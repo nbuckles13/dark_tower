@@ -1,0 +1,184 @@
+syntax = "proto3";
+
+package dark_tower.signaling;
+
+// Participant capabilities during join
+message ParticipantCapabilities {
+  repeated string video_codecs = 1;  // e.g., ["VP9", "AV1", "H264"]
+  repeated string audio_codecs = 2;  // e.g., ["Opus", "AAC"]
+  bool supports_simulcast = 3;
+  uint32 max_video_streams = 4;
+}
+
+// Request to join a meeting
+message JoinRequest {
+  string meeting_id = 1;
+  string join_token = 2;
+  string participant_name = 3;
+  ParticipantCapabilities capabilities = 4;
+}
+
+// Encryption keys for end-to-end encryption
+message EncryptionKeys {
+  bytes public_key = 1;
+  string key_id = 2;
+}
+
+// Information about the media server
+message MediaServerInfo {
+  string media_handler_url = 1;
+  string connection_token = 2;
+}
+
+// Stream type enumeration
+enum StreamType {
+  AUDIO = 0;
+  VIDEO_CAMERA = 1;
+  VIDEO_SCREEN = 2;
+}
+
+// Simulcast layer configuration
+message SimulcastLayer {
+  string layer_id = 1;
+  uint32 width = 2;
+  uint32 height = 3;
+  uint32 max_bitrate = 4;
+}
+
+// Video metadata
+message VideoMetadata {
+  uint32 width = 1;
+  uint32 height = 2;
+  uint32 framerate = 3;
+  repeated SimulcastLayer simulcast_layers = 4;
+}
+
+// Stream metadata
+message StreamMetadata {
+  string codec = 1;
+  uint32 max_bitrate = 2;
+  VideoMetadata video = 3;  // Only for video streams
+}
+
+// Media stream information
+message MediaStream {
+  string stream_id = 1;
+  StreamType stream_type = 2;
+  StreamMetadata metadata = 3;
+}
+
+// Participant information
+message Participant {
+  string participant_id = 1;
+  string name = 2;
+  repeated MediaStream streams = 3;
+  uint64 joined_at = 4;
+}
+
+// Response to join request
+message JoinResponse {
+  string participant_id = 1;
+  repeated Participant existing_participants = 2;
+  MediaServerInfo media_server = 3;
+  EncryptionKeys encryption_keys = 4;
+}
+
+// Reason for participant leaving
+enum LeaveReason {
+  VOLUNTARY = 0;
+  KICKED = 1;
+  CONNECTION_LOST = 2;
+  MEETING_ENDED = 3;
+}
+
+// Notification of participant joining
+message ParticipantJoined {
+  Participant participant = 1;
+}
+
+// Notification of participant leaving
+message ParticipantLeft {
+  string participant_id = 1;
+  LeaveReason reason = 2;
+}
+
+// Request to publish a new stream
+message PublishStream {
+  string stream_id = 1;
+  StreamType stream_type = 2;
+  StreamMetadata metadata = 3;
+}
+
+// Notification of stream being published
+message StreamPublished {
+  string participant_id = 1;
+  MediaStream stream = 2;
+}
+
+// Subscription options for a stream
+message SubscriptionOptions {
+  string preferred_layer = 1;  // For simulcast
+  uint32 max_bitrate = 2;
+}
+
+// Request to subscribe to a stream
+message SubscribeStream {
+  string stream_id = 1;
+  SubscriptionOptions options = 2;
+}
+
+// Request to unsubscribe from a stream
+message UnsubscribeStream {
+  string stream_id = 1;
+}
+
+// Stream quality update (bidirectional)
+message StreamQualityUpdate {
+  string stream_id = 1;
+  uint32 available_bitrate = 2;
+  float packet_loss = 3;
+  uint32 rtt_ms = 4;
+}
+
+// Error codes
+enum ErrorCode {
+  UNKNOWN = 0;
+  INVALID_REQUEST = 1;
+  UNAUTHORIZED = 2;
+  FORBIDDEN = 3;
+  NOT_FOUND = 4;
+  CONFLICT = 5;
+  INTERNAL_ERROR = 6;
+  CAPACITY_EXCEEDED = 7;
+  STREAM_ERROR = 8;
+}
+
+// Error message
+message ErrorMessage {
+  ErrorCode code = 1;
+  string message = 2;
+  map<string, string> details = 3;
+}
+
+// Client to server message wrapper
+message ClientMessage {
+  oneof message {
+    JoinRequest join_request = 1;
+    PublishStream publish_stream = 2;
+    SubscribeStream subscribe_stream = 3;
+    UnsubscribeStream unsubscribe_stream = 4;
+    StreamQualityUpdate stream_quality_update = 5;
+  }
+}
+
+// Server to client message wrapper
+message ServerMessage {
+  oneof message {
+    JoinResponse join_response = 1;
+    ParticipantJoined participant_joined = 2;
+    ParticipantLeft participant_left = 3;
+    StreamPublished stream_published = 4;
+    StreamQualityUpdate stream_quality_update = 5;
+    ErrorMessage error = 6;
+  }
+}

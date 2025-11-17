@@ -1,0 +1,74 @@
+[workspace]
+resolver = "2"
+
+members = [
+    "crates/global-controller",
+    "crates/meeting-controller",
+    "crates/media-handler",
+    "crates/common",
+    "crates/proto-gen",
+    "crates/media-protocol",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Dark Tower Contributors"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/nbuckles13/dark_tower"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1.40", features = ["full"] }
+tokio-util = "0.7"
+
+# Web frameworks
+axum = "0.7"
+tower = "0.5"
+tower-http = "0.5"
+
+# QUIC/WebTransport
+quinn = "0.11"
+wtransport = "0.1"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+prost = "0.13"
+prost-types = "0.13"
+
+# Database clients
+tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] }
+redis = { version = "0.26", features = ["tokio-comp", "connection-manager"] }
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+opentelemetry = "0.24"
+opentelemetry-otlp = "0.17"
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Utilities
+uuid = { version = "1.10", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+bytes = "1.7"
+
+# Cryptography (for E2E encryption)
+ring = "0.17"
+rustls = "0.23"
+
+# Testing
+criterion = "0.5"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+
+[profile.dev]
+opt-level = 0
+debug = true

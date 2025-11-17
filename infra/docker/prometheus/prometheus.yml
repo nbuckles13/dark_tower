@@ -1,0 +1,54 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: 'dark-tower-dev'
+    environment: 'development'
+
+# Alertmanager configuration (optional, for future use)
+# alerting:
+#   alertmanagers:
+#     - static_configs:
+#         - targets:
+#           - alertmanager:9093
+
+# Load rules once and periodically evaluate them
+# rule_files:
+#   - "alerts/*.yml"
+
+scrape_configs:
+  # Prometheus itself
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # Global Controller (when implemented)
+  - job_name: 'global-controller'
+    static_configs:
+      - targets: ['global-controller:8000']
+    metrics_path: '/metrics'
+    scrape_interval: 10s
+
+  # Meeting Controller (when implemented)
+  - job_name: 'meeting-controller'
+    static_configs:
+      - targets: ['meeting-controller:9100']
+    metrics_path: '/metrics'
+    scrape_interval: 10s
+
+  # Media Handler (when implemented)
+  - job_name: 'media-handler'
+    static_configs:
+      - targets: ['media-handler:9100']
+    metrics_path: '/metrics'
+    scrape_interval: 5s  # More frequent for real-time media metrics
+
+  # PostgreSQL exporter (optional, for future use)
+  # - job_name: 'postgres'
+  #   static_configs:
+  #     - targets: ['postgres-exporter:9187']
+
+  # Redis exporter (optional, for future use)
+  # - job_name: 'redis'
+  #   static_configs:
+  #     - targets: ['redis-exporter:9121']

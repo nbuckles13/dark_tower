@@ -1,0 +1,20 @@
+[package]
+name = "proto-gen"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# Workspace dependencies
+prost = { workspace = true }
+prost-types = { workspace = true }
+serde = { workspace = true }
+bytes = { workspace = true }
+
+[build-dependencies]
+prost-build = "0.13"
+
+[dev-dependencies]
+criterion = { workspace = true }

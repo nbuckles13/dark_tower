@@ -1,0 +1,139 @@
+syntax = "proto3";
+
+package dark_tower.internal;
+
+import "signaling.proto";
+
+// ============================================================================
+// Meeting Controller <-> Media Handler
+// ============================================================================
+
+// Request to register a participant with the media handler
+message RegisterParticipant {
+  string participant_id = 1;
+  string meeting_id = 2;
+  repeated dark_tower.signaling.MediaStream streams = 3;
+}
+
+// Response to participant registration
+message RegisterParticipantResponse {
+  string connection_token = 1;
+  string media_handler_url = 2;
+}
+
+// Routing options for media forwarding
+message RoutingOptions {
+  bool transcode = 1;
+  string target_codec = 2;
+  uint32 target_bitrate = 3;
+  bool mix_audio = 4;  // Mix multiple audio streams
+}
+
+// Command to route media between participants
+message RouteMediaCommand {
+  string source_stream_id = 1;
+  repeated string destination_participant_ids = 2;
+  RoutingOptions options = 3;
+}
+
+// Media telemetry from media handler to meeting controller
+message MediaTelemetry {
+  string stream_id = 1;
+  uint64 bytes_sent = 2;
+  uint64 bytes_received = 3;
+  float packet_loss = 4;
+  uint32 bitrate = 5;
+  uint32 jitter_ms = 6;
+  uint64 timestamp = 7;
+}
+
+// ============================================================================
+// Global Controller <-> Meeting Controller
+// ============================================================================
+
+// Capacity information for a meeting controller
+message ControllerCapacity {
+  uint32 max_meetings = 1;
+  uint32 current_meetings = 2;
+  uint32 max_participants = 3;
+  uint32 current_participants = 4;
+}
+
+// Health status of a controller
+enum HealthStatus {
+  HEALTHY = 0;
+  DEGRADED = 1;
+  UNHEALTHY = 2;
+}
+
+// Request to register a meeting controller with global controller
+message RegisterMeetingController {
+  string controller_id = 1;
+  string region = 2;
+  string endpoint = 3;
+  ControllerCapacity capacity = 4;
+}
+
+// Heartbeat from meeting controller to global controller
+message Heartbeat {
+  string controller_id = 1;
+  ControllerCapacity capacity = 2;
+  HealthStatus health = 3;
+}
+
+// Meeting configuration
+message MeetingConfig {
+  string display_name = 1;
+  uint32 max_participants = 2;
+  bool enable_e2e_encryption = 3;
+  bool recording_enabled = 4;
+}
+
+// Request to assign a meeting to a controller
+message AssignMeeting {
+  string meeting_id = 1;
+  MeetingConfig config = 2;
+}
+
+// Response to meeting assignment
+message AssignMeetingResponse {
+  bool accepted = 1;
+  string reason = 2;  // If not accepted
+}
+
+// ============================================================================
+// Service Definitions
+// ============================================================================
+
+// Media handler service (Meeting Controller -> Media Handler)
+service MediaHandlerService {
+  rpc RegisterParticipant(RegisterParticipant) returns (RegisterParticipantResponse);
+  rpc RouteMedia(RouteMediaCommand) returns (RouteMediaResponse);
+  rpc StreamTelemetry(stream MediaTelemetry) returns (TelemetryAck);
+}
+
+message RouteMediaResponse {
+  bool success = 1;
+  string error_message = 2;
+}
+
+message TelemetryAck {
+  bool received = 1;
+}
+
+// Meeting controller service (Global Controller -> Meeting Controller)
+service MeetingControllerService {
+  rpc RegisterController(RegisterMeetingController) returns (RegistrationResponse);
+  rpc SendHeartbeat(Heartbeat) returns (HeartbeatResponse);
+  rpc AssignMeeting(AssignMeeting) returns (AssignMeetingResponse);
+}
+
+message RegistrationResponse {
+  bool accepted = 1;
+  string controller_id = 2;
+}
+
+message HeartbeatResponse {
+  bool acknowledged = 1;
+  uint64 timestamp = 2;
+}
