@@ -78,9 +78,8 @@ Dark Tower is a distributed system with multiple services that need to communica
 **User Tokens** (issued by Auth Controller):
 ```json
 {
-  "sub": "user_id",
-  "org_id": "org_id",
-  "email": "user@example.com",
+  "sub": "550e8400-e29b-41d4-a716-446655440000",
+  "org_id": "org_123",
   "scopes": ["user.read.gc", "user.write.gc", "user.read.mc", "user.write.mc"],
   "iss": "auth.us.dark.com",
   "iat": 1234567890,
@@ -88,6 +87,8 @@ Dark Tower is a distributed system with multiple services that need to communica
   "aud": "dark-tower-api"
 }
 ```
+
+**Note**: `email` field intentionally omitted (PII). Services look up email from database using `sub` if needed.
 
 **Service Tokens** (issued by Auth Controller):
 ```json
@@ -157,9 +158,20 @@ federation:
 **Cross-Cluster Validation**:
 1. Service receives token with `kid: auth-eu-2025-01`
 2. Service checks JWKS cache for `auth-eu-2025-01`
-3. If not found, fetch JWKS from all federated clusters
+3. If not found, fetch JWKS from all federated clusters (with certificate pinning)
 4. Validate signature using public key
 5. Accept token from any trusted cluster
+
+**JWKS Security** (Protection against JWKS poisoning):
+- **Certificate pinning**: Services pin AC's TLS certificate to prevent MITM attacks
+- **HTTPS only**: JWKS fetched over TLS 1.3
+- Implementation example:
+```rust
+let ac_cert = include_bytes!("../certs/auth-us.crt");
+let jwks_client = reqwest::Client::builder()
+    .add_root_certificate(reqwest::Certificate::from_pem(ac_cert)?)
+    .build()?;
+```
 
 ### Component 5: mTLS for Transport Security
 
@@ -220,7 +232,7 @@ async fn validate_token(
 **Service Registration** (at deployment):
 ```
 1. Deploy new MC instance
-2. Call Auth Controller: POST /admin/services/register
+2. Call Auth Controller: POST /api/v1/admin/services/register
    Body: { "service_type": "meeting-controller", "region": "us-west-1" }
 3. Auth Controller returns: { "client_id": "...", "client_secret": "..." }
 4. Deployment injects as env vars: AC_CLIENT_ID, AC_CLIENT_SECRET
@@ -228,7 +240,7 @@ async fn validate_token(
 
 **Token Exchange** (at service startup):
 ```
-1. MC calls Auth Controller: POST /auth/service/token
+1. MC calls Auth Controller: POST /api/v1/auth/service/token
    Headers: Authorization: Basic base64(client_id:client_secret)
    Body: { "grant_type": "client_credentials" }
 2. Auth Controller validates credentials
@@ -349,7 +361,7 @@ Week 4: Keys [keyC, keyD]    - sign with keyD, validate both
 │(MC instance)│                  │                  │
 └──────┬──────┘                  └────────┬─────────┘
        │                                  │
-       │ POST /auth/service/token         │
+       │ POST /api/v1/auth/service/token  │
        │ Basic auth(client_id, secret)    │
        │─────────────────────────────────>│
        │                                  │
@@ -358,7 +370,8 @@ Week 4: Keys [keyC, keyD]    - sign with keyD, validate both
        │                                  │ Verify client_secret hash
        │                                  │
        │   200 OK                         │
-       │   { access_token, expires_in }   │
+       │   { access_token, expires_in,    │
+       │     scope, token_type }          │
        │<─────────────────────────────────│
        │                                  │
 ```
@@ -407,6 +420,88 @@ Week 4: Keys [keyC, keyD]    - sign with keyD, validate both
 - Short-lived tokens (5 minutes) with refresh
 - OIDC integration for enterprise customers
 
+### OAuth 2.0 Token Response Format
+
+**Service Token Response** (RFC 6749 Section 5.1):
+```json
+{
+  "access_token": "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9...",
+  "token_type": "Bearer",
+  "expires_in": 7200,
+  "scope": "service.write.mh service.read.gc"
+}
+```
+
+**User Token Response**:
+```json
+{
+  "access_token": "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9...",
+  "token_type": "Bearer",
+  "expires_in": 3600,
+  "scope": "user.read.gc user.write.gc user.read.mc user.write.mc"
+}
+```
+
+**Field Requirements**:
+- `access_token` (REQUIRED): The JWT token
+- `token_type` (REQUIRED): Always "Bearer"
+- `expires_in` (REQUIRED): Token lifetime in seconds
+- `scope` (REQUIRED): Space-separated list of granted scopes
+
+**Note**: RFC 6749 makes `scope` optional if identical to requested scope, but Dark Tower **always includes it** to avoid client confusion about granted permissions.
+
+### OAuth 2.0 Error Responses
+
+**401 Unauthorized** (invalid, expired, or missing token):
+```http
+HTTP/1.1 401 Unauthorized
+WWW-Authenticate: Bearer realm="dark-tower-api", error="invalid_token", error_description="The access token expired"
+Content-Type: application/json
+
+{
+  "error": {
+    "code": "UNAUTHORIZED",
+    "message": "The access token expired"
+  }
+}
+```
+
+**403 Forbidden** (insufficient scope):
+```http
+HTTP/1.1 403 Forbidden
+WWW-Authenticate: Bearer realm="dark-tower-api", error="insufficient_scope", scope="service.admin.gc"
+Content-Type: application/json
+
+{
+  "error": {
+    "code": "FORBIDDEN",
+    "message": "Requires scope: service.admin.gc",
+    "required_scope": "service.admin.gc",
+    "provided_scopes": ["service.read.gc", "service.write.mh"]
+  }
+}
+```
+
+**400 Bad Request** (malformed request):
+```http
+HTTP/1.1 400 Bad Request
+WWW-Authenticate: Bearer realm="dark-tower-api", error="invalid_request", error_description="Missing grant_type parameter"
+Content-Type: application/json
+
+{
+  "error": {
+    "code": "INVALID_REQUEST",
+    "message": "Missing grant_type parameter"
+  }
+}
+```
+
+**WWW-Authenticate Header** (RFC 6750 Section 3):
+- **REQUIRED** on all 401 responses involving Bearer tokens
+- **error** parameter: `invalid_token`, `invalid_request`, `insufficient_scope`
+- **error_description** parameter: Human-readable description
+- **scope** parameter (403 only): Required scope for the operation
+
 ### Security Considerations
 
 **Token Storage**:
@@ -429,6 +524,162 @@ fn check_scope(claims: &Claims, required: &str) -> Result<(), AuthError> {
         });
     }
     Ok(())
+}
+```
+
+### Cryptographic Requirements
+
+**CSPRNG (Cryptographically Secure RNG)**:
+
+All random values MUST use `ring::rand::SystemRandom`:
+
+```rust
+use ring::rand::{SecureRandom, SystemRandom};
+
+// Signing key generation
+let rng = SystemRandom::new();
+let pkcs8_bytes = ring::signature::Ed25519KeyPair::generate_pkcs8(&rng)
+    .map_err(|_| CryptoError::KeyGenerationFailed)?;
+
+// Client secret generation (32 bytes = 256 bits)
+let mut secret = [0u8; 32];
+rng.fill(&mut secret)
+    .map_err(|_| CryptoError::RandomGenerationFailed)?;
+let client_secret = base64::encode_config(&secret, base64::URL_SAFE_NO_PAD);
+```
+
+**DO NOT USE**:
+- `rand::thread_rng()` - Not guaranteed cryptographically secure
+- `std::collections::hash_map::RandomState` - Not cryptographic
+
+**Key Encryption at Rest**:
+
+Private signing keys encrypted with AES-256-GCM before storing in database:
+
+```rust
+use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM};
+
+// Encryption
+fn encrypt_private_key(
+    plaintext: &[u8],
+    master_key: &[u8; 32],
+) -> Result<EncryptedKey, CryptoError> {
+    let unbound_key = UnboundKey::new(&AES_256_GCM, master_key)
+        .map_err(|_| CryptoError::InvalidKey)?;
+    let key = LessSafeKey::new(unbound_key);
+
+    // Generate random 96-bit nonce
+    let rng = SystemRandom::new();
+    let mut nonce_bytes = [0u8; 12];
+    rng.fill(&mut nonce_bytes)?;
+    let nonce = Nonce::assume_unique_for_key(nonce_bytes);
+
+    let mut ciphertext = plaintext.to_vec();
+    let tag = key.seal_in_place_separate_tag(nonce, Aad::empty(), &mut ciphertext)
+        .map_err(|_| CryptoError::EncryptionFailed)?;
+
+    Ok(EncryptedKey {
+        ciphertext,
+        nonce: nonce_bytes.to_vec(),
+        tag: tag.as_ref().to_vec(),
+    })
+}
+
+// Decryption
+fn decrypt_private_key(
+    encrypted: &EncryptedKey,
+    master_key: &[u8; 32],
+) -> Result<Vec<u8>, CryptoError> {
+    let unbound_key = UnboundKey::new(&AES_256_GCM, master_key)
+        .map_err(|_| CryptoError::InvalidKey)?;
+    let key = LessSafeKey::new(unbound_key);
+
+    let nonce = Nonce::try_assume_unique_for_key(&encrypted.nonce)
+        .map_err(|_| CryptoError::InvalidNonce)?;
+
+    let mut plaintext = encrypted.ciphertext.clone();
+    plaintext.extend_from_slice(&encrypted.tag);
+
+    key.open_in_place(nonce, Aad::empty(), &mut plaintext)
+        .map_err(|_| CryptoError::DecryptionFailed)?;
+
+    // Remove tag from end
+    plaintext.truncate(plaintext.len() - 16);
+    Ok(plaintext)
+}
+```
+
+**Master Key Management**:
+- **Production**: Environment variable `AC_MASTER_KEY` (base64-encoded 32 bytes)
+- **Future**: Migrate to HashiCorp Vault for cloud-independent key management
+- **Never**: Commit master key to git, log master key, expose in APIs
+- **Rotation**: Master key rotated annually, all signing keys re-encrypted
+
+**Database Storage**:
+```sql
+CREATE TABLE signing_keys (
+    key_id VARCHAR(50) PRIMARY KEY,
+    public_key TEXT NOT NULL,  -- PEM format, plaintext
+    private_key_encrypted BYTEA NOT NULL,  -- AES-256-GCM ciphertext
+    encryption_nonce BYTEA NOT NULL,  -- 96-bit nonce
+    encryption_tag BYTEA NOT NULL,  -- 128-bit authentication tag
+    encryption_algorithm VARCHAR(50) NOT NULL DEFAULT 'AES-256-GCM',
+    -- ...
+);
+```
+
+### Rate Limiting & Brute Force Protection
+
+**Multi-Layer Rate Limiting**:
+
+**Layer 1: IP-Based** (prevents distributed attacks):
+- User login: 10 attempts per 15 minutes per IP
+- Service token: 60 requests per hour per IP
+- JWKS endpoint: 100 requests per minute per IP
+
+**Layer 2: Account-Based** (prevents credential stuffing):
+- User account: 10 failed attempts → lock account for 1 hour
+- Service credential: 20 failed attempts → disable credential, require admin re-enable
+
+**Layer 3: Exponential Backoff** (slows attackers):
+```rust
+fn calculate_backoff(failed_attempts: u32) -> Duration {
+    match failed_attempts {
+        0..=2 => Duration::from_secs(0),      // No delay
+        3..=5 => Duration::from_secs(5),      // 5 second delay
+        6..=8 => Duration::from_secs(30),     // 30 second delay
+        9..=10 => Duration::from_secs(300),   // 5 minute delay
+        _ => Duration::from_secs(3600),       // 1 hour lockout
+    }
+}
+```
+
+**Layer 4: CAPTCHA** (future):
+- Require CAPTCHA after 3 failed login attempts
+- Prevents automated brute force
+
+**Layer 5: Alerting**:
+- Email user on 5+ failed login attempts
+- Alert ops team on unusual patterns (100+ failures/min)
+
+**Implementation**:
+- **MVP**: In-memory rate limiting (single AC instance)
+- **Production**: Redis-based distributed rate limiting (multi-instance AC)
+
+**Rate Limit Response** (RFC 6585):
+```http
+HTTP/1.1 429 Too Many Requests
+Retry-After: 300
+X-RateLimit-Limit: 10
+X-RateLimit-Remaining: 0
+X-RateLimit-Reset: 1234567890
+
+{
+  "error": {
+    "code": "RATE_LIMIT_EXCEEDED",
+    "message": "Too many failed login attempts. Try again in 5 minutes.",
+    "retry_after": 300
+  }
 }
 ```
 
