@@ -57,7 +57,7 @@ This document defines the interfaces and communication patterns between Dark Tow
   "meeting_id": "550e8400-e29b-41d4-a716-446655440000",
   "meeting_url": "https://darktower.example.com/m/abc123",
   "join_token": "eyJhbGciOiJIUzI1NiIs...",
-  "meeting_controller_url": "wss://us-west-1.darktower.example.com/ws",
+  "meeting_controller_url": "https://us-west-1.darktower.example.com:4433/wt",
   "created_at": "2025-01-16T12:00:00Z"
 }
 ```
@@ -75,7 +75,7 @@ This document defines the interfaces and communication patterns between Dark Tow
   "max_participants": 100,
   "created_at": "2025-01-16T12:00:00Z",
   "meeting_controller_region": "us-west-1",
-  "meeting_controller_url": "wss://us-west-1.darktower.example.com/ws"
+  "meeting_controller_url": "https://us-west-1.darktower.example.com:4433/wt"
 }
 ```
 
@@ -159,9 +159,10 @@ message ParticipantCapabilities {
 ```protobuf
 message JoinResponse {
   string participant_id = 1;
-  repeated Participant existing_participants = 2;
-  MediaServerInfo media_server = 3;
-  EncryptionKeys encryption_keys = 4;
+  uint64 user_id = 2;  // 8-byte user ID for media frames
+  repeated Participant existing_participants = 3;
+  repeated MediaServerInfo media_servers = 4;  // Multiple handlers
+  EncryptionKeys encryption_keys = 5;
 }
 
 message Participant {
@@ -253,23 +254,107 @@ message MediaStream {
 }
 ```
 
-#### SubscribeStream (Client → Server)
+#### SubscribeToLayout (Client → Server)
+
+**Virtualized Subscription**: Client subscribes to a layout, not individual streams.
+
 ```protobuf
-message SubscribeStream {
-  string stream_id = 1;
-  SubscriptionOptions options = 2;
+message SubscribeToLayout {
+  LayoutType layout_type = 1;
+  LayoutConfig config = 2;
+  repeated uint32 stream_ids = 3;  // Subscriber-chosen IDs for each slot
 }
 
-message SubscriptionOptions {
-  string preferred_layer = 1;  // For simulcast
-  uint32 max_bitrate = 2;
+enum LayoutType {
+  GRID = 0;
+  // Future: STACK = 1, PRESENTATION = 2, etc.
+}
+
+message LayoutConfig {
+  // For Grid layout
+  uint32 rows = 1;
+  uint32 columns = 2;
+  uint32 max_streams = 3;  // rows * columns
+
+  // Customization
+  repeated uint64 pinned_users = 4;   // Must appear in layout
+  repeated uint64 excluded_users = 5;  // Must not appear
+  bool prefer_video_over_audio = 6;
+  bool include_self = 7;
 }
 ```
 
-#### UnsubscribeStream (Client → Server)
+**Example**:
 ```protobuf
-message UnsubscribeStream {
-  string stream_id = 1;
+SubscribeToLayout {
+  layout_type: GRID,
+  config: {
+    rows: 3,
+    columns: 3,
+    max_streams: 9,
+    pinned_users: [0x123456, 0x789ABC],
+    include_self: false
+  },
+  stream_ids: [1, 2, 3, 4, 5, 6, 7, 8, 9]  // One for each grid slot
+}
+```
+
+Meeting Controller responds with `StreamAssignments` indicating which user/stream maps to each slot.
+
+#### StreamAssignments (Server → Client)
+
+Meeting Controller sends this after processing layout subscription:
+
+```protobuf
+message StreamAssignments {
+  repeated StreamAssignment assignments = 1;
+}
+
+message StreamAssignment {
+  uint32 stream_id = 1;        // The subscriber's local stream_id
+  uint64 user_id = 2;           // Source participant
+  MediaType media_type = 3;     // camera, screen, audio
+  uint32 slot_index = 4;        // Position in layout (0-based)
+  string media_handler_url = 5; // Which handler to receive from
+}
+
+enum MediaType {
+  AUDIO = 0;
+  VIDEO_CAMERA = 1;
+  VIDEO_SCREEN = 2;
+}
+```
+
+**Example Response**:
+```protobuf
+StreamAssignments {
+  assignments: [
+    { stream_id: 1, user_id: 0x123456, media_type: VIDEO_CAMERA, slot_index: 0, media_handler_url: "https://mh1..." },
+    { stream_id: 2, user_id: 0x789ABC, media_type: VIDEO_CAMERA, slot_index: 1, media_handler_url: "https://mh1..." },
+    { stream_id: 3, user_id: 0xDEF012, media_type: VIDEO_SCREEN, slot_index: 2, media_handler_url: "https://mh2..." },
+    // ... up to 9 assignments for 3x3 grid
+  ]
+}
+```
+
+Client uses this mapping to route received datagrams to correct UI slots.
+
+#### UpdateLayout (Client → Server)
+
+Client can update layout without full resubscription:
+
+```protobuf
+message UpdateLayout {
+  LayoutConfig new_config = 1;  // New layout configuration
+}
+```
+
+Server responds with updated `StreamAssignments`.
+
+#### UnsubscribeLayout (Client → Server)
+```protobuf
+message UnsubscribeLayout {
+  // No parameters needed - unsubscribes from current layout
 }
 ```
 
@@ -304,7 +389,9 @@ message StreamQualityUpdate {
 │ Frame Type (1 byte)                                     │
 │ 0x00 = Audio, 0x01 = Video Key, 0x02 = Video Delta     │
 ├─────────────────────────────────────────────────────────┤
-│ Stream ID (16 bytes - UUID)                            │
+│ User ID (8 bytes - participant identifier)             │
+├─────────────────────────────────────────────────────────┤
+│ Stream ID (4 bytes - subscriber-chosen identifier)     │
 ├─────────────────────────────────────────────────────────┤
 │ Timestamp (8 bytes - microseconds since epoch)         │
 ├─────────────────────────────────────────────────────────┤
@@ -319,11 +406,13 @@ message StreamQualityUpdate {
 ├─────────────────────────────────────────────────────────┤
 │ Reserved (6 bytes)                                     │
 ├─────────────────────────────────────────────────────────┤
-│ Payload (variable length)                              │
+│ Payload (variable length - encrypted with SFrame)      │
 └─────────────────────────────────────────────────────────┘
 
-Total header size: 46 bytes
+Total header size: 42 bytes
 ```
+
+**Note**: User ID (8 bytes) identifies the participant, Stream ID (4 bytes) is chosen by the subscriber for local routing.
 
 ### 3.3 Flow Control
 

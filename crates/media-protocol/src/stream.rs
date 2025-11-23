@@ -1,12 +1,12 @@
 //! Media stream management.
 
-use common::types::StreamId;
-
 /// Media stream configuration
 #[derive(Debug, Clone)]
 pub struct StreamConfig {
-    /// Unique stream identifier
-    pub id: StreamId,
+    /// User identifier (participant)
+    pub user_id: u64,
+    /// Stream identifier (subscriber-chosen)
+    pub stream_id: u32,
     /// Maximum bitrate in bits per second
     pub max_bitrate: u64,
     /// Whether this is an audio or video stream
@@ -36,5 +36,17 @@ impl MediaStream {
             frames_received: 0,
             bytes_received: 0,
         }
+    }
+
+    /// Get the user ID for this stream
+    #[must_use]
+    pub const fn user_id(&self) -> u64 {
+        self.config.user_id
+    }
+
+    /// Get the stream ID for this stream
+    #[must_use]
+    pub const fn stream_id(&self) -> u32 {
+        self.config.stream_id
     }
 }
