@@ -7,9 +7,85 @@ This guide helps you set up your local development environment for Dark Tower.
 ### Required Software
 
 - **Rust**: 1.75+ (install via [rustup](https://rustup.rs/))
+- **C Compiler Toolchain**: gcc (Linux), clang (macOS), or MSVC (Windows)
+- **Protocol Buffer Compiler**: `protoc` 3.0+
 - **Node.js**: 20+ (for client development)
 - **Docker**: 24+ and Docker Compose
 - **Git**: Latest version
+
+### System Build Tools
+
+**⚠️ CRITICAL**: Dark Tower requires a C compiler and build tools for native dependencies. The project uses cryptography libraries (`ring`, `rustls`, `bcrypt`) and Protocol Buffers that compile native code during the build process.
+
+#### Ubuntu/Debian (including WSL2)
+
+```bash
+sudo apt update
+sudo apt install -y build-essential pkg-config protobuf-compiler
+```
+
+This installs:
+- **gcc/g++**: C/C++ compilers (required by `ring`, `bcrypt`, and many dependencies)
+- **make**: Build automation tool
+- **libc-dev**: C standard library headers
+- **pkg-config**: Build configuration tool
+- **protoc**: Protocol Buffer compiler (required for `proto-gen` crate)
+
+**Verify installation**:
+```bash
+gcc --version       # Should show version 7.0+
+protoc --version    # Should show version 3.0+
+pkg-config --version
+```
+
+#### macOS
+
+```bash
+# Xcode Command Line Tools (includes clang/gcc)
+xcode-select --install
+
+# Protocol Buffer compiler and pkg-config
+brew install protobuf pkg-config
+```
+
+**Verify installation**:
+```bash
+gcc --version       # Uses clang (symlinked as gcc)
+protoc --version    # Should show version 3.0+
+```
+
+#### Fedora/RHEL/CentOS
+
+```bash
+# Fedora/RHEL 8+/CentOS Stream
+sudo dnf groupinstall "Development Tools"
+sudo dnf install pkg-config protobuf-compiler
+
+# RHEL 7/CentOS 7
+sudo yum groupinstall "Development Tools"
+sudo yum install pkg-config protobuf-compiler
+```
+
+#### Windows
+
+**Option 1 (Recommended): WSL2**
+```bash
+# Use Ubuntu on WSL2 - follow Ubuntu instructions above
+sudo apt update && sudo apt install -y build-essential pkg-config protobuf-compiler
+```
+
+**Option 2: Native Windows**
+1. Install Visual Studio 2019 or later with "Desktop development with C++" workload
+2. Install Protocol Buffer compiler:
+   ```powershell
+   choco install protoc
+   ```
+   Or download from [GitHub releases](https://github.com/protocolbuffers/protobuf/releases)
+
+**Option 3: MSYS2/MinGW**
+```bash
+pacman -S mingw-w64-x86_64-gcc mingw-w64-x86_64-pkg-config mingw-w64-x86_64-protobuf
+```
 
 ### Optional Tools
 
@@ -17,13 +93,15 @@ This guide helps you set up your local development environment for Dark Tower.
   ```bash
   cargo install cargo-watch
   ```
-- **Protocol Buffer Compiler**: For manual proto compilation
+- **sccache**: Faster incremental builds
   ```bash
-  # macOS
-  brew install protobuf
-
-  # Ubuntu/Debian
-  sudo apt install protobuf-compiler
+  cargo install sccache
+  export RUSTC_WRAPPER=sccache
+  ```
+- **mold linker** (Linux only): Much faster linking
+  ```bash
+  sudo apt install mold
+  export RUSTFLAGS="-C link-arg=-fuse-ld=mold"
   ```
 
 ## Quick Start
@@ -485,6 +563,58 @@ kill -9 <PID>
 # Add user to docker group (Linux)
 sudo usermod -aG docker $USER
 newgrp docker
+```
+
+### Build Error: Missing C Compiler
+
+**Error**:
+```
+error: linker `cc` not found
+  |
+  = note: No such file or directory (os error 2)
+
+error: could not compile `ring` due to 1 previous error
+```
+
+**Cause**: Missing C compiler toolchain. Dark Tower's cryptography libraries (`ring`, `rustls`, `bcrypt`) require a C compiler to build native code.
+
+**Solution**:
+```bash
+# Ubuntu/Debian/WSL2
+sudo apt install build-essential
+
+# macOS
+xcode-select --install
+
+# Fedora/RHEL
+sudo dnf groupinstall "Development Tools"
+
+# Windows: Use WSL2 or install Visual Studio with C++ workload
+```
+
+After installing, run `cargo clean && cargo build` to rebuild from scratch.
+
+### Build Error: Missing Protocol Buffer Compiler
+
+**Error**:
+```
+error: failed to run custom build command for `proto-gen`
+--- stderr
+Error: Custom { kind: NotFound, error: "protoc failed: No such file or directory" }
+```
+
+**Cause**: The `proto-gen` crate requires the Protocol Buffer compiler (`protoc`) to generate Rust code from `.proto` files.
+
+**Solution**:
+```bash
+# Ubuntu/Debian
+sudo apt install protobuf-compiler
+
+# macOS
+brew install protobuf
+
+# Verify installation
+protoc --version  # Should show version 3.0+
 ```
 
 ### Rust Build Errors

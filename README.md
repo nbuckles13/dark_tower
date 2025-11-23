@@ -66,11 +66,43 @@ See [TECHNICAL_STACK.md](docs/TECHNICAL_STACK.md) for complete details.
 
 ### Prerequisites
 
-- Rust 1.75+ (stable)
-- Node.js 20+
-- Docker and Docker Compose
-- PostgreSQL 15+
-- Redis 7+
+- **Rust** 1.75+ (install via [rustup](https://rustup.rs/))
+- **C Compiler** and build tools (gcc/clang/MSVC)
+- **Protocol Buffer Compiler** (`protoc` 3.0+)
+- **Node.js** 20+
+- **Docker** and Docker Compose
+- **PostgreSQL** 15+
+- **Redis** 7+
+
+**⚠️ Important**: Dark Tower requires a C compiler for native dependencies (`ring`, `rustls`, `bcrypt`). See [DEVELOPMENT.md](docs/DEVELOPMENT.md#system-build-tools) for platform-specific setup.
+
+#### Quick Setup (Ubuntu/WSL2)
+
+```bash
+# Install build dependencies
+sudo apt update && sudo apt install -y build-essential pkg-config protobuf-compiler
+
+# Install Rust
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
+# Verify installation
+rustc --version && gcc --version && protoc --version
+```
+
+#### Quick Setup (macOS)
+
+```bash
+# Install Xcode Command Line Tools
+xcode-select --install
+
+# Install protobuf
+brew install protobuf pkg-config
+
+# Install Rust
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+```
+
+See [DEVELOPMENT.md](docs/DEVELOPMENT.md) for detailed setup instructions for other platforms.
 
 ### Getting Started
 
