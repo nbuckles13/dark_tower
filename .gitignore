@@ -20,6 +20,11 @@ crates/proto-gen/src/generated/*.rs
 .env.local
 .env.*.local
 
+# TLS Certificates (local development only - never commit private keys)
+infra/docker/certs/*.key
+infra/docker/certs/*.crt
+infra/docker/certs/*.pem
+
 # Logs
 *.log
 logs/

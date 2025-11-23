@@ -118,6 +118,34 @@ services:
     networks:
       - dark_tower_network
 
+  # Auth Controller - Authentication and authorization service
+  # Uncomment when ready to run in Docker (currently run from source: cargo run --bin auth-controller)
+  # auth-controller:
+  #   build:
+  #     context: .
+  #     dockerfile: infra/docker/auth-controller.Dockerfile
+  #   container_name: dark_tower_auth_controller
+  #   environment:
+  #     - RUST_LOG=info,ac_service=debug
+  #     - DATABASE_URL=postgresql://darktower:dev_password_change_in_production@postgres:5432/dark_tower
+  #     - REDIS_URL=redis://:dev_password_change_in_production@redis:6379
+  #     - AC_MASTER_KEY=${AC_MASTER_KEY}  # REQUIRED: Set in .env (generate with: ./scripts/generate-master-key.sh)
+  #     - BIND_ADDRESS=0.0.0.0:8082
+  #     - TLS_CERT_PATH=/certs/auth-localhost.crt
+  #     - TLS_KEY_PATH=/certs/auth-localhost.key
+  #     - OTLP_ENDPOINT=http://jaeger:4317
+  #   ports:
+  #     - "8082:8082"  # Auth Controller HTTP/3 API
+  #   volumes:
+  #     - ./infra/docker/certs:/certs:ro  # TLS certificates for HTTPS
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+  #     redis:
+  #       condition: service_healthy
+  #   networks:
+  #     - dark_tower_network
+
   # Global Controller (placeholder - will be built from source)
   # global-controller:
   #   build:
