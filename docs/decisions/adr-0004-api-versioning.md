@@ -32,19 +32,19 @@ Dark Tower exposes multiple HTTP APIs:
 
 ### Versioning Pattern
 
-**All API endpoints include version in path**: `/v{N}/...`
+**All API endpoints include version in path**: `/api/v{N}/...`
 
 **Examples**:
 ```
 Global Controller:
-  POST   /v1/meetings
-  GET    /v1/meetings/{id}
-  DELETE /v1/meetings/{id}
+  POST   /api/v1/meetings
+  GET    /api/v1/meetings/{id}
+  DELETE /api/v1/meetings/{id}
 
 Auth Controller:
-  POST /v1/auth/user/token
-  POST /v1/auth/service/token
-  POST /v1/admin/services/register
+  POST /api/v1/auth/user/token
+  POST /api/v1/auth/service/token
+  POST /api/v1/admin/services/register
 ```
 
 ### Exception: Well-Known URIs
@@ -237,10 +237,10 @@ GET /meetings?api_version=v1
 async fn configure_routes() -> Router {
     Router::new()
         // v1 routes
-        .nest("/v1", v1_routes())
+        .nest("/api/v1", v1_routes())
 
         // v2 routes (future)
-        .nest("/v2", v2_routes())
+        .nest("/api/v2", v2_routes())
 
         // Well-known URIs (no version)
         .route("/.well-known/jwks.json", get(jwks_handler))
@@ -286,8 +286,8 @@ async fn create_meeting_v2(
 
 **OpenAPI/Swagger**: Generate separate specs per version
 ```
-/docs/v1/openapi.json
-/docs/v2/openapi.json
+/api/v1/openapi.json
+/api/v2/openapi.json
 ```
 
 **Changelog**: Document version changes
@@ -301,7 +301,7 @@ async fn create_meeting_v2(
 - Changed `created_at` from Unix timestamp to ISO 8601 string
 
 ### Additions
-- Added `/v2/meetings/{id}/participants` endpoint
+- Added `/api/v2/meetings/{id}/participants` endpoint
 - Added `layout_type` field to meeting settings
 
 ## v1 (2025-01-01)
