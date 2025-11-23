@@ -5,6 +5,7 @@ members = [
     "crates/global-controller",
     "crates/meeting-controller",
     "crates/media-handler",
+    "crates/ac-service",
     "crates/common",
     "crates/proto-gen",
     "crates/media-protocol",
