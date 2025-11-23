@@ -116,7 +116,7 @@ message AssignMeetingResponse {
 
 // Media handler service (Meeting Controller -> Media Handler)
 service MediaHandlerService {
-  rpc RegisterParticipant(RegisterParticipant) returns (RegisterParticipantResponse);
+  rpc Register(RegisterParticipant) returns (RegisterParticipantResponse);
   rpc RouteMedia(RouteMediaCommand) returns (RouteMediaResponse);
   rpc StreamTelemetry(stream MediaTelemetry) returns (TelemetryAck);
 }
@@ -134,7 +134,7 @@ message TelemetryAck {
 service MeetingControllerService {
   rpc RegisterController(RegisterMeetingController) returns (RegistrationResponse);
   rpc SendHeartbeat(Heartbeat) returns (HeartbeatResponse);
-  rpc AssignMeeting(AssignMeeting) returns (AssignMeetingResponse);
+  rpc Assign(AssignMeeting) returns (AssignMeetingResponse);
 }
 
 message RegistrationResponse {
