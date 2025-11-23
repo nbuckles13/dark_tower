@@ -78,9 +78,10 @@ message Participant {
 // Response to join request
 message JoinResponse {
   string participant_id = 1;
-  repeated Participant existing_participants = 2;
-  MediaServerInfo media_server = 3;
-  EncryptionKeys encryption_keys = 4;
+  uint64 user_id = 2;  // 8-byte user ID for media frames
+  repeated Participant existing_participants = 3;
+  repeated MediaServerInfo media_servers = 4;  // Multiple handlers
+  EncryptionKeys encryption_keys = 5;
 }
 
 // Reason for participant leaving
@@ -115,21 +116,66 @@ message StreamPublished {
   MediaStream stream = 2;
 }
 
-// Subscription options for a stream
-message SubscriptionOptions {
-  string preferred_layer = 1;  // For simulcast
-  uint32 max_bitrate = 2;
+// ============================================================================
+// Virtualized Pub/Sub - Layout-based Subscription
+// ============================================================================
+
+// Layout type enumeration
+enum LayoutType {
+  GRID = 0;
+  // Future: STACK = 1, PRESENTATION = 2, etc.
 }
 
-// Request to subscribe to a stream
-message SubscribeStream {
-  string stream_id = 1;
-  SubscriptionOptions options = 2;
+// Media type for stream assignments
+enum MediaType {
+  MEDIA_AUDIO = 0;
+  MEDIA_VIDEO_CAMERA = 1;
+  MEDIA_VIDEO_SCREEN = 2;
 }
 
-// Request to unsubscribe from a stream
-message UnsubscribeStream {
-  string stream_id = 1;
+// Layout configuration
+message LayoutConfig {
+  // For Grid layout
+  uint32 rows = 1;
+  uint32 columns = 2;
+  uint32 max_streams = 3;  // rows * columns
+
+  // Customization
+  repeated uint64 pinned_users = 4;   // Must appear in layout
+  repeated uint64 excluded_users = 5;  // Must not appear
+  bool prefer_video_over_audio = 6;
+  bool include_self = 7;
+}
+
+// Request to subscribe to a layout (replaces individual stream subscription)
+message SubscribeToLayout {
+  LayoutType layout_type = 1;
+  LayoutConfig config = 2;
+  repeated uint32 stream_ids = 3;  // Subscriber-chosen IDs for each slot
+}
+
+// Stream assignment for a layout slot
+message StreamAssignment {
+  uint32 stream_id = 1;        // The subscriber's local stream_id
+  uint64 user_id = 2;           // Source participant
+  MediaType media_type = 3;     // camera, screen, audio
+  uint32 slot_index = 4;        // Position in layout (0-based)
+  string media_handler_url = 5; // Which handler to receive from
+}
+
+// Response with stream assignments for layout
+message StreamAssignments {
+  repeated StreamAssignment assignments = 1;
+}
+
+// Request to update current layout configuration
+message UpdateLayout {
+  LayoutConfig new_config = 1;  // New layout configuration
+}
+
+// Request to unsubscribe from current layout
+message UnsubscribeLayout {
+  // No parameters needed - unsubscribes from current layout
 }
 
 // Stream quality update (bidirectional)
@@ -165,9 +211,10 @@ message ClientMessage {
   oneof message {
     JoinRequest join_request = 1;
     PublishStream publish_stream = 2;
-    SubscribeStream subscribe_stream = 3;
-    UnsubscribeStream unsubscribe_stream = 4;
-    StreamQualityUpdate stream_quality_update = 5;
+    SubscribeToLayout subscribe_to_layout = 3;
+    UpdateLayout update_layout = 4;
+    UnsubscribeLayout unsubscribe_layout = 5;
+    StreamQualityUpdate stream_quality_update = 6;
   }
 }
 
@@ -178,7 +225,8 @@ message ServerMessage {
     ParticipantJoined participant_joined = 2;
     ParticipantLeft participant_left = 3;
     StreamPublished stream_published = 4;
-    StreamQualityUpdate stream_quality_update = 5;
-    ErrorMessage error = 6;
+    StreamAssignments stream_assignments = 5;
+    StreamQualityUpdate stream_quality_update = 6;
+    ErrorMessage error = 7;
   }
 }

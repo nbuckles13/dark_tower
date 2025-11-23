@@ -4,28 +4,67 @@ This document defines the data models for PostgreSQL (persistent storage) and Re
 
 ## PostgreSQL Schema
 
-### 1. Users Table
+### 1. Organizations Table
 
-Stores user account information.
+Stores multi-tenant organization information. Each organization gets a unique subdomain.
+
+```sql
+CREATE TABLE organizations (
+    org_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    subdomain VARCHAR(63) UNIQUE NOT NULL,  -- e.g., 'company1' for company1.dark.com
+    display_name VARCHAR(255) NOT NULL,
+
+    -- Subscription/billing
+    plan_tier VARCHAR(50) NOT NULL DEFAULT 'free',  -- 'free', 'pro', 'enterprise'
+    max_concurrent_meetings INTEGER NOT NULL DEFAULT 10,
+    max_participants_per_meeting INTEGER NOT NULL DEFAULT 100,
+    max_monthly_meeting_minutes BIGINT,
+
+    -- Status
+    is_active BOOLEAN NOT NULL DEFAULT true,
+    suspended_at TIMESTAMPTZ,
+    suspension_reason TEXT,
+
+    -- Metadata
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    metadata JSONB DEFAULT '{}'::jsonb,
+
+    -- Constraints
+    CONSTRAINT subdomain_format CHECK (subdomain ~ '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$')
+);
+
+CREATE INDEX idx_orgs_subdomain ON organizations(subdomain);
+CREATE INDEX idx_orgs_is_active ON organizations(is_active);
+```
+
+### 2. Users Table
+
+Stores user account information. Users belong to an organization.
 
 ```sql
 CREATE TABLE users (
     user_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    email VARCHAR(255) UNIQUE NOT NULL,
+    org_id UUID NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+    email VARCHAR(255) NOT NULL,
     display_name VARCHAR(255) NOT NULL,
     password_hash VARCHAR(255),  -- NULL for OAuth users
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     last_login_at TIMESTAMPTZ,
     is_active BOOLEAN NOT NULL DEFAULT true,
-    metadata JSONB DEFAULT '{}'::jsonb
+    metadata JSONB DEFAULT '{}'::jsonb,
+
+    -- Email is unique within an organization
+    UNIQUE(org_id, email)
 );
 
-CREATE INDEX idx_users_email ON users(email);
+CREATE INDEX idx_users_org_id ON users(org_id);
+CREATE INDEX idx_users_email ON users(org_id, email);
 CREATE INDEX idx_users_created_at ON users(created_at);
 ```
 
-### 2. OAuth Providers Table
+### 3. OAuth Providers Table
 
 Links users to OAuth providers.
 
@@ -46,16 +85,17 @@ CREATE TABLE oauth_providers (
 CREATE INDEX idx_oauth_user_id ON oauth_providers(user_id);
 ```
 
-### 3. Meetings Table
+### 4. Meetings Table
 
-Stores meeting metadata and configuration.
+Stores meeting metadata and configuration. Meetings belong to an organization.
 
 ```sql
 CREATE TABLE meetings (
     meeting_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    org_id UUID NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
     created_by_user_id UUID REFERENCES users(user_id) ON DELETE SET NULL,
     display_name VARCHAR(255) NOT NULL,
-    meeting_code VARCHAR(20) UNIQUE NOT NULL,  -- Short human-readable code
+    meeting_code VARCHAR(20) NOT NULL,  -- Short human-readable code within org
     max_participants INTEGER NOT NULL DEFAULT 100,
 
     -- Settings
@@ -80,14 +120,17 @@ CREATE TABLE meetings (
     metadata JSONB DEFAULT '{}'::jsonb
 );
 
+CREATE INDEX idx_meetings_org_id ON meetings(org_id);
 CREATE INDEX idx_meetings_created_by ON meetings(created_by_user_id);
-CREATE INDEX idx_meetings_meeting_code ON meetings(meeting_code);
-CREATE INDEX idx_meetings_status ON meetings(status);
+CREATE INDEX idx_meetings_status ON meetings(org_id, status);
 CREATE INDEX idx_meetings_scheduled_start ON meetings(scheduled_start_time);
 CREATE INDEX idx_meetings_controller ON meetings(assigned_controller_id);
+
+-- Meeting code is unique within an organization
+CREATE UNIQUE INDEX idx_meetings_org_meeting_code ON meetings(org_id, meeting_code);
 ```
 
-### 4. Meeting Participants Table
+### 5. Meeting Participants Table
 
 Tracks who joined which meetings.
 
@@ -120,7 +163,7 @@ CREATE INDEX idx_participants_user_id ON meeting_participants(user_id);
 CREATE INDEX idx_participants_joined_at ON meeting_participants(joined_at);
 ```
 
-### 5. Recordings Table
+### 6. Recordings Table
 
 Metadata for meeting recordings.
 
@@ -162,7 +205,7 @@ CREATE INDEX idx_recordings_started_by ON recordings(started_by_user_id);
 CREATE INDEX idx_recordings_status ON recordings(status);
 ```
 
-### 6. Meeting Controllers Table
+### 7. Meeting Controllers Table
 
 Tracks registered meeting controllers.
 
@@ -194,7 +237,7 @@ CREATE INDEX idx_controllers_health ON meeting_controllers(health_status);
 CREATE INDEX idx_controllers_heartbeat ON meeting_controllers(last_heartbeat_at);
 ```
 
-### 7. Media Handlers Table
+### 8. Media Handlers Table
 
 Tracks registered media handlers.
 
@@ -228,13 +271,14 @@ CREATE INDEX idx_handlers_region ON media_handlers(region);
 CREATE INDEX idx_handlers_health ON media_handlers(health_status);
 ```
 
-### 8. Audit Logs Table
+### 9. Audit Logs Table
 
 Comprehensive audit trail.
 
 ```sql
 CREATE TABLE audit_logs (
     id BIGSERIAL PRIMARY KEY,
+    org_id UUID REFERENCES organizations(org_id) ON DELETE CASCADE,
     event_type VARCHAR(50) NOT NULL,  -- 'user_login', 'meeting_created', 'participant_joined', etc.
     actor_user_id UUID REFERENCES users(user_id) ON DELETE SET NULL,
     actor_type VARCHAR(50) NOT NULL,  -- 'user', 'system', 'api'
@@ -256,18 +300,19 @@ CREATE TABLE audit_logs (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX idx_audit_event_type ON audit_logs(event_type);
+CREATE INDEX idx_audit_org_id ON audit_logs(org_id);
+CREATE INDEX idx_audit_event_type ON audit_logs(org_id, event_type);
 CREATE INDEX idx_audit_actor ON audit_logs(actor_user_id);
 CREATE INDEX idx_audit_target ON audit_logs(target_type, target_id);
 CREATE INDEX idx_audit_created_at ON audit_logs(created_at);
 
--- Partition by month for better performance
+-- Partition by month for better performance (per-org partitioning in production)
 CREATE TABLE audit_logs_y2025m01 PARTITION OF audit_logs
     FOR VALUES FROM ('2025-01-01') TO ('2025-02-01');
 -- Add more partitions as needed
 ```
 
-### 9. API Keys Table
+### 10. API Keys Table
 
 For programmatic access.
 

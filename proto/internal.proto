@@ -29,22 +29,31 @@ message RoutingOptions {
   bool mix_audio = 4;  // Mix multiple audio streams
 }
 
-// Command to route media between participants
+// Cascading destination for multi-handler routing
+message CascadeDestination {
+  string media_handler_url = 1;
+  repeated string destination_participant_ids = 2;  // Participants on this handler
+}
+
+// Command to route media between participants (supports multi-handler cascading)
 message RouteMediaCommand {
-  string source_stream_id = 1;
-  repeated string destination_participant_ids = 2;
-  RoutingOptions options = 3;
+  uint64 source_user_id = 1;  // Source participant (8-byte user ID)
+  uint32 source_stream_id = 2;  // Source stream (4-byte subscriber ID)
+  repeated string destination_participant_ids = 3;  // Direct destinations on this handler
+  repeated CascadeDestination cascade_destinations = 4;  // Destinations on other handlers
+  RoutingOptions options = 5;
 }
 
 // Media telemetry from media handler to meeting controller
 message MediaTelemetry {
-  string stream_id = 1;
-  uint64 bytes_sent = 2;
-  uint64 bytes_received = 3;
-  float packet_loss = 4;
-  uint32 bitrate = 5;
-  uint32 jitter_ms = 6;
-  uint64 timestamp = 7;
+  uint64 user_id = 1;  // Source participant (8-byte user ID)
+  uint32 stream_id = 2;  // Stream identifier (4-byte)
+  uint64 bytes_sent = 3;
+  uint64 bytes_received = 4;
+  float packet_loss = 5;
+  uint32 bitrate = 6;
+  uint32 jitter_ms = 7;
+  uint64 timestamp = 8;
 }
 
 // ============================================================================

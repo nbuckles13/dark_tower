@@ -18,5 +18,8 @@ uuid = { workspace = true }
 chrono = { workspace = true }
 bytes = { workspace = true }
 
+# Additional dependencies
+rand = "0.8"
+
 [dev-dependencies]
 criterion = { workspace = true }

@@ -21,7 +21,7 @@ Dark Tower uses WebTransport (QUIC) for two primary connection types:
     │    from Global Controller via HTTPS             │
     │                                                  │
     │ 2. WebTransport Connect                         │
-    │    URL: wss://mc.region.dark.com/ws             │
+    │    URL: https://mc.region.dark.com/wt           │
     │─────────────────────────────────────────────────>│
     │                                                  │
     │ 3. TLS 1.3 Handshake + QUIC Connection          │
@@ -219,7 +219,7 @@ If no heartbeat received for 30 seconds, the participant is marked as disconnect
     │    connection_token from Meeting Controller   │
     │                                                │
     │ 2. WebTransport Connect                       │
-    │    URL: wss://mh.region.dark.com:4434         │
+    │    URL: https://mh.region.dark.com:4434       │
     │───────────────────────────────────────────────>│
     │                                                │
     │ 3. TLS 1.3 Handshake + QUIC Connection        │
@@ -243,57 +243,59 @@ If no heartbeat received for 30 seconds, the participant is marked as disconnect
     │                                                │
 ```
 
-### 2.2 Media Stream Mapping
+### 2.2 Media Transport via QUIC Datagrams
 
-Each media stream (audio/video) uses a dedicated QUIC stream:
+**All media frames are sent using QUIC datagrams**, not streams. This provides:
+- Lower latency (no head-of-line blocking)
+- Unreliable delivery (acceptable for real-time media)
+- Automatic flow control at the connection level
 
-- **Outgoing Media**: Client opens unidirectional stream per media source
-- **Incoming Media**: Media Handler opens unidirectional streams to client
+Control messages (layout changes, routing updates) use bidirectional streams.
 
 ```
 Client                                    Media Handler
   │                                              │
-  │ Open UniStream (Stream ID: 4)               │
-  │ Tag: audio, stream_id=abc123                │
+  │ Send Datagram: MediaFrame (audio)           │
+  │ [user_id=0x123, stream_id=0x001]            │
   │───────────────────────────────────────────>│
   │                                              │
-  │ MediaFrame 1 ────────────────────────────>│
-  │ MediaFrame 2 ────────────────────────────>│
-  │ MediaFrame 3 ────────────────────────────>│
+  │ Send Datagram: MediaFrame (video)           │
+  │ [user_id=0x123, stream_id=0x002]            │
+  │───────────────────────────────────────────>│
   │                                              │
   │                                    Route to  │
-  │                                    subscriber│
+  │                                    subscribers│
   │                                              │
-  │                  UniStream (Stream ID: 5)   │
-  │                  Tag: video, stream_id=def456│
+  │          Receive Datagram: MediaFrame       │
+  │          [user_id=0x456, stream_id=0x003]   │
   │<─────────────────────────────────────────────│
   │                                              │
-  │<──────────────────────────────── MediaFrame 1│
-  │<──────────────────────────────── MediaFrame 2│
-  │<──────────────────────────────── MediaFrame 3│
+  │          Receive Datagram: MediaFrame       │
+  │          [user_id=0x456, stream_id=0x004]   │
+  │<─────────────────────────────────────────────│
   │                                              │
 ```
 
-### 2.3 Stream Initialization
+### 2.3 Datagram Flow Control
 
-Each media stream starts with a header message:
+QUIC provides datagram-level flow control:
 
-```
-┌─────────────────────────────────────────────────┐
-│ Stream Header (32 bytes)                        │
-├─────────────────────────────────────────────────┤
-│ Magic (4 bytes): 0x44415254 ("DART")           │
-├─────────────────────────────────────────────────┤
-│ Version (1 byte): 0x01                          │
-├─────────────────────────────────────────────────┤
-│ Stream Type (1 byte): 0x00=Audio, 0x01=Video   │
-├─────────────────────────────────────────────────┤
-│ Stream ID (16 bytes): UUID                      │
-├─────────────────────────────────────────────────┤
-│ Codec (4 bytes): FourCC code                    │
-├─────────────────────────────────────────────────┤
-│ Reserved (6 bytes)                              │
-└─────────────────────────────────────────────────┘
+- Maximum datagram size: Configurable per connection (typically 1200-1500 bytes)
+- No per-stream flow control (datagrams bypass stream mechanisms)
+- Configurable QUIC retransmission for lost datagrams
+- Connection-level congestion control
+
+**Configuration**:
+```rust
+// QUIC datagram configuration
+let mut transport_config = quinn::TransportConfig::default();
+
+// Enable datagrams
+transport_config.datagram_receive_buffer_size(Some(10_000_000)); // 10 MB
+transport_config.datagram_send_buffer_size(10_000_000);
+
+// Configure retransmission for media
+transport_config.max_idle_timeout(Some(Duration::from_secs(30).try_into()?));
 ```
 
 ### 2.4 Media Frame Format
@@ -306,7 +308,9 @@ After the header, each frame follows the format defined in API_CONTRACTS.md:
 ├─────────────────────────────────────────────────────────┤
 │ Frame Type (1 byte)                                     │
 ├─────────────────────────────────────────────────────────┤
-│ Stream ID (16 bytes)                                    │
+│ User ID (8 bytes - participant identifier)             │
+├─────────────────────────────────────────────────────────┤
+│ Stream ID (4 bytes - subscriber-chosen identifier)     │
 ├─────────────────────────────────────────────────────────┤
 │ Timestamp (8 bytes)                                     │
 ├─────────────────────────────────────────────────────────┤
@@ -318,26 +322,39 @@ After the header, each frame follows the format defined in API_CONTRACTS.md:
 ├─────────────────────────────────────────────────────────┤
 │ Reserved (6 bytes)                                      │
 ├─────────────────────────────────────────────────────────┤
-│ Payload (variable)                                      │
+│ Payload (variable length - encrypted with SFrame)      │
 └─────────────────────────────────────────────────────────┘
+
+Total header size: 42 bytes
 ```
 
-### 2.5 Flow Control
+**Stream ID Semantics**:
+- **User ID (8 bytes)**: Assigned by Meeting Controller when participant joins. This is a random 64-bit number that uniquely identifies the participant within the meeting. Shared with all participants via roster distribution.
+- **Stream ID (4 bytes)**: Chosen by the subscriber for their own local bookkeeping. The Meeting Controller maintains a mapping between subscriber's local stream_id and the actual media source.
 
-QUIC provides automatic flow control per stream:
+### 2.5 Bandwidth Adaptation
 
-```rust
-// Server-side flow control
-const MAX_STREAM_BUFFER: usize = 1_048_576; // 1MB
-const MAX_CONNECTION_BUFFER: usize = 10_485_760; // 10MB
+Since media is sent via unreliable datagrams, bandwidth adaptation is critical:
 
-// Configure QUIC transport
-let mut config = quinn::ServerConfig::default();
-config.transport.stream_receive_window(MAX_STREAM_BUFFER as u64);
-config.transport.receive_window(MAX_CONNECTION_BUFFER as u64);
+**Client-Side Adaptation**:
+1. Client monitors packet loss and RTT
+2. Adjusts encoding bitrate dynamically
+3. Switches between simulcast layers if needed
+4. Drops frames if necessary to maintain real-time performance
+
+**Server-Side Feedback**:
+Meeting Controller sends bandwidth estimates via control stream (Protocol Buffer messages):
+
+```protobuf
+message BandwidthEstimate {
+  uint64 estimated_bandwidth_bps = 1;  // bits per second
+  float packet_loss_rate = 2;          // 0.0 to 1.0
+  uint32 rtt_ms = 3;                   // round-trip time
+  uint64 timestamp = 4;                // when measured
+}
 ```
 
-Client adapts to available bandwidth using feedback from Meeting Controller.
+Client uses this feedback to adjust encoding parameters before sending the next frame.
 
 ---
 
@@ -507,16 +524,31 @@ Multiple media streams share single QUIC connection:
 - Better congestion control
 - Simplified firewall traversal
 
-### 3. Datagram Support (Future)
+### 3. Datagram API Usage
 
-For ultra-low latency, use QUIC datagrams:
+Client-side JavaScript for sending media via datagrams:
 
 ```javascript
-// Send unreliable audio frame (datagram mode)
-transport.datagrams.writable.getWriter().write(audioFrame);
+// Get datagram writer
+const datagramWriter = transport.datagrams.writable.getWriter();
+
+// Encode media frame (using media-protocol format)
+const encodedFrame = encodeMediaFrame({
+  user_id: myUserId,
+  stream_id: streamId,
+  frame_type: FrameType.VideoKey,
+  timestamp: performance.now() * 1000,  // microseconds
+  sequence: frameSequence++,
+  flags: { end_of_frame: true, discardable: false },
+  payload: encryptedFrameData  // SFrame encrypted
+});
+
+// Send via datagram
+await datagramWriter.write(encodedFrame);
 ```
 
-Trade-off: Unreliable delivery vs. lower latency
+**Benefits**: Lower latency, no head-of-line blocking
+**Trade-off**: Unreliable delivery (acceptable for real-time media)
 
 ---
 
