@@ -1,0 +1,415 @@
+# Code Review Workflow
+
+## Purpose
+
+This workflow orchestrates a comprehensive multi-specialist code review process for Dark Tower. Similar to the multi-agent debate workflow, this process leverages specialized agents to review code changes from different perspectives before merging.
+
+## When to Use
+
+Trigger this workflow:
+- **Before committing significant changes** (>500 lines or critical components)
+- **For security-sensitive code** (authentication, cryptography, data access)
+- **For new features or major refactors**
+- **When requested by user** for any changeset
+- **As part of CI/CD pipeline** (GitHub PR integration)
+
+## Workflow Overview
+
+```
+1. Identify Changes
+   ↓
+2. Determine Relevant ADRs
+   ↓
+3. Parallel Specialist Reviews
+   ├─→ Code Reviewer (quality, maintainability, Rust idioms)
+   ├─→ Security Specialist (vulnerabilities, crypto, auth)
+   └─→ Test Specialist (coverage, edge cases, test quality)
+   ↓
+4. Synthesize Findings
+   ↓
+5. Generate Action Plan
+   ↓
+6. Present to User
+```
+
+## Workflow Steps
+
+### Step 1: Identify Changes
+
+**Orchestrator Action**:
+1. Determine what files changed (use `git diff` or list of modified files)
+2. Calculate scope:
+   - Line count
+   - Number of files
+   - Components affected (auth, database, API, media, etc.)
+3. Classify change type:
+   - New feature
+   - Bug fix
+   - Refactor
+   - Security update
+   - Performance optimization
+
+**Output**: Change summary document
+
+### Step 2: Determine Relevant ADRs
+
+**Orchestrator Action**:
+1. List all ADRs in `docs/decisions/`
+2. Map changes to relevant ADRs based on:
+   - File paths (e.g., `crates/ac-service/` → ADR-0003)
+   - Keywords (e.g., "JWT", "OAuth" → ADR-0003)
+   - Component tags in ADR metadata
+3. Create focused ADR list (typically 2-5 ADRs per review)
+
+**Output**: List of relevant ADRs with compliance requirements
+
+### Step 3: Parallel Specialist Reviews
+
+Run three specialists in parallel (three separate Task tool calls in a single message):
+
+#### Review A: Code Reviewer Specialist
+
+**Focus**: Code quality, maintainability, Rust best practices
+
+**Inputs**:
+- List of changed files
+- Relevant ADRs (for API design, error handling patterns)
+- Change context
+
+**Deliverables**:
+- Code quality assessment
+- Rust idiom violations
+- Maintainability concerns
+- Documentation gaps
+- Architecture consistency check
+- Issues categorized by severity (BLOCKER, CRITICAL, MAJOR, MINOR, SUGGESTION)
+
+#### Review B: Security Specialist
+
+**Focus**: Security vulnerabilities, cryptographic correctness, authentication/authorization
+
+**Inputs**:
+- List of changed files
+- Relevant ADRs (security, authentication)
+- Security-focused context
+
+**Deliverables**:
+- Security vulnerability assessment
+- Cryptographic implementation review
+- Authentication/authorization validation
+- Input validation check
+- Secret management review
+- OWASP/CWE mapping
+- Issues categorized by severity (CRITICAL, HIGH, MEDIUM, LOW)
+
+#### Review C: Test Specialist
+
+**Focus**: Test coverage, test quality, edge cases
+
+**Inputs**:
+- List of changed files
+- Test files
+- Coverage reports (if available)
+
+**Deliverables**:
+- Test coverage analysis
+- Missing test cases (critical paths, edge cases, error paths)
+- Test quality assessment
+- Integration test needs
+- Performance test recommendations
+- Coverage gaps categorized by priority (CRITICAL, HIGH, MEDIUM, LOW)
+
+### Step 4: Synthesize Findings
+
+**Orchestrator Action**:
+1. Collect all three specialist reports
+2. Identify overlapping concerns
+3. Prioritize issues by severity:
+   - **BLOCKER**: Must fix before merge (security critical, data loss, ADR violation)
+   - **CRITICAL**: Should fix before merge (performance, major quality issues)
+   - **MAJOR**: Should address soon (code smell, missing tests)
+   - **MINOR**: Nice to have (style, optimization)
+   - **SUGGESTION**: Future improvements
+4. Create consolidated findings document
+5. Check for conflicts between specialist recommendations
+
+**Output**: Unified code review report
+
+### Step 5: Generate Action Plan
+
+**Orchestrator Action**:
+1. For each BLOCKER/CRITICAL issue, propose specific fix
+2. Estimate effort for each fix
+3. Identify quick wins vs. substantial refactors
+4. Create prioritized task list
+5. Determine overall recommendation:
+   - ✅ **APPROVE**: Ready to merge
+   - ⚠️ **APPROVE WITH MINOR CHANGES**: Can merge after minor fixes
+   - 🔄 **REQUEST CHANGES**: Must address blocker/critical issues
+   - ❌ **REJECT**: Fundamental issues, needs redesign
+
+**Output**: Action plan with specific next steps
+
+### Step 6: Present to User
+
+**Orchestrator Action**:
+1. Present consolidated review report
+2. Highlight top 3-5 most important issues
+3. Show action plan
+4. Present overall recommendation
+5. Ask user:
+   - Should we address findings now?
+   - Which issues to prioritize?
+   - Approve action plan?
+
+**Output**: User-friendly review summary
+
+## Specialist Coordination
+
+### How Specialists Communicate
+
+Specialists don't directly communicate. The orchestrator (Claude):
+1. Runs all specialists in parallel (single message, multiple Task calls)
+2. Receives all reports
+3. Synthesizes findings
+4. Resolves conflicts or ambiguities
+5. Creates unified view
+
+### Handling Conflicting Recommendations
+
+If specialists disagree:
+1. **Security > Performance**: Security concerns always win
+2. **ADR Compliance > Style**: Architectural standards take precedence
+3. **Explicit > Implicit**: Documented decisions override preferences
+4. **User Decision**: Present conflict to user for final call
+
+## Review Document Template
+
+```markdown
+# Code Review Report: [Component Name]
+
+**Date**: [YYYY-MM-DD]
+**Reviewers**: Code Reviewer, Security Specialist, Test Specialist
+**Scope**: [X files, Y lines changed]
+**Change Type**: [Feature/Bugfix/Refactor/etc.]
+
+## Executive Summary
+[2-3 sentence overview of changes and overall quality]
+
+## Overall Recommendation
+- [ ] ✅ APPROVE
+- [ ] ⚠️ APPROVE WITH MINOR CHANGES
+- [ ] 🔄 REQUEST CHANGES (current recommendation)
+- [ ] ❌ REJECT
+
+## Critical Findings
+
+### 🔴 BLOCKER Issues (Must Fix Before Merge)
+1. [Issue description] - **[Specialist]** - `file.rs:123`
+   - Impact: [Security/Data Loss/ADR Violation]
+   - Fix: [Specific action required]
+
+### 🟠 CRITICAL Issues (Should Fix Before Merge)
+[List with file references and proposed fixes]
+
+## By Specialist
+
+### Code Quality Review
+[Code Reviewer findings summary]
+- Positive highlights
+- Issues found
+- Recommendations
+
+### Security Review
+[Security Specialist findings summary]
+- Vulnerabilities identified
+- Cryptographic concerns
+- Authentication/authorization issues
+- Recommendations
+
+### Test Coverage Review
+[Test Specialist findings summary]
+- Coverage percentage
+- Missing test cases
+- Test quality issues
+- Recommendations
+
+## ADR Compliance
+[Relevant ADRs and compliance status]
+- ✅ ADR-XXXX: Compliant
+- ⚠️ ADR-YYYY: Partial compliance (details...)
+- ❌ ADR-ZZZZ: Non-compliant (must address)
+
+## Action Plan
+
+### Immediate Actions (Before Merge)
+1. [Action] - Est: [time] - Priority: BLOCKER
+2. [Action] - Est: [time] - Priority: CRITICAL
+
+### Follow-up Actions (Next Sprint)
+1. [Action] - Est: [time] - Priority: MAJOR
+2. [Action] - Est: [time] - Priority: MINOR
+
+### Future Improvements
+- [Suggestion 1]
+- [Suggestion 2]
+
+## Metrics
+- Files reviewed: X
+- Lines reviewed: Y
+- Issues found: Z
+  - Blocker: A
+  - Critical: B
+  - Major: C
+  - Minor: D
+- Estimated fix time: [hours]
+
+## Next Steps
+[Specific instructions for addressing findings]
+```
+
+## Integration with Development Workflow
+
+### Pre-commit Review (Manual)
+```bash
+# User requests review
+User: "Review the auth controller changes before committing"
+
+# Orchestrator runs workflow
+Claude: [Identifies changes, determines ADRs, runs 3 specialists in parallel]
+Claude: [Synthesizes findings, creates action plan]
+Claude: [Presents report and recommendations]
+
+# User decides
+User: "Let's fix the blocker issues first"
+Claude: [Addresses findings]
+Claude: [Re-runs review if needed]
+Claude: [Commits when approved]
+```
+
+### GitHub PR Review (Future)
+
+**Architecture**: Custom GitHub Action using Dark Tower specialists
+
+The GitHub Action will:
+1. Clone repository including `.claude/` directory
+2. Read specialist definitions from `.claude/agents/*.md`
+3. Read workflow from `.claude/workflows/code-review.md`
+4. Call Claude API with our custom specialist prompts
+5. Execute the same review process as local workflow
+6. Post consolidated review as PR comment
+7. Post individual findings as inline code comments
+8. Set PR status (approve/request changes/block merge)
+
+**Benefits**:
+- ✅ Uses project-specific specialists with ADR knowledge
+- ✅ Consistent review criteria (local and CI)
+- ✅ Specialists evolve with project
+- ✅ Domain expertise (Auth Controller, Security, etc.)
+- ✅ Full control over review process
+
+**Implementation** (Phase 2 - Future):
+```yaml
+# .github/workflows/code-review.yml
+name: Dark Tower Code Review
+on: pull_request
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          fetch-depth: 0  # Full history for git diff
+
+      - name: Dark Tower Code Review
+        uses: ./.github/actions/dark-tower-review
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          specialists_path: .claude/agents
+          workflow_path: .claude/workflows/code-review.md
+          post_comments: true
+          block_on_blocker: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+```
+
+**Custom Action** (`.github/actions/dark-tower-review/action.yml`):
+- Written in TypeScript or Python
+- Reads specialist definitions dynamically
+- Constructs Claude API prompts
+- Runs parallel specialist reviews
+- Synthesizes findings
+- Posts to GitHub PR
+
+**Why Custom Action Over Generic**:
+- Generic reviewers don't know Dark Tower's ADRs, OAuth flows, debate decisions
+- Our specialists encode institutional knowledge
+- Project-specific security requirements (EdDSA, AES-256-GCM, bcrypt cost)
+- Consistent with local development workflow
+
+## Quality Gates
+
+### Merge Criteria
+
+**Required**:
+- ✅ No BLOCKER issues
+- ✅ All CRITICAL security issues addressed
+- ✅ ADR compliance (no violations)
+- ✅ Builds successfully
+- ✅ All existing tests pass
+
+**Recommended**:
+- ⚠️ No CRITICAL quality issues
+- ⚠️ Test coverage > 80% for new code
+- ⚠️ No major performance regressions
+
+**Nice to Have**:
+- 💡 MAJOR issues addressed
+- 💡 Test coverage > 90%
+- 💡 Documentation complete
+
+## Success Metrics
+
+Track over time:
+- **Review Turnaround Time**: < 30 minutes for typical PR
+- **Defect Detection Rate**: > 90% of bugs caught pre-merge
+- **False Positive Rate**: < 10% of issues invalid
+- **Rework Rate**: < 20% of PRs require major changes
+- **Security Vulnerability Escape Rate**: 0% critical vulnerabilities to production
+
+## Tips for Effective Reviews
+
+**For Orchestrator**:
+- Be thorough but pragmatic
+- Focus specialist attention on high-risk areas
+- Don't let perfect be the enemy of good
+- Security is non-negotiable
+- Provide actionable, specific feedback
+
+**For Specialists**:
+- Be constructive, not critical
+- Explain *why*, not just *what*
+- Suggest solutions, not just problems
+- Acknowledge good code
+- Reference standards (ADRs, RFCs, best practices)
+
+**For Users**:
+- Don't skip reviews for "quick fixes"
+- Address BLOCKER issues before requesting re-review
+- Ask questions if recommendations unclear
+- Push back on low-value feedback
+- Treat reviews as learning opportunities
+
+## Continuous Improvement
+
+After each review:
+1. Collect feedback on review quality
+2. Track recurring issues (opportunities for tooling/linting)
+3. Update specialist prompts based on learnings
+4. Refine severity criteria if needed
+5. Adjust process for efficiency
+
+---
+
+**Remember**: The goal is **high-quality, secure code delivered rapidly**. Reviews should enable confidence, not create bottlenecks. Be thorough on security, pragmatic on style.
