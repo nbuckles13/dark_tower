@@ -7,7 +7,7 @@ use axum::{
     http::HeaderMap,
     Json,
 };
-use base64::{Engine as _, engine::general_purpose};
+use base64::{engine::general_purpose, Engine as _};
 use serde::Deserialize;
 use sqlx::PgPool;
 use std::net::SocketAddr;
@@ -122,8 +122,8 @@ fn extract_client_credentials(
                 .decode(basic_auth)
                 .map_err(|_| AcError::InvalidCredentials)?;
 
-            let credentials = String::from_utf8(decoded)
-                .map_err(|_| AcError::InvalidCredentials)?;
+            let credentials =
+                String::from_utf8(decoded).map_err(|_| AcError::InvalidCredentials)?;
 
             return match credentials.splitn(2, ':').collect::<Vec<_>>().as_slice() {
                 [username, password] => Ok((username.to_string(), password.to_string())),

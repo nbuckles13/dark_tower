@@ -7,6 +7,7 @@
 #![allow(clippy::module_name_repetitions)]
 #![allow(clippy::missing_errors_doc)]
 #![allow(clippy::must_use_candidate)]
+#![allow(clippy::doc_markdown)] // Generated code has various doc formatting
 
 // Re-export prost traits for convenience
 pub use prost::Message;

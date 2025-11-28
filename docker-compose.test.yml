@@ -1,0 +1,48 @@
+# Docker Compose for local testing
+#
+# Provides PostgreSQL database for integration and E2E tests.
+# Usage: docker-compose -f docker-compose.test.yml up -d
+
+version: '3.8'
+
+services:
+  postgres-test:
+    image: postgres:16-alpine
+    container_name: dark-tower-postgres-test
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: dark_tower_test
+    ports:
+      - "5433:5432"  # Use 5433 to avoid conflicts with production DB on 5432
+    volumes:
+      - postgres-test-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - dark-tower-test
+
+  # Redis for future testing needs (optional, not yet used)
+  redis-test:
+    image: redis:7-alpine
+    container_name: dark-tower-redis-test
+    ports:
+      - "6380:6379"  # Use 6380 to avoid conflicts
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - dark-tower-test
+
+volumes:
+  postgres-test-data:
+    driver: local
+
+networks:
+  dark-tower-test:
+    driver: bridge

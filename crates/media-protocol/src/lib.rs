@@ -5,6 +5,6 @@
 
 #![warn(clippy::pedantic)]
 
-pub mod frame;
 pub mod codec;
+pub mod frame;
 pub mod stream;

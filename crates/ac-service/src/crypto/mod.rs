@@ -1,6 +1,6 @@
 use crate::errors::AcError;
-use base64::{Engine as _, engine::general_purpose};
-use jsonwebtoken::{encode, decode, Header, Validation, Algorithm, EncodingKey, DecodingKey};
+use base64::{engine::general_purpose, Engine as _};
+use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use ring::{
     aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM},
     rand::{SecureRandom, SystemRandom},
@@ -11,20 +11,20 @@ use serde::{Deserialize, Serialize};
 /// JWT Claims structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Claims {
-    pub sub: String,           // Subject (user_id or client_id)
-    pub exp: i64,              // Expiration timestamp
-    pub iat: i64,              // Issued at timestamp
-    pub scope: String,         // Space-separated scopes
+    pub sub: String,   // Subject (user_id or client_id)
+    pub exp: i64,      // Expiration timestamp
+    pub iat: i64,      // Issued at timestamp
+    pub scope: String, // Space-separated scopes
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub service_type: Option<String>,  // Service type for service tokens
+    pub service_type: Option<String>, // Service type for service tokens
 }
 
 /// Encrypted key structure (AES-256-GCM)
 #[derive(Debug, Clone)]
 pub struct EncryptedKey {
     pub encrypted_data: Vec<u8>,
-    pub nonce: Vec<u8>,        // 96-bit (12 bytes)
-    pub tag: Vec<u8>,          // 128-bit (16 bytes)
+    pub nonce: Vec<u8>, // 96-bit (12 bytes)
+    pub tag: Vec<u8>,   // 128-bit (16 bytes)
 }
 
 /// Generate EdDSA (Ed25519) keypair using CSPRNG
@@ -34,17 +34,15 @@ pub fn generate_signing_key() -> Result<(String, Vec<u8>), AcError> {
     let rng = SystemRandom::new();
 
     // Generate Ed25519 keypair in PKCS8 format
-    let pkcs8_bytes = Ed25519KeyPair::generate_pkcs8(&rng)
-        .map_err(|e| {
-            tracing::error!(target: "crypto", error = ?e, "Keypair generation failed");
-            AcError::Crypto("Key generation failed".to_string())
-        })?;
+    let pkcs8_bytes = Ed25519KeyPair::generate_pkcs8(&rng).map_err(|e| {
+        tracing::error!(target: "crypto", error = ?e, "Keypair generation failed");
+        AcError::Crypto("Key generation failed".to_string())
+    })?;
 
-    let key_pair = Ed25519KeyPair::from_pkcs8(pkcs8_bytes.as_ref())
-        .map_err(|e| {
-            tracing::error!(target: "crypto", error = ?e, "Keypair parsing failed");
-            AcError::Crypto("Key generation failed".to_string())
-        })?;
+    let key_pair = Ed25519KeyPair::from_pkcs8(pkcs8_bytes.as_ref()).map_err(|e| {
+        tracing::error!(target: "crypto", error = ?e, "Keypair parsing failed");
+        AcError::Crypto("Key generation failed".to_string())
+    })?;
 
     // Get public key bytes
     let public_key_bytes = key_pair.public_key().as_ref();
@@ -71,20 +69,18 @@ pub fn encrypt_private_key(private_key: &[u8], master_key: &[u8]) -> Result<Encr
 
     // Generate random 96-bit nonce (12 bytes)
     let mut nonce_bytes = [0u8; 12];
-    rng.fill(&mut nonce_bytes)
-        .map_err(|e| {
-            tracing::error!(target: "crypto", error = ?e, "Nonce generation failed");
-            AcError::Crypto("Encryption failed".to_string())
-        })?;
+    rng.fill(&mut nonce_bytes).map_err(|e| {
+        tracing::error!(target: "crypto", error = ?e, "Nonce generation failed");
+        AcError::Crypto("Encryption failed".to_string())
+    })?;
 
     let nonce = Nonce::assume_unique_for_key(nonce_bytes);
 
     // Create AES-256-GCM cipher
-    let unbound_key = UnboundKey::new(&AES_256_GCM, master_key)
-        .map_err(|e| {
-            tracing::error!(target: "crypto", error = ?e, "Cipher key creation failed");
-            AcError::Crypto("Encryption failed".to_string())
-        })?;
+    let unbound_key = UnboundKey::new(&AES_256_GCM, master_key).map_err(|e| {
+        tracing::error!(target: "crypto", error = ?e, "Cipher key creation failed");
+        AcError::Crypto("Encryption failed".to_string())
+    })?;
     let sealing_key = LessSafeKey::new(unbound_key);
 
     // Encrypt the private key (in-place operation requires mutable buffer)
@@ -109,7 +105,10 @@ pub fn encrypt_private_key(private_key: &[u8], master_key: &[u8]) -> Result<Encr
 }
 
 /// Decrypt private key with AES-256-GCM
-pub fn decrypt_private_key(encrypted: &EncryptedKey, master_key: &[u8]) -> Result<Vec<u8>, AcError> {
+pub fn decrypt_private_key(
+    encrypted: &EncryptedKey,
+    master_key: &[u8],
+) -> Result<Vec<u8>, AcError> {
     if master_key.len() != 32 {
         tracing::error!(target: "crypto", "Invalid master key length: {}", master_key.len());
         return Err(AcError::Crypto("Invalid decryption key".to_string()));
@@ -129,19 +128,17 @@ pub fn decrypt_private_key(encrypted: &EncryptedKey, master_key: &[u8]) -> Resul
     let mut in_out = encrypted.encrypted_data.clone();
     in_out.extend_from_slice(&encrypted.tag);
 
-    let nonce_bytes: [u8; 12] = encrypted.nonce.as_slice().try_into()
-        .map_err(|_| {
-            tracing::error!(target: "crypto", "Invalid nonce format");
-            AcError::Crypto("Decryption failed".to_string())
-        })?;
+    let nonce_bytes: [u8; 12] = encrypted.nonce.as_slice().try_into().map_err(|_| {
+        tracing::error!(target: "crypto", "Invalid nonce format");
+        AcError::Crypto("Decryption failed".to_string())
+    })?;
     let nonce = Nonce::assume_unique_for_key(nonce_bytes);
 
     // Create AES-256-GCM cipher
-    let unbound_key = UnboundKey::new(&AES_256_GCM, master_key)
-        .map_err(|e| {
-            tracing::error!(target: "crypto", error = ?e, "Cipher key creation failed");
-            AcError::Crypto("Decryption failed".to_string())
-        })?;
+    let unbound_key = UnboundKey::new(&AES_256_GCM, master_key).map_err(|e| {
+        tracing::error!(target: "crypto", error = ?e, "Cipher key creation failed");
+        AcError::Crypto("Decryption failed".to_string())
+    })?;
     let opening_key = LessSafeKey::new(unbound_key);
 
     // Decrypt in place
@@ -158,11 +155,10 @@ pub fn decrypt_private_key(encrypted: &EncryptedKey, master_key: &[u8]) -> Resul
 /// Sign JWT with EdDSA private key
 pub fn sign_jwt(claims: &Claims, private_key_pkcs8: &[u8]) -> Result<String, AcError> {
     // Validate the private key format
-    let _key_pair = Ed25519KeyPair::from_pkcs8(private_key_pkcs8)
-        .map_err(|e| {
-            tracing::error!(target: "crypto", error = ?e, "Invalid private key format");
-            AcError::Crypto("JWT signing failed".to_string())
-        })?;
+    let _key_pair = Ed25519KeyPair::from_pkcs8(private_key_pkcs8).map_err(|e| {
+        tracing::error!(target: "crypto", error = ?e, "Invalid private key format");
+        AcError::Crypto("JWT signing failed".to_string())
+    })?;
 
     // Get the raw private key bytes for jsonwebtoken
     // Ed25519KeyPair doesn't expose the seed directly, so we need to use the PKCS8 format
@@ -171,11 +167,10 @@ pub fn sign_jwt(claims: &Claims, private_key_pkcs8: &[u8]) -> Result<String, AcE
     let mut header = Header::new(Algorithm::EdDSA);
     header.typ = Some("JWT".to_string());
 
-    let token = encode(&header, claims, &encoding_key)
-        .map_err(|e| {
-            tracing::error!(target: "crypto", error = ?e, "JWT signing operation failed");
-            AcError::Crypto("JWT signing failed".to_string())
-        })?;
+    let token = encode(&header, claims, &encoding_key).map_err(|e| {
+        tracing::error!(target: "crypto", error = ?e, "JWT signing operation failed");
+        AcError::Crypto("JWT signing failed".to_string())
+    })?;
 
     Ok(token)
 }
@@ -200,42 +195,38 @@ pub fn verify_jwt(token: &str, public_key_pem: &str) -> Result<Claims, AcError> 
     let mut validation = Validation::new(Algorithm::EdDSA);
     validation.validate_exp = true;
 
-    let token_data = decode::<Claims>(token, &decoding_key, &validation)
-        .map_err(|e| {
-            tracing::debug!(target: "crypto", error = ?e, "Token verification failed");
-            AcError::InvalidToken("The access token is invalid or expired".to_string())
-        })?;
+    let token_data = decode::<Claims>(token, &decoding_key, &validation).map_err(|e| {
+        tracing::debug!(target: "crypto", error = ?e, "Token verification failed");
+        AcError::InvalidToken("The access token is invalid or expired".to_string())
+    })?;
 
     Ok(token_data.claims)
 }
 
 /// Hash client secret with bcrypt (cost factor 12)
 pub fn hash_client_secret(secret: &str) -> Result<String, AcError> {
-    bcrypt::hash(secret, 12)
-        .map_err(|e| {
-            tracing::error!(target: "crypto", error = ?e, "Password hashing failed");
-            AcError::Crypto("Password hashing failed".to_string())
-        })
+    bcrypt::hash(secret, 12).map_err(|e| {
+        tracing::error!(target: "crypto", error = ?e, "Password hashing failed");
+        AcError::Crypto("Password hashing failed".to_string())
+    })
 }
 
 /// Verify client secret against bcrypt hash
 pub fn verify_client_secret(secret: &str, hash: &str) -> Result<bool, AcError> {
-    bcrypt::verify(secret, hash)
-        .map_err(|e| {
-            tracing::error!(target: "crypto", error = ?e, "Password verification failed");
-            AcError::Crypto("Password verification failed".to_string())
-        })
+    bcrypt::verify(secret, hash).map_err(|e| {
+        tracing::error!(target: "crypto", error = ?e, "Password verification failed");
+        AcError::Crypto("Password verification failed".to_string())
+    })
 }
 
 /// Generate cryptographically secure random bytes
 pub fn generate_random_bytes(len: usize) -> Result<Vec<u8>, AcError> {
     let rng = SystemRandom::new();
     let mut bytes = vec![0u8; len];
-    rng.fill(&mut bytes)
-        .map_err(|e| {
-            tracing::error!(target: "crypto", error = ?e, "Random bytes generation failed");
-            AcError::Crypto("Random generation failed".to_string())
-        })?;
+    rng.fill(&mut bytes).map_err(|e| {
+        tracing::error!(target: "crypto", error = ?e, "Random bytes generation failed");
+        AcError::Crypto("Random generation failed".to_string())
+    })?;
     Ok(bytes)
 }
 
@@ -404,7 +395,7 @@ mod tests {
 
         assert!(result.is_err());
         match result {
-            Err(AcError::InvalidToken(_)) => {},
+            Err(AcError::InvalidToken(_)) => {}
             _ => panic!("Expected InvalidToken error for expired token"),
         }
     }
@@ -427,7 +418,7 @@ mod tests {
 
         assert!(result.is_err());
         match result {
-            Err(AcError::InvalidToken(_)) => {},
+            Err(AcError::InvalidToken(_)) => {}
             _ => panic!("Expected InvalidToken error for wrong public key"),
         }
     }

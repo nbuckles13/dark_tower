@@ -84,7 +84,8 @@ pub async fn initialize_signing_key(
             "valid_until": valid_until.to_rfc3339(),
         })),
     )
-    .await {
+    .await
+    {
         tracing::warn!("Failed to log auth event: {}", e);
     }
 
@@ -92,6 +93,7 @@ pub async fn initialize_signing_key(
 }
 
 /// Rotate signing keys (generate new key, mark old keys as inactive)
+#[allow(dead_code)] // Will be used in Phase 4 key rotation endpoints
 pub async fn rotate_signing_key(
     pool: &PgPool,
     master_key: &[u8],
@@ -146,7 +148,8 @@ pub async fn rotate_signing_key(
             "valid_until": valid_until.to_rfc3339(),
         })),
     )
-    .await {
+    .await
+    {
         tracing::warn!("Failed to log auth event: {}", e);
     }
 
@@ -173,11 +176,11 @@ pub async fn get_jwks(pool: &PgPool) -> Result<Jwks, AcError> {
 
             JsonWebKey {
                 kid: key.key_id,
-                kty: "OKP".to_string(),        // Octet Key Pair for EdDSA
-                crv: "Ed25519".to_string(),    // Curve
-                x: public_key_b64,             // Public key
-                use_: "sig".to_string(),       // Signature use
-                alg: "EdDSA".to_string(),      // Algorithm
+                kty: "OKP".to_string(),     // Octet Key Pair for EdDSA
+                crv: "Ed25519".to_string(), // Curve
+                x: public_key_b64,          // Public key
+                use_: "sig".to_string(),    // Signature use
+                alg: "EdDSA".to_string(),   // Algorithm
             }
         })
         .collect();
@@ -188,6 +191,7 @@ pub async fn get_jwks(pool: &PgPool) -> Result<Jwks, AcError> {
 }
 
 /// Check and mark expired keys as inactive
+#[allow(dead_code)] // Will be used in Phase 4 background tasks
 pub async fn expire_old_keys(_pool: &PgPool) -> Result<Vec<String>, AcError> {
     // This would be called periodically by a background task
     // For now, it's a placeholder that could be implemented in Phase 4

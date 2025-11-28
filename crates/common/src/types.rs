@@ -65,6 +65,12 @@ impl Default for ParticipantId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct UserId(pub u64);
 
+impl Default for UserId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl UserId {
     /// Create a new random user ID
     #[must_use]
@@ -84,7 +90,7 @@ impl UserId {
 ///
 /// This is a local identifier chosen by the subscriber for their
 /// own bookkeeping. The Meeting Controller maintains a mapping
-/// between the subscriber's stream_id and the actual media source.
+/// between the subscriber's `stream_id` and the actual media source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct StreamId(pub u32);
 

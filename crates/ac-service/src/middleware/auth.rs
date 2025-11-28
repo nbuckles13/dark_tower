@@ -29,12 +29,16 @@ pub async fn require_admin_scope(
         .headers()
         .get("authorization")
         .and_then(|h| h.to_str().ok())
-        .ok_or(AcError::InvalidToken("Missing Authorization header".to_string()))?;
+        .ok_or(AcError::InvalidToken(
+            "Missing Authorization header".to_string(),
+        ))?;
 
     // Extract Bearer token
     let token = auth_header
         .strip_prefix("Bearer ")
-        .ok_or(AcError::InvalidToken("Invalid Authorization header format".to_string()))?;
+        .ok_or(AcError::InvalidToken(
+            "Invalid Authorization header format".to_string(),
+        ))?;
 
     // Get active signing key for verification
     let signing_key = signing_keys::get_active_key(&state.pool)

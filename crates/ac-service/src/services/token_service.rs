@@ -10,6 +10,7 @@ const TOKEN_EXPIRY_SECONDS: i64 = 3600; // 1 hour
 /// Issue a service token using OAuth 2.0 Client Credentials flow
 ///
 /// Verifies client credentials, generates JWT with scopes, logs event
+#[allow(clippy::too_many_arguments)] // OAuth 2.0 token endpoint requires many params
 pub async fn issue_service_token(
     pool: &PgPool,
     master_key: &[u8],
@@ -31,11 +32,9 @@ pub async fn issue_service_token(
     // Check for account lockout (prevent brute force)
     if let Some(ref cred) = credential {
         let fifteen_mins_ago = Utc::now() - chrono::Duration::minutes(15);
-        let failed_count = auth_events::get_failed_attempts_count(
-            pool,
-            &cred.credential_id,
-            fifteen_mins_ago
-        ).await?;
+        let failed_count =
+            auth_events::get_failed_attempts_count(pool, &cred.credential_id, fifteen_mins_ago)
+                .await?;
 
         if failed_count >= 5 {
             tracing::warn!(
@@ -66,12 +65,17 @@ pub async fn issue_service_token(
             None,
             Some(credential.credential_id),
             false,
-            Some(if !credential.is_active { "Credential is inactive" } else { "Invalid client secret" }),
+            Some(if !credential.is_active {
+                "Credential is inactive"
+            } else {
+                "Invalid client secret"
+            }),
             ip_address,
             user_agent,
             None,
         )
-        .await {
+        .await
+        {
             tracing::warn!("Failed to log auth event: {}", e);
         }
 
@@ -81,9 +85,7 @@ pub async fn issue_service_token(
     // Determine scopes (use requested scopes if provided and valid, otherwise use default)
     let scopes = if let Some(req_scopes) = requested_scopes {
         // Verify requested scopes are subset of allowed scopes
-        let all_valid = req_scopes
-            .iter()
-            .all(|s| credential.scopes.contains(s));
+        let all_valid = req_scopes.iter().all(|s| credential.scopes.contains(s));
 
         if !all_valid {
             return Err(AcError::InsufficientScope {
@@ -138,7 +140,8 @@ pub async fn issue_service_token(
             "scopes": scopes,
         })),
     )
-    .await {
+    .await
+    {
         tracing::warn!("Failed to log auth event: {}", e);
     }
 
@@ -154,10 +157,10 @@ pub async fn issue_service_token(
 ///
 /// This is a simplified implementation for future use
 pub async fn issue_user_token(
-    pool: &PgPool,
-    master_key: &[u8],
-    username: &str,
-    password: &str,
+    _pool: &PgPool,
+    _master_key: &[u8],
+    _username: &str,
+    _password: &str,
 ) -> Result<TokenResponse, AcError> {
     // NOTE: In Phase 1, we don't have a users table yet
     // This is a placeholder that would need to:

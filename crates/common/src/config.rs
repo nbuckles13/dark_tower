@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 /// Database configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DatabaseConfig {
-    /// PostgreSQL connection string
+    /// `PostgreSQL` connection string
     pub postgres_url: String,
     /// Maximum number of connections in the pool
     pub max_connections: u32,

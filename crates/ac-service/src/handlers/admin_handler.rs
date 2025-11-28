@@ -33,12 +33,9 @@ pub async fn handle_register_service(
     }
 
     // Register the service
-    let response = registration_service::register_service(
-        &state.pool,
-        &payload.service_type,
-        payload.region,
-    )
-    .await?;
+    let response =
+        registration_service::register_service(&state.pool, &payload.service_type, payload.region)
+            .await?;
 
     Ok(Json(response))
 }

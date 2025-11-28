@@ -59,7 +59,7 @@ impl FrameFlags {
 /// - Payload Length: 4 bytes
 /// - Flags: 2 bytes
 /// - Reserved: 6 bytes
-/// - Payload: variable (SFrame encrypted)
+/// - Payload: variable (`SFrame` encrypted)
 #[derive(Debug, Clone)]
 pub struct MediaFrame {
     /// Protocol version (currently 1)
