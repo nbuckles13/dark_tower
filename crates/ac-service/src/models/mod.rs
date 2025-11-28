@@ -5,6 +5,7 @@ use uuid::Uuid;
 
 /// Service credential model (maps to service_credentials table)
 #[derive(Debug, Clone, FromRow)]
+#[allow(dead_code)] // Some fields used only in Phase 4 admin endpoints
 pub struct ServiceCredential {
     pub credential_id: Uuid,
     pub client_id: String,
@@ -19,6 +20,7 @@ pub struct ServiceCredential {
 
 /// Signing key model (maps to signing_keys table)
 #[derive(Debug, Clone, FromRow)]
+#[allow(dead_code)] // Some fields used only in Phase 4 admin/JWKS endpoints
 pub struct SigningKey {
     pub key_id: String,
     pub public_key: String,
@@ -36,6 +38,7 @@ pub struct SigningKey {
 
 /// Auth event model (maps to auth_events table)
 #[derive(Debug, Clone, FromRow)]
+#[allow(dead_code)] // Used only in Phase 4 audit/monitoring endpoints
 pub struct AuthEvent {
     pub event_id: Uuid,
     pub event_type: String,
@@ -76,13 +79,13 @@ pub struct Jwks {
 /// JSON Web Key (RFC 7517)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JsonWebKey {
-    pub kid: String,           // Key ID
-    pub kty: String,           // Key Type (e.g., "OKP" for EdDSA)
-    pub crv: String,           // Curve (e.g., "Ed25519")
-    pub x: String,             // Public key (base64url encoded)
+    pub kid: String, // Key ID
+    pub kty: String, // Key Type (e.g., "OKP" for EdDSA)
+    pub crv: String, // Curve (e.g., "Ed25519")
+    pub x: String,   // Public key (base64url encoded)
     #[serde(rename = "use")]
-    pub use_: String,          // Public key use (e.g., "sig")
-    pub alg: String,           // Algorithm (e.g., "EdDSA")
+    pub use_: String, // Public key use (e.g., "sig")
+    pub alg: String, // Algorithm (e.g., "EdDSA")
 }
 
 /// Service type enum
@@ -129,6 +132,7 @@ impl ServiceType {
     }
 
     /// Convert to string
+    #[allow(dead_code)] // Will be used in Phase 4 admin endpoints
     pub fn as_str(&self) -> &'static str {
         match self {
             ServiceType::GlobalController => "global-controller",
@@ -140,6 +144,7 @@ impl ServiceType {
 
 /// Auth event type enum
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // All variants used in Phase 4 event logging
 pub enum AuthEventType {
     UserLogin,
     UserLoginFailed,
@@ -154,6 +159,7 @@ pub enum AuthEventType {
 }
 
 impl AuthEventType {
+    #[allow(dead_code)] // Used in Phase 4 event logging
     pub fn as_str(&self) -> &'static str {
         match self {
             AuthEventType::UserLogin => "user_login",

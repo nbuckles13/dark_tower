@@ -1,0 +1,79 @@
+# Codecov configuration for Dark Tower
+#
+# Coverage thresholds per ADR-0005:
+# - Crypto modules: 100%
+# - Handlers/Services/Repositories: 95%
+# - Middleware: 90%
+# - Overall: 90%+
+
+coverage:
+  status:
+    project:
+      default:
+        target: 90%
+        threshold: 1%
+        if_ci_failed: error
+
+    patch:
+      default:
+        target: 95%
+        threshold: 2%
+
+  range: 70..100
+
+comment:
+  layout: "header, diff, components, files, footer"
+  behavior: default
+  require_changes: false
+
+component_management:
+  individual_components:
+    # Crypto modules - 100% required
+    - component_id: crypto
+      name: Cryptography
+      paths:
+        - "**/crypto/**"
+      flag_regexes:
+        - crypto
+      statuses:
+        - type: project
+          target: 100%
+          threshold: 0%
+
+    # Auth Controller - 95% required
+    - component_id: auth-controller
+      name: Authentication Controller
+      paths:
+        - "crates/ac-service/src/handlers/**"
+        - "crates/ac-service/src/services/**"
+        - "crates/ac-service/src/repositories/**"
+      statuses:
+        - type: project
+          target: 95%
+          threshold: 1%
+
+    # Middleware - 90% required
+    - component_id: middleware
+      name: Middleware
+      paths:
+        - "**/middleware/**"
+      statuses:
+        - type: project
+          target: 90%
+          threshold: 2%
+
+    # Models - 85% required
+    - component_id: models
+      name: Data Models
+      paths:
+        - "**/models/**"
+      statuses:
+        - type: project
+          target: 85%
+          threshold: 3%
+
+ignore:
+  - "crates/proto-gen/**"  # Generated code
+  - "**/benches/**"        # Benchmark code
+  - "**/examples/**"       # Example code
+  - "**/.claude/**"        # Agent configurations

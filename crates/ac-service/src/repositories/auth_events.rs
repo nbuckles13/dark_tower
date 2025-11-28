@@ -5,6 +5,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 /// Log an authentication event
+#[allow(clippy::too_many_arguments)] // Represents all auth_events table columns
 pub async fn log_event(
     pool: &PgPool,
     event_type: &str,
@@ -44,6 +45,7 @@ pub async fn log_event(
 }
 
 /// Get authentication events for a user
+#[allow(dead_code)] // Will be used in Phase 4 audit endpoints
 pub async fn get_events_by_user(
     pool: &PgPool,
     user_id: Uuid,
@@ -70,6 +72,7 @@ pub async fn get_events_by_user(
 }
 
 /// Get authentication events for a service credential
+#[allow(dead_code)] // Will be used in Phase 4 audit endpoints
 pub async fn get_events_by_credential(
     pool: &PgPool,
     credential_id: Uuid,
@@ -96,6 +99,7 @@ pub async fn get_events_by_credential(
 }
 
 /// Get failed authentication attempts from an IP address
+#[allow(dead_code)] // Will be used in Phase 4 rate limiting
 pub async fn get_failed_attempts_by_ip(
     pool: &PgPool,
     ip_address: &str,
@@ -123,6 +127,7 @@ pub async fn get_failed_attempts_by_ip(
 }
 
 /// Get events by type within a time range
+#[allow(dead_code)] // Will be used in Phase 4 analytics/monitoring
 pub async fn get_events_by_type(
     pool: &PgPool,
     event_type: &str,

@@ -76,12 +76,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = routes::build_routes(state);
 
     // Parse bind address
-    let addr: SocketAddr = bind_address
-        .parse()
-        .map_err(|e| {
-            error!("Invalid bind address: {}", e);
-            e
-        })?;
+    let addr: SocketAddr = bind_address.parse().map_err(|e| {
+        error!("Invalid bind address: {}", e);
+        e
+    })?;
 
     info!("Auth Controller listening on {}", addr);
 

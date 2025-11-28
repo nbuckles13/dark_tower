@@ -68,7 +68,7 @@ impl IntoResponse for AcError {
                     None,
                     None,
                 )
-            },
+            }
             AcError::InvalidCredentials => (
                 StatusCode::UNAUTHORIZED,
                 "INVALID_CREDENTIALS",
@@ -126,14 +126,13 @@ impl IntoResponse for AcError {
                     realm, req_scope
                 )
             } else {
-                format!(
-                    "Bearer realm=\"{}\", error=\"invalid_token\"",
-                    realm
-                )
+                format!("Bearer realm=\"{}\", error=\"invalid_token\"", realm)
             };
 
             if let Ok(header_value) = www_auth_value.parse() {
-                response.headers_mut().insert("WWW-Authenticate", header_value);
+                response
+                    .headers_mut()
+                    .insert("WWW-Authenticate", header_value);
             }
         }
 
