@@ -58,13 +58,17 @@ impl IntoResponse for AcError {
                 None,
                 None,
             ),
-            AcError::Crypto(_) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "CRYPTO_ERROR",
-                "An internal cryptographic error occurred".to_string(),
-                None,
-                None,
-            ),
+            AcError::Crypto(err) => {
+                // Log the actual error server-side, but don't expose to client
+                tracing::error!(target: "crypto", error = %err, "Cryptographic operation failed");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "CRYPTO_ERROR",
+                    "An internal error occurred".to_string(),
+                    None,
+                    None,
+                )
+            },
             AcError::InvalidCredentials => (
                 StatusCode::UNAUTHORIZED,
                 "INVALID_CREDENTIALS",
@@ -106,11 +110,33 @@ impl IntoResponse for AcError {
             error: ErrorDetail {
                 code: code.to_string(),
                 message,
-                required_scope,
-                provided_scopes,
+                required_scope: required_scope.clone(),
+                provided_scopes: provided_scopes.clone(),
             },
         };
 
-        (status, Json(error_response)).into_response()
+        let mut response = (status, Json(error_response)).into_response();
+
+        // Add WWW-Authenticate header for 401/403 responses
+        if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+            let realm = "dark-tower-api";
+            let www_auth_value = if let Some(req_scope) = required_scope {
+                format!(
+                    "Bearer realm=\"{}\", error=\"insufficient_scope\", error_description=\"Requires scope: {}\"",
+                    realm, req_scope
+                )
+            } else {
+                format!(
+                    "Bearer realm=\"{}\", error=\"invalid_token\"",
+                    realm
+                )
+            };
+
+            if let Ok(header_value) = www_auth_value.parse() {
+                response.headers_mut().insert("WWW-Authenticate", header_value);
+            }
+        }
+
+        response
     }
 }
