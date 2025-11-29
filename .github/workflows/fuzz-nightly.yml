@@ -1,0 +1,81 @@
+name: Nightly Fuzz Testing
+
+on:
+  schedule:
+    # Run every night at 2 AM UTC
+    - cron: '0 2 * * *'
+  workflow_dispatch: # Allow manual trigger
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  extended-fuzz:
+    name: Extended Fuzz Testing (8 hours)
+    runs-on: ubuntu-latest
+    timeout-minutes: 480 # 8 hours
+
+    strategy:
+      fail-fast: false
+      matrix:
+        fuzz_target:
+          - crate: media-protocol
+            target: codec_decode
+          - crate: media-protocol
+            target: codec_roundtrip
+          - crate: ac-service
+            target: jwt_validation
+          - crate: ac-service
+            target: signaling_messages
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "fuzz-nightly-${{ matrix.fuzz_target.crate }}"
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz
+
+      - name: Run extended fuzz test
+        working-directory: crates/${{ matrix.fuzz_target.crate }}
+        run: |
+          echo "=== Extended fuzzing ${{ matrix.fuzz_target.target }} for 8 hours ==="
+          cargo +nightly fuzz run ${{ matrix.fuzz_target.target }} \
+            -- \
+            -max_total_time=28800 \
+            -rss_limit_mb=4096 \
+            -workers=2 \
+            -print_final_stats=1
+
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes-${{ matrix.fuzz_target.crate }}-${{ matrix.fuzz_target.target }}
+          path: crates/${{ matrix.fuzz_target.crate }}/fuzz/artifacts/
+
+      - name: Upload corpus
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-corpus-${{ matrix.fuzz_target.crate }}-${{ matrix.fuzz_target.target }}
+          path: crates/${{ matrix.fuzz_target.crate }}/fuzz/corpus/
+
+      - name: Notify on crash
+        if: failure()
+        run: |
+          echo "::error::Fuzz test ${{ matrix.fuzz_target.crate }}/${{ matrix.fuzz_target.target }} found crashes!"
+          echo "Check artifacts for crash inputs"
