@@ -63,3 +63,4 @@ coverage/
 
 # OS
 Thumbs.db
+.env.test
