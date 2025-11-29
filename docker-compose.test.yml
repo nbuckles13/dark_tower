@@ -7,7 +7,7 @@ version: '3.8'
 
 services:
   postgres-test:
-    image: postgres:16-alpine
+    image: docker.io/library/postgres:16-alpine
     container_name: dark-tower-postgres-test
     environment:
       POSTGRES_USER: postgres
@@ -27,7 +27,7 @@ services:
 
   # Redis for future testing needs (optional, not yet used)
   redis-test:
-    image: redis:7-alpine
+    image: docker.io/library/redis:7-alpine
     container_name: dark-tower-redis-test
     ports:
       - "6380:6379"  # Use 6380 to avoid conflicts
