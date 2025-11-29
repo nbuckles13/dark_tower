@@ -121,3 +121,55 @@ jobs:
           files: lcov.info
           fail_ci_if_error: true
           token: ${{ secrets.CODECOV_TOKEN }}
+
+  fuzz:
+    name: Fuzz Testing
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "fuzz-cache"
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz
+
+      - name: Run fuzz tests (media-protocol)
+        working-directory: crates/media-protocol
+        run: |
+          echo "=== Fuzzing codec_decode for 60 seconds ==="
+          cargo +nightly fuzz run codec_decode -- -max_total_time=60 -rss_limit_mb=2048 || true
+
+          echo "=== Fuzzing codec_roundtrip for 60 seconds ==="
+          cargo +nightly fuzz run codec_roundtrip -- -max_total_time=60 -rss_limit_mb=2048 || true
+
+      - name: Run fuzz tests (ac-service)
+        working-directory: crates/ac-service
+        run: |
+          echo "=== Fuzzing jwt_validation for 60 seconds ==="
+          cargo +nightly fuzz run jwt_validation -- -max_total_time=60 -rss_limit_mb=2048 || true
+
+          echo "=== Fuzzing signaling_messages for 60 seconds ==="
+          cargo +nightly fuzz run signaling_messages -- -max_total_time=60 -rss_limit_mb=2048 || true
+
+      - name: Upload fuzz artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: |
+            crates/*/fuzz/artifacts/
+          if-no-files-found: ignore

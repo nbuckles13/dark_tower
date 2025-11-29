@@ -1,0 +1,25 @@
+[package]
+name = "media-protocol-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+media-protocol = { path = ".." }
+bytes = "1.9"
+
+[[bin]]
+name = "codec_decode"
+path = "fuzz_targets/codec_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "codec_roundtrip"
+path = "fuzz_targets/codec_roundtrip.rs"
+test = false
+doc = false

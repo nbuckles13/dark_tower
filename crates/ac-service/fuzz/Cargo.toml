@@ -1,0 +1,31 @@
+[package]
+name = "ac-service-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+proto-gen = { path = "../../proto-gen" }
+ring = "0.17"
+base64 = "0.22"
+
+# For JWT fuzzing
+[dependencies.jsonwebtoken]
+version = "9.3"
+default-features = false
+
+[[bin]]
+name = "jwt_validation"
+path = "fuzz_targets/jwt_validation.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "signaling_messages"
+path = "fuzz_targets/signaling_messages.rs"
+test = false
+doc = false
