@@ -128,7 +128,7 @@ pub async fn get_active_by_service_type(
 mod tests {
     use super::*;
 
-    #[sqlx::test]
+    #[sqlx::test(migrations = "../../migrations")]
     async fn test_create_and_get_service_credential(pool: PgPool) -> Result<(), AcError> {
         // Create a service credential
         let scopes = vec!["meeting:create".to_string(), "meeting:read".to_string()];
@@ -160,14 +160,14 @@ mod tests {
         Ok(())
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrations = "../../migrations")]
     async fn test_get_nonexistent_credential(pool: PgPool) -> Result<(), AcError> {
         let result = get_by_client_id(&pool, "nonexistent-client").await?;
         assert!(result.is_none());
         Ok(())
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrations = "../../migrations")]
     async fn test_update_scopes(pool: PgPool) -> Result<(), AcError> {
         // Create credential
         let initial_scopes = vec!["meeting:create".to_string()];
@@ -197,7 +197,7 @@ mod tests {
         Ok(())
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrations = "../../migrations")]
     async fn test_deactivate_credential(pool: PgPool) -> Result<(), AcError> {
         // Create active credential
         let credential = create_service_credential(
@@ -224,7 +224,7 @@ mod tests {
         Ok(())
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrations = "../../migrations")]
     async fn test_get_active_by_service_type(pool: PgPool) -> Result<(), AcError> {
         // Create multiple credentials of different types
         create_service_credential(
@@ -277,7 +277,7 @@ mod tests {
         Ok(())
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrations = "../../migrations")]
     async fn test_duplicate_client_id_fails(pool: PgPool) -> Result<(), AcError> {
         // Create first credential
         create_service_credential(
