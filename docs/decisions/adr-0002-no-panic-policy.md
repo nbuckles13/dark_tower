@@ -285,6 +285,44 @@ For existing code with `unwrap()`:
 4. Update function signatures to return `Result`
 5. Propagate errors with `?` operator
 
+### Suppressing Lints with `#[expect]`
+
+**When lints must be suppressed** (rare cases), use `#[expect(...)]` instead of `#[allow(...)]`:
+
+```rust
+// ✅ GOOD: Use #[expect] with explanation
+#[expect(clippy::too_many_arguments, reason = "Represents all table columns")]
+pub async fn create_signing_key(
+    pool: &PgPool,
+    key_id: &str,
+    public_key: &str,
+    // ... 6 more parameters
+) -> Result<SigningKey, AcError> { }
+
+// ❌ BAD: Don't use #[allow]
+#[allow(clippy::too_many_arguments)]
+pub async fn create_signing_key(...) { }
+```
+
+**Why `#[expect]` is better**:
+- ✅ **Warns when lint no longer applies**: If the code changes and the lint doesn't trigger, you get a warning to remove the `#[expect]`
+- ✅ **More explicit**: Shows this is an intentional design decision, not forgotten code
+- ✅ **Encourages review**: Forces periodic evaluation of whether the suppression is still needed
+- ✅ **Self-documenting**: The `reason` attribute explains why the lint is suppressed
+
+**Valid reasons to suppress lints**:
+1. **`too_many_arguments`**: Database repository functions representing table columns
+2. **`cast_possible_truncation`**: When the cast is guaranteed safe by protocol design (e.g., payload length bounded by protocol)
+3. **`dead_code`**: Phase-specific code that will be used in future phases (document with comment)
+
+**Example with dead_code**:
+```rust
+#[expect(dead_code, reason = "Will be used in Phase 4 for JWKS endpoint")]
+pub async fn get_all_active_keys(pool: &PgPool) -> Result<Vec<SigningKey>, AcError> {
+    // Implementation for future JWKS endpoint
+}
+```
+
 ### Code Review Checklist
 
 When reviewing code, verify:
@@ -293,6 +331,8 @@ When reviewing code, verify:
 - [ ] Collection access uses `.get()` not `[idx]`
 - [ ] Errors have descriptive types (not just `String`)
 - [ ] Error messages include context
+- [ ] Lint suppressions use `#[expect(...)]` not `#[allow(...)]`
+- [ ] Each `#[expect]` has a `reason` attribute explaining why
 
 ## References
 

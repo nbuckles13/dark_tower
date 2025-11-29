@@ -10,7 +10,7 @@ const TOKEN_EXPIRY_SECONDS: i64 = 3600; // 1 hour
 /// Issue a service token using OAuth 2.0 Client Credentials flow
 ///
 /// Verifies client credentials, generates JWT with scopes, logs event
-#[allow(clippy::too_many_arguments)] // OAuth 2.0 token endpoint requires many params
+#[expect(clippy::too_many_arguments)] // OAuth 2.0 token endpoint requires many params
 pub async fn issue_service_token(
     pool: &PgPool,
     master_key: &[u8],

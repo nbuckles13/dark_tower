@@ -77,7 +77,7 @@ pub async fn register_service(
 }
 
 /// Update scopes for an existing service
-#[allow(dead_code)] // Will be used in Phase 4 admin endpoints
+#[expect(dead_code)] // Will be used in Phase 4 admin endpoints
 pub async fn update_service_scopes(
     pool: &PgPool,
     client_id: &str,
@@ -116,7 +116,7 @@ pub async fn update_service_scopes(
 }
 
 /// Deactivate a service credential
-#[allow(dead_code)] // Will be used in Phase 4 admin endpoints
+#[expect(dead_code)] // Will be used in Phase 4 admin endpoints
 pub async fn deactivate_service(pool: &PgPool, client_id: &str) -> Result<(), AcError> {
     // Fetch credential
     let credential = service_credentials::get_by_client_id(pool, client_id)

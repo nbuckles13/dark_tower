@@ -53,7 +53,7 @@ pub fn encode_frame(frame: &MediaFrame) -> Result<Bytes, CodecError> {
     buf.put_u64(frame.sequence);
 
     // Payload Length (4 bytes)
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(clippy::cast_possible_truncation)]
     buf.put_u32(payload_len as u32);
 
     // Flags (2 bytes)

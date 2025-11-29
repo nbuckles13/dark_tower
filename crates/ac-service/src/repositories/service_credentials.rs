@@ -56,7 +56,6 @@ pub async fn get_by_client_id(
 }
 
 /// Update scopes for a service credential
-#[allow(dead_code)] // Will be used in Phase 4 admin endpoints
 pub async fn update_scopes(
     pool: &PgPool,
     credential_id: Uuid,
@@ -82,7 +81,6 @@ pub async fn update_scopes(
 }
 
 /// Deactivate a service credential
-#[allow(dead_code)] // Will be used in Phase 4 admin endpoints
 pub async fn deactivate(pool: &PgPool, credential_id: Uuid) -> Result<ServiceCredential, AcError> {
     let credential = sqlx::query_as::<_, ServiceCredential>(
         r#"
@@ -103,7 +101,7 @@ pub async fn deactivate(pool: &PgPool, credential_id: Uuid) -> Result<ServiceCre
 }
 
 /// Get all active service credentials by service type
-#[allow(dead_code)] // Will be used in Phase 4 admin endpoints
+#[expect(dead_code)] // Will be used in Phase 4 admin endpoints
 pub async fn get_active_by_service_type(
     pool: &PgPool,
     service_type: &str,
