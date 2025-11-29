@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 
 /// Create a new signing key
-#[allow(clippy::too_many_arguments)] // Represents all signing_keys table columns
+#[expect(clippy::too_many_arguments)] // Represents all signing_keys table columns
 pub async fn create_signing_key(
     pool: &PgPool,
     key_id: &str,
@@ -69,7 +69,7 @@ pub async fn get_active_key(pool: &PgPool) -> Result<Option<SigningKey>, AcError
 }
 
 /// Get signing key by key_id
-#[allow(dead_code)] // Will be used in Phase 4 JWKS/admin endpoints
+#[expect(dead_code)] // Will be used in Phase 4 JWKS/admin endpoints
 pub async fn get_by_key_id(pool: &PgPool, key_id: &str) -> Result<Option<SigningKey>, AcError> {
     let key = sqlx::query_as::<_, SigningKey>(
         r#"
@@ -90,7 +90,6 @@ pub async fn get_by_key_id(pool: &PgPool, key_id: &str) -> Result<Option<Signing
 }
 
 /// Mark old keys as inactive and new key as active (key rotation)
-#[allow(dead_code)] // Will be used in Phase 4 key rotation
 pub async fn rotate_key(pool: &PgPool, new_key_id: &str) -> Result<(), AcError> {
     // Start transaction
     let mut tx = pool
@@ -132,7 +131,6 @@ pub async fn rotate_key(pool: &PgPool, new_key_id: &str) -> Result<(), AcError> 
 }
 
 /// Get all active public keys (for JWKS endpoint)
-#[allow(dead_code)] // Will be used in Phase 4 JWKS endpoint
 pub async fn get_all_active_keys(pool: &PgPool) -> Result<Vec<SigningKey>, AcError> {
     let keys = sqlx::query_as::<_, SigningKey>(
         r#"
@@ -155,7 +153,7 @@ pub async fn get_all_active_keys(pool: &PgPool) -> Result<Vec<SigningKey>, AcErr
 }
 
 /// Mark a key as inactive
-#[allow(dead_code)] // Will be used in Phase 4 key management
+#[expect(dead_code)] // Will be used in Phase 4 key management
 pub async fn deactivate_key(pool: &PgPool, key_id: &str) -> Result<(), AcError> {
     sqlx::query(
         r#"
