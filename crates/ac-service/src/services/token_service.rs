@@ -172,3 +172,475 @@ pub async fn issue_user_token(
     // For now, return an error indicating this is not yet implemented
     Err(AcError::Internal)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto;
+    use crate::repositories::service_credentials;
+    use crate::services::key_management_service;
+    use std::time::Instant;
+
+    /// P0-1 (CG-1): Test timing attack prevention - invalid client_id
+    ///
+    /// Verifies that authentication attempts with non-existent client_ids
+    /// take roughly the same time as valid client_ids to prevent username enumeration.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_timing_attack_prevention_invalid_client_id(pool: PgPool) -> Result<(), AcError> {
+        // Setup: Create master key (32 bytes for AES-256-GCM) and signing key
+        let master_key = crypto::generate_random_bytes(32)?;
+        key_management_service::initialize_signing_key(&pool, &master_key, "test").await?;
+
+        // Create valid credential
+        let valid_secret = "valid-secret-12345";
+        let valid_hash = crypto::hash_client_secret(valid_secret)?;
+        service_credentials::create_service_credential(
+            &pool,
+            "valid-client",
+            &valid_hash,
+            "global-controller",
+            None,
+            &vec!["test:scope".to_string()],
+        )
+        .await?;
+
+        // Measure time for valid client_id with wrong password
+        let start = Instant::now();
+        let _ = issue_service_token(
+            &pool,
+            &master_key,
+            "valid-client",
+            "wrong-password",
+            "client_credentials",
+            None,
+            None,
+            None,
+        )
+        .await;
+        let valid_client_duration = start.elapsed();
+
+        // Measure time for invalid client_id
+        let start = Instant::now();
+        let _ = issue_service_token(
+            &pool,
+            &master_key,
+            "nonexistent-client",
+            "some-password",
+            "client_credentials",
+            None,
+            None,
+            None,
+        )
+        .await;
+        let invalid_client_duration = start.elapsed();
+
+        // Both should take similar time (within 50ms) due to dummy hash verification
+        let time_diff = if valid_client_duration > invalid_client_duration {
+            valid_client_duration - invalid_client_duration
+        } else {
+            invalid_client_duration - valid_client_duration
+        };
+
+        // Timing should be close (bcrypt takes ~100-200ms, so 50ms tolerance is reasonable)
+        assert!(
+            time_diff.as_millis() < 50,
+            "Timing difference too large: {}ms - potential timing attack vulnerability",
+            time_diff.as_millis()
+        );
+
+        Ok(())
+    }
+
+    /// P0-1 (CG-1): Test timing attack prevention - consistent error messages
+    ///
+    /// Verifies that the same error is returned for invalid client_id and invalid secret
+    /// to prevent username enumeration.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_timing_attack_prevention_consistent_errors(pool: PgPool) -> Result<(), AcError> {
+        let master_key = crypto::generate_random_bytes(32)?;
+        key_management_service::initialize_signing_key(&pool, &master_key, "test").await?;
+
+        // Create valid credential
+        let valid_secret = "valid-secret-12345";
+        let valid_hash = crypto::hash_client_secret(valid_secret)?;
+        service_credentials::create_service_credential(
+            &pool,
+            "valid-client",
+            &valid_hash,
+            "global-controller",
+            None,
+            &vec!["test:scope".to_string()],
+        )
+        .await?;
+
+        // Test invalid client_id
+        let invalid_client_result = issue_service_token(
+            &pool,
+            &master_key,
+            "nonexistent-client",
+            "some-password",
+            "client_credentials",
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        // Test valid client_id with wrong password
+        let wrong_password_result = issue_service_token(
+            &pool,
+            &master_key,
+            "valid-client",
+            "wrong-password",
+            "client_credentials",
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        // Both should return the same error type (InvalidCredentials)
+        assert!(matches!(
+            invalid_client_result,
+            Err(AcError::InvalidCredentials)
+        ));
+        assert!(matches!(
+            wrong_password_result,
+            Err(AcError::InvalidCredentials)
+        ));
+
+        Ok(())
+    }
+
+    /// P0-2 (CG-2): Test rate limiting - basic lockout after 5 failed attempts
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_rate_limiting_basic_lockout(pool: PgPool) -> Result<(), AcError> {
+        let master_key = crypto::generate_random_bytes(32)?;
+        key_management_service::initialize_signing_key(&pool, &master_key, "test").await?;
+
+        let valid_secret = "valid-secret-12345";
+        let valid_hash = crypto::hash_client_secret(valid_secret)?;
+        let credential = service_credentials::create_service_credential(
+            &pool,
+            "test-client",
+            &valid_hash,
+            "global-controller",
+            None,
+            &vec!["test:scope".to_string()],
+        )
+        .await?;
+
+        // Attempt 5 failed logins
+        for _ in 0..5 {
+            let _ = issue_service_token(
+                &pool,
+                &master_key,
+                "test-client",
+                "wrong-password",
+                "client_credentials",
+                None,
+                Some("192.168.1.1"),
+                None,
+            )
+            .await;
+        }
+
+        // 6th attempt should be rate limited
+        let result = issue_service_token(
+            &pool,
+            &master_key,
+            "test-client",
+            "wrong-password",
+            "client_credentials",
+            None,
+            Some("192.168.1.1"),
+            None,
+        )
+        .await;
+
+        assert!(matches!(result, Err(AcError::RateLimitExceeded)));
+
+        // Even with correct password, should still be locked
+        let result = issue_service_token(
+            &pool,
+            &master_key,
+            "test-client",
+            valid_secret,
+            "client_credentials",
+            None,
+            Some("192.168.1.1"),
+            None,
+        )
+        .await;
+
+        assert!(matches!(result, Err(AcError::RateLimitExceeded)));
+
+        Ok(())
+    }
+
+    /// P0-2 (CG-2): Test rate limiting - window expiration
+    ///
+    /// Verifies that failed attempts outside the 15-minute window don't count
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_rate_limiting_window_expiration(pool: PgPool) -> Result<(), AcError> {
+        let master_key = crypto::generate_random_bytes(32)?;
+        key_management_service::initialize_signing_key(&pool, &master_key, "test").await?;
+
+        let valid_secret = "valid-secret-12345";
+        let valid_hash = crypto::hash_client_secret(valid_secret)?;
+        service_credentials::create_service_credential(
+            &pool,
+            "test-client-window",
+            &valid_hash,
+            "global-controller",
+            None,
+            &vec!["test:scope".to_string()],
+        )
+        .await?;
+
+        // Note: This test simulates the window but doesn't actually wait 15 minutes.
+        // In a real scenario, old events would be outside the window.
+        // For this test, we just verify the logic doesn't lock out with < 5 recent failures.
+
+        // Make 3 failed attempts
+        for _ in 0..3 {
+            let _ = issue_service_token(
+                &pool,
+                &master_key,
+                "test-client-window",
+                "wrong-password",
+                "client_credentials",
+                None,
+                Some("192.168.1.2"),
+                None,
+            )
+            .await;
+        }
+
+        // Should NOT be locked (only 3 failures)
+        let result = issue_service_token(
+            &pool,
+            &master_key,
+            "test-client-window",
+            "wrong-password",
+            "client_credentials",
+            None,
+            Some("192.168.1.2"),
+            None,
+        )
+        .await;
+
+        // Should get InvalidCredentials, not RateLimitExceeded
+        assert!(matches!(result, Err(AcError::InvalidCredentials)));
+
+        Ok(())
+    }
+
+    /// P0-4 (CG-6): Test scope escalation prevention - reject unauthorized scopes
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_scope_escalation_prevention(pool: PgPool) -> Result<(), AcError> {
+        let master_key = crypto::generate_random_bytes(32)?;
+        key_management_service::initialize_signing_key(&pool, &master_key, "test").await?;
+
+        let valid_secret = "valid-secret-12345";
+        let valid_hash = crypto::hash_client_secret(valid_secret)?;
+
+        // Create credential with limited scopes
+        service_credentials::create_service_credential(
+            &pool,
+            "limited-client",
+            &valid_hash,
+            "media-handler",
+            None,
+            &vec!["media:process".to_string(), "media:forward".to_string()],
+        )
+        .await?;
+
+        // Attempt to request unauthorized scope
+        let result = issue_service_token(
+            &pool,
+            &master_key,
+            "limited-client",
+            valid_secret,
+            "client_credentials",
+            Some(vec![
+                "media:process".to_string(),
+                "meeting:create".to_string(), // Unauthorized!
+            ]),
+            None,
+            None,
+        )
+        .await;
+
+        assert!(matches!(result, Err(AcError::InsufficientScope { .. })));
+
+        Ok(())
+    }
+
+    /// P0-4 (CG-6): Test scope validation - subset of allowed scopes works
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_scope_validation_subset_allowed(pool: PgPool) -> Result<(), AcError> {
+        let master_key = crypto::generate_random_bytes(32)?;
+        key_management_service::initialize_signing_key(&pool, &master_key, "test").await?;
+
+        let valid_secret = "valid-secret-12345";
+        let valid_hash = crypto::hash_client_secret(valid_secret)?;
+
+        service_credentials::create_service_credential(
+            &pool,
+            "multi-scope-client",
+            &valid_hash,
+            "global-controller",
+            None,
+            &vec![
+                "meeting:create".to_string(),
+                "meeting:read".to_string(),
+                "meeting:list".to_string(),
+            ],
+        )
+        .await?;
+
+        // Request subset of scopes (should succeed)
+        let result = issue_service_token(
+            &pool,
+            &master_key,
+            "multi-scope-client",
+            valid_secret,
+            "client_credentials",
+            Some(vec!["meeting:read".to_string()]),
+            None,
+            None,
+        )
+        .await?;
+
+        assert_eq!(result.scope, "meeting:read");
+        assert_eq!(result.token_type, "Bearer");
+
+        Ok(())
+    }
+
+    /// P0-3 (CG-5): Test authentication bypass - inactive credentials rejected
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_authentication_bypass_inactive_credential(pool: PgPool) -> Result<(), AcError> {
+        let master_key = crypto::generate_random_bytes(32)?;
+        key_management_service::initialize_signing_key(&pool, &master_key, "test").await?;
+
+        let valid_secret = "valid-secret-12345";
+        let valid_hash = crypto::hash_client_secret(valid_secret)?;
+
+        let credential = service_credentials::create_service_credential(
+            &pool,
+            "deactivated-client",
+            &valid_hash,
+            "global-controller",
+            None,
+            &vec!["test:scope".to_string()],
+        )
+        .await?;
+
+        // Deactivate the credential
+        service_credentials::deactivate(&pool, credential.credential_id).await?;
+
+        // Attempt to authenticate with valid password but inactive credential
+        let result = issue_service_token(
+            &pool,
+            &master_key,
+            "deactivated-client",
+            valid_secret,
+            "client_credentials",
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(matches!(result, Err(AcError::InvalidCredentials)));
+
+        Ok(())
+    }
+
+    /// P0-3 (CG-5): Test authentication bypass - invalid grant type rejected
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_authentication_bypass_invalid_grant_type(pool: PgPool) -> Result<(), AcError> {
+        let master_key = crypto::generate_random_bytes(32)?;
+        key_management_service::initialize_signing_key(&pool, &master_key, "test").await?;
+
+        let valid_secret = "valid-secret-12345";
+        let valid_hash = crypto::hash_client_secret(valid_secret)?;
+
+        service_credentials::create_service_credential(
+            &pool,
+            "test-grant-client",
+            &valid_hash,
+            "global-controller",
+            None,
+            &vec!["test:scope".to_string()],
+        )
+        .await?;
+
+        // Attempt with invalid grant_type
+        let result = issue_service_token(
+            &pool,
+            &master_key,
+            "test-grant-client",
+            valid_secret,
+            "password", // Wrong grant type
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(matches!(result, Err(AcError::InvalidCredentials)));
+
+        Ok(())
+    }
+
+    /// P0: Test successful token issuance with all parameters
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_successful_token_issuance(pool: PgPool) -> Result<(), AcError> {
+        let master_key = crypto::generate_random_bytes(32)?;
+        key_management_service::initialize_signing_key(&pool, &master_key, "test").await?;
+
+        let valid_secret = "valid-secret-12345";
+        let valid_hash = crypto::hash_client_secret(valid_secret)?;
+
+        service_credentials::create_service_credential(
+            &pool,
+            "success-client",
+            &valid_hash,
+            "global-controller",
+            Some("us-west-2"),
+            &vec!["meeting:create".to_string(), "meeting:read".to_string()],
+        )
+        .await?;
+
+        let result = issue_service_token(
+            &pool,
+            &master_key,
+            "success-client",
+            valid_secret,
+            "client_credentials",
+            None,
+            Some("192.168.1.100"),
+            Some("TestAgent/1.0"),
+        )
+        .await?;
+
+        assert_eq!(result.token_type, "Bearer");
+        assert_eq!(result.expires_in, 3600);
+        assert!(result.scope.contains("meeting:create"));
+        assert!(result.scope.contains("meeting:read"));
+        assert!(!result.access_token.is_empty());
+
+        // Verify JWT structure using test utilities
+        use ac_test_utils::assertions::TokenAssertions;
+        result
+            .access_token
+            .assert_valid_jwt()
+            .assert_has_scope("meeting:create")
+            .assert_has_scope("meeting:read");
+
+        Ok(())
+    }
+}

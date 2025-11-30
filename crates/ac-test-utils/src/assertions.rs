@@ -184,7 +184,8 @@ mod tests {
         // This is a test JWT with valid structure (header.payload.signature)
         // Note: Signature validation is done separately in crypto tests
         let header = r#"{"alg":"EdDSA","typ":"JWT","kid":"test-key-1"}"#;
-        let payload = r#"{"sub":"test-client","exp":9999999999,"iat":1234567890,"scope":"meeting:create"}"#;
+        let payload =
+            r#"{"sub":"test-client","exp":9999999999,"iat":1234567890,"scope":"meeting:create"}"#;
 
         let header_b64 = URL_SAFE_NO_PAD.encode(header.as_bytes());
         let payload_b64 = URL_SAFE_NO_PAD.encode(payload.as_bytes());
