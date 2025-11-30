@@ -182,12 +182,19 @@ mod tests {
         let private_key_encrypted = vec![seed; 32];
         let encryption_nonce = vec![seed + 1; 12];
         let encryption_tag = vec![seed + 2; 16];
-        (key_id, public_key, private_key_encrypted, encryption_nonce, encryption_tag)
+        (
+            key_id,
+            public_key,
+            private_key_encrypted,
+            encryption_nonce,
+            encryption_tag,
+        )
     }
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn test_create_signing_key(pool: PgPool) -> Result<(), AcError> {
-        let (key_id, public_key, private_key_encrypted, encryption_nonce, encryption_tag) = test_key_data(1);
+        let (key_id, public_key, private_key_encrypted, encryption_nonce, encryption_tag) =
+            test_key_data(1);
 
         let now = Utc::now();
         let valid_from = now;
@@ -231,7 +238,8 @@ mod tests {
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn test_get_active_key_returns_current(pool: PgPool) -> Result<(), AcError> {
-        let (key_id, public_key, private_key_encrypted, encryption_nonce, encryption_tag) = test_key_data(1);
+        let (key_id, public_key, private_key_encrypted, encryption_nonce, encryption_tag) =
+            test_key_data(1);
 
         let now = Utc::now();
         let valid_from = now - Duration::days(1); // Started yesterday
@@ -261,7 +269,8 @@ mod tests {
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn test_get_active_key_respects_validity_window(pool: PgPool) -> Result<(), AcError> {
-        let (key_id, public_key, private_key_encrypted, encryption_nonce, encryption_tag) = test_key_data(1);
+        let (key_id, public_key, private_key_encrypted, encryption_nonce, encryption_tag) =
+            test_key_data(1);
 
         let now = Utc::now();
 
@@ -284,14 +293,18 @@ mod tests {
 
         // Should not return the future key
         let active_key = get_active_key(&pool).await?;
-        assert!(active_key.is_none(), "Should not return key that's not yet valid");
+        assert!(
+            active_key.is_none(),
+            "Should not return key that's not yet valid"
+        );
 
         Ok(())
     }
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn test_get_active_key_expired_not_returned(pool: PgPool) -> Result<(), AcError> {
-        let (key_id, public_key, private_key_encrypted, encryption_nonce, encryption_tag) = test_key_data(1);
+        let (key_id, public_key, private_key_encrypted, encryption_nonce, encryption_tag) =
+            test_key_data(1);
 
         let now = Utc::now();
 
@@ -321,7 +334,8 @@ mod tests {
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn test_get_by_key_id(pool: PgPool) -> Result<(), AcError> {
-        let (key_id, public_key, private_key_encrypted, encryption_nonce, encryption_tag) = test_key_data(1);
+        let (key_id, public_key, private_key_encrypted, encryption_nonce, encryption_tag) =
+            test_key_data(1);
 
         let now = Utc::now();
         create_signing_key(
@@ -352,8 +366,10 @@ mod tests {
         let now = Utc::now();
 
         // Create two keys
-        let (key_id_1, public_key_1, private_key_encrypted_1, encryption_nonce_1, encryption_tag_1) = test_key_data(1);
-        let (key_id_2, public_key_2, private_key_encrypted_2, encryption_nonce_2, encryption_tag_2) = test_key_data(2);
+        let (key_id_1, public_key_1, private_key_encrypted_1, encryption_nonce_1, encryption_tag_1) =
+            test_key_data(1);
+        let (key_id_2, public_key_2, private_key_encrypted_2, encryption_nonce_2, encryption_tag_2) =
+            test_key_data(2);
 
         create_signing_key(
             &pool,
@@ -406,9 +422,12 @@ mod tests {
         let now = Utc::now();
 
         // Create multiple keys with different validity periods
-        let (key_id_1, public_key_1, private_key_encrypted_1, encryption_nonce_1, encryption_tag_1) = test_key_data(1);
-        let (key_id_2, public_key_2, private_key_encrypted_2, encryption_nonce_2, encryption_tag_2) = test_key_data(2);
-        let (key_id_3, public_key_3, private_key_encrypted_3, encryption_nonce_3, encryption_tag_3) = test_key_data(3);
+        let (key_id_1, public_key_1, private_key_encrypted_1, encryption_nonce_1, encryption_tag_1) =
+            test_key_data(1);
+        let (key_id_2, public_key_2, private_key_encrypted_2, encryption_nonce_2, encryption_tag_2) =
+            test_key_data(2);
+        let (key_id_3, public_key_3, private_key_encrypted_3, encryption_nonce_3, encryption_tag_3) =
+            test_key_data(3);
 
         // Current valid key
         create_signing_key(
@@ -463,7 +482,8 @@ mod tests {
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn test_deactivate_key(pool: PgPool) -> Result<(), AcError> {
-        let (key_id, public_key, private_key_encrypted, encryption_nonce, encryption_tag) = test_key_data(1);
+        let (key_id, public_key, private_key_encrypted, encryption_nonce, encryption_tag) =
+            test_key_data(1);
 
         let now = Utc::now();
         create_signing_key(
