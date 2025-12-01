@@ -12,9 +12,9 @@ env:
 
 jobs:
   extended-fuzz:
-    name: Extended Fuzz Testing (8 hours)
+    name: Extended Fuzz Testing (5.5 hours)
     runs-on: ubuntu-latest
-    timeout-minutes: 480 # 8 hours
+    timeout-minutes: 350 # 5 hours 50 min (GitHub Actions max is 6 hours)
 
     strategy:
       fail-fast: false
@@ -52,10 +52,10 @@ jobs:
       - name: Run extended fuzz test
         working-directory: crates/${{ matrix.fuzz_target.crate }}
         run: |
-          echo "=== Extended fuzzing ${{ matrix.fuzz_target.target }} for 8 hours ==="
+          echo "=== Extended fuzzing ${{ matrix.fuzz_target.target }} for 5.5 hours ==="
           cargo +nightly fuzz run ${{ matrix.fuzz_target.target }} \
             -- \
-            -max_total_time=28800 \
+            -max_total_time=19800 \
             -rss_limit_mb=4096 \
             -workers=2 \
             -print_final_stats=1
