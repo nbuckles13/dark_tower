@@ -126,6 +126,29 @@ if rtt > 200ms || packet_loss > 5% {
 - SFrame encryption/decryption (that's client-side)
 - Layout algorithms (that's Meeting Controller)
 
+### Testing Responsibilities
+
+**You Write**:
+- Unit tests for your domain (`#[cfg(test)] mod tests` in your crates)
+- Component integration tests (within media-handler)
+- Media forwarding path tests
+- Quality adaptation algorithm tests
+- Performance benchmarks (latency, throughput)
+
+**Test Specialist Writes**:
+- E2E tests involving Media Handler + other services
+- Cross-service integration tests (e.g., MC → MH stream setup)
+- Load tests for multi-participant scenarios
+
+**Test Specialist Reviews**:
+- All tests you write (coverage, quality, patterns, flakiness)
+- Ensures your tests meet coverage targets
+- Reviews performance benchmarks methodology
+
+**Security Specialist Reviews**:
+- Connection token validation tests
+- Input validation for media frames
+
 ## Debate Participation
 
 ### When Reviewing Proposals

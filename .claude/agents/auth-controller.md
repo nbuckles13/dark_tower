@@ -108,6 +108,25 @@ repositories/credential_repo.rs
 - Security requirements (defined by Security specialist)
 - mTLS certificates (infrastructure concern)
 
+### Testing Responsibilities
+
+**You Write**:
+- Unit tests for your domain (`#[cfg(test)] mod tests` in your crates)
+- Component integration tests (within ac-service, using `#[sqlx::test]`)
+- Security tests for your domain (JWT validation, crypto, injection prevention)
+
+**Test Specialist Writes**:
+- E2E tests involving Auth Controller + other services
+- Cross-service integration tests (e.g., GC authenticating with AC)
+
+**Test Specialist Reviews**:
+- All tests you write (coverage, quality, patterns, flakiness)
+- Ensures your tests meet coverage targets (95% for security-critical code)
+
+**Security Specialist Reviews**:
+- Security-related tests you write (attack vectors, cryptographic tests)
+- Ensures comprehensive coverage of security requirements
+
 ## Debate Participation
 
 ### When Reviewing Proposals

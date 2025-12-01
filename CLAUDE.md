@@ -2,6 +2,28 @@
 
 **Auto-loaded project context for Claude Code sessions**
 
+---
+
+## ⚠️ ORCHESTRATOR PRE-FLIGHT CHECKLIST
+
+**STOP! Before starting ANY task, answer these questions:**
+
+| Question | If YES → Action |
+|----------|-----------------|
+| Is this implementation work (code, tests, features)? | → **USE SPECIALISTS** - Do NOT implement directly |
+| Does it touch security or crypto? | → **INCLUDE Security specialist** |
+| Does it involve writing tests? | → Domain specialist writes, **Test specialist reviews** |
+| Does it cross 2+ components? | → **INITIATE A DEBATE** (get user approval first) |
+| Does it change database schema? | → **INCLUDE Database specialist** |
+
+**You CAN do directly**: Update Cargo.toml, create docs, orchestrate workflows, synthesize results
+
+**You CANNOT do directly**: Write features, write tests, implement security, change schemas
+
+**If in doubt**: Ask the user or check `.claude/workflows/specialist-decision-matrix.md`
+
+---
+
 ## What is Dark Tower?
 
 Dark Tower is a modern, AI-generated video conferencing platform built with Rust and WebTransport. The project uses a multi-service architecture with specialist-led development and multi-agent debates for cross-cutting design decisions.

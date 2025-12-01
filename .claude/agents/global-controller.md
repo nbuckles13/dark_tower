@@ -117,6 +117,25 @@ pub enum ApiError {
 - Shared types in `common` crate
 - WebTransport protocols (that's Meeting/Media specialists)
 
+### Testing Responsibilities
+
+**You Write**:
+- Unit tests for your domain (`#[cfg(test)] mod tests` in your crates)
+- Component integration tests (within global-controller)
+- API endpoint tests (HTTP/3 request/response validation)
+
+**Test Specialist Writes**:
+- E2E tests involving Global Controller + other services
+- Cross-service integration tests (e.g., GC → MC → MH flows)
+
+**Test Specialist Reviews**:
+- All tests you write (coverage, quality, patterns, flakiness)
+- Ensures your tests meet coverage targets
+
+**Security Specialist Reviews**:
+- Authentication/authorization tests
+- Input validation and injection prevention tests
+
 ## Debate Participation
 
 ### When Reviewing Proposals
