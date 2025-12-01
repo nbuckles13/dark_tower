@@ -448,4 +448,80 @@ mod tests {
             _ => panic!("Expected Crypto error"),
         }
     }
+
+    /// P1-SECURITY: Test that bcrypt cost factor is 12 (per ADR-0003)
+    ///
+    /// Verifies that password hashing uses the correct cost factor as specified
+    /// in ADR-0003 (Service Authentication). Cost factor 12 provides appropriate
+    /// security for 2024+ (2^12 = 4,096 iterations).
+    ///
+    /// Per OWASP, bcrypt cost of 10-12 is recommended as of 2024.
+    /// Per CWE-916: Use of Password Hash With Insufficient Computational Effort
+    #[test]
+    fn test_bcrypt_cost_factor_is_12() {
+        let secret = "test-password-for-cost-verification";
+        let hash = hash_client_secret(secret).expect("Hashing should succeed");
+
+        // Bcrypt hash format: $2b$<cost>$<salt+hash>
+        // Example: $2b$12$R9h/cIPz0gi.URNNX3kh2OPST9/PgBkqquzi.Ss7KIUgO2t0jWMUW
+        //          └─┬─┘ └┬┘
+        //          version cost
+        let parts: Vec<&str> = hash.split('$').collect();
+
+        // Verify hash structure
+        assert_eq!(
+            parts.len(),
+            4,
+            "Bcrypt hash should have 4 parts: ['', '2b', 'cost', 'salt+hash']"
+        );
+
+        // Verify bcrypt version (2b is the current standard)
+        assert_eq!(
+            parts[1], "2b",
+            "Bcrypt should use version 2b (current standard)"
+        );
+
+        // Verify cost factor is exactly 12 per ADR-0003
+        assert_eq!(
+            parts[2], "12",
+            "Bcrypt cost factor must be 12 per ADR-0003 (Service Authentication). \
+             Cost 12 = 2^12 = 4,096 iterations, appropriate for 2024+ security requirements."
+        );
+
+        // Verify the hash is valid (can be verified)
+        assert!(
+            verify_client_secret(secret, &hash).expect("Verification should succeed"),
+            "Generated hash should verify correctly"
+        );
+    }
+
+    /// P1-SECURITY: Test bcrypt cost factor security boundary
+    ///
+    /// Documents that cost < 10 is insecure per OWASP guidelines.
+    /// This is a documentation test - we don't actually test weak hashes,
+    /// but document the security requirement.
+    #[test]
+    fn test_bcrypt_cost_factor_security_rationale() {
+        // Cost factor security analysis (for documentation):
+        //
+        // Cost 10 = 2^10 = 1,024 iterations
+        // Cost 11 = 2^11 = 2,048 iterations
+        // Cost 12 = 2^12 = 4,096 iterations ← Our choice (ADR-0003)
+        // Cost 13 = 2^13 = 8,192 iterations
+        //
+        // OWASP (2024) recommends cost 10-12 depending on hardware.
+        // We chose 12 to future-proof against improving attack hardware.
+        //
+        // Approximate hashing time on modern CPU (2024):
+        // Cost 10: ~50ms
+        // Cost 12: ~200ms ← Our choice
+        // Cost 13: ~400ms
+        //
+        // Our cost=12 provides good security without excessive latency.
+
+        let hash = hash_client_secret("test").unwrap();
+        let cost = hash.split('$').nth(2).unwrap();
+
+        assert_eq!(cost, "12", "Cost factor must be 12 per security policy");
+    }
 }

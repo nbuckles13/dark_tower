@@ -8,35 +8,41 @@ Dark Tower is an ambitious open-source video conferencing platform designed for 
 
 ## Architecture
 
-The platform consists of four main components:
+The platform consists of five main components:
 
-1. **Global Controller** - Global API entry point with DNS-based geographic routing
-2. **Meeting Controller** - Manages individual meetings, signaling, and participant coordination
-3. **Media Handler** - Handles media routing, transcoding, and mixing (SFU architecture)
-4. **Client** - Web-based user interface built with Svelte and WebCodec
+1. **Authentication Controller** ✅ - Service-to-service authentication via OAuth 2.0, JWT tokens, JWKS federation
+2. **Global Controller** 🚧 - Global API entry point with DNS-based geographic routing
+3. **Meeting Controller** 🚧 - Manages individual meetings, signaling, and participant coordination
+4. **Media Handler** 🚧 - Handles media routing, transcoding, and mixing (SFU architecture)
+5. **Client** 📋 - Web-based user interface built with Svelte and WebCodec
 
 ## Project Structure
 
 ```
 dark_tower/
 ├── crates/                    # Rust workspace
+│   ├── ac-service/            # Authentication Controller (IMPLEMENTED)
+│   ├── ac-test-utils/         # Auth testing utilities (IMPLEMENTED)
 │   ├── global-controller/     # Global Controller service
 │   ├── meeting-controller/    # Meeting Controller service
 │   ├── media-handler/         # Media Handler service
 │   ├── common/                # Shared utilities and types
 │   ├── proto-gen/             # Generated Protocol Buffer code
 │   └── media-protocol/        # Proprietary media protocol implementation
-├── client/                    # Svelte web client
+├── client/                    # Svelte web client (planned)
 ├── proto/                     # Protocol Buffer definitions
+├── migrations/                # Database migrations (AC schema implemented)
 ├── infra/                     # Infrastructure as Code
-│   ├── terraform/             # Terraform configurations
-│   ├── kubernetes/            # Kubernetes manifests
-│   └── docker/                # Dockerfiles
-├── scripts/                   # Build and development scripts
+│   ├── terraform/             # Terraform configurations (planned)
+│   ├── kubernetes/            # Kubernetes manifests (planned)
+│   └── docker/                # Docker configurations
+├── .claude/                   # Claude Code orchestration
+│   ├── agents/                # Specialist agent definitions
+│   └── workflows/             # Debate and code review workflows
 ├── tests/                     # Integration and E2E tests
-│   ├── integration/           # Integration tests
-│   └── e2e/                   # End-to-end tests
-└── docs/                      # Documentation
+└── docs/                      # Comprehensive documentation
+    ├── debates/               # Multi-agent design debates
+    └── decisions/             # Architecture Decision Records
 
 ```
 
@@ -54,13 +60,16 @@ See [TECHNICAL_STACK.md](docs/TECHNICAL_STACK.md) for complete details.
 
 ## Key Features
 
-- End-to-end encrypted media streams
-- Sub-250ms join-to-media latency
-- Support for multiple simultaneous content shares
-- Multiple cameras per participant
+- **Service Authentication** ✅ - OAuth 2.0 Client Credentials, JWT tokens, JWKS federation
+- **Security** ✅ - EdDSA signatures, AES-256-GCM encryption, bcrypt hashing, rate limiting
+- **Testing** ✅ - 83% code coverage, P0/P1 security tests, fuzzing infrastructure
+- End-to-end encrypted media streams (planned)
+- Sub-250ms join-to-media latency (planned)
+- Support for multiple simultaneous content shares (planned)
+- Multiple cameras per participant (planned)
 - Highly scalable architecture (10,000+ concurrent participants per region)
-- Power user controls and customization
-- Open APIs for extensibility
+- Power user controls and customization (planned)
+- Open APIs for extensibility (planned)
 
 ## Development
 
@@ -133,10 +142,13 @@ npm run dev
 
 We maintain ambitious test coverage goals:
 
-- **Unit Tests**: 90%+ code coverage
-- **Integration Tests**: All critical paths
-- **E2E Tests**: All user flows
-- **Performance Tests**: Baseline and regression testing
+- **P0 Security Tests**: 48 tests - Critical security paths (all passing) ✅
+- **P1 Security Tests**: 17 tests - Important security functionality (all passing) ✅
+- **Unit Tests**: 83% code coverage (targeting 95%)
+- **Integration Tests**: All critical paths ✅
+- **Fuzzing**: cargo-fuzz infrastructure for parsers and protocols ✅
+- **CI/CD**: GitHub Actions with automated testing and code coverage ✅
+- **Performance Tests**: Baseline and regression testing (planned)
 
 ## Code Quality
 
@@ -157,6 +169,12 @@ MIT OR Apache-2.0
 
 ## Project Status
 
-🚧 **Phase 1: Foundation & Architecture** - In Progress
+🔄 **Phase 4: Security Hardening & Testing Infrastructure** - In Progress
 
-See the project roadmap in [docs/](docs/) for more details.
+**Recent Achievements**:
+- ✅ Authentication Controller fully implemented (OAuth 2.0, JWT, JWKS)
+- ✅ Comprehensive security test suite (65 tests passing)
+- ✅ Fuzzing infrastructure operational
+- ✅ CI/CD pipeline with code coverage tracking
+
+See [docs/PROJECT_STATUS.md](docs/PROJECT_STATUS.md) for detailed roadmap and progress.

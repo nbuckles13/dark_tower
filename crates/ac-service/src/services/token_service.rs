@@ -5,7 +5,17 @@ use crate::repositories::{auth_events, service_credentials, signing_keys};
 use chrono::Utc;
 use sqlx::PgPool;
 
-const TOKEN_EXPIRY_SECONDS: i64 = 3600; // 1 hour
+// Token configuration
+const TOKEN_EXPIRY_SECONDS: u64 = 3600; // 1 hour
+const TOKEN_EXPIRY_SECONDS_I64: i64 = 3600; // 1 hour (for timestamp calculations)
+
+// Rate limiting configuration (per ADR-0003)
+const RATE_LIMIT_WINDOW_MINUTES: i64 = 15; // 15-minute sliding window
+const RATE_LIMIT_MAX_ATTEMPTS: i64 = 5; // Maximum failed attempts before lockout
+
+// Security test configuration
+#[cfg(test)]
+const MAX_TIMING_VARIANCE_PERCENT: f64 = 30.0; // Timing attack tolerance threshold
 
 /// Issue a service token using OAuth 2.0 Client Credentials flow
 ///
@@ -31,12 +41,16 @@ pub async fn issue_service_token(
 
     // Check for account lockout (prevent brute force)
     if let Some(ref cred) = credential {
-        let fifteen_mins_ago = Utc::now() - chrono::Duration::minutes(15);
-        let failed_count =
-            auth_events::get_failed_attempts_count(pool, &cred.credential_id, fifteen_mins_ago)
-                .await?;
+        let rate_limit_window_ago =
+            Utc::now() - chrono::Duration::minutes(RATE_LIMIT_WINDOW_MINUTES);
+        let failed_count = auth_events::get_failed_attempts_count(
+            pool,
+            &cred.credential_id,
+            rate_limit_window_ago,
+        )
+        .await?;
 
-        if failed_count >= 5 {
+        if failed_count >= RATE_LIMIT_MAX_ATTEMPTS {
             tracing::warn!(
                 "Account locked due to excessive failed attempts: client_id={}",
                 client_id
@@ -116,7 +130,7 @@ pub async fn issue_service_token(
     let now = Utc::now().timestamp();
     let claims = Claims {
         sub: client_id.to_string(),
-        exp: now + TOKEN_EXPIRY_SECONDS,
+        exp: now + TOKEN_EXPIRY_SECONDS_I64,
         iat: now,
         scope: scopes.join(" "),
         service_type: Some(credential.service_type.clone()),
@@ -148,7 +162,7 @@ pub async fn issue_service_token(
     Ok(TokenResponse {
         access_token: token,
         token_type: "Bearer".to_string(),
-        expires_in: TOKEN_EXPIRY_SECONDS as u64,
+        expires_in: TOKEN_EXPIRY_SECONDS,
         scope: scopes.join(" "),
     })
 }
@@ -244,14 +258,23 @@ mod tests {
         let max_time = valid_client_duration.max(invalid_client_duration);
         let diff_percentage = (time_diff.as_millis() as f64 / max_time.as_millis() as f64) * 100.0;
 
-        // Timing difference should be less than 50% of the longer operation
-        // This ensures constant-time behavior while tolerating CI environment variations
+        // Timing difference should be less than 30% of the longer operation
+        // Tightened from 50% based on security review to reduce timing attack surface.
+        // bcrypt operations have inherent variance, but 30% tolerance is acceptable
+        // while still catching timing vulnerabilities.
+
         assert!(
-            diff_percentage < 50.0,
-            "Timing difference too large: {}ms ({:.1}% of {}ms) - potential timing attack vulnerability",
+            diff_percentage < MAX_TIMING_VARIANCE_PERCENT,
+            "Timing difference too large: {}ms ({:.1}% of {}ms) - potential timing attack vulnerability.\n  \
+             Valid client: {:?}\n  \
+             Invalid client: {:?}\n  \
+             Max allowed variance: {:.1}%",
             time_diff.as_millis(),
             diff_percentage,
-            max_time.as_millis()
+            max_time.as_millis(),
+            valid_client_duration,
+            invalid_client_duration,
+            MAX_TIMING_VARIANCE_PERCENT
         );
 
         Ok(())
@@ -336,8 +359,8 @@ mod tests {
         )
         .await?;
 
-        // Attempt 5 failed logins
-        for _ in 0..5 {
+        // Attempt RATE_LIMIT_MAX_ATTEMPTS failed logins
+        for _ in 0..RATE_LIMIT_MAX_ATTEMPTS {
             let _ = issue_service_token(
                 &pool,
                 &master_key,
@@ -634,7 +657,7 @@ mod tests {
         .await?;
 
         assert_eq!(result.token_type, "Bearer");
-        assert_eq!(result.expires_in, 3600);
+        assert_eq!(result.expires_in, TOKEN_EXPIRY_SECONDS);
         assert!(result.scope.contains("meeting:create"));
         assert!(result.scope.contains("meeting:read"));
         assert!(!result.access_token.is_empty());
@@ -750,7 +773,7 @@ mod tests {
         // Create valid claims
         let claims = crypto::Claims {
             sub: "test-client".to_string(),
-            exp: Utc::now().timestamp() + 3600,
+            exp: Utc::now().timestamp() + TOKEN_EXPIRY_SECONDS_I64,
             iat: Utc::now().timestamp(),
             scope: "meeting:create".to_string(),
             service_type: Some("global-controller".to_string()),
@@ -992,8 +1015,8 @@ mod tests {
         // Manually create an expired token
         let expired_claims = crypto::Claims {
             sub: "expired-client".to_string(),
-            exp: Utc::now().timestamp() - 3600, // Expired 1 hour ago
-            iat: Utc::now().timestamp() - 7200, // Issued 2 hours ago
+            exp: Utc::now().timestamp() - TOKEN_EXPIRY_SECONDS_I64, // Expired 1 hour ago
+            iat: Utc::now().timestamp() - (TOKEN_EXPIRY_SECONDS_I64 * 2), // Issued 2 hours ago
             scope: "meeting:create".to_string(),
             service_type: Some("global-controller".to_string()),
         };
@@ -1021,11 +1044,26 @@ mod tests {
         Ok(())
     }
 
-    /// P1-1: Test JWT with future issued-at time rejected
+    /// P1-1: Test JWT with future issued-at time (documents current behavior)
     ///
-    /// Verifies that tokens with iat > current time are handled appropriately.
-    /// Note: jsonwebtoken crate doesn't validate iat by default, but we test
-    /// that the token structure is valid even with future iat.
+    /// Verifies that tokens with iat > current time are currently accepted.
+    ///
+    /// **SECURITY NOTE**: The jsonwebtoken crate doesn't validate iat by default.
+    /// This means tokens with future iat (issued-at times in the future) are
+    /// currently accepted, which could indicate:
+    /// - Clock skew between systems
+    /// - Potential replay attacks
+    /// - Token pre-generation
+    ///
+    /// **DECISION REQUIRED**:
+    /// - Option 1: Add custom iat validation in crypto::verify_jwt() with clock skew tolerance (±5 minutes)
+    /// - Option 2: Document as accepted risk for Phase 1, defer to Phase 2
+    ///
+    /// TODO(security): Decide iat validation policy and track in issue or ADR.
+    /// If implementing custom validation:
+    /// 1. Add check in crypto::verify_jwt(): if claims.iat > now + CLOCK_SKEW { return Err(...) }
+    /// 2. Update this test to expect rejection
+    /// 3. Add separate test for valid iat within clock skew tolerance
     #[sqlx::test(migrations = "../../migrations")]
     async fn test_jwt_future_iat_accepted_by_library(pool: PgPool) -> Result<(), AcError> {
         use chrono::Utc;
@@ -1041,8 +1079,8 @@ mod tests {
         // Create a token with future iat (issued in the future)
         let future_claims = crypto::Claims {
             sub: "future-client".to_string(),
-            exp: Utc::now().timestamp() + 7200, // Expires in 2 hours
-            iat: Utc::now().timestamp() + 3600, // Issued 1 hour from now (suspicious!)
+            exp: Utc::now().timestamp() + (TOKEN_EXPIRY_SECONDS_I64 * 2), // Expires in 2 hours
+            iat: Utc::now().timestamp() + TOKEN_EXPIRY_SECONDS_I64, // Issued 1 hour from now (suspicious!)
             scope: "meeting:create".to_string(),
             service_type: Some("global-controller".to_string()),
         };
@@ -1120,7 +1158,7 @@ mod tests {
 
         let claims_with_extra = ClaimsWithExtra {
             sub: "extra-claims-client".to_string(),
-            exp: Utc::now().timestamp() + 3600,
+            exp: Utc::now().timestamp() + TOKEN_EXPIRY_SECONDS_I64,
             iat: Utc::now().timestamp(),
             scope: "meeting:create".to_string(),
             service_type: Some("global-controller".to_string()),
@@ -1183,7 +1221,7 @@ mod tests {
 
         let incomplete_claims = IncompleteClaims {
             sub: "incomplete-client".to_string(),
-            exp: chrono::Utc::now().timestamp() + 3600,
+            exp: chrono::Utc::now().timestamp() + TOKEN_EXPIRY_SECONDS_I64,
             iat: chrono::Utc::now().timestamp(),
         };
 
@@ -1264,6 +1302,214 @@ mod tests {
         assert!(
             matches!(result, Err(AcError::InvalidToken(_))),
             "JWT with tampered sub claim should be rejected"
+        );
+
+        Ok(())
+    }
+
+    // ============================================================================
+    // P1 Security Tests - Key Rotation & Lifecycle
+    // ============================================================================
+    //
+    // TODO(security): Add key rotation tests when supporting repository methods exist:
+    // - signing_keys::get_by_key_id() - Retrieve specific key by ID
+    // - signing_keys::list_all_keys() - List all keys (active and inactive)
+    //
+    // Required tests:
+    // 1. test_jwt_signed_with_deactivated_key_rejected - Verify old keys don't work after rotation
+    // 2. test_key_rotation_lifecycle - Verify only one key active at a time
+
+    // ============================================================================
+    // P1 Security Tests - Error Message Information Leakage Prevention
+    // ============================================================================
+
+    /// P1-SECURITY: Test that error messages don't leak sensitive information
+    ///
+    /// Verifies that error messages don't reveal:
+    /// - Whether a client_id exists in the database (username enumeration)
+    /// - Database implementation details
+    /// - Stack traces or internal paths
+    /// - Specific authentication failure reasons (password vs client_id)
+    ///
+    /// Per OWASP A05:2021 (Security Misconfiguration), CWE-209 (Information Exposure)
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_error_messages_no_info_leakage(pool: PgPool) -> Result<(), AcError> {
+        let master_key = crypto::generate_random_bytes(32)?;
+        key_management_service::initialize_signing_key(&pool, &master_key, "test").await?;
+
+        // Create a valid credential
+        let valid_secret = "valid-secret-12345";
+        let valid_hash = crypto::hash_client_secret(valid_secret)?;
+        service_credentials::create_service_credential(
+            &pool,
+            "existing-client",
+            &valid_hash,
+            "global-controller",
+            None,
+            &["meeting:create".to_string()],
+        )
+        .await?;
+
+        // Test various failure scenarios
+        let scenarios = vec![
+            (
+                "nonexistent-client",
+                "any-password",
+                "nonexistent client_id should not be revealed",
+            ),
+            (
+                "existing-client",
+                "wrong-password",
+                "invalid password should not be revealed",
+            ),
+        ];
+
+        for (client_id, password, expectation) in scenarios {
+            let result = issue_service_token(
+                &pool,
+                &master_key,
+                client_id,
+                password,
+                "client_credentials",
+                None,
+                None,
+                None,
+            )
+            .await;
+
+            // Both scenarios should return InvalidCredentials
+            assert!(
+                matches!(result, Err(AcError::InvalidCredentials)),
+                "Expected InvalidCredentials for: {}",
+                expectation
+            );
+
+            if let Err(e) = result {
+                let error_msg = e.to_string();
+
+                // Error message should NOT contain sensitive information
+                assert!(
+                    !error_msg.to_lowercase().contains("not found"),
+                    "Error should not reveal 'not found': {}",
+                    expectation
+                );
+                assert!(
+                    !error_msg.to_lowercase().contains("password"),
+                    "Error should not reveal 'password': {}",
+                    expectation
+                );
+                assert!(
+                    !error_msg.to_lowercase().contains("database"),
+                    "Error should not reveal 'database': {}",
+                    expectation
+                );
+                assert!(
+                    !error_msg.to_lowercase().contains("sql"),
+                    "Error should not reveal 'sql': {}",
+                    expectation
+                );
+                assert!(
+                    !error_msg.contains("client_id"),
+                    "Error should not reveal 'client_id': {}",
+                    expectation
+                );
+                // Allow "credentials" (plural, generic) but not "credential_id" or specific details
+                assert!(
+                    !error_msg.contains("credential_id")
+                        && !error_msg.contains("service_credential"),
+                    "Error should not reveal specific credential details: {}",
+                    expectation
+                );
+                assert!(
+                    !error_msg.contains("/home/") && !error_msg.contains("C:\\"),
+                    "Error should not reveal file paths: {}",
+                    expectation
+                );
+
+                // Error message should be generic
+                assert!(
+                    error_msg.contains("Invalid") || error_msg.contains("invalid"),
+                    "Error message should be generic: {}",
+                    error_msg
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    /// P1-SECURITY: Test error message consistency for timing attack prevention
+    ///
+    /// Ensures that different failure types return the same error type and similar messages
+    /// to prevent information leakage via error message differences.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_error_message_consistency(pool: PgPool) -> Result<(), AcError> {
+        let master_key = crypto::generate_random_bytes(32)?;
+        key_management_service::initialize_signing_key(&pool, &master_key, "test").await?;
+
+        let valid_secret = "valid-secret-12345";
+        let valid_hash = crypto::hash_client_secret(valid_secret)?;
+        service_credentials::create_service_credential(
+            &pool,
+            "valid-client",
+            &valid_hash,
+            "global-controller",
+            None,
+            &["meeting:create".to_string()],
+        )
+        .await?;
+
+        // Both scenarios should return the same error type
+        let invalid_client_result = issue_service_token(
+            &pool,
+            &master_key,
+            "nonexistent-client",
+            "any-password",
+            "client_credentials",
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        let invalid_password_result = issue_service_token(
+            &pool,
+            &master_key,
+            "valid-client",
+            "wrong-password",
+            "client_credentials",
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        // Both should return InvalidCredentials
+        assert!(matches!(
+            invalid_client_result,
+            Err(AcError::InvalidCredentials)
+        ));
+        assert!(matches!(
+            invalid_password_result,
+            Err(AcError::InvalidCredentials)
+        ));
+
+        // Error messages should be similar in content and length
+        let err1 = invalid_client_result.unwrap_err().to_string();
+        let err2 = invalid_password_result.unwrap_err().to_string();
+
+        // Messages should have similar length (within 50%) to prevent information leakage
+        let length_ratio = if err1.len() > err2.len() {
+            err1.len() as f64 / err2.len() as f64
+        } else {
+            err2.len() as f64 / err1.len() as f64
+        };
+
+        assert!(
+            length_ratio < 1.5,
+            "Error message lengths should be similar: {} chars vs {} chars",
+            err1.len(),
+            err2.len()
         );
 
         Ok(())
