@@ -1,0 +1,353 @@
+# Dark Tower - Claude Code Context
+
+**Auto-loaded project context for Claude Code sessions**
+
+## What is Dark Tower?
+
+Dark Tower is a modern, AI-generated video conferencing platform built with Rust and WebTransport. The project uses a multi-service architecture with specialist-led development and multi-agent debates for cross-cutting design decisions.
+
+**Core Technology Stack**:
+- **Backend**: Rust (async/await with Tokio)
+- **Transport**: WebTransport (QUIC), HTTP/3
+- **Database**: PostgreSQL (persistent), Redis (ephemeral)
+- **Protocols**: Protocol Buffers (signaling), proprietary binary (media)
+- **Security**: OAuth 2.0, EdDSA (Ed25519), AES-256-GCM, bcrypt
+- **Frontend** (planned): Svelte, WebCodec
+
+## Architecture Overview
+
+The platform consists of **five main components**:
+
+### 1. Authentication Controller (ac-service) ✅ IMPLEMENTED
+- **Status**: Production-ready, 83% test coverage (targeting 95%)
+- **Purpose**: Service-to-service authentication via OAuth 2.0 Client Credentials
+- **Features**:
+  - JWT token issuance (EdDSA signatures)
+  - JWKS endpoint for federation
+  - Rate limiting (token bucket algorithm)
+  - Bcrypt password hashing (cost factor 12)
+  - AES-256-GCM encryption at rest for private keys
+- **Location**: `crates/ac-service/`
+- **Database**: PostgreSQL with sqlx migrations
+
+### 2. Global Controller 🚧 SKELETON
+- **Status**: Planned for Phase 5
+- **Purpose**: HTTP/3 API gateway, geographic routing, meeting management
+- **Location**: `crates/global-controller/`
+
+### 3. Meeting Controller 🚧 SKELETON
+- **Status**: Planned for Phase 6
+- **Purpose**: WebTransport signaling, session management, participant coordination
+- **Location**: `crates/meeting-controller/`
+
+### 4. Media Handler 🚧 SKELETON
+- **Status**: Planned for Phase 7
+- **Purpose**: SFU (Selective Forwarding Unit) media routing, quality adaptation
+- **Location**: `crates/media-handler/`
+
+### 5. Client 📋 PLANNED
+- **Status**: Planned for Phase 8
+- **Purpose**: Svelte web UI, WebCodec media processing, E2E encryption
+- **Location**: `client/`
+
+## Development Model
+
+### Specialist-Led Development
+
+**CRITICAL**: You (Claude Code orchestrator) do NOT implement features directly. Your role is to:
+1. Identify which specialists should handle each task
+2. Invoke specialist agents to do the work
+3. Coordinate debates for cross-cutting features
+4. Synthesize results and present to user
+
+**See**: `.claude/DEVELOPMENT_WORKFLOW.md` for complete rules
+
+### Available Specialists
+
+**Service Specialists**:
+- `auth-controller` - Authentication, JWT, JWKS, federation
+- `global-controller` - HTTP/3 API, meeting management
+- `meeting-controller` - WebTransport signaling, sessions
+- `media-handler` - Media forwarding, quality adaptation
+
+**Cross-Cutting Specialists** (ALWAYS INCLUDED):
+- `test` - E2E tests, coverage, quality gates (MANDATORY in all debates)
+- `security` - Security architecture, threat modeling, cryptography (MANDATORY in all debates)
+- `database` - PostgreSQL schema, migrations, queries
+- `protocol` - Protocol Buffers, API contracts, versioning
+- `code-reviewer` - Code quality, Rust idioms, ADR compliance
+
+**Specialist Definitions**: `.claude/agents/*.md`
+
+### When to Use Specialists
+
+**NEVER implement directly**:
+- Database schemas or migrations → Database specialist
+- Authentication/authorization → Auth Controller specialist
+- API endpoints → Service specialist
+- Test suites → Test specialist
+- Security features → Security specialist
+
+**You CAN do directly**:
+- Update Cargo.toml dependencies
+- Create documentation files
+- Orchestrate workflows
+- Synthesize debate results
+
+**If in doubt**: Use the decision matrix in `.claude/workflows/specialist-decision-matrix.md`
+
+### Multi-Agent Debates
+
+**When to initiate debates**:
+- Features touching 2+ services
+- Protocol or contract changes
+- Database schema changes
+- Performance/scalability impacts
+- Core pattern modifications
+
+**Minimum debate size**: 3 agents (1 domain + Test + Security)
+
+**Process**:
+1. Propose debate to user (ALWAYS get approval first)
+2. Run specialists in rounds (max 10 rounds)
+3. Track satisfaction scores (target: 90%+ consensus)
+4. Create ADR when consensus reached
+5. Implement via specialists
+
+**See**: `.claude/workflows/multi-agent-debate.md`
+
+## Critical Conventions
+
+### 1. No Panics in Production Code
+- **ADR**: `docs/decisions/adr-0002-no-panic-policy.md`
+- Use `Result<T, E>` for all fallible operations
+- Validate inputs at system boundaries
+- `panic!` only allowed in: test code, unreachable invariants, development tools
+
+### 2. Test Coverage Requirements
+- **Target**: 95% for security-critical code (auth, crypto, validation)
+- **Minimum**: 90% for critical paths
+- **P0 tests**: Must pass (security-critical)
+- **P1 tests**: Important functionality
+- **Fuzz tests**: All parsers and protocols
+
+### 3. Database Queries
+- **ALWAYS** use sqlx with compile-time query checking
+- **NEVER** use string concatenation for SQL
+- All queries are parameterized (SQL injection safe by design)
+- Migrations: `migrations/*.sql` (numbered sequentially)
+
+### 4. Security Standards
+- **Cryptography**: EdDSA (Ed25519) for signatures, AES-256-GCM for encryption
+- **Password hashing**: bcrypt with cost factor 12
+- **Token lifetimes**: 1 hour default, configurable
+- **Rate limiting**: Required on all authentication endpoints
+- **Zero-trust architecture**: Every service-to-service call authenticated
+
+### 5. Error Handling
+- Custom error types per crate (e.g., `AcError` in ac-service)
+- Implement `std::error::Error` trait
+- Use `thiserror` for error definitions
+- Map errors at API boundaries (don't leak internal details)
+
+## Build & Test Commands
+
+### Development
+```bash
+# Build all services
+cargo build --workspace
+
+# Run all tests
+cargo test --workspace
+
+# Run tests with coverage
+cargo llvm-cov --workspace --lcov --output-path lcov.info
+
+# Format code
+cargo fmt --all
+
+# Linting
+cargo clippy --workspace --lib --bins -- -D warnings
+```
+
+### Database
+```bash
+# Start PostgreSQL (test environment)
+docker-compose -f docker-compose.test.yml up -d
+
+# Run migrations
+export DATABASE_URL=postgresql://postgres:postgres@localhost:5432/dark_tower_test
+sqlx migrate run
+
+# Create new migration
+sqlx migrate add <name>
+```
+
+### Testing Specific Components
+```bash
+# Auth Controller tests only
+cd crates/ac-service
+cargo test
+
+# Integration tests with database
+export DATABASE_URL=postgresql://postgres:postgres@localhost:5432/dark_tower_test
+cargo test --workspace --verbose
+
+# Fuzz testing
+cd crates/ac-service
+cargo fuzz run token_validation_fuzzer
+```
+
+## Project Structure
+
+```
+dark_tower/
+├── crates/
+│   ├── ac-service/          # Authentication Controller (IMPLEMENTED)
+│   ├── ac-test-utils/       # Auth testing utilities (IMPLEMENTED)
+│   ├── common/              # Shared types and utilities
+│   ├── proto-gen/           # Generated Protocol Buffer code
+│   ├── media-protocol/      # Proprietary media protocol
+│   ├── global-controller/   # Global API gateway (SKELETON)
+│   ├── meeting-controller/  # Meeting signaling (SKELETON)
+│   └── media-handler/       # Media routing SFU (SKELETON)
+├── client/                  # Svelte web application (PLANNED)
+├── proto/                   # Protocol Buffer definitions
+│   ├── signaling.proto      # Client ↔ Meeting Controller messages
+│   └── internal.proto       # Internal service messages
+├── migrations/              # Database migrations (AC schema implemented)
+├── docs/
+│   ├── debates/             # Multi-agent design debates
+│   ├── decisions/           # Architecture Decision Records (ADRs)
+│   ├── ARCHITECTURE.md      # System architecture
+│   ├── API_CONTRACTS.md     # API specifications
+│   ├── DATABASE_SCHEMA.md   # Database design
+│   └── PROJECT_STATUS.md    # Current progress tracking
+├── .claude/
+│   ├── agents/              # Specialist agent definitions
+│   ├── workflows/           # Debate and orchestration workflows
+│   └── DEVELOPMENT_WORKFLOW.md  # Orchestrator rules
+└── infra/
+    ├── docker/              # Docker configurations
+    └── kubernetes/          # K8s manifests (future)
+```
+
+## Documentation Map
+
+### Architecture & Design
+- **ARCHITECTURE.md** - System design, component interactions, scaling strategy
+- **API_CONTRACTS.md** - API specifications, error handling patterns
+- **DATABASE_SCHEMA.md** - PostgreSQL schema, indexes, migrations
+- **WEBTRANSPORT_FLOW.md** - WebTransport connection flow, message framing
+
+### Decision History
+- **docs/debates/** - Multi-agent design debates (YYYY-MM-DD-{topic}.md)
+- **docs/decisions/** - Architecture Decision Records (adr-NNNN-{feature}.md)
+
+### Development Process
+- **.claude/DEVELOPMENT_WORKFLOW.md** - Orchestrator rules, specialist usage
+- **.claude/workflows/multi-agent-debate.md** - Debate mechanics
+- **.claude/workflows/code-review.md** - Code review process
+- **FUZZING.md** - Fuzzing strategy and setup
+
+### Current Status
+- **PROJECT_STATUS.md** - Current phase, completed work, roadmap
+- **.claude/TODO.md** - Technical debt and future work
+
+## Common Development Tasks
+
+### Adding a Database Table
+1. Create migration: `sqlx migrate add create_table_name`
+2. Write SQL in `migrations/NNNN_create_table_name.sql`
+3. Update `docs/DATABASE_SCHEMA.md`
+4. Invoke Database specialist to review
+5. Test migration: `sqlx migrate run`
+
+### Adding an API Endpoint
+1. Identify service (GC, MC, MH, AC)
+2. Invoke service specialist + Test + Security (minimum)
+3. If cross-cutting: Initiate debate (get user approval first)
+4. Create ADR if consensus reached
+5. Update `docs/API_CONTRACTS.md`
+
+### Security Changes
+1. **ALWAYS** invoke Security specialist
+2. Include Test specialist for security tests
+3. Update threat model if needed
+4. Run comprehensive security tests (P0 + P1)
+5. Update security documentation
+
+### Implementing Tests
+1. **NEVER** implement tests directly
+2. Invoke Test specialist to create tests
+3. Test specialist determines:
+   - What to test (critical paths, edge cases)
+   - How to test (unit, integration, fuzz)
+   - Coverage requirements
+4. Security specialist reviews security test coverage
+
+## Common Pitfalls
+
+### ❌ DON'T
+- Implement tests yourself → Invoke Test specialist
+- Implement security features yourself → Invoke Security specialist
+- Skip migrations when changing schema
+- Use `unwrap()` or `expect()` in production code
+- Concatenate strings for SQL queries
+- Start debates without user approval
+- Skip Test or Security specialists in debates
+- Forget to create ADR after reaching consensus
+
+### ✅ DO
+- Use sqlx compile-time query checking
+- Use CSPRNG for security-critical randomness (ring::rand::SystemRandom)
+- Add rate limiting to authentication endpoints
+- Include Test and Security specialists in ALL debates
+- Propose debates to user before starting
+- Create ADRs for all consensus-based decisions
+- Update PROJECT_STATUS.md when phase changes
+- Follow the specialist decision matrix when unsure
+
+## Current Phase: Phase 4 - Security Hardening
+
+**Focus**: Achieve 95% test coverage, implement P1 security improvements
+
+**Recent Achievements**:
+- ✅ Authentication Controller fully implemented
+- ✅ P0/P1 security test framework
+- ✅ JWT validation security tests (10 tests)
+- ✅ SQL injection prevention tests (7 tests)
+- ✅ Fuzzing infrastructure
+- ✅ CI/CD with GitHub Actions
+
+**In Progress**:
+- Additional JWT security tests (iat validation, header injection)
+- Second-order SQL injection tests
+- Performance benchmarks for auth under attack
+
+**See**: `docs/PROJECT_STATUS.md` for detailed roadmap
+
+## Quick Reference
+
+**Need to know what to do?** Check these in order:
+1. This file (CLAUDE.md) - Project context ← You are here
+2. `.claude/DEVELOPMENT_WORKFLOW.md` - Orchestrator rules
+3. `.claude/workflows/specialist-decision-matrix.md` - When to use specialists
+4. `docs/PROJECT_STATUS.md` - Current phase and status
+5. `.claude/TODO.md` - Immediate work items
+
+**Starting a new session?**
+1. Read `.claude/DEVELOPMENT_WORKFLOW.md`
+2. Check `docs/PROJECT_STATUS.md` for current phase
+3. Review `.claude/TODO.md` for ongoing work
+4. Identify which specialists you'll need today
+
+**Making a commit?**
+1. Check `.claude/workflows/pre-commit-checklist.md`
+2. Verify workflow compliance (debates, specialists, ADRs)
+3. Update documentation if needed
+4. Run tests and linting
+
+---
+
+**Remember**: You are the **orchestrator**, not the implementer. Direct the specialists, facilitate debates, and synthesize results. Trust the specialists to do their domain work.
