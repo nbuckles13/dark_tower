@@ -185,7 +185,11 @@ mod tests {
     ///
     /// Verifies that authentication attempts with non-existent client_ids
     /// take roughly the same time as valid client_ids to prevent username enumeration.
+    ///
+    /// Note: Ignored under coverage builds because instrumentation adds significant
+    /// overhead that makes timing comparisons meaningless.
     #[sqlx::test(migrations = "../../migrations")]
+    #[cfg_attr(coverage, ignore)]
     async fn test_timing_attack_prevention_invalid_client_id(pool: PgPool) -> Result<(), AcError> {
         // Setup: Create master key (32 bytes for AES-256-GCM) and signing key
         let master_key = crypto::generate_random_bytes(32)?;
