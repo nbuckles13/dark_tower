@@ -7,11 +7,16 @@ edition = "2021"
 [package.metadata]
 cargo-fuzz = true
 
+[workspace]
+# This is an independent workspace for fuzzing
+# (not part of the main Dark Tower workspace)
+
 [dependencies]
 libfuzzer-sys = "0.4"
 proto-gen = { path = "../../proto-gen" }
 ring = "0.17"
 base64 = "0.22"
+serde = { version = "1.0", features = ["derive"] }
 
 # For JWT fuzzing
 [dependencies.jsonwebtoken]
