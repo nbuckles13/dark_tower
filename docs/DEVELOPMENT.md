@@ -89,6 +89,21 @@ pacman -S mingw-w64-x86_64-gcc mingw-w64-x86_64-pkg-config mingw-w64-x86_64-prot
 
 ### Optional Tools
 
+- **GitHub CLI (`gh`)**: Create PRs, manage issues from terminal
+  ```bash
+  # Ubuntu/Debian
+  sudo apt install gh
+
+  # macOS
+  brew install gh
+
+  # Windows
+  winget install --id GitHub.cli
+
+  # Authenticate (one-time setup)
+  gh auth login
+  ```
+
 - **Cargo Watch**: Auto-rebuild on file changes
   ```bash
   cargo install cargo-watch
