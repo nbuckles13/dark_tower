@@ -120,6 +120,27 @@ match client_message {
 - Meeting creation/metadata (that's Global Controller)
 - Actual media forwarding (that's Media Handler)
 
+### Testing Responsibilities
+
+**You Write**:
+- Unit tests for your domain (`#[cfg(test)] mod tests` in your crates)
+- Component integration tests (within meeting-controller)
+- WebTransport signaling tests (connection, message handling)
+- Session state management tests
+
+**Test Specialist Writes**:
+- E2E tests involving Meeting Controller + other services
+- Cross-service integration tests (e.g., MC ↔ MH media routing)
+- Multi-participant scenario tests
+
+**Test Specialist Reviews**:
+- All tests you write (coverage, quality, patterns, flakiness)
+- Ensures your tests meet coverage targets
+
+**Security Specialist Reviews**:
+- Token validation tests
+- Authorization tests for participant actions
+
 ## Debate Participation
 
 ### When Reviewing Proposals
