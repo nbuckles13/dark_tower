@@ -56,6 +56,7 @@ pub async fn get_by_client_id(
 }
 
 /// Update scopes for a service credential
+#[allow(dead_code)] // Library function - will be used in Phase 4 admin endpoints
 pub async fn update_scopes(
     pool: &PgPool,
     credential_id: Uuid,
@@ -81,6 +82,7 @@ pub async fn update_scopes(
 }
 
 /// Deactivate a service credential
+#[allow(dead_code)] // Library function - will be used in Phase 4 admin endpoints
 pub async fn deactivate(pool: &PgPool, credential_id: Uuid) -> Result<ServiceCredential, AcError> {
     let credential = sqlx::query_as::<_, ServiceCredential>(
         r#"
@@ -101,7 +103,7 @@ pub async fn deactivate(pool: &PgPool, credential_id: Uuid) -> Result<ServiceCre
 }
 
 /// Get all active service credentials by service type
-#[expect(dead_code)] // Will be used in Phase 4 admin endpoints
+#[allow(dead_code)] // Library function - will be used in Phase 4 admin endpoints
 pub async fn get_active_by_service_type(
     pool: &PgPool,
     service_type: &str,
@@ -206,7 +208,7 @@ mod tests {
             "hash",
             "media-handler",
             None,
-            &vec!["media:process".to_string()],
+            &["media:process".to_string()],
         )
         .await?;
         assert!(credential.is_active);
@@ -233,7 +235,7 @@ mod tests {
             "hash1",
             "global-controller",
             None,
-            &vec!["meeting:create".to_string()],
+            &["meeting:create".to_string()],
         )
         .await?;
 
@@ -243,7 +245,7 @@ mod tests {
             "hash2",
             "global-controller",
             None,
-            &vec!["meeting:create".to_string()],
+            &["meeting:create".to_string()],
         )
         .await?;
 
@@ -253,7 +255,7 @@ mod tests {
             "hash3",
             "meeting-controller",
             None,
-            &vec!["participant:manage".to_string()],
+            &["participant:manage".to_string()],
         )
         .await?;
 
@@ -286,7 +288,7 @@ mod tests {
             "hash1",
             "global-controller",
             None,
-            &vec!["scope1".to_string()],
+            &["scope1".to_string()],
         )
         .await?;
 
@@ -297,7 +299,7 @@ mod tests {
             "hash2",
             "meeting-controller",
             None,
-            &vec!["scope2".to_string()],
+            &["scope2".to_string()],
         )
         .await;
 

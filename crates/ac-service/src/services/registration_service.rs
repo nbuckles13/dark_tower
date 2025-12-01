@@ -3,6 +3,7 @@ use crate::errors::AcError;
 use crate::models::{AuthEventType, RegisterServiceResponse, ServiceType};
 use crate::repositories::{auth_events, service_credentials};
 use sqlx::PgPool;
+use std::str::FromStr;
 use uuid::Uuid;
 
 /// Register a new service and generate credentials
@@ -15,13 +16,9 @@ pub async fn register_service(
     region: Option<String>,
 ) -> Result<RegisterServiceResponse, AcError> {
     // Validate and parse service_type
-    let svc_type = ServiceType::from_str(service_type)
-        .ok_or_else(|| {
-            AcError::Database(format!(
-                "Invalid service_type: '{}'. Must be one of: global-controller, meeting-controller, media-handler",
-                service_type
-            ))
-        })?;
+    let svc_type = ServiceType::from_str(service_type).map_err(|e| {
+        AcError::Database(format!("Invalid service_type: '{}'. {}", service_type, e))
+    })?;
 
     // Generate client_id (UUID)
     let client_id = Uuid::new_v4().to_string();
@@ -77,7 +74,7 @@ pub async fn register_service(
 }
 
 /// Update scopes for an existing service
-#[expect(dead_code)] // Will be used in Phase 4 admin endpoints
+#[allow(dead_code)] // Library function - will be used in Phase 4 admin endpoints
 pub async fn update_service_scopes(
     pool: &PgPool,
     client_id: &str,
@@ -116,7 +113,7 @@ pub async fn update_service_scopes(
 }
 
 /// Deactivate a service credential
-#[expect(dead_code)] // Will be used in Phase 4 admin endpoints
+#[allow(dead_code)] // Library function - will be used in Phase 4 admin endpoints
 pub async fn deactivate_service(pool: &PgPool, client_id: &str) -> Result<(), AcError> {
     // Fetch credential
     let credential = service_credentials::get_by_client_id(pool, client_id)

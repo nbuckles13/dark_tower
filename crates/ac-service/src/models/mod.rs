@@ -1,54 +1,73 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
+use std::str::FromStr;
 use uuid::Uuid;
 
 /// Service credential model (maps to service_credentials table)
 #[derive(Debug, Clone, FromRow)]
-#[expect(dead_code)] // Some fields used only in Phase 4 admin endpoints
 pub struct ServiceCredential {
     pub credential_id: Uuid,
+    #[allow(dead_code)] // Will be used in Phase 4 admin endpoints
     pub client_id: String,
     pub client_secret_hash: String,
     pub service_type: String,
+    #[allow(dead_code)] // Will be used in Phase 4 admin endpoints
     pub region: Option<String>,
     pub scopes: Vec<String>,
     pub is_active: bool,
+    #[allow(dead_code)] // Will be used in Phase 4 admin endpoints
     pub created_at: DateTime<Utc>,
+    #[allow(dead_code)] // Will be used in Phase 4 admin endpoints
     pub updated_at: DateTime<Utc>,
 }
 
 /// Signing key model (maps to signing_keys table)
 #[derive(Debug, Clone, FromRow)]
-#[expect(dead_code)] // Some fields used only in Phase 4 admin/JWKS endpoints
 pub struct SigningKey {
     pub key_id: String,
     pub public_key: String,
     pub private_key_encrypted: Vec<u8>,
     pub encryption_nonce: Vec<u8>,
     pub encryption_tag: Vec<u8>,
+    #[allow(dead_code)] // Will be used in Phase 4 admin endpoints
     pub encryption_algorithm: String,
+    #[allow(dead_code)] // Will be used in Phase 4 admin endpoints
     pub master_key_version: i32,
+    #[allow(dead_code)] // Will be used in Phase 4 admin endpoints
     pub algorithm: String,
+    #[allow(dead_code)] // Will be used in Phase 4 admin endpoints
     pub is_active: bool,
+    #[allow(dead_code)] // Will be used in Phase 4 admin endpoints
     pub valid_from: DateTime<Utc>,
+    #[allow(dead_code)] // Will be used in Phase 4 admin endpoints
     pub valid_until: DateTime<Utc>,
+    #[allow(dead_code)] // Will be used in Phase 4 admin endpoints
     pub created_at: DateTime<Utc>,
 }
 
 /// Auth event model (maps to auth_events table)
 #[derive(Debug, Clone, FromRow)]
-#[expect(dead_code)] // Used only in Phase 4 audit/monitoring endpoints
 pub struct AuthEvent {
+    #[allow(dead_code)] // Will be used in Phase 4 audit endpoints
     pub event_id: Uuid,
+    #[allow(dead_code)] // Will be used in Phase 4 audit endpoints
     pub event_type: String,
+    #[allow(dead_code)] // Will be used in Phase 4 user auth
     pub user_id: Option<Uuid>,
+    #[allow(dead_code)] // Will be used in Phase 4 audit endpoints
     pub credential_id: Option<Uuid>,
+    #[allow(dead_code)] // Will be used in Phase 4 audit endpoints
     pub success: bool,
+    #[allow(dead_code)] // Will be used in Phase 4 audit endpoints
     pub failure_reason: Option<String>,
+    #[allow(dead_code)] // Will be used in Phase 4 audit endpoints
     pub ip_address: Option<String>,
+    #[allow(dead_code)] // Will be used in Phase 4 audit endpoints
     pub user_agent: Option<String>,
+    #[allow(dead_code)] // Will be used in Phase 4 audit endpoints
     pub metadata: Option<serde_json::Value>,
+    #[allow(dead_code)] // Will be used in Phase 4 audit endpoints
     pub created_at: DateTime<Utc>,
 }
 
@@ -121,18 +140,8 @@ impl ServiceType {
         }
     }
 
-    /// Parse from string
-    pub fn from_str(s: &str) -> Option<Self> {
-        match s {
-            "global-controller" => Some(ServiceType::GlobalController),
-            "meeting-controller" => Some(ServiceType::MeetingController),
-            "media-handler" => Some(ServiceType::MediaHandler),
-            _ => None,
-        }
-    }
-
     /// Convert to string
-    #[expect(dead_code)] // Will be used in Phase 4 admin endpoints
+    #[allow(dead_code)] // Will be used in Phase 4 admin endpoints
     pub fn as_str(&self) -> &'static str {
         match self {
             ServiceType::GlobalController => "global-controller",
@@ -142,19 +151,37 @@ impl ServiceType {
     }
 }
 
+impl FromStr for ServiceType {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "global-controller" => Ok(ServiceType::GlobalController),
+            "meeting-controller" => Ok(ServiceType::MeetingController),
+            "media-handler" => Ok(ServiceType::MediaHandler),
+            _ => Err(format!("Invalid service type: {}", s)),
+        }
+    }
+}
+
 /// Auth event type enum
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[expect(dead_code)] // All variants used in Phase 4 event logging
 pub enum AuthEventType {
+    #[allow(dead_code)] // Will be used in Phase 4 user auth
     UserLogin,
+    #[allow(dead_code)] // Will be used in Phase 4 user auth
     UserLoginFailed,
     ServiceTokenIssued,
     ServiceTokenFailed,
     ServiceRegistered,
     KeyGenerated,
+    #[allow(dead_code)] // Will be used in Phase 4 key rotation
     KeyRotated,
+    #[allow(dead_code)] // Will be used in Phase 4 key rotation
     KeyExpired,
+    #[allow(dead_code)] // Will be used in Phase 4 token validation
     TokenValidationFailed,
+    #[allow(dead_code)] // Will be used in Phase 4 rate limiting
     RateLimitExceeded,
 }
 
@@ -194,17 +221,17 @@ mod tests {
     #[test]
     fn test_service_type_parsing() {
         assert_eq!(
-            ServiceType::from_str("global-controller"),
+            ServiceType::from_str("global-controller").ok(),
             Some(ServiceType::GlobalController)
         );
         assert_eq!(
-            ServiceType::from_str("meeting-controller"),
+            ServiceType::from_str("meeting-controller").ok(),
             Some(ServiceType::MeetingController)
         );
         assert_eq!(
-            ServiceType::from_str("media-handler"),
+            ServiceType::from_str("media-handler").ok(),
             Some(ServiceType::MediaHandler)
         );
-        assert_eq!(ServiceType::from_str("invalid"), None);
+        assert!(ServiceType::from_str("invalid").is_err());
     }
 }

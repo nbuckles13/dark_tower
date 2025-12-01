@@ -45,7 +45,7 @@ pub async fn log_event(
 }
 
 /// Get authentication events for a user
-#[expect(dead_code)] // Will be used in Phase 4 audit endpoints
+#[allow(dead_code)] // Library function - will be used in Phase 4 audit endpoints
 pub async fn get_events_by_user(
     pool: &PgPool,
     user_id: Uuid,
@@ -72,7 +72,7 @@ pub async fn get_events_by_user(
 }
 
 /// Get authentication events for a service credential
-#[expect(dead_code)] // Will be used in Phase 4 audit endpoints
+#[allow(dead_code)] // Library function - will be used in Phase 4 audit endpoints
 pub async fn get_events_by_credential(
     pool: &PgPool,
     credential_id: Uuid,
@@ -99,7 +99,7 @@ pub async fn get_events_by_credential(
 }
 
 /// Get failed authentication attempts from an IP address
-#[expect(dead_code)] // Will be used in Phase 4 rate limiting
+#[allow(dead_code)] // Library function - will be used in Phase 4 rate limiting
 pub async fn get_failed_attempts_by_ip(
     pool: &PgPool,
     ip_address: &str,
@@ -127,7 +127,7 @@ pub async fn get_failed_attempts_by_ip(
 }
 
 /// Get events by type within a time range
-#[expect(dead_code)] // Will be used in Phase 4 analytics/monitoring
+#[allow(dead_code)] // Library function - will be used in Phase 4 analytics/monitoring
 pub async fn get_events_by_type(
     pool: &PgPool,
     event_type: &str,
@@ -198,7 +198,7 @@ mod tests {
             "hash",
             "global-controller",
             None,
-            &vec!["test:scope".to_string()],
+            &["test:scope".to_string()],
         )
         .await?;
         let credential_id = credential.credential_id;
@@ -236,7 +236,7 @@ mod tests {
             "hash",
             "global-controller",
             None,
-            &vec!["test:scope".to_string()],
+            &["test:scope".to_string()],
         )
         .await?;
         let credential_id = credential.credential_id;
@@ -300,7 +300,7 @@ mod tests {
             "hash",
             "global-controller",
             None,
-            &vec!["test:scope".to_string()],
+            &["test:scope".to_string()],
         )
         .await?;
         let credential_id = credential.credential_id;
@@ -311,7 +311,7 @@ mod tests {
             "hash",
             "media-handler",
             None,
-            &vec!["test:scope".to_string()],
+            &["test:scope".to_string()],
         )
         .await?;
         let other_credential_id = other_credential.credential_id;
@@ -368,7 +368,7 @@ mod tests {
             "hash",
             "global-controller",
             None,
-            &vec!["test:scope".to_string()],
+            &["test:scope".to_string()],
         )
         .await?;
         let cred2 = service_credentials::create_service_credential(
@@ -377,7 +377,7 @@ mod tests {
             "hash",
             "global-controller",
             None,
-            &vec!["test:scope".to_string()],
+            &["test:scope".to_string()],
         )
         .await?;
         let cred3 = service_credentials::create_service_credential(
@@ -386,7 +386,7 @@ mod tests {
             "hash",
             "global-controller",
             None,
-            &vec!["test:scope".to_string()],
+            &["test:scope".to_string()],
         )
         .await?;
 
@@ -419,7 +419,7 @@ mod tests {
             "hash",
             "global-controller",
             None,
-            &vec!["test:scope".to_string()],
+            &["test:scope".to_string()],
         )
         .await?;
 
@@ -444,7 +444,7 @@ mod tests {
             "hash",
             "global-controller",
             None,
-            &vec!["test:scope".to_string()],
+            &["test:scope".to_string()],
         )
         .await?;
 
@@ -488,7 +488,7 @@ mod tests {
             "hash",
             "global-controller",
             None,
-            &vec!["test:scope".to_string()],
+            &["test:scope".to_string()],
         )
         .await?;
         let cred2 = service_credentials::create_service_credential(
@@ -497,7 +497,7 @@ mod tests {
             "hash",
             "global-controller",
             None,
-            &vec!["test:scope".to_string()],
+            &["test:scope".to_string()],
         )
         .await?;
 
@@ -561,7 +561,7 @@ mod tests {
             "hash",
             "global-controller",
             None,
-            &vec!["test:scope".to_string()],
+            &["test:scope".to_string()],
         )
         .await?;
         let credential_id = credential.credential_id;
@@ -615,7 +615,7 @@ mod tests {
             "hash",
             "global-controller",
             None,
-            &vec!["test:scope".to_string()],
+            &["test:scope".to_string()],
         )
         .await?;
         let credential_id = credential.credential_id;
