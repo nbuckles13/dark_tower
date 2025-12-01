@@ -7,6 +7,10 @@ edition = "2021"
 [package.metadata]
 cargo-fuzz = true
 
+[workspace]
+# This is an independent workspace for fuzzing
+# (not part of the main Dark Tower workspace)
+
 [dependencies]
 libfuzzer-sys = "0.4"
 media-protocol = { path = ".." }

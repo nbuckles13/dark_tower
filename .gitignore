@@ -4,6 +4,11 @@
 *.pdb
 Cargo.lock
 
+# Fuzz testing artifacts
+**/fuzz/corpus/
+**/fuzz/target/
+**/fuzz/artifacts/
+
 # Generated protobuf code
 crates/proto-gen/src/generated/*.rs
 
