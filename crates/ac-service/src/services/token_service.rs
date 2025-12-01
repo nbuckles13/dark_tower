@@ -649,4 +649,623 @@ mod tests {
 
         Ok(())
     }
+
+    // ============================================================================
+    // P1 Security Tests - JWT Validation & Manipulation
+    // ============================================================================
+
+    /// P1-1: Test JWT payload tampering detection
+    ///
+    /// Verifies that modifying JWT claims (sub, scope, etc.) is detected
+    /// and rejected even if the signature appears valid.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_jwt_payload_tampering_rejected(pool: PgPool) -> Result<(), AcError> {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+
+        let master_key = crypto::generate_random_bytes(32)?;
+        key_management_service::initialize_signing_key(&pool, &master_key, "test").await?;
+
+        let valid_secret = "valid-secret-12345";
+        let valid_hash = crypto::hash_client_secret(valid_secret)?;
+
+        service_credentials::create_service_credential(
+            &pool,
+            "tamper-client",
+            &valid_hash,
+            "media-handler",
+            None,
+            &["media:process".to_string()],
+        )
+        .await?;
+
+        // Issue a valid token
+        let token_response = issue_service_token(
+            &pool,
+            &master_key,
+            "tamper-client",
+            valid_secret,
+            "client_credentials",
+            None,
+            None,
+            None,
+        )
+        .await?;
+
+        // Tamper with the payload by changing scope claim
+        let parts: Vec<&str> = token_response.access_token.split('.').collect();
+        assert_eq!(parts.len(), 3, "JWT should have 3 parts");
+
+        // Decode the payload
+        let payload_bytes = URL_SAFE_NO_PAD
+            .decode(parts[1])
+            .expect("Failed to decode payload");
+        let mut payload: serde_json::Value =
+            serde_json::from_slice(&payload_bytes).expect("Failed to parse payload JSON");
+
+        // Tamper: escalate scope to admin
+        payload["scope"] = serde_json::Value::String("admin:all meeting:delete".to_string());
+
+        // Re-encode the tampered payload
+        let tampered_payload = URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&payload).expect("Failed to serialize payload"));
+
+        // Reconstruct JWT with tampered payload (signature will be invalid)
+        let tampered_token = format!("{}.{}.{}", parts[0], tampered_payload, parts[2]);
+
+        // Attempt to verify the tampered token
+        let signing_key = signing_keys::get_active_key(&pool)
+            .await?
+            .expect("No active signing key found");
+        let result = crypto::verify_jwt(&tampered_token, &signing_key.public_key);
+
+        // Should be rejected due to signature mismatch
+        assert!(
+            matches!(result, Err(AcError::InvalidToken(_))),
+            "Tampered JWT should be rejected"
+        );
+
+        Ok(())
+    }
+
+    /// P1-1: Test JWT signed with wrong key is rejected
+    ///
+    /// Verifies that a valid JWT signed with a different key is rejected.
+    /// This is critical - if signature verification is broken, attackers could
+    /// generate tokens with their own keys.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_jwt_wrong_signature_rejected(pool: PgPool) -> Result<(), AcError> {
+        use chrono::Utc;
+
+        let master_key = crypto::generate_random_bytes(32)?;
+        key_management_service::initialize_signing_key(&pool, &master_key, "test").await?;
+
+        // Get the correct signing key
+        let correct_key = signing_keys::get_active_key(&pool)
+            .await?
+            .expect("No active signing key found");
+
+        // Generate a DIFFERENT keypair (attacker's key)
+        let (wrong_public_key, wrong_private_key) = crypto::generate_signing_key()?;
+
+        // Create valid claims
+        let claims = crypto::Claims {
+            sub: "test-client".to_string(),
+            exp: Utc::now().timestamp() + 3600,
+            iat: Utc::now().timestamp(),
+            scope: "meeting:create".to_string(),
+            service_type: Some("global-controller".to_string()),
+        };
+
+        // Sign with the WRONG key (attacker's key)
+        let token_wrong_key = crypto::sign_jwt(&claims, &wrong_private_key)?;
+
+        // Try to verify with the CORRECT public key
+        let result = crypto::verify_jwt(&token_wrong_key, &correct_key.public_key);
+
+        // Should be rejected - signature won't match
+        assert!(
+            matches!(result, Err(AcError::InvalidToken(_))),
+            "JWT signed with wrong key should be rejected"
+        );
+
+        // Also verify that verifying with the wrong public key would succeed
+        // (to prove the token itself is valid, just not for our system)
+        let verify_with_wrong_key = crypto::verify_jwt(&token_wrong_key, &wrong_public_key);
+        assert!(
+            verify_with_wrong_key.is_ok(),
+            "Token should be valid for the key it was signed with"
+        );
+
+        Ok(())
+    }
+
+    /// P1-1: Test JWT signature stripping attack
+    ///
+    /// Verifies that removing the signature component is detected and rejected.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_jwt_signature_stripped_rejected(pool: PgPool) -> Result<(), AcError> {
+        let master_key = crypto::generate_random_bytes(32)?;
+        key_management_service::initialize_signing_key(&pool, &master_key, "test").await?;
+
+        let valid_secret = "valid-secret-12345";
+        let valid_hash = crypto::hash_client_secret(valid_secret)?;
+
+        service_credentials::create_service_credential(
+            &pool,
+            "sig-strip-client",
+            &valid_hash,
+            "global-controller",
+            None,
+            &["meeting:create".to_string()],
+        )
+        .await?;
+
+        // Issue a valid token
+        let token_response = issue_service_token(
+            &pool,
+            &master_key,
+            "sig-strip-client",
+            valid_secret,
+            "client_credentials",
+            None,
+            None,
+            None,
+        )
+        .await?;
+
+        // Strip signature (remove third component)
+        let parts: Vec<&str> = token_response.access_token.split('.').collect();
+        let stripped_token = format!("{}.{}", parts[0], parts[1]);
+
+        // Attempt to verify the stripped token
+        let signing_key = signing_keys::get_active_key(&pool)
+            .await?
+            .expect("No active signing key found");
+        let result = crypto::verify_jwt(&stripped_token, &signing_key.public_key);
+
+        // Should be rejected - invalid JWT format
+        assert!(
+            matches!(result, Err(AcError::InvalidToken(_))),
+            "JWT without signature should be rejected"
+        );
+
+        Ok(())
+    }
+
+    /// P1-1: Test JWT algorithm confusion prevention
+    ///
+    /// Verifies that changing the algorithm in the header (e.g., EdDSA -> HS256)
+    /// is rejected even if the signature appears valid.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_jwt_algorithm_confusion_rejected(pool: PgPool) -> Result<(), AcError> {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+
+        let master_key = crypto::generate_random_bytes(32)?;
+        key_management_service::initialize_signing_key(&pool, &master_key, "test").await?;
+
+        let valid_secret = "valid-secret-12345";
+        let valid_hash = crypto::hash_client_secret(valid_secret)?;
+
+        service_credentials::create_service_credential(
+            &pool,
+            "alg-conf-client",
+            &valid_hash,
+            "global-controller",
+            None,
+            &["meeting:create".to_string()],
+        )
+        .await?;
+
+        // Issue a valid token with EdDSA
+        let token_response = issue_service_token(
+            &pool,
+            &master_key,
+            "alg-conf-client",
+            valid_secret,
+            "client_credentials",
+            None,
+            None,
+            None,
+        )
+        .await?;
+
+        // Attempt to change algorithm to HS256
+        let parts: Vec<&str> = token_response.access_token.split('.').collect();
+
+        // Decode the header
+        let header_bytes = URL_SAFE_NO_PAD
+            .decode(parts[0])
+            .expect("Failed to decode header");
+        let mut header: serde_json::Value =
+            serde_json::from_slice(&header_bytes).expect("Failed to parse header JSON");
+
+        // Tamper: change algorithm from EdDSA to HS256
+        header["alg"] = serde_json::Value::String("HS256".to_string());
+
+        // Re-encode the tampered header
+        let tampered_header = URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&header).expect("Failed to serialize header"));
+
+        // Reconstruct JWT with tampered header
+        let tampered_token = format!("{}.{}.{}", tampered_header, parts[1], parts[2]);
+
+        // Attempt to verify with EdDSA public key
+        let signing_key = signing_keys::get_active_key(&pool)
+            .await?
+            .expect("No active signing key found");
+        let result = crypto::verify_jwt(&tampered_token, &signing_key.public_key);
+
+        // Should be rejected due to algorithm mismatch
+        assert!(
+            matches!(result, Err(AcError::InvalidToken(_))),
+            "JWT with modified algorithm should be rejected"
+        );
+
+        Ok(())
+    }
+
+    /// P1-1: Test JWT "none" algorithm attack
+    ///
+    /// Verifies that JWTs with alg: "none" are rejected. This is a classic
+    /// JWT vulnerability (CVE-2015-2951) where attackers bypass signature
+    /// verification by claiming no algorithm is used.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_jwt_none_algorithm_rejected(pool: PgPool) -> Result<(), AcError> {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+
+        let master_key = crypto::generate_random_bytes(32)?;
+        key_management_service::initialize_signing_key(&pool, &master_key, "test").await?;
+
+        let valid_secret = "valid-secret-12345";
+        let valid_hash = crypto::hash_client_secret(valid_secret)?;
+
+        service_credentials::create_service_credential(
+            &pool,
+            "none-alg-client",
+            &valid_hash,
+            "global-controller",
+            None,
+            &["meeting:create".to_string()],
+        )
+        .await?;
+
+        // Issue a valid token first
+        let token_response = issue_service_token(
+            &pool,
+            &master_key,
+            "none-alg-client",
+            valid_secret,
+            "client_credentials",
+            None,
+            None,
+            None,
+        )
+        .await?;
+
+        // Modify the algorithm to "none"
+        let parts: Vec<&str> = token_response.access_token.split('.').collect();
+        let header_bytes = URL_SAFE_NO_PAD
+            .decode(parts[0])
+            .expect("Failed to decode header");
+        let mut header: serde_json::Value =
+            serde_json::from_slice(&header_bytes).expect("Failed to parse header JSON");
+
+        // Classic attack: set alg to "none"
+        header["alg"] = serde_json::Value::String("none".to_string());
+
+        let tampered_header = URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&header).expect("Failed to serialize header"));
+
+        // Reconstruct JWT with "none" algorithm (no signature or empty signature)
+        let none_token = format!("{}.{}.", tampered_header, parts[1]);
+
+        // Attempt to verify
+        let signing_key = signing_keys::get_active_key(&pool)
+            .await?
+            .expect("No active signing key found");
+        let result = crypto::verify_jwt(&none_token, &signing_key.public_key);
+
+        // Should be rejected - "none" algorithm not allowed
+        assert!(
+            matches!(result, Err(AcError::InvalidToken(_))),
+            "JWT with 'none' algorithm should be rejected"
+        );
+
+        Ok(())
+    }
+
+    /// P1-1: Test expired token rejection in full validation flow
+    ///
+    /// Verifies that tokens with exp < current time are rejected.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_jwt_expired_token_rejected(pool: PgPool) -> Result<(), AcError> {
+        use chrono::Utc;
+
+        let master_key = crypto::generate_random_bytes(32)?;
+        key_management_service::initialize_signing_key(&pool, &master_key, "test").await?;
+
+        // Get the signing key
+        let signing_key_model = signing_keys::get_active_key(&pool)
+            .await?
+            .expect("No active signing key found");
+
+        // Manually create an expired token
+        let expired_claims = crypto::Claims {
+            sub: "expired-client".to_string(),
+            exp: Utc::now().timestamp() - 3600, // Expired 1 hour ago
+            iat: Utc::now().timestamp() - 7200, // Issued 2 hours ago
+            scope: "meeting:create".to_string(),
+            service_type: Some("global-controller".to_string()),
+        };
+
+        // Decrypt the private key
+        let encrypted_key = crypto::EncryptedKey {
+            encrypted_data: signing_key_model.private_key_encrypted.clone(),
+            nonce: signing_key_model.encryption_nonce.clone(),
+            tag: signing_key_model.encryption_tag.clone(),
+        };
+        let private_key = crypto::decrypt_private_key(&encrypted_key, &master_key)?;
+
+        // Sign the expired token
+        let expired_token = crypto::sign_jwt(&expired_claims, &private_key)?;
+
+        // Attempt to verify the expired token
+        let result = crypto::verify_jwt(&expired_token, &signing_key_model.public_key);
+
+        // Should be rejected due to expiration
+        assert!(
+            matches!(result, Err(AcError::InvalidToken(_))),
+            "Expired JWT should be rejected"
+        );
+
+        Ok(())
+    }
+
+    /// P1-1: Test JWT with future issued-at time rejected
+    ///
+    /// Verifies that tokens with iat > current time are handled appropriately.
+    /// Note: jsonwebtoken crate doesn't validate iat by default, but we test
+    /// that the token structure is valid even with future iat.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_jwt_future_iat_accepted_by_library(pool: PgPool) -> Result<(), AcError> {
+        use chrono::Utc;
+
+        let master_key = crypto::generate_random_bytes(32)?;
+        key_management_service::initialize_signing_key(&pool, &master_key, "test").await?;
+
+        // Get the signing key
+        let signing_key_model = signing_keys::get_active_key(&pool)
+            .await?
+            .expect("No active signing key found");
+
+        // Create a token with future iat (issued in the future)
+        let future_claims = crypto::Claims {
+            sub: "future-client".to_string(),
+            exp: Utc::now().timestamp() + 7200, // Expires in 2 hours
+            iat: Utc::now().timestamp() + 3600, // Issued 1 hour from now (suspicious!)
+            scope: "meeting:create".to_string(),
+            service_type: Some("global-controller".to_string()),
+        };
+
+        // Decrypt the private key
+        let encrypted_key = crypto::EncryptedKey {
+            encrypted_data: signing_key_model.private_key_encrypted.clone(),
+            nonce: signing_key_model.encryption_nonce.clone(),
+            tag: signing_key_model.encryption_tag.clone(),
+        };
+        let private_key = crypto::decrypt_private_key(&encrypted_key, &master_key)?;
+
+        // Sign the token with future iat
+        let future_token = crypto::sign_jwt(&future_claims, &private_key)?;
+
+        // Verify the token - jsonwebtoken library doesn't validate iat by default
+        // so this will succeed. This documents the current behavior.
+        let result = crypto::verify_jwt(&future_token, &signing_key_model.public_key);
+
+        // Currently accepted (library doesn't validate iat)
+        // If we want stricter validation, we'd need to add custom iat checking
+        assert!(
+            result.is_ok(),
+            "JWT with future iat is currently accepted by jsonwebtoken library"
+        );
+
+        let claims = result.unwrap();
+        assert_eq!(claims.sub, "future-client");
+
+        // Note: This test documents that we rely on the jsonwebtoken library's
+        // validation. If stricter iat validation is needed, add to crypto::verify_jwt.
+
+        Ok(())
+    }
+
+    /// P1-2: Test JWT claims injection - extra claims
+    ///
+    /// Verifies that extra claims in the JWT are safely ignored during deserialization.
+    /// This tests that serde correctly handles unknown fields when deserializing into
+    /// the Claims struct, which is critical for forward compatibility.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_jwt_extra_claims_ignored_safely(pool: PgPool) -> Result<(), AcError> {
+        use chrono::Utc;
+        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+
+        let master_key = crypto::generate_random_bytes(32)?;
+        key_management_service::initialize_signing_key(&pool, &master_key, "test").await?;
+
+        // Get the signing key
+        let signing_key_model = signing_keys::get_active_key(&pool)
+            .await?
+            .expect("No active signing key found");
+
+        // Decrypt the private key
+        let encrypted_key = crypto::EncryptedKey {
+            encrypted_data: signing_key_model.private_key_encrypted.clone(),
+            nonce: signing_key_model.encryption_nonce.clone(),
+            tag: signing_key_model.encryption_tag.clone(),
+        };
+        let private_key = crypto::decrypt_private_key(&encrypted_key, &master_key)?;
+
+        // Create a custom struct with EXTRA fields beyond what Claims has
+        #[derive(serde::Serialize)]
+        struct ClaimsWithExtra {
+            sub: String,
+            exp: i64,
+            iat: i64,
+            scope: String,
+            service_type: Option<String>,
+            // Extra fields that Claims doesn't have
+            admin: bool,
+            roles: Vec<String>,
+            custom_field: String,
+        }
+
+        let claims_with_extra = ClaimsWithExtra {
+            sub: "extra-claims-client".to_string(),
+            exp: Utc::now().timestamp() + 3600,
+            iat: Utc::now().timestamp(),
+            scope: "meeting:create".to_string(),
+            service_type: Some("global-controller".to_string()),
+            admin: true,                                // Extra field
+            roles: vec!["superuser".to_string()],       // Extra field
+            custom_field: "malicious_data".to_string(), // Extra field
+        };
+
+        // Sign the token WITH extra fields
+        let encoding_key = EncodingKey::from_ed_der(&private_key);
+        let header = Header::new(Algorithm::EdDSA);
+        let token_with_extra = encode(&header, &claims_with_extra, &encoding_key)
+            .expect("Failed to encode token with extra claims");
+
+        // Verify it deserializes into Claims struct (should ignore extra fields)
+        let verified = crypto::verify_jwt(&token_with_extra, &signing_key_model.public_key)?;
+
+        // Should successfully parse the standard fields
+        assert_eq!(verified.sub, "extra-claims-client");
+        assert_eq!(verified.scope, "meeting:create");
+        assert_eq!(verified.service_type, Some("global-controller".to_string()));
+
+        // Extra fields (admin, roles, custom_field) are silently ignored
+        // This is the expected behavior for forward compatibility
+
+        Ok(())
+    }
+
+    /// P1-2: Test JWT missing required claims
+    ///
+    /// Verifies that JWTs missing required claims (sub, exp, iat, scope) are rejected.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_jwt_missing_required_claims_rejected(pool: PgPool) -> Result<(), AcError> {
+        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+
+        let master_key = crypto::generate_random_bytes(32)?;
+        key_management_service::initialize_signing_key(&pool, &master_key, "test").await?;
+
+        // Get the signing key
+        let signing_key_model = signing_keys::get_active_key(&pool)
+            .await?
+            .expect("No active signing key found");
+
+        // Decrypt the private key
+        let encrypted_key = crypto::EncryptedKey {
+            encrypted_data: signing_key_model.private_key_encrypted.clone(),
+            nonce: signing_key_model.encryption_nonce.clone(),
+            tag: signing_key_model.encryption_tag.clone(),
+        };
+        let private_key = crypto::decrypt_private_key(&encrypted_key, &master_key)?;
+
+        // Create a JWT with missing 'scope' claim
+        #[derive(serde::Serialize)]
+        struct IncompleteClaims {
+            sub: String,
+            exp: i64,
+            iat: i64,
+            // Missing 'scope' field!
+        }
+
+        let incomplete_claims = IncompleteClaims {
+            sub: "incomplete-client".to_string(),
+            exp: chrono::Utc::now().timestamp() + 3600,
+            iat: chrono::Utc::now().timestamp(),
+        };
+
+        let encoding_key = EncodingKey::from_ed_der(&private_key);
+        let header = Header::new(Algorithm::EdDSA);
+        let incomplete_token = encode(&header, &incomplete_claims, &encoding_key)
+            .expect("Failed to encode incomplete token");
+
+        // Attempt to verify - should fail during deserialization
+        let result = crypto::verify_jwt(&incomplete_token, &signing_key_model.public_key);
+
+        assert!(
+            matches!(result, Err(AcError::InvalidToken(_))),
+            "JWT missing required claims should be rejected"
+        );
+
+        Ok(())
+    }
+
+    /// P1-2: Test JWT sub claim tampering
+    ///
+    /// Verifies that changing the subject claim is detected by signature verification.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_jwt_sub_claim_tampering_rejected(pool: PgPool) -> Result<(), AcError> {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+
+        let master_key = crypto::generate_random_bytes(32)?;
+        key_management_service::initialize_signing_key(&pool, &master_key, "test").await?;
+
+        let valid_secret = "valid-secret-12345";
+        let valid_hash = crypto::hash_client_secret(valid_secret)?;
+
+        service_credentials::create_service_credential(
+            &pool,
+            "sub-tamper-client",
+            &valid_hash,
+            "global-controller",
+            None,
+            &["meeting:create".to_string()],
+        )
+        .await?;
+
+        // Issue a valid token
+        let token_response = issue_service_token(
+            &pool,
+            &master_key,
+            "sub-tamper-client",
+            valid_secret,
+            "client_credentials",
+            None,
+            None,
+            None,
+        )
+        .await?;
+
+        // Tamper with the sub claim
+        let parts: Vec<&str> = token_response.access_token.split('.').collect();
+        let payload_bytes = URL_SAFE_NO_PAD
+            .decode(parts[1])
+            .expect("Failed to decode payload");
+        let mut payload: serde_json::Value =
+            serde_json::from_slice(&payload_bytes).expect("Failed to parse payload JSON");
+
+        // Change sub to impersonate another client
+        payload["sub"] = serde_json::Value::String("admin-client".to_string());
+
+        let tampered_payload = URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&payload).expect("Failed to serialize payload"));
+        let tampered_token = format!("{}.{}.{}", parts[0], tampered_payload, parts[2]);
+
+        // Attempt to verify
+        let signing_key = signing_keys::get_active_key(&pool)
+            .await?
+            .expect("No active signing key found");
+        let result = crypto::verify_jwt(&tampered_token, &signing_key.public_key);
+
+        // Should be rejected due to signature mismatch
+        assert!(
+            matches!(result, Err(AcError::InvalidToken(_))),
+            "JWT with tampered sub claim should be rejected"
+        );
+
+        Ok(())
+    }
 }
