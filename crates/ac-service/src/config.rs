@@ -7,7 +7,7 @@ pub struct Config {
     pub database_url: String,
     pub bind_address: String,
     pub master_key: Vec<u8>,
-    #[expect(dead_code)] // Will be used in Phase 4 for observability
+    #[allow(dead_code)] // Will be used in Phase 4 for observability
     pub otlp_endpoint: Option<String>,
 }
 

@@ -93,7 +93,7 @@ pub async fn initialize_signing_key(
 }
 
 /// Rotate signing keys (generate new key, mark old keys as inactive)
-#[expect(dead_code)] // Will be used in Phase 4 key rotation endpoints
+#[allow(dead_code)] // Library function - will be used in Phase 4 key rotation endpoints
 pub async fn rotate_signing_key(
     pool: &PgPool,
     master_key: &[u8],
@@ -191,7 +191,7 @@ pub async fn get_jwks(pool: &PgPool) -> Result<Jwks, AcError> {
 }
 
 /// Check and mark expired keys as inactive
-#[expect(dead_code)] // Will be used in Phase 4 background tasks
+#[allow(dead_code)] // Library function - will be used in Phase 4 background tasks
 pub async fn expire_old_keys(_pool: &PgPool) -> Result<Vec<String>, AcError> {
     // This would be called periodically by a background task
     // For now, it's a placeholder that could be implemented in Phase 4
