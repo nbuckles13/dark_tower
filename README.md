@@ -111,6 +111,9 @@ See [DEVELOPMENT.md](docs/DEVELOPMENT.md) for detailed setup instructions for ot
 git clone https://github.com/nbuckles13/dark_tower.git
 cd dark_tower
 
+# Install git hooks (automatically runs cargo fmt and clippy before commits)
+./.githooks/install.sh
+
 # Build all components
 cargo build
 

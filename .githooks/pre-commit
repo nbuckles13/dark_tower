@@ -1,0 +1,34 @@
+#!/bin/bash
+#
+# Pre-commit hook for Dark Tower project
+# Automatically runs cargo fmt and cargo clippy before each commit
+#
+
+set -e
+
+echo "🔍 Running pre-commit checks..."
+
+# Run cargo fmt
+echo "  ➜ Formatting code with cargo fmt..."
+cargo fmt --all -- --check
+if [ $? -ne 0 ]; then
+    echo ""
+    echo "❌ Code formatting issues detected!"
+    echo "   Run 'cargo fmt' to fix formatting, then commit again."
+    exit 1
+fi
+
+# Run cargo clippy on changed Rust files
+echo "  ➜ Running clippy on changed files..."
+if git diff --cached --name-only | grep -q "\.rs$"; then
+    cargo clippy --all-targets --all-features -- -D warnings
+    if [ $? -ne 0 ]; then
+        echo ""
+        echo "❌ Clippy warnings/errors detected!"
+        echo "   Fix the issues and commit again."
+        exit 1
+    fi
+fi
+
+echo "✅ All pre-commit checks passed!"
+exit 0
