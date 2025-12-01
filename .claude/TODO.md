@@ -2,11 +2,21 @@
 
 ## Phase 4: P1 Security Test Improvements
 
-### Completed Items (2025-11-30)
+### Completed Items (2025-12-01)
 
-Based on comprehensive security code review, the following 11 improvements have been completed:
+#### JWT iat Validation (2025-12-01)
 
-- [x] **iat Validation Documentation**: Documented iat validation policy decision in `test_jwt_future_iat_accepted_by_library` with comprehensive TODO comments outlining options for custom validation vs accepted risk
+- [x] **iat Validation Implementation**: Implemented strict iat validation with ±5 minute clock skew tolerance in `crypto::verify_jwt()`. Tokens with future `iat` beyond tolerance are rejected (prevents token pre-generation attacks)
+- [x] **JWT_CLOCK_SKEW_SECONDS Constant**: Added 300-second (5 minute) constant per NIST SP 800-63B
+- [x] **iat Unit Tests**: Added 3 tests in crypto module (rejects future, accepts within skew, constant value)
+- [x] **iat Integration Tests**: Added 4 tests in token_service (boundary tests at exact 5-min mark)
+- [x] **Test Specialist Review**: WELL TESTED - Comprehensive coverage, excellent documentation
+- [x] **Security Specialist Review**: ACCEPTABLE - Secure implementation, defense-in-depth recommendation noted
+
+**Test Count**: Increased from 71 → 77 tests (+6 new iat validation tests)
+
+#### Previous Improvements (2025-11-30)
+
 - [x] **Error Information Leakage Prevention**: Added 2 tests preventing sensitive data exposure (OWASP A05:2021, CWE-209)
 - [x] **Key Rotation Tests Planning**: Documented required tests and missing repository methods (`get_by_key_id()`, `list_all_keys()`)
 - [x] **Timing Attack Tolerance**: Tightened from 50% to 30% to reduce attack surface
@@ -15,18 +25,18 @@ Based on comprehensive security code review, the following 11 improvements have 
 - [x] **bcrypt Cost Factor Validation**: Added 2 tests verifying cost=12 per ADR-0003 (CWE-916 mitigation)
 - [x] **Test Naming Standardization**: Fixed null byte test name and verified consistent naming across all tests
 - [x] **Magic Number Extraction**: Extracted 5 constants (token expiry, rate limits, timing thresholds) to improve maintainability
-- [x] **Code Quality**: All tests pass (71 tests), zero clippy warnings, properly formatted
 
-**Test Count**: Increased from 65 → 71 tests (+6 new security tests)
 **Code Coverage**: Maintained 83% (targeting 95%)
 
 ### Future Enhancements
 
 #### JWT Security Enhancements
 
-- [ ] **iat Validation Implementation**: Implement strict iat validation with clock skew tolerance (±5 minutes) based on decision from documented TODO
+- [x] ~~**iat Validation Implementation**: Implement strict iat validation with clock skew tolerance (±5 minutes)~~ ✅ DONE
+- [ ] **Maximum Token Age Validation** (Security Specialist Recommendation): Add validation to reject tokens with `iat` too far in the PAST (e.g., >15 minutes old) to prevent replay attacks with old tokens. Currently only future `iat` is validated.
 - [ ] **JWT Header Injection**: Add test for typ claim tampering (e.g., changing "JWT" to "something-else")
 - [ ] **Key Rotation Implementation**: Complete key rotation tests once `signing_keys::get_by_key_id()` and `signing_keys::list_all_keys()` are implemented
+- [ ] **Configurable Clock Skew**: Consider making `JWT_CLOCK_SKEW_SECONDS` configurable via environment variable for different security postures
 
 #### SQL Injection Testing Enhancements
 

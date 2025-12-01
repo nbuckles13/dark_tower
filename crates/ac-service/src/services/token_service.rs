@@ -1044,28 +1044,24 @@ mod tests {
         Ok(())
     }
 
-    /// P1-1: Test JWT with future issued-at time (documents current behavior)
+    /// P1-SECURITY: Test JWT with far-future iat is rejected (beyond clock skew)
     ///
-    /// Verifies that tokens with iat > current time are currently accepted.
+    /// Verifies that tokens with iat more than 5 minutes (JWT_CLOCK_SKEW_SECONDS)
+    /// in the future are rejected. This prevents token pre-generation attacks
+    /// and detects compromised systems with incorrect clocks.
     ///
-    /// **SECURITY NOTE**: The jsonwebtoken crate doesn't validate iat by default.
-    /// This means tokens with future iat (issued-at times in the future) are
-    /// currently accepted, which could indicate:
-    /// - Clock skew between systems
-    /// - Potential replay attacks
-    /// - Token pre-generation
+    /// This test validates the custom iat validation implemented in crypto::verify_jwt()
+    /// which supplements the jsonwebtoken library's standard validation.
     ///
-    /// **DECISION REQUIRED**:
-    /// - Option 1: Add custom iat validation in crypto::verify_jwt() with clock skew tolerance (±5 minutes)
-    /// - Option 2: Document as accepted risk for Phase 1, defer to Phase 2
+    /// Security rationale:
+    /// - Prevents attackers from pre-generating tokens for future use
+    /// - Detects systems with severely incorrect clocks (potential compromise)
+    /// - Allows reasonable clock skew (±5 minutes) for distributed systems
     ///
-    /// TODO(security): Decide iat validation policy and track in issue or ADR.
-    /// If implementing custom validation:
-    /// 1. Add check in crypto::verify_jwt(): if claims.iat > now + CLOCK_SKEW { return Err(...) }
-    /// 2. Update this test to expect rejection
-    /// 3. Add separate test for valid iat within clock skew tolerance
+    /// Per NIST SP 800-63B: Clock synchronization should be maintained within
+    /// reasonable bounds (typically 5 minutes) for time-based security controls.
     #[sqlx::test(migrations = "../../migrations")]
-    async fn test_jwt_future_iat_accepted_by_library(pool: PgPool) -> Result<(), AcError> {
+    async fn test_jwt_future_iat_beyond_clock_skew_rejected(pool: PgPool) -> Result<(), AcError> {
         use chrono::Utc;
 
         let master_key = crypto::generate_random_bytes(32)?;
@@ -1076,11 +1072,11 @@ mod tests {
             .await?
             .expect("No active signing key found");
 
-        // Create a token with future iat (issued in the future)
+        // Create a token with future iat (issued in the future, beyond clock skew)
         let future_claims = crypto::Claims {
             sub: "future-client".to_string(),
             exp: Utc::now().timestamp() + (TOKEN_EXPIRY_SECONDS_I64 * 2), // Expires in 2 hours
-            iat: Utc::now().timestamp() + TOKEN_EXPIRY_SECONDS_I64, // Issued 1 hour from now (suspicious!)
+            iat: Utc::now().timestamp() + TOKEN_EXPIRY_SECONDS_I64, // Issued 1 hour from now (way beyond 5 min skew!)
             scope: "meeting:create".to_string(),
             service_type: Some("global-controller".to_string()),
         };
@@ -1096,22 +1092,170 @@ mod tests {
         // Sign the token with future iat
         let future_token = crypto::sign_jwt(&future_claims, &private_key)?;
 
-        // Verify the token - jsonwebtoken library doesn't validate iat by default
-        // so this will succeed. This documents the current behavior.
+        // Verify the token - should be REJECTED due to custom iat validation
         let result = crypto::verify_jwt(&future_token, &signing_key_model.public_key);
 
-        // Currently accepted (library doesn't validate iat)
-        // If we want stricter validation, we'd need to add custom iat checking
+        // Should be rejected - iat too far in the future
         assert!(
-            result.is_ok(),
-            "JWT with future iat is currently accepted by jsonwebtoken library"
+            matches!(result, Err(AcError::InvalidToken(_))),
+            "JWT with iat 1 hour in future should be rejected (beyond clock skew tolerance)"
         );
 
-        let claims = result.unwrap();
-        assert_eq!(claims.sub, "future-client");
+        Ok(())
+    }
 
-        // Note: This test documents that we rely on the jsonwebtoken library's
-        // validation. If stricter iat validation is needed, add to crypto::verify_jwt.
+    /// P1-SECURITY: Test JWT with future iat within clock skew is accepted
+    ///
+    /// Verifies that tokens with iat slightly in the future (2 minutes) are accepted,
+    /// allowing for reasonable clock drift between distributed servers.
+    ///
+    /// The 5-minute clock skew tolerance (JWT_CLOCK_SKEW_SECONDS) balances security
+    /// with operational reliability for systems that may have minor time synchronization
+    /// differences.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_jwt_future_iat_within_clock_skew_accepted(pool: PgPool) -> Result<(), AcError> {
+        use chrono::Utc;
+
+        let master_key = crypto::generate_random_bytes(32)?;
+        key_management_service::initialize_signing_key(&pool, &master_key, "test").await?;
+
+        // Get the signing key
+        let signing_key_model = signing_keys::get_active_key(&pool)
+            .await?
+            .expect("No active signing key found");
+
+        // Create a token with iat 2 minutes in the future (within 5 min clock skew)
+        let claims_within_skew = crypto::Claims {
+            sub: "clock-skew-client".to_string(),
+            exp: Utc::now().timestamp() + TOKEN_EXPIRY_SECONDS_I64, // Expires in 1 hour
+            iat: Utc::now().timestamp() + 120, // Issued 2 minutes from now (within tolerance)
+            scope: "meeting:create".to_string(),
+            service_type: Some("global-controller".to_string()),
+        };
+
+        // Decrypt the private key
+        let encrypted_key = crypto::EncryptedKey {
+            encrypted_data: signing_key_model.private_key_encrypted.clone(),
+            nonce: signing_key_model.encryption_nonce.clone(),
+            tag: signing_key_model.encryption_tag.clone(),
+        };
+        let private_key = crypto::decrypt_private_key(&encrypted_key, &master_key)?;
+
+        // Sign the token
+        let token = crypto::sign_jwt(&claims_within_skew, &private_key)?;
+
+        // Verify the token - should be accepted (within clock skew)
+        let result = crypto::verify_jwt(&token, &signing_key_model.public_key);
+
+        assert!(
+            result.is_ok(),
+            "JWT with iat 2 minutes in future should be accepted (within clock skew tolerance)"
+        );
+
+        let verified_claims = result.unwrap();
+        assert_eq!(verified_claims.sub, "clock-skew-client");
+        assert_eq!(verified_claims.scope, "meeting:create");
+
+        Ok(())
+    }
+
+    /// P1-SECURITY: Test JWT iat at exact clock skew boundary is accepted
+    ///
+    /// Verifies that tokens with iat exactly at the 5-minute boundary are accepted.
+    /// This is a boundary condition test to ensure the validation uses <= not <.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_jwt_iat_at_clock_skew_boundary_accepted(pool: PgPool) -> Result<(), AcError> {
+        use chrono::Utc;
+
+        const JWT_CLOCK_SKEW_SECONDS: i64 = 300; // 5 minutes (same as crypto module constant)
+
+        let master_key = crypto::generate_random_bytes(32)?;
+        key_management_service::initialize_signing_key(&pool, &master_key, "test").await?;
+
+        // Get the signing key
+        let signing_key_model = signing_keys::get_active_key(&pool)
+            .await?
+            .expect("No active signing key found");
+
+        // Create a token with iat exactly at the clock skew boundary (5 minutes)
+        let claims_at_boundary = crypto::Claims {
+            sub: "boundary-client".to_string(),
+            exp: Utc::now().timestamp() + TOKEN_EXPIRY_SECONDS_I64,
+            iat: Utc::now().timestamp() + JWT_CLOCK_SKEW_SECONDS, // Exactly at 5 min boundary
+            scope: "meeting:create".to_string(),
+            service_type: Some("global-controller".to_string()),
+        };
+
+        // Decrypt the private key
+        let encrypted_key = crypto::EncryptedKey {
+            encrypted_data: signing_key_model.private_key_encrypted.clone(),
+            nonce: signing_key_model.encryption_nonce.clone(),
+            tag: signing_key_model.encryption_tag.clone(),
+        };
+        let private_key = crypto::decrypt_private_key(&encrypted_key, &master_key)?;
+
+        // Sign the token
+        let token = crypto::sign_jwt(&claims_at_boundary, &private_key)?;
+
+        // Verify the token - should be accepted (exactly at boundary)
+        let result = crypto::verify_jwt(&token, &signing_key_model.public_key);
+
+        assert!(
+            result.is_ok(),
+            "JWT with iat exactly at 5 minute boundary should be accepted"
+        );
+
+        let verified_claims = result.unwrap();
+        assert_eq!(verified_claims.sub, "boundary-client");
+
+        Ok(())
+    }
+
+    /// P1-SECURITY: Test JWT iat just beyond clock skew boundary is rejected
+    ///
+    /// Verifies that tokens with iat just 1 second beyond the 5-minute boundary
+    /// are rejected. This ensures the boundary validation is strict.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_jwt_iat_just_beyond_clock_skew_rejected(pool: PgPool) -> Result<(), AcError> {
+        use chrono::Utc;
+
+        const JWT_CLOCK_SKEW_SECONDS: i64 = 300; // 5 minutes (same as crypto module constant)
+
+        let master_key = crypto::generate_random_bytes(32)?;
+        key_management_service::initialize_signing_key(&pool, &master_key, "test").await?;
+
+        // Get the signing key
+        let signing_key_model = signing_keys::get_active_key(&pool)
+            .await?
+            .expect("No active signing key found");
+
+        // Create a token with iat 1 second beyond the clock skew boundary
+        let claims_beyond_boundary = crypto::Claims {
+            sub: "beyond-boundary-client".to_string(),
+            exp: Utc::now().timestamp() + TOKEN_EXPIRY_SECONDS_I64,
+            iat: Utc::now().timestamp() + JWT_CLOCK_SKEW_SECONDS + 1, // 1 second beyond 5 min
+            scope: "meeting:create".to_string(),
+            service_type: Some("global-controller".to_string()),
+        };
+
+        // Decrypt the private key
+        let encrypted_key = crypto::EncryptedKey {
+            encrypted_data: signing_key_model.private_key_encrypted.clone(),
+            nonce: signing_key_model.encryption_nonce.clone(),
+            tag: signing_key_model.encryption_tag.clone(),
+        };
+        let private_key = crypto::decrypt_private_key(&encrypted_key, &master_key)?;
+
+        // Sign the token
+        let token = crypto::sign_jwt(&claims_beyond_boundary, &private_key)?;
+
+        // Verify the token - should be rejected (beyond boundary)
+        let result = crypto::verify_jwt(&token, &signing_key_model.public_key);
+
+        assert!(
+            matches!(result, Err(AcError::InvalidToken(_))),
+            "JWT with iat 1 second beyond 5 minute boundary should be rejected"
+        );
 
         Ok(())
     }

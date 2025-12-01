@@ -8,6 +8,16 @@ use ring::{
 };
 use serde::{Deserialize, Serialize};
 
+/// Clock skew tolerance for JWT `iat` (issued-at) validation in seconds.
+///
+/// Tokens with `iat` timestamps more than 5 minutes in the future will be rejected.
+/// This prevents token pre-generation attacks and detects compromised systems with
+/// incorrect clocks while allowing reasonable clock drift between servers.
+///
+/// Per NIST SP 800-63B: Clock synchronization should be maintained within
+/// reasonable bounds (typically 5 minutes) for time-based security controls.
+const JWT_CLOCK_SKEW_SECONDS: i64 = 300; // 5 minutes
+
 /// JWT Claims structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Claims {
@@ -176,6 +186,14 @@ pub fn sign_jwt(claims: &Claims, private_key_pkcs8: &[u8]) -> Result<String, AcE
 }
 
 /// Verify JWT with EdDSA public key
+///
+/// Validates:
+/// - Signature (EdDSA/Ed25519)
+/// - Expiration (`exp` claim)
+/// - Issued-at time (`iat` claim) with clock skew tolerance
+///
+/// The `iat` claim is validated to prevent token pre-generation attacks.
+/// Tokens with `iat` more than `JWT_CLOCK_SKEW_SECONDS` in the future are rejected.
 pub fn verify_jwt(token: &str, public_key_pem: &str) -> Result<Claims, AcError> {
     // Extract base64 from PEM format
     let public_key_b64 = public_key_pem
@@ -199,6 +217,24 @@ pub fn verify_jwt(token: &str, public_key_pem: &str) -> Result<Claims, AcError> 
         tracing::debug!(target: "crypto", error = ?e, "Token verification failed");
         AcError::InvalidToken("The access token is invalid or expired".to_string())
     })?;
+
+    // Validate iat (issued-at) claim with clock skew tolerance
+    // Reject tokens with iat too far in the future (potential pre-generation attack)
+    let now = chrono::Utc::now().timestamp();
+    let max_iat = now + JWT_CLOCK_SKEW_SECONDS;
+
+    if token_data.claims.iat > max_iat {
+        tracing::debug!(
+            target: "crypto",
+            iat = token_data.claims.iat,
+            now = now,
+            max_allowed = max_iat,
+            "Token rejected: iat too far in the future"
+        );
+        return Err(AcError::InvalidToken(
+            "The access token is invalid or expired".to_string(),
+        ));
+    }
 
     Ok(token_data.claims)
 }
@@ -523,5 +559,86 @@ mod tests {
         let cost = hash.split('$').nth(2).unwrap();
 
         assert_eq!(cost, "12", "Cost factor must be 12 per security policy");
+    }
+
+    // ============================================================================
+    // P1 Security Tests - JWT iat (issued-at) Validation
+    // ============================================================================
+
+    /// P1-SECURITY: Test JWT iat validation rejects far-future tokens
+    ///
+    /// Verifies that tokens with iat more than JWT_CLOCK_SKEW_SECONDS (5 minutes)
+    /// in the future are rejected. This prevents token pre-generation attacks
+    /// and detects compromised systems with incorrect clocks.
+    #[test]
+    fn test_jwt_iat_validation_rejects_future() {
+        let (public_pem, private_pkcs8) = generate_signing_key().unwrap();
+
+        let now = chrono::Utc::now().timestamp();
+
+        // Create token with iat 1 hour in the future (way beyond clock skew)
+        let claims = Claims {
+            sub: "test-user".to_string(),
+            exp: now + 7200, // Expires in 2 hours
+            iat: now + 3600, // Issued 1 hour from now (suspicious!)
+            scope: "read write".to_string(),
+            service_type: None,
+        };
+
+        let token = sign_jwt(&claims, &private_pkcs8).unwrap();
+        let result = verify_jwt(&token, &public_pem);
+
+        // Should be rejected - iat too far in the future
+        assert!(
+            matches!(result, Err(AcError::InvalidToken(_))),
+            "Token with iat 1 hour in future should be rejected"
+        );
+    }
+
+    /// P1-SECURITY: Test JWT iat validation accepts within clock skew
+    ///
+    /// Verifies that tokens with iat within the clock skew tolerance
+    /// (2 minutes in the future) are accepted. This allows for reasonable
+    /// clock drift between servers.
+    #[test]
+    fn test_jwt_iat_validation_accepts_within_skew() {
+        let (public_pem, private_pkcs8) = generate_signing_key().unwrap();
+
+        let now = chrono::Utc::now().timestamp();
+
+        // Create token with iat 2 minutes in the future (within 5 min clock skew)
+        let claims = Claims {
+            sub: "test-user".to_string(),
+            exp: now + 3600, // Expires in 1 hour
+            iat: now + 120,  // Issued 2 minutes from now (within tolerance)
+            scope: "read write".to_string(),
+            service_type: None,
+        };
+
+        let token = sign_jwt(&claims, &private_pkcs8).unwrap();
+        let result = verify_jwt(&token, &public_pem);
+
+        // Should be accepted - iat within clock skew tolerance
+        assert!(
+            result.is_ok(),
+            "Token with iat 2 minutes in future should be accepted"
+        );
+
+        let verified_claims = result.unwrap();
+        assert_eq!(verified_claims.sub, claims.sub);
+        assert_eq!(verified_claims.scope, claims.scope);
+    }
+
+    /// P1-SECURITY: Test JWT clock skew constant value
+    ///
+    /// Documents that JWT_CLOCK_SKEW_SECONDS is 300 seconds (5 minutes)
+    /// per NIST SP 800-63B recommendations for time-based security controls.
+    #[test]
+    fn test_clock_skew_constant_value() {
+        // This test documents the constant value for security review
+        assert_eq!(
+            JWT_CLOCK_SKEW_SECONDS, 300,
+            "Clock skew tolerance must be 300 seconds (5 minutes) per NIST SP 800-63B"
+        );
     }
 }
