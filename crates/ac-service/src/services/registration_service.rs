@@ -602,4 +602,155 @@ mod tests {
 
         Ok(())
     }
+
+    /// P1-3: Test time-based blind SQL injection prevention
+    ///
+    /// Verifies that time-based blind SQL injection attacks (using pg_sleep() to infer
+    /// information based on query timing) are prevented by sqlx parameterization.
+    ///
+    /// Time-based blind SQL injection is a technique where attackers inject database
+    /// sleep functions (pg_sleep in PostgreSQL, SLEEP in MySQL) to extract information
+    /// based on whether queries complete quickly or are delayed. This is particularly
+    /// dangerous when error messages are suppressed or when other injection techniques
+    /// don't produce visible results.
+    ///
+    /// Attack vectors tested:
+    /// - Direct pg_sleep injection: `'; SELECT pg_sleep(5); --`
+    /// - Boolean-based sleep: `' OR 1=1; SELECT pg_sleep(5); --`
+    /// - Nested sleep in region parameter
+    ///
+    /// Expected behavior:
+    /// With proper parameterization, pg_sleep() is treated as literal string data,
+    /// not executed as SQL. Queries complete in milliseconds, not seconds.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_time_based_sql_injection_prevented(pool: PgPool) -> Result<(), AcError> {
+        use tokio::time::Instant;
+
+        // Attack vectors that attempt to execute pg_sleep() for 5 seconds
+        let time_based_attacks = vec![
+            (
+                "service_type",
+                "global-controller'; SELECT pg_sleep(5); --",
+                None,
+            ),
+            (
+                "service_type",
+                "media-handler' OR 1=1; SELECT pg_sleep(5); --",
+                None,
+            ),
+            (
+                "region",
+                "global-controller",
+                Some("us-east'; SELECT pg_sleep(5); --".to_string()),
+            ),
+            (
+                "region",
+                "meeting-controller",
+                Some("eu-west' OR '1'='1'; SELECT pg_sleep(5); --".to_string()),
+            ),
+        ];
+
+        for (attack_location, service_type, region) in time_based_attacks {
+            let start_time = Instant::now();
+
+            // Attempt registration with time-based injection
+            let result = register_service(&pool, service_type, region.clone()).await;
+
+            let elapsed = start_time.elapsed();
+
+            // Query should complete in well under 1 second, proving pg_sleep didn't execute
+            assert!(
+                elapsed.as_millis() < 1000,
+                "Query completed in {:?} (expected <1s). Time-based SQL injection in {} may have executed!",
+                elapsed,
+                attack_location
+            );
+
+            // The attack should either fail validation (bad service_type)
+            // or succeed with the payload safely stored as literal text
+            match attack_location {
+                "service_type" => {
+                    // Invalid service_type should fail
+                    assert!(
+                        result.is_err(),
+                        "Malicious service_type should fail validation"
+                    );
+                }
+                "region" => {
+                    // Region is just text, should succeed with safe parameterization
+                    assert!(
+                        result.is_ok(),
+                        "Region with pg_sleep should be safely stored as text"
+                    );
+
+                    if let Ok(response) = result {
+                        // Verify the malicious string was stored as-is
+                        let credential =
+                            service_credentials::get_by_client_id(&pool, &response.client_id)
+                                .await?
+                                .expect("Credential should exist");
+
+                        assert_eq!(
+                            credential.region, region,
+                            "pg_sleep payload should be stored as literal text"
+                        );
+                    }
+                }
+                _ => unreachable!(),
+            }
+        }
+
+        // Additional test: Verify scopes with pg_sleep are also safe
+        let malicious_scopes = vec![
+            "admin:all'; SELECT pg_sleep(5); --".to_string(),
+            "test:scope".to_string(),
+        ];
+
+        let client_id = "time-based-test";
+        let secret_hash = crypto::hash_client_secret("test-secret")?;
+
+        let start_time = Instant::now();
+
+        let credential = service_credentials::create_service_credential(
+            &pool,
+            client_id,
+            &secret_hash,
+            "global-controller",
+            None,
+            &malicious_scopes,
+        )
+        .await?;
+
+        let elapsed = start_time.elapsed();
+
+        // Should complete quickly
+        assert!(
+            elapsed.as_millis() < 1000,
+            "Scope insertion completed in {:?} (expected <1s)",
+            elapsed
+        );
+
+        // Verify the malicious scope was stored as literal text
+        assert!(credential.scopes.contains(&malicious_scopes[0]));
+
+        // Test retrieval timing (verify pg_sleep doesn't execute on SELECT)
+        let start_time = Instant::now();
+
+        let retrieved = service_credentials::get_by_client_id(&pool, client_id).await?;
+
+        let elapsed = start_time.elapsed();
+
+        assert!(
+            elapsed.as_millis() < 1000,
+            "Retrieval completed in {:?} (expected <1s)",
+            elapsed
+        );
+
+        assert!(
+            retrieved.is_some(),
+            "Should retrieve credential with pg_sleep payload"
+        );
+
+        Ok(())
+    }
 }
