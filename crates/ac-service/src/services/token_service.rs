@@ -1807,6 +1807,144 @@ mod tests {
     }
 
     // ============================================================================
+    // P1 Security Tests - JWT Size Limit (DoS Prevention)
+    // ============================================================================
+
+    /// P1-SECURITY: Test JWT size limit enforcement
+    ///
+    /// Verifies that oversized JWTs are rejected before any parsing or signature
+    /// verification to prevent Denial-of-Service (DoS) attacks via resource exhaustion.
+    ///
+    /// Attack scenario:
+    /// - Attacker sends extremely large JWT (e.g., 10MB) to /token/verify endpoint
+    /// - Without size limit: System allocates large buffers, wastes CPU on base64 decode
+    ///   and signature verification, potentially exhausting memory/CPU resources
+    /// - With size limit: Token rejected immediately with minimal resource usage
+    ///
+    /// Defense-in-depth rationale:
+    /// - Size check happens BEFORE base64 decode (prevents allocation attacks)
+    /// - Size check happens BEFORE signature verification (prevents CPU exhaustion)
+    /// - 4KB limit is generous (typical JWTs are 200-500 bytes) but prevents abuse
+    ///
+    /// Security impact: HIGH - prevents resource exhaustion DoS attacks
+    ///
+    /// Per OWASP API Security Top 10 - API4:2023 (Unrestricted Resource Consumption)
+    /// Per CWE-400 (Uncontrolled Resource Consumption)
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_jwt_oversized_token_rejected(pool: PgPool) -> Result<(), AcError> {
+        use chrono::Utc;
+        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+
+        let master_key = crypto::generate_random_bytes(32)?;
+        key_management_service::initialize_signing_key(&pool, &master_key, "test").await?;
+
+        // Get the signing key
+        let signing_key_model = signing_keys::get_active_key(&pool)
+            .await?
+            .expect("No active signing key found");
+
+        // Decrypt the private key
+        let encrypted_key = crypto::EncryptedKey {
+            encrypted_data: signing_key_model.private_key_encrypted.clone(),
+            nonce: signing_key_model.encryption_nonce.clone(),
+            tag: signing_key_model.encryption_tag.clone(),
+        };
+        let private_key = crypto::decrypt_private_key(&encrypted_key, &master_key)?;
+
+        // Create a JWT with an EXTREMELY large payload (10KB of extra claims data)
+        // This simulates an attacker trying to cause resource exhaustion
+        #[derive(serde::Serialize)]
+        struct OversizedClaims {
+            sub: String,
+            exp: i64,
+            iat: i64,
+            scope: String,
+            service_type: Option<String>,
+            // Add a massive payload to exceed 4KB limit
+            bloat: String,
+        }
+
+        // Create 10KB of junk data (far exceeding the 4KB limit)
+        // This will cause the final JWT to be much larger than MAX_JWT_SIZE_BYTES
+        let bloat_data = "A".repeat(10_000);
+
+        let oversized_claims = OversizedClaims {
+            sub: "oversized-client".to_string(),
+            exp: Utc::now().timestamp() + TOKEN_EXPIRY_SECONDS_I64,
+            iat: Utc::now().timestamp(),
+            scope: "meeting:create".to_string(),
+            service_type: Some("global-controller".to_string()),
+            bloat: bloat_data,
+        };
+
+        // Sign the oversized token (this will succeed, signature is valid)
+        let encoding_key = EncodingKey::from_ed_der(&private_key);
+        let header = Header::new(Algorithm::EdDSA);
+        let oversized_token = encode(&header, &oversized_claims, &encoding_key)
+            .expect("Failed to encode oversized token");
+
+        // Verify the token is indeed oversized (should be > 4KB)
+        assert!(
+            oversized_token.len() > 4096,
+            "Test token must exceed 4KB limit for this test to be valid. Got {} bytes",
+            oversized_token.len()
+        );
+
+        tracing::info!(
+            "Test generated oversized JWT: {} bytes (limit: 4096 bytes)",
+            oversized_token.len()
+        );
+
+        // Attempt to verify the oversized token
+        // Should be rejected BEFORE signature verification (efficiency)
+        let result = crypto::verify_jwt(&oversized_token, &signing_key_model.public_key);
+
+        // Should be rejected due to size limit
+        assert!(
+            matches!(result, Err(AcError::InvalidToken(_))),
+            "Oversized JWT should be rejected to prevent DoS attacks"
+        );
+
+        // Verify that a normal-sized token still works (regression test)
+        let normal_claims = crypto::Claims {
+            sub: "normal-client".to_string(),
+            exp: Utc::now().timestamp() + TOKEN_EXPIRY_SECONDS_I64,
+            iat: Utc::now().timestamp(),
+            scope: "meeting:create".to_string(),
+            service_type: Some("global-controller".to_string()),
+        };
+
+        let normal_token = crypto::sign_jwt(&normal_claims, &private_key)?;
+
+        // Verify the normal token is under the size limit
+        assert!(
+            normal_token.len() <= 4096,
+            "Normal token should be under 4KB. Got {} bytes",
+            normal_token.len()
+        );
+
+        // Normal token should verify successfully
+        let result = crypto::verify_jwt(&normal_token, &signing_key_model.public_key);
+        assert!(
+            result.is_ok(),
+            "Normal-sized JWT should still be accepted (regression check)"
+        );
+
+        let verified = result.unwrap();
+        assert_eq!(verified.sub, "normal-client");
+        assert_eq!(verified.scope, "meeting:create");
+
+        Ok(())
+    }
+
+    // NOTE: JWT size limit boundary testing (4095, 4096, 4097 bytes) is complex
+    // because base64 encoding affects final size unpredictably. The unit tests
+    // in crypto::tests::test_jwt_size_limit_enforcement and
+    // crypto::tests::test_jwt_size_limit_allows_normal_tokens provide adequate
+    // coverage for the size limit logic. The integration test above
+    // (test_jwt_oversized_token_rejected) validates the full flow with a 10KB token.
+
+    // ============================================================================
     // P1 Security Tests - Key Rotation & Lifecycle
     // ============================================================================
     //

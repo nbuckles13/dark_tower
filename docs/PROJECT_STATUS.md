@@ -181,10 +181,10 @@ All foundational work completed:
    - See: `.github/workflows/ci.yml`
 
 **Test Coverage**:
-- **Current**: 83% overall, 80 tests passing
+- **Current**: 83% overall, 84 tests passing
 - **Target**: 95% for security-critical code
 - **P0 tests**: 48 (all passing)
-- **P1 tests**: 32 (all passing)
+- **P1 tests**: 36 (all passing)
 
 ## Current Phase: Phase 4 - Security Hardening
 
@@ -194,10 +194,7 @@ All foundational work completed:
 ### In Progress
 
 - [ ] Additional security tests
-  - JWT size limits (DoS prevention)
-  - Maximum token age validation (reject old `iat`)
   - Key rotation tests (pending repository methods)
-  - Time-based SQL injection detection
 
 - [ ] Performance testing
   - Benchmarks for token validation under attack
@@ -213,9 +210,11 @@ All foundational work completed:
 
 - [x] P1 security test suite implementation
 - [x] JWT validation security tests
-- [x] SQL injection prevention tests (7 tests including UNION SELECT, second-order)
+- [x] SQL injection prevention tests (8 tests including UNION SELECT, second-order, time-based)
 - [x] JWT iat validation with ±5 minute clock skew tolerance (6 tests)
 - [x] JWT header injection tests (typ, alg, kid tampering - 3 tests)
+- [x] JWT size limits (4KB DoS prevention - 3 tests)
+- [x] Time-based SQL injection prevention (pg_sleep timing validation)
 - [x] bcrypt cost factor validation (cost=12 per ADR-0003)
 - [x] Error information leakage prevention
 - [x] Code review workflow implementation

@@ -18,6 +18,26 @@ use serde::{Deserialize, Serialize};
 /// reasonable bounds (typically 5 minutes) for time-based security controls.
 const JWT_CLOCK_SKEW_SECONDS: i64 = 300; // 5 minutes
 
+/// Maximum allowed JWT size in bytes (4KB).
+///
+/// This limit prevents Denial-of-Service (DoS) attacks via oversized tokens.
+/// JWTs larger than this size are rejected before any parsing or cryptographic
+/// operations, providing defense-in-depth against resource exhaustion attacks.
+///
+/// Rationale:
+/// - Typical JWTs are 200-500 bytes (header + claims + signature)
+/// - Our standard token: ~350 bytes (EdDSA sig, basic claims)
+/// - 4KB limit allows for reasonable future expansion while preventing abuse
+/// - Checked BEFORE base64 decode and signature verification for efficiency
+///
+/// Attack scenario:
+/// - Attacker sends 10MB JWT to /token/verify endpoint
+/// - Without size limit: Base64 decode allocates large buffer, wastes CPU/memory
+/// - With size limit: Rejected immediately with minimal resource usage
+///
+/// Per OWASP API Security Top 10 - API4:2023 (Unrestricted Resource Consumption)
+const MAX_JWT_SIZE_BYTES: usize = 4096; // 4KB
+
 /// JWT Claims structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Claims {
@@ -188,13 +208,32 @@ pub fn sign_jwt(claims: &Claims, private_key_pkcs8: &[u8]) -> Result<String, AcE
 /// Verify JWT with EdDSA public key
 ///
 /// Validates:
+/// - Token size (must be <= MAX_JWT_SIZE_BYTES)
 /// - Signature (EdDSA/Ed25519)
 /// - Expiration (`exp` claim)
-/// - Issued-at time (`iat` claim) with clock skew tolerance
+/// - Issued-at time (`iat` claim) with clock skew tolerance and maximum age
 ///
-/// The `iat` claim is validated to prevent token pre-generation attacks.
-/// Tokens with `iat` more than `JWT_CLOCK_SKEW_SECONDS` in the future are rejected.
+/// The `iat` claim is validated to prevent token pre-generation and replay attacks:
+/// - Tokens with `iat` more than `JWT_CLOCK_SKEW_SECONDS` in the future are rejected
+/// - Tokens with `iat` more than `MAX_TOKEN_AGE_SECONDS` in the past are rejected
+///
+/// The size check is performed BEFORE any parsing to prevent DoS attacks
+/// via oversized tokens.
 pub fn verify_jwt(token: &str, public_key_pem: &str) -> Result<Claims, AcError> {
+    // Check token size BEFORE any parsing or cryptographic operations
+    // This is a defense-in-depth measure against DoS attacks
+    if token.len() > MAX_JWT_SIZE_BYTES {
+        tracing::debug!(
+            target: "crypto",
+            token_size = token.len(),
+            max_size = MAX_JWT_SIZE_BYTES,
+            "Token rejected: size exceeds maximum allowed"
+        );
+        return Err(AcError::InvalidToken(
+            "The access token is invalid or expired".to_string(),
+        ));
+    }
+
     // Extract base64 from PEM format
     let public_key_b64 = public_key_pem
         .lines()
@@ -529,6 +568,60 @@ mod tests {
             verify_client_secret(secret, &hash).expect("Verification should succeed"),
             "Generated hash should verify correctly"
         );
+    }
+
+    /// P1-SECURITY: Test JWT size limit enforcement (unit test)
+    ///
+    /// Verifies that oversized JWTs are rejected before parsing.
+    /// This is a simple unit test that complements the integration test
+    /// in token_service.rs.
+    #[test]
+    fn test_jwt_size_limit_enforcement() {
+        // Create an oversized token (just a long string, doesn't need to be valid JWT)
+        let oversized_token = "a".repeat(MAX_JWT_SIZE_BYTES + 1);
+
+        // Generate a keypair for testing
+        let (public_pem, _) = generate_signing_key().unwrap();
+
+        // Attempt to verify the oversized token
+        let result = verify_jwt(&oversized_token, &public_pem);
+
+        // Should be rejected due to size limit
+        assert!(
+            matches!(result, Err(AcError::InvalidToken(_))),
+            "Oversized JWT should be rejected before parsing"
+        );
+    }
+
+    /// P1-SECURITY: Test JWT size limit allows normal tokens
+    ///
+    /// Regression test to ensure the size limit doesn't reject normal JWTs.
+    #[test]
+    fn test_jwt_size_limit_allows_normal_tokens() {
+        let (public_pem, private_pkcs8) = generate_signing_key().unwrap();
+
+        let claims = Claims {
+            sub: "test-user".to_string(),
+            exp: chrono::Utc::now().timestamp() + 3600,
+            iat: chrono::Utc::now().timestamp(),
+            scope: "read write".to_string(),
+            service_type: None,
+        };
+
+        let token = sign_jwt(&claims, &private_pkcs8).unwrap();
+
+        // Verify the token is under the size limit
+        assert!(
+            token.len() <= MAX_JWT_SIZE_BYTES,
+            "Normal JWT should be well under the size limit. Got {} bytes",
+            token.len()
+        );
+
+        // Should verify successfully
+        let verified_claims = verify_jwt(&token, &public_pem).unwrap();
+
+        assert_eq!(verified_claims.sub, claims.sub);
+        assert_eq!(verified_claims.scope, claims.scope);
     }
 
     /// P1-SECURITY: Test bcrypt cost factor security boundary

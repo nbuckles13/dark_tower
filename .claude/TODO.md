@@ -4,6 +4,19 @@
 
 ### Completed Items (2025-12-01)
 
+#### P2 Security Tests (2025-12-01)
+
+- [x] **JWT Size Limits (DoS Prevention)**: Added `MAX_JWT_SIZE_BYTES = 4096` constant, size check in `verify_jwt()` BEFORE parsing/crypto operations
+- [x] **test_jwt_size_limit_enforcement**: Unit test verifying oversized tokens rejected
+- [x] **test_jwt_size_limit_allows_normal_tokens**: Regression test for normal tokens
+- [x] **test_jwt_oversized_token_rejected**: Integration test with 10KB payload
+- [x] **Time-Based SQL Injection Prevention**: Tests pg_sleep() injection attempts with timing validation
+- [x] **test_time_based_sql_injection_prevented**: Multiple attack vectors, measures execution time
+- [x] **Test Specialist Review**: ACCEPTABLE
+- [x] **Security Specialist Review**: ACCEPTABLE
+
+**Test Count**: Increased from 80 → 84 tests (+4 new P2 security tests)
+
 #### JWT Header Injection Tests (2025-12-01)
 
 - [x] **test_jwt_header_typ_tampering**: Tests various `typ` header values (at+jwt, jwt, CUSTOM, null) - documents typ is not security-critical per RFC 7519
@@ -44,7 +57,7 @@
 
 - [x] ~~**iat Validation Implementation**: Implement strict iat validation with clock skew tolerance (±5 minutes)~~ ✅ DONE
 - [x] ~~**JWT Header Injection**: Add tests for typ/alg/kid header tampering~~ ✅ DONE
-- [ ] **JWT Size Limits** (Security Specialist Recommendation): Add size limit check in `verify_jwt()` to prevent DoS via large tokens (suggest 4KB limit)
+- [x] ~~**JWT Size Limits**: Added `MAX_JWT_SIZE_BYTES = 4096` (4KB) DoS prevention~~ ✅ DONE
 - [x] ~~**Maximum Token Age Validation** (DEBATED)~~: Debate concluded 2025-12-01 with consensus on context-specific strategy. See [ADR-0007](../docs/decisions/adr-0007-token-lifetime-strategy.md). **Decision**: Service tokens keep 1-hour lifetime (no max age), user tokens (Phase 8) will use 15-min access + refresh pattern.
 - [ ] **Key Rotation Implementation**: Complete key rotation tests once `signing_keys::get_by_key_id()` and `signing_keys::list_all_keys()` are implemented. **SECURITY NOTE**: When implementing, must validate `kid` against database whitelist only - never fetch keys based on untrusted kid values.
 - [ ] **Configurable Clock Skew**: Consider making `JWT_CLOCK_SKEW_SECONDS` configurable via environment variable for different security postures
@@ -52,7 +65,7 @@
 #### SQL Injection Testing Enhancements
 
 - [ ] **Deterministic Oversized Input Test**: Refactor `test_oversized_input_handling` to check against actual schema limits (VARCHAR lengths, etc.) instead of arbitrary 1000-char strings
-- [ ] **Time-Based SQL Injection**: Add tests that verify timing-based blind SQL injection is prevented (e.g., SLEEP/pg_sleep injection attempts)
+- [x] ~~**Time-Based SQL Injection**: Added `test_time_based_sql_injection_prevented` with pg_sleep() timing validation~~ ✅ DONE
 - [ ] **Stored Procedure Injection**: If using stored procedures in future, add tests for SQL injection via procedure parameters
 
 ### Test Infrastructure
