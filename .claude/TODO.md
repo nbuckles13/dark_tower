@@ -44,8 +44,8 @@
 
 - [x] ~~**iat Validation Implementation**: Implement strict iat validation with clock skew tolerance (±5 minutes)~~ ✅ DONE
 - [x] ~~**JWT Header Injection**: Add tests for typ/alg/kid header tampering~~ ✅ DONE
-- [ ] **Maximum Token Age Validation** (Security Specialist Recommendation): Add validation to reject tokens with `iat` too far in the PAST (e.g., >15 minutes old) to prevent replay attacks with old tokens. Currently only future `iat` is validated.
 - [ ] **JWT Size Limits** (Security Specialist Recommendation): Add size limit check in `verify_jwt()` to prevent DoS via large tokens (suggest 4KB limit)
+- [x] ~~**Maximum Token Age Validation** (DEBATED)~~: Debate concluded 2025-12-01 with consensus on context-specific strategy. See [ADR-0007](../docs/decisions/adr-0007-token-lifetime-strategy.md). **Decision**: Service tokens keep 1-hour lifetime (no max age), user tokens (Phase 8) will use 15-min access + refresh pattern.
 - [ ] **Key Rotation Implementation**: Complete key rotation tests once `signing_keys::get_by_key_id()` and `signing_keys::list_all_keys()` are implemented. **SECURITY NOTE**: When implementing, must validate `kid` against database whitelist only - never fetch keys based on untrusted kid values.
 - [ ] **Configurable Clock Skew**: Consider making `JWT_CLOCK_SKEW_SECONDS` configurable via environment variable for different security postures
 
@@ -65,6 +65,25 @@
 - [ ] **Security Testing Guide**: Document security testing patterns and attack vectors in developer documentation
 - [ ] **Threat Model**: Create formal threat model documentation for authentication controller
 
+## Phase 5: Global Controller Implementation
+
+### Token Revocation (from ADR-0007)
+
+- [ ] **JWT Blacklist in Redis**: Implement emergency revocation capability for service tokens
+  - Key pattern: `blacklist:jwt:{jti}`
+  - TTL: Remaining token lifetime at blacklist time
+  - Check blacklist in token validation path
+
+## Phase 8: User Authentication
+
+### Refresh Token Flow (from ADR-0007)
+
+- [ ] **Refresh Token Implementation**: Short-lived access tokens (15 min) + long-lived refresh tokens (24 hours)
+- [ ] **Refresh Token Rotation**: Issue new refresh token on each use
+- [ ] **Token Family Tracking**: Detect refresh token reuse attacks
+- [ ] **Rate Limiting on Refresh**: Prevent abuse of refresh endpoint
+- [ ] **Meeting Token Protocol**: Implement `TOKEN_EXPIRING_SOON` and `UPDATE_TOKEN` signaling messages for seamless WebTransport session continuity
+
 ## Low Priority
 
 ### Clean up dead_code lints (Phase 5+)
@@ -76,7 +95,7 @@ Once more of the system is implemented and library functions are actually used b
 
 **Why deferred**: Currently many library functions are tested but not used by binaries yet. The dead_code lint situation will resolve naturally as we implement Phase 4+ features (admin endpoints, audit endpoints, key rotation, etc).
 
-**Files affected**: 
+**Files affected**:
 - `crates/ac-service/src/config.rs`
 - `crates/ac-service/src/models/mod.rs`
 - `crates/ac-service/src/repositories/*.rs`
