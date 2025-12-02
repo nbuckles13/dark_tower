@@ -761,4 +761,155 @@ mod tests {
 
         Ok(())
     }
+
+    // ============================================================================
+    // Coverage Tests - Service Lifecycle
+    // ============================================================================
+
+    /// Test successful service registration for all service types
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_register_service_all_types(pool: PgPool) -> Result<(), AcError> {
+        let service_types = ["global-controller", "meeting-controller", "media-handler"];
+
+        for service_type in service_types {
+            let result = register_service(&pool, service_type, Some("us-west-2".to_string())).await;
+
+            assert!(
+                result.is_ok(),
+                "Registration for {} should succeed: {:?}",
+                service_type,
+                result.err()
+            );
+
+            let response = result.unwrap();
+
+            // Verify response fields
+            assert!(
+                !response.client_id.is_empty(),
+                "client_id should not be empty"
+            );
+            assert!(
+                !response.client_secret.is_empty(),
+                "client_secret should not be empty"
+            );
+            assert_eq!(response.service_type, service_type);
+            assert!(!response.scopes.is_empty(), "scopes should not be empty");
+
+            // Verify credential was stored
+            let credential = service_credentials::get_by_client_id(&pool, &response.client_id)
+                .await?
+                .expect("Credential should exist");
+
+            assert!(credential.is_active);
+            assert_eq!(credential.service_type, service_type);
+            assert_eq!(credential.region.as_deref(), Some("us-west-2"));
+        }
+
+        Ok(())
+    }
+
+    /// Test service registration without region
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_register_service_no_region(pool: PgPool) -> Result<(), AcError> {
+        let result = register_service(&pool, "global-controller", None).await?;
+
+        let credential = service_credentials::get_by_client_id(&pool, &result.client_id)
+            .await?
+            .expect("Credential should exist");
+
+        assert!(credential.region.is_none(), "Region should be None");
+
+        Ok(())
+    }
+
+    /// Test update_service_scopes function
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_update_service_scopes(pool: PgPool) -> Result<(), AcError> {
+        // Register a service first
+        let response = register_service(&pool, "meeting-controller", None).await?;
+        let original_scopes = response.scopes.clone();
+
+        // Define new scopes
+        let new_scopes = vec!["custom:read".to_string(), "custom:write".to_string()];
+
+        // Update scopes
+        update_service_scopes(&pool, &response.client_id, new_scopes.clone()).await?;
+
+        // Verify scopes were updated
+        let credential = service_credentials::get_by_client_id(&pool, &response.client_id)
+            .await?
+            .expect("Credential should exist");
+
+        assert_eq!(credential.scopes, new_scopes);
+        assert_ne!(credential.scopes, original_scopes);
+
+        Ok(())
+    }
+
+    /// Test update_service_scopes with non-existent client_id
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_update_service_scopes_not_found(pool: PgPool) -> Result<(), AcError> {
+        let result = update_service_scopes(
+            &pool,
+            "non-existent-client-id",
+            vec!["test:scope".to_string()],
+        )
+        .await;
+
+        assert!(result.is_err(), "Should fail for non-existent client_id");
+
+        Ok(())
+    }
+
+    /// Test deactivate_service function
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_deactivate_service(pool: PgPool) -> Result<(), AcError> {
+        // Register a service first
+        let response = register_service(&pool, "media-handler", None).await?;
+
+        // Verify it's active
+        let credential = service_credentials::get_by_client_id(&pool, &response.client_id)
+            .await?
+            .expect("Credential should exist");
+        assert!(credential.is_active);
+
+        // Deactivate
+        deactivate_service(&pool, &response.client_id).await?;
+
+        // Verify it's deactivated
+        let credential = service_credentials::get_by_client_id(&pool, &response.client_id)
+            .await?
+            .expect("Credential should still exist");
+        assert!(!credential.is_active);
+
+        Ok(())
+    }
+
+    /// Test deactivate_service with non-existent client_id
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_deactivate_service_not_found(pool: PgPool) -> Result<(), AcError> {
+        let result = deactivate_service(&pool, "non-existent-client-id").await;
+
+        assert!(result.is_err(), "Should fail for non-existent client_id");
+
+        Ok(())
+    }
+
+    /// Test registration with invalid service type
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_register_invalid_service_type(pool: PgPool) -> Result<(), AcError> {
+        let result = register_service(&pool, "invalid-service", None).await;
+
+        assert!(result.is_err(), "Should fail for invalid service type");
+
+        // Verify error message mentions the invalid type
+        let err = result.unwrap_err();
+        let err_msg = format!("{}", err);
+        assert!(
+            err_msg.contains("invalid-service"),
+            "Error should mention the invalid service type"
+        );
+
+        Ok(())
+    }
 }
