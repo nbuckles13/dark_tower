@@ -1,6 +1,6 @@
 # Dark Tower - Project Status
 
-**Last Updated**: 2025-11-30
+**Last Updated**: 2025-12-01
 **Current Phase**: Phase 4 - Security Hardening & Testing Infrastructure
 
 ## Executive Summary
@@ -181,10 +181,10 @@ All foundational work completed:
    - See: `.github/workflows/ci.yml`
 
 **Test Coverage**:
-- **Current**: 83% overall, 65 tests passing
+- **Current**: 83% overall, 80 tests passing
 - **Target**: 95% for security-critical code
 - **P0 tests**: 48 (all passing)
-- **P1 tests**: 17 (all passing)
+- **P1 tests**: 32 (all passing)
 
 ## Current Phase: Phase 4 - Security Hardening
 
@@ -193,14 +193,10 @@ All foundational work completed:
 
 ### In Progress
 
-- [ ] Additional JWT security tests
-  - iat (issued-at) validation or documentation
-  - JWT header injection tests (typ tampering)
-  - Key rotation edge cases
-
-- [ ] Enhanced SQL injection testing
-  - Deterministic oversized input tests (schema limits)
-  - Second-order SQL injection tests
+- [ ] Additional security tests
+  - JWT size limits (DoS prevention)
+  - Maximum token age validation (reject old `iat`)
+  - Key rotation tests (pending repository methods)
   - Time-based SQL injection detection
 
 - [ ] Performance testing
@@ -217,10 +213,15 @@ All foundational work completed:
 
 - [x] P1 security test suite implementation
 - [x] JWT validation security tests
-- [x] SQL injection prevention tests
+- [x] SQL injection prevention tests (7 tests including UNION SELECT, second-order)
+- [x] JWT iat validation with ±5 minute clock skew tolerance (6 tests)
+- [x] JWT header injection tests (typ, alg, kid tampering - 3 tests)
+- [x] bcrypt cost factor validation (cost=12 per ADR-0003)
+- [x] Error information leakage prevention
 - [x] Code review workflow implementation
 - [x] Multi-agent debate framework
 - [x] Specialist-led development process
+- [x] Nightly fuzz testing workflow (5.5 hours)
 
 **Status**: See [.claude/TODO.md](../.claude/TODO.md) for current work items
 
@@ -398,14 +399,18 @@ dark_tower/
 ## Recent Achievements (Last 2 Weeks)
 
 - ✅ Implemented comprehensive P0 security test suite (48 tests)
-- ✅ Implemented P1 security test suite (17 tests)
+- ✅ Implemented P1 security test suite (32 tests)
 - ✅ Added JWT validation security tests (signature tampering, algorithm confusion, "none" attack)
-- ✅ Implemented SQL injection prevention tests (parameterization, special chars, Unicode)
-- ✅ Set up fuzzing infrastructure (cargo-fuzz)
+- ✅ Added JWT iat validation with ±5 minute clock skew tolerance (NIST SP 800-63B)
+- ✅ Added JWT header injection tests (typ, alg mismatch, kid injection - CVE-2015-2951, CVE-2016-5431)
+- ✅ Implemented SQL injection prevention tests (UNION SELECT, second-order, parameterization, Unicode)
+- ✅ Added bcrypt cost factor validation (cost=12 per ADR-0003, CWE-916 mitigation)
+- ✅ Added error information leakage prevention (OWASP A05:2021, CWE-209)
+- ✅ Set up fuzzing infrastructure (cargo-fuzz) with nightly 5.5-hour runs
 - ✅ Configured CI/CD with GitHub Actions and Codecov
 - ✅ Added automated git hooks for code quality
 - ✅ Established multi-agent debate framework
-- ✅ Created specialist-led development workflow
+- ✅ Created specialist-led development workflow with test ownership model
 - ✅ Documented 2 major design debates
 - ✅ Created 6 Architecture Decision Records
 
@@ -484,10 +489,12 @@ dark_tower/
 - [x] Code coverage tracking
 
 ### Phase 4: Security Hardening 🔄 IN PROGRESS
-- [x] P1 security tests implemented (17 tests)
+- [x] P1 security tests implemented (32 tests)
 - [x] JWT validation security validated
 - [x] SQL injection prevention verified
-- [ ] Additional security tests (iat, header injection)
+- [x] JWT iat validation implemented
+- [x] JWT header injection tests added
+- [ ] JWT size limits (DoS prevention)
 - [ ] Performance benchmarks
 - [ ] 95% test coverage achieved
 - [ ] Security documentation complete
