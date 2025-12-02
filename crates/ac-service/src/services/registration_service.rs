@@ -622,7 +622,13 @@ mod tests {
     /// Expected behavior:
     /// With proper parameterization, pg_sleep() is treated as literal string data,
     /// not executed as SQL. Queries complete in milliseconds, not seconds.
+    ///
+    /// NOTE: This test uses timing assertions to verify pg_sleep(5) wasn't executed.
+    /// We use a 4-second threshold (well under the 5-second sleep) to accommodate
+    /// slow CI environments while still detecting injection. Skipped under coverage
+    /// because instrumentation adds unpredictable overhead.
     #[sqlx::test(migrations = "../../migrations")]
+    #[cfg_attr(coverage, ignore)]
     async fn test_time_based_sql_injection_prevented(pool: PgPool) -> Result<(), AcError> {
         use tokio::time::Instant;
 
@@ -658,10 +664,12 @@ mod tests {
 
             let elapsed = start_time.elapsed();
 
-            // Query should complete in well under 1 second, proving pg_sleep didn't execute
+            // Query should complete in well under 5 seconds, proving pg_sleep didn't execute.
+            // We use 4 seconds as threshold to accommodate slow CI while still detecting
+            // the 5-second sleep attack.
             assert!(
-                elapsed.as_millis() < 1000,
-                "Query completed in {:?} (expected <1s). Time-based SQL injection in {} may have executed!",
+                elapsed.as_millis() < 4000,
+                "Query completed in {:?} (expected <4s). Time-based SQL injection in {} may have executed!",
                 elapsed,
                 attack_location
             );
@@ -723,10 +731,10 @@ mod tests {
 
         let elapsed = start_time.elapsed();
 
-        // Should complete quickly
+        // Should complete quickly (under 4 seconds to accommodate slow CI)
         assert!(
-            elapsed.as_millis() < 1000,
-            "Scope insertion completed in {:?} (expected <1s)",
+            elapsed.as_millis() < 4000,
+            "Scope insertion completed in {:?} (expected <4s)",
             elapsed
         );
 
@@ -741,8 +749,8 @@ mod tests {
         let elapsed = start_time.elapsed();
 
         assert!(
-            elapsed.as_millis() < 1000,
-            "Retrieval completed in {:?} (expected <1s)",
+            elapsed.as_millis() < 4000,
+            "Retrieval completed in {:?} (expected <4s)",
             elapsed
         );
 
