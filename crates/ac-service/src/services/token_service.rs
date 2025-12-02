@@ -1260,6 +1260,361 @@ mod tests {
         Ok(())
     }
 
+    // ============================================================================
+    // P1 Security Tests - JWT Header Injection
+    // ============================================================================
+
+    /// P1-SECURITY: Test JWT header typ claim tampering
+    ///
+    /// Verifies that tokens with various `typ` header values are handled correctly.
+    /// Per RFC 7519 Section 5.1, the `typ` (type) header is OPTIONAL and is used
+    /// by JWT applications to declare the media type of the complete JWT.
+    ///
+    /// Common values:
+    /// - "JWT" (uppercase) - Traditional JWT type
+    /// - "at+jwt" - RFC 9068 OAuth 2.0 Access Token type
+    /// - null/missing - Valid per RFC 7519 (typ is optional)
+    ///
+    /// Security rationale:
+    /// The `typ` header is NOT security-critical. It's a hint for parsers and
+    /// is not part of the signature verification or claims validation.
+    /// We verify that our implementation correctly:
+    /// 1. Accepts tokens regardless of typ value (since it's optional)
+    /// 2. Does not use typ for security decisions
+    /// 3. Validates tokens based on signature and claims, not header metadata
+    ///
+    /// This test documents expected behavior and prevents regressions if
+    /// we add typ validation in the future.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_jwt_header_typ_tampering(pool: PgPool) -> Result<(), AcError> {
+        use chrono::Utc;
+        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+
+        let master_key = crypto::generate_random_bytes(32)?;
+        key_management_service::initialize_signing_key(&pool, &master_key, "test").await?;
+
+        // Get the signing key
+        let signing_key_model = signing_keys::get_active_key(&pool)
+            .await?
+            .expect("No active signing key found");
+
+        // Decrypt the private key
+        let encrypted_key = crypto::EncryptedKey {
+            encrypted_data: signing_key_model.private_key_encrypted.clone(),
+            nonce: signing_key_model.encryption_nonce.clone(),
+            tag: signing_key_model.encryption_tag.clone(),
+        };
+        let private_key = crypto::decrypt_private_key(&encrypted_key, &master_key)?;
+
+        // Create standard claims
+        let claims = crypto::Claims {
+            sub: "typ-test-client".to_string(),
+            exp: Utc::now().timestamp() + TOKEN_EXPIRY_SECONDS_I64,
+            iat: Utc::now().timestamp(),
+            scope: "meeting:create".to_string(),
+            service_type: Some("global-controller".to_string()),
+        };
+
+        let encoding_key = EncodingKey::from_ed_der(&private_key);
+
+        // Test 1: typ = "at+jwt" (RFC 9068 access token type)
+        let mut header_at_jwt = Header::new(Algorithm::EdDSA);
+        header_at_jwt.typ = Some("at+jwt".to_string());
+        let token_at_jwt = encode(&header_at_jwt, &claims, &encoding_key)
+            .expect("Failed to encode token with typ=at+jwt");
+
+        let result = crypto::verify_jwt(&token_at_jwt, &signing_key_model.public_key);
+        assert!(
+            result.is_ok(),
+            "JWT with typ='at+jwt' should be accepted (RFC 9068 standard)"
+        );
+
+        // Test 2: typ = "jwt" (lowercase)
+        let mut header_lowercase = Header::new(Algorithm::EdDSA);
+        header_lowercase.typ = Some("jwt".to_string());
+        let token_lowercase = encode(&header_lowercase, &claims, &encoding_key)
+            .expect("Failed to encode token with typ=jwt");
+
+        let result = crypto::verify_jwt(&token_lowercase, &signing_key_model.public_key);
+        assert!(
+            result.is_ok(),
+            "JWT with typ='jwt' (lowercase) should be accepted"
+        );
+
+        // Test 3: typ = "CUSTOM" (arbitrary value)
+        let mut header_custom = Header::new(Algorithm::EdDSA);
+        header_custom.typ = Some("CUSTOM".to_string());
+        let token_custom = encode(&header_custom, &claims, &encoding_key)
+            .expect("Failed to encode token with typ=CUSTOM");
+
+        let result = crypto::verify_jwt(&token_custom, &signing_key_model.public_key);
+        assert!(
+            result.is_ok(),
+            "JWT with typ='CUSTOM' should be accepted (typ is optional, any value allowed)"
+        );
+
+        // Test 4: typ = null/missing (manually construct header without typ)
+        // The default Header::new() sets typ to Some("JWT"), so we need to manually clear it
+        let mut header_no_typ = Header::new(Algorithm::EdDSA);
+        header_no_typ.typ = None;
+        let token_no_typ = encode(&header_no_typ, &claims, &encoding_key)
+            .expect("Failed to encode token without typ");
+
+        let result = crypto::verify_jwt(&token_no_typ, &signing_key_model.public_key);
+        assert!(
+            result.is_ok(),
+            "JWT without typ header should be accepted (typ is optional per RFC 7519)"
+        );
+
+        // Verify the verified claims are correct regardless of typ
+        let verified_claims = result.unwrap();
+        assert_eq!(verified_claims.sub, "typ-test-client");
+        assert_eq!(verified_claims.scope, "meeting:create");
+
+        Ok(())
+    }
+
+    /// P1-SECURITY: Test JWT header alg mismatch is rejected
+    ///
+    /// Verifies that tampering with the `alg` header (e.g., changing EdDSA to HS256)
+    /// is rejected. This tests defense against algorithm confusion attacks.
+    ///
+    /// Algorithm confusion (CVE-2015-2951, CVE-2016-5431) occurs when:
+    /// 1. Attacker changes alg from asymmetric (EdDSA/RS256) to symmetric (HS256)
+    /// 2. Server's public key is used as HMAC secret
+    /// 3. Attacker signs token with HMAC-SHA256 using the public key
+    /// 4. Server incorrectly validates with HS256 instead of EdDSA
+    ///
+    /// Our defense:
+    /// - jsonwebtoken library enforces algorithm on decoding
+    /// - crypto::verify_jwt() specifies EdDSA algorithm explicitly
+    /// - Signature verification will fail if algorithm doesn't match
+    ///
+    /// Security impact: CRITICAL - prevents complete authentication bypass
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_jwt_header_alg_mismatch_rejected(pool: PgPool) -> Result<(), AcError> {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+
+        let master_key = crypto::generate_random_bytes(32)?;
+        key_management_service::initialize_signing_key(&pool, &master_key, "test").await?;
+
+        let valid_secret = "valid-secret-12345";
+        let valid_hash = crypto::hash_client_secret(valid_secret)?;
+
+        service_credentials::create_service_credential(
+            &pool,
+            "alg-mismatch-client",
+            &valid_hash,
+            "global-controller",
+            None,
+            &["meeting:create".to_string()],
+        )
+        .await?;
+
+        // Issue a valid token with EdDSA
+        let token_response = issue_service_token(
+            &pool,
+            &master_key,
+            "alg-mismatch-client",
+            valid_secret,
+            "client_credentials",
+            None,
+            None,
+            None,
+        )
+        .await?;
+
+        // Tamper with the algorithm header: EdDSA -> HS256
+        let parts: Vec<&str> = token_response.access_token.split('.').collect();
+        assert_eq!(parts.len(), 3, "JWT should have 3 parts");
+
+        // Decode the header
+        let header_bytes = URL_SAFE_NO_PAD
+            .decode(parts[0])
+            .expect("Failed to decode header");
+        let mut header: serde_json::Value =
+            serde_json::from_slice(&header_bytes).expect("Failed to parse header JSON");
+
+        // Verify original algorithm is EdDSA
+        assert_eq!(
+            header["alg"].as_str().unwrap(),
+            "EdDSA",
+            "Original token should use EdDSA algorithm"
+        );
+
+        // Tamper: change algorithm from EdDSA to HS256
+        header["alg"] = serde_json::Value::String("HS256".to_string());
+
+        // Re-encode the tampered header
+        let tampered_header = URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&header).expect("Failed to serialize header"));
+
+        // Reconstruct JWT with tampered header (same payload and signature)
+        let tampered_token = format!("{}.{}.{}", tampered_header, parts[1], parts[2]);
+
+        // Attempt to verify with EdDSA public key
+        let signing_key = signing_keys::get_active_key(&pool)
+            .await?
+            .expect("No active signing key found");
+        let result = crypto::verify_jwt(&tampered_token, &signing_key.public_key);
+
+        // Should be rejected - algorithm mismatch
+        assert!(
+            matches!(result, Err(AcError::InvalidToken(_))),
+            "JWT with tampered algorithm header (EdDSA->HS256) should be rejected"
+        );
+
+        // Also test other algorithm confusions
+        header["alg"] = serde_json::Value::String("RS256".to_string());
+        let tampered_header_rs256 = URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&header).expect("Failed to serialize header"));
+        let tampered_token_rs256 = format!("{}.{}.{}", tampered_header_rs256, parts[1], parts[2]);
+
+        let result = crypto::verify_jwt(&tampered_token_rs256, &signing_key.public_key);
+        assert!(
+            matches!(result, Err(AcError::InvalidToken(_))),
+            "JWT with tampered algorithm header (EdDSA->RS256) should be rejected"
+        );
+
+        Ok(())
+    }
+
+    /// P1-SECURITY: Test JWT header kid injection
+    ///
+    /// Verifies that a token with a manipulated `kid` (key ID) header pointing to
+    /// an "attacker-controlled" key ID is still validated against our actual public key,
+    /// not some attacker's key.
+    ///
+    /// The `kid` (Key ID) header parameter (RFC 7515 Section 4.1.4) is a hint
+    /// indicating which key was used to sign the JWT. It's commonly used in:
+    /// - Multi-key environments (key rotation)
+    /// - JWKS (JSON Web Key Set) endpoints
+    ///
+    /// Attack scenario:
+    /// 1. Attacker generates their own keypair
+    /// 2. Attacker creates JWT with kid="attacker-key-123"
+    /// 3. Attacker signs JWT with their private key
+    /// 4. Vulnerable server fetches key from JWKS using kid
+    /// 5. Server validates with attacker's public key -> success!
+    ///
+    /// Our defense:
+    /// - We do NOT use kid to fetch keys dynamically
+    /// - crypto::verify_jwt() requires explicit public_key parameter
+    /// - Verification always uses our trusted signing key, ignoring kid
+    /// - kid is informational only, not used for security decisions
+    ///
+    /// Security impact: CRITICAL - prevents authentication bypass via key substitution
+    ///
+    /// Note: When we implement key rotation with get_by_key_id(), we must ensure:
+    /// - Only keys from our database are trusted
+    /// - kid cannot reference external/attacker-controlled keys
+    /// - Whitelist approach: validate kid against known key IDs before lookup
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_jwt_header_kid_injection(pool: PgPool) -> Result<(), AcError> {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+        use chrono::Utc;
+        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+
+        let master_key = crypto::generate_random_bytes(32)?;
+        key_management_service::initialize_signing_key(&pool, &master_key, "test").await?;
+
+        // Get our legitimate signing key
+        let legitimate_key = signing_keys::get_active_key(&pool)
+            .await?
+            .expect("No active signing key found");
+
+        // Generate attacker's keypair
+        let (attacker_public_key, attacker_private_key) = crypto::generate_signing_key()?;
+
+        // Create claims
+        let claims = crypto::Claims {
+            sub: "kid-injection-client".to_string(),
+            exp: Utc::now().timestamp() + TOKEN_EXPIRY_SECONDS_I64,
+            iat: Utc::now().timestamp(),
+            scope: "admin:all meeting:delete".to_string(), // Escalated privileges!
+            service_type: Some("global-controller".to_string()),
+        };
+
+        // Create header with attacker's kid
+        let mut attacker_header = Header::new(Algorithm::EdDSA);
+        attacker_header.kid = Some("attacker-controlled-key-12345".to_string());
+
+        // Sign with attacker's private key
+        let attacker_encoding_key = EncodingKey::from_ed_der(&attacker_private_key);
+        let attacker_token = encode(&attacker_header, &claims, &attacker_encoding_key)
+            .expect("Failed to encode attacker token");
+
+        // Attempt to verify with OUR legitimate public key (not attacker's)
+        // This simulates the secure behavior: we ignore kid and use our trusted key
+        let result = crypto::verify_jwt(&attacker_token, &legitimate_key.public_key);
+
+        // Should be REJECTED - signature won't match our public key
+        assert!(
+            matches!(result, Err(AcError::InvalidToken(_))),
+            "JWT signed with attacker's key should be rejected even with spoofed kid header"
+        );
+
+        // Verify that the token WOULD be valid if verified with attacker's key
+        // (to prove the token itself is well-formed, just signed by wrong key)
+        let attacker_verification = crypto::verify_jwt(&attacker_token, &attacker_public_key);
+        assert!(
+            attacker_verification.is_ok(),
+            "Token should be valid when verified with the key it was signed with (attacker's key)"
+        );
+
+        // Test 2: Legitimate token with manipulated kid header
+        // Issue a real token
+        let valid_secret = "valid-secret-12345";
+        let valid_hash = crypto::hash_client_secret(valid_secret)?;
+        service_credentials::create_service_credential(
+            &pool,
+            "kid-test-client",
+            &valid_hash,
+            "media-handler",
+            None,
+            &["media:process".to_string()],
+        )
+        .await?;
+
+        let token_response = issue_service_token(
+            &pool,
+            &master_key,
+            "kid-test-client",
+            valid_secret,
+            "client_credentials",
+            None,
+            None,
+            None,
+        )
+        .await?;
+
+        // Manually add/modify kid header
+        let parts: Vec<&str> = token_response.access_token.split('.').collect();
+        let header_bytes = URL_SAFE_NO_PAD
+            .decode(parts[0])
+            .expect("Failed to decode header");
+        let mut header: serde_json::Value =
+            serde_json::from_slice(&header_bytes).expect("Failed to parse header JSON");
+
+        // Inject malicious kid
+        header["kid"] = serde_json::Value::String("../../../etc/passwd".to_string());
+
+        let tampered_header = URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&header).expect("Failed to serialize header"));
+        let tampered_token = format!("{}.{}.{}", tampered_header, parts[1], parts[2]);
+
+        // Verify still succeeds because kid is ignored (only signature matters)
+        let result = crypto::verify_jwt(&tampered_token, &legitimate_key.public_key);
+
+        // Token should be REJECTED because changing the header invalidates the signature
+        assert!(
+            matches!(result, Err(AcError::InvalidToken(_))),
+            "JWT with tampered kid header should be rejected due to signature mismatch"
+        );
+
+        Ok(())
+    }
+
     /// P1-2: Test JWT claims injection - extra claims
     ///
     /// Verifies that extra claims in the JWT are safely ignored during deserialization.

@@ -4,6 +4,16 @@
 
 ### Completed Items (2025-12-01)
 
+#### JWT Header Injection Tests (2025-12-01)
+
+- [x] **test_jwt_header_typ_tampering**: Tests various `typ` header values (at+jwt, jwt, CUSTOM, null) - documents typ is not security-critical per RFC 7519
+- [x] **test_jwt_header_alg_mismatch_rejected**: Tests algorithm confusion attack defense (CVE-2015-2951, CVE-2016-5431) - EdDSA→HS256/RS256 rejected
+- [x] **test_jwt_header_kid_injection**: Tests key ID injection attack defense - verifies kid header cannot redirect to attacker-controlled keys
+- [x] **Test Specialist Review**: WELL TESTED - Excellent security coverage, outstanding documentation
+- [x] **Security Specialist Review**: ACCEPTABLE - Recommends adding JWT size limits and preparing for future key rotation security
+
+**Test Count**: Increased from 77 → 80 tests (+3 new header injection tests)
+
 #### JWT iat Validation (2025-12-01)
 
 - [x] **iat Validation Implementation**: Implemented strict iat validation with ±5 minute clock skew tolerance in `crypto::verify_jwt()`. Tokens with future `iat` beyond tolerance are rejected (prevents token pre-generation attacks)
@@ -33,9 +43,10 @@
 #### JWT Security Enhancements
 
 - [x] ~~**iat Validation Implementation**: Implement strict iat validation with clock skew tolerance (±5 minutes)~~ ✅ DONE
+- [x] ~~**JWT Header Injection**: Add tests for typ/alg/kid header tampering~~ ✅ DONE
 - [ ] **Maximum Token Age Validation** (Security Specialist Recommendation): Add validation to reject tokens with `iat` too far in the PAST (e.g., >15 minutes old) to prevent replay attacks with old tokens. Currently only future `iat` is validated.
-- [ ] **JWT Header Injection**: Add test for typ claim tampering (e.g., changing "JWT" to "something-else")
-- [ ] **Key Rotation Implementation**: Complete key rotation tests once `signing_keys::get_by_key_id()` and `signing_keys::list_all_keys()` are implemented
+- [ ] **JWT Size Limits** (Security Specialist Recommendation): Add size limit check in `verify_jwt()` to prevent DoS via large tokens (suggest 4KB limit)
+- [ ] **Key Rotation Implementation**: Complete key rotation tests once `signing_keys::get_by_key_id()` and `signing_keys::list_all_keys()` are implemented. **SECURITY NOTE**: When implementing, must validate `kid` against database whitelist only - never fetch keys based on untrusted kid values.
 - [ ] **Configurable Clock Skew**: Consider making `JWT_CLOCK_SKEW_SECONDS` configurable via environment variable for different security postures
 
 #### SQL Injection Testing Enhancements
