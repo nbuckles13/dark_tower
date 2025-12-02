@@ -39,3 +39,45 @@ pub async fn handle_register_service(
 
     Ok(Json(response))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_register_service_request_deserialization() {
+        let json = r#"{"service_type": "global-controller", "region": "us-west-2"}"#;
+        let req: RegisterServiceRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.service_type, "global-controller");
+        assert_eq!(req.region, Some("us-west-2".to_string()));
+    }
+
+    #[test]
+    fn test_register_service_request_without_region() {
+        let json = r#"{"service_type": "meeting-controller"}"#;
+        let req: RegisterServiceRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.service_type, "meeting-controller");
+        assert_eq!(req.region, None);
+    }
+
+    #[test]
+    fn test_valid_service_types() {
+        let valid_types = ["global-controller", "meeting-controller", "media-handler"];
+
+        for service_type in valid_types {
+            let json = format!(r#"{{"service_type": "{}"}}"#, service_type);
+            let req: RegisterServiceRequest = serde_json::from_str(&json).unwrap();
+            assert_eq!(req.service_type, service_type);
+        }
+    }
+
+    #[test]
+    fn test_invalid_service_type_format() {
+        // Note: This tests deserialization, not handler validation
+        let json = r#"{"service_type": "invalid-service"}"#;
+        let req: RegisterServiceRequest = serde_json::from_str(json).unwrap();
+        // Deserialization succeeds (it's just a string)
+        assert_eq!(req.service_type, "invalid-service");
+        // Validation happens in the handler, not during deserialization
+    }
+}

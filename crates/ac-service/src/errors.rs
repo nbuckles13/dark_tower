@@ -139,3 +139,201 @@ impl IntoResponse for AcError {
         response
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use http_body_util::BodyExt;
+
+    // Helper function to read the response body as JSON
+    async fn read_body_json(body: Body) -> serde_json::Value {
+        let bytes = body.collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    // Display tests
+    #[test]
+    fn test_display_database_error() {
+        let error = AcError::Database("connection failed".to_string());
+        assert_eq!(format!("{}", error), "Database error: connection failed");
+    }
+
+    #[test]
+    fn test_display_crypto_error() {
+        let error = AcError::Crypto("key generation failed".to_string());
+        assert_eq!(
+            format!("{}", error),
+            "Cryptographic error: key generation failed"
+        );
+    }
+
+    #[test]
+    fn test_display_invalid_credentials() {
+        let error = AcError::InvalidCredentials;
+        assert_eq!(format!("{}", error), "Invalid credentials");
+    }
+
+    #[test]
+    fn test_display_insufficient_scope() {
+        let error = AcError::InsufficientScope {
+            required: "admin".to_string(),
+            provided: vec!["read".to_string(), "write".to_string()],
+        };
+        assert_eq!(
+            format!("{}", error),
+            "Insufficient scope: required admin, provided [\"read\", \"write\"]"
+        );
+    }
+
+    #[test]
+    fn test_display_invalid_token() {
+        let error = AcError::InvalidToken("expired".to_string());
+        assert_eq!(format!("{}", error), "Invalid token: expired");
+    }
+
+    #[test]
+    fn test_display_rate_limit_exceeded() {
+        let error = AcError::RateLimitExceeded;
+        assert_eq!(format!("{}", error), "Rate limit exceeded");
+    }
+
+    #[test]
+    fn test_display_internal() {
+        let error = AcError::Internal;
+        assert_eq!(format!("{}", error), "Internal server error");
+    }
+
+    // IntoResponse tests
+    #[tokio::test]
+    async fn test_into_response_database_error() {
+        let error = AcError::Database("connection failed".to_string());
+        let response = error.into_response();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let body_json = read_body_json(response.into_body()).await;
+        assert_eq!(body_json["error"]["code"], "DATABASE_ERROR");
+        assert_eq!(
+            body_json["error"]["message"],
+            "An internal database error occurred"
+        );
+        assert!(body_json["error"]["required_scope"].is_null());
+        assert!(body_json["error"]["provided_scopes"].is_null());
+    }
+
+    #[tokio::test]
+    async fn test_into_response_crypto_error() {
+        let error = AcError::Crypto("key generation failed".to_string());
+        let response = error.into_response();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let body_json = read_body_json(response.into_body()).await;
+        assert_eq!(body_json["error"]["code"], "CRYPTO_ERROR");
+        assert_eq!(body_json["error"]["message"], "An internal error occurred");
+        assert!(body_json["error"]["required_scope"].is_null());
+        assert!(body_json["error"]["provided_scopes"].is_null());
+    }
+
+    #[tokio::test]
+    async fn test_into_response_invalid_credentials() {
+        let error = AcError::InvalidCredentials;
+        let response = error.into_response();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        // Check WWW-Authenticate header before consuming the body
+        let www_auth = response.headers().get("WWW-Authenticate");
+        assert!(www_auth.is_some());
+        let www_auth_str = www_auth.unwrap().to_str().unwrap();
+        assert!(www_auth_str.contains("Bearer realm=\"dark-tower-api\""));
+        assert!(www_auth_str.contains("error=\"invalid_token\""));
+
+        let body_json = read_body_json(response.into_body()).await;
+        assert_eq!(body_json["error"]["code"], "INVALID_CREDENTIALS");
+        assert_eq!(body_json["error"]["message"], "Invalid client credentials");
+    }
+
+    #[tokio::test]
+    async fn test_into_response_insufficient_scope() {
+        let error = AcError::InsufficientScope {
+            required: "admin".to_string(),
+            provided: vec!["read".to_string(), "write".to_string()],
+        };
+        let response = error.into_response();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        // Check WWW-Authenticate header before consuming the body
+        let www_auth = response.headers().get("WWW-Authenticate");
+        assert!(www_auth.is_some());
+        let www_auth_str = www_auth.unwrap().to_str().unwrap();
+        assert!(www_auth_str.contains("Bearer realm=\"dark-tower-api\""));
+        assert!(www_auth_str.contains("error=\"insufficient_scope\""));
+        assert!(www_auth_str.contains("Requires scope: admin"));
+
+        let body_json = read_body_json(response.into_body()).await;
+        assert_eq!(body_json["error"]["code"], "INSUFFICIENT_SCOPE");
+        assert_eq!(body_json["error"]["message"], "Requires scope: admin");
+        assert_eq!(body_json["error"]["required_scope"], "admin");
+        assert_eq!(
+            body_json["error"]["provided_scopes"],
+            serde_json::json!(["read", "write"])
+        );
+    }
+
+    #[tokio::test]
+    async fn test_into_response_invalid_token() {
+        let error = AcError::InvalidToken("token expired".to_string());
+        let response = error.into_response();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        // Check WWW-Authenticate header before consuming the body
+        let www_auth = response.headers().get("WWW-Authenticate");
+        assert!(www_auth.is_some());
+        let www_auth_str = www_auth.unwrap().to_str().unwrap();
+        assert!(www_auth_str.contains("Bearer realm=\"dark-tower-api\""));
+        assert!(www_auth_str.contains("error=\"invalid_token\""));
+
+        let body_json = read_body_json(response.into_body()).await;
+        assert_eq!(body_json["error"]["code"], "INVALID_TOKEN");
+        assert_eq!(body_json["error"]["message"], "token expired");
+    }
+
+    #[tokio::test]
+    async fn test_into_response_rate_limit_exceeded() {
+        let error = AcError::RateLimitExceeded;
+        let response = error.into_response();
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        // Rate limit errors should not have WWW-Authenticate header
+        let www_auth = response.headers().get("WWW-Authenticate");
+        assert!(www_auth.is_none());
+
+        let body_json = read_body_json(response.into_body()).await;
+        assert_eq!(body_json["error"]["code"], "RATE_LIMIT_EXCEEDED");
+        assert_eq!(
+            body_json["error"]["message"],
+            "Too many requests. Please try again later."
+        );
+    }
+
+    #[tokio::test]
+    async fn test_into_response_internal() {
+        let error = AcError::Internal;
+        let response = error.into_response();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        // Internal errors should not have WWW-Authenticate header
+        let www_auth = response.headers().get("WWW-Authenticate");
+        assert!(www_auth.is_none());
+
+        let body_json = read_body_json(response.into_body()).await;
+        assert_eq!(body_json["error"]["code"], "INTERNAL_ERROR");
+        assert_eq!(body_json["error"]["message"], "An internal error occurred");
+    }
+}
