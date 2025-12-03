@@ -183,7 +183,11 @@ pub fn decrypt_private_key(
 }
 
 /// Sign JWT with EdDSA private key
-pub fn sign_jwt(claims: &Claims, private_key_pkcs8: &[u8]) -> Result<String, AcError> {
+pub fn sign_jwt(
+    claims: &Claims,
+    private_key_pkcs8: &[u8],
+    key_id: &str,
+) -> Result<String, AcError> {
     // Validate the private key format
     let _key_pair = Ed25519KeyPair::from_pkcs8(private_key_pkcs8).map_err(|e| {
         tracing::error!(target: "crypto", error = ?e, "Invalid private key format");
@@ -196,6 +200,7 @@ pub fn sign_jwt(claims: &Claims, private_key_pkcs8: &[u8]) -> Result<String, AcE
 
     let mut header = Header::new(Algorithm::EdDSA);
     header.typ = Some("JWT".to_string());
+    header.kid = Some(key_id.to_string());
 
     let token = encode(&header, claims, &encoding_key).map_err(|e| {
         tracing::error!(target: "crypto", error = ?e, "JWT signing operation failed");
@@ -349,7 +354,7 @@ mod tests {
             service_type: None,
         };
 
-        let token = sign_jwt(&claims, &private_pkcs8).unwrap();
+        let token = sign_jwt(&claims, &private_pkcs8, "test-key-01").unwrap();
         let verified_claims = verify_jwt(&token, &public_pem).unwrap();
 
         assert_eq!(verified_claims.sub, claims.sub);
@@ -465,7 +470,7 @@ mod tests {
             service_type: None,
         };
 
-        let token = sign_jwt(&claims, &private_pkcs8).unwrap();
+        let token = sign_jwt(&claims, &private_pkcs8, "test-key-01").unwrap();
         let result = verify_jwt(&token, &public_pem);
 
         assert!(result.is_err());
@@ -488,7 +493,7 @@ mod tests {
             service_type: None,
         };
 
-        let token = sign_jwt(&claims, &private_pkcs8).unwrap();
+        let token = sign_jwt(&claims, &private_pkcs8, "test-key-01").unwrap();
         let result = verify_jwt(&token, &wrong_public_pem);
 
         assert!(result.is_err());
@@ -608,7 +613,7 @@ mod tests {
             service_type: None,
         };
 
-        let token = sign_jwt(&claims, &private_pkcs8).unwrap();
+        let token = sign_jwt(&claims, &private_pkcs8, "test-key-01").unwrap();
 
         // Verify the token is under the size limit
         assert!(
@@ -678,7 +683,7 @@ mod tests {
             service_type: None,
         };
 
-        let token = sign_jwt(&claims, &private_pkcs8).unwrap();
+        let token = sign_jwt(&claims, &private_pkcs8, "test-key-01").unwrap();
         let result = verify_jwt(&token, &public_pem);
 
         // Should be rejected - iat too far in the future
@@ -708,7 +713,7 @@ mod tests {
             service_type: None,
         };
 
-        let token = sign_jwt(&claims, &private_pkcs8).unwrap();
+        let token = sign_jwt(&claims, &private_pkcs8, "test-key-01").unwrap();
         let result = verify_jwt(&token, &public_pem);
 
         // Should be accepted - iat within clock skew tolerance
@@ -735,6 +740,51 @@ mod tests {
         );
     }
 
+    /// Test that sign_jwt() includes kid (key ID) in JWT header
+    ///
+    /// Verifies that the JWT header contains the kid field with the correct value.
+    /// This is required for key rotation support per ADR-0008.
+    #[test]
+    fn test_jwt_includes_kid_header() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+
+        let (_, private_pkcs8) = generate_signing_key().unwrap();
+
+        let claims = Claims {
+            sub: "test-user".to_string(),
+            exp: chrono::Utc::now().timestamp() + 3600,
+            iat: chrono::Utc::now().timestamp(),
+            scope: "read write".to_string(),
+            service_type: None,
+        };
+
+        let key_id = "auth-prod-2025-01";
+        let token = sign_jwt(&claims, &private_pkcs8, key_id).unwrap();
+
+        // Extract and decode the header (first part of JWT)
+        let parts: Vec<&str> = token.split('.').collect();
+        assert_eq!(parts.len(), 3, "JWT should have 3 parts");
+
+        let header_bytes = URL_SAFE_NO_PAD
+            .decode(parts[0])
+            .expect("Failed to decode header");
+        let header: serde_json::Value =
+            serde_json::from_slice(&header_bytes).expect("Failed to parse header JSON");
+
+        // Verify kid is present and matches
+        assert_eq!(
+            header["kid"].as_str().unwrap(),
+            key_id,
+            "JWT header should contain kid matching the provided key_id"
+        );
+
+        // Verify algorithm is EdDSA
+        assert_eq!(header["alg"].as_str().unwrap(), "EdDSA");
+
+        // Verify typ is JWT
+        assert_eq!(header["typ"].as_str().unwrap(), "JWT");
+    }
+
     // ============================================================================
     // Additional Coverage Tests - Error Paths
     // ============================================================================
@@ -755,7 +805,7 @@ mod tests {
         // Use invalid PKCS8 data
         let invalid_key = vec![0u8; 32]; // Not a valid PKCS8 structure
 
-        let result = sign_jwt(&claims, &invalid_key);
+        let result = sign_jwt(&claims, &invalid_key, "test-key-01");
 
         assert!(result.is_err(), "Invalid private key should be rejected");
 
@@ -782,7 +832,7 @@ mod tests {
             service_type: None,
         };
 
-        let token = sign_jwt(&claims, &private_pkcs8).unwrap();
+        let token = sign_jwt(&claims, &private_pkcs8, "test-key-01").unwrap();
 
         // Use invalid PEM format (not proper base64)
         let invalid_pem = "-----BEGIN PUBLIC KEY-----\ninvalid!@#$%\n-----END PUBLIC KEY-----";
@@ -815,7 +865,7 @@ mod tests {
             service_type: None,
         };
 
-        let token = sign_jwt(&claims, &private_pkcs8).unwrap();
+        let token = sign_jwt(&claims, &private_pkcs8, "test-key-01").unwrap();
 
         // Use valid base64 but invalid key bytes (wrong length for Ed25519)
         let invalid_key_bytes = vec![0u8; 16]; // Too short for Ed25519
@@ -852,7 +902,7 @@ mod tests {
             service_type: None,
         };
 
-        let mut token = sign_jwt(&claims, &private_pkcs8).unwrap();
+        let mut token = sign_jwt(&claims, &private_pkcs8, "test-key-01").unwrap();
 
         // Tamper with the token by changing one character in the payload
         // JWT format: header.payload.signature
@@ -911,7 +961,7 @@ mod tests {
             service_type: None,
         };
 
-        let token = sign_jwt(&claims, &private_pkcs8).unwrap();
+        let token = sign_jwt(&claims, &private_pkcs8, "test-key-01").unwrap();
         let result = verify_jwt(&token, &public_pem);
 
         // Should be accepted (boundary is inclusive: iat <= max_iat)
@@ -939,7 +989,7 @@ mod tests {
             service_type: None,
         };
 
-        let token = sign_jwt(&claims, &private_pkcs8).unwrap();
+        let token = sign_jwt(&claims, &private_pkcs8, "test-key-01").unwrap();
         let result = verify_jwt(&token, &public_pem);
 
         // Should be rejected
@@ -973,7 +1023,7 @@ mod tests {
             service_type: None,
         };
 
-        let token = sign_jwt(&claims, &private_pkcs8).unwrap();
+        let token = sign_jwt(&claims, &private_pkcs8, "test-key-01").unwrap();
         let result = verify_jwt(&token, &public_pem);
 
         // Should be accepted (iat in the past is fine as long as not expired)

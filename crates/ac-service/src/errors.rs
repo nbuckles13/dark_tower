@@ -29,6 +29,12 @@ pub enum AcError {
     #[error("Rate limit exceeded")]
     RateLimitExceeded,
 
+    #[error("Too many requests. Retry after {retry_after_seconds} seconds: {message}")]
+    TooManyRequests {
+        retry_after_seconds: i64,
+        message: String,
+    },
+
     #[error("Internal server error")]
     Internal,
 }
@@ -46,15 +52,18 @@ struct ErrorDetail {
     required_scope: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     provided_scopes: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retry_after_seconds: Option<i64>,
 }
 
 impl IntoResponse for AcError {
     fn into_response(self) -> Response {
-        let (status, code, message, required_scope, provided_scopes) = match &self {
+        let (status, code, message, required_scope, provided_scopes, retry_after) = match &self {
             AcError::Database(_) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "DATABASE_ERROR",
                 "An internal database error occurred".to_string(),
+                None,
                 None,
                 None,
             ),
@@ -67,12 +76,14 @@ impl IntoResponse for AcError {
                     "An internal error occurred".to_string(),
                     None,
                     None,
+                    None,
                 )
             }
             AcError::InvalidCredentials => (
                 StatusCode::UNAUTHORIZED,
                 "INVALID_CREDENTIALS",
                 "Invalid client credentials".to_string(),
+                None,
                 None,
                 None,
             ),
@@ -82,11 +93,13 @@ impl IntoResponse for AcError {
                 format!("Requires scope: {}", required),
                 Some(required.clone()),
                 Some(provided.clone()),
+                None,
             ),
             AcError::InvalidToken(reason) => (
                 StatusCode::UNAUTHORIZED,
                 "INVALID_TOKEN",
                 reason.clone(),
+                None,
                 None,
                 None,
             ),
@@ -96,11 +109,24 @@ impl IntoResponse for AcError {
                 "Too many requests. Please try again later.".to_string(),
                 None,
                 None,
+                None,
+            ),
+            AcError::TooManyRequests {
+                retry_after_seconds,
+                message,
+            } => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "TOO_MANY_REQUESTS",
+                message.clone(),
+                None,
+                None,
+                Some(*retry_after_seconds),
             ),
             AcError::Internal => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "INTERNAL_ERROR",
                 "An internal error occurred".to_string(),
+                None,
                 None,
                 None,
             ),
@@ -112,6 +138,7 @@ impl IntoResponse for AcError {
                 message,
                 required_scope: required_scope.clone(),
                 provided_scopes: provided_scopes.clone(),
+                retry_after_seconds: retry_after,
             },
         };
 
@@ -133,6 +160,13 @@ impl IntoResponse for AcError {
                 response
                     .headers_mut()
                     .insert("WWW-Authenticate", header_value);
+            }
+        }
+
+        // Add Retry-After header for 429 responses
+        if let Some(retry_after_secs) = retry_after {
+            if let Ok(header_value) = retry_after_secs.to_string().parse() {
+                response.headers_mut().insert("Retry-After", header_value);
             }
         }
 

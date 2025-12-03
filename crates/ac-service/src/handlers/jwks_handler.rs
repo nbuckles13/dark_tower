@@ -1,7 +1,11 @@
 use crate::errors::AcError;
 use crate::models::Jwks;
 use crate::services::key_management_service;
-use axum::{extract::State, Json};
+use axum::{
+    extract::State,
+    http::header::{HeaderMap, CACHE_CONTROL},
+    Json,
+};
 use std::sync::Arc;
 
 use super::auth_handler::AppState;
@@ -11,10 +15,20 @@ use super::auth_handler::AppState;
 /// GET /.well-known/jwks.json
 ///
 /// Returns all active public keys in JWKS format (RFC 7517)
-pub async fn handle_get_jwks(State(state): State<Arc<AppState>>) -> Result<Json<Jwks>, AcError> {
+/// with Cache-Control header set to max-age=3600 (1 hour)
+pub async fn handle_get_jwks(
+    State(state): State<Arc<AppState>>,
+) -> Result<(HeaderMap, Json<Jwks>), AcError> {
     let jwks = key_management_service::get_jwks(&state.pool).await?;
 
-    Ok(Json(jwks))
+    // Add Cache-Control header to allow caching for 1 hour
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        CACHE_CONTROL,
+        "max-age=3600".parse().expect("Valid header value"),
+    );
+
+    Ok((headers, Json(jwks)))
 }
 
 #[cfg(test)]

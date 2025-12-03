@@ -1,8 +1,13 @@
 use crate::errors::AcError;
 use crate::models::RegisterServiceResponse;
-use crate::services::registration_service;
-use axum::{extract::State, Json};
-use serde::Deserialize;
+use crate::repositories::signing_keys;
+use crate::services::{key_management_service, registration_service};
+use axum::{
+    extract::{Request, State},
+    Json,
+};
+use chrono::Utc;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use super::auth_handler::AppState;
@@ -38,6 +43,206 @@ pub async fn handle_register_service(
             .await?;
 
     Ok(Json(response))
+}
+
+#[derive(Debug, Serialize)]
+pub struct RotateKeysResponse {
+    pub rotated: bool,
+    pub new_key_id: String,
+    pub old_key_id: String,
+    pub old_key_valid_until: String,
+}
+
+/// Handle key rotation request
+///
+/// POST /internal/rotate-keys
+///
+/// Requires scope: service.rotate-keys.ac OR admin.force-rotate-keys.ac
+///
+/// Implements database-driven rate limiting:
+/// - Normal rotation (service.rotate-keys.ac): 1 per 6 days
+/// - Force rotation (admin.force-rotate-keys.ac): 1 per hour
+///
+/// SECURITY: Uses database transactions with SELECT FOR UPDATE to prevent
+/// TOCTOU race conditions in concurrent rotation requests.
+pub async fn handle_rotate_keys(
+    State(state): State<Arc<AppState>>,
+    req: Request,
+) -> Result<Json<RotateKeysResponse>, AcError> {
+    // Extract Authorization header
+    let auth_header = req
+        .headers()
+        .get("authorization")
+        .and_then(|h| h.to_str().ok())
+        .ok_or(AcError::InvalidToken(
+            "Missing Authorization header".to_string(),
+        ))?;
+
+    // Extract Bearer token
+    let token = auth_header
+        .strip_prefix("Bearer ")
+        .ok_or(AcError::InvalidToken(
+            "Invalid Authorization header format".to_string(),
+        ))?;
+
+    // Get active signing key for verification
+    let signing_key = signing_keys::get_active_key(&state.pool)
+        .await?
+        .ok_or_else(|| AcError::Crypto("No active signing key available".to_string()))?;
+
+    // Verify JWT and extract claims
+    let claims = crate::crypto::verify_jwt(token, &signing_key.public_key)?;
+
+    // Check for rotation scopes
+    let token_scopes: Vec<&str> = claims.scope.split_whitespace().collect();
+    let has_normal_scope = token_scopes.contains(&"service.rotate-keys.ac");
+    let has_force_scope = token_scopes.contains(&"admin.force-rotate-keys.ac");
+
+    if !has_normal_scope && !has_force_scope {
+        // SECURITY FIX: Audit log failed authorization attempts
+        tracing::warn!(
+            target: "audit",
+            event = "key_rotation_denied",
+            client_id = %claims.sub,
+            success = false,
+            reason = "insufficient_scope",
+            required_scope = "service.rotate-keys.ac or admin.force-rotate-keys.ac",
+            provided_scopes = ?token_scopes,
+            "Key rotation denied: insufficient scope"
+        );
+
+        return Err(AcError::InsufficientScope {
+            required: "service.rotate-keys.ac".to_string(),
+            provided: token_scopes.iter().map(|s| s.to_string()).collect(),
+        });
+    }
+
+    // Get cluster name from environment, default to "default" for development
+    // SECURITY FIX: Make cluster name configurable instead of hardcoded
+    let cluster_name = std::env::var("AC_CLUSTER_NAME").unwrap_or_else(|_| "default".to_string());
+
+    // SECURITY FIX: Use database transaction with SELECT FOR UPDATE to prevent TOCTOU race condition
+    // This ensures rate limit check and rotation are atomic
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(|e| AcError::Database(format!("Failed to begin transaction: {}", e)))?;
+
+    // Lock the signing_keys table during rate limit check
+    // This prevents concurrent requests from bypassing rate limiting
+    let last_rotation: Option<chrono::DateTime<Utc>> = sqlx::query_scalar(
+        r#"
+        SELECT created_at
+        FROM signing_keys
+        ORDER BY created_at DESC
+        LIMIT 1
+        FOR UPDATE
+        "#,
+    )
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|e| AcError::Database(format!("Failed to query last rotation: {}", e)))?;
+
+    // Determine minimum interval based on scope
+    let (min_interval_days, min_interval_hours) = if has_force_scope {
+        (0, 1) // Force rotation: 1 hour minimum
+    } else {
+        (6, 0) // Normal rotation: 6 days minimum
+    };
+
+    // Check if enough time has passed since last rotation
+    if let Some(last) = last_rotation {
+        let now = Utc::now();
+        let elapsed = now.signed_duration_since(last);
+
+        let min_duration =
+            chrono::Duration::days(min_interval_days) + chrono::Duration::hours(min_interval_hours);
+
+        if elapsed < min_duration {
+            let remaining = min_duration - elapsed;
+            let retry_after_seconds = remaining.num_seconds();
+
+            // SECURITY FIX: Audit log rate-limited attempts
+            tracing::warn!(
+                target: "audit",
+                event = "key_rotation_denied",
+                client_id = %claims.sub,
+                success = false,
+                reason = "rate_limit_exceeded",
+                forced = has_force_scope,
+                retry_after_seconds = retry_after_seconds,
+                elapsed_seconds = elapsed.num_seconds(),
+                min_interval_seconds = min_duration.num_seconds(),
+                "Key rotation denied: rate limit exceeded"
+            );
+
+            // SECURITY FIX: Use generic error message to avoid information leakage
+            return Err(AcError::TooManyRequests {
+                retry_after_seconds,
+                message: "Key rotation temporarily unavailable".to_string(),
+            });
+        }
+    }
+
+    // Get old active key before rotation (within same transaction)
+    let old_key = sqlx::query_as::<_, crate::models::SigningKey>(
+        r#"
+        SELECT
+            key_id, public_key, private_key_encrypted, encryption_nonce, encryption_tag,
+            encryption_algorithm, master_key_version, algorithm,
+            is_active, valid_from, valid_until, created_at
+        FROM signing_keys
+        WHERE is_active = true
+            AND valid_from <= NOW()
+            AND valid_until > NOW()
+        ORDER BY valid_from DESC
+        LIMIT 1
+        "#,
+    )
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|e| AcError::Database(format!("Failed to fetch active key: {}", e)))?
+    .ok_or_else(|| AcError::Crypto("No active signing key available".to_string()))?;
+
+    // Perform rotation within same transaction
+    let new_key_id = key_management_service::rotate_signing_key_tx(
+        &mut tx,
+        &state.config.master_key,
+        &cluster_name,
+    )
+    .await?;
+
+    // Commit transaction - if this fails, all changes (including rotation) are rolled back
+    tx.commit()
+        .await
+        .map_err(|e| AcError::Database(format!("Failed to commit rotation transaction: {}", e)))?;
+
+    // Get the updated old key to retrieve its valid_until (after transaction commit)
+    let old_key_updated = signing_keys::get_by_key_id(&state.pool, &old_key.key_id)
+        .await?
+        .ok_or_else(|| AcError::Crypto("Failed to retrieve old key after rotation".to_string()))?;
+
+    // Log successful rotation AFTER transaction commits
+    // This ensures we only log events that actually happened
+    tracing::info!(
+        target: "audit",
+        event = "key_rotation_success",
+        client_id = %claims.sub,
+        success = true,
+        forced = has_force_scope,
+        new_key_id = %new_key_id,
+        old_key_id = %old_key.key_id,
+        cluster_name = %cluster_name,
+        "Key rotation successful"
+    );
+
+    Ok(Json(RotateKeysResponse {
+        rotated: true,
+        new_key_id,
+        old_key_id: old_key.key_id.clone(),
+        old_key_valid_until: old_key_updated.valid_until.to_rfc3339(),
+    }))
 }
 
 #[cfg(test)]
