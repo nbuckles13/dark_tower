@@ -734,4 +734,495 @@ mod tests {
             "Clock skew tolerance must be 300 seconds (5 minutes) per NIST SP 800-63B"
         );
     }
+
+    // ============================================================================
+    // Additional Coverage Tests - Error Paths
+    // ============================================================================
+
+    /// Test sign_jwt with invalid private key format
+    ///
+    /// Validates that sign_jwt properly rejects malformed private keys.
+    #[test]
+    fn test_sign_jwt_invalid_private_key() {
+        let claims = Claims {
+            sub: "test-user".to_string(),
+            exp: chrono::Utc::now().timestamp() + 3600,
+            iat: chrono::Utc::now().timestamp(),
+            scope: "read write".to_string(),
+            service_type: None,
+        };
+
+        // Use invalid PKCS8 data
+        let invalid_key = vec![0u8; 32]; // Not a valid PKCS8 structure
+
+        let result = sign_jwt(&claims, &invalid_key);
+
+        assert!(result.is_err(), "Invalid private key should be rejected");
+
+        match result {
+            Err(AcError::Crypto(msg)) => {
+                assert_eq!(msg, "JWT signing failed");
+            }
+            _ => panic!("Expected Crypto error for invalid private key"),
+        }
+    }
+
+    /// Test verify_jwt with invalid public key PEM format
+    ///
+    /// Validates that verify_jwt properly rejects malformed PEM data.
+    #[test]
+    fn test_verify_jwt_invalid_pem_format() {
+        let (_, private_pkcs8) = generate_signing_key().unwrap();
+
+        let claims = Claims {
+            sub: "test-user".to_string(),
+            exp: chrono::Utc::now().timestamp() + 3600,
+            iat: chrono::Utc::now().timestamp(),
+            scope: "read write".to_string(),
+            service_type: None,
+        };
+
+        let token = sign_jwt(&claims, &private_pkcs8).unwrap();
+
+        // Use invalid PEM format (not proper base64)
+        let invalid_pem = "-----BEGIN PUBLIC KEY-----\ninvalid!@#$%\n-----END PUBLIC KEY-----";
+
+        let result = verify_jwt(&token, invalid_pem);
+
+        assert!(
+            result.is_err(),
+            "Invalid PEM format should be rejected during base64 decode"
+        );
+
+        match result {
+            Err(AcError::InvalidToken(_)) => {} // Expected
+            _ => panic!("Expected InvalidToken error for invalid PEM"),
+        }
+    }
+
+    /// Test verify_jwt with valid base64 but invalid key bytes
+    ///
+    /// Validates that verify_jwt rejects valid base64 that's not a valid Ed25519 key.
+    #[test]
+    fn test_verify_jwt_invalid_key_bytes() {
+        let (_, private_pkcs8) = generate_signing_key().unwrap();
+
+        let claims = Claims {
+            sub: "test-user".to_string(),
+            exp: chrono::Utc::now().timestamp() + 3600,
+            iat: chrono::Utc::now().timestamp(),
+            scope: "read write".to_string(),
+            service_type: None,
+        };
+
+        let token = sign_jwt(&claims, &private_pkcs8).unwrap();
+
+        // Use valid base64 but invalid key bytes (wrong length for Ed25519)
+        let invalid_key_bytes = vec![0u8; 16]; // Too short for Ed25519
+        let invalid_pem = format!(
+            "-----BEGIN PUBLIC KEY-----\n{}\n-----END PUBLIC KEY-----",
+            general_purpose::STANDARD.encode(&invalid_key_bytes)
+        );
+
+        let result = verify_jwt(&token, &invalid_pem);
+
+        assert!(
+            result.is_err(),
+            "Invalid key bytes should be rejected during verification"
+        );
+
+        match result {
+            Err(AcError::InvalidToken(_)) => {} // Expected
+            _ => panic!("Expected InvalidToken error for invalid key bytes"),
+        }
+    }
+
+    /// Test verify_jwt with tampered token
+    ///
+    /// Validates that signature verification catches token tampering.
+    #[test]
+    fn test_verify_jwt_tampered_token() {
+        let (public_pem, private_pkcs8) = generate_signing_key().unwrap();
+
+        let claims = Claims {
+            sub: "test-user".to_string(),
+            exp: chrono::Utc::now().timestamp() + 3600,
+            iat: chrono::Utc::now().timestamp(),
+            scope: "read write".to_string(),
+            service_type: None,
+        };
+
+        let mut token = sign_jwt(&claims, &private_pkcs8).unwrap();
+
+        // Tamper with the token by changing one character in the payload
+        // JWT format: header.payload.signature
+        let parts: Vec<&str> = token.split('.').collect();
+        assert_eq!(parts.len(), 3, "JWT should have 3 parts");
+
+        // Modify the payload slightly
+        let tampered_payload = parts[1].to_string() + "X"; // Append character
+        token = format!("{}.{}.{}", parts[0], tampered_payload, parts[2]);
+
+        let result = verify_jwt(&token, &public_pem);
+
+        assert!(result.is_err(), "Tampered token should be rejected");
+
+        match result {
+            Err(AcError::InvalidToken(_)) => {} // Expected
+            _ => panic!("Expected InvalidToken error for tampered token"),
+        }
+    }
+
+    /// Test verify_jwt with malformed token (not JWT format)
+    ///
+    /// Validates that completely invalid tokens are rejected early.
+    #[test]
+    fn test_verify_jwt_malformed_token() {
+        let (public_pem, _) = generate_signing_key().unwrap();
+
+        // Not a JWT at all
+        let malformed_token = "not.a.valid.jwt.format.with.too.many.parts";
+
+        let result = verify_jwt(malformed_token, &public_pem);
+
+        assert!(result.is_err(), "Malformed token should be rejected");
+
+        match result {
+            Err(AcError::InvalidToken(_)) => {} // Expected
+            _ => panic!("Expected InvalidToken error for malformed token"),
+        }
+    }
+
+    /// Test JWT iat validation at exact clock skew boundary
+    ///
+    /// Tests the boundary condition where iat equals max_iat (should accept).
+    #[test]
+    fn test_jwt_iat_at_clock_skew_boundary() {
+        let (public_pem, private_pkcs8) = generate_signing_key().unwrap();
+
+        let now = chrono::Utc::now().timestamp();
+
+        // Create token with iat exactly at the boundary (now + JWT_CLOCK_SKEW_SECONDS)
+        let claims = Claims {
+            sub: "test-user".to_string(),
+            exp: now + 7200,                   // Expires in 2 hours
+            iat: now + JWT_CLOCK_SKEW_SECONDS, // Exactly at boundary
+            scope: "read write".to_string(),
+            service_type: None,
+        };
+
+        let token = sign_jwt(&claims, &private_pkcs8).unwrap();
+        let result = verify_jwt(&token, &public_pem);
+
+        // Should be accepted (boundary is inclusive: iat <= max_iat)
+        assert!(
+            result.is_ok(),
+            "Token with iat at exact boundary should be accepted"
+        );
+    }
+
+    /// Test JWT iat validation one second past boundary
+    ///
+    /// Tests that iat > max_iat is properly rejected.
+    #[test]
+    fn test_jwt_iat_one_second_past_boundary() {
+        let (public_pem, private_pkcs8) = generate_signing_key().unwrap();
+
+        let now = chrono::Utc::now().timestamp();
+
+        // Create token with iat 1 second past the boundary
+        let claims = Claims {
+            sub: "test-user".to_string(),
+            exp: now + 7200,
+            iat: now + JWT_CLOCK_SKEW_SECONDS + 1, // 1 second past boundary
+            scope: "read write".to_string(),
+            service_type: None,
+        };
+
+        let token = sign_jwt(&claims, &private_pkcs8).unwrap();
+        let result = verify_jwt(&token, &public_pem);
+
+        // Should be rejected
+        assert!(
+            result.is_err(),
+            "Token with iat 1 second past boundary should be rejected"
+        );
+
+        match result {
+            Err(AcError::InvalidToken(_)) => {} // Expected
+            _ => panic!("Expected InvalidToken error"),
+        }
+    }
+
+    /// Test JWT with negative iat (old token)
+    ///
+    /// Validates that old tokens with iat in the past are accepted
+    /// (as long as they haven't expired).
+    #[test]
+    fn test_jwt_with_old_iat() {
+        let (public_pem, private_pkcs8) = generate_signing_key().unwrap();
+
+        let now = chrono::Utc::now().timestamp();
+
+        // Create token with iat 30 minutes ago
+        let claims = Claims {
+            sub: "test-user".to_string(),
+            exp: now + 3600, // Still valid for 1 hour
+            iat: now - 1800, // Issued 30 minutes ago
+            scope: "read write".to_string(),
+            service_type: None,
+        };
+
+        let token = sign_jwt(&claims, &private_pkcs8).unwrap();
+        let result = verify_jwt(&token, &public_pem);
+
+        // Should be accepted (iat in the past is fine as long as not expired)
+        assert!(
+            result.is_ok(),
+            "Token with old iat should be accepted if not expired"
+        );
+    }
+
+    /// Test Claims serialization and deserialization
+    ///
+    /// Validates that Claims properly round-trips through JSON.
+    #[test]
+    fn test_claims_serialization() {
+        let claims = Claims {
+            sub: "test-user".to_string(),
+            exp: 1234567890,
+            iat: 1234567800,
+            scope: "read write admin".to_string(),
+            service_type: Some("global-controller".to_string()),
+        };
+
+        // Serialize to JSON
+        let json = serde_json::to_string(&claims).unwrap();
+
+        // Deserialize back
+        let deserialized: Claims = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.sub, claims.sub);
+        assert_eq!(deserialized.exp, claims.exp);
+        assert_eq!(deserialized.iat, claims.iat);
+        assert_eq!(deserialized.scope, claims.scope);
+        assert_eq!(deserialized.service_type, claims.service_type);
+    }
+
+    /// Test Claims without service_type (user token)
+    ///
+    /// Validates that service_type is properly optional and omitted when None.
+    #[test]
+    fn test_claims_without_service_type() {
+        let claims = Claims {
+            sub: "user123".to_string(),
+            exp: 1234567890,
+            iat: 1234567800,
+            scope: "user:read user:write".to_string(),
+            service_type: None, // User tokens don't have service_type
+        };
+
+        let json = serde_json::to_string(&claims).unwrap();
+
+        // Verify service_type is not present in JSON
+        assert!(
+            !json.contains("service_type"),
+            "service_type should be omitted when None"
+        );
+
+        let deserialized: Claims = serde_json::from_str(&json).unwrap();
+        assert!(deserialized.service_type.is_none());
+    }
+
+    /// Test Claims Debug implementation
+    #[test]
+    fn test_claims_debug() {
+        let claims = Claims {
+            sub: "test-user".to_string(),
+            exp: 1234567890,
+            iat: 1234567800,
+            scope: "read write".to_string(),
+            service_type: Some("media-handler".to_string()),
+        };
+
+        let debug_str = format!("{:?}", claims);
+        assert!(debug_str.contains("test-user"));
+        assert!(debug_str.contains("read write"));
+        assert!(debug_str.contains("media-handler"));
+    }
+
+    /// Test Claims Clone implementation
+    #[test]
+    fn test_claims_clone() {
+        let claims = Claims {
+            sub: "test-user".to_string(),
+            exp: 1234567890,
+            iat: 1234567800,
+            scope: "read write".to_string(),
+            service_type: Some("global-controller".to_string()),
+        };
+
+        let cloned = claims.clone();
+
+        assert_eq!(cloned.sub, claims.sub);
+        assert_eq!(cloned.exp, claims.exp);
+        assert_eq!(cloned.iat, claims.iat);
+        assert_eq!(cloned.scope, claims.scope);
+        assert_eq!(cloned.service_type, claims.service_type);
+    }
+
+    /// Test EncryptedKey Debug implementation
+    #[test]
+    fn test_encrypted_key_debug() {
+        let encrypted = EncryptedKey {
+            encrypted_data: vec![1, 2, 3, 4],
+            nonce: vec![5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+            tag: vec![
+                17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32,
+            ],
+        };
+
+        let debug_str = format!("{:?}", encrypted);
+        assert!(debug_str.contains("EncryptedKey"));
+    }
+
+    /// Test EncryptedKey Clone implementation
+    #[test]
+    fn test_encrypted_key_clone() {
+        let encrypted = EncryptedKey {
+            encrypted_data: vec![1, 2, 3],
+            nonce: vec![4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+            tag: vec![
+                16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
+            ],
+        };
+
+        let cloned = encrypted.clone();
+
+        assert_eq!(cloned.encrypted_data, encrypted.encrypted_data);
+        assert_eq!(cloned.nonce, encrypted.nonce);
+        assert_eq!(cloned.tag, encrypted.tag);
+    }
+
+    /// Test generate_random_bytes with various lengths
+    #[test]
+    fn test_generate_random_bytes_various_lengths() {
+        for len in [0, 1, 16, 32, 64, 256] {
+            let bytes = generate_random_bytes(len).unwrap();
+            assert_eq!(bytes.len(), len, "Should generate exactly {} bytes", len);
+
+            if len > 0 {
+                // Generate again to verify it's random (extremely unlikely to be identical)
+                let bytes2 = generate_random_bytes(len).unwrap();
+                // For small lengths, this could theoretically match, but it's astronomically unlikely
+                if len >= 16 {
+                    assert_ne!(
+                        bytes, bytes2,
+                        "Two random byte sequences should be different"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Test generate_client_secret produces unique values
+    #[test]
+    fn test_generate_client_secret_uniqueness() {
+        let secret1 = generate_client_secret().unwrap();
+        let secret2 = generate_client_secret().unwrap();
+
+        assert_ne!(
+            secret1, secret2,
+            "Two generated secrets should be different"
+        );
+
+        // Verify they're valid base64
+        assert!(general_purpose::STANDARD.decode(&secret1).is_ok());
+        assert!(general_purpose::STANDARD.decode(&secret2).is_ok());
+
+        // Verify decoded length is 32 bytes
+        let decoded1 = general_purpose::STANDARD.decode(&secret1).unwrap();
+        assert_eq!(decoded1.len(), 32, "Decoded secret should be 32 bytes");
+    }
+
+    /// Test JWT size limit constant value
+    ///
+    /// Documents the MAX_JWT_SIZE_BYTES constant for security review.
+    #[test]
+    fn test_max_jwt_size_constant() {
+        assert_eq!(
+            MAX_JWT_SIZE_BYTES, 4096,
+            "Max JWT size must be 4096 bytes (4KB) for DoS protection"
+        );
+    }
+
+    /// Test verify_jwt with empty token
+    #[test]
+    fn test_verify_jwt_empty_token() {
+        let (public_pem, _) = generate_signing_key().unwrap();
+
+        let result = verify_jwt("", &public_pem);
+
+        assert!(result.is_err(), "Empty token should be rejected");
+
+        match result {
+            Err(AcError::InvalidToken(_)) => {} // Expected
+            _ => panic!("Expected InvalidToken error for empty token"),
+        }
+    }
+
+    /// Test decrypt with corrupted ciphertext
+    ///
+    /// Validates that authentication tag verification catches corruption.
+    #[test]
+    fn test_decrypt_corrupted_ciphertext() {
+        let master_key = vec![0u8; 32];
+        let data = b"sensitive data";
+
+        let mut encrypted = encrypt_private_key(data, &master_key).unwrap();
+
+        // Corrupt one byte of the ciphertext
+        if !encrypted.encrypted_data.is_empty() {
+            encrypted.encrypted_data[0] ^= 0xFF;
+        }
+
+        let result = decrypt_private_key(&encrypted, &master_key);
+
+        assert!(
+            result.is_err(),
+            "Corrupted ciphertext should fail authentication"
+        );
+
+        match result {
+            Err(AcError::Crypto(msg)) => {
+                assert_eq!(msg, "Decryption failed");
+            }
+            _ => panic!("Expected Crypto error for corrupted ciphertext"),
+        }
+    }
+
+    /// Test decrypt with corrupted tag
+    ///
+    /// Validates that tag verification catches tampering.
+    #[test]
+    fn test_decrypt_corrupted_tag() {
+        let master_key = vec![0u8; 32];
+        let data = b"sensitive data";
+
+        let mut encrypted = encrypt_private_key(data, &master_key).unwrap();
+
+        // Corrupt one byte of the authentication tag
+        encrypted.tag[0] ^= 0xFF;
+
+        let result = decrypt_private_key(&encrypted, &master_key);
+
+        assert!(result.is_err(), "Corrupted tag should fail authentication");
+
+        match result {
+            Err(AcError::Crypto(msg)) => {
+                assert_eq!(msg, "Decryption failed");
+            }
+            _ => panic!("Expected Crypto error for corrupted tag"),
+        }
+    }
 }
