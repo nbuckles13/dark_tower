@@ -1,0 +1,29 @@
+# GitGuardian configuration
+# https://docs.gitguardian.com/ggshield-docs/configuration
+version: 2
+
+secret:
+  # Ignore specific fake test credentials
+  #
+  # These are Base64-encoded test fixtures used in unit tests for credential
+  # parsing logic. They decode to obviously fake values and don't authenticate
+  # to any real system.
+  #
+  # IMPORTANT: Do NOT add broad path exclusions here. Each ignored secret should
+  # be listed explicitly so that any new accidental exposure will still trigger
+  # an alert.
+  #
+  # Location: crates/ac-service/src/handlers/auth_handler.rs (in #[cfg(test)] block)
+  ignored_matches:
+    # Decodes to "client_id:client_secret" - generic test fixture
+    - name: "test-basic-auth-client-id"
+      match: "Y2xpZW50X2lkOmNsaWVudF9zZWNyZXQ="
+    # Decodes to "auth_client:auth_secret" - tests Basic Auth priority over body params
+    - name: "test-basic-auth-priority"
+      match: "YXV0aF9jbGllbnQ6YXV0aF9zZWNyZXQ="
+    # Decodes to "nocredentials" - tests missing colon separator error handling
+    - name: "test-basic-auth-no-colon"
+      match: "bm9jcmVkZW50aWFscw=="
+    # Decodes to "client:pass@word:with:colons" - tests special characters in passwords
+    - name: "test-basic-auth-special-chars"
+      match: "Y2xpZW50OnBhc3NAd29yZDp3aXRoOmNvbG9ucw=="
