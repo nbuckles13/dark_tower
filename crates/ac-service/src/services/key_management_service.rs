@@ -156,6 +156,103 @@ pub async fn rotate_signing_key(
     Ok(key_id)
 }
 
+/// Rotate signing keys within a transaction (for atomic rate limiting + rotation)
+/// This version accepts a transaction to ensure atomicity with rate limit checks
+#[allow(dead_code)]
+pub async fn rotate_signing_key_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    master_key: &[u8],
+    cluster_name: &str,
+) -> Result<String, AcError> {
+    // Generate new key_id
+    let now = Utc::now();
+    let key_prefix = format!("auth-{}-{}-", cluster_name, now.format("%Y"));
+
+    // Get sequence within transaction
+    let count: (i64,) = sqlx::query_as(
+        r#"
+        SELECT COUNT(*)
+        FROM signing_keys
+        WHERE key_id LIKE $1
+        "#,
+    )
+    .bind(format!("{}%", key_prefix))
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(|e| AcError::Database(format!("Failed to count keys: {}", e)))?;
+
+    let sequence = (count.0 + 1) as u32;
+    let key_id = format!("{}{:02}", key_prefix, sequence);
+
+    // Generate new EdDSA keypair
+    let (public_key_pem, private_key_pkcs8) = crypto::generate_signing_key()?;
+
+    // Encrypt private key
+    let encrypted = crypto::encrypt_private_key(&private_key_pkcs8, master_key)?;
+
+    // Set validity period
+    let valid_from = now;
+    let valid_until = now + Duration::days(KEY_VALIDITY_DAYS);
+
+    // Create new key within transaction
+    let _key = sqlx::query_as::<_, crate::models::SigningKey>(
+        r#"
+        INSERT INTO signing_keys (
+            key_id, public_key, private_key_encrypted, encryption_nonce, encryption_tag,
+            encryption_algorithm, master_key_version, algorithm,
+            is_active, valid_from, valid_until
+        )
+        VALUES ($1, $2, $3, $4, $5, 'AES-256-GCM', $6, 'EdDSA', true, $7, $8)
+        RETURNING
+            key_id, public_key, private_key_encrypted, encryption_nonce, encryption_tag,
+            encryption_algorithm, master_key_version, algorithm,
+            is_active, valid_from, valid_until, created_at
+        "#,
+    )
+    .bind(&key_id)
+    .bind(&public_key_pem)
+    .bind(&encrypted.encrypted_data)
+    .bind(&encrypted.nonce)
+    .bind(&encrypted.tag)
+    .bind(1) // master_key_version
+    .bind(valid_from)
+    .bind(valid_until)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(|e| AcError::Database(format!("Failed to create signing key: {}", e)))?;
+
+    // Rotate keys (mark old as inactive, new as active) within transaction
+    // Deactivate all existing active keys
+    sqlx::query(
+        r#"
+        UPDATE signing_keys
+        SET is_active = false
+        WHERE is_active = true
+        "#,
+    )
+    .execute(&mut **tx)
+    .await
+    .map_err(|e| AcError::Database(format!("Failed to deactivate old keys: {}", e)))?;
+
+    // Activate the new key
+    sqlx::query(
+        r#"
+        UPDATE signing_keys
+        SET is_active = true
+        WHERE key_id = $1
+        "#,
+    )
+    .bind(&key_id)
+    .execute(&mut **tx)
+    .await
+    .map_err(|e| AcError::Database(format!("Failed to activate new key: {}", e)))?;
+
+    // Note: We log the event after the transaction commits in the calling function
+    // to avoid logging if the transaction is rolled back
+
+    Ok(key_id)
+}
+
 /// Get JWKS (JSON Web Key Set) for public key distribution
 ///
 /// Returns all active public keys in RFC 7517 format
@@ -191,12 +288,53 @@ pub async fn get_jwks(pool: &PgPool) -> Result<Jwks, AcError> {
 }
 
 /// Check and mark expired keys as inactive
-#[allow(dead_code)] // Library function - will be used in Phase 4 background tasks
-pub async fn expire_old_keys(_pool: &PgPool) -> Result<Vec<String>, AcError> {
-    // This would be called periodically by a background task
-    // For now, it's a placeholder that could be implemented in Phase 4
+///
+/// Finds all keys where `valid_until < NOW()` and `is_active = true`,
+/// then deactivates them. Returns the list of deactivated key IDs.
+#[allow(dead_code)] // Will be used in background tasks/cron jobs in production
+pub async fn expire_old_keys(pool: &PgPool) -> Result<Vec<String>, AcError> {
+    // Find expired keys that are still active
+    let expired_keys: Vec<(String,)> = sqlx::query_as(
+        r#"
+        SELECT key_id
+        FROM signing_keys
+        WHERE valid_until < NOW()
+          AND is_active = true
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| AcError::Database(format!("Failed to query expired keys: {}", e)))?;
 
-    Ok(vec![])
+    let mut deactivated_keys = Vec::new();
+
+    // Deactivate each expired key
+    for (key_id,) in expired_keys {
+        signing_keys::deactivate_key(pool, &key_id).await?;
+        deactivated_keys.push(key_id.clone());
+
+        // Log key expiration
+        if let Err(e) = auth_events::log_event(
+            pool,
+            AuthEventType::KeyExpired.as_str(),
+            None,
+            None,
+            true,
+            None,
+            None,
+            None,
+            Some(serde_json::json!({
+                "key_id": key_id,
+                "expired_at": chrono::Utc::now().to_rfc3339(),
+            })),
+        )
+        .await
+        {
+            tracing::warn!("Failed to log key expiration event: {}", e);
+        }
+    }
+
+    Ok(deactivated_keys)
 }
 
 #[cfg(test)]

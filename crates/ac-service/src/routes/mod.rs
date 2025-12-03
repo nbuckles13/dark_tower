@@ -14,7 +14,7 @@ pub fn build_routes(state: Arc<auth_handler::AppState>) -> Router {
         pool: state.pool.clone(),
     });
 
-    // Admin routes that require authentication
+    // Admin routes that require authentication with admin:services scope
     let admin_routes = Router::new()
         .route(
             "/api/v1/admin/services/register",
@@ -24,6 +24,15 @@ pub fn build_routes(state: Arc<auth_handler::AppState>) -> Router {
             auth_state.clone(),
             require_admin_scope,
         ))
+        .with_state(state.clone());
+
+    // Internal routes (key rotation) - authentication handled in handler
+    // (requires rotation-specific scopes, not admin:services)
+    let internal_routes = Router::new()
+        .route(
+            "/internal/rotate-keys",
+            post(admin_handler::handle_rotate_keys),
+        )
         .with_state(state.clone());
 
     // Public routes (no authentication required)
@@ -45,6 +54,7 @@ pub fn build_routes(state: Arc<auth_handler::AppState>) -> Router {
 
     // Merge routes
     admin_routes
+        .merge(internal_routes)
         .merge(public_routes)
         .layer(TraceLayer::new_for_http())
 }

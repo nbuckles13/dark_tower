@@ -136,8 +136,8 @@ pub async fn issue_service_token(
         service_type: Some(credential.service_type.clone()),
     };
 
-    // Sign JWT
-    let token = crypto::sign_jwt(&claims, &private_key_pkcs8)?;
+    // Sign JWT with key_id
+    let token = crypto::sign_jwt(&claims, &private_key_pkcs8, &signing_key.key_id)?;
 
     // Log successful token issuance
     if let Err(e) = auth_events::log_event(
@@ -780,7 +780,7 @@ mod tests {
         };
 
         // Sign with the WRONG key (attacker's key)
-        let token_wrong_key = crypto::sign_jwt(&claims, &wrong_private_key)?;
+        let token_wrong_key = crypto::sign_jwt(&claims, &wrong_private_key, "attacker-key-01")?;
 
         // Try to verify with the CORRECT public key
         let result = crypto::verify_jwt(&token_wrong_key, &correct_key.public_key);
@@ -1030,7 +1030,8 @@ mod tests {
         let private_key = crypto::decrypt_private_key(&encrypted_key, &master_key)?;
 
         // Sign the expired token
-        let expired_token = crypto::sign_jwt(&expired_claims, &private_key)?;
+        let expired_token =
+            crypto::sign_jwt(&expired_claims, &private_key, &signing_key_model.key_id)?;
 
         // Attempt to verify the expired token
         let result = crypto::verify_jwt(&expired_token, &signing_key_model.public_key);
@@ -1090,7 +1091,8 @@ mod tests {
         let private_key = crypto::decrypt_private_key(&encrypted_key, &master_key)?;
 
         // Sign the token with future iat
-        let future_token = crypto::sign_jwt(&future_claims, &private_key)?;
+        let future_token =
+            crypto::sign_jwt(&future_claims, &private_key, &signing_key_model.key_id)?;
 
         // Verify the token - should be REJECTED due to custom iat validation
         let result = crypto::verify_jwt(&future_token, &signing_key_model.public_key);
@@ -1142,7 +1144,7 @@ mod tests {
         let private_key = crypto::decrypt_private_key(&encrypted_key, &master_key)?;
 
         // Sign the token
-        let token = crypto::sign_jwt(&claims_within_skew, &private_key)?;
+        let token = crypto::sign_jwt(&claims_within_skew, &private_key, &signing_key_model.key_id)?;
 
         // Verify the token - should be accepted (within clock skew)
         let result = crypto::verify_jwt(&token, &signing_key_model.public_key);
@@ -1195,7 +1197,7 @@ mod tests {
         let private_key = crypto::decrypt_private_key(&encrypted_key, &master_key)?;
 
         // Sign the token
-        let token = crypto::sign_jwt(&claims_at_boundary, &private_key)?;
+        let token = crypto::sign_jwt(&claims_at_boundary, &private_key, &signing_key_model.key_id)?;
 
         // Verify the token - should be accepted (exactly at boundary)
         let result = crypto::verify_jwt(&token, &signing_key_model.public_key);
@@ -1247,7 +1249,11 @@ mod tests {
         let private_key = crypto::decrypt_private_key(&encrypted_key, &master_key)?;
 
         // Sign the token
-        let token = crypto::sign_jwt(&claims_beyond_boundary, &private_key)?;
+        let token = crypto::sign_jwt(
+            &claims_beyond_boundary,
+            &private_key,
+            &signing_key_model.key_id,
+        )?;
 
         // Verify the token - should be rejected (beyond boundary)
         let result = crypto::verify_jwt(&token, &signing_key_model.public_key);
@@ -1914,7 +1920,8 @@ mod tests {
             service_type: Some("global-controller".to_string()),
         };
 
-        let normal_token = crypto::sign_jwt(&normal_claims, &private_key)?;
+        let normal_token =
+            crypto::sign_jwt(&normal_claims, &private_key, &signing_key_model.key_id)?;
 
         // Verify the normal token is under the size limit
         assert!(
