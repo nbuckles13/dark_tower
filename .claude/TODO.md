@@ -59,7 +59,14 @@
 - [x] ~~**JWT Header Injection**: Add tests for typ/alg/kid header tampering~~ ✅ DONE
 - [x] ~~**JWT Size Limits**: Added `MAX_JWT_SIZE_BYTES = 4096` (4KB) DoS prevention~~ ✅ DONE
 - [x] ~~**Maximum Token Age Validation** (DEBATED)~~: Debate concluded 2025-12-01 with consensus on context-specific strategy. See [ADR-0007](../docs/decisions/adr-0007-token-lifetime-strategy.md). **Decision**: Service tokens keep 1-hour lifetime (no max age), user tokens (Phase 8) will use 15-min access + refresh pattern.
-- [ ] **Key Rotation Implementation**: Complete key rotation tests once `signing_keys::get_by_key_id()` and `signing_keys::list_all_keys()` are implemented. **SECURITY NOTE**: When implementing, must validate `kid` against database whitelist only - never fetch keys based on untrusted kid values.
+- [x] ~~**Key Rotation Implementation**: Complete key rotation endpoint and tests~~ ✅ DONE (2025-12-04)
+  - Implemented `/internal/rotate-keys` endpoint (ADR-0008)
+  - Added 10 integration tests for key rotation
+  - Fixed TOCTOU race condition with PostgreSQL advisory lock
+  - Added `signing_keys::get_by_key_id()` repository method
+  - Service-only token validation (user tokens rejected)
+  - Rate limiting: 6 days (normal), 1 hour (force)
+  - See: ADR-0008, ADR-0009 for design decisions
 - [ ] **Configurable Clock Skew**: Consider making `JWT_CLOCK_SKEW_SECONDS` configurable via environment variable for different security postures
 
 #### SQL Injection Testing Enhancements

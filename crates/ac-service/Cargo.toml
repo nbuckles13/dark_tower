@@ -44,6 +44,7 @@ common = { path = "../common" }
 [dev-dependencies]
 # Testing utilities
 ac-test-utils = { path = "../ac-test-utils" }
+anyhow = "1.0"
 
 # Test framework
 tokio = { workspace = true, features = ["test-util"] }
@@ -52,3 +53,4 @@ http-body-util = "0.1"
 
 # Benchmarking
 criterion = { workspace = true }
+futures = "0.3.31"
