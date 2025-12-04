@@ -93,6 +93,23 @@ pub async fn handle_rotate_keys(
     // Verify JWT and extract claims
     let claims = crate::crypto::verify_jwt(token, &signing_key.public_key)?;
 
+    // SECURITY: Require service token (must have service_type)
+    // User tokens (no service_type) are not authorized for key rotation
+    if claims.service_type.is_none() {
+        tracing::warn!(
+            target: "audit",
+            event = "key_rotation_denied",
+            client_id = %claims.sub,
+            success = false,
+            reason = "user_token_not_allowed",
+            "Key rotation denied: user tokens cannot rotate keys"
+        );
+
+        return Err(AcError::InvalidToken(
+            "User tokens are not authorized for key rotation".to_string(),
+        ));
+    }
+
     // Check for rotation scopes
     let token_scopes: Vec<&str> = claims.scope.split_whitespace().collect();
     let has_normal_scope = token_scopes.contains(&"service.rotate-keys.ac");
@@ -121,7 +138,7 @@ pub async fn handle_rotate_keys(
     // SECURITY FIX: Make cluster name configurable instead of hardcoded
     let cluster_name = std::env::var("AC_CLUSTER_NAME").unwrap_or_else(|_| "default".to_string());
 
-    // SECURITY FIX: Use database transaction with SELECT FOR UPDATE to prevent TOCTOU race condition
+    // SECURITY FIX: Use database transaction with advisory lock to prevent TOCTOU race condition
     // This ensures rate limit check and rotation are atomic
     let mut tx = state
         .pool
@@ -129,15 +146,23 @@ pub async fn handle_rotate_keys(
         .await
         .map_err(|e| AcError::Database(format!("Failed to begin transaction: {}", e)))?;
 
-    // Lock the signing_keys table during rate limit check
-    // This prevents concurrent requests from bypassing rate limiting
+    // SECURITY: Acquire advisory lock to serialize all key rotation requests
+    // This prevents TOCTOU race conditions where multiple concurrent requests
+    // could bypass rate limiting by reading the same last_rotation timestamp.
+    // The lock is transaction-scoped and automatically released on commit/rollback.
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('key_rotation'))")
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| AcError::Database(format!("Failed to acquire rotation lock: {}", e)))?;
+
+    // Query last rotation timestamp
+    // The advisory lock ensures only ONE request at a time can perform this check
     let last_rotation: Option<chrono::DateTime<Utc>> = sqlx::query_scalar(
         r#"
         SELECT created_at
         FROM signing_keys
         ORDER BY created_at DESC
         LIMIT 1
-        FOR UPDATE
         "#,
     )
     .fetch_optional(&mut *tx)

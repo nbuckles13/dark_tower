@@ -33,6 +33,7 @@
 
 pub mod assertions;
 pub mod crypto_fixtures;
+pub mod rotation_time;
 pub mod server_harness;
 pub mod test_ids;
 pub mod token_builders;

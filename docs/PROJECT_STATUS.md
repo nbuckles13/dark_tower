@@ -1,6 +1,6 @@
 # Dark Tower - Project Status
 
-**Last Updated**: 2025-12-01
+**Last Updated**: 2025-12-04
 **Current Phase**: Phase 4 - Security Hardening & Testing Infrastructure
 
 ## Executive Summary
@@ -193,9 +193,6 @@ All foundational work completed:
 
 ### In Progress
 
-- [ ] Additional security tests
-  - Key rotation tests (pending repository methods)
-
 - [ ] Performance testing
   - Benchmarks for token validation under attack
   - Rate limiting performance validation
@@ -221,6 +218,19 @@ All foundational work completed:
 - [x] Multi-agent debate framework
 - [x] Specialist-led development process
 - [x] Nightly fuzz testing workflow (5.5 hours)
+- [x] Key rotation endpoint implementation (ADR-0008)
+- [x] Key rotation integration tests (10 tests)
+  - Auth header validation (2 tests)
+  - Scope/authorization checks (2 tests)
+  - Rate limiting enforcement (2 tests)
+  - Token expiration validation (1 test)
+  - User token rejection (1 test)
+  - TOCTOU race condition prevention (1 test)
+- [x] TOCTOU security fix (PostgreSQL advisory lock)
+- [x] Integration test infrastructure (ADR-0009)
+  - TestAuthServer for E2E HTTP testing
+  - rotation_time module for time manipulation
+  - Database isolation via sqlx::test
 
 **Status**: See [.claude/TODO.md](../.claude/TODO.md) for current work items
 
@@ -306,8 +316,8 @@ dark_tower/
 ### Decision History
 | Location | Description | Count |
 |----------|-------------|-------|
-| [docs/debates/](debates/) | Multi-agent design debates | 2 |
-| [docs/decisions/](decisions/) | Architecture Decision Records | 6 |
+| [docs/debates/](debates/) | Multi-agent design debates | 4 |
+| [docs/decisions/](decisions/) | Architecture Decision Records | 9 |
 
 ## Future Phases
 
@@ -397,6 +407,12 @@ dark_tower/
 
 ## Recent Achievements (Last 2 Weeks)
 
+- ✅ Implemented key rotation endpoint with TOCTOU protection (ADR-0008)
+- ✅ Added integration test infrastructure (ADR-0009)
+  - TestAuthServer for E2E HTTP testing with isolated databases
+  - rotation_time module for time manipulation in rate limit tests
+  - 10 key rotation integration tests (auth, scope, rate limiting, TOCTOU)
+- ✅ Fixed TOCTOU race condition via PostgreSQL advisory lock
 - ✅ Implemented comprehensive P0 security test suite (48 tests)
 - ✅ Implemented P1 security test suite (32 tests)
 - ✅ Added JWT validation security tests (signature tampering, algorithm confusion, "none" attack)
@@ -410,8 +426,8 @@ dark_tower/
 - ✅ Added automated git hooks for code quality
 - ✅ Established multi-agent debate framework
 - ✅ Created specialist-led development workflow with test ownership model
-- ✅ Documented 2 major design debates
-- ✅ Created 6 Architecture Decision Records
+- ✅ Documented 4 major design debates
+- ✅ Created 9 Architecture Decision Records
 
 ## Repository Information
 
