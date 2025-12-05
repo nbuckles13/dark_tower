@@ -210,6 +210,41 @@ pub fn sign_jwt(
     Ok(token)
 }
 
+/// Extract the `kid` (key ID) from a JWT header without verifying the signature.
+///
+/// This is used to look up the correct signing key for verification when
+/// multiple keys may be valid (e.g., during key rotation).
+///
+/// Returns `None` if:
+/// - Token is malformed (not valid JWT format)
+/// - Header doesn't contain a `kid` field
+/// - `kid` field is not a string
+///
+/// SECURITY NOTE: This function does NOT validate the token. It only extracts
+/// the `kid` claim for key lookup. The token MUST still be verified after
+/// fetching the key.
+pub fn extract_jwt_kid(token: &str) -> Option<String> {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+
+    // Check token size first (same as verify_jwt)
+    if token.len() > MAX_JWT_SIZE_BYTES {
+        return None;
+    }
+
+    // JWT format: header.payload.signature
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+
+    // Decode the header (first part)
+    let header_bytes = URL_SAFE_NO_PAD.decode(parts[0]).ok()?;
+    let header: serde_json::Value = serde_json::from_slice(&header_bytes).ok()?;
+
+    // Extract kid as string
+    header["kid"].as_str().map(|s| s.to_string())
+}
+
 /// Verify JWT with EdDSA public key
 ///
 /// Validates:
@@ -1274,5 +1309,126 @@ mod tests {
             }
             _ => panic!("Expected Crypto error for corrupted tag"),
         }
+    }
+
+    // ============================================================================
+    // extract_jwt_kid tests
+    // ============================================================================
+
+    /// Test extract_jwt_kid with valid token containing kid
+    #[test]
+    fn test_extract_jwt_kid_valid_token() {
+        let (_, private_pkcs8) = generate_signing_key().unwrap();
+
+        let claims = Claims {
+            sub: "test-user".to_string(),
+            exp: chrono::Utc::now().timestamp() + 3600,
+            iat: chrono::Utc::now().timestamp(),
+            scope: "read write".to_string(),
+            service_type: None,
+        };
+
+        let key_id = "auth-prod-2025-01";
+        let token = sign_jwt(&claims, &private_pkcs8, key_id).unwrap();
+
+        let extracted_kid = extract_jwt_kid(&token);
+
+        assert_eq!(
+            extracted_kid,
+            Some(key_id.to_string()),
+            "Should extract the correct kid from token header"
+        );
+    }
+
+    /// Test extract_jwt_kid with oversized token
+    #[test]
+    fn test_extract_jwt_kid_oversized_token() {
+        // Create an oversized token (just a long string)
+        let oversized_token = "a".repeat(MAX_JWT_SIZE_BYTES + 1);
+
+        let result = extract_jwt_kid(&oversized_token);
+
+        assert!(
+            result.is_none(),
+            "Oversized token should return None before parsing"
+        );
+    }
+
+    /// Test extract_jwt_kid with malformed token (wrong number of parts)
+    #[test]
+    fn test_extract_jwt_kid_malformed_token() {
+        let malformed_tokens = [
+            "",                           // Empty
+            "single-part",                // 1 part
+            "two.parts",                  // 2 parts
+            "too.many.parts.here.really", // 5 parts
+        ];
+
+        for token in malformed_tokens {
+            let result = extract_jwt_kid(token);
+            assert!(
+                result.is_none(),
+                "Malformed token '{}' should return None",
+                token
+            );
+        }
+    }
+
+    /// Test extract_jwt_kid with invalid base64 header
+    #[test]
+    fn test_extract_jwt_kid_invalid_base64() {
+        // JWT format with invalid base64 in header (! is not valid base64)
+        let token = "invalid!!!base64.payload.signature";
+
+        let result = extract_jwt_kid(token);
+
+        assert!(result.is_none(), "Invalid base64 header should return None");
+    }
+
+    /// Test extract_jwt_kid with valid base64 but invalid JSON header
+    #[test]
+    fn test_extract_jwt_kid_invalid_json() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+
+        // Valid base64 but not valid JSON
+        let invalid_json_header = URL_SAFE_NO_PAD.encode("not valid json");
+        let token = format!("{}.payload.signature", invalid_json_header);
+
+        let result = extract_jwt_kid(&token);
+
+        assert!(result.is_none(), "Invalid JSON header should return None");
+    }
+
+    /// Test extract_jwt_kid with valid JWT header but missing kid
+    #[test]
+    fn test_extract_jwt_kid_missing_kid() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+
+        // Valid JWT header JSON but without kid field
+        let header_json = r#"{"alg":"EdDSA","typ":"JWT"}"#;
+        let header_b64 = URL_SAFE_NO_PAD.encode(header_json);
+        let token = format!("{}.payload.signature", header_b64);
+
+        let result = extract_jwt_kid(&token);
+
+        assert!(
+            result.is_none(),
+            "Header without kid field should return None"
+        );
+    }
+
+    /// Test extract_jwt_kid with kid as non-string value
+    #[test]
+    fn test_extract_jwt_kid_non_string_kid() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+
+        // kid is a number, not a string
+        let header_json = r#"{"alg":"EdDSA","typ":"JWT","kid":12345}"#;
+        let header_b64 = URL_SAFE_NO_PAD.encode(header_json);
+        let token = format!("{}.payload.signature", header_b64);
+
+        let result = extract_jwt_kid(&token);
+
+        assert!(result.is_none(), "kid as non-string should return None");
     }
 }
