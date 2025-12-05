@@ -85,10 +85,42 @@ pub async fn handle_rotate_keys(
             "Invalid Authorization header format".to_string(),
         ))?;
 
-    // Get active signing key for verification
-    let signing_key = signing_keys::get_active_key(&state.pool)
+    // Extract kid from JWT header to look up the correct signing key
+    // This is required for key rotation support: during the overlap period,
+    // tokens signed with the old key are still valid but we need to verify
+    // them with the old key, not the new "active" key.
+    let kid = crate::crypto::extract_jwt_kid(token).ok_or(AcError::InvalidToken(
+        "Missing or invalid key ID in token header".to_string(),
+    ))?;
+
+    // Look up the signing key by kid (not just "active" key)
+    // This ensures tokens signed with old keys (still in validity window) work
+    let signing_key = signing_keys::get_by_key_id(&state.pool, &kid)
         .await?
-        .ok_or_else(|| AcError::Crypto("No active signing key available".to_string()))?;
+        .ok_or_else(|| {
+            tracing::debug!(
+                target: "crypto",
+                kid = %kid,
+                "Token references unknown key ID"
+            );
+            AcError::InvalidToken("The access token is invalid or expired".to_string())
+        })?;
+
+    // SECURITY: Verify the key is still within its validity window
+    let now = Utc::now();
+    if now < signing_key.valid_from || now >= signing_key.valid_until {
+        tracing::debug!(
+            target: "crypto",
+            kid = %kid,
+            valid_from = %signing_key.valid_from,
+            valid_until = %signing_key.valid_until,
+            now = %now,
+            "Token signed with key outside validity window"
+        );
+        return Err(AcError::InvalidToken(
+            "The access token is invalid or expired".to_string(),
+        ));
+    }
 
     // Verify JWT and extract claims
     let claims = crate::crypto::verify_jwt(token, &signing_key.public_key)?;
