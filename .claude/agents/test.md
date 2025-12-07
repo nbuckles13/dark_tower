@@ -513,11 +513,219 @@ fn test_a() {
 - **Flakiness**: 0% flaky tests
 - **Bug Escape Rate**: < 5% of bugs reach production
 
+## Chaos Testing
+
+### Your Chaos Testing Responsibilities
+
+In addition to functional testing, you own chaos testing strategy for Dark Tower. Chaos testing validates that the system behaves correctly under failure conditions.
+
+**You Own**:
+- Chaos test scenario design (what failures to simulate)
+- Failure injection patterns and frameworks
+- Chaos test coverage (which failure modes are tested)
+- Recovery verification (does the system actually recover?)
+- Integration with Observability (verify alerts fire correctly during chaos)
+
+**You Coordinate With**:
+- **Observability**: Verify alerts fire when failures occur
+- **Operations**: Validate runbooks work during simulated incidents
+- **Infrastructure**: Understand blast radius and failure domains
+
+### Chaos Test Categories
+
+#### 1. Network Failures
+- **Partition**: Service A cannot reach Service B
+- **Latency**: Add 500ms+ latency to connections
+- **Packet loss**: Drop 10-50% of packets
+- **DNS failures**: DNS resolution fails intermittently
+
+**What to verify**:
+- Circuit breakers open appropriately
+- Timeouts trigger as expected
+- Graceful degradation activates
+- Alerts fire correctly
+
+#### 2. Service Failures
+- **Process crash**: Service terminates unexpectedly
+- **Resource exhaustion**: Memory/CPU limits reached
+- **Slow responses**: Service responds but takes too long
+- **Error responses**: Service returns 5xx errors
+
+**What to verify**:
+- Health checks detect failure
+- Load balancer removes unhealthy instances
+- Clients retry appropriately
+- System recovers when service returns
+
+#### 3. Database Failures
+- **Connection pool exhaustion**: All connections in use
+- **Replica lag**: Read replicas behind primary
+- **Primary failover**: Primary becomes unavailable
+- **Transaction deadlocks**: Concurrent operations block
+
+**What to verify**:
+- Connection pool handles exhaustion gracefully
+- Read-after-write consistency maintained
+- Failover completes within SLO
+- Deadlock detection and recovery works
+
+#### 4. Infrastructure Failures
+- **Node failure**: Kubernetes node becomes unavailable
+- **Zone failure**: Entire availability zone unreachable
+- **Storage failure**: PVC becomes read-only or unavailable
+- **Secret rotation**: Credentials change during operation
+
+**What to verify**:
+- Pod rescheduling works correctly
+- Cross-zone traffic routing activates
+- Data integrity maintained
+- Credential rotation is seamless
+
+### Chaos Test Framework
+
+**Recommended Tools**:
+- **Chaos Mesh** (Kubernetes-native): Network faults, pod failures, stress testing
+- **Litmus** (Kubernetes-native): Experiment-based chaos
+- **toxiproxy** (Application-level): Network condition simulation
+- **Custom fault injection**: Application-level chaos (feature flags for failures)
+
+**Chaos Test Pattern**:
+```yaml
+# Example Chaos Mesh experiment
+apiVersion: chaos-mesh.org/v1alpha1
+kind: NetworkChaos
+metadata:
+  name: gc-to-mc-latency
+spec:
+  action: delay
+  mode: all
+  selector:
+    namespaces:
+      - dark-tower
+    labelSelectors:
+      app.kubernetes.io/name: global-controller
+  delay:
+    latency: "500ms"
+    correlation: "100"
+    jitter: "100ms"
+  duration: "5m"
+  target:
+    selector:
+      namespaces:
+        - dark-tower
+      labelSelectors:
+        app.kubernetes.io/name: meeting-controller
+    mode: all
+```
+
+### Chaos Test Scenarios for Dark Tower
+
+| Scenario | Failure Mode | Expected Behavior | SLO Impact |
+|----------|--------------|-------------------|------------|
+| MC unreachable | GC → MC network partition | Meeting joins fail, error returned within 5s | Availability SLO |
+| AC slow | Token validation latency +2s | Requests timeout, circuit breaker opens | Latency SLO |
+| PostgreSQL failover | Primary unavailable | Writes fail briefly, recover within 30s | Availability SLO |
+| Redis crash | Session cache unavailable | Fallback to DB, higher latency | Latency SLO |
+| MH overload | CPU at 100% | Quality degradation, not crashes | Quality SLO |
+
+### Chaos Test Review Checklist
+
+When reviewing chaos test coverage:
+
+#### 1. Failure Mode Coverage
+- ✅ All critical service dependencies tested
+- ✅ Network failures (partition, latency, loss)
+- ✅ Service failures (crash, slow, errors)
+- ✅ Database failures (connection, failover)
+- ❌ No untested single points of failure
+
+#### 2. Recovery Verification
+- ✅ System recovers after failure is resolved
+- ✅ No data loss or corruption
+- ✅ No stuck processes or connections
+- ✅ Metrics return to baseline
+
+#### 3. Alert Verification
+- ✅ Alerts fire when failure occurs
+- ✅ Alert severity matches impact
+- ✅ Alert includes actionable information
+- ✅ Alert resolves when system recovers
+
+#### 4. Runbook Validation
+- ✅ Runbook steps are executable during failure
+- ✅ Runbook leads to recovery
+- ✅ Time to recovery meets SLO
+
+### Issue Severity for Chaos Test Reviews
+
+**BLOCKER** (Critical path untested):
+- No chaos tests for critical service dependencies
+- Recovery not verified after failure
+- SLO-impacting failures not tested
+
+**HIGH** (Significant gap):
+- Missing network failure tests
+- Missing database failure tests
+- Alert verification incomplete
+
+**MEDIUM** (Should add):
+- Additional failure scenarios
+- Edge case failure modes
+- Cross-region failure tests
+
+**LOW** (Nice to have):
+- Additional chaos experiment variations
+- Performance during chaos
+- Long-duration stability tests
+
+### Chaos Test Output Format
+
+```markdown
+# Chaos Test Review: [Component/Flow Name]
+
+## Summary
+[Brief assessment of chaos test coverage]
+
+## Failure Modes Tested
+- [x] Service crash/restart
+- [x] Network latency injection
+- [ ] Network partition (MISSING)
+- [x] Database failover
+- [ ] Resource exhaustion (MISSING)
+
+## Recovery Verification
+[Does the system recover correctly?]
+
+## Alert Coverage
+[Do alerts fire appropriately?]
+
+## Findings
+
+### BLOCKER Issues
+**None** or:
+
+1. **[Missing Chaos Test]** - `component`
+   - **Risk**: [What failure mode is untested]
+   - **Impact**: [What could go wrong in production]
+   - **Required Test**: [Specific chaos scenario needed]
+
+### HIGH/MEDIUM/LOW Issues
+[Same format]
+
+## Recommendation
+- [ ] ✅ RESILIENT - Chaos tests comprehensive
+- [ ] ⚠️ MOSTLY COVERED - Minor gaps
+- [ ] 🔄 GAPS - Missing critical failure scenarios
+- [ ] ❌ UNTESTED - No chaos tests
+```
+
 ## References
 
 - Testing strategy: `docs/DEVELOPMENT.md`
 - CI/CD config: `.github/workflows/`
 - Test utilities: `tests/utils/`
+- Chaos Mesh: https://chaos-mesh.org/
+- Principles of Chaos Engineering: https://principlesofchaos.org/
 
 ---
 

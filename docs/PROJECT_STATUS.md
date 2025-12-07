@@ -273,7 +273,7 @@ dark_tower/
 │   ├── RATE_LIMITING.md     # Rate limiting implementation
 │   └── PROJECT_STATUS.md    # This document
 ├── .claude/
-│   ├── agents/              # Specialist agent definitions (9 specialists)
+│   ├── agents/              # Specialist agent definitions (12 specialists)
 │   ├── workflows/           # Debate and orchestration workflows
 │   ├── DEVELOPMENT_WORKFLOW.md  # Orchestrator rules
 │   └── TODO.md              # Technical debt tracking
@@ -412,6 +412,12 @@ dark_tower/
 
 ## Recent Achievements (Last 2 Weeks)
 
+- ✅ Extended specialist model with operational concerns (12 specialists total)
+  - Added Observability Specialist (metrics, logging, tracing, SLOs, error budgets)
+  - Added Operations Specialist (deployment safety, runbooks, incident response, cost)
+  - Added Infrastructure Specialist (Kubernetes, Terraform, cloud-agnostic platform)
+  - Extended Test Specialist with chaos testing responsibilities
+  - All cross-cutting specialists now mandatory in every debate
 - ✅ Designed Global Controller architecture (ADR-0010)
   - Atomic MC health check + assignment with CTE (race-condition safe)
   - Batched transactional outbox publisher with exponential backoff
