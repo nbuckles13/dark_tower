@@ -87,12 +87,49 @@
 
 ## Phase 5: Global Controller Implementation
 
+### Architecture (from ADR-0010)
+
+- [x] ~~**Inter-Region MC Discovery**~~: ✅ RESOLVED (2025-12-05)
+  Design completed via multi-agent debate. See [ADR-0010 Section 5](../docs/decisions/adr-0010-global-controller-architecture.md).
+
+  **Final Design - Direct MC-to-Bus (83.2% consensus)**:
+  - MC subscribes directly to Redis Streams (no GC subscription tracking)
+  - Transactional outbox pattern for atomic DB write + bus publish
+  - Regional DB isolation (no cross-region PostgreSQL queries)
+  - Blind cross-region broadcast via GC-to-GC gRPC
+  - Remote GC blindly writes to local Redis (handles late-joiner race conditions)
+  - Redis ACLs enforce read/write separation (GC write-only, MC read-only)
+  - mTLS for all inter-service communication
+
+- [ ] **MC Failure and Migration**: Design graceful handling when MC becomes unhealthy
+  - How to detect MC failure (heartbeat timeout)
+  - How to migrate active meetings to healthy MC
+  - Participant reconnection flow
+  - State transfer or reconstruction
+  - Impact on cross-region MC connections
+
+- [ ] **PostgreSQL Caching for Meeting Joins**: Evaluate caching strategy
+  - Every meeting join currently requires at least one Postgres query
+  - Consider Redis cache for hot meetings with short TTL
+  - Cache invalidation when meeting ends
+
+- [ ] **Meeting Timeout Detection**: Clarify how background job detects no participants
+  - MC must report participant count to GC (via heartbeat?)
+  - Or: MC directly marks assignment ended when last participant leaves
+  - Background job is fallback for orphaned assignments
+
+- [ ] **Asymmetric Cluster Counts**: Support different numbers of clusters per region (deferred)
+  - Example: 3 clusters in us-west, 2 in eu-west, 1 in asia
+  - Affects: GC peer registry, load balancing, meeting assignment
+  - Currently assumes symmetric 1 cluster per region
+  - Implement when multi-cluster regions are needed
+
 ### Token Revocation (from ADR-0007)
 
-- [ ] **JWT Blacklist in Redis**: Implement emergency revocation capability for service tokens
-  - Key pattern: `blacklist:jwt:{jti}`
-  - TTL: Remaining token lifetime at blacklist time
-  - Check blacklist in token validation path
+- [ ] **JWT Denylist in Redis**: Implement emergency revocation capability for service tokens
+  - Key pattern: `denylist:jwt:{jti}`
+  - TTL: Remaining token lifetime at denylist time
+  - Check denylist in token validation path
 
 ## Phase 8: User Authentication
 
