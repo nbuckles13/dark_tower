@@ -29,19 +29,26 @@
 - Orchestrate workflows
 - Synthesize debate results
 
-### Rule 2: Test and Security Specialists are ALWAYS Included
+### Rule 2: Cross-Cutting Specialists are ALWAYS Included
 
-**Every debate MUST include Test and Security specialists**, regardless of:
+**Every debate MUST include these cross-cutting specialists**, regardless of:
 - How simple the feature is
 - Whether it seems "obviously testable" or "obviously secure"
 - Number of other specialists involved
 
-**Minimum debate size**: 3 agents (domain specialist + Test + Security)
+**Mandatory in EVERY debate**:
+1. **Test Specialist** - Test coverage, E2E tests, chaos testing
+2. **Security Specialist** - Security vulnerabilities, crypto, auth
+3. **Observability Specialist** - Logging, metrics, tracing, SLOs
+4. **Operations Specialist** - Deployment safety, runbooks, failure modes
+
+**Minimum debate size**: 5 agents (domain specialist + 4 cross-cutting specialists)
 
 **Example**:
-- "Add database index" → Database + Test + Security debate
-- "Add API endpoint" → Global Controller + Test + Security debate
-- "New protobuf message" → Protocol + Media Handler + Test + Security debate
+- "Add database index" → Database + Test + Security + Observability + Operations debate
+- "Add API endpoint" → Global Controller + Test + Security + Observability + Operations debate
+- "New protobuf message" → Protocol + Media Handler + Test + Security + Observability + Operations debate
+- "Deploy to new region" → Infrastructure + Test + Security + Observability + Operations debate
 
 ### Rule 3: Use Debates for Cross-Cutting Features
 
@@ -119,17 +126,23 @@ Use a **single message with multiple Task tool calls** for parallel execution.
 
 ## Specialist Roster
 
-**Service Specialists**:
+**Service Specialists** (domain experts):
 - `auth-controller.md` - User/service authentication, JWT tokens, JWKS, federation
 - `global-controller.md` - HTTP/3 API, meeting management, multi-tenancy
 - `meeting-controller.md` - WebTransport signaling, sessions, layouts
 - `media-handler.md` - Media forwarding, quality adaptation
 
-**Cross-Cutting Specialists**:
+**Domain Specialists** (specific domains):
 - `protocol.md` - Protocol Buffers, API contracts, versioning
 - `database.md` - PostgreSQL schema, migrations, queries
-- `test.md` - E2E tests, coverage, quality gates (ALWAYS included)
-- `security.md` - Security architecture, threat modeling, cryptography (ALWAYS included)
+- `infrastructure.md` - Kubernetes, Terraform, IaC, cloud-agnostic platform
+- `code-reviewer.md` - Code quality, Rust idioms, maintainability
+
+**Cross-Cutting Specialists** (ALWAYS included in debates):
+- `test.md` - E2E tests, coverage, chaos testing, quality gates
+- `security.md` - Security architecture, threat modeling, cryptography
+- `observability.md` - Metrics, logging, tracing, SLOs, error budgets
+- `operations.md` - Deployment safety, runbooks, incident response, cost
 
 ## Debate Mechanics
 
@@ -165,10 +178,12 @@ docs/decisions/adr-NNNN-{feature-slug}.md
 ## Common Mistakes to Avoid
 
 ❌ **Implementing directly**: Don't write code yourself - invoke specialists
-❌ **Skipping Test or Security specialists**: Both must be in every debate
+❌ **Skipping cross-cutting specialists**: Test, Security, Observability, and Operations must be in every debate
 ❌ **Solo decisions on cross-cutting**: Always debate when multiple services affected
 ❌ **Micro-managing specialists**: Let them break down tasks themselves
 ❌ **Sequential when parallel**: Run independent tasks in parallel
+❌ **Forgetting observability**: Every feature needs metrics, logs, and traces
+❌ **Ignoring operations**: Every feature needs deployment plan and runbook
 
 ## Session Start Checklist
 

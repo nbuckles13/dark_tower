@@ -86,18 +86,23 @@ The platform consists of **five main components**:
 
 ### Available Specialists
 
-**Service Specialists**:
+**Service Specialists** (domain experts):
 - `auth-controller` - Authentication, JWT, JWKS, federation
 - `global-controller` - HTTP/3 API, meeting management
 - `meeting-controller` - WebTransport signaling, sessions
 - `media-handler` - Media forwarding, quality adaptation
 
-**Cross-Cutting Specialists** (ALWAYS INCLUDED):
-- `test` - E2E tests, coverage, quality gates (MANDATORY in all debates)
-- `security` - Security architecture, threat modeling, cryptography (MANDATORY in all debates)
+**Domain Specialists** (specific domains):
 - `database` - PostgreSQL schema, migrations, queries
 - `protocol` - Protocol Buffers, API contracts, versioning
+- `infrastructure` - Kubernetes, Terraform, IaC, cloud-agnostic platform
 - `code-reviewer` - Code quality, Rust idioms, ADR compliance
+
+**Cross-Cutting Specialists** (MANDATORY in ALL debates):
+- `test` - E2E tests, coverage, chaos testing, quality gates
+- `security` - Security architecture, threat modeling, cryptography
+- `observability` - Metrics, logging, tracing, SLOs, error budgets
+- `operations` - Deployment safety, runbooks, incident response, cost
 
 **Specialist Definitions**: `.claude/agents/*.md`
 
@@ -127,7 +132,7 @@ The platform consists of **five main components**:
 - Performance/scalability impacts
 - Core pattern modifications
 
-**Minimum debate size**: 3 agents (1 domain + Test + Security)
+**Minimum debate size**: 5 agents (1 domain + Test + Security + Observability + Operations)
 
 **Process**:
 1. Propose debate to user (ALWAYS get approval first)

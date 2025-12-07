@@ -12,32 +12,38 @@ When a feature or design decision affects multiple subsystems, we use a **multi-
 
 | Feature Type | Agents Involved |
 |--------------|----------------|
-| API endpoint (GC only) | GC + Test + Security |
-| Signaling message (MC only) | MC + Protocol + Test + Security |
-| Media forwarding change | MH + Test + Security (maybe Protocol) |
-| Cross-service feature | Multiple agents based on impact + Test + Security |
-| Database schema change | Database + affected service agents + Test + Security |
-| Performance optimization | Affected service agents + Test + Security |
+| API endpoint (GC only) | GC + Test + Security + Observability + Operations |
+| Signaling message (MC only) | MC + Protocol + Test + Security + Observability + Operations |
+| Media forwarding change | MH + Test + Security + Observability + Operations (maybe Protocol) |
+| Cross-service feature | Multiple agents based on impact + Test + Security + Observability + Operations |
+| Database schema change | Database + affected service agents + Test + Security + Observability + Operations |
+| Performance optimization | Affected service agents + Test + Security + Observability + Operations |
+| Infrastructure change | Infrastructure + affected service agents + Test + Security + Observability + Operations |
+| Deployment/scaling change | Operations + Infrastructure + Test + Security + Observability |
 
 ### Examples
 
 **Feature**: "Add endpoint to update meeting settings"
-- **Agents**: Global Controller, Test, Security (maybe Database if schema changes)
-- **Rationale**: GC implements, Test ensures testability, Security validates auth/authz
+- **Agents**: Global Controller, Test, Security, Observability, Operations (maybe Database if schema changes)
+- **Rationale**: GC implements, Test ensures testability, Security validates auth/authz, Observability defines metrics/traces, Operations ensures deployability
 
 **Feature**: "Implement adaptive bitrate control"
-- **Agents**: Meeting Controller, Media Handler, Protocol, Test, Security
-- **Rationale**: MC sets policy, MH executes, Protocol defines messages, Test ensures E2E testing, Security validates DoS protection
+- **Agents**: Meeting Controller, Media Handler, Protocol, Test, Security, Observability, Operations
+- **Rationale**: MC sets policy, MH executes, Protocol defines messages, Test ensures E2E testing, Security validates DoS protection, Observability defines SLOs for quality, Operations ensures failure modes are handled
 
 **Feature**: "Add participant mute functionality"
-- **Agents**: Meeting Controller, Protocol, Database, Test, Security
-- **Rationale**: MC enforces, Protocol defines messages, DB stores mute state, Test ensures coverage, Security validates authorization
+- **Agents**: Meeting Controller, Protocol, Database, Test, Security, Observability, Operations
+- **Rationale**: MC enforces, Protocol defines messages, DB stores mute state, Test ensures coverage, Security validates authorization, Observability ensures mute events are auditable, Operations validates runbook for mute-related issues
 
 **Feature**: "Optimize layout computation performance"
-- **Agents**: Meeting Controller, Test, Security
-- **Rationale**: Internal MC optimization, Test validates performance, Security ensures no DoS vulnerability introduced
+- **Agents**: Meeting Controller, Test, Security, Observability, Operations
+- **Rationale**: Internal MC optimization, Test validates performance, Security ensures no DoS vulnerability introduced, Observability defines latency SLOs, Operations ensures degradation path exists
 
-**Rule of thumb**: Test and Security are ALWAYS included. If unsure about domain specialists, err on the side of including more agents. Extra perspectives help.
+**Feature**: "Deploy to new region"
+- **Agents**: Infrastructure, Operations, Test, Security, Observability
+- **Rationale**: Infrastructure provisions resources, Operations defines deployment strategy, Test validates cross-region behavior, Security ensures data residency compliance, Observability defines cross-region dashboards
+
+**Rule of thumb**: Test, Security, Observability, and Operations are ALWAYS included in debates. If unsure about domain specialists, err on the side of including more agents. Extra perspectives help.
 
 ## The N-Agent Debate Loop
 
@@ -84,8 +90,10 @@ function multi_agent_debate(topic, agents):
     satisfaction_scores = {agent: 0 for agent in agents}
     round = 0
 
-    # Separate Test and Security from other agents
-    domain_agents = [a for a in agents if a not in ['Test', 'Security']]
+    # Separate cross-cutting specialists from domain agents
+    # Cross-cutting specialists have fixed order at end of each round
+    cross_cutting = ['Observability', 'Operations', 'Test', 'Security']
+    domain_agents = [a for a in agents if a not in cross_cutting]
 
     # Randomize domain agents initially (avoid order bias)
     if len(domain_agents) > 1:
@@ -99,12 +107,12 @@ function multi_agent_debate(topic, agents):
         if len(domain_agents) > 1 and round > 1 and (round - 1) % 3 == 0:
             shuffle(domain_agents)
 
-        # Build agent order: domain agents first (randomized), then Test, then Security
+        # Build agent order: domain agents first (randomized), then cross-cutting in fixed order
+        # Order: Domain agents → Observability → Operations → Test → Security
         agent_order = domain_agents.copy()
-        if 'Test' in agents:
-            agent_order.append('Test')
-        if 'Security' in agents:
-            agent_order.append('Security')
+        for cc in ['Observability', 'Operations', 'Test', 'Security']:
+            if cc in agents:
+                agent_order.append(cc)
 
         # Each agent responds in sequence
         for agent in agent_order:
@@ -159,26 +167,26 @@ function multi_agent_debate(topic, agents):
 
 ### Agent Ordering Strategy
 
-**Fixed Order for Test and Security**:
-- Test specialist ALWAYS goes second-to-last in each round
+**Fixed Order for Cross-Cutting Specialists**:
+- Observability specialist goes after all domain agents
+- Operations specialist goes after Observability
+- Test specialist goes after Operations
 - Security specialist ALWAYS goes last in each round
-- This allows them to review all domain proposals before providing feedback
+- This allows cross-cutting specialists to review all domain proposals before providing feedback
+- Order: Domain agents → Observability → Operations → Test → Security
 
 **Domain Agent Randomization**:
-When multiple domain agents (not Test/Security) are debating:
+When multiple domain agents (not cross-cutting) are debating:
 - Randomize domain agents once at start of debate (Round 1)
 - Re-randomize domain agents every 3 rounds (Rounds 4, 7, 10)
 - This provides structure while preventing order bias
 
-**Example ordering** (5-agent debate: GC, MC, Protocol, Test, Security):
-- Round 1: [GC, Protocol, MC, Test, Security] ← domain agents randomized initially
-- Round 2: [GC, Protocol, MC, Test, Security] ← same order
-- Round 3: [GC, Protocol, MC, Test, Security] ← same order
-- Round 4: [MC, GC, Protocol, Test, Security] ← domain agents re-randomized
-- Round 5: [MC, GC, Protocol, Test, Security] ← same order
-- Round 6: [MC, GC, Protocol, Test, Security] ← same order
-- Round 7: [Protocol, MC, GC, Test, Security] ← domain agents re-randomized
-- Test and Security always last in that order
+**Example ordering** (7-agent debate: GC, MC, Protocol, Observability, Operations, Test, Security):
+- Round 1: [GC, Protocol, MC, Observability, Operations, Test, Security] ← domain agents randomized initially
+- Round 2: [GC, Protocol, MC, Observability, Operations, Test, Security] ← same order
+- Round 3: [GC, Protocol, MC, Observability, Operations, Test, Security] ← same order
+- Round 4: [MC, GC, Protocol, Observability, Operations, Test, Security] ← domain agents re-randomized
+- Cross-cutting specialists always go last in fixed order: Observability → Operations → Test → Security
 
 ### Context Management
 
@@ -351,7 +359,7 @@ Proceed? [Y/n]
 
 ## Example Workflow
 
-### Simple Case (2 agents, quick consensus)
+### Simple Case (quick consensus)
 
 ```
 User: "Add QualityAlert message for immediate quality drops"
@@ -359,33 +367,37 @@ User: "Add QualityAlert message for immediate quality drops"
 Orchestrator: Analyzing impact...
   - Touches signaling protocol (Protocol agent)
   - Touches media handler behavior (MH agent)
-  - Test and Security always included
+  - Cross-cutting specialists always included
 
-Initiating 4-agent debate: Protocol, Media Handler, Test, Security
+Initiating 6-agent debate: Protocol, Media Handler, Observability, Operations, Test, Security
 
 Round 1:
-  [Order: Protocol, MH, Test, Security]
+  [Order: Protocol, MH, Observability, Operations, Test, Security]
   Protocol: 85% - "Good idea, but field naming could be clearer"
   MH: 90% - "Perfect, this is exactly what we need"
+  Observability: 88% - "Need metric for alert frequency, add trace context"
+  Operations: 90% - "Need runbook for high-frequency alerts, otherwise good"
   Test: 92% - "Easy to test, clear contract"
   Security: 91% - "No security concerns, normal signaling"
 
 Round 2:
-  [Order: Protocol, MH, Test, Security] ← same domain order
-  Protocol: 93% - "Better field names, satisfied"
+  [Order: Protocol, MH, Observability, Operations, Test, Security]
+  Protocol: 93% - "Better field names, added trace_id field"
   MH: 91% - "Agreed on naming"
+  Observability: 92% - "Trace context included, metrics defined"
+  Operations: 91% - "Runbook drafted, thresholds clear"
   Test: 93% - "Still good"
   Security: 92% - "Still secure"
 
 CONSENSUS (2 rounds)
 
 Final Design:
-[Consolidated QualityAlert message definition]
+[Consolidated QualityAlert message definition with observability requirements]
 
 Implementing...
 ```
 
-### Complex Case (3 agents, multiple rounds)
+### Complex Case (multiple rounds)
 
 ```
 User: "Implement participant mute functionality"
@@ -394,32 +406,38 @@ Orchestrator: Analyzing impact...
   - Database: Store mute state
   - Protocol: Define mute messages
   - Meeting Controller: Enforce mute
-  - Test and Security: Always included
+  - Cross-cutting specialists always included
 
-Initiating 5-agent debate: Database, Protocol, Meeting Controller, Test, Security
+Initiating 7-agent debate: Database, Protocol, Meeting Controller, Observability, Operations, Test, Security
 
 Round 1:
-  [Order: Database, Protocol, MC, Test, Security]
+  [Order: Database, Protocol, MC, Observability, Operations, Test, Security]
   Database: 70% - "Where do we store mute state? Redis or PostgreSQL?"
   Protocol: 85% - "Need both MuteParticipant command and ParticipantMuted event"
   MC: 80% - "Who can mute whom? Need permission system"
+  Observability: 75% - "Need metrics for mute frequency, trace mute operations"
+  Operations: 70% - "What's the failure mode if mute state is lost? Need runbook"
   Test: 88% - "Testable, need clear permission scenarios defined"
   Security: 60% - "CRITICAL: Who can mute whom? Need authorization checks, audit logging"
 
 Round 2:
-  [Order: Database, Protocol, MC, Test, Security] ← same domain order
+  [Order: Database, Protocol, MC, Observability, Operations, Test, Security]
   Protocol: 88% - "Added role field to determine permissions"
   MC: 75% - "Better, but need to clarify server-side enforcement"
   Database: 78% - "Suggest Redis for live state, PostgreSQL for history"
+  Observability: 85% - "Mute metrics defined, audit events traced"
+  Operations: 82% - "Runbook drafted, but need graceful degradation for Redis failure"
   Test: 90% - "Clear test scenarios emerging"
   Security: 75% - "Better with roles, but need explicit permission checks at MC level"
 
 Round 3:
-  [Order: Database, Protocol, MC, Test, Security] ← same domain order
+  [Order: Database, Protocol, MC, Observability, Operations, Test, Security]
   MC: 92% - "Server-side enforcement designed, permission checks in place"
   Database: 91% - "Agreed on hybrid storage approach"
   Protocol: 93% - "Messages are clean and complete"
-  Test: 93% - "Can test all permission combinations"
+  Observability: 91% - "SLO defined: mute latency <100ms p99, dashboard ready"
+  Operations: 90% - "Graceful degradation: fall back to PostgreSQL if Redis down"
+  Test: 93% - "Can test all permission combinations, including chaos tests"
   Security: 91% - "Good! Audit log captures mute events, proper authz checks"
 
 CONSENSUS (3 rounds)
@@ -428,7 +446,9 @@ Final Design:
   Database: Redis for live mute state, PostgreSQL audit log
   Protocol: MuteParticipant (command) + ParticipantMuted (event)
   MC: Server-side enforcement, role-based permissions
-  Test: E2E tests for all permission scenarios
+  Observability: Mute latency SLO, audit trace events
+  Operations: Runbook for mute issues, Redis failover to PostgreSQL
+  Test: E2E tests for all permission scenarios + chaos tests
   Security: Authorization checks, audit logging, rate limiting
 
 Implementing...

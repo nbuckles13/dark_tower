@@ -23,7 +23,9 @@ Trigger this workflow:
 3. Parallel Specialist Reviews
    ├─→ Code Reviewer (quality, maintainability, Rust idioms)
    ├─→ Security Specialist (vulnerabilities, crypto, auth)
-   └─→ Test Specialist (coverage, edge cases, test quality)
+   ├─→ Test Specialist (coverage, edge cases, test quality)
+   ├─→ Observability Specialist (logging, metrics, traces)
+   └─→ Operations Specialist (if ops-related: deployments, migrations, configs)
    ↓
 4. Synthesize Findings
    ↓
@@ -31,6 +33,19 @@ Trigger this workflow:
    ↓
 6. Present to User
 ```
+
+## Reviewer Participation
+
+| Reviewer | Participation | Focus |
+|----------|--------------|-------|
+| Code Reviewer | Every review | Quality, idioms, maintainability |
+| Security Specialist | Every review | Vulnerabilities, crypto, auth |
+| Test Specialist | Every review | Coverage, test quality |
+| Observability Specialist | Every review | Logging, metrics, traces, SLOs |
+| Operations Specialist | Ops-related only | Deployments, migrations, configs, runbooks |
+| Infrastructure Specialist | Infra-related only | K8s, Terraform, Dockerfiles |
+
+**Ops-related changes**: Deployment scripts, database migrations, configuration changes, Kubernetes manifests, Terraform, CI/CD pipelines, credential handling.
 
 ## Workflow Steps
 
@@ -117,12 +132,68 @@ Run three specialists in parallel (three separate Task tool calls in a single me
 - Test quality assessment
 - Integration test needs
 - Performance test recommendations
+- Chaos test needs (if applicable)
 - Coverage gaps categorized by priority (CRITICAL, HIGH, MEDIUM, LOW)
+
+#### Review D: Observability Specialist
+
+**Focus**: Logging, metrics, tracing, SLO impact
+
+**Inputs**:
+- List of changed files
+- Relevant ADRs (observability, SLOs)
+- Observability-focused context
+
+**Deliverables**:
+- Logging assessment (structured logging, correlation IDs)
+- Metrics review (naming, cardinality, SLO alignment)
+- Trace span coverage (external calls, critical paths)
+- SLO impact analysis
+- Dashboard recommendations
+- Issues categorized by severity (BLOCKER, HIGH, MEDIUM, LOW)
+
+#### Review E: Operations Specialist (if ops-related)
+
+**Trigger**: Include when changes affect deployments, migrations, configs, or operational procedures
+
+**Focus**: Deployment safety, operational readiness, runbook updates
+
+**Inputs**:
+- List of changed files
+- Migration files
+- Configuration changes
+- Deployment scripts
+
+**Deliverables**:
+- Deployment safety assessment
+- Migration rollback plan
+- Configuration validation
+- Runbook requirements
+- Cost implications
+- Issues categorized by severity (BLOCKER, HIGH, MEDIUM, LOW)
+
+#### Review F: Infrastructure Specialist (if infra-related)
+
+**Trigger**: Include when changes affect K8s manifests, Terraform, Dockerfiles, or CI/CD
+
+**Focus**: Portability, security boundaries, resource sizing
+
+**Inputs**:
+- List of changed files
+- Infrastructure files
+- Cloud provider configurations
+
+**Deliverables**:
+- Portability assessment (cloud-agnostic)
+- Security boundary validation
+- Resource limit review
+- Network policy check
+- Issues categorized by severity (BLOCKER, HIGH, MEDIUM, LOW)
 
 ### Step 4: Synthesize Findings
 
 **Orchestrator Action**:
-1. Collect all three specialist reports
+1. Collect all specialist reports (4-6 depending on change type)
 2. Identify overlapping concerns
 3. Prioritize issues by severity:
    - **BLOCKER**: Must fix before merge (security critical, data loss, ADR violation)
@@ -189,7 +260,7 @@ If specialists disagree:
 # Code Review Report: [Component Name]
 
 **Date**: [YYYY-MM-DD]
-**Reviewers**: Code Reviewer, Security Specialist, Test Specialist
+**Reviewers**: Code Reviewer, Security Specialist, Test Specialist, Observability Specialist [, Operations Specialist, Infrastructure Specialist]
 **Scope**: [X files, Y lines changed]
 **Change Type**: [Feature/Bugfix/Refactor/etc.]
 
@@ -232,6 +303,30 @@ If specialists disagree:
 - Coverage percentage
 - Missing test cases
 - Test quality issues
+- Chaos test coverage (if applicable)
+- Recommendations
+
+### Observability Review
+[Observability Specialist findings summary]
+- Logging coverage
+- Metrics coverage
+- Trace span coverage
+- SLO impact
+- Recommendations
+
+### Operations Review (if ops-related)
+[Operations Specialist findings summary]
+- Deployment safety
+- Migration rollback plan
+- Runbook requirements
+- Cost implications
+- Recommendations
+
+### Infrastructure Review (if infra-related)
+[Infrastructure Specialist findings summary]
+- Portability assessment
+- Security boundaries
+- Resource sizing
 - Recommendations
 
 ## ADR Compliance
