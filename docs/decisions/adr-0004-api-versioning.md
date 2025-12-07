@@ -105,6 +105,48 @@ service MediaHandlerService {
 - gRPC services are internal (we control both client and server)
 - Can coordinate breaking changes across services
 
+### Protobuf Field Evolution Rules
+
+**Safe changes** (no coordination needed):
+- Add new fields (old receivers ignore, new receivers use default)
+- Add new enum values (with explicit default handling)
+- Add new RPC methods
+- Add new message types
+
+**Unsafe changes** (require major version bump):
+- Remove fields (mark `deprecated`, reserve field number forever)
+- Change field type (add new field with different name/number instead)
+- Rename fields (wire format uses numbers, but regenerated code breaks)
+- Change field number
+- Remove enum values
+
+**Best practices**:
+```protobuf
+message MeetingEvent {
+  string meeting_id = 1;
+  string mc_id = 2;
+  // DEPRECATED: Use org_uuid instead (UUID format preferred)
+  string org_id = 3 [deprecated = true];
+  string org_uuid = 4;  // New field - preferred
+
+  reserved 5, 6;  // Field numbers reserved (previously used, now removed)
+  reserved "old_field_name";  // Field name reserved
+}
+
+enum MeetingState {
+  MEETING_STATE_UNSPECIFIED = 0;  // Always have explicit default
+  MEETING_STATE_ACTIVE = 1;
+  MEETING_STATE_ENDED = 2;
+  // MEETING_STATE_PAUSED = 3;  // Removed - do NOT reuse number
+  reserved 3;
+}
+```
+
+**Field number ranges**:
+- 1-15: Reserved for high-frequency fields (1-byte encoding)
+- 16-2047: Standard fields (2-byte encoding)
+- 19000-19999: Reserved by protobuf (never use)
+
 ### Error Responses
 
 **Version mismatch errors**:

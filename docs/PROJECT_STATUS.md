@@ -1,6 +1,6 @@
 # Dark Tower - Project Status
 
-**Last Updated**: 2025-12-04
+**Last Updated**: 2025-12-07
 **Current Phase**: Phase 4 - Security Hardening & Testing Infrastructure
 
 ## Executive Summary
@@ -181,10 +181,10 @@ All foundational work completed:
    - See: `.github/workflows/ci.yml`
 
 **Test Coverage**:
-- **Current**: 83% overall, 84 tests passing
+- **Current**: 86% overall (ac-service), 90+ tests passing
 - **Target**: 95% for security-critical code
 - **P0 tests**: 48 (all passing)
-- **P1 tests**: 36 (all passing)
+- **P1 tests**: 36+ (all passing)
 
 ## Current Phase: Phase 4 - Security Hardening
 
@@ -259,13 +259,13 @@ dark_tower/
 │   ├── debates/             # Multi-agent design debates
 │   │   ├── 2025-01-22-auth-controller-implementation.md
 │   │   └── 2025-01-testing-strategy.md
-│   ├── decisions/           # Architecture Decision Records
+│   ├── decisions/           # Architecture Decision Records (10 ADRs)
 │   │   ├── adr-0001-actor-pattern.md
 │   │   ├── adr-0002-no-panic-policy.md
 │   │   ├── adr-0003-service-authentication.md
 │   │   ├── adr-0004-api-versioning.md
-│   │   ├── adr-0005-integration-testing.md
-│   │   └── adr-0006-fuzz-testing.md
+│   │   ├── adr-0005 through adr-0009 (testing, key rotation)
+│   │   └── adr-0010-global-controller-architecture.md
 │   ├── ARCHITECTURE.md      # System architecture
 │   ├── API_CONTRACTS.md     # API specifications
 │   ├── DATABASE_SCHEMA.md   # Database design
@@ -317,7 +317,7 @@ dark_tower/
 | Location | Description | Count |
 |----------|-------------|-------|
 | [docs/debates/](debates/) | Multi-agent design debates | 4 |
-| [docs/decisions/](decisions/) | Architecture Decision Records | 9 |
+| [docs/decisions/](decisions/) | Architecture Decision Records | 10 |
 
 ## Future Phases
 
@@ -327,6 +327,11 @@ dark_tower/
 - Integration with ac-service for authentication
 - Multi-tenancy support
 - Geographic routing logic
+- **Architecture designed**: See [ADR-0010](decisions/adr-0010-global-controller-architecture.md)
+  - Atomic MC health check + assignment (race-condition safe)
+  - Inter-region MC discovery via Redis Streams + transactional outbox
+  - Meeting-scoped tokens for MC/MH (no denylist check needed)
+  - MC-to-GC heartbeat system
 
 ### Phase 6: Meeting Controller Implementation (Planned)
 - WebTransport signaling server
@@ -407,6 +412,11 @@ dark_tower/
 
 ## Recent Achievements (Last 2 Weeks)
 
+- ✅ Designed Global Controller architecture (ADR-0010)
+  - Atomic MC health check + assignment with CTE (race-condition safe)
+  - Batched transactional outbox publisher with exponential backoff
+  - Meeting-scoped tokens for MC/MH (no denylist check needed)
+  - Inter-region MC discovery via Redis Streams
 - ✅ Implemented key rotation endpoint with TOCTOU protection (ADR-0008)
 - ✅ Added integration test infrastructure (ADR-0009)
   - TestAuthServer for E2E HTTP testing with isolated databases
@@ -504,12 +514,16 @@ dark_tower/
 - [x] Code coverage tracking
 
 ### Phase 4: Security Hardening 🔄 IN PROGRESS
-- [x] P1 security tests implemented (32 tests)
+- [x] P1 security tests implemented (32+ tests)
 - [x] JWT validation security validated
 - [x] SQL injection prevention verified
 - [x] JWT iat validation implemented
 - [x] JWT header injection tests added
-- [ ] JWT size limits (DoS prevention)
+- [x] JWT size limits (4KB DoS prevention)
+- [x] Time-based SQL injection prevention
+- [x] Key rotation implementation (ADR-0008)
+- [x] Integration test infrastructure (ADR-0009)
+- [x] Global Controller architecture (ADR-0010)
 - [ ] Performance benchmarks
 - [ ] 95% test coverage achieved
 - [ ] Security documentation complete
