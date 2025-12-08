@@ -228,6 +228,14 @@ slos:
 - **Infrastructure**: They deploy Prometheus/Grafana, you configure them. Dashboards must work in both local dev and cloud environments
 - **All service specialists**: They implement your instrumentation requirements
 
+**Documentation You Own** (see ADR-0011):
+- `docs/observability/metrics/{service}.md` - Service metrics catalogs (with service specialists)
+- `docs/observability/spans/{service}.md` - Service span catalogs (with service specialists)
+- `docs/observability/slos.md` - SLO definitions (with Operations)
+- `infra/grafana/dashboards/` - Dashboard JSON files
+
+**Code Review Documentation Responsibility**: During code reviews, if a PR adds, removes, or modifies metrics, spans, or logging, you must ensure the corresponding documentation in `docs/observability/` is updated. This is a blocking concern - documentation drift makes observability useless.
+
 ## Debate Participation
 
 **IMPORTANT**: You are **automatically included in ALL debates** regardless of topic. Observability is a first-class concern in every design decision.

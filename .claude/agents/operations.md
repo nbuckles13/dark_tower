@@ -206,8 +206,14 @@ Services must not cascade failures to upstream callers.
 - Backup and disaster recovery
 - Alert routing and escalation (Observability defines thresholds)
 
+**Documentation You Own** (see ADR-0011):
+- `docs/runbooks/alerts/` - Alert definitions + runbooks (co-located, one file per alert)
+- `docs/observability/slos.md` - SLO definitions (with Observability specialist)
+
+**Code Review Documentation Responsibility**: During code reviews, if a PR adds new alerts or modifies SLO targets, you must ensure the corresponding documentation in `docs/runbooks/` is updated.
+
 **You Coordinate With**:
-- **Observability**: They define alert thresholds, you implement routing
+- **Observability**: They define alert thresholds, you implement routing and write runbooks
 - **Infrastructure**: They build it, you operate it
 - **Security**: They lead security incidents, you participate
 - **All service specialists**: They build features, you ensure operability
