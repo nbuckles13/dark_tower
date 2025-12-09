@@ -300,68 +300,56 @@ This gap analysis evaluates ac-service against the standards defined by the newl
 
 ---
 
-## Consolidated Action Plan
+## Implementation Plan
 
-### Quick Fixes (Code Review Scope)
+**Status**: ADR-0011 and ADR-0012 debates complete. Implementation plan created 2025-12-08.
 
-| Priority | Item | Owner | Effort |
-|----------|------|-------|--------|
-| P0 | Add graceful shutdown handling | Any | 1-2 hours |
-| P0 | Add `/ready` endpoint (check DB + keys) | Any | 1 hour |
-| P1 | Add DB connection timeout | Any | 30 mins |
-| P2 | Enhance health check with DB ping | Any | 30 mins |
-| P2 | Make rotation rate limit configurable | Any | 1 hour |
+See [AC Operational Readiness Re-Review Debate](../debates/2025-12-08-ac-operational-readiness-re-review.md) for full implementation plan.
 
-### Needs Design (After Observability Framework Debate)
+### Summary
 
-| Priority | Item | Owner | Effort |
-|----------|------|-------|--------|
-| P1 | Add `#[instrument]` to all handlers (privacy-by-default) | AC + Observability | 2-3 hours |
-| P1 | Add DB operation spans | AC + Observability | 2 hours |
-| P1 | Add crypto operation spans | AC + Observability | 1 hour |
-| P2 | Add rate limit rejection counter | AC + Observability | 30 mins |
+| Phase | Goal | Effort | Owner |
+|-------|------|--------|-------|
+| **Phase 1** | Deployment Foundation (Dockerfile, K8s) | 8h | Infrastructure |
+| **Phase 2** | Operational Safety (shutdown, /ready, timeouts) | 6h | Operations, AC |
+| **Phase 3** | Observability (metrics, tracing, PII) | 10h | Observability, AC |
+| **Phase 4** | Documentation & Testing (runbooks, chaos) | 4h | Operations, Test |
+| **Phase 5** | Operational Readiness Review | 4h | Operations (all review) |
 
-**Note**: All instrumentation items require the observability framework debate to complete first. Security must review all logged fields for PII before implementation.
+**Total**: 32 hours (~4 developer-days)
 
-### Needs Debate (Architectural Decisions)
+### Phase Details
 
-| Topic | Specialists | Scope | Notes |
-|-------|-------------|-------|-------|
-| Observability framework | Observability (lead), Security, Infrastructure, AC, GC, MC, MH, Operations, Test | HIGH | Metrics naming, dimensions, privacy-by-default logging, SLOs, dashboards. Security must review for PII. |
-| Infrastructure architecture | Infrastructure (lead), Operations, Security, Observability, AC, GC, MC, MH, Database, Test | HIGH | Local dev environment, cloud deployment, code organization, secrets management |
-| Container image | Infrastructure, Security | HIGH | Base image, build process, scanning |
-| Kubernetes deployment | Infrastructure, Operations | HIGH | Resource sizing, replicas, networking |
-| Circuit breaker | Operations, AC | MEDIUM | Pattern, fallback behavior for DB failures |
-| Chaos test framework | Test, Operations | MEDIUM | Chaos Mesh vs custom |
+#### Phase 1: Deployment Foundation
+- Multi-stage Dockerfile with distroless base
+- K8s StatefulSet, Service, NetworkPolicy
+- TLS on PostgreSQL connection (verify-full)
+- DB pool configuration (20 connections, timeouts)
 
-### Documentation Needed
+#### Phase 2: Operational Safety
+- Graceful shutdown (30s drain)
+- `/ready` endpoint (DB + signing key check)
+- HTTP request timeout (30s)
+- SQL query timeout (5s)
 
-| Document | Owner | Priority |
-|----------|-------|----------|
-| AC deployment runbook | Operations | P1 |
-| AC incident response runbooks (5) | Operations | P1 |
-| AC architecture for operators | Operations | P2 |
-| AC dashboard template | Observability | P2 (after metrics) |
+#### Phase 3: Observability
+- Prometheus `/metrics` endpoint
+- Business metrics per ADR-0011
+- `#[instrument(skip_all)]` on all handlers
+- PII redaction helpers
+- Grafana dashboard
 
----
+#### Phase 4: Documentation & Testing
+- Deployment runbook
+- Incident response runbooks (AC-001 through AC-004)
+- Chaos tests (DB failure, slow queries)
 
-## Next Steps
-
-1. **Immediate** (before Phase 5 GC work):
-   - Add graceful shutdown (P0)
-   - Add readiness endpoint (P0)
-   - Add DB connection timeout (P1)
-
-2. **Debates Required**:
-   - Run observability framework debate (all services + specialists)
-   - Run infrastructure architecture debate (all services + specialists)
-
-3. **After Debates**:
-   - Implement instrumentation per observability framework ADR
-   - Implement infrastructure per infrastructure ADR
-   - Create dashboards (must work in local dev and cloud)
-   - Create runbooks
-   - Implement chaos tests
+#### Phase 5: Operational Readiness Review
+- ADR-0011/ADR-0012 compliance checklist
+- Prometheus AlertManager rules
+- SLO dashboards with error budget
+- Security final review
+- Load test at 2x traffic
 
 ---
 
