@@ -1,0 +1,14 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: ac-service
+  namespace: dark-tower
+  labels:
+    app: ac-service
+    component: auth
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: ac-service
+      component: auth

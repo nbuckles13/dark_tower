@@ -2,6 +2,7 @@ use base64::{engine::general_purpose, Engine as _};
 use std::collections::HashMap;
 use std::env;
 use thiserror::Error;
+use tracing::warn;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -59,12 +60,41 @@ impl Config {
 
         let otlp_endpoint = vars.get("OTLP_ENDPOINT").cloned();
 
+        // ADR-0012: Validate TLS configuration for PostgreSQL
+        // Production deployments should use sslmode=verify-full
+        // Allow non-TLS for local development but warn
+        Self::validate_tls_config(&database_url);
+
         Ok(Config {
             database_url,
             bind_address,
             master_key,
             otlp_endpoint,
         })
+    }
+
+    /// Validates TLS configuration in DATABASE_URL
+    /// Warns if sslmode is not set to verify-full (ADR-0012 requirement)
+    fn validate_tls_config(database_url: &str) {
+        // Skip validation in test mode to avoid tracing initialization issues
+        if cfg!(test) {
+            return;
+        }
+
+        let has_sslmode = database_url.contains("sslmode=");
+        let has_verify_full = database_url.contains("sslmode=verify-full");
+
+        if !has_sslmode {
+            warn!(
+                "DATABASE_URL does not specify sslmode. ADR-0012 requires sslmode=verify-full for production. \
+                 This is acceptable for local development, but production deployments MUST use TLS."
+            );
+        } else if !has_verify_full {
+            warn!(
+                "DATABASE_URL uses sslmode other than verify-full. ADR-0012 requires sslmode=verify-full \
+                 for production deployments to ensure proper certificate validation."
+            );
+        }
     }
 }
 

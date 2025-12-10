@@ -5,3 +5,6 @@
 
 #[path = "integration/key_rotation_tests.rs"]
 mod key_rotation_tests;
+
+#[path = "integration/health_tests.rs"]
+mod health_tests;

@@ -1,0 +1,48 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ac-service
+  namespace: dark-tower
+  labels:
+    app: ac-service
+    component: auth
+spec:
+  podSelector:
+    matchLabels:
+      app: ac-service
+      component: auth
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  # Allow ingress from Global Controller
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: dark-tower
+      podSelector:
+        matchLabels:
+          app: global-controller
+    ports:
+    - protocol: TCP
+      port: 8082
+  egress:
+  # Allow egress to PostgreSQL
+  - to:
+    - podSelector:
+        matchLabels:
+          app: postgresql
+    ports:
+    - protocol: TCP
+      port: 5432
+  # Allow DNS resolution
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: kube-system
+      podSelector:
+        matchLabels:
+          k8s-app: kube-dns
+    ports:
+    - protocol: UDP
+      port: 53

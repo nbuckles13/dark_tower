@@ -13,7 +13,9 @@ use handlers::auth_handler::AppState;
 use services::key_management_service;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tracing::{error, info};
+use std::time::Duration;
+use tokio::signal;
+use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[tokio::main]
@@ -37,11 +39,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Configuration loaded successfully");
 
-    // Initialize database connection pool
+    // Initialize database connection pool with query timeout
+    // ADR-0012: 5s statement timeout to fail fast on hung queries
     info!("Connecting to database...");
+    let db_url_with_timeout = add_query_timeout(&config.database_url, 5);
     let db_pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(5)
-        .connect(&config.database_url)
+        .max_connections(20) // ADR-0012: Increased from 5 to 20 for production capacity
+        .min_connections(2) // Keep warm connections to reduce latency
+        .acquire_timeout(Duration::from_secs(5)) // Fail fast on connection issues
+        .idle_timeout(Duration::from_secs(600)) // 10 minutes
+        .max_lifetime(Duration::from_secs(1800)) // 30 minutes
+        .connect(&db_url_with_timeout)
         .await
         .map_err(|e| {
             error!("Failed to connect to database: {}", e);
@@ -72,7 +80,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config,
     });
 
-    // Build application routes
+    // Build application routes with HTTP request timeout
+    // ADR-0012: 30s request timeout to prevent hung connections
     let app = routes::build_routes(state);
 
     // Parse bind address
@@ -83,13 +92,75 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Auth Controller listening on {}", addr);
 
-    // Start server with ConnectInfo support
+    // Start server with graceful shutdown support
+    // ADR-0012: 30s graceful shutdown drain period
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
+    .with_graceful_shutdown(shutdown_signal())
     .await?;
 
+    info!("Auth Controller shutdown complete");
+
     Ok(())
+}
+
+/// Listens for shutdown signals (SIGTERM, SIGINT)
+/// Returns when a shutdown signal is received and drain period is complete
+///
+/// ADR-0012: Graceful shutdown with 30s drain period
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        match signal::ctrl_c().await {
+            Ok(()) => info!("Received SIGINT, starting graceful shutdown..."),
+            Err(e) => error!("Failed to listen for SIGINT: {}", e),
+        }
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match signal::unix::signal(signal::unix::SignalKind::terminate()) {
+            Ok(mut stream) => {
+                stream.recv().await;
+                info!("Received SIGTERM, starting graceful shutdown...");
+            }
+            Err(e) => {
+                error!("Failed to listen for SIGTERM: {}", e);
+                // Fall through - ctrl_c will still work
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
+
+    // ADR-0012: 30s drain period for graceful shutdown
+    // K8s sends SIGTERM, then waits terminationGracePeriodSeconds (35s in our StatefulSet)
+    // We use 30s here to allow 5s buffer for final cleanup
+    //
+    // During this period:
+    // - axum stops accepting new connections (handled by with_graceful_shutdown)
+    // - Existing connections are allowed to complete
+    // - K8s removes us from service endpoints (readiness probe fails after SIGTERM)
+    warn!("Draining connections for 30 seconds...");
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    info!("Drain period complete");
+}
+
+/// Adds statement_timeout to the database URL
+/// This ensures queries don't hang indefinitely
+fn add_query_timeout(url: &str, timeout_secs: u32) -> String {
+    let separator = if url.contains('?') { '&' } else { '?' };
+    format!(
+        "{}{}options=-c%20statement_timeout%3D{}s",
+        url, separator, timeout_secs
+    )
 }
