@@ -297,7 +297,8 @@ impl Drop for TestAuthServer {
 fn build_test_routes(state: Arc<AppState>) -> Router {
     use ac_service::handlers::{admin_handler, auth_handler, jwks_handler};
     use axum::{middleware, routing::get, routing::post, Router};
-    use tower_http::trace::TraceLayer;
+    use std::time::Duration;
+    use tower_http::{timeout::TimeoutLayer, trace::TraceLayer};
 
     // Create auth middleware state
     let auth_state = Arc::new(AuthMiddlewareState {
@@ -335,14 +336,95 @@ fn build_test_routes(state: Arc<AppState>) -> Router {
             post(auth_handler::handle_service_token),
         )
         .route("/.well-known/jwks.json", get(jwks_handler::handle_get_jwks))
+        // Health check (liveness probe)
         .route("/health", get(health_check))
+        // Readiness probe (ADR-0012)
+        .route("/ready", get(readiness_check))
         .with_state(state);
 
-    // Merge routes
+    // Merge routes with global layers
     admin_routes
         .merge(internal_routes)
         .merge(public_routes)
         .layer(TraceLayer::new_for_http())
+        // ADR-0012: 30s HTTP request timeout
+        .layer(TimeoutLayer::new(Duration::from_secs(30)))
+}
+
+/// Readiness response structure
+#[derive(serde::Serialize)]
+struct ReadinessResponse {
+    status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    database: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    signing_key: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+/// Readiness probe - verifies service dependencies are available
+/// Security: Error messages are intentionally generic to avoid leaking infrastructure details.
+async fn readiness_check(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+) -> impl axum::response::IntoResponse {
+    use ac_service::repositories::signing_keys;
+    use axum::http::StatusCode;
+
+    // Check 1: Database connectivity
+    let db_check = sqlx::query("SELECT 1").fetch_one(&state.pool).await;
+
+    if let Err(_e) = db_check {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(ReadinessResponse {
+                status: "not_ready",
+                database: Some("unhealthy"),
+                signing_key: None,
+                // Generic error - don't leak infrastructure details
+                error: Some("Service dependencies unavailable".to_string()),
+            }),
+        );
+    }
+
+    // Check 2: Active signing key availability
+    let key_check = signing_keys::get_active_key(&state.pool).await;
+
+    match key_check {
+        Ok(Some(_)) => (
+            StatusCode::OK,
+            axum::Json(ReadinessResponse {
+                status: "ready",
+                database: Some("healthy"),
+                signing_key: Some("available"),
+                error: None,
+            }),
+        ),
+        Ok(None) => {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                axum::Json(ReadinessResponse {
+                    status: "not_ready",
+                    database: Some("healthy"),
+                    signing_key: Some("unavailable"),
+                    // Generic error - don't leak key rotation state
+                    error: Some("Service dependencies unavailable".to_string()),
+                }),
+            )
+        }
+        Err(_e) => {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                axum::Json(ReadinessResponse {
+                    status: "not_ready",
+                    database: Some("healthy"),
+                    signing_key: Some("error"),
+                    // Generic error - don't leak infrastructure details
+                    error: Some("Service dependencies unavailable".to_string()),
+                }),
+            )
+        }
+    }
 }
 
 /// Middleware state for authentication

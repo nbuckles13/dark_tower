@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: ac-service
+  namespace: dark-tower
+  labels:
+    app: ac-service
+    component: auth
+spec:
+  type: ClusterIP
+  selector:
+    app: ac-service
+    component: auth
+  ports:
+  - name: https
+    protocol: TCP
+    port: 443
+    targetPort: 8082
+  sessionAffinity: None
