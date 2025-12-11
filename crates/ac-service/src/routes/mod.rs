@@ -9,12 +9,59 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use serde::Serialize;
 use std::sync::Arc;
 use std::time::Duration;
 use tower_http::{timeout::TimeoutLayer, trace::TraceLayer};
 
-pub fn build_routes(state: Arc<auth_handler::AppState>) -> Router {
+/// Initialize Prometheus metrics recorder and return the handle
+/// for serving metrics via HTTP.
+///
+/// ADR-0011: Must be called before any metrics are recorded.
+/// Configures histogram buckets aligned with SLO targets:
+/// - Token issuance p99 < 350ms
+/// - DB queries p99 < 50ms
+///
+/// # Errors
+///
+/// Returns error if Prometheus recorder fails to install (e.g., already installed).
+pub fn init_metrics_recorder() -> Result<PrometheusHandle, String> {
+    use metrics_exporter_prometheus::Matcher;
+
+    PrometheusBuilder::new()
+        // Token issuance buckets aligned with 350ms SLO target
+        .set_buckets_for_metric(
+            Matcher::Prefix("ac_token_issuance".to_string()),
+            &[
+                0.010, 0.025, 0.050, 0.100, 0.150, 0.200, 0.250, 0.300, 0.350, 0.500, 1.000, 2.000,
+            ],
+        )
+        .map_err(|e| format!("Failed to set token issuance buckets: {}", e))?
+        // DB query buckets aligned with 50ms SLO target
+        .set_buckets_for_metric(
+            Matcher::Prefix("ac_db_query".to_string()),
+            &[
+                0.001, 0.002, 0.005, 0.010, 0.020, 0.050, 0.100, 0.250, 0.500, 1.000,
+            ],
+        )
+        .map_err(|e| format!("Failed to set DB query buckets: {}", e))?
+        // Bcrypt buckets - coarse (50ms minimum) to prevent timing side-channel attacks
+        .set_buckets_for_metric(
+            Matcher::Prefix("ac_bcrypt".to_string()),
+            &[
+                0.050, 0.100, 0.150, 0.200, 0.250, 0.300, 0.400, 0.500, 1.000,
+            ],
+        )
+        .map_err(|e| format!("Failed to set bcrypt buckets: {}", e))?
+        .install_recorder()
+        .map_err(|e| format!("Failed to install Prometheus recorder: {}", e))
+}
+
+pub fn build_routes(
+    state: Arc<auth_handler::AppState>,
+    metrics_handle: PrometheusHandle,
+) -> Router {
     // Create auth middleware state
     let auth_state = Arc::new(AuthMiddlewareState {
         pool: state.pool.clone(),
@@ -41,6 +88,11 @@ pub fn build_routes(state: Arc<auth_handler::AppState>) -> Router {
         )
         .with_state(state.clone());
 
+    // Metrics route with its own state (ADR-0011)
+    let metrics_routes = Router::new()
+        .route("/metrics", get(metrics_endpoint))
+        .with_state(metrics_handle);
+
     // Public routes (no authentication required)
     let public_routes = Router::new()
         // OAuth 2.0 authentication endpoints
@@ -64,6 +116,7 @@ pub fn build_routes(state: Arc<auth_handler::AppState>) -> Router {
     // Merge routes with global layers
     admin_routes
         .merge(internal_routes)
+        .merge(metrics_routes)
         .merge(public_routes)
         .layer(TraceLayer::new_for_http())
         // ADR-0012: 30s HTTP request timeout to prevent hung connections
@@ -163,4 +216,15 @@ async fn readiness_check(State(state): State<Arc<auth_handler::AppState>>) -> im
             )
         }
     }
+}
+
+/// Prometheus metrics endpoint (ADR-0011)
+///
+/// Returns metrics in Prometheus text format for scraping.
+/// This endpoint is unauthenticated to allow Prometheus to scrape metrics.
+///
+/// Security: No PII or secrets are exposed in metrics. Only
+/// operational data with bounded cardinality labels.
+async fn metrics_endpoint(State(handle): State<PrometheusHandle>) -> String {
+    handle.render()
 }

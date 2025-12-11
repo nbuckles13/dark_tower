@@ -18,5 +18,6 @@ pub mod crypto;
 pub mod errors;
 pub mod handlers;
 pub mod models;
+pub mod observability;
 pub mod repositories;
 pub mod services;

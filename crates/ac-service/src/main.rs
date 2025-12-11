@@ -4,6 +4,7 @@ mod errors;
 mod handlers;
 mod middleware;
 mod models;
+mod observability;
 mod repositories;
 mod routes;
 mod services;
@@ -30,6 +31,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     info!("Starting Auth Controller");
+
+    // Initialize Prometheus metrics recorder (ADR-0011)
+    // Must be done before any metrics are recorded
+    let metrics_handle = routes::init_metrics_recorder().map_err(|e| {
+        error!("Failed to initialize metrics recorder: {}", e);
+        e
+    })?;
+    info!("Prometheus metrics recorder initialized");
 
     // Load configuration
     let config = Config::from_env().map_err(|e| {
@@ -82,7 +91,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Build application routes with HTTP request timeout
     // ADR-0012: 30s request timeout to prevent hung connections
-    let app = routes::build_routes(state);
+    // ADR-0011: metrics_handle enables /metrics endpoint for Prometheus scraping
+    let app = routes::build_routes(state, metrics_handle);
 
     // Parse bind address
     let addr: SocketAddr = bind_address.parse().map_err(|e| {
