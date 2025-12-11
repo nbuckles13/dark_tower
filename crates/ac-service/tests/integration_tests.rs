@@ -8,3 +8,6 @@ mod key_rotation_tests;
 
 #[path = "integration/health_tests.rs"]
 mod health_tests;
+
+#[path = "integration/admin_auth_tests.rs"]
+mod admin_auth_tests;

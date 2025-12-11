@@ -39,6 +39,7 @@ async fn create_service_with_token(
     let token_response = token_service::issue_service_token(
         pool,
         master_key,
+        master_key,
         client_id,
         client_secret,
         "client_credentials",
