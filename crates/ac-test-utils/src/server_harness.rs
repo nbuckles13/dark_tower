@@ -7,8 +7,8 @@ use ac_service::config::Config;
 use ac_service::crypto;
 use ac_service::handlers::auth_handler::AppState;
 use ac_service::repositories::{service_credentials, signing_keys};
+use ac_service::routes;
 use ac_service::services::{key_management_service, token_service};
-use axum::Router;
 use chrono::Utc;
 use sqlx::PgPool;
 use std::net::SocketAddr;
@@ -78,8 +78,22 @@ impl TestAuthServer {
             config: config.clone(),
         });
 
-        // Build routes using ac-service's route builder
-        let app = build_test_routes(state);
+        // Initialize metrics recorder for test server
+        // Note: This may fail if already installed in the test process.
+        // In that case, we create a new recorder without installing it globally.
+        let metrics_handle = match routes::init_metrics_recorder() {
+            Ok(handle) => handle,
+            Err(_) => {
+                // If metrics recorder already installed globally, create a standalone recorder
+                // without installing it. This allows each test to have its own metrics.
+                use metrics_exporter_prometheus::PrometheusBuilder;
+                let recorder = PrometheusBuilder::new().build_recorder();
+                recorder.handle()
+            }
+        };
+
+        // Build routes using ac-service's real route builder
+        let app = routes::build_routes(state, metrics_handle);
 
         // Bind to random port
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -285,212 +299,6 @@ impl Drop for TestAuthServer {
         // when the test completes. This stops the server gracefully.
         self._handle.abort();
     }
-}
-
-/// Build routes for test server
-///
-/// NOTE: This duplicates middleware from ac-service because the middleware
-/// module is not publicly exported. This is intentional for Phase 4 to
-/// maintain test isolation and allow tests to verify actual HTTP behavior
-/// end-to-end. Consider refactoring in Phase 5 when middleware API stabilizes
-/// by exporting `pub mod middleware;` from ac-service.
-fn build_test_routes(state: Arc<AppState>) -> Router {
-    use ac_service::handlers::{admin_handler, auth_handler, jwks_handler};
-    use axum::{middleware, routing::get, routing::post, Router};
-    use std::time::Duration;
-    use tower_http::{timeout::TimeoutLayer, trace::TraceLayer};
-
-    // Create auth middleware state
-    let auth_state = Arc::new(AuthMiddlewareState {
-        pool: state.pool.clone(),
-    });
-
-    // Admin routes that require authentication with admin:services scope
-    let admin_routes = Router::new()
-        .route(
-            "/api/v1/admin/services/register",
-            post(admin_handler::handle_register_service),
-        )
-        .layer(middleware::from_fn_with_state(
-            auth_state.clone(),
-            require_admin_scope,
-        ))
-        .with_state(state.clone());
-
-    // Internal routes (key rotation) - authentication handled in handler
-    let internal_routes = Router::new()
-        .route(
-            "/internal/rotate-keys",
-            post(admin_handler::handle_rotate_keys),
-        )
-        .with_state(state.clone());
-
-    // Public routes (no authentication required)
-    let public_routes = Router::new()
-        .route(
-            "/api/v1/auth/user/token",
-            post(auth_handler::handle_user_token),
-        )
-        .route(
-            "/api/v1/auth/service/token",
-            post(auth_handler::handle_service_token),
-        )
-        .route("/.well-known/jwks.json", get(jwks_handler::handle_get_jwks))
-        // Health check (liveness probe)
-        .route("/health", get(health_check))
-        // Readiness probe (ADR-0012)
-        .route("/ready", get(readiness_check))
-        .with_state(state);
-
-    // Merge routes with global layers
-    admin_routes
-        .merge(internal_routes)
-        .merge(public_routes)
-        .layer(TraceLayer::new_for_http())
-        // ADR-0012: 30s HTTP request timeout
-        .layer(TimeoutLayer::new(Duration::from_secs(30)))
-}
-
-/// Readiness response structure
-#[derive(serde::Serialize)]
-struct ReadinessResponse {
-    status: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    database: Option<&'static str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    signing_key: Option<&'static str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<String>,
-}
-
-/// Readiness probe - verifies service dependencies are available
-/// Security: Error messages are intentionally generic to avoid leaking infrastructure details.
-async fn readiness_check(
-    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
-) -> impl axum::response::IntoResponse {
-    use ac_service::repositories::signing_keys;
-    use axum::http::StatusCode;
-
-    // Check 1: Database connectivity
-    let db_check = sqlx::query("SELECT 1").fetch_one(&state.pool).await;
-
-    if let Err(_e) = db_check {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            axum::Json(ReadinessResponse {
-                status: "not_ready",
-                database: Some("unhealthy"),
-                signing_key: None,
-                // Generic error - don't leak infrastructure details
-                error: Some("Service dependencies unavailable".to_string()),
-            }),
-        );
-    }
-
-    // Check 2: Active signing key availability
-    let key_check = signing_keys::get_active_key(&state.pool).await;
-
-    match key_check {
-        Ok(Some(_)) => (
-            StatusCode::OK,
-            axum::Json(ReadinessResponse {
-                status: "ready",
-                database: Some("healthy"),
-                signing_key: Some("available"),
-                error: None,
-            }),
-        ),
-        Ok(None) => {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                axum::Json(ReadinessResponse {
-                    status: "not_ready",
-                    database: Some("healthy"),
-                    signing_key: Some("unavailable"),
-                    // Generic error - don't leak key rotation state
-                    error: Some("Service dependencies unavailable".to_string()),
-                }),
-            )
-        }
-        Err(_e) => {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                axum::Json(ReadinessResponse {
-                    status: "not_ready",
-                    database: Some("healthy"),
-                    signing_key: Some("error"),
-                    // Generic error - don't leak infrastructure details
-                    error: Some("Service dependencies unavailable".to_string()),
-                }),
-            )
-        }
-    }
-}
-
-/// Middleware state for authentication
-///
-/// Duplicated from ac-service since middleware module is not public.
-#[derive(Clone)]
-struct AuthMiddlewareState {
-    pool: PgPool,
-}
-
-/// Authentication middleware requiring admin:services scope
-///
-/// Duplicated from ac-service since middleware module is not public.
-async fn require_admin_scope(
-    axum::extract::State(state): axum::extract::State<Arc<AuthMiddlewareState>>,
-    mut req: axum::extract::Request,
-    next: axum::middleware::Next,
-) -> Result<impl axum::response::IntoResponse, ac_service::errors::AcError> {
-    use ac_service::crypto;
-    use ac_service::errors::AcError;
-    use ac_service::repositories::signing_keys;
-
-    // Extract Authorization header
-    let auth_header = req
-        .headers()
-        .get("authorization")
-        .and_then(|h| h.to_str().ok())
-        .ok_or(AcError::InvalidToken(
-            "Missing Authorization header".to_string(),
-        ))?;
-
-    // Extract Bearer token
-    let token = auth_header
-        .strip_prefix("Bearer ")
-        .ok_or(AcError::InvalidToken(
-            "Invalid Authorization header format".to_string(),
-        ))?;
-
-    // Get active signing key for verification
-    let signing_key = signing_keys::get_active_key(&state.pool)
-        .await?
-        .ok_or_else(|| AcError::Crypto("No active signing key available".to_string()))?;
-
-    // Verify JWT
-    let claims = crypto::verify_jwt(token, &signing_key.public_key)?;
-
-    // Check if token has required scope (admin:services)
-    let required_scope = "admin:services";
-    let token_scopes: Vec<&str> = claims.scope.split_whitespace().collect();
-
-    if !token_scopes.contains(&required_scope) {
-        return Err(AcError::InsufficientScope {
-            required: required_scope.to_string(),
-            provided: token_scopes.iter().map(|s| s.to_string()).collect(),
-        });
-    }
-
-    // Store claims in request extensions for downstream handlers
-    req.extensions_mut().insert(claims);
-
-    // Continue to next handler
-    Ok(next.run(req).await)
-}
-
-async fn health_check() -> &'static str {
-    "OK"
 }
 
 #[cfg(test)]
