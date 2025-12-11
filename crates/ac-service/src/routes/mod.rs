@@ -228,3 +228,209 @@ async fn readiness_check(State(state): State<Arc<auth_handler::AppState>>) -> im
 async fn metrics_endpoint(State(handle): State<PrometheusHandle>) -> String {
     handle.render()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use sqlx::PgPool;
+
+    /// Test-only version of ReadinessResponse with owned strings for deserialization
+    #[derive(serde::Deserialize)]
+    struct ReadinessResponseOwned {
+        status: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        database: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        signing_key: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    }
+
+    #[tokio::test]
+    async fn test_health_check() {
+        let result = health_check().await;
+        assert_eq!(result, "OK");
+    }
+
+    #[test]
+    fn test_init_metrics_recorder_does_not_panic() {
+        // NOTE: init_metrics_recorder() can only succeed once per process
+        // due to global Prometheus recorder installation. Subsequent calls
+        // will return Err() once a recorder is installed.
+        //
+        // This test verifies the function doesn't panic, regardless of
+        // whether it succeeds or fails due to already-installed recorder.
+        let result = init_metrics_recorder();
+
+        // Either succeeds (first call in process) or fails gracefully
+        match result {
+            Ok(handle) => {
+                // Verify handle can render (basic smoke test)
+                let metrics = handle.render();
+                assert!(
+                    metrics.is_empty() || metrics.contains('#'),
+                    "Metrics should be empty or contain Prometheus format markers"
+                );
+            }
+            Err(e) => {
+                // Verify error message is descriptive
+                assert!(
+                    e.contains("Prometheus") || e.contains("install") || e.contains("bucket"),
+                    "Error message should mention Prometheus or installation: {}",
+                    e
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_metrics_endpoint() {
+        // Initialize metrics recorder (may fail if already installed in process)
+        let handle = match init_metrics_recorder() {
+            Ok(h) => h,
+            Err(_) => {
+                // If recorder already installed, we can't test this in isolation.
+                // This is expected when running multiple tests in the same process.
+                // The function is also covered by E2E tests in server_harness.
+                return;
+            }
+        };
+
+        // Call the endpoint handler
+        let result = metrics_endpoint(State(handle)).await;
+
+        // Verify metrics are in Prometheus text format
+        // Empty is valid (no metrics recorded yet)
+        // Non-empty should contain Prometheus format markers (# for comments/metadata)
+        assert!(
+            result.is_empty() || result.contains('#'),
+            "Metrics should be in Prometheus text format"
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_readiness_check_healthy(pool: PgPool) -> Result<(), anyhow::Error> {
+        use crate::services::key_management_service;
+        use ac_test_utils::crypto_fixtures::test_master_key;
+
+        // Initialize signing key so readiness check passes
+        let master_key = test_master_key();
+        key_management_service::initialize_signing_key(&pool, &master_key, "test-cluster").await?;
+
+        // Create app state
+        let config = Config {
+            database_url: String::new(),
+            bind_address: "127.0.0.1:0".to_string(),
+            master_key,
+            otlp_endpoint: None,
+        };
+        let state = Arc::new(auth_handler::AppState {
+            pool: pool.clone(),
+            config,
+        });
+
+        // Call readiness check - it returns impl IntoResponse
+        // We need to convert it to a response to inspect it
+        let response_impl = readiness_check(State(state)).await;
+
+        // Convert to HTTP response to extract status and body
+        use axum::response::IntoResponse;
+        let response = response_impl.into_response();
+
+        // Verify status code
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Extract and parse body
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        let body_str = String::from_utf8(body_bytes.to_vec())?;
+        let body: ReadinessResponseOwned = serde_json::from_str(&body_str)?;
+
+        // Verify response indicates healthy state
+        assert_eq!(body.status, "ready");
+        assert_eq!(body.database, Some("healthy".to_string()));
+        assert_eq!(body.signing_key, Some("available".to_string()));
+        assert_eq!(body.error, None);
+
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_readiness_check_no_signing_key(pool: PgPool) -> Result<(), anyhow::Error> {
+        // DO NOT initialize signing key - this simulates missing key scenario
+
+        // Create app state
+        let config = Config {
+            database_url: String::new(),
+            bind_address: "127.0.0.1:0".to_string(),
+            master_key: vec![0u8; 32], // Dummy key (won't be used)
+            otlp_endpoint: None,
+        };
+        let state = Arc::new(auth_handler::AppState {
+            pool: pool.clone(),
+            config,
+        });
+
+        // Call readiness check - it returns impl IntoResponse
+        let response_impl = readiness_check(State(state)).await;
+
+        // Convert to HTTP response to extract status and body
+        use axum::response::IntoResponse;
+        let response = response_impl.into_response();
+
+        // Verify status code
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        // Extract and parse body
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        let body_str = String::from_utf8(body_bytes.to_vec())?;
+        let body: ReadinessResponseOwned = serde_json::from_str(&body_str)?;
+
+        // Verify response indicates unhealthy state due to missing signing key
+        assert_eq!(body.status, "not_ready");
+        assert_eq!(body.database, Some("healthy".to_string()));
+        assert_eq!(body.signing_key, Some("unavailable".to_string()));
+        assert_eq!(
+            body.error,
+            Some("Service dependencies unavailable".to_string())
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_readiness_response_serialization() {
+        // Test healthy response serialization
+        let healthy = ReadinessResponse {
+            status: "ready",
+            database: Some("healthy"),
+            signing_key: Some("available"),
+            error: None,
+        };
+
+        let json = serde_json::to_string(&healthy).unwrap();
+        assert!(json.contains("\"status\":\"ready\""));
+        assert!(json.contains("\"database\":\"healthy\""));
+        assert!(json.contains("\"signing_key\":\"available\""));
+        // Error field should be omitted (skip_serializing_if)
+        assert!(!json.contains("\"error\""));
+
+        // Test unhealthy response serialization
+        let unhealthy = ReadinessResponse {
+            status: "not_ready",
+            database: Some("unhealthy"),
+            signing_key: None,
+            error: Some("Service dependencies unavailable".to_string()),
+        };
+
+        let json = serde_json::to_string(&unhealthy).unwrap();
+        assert!(json.contains("\"status\":\"not_ready\""));
+        assert!(json.contains("\"database\":\"unhealthy\""));
+        // signing_key is None, should be omitted
+        assert!(!json.contains("\"signing_key\""));
+        assert!(json.contains("\"error\":\"Service dependencies unavailable\""));
+    }
+
+    // Note: build_routes() is tested via E2E tests in ac-test-utils/server_harness.rs
+    // Integration testing with actual HTTP server is more appropriate for route assembly.
+}
