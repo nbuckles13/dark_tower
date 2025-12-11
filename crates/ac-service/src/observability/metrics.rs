@@ -167,7 +167,6 @@ pub fn record_audit_log_failure(event_type: &str, reason: &str) {
 ///
 /// Metric: `ac_errors_total`
 /// Labels: `operation`, `error_category`, `status_code`
-#[allow(dead_code)]
 pub fn record_error(operation: &str, error_category: &str, status_code: u16) {
     counter!("ac_errors_total",
         "operation" => operation.to_string(),
@@ -181,32 +180,128 @@ pub fn record_error(operation: &str, error_category: &str, status_code: u16) {
 mod tests {
     use super::*;
 
+    // Note: These tests execute the metric recording functions to ensure code coverage.
+    // The metrics crate will record to a global no-op recorder if none is installed,
+    // which is sufficient for coverage testing. We don't need to verify the actual
+    // metric values - that would require installing a test recorder from metrics-util.
+    //
+    // Per ADR-0002: These tests do not panic on missing recorder.
+
     #[test]
-    fn test_record_token_issuance_compiles() {
-        // Just verify the function compiles with correct types
-        // Actual metric recording requires a recorder to be installed
-        let _ = || {
-            record_token_issuance("client_credentials", "success", Duration::from_millis(250));
-        };
+    fn test_record_token_issuance() {
+        // Test with various grant types and statuses
+        record_token_issuance("client_credentials", "success", Duration::from_millis(250));
+        record_token_issuance("client_credentials", "error", Duration::from_millis(100));
+        record_token_issuance("authorization_code", "success", Duration::from_millis(300));
+        record_token_issuance("refresh_token", "error", Duration::from_millis(50));
     }
 
     #[test]
-    fn test_record_db_query_compiles() {
-        let _ = || {
-            record_db_query(
-                "select",
-                "service_credentials",
-                "success",
-                Duration::from_millis(5),
-            );
-        };
+    fn test_record_token_validation() {
+        // Test with and without error category
+        record_token_validation("success", None);
+        record_token_validation("error", Some("authentication"));
+        record_token_validation("error", Some("authorization"));
+        record_token_validation("error", Some("cryptographic"));
+        record_token_validation("error", Some("internal"));
     }
 
     #[test]
-    fn test_record_rate_limit_compiles() {
-        let _ = || {
-            record_rate_limit_decision("allowed");
-            record_rate_limit_decision("rejected");
-        };
+    fn test_record_key_rotation() {
+        // Test with success and error statuses
+        record_key_rotation("success");
+        record_key_rotation("error");
+    }
+
+    #[test]
+    fn test_set_signing_key_age_days() {
+        // Test with various age values
+        set_signing_key_age_days(0.0);
+        set_signing_key_age_days(15.5);
+        set_signing_key_age_days(30.0);
+        set_signing_key_age_days(90.0);
+    }
+
+    #[test]
+    fn test_set_active_signing_keys() {
+        // Test with various key counts
+        set_active_signing_keys(0);
+        set_active_signing_keys(1);
+        set_active_signing_keys(2);
+        set_active_signing_keys(5);
+    }
+
+    #[test]
+    fn test_set_key_rotation_last_success() {
+        // Test with various timestamps (Unix epoch seconds)
+        set_key_rotation_last_success(0.0);
+        set_key_rotation_last_success(1234567890.0);
+        set_key_rotation_last_success(1700000000.0);
+    }
+
+    #[test]
+    fn test_record_rate_limit_decision() {
+        // Test with allowed and rejected actions
+        record_rate_limit_decision("allowed");
+        record_rate_limit_decision("rejected");
+    }
+
+    #[test]
+    fn test_record_db_query() {
+        // Test with various operations, tables, and statuses
+        record_db_query(
+            "select",
+            "service_credentials",
+            "success",
+            Duration::from_millis(5),
+        );
+        record_db_query(
+            "insert",
+            "service_credentials",
+            "success",
+            Duration::from_millis(10),
+        );
+        record_db_query(
+            "update",
+            "signing_keys",
+            "success",
+            Duration::from_millis(7),
+        );
+        record_db_query("delete", "signing_keys", "error", Duration::from_millis(3));
+        record_db_query("select", "jwks_cache", "success", Duration::from_millis(2));
+    }
+
+    #[test]
+    fn test_record_bcrypt_duration() {
+        // Test with hash and verify operations
+        record_bcrypt_duration("hash", Duration::from_millis(150));
+        record_bcrypt_duration("verify", Duration::from_millis(120));
+        record_bcrypt_duration("hash", Duration::from_millis(200));
+    }
+
+    #[test]
+    fn test_record_jwks_request() {
+        // Test with various cache statuses
+        record_jwks_request("hit");
+        record_jwks_request("miss");
+        record_jwks_request("bypass");
+    }
+
+    #[test]
+    fn test_record_audit_log_failure() {
+        // Test with various event types and reasons
+        record_audit_log_failure("token_issued", "db_write_failed");
+        record_audit_log_failure("key_rotation", "encryption_failed");
+        record_audit_log_failure("authentication", "log_overflow");
+    }
+
+    #[test]
+    fn test_record_error() {
+        // Test with various operations, categories, and status codes
+        record_error("token_issuance", "authentication", 401);
+        record_error("token_issuance", "authorization", 403);
+        record_error("key_rotation", "cryptographic", 500);
+        record_error("db_query", "internal", 500);
+        record_error("rate_limit", "authorization", 429);
     }
 }
