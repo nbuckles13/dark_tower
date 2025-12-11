@@ -1,6 +1,7 @@
 use crate::crypto::{self, Claims, EncryptedKey};
 use crate::errors::AcError;
 use crate::models::{AuthEventType, TokenResponse};
+use crate::observability::hash_for_correlation;
 use crate::repositories::{auth_events, service_credentials, signing_keys};
 use chrono::Utc;
 use sqlx::PgPool;
@@ -51,9 +52,10 @@ pub async fn issue_service_token(
         .await?;
 
         if failed_count >= RATE_LIMIT_MAX_ATTEMPTS {
+            // ADR-0011: Log hashed client_id to prevent PII leakage while preserving correlation
             tracing::warn!(
-                "Account locked due to excessive failed attempts: client_id={}",
-                client_id
+                "Account locked due to excessive failed attempts: client_id_hash={}",
+                hash_for_correlation(client_id)
             );
             return Err(AcError::RateLimitExceeded);
         }

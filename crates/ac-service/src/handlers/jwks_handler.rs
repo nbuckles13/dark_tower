@@ -1,5 +1,6 @@
 use crate::errors::AcError;
 use crate::models::Jwks;
+use crate::observability::metrics::record_jwks_request;
 use crate::services::key_management_service;
 use axum::{
     extract::State,
@@ -7,6 +8,7 @@ use axum::{
     Json,
 };
 use std::sync::Arc;
+use tracing::instrument;
 
 use super::auth_handler::AppState;
 
@@ -16,10 +18,21 @@ use super::auth_handler::AppState;
 ///
 /// Returns all active public keys in JWKS format (RFC 7517)
 /// with Cache-Control header set to max-age=3600 (1 hour)
+///
+/// ADR-0011: Handler instrumented with skip_all to prevent PII leakage.
+#[instrument(name = "ac.jwks.get", skip_all, fields(cache_status = "miss", status))]
 pub async fn handle_get_jwks(
     State(state): State<Arc<AppState>>,
 ) -> Result<(HeaderMap, Json<Jwks>), AcError> {
-    let jwks = key_management_service::get_jwks(&state.pool).await?;
+    // Note: Cache status is always "miss" at the handler level.
+    // Upstream caches (CDN, browser) handle caching based on Cache-Control.
+    let result = key_management_service::get_jwks(&state.pool).await;
+
+    let status = if result.is_ok() { "success" } else { "error" };
+    tracing::Span::current().record("status", status);
+    record_jwks_request("miss"); // Handler always fetches from DB
+
+    let jwks = result?;
 
     // Add Cache-Control header to allow caching for 1 hour
     let mut headers = HeaderMap::new();

@@ -38,6 +38,15 @@ jsonwebtoken = { workspace = true }
 # Additional dependencies for auth controller
 base64 = "0.21"
 
+# Metrics (ADR-0011 Observability)
+metrics = "0.24"
+metrics-exporter-prometheus = "0.16"
+
+# For field hashing (ADR-0011 privacy)
+sha2 = "0.10"
+hmac = "0.12"
+hex = "0.4"
+
 # Local dependencies
 common = { path = "../common" }
 

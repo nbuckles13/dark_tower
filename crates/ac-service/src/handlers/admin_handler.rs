@@ -1,5 +1,7 @@
 use crate::errors::AcError;
 use crate::models::RegisterServiceResponse;
+use crate::observability::metrics::{record_error, record_key_rotation};
+use crate::observability::ErrorCategory;
 use crate::repositories::signing_keys;
 use crate::services::{key_management_service, registration_service};
 use axum::{
@@ -9,6 +11,7 @@ use axum::{
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use tracing::instrument;
 
 use super::auth_handler::AppState;
 
@@ -23,26 +26,55 @@ pub struct RegisterServiceRequest {
 /// POST /api/v1/admin/services/register
 ///
 /// Generates client_id and client_secret, stores in database
+///
+/// ADR-0011: Handler instrumented with skip_all to prevent PII leakage.
+/// Only safe fields (service_type, status) are recorded.
+#[instrument(
+    name = "ac.admin.register_service",
+    skip_all,
+    fields(service_type, status)
+)]
 pub async fn handle_register_service(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<RegisterServiceRequest>,
 ) -> Result<Json<RegisterServiceResponse>, AcError> {
+    // Record service_type for tracing (safe field per ADR-0011)
+    tracing::Span::current().record("service_type", &payload.service_type);
+
     // Validate service_type
     let valid_types = ["global-controller", "meeting-controller", "media-handler"];
     if !valid_types.contains(&payload.service_type.as_str()) {
-        return Err(AcError::Database(format!(
+        tracing::Span::current().record("status", "error");
+        let err = AcError::Database(format!(
             "Invalid service_type: '{}'. Must be one of: {}",
             payload.service_type,
             valid_types.join(", ")
-        )));
+        ));
+        record_error(
+            "register_service",
+            ErrorCategory::from(&err).as_str(),
+            err.status_code(),
+        );
+        return Err(err);
     }
 
     // Register the service
-    let response =
+    let result =
         registration_service::register_service(&state.pool, &payload.service_type, payload.region)
-            .await?;
+            .await;
 
-    Ok(Json(response))
+    let status = if result.is_ok() { "success" } else { "error" };
+    tracing::Span::current().record("status", status);
+
+    // ADR-0011: Record error category for failed requests
+    match result {
+        Ok(response) => Ok(Json(response)),
+        Err(ref e) => {
+            let category = ErrorCategory::from(e);
+            record_error("register_service", category.as_str(), e.status_code());
+            Err(result.unwrap_err())
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -65,6 +97,10 @@ pub struct RotateKeysResponse {
 ///
 /// SECURITY: Uses database transactions with SELECT FOR UPDATE to prevent
 /// TOCTOU race conditions in concurrent rotation requests.
+///
+/// ADR-0011: Handler instrumented with skip_all to prevent PII leakage.
+/// Only safe fields (forced, status) are recorded. client_id is NOT logged.
+#[instrument(name = "ac.admin.rotate_keys", skip_all, fields(forced, status))]
 pub async fn handle_rotate_keys(
     State(state): State<Arc<AppState>>,
     req: Request,
@@ -117,9 +153,15 @@ pub async fn handle_rotate_keys(
             now = %now,
             "Token signed with key outside validity window"
         );
-        return Err(AcError::InvalidToken(
-            "The access token is invalid or expired".to_string(),
-        ));
+        let err = AcError::InvalidToken("The access token is invalid or expired".to_string());
+        tracing::Span::current().record("status", "error");
+        record_key_rotation("error");
+        record_error(
+            "rotate_keys",
+            ErrorCategory::from(&err).as_str(),
+            err.status_code(),
+        );
+        return Err(err);
     }
 
     // Verify JWT and extract claims
@@ -137,9 +179,16 @@ pub async fn handle_rotate_keys(
             "Key rotation denied: user tokens cannot rotate keys"
         );
 
-        return Err(AcError::InvalidToken(
-            "User tokens are not authorized for key rotation".to_string(),
-        ));
+        let err =
+            AcError::InvalidToken("User tokens are not authorized for key rotation".to_string());
+        tracing::Span::current().record("status", "error");
+        record_key_rotation("error");
+        record_error(
+            "rotate_keys",
+            ErrorCategory::from(&err).as_str(),
+            err.status_code(),
+        );
+        return Err(err);
     }
 
     // Check for rotation scopes
@@ -160,10 +209,18 @@ pub async fn handle_rotate_keys(
             "Key rotation denied: insufficient scope"
         );
 
-        return Err(AcError::InsufficientScope {
+        let err = AcError::InsufficientScope {
             required: "service.rotate-keys.ac".to_string(),
             provided: token_scopes.iter().map(|s| s.to_string()).collect(),
-        });
+        };
+        tracing::Span::current().record("status", "error");
+        record_key_rotation("error");
+        record_error(
+            "rotate_keys",
+            ErrorCategory::from(&err).as_str(),
+            err.status_code(),
+        );
+        return Err(err);
     }
 
     // Get cluster name from environment, default to "default" for development
@@ -235,10 +292,19 @@ pub async fn handle_rotate_keys(
             );
 
             // SECURITY FIX: Use generic error message to avoid information leakage
-            return Err(AcError::TooManyRequests {
+            let err = AcError::TooManyRequests {
                 retry_after_seconds,
                 message: "Key rotation temporarily unavailable".to_string(),
-            });
+            };
+            tracing::Span::current().record("status", "error");
+            tracing::Span::current().record("forced", has_force_scope);
+            record_key_rotation("error");
+            record_error(
+                "rotate_keys",
+                ErrorCategory::from(&err).as_str(),
+                err.status_code(),
+            );
+            return Err(err);
         }
     }
 
@@ -293,6 +359,11 @@ pub async fn handle_rotate_keys(
         cluster_name = %cluster_name,
         "Key rotation successful"
     );
+
+    // ADR-0011: Record metrics and span fields
+    tracing::Span::current().record("forced", has_force_scope);
+    tracing::Span::current().record("status", "success");
+    record_key_rotation("success");
 
     Ok(Json(RotateKeysResponse {
         rotated: true,

@@ -39,6 +39,18 @@ pub enum AcError {
     Internal,
 }
 
+impl AcError {
+    /// Returns the HTTP status code for this error (ADR-0011: for metrics recording)
+    pub fn status_code(&self) -> u16 {
+        match self {
+            AcError::Database(_) | AcError::Crypto(_) | AcError::Internal => 500,
+            AcError::InvalidCredentials | AcError::InvalidToken(_) => 401,
+            AcError::InsufficientScope { .. } => 403,
+            AcError::RateLimitExceeded | AcError::TooManyRequests { .. } => 429,
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct ErrorResponse {
     error: ErrorDetail,

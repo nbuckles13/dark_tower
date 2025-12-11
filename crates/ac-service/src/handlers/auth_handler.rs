@@ -1,6 +1,8 @@
 use crate::config::Config;
 use crate::errors::AcError;
 use crate::models::TokenResponse;
+use crate::observability::metrics::{record_error, record_token_issuance};
+use crate::observability::ErrorCategory;
 use crate::services::token_service;
 use axum::{
     extract::{ConnectInfo, State},
@@ -12,6 +14,8 @@ use serde::Deserialize;
 use sqlx::PgPool;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Instant;
+use tracing::instrument;
 
 #[derive(Debug, Deserialize)]
 pub struct UserTokenRequest {
@@ -40,19 +44,42 @@ pub struct AppState {
 /// Handle user token request
 ///
 /// POST /api/v1/auth/user/token
+///
+/// ADR-0011: Handler instrumented with skip_all to prevent PII leakage.
+/// Only safe fields (grant_type, status) are recorded.
+#[instrument(
+    name = "ac.token.issue_user",
+    skip_all,
+    fields(grant_type = "password", status)
+)]
 pub async fn handle_user_token(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<UserTokenRequest>,
 ) -> Result<Json<TokenResponse>, AcError> {
-    let token = token_service::issue_user_token(
+    let start = Instant::now();
+
+    let result = token_service::issue_user_token(
         &state.pool,
         &state.config.master_key,
         &payload.username,
         &payload.password,
     )
-    .await?;
+    .await;
 
-    Ok(Json(token))
+    let duration = start.elapsed();
+    let status = if result.is_ok() { "success" } else { "error" };
+    tracing::Span::current().record("status", status);
+    record_token_issuance("password", status, duration);
+
+    // ADR-0011: Record error category for failed requests
+    match result {
+        Ok(token) => Ok(Json(token)),
+        Err(ref e) => {
+            let category = ErrorCategory::from(e);
+            record_error("issue_user_token", category.as_str(), e.status_code());
+            Err(result.unwrap_err())
+        }
+    }
 }
 
 /// Handle service token request (OAuth 2.0 Client Credentials)
@@ -62,19 +89,51 @@ pub async fn handle_user_token(
 /// Accepts credentials via:
 /// - HTTP Basic Auth (preferred)
 /// - Request body (client_id, client_secret)
+///
+/// ADR-0011: Handler instrumented with skip_all to prevent PII leakage.
+/// Only safe fields (grant_type, status) are recorded.
+#[instrument(
+    name = "ac.token.issue_service",
+    skip_all,
+    fields(grant_type = "client_credentials", status)
+)]
 pub async fn handle_service_token(
     State(state): State<Arc<AppState>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(payload): Json<ServiceTokenRequest>,
 ) -> Result<Json<TokenResponse>, AcError> {
+    let start = Instant::now();
+
     // Validate grant_type
     if payload.grant_type != "client_credentials" {
-        return Err(AcError::InvalidCredentials);
+        let duration = start.elapsed();
+        let err = AcError::InvalidCredentials;
+        tracing::Span::current().record("status", "error");
+        record_token_issuance("client_credentials", "error", duration);
+        record_error(
+            "issue_service_token",
+            ErrorCategory::from(&err).as_str(),
+            err.status_code(),
+        );
+        return Err(err);
     }
 
     // Extract client credentials from Basic Auth or request body
-    let (client_id, client_secret) = extract_client_credentials(&headers, &payload)?;
+    let (client_id, client_secret) = match extract_client_credentials(&headers, &payload) {
+        Ok(creds) => creds,
+        Err(e) => {
+            let duration = start.elapsed();
+            tracing::Span::current().record("status", "error");
+            record_token_issuance("client_credentials", "error", duration);
+            record_error(
+                "issue_service_token",
+                ErrorCategory::from(&e).as_str(),
+                e.status_code(),
+            );
+            return Err(e);
+        }
+    };
 
     // Extract IP address and User-Agent
     let ip_address = Some(addr.ip().to_string());
@@ -91,7 +150,7 @@ pub async fn handle_service_token(
     });
 
     // Issue token
-    let token = token_service::issue_service_token(
+    let result = token_service::issue_service_token(
         &state.pool,
         &state.config.master_key,
         &client_id,
@@ -101,9 +160,22 @@ pub async fn handle_service_token(
         ip_address.as_deref(),
         user_agent.as_deref(),
     )
-    .await?;
+    .await;
 
-    Ok(Json(token))
+    let duration = start.elapsed();
+    let status = if result.is_ok() { "success" } else { "error" };
+    tracing::Span::current().record("status", status);
+    record_token_issuance("client_credentials", status, duration);
+
+    // ADR-0011: Record error category for failed requests
+    match result {
+        Ok(token) => Ok(Json(token)),
+        Err(ref e) => {
+            let category = ErrorCategory::from(e);
+            record_error("issue_service_token", category.as_str(), e.status_code());
+            Err(result.unwrap_err())
+        }
+    }
 }
 
 /// Extract client credentials from Basic Auth header or request body
