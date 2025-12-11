@@ -7,24 +7,22 @@
 //! All instrumentation uses `#[instrument(skip_all)]` and explicit safe field allow-listing.
 //! Fields are categorized as:
 //! - **SAFE**: Can be logged in plaintext (enums, operation types)
-//! - **HASHED**: Must be SHA-256 hashed for correlation (client_id)
+//! - **HASHED**: Must be HMAC-SHA256 hashed for correlation (client_id)
 //! - **NEVER**: Must never appear in logs (secrets, tokens, keys)
 //!
-//! ## Phase 4 Implementation Note: HMAC Migration
+//! ## HMAC-SHA256 Correlation Hashing (ADR-0011 Section 3.4)
 //!
-//! ADR-0011 Section 3.4 specifies HMAC-SHA256 with per-service key for correlation hashing.
-//! The current implementation uses plain SHA-256, which provides:
-//! - ✅ Consistent correlation across log entries
-//! - ✅ One-way transformation (not reversible without brute force)
-//! - ⚠️ Vulnerable to rainbow table attacks if client_ids are enumerable
+//! The correlation hash function uses HMAC-SHA256 with per-service key to prevent
+//! rainbow table attacks:
+//! - ✅ Consistent correlation across log entries (same input = same hash)
+//! - ✅ One-way transformation (not reversible without secret key)
+//! - ✅ Resistant to rainbow table attacks (requires per-service secret)
+//! - ✅ `h:` prefix distinguishes HMAC hashes from legacy SHA-256 hashes
 //!
-//! **Phase 4 Remediation**: Migrate to HMAC-SHA256 with:
-//! - Per-service secret key loaded from environment (`AC_HASH_SECRET`)
-//! - 30-day key rotation capability
-//! - `h:` prefix to distinguish hashed values
-//!
-//! For development/testing (Phase 3), SHA-256 is sufficient as client_ids are
-//! not exposed to external attackers.
+//! **Configuration**:
+//! - Secret key loaded from `AC_HASH_SECRET` environment variable (base64-encoded)
+//! - Must be at least 32 bytes
+//! - Defaults to 32 zero bytes for tests (production MUST override)
 
 pub mod metrics;
 
@@ -33,30 +31,35 @@ pub mod metrics;
 #[allow(unused_imports)]
 pub use metrics::{record_jwks_request, record_key_rotation, record_token_issuance};
 
-use sha2::{Digest, Sha256};
+use ring::hmac;
 
-/// Hash a field value for correlation in logs (SHA-256, first 8 hex chars)
+/// Hash a field value for correlation in logs (HMAC-SHA256, first 8 hex chars)
 ///
 /// Used for fields like `client_id` that need correlation across log entries
 /// but should not be stored in plaintext.
 ///
 /// # Privacy
 ///
-/// This is NOT cryptographically secure for secrets - it's a one-way hash
-/// for correlation purposes only. The truncation to 8 chars provides
-/// sufficient uniqueness for debugging while limiting reversibility.
+/// Uses HMAC-SHA256 with per-service secret key (ADR-0011 Section 3.4) to prevent
+/// rainbow table attacks. The truncation to 8 hex chars provides sufficient
+/// uniqueness for debugging while limiting reversibility.
 ///
-/// # Phase 4 Migration
+/// # Implementation
 ///
-/// ADR-0011 specifies HMAC-SHA256 with per-service key. Current implementation
-/// uses plain SHA-256 which is sufficient for Phase 3 (development/testing).
-/// See module-level documentation for migration details.
-pub fn hash_for_correlation(value: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(value.as_bytes());
-    let result = hasher.finalize();
+/// - Uses `ring::hmac` for HMAC-SHA256
+/// - Prefixes output with `h:` to distinguish from legacy SHA-256 hashes
+/// - Truncates to 4 bytes (8 hex chars) for correlation
+///
+/// # Arguments
+///
+/// * `value` - The string to hash (e.g., client_id)
+/// * `secret` - The HMAC secret key (from config.hash_secret)
+pub fn hash_for_correlation(value: &str, secret: &[u8]) -> String {
+    let key = hmac::Key::new(hmac::HMAC_SHA256, secret);
+    let tag = hmac::sign(&key, value.as_bytes());
     // Take first 8 hex chars (32 bits) - enough for correlation, limits reversibility
-    hex::encode(&result[..4])
+    // Prefix with "h:" to distinguish from legacy SHA-256 hashes
+    format!("h:{}", hex::encode(&tag.as_ref()[..4]))
 }
 
 /// Error categories for metrics labels (bounded cardinality)
@@ -108,18 +111,21 @@ impl From<&crate::errors::AcError> for ErrorCategory {
 mod tests {
     use super::*;
 
+    // Test secret: 32 zero bytes (consistent with config.rs default)
+    const TEST_SECRET: &[u8] = &[0u8; 32];
+
     #[test]
     fn test_hash_for_correlation_consistency() {
         let value = "test-client-id";
-        let hash1 = hash_for_correlation(value);
-        let hash2 = hash_for_correlation(value);
+        let hash1 = hash_for_correlation(value, TEST_SECRET);
+        let hash2 = hash_for_correlation(value, TEST_SECRET);
         assert_eq!(hash1, hash2, "Same input should produce same hash");
     }
 
     #[test]
     fn test_hash_for_correlation_uniqueness() {
-        let hash1 = hash_for_correlation("client-a");
-        let hash2 = hash_for_correlation("client-b");
+        let hash1 = hash_for_correlation("client-a", TEST_SECRET);
+        let hash2 = hash_for_correlation("client-b", TEST_SECRET);
         assert_ne!(
             hash1, hash2,
             "Different inputs should produce different hashes"
@@ -128,8 +134,10 @@ mod tests {
 
     #[test]
     fn test_hash_for_correlation_length() {
-        let hash = hash_for_correlation("any-value");
-        assert_eq!(hash.len(), 8, "Hash should be 8 hex characters");
+        let hash = hash_for_correlation("any-value", TEST_SECRET);
+        // Length is 10: "h:" prefix (2) + 8 hex chars (8)
+        assert_eq!(hash.len(), 10, "Hash should be 'h:' + 8 hex characters");
+        assert!(hash.starts_with("h:"), "Hash should start with 'h:' prefix");
     }
 
     #[test]
@@ -202,35 +210,68 @@ mod tests {
     #[test]
     fn test_hash_for_correlation_empty_input() {
         // Edge case: empty string should produce consistent hash
-        let hash1 = hash_for_correlation("");
-        let hash2 = hash_for_correlation("");
+        let hash1 = hash_for_correlation("", TEST_SECRET);
+        let hash2 = hash_for_correlation("", TEST_SECRET);
         assert_eq!(hash1, hash2, "Empty string should produce consistent hash");
-        assert_eq!(hash1.len(), 8, "Hash should be 8 hex characters");
+        assert_eq!(hash1.len(), 10, "Hash should be 'h:' + 8 hex characters");
     }
 
     #[test]
     fn test_hash_for_correlation_unicode() {
         // Edge case: Unicode characters should be handled correctly
-        let hash = hash_for_correlation("日本語テスト");
-        assert_eq!(hash.len(), 8, "Unicode input should produce 8 hex chars");
+        let hash = hash_for_correlation("日本語テスト", TEST_SECRET);
+        assert_eq!(
+            hash.len(),
+            10,
+            "Unicode input should produce 'h:' + 8 hex chars"
+        );
+        assert!(hash.starts_with("h:"), "Hash should start with 'h:' prefix");
+        // Check the hex part after "h:"
+        let hex_part = &hash[2..];
         assert!(
-            hash.chars().all(|c| c.is_ascii_hexdigit()),
-            "Hash should only contain hex digits"
+            hex_part.chars().all(|c| c.is_ascii_hexdigit()),
+            "Hash should only contain hex digits after 'h:' prefix"
         );
     }
 
     #[test]
     fn test_hash_for_correlation_hex_format() {
-        // Verify output is valid lowercase hex
-        let hash = hash_for_correlation("test-value");
+        // Verify output is valid lowercase hex with h: prefix
+        let hash = hash_for_correlation("test-value", TEST_SECRET);
+        assert!(hash.starts_with("h:"), "Hash should start with 'h:' prefix");
+        let hex_part = &hash[2..];
         assert!(
-            hash.chars().all(|c| c.is_ascii_hexdigit()),
-            "Hash should only contain hex digits"
+            hex_part.chars().all(|c| c.is_ascii_hexdigit()),
+            "Hash should only contain hex digits after 'h:' prefix"
         );
         assert!(
-            hash.chars()
+            hex_part
+                .chars()
                 .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()),
             "Hash should be lowercase hex"
+        );
+    }
+
+    #[test]
+    fn test_hash_for_correlation_hmac_consistency() {
+        // Verify HMAC produces consistent output for same secret
+        let value = "test-client-id";
+        let hash1 = hash_for_correlation(value, TEST_SECRET);
+        let hash2 = hash_for_correlation(value, TEST_SECRET);
+        assert_eq!(hash1, hash2, "HMAC should produce consistent hashes");
+    }
+
+    #[test]
+    fn test_hash_for_correlation_different_secrets() {
+        // Verify different secrets produce different hashes
+        let value = "test-client-id";
+        let secret1 = [0u8; 32];
+        let secret2 = [1u8; 32];
+        let hash1 = hash_for_correlation(value, &secret1);
+        let hash2 = hash_for_correlation(value, &secret2);
+        assert_ne!(
+            hash1, hash2,
+            "Different secrets should produce different hashes"
         );
     }
 }

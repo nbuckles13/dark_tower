@@ -153,6 +153,7 @@ pub async fn handle_service_token(
     let result = token_service::issue_service_token(
         &state.pool,
         &state.config.master_key,
+        &state.config.hash_secret,
         &client_id,
         &client_secret,
         &payload.grant_type,

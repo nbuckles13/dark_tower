@@ -322,7 +322,8 @@ mod tests {
         let config = Config {
             database_url: String::new(),
             bind_address: "127.0.0.1:0".to_string(),
-            master_key,
+            master_key: master_key.clone(),
+            hash_secret: master_key.clone(),
             otlp_endpoint: None,
         };
         let state = Arc::new(auth_handler::AppState {
@@ -363,7 +364,8 @@ mod tests {
         let config = Config {
             database_url: String::new(),
             bind_address: "127.0.0.1:0".to_string(),
-            master_key: vec![0u8; 32], // Dummy key (won't be used)
+            master_key: vec![0u8; 32],  // Dummy key (won't be used)
+            hash_secret: vec![0u8; 32], // Dummy hash secret for tests
             otlp_endpoint: None,
         };
         let state = Arc::new(auth_handler::AppState {

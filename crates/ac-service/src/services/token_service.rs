@@ -25,6 +25,7 @@ const MAX_TIMING_VARIANCE_PERCENT: f64 = 30.0; // Timing attack tolerance thresh
 pub async fn issue_service_token(
     pool: &PgPool,
     master_key: &[u8],
+    hash_secret: &[u8],
     client_id: &str,
     client_secret: &str,
     grant_type: &str,
@@ -55,7 +56,7 @@ pub async fn issue_service_token(
             // ADR-0011: Log hashed client_id to prevent PII leakage while preserving correlation
             tracing::warn!(
                 "Account locked due to excessive failed attempts: client_id_hash={}",
-                hash_for_correlation(client_id)
+                hash_for_correlation(client_id, hash_secret)
             );
             return Err(AcError::RateLimitExceeded);
         }
@@ -229,6 +230,7 @@ mod tests {
         let _ = issue_service_token(
             &pool,
             &master_key,
+            &master_key,
             "valid-client",
             "wrong-password",
             "client_credentials",
@@ -243,6 +245,7 @@ mod tests {
         let start = Instant::now();
         let _ = issue_service_token(
             &pool,
+            &master_key,
             &master_key,
             "nonexistent-client",
             "some-password",
@@ -308,6 +311,7 @@ mod tests {
         let invalid_client_result = issue_service_token(
             &pool,
             &master_key,
+            &master_key,
             "nonexistent-client",
             "some-password",
             "client_credentials",
@@ -320,6 +324,7 @@ mod tests {
         // Test valid client_id with wrong password
         let wrong_password_result = issue_service_token(
             &pool,
+            &master_key,
             &master_key,
             "valid-client",
             "wrong-password",
@@ -366,6 +371,7 @@ mod tests {
             let _ = issue_service_token(
                 &pool,
                 &master_key,
+                &master_key,
                 "test-client",
                 "wrong-password",
                 "client_credentials",
@@ -379,6 +385,7 @@ mod tests {
         // 6th attempt should be rate limited
         let result = issue_service_token(
             &pool,
+            &master_key,
             &master_key,
             "test-client",
             "wrong-password",
@@ -394,6 +401,7 @@ mod tests {
         // Even with correct password, should still be locked
         let result = issue_service_token(
             &pool,
+            &master_key,
             &master_key,
             "test-client",
             valid_secret,
@@ -438,6 +446,7 @@ mod tests {
             let _ = issue_service_token(
                 &pool,
                 &master_key,
+                &master_key,
                 "test-client-window",
                 "wrong-password",
                 "client_credentials",
@@ -451,6 +460,7 @@ mod tests {
         // Should NOT be locked (only 3 failures)
         let result = issue_service_token(
             &pool,
+            &master_key,
             &master_key,
             "test-client-window",
             "wrong-password",
@@ -490,6 +500,7 @@ mod tests {
         // Attempt to request unauthorized scope
         let result = issue_service_token(
             &pool,
+            &master_key,
             &master_key,
             "limited-client",
             valid_secret,
@@ -535,6 +546,7 @@ mod tests {
         let result = issue_service_token(
             &pool,
             &master_key,
+            &master_key,
             "multi-scope-client",
             valid_secret,
             "client_credentials",
@@ -576,6 +588,7 @@ mod tests {
         let result = issue_service_token(
             &pool,
             &master_key,
+            &master_key,
             "deactivated-client",
             valid_secret,
             "client_credentials",
@@ -613,6 +626,7 @@ mod tests {
         let result = issue_service_token(
             &pool,
             &master_key,
+            &master_key,
             "test-grant-client",
             valid_secret,
             "password", // Wrong grant type
@@ -648,6 +662,7 @@ mod tests {
 
         let result = issue_service_token(
             &pool,
+            &master_key,
             &master_key,
             "success-client",
             valid_secret,
@@ -706,6 +721,7 @@ mod tests {
         // Issue a valid token
         let token_response = issue_service_token(
             &pool,
+            &master_key,
             &master_key,
             "tamper-client",
             valid_secret,
@@ -829,6 +845,7 @@ mod tests {
         let token_response = issue_service_token(
             &pool,
             &master_key,
+            &master_key,
             "sig-strip-client",
             valid_secret,
             "client_credentials",
@@ -884,6 +901,7 @@ mod tests {
         // Issue a valid token with EdDSA
         let token_response = issue_service_token(
             &pool,
+            &master_key,
             &master_key,
             "alg-conf-client",
             valid_secret,
@@ -957,6 +975,7 @@ mod tests {
         // Issue a valid token first
         let token_response = issue_service_token(
             &pool,
+            &master_key,
             &master_key,
             "none-alg-client",
             valid_secret,
@@ -1423,6 +1442,7 @@ mod tests {
         let token_response = issue_service_token(
             &pool,
             &master_key,
+            &master_key,
             "alg-mismatch-client",
             valid_secret,
             "client_credentials",
@@ -1586,6 +1606,7 @@ mod tests {
 
         let token_response = issue_service_token(
             &pool,
+            &master_key,
             &master_key,
             "kid-test-client",
             valid_secret,
@@ -1774,6 +1795,7 @@ mod tests {
         // Issue a valid token
         let token_response = issue_service_token(
             &pool,
+            &master_key,
             &master_key,
             "sub-tamper-client",
             valid_secret,
@@ -2014,6 +2036,7 @@ mod tests {
             let result = issue_service_token(
                 &pool,
                 &master_key,
+                &master_key,
                 client_id,
                 password,
                 "client_credentials",
@@ -2109,6 +2132,7 @@ mod tests {
         let invalid_client_result = issue_service_token(
             &pool,
             &master_key,
+            &master_key,
             "nonexistent-client",
             "any-password",
             "client_credentials",
@@ -2120,6 +2144,7 @@ mod tests {
 
         let invalid_password_result = issue_service_token(
             &pool,
+            &master_key,
             &master_key,
             "valid-client",
             "wrong-password",

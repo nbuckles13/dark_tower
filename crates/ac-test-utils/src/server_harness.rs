@@ -68,7 +68,8 @@ impl TestAuthServer {
         let config = Config {
             database_url: String::new(), // Not used after connection established
             bind_address: "127.0.0.1:0".to_string(),
-            master_key,
+            master_key: master_key.clone(),
+            hash_secret: master_key.clone(), // Use same as master_key for tests
             otlp_endpoint: None,
         };
 
@@ -167,12 +168,13 @@ impl TestAuthServer {
         let scopes_vec: Vec<String> = scopes.iter().map(|s| s.to_string()).collect();
 
         // Register service credential
+        // Use 'global-controller' as it's a valid service_type per DB constraint
         service_credentials::create_service_credential(
             &self.pool,
             client_id,
             &client_secret_hash,
-            "test-service", // service_type
-            None,           // region
+            "global-controller", // service_type (must be valid per DB constraint)
+            None,                // region
             &scopes_vec,
         )
         .await?;
@@ -181,6 +183,7 @@ impl TestAuthServer {
         let token_response = token_service::issue_service_token(
             &self.pool,
             &self.config.master_key,
+            &self.config.hash_secret,
             client_id,
             client_secret,
             "client_credentials", // grant_type
