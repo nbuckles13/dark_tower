@@ -29,7 +29,9 @@ pub mod metrics;
 // Re-exports for handler-level instrumentation (Phase 3)
 // These are used by the handlers module but clippy doesn't see cross-module usage
 #[allow(unused_imports)]
-pub use metrics::{record_jwks_request, record_key_rotation, record_token_issuance};
+pub use metrics::{
+    record_http_request, record_jwks_request, record_key_rotation, record_token_issuance,
+};
 
 use ring::hmac;
 

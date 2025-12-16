@@ -8,6 +8,7 @@ This directory contains integration and end-to-end tests for the Authentication 
 tests/
 ├── common/              # Shared test utilities (re-exports from ac-test-utils)
 ├── integration/         # Integration tests (service layer, real DB, no HTTP)
+├── fault_injection/     # Fault injection tests (simulated failures via code)
 ├── e2e/                # End-to-end tests (full HTTP stack)
 └── migrations/         # Migration validation tests
 ```
@@ -84,6 +85,17 @@ open target/llvm-cov/html/index.html
 - Validate schema correctness
 - Test migration idempotency
 - Verify constraints and indexes
+
+### Fault Injection Tests (`tests/fault_injection/`)
+- **Programmatic** fault simulation within the application
+- Uses `pool.close()` to simulate database unavailability
+- Tests concurrent operations under stress
+- Validates resilience behavior (readiness probes, graceful degradation)
+
+**NOTE**: These are NOT infrastructure-level chaos tests. For true chaos testing
+(stopping containers, network partitions, resource exhaustion), ADR-0012 specifies
+**LitmusChaos** for Kubernetes-native chaos experiments. Those tests will live in
+`infra/chaos/` when implemented.
 
 ## Test Utilities
 

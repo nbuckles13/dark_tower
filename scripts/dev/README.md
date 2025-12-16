@@ -87,7 +87,7 @@ Populate the database with sample service credentials for manual testing.
 ./scripts/dev/seed-test-data.sh
 ```
 
-**Created credentials:**
+**Created credentials (docker-compose):**
 
 | client_id | client_secret |
 |-----------|---------------|
@@ -97,6 +97,85 @@ Populate the database with sample service credentials for manual testing.
 | `test-client` | `test-client-secret-dev-999` |
 
 > **Note:** These are development-only credentials with bcrypt cost factor 12
+
+### 4. kind Cluster Credentials (pre-seeded)
+
+If you're using the kind cluster setup (`infra/kind/scripts/setup.sh`), the same test credentials are automatically seeded during cluster creation:
+
+**Kind cluster credentials (auto-seeded):**
+
+| client_id | client_secret |
+|-----------|---------------|
+| `global-controller` | `global-controller-secret-dev-001` |
+| `meeting-controller` | `meeting-controller-secret-dev-002` |
+| `media-handler` | `media-handler-secret-dev-003` |
+| `test-client` | `test-client-secret-dev-999` |
+
+**No manual seeding required** - credentials are inserted during `./infra/kind/scripts/setup.sh`
+
+To test token issuance against the kind cluster:
+
+```bash
+# 1. Ensure kind cluster is running
+kubectl get pods -n dark-tower
+
+# 2. Deploy or run AC service
+skaffold dev
+# OR run locally:
+export DATABASE_URL="postgresql://darktower:dev_password_change_in_production@localhost:5432/dark_tower"
+export AC_MASTER_KEY="$(./scripts/generate-master-key.sh)"
+cargo run --bin ac-service
+
+# 3. Get a token
+curl -X POST http://localhost:8082/api/v1/auth/service/token \
+  -H 'Content-Type: application/x-www-form-urlencoded' \
+  -d 'grant_type=client_credentials' \
+  -d 'client_id=test-client' \
+  -d 'client_secret=test-client-secret-dev-999'
+```
+
+### 5. iterate.sh - Telepresence Local Development
+
+Run services locally while connected to the kind cluster. This enables a fast edit-run-test cycle with production-like infrastructure.
+
+**Prerequisites:**
+1. Kind cluster running: `./infra/kind/scripts/setup.sh`
+2. Telepresence CLI installed: https://www.telepresence.io/docs/latest/install/
+
+**Quick install Telepresence (Linux):**
+```bash
+curl -fsSL https://app.getambassador.io/download/tel2/linux/amd64/latest/telepresence -o /tmp/telepresence
+sudo install -m 755 /tmp/telepresence /usr/local/bin/telepresence
+```
+
+**Usage:**
+```bash
+# Run AC service locally (replaces in-cluster pods)
+./scripts/dev/iterate.sh ac
+
+# Press Ctrl+C to stop and restore cluster state
+```
+
+**What it does:**
+1. Scales down in-cluster StatefulSet to 0 replicas
+2. Connects to cluster via Telepresence
+3. Sets environment variables for local development
+4. Runs `cargo run --bin ac-service` on your machine
+5. On Ctrl+C: cleans up and restores in-cluster pods
+
+**Available services:**
+| Key | Service | Port |
+|-----|---------|------|
+| `ac` | Auth Controller | 8082 |
+| `gc` | Global Controller | 8080 (skeleton) |
+| `mc` | Meeting Controller | 8081 (skeleton) |
+| `mh` | Media Handler | 8083 (skeleton) |
+
+**Workflow benefits:**
+- Fast iteration: no container build cycle
+- Real infrastructure: PostgreSQL, Redis, Prometheus in cluster
+- Metrics visible: Grafana scrapes your local service
+- Hot reload: restart with `cargo run` (no cluster changes needed)
 
 ## Common Workflows
 
@@ -115,7 +194,7 @@ export AC_MASTER_KEY="AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
 cargo run --bin ac-service
 ```
 
-### Daily Development
+### Daily Development (docker-compose)
 
 ```bash
 # Start infrastructure (if not already running)
@@ -123,6 +202,31 @@ cargo run --bin ac-service
 
 # In another terminal, start AC service
 ./scripts/dev/start-local-stack.sh --start-service
+```
+
+### Daily Development (kind cluster) - RECOMMENDED
+
+```bash
+# First time: Create cluster with all infrastructure
+./infra/kind/scripts/setup.sh
+
+# AC service is already running in-cluster!
+# Get a token immediately:
+curl -X POST http://localhost:8082/api/v1/auth/service/token \
+  -H 'Content-Type: application/x-www-form-urlencoded' \
+  -d 'grant_type=client_credentials' \
+  -d 'client_id=test-client' \
+  -d 'client_secret=test-client-secret-dev-999'
+
+# To iterate locally with fast edit-run cycle:
+./scripts/dev/iterate.sh ac
+# Make changes, Ctrl+C, repeat
+
+# Cluster persists between sessions
+# Only need to re-run setup.sh if you:
+#   - Deleted the cluster (teardown.sh)
+#   - Rebooted your machine
+#   - Changed infrastructure config
 ```
 
 ### Testing Migration Changes

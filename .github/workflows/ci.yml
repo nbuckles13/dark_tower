@@ -53,6 +53,9 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      - name: Lint Grafana dashboards
+        run: ./scripts/lint-grafana-dashboards.sh
+
       - name: Run Clippy
         run: cargo clippy --workspace --lib --bins -- -D warnings
 

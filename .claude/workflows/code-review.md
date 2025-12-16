@@ -312,7 +312,14 @@ If specialists disagree:
 - Metrics coverage
 - Trace span coverage
 - SLO impact
+- Dashboard validation (if applicable)
 - Recommendations
+
+#### Dashboard Validation Checklist (if PR includes dashboard changes)
+- [ ] Dashboard metric queries match service metrics catalog (`docs/observability/metrics/`)
+- [ ] Dashboard job labels match Prometheus scrape targets (e.g., `ac-service-local` for local dev)
+- [ ] Dashboard works in both local development and cloud environments
+- [ ] No placeholder or generic metric names (see PRR-0001)
 
 ### Operations Review (if ops-related)
 [Operations Specialist findings summary]

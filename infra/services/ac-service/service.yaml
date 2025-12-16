@@ -16,4 +16,8 @@ spec:
     protocol: TCP
     port: 443
     targetPort: 8082
+  - name: http
+    protocol: TCP
+    port: 8082
+    targetPort: 8082
   sessionAffinity: None

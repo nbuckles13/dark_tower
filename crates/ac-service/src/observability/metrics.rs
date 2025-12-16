@@ -176,6 +176,61 @@ pub fn record_error(operation: &str, error_category: &str, status_code: u16) {
     .increment(1);
 }
 
+// ============================================================================
+// HTTP Request Metrics
+// ============================================================================
+
+/// Record HTTP request completion
+///
+/// Metric: `ac_http_requests_total`, `ac_http_request_duration_seconds`
+/// Labels: `method`, `path`, `status_code`
+///
+/// This captures ALL HTTP responses including framework-level errors like:
+/// - 415 Unsupported Media Type (wrong Content-Type)
+/// - 400 Bad Request (JSON parse errors)
+/// - 404 Not Found
+/// - 405 Method Not Allowed
+pub fn record_http_request(method: &str, path: &str, status_code: u16, duration: Duration) {
+    // Normalize path to prevent cardinality explosion
+    // Replace UUIDs and numeric IDs with placeholders
+    let normalized_path = normalize_path(path);
+
+    histogram!("ac_http_request_duration_seconds",
+        "method" => method.to_string(),
+        "path" => normalized_path.clone(),
+        "status_code" => status_code.to_string()
+    )
+    .record(duration.as_secs_f64());
+
+    counter!("ac_http_requests_total",
+        "method" => method.to_string(),
+        "path" => normalized_path,
+        "status_code" => status_code.to_string()
+    )
+    .increment(1);
+}
+
+/// Normalize path to prevent label cardinality explosion
+///
+/// Replaces dynamic segments (UUIDs, numeric IDs) with placeholders.
+fn normalize_path(path: &str) -> String {
+    // Simple normalization: keep known paths, replace others with pattern
+    // This prevents unbounded cardinality from dynamic path segments
+    match path {
+        "/" => "/".to_string(),
+        "/health" => "/health".to_string(),
+        "/ready" => "/ready".to_string(),
+        "/metrics" => "/metrics".to_string(),
+        "/.well-known/jwks.json" => "/.well-known/jwks.json".to_string(),
+        "/api/v1/auth/service/token" => "/api/v1/auth/service/token".to_string(),
+        "/api/v1/auth/user/token" => "/api/v1/auth/user/token".to_string(),
+        "/api/v1/admin/services/register" => "/api/v1/admin/services/register".to_string(),
+        "/internal/rotate-keys" => "/internal/rotate-keys".to_string(),
+        // For unknown paths, use a generic label to bound cardinality
+        _ => "/other".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -303,5 +358,88 @@ mod tests {
         record_error("key_rotation", "cryptographic", 500);
         record_error("db_query", "internal", 500);
         record_error("rate_limit", "authorization", 429);
+    }
+
+    #[test]
+    fn test_record_http_request() {
+        // Test successful requests
+        record_http_request(
+            "GET",
+            "/.well-known/jwks.json",
+            200,
+            Duration::from_millis(50),
+        );
+        record_http_request(
+            "POST",
+            "/api/v1/auth/service/token",
+            200,
+            Duration::from_millis(250),
+        );
+
+        // Test client errors (including framework-level errors)
+        record_http_request(
+            "POST",
+            "/api/v1/auth/service/token",
+            400,
+            Duration::from_millis(5),
+        );
+        record_http_request(
+            "POST",
+            "/api/v1/auth/service/token",
+            415,
+            Duration::from_millis(2),
+        );
+        record_http_request("GET", "/not-found", 404, Duration::from_millis(1));
+        record_http_request(
+            "DELETE",
+            "/api/v1/auth/service/token",
+            405,
+            Duration::from_millis(1),
+        );
+
+        // Test server errors
+        record_http_request(
+            "POST",
+            "/api/v1/auth/service/token",
+            500,
+            Duration::from_millis(100),
+        );
+    }
+
+    #[test]
+    fn test_normalize_path_known_paths() {
+        assert_eq!(normalize_path("/"), "/");
+        assert_eq!(normalize_path("/health"), "/health");
+        assert_eq!(normalize_path("/ready"), "/ready");
+        assert_eq!(normalize_path("/metrics"), "/metrics");
+        assert_eq!(
+            normalize_path("/.well-known/jwks.json"),
+            "/.well-known/jwks.json"
+        );
+        assert_eq!(
+            normalize_path("/api/v1/auth/service/token"),
+            "/api/v1/auth/service/token"
+        );
+        assert_eq!(
+            normalize_path("/api/v1/auth/user/token"),
+            "/api/v1/auth/user/token"
+        );
+        assert_eq!(
+            normalize_path("/api/v1/admin/services/register"),
+            "/api/v1/admin/services/register"
+        );
+        assert_eq!(
+            normalize_path("/internal/rotate-keys"),
+            "/internal/rotate-keys"
+        );
+    }
+
+    #[test]
+    fn test_normalize_path_unknown_paths() {
+        // Unknown paths should be normalized to "/other" to bound cardinality
+        assert_eq!(normalize_path("/unknown"), "/other");
+        assert_eq!(normalize_path("/api/v2/something"), "/other");
+        assert_eq!(normalize_path("/users/123"), "/other");
+        assert_eq!(normalize_path("/api/v1/auth/service/token/extra"), "/other");
     }
 }

@@ -1,5 +1,6 @@
 use crate::handlers::{admin_handler, auth_handler, jwks_handler};
 use crate::middleware::auth::{require_admin_scope, AuthMiddlewareState};
+use crate::middleware::http_metrics::http_metrics_middleware;
 use crate::repositories::signing_keys;
 use axum::{
     extract::State,
@@ -114,6 +115,10 @@ pub fn build_routes(
         .with_state(state);
 
     // Merge routes with global layers
+    // Layer order (bottom-to-top execution):
+    // 1. TimeoutLayer - Timeout the request (innermost)
+    // 2. TraceLayer - Log request details
+    // 3. http_metrics_middleware - Record ALL responses (outermost)
     admin_routes
         .merge(internal_routes)
         .merge(metrics_routes)
@@ -121,6 +126,9 @@ pub fn build_routes(
         .layer(TraceLayer::new_for_http())
         // ADR-0012: 30s HTTP request timeout to prevent hung connections
         .layer(TimeoutLayer::new(Duration::from_secs(30)))
+        // HTTP metrics layer (outermost) - captures ALL responses including
+        // framework-level errors like 415, 400, 404, 405
+        .layer(middleware::from_fn(http_metrics_middleware))
 }
 
 /// Liveness probe - returns OK if the process is running
