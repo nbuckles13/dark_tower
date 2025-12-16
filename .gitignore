@@ -51,6 +51,9 @@ out/
 # Testing
 coverage/
 .nyc_output/
+lcov.info
+*.profraw
+*.profdata
 
 # Terraform
 .terraform/
