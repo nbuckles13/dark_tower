@@ -2,6 +2,9 @@
 # Multi-Stage Dockerfile for AC Service
 # ========================================
 #
+# Uses cargo-chef for efficient dependency caching in Docker builds.
+# https://github.com/LukeMathWalker/cargo-chef
+#
 # Build targets:
 #   - Default: Minimal distroless (production-ready, no HEALTHCHECK)
 #   - runtime-with-healthcheck: Debug distroless (includes HEALTHCHECK, for testing)
@@ -11,9 +14,11 @@
 #   docker build -t ac-service:debug --target runtime-with-healthcheck .
 
 # ========================================
-# Stage 1: Builder
+# Stage 1: Chef base (install cargo-chef)
 # ========================================
-FROM rust:1.83-slim AS builder
+FROM docker.io/library/rust:1.91-slim AS chef
+
+RUN cargo install cargo-chef
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y \
@@ -21,50 +26,41 @@ RUN apt-get update && apt-get install -y \
     libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Set working directory
 WORKDIR /build
 
-# Copy workspace configuration
-COPY Cargo.toml Cargo.lock ./
+# ========================================
+# Stage 2: Planner (generate recipe.json)
+# ========================================
+FROM chef AS planner
 
-# Copy all crate manifests to establish workspace structure
-COPY crates/ac-service/Cargo.toml ./crates/ac-service/
-COPY crates/common/Cargo.toml ./crates/common/
-COPY crates/ac-test-utils/Cargo.toml ./crates/ac-test-utils/
+# Copy entire project to generate dependency recipe
+COPY . .
 
-# Create dummy source files to cache dependencies
-RUN mkdir -p crates/ac-service/src \
-    && echo "fn main() {}" > crates/ac-service/src/main.rs \
-    && echo "pub fn dummy() {}" > crates/ac-service/src/lib.rs \
-    && mkdir -p crates/common/src \
-    && echo "pub fn dummy() {}" > crates/common/src/lib.rs \
-    && mkdir -p crates/ac-test-utils/src \
-    && echo "pub fn dummy() {}" > crates/ac-test-utils/src/lib.rs
+# Generate recipe.json - captures all dependency information
+RUN cargo chef prepare --recipe-path recipe.json
 
-# Build dependencies only (this layer will be cached)
-RUN cargo build --release --package ac-service
+# ========================================
+# Stage 3: Builder (build with cached deps)
+# ========================================
+FROM chef AS builder
 
-# Remove dummy files and artifacts
-RUN rm -rf crates/*/src target/release/.fingerprint/ac-service-* \
-    target/release/.fingerprint/common-* \
-    target/release/.fingerprint/ac-test-utils-*
+# Copy recipe from planner stage
+COPY --from=planner /build/recipe.json recipe.json
+
+# Build dependencies only - this layer is cached unless Cargo.toml/Cargo.lock change
+RUN cargo chef cook --release --recipe-path recipe.json --package ac-service
 
 # Copy actual source code
-COPY crates/ac-service/src ./crates/ac-service/src
-COPY crates/common/src ./crates/common/src
-COPY crates/ac-test-utils/src ./crates/ac-test-utils/src
+COPY . .
 
-# Copy migrations directory for runtime schema initialization
-COPY migrations ./migrations
-
-# Build the actual application with release optimizations
+# Build the application (dependencies are already cached)
 RUN cargo build --release --package ac-service
 
 # Strip debug symbols to reduce binary size
 RUN strip target/release/auth-controller
 
 # ========================================
-# Stage 2: Minimal Production Runtime (Default)
+# Stage 4: Minimal Production Runtime (Default)
 # ========================================
 FROM gcr.io/distroless/cc-debian12 AS runtime
 
@@ -120,7 +116,7 @@ ENV RUST_LOG=info \
 ENTRYPOINT ["/usr/local/bin/auth-controller"]
 
 # ========================================
-# Stage 3: Debug Runtime with HEALTHCHECK (Optional)
+# Stage 5: Debug Runtime with HEALTHCHECK (Optional)
 # ========================================
 FROM gcr.io/distroless/cc-debian12:debug AS runtime-with-healthcheck
 

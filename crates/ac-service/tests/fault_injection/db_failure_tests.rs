@@ -1,4 +1,10 @@
-//! Chaos tests for database connection loss scenarios
+//! Fault injection tests for database connection loss scenarios
+//!
+//! These are **programmatic fault injection tests** that use `pool.close()` to
+//! simulate database unavailability within the application.
+//!
+//! NOTE: For true infrastructure-level chaos tests (stopping PostgreSQL container,
+//! network partitions, etc.), see ADR-0012 which specifies LitmusChaos.
 //!
 //! These tests validate that the AC service handles database unavailability gracefully:
 //! - Readiness probe returns 503 when DB is unavailable

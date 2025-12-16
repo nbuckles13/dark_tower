@@ -152,17 +152,28 @@ async fn shutdown_signal() {
         _ = terminate => {}
     }
 
-    // ADR-0012: 30s drain period for graceful shutdown
+    // ADR-0012: Graceful shutdown drain period
     // K8s sends SIGTERM, then waits terminationGracePeriodSeconds (35s in our StatefulSet)
-    // We use 30s here to allow 5s buffer for final cleanup
+    // We use 30s in production to allow 5s buffer for final cleanup
     //
     // During this period:
     // - axum stops accepting new connections (handled by with_graceful_shutdown)
     // - Existing connections are allowed to complete
     // - K8s removes us from service endpoints (readiness probe fails after SIGTERM)
-    warn!("Draining connections for 30 seconds...");
-    tokio::time::sleep(Duration::from_secs(30)).await;
-    info!("Drain period complete");
+    //
+    // For local development, use AC_DRAIN_SECONDS=0 to exit immediately
+    let drain_secs: u64 = std::env::var("AC_DRAIN_SECONDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(30);
+
+    if drain_secs > 0 {
+        warn!("Draining connections for {} seconds...", drain_secs);
+        tokio::time::sleep(Duration::from_secs(drain_secs)).await;
+        info!("Drain period complete");
+    } else {
+        info!("Skipping drain period (AC_DRAIN_SECONDS=0)");
+    }
 }
 
 /// Adds statement_timeout to the database URL

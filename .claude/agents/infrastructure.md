@@ -289,6 +289,7 @@ spec:
 - **Database**: They define data architecture, you provide platform
 - **Security**: They define security requirements, you implement infrastructure controls
 - **Observability**: They define metrics, you ensure infrastructure exposes them
+  - **Dashboard Requirement**: When creating or modifying Grafana dashboards, ALWAYS reference the service's metrics catalog in `docs/observability/metrics/` or the actual metrics implementation. Require Observability specialist sign-off on dashboard metric queries to prevent mismatches (see PRR-0001).
 
 ## Debate Participation
 

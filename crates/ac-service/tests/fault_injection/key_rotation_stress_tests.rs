@@ -1,4 +1,9 @@
-//! Chaos tests for key rotation under load and concurrent operations
+//! Fault injection tests for key rotation under load and concurrent operations
+//!
+//! These are **programmatic fault injection tests** that validate key rotation
+//! behavior under concurrent load conditions within the application.
+//!
+//! NOTE: For true infrastructure-level chaos tests, see ADR-0012 (LitmusChaos).
 //!
 //! These tests validate that key rotation maintains consistency during:
 //! - Concurrent token validation operations

@@ -27,7 +27,7 @@ spec:
         fsGroup: 65532
       containers:
       - name: ac-service
-        image: ac-service:latest
+        image: localhost/ac-service:latest
         imagePullPolicy: IfNotPresent
         ports:
         - name: https

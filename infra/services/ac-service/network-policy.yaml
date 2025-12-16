@@ -19,10 +19,21 @@ spec:
   - from:
     - namespaceSelector:
         matchLabels:
-          name: dark-tower
+          kubernetes.io/metadata.name: dark-tower
       podSelector:
         matchLabels:
           app: global-controller
+    ports:
+    - protocol: TCP
+      port: 8082
+  # Allow ingress from Prometheus for metrics scraping
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: dark-tower-observability
+      podSelector:
+        matchLabels:
+          app: prometheus
     ports:
     - protocol: TCP
       port: 8082
@@ -31,7 +42,7 @@ spec:
   - to:
     - podSelector:
         matchLabels:
-          app: postgresql
+          app: postgres
     ports:
     - protocol: TCP
       port: 5432
@@ -39,7 +50,7 @@ spec:
   - to:
     - namespaceSelector:
         matchLabels:
-          name: kube-system
+          kubernetes.io/metadata.name: kube-system
       podSelector:
         matchLabels:
           k8s-app: kube-dns

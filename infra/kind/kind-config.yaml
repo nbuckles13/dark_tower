@@ -1,0 +1,43 @@
+# kind cluster configuration for Dark Tower local development
+# This configuration creates a single-node cluster with Calico CNI for NetworkPolicy enforcement
+#
+# Usage: kind create cluster --config=infra/kind/kind-config.yaml --name=dark-tower
+#
+# See ADR-0013 for the single-tier development environment strategy.
+
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: dark-tower
+
+nodes:
+  - role: control-plane
+    # Expose ports for local access
+    extraPortMappings:
+      # Prometheus
+      - containerPort: 30090
+        hostPort: 9090
+        protocol: TCP
+      # Grafana
+      - containerPort: 30030
+        hostPort: 3000
+        protocol: TCP
+      # Loki
+      - containerPort: 30080
+        hostPort: 3100
+        protocol: TCP
+
+# Use containerd as the container runtime
+containerdConfigPatches:
+  - |-
+    [plugins."io.containerd.grpc.v1.cri".registry.mirrors."localhost:5001"]
+      endpoint = ["http://kind-registry:5000"]
+
+# Networking configuration for Calico
+networking:
+  # Pod subnet - must match Calico's default
+  podSubnet: "192.168.0.0/16"
+  # Service subnet
+  serviceSubnet: "10.96.0.0/16"
+  # IMPORTANT: Disable default CNI so Calico can be installed
+  # This enables NetworkPolicy enforcement in both dev and CI
+  disableDefaultCNI: true

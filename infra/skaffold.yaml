@@ -1,0 +1,69 @@
+# Skaffold configuration for Dark Tower local development
+#
+# Usage:
+#   skaffold dev     # Watch mode with hot-reload
+#   skaffold run     # Deploy once without watching
+#   skaffold delete  # Remove all deployed resources
+#
+# See ADR-0013 for the single-tier development environment strategy.
+
+apiVersion: skaffold/v4beta11
+kind: Config
+metadata:
+  name: dark-tower
+
+# Build configuration
+build:
+  local:
+    push: false  # Don't push to registry, load directly into kind
+    useBuildkit: true
+  artifacts:
+    - image: dark-tower/ac-service
+      context: ..
+      docker:
+        dockerfile: infra/docker/ac-service/Dockerfile
+        buildArgs:
+          RUST_VERSION: "1.83"
+
+# Deployment configuration
+deploy:
+  kubectl:
+    hooks:
+      before:
+        - host:
+            command: ["sh", "-c", "echo 'Deploying to kind cluster...'"]
+    manifests:
+      - services/ac-service/*.yaml
+
+# Port forwarding for local access
+portForward:
+  - resourceType: service
+    resourceName: ac-service
+    namespace: dark-tower
+    port: 8082
+    localPort: 8083  # Use 8083 to avoid conflict with local cargo run on 8082
+  - resourceType: service
+    resourceName: grafana
+    namespace: dark-tower-observability
+    port: 3000
+    localPort: 3000
+  - resourceType: service
+    resourceName: prometheus
+    namespace: dark-tower-observability
+    port: 9090
+    localPort: 9090
+  - resourceType: service
+    resourceName: loki
+    namespace: dark-tower-observability
+    port: 3100
+    localPort: 3100
+  - resourceType: service
+    resourceName: postgres
+    namespace: dark-tower
+    port: 5432
+    localPort: 5432
+  - resourceType: service
+    resourceName: redis
+    namespace: dark-tower
+    port: 6379
+    localPort: 6379
