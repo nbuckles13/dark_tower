@@ -2,6 +2,8 @@
 
 This guide helps you set up your local development environment for Dark Tower.
 
+> **Recommended**: For full local development with a kind cluster, Prometheus, Grafana, and Loki, see [LOCAL_DEVELOPMENT.md](LOCAL_DEVELOPMENT.md). This provides production parity and the `iterate.sh` workflow for fast development.
+
 ## Prerequisites
 
 ### Required Software
