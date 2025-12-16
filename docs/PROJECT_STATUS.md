@@ -1,6 +1,6 @@
 # Dark Tower - Project Status
 
-**Last Updated**: 2025-12-07
+**Last Updated**: 2025-12-15
 **Current Phase**: Phase 4 - Security Hardening & Testing Infrastructure
 
 ## Executive Summary
@@ -264,8 +264,10 @@ dark_tower/
 │   │   ├── adr-0002-no-panic-policy.md
 │   │   ├── adr-0003-service-authentication.md
 │   │   ├── adr-0004-api-versioning.md
-│   │   ├── adr-0005 through adr-0009 (testing, key rotation)
-│   │   └── adr-0010-global-controller-architecture.md
+│   │   ├── adr-0005 through adr-0010 (testing, key rotation, GC architecture)
+│   │   ├── adr-0011-ac-operational-readiness.md
+│   │   ├── adr-0012-credential-seeding.md
+│   │   └── adr-0013-local-development-environment.md
 │   ├── ARCHITECTURE.md      # System architecture
 │   ├── API_CONTRACTS.md     # API specifications
 │   ├── DATABASE_SCHEMA.md   # Database design
@@ -280,9 +282,14 @@ dark_tower/
 ├── .github/
 │   └── workflows/
 │       └── ci.yml           # CI/CD pipeline
-└── infra/
-    ├── docker/              # Docker configurations
-    └── kubernetes/          # K8s manifests (future)
+├── infra/
+│   ├── docker/              # Dockerfiles (ac-service uses cargo-chef)
+│   ├── grafana/             # Dashboards and provisioning
+│   ├── kind/                # Local cluster setup (setup.sh, teardown.sh)
+│   └── services/            # Kubernetes manifests for services
+└── scripts/
+    └── dev/
+        └── iterate.sh       # Telepresence-based local dev workflow
 ```
 
 ## Documentation Index
@@ -302,9 +309,9 @@ dark_tower/
 ### Specialized Documentation
 | Document | Description | Status |
 |----------|-------------|--------|
-| [FUZZING.md](../FUZZING.md) | Fuzzing strategy and setup | ✅ Current |
-| [RATE_LIMITING.md](../RATE_LIMITING.md) | Rate limiting implementation | ✅ Current |
-| [LOCAL_TESTING_SETUP.md](../LOCAL_TESTING_SETUP.md) | Local test environment | ✅ Current |
+| [FUZZING.md](FUZZING.md) | Fuzzing strategy and setup | ✅ Current |
+| [RATE_LIMITING.md](RATE_LIMITING.md) | Rate limiting implementation | ✅ Current |
+| [LOCAL_DEVELOPMENT.md](LOCAL_DEVELOPMENT.md) | kind cluster & iterate.sh workflow | ✅ Current |
 
 ### Process Documentation
 | Document | Description | Status |
@@ -312,12 +319,14 @@ dark_tower/
 | [.claude/DEVELOPMENT_WORKFLOW.md](../.claude/DEVELOPMENT_WORKFLOW.md) | Specialist-led development | ✅ Current |
 | [.claude/workflows/multi-agent-debate.md](../.claude/workflows/multi-agent-debate.md) | Debate mechanics | ✅ Current |
 | [.claude/workflows/code-review.md](../.claude/workflows/code-review.md) | Code review process | ✅ Current |
+| [.claude/workflows/process-review-record.md](../.claude/workflows/process-review-record.md) | Process review workflow | ✅ Current |
+| [docs/process-reviews/](process-reviews/) | Process review records (PRRs) | ✅ Current |
 
 ### Decision History
 | Location | Description | Count |
 |----------|-------------|-------|
-| [docs/debates/](debates/) | Multi-agent design debates | 4 |
-| [docs/decisions/](decisions/) | Architecture Decision Records | 10 |
+| [docs/debates/](debates/) | Multi-agent design debates | 5 |
+| [docs/decisions/](decisions/) | Architecture Decision Records | 13 |
 
 ## Future Phases
 
@@ -412,6 +421,17 @@ dark_tower/
 
 ## Recent Achievements (Last 2 Weeks)
 
+- ✅ Local Development Environment (ADR-0013)
+  - kind cluster setup with Calico CNI (NetworkPolicy enforcement)
+  - Full observability: Prometheus, Grafana (pre-configured), Loki
+  - Telepresence-based `iterate.sh` for fast local development loop
+  - Pre-configured AC service Grafana dashboard
+  - cargo-chef Dockerfile for efficient builds (Rust 1.91)
+- ✅ AC Operational Readiness (ADR-0011, ADR-0012)
+  - Health/ready endpoints with detailed status
+  - Graceful shutdown with configurable drain period
+  - HTTP metrics middleware for request/response tracking
+  - Credential seeding for dev environment (global-controller-dev)
 - ✅ Extended specialist model with operational concerns (12 specialists total)
   - Added Observability Specialist (metrics, logging, tracing, SLOs, error budgets)
   - Added Operations Specialist (deployment safety, runbooks, incident response, cost)
@@ -467,7 +487,12 @@ dark_tower/
    ```bash
    git clone https://github.com/nbuckles13/dark_tower.git
    cd dark_tower
-   docker-compose -f docker-compose.test.yml up -d  # Start PostgreSQL
+
+   # Option A: Full local cluster (recommended)
+   ./infra/kind/scripts/setup.sh  # Creates kind cluster with full observability
+
+   # Option B: Minimal for running tests only
+   docker-compose -f docker-compose.test.yml up -d
    cargo build --workspace
    cargo test --workspace
    ```
@@ -530,6 +555,15 @@ dark_tower/
 - [x] Key rotation implementation (ADR-0008)
 - [x] Integration test infrastructure (ADR-0009)
 - [x] Global Controller architecture (ADR-0010)
+- [x] AC Operational Readiness (ADR-0011, ADR-0012)
+  - Health/ready endpoints, graceful shutdown
+  - Credential seeding for dev environment
+  - HTTP metrics middleware
+- [x] Local Development Environment (ADR-0013)
+  - kind cluster with full observability (Prometheus, Grafana, Loki)
+  - Telepresence-based iterate.sh for fast local development
+  - Pre-configured Grafana dashboards for AC service
+  - Cargo-chef Dockerfile for efficient builds
 - [ ] Performance benchmarks
 - [ ] 95% test coverage achieved
 - [ ] Security documentation complete
