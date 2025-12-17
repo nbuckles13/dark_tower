@@ -74,10 +74,10 @@ pub async fn handle_user_token(
     // ADR-0011: Record error category for failed requests
     match result {
         Ok(token) => Ok(Json(token)),
-        Err(ref e) => {
-            let category = ErrorCategory::from(e);
+        Err(e) => {
+            let category = ErrorCategory::from(&e);
             record_error("issue_user_token", category.as_str(), e.status_code());
-            Err(result.unwrap_err())
+            Err(e)
         }
     }
 }
@@ -171,10 +171,10 @@ pub async fn handle_service_token(
     // ADR-0011: Record error category for failed requests
     match result {
         Ok(token) => Ok(Json(token)),
-        Err(ref e) => {
-            let category = ErrorCategory::from(e);
+        Err(e) => {
+            let category = ErrorCategory::from(&e);
             record_error("issue_service_token", category.as_str(), e.status_code());
-            Err(result.unwrap_err())
+            Err(e)
         }
     }
 }
@@ -564,10 +564,12 @@ mod tests {
         // Should return InvalidCredentials error
         assert!(result.is_err(), "Invalid grant_type should be rejected");
 
-        match result.unwrap_err() {
-            AcError::InvalidCredentials => {} // Expected
-            other => panic!("Expected InvalidCredentials, got: {:?}", other),
-        }
+        let err = result.expect_err("Invalid grant_type should return error");
+        assert!(
+            matches!(err, AcError::InvalidCredentials),
+            "Expected InvalidCredentials, got: {:?}",
+            err
+        );
     }
 
     /// Test handle_service_token extracts IP address correctly

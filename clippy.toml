@@ -1,0 +1,12 @@
+# Clippy Configuration
+# See: https://doc.rust-lang.org/clippy/lint_configuration.html
+
+# Allow expect(), unwrap(), and indexing in test code
+# Per ADR-0002, these are prohibited in production code but acceptable in tests
+#
+# Note: These options only work for code in #[cfg(test)] modules and #[test] functions.
+# Integration tests (tests/ directory) and test helper functions need crate-level overrides.
+# See: https://github.com/rust-lang/rust-clippy/issues/13981
+allow-expect-in-tests = true
+allow-unwrap-in-tests = true
+allow-indexing-slicing-in-tests = true

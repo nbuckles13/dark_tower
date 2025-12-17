@@ -61,7 +61,10 @@ pub fn hash_for_correlation(value: &str, secret: &[u8]) -> String {
     let tag = hmac::sign(&key, value.as_bytes());
     // Take first 8 hex chars (32 bits) - enough for correlation, limits reversibility
     // Prefix with "h:" to distinguish from legacy SHA-256 hashes
-    format!("h:{}", hex::encode(&tag.as_ref()[..4]))
+    // Note: HMAC-SHA256 always produces 32 bytes, so .get(..4) always succeeds
+    let tag_bytes = tag.as_ref();
+    let prefix = tag_bytes.get(..4).unwrap_or(tag_bytes);
+    format!("h:{}", hex::encode(prefix))
 }
 
 /// Error categories for metrics labels (bounded cardinality)

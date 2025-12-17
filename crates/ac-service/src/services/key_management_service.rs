@@ -2,6 +2,7 @@ use crate::crypto;
 use crate::errors::AcError;
 use crate::models::{AuthEventType, JsonWebKey, Jwks};
 use crate::repositories::{auth_events, signing_keys};
+use base64::{engine::general_purpose, Engine as _};
 use chrono::{Duration, Utc};
 use sqlx::PgPool;
 
@@ -260,25 +261,40 @@ pub async fn get_jwks(pool: &PgPool) -> Result<Jwks, AcError> {
     // Fetch all active keys
     let keys = signing_keys::get_all_active_keys(pool).await?;
 
-    // Convert to JWKS format
+    // Convert to JWKS format, filtering out any corrupted keys
     let json_web_keys: Vec<JsonWebKey> = keys
         .into_iter()
-        .map(|key| {
-            // Extract base64 from PEM format
-            let public_key_b64 = key
+        .filter_map(|key| {
+            // Extract base64 from PEM format (standard base64)
+            let public_key_std_b64: String = key
                 .public_key
                 .lines()
                 .filter(|line| !line.starts_with("-----"))
-                .collect::<String>();
+                .collect();
 
-            JsonWebKey {
+            // Convert from standard base64 to base64url (RFC 7517 requires base64url)
+            let public_key_bytes = match general_purpose::STANDARD.decode(&public_key_std_b64) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    // Log the error but don't fail - skip corrupted keys
+                    tracing::error!(
+                        key_id = %key.key_id,
+                        error = %e,
+                        "Failed to decode public key from PEM - skipping corrupted key"
+                    );
+                    return None;
+                }
+            };
+            let public_key_b64url = general_purpose::URL_SAFE_NO_PAD.encode(&public_key_bytes);
+
+            Some(JsonWebKey {
                 kid: key.key_id,
                 kty: "OKP".to_string(),     // Octet Key Pair for EdDSA
                 crv: "Ed25519".to_string(), // Curve
-                x: public_key_b64,          // Public key
+                x: public_key_b64url,       // Public key (base64url encoded per RFC 7517)
                 use_: "sig".to_string(),    // Signature use
                 alg: "EdDSA".to_string(),   // Algorithm
-            }
+            })
         })
         .collect();
 
@@ -517,6 +533,18 @@ mod tests {
         assert_eq!(key.use_, "sig");
         assert_eq!(key.alg, "EdDSA");
         assert!(!key.x.is_empty(), "Public key should not be empty");
+
+        // RFC 7517 requires base64url encoding (no +, /, or = characters)
+        assert!(
+            !key.x.contains('+') && !key.x.contains('/') && !key.x.contains('='),
+            "Public key x must be base64url encoded (RFC 7517), found standard base64 characters"
+        );
+
+        // Verify it's valid base64url and decodes to 32 bytes (Ed25519 public key)
+        let decoded = general_purpose::URL_SAFE_NO_PAD
+            .decode(&key.x)
+            .expect("Public key should be valid base64url");
+        assert_eq!(decoded.len(), 32, "Ed25519 public key should be 32 bytes");
 
         Ok(())
     }

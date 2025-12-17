@@ -4,7 +4,7 @@ use crate::observability::metrics::record_jwks_request;
 use crate::services::key_management_service;
 use axum::{
     extract::State,
-    http::header::{HeaderMap, CACHE_CONTROL},
+    http::header::{HeaderMap, HeaderValue, CACHE_CONTROL},
     Json,
 };
 use std::sync::Arc;
@@ -36,10 +36,7 @@ pub async fn handle_get_jwks(
 
     // Add Cache-Control header to allow caching for 1 hour
     let mut headers = HeaderMap::new();
-    headers.insert(
-        CACHE_CONTROL,
-        "max-age=3600".parse().expect("Valid header value"),
-    );
+    headers.insert(CACHE_CONTROL, HeaderValue::from_static("max-age=3600"));
 
     Ok((headers, Json(jwks)))
 }

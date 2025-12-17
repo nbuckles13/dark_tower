@@ -10,6 +10,7 @@ members = [
     "crates/common",
     "crates/proto-gen",
     "crates/media-protocol",
+    "crates/env-tests",
 ]
 
 exclude = [
@@ -24,13 +25,17 @@ authors = ["Dark Tower Contributors"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/nbuckles13/dark_tower"
 
+[workspace.lints.rust]
+# Allow cfg(coverage) for llvm-cov instrumentation
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage)'] }
+
 [workspace.lints.clippy]
 # ADR-0002: No-Panic Error Handling Policy
 # These lints enforce zero-panic production code at compile time
 unwrap_used = "deny"
 expect_used = "deny"
 panic = "deny"
-indexing_slicing = "warn"
+indexing_slicing = "deny"
 
 [workspace.dependencies]
 # Async runtime
