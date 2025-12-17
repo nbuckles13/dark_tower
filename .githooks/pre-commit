@@ -8,8 +8,8 @@ set -e
 
 echo "🔍 Running pre-commit checks..."
 
-# Run cargo fmt
-echo "  ➜ Formatting code with cargo fmt..."
+# Check code formatting (does NOT format, only checks)
+echo "  ➜ Checking code formatting with cargo fmt..."
 cargo fmt --all -- --check
 if [ $? -ne 0 ]; then
     echo ""

@@ -303,12 +303,8 @@ mod tests {
         )
         .await;
 
-        assert!(result.is_err());
-        // Verify it's a database error
-        match result {
-            Err(AcError::Database(_)) => {} // Expected
-            _ => panic!("Expected Database error for duplicate client_id"),
-        }
+        let err = result.expect_err("Expected Database error for duplicate client_id");
+        assert!(matches!(err, AcError::Database(_)));
 
         Ok(())
     }

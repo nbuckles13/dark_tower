@@ -6,6 +6,13 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 
+# Note: ac-test-utils is a test utility library providing assertion helpers.
+# Test assertion methods intentionally use unwrap/expect/panic to fail tests.
+# Unlike production crates, this crate does NOT inherit workspace lints because
+# test utilities need to use unwrap/expect/panic for assertions.
+#
+# We still deny the most important lints but allow panic-related ones for test assertions.
+
 [dependencies]
 # Async runtime
 tokio = { workspace = true }

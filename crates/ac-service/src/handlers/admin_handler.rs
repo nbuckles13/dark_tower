@@ -69,10 +69,10 @@ pub async fn handle_register_service(
     // ADR-0011: Record error category for failed requests
     match result {
         Ok(response) => Ok(Json(response)),
-        Err(ref e) => {
-            let category = ErrorCategory::from(e);
+        Err(e) => {
+            let category = ErrorCategory::from(&e);
             record_error("register_service", category.as_str(), e.status_code());
-            Err(result.unwrap_err())
+            Err(e)
         }
     }
 }
@@ -466,7 +466,15 @@ mod tests {
                     "Error should include the invalid value"
                 );
             }
-            _ => panic!("Expected Database error, got: {:?}", err),
+            other => {
+                // Use expect to fail with a clear message if it's not the expected error type
+                let _ = matches!(other, AcError::Database(_));
+                assert!(
+                    matches!(other, AcError::Database(_)),
+                    "Expected Database error, got: {:?}",
+                    other
+                );
+            }
         }
     }
 

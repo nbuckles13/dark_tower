@@ -123,9 +123,19 @@ pub fn encrypt_private_key(private_key: &[u8], master_key: &[u8]) -> Result<Encr
         })?;
 
     // Split ciphertext and tag (last 16 bytes are the tag)
-    let tag_start = in_out.len() - 16;
-    let encrypted_data = in_out[..tag_start].to_vec();
-    let tag = in_out[tag_start..].to_vec();
+    // After seal_in_place_append_tag, the buffer contains original data + 16-byte tag
+    let tag_start = in_out
+        .len()
+        .checked_sub(16)
+        .ok_or_else(|| AcError::Crypto("Encryption produced invalid output".to_string()))?;
+    let encrypted_data = in_out
+        .get(..tag_start)
+        .ok_or_else(|| AcError::Crypto("Encryption produced invalid output".to_string()))?
+        .to_vec();
+    let tag = in_out
+        .get(tag_start..)
+        .ok_or_else(|| AcError::Crypto("Encryption produced invalid output".to_string()))?
+        .to_vec();
 
     Ok(EncryptedKey {
         encrypted_data,
@@ -238,11 +248,11 @@ pub fn extract_jwt_kid(token: &str) -> Option<String> {
     }
 
     // Decode the header (first part)
-    let header_bytes = URL_SAFE_NO_PAD.decode(parts[0]).ok()?;
+    let header_bytes = URL_SAFE_NO_PAD.decode(parts.first()?).ok()?;
     let header: serde_json::Value = serde_json::from_slice(&header_bytes).ok()?;
 
     // Extract kid as string
-    header["kid"].as_str().map(|s| s.to_string())
+    header.get("kid")?.as_str().map(|s| s.to_string())
 }
 
 /// Verify JWT with EdDSA public key
@@ -421,11 +431,8 @@ mod tests {
         let wrong_key = vec![0u8; 16]; // Wrong length (should be 32)
 
         let result = encrypt_private_key(data, &wrong_key);
-        assert!(result.is_err());
-        match result {
-            Err(AcError::Crypto(msg)) => assert_eq!(msg, "Invalid encryption key"),
-            _ => panic!("Expected Crypto error"),
-        }
+        let err = result.expect_err("Expected Crypto error");
+        assert!(matches!(err, AcError::Crypto(msg) if msg == "Invalid encryption key"));
     }
 
     #[test]
@@ -436,12 +443,8 @@ mod tests {
 
         let encrypted = encrypt_private_key(data, &master_key).unwrap();
         let result = decrypt_private_key(&encrypted, &wrong_key);
-
-        assert!(result.is_err());
-        match result {
-            Err(AcError::Crypto(msg)) => assert_eq!(msg, "Decryption failed"),
-            _ => panic!("Expected Crypto error"),
-        }
+        let err = result.expect_err("Expected Crypto error");
+        assert!(matches!(err, AcError::Crypto(msg) if msg == "Decryption failed"));
     }
 
     #[test]
@@ -452,12 +455,8 @@ mod tests {
 
         let encrypted = encrypt_private_key(data, &master_key).unwrap();
         let result = decrypt_private_key(&encrypted, &wrong_key);
-
-        assert!(result.is_err());
-        match result {
-            Err(AcError::Crypto(msg)) => assert_eq!(msg, "Invalid decryption key"),
-            _ => panic!("Expected Crypto error"),
-        }
+        let err = result.expect_err("Expected Crypto error");
+        assert!(matches!(err, AcError::Crypto(msg) if msg == "Invalid decryption key"));
     }
 
     #[test]
@@ -469,11 +468,8 @@ mod tests {
         encrypted.nonce = vec![0u8; 8]; // Wrong nonce length (should be 12)
 
         let result = decrypt_private_key(&encrypted, &master_key);
-        assert!(result.is_err());
-        match result {
-            Err(AcError::Crypto(msg)) => assert_eq!(msg, "Decryption failed"),
-            _ => panic!("Expected Crypto error"),
-        }
+        let err = result.expect_err("Expected Crypto error");
+        assert!(matches!(err, AcError::Crypto(msg) if msg == "Decryption failed"));
     }
 
     #[test]
@@ -485,11 +481,8 @@ mod tests {
         encrypted.tag = vec![0u8; 8]; // Wrong tag length (should be 16)
 
         let result = decrypt_private_key(&encrypted, &master_key);
-        assert!(result.is_err());
-        match result {
-            Err(AcError::Crypto(msg)) => assert_eq!(msg, "Decryption failed"),
-            _ => panic!("Expected Crypto error"),
-        }
+        let err = result.expect_err("Expected Crypto error");
+        assert!(matches!(err, AcError::Crypto(msg) if msg == "Decryption failed"));
     }
 
     #[test]
@@ -507,12 +500,8 @@ mod tests {
 
         let token = sign_jwt(&claims, &private_pkcs8, "test-key-01").unwrap();
         let result = verify_jwt(&token, &public_pem);
-
-        assert!(result.is_err());
-        match result {
-            Err(AcError::InvalidToken(_)) => {}
-            _ => panic!("Expected InvalidToken error for expired token"),
-        }
+        let err = result.expect_err("Expected InvalidToken error for expired token");
+        assert!(matches!(err, AcError::InvalidToken(_)));
     }
 
     #[test]
@@ -530,12 +519,8 @@ mod tests {
 
         let token = sign_jwt(&claims, &private_pkcs8, "test-key-01").unwrap();
         let result = verify_jwt(&token, &wrong_public_pem);
-
-        assert!(result.is_err());
-        match result {
-            Err(AcError::InvalidToken(_)) => {}
-            _ => panic!("Expected InvalidToken error for wrong public key"),
-        }
+        let err = result.expect_err("Expected InvalidToken error for wrong public key");
+        assert!(matches!(err, AcError::InvalidToken(_)));
     }
 
     #[test]
@@ -556,12 +541,8 @@ mod tests {
     fn test_verify_password_with_invalid_hash() {
         // Try to verify against an invalid bcrypt hash
         let result = verify_client_secret("password", "not-a-valid-hash");
-
-        assert!(result.is_err());
-        match result {
-            Err(AcError::Crypto(msg)) => assert_eq!(msg, "Password verification failed"),
-            _ => panic!("Expected Crypto error"),
-        }
+        let err = result.expect_err("Expected Crypto error");
+        assert!(matches!(err, AcError::Crypto(msg) if msg == "Password verification failed"));
     }
 
     /// P1-SECURITY: Test that bcrypt cost factor is 12 (per ADR-0003)
@@ -841,15 +822,8 @@ mod tests {
         let invalid_key = vec![0u8; 32]; // Not a valid PKCS8 structure
 
         let result = sign_jwt(&claims, &invalid_key, "test-key-01");
-
-        assert!(result.is_err(), "Invalid private key should be rejected");
-
-        match result {
-            Err(AcError::Crypto(msg)) => {
-                assert_eq!(msg, "JWT signing failed");
-            }
-            _ => panic!("Expected Crypto error for invalid private key"),
-        }
+        let err = result.expect_err("Invalid private key should be rejected");
+        assert!(matches!(err, AcError::Crypto(msg) if msg == "JWT signing failed"));
     }
 
     /// Test verify_jwt with invalid public key PEM format
@@ -873,16 +847,8 @@ mod tests {
         let invalid_pem = "-----BEGIN PUBLIC KEY-----\ninvalid!@#$%\n-----END PUBLIC KEY-----";
 
         let result = verify_jwt(&token, invalid_pem);
-
-        assert!(
-            result.is_err(),
-            "Invalid PEM format should be rejected during base64 decode"
-        );
-
-        match result {
-            Err(AcError::InvalidToken(_)) => {} // Expected
-            _ => panic!("Expected InvalidToken error for invalid PEM"),
-        }
+        let err = result.expect_err("Invalid PEM format should be rejected during base64 decode");
+        assert!(matches!(err, AcError::InvalidToken(_)));
     }
 
     /// Test verify_jwt with valid base64 but invalid key bytes
@@ -910,16 +876,8 @@ mod tests {
         );
 
         let result = verify_jwt(&token, &invalid_pem);
-
-        assert!(
-            result.is_err(),
-            "Invalid key bytes should be rejected during verification"
-        );
-
-        match result {
-            Err(AcError::InvalidToken(_)) => {} // Expected
-            _ => panic!("Expected InvalidToken error for invalid key bytes"),
-        }
+        let err = result.expect_err("Invalid key bytes should be rejected during verification");
+        assert!(matches!(err, AcError::InvalidToken(_)));
     }
 
     /// Test verify_jwt with tampered token
@@ -949,13 +907,8 @@ mod tests {
         token = format!("{}.{}.{}", parts[0], tampered_payload, parts[2]);
 
         let result = verify_jwt(&token, &public_pem);
-
-        assert!(result.is_err(), "Tampered token should be rejected");
-
-        match result {
-            Err(AcError::InvalidToken(_)) => {} // Expected
-            _ => panic!("Expected InvalidToken error for tampered token"),
-        }
+        let err = result.expect_err("Tampered token should be rejected");
+        assert!(matches!(err, AcError::InvalidToken(_)));
     }
 
     /// Test verify_jwt with malformed token (not JWT format)
@@ -969,13 +922,8 @@ mod tests {
         let malformed_token = "not.a.valid.jwt.format.with.too.many.parts";
 
         let result = verify_jwt(malformed_token, &public_pem);
-
-        assert!(result.is_err(), "Malformed token should be rejected");
-
-        match result {
-            Err(AcError::InvalidToken(_)) => {} // Expected
-            _ => panic!("Expected InvalidToken error for malformed token"),
-        }
+        let err = result.expect_err("Malformed token should be rejected");
+        assert!(matches!(err, AcError::InvalidToken(_)));
     }
 
     /// Test JWT iat validation at exact clock skew boundary
@@ -1033,10 +981,8 @@ mod tests {
             "Token with iat 1 second past boundary should be rejected"
         );
 
-        match result {
-            Err(AcError::InvalidToken(_)) => {} // Expected
-            _ => panic!("Expected InvalidToken error"),
-        }
+        let err = result.expect_err("Expected InvalidToken error");
+        assert!(matches!(err, AcError::InvalidToken(_)));
     }
 
     /// Test JWT with negative iat (old token)
@@ -1248,12 +1194,8 @@ mod tests {
 
         let result = verify_jwt("", &public_pem);
 
-        assert!(result.is_err(), "Empty token should be rejected");
-
-        match result {
-            Err(AcError::InvalidToken(_)) => {} // Expected
-            _ => panic!("Expected InvalidToken error for empty token"),
-        }
+        let err = result.expect_err("Empty token should be rejected");
+        assert!(matches!(err, AcError::InvalidToken(_)));
     }
 
     /// Test decrypt with corrupted ciphertext
@@ -1273,17 +1215,8 @@ mod tests {
 
         let result = decrypt_private_key(&encrypted, &master_key);
 
-        assert!(
-            result.is_err(),
-            "Corrupted ciphertext should fail authentication"
-        );
-
-        match result {
-            Err(AcError::Crypto(msg)) => {
-                assert_eq!(msg, "Decryption failed");
-            }
-            _ => panic!("Expected Crypto error for corrupted ciphertext"),
-        }
+        let err = result.expect_err("Corrupted ciphertext should fail authentication");
+        assert!(matches!(err, AcError::Crypto(msg) if msg == "Decryption failed"));
     }
 
     /// Test decrypt with corrupted tag
@@ -1301,14 +1234,8 @@ mod tests {
 
         let result = decrypt_private_key(&encrypted, &master_key);
 
-        assert!(result.is_err(), "Corrupted tag should fail authentication");
-
-        match result {
-            Err(AcError::Crypto(msg)) => {
-                assert_eq!(msg, "Decryption failed");
-            }
-            _ => panic!("Expected Crypto error for corrupted tag"),
-        }
+        let err = result.expect_err("Corrupted tag should fail authentication");
+        assert!(matches!(err, AcError::Crypto(msg) if msg == "Decryption failed"));
     }
 
     // ============================================================================

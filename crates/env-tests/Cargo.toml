@@ -1,0 +1,52 @@
+[package]
+name = "env-tests"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+# Feature gates for test categories
+# No default features - tests require explicit --features flag
+smoke = []                           # Fast cluster health (30s)
+flows = []                           # Service flows (2-3min)
+observability = []                   # Metrics/logs validation (Loki optional)
+resilience = ["observability"]       # Pod restarts, chaos (requires observability)
+all = ["smoke", "flows", "observability", "resilience"]
+
+[dependencies]
+# Async runtime
+tokio = { workspace = true }
+
+# HTTP client (use rustls to avoid OpenSSL dependency)
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+[dev-dependencies]
+# JWT validation
+jsonwebtoken = { workspace = true }
+
+# Base64 decoding for JWKS
+base64 = "0.22"
+
+# Serial test execution for stateful tests
+serial_test = "3.1"
+
+# Time utilities for timestamp checks
+chrono = { workspace = true }
+
+# Note: env-tests is a test crate containing integration tests.
+# Test code intentionally uses expect/unwrap for cleaner assertions.
+# Unlike production crates, this crate does NOT inherit workspace lints.
+#
+# We still want other workspace lints, just not panic-related ones for tests.

@@ -80,6 +80,57 @@
 - [ ] **Code Coverage Target**: Improve P1 test coverage from current 83% to target 95%
 - [ ] **Performance Benchmarks**: Add criterion benchmarks for token validation performance under security attacks
 
+### Observability (ADR-0011 Phase 5)
+
+- [ ] **OpenTelemetry Integration**: Add OTel SDK to AC service for trace propagation
+  - Currently: Basic `tracing` crate with `#[instrument]` macros
+  - Needed: `tracing-opentelemetry` layer, OTLP exporter
+  - Ref: ADR-0011 Implementation Plan Phase 5
+- [ ] **Trace ID in Logs**: Once OTel is integrated, `test_logs_have_trace_ids` in env-tests should pass
+  - Currently: Test is a soft check (warns but doesn't fail)
+  - Location: `crates/env-tests/tests/30_observability.rs`
+  - ADR-0011 specifies `trace_id`, `span_id`, `request_id` as SAFE fields for logging
+- [ ] **Cardinality Validation Test**: Validate metric cardinality matches ADR-0011 bounds
+  - e.g., 4 grant_types × 2 statuses = 8 max series for token issuance
+- [ ] **Histogram Bucket Alignment Test**: Verify buckets include SLO threshold (350ms for token issuance)
+
+### env-tests Enhancements (from Code Review 2025-12-16)
+
+#### Security Specialist Findings (Priority 1 - Before Production)
+
+- [ ] **NetworkPolicy Testing**: Implement `CanaryPod` in `crates/env-tests/src/canary.rs`
+  - Currently: Placeholder with `panic!` stubs
+  - Need: Deploy canary pod, verify isolation via HTTP probes
+  - Critical for zero-trust architecture validation
+- [ ] **Rate Limit Smoke Test**: Add `test_rate_limiting_enabled` to verify rate limiting active in deployed config
+  - ADR-0014 deferred rate limit testing, but should validate it's *enabled*
+- [ ] **TLS/Transport Security Tests**: New file `crates/env-tests/tests/26_transport_security.rs`
+  - Validate in-cluster TLS configuration
+  - Document HTTP-over-localhost exception for port-forwards
+- [ ] **JWT Header Injection (env-level)**: Add `test_jwt_header_injection_attacks` for kid/jwk manipulation
+  - Unit tests exist, but env-level validation against deployed service missing
+- [ ] **Time-Based Claims Validation**: Add `test_iat_validation`, `test_nbf_validation` with crafted tokens
+- [ ] **JWKS Security Properties**: Add `test_jwks_no_private_key_leakage`
+  - Verify no `d`, `p`, `q` parameters in JWKS response
+
+#### Infrastructure Specialist Findings (Priority 1 - Before Resilience)
+
+- [ ] **ClusterConnection Retry Logic**: Add retry with exponential backoff to `ClusterConnection::new()`
+  - Currently: Fails immediately if port-forward not ready
+  - Need: Retry TCP checks up to 3 times with 2s delays
+  - Location: `crates/env-tests/src/cluster.rs:59-100`
+- [ ] **Health Check Validation**: Verify services are ready, not just TCP-listening
+  - AC may accept connections but have pending migrations
+  - Add optional health check parameter to `ClusterConnection::new()`
+- [ ] **Connection Error Details**: Include underlying error reason in TCP check failures
+  - Currently only reports port number, not why (refused vs timeout vs no route)
+
+#### Code Reviewer Findings (Low Priority)
+
+- [ ] **Extract Common Test Utilities**: Consider moving `cluster()` helper and `Claims` struct to shared module
+  - Currently duplicated in 5 test files (idiomatic for integration tests, but creates maintenance burden)
+- [ ] **Document Pre-seeded Credentials**: Add comments explaining `test-client` must be seeded by setup script
+
 ### Documentation
 
 - [ ] **Security Testing Guide**: Document security testing patterns and attack vectors in developer documentation
