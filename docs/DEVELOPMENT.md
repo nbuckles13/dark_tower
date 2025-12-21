@@ -9,11 +9,25 @@ This guide helps you set up your local development environment for Dark Tower.
 ### Required Software
 
 - **Rust**: 1.75+ (install via [rustup](https://rustup.rs/))
+- **Rust Nightly**: Required for code guards (see [Guards](#guards))
 - **C Compiler Toolchain**: gcc (Linux), clang (macOS), or MSVC (Windows)
 - **Protocol Buffer Compiler**: `protoc` 3.0+
 - **Node.js**: 20+ (for client development)
 - **Docker**: 24+ and Docker Compose
 - **Git**: Latest version
+
+#### Installing Rust Nightly
+
+Guards use the Rust compiler to reliably detect test code. Install nightly alongside stable:
+
+```bash
+rustup toolchain install nightly
+
+# Verify installation
+rustup run nightly rustc --version
+```
+
+> **Note**: You don't need to use nightly as your default toolchain. Guards invoke it explicitly via `rustup run nightly`.
 
 ### System Build Tools
 
@@ -397,6 +411,64 @@ Make it executable:
 ```bash
 chmod +x .git/hooks/pre-commit
 ```
+
+### Guards
+
+Guards are automated checks that detect security and code quality issues beyond what linting catches. They use a layered approach:
+
+1. **Simple Guards**: Fast grep/pattern-based checks (~100ms)
+2. **Semantic Guards**: LLM-based deep analysis for subtle issues
+
+#### Running Guards
+
+```bash
+# Run all simple guards (fast, no API calls)
+./scripts/guards/run-guards.sh
+
+# Run on specific path
+./scripts/guards/run-guards.sh crates/ac-service/src/
+
+# Include semantic guards (requires Claude CLI)
+./scripts/guards/run-guards.sh --semantic
+
+# Verbose output
+./scripts/guards/run-guards.sh --verbose
+```
+
+#### Available Guards
+
+| Guard | Type | Description |
+|-------|------|-------------|
+| `no-secrets-in-logs` | Simple | Detects potential credential leaks in logging statements |
+| `credential-leak` | Semantic | Deep analysis for subtle credential exposure |
+
+#### Guard Behavior
+
+- Guards automatically **exclude test code** using the Rust compiler
+- Exit code 0 means no violations, exit code 1 means violations found
+- Semantic guards require `claude` CLI to be installed and authenticated
+
+#### Fixing Violations
+
+When guards find violations, they'll suggest fixes:
+
+```bash
+# Example: #[instrument] missing skip for password
+#[instrument(skip(password))]  # Add skip for secret params
+
+# Example: Secret in log macro
+info!("Login attempt for user {}", user_id);  # Don't log password
+
+# Example: Mark as false positive
+info!("Key rotation complete");  // guard:ignore
+```
+
+#### Adding New Guards
+
+See `docs/principles/` for principle definitions that guards enforce. Each principle document explains:
+- What counts as a violation
+- Acceptable patterns
+- Code examples
 
 ## Environment Variables
 
