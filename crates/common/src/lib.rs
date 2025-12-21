@@ -10,3 +10,6 @@ pub mod types;
 
 /// Module for common configuration
 pub mod config;
+
+/// Module for secret types that prevent accidental logging
+pub mod secret;

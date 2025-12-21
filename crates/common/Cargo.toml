@@ -23,6 +23,8 @@ bytes = { workspace = true }
 
 # Additional dependencies
 rand = "0.8"
+secrecy = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
+serde_json = { workspace = true }

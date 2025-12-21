@@ -83,9 +83,34 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-# Check 3: Named tracing fields with secret names
+# Check 3: expose_secret() in log macros (defeats SecretString protection)
 # -----------------------------------------------------------------------------
-print_section "Check 3: Named tracing fields with secret names"
+print_section "Check 3: expose_secret() in log macros"
+
+# expose_secret() is a specific function that unwraps SecretString - logging its result defeats the protection
+expose_violations=$(grep -rn --include="*.rs" -E '\b(info|debug|warn|error|trace)!\s*\(' "$SEARCH_PATH" 2>/dev/null | \
+    grep 'expose_secret\s*(' | \
+    grep -v '//.*' | \
+    filter_test_code || true)
+
+if [[ -n "$expose_violations" ]]; then
+    echo -e "${RED}VIOLATIONS FOUND:${NC}"
+    echo "$expose_violations" | while read -r line; do
+        echo "  $line"
+        increment_violations
+    done
+    echo ""
+    echo "expose_secret() defeats SecretString protection - never log its result."
+    echo ""
+else
+    print_ok "No expose_secret() in log macros"
+    echo ""
+fi
+
+# -----------------------------------------------------------------------------
+# Check 4: Named tracing fields with secret names
+# -----------------------------------------------------------------------------
+print_section "Check 4: Named tracing fields with secret names"
 
 # Look for patterns like: password = %, token = ?, secret =
 named_field_violations=$(grep -rn --include="*.rs" -E "tracing::(info|debug|warn|error|trace)!\s*\(" "$SEARCH_PATH" 2>/dev/null | \
@@ -106,9 +131,9 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-# Check 4: Secrets in error/anyhow messages
+# Check 5: Secrets in error/anyhow messages
 # -----------------------------------------------------------------------------
-print_section "Check 4: Secrets in error messages"
+print_section "Check 5: Secrets in error messages"
 
 # Look for Err(), anyhow!(), bail!() containing secret variables
 error_violations=$(grep -rn --include="*.rs" -E '(Err\(|anyhow!|bail!|context\()' "$SEARCH_PATH" 2>/dev/null | \
@@ -129,9 +154,9 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-# Check 5: Debug formatting of structs that might contain secrets
+# Check 6: Debug formatting of structs that might contain secrets
 # -----------------------------------------------------------------------------
-print_section "Check 5: Debug formatting with {:?} on request/response objects"
+print_section "Check 6: Debug formatting with {:?} on request/response objects"
 
 # This is a heuristic - flag {:?} on common struct names that often contain secrets
 debug_violations=$(grep -rn --include="*.rs" -E '\{:\?\}.*\b(request|req|response|res|body|payload|credentials|auth|login)\b|\b(request|req|response|res|body|payload|credentials|auth|login)\b.*\{:\?\}' "$SEARCH_PATH" 2>/dev/null | \

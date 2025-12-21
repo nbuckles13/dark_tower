@@ -111,28 +111,66 @@ info!("Token has {} scopes", token.scopes.len());
 info!("Password hash updated: {}", redact(&password_hash));
 ```
 
-## Type-System Constraints (Future)
+## Type-System Constraints (Implemented)
 
-In addition to guards, consider using the type system to prevent violations at compile time:
+**Status**: Active - Using `secrecy` crate
 
-```rust
-/// Newtype that cannot be logged
-pub struct Password(String);
+The type system prevents violations at compile time using the `secrecy` crate. This is
+the **first line of defense** in the layered approach:
 
-impl std::fmt::Debug for Password {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "[REDACTED]")
-    }
-}
-
-impl std::fmt::Display for Password {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "[REDACTED]")
-    }
-}
+```
+Constraints (compile-time) → Simple Guards → Semantic Guards → Learning
 ```
 
-This makes accidental logging impossible because `Password` always displays as `[REDACTED]`.
+### Using SecretString
+
+Import from the `common` crate:
+
+```rust
+use common::secret::{ExposeSecret, SecretString};
+
+// Define request structs with SecretString for sensitive fields
+#[derive(Debug, Deserialize)]
+pub struct TokenRequest {
+    pub client_id: String,
+    pub client_secret: Option<SecretString>,  // Automatically redacted in Debug
+}
+
+// The Debug implementation will show:
+// TokenRequest { client_id: "my-service", client_secret: Some(Secret([REDACTED])) }
+```
+
+### Key Benefits
+
+1. **Compile-time safety**: Any struct containing `SecretString` automatically has safe Debug
+2. **Explicit access**: Must call `.expose_secret()` to get the inner value
+3. **Memory zeroization**: Secrets are wiped from memory when dropped
+4. **Serde integration**: Works seamlessly with JSON deserialization
+
+### Accessing Secret Values
+
+```rust
+// To use the secret value, explicitly expose it:
+let password: &str = payload.password.expose_secret();
+validate_password(password)?;
+
+// For Option<SecretString>:
+let secret = payload.client_secret
+    .as_ref()
+    .map(|s| s.expose_secret().to_string());
+```
+
+### Applied In
+
+- `ac-service/handlers/auth_handler.rs`:
+  - `UserTokenRequest.password: SecretString`
+  - `ServiceTokenRequest.client_secret: Option<SecretString>`
+
+### Module Location
+
+- `common/src/secret.rs` - Re-exports from `secrecy` crate with Dark Tower documentation
+
+This makes accidental logging impossible because `SecretString` always displays as `[REDACTED]`.
 
 ## Guard Detection
 
