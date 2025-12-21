@@ -80,6 +80,7 @@ bytes = "1.7"
 ring = "0.17"
 rustls = "0.23"
 bcrypt = "0.15"
+secrecy = { version = "0.10", features = ["serde"] }
 
 # JWT
 jsonwebtoken = "9.3"

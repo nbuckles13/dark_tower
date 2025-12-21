@@ -10,6 +10,7 @@ use axum::{
     Json,
 };
 use base64::{engine::general_purpose, Engine as _};
+use common::secret::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use sqlx::PgPool;
 use std::net::SocketAddr;
@@ -17,19 +18,31 @@ use std::sync::Arc;
 use std::time::Instant;
 use tracing::instrument;
 
+/// User token request with password protected by SecretString.
+///
+/// The password field uses `SecretString` which:
+/// - Implements Debug with "[REDACTED]" to prevent accidental logging
+/// - Zeroizes memory on drop to prevent secrets lingering in memory
+/// - Requires explicit `.expose_secret()` call to access the value
 #[derive(Debug, Deserialize)]
 pub struct UserTokenRequest {
     pub username: String,
-    pub password: String,
+    pub password: SecretString,
 }
 
+/// Service token request with client_secret protected by SecretString.
+///
+/// The client_secret field uses `SecretString` which:
+/// - Implements Debug with "[REDACTED]" to prevent accidental logging
+/// - Zeroizes memory on drop to prevent secrets lingering in memory
+/// - Requires explicit `.expose_secret()` call to access the value
 #[derive(Debug, Deserialize)]
 pub struct ServiceTokenRequest {
     pub grant_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub client_secret: Option<String>,
+    pub client_secret: Option<SecretString>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
 }
@@ -62,7 +75,7 @@ pub async fn handle_user_token(
         &state.pool,
         &state.config.master_key,
         &payload.username,
-        &payload.password,
+        payload.password.expose_secret(),
     )
     .await;
 
@@ -207,7 +220,7 @@ fn extract_client_credentials(
 
     // Fall back to request body
     match (&payload.client_id, &payload.client_secret) {
-        (Some(id), Some(secret)) => Ok((id.clone(), secret.clone())),
+        (Some(id), Some(secret)) => Ok((id.clone(), secret.expose_secret().to_string())),
         _ => Err(AcError::InvalidCredentials),
     }
 }
@@ -261,7 +274,7 @@ mod tests {
         let payload = ServiceTokenRequest {
             grant_type: "client_credentials".to_string(),
             client_id: Some("test_client".to_string()),
-            client_secret: Some("test_secret".to_string()),
+            client_secret: Some(SecretString::from("test_secret")),
             scope: None,
         };
 
@@ -284,7 +297,7 @@ mod tests {
         let payload = ServiceTokenRequest {
             grant_type: "client_credentials".to_string(),
             client_id: Some("body_client".to_string()),
-            client_secret: Some("body_secret".to_string()),
+            client_secret: Some(SecretString::from("body_secret")),
             scope: None,
         };
 
@@ -360,7 +373,7 @@ mod tests {
         let payload = ServiceTokenRequest {
             grant_type: "client_credentials".to_string(),
             client_id: Some("body_client".to_string()),
-            client_secret: Some("body_secret".to_string()),
+            client_secret: Some(SecretString::from("body_secret")),
             scope: None,
         };
 
@@ -449,7 +462,7 @@ mod tests {
         let payload = ServiceTokenRequest {
             grant_type: "client_credentials".to_string(),
             client_id: Some("fallback_client".to_string()),
-            client_secret: Some("fallback_secret".to_string()),
+            client_secret: Some(SecretString::from("fallback_secret")),
             scope: None,
         };
 
@@ -474,7 +487,10 @@ mod tests {
         let req: ServiceTokenRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.grant_type, "client_credentials");
         assert_eq!(req.client_id, Some("test-client".to_string()));
-        assert_eq!(req.client_secret, Some("test-secret".to_string()));
+        assert_eq!(
+            req.client_secret.as_ref().map(|s| s.expose_secret()),
+            Some("test-secret")
+        );
         assert_eq!(req.scope, Some("read write".to_string()));
     }
 
@@ -500,38 +516,47 @@ mod tests {
 
         let req: UserTokenRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.username, "testuser");
-        assert_eq!(req.password, "testpass");
+        assert_eq!(req.password.expose_secret(), "testpass");
     }
 
     /// Test UserTokenRequest Debug implementation doesn't leak password
     ///
-    /// Ensures Debug output is safe for logging (password field exists).
+    /// With SecretString, Debug automatically redacts the password.
     #[test]
     fn test_user_token_request_debug() {
         let req = UserTokenRequest {
             username: "testuser".to_string(),
-            password: "secret123".to_string(),
+            password: SecretString::from("secret123"),
         };
 
         let debug_str = format!("{:?}", req);
-        // Debug should show the struct but we can't prevent password from appearing
-        // This test just ensures Debug is implemented
+        // Debug should show the struct name and username
         assert!(debug_str.contains("UserTokenRequest"));
+        assert!(debug_str.contains("testuser"));
+        // Password should be redacted, not exposed
+        assert!(!debug_str.contains("secret123"));
+        assert!(debug_str.contains("REDACTED"));
     }
 
-    /// Test ServiceTokenRequest Debug implementation
+    /// Test ServiceTokenRequest Debug implementation doesn't leak client_secret
+    ///
+    /// With SecretString, Debug automatically redacts the client_secret.
     #[test]
     fn test_service_token_request_debug() {
         let req = ServiceTokenRequest {
             grant_type: "client_credentials".to_string(),
             client_id: Some("test-client".to_string()),
-            client_secret: Some("test-secret".to_string()),
+            client_secret: Some(SecretString::from("test-secret")),
             scope: Some("read write".to_string()),
         };
 
         let debug_str = format!("{:?}", req);
         assert!(debug_str.contains("ServiceTokenRequest"));
         assert!(debug_str.contains("client_credentials"));
+        assert!(debug_str.contains("test-client"));
+        // client_secret should be redacted, not exposed
+        assert!(!debug_str.contains("test-secret"));
+        assert!(debug_str.contains("REDACTED"));
     }
 
     // ============================================================================
@@ -552,7 +577,7 @@ mod tests {
         let payload = ServiceTokenRequest {
             grant_type: "password".to_string(), // Invalid - should be client_credentials
             client_id: Some("test-client".to_string()),
-            client_secret: Some("test-secret".to_string()),
+            client_secret: Some(SecretString::from("test-secret")),
             scope: None,
         };
 
@@ -606,7 +631,7 @@ mod tests {
         let payload = ServiceTokenRequest {
             grant_type: "client_credentials".to_string(),
             client_id: Some(registration.client_id.clone()),
-            client_secret: Some(registration.client_secret.clone()),
+            client_secret: Some(SecretString::from(registration.client_secret.clone())),
             scope: None,
         };
 
@@ -653,7 +678,7 @@ mod tests {
         let payload = ServiceTokenRequest {
             grant_type: "client_credentials".to_string(),
             client_id: Some(registration.client_id.clone()),
-            client_secret: Some(registration.client_secret.clone()),
+            client_secret: Some(SecretString::from(registration.client_secret.clone())),
             scope: Some("meeting:read meeting:update".to_string()), // Request allowed scopes
         };
 
@@ -704,7 +729,7 @@ mod tests {
         let payload = ServiceTokenRequest {
             grant_type: "client_credentials".to_string(),
             client_id: Some(registration.client_id.clone()),
-            client_secret: Some(registration.client_secret.clone()),
+            client_secret: Some(SecretString::from(registration.client_secret.clone())),
             scope: None,
         };
 
@@ -750,7 +775,7 @@ mod tests {
         let payload = ServiceTokenRequest {
             grant_type: "client_credentials".to_string(),
             client_id: Some(registration.client_id.clone()),
-            client_secret: Some(registration.client_secret.clone()),
+            client_secret: Some(SecretString::from(registration.client_secret.clone())),
             scope: None,
         };
 
