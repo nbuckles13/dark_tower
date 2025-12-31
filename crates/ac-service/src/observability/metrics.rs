@@ -177,6 +177,25 @@ pub fn record_error(operation: &str, error_category: &str, status_code: u16) {
 }
 
 // ============================================================================
+// Admin Operations Metrics
+// ============================================================================
+
+/// Record admin client management operation
+///
+/// Metric: `ac_admin_operations_total`
+/// Labels: `operation`, `status`
+///
+/// Operations: list, get, create, update, delete, rotate_secret
+/// Status: success, error
+///
+/// NOTE: Defined per review feedback O2 for admin operation tracking.
+#[allow(dead_code)]
+pub fn record_admin_operation(operation: &str, status: &str) {
+    counter!("ac_admin_operations_total", "operation" => operation.to_string(), "status" => status.to_string())
+        .increment(1);
+}
+
+// ============================================================================
 // HTTP Request Metrics
 // ============================================================================
 
@@ -225,10 +244,84 @@ fn normalize_path(path: &str) -> String {
         "/api/v1/auth/service/token" => "/api/v1/auth/service/token".to_string(),
         "/api/v1/auth/user/token" => "/api/v1/auth/user/token".to_string(),
         "/api/v1/admin/services/register" => "/api/v1/admin/services/register".to_string(),
+        "/api/v1/admin/clients" => "/api/v1/admin/clients".to_string(),
         "/internal/rotate-keys" => "/internal/rotate-keys".to_string(),
-        // For unknown paths, use a generic label to bound cardinality
-        _ => "/other".to_string(),
+        // For paths with dynamic segments (UUIDs), normalize them
+        _ => normalize_dynamic_path(path),
     }
+}
+
+/// Normalize paths with dynamic UUID segments
+///
+/// Replaces UUIDs with {id} placeholder to bound cardinality while
+/// preserving path structure for meaningful metrics.
+///
+/// Examples:
+/// - `/api/v1/admin/clients/550e8400-e29b-41d4-a716-446655440000` → `/api/v1/admin/clients/{id}`
+/// - `/api/v1/admin/clients/550e8400-e29b-41d4-a716-446655440000/rotate-secret` → `/api/v1/admin/clients/{id}/rotate-secret`
+fn normalize_dynamic_path(path: &str) -> String {
+    // Check for admin client paths with UUID
+    if path.starts_with("/api/v1/admin/clients/") {
+        let parts: Vec<&str> = path.split('/').collect();
+
+        // /api/v1/admin/clients/{uuid} → parts.len() == 6
+        // Use get() to avoid potential panic per ADR-0002
+        if parts.len() == 6 {
+            if let Some(segment) = parts.get(5) {
+                if is_uuid(segment) {
+                    return "/api/v1/admin/clients/{id}".to_string();
+                }
+            }
+        }
+
+        // /api/v1/admin/clients/{uuid}/rotate-secret → parts.len() == 7
+        if parts.len() == 7 {
+            if let (Some(id_segment), Some(action)) = (parts.get(5), parts.get(6)) {
+                if is_uuid(id_segment) && *action == "rotate-secret" {
+                    return "/api/v1/admin/clients/{id}/rotate-secret".to_string();
+                }
+            }
+        }
+    }
+
+    // For unknown paths, use a generic label to bound cardinality
+    "/other".to_string()
+}
+
+/// Check if a string matches UUID format (8-4-4-4-12 hex digits with dashes)
+///
+/// This is a lightweight check that doesn't validate UUID variants.
+/// Good enough for metrics path normalization.
+fn is_uuid(s: &str) -> bool {
+    // UUID format: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+    // Length: 36 characters (32 hex + 4 dashes)
+    if s.len() != 36 {
+        return false;
+    }
+
+    let bytes = s.as_bytes();
+
+    // Check dashes at positions 8, 13, 18, 23
+    // Use get() to avoid potential panic per ADR-0002
+    if bytes.get(8) != Some(&b'-')
+        || bytes.get(13) != Some(&b'-')
+        || bytes.get(18) != Some(&b'-')
+        || bytes.get(23) != Some(&b'-')
+    {
+        return false;
+    }
+
+    // Check all other characters are hex digits
+    for (i, &byte) in bytes.iter().enumerate() {
+        if i == 8 || i == 13 || i == 18 || i == 23 {
+            continue; // Skip dashes
+        }
+        if !byte.is_ascii_hexdigit() {
+            return false;
+        }
+    }
+
+    true
 }
 
 #[cfg(test)]
@@ -441,5 +534,122 @@ mod tests {
         assert_eq!(normalize_path("/api/v2/something"), "/other");
         assert_eq!(normalize_path("/users/123"), "/other");
         assert_eq!(normalize_path("/api/v1/auth/service/token/extra"), "/other");
+    }
+
+    #[test]
+    fn test_normalize_path_admin_clients() {
+        // Static admin clients path
+        assert_eq!(
+            normalize_path("/api/v1/admin/clients"),
+            "/api/v1/admin/clients"
+        );
+
+        // Admin clients with UUID (GET /api/v1/admin/clients/{id})
+        assert_eq!(
+            normalize_path("/api/v1/admin/clients/550e8400-e29b-41d4-a716-446655440000"),
+            "/api/v1/admin/clients/{id}"
+        );
+
+        // Admin clients rotate secret (POST /api/v1/admin/clients/{id}/rotate-secret)
+        assert_eq!(
+            normalize_path(
+                "/api/v1/admin/clients/550e8400-e29b-41d4-a716-446655440000/rotate-secret"
+            ),
+            "/api/v1/admin/clients/{id}/rotate-secret"
+        );
+
+        // Different UUIDs should normalize to same path (cardinality bounded)
+        assert_eq!(
+            normalize_path("/api/v1/admin/clients/123e4567-e89b-12d3-a456-426614174000"),
+            "/api/v1/admin/clients/{id}"
+        );
+        assert_eq!(
+            normalize_path("/api/v1/admin/clients/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"),
+            "/api/v1/admin/clients/{id}"
+        );
+    }
+
+    #[test]
+    fn test_is_uuid_valid() {
+        // Valid UUIDs
+        assert!(is_uuid("550e8400-e29b-41d4-a716-446655440000"));
+        assert!(is_uuid("123e4567-e89b-12d3-a456-426614174000"));
+        assert!(is_uuid("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"));
+        assert!(is_uuid("00000000-0000-0000-0000-000000000000"));
+        assert!(is_uuid("ffffffff-ffff-ffff-ffff-ffffffffffff"));
+
+        // Mixed case should work (hex digits are case-insensitive)
+        assert!(is_uuid("AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE"));
+        assert!(is_uuid("AaBbCcDd-EeFf-0011-2233-445566778899"));
+    }
+
+    #[test]
+    fn test_is_uuid_invalid() {
+        // Wrong length
+        assert!(!is_uuid("550e8400-e29b-41d4-a716-44665544000")); // 35 chars
+        assert!(!is_uuid("550e8400-e29b-41d4-a716-4466554400000")); // 37 chars
+        assert!(!is_uuid("")); // Empty
+        assert!(!is_uuid("123")); // Too short
+
+        // Wrong dash positions
+        assert!(!is_uuid("550e8400e29b-41d4-a716-446655440000")); // Missing dash at position 8
+        assert!(!is_uuid("550e8400-e29b41d4-a716-446655440000")); // Missing dash at position 13
+        assert!(!is_uuid("550e8400-e29b-41d4a716-446655440000")); // Missing dash at position 18
+        assert!(!is_uuid("550e8400-e29b-41d4-a716446655440000")); // Missing dash at position 23
+
+        // Non-hex characters
+        assert!(!is_uuid("550e8400-e29b-41d4-a716-44665544000g")); // 'g' is not hex
+        assert!(!is_uuid("550e8400-e29b-41d4-a716-44665544000 ")); // Space
+        assert!(!is_uuid("550e8400-e29b-41d4-a716-44665544000!")); // Special char
+
+        // Not a UUID at all
+        assert!(!is_uuid("not-a-uuid"));
+        assert!(!is_uuid("xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx")); // 'x' is hex, but this tests format
+        assert!(!is_uuid("550e8400-e29b-41d4-a716-4466554400zz")); // 'z' is not hex
+    }
+
+    #[test]
+    fn test_normalize_dynamic_path_edge_cases() {
+        // Path with UUID but wrong structure
+        assert_eq!(
+            normalize_dynamic_path(
+                "/api/v1/admin/clients/550e8400-e29b-41d4-a716-446655440000/other"
+            ),
+            "/other"
+        );
+
+        // Path with non-UUID
+        assert_eq!(
+            normalize_dynamic_path("/api/v1/admin/clients/not-a-uuid"),
+            "/other"
+        );
+
+        // Path with numeric ID instead of UUID
+        assert_eq!(
+            normalize_dynamic_path("/api/v1/admin/clients/123"),
+            "/other"
+        );
+
+        // Completely different path
+        assert_eq!(
+            normalize_dynamic_path("/api/v2/users/550e8400-e29b-41d4-a716-446655440000"),
+            "/other"
+        );
+    }
+
+    #[test]
+    fn test_record_admin_operation() {
+        // Test with various operations and statuses
+        record_admin_operation("list", "success");
+        record_admin_operation("get", "success");
+        record_admin_operation("create", "success");
+        record_admin_operation("update", "success");
+        record_admin_operation("delete", "success");
+        record_admin_operation("rotate_secret", "success");
+
+        // Error cases
+        record_admin_operation("create", "error");
+        record_admin_operation("update", "error");
+        record_admin_operation("delete", "error");
     }
 }
