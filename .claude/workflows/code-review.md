@@ -66,7 +66,7 @@ Trigger this workflow:
 
 **Output**: Change summary document
 
-### Step 2: Determine Relevant ADRs
+### Step 2: Determine Relevant ADRs and Principles
 
 **Orchestrator Action**:
 1. List all ADRs in `docs/decisions/`
@@ -75,8 +75,22 @@ Trigger this workflow:
    - Keywords (e.g., "JWT", "OAuth" → ADR-0003)
    - Component tags in ADR metadata
 3. Create focused ADR list (typically 2-5 ADRs per review)
+4. **Match changes to principle categories** (see `contextual-injection.md`):
+   - Use same task-to-category mapping as implementation phase
+   - Reviewer receives same principles that were given to implementer
+   - This ensures consistent standards between implementation and review
 
-**Output**: List of relevant ADRs with compliance requirements
+**Task-to-Category Mapping** (match file paths/changes against):
+```yaml
+"password|hash|bcrypt|encrypt|decrypt|key|secret": [crypto, logging]
+"query|select|database|migration|sql": [queries, logging]
+"jwt|token|auth|oauth|bearer": [crypto, jwt, logging]
+"handler|endpoint|route|api": [logging, errors, input]
+"client|credential|oauth": [crypto, logging, errors]
+"parse|input|validate|request": [input, errors]
+```
+
+**Output**: List of relevant ADRs and principle categories
 
 ### Step 3: Parallel Specialist Reviews
 
@@ -342,6 +356,19 @@ If specialists disagree:
 - ⚠️ ADR-YYYY: Partial compliance (details...)
 - ❌ ADR-ZZZZ: Non-compliant (must address)
 
+## Principle Compliance
+[Matched principle categories and compliance status]
+
+### Principle Checklist
+- [ ] **crypto.md**: No hardcoded secrets, EdDSA for signing, bcrypt≥12, CSPRNG
+- [ ] **jwt.md**: Token validation, size limits, algorithm enforcement
+- [ ] **logging.md**: No secrets in logs, SecretString usage, structured format
+- [ ] **queries.md**: Parameterized SQL, no string concatenation
+- [ ] **errors.md**: No panics, Result types, generic API messages
+- [ ] **input.md**: Length limits, type validation, early rejection
+
+(Check only categories that were matched to this change)
+
 ## Action Plan
 
 ### Immediate Actions (Before Merge)
@@ -515,3 +542,9 @@ After each review:
 ---
 
 **Remember**: The goal is **high-quality, secure code delivered rapidly**. Reviews should enable confidence, not create bottlenecks. Be thorough on security, pragmatic on style.
+
+## Related Workflows
+
+- **contextual-injection.md**: How to match tasks to principle categories
+- **orchestrator-guide.md**: Principles are also injected during debates
+- **multi-agent-debate.md**: Debate mechanics and format

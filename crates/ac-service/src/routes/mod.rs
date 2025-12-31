@@ -74,6 +74,21 @@ pub fn build_routes(
             "/api/v1/admin/services/register",
             post(admin_handler::handle_register_service),
         )
+        // OAuth client management CRUD endpoints
+        .route(
+            "/api/v1/admin/clients",
+            get(admin_handler::handle_list_clients).post(admin_handler::handle_create_client),
+        )
+        .route(
+            "/api/v1/admin/clients/{id}",
+            get(admin_handler::handle_get_client)
+                .put(admin_handler::handle_update_client)
+                .delete(admin_handler::handle_delete_client),
+        )
+        .route(
+            "/api/v1/admin/clients/{id}/rotate-secret",
+            post(admin_handler::handle_rotate_client_secret),
+        )
         .layer(middleware::from_fn_with_state(
             auth_state.clone(),
             require_admin_scope,

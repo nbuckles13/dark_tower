@@ -107,7 +107,9 @@ impl From<&crate::errors::AcError> for ErrorCategory {
             | AcError::TooManyRequests { .. } => ErrorCategory::Authentication,
             AcError::InsufficientScope { .. } => ErrorCategory::Authorization,
             AcError::InvalidToken(_) | AcError::Crypto(_) => ErrorCategory::Cryptographic,
-            AcError::Database(_) | AcError::Internal => ErrorCategory::Internal,
+            AcError::Database(_) | AcError::Internal | AcError::NotFound(_) => {
+                ErrorCategory::Internal
+            }
         }
     }
 }

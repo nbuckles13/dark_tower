@@ -89,15 +89,19 @@ Use a **single message with multiple Task tool calls** for parallel execution.
 
 ```
 1. Analyze feature → Identify affected specialists
-2. Propose debate to user (include Test and Security specialists)
-3. Get user approval
-4. Initiate N-agent debate
-5. Reach consensus (90%+ satisfaction)
-6. Create ADR file (Architecture Decision Record)
-7. Invoke specialists to implement (parallel when possible)
-8. Test specialist creates E2E tests
-9. Security specialist validates implementation meets security requirements
-10. Commit and document
+2. Match task to principle categories (see contextual-injection.md)
+3. Propose debate to user (include Test and Security specialists)
+4. Get user approval
+5. Initiate N-agent debate (inject matched principles into context)
+6. Reach consensus (90%+ satisfaction)
+7. Create ADR file (Architecture Decision Record)
+8. Invoke specialists to implement (with principles injected)
+9. Run category-matched guards on produced code
+10. Apply hybrid iteration (auto-fix simple, escalate complex)
+11. Test specialist creates E2E tests
+12. Security specialist validates implementation meets security requirements
+13. Run ALL guards before commit
+14. Commit and document
 ```
 
 ### For Bug Fixes
@@ -194,14 +198,51 @@ At the beginning of each session:
 - [ ] Understand current todo list
 - [ ] Identify which specialists needed for today's work
 
+## Contextual Injection
+
+When invoking specialists, inject relevant principles based on task keywords:
+
+**Task-to-Category Mapping**:
+```yaml
+"password|hash|bcrypt|encrypt|decrypt|key|secret": [crypto, logging]
+"query|select|database|migration|sql": [queries, logging]
+"jwt|token|auth|oauth|bearer": [crypto, jwt, logging]
+"handler|endpoint|route|api": [logging, errors, input]
+"client|credential|oauth": [crypto, logging, errors]
+"parse|input|validate|request": [input, errors]
+```
+
+**Category Files** (`docs/principles/`):
+- `crypto.md` - EdDSA, bcrypt, CSPRNG, key rotation, no hardcoded secrets
+- `jwt.md` - Token validation, claims, expiry, size limits
+- `logging.md` - No PII, no secrets, SecretString, structured format
+- `queries.md` - Parameterized SQL, org_id filter, no dynamic SQL
+- `errors.md` - No panics, Result types, generic API messages
+- `input.md` - Length limits, type validation, early rejection
+
+**Guard Execution**:
+- During work: Run category-matched guards only
+- Pre-commit: Run ALL simple guards
+- CI: Run ALL guards
+
+See `.claude/workflows/contextual-injection.md` for complete details.
+
 ## Quick Reference
 
-**Invoke specialist**:
+**Invoke specialist with principles**:
 ```
 Task(
   subagent_type="general-purpose",
   description="{specialist} does {task}",
-  prompt="{specialist definition} + {task details}"
+  prompt="""
+    {specialist definition}
+
+    ## Project Principles (MUST FOLLOW)
+    {matched category principles from docs/principles/}
+
+    ## Task
+    {task details}
+  """
 )
 ```
 

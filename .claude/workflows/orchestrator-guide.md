@@ -264,6 +264,18 @@ Proceed? [Y/n/revise]
 
 ## Context Building Strategy
 
+### Principle Injection (ALWAYS)
+
+Before building debate context, inject relevant project principles:
+
+1. Match debate topic against task patterns (see `.claude/workflows/contextual-injection.md`)
+2. Include matched category principles in Round 1 context
+3. All specialists see same principles during debate
+
+**Example**: Debate on "JWT refresh token strategy"
+- Matched patterns: `jwt|token|auth` → crypto, jwt, logging categories
+- All participants receive these principles in their context
+
 ### Early Rounds (1-3)
 
 ```markdown
@@ -275,6 +287,13 @@ Proceed? [Y/n/revise]
 ## Participating Agents
 - {agent1}: {1-line responsibility}
 - {agent2}: {1-line responsibility}
+
+## Project Principles (MUST FOLLOW)
+{Inject matched category principles from docs/principles/}
+- crypto.md (if crypto-related)
+- jwt.md (if JWT-related)
+- logging.md (if logging-related)
+- errors.md (always for production code)
 
 ## Round {N}/10
 
@@ -410,12 +429,19 @@ Content:
 ## Best Practices
 
 1. **Always ask user approval before starting debate** ⚠️ CRITICAL
-2. **Read agent definitions fresh**: Don't rely on memory
-3. **Be precise with context**: Include exactly what's needed
-4. **Monitor token usage**: Summarize aggressively if approaching limits
-5. **Trust the scores**: Don't second-guess specialist satisfaction
-6. **Escalate thoughtfully**: Explain disagreements clearly
-7. **Document everything**: ADRs are valuable long-term
+2. **Inject relevant principles**: Match topic to categories, include in context
+3. **Read agent definitions fresh**: Don't rely on memory
+4. **Be precise with context**: Include exactly what's needed
+5. **Monitor token usage**: Summarize aggressively if approaching limits
+6. **Trust the scores**: Don't second-guess specialist satisfaction
+7. **Escalate thoughtfully**: Explain disagreements clearly
+8. **Document everything**: ADRs are valuable long-term
+
+## Related Workflows
+
+- **contextual-injection.md**: How to match tasks to principle categories
+- **code-review.md**: Reviews check against same principles given to implementer
+- **multi-agent-debate.md**: Debate mechanics and format
 
 ## Error Handling
 

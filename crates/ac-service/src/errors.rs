@@ -26,6 +26,9 @@ pub enum AcError {
     #[error("Invalid token: {0}")]
     InvalidToken(String),
 
+    #[error("Not found: {0}")]
+    NotFound(String),
+
     #[error("Rate limit exceeded")]
     RateLimitExceeded,
 
@@ -46,6 +49,7 @@ impl AcError {
             AcError::Database(_) | AcError::Crypto(_) | AcError::Internal => 500,
             AcError::InvalidCredentials | AcError::InvalidToken(_) => 401,
             AcError::InsufficientScope { .. } => 403,
+            AcError::NotFound(_) => 404,
             AcError::RateLimitExceeded | AcError::TooManyRequests { .. } => 429,
         }
     }
@@ -111,6 +115,14 @@ impl IntoResponse for AcError {
                 StatusCode::UNAUTHORIZED,
                 "INVALID_TOKEN",
                 reason.clone(),
+                None,
+                None,
+                None,
+            ),
+            AcError::NotFound(resource) => (
+                StatusCode::NOT_FOUND,
+                "NOT_FOUND",
+                resource.clone(),
                 None,
                 None,
                 None,

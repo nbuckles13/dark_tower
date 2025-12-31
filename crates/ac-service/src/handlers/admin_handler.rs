@@ -1,17 +1,19 @@
+use crate::crypto;
 use crate::errors::AcError;
 use crate::models::RegisterServiceResponse;
 use crate::observability::metrics::{record_error, record_key_rotation};
 use crate::observability::ErrorCategory;
-use crate::repositories::signing_keys;
+use crate::repositories::{service_credentials, signing_keys};
 use crate::services::{key_management_service, registration_service};
 use axum::{
-    extract::{Request, State},
+    extract::{Path, Request, State},
     Json,
 };
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::instrument;
+use uuid::Uuid;
 
 use super::auth_handler::AppState;
 
@@ -373,6 +375,671 @@ pub async fn handle_rotate_keys(
     }))
 }
 
+// ============================================================================
+// OAuth Client Management CRUD Endpoints
+// ============================================================================
+
+/// Client list item response (excludes client_secret_hash)
+#[derive(Debug, Serialize)]
+pub struct ClientListItem {
+    pub id: Uuid,
+    pub client_id: String,
+    pub service_type: String,
+    pub scopes: Vec<String>,
+    pub is_active: bool,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Client detail response (excludes client_secret_hash)
+#[derive(Debug, Serialize)]
+pub struct ClientDetailResponse {
+    pub id: Uuid,
+    pub client_id: String,
+    pub service_type: String,
+    pub region: Option<String>,
+    pub scopes: Vec<String>,
+    pub is_active: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Create client request
+#[derive(Debug, Deserialize)]
+pub struct CreateClientRequest {
+    pub service_type: String,
+    pub region: Option<String>,
+}
+
+/// Create client response (ONLY time client_secret is returned)
+#[derive(Debug, Serialize)]
+pub struct CreateClientResponse {
+    pub id: Uuid,
+    pub client_id: String,
+    pub client_secret: String, // ONLY returned at creation time
+    pub service_type: String,
+    pub scopes: Vec<String>,
+}
+
+/// Update client request
+#[derive(Debug, Deserialize)]
+pub struct UpdateClientRequest {
+    pub scopes: Option<Vec<String>>,
+}
+
+/// Rotate secret response (ONLY time new client_secret is returned)
+#[derive(Debug, Serialize)]
+pub struct RotateSecretResponse {
+    pub client_id: String,
+    pub client_secret: String, // New secret - ONLY returned at rotation time
+}
+
+/// List all OAuth clients
+///
+/// GET /api/v1/admin/clients
+///
+/// Returns all registered OAuth clients (excludes client_secret)
+///
+/// ADR-0011: Handler instrumented with skip_all to prevent PII leakage.
+#[instrument(name = "ac.admin.list_clients", skip_all, fields(status))]
+pub async fn handle_list_clients(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Vec<ClientListItem>>, AcError> {
+    // Fetch all credentials
+    let result = service_credentials::get_all(&state.pool).await;
+
+    match result {
+        Ok(credentials) => {
+            // Map to response type (exclude client_secret_hash)
+            let clients: Vec<ClientListItem> = credentials
+                .into_iter()
+                .map(|c| ClientListItem {
+                    id: c.credential_id,
+                    client_id: c.client_id,
+                    service_type: c.service_type,
+                    scopes: c.scopes,
+                    is_active: c.is_active,
+                    created_at: c.created_at,
+                })
+                .collect();
+
+            tracing::Span::current().record("status", "success");
+
+            // Audit log successful operation
+            tracing::info!(
+                target: "audit",
+                event = "clients_listed",
+                success = true,
+                count = clients.len(),
+                "Clients listed successfully"
+            );
+
+            Ok(Json(clients))
+        }
+        Err(e) => {
+            tracing::Span::current().record("status", "error");
+            let category = ErrorCategory::from(&e);
+            record_error("list_clients", category.as_str(), e.status_code());
+
+            // Audit log failed operation
+            tracing::warn!(
+                target: "audit",
+                event = "clients_listed",
+                success = false,
+                "Failed to list clients"
+            );
+
+            Err(e)
+        }
+    }
+}
+
+/// Get specific client details
+///
+/// GET /api/v1/admin/clients/{id}
+///
+/// Returns detailed information about a specific client (excludes client_secret)
+///
+/// ADR-0011: Handler instrumented with skip_all to prevent PII leakage.
+#[instrument(name = "ac.admin.get_client", skip_all, fields(status))]
+pub async fn handle_get_client(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<ClientDetailResponse>, AcError> {
+    // Fetch credential by ID
+    let result = service_credentials::get_by_credential_id(&state.pool, id).await;
+
+    match result {
+        Ok(Some(credential)) => {
+            // Map to response type (exclude client_secret_hash)
+            let response = ClientDetailResponse {
+                id: credential.credential_id,
+                client_id: credential.client_id.clone(),
+                service_type: credential.service_type,
+                region: credential.region,
+                scopes: credential.scopes,
+                is_active: credential.is_active,
+                created_at: credential.created_at,
+                updated_at: credential.updated_at,
+            };
+
+            tracing::Span::current().record("status", "success");
+
+            // Audit log successful operation
+            tracing::info!(
+                target: "audit",
+                event = "client_retrieved",
+                success = true,
+                credential_id = %id,
+                "Client retrieved successfully"
+            );
+
+            Ok(Json(response))
+        }
+        Ok(None) => {
+            tracing::Span::current().record("status", "error");
+            let err = AcError::NotFound(format!("Client with ID {} not found", id));
+            record_error(
+                "get_client",
+                ErrorCategory::from(&err).as_str(),
+                err.status_code(),
+            );
+
+            // Audit log failed operation
+            tracing::warn!(
+                target: "audit",
+                event = "client_retrieved",
+                success = false,
+                credential_id = %id,
+                "Client not found"
+            );
+
+            Err(err)
+        }
+        Err(e) => {
+            tracing::Span::current().record("status", "error");
+            let category = ErrorCategory::from(&e);
+            record_error("get_client", category.as_str(), e.status_code());
+
+            // Audit log failed operation
+            tracing::warn!(
+                target: "audit",
+                event = "client_retrieved",
+                success = false,
+                credential_id = %id,
+                "Failed to retrieve client"
+            );
+
+            Err(e)
+        }
+    }
+}
+
+/// Create new OAuth client
+///
+/// POST /api/v1/admin/clients
+///
+/// Generates client_id and client_secret, stores in database.
+/// This is the ONLY time the plaintext client_secret is returned.
+///
+/// ADR-0011: Handler instrumented with skip_all to prevent PII leakage.
+/// Only safe fields (service_type, status) are recorded.
+#[instrument(
+    name = "ac.admin.create_client",
+    skip_all,
+    fields(service_type, status)
+)]
+pub async fn handle_create_client(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<CreateClientRequest>,
+) -> Result<Json<CreateClientResponse>, AcError> {
+    // Record service_type for tracing (safe field per ADR-0011)
+    tracing::Span::current().record("service_type", &payload.service_type);
+
+    // Validate service_type
+    let valid_types = ["global-controller", "meeting-controller", "media-handler"];
+    if !valid_types.contains(&payload.service_type.as_str()) {
+        tracing::Span::current().record("status", "error");
+        let err = AcError::Database(format!(
+            "Invalid service_type: '{}'. Must be one of: {}",
+            payload.service_type,
+            valid_types.join(", ")
+        ));
+        record_error(
+            "create_client",
+            ErrorCategory::from(&err).as_str(),
+            err.status_code(),
+        );
+
+        // Audit log failed operation
+        tracing::warn!(
+            target: "audit",
+            event = "client_created",
+            success = false,
+            service_type = %payload.service_type,
+            "Client creation failed: invalid service_type"
+        );
+
+        return Err(err);
+    }
+
+    // Use existing registration service to create the client
+    let result =
+        registration_service::register_service(&state.pool, &payload.service_type, payload.region)
+            .await;
+
+    match result {
+        Ok(registration) => {
+            // Fetch the created credential to get credential_id
+            let credential =
+                service_credentials::get_by_client_id(&state.pool, &registration.client_id)
+                    .await?
+                    .ok_or_else(|| {
+                        AcError::Database("Failed to retrieve created credential".to_string())
+                    })?;
+
+            // Map to response type
+            let response = CreateClientResponse {
+                id: credential.credential_id,
+                client_id: registration.client_id.clone(),
+                client_secret: registration.client_secret, // ONLY returned here
+                service_type: registration.service_type,
+                scopes: registration.scopes,
+            };
+
+            tracing::Span::current().record("status", "success");
+
+            // Audit log successful operation
+            tracing::info!(
+                target: "audit",
+                event = "client_created",
+                success = true,
+                credential_id = %credential.credential_id,
+                client_id = %registration.client_id,
+                "Client created successfully"
+            );
+
+            Ok(Json(response))
+        }
+        Err(e) => {
+            tracing::Span::current().record("status", "error");
+            let category = ErrorCategory::from(&e);
+            record_error("create_client", category.as_str(), e.status_code());
+
+            // Audit log failed operation
+            tracing::warn!(
+                target: "audit",
+                event = "client_created",
+                success = false,
+                "Failed to create client"
+            );
+
+            Err(e)
+        }
+    }
+}
+
+/// Update client metadata
+///
+/// PUT /api/v1/admin/clients/{id}
+///
+/// Updates client scopes. Cannot update client_id or regenerate secret.
+///
+/// ADR-0011: Handler instrumented with skip_all to prevent PII leakage.
+#[instrument(name = "ac.admin.update_client", skip_all, fields(status))]
+pub async fn handle_update_client(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<Uuid>,
+    Json(payload): Json<UpdateClientRequest>,
+) -> Result<Json<ClientDetailResponse>, AcError> {
+    // Verify credential exists
+    let result = service_credentials::get_by_credential_id(&state.pool, id).await;
+
+    let credential = match result {
+        Ok(Some(c)) => c,
+        Ok(None) => {
+            tracing::Span::current().record("status", "error");
+            let err = AcError::NotFound(format!("Client with ID {} not found", id));
+            record_error(
+                "update_client",
+                ErrorCategory::from(&err).as_str(),
+                err.status_code(),
+            );
+
+            // Audit log failed operation
+            tracing::warn!(
+                target: "audit",
+                event = "client_updated",
+                success = false,
+                credential_id = %id,
+                "Client not found"
+            );
+
+            return Err(err);
+        }
+        Err(e) => {
+            tracing::Span::current().record("status", "error");
+            let category = ErrorCategory::from(&e);
+            record_error("update_client", category.as_str(), e.status_code());
+
+            // Audit log failed operation
+            tracing::warn!(
+                target: "audit",
+                event = "client_updated",
+                success = false,
+                credential_id = %id,
+                "Failed to update client"
+            );
+
+            return Err(e);
+        }
+    };
+
+    // Update scopes if provided
+    let updated_credential = if let Some(new_scopes) = payload.scopes {
+        // Validate scopes format
+        for scope in &new_scopes {
+            // Basic scope validation: non-empty, reasonable length, allowed characters
+            if scope.is_empty() {
+                tracing::Span::current().record("status", "error");
+                let err = AcError::Database("Scope cannot be empty".to_string());
+                record_error(
+                    "update_client",
+                    ErrorCategory::from(&err).as_str(),
+                    err.status_code(),
+                );
+
+                // Audit log failed operation
+                tracing::warn!(
+                    target: "audit",
+                    event = "client_updated",
+                    success = false,
+                    credential_id = %id,
+                    "Invalid scope: empty"
+                );
+
+                return Err(err);
+            }
+
+            if scope.len() > 100 {
+                tracing::Span::current().record("status", "error");
+                let err = AcError::Database(format!(
+                    "Scope '{}' exceeds maximum length of 100 characters",
+                    scope
+                ));
+                record_error(
+                    "update_client",
+                    ErrorCategory::from(&err).as_str(),
+                    err.status_code(),
+                );
+
+                // Audit log failed operation
+                tracing::warn!(
+                    target: "audit",
+                    event = "client_updated",
+                    success = false,
+                    credential_id = %id,
+                    "Invalid scope: too long"
+                );
+
+                return Err(err);
+            }
+
+            // Allow alphanumeric, hyphens, dots, colons (common in OAuth scopes)
+            if !scope
+                .chars()
+                .all(|c| c.is_alphanumeric() || c == '-' || c == '.' || c == ':')
+            {
+                tracing::Span::current().record("status", "error");
+                let err = AcError::Database(format!("Scope '{}' contains invalid characters. Only alphanumeric, hyphens, dots, and colons are allowed", scope));
+                record_error(
+                    "update_client",
+                    ErrorCategory::from(&err).as_str(),
+                    err.status_code(),
+                );
+
+                // Audit log failed operation
+                tracing::warn!(
+                    target: "audit",
+                    event = "client_updated",
+                    success = false,
+                    credential_id = %id,
+                    "Invalid scope: invalid characters"
+                );
+
+                return Err(err);
+            }
+        }
+
+        service_credentials::update_metadata(&state.pool, id, &new_scopes).await?
+    } else {
+        // No updates requested, return current credential
+        credential
+    };
+
+    // Map to response type
+    let response = ClientDetailResponse {
+        id: updated_credential.credential_id,
+        client_id: updated_credential.client_id.clone(),
+        service_type: updated_credential.service_type,
+        region: updated_credential.region,
+        scopes: updated_credential.scopes,
+        is_active: updated_credential.is_active,
+        created_at: updated_credential.created_at,
+        updated_at: updated_credential.updated_at,
+    };
+
+    tracing::Span::current().record("status", "success");
+
+    // Audit log successful operation
+    tracing::info!(
+        target: "audit",
+        event = "client_updated",
+        success = true,
+        credential_id = %id,
+        "Client updated successfully"
+    );
+
+    Ok(Json(response))
+}
+
+/// Delete client
+///
+/// DELETE /api/v1/admin/clients/{id}
+///
+/// Hard delete - removes credentials from database.
+///
+/// ADR-0011: Handler instrumented with skip_all to prevent PII leakage.
+#[instrument(name = "ac.admin.delete_client", skip_all, fields(status))]
+pub async fn handle_delete_client(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, AcError> {
+    // First check if credential exists
+    let result = service_credentials::get_by_credential_id(&state.pool, id).await;
+
+    match result {
+        Ok(Some(_)) => {
+            // Credential exists, proceed with deletion
+            let delete_result = service_credentials::delete(&state.pool, id).await;
+
+            match delete_result {
+                Ok(_) => {
+                    tracing::Span::current().record("status", "success");
+
+                    // Audit log successful operation
+                    tracing::info!(
+                        target: "audit",
+                        event = "client_deleted",
+                        success = true,
+                        credential_id = %id,
+                        "Client deleted successfully"
+                    );
+
+                    Ok(Json(serde_json::json!({ "deleted": true })))
+                }
+                Err(e) => {
+                    tracing::Span::current().record("status", "error");
+                    let category = ErrorCategory::from(&e);
+                    record_error("delete_client", category.as_str(), e.status_code());
+
+                    // Audit log failed operation
+                    tracing::warn!(
+                        target: "audit",
+                        event = "client_deleted",
+                        success = false,
+                        credential_id = %id,
+                        "Failed to delete client"
+                    );
+
+                    Err(e)
+                }
+            }
+        }
+        Ok(None) => {
+            tracing::Span::current().record("status", "error");
+            let err = AcError::NotFound(format!("Client with ID {} not found", id));
+            record_error(
+                "delete_client",
+                ErrorCategory::from(&err).as_str(),
+                err.status_code(),
+            );
+
+            // Audit log failed operation
+            tracing::warn!(
+                target: "audit",
+                event = "client_deleted",
+                success = false,
+                credential_id = %id,
+                "Client not found"
+            );
+
+            Err(err)
+        }
+        Err(e) => {
+            tracing::Span::current().record("status", "error");
+            let category = ErrorCategory::from(&e);
+            record_error("delete_client", category.as_str(), e.status_code());
+
+            // Audit log failed operation
+            tracing::warn!(
+                target: "audit",
+                event = "client_deleted",
+                success = false,
+                credential_id = %id,
+                "Failed to delete client"
+            );
+
+            Err(e)
+        }
+    }
+}
+
+/// Rotate client secret
+///
+/// POST /api/v1/admin/clients/{id}/rotate-secret
+///
+/// Generates new client_secret, invalidates old one.
+/// This is the ONLY time the new plaintext client_secret is returned.
+///
+/// ADR-0011: Handler instrumented with skip_all to prevent PII leakage.
+#[instrument(name = "ac.admin.rotate_client_secret", skip_all, fields(status))]
+pub async fn handle_rotate_client_secret(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<RotateSecretResponse>, AcError> {
+    // Verify credential exists
+    let result = service_credentials::get_by_credential_id(&state.pool, id).await;
+
+    let credential = match result {
+        Ok(Some(c)) => c,
+        Ok(None) => {
+            tracing::Span::current().record("status", "error");
+            let err = AcError::NotFound(format!("Client with ID {} not found", id));
+            record_error(
+                "rotate_client_secret",
+                ErrorCategory::from(&err).as_str(),
+                err.status_code(),
+            );
+
+            // Audit log failed operation
+            tracing::warn!(
+                target: "audit",
+                event = "client_secret_rotated",
+                success = false,
+                credential_id = %id,
+                "Client not found"
+            );
+
+            return Err(err);
+        }
+        Err(e) => {
+            tracing::Span::current().record("status", "error");
+            let category = ErrorCategory::from(&e);
+            record_error("rotate_client_secret", category.as_str(), e.status_code());
+
+            // Audit log failed operation
+            tracing::warn!(
+                target: "audit",
+                event = "client_secret_rotated",
+                success = false,
+                credential_id = %id,
+                "Failed to rotate client secret"
+            );
+
+            return Err(e);
+        }
+    };
+
+    // Generate new client_secret (32 bytes, CSPRNG, base64)
+    let new_client_secret = crypto::generate_client_secret()?;
+
+    // Hash new client_secret with bcrypt (cost factor 12)
+    let new_secret_hash = crypto::hash_client_secret(&new_client_secret)?;
+
+    // Update database with new hash
+    let rotate_result = service_credentials::rotate_secret(&state.pool, id, &new_secret_hash).await;
+
+    match rotate_result {
+        Ok(_) => {
+            // Return response with new secret (ONLY time it's shown)
+            let response = RotateSecretResponse {
+                client_id: credential.client_id.clone(),
+                client_secret: new_client_secret, // ONLY returned here
+            };
+
+            tracing::Span::current().record("status", "success");
+
+            // Audit log successful operation
+            tracing::info!(
+                target: "audit",
+                event = "client_secret_rotated",
+                success = true,
+                credential_id = %id,
+                client_id = %credential.client_id,
+                "Client secret rotated successfully"
+            );
+
+            Ok(Json(response))
+        }
+        Err(e) => {
+            tracing::Span::current().record("status", "error");
+            let category = ErrorCategory::from(&e);
+            record_error("rotate_client_secret", category.as_str(), e.status_code());
+
+            // Audit log failed operation
+            tracing::warn!(
+                target: "audit",
+                event = "client_secret_rotated",
+                success = false,
+                credential_id = %id,
+                "Failed to rotate client secret"
+            );
+
+            Err(e)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -616,5 +1283,514 @@ mod tests {
         let debug_str = format!("{:?}", req);
         assert!(debug_str.contains("global-controller"));
         assert!(debug_str.contains("us-west-2"));
+    }
+
+    // ============================================================================
+    // Handler Tests for OAuth Client Management CRUD Endpoints
+    // ============================================================================
+
+    // ----------------------------------------------------------------------------
+    // Create Client Tests
+    // ----------------------------------------------------------------------------
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_handle_create_client_success(pool: sqlx::PgPool) {
+        let config = test_config();
+        let state = Arc::new(AppState { pool, config });
+
+        let payload = CreateClientRequest {
+            service_type: "global-controller".to_string(),
+            region: Some("us-west-2".to_string()),
+        };
+
+        let result = handle_create_client(State(state), Json(payload)).await;
+
+        assert!(
+            result.is_ok(),
+            "Valid request should succeed: {:?}",
+            result.err()
+        );
+        let response = result.unwrap().0;
+        assert_eq!(response.service_type, "global-controller");
+        assert!(!response.client_id.is_empty());
+        assert!(!response.client_secret.is_empty());
+        assert!(!response.scopes.is_empty());
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_handle_create_client_invalid_service_type(pool: sqlx::PgPool) {
+        let config = test_config();
+        let state = Arc::new(AppState { pool, config });
+
+        let payload = CreateClientRequest {
+            service_type: "invalid-service".to_string(),
+            region: None,
+        };
+
+        let result = handle_create_client(State(state), Json(payload)).await;
+
+        assert!(result.is_err(), "Invalid service_type should be rejected");
+        let err = result.unwrap_err();
+        assert!(
+            matches!(&err, AcError::Database(msg) if msg.contains("Invalid service_type")),
+            "Expected Database error with 'Invalid service_type', got: {:?}",
+            err
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_handle_create_client_empty_service_type(pool: sqlx::PgPool) {
+        let config = test_config();
+        let state = Arc::new(AppState { pool, config });
+
+        let payload = CreateClientRequest {
+            service_type: "".to_string(),
+            region: None,
+        };
+
+        let result = handle_create_client(State(state), Json(payload)).await;
+
+        assert!(result.is_err(), "Empty service_type should be rejected");
+    }
+
+    // ----------------------------------------------------------------------------
+    // List Clients Tests
+    // ----------------------------------------------------------------------------
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_handle_list_clients_empty(pool: sqlx::PgPool) {
+        let config = test_config();
+        let state = Arc::new(AppState { pool, config });
+
+        let result = handle_list_clients(State(state)).await;
+
+        assert!(result.is_ok(), "List should succeed even when empty");
+        let response = result.unwrap().0;
+        assert_eq!(response.len(), 0, "Empty database should return empty list");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_handle_list_clients_multiple(pool: sqlx::PgPool) {
+        let config = test_config();
+        let state = Arc::new(AppState {
+            pool: pool.clone(),
+            config,
+        });
+
+        // Create multiple clients
+        let payload1 = CreateClientRequest {
+            service_type: "global-controller".to_string(),
+            region: Some("us-west-2".to_string()),
+        };
+        let _ = handle_create_client(State(state.clone()), Json(payload1))
+            .await
+            .unwrap();
+
+        let payload2 = CreateClientRequest {
+            service_type: "meeting-controller".to_string(),
+            region: None,
+        };
+        let _ = handle_create_client(State(state.clone()), Json(payload2))
+            .await
+            .unwrap();
+
+        // List all clients
+        let result = handle_list_clients(State(state)).await;
+
+        assert!(result.is_ok(), "List should succeed");
+        let response = result.unwrap().0;
+        assert_eq!(response.len(), 2, "Should return all 2 clients");
+
+        // Verify response structure (excludes client_secret_hash)
+        assert!(!response[0].client_id.is_empty());
+        assert!(!response[0].service_type.is_empty());
+        assert!(!response[0].scopes.is_empty());
+    }
+
+    // ----------------------------------------------------------------------------
+    // Get Client Tests
+    // ----------------------------------------------------------------------------
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_handle_get_client_success(pool: sqlx::PgPool) {
+        let config = test_config();
+        let state = Arc::new(AppState {
+            pool: pool.clone(),
+            config,
+        });
+
+        // Create a client
+        let payload = CreateClientRequest {
+            service_type: "global-controller".to_string(),
+            region: Some("us-west-2".to_string()),
+        };
+        let create_response = handle_create_client(State(state.clone()), Json(payload))
+            .await
+            .unwrap()
+            .0;
+
+        // Get the client by ID
+        let result = handle_get_client(State(state), Path(create_response.id)).await;
+
+        assert!(result.is_ok(), "Get should succeed");
+        let response = result.unwrap().0;
+        assert_eq!(response.id, create_response.id);
+        assert_eq!(response.client_id, create_response.client_id);
+        assert_eq!(response.service_type, "global-controller");
+        assert_eq!(response.region, Some("us-west-2".to_string()));
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_handle_get_client_not_found(pool: sqlx::PgPool) {
+        let config = test_config();
+        let state = Arc::new(AppState { pool, config });
+
+        // Try to get nonexistent client
+        let random_uuid = Uuid::new_v4();
+        let result = handle_get_client(State(state), Path(random_uuid)).await;
+
+        assert!(result.is_err(), "Should return error for unknown UUID");
+        let err = result.unwrap_err();
+        assert!(
+            matches!(&err, AcError::NotFound(_)),
+            "Expected NotFound error, got: {:?}",
+            err
+        );
+    }
+
+    // ----------------------------------------------------------------------------
+    // Update Client Tests
+    // ----------------------------------------------------------------------------
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_handle_update_client_success(pool: sqlx::PgPool) {
+        let config = test_config();
+        let state = Arc::new(AppState {
+            pool: pool.clone(),
+            config,
+        });
+
+        // Create a client
+        let payload = CreateClientRequest {
+            service_type: "global-controller".to_string(),
+            region: None,
+        };
+        let create_response = handle_create_client(State(state.clone()), Json(payload))
+            .await
+            .unwrap()
+            .0;
+
+        // Update scopes
+        let update_payload = UpdateClientRequest {
+            scopes: Some(vec![
+                "meeting:create".to_string(),
+                "meeting:update".to_string(),
+                "meeting:delete".to_string(),
+            ]),
+        };
+
+        let result =
+            handle_update_client(State(state), Path(create_response.id), Json(update_payload))
+                .await;
+
+        assert!(result.is_ok(), "Update should succeed");
+        let response = result.unwrap().0;
+        assert_eq!(response.id, create_response.id);
+        assert_eq!(
+            response.scopes,
+            vec![
+                "meeting:create".to_string(),
+                "meeting:update".to_string(),
+                "meeting:delete".to_string(),
+            ]
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_handle_update_client_not_found(pool: sqlx::PgPool) {
+        let config = test_config();
+        let state = Arc::new(AppState { pool, config });
+
+        let random_uuid = Uuid::new_v4();
+        let update_payload = UpdateClientRequest {
+            scopes: Some(vec!["scope1".to_string()]),
+        };
+
+        let result =
+            handle_update_client(State(state), Path(random_uuid), Json(update_payload)).await;
+
+        assert!(result.is_err(), "Should return error for unknown UUID");
+        let err = result.unwrap_err();
+        assert!(
+            matches!(&err, AcError::NotFound(msg) if msg.contains(&random_uuid.to_string())),
+            "Expected NotFound error containing UUID, got: {:?}",
+            err
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_handle_update_client_invalid_scope_format(pool: sqlx::PgPool) {
+        let config = test_config();
+        let state = Arc::new(AppState {
+            pool: pool.clone(),
+            config,
+        });
+
+        // Create a client
+        let payload = CreateClientRequest {
+            service_type: "global-controller".to_string(),
+            region: None,
+        };
+        let create_response = handle_create_client(State(state.clone()), Json(payload))
+            .await
+            .unwrap()
+            .0;
+
+        // Try to update with invalid scope (contains special characters)
+        let update_payload = UpdateClientRequest {
+            scopes: Some(vec!["invalid@scope#value".to_string()]),
+        };
+
+        let result =
+            handle_update_client(State(state), Path(create_response.id), Json(update_payload))
+                .await;
+
+        assert!(result.is_err(), "Should reject invalid scope format");
+        let err = result.unwrap_err();
+        assert!(
+            matches!(&err, AcError::Database(msg) if msg.contains("invalid characters")),
+            "Expected Database error with 'invalid characters', got: {:?}",
+            err
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_handle_update_client_no_changes(pool: sqlx::PgPool) {
+        let config = test_config();
+        let state = Arc::new(AppState {
+            pool: pool.clone(),
+            config,
+        });
+
+        // Create a client
+        let payload = CreateClientRequest {
+            service_type: "global-controller".to_string(),
+            region: None,
+        };
+        let create_response = handle_create_client(State(state.clone()), Json(payload))
+            .await
+            .unwrap()
+            .0;
+
+        let original_scopes = create_response.scopes.clone();
+
+        // Update with no scopes provided (no-op)
+        let update_payload = UpdateClientRequest { scopes: None };
+
+        let result =
+            handle_update_client(State(state), Path(create_response.id), Json(update_payload))
+                .await;
+
+        assert!(result.is_ok(), "No-op update should succeed");
+        let response = result.unwrap().0;
+        assert_eq!(
+            response.scopes, original_scopes,
+            "Scopes should be unchanged"
+        );
+    }
+
+    // ----------------------------------------------------------------------------
+    // Delete Client Tests
+    // ----------------------------------------------------------------------------
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_handle_delete_client_success(pool: sqlx::PgPool) {
+        let config = test_config();
+        let state = Arc::new(AppState {
+            pool: pool.clone(),
+            config,
+        });
+
+        // Create a client directly via repository (avoid creating auth_events)
+        let credential = crate::repositories::service_credentials::create_service_credential(
+            &pool,
+            "test-delete-client",
+            "hash",
+            "global-controller",
+            None,
+            &["meeting:create".to_string()],
+        )
+        .await
+        .unwrap();
+
+        // Delete the client
+        let result =
+            handle_delete_client(State(state.clone()), Path(credential.credential_id)).await;
+
+        assert!(result.is_ok(), "Delete should succeed: {:?}", result.err());
+        let response = result.unwrap().0;
+        assert_eq!(response.get("deleted"), Some(&serde_json::json!(true)));
+
+        // Verify it's actually deleted
+        let get_result = handle_get_client(State(state), Path(credential.credential_id)).await;
+        assert!(get_result.is_err(), "Client should be deleted");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_handle_delete_client_not_found(pool: sqlx::PgPool) {
+        let config = test_config();
+        let state = Arc::new(AppState { pool, config });
+
+        let random_uuid = Uuid::new_v4();
+        let result = handle_delete_client(State(state), Path(random_uuid)).await;
+
+        assert!(result.is_err(), "Should return error for unknown UUID");
+        let err = result.unwrap_err();
+        assert!(
+            matches!(&err, AcError::NotFound(msg) if msg.contains(&random_uuid.to_string())),
+            "Expected NotFound error containing UUID, got: {:?}",
+            err
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_handle_delete_client_idempotent(pool: sqlx::PgPool) {
+        let config = test_config();
+        let state = Arc::new(AppState {
+            pool: pool.clone(),
+            config,
+        });
+
+        // Create a client directly via repository (avoid creating auth_events)
+        let credential = crate::repositories::service_credentials::create_service_credential(
+            &pool,
+            "test-delete-idempotent",
+            "hash",
+            "global-controller",
+            None,
+            &["meeting:create".to_string()],
+        )
+        .await
+        .unwrap();
+
+        // First delete
+        let result1 =
+            handle_delete_client(State(state.clone()), Path(credential.credential_id)).await;
+        assert!(
+            result1.is_ok(),
+            "First delete should succeed: {:?}",
+            result1.err()
+        );
+
+        // Second delete (should return 404)
+        let result2 = handle_delete_client(State(state), Path(credential.credential_id)).await;
+        assert!(result2.is_err(), "Second delete should return error");
+        let err = result2.unwrap_err();
+        assert!(
+            matches!(&err, AcError::NotFound(_)),
+            "Expected NotFound error, got: {:?}",
+            err
+        );
+    }
+
+    // ----------------------------------------------------------------------------
+    // Rotate Secret Tests
+    // ----------------------------------------------------------------------------
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_handle_rotate_client_secret_success(pool: sqlx::PgPool) {
+        let config = test_config();
+        let state = Arc::new(AppState {
+            pool: pool.clone(),
+            config,
+        });
+
+        // Create a client
+        let payload = CreateClientRequest {
+            service_type: "global-controller".to_string(),
+            region: None,
+        };
+        let create_response = handle_create_client(State(state.clone()), Json(payload))
+            .await
+            .unwrap()
+            .0;
+
+        let original_secret = create_response.client_secret.clone();
+
+        // Rotate secret
+        let result = handle_rotate_client_secret(State(state), Path(create_response.id)).await;
+
+        assert!(result.is_ok(), "Rotate should succeed");
+        let response = result.unwrap().0;
+        assert_eq!(response.client_id, create_response.client_id);
+        assert!(!response.client_secret.is_empty());
+        assert_ne!(
+            response.client_secret, original_secret,
+            "New secret should differ from original"
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_handle_rotate_client_secret_not_found(pool: sqlx::PgPool) {
+        let config = test_config();
+        let state = Arc::new(AppState { pool, config });
+
+        let random_uuid = Uuid::new_v4();
+        let result = handle_rotate_client_secret(State(state), Path(random_uuid)).await;
+
+        assert!(result.is_err(), "Should return error for unknown UUID");
+        let err = result.unwrap_err();
+        assert!(
+            matches!(&err, AcError::NotFound(msg) if msg.contains(&random_uuid.to_string())),
+            "Expected NotFound error containing UUID, got: {:?}",
+            err
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_handle_rotate_client_secret_changes_hash(pool: sqlx::PgPool) {
+        let config = test_config();
+        let state = Arc::new(AppState {
+            pool: pool.clone(),
+            config,
+        });
+
+        // Create a client
+        let payload = CreateClientRequest {
+            service_type: "global-controller".to_string(),
+            region: None,
+        };
+        let create_response = handle_create_client(State(state.clone()), Json(payload))
+            .await
+            .unwrap()
+            .0;
+
+        // Get original credential from database to check hash
+        let original_cred = crate::repositories::service_credentials::get_by_credential_id(
+            &state.pool,
+            create_response.id,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        // Rotate secret
+        let rotate_result =
+            handle_rotate_client_secret(State(state.clone()), Path(create_response.id)).await;
+        assert!(rotate_result.is_ok(), "Rotate should succeed");
+
+        // Get updated credential to verify hash changed
+        let updated_cred = crate::repositories::service_credentials::get_by_credential_id(
+            &state.pool,
+            create_response.id,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_ne!(
+            updated_cred.client_secret_hash, original_cred.client_secret_hash,
+            "Secret hash should change after rotation"
+        );
     }
 }
