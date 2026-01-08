@@ -25,6 +25,10 @@ Self-contained principle files in `docs/principles/`:
 | Queries | `queries.md` | Parameterized SQL, org_id filter, no dynamic SQL |
 | Errors | `errors.md` | No panics, Result types, generic API messages |
 | Input | `input.md` | Length limits, type validation, early rejection |
+| Testing | `testing.md` | Test ownership, three tiers, determinism, coverage targets |
+| Concurrency | `concurrency.md` | Actor pattern, message passing, no shared mutable state |
+| API Design | `api-design.md` | URL versioning, deprecation, protobuf evolution |
+| Observability | `observability.md` | Privacy-by-default, metrics naming, spans, SLOs |
 
 ## Task-to-Category Mapping
 
@@ -35,9 +39,13 @@ task_patterns:
   "password|hash|bcrypt|encrypt|decrypt|key|secret": [crypto, logging]
   "query|select|database|migration|sql": [queries, logging]
   "jwt|token|auth|oauth|bearer": [crypto, jwt, logging]
-  "handler|endpoint|route|api": [logging, errors, input]
+  "handler|endpoint|route|api": [logging, errors, input, api-design]
   "client|credential|oauth": [crypto, logging, errors]
   "parse|input|validate|request": [input, errors]
+  "test|coverage|fuzz|integration|e2e": [testing, errors]
+  "actor|channel|spawn|concurrent|async": [concurrency, errors]
+  "version|deprecate|breaking|protobuf": [api-design, errors]
+  "metric|trace|span|instrument|log": [observability, logging]
 ```
 
 **Matching Rules**:
@@ -233,3 +241,7 @@ During experiment and ongoing:
 - `queries` - parameterized SQL, no injection
 - `errors` - no panics, proper types
 - `input` - validation, limits, sanitization
+- `testing` - test ownership, three tiers, determinism
+- `concurrency` - actor pattern, message passing
+- `api-design` - URL versioning, deprecation
+- `observability` - privacy-by-default, metrics, spans
