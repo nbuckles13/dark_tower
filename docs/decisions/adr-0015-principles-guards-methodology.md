@@ -77,20 +77,9 @@ Principles are injected into specialist prompts based on task keywords:
 - Matched principles included in specialist prompt before implementation
 - Category-specific guards run after specialist produces code
 
-### Guard Coverage Matrix
+### Guard Coverage
 
-| Principle | Guard Type | Implementation |
-|-----------|------------|----------------|
-| crypto | Simple | `no-hardcoded-secrets.sh` |
-| logging | Simple + Semantic | `no-secrets-in-logs.sh` + `credential-leak.sh` |
-| errors | Clippy | `unwrap_used`, `expect_used`, `panic` = deny |
-| queries | Compile-time | sqlx parameterization |
-| jwt | Tests | P0/P1 security tests (signature, algorithm, claims) |
-| input | Compile-time + Tests | sqlx + fuzzing |
-| testing | Coverage + Protection | `test-coverage.sh` + `no-test-removal.sh` |
-| concurrency | Code review | Manual (Arc<Mutex<>> patterns) |
-| api-design | Code review | Manual (version increments) |
-| observability | Code review | Manual (field classification) |
+Each principle file (`docs/principles/*.md`) documents its enforcement mechanism in a `## Guards` section. This is the authoritative source for guard coverage - principle files are self-documenting.
 
 ### Adding New Guards - Decision Tree
 

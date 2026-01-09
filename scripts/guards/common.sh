@@ -42,6 +42,13 @@ is_test_file() {
         return 0
     fi
 
+    # Check for test utility crates (e.g., ac-test-utils, foo-test-utils)
+    if [[ "$file" =~ -test-utils/ ]] || \
+       [[ "$file" =~ -test-helpers/ ]] || \
+       [[ "$file" =~ /test_utils/ ]]; then
+        return 0
+    fi
+
     return 1
 }
 

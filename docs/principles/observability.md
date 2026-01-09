@@ -112,6 +112,11 @@
 
 ## Guards
 
+**`scripts/guards/simple/no-pii-in-logs.sh`** detects:
+- PII variables in log macros (info!, debug!, etc.)
+- PII in named tracing fields (email = %, ip_address = ?)
+- PII in #[instrument] fields() without skip
+
 **Code Review**: Security specialist must review any field added to logging/tracing
 **CI**: PII leakage tests for all log paths
 **Runtime**: Span validation middleware filters sensitive attributes
