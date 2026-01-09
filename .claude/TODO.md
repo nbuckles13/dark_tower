@@ -192,6 +192,41 @@
 - [ ] **Rate Limiting on Refresh**: Prevent abuse of refresh endpoint
 - [ ] **Meeting Token Protocol**: Implement `TOKEN_EXPIRING_SOON` and `UPDATE_TOKEN` signaling messages for seamless WebTransport session continuity
 
+## Guard Infrastructure
+
+### JWT Principle Test Coverage Analysis
+
+Review existing P0/P1 security tests against `docs/principles/jwt.md` to identify gaps:
+
+**Current test coverage** (token_service.rs):
+- [x] Algorithm confusion attack (line 882)
+- [x] `alg: "none"` attack (line 956)
+- [x] Oversized token rejection (line 1864)
+- [x] Signature tampering (line 702)
+- [x] Wrong key rejection (line 777)
+- [x] Expiration validation (line 1025)
+- [x] Future `iat` validation (line 1086)
+- [x] `kid` injection attacks (line 1541)
+- [x] Missing required claims (line 1722)
+
+**Potential gaps to analyze**:
+- [ ] Clock skew boundary conditions (exactly ±5 minutes)
+- [ ] Multiple custom claims rejection (>10 claims)
+- [ ] `typ` header is informational only (not security-critical)
+- [ ] Constant-time comparison verification (timing tests)
+
+### Guard Orchestration (Future Discussion)
+
+Design how guards are executed and how results are surfaced:
+
+- [ ] **PR visibility**: Include guard warnings in PR descriptions so they're unmissable
+- [ ] **CI integration**: How to enforce guard output appears in PRs
+- [ ] **When guards run**: Pre-commit vs CI vs both, with clear rationale
+- [ ] **Guard result aggregation**: Single summary of all guard findings for review
+- [ ] **Blocking vs warning**: Which guards block merge, which just warn
+
+Related: ADR-0015 documents guard taxonomy but not orchestration.
+
 ## Low Priority
 
 ### Clean up dead_code lints (Phase 5+)

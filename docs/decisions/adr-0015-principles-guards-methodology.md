@@ -51,6 +51,24 @@ Automated enforcement of principles. Guards are categorized by speed and capabil
 | Clippy | `Cargo.toml` lints | Build time | Rust-specific patterns (unwrap, panic, indexing) |
 | Compile-time | sqlx, type system | Build time | Query safety, type constraints |
 | Tests | P0/P1 security tests | CI | Runtime behavior validation |
+| Coverage | `test-coverage.sh` | CI | Ensure changed code is tested |
+| Test Protection | `no-test-removal.sh` | Pre-commit | Warn on test removal/weakening |
+
+### Tests as Guards
+
+P0/P1 security tests serve as **runtime guards** - they verify actual behavior rather than code patterns. Tests are the preferred enforcement mechanism when:
+
+| Condition | Example | Why Tests > Static Guards |
+|-----------|---------|---------------------------|
+| Behavior matters more than pattern | JWT algorithm rejection | Need to verify token is actually rejected, not just that EdDSA is mentioned |
+| Implementation is centralized | `verify_jwt()` function | One well-tested function, called by many places |
+| Multiple valid implementations | Error handling | Many ways to handle errors correctly |
+| Edge cases are complex | Clock skew boundaries | Boundary conditions need runtime verification |
+
+**Tests are NOT sufficient alone** - they require protection:
+1. **Tests must run before merge** - CI enforcement
+2. **Tests must be exhaustive** - Coverage guard on changed code
+3. **Tests must not be weakened** - Test modification guard warns on removals
 
 ### Layer 3: Contextual Injection (`.claude/workflows/contextual-injection.md`)
 
@@ -69,7 +87,7 @@ Principles are injected into specialist prompts based on task keywords:
 | queries | Compile-time | sqlx parameterization |
 | jwt | Tests | P0/P1 security tests (signature, algorithm, claims) |
 | input | Compile-time + Tests | sqlx + fuzzing |
-| testing | CI | `cargo-llvm-cov` thresholds |
+| testing | Coverage + Protection | `test-coverage.sh` + `no-test-removal.sh` |
 | concurrency | Code review | Manual (Arc<Mutex<>> patterns) |
 | api-design | Code review | Manual (version increments) |
 | observability | Code review | Manual (field classification) |
@@ -79,8 +97,14 @@ Principles are injected into specialist prompts based on task keywords:
 1. Can grep/regex catch it reliably? → **Simple guard**
 2. Does it need control flow analysis or context? → **Semantic guard**
 3. Is it a Rust-specific pattern? → **Clippy lint**
-4. Does it need runtime behavior validation? → **P0/P1 test**
+4. Does it need runtime behavior validation? → **P0/P1 test** (ensure coverage guard protects it)
 5. Is it too context-dependent for automation? → **Code review** (document in principle's Guards section)
+
+**When to use tests instead of static guards**:
+- The principle is about behavior, not code patterns
+- Implementation is centralized and well-tested
+- There are multiple valid ways to implement correctly
+- Edge cases require runtime verification
 
 ### Adding New Principles
 
