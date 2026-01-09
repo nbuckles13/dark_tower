@@ -103,5 +103,9 @@
 
 ## Guards
 
+**`scripts/guards/simple/api-version-check.sh`** detects:
+- Route definitions without /api/v{N}/ or /v{N}/ prefix
+- Exceptions: /.well-known/*, /health, /ready, /metrics, /internal/*
+
 **Code Review**: Verify version increments for breaking changes
 **CI**: Validate protobuf field number usage (no reuse, no 19000-19999)
