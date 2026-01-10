@@ -166,8 +166,12 @@ pub async fn handle_rotate_keys(
         return Err(err);
     }
 
-    // Verify JWT and extract claims
-    let claims = crate::crypto::verify_jwt(token, &signing_key.public_key)?;
+    // Verify JWT and extract claims with configured clock skew tolerance
+    let claims = crate::crypto::verify_jwt(
+        token,
+        &signing_key.public_key,
+        state.config.jwt_clock_skew_seconds,
+    )?;
 
     // SECURITY: Require service token (must have service_type)
     // User tokens (no service_type) are not authorized for key rotation

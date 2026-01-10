@@ -3,6 +3,7 @@
 //! These tests validate the key rotation endpoint with proper authentication,
 //! authorization, and rate limiting enforcement.
 
+use ac_service::config::DEFAULT_JWT_CLOCK_SKEW_SECONDS;
 use ac_service::crypto;
 use ac_service::repositories::{service_credentials, signing_keys};
 use ac_service::services::token_service;
@@ -701,7 +702,11 @@ async fn test_old_key_tokens_valid_after_rotation(pool: PgPool) -> Result<(), an
     );
 
     // Verify the token can be parsed and verified with the old key
-    let claims = crypto::verify_jwt(&old_token, &old_key.public_key)?;
+    let claims = crypto::verify_jwt(
+        &old_token,
+        &old_key.public_key,
+        DEFAULT_JWT_CLOCK_SKEW_SECONDS,
+    )?;
     assert_eq!(
         claims.sub, "overlap-test-client",
         "Token claims should be intact"
