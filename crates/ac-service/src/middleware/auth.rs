@@ -9,10 +9,12 @@ use axum::{
 use sqlx::PgPool;
 use std::sync::Arc;
 
-/// Middleware state containing database pool
+/// Middleware state containing database pool and JWT configuration
 #[derive(Clone)]
 pub struct AuthMiddlewareState {
     pub pool: PgPool,
+    /// JWT clock skew tolerance in seconds for iat validation.
+    pub jwt_clock_skew_seconds: i64,
 }
 
 /// Authentication middleware that validates JWT tokens
@@ -45,8 +47,8 @@ pub async fn require_admin_scope(
         .await?
         .ok_or_else(|| AcError::Crypto("No active signing key available".to_string()))?;
 
-    // Verify JWT
-    let claims = crypto::verify_jwt(token, &signing_key.public_key)?;
+    // Verify JWT with configured clock skew tolerance
+    let claims = crypto::verify_jwt(token, &signing_key.public_key, state.jwt_clock_skew_seconds)?;
 
     // Check if token has required scope (admin:services)
     let required_scope = "admin:services";

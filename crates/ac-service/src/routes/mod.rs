@@ -63,9 +63,10 @@ pub fn build_routes(
     state: Arc<auth_handler::AppState>,
     metrics_handle: PrometheusHandle,
 ) -> Router {
-    // Create auth middleware state
+    // Create auth middleware state with JWT clock skew from config
     let auth_state = Arc::new(AuthMiddlewareState {
         pool: state.pool.clone(),
+        jwt_clock_skew_seconds: state.config.jwt_clock_skew_seconds,
     });
 
     // Admin routes that require authentication with admin:services scope
@@ -348,6 +349,7 @@ mod tests {
             master_key: master_key.clone(),
             hash_secret: master_key.clone(),
             otlp_endpoint: None,
+            jwt_clock_skew_seconds: crate::config::DEFAULT_JWT_CLOCK_SKEW_SECONDS,
         };
         let state = Arc::new(auth_handler::AppState {
             pool: pool.clone(),
@@ -390,6 +392,7 @@ mod tests {
             master_key: vec![0u8; 32],  // Dummy key (won't be used)
             hash_secret: vec![0u8; 32], // Dummy hash secret for tests
             otlp_endpoint: None,
+            jwt_clock_skew_seconds: crate::config::DEFAULT_JWT_CLOCK_SKEW_SECONDS,
         };
         let state = Arc::new(auth_handler::AppState {
             pool: pool.clone(),

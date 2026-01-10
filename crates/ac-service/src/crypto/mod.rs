@@ -1,4 +1,7 @@
+#[cfg(test)]
+use crate::config::DEFAULT_JWT_CLOCK_SKEW_SECONDS;
 use crate::errors::AcError;
+use crate::observability::metrics::record_token_validation;
 use base64::{engine::general_purpose, Engine as _};
 use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use ring::{
@@ -7,16 +10,6 @@ use ring::{
     signature::{Ed25519KeyPair, KeyPair},
 };
 use serde::{Deserialize, Serialize};
-
-/// Clock skew tolerance for JWT `iat` (issued-at) validation in seconds.
-///
-/// Tokens with `iat` timestamps more than 5 minutes in the future will be rejected.
-/// This prevents token pre-generation attacks and detects compromised systems with
-/// incorrect clocks while allowing reasonable clock drift between servers.
-///
-/// Per NIST SP 800-63B: Clock synchronization should be maintained within
-/// reasonable bounds (typically 5 minutes) for time-based security controls.
-const JWT_CLOCK_SKEW_SECONDS: i64 = 300; // 5 minutes
 
 /// Maximum allowed JWT size in bytes (4KB).
 ///
@@ -264,12 +257,22 @@ pub fn extract_jwt_kid(token: &str) -> Option<String> {
 /// - Issued-at time (`iat` claim) with clock skew tolerance and maximum age
 ///
 /// The `iat` claim is validated to prevent token pre-generation and replay attacks:
-/// - Tokens with `iat` more than `JWT_CLOCK_SKEW_SECONDS` in the future are rejected
+/// - Tokens with `iat` more than `clock_skew_seconds` in the future are rejected
 /// - Tokens with `iat` more than `MAX_TOKEN_AGE_SECONDS` in the past are rejected
 ///
 /// The size check is performed BEFORE any parsing to prevent DoS attacks
 /// via oversized tokens.
-pub fn verify_jwt(token: &str, public_key_pem: &str) -> Result<Claims, AcError> {
+///
+/// # Arguments
+///
+/// * `token` - The JWT string to verify
+/// * `public_key_pem` - The public key in PEM format for signature verification
+/// * `clock_skew_seconds` - Clock skew tolerance for iat validation (typically 300 seconds / 5 minutes)
+pub fn verify_jwt(
+    token: &str,
+    public_key_pem: &str,
+    clock_skew_seconds: i64,
+) -> Result<Claims, AcError> {
     // Check token size BEFORE any parsing or cryptographic operations
     // This is a defense-in-depth measure against DoS attacks
     if token.len() > MAX_JWT_SIZE_BYTES {
@@ -310,7 +313,7 @@ pub fn verify_jwt(token: &str, public_key_pem: &str) -> Result<Claims, AcError> 
     // Validate iat (issued-at) claim with clock skew tolerance
     // Reject tokens with iat too far in the future (potential pre-generation attack)
     let now = chrono::Utc::now().timestamp();
-    let max_iat = now + JWT_CLOCK_SKEW_SECONDS;
+    let max_iat = now + clock_skew_seconds;
 
     if token_data.claims.iat > max_iat {
         tracing::debug!(
@@ -318,8 +321,11 @@ pub fn verify_jwt(token: &str, public_key_pem: &str) -> Result<Claims, AcError> 
             iat = token_data.claims.iat,
             now = now,
             max_allowed = max_iat,
+            clock_skew_seconds = clock_skew_seconds,
             "Token rejected: iat too far in the future"
         );
+        // Record metric for clock skew rejection (enables alerting on clock drift issues)
+        record_token_validation("error", Some("clock_skew"));
         return Err(AcError::InvalidToken(
             "The access token is invalid or expired".to_string(),
         ));
@@ -400,7 +406,8 @@ mod tests {
         };
 
         let token = sign_jwt(&claims, &private_pkcs8, "test-key-01").unwrap();
-        let verified_claims = verify_jwt(&token, &public_pem).unwrap();
+        let verified_claims =
+            verify_jwt(&token, &public_pem, DEFAULT_JWT_CLOCK_SKEW_SECONDS).unwrap();
 
         assert_eq!(verified_claims.sub, claims.sub);
         assert_eq!(verified_claims.scope, claims.scope);
@@ -499,7 +506,7 @@ mod tests {
         };
 
         let token = sign_jwt(&claims, &private_pkcs8, "test-key-01").unwrap();
-        let result = verify_jwt(&token, &public_pem);
+        let result = verify_jwt(&token, &public_pem, DEFAULT_JWT_CLOCK_SKEW_SECONDS);
         let err = result.expect_err("Expected InvalidToken error for expired token");
         assert!(matches!(err, AcError::InvalidToken(_)));
     }
@@ -518,7 +525,7 @@ mod tests {
         };
 
         let token = sign_jwt(&claims, &private_pkcs8, "test-key-01").unwrap();
-        let result = verify_jwt(&token, &wrong_public_pem);
+        let result = verify_jwt(&token, &wrong_public_pem, DEFAULT_JWT_CLOCK_SKEW_SECONDS);
         let err = result.expect_err("Expected InvalidToken error for wrong public key");
         assert!(matches!(err, AcError::InvalidToken(_)));
     }
@@ -605,7 +612,11 @@ mod tests {
         let (public_pem, _) = generate_signing_key().unwrap();
 
         // Attempt to verify the oversized token
-        let result = verify_jwt(&oversized_token, &public_pem);
+        let result = verify_jwt(
+            &oversized_token,
+            &public_pem,
+            DEFAULT_JWT_CLOCK_SKEW_SECONDS,
+        );
 
         // Should be rejected due to size limit
         assert!(
@@ -639,7 +650,8 @@ mod tests {
         );
 
         // Should verify successfully
-        let verified_claims = verify_jwt(&token, &public_pem).unwrap();
+        let verified_claims =
+            verify_jwt(&token, &public_pem, DEFAULT_JWT_CLOCK_SKEW_SECONDS).unwrap();
 
         assert_eq!(verified_claims.sub, claims.sub);
         assert_eq!(verified_claims.scope, claims.scope);
@@ -700,7 +712,7 @@ mod tests {
         };
 
         let token = sign_jwt(&claims, &private_pkcs8, "test-key-01").unwrap();
-        let result = verify_jwt(&token, &public_pem);
+        let result = verify_jwt(&token, &public_pem, DEFAULT_JWT_CLOCK_SKEW_SECONDS);
 
         // Should be rejected - iat too far in the future
         assert!(
@@ -730,7 +742,7 @@ mod tests {
         };
 
         let token = sign_jwt(&claims, &private_pkcs8, "test-key-01").unwrap();
-        let result = verify_jwt(&token, &public_pem);
+        let result = verify_jwt(&token, &public_pem, DEFAULT_JWT_CLOCK_SKEW_SECONDS);
 
         // Should be accepted - iat within clock skew tolerance
         assert!(
@@ -745,13 +757,13 @@ mod tests {
 
     /// P1-SECURITY: Test JWT clock skew constant value
     ///
-    /// Documents that JWT_CLOCK_SKEW_SECONDS is 300 seconds (5 minutes)
+    /// Documents that DEFAULT_JWT_CLOCK_SKEW_SECONDS is 300 seconds (5 minutes)
     /// per NIST SP 800-63B recommendations for time-based security controls.
     #[test]
     fn test_clock_skew_constant_value() {
         // This test documents the constant value for security review
         assert_eq!(
-            JWT_CLOCK_SKEW_SECONDS, 300,
+            DEFAULT_JWT_CLOCK_SKEW_SECONDS, 300,
             "Clock skew tolerance must be 300 seconds (5 minutes) per NIST SP 800-63B"
         );
     }
@@ -846,7 +858,7 @@ mod tests {
         // Use invalid PEM format (not proper base64)
         let invalid_pem = "-----BEGIN PUBLIC KEY-----\ninvalid!@#$%\n-----END PUBLIC KEY-----";
 
-        let result = verify_jwt(&token, invalid_pem);
+        let result = verify_jwt(&token, invalid_pem, DEFAULT_JWT_CLOCK_SKEW_SECONDS);
         let err = result.expect_err("Invalid PEM format should be rejected during base64 decode");
         assert!(matches!(err, AcError::InvalidToken(_)));
     }
@@ -875,7 +887,7 @@ mod tests {
             general_purpose::STANDARD.encode(&invalid_key_bytes)
         );
 
-        let result = verify_jwt(&token, &invalid_pem);
+        let result = verify_jwt(&token, &invalid_pem, DEFAULT_JWT_CLOCK_SKEW_SECONDS);
         let err = result.expect_err("Invalid key bytes should be rejected during verification");
         assert!(matches!(err, AcError::InvalidToken(_)));
     }
@@ -906,7 +918,7 @@ mod tests {
         let tampered_payload = parts[1].to_string() + "X"; // Append character
         token = format!("{}.{}.{}", parts[0], tampered_payload, parts[2]);
 
-        let result = verify_jwt(&token, &public_pem);
+        let result = verify_jwt(&token, &public_pem, DEFAULT_JWT_CLOCK_SKEW_SECONDS);
         let err = result.expect_err("Tampered token should be rejected");
         assert!(matches!(err, AcError::InvalidToken(_)));
     }
@@ -921,7 +933,7 @@ mod tests {
         // Not a JWT at all
         let malformed_token = "not.a.valid.jwt.format.with.too.many.parts";
 
-        let result = verify_jwt(malformed_token, &public_pem);
+        let result = verify_jwt(malformed_token, &public_pem, DEFAULT_JWT_CLOCK_SKEW_SECONDS);
         let err = result.expect_err("Malformed token should be rejected");
         assert!(matches!(err, AcError::InvalidToken(_)));
     }
@@ -935,17 +947,17 @@ mod tests {
 
         let now = chrono::Utc::now().timestamp();
 
-        // Create token with iat exactly at the boundary (now + JWT_CLOCK_SKEW_SECONDS)
+        // Create token with iat exactly at the boundary (now + DEFAULT_JWT_CLOCK_SKEW_SECONDS)
         let claims = Claims {
             sub: "test-user".to_string(),
-            exp: now + 7200,                   // Expires in 2 hours
-            iat: now + JWT_CLOCK_SKEW_SECONDS, // Exactly at boundary
+            exp: now + 7200,                           // Expires in 2 hours
+            iat: now + DEFAULT_JWT_CLOCK_SKEW_SECONDS, // Exactly at boundary
             scope: "read write".to_string(),
             service_type: None,
         };
 
         let token = sign_jwt(&claims, &private_pkcs8, "test-key-01").unwrap();
-        let result = verify_jwt(&token, &public_pem);
+        let result = verify_jwt(&token, &public_pem, DEFAULT_JWT_CLOCK_SKEW_SECONDS);
 
         // Should be accepted (boundary is inclusive: iat <= max_iat)
         assert!(
@@ -967,13 +979,13 @@ mod tests {
         let claims = Claims {
             sub: "test-user".to_string(),
             exp: now + 7200,
-            iat: now + JWT_CLOCK_SKEW_SECONDS + 1, // 1 second past boundary
+            iat: now + DEFAULT_JWT_CLOCK_SKEW_SECONDS + 1, // 1 second past boundary
             scope: "read write".to_string(),
             service_type: None,
         };
 
         let token = sign_jwt(&claims, &private_pkcs8, "test-key-01").unwrap();
-        let result = verify_jwt(&token, &public_pem);
+        let result = verify_jwt(&token, &public_pem, DEFAULT_JWT_CLOCK_SKEW_SECONDS);
 
         // Should be rejected
         assert!(
@@ -1005,7 +1017,7 @@ mod tests {
         };
 
         let token = sign_jwt(&claims, &private_pkcs8, "test-key-01").unwrap();
-        let result = verify_jwt(&token, &public_pem);
+        let result = verify_jwt(&token, &public_pem, DEFAULT_JWT_CLOCK_SKEW_SECONDS);
 
         // Should be accepted (iat in the past is fine as long as not expired)
         assert!(
@@ -1192,7 +1204,7 @@ mod tests {
     fn test_verify_jwt_empty_token() {
         let (public_pem, _) = generate_signing_key().unwrap();
 
-        let result = verify_jwt("", &public_pem);
+        let result = verify_jwt("", &public_pem, DEFAULT_JWT_CLOCK_SKEW_SECONDS);
 
         let err = result.expect_err("Empty token should be rejected");
         assert!(matches!(err, AcError::InvalidToken(_)));

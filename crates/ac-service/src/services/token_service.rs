@@ -1,3 +1,5 @@
+#[cfg(test)]
+use crate::config::DEFAULT_JWT_CLOCK_SKEW_SECONDS;
 use crate::crypto::{self, Claims, EncryptedKey};
 use crate::errors::AcError;
 use crate::models::{AuthEventType, TokenResponse};
@@ -757,7 +759,11 @@ mod tests {
         let signing_key = signing_keys::get_active_key(&pool)
             .await?
             .expect("No active signing key found");
-        let result = crypto::verify_jwt(&tampered_token, &signing_key.public_key);
+        let result = crypto::verify_jwt(
+            &tampered_token,
+            &signing_key.public_key,
+            DEFAULT_JWT_CLOCK_SKEW_SECONDS,
+        );
 
         // Should be rejected due to signature mismatch
         assert!(
@@ -801,7 +807,11 @@ mod tests {
         let token_wrong_key = crypto::sign_jwt(&claims, &wrong_private_key, "attacker-key-01")?;
 
         // Try to verify with the CORRECT public key
-        let result = crypto::verify_jwt(&token_wrong_key, &correct_key.public_key);
+        let result = crypto::verify_jwt(
+            &token_wrong_key,
+            &correct_key.public_key,
+            DEFAULT_JWT_CLOCK_SKEW_SECONDS,
+        );
 
         // Should be rejected - signature won't match
         assert!(
@@ -811,7 +821,11 @@ mod tests {
 
         // Also verify that verifying with the wrong public key would succeed
         // (to prove the token itself is valid, just not for our system)
-        let verify_with_wrong_key = crypto::verify_jwt(&token_wrong_key, &wrong_public_key);
+        let verify_with_wrong_key = crypto::verify_jwt(
+            &token_wrong_key,
+            &wrong_public_key,
+            DEFAULT_JWT_CLOCK_SKEW_SECONDS,
+        );
         assert!(
             verify_with_wrong_key.is_ok(),
             "Token should be valid for the key it was signed with"
@@ -863,7 +877,11 @@ mod tests {
         let signing_key = signing_keys::get_active_key(&pool)
             .await?
             .expect("No active signing key found");
-        let result = crypto::verify_jwt(&stripped_token, &signing_key.public_key);
+        let result = crypto::verify_jwt(
+            &stripped_token,
+            &signing_key.public_key,
+            DEFAULT_JWT_CLOCK_SKEW_SECONDS,
+        );
 
         // Should be rejected - invalid JWT format
         assert!(
@@ -936,7 +954,11 @@ mod tests {
         let signing_key = signing_keys::get_active_key(&pool)
             .await?
             .expect("No active signing key found");
-        let result = crypto::verify_jwt(&tampered_token, &signing_key.public_key);
+        let result = crypto::verify_jwt(
+            &tampered_token,
+            &signing_key.public_key,
+            DEFAULT_JWT_CLOCK_SKEW_SECONDS,
+        );
 
         // Should be rejected due to algorithm mismatch
         assert!(
@@ -1007,7 +1029,11 @@ mod tests {
         let signing_key = signing_keys::get_active_key(&pool)
             .await?
             .expect("No active signing key found");
-        let result = crypto::verify_jwt(&none_token, &signing_key.public_key);
+        let result = crypto::verify_jwt(
+            &none_token,
+            &signing_key.public_key,
+            DEFAULT_JWT_CLOCK_SKEW_SECONDS,
+        );
 
         // Should be rejected - "none" algorithm not allowed
         assert!(
@@ -1055,7 +1081,11 @@ mod tests {
             crypto::sign_jwt(&expired_claims, &private_key, &signing_key_model.key_id)?;
 
         // Attempt to verify the expired token
-        let result = crypto::verify_jwt(&expired_token, &signing_key_model.public_key);
+        let result = crypto::verify_jwt(
+            &expired_token,
+            &signing_key_model.public_key,
+            DEFAULT_JWT_CLOCK_SKEW_SECONDS,
+        );
 
         // Should be rejected due to expiration
         assert!(
@@ -1116,7 +1146,11 @@ mod tests {
             crypto::sign_jwt(&future_claims, &private_key, &signing_key_model.key_id)?;
 
         // Verify the token - should be REJECTED due to custom iat validation
-        let result = crypto::verify_jwt(&future_token, &signing_key_model.public_key);
+        let result = crypto::verify_jwt(
+            &future_token,
+            &signing_key_model.public_key,
+            DEFAULT_JWT_CLOCK_SKEW_SECONDS,
+        );
 
         // Should be rejected - iat too far in the future
         assert!(
@@ -1168,7 +1202,11 @@ mod tests {
         let token = crypto::sign_jwt(&claims_within_skew, &private_key, &signing_key_model.key_id)?;
 
         // Verify the token - should be accepted (within clock skew)
-        let result = crypto::verify_jwt(&token, &signing_key_model.public_key);
+        let result = crypto::verify_jwt(
+            &token,
+            &signing_key_model.public_key,
+            DEFAULT_JWT_CLOCK_SKEW_SECONDS,
+        );
 
         assert!(
             result.is_ok(),
@@ -1190,8 +1228,6 @@ mod tests {
     async fn test_jwt_iat_at_clock_skew_boundary_accepted(pool: PgPool) -> Result<(), AcError> {
         use chrono::Utc;
 
-        const JWT_CLOCK_SKEW_SECONDS: i64 = 300; // 5 minutes (same as crypto module constant)
-
         let master_key = crypto::generate_random_bytes(32)?;
         key_management_service::initialize_signing_key(&pool, &master_key, "test").await?;
 
@@ -1204,7 +1240,7 @@ mod tests {
         let claims_at_boundary = crypto::Claims {
             sub: "boundary-client".to_string(),
             exp: Utc::now().timestamp() + TOKEN_EXPIRY_SECONDS_I64,
-            iat: Utc::now().timestamp() + JWT_CLOCK_SKEW_SECONDS, // Exactly at 5 min boundary
+            iat: Utc::now().timestamp() + DEFAULT_JWT_CLOCK_SKEW_SECONDS, // Exactly at 5 min boundary
             scope: "meeting:create".to_string(),
             service_type: Some("global-controller".to_string()),
         };
@@ -1221,7 +1257,11 @@ mod tests {
         let token = crypto::sign_jwt(&claims_at_boundary, &private_key, &signing_key_model.key_id)?;
 
         // Verify the token - should be accepted (exactly at boundary)
-        let result = crypto::verify_jwt(&token, &signing_key_model.public_key);
+        let result = crypto::verify_jwt(
+            &token,
+            &signing_key_model.public_key,
+            DEFAULT_JWT_CLOCK_SKEW_SECONDS,
+        );
 
         assert!(
             result.is_ok(),
@@ -1242,8 +1282,6 @@ mod tests {
     async fn test_jwt_iat_just_beyond_clock_skew_rejected(pool: PgPool) -> Result<(), AcError> {
         use chrono::Utc;
 
-        const JWT_CLOCK_SKEW_SECONDS: i64 = 300; // 5 minutes (same as crypto module constant)
-
         let master_key = crypto::generate_random_bytes(32)?;
         key_management_service::initialize_signing_key(&pool, &master_key, "test").await?;
 
@@ -1256,7 +1294,7 @@ mod tests {
         let claims_beyond_boundary = crypto::Claims {
             sub: "beyond-boundary-client".to_string(),
             exp: Utc::now().timestamp() + TOKEN_EXPIRY_SECONDS_I64,
-            iat: Utc::now().timestamp() + JWT_CLOCK_SKEW_SECONDS + 1, // 1 second beyond 5 min
+            iat: Utc::now().timestamp() + DEFAULT_JWT_CLOCK_SKEW_SECONDS + 1, // 1 second beyond 5 min
             scope: "meeting:create".to_string(),
             service_type: Some("global-controller".to_string()),
         };
@@ -1277,7 +1315,11 @@ mod tests {
         )?;
 
         // Verify the token - should be rejected (beyond boundary)
-        let result = crypto::verify_jwt(&token, &signing_key_model.public_key);
+        let result = crypto::verify_jwt(
+            &token,
+            &signing_key_model.public_key,
+            DEFAULT_JWT_CLOCK_SKEW_SECONDS,
+        );
 
         assert!(
             matches!(result, Err(AcError::InvalidToken(_))),
@@ -1350,7 +1392,11 @@ mod tests {
         let token_at_jwt = encode(&header_at_jwt, &claims, &encoding_key)
             .expect("Failed to encode token with typ=at+jwt");
 
-        let result = crypto::verify_jwt(&token_at_jwt, &signing_key_model.public_key);
+        let result = crypto::verify_jwt(
+            &token_at_jwt,
+            &signing_key_model.public_key,
+            DEFAULT_JWT_CLOCK_SKEW_SECONDS,
+        );
         assert!(
             result.is_ok(),
             "JWT with typ='at+jwt' should be accepted (RFC 9068 standard)"
@@ -1362,7 +1408,11 @@ mod tests {
         let token_lowercase = encode(&header_lowercase, &claims, &encoding_key)
             .expect("Failed to encode token with typ=jwt");
 
-        let result = crypto::verify_jwt(&token_lowercase, &signing_key_model.public_key);
+        let result = crypto::verify_jwt(
+            &token_lowercase,
+            &signing_key_model.public_key,
+            DEFAULT_JWT_CLOCK_SKEW_SECONDS,
+        );
         assert!(
             result.is_ok(),
             "JWT with typ='jwt' (lowercase) should be accepted"
@@ -1374,7 +1424,11 @@ mod tests {
         let token_custom = encode(&header_custom, &claims, &encoding_key)
             .expect("Failed to encode token with typ=CUSTOM");
 
-        let result = crypto::verify_jwt(&token_custom, &signing_key_model.public_key);
+        let result = crypto::verify_jwt(
+            &token_custom,
+            &signing_key_model.public_key,
+            DEFAULT_JWT_CLOCK_SKEW_SECONDS,
+        );
         assert!(
             result.is_ok(),
             "JWT with typ='CUSTOM' should be accepted (typ is optional, any value allowed)"
@@ -1387,7 +1441,11 @@ mod tests {
         let token_no_typ = encode(&header_no_typ, &claims, &encoding_key)
             .expect("Failed to encode token without typ");
 
-        let result = crypto::verify_jwt(&token_no_typ, &signing_key_model.public_key);
+        let result = crypto::verify_jwt(
+            &token_no_typ,
+            &signing_key_model.public_key,
+            DEFAULT_JWT_CLOCK_SKEW_SECONDS,
+        );
         assert!(
             result.is_ok(),
             "JWT without typ header should be accepted (typ is optional per RFC 7519)"
@@ -1484,7 +1542,11 @@ mod tests {
         let signing_key = signing_keys::get_active_key(&pool)
             .await?
             .expect("No active signing key found");
-        let result = crypto::verify_jwt(&tampered_token, &signing_key.public_key);
+        let result = crypto::verify_jwt(
+            &tampered_token,
+            &signing_key.public_key,
+            DEFAULT_JWT_CLOCK_SKEW_SECONDS,
+        );
 
         // Should be rejected - algorithm mismatch
         assert!(
@@ -1498,7 +1560,11 @@ mod tests {
             .encode(serde_json::to_vec(&header).expect("Failed to serialize header"));
         let tampered_token_rs256 = format!("{}.{}.{}", tampered_header_rs256, parts[1], parts[2]);
 
-        let result = crypto::verify_jwt(&tampered_token_rs256, &signing_key.public_key);
+        let result = crypto::verify_jwt(
+            &tampered_token_rs256,
+            &signing_key.public_key,
+            DEFAULT_JWT_CLOCK_SKEW_SECONDS,
+        );
         assert!(
             matches!(result, Err(AcError::InvalidToken(_))),
             "JWT with tampered algorithm header (EdDSA->RS256) should be rejected"
@@ -1574,7 +1640,11 @@ mod tests {
 
         // Attempt to verify with OUR legitimate public key (not attacker's)
         // This simulates the secure behavior: we ignore kid and use our trusted key
-        let result = crypto::verify_jwt(&attacker_token, &legitimate_key.public_key);
+        let result = crypto::verify_jwt(
+            &attacker_token,
+            &legitimate_key.public_key,
+            DEFAULT_JWT_CLOCK_SKEW_SECONDS,
+        );
 
         // Should be REJECTED - signature won't match our public key
         assert!(
@@ -1584,7 +1654,11 @@ mod tests {
 
         // Verify that the token WOULD be valid if verified with attacker's key
         // (to prove the token itself is well-formed, just signed by wrong key)
-        let attacker_verification = crypto::verify_jwt(&attacker_token, &attacker_public_key);
+        let attacker_verification = crypto::verify_jwt(
+            &attacker_token,
+            &attacker_public_key,
+            DEFAULT_JWT_CLOCK_SKEW_SECONDS,
+        );
         assert!(
             attacker_verification.is_ok(),
             "Token should be valid when verified with the key it was signed with (attacker's key)"
@@ -1633,7 +1707,11 @@ mod tests {
         let tampered_token = format!("{}.{}.{}", tampered_header, parts[1], parts[2]);
 
         // Verify still succeeds because kid is ignored (only signature matters)
-        let result = crypto::verify_jwt(&tampered_token, &legitimate_key.public_key);
+        let result = crypto::verify_jwt(
+            &tampered_token,
+            &legitimate_key.public_key,
+            DEFAULT_JWT_CLOCK_SKEW_SECONDS,
+        );
 
         // Token should be REJECTED because changing the header invalidates the signature
         assert!(
@@ -1702,7 +1780,11 @@ mod tests {
             .expect("Failed to encode token with extra claims");
 
         // Verify it deserializes into Claims struct (should ignore extra fields)
-        let verified = crypto::verify_jwt(&token_with_extra, &signing_key_model.public_key)?;
+        let verified = crypto::verify_jwt(
+            &token_with_extra,
+            &signing_key_model.public_key,
+            DEFAULT_JWT_CLOCK_SKEW_SECONDS,
+        )?;
 
         // Should successfully parse the standard fields
         assert_eq!(verified.sub, "extra-claims-client");
@@ -1759,7 +1841,11 @@ mod tests {
             .expect("Failed to encode incomplete token");
 
         // Attempt to verify - should fail during deserialization
-        let result = crypto::verify_jwt(&incomplete_token, &signing_key_model.public_key);
+        let result = crypto::verify_jwt(
+            &incomplete_token,
+            &signing_key_model.public_key,
+            DEFAULT_JWT_CLOCK_SKEW_SECONDS,
+        );
 
         assert!(
             matches!(result, Err(AcError::InvalidToken(_))),
@@ -1825,7 +1911,11 @@ mod tests {
         let signing_key = signing_keys::get_active_key(&pool)
             .await?
             .expect("No active signing key found");
-        let result = crypto::verify_jwt(&tampered_token, &signing_key.public_key);
+        let result = crypto::verify_jwt(
+            &tampered_token,
+            &signing_key.public_key,
+            DEFAULT_JWT_CLOCK_SKEW_SECONDS,
+        );
 
         // Should be rejected due to signature mismatch
         assert!(
@@ -1927,7 +2017,11 @@ mod tests {
 
         // Attempt to verify the oversized token
         // Should be rejected BEFORE signature verification (efficiency)
-        let result = crypto::verify_jwt(&oversized_token, &signing_key_model.public_key);
+        let result = crypto::verify_jwt(
+            &oversized_token,
+            &signing_key_model.public_key,
+            DEFAULT_JWT_CLOCK_SKEW_SECONDS,
+        );
 
         // Should be rejected due to size limit
         assert!(
@@ -1955,7 +2049,11 @@ mod tests {
         );
 
         // Normal token should verify successfully
-        let result = crypto::verify_jwt(&normal_token, &signing_key_model.public_key);
+        let result = crypto::verify_jwt(
+            &normal_token,
+            &signing_key_model.public_key,
+            DEFAULT_JWT_CLOCK_SKEW_SECONDS,
+        );
         assert!(
             result.is_ok(),
             "Normal-sized JWT should still be accepted (regression check)"

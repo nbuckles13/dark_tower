@@ -46,7 +46,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         e
     })?;
 
-    info!("Configuration loaded successfully");
+    // Log whether clock skew was explicitly configured or using default
+    let is_default_clock_skew =
+        config.jwt_clock_skew_seconds == config::DEFAULT_JWT_CLOCK_SKEW_SECONDS;
+    info!(
+        jwt_clock_skew_seconds = config.jwt_clock_skew_seconds,
+        is_default = is_default_clock_skew,
+        "Configuration loaded successfully"
+    );
 
     // Initialize database connection pool with query timeout
     // ADR-0012: 5s statement timeout to fail fast on hung queries
