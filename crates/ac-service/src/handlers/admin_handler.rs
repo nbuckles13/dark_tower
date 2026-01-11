@@ -60,10 +60,14 @@ pub async fn handle_register_service(
         return Err(err);
     }
 
-    // Register the service
-    let result =
-        registration_service::register_service(&state.pool, &payload.service_type, payload.region)
-            .await;
+    // Register the service using configured bcrypt cost
+    let result = registration_service::register_service(
+        &state.pool,
+        &payload.service_type,
+        payload.region,
+        state.config.bcrypt_cost,
+    )
+    .await;
 
     let status = if result.is_ok() { "success" } else { "error" };
     tracing::Span::current().record("status", status);
@@ -627,9 +631,13 @@ pub async fn handle_create_client(
     }
 
     // Use existing registration service to create the client
-    let result =
-        registration_service::register_service(&state.pool, &payload.service_type, payload.region)
-            .await;
+    let result = registration_service::register_service(
+        &state.pool,
+        &payload.service_type,
+        payload.region,
+        state.config.bcrypt_cost,
+    )
+    .await;
 
     match result {
         Ok(registration) => {
@@ -997,8 +1005,8 @@ pub async fn handle_rotate_client_secret(
     // Generate new client_secret (32 bytes, CSPRNG, base64)
     let new_client_secret = crypto::generate_client_secret()?;
 
-    // Hash new client_secret with bcrypt (cost factor 12)
-    let new_secret_hash = crypto::hash_client_secret(&new_client_secret)?;
+    // Hash new client_secret with bcrypt using configured cost factor
+    let new_secret_hash = crypto::hash_client_secret(&new_client_secret, state.config.bcrypt_cost)?;
 
     // Update database with new hash
     let rotate_result = service_credentials::rotate_secret(&state.pool, id, &new_secret_hash).await;

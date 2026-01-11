@@ -1,4 +1,6 @@
 use crate::config::Config;
+#[cfg(test)]
+use crate::config::DEFAULT_BCRYPT_COST;
 use crate::errors::AcError;
 use crate::models::TokenResponse;
 use crate::observability::metrics::{record_error, record_token_issuance};
@@ -621,6 +623,7 @@ mod tests {
             &pool,
             "global-controller",
             Some("test-region".to_string()),
+            DEFAULT_BCRYPT_COST,
         )
         .await
         .expect("Registration should succeed");
@@ -669,10 +672,14 @@ mod tests {
             .expect("Should initialize signing key");
 
         // Register a service
-        let registration =
-            registration_service::register_service(&pool, "meeting-controller", None)
-                .await
-                .expect("Registration should succeed");
+        let registration = registration_service::register_service(
+            &pool,
+            "meeting-controller",
+            None,
+            DEFAULT_BCRYPT_COST,
+        )
+        .await
+        .expect("Registration should succeed");
 
         let headers = HeaderMap::new();
         let payload = ServiceTokenRequest {
@@ -719,9 +726,14 @@ mod tests {
             .expect("Should initialize signing key");
 
         // Register a service
-        let registration = registration_service::register_service(&pool, "media-handler", None)
-            .await
-            .expect("Registration should succeed");
+        let registration = registration_service::register_service(
+            &pool,
+            "media-handler",
+            None,
+            DEFAULT_BCRYPT_COST,
+        )
+        .await
+        .expect("Registration should succeed");
 
         let mut headers = HeaderMap::new();
         headers.insert("user-agent", "DarkTower-MediaHandler/1.0".parse().unwrap());
@@ -766,9 +778,14 @@ mod tests {
             .expect("Should initialize signing key");
 
         // Register a service
-        let registration = registration_service::register_service(&pool, "global-controller", None)
-            .await
-            .expect("Registration should succeed");
+        let registration = registration_service::register_service(
+            &pool,
+            "global-controller",
+            None,
+            DEFAULT_BCRYPT_COST,
+        )
+        .await
+        .expect("Registration should succeed");
 
         let headers = HeaderMap::new(); // No User-Agent header
 

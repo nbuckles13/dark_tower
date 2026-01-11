@@ -350,6 +350,7 @@ mod tests {
             hash_secret: master_key.clone(),
             otlp_endpoint: None,
             jwt_clock_skew_seconds: crate::config::DEFAULT_JWT_CLOCK_SKEW_SECONDS,
+            bcrypt_cost: crate::config::DEFAULT_BCRYPT_COST,
         };
         let state = Arc::new(auth_handler::AppState {
             pool: pool.clone(),
@@ -393,6 +394,7 @@ mod tests {
             hash_secret: vec![0u8; 32], // Dummy hash secret for tests
             otlp_endpoint: None,
             jwt_clock_skew_seconds: crate::config::DEFAULT_JWT_CLOCK_SKEW_SECONDS,
+            bcrypt_cost: crate::config::DEFAULT_BCRYPT_COST,
         };
         let state = Arc::new(auth_handler::AppState {
             pool: pool.clone(),

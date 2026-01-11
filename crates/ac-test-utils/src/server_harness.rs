@@ -3,7 +3,7 @@
 //! Provides TestAuthServer for spawning real AC server instances in tests.
 
 use crate::crypto_fixtures::test_master_key;
-use ac_service::config::Config;
+use ac_service::config::{Config, DEFAULT_BCRYPT_COST};
 use ac_service::crypto;
 use ac_service::handlers::auth_handler::AppState;
 use ac_service::repositories::{service_credentials, signing_keys};
@@ -72,6 +72,7 @@ impl TestAuthServer {
             hash_secret: master_key.clone(), // Use same as master_key for tests
             otlp_endpoint: None,
             jwt_clock_skew_seconds: ac_service::config::DEFAULT_JWT_CLOCK_SKEW_SECONDS,
+            bcrypt_cost: DEFAULT_BCRYPT_COST,
         };
 
         // Create application state
@@ -163,7 +164,7 @@ impl TestAuthServer {
     ) -> Result<String, anyhow::Error> {
         // Use deterministic test secret for reproducibility
         let client_secret = "test-secret-12345";
-        let client_secret_hash = crypto::hash_client_secret(client_secret)?;
+        let client_secret_hash = crypto::hash_client_secret(client_secret, DEFAULT_BCRYPT_COST)?;
 
         // Convert scopes to Vec<String>
         let scopes_vec: Vec<String> = scopes.iter().map(|s| s.to_string()).collect();

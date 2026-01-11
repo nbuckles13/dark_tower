@@ -1,5 +1,5 @@
 #[cfg(test)]
-use crate::config::DEFAULT_JWT_CLOCK_SKEW_SECONDS;
+use crate::config::{DEFAULT_BCRYPT_COST, DEFAULT_JWT_CLOCK_SKEW_SECONDS};
 use crate::crypto::{self, Claims, EncryptedKey};
 use crate::errors::AcError;
 use crate::models::{AuthEventType, TokenResponse};
@@ -216,7 +216,7 @@ mod tests {
 
         // Create valid credential
         let valid_secret = "valid-secret-12345";
-        let valid_hash = crypto::hash_client_secret(valid_secret)?;
+        let valid_hash = crypto::hash_client_secret(valid_secret, DEFAULT_BCRYPT_COST)?;
         service_credentials::create_service_credential(
             &pool,
             "valid-client",
@@ -298,7 +298,7 @@ mod tests {
 
         // Create valid credential
         let valid_secret = "valid-secret-12345";
-        let valid_hash = crypto::hash_client_secret(valid_secret)?;
+        let valid_hash = crypto::hash_client_secret(valid_secret, DEFAULT_BCRYPT_COST)?;
         service_credentials::create_service_credential(
             &pool,
             "valid-client",
@@ -357,7 +357,7 @@ mod tests {
         key_management_service::initialize_signing_key(&pool, &master_key, "test").await?;
 
         let valid_secret = "valid-secret-12345";
-        let valid_hash = crypto::hash_client_secret(valid_secret)?;
+        let valid_hash = crypto::hash_client_secret(valid_secret, DEFAULT_BCRYPT_COST)?;
         let _credential = service_credentials::create_service_credential(
             &pool,
             "test-client",
@@ -428,7 +428,7 @@ mod tests {
         key_management_service::initialize_signing_key(&pool, &master_key, "test").await?;
 
         let valid_secret = "valid-secret-12345";
-        let valid_hash = crypto::hash_client_secret(valid_secret)?;
+        let valid_hash = crypto::hash_client_secret(valid_secret, DEFAULT_BCRYPT_COST)?;
         service_credentials::create_service_credential(
             &pool,
             "test-client-window",
@@ -486,7 +486,7 @@ mod tests {
         key_management_service::initialize_signing_key(&pool, &master_key, "test").await?;
 
         let valid_secret = "valid-secret-12345";
-        let valid_hash = crypto::hash_client_secret(valid_secret)?;
+        let valid_hash = crypto::hash_client_secret(valid_secret, DEFAULT_BCRYPT_COST)?;
 
         // Create credential with limited scopes
         service_credentials::create_service_credential(
@@ -528,7 +528,7 @@ mod tests {
         key_management_service::initialize_signing_key(&pool, &master_key, "test").await?;
 
         let valid_secret = "valid-secret-12345";
-        let valid_hash = crypto::hash_client_secret(valid_secret)?;
+        let valid_hash = crypto::hash_client_secret(valid_secret, DEFAULT_BCRYPT_COST)?;
 
         service_credentials::create_service_credential(
             &pool,
@@ -571,7 +571,7 @@ mod tests {
         key_management_service::initialize_signing_key(&pool, &master_key, "test").await?;
 
         let valid_secret = "valid-secret-12345";
-        let valid_hash = crypto::hash_client_secret(valid_secret)?;
+        let valid_hash = crypto::hash_client_secret(valid_secret, DEFAULT_BCRYPT_COST)?;
 
         let credential = service_credentials::create_service_credential(
             &pool,
@@ -612,7 +612,7 @@ mod tests {
         key_management_service::initialize_signing_key(&pool, &master_key, "test").await?;
 
         let valid_secret = "valid-secret-12345";
-        let valid_hash = crypto::hash_client_secret(valid_secret)?;
+        let valid_hash = crypto::hash_client_secret(valid_secret, DEFAULT_BCRYPT_COST)?;
 
         service_credentials::create_service_credential(
             &pool,
@@ -650,7 +650,7 @@ mod tests {
         key_management_service::initialize_signing_key(&pool, &master_key, "test").await?;
 
         let valid_secret = "valid-secret-12345";
-        let valid_hash = crypto::hash_client_secret(valid_secret)?;
+        let valid_hash = crypto::hash_client_secret(valid_secret, DEFAULT_BCRYPT_COST)?;
 
         service_credentials::create_service_credential(
             &pool,
@@ -708,7 +708,7 @@ mod tests {
         key_management_service::initialize_signing_key(&pool, &master_key, "test").await?;
 
         let valid_secret = "valid-secret-12345";
-        let valid_hash = crypto::hash_client_secret(valid_secret)?;
+        let valid_hash = crypto::hash_client_secret(valid_secret, DEFAULT_BCRYPT_COST)?;
 
         service_credentials::create_service_credential(
             &pool,
@@ -843,7 +843,7 @@ mod tests {
         key_management_service::initialize_signing_key(&pool, &master_key, "test").await?;
 
         let valid_secret = "valid-secret-12345";
-        let valid_hash = crypto::hash_client_secret(valid_secret)?;
+        let valid_hash = crypto::hash_client_secret(valid_secret, DEFAULT_BCRYPT_COST)?;
 
         service_credentials::create_service_credential(
             &pool,
@@ -904,7 +904,7 @@ mod tests {
         key_management_service::initialize_signing_key(&pool, &master_key, "test").await?;
 
         let valid_secret = "valid-secret-12345";
-        let valid_hash = crypto::hash_client_secret(valid_secret)?;
+        let valid_hash = crypto::hash_client_secret(valid_secret, DEFAULT_BCRYPT_COST)?;
 
         service_credentials::create_service_credential(
             &pool,
@@ -982,7 +982,7 @@ mod tests {
         key_management_service::initialize_signing_key(&pool, &master_key, "test").await?;
 
         let valid_secret = "valid-secret-12345";
-        let valid_hash = crypto::hash_client_secret(valid_secret)?;
+        let valid_hash = crypto::hash_client_secret(valid_secret, DEFAULT_BCRYPT_COST)?;
 
         service_credentials::create_service_credential(
             &pool,
@@ -1484,7 +1484,7 @@ mod tests {
         key_management_service::initialize_signing_key(&pool, &master_key, "test").await?;
 
         let valid_secret = "valid-secret-12345";
-        let valid_hash = crypto::hash_client_secret(valid_secret)?;
+        let valid_hash = crypto::hash_client_secret(valid_secret, DEFAULT_BCRYPT_COST)?;
 
         service_credentials::create_service_credential(
             &pool,
@@ -1667,7 +1667,7 @@ mod tests {
         // Test 2: Legitimate token with manipulated kid header
         // Issue a real token
         let valid_secret = "valid-secret-12345";
-        let valid_hash = crypto::hash_client_secret(valid_secret)?;
+        let valid_hash = crypto::hash_client_secret(valid_secret, DEFAULT_BCRYPT_COST)?;
         service_credentials::create_service_credential(
             &pool,
             "kid-test-client",
@@ -1866,7 +1866,7 @@ mod tests {
         key_management_service::initialize_signing_key(&pool, &master_key, "test").await?;
 
         let valid_secret = "valid-secret-12345";
-        let valid_hash = crypto::hash_client_secret(valid_secret)?;
+        let valid_hash = crypto::hash_client_secret(valid_secret, DEFAULT_BCRYPT_COST)?;
 
         service_credentials::create_service_credential(
             &pool,
@@ -2105,7 +2105,7 @@ mod tests {
 
         // Create a valid credential
         let valid_secret = "valid-secret-12345";
-        let valid_hash = crypto::hash_client_secret(valid_secret)?;
+        let valid_hash = crypto::hash_client_secret(valid_secret, DEFAULT_BCRYPT_COST)?;
         service_credentials::create_service_credential(
             &pool,
             "existing-client",
@@ -2215,7 +2215,7 @@ mod tests {
         key_management_service::initialize_signing_key(&pool, &master_key, "test").await?;
 
         let valid_secret = "valid-secret-12345";
-        let valid_hash = crypto::hash_client_secret(valid_secret)?;
+        let valid_hash = crypto::hash_client_secret(valid_secret, DEFAULT_BCRYPT_COST)?;
         service_credentials::create_service_credential(
             &pool,
             "valid-client",
