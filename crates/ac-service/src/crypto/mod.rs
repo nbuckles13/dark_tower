@@ -1,5 +1,6 @@
 #[cfg(test)]
-use crate::config::DEFAULT_JWT_CLOCK_SKEW_SECONDS;
+use crate::config::{DEFAULT_BCRYPT_COST, DEFAULT_JWT_CLOCK_SKEW_SECONDS};
+use crate::config::{MAX_BCRYPT_COST, MIN_BCRYPT_COST};
 use crate::errors::AcError;
 use crate::observability::metrics::record_token_validation;
 use base64::{engine::general_purpose, Engine as _};
@@ -10,6 +11,7 @@ use ring::{
     signature::{Ed25519KeyPair, KeyPair},
 };
 use serde::{Deserialize, Serialize};
+use tracing::instrument;
 
 /// Maximum allowed JWT size in bytes (4KB).
 ///
@@ -43,16 +45,29 @@ pub struct Claims {
 }
 
 /// Encrypted key structure (AES-256-GCM)
-#[derive(Debug, Clone)]
+///
+/// Debug is manually implemented to redact cryptographic material.
+#[derive(Clone)]
 pub struct EncryptedKey {
     pub encrypted_data: Vec<u8>,
     pub nonce: Vec<u8>, // 96-bit (12 bytes)
     pub tag: Vec<u8>,   // 128-bit (16 bytes)
 }
 
+impl std::fmt::Debug for EncryptedKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EncryptedKey")
+            .field("encrypted_data", &"[REDACTED]")
+            .field("nonce", &"[REDACTED]")
+            .field("tag", &"[REDACTED]")
+            .finish()
+    }
+}
+
 /// Generate EdDSA (Ed25519) keypair using CSPRNG
 ///
 /// Returns (public_key_pem, private_key_pkcs8)
+#[instrument(skip_all)]
 pub fn generate_signing_key() -> Result<(String, Vec<u8>), AcError> {
     let rng = SystemRandom::new();
 
@@ -82,6 +97,7 @@ pub fn generate_signing_key() -> Result<(String, Vec<u8>), AcError> {
 /// Encrypt private key with AES-256-GCM
 ///
 /// Uses a 96-bit random nonce and produces a 128-bit authentication tag
+#[instrument(skip_all)]
 pub fn encrypt_private_key(private_key: &[u8], master_key: &[u8]) -> Result<EncryptedKey, AcError> {
     if master_key.len() != 32 {
         tracing::error!(target: "crypto", "Invalid master key length: {}", master_key.len());
@@ -138,6 +154,7 @@ pub fn encrypt_private_key(private_key: &[u8], master_key: &[u8]) -> Result<Encr
 }
 
 /// Decrypt private key with AES-256-GCM
+#[instrument(skip_all)]
 pub fn decrypt_private_key(
     encrypted: &EncryptedKey,
     master_key: &[u8],
@@ -186,6 +203,7 @@ pub fn decrypt_private_key(
 }
 
 /// Sign JWT with EdDSA private key
+#[instrument(skip_all)]
 pub fn sign_jwt(
     claims: &Claims,
     private_key_pkcs8: &[u8],
@@ -226,6 +244,7 @@ pub fn sign_jwt(
 /// SECURITY NOTE: This function does NOT validate the token. It only extracts
 /// the `kid` claim for key lookup. The token MUST still be verified after
 /// fetching the key.
+#[instrument(skip_all)]
 pub fn extract_jwt_kid(token: &str) -> Option<String> {
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 
@@ -268,6 +287,7 @@ pub fn extract_jwt_kid(token: &str) -> Option<String> {
 /// * `token` - The JWT string to verify
 /// * `public_key_pem` - The public key in PEM format for signature verification
 /// * `clock_skew_seconds` - Clock skew tolerance for iat validation (typically 300 seconds / 5 minutes)
+#[instrument(skip_all)]
 pub fn verify_jwt(
     token: &str,
     public_key_pem: &str,
@@ -334,15 +354,50 @@ pub fn verify_jwt(
     Ok(token_data.claims)
 }
 
-/// Hash client secret with bcrypt (cost factor 12)
-pub fn hash_client_secret(secret: &str) -> Result<String, AcError> {
-    bcrypt::hash(secret, 12).map_err(|e| {
-        tracing::error!(target: "crypto", error = ?e, "Password hashing failed");
+/// Hash client secret with bcrypt using configurable cost factor.
+///
+/// # Arguments
+///
+/// * `secret` - The plaintext client secret to hash
+/// * `cost` - Bcrypt cost factor (2^cost iterations). Valid range: 10-14.
+///
+/// # Security
+///
+/// - Cost < 10 is insecure per OWASP 2024 guidelines
+/// - Cost > 14 causes excessive latency (~800ms+)
+/// - Default: 12 per ADR-0003 (~200ms hash time)
+///
+/// # Errors
+///
+/// Returns `AcError::Crypto` if:
+/// - Cost is outside valid range (10-14) - defense-in-depth validation
+/// - Bcrypt hashing fails
+#[instrument(skip_all)]
+pub fn hash_client_secret(secret: &str, cost: u32) -> Result<String, AcError> {
+    // Defense-in-depth: Validate cost even though config should have already validated.
+    // This prevents insecure hashing if this function is called directly with invalid cost.
+    if !(MIN_BCRYPT_COST..=MAX_BCRYPT_COST).contains(&cost) {
+        tracing::error!(
+            target: "crypto",
+            cost = cost,
+            min = MIN_BCRYPT_COST,
+            max = MAX_BCRYPT_COST,
+            "Bcrypt cost outside valid range"
+        );
+        return Err(AcError::Crypto(format!(
+            "Invalid bcrypt cost: {} (must be {}-{})",
+            cost, MIN_BCRYPT_COST, MAX_BCRYPT_COST
+        )));
+    }
+
+    bcrypt::hash(secret, cost).map_err(|e| {
+        tracing::error!(target: "crypto", error = ?e, cost = cost, "Password hashing failed");
         AcError::Crypto("Password hashing failed".to_string())
     })
 }
 
 /// Verify client secret against bcrypt hash
+#[instrument(skip_all)]
 pub fn verify_client_secret(secret: &str, hash: &str) -> Result<bool, AcError> {
     bcrypt::verify(secret, hash).map_err(|e| {
         tracing::error!(target: "crypto", error = ?e, "Password verification failed");
@@ -362,12 +417,14 @@ pub fn generate_random_bytes(len: usize) -> Result<Vec<u8>, AcError> {
 }
 
 /// Generate a client secret (32 bytes, base64 encoded)
+#[instrument(skip_all)]
 pub fn generate_client_secret() -> Result<String, AcError> {
     let bytes = generate_random_bytes(32)?;
     Ok(general_purpose::STANDARD.encode(&bytes))
 }
 
 #[cfg(test)]
+#[allow(clippy::panic, clippy::assertions_on_constants)]
 mod tests {
     use super::*;
 
@@ -416,7 +473,7 @@ mod tests {
     #[test]
     fn test_password_hashing() {
         let secret = "my-secure-secret";
-        let hash = hash_client_secret(secret).unwrap();
+        let hash = hash_client_secret(secret, DEFAULT_BCRYPT_COST).unwrap();
 
         assert!(verify_client_secret(secret, &hash).unwrap());
         assert!(!verify_client_secret("wrong-secret", &hash).unwrap());
@@ -533,7 +590,7 @@ mod tests {
     #[test]
     fn test_password_hashing_empty_string() {
         // Empty password should still hash successfully
-        let result = hash_client_secret("");
+        let result = hash_client_secret("", DEFAULT_BCRYPT_COST);
         assert!(result.is_ok());
 
         let hash = result.unwrap();
@@ -563,7 +620,7 @@ mod tests {
     #[test]
     fn test_bcrypt_cost_factor_is_12() {
         let secret = "test-password-for-cost-verification";
-        let hash = hash_client_secret(secret).expect("Hashing should succeed");
+        let hash = hash_client_secret(secret, DEFAULT_BCRYPT_COST).expect("Hashing should succeed");
 
         // Bcrypt hash format: $2b$<cost>$<salt+hash>
         // Example: $2b$12$R9h/cIPz0gi.URNNX3kh2OPST9/PgBkqquzi.Ss7KIUgO2t0jWMUW
@@ -681,7 +738,7 @@ mod tests {
         //
         // Our cost=12 provides good security without excessive latency.
 
-        let hash = hash_client_secret("test").unwrap();
+        let hash = hash_client_secret("test", DEFAULT_BCRYPT_COST).unwrap();
         let cost = hash.split('$').nth(2).unwrap();
 
         assert_eq!(cost, "12", "Cost factor must be 12 per security policy");
@@ -1369,5 +1426,226 @@ mod tests {
         let result = extract_jwt_kid(&token);
 
         assert!(result.is_none(), "kid as non-string should return None");
+    }
+
+    // ============================================================================
+    // Configurable Bcrypt Cost Tests
+    // ============================================================================
+
+    /// Test hash_client_secret uses the provided cost factor
+    #[test]
+    fn test_hash_client_secret_uses_configured_cost() {
+        let secret = "test-secret-for-cost-verification";
+
+        // Test with cost 10 (minimum allowed)
+        let hash_10 = hash_client_secret(secret, 10).expect("Cost 10 should work");
+        let cost_10 = hash_10.split('$').nth(2).unwrap();
+        assert_eq!(cost_10, "10", "Hash should use cost factor 10");
+        assert!(
+            verify_client_secret(secret, &hash_10).unwrap(),
+            "Cost 10 hash should verify"
+        );
+
+        // Test with cost 11
+        let hash_11 = hash_client_secret(secret, 11).expect("Cost 11 should work");
+        let cost_11 = hash_11.split('$').nth(2).unwrap();
+        assert_eq!(cost_11, "11", "Hash should use cost factor 11");
+        assert!(
+            verify_client_secret(secret, &hash_11).unwrap(),
+            "Cost 11 hash should verify"
+        );
+
+        // Test with cost 12 (default)
+        let hash_12 = hash_client_secret(secret, 12).expect("Cost 12 should work");
+        let cost_12 = hash_12.split('$').nth(2).unwrap();
+        assert_eq!(cost_12, "12", "Hash should use cost factor 12");
+        assert!(
+            verify_client_secret(secret, &hash_12).unwrap(),
+            "Cost 12 hash should verify"
+        );
+
+        // Test with cost 13
+        let hash_13 = hash_client_secret(secret, 13).expect("Cost 13 should work");
+        let cost_13 = hash_13.split('$').nth(2).unwrap();
+        assert_eq!(cost_13, "13", "Hash should use cost factor 13");
+        assert!(
+            verify_client_secret(secret, &hash_13).unwrap(),
+            "Cost 13 hash should verify"
+        );
+
+        // Test with cost 14 (maximum allowed)
+        let hash_14 = hash_client_secret(secret, 14).expect("Cost 14 should work");
+        let cost_14 = hash_14.split('$').nth(2).unwrap();
+        assert_eq!(cost_14, "14", "Hash should use cost factor 14");
+        assert!(
+            verify_client_secret(secret, &hash_14).unwrap(),
+            "Cost 14 hash should verify"
+        );
+    }
+
+    /// Test that different cost factors produce different hashes
+    #[test]
+    fn test_hash_client_secret_cost_affects_hash() {
+        let secret = "same-secret";
+
+        // Different costs should produce different hashes (even for same secret)
+        let hash_10 = hash_client_secret(secret, 10).unwrap();
+        let hash_12 = hash_client_secret(secret, 12).unwrap();
+
+        // The cost factor portion should be different
+        let cost_10 = hash_10.split('$').nth(2).unwrap();
+        let cost_12 = hash_12.split('$').nth(2).unwrap();
+
+        assert_ne!(cost_10, cost_12, "Different costs should be in hash");
+
+        // But both should still verify the same secret
+        assert!(verify_client_secret(secret, &hash_10).unwrap());
+        assert!(verify_client_secret(secret, &hash_12).unwrap());
+    }
+
+    /// Test that cost 4 (below minimum) still works at bcrypt level
+    ///
+    /// Test defense-in-depth: cost below minimum (10) is rejected at function level.
+    /// This prevents insecure hashing even if config validation is bypassed.
+    #[test]
+    fn test_hash_client_secret_rejects_cost_below_minimum() {
+        let secret = "test-secret";
+
+        // Cost 9 is one below minimum (10)
+        let result = hash_client_secret(secret, 9);
+        assert!(
+            result.is_err(),
+            "Cost 9 should be rejected (below OWASP minimum of 10)"
+        );
+
+        let err = result.unwrap_err();
+        match &err {
+            AcError::Crypto(msg) => {
+                assert!(
+                    msg.contains("Invalid bcrypt cost") && msg.contains("10-14"),
+                    "Error should mention valid range: {}",
+                    msg
+                );
+            }
+            _ => panic!("Expected AcError::Crypto, got {:?}", err),
+        }
+
+        // Cost 4 (bcrypt library minimum) should also be rejected
+        let result = hash_client_secret(secret, 4);
+        assert!(
+            result.is_err(),
+            "Cost 4 should be rejected (below OWASP minimum)"
+        );
+    }
+
+    /// Test defense-in-depth: cost above maximum (14) is rejected at function level.
+    /// This prevents excessive latency even if config validation is bypassed.
+    #[test]
+    fn test_hash_client_secret_rejects_cost_above_maximum() {
+        let secret = "test-secret";
+
+        // Cost 15 is one above maximum (14)
+        let result = hash_client_secret(secret, 15);
+        assert!(
+            result.is_err(),
+            "Cost 15 should be rejected (above maximum of 14)"
+        );
+
+        let err = result.unwrap_err();
+        match &err {
+            AcError::Crypto(msg) => {
+                assert!(
+                    msg.contains("Invalid bcrypt cost") && msg.contains("10-14"),
+                    "Error should mention valid range: {}",
+                    msg
+                );
+            }
+            _ => panic!("Expected AcError::Crypto, got {:?}", err),
+        }
+
+        // Cost 32 (above bcrypt library max) should also be rejected by our validation first
+        let result = hash_client_secret(secret, 32);
+        assert!(result.is_err(), "Cost 32 should be rejected");
+    }
+
+    /// Test that hashes created with one cost can be verified regardless of current cost config.
+    /// This is critical for migration scenarios: if cost changes from 10 to 12, existing
+    /// hashes (created with cost 10) must still verify correctly.
+    #[test]
+    fn test_hash_verification_works_across_cost_factors() {
+        let secret = "test-migration-secret";
+
+        // Create hashes with all valid cost factors
+        let hash_10 = hash_client_secret(secret, 10).expect("Cost 10 should work");
+        let hash_11 = hash_client_secret(secret, 11).expect("Cost 11 should work");
+        let hash_12 = hash_client_secret(secret, 12).expect("Cost 12 should work");
+        let hash_13 = hash_client_secret(secret, 13).expect("Cost 13 should work");
+        let hash_14 = hash_client_secret(secret, 14).expect("Cost 14 should work");
+
+        // Verify each hash correctly - bcrypt verification doesn't depend on current cost config
+        assert!(
+            verify_client_secret(secret, &hash_10).unwrap(),
+            "Cost 10 hash should verify"
+        );
+        assert!(
+            verify_client_secret(secret, &hash_11).unwrap(),
+            "Cost 11 hash should verify"
+        );
+        assert!(
+            verify_client_secret(secret, &hash_12).unwrap(),
+            "Cost 12 hash should verify"
+        );
+        assert!(
+            verify_client_secret(secret, &hash_13).unwrap(),
+            "Cost 13 hash should verify"
+        );
+        assert!(
+            verify_client_secret(secret, &hash_14).unwrap(),
+            "Cost 14 hash should verify"
+        );
+
+        // Wrong password should fail for all cost factors
+        assert!(
+            !verify_client_secret("wrong-password", &hash_10).unwrap(),
+            "Wrong password should fail for cost 10 hash"
+        );
+        assert!(
+            !verify_client_secret("wrong-password", &hash_14).unwrap(),
+            "Wrong password should fail for cost 14 hash"
+        );
+
+        // Verify hashes are different for different costs (different iteration counts)
+        assert_ne!(
+            hash_10, hash_12,
+            "Different costs should produce different hashes"
+        );
+        assert_ne!(
+            hash_12, hash_14,
+            "Different costs should produce different hashes"
+        );
+    }
+
+    /// Test DEFAULT_BCRYPT_COST constant is used correctly
+    #[test]
+    fn test_default_bcrypt_cost_constant() {
+        use crate::config::{DEFAULT_BCRYPT_COST, MAX_BCRYPT_COST, MIN_BCRYPT_COST};
+
+        // Verify the constant value
+        assert_eq!(DEFAULT_BCRYPT_COST, 12, "Default cost should be 12");
+
+        // Verify it's within the allowed range
+        assert!(
+            DEFAULT_BCRYPT_COST >= MIN_BCRYPT_COST,
+            "Default should be >= minimum"
+        );
+        assert!(
+            DEFAULT_BCRYPT_COST <= MAX_BCRYPT_COST,
+            "Default should be <= maximum"
+        );
+
+        // Verify a hash with DEFAULT_BCRYPT_COST uses cost 12
+        let hash = hash_client_secret("test", DEFAULT_BCRYPT_COST).unwrap();
+        let cost = hash.split('$').nth(2).unwrap();
+        assert_eq!(cost, "12");
     }
 }

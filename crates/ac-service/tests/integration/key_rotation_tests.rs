@@ -3,7 +3,7 @@
 //! These tests validate the key rotation endpoint with proper authentication,
 //! authorization, and rate limiting enforcement.
 
-use ac_service::config::DEFAULT_JWT_CLOCK_SKEW_SECONDS;
+use ac_service::config::{DEFAULT_BCRYPT_COST, DEFAULT_JWT_CLOCK_SKEW_SECONDS};
 use ac_service::crypto;
 use ac_service::repositories::{service_credentials, signing_keys};
 use ac_service::services::token_service;
@@ -25,7 +25,7 @@ async fn create_service_with_token(
 ) -> Result<String, anyhow::Error> {
     // Create service credentials
     let client_secret = "test-secret-12345";
-    let client_secret_hash = crypto::hash_client_secret(client_secret)?;
+    let client_secret_hash = crypto::hash_client_secret(client_secret, DEFAULT_BCRYPT_COST)?;
     service_credentials::create_service_credential(
         pool,
         client_id,

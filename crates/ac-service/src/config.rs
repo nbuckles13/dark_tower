@@ -11,6 +11,24 @@ pub const DEFAULT_JWT_CLOCK_SKEW_SECONDS: i64 = 300;
 /// This prevents misconfiguration that could weaken security.
 pub const MAX_JWT_CLOCK_SKEW_SECONDS: i64 = 600;
 
+/// Default bcrypt cost factor (12 per ADR-0003).
+///
+/// Cost 12 = 2^12 = 4,096 iterations, providing appropriate security
+/// for 2024+ per OWASP guidelines. Approximate hash time: ~200ms.
+pub const DEFAULT_BCRYPT_COST: u32 = 12;
+
+/// Minimum allowed bcrypt cost factor (10 per OWASP 2024 guidelines).
+///
+/// Cost < 10 is considered insecure by modern standards.
+/// Cost 10 = 2^10 = 1,024 iterations, approximate hash time: ~50ms.
+pub const MIN_BCRYPT_COST: u32 = 10;
+
+/// Maximum allowed bcrypt cost factor (14 to prevent excessive latency).
+///
+/// Cost > 14 causes unacceptable latency for authentication endpoints.
+/// Cost 14 = 2^14 = 16,384 iterations, approximate hash time: ~800ms.
+pub const MAX_BCRYPT_COST: u32 = 14;
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub database_url: String,
@@ -23,6 +41,12 @@ pub struct Config {
     /// Per NIST SP 800-63B: Clock synchronization should be maintained within
     /// reasonable bounds (typically 5 minutes) for time-based security controls.
     pub jwt_clock_skew_seconds: i64,
+    /// Bcrypt cost factor for password hashing.
+    /// Per ADR-0003 and OWASP 2024 guidelines: cost 10-14 is recommended.
+    /// Default: 12 (2^12 = 4,096 iterations, ~200ms hash time).
+    /// Minimum: 10 (security floor per OWASP 2024).
+    /// Maximum: 14 (prevents excessive latency ~800ms).
+    pub bcrypt_cost: u32,
 }
 
 #[derive(Debug, Error)]
@@ -41,6 +65,9 @@ pub enum ConfigError {
 
     #[error("Invalid JWT clock skew configuration: {0}")]
     InvalidJwtClockSkew(String),
+
+    #[error("Invalid bcrypt cost configuration: {0}")]
+    InvalidBcryptCost(String),
 }
 
 impl Config {
@@ -139,6 +166,49 @@ impl Config {
             DEFAULT_JWT_CLOCK_SKEW_SECONDS
         };
 
+        // Parse bcrypt cost factor with validation
+        // Default: 12 (ADR-0003)
+        // Min: 10 (OWASP 2024 security floor)
+        // Max: 14 (prevent excessive latency)
+        let bcrypt_cost = if let Some(value_str) = vars.get("BCRYPT_COST") {
+            let value: u32 = value_str.parse().map_err(|_| {
+                ConfigError::InvalidBcryptCost(format!(
+                    "BCRYPT_COST must be a valid positive integer, got '{}'",
+                    value_str
+                ))
+            })?;
+
+            if value < MIN_BCRYPT_COST {
+                return Err(ConfigError::InvalidBcryptCost(format!(
+                    "BCRYPT_COST must be at least {} (OWASP 2024 security floor), got {}",
+                    MIN_BCRYPT_COST, value
+                )));
+            }
+
+            if value > MAX_BCRYPT_COST {
+                return Err(ConfigError::InvalidBcryptCost(format!(
+                    "BCRYPT_COST must not exceed {} (prevents excessive latency), got {}",
+                    MAX_BCRYPT_COST, value
+                )));
+            }
+
+            // Warn if cost is below recommended default of 12
+            // Cost 10-11 is secure but provides less protection against brute force
+            if value < DEFAULT_BCRYPT_COST {
+                warn!(
+                    bcrypt_cost = value,
+                    default = DEFAULT_BCRYPT_COST,
+                    "BCRYPT_COST is below recommended default of {}. \
+                     This reduces protection against brute force attacks.",
+                    DEFAULT_BCRYPT_COST
+                );
+            }
+
+            value
+        } else {
+            DEFAULT_BCRYPT_COST
+        };
+
         // ADR-0012: Validate TLS configuration for PostgreSQL
         // Production deployments should use sslmode=verify-full
         // Allow non-TLS for local development but warn
@@ -151,6 +221,7 @@ impl Config {
             hash_secret,
             otlp_endpoint,
             jwt_clock_skew_seconds,
+            bcrypt_cost,
         })
     }
 
@@ -180,6 +251,7 @@ impl Config {
 }
 
 #[cfg(test)]
+#[allow(clippy::panic, clippy::assertions_on_constants)]
 mod tests {
     use super::*;
 
@@ -629,6 +701,282 @@ mod tests {
         assert_eq!(
             config.jwt_clock_skew_seconds, 1,
             "JWT clock skew of 1 second should be allowed"
+        );
+    }
+
+    // ============================================================================
+    // Bcrypt Cost Configuration Tests
+    // ============================================================================
+
+    #[test]
+    fn test_bcrypt_cost_default_value() {
+        // When BCRYPT_COST is not set, default to 12 (ADR-0003)
+        let vars = HashMap::from([
+            (
+                "DATABASE_URL".to_string(),
+                "postgresql://localhost/test".to_string(),
+            ),
+            ("AC_MASTER_KEY".to_string(), test_master_key_base64()),
+        ]);
+
+        let config = Config::from_vars(&vars).expect("Config should load successfully");
+        assert_eq!(
+            config.bcrypt_cost, DEFAULT_BCRYPT_COST,
+            "Default bcrypt cost should be 12 (ADR-0003)"
+        );
+        assert_eq!(config.bcrypt_cost, 12);
+    }
+
+    #[test]
+    fn test_bcrypt_cost_custom_value() {
+        // When BCRYPT_COST is set, use the provided value
+        let vars = HashMap::from([
+            (
+                "DATABASE_URL".to_string(),
+                "postgresql://localhost/test".to_string(),
+            ),
+            ("AC_MASTER_KEY".to_string(), test_master_key_base64()),
+            ("BCRYPT_COST".to_string(), "13".to_string()),
+        ]);
+
+        let config = Config::from_vars(&vars).expect("Config should load successfully");
+        assert_eq!(
+            config.bcrypt_cost, 13,
+            "Bcrypt cost should be 13 when configured"
+        );
+    }
+
+    #[test]
+    fn test_bcrypt_cost_min_allowed_value() {
+        // 10 is the minimum allowed value (OWASP 2024 security floor)
+        let vars = HashMap::from([
+            (
+                "DATABASE_URL".to_string(),
+                "postgresql://localhost/test".to_string(),
+            ),
+            ("AC_MASTER_KEY".to_string(), test_master_key_base64()),
+            ("BCRYPT_COST".to_string(), "10".to_string()),
+        ]);
+
+        let config = Config::from_vars(&vars).expect("Config should load successfully");
+        assert_eq!(
+            config.bcrypt_cost, 10,
+            "Bcrypt cost of 10 should be allowed (OWASP minimum)"
+        );
+    }
+
+    #[test]
+    fn test_bcrypt_cost_max_allowed_value() {
+        // 14 is the maximum allowed value (prevents excessive latency)
+        let vars = HashMap::from([
+            (
+                "DATABASE_URL".to_string(),
+                "postgresql://localhost/test".to_string(),
+            ),
+            ("AC_MASTER_KEY".to_string(), test_master_key_base64()),
+            ("BCRYPT_COST".to_string(), "14".to_string()),
+        ]);
+
+        let config = Config::from_vars(&vars).expect("Config should load successfully");
+        assert_eq!(
+            config.bcrypt_cost, 14,
+            "Bcrypt cost of 14 should be allowed (maximum before excessive latency)"
+        );
+    }
+
+    #[test]
+    fn test_bcrypt_cost_rejects_too_low() {
+        // Values less than 10 are insecure per OWASP 2024
+        let vars = HashMap::from([
+            (
+                "DATABASE_URL".to_string(),
+                "postgresql://localhost/test".to_string(),
+            ),
+            ("AC_MASTER_KEY".to_string(), test_master_key_base64()),
+            ("BCRYPT_COST".to_string(), "9".to_string()),
+        ]);
+
+        let result = Config::from_vars(&vars);
+        assert!(
+            matches!(result, Err(ConfigError::InvalidBcryptCost(msg)) if msg.contains("must be at least 10")),
+            "Bcrypt cost < 10 should be rejected (insecure per OWASP 2024)"
+        );
+    }
+
+    #[test]
+    fn test_bcrypt_cost_rejects_zero() {
+        // Zero is not a valid bcrypt cost
+        let vars = HashMap::from([
+            (
+                "DATABASE_URL".to_string(),
+                "postgresql://localhost/test".to_string(),
+            ),
+            ("AC_MASTER_KEY".to_string(), test_master_key_base64()),
+            ("BCRYPT_COST".to_string(), "0".to_string()),
+        ]);
+
+        let result = Config::from_vars(&vars);
+        assert!(
+            matches!(result, Err(ConfigError::InvalidBcryptCost(msg)) if msg.contains("must be at least 10")),
+            "Bcrypt cost of 0 should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_bcrypt_cost_rejects_too_high() {
+        // Values greater than 14 cause excessive latency
+        let vars = HashMap::from([
+            (
+                "DATABASE_URL".to_string(),
+                "postgresql://localhost/test".to_string(),
+            ),
+            ("AC_MASTER_KEY".to_string(), test_master_key_base64()),
+            ("BCRYPT_COST".to_string(), "15".to_string()),
+        ]);
+
+        let result = Config::from_vars(&vars);
+        assert!(
+            matches!(result, Err(ConfigError::InvalidBcryptCost(msg)) if msg.contains("must not exceed 14")),
+            "Bcrypt cost > 14 should be rejected (excessive latency)"
+        );
+    }
+
+    #[test]
+    fn test_bcrypt_cost_rejects_very_high() {
+        // Very high values are rejected
+        let vars = HashMap::from([
+            (
+                "DATABASE_URL".to_string(),
+                "postgresql://localhost/test".to_string(),
+            ),
+            ("AC_MASTER_KEY".to_string(), test_master_key_base64()),
+            ("BCRYPT_COST".to_string(), "31".to_string()),
+        ]);
+
+        let result = Config::from_vars(&vars);
+        assert!(
+            matches!(result, Err(ConfigError::InvalidBcryptCost(msg)) if msg.contains("must not exceed 14")),
+            "Bcrypt cost of 31 should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_bcrypt_cost_rejects_negative() {
+        // Negative values should be rejected (u32 parse fails)
+        let vars = HashMap::from([
+            (
+                "DATABASE_URL".to_string(),
+                "postgresql://localhost/test".to_string(),
+            ),
+            ("AC_MASTER_KEY".to_string(), test_master_key_base64()),
+            ("BCRYPT_COST".to_string(), "-5".to_string()),
+        ]);
+
+        let result = Config::from_vars(&vars);
+        assert!(
+            matches!(result, Err(ConfigError::InvalidBcryptCost(msg)) if msg.contains("must be a valid positive integer")),
+            "Negative bcrypt cost should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_bcrypt_cost_rejects_non_numeric() {
+        // Non-numeric values should be rejected
+        let vars = HashMap::from([
+            (
+                "DATABASE_URL".to_string(),
+                "postgresql://localhost/test".to_string(),
+            ),
+            ("AC_MASTER_KEY".to_string(), test_master_key_base64()),
+            ("BCRYPT_COST".to_string(), "twelve".to_string()),
+        ]);
+
+        let result = Config::from_vars(&vars);
+        assert!(
+            matches!(result, Err(ConfigError::InvalidBcryptCost(msg)) if msg.contains("must be a valid positive integer")),
+            "Non-numeric bcrypt cost should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_bcrypt_cost_rejects_float() {
+        // Floating point values should be rejected (must be integer)
+        let vars = HashMap::from([
+            (
+                "DATABASE_URL".to_string(),
+                "postgresql://localhost/test".to_string(),
+            ),
+            ("AC_MASTER_KEY".to_string(), test_master_key_base64()),
+            ("BCRYPT_COST".to_string(), "12.5".to_string()),
+        ]);
+
+        let result = Config::from_vars(&vars);
+        assert!(
+            matches!(result, Err(ConfigError::InvalidBcryptCost(msg)) if msg.contains("must be a valid positive integer")),
+            "Floating point bcrypt cost should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_bcrypt_cost_rejects_empty_string() {
+        // Empty string should be rejected
+        let vars = HashMap::from([
+            (
+                "DATABASE_URL".to_string(),
+                "postgresql://localhost/test".to_string(),
+            ),
+            ("AC_MASTER_KEY".to_string(), test_master_key_base64()),
+            ("BCRYPT_COST".to_string(), "".to_string()),
+        ]);
+
+        let result = Config::from_vars(&vars);
+        assert!(
+            matches!(result, Err(ConfigError::InvalidBcryptCost(msg)) if msg.contains("must be a valid positive integer")),
+            "Empty string bcrypt cost should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_bcrypt_cost_accepts_all_valid_range() {
+        // Test all valid cost values: 10, 11, 12, 13, 14
+        for cost in MIN_BCRYPT_COST..=MAX_BCRYPT_COST {
+            let vars = HashMap::from([
+                (
+                    "DATABASE_URL".to_string(),
+                    "postgresql://localhost/test".to_string(),
+                ),
+                ("AC_MASTER_KEY".to_string(), test_master_key_base64()),
+                ("BCRYPT_COST".to_string(), cost.to_string()),
+            ]);
+
+            let config = Config::from_vars(&vars)
+                .unwrap_or_else(|_| panic!("Config should accept bcrypt cost {}", cost));
+            assert_eq!(
+                config.bcrypt_cost, cost,
+                "Bcrypt cost {} should be accepted",
+                cost
+            );
+        }
+    }
+
+    #[test]
+    fn test_bcrypt_cost_constants_are_valid() {
+        // Verify our constants have sensible values
+        assert_eq!(DEFAULT_BCRYPT_COST, 12, "Default should be 12 per ADR-0003");
+        assert_eq!(MIN_BCRYPT_COST, 10, "Minimum should be 10 per OWASP 2024");
+        assert_eq!(
+            MAX_BCRYPT_COST, 14,
+            "Maximum should be 14 to prevent excessive latency"
+        );
+
+        // Verify ordering: MIN <= DEFAULT <= MAX
+        assert!(
+            MIN_BCRYPT_COST <= DEFAULT_BCRYPT_COST,
+            "Default must be >= minimum"
+        );
+        assert!(
+            DEFAULT_BCRYPT_COST <= MAX_BCRYPT_COST,
+            "Default must be <= maximum"
         );
     }
 }

@@ -1,3 +1,5 @@
+#[cfg(test)]
+use crate::config::DEFAULT_BCRYPT_COST;
 use crate::crypto;
 use crate::errors::AcError;
 use crate::models::{AuthEventType, RegisterServiceResponse, ServiceType};
@@ -10,10 +12,18 @@ use uuid::Uuid;
 ///
 /// Generates client_id (UUID), generates and hashes client_secret (bcrypt),
 /// assigns default scopes based on service_type, stores in database
+///
+/// # Arguments
+///
+/// * `pool` - Database connection pool
+/// * `service_type` - Type of service (e.g., "global-controller", "media-handler")
+/// * `region` - Optional region identifier
+/// * `bcrypt_cost` - Bcrypt cost factor for password hashing (10-14, default 12)
 pub async fn register_service(
     pool: &PgPool,
     service_type: &str,
     region: Option<String>,
+    bcrypt_cost: u32,
 ) -> Result<RegisterServiceResponse, AcError> {
     // Validate and parse service_type
     let svc_type = ServiceType::from_str(service_type).map_err(|e| {
@@ -26,8 +36,8 @@ pub async fn register_service(
     // Generate client_secret (32 bytes, CSPRNG, base64)
     let client_secret = crypto::generate_client_secret()?;
 
-    // Hash client_secret with bcrypt (cost factor 12)
-    let client_secret_hash = crypto::hash_client_secret(&client_secret)?;
+    // Hash client_secret with bcrypt using configured cost factor
+    let client_secret_hash = crypto::hash_client_secret(&client_secret, bcrypt_cost)?;
 
     // Get default scopes for this service type
     let scopes = svc_type.default_scopes();
@@ -166,7 +176,8 @@ mod tests {
         let malicious_service_type = "global-controller'; DROP TABLE service_credentials; --";
 
         // This should either fail validation OR be safely escaped
-        let result = register_service(&pool, malicious_service_type, None).await;
+        let result =
+            register_service(&pool, malicious_service_type, None, DEFAULT_BCRYPT_COST).await;
 
         // Should fail due to invalid service_type (doesn't match enum)
         assert!(
@@ -201,6 +212,7 @@ mod tests {
             &pool,
             "global-controller",
             Some(malicious_region.to_string()),
+            DEFAULT_BCRYPT_COST,
         )
         .await;
 
@@ -247,7 +259,7 @@ mod tests {
         ];
 
         let client_id = "test-sql-scopes";
-        let secret_hash = crypto::hash_client_secret("test-secret")?;
+        let secret_hash = crypto::hash_client_secret("test-secret", DEFAULT_BCRYPT_COST)?;
 
         // SQLx should safely parameterize array values
         let credential = service_credentials::create_service_credential(
@@ -300,7 +312,7 @@ mod tests {
         ];
 
         for (client_id, region_value) in test_cases {
-            let secret_hash = crypto::hash_client_secret("test-secret")?;
+            let secret_hash = crypto::hash_client_secret("test-secret", DEFAULT_BCRYPT_COST)?;
 
             let credential = service_credentials::create_service_credential(
                 &pool,
@@ -342,7 +354,7 @@ mod tests {
     async fn test_oversized_input_handling(pool: PgPool) -> Result<(), AcError> {
         // Create an extremely long client_id (reasonable limit is ~255 chars)
         let long_client_id = "a".repeat(1000);
-        let secret_hash = crypto::hash_client_secret("test-secret")?;
+        let secret_hash = crypto::hash_client_secret("test-secret", DEFAULT_BCRYPT_COST)?;
 
         // This should either succeed (if DB allows it) or fail gracefully
         let result = service_credentials::create_service_credential(
@@ -390,7 +402,7 @@ mod tests {
         ];
 
         for client_id in comment_attacks {
-            let secret_hash = crypto::hash_client_secret("test-secret")?;
+            let secret_hash = crypto::hash_client_secret("test-secret", DEFAULT_BCRYPT_COST)?;
 
             // Should succeed - comments are just part of the string value
             let credential = service_credentials::create_service_credential(
@@ -431,7 +443,7 @@ mod tests {
         ];
 
         for malicious_id in boolean_attacks {
-            let secret_hash = crypto::hash_client_secret("test-secret")?;
+            let secret_hash = crypto::hash_client_secret("test-secret", DEFAULT_BCRYPT_COST)?;
 
             // Create with malicious client_id
             service_credentials::create_service_credential(
@@ -484,7 +496,7 @@ mod tests {
         ];
 
         for malicious_id in union_attacks {
-            let secret_hash = crypto::hash_client_secret("test-secret")?;
+            let secret_hash = crypto::hash_client_secret("test-secret", DEFAULT_BCRYPT_COST)?;
 
             // SQLx should safely parameterize, treating this as a literal string
             let credential = service_credentials::create_service_credential(
@@ -538,7 +550,7 @@ mod tests {
         // Step 1: Store malicious data in a scope
         let malicious_scope = "admin:all'; DROP TABLE service_credentials; --";
         let client_id = "second-order-test";
-        let secret_hash = crypto::hash_client_secret("test-secret")?;
+        let secret_hash = crypto::hash_client_secret("test-secret", DEFAULT_BCRYPT_COST)?;
 
         service_credentials::create_service_credential(
             &pool,
@@ -660,7 +672,8 @@ mod tests {
             let start_time = Instant::now();
 
             // Attempt registration with time-based injection
-            let result = register_service(&pool, service_type, region.clone()).await;
+            let result =
+                register_service(&pool, service_type, region.clone(), DEFAULT_BCRYPT_COST).await;
 
             let elapsed = start_time.elapsed();
 
@@ -715,7 +728,7 @@ mod tests {
         ];
 
         let client_id = "time-based-test";
-        let secret_hash = crypto::hash_client_secret("test-secret")?;
+        let secret_hash = crypto::hash_client_secret("test-secret", DEFAULT_BCRYPT_COST)?;
 
         let start_time = Instant::now();
 
@@ -772,7 +785,13 @@ mod tests {
         let service_types = ["global-controller", "meeting-controller", "media-handler"];
 
         for service_type in service_types {
-            let result = register_service(&pool, service_type, Some("us-west-2".to_string())).await;
+            let result = register_service(
+                &pool,
+                service_type,
+                Some("us-west-2".to_string()),
+                DEFAULT_BCRYPT_COST,
+            )
+            .await;
 
             assert!(
                 result.is_ok(),
@@ -811,7 +830,8 @@ mod tests {
     /// Test service registration without region
     #[sqlx::test(migrations = "../../migrations")]
     async fn test_register_service_no_region(pool: PgPool) -> Result<(), AcError> {
-        let result = register_service(&pool, "global-controller", None).await?;
+        let result =
+            register_service(&pool, "global-controller", None, DEFAULT_BCRYPT_COST).await?;
 
         let credential = service_credentials::get_by_client_id(&pool, &result.client_id)
             .await?
@@ -826,7 +846,8 @@ mod tests {
     #[sqlx::test(migrations = "../../migrations")]
     async fn test_update_service_scopes(pool: PgPool) -> Result<(), AcError> {
         // Register a service first
-        let response = register_service(&pool, "meeting-controller", None).await?;
+        let response =
+            register_service(&pool, "meeting-controller", None, DEFAULT_BCRYPT_COST).await?;
         let original_scopes = response.scopes.clone();
 
         // Define new scopes
@@ -865,7 +886,7 @@ mod tests {
     #[sqlx::test(migrations = "../../migrations")]
     async fn test_deactivate_service(pool: PgPool) -> Result<(), AcError> {
         // Register a service first
-        let response = register_service(&pool, "media-handler", None).await?;
+        let response = register_service(&pool, "media-handler", None, DEFAULT_BCRYPT_COST).await?;
 
         // Verify it's active
         let credential = service_credentials::get_by_client_id(&pool, &response.client_id)
@@ -898,7 +919,7 @@ mod tests {
     /// Test registration with invalid service type
     #[sqlx::test(migrations = "../../migrations")]
     async fn test_register_invalid_service_type(pool: PgPool) -> Result<(), AcError> {
-        let result = register_service(&pool, "invalid-service", None).await;
+        let result = register_service(&pool, "invalid-service", None, DEFAULT_BCRYPT_COST).await;
 
         assert!(result.is_err(), "Should fail for invalid service type");
 
@@ -908,6 +929,66 @@ mod tests {
         assert!(
             err_msg.contains("invalid-service"),
             "Error should mention the invalid service type"
+        );
+
+        Ok(())
+    }
+
+    // ============================================================================
+    // Bcrypt Cost Propagation Tests
+    // ============================================================================
+
+    /// Test that register_service uses the provided bcrypt cost factor.
+    /// This is critical for verifying that config.bcrypt_cost is properly propagated.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_register_service_uses_provided_bcrypt_cost(pool: PgPool) -> Result<(), AcError> {
+        use crate::config::{MAX_BCRYPT_COST, MIN_BCRYPT_COST};
+
+        // Test with minimum cost (10)
+        let response_min =
+            register_service(&pool, "global-controller", None, MIN_BCRYPT_COST).await?;
+
+        // Retrieve the credential and verify the hash uses cost 10
+        let credential_min = service_credentials::get_by_client_id(&pool, &response_min.client_id)
+            .await?
+            .expect("Credential should exist");
+
+        // Bcrypt hash format: $2b$XX$... where XX is the cost
+        let cost_min = credential_min
+            .client_secret_hash
+            .split('$')
+            .nth(2)
+            .expect("Hash should have cost field");
+        assert_eq!(cost_min, "10", "Hash should use cost 10 (MIN_BCRYPT_COST)");
+
+        // Test with maximum cost (14)
+        let response_max = register_service(&pool, "media-handler", None, MAX_BCRYPT_COST).await?;
+
+        let credential_max = service_credentials::get_by_client_id(&pool, &response_max.client_id)
+            .await?
+            .expect("Credential should exist");
+
+        let cost_max = credential_max
+            .client_secret_hash
+            .split('$')
+            .nth(2)
+            .expect("Hash should have cost field");
+        assert_eq!(cost_max, "14", "Hash should use cost 14 (MAX_BCRYPT_COST)");
+
+        // Verify both credentials can still authenticate with their original secrets
+        assert!(
+            crypto::verify_client_secret(
+                &response_min.client_secret,
+                &credential_min.client_secret_hash
+            )?,
+            "Should verify with cost 10 hash"
+        );
+        assert!(
+            crypto::verify_client_secret(
+                &response_max.client_secret,
+                &credential_max.client_secret_hash
+            )?,
+            "Should verify with cost 14 hash"
         );
 
         Ok(())
