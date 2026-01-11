@@ -1,6 +1,6 @@
-# ADR-0016: Development Loop with Guard Integration
+# ADR-0016: Development Loop with Guard and Code Review Integration
 
-**Status**: Accepted
+**Status**: Accepted (Updated 2026-01-10)
 
 **Date**: 2026-01-08
 
@@ -31,22 +31,25 @@ We observed the [Ralph-Wiggum](https://github.com/anthropics/claude-code/tree/ma
 
 ## Decision
 
-**We adopt a Development Loop workflow with 3-attempt limit and human collaboration escalation.**
+**We adopt a Development Loop workflow with integrated code review, 5-attempt limit, and human collaboration escalation.**
 
 ### Core Design
 
 ```
-┌─────────────────────────────────────────┐
-│           Development Loop               │
-├─────────────────────────────────────────┤
-│  1. Specialist invocation (iteration 1) │
-│  2. Run verification                    │
-│     - compile → guards → tests → clippy │
-│  3. If FAIL and iteration < 3 → retry   │
-│  4. If FAIL and iteration = 3 →         │
-│     → Stop and collaborate with human   │
-│  5. If PASS → Done, proceed to review   │
-└─────────────────────────────────────────┘
+┌──────────────────────────────────────────────┐
+│    Development Loop (with Code Review)        │
+├──────────────────────────────────────────────┤
+│  1. Specialist invocation (iteration N)      │
+│  2. Run verification (7 layers)              │
+│     - compile → fmt → guards → tests →       │
+│       clippy → semantic guards               │
+│  3. If FAIL → retry (back to 1)              │
+│  4. Run code review (per code-review.md)     │
+│  5. If findings → retry with findings        │
+│  6. If clean → Done, ready to commit         │
+│  COLLABORATION: If iteration > 5             │
+│     → Stop and collaborate with human        │
+└──────────────────────────────────────────────┘
 ```
 
 ### Key Decisions
@@ -56,9 +59,11 @@ We observed the [Ralph-Wiggum](https://github.com/anthropics/claude-code/tree/ma
 | Implementation | Custom (not Ralph plugin) | Tighter integration with specialist workflow |
 | Failure routing | Same specialist retries | Simpler; they wrote the code, they fix it |
 | Verification level | Full (all checks) | All guards + tests + clippy must pass |
-| Max iterations | 3 attempts | Prevent infinite loops; human insight for hard problems |
+| Max iterations | 5 attempts | Increased from 3 to accommodate code review fixes |
+| Code review integration | All findings blocking | Any review finding triggers retry until clean |
+| Code review workflow | Reference existing | `code-review.md` used, not duplicated |
 | Workflow files | Combined | Single `development-loop.md` replaces `contextual-injection.md` |
-| Loop trigger | Implicit + announcement | Auto-use for implementation; announce "Starting development loop" |
+| Loop trigger | Implicit + announcement | Auto-use; announce "Starting development loop (max 5 iterations, includes code review)" |
 
 ### Verification Script
 
@@ -76,11 +81,18 @@ Created `scripts/verify-completion.sh` that runs layered checks:
 
 Exit codes: 0 = pass, 1 = fail with report
 
+### Code Review Step
+
+After verification passes, code review runs per `code-review.md`:
+- Same specialist reviewers (Code Reviewer, Security, Test, Observability)
+- All findings are blocking (BLOCKER through SUGGESTION)
+- Findings formatted like verification failures for retry prompt
+
 ### Collaboration Mode
 
-After 3 failed attempts, the loop stops and presents:
-- Current failures with details
-- History of what was attempted
+After 5 failed attempts (covering both verification and code review fixes), the loop stops and presents:
+- Current failures with details (verification OR review)
+- History of what was attempted at each stage
 - Suggested next steps
 
 Human can then: provide guidance, adjust task, involve another specialist, or debug together.
@@ -90,7 +102,7 @@ Human can then: provide guidance, adjust task, involve another specialist, or de
 | Workflow | Relationship |
 |----------|--------------|
 | `multi-agent-debate.md` | BEFORE loop - produces ADR for design context |
-| `code-review.md` | AFTER loop - quality gate before merge |
+| `code-review.md` | INTEGRATED into loop (step 4) - also usable standalone |
 | `development-loop.md` | Central implementation workflow |
 
 ## Consequences
@@ -99,20 +111,23 @@ Human can then: provide guidance, adjust task, involve another specialist, or de
 
 - **Clear expectations**: Specialists know exactly what checks will run
 - **Fast feedback**: Layered verification catches simple issues quickly
-- **Bounded iteration**: 3-attempt limit prevents runaway costs
+- **Bounded iteration**: 5-attempt limit prevents runaway costs
 - **Human escalation**: Hard problems get human insight instead of infinite retries
-- **Unified workflow**: Context injection + verification in one document
+- **Unified workflow**: Context injection + verification + code review in one flow
+- **End-to-end quality**: Code review integrated means no manual step before commit
+- **Clean reviews**: All findings blocking ensures high-quality output
 
 ### Negative
 
-- **Latency**: Full verification adds ~2-3 minutes per iteration
+- **Latency**: Full verification + code review adds ~5-10 minutes per iteration
 - **False failures**: Flaky tests could waste iterations
 - **Orchestrator complexity**: Orchestrator must track iteration count and format failures
+- **Strict by default**: All review findings blocking may require tuning
 
 ### Neutral
 
-- **Code review remains separate**: Could add to loop later if desired
-- **3-attempt limit is tunable**: May adjust based on experience
+- **5-attempt limit is tunable**: May adjust based on experience
+- **Code review can still run standalone**: `code-review.md` usable outside loop
 
 ## Implementation
 
@@ -126,10 +141,10 @@ Files deprecated:
 
 ## Future Considerations
 
-1. **Code review in loop**: Could add specialist code review as a verification step
-2. **Parallel verification**: Run guards and tests concurrently for speed
-3. **Selective retests**: Only rerun failed tests on retry iterations
-4. **Metrics tracking**: Track iteration counts, failure patterns, collaboration rates
+1. **Parallel verification**: Run guards and tests concurrently for speed
+2. **Selective retests**: Only rerun failed tests on retry iterations
+3. **Metrics tracking**: Track iteration counts, failure patterns, collaboration rates
+4. **Configurable strictness**: Allow some review findings to be advisory vs blocking
 
 ## References
 

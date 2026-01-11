@@ -5,7 +5,8 @@
 The Development Loop is the primary workflow for implementing features. It combines:
 - **Context injection** - Principles and patterns injected into specialist prompts
 - **Iterative verification** - Guards and tests run after each attempt
-- **Collaboration escalation** - Human involvement after 3 failed attempts
+- **Code review** - Specialist reviewers validate quality before completion
+- **Collaboration escalation** - Human involvement after 5 failed attempts
 
 ## When to Use
 
@@ -21,32 +22,36 @@ The Development Loop is the primary workflow for implementing features. It combi
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                    Development Loop                              │
+│              Development Loop (with Code Review)                 │
 ├─────────────────────────────────────────────────────────────────┤
 │                                                                  │
 │  1. DEBATE (if cross-cutting)                                   │
 │     └─→ Produces ADR with design decisions                      │
 │     └─→ See: multi-agent-debate.md                              │
 │                                                                  │
-│  2. SPECIALIST INVOCATION (iteration 1)                         │
+│  2. SPECIALIST INVOCATION (iteration N)                         │
 │     └─→ Context injection: principles + ADR + task              │
-│     └─→ Specialist implements                                   │
+│     └─→ Specialist implements (or fixes)                        │
 │                                                                  │
-│  3. VERIFICATION                                                │
+│  3. VERIFICATION (7 layers)                                     │
 │     └─→ ./scripts/verify-completion.sh                          │
-│     └─→ If PASS: Done ✓                                         │
-│     └─→ If FAIL: Continue to step 4                             │
+│     └─→ If FAIL: Back to step 2                                 │
+│     └─→ If PASS: Continue to step 4                             │
 │                                                                  │
-│  4. RETRY (iterations 2-3)                                      │
-│     └─→ Same specialist + failure context                       │
-│     └─→ Back to step 3                                          │
+│  4. CODE REVIEW (per code-review.md)                            │
+│     └─→ Run specialist reviewers in parallel                    │
+│     └─→ Synthesize findings                                     │
+│     └─→ If ANY findings: Back to step 2 with review context     │
+│     └─→ If CLEAN: Continue to step 5                            │
 │                                                                  │
-│  5. COLLABORATION (if still failing after 3 attempts)           │
-│     └─→ Stop loop, present failures to human                    │
+│  5. COMPLETE                                                    │
+│     └─→ All verification passed                                 │
+│     └─→ Code review clean                                       │
+│     └─→ Ready to commit                                         │
+│                                                                  │
+│  COLLABORATION (if iteration > 5)                               │
+│     └─→ Stop loop, present status to human                      │
 │     └─→ Work together to resolve                                │
-│                                                                  │
-│  [After loop completes: Code review before merge]               │
-│     └─→ See: code-review.md                                     │
 │                                                                  │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -56,7 +61,7 @@ The Development Loop is the primary workflow for implementing features. It combi
 **Implicit trigger**: The orchestrator automatically uses this loop for implementation tasks.
 
 When starting, announce:
-> *"Starting development loop (max 3 iterations)"*
+> *"Starting development loop (max 5 iterations, includes code review)"*
 
 Report each iteration result as you go.
 
@@ -147,21 +152,21 @@ When complete, the following checks will run:
 3. All verification checks passing
 ```
 
-## Iterations 2-3 Template (Retry)
+## Iterations 2-5 Template (Retry)
 
 ```markdown
 {Same as iteration 1, plus:}
 
-## Previous Attempt Failed (Iteration {N} of 3)
+## Previous Attempt Failed (Iteration {N} of 5)
 
-{Formatted failure report from verification script}
+{Formatted failure report from verification script OR code review findings}
 
 Please fix these issues. Focus on:
 1. {Specific failure 1}
 2. {Specific failure 2}
 ...
 
-Do not change unrelated code. Make minimal fixes to pass verification.
+Do not change unrelated code. Make minimal fixes to pass verification and code review.
 ```
 
 ---
@@ -194,7 +199,7 @@ After specialist completes, run:
 When verification fails, format the failure report for the retry prompt:
 
 ```markdown
-## Previous Attempt Failed (Iteration 2 of 3)
+## Previous Attempt Failed (Iteration 2 of 5)
 
 **Failed at**: simple-guards
 **Time**: 1.5 seconds
@@ -221,41 +226,95 @@ Please fix the guard violations and ensure all checks pass.
 
 ---
 
-# Part 4: Collaboration Mode
+# Part 4: Code Review Integration
+
+## Running Code Review
+
+After verification passes (all 7 layers), run code review per `.claude/workflows/code-review.md`:
+
+1. **Execute code review workflow**
+   - Determine relevant ADRs and principles (same as implementation phase)
+   - Run specialist reviewers in parallel (Code Reviewer, Security, Test, Observability)
+   - Include Operations/Infrastructure specialists if relevant
+   - Synthesize findings
+
+2. **Evaluate results**:
+   - If NO findings: Loop complete ✓
+   - If ANY findings: Format as retry context, back to specialist
+
+3. **All findings are blocking** - BLOCKER, CRITICAL, MAJOR, MINOR, SUGGESTION all trigger retry
+
+## Formatting Code Review Findings for Retry
+
+```markdown
+## Previous Attempt: Code Review Findings (Iteration 3 of 5)
+
+Verification passed ✓
+
+Code review found the following issues:
+
+### 🔴 Security Specialist
+1. **Missing rate limiting on new endpoint** - `src/handlers.rs:45`
+   - Impact: DoS vulnerability
+   - Fix: Add rate_limit middleware
+
+### 🟡 Test Specialist
+2. **Missing edge case test** - `src/auth.rs:120`
+   - Missing: Test for expired token with valid signature
+   - Fix: Add test case
+
+### 🟢 Code Reviewer
+3. **Inconsistent error message** - `src/errors.rs:30`
+   - Current: "Invalid token"
+   - Suggested: "Token validation failed" (matches ADR-0005)
+
+Please address ALL findings. After fixing:
+- Verification will run again
+- Code review will run again
+- Loop continues until clean review or iteration 5
+```
+
+See `code-review.md` for full reviewer participation rules, synthesis process, and severity categories.
+
+---
+
+# Part 5: Collaboration Mode
 
 ## When to Enter Collaboration
 
-After **3 failed attempts**, stop the loop and present to user:
+After **5 failed attempts**, stop the loop and present to user:
 
 ```markdown
 ## Development Loop: Collaboration Needed
 
-The specialist attempted this task 3 times but verification still fails.
+The specialist attempted this task 5 times but loop still fails.
 
-### Current Failures
+### Current Status
 
-{Remaining failures from last verification}
+{Remaining failures - could be verification OR code review}
 
 ### Attempt History
 
-| Attempt | Result | What Failed | What Was Fixed |
-|---------|--------|-------------|----------------|
-| 1 | FAIL | Compile error in auth.rs | Added missing import |
-| 2 | FAIL | Guard: PII in logs | Used [REDACTED] for email |
-| 3 | FAIL | Test: jwt_validation | Still failing |
+| Attempt | Result | Stage | What Failed | What Was Fixed |
+|---------|--------|-------|-------------|----------------|
+| 1 | FAIL | Verification | Compile error in auth.rs | Added missing import |
+| 2 | FAIL | Verification | Guard: PII in logs | Used [REDACTED] for email |
+| 3 | FAIL | Code Review | Security: missing rate limit | Added middleware |
+| 4 | FAIL | Code Review | Test: missing edge case | Added test |
+| 5 | FAIL | Code Review | Code quality issue | Still failing |
 
 ### Analysis
 
-The test failure appears to be:
+The current issue appears to be:
 - {Brief analysis of why the specialist couldn't fix it}
 - {Possible root causes}
 
 ### Suggested Next Steps
 
-1. Review test expectations - may need updating if requirements changed
+1. Review code review expectations - may be overly strict
 2. Check if ADR design needs revision
 3. Consider involving {other specialist} for fresh perspective
-4. Manual debugging with `cargo test {test_name} -- --nocapture`
+4. Manual debugging or pair programming
 ```
 
 ## Collaboration Options
@@ -265,11 +324,11 @@ Present to user:
 2. **Adjust task** - Simplify or split task
 3. **Involve another specialist** - Fresh perspective
 4. **Debug together** - Interactive troubleshooting
-5. **Accept partial** - Commit working parts, create TODO for rest
+5. **Accept with known issues** - Commit with documented limitations
 
 ---
 
-# Part 5: Integration with Other Workflows
+# Part 6: Integration with Other Workflows
 
 ## Multi-Agent Debate
 
@@ -286,19 +345,15 @@ After debate produces ADR:
 - ADR summary injected as "Design Context" in specialist prompt
 - Development loop implements the debated design
 
-## Code Review
+## Standalone Code Review
 
-See: `code-review.md`
+The code review workflow (`code-review.md`) can also be run independently:
 
-Code review happens **after** the development loop completes, **before** merge:
+- Manual review of existing code
+- PR reviews in CI/CD
+- Spot checks outside the development loop
 
-1. Loop completes (verification passes)
-2. Present code for review per `code-review.md`
-3. Code reviewers receive same principle categories as implementer
-4. Fix review feedback (may restart loop if significant changes)
-5. Merge when review passes
-
-**Note**: Code review is currently a separate step after the loop. Future consideration: add code review as a verification step within the loop itself.
+When run within the development loop, it uses the same reviewer set and principles as standalone mode.
 
 ---
 
@@ -308,14 +363,16 @@ Code review happens **after** the development loop completes, **before** merge:
 
 1. Match task → categories (see mapping above)
 2. Build prompt with principles + existing patterns
-3. Announce: "Starting development loop (max 3 iterations)"
+3. Announce: "Starting development loop (max 5 iterations, includes code review)"
 
 ## After Each Specialist Attempt
 
 1. Run `./scripts/verify-completion.sh --verbose`
-2. If PASS → Done, proceed to code review
-3. If FAIL and iteration < 3 → Format failures, retry
-4. If FAIL and iteration = 3 → Enter collaboration mode
+2. If verification FAIL and iteration ≤ 5 → Format failures, retry
+3. If verification PASS → Run code review (per `code-review.md`)
+4. If code review CLEAN → Done, ready to commit
+5. If code review has findings and iteration ≤ 5 → Format findings, retry
+6. If iteration > 5 → Enter collaboration mode
 
 ## Verification Commands
 
@@ -350,6 +407,6 @@ Code review happens **after** the development loop completes, **before** merge:
 | Workflow | When to Use | Relationship to Loop |
 |----------|-------------|---------------------|
 | `multi-agent-debate.md` | Cross-cutting design | Happens BEFORE loop, produces ADR |
-| `code-review.md` | Quality gate | Happens AFTER loop, before merge |
+| `code-review.md` | Quality gate | Integrated INTO loop (step 4), also usable standalone |
 | `orchestrator-guide.md` | General orchestration | This loop is a key subprocess |
 | `process-review-record.md` | Process failures | Use when loop reveals coordination gaps |
