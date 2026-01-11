@@ -20,9 +20,9 @@
 #   --help           Show this help message
 #
 # Layers:
-#   quick    - cargo check + simple guards (~7s)
-#   standard - quick + unit tests (~40s)
-#   full     - standard + all tests + clippy (~2-5min)
+#   quick    - cargo check + fmt + simple guards (~10s)
+#   standard - quick + unit tests (~45s)
+#   full     - standard + all tests + clippy + semantic guards (~3-6min)
 #
 # Examples:
 #   ./verify-completion.sh                    # Full verification
@@ -150,9 +150,50 @@ verify_compile() {
         "Fix compilation errors before proceeding"
 }
 
-verify_guards() {
+verify_format() {
     if $VERBOSE; then
-        echo -e "\n${BOLD}Layer 2: Simple Guards${NC}"
+        echo -e "\n${BOLD}Layer 2: Code Formatting${NC}"
+        echo "─────────────────────────"
+    fi
+
+    # First, try to auto-format
+    if $VERBOSE; then
+        echo -e "${BLUE}Running:${NC} cargo fmt"
+    fi
+
+    local fmt_output
+    local exit_code=0
+    fmt_output=$(cargo fmt --all 2>&1) || exit_code=$?
+
+    if [[ $exit_code -ne 0 ]]; then
+        # cargo fmt failed (syntax error or other issue)
+        add_failure "format" "cargo-fmt" "$fmt_output" "Fix syntax errors preventing formatting"
+        return 1
+    fi
+
+    # Check if formatting made any changes (files were modified)
+    local changed_files
+    changed_files=$(git diff --name-only 2>/dev/null || true)
+
+    if [[ -n "$changed_files" ]]; then
+        if $VERBOSE; then
+            echo -e "${YELLOW}AUTO-FORMATTED${NC}: cargo fmt applied changes to:"
+            echo "$changed_files" | head -10
+            if [[ $(echo "$changed_files" | wc -l) -gt 10 ]]; then
+                echo "  ... and more"
+            fi
+        fi
+    fi
+
+    if $VERBOSE; then
+        echo -e "${GREEN}PASSED${NC}: cargo-fmt"
+    fi
+    return 0
+}
+
+verify_simple_guards() {
+    if $VERBOSE; then
+        echo -e "\n${BOLD}Layer 3: Simple Guards${NC}"
         echo "─────────────────────────"
     fi
 
@@ -176,7 +217,7 @@ verify_guards() {
 
 verify_unit_tests() {
     if $VERBOSE; then
-        echo -e "\n${BOLD}Layer 3: Unit Tests${NC}"
+        echo -e "\n${BOLD}Layer 4: Unit Tests${NC}"
         echo "─────────────────────────"
     fi
 
@@ -187,7 +228,7 @@ verify_unit_tests() {
 
 verify_all_tests() {
     if $VERBOSE; then
-        echo -e "\n${BOLD}Layer 4: All Tests${NC}"
+        echo -e "\n${BOLD}Layer 5: All Tests${NC}"
         echo "─────────────────────────"
     fi
 
@@ -198,13 +239,37 @@ verify_all_tests() {
 
 verify_clippy() {
     if $VERBOSE; then
-        echo -e "\n${BOLD}Layer 5: Clippy${NC}"
+        echo -e "\n${BOLD}Layer 6: Clippy${NC}"
         echo "─────────────────────────"
     fi
 
     run_check "clippy" \
         "cargo clippy --workspace --quiet -- -D warnings" \
         "Fix clippy warnings"
+}
+
+verify_semantic_guards() {
+    if $VERBOSE; then
+        echo -e "\n${BOLD}Layer 7: Semantic Guards${NC}"
+        echo "─────────────────────────"
+    fi
+
+    local guard_output
+    local exit_code=0
+    guard_output=$("$SCRIPT_DIR/guards/run-guards.sh" --semantic "$SEARCH_PATH" 2>&1) || exit_code=$?
+
+    if [[ $exit_code -ne 0 ]]; then
+        # Extract violation details from guard output
+        local violations
+        violations=$(echo "$guard_output" | grep -E "(VIOLATION|violation|FAILED|Failed guards:)" | head -20 || true)
+        add_failure "guard" "semantic-guards" "$violations" "Review semantic guard output and fix violations"
+        return 1
+    fi
+
+    if $VERBOSE; then
+        echo -e "${GREEN}PASSED${NC}: semantic-guards"
+    fi
+    return 0
 }
 
 # -----------------------------------------------------------------------------
@@ -319,9 +384,14 @@ main() {
     # Layer 1: Compile (always)
     verify_compile || true
 
-    # Layer 2: Guards (always)
+    # Layer 2: Format (always) - auto-formats code
     if [[ ${#FAILURES[@]} -eq 0 ]]; then
-        verify_guards || true
+        verify_format || true
+    fi
+
+    # Layer 3: Simple guards (always)
+    if [[ ${#FAILURES[@]} -eq 0 ]]; then
+        verify_simple_guards || true
     fi
 
     # Stop here for quick layer
@@ -334,7 +404,7 @@ main() {
         [[ ${#FAILURES[@]} -eq 0 ]] && exit 0 || exit 1
     fi
 
-    # Layer 3: Unit tests (standard+)
+    # Layer 4: Unit tests (standard+)
     if [[ ${#FAILURES[@]} -eq 0 ]]; then
         verify_unit_tests || true
     fi
@@ -349,14 +419,19 @@ main() {
         [[ ${#FAILURES[@]} -eq 0 ]] && exit 0 || exit 1
     fi
 
-    # Layer 4: All tests (full only)
+    # Layer 5: All tests (full only)
     if [[ ${#FAILURES[@]} -eq 0 ]]; then
         verify_all_tests || true
     fi
 
-    # Layer 5: Clippy (full only)
+    # Layer 6: Clippy (full only)
     if [[ ${#FAILURES[@]} -eq 0 ]]; then
         verify_clippy || true
+    fi
+
+    # Layer 7: Semantic guards (full only, after all other checks pass)
+    if [[ ${#FAILURES[@]} -eq 0 ]]; then
+        verify_semantic_guards || true
     fi
 
     # Output results

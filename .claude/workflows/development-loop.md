@@ -134,9 +134,11 @@ task_patterns:
 
 When complete, the following checks will run:
 - cargo check (must compile)
-- ./scripts/guards/run-guards.sh --simple-only (all guards must pass)
+- cargo fmt (auto-formats code, fails if syntax broken)
+- ./scripts/guards/run-guards.sh --simple-only (simple guards must pass)
 - cargo test (all tests must pass)
 - cargo clippy -- -D warnings (no new warnings)
+- ./scripts/guards/run-guards.sh --semantic (semantic guards must pass)
 
 ## Deliverables
 
@@ -180,10 +182,12 @@ After specialist completes, run:
 
 **Verification layers** (all run for full verification):
 1. `cargo check` - Compilation
-2. Simple guards - Pattern-based checks
-3. Unit tests - `cargo test --lib`
-4. All tests - `cargo test`
-5. Clippy - Lint warnings
+2. `cargo fmt` - Auto-formatting (fixes in-place, fails only if syntax broken)
+3. Simple guards - Pattern-based checks
+4. Unit tests - `cargo test --lib`
+5. All tests - `cargo test`
+6. Clippy - Lint warnings
+7. Semantic guards - LLM-based analysis (slowest, runs last)
 
 ## Formatting Failures for Retry
 
