@@ -67,10 +67,12 @@ Created `scripts/verify-completion.sh` that runs layered checks:
 | Layer | Check | Speed |
 |-------|-------|-------|
 | 1 | `cargo check` | ~5s |
-| 2 | Simple guards | ~2s |
-| 3 | `cargo test --lib` | ~30s |
-| 4 | `cargo test` (all) | ~1-2min |
-| 5 | `cargo clippy` | ~30s |
+| 2 | `cargo fmt` | ~2s (auto-formats in place) |
+| 3 | Simple guards | ~2s |
+| 4 | `cargo test --lib` | ~30s |
+| 5 | `cargo test` (all) | ~1-2min |
+| 6 | `cargo clippy` | ~30s |
+| 7 | Semantic guards | ~30s+ (LLM-based, runs last) |
 
 Exit codes: 0 = pass, 1 = fail with report
 
