@@ -3,9 +3,10 @@
 ## Overview
 
 The Development Loop is the primary workflow for implementing features. It combines:
-- **Context injection** - Principles and patterns injected into specialist prompts
+- **Context injection** - Principles, patterns, and specialist knowledge injected into prompts
 - **Iterative verification** - Guards and tests run after each attempt
 - **Code review** - Specialist reviewers validate quality before completion
+- **Reflection** - Specialists update their knowledge files after completion
 - **Collaboration escalation** - Human involvement after 5 failed attempts
 
 ## When to Use
@@ -22,7 +23,7 @@ The Development Loop is the primary workflow for implementing features. It combi
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│              Development Loop (with Code Review)                 │
+│              Development Loop (with Code Review & Reflection)    │
 ├─────────────────────────────────────────────────────────────────┤
 │                                                                  │
 │  1. DEBATE (if cross-cutting)                                   │
@@ -30,7 +31,7 @@ The Development Loop is the primary workflow for implementing features. It combi
 │     └─→ See: multi-agent-debate.md                              │
 │                                                                  │
 │  2. SPECIALIST INVOCATION (iteration N)                         │
-│     └─→ Context injection: principles + ADR + task              │
+│     └─→ Context injection: principles + knowledge + ADR + task  │
 │     └─→ Specialist implements (or fixes)                        │
 │                                                                  │
 │  3. VERIFICATION (7 layers)                                     │
@@ -47,7 +48,12 @@ The Development Loop is the primary workflow for implementing features. It combi
 │  5. COMPLETE                                                    │
 │     └─→ All verification passed                                 │
 │     └─→ Code review clean                                       │
-│     └─→ Ready to commit                                         │
+│     └─→ Proceed to reflection                                   │
+│                                                                  │
+│  6. REFLECTION (before exit)                                    │
+│     └─→ All involved specialists reflect                        │
+│     └─→ Update knowledge files directly (patterns, gotchas)     │
+│     └─→ Changes visible in git diff for user review             │
 │                                                                  │
 │  COLLABORATION (if iteration > 5)                               │
 │     └─→ Stop loop, present status to human                      │
@@ -68,6 +74,27 @@ Report each iteration result as you go.
 ---
 
 # Part 1: Context Injection
+
+## Injection Order
+
+When building specialist prompts, inject context in this order:
+
+1. **Specialist definition** - From `.claude/agents/{specialist}.md`
+2. **Matched principles** - From `docs/principles/` based on task keywords
+3. **Specialist knowledge** - From `.claude/agents/{specialist}/` (if exists)
+4. **Design context** - ADR summary if from debate
+5. **Task context** - The actual task description and existing patterns
+
+## Specialist Knowledge Files
+
+Each specialist may have accumulated knowledge in `.claude/agents/{specialist}/`:
+- `patterns.md` - Established approaches for common tasks
+- `gotchas.md` - Mistakes to avoid, learned from experience
+- `integration.md` - Notes on working with other services
+
+**If these files exist**: Inject their contents after principles, before task context.
+
+**If these files don't exist**: Skip this step (specialist will bootstrap them during first reflection).
 
 ## Principle Categories
 
@@ -122,6 +149,10 @@ task_patterns:
 ## Project Principles (MUST FOLLOW)
 
 {Inject matched category files here}
+
+## Your Accumulated Knowledge
+
+{Contents of .claude/agents/{specialist}/*.md if they exist, or "No accumulated knowledge yet - you'll be asked to reflect after completing this task."}
 
 ## Design Context
 
@@ -357,22 +388,179 @@ When run within the development loop, it uses the same reviewer set and principl
 
 ---
 
+# Part 7: Reflection
+
+## Purpose
+
+After a successful implementation (verification passed, code review clean), all involved specialists reflect on what they learned. This builds the specialist knowledge base over time and captures insights while context is fresh.
+
+## When to Reflect
+
+Reflection happens **after code review is clean but before exiting the loop**. This ensures:
+- Knowledge updates are captured while context is fresh
+- Both implementation and knowledge updates can be presented together for human approval
+- User sees the complete picture before committing anything
+
+## Who Reflects
+
+All specialists involved in the task:
+- **Implementing specialist** (e.g., Auth Controller)
+- **Code review specialists** (Security, Test, Observability, Code Reviewer)
+- **Operations/Infrastructure** if they participated in review
+
+Each gets a reflection prompt asking what they learned.
+
+## Reflection Prompt Template
+
+```markdown
+## Reflection: {Specialist Name}
+
+You just completed work on: {task description}
+
+Your current knowledge files:
+{Contents of .claude/agents/{specialist}/*.md, or "None yet - this is your first reflection"}
+
+Based on this task, update your knowledge files directly:
+
+### What to Add
+- New patterns you established that should be reused
+- Gotchas you encountered that others should avoid
+- Integration notes about working with other services
+
+### What to Update
+- Existing knowledge that needs modification based on what you learned
+- Patterns that evolved or improved
+
+### What to Remove
+- Knowledge that's now outdated (e.g., code was deleted or approach changed)
+
+### If No Changes Needed
+If nothing new was learned, explain briefly why and skip file updates.
+
+**Remember**: Update the files directly. The user will see changes in the git diff.
+```
+
+## Knowledge File Format
+
+Each knowledge file follows a structured format:
+
+```markdown
+# Patterns (or Gotchas, or Integration)
+
+## Pattern: Descriptive Title
+**Added**: YYYY-MM-DD
+**Related files**: `src/path/to/file.rs`, `src/another/file.rs`
+
+Brief description of the pattern, gotcha, or integration note.
+Keep it concise (2-4 sentences max).
+
+## Pattern: Another Title
+**Added**: YYYY-MM-DD
+**Related files**: `src/file.rs`
+
+Description here.
+```
+
+**Guidelines**:
+- ~100 lines per file limit
+- Each item has Added date and Related files
+- Keep descriptions brief and actionable
+- Use H2 headers for each item
+
+## Types of Knowledge Updates
+
+| Routine Updates | Significant Updates |
+|-----------------|---------------------|
+| Adding a gotcha from a mistake made | Changing fundamental approach patterns |
+| Updating a pattern to match current code | Adding new knowledge categories |
+| Removing knowledge about deleted code | Anything affecting security behavior |
+| Typo/clarification fixes | Contradicting existing ADRs |
+
+**Heuristic**: Most updates should be "learning from this task" - capturing patterns and gotchas. If you find yourself "rethinking how we do things", that may warrant discussion before updating.
+
+## Approval Flow
+
+1. **Reflection runs** after code review is clean
+2. **Specialists update knowledge files directly** (create/modify as needed)
+3. **Changes appear in git diff** alongside implementation
+4. **User reviews everything** when exiting the loop
+5. **User commits** when satisfied (implementation + knowledge updates together)
+
+**Note**: Knowledge file changes are just regular file changes - the user sees them in the diff and can approve/reject like any other change.
+
+## Bootstrap Behavior
+
+When a specialist reflects for the first time (no knowledge files exist):
+
+1. Specialist creates `.claude/agents/{specialist}/` directory
+2. Creates initial `patterns.md`, `gotchas.md`, `integration.md` files
+3. Populates with knowledge based on existing code patterns and the task just completed
+4. User sees new files in git diff and can review/approve
+
+## Pruning During Reflection
+
+When a specialist removes or significantly changes code, they should identify related knowledge to remove:
+
+```markdown
+### Removals
+
+**File**: gotchas.md
+**Item**: "Legacy OAuth Token Format"
+**Reason**: Removed legacy OAuth support in this task. The `parse_legacy_token()`
+function no longer exists, so this gotcha is obsolete.
+```
+
+The orchestrator verifies the referenced code is actually gone before approving removal.
+
+## Example Reflection Output
+
+```markdown
+### Additions
+
+**Category**: patterns
+**Title**: JWT Clock Skew Handling
+**Description**: When validating JWTs, use the configurable clock skew tolerance
+from config (default 300 seconds per NIST SP 800-63B). See `src/crypto/jwt.rs:validate()`.
+
+### Updates
+
+**File**: integration.md
+**Item**: "Calling Auth Controller"
+**Change**: Updated to note that AC now returns structured error responses with
+error codes, not just HTTP status. Update client code to parse error body.
+
+### Removals
+
+None.
+```
+
+---
+
 # Quick Reference
 
 ## Before Specialist Invocation
 
 1. Match task → categories (see mapping above)
-2. Build prompt with principles + existing patterns
-3. Announce: "Starting development loop (max 5 iterations, includes code review)"
+2. Load specialist knowledge files if they exist
+3. Build prompt with principles + knowledge + existing patterns
+4. Announce: "Starting development loop (max 5 iterations, includes code review)"
 
 ## After Each Specialist Attempt
 
 1. Run `./scripts/verify-completion.sh --verbose`
 2. If verification FAIL and iteration ≤ 5 → Format failures, retry
 3. If verification PASS → Run code review (per `code-review.md`)
-4. If code review CLEAN → Done, ready to commit
+4. If code review CLEAN → Run reflection, then exit loop
 5. If code review has findings and iteration ≤ 5 → Format findings, retry
 6. If iteration > 5 → Enter collaboration mode
+
+## Loop Exit
+
+After reflection completes:
+1. Announce loop completion
+2. Summarize what was implemented and any knowledge updates
+3. User reviews git diff (implementation + knowledge files)
+4. User commits when satisfied
 
 ## Verification Commands
 

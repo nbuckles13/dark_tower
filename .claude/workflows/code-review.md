@@ -94,13 +94,23 @@ Trigger this workflow:
 
 ### Step 3: Parallel Specialist Reviews
 
-Run three specialists in parallel (three separate Task tool calls in a single message):
+Run specialists in parallel (multiple Task tool calls in a single message).
+
+**Context Injection for Each Reviewer**:
+Each reviewer receives:
+1. Their specialist definition (`.claude/agents/{specialist}.md`)
+2. Their accumulated knowledge files (`.claude/agents/{specialist}/*.md` if they exist)
+3. Relevant ADRs and principles
+4. The change context and files to review
+
+This ensures reviewers apply both their domain expertise AND learned patterns/gotchas.
 
 #### Review A: Code Reviewer Specialist
 
 **Focus**: Code quality, maintainability, Rust best practices
 
 **Inputs**:
+- Specialist definition + accumulated knowledge (`.claude/agents/code-reviewer/`)
 - List of changed files
 - Relevant ADRs (for API design, error handling patterns)
 - Change context
@@ -118,6 +128,7 @@ Run three specialists in parallel (three separate Task tool calls in a single me
 **Focus**: Security vulnerabilities, cryptographic correctness, authentication/authorization
 
 **Inputs**:
+- Specialist definition + accumulated knowledge (`.claude/agents/security/`)
 - List of changed files
 - Relevant ADRs (security, authentication)
 - Security-focused context
@@ -136,6 +147,7 @@ Run three specialists in parallel (three separate Task tool calls in a single me
 **Focus**: Test coverage, test quality, edge cases
 
 **Inputs**:
+- Specialist definition + accumulated knowledge (`.claude/agents/test/`)
 - List of changed files
 - Test files
 - Coverage reports (if available)
@@ -154,6 +166,7 @@ Run three specialists in parallel (three separate Task tool calls in a single me
 **Focus**: Logging, metrics, tracing, SLO impact
 
 **Inputs**:
+- Specialist definition + accumulated knowledge (`.claude/agents/observability/`)
 - List of changed files
 - Relevant ADRs (observability, SLOs)
 - Observability-focused context
@@ -173,6 +186,7 @@ Run three specialists in parallel (three separate Task tool calls in a single me
 **Focus**: Deployment safety, operational readiness, runbook updates
 
 **Inputs**:
+- Specialist definition + accumulated knowledge (`.claude/agents/operations/`)
 - List of changed files
 - Migration files
 - Configuration changes
@@ -193,6 +207,7 @@ Run three specialists in parallel (three separate Task tool calls in a single me
 **Focus**: Portability, security boundaries, resource sizing
 
 **Inputs**:
+- Specialist definition + accumulated knowledge (`.claude/agents/infrastructure/`)
 - List of changed files
 - Infrastructure files
 - Cloud provider configurations
