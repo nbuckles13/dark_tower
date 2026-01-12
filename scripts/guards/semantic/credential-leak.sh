@@ -84,7 +84,14 @@ For each finding, specify:
 - Risk level (HIGH/MEDIUM/LOW)
 - Specific remediation
 
-Your response MUST start with one of these verdicts on the first line:
+Analyze the code thoroughly, then provide your final verdict at the end.
+
+Your response MUST end with a final verdict section in exactly this format:
+
+## VERDICT
+SAFE|UNSAFE|UNCLEAR: <one-line explanation>
+
+Choose:
 - SAFE: No credential leak risks found
 - UNSAFE: Credential leak risks detected (followed by details)
 - UNCLEAR: Cannot determine, manual review needed (followed by reason)
@@ -109,9 +116,9 @@ ${FILE_CONTENT}
     exit 3
 }
 
-# Extract verdict from first few lines (model may add preamble before verdict)
-# Look for SAFE:, UNSAFE:, or UNCLEAR: pattern anywhere in first 5 lines
-VERDICT=$(echo "$ANALYSIS" | head -5 | grep -oiE '(SAFE|UNSAFE|UNCLEAR):' | head -1 | tr -d ':' | tr '[:lower:]' '[:upper:]')
+# Extract verdict from the end of the response (after ## VERDICT section)
+# The LLM analyzes first, then concludes - so verdict is at the end
+VERDICT=$(echo "$ANALYSIS" | tail -20 | grep -oiE '^(SAFE|UNSAFE|UNCLEAR):' | tail -1 | tr -d ':' | tr '[:lower:]' '[:upper:]')
 VERDICT="${VERDICT:-UNCLEAR}"
 
 echo "Analysis Result:"
