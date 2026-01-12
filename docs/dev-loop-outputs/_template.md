@@ -1,0 +1,185 @@
+# Dev-Loop Output: {Task Title}
+
+**Date**: YYYY-MM-DD
+**Task**: Brief description of what was implemented
+**Branch**: `branch-name`
+**Duration**: ~Xm (approximate total time)
+
+---
+
+## Task Overview
+
+### Objective
+{What was the goal of this task?}
+
+### Scope
+- **Service(s)**: {Which services were affected}
+- **Schema**: {Database schema changes? Yes/No}
+- **Cross-cutting**: {Does this affect multiple services? Yes/No}
+
+### Debate Decision
+{NEEDED/NOT NEEDED} - {Brief justification}
+
+{If debate was needed, link to debate record: `docs/debates/YYYY-MM-DD-{topic}.md`}
+
+---
+
+## Pre-Work
+
+{Any pending changes committed before starting, dependencies resolved, etc.}
+
+{Or "None" if no pre-work was required}
+
+---
+
+## Implementation Summary
+
+### {Priority/Category 1}
+| Item | Before | After |
+|------|--------|-------|
+| {field/function} | {old} | {new} |
+
+### {Priority/Category 2}
+{Description of changes}
+
+### Additional Changes
+{Any other notable changes made during implementation}
+
+---
+
+## Files Modified
+
+```
+{Output of: git diff --stat HEAD}
+```
+
+### Key Changes by File
+| File | Changes |
+|------|---------|
+| `path/to/file.rs` | {Brief description} |
+
+---
+
+## Dev-Loop Verification Steps
+
+### Layer 1: cargo check
+**Status**: PASS/FAIL
+**Duration**: ~Xs
+**Output**: {Any relevant notes}
+
+### Layer 2: cargo fmt
+**Status**: PASS/FAIL
+**Duration**: ~Xs
+**Output**: {Any relevant notes}
+
+### Layer 3: Simple Guards
+**Status**: ALL PASS / X FAILED
+**Duration**: ~Xs
+
+| Guard | Status |
+|-------|--------|
+| api-version-check | PASS/FAIL |
+| no-hardcoded-secrets | PASS/FAIL |
+| no-pii-in-logs | PASS/FAIL |
+| no-secrets-in-logs | PASS/FAIL |
+| no-test-removal | PASS/FAIL |
+| test-coverage | PASS/FAIL |
+
+{Details on any failures}
+
+### Layer 4: Unit Tests
+**Status**: PASS/FAIL
+**Duration**: ~Xs
+**Output**: {Test counts, any failures}
+
+### Layer 5: All Tests (Integration)
+**Status**: PASS/FAIL
+**Duration**: ~Xs
+**Tests**: {X passed, Y failed}
+
+{Details on any failures}
+
+### Layer 6: Clippy
+**Status**: PASS/FAIL
+**Duration**: ~Xs
+**Output**: {Any warnings}
+
+### Layer 7: Semantic Guards
+**Status**: PASS/MIXED/FAIL
+**Duration**: ~Xs per file
+
+| File | Verdict | Notes |
+|------|---------|-------|
+| `path/to/file.rs` | SAFE/UNSAFE | {Brief notes} |
+
+{Details on any UNSAFE verdicts - were they valid concerns or false positives?}
+
+---
+
+## Code Review Results
+
+### Security Specialist
+**Verdict**: APPROVED / FINDINGS
+
+{Key findings or "No issues found"}
+
+### Test Specialist
+**Verdict**: APPROVED / FINDINGS
+
+{Key findings or "No issues found"}
+
+### Code Quality Reviewer
+**Verdict**: APPROVED / FINDINGS
+
+{Key findings or "No issues found"}
+
+{Add other reviewers as applicable: Observability, Operations, Infrastructure}
+
+---
+
+## Issues Encountered & Resolutions
+
+### Issue 1: {Brief title}
+**Problem**: {What went wrong}
+**Resolution**: {How it was fixed}
+
+### Issue 2: {Brief title}
+**Problem**: {What went wrong}
+**Resolution**: {How it was fixed}
+
+{Add more issues as needed, or "None" if no issues}
+
+---
+
+## Lessons Learned
+
+1. {Key takeaway 1}
+2. {Key takeaway 2}
+3. {Key takeaway 3}
+
+{Add more as applicable}
+
+---
+
+## Next Steps
+
+{Any follow-up work identified during this task}
+
+{Or "None - task complete"}
+
+---
+
+## Appendix: Verification Commands
+
+```bash
+# Commands used for verification
+./scripts/verify-completion.sh --layer full
+
+# Individual steps
+cargo check --workspace
+cargo fmt --all --check
+./scripts/guards/run-guards.sh
+DATABASE_URL=... cargo test --workspace
+DATABASE_URL=... cargo clippy --workspace --lib --bins -- -D warnings
+./scripts/guards/semantic/credential-leak.sh path/to/file.rs
+```

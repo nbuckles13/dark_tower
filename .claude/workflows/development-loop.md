@@ -3,10 +3,12 @@
 ## Overview
 
 The Development Loop is the primary workflow for implementing features. It combines:
+- **Specialist ownership** - Implementing specialist runs verification and fixes issues
 - **Context injection** - Principles, patterns, and specialist knowledge injected into prompts
-- **Iterative verification** - Guards and tests run after each attempt
+- **Trust-but-verify** - Orchestrator re-runs verification as safety net
 - **Code review** - Specialist reviewers validate quality before completion
-- **Reflection** - Specialists update their knowledge files after completion
+- **Reflection via resume** - All specialists resumed to capture learnings with intact context
+- **Output as proof-of-work** - Specialist writes output file, orchestrator validates
 - **Collaboration escalation** - Human involvement after 5 failed attempts
 
 ## When to Use
@@ -23,37 +25,42 @@ The Development Loop is the primary workflow for implementing features. It combi
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│              Development Loop (with Code Review & Reflection)    │
+│         Development Loop (Specialist-Owned Verification)         │
 ├─────────────────────────────────────────────────────────────────┤
 │                                                                  │
 │  1. DEBATE (if cross-cutting)                                   │
 │     └─→ Produces ADR with design decisions                      │
 │     └─→ See: multi-agent-debate.md                              │
 │                                                                  │
-│  2. SPECIALIST INVOCATION (iteration N)                         │
+│  2. SPECIALIST IMPLEMENTATION (single resumed session)          │
 │     └─→ Context injection: principles + knowledge + ADR + task  │
-│     └─→ Specialist implements (or fixes)                        │
+│     └─→ Specialist implements feature                           │
+│     └─→ Specialist runs verification (7 layers)                 │
+│     └─→ Specialist fixes failures, iterates until pass          │
+│     └─→ Specialist writes output file (impl + verification)     │
+│     └─→ Returns to orchestrator                                 │
 │                                                                  │
-│  3. VERIFICATION (7 layers)                                     │
-│     └─→ ./scripts/verify-completion.sh                          │
-│     └─→ If FAIL: Back to step 2                                 │
-│     └─→ If PASS: Continue to step 4                             │
+│  3. ORCHESTRATOR VALIDATES                                      │
+│     └─→ Re-runs verification (trust but verify)                 │
+│     └─→ Validates output file has required sections             │
+│     └─→ If FAIL: Resume specialist → fix issues                 │
+│     └─→ If PASS: Continue to code review                        │
 │                                                                  │
 │  4. CODE REVIEW (per code-review.md)                            │
 │     └─→ Run specialist reviewers in parallel                    │
-│     └─→ Synthesize findings                                     │
-│     └─→ If ANY findings: Back to step 2 with review context     │
-│     └─→ If CLEAN: Continue to step 5                            │
+│     └─→ Save agent IDs for later resume                         │
+│     └─→ If ANY findings: Resume impl specialist → fix → step 3  │
+│     └─→ If CLEAN: Continue to reflection                        │
 │                                                                  │
-│  5. COMPLETE                                                    │
-│     └─→ All verification passed                                 │
-│     └─→ Code review clean                                       │
-│     └─→ Proceed to reflection                                   │
+│  5. REFLECTION (all specialists resumed)                        │
+│     └─→ Resume implementing specialist → reflect → update KB    │
+│     └─→ Resume each reviewer specialist → reflect → update KB   │
+│     └─→ Each appends reflection to output file                  │
 │                                                                  │
-│  6. REFLECTION (before exit)                                    │
-│     └─→ All involved specialists reflect                        │
-│     └─→ Update knowledge files directly (patterns, gotchas)     │
-│     └─→ Changes visible in git diff for user review             │
+│  6. FINALIZE OUTPUT                                             │
+│     └─→ Orchestrator appends code review results to output file │
+│     └─→ Validates all required sections present                 │
+│     └─→ Present to user for review                              │
 │                                                                  │
 │  COLLABORATION (if iteration > 5)                               │
 │     └─→ Stop loop, present status to human                      │
@@ -62,12 +69,27 @@ The Development Loop is the primary workflow for implementing features. It combi
 └─────────────────────────────────────────────────────────────────┘
 ```
 
+## Key Principles
+
+### Specialist Ownership
+The implementing specialist owns verification - it runs checks, fixes failures, and iterates until passing. This keeps the specialist's context intact and ensures it learns from its own mistakes.
+
+### Resume for Continuity
+All specialists are **resumed** (not re-invoked fresh) for:
+- Fix cycles (implementing specialist)
+- Reflection (all specialists)
+
+This preserves context so reflection captures genuine learnings, not summaries.
+
+### Output as Proof-of-Work
+The specialist writes the dev-loop output file as it works. The orchestrator validates required sections exist - if verification results are missing, the specialist skipped that step.
+
 ## Triggering the Loop
 
 **Implicit trigger**: The orchestrator automatically uses this loop for implementation tasks.
 
 When starting, announce:
-> *"Starting development loop (max 5 iterations, includes code review)"*
+> *"Starting development loop (specialist-owned verification, max 5 iterations)"*
 
 Report each iteration result as you go.
 
@@ -141,7 +163,7 @@ task_patterns:
 
 # Part 2: Specialist Prompts
 
-## Iteration 1 Template (Initial)
+## Initial Invocation Template
 
 ```markdown
 {Specialist definition from .claude/agents/{specialist}.md}
@@ -166,93 +188,145 @@ task_patterns:
 
 {The actual task description}
 
-## Verification
+## Your Responsibilities
 
-When complete, the following checks will run:
-- cargo check (must compile)
-- cargo fmt (auto-formats code, fails if syntax broken)
-- ./scripts/guards/run-guards.sh --simple-only (simple guards must pass)
-- cargo test (all tests must pass)
-- cargo clippy -- -D warnings (no new warnings)
-- ./scripts/guards/run-guards.sh --semantic (semantic guards must pass)
+You own the full implementation cycle:
+
+1. **Implement** the feature with tests
+2. **Run verification** (all 7 layers):
+   - cargo check (must compile)
+   - cargo fmt (auto-formats code)
+   - ./scripts/guards/run-guards.sh (simple guards)
+   - cargo test (all tests must pass)
+   - cargo clippy -- -D warnings (no warnings)
+   - ./scripts/guards/semantic/credential-leak.sh {changed files} (semantic guards)
+3. **Fix failures** and re-run until all pass
+4. **Write output file** at `docs/dev-loop-outputs/YYYY-MM-DD-{task-slug}.md`:
+   - Use template from `docs/dev-loop-outputs/_template.md`
+   - Fill in: Task Overview, Implementation Summary, Files Modified
+   - Fill in: Verification Results (all 7 layers with status, timing, any issues)
+   - Fill in: Issues Encountered & Resolutions
+5. **Return** when verification passes
+
+The orchestrator will re-run verification to confirm, then run code review.
+If code review has findings, you'll be resumed to fix them.
+After code review is clean, you'll be resumed for reflection.
 
 ## Deliverables
 
 1. Implementation code
 2. Unit tests for new/modified code
 3. All verification checks passing
+4. Output file with implementation and verification sections completed
 ```
 
-## Iterations 2-5 Template (Retry)
+## Resume for Fixes Template
+
+When resuming a specialist to fix code review findings:
 
 ```markdown
-{Same as iteration 1, plus:}
+## Code Review Findings (Iteration {N} of 5)
 
-## Previous Attempt Failed (Iteration {N} of 5)
+Verification passed ✓
 
-{Formatted failure report from verification script OR code review findings}
+Code review found the following issues:
 
-Please fix these issues. Focus on:
-1. {Specific failure 1}
-2. {Specific failure 2}
-...
+### 🔴 Security Specialist
+1. **{Finding title}** - `{file:line}`
+   - Impact: {description}
+   - Fix: {suggested fix}
 
-Do not change unrelated code. Make minimal fixes to pass verification and code review.
+### 🟡 Test Specialist
+2. **{Finding title}** - `{file:line}`
+   - {description}
+
+{... more findings ...}
+
+Please address ALL findings, then:
+1. Re-run verification
+2. Update the output file with what you fixed
+3. Return when complete
+```
+
+## Resume for Reflection Template
+
+When resuming a specialist for reflection (after code review is clean):
+
+```markdown
+## Reflection Time
+
+The task is complete - verification passed and code review is clean.
+
+Please reflect on what you learned and update your knowledge files:
+
+1. **Review** your current knowledge in `.claude/agents/{specialist}/`
+2. **Add** new patterns, gotchas, or integration notes you discovered
+3. **Update** any existing knowledge that evolved
+4. **Remove** any knowledge that's now outdated
+5. **Append** a Reflection section to the output file summarizing your learnings
+
+If nothing new was learned, note that briefly and skip file updates.
 ```
 
 ---
 
 # Part 3: Verification
 
-## Running Verification
+## Specialist Runs Verification
 
-After specialist completes, run:
+The implementing specialist is responsible for running verification and fixing failures. This keeps context intact and ensures the specialist learns from its own mistakes.
+
+**Verification layers** (specialist runs all 7):
+1. `cargo check` - Compilation
+2. `cargo fmt` - Auto-formatting
+3. Simple guards - `./scripts/guards/run-guards.sh`
+4. Unit tests - `cargo test --lib`
+5. All tests - `cargo test`
+6. Clippy - `cargo clippy -- -D warnings`
+7. Semantic guards - `./scripts/guards/semantic/credential-leak.sh {files}`
+
+The specialist iterates until all pass, documenting results in the output file.
+
+## Orchestrator Validates (Trust but Verify)
+
+After the specialist returns, the orchestrator re-runs verification:
 
 ```bash
 ./scripts/verify-completion.sh --verbose
 ```
 
 **Exit codes**:
-- 0 = All checks passed → Loop complete
-- 1 = Checks failed → Continue to retry or collaboration
+- 0 = Confirmed passing → Continue to code review
+- 1 = Failed → Resume specialist to fix
 
-**Verification layers** (all run for full verification):
-1. `cargo check` - Compilation
-2. `cargo fmt` - Auto-formatting (fixes in-place, fails only if syntax broken)
-3. Simple guards - Pattern-based checks
-4. Unit tests - `cargo test --lib`
-5. All tests - `cargo test`
-6. Clippy - Lint warnings
-7. Semantic guards - LLM-based analysis (slowest, runs last)
+This catches cases where the specialist skipped steps or didn't fully fix issues.
 
-## Formatting Failures for Retry
+## Validating the Output File
 
-When verification fails, format the failure report for the retry prompt:
+The orchestrator also checks that the output file has required sections:
+
+```bash
+# Check output file exists and has verification results
+grep -q "## Verification Results" docs/dev-loop-outputs/YYYY-MM-DD-*.md
+```
+
+If verification results are missing from the output file, the specialist skipped that step - resume to fix.
+
+## Resume for Fixes
+
+When verification fails after specialist returns:
 
 ```markdown
-## Previous Attempt Failed (Iteration 2 of 5)
+## Verification Failed
 
-**Failed at**: simple-guards
-**Time**: 1.5 seconds
+The orchestrator re-ran verification and it failed:
 
-### Guard Failures
+**Failed at**: {layer}
+**Output**:
+{failure details}
 
-#### no-pii-in-logs.sh (2 violations)
-
-```
-src/handlers.rs:45: info!("User email: {}", email)
-src/handlers.rs:52: debug!("IP: {}", ip_address)
-```
-
-**How to fix**: Use `[REDACTED]` placeholder or add `skip(email, ip_address)` to #[instrument]
-
-### Summary
-
-- Compilation: PASSED
-- Guards: FAILED (2 violations)
-- Tests: SKIPPED (blocked by guard failure)
-
-Please fix the guard violations and ensure all checks pass.
+Your output file shows verification passed, but re-running shows failures.
+Please investigate, fix the issues, re-run verification, and update the output file.
 ```
 
 ---
@@ -261,24 +335,38 @@ Please fix the guard violations and ensure all checks pass.
 
 ## Running Code Review
 
-After verification passes (all 7 layers), run code review per `.claude/workflows/code-review.md`:
+After verification passes (confirmed by orchestrator), run code review per `.claude/workflows/code-review.md`:
 
 1. **Execute code review workflow**
    - Determine relevant ADRs and principles (same as implementation phase)
    - Run specialist reviewers in parallel (Code Reviewer, Security, Test, Observability)
    - Include Operations/Infrastructure specialists if relevant
-   - Synthesize findings
+   - **Save agent IDs** for each reviewer (needed for reflection later)
 
 2. **Evaluate results**:
-   - If NO findings: Loop complete ✓
-   - If ANY findings: Format as retry context, back to specialist
+   - If NO findings: Continue to reflection ✓
+   - If ANY findings: Resume implementing specialist to fix
 
-3. **All findings are blocking** - BLOCKER, CRITICAL, MAJOR, MINOR, SUGGESTION all trigger retry
+3. **All findings are blocking** - BLOCKER, CRITICAL, MAJOR, MINOR, SUGGESTION all trigger fixes
 
-## Formatting Code Review Findings for Retry
+## Saving Agent IDs
+
+When invoking code review specialists, capture their agent IDs:
+
+```
+Security review: agent_id = abc123
+Test review: agent_id = def456
+Code Reviewer: agent_id = ghi789
+```
+
+These IDs are needed to resume each reviewer for reflection after the loop completes.
+
+## Resume Implementing Specialist for Fixes
+
+When code review has findings, **resume** the implementing specialist (don't invoke fresh):
 
 ```markdown
-## Previous Attempt: Code Review Findings (Iteration 3 of 5)
+## Code Review Findings (Iteration {N} of 5)
 
 Verification passed ✓
 
@@ -299,11 +387,14 @@ Code review found the following issues:
    - Current: "Invalid token"
    - Suggested: "Token validation failed" (matches ADR-0005)
 
-Please address ALL findings. After fixing:
-- Verification will run again
-- Code review will run again
-- Loop continues until clean review or iteration 5
+Please address ALL findings:
+1. Fix each issue
+2. Re-run verification (all 7 layers)
+3. Update the output file with fixes made
+4. Return when complete
 ```
+
+After the specialist fixes and returns, orchestrator re-validates and re-runs code review.
 
 See `code-review.md` for full reviewer participation rules, synthesis process, and severity categories.
 
@@ -394,50 +485,56 @@ When run within the development loop, it uses the same reviewer set and principl
 
 After a successful implementation (verification passed, code review clean), all involved specialists reflect on what they learned. This builds the specialist knowledge base over time and captures insights while context is fresh.
 
+## Critical: Resume, Don't Re-invoke
+
+Specialists must be **resumed** for reflection, not invoked fresh. This preserves their context so they can reflect on their actual experience, not a summary provided by the orchestrator.
+
+```
+# Correct - resume with agent ID
+Task(resume="abc123", prompt="Time to reflect...")
+
+# Wrong - fresh invocation loses context
+Task(prompt="You just reviewed code for X, please reflect...")
+```
+
 ## When to Reflect
 
-Reflection happens **after code review is clean but before exiting the loop**. This ensures:
-- Knowledge updates are captured while context is fresh
-- Both implementation and knowledge updates can be presented together for human approval
-- User sees the complete picture before committing anything
+Reflection happens **after code review is clean but before finalizing output**. This ensures:
+- Specialists have intact memory of what they did
+- Knowledge updates capture genuine learnings
+- User sees complete picture before committing
 
-## Who Reflects
+## Who Reflects (All Resumed)
 
-All specialists involved in the task:
-- **Implementing specialist** (e.g., Auth Controller)
-- **Code review specialists** (Security, Test, Observability, Code Reviewer)
-- **Operations/Infrastructure** if they participated in review
+| Specialist | Agent ID Source | What They Reflect On |
+|------------|-----------------|---------------------|
+| Implementing specialist | Saved from step 2 | Implementation decisions, verification fixes |
+| Security reviewer | Saved from step 4 | Security patterns observed, gaps found |
+| Test reviewer | Saved from step 4 | Test coverage insights, testing patterns |
+| Code Reviewer | Saved from step 4 | Code quality observations, idioms |
+| Others (if participated) | Saved from step 4 | Domain-specific learnings |
 
-Each gets a reflection prompt asking what they learned.
+## Reflection Prompt (for Resume)
 
-## Reflection Prompt Template
+Since the specialist is being resumed with full context, the prompt is simple:
 
 ```markdown
-## Reflection: {Specialist Name}
+## Reflection Time
 
-You just completed work on: {task description}
+The task is complete - verification passed and code review is clean.
 
-Your current knowledge files:
-{Contents of .claude/agents/{specialist}/*.md, or "None yet - this is your first reflection"}
+Please reflect on what you learned:
 
-Based on this task, update your knowledge files directly:
+1. **Review** your current knowledge in `.claude/agents/{specialist}/`
+2. **Add** new patterns, gotchas, or integration notes you discovered
+3. **Update** any existing knowledge that evolved
+4. **Remove** any knowledge that's now outdated
+5. **Append** a Reflection section to the output file
 
-### What to Add
-- New patterns you established that should be reused
-- Gotchas you encountered that others should avoid
-- Integration notes about working with other services
+Your knowledge files:
+{Contents of .claude/agents/{specialist}/*.md, or "None yet - create them now"}
 
-### What to Update
-- Existing knowledge that needs modification based on what you learned
-- Patterns that evolved or improved
-
-### What to Remove
-- Knowledge that's now outdated (e.g., code was deleted or approach changed)
-
-### If No Changes Needed
-If nothing new was learned, explain briefly why and skip file updates.
-
-**Remember**: Update the files directly. The user will see changes in the git diff.
+If nothing new was learned, note that briefly and skip file updates.
 ```
 
 ## Knowledge File Format
@@ -536,31 +633,109 @@ None.
 
 ---
 
+# Part 8: Output Documentation
+
+## Purpose
+
+The output file serves as:
+- **Proof-of-work** - Evidence that the specialist ran all required steps
+- **Audit trail** - Record of the development process
+- **Historical reference** - Patterns in what works/doesn't
+
+## Shared Responsibility
+
+| Section | Written By | When |
+|---------|------------|------|
+| Task Overview | Specialist | During implementation |
+| Implementation Summary | Specialist | During implementation |
+| Files Modified | Specialist | During implementation |
+| Verification Results (7 layers) | Specialist | After each verification run |
+| Issues Encountered | Specialist | As issues arise |
+| Reflection | Each specialist | During reflection step |
+| Code Review Results | Orchestrator | After code review |
+| Final Validation | Orchestrator | Before presenting to user |
+
+## Output Location
+
+`docs/dev-loop-outputs/YYYY-MM-DD-{task-slug}.md`
+
+## Template
+
+Use the template at `docs/dev-loop-outputs/_template.md`
+
+## Orchestrator Validation
+
+Before presenting to user, orchestrator validates:
+
+```bash
+# Required sections from specialist
+grep -q "## Task Overview" $OUTPUT_FILE
+grep -q "## Implementation Summary" $OUTPUT_FILE
+grep -q "## Verification Results" $OUTPUT_FILE  # Proof verification was run
+
+# If any missing, resume specialist to complete
+```
+
+If verification results are missing, the specialist skipped that step - resume to fix.
+
+## Orchestrator Appends
+
+After validation, orchestrator appends:
+- Code review results (from all reviewers)
+- Final validation timestamp
+- Any orchestrator-level observations
+
+---
+
 # Quick Reference
 
-## Before Specialist Invocation
+## Starting the Loop
 
 1. Match task → categories (see mapping above)
 2. Load specialist knowledge files if they exist
-3. Build prompt with principles + knowledge + existing patterns
-4. Announce: "Starting development loop (max 5 iterations, includes code review)"
+3. Build prompt with principles + knowledge + verification responsibilities
+4. Announce: "Starting development loop (specialist-owned verification, max 5 iterations)"
+5. Invoke implementing specialist
+6. **Save agent ID** for later resume
 
-## After Each Specialist Attempt
+## After Specialist Returns
 
-1. Run `./scripts/verify-completion.sh --verbose`
-2. If verification FAIL and iteration ≤ 5 → Format failures, retry
-3. If verification PASS → Run code review (per `code-review.md`)
-4. If code review CLEAN → Run reflection, then exit loop
-5. If code review has findings and iteration ≤ 5 → Format findings, retry
-6. If iteration > 5 → Enter collaboration mode
+1. **Re-run verification** (trust but verify): `./scripts/verify-completion.sh`
+2. **Validate output file** has required sections
+3. If verification FAIL → Resume specialist to fix
+4. If output file incomplete → Resume specialist to complete
+5. If all good → Run code review
 
-## Loop Exit
+## Code Review
 
-After reflection completes:
-1. Announce loop completion
-2. Summarize what was implemented and any knowledge updates
-3. User reviews git diff (implementation + knowledge files)
-4. User commits when satisfied
+1. Run reviewers in parallel (Security, Test, Code Reviewer, etc.)
+2. **Save agent IDs** for each reviewer
+3. If ANY findings → Resume implementing specialist with findings → back to validation
+4. If CLEAN → Continue to reflection
+
+## Reflection (All Specialists Resumed)
+
+1. **Resume** implementing specialist → reflect → update knowledge files
+2. **Resume** each code review specialist → reflect → update knowledge files
+3. Each specialist appends reflection to output file
+
+## Finalize
+
+1. Orchestrator appends code review results to output file
+2. Validate all required sections present
+3. Announce loop completion
+4. User reviews git diff (implementation + knowledge files + output doc)
+5. User commits when satisfied
+
+## Agent IDs to Track
+
+| Agent | When Saved | Used For |
+|-------|------------|----------|
+| Implementing specialist | Step 2 initial invoke | Fix cycles, reflection |
+| Security reviewer | Code review | Reflection |
+| Test reviewer | Code review | Reflection |
+| Code Reviewer | Code review | Reflection |
+| Others | Code review | Reflection |
 
 ## Verification Commands
 
