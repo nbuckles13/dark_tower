@@ -6,6 +6,8 @@ A modern, high-performance video conferencing platform built with Rust and WebTr
 
 Dark Tower is an ambitious open-source video conferencing platform designed for scalability, performance, and user flexibility. Built entirely with AI-generated code, it leverages cutting-edge web technologies including WebTransport, WebCodec, and QUIC to deliver low-latency, high-quality video conferencing experiences.
 
+> **Curious how we build with AI?** See [AI_DEVELOPMENT.md](AI_DEVELOPMENT.md) for an overview of our specialist agents, guard pipeline, and development methodology.
+
 ## Architecture
 
 The platform consists of five main components:
