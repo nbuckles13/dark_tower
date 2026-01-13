@@ -50,6 +50,7 @@ thiserror = { workspace = true }
 
 # Local dependencies
 ac-service = { path = "../ac-service" }
+common = { path = "../common" }
 
 [lib]
 name = "ac_test_utils"

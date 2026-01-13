@@ -4,6 +4,7 @@ use crate::models::{AuthEventType, JsonWebKey, Jwks};
 use crate::repositories::{auth_events, signing_keys};
 use base64::{engine::general_purpose, Engine as _};
 use chrono::{Duration, Utc};
+use common::secret::ExposeSecret;
 use sqlx::PgPool;
 
 const KEY_VALIDITY_DAYS: i64 = 365; // 1 year
@@ -60,7 +61,7 @@ pub async fn initialize_signing_key(
         pool,
         &key_id,
         &public_key_pem,
-        &encrypted.encrypted_data,
+        encrypted.encrypted_data.expose_secret(),
         &encrypted.nonce,
         &encrypted.tag,
         1, // master_key_version
@@ -121,7 +122,7 @@ pub async fn rotate_signing_key(
         pool,
         &key_id,
         &public_key_pem,
-        &encrypted.encrypted_data,
+        encrypted.encrypted_data.expose_secret(),
         &encrypted.nonce,
         &encrypted.tag,
         1, // master_key_version
@@ -212,7 +213,7 @@ pub async fn rotate_signing_key_tx(
     )
     .bind(&key_id)
     .bind(&public_key_pem)
-    .bind(&encrypted.encrypted_data)
+    .bind(encrypted.encrypted_data.expose_secret())
     .bind(&encrypted.nonce)
     .bind(&encrypted.tag)
     .bind(1) // master_key_version

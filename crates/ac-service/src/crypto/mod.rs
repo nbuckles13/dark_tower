@@ -4,6 +4,7 @@ use crate::config::{MAX_BCRYPT_COST, MIN_BCRYPT_COST};
 use crate::errors::AcError;
 use crate::observability::metrics::record_token_validation;
 use base64::{engine::general_purpose, Engine as _};
+use common::secret::{ExposeSecret, SecretBox, SecretString};
 use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use ring::{
     aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM},
@@ -11,6 +12,7 @@ use ring::{
     signature::{Ed25519KeyPair, KeyPair},
 };
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use tracing::instrument;
 
 /// Maximum allowed JWT size in bytes (4KB).
@@ -33,8 +35,11 @@ use tracing::instrument;
 /// Per OWASP API Security Top 10 - API4:2023 (Unrestricted Resource Consumption)
 const MAX_JWT_SIZE_BYTES: usize = 4096; // 4KB
 
-/// JWT Claims structure
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// JWT Claims structure.
+///
+/// The `sub` field contains user or client identifiers which should not
+/// be exposed in logs. A custom Debug implementation redacts this field.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Claims {
     pub sub: String,   // Subject (user_id or client_id)
     pub exp: i64,      // Expiration timestamp
@@ -44,18 +49,50 @@ pub struct Claims {
     pub service_type: Option<String>, // Service type for service tokens
 }
 
+/// Custom Debug implementation that redacts the `sub` field.
+///
+/// The `sub` field contains user/client identifiers which are sensitive
+/// and should not be exposed in logs or debug output.
+impl fmt::Debug for Claims {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Claims")
+            .field("sub", &"[REDACTED]")
+            .field("exp", &self.exp)
+            .field("iat", &self.iat)
+            .field("scope", &self.scope)
+            .field("service_type", &self.service_type)
+            .finish()
+    }
+}
+
 /// Encrypted key structure (AES-256-GCM)
 ///
-/// Debug is manually implemented to redact cryptographic material.
-#[derive(Clone)]
+/// The `encrypted_data` field is wrapped in `SecretBox` to prevent accidental
+/// exposure. While it is ciphertext, it still contains sensitive encrypted
+/// key material that should not be logged.
+///
+/// Debug is manually implemented to redact all cryptographic material.
+/// Clone is manually implemented because SecretBox requires explicit cloning.
 pub struct EncryptedKey {
-    pub encrypted_data: Vec<u8>,
+    /// Encrypted key material (AES-256-GCM ciphertext).
+    /// Use `.expose_secret()` to access the actual bytes.
+    pub encrypted_data: SecretBox<Vec<u8>>,
     pub nonce: Vec<u8>, // 96-bit (12 bytes)
     pub tag: Vec<u8>,   // 128-bit (16 bytes)
 }
 
-impl std::fmt::Debug for EncryptedKey {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Clone for EncryptedKey {
+    fn clone(&self) -> Self {
+        Self {
+            encrypted_data: SecretBox::new(Box::new(self.encrypted_data.expose_secret().clone())),
+            nonce: self.nonce.clone(),
+            tag: self.tag.clone(),
+        }
+    }
+}
+
+impl fmt::Debug for EncryptedKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("EncryptedKey")
             .field("encrypted_data", &"[REDACTED]")
             .field("nonce", &"[REDACTED]")
@@ -72,13 +109,13 @@ pub fn generate_signing_key() -> Result<(String, Vec<u8>), AcError> {
     let rng = SystemRandom::new();
 
     // Generate Ed25519 keypair in PKCS8 format
-    let pkcs8_bytes = Ed25519KeyPair::generate_pkcs8(&rng).map_err(|e| {
-        tracing::error!(target: "crypto", error = ?e, "Keypair generation failed");
+    let pkcs8_bytes = Ed25519KeyPair::generate_pkcs8(&rng).map_err(|_| {
+        tracing::error!(target: "crypto", "Keypair generation failed");
         AcError::Crypto("Key generation failed".to_string())
     })?;
 
-    let key_pair = Ed25519KeyPair::from_pkcs8(pkcs8_bytes.as_ref()).map_err(|e| {
-        tracing::error!(target: "crypto", error = ?e, "Keypair parsing failed");
+    let key_pair = Ed25519KeyPair::from_pkcs8(pkcs8_bytes.as_ref()).map_err(|_| {
+        tracing::error!(target: "crypto", "Keypair parsing failed");
         AcError::Crypto("Key generation failed".to_string())
     })?;
 
@@ -108,16 +145,16 @@ pub fn encrypt_private_key(private_key: &[u8], master_key: &[u8]) -> Result<Encr
 
     // Generate random 96-bit nonce (12 bytes)
     let mut nonce_bytes = [0u8; 12];
-    rng.fill(&mut nonce_bytes).map_err(|e| {
-        tracing::error!(target: "crypto", error = ?e, "Nonce generation failed");
+    rng.fill(&mut nonce_bytes).map_err(|_| {
+        tracing::error!(target: "crypto", "Nonce generation failed");
         AcError::Crypto("Encryption failed".to_string())
     })?;
 
     let nonce = Nonce::assume_unique_for_key(nonce_bytes);
 
     // Create AES-256-GCM cipher
-    let unbound_key = UnboundKey::new(&AES_256_GCM, master_key).map_err(|e| {
-        tracing::error!(target: "crypto", error = ?e, "Cipher key creation failed");
+    let unbound_key = UnboundKey::new(&AES_256_GCM, master_key).map_err(|_| {
+        tracing::error!(target: "crypto", "Cipher key creation failed");
         AcError::Crypto("Encryption failed".to_string())
     })?;
     let sealing_key = LessSafeKey::new(unbound_key);
@@ -126,8 +163,8 @@ pub fn encrypt_private_key(private_key: &[u8], master_key: &[u8]) -> Result<Encr
     let mut in_out = private_key.to_vec();
     sealing_key
         .seal_in_place_append_tag(nonce, Aad::empty(), &mut in_out)
-        .map_err(|e| {
-            tracing::error!(target: "crypto", error = ?e, "Encryption operation failed");
+        .map_err(|_| {
+            tracing::error!(target: "crypto", "Encryption operation failed");
             AcError::Crypto("Encryption failed".to_string())
         })?;
 
@@ -147,7 +184,7 @@ pub fn encrypt_private_key(private_key: &[u8], master_key: &[u8]) -> Result<Encr
         .to_vec();
 
     Ok(EncryptedKey {
-        encrypted_data,
+        encrypted_data: SecretBox::new(Box::new(encrypted_data)),
         nonce: nonce_bytes.to_vec(),
         tag,
     })
@@ -175,7 +212,7 @@ pub fn decrypt_private_key(
     }
 
     // Reconstruct ciphertext with tag
-    let mut in_out = encrypted.encrypted_data.clone();
+    let mut in_out = encrypted.encrypted_data.expose_secret().clone();
     in_out.extend_from_slice(&encrypted.tag);
 
     let nonce_bytes: [u8; 12] = encrypted.nonce.as_slice().try_into().map_err(|_| {
@@ -185,8 +222,8 @@ pub fn decrypt_private_key(
     let nonce = Nonce::assume_unique_for_key(nonce_bytes);
 
     // Create AES-256-GCM cipher
-    let unbound_key = UnboundKey::new(&AES_256_GCM, master_key).map_err(|e| {
-        tracing::error!(target: "crypto", error = ?e, "Cipher key creation failed");
+    let unbound_key = UnboundKey::new(&AES_256_GCM, master_key).map_err(|_| {
+        tracing::error!(target: "crypto", "Cipher key creation failed");
         AcError::Crypto("Decryption failed".to_string())
     })?;
     let opening_key = LessSafeKey::new(unbound_key);
@@ -194,8 +231,8 @@ pub fn decrypt_private_key(
     // Decrypt in place
     let decrypted = opening_key
         .open_in_place(nonce, Aad::empty(), &mut in_out)
-        .map_err(|e| {
-            tracing::error!(target: "crypto", error = ?e, "Decryption operation failed");
+        .map_err(|_| {
+            tracing::error!(target: "crypto", "Decryption operation failed");
             AcError::Crypto("Decryption failed".to_string())
         })?;
 
@@ -210,8 +247,8 @@ pub fn sign_jwt(
     key_id: &str,
 ) -> Result<String, AcError> {
     // Validate the private key format
-    let _key_pair = Ed25519KeyPair::from_pkcs8(private_key_pkcs8).map_err(|e| {
-        tracing::error!(target: "crypto", error = ?e, "Invalid private key format");
+    let _key_pair = Ed25519KeyPair::from_pkcs8(private_key_pkcs8).map_err(|_| {
+        tracing::error!(target: "crypto", "Invalid private key format");
         AcError::Crypto("JWT signing failed".to_string())
     })?;
 
@@ -223,8 +260,8 @@ pub fn sign_jwt(
     header.typ = Some("JWT".to_string());
     header.kid = Some(key_id.to_string());
 
-    let token = encode(&header, claims, &encoding_key).map_err(|e| {
-        tracing::error!(target: "crypto", error = ?e, "JWT signing operation failed");
+    let token = encode(&header, claims, &encoding_key).map_err(|_| {
+        tracing::error!(target: "crypto", "JWT signing operation failed");
         AcError::Crypto("JWT signing failed".to_string())
     })?;
 
@@ -315,8 +352,8 @@ pub fn verify_jwt(
 
     let public_key_bytes = general_purpose::STANDARD
         .decode(&public_key_b64)
-        .map_err(|e| {
-            tracing::debug!(target: "crypto", error = ?e, "Invalid public key encoding");
+        .map_err(|_| {
+            tracing::debug!(target: "crypto", "Invalid public key encoding");
             AcError::InvalidToken("The access token is invalid or expired".to_string())
         })?;
 
@@ -325,8 +362,8 @@ pub fn verify_jwt(
     let mut validation = Validation::new(Algorithm::EdDSA);
     validation.validate_exp = true;
 
-    let token_data = decode::<Claims>(token, &decoding_key, &validation).map_err(|e| {
-        tracing::debug!(target: "crypto", error = ?e, "Token verification failed");
+    let token_data = decode::<Claims>(token, &decoding_key, &validation).map_err(|_| {
+        tracing::debug!(target: "crypto", "Token verification failed");
         AcError::InvalidToken("The access token is invalid or expired".to_string())
     })?;
 
@@ -390,8 +427,8 @@ pub fn hash_client_secret(secret: &str, cost: u32) -> Result<String, AcError> {
         )));
     }
 
-    bcrypt::hash(secret, cost).map_err(|e| {
-        tracing::error!(target: "crypto", error = ?e, cost = cost, "Password hashing failed");
+    bcrypt::hash(secret, cost).map_err(|_| {
+        tracing::error!(target: "crypto", cost = cost, "Password hashing failed");
         AcError::Crypto("Password hashing failed".to_string())
     })
 }
@@ -399,8 +436,8 @@ pub fn hash_client_secret(secret: &str, cost: u32) -> Result<String, AcError> {
 /// Verify client secret against bcrypt hash
 #[instrument(skip_all)]
 pub fn verify_client_secret(secret: &str, hash: &str) -> Result<bool, AcError> {
-    bcrypt::verify(secret, hash).map_err(|e| {
-        tracing::error!(target: "crypto", error = ?e, "Password verification failed");
+    bcrypt::verify(secret, hash).map_err(|_| {
+        tracing::error!(target: "crypto", "Password verification failed");
         AcError::Crypto("Password verification failed".to_string())
     })
 }
@@ -409,18 +446,22 @@ pub fn verify_client_secret(secret: &str, hash: &str) -> Result<bool, AcError> {
 pub fn generate_random_bytes(len: usize) -> Result<Vec<u8>, AcError> {
     let rng = SystemRandom::new();
     let mut bytes = vec![0u8; len];
-    rng.fill(&mut bytes).map_err(|e| {
-        tracing::error!(target: "crypto", error = ?e, "Random bytes generation failed");
+    rng.fill(&mut bytes).map_err(|_| {
+        tracing::error!(target: "crypto", "Random bytes generation failed");
         AcError::Crypto("Random generation failed".to_string())
     })?;
     Ok(bytes)
 }
 
-/// Generate a client secret (32 bytes, base64 encoded)
+/// Generate a client secret (32 bytes, base64 encoded).
+///
+/// Returns a `SecretString` to prevent accidental exposure in logs or debug output.
+/// The caller must use `.expose_secret()` to access the actual value.
 #[instrument(skip_all)]
-pub fn generate_client_secret() -> Result<String, AcError> {
+pub fn generate_client_secret() -> Result<SecretString, AcError> {
     let bytes = generate_random_bytes(32)?;
-    Ok(general_purpose::STANDARD.encode(&bytes))
+    let encoded = general_purpose::STANDARD.encode(&bytes);
+    Ok(SecretString::from(encoded))
 }
 
 #[cfg(test)]
@@ -481,11 +522,15 @@ mod tests {
 
     #[test]
     fn test_generate_client_secret() {
+        use common::secret::ExposeSecret;
+
         let secret = generate_client_secret().unwrap();
-        assert!(!secret.is_empty());
+        assert!(!secret.expose_secret().is_empty());
 
         // Should be base64 encoded
-        assert!(general_purpose::STANDARD.decode(&secret).is_ok());
+        assert!(general_purpose::STANDARD
+            .decode(secret.expose_secret())
+            .is_ok());
     }
 
     // Error path tests
@@ -1134,7 +1179,7 @@ mod tests {
         assert!(deserialized.service_type.is_none());
     }
 
-    /// Test Claims Debug implementation
+    /// Test Claims Debug implementation redacts sensitive sub field
     #[test]
     fn test_claims_debug() {
         let claims = Claims {
@@ -1146,7 +1191,16 @@ mod tests {
         };
 
         let debug_str = format!("{:?}", claims);
-        assert!(debug_str.contains("test-user"));
+        // Sub field should be redacted
+        assert!(
+            !debug_str.contains("test-user"),
+            "Debug output should not contain actual sub value"
+        );
+        assert!(
+            debug_str.contains("[REDACTED]"),
+            "Debug output should contain [REDACTED] for sub field"
+        );
+        // Other fields should be visible
         assert!(debug_str.contains("read write"));
         assert!(debug_str.contains("media-handler"));
     }
@@ -1171,11 +1225,11 @@ mod tests {
         assert_eq!(cloned.service_type, claims.service_type);
     }
 
-    /// Test EncryptedKey Debug implementation
+    /// Test EncryptedKey Debug implementation redacts sensitive data
     #[test]
     fn test_encrypted_key_debug() {
         let encrypted = EncryptedKey {
-            encrypted_data: vec![1, 2, 3, 4],
+            encrypted_data: common::secret::SecretBox::new(Box::new(vec![1, 2, 3, 4])),
             nonce: vec![5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
             tag: vec![
                 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32,
@@ -1184,13 +1238,19 @@ mod tests {
 
         let debug_str = format!("{:?}", encrypted);
         assert!(debug_str.contains("EncryptedKey"));
+        assert!(
+            debug_str.contains("[REDACTED]"),
+            "Debug output should redact encrypted data"
+        );
     }
 
     /// Test EncryptedKey Clone implementation
     #[test]
     fn test_encrypted_key_clone() {
+        use common::secret::ExposeSecret;
+
         let encrypted = EncryptedKey {
-            encrypted_data: vec![1, 2, 3],
+            encrypted_data: common::secret::SecretBox::new(Box::new(vec![1, 2, 3])),
             nonce: vec![4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
             tag: vec![
                 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
@@ -1199,7 +1259,10 @@ mod tests {
 
         let cloned = encrypted.clone();
 
-        assert_eq!(cloned.encrypted_data, encrypted.encrypted_data);
+        assert_eq!(
+            cloned.encrypted_data.expose_secret(),
+            encrypted.encrypted_data.expose_secret()
+        );
         assert_eq!(cloned.nonce, encrypted.nonce);
         assert_eq!(cloned.tag, encrypted.tag);
     }
@@ -1228,20 +1291,29 @@ mod tests {
     /// Test generate_client_secret produces unique values
     #[test]
     fn test_generate_client_secret_uniqueness() {
+        use common::secret::ExposeSecret;
+
         let secret1 = generate_client_secret().unwrap();
         let secret2 = generate_client_secret().unwrap();
 
         assert_ne!(
-            secret1, secret2,
+            secret1.expose_secret(),
+            secret2.expose_secret(),
             "Two generated secrets should be different"
         );
 
         // Verify they're valid base64
-        assert!(general_purpose::STANDARD.decode(&secret1).is_ok());
-        assert!(general_purpose::STANDARD.decode(&secret2).is_ok());
+        assert!(general_purpose::STANDARD
+            .decode(secret1.expose_secret())
+            .is_ok());
+        assert!(general_purpose::STANDARD
+            .decode(secret2.expose_secret())
+            .is_ok());
 
         // Verify decoded length is 32 bytes
-        let decoded1 = general_purpose::STANDARD.decode(&secret1).unwrap();
+        let decoded1 = general_purpose::STANDARD
+            .decode(secret1.expose_secret())
+            .unwrap();
         assert_eq!(decoded1.len(), 32, "Decoded secret should be 32 bytes");
     }
 
@@ -1272,17 +1344,25 @@ mod tests {
     /// Validates that authentication tag verification catches corruption.
     #[test]
     fn test_decrypt_corrupted_ciphertext() {
+        use common::secret::ExposeSecret;
+
         let master_key = vec![0u8; 32];
         let data = b"sensitive data";
 
-        let mut encrypted = encrypt_private_key(data, &master_key).unwrap();
+        let encrypted = encrypt_private_key(data, &master_key).unwrap();
 
-        // Corrupt one byte of the ciphertext
-        if !encrypted.encrypted_data.is_empty() {
-            encrypted.encrypted_data[0] ^= 0xFF;
+        // Corrupt one byte of the ciphertext by creating a new EncryptedKey with modified data
+        let mut corrupted_data = encrypted.encrypted_data.expose_secret().clone();
+        if !corrupted_data.is_empty() {
+            corrupted_data[0] ^= 0xFF;
         }
+        let corrupted_encrypted = EncryptedKey {
+            encrypted_data: common::secret::SecretBox::new(Box::new(corrupted_data)),
+            nonce: encrypted.nonce.clone(),
+            tag: encrypted.tag.clone(),
+        };
 
-        let result = decrypt_private_key(&encrypted, &master_key);
+        let result = decrypt_private_key(&corrupted_encrypted, &master_key);
 
         let err = result.expect_err("Corrupted ciphertext should fail authentication");
         assert!(matches!(err, AcError::Crypto(msg) if msg == "Decryption failed"));

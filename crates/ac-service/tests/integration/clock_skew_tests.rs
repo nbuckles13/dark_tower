@@ -5,9 +5,11 @@
 
 use ac_service::config::DEFAULT_JWT_CLOCK_SKEW_SECONDS;
 use ac_service::crypto;
+use ac_service::models::SigningKey;
 use ac_service::repositories::signing_keys;
 use ac_service::services::key_management_service;
 use chrono::Utc;
+use common::secret::SecretBox;
 use sqlx::PgPool;
 
 // ============================================================================
@@ -18,13 +20,13 @@ use sqlx::PgPool;
 async fn get_signing_key_and_private(
     pool: &PgPool,
     master_key: &[u8],
-) -> Result<(signing_keys::SigningKey, Vec<u8>), anyhow::Error> {
+) -> Result<(SigningKey, Vec<u8>), anyhow::Error> {
     let signing_key = signing_keys::get_active_key(pool)
         .await?
         .ok_or_else(|| anyhow::anyhow!("No active signing key"))?;
 
     let encrypted_key = crypto::EncryptedKey {
-        encrypted_data: signing_key.private_key_encrypted.clone(),
+        encrypted_data: SecretBox::new(Box::new(signing_key.private_key_encrypted.clone())),
         nonce: signing_key.encryption_nonce.clone(),
         tag: signing_key.encryption_tag.clone(),
     };
@@ -43,8 +45,9 @@ async fn get_signing_key_and_private(
 /// - A token with iat 30 seconds in the future (within 60s skew) is accepted
 /// - This proves the custom configuration is correctly propagated through the pipeline
 #[sqlx::test(migrations = "../../migrations")]
-async fn test_custom_clock_skew_accepts_within_tolerance(pool: PgPool) -> Result<(), anyhow::Error>
-{
+async fn test_custom_clock_skew_accepts_within_tolerance(
+    pool: PgPool,
+) -> Result<(), anyhow::Error> {
     // Arrange: Initialize signing key
     let master_key = crypto::generate_random_bytes(32)?;
     key_management_service::initialize_signing_key(&pool, &master_key, "test").await?;
@@ -57,8 +60,8 @@ async fn test_custom_clock_skew_accepts_within_tolerance(pool: PgPool) -> Result
     // This is within 60 second custom clock skew but outside 5 minute default
     let claims = crypto::Claims {
         sub: "clock-skew-test-client".to_string(),
-        exp: now + 3600,       // Expires in 1 hour
-        iat: now + 30,         // Issued 30 seconds from now (within 60s skew)
+        exp: now + 3600, // Expires in 1 hour
+        iat: now + 30,   // Issued 30 seconds from now (within 60s skew)
         scope: "test:scope".to_string(),
         service_type: Some("global-controller".to_string()),
     };
@@ -88,8 +91,9 @@ async fn test_custom_clock_skew_accepts_within_tolerance(pool: PgPool) -> Result
 /// - A token with iat 90 seconds in the future (beyond 60s skew) is rejected
 /// - This proves the custom configuration is correctly enforced
 #[sqlx::test(migrations = "../../migrations")]
-async fn test_custom_clock_skew_rejects_beyond_tolerance(pool: PgPool) -> Result<(), anyhow::Error>
-{
+async fn test_custom_clock_skew_rejects_beyond_tolerance(
+    pool: PgPool,
+) -> Result<(), anyhow::Error> {
     // Arrange: Initialize signing key
     let master_key = crypto::generate_random_bytes(32)?;
     key_management_service::initialize_signing_key(&pool, &master_key, "test").await?;
@@ -102,8 +106,8 @@ async fn test_custom_clock_skew_rejects_beyond_tolerance(pool: PgPool) -> Result
     // This is beyond 60 second custom clock skew
     let claims = crypto::Claims {
         sub: "clock-skew-test-client".to_string(),
-        exp: now + 3600,       // Expires in 1 hour
-        iat: now + 90,         // Issued 90 seconds from now (beyond 60s skew)
+        exp: now + 3600, // Expires in 1 hour
+        iat: now + 90,   // Issued 90 seconds from now (beyond 60s skew)
         scope: "test:scope".to_string(),
         service_type: Some("global-controller".to_string()),
     };
@@ -141,7 +145,7 @@ async fn test_default_clock_skew_behavior_unchanged(pool: PgPool) -> Result<(), 
     let claims = crypto::Claims {
         sub: "default-skew-test-client".to_string(),
         exp: now + 3600,
-        iat: now + 120,        // Within default 300 second clock skew
+        iat: now + 120, // Within default 300 second clock skew
         scope: "test:scope".to_string(),
         service_type: Some("global-controller".to_string()),
     };
@@ -149,7 +153,11 @@ async fn test_default_clock_skew_behavior_unchanged(pool: PgPool) -> Result<(), 
     let token = crypto::sign_jwt(&claims, &private_key, &signing_key.key_id)?;
 
     // Act: Verify with DEFAULT clock skew
-    let result = crypto::verify_jwt(&token, &signing_key.public_key, DEFAULT_JWT_CLOCK_SKEW_SECONDS);
+    let result = crypto::verify_jwt(
+        &token,
+        &signing_key.public_key,
+        DEFAULT_JWT_CLOCK_SKEW_SECONDS,
+    );
 
     // Assert: Token should be accepted with default clock skew
     assert!(
@@ -180,12 +188,13 @@ async fn test_minimum_clock_skew_edge_case(pool: PgPool) -> Result<(), anyhow::E
     let claims_at_boundary = crypto::Claims {
         sub: "min-skew-boundary-client".to_string(),
         exp: now + 3600,
-        iat: now + 1,          // Exactly at 1 second boundary
+        iat: now + 1, // Exactly at 1 second boundary
         scope: "test:scope".to_string(),
         service_type: Some("global-controller".to_string()),
     };
 
-    let token_at_boundary = crypto::sign_jwt(&claims_at_boundary, &private_key, &signing_key.key_id)?;
+    let token_at_boundary =
+        crypto::sign_jwt(&claims_at_boundary, &private_key, &signing_key.key_id)?;
 
     // Act & Assert: Token at boundary should be accepted
     let min_clock_skew: i64 = 1;
@@ -199,7 +208,7 @@ async fn test_minimum_clock_skew_edge_case(pool: PgPool) -> Result<(), anyhow::E
     let claims_beyond = crypto::Claims {
         sub: "min-skew-beyond-client".to_string(),
         exp: now + 3600,
-        iat: now + 2,          // 1 second beyond the boundary
+        iat: now + 2, // 1 second beyond the boundary
         scope: "test:scope".to_string(),
         service_type: Some("global-controller".to_string()),
     };
@@ -232,13 +241,14 @@ async fn test_maximum_clock_skew_edge_case(pool: PgPool) -> Result<(), anyhow::E
     // Create token with iat at the 600 second boundary
     let claims_at_boundary = crypto::Claims {
         sub: "max-skew-boundary-client".to_string(),
-        exp: now + 7200,       // Expires in 2 hours
-        iat: now + 600,        // Exactly at 600 second (10 minute) boundary
+        exp: now + 7200, // Expires in 2 hours
+        iat: now + 600,  // Exactly at 600 second (10 minute) boundary
         scope: "test:scope".to_string(),
         service_type: Some("global-controller".to_string()),
     };
 
-    let token_at_boundary = crypto::sign_jwt(&claims_at_boundary, &private_key, &signing_key.key_id)?;
+    let token_at_boundary =
+        crypto::sign_jwt(&claims_at_boundary, &private_key, &signing_key.key_id)?;
 
     // Act & Assert: Token at max boundary should be accepted
     let max_clock_skew: i64 = 600;
@@ -252,7 +262,7 @@ async fn test_maximum_clock_skew_edge_case(pool: PgPool) -> Result<(), anyhow::E
     let claims_beyond = crypto::Claims {
         sub: "max-skew-beyond-client".to_string(),
         exp: now + 7200,
-        iat: now + 601,        // 1 second beyond max boundary
+        iat: now + 601, // 1 second beyond max boundary
         scope: "test:scope".to_string(),
         service_type: Some("global-controller".to_string()),
     };

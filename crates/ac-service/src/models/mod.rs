@@ -1,6 +1,8 @@
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use common::secret::{ExposeSecret, SecretString};
+use serde::{Deserialize, Serialize, Serializer};
 use sqlx::FromRow;
+use std::fmt;
 use std::str::FromStr;
 use uuid::Uuid;
 
@@ -80,13 +82,59 @@ pub struct TokenResponse {
     pub scope: String,
 }
 
-/// Service registration response
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Service registration response.
+///
+/// The `client_secret` field is wrapped in `SecretString` which:
+/// - Redacts the value in Debug output to prevent accidental logging
+/// - Requires explicit `.expose_secret()` to access the value
+/// - Uses custom serialization to expose the secret in API responses
+///   (this is the ONLY time the client_secret should be visible to the user)
+#[derive(Clone, Deserialize)]
 pub struct RegisterServiceResponse {
     pub client_id: String,
-    pub client_secret: String,
+    #[serde(deserialize_with = "deserialize_secret_string")]
+    pub client_secret: SecretString,
     pub service_type: String,
     pub scopes: Vec<String>,
+}
+
+/// Custom Debug that redacts client_secret
+impl fmt::Debug for RegisterServiceResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RegisterServiceResponse")
+            .field("client_id", &self.client_id)
+            .field("client_secret", &"[REDACTED]")
+            .field("service_type", &self.service_type)
+            .field("scopes", &self.scopes)
+            .finish()
+    }
+}
+
+/// Custom Serialize that exposes client_secret for API response.
+/// This is intentional: the registration response is the ONLY time
+/// the plaintext client_secret is shown to the user.
+impl Serialize for RegisterServiceResponse {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut state = serializer.serialize_struct("RegisterServiceResponse", 4)?;
+        state.serialize_field("client_id", &self.client_id)?;
+        state.serialize_field("client_secret", self.client_secret.expose_secret())?;
+        state.serialize_field("service_type", &self.service_type)?;
+        state.serialize_field("scopes", &self.scopes)?;
+        state.end()
+    }
+}
+
+/// Helper to deserialize SecretString from JSON string
+fn deserialize_secret_string<'de, D>(deserializer: D) -> Result<SecretString, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s = String::deserialize(deserializer)?;
+    Ok(SecretString::from(s))
 }
 
 /// JWKS response (RFC 7517)

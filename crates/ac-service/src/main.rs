@@ -9,6 +9,7 @@ mod repositories;
 mod routes;
 mod services;
 
+use common::secret::ExposeSecret;
 use config::Config;
 use handlers::auth_handler::AppState;
 use services::key_management_service;
@@ -78,12 +79,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Initializing signing keys...");
     let cluster_name = std::env::var("CLUSTER_NAME").unwrap_or_else(|_| "us".to_string());
 
-    key_management_service::initialize_signing_key(&db_pool, &config.master_key, &cluster_name)
-        .await
-        .map_err(|e| {
-            error!("Failed to initialize signing key: {}", e);
-            e
-        })?;
+    key_management_service::initialize_signing_key(
+        &db_pool,
+        config.master_key.expose_secret(),
+        &cluster_name,
+    )
+    .await
+    .map_err(|e| {
+        error!("Failed to initialize signing key: {}", e);
+        e
+    })?;
 
     info!("Signing keys initialized");
 

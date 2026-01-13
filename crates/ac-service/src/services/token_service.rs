@@ -6,6 +6,7 @@ use crate::models::{AuthEventType, TokenResponse};
 use crate::observability::hash_for_correlation;
 use crate::repositories::{auth_events, service_credentials, signing_keys};
 use chrono::Utc;
+use common::secret::SecretBox;
 use sqlx::PgPool;
 
 // Token configuration
@@ -124,7 +125,7 @@ pub async fn issue_service_token(
 
     // Decrypt private key
     let encrypted_key = EncryptedKey {
-        encrypted_data: signing_key.private_key_encrypted,
+        encrypted_data: SecretBox::new(Box::new(signing_key.private_key_encrypted)),
         nonce: signing_key.encryption_nonce,
         tag: signing_key.encryption_tag,
     };
@@ -1070,7 +1071,9 @@ mod tests {
 
         // Decrypt the private key
         let encrypted_key = crypto::EncryptedKey {
-            encrypted_data: signing_key_model.private_key_encrypted.clone(),
+            encrypted_data: common::secret::SecretBox::new(Box::new(
+                signing_key_model.private_key_encrypted.clone(),
+            )),
             nonce: signing_key_model.encryption_nonce.clone(),
             tag: signing_key_model.encryption_tag.clone(),
         };
@@ -1135,7 +1138,9 @@ mod tests {
 
         // Decrypt the private key
         let encrypted_key = crypto::EncryptedKey {
-            encrypted_data: signing_key_model.private_key_encrypted.clone(),
+            encrypted_data: common::secret::SecretBox::new(Box::new(
+                signing_key_model.private_key_encrypted.clone(),
+            )),
             nonce: signing_key_model.encryption_nonce.clone(),
             tag: signing_key_model.encryption_tag.clone(),
         };
@@ -1192,7 +1197,9 @@ mod tests {
 
         // Decrypt the private key
         let encrypted_key = crypto::EncryptedKey {
-            encrypted_data: signing_key_model.private_key_encrypted.clone(),
+            encrypted_data: common::secret::SecretBox::new(Box::new(
+                signing_key_model.private_key_encrypted.clone(),
+            )),
             nonce: signing_key_model.encryption_nonce.clone(),
             tag: signing_key_model.encryption_tag.clone(),
         };
@@ -1247,7 +1254,9 @@ mod tests {
 
         // Decrypt the private key
         let encrypted_key = crypto::EncryptedKey {
-            encrypted_data: signing_key_model.private_key_encrypted.clone(),
+            encrypted_data: common::secret::SecretBox::new(Box::new(
+                signing_key_model.private_key_encrypted.clone(),
+            )),
             nonce: signing_key_model.encryption_nonce.clone(),
             tag: signing_key_model.encryption_tag.clone(),
         };
@@ -1301,7 +1310,9 @@ mod tests {
 
         // Decrypt the private key
         let encrypted_key = crypto::EncryptedKey {
-            encrypted_data: signing_key_model.private_key_encrypted.clone(),
+            encrypted_data: common::secret::SecretBox::new(Box::new(
+                signing_key_model.private_key_encrypted.clone(),
+            )),
             nonce: signing_key_model.encryption_nonce.clone(),
             tag: signing_key_model.encryption_tag.clone(),
         };
@@ -1369,7 +1380,9 @@ mod tests {
 
         // Decrypt the private key
         let encrypted_key = crypto::EncryptedKey {
-            encrypted_data: signing_key_model.private_key_encrypted.clone(),
+            encrypted_data: common::secret::SecretBox::new(Box::new(
+                signing_key_model.private_key_encrypted.clone(),
+            )),
             nonce: signing_key_model.encryption_nonce.clone(),
             tag: signing_key_model.encryption_tag.clone(),
         };
@@ -1742,7 +1755,9 @@ mod tests {
 
         // Decrypt the private key
         let encrypted_key = crypto::EncryptedKey {
-            encrypted_data: signing_key_model.private_key_encrypted.clone(),
+            encrypted_data: common::secret::SecretBox::new(Box::new(
+                signing_key_model.private_key_encrypted.clone(),
+            )),
             nonce: signing_key_model.encryption_nonce.clone(),
             tag: signing_key_model.encryption_tag.clone(),
         };
@@ -1814,7 +1829,9 @@ mod tests {
 
         // Decrypt the private key
         let encrypted_key = crypto::EncryptedKey {
-            encrypted_data: signing_key_model.private_key_encrypted.clone(),
+            encrypted_data: common::secret::SecretBox::new(Box::new(
+                signing_key_model.private_key_encrypted.clone(),
+            )),
             nonce: signing_key_model.encryption_nonce.clone(),
             tag: signing_key_model.encryption_tag.clone(),
         };
@@ -1965,7 +1982,9 @@ mod tests {
 
         // Decrypt the private key
         let encrypted_key = crypto::EncryptedKey {
-            encrypted_data: signing_key_model.private_key_encrypted.clone(),
+            encrypted_data: common::secret::SecretBox::new(Box::new(
+                signing_key_model.private_key_encrypted.clone(),
+            )),
             nonce: signing_key_model.encryption_nonce.clone(),
             tag: signing_key_model.encryption_tag.clone(),
         };

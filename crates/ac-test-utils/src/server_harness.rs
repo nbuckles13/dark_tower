@@ -10,6 +10,7 @@ use ac_service::repositories::{service_credentials, signing_keys};
 use ac_service::routes;
 use ac_service::services::{key_management_service, token_service};
 use chrono::Utc;
+use common::secret::{ExposeSecret, SecretBox};
 use sqlx::PgPool;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -68,8 +69,8 @@ impl TestAuthServer {
         let config = Config {
             database_url: String::new(), // Not used after connection established
             bind_address: "127.0.0.1:0".to_string(),
-            master_key: master_key.clone(),
-            hash_secret: master_key.clone(), // Use same as master_key for tests
+            master_key: SecretBox::new(Box::new(master_key.clone())),
+            hash_secret: SecretBox::new(Box::new(master_key.clone())), // Use same as master_key for tests
             otlp_endpoint: None,
             jwt_clock_skew_seconds: ac_service::config::DEFAULT_JWT_CLOCK_SKEW_SECONDS,
             bcrypt_cost: DEFAULT_BCRYPT_COST,
@@ -184,8 +185,8 @@ impl TestAuthServer {
         // Issue token
         let token_response = token_service::issue_service_token(
             &self.pool,
-            &self.config.master_key,
-            &self.config.hash_secret,
+            self.config.master_key.expose_secret(),
+            self.config.hash_secret.expose_secret(),
             client_id,
             client_secret,
             "client_credentials", // grant_type
@@ -223,12 +224,12 @@ impl TestAuthServer {
 
         // Decrypt private key
         let encrypted_key = crypto::EncryptedKey {
-            encrypted_data: signing_key.private_key_encrypted.clone(),
+            encrypted_data: SecretBox::new(Box::new(signing_key.private_key_encrypted.clone())),
             nonce: signing_key.encryption_nonce.clone(),
             tag: signing_key.encryption_tag.clone(),
         };
         let private_key_bytes =
-            crypto::decrypt_private_key(&encrypted_key, &self.config.master_key)?;
+            crypto::decrypt_private_key(&encrypted_key, self.config.master_key.expose_secret())?;
 
         // Create user claims (service_type: None)
         let now = Utc::now().timestamp();
@@ -272,12 +273,12 @@ impl TestAuthServer {
 
         // Decrypt private key
         let encrypted_key = crypto::EncryptedKey {
-            encrypted_data: signing_key.private_key_encrypted.clone(),
+            encrypted_data: SecretBox::new(Box::new(signing_key.private_key_encrypted.clone())),
             nonce: signing_key.encryption_nonce.clone(),
             tag: signing_key.encryption_tag.clone(),
         };
         let private_key_bytes =
-            crypto::decrypt_private_key(&encrypted_key, &self.config.master_key)?;
+            crypto::decrypt_private_key(&encrypted_key, self.config.master_key.expose_secret())?;
 
         // Create expired claims
         let now = Utc::now().timestamp();

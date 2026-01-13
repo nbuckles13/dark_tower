@@ -4,6 +4,7 @@ use crate::crypto;
 use crate::errors::AcError;
 use crate::models::{AuthEventType, RegisterServiceResponse, ServiceType};
 use crate::repositories::{auth_events, service_credentials};
+use common::secret::ExposeSecret;
 use sqlx::PgPool;
 use std::str::FromStr;
 use uuid::Uuid;
@@ -37,7 +38,8 @@ pub async fn register_service(
     let client_secret = crypto::generate_client_secret()?;
 
     // Hash client_secret with bcrypt using configured cost factor
-    let client_secret_hash = crypto::hash_client_secret(&client_secret, bcrypt_cost)?;
+    let client_secret_hash =
+        crypto::hash_client_secret(client_secret.expose_secret(), bcrypt_cost)?;
 
     // Get default scopes for this service type
     let scopes = svc_type.default_scopes();
@@ -808,7 +810,7 @@ mod tests {
                 "client_id should not be empty"
             );
             assert!(
-                !response.client_secret.is_empty(),
+                !response.client_secret.expose_secret().is_empty(),
                 "client_secret should not be empty"
             );
             assert_eq!(response.service_type, service_type);
@@ -978,14 +980,14 @@ mod tests {
         // Verify both credentials can still authenticate with their original secrets
         assert!(
             crypto::verify_client_secret(
-                &response_min.client_secret,
+                response_min.client_secret.expose_secret(),
                 &credential_min.client_secret_hash
             )?,
             "Should verify with cost 10 hash"
         );
         assert!(
             crypto::verify_client_secret(
-                &response_max.client_secret,
+                response_max.client_secret.expose_secret(),
                 &credential_max.client_secret_hash
             )?,
             "Should verify with cost 14 hash"

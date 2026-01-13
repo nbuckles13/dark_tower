@@ -75,7 +75,7 @@ pub async fn handle_user_token(
 
     let result = token_service::issue_user_token(
         &state.pool,
-        &state.config.master_key,
+        state.config.master_key.expose_secret(),
         &payload.username,
         payload.password.expose_secret(),
     )
@@ -167,8 +167,8 @@ pub async fn handle_service_token(
     // Issue token
     let result = token_service::issue_service_token(
         &state.pool,
-        &state.config.master_key,
-        &state.config.hash_secret,
+        state.config.master_key.expose_secret(),
+        state.config.hash_secret.expose_secret(),
         &client_id,
         &client_secret,
         &payload.grant_type,
@@ -614,9 +614,13 @@ mod tests {
         });
 
         // Initialize signing key first
-        key_management_service::initialize_signing_key(&pool, &config.master_key, "test-cluster")
-            .await
-            .expect("Should initialize signing key");
+        key_management_service::initialize_signing_key(
+            &pool,
+            config.master_key.expose_secret(),
+            "test-cluster",
+        )
+        .await
+        .expect("Should initialize signing key");
 
         // Register a service first
         let registration = registration_service::register_service(
@@ -634,7 +638,9 @@ mod tests {
         let payload = ServiceTokenRequest {
             grant_type: "client_credentials".to_string(),
             client_id: Some(registration.client_id.clone()),
-            client_secret: Some(SecretString::from(registration.client_secret.clone())),
+            client_secret: Some(SecretString::from(
+                registration.client_secret.expose_secret().to_string(),
+            )),
             scope: None,
         };
 
@@ -667,9 +673,13 @@ mod tests {
         });
 
         // Initialize signing key first
-        key_management_service::initialize_signing_key(&pool, &config.master_key, "test-cluster")
-            .await
-            .expect("Should initialize signing key");
+        key_management_service::initialize_signing_key(
+            &pool,
+            config.master_key.expose_secret(),
+            "test-cluster",
+        )
+        .await
+        .expect("Should initialize signing key");
 
         // Register a service
         let registration = registration_service::register_service(
@@ -685,7 +695,9 @@ mod tests {
         let payload = ServiceTokenRequest {
             grant_type: "client_credentials".to_string(),
             client_id: Some(registration.client_id.clone()),
-            client_secret: Some(SecretString::from(registration.client_secret.clone())),
+            client_secret: Some(SecretString::from(
+                registration.client_secret.expose_secret().to_string(),
+            )),
             scope: Some("meeting:read meeting:update".to_string()), // Request allowed scopes
         };
 
@@ -721,9 +733,13 @@ mod tests {
         });
 
         // Initialize signing key first
-        key_management_service::initialize_signing_key(&pool, &config.master_key, "test-cluster")
-            .await
-            .expect("Should initialize signing key");
+        key_management_service::initialize_signing_key(
+            &pool,
+            config.master_key.expose_secret(),
+            "test-cluster",
+        )
+        .await
+        .expect("Should initialize signing key");
 
         // Register a service
         let registration = registration_service::register_service(
@@ -741,7 +757,9 @@ mod tests {
         let payload = ServiceTokenRequest {
             grant_type: "client_credentials".to_string(),
             client_id: Some(registration.client_id.clone()),
-            client_secret: Some(SecretString::from(registration.client_secret.clone())),
+            client_secret: Some(SecretString::from(
+                registration.client_secret.expose_secret().to_string(),
+            )),
             scope: None,
         };
 
@@ -773,9 +791,13 @@ mod tests {
         });
 
         // Initialize signing key first
-        key_management_service::initialize_signing_key(&pool, &config.master_key, "test-cluster")
-            .await
-            .expect("Should initialize signing key");
+        key_management_service::initialize_signing_key(
+            &pool,
+            config.master_key.expose_secret(),
+            "test-cluster",
+        )
+        .await
+        .expect("Should initialize signing key");
 
         // Register a service
         let registration = registration_service::register_service(
@@ -792,7 +814,9 @@ mod tests {
         let payload = ServiceTokenRequest {
             grant_type: "client_credentials".to_string(),
             client_id: Some(registration.client_id.clone()),
-            client_secret: Some(SecretString::from(registration.client_secret.clone())),
+            client_secret: Some(SecretString::from(
+                registration.client_secret.expose_secret().to_string(),
+            )),
             scope: None,
         };
 
