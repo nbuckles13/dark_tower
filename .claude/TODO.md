@@ -1,5 +1,44 @@
 # Technical Debt and Future Work
 
+## Recently Completed (January 2026)
+
+### SecretBox/SecretString Refactor ✅
+- [x] Wrapped Config master_key/hash_secret with SecretBox<Vec<u8>>
+- [x] Wrapped EncryptedKey.encrypted_data with SecretBox<Vec<u8>>
+- [x] Changed generate_client_secret() return to SecretString
+- [x] Response types client_secret → SecretString
+- [x] Custom Debug impls redact all sensitive data as [REDACTED]
+- [x] Custom Clone/Serialize for SecretBox-containing structs
+- [x] Fixed clock_skew_tests.rs integration (was missing from harness)
+- **Commit**: bf65dce
+
+### Guard Pipeline Phase 1 ✅
+- [x] Principles framework (ADR-0015)
+- [x] Simple guards: no-hardcoded-secrets, no-secrets-in-logs, no-pii-in-logs, no-test-removal, api-version-check, test-coverage
+- [x] Semantic guard: credential-leak detection using Claude API
+- [x] Guard runner script with unified execution
+- [x] 7-layer verification: check → fmt → guards → tests → clippy → semantic
+- **Commits**: 80113e3, 9b1b599, d490c80
+
+### Development Loop Workflow ✅ (ADR-0016)
+- [x] Specialist-owned verification (runs checks, fixes failures)
+- [x] Context injection: principles + specialist knowledge + ADR
+- [x] Trust-but-verify orchestrator validation
+- [x] Code review integration with resume for fixes
+- [x] Reflection step for knowledge capture
+- [x] State checkpointing for context compression recovery
+- [x] Output file as proof-of-work (docs/dev-loop-outputs/)
+- **Commits**: b949052, 14dbf44
+
+### Specialist Knowledge Architecture ✅ (ADR-0017)
+- [x] Dynamic knowledge files in .claude/agents/{specialist}/
+- [x] patterns.md, gotchas.md, integration.md per specialist
+- [x] Reflection captures learnings after each implementation
+- [x] Knowledge injected into specialist prompts
+- **Specialists with knowledge**: auth-controller, security, test, code-reviewer
+
+---
+
 ## Phase 4: P1 Security Test Improvements
 
 ### Completed Items (2025-12-01)
@@ -194,38 +233,40 @@
 
 ## Guard Infrastructure
 
-### JWT Principle Test Coverage Analysis
+### Phase 1: Complete ✅
 
-Review existing P0/P1 security tests against `docs/principles/jwt.md` to identify gaps:
+See "Recently Completed (January 2026)" above.
 
-**Current test coverage** (token_service.rs):
-- [x] Algorithm confusion attack (line 882)
-- [x] `alg: "none"` attack (line 956)
-- [x] Oversized token rejection (line 1864)
-- [x] Signature tampering (line 702)
-- [x] Wrong key rejection (line 777)
-- [x] Expiration validation (line 1025)
-- [x] Future `iat` validation (line 1086)
-- [x] `kid` injection attacks (line 1541)
-- [x] Missing required claims (line 1722)
+### Phase 2: Future Enhancements
 
-**Potential gaps to analyze**:
-- [ ] Clock skew boundary conditions (exactly ±5 minutes)
-- [ ] Multiple custom claims rejection (>10 claims)
-- [ ] `typ` header is informational only (not security-critical)
-- [ ] Constant-time comparison verification (timing tests)
+#### Additional Simple Guards
+- [ ] **Complexity guard**: Flag functions over N lines or cyclomatic complexity
+- [ ] **Import guard**: Enforce no direct `panic!` usage in production code
+- [ ] **Doc guard**: Ensure public APIs have documentation
 
-### Guard Orchestration (Future Discussion)
+#### Semantic Guards
+- [ ] **Logic leak detection**: Detect business logic that shouldn't be in certain layers
+- [ ] **Dependency injection check**: Verify proper DI patterns in handlers
 
-Design how guards are executed and how results are surfaced:
+#### Guard Orchestration
+- [ ] **PR visibility**: Include guard warnings in PR descriptions
+- [ ] **CI integration**: Enforce guard output appears in PRs
+- [ ] **Guard result aggregation**: Single summary for review
+- [ ] **Blocking vs warning**: Configure which guards block merge
 
-- [ ] **PR visibility**: Include guard warnings in PR descriptions so they're unmissable
-- [ ] **CI integration**: How to enforce guard output appears in PRs
-- [ ] **When guards run**: Pre-commit vs CI vs both, with clear rationale
-- [ ] **Guard result aggregation**: Single summary of all guard findings for review
-- [ ] **Blocking vs warning**: Which guards block merge, which just warn
+### JWT Principle Test Coverage (Phase 1 Complete)
 
-Related: ADR-0015 documents guard taxonomy but not orchestration.
+All major attack vectors now covered:
+- [x] Algorithm confusion attack
+- [x] `alg: "none"` attack
+- [x] Oversized token rejection
+- [x] Signature tampering
+- [x] Wrong key rejection
+- [x] Expiration validation
+- [x] Future `iat` validation
+- [x] `kid` injection attacks
+- [x] Missing required claims
+- [x] Clock skew boundary conditions (added in configurable clock skew work)
 
 ## Low Priority
 

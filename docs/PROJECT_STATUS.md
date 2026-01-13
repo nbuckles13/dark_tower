@@ -1,6 +1,6 @@
 # Dark Tower - Project Status
 
-**Last Updated**: 2025-12-15
+**Last Updated**: 2026-01-12
 **Current Phase**: Phase 4 - Security Hardening & Testing Infrastructure
 
 ## Executive Summary
@@ -231,6 +231,26 @@ All foundational work completed:
   - TestAuthServer for E2E HTTP testing
   - rotation_time module for time manipulation
   - Database isolation via sqlx::test
+- [x] **SecretBox/SecretString refactor** (Jan 2026)
+  - Wrapped sensitive data with secrecy crate wrappers
+  - Config master_key/hash_secret → SecretBox<Vec<u8>>
+  - Response client_secret fields → SecretString
+  - Custom Debug impls redact all sensitive data as [REDACTED]
+- [x] **Guard Pipeline Phase 1** (Jan 2026)
+  - Principles framework (ADR-0015)
+  - Simple guards: no-hardcoded-secrets, no-secrets-in-logs, no-pii-in-logs
+  - Semantic guard: credential-leak detection using Claude
+  - Guard runner script with 7-layer verification
+- [x] **Development Loop Workflow** (ADR-0016, Jan 2026)
+  - Specialist-owned verification (runs checks, fixes failures)
+  - Context injection with principles and specialist knowledge
+  - Trust-but-verify orchestrator validation
+  - Code review integration with resume for fixes
+  - State checkpointing for context compression recovery
+- [x] **Specialist Knowledge Architecture** (ADR-0017, Jan 2026)
+  - Dynamic knowledge files: patterns.md, gotchas.md, integration.md
+  - Reflection step captures learnings after each implementation
+  - Knowledge injected into specialist prompts
 
 **Status**: See [.claude/TODO.md](../.claude/TODO.md) for current work items
 
@@ -316,17 +336,34 @@ dark_tower/
 ### Process Documentation
 | Document | Description | Status |
 |----------|-------------|--------|
-| [.claude/DEVELOPMENT_WORKFLOW.md](../.claude/DEVELOPMENT_WORKFLOW.md) | Specialist-led development | ✅ Current |
+| [.claude/DEVELOPMENT_WORKFLOW.md](../.claude/DEVELOPMENT_WORKFLOW.md) | Specialist-led development rules | ✅ Current |
+| [.claude/workflows/development-loop.md](../.claude/workflows/development-loop.md) | **Implementation workflow mechanics** | ✅ New |
 | [.claude/workflows/multi-agent-debate.md](../.claude/workflows/multi-agent-debate.md) | Debate mechanics | ✅ Current |
 | [.claude/workflows/code-review.md](../.claude/workflows/code-review.md) | Code review process | ✅ Current |
 | [.claude/workflows/process-review-record.md](../.claude/workflows/process-review-record.md) | Process review workflow | ✅ Current |
 | [docs/process-reviews/](process-reviews/) | Process review records (PRRs) | ✅ Current |
+| [docs/dev-loop-outputs/](dev-loop-outputs/) | **Development loop output records** | ✅ New |
+
+### Specialist Knowledge
+| Location | Description | Status |
+|----------|-------------|--------|
+| [.claude/agents/{specialist}/](../.claude/agents/) | Dynamic knowledge files | ✅ New |
+| patterns.md | Established approaches for common tasks | ✅ Active |
+| gotchas.md | Mistakes to avoid, learned from experience | ✅ Active |
+| integration.md | Notes on working with other services | ✅ Active |
 
 ### Decision History
 | Location | Description | Count |
 |----------|-------------|-------|
 | [docs/debates/](debates/) | Multi-agent design debates | 5 |
-| [docs/decisions/](decisions/) | Architecture Decision Records | 13 |
+| [docs/decisions/](decisions/) | Architecture Decision Records | 17 |
+
+### Recent ADRs (Jan 2026)
+| ADR | Title |
+|-----|-------|
+| ADR-0015 | Principles & Guards Methodology |
+| ADR-0016 | Development Loop Workflow |
+| ADR-0017 | Specialist Knowledge Architecture |
 
 ## Future Phases
 
@@ -419,8 +456,31 @@ dark_tower/
 7. **No Panics**: Production code uses Result<T, E> for all fallible operations
 8. **Open Source**: MIT/Apache-2.0 licensed, community-driven
 
-## Recent Achievements (Last 2 Weeks)
+## Recent Achievements (January 2026)
 
+- ✅ **SecretBox/SecretString Refactor**
+  - Wrapped all sensitive cryptographic data with secrecy crate
+  - Config master_key, hash_secret → SecretBox<Vec<u8>>
+  - API response client_secret → SecretString
+  - Custom Debug impls redact secrets as [REDACTED]
+  - Custom Clone/Serialize for SecretBox-containing structs
+- ✅ **Guard Pipeline Phase 1** (ADR-0015)
+  - Principles framework: crypto, jwt, logging, queries, errors, input, testing
+  - Simple guards: no-hardcoded-secrets, no-secrets-in-logs, no-pii-in-logs, no-test-removal
+  - Semantic guard: credential-leak detection using Claude API
+  - 7-layer verification: check → fmt → guards → tests → clippy → semantic
+- ✅ **Development Loop Workflow** (ADR-0016)
+  - Specialist-owned verification (runs checks, fixes failures)
+  - Context injection: principles + specialist knowledge + ADR
+  - Trust-but-verify orchestrator validation
+  - Code review integration with resume for fixes
+  - Reflection step for knowledge capture
+  - State checkpointing for context compression recovery
+- ✅ **Specialist Knowledge Architecture** (ADR-0017)
+  - Dynamic knowledge files in .claude/agents/{specialist}/
+  - patterns.md, gotchas.md, integration.md per specialist
+  - Reflection captures learnings after each implementation
+  - Knowledge injected into specialist prompts
 - ✅ Local Development Environment (ADR-0013)
   - kind cluster setup with Calico CNI (NetworkPolicy enforcement)
   - Full observability: Prometheus, Grafana (pre-configured), Loki
