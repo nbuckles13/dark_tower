@@ -7,6 +7,22 @@
 
 ---
 
+## Loop State (Internal)
+
+<!-- This section is maintained by the orchestrator for state recovery after context compression. -->
+<!-- Do not edit manually - the orchestrator updates this as the loop progresses. -->
+
+| Field | Value |
+|-------|-------|
+| Implementing Agent | `{agent_id}` |
+| Current Step | `{implementation|validation|code_review|reflection|complete}` |
+| Iteration | `{1-5}` |
+| Security Reviewer | `{agent_id or pending}` |
+| Test Reviewer | `{agent_id or pending}` |
+| Code Reviewer | `{agent_id or pending}` |
+
+---
+
 ## Task Overview
 
 ### Objective

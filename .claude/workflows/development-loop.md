@@ -168,6 +168,25 @@ task_patterns:
 ```markdown
 {Specialist definition from .claude/agents/{specialist}.md}
 
+## IMPLEMENTATION MODE
+
+You are being invoked to IMPLEMENT. The design phase is complete - either the task
+is straightforward or a debate has already produced an ADR.
+
+**Expected behavior**:
+- Explore the codebase as needed to understand existing patterns
+- Implement the changes directly
+- Run verification and fix issues
+- Write the output file
+
+**If requirements are unclear or contradictory**:
+- Do NOT guess or make assumptions about ambiguous requirements
+- Return to the orchestrator with specific questions about what's unclear
+- The orchestrator will either clarify or escalate to a debate/planning phase
+
+The goal is to avoid planning work that's already been designed, while still
+allowing you to raise genuine blockers.
+
 ## Project Principles (MUST FOLLOW)
 
 {Inject matched category files here}
@@ -684,6 +703,77 @@ After validation, orchestrator appends:
 - Code review results (from all reviewers)
 - Final validation timestamp
 - Any orchestrator-level observations
+
+---
+
+# Part 9: State Checkpointing
+
+## Purpose
+
+When orchestrator context compresses mid-loop, critical state can be lost:
+- Implementing specialist agent ID (needed to resume for fixes/reflection)
+- Code review specialist agent IDs (needed for reflection)
+- Current iteration count
+- What steps have been completed
+
+The dev-loop output file serves as a checkpoint to recover this state.
+
+## Loop State Section
+
+The orchestrator maintains a `## Loop State (Internal)` section in the output file:
+
+```markdown
+## Loop State (Internal)
+
+| Field | Value |
+|-------|-------|
+| Implementing Agent | `abc123` |
+| Current Step | code_review |
+| Iteration | 2 |
+| Security Reviewer | `def456` |
+| Test Reviewer | `ghi789` |
+| Code Reviewer | `jkl012` |
+```
+
+**Field definitions**:
+- `Implementing Agent`: Agent ID of the specialist doing the implementation
+- `Current Step`: One of `implementation`, `validation`, `code_review`, `reflection`, `complete`
+- `Iteration`: Current iteration number (1-5)
+- `{Specialist} Reviewer`: Agent IDs for each code reviewer (added during code review step)
+
+## When to Update
+
+| Event | Action |
+|-------|--------|
+| Invoke implementing specialist | Write Loop State with agent ID, step=`implementation`, iteration=1 |
+| Specialist returns | Update step to `validation` |
+| Validation passes | Update step to `code_review` |
+| Invoke each reviewer | Add reviewer agent ID to Loop State |
+| Code review clean | Update step to `reflection` |
+| Code review has findings | Increment iteration, update step to `implementation` |
+| All reflection complete | Update step to `complete` |
+
+## Recovering from Compression
+
+When the orchestrator's context is compressed (you'll notice you don't remember earlier parts of the conversation):
+
+1. **Read the output file** to find the Loop State section
+2. **Resume from current step** using the stored agent IDs
+3. **Don't re-run completed steps** - trust the output file's record
+
+Example recovery:
+```
+Orchestrator notices context was compressed.
+Reads output file → Loop State shows step=code_review, iteration=2
+Reads agent IDs for reviewers
+Continues with code review step using stored IDs
+```
+
+## Ownership Rules
+
+- **Only the orchestrator** edits the Loop State section
+- Specialists write other sections (Task Overview, Verification Results, etc.)
+- This prevents conflicts when both are editing the same file
 
 ---
 
