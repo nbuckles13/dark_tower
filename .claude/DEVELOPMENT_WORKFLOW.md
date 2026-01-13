@@ -2,6 +2,9 @@
 
 **CRITICAL**: Read this file at the start of every session. These are mandatory development practices for Dark Tower.
 
+> **Note**: This file defines **orchestrator rules** (what you can/cannot do, when to use specialists).
+> For **implementation mechanics** (verification layers, code review, reflection), see `.claude/workflows/development-loop.md`.
+
 ## Core Principle: Specialist-Led Development
 
 **You (Claude Code orchestrator) do NOT implement features directly.** Your role is to:
@@ -87,6 +90,14 @@ Use a **single message with multiple Task tool calls** for parallel execution.
 
 ### For New Features
 
+**Recommended**: Use the **Development Loop** workflow for implementation tasks.
+See `.claude/workflows/development-loop.md` for the full process with:
+- Specialist-owned verification (7-layer: check → fmt → guards → tests → clippy → semantic)
+- Code review by Security, Test, and Code Quality specialists
+- Reflection step to capture learnings
+- State checkpointing for context recovery
+
+**High-level steps**:
 ```
 1. Analyze feature → Identify affected specialists
 2. Match task to principle categories (see contextual-injection.md)
@@ -95,13 +106,8 @@ Use a **single message with multiple Task tool calls** for parallel execution.
 5. Initiate N-agent debate (inject matched principles into context)
 6. Reach consensus (90%+ satisfaction)
 7. Create ADR file (Architecture Decision Record)
-8. Invoke specialists to implement (with principles injected)
-9. Run category-matched guards on produced code
-10. Apply hybrid iteration (auto-fix simple, escalate complex)
-11. Test specialist creates E2E tests
-12. Security specialist validates implementation meets security requirements
-13. Run ALL guards before commit
-14. Commit and document
+8. Invoke specialists to implement → **Follow Development Loop**
+9. Commit and document (output file in docs/dev-loop-outputs/)
 ```
 
 ### For Bug Fixes
@@ -253,6 +259,14 @@ Task(
 4. Track satisfaction scores
 5. Synthesize consensus
 6. Create ADR
+
+---
+
+## Related ADRs
+
+- **ADR-0015** - Principles & guards methodology
+- **ADR-0016** - Development loop design (specialist-owned verification)
+- **ADR-0017** - Specialist knowledge architecture (dynamic knowledge files)
 
 ---
 

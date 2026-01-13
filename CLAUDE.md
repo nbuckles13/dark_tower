@@ -273,8 +273,10 @@ dark_tower/
 
 ### Development Process
 - **.claude/DEVELOPMENT_WORKFLOW.md** - Orchestrator rules, specialist usage
+- **.claude/workflows/development-loop.md** - Implementation workflow with verification
 - **.claude/workflows/multi-agent-debate.md** - Debate mechanics
 - **.claude/workflows/code-review.md** - Code review process
+- **docs/dev-loop-outputs/** - Implementation output tracking
 - **FUZZING.md** - Fuzzing strategy and setup
 
 ### Current Status
@@ -282,6 +284,12 @@ dark_tower/
 - **.claude/TODO.md** - Technical debt and future work
 
 ## Common Development Tasks
+
+### Implementing a Feature or Refactor
+1. Follow the **Development Loop** workflow
+2. See `.claude/workflows/development-loop.md` for full process
+3. Key steps: specialist implements → verification → code review → reflection
+4. Track progress in `docs/dev-loop-outputs/YYYY-MM-DD-{task}.md`
 
 ### Adding a Database Table
 1. Create migration: `sqlx migrate add create_table_name`
@@ -335,21 +343,71 @@ dark_tower/
 - Update PROJECT_STATUS.md when phase changes
 - Follow the specialist decision matrix when unsure
 
+## Development Loop Workflow
+
+For implementation tasks, follow the **Development Loop** workflow:
+
+1. **Specialist implements** with principles + dynamic knowledge injected
+2. **7-layer verification** runs automatically (check → fmt → guards → tests → clippy → semantic)
+3. **Code review** by Security, Test, and Code Quality specialists
+4. **Reflection** captures learnings to specialist knowledge files
+5. **State checkpointing** enables recovery after context compression
+
+**Key Files**:
+- `.claude/workflows/development-loop.md` - Full workflow mechanics
+- `docs/dev-loop-outputs/` - Output files tracking each implementation
+- `docs/dev-loop-outputs/_template.md` - Template with Loop State for recovery
+
+**When to use**: Any implementation task (features, tests, refactors, security changes)
+
+**See**: ADR-0016 for design rationale
+
+---
+
+## Specialist Knowledge Files
+
+Each specialist accumulates learnings in dynamic knowledge files:
+
+```
+.claude/agents/{specialist}/
+├── patterns.md      # What works well (successful approaches)
+├── gotchas.md       # What to avoid (pitfalls encountered)
+└── integration.md   # How to work with other components
+```
+
+**Current specialists with knowledge**: auth-controller, security, test, code-reviewer
+
+**How it works**:
+- Knowledge files are injected into specialist prompts at invocation
+- After each implementation, reflection captures new learnings
+- Knowledge compounds over time, improving specialist effectiveness
+
+**See**: ADR-0017 for architecture details
+
+---
+
 ## Current Phase: Phase 4 - Security Hardening
 
 **Focus**: Achieve 95% test coverage, implement P1 security improvements
 
-**Recent Achievements**:
+**Recent Achievements (January 2026)**:
+- ✅ SecretBox/SecretString refactor (sensitive data protection)
+- ✅ Guard pipeline Phase 1 (credential leak detection)
+- ✅ Development loop workflow (specialist-owned verification)
+- ✅ Specialist knowledge architecture (dynamic knowledge files)
+
+**Previous Achievements**:
 - ✅ Authentication Controller fully implemented
 - ✅ P0/P1 security test framework
-- ✅ JWT validation security tests (10 tests)
+- ✅ JWT validation security tests (iat, header injection, size limits)
 - ✅ SQL injection prevention tests (7 tests)
+- ✅ Key rotation implementation (ADR-0008, ADR-0009)
 - ✅ Fuzzing infrastructure
 - ✅ CI/CD with GitHub Actions
 
 **In Progress**:
-- Additional JWT security tests (iat validation, header injection)
-- Second-order SQL injection tests
+- env-tests enhancements (NetworkPolicy, TLS, rate limit validation)
+- Code coverage improvement (83% → 95% target)
 - Performance benchmarks for auth under attack
 
 **See**: `docs/PROJECT_STATUS.md` for detailed roadmap
