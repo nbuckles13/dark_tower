@@ -73,3 +73,29 @@ Include load tests that verify authentication latency SLOs with configured cost.
 2. Warning log tests for low clock_skew config (needs tracing-test)
 3. TLS config warning tests (cfg(test) bypass prevents testing)
 4. Performance regression tests for bcrypt at different costs
+
+---
+
+## For Security Specialist: SecretBox/SecretString Refactors
+**Added**: 2026-01-12
+**Related files**: `crates/ac-service/src/crypto/mod.rs`, `crates/ac-service/src/config.rs`, `crates/ac-service/src/models/mod.rs`
+
+When reviewing SecretBox/SecretString refactors, verify tests cover:
+1. **Debug redaction**: Test that `format!("{:?}", struct_with_secret)` contains `[REDACTED]` and NOT the actual value
+2. **expose_secret() usage**: Tests must call `.expose_secret()` to access values - compiler enforces this
+3. **Custom Clone impls**: If struct has `SecretBox` field, verify Clone test exists (SecretBox requires explicit handling)
+4. **Custom Serialize impls**: If intentionally exposing secret in API response (e.g., one-time credential display), test and document this
+
+---
+
+## For All Specialists: Integration Test Module Inclusion
+**Added**: 2026-01-12
+**Related files**: `crates/*/tests/integration/mod.rs`
+
+When adding new integration test files:
+1. Create the test file (e.g., `clock_skew_tests.rs`)
+2. **MUST add `mod clock_skew_tests;` to `mod.rs`** - without this, the file is never compiled!
+3. Run `cargo test --package <crate> -- <test_name>` to verify tests execute
+4. Check test count in output matches expected number of tests
+
+Failure mode: Test file exists, looks correct, but 0 tests run. Silent failure.

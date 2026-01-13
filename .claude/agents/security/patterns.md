@@ -67,3 +67,27 @@ When reviewing security code, check: (1) Timing attack vectors, (2) Error messag
 All functions handling secrets MUST use `#[instrument(skip_all)]` to prevent tracing from capturing sensitive parameters in spans. Types holding crypto material need manual Debug impl with `[REDACTED]` fields, or use `secrecy::Secret<T>` wrapper. This is a MANDATORY check when reviewing any crypto-adjacent code.
 
 ---
+
+## Pattern: SecretBox/SecretString for Compile-Time Secret Safety
+**Added**: 2026-01-12
+**Related files**: `crates/ac-service/src/config.rs`, `crates/ac-service/src/crypto/mod.rs`, `crates/ac-service/src/models/mod.rs`
+
+Use `SecretBox<T>` (binary data) and `SecretString` (text) from `secrecy` crate for all secrets. Benefits: (1) Debug auto-redacts as `[REDACTED]`, (2) `.expose_secret()` makes access explicit and grep-able, (3) Zeroization on drop. Use `SecretBox<Vec<u8>>` for keys, `SecretString` for passwords/tokens. Types with derived Debug that contain secrets automatically get safe logging.
+
+---
+
+## Pattern: Intentional Secret Exposure via Custom Serialize
+**Added**: 2026-01-12
+**Related files**: `crates/ac-service/src/models/mod.rs`, `crates/ac-service/src/handlers/admin_handler.rs`
+
+For "one-time reveal" API responses (registration, secret rotation), implement custom `Serialize` that calls `.expose_secret()`. This is the ONLY place secrets should be exposed. Pattern: (1) Custom Debug that redacts, (2) Custom Serialize that exposes for API response, (3) Document as intentional in comments. Example: `RegisterServiceResponse`, `RotateSecretResponse`.
+
+---
+
+## Pattern: Custom Clone for SecretBox Types
+**Added**: 2026-01-12
+**Related files**: `crates/ac-service/src/config.rs`, `crates/ac-service/src/crypto/mod.rs`
+
+`SecretBox<T>` doesn't derive Clone. For types containing SecretBox, implement Clone manually: `SecretBox::new(Box::new(self.field.expose_secret().clone()))`. This maintains secret protection on cloned values. Essential for structs like `Config` that may be cloned across threads.
+
+---

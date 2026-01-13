@@ -11,3 +11,6 @@ mod health_tests;
 
 #[path = "integration/admin_auth_tests.rs"]
 mod admin_auth_tests;
+
+#[path = "integration/clock_skew_tests.rs"]
+mod clock_skew_tests;

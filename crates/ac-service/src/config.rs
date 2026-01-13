@@ -1,6 +1,8 @@
 use base64::{engine::general_purpose, Engine as _};
+use common::secret::{ExposeSecret, SecretBox};
 use std::collections::HashMap;
 use std::env;
+use std::fmt;
 use thiserror::Error;
 use tracing::warn;
 
@@ -29,12 +31,27 @@ pub const MIN_BCRYPT_COST: u32 = 10;
 /// Cost 14 = 2^14 = 16,384 iterations, approximate hash time: ~800ms.
 pub const MAX_BCRYPT_COST: u32 = 14;
 
-#[derive(Debug, Clone)]
+/// Application configuration with secure handling of sensitive fields.
+///
+/// Sensitive fields (`master_key`, `hash_secret`) are wrapped in `SecretBox`
+/// which provides:
+/// - Automatic redaction in Debug output (prevents accidental logging)
+/// - Explicit `.expose_secret()` required to access values
+/// - Zeroization on drop (when using zeroize feature)
+///
+/// The `database_url` is also redacted in Debug output as it may contain
+/// credentials in the connection string.
+///
+/// Clone is manually implemented since SecretBox requires explicit cloning.
 pub struct Config {
     pub database_url: String,
     pub bind_address: String,
-    pub master_key: Vec<u8>,
-    pub hash_secret: Vec<u8>,
+    /// AES-256 master key for encrypting private keys at rest.
+    /// Must be exactly 32 bytes. Use `.expose_secret()` to access.
+    pub master_key: SecretBox<Vec<u8>>,
+    /// HMAC-SHA256 secret for correlation ID hashing.
+    /// Must be at least 32 bytes. Use `.expose_secret()` to access.
+    pub hash_secret: SecretBox<Vec<u8>>,
     #[allow(dead_code)] // Will be used in Phase 4 for observability
     pub otlp_endpoint: Option<String>,
     /// JWT clock skew tolerance in seconds for `iat` validation.
@@ -47,6 +64,41 @@ pub struct Config {
     /// Minimum: 10 (security floor per OWASP 2024).
     /// Maximum: 14 (prevents excessive latency ~800ms).
     pub bcrypt_cost: u32,
+}
+
+/// Clone implementation that explicitly clones SecretBox fields.
+impl Clone for Config {
+    fn clone(&self) -> Self {
+        Self {
+            database_url: self.database_url.clone(),
+            bind_address: self.bind_address.clone(),
+            master_key: SecretBox::new(Box::new(self.master_key.expose_secret().clone())),
+            hash_secret: SecretBox::new(Box::new(self.hash_secret.expose_secret().clone())),
+            otlp_endpoint: self.otlp_endpoint.clone(),
+            jwt_clock_skew_seconds: self.jwt_clock_skew_seconds,
+            bcrypt_cost: self.bcrypt_cost,
+        }
+    }
+}
+
+/// Custom Debug implementation that redacts sensitive fields.
+///
+/// Redacted fields:
+/// - `master_key`: Cryptographic key material
+/// - `hash_secret`: HMAC secret key
+/// - `database_url`: May contain credentials in connection string
+impl fmt::Debug for Config {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Config")
+            .field("database_url", &"[REDACTED]")
+            .field("bind_address", &self.bind_address)
+            .field("master_key", &"[REDACTED]")
+            .field("hash_secret", &"[REDACTED]")
+            .field("otlp_endpoint", &self.otlp_endpoint)
+            .field("jwt_clock_skew_seconds", &self.jwt_clock_skew_seconds)
+            .field("bcrypt_cost", &self.bcrypt_cost)
+            .finish()
+    }
 }
 
 #[derive(Debug, Error)]
@@ -217,8 +269,8 @@ impl Config {
         Ok(Config {
             database_url,
             bind_address,
-            master_key,
-            hash_secret,
+            master_key: SecretBox::new(Box::new(master_key)),
+            hash_secret: SecretBox::new(Box::new(hash_secret)),
             otlp_endpoint,
             jwt_clock_skew_seconds,
             bcrypt_cost,
@@ -278,7 +330,7 @@ mod tests {
 
         assert_eq!(config.database_url, "postgresql://localhost/test");
         assert_eq!(config.bind_address, "127.0.0.1:9000");
-        assert_eq!(config.master_key.len(), 32);
+        assert_eq!(config.master_key.expose_secret().len(), 32);
         assert_eq!(
             config.otlp_endpoint,
             Some("http://localhost:4317".to_string())
@@ -410,8 +462,8 @@ mod tests {
         ]);
 
         let config = Config::from_vars(&vars).expect("Config should load successfully");
-        assert_eq!(config.hash_secret.len(), 32);
-        assert_eq!(config.hash_secret, vec![0u8; 32]);
+        assert_eq!(config.hash_secret.expose_secret().len(), 32);
+        assert_eq!(config.hash_secret.expose_secret(), &vec![0u8; 32]);
     }
 
     #[test]
@@ -428,8 +480,8 @@ mod tests {
         ]);
 
         let config = Config::from_vars(&vars).expect("Config should load successfully");
-        assert_eq!(config.hash_secret.len(), 32);
-        assert_eq!(config.hash_secret, vec![1u8; 32]);
+        assert_eq!(config.hash_secret.expose_secret().len(), 32);
+        assert_eq!(config.hash_secret.expose_secret(), &vec![1u8; 32]);
     }
 
     #[test]
@@ -465,8 +517,8 @@ mod tests {
         ]);
 
         let config = Config::from_vars(&vars).expect("Config should load successfully");
-        assert_eq!(config.hash_secret.len(), 64);
-        assert_eq!(config.hash_secret, vec![2u8; 64]);
+        assert_eq!(config.hash_secret.expose_secret().len(), 64);
+        assert_eq!(config.hash_secret.expose_secret(), &vec![2u8; 64]);
     }
 
     #[test]

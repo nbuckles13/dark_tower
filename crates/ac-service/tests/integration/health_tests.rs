@@ -5,6 +5,7 @@
 
 use ac_service::services::key_management_service;
 use ac_test_utils::TestAuthServer;
+use common::secret::ExposeSecret;
 use reqwest::StatusCode;
 use sqlx::PgPool;
 
@@ -146,7 +147,7 @@ async fn test_ready_returns_503_when_no_signing_key(pool: PgPool) -> Result<(), 
 async fn test_ready_recovers_after_key_creation(pool: PgPool) -> Result<(), anyhow::Error> {
     // Arrange - Spawn server
     let server = TestAuthServer::spawn(pool.clone()).await?;
-    let master_key = server.config().master_key.clone();
+    let master_key = server.config().master_key.expose_secret().clone();
 
     // Delete all signing keys
     sqlx::query("DELETE FROM signing_keys")

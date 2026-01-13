@@ -75,3 +75,27 @@ Test configs may default to insecure values (zero keys, low costs). Ensure produ
 All functions handling secrets (keys, tokens, passwords) MUST use `#[instrument(skip_all)]` to prevent accidental logging via tracing spans. **This is a mandatory review check for any code touching crypto.** Also: types holding crypto material need custom Debug impl with redaction, or use `secrecy` crate wrappers.
 
 ---
+
+## Gotcha: SecretBox Doesn't Derive Clone
+**Added**: 2026-01-12
+**Related files**: `crates/ac-service/src/config.rs`, `crates/ac-service/src/crypto/mod.rs`
+
+`SecretBox<T>` from `secrecy` crate doesn't implement `Clone` via derive. If your struct contains `SecretBox` and needs Clone, you must implement it manually with `SecretBox::new(Box::new(self.field.expose_secret().clone()))`. Forgetting this causes compile errors, but the fix pattern must maintain secret protection.
+
+---
+
+## Gotcha: Serde Serialize Bypasses SecretString Protection
+**Added**: 2026-01-12
+**Related files**: `crates/ac-service/src/models/mod.rs`
+
+If you derive `Serialize` on a struct with `SecretString`, the default serialization will NOT expose the secret (it serializes the wrapper). For API responses that MUST return secrets (registration, rotation), implement custom `Serialize` with explicit `.expose_secret()`. Document this as intentional - it's the one place secrets should be exposed.
+
+---
+
+## Gotcha: grep for .expose_secret() During Reviews
+**Added**: 2026-01-12
+**Related files**: `crates/ac-service/src/`
+
+Every call to `.expose_secret()` is a potential leak point. During security reviews, grep for all `.expose_secret()` calls and verify each is: (1) necessary for crypto operations, (2) intentional API exposure, or (3) test code. Any other usage is suspicious. This is the primary benefit of SecretBox - it makes secret access auditable.
+
+---

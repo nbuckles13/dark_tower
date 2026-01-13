@@ -346,8 +346,8 @@ mod tests {
         let config = Config {
             database_url: String::new(),
             bind_address: "127.0.0.1:0".to_string(),
-            master_key: master_key.clone(),
-            hash_secret: master_key.clone(),
+            master_key: common::secret::SecretBox::new(Box::new(master_key.clone())),
+            hash_secret: common::secret::SecretBox::new(Box::new(master_key.clone())),
             otlp_endpoint: None,
             jwt_clock_skew_seconds: crate::config::DEFAULT_JWT_CLOCK_SKEW_SECONDS,
             bcrypt_cost: crate::config::DEFAULT_BCRYPT_COST,
@@ -390,8 +390,8 @@ mod tests {
         let config = Config {
             database_url: String::new(),
             bind_address: "127.0.0.1:0".to_string(),
-            master_key: vec![0u8; 32],  // Dummy key (won't be used)
-            hash_secret: vec![0u8; 32], // Dummy hash secret for tests
+            master_key: common::secret::SecretBox::new(Box::new(vec![0u8; 32])), // Dummy key (won't be used)
+            hash_secret: common::secret::SecretBox::new(Box::new(vec![0u8; 32])), // Dummy hash secret for tests
             otlp_endpoint: None,
             jwt_clock_skew_seconds: crate::config::DEFAULT_JWT_CLOCK_SKEW_SECONDS,
             bcrypt_cost: crate::config::DEFAULT_BCRYPT_COST,

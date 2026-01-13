@@ -65,3 +65,35 @@ Tests use `Config::from_vars()` with HashMap, but production uses `Config::from_
 **Related files**: `crates/ac-service/src/crypto/mod.rs`
 
 The Claims struct uses `#[serde(skip_serializing_if = "Option::is_none")]` for service_type. Tests verify this omission in serialized JSON. If this attribute is accidentally removed, user tokens would include `service_type: null`.
+
+---
+
+## Gotcha: Integration Test Modules Must Be Included
+**Added**: 2026-01-12
+**Related files**: `crates/ac-service/tests/integration/mod.rs`
+
+When adding new integration test files, they MUST be added to `mod.rs` (e.g., `mod clock_skew_tests;`). Otherwise, the test file is never compiled or executed, and test failures are silently ignored. Symptom: file exists but `cargo test` shows 0 tests from that module.
+
+---
+
+## Gotcha: SecretBox/SecretString Type Mismatches After Refactor
+**Added**: 2026-01-12
+**Related files**: `crates/ac-service/src/crypto/mod.rs`, integration tests
+
+When refactoring fields to use `SecretBox<T>` or `SecretString`, existing test code that constructs those structs will have type mismatches. Example: if `EncryptedKey.encrypted_data` changes from `Vec<u8>` to `SecretBox<Vec<u8>>`, tests must change from:
+```rust
+encrypted_data: signing_key.private_key_encrypted.clone()
+```
+to:
+```rust
+encrypted_data: SecretBox::new(Box::new(signing_key.private_key_encrypted.clone()))
+```
+The compiler catches this, but orphaned test files (not in mod.rs) won't be compiled.
+
+---
+
+## Gotcha: Database Models vs Crypto Structs Have Different Types
+**Added**: 2026-01-12
+**Related files**: `crates/ac-service/src/models/mod.rs`, `crates/ac-service/src/crypto/mod.rs`
+
+Database models (e.g., `SigningKey` from sqlx) store raw `Vec<u8>` for encrypted data. Crypto structs (e.g., `EncryptedKey`) may use `SecretBox<Vec<u8>>`. When constructing crypto structs from DB models, always wrap with `SecretBox::new(Box::new(...))`. This is intentional - DB layer is raw bytes, crypto layer protects them.

@@ -10,6 +10,7 @@ use axum::{
     Json,
 };
 use chrono::{DateTime, Utc};
+use common::secret::ExposeSecret;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::instrument;
@@ -341,7 +342,7 @@ pub async fn handle_rotate_keys(
     // Perform rotation within same transaction
     let new_key_id = key_management_service::rotate_signing_key_tx(
         &mut tx,
-        &state.config.master_key,
+        state.config.master_key.expose_secret(),
         &cluster_name,
     )
     .await?;
@@ -419,13 +420,49 @@ pub struct CreateClientRequest {
 }
 
 /// Create client response (ONLY time client_secret is returned)
-#[derive(Debug, Serialize)]
+///
+/// The `client_secret` field is wrapped in `SecretString` which:
+/// - Redacts the value in Debug output to prevent accidental logging
+/// - Requires explicit `.expose_secret()` to access the value
+/// - Uses custom serialization to expose the secret in API responses
 pub struct CreateClientResponse {
     pub id: Uuid,
     pub client_id: String,
-    pub client_secret: String, // ONLY returned at creation time
+    pub client_secret: common::secret::SecretString, // ONLY returned at creation time
     pub service_type: String,
     pub scopes: Vec<String>,
+}
+
+/// Custom Debug that redacts client_secret
+impl std::fmt::Debug for CreateClientResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CreateClientResponse")
+            .field("id", &self.id)
+            .field("client_id", &self.client_id)
+            .field("client_secret", &"[REDACTED]")
+            .field("service_type", &self.service_type)
+            .field("scopes", &self.scopes)
+            .finish()
+    }
+}
+
+/// Custom Serialize that exposes client_secret for API response.
+/// This is intentional: the create client response is the ONLY time
+/// the plaintext client_secret is shown to the user.
+impl Serialize for CreateClientResponse {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut state = serializer.serialize_struct("CreateClientResponse", 5)?;
+        state.serialize_field("id", &self.id)?;
+        state.serialize_field("client_id", &self.client_id)?;
+        state.serialize_field("client_secret", self.client_secret.expose_secret())?;
+        state.serialize_field("service_type", &self.service_type)?;
+        state.serialize_field("scopes", &self.scopes)?;
+        state.end()
+    }
 }
 
 /// Update client request
@@ -435,10 +472,40 @@ pub struct UpdateClientRequest {
 }
 
 /// Rotate secret response (ONLY time new client_secret is returned)
-#[derive(Debug, Serialize)]
+///
+/// The `client_secret` field is wrapped in `SecretString` which:
+/// - Redacts the value in Debug output to prevent accidental logging
+/// - Requires explicit `.expose_secret()` to access the value
+/// - Uses custom serialization to expose the secret in API responses
 pub struct RotateSecretResponse {
     pub client_id: String,
-    pub client_secret: String, // New secret - ONLY returned at rotation time
+    pub client_secret: common::secret::SecretString, // New secret - ONLY returned at rotation time
+}
+
+/// Custom Debug that redacts client_secret
+impl std::fmt::Debug for RotateSecretResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RotateSecretResponse")
+            .field("client_id", &self.client_id)
+            .field("client_secret", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// Custom Serialize that exposes client_secret for API response.
+/// This is intentional: the rotate secret response is the ONLY time
+/// the new plaintext client_secret is shown to the user.
+impl Serialize for RotateSecretResponse {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut state = serializer.serialize_struct("RotateSecretResponse", 2)?;
+        state.serialize_field("client_id", &self.client_id)?;
+        state.serialize_field("client_secret", self.client_secret.expose_secret())?;
+        state.end()
+    }
 }
 
 /// List all OAuth clients
@@ -1006,7 +1073,8 @@ pub async fn handle_rotate_client_secret(
     let new_client_secret = crypto::generate_client_secret()?;
 
     // Hash new client_secret with bcrypt using configured cost factor
-    let new_secret_hash = crypto::hash_client_secret(&new_client_secret, state.config.bcrypt_cost)?;
+    let new_secret_hash =
+        crypto::hash_client_secret(new_client_secret.expose_secret(), state.config.bcrypt_cost)?;
 
     // Update database with new hash
     let rotate_result = service_credentials::rotate_secret(&state.pool, id, &new_secret_hash).await;
@@ -1182,7 +1250,7 @@ mod tests {
         let response = result.unwrap().0;
         assert_eq!(response.service_type, "global-controller");
         assert!(!response.client_id.is_empty());
-        assert!(!response.client_secret.is_empty());
+        assert!(!response.client_secret.expose_secret().is_empty());
         assert!(!response.scopes.is_empty());
     }
 
@@ -1325,7 +1393,7 @@ mod tests {
         let response = result.unwrap().0;
         assert_eq!(response.service_type, "global-controller");
         assert!(!response.client_id.is_empty());
-        assert!(!response.client_secret.is_empty());
+        assert!(!response.client_secret.expose_secret().is_empty());
         assert!(!response.scopes.is_empty());
     }
 
@@ -1727,7 +1795,7 @@ mod tests {
             .unwrap()
             .0;
 
-        let original_secret = create_response.client_secret.clone();
+        let original_secret = create_response.client_secret.expose_secret().to_string();
 
         // Rotate secret
         let result = handle_rotate_client_secret(State(state), Path(create_response.id)).await;
@@ -1735,9 +1803,10 @@ mod tests {
         assert!(result.is_ok(), "Rotate should succeed");
         let response = result.unwrap().0;
         assert_eq!(response.client_id, create_response.client_id);
-        assert!(!response.client_secret.is_empty());
+        assert!(!response.client_secret.expose_secret().is_empty());
         assert_ne!(
-            response.client_secret, original_secret,
+            response.client_secret.expose_secret(),
+            &original_secret,
             "New secret should differ from original"
         );
     }

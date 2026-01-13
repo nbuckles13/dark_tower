@@ -60,6 +60,14 @@ All PRs touching auth/crypto need Security specialist review. Check: no timing l
 
 ---
 
+## Integration: Code Review - SecretBox/SecretString Verification
+**Added**: 2026-01-12
+**Related files**: `crates/ac-service/src/config.rs`, `crates/ac-service/src/crypto/mod.rs`
+
+When reviewing code with secrets: (1) Grep for `.expose_secret()` - each call is a potential leak, verify necessity, (2) Check custom Debug impls redact with `[REDACTED]`, (3) Verify custom Serialize only on "one-time reveal" response types, (4) Confirm Clone impls re-wrap in SecretBox. Any raw `String`/`Vec<u8>` holding secrets is a finding.
+
+---
+
 ## Integration: Infrastructure - Key Management
 **Added**: 2026-01-11
 **Related files**: `crates/ac-service/src/config.rs`

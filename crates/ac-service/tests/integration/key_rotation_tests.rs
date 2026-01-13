@@ -9,6 +9,7 @@ use ac_service::repositories::{service_credentials, signing_keys};
 use ac_service::services::token_service;
 use ac_test_utils::{rotation_time, TestAuthServer};
 use chrono::Utc;
+use common::secret::ExposeSecret;
 use reqwest::StatusCode;
 use sqlx::PgPool;
 
@@ -65,7 +66,9 @@ async fn create_user_token(pool: &PgPool, master_key: &[u8]) -> Result<String, a
 
     // Decrypt private key
     let encrypted_key = crypto::EncryptedKey {
-        encrypted_data: signing_key_model.private_key_encrypted.clone(),
+        encrypted_data: common::secret::SecretBox::new(Box::new(
+            signing_key_model.private_key_encrypted.clone(),
+        )),
         nonce: signing_key_model.encryption_nonce.clone(),
         tag: signing_key_model.encryption_tag.clone(),
     };
@@ -98,7 +101,7 @@ async fn create_user_token(pool: &PgPool, master_key: &[u8]) -> Result<String, a
 async fn test_rotate_keys_with_valid_scope_succeeds(pool: PgPool) -> Result<(), anyhow::Error> {
     // Arrange
     let server = TestAuthServer::spawn(pool.clone()).await?;
-    let master_key = server.config().master_key.clone();
+    let master_key = server.config().master_key.expose_secret().clone();
 
     // Set rotation eligible (7 days ago)
     rotation_time::set_eligible(&pool).await?;
@@ -153,7 +156,7 @@ async fn test_rotate_keys_with_valid_scope_succeeds(pool: PgPool) -> Result<(), 
 async fn test_rotate_keys_without_scope_returns_403(pool: PgPool) -> Result<(), anyhow::Error> {
     // Arrange
     let server = TestAuthServer::spawn(pool.clone()).await?;
-    let master_key = server.config().master_key.clone();
+    let master_key = server.config().master_key.expose_secret().clone();
 
     // Set rotation eligible (7 days ago)
     rotation_time::set_eligible(&pool).await?;
@@ -207,7 +210,7 @@ async fn test_rotate_keys_without_scope_returns_403(pool: PgPool) -> Result<(), 
 async fn test_rotate_keys_user_token_returns_401(pool: PgPool) -> Result<(), anyhow::Error> {
     // Arrange
     let server = TestAuthServer::spawn(pool.clone()).await?;
-    let master_key = server.config().master_key.clone();
+    let master_key = server.config().master_key.expose_secret().clone();
 
     // Set rotation eligible (7 days ago)
     rotation_time::set_eligible(&pool).await?;
@@ -250,7 +253,7 @@ async fn test_rotate_keys_user_token_returns_401(pool: PgPool) -> Result<(), any
 async fn test_rotate_keys_expired_token_returns_401(pool: PgPool) -> Result<(), anyhow::Error> {
     // Arrange
     let server = TestAuthServer::spawn(pool.clone()).await?;
-    let master_key = server.config().master_key.clone();
+    let master_key = server.config().master_key.expose_secret().clone();
 
     // Set rotation eligible (7 days ago)
     rotation_time::set_eligible(&pool).await?;
@@ -262,7 +265,9 @@ async fn test_rotate_keys_expired_token_returns_401(pool: PgPool) -> Result<(), 
 
     // Decrypt private key
     let encrypted_key = crypto::EncryptedKey {
-        encrypted_data: signing_key_model.private_key_encrypted.clone(),
+        encrypted_data: common::secret::SecretBox::new(Box::new(
+            signing_key_model.private_key_encrypted.clone(),
+        )),
         nonce: signing_key_model.encryption_nonce.clone(),
         tag: signing_key_model.encryption_tag.clone(),
     };
@@ -306,7 +311,7 @@ async fn test_rotate_keys_expired_token_returns_401(pool: PgPool) -> Result<(), 
 async fn test_rotate_keys_within_6_days_returns_429(pool: PgPool) -> Result<(), anyhow::Error> {
     // Arrange
     let server = TestAuthServer::spawn(pool.clone()).await?;
-    let master_key = server.config().master_key.clone();
+    let master_key = server.config().master_key.expose_secret().clone();
 
     // Set rotation to 30 minutes ago (within 6 day window)
     rotation_time::set_rate_limited(&pool).await?;
@@ -358,7 +363,7 @@ async fn test_rotate_keys_within_6_days_returns_429(pool: PgPool) -> Result<(), 
 async fn test_force_rotate_within_1_hour_returns_429(pool: PgPool) -> Result<(), anyhow::Error> {
     // Arrange
     let server = TestAuthServer::spawn(pool.clone()).await?;
-    let master_key = server.config().master_key.clone();
+    let master_key = server.config().master_key.expose_secret().clone();
 
     // Set rotation to 30 minutes ago (within 1 hour force window)
     rotation_time::set_rate_limited(&pool).await?;
@@ -399,7 +404,7 @@ async fn test_force_rotate_within_1_hour_returns_429(pool: PgPool) -> Result<(),
 async fn test_force_rotate_after_1_hour_succeeds(pool: PgPool) -> Result<(), anyhow::Error> {
     // Arrange
     let server = TestAuthServer::spawn(pool.clone()).await?;
-    let master_key = server.config().master_key.clone();
+    let master_key = server.config().master_key.expose_secret().clone();
 
     // Set rotation to 2 hours ago (past 1 hour force limit, but within 6 day normal limit)
     rotation_time::set_force_eligible(&pool).await?;
@@ -539,7 +544,7 @@ async fn test_rotate_keys_malformed_auth_header_returns_401(
 async fn test_concurrent_rotation_enforces_rate_limit(pool: PgPool) -> Result<(), anyhow::Error> {
     // Arrange
     let server = TestAuthServer::spawn(pool.clone()).await?;
-    let master_key = server.config().master_key.clone();
+    let master_key = server.config().master_key.expose_secret().clone();
 
     // Set rotation eligible (7 days ago)
     rotation_time::set_eligible(&pool).await?;
@@ -620,7 +625,7 @@ async fn test_concurrent_rotation_enforces_rate_limit(pool: PgPool) -> Result<()
 async fn test_old_key_tokens_valid_after_rotation(pool: PgPool) -> Result<(), anyhow::Error> {
     // Arrange
     let server = TestAuthServer::spawn(pool.clone()).await?;
-    let master_key = server.config().master_key.clone();
+    let master_key = server.config().master_key.expose_secret().clone();
 
     // Set rotation eligible (7 days ago)
     rotation_time::set_eligible(&pool).await?;
