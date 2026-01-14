@@ -201,6 +201,7 @@ At the beginning of each session:
 - [ ] Read this file
 - [ ] Review specialist agent definitions (`.claude/agents/`)
 - [ ] Check existing ADRs (`docs/decisions/`)
+- [ ] **Check for incomplete dev-loops** in `docs/dev-loop-outputs/` (look for `Current Step` != `complete`)
 - [ ] Understand current todo list
 - [ ] Identify which specialists needed for today's work
 

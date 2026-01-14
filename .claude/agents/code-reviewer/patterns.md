@@ -101,3 +101,67 @@ CRITICAL: Add doc comment stating "This is intentional: the [response type] is t
 **Related files**: `crates/ac-service/src/handlers/admin_handler.rs`
 
 Manual trait implementations (Debug, Clone, Serialize) are acceptable for up to ~5 similar types. Beyond that, consider a derive macro. Current examples: `RegisterServiceResponse`, `CreateClientResponse`, `RotateSecretResponse` all follow the same pattern - acceptable as 3 types. If pattern proliferates, create `#[derive(SecretSerialize)]` or similar.
+
+---
+
+## Pattern: Debugging-Friendly Assertion Messages
+**Added**: 2026-01-13
+**Related files**: `crates/env-tests/tests/25_auth_security.rs`, `crates/env-tests/tests/40_resilience.rs`
+
+Assertion messages should guide debugging, not just state what failed. Include: (1) what was expected, (2) what was received, (3) likely causes, (4) remediation steps. Example from NetworkPolicy test:
+```rust
+assert!(
+    can_reach,
+    "Canary pod in dark-tower namespace should be able to reach AC service at {}. \
+     If this fails, check: 1) AC service is running, 2) Service DNS resolves, \
+     3) No NetworkPolicy blocking same-namespace traffic.",
+    target_url
+);
+```
+
+---
+
+## Pattern: CVE/CWE Reference Documentation in Security Tests
+**Added**: 2026-01-13
+**Related files**: `crates/env-tests/tests/25_auth_security.rs`
+
+Document security tests with specific CVE/CWE references in doc comments. This provides audit trail and helps future reviewers understand the threat being mitigated. Example:
+```rust
+/// Test that tokens with embedded 'jwk' header are rejected (CVE-2018-0114).
+/// An attacker should not be able to embed their own key in the token header.
+#[tokio::test]
+async fn test_jwk_header_injection_rejected() { ... }
+```
+Common references: CVE-2018-0114 (JWT embedded key), CWE-321 (hardcoded crypto key), CWE-89 (SQL injection).
+
+---
+
+## Pattern: Test Isolation with #[serial] for Shared Resources
+**Added**: 2026-01-13
+**Related files**: `crates/env-tests/tests/40_resilience.rs`
+
+Use `#[serial]` from `serial_test` crate when tests share mutable state (Kubernetes cluster, database, network resources). Prevents race conditions and flaky tests. Apply to all tests in a file that touch the same resource:
+```rust
+use serial_test::serial;
+
+#[tokio::test]
+#[serial]
+async fn test_same_namespace_connectivity() { ... }
+
+#[tokio::test]
+#[serial]
+async fn test_network_policy_blocks_cross_namespace() { ... }
+```
+
+---
+
+## Pattern: Feature-Gated Test Organization
+**Added**: 2026-01-13
+**Related files**: `crates/env-tests/tests/*.rs`
+
+Organize tests by feature flag based on infrastructure requirements:
+- `#![cfg(feature = "smoke")]` - Basic tests requiring minimal infrastructure
+- `#![cfg(feature = "flows")]` - Full integration tests requiring deployed services
+- `#![cfg(feature = "resilience")]` - Chaos/resilience tests requiring cluster access
+
+Each test file declares exactly one feature gate at the module level. This prevents accidental execution in `cargo test --workspace` while enabling selective test runs in CI.

@@ -99,3 +99,37 @@ When adding new integration test files:
 4. Check test count in output matches expected number of tests
 
 Failure mode: Test file exists, looks correct, but 0 tests run. Silent failure.
+
+---
+
+## For Infrastructure Specialist: env-tests Cluster Requirements
+**Added**: 2026-01-13
+**Related files**: `crates/env-tests/src/*.rs`, `crates/env-tests/tests/*.rs`
+
+env-tests require running cluster infrastructure:
+- Kind cluster with AC service deployed
+- Port-forwards active: AC (8082), Prometheus (9090), Grafana (3000), Loki (3100)
+- kubectl in PATH and configured for cluster
+
+CanaryPod tests additionally require:
+- RBAC: pods.create/delete permissions in test namespaces
+- Network connectivity between namespaces (for positive tests)
+- NetworkPolicy deployed (for negative tests to validate blocking)
+
+---
+
+## For Security Specialist: JWT Security Test Coverage
+**Added**: 2026-01-13
+**Related files**: `crates/env-tests/tests/25_auth_security.rs`
+
+Current JWT security test coverage in env-tests:
+- **JWKS exposure**: Private key fields (d, p, q, dp, dq, qi) checked
+- **Algorithm confusion**: Wrong algorithm rejected
+- **Token tampering**: Payload modification detected
+- **Header injection**: kid, jwk (CVE-2018-0114), jku validated
+- **Time claims**: iat currentness, exp > iat, lifetime ~3600s
+
+Missing (documented for future work):
+- Expired token rejection (requires time manipulation or waiting)
+- Token size limits (>8KB rejection)
+- Audience validation edge cases

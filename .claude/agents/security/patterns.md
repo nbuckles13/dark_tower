@@ -91,3 +91,35 @@ For "one-time reveal" API responses (registration, secret rotation), implement c
 `SecretBox<T>` doesn't derive Clone. For types containing SecretBox, implement Clone manually: `SecretBox::new(Box::new(self.field.expose_secret().clone()))`. This maintains secret protection on cloned values. Essential for structs like `Config` that may be cloned across threads.
 
 ---
+
+## Pattern: JWKS Private Key Field Validation
+**Added**: 2026-01-13
+**Related files**: `crates/env-tests/tests/25_auth_security.rs`
+
+When testing JWKS endpoints for private key leakage, check for ALL private key fields that could be present: `d` (private key for RSA/EC/OKP), `p`, `q`, `dp`, `dq`, `qi` (RSA CRT parameters). Use raw JSON parsing rather than typed deserialization to catch any field that shouldn't be there. This validates CWE-321 (cryptographic key exposure).
+
+---
+
+## Pattern: JWT Header Injection Test Suite
+**Added**: 2026-01-13
+**Related files**: `crates/env-tests/tests/25_auth_security.rs`
+
+When testing JWT header security, validate three attack surfaces: (1) `kid` injection - test path traversal (`../../etc/passwd`), SQL injection (`'; DROP TABLE--`), XSS, null bytes, header injection; (2) `jwk` embedding (CVE-2018-0114) - verify service ignores embedded public keys; (3) `jku` SSRF - test external URLs, internal URLs, file:// protocol, cloud metadata endpoints. All tests pass because JWT signatures cover the header - tampering invalidates signature.
+
+---
+
+## Pattern: Security Test via Signature Integrity
+**Added**: 2026-01-13
+**Related files**: `crates/env-tests/tests/25_auth_security.rs`
+
+JWT header injection attacks are implicitly prevented by signature validation. When testing header injection (kid, jwk, jku), modifying the header invalidates the signature. This means testing "header injection rejection" is really testing "signature validation works correctly." Document this in test comments to avoid confusion - the protection mechanism is cryptographic, not input validation.
+
+---
+
+## Pattern: Subprocess Command Array for Shell Injection Prevention
+**Added**: 2026-01-13
+**Related files**: `crates/env-tests/src/canary.rs`
+
+When invoking external commands (kubectl, etc.) from Rust, use `Command::new("cmd").args([...])` with explicit argument arrays, NOT shell string concatenation. This prevents shell metacharacter injection. Even if namespace/input values are controlled, this pattern is defense-in-depth. Example: `Command::new("kubectl").args(["get", "pod", &name, &format!("--namespace={}", ns)])` - the namespace cannot break out of its argument position.
+
+---
