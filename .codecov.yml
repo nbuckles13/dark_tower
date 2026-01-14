@@ -74,6 +74,7 @@ component_management:
 
 ignore:
   - "crates/proto-gen/**"  # Generated code
+  - "crates/env-tests/**"  # Test infrastructure (runs against live cluster)
   - "**/benches/**"        # Benchmark code
   - "**/examples/**"       # Example code
   - "**/.claude/**"        # Agent configurations
