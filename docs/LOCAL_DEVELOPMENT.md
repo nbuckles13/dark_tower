@@ -231,41 +231,14 @@ This deletes the cluster and cleans up port-forwards.
 
 ## Development Workflow
 
-### Typical Development Session
+### Unit Tests (No Cluster Required)
+
+For unit and integration tests, only the test database is needed:
 
 ```bash
-# 1. Start the cluster (once per session)
-./infra/kind/scripts/setup.sh
-
-# 2. Iterate on code
-cd crates/ac-service
-cargo build
-cargo test
-
-# 3. Deploy changes to cluster
-kubectl rollout restart deployment/ac-service -n dark-tower
-
-# Or use Skaffold for automatic rebuilds
-cd infra
-skaffold dev
-
-# 4. View logs in Grafana
-open http://localhost:3000
-
-# 5. When done, teardown
-./infra/kind/scripts/teardown.sh
-```
-
-### Running Tests
-
-For unit and integration tests, use the test database:
-
-```bash
-# Start test database (uses docker-compose.test.yml)
+# Start test database
 podman-compose -f docker-compose.test.yml up -d
-
-# Or with Docker
-docker-compose -f docker-compose.test.yml up -d
+# Or with Docker: docker-compose -f docker-compose.test.yml up -d
 
 # Run tests
 export DATABASE_URL="postgresql://postgres:postgres@localhost:5433/dark_tower_test"
@@ -277,6 +250,40 @@ cargo llvm-cov --workspace --lcov --output-path lcov.info
 # Stop test database
 podman-compose -f docker-compose.test.yml down
 ```
+
+### Cluster Tests (env-tests)
+
+The `env-tests` crate contains tests that run against a deployed cluster:
+
+```bash
+# 1. Start the cluster (once per session)
+./infra/kind/scripts/setup.sh
+
+# 2. Run env-tests
+cargo test -p env-tests --features smoke        # Quick health checks (~30s)
+cargo test -p env-tests --features flows        # Auth flow tests (~2-3min)
+cargo test -p env-tests --features observability # Metrics/logs validation
+cargo test -p env-tests --features all          # Everything
+
+# 3. When done, teardown
+./infra/kind/scripts/teardown.sh
+```
+
+**Feature flags:**
+| Feature | Purpose | Duration |
+|---------|---------|----------|
+| `smoke` | Basic health checks | ~30s |
+| `flows` | Service flow validation | ~2-3min |
+| `observability` | Metrics and logs | ~30s |
+| `resilience` | Pod restarts, chaos | ~5min |
+| `all` | All of the above | ~10min |
+
+**Pre-seeded test credentials:**
+- Client ID: `test-client`
+- Client Secret: `test-client-secret-dev-999`
+- Scope: `test:all`
+
+These credentials are automatically seeded by `setup.sh` for env-tests.
 
 **Why separate test database?**
 - Different port (5433 vs 5432) avoids conflicts with dev cluster
@@ -566,7 +573,7 @@ kubectl delete pod -n dark-tower <pod>  # Delete pod
 
 # === Service Management ===
 kubectl get svc -A                      # All services
-kubectl rollout restart deployment/ac-service -n dark-tower  # Restart AC
+kubectl rollout restart statefulset/ac-service -n dark-tower  # Restart AC
 
 # === Database ===
 sqlx migrate run                        # Run migrations
