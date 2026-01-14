@@ -29,6 +29,9 @@ serde_json = { workspace = true }
 # Error handling
 thiserror = { workspace = true }
 
+# UUID for unique identifiers (canary pod names)
+uuid = { version = "1.11", features = ["v4"] }
+
 # Logging
 tracing = { workspace = true }
 
