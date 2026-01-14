@@ -73,3 +73,43 @@ When implementing custom `Serialize` that exposes a `SecretString` via `.expose_
 **Related files**: `crates/ac-service/src/`
 
 Use consistent `"[REDACTED]"` string across all Debug implementations. Inconsistent placeholders (e.g., `"***"`, `"<hidden>"`, `"[SECRET]"`) make log analysis harder and suggest incomplete refactoring. Grep for redaction patterns to verify consistency.
+
+---
+
+## Gotcha: Unused Struct Fields in Test Deserialization
+**Added**: 2026-01-13
+**Related files**: `crates/env-tests/tests/25_auth_security.rs`
+
+When defining structs for deserializing test data (e.g., JWT claims), only include fields that are actually used in assertions. Unused fields like `aud: Option<Vec<String>>` add complexity without value. If the field might be used later, add a comment explaining why it's present. Otherwise, remove it.
+
+---
+
+## Gotcha: panic!() in Test Metrics Fallback
+**Added**: 2026-01-13
+**Related files**: `crates/env-tests/tests/10_auth_smoke.rs`
+
+Avoid `panic!()` in test fallback paths where infrastructure might be temporarily unavailable. Example: Metrics endpoint returning 500 should trigger a warning, not a test panic. Use `eprintln!()` for warnings or `assert!()` with helpful message. Reserve `panic!()` for true invariant violations.
+
+---
+
+## Gotcha: Magic Numbers for Timeouts in Test Infrastructure
+**Added**: 2026-01-13
+**Related files**: `crates/env-tests/src/canary.rs`
+
+Timeouts and durations in test infrastructure should be named constants:
+- Pod sleep duration: `3600` -> `const POD_SLEEP_SECONDS: u32 = 3600;`
+- Wait timeout: `30` -> `const POD_READY_TIMEOUT_SECONDS: u32 = 30;`
+- wget timeout: `"5"` -> `const WGET_TIMEOUT_SECONDS: &str = "5";`
+
+This makes tuning easier and documents expected behavior.
+
+---
+
+## Gotcha: Synchronous Subprocess in Async Context
+**Added**: 2026-01-13
+**Related files**: `crates/env-tests/src/canary.rs`
+
+Using `std::process::Command` (blocking) inside `async fn` works for test code but blocks the runtime thread. Document this limitation. For production code or long-running operations, use `tokio::process::Command`. Current CanaryPod implementation is acceptable because:
+1. It's test infrastructure only
+2. kubectl calls are short-lived
+3. Tests run sequentially with `#[serial]`

@@ -128,3 +128,100 @@ When refactoring raw types to wrapper types (e.g., `Vec<u8>` to `SecretBox<Vec<u
 3. Update access sites to unwrap: `.expose_secret()`
 4. **Verify test files are included in mod.rs** - orphaned tests won't catch type errors
 5. Run `cargo test` and verify expected test count executes
+
+---
+
+## Pattern: NetworkPolicy Positive/Negative Test Pair
+**Added**: 2026-01-13
+**Related files**: `crates/env-tests/tests/40_resilience.rs`, `crates/env-tests/src/canary.rs`
+
+When testing NetworkPolicy enforcement, always implement paired tests:
+1. **Positive test** (same namespace): Deploy canary with allowed labels, verify connectivity WORKS
+2. **Negative test** (cross namespace): Deploy canary in different namespace, verify connectivity BLOCKED
+
+Interpretation matrix:
+- Positive passes, negative fails = NetworkPolicy working correctly
+- Both pass = NetworkPolicy NOT enforced (security gap!)
+- Positive fails = Service down OR NetworkPolicy misconfigured (blocking all traffic)
+
+Always run positive test first to validate test infrastructure works.
+
+---
+
+## Pattern: Cluster-Dependent Test Structure
+**Added**: 2026-01-13
+**Related files**: `crates/env-tests/tests/*.rs`
+
+For tests requiring a running cluster, follow this structure:
+```rust
+#![cfg(feature = "flows")]  // Feature-gate to prevent accidental runs
+
+async fn cluster() -> ClusterConnection {
+    ClusterConnection::new()
+        .await
+        .expect("Failed to connect - ensure port-forwards are running")
+}
+
+#[tokio::test]
+async fn test_feature() {
+    let cluster = cluster().await;
+    let client = ServiceClient::new(&cluster.service_base_url);
+    // ... test logic
+}
+```
+Use feature gates (smoke, flows, observability, resilience) to categorize test execution time.
+
+---
+
+## Pattern: CanaryPod for In-Cluster Testing
+**Added**: 2026-01-13
+**Related files**: `crates/env-tests/src/canary.rs`
+
+For testing cluster-internal behavior (NetworkPolicies, service mesh, etc.), use CanaryPod pattern:
+```rust
+let canary = CanaryPod::deploy("target-namespace").await?;
+let can_reach = canary.can_reach("http://service:port/health").await;
+canary.cleanup().await?;  // Also cleaned on Drop
+```
+Key design decisions:
+- Use `std::process::Command` to call kubectl (not async kubectl client)
+- Implement `Drop` for automatic cleanup even on test panic
+- Use `AtomicBool` to prevent double-cleanup
+- Generate unique pod names with UUIDs to avoid collisions
+
+---
+
+## Pattern: JWT Header Injection Test Suite
+**Added**: 2026-01-13
+**Related files**: `crates/env-tests/tests/25_auth_security.rs`
+
+Test all JWT header injection attack vectors:
+1. **kid injection**: Path traversal (`../../etc/passwd`), SQL injection (`'; DROP TABLE`), XSS, null bytes
+2. **jwk injection**: Embedded attacker key (CVE-2018-0114)
+3. **jku injection**: External URL, internal SSRF, file:// protocol
+
+For each vector, craft a tampered header and verify signature validation fails:
+```rust
+let new_header = serde_json::json!({ "alg": "EdDSA", "typ": "JWT", "kid": malicious_value });
+let tampered = format!("{}.{}.{}", encode(new_header), original_payload, original_sig);
+assert!(decode(&tampered, &key, &validation).is_err());
+```
+Signature mismatch proves the attack was rejected (header is part of signed data).
+
+---
+
+## Pattern: JWKS Private Key Leakage Validation
+**Added**: 2026-01-13
+**Related files**: `crates/env-tests/tests/25_auth_security.rs`
+
+Validate JWKS endpoint does not expose private key fields (CWE-321):
+```rust
+let private_key_fields = ["d", "p", "q", "dp", "dq", "qi"];
+for key in jwks_value["keys"].as_array().unwrap() {
+    for field in &private_key_fields {
+        assert!(key.get(*field).is_none(),
+            "JWKS exposes private key field '{}'", field);
+    }
+}
+```
+Fetch raw JSON to check all fields - typed deserialization may skip unknown fields.

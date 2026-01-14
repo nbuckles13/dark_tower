@@ -21,6 +21,14 @@
 | Test Reviewer | `{agent_id or pending}` |
 | Code Reviewer | `{agent_id or pending}` |
 
+<!-- ORCHESTRATOR REMINDER:
+     - Update this table at EVERY state transition (see development-loop.md "Orchestrator Checklist")
+     - Capture reviewer agent IDs AS SOON as you invoke each reviewer
+     - When step is code_review and all reviewers approve, MUST advance to reflection
+     - Only mark complete after ALL reflections are done
+     - Before switching to a new user request, check if Current Step != complete
+-->
+
 ---
 
 ## Task Overview

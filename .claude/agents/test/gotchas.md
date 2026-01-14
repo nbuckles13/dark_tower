@@ -97,3 +97,51 @@ The compiler catches this, but orphaned test files (not in mod.rs) won't be comp
 **Related files**: `crates/ac-service/src/models/mod.rs`, `crates/ac-service/src/crypto/mod.rs`
 
 Database models (e.g., `SigningKey` from sqlx) store raw `Vec<u8>` for encrypted data. Crypto structs (e.g., `EncryptedKey`) may use `SecretBox<Vec<u8>>`. When constructing crypto structs from DB models, always wrap with `SecretBox::new(Box::new(...))`. This is intentional - DB layer is raw bytes, crypto layer protects them.
+
+---
+
+## Gotcha: env-tests Feature Gates Require Explicit Flags
+**Added**: 2026-01-13
+**Related files**: `crates/env-tests/Cargo.toml`, `crates/env-tests/tests/*.rs`
+
+env-tests has no default features - tests require explicit `--features` flag:
+```bash
+cargo test -p env-tests                     # Runs 0 tests!
+cargo test -p env-tests --features smoke    # Runs smoke tests (~30s)
+cargo test -p env-tests --features flows    # Runs flow tests (~2-3min)
+cargo test -p env-tests --features all      # Runs all tests (~8-10min)
+```
+Symptom: `cargo test --workspace` shows env-tests compiles but runs 0 tests. This is intentional - env-tests require cluster infrastructure.
+
+---
+
+## Gotcha: NetworkPolicy Tests Require Matching Pod Labels
+**Added**: 2026-01-13
+**Related files**: `crates/env-tests/tests/40_resilience.rs`
+
+When testing that same-namespace traffic is ALLOWED by NetworkPolicy, the canary pod must have labels that match the NetworkPolicy's ingress rules. If AC service's NetworkPolicy only allows `app=global-controller`, a canary with `app=canary` will be blocked even in the same namespace.
+
+Solution: Make canary pod labels configurable. Positive tests use allowed labels, negative tests use non-matching labels.
+
+---
+
+## Gotcha: Clippy Warns on Unused Structs in Tests
+**Added**: 2026-01-13
+**Related files**: `crates/env-tests/tests/10_auth_smoke.rs`
+
+If you define structs for deserialization but only use pattern matching on raw text, clippy will warn about unused structs. Example: Defining `PrometheusResponse` for JSON parsing but checking `metrics_text.contains("rate_limit")` instead.
+
+Solution: Remove unused structs OR add `#[allow(dead_code)]` with explanation OR actually use the parsed data.
+
+---
+
+## Gotcha: Synchronous kubectl in Async Context
+**Added**: 2026-01-13
+**Related files**: `crates/env-tests/src/canary.rs`
+
+`std::process::Command` is synchronous but used in async test functions. This works but blocks the executor during kubectl calls. For test code this is acceptable - test execution is sequential anyway.
+
+For production async code, consider:
+- `tokio::process::Command` for async subprocess
+- `kube` crate for native async Kubernetes API
+- Spawning blocking task: `tokio::task::spawn_blocking(...)`
