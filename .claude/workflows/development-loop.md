@@ -222,12 +222,17 @@ You own the full implementation cycle:
    - cargo clippy -- -D warnings (no warnings)
    - ./scripts/guards/semantic/credential-leak.sh {changed files} (semantic guards)
 3. **Fix failures** and re-run until all pass
-4. **Write output file** at `docs/dev-loop-outputs/YYYY-MM-DD-{task-slug}.md`:
-   - Use template from `docs/dev-loop-outputs/_template.md`
+4. **Write output** to `docs/dev-loop-outputs/YYYY-MM-DD-{task-slug}/`:
+   - Create directory for this dev-loop
+   - Use template from `docs/dev-loop-outputs/_template/main.md`
    - Fill in: Task Overview, Implementation Summary, Files Modified
    - Fill in: Verification Results (all 7 layers with status, timing, any issues)
    - Fill in: Issues Encountered & Resolutions
-5. **Return** when verification passes
+5. **Write checkpoint** to `docs/dev-loop-outputs/YYYY-MM-DD-{task-slug}/{your-name}.md`:
+   - Use template from `docs/dev-loop-outputs/_template/specialist.md`
+   - Document patterns discovered, gotchas encountered, key decisions
+   - This enables recovery if the session is interrupted
+6. **Return** when verification passes
 
 The orchestrator will re-run verification to confirm, then run code review.
 If code review has findings, you'll be resumed to fix them.
@@ -238,7 +243,8 @@ After code review is clean, you'll be resumed for reflection.
 1. Implementation code
 2. Unit tests for new/modified code
 3. All verification checks passing
-4. Output file with implementation and verification sections completed
+4. Output directory with main.md (implementation and verification sections)
+5. Checkpoint file with working notes (patterns, gotchas, decisions)
 ```
 
 ## Resume for Fixes Template
@@ -689,21 +695,34 @@ The output file serves as:
 
 ## Output Location
 
-`docs/dev-loop-outputs/YYYY-MM-DD-{task-slug}.md`
+```
+docs/dev-loop-outputs/YYYY-MM-DD-{task-slug}/
+├── main.md              # Main output (orchestrator owns Loop State)
+├── {specialist}.md      # Implementing specialist checkpoint
+└── {reviewer}.md        # One checkpoint per code reviewer
+```
 
-## Template
+## Templates
 
-Use the template at `docs/dev-loop-outputs/_template.md`
+- Main output: `docs/dev-loop-outputs/_template/main.md`
+- Specialist checkpoint: `docs/dev-loop-outputs/_template/specialist.md`
 
 ## Orchestrator Validation
 
 Before presenting to user, orchestrator validates:
 
 ```bash
-# Required sections from specialist
-grep -q "## Task Overview" $OUTPUT_FILE
-grep -q "## Implementation Summary" $OUTPUT_FILE
-grep -q "## Verification Results" $OUTPUT_FILE  # Proof verification was run
+# Check output directory exists
+OUTPUT_DIR="docs/dev-loop-outputs/YYYY-MM-DD-{task-slug}"
+test -d "$OUTPUT_DIR"
+
+# Required sections in main.md
+grep -q "## Task Overview" "$OUTPUT_DIR/main.md"
+grep -q "## Implementation Summary" "$OUTPUT_DIR/main.md"
+grep -q "## Verification Results" "$OUTPUT_DIR/main.md"
+
+# Checkpoint file exists for implementing specialist
+test -f "$OUTPUT_DIR/{specialist}.md"
 
 # If any missing, resume specialist to complete
 ```
@@ -930,3 +949,89 @@ If user requests a different task while a dev-loop is in progress:
 | `code-review.md` | Quality gate | Integrated INTO loop (step 4), also usable standalone |
 | `orchestrator-guide.md` | General orchestration | This loop is a key subprocess |
 | `process-review-record.md` | Process failures | Use when loop reveals coordination gaps |
+
+---
+
+# Part 10: Session Restore
+
+## Purpose
+
+If a session is interrupted (computer restart, context compression, process kill), agent context is lost. Per-specialist checkpoint files enable meaningful recovery by capturing working notes as specialists work.
+
+## Checkpoint Files
+
+Each specialist writes to their own checkpoint file during work:
+
+```
+docs/dev-loop-outputs/YYYY-MM-DD-{task}/
+├── main.md                    # Main output (orchestrator owns)
+├── {implementing-specialist}.md  # Implementing specialist's working notes
+└── {reviewer}.md              # Each reviewer's observations
+```
+
+**Checkpoint content** (written as specialist works):
+- **Patterns Discovered** - What approaches worked well
+- **Gotchas Encountered** - What was tricky, what to warn others about
+- **Key Decisions** - Choices made and why
+- **Observations** - What informed the review verdict (reviewers)
+- **Status** - Current step, verdict, timestamp
+
+## Restore Procedure
+
+When starting a new session, check for incomplete dev-loops:
+
+1. **Scan** `docs/dev-loop-outputs/` for directories
+2. **Check** each `main.md` for Loop State with `Current Step != complete`
+3. **If found**, offer restore to user
+
+### Restore Prompt
+
+```
+Found incomplete dev-loop: {task-slug}
+- Current step: {step}
+- Iteration: {iteration}
+- Implementing specialist: {name}
+
+Restore and continue? (Specialists will be re-invoked with checkpoint context)
+```
+
+### Restore Context Template
+
+When restoring a specialist, inject their checkpoint:
+
+```markdown
+# Context Recovery for {Specialist}
+
+You are continuing a dev-loop that was interrupted. Here's your previous context:
+
+## Your Previous Working Notes
+
+{paste from checkpoint file: Patterns, Gotchas, Decisions, Observations}
+
+## Current Loop State
+
+- Step: {current_step}
+- Iteration: {iteration}
+
+## What's Already Complete
+
+{summary from main.md: Task Overview, Implementation Summary if present}
+
+## Your Task
+
+Continue from where you left off. Based on your working notes, {specific instruction for current step}.
+```
+
+## Validation Before Step Transitions
+
+Orchestrator validates checkpoint files exist before advancing:
+
+| Transition | Validation |
+|------------|------------|
+| Implementation → Validation | Implementing specialist checkpoint has Patterns/Gotchas sections |
+| Code Review → Reflection | All reviewer checkpoints have Observations sections |
+| Reflection → Complete | All specialists have updated Status to reflection complete |
+
+## Limitations
+
+Restored specialists have checkpoint context but not full memory. The restore is "good enough" to continue meaningful work, but may miss nuances from the original session. This is acceptable - the alternative is starting over completely.
