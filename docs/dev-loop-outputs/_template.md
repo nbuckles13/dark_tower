@@ -217,14 +217,6 @@
 
 ---
 
-## Next Steps
-
-{Any follow-up work identified during this task}
-
-{Or "None - task complete"}
-
----
-
 ## Appendix: Verification Commands
 
 ```bash
