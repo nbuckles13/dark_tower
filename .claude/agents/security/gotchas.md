@@ -139,3 +139,11 @@ When testing `iat` (issued at) claims, account for clock skew between test runne
 When testing JWKS endpoints for private key leakage, DON'T rely on typed deserialization alone. A struct without a `d` field will silently ignore `d` in the JSON. Use raw JSON (`serde_json::Value`) to check if forbidden fields exist. Pattern: `jwks_value.get("keys")[i].get("d").is_none()` catches fields that typed structs would skip.
 
 ---
+
+## Gotcha: Application-Level Timeout Without Statement Timeout
+**Added**: 2026-01-14
+**Related files**: `crates/global-controller/src/main.rs`
+
+Setting a request timeout in the application (e.g., `tower_http::TimeoutLayer`) is insufficient if the database connection lacks a statement timeout. Attackers can still hang the database connection, exhausting the connection pool. ALWAYS set `statement_timeout` at the PostgreSQL connection level. This creates two independent timeouts: (1) DB-level statement timeout prevents hung queries, (2) Application-level request timeout prevents hung handlers. Both are necessary.
+
+---

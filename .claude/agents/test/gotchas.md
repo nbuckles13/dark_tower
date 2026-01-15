@@ -145,3 +145,74 @@ For production async code, consider:
 - `tokio::process::Command` for async subprocess
 - `kube` crate for native async Kubernetes API
 - Spawning blocking task: `tokio::task::spawn_blocking(...)`
+
+---
+
+## Gotcha: TestGcServer Random Port Binding
+**Added**: 2026-01-14
+**Related files**: `crates/gc-test-utils/src/server_harness.rs`
+
+TestGcServer binds to "127.0.0.1:0" which gives a random available port. This is correct and intentional for:
+- Parallel test execution (no port conflicts)
+- Running tests on systems where specific ports are unavailable
+
+However, the address is ONLY available AFTER binding:
+```rust
+// WRONG: addr is not determined yet
+let config = build_config(8000);  // Hardcoded port
+
+// RIGHT: get addr after binding
+let listener = TcpListener::bind("127.0.0.1:0").await?;
+let addr = listener.local_addr()?;  // Now we know the port
+```
+
+Also remember: Drop impl calls `_handle.abort()` which stops the background server when test ends. Tests that create a server must complete before server is needed elsewhere.
+
+---
+
+## Gotcha: reqwest Client in Tests Without Connection Info
+**Added**: 2026-01-14
+**Related files**: `crates/global-controller/tests/health_tests.rs`
+
+The test server uses `into_make_service_with_connect_info::<SocketAddr>()` for remote address extraction. This is needed if routes extract ConnectInfo. However, if a route tries to extract ConnectInfo but tests use a plain reqwest Client, the extraction will fail or return a dummy address.
+
+Solution: For tests with HTTP client, ensure either:
+1. Routes don't extract ConnectInfo (simplest for GC Phase 1)
+2. Use TestGcServer which provides proper SocketAddr propagation (required for Phase 2+ when we track client IPs)
+
+---
+
+## Gotcha: IntoResponse Body Reading Requires Full Buffering
+**Added**: 2026-01-14
+**Related files**: `crates/global-controller/src/errors.rs` (tests)
+
+Reading response body from axum IntoResponse:
+```rust
+// Helper needed:
+async fn read_body_json(body: Body) -> serde_json::Value {
+    let bytes = body.collect().await.unwrap().to_bytes();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+// WRONG: body.to_string() - body is not a String
+// RIGHT: use collect().to_bytes() to buffer full body
+let json: serde_json::Value = read_body_json(response.into_body()).await;
+assert_eq!(json["error"]["code"], "DATABASE_ERROR");
+```
+
+Body is a stream that must be fully buffered before JSON parsing. The `http_body_util::BodyExt` trait provides `.collect()` which buffers the full body into bytes.
+
+---
+
+## Gotcha: #[allow(dead_code)] on Skeleton Code
+**Added**: 2026-01-14
+**Related files**: `crates/global-controller/src/models/mod.rs`, `crates/global-controller/src/errors.rs`
+
+GC Phase 1 defines enum variants and methods that won't be used until Phase 2+:
+- `MeetingStatus::Active` (used in Phase 2 meeting lifecycle)
+- `GcError::Conflict` (used when managing concurrent operations)
+- Methods like `MeetingStatus::as_str()` that aren't called in Phase 1
+
+These require `#[allow(dead_code)]` to prevent clippy warnings. Document the phase when they'll be used. This is intentional skeleton code - DO NOT remove these.
+
+Symptom: Adding a `#[test]` for a skeleton variant should also work fine; the test will be the only usage of that variant until Phase 2 implementation begins.

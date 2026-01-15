@@ -113,3 +113,45 @@ Using `std::process::Command` (blocking) inside `async fn` works for test code b
 1. It's test infrastructure only
 2. kubectl calls are short-lived
 3. Tests run sequentially with `#[serial]`
+
+---
+
+## Gotcha: Confusing AppState Clone with Config Clone
+**Added**: 2026-01-14
+**Related files**: `crates/global-controller/src/routes/mod.rs`
+
+Both `AppState` and `Config` need to implement `Clone` for Axum's `State` extractor. When testing that they're Clone, it's easy to accidentally test the same trait twice. Make sure trait bound tests are distinct:
+```rust
+#[test]
+fn test_app_state_is_clone() {
+    fn assert_clone<T: Clone>() {}
+    assert_clone::<AppState>();  // Tests AppState specifically
+}
+
+#[test]
+fn test_config_is_clone() {
+    fn assert_clone<T: Clone>() {}
+    assert_clone::<Config>();  // Tests Config specifically
+}
+```
+These look similar but are essential distinct tests - AppState contains Config, but if Config loses Clone, AppState will fail to compile.
+
+---
+
+## Gotcha: Health Check HTTP 200 vs Error Status
+**Added**: 2026-01-14
+**Related files**: `crates/global-controller/src/handlers/health.rs`
+
+Common mistake: returning an error status (500) when a health check probe fails. This causes the HTTP request to fail and the probe to timeout, which is worse than returning 200 with `"unhealthy"` status. K8s expects to parse the response body, so:
+- BAD: `.map_err(|_| GcError::DatabaseUnavailable)` - probe fails
+- GOOD: `let db_healthy = sqlx::query().await.is_ok()` then return 200 with status field
+
+The probe should always succeed HTTP-wise; the body tells K8s the actual health state.
+
+---
+
+## Gotcha: AppState Clone Holding Arc References
+**Added**: 2026-01-14
+**Related files**: `crates/global-controller/src/routes/mod.rs`, `crates/gc-test-utils/src/server_harness.rs`
+
+`AppState` can cheaply clone because it holds an `Arc<AppState>` when passed to Axum. However, individual fields (PgPool, Config) must individually support Clone. If a future field doesn't clone (e.g., `tokio::sync::Mutex` without Arc), the struct-level Clone becomes problematic. Always verify all fields are Clone before deriving it.

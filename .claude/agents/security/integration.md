@@ -75,3 +75,11 @@ When reviewing code with secrets: (1) Grep for `.expose_secret()` - each call is
 Master keys via environment variables or secrets manager. Never in code/config files. Key rotation: `POST /internal/rotate-keys` with proper scopes. Old keys valid 24 hours post-rotation.
 
 ---
+
+## Integration: Operations - Query Timeout Configuration
+**Added**: 2026-01-14
+**Related files**: `crates/global-controller/src/main.rs`
+
+Production deployments with database queries MUST have both: (1) Application-level request timeout (e.g., 30 seconds), set in `TimeoutLayer`, (2) Database statement timeout (e.g., 5 seconds), configured via `statement_timeout` URL parameter. Verify both are in place in logs at startup. Alert if statement timeout is not configured - it's a DoS vulnerability. Recommend: statement timeout 5-10 seconds, request timeout 30 seconds. Tune based on expected query latency p99.
+
+---
