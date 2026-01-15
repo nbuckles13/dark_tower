@@ -20,6 +20,7 @@
 | Security Reviewer | `{agent_id or pending}` |
 | Test Reviewer | `{agent_id or pending}` |
 | Code Reviewer | `{agent_id or pending}` |
+| DRY Reviewer | `{agent_id or pending}` |
 
 <!-- ORCHESTRATOR REMINDER:
      - Update this table at EVERY state transition (see development-loop.md "Orchestrator Checklist")
@@ -157,7 +158,28 @@
 
 {Key findings or "No issues found"}
 
+### DRY Reviewer
+**Verdict**: APPROVED / FINDINGS
+
+**Blocking findings** (BLOCKER - code exists in common but wasn't used):
+{List any BLOCKERs that must be fixed, or "None"}
+
+**Tech debt findings** (non-blocking - opportunities for extraction):
+{List CRITICAL/MAJOR/MINOR findings documented below, or "None"}
+
 {Add other reviewers as applicable: Observability, Operations, Infrastructure}
+
+---
+
+## Tech Debt: Cross-Service Duplication
+
+<!-- Document non-blocking DRY findings here. These are tracked for follow-up tasks. -->
+
+| Pattern | New Location | Existing Location | Severity | Follow-up Task |
+|---------|--------------|-------------------|----------|----------------|
+| {pattern name} | `crates/X/src/file.rs:line` | `crates/Y/src/file.rs:line` | CRITICAL/MAJOR/MINOR | {Extraction task} |
+
+{Or "No cross-service duplication detected" if DRY review found nothing}
 
 ---
 

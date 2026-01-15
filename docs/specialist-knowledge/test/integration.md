@@ -206,3 +206,41 @@ async fn test_error_into_response() {
 ```
 
 All GC error conversions should be sync (not async) - use plain `#[test]` for Display/status_code, `#[tokio::test]` only for IntoResponse (due to body reading).
+
+---
+
+## For Security Specialist: JWT Validation Test Requirements
+**Added**: 2026-01-14
+**Related files**: `crates/global-controller/src/auth/jwt.rs`, `crates/global-controller/tests/auth_tests.rs`
+
+When reviewing JWT validation code, verify test coverage includes:
+1. **Token size limits**: Exact boundary tests (at limit, 1 byte over, far over)
+2. **Algorithm validation**: alg:none, HS256, missing alg, plus correct EdDSA
+3. **JWK structure validation**: kty check (must be "OKP"), alg check (must be "EdDSA"), required fields present
+4. **iat (issued-at) validation**: With clock skew tolerance from config
+5. **Time claim sanity**: exp > iat, lifetime reasonable (~3600s)
+6. **Header injection**: kid, jwk, jku attacks
+7. **JWKS caching**: Cache TTL respected, updates on new kid
+8. **Error messages**: Generic "invalid or expired" - no info leak
+
+Security-critical tests should be marked with descriptive names like `test_algorithm_confusion_attack_alg_hs256_rejected` so the vulnerability being tested is obvious.
+
+---
+
+## For Global Controller Specialist: Auth Middleware Integration
+**Added**: 2026-01-14
+**Related files**: `crates/global-controller/src/middleware/auth.rs`
+
+When adding authentication middleware to new routes:
+1. Understand the middleware layers: Extract Bearer token → Fetch JWK from cache → Validate signature → Extract claims
+2. Each layer has different error modes:
+   - No Authorization header = 401 (Unauthorized)
+   - Invalid Bearer format = 401 (Unauthorized)
+   - JWK not found = 500 (Internal) - JWKS endpoint unavailable
+   - Invalid signature = 401 (Unauthorized) - attacker tampering
+   - Invalid claims = 401 (Unauthorized) - expired, wrong aud, etc.
+3. Test error paths don't expose internal details (use generic messages)
+4. Test that claims are correctly extracted and available to handlers
+5. Protected routes should use `middleware::from_fn_with_state(require_auth)` pattern
+
+The middleware pattern with `from_fn_with_state` allows accessing shared state (config, JWKS client) while validating requests.

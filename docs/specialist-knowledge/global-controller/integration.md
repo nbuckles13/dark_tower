@@ -66,10 +66,108 @@ GC uses sqlx PgPool. Pool settings from DATABASE_URL. Recommended: `?max_connect
 
 ---
 
-## Integration: Meeting CRUD (Phase 2)
+## Integration: Meeting CRUD (Phase 3)
 **Added**: 2026-01-14
 **Related files**: `crates/global-controller/src/models/mod.rs`
 
-Phase 2 will add: `POST /v1/meetings`, `GET /v1/meetings/{id}`, `PUT /v1/meetings/{id}`, `DELETE /v1/meetings/{id}`. Requires valid JWT with appropriate scopes. Meeting state transitions managed by GC.
+Phase 3 will add: `POST /v1/meetings`, `GET /v1/meetings/{id}`, `PUT /v1/meetings/{id}`, `DELETE /v1/meetings/{id}`. Requires valid JWT with appropriate scopes. Meeting state transitions managed by GC.
+
+---
+
+## Integration: JWT Validation Flow
+**Added**: 2026-01-14
+**Related files**: `crates/global-controller/src/auth/`, `crates/global-controller/src/middleware/auth.rs`
+
+End-to-end JWT validation in GC:
+1. Client sends: `Authorization: Bearer <token>`
+2. Middleware extracts token, calls `JwtValidator::validate(token)`
+3. JwtValidator:
+   - Checks token size (< 8KB)
+   - Extracts kid from header
+   - Fetches JWK from cached JWKS (5 min TTL)
+   - Validates JWK (kty=OKP, alg=EdDSA)
+   - Verifies EdDSA signature using jsonwebtoken
+   - Validates iat claim (with clock skew tolerance)
+4. On success: Claims injected into request.extensions
+5. Handler calls `req.extensions().get::<Claims>()`
+
+---
+
+## Integration: Protected Routes Pattern
+**Added**: 2026-01-14
+**Related files**: `crates/global-controller/src/routes/mod.rs`
+
+Protected routes use `middleware::from_fn_with_state`:
+```rust
+.route(
+    "/v1/me",
+    get(handlers::me::get_me)
+        .layer(middleware::from_fn_with_state(
+            Arc::new(auth_state),
+            require_auth,
+        )),
+)
+```
+
+The middleware chain:
+- Layer wraps handler
+- Middleware runs before handler (extracts/validates token)
+- Handler receives Request with claims in extensions
+- If middleware returns Err (401), handler never runs
+
+---
+
+## Integration: Claims Structure
+**Added**: 2026-01-14
+**Related files**: `crates/global-controller/src/auth/claims.rs`
+
+JWT claims struct from AC tokens:
+```
+sub: String       # Subject (user ID)
+exp: i64          # Expiration time (Unix timestamp)
+iat: i64          # Issued at (Unix timestamp)
+scopes: Vec<String> # Authorization scopes
+```
+
+Handlers extract via request extensions. Claims implement Debug with redacted `sub` field to prevent leaking user IDs in logs.
+
+---
+
+## Integration: Testing with Mocked JWKS
+**Added**: 2026-01-14
+**Related files**: `crates/global-controller/tests/auth_tests.rs`
+
+Integration tests use wiremock to mock AC's JWKS endpoint:
+- Start mock server with `wiremock::MockServer::new()`
+- Register JWKS endpoint response: `POST /expected_path(path_regex("/\.well-known/jwks\.json"))`
+- Pass mock URL to GC config
+- GC fetches and caches JWKS from mock
+- Tests verify auth behavior without depending on real AC
+
+---
+
+## Integration: Bearer Token Format Requirements
+**Added**: 2026-01-14
+**Related files**: `crates/global-controller/src/middleware/auth.rs:44-58`
+
+Authorization header requirements:
+- MUST be present (returns 401 if missing)
+- MUST start with "Bearer " (6 characters including space)
+- Token follows after "Bearer "
+- No other formats accepted (Basic, Digest, etc.)
+- Header value MUST be valid UTF-8 (HTTP spec)
+
+Example valid headers:
+```
+Authorization: Bearer eyJhbGciOiJFZERTQSI...
+Authorization: Bearer short_token
+```
+
+Invalid headers (return 401):
+```
+Authorization: bearer eyJ... (lowercase b - case sensitive)
+Authorization: eyJ... (missing Bearer prefix)
+Authorization: Token eyJ... (wrong scheme)
+```
 
 ---

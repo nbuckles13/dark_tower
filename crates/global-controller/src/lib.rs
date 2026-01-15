@@ -18,14 +18,18 @@
 //!
 //! # Modules
 //!
+//! - `auth` - JWT validation via AC JWKS endpoint
 //! - `config` - Service configuration from environment
 //! - `errors` - Error types with HTTP status code mapping
 //! - `handlers` - HTTP request handlers
+//! - `middleware` - HTTP middleware (authentication)
 //! - `models` - Data models
 //! - `routes` - Axum router setup
 
+pub mod auth;
 pub mod config;
 pub mod errors;
 pub mod handlers;
+pub mod middleware;
 pub mod models;
 pub mod routes;

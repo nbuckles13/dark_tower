@@ -370,3 +370,111 @@ fn test_deserialization_missing_optional() {
 ```
 
 Essential for REST APIs to maintain clean JSON and avoid breaking clients when adding optional fields.
+
+---
+
+## Pattern: Boundary Testing for Security Limits
+**Added**: 2026-01-14
+**Related files**: `crates/global-controller/src/auth/jwt.rs`, `crates/global-controller/tests/auth_tests.rs`
+
+For security-critical size limits (token size, buffer sizes, etc.), test the boundary explicitly:
+1. **At limit**: Size exactly at boundary should be accepted
+2. **Below limit**: Size below boundary should be accepted
+3. **Above limit**: Size above boundary should be rejected
+4. **Far above limit**: Much larger size should be rejected (catches off-by-one in both directions)
+
+Example for JWT 8KB limit:
+```rust
+#[test]
+fn test_token_exactly_at_8kb_limit_accepted() {
+    // Create valid token padded to exactly 8192 bytes
+    let token = create_valid_token_with_size(8192);
+    assert_eq!(validate_token(&token).is_ok(), true);
+}
+
+#[test]
+fn test_token_at_8193_bytes_rejected() {
+    // Create valid token at 8193 bytes (1 byte over limit)
+    let token = create_valid_token_with_size(8193);
+    assert!(validate_token(&token).is_err());
+}
+```
+
+Why this matters: Off-by-one errors in size checks can allow DoS attacks. Test the exact boundary, not just "large" vs "small".
+
+---
+
+## Pattern: Algorithm Confusion Attack Testing
+**Added**: 2026-01-14
+**Related files**: `crates/global-controller/src/auth/jwt.rs`, `crates/global-controller/tests/auth_tests.rs`
+
+For JWT validation, test algorithm confusion attacks where attacker changes the algorithm in the token header:
+1. **Test `alg:none`**: Token with no algorithm should be rejected (CVE-2016-10555)
+2. **Test alternative algorithms**: Token with HS256/RS256 when only EdDSA is supported should be rejected (CVE-2017-11424)
+3. **Test correct algorithm**: Valid EdDSA token should pass
+
+```rust
+#[test]
+fn test_token_with_alg_none_rejected() {
+    let token = create_token_with_header_override(json!({"alg": "none", "typ": "JWT"}), valid_claims);
+    let result = validate_token(&token);
+    assert!(result.is_err(), "alg:none must be rejected");
+    assert_eq!(result.unwrap_err().status_code(), StatusCode::UNAUTHORIZED);
+}
+
+#[test]
+fn test_token_with_alg_hs256_rejected() {
+    let token = create_token_with_header_override(json!({"alg": "HS256", "typ": "JWT"}), valid_claims);
+    let result = validate_token(&token);
+    assert!(result.is_err(), "HS256 must be rejected when EdDSA is expected");
+}
+
+#[test]
+fn test_only_eddsa_algorithm_accepted() {
+    let token = create_valid_eddsa_token();
+    assert!(validate_token(&token).is_ok());
+}
+```
+
+Why this matters: Algorithm confusion is a common JWT vulnerability. Always explicitly test that ONLY the expected algorithm is accepted, not just "any valid JWT".
+
+---
+
+## Pattern: JWK Structure Validation
+**Added**: 2026-01-14
+**Related files**: `crates/global-controller/src/auth/jwt.rs`
+
+When validating JWKs from a JWKS endpoint, validate the key structure itself, not just use it:
+1. **Verify kty (key type)**: EdDSA uses `"OKP"`, not `"RSA"` or `"EC"`
+2. **Verify alg (algorithm)**: When present in JWK, must match expected algorithm
+3. **Log warnings**: If validation fails, log the mismatch before rejecting (helps operators debug misconfigurations)
+
+```rust
+pub fn verify_token(token: &str, jwk: &Jwk) -> Result<Claims, GcError> {
+    // Validate JWK structure before attempting verification
+    if jwk.kty != "OKP" {
+        tracing::warn!(
+            expected = "OKP",
+            actual = jwk.kty,
+            "JWK has incorrect key type (expected OKP for EdDSA)"
+        );
+        return Err(GcError::Unauthorized("invalid or expired token".to_string()));
+    }
+
+    if let Some(alg) = &jwk.alg {
+        if alg != "EdDSA" {
+            tracing::warn!(
+                expected = "EdDSA",
+                actual = alg,
+                "JWK has incorrect algorithm"
+            );
+            return Err(GcError::Unauthorized("invalid or expired token".to_string()));
+        }
+    }
+
+    // Now safe to use the key
+    // ...
+}
+```
+
+Why this matters: A compromised JWKS endpoint might return keys with wrong algorithms, enabling signature confusion attacks. Validate the structure, not just trust the endpoint.

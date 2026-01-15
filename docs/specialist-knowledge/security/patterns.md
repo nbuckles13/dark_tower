@@ -131,3 +131,19 @@ When invoking external commands (kubectl, etc.) from Rust, use `Command::new("cm
 Prevent hung queries and DoS attacks by setting database statement_timeout at connection time, not per-query. Pattern: append `?options=-c%20statement_timeout%3D{seconds}` to the PostgreSQL connection URL. This ensures ALL queries timeout after N seconds, preventing resource exhaustion. Combine with application-level request timeout (e.g., 30s via `tower_http::TimeoutLayer`) for defense-in-depth. Set timeout low enough (e.g., 5 seconds) to catch expensive operations, high enough for legitimate slow queries. Timeout value should be logged at startup for observability.
 
 ---
+
+## Pattern: JWK Field Validation as Defense-in-Depth
+**Added**: 2026-01-14
+**Related files**: `crates/global-controller/src/auth/jwt.rs`
+
+JWT validation includes algorithm pinning (token must have `alg: EdDSA`), but defense-in-depth also requires validating JWK fields: (1) `kty` (key type) must be `"OKP"` (Octet Key Pair) for Ed25519 keys, (2) `alg` field in JWK, if present, must be `"EdDSA"`. This prevents accepting keys from wrong cryptosystems (RSA, ECDSA) or key type mismatches. Pattern: Validate JWK fields at start of token verification before any crypto operations. Log warnings if fields are missing or invalid. This catches misconfigured JWKS endpoints and server misconfigurations that token-level validation alone wouldn't catch.
+
+---
+
+## Pattern: JWKS Endpoint Validation Recommendations
+**Added**: 2026-01-14
+**Related files**: `crates/global-controller/src/auth/jwks.rs`
+
+JWKS endpoints should be validated for: (1) HTTPS scheme required (not HTTP), (2) No redirects to different hosts allowed, (3) Response size capped (prevent OOM via huge JWKS). In Global Controller Phase 2, only the JWK field validation was critical and implemented. HTTPS validation and cache stampede protection are Phase 3+ hardening items, documented as minor for future work. Current implementation logs warnings on HTTP client failures to surface misconfigurations.
+
+---

@@ -28,13 +28,20 @@ chrono = { workspace = true }
 bcrypt = { workspace = true }
 jsonwebtoken = { workspace = true }
 
+# HTTP client for JWKS fetching
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# Base64 encoding for JWK keys
+base64 = "0.22"
+
 # Local dependencies
 common = { path = "../common" }
 proto-gen = { path = "../proto-gen" }
 
 [dev-dependencies]
 criterion = { workspace = true }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 gc-test-utils = { path = "../gc-test-utils" }
 anyhow = { workspace = true }
 http-body-util = "0.1"
+wiremock = "0.6"
+ring = { workspace = true }

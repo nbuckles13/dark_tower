@@ -36,16 +36,34 @@ Trigger this workflow:
 
 ## Reviewer Participation
 
-| Reviewer | Participation | Focus |
-|----------|--------------|-------|
-| Code Reviewer | Every review | Quality, idioms, maintainability |
-| Security Specialist | Every review | Vulnerabilities, crypto, auth |
-| Test Specialist | Every review | Coverage, test quality |
-| Observability Specialist | Every review | Logging, metrics, traces, SLOs |
-| Operations Specialist | Ops-related only | Deployments, migrations, configs, runbooks |
-| Infrastructure Specialist | Infra-related only | K8s, Terraform, Dockerfiles |
+| Reviewer | Participation | Focus | Blocking Behavior |
+|----------|--------------|-------|-------------------|
+| Code Reviewer | Every review | Quality, idioms, maintainability | All findings block |
+| Security Specialist | Every review | Vulnerabilities, crypto, auth | All findings block |
+| Test Specialist | Every review | Coverage, test quality | All findings block |
+| Observability Specialist | Every review | Logging, metrics, traces, SLOs | All findings block |
+| **DRY Reviewer** | Every review | Cross-service duplication | **Only BLOCKER blocks** |
+| Operations Specialist | Ops-related only | Deployments, migrations, configs, runbooks | All findings block |
+| Infrastructure Specialist | Infra-related only | K8s, Terraform, Dockerfiles | All findings block |
 
 **Ops-related changes**: Deployment scripts, database migrations, configuration changes, Kubernetes manifests, Terraform, CI/CD pipelines, credential handling.
+
+### DRY Reviewer Blocking Behavior
+
+The DRY Reviewer has **different blocking behavior** from other reviewers (see ADR-0019):
+
+| Severity | Trigger | Blocking? | Action |
+|----------|---------|-----------|--------|
+| 🔴 BLOCKER | Code EXISTS in `common` but wasn't used | **Yes** | Must fix before approval |
+| 🟠 CRITICAL | >90% similar to another service | No | Document as tech debt |
+| 🟡 MAJOR | 70-90% similar to another service | No | Document as tech debt |
+| 🟢 MINOR | 50-70% similar | No | Document as tech debt |
+
+**Why different?**
+- BLOCKER = Code already exists in `common` crate but wasn't imported (a mistake)
+- Non-BLOCKER = Code could be extracted to `common` (an opportunity, not a mistake)
+
+Non-BLOCKER findings are documented in the dev-loop output under "Tech Debt: Cross-Service Duplication" and result in follow-up tasks.
 
 ## Workflow Steps
 
@@ -219,6 +237,34 @@ This ensures reviewers apply both their domain expertise AND learned patterns/go
 - Network policy check
 - Issues categorized by severity (BLOCKER, HIGH, MEDIUM, LOW)
 
+#### Review G: DRY Reviewer Specialist
+
+**Focus**: Cross-service code duplication detection
+
+**Inputs**:
+- Specialist definition (`.claude/agents/dry-reviewer.md`)
+- List of changed files
+- Read-only access to ALL service crates
+
+**What to Look For**:
+1. **Function signatures**: Similar names or parameter patterns across services
+2. **Logic patterns**: Same algorithm implemented differently
+3. **Constants**: Duplicated magic numbers, size limits, timeout values
+4. **Structs/Types**: Similar data structures that could be shared
+5. **Error handling**: Identical error mapping patterns
+
+**Deliverables**:
+- Cross-service duplication findings
+- Similarity percentage estimates
+- Extraction recommendations
+- Issues categorized by severity (BLOCKER, CRITICAL, MAJOR, MINOR)
+
+**Blocking Behavior** (DIFFERENT from other reviewers):
+- **BLOCKER**: Must fix (code exists in `common` but wasn't used)
+- **CRITICAL/MAJOR/MINOR**: Document as tech debt, create follow-up task
+
+**See**: ADR-0019 for full rationale on blocking behavior
+
 ### Step 4: Synthesize Findings
 
 **Orchestrator Action**:
@@ -364,6 +410,24 @@ If specialists disagree:
 - Security boundaries
 - Resource sizing
 - Recommendations
+
+### DRY Review
+[DRY Reviewer findings summary]
+- Cross-service duplication detected
+- Similarity assessments
+- Extraction recommendations
+
+**Blocking findings** (must fix):
+- [Any BLOCKER findings - code exists in common but wasn't used]
+
+**Tech debt findings** (documented, fix later):
+- [CRITICAL/MAJOR/MINOR findings - opportunities for extraction]
+
+## Tech Debt: Cross-Service Duplication
+
+| Pattern | New Location | Existing Location | Severity | Follow-up Task |
+|---------|--------------|-------------------|----------|----------------|
+| [pattern] | `crates/X/src/file.rs:line` | `crates/Y/src/file.rs:line` | CRITICAL | Extract to common |
 
 ## ADR Compliance
 [Relevant ADRs and compliance status]
