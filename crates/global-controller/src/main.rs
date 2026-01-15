@@ -3,9 +3,11 @@
 //! Entry point for the Dark Tower video conferencing platform.
 //! Handles global routing, meeting discovery, and load balancing.
 
+mod auth;
 mod config;
 mod errors;
 mod handlers;
+mod middleware;
 mod models;
 mod routes;
 

@@ -216,3 +216,51 @@ GC Phase 1 defines enum variants and methods that won't be used until Phase 2+:
 These require `#[allow(dead_code)]` to prevent clippy warnings. Document the phase when they'll be used. This is intentional skeleton code - DO NOT remove these.
 
 Symptom: Adding a `#[test]` for a skeleton variant should also work fine; the test will be the only usage of that variant until Phase 2 implementation begins.
+
+---
+
+## Gotcha: JWT Size Boundary Off-by-One Errors
+**Added**: 2026-01-14
+**Related files**: `crates/global-controller/src/auth/jwt.rs`, `crates/global-controller/tests/auth_tests.rs`
+
+Size checks like "token.len() > 8192" can be error-prone:
+- `> 8192` means 8192 is accepted but 8193 is rejected (correct for 8KB limit)
+- `>= 8192` means 8192 is rejected (off by one - 8191 is max)
+- `> 8191` means 8192 is accepted (correct, but confusing - prefer `> 8192`)
+
+The gotcha: Tests that only check "small tokens pass, large tokens fail" won't catch off-by-one errors. You need explicit boundary tests:
+- Exactly at limit (should pass)
+- One byte over (should fail)
+
+Without these tests, an attacker could exploit an off-by-one to bypass the limit and cause DoS.
+
+---
+
+## Gotcha: Algorithm Confusion Tests Need Multiple Attack Vectors
+**Added**: 2026-01-14
+**Related files**: `crates/global-controller/tests/auth_tests.rs`
+
+Testing that "EdDSA tokens are accepted" is not enough. You must also test:
+1. **alg:none** - Attacker removes signature requirement (CVE-2016-10555)
+2. **alg:HS256** - Attacker uses symmetric algorithm (CVE-2017-11424)
+3. **Missing alg** - Attacker removes algorithm header
+
+Each attack vector can be exploited independently. Testing only "alg:none" won't catch "alg:HS256" vulnerabilities.
+
+---
+
+## Gotcha: JWK Structure Validation vs Signature Validation
+**Added**: 2026-01-14
+**Related files**: `crates/global-controller/src/auth/jwt.rs`
+
+Don't assume a JWK from a JWKS endpoint is valid just because it's in the endpoint response:
+- JWKS endpoint could be compromised
+- JWKS endpoint could be misconfigured
+- A man-in-the-middle could modify the response
+
+Always validate JWK structure BEFORE using it:
+- Check `kty` (key type) matches expected value
+- Check `alg` (if present) matches expected value
+- Check required fields are present (e.g., `x`, `y` for OKP/EdDSA)
+
+Silent failures here lead to accepting invalid signatures from the wrong key type.

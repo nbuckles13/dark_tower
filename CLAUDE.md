@@ -97,6 +97,7 @@ The platform consists of **five main components**:
 - `protocol` - Protocol Buffers, API contracts, versioning
 - `infrastructure` - Kubernetes, Terraform, IaC, cloud-agnostic platform
 - `code-reviewer` - Code quality, Rust idioms, ADR compliance
+- `dry-reviewer` - Cross-service duplication detection (see ADR-0019)
 
 **Cross-Cutting Specialists** (MANDATORY in ALL debates):
 - `test` - E2E tests, coverage, chaos testing, quality gates
@@ -349,9 +350,13 @@ For implementation tasks, follow the **Development Loop** workflow:
 
 1. **Specialist implements** with principles + dynamic knowledge injected
 2. **7-layer verification** runs automatically (check → fmt → guards → tests → clippy → semantic)
-3. **Code review** by Security, Test, and Code Quality specialists
+3. **Code review** by Security, Test, Code Quality, and DRY specialists
 4. **Reflection** captures learnings to specialist knowledge files
 5. **State checkpointing** enables recovery after context compression
+
+**Code review blocking behavior**:
+- Security, Test, Code Quality: ALL findings must be fixed
+- DRY Reviewer: Only BLOCKER blocks; non-BLOCKERs documented as tech debt (see ADR-0019)
 
 **Key Files**:
 - `.claude/workflows/development-loop.md` - Full workflow mechanics

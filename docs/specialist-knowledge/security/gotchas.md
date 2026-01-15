@@ -147,3 +147,19 @@ When testing JWKS endpoints for private key leakage, DON'T rely on typed deseria
 Setting a request timeout in the application (e.g., `tower_http::TimeoutLayer`) is insufficient if the database connection lacks a statement timeout. Attackers can still hang the database connection, exhausting the connection pool. ALWAYS set `statement_timeout` at the PostgreSQL connection level. This creates two independent timeouts: (1) DB-level statement timeout prevents hung queries, (2) Application-level request timeout prevents hung handlers. Both are necessary.
 
 ---
+
+## Gotcha: JWK Algorithm Mismatch Bypasses Token Validation
+**Added**: 2026-01-14
+**Related files**: `crates/global-controller/src/auth/jwt.rs`
+
+While JWT token validation checks `alg: EdDSA` in the token header, the JWKS JWK object may have inconsistent `kty` or `alg` fields. If a JWK with `kty: RSA` and `alg: RS256` is returned by the JWKS endpoint, and the validator doesn't check JWK fields, an attacker could potentially trick the validator into using the wrong key for the wrong algorithm (though signature verification would still fail). The defense is double-layered: (1) Token must have `alg: EdDSA`, (2) JWK must have `kty: OKP` and `alg: EdDSA`. Check BOTH during verification, not just one. A misconfigured JWKS endpoint serving wrong key types could bypass token-level checks if JWK fields aren't validated.
+
+---
+
+## Gotcha: JWKS HTTP Responses Lack Size Limits
+**Added**: 2026-01-14
+**Related files**: `crates/global-controller/src/auth/jwks.rs`
+
+JWKS endpoints can be exploited to consume memory by returning extremely large responses (gigabytes of data). If JWKS client doesn't limit response size, an attacker can OOM the application. Pattern: Implement response size cap (e.g., 1MB) in HTTP client or JWKS parsing. Test with oversized responses. This is documented as Phase 3+ hardening but not implemented in Phase 2 - flag as minor tech debt.
+
+---

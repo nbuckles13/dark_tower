@@ -83,3 +83,11 @@ Master keys via environment variables or secrets manager. Never in code/config f
 Production deployments with database queries MUST have both: (1) Application-level request timeout (e.g., 30 seconds), set in `TimeoutLayer`, (2) Database statement timeout (e.g., 5 seconds), configured via `statement_timeout` URL parameter. Verify both are in place in logs at startup. Alert if statement timeout is not configured - it's a DoS vulnerability. Recommend: statement timeout 5-10 seconds, request timeout 30 seconds. Tune based on expected query latency p99.
 
 ---
+
+## Integration: Global Controller - JWT/JWKS Validation Requirements
+**Added**: 2026-01-14
+**Related files**: `crates/global-controller/src/auth/jwt.rs`, `crates/global-controller/src/auth/jwks.rs`
+
+GC must validate JWTs from AC via JWKS endpoint. Security requirements: (1) Fetch JWKS from AC_JWKS_URL with caching (5 min TTL), (2) Validate token `alg` is `EdDSA`, (3) Extract `kid` and find matching JWK, (4) **Validate JWK fields**: `kty == "OKP"` and `alg == "EdDSA"` (critical for defense-in-depth), (5) Verify signature, (6) Check `iat` with clock skew tolerance, (7) Return generic error messages on failure (no "key not found" vs "invalid signature"). Phase 2 implements core validation. Phase 3+ adds HTTPS validation of JWKS endpoint and response size limits. Test with: valid tokens, expired tokens, wrong algorithm, algorithm confusion attacks, missing kid, size boundary tests.
+
+---

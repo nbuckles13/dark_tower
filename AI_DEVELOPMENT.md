@@ -206,10 +206,11 @@ Putting it all together, here's how a feature gets implemented:
                                  ▼
 ┌─────────────────────────────────────────────────────────────┐
 │  4. CODE REVIEW                                             │
-│     Three specialists review in parallel:                   │
+│     Four specialists review in parallel:                    │
 │     - Security Specialist (vulnerabilities, crypto)         │
 │     - Test Specialist (coverage, edge cases)                │
 │     - Code Quality Reviewer (idioms, maintainability)       │
+│     - DRY Reviewer (cross-service duplication detection)    │
 └────────────────────────────────┬────────────────────────────┘
                                  ▼
 ┌─────────────────────────────────────────────────────────────┐
