@@ -415,6 +415,11 @@ Please address ALL findings:
 
 After the specialist fixes and returns, orchestrator re-validates and re-runs code review.
 
+**Important**: After the specialist returns from fixing code review findings, the orchestrator MUST:
+1. Re-run verification (`./scripts/verify-completion.sh`) - this is step 3 in the flow
+2. Only if verification passes, re-run code review
+3. This ensures code changes made during fixes don't introduce new issues
+
 See `code-review.md` for full reviewer participation rules, synthesis process, and severity categories.
 
 ---
@@ -851,8 +856,9 @@ If user requests a different task while a dev-loop is in progress:
 
 1. Run reviewers in parallel (Security, Test, Code Reviewer, etc.)
 2. **Save agent IDs** for each reviewer
-3. If ANY findings → Resume implementing specialist with findings → back to validation
-4. If CLEAN → Continue to reflection
+3. If ANY findings → Resume implementing specialist with findings
+4. **After specialist fixes**: Re-run verification (`./scripts/verify-completion.sh`) → re-run code review
+5. If CLEAN → Continue to reflection
 
 ## Reflection (All Specialists Resumed)
 
