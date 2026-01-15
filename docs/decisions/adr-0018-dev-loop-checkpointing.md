@@ -1,6 +1,6 @@
 # ADR-0018: Dev-Loop Checkpointing and Restore
 
-**Status**: Proposed
+**Status**: Accepted
 
 **Date**: 2026-01-14
 

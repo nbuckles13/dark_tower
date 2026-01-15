@@ -15,6 +15,7 @@
 | Field | Value |
 |-------|-------|
 | Implementing Agent | `{agent_id}` |
+| Implementing Specialist | `{specialist-name}` |
 | Current Step | `{implementation|validation|code_review|reflection|complete}` |
 | Iteration | `{1-5}` |
 | Security Reviewer | `{agent_id or pending}` |
@@ -28,6 +29,7 @@
      - When step is code_review and all reviewers approve, MUST advance to reflection
      - Only mark complete after ALL reflections are done
      - Before switching to a new user request, check if Current Step != complete
+     - Each specialist writes to their own checkpoint file (see _template/specialist.md)
 -->
 
 ---
@@ -161,11 +163,11 @@
 ### DRY Reviewer
 **Verdict**: APPROVED / FINDINGS
 
-**Blocking findings** (BLOCKER - code exists in common but wasn't used):
-{List any BLOCKERs that must be fixed, or "None"}
+**Blocking findings** (BLOCKING - code exists in common but wasn't used):
+{List any BLOCKINGs that must be fixed, or "None"}
 
-**Tech debt findings** (non-blocking - opportunities for extraction):
-{List CRITICAL/MAJOR/MINOR findings documented below, or "None"}
+**Tech debt findings** (TECH_DEBT - opportunities for extraction):
+{List findings documented below, or "None"}
 
 {Add other reviewers as applicable: Observability, Operations, Infrastructure}
 

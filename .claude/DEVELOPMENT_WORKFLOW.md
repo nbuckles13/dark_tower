@@ -201,9 +201,39 @@ At the beginning of each session:
 - [ ] Read this file
 - [ ] Review specialist agent definitions (`.claude/agents/`)
 - [ ] Check existing ADRs (`docs/decisions/`)
-- [ ] **Check for incomplete dev-loops** in `docs/dev-loop-outputs/` (look for `Current Step` != `complete`)
+- [ ] **Check for incomplete dev-loops** (see procedure below)
 - [ ] Understand current todo list
 - [ ] Identify which specialists needed for today's work
+
+### Checking for Incomplete Dev-Loops
+
+**Procedure**:
+1. Scan `docs/dev-loop-outputs/` for directories (not single `.md` files)
+2. For each directory, check `main.md` for the Loop State section
+3. If `Current Step` is NOT `complete`, offer restore to user
+
+**Restore prompt**:
+```
+Found incomplete dev-loop: {task-slug}
+- Current step: {step}
+- Iteration: {iteration}
+- Implementing specialist: {name from Loop State}
+
+Checkpoint files available:
+- {list .md files in directory besides main.md}
+
+Restore and continue? (Specialists will be re-invoked with checkpoint context)
+```
+
+**If user accepts restore**:
+1. Read all checkpoint files in the directory
+2. Re-invoke specialists with their checkpoint content as context
+3. Continue from the interrupted step
+4. See `.claude/workflows/development-loop.md` Part 10 for restore context template
+
+**If user declines restore**:
+- Continue with new work
+- Incomplete dev-loop can be resumed later or abandoned
 
 ## Contextual Injection
 
@@ -268,6 +298,7 @@ Task(
 - **ADR-0015** - Principles & guards methodology
 - **ADR-0016** - Development loop design (specialist-owned verification)
 - **ADR-0017** - Specialist knowledge architecture (dynamic knowledge files)
+- **ADR-0018** - Dev-loop checkpointing and restore (session recovery)
 
 ---
 
