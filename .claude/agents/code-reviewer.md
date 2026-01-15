@@ -168,6 +168,28 @@ let hash = bcrypt::hash(password, 12)?;
 - Note placeholder implementations
 - Identify areas needing refactor before new features
 
+### 7. Temporary Code Detection
+
+Detect code that exists for phased development but should be removed later:
+
+**Detection Triggers**:
+- Comments containing: `TEMPORARY`, `TODO: remove`, `scaffolding`, `test-only`, `placeholder`
+- Code that exists solely to support phased development
+- Debug endpoints or test-only APIs in production code
+- Placeholder implementations marked for replacement
+
+**Output**: Report as `TECH_DEBT` severity (non-blocking)
+
+**Example Finding**:
+```markdown
+### 📋 TECH_DEBT: Temporary Code
+
+1. **Test endpoint /v1/me** - `handlers/me.rs:1`
+   - **Type**: Temporary endpoint
+   - **Reason**: Added for Phase 2 testing, should be removed when real endpoints exist
+   - **Action**: Document in Tech Debt section for follow-up removal
+```
+
 ## Review Severity Levels
 
 **BLOCKER** 🔴:
@@ -202,6 +224,11 @@ let hash = bcrypt::hash(password, 12)?;
 - Future enhancements
 - Best practice recommendations
 - No action required
+
+**TECH_DEBT** 📋:
+- Temporary code that should be removed later
+- Scaffolding for phased development
+- **Does NOT block** - documented for follow-up
 
 ## Output Format
 

@@ -1,6 +1,9 @@
 //! Current user handler.
 //!
 //! Returns information about the authenticated user/service from JWT claims.
+//!
+//! **TEMPORARY**: This endpoint exists for Phase 2 auth middleware testing.
+//! Remove when real GC endpoints (meeting management, etc.) are implemented.
 
 use crate::auth::Claims;
 use axum::{Extension, Json};

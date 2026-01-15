@@ -53,18 +53,16 @@ During code review, search for patterns in the new/modified code that already ex
 
 | Severity | Trigger | Blocking? | Example |
 |----------|---------|-----------|---------|
-| 🔴 BLOCKER | Code EXISTS in `common` but wasn't used | **Yes** | New service defines `SecretString` when `common::secret` exports it |
-| 🟠 CRITICAL | >90% similar to another service | No | GC's `extract_kid` identical to AC's `extract_jwt_kid` |
-| 🟡 MAJOR | 70-90% similar to another service | No | Similar validation logic with minor differences |
-| 🟢 MINOR | 50-70% similar | No | Same pattern, different enough to warrant awareness |
+| 🔴 BLOCKING | Code EXISTS in `common` but wasn't used | **Yes** | New service defines `SecretString` when `common::secret` exports it |
+| 📋 TECH_DEBT | Similar code exists in another service | **No** | GC's `extract_kid` similar to AC's `extract_jwt_kid` |
 
-### BLOCKER vs Non-BLOCKER
+### BLOCKING vs TECH_DEBT
 
-**BLOCKER** (must fix before approval):
+**BLOCKING** (must fix before approval):
 - Code that already exists in `common` crate but wasn't imported
 - This is a mistake, not a design choice
 
-**Non-BLOCKER** (document as tech debt):
+**TECH_DEBT** (document for follow-up):
 - Code that exists in another service but not yet in `common`
 - This is an opportunity for extraction, not a mistake
 - Current task completes; follow-up task created for extraction
@@ -86,8 +84,8 @@ During code review, search for patterns in the new/modified code that already ex
 
 **Recommendation**:
 {One of:}
-- BLOCKER: Import from `common::{module}` instead of reimplementing
-- Non-BLOCKER: Create follow-up task to extract to `common` crate
+- BLOCKING: Import from `common::{module}` instead of reimplementing
+- TECH_DEBT: Create follow-up task to extract to `common` crate
 ```
 
 ### Summary Format
@@ -97,43 +95,36 @@ During code review, search for patterns in the new/modified code that already ex
 
 | Severity | Count | Blocking? |
 |----------|-------|-----------|
-| BLOCKER | {N} | Yes |
-| CRITICAL | {N} | No |
-| MAJOR | {N} | No |
-| MINOR | {N} | No |
+| BLOCKING | {N} | Yes |
+| TECH_DEBT | {N} | No |
 
 **Verdict**: {APPROVED | NOT APPROVED}
-- APPROVED if no BLOCKERs (non-blocking findings documented as tech debt)
-- NOT APPROVED if any BLOCKERs exist
+- APPROVED if no BLOCKING findings (TECH_DEBT documented for follow-up)
+- NOT APPROVED if any BLOCKING findings exist
 ```
 
 ---
 
 ## Integration with Dev-Loop
 
-### Different Blocking Behavior
+### Blocking Behavior
 
-You are different from other reviewers:
+The dev-loop uses severity-based blocking:
+- **BLOCKING** findings → Must fix before approval
+- **TECH_DEBT** findings → Documented, don't block
 
-| Reviewer | Blocking Behavior |
-|----------|-------------------|
-| Security | ALL findings must be fixed |
-| Test | ALL findings must be fixed |
-| Code Quality | ALL findings must be fixed |
-| **You (DRY)** | Only BLOCKER blocks |
-
-Non-BLOCKER findings are documented in the dev-loop output under "Tech Debt: Cross-Service Duplication" and result in follow-up tasks.
+TECH_DEBT findings are documented in the dev-loop output under "Tech Debt" and result in follow-up tasks.
 
 ### Tech Debt Documentation
 
-When you report non-BLOCKER findings, include:
+When you report TECH_DEBT findings, include:
 
 ```markdown
 ## Tech Debt: Cross-Service Duplication
 
-| Pattern | New Location | Existing Location | Severity | Follow-up Task |
-|---------|--------------|-------------------|----------|----------------|
-| `extract_kid` | `gc/auth/jwt.rs:127` | `ac/crypto/mod.rs:285` | CRITICAL | Extract JWT utils to common |
+| Pattern | New Location | Existing Location | Follow-up Task |
+|---------|--------------|-------------------|----------------|
+| `extract_kid` | `gc/auth/jwt.rs:127` | `ac/crypto/mod.rs:285` | Extract JWT utils to common |
 ```
 
 ---

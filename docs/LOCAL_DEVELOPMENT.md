@@ -64,10 +64,14 @@ brew install podman
 # Verify
 podman --version
 
-# Optional: Create docker alias
+# Recommended: Create docker alias for compatibility
 alias docker='podman'
+alias docker-compose='podman-compose'
 echo "alias docker='podman'" >> ~/.bashrc
+echo "alias docker-compose='podman-compose'" >> ~/.bashrc
 ```
+
+> **Note**: The docker alias is recommended because Claude agents will frequently use `docker` commands instead of `podman`. Without this alias, you'll encounter permission prompts or failed commands during AI-assisted development.
 
 **Why Podman?**
 - **Rootless**: Better security, no daemon running as root

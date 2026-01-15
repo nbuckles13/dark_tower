@@ -171,15 +171,25 @@
 
 ---
 
-## Tech Debt: Cross-Service Duplication
+## Tech Debt
 
-<!-- Document non-blocking DRY findings here. These are tracked for follow-up tasks. -->
+<!-- Document all TECH_DEBT findings here. These are non-blocking and tracked for follow-up. -->
 
-| Pattern | New Location | Existing Location | Severity | Follow-up Task |
-|---------|--------------|-------------------|----------|----------------|
-| {pattern name} | `crates/X/src/file.rs:line` | `crates/Y/src/file.rs:line` | CRITICAL/MAJOR/MINOR | {Extraction task} |
+### Cross-Service Duplication (from DRY Reviewer)
+
+| Pattern | New Location | Existing Location | Follow-up Task |
+|---------|--------------|-------------------|----------------|
+| {pattern name} | `crates/X/src/file.rs:line` | `crates/Y/src/file.rs:line` | {Extraction task} |
 
 {Or "No cross-service duplication detected" if DRY review found nothing}
+
+### Temporary Code (from Code Reviewer)
+
+| Item | Location | Reason | Follow-up Task |
+|------|----------|--------|----------------|
+| {endpoint/function} | `path/to/file.rs:line` | {Why it's temporary} | {Remove when X} |
+
+{Or "No temporary code detected" if Code Reviewer found nothing}
 
 ---
 
