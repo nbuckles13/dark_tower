@@ -82,7 +82,7 @@ The result was a more robust design than any single specialist would have produc
 Each specialist maintains **knowledge files** that compound over time:
 
 ```
-.claude/agents/{specialist}/
+docs/specialist-knowledge/{specialist}/
 ├── patterns.md      # What works well
 ├── gotchas.md       # Pitfalls to avoid
 └── integration.md   # How to work with other components

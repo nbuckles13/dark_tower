@@ -99,7 +99,7 @@ Run specialists in parallel (multiple Task tool calls in a single message).
 **Context Injection for Each Reviewer**:
 Each reviewer receives:
 1. Their specialist definition (`.claude/agents/{specialist}.md`)
-2. Their accumulated knowledge files (`.claude/agents/{specialist}/*.md` if they exist)
+2. Their accumulated knowledge files (`docs/specialist-knowledge/{specialist}/*.md` if they exist)
 3. Relevant ADRs and principles
 4. The change context and files to review
 
@@ -110,7 +110,7 @@ This ensures reviewers apply both their domain expertise AND learned patterns/go
 **Focus**: Code quality, maintainability, Rust best practices
 
 **Inputs**:
-- Specialist definition + accumulated knowledge (`.claude/agents/code-reviewer/`)
+- Specialist definition + accumulated knowledge (`docs/specialist-knowledge/code-reviewer/`)
 - List of changed files
 - Relevant ADRs (for API design, error handling patterns)
 - Change context
@@ -128,7 +128,7 @@ This ensures reviewers apply both their domain expertise AND learned patterns/go
 **Focus**: Security vulnerabilities, cryptographic correctness, authentication/authorization
 
 **Inputs**:
-- Specialist definition + accumulated knowledge (`.claude/agents/security/`)
+- Specialist definition + accumulated knowledge (`docs/specialist-knowledge/security/`)
 - List of changed files
 - Relevant ADRs (security, authentication)
 - Security-focused context
@@ -147,7 +147,7 @@ This ensures reviewers apply both their domain expertise AND learned patterns/go
 **Focus**: Test coverage, test quality, edge cases
 
 **Inputs**:
-- Specialist definition + accumulated knowledge (`.claude/agents/test/`)
+- Specialist definition + accumulated knowledge (`docs/specialist-knowledge/test/`)
 - List of changed files
 - Test files
 - Coverage reports (if available)
@@ -166,7 +166,7 @@ This ensures reviewers apply both their domain expertise AND learned patterns/go
 **Focus**: Logging, metrics, tracing, SLO impact
 
 **Inputs**:
-- Specialist definition + accumulated knowledge (`.claude/agents/observability/`)
+- Specialist definition + accumulated knowledge (`docs/specialist-knowledge/observability/`)
 - List of changed files
 - Relevant ADRs (observability, SLOs)
 - Observability-focused context
@@ -186,7 +186,7 @@ This ensures reviewers apply both their domain expertise AND learned patterns/go
 **Focus**: Deployment safety, operational readiness, runbook updates
 
 **Inputs**:
-- Specialist definition + accumulated knowledge (`.claude/agents/operations/`)
+- Specialist definition + accumulated knowledge (`docs/specialist-knowledge/operations/`)
 - List of changed files
 - Migration files
 - Configuration changes
@@ -207,7 +207,7 @@ This ensures reviewers apply both their domain expertise AND learned patterns/go
 **Focus**: Portability, security boundaries, resource sizing
 
 **Inputs**:
-- Specialist definition + accumulated knowledge (`.claude/agents/infrastructure/`)
+- Specialist definition + accumulated knowledge (`docs/specialist-knowledge/infrastructure/`)
 - List of changed files
 - Infrastructure files
 - Cloud provider configurations

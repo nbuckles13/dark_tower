@@ -31,8 +31,8 @@ As the Dark Tower codebase grows, specialists face increasing cognitive load:
 ### Architecture
 
 ```
-.claude/agents/auth-controller.md           <- Static core (human-controlled)
-.claude/agents/auth-controller/             <- Dynamic knowledge (specialist-maintained)
+.claude/agents/auth-controller.md               <- Static core (human-controlled)
+docs/specialist-knowledge/auth-controller/      <- Dynamic knowledge (specialist-maintained)
   ├── patterns.md                           <- "Here's how we do X"
   ├── gotchas.md                            <- "Watch out for Y"
   └── integration.md                        <- "When calling Z, remember..."
@@ -55,7 +55,7 @@ When building specialist prompts, inject context in this order:
 
 1. Specialist definition (`.claude/agents/{specialist}.md`)
 2. Matched principles (`docs/principles/`)
-3. Specialist knowledge (`.claude/agents/{specialist}/*.md` if exists)
+3. Specialist knowledge (`docs/specialist-knowledge/{specialist}/*.md` if exists)
 4. Design context (ADR summary if from debate)
 5. Task context (actual task and existing patterns)
 
@@ -93,7 +93,7 @@ After code review is clean but before exiting the development loop:
 
 When a specialist reflects for the first time (no knowledge directory exists):
 
-1. Specialist creates `.claude/agents/{specialist}/` directory
+1. Specialist creates `docs/specialist-knowledge/{specialist}/` directory
 2. Creates initial `patterns.md`, `gotchas.md`, `integration.md`
 3. Populates with knowledge based on existing code and the task just completed
 4. User sees new files in git diff and can review/approve
@@ -111,7 +111,7 @@ When a specialist reflects for the first time (no knowledge directory exists):
 
 ### Negative
 
-- **File management overhead**: More files in `.claude/agents/`
+- **File management overhead**: More files in `docs/specialist-knowledge/`
 - **Potential staleness**: Knowledge could become outdated if not pruned
 - **Initial bootstrap**: First reflection takes longer as specialists seed their knowledge
 - **Review burden**: User must review knowledge updates along with code
@@ -156,9 +156,9 @@ Keep specialists stateless, rely only on static definitions.
 ### Knowledge Directories
 
 Created on-demand by specialists during their first reflection:
-- `.claude/agents/{specialist}/patterns.md`
-- `.claude/agents/{specialist}/gotchas.md`
-- `.claude/agents/{specialist}/integration.md`
+- `docs/specialist-knowledge/{specialist}/patterns.md`
+- `docs/specialist-knowledge/{specialist}/gotchas.md`
+- `docs/specialist-knowledge/{specialist}/integration.md`
 
 ### Rollout
 

@@ -369,7 +369,7 @@ For implementation tasks, follow the **Development Loop** workflow:
 Each specialist accumulates learnings in dynamic knowledge files:
 
 ```
-.claude/agents/{specialist}/
+docs/specialist-knowledge/{specialist}/
 ├── patterns.md      # What works well (successful approaches)
 ├── gotchas.md       # What to avoid (pitfalls encountered)
 └── integration.md   # How to work with other components

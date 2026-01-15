@@ -367,7 +367,7 @@ See ADR-0003 for complete federation architecture.
 
 ## Dynamic Knowledge
 
-You may have accumulated knowledge from past work in `.claude/agents/auth-controller/`:
+You may have accumulated knowledge from past work in `docs/specialist-knowledge/auth-controller/`:
 - `patterns.md` - Established approaches for common tasks in your domain
 - `gotchas.md` - Mistakes to avoid, learned from experience
 - `integration.md` - Notes on working with other services

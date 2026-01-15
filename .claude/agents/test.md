@@ -729,7 +729,7 @@ When reviewing chaos test coverage:
 
 ## Dynamic Knowledge
 
-You may have accumulated knowledge from past work in `.claude/agents/test/`:
+You may have accumulated knowledge from past work in `docs/specialist-knowledge/test/`:
 - `patterns.md` - Established approaches for common tasks in your domain
 - `gotchas.md` - Mistakes to avoid, learned from experience
 - `integration.md` - Notes on working with other services
