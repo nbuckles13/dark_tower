@@ -225,3 +225,148 @@ for key in jwks_value["keys"].as_array().unwrap() {
 }
 ```
 Fetch raw JSON to check all fields - typed deserialization may skip unknown fields.
+
+---
+
+## Pattern: Test Server Harness for E2E HTTP Testing
+**Added**: 2026-01-14
+**Related files**: `crates/gc-test-utils/src/server_harness.rs`, `crates/global-controller/tests/health_tests.rs`
+
+For HTTP service E2E testing, create a reusable server harness that:
+1. Spawns a real HTTP server on a random available port (127.0.0.1:0)
+2. Provides access to the database pool for assertions
+3. Implements Drop for automatic cleanup
+4. Uses `#[sqlx::test(migrations = "...")]` for database setup
+
+```rust
+pub struct TestGcServer {
+    addr: SocketAddr,
+    pool: PgPool,
+    _handle: JoinHandle<()>,
+}
+
+impl TestGcServer {
+    pub async fn spawn(pool: PgPool) -> Result<Self, anyhow::Error> {
+        // 1. Create config from test vars
+        let config = Config::from_vars(&test_vars)?;
+
+        // 2. Build app state and routes
+        let app = routes::build_routes(Arc::new(AppState { pool, config }));
+
+        // 3. Bind to random port
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+
+        // 4. Spawn server in background
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service()).await.ok()
+        });
+
+        Ok(Self { addr, pool, _handle: handle })
+    }
+
+    pub fn url(&self) -> String {
+        format!("http://{}", self.addr)
+    }
+}
+```
+
+Usage in tests:
+```rust
+#[sqlx::test(migrations = "../../migrations")]
+async fn test_endpoint(pool: PgPool) -> Result<(), anyhow::Error> {
+    let server = TestGcServer::spawn(pool).await?;
+    let client = reqwest::Client::new();
+    let response = client.get(&format!("{}/v1/health", server.url())).send().await?;
+    assert_eq!(response.status(), 200);
+    Ok(())
+}
+```
+
+Key benefits:
+- Real HTTP server, not mocked
+- Runs database migrations automatically (via sqlx::test)
+- Random ports prevent conflicts in parallel test execution
+- Drop impl ensures server stops on test completion
+- Direct database pool access for assertions
+
+---
+
+## Pattern: Manual Debug Redaction Alternative
+**Added**: 2026-01-14
+**Related files**: `crates/global-controller/src/config.rs`
+
+For sensitive configuration that doesn't use SecretBox/SecretString, implement manual Debug:
+```rust
+impl fmt::Debug for Config {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Config")
+            .field("public_field", &self.public_field)
+            .field("secret_field", &"[REDACTED]")  // Redact sensitive
+            .finish()
+    }
+}
+```
+
+Test this pattern:
+```rust
+#[test]
+fn test_debug_redacts_secrets() {
+    let config = Config { ..., secret_field: "actual_secret" };
+    let debug = format!("{:?}", config);
+
+    assert!(debug.contains("[REDACTED]"));
+    assert!(!debug.contains("actual_secret"));
+}
+```
+
+This is appropriate for simple config values that don't need zeroizing. SecretBox/SecretString is preferred for cryptographic material.
+
+---
+
+## Pattern: Serde skip_serializing_if for Optional Response Fields
+**Added**: 2026-01-14
+**Related files**: `crates/global-controller/src/models/mod.rs`
+
+For API responses with optional fields, use `#[serde(skip_serializing_if = "Option::is_none")]` to omit None fields from JSON. Test both cases:
+
+```rust
+#[derive(Serialize)]
+pub struct HealthResponse {
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub database: Option<String>,
+}
+```
+
+Tests:
+```rust
+#[test]
+fn test_serialization_without_optional() {
+    let response = HealthResponse {
+        status: "ok".into(),
+        database: None,
+    };
+    let json = serde_json::to_string(&response).unwrap();
+    assert!(!json.contains("database"));  // Field omitted!
+}
+
+#[test]
+fn test_serialization_with_optional() {
+    let response = HealthResponse {
+        status: "ok".into(),
+        database: Some("healthy".into()),
+    };
+    let json = serde_json::to_string(&response).unwrap();
+    assert!(json.contains("database"));
+}
+
+#[test]
+fn test_deserialization_missing_optional() {
+    let json = r#"{"status":"ok"}"#;
+    let response: HealthResponse = serde_json::from_str(json).unwrap();
+    assert_eq!(response.database, None);
+}
+```
+
+Essential for REST APIs to maintain clean JSON and avoid breaking clients when adding optional fields.

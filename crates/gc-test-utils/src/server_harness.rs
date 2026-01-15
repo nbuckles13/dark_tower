@@ -1,0 +1,171 @@
+//! Test server harness for E2E testing
+//!
+//! Provides `TestGcServer` for spawning real GC server instances in tests.
+
+use global_controller::config::Config;
+use global_controller::routes::{self, AppState};
+use sqlx::PgPool;
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use tokio::task::JoinHandle;
+
+/// Test harness for spawning Global Controller server in E2E tests.
+///
+/// # Example
+/// ```rust,ignore
+/// #[sqlx::test(migrations = "../../migrations")]
+/// async fn test_health_flow_e2e(pool: PgPool) -> Result<()> {
+///     let server = TestGcServer::spawn(pool).await?;
+///     let client = reqwest::Client::new();
+///
+///     let response = client
+///         .get(&format!("{}/v1/health", server.url()))
+///         .send()
+///         .await?;
+///
+///     assert_eq!(response.status(), 200);
+///     Ok(())
+/// }
+/// ```
+pub struct TestGcServer {
+    addr: SocketAddr,
+    pool: PgPool,
+    config: Config,
+    _handle: JoinHandle<()>,
+}
+
+impl TestGcServer {
+    /// Spawn a new test server instance with isolated database.
+    ///
+    /// The server will:
+    /// - Bind to a random available port (127.0.0.1:0)
+    /// - Start the HTTP server in the background
+    ///
+    /// # Arguments
+    /// * `pool` - Database connection pool (typically from `#[sqlx::test]`)
+    ///
+    /// # Returns
+    /// * `Ok(TestGcServer)` - Running server instance
+    /// * `Err(anyhow::Error)` - If server spawn fails
+    pub async fn spawn(pool: PgPool) -> Result<Self, anyhow::Error> {
+        // Build configuration for test environment
+        let vars = HashMap::from([
+            (
+                "DATABASE_URL".to_string(),
+                "postgresql://test/test".to_string(),
+            ),
+            ("BIND_ADDRESS".to_string(), "127.0.0.1:0".to_string()),
+            ("GC_REGION".to_string(), "test-region".to_string()),
+            (
+                "AC_JWKS_URL".to_string(),
+                "http://localhost:8082/.well-known/jwks.json".to_string(),
+            ),
+        ]);
+
+        let config = Config::from_vars(&vars)
+            .map_err(|e| anyhow::anyhow!("Failed to create config: {}", e))?;
+
+        // Create application state
+        let state = Arc::new(AppState {
+            pool: pool.clone(),
+            config: config.clone(),
+        });
+
+        // Build routes using global-controller's real route builder
+        let app = routes::build_routes(state);
+
+        // Bind to random port
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to bind test server: {}", e))?;
+
+        let addr = listener
+            .local_addr()
+            .map_err(|e| anyhow::anyhow!("Failed to get local address: {}", e))?;
+
+        // Spawn server in background
+        let handle = tokio::spawn(async move {
+            // Use into_make_service_with_connect_info to support SocketAddr extraction
+            let make_service = app.into_make_service_with_connect_info::<SocketAddr>();
+            if let Err(e) = axum::serve(listener, make_service).await {
+                eprintln!("Test server error: {}", e);
+            }
+        });
+
+        Ok(Self {
+            addr,
+            pool,
+            config,
+            _handle: handle,
+        })
+    }
+
+    /// Get reference to the database pool.
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
+    /// Get the base URL of the test server.
+    pub fn url(&self) -> String {
+        format!("http://{}", self.addr)
+    }
+
+    /// Get the socket address.
+    pub fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+
+    /// Get reference to the server configuration.
+    pub fn config(&self) -> &Config {
+        &self.config
+    }
+}
+
+impl Drop for TestGcServer {
+    fn drop(&mut self) {
+        // Explicitly abort the HTTP server task to ensure immediate cleanup
+        // when the test completes. This stops the server gracefully.
+        self._handle.abort();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_server_spawns_successfully(pool: PgPool) -> Result<(), anyhow::Error> {
+        let server = TestGcServer::spawn(pool).await?;
+
+        // Verify server is accessible
+        assert!(server.url().starts_with("http://127.0.0.1:"));
+
+        // Verify health endpoint works
+        let response = reqwest::get(&format!("{}/v1/health", server.url())).await?;
+        assert_eq!(response.status(), 200);
+
+        // Verify response body
+        let body: serde_json::Value = response.json().await?;
+        assert_eq!(body["status"], "healthy");
+        assert_eq!(body["region"], "test-region");
+        assert_eq!(body["database"], "healthy");
+
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_server_provides_pool_access(pool: PgPool) -> Result<(), anyhow::Error> {
+        let server = TestGcServer::spawn(pool.clone()).await?;
+
+        // Verify we can access the pool
+        let pool_ref = server.pool();
+
+        // Execute a simple query to verify pool works
+        let result: (i32,) = sqlx::query_as("SELECT 1").fetch_one(pool_ref).await?;
+
+        assert_eq!(result.0, 1);
+
+        Ok(())
+    }
+}

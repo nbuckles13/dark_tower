@@ -165,3 +165,50 @@ Organize tests by feature flag based on infrastructure requirements:
 - `#![cfg(feature = "resilience")]` - Chaos/resilience tests requiring cluster access
 
 Each test file declares exactly one feature gate at the module level. This prevents accidental execution in `cargo test --workspace` while enabling selective test runs in CI.
+
+---
+
+## Pattern: Test Harness with Real Server Instance (Arc + JoinHandle)
+**Added**: 2026-01-14
+**Related files**: `crates/gc-test-utils/src/server_harness.rs`
+
+For E2E testing, create a test harness that spawns a real service instance:
+1. Use `Arc<AppState>` to wrap shared state (DB pool, config)
+2. Spawn the HTTP server in background via `tokio::spawn()` and hold the `JoinHandle`
+3. Return a wrapper struct (e.g., `TestGcServer`) that provides accessor methods (`url()`, `pool()`, `config()`)
+4. Implement `Drop` to explicitly `abort()` the background task for immediate cleanup
+5. Support test-specific config via `from_vars()` with sensible defaults
+6. Document in examples and comprehensive self-test that verifies spawning works
+
+Benefits: Tests the full integration with real networking, real database pool, real middleware (tracing, timeouts).
+
+---
+
+## Pattern: Module-Level Architecture Documentation
+**Added**: 2026-01-14
+**Related files**: `crates/global-controller/src/lib.rs`
+
+Document the overall service architecture in the library crate's module doc comment:
+1. State what the service does (meeting management, API gateway, etc.)
+2. Explain the responsibility breakdown (config, handlers, models, routes)
+3. Show the data flow diagram (routes -> handlers -> services -> repositories)
+4. List all modules with brief descriptions
+5. This becomes the single source of truth for how the crate is organized
+
+This helps new contributors quickly understand the codebase structure without hunting through files.
+
+---
+
+## Pattern: Health Check That Reports Status Without Erroring
+**Added**: 2026-01-14
+**Related files**: `crates/global-controller/src/handlers/health.rs`
+
+Health checks for Kubernetes readiness/liveness probes should:
+1. Always return HTTP 200 (no error status)
+2. Include a `status` field ("healthy" or "unhealthy") in response body
+3. Include probe-specific sub-statuses (e.g., `database` field)
+4. Ping critical dependencies (database, cache) but don't fail the request if they're down
+5. Use `is_ok()` for probe calls, not `?` operator
+6. Let K8s interpret the response body to make routing decisions
+
+This allows K8s to see unhealthy services and stop routing traffic, but doesn't cause the probe to timeout.

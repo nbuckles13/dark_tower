@@ -14,7 +14,7 @@ workspace = true
 tokio = { workspace = true }
 axum = { workspace = true }
 tower = { workspace = true }
-tower-http = { workspace = true }
+tower-http = { workspace = true, features = ["trace", "timeout"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sqlx = { workspace = true }
@@ -34,3 +34,7 @@ proto-gen = { path = "../proto-gen" }
 
 [dev-dependencies]
 criterion = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+gc-test-utils = { path = "../gc-test-utils" }
+anyhow = { workspace = true }
+http-body-util = "0.1"

@@ -41,3 +41,35 @@ Before starting review, verify: (1) no unwrap/expect/panic in production paths, 
 **Related files**: `docs/decisions/`
 
 Cross-reference code changes against existing ADRs. Key ADRs: ADR-0002 (no-panic policy), ADR-0003 (error handling). Flag violations as MAJOR findings requiring remediation before approval.
+
+---
+
+## Integration: Global Controller Service Foundation
+**Added**: 2026-01-14
+**Related files**: `crates/global-controller/`
+
+GC Phase 1 establishes the foundation for HTTP/3 API gateway. Key patterns for future reviewers:
+1. Config loads from environment with sensible defaults (`from_vars()` for testing)
+2. AppState holds shared resources (Arc<PgPool>, Config) - must all implement Clone
+3. Handlers use State extractor, delegate to services/repositories (not yet implemented)
+4. Error handling maps to HTTP status codes via impl From<GcError> for StatusCode
+5. Health checks always return 200 with status field - never error on probe failure
+6. Test harness spawns real server instance with JoinHandle for cleanup
+
+When reviewing future GC features (meeting APIs, rate limiting, etc.), ensure they follow these established patterns.
+
+---
+
+## Integration: Test Harness Patterns
+**Added**: 2026-01-14
+**Related files**: `crates/gc-test-utils/src/server_harness.rs`
+
+The GC test harness is reusable for all GC integration tests. Future test specs should:
+1. Import TestGcServer from gc-test-utils
+2. Use `#[sqlx::test(migrations = "../../migrations")]` to get a real database
+3. Call `TestGcServer::spawn(pool).await?` to get a running server
+4. Use `server.url()` for HTTP requests
+5. Use `server.pool()` for database queries
+6. Don't worry about cleanup - Drop impl handles it
+
+This pattern is similar to ac-test-utils' `TestAcServer` if it exists, or establishes the pattern for future services.

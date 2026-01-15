@@ -123,3 +123,11 @@ JWT header injection attacks are implicitly prevented by signature validation. W
 When invoking external commands (kubectl, etc.) from Rust, use `Command::new("cmd").args([...])` with explicit argument arrays, NOT shell string concatenation. This prevents shell metacharacter injection. Even if namespace/input values are controlled, this pattern is defense-in-depth. Example: `Command::new("kubectl").args(["get", "pod", &name, &format!("--namespace={}", ns)])` - the namespace cannot break out of its argument position.
 
 ---
+
+## Pattern: Query Timeout via Connection URL Parameters
+**Added**: 2026-01-14
+**Related files**: `crates/global-controller/src/main.rs`
+
+Prevent hung queries and DoS attacks by setting database statement_timeout at connection time, not per-query. Pattern: append `?options=-c%20statement_timeout%3D{seconds}` to the PostgreSQL connection URL. This ensures ALL queries timeout after N seconds, preventing resource exhaustion. Combine with application-level request timeout (e.g., 30s via `tower_http::TimeoutLayer`) for defense-in-depth. Set timeout low enough (e.g., 5 seconds) to catch expensive operations, high enough for legitimate slow queries. Timeout value should be logged at startup for observability.
+
+---

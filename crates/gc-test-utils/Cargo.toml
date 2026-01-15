@@ -1,0 +1,45 @@
+[package]
+name = "gc-test-utils"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Note: gc-test-utils is a test utility library providing assertion helpers.
+# Test assertion methods intentionally use unwrap/expect/panic to fail tests.
+# Unlike production crates, this crate does NOT inherit workspace lints because
+# test utilities need to use unwrap/expect/panic for assertions.
+
+[dependencies]
+# Async runtime
+tokio = { workspace = true }
+
+# Database
+sqlx = { workspace = true }
+
+# HTTP testing
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true, features = ["trace", "timeout"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Utilities
+uuid = { workspace = true }
+chrono = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+# Local dependencies
+global-controller = { path = "../global-controller" }
+common = { path = "../common" }
+
+[lib]
+name = "gc_test_utils"
+path = "src/lib.rs"

@@ -133,3 +133,76 @@ Missing (documented for future work):
 - Expired token rejection (requires time manipulation or waiting)
 - Token size limits (>8KB rejection)
 - Audience validation edge cases
+
+---
+
+## For Global Controller Specialist: HTTP Endpoint Tests
+**Added**: 2026-01-14
+**Related files**: `crates/global-controller/tests/health_tests.rs`, `crates/gc-test-utils/src/server_harness.rs`
+
+When testing GC HTTP endpoints:
+1. Use `TestGcServer::spawn(pool)` for real HTTP server testing
+2. Use `#[sqlx::test(migrations = "../../migrations")]` on each test for database isolation
+3. Test response status codes AND response bodies (JSON structure)
+4. Verify response headers (Content-Type, authentication headers, etc.)
+5. Consider both happy path and error responses
+
+Example test structure:
+```rust
+#[sqlx::test(migrations = "../../migrations")]
+async fn test_endpoint(pool: PgPool) -> Result<(), anyhow::Error> {
+    let server = TestGcServer::spawn(pool).await?;
+    let client = reqwest::Client::new();
+
+    let response = client.get(&format!("{}/v1/health", server.url())).send().await?;
+
+    // Check status
+    assert_eq!(response.status(), 200);
+
+    // Check content type
+    assert!(response.headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.contains("application/json")));
+
+    // Check body structure
+    let body: serde_json::Value = response.json().await?;
+    assert_eq!(body["status"], "healthy");
+
+    Ok(())
+}
+```
+
+Database operations within tests:
+- Use `server.pool()` to run assertions against test database
+- No separate setup needed - TestGcServer uses the pool from sqlx::test
+
+---
+
+## For Code Reviewer: Error Type Coverage Checklist (GC)
+**Added**: 2026-01-14
+**Related files**: `crates/global-controller/src/errors.rs`
+
+When reviewing GC error types, verify tests cover:
+1. **Error Display**: Each error variant displays with appropriate message
+2. **Status Code Mapping**: Each variant maps to correct HTTP status code
+3. **IntoResponse Behavior**: Converts to correct status + JSON body
+4. **Special Headers**: 401 responses include WWW-Authenticate header
+5. **Message Sanitization**: Internal errors don't leak sensitive details to client
+
+Example test pattern:
+```rust
+#[tokio::test]
+async fn test_error_into_response() {
+    let error = GcError::NotFound("Resource".to_string());
+    let response = error.into_response();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    let body = read_body_json(response.into_body()).await;
+    assert_eq!(body["error"]["code"], "NOT_FOUND");
+    assert_eq!(body["error"]["message"], "Resource");
+}
+```
+
+All GC error conversions should be sync (not async) - use plain `#[test]` for Display/status_code, `#[tokio::test]` only for IntoResponse (due to body reading).
