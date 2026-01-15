@@ -233,7 +233,7 @@ You are the {agent_name} specialist.
 [Agent's full specialist definition from .claude/agents/{agent}.md]
 
 ## Your Accumulated Knowledge
-[Contents of .claude/agents/{agent}/*.md if they exist, or "No accumulated knowledge yet"]
+[Contents of docs/specialist-knowledge/{agent}/*.md if they exist, or "No accumulated knowledge yet"]
 
 Please provide your proposal following the standard format.
 ```
@@ -241,7 +241,7 @@ Please provide your proposal following the standard format.
 **Context Injection for Each Debater**:
 Each debater receives:
 1. Their specialist definition (`.claude/agents/{specialist}.md`)
-2. Their accumulated knowledge files (`.claude/agents/{specialist}/*.md` if they exist)
+2. Their accumulated knowledge files (`docs/specialist-knowledge/{specialist}/*.md` if they exist)
 3. Relevant ADRs and principles
 4. Debate history and current state
 

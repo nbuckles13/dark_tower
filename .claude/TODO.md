@@ -31,7 +31,7 @@
 - **Commits**: b949052, 14dbf44
 
 ### Specialist Knowledge Architecture ✅ (ADR-0017)
-- [x] Dynamic knowledge files in .claude/agents/{specialist}/
+- [x] Dynamic knowledge files in docs/specialist-knowledge/{specialist}/
 - [x] patterns.md, gotchas.md, integration.md per specialist
 - [x] Reflection captures learnings after each implementation
 - [x] Knowledge injected into specialist prompts

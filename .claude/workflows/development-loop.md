@@ -103,13 +103,13 @@ When building specialist prompts, inject context in this order:
 
 1. **Specialist definition** - From `.claude/agents/{specialist}.md`
 2. **Matched principles** - From `docs/principles/` based on task keywords
-3. **Specialist knowledge** - From `.claude/agents/{specialist}/` (if exists)
+3. **Specialist knowledge** - From `docs/specialist-knowledge/{specialist}/` (if exists)
 4. **Design context** - ADR summary if from debate
 5. **Task context** - The actual task description and existing patterns
 
 ## Specialist Knowledge Files
 
-Each specialist may have accumulated knowledge in `.claude/agents/{specialist}/`:
+Each specialist may have accumulated knowledge in `docs/specialist-knowledge/{specialist}/`:
 - `patterns.md` - Established approaches for common tasks
 - `gotchas.md` - Mistakes to avoid, learned from experience
 - `integration.md` - Notes on working with other services
@@ -193,7 +193,7 @@ allowing you to raise genuine blockers.
 
 ## Your Accumulated Knowledge
 
-{Contents of .claude/agents/{specialist}/*.md if they exist, or "No accumulated knowledge yet - you'll be asked to reflect after completing this task."}
+{Contents of docs/specialist-knowledge/{specialist}/*.md if they exist, or "No accumulated knowledge yet - you'll be asked to reflect after completing this task."}
 
 ## Design Context
 
@@ -278,7 +278,7 @@ The task is complete - verification passed and code review is clean.
 
 Please reflect on what you learned and update your knowledge files:
 
-1. **Review** your current knowledge in `.claude/agents/{specialist}/`
+1. **Review** your current knowledge in `docs/specialist-knowledge/{specialist}/`
 2. **Add** new patterns, gotchas, or integration notes you discovered
 3. **Update** any existing knowledge that evolved
 4. **Remove** any knowledge that's now outdated
@@ -544,14 +544,14 @@ The task is complete - verification passed and code review is clean.
 
 Please reflect on what you learned:
 
-1. **Review** your current knowledge in `.claude/agents/{specialist}/`
+1. **Review** your current knowledge in `docs/specialist-knowledge/{specialist}/`
 2. **Add** new patterns, gotchas, or integration notes you discovered
 3. **Update** any existing knowledge that evolved
 4. **Remove** any knowledge that's now outdated
 5. **Append** a Reflection section to the output file
 
 Your knowledge files:
-{Contents of .claude/agents/{specialist}/*.md, or "None yet - create them now"}
+{Contents of docs/specialist-knowledge/{specialist}/*.md, or "None yet - create them now"}
 
 If nothing new was learned, note that briefly and skip file updates.
 ```
@@ -608,7 +608,7 @@ Description here.
 
 When a specialist reflects for the first time (no knowledge files exist):
 
-1. Specialist creates `.claude/agents/{specialist}/` directory
+1. Specialist creates `docs/specialist-knowledge/{specialist}/` directory
 2. Creates initial `patterns.md`, `gotchas.md`, `integration.md` files
 3. Populates with knowledge based on existing code patterns and the task just completed
 4. User sees new files in git diff and can review/approve

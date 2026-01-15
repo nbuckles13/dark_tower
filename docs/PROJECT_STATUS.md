@@ -347,7 +347,7 @@ dark_tower/
 ### Specialist Knowledge
 | Location | Description | Status |
 |----------|-------------|--------|
-| [.claude/agents/{specialist}/](../.claude/agents/) | Dynamic knowledge files | ✅ New |
+| [docs/specialist-knowledge/{specialist}/](specialist-knowledge/) | Dynamic knowledge files | ✅ New |
 | patterns.md | Established approaches for common tasks | ✅ Active |
 | gotchas.md | Mistakes to avoid, learned from experience | ✅ Active |
 | integration.md | Notes on working with other services | ✅ Active |
@@ -477,7 +477,7 @@ dark_tower/
   - Reflection step for knowledge capture
   - State checkpointing for context compression recovery
 - ✅ **Specialist Knowledge Architecture** (ADR-0017)
-  - Dynamic knowledge files in .claude/agents/{specialist}/
+  - Dynamic knowledge files in docs/specialist-knowledge/{specialist}/
   - patterns.md, gotchas.md, integration.md per specialist
   - Reflection captures learnings after each implementation
   - Knowledge injected into specialist prompts

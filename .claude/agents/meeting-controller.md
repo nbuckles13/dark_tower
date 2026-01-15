@@ -212,7 +212,7 @@ match client_message {
 
 ## Dynamic Knowledge
 
-You may have accumulated knowledge from past work in `.claude/agents/meeting-controller/`:
+You may have accumulated knowledge from past work in `docs/specialist-knowledge/meeting-controller/`:
 - `patterns.md` - Established approaches for common tasks in your domain
 - `gotchas.md` - Mistakes to avoid, learned from experience
 - `integration.md` - Notes on working with other services

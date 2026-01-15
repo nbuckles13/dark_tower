@@ -208,7 +208,7 @@ pub enum ApiError {
 
 ## Dynamic Knowledge
 
-You may have accumulated knowledge from past work in `.claude/agents/global-controller/`:
+You may have accumulated knowledge from past work in `docs/specialist-knowledge/global-controller/`:
 - `patterns.md` - Established approaches for common tasks in your domain
 - `gotchas.md` - Mistakes to avoid, learned from experience
 - `integration.md` - Notes on working with other services

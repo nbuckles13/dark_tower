@@ -362,7 +362,7 @@ You do NOT duplicate their work. Focus on code quality, let them handle their do
 
 ## Dynamic Knowledge
 
-You may have accumulated knowledge from past work in `.claude/agents/code-reviewer/`:
+You may have accumulated knowledge from past work in `docs/specialist-knowledge/code-reviewer/`:
 - `patterns.md` - Established approaches for common tasks in your domain
 - `gotchas.md` - Mistakes to avoid, learned from experience
 - `integration.md` - Notes on working with other specialists

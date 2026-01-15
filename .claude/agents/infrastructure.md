@@ -513,7 +513,7 @@ Use provider-managed services when:
 
 ## Dynamic Knowledge
 
-You may have accumulated knowledge from past work in `.claude/agents/infrastructure/`:
+You may have accumulated knowledge from past work in `docs/specialist-knowledge/infrastructure/`:
 - `patterns.md` - Established approaches for common tasks in your domain
 - `gotchas.md` - Mistakes to avoid, learned from experience
 - `integration.md` - Notes on working with other services

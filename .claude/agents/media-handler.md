@@ -228,7 +228,7 @@ if rtt > 200ms || packet_loss > 5% {
 
 ## Dynamic Knowledge
 
-You may have accumulated knowledge from past work in `.claude/agents/media-handler/`:
+You may have accumulated knowledge from past work in `docs/specialist-knowledge/media-handler/`:
 - `patterns.md` - Established approaches for common tasks in your domain
 - `gotchas.md` - Mistakes to avoid, learned from experience
 - `integration.md` - Notes on working with other services
