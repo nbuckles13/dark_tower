@@ -165,135 +165,39 @@ task_patterns:
 
 # Part 2: Specialist Prompts
 
-## Initial Invocation Template
+## Initial Invocation
 
-```markdown
-{Specialist definition from .claude/agents/{specialist}.md}
+When invoking an implementing specialist, include these sections in order:
 
-## IMPLEMENTATION MODE
+1. **Specialist definition** - From `.claude/agents/{specialist}.md`
+2. **Implementation mode header** - "You are being invoked to IMPLEMENT" + expected behavior
+3. **Project principles** - Matched category files from `docs/principles/`
+4. **Accumulated knowledge** - From `docs/specialist-knowledge/{specialist}/*.md` (if exists)
+5. **Design context** - ADR summary if from debate
+6. **Existing patterns** - Relevant code snippets
+7. **Task description** - The actual task
+8. **Responsibilities** - Implement → verify (7 layers) → fix → write output + checkpoint → return
 
-You are being invoked to IMPLEMENT. The design phase is complete - either the task
-is straightforward or a debate has already produced an ADR.
+**Key instructions to include**:
+- If requirements unclear: Return to orchestrator with questions (don't guess)
+- Run all 7 verification layers and fix failures before returning
+- Write output to `docs/dev-loop-outputs/YYYY-MM-DD-{task-slug}/main.md`
+- Write checkpoint to `docs/dev-loop-outputs/YYYY-MM-DD-{task-slug}/{your-name}.md`
 
-**Expected behavior**:
-- Explore the codebase as needed to understand existing patterns
-- Implement the changes directly
-- Run verification and fix issues
-- Write the output file
+**Templates**: See `docs/dev-loop-outputs/_template/` for output and checkpoint formats.
 
-**If requirements are unclear or contradictory**:
-- Do NOT guess or make assumptions about ambiguous requirements
-- Return to the orchestrator with specific questions about what's unclear
-- The orchestrator will either clarify or escalate to a debate/planning phase
+## Resume for Fixes
 
-The goal is to avoid planning work that's already been designed, while still
-allowing you to raise genuine blockers.
+When resuming to fix code review findings, provide:
+- Iteration number (N of 5)
+- List of findings with severity, file:line, description, suggested fix
+- Instruction: Fix all → re-run verification → update output → return
 
-## Project Principles (MUST FOLLOW)
+## Resume for Reflection
 
-{Inject matched category files here}
-
-## Your Accumulated Knowledge
-
-{Contents of docs/specialist-knowledge/{specialist}/*.md if they exist, or "No accumulated knowledge yet - you'll be asked to reflect after completing this task."}
-
-## Design Context
-
-{ADR summary if from debate, or "N/A" if no debate}
-
-## Existing Patterns
-
-{Relevant code snippets from similar implementations}
-
-## Task
-
-{The actual task description}
-
-## Your Responsibilities
-
-You own the full implementation cycle:
-
-1. **Implement** the feature with tests
-2. **Run verification** (all 7 layers):
-   - cargo check (must compile)
-   - cargo fmt (auto-formats code)
-   - ./scripts/guards/run-guards.sh (simple guards)
-   - cargo test (all tests must pass)
-   - cargo clippy -- -D warnings (no warnings)
-   - ./scripts/guards/semantic/credential-leak.sh {changed files} (semantic guards)
-3. **Fix failures** and re-run until all pass
-4. **Write output** to `docs/dev-loop-outputs/YYYY-MM-DD-{task-slug}/`:
-   - Create directory for this dev-loop
-   - Use template from `docs/dev-loop-outputs/_template/main.md`
-   - Fill in: Task Overview, Implementation Summary, Files Modified
-   - Fill in: Verification Results (all 7 layers with status, timing, any issues)
-   - Fill in: Issues Encountered & Resolutions
-5. **Write checkpoint** to `docs/dev-loop-outputs/YYYY-MM-DD-{task-slug}/{your-name}.md`:
-   - Use template from `docs/dev-loop-outputs/_template/specialist.md`
-   - Document patterns discovered, gotchas encountered, key decisions
-   - This enables recovery if the session is interrupted
-6. **Return** when verification passes
-
-The orchestrator will re-run verification to confirm, then run code review.
-If code review has findings, you'll be resumed to fix them.
-After code review is clean, you'll be resumed for reflection.
-
-## Deliverables
-
-1. Implementation code
-2. Unit tests for new/modified code
-3. All verification checks passing
-4. Output directory with main.md (implementation and verification sections)
-5. Checkpoint file with working notes (patterns, gotchas, decisions)
-```
-
-## Resume for Fixes Template
-
-When resuming a specialist to fix code review findings:
-
-```markdown
-## Code Review Findings (Iteration {N} of 5)
-
-Verification passed ✓
-
-Code review found the following issues:
-
-### 🔴 Security Specialist
-1. **{Finding title}** - `{file:line}`
-   - Impact: {description}
-   - Fix: {suggested fix}
-
-### 🟡 Test Specialist
-2. **{Finding title}** - `{file:line}`
-   - {description}
-
-{... more findings ...}
-
-Please address ALL findings, then:
-1. Re-run verification
-2. Update the output file with what you fixed
-3. Return when complete
-```
-
-## Resume for Reflection Template
-
-When resuming a specialist for reflection (after code review is clean):
-
-```markdown
-## Reflection Time
-
-The task is complete - verification passed and code review is clean.
-
-Please reflect on what you learned and update your knowledge files:
-
-1. **Review** your current knowledge in `docs/specialist-knowledge/{specialist}/`
-2. **Add** new patterns, gotchas, or integration notes you discovered
-3. **Update** any existing knowledge that evolved
-4. **Remove** any knowledge that's now outdated
-5. **Append** a Reflection section to the output file summarizing your learnings
-
-If nothing new was learned, note that briefly and skip file updates.
-```
+When resuming for reflection (after code review clean):
+- Instruction: Review knowledge files → add/update/remove entries → append reflection to output
+- Reference: `docs/specialist-knowledge/{specialist}/*.md`
 
 ---
 
@@ -396,45 +300,11 @@ These IDs are needed to resume each reviewer for reflection after the loop compl
 
 ## Resume Implementing Specialist for Fixes
 
-When code review has findings, **resume** the implementing specialist (don't invoke fresh):
+When code review has findings, **resume** the implementing specialist (don't invoke fresh). See Part 2 "Resume for Fixes" for prompt format.
 
-```markdown
-## Code Review Findings (Iteration {N} of 5)
+**After fixes**: Orchestrator MUST re-run verification before re-running code review. This ensures fixes don't introduce new issues.
 
-Verification passed ✓
-
-Code review found the following issues:
-
-### 🔴 Security Specialist
-1. **Missing rate limiting on new endpoint** - `src/handlers.rs:45`
-   - Impact: DoS vulnerability
-   - Fix: Add rate_limit middleware
-
-### 🟡 Test Specialist
-2. **Missing edge case test** - `src/auth.rs:120`
-   - Missing: Test for expired token with valid signature
-   - Fix: Add test case
-
-### 🟢 Code Reviewer
-3. **Inconsistent error message** - `src/errors.rs:30`
-   - Current: "Invalid token"
-   - Suggested: "Token validation failed" (matches ADR-0005)
-
-Please address ALL findings:
-1. Fix each issue
-2. Re-run verification (all 7 layers)
-3. Update the output file with fixes made
-4. Return when complete
-```
-
-After the specialist fixes and returns, orchestrator re-validates and re-runs code review.
-
-**Important**: After the specialist returns from fixing code review findings, the orchestrator MUST:
-1. Re-run verification (`./scripts/verify-completion.sh`) - this is step 3 in the flow
-2. Only if verification passes, re-run code review
-3. This ensures code changes made during fixes don't introduce new issues
-
-See `code-review.md` for full reviewer participation rules, synthesis process, and severity categories.
+See `code-review.md` for full reviewer participation rules and severity categories.
 
 ---
 
@@ -521,153 +391,36 @@ When run within the development loop, it uses the same reviewer set and principl
 
 ## Purpose
 
-After a successful implementation (verification passed, code review clean), all involved specialists reflect on what they learned. This builds the specialist knowledge base over time and captures insights while context is fresh.
+After code review is clean, all specialists reflect on learnings. This builds the knowledge base while context is fresh.
 
 ## Critical: Resume, Don't Re-invoke
 
-Specialists must be **resumed** for reflection, not invoked fresh. This preserves their context so they can reflect on their actual experience, not a summary provided by the orchestrator.
+Specialists must be **resumed** (not invoked fresh) to preserve context. See Part 2 "Resume for Reflection" for prompt format.
 
-```
-# Correct - resume with agent ID
-Task(resume="abc123", prompt="Time to reflect...")
+## Who Reflects
 
-# Wrong - fresh invocation loses context
-Task(prompt="You just reviewed code for X, please reflect...")
-```
+| Specialist | Agent ID Source |
+|------------|-----------------|
+| Implementing specialist | Saved from step 2 |
+| All reviewers | Saved from step 4 |
 
-## When to Reflect
+## What Specialists Do
 
-Reflection happens **after code review is clean but before finalizing output**. This ensures:
-- Specialists have intact memory of what they did
-- Knowledge updates capture genuine learnings
-- User sees complete picture before committing
+1. Review knowledge in `docs/specialist-knowledge/{specialist}/`
+2. Add/update/remove entries based on learnings
+3. Append reflection summary to checkpoint file
 
-## Who Reflects (All Resumed)
+**Knowledge file format**: See existing files in `docs/specialist-knowledge/*/` for examples.
 
-| Specialist | Agent ID Source | What They Reflect On |
-|------------|-----------------|---------------------|
-| Implementing specialist | Saved from step 2 | Implementation decisions, verification fixes |
-| Security reviewer | Saved from step 4 | Security patterns observed, gaps found |
-| Test reviewer | Saved from step 4 | Test coverage insights, testing patterns |
-| Code Reviewer | Saved from step 4 | Code quality observations, idioms |
-| Others (if participated) | Saved from step 4 | Domain-specific learnings |
-
-## Reflection Prompt (for Resume)
-
-Since the specialist is being resumed with full context, the prompt is simple:
-
-```markdown
-## Reflection Time
-
-The task is complete - verification passed and code review is clean.
-
-Please reflect on what you learned:
-
-1. **Review** your current knowledge in `docs/specialist-knowledge/{specialist}/`
-2. **Add** new patterns, gotchas, or integration notes you discovered
-3. **Update** any existing knowledge that evolved
-4. **Remove** any knowledge that's now outdated
-5. **Append** a Reflection section to the output file
-
-Your knowledge files:
-{Contents of docs/specialist-knowledge/{specialist}/*.md, or "None yet - create them now"}
-
-If nothing new was learned, note that briefly and skip file updates.
-```
-
-## Knowledge File Format
-
-Each knowledge file follows a structured format:
-
-```markdown
-# Patterns (or Gotchas, or Integration)
-
-## Pattern: Descriptive Title
-**Added**: YYYY-MM-DD
-**Related files**: `src/path/to/file.rs`, `src/another/file.rs`
-
-Brief description of the pattern, gotcha, or integration note.
-Keep it concise (2-4 sentences max).
-
-## Pattern: Another Title
-**Added**: YYYY-MM-DD
-**Related files**: `src/file.rs`
-
-Description here.
-```
-
-**Guidelines**:
-- ~100 lines per file limit
-- Each item has Added date and Related files
-- Keep descriptions brief and actionable
-- Use H2 headers for each item
-
-## Types of Knowledge Updates
-
-| Routine Updates | Significant Updates |
-|-----------------|---------------------|
-| Adding a gotcha from a mistake made | Changing fundamental approach patterns |
-| Updating a pattern to match current code | Adding new knowledge categories |
-| Removing knowledge about deleted code | Anything affecting security behavior |
-| Typo/clarification fixes | Contradicting existing ADRs |
-
-**Heuristic**: Most updates should be "learning from this task" - capturing patterns and gotchas. If you find yourself "rethinking how we do things", that may warrant discussion before updating.
-
-## Approval Flow
-
-1. **Reflection runs** after code review is clean
-2. **Specialists update knowledge files directly** (create/modify as needed)
-3. **Changes appear in git diff** alongside implementation
-4. **User reviews everything** when exiting the loop
-5. **User commits** when satisfied (implementation + knowledge updates together)
-
-**Note**: Knowledge file changes are just regular file changes - the user sees them in the diff and can approve/reject like any other change.
+**Guidelines**: ~100 lines per file, each entry has Added date + Related files, keep descriptions to 2-4 sentences.
 
 ## Bootstrap Behavior
 
-When a specialist reflects for the first time (no knowledge files exist):
+First-time reflection: Specialist creates `docs/specialist-knowledge/{specialist}/` with initial `patterns.md`, `gotchas.md`, `integration.md`.
 
-1. Specialist creates `docs/specialist-knowledge/{specialist}/` directory
-2. Creates initial `patterns.md`, `gotchas.md`, `integration.md` files
-3. Populates with knowledge based on existing code patterns and the task just completed
-4. User sees new files in git diff and can review/approve
+## Approval Flow
 
-## Pruning During Reflection
-
-When a specialist removes or significantly changes code, they should identify related knowledge to remove:
-
-```markdown
-### Removals
-
-**File**: gotchas.md
-**Item**: "Legacy OAuth Token Format"
-**Reason**: Removed legacy OAuth support in this task. The `parse_legacy_token()`
-function no longer exists, so this gotcha is obsolete.
-```
-
-The orchestrator verifies the referenced code is actually gone before approving removal.
-
-## Example Reflection Output
-
-```markdown
-### Additions
-
-**Category**: patterns
-**Title**: JWT Clock Skew Handling
-**Description**: When validating JWTs, use the configurable clock skew tolerance
-from config (default 300 seconds per NIST SP 800-63B). See `src/crypto/jwt.rs:validate()`.
-
-### Updates
-
-**File**: integration.md
-**Item**: "Calling Auth Controller"
-**Change**: Updated to note that AC now returns structured error responses with
-error codes, not just HTTP status. Update client code to parse error body.
-
-### Removals
-
-None.
-```
+Knowledge file changes appear in git diff alongside implementation. User reviews and commits everything together.
 
 ---
 
