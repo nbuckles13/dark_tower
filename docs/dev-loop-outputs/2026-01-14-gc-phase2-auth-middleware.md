@@ -20,6 +20,7 @@
 | Security Reviewer | `ac99e8f` |
 | Test Reviewer | `a6e4e07` |
 | Code Reviewer | `af76dc3` |
+| DRY Reviewer | `(post-hoc)` |
 
 <!-- ORCHESTRATOR REMINDER:
      - Update this table at EVERY state transition (see development-loop.md "Orchestrator Checklist")
@@ -149,8 +150,14 @@ test result: ok. 60 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 ```
 
 ### Layer 5: All Tests (Integration)
-**Status**: SKIPPED (database not available)
-**Note**: Integration tests require PostgreSQL. Tests verified to compile correctly and will pass with database.
+**Status**: PASS
+**Duration**: ~14s
+**Output**: All workspace tests passed (0 failures)
+
+Key test counts:
+- ac-service: 293 unit + 9 integration tests
+- global-controller: 60 unit + 15 integration tests (auth_tests)
+- common, proto-gen, media-protocol: all passing
 
 ### Layer 6: Clippy
 **Status**: PASS
@@ -177,6 +184,23 @@ test result: ok. 60 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 | Security | ✅ APPROVED |
 | Test | ✅ APPROVED |
 | Code Quality | ✅ APPROVED |
+
+---
+
+## Tech Debt
+
+### Cross-Service Duplication (from DRY Reviewer)
+
+| Pattern | New Location | Existing Location | Follow-up Task |
+|---------|--------------|-------------------|----------------|
+| JWT validation | `gc/auth/jwt.rs` | `ac/crypto/mod.rs` | Extract JWT utils to common |
+| `MAX_JWT_SIZE_BYTES` | `gc/auth/jwt.rs:17` | `ac/crypto/jwt.rs:22` | Move to common crate |
+
+### Temporary Code (from Code Reviewer)
+
+| Item | Location | Reason | Follow-up Task |
+|------|----------|--------|----------------|
+| `/v1/me` endpoint | `gc/handlers/me.rs` | Phase 2 auth middleware testing | Remove when real GC endpoints exist |
 
 ---
 

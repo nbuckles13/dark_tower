@@ -50,10 +50,9 @@ The Development Loop is the primary workflow for implementing features. It combi
 │     └─→ Run specialist reviewers in parallel (incl. DRY)        │
 │     └─→ Save agent IDs for later resume                         │
 │     └─→ Blocking findings → Resume impl specialist → fix → 3    │
-│        • Other specialists: ALL findings block                  │
-│        • DRY Reviewer: Only BLOCKER blocks                      │
-│     └─→ DRY non-BLOCKERs: Document tech debt, continue          │
-│     └─→ If CLEAN: Continue to reflection                        │
+│        • All findings block EXCEPT TECH_DEBT severity           │
+│        • TECH_DEBT: Document in Tech Debt section, continue     │
+│     └─→ If no blocking findings: Continue to reflection         │
 │                                                                  │
 │  5. REFLECTION (all specialists resumed)                        │
 │     └─→ Resume implementing specialist → reflect → update KB    │
@@ -365,16 +364,15 @@ After verification passes (confirmed by orchestrator), run code review per `.cla
    - Include Operations/Infrastructure specialists if relevant
    - **Save agent IDs** for each reviewer (needed for reflection later)
 
-2. **Evaluate results** (blocking behavior differs by reviewer):
-   - **Other specialists** (Security, Test, Code Quality, Observability, etc.): ALL findings block
-   - **DRY Reviewer**: Only BLOCKER blocks; non-BLOCKERs documented as tech debt
+2. **Evaluate results** (severity-based blocking):
+   - **All severities block EXCEPT TECH_DEBT**
+   - TECH_DEBT findings: Document in Tech Debt section, continue (don't block)
    - If NO blocking findings: Continue to reflection ✓
    - If blocking findings exist: Resume implementing specialist to fix
 
-3. **Blocking behavior summary**:
-   - Security, Test, Code Quality, Observability, Operations, Infrastructure: All severities block
-   - DRY Reviewer: Only BLOCKER severity blocks (code exists in `common` but wasn't used)
-   - DRY non-BLOCKERs (CRITICAL/MAJOR/MINOR): Document in "Tech Debt: Cross-Service Duplication" section, create follow-up task, continue
+3. **Who uses TECH_DEBT severity**:
+   - **DRY Reviewer**: Cross-service duplication (candidates for extraction to common)
+   - **Code Reviewer**: Temporary code (scaffolding, test endpoints, placeholders)
 
 **See**: ADR-0019 for DRY Reviewer rationale
 
@@ -866,10 +864,9 @@ If user requests a different task while a dev-loop is in progress:
 
 1. Run reviewers in parallel (Security, Test, Code Reviewer, DRY, etc.)
 2. **Save agent IDs** for each reviewer
-3. Evaluate blocking findings:
-   - Other specialists: ALL findings block → Resume implementing specialist
-   - DRY Reviewer: Only BLOCKER blocks → Resume implementing specialist
-   - DRY non-BLOCKERs: Document as tech debt, continue
+3. Evaluate blocking findings (severity-based):
+   - All findings block EXCEPT TECH_DEBT severity
+   - TECH_DEBT findings: Document in Tech Debt section, continue
 4. **After specialist fixes**: Re-run verification (`./scripts/verify-completion.sh`) → re-run code review
 5. If no blocking findings → Continue to reflection
 

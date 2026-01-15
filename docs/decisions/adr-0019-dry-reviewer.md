@@ -43,10 +43,10 @@ The DRY (Don't Repeat Yourself) Reviewer participates in every code review along
 
 | Severity | Trigger | Blocking? | Action |
 |----------|---------|-----------|--------|
-| BLOCKER | Code EXISTS in `common` but wasn't used | Yes | Must fix before approval |
-| CRITICAL | >90% similar to another service | No | Document, create follow-up task |
-| MAJOR | 70-90% similar | No | Document for awareness |
-| MINOR | 50-70% similar | No | Document for awareness |
+| 🔴 BLOCKING | Code EXISTS in `common` but wasn't used | **Yes** | Must fix before approval |
+| 📋 TECH_DEBT | Similar code exists in another service | No | Document, create follow-up task |
+
+**Note**: The unified severity model uses TECH_DEBT for all non-blocking findings. This simplifies the blocking rule to: "All findings block EXCEPT TECH_DEBT."
 
 ### Blocking Behavior (Different from Other Reviewers)
 

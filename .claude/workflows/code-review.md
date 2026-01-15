@@ -36,34 +36,42 @@ Trigger this workflow:
 
 ## Reviewer Participation
 
-| Reviewer | Participation | Focus | Blocking Behavior |
-|----------|--------------|-------|-------------------|
-| Code Reviewer | Every review | Quality, idioms, maintainability | All findings block |
-| Security Specialist | Every review | Vulnerabilities, crypto, auth | All findings block |
-| Test Specialist | Every review | Coverage, test quality | All findings block |
-| Observability Specialist | Every review | Logging, metrics, traces, SLOs | All findings block |
-| **DRY Reviewer** | Every review | Cross-service duplication | **Only BLOCKER blocks** |
-| Operations Specialist | Ops-related only | Deployments, migrations, configs, runbooks | All findings block |
-| Infrastructure Specialist | Infra-related only | K8s, Terraform, Dockerfiles | All findings block |
+| Reviewer | Participation | Focus | Uses TECH_DEBT? |
+|----------|--------------|-------|-----------------|
+| Code Reviewer | Every review | Quality, idioms, maintainability | Yes (temp code) |
+| Security Specialist | Every review | Vulnerabilities, crypto, auth | No |
+| Test Specialist | Every review | Coverage, test quality | No |
+| Observability Specialist | Every review | Logging, metrics, traces, SLOs | No |
+| **DRY Reviewer** | Every review | Cross-service duplication | Yes (extraction) |
+| Operations Specialist | Ops-related only | Deployments, migrations, configs, runbooks | No |
+| Infrastructure Specialist | Infra-related only | K8s, Terraform, Dockerfiles | No |
+
+**Blocking rule**: All findings block EXCEPT TECH_DEBT severity.
 
 **Ops-related changes**: Deployment scripts, database migrations, configuration changes, Kubernetes manifests, Terraform, CI/CD pipelines, credential handling.
 
-### DRY Reviewer Blocking Behavior
+### TECH_DEBT Severity
 
-The DRY Reviewer has **different blocking behavior** from other reviewers (see ADR-0019):
+Two reviewers use TECH_DEBT severity for non-blocking findings:
 
-| Severity | Trigger | Blocking? | Action |
-|----------|---------|-----------|--------|
-| 🔴 BLOCKER | Code EXISTS in `common` but wasn't used | **Yes** | Must fix before approval |
-| 🟠 CRITICAL | >90% similar to another service | No | Document as tech debt |
-| 🟡 MAJOR | 70-90% similar to another service | No | Document as tech debt |
-| 🟢 MINOR | 50-70% similar | No | Document as tech debt |
+**DRY Reviewer** (cross-service duplication):
+| Severity | Trigger | Blocking? |
+|----------|---------|-----------|
+| 🔴 BLOCKING | Code EXISTS in `common` but wasn't used | **Yes** |
+| 📋 TECH_DEBT | Similar code exists in another service | No |
 
-**Why different?**
-- BLOCKER = Code already exists in `common` crate but wasn't imported (a mistake)
-- Non-BLOCKER = Code could be extracted to `common` (an opportunity, not a mistake)
+**Code Reviewer** (temporary code):
+| Severity | Trigger | Blocking? |
+|----------|---------|-----------|
+| Standard (BLOCKER/CRITICAL/MAJOR/MINOR) | Quality issues | **Yes** |
+| 📋 TECH_DEBT | Temporary/scaffolding code | No |
 
-Non-BLOCKER findings are documented in the dev-loop output under "Tech Debt: Cross-Service Duplication" and result in follow-up tasks.
+**Why TECH_DEBT doesn't block**:
+- BLOCKING (DRY) = Code already exists in `common` but wasn't imported (a mistake)
+- TECH_DEBT (DRY) = Code could be extracted to `common` (an opportunity, not a mistake)
+- TECH_DEBT (Code Reviewer) = Scaffolding code that should be removed later (phased development)
+
+TECH_DEBT findings are documented in the dev-loop output "Tech Debt" section and result in follow-up tasks.
 
 ## Workflow Steps
 
@@ -257,13 +265,13 @@ This ensures reviewers apply both their domain expertise AND learned patterns/go
 - Cross-service duplication findings
 - Similarity percentage estimates
 - Extraction recommendations
-- Issues categorized by severity (BLOCKER, CRITICAL, MAJOR, MINOR)
+- Issues categorized as BLOCKING or TECH_DEBT
 
-**Blocking Behavior** (DIFFERENT from other reviewers):
-- **BLOCKER**: Must fix (code exists in `common` but wasn't used)
-- **CRITICAL/MAJOR/MINOR**: Document as tech debt, create follow-up task
+**Severity Output**:
+- **BLOCKING**: Code exists in `common` but wasn't used (must fix)
+- **TECH_DEBT**: Similar code in another service, candidate for extraction (document, continue)
 
-**See**: ADR-0019 for full rationale on blocking behavior
+**See**: ADR-0019 for full rationale
 
 ### Step 4: Synthesize Findings
 
@@ -417,17 +425,27 @@ If specialists disagree:
 - Similarity assessments
 - Extraction recommendations
 
-**Blocking findings** (must fix):
-- [Any BLOCKER findings - code exists in common but wasn't used]
+**Blocking findings** (BLOCKING - must fix):
+- [Code exists in common but wasn't used]
 
-**Tech debt findings** (documented, fix later):
-- [CRITICAL/MAJOR/MINOR findings - opportunities for extraction]
+**Tech debt findings** (TECH_DEBT - documented, fix later):
+- [Opportunities for extraction to common]
 
-## Tech Debt: Cross-Service Duplication
+## Tech Debt
 
-| Pattern | New Location | Existing Location | Severity | Follow-up Task |
-|---------|--------------|-------------------|----------|----------------|
-| [pattern] | `crates/X/src/file.rs:line` | `crates/Y/src/file.rs:line` | CRITICAL | Extract to common |
+This section captures non-blocking findings from reviewers using TECH_DEBT severity.
+
+### Cross-Service Duplication (from DRY Reviewer)
+
+| Pattern | New Location | Existing Location | Follow-up Task |
+|---------|--------------|-------------------|----------------|
+| [pattern] | `crates/X/src/file.rs:line` | `crates/Y/src/file.rs:line` | Extract to common |
+
+### Temporary Code (from Code Reviewer)
+
+| Item | Location | Reason | Follow-up Task |
+|------|----------|--------|----------------|
+| [endpoint/function] | `path/to/file.rs:line` | [Why it's temporary] | Remove when X implemented |
 
 ## ADR Compliance
 [Relevant ADRs and compliance status]
