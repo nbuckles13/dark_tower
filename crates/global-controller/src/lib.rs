@@ -25,6 +25,7 @@
 //! - `middleware` - HTTP middleware (authentication)
 //! - `models` - Data models
 //! - `routes` - Axum router setup
+//! - `services` - External service clients (AC, etc.)
 
 pub mod auth;
 pub mod config;
@@ -33,3 +34,4 @@ pub mod handlers;
 pub mod middleware;
 pub mod models;
 pub mod routes;
+pub mod services;

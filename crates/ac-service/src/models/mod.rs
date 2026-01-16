@@ -6,6 +6,139 @@ use std::fmt;
 use std::str::FromStr;
 use uuid::Uuid;
 
+// ============================================================================
+// Internal Token Request/Response Types (ADR-0020)
+// ============================================================================
+
+/// Request to issue a meeting token for a user via internal endpoint.
+///
+/// Called by GC (with service token having `internal:meeting-token` scope)
+/// to get meeting tokens for authenticated users joining meetings.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MeetingTokenRequest {
+    /// The user ID to issue the token for
+    pub subject_user_id: Uuid,
+    /// The meeting being joined
+    pub meeting_id: Uuid,
+    /// The org that owns the meeting
+    pub meeting_org_id: Uuid,
+    /// The user's home org (may differ for cross-org meetings)
+    pub home_org_id: Uuid,
+    /// Whether this is a member of the meeting org or external participant
+    #[serde(default)]
+    pub participant_type: ParticipantType,
+    /// Role in the meeting (host or participant)
+    #[serde(default)]
+    pub role: MeetingRole,
+    /// Capabilities granted (e.g., video, audio, screen_share)
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    /// Token TTL in seconds (max 900 = 15 minutes)
+    #[serde(default = "default_meeting_ttl")]
+    pub ttl_seconds: u32,
+}
+
+/// Request to issue a guest token via internal endpoint.
+///
+/// Called by GC (with service token having `internal:meeting-token` scope)
+/// to get guest tokens for unauthenticated users joining meetings.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GuestTokenRequest {
+    /// Generated guest ID
+    pub guest_id: Uuid,
+    /// Display name for the guest
+    pub display_name: String,
+    /// The meeting being joined
+    pub meeting_id: Uuid,
+    /// The org that owns the meeting
+    pub meeting_org_id: Uuid,
+    /// Whether guest should wait in waiting room
+    #[serde(default = "default_waiting_room")]
+    pub waiting_room: bool,
+    /// Token TTL in seconds (max 900 = 15 minutes)
+    #[serde(default = "default_meeting_ttl")]
+    pub ttl_seconds: u32,
+}
+
+/// Response for internal token endpoints.
+#[derive(Debug, Clone, Serialize)]
+pub struct InternalTokenResponse {
+    /// The issued JWT token
+    pub token: String,
+    /// Token lifetime in seconds
+    pub expires_in: u32,
+}
+
+/// Participant type in a meeting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ParticipantType {
+    /// Member of the meeting organization
+    #[default]
+    Member,
+    /// External user (from a different organization)
+    External,
+    /// Guest (unauthenticated)
+    Guest,
+}
+
+impl ParticipantType {
+    /// Convert to string for JWT claims
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ParticipantType::Member => "member",
+            ParticipantType::External => "external",
+            ParticipantType::Guest => "guest",
+        }
+    }
+}
+
+impl fmt::Display for ParticipantType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+/// Role in a meeting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MeetingRole {
+    /// Meeting host with elevated privileges
+    Host,
+    /// Regular participant
+    #[default]
+    Participant,
+    /// Guest (waiting room or limited privileges)
+    Guest,
+}
+
+impl MeetingRole {
+    /// Convert to string for JWT claims
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            MeetingRole::Host => "host",
+            MeetingRole::Participant => "participant",
+            MeetingRole::Guest => "guest",
+        }
+    }
+}
+
+impl fmt::Display for MeetingRole {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+/// Default TTL for meeting tokens (15 minutes)
+fn default_meeting_ttl() -> u32 {
+    900
+}
+
+/// Default waiting room setting (true)
+fn default_waiting_room() -> bool {
+    true
+}
+
 /// Service credential model (maps to service_credentials table)
 #[derive(Debug, Clone, FromRow)]
 pub struct ServiceCredential {
@@ -281,5 +414,120 @@ mod tests {
             Some(ServiceType::MediaHandler)
         );
         assert!(ServiceType::from_str("invalid").is_err());
+    }
+
+    // ============================================================================
+    // Internal Token Types Tests (ADR-0020)
+    // ============================================================================
+
+    #[test]
+    fn test_participant_type_display() {
+        assert_eq!(format!("{}", ParticipantType::Member), "member");
+        assert_eq!(format!("{}", ParticipantType::External), "external");
+        assert_eq!(format!("{}", ParticipantType::Guest), "guest");
+    }
+
+    #[test]
+    fn test_participant_type_default() {
+        let default: ParticipantType = Default::default();
+        assert_eq!(default, ParticipantType::Member);
+    }
+
+    #[test]
+    fn test_participant_type_serde() {
+        // Serialize
+        let member = ParticipantType::Member;
+        let json = serde_json::to_string(&member).expect("Should serialize");
+        assert_eq!(json, "\"member\"");
+
+        // Deserialize
+        let deserialized: ParticipantType =
+            serde_json::from_str("\"external\"").expect("Should deserialize");
+        assert_eq!(deserialized, ParticipantType::External);
+    }
+
+    #[test]
+    fn test_meeting_role_display() {
+        assert_eq!(format!("{}", MeetingRole::Host), "host");
+        assert_eq!(format!("{}", MeetingRole::Participant), "participant");
+        assert_eq!(format!("{}", MeetingRole::Guest), "guest");
+    }
+
+    #[test]
+    fn test_meeting_role_default() {
+        let default: MeetingRole = Default::default();
+        assert_eq!(default, MeetingRole::Participant);
+    }
+
+    #[test]
+    fn test_meeting_role_serde() {
+        // Serialize
+        let host = MeetingRole::Host;
+        let json = serde_json::to_string(&host).expect("Should serialize");
+        assert_eq!(json, "\"host\"");
+
+        // Deserialize
+        let deserialized: MeetingRole =
+            serde_json::from_str("\"guest\"").expect("Should deserialize");
+        assert_eq!(deserialized, MeetingRole::Guest);
+    }
+
+    #[test]
+    fn test_internal_token_response_serialization() {
+        let response = InternalTokenResponse {
+            token: "eyJhbGciOiJFZERTQSJ9.test.sig".to_string(),
+            expires_in: 900,
+        };
+
+        let json = serde_json::to_string(&response).expect("Should serialize");
+        assert!(json.contains("\"token\":"));
+        assert!(json.contains("\"expires_in\":900"));
+    }
+
+    #[test]
+    fn test_meeting_token_request_full() {
+        let json = r#"{
+            "subject_user_id": "550e8400-e29b-41d4-a716-446655440001",
+            "meeting_id": "550e8400-e29b-41d4-a716-446655440002",
+            "meeting_org_id": "550e8400-e29b-41d4-a716-446655440003",
+            "home_org_id": "550e8400-e29b-41d4-a716-446655440004",
+            "participant_type": "external",
+            "role": "host",
+            "capabilities": ["video", "audio", "screen_share"],
+            "ttl_seconds": 600
+        }"#;
+
+        let req: MeetingTokenRequest = serde_json::from_str(json).expect("Should deserialize");
+        assert_eq!(req.participant_type, ParticipantType::External);
+        assert_eq!(req.role, MeetingRole::Host);
+        assert_eq!(req.capabilities.len(), 3);
+        assert_eq!(req.ttl_seconds, 600);
+    }
+
+    #[test]
+    fn test_guest_token_request_full() {
+        let json = r#"{
+            "guest_id": "550e8400-e29b-41d4-a716-446655440001",
+            "display_name": "Test Guest",
+            "meeting_id": "550e8400-e29b-41d4-a716-446655440002",
+            "meeting_org_id": "550e8400-e29b-41d4-a716-446655440003",
+            "waiting_room": false,
+            "ttl_seconds": 300
+        }"#;
+
+        let req: GuestTokenRequest = serde_json::from_str(json).expect("Should deserialize");
+        assert_eq!(req.display_name, "Test Guest");
+        assert!(!req.waiting_room);
+        assert_eq!(req.ttl_seconds, 300);
+    }
+
+    #[test]
+    fn test_default_ttl_value() {
+        assert_eq!(default_meeting_ttl(), 900);
+    }
+
+    #[test]
+    fn test_default_waiting_room_value() {
+        assert!(default_waiting_room());
     }
 }
