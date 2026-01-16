@@ -1,5 +1,5 @@
-use crate::handlers::{admin_handler, auth_handler, jwks_handler};
-use crate::middleware::auth::{require_admin_scope, AuthMiddlewareState};
+use crate::handlers::{admin_handler, auth_handler, internal_tokens, jwks_handler};
+use crate::middleware::auth::{require_admin_scope, require_service_auth, AuthMiddlewareState};
 use crate::middleware::http_metrics::http_metrics_middleware;
 use crate::repositories::signing_keys;
 use axum::{
@@ -98,11 +98,28 @@ pub fn build_routes(
 
     // Internal routes (key rotation) - authentication handled in handler
     // (requires rotation-specific scopes, not admin:services)
-    let internal_routes = Router::new()
+    let key_rotation_routes = Router::new()
         .route(
             "/internal/rotate-keys",
             post(admin_handler::handle_rotate_keys),
         )
+        .with_state(state.clone());
+
+    // Internal token endpoints (meeting and guest tokens)
+    // These require service authentication with internal:meeting-token scope
+    let internal_token_routes = Router::new()
+        .route(
+            "/api/v1/auth/internal/meeting-token",
+            post(internal_tokens::handle_meeting_token),
+        )
+        .route(
+            "/api/v1/auth/internal/guest-token",
+            post(internal_tokens::handle_guest_token),
+        )
+        .layer(middleware::from_fn_with_state(
+            auth_state.clone(),
+            require_service_auth,
+        ))
         .with_state(state.clone());
 
     // Metrics route with its own state (ADR-0011)
@@ -136,7 +153,8 @@ pub fn build_routes(
     // 2. TraceLayer - Log request details
     // 3. http_metrics_middleware - Record ALL responses (outermost)
     admin_routes
-        .merge(internal_routes)
+        .merge(key_rotation_routes)
+        .merge(internal_token_routes)
         .merge(metrics_routes)
         .merge(public_routes)
         .layer(TraceLayer::new_for_http())

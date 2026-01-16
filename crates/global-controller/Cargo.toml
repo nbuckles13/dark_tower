@@ -28,11 +28,14 @@ chrono = { workspace = true }
 bcrypt = { workspace = true }
 jsonwebtoken = { workspace = true }
 
-# HTTP client for JWKS fetching
+# HTTP client for JWKS fetching and AC communication
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 # Base64 encoding for JWK keys
 base64 = "0.22"
+
+# CSPRNG for guest ID generation
+ring = { workspace = true }
 
 # Local dependencies
 common = { path = "../common" }
@@ -44,4 +47,3 @@ gc-test-utils = { path = "../gc-test-utils" }
 anyhow = { workspace = true }
 http-body-util = "0.1"
 wiremock = "0.6"
-ring = { workspace = true }

@@ -65,3 +65,72 @@ Handlers use Axum State extractor with Arc<AppState> containing pool and config.
 **Related files**: `crates/ac-service/src/handlers/admin_handler.rs`
 
 Tests use `test_config()` helper with minimal valid Config from HashMap. Provides zero master key and localhost DATABASE_URL.
+
+---
+
+## Pattern: JWT Claims Extension for Multiple Token Types
+**Added**: 2026-01-15
+**Related files**: `crates/ac-service/src/handlers/internal_tokens.rs`
+
+When different token types need different claims, create dedicated claim structs rather than overloading a single Claims type:
+```rust
+struct MeetingTokenClaims {
+    sub: String,
+    token_type: String,  // Discriminator field
+    meeting_id: String,
+    // meeting-specific fields
+}
+
+struct GuestTokenClaims {
+    sub: String,
+    token_type: String,
+    display_name: String,
+    waiting_room: bool,
+    // guest-specific fields
+}
+```
+Type-safe approach prevents mixing incompatible fields.
+
+---
+
+## Pattern: Scope Validation at Handler Level
+**Added**: 2026-01-15
+**Related files**: `crates/ac-service/src/handlers/internal_tokens.rs`
+
+Validate scopes in handler rather than middleware for endpoint-specific authorization:
+```rust
+let token_scopes: Vec<&str> = claims.scope.split_whitespace().collect();
+if !token_scopes.contains(&REQUIRED_SCOPE) {
+    return Err(AcError::InsufficientScope { ... });
+}
+```
+Separates authentication (middleware) from authorization (handler). More flexible than per-scope middleware.
+
+---
+
+## Pattern: Middleware for Claims Injection
+**Added**: 2026-01-15
+**Related files**: `crates/ac-service/src/middleware/auth.rs`
+
+Authentication middleware validates token and injects claims without checking specific scopes:
+```rust
+pub async fn require_service_auth(...) -> Result<impl IntoResponse, AcError> {
+    // Validate token
+    req.extensions_mut().insert(claims);
+    Ok(next.run(req).await)
+}
+```
+Handler extracts claims via `Extension<crypto::Claims>`. Decouples authentication from authorization.
+
+---
+
+## Pattern: TTL Capping (Defense in Depth)
+**Added**: 2026-01-15
+**Related files**: `crates/ac-service/src/handlers/internal_tokens.rs`
+
+Always cap TTL at endpoint level regardless of client request:
+```rust
+const MAX_TOKEN_TTL_SECONDS: u32 = 900;
+let ttl = payload.ttl_seconds.min(MAX_TOKEN_TTL_SECONDS);
+```
+Defense in depth - even if validation bypassed, tokens remain short-lived.

@@ -6,7 +6,11 @@ use crate::auth::{JwksClient, JwtValidator};
 use crate::config::Config;
 use crate::handlers;
 use crate::middleware::{require_auth, AuthState};
-use axum::{middleware, routing::get, Router};
+use axum::{
+    middleware,
+    routing::{get, patch, post},
+    Router,
+};
 use sqlx::PgPool;
 use std::sync::Arc;
 use std::time::Duration;
@@ -27,6 +31,9 @@ pub struct AppState {
 /// Creates an Axum router with:
 /// - `/v1/health` - Health check endpoint (database ping) - public
 /// - `/v1/me` - Current user endpoint - requires authentication
+/// - `/v1/meetings/{code}` - Join meeting (authenticated)
+/// - `/v1/meetings/{code}/guest-token` - Get guest token (public)
+/// - `/v1/meetings/{id}/settings` - Update meeting settings (authenticated, host only)
 /// - TraceLayer for request logging
 /// - 30 second request timeout
 pub fn build_routes(state: Arc<AppState>) -> Router {
@@ -42,12 +49,24 @@ pub fn build_routes(state: Arc<AppState>) -> Router {
     let public_routes = Router::new()
         // Health check endpoint
         .route("/v1/health", get(handlers::health_check))
+        // Guest token endpoint (public, rate limited)
+        .route(
+            "/v1/meetings/:code/guest-token",
+            post(handlers::get_guest_token),
+        )
         .with_state(state.clone());
 
     // Protected routes (authentication required)
     let protected_routes = Router::new()
         // Current user endpoint
         .route("/v1/me", get(handlers::get_me))
+        // Meeting join endpoint
+        .route("/v1/meetings/:code", get(handlers::join_meeting))
+        // Meeting settings endpoint
+        .route(
+            "/v1/meetings/:id/settings",
+            patch(handlers::update_meeting_settings),
+        )
         .route_layer(middleware::from_fn_with_state(
             auth_state.clone(),
             require_auth,

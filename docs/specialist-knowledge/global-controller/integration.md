@@ -171,3 +171,36 @@ Authorization: Token eyJ... (wrong scheme)
 ```
 
 ---
+
+## Integration: AC Internal Token Endpoints
+**Added**: 2026-01-15
+**Related files**: `crates/global-controller/src/services/ac_client.rs`
+
+GC calls AC internal endpoints for meeting tokens:
+- `POST /api/v1/auth/internal/meeting-token` - Issue token for authenticated user joining meeting
+- `POST /api/v1/auth/internal/guest-token` - Issue token for guest participant
+
+Both require `Authorization: Bearer <GC_SERVICE_TOKEN>`. Request body includes meeting_code, user_id/guest_id, participant_type, role. Response contains signed JWT for WebTransport connection to MC.
+
+---
+
+## Integration: Shared Types Tech Debt
+**Added**: 2026-01-15
+**Related files**: `crates/global-controller/src/models/mod.rs`, `crates/ac-service/src/models/`
+
+`ParticipantType` (Host, Participant, Guest) and `MeetingRole` (Presenter, Attendee) enums are duplicated between GC and AC. Both serialize to same JSON values but are separate types. Extract to `crates/common/` when implementing Phase 3. Until then, keep definitions in sync manually.
+
+---
+
+## Integration: Meeting API Endpoints (Phase 2)
+**Added**: 2026-01-15
+**Related files**: `crates/global-controller/src/routes/mod.rs`, `crates/global-controller/src/handlers/meetings.rs`
+
+Meeting API endpoints:
+- `GET /v1/meetings/{code}` - Join meeting (authenticated, returns meeting token)
+- `POST /v1/meetings/{code}/guest-token` - Get guest token (public, requires captcha)
+- `PATCH /v1/meetings/{id}/settings` - Update meeting settings (host only)
+
+Join endpoint returns AC-issued meeting token for WebTransport connection. Guest endpoint allows unauthenticated access with captcha verification (placeholder). Settings endpoint allows host to toggle allow_guests, allow_external_participants, waiting_room_enabled.
+
+---

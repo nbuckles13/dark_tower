@@ -81,3 +81,41 @@ Invalid client_id and invalid password return identical `AcError::InvalidCredent
 **Related files**: `crates/ac-service/src/crypto/mod.rs`
 
 `verify_jwt()` checks 4KB limit BEFORE base64/signature ops. Defense against DoS. Do not move check after parsing. Limit is generous (typical JWT 200-500 bytes).
+
+---
+
+## Gotcha: JTI Required for Revocable Tokens
+**Added**: 2026-01-15
+**Related files**: `crates/ac-service/src/handlers/internal_tokens.rs`
+
+Meeting and guest tokens need unique `jti` (JWT ID) claims for tracking and revocation:
+```rust
+jti: uuid::Uuid::new_v4().to_string(),
+```
+Always include jti for tokens that may need revocation. Service tokens may omit jti if revocation not needed.
+
+---
+
+## Gotcha: Claims Extension Type Must Match Exactly
+**Added**: 2026-01-15
+**Related files**: `crates/ac-service/src/middleware/auth.rs`, `crates/ac-service/src/handlers/internal_tokens.rs`
+
+When using `Extension<T>` in handlers, middleware must insert the exact same type:
+```rust
+// Middleware:
+req.extensions_mut().insert(claims);  // crypto::Claims
+
+// Handler:
+Extension(claims): Extension<crypto::Claims>  // Must match
+```
+No trait objects or generics - type must match exactly or extraction fails silently.
+
+---
+
+## Gotcha: Signing Function Not Reusable Across Claim Types
+**Added**: 2026-01-15
+**Related files**: `crates/ac-service/src/crypto/mod.rs`, `crates/ac-service/src/handlers/internal_tokens.rs`
+
+Existing `crypto::sign_jwt()` expects `crypto::Claims`. Cannot reuse for different claim types. Created local signing functions for meeting and guest tokens.
+
+**Future**: Generic signing function would need `impl Serialize` to handle different claim types (see TD-1 tech debt).

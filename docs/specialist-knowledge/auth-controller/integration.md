@@ -59,3 +59,51 @@ Valid types: `global-controller`, `meeting-controller`, `media-handler`. `client
 **Related files**: `crates/ac-service/src/handlers/admin_handler.rs`
 
 Endpoint: `POST /internal/rotate-keys`. Scopes: `service.rotate-keys.ac` (6-day min) or `admin.force-rotate-keys.ac` (1-hour min). Old key valid 24 hours after rotation.
+
+---
+
+## Integration: Internal Token Endpoints
+**Added**: 2026-01-15
+**Related files**: `crates/ac-service/src/handlers/internal_tokens.rs`
+
+**Endpoints**:
+- `POST /api/v1/auth/internal/meeting-token` - Issue token for authenticated meeting participant
+- `POST /api/v1/auth/internal/guest-token` - Issue token for guest (waiting room) participant
+
+**Required scope**: `internal:meeting-token` (GC must have this scope)
+
+**Token characteristics**:
+- Max TTL: 900 seconds (15 minutes), client requests capped
+- Includes `jti` for revocation tracking
+- `token_type` claim distinguishes meeting vs guest tokens
+
+---
+
+## Integration: Meeting Token Validation
+**Added**: 2026-01-15
+**Related files**: `crates/ac-service/src/handlers/internal_tokens.rs`
+
+Meeting Controllers validating these tokens should:
+1. Fetch JWKS from AC's `/.well-known/jwks.json`
+2. Verify signature using `kid` header
+3. Check `token_type` claim: `"meeting"` or `"guest"`
+4. Validate `meeting_id` matches expected meeting
+
+Guest tokens have `waiting_room: true` and fixed capabilities `["video", "audio"]`.
+
+---
+
+## Integration: Tech Debt Backlog
+**Added**: 2026-01-15
+**Related files**: Various
+
+From DRY reviewer findings (non-blocking per ADR-0019):
+
+**TD-1**: JWT signing pattern appears 3+ times. Candidate for generic function accepting `impl Serialize`:
+```rust
+pub fn sign_jwt_generic<T: Serialize>(claims: &T, key: &SigningKey) -> Result<String, AcError>
+```
+Files: `crypto/mod.rs`, `handlers/internal_tokens.rs`
+
+**TD-2**: Key loading/decryption block duplicated across handlers. Consider extracting to shared helper or service.
+Files: `handlers/auth_handler.rs`, `handlers/internal_tokens.rs`

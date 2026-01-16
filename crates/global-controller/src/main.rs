@@ -10,6 +10,7 @@ mod handlers;
 mod middleware;
 mod models;
 mod routes;
+mod services;
 
 use config::Config;
 use routes::AppState;

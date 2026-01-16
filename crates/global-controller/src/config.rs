@@ -35,6 +35,9 @@ pub struct Config {
     /// URL to Auth Controller JWKS endpoint for token validation.
     pub ac_jwks_url: String,
 
+    /// URL to Auth Controller internal API for token generation.
+    pub ac_internal_url: String,
+
     /// JWT clock skew tolerance in seconds for token validation.
     pub jwt_clock_skew_seconds: i64,
 
@@ -50,6 +53,7 @@ impl fmt::Debug for Config {
             .field("bind_address", &self.bind_address)
             .field("region", &self.region)
             .field("ac_jwks_url", &self.ac_jwks_url)
+            .field("ac_internal_url", &self.ac_internal_url)
             .field("jwt_clock_skew_seconds", &self.jwt_clock_skew_seconds)
             .field("rate_limit_rpm", &self.rate_limit_rpm)
             .finish()
@@ -95,6 +99,11 @@ impl Config {
             .get("AC_JWKS_URL")
             .cloned()
             .unwrap_or_else(|| "http://localhost:8082/.well-known/jwks.json".to_string());
+
+        let ac_internal_url = vars
+            .get("AC_INTERNAL_URL")
+            .cloned()
+            .unwrap_or_else(|| "http://localhost:8082".to_string());
 
         // Parse JWT clock skew tolerance with validation
         let jwt_clock_skew_seconds = if let Some(value_str) = vars.get("JWT_CLOCK_SKEW_SECONDS") {
@@ -149,6 +158,7 @@ impl Config {
             bind_address,
             region,
             ac_jwks_url,
+            ac_internal_url,
             jwt_clock_skew_seconds,
             rate_limit_rpm,
         })
@@ -180,6 +190,7 @@ mod tests {
             config.ac_jwks_url,
             "http://localhost:8082/.well-known/jwks.json"
         );
+        assert_eq!(config.ac_internal_url, "http://localhost:8082");
         assert_eq!(
             config.jwt_clock_skew_seconds,
             DEFAULT_JWT_CLOCK_SKEW_SECONDS
@@ -196,6 +207,10 @@ mod tests {
             "AC_JWKS_URL".to_string(),
             "https://auth.example.com/.well-known/jwks.json".to_string(),
         );
+        vars.insert(
+            "AC_INTERNAL_URL".to_string(),
+            "https://auth.internal.example.com".to_string(),
+        );
         vars.insert("JWT_CLOCK_SKEW_SECONDS".to_string(), "120".to_string());
         vars.insert("RATE_LIMIT_RPM".to_string(), "500".to_string());
 
@@ -207,6 +222,7 @@ mod tests {
             config.ac_jwks_url,
             "https://auth.example.com/.well-known/jwks.json"
         );
+        assert_eq!(config.ac_internal_url, "https://auth.internal.example.com");
         assert_eq!(config.jwt_clock_skew_seconds, 120);
         assert_eq!(config.rate_limit_rpm, 500);
     }

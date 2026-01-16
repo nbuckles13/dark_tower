@@ -152,3 +152,27 @@ The jsonwebtoken library defaults to accepting `alg:none` if not explicitly pinn
 Review code review findings from 2026-01-14 for test coverage.
 
 ---
+
+## Gotcha: GC_SERVICE_TOKEN Required for AC Communication
+**Added**: 2026-01-15
+**Related files**: `crates/global-controller/src/config.rs`, `crates/global-controller/src/services/ac_client.rs`
+
+GC_SERVICE_TOKEN env var is required for internal AC endpoint calls (meeting tokens, guest tokens). Empty string default causes silent 401 failures from AC. In tests, mock the AC endpoints or provide valid test token. Production MUST set this via secrets management.
+
+---
+
+## Gotcha: Captcha Validation is Placeholder
+**Added**: 2026-01-15
+**Related files**: `crates/global-controller/src/handlers/meetings.rs`
+
+Guest token endpoint has TODO placeholder for captcha validation. Currently accepts any captcha_token value. Phase 3+ must integrate real captcha provider (reCAPTCHA, hCaptcha). Do not deploy guest access without implementing this security control.
+
+---
+
+## Gotcha: Meeting Status Type Mismatch
+**Added**: 2026-01-15
+**Related files**: `crates/global-controller/src/models/mod.rs`, `crates/global-controller/src/services/meeting_service.rs`
+
+Database stores status as VARCHAR, but MeetingStatus enum exists in models. Current code reads status as String from DB, not the enum. Converting requires either: (1) impl FromStr for MeetingStatus, or (2) use sqlx Type derive with rename. Document tech debt until unified.
+
+---

@@ -155,3 +155,43 @@ Extract kid for key lookup by:
 This avoids full JWT parsing before signature validation - kid selection is data-only.
 
 ---
+
+## Pattern: AC Client Service for Internal Endpoints
+**Added**: 2026-01-15
+**Related files**: `crates/global-controller/src/services/ac_client.rs`
+
+HTTP client for calling AC internal token endpoints. Uses Bearer auth with GC_SERVICE_TOKEN, configurable timeout (default 10s), and proper error mapping (network errors → ServiceUnavailable, 4xx → Unauthorized/Forbidden). Client is reusable via Arc in AppState.
+
+---
+
+## Pattern: Runtime sqlx Queries for CI/CD Flexibility
+**Added**: 2026-01-15
+**Related files**: `crates/global-controller/src/services/meeting_service.rs`
+
+Use runtime-checked queries (`sqlx::query_as::<_, T>()`) instead of compile-time macros (`query_as!()`) when DATABASE_URL may not be available during CI builds. Trade compile-time safety for deployment flexibility. Document decision in code comments.
+
+---
+
+## Pattern: CSPRNG Guest ID Generation
+**Added**: 2026-01-15
+**Related files**: `crates/global-controller/src/handlers/meetings.rs`
+
+Generate guest IDs using `ring::rand::SystemRandom` for CSPRNG security. Fill 16-byte buffer, then apply UUID v4 bit manipulation (version nibble = 4, variant bits = 10xx). Format as hyphenated UUID string. Never use thread_rng() for security-critical IDs.
+
+---
+
+## Pattern: Host-Only Authorization Check
+**Added**: 2026-01-15
+**Related files**: `crates/global-controller/src/handlers/meetings.rs`
+
+For host-only endpoints (settings, kick participant), compare `meeting.created_by_user_id` against `claims.sub`. Return 403 Forbidden if mismatch. This check happens AFTER meeting lookup to avoid leaking meeting existence via 403 vs 404.
+
+---
+
+## Pattern: COALESCE for Partial Updates (PATCH)
+**Added**: 2026-01-15
+**Related files**: `crates/global-controller/src/services/meeting_service.rs`
+
+Use SQL `COALESCE($N, column_name)` pattern for PATCH endpoints. Client sends only fields to update, NULL/None means "keep existing". Example: `SET allow_guests = COALESCE($2, allow_guests)`. Avoids multiple queries or complex conditionals.
+
+---
