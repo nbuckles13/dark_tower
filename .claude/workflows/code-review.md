@@ -640,6 +640,53 @@ After each review:
 
 **Remember**: The goal is **high-quality, secure code delivered rapidly**. Reviews should enable confidence, not create bottlenecks. Be thorough on security, pragmatic on style.
 
+## Dev-Loop Integration
+
+When code review is run as part of a dev-loop (not standalone), additional requirements apply.
+
+### Reviewer Checkpoints (Dev-Loop Only)
+
+**CRITICAL**: Each reviewer MUST write a checkpoint file after completing their review.
+
+**Location**: `docs/dev-loop-outputs/YYYY-MM-DD-{task}/{reviewer-name}.md`
+
+**Required content**:
+```markdown
+# {Reviewer Name} Checkpoint
+
+**Date**: YYYY-MM-DD
+**Task**: {task description}
+**Verdict**: APPROVED | APPROVED_WITH_NOTES | REQUEST_CHANGES | BLOCKED
+
+## Observations
+
+- Key finding 1
+- Key finding 2
+- ...
+
+## Status
+
+Review complete. Verdict: {verdict}
+```
+
+**Reviewer checkpoint filenames**:
+| Reviewer | Filename |
+|----------|----------|
+| Security Specialist | `security.md` |
+| Test Specialist | `test.md` |
+| Code Reviewer | `code-reviewer.md` |
+| DRY Reviewer | `dry-reviewer.md` |
+| Observability Specialist | `observability.md` |
+| Operations Specialist | `operations.md` |
+
+**Why checkpoints matter**:
+1. Enable session recovery if context is lost mid-review
+2. Provide audit trail of review decisions
+3. Required for reflection phase (reviewers update knowledge files)
+4. Validation script checks for missing checkpoints
+
+---
+
 ## Related Workflows
 
 - **contextual-injection.md**: How to match tasks to principle categories

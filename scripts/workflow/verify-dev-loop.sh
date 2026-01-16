@@ -2,7 +2,7 @@
 # Dev-loop verification script
 # Extracted from .claude/workflows/development-loop.md
 
-set -e
+# Note: Don't use set -e because we want all checks to run even if some fail
 
 # Colors for output
 RED='\033[0;31m'
@@ -134,10 +134,11 @@ for placeholder in "${PLACEHOLDERS[@]}"; do
 done
 
 # Check Implementation Summary has content (not just header)
-if awk '/## Implementation Summary/{found=1} found && /^\|/{has_content=1} /^##/ && found && !/## Implementation Summary/{exit} END{exit !has_content}' "$MAIN_FILE"; then
+# Look for tables (|), lists (-), or sub-headers (###)
+if awk '/## Implementation Summary/{found=1} found && /^(\||- |### )/{has_content=1} /^## / && found && !/## Implementation Summary/{exit} END{exit !has_content}' "$MAIN_FILE"; then
     log_pass "Implementation Summary has content"
 else
-    log_fail "Implementation Summary has content" "Section appears empty (no tables/lists)"
+    log_fail "Implementation Summary has content" "Section appears empty (no tables/lists/sub-headers)"
     ((ERRORS++))
 fi
 
@@ -156,12 +157,56 @@ else
     log_warn "Loop State section exists" "Section not found (may be older format)"
 fi
 
-# Check for specialist checkpoint file
-SPECIALIST_FILES=$(find "$OUTPUT_DIR" -name "*.md" ! -name "main.md" 2>/dev/null | wc -l)
-if [ "$SPECIALIST_FILES" -gt 0 ]; then
-    log_pass "Specialist checkpoint files exist ($SPECIALIST_FILES found)"
+# Check for required checkpoint files based on Loop State
+# Extract implementing specialist from Loop State
+IMPLEMENTING_SPECIALIST=$(grep -A20 "## Loop State" "$MAIN_FILE" | grep "Implementing Specialist" | sed 's/.*| *`\?\([^`|]*\)`\? *|.*/\1/' | tr -d '[:space:]')
+
+if [ -n "$IMPLEMENTING_SPECIALIST" ]; then
+    IMPL_CHECKPOINT="$OUTPUT_DIR/$IMPLEMENTING_SPECIALIST.md"
+    if [ -f "$IMPL_CHECKPOINT" ]; then
+        log_pass "Implementing specialist checkpoint: $IMPLEMENTING_SPECIALIST.md"
+    else
+        log_fail "Implementing specialist checkpoint" "Missing: $IMPLEMENTING_SPECIALIST.md"
+        ((ERRORS++))
+    fi
 else
-    log_warn "Specialist checkpoint files" "No specialist checkpoint files found"
+    log_warn "Implementing specialist" "Could not determine from Loop State"
+fi
+
+# Check for reviewer checkpoints
+# Map reviewer names from Loop State to expected filenames
+declare -A REVIEWER_FILES=(
+    ["Security Reviewer"]="security.md"
+    ["Test Reviewer"]="test.md"
+    ["Code Reviewer"]="code-reviewer.md"
+    ["DRY Reviewer"]="dry-reviewer.md"
+    ["Observability Reviewer"]="observability.md"
+    ["Operations Reviewer"]="operations.md"
+)
+
+REVIEWERS_FOUND=0
+REVIEWERS_MISSING=0
+
+for reviewer in "${!REVIEWER_FILES[@]}"; do
+    # Check if this reviewer is listed in Loop State (has an agent ID)
+    if grep -A30 "## Loop State" "$MAIN_FILE" | grep -q "$reviewer.*\`[a-f0-9]"; then
+        EXPECTED_FILE="${REVIEWER_FILES[$reviewer]}"
+        CHECKPOINT_PATH="$OUTPUT_DIR/$EXPECTED_FILE"
+        if [ -f "$CHECKPOINT_PATH" ]; then
+            log_pass "Reviewer checkpoint: $EXPECTED_FILE"
+            ((REVIEWERS_FOUND++))
+        else
+            log_fail "Reviewer checkpoint" "Missing: $EXPECTED_FILE (for $reviewer)"
+            ((REVIEWERS_MISSING++))
+            ((ERRORS++))
+        fi
+    fi
+done
+
+if [ "$REVIEWERS_FOUND" -gt 0 ] || [ "$REVIEWERS_MISSING" -gt 0 ]; then
+    if [ "$VERBOSE" = true ]; then
+        echo "  Reviewer checkpoints: $REVIEWERS_FOUND found, $REVIEWERS_MISSING missing"
+    fi
 fi
 
 # Summary
