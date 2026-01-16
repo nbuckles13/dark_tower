@@ -244,3 +244,98 @@ When adding authentication middleware to new routes:
 5. Protected routes should use `middleware::from_fn_with_state(require_auth)` pattern
 
 The middleware pattern with `from_fn_with_state` allows accessing shared state (config, JWKS client) while validating requests.
+
+---
+
+## For Implementation Teams: Test Coverage Requirements by Feature Type
+**Added**: 2026-01-15
+**Related files**: Code review process, test specialist role
+
+Different feature types have different test coverage expectations:
+
+**Security-critical features** (auth, crypto, validation):
+- Minimum 90% code coverage (target 95%)
+- All attack vectors tested explicitly (not just happy path)
+- Boundary cases tested (off-by-one errors in size/count checks)
+- Integration tests verify end-to-end flows
+- Example: JWT validation requires token size limits, algorithm confusion, claim validation tests
+
+**Core business logic** (user management, meetings, payments):
+- Minimum 85% code coverage
+- Happy path and error paths tested
+- Database integration tested with real transactions
+- Example: User registration requires happy path, validation failures, database persistence tests
+
+**Infrastructure/utilities** (logging, config, metrics):
+- Minimum 80% code coverage
+- Config boundary values tested
+- Error handling paths tested
+
+**Code review standard**: "Missing integration tests for critical paths = BLOCKER". If a feature touches the database or calls external services, integration tests are required before approval.
+
+---
+
+## For Authentication/Authorization Work: User Provisioning Test Patterns
+**Added**: 2026-01-15
+**Related files**: `crates/ac-service/tests/auth_tests.rs`, user management features
+
+When implementing user provisioning features (registration, login, token issuance, claims management), ensure test coverage includes:
+
+**Happy path tests** (1-2 tests):
+- Register user → issue token → extract claims → verify expected fields
+
+**Validation tests** (5-8 tests):
+- Invalid username (too short, too long, invalid chars)
+- Invalid email format
+- Invalid password (too weak, empty, too long)
+- Each validation should have its own test
+
+**Rate limiting tests** (2-4 tests):
+- N registrations within rate limit window succeeds
+- (N+1)th registration within window fails with 429
+- Window expiry allows next registration to succeed
+- Per-IP or per-email rate limiting (depending on design)
+
+**Timing attack prevention** (1 test):
+- Registration duration constant regardless of validation failure
+- Measures elapsed time for valid vs invalid username, ensures within tolerance
+
+**Claims structure tests** (3-5 tests):
+- All required fields present (sub, iat, exp, scopes)
+- Optional fields handled correctly (service_type for service tokens, custom claims)
+- Scopes serialized as JSON array
+- Scope parsing/validation works (has_scope method or similar)
+
+**Integration tests** (2-4 tests):
+- Full registration flow with database persistence
+- Login with credentials → correct token returned
+- Token verification → correct claims extracted
+- Multiple users → each gets correct claims
+
+**Example test structure**:
+```
+tests/auth_tests.rs
+├── Happy path
+│   └── test_register_and_issue_token
+├── Validation
+│   ├── test_register_rejects_short_username
+│   ├── test_register_rejects_long_username
+│   ├── test_register_rejects_invalid_email
+│   ├── test_register_rejects_weak_password
+│   └── test_register_validates_all_fields_independently
+├── Rate limiting
+│   ├── test_register_rate_limiting_per_email
+│   └── test_register_rate_limiting_per_ip
+├── Timing
+│   └── test_register_timing_constant_for_all_failures
+├── Claims
+│   ├── test_user_claims_structure_complete
+│   ├── test_user_claims_scopes_parsed_correctly
+│   └── test_user_claims_missing_required_field_rejected
+└── Integration
+    ├── test_register_persists_to_database
+    ├── test_login_with_credentials
+    └── test_token_claims_match_user_record
+```
+
+This structure ensures comprehensive coverage and can be adapted for service tokens, admin tokens, or other token types.

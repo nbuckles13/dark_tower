@@ -264,3 +264,57 @@ Always validate JWK structure BEFORE using it:
 - Check required fields are present (e.g., `x`, `y` for OKP/EdDSA)
 
 Silent failures here lead to accepting invalid signatures from the wrong key type.
+
+---
+
+## Gotcha: BLOCKER Enforcement for Missing Integration Tests
+**Added**: 2026-01-15
+**Related files**: Code review process, test specialist role
+
+During code review, issuing a BLOCKER for missing integration tests is the primary mechanism to ensure coverage completeness. A single BLOCKER finding that "register_user and issue_user_token need integration tests" should lead to 12-16 new tests being implemented before review is complete. The BLOCKER is not a suggestion - it blocks approval until resolved.
+
+This works because:
+1. Test coverage gaps are easily overlooked in code review if only unit tests are visible
+2. Integration tests catch real-world failures (database interactions, service boundaries)
+3. BLOCKER status forces implementation, not deferral to "Phase 3+"
+
+Example: GC Phase 2 code review found 10 tests for JWT validation but missing boundary tests (8KB limit, algorithm confusion). BLOCKER → 5 new security tests added → re-review → approved. The additional tests prevented real vulnerabilities from being overlooked.
+
+---
+
+## Gotcha: Integration Test Database Setup Isolation
+**Added**: 2026-01-15
+**Related files**: `crates/ac-service/tests/integration/user_service_tests.rs`
+
+Each test using `#[sqlx::test(migrations = "...")]` gets its own database transaction that rolls back at test completion. This is excellent for isolation BUT creates a gotcha:
+- Tests can see data from within their own transaction
+- Tests CANNOT see data from other tests (each runs in separate transaction)
+- Migrations run for EACH test (not once for test suite)
+
+This means:
+1. You CANNOT have one test create a user and another test fetch it - separate transactions
+2. If a test inserts 100 records and rolls back, the next test doesn't see them (correct isolation)
+3. Never write tests that depend on state from a previous test
+
+This is by design and catches invalid test dependencies early. If you need cross-test data:
+- Use a single `#[test]` function with multiple assertions
+- Or use fixtures to create test data within each test
+
+---
+
+## Gotcha: BLOCKER vs Non-Blocker Distinction in Security Reviews
+**Added**: 2026-01-15
+**Related files**: Code review process, security specialist role
+
+When a security reviewer finds issues, classifying as BLOCKER (must fix) vs MAJOR (important) vs MINOR (fix eventually) has different enforcement:
+
+- **BLOCKER** (e.g., JWK validation missing): Must be fixed before approval. Code cannot ship without fix.
+- **MAJOR** (e.g., "could add HTTPS validation"): Recommended but doesn't block approval. Implementation is higher priority than release.
+- **MINOR** (e.g., "Consider logging this edge case"): Nice to have. Can be deferred to next phase.
+
+Example from GC Phase 2:
+- BLOCKER: JWK kty/alg validation missing → Required immediate fix
+- MAJOR: HTTPS validation not present → Recommended for Phase 3, documented as debt
+- MINOR: JWKS response size limit → Phase 3+ nice-to-have
+
+The distinction prevents "death by a thousand paper cuts" where all feedback is treated as blocking.

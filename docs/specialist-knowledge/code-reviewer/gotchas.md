@@ -155,3 +155,51 @@ The probe should always succeed HTTP-wise; the body tells K8s the actual health 
 **Related files**: `crates/global-controller/src/routes/mod.rs`, `crates/gc-test-utils/src/server_harness.rs`
 
 `AppState` can cheaply clone because it holds an `Arc<AppState>` when passed to Axum. However, individual fields (PgPool, Config) must individually support Clone. If a future field doesn't clone (e.g., `tokio::sync::Mutex` without Arc), the struct-level Clone becomes problematic. Always verify all fields are Clone before deriving it.
+
+---
+
+## Gotcha: UserClaims Struct Visibility and Debug Implementation
+**Added**: 2026-01-15
+**Related files**: `crates/ac-service/src/models/users.rs`
+
+`UserClaims` is a private struct used internally for token validation. It should NOT derive `Debug` automatically - implement manually with redacted fields to prevent accidental logging of sensitive claims. If this struct becomes public in the future, ensure custom Debug is in place. Don't assume struct privacy eliminates the need for Debug redaction.
+
+---
+
+## Gotcha: Missing Validation in Middleware Before Injecting Context
+**Added**: 2026-01-15
+**Related files**: `crates/ac-service/src/middleware/org_context.rs`
+
+Middleware that extracts and injects context (like `OrgContext`) must validate the data before attaching to extensions. If a handler calls `.unwrap()` or `.expect()` on an `Option<T>` extracted from extensions, middleware failure becomes a panic. Always ensure middleware either validates completely or returns error responses. Audit middleware for fallible operations that don't return errors properly.
+
+---
+
+## Gotcha: Confusing Service Layer vs Repository Layer Errors
+**Added**: 2026-01-15
+**Related files**: `crates/ac-service/src/service/`, `crates/ac-service/src/repository/`
+
+Repository layer errors (e.g., `UserRepositoryError`) are internal implementation details. Service layer should wrap these in domain-specific errors (e.g., `UserServiceError`) that handlers understand. Don't leak repository errors through service layer - always map. Pattern: repository might return `DatabaseError::UniqueViolation`, service wraps in `UserServiceError::EmailAlreadyExists`.
+
+---
+
+## Gotcha: Handler Returning Wrong Error Type
+**Added**: 2026-01-15
+**Related files**: `crates/ac-service/src/handlers/auth_handler.rs`
+
+Handlers should return the service layer error type directly, not wrap it again in another handler-specific error. The service error should implement `IntoResponse` to map to HTTP status codes at the boundary. Bad pattern: `handler -> HandlerError -> ServiceError`. Good pattern: `handler -> ServiceError` (which implements IntoResponse).
+
+---
+
+## Gotcha: Token Parsing in Middleware vs Handler
+**Added**: 2026-01-15
+**Related files**: `crates/ac-service/src/middleware/org_context.rs`
+
+Don't implement token parsing logic in both middleware and handlers. Parse once in middleware, attach structured claims to extensions, handlers use pre-parsed data. If token validation happens in middleware, handlers should not re-validate - trust the middleware's extraction or return error. Duplicate parsing is error-prone and wastes cycles.
+
+---
+
+## Gotcha: Organization ID Type Safety
+**Added**: 2026-01-15
+**Related files**: `crates/ac-service/src/models/users.rs`, `crates/ac-service/src/middleware/org_context.rs`
+
+When extracting organization ID from tokens or claims, verify the type matches expectations. If tokens embed `org_id` as a string UUID, make sure the type system enforces this (e.g., `newtype` wrapper like `OrganizationId(uuid::Uuid)` rather than raw `String`). This prevents accidental mixing of different ID namespaces.

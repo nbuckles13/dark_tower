@@ -91,3 +91,19 @@ Production deployments with database queries MUST have both: (1) Application-lev
 GC must validate JWTs from AC via JWKS endpoint. Security requirements: (1) Fetch JWKS from AC_JWKS_URL with caching (5 min TTL), (2) Validate token `alg` is `EdDSA`, (3) Extract `kid` and find matching JWK, (4) **Validate JWK fields**: `kty == "OKP"` and `alg == "EdDSA"` (critical for defense-in-depth), (5) Verify signature, (6) Check `iat` with clock skew tolerance, (7) Return generic error messages on failure (no "key not found" vs "invalid signature"). Phase 2 implements core validation. Phase 3+ adds HTTPS validation of JWKS endpoint and response size limits. Test with: valid tokens, expired tokens, wrong algorithm, algorithm confusion attacks, missing kid, size boundary tests.
 
 ---
+
+## Integration: Test Specialist - Custom Debug Redaction Verification
+**Added**: 2026-01-15
+**Related files**: `crates/ac-service/src/crypto/mod.rs`
+
+Security tests must verify custom Debug implementations don't leak PII. Pattern: Create a test that formats the type with `{:?}` and checks the output doesn't contain actual values (user IDs, emails, secrets). Grep the debug output for expected `[REDACTED]` strings. Example: `format!("{:?}", claims)` should contain `"[REDACTED]"` for sub field, not the actual user ID. This catches regressions if developers forget custom Debug when adding PII fields.
+
+---
+
+## Integration: Protocol Specialist - Service Registration Responses
+**Added**: 2026-01-15
+**Related files**: `crates/ac-service/src/services/registration_service.rs`
+
+Service registration endpoints (e.g., `POST /admin/services`) must return the plaintext client_secret in the response ONLY. This is intentional and documented in the response schema. Other endpoints (login, token issue, admin info retrieval) MUST NEVER expose the plaintext secret. Document in API contracts: "This credential cannot be recovered. Store it securely immediately." Error handling for lost credentials should direct users to request new credentials. This asymmetric exposure (register exposes, others hide) is a security feature that forces proper handling.
+
+---
