@@ -163,3 +163,27 @@ While JWT token validation checks `alg: EdDSA` in the token header, the JWKS JWK
 JWKS endpoints can be exploited to consume memory by returning extremely large responses (gigabytes of data). If JWKS client doesn't limit response size, an attacker can OOM the application. Pattern: Implement response size cap (e.g., 1MB) in HTTP client or JWKS parsing. Test with oversized responses. This is documented as Phase 3+ hardening but not implemented in Phase 2 - flag as minor tech debt.
 
 ---
+
+## Gotcha: Custom Debug Implementations Must Be Comprehensive
+**Added**: 2026-01-15
+**Related files**: `crates/ac-service/src/crypto/mod.rs`
+
+A single missing PII field in a custom Debug impl exposes secrets in logs. Example: `Claims` redacts `sub` but doesn't redact derived Debug output of the entire struct. When reviewing custom Debug, check EVERY field: mark all PII as `[REDACTED]`, keep non-sensitive metadata. For complex types, remember derived Debug will recursively call field Debug impls, so nested types must also have safe Debug. Test by printing debug output and grep for actual values (user IDs, secrets, emails).
+
+---
+
+## Gotcha: Dummy Hash Regeneration on Cost Changes
+**Added**: 2026-01-15
+**Related files**: `crates/ac-service/src/services/token_service.rs`
+
+If bcrypt cost is configurable and changes between requests, the pre-computed dummy hash becomes stale if cost increases. Example: If dummy hash was created with cost 12, then cost increases to 13, the dummy is now faster than real hashes, enabling timing attacks. Pattern: Either (1) pin cost at config load time and never change, or (2) regenerate dummy hash whenever cost changes. Monitor configuration changes and log when dummy is regenerated - this is rare enough that logging helps catch misconfiguration.
+
+---
+
+## Gotcha: Service Registration Secret Is One-Time Only
+**Added**: 2026-01-15
+**Related files**: `crates/ac-service/src/services/registration_service.rs`
+
+Clients often expect to retrieve lost credentials via password reset or admin endpoints. Service registration MUST NOT support this. Once the plaintext secret is revealed at registration, it's never available again. Clients that lose the secret must request new credentials, invalidating old ones. This is intentionally restrictive - it forces secure credential handling. Document clearly in API docs and error messages. This prevents privilege escalation via compromised admin accounts who could retrieve all service secrets.
+
+---

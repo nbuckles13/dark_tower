@@ -478,3 +478,90 @@ pub fn verify_token(token: &str, jwk: &Jwk) -> Result<Claims, GcError> {
 ```
 
 Why this matters: A compromised JWKS endpoint might return keys with wrong algorithms, enabling signature confusion attacks. Validate the structure, not just trust the endpoint.
+
+---
+
+## Pattern: Layered JWT Testing (Defense-in-Depth)
+**Added**: 2026-01-15
+**Related files**: `crates/global-controller/tests/auth_tests.rs`
+
+JWT security requires testing at multiple layers, not just the happy path:
+1. **Token algorithm layer**: Reject `alg:none`, `alg:HS256`, accept only `alg:EdDSA`
+2. **JWK structure layer**: Reject `kty != "OKP"`, reject `alg != "EdDSA"` (when present)
+3. **Signature verification layer**: Reject tampered payloads
+4. **Claims validation layer**: Reject expired tokens, invalid iat, missing required fields
+
+Each layer is independent - a compromised JWKS endpoint or network MITM could bypass token-level checks, which is why JWK structure validation is essential. Test each layer separately:
+
+```rust
+#[test]
+fn test_algorithm_confusion_attack_alg_none_rejected() {
+    // Token layer: attack via header algorithm field
+    let token = create_token_with_header_override(json!({"alg": "none", "typ": "JWT"}), valid_claims);
+    assert!(validate_token(&token).is_err());
+}
+
+#[test]
+fn test_jwk_structure_validation_rejects_wrong_kty() {
+    // JWK layer: attack via key type mismatch
+    let jwk = create_jwk_with_kty("RSA");  // Wrong type for EdDSA
+    assert_eq!(verify_token_with_jwk(valid_token, &jwk).status(), 401);
+}
+
+#[test]
+fn test_signature_validation_detects_tampering() {
+    // Signature layer: payload modified after signing
+    let tampered_payload = modify_jwt_payload(valid_token, |p| p["sub"] = "attacker");
+    assert!(validate_token(&tampered_payload).is_err());
+}
+```
+
+Why this matters: Algorithm confusion (CVE-2016-10555, CVE-2017-11424) is a real attack. Testing only "EdDSA works" misses the attacks that use `none` or `HS256`. Test must include both positive (EdDSA accepted) and negative cases (other algorithms rejected).
+
+---
+
+## Pattern: User Provisioning Test Coverage
+**Added**: 2026-01-15
+**Related files**: `crates/ac-service/tests/auth_tests.rs`, `crates/ac-service/tests/integration/user_service_tests.rs`
+
+When testing user provisioning (registration, token issuance, claims), cover these test categories:
+
+1. **Happy path**: Valid registration → valid token issuance → valid claims extraction
+2. **Validation**: Username length, email format, password strength validation
+3. **Rate limiting**: Prevent brute force registration, token issuance throttling
+4. **Timing attack prevention**: Registration duration constant regardless of validation failure
+5. **Claims structure**: All required fields present, optional fields handled, scopes serialized correctly
+
+Example structure:
+```rust
+// Happy path
+#[test]
+fn test_user_registration_and_token_issuance() { ... }
+
+// Validation boundaries
+#[test]
+fn test_register_user_rejects_short_username() { ... }
+#[test]
+fn test_register_user_rejects_invalid_email() { ... }
+
+// Rate limiting
+#[test]
+fn test_register_user_rate_limiting() { ... }
+#[test]
+fn test_issue_user_token_rate_limiting() { ... }
+
+// Timing
+#[test]
+fn test_registration_timing_constant_regardless_of_validation_failure() { ... }
+
+// Claims
+#[test]
+fn test_user_claims_contains_all_required_fields() { ... }
+#[test]
+fn test_user_claims_scopes_serialized_correctly() { ... }
+```
+
+Integration tests should verify full flows:
+- User registers → Auth service persists to database → User later logs in with credentials → Token issued with correct claims
+- Test database interaction, not just function logic
+- Use `#[sqlx::test(migrations = "../../migrations")]` for database isolation

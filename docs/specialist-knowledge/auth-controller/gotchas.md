@@ -119,3 +119,40 @@ No trait objects or generics - type must match exactly or extraction fails silen
 Existing `crypto::sign_jwt()` expects `crypto::Claims`. Cannot reuse for different claim types. Created local signing functions for meeting and guest tokens.
 
 **Future**: Generic signing function would need `impl Serialize` to handle different claim types (see TD-1 tech debt).
+
+---
+
+## Gotcha: UserTokenRequest Uses Email Not Username
+**Added**: 2026-01-15
+**Related files**: `crates/ac-service/src/handlers/auth_handler.rs`
+
+Per ADR-0020, user authentication uses email address, not username. The `UserTokenRequest` struct has an `email` field, not `username`. This differs from some OAuth implementations that use username. When writing tests or integrating, always use email for the user identifier field.
+
+---
+
+## Gotcha: User Rate Limiting Requires Separate Database Function
+**Added**: 2026-01-15
+**Related files**: `crates/ac-service/src/repositories/auth_events.rs`, `crates/ac-service/src/services/token_service.rs`
+
+Cannot reuse `get_failed_attempts_count()` (credential-based) for user rate limiting. Added `get_failed_attempts_count_by_user()` which queries by user_id instead of client_id. The auth_events table tracks both service credentials and user authentications, but the lookup key differs.
+
+---
+
+## Gotcha: Subdomain Extraction Edge Cases
+**Added**: 2026-01-15
+**Related files**: `crates/ac-service/src/middleware/org_extraction.rs`
+
+Host header parsing has edge cases: IP addresses (no subdomain), ports (strip before parsing), single-part hostnames (localhost), and hosts with many parts (a.b.c.example.com). Middleware must handle: stripping port, checking for IP addresses, and extracting first segment only when at least 3 parts exist. Tests should cover all edge cases.
+
+---
+
+## Gotcha: Clippy Indexing Lint
+**Added**: 2026-01-15
+**Related files**: `crates/ac-service/src/middleware/org_extraction.rs`
+
+Clippy warns against direct array indexing like `parts[0]` due to potential panics. Use `.first()` and `.get()` methods instead, which return `Option` and force explicit handling of missing elements:
+```rust
+// Bad: parts[0]
+// Good: parts.first().ok_or(Error)?
+```
+This pattern aligns with the no-panic policy.

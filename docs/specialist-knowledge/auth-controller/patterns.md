@@ -134,3 +134,46 @@ const MAX_TOKEN_TTL_SECONDS: u32 = 900;
 let ttl = payload.ttl_seconds.min(MAX_TOKEN_TTL_SECONDS);
 ```
 Defense in depth - even if validation bypassed, tokens remain short-lived.
+
+---
+
+## Pattern: UserClaims with Custom Debug for Sensitive Field Redaction
+**Added**: 2026-01-15
+**Related files**: `crates/ac-service/src/crypto/mod.rs`
+
+User token claims contain sensitive fields (email, roles). Implement custom `Debug` trait to redact sensitive data in logs while preserving debuggability for non-sensitive fields:
+```rust
+impl fmt::Debug for UserClaims {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("UserClaims")
+            .field("sub", &self.sub)
+            .field("email", &"[REDACTED]")
+            .finish()
+    }
+}
+```
+Prevents accidental exposure of PII in error logs and debug output.
+
+---
+
+## Pattern: Subdomain-Based Organization Extraction Middleware
+**Added**: 2026-01-15
+**Related files**: `crates/ac-service/src/middleware/org_extraction.rs`
+
+Extract organization context from request Host header subdomain before handler execution. Middleware parses subdomain, looks up organization in database, and injects `OrgContext` via `Extension`. Handlers receive validated organization without repeated lookup logic. Pattern enables multi-tenant routing without path-based organization IDs.
+
+---
+
+## Pattern: Repository Functions for Domain Entity Lookups
+**Added**: 2026-01-15
+**Related files**: `crates/ac-service/src/repositories/users.rs`, `crates/ac-service/src/repositories/organizations.rs`
+
+Create dedicated repository modules for each domain entity with focused query functions: `get_user_by_email()`, `get_organization_by_subdomain()`. Keeps database access isolated from business logic. Each function handles one query with compile-time sqlx verification. Handlers and services compose these primitives rather than embedding SQL.
+
+---
+
+## Pattern: Auto-Login on Registration
+**Added**: 2026-01-15
+**Related files**: `crates/ac-service/src/handlers/auth_handler.rs`, `crates/ac-service/src/services/user_service.rs`
+
+Issue JWT token immediately after successful user registration in a single transaction. Eliminates need for separate login call, improves UX, and reduces round trips. Registration handler creates user, then calls token issuance with the newly created user record. Response includes both user info and access token.

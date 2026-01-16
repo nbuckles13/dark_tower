@@ -147,3 +147,27 @@ JWT validation includes algorithm pinning (token must have `alg: EdDSA`), but de
 JWKS endpoints should be validated for: (1) HTTPS scheme required (not HTTP), (2) No redirects to different hosts allowed, (3) Response size capped (prevent OOM via huge JWKS). In Global Controller Phase 2, only the JWK field validation was critical and implemented. HTTPS validation and cache stampede protection are Phase 3+ hardening items, documented as minor for future work. Current implementation logs warnings on HTTP client failures to surface misconfigurations.
 
 ---
+
+## Pattern: Custom Debug Redaction for PII Claims
+**Added**: 2026-01-15
+**Related files**: `crates/ac-service/src/crypto/mod.rs`
+
+Custom Debug implementations should redact PII fields like subject identifiers. Pattern: `impl fmt::Debug for Claims` with `.field("sub", &"[REDACTED]")` for any field containing user/client IDs. This prevents accidental exposure in debug output and logs. Non-PII fields like `exp`, `iat`, `scope` are safe to expose. This complements SecretString/SecretBox protection by handling structured types containing identifiers.
+
+---
+
+## Pattern: Timing-Safe Dummy Hash with Matching Cost
+**Added**: 2026-01-15
+**Related files**: `crates/ac-service/src/services/token_service.rs`
+
+When implementing constant-time authentication, the dummy hash used for non-existent users must use the same bcrypt cost factor as production hashes. Pattern: Store dummy hash at config load time with production cost, reuse for all non-existent user attempts. If cost changes dynamically, regenerate dummy hash immediately. This ensures timing is consistent regardless of user existence, preventing timing-based account enumeration.
+
+---
+
+## Pattern: Service Registration Only Exposes Secret Once
+**Added**: 2026-01-15
+**Related files**: `crates/ac-service/src/services/registration_service.rs`
+
+When registering services/users, the generated plaintext secret is exposed ONLY in the registration response. Pattern: (1) Generate secret with CSPRNG, (2) Hash for storage, (3) Expose plaintext only in RegisterServiceResponse, (4) Document "store this securely!" in response. After registration, the plaintext is never available again - even admins cannot retrieve it. This forces proper secret management: services must store the credential immediately or generate new ones. Example: `RegisterServiceResponse` with custom Serialize that exposes the client_secret.
+
+---

@@ -73,3 +73,33 @@ The GC test harness is reusable for all GC integration tests. Future test specs 
 6. Don't worry about cleanup - Drop impl handles it
 
 This pattern is similar to ac-test-utils' `TestAcServer` if it exists, or establishes the pattern for future services.
+
+---
+
+## Integration: User Provisioning Foundation in AC Service
+**Added**: 2026-01-15
+**Related files**: `crates/ac-service/src/models/users.rs`, `crates/ac-service/src/service/user_service.rs`, `crates/ac-service/src/handlers/user_handler.rs`
+
+User provisioning establishes these patterns for AC service:
+1. **Models**: UserClaims (private, for token validation), UserResponse (public, for API)
+2. **Service layer**: `UserService` wraps repository with domain logic, returns domain errors
+3. **Middleware**: `OrgContext` extracts organization ID from tokens, handlers use via Extension
+4. **Organization extraction**: Done in middleware, not handlers - centralizes auth logic
+5. **Error mapping**: Service errors map to HTTP status codes via IntoResponse trait
+
+When reviewing future user-related features (permissions, profile updates, etc.), ensure they follow these established patterns. User service is the canonical example of layered architecture for this project.
+
+---
+
+## Integration: Service Layer Pattern for Repositories
+**Added**: 2026-01-15
+**Related files**: `crates/ac-service/src/service/user_service.rs`, `crates/ac-service/src/repository/users.rs`
+
+The service layer pattern used in user provisioning is the template for all future AC service methods. Service functions should:
+1. Take repository functions as parameters or use dependency injection (not hardcoded)
+2. Wrap repository errors in domain-specific error types
+3. Add business logic (validation, filtering, transformation) between repository and handler
+4. Be unit-testable without database (mock repository layer)
+5. Implement `IntoResponse` on error type to map to HTTP status codes
+
+This pattern separates data access (repository) from business logic (service) from HTTP handling (handlers).

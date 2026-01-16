@@ -107,3 +107,42 @@ Files: `crypto/mod.rs`, `handlers/internal_tokens.rs`
 
 **TD-2**: Key loading/decryption block duplicated across handlers. Consider extracting to shared helper or service.
 Files: `handlers/auth_handler.rs`, `handlers/internal_tokens.rs`
+
+---
+
+## Integration: User Token Claims Structure (ADR-0020)
+**Added**: 2026-01-15
+**Related files**: `crates/ac-service/src/crypto/mod.rs`, `docs/decisions/adr-0020-user-tokens.md`
+
+User tokens follow ADR-0020 claim structure:
+- `sub`: User UUID (not email)
+- `org_id`: Organization UUID
+- `email`: User email address
+- `roles`: Array of role strings (e.g., ["admin", "member"])
+- `iat`: Issued-at timestamp
+- `exp`: Expiration timestamp (1 hour from issuance)
+- `jti`: Unique token ID for revocation tracking
+
+GC and MC should use `verify_user_jwt()` from ac-service crypto module to validate user tokens.
+
+---
+
+## Integration: Subdomain Requirement for User Endpoints
+**Added**: 2026-01-15
+**Related files**: `crates/ac-service/src/middleware/org_extraction.rs`, `crates/ac-service/src/routes/mod.rs`
+
+User-facing endpoints (`/api/v1/auth/register`, `/api/v1/auth/user/token`) require organization subdomain in Host header. Requests to these endpoints without valid subdomain receive 400 Bad Request. Integration tests must set Host header: `Host: acme.example.com`. The subdomain identifies the organization context for user operations.
+
+---
+
+## Integration: verify_user_jwt() for GC/MC Token Validation
+**Added**: 2026-01-15
+**Related files**: `crates/ac-service/src/crypto/mod.rs`
+
+GC and MC services should use `verify_user_jwt()` function to validate user tokens. This function:
+1. Fetches JWKS from AC's `/.well-known/jwks.json`
+2. Verifies EdDSA signature using `kid` header
+3. Validates `exp`, `iat`, and clock skew
+4. Returns `UserClaims` struct with all claim fields
+
+Different from `verify_jwt()` which returns service `Claims`. Token type should be checked before calling appropriate verification function.

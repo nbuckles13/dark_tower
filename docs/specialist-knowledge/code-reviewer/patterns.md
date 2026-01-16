@@ -212,3 +212,63 @@ Health checks for Kubernetes readiness/liveness probes should:
 6. Let K8s interpret the response body to make routing decisions
 
 This allows K8s to see unhealthy services and stop routing traffic, but doesn't cause the probe to timeout.
+
+---
+
+## Pattern: Repository Organization for Multiple Domain Entities
+**Added**: 2026-01-15
+**Related files**: `crates/ac-service/src/repository/users.rs`, `crates/ac-service/src/repository/organizations.rs`
+
+When a service manages multiple domain entities (users, organizations, clients, etc.), organize repositories as separate files in `src/repository/` directory, each scoped to one entity. Re-export all via `src/repository/mod.rs` for convenience. Each file should contain only that entity's queries and error types. This improves discoverability, reduces file complexity, and makes dependency relationships clear. Pattern is already established in AC service and extends well to GC.
+
+---
+
+## Pattern: Custom Debug Implementation for Sensitive Request/Response Types
+**Added**: 2026-01-15
+**Related files**: `crates/ac-service/src/models/users.rs`, `crates/ac-service/src/handlers/auth_handler.rs`
+
+Request and response types containing sensitive data (passwords, tokens, claims) should implement custom `Debug` to redact sensitive fields. Unlike Config structs, these typically don't contain `SecretBox` (which auto-redacts), so manual Debug is essential:
+```rust
+impl fmt::Debug for RegisterUserRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RegisterUserRequest")
+            .field("email", &self.email)
+            .field("password", &"[REDACTED]")
+            .finish()
+    }
+}
+```
+This prevents accidental credential leaks in logs when requests are formatted for debugging.
+
+---
+
+## Pattern: Middleware for Request Context Injection
+**Added**: 2026-01-15
+**Related files**: `crates/ac-service/src/middleware/org_context.rs`
+
+Use middleware to extract and attach request context (organization ID, user claims, request ID) to typed extensions. This allows handlers to receive context via Axum's `Extension` extractor without manual extraction in each handler. Pattern:
+1. Define a middleware function that parses tokens/headers and extracts context
+2. Attach context to `request.extensions_mut()`
+3. Handlers receive context via `Extension(OrgContext)` extractor
+4. Middleware should return error responses for invalid context, not panics
+5. Document what context is attached and when in the middleware module doc comment
+
+This centralizes context extraction logic and makes handler signatures clearer about their dependencies.
+
+---
+
+## Pattern: ServiceError Wrapping for Handler Results
+**Added**: 2026-01-15
+**Related files**: `crates/ac-service/src/handlers/`, `crates/ac-service/src/error.rs`
+
+Handlers that call service layer functions should use `?` operator with service layer error types (e.g., `UserServiceError`), not create new domain errors. The service layer defines domain-specific error variants (UserNotFound, InvalidPassword, etc.), and handlers map these to HTTP responses at the boundary. This preserves error context and makes error handling policy centralized. Pattern:
+```rust
+pub async fn get_user(
+    Extension(OrgContext { user_id, .. }): Extension<OrgContext>,
+    Extension(pool): Extension<PgPool>,
+) -> Result<Json<UserResponse>, UserServiceError> {
+    let user = user_service::get_user(user_id, &pool).await?;
+    Ok(Json(UserResponse::from(user)))
+}
+```
+The service layer returns `UserServiceError` which implements `IntoResponse` to map to HTTP status codes.
