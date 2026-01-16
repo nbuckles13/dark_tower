@@ -2,34 +2,53 @@ use crate::config::Config;
 #[cfg(test)]
 use crate::config::DEFAULT_BCRYPT_COST;
 use crate::errors::AcError;
+use crate::middleware::org_extraction::OrgContext;
 use crate::models::TokenResponse;
 use crate::observability::metrics::{record_error, record_token_issuance};
 use crate::observability::ErrorCategory;
-use crate::services::token_service;
+use crate::services::{token_service, user_service};
 use axum::{
-    extract::{ConnectInfo, State},
+    extract::{ConnectInfo, Extension, State},
     http::HeaderMap,
     Json,
 };
 use base64::{engine::general_purpose, Engine as _};
 use common::secret::{ExposeSecret, SecretString};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::instrument;
+use uuid::Uuid;
 
-/// User token request with password protected by SecretString.
+/// User token request (ADR-0020).
 ///
-/// The password field uses `SecretString` which:
-/// - Implements Debug with "[REDACTED]" to prevent accidental logging
-/// - Zeroizes memory on drop to prevent secrets lingering in memory
-/// - Requires explicit `.expose_secret()` call to access the value
+/// Uses email for identification (not username) per ADR-0020.
+/// The password field uses `SecretString` for security.
 #[derive(Debug, Deserialize)]
 pub struct UserTokenRequest {
-    pub username: String,
+    pub email: String,
     pub password: SecretString,
+}
+
+/// User registration request (ADR-0020).
+#[derive(Debug, Deserialize)]
+pub struct UserRegistrationRequest {
+    pub email: String,
+    pub password: SecretString,
+    pub display_name: String,
+}
+
+/// User registration response (ADR-0020).
+#[derive(Debug, Clone, Serialize)]
+pub struct UserRegistrationResponse {
+    pub user_id: Uuid,
+    pub email: String,
+    pub display_name: String,
+    pub access_token: String,
+    pub token_type: String,
+    pub expires_in: u64,
 }
 
 /// Service token request with client_secret protected by SecretString.
@@ -56,9 +75,11 @@ pub struct AppState {
     pub config: Config,
 }
 
-/// Handle user token request
+/// Handle user token request (ADR-0020).
 ///
 /// POST /api/v1/auth/user/token
+///
+/// Requires org context from middleware (subdomain-based org identification).
 ///
 /// ADR-0011: Handler instrumented with skip_all to prevent PII leakage.
 /// Only safe fields (grant_type, status) are recorded.
@@ -69,15 +90,29 @@ pub struct AppState {
 )]
 pub async fn handle_user_token(
     State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Extension(org_context): Extension<OrgContext>,
+    headers: HeaderMap,
     Json(payload): Json<UserTokenRequest>,
-) -> Result<Json<TokenResponse>, AcError> {
+) -> Result<Json<token_service::UserTokenResponse>, AcError> {
     let start = Instant::now();
+
+    // Extract IP address and User-Agent
+    let ip_address = Some(addr.ip().to_string());
+    let user_agent = headers
+        .get("user-agent")
+        .and_then(|h| h.to_str().ok())
+        .map(|s| s.to_string());
 
     let result = token_service::issue_user_token(
         &state.pool,
         state.config.master_key.expose_secret(),
-        &payload.username,
+        state.config.hash_secret.expose_secret(),
+        org_context.org_id,
+        &payload.email,
         payload.password.expose_secret(),
+        ip_address.as_deref(),
+        user_agent.as_deref(),
     )
     .await;
 
@@ -92,6 +127,70 @@ pub async fn handle_user_token(
         Err(e) => {
             let category = ErrorCategory::from(&e);
             record_error("issue_user_token", category.as_str(), e.status_code());
+            Err(e)
+        }
+    }
+}
+
+/// Handle user registration request (ADR-0020).
+///
+/// POST /api/v1/auth/register
+///
+/// Requires org context from middleware (subdomain-based org identification).
+/// Creates a new user and returns an auto-login token.
+///
+/// ADR-0011: Handler instrumented with skip_all to prevent PII leakage.
+#[instrument(name = "ac.auth.register", skip_all, fields(status))]
+pub async fn handle_register(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Extension(org_context): Extension<OrgContext>,
+    headers: HeaderMap,
+    Json(payload): Json<UserRegistrationRequest>,
+) -> Result<Json<UserRegistrationResponse>, AcError> {
+    let start = Instant::now();
+
+    // Extract IP address and User-Agent
+    let ip_address = Some(addr.ip().to_string());
+    let user_agent = headers
+        .get("user-agent")
+        .and_then(|h| h.to_str().ok())
+        .map(|s| s.to_string());
+
+    let request = user_service::RegistrationRequest {
+        email: payload.email,
+        password: payload.password.expose_secret().to_string(),
+        display_name: payload.display_name,
+    };
+
+    let result = user_service::register_user(
+        &state.pool,
+        state.config.master_key.expose_secret(),
+        state.config.hash_secret.expose_secret(),
+        org_context.org_id,
+        request,
+        ip_address.as_deref(),
+        user_agent.as_deref(),
+    )
+    .await;
+
+    let duration = start.elapsed();
+    let status = if result.is_ok() { "success" } else { "error" };
+    tracing::Span::current().record("status", status);
+    record_token_issuance("registration", status, duration);
+
+    match result {
+        Ok(response) => Ok(Json(UserRegistrationResponse {
+            user_id: response.user_id,
+            email: response.email,
+            display_name: response.display_name,
+            access_token: response.access_token,
+            token_type: response.token_type,
+            expires_in: response.expires_in,
+        })),
+        Err(e) => {
+            let category = ErrorCategory::from(&e);
+            record_error("register_user", category.as_str(), e.status_code());
             Err(e)
         }
     }
@@ -512,12 +611,12 @@ mod tests {
     #[test]
     fn test_user_token_request_deserialization() {
         let json = r#"{
-            "username": "testuser",
+            "email": "testuser@example.com",
             "password": "testpass"
         }"#;
 
         let req: UserTokenRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(req.username, "testuser");
+        assert_eq!(req.email, "testuser@example.com");
         assert_eq!(req.password.expose_secret(), "testpass");
     }
 
@@ -527,14 +626,14 @@ mod tests {
     #[test]
     fn test_user_token_request_debug() {
         let req = UserTokenRequest {
-            username: "testuser".to_string(),
+            email: "testuser@example.com".to_string(),
             password: SecretString::from("secret123"),
         };
 
         let debug_str = format!("{:?}", req);
-        // Debug should show the struct name and username
+        // Debug should show the struct name and email
         assert!(debug_str.contains("UserTokenRequest"));
-        assert!(debug_str.contains("testuser"));
+        assert!(debug_str.contains("testuser@example.com"));
         // Password should be redacted, not exposed
         assert!(!debug_str.contains("secret123"));
         assert!(debug_str.contains("REDACTED"));

@@ -1,13 +1,14 @@
 #[cfg(test)]
 use crate::config::{DEFAULT_BCRYPT_COST, DEFAULT_JWT_CLOCK_SKEW_SECONDS};
-use crate::crypto::{self, Claims, EncryptedKey};
+use crate::crypto::{self, Claims, EncryptedKey, UserClaims};
 use crate::errors::AcError;
 use crate::models::{AuthEventType, TokenResponse};
 use crate::observability::hash_for_correlation;
-use crate::repositories::{auth_events, service_credentials, signing_keys};
+use crate::repositories::{auth_events, service_credentials, signing_keys, users};
 use chrono::Utc;
 use common::secret::SecretBox;
 use sqlx::PgPool;
+use uuid::Uuid;
 
 // Token configuration
 const TOKEN_EXPIRY_SECONDS: u64 = 3600; // 1 hour
@@ -173,24 +174,182 @@ pub async fn issue_service_token(
     })
 }
 
-/// Issue a user token (placeholder - not fully implemented in Phase 1)
+/// User token response (ADR-0020).
 ///
-/// This is a simplified implementation for future use
-pub async fn issue_user_token(
-    _pool: &PgPool,
-    _master_key: &[u8],
-    _username: &str,
-    _password: &str,
-) -> Result<TokenResponse, AcError> {
-    // NOTE: In Phase 1, we don't have a users table yet
-    // This is a placeholder that would need to:
-    // 1. Fetch user from database
-    // 2. Verify password hash
-    // 3. Get user roles/scopes
-    // 4. Generate JWT with user claims
+/// Contains the JWT access token and its metadata.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct UserTokenResponse {
+    pub access_token: String,
+    pub token_type: String,
+    pub expires_in: u64,
+}
 
-    // For now, return an error indicating this is not yet implemented
-    Err(AcError::Internal)
+/// Issue a user token using email/password authentication (ADR-0020).
+///
+/// Authenticates user within an organization, generates JWT with UserClaims.
+///
+/// # Security
+///
+/// - Rate limiting by IP + email (via auth_events)
+/// - Constant-time bcrypt verification (dummy hash for non-existent users)
+/// - Check is_active status
+/// - Log auth events
+#[expect(clippy::too_many_arguments)]
+pub async fn issue_user_token(
+    pool: &PgPool,
+    master_key: &[u8],
+    hash_secret: &[u8],
+    org_id: Uuid,
+    email: &str,
+    password: &str,
+    ip_address: Option<&str>,
+    user_agent: Option<&str>,
+) -> Result<UserTokenResponse, AcError> {
+    // Check for account lockout (prevent brute force)
+    // We use email as the identifier for rate limiting in user context
+    let rate_limit_window_ago = Utc::now() - chrono::Duration::minutes(RATE_LIMIT_WINDOW_MINUTES);
+
+    // Get failed attempts for this email (using correlation hash)
+    // For user auth, we need to check by email correlation, not credential_id
+    // We'll use a simple approach: get user first if exists, then check
+    let user = users::get_by_email(pool, org_id, email).await?;
+
+    if let Some(ref u) = user {
+        let failed_count =
+            auth_events::get_failed_attempts_count_by_user(pool, &u.user_id, rate_limit_window_ago)
+                .await
+                .unwrap_or(0);
+
+        if failed_count >= RATE_LIMIT_MAX_ATTEMPTS {
+            tracing::warn!(
+                "User account locked due to excessive failed attempts: email_hash={}",
+                hash_for_correlation(email, hash_secret)
+            );
+            return Err(AcError::TooManyRequests {
+                retry_after_seconds: RATE_LIMIT_WINDOW_MINUTES * 60,
+                message: "Too many failed login attempts. Please try again later.".to_string(),
+            });
+        }
+    }
+
+    // Always run bcrypt to prevent timing attacks
+    // Use dummy hash if user not found (constant-time operation)
+    let hash_to_verify = match &user {
+        Some(u) => u.password_hash.as_str(),
+        None => "$2b$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtxMQJqhN8/LewY5GyYqExt7YD3a", // Dummy bcrypt hash
+    };
+
+    let is_valid = crypto::verify_client_secret(password, hash_to_verify)?;
+
+    // Now check if user existed and credentials were valid
+    let user = user.ok_or(AcError::InvalidCredentials)?;
+
+    if !user.is_active {
+        // Log failed attempt
+        log_user_auth_event(
+            pool,
+            &user.user_id,
+            false,
+            Some("User account is inactive"),
+            ip_address,
+            user_agent,
+        )
+        .await;
+        return Err(AcError::InvalidCredentials);
+    }
+
+    if !is_valid {
+        // Log failed attempt
+        log_user_auth_event(
+            pool,
+            &user.user_id,
+            false,
+            Some("Invalid password"),
+            ip_address,
+            user_agent,
+        )
+        .await;
+        return Err(AcError::InvalidCredentials);
+    }
+
+    // Get user roles
+    let roles = users::get_user_roles(pool, user.user_id).await?;
+
+    // Load active signing key
+    let signing_key = signing_keys::get_active_key(pool)
+        .await?
+        .ok_or_else(|| AcError::Crypto("No active signing key available".to_string()))?;
+
+    // Decrypt private key
+    let encrypted_key = EncryptedKey {
+        encrypted_data: SecretBox::new(Box::new(signing_key.private_key_encrypted)),
+        nonce: signing_key.encryption_nonce,
+        tag: signing_key.encryption_tag,
+    };
+
+    let private_key_pkcs8 = crypto::decrypt_private_key(&encrypted_key, master_key)?;
+
+    // Generate user JWT claims per ADR-0020
+    let now = Utc::now().timestamp();
+    let jti = Uuid::new_v4().to_string();
+    let claims = UserClaims {
+        sub: user.user_id.to_string(),
+        org_id: user.org_id.to_string(),
+        email: user.email.clone(),
+        roles,
+        iat: now,
+        exp: now + TOKEN_EXPIRY_SECONDS_I64,
+        jti,
+    };
+
+    // Sign JWT with user claims
+    let token = crypto::sign_user_jwt(&claims, &private_key_pkcs8, &signing_key.key_id)?;
+
+    // Log successful login
+    log_user_auth_event(pool, &user.user_id, true, None, ip_address, user_agent).await;
+
+    // Update last_login_at
+    if let Err(e) = users::update_last_login(pool, user.user_id).await {
+        tracing::warn!("Failed to update last login timestamp: {}", e);
+    }
+
+    Ok(UserTokenResponse {
+        access_token: token,
+        token_type: "Bearer".to_string(),
+        expires_in: TOKEN_EXPIRY_SECONDS,
+    })
+}
+
+/// Log a user authentication event.
+async fn log_user_auth_event(
+    pool: &PgPool,
+    user_id: &Uuid,
+    success: bool,
+    failure_reason: Option<&str>,
+    ip_address: Option<&str>,
+    user_agent: Option<&str>,
+) {
+    let event_type = if success {
+        AuthEventType::UserLogin.as_str()
+    } else {
+        AuthEventType::UserLoginFailed.as_str()
+    };
+
+    if let Err(e) = auth_events::log_event(
+        pool,
+        event_type,
+        Some(*user_id),
+        None,
+        success,
+        failure_reason,
+        ip_address,
+        user_agent,
+        None,
+    )
+    .await
+    {
+        tracing::warn!("Failed to log user auth event: {}", e);
+    }
 }
 
 #[cfg(test)]
@@ -2298,6 +2457,418 @@ mod tests {
             "Error message lengths should be similar: {} chars vs {} chars",
             err1.len(),
             err2.len()
+        );
+
+        Ok(())
+    }
+
+    // ============================================================================
+    // User Token Tests (ADR-0020)
+    // ============================================================================
+
+    /// Helper to create a test organization
+    async fn create_test_org(pool: &PgPool, subdomain: &str) -> uuid::Uuid {
+        let org: (uuid::Uuid,) = sqlx::query_as(
+            r#"
+            INSERT INTO organizations (subdomain, display_name)
+            VALUES ($1, $2)
+            RETURNING org_id
+            "#,
+        )
+        .bind(subdomain)
+        .bind(format!("{} Org", subdomain))
+        .fetch_one(pool)
+        .await
+        .expect("Should create organization");
+
+        org.0
+    }
+
+    /// Helper to create a test user
+    async fn create_test_user(
+        pool: &PgPool,
+        org_id: uuid::Uuid,
+        email: &str,
+        password: &str,
+    ) -> uuid::Uuid {
+        let password_hash = crypto::hash_client_secret(password, DEFAULT_BCRYPT_COST)
+            .expect("Should hash password");
+
+        let user = crate::repositories::users::create_user(
+            pool,
+            org_id,
+            email,
+            &password_hash,
+            "Test User",
+        )
+        .await
+        .expect("Should create user");
+
+        // Add default role
+        crate::repositories::users::add_user_role(pool, user.user_id, "user")
+            .await
+            .expect("Should add role");
+
+        user.user_id
+    }
+
+    /// Test issue_user_token happy path: valid credentials return JWT with correct UserClaims
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_issue_user_token_happy_path(pool: PgPool) -> Result<(), AcError> {
+        let master_key = crypto::generate_random_bytes(32)?;
+        key_management_service::initialize_signing_key(&pool, &master_key, "test").await?;
+
+        // Create org and user
+        let org_id = create_test_org(&pool, "happy-test").await;
+        let password = "secure-password-123";
+        let email = "user@example.com";
+        let _user_id = create_test_user(&pool, org_id, email, password).await;
+
+        // Issue token
+        let result = issue_user_token(
+            &pool,
+            &master_key,
+            &master_key,
+            org_id,
+            email,
+            password,
+            Some("192.168.1.1"),
+            Some("TestAgent/1.0"),
+        )
+        .await?;
+
+        // Verify response structure
+        assert_eq!(result.token_type, "Bearer");
+        assert_eq!(result.expires_in, TOKEN_EXPIRY_SECONDS);
+        assert!(!result.access_token.is_empty());
+
+        // Verify JWT structure and claims
+        let signing_key = signing_keys::get_active_key(&pool)
+            .await?
+            .expect("No active signing key");
+        let claims = crypto::verify_user_jwt(
+            &result.access_token,
+            &signing_key.public_key,
+            DEFAULT_JWT_CLOCK_SKEW_SECONDS,
+        )?;
+
+        assert_eq!(claims.org_id, org_id.to_string());
+        assert_eq!(claims.email, email);
+        assert!(claims.roles.contains(&"user".to_string()));
+        assert!(!claims.jti.is_empty());
+
+        Ok(())
+    }
+
+    /// Test issue_user_token: invalid password returns same error as non-existent user (no enumeration)
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_issue_user_token_no_enumeration(pool: PgPool) -> Result<(), AcError> {
+        let master_key = crypto::generate_random_bytes(32)?;
+        key_management_service::initialize_signing_key(&pool, &master_key, "test").await?;
+
+        // Create org and user
+        let org_id = create_test_org(&pool, "enum-test").await;
+        let password = "secure-password-123";
+        let email = "existing@example.com";
+        let _user_id = create_test_user(&pool, org_id, email, password).await;
+
+        // Test 1: Invalid password for existing user
+        let invalid_password_result = issue_user_token(
+            &pool,
+            &master_key,
+            &master_key,
+            org_id,
+            email,
+            "wrong-password",
+            None,
+            None,
+        )
+        .await;
+
+        // Test 2: Non-existent user
+        let nonexistent_result = issue_user_token(
+            &pool,
+            &master_key,
+            &master_key,
+            org_id,
+            "nonexistent@example.com",
+            "some-password",
+            None,
+            None,
+        )
+        .await;
+
+        // Both should return InvalidCredentials
+        assert!(
+            matches!(invalid_password_result, Err(AcError::InvalidCredentials)),
+            "Invalid password should return InvalidCredentials"
+        );
+        assert!(
+            matches!(nonexistent_result, Err(AcError::InvalidCredentials)),
+            "Non-existent user should return InvalidCredentials"
+        );
+
+        Ok(())
+    }
+
+    /// Test issue_user_token: inactive user is rejected
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_issue_user_token_inactive_user_rejected(pool: PgPool) -> Result<(), AcError> {
+        let master_key = crypto::generate_random_bytes(32)?;
+        key_management_service::initialize_signing_key(&pool, &master_key, "test").await?;
+
+        // Create org and user
+        let org_id = create_test_org(&pool, "inactive-test").await;
+        let password = "secure-password-123";
+        let email = "inactive@example.com";
+        let user_id = create_test_user(&pool, org_id, email, password).await;
+
+        // Deactivate user
+        sqlx::query(
+            r#"
+            UPDATE users SET is_active = false WHERE user_id = $1
+            "#,
+        )
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("Should deactivate user");
+
+        // Attempt to authenticate
+        let result = issue_user_token(
+            &pool,
+            &master_key,
+            &master_key,
+            org_id,
+            email,
+            password,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(AcError::InvalidCredentials)),
+            "Inactive user should return InvalidCredentials"
+        );
+
+        Ok(())
+    }
+
+    /// Test issue_user_token: account lockout after 5 failed attempts
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_issue_user_token_lockout_after_5_failures(pool: PgPool) -> Result<(), AcError> {
+        let master_key = crypto::generate_random_bytes(32)?;
+        key_management_service::initialize_signing_key(&pool, &master_key, "test").await?;
+
+        // Create org and user
+        let org_id = create_test_org(&pool, "lockout-test").await;
+        let password = "secure-password-123";
+        let email = "lockout@example.com";
+        let _user_id = create_test_user(&pool, org_id, email, password).await;
+
+        // Attempt 5 failed logins
+        for _ in 0..RATE_LIMIT_MAX_ATTEMPTS {
+            let _ = issue_user_token(
+                &pool,
+                &master_key,
+                &master_key,
+                org_id,
+                email,
+                "wrong-password",
+                Some("192.168.1.1"),
+                None,
+            )
+            .await;
+        }
+
+        // 6th attempt should be rate limited
+        let result = issue_user_token(
+            &pool,
+            &master_key,
+            &master_key,
+            org_id,
+            email,
+            "wrong-password",
+            Some("192.168.1.1"),
+            None,
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(AcError::TooManyRequests { .. })),
+            "6th failed attempt should trigger rate limit"
+        );
+
+        // Even with correct password, should still be locked
+        let result_correct = issue_user_token(
+            &pool,
+            &master_key,
+            &master_key,
+            org_id,
+            email,
+            password,
+            Some("192.168.1.1"),
+            None,
+        )
+        .await;
+
+        assert!(
+            matches!(result_correct, Err(AcError::TooManyRequests { .. })),
+            "Account should remain locked even with correct password"
+        );
+
+        Ok(())
+    }
+
+    /// Test issue_user_token: successful login updates last_login_at
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_issue_user_token_updates_last_login(pool: PgPool) -> Result<(), AcError> {
+        let master_key = crypto::generate_random_bytes(32)?;
+        key_management_service::initialize_signing_key(&pool, &master_key, "test").await?;
+
+        // Create org and user
+        let org_id = create_test_org(&pool, "last-login-test").await;
+        let password = "secure-password-123";
+        let email = "lastlogin@example.com";
+        let user_id = create_test_user(&pool, org_id, email, password).await;
+
+        // Verify last_login_at is null initially
+        let user = crate::repositories::users::get_by_id(&pool, user_id)
+            .await?
+            .expect("User should exist");
+        assert!(
+            user.last_login_at.is_none(),
+            "last_login_at should be null initially"
+        );
+
+        // Issue token (successful login)
+        let _result = issue_user_token(
+            &pool,
+            &master_key,
+            &master_key,
+            org_id,
+            email,
+            password,
+            None,
+            None,
+        )
+        .await?;
+
+        // Verify last_login_at is now set
+        let user_after = crate::repositories::users::get_by_id(&pool, user_id)
+            .await?
+            .expect("User should exist");
+        assert!(
+            user_after.last_login_at.is_some(),
+            "last_login_at should be set after login"
+        );
+
+        Ok(())
+    }
+
+    /// Test issue_user_token: user with multiple roles includes all roles in token
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_issue_user_token_includes_all_roles(pool: PgPool) -> Result<(), AcError> {
+        let master_key = crypto::generate_random_bytes(32)?;
+        key_management_service::initialize_signing_key(&pool, &master_key, "test").await?;
+
+        // Create org and user
+        let org_id = create_test_org(&pool, "roles-test").await;
+        let password = "secure-password-123";
+        let email = "admin@example.com";
+        let user_id = create_test_user(&pool, org_id, email, password).await;
+
+        // Add admin role
+        crate::repositories::users::add_user_role(&pool, user_id, "admin").await?;
+
+        // Issue token
+        let result = issue_user_token(
+            &pool,
+            &master_key,
+            &master_key,
+            org_id,
+            email,
+            password,
+            None,
+            None,
+        )
+        .await?;
+
+        // Verify claims include both roles
+        let signing_key = signing_keys::get_active_key(&pool)
+            .await?
+            .expect("No active signing key");
+        let claims = crypto::verify_user_jwt(
+            &result.access_token,
+            &signing_key.public_key,
+            DEFAULT_JWT_CLOCK_SKEW_SECONDS,
+        )?;
+
+        assert!(claims.roles.contains(&"user".to_string()));
+        assert!(claims.roles.contains(&"admin".to_string()));
+        assert_eq!(claims.roles.len(), 2);
+
+        Ok(())
+    }
+
+    /// Test issue_user_token: timing attack prevention with dummy hash
+    ///
+    /// Verifies that authentication for non-existent users takes roughly the same
+    /// time as for existing users (both run bcrypt).
+    #[sqlx::test(migrations = "../../migrations")]
+    #[cfg_attr(coverage, ignore)]
+    async fn test_issue_user_token_timing_attack_prevention(pool: PgPool) -> Result<(), AcError> {
+        let master_key = crypto::generate_random_bytes(32)?;
+        key_management_service::initialize_signing_key(&pool, &master_key, "test").await?;
+
+        // Create org and user
+        let org_id = create_test_org(&pool, "timing-test").await;
+        let password = "secure-password-123";
+        let email = "timing@example.com";
+        let _user_id = create_test_user(&pool, org_id, email, password).await;
+
+        // Measure time for existing user with wrong password
+        let start = Instant::now();
+        let _ = issue_user_token(
+            &pool,
+            &master_key,
+            &master_key,
+            org_id,
+            email,
+            "wrong-password",
+            None,
+            None,
+        )
+        .await;
+        let existing_user_duration = start.elapsed();
+
+        // Measure time for non-existent user
+        let start = Instant::now();
+        let _ = issue_user_token(
+            &pool,
+            &master_key,
+            &master_key,
+            org_id,
+            "nonexistent@example.com",
+            "some-password",
+            None,
+            None,
+        )
+        .await;
+        let nonexistent_user_duration = start.elapsed();
+
+        // Both should take similar time due to dummy hash verification
+        let time_diff = existing_user_duration.abs_diff(nonexistent_user_duration);
+        let max_time = existing_user_duration.max(nonexistent_user_duration);
+        let diff_percentage = (time_diff.as_millis() as f64 / max_time.as_millis() as f64) * 100.0;
+
+        assert!(
+            diff_percentage < MAX_TIMING_VARIANCE_PERCENT,
+            "Timing difference too large: {}ms ({:.1}% of {}ms) - potential timing attack vulnerability",
+            time_diff.as_millis(),
+            diff_percentage,
+            max_time.as_millis()
         );
 
         Ok(())

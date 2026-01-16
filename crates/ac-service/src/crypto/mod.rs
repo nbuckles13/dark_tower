@@ -464,6 +464,154 @@ pub fn generate_client_secret() -> Result<SecretString, AcError> {
     Ok(SecretString::from(encoded))
 }
 
+// ============================================================================
+// User Token Support (ADR-0020)
+// ============================================================================
+
+/// User JWT Claims structure per ADR-0020.
+///
+/// User tokens are issued by AC for authenticated users and include
+/// organization membership information.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct UserClaims {
+    /// Subject (user UUID)
+    pub sub: String,
+    /// Organization ID the user belongs to
+    pub org_id: String,
+    /// User's email address
+    pub email: String,
+    /// User roles (e.g., ["user"], ["user", "admin"])
+    pub roles: Vec<String>,
+    /// Issued at timestamp
+    pub iat: i64,
+    /// Expiration timestamp
+    pub exp: i64,
+    /// Unique token identifier for revocation
+    pub jti: String,
+}
+
+/// Custom Debug implementation that redacts sensitive fields.
+///
+/// The `sub`, `email`, and `jti` fields are sensitive and should not
+/// be exposed in logs or debug output.
+impl fmt::Debug for UserClaims {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("UserClaims")
+            .field("sub", &"[REDACTED]")
+            .field("org_id", &self.org_id)
+            .field("email", &"[REDACTED]")
+            .field("roles", &self.roles)
+            .field("iat", &self.iat)
+            .field("exp", &self.exp)
+            .field("jti", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// Sign a user JWT with EdDSA private key.
+///
+/// Uses the same signing infrastructure as service tokens but with
+/// UserClaims structure per ADR-0020.
+#[instrument(skip_all)]
+pub fn sign_user_jwt(
+    claims: &UserClaims,
+    private_key_pkcs8: &[u8],
+    key_id: &str,
+) -> Result<String, AcError> {
+    use ring::signature::Ed25519KeyPair;
+
+    // Validate the private key format
+    let _key_pair = Ed25519KeyPair::from_pkcs8(private_key_pkcs8).map_err(|_| {
+        tracing::error!(target: "crypto", "Invalid private key format");
+        AcError::Crypto("JWT signing failed".to_string())
+    })?;
+
+    let encoding_key = EncodingKey::from_ed_der(private_key_pkcs8);
+
+    let mut header = Header::new(Algorithm::EdDSA);
+    header.typ = Some("JWT".to_string());
+    header.kid = Some(key_id.to_string());
+
+    let token = encode(&header, claims, &encoding_key).map_err(|_| {
+        tracing::error!(target: "crypto", "JWT signing operation failed");
+        AcError::Crypto("JWT signing failed".to_string())
+    })?;
+
+    Ok(token)
+}
+
+/// Verify a user JWT and extract claims.
+///
+/// Validates:
+/// - Token size (must be <= MAX_JWT_SIZE_BYTES)
+/// - Signature (EdDSA/Ed25519)
+/// - Expiration (`exp` claim)
+/// - Issued-at time (`iat` claim) with clock skew tolerance
+#[allow(dead_code)] // Library function - will be used by GC and MC for token validation
+#[instrument(skip_all)]
+pub fn verify_user_jwt(
+    token: &str,
+    public_key_pem: &str,
+    clock_skew_seconds: i64,
+) -> Result<UserClaims, AcError> {
+    // Check token size BEFORE any parsing
+    if token.len() > MAX_JWT_SIZE_BYTES {
+        tracing::debug!(
+            target: "crypto",
+            token_size = token.len(),
+            max_size = MAX_JWT_SIZE_BYTES,
+            "User token rejected: size exceeds maximum allowed"
+        );
+        return Err(AcError::InvalidToken(
+            "The access token is invalid or expired".to_string(),
+        ));
+    }
+
+    // Extract base64 from PEM format
+    let public_key_b64 = public_key_pem
+        .lines()
+        .filter(|line| !line.starts_with("-----"))
+        .collect::<String>();
+
+    let public_key_bytes = general_purpose::STANDARD
+        .decode(&public_key_b64)
+        .map_err(|_| {
+            tracing::debug!(target: "crypto", "Invalid public key encoding");
+            AcError::InvalidToken("The access token is invalid or expired".to_string())
+        })?;
+
+    let decoding_key = DecodingKey::from_ed_der(&public_key_bytes);
+
+    let mut validation = Validation::new(Algorithm::EdDSA);
+    validation.validate_exp = true;
+
+    let token_data = decode::<UserClaims>(token, &decoding_key, &validation).map_err(|_| {
+        tracing::debug!(target: "crypto", "User token verification failed");
+        AcError::InvalidToken("The access token is invalid or expired".to_string())
+    })?;
+
+    // Validate iat (issued-at) claim with clock skew tolerance
+    let now = chrono::Utc::now().timestamp();
+    let max_iat = now + clock_skew_seconds;
+
+    if token_data.claims.iat > max_iat {
+        tracing::debug!(
+            target: "crypto",
+            iat = token_data.claims.iat,
+            now = now,
+            max_allowed = max_iat,
+            clock_skew_seconds = clock_skew_seconds,
+            "User token rejected: iat too far in the future"
+        );
+        record_token_validation("error", Some("clock_skew"));
+        return Err(AcError::InvalidToken(
+            "The access token is invalid or expired".to_string(),
+        ));
+    }
+
+    Ok(token_data.claims)
+}
+
 #[cfg(test)]
 #[allow(clippy::panic, clippy::assertions_on_constants)]
 mod tests {
@@ -1727,5 +1875,310 @@ mod tests {
         let hash = hash_client_secret("test", DEFAULT_BCRYPT_COST).unwrap();
         let cost = hash.split('$').nth(2).unwrap();
         assert_eq!(cost, "12");
+    }
+
+    // ============================================================================
+    // User JWT Tests (ADR-0020)
+    // ============================================================================
+
+    /// Test sign_user_jwt produces valid JWT with correct claims
+    #[test]
+    fn test_sign_user_jwt_valid_jwt() {
+        let (public_pem, private_pkcs8) = generate_signing_key().unwrap();
+
+        let claims = UserClaims {
+            sub: "user-123".to_string(),
+            org_id: "org-456".to_string(),
+            email: "user@example.com".to_string(),
+            roles: vec!["user".to_string(), "admin".to_string()],
+            iat: chrono::Utc::now().timestamp(),
+            exp: chrono::Utc::now().timestamp() + 3600,
+            jti: "jti-789".to_string(),
+        };
+
+        let token = sign_user_jwt(&claims, &private_pkcs8, "user-key-01").unwrap();
+
+        // Verify it's a valid JWT structure (3 parts)
+        let parts: Vec<&str> = token.split('.').collect();
+        assert_eq!(parts.len(), 3, "JWT should have 3 parts");
+
+        // Verify the token can be verified with the public key
+        let verified =
+            verify_user_jwt(&token, &public_pem, DEFAULT_JWT_CLOCK_SKEW_SECONDS).unwrap();
+        assert_eq!(verified.sub, claims.sub);
+        assert_eq!(verified.org_id, claims.org_id);
+        assert_eq!(verified.email, claims.email);
+        assert_eq!(verified.roles, claims.roles);
+        assert_eq!(verified.jti, claims.jti);
+    }
+
+    /// Test sign_user_jwt includes kid in header
+    #[test]
+    fn test_sign_user_jwt_includes_kid_header() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+
+        let (_, private_pkcs8) = generate_signing_key().unwrap();
+
+        let claims = UserClaims {
+            sub: "user-123".to_string(),
+            org_id: "org-456".to_string(),
+            email: "user@example.com".to_string(),
+            roles: vec!["user".to_string()],
+            iat: chrono::Utc::now().timestamp(),
+            exp: chrono::Utc::now().timestamp() + 3600,
+            jti: "jti-789".to_string(),
+        };
+
+        let key_id = "user-signing-key-2026-01";
+        let token = sign_user_jwt(&claims, &private_pkcs8, key_id).unwrap();
+
+        // Extract and decode the header
+        let parts: Vec<&str> = token.split('.').collect();
+        let header_bytes = URL_SAFE_NO_PAD
+            .decode(parts[0])
+            .expect("Failed to decode header");
+        let header: serde_json::Value =
+            serde_json::from_slice(&header_bytes).expect("Failed to parse header JSON");
+
+        assert_eq!(header["kid"].as_str().unwrap(), key_id);
+        assert_eq!(header["alg"].as_str().unwrap(), "EdDSA");
+        assert_eq!(header["typ"].as_str().unwrap(), "JWT");
+    }
+
+    /// Test verify_user_jwt validates signature and claims
+    #[test]
+    fn test_verify_user_jwt_validates_signature() {
+        let (public_pem, private_pkcs8) = generate_signing_key().unwrap();
+        let (wrong_public_pem, _) = generate_signing_key().unwrap(); // Different keypair
+
+        let claims = UserClaims {
+            sub: "user-123".to_string(),
+            org_id: "org-456".to_string(),
+            email: "user@example.com".to_string(),
+            roles: vec!["user".to_string()],
+            iat: chrono::Utc::now().timestamp(),
+            exp: chrono::Utc::now().timestamp() + 3600,
+            jti: "jti-789".to_string(),
+        };
+
+        let token = sign_user_jwt(&claims, &private_pkcs8, "test-key").unwrap();
+
+        // Should verify with correct key
+        assert!(verify_user_jwt(&token, &public_pem, DEFAULT_JWT_CLOCK_SKEW_SECONDS).is_ok());
+
+        // Should fail with wrong key
+        let result = verify_user_jwt(&token, &wrong_public_pem, DEFAULT_JWT_CLOCK_SKEW_SECONDS);
+        assert!(matches!(result, Err(AcError::InvalidToken(_))));
+    }
+
+    /// Test verify_user_jwt rejects expired tokens
+    #[test]
+    fn test_verify_user_jwt_rejects_expired() {
+        let (public_pem, private_pkcs8) = generate_signing_key().unwrap();
+
+        let claims = UserClaims {
+            sub: "user-123".to_string(),
+            org_id: "org-456".to_string(),
+            email: "user@example.com".to_string(),
+            roles: vec!["user".to_string()],
+            iat: chrono::Utc::now().timestamp() - 7200, // 2 hours ago
+            exp: chrono::Utc::now().timestamp() - 3600, // Expired 1 hour ago
+            jti: "jti-789".to_string(),
+        };
+
+        let token = sign_user_jwt(&claims, &private_pkcs8, "test-key").unwrap();
+
+        let result = verify_user_jwt(&token, &public_pem, DEFAULT_JWT_CLOCK_SKEW_SECONDS);
+        assert!(matches!(result, Err(AcError::InvalidToken(_))));
+    }
+
+    /// Test verify_user_jwt rejects future iat beyond clock skew
+    #[test]
+    fn test_verify_user_jwt_rejects_future_iat() {
+        let (public_pem, private_pkcs8) = generate_signing_key().unwrap();
+
+        let now = chrono::Utc::now().timestamp();
+        let claims = UserClaims {
+            sub: "user-123".to_string(),
+            org_id: "org-456".to_string(),
+            email: "user@example.com".to_string(),
+            roles: vec!["user".to_string()],
+            iat: now + 3600, // 1 hour in the future (beyond 5 min clock skew)
+            exp: now + 7200, // Expires in 2 hours
+            jti: "jti-789".to_string(),
+        };
+
+        let token = sign_user_jwt(&claims, &private_pkcs8, "test-key").unwrap();
+
+        let result = verify_user_jwt(&token, &public_pem, DEFAULT_JWT_CLOCK_SKEW_SECONDS);
+        assert!(matches!(result, Err(AcError::InvalidToken(_))));
+    }
+
+    /// Test verify_user_jwt accepts iat within clock skew
+    #[test]
+    fn test_verify_user_jwt_accepts_iat_within_skew() {
+        let (public_pem, private_pkcs8) = generate_signing_key().unwrap();
+
+        let now = chrono::Utc::now().timestamp();
+        let claims = UserClaims {
+            sub: "user-123".to_string(),
+            org_id: "org-456".to_string(),
+            email: "user@example.com".to_string(),
+            roles: vec!["user".to_string()],
+            iat: now + 120, // 2 minutes in the future (within 5 min clock skew)
+            exp: now + 3600,
+            jti: "jti-789".to_string(),
+        };
+
+        let token = sign_user_jwt(&claims, &private_pkcs8, "test-key").unwrap();
+
+        let result = verify_user_jwt(&token, &public_pem, DEFAULT_JWT_CLOCK_SKEW_SECONDS);
+        assert!(result.is_ok());
+    }
+
+    /// Test verify_user_jwt rejects oversized tokens
+    #[test]
+    fn test_verify_user_jwt_rejects_oversized() {
+        let (public_pem, _) = generate_signing_key().unwrap();
+
+        // Create an oversized token
+        let oversized_token = "a".repeat(MAX_JWT_SIZE_BYTES + 1);
+
+        let result = verify_user_jwt(
+            &oversized_token,
+            &public_pem,
+            DEFAULT_JWT_CLOCK_SKEW_SECONDS,
+        );
+        assert!(matches!(result, Err(AcError::InvalidToken(_))));
+    }
+
+    /// Test UserClaims Debug implementation redacts sensitive fields
+    #[test]
+    fn test_user_claims_debug_redacts_sensitive() {
+        let claims = UserClaims {
+            sub: "user-secret-id".to_string(),
+            org_id: "org-456".to_string(),
+            email: "secret@example.com".to_string(),
+            roles: vec!["user".to_string(), "admin".to_string()],
+            iat: 1234567890,
+            exp: 1234571490,
+            jti: "secret-jti-token".to_string(),
+        };
+
+        let debug_str = format!("{:?}", claims);
+
+        // Sensitive fields should be redacted
+        assert!(
+            !debug_str.contains("user-secret-id"),
+            "sub should be redacted"
+        );
+        assert!(
+            !debug_str.contains("secret@example.com"),
+            "email should be redacted"
+        );
+        assert!(
+            !debug_str.contains("secret-jti-token"),
+            "jti should be redacted"
+        );
+        assert!(
+            debug_str.contains("[REDACTED]"),
+            "Should contain [REDACTED] markers"
+        );
+
+        // Non-sensitive fields should be visible
+        assert!(debug_str.contains("org-456"), "org_id should be visible");
+        assert!(debug_str.contains("user"), "roles should be visible");
+        assert!(debug_str.contains("admin"), "roles should be visible");
+        assert!(debug_str.contains("1234567890"), "iat should be visible");
+        assert!(debug_str.contains("1234571490"), "exp should be visible");
+    }
+
+    /// Test UserClaims serialization/deserialization roundtrip
+    #[test]
+    fn test_user_claims_serde_roundtrip() {
+        let claims = UserClaims {
+            sub: "user-123".to_string(),
+            org_id: "org-456".to_string(),
+            email: "user@example.com".to_string(),
+            roles: vec!["user".to_string(), "admin".to_string()],
+            iat: 1234567890,
+            exp: 1234571490,
+            jti: "jti-789".to_string(),
+        };
+
+        // Serialize to JSON
+        let json = serde_json::to_string(&claims).unwrap();
+
+        // Deserialize back
+        let deserialized: UserClaims = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.sub, claims.sub);
+        assert_eq!(deserialized.org_id, claims.org_id);
+        assert_eq!(deserialized.email, claims.email);
+        assert_eq!(deserialized.roles, claims.roles);
+        assert_eq!(deserialized.iat, claims.iat);
+        assert_eq!(deserialized.exp, claims.exp);
+        assert_eq!(deserialized.jti, claims.jti);
+    }
+
+    /// Test UserClaims Clone implementation
+    #[test]
+    fn test_user_claims_clone() {
+        let claims = UserClaims {
+            sub: "user-123".to_string(),
+            org_id: "org-456".to_string(),
+            email: "user@example.com".to_string(),
+            roles: vec!["user".to_string()],
+            iat: 1234567890,
+            exp: 1234571490,
+            jti: "jti-789".to_string(),
+        };
+
+        let cloned = claims.clone();
+
+        assert_eq!(cloned.sub, claims.sub);
+        assert_eq!(cloned.org_id, claims.org_id);
+        assert_eq!(cloned.email, claims.email);
+        assert_eq!(cloned.roles, claims.roles);
+        assert_eq!(cloned.iat, claims.iat);
+        assert_eq!(cloned.exp, claims.exp);
+        assert_eq!(cloned.jti, claims.jti);
+    }
+
+    /// Test sign_user_jwt with invalid private key
+    #[test]
+    fn test_sign_user_jwt_invalid_private_key() {
+        let claims = UserClaims {
+            sub: "user-123".to_string(),
+            org_id: "org-456".to_string(),
+            email: "user@example.com".to_string(),
+            roles: vec!["user".to_string()],
+            iat: chrono::Utc::now().timestamp(),
+            exp: chrono::Utc::now().timestamp() + 3600,
+            jti: "jti-789".to_string(),
+        };
+
+        // Use invalid PKCS8 data
+        let invalid_key = vec![0u8; 32];
+
+        let result = sign_user_jwt(&claims, &invalid_key, "test-key");
+        assert!(matches!(result, Err(AcError::Crypto(_))));
+    }
+
+    /// Test verify_user_jwt with malformed token
+    #[test]
+    fn test_verify_user_jwt_malformed_token() {
+        let (public_pem, _) = generate_signing_key().unwrap();
+
+        let malformed_tokens = ["", "a.b", "not-a-jwt", "a.b.c.d.e"];
+
+        for token in malformed_tokens {
+            let result = verify_user_jwt(token, &public_pem, DEFAULT_JWT_CLOCK_SKEW_SECONDS);
+            assert!(
+                matches!(result, Err(AcError::InvalidToken(_))),
+                "Token '{}' should be rejected",
+                token
+            );
+        }
     }
 }

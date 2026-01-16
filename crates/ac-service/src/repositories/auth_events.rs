@@ -183,6 +183,30 @@ pub async fn get_failed_attempts_count(
     Ok(count.0)
 }
 
+/// Get count of failed authentication attempts for a user since a given time
+pub async fn get_failed_attempts_count_by_user(
+    pool: &PgPool,
+    user_id: &Uuid,
+    since: DateTime<Utc>,
+) -> Result<i64, AcError> {
+    let count: (i64,) = sqlx::query_as(
+        r#"
+        SELECT COUNT(*)
+        FROM auth_events
+        WHERE user_id = $1
+          AND success = false
+          AND created_at >= $2
+        "#,
+    )
+    .bind(user_id)
+    .bind(since)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| AcError::Database(format!("Failed to count failed user attempts: {}", e)))?;
+
+    Ok(count.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
