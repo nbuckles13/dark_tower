@@ -1,6 +1,7 @@
 use crate::handlers::{admin_handler, auth_handler, internal_tokens, jwks_handler};
 use crate::middleware::auth::{require_admin_scope, require_service_auth, AuthMiddlewareState};
 use crate::middleware::http_metrics::http_metrics_middleware;
+use crate::middleware::org_extraction::{require_org_context, OrgExtractionState};
 use crate::repositories::signing_keys;
 use axum::{
     extract::State,
@@ -127,13 +128,28 @@ pub fn build_routes(
         .route("/metrics", get(metrics_endpoint))
         .with_state(metrics_handle);
 
-    // Public routes (no authentication required)
-    let public_routes = Router::new()
-        // OAuth 2.0 authentication endpoints
+    // Org extraction state for user auth routes
+    let org_extraction_state = Arc::new(OrgExtractionState {
+        pool: state.pool.clone(),
+    });
+
+    // User auth routes that require org context from subdomain (ADR-0020)
+    // These endpoints extract organization from subdomain via Host header
+    let user_auth_routes = Router::new()
         .route(
             "/api/v1/auth/user/token",
             post(auth_handler::handle_user_token),
         )
+        .route("/api/v1/auth/register", post(auth_handler::handle_register))
+        .layer(middleware::from_fn_with_state(
+            org_extraction_state,
+            require_org_context,
+        ))
+        .with_state(state.clone());
+
+    // Public routes (no authentication required)
+    let public_routes = Router::new()
+        // OAuth 2.0 service token endpoint (client credentials flow)
         .route(
             "/api/v1/auth/service/token",
             post(auth_handler::handle_service_token),
@@ -155,6 +171,7 @@ pub fn build_routes(
     admin_routes
         .merge(key_rotation_routes)
         .merge(internal_token_routes)
+        .merge(user_auth_routes)
         .merge(metrics_routes)
         .merge(public_routes)
         .layer(TraceLayer::new_for_http())
