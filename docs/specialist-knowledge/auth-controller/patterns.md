@@ -32,95 +32,11 @@ Crypto functions receive config explicitly: `hash_client_secret(secret, cost)`, 
 
 ---
 
-## Pattern: Service Layer Receives Config Values
+## Pattern: Timing Attack Prevention via Dummy Hash Verification
 **Added**: 2026-01-11
-**Related files**: `crates/ac-service/src/services/registration_service.rs`
+**Related files**: `crates/ac-service/src/services/token_service.rs`
 
-Service functions receive config values as parameters, not Config struct:
-```rust
-pub async fn register_service(pool, service_type, region, bcrypt_cost) -> Result<...>
-```
-Handlers extract from AppState.config and pass down.
-
----
-
-## Pattern: Boundary Tests for Config Validation
-**Added**: 2026-01-11
-**Related files**: `crates/ac-service/src/config.rs`
-
-Config tests cover: default value, custom valid, min boundary, max boundary, below min (rejected), above max (rejected), zero/negative, non-numeric, float, empty string, all valid range (loop), constants relationship (MIN <= DEFAULT <= MAX).
-
----
-
-## Pattern: AppState for Handler Dependencies
-**Added**: 2026-01-11
-**Related files**: `crates/ac-service/src/handlers/auth_handler.rs`
-
-Handlers use Axum State extractor with Arc<AppState> containing pool and config. Access as `state.config.bcrypt_cost`.
-
----
-
-## Pattern: Test Helper for Config Construction
-**Added**: 2026-01-11
-**Related files**: `crates/ac-service/src/handlers/admin_handler.rs`
-
-Tests use `test_config()` helper with minimal valid Config from HashMap. Provides zero master key and localhost DATABASE_URL.
-
----
-
-## Pattern: JWT Claims Extension for Multiple Token Types
-**Added**: 2026-01-15
-**Related files**: `crates/ac-service/src/handlers/internal_tokens.rs`
-
-When different token types need different claims, create dedicated claim structs rather than overloading a single Claims type:
-```rust
-struct MeetingTokenClaims {
-    sub: String,
-    token_type: String,  // Discriminator field
-    meeting_id: String,
-    // meeting-specific fields
-}
-
-struct GuestTokenClaims {
-    sub: String,
-    token_type: String,
-    display_name: String,
-    waiting_room: bool,
-    // guest-specific fields
-}
-```
-Type-safe approach prevents mixing incompatible fields.
-
----
-
-## Pattern: Scope Validation at Handler Level
-**Added**: 2026-01-15
-**Related files**: `crates/ac-service/src/handlers/internal_tokens.rs`
-
-Validate scopes in handler rather than middleware for endpoint-specific authorization:
-```rust
-let token_scopes: Vec<&str> = claims.scope.split_whitespace().collect();
-if !token_scopes.contains(&REQUIRED_SCOPE) {
-    return Err(AcError::InsufficientScope { ... });
-}
-```
-Separates authentication (middleware) from authorization (handler). More flexible than per-scope middleware.
-
----
-
-## Pattern: Middleware for Claims Injection
-**Added**: 2026-01-15
-**Related files**: `crates/ac-service/src/middleware/auth.rs`
-
-Authentication middleware validates token and injects claims without checking specific scopes:
-```rust
-pub async fn require_service_auth(...) -> Result<impl IntoResponse, AcError> {
-    // Validate token
-    req.extensions_mut().insert(claims);
-    Ok(next.run(req).await)
-}
-```
-Handler extracts claims via `Extension<crypto::Claims>`. Decouples authentication from authorization.
+When client_id not found, bcrypt runs against a pre-generated dummy hash. This ensures constant-time behavior regardless of whether the client exists. The dummy hash MUST use the same cost factor as production hashes. Always pair this with identical error messages for found/not-found cases.
 
 ---
 
@@ -137,11 +53,11 @@ Defense in depth - even if validation bypassed, tokens remain short-lived.
 
 ---
 
-## Pattern: UserClaims with Custom Debug for Sensitive Field Redaction
+## Pattern: Custom Debug for Sensitive Field Redaction
 **Added**: 2026-01-15
 **Related files**: `crates/ac-service/src/crypto/mod.rs`
 
-User token claims contain sensitive fields (email, roles). Implement custom `Debug` trait to redact sensitive data in logs while preserving debuggability for non-sensitive fields:
+Claims containing sensitive fields (email, roles) implement custom `Debug` trait to redact sensitive data in logs while preserving debuggability for non-sensitive fields:
 ```rust
 impl fmt::Debug for UserClaims {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -164,32 +80,10 @@ Extract organization context from request Host header subdomain before handler e
 
 ---
 
-## Pattern: Repository Functions for Domain Entity Lookups
-**Added**: 2026-01-15
-**Related files**: `crates/ac-service/src/repositories/users.rs`, `crates/ac-service/src/repositories/organizations.rs`
-
-Create dedicated repository modules for each domain entity with focused query functions: `get_user_by_email()`, `get_organization_by_subdomain()`. Keeps database access isolated from business logic. Each function handles one query with compile-time sqlx verification. Handlers and services compose these primitives rather than embedding SQL.
-
----
-
-## Pattern: Auto-Login on Registration
-**Added**: 2026-01-15
-**Related files**: `crates/ac-service/src/handlers/auth_handler.rs`, `crates/ac-service/src/services/user_service.rs`
-
-Issue JWT token immediately after successful user registration in a single transaction. Eliminates need for separate login call, improves UX, and reduces round trips. Registration handler creates user, then calls token issuance with the newly created user record. Response includes both user info and access token.
-
----
-
-## Pattern: TestAuthServer Multi-Tenant Helpers
-**Added**: 2026-01-15
-**Related files**: `crates/ac-test-utils/src/server_harness.rs`, `crates/ac-service/tests/integration/user_auth_tests.rs`
-
-For multi-tenant integration testing, TestAuthServer provides helpers: `create_test_org(subdomain, display_name)` creates an org in DB, `create_test_user(org_id, email, password, display_name)` creates a user with hashed password, `host_header(subdomain)` returns correct Host header including port. Pattern enables testing org-scoped operations without manual setup. Use `server.client()` for reqwest client access.
-
----
-
 ## Pattern: Host Header Subdomain Testing
 **Added**: 2026-01-15
-**Related files**: `crates/ac-test-utils/src/server_harness.rs`, `crates/ac-service/tests/integration/user_auth_tests.rs`
+**Related files**: `crates/ac-test-utils/src/server_harness.rs`
 
-Test subdomain extraction by setting Host header in HTTP requests: `.header("Host", server.host_header("acme"))` returns `acme.localhost:PORT`. The port must be included for test server binding. This validates org_extraction middleware in integration tests without modifying DNS. Test cases should cover valid subdomains, IP addresses (rejected), uppercase (rejected), and unknown subdomains (404).
+Test subdomain extraction by setting Host header in HTTP requests: `.header("Host", server.host_header("acme"))` returns `acme.localhost:PORT`. The port must be included for test server binding. Test cases should cover valid subdomains, IP addresses (rejected), uppercase (rejected), and unknown subdomains (404).
+
+---

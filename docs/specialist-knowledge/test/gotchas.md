@@ -4,14 +4,6 @@ Common test coverage gaps and pitfalls to watch for.
 
 ---
 
-## Gotcha: Warning Log Tests Require tracing-test
-**Added**: 2026-01-11
-**Related files**: `crates/ac-service/src/config.rs`
-
-Config warns when bcrypt_cost < DEFAULT or clock_skew < 60. Testing warning log emission requires `tracing-test` or `tracing-subscriber` test utilities. Currently skipped - add to TODO when tracing-test is added as dev dependency.
-
----
-
 ## Gotcha: TLS Validation Disabled in cfg(test)
 **Added**: 2026-01-11
 **Related files**: `crates/ac-service/src/config.rs`
@@ -25,14 +17,6 @@ The `validate_tls_config()` function returns early when `cfg!(test)` is true. Th
 **Related files**: `crates/ac-service/src/crypto/mod.rs`
 
 Bcrypt cost 14 takes ~800ms per hash. Tests like `test_hash_verification_works_across_cost_factors` that hash at all valid costs (10-14) take several seconds. Consider using `#[ignore]` for slow tests or only testing min/default/max in CI.
-
----
-
-## Gotcha: u32 Parse Rejection vs Validation Rejection
-**Added**: 2026-01-11
-**Related files**: `crates/ac-service/src/config.rs`
-
-Negative bcrypt cost like "-5" is rejected at u32::parse() (not a positive integer), not at MIN_BCRYPT_COST validation. Test both paths: parse failure (negative, float, non-numeric) vs. validation failure (9, 15). Error messages differ.
 
 ---
 
@@ -57,14 +41,6 @@ Delete client tests create credentials directly via repository to avoid creating
 **Related files**: `crates/ac-service/src/config.rs`
 
 Tests use `Config::from_vars()` with HashMap, but production uses `Config::from_env()`. Ensure both paths are tested. Currently `from_env()` is a thin wrapper around `from_vars()`, but if that changes, tests could miss bugs.
-
----
-
-## Gotcha: Claims service_type Skip Serialization
-**Added**: 2026-01-11
-**Related files**: `crates/ac-service/src/crypto/mod.rs`
-
-The Claims struct uses `#[serde(skip_serializing_if = "Option::is_none")]` for service_type. Tests verify this omission in serialized JSON. If this attribute is accidentally removed, user tokens would include `service_type: null`.
 
 ---
 
@@ -125,16 +101,6 @@ Solution: Make canary pod labels configurable. Positive tests use allowed labels
 
 ---
 
-## Gotcha: Clippy Warns on Unused Structs in Tests
-**Added**: 2026-01-13
-**Related files**: `crates/env-tests/tests/10_auth_smoke.rs`
-
-If you define structs for deserialization but only use pattern matching on raw text, clippy will warn about unused structs. Example: Defining `PrometheusResponse` for JSON parsing but checking `metrics_text.contains("rate_limit")` instead.
-
-Solution: Remove unused structs OR add `#[allow(dead_code)]` with explanation OR actually use the parsed data.
-
----
-
 ## Gotcha: Synchronous kubectl in Async Context
 **Added**: 2026-01-13
 **Related files**: `crates/env-tests/src/canary.rs`
@@ -166,19 +132,7 @@ let listener = TcpListener::bind("127.0.0.1:0").await?;
 let addr = listener.local_addr()?;  // Now we know the port
 ```
 
-Also remember: Drop impl calls `_handle.abort()` which stops the background server when test ends. Tests that create a server must complete before server is needed elsewhere.
-
----
-
-## Gotcha: reqwest Client in Tests Without Connection Info
-**Added**: 2026-01-14
-**Related files**: `crates/global-controller/tests/health_tests.rs`
-
-The test server uses `into_make_service_with_connect_info::<SocketAddr>()` for remote address extraction. This is needed if routes extract ConnectInfo. However, if a route tries to extract ConnectInfo but tests use a plain reqwest Client, the extraction will fail or return a dummy address.
-
-Solution: For tests with HTTP client, ensure either:
-1. Routes don't extract ConnectInfo (simplest for GC Phase 1)
-2. Use TestGcServer which provides proper SocketAddr propagation (required for Phase 2+ when we track client IPs)
+Also remember: Drop impl calls `_handle.abort()` which stops the background server when test ends.
 
 ---
 
@@ -214,8 +168,6 @@ GC Phase 1 defines enum variants and methods that won't be used until Phase 2+:
 - Methods like `MeetingStatus::as_str()` that aren't called in Phase 1
 
 These require `#[allow(dead_code)]` to prevent clippy warnings. Document the phase when they'll be used. This is intentional skeleton code - DO NOT remove these.
-
-Symptom: Adding a `#[test]` for a skeleton variant should also work fine; the test will be the only usage of that variant until Phase 2 implementation begins.
 
 ---
 
@@ -267,21 +219,6 @@ Silent failures here lead to accepting invalid signatures from the wrong key typ
 
 ---
 
-## Gotcha: BLOCKER Enforcement for Missing Integration Tests
-**Added**: 2026-01-15
-**Related files**: Code review process, test specialist role
-
-During code review, issuing a BLOCKER for missing integration tests is the primary mechanism to ensure coverage completeness. A single BLOCKER finding that "register_user and issue_user_token need integration tests" should lead to 12-16 new tests being implemented before review is complete. The BLOCKER is not a suggestion - it blocks approval until resolved.
-
-This works because:
-1. Test coverage gaps are easily overlooked in code review if only unit tests are visible
-2. Integration tests catch real-world failures (database interactions, service boundaries)
-3. BLOCKER status forces implementation, not deferral to "Phase 3+"
-
-Example: GC Phase 2 code review found 10 tests for JWT validation but missing boundary tests (8KB limit, algorithm confusion). BLOCKER → 5 new security tests added → re-review → approved. The additional tests prevented real vulnerabilities from being overlooked.
-
----
-
 ## Gotcha: Integration Test Database Setup Isolation
 **Added**: 2026-01-15
 **Related files**: `crates/ac-service/tests/integration/user_service_tests.rs`
@@ -296,25 +233,6 @@ This means:
 2. If a test inserts 100 records and rolls back, the next test doesn't see them (correct isolation)
 3. Never write tests that depend on state from a previous test
 
-This is by design and catches invalid test dependencies early. If you need cross-test data:
-- Use a single `#[test]` function with multiple assertions
-- Or use fixtures to create test data within each test
+This is by design and catches invalid test dependencies early.
 
 ---
-
-## Gotcha: BLOCKER vs Non-Blocker Distinction in Security Reviews
-**Added**: 2026-01-15
-**Related files**: Code review process, security specialist role
-
-When a security reviewer finds issues, classifying as BLOCKER (must fix) vs MAJOR (important) vs MINOR (fix eventually) has different enforcement:
-
-- **BLOCKER** (e.g., JWK validation missing): Must be fixed before approval. Code cannot ship without fix.
-- **MAJOR** (e.g., "could add HTTPS validation"): Recommended but doesn't block approval. Implementation is higher priority than release.
-- **MINOR** (e.g., "Consider logging this edge case"): Nice to have. Can be deferred to next phase.
-
-Example from GC Phase 2:
-- BLOCKER: JWK kty/alg validation missing → Required immediate fix
-- MAJOR: HTTPS validation not present → Recommended for Phase 3, documented as debt
-- MINOR: JWKS response size limit → Phase 3+ nice-to-have
-
-The distinction prevents "death by a thousand paper cuts" where all feedback is treated as blocking.

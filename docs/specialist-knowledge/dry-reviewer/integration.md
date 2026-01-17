@@ -1,116 +1,51 @@
 # DRY Reviewer - Cross-Service Integration Notes
 
-## Known Duplication Patterns
+Known duplication patterns and cross-service coordination for Dark Tower.
 
-### Tech Debt Registry
+---
 
-#### TD-1: JWT Signing Duplication
-- **Location**: ac-service JWT signing + user-provisioning JWT signing
-- **Pattern**: Both services implement JWT claim signing with EdDSA
-- **Severity**: Medium (security code, but isolated per service)
-- **Status**: DOCUMENTED, KNOWN
-- **Improvement Path**: Extract to `common::crypto::jwt` utilities module
-- **Timeline**: Phase 5+ (post-Phase 4 hardening)
-- **Notes**: Each service maintains its own key management, so extraction must preserve that property
+## Tech Debt Registry
 
-#### TD-2: Key Loading from Environment
-- **Location**: ac-service key loading + global-controller key loading
-- **Pattern**: Both load EdDSA keys from environment with SecretString protection
-- **Severity**: Medium (security-critical, but straightforward extraction)
-- **Status**: DOCUMENTED, KNOWN
-- **Improvement Path**: Extract to `common::crypto::key_management::load_from_env()`
-- **Timeline**: Phase 5+ (post-Phase 4 hardening)
-- **Notes**: Must preserve SecretString semantics throughout extraction
+Tracked duplication patterns with assigned IDs for consistent classification.
 
-## Integration Guidelines
+---
 
-### Working with Other Specialists
+### TD-1: JWT Validation Duplication (AC vs GC)
+**Added**: 2026-01-15
+**Related files**: `crates/ac-service/src/crypto/mod.rs`, `crates/global-controller/src/auth/jwt.rs`
 
-#### Security Specialist Handoff
-- Always escalate duplication in cryptographic code to Security specialist
-- Security may accept duplication if it reduces coupling
-- Document security rationale in integration.md
-- Reference ADR-0019 compliance
+JWT validation logic duplicated between AC and GC: `extract_jwt_kid` (AC) vs `extract_kid` (GC), `verify_jwt` (AC) vs `verify_token` (GC), and `MAX_JWT_SIZE_BYTES` constant (4KB in AC, 8KB in GC). Severity: Medium. Improvement path: Extract to `common::crypto::jwt` utilities module. Timeline: Phase 5+ (post-Phase 4 hardening). Note: GC uses JWKS client for key fetching while AC uses database - extraction must preserve these different key sources.
 
-#### Code Reviewer Handoff
-- Code Quality specialist focuses on style and patterns
-- Coordinate if duplication involves architectural patterns
-- DRY focuses on actual duplication; Code Quality focuses on structure
-- Share findings if both identify same duplication
+---
 
-#### Test Specialist Coordination
-- Duplication in test utilities may warrant extraction
-- Test specialist has final say on test code organization
-- Document test duplication separately in `gotchas.md`
+### TD-2: EdDSA Key Handling Patterns
+**Added**: 2026-01-15
+**Related files**: `crates/ac-service/src/crypto/mod.rs`, `crates/global-controller/src/auth/jwt.rs`
 
-### Cross-Service Review Process
+Both services implement EdDSA public key decoding from base64url and DecodingKey creation. Severity: Low (small code). Improvement path: Consider extraction when a third service (MC or MH) needs the same pattern. Timeline: Phase 5+ or when third consumer appears.
 
-**When reviewing code that touches multiple services:**
+---
 
-1. **Identify scope**: Which services does this code affect?
-2. **Check history**: Is there established code in those services?
-3. **Compare patterns**: Gather all implementations of the pattern
-4. **Classify**: BLOCKER (new) vs TECH_DEBT (existing)
-5. **Document**: Add to tech debt registry if TECH_DEBT
-6. **Escalate**: Talk to specialist if security-related
+## Specialist Coordination
+**Added**: 2026-01-15
+**Related files**: `.claude/agents/security.md`, `.claude/agents/code-reviewer.md`, `.claude/agents/test.md`
 
-## Architecture Considerations
+Security specialist handoff: Escalate duplication in cryptographic code to Security specialist. Security may accept duplication if it reduces coupling - document their rationale. Code reviewer handoff: DRY reviewer focuses on cross-service duplication; Code Quality specialist focuses on single-service structure. Share findings if both identify the same issue. Test specialist handoff: Test utility duplication (e.g., ac-test-utils) may warrant extraction; Test specialist has final say on test code organization.
 
-### Service Boundaries and Duplication
+---
 
-**Principle**: Service boundaries take precedence over DRY
+## Acceptable Duplication Patterns
+**Added**: 2026-01-15
+**Related files**: `crates/*/src/config.rs`, `crates/*/src/errors.rs`
 
-- Each service owns its implementation within domain
-- Shared code must cross clear architectural lines
-- Don't force cross-service coupling to eliminate duplication
-- Use `common` crate strategically (with Security/Architecture oversight)
+These patterns are acceptable and should NOT be flagged: (1) Per-service configuration loading (each service has different env vars), (2) Service-specific error types (each service defines its own error.rs), (3) Protocol message handling (each service may interpret messages differently), (4) Logging/metrics initialization (boilerplate is expected per OWASP guidelines).
 
-### Acceptable Duplication Patterns
-
-These patterns are acceptable and should NOT be marked as issues:
-
-1. **Per-service configuration loading** - Each service has different env vars
-2. **Service-specific error types** - Defined in each service's error.rs
-3. **Protocol message handling** - Each service may interpret messages differently
-4. **Logging/metrics initialization** - Boilerplate is expected
-
-### Duplication Requiring Extraction
-
-These patterns should be extracted to `common`:
-
-1. **Cryptographic operations** - Single source of truth required
-2. **Standard library patterns** - Proven utilities should be shared
-3. **3+ services repeating** - Extraction ROI is high
-4. **Security-critical code** - Audit burden reduced by centralization
-
-## Tracking and Future Work
-
-### How Duplication Becomes Tech Debt
-
-1. DRY reviewer identifies during code review
-2. Classified as TECH_DEBT per ADR-0019
-3. Added to tech debt registry (this file) with TD-N ID
-4. Improvement path documented
-5. Referenced in `.claude/TODO.md` or phase planning
-6. Extracted in future phase when timeline permits
-
-### Phase 5+ Refactoring Plans
-
-Expected tech debt extraction work:
-- **TD-1 Extraction**: Common JWT utilities (estimated 2 days)
-- **TD-2 Extraction**: Common key management utilities (estimated 2 days)
-- May uncover TD-3, TD-4, etc. during Phase 5
+---
 
 ## Escalation Criteria
+**Added**: 2026-01-15
+**Related files**: `.claude/agents/security.md`
 
-Escalate to Architecture specialist if:
-- Duplication spans 3+ services
-- Extraction requires database schema changes
-- Pattern impacts protocol or API contracts
-- Uncertainty about service boundary placement
+Escalate to Architecture specialist if: duplication spans 3+ services, extraction requires database schema changes, pattern impacts protocol or API contracts, uncertainty about service boundary placement. Escalate to Security specialist if: duplication involves cryptography, authentication, or authorization, or pattern impacts threat model.
 
-Escalate to Security specialist if:
-- Duplication involves cryptography
-- Duplication involves authentication/authorization
-- Pattern impacts threat model
-
+---

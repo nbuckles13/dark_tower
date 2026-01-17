@@ -20,14 +20,6 @@ JWT `iat` validation uses clock skew. 300s skew means tokens 5 min in future are
 
 ---
 
-## Gotcha: #[cfg(test)] Imports in Production Files
-**Added**: 2026-01-11
-**Related files**: `crates/ac-service/src/crypto/mod.rs`
-
-Files have `#[cfg(test)] use crate::config::{DEFAULT_BCRYPT_COST, ...}`. Intentional - tests need constants that production receives via Config. Do not remove.
-
----
-
 ## Gotcha: Timing Attack Requires Matching Dummy Hash
 **Added**: 2026-01-11
 **Related files**: `crates/ac-service/src/services/token_service.rs`
@@ -41,14 +33,6 @@ When client_id not found, bcrypt runs against dummy hash. Dummy MUST use same co
 **Related files**: `crates/ac-service/src/config.rs`
 
 AC_HASH_SECRET defaults to 32 zero bytes. Intentional for tests, MUST set in production. Config does not error on missing - silently uses default.
-
----
-
-## Gotcha: TLS Validation Skipped in Tests
-**Added**: 2026-01-11
-**Related files**: `crates/ac-service/src/config.rs`
-
-`validate_tls_config()` skips in test builds (tracing issues). TLS warnings only in production. Don't rely on tests for sslmode validation.
 
 ---
 
@@ -88,11 +72,7 @@ Invalid client_id and invalid password return identical `AcError::InvalidCredent
 **Added**: 2026-01-15
 **Related files**: `crates/ac-service/src/handlers/internal_tokens.rs`
 
-Meeting and guest tokens need unique `jti` (JWT ID) claims for tracking and revocation:
-```rust
-jti: uuid::Uuid::new_v4().to_string(),
-```
-Always include jti for tokens that may need revocation. Service tokens may omit jti if revocation not needed.
+Meeting and guest tokens need unique `jti` (JWT ID) claims for tracking and revocation. Always include jti for tokens that may need revocation. Service tokens may omit jti if revocation not needed.
 
 ---
 
@@ -112,32 +92,6 @@ No trait objects or generics - type must match exactly or extraction fails silen
 
 ---
 
-## Gotcha: Signing Function Not Reusable Across Claim Types
-**Added**: 2026-01-15
-**Related files**: `crates/ac-service/src/crypto/mod.rs`, `crates/ac-service/src/handlers/internal_tokens.rs`
-
-Existing `crypto::sign_jwt()` expects `crypto::Claims`. Cannot reuse for different claim types. Created local signing functions for meeting and guest tokens.
-
-**Future**: Generic signing function would need `impl Serialize` to handle different claim types (see TD-1 tech debt).
-
----
-
-## Gotcha: UserTokenRequest Uses Email Not Username
-**Added**: 2026-01-15
-**Related files**: `crates/ac-service/src/handlers/auth_handler.rs`
-
-Per ADR-0020, user authentication uses email address, not username. The `UserTokenRequest` struct has an `email` field, not `username`. This differs from some OAuth implementations that use username. When writing tests or integrating, always use email for the user identifier field.
-
----
-
-## Gotcha: User Rate Limiting Requires Separate Database Function
-**Added**: 2026-01-15
-**Related files**: `crates/ac-service/src/repositories/auth_events.rs`, `crates/ac-service/src/services/token_service.rs`
-
-Cannot reuse `get_failed_attempts_count()` (credential-based) for user rate limiting. Added `get_failed_attempts_count_by_user()` which queries by user_id instead of client_id. The auth_events table tracks both service credentials and user authentications, but the lookup key differs.
-
----
-
 ## Gotcha: Subdomain Extraction Edge Cases
 **Added**: 2026-01-15
 **Related files**: `crates/ac-service/src/middleware/org_extraction.rs`
@@ -145,14 +99,3 @@ Cannot reuse `get_failed_attempts_count()` (credential-based) for user rate limi
 Host header parsing has edge cases: IP addresses (no subdomain), ports (strip before parsing), single-part hostnames (localhost), and hosts with many parts (a.b.c.example.com). Middleware must handle: stripping port, checking for IP addresses, and extracting first segment only when at least 3 parts exist. Tests should cover all edge cases.
 
 ---
-
-## Gotcha: Clippy Indexing Lint
-**Added**: 2026-01-15
-**Related files**: `crates/ac-service/src/middleware/org_extraction.rs`
-
-Clippy warns against direct array indexing like `parts[0]` due to potential panics. Use `.first()` and `.get()` methods instead, which return `Option` and force explicit handling of missing elements:
-```rust
-// Bad: parts[0]
-// Good: parts.first().ok_or(Error)?
-```
-This pattern aligns with the no-panic policy.

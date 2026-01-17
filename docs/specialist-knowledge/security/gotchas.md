@@ -12,14 +12,6 @@ Bcrypt crate accepts cost 4-31, but OWASP 2024 requires minimum 10. Library vali
 
 ---
 
-## Gotcha: Timing Attacks in Config-Time vs Request-Time
-**Added**: 2026-01-11
-**Related files**: `crates/ac-service/src/config.rs`
-
-Security parameters loaded at config time (startup) are safe from timing attacks. Parameters that vary per-request introduce timing side channels. Bcrypt cost is config-time, so no timing leak between requests.
-
----
-
 ## Gotcha: Dummy Hash Must Match Production Cost
 **Added**: 2026-01-11
 **Related files**: `crates/ac-service/src/services/token_service.rs`
@@ -36,43 +28,11 @@ JWT `iat` validation with clock skew allows tokens up to N seconds in the future
 
 ---
 
-## Gotcha: Error Messages Enable Enumeration
-**Added**: 2026-01-11
-**Related files**: `crates/ac-service/src/services/token_service.rs`
-
-Different error messages for "user not found" vs "wrong password" enable account enumeration. Always return identical generic errors. Check all error paths return same message AND same HTTP status.
-
----
-
-## Gotcha: DoS via Expensive Operations
-**Added**: 2026-01-11
-**Related files**: `crates/ac-service/src/crypto/mod.rs`
-
-Bcrypt and signature verification are intentionally expensive. Without input limits, attackers can DoS by submitting large payloads. Always size-check before crypto operations.
-
----
-
 ## Gotcha: Test Coverage Hides Timing Issues
 **Added**: 2026-01-11
 **Related files**: `crates/ac-service/src/services/token_service.rs`
 
 Coverage instrumentation adds overhead that masks timing differences. Timing-sensitive tests must be `#[cfg_attr(coverage, ignore)]`. Manual verification required for timing-critical code.
-
----
-
-## Gotcha: Default Secrets in Test Configs
-**Added**: 2026-01-11
-**Related files**: `crates/ac-service/src/config.rs`
-
-Test configs may default to insecure values (zero keys, low costs). Ensure production deployment requires explicit secure configuration. Consider failing startup if secrets are default/zero.
-
----
-
-## Gotcha: Crypto Functions MUST Use #[instrument(skip_all)]
-**Added**: 2026-01-11
-**Related files**: `crates/ac-service/src/crypto/mod.rs`
-
-All functions handling secrets (keys, tokens, passwords) MUST use `#[instrument(skip_all)]` to prevent accidental logging via tracing spans. **This is a mandatory review check for any code touching crypto.** Also: types holding crypto material need custom Debug impl with redaction, or use `secrecy` crate wrappers.
 
 ---
 
@@ -104,7 +64,7 @@ Every call to `.expose_secret()` is a potential leak point. During security revi
 **Added**: 2026-01-13
 **Related files**: `crates/env-tests/tests/25_auth_security.rs`
 
-Some JWT libraries trust public keys embedded in the token's `jwk` header parameter, allowing attackers to sign tokens with their own key. Always validate against keys from a trusted JWKS endpoint only, NEVER from the token header. Test by embedding a fake `jwk` in the header and verifying signature validation still uses the server's JWKS. Most modern libraries are safe, but this must be verified.
+Some JWT libraries trust public keys embedded in the token's `jwk` header parameter, allowing attackers to sign tokens with their own key. Always validate against keys from a trusted JWKS endpoint only, NEVER from the token header. Test by embedding a fake `jwk` in the header and verifying signature validation still uses the server's JWKS.
 
 ---
 
@@ -120,15 +80,7 @@ The `jku` (JWK Set URL) header tells the validator where to fetch public keys. I
 **Added**: 2026-01-13
 **Related files**: `crates/env-tests/tests/10_auth_smoke.rs`
 
-Rate limit tests that send N requests expecting a 429 may not trigger if: (1) rate limits are per-IP and test runs through different IPs, (2) rate limit thresholds are very high, (3) rate limiting is per-client-id and test varies credentials. Consider checking metrics endpoints for rate limit counters as alternative validation. Log warnings rather than failing tests when rate limits don't trigger - different environments have different configurations.
-
----
-
-## Gotcha: Clock Skew in Time-Based JWT Validation Tests
-**Added**: 2026-01-13
-**Related files**: `crates/env-tests/tests/25_auth_security.rs`
-
-When testing `iat` (issued at) claims, account for clock skew between test runner and token issuer. Use a tolerance window (e.g., 300 seconds) when asserting timestamps. Record time before AND after token issuance to create a valid window. Don't assume clocks are synchronized - distributed systems rarely have perfect time agreement.
+Rate limit tests that send N requests expecting a 429 may not trigger if: (1) rate limits are per-IP and test runs through different IPs, (2) rate limit thresholds are very high, (3) rate limiting is per-client-id and test varies credentials. Consider checking metrics endpoints for rate limit counters as alternative validation.
 
 ---
 
@@ -137,53 +89,5 @@ When testing `iat` (issued at) claims, account for clock skew between test runne
 **Related files**: `crates/env-tests/tests/25_auth_security.rs`
 
 When testing JWKS endpoints for private key leakage, DON'T rely on typed deserialization alone. A struct without a `d` field will silently ignore `d` in the JSON. Use raw JSON (`serde_json::Value`) to check if forbidden fields exist. Pattern: `jwks_value.get("keys")[i].get("d").is_none()` catches fields that typed structs would skip.
-
----
-
-## Gotcha: Application-Level Timeout Without Statement Timeout
-**Added**: 2026-01-14
-**Related files**: `crates/global-controller/src/main.rs`
-
-Setting a request timeout in the application (e.g., `tower_http::TimeoutLayer`) is insufficient if the database connection lacks a statement timeout. Attackers can still hang the database connection, exhausting the connection pool. ALWAYS set `statement_timeout` at the PostgreSQL connection level. This creates two independent timeouts: (1) DB-level statement timeout prevents hung queries, (2) Application-level request timeout prevents hung handlers. Both are necessary.
-
----
-
-## Gotcha: JWK Algorithm Mismatch Bypasses Token Validation
-**Added**: 2026-01-14
-**Related files**: `crates/global-controller/src/auth/jwt.rs`
-
-While JWT token validation checks `alg: EdDSA` in the token header, the JWKS JWK object may have inconsistent `kty` or `alg` fields. If a JWK with `kty: RSA` and `alg: RS256` is returned by the JWKS endpoint, and the validator doesn't check JWK fields, an attacker could potentially trick the validator into using the wrong key for the wrong algorithm (though signature verification would still fail). The defense is double-layered: (1) Token must have `alg: EdDSA`, (2) JWK must have `kty: OKP` and `alg: EdDSA`. Check BOTH during verification, not just one. A misconfigured JWKS endpoint serving wrong key types could bypass token-level checks if JWK fields aren't validated.
-
----
-
-## Gotcha: JWKS HTTP Responses Lack Size Limits
-**Added**: 2026-01-14
-**Related files**: `crates/global-controller/src/auth/jwks.rs`
-
-JWKS endpoints can be exploited to consume memory by returning extremely large responses (gigabytes of data). If JWKS client doesn't limit response size, an attacker can OOM the application. Pattern: Implement response size cap (e.g., 1MB) in HTTP client or JWKS parsing. Test with oversized responses. This is documented as Phase 3+ hardening but not implemented in Phase 2 - flag as minor tech debt.
-
----
-
-## Gotcha: Custom Debug Implementations Must Be Comprehensive
-**Added**: 2026-01-15
-**Related files**: `crates/ac-service/src/crypto/mod.rs`
-
-A single missing PII field in a custom Debug impl exposes secrets in logs. Example: `Claims` redacts `sub` but doesn't redact derived Debug output of the entire struct. When reviewing custom Debug, check EVERY field: mark all PII as `[REDACTED]`, keep non-sensitive metadata. For complex types, remember derived Debug will recursively call field Debug impls, so nested types must also have safe Debug. Test by printing debug output and grep for actual values (user IDs, secrets, emails).
-
----
-
-## Gotcha: Dummy Hash Regeneration on Cost Changes
-**Added**: 2026-01-15
-**Related files**: `crates/ac-service/src/services/token_service.rs`
-
-If bcrypt cost is configurable and changes between requests, the pre-computed dummy hash becomes stale if cost increases. Example: If dummy hash was created with cost 12, then cost increases to 13, the dummy is now faster than real hashes, enabling timing attacks. Pattern: Either (1) pin cost at config load time and never change, or (2) regenerate dummy hash whenever cost changes. Monitor configuration changes and log when dummy is regenerated - this is rare enough that logging helps catch misconfiguration.
-
----
-
-## Gotcha: Service Registration Secret Is One-Time Only
-**Added**: 2026-01-15
-**Related files**: `crates/ac-service/src/services/registration_service.rs`
-
-Clients often expect to retrieve lost credentials via password reset or admin endpoints. Service registration MUST NOT support this. Once the plaintext secret is revealed at registration, it's never available again. Clients that lose the secret must request new credentials, invalidating old ones. This is intentionally restrictive - it forces secure credential handling. Document clearly in API docs and error messages. This prevents privilege escalation via compromised admin accounts who could retrieve all service secrets.
 
 ---
