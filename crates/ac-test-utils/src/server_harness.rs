@@ -297,6 +297,170 @@ impl TestAuthServer {
         let token = crypto::sign_jwt(&claims, &private_key_bytes, &signing_key.key_id)?;
         Ok(token)
     }
+
+    /// Create a test organization in the database
+    ///
+    /// Creates an organization with the given subdomain and display name.
+    /// Used for setting up multi-tenant test scenarios.
+    ///
+    /// # Arguments
+    /// * `subdomain` - The subdomain for the organization (e.g., "acme")
+    /// * `display_name` - Human-readable name (e.g., "Acme Corp")
+    ///
+    /// # Returns
+    /// The org_id (UUID) of the newly created organization
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// let org_id = server.create_test_org("acme", "Acme Corp").await?;
+    /// ```
+    pub async fn create_test_org(
+        &self,
+        subdomain: &str,
+        display_name: &str,
+    ) -> Result<uuid::Uuid, anyhow::Error> {
+        let org: (uuid::Uuid,) = sqlx::query_as(
+            r#"
+            INSERT INTO organizations (subdomain, display_name)
+            VALUES ($1, $2)
+            RETURNING org_id
+            "#,
+        )
+        .bind(subdomain)
+        .bind(display_name)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to create test organization: {}", e))?;
+
+        Ok(org.0)
+    }
+
+    /// Create a test user in an organization
+    ///
+    /// Creates a user with the given email, password, and display name.
+    /// The password is hashed with bcrypt before storage.
+    ///
+    /// # Arguments
+    /// * `org_id` - The organization ID
+    /// * `email` - User email address
+    /// * `password` - Plain text password (will be hashed)
+    /// * `display_name` - Human-readable name
+    ///
+    /// # Returns
+    /// The user_id (UUID) of the newly created user
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// let user_id = server.create_test_user(org_id, "alice@example.com", "password123", "Alice").await?;
+    /// ```
+    pub async fn create_test_user(
+        &self,
+        org_id: uuid::Uuid,
+        email: &str,
+        password: &str,
+        display_name: &str,
+    ) -> Result<uuid::Uuid, anyhow::Error> {
+        // Hash password with bcrypt (use low cost for tests)
+        let password_hash = crypto::hash_client_secret(password, DEFAULT_BCRYPT_COST)
+            .map_err(|e| anyhow::anyhow!("Failed to hash password: {:?}", e))?;
+
+        let user: (uuid::Uuid,) = sqlx::query_as(
+            r#"
+            INSERT INTO users (org_id, email, password_hash, display_name)
+            VALUES ($1, $2, $3, $4)
+            RETURNING user_id
+            "#,
+        )
+        .bind(org_id)
+        .bind(email)
+        .bind(&password_hash)
+        .bind(display_name)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to create test user: {}", e))?;
+
+        // Add default "user" role
+        sqlx::query(
+            r#"
+            INSERT INTO user_roles (user_id, role)
+            VALUES ($1, 'user')
+            "#,
+        )
+        .bind(user.0)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to add user role: {}", e))?;
+
+        Ok(user.0)
+    }
+
+    /// Create an inactive test user in an organization
+    ///
+    /// Creates a user with is_active = false for testing inactive user scenarios.
+    ///
+    /// # Arguments
+    /// * `org_id` - The organization ID
+    /// * `email` - User email address
+    /// * `password` - Plain text password (will be hashed)
+    /// * `display_name` - Human-readable name
+    ///
+    /// # Returns
+    /// The user_id (UUID) of the newly created inactive user
+    pub async fn create_inactive_test_user(
+        &self,
+        org_id: uuid::Uuid,
+        email: &str,
+        password: &str,
+        display_name: &str,
+    ) -> Result<uuid::Uuid, anyhow::Error> {
+        // Hash password with bcrypt (use low cost for tests)
+        let password_hash = crypto::hash_client_secret(password, DEFAULT_BCRYPT_COST)
+            .map_err(|e| anyhow::anyhow!("Failed to hash password: {:?}", e))?;
+
+        let user: (uuid::Uuid,) = sqlx::query_as(
+            r#"
+            INSERT INTO users (org_id, email, password_hash, display_name, is_active)
+            VALUES ($1, $2, $3, $4, false)
+            RETURNING user_id
+            "#,
+        )
+        .bind(org_id)
+        .bind(email)
+        .bind(&password_hash)
+        .bind(display_name)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to create inactive test user: {}", e))?;
+
+        Ok(user.0)
+    }
+
+    /// Get Host header value for a subdomain
+    ///
+    /// Returns the Host header value for the given subdomain at localhost
+    /// with the test server's port.
+    ///
+    /// # Arguments
+    /// * `subdomain` - The subdomain (e.g., "acme")
+    ///
+    /// # Returns
+    /// Host header value (e.g., "acme.localhost:12345")
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// let host = server.host_header("acme");
+    /// // host = "acme.localhost:12345"
+    /// ```
+    pub fn host_header(&self, subdomain: &str) -> String {
+        format!("{}.localhost:{}", subdomain, self.addr.port())
+    }
+
+    /// Get a reqwest client for making requests to the test server
+    ///
+    /// Returns a configured reqwest client suitable for testing.
+    pub fn client(&self) -> reqwest::Client {
+        reqwest::Client::new()
+    }
 }
 
 impl Drop for TestAuthServer {

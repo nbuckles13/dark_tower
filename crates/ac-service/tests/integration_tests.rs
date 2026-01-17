@@ -14,3 +14,6 @@ mod admin_auth_tests;
 
 #[path = "integration/clock_skew_tests.rs"]
 mod clock_skew_tests;
+
+#[path = "integration/user_auth_tests.rs"]
+mod user_auth_tests;

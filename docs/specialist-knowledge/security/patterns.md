@@ -171,3 +171,11 @@ When implementing constant-time authentication, the dummy hash used for non-exis
 When registering services/users, the generated plaintext secret is exposed ONLY in the registration response. Pattern: (1) Generate secret with CSPRNG, (2) Hash for storage, (3) Expose plaintext only in RegisterServiceResponse, (4) Document "store this securely!" in response. After registration, the plaintext is never available again - even admins cannot retrieve it. This forces proper secret management: services must store the credential immediately or generate new ones. Example: `RegisterServiceResponse` with custom Serialize that exposes the client_secret.
 
 ---
+
+## Pattern: Identical Error Responses for Login Failures
+**Added**: 2026-01-15
+**Related files**: `crates/ac-service/tests/integration/user_auth_tests.rs`
+
+Login endpoints must return identical error responses for different failure reasons to prevent user enumeration. Test that wrong password, nonexistent user, and inactive user all return the same 401 status and similar error body. Attackers shouldn't be able to distinguish "user exists but wrong password" from "user doesn't exist". Integration tests should explicitly verify this by comparing responses across failure modes.
+
+---

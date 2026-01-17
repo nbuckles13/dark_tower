@@ -228,11 +228,11 @@ Fetch raw JSON to check all fields - typed deserialization may skip unknown fiel
 
 ---
 
-## Pattern: Test Server Harness for E2E HTTP Testing
+## Pattern: Test Server Harness for Integration HTTP Testing
 **Added**: 2026-01-14
 **Related files**: `crates/gc-test-utils/src/server_harness.rs`, `crates/global-controller/tests/health_tests.rs`
 
-For HTTP service E2E testing, create a reusable server harness that:
+For HTTP service integration testing, create a reusable server harness that:
 1. Spawns a real HTTP server on a random available port (127.0.0.1:0)
 2. Provides access to the database pool for assertions
 3. Implements Drop for automatic cleanup
@@ -565,3 +565,35 @@ Integration tests should verify full flows:
 - User registers → Auth service persists to database → User later logs in with credentials → Token issued with correct claims
 - Test database interaction, not just function logic
 - Use `#[sqlx::test(migrations = "../../migrations")]` for database isolation
+
+---
+
+## Pattern: Integration User Auth Test Organization
+**Added**: 2026-01-15
+**Related files**: `crates/ac-service/tests/integration/user_auth_tests.rs`
+
+Organize user auth integration tests into logical groups with section comments:
+1. **Registration tests** (11): happy path, token claims, default role, validation errors (email, password, display_name), duplicate email, multi-tenant (same email different orgs), invalid subdomain, unknown org, rate limiting
+2. **Login tests** (7): happy path, token claims, last_login update, wrong password, nonexistent user, inactive user, rate limit lockout
+3. **Org extraction tests** (4): valid subdomain, with port, IP rejected, uppercase rejected
+
+Use `// =========` visual separators for navigating large test files. Each test follows Arrange-Act-Assert with explicit comments.
+
+---
+
+## Pattern: Rate Limiting Tests via Loop
+**Added**: 2026-01-15
+**Related files**: `crates/ac-service/tests/integration/user_auth_tests.rs`
+
+Test rate limiting by sending requests in a loop until lockout triggers:
+```rust
+for i in 0..6 {
+    let response = client.post(...).send().await?;
+    if i < 5 {
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    } else {
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+}
+```
+This approach validates that rate limiting kicks in after threshold without hardcoding timing assumptions. For registration, use unique emails per attempt; for login, use same invalid password.

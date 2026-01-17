@@ -203,3 +203,45 @@ Don't implement token parsing logic in both middleware and handlers. Parse once 
 **Related files**: `crates/ac-service/src/models/users.rs`, `crates/ac-service/src/middleware/org_context.rs`
 
 When extracting organization ID from tokens or claims, verify the type matches expectations. If tokens embed `org_id` as a string UUID, make sure the type system enforces this (e.g., `newtype` wrapper like `OrganizationId(uuid::Uuid)` rather than raw `String`). This prevents accidental mixing of different ID namespaces.
+
+---
+
+## Gotcha: Duplicated JWT Decoding Logic in Tests
+**Added**: 2026-01-15
+**Related files**: `crates/ac-service/tests/integration/user_auth_tests.rs`
+
+When tests verify JWT claims, the base64 decode + JSON parse pattern gets duplicated:
+```rust
+let parts: Vec<&str> = token.split('.').collect();
+let payload_bytes = base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, parts[1])?;
+let payload: serde_json::Value = serde_json::from_slice(&payload_bytes)?;
+```
+This pattern appeared 8+ times in user_auth_tests.rs. Extract to a helper function in the test harness (e.g., `TestAuthServer::decode_jwt_payload(token: &str) -> Result<serde_json::Value, anyhow::Error>`). Reduces duplication and makes JWT format changes easier to maintain.
+
+---
+
+## Gotcha: Weak OR Assertion Logic in Rate Limiting Tests
+**Added**: 2026-01-15
+**Related files**: `crates/ac-service/tests/integration/user_auth_tests.rs`
+
+Rate limiting tests that assert `hit_rate_limit || success_count <= N` can pass even if rate limiting is broken. The OR condition allows either branch to satisfy the assertion. Pattern seen:
+```rust
+assert!(hit_rate_limit || success_count <= 6, "Should hit rate limit...");
+```
+This passes if `success_count == 5` even without hitting rate limit. Better: assert that rate limit was actually hit (`assert!(hit_rate_limit, ...)`), or loop until confirmed. Weak assertions mask bugs.
+
+---
+
+## Gotcha: Implementation Details in Test Assertion Comments
+**Added**: 2026-01-15
+**Related files**: `crates/ac-service/tests/integration/user_auth_tests.rs`
+
+Avoid exposing internal error mapping in test comments:
+```rust
+// BAD: Exposes internal error type
+assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "Invalid email should return 401 (using InvalidToken error)");
+
+// GOOD: Focus on observable behavior
+assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "Invalid email should return 401 Unauthorized");
+```
+Comments like "using InvalidToken error" leak implementation details that tests shouldn't care about. Tests verify behavior, not internal error variants. If the internal mapping changes, these comments become misleading.
