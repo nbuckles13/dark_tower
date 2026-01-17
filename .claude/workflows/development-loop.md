@@ -17,6 +17,41 @@ The Development Loop is the primary workflow for implementing features. It combi
 When starting, announce:
 > *"Starting development loop (specialist-owned verification, max 5 iterations)"*
 
+Record the start time for duration tracking.
+
+---
+
+## Step Announcements
+
+Announce each step transition to keep the user informed of progress.
+
+### Format
+
+> **[Step Name]** | Duration: {elapsed} | {status info}
+
+### Step-Specific Announcements
+
+| Transition | Announcement |
+|------------|--------------|
+| → Implementation | **Implementation** \| Duration: 0m \| Iteration 1, invoking {specialist} specialist |
+| → Validation | **Validation** \| Duration: {elapsed} \| Specialist returned, re-running verification |
+| → Code Review | **Code Review** \| Duration: {elapsed} \| Validation passed, invoking reviewers |
+| → Reflection | **Reflection** \| Duration: {elapsed} \| Code review approved, capturing learnings |
+| → Complete | **Complete** \| Duration: {elapsed} \| All steps passed |
+
+### Iteration Announcements
+
+When returning to implementation after findings:
+> **Implementation** | Duration: {elapsed} | Iteration {n}, fixing {count} findings from {reviewer}
+
+### Failure Announcements
+
+| Scenario | Announcement |
+|----------|--------------|
+| Validation failed | **Validation Failed** \| Duration: {elapsed} \| Layer {n} failed, resuming specialist |
+| Code review blocked | **Code Review Blocked** \| Duration: {elapsed} \| {reviewer} raised BLOCKER, returning to implementation |
+| Max iterations | **Loop Aborted** \| Duration: {elapsed} \| Max 5 iterations reached, escalating to user |
+
 ---
 
 ## Loop States

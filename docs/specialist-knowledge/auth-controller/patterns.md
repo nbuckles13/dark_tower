@@ -177,3 +177,19 @@ Create dedicated repository modules for each domain entity with focused query fu
 **Related files**: `crates/ac-service/src/handlers/auth_handler.rs`, `crates/ac-service/src/services/user_service.rs`
 
 Issue JWT token immediately after successful user registration in a single transaction. Eliminates need for separate login call, improves UX, and reduces round trips. Registration handler creates user, then calls token issuance with the newly created user record. Response includes both user info and access token.
+
+---
+
+## Pattern: TestAuthServer Multi-Tenant Helpers
+**Added**: 2026-01-15
+**Related files**: `crates/ac-test-utils/src/server_harness.rs`, `crates/ac-service/tests/integration/user_auth_tests.rs`
+
+For multi-tenant integration testing, TestAuthServer provides helpers: `create_test_org(subdomain, display_name)` creates an org in DB, `create_test_user(org_id, email, password, display_name)` creates a user with hashed password, `host_header(subdomain)` returns correct Host header including port. Pattern enables testing org-scoped operations without manual setup. Use `server.client()` for reqwest client access.
+
+---
+
+## Pattern: Host Header Subdomain Testing
+**Added**: 2026-01-15
+**Related files**: `crates/ac-test-utils/src/server_harness.rs`, `crates/ac-service/tests/integration/user_auth_tests.rs`
+
+Test subdomain extraction by setting Host header in HTTP requests: `.header("Host", server.host_header("acme"))` returns `acme.localhost:PORT`. The port must be included for test server binding. This validates org_extraction middleware in integration tests without modifying DNS. Test cases should cover valid subdomains, IP addresses (rejected), uppercase (rejected), and unknown subdomains (404).

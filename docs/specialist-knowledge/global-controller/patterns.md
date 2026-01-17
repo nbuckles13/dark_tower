@@ -48,7 +48,7 @@ Config loads from env vars with `from_env()`. Validates bounds (JWT clock skew 1
 **Added**: 2026-01-14
 **Related files**: `crates/gc-test-utils/src/server_harness.rs`
 
-TestGcServer::spawn(pool) starts real Axum server on random port. Returns base_url for reqwest calls. Server drops when handle dropped. Matches TestAcServer pattern for E2E testing.
+TestGcServer::spawn(pool) starts real Axum server on random port. Returns base_url for reqwest calls. Server drops when handle dropped. Matches TestAcServer pattern for integration testing.
 
 ---
 

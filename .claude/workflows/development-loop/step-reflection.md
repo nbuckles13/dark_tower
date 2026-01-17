@@ -18,6 +18,18 @@ If resume fails, use checkpoint injection. See `session-restore.md` for the fall
 
 ---
 
+## Resume Sequentially, Not in Parallel
+
+**Resume one specialist at a time**, waiting for each to complete before resuming the next.
+
+Parallel resume operations cause `API Error: 400 due to tool use concurrency issues`. The backend cannot handle multiple simultaneous agent resume calls.
+
+**Order**: Resume implementing specialist first, then each reviewer.
+
+**If resume fails**: Don't retry the same agent ID. Instead, spawn a fresh agent with checkpoint injection per `session-restore.md` "Resume Fallback Pattern" section.
+
+---
+
 ## Who Reflects
 
 | Specialist | Agent ID Source |

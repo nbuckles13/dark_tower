@@ -172,7 +172,7 @@ Each test file declares exactly one feature gate at the module level. This preve
 **Added**: 2026-01-14
 **Related files**: `crates/gc-test-utils/src/server_harness.rs`
 
-For E2E testing, create a test harness that spawns a real service instance:
+For integration testing, create a test harness that spawns a real service instance:
 1. Use `Arc<AppState>` to wrap shared state (DB pool, config)
 2. Spawn the HTTP server in background via `tokio::spawn()` and hold the `JoinHandle`
 3. Return a wrapper struct (e.g., `TestGcServer`) that provides accessor methods (`url()`, `pool()`, `config()`)
@@ -272,3 +272,67 @@ pub async fn get_user(
 }
 ```
 The service layer returns `UserServiceError` which implements `IntoResponse` to map to HTTP status codes.
+
+---
+
+## Pattern: Integration Test Organization with Section Comments
+**Added**: 2026-01-15
+**Related files**: `crates/ac-service/tests/integration/user_auth_tests.rs`
+
+Organize integration tests with clear section separators and category headers when testing related flows:
+```rust
+// ============================================================================
+// Registration Tests (11 tests)
+// ============================================================================
+
+/// Test that valid registration returns user_id and access_token.
+#[sqlx::test(migrations = "../../migrations")]
+async fn test_register_happy_path(pool: PgPool) -> Result<(), anyhow::Error> { ... }
+```
+Benefits: (1) Easy navigation in long test files, (2) Clear test count per category, (3) Module-level doc comments explain test organization. This pattern works well for files with 20+ tests.
+
+---
+
+## Pattern: Subdomain-Based Host Header Testing
+**Added**: 2026-01-15
+**Related files**: `crates/ac-service/tests/integration/user_auth_tests.rs`, `crates/ac-test-utils/src/server_harness.rs`
+
+For multi-tenant systems using subdomain-based org extraction, provide a test helper that constructs Host headers:
+```rust
+impl TestAuthServer {
+    pub fn host_header(&self, subdomain: &str) -> String {
+        format!("{}.localhost:{}", subdomain, self.addr().port())
+    }
+}
+```
+Tests then use: `.header("Host", server.host_header("acme"))`. This centralizes host header construction and makes tests resilient to port changes. Also test edge cases: IP addresses (rejected), uppercase (rejected), unknown subdomains (404).
+
+---
+
+## Pattern: Underscore Prefix for Intentionally Unused Variables
+**Added**: 2026-01-15
+**Related files**: `crates/ac-service/tests/integration/user_auth_tests.rs`
+
+When test setup creates data that isn't directly used but is necessary for the test scenario (e.g., creating an org for subdomain extraction), use underscore prefix to silence compiler warnings:
+```rust
+let _org_id = server.create_test_org("acme", "Acme Corp").await?;
+```
+This is idiomatic Rust and signals intentional non-use. Consider adding a brief comment when the reason isn't obvious. Better than `#[allow(unused)]` because it's explicit at the binding site.
+
+---
+
+## Pattern: Consistent Error Code Assertions in API Tests
+**Added**: 2026-01-15
+**Related files**: `crates/ac-service/tests/integration/user_auth_tests.rs`
+
+When testing error responses, assert both HTTP status code AND the application error code:
+```rust
+assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+let body: serde_json::Value = response.json().await?;
+assert_eq!(
+    body["error"]["code"].as_str(),
+    Some("INVALID_CREDENTIALS"),
+    "Error code should be INVALID_CREDENTIALS"
+);
+```
+This catches cases where the status is correct but the error body is wrong. Also verify error messages contain expected keywords using `.contains()` assertions.

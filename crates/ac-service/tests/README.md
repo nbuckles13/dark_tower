@@ -10,8 +10,34 @@ tests/
 ├── integration/         # Integration tests (service layer, real DB, no HTTP)
 ├── fault_injection/     # Fault injection tests (simulated failures via code)
 ├── e2e/                # End-to-end tests (full HTTP stack)
-└── migrations/         # Migration validation tests
+├── migrations/         # Migration validation tests
+├── integration_tests.rs # Entry point for integration tests
+└── fault_injection_tests.rs # Entry point for fault injection tests
 ```
+
+## Test Registration
+
+Tests in subdirectories must be explicitly registered in their entry point file using `#[path = "..."]`.
+
+**Pattern:**
+```rust
+// In tests/integration_tests.rs
+#[path = "integration/my_new_tests.rs"]
+mod my_new_tests;
+```
+
+**Why?** Cargo only compiles `.rs` files at the root of `tests/`. Files in subdirectories are not automatically discovered - they must be included via `mod` with `#[path]`.
+
+**Guard:** The `test-registration` guard verifies all test files are registered. It runs as part of `./scripts/guards/run-guards.sh` and will fail if any test files in subdirectories are not registered.
+
+**Adding a new test file:**
+1. Create the file in the appropriate subdirectory (e.g., `tests/integration/my_tests.rs`)
+2. Add the registration to the entry point (e.g., `tests/integration_tests.rs`):
+   ```rust
+   #[path = "integration/my_tests.rs"]
+   mod my_tests;
+   ```
+3. Run the guard to verify: `./scripts/guards/simple/test-registration.sh`
 
 ## Running Tests
 

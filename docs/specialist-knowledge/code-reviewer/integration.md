@@ -103,3 +103,32 @@ The service layer pattern used in user provisioning is the template for all futu
 5. Implement `IntoResponse` on error type to map to HTTP status codes
 
 This pattern separates data access (repository) from business logic (service) from HTTP handling (handlers).
+
+---
+
+## Integration: User Auth Integration Test Patterns
+**Added**: 2026-01-15
+**Related files**: `crates/ac-service/tests/integration/user_auth_tests.rs`, `crates/ac-test-utils/src/server_harness.rs`
+
+The user auth integration tests establish patterns for testing multi-tenant authentication flows:
+1. **Test harness**: `TestAuthServer` spawns real HTTP server with database, provides `host_header()` helper for subdomain testing
+2. **Test data helpers**: `create_test_org()`, `create_test_user()`, `create_inactive_test_user()` in server harness
+3. **Request pattern**: Use reqwest client with `.header("Host", server.host_header("subdomain"))` for tenant isolation
+4. **Assertion pattern**: Assert HTTP status, then parse JSON body and assert error codes/messages
+5. **Organization**: Section comments separate Registration/Login/OrgExtraction tests
+
+Future auth-related integration tests should follow these patterns. Test specialist should verify new tests use these helpers rather than reinventing them.
+
+---
+
+## Integration: Test Specialist Coordination for DRY Findings
+**Added**: 2026-01-15
+**Related files**: `crates/ac-service/tests/integration/user_auth_tests.rs`
+
+When code review identifies DRY violations in test code (duplicated JWT decoding, repeated assertion patterns), coordinate with Test specialist to:
+1. Create shared helper functions in the test-utils crate
+2. Update existing tests to use new helpers
+3. Document helpers in test harness module docs
+4. Ensure helpers return `Result` for ADR-0002 compliance
+
+For this review, JWT decoding was duplicated 8+ times - a helper function like `decode_jwt_payload()` should be added to `server_harness.rs`. Flag as tech debt if not immediately addressable.
