@@ -41,6 +41,45 @@ All agent IDs should be stored in the Loop State table.
 
 ---
 
+## Curation Criteria
+
+Before adding a new entry, ask yourself:
+
+1. **Would a fresh specialist benefit?** Would someone unfamiliar with this task find this useful on a similar future task?
+2. **Is this reusable or task-specific?** Patterns should generalize beyond this one implementation.
+3. **Is this project-specific?** Universal best practices (Arrange-Act-Assert, DRY) don't need entries.
+4. **Does an existing entry cover this?** Update existing entries rather than creating duplicates.
+
+If the answer to #1 or #2 is "no", don't add the entry.
+
+---
+
+## Pruning Check
+
+During each reflection, review existing entries for:
+
+1. **Dead references**: File paths that no longer exist or have moved significantly
+2. **Superseded patterns**: Approaches replaced by better ones
+3. **Over-specific entries**: Implementation details that won't help future tasks
+4. **Redundant entries**: Knowledge now covered by other entries or project docs
+
+Remove or update entries that match these criteria. Pruning is as valuable as adding.
+
+---
+
+## Valid Reflection Outcomes
+
+Not every task produces new knowledge. Valid reflection outcomes include:
+
+- **Added N entries**: New patterns/gotchas discovered
+- **Updated N entries**: Existing entries refined or corrected
+- **Pruned N entries**: Stale or redundant entries removed
+- **No changes**: Existing knowledge was sufficient; nothing new learned
+
+"No changes" is a valid outcome. Don't add entries just to add them.
+
+---
+
 ## What Specialists Do
 
 1. Review knowledge in `docs/specialist-knowledge/{specialist}/`

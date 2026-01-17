@@ -1,43 +1,37 @@
 # DRY Reviewer - Patterns That Work
 
-## Successful Approaches
+Successful approaches for cross-service duplication detection in Dark Tower.
 
-### 1. ADR-0019 Duplication Classification
-**Pattern**: Distinguish between BLOCKER duplication and TECH_DEBT duplication
-- **BLOCKER**: New duplication introduced that violates established patterns
-- **TECH_DEBT**: Existing duplication patterns already documented in codebase
-- **When to apply**: All code reviews where duplication is detected
+---
 
-**Why it works**: Allows progress on features without requiring all tech debt resolved first, while maintaining architectural integrity
+## Pattern: ADR-0019 BLOCKER vs TECH_DEBT Classification
+**Added**: 2026-01-15
+**Related files**: `docs/decisions/adr-0019-dry-reviewer.md`
 
-### 2. Cross-Service Pattern Registry
-**Pattern**: Document established duplication patterns across services in integration.md
-- **Content**: List known duplication patterns (JWT signing, key loading, etc.)
-- **Reference ID**: Assign tech debt IDs (TD-1, TD-2, etc.) for tracking
-- **When to apply**: During knowledge accumulation, before future reviews
+Distinguish between BLOCKER duplication (must fix) and TECH_DEBT duplication (document and continue). BLOCKER: Code EXISTS in `common` crate but wasn't used, or new duplication of security-critical code. TECH_DEBT: Similar code exists in another service (parallel evolution). This allows feature velocity while tracking architectural debt.
 
-**Why it works**: Enables quick classification of similar issues in future reviews, prevents repeated discovery
+---
 
-### 3. Duplication Severity Tiers
-**Pattern**: Use tiers to assess duplication impact:
-- **Tier 1 (BLOCKER)**: Critical security implications, breaks DRY principle, new pattern
-- **Tier 2 (TECH_DEBT)**: Known pattern, documented, improvement tracked
-- **Tier 3 (ACCEPTABLE)**: Small isolated code, cost of extraction > benefit
+## Pattern: Tech Debt Registry with Tracking IDs
+**Added**: 2026-01-15
+**Related files**: `docs/specialist-knowledge/dry-reviewer/integration.md`
 
-**Why it works**: Focuses energy on highest-impact duplication while acknowledging technical realities
+Assign stable tech debt IDs (TD-1, TD-2, etc.) to known duplication patterns. Include: location, pattern description, severity, status, improvement path, and timeline. This enables quick classification of similar issues in future reviews and prevents repeated discovery of the same duplication.
 
-## Code Review Integration
+---
 
-### Successful Review Flow
-1. Identify all duplication points in changeset
-2. Check against cross-service pattern registry (integration.md)
-3. Classify as BLOCKER or TECH_DEBT per ADR-0019
-4. Document findings with reference IDs
-5. Approve/reject based on blocking status only
+## Pattern: Three-Tier Severity Assessment
+**Added**: 2026-01-15
+**Related files**: `docs/decisions/adr-0019-dry-reviewer.md`
 
-### Effective Documentation
-- Always cite ADR-0019 when applying TECH_DEBT classification
-- Reference existing tech debt IDs when applicable (TD-1, TD-2, etc.)
-- Include rationale for BLOCKER classification
-- Provide clear improvement path for TECH_DEBT items
+Use severity tiers to assess duplication impact: Tier 1 (BLOCKER) for code that ignores existing common utilities or introduces new security duplication. Tier 2 (TECH_DEBT) for known patterns already documented. Tier 3 (ACCEPTABLE) for small isolated code where extraction cost exceeds benefit. Only Tier 1 blocks code review approval.
 
+---
+
+## Pattern: Review Flow with Registry Lookup
+**Added**: 2026-01-15
+**Related files**: `docs/specialist-knowledge/dry-reviewer/integration.md`
+
+Before classifying duplication: (1) Identify all duplication points in changeset, (2) Check tech debt registry in integration.md for existing TD-N entries, (3) If found, classify as TECH_DEBT with existing ID, (4) If new, assess whether BLOCKER or new TECH_DEBT. This prevents re-flagging known debt and ensures consistent classification.
+
+---

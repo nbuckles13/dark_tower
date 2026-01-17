@@ -20,38 +20,6 @@ Security parameters should be configurable but bounded. Pattern: MIN (security f
 
 ---
 
-## Pattern: Constant-Time Error Responses
-**Added**: 2026-01-11
-**Related files**: `crates/ac-service/src/services/token_service.rs`
-
-Authentication failures must return identical errors regardless of failure reason. Pattern: Run same crypto operations (dummy hash) even on non-existent users. Return generic "invalid credentials" for all failure paths.
-
----
-
-## Pattern: Size-Before-Parse Validation
-**Added**: 2026-01-11
-**Related files**: `crates/ac-service/src/crypto/mod.rs`
-
-Check input sizes BEFORE expensive operations (base64 decode, signature verify, JSON parse). Prevents DoS via oversized inputs. Example: JWT 4KB limit checked before any parsing.
-
----
-
-## Pattern: Log Security Events, Not Secrets
-**Added**: 2026-01-11
-**Related files**: `crates/ac-service/src/crypto/mod.rs`
-
-Log security-relevant events (cost warnings, validation failures) but never secrets. Pattern: `warn!("bcrypt cost {} below recommended", cost)` logs fact, not the password being hashed.
-
----
-
-## Pattern: Cryptographic Agility via Config
-**Added**: 2026-01-11
-**Related files**: `crates/ac-service/src/config.rs`
-
-Design crypto to accept algorithm/strength parameters from config. Enables future upgrades (bcrypt cost increase, algorithm migration) without code changes. Document recommended values per current standards (OWASP, NIST).
-
----
-
 ## Pattern: Security Review Checklist
 **Added**: 2026-01-11
 **Related files**: `.claude/agents/security.md`
@@ -84,14 +52,6 @@ For "one-time reveal" API responses (registration, secret rotation), implement c
 
 ---
 
-## Pattern: Custom Clone for SecretBox Types
-**Added**: 2026-01-12
-**Related files**: `crates/ac-service/src/config.rs`, `crates/ac-service/src/crypto/mod.rs`
-
-`SecretBox<T>` doesn't derive Clone. For types containing SecretBox, implement Clone manually: `SecretBox::new(Box::new(self.field.expose_secret().clone()))`. This maintains secret protection on cloned values. Essential for structs like `Config` that may be cloned across threads.
-
----
-
 ## Pattern: JWKS Private Key Field Validation
 **Added**: 2026-01-13
 **Related files**: `crates/env-tests/tests/25_auth_security.rs`
@@ -100,35 +60,11 @@ When testing JWKS endpoints for private key leakage, check for ALL private key f
 
 ---
 
-## Pattern: JWT Header Injection Test Suite
-**Added**: 2026-01-13
-**Related files**: `crates/env-tests/tests/25_auth_security.rs`
-
-When testing JWT header security, validate three attack surfaces: (1) `kid` injection - test path traversal (`../../etc/passwd`), SQL injection (`'; DROP TABLE--`), XSS, null bytes, header injection; (2) `jwk` embedding (CVE-2018-0114) - verify service ignores embedded public keys; (3) `jku` SSRF - test external URLs, internal URLs, file:// protocol, cloud metadata endpoints. All tests pass because JWT signatures cover the header - tampering invalidates signature.
-
----
-
-## Pattern: Security Test via Signature Integrity
-**Added**: 2026-01-13
-**Related files**: `crates/env-tests/tests/25_auth_security.rs`
-
-JWT header injection attacks are implicitly prevented by signature validation. When testing header injection (kid, jwk, jku), modifying the header invalidates the signature. This means testing "header injection rejection" is really testing "signature validation works correctly." Document this in test comments to avoid confusion - the protection mechanism is cryptographic, not input validation.
-
----
-
-## Pattern: Subprocess Command Array for Shell Injection Prevention
-**Added**: 2026-01-13
-**Related files**: `crates/env-tests/src/canary.rs`
-
-When invoking external commands (kubectl, etc.) from Rust, use `Command::new("cmd").args([...])` with explicit argument arrays, NOT shell string concatenation. This prevents shell metacharacter injection. Even if namespace/input values are controlled, this pattern is defense-in-depth. Example: `Command::new("kubectl").args(["get", "pod", &name, &format!("--namespace={}", ns)])` - the namespace cannot break out of its argument position.
-
----
-
 ## Pattern: Query Timeout via Connection URL Parameters
 **Added**: 2026-01-14
 **Related files**: `crates/global-controller/src/main.rs`
 
-Prevent hung queries and DoS attacks by setting database statement_timeout at connection time, not per-query. Pattern: append `?options=-c%20statement_timeout%3D{seconds}` to the PostgreSQL connection URL. This ensures ALL queries timeout after N seconds, preventing resource exhaustion. Combine with application-level request timeout (e.g., 30s via `tower_http::TimeoutLayer`) for defense-in-depth. Set timeout low enough (e.g., 5 seconds) to catch expensive operations, high enough for legitimate slow queries. Timeout value should be logged at startup for observability.
+Prevent hung queries and DoS attacks by setting database statement_timeout at connection time, not per-query. Pattern: append `?options=-c%20statement_timeout%3D{seconds}` to the PostgreSQL connection URL. This ensures ALL queries timeout after N seconds, preventing resource exhaustion. Combine with application-level request timeout for defense-in-depth. Set timeout low enough (e.g., 5 seconds) to catch expensive operations, high enough for legitimate slow queries.
 
 ---
 
@@ -136,46 +72,6 @@ Prevent hung queries and DoS attacks by setting database statement_timeout at co
 **Added**: 2026-01-14
 **Related files**: `crates/global-controller/src/auth/jwt.rs`
 
-JWT validation includes algorithm pinning (token must have `alg: EdDSA`), but defense-in-depth also requires validating JWK fields: (1) `kty` (key type) must be `"OKP"` (Octet Key Pair) for Ed25519 keys, (2) `alg` field in JWK, if present, must be `"EdDSA"`. This prevents accepting keys from wrong cryptosystems (RSA, ECDSA) or key type mismatches. Pattern: Validate JWK fields at start of token verification before any crypto operations. Log warnings if fields are missing or invalid. This catches misconfigured JWKS endpoints and server misconfigurations that token-level validation alone wouldn't catch.
-
----
-
-## Pattern: JWKS Endpoint Validation Recommendations
-**Added**: 2026-01-14
-**Related files**: `crates/global-controller/src/auth/jwks.rs`
-
-JWKS endpoints should be validated for: (1) HTTPS scheme required (not HTTP), (2) No redirects to different hosts allowed, (3) Response size capped (prevent OOM via huge JWKS). In Global Controller Phase 2, only the JWK field validation was critical and implemented. HTTPS validation and cache stampede protection are Phase 3+ hardening items, documented as minor for future work. Current implementation logs warnings on HTTP client failures to surface misconfigurations.
-
----
-
-## Pattern: Custom Debug Redaction for PII Claims
-**Added**: 2026-01-15
-**Related files**: `crates/ac-service/src/crypto/mod.rs`
-
-Custom Debug implementations should redact PII fields like subject identifiers. Pattern: `impl fmt::Debug for Claims` with `.field("sub", &"[REDACTED]")` for any field containing user/client IDs. This prevents accidental exposure in debug output and logs. Non-PII fields like `exp`, `iat`, `scope` are safe to expose. This complements SecretString/SecretBox protection by handling structured types containing identifiers.
-
----
-
-## Pattern: Timing-Safe Dummy Hash with Matching Cost
-**Added**: 2026-01-15
-**Related files**: `crates/ac-service/src/services/token_service.rs`
-
-When implementing constant-time authentication, the dummy hash used for non-existent users must use the same bcrypt cost factor as production hashes. Pattern: Store dummy hash at config load time with production cost, reuse for all non-existent user attempts. If cost changes dynamically, regenerate dummy hash immediately. This ensures timing is consistent regardless of user existence, preventing timing-based account enumeration.
-
----
-
-## Pattern: Service Registration Only Exposes Secret Once
-**Added**: 2026-01-15
-**Related files**: `crates/ac-service/src/services/registration_service.rs`
-
-When registering services/users, the generated plaintext secret is exposed ONLY in the registration response. Pattern: (1) Generate secret with CSPRNG, (2) Hash for storage, (3) Expose plaintext only in RegisterServiceResponse, (4) Document "store this securely!" in response. After registration, the plaintext is never available again - even admins cannot retrieve it. This forces proper secret management: services must store the credential immediately or generate new ones. Example: `RegisterServiceResponse` with custom Serialize that exposes the client_secret.
-
----
-
-## Pattern: Identical Error Responses for Login Failures
-**Added**: 2026-01-15
-**Related files**: `crates/ac-service/tests/integration/user_auth_tests.rs`
-
-Login endpoints must return identical error responses for different failure reasons to prevent user enumeration. Test that wrong password, nonexistent user, and inactive user all return the same 401 status and similar error body. Attackers shouldn't be able to distinguish "user exists but wrong password" from "user doesn't exist". Integration tests should explicitly verify this by comparing responses across failure modes.
+JWT validation includes algorithm pinning (token must have `alg: EdDSA`), but defense-in-depth also requires validating JWK fields: (1) `kty` (key type) must be `"OKP"` (Octet Key Pair) for Ed25519 keys, (2) `alg` field in JWK, if present, must be `"EdDSA"`. This prevents accepting keys from wrong cryptosystems. Pattern: Validate JWK fields at start of token verification before any crypto operations.
 
 ---
