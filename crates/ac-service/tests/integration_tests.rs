@@ -17,3 +17,6 @@ mod clock_skew_tests;
 
 #[path = "integration/user_auth_tests.rs"]
 mod user_auth_tests;
+
+#[path = "integration/internal_token_tests.rs"]
+mod internal_token_tests;

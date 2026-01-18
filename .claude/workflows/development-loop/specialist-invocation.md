@@ -8,6 +8,11 @@ This file describes how step-runners invoke specialists during the dev-loop.
 
 Use the **Task tool** with `general-purpose` subagent_type.
 
+**Why Task tool (not `claude --print`)**:
+- Task sub-agents inherit the session's permissions
+- `claude --print` spawns a separate CLI process that cannot get user approval for permissions
+- This caused silent failures when the spawned process needed permissions
+
 Build the prompt by reading and concatenating these inputs (provided by orchestrator):
 
 | Input | Source | Required |
@@ -57,11 +62,15 @@ Build the prompt by reading and concatenating these inputs (provided by orchestr
 - Add implementation suggestions or design guidance
 - Specify function names, patterns, or architecture
 - Write code yourself - the specialist writes code
+- **Implement directly if specialist invocation fails** - return error to orchestrator instead
 
 **DO**:
 - Read and concatenate the files as specified
 - Pass task and findings exactly as received from orchestrator
 - Verify checkpoint exists after specialist returns
+- **If Task invocation fails**: Return `status: failed` with error details. Do NOT fall back to implementing yourself.
+
+**Why no fallback implementation**: Step-runners have full tool access, so they *could* implement directly. But this bypasses specialist expertise, principles injection, and creates confusion about who did the work. Always return errors to orchestrator.
 
 ---
 

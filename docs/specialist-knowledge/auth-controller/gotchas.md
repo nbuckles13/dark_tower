@@ -99,3 +99,16 @@ No trait objects or generics - type must match exactly or extraction fails silen
 Host header parsing has edge cases: IP addresses (no subdomain), ports (strip before parsing), single-part hostnames (localhost), and hosts with many parts (a.b.c.example.com). Middleware must handle: stripping port, checking for IP addresses, and extracting first segment only when at least 3 parts exist. Tests should cover all edge cases.
 
 ---
+
+## Gotcha: split_whitespace() Scope Extraction Behavior
+**Added**: 2026-01-18
+**Related files**: `crates/ac-service/src/handlers/internal_tokens.rs`
+
+The handler uses `claims.scope.split_whitespace().collect()` to extract scopes from the JWT claim. This means:
+- Empty string scope (`""`) results in empty Vec (not Vec with empty string)
+- Whitespace-only scopes (`"   "`) also result in empty Vec
+- Multiple spaces between scopes are handled correctly
+
+Tests should verify empty scope rejection, not just "wrong scope" rejection. An empty token scope should fail authorization even if the handler has a default behavior.
+
+---
