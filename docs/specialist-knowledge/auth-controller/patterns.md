@@ -87,3 +87,19 @@ Extract organization context from request Host header subdomain before handler e
 Test subdomain extraction by setting Host header in HTTP requests: `.header("Host", server.host_header("acme"))` returns `acme.localhost:PORT`. The port must be included for test server binding. Test cases should cover valid subdomains, IP addresses (rejected), uppercase (rejected), and unknown subdomains (404).
 
 ---
+
+## Pattern: Scope Validation Test Pattern (Multiple Attack Vectors)
+**Added**: 2026-01-18
+**Related files**: `crates/ac-service/tests/integration/internal_token_tests.rs`
+
+When testing scope-based authorization, cover multiple attack vectors beyond happy path:
+1. **Exact match succeeds** - Required scope present works
+2. **Prefix attack** - `internal:meeting` should NOT match `internal:meeting-token`
+3. **Suffix attack** - `internal:meeting-token-extra` should NOT match `internal:meeting-token`
+4. **Case sensitivity** - `INTERNAL:MEETING-TOKEN` should NOT match `internal:meeting-token`
+5. **Empty scope** - Token with empty scope claim should be rejected
+6. **Multiple scopes** - Token with multiple scopes including required one should succeed
+
+This pattern prevents subtle authorization bypass where similar-looking scopes are accepted.
+
+---
