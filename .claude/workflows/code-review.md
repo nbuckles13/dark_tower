@@ -297,10 +297,9 @@ This ensures reviewers apply both their domain expertise AND learned patterns/go
 3. Identify quick wins vs. substantial refactors
 4. Create prioritized task list
 5. Determine overall recommendation:
-   - ✅ **APPROVE**: Ready to merge
-   - ⚠️ **APPROVE WITH MINOR CHANGES**: Can merge after minor fixes
-   - 🔄 **REQUEST CHANGES**: Must address blocker/critical issues
-   - ❌ **REJECT**: Fundamental issues, needs redesign
+   - ✅ **APPROVE**: No blocking findings (only TECH_DEBT or none)
+   - 🔄 **REQUEST CHANGES**: Any BLOCKER, CRITICAL, MAJOR, or MINOR findings
+   - ❌ **REJECT**: Fundamental design issues, needs redesign
 
 **Output**: Action plan with specific next steps
 
@@ -351,10 +350,9 @@ If specialists disagree:
 [2-3 sentence overview of changes and overall quality]
 
 ## Overall Recommendation
-- [ ] ✅ APPROVE
-- [ ] ⚠️ APPROVE WITH MINOR CHANGES
-- [ ] 🔄 REQUEST CHANGES (current recommendation)
-- [ ] ❌ REJECT
+- [ ] ✅ APPROVE (no blocking findings)
+- [ ] 🔄 REQUEST CHANGES (BLOCKER/CRITICAL/MAJOR/MINOR findings)
+- [ ] ❌ REJECT (fundamental design issues)
 
 ## Critical Findings
 
@@ -656,7 +654,7 @@ When code review is run as part of a dev-loop (not standalone), additional requi
 
 **Date**: YYYY-MM-DD
 **Task**: {task description}
-**Verdict**: APPROVED | APPROVED_WITH_NOTES | REQUEST_CHANGES | BLOCKED
+**Verdict**: APPROVED | REQUEST_CHANGES | BLOCKED
 
 ## Observations
 

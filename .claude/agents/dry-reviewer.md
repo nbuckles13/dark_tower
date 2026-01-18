@@ -59,13 +59,15 @@ During code review, search for patterns in the new/modified code that already ex
 ### BLOCKING vs TECH_DEBT
 
 **BLOCKING** (must fix before approval):
-- Code that already exists in `common` crate but wasn't imported
+- Code that already exists in `crates/common/` but wasn't imported
 - This is a mistake, not a design choice
 
 **TECH_DEBT** (document for follow-up):
 - Code that exists in another service but not yet in `common`
 - This is an opportunity for extraction, not a mistake
 - Current task completes; follow-up task created for extraction
+
+**Important**: Only `crates/common/` is shared across services. All other crates (including `*-test-utils` crates like `ac-test-utils`, `gc-test-utils`) are service-specific. Duplication from service-specific crates is TECH_DEBT, not BLOCKING.
 
 ---
 
