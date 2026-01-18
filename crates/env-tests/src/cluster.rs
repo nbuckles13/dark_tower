@@ -24,6 +24,7 @@ pub enum ClusterError {
 #[derive(Debug, Clone)]
 pub struct ClusterPorts {
     pub ac_service: u16,
+    pub gc_service: u16,
     pub prometheus: u16,
     pub grafana: u16,
     pub loki: Option<u16>,
@@ -33,6 +34,7 @@ impl Default for ClusterPorts {
     fn default() -> Self {
         Self {
             ac_service: 8082,
+            gc_service: 8080,
             prometheus: 9090,
             grafana: 3000,
             loki: Some(3100),
@@ -45,6 +47,7 @@ impl Default for ClusterPorts {
 /// Provides health check utilities and base URLs for service access.
 pub struct ClusterConnection {
     pub ac_base_url: String,
+    pub gc_base_url: String,
     pub prometheus_base_url: String,
     pub grafana_base_url: String,
     pub loki_base_url: Option<String>,
@@ -64,6 +67,9 @@ impl ClusterConnection {
     pub async fn new_with_ports(ports: ClusterPorts) -> Result<Self, ClusterError> {
         // Check AC service port-forward
         Self::check_tcp_port(ports.ac_service)?;
+
+        // Check GC service port-forward (optional - may not be deployed yet)
+        let gc_available = Self::check_tcp_port(ports.gc_service).is_ok();
 
         // Check Prometheus port-forward
         Self::check_tcp_port(ports.prometheus)?;
@@ -90,8 +96,17 @@ impl ClusterConnection {
                 message: format!("Failed to create HTTP client: {}", e),
             })?;
 
+        // GC base URL - may be unavailable if GC not deployed
+        let gc_base_url = if gc_available {
+            format!("http://localhost:{}", ports.gc_service)
+        } else {
+            // Return URL anyway, tests will fail with connection error if GC not running
+            format!("http://localhost:{}", ports.gc_service)
+        };
+
         Ok(Self {
             ac_base_url: format!("http://localhost:{}", ports.ac_service),
+            gc_base_url,
             prometheus_base_url: format!("http://localhost:{}", ports.prometheus),
             grafana_base_url: format!("http://localhost:{}", ports.grafana),
             loki_base_url,
@@ -134,6 +149,28 @@ impl ClusterConnection {
         }
 
         Ok(())
+    }
+
+    /// Check if the GC service health endpoint is responding.
+    pub async fn check_gc_health(&self) -> Result<(), ClusterError> {
+        let health_url = format!("{}/v1/health", self.gc_base_url);
+
+        let response = self.http_client.get(&health_url).send().await?;
+
+        if !response.status().is_success() {
+            return Err(ClusterError::HealthCheckFailed {
+                message: format!("GC health endpoint returned status {}", response.status()),
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Check if the GC service is available.
+    ///
+    /// Returns true if GC port-forward is detected and health check passes.
+    pub async fn is_gc_available(&self) -> bool {
+        self.check_gc_health().await.is_ok()
     }
 
     /// Check if the AC service ready endpoint is responding.
@@ -208,6 +245,7 @@ mod tests {
     fn test_default_ports() {
         let ports = ClusterPorts::default();
         assert_eq!(ports.ac_service, 8082);
+        assert_eq!(ports.gc_service, 8080);
         assert_eq!(ports.prometheus, 9090);
         assert_eq!(ports.grafana, 3000);
         assert_eq!(ports.loki, Some(3100));

@@ -236,3 +236,26 @@ This means:
 This is by design and catches invalid test dependencies early.
 
 ---
+
+## Gotcha: Custom Debug Not Sufficient for Error Response Bodies
+**Added**: 2026-01-18
+**Related files**: `crates/env-tests/src/fixtures/gc_client.rs`
+
+Custom Debug implementations only redact when Debug formatting is used. Error response bodies stored in error variants (e.g., `RequestFailed { status, body }`) can still leak credentials through other paths: (1) Test assertions with `assert_eq!`, (2) Error `Display` implementations, (3) Logging with `{:?}` on the body directly. Solution: Sanitize error bodies at capture time, not just in Debug. The `sanitize_error_body()` pattern removes JWTs and Bearer tokens before storing in error variants.
+
+---
+
+## Gotcha: Response Body Consumed Before Status Check
+**Added**: 2026-01-18
+**Related files**: `crates/env-tests/src/fixtures/gc_client.rs`
+
+`response.text().await` consumes the response body. If you try to check `response.status()` afterward, you get a borrow-after-move error. Solution: Store status before consuming body:
+```rust
+let status = response.status();  // Get status first
+let body = response.text().await?;  // Then consume body
+if !status.is_success() {
+    return Err(Error::RequestFailed { status, body: sanitize_error_body(&body) });
+}
+```
+
+---

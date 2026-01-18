@@ -29,11 +29,14 @@ serde_json = { workspace = true }
 # Error handling
 thiserror = { workspace = true }
 
-# UUID for unique identifiers (canary pod names)
-uuid = { version = "1.11", features = ["v4"] }
+# UUID for unique identifiers (canary pod names, meeting IDs)
+uuid = { version = "1.11", features = ["v4", "serde"] }
 
 # Logging
 tracing = { workspace = true }
+
+# Regex for sanitizing error bodies
+regex = "1.10"
 
 [dev-dependencies]
 # JWT validation

@@ -200,3 +200,26 @@ Different feature types have different test coverage expectations:
 **Code review standard**: "Missing integration tests for critical paths = BLOCKER". If a feature touches the database or calls external services, integration tests are required before approval.
 
 ---
+
+## For Security Specialist: Error Body Sanitization in Test Clients
+**Added**: 2026-01-18
+**Related files**: `crates/env-tests/src/fixtures/gc_client.rs`
+
+When reviewing test client fixtures, verify error handling includes body sanitization. `GcClient` implements `sanitize_error_body()` which removes JWT patterns and Bearer tokens from error messages before storage. `AuthClient` does NOT have this yet - consider backporting. Sanitization catches credential leaks that custom Debug alone misses, especially in assertion output and error Display formatting.
+
+---
+
+## For All Specialists: Cross-Service Test Client Consistency
+**Added**: 2026-01-18
+**Related files**: `crates/env-tests/src/fixtures/gc_client.rs`, `crates/env-tests/src/fixtures/auth_client.rs`
+
+env-tests now has two service client fixtures: `AuthClient` (AC) and `GcClient` (GC). When adding new service clients (MC, MH), follow the established pattern:
+1. Error enum with `HttpError`, `RequestFailed`, `JsonError` variants
+2. Custom Debug on types with sensitive fields (tokens, captcha, subject IDs)
+3. `sanitize_error_body()` for error response handling
+4. `health_check()` method for availability detection
+5. `raw_*` methods returning Response for error path testing
+
+The `GcClient` pattern is more complete than `AuthClient` - use it as the reference.
+
+---

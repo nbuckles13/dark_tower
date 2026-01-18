@@ -75,3 +75,16 @@ Prevent hung queries and DoS attacks by setting database statement_timeout at co
 JWT validation includes algorithm pinning (token must have `alg: EdDSA`), but defense-in-depth also requires validating JWK fields: (1) `kty` (key type) must be `"OKP"` (Octet Key Pair) for Ed25519 keys, (2) `alg` field in JWK, if present, must be `"EdDSA"`. This prevents accepting keys from wrong cryptosystems. Pattern: Validate JWK fields at start of token verification before any crypto operations.
 
 ---
+
+## Pattern: Error Body Sanitization for Credential Protection
+**Added**: 2026-01-18
+**Related files**: `crates/env-tests/src/fixtures/gc_client.rs`
+
+HTTP error responses can contain credentials (JWTs in error messages, Bearer tokens in auth headers). Sanitize error bodies at capture time using regex pattern matching:
+1. JWT pattern: `eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+` -> `[JWT_REDACTED]`
+2. Bearer pattern: `Bearer\s+eyJ[A-Za-z0-9_-]+` -> `[BEARER_REDACTED]`
+3. Truncate long bodies (>256 chars) to limit info disclosure
+
+This provides defense-in-depth beyond custom Debug implementations, catching credentials in assertion output, Display formatting, and log messages.
+
+---

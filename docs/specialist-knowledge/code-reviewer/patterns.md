@@ -209,3 +209,20 @@ Organize integration tests with clear section separators and category headers:
 async fn test_register_happy_path(pool: PgPool) -> Result<(), anyhow::Error> { ... }
 ```
 Benefits: Easy navigation in long test files, clear test count per category. Works well for files with 20+ tests.
+
+---
+
+## Pattern: Service Client Fixture with Error Body Sanitization
+**Added**: 2026-01-18
+**Related files**: `crates/env-tests/src/fixtures/gc_client.rs`
+
+Test API clients should follow this complete pattern (GcClient is the reference):
+1. Error enum with `HttpError`, `RequestFailed { status, body }`, `JsonError` variants
+2. `sanitize_error_body()` helper using regex to remove JWT/Bearer patterns
+3. Custom Debug on response types with sensitive fields
+4. `health_check()` method for availability detection
+5. `raw_*` methods returning `Response` for testing error paths
+
+Key insight: Sanitize error bodies at capture time (in `handle_response()`), not in Debug output. This prevents credential leaks through all code paths including assertions and error chains.
+
+---

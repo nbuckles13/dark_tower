@@ -221,3 +221,46 @@ for i in 0..6 {
 This approach validates that rate limiting kicks in after threshold without hardcoding timing assumptions. For registration, use unique emails per attempt; for login, use same invalid password.
 
 ---
+
+## Pattern: Cross-Service Client Fixture with Graceful Service Availability
+**Added**: 2026-01-18
+**Related files**: `crates/env-tests/src/fixtures/gc_client.rs`, `crates/env-tests/src/fixtures/auth_client.rs`
+
+When testing cross-service flows, create service client fixtures that handle optional service availability:
+```rust
+// Check if service is available before running tests
+if !cluster.is_gc_available().await {
+    println!("SKIPPED: GC not deployed");
+    return;
+}
+```
+This allows tests to run even during phased rollouts where not all services are deployed. Pattern elements: (1) Health check method, (2) `is_X_available()` boolean wrapper, (3) Tests skip gracefully with message. Essential for incremental development.
+
+---
+
+## Pattern: Error Body Sanitization in Test Clients
+**Added**: 2026-01-18
+**Related files**: `crates/env-tests/src/fixtures/gc_client.rs`
+
+API client fixtures should sanitize error response bodies to prevent credential leaks in test logs:
+```rust
+fn sanitize_error_body(body: &str) -> String {
+    static JWT_PATTERN: LazyLock<Regex> = LazyLock::new(||
+        Regex::new(r"eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+").unwrap()
+    );
+    static BEARER_PATTERN: LazyLock<Regex> = LazyLock::new(||
+        Regex::new(r"Bearer\s+eyJ[A-Za-z0-9_-]+").unwrap()
+    );
+
+    let result = JWT_PATTERN.replace_all(body, "[JWT_REDACTED]");
+    let result = BEARER_PATTERN.replace_all(&result, "[BEARER_REDACTED]");
+    if result.len() > 256 {
+        format!("{}...[truncated]", &result[..256])
+    } else {
+        result.to_string()
+    }
+}
+```
+Apply sanitization in error handling paths. This caught credential leaks that custom Debug alone missed.
+
+---
