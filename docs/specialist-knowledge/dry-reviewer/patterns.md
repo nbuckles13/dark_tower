@@ -35,3 +35,11 @@ Use severity tiers to assess duplication impact: Tier 1 (BLOCKER) for code that 
 Before classifying duplication: (1) Identify all duplication points in changeset, (2) Check tech debt registry in integration.md for existing TD-N entries, (3) If found, classify as TECH_DEBT with existing ID, (4) If new, assess whether BLOCKER or new TECH_DEBT. This prevents re-flagging known debt and ensures consistent classification.
 
 ---
+
+## Pattern: Improvement vs Duplication Assessment
+**Added**: 2026-01-18
+**Related files**: `crates/env-tests/src/fixtures/gc_client.rs`, `crates/env-tests/src/fixtures/auth_client.rs`
+
+When new code follows an existing pattern but adds enhancements, classify as IMPROVEMENT, not duplication. Example: `GcClient.sanitize_error_body()` is an enhancement not in `AuthClient`. The assessment should be: "This is an improvement - consider backporting" not "This duplicates AuthClient." Improvements flow forward (new code is better), duplication flows both ways (same code, neither better).
+
+---

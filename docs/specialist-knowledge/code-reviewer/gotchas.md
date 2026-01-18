@@ -101,3 +101,11 @@ Rate limiting tests that assert `hit_rate_limit || success_count <= N` can pass 
 **Related files**: `crates/ac-service/tests/integration/user_auth_tests.rs`
 
 When tests verify JWT claims, the base64 decode + JSON parse pattern gets duplicated. Extract to a helper function in the test harness (e.g., `decode_jwt_payload(token: &str) -> Result<serde_json::Value, anyhow::Error>`). Reduces duplication and makes JWT format changes easier to maintain.
+
+---
+
+## Gotcha: Improvements in New Code That Should Be Backported
+**Added**: 2026-01-18
+**Related files**: `crates/env-tests/src/fixtures/gc_client.rs`, `crates/env-tests/src/fixtures/auth_client.rs`
+
+When reviewing new code that follows an existing pattern but adds improvements, flag the improvement for backporting. Example: `GcClient` added `sanitize_error_body()` which `AuthClient` lacks. Don't block the review, but document as a suggestion or add to TODO.md. Pattern: "GcClient adds [feature] which AuthClient does not have - consider backporting."

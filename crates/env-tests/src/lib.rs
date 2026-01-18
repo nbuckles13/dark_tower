@@ -7,7 +7,7 @@
 //! # Features
 //!
 //! - `smoke`: Fast cluster health checks (30s)
-//! - `flows`: Service flow tests (2-3min)
+//! - `flows`: Service flow tests (2-3min), including cross-service AC+GC flows
 //! - `observability`: Metrics and logs validation (Loki optional)
 //! - `resilience`: Pod restart and chaos tests (5min+)
 //! - `all`: Enable all test categories
@@ -15,7 +15,7 @@
 //! # Prerequisites
 //!
 //! 1. Kind cluster running: `./infra/kind/scripts/setup.sh`
-//! 2. Port-forwards active: AC (8082), Prometheus (9090), Grafana (3000), Loki (3100 optional)
+//! 2. Port-forwards active: AC (8082), GC (8080), Prometheus (9090), Grafana (3000), Loki (3100 optional)
 //! 3. kubectl in PATH for NetworkPolicy diagnostics
 //!
 //! # Usage

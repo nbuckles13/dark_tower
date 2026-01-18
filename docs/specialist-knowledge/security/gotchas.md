@@ -91,3 +91,11 @@ Rate limit tests that send N requests expecting a 429 may not trigger if: (1) ra
 When testing JWKS endpoints for private key leakage, DON'T rely on typed deserialization alone. A struct without a `d` field will silently ignore `d` in the JSON. Use raw JSON (`serde_json::Value`) to check if forbidden fields exist. Pattern: `jwks_value.get("keys")[i].get("d").is_none()` catches fields that typed structs would skip.
 
 ---
+
+## Gotcha: Custom Debug Insufficient for Error Response Bodies
+**Added**: 2026-01-18
+**Related files**: `crates/env-tests/src/fixtures/gc_client.rs`
+
+Custom Debug implementations only activate when `{:?}` formatting is used. Credentials stored in error enum variants can leak through: (1) `assert_eq!` comparisons (uses Debug but also compares values), (2) `Display` impl that includes the body, (3) Direct string interpolation `format!("{}", body)`. The semantic guard flagged this as HIGH risk. Solution: Sanitize bodies BEFORE storing in error variants, not just in Debug output. This is defense-in-depth - never assume callers will use the "safe" formatting path.
+
+---
