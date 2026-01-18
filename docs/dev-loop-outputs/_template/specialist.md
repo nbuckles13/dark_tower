@@ -6,6 +6,21 @@ It enables recovery if the session is interrupted.
 Filename should match the specialist: e.g., global-controller.md, security.md, test.md, code-reviewer.md
 -->
 
+## Prompt Received
+
+<!--
+Record the prompt/instructions you received from the step-runner.
+This enables auditing of what step-runners are telling specialists.
+Copy the task description and any findings verbatim.
+-->
+
+**Task**: {copy task description here}
+
+**Findings to address** (if any):
+{copy findings verbatim, or "None - initial implementation"}
+
+---
+
 ## Working Notes
 
 ### Patterns Discovered

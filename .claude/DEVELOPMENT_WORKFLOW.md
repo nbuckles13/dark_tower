@@ -100,7 +100,7 @@ See `.claude/workflows/development-loop.md` for the full process with:
 **High-level steps**:
 ```
 1. Analyze feature → Identify affected specialists
-2. Match task to principle categories (see contextual-injection.md)
+2. Match task to principle categories (see Contextual Injection section below)
 3. Propose debate to user (include Test and Security specialists)
 4. Get user approval
 5. Initiate N-agent debate (inject matched principles into context)
@@ -237,68 +237,38 @@ Restore and continue? (Specialists will be re-invoked with checkpoint context)
 
 ## Contextual Injection
 
-When invoking specialists, inject relevant principles based on task keywords:
+When starting the dev-loop, match task keywords to principle categories and pass to step-runners.
 
-**Task-to-Category Mapping**:
-```yaml
-"password|hash|bcrypt|encrypt|decrypt|key|secret": [crypto, logging]
-"query|select|database|migration|sql": [queries, logging]
-"jwt|token|auth|oauth|bearer": [crypto, jwt, logging]
-"handler|endpoint|route|api": [logging, errors, input]
-"client|credential|oauth": [crypto, logging, errors]
-"parse|input|validate|request": [input, errors]
-```
+**Task-to-Category Mapping** (regex patterns):
+- `password|hash|bcrypt|encrypt|decrypt|key|secret` → crypto, logging
+- `query|select|database|migration|sql` → queries, logging
+- `jwt|token|auth|oauth|bearer` → crypto, jwt, logging
+- `handler|endpoint|route|api` → logging, errors, input
+- `test|coverage|fuzz|e2e` → testing, errors
 
-**Category Files** (`docs/principles/`):
-- `crypto.md` - EdDSA, bcrypt, CSPRNG, key rotation, no hardcoded secrets
-- `jwt.md` - Token validation, claims, expiry, size limits
-- `logging.md` - No PII, no secrets, SecretString, structured format
-- `queries.md` - Parameterized SQL, org_id filter, no dynamic SQL
-- `errors.md` - No panics, Result types, generic API messages
-- `input.md` - Length limits, type validation, early rejection
+**Category Files**: `docs/principles/*.md`
 
-**Guard Execution**:
-- During work: Run category-matched guards only
-- Pre-commit: Run ALL simple guards
-- CI: Run ALL guards
+**Your job**: Match patterns, pass file paths to step-runner. Step-runner handles injection.
 
-See `.claude/workflows/contextual-injection.md` for complete details.
-
-## Quick Reference
-
-**Invoke specialist with principles**:
-```
-Task(
-  subagent_type="general-purpose",
-  description="{specialist} does {task}",
-  prompt="""
-    {specialist definition}
-
-    ## Project Principles (MUST FOLLOW)
-    {matched category principles from docs/principles/}
-
-    ## Task
-    {task details}
-  """
-)
-```
-
-**Initiate debate**:
-1. Propose to user (include Test specialist)
-2. Get approval
-3. Invoke all specialists in rounds
-4. Track satisfaction scores
-5. Synthesize consensus
-6. Create ADR
+See `.claude/workflows/development-loop/step-implementation.md` for full category list.
 
 ---
 
-## Related ADRs
+## Related Files
 
+**Workflow Files** (`.claude/workflows/`):
+- `development-loop.md` - Dev-loop state machine and step-runner format
+- `development-loop/step-implementation.md` - Implementation step details
+- `development-loop/specialist-invocation.md` - How step-runners invoke specialists
+- `multi-agent-debate.md` - Debate mechanics
+- `code-review.md` - Code review process
+
+**ADRs** (`docs/decisions/`):
 - **ADR-0015** - Principles & guards methodology
 - **ADR-0016** - Development loop design (specialist-owned verification)
 - **ADR-0017** - Specialist knowledge architecture (dynamic knowledge files)
 - **ADR-0018** - Dev-loop checkpointing and restore (session recovery)
+- **ADR-0021** - Step-runner architecture for dev-loop reliability
 
 ---
 
