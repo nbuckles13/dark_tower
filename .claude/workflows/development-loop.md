@@ -111,6 +111,18 @@ The dev-loop uses a three-level agent architecture:
 
 ---
 
+## Orchestrator Responsibilities
+
+Before invoking step-runners, the orchestrator must prepare:
+
+1. **Match task to principle categories** using regex patterns in `.claude/DEVELOPMENT_WORKFLOW.md` (Contextual Injection section)
+2. **Check for knowledge files** at `docs/specialist-knowledge/{specialist}/*.md`
+3. **Fill in step-runner input** with paths to matched files
+
+The orchestrator passes file paths to the step-runner; the step-runner reads and injects them.
+
+---
+
 ## Step-Runner Invocation
 
 ### Standard Format
@@ -122,14 +134,36 @@ All step-runners are general-purpose agents invoked with this structure:
 
 **Your job**: Execute the {step_name} step of the dev-loop.
 
+### CRITICAL CONSTRAINTS
+
+You are a **process orchestrator**, not a designer or implementer.
+
+**Do NOT**:
+- Design the solution or suggest implementation approaches
+- Specify function names, patterns, or architecture
+- Tell the specialist HOW to solve the problem
+- Write or modify code yourself (except main.md updates)
+
+**DO**:
+- Pass the task description and findings VERBATIM to the specialist
+- Let the specialist determine the approach based on their domain expertise
+- Verify the specialist created their checkpoint file
+- Update main.md with step results
+- Return structured output
+
 ### Instructions
 
-Read and follow: `.claude/workflows/{step_file}`
+Read and follow these files:
+1. `.claude/workflows/development-loop/specialist-invocation.md` - How to invoke specialists
+2. `.claude/workflows/{step_file}` - Step-specific instructions
 
 ### Input
 
 Task: {task_description}
 Specialist: {specialist_name}
+Specialist definition: `.claude/agents/{specialist_name}.md`
+Matched principles: {list of paths to docs/principles/*.md files}
+Knowledge files: {list of paths to docs/specialist-knowledge/{specialist}/*.md, if exist}
 Output directory: {output_dir}
 Action: {Start new specialist | Resume specialist {id}}
 Findings to address: {list, if iteration 2+}
@@ -303,7 +337,14 @@ The orchestrator maintains minimal state between steps:
 | validation | failed | implementation (resume specialist with errors) |
 | code_review | approved | reflection |
 | code_review | needs_fixes | implementation (resume specialist with findings) |
-| reflection | success | complete |
+| reflection | success | **run validation script** → complete |
+
+**Before marking complete**: Run output validation script:
+```bash
+./scripts/workflow/verify-dev-loop.sh --output-dir {output_dir} --verbose
+```
+
+If validation fails, fix issues before announcing completion.
 
 ---
 
