@@ -93,3 +93,42 @@ After validation, orchestrator appends:
 - Code review results (from all reviewers)
 - Final validation timestamp
 - Any orchestrator-level observations
+
+---
+
+## Loop State Section Format
+
+The Loop State table is maintained in main.md for state recovery:
+
+```markdown
+## Loop State (Internal)
+
+| Field | Value |
+|-------|-------|
+| Implementing Specialist | `global-controller` |
+| Current Step | code_review |
+| Iteration | 2 |
+| Security Reviewer | `def456` |
+| Test Reviewer | `ghi789` |
+| Code Reviewer | `jkl012` |
+| DRY Reviewer | `mno345` |
+```
+
+---
+
+## Categories Shorthand
+
+Use these categories when describing what areas code touches (in Implementation Summary, Code Review, etc.):
+
+| Category | Key Concerns |
+|----------|--------------|
+| `crypto` | secrets, keys, hashing, encryption |
+| `jwt` | token validation, claims, expiry |
+| `logging` | no secrets in logs, structured format |
+| `queries` | parameterized SQL, no injection |
+| `errors` | no panics, proper types |
+| `input` | validation, limits, sanitization |
+| `testing` | test ownership, three tiers, determinism |
+| `concurrency` | actor pattern, message passing |
+| `api-design` | URL versioning, deprecation |
+| `observability` | privacy-by-default, metrics, spans |
