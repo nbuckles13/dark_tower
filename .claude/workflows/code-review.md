@@ -120,7 +120,7 @@ TECH_DEBT findings are documented in the dev-loop output "Tech Debt" section and
 
 ### Step 3: Parallel Specialist Reviews
 
-Run specialists in parallel (multiple Task tool calls in a single message).
+Run specialist reviews. Note: When invoked via step-runners, specialists are called via `claude --print` (see `specialist-invocation.md`).
 
 **Context Injection for Each Reviewer**:
 Each reviewer receives:

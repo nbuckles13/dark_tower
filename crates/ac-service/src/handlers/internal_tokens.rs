@@ -527,6 +527,95 @@ mod tests {
         );
     }
 
+    // P0 Crypto Tests - Invalid Key Format
+
+    /// Test that sign_meeting_jwt rejects invalid PKCS8 private key format.
+    /// This tests the error path at lines 276-279 where Ed25519KeyPair::from_pkcs8
+    /// fails due to malformed key data.
+    #[test]
+    fn test_sign_meeting_jwt_invalid_pkcs8_format_returns_error() {
+        use chrono::Utc;
+
+        // Create valid meeting token claims
+        let now = Utc::now().timestamp();
+        let claims = MeetingTokenClaims {
+            sub: "user-123".to_string(),
+            token_type: "meeting".to_string(),
+            meeting_id: "meeting-456".to_string(),
+            home_org_id: "org-789".to_string(),
+            meeting_org_id: "org-789".to_string(),
+            participant_type: "member".to_string(),
+            role: "participant".to_string(),
+            capabilities: vec!["video".to_string(), "audio".to_string()],
+            iat: now,
+            exp: now + 900,
+            jti: "jti-abc".to_string(),
+        };
+
+        // Use invalid PKCS8 data (random bytes that are NOT valid Ed25519 key material)
+        let invalid_pkcs8 = vec![0x42; 64]; // Just 64 bytes of 0x42, not valid PKCS8
+        let key_id = "test-key-id";
+
+        // Attempt to sign with invalid key - should return AcError::Crypto
+        let result = sign_meeting_jwt(&claims, &invalid_pkcs8, key_id);
+
+        assert!(
+            result.is_err(),
+            "sign_meeting_jwt should reject invalid PKCS8 format"
+        );
+
+        let err = result.expect_err("Expected error");
+        assert!(
+            matches!(&err, AcError::Crypto(msg) if msg == "JWT signing failed"),
+            "Expected AcError::Crypto with 'JWT signing failed', got {:?}",
+            err
+        );
+    }
+
+    /// Test that sign_guest_jwt rejects invalid PKCS8 private key format.
+    /// This tests the error path at lines 303-306 where Ed25519KeyPair::from_pkcs8
+    /// fails due to malformed key data.
+    #[test]
+    fn test_sign_guest_jwt_invalid_pkcs8_format_returns_error() {
+        use chrono::Utc;
+
+        // Create valid guest token claims
+        let now = Utc::now().timestamp();
+        let claims = GuestTokenClaims {
+            sub: "guest-123".to_string(),
+            token_type: "guest".to_string(),
+            meeting_id: "meeting-456".to_string(),
+            meeting_org_id: "org-789".to_string(),
+            participant_type: "guest".to_string(),
+            role: "guest".to_string(),
+            display_name: "Alice Guest".to_string(),
+            waiting_room: true,
+            capabilities: vec!["video".to_string(), "audio".to_string()],
+            iat: now,
+            exp: now + 900,
+            jti: "jti-xyz".to_string(),
+        };
+
+        // Use invalid PKCS8 data (random bytes that are NOT valid Ed25519 key material)
+        let invalid_pkcs8 = vec![0x99; 64]; // Just 64 bytes of 0x99, not valid PKCS8
+        let key_id = "test-key-id";
+
+        // Attempt to sign with invalid key - should return AcError::Crypto
+        let result = sign_guest_jwt(&claims, &invalid_pkcs8, key_id);
+
+        assert!(
+            result.is_err(),
+            "sign_guest_jwt should reject invalid PKCS8 format"
+        );
+
+        let err = result.expect_err("Expected error");
+        assert!(
+            matches!(&err, AcError::Crypto(msg) if msg == "JWT signing failed"),
+            "Expected AcError::Crypto with 'JWT signing failed', got {:?}",
+            err
+        );
+    }
+
     // P1 Tests - TTL Capping
 
     /// Test that TTL values are properly capped to MAX_TOKEN_TTL_SECONDS (900).
