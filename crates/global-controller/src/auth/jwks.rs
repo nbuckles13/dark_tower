@@ -241,6 +241,8 @@ impl JwksClient {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
     fn test_jwk_deserialization() {
@@ -313,5 +315,470 @@ mod tests {
             Duration::from_secs(60),
         );
         assert_eq!(client.cache_ttl, Duration::from_secs(60));
+    }
+
+    // =========================================================================
+    // get_key tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_get_key_success_from_fetch() {
+        let mock_server = MockServer::start().await;
+
+        let jwks_response = serde_json::json!({
+            "keys": [
+                {
+                    "kty": "OKP",
+                    "kid": "test-key-01",
+                    "crv": "Ed25519",
+                    "x": "dGVzdC1wdWJsaWMta2V5LWRhdGE",
+                    "alg": "EdDSA",
+                    "use": "sig"
+                }
+            ]
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jwks.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&jwks_response))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let client = JwksClient::new(format!("{}/.well-known/jwks.json", mock_server.uri()));
+
+        let key = client.get_key("test-key-01").await;
+        assert!(key.is_ok());
+        let jwk = key.unwrap();
+        assert_eq!(jwk.kid, "test-key-01");
+        assert_eq!(jwk.kty, "OKP");
+    }
+
+    #[tokio::test]
+    async fn test_get_key_cache_hit() {
+        let mock_server = MockServer::start().await;
+
+        let jwks_response = serde_json::json!({
+            "keys": [
+                {
+                    "kty": "OKP",
+                    "kid": "cached-key",
+                    "crv": "Ed25519",
+                    "x": "dGVzdA",
+                    "alg": "EdDSA"
+                }
+            ]
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jwks.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&jwks_response))
+            .expect(1) // Should only be called once due to caching
+            .mount(&mock_server)
+            .await;
+
+        let client = JwksClient::new(format!("{}/.well-known/jwks.json", mock_server.uri()));
+
+        // First call - fetches from server
+        let key1 = client.get_key("cached-key").await;
+        assert!(key1.is_ok());
+
+        // Second call - should hit cache
+        let key2 = client.get_key("cached-key").await;
+        assert!(key2.is_ok());
+
+        // Both should return the same key
+        assert_eq!(key1.unwrap().kid, key2.unwrap().kid);
+    }
+
+    #[tokio::test]
+    async fn test_get_key_not_found_in_valid_cache() {
+        let mock_server = MockServer::start().await;
+
+        let jwks_response = serde_json::json!({
+            "keys": [
+                {
+                    "kty": "OKP",
+                    "kid": "existing-key",
+                    "crv": "Ed25519",
+                    "x": "dGVzdA",
+                    "alg": "EdDSA"
+                }
+            ]
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jwks.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&jwks_response))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let client = JwksClient::new(format!("{}/.well-known/jwks.json", mock_server.uri()));
+
+        // First call to populate cache
+        let _ = client.get_key("existing-key").await;
+
+        // Second call with non-existent key should return error from cache
+        let result = client.get_key("non-existent-key").await;
+        let err = result.expect_err("Expected error");
+        assert!(
+            matches!(&err, GcError::InvalidToken(msg) if msg.contains("invalid or expired")),
+            "Expected InvalidToken with 'invalid or expired', got {:?}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_key_not_found_after_refresh() {
+        let mock_server = MockServer::start().await;
+
+        let jwks_response = serde_json::json!({
+            "keys": [
+                {
+                    "kty": "OKP",
+                    "kid": "different-key",
+                    "crv": "Ed25519",
+                    "x": "dGVzdA",
+                    "alg": "EdDSA"
+                }
+            ]
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jwks.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&jwks_response))
+            .mount(&mock_server)
+            .await;
+
+        // Create client with very short TTL (1ms) to force refresh
+        let client = JwksClient::with_ttl(
+            format!("{}/.well-known/jwks.json", mock_server.uri()),
+            Duration::from_millis(1),
+        );
+
+        // Wait for TTL to expire
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // Request a key that doesn't exist
+        let result = client.get_key("non-existent-key").await;
+        let err = result.expect_err("Expected error");
+        assert!(
+            matches!(&err, GcError::InvalidToken(msg) if msg.contains("invalid or expired")),
+            "Expected InvalidToken with 'invalid or expired', got {:?}",
+            err
+        );
+    }
+
+    // =========================================================================
+    // refresh_cache tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_refresh_cache_network_error() {
+        // Point to a non-existent server
+        let client = JwksClient::new("http://127.0.0.1:1/.well-known/jwks.json".to_string());
+
+        let result = client.get_key("any-key").await;
+        let err = result.expect_err("Expected error");
+        assert!(
+            matches!(&err, GcError::ServiceUnavailable(msg) if msg.contains("unavailable")),
+            "Expected ServiceUnavailable with 'unavailable', got {:?}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_refresh_cache_non_success_status() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jwks.json"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&mock_server)
+            .await;
+
+        let client = JwksClient::new(format!("{}/.well-known/jwks.json", mock_server.uri()));
+
+        let result = client.get_key("any-key").await;
+        let err = result.expect_err("Expected error");
+        assert!(
+            matches!(&err, GcError::ServiceUnavailable(msg) if msg.contains("unavailable")),
+            "Expected ServiceUnavailable with 'unavailable', got {:?}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_refresh_cache_invalid_json() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jwks.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("not valid json"))
+            .mount(&mock_server)
+            .await;
+
+        let client = JwksClient::new(format!("{}/.well-known/jwks.json", mock_server.uri()));
+
+        let result = client.get_key("any-key").await;
+        let err = result.expect_err("Expected error");
+        assert!(
+            matches!(&err, GcError::ServiceUnavailable(msg) if msg.contains("unavailable")),
+            "Expected ServiceUnavailable with 'unavailable', got {:?}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_refresh_cache_404_error() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jwks.json"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&mock_server)
+            .await;
+
+        let client = JwksClient::new(format!("{}/.well-known/jwks.json", mock_server.uri()));
+
+        let result = client.get_key("any-key").await;
+        let err = result.expect_err("Expected error");
+        assert!(
+            matches!(&err, GcError::ServiceUnavailable(msg) if msg.contains("unavailable")),
+            "Expected ServiceUnavailable with 'unavailable', got {:?}",
+            err
+        );
+    }
+
+    // =========================================================================
+    // force_refresh and clear_cache tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_force_refresh_success() {
+        let mock_server = MockServer::start().await;
+
+        let jwks_response = serde_json::json!({
+            "keys": [
+                {
+                    "kty": "OKP",
+                    "kid": "force-refresh-key",
+                    "crv": "Ed25519",
+                    "x": "dGVzdA",
+                    "alg": "EdDSA"
+                }
+            ]
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jwks.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&jwks_response))
+            .mount(&mock_server)
+            .await;
+
+        let client = JwksClient::new(format!("{}/.well-known/jwks.json", mock_server.uri()));
+
+        let result = client.force_refresh().await;
+        assert!(result.is_ok());
+
+        // Verify cache was populated
+        let key = client.get_key("force-refresh-key").await;
+        assert!(key.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_clear_cache() {
+        let mock_server = MockServer::start().await;
+
+        let jwks_response = serde_json::json!({
+            "keys": [
+                {
+                    "kty": "OKP",
+                    "kid": "clear-cache-key",
+                    "crv": "Ed25519",
+                    "x": "dGVzdA",
+                    "alg": "EdDSA"
+                }
+            ]
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jwks.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&jwks_response))
+            .expect(2) // Should be called twice - once before clear, once after
+            .mount(&mock_server)
+            .await;
+
+        let client = JwksClient::new(format!("{}/.well-known/jwks.json", mock_server.uri()));
+
+        // Populate cache
+        let _ = client.get_key("clear-cache-key").await;
+
+        // Clear cache
+        client.clear_cache().await;
+
+        // Next get_key should fetch again
+        let key = client.get_key("clear-cache-key").await;
+        assert!(key.is_ok());
+    }
+
+    // =========================================================================
+    // Multiple keys tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_get_key_multiple_keys_in_jwks() {
+        let mock_server = MockServer::start().await;
+
+        let jwks_response = serde_json::json!({
+            "keys": [
+                {
+                    "kty": "OKP",
+                    "kid": "key-1",
+                    "crv": "Ed25519",
+                    "x": "a2V5LTE",
+                    "alg": "EdDSA"
+                },
+                {
+                    "kty": "OKP",
+                    "kid": "key-2",
+                    "crv": "Ed25519",
+                    "x": "a2V5LTI",
+                    "alg": "EdDSA"
+                },
+                {
+                    "kty": "OKP",
+                    "kid": "key-3",
+                    "crv": "Ed25519",
+                    "x": "a2V5LTM",
+                    "alg": "EdDSA"
+                }
+            ]
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jwks.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&jwks_response))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let client = JwksClient::new(format!("{}/.well-known/jwks.json", mock_server.uri()));
+
+        // Get each key
+        let key1 = client.get_key("key-1").await.unwrap();
+        assert_eq!(key1.kid, "key-1");
+        assert_eq!(key1.x, Some("a2V5LTE".to_string()));
+
+        let key2 = client.get_key("key-2").await.unwrap();
+        assert_eq!(key2.kid, "key-2");
+        assert_eq!(key2.x, Some("a2V5LTI".to_string()));
+
+        let key3 = client.get_key("key-3").await.unwrap();
+        assert_eq!(key3.kid, "key-3");
+        assert_eq!(key3.x, Some("a2V5LTM".to_string()));
+    }
+
+    // =========================================================================
+    // Clone and Debug trait tests
+    // =========================================================================
+
+    #[test]
+    fn test_jwk_clone() {
+        let jwk = Jwk {
+            kty: "OKP".to_string(),
+            kid: "test-key".to_string(),
+            crv: Some("Ed25519".to_string()),
+            x: Some("dGVzdA".to_string()),
+            alg: Some("EdDSA".to_string()),
+            key_use: Some("sig".to_string()),
+        };
+        let cloned = jwk.clone();
+        assert_eq!(cloned.kty, jwk.kty);
+        assert_eq!(cloned.kid, jwk.kid);
+        assert_eq!(cloned.crv, jwk.crv);
+        assert_eq!(cloned.x, jwk.x);
+        assert_eq!(cloned.alg, jwk.alg);
+        assert_eq!(cloned.key_use, jwk.key_use);
+    }
+
+    #[test]
+    fn test_jwk_debug() {
+        let jwk = Jwk {
+            kty: "OKP".to_string(),
+            kid: "test-key".to_string(),
+            crv: None,
+            x: None,
+            alg: None,
+            key_use: None,
+        };
+        let debug_str = format!("{:?}", jwk);
+        assert!(debug_str.contains("Jwk"));
+        assert!(debug_str.contains("test-key"));
+    }
+
+    #[test]
+    fn test_jwks_response_clone() {
+        let jwks = JwksResponse {
+            keys: vec![Jwk {
+                kty: "OKP".to_string(),
+                kid: "key-1".to_string(),
+                crv: None,
+                x: None,
+                alg: None,
+                key_use: None,
+            }],
+        };
+        let cloned = jwks.clone();
+        assert_eq!(cloned.keys.len(), 1);
+        assert_eq!(cloned.keys.first().unwrap().kid, "key-1");
+    }
+
+    #[test]
+    fn test_jwks_response_debug() {
+        let jwks = JwksResponse { keys: vec![] };
+        let debug_str = format!("{:?}", jwks);
+        assert!(debug_str.contains("JwksResponse"));
+    }
+
+    #[tokio::test]
+    async fn test_cache_expiration_triggers_refresh() {
+        let mock_server = MockServer::start().await;
+
+        let jwks_response = serde_json::json!({
+            "keys": [
+                {
+                    "kty": "OKP",
+                    "kid": "expiring-key",
+                    "crv": "Ed25519",
+                    "x": "dGVzdA",
+                    "alg": "EdDSA"
+                }
+            ]
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jwks.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&jwks_response))
+            .expect(2) // Should be called twice due to expiration
+            .mount(&mock_server)
+            .await;
+
+        // Create client with very short TTL
+        let client = JwksClient::with_ttl(
+            format!("{}/.well-known/jwks.json", mock_server.uri()),
+            Duration::from_millis(1),
+        );
+
+        // First call populates cache
+        let _ = client.get_key("expiring-key").await;
+
+        // Wait for TTL to expire
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // Second call should refresh due to expired cache
+        let key = client.get_key("expiring-key").await;
+        assert!(key.is_ok());
     }
 }

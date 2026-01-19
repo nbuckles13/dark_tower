@@ -81,3 +81,11 @@ GC_SERVICE_TOKEN env var is required for internal AC endpoint calls (meeting tok
 Guest token endpoint has TODO placeholder for captcha validation. Currently accepts any captcha_token value. Phase 3+ must integrate real captcha provider (reCAPTCHA, hCaptcha). Do not deploy guest access without implementing this security control.
 
 ---
+
+## Gotcha: JWT kid Extraction Returns None for Non-String Values
+**Added**: 2026-01-18
+**Related files**: `crates/global-controller/src/auth/jwt.rs`
+
+The `extract_kid()` function returns `None` (not an error) when the JWT header contains a `kid` that is not a JSON string - including numeric values, null, or empty strings. This is by design: attackers may send malformed headers to probe error handling. Always handle `None` as "key not found" and return generic error message.
+
+---

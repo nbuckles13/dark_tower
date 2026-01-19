@@ -250,6 +250,8 @@ impl AcClient {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
     fn test_participant_type_serialization() {
@@ -267,6 +269,18 @@ mod tests {
     }
 
     #[test]
+    fn test_participant_type_deserialization() {
+        let member: ParticipantType = serde_json::from_str("\"member\"").unwrap();
+        assert_eq!(member, ParticipantType::Member);
+
+        let external: ParticipantType = serde_json::from_str("\"external\"").unwrap();
+        assert_eq!(external, ParticipantType::External);
+
+        let guest: ParticipantType = serde_json::from_str("\"guest\"").unwrap();
+        assert_eq!(guest, ParticipantType::Guest);
+    }
+
+    #[test]
     fn test_meeting_role_serialization() {
         let host = MeetingRole::Host;
         let json = serde_json::to_string(&host).unwrap();
@@ -275,6 +289,15 @@ mod tests {
         let participant = MeetingRole::Participant;
         let json = serde_json::to_string(&participant).unwrap();
         assert_eq!(json, "\"participant\"");
+    }
+
+    #[test]
+    fn test_meeting_role_deserialization() {
+        let host: MeetingRole = serde_json::from_str("\"host\"").unwrap();
+        assert_eq!(host, MeetingRole::Host);
+
+        let participant: MeetingRole = serde_json::from_str("\"participant\"").unwrap();
+        assert_eq!(participant, MeetingRole::Participant);
     }
 
     #[test]
@@ -339,5 +362,527 @@ mod tests {
         let response: TokenResponse = serde_json::from_str(json).unwrap();
         assert_eq!(response.token, "eyJ...");
         assert_eq!(response.expires_in, 900);
+    }
+
+    // =========================================================================
+    // AcClient creation tests
+    // =========================================================================
+
+    #[test]
+    fn test_ac_client_creation_success() {
+        let client = AcClient::new(
+            "http://localhost:8082".to_string(),
+            "test-service-token".to_string(),
+        );
+        assert!(client.is_ok());
+    }
+
+    // =========================================================================
+    // Meeting token request tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_request_meeting_token_success() {
+        let mock_server = MockServer::start().await;
+
+        let response_body = serde_json::json!({
+            "token": "eyJ.test.token",
+            "expires_in": 900
+        });
+
+        Mock::given(method("POST"))
+            .and(path("/api/v1/auth/internal/meeting-token"))
+            .and(header("Authorization", "Bearer test-service-token"))
+            .and(header("Content-Type", "application/json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&response_body))
+            .mount(&mock_server)
+            .await;
+
+        let client = AcClient::new(mock_server.uri(), "test-service-token".to_string()).unwrap();
+
+        let request = MeetingTokenRequest {
+            subject_user_id: Uuid::from_u128(1),
+            meeting_id: Uuid::from_u128(2),
+            meeting_org_id: Uuid::from_u128(3),
+            home_org_id: None,
+            participant_type: ParticipantType::Member,
+            role: MeetingRole::Participant,
+            capabilities: vec!["audio".to_string()],
+            ttl_seconds: 900,
+        };
+
+        let result = client.request_meeting_token(&request).await;
+        assert!(result.is_ok());
+        let token_response = result.unwrap();
+        assert_eq!(token_response.token, "eyJ.test.token");
+        assert_eq!(token_response.expires_in, 900);
+    }
+
+    #[tokio::test]
+    async fn test_request_meeting_token_network_error() {
+        // Point to a non-existent server
+        let client =
+            AcClient::new("http://127.0.0.1:1".to_string(), "test-token".to_string()).unwrap();
+
+        let request = MeetingTokenRequest {
+            subject_user_id: Uuid::from_u128(1),
+            meeting_id: Uuid::from_u128(2),
+            meeting_org_id: Uuid::from_u128(3),
+            home_org_id: None,
+            participant_type: ParticipantType::Member,
+            role: MeetingRole::Participant,
+            capabilities: vec![],
+            ttl_seconds: 900,
+        };
+
+        let result = client.request_meeting_token(&request).await;
+        let err = result.expect_err("Expected error");
+        assert!(
+            matches!(&err, GcError::ServiceUnavailable(msg) if msg.contains("unavailable")),
+            "Expected ServiceUnavailable with 'unavailable', got {:?}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_request_meeting_token_server_error() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/v1/auth/internal/meeting-token"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&mock_server)
+            .await;
+
+        let client = AcClient::new(mock_server.uri(), "test-service-token".to_string()).unwrap();
+
+        let request = MeetingTokenRequest {
+            subject_user_id: Uuid::from_u128(1),
+            meeting_id: Uuid::from_u128(2),
+            meeting_org_id: Uuid::from_u128(3),
+            home_org_id: None,
+            participant_type: ParticipantType::Member,
+            role: MeetingRole::Participant,
+            capabilities: vec![],
+            ttl_seconds: 900,
+        };
+
+        let result = client.request_meeting_token(&request).await;
+        let err = result.expect_err("Expected error");
+        assert!(
+            matches!(&err, GcError::ServiceUnavailable(msg) if msg.contains("unavailable")),
+            "Expected ServiceUnavailable with 'unavailable', got {:?}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_request_meeting_token_forbidden() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/v1/auth/internal/meeting-token"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&mock_server)
+            .await;
+
+        let client = AcClient::new(mock_server.uri(), "test-service-token".to_string()).unwrap();
+
+        let request = MeetingTokenRequest {
+            subject_user_id: Uuid::from_u128(1),
+            meeting_id: Uuid::from_u128(2),
+            meeting_org_id: Uuid::from_u128(3),
+            home_org_id: None,
+            participant_type: ParticipantType::Member,
+            role: MeetingRole::Participant,
+            capabilities: vec![],
+            ttl_seconds: 900,
+        };
+
+        let result = client.request_meeting_token(&request).await;
+        let err = result.expect_err("Expected error");
+        assert!(
+            matches!(&err, GcError::Forbidden(msg) if msg.contains("denied")),
+            "Expected Forbidden with 'denied', got {:?}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_request_meeting_token_bad_request() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/v1/auth/internal/meeting-token"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("Invalid request parameters"))
+            .mount(&mock_server)
+            .await;
+
+        let client = AcClient::new(mock_server.uri(), "test-service-token".to_string()).unwrap();
+
+        let request = MeetingTokenRequest {
+            subject_user_id: Uuid::from_u128(1),
+            meeting_id: Uuid::from_u128(2),
+            meeting_org_id: Uuid::from_u128(3),
+            home_org_id: None,
+            participant_type: ParticipantType::Member,
+            role: MeetingRole::Participant,
+            capabilities: vec![],
+            ttl_seconds: 900,
+        };
+
+        let result = client.request_meeting_token(&request).await;
+        let err = result.expect_err("Expected error");
+        assert!(
+            matches!(&err, GcError::BadRequest(msg) if msg.contains("Invalid")),
+            "Expected BadRequest with 'Invalid', got {:?}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_request_meeting_token_unauthorized() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/v1/auth/internal/meeting-token"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&mock_server)
+            .await;
+
+        let client = AcClient::new(mock_server.uri(), "invalid-token".to_string()).unwrap();
+
+        let request = MeetingTokenRequest {
+            subject_user_id: Uuid::from_u128(1),
+            meeting_id: Uuid::from_u128(2),
+            meeting_org_id: Uuid::from_u128(3),
+            home_org_id: None,
+            participant_type: ParticipantType::Member,
+            role: MeetingRole::Participant,
+            capabilities: vec![],
+            ttl_seconds: 900,
+        };
+
+        let result = client.request_meeting_token(&request).await;
+        assert!(
+            matches!(result, Err(GcError::Internal)),
+            "Expected Internal (for 401), got {:?}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn test_request_meeting_token_unexpected_status() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/v1/auth/internal/meeting-token"))
+            .respond_with(ResponseTemplate::new(418)) // I'm a teapot
+            .mount(&mock_server)
+            .await;
+
+        let client = AcClient::new(mock_server.uri(), "test-service-token".to_string()).unwrap();
+
+        let request = MeetingTokenRequest {
+            subject_user_id: Uuid::from_u128(1),
+            meeting_id: Uuid::from_u128(2),
+            meeting_org_id: Uuid::from_u128(3),
+            home_org_id: None,
+            participant_type: ParticipantType::Member,
+            role: MeetingRole::Participant,
+            capabilities: vec![],
+            ttl_seconds: 900,
+        };
+
+        let result = client.request_meeting_token(&request).await;
+        assert!(
+            matches!(result, Err(GcError::Internal)),
+            "Expected Internal for unexpected status, got {:?}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn test_request_meeting_token_invalid_json_response() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/v1/auth/internal/meeting-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("not valid json"))
+            .mount(&mock_server)
+            .await;
+
+        let client = AcClient::new(mock_server.uri(), "test-service-token".to_string()).unwrap();
+
+        let request = MeetingTokenRequest {
+            subject_user_id: Uuid::from_u128(1),
+            meeting_id: Uuid::from_u128(2),
+            meeting_org_id: Uuid::from_u128(3),
+            home_org_id: None,
+            participant_type: ParticipantType::Member,
+            role: MeetingRole::Participant,
+            capabilities: vec![],
+            ttl_seconds: 900,
+        };
+
+        let result = client.request_meeting_token(&request).await;
+        assert!(
+            matches!(result, Err(GcError::Internal)),
+            "Expected Internal for invalid JSON, got {:?}",
+            result
+        );
+    }
+
+    // =========================================================================
+    // Guest token request tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_request_guest_token_success() {
+        let mock_server = MockServer::start().await;
+
+        let response_body = serde_json::json!({
+            "token": "eyJ.guest.token",
+            "expires_in": 900
+        });
+
+        Mock::given(method("POST"))
+            .and(path("/api/v1/auth/internal/guest-token"))
+            .and(header("Authorization", "Bearer test-service-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&response_body))
+            .mount(&mock_server)
+            .await;
+
+        let client = AcClient::new(mock_server.uri(), "test-service-token".to_string()).unwrap();
+
+        let request = GuestTokenRequest {
+            guest_id: Uuid::from_u128(100),
+            display_name: "Test Guest".to_string(),
+            meeting_id: Uuid::from_u128(2),
+            meeting_org_id: Uuid::from_u128(3),
+            waiting_room: true,
+            ttl_seconds: 900,
+        };
+
+        let result = client.request_guest_token(&request).await;
+        assert!(result.is_ok());
+        let token_response = result.unwrap();
+        assert_eq!(token_response.token, "eyJ.guest.token");
+        assert_eq!(token_response.expires_in, 900);
+    }
+
+    #[tokio::test]
+    async fn test_request_guest_token_network_error() {
+        // Point to a non-existent server
+        let client =
+            AcClient::new("http://127.0.0.1:1".to_string(), "test-token".to_string()).unwrap();
+
+        let request = GuestTokenRequest {
+            guest_id: Uuid::from_u128(100),
+            display_name: "Test Guest".to_string(),
+            meeting_id: Uuid::from_u128(2),
+            meeting_org_id: Uuid::from_u128(3),
+            waiting_room: false,
+            ttl_seconds: 900,
+        };
+
+        let result = client.request_guest_token(&request).await;
+        let err = result.expect_err("Expected error");
+        assert!(
+            matches!(&err, GcError::ServiceUnavailable(msg) if msg.contains("unavailable")),
+            "Expected ServiceUnavailable with 'unavailable', got {:?}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_request_guest_token_server_error() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/v1/auth/internal/guest-token"))
+            .respond_with(ResponseTemplate::new(502))
+            .mount(&mock_server)
+            .await;
+
+        let client = AcClient::new(mock_server.uri(), "test-service-token".to_string()).unwrap();
+
+        let request = GuestTokenRequest {
+            guest_id: Uuid::from_u128(100),
+            display_name: "Test Guest".to_string(),
+            meeting_id: Uuid::from_u128(2),
+            meeting_org_id: Uuid::from_u128(3),
+            waiting_room: false,
+            ttl_seconds: 900,
+        };
+
+        let result = client.request_guest_token(&request).await;
+        assert!(
+            matches!(result, Err(GcError::ServiceUnavailable(_))),
+            "Expected ServiceUnavailable, got {:?}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn test_request_guest_token_forbidden() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/v1/auth/internal/guest-token"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&mock_server)
+            .await;
+
+        let client = AcClient::new(mock_server.uri(), "test-service-token".to_string()).unwrap();
+
+        let request = GuestTokenRequest {
+            guest_id: Uuid::from_u128(100),
+            display_name: "Test Guest".to_string(),
+            meeting_id: Uuid::from_u128(2),
+            meeting_org_id: Uuid::from_u128(3),
+            waiting_room: false,
+            ttl_seconds: 900,
+        };
+
+        let result = client.request_guest_token(&request).await;
+        assert!(
+            matches!(result, Err(GcError::Forbidden(_))),
+            "Expected Forbidden, got {:?}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn test_request_guest_token_bad_request() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/v1/auth/internal/guest-token"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("Invalid display name"))
+            .mount(&mock_server)
+            .await;
+
+        let client = AcClient::new(mock_server.uri(), "test-service-token".to_string()).unwrap();
+
+        let request = GuestTokenRequest {
+            guest_id: Uuid::from_u128(100),
+            display_name: "".to_string(), // Invalid empty name
+            meeting_id: Uuid::from_u128(2),
+            meeting_org_id: Uuid::from_u128(3),
+            waiting_room: false,
+            ttl_seconds: 900,
+        };
+
+        let result = client.request_guest_token(&request).await;
+        assert!(
+            matches!(result, Err(GcError::BadRequest(_))),
+            "Expected BadRequest, got {:?}",
+            result
+        );
+    }
+
+    // =========================================================================
+    // Clone and Debug trait tests
+    // =========================================================================
+
+    #[test]
+    fn test_participant_type_clone_and_copy() {
+        let member = ParticipantType::Member;
+        let cloned = member;
+        assert_eq!(member, cloned);
+    }
+
+    #[test]
+    fn test_meeting_role_clone_and_copy() {
+        let host = MeetingRole::Host;
+        let cloned = host;
+        assert_eq!(host, cloned);
+    }
+
+    #[test]
+    fn test_meeting_token_request_debug() {
+        let request = MeetingTokenRequest {
+            subject_user_id: Uuid::nil(),
+            meeting_id: Uuid::nil(),
+            meeting_org_id: Uuid::nil(),
+            home_org_id: None,
+            participant_type: ParticipantType::Member,
+            role: MeetingRole::Participant,
+            capabilities: vec![],
+            ttl_seconds: 900,
+        };
+        let debug_str = format!("{:?}", request);
+        assert!(debug_str.contains("MeetingTokenRequest"));
+    }
+
+    #[test]
+    fn test_guest_token_request_debug() {
+        let request = GuestTokenRequest {
+            guest_id: Uuid::nil(),
+            display_name: "Test".to_string(),
+            meeting_id: Uuid::nil(),
+            meeting_org_id: Uuid::nil(),
+            waiting_room: false,
+            ttl_seconds: 900,
+        };
+        let debug_str = format!("{:?}", request);
+        assert!(debug_str.contains("GuestTokenRequest"));
+    }
+
+    #[test]
+    fn test_token_response_debug() {
+        let response = TokenResponse {
+            token: "test".to_string(),
+            expires_in: 900,
+        };
+        let debug_str = format!("{:?}", response);
+        assert!(debug_str.contains("TokenResponse"));
+    }
+
+    #[test]
+    fn test_meeting_token_request_clone() {
+        let request = MeetingTokenRequest {
+            subject_user_id: Uuid::nil(),
+            meeting_id: Uuid::nil(),
+            meeting_org_id: Uuid::nil(),
+            home_org_id: Some(Uuid::nil()),
+            participant_type: ParticipantType::External,
+            role: MeetingRole::Host,
+            capabilities: vec!["audio".to_string()],
+            ttl_seconds: 900,
+        };
+        let cloned = request.clone();
+        assert_eq!(cloned.subject_user_id, request.subject_user_id);
+        assert_eq!(cloned.home_org_id, request.home_org_id);
+        assert_eq!(cloned.participant_type, request.participant_type);
+        assert_eq!(cloned.role, request.role);
+    }
+
+    #[test]
+    fn test_guest_token_request_clone() {
+        let request = GuestTokenRequest {
+            guest_id: Uuid::nil(),
+            display_name: "Test".to_string(),
+            meeting_id: Uuid::nil(),
+            meeting_org_id: Uuid::nil(),
+            waiting_room: true,
+            ttl_seconds: 900,
+        };
+        let cloned = request.clone();
+        assert_eq!(cloned.guest_id, request.guest_id);
+        assert_eq!(cloned.display_name, request.display_name);
+        assert_eq!(cloned.waiting_room, request.waiting_room);
+    }
+
+    #[test]
+    fn test_token_response_clone() {
+        let response = TokenResponse {
+            token: "test-token".to_string(),
+            expires_in: 3600,
+        };
+        let cloned = response.clone();
+        assert_eq!(cloned.token, response.token);
+        assert_eq!(cloned.expires_in, response.expires_in);
     }
 }

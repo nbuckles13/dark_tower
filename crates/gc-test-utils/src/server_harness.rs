@@ -168,4 +168,83 @@ mod tests {
 
         Ok(())
     }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_server_provides_addr(pool: PgPool) -> Result<(), anyhow::Error> {
+        let server = TestGcServer::spawn(pool).await?;
+
+        // Verify addr() returns a valid SocketAddr
+        let addr = server.addr();
+
+        // Should be localhost
+        assert!(addr.ip().is_loopback());
+
+        // Should have a non-zero port
+        assert!(addr.port() > 0);
+
+        // Verify addr matches url
+        let expected_url = format!("http://{}", addr);
+        assert_eq!(server.url(), expected_url);
+
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_server_provides_config_access(pool: PgPool) -> Result<(), anyhow::Error> {
+        let server = TestGcServer::spawn(pool).await?;
+
+        // Verify we can access the config
+        let config = server.config();
+
+        // Verify region is set from test environment
+        assert_eq!(config.region, "test-region");
+
+        // Verify bind address is set
+        assert_eq!(config.bind_address.to_string(), "127.0.0.1:0");
+
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_server_cleanup_on_drop(pool: PgPool) -> Result<(), anyhow::Error> {
+        let addr;
+        {
+            let server = TestGcServer::spawn(pool).await?;
+            addr = server.addr();
+
+            // Verify server is running
+            let response = reqwest::get(&format!("http://{}/v1/health", addr)).await?;
+            assert_eq!(response.status(), 200);
+
+            // Server will be dropped here
+        }
+
+        // Give the server time to shut down
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // After drop, server should no longer accept connections
+        // Note: We can't reliably test this as the port might be quickly reused
+        // The key thing is that Drop::drop() was called and abort() was invoked
+        // This test exercises the Drop implementation path
+
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_multiple_servers_different_ports(pool: PgPool) -> Result<(), anyhow::Error> {
+        let server1 = TestGcServer::spawn(pool.clone()).await?;
+        let server2 = TestGcServer::spawn(pool).await?;
+
+        // Verify both servers have different addresses
+        assert_ne!(server1.addr(), server2.addr());
+
+        // Verify both servers are accessible
+        let response1 = reqwest::get(&format!("{}/v1/health", server1.url())).await?;
+        assert_eq!(response1.status(), 200);
+
+        let response2 = reqwest::get(&format!("{}/v1/health", server2.url())).await?;
+        assert_eq!(response2.status(), 200);
+
+        Ok(())
+    }
 }

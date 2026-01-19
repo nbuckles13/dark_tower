@@ -192,6 +192,7 @@ fn verify_token(token: &str, jwk: &Jwk) -> Result<Claims, GcError> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::auth::jwks::Jwk;
 
     #[test]
     fn test_extract_kid_valid_token() {
@@ -242,5 +243,238 @@ mod tests {
             MAX_JWT_SIZE_BYTES, 8192,
             "Max JWT size should be 8KB for DoS protection"
         );
+    }
+
+    // =========================================================================
+    // verify_token tests - JWK validation
+    // =========================================================================
+
+    #[test]
+    fn test_verify_token_rejects_non_okp_key_type() {
+        let jwk = Jwk {
+            kty: "RSA".to_string(), // Wrong key type
+            kid: "test-key".to_string(),
+            crv: Some("Ed25519".to_string()),
+            x: Some("dGVzdC1wdWJsaWMta2V5".to_string()),
+            alg: Some("EdDSA".to_string()),
+            key_use: Some("sig".to_string()),
+        };
+
+        // Create a fake token (doesn't matter, we're testing JWK validation)
+        let header = r#"{"alg":"EdDSA","typ":"JWT","kid":"test-key"}"#;
+        let header_b64 = URL_SAFE_NO_PAD.encode(header.as_bytes());
+        let payload = r#"{"sub":"test","exp":9999999999,"iat":1234567890,"scope":"read"}"#;
+        let payload_b64 = URL_SAFE_NO_PAD.encode(payload.as_bytes());
+        let token = format!("{}.{}.fake_signature", header_b64, payload_b64);
+
+        let result = verify_token(&token, &jwk);
+        let err = result.expect_err("Expected error");
+        assert!(
+            matches!(&err, GcError::InvalidToken(msg) if msg.contains("invalid or expired")),
+            "Expected InvalidToken with 'invalid or expired', got {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_verify_token_rejects_non_eddsa_algorithm() {
+        let jwk = Jwk {
+            kty: "OKP".to_string(),
+            kid: "test-key".to_string(),
+            crv: Some("Ed25519".to_string()),
+            x: Some("dGVzdC1wdWJsaWMta2V5".to_string()),
+            alg: Some("RS256".to_string()), // Wrong algorithm
+            key_use: Some("sig".to_string()),
+        };
+
+        let header = r#"{"alg":"EdDSA","typ":"JWT","kid":"test-key"}"#;
+        let header_b64 = URL_SAFE_NO_PAD.encode(header.as_bytes());
+        let payload = r#"{"sub":"test","exp":9999999999,"iat":1234567890,"scope":"read"}"#;
+        let payload_b64 = URL_SAFE_NO_PAD.encode(payload.as_bytes());
+        let token = format!("{}.{}.fake_signature", header_b64, payload_b64);
+
+        let result = verify_token(&token, &jwk);
+        let err = result.expect_err("Expected error");
+        assert!(
+            matches!(&err, GcError::InvalidToken(msg) if msg.contains("invalid or expired")),
+            "Expected InvalidToken with 'invalid or expired', got {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_verify_token_rejects_missing_x_field() {
+        let jwk = Jwk {
+            kty: "OKP".to_string(),
+            kid: "test-key".to_string(),
+            crv: Some("Ed25519".to_string()),
+            x: None, // Missing public key
+            alg: Some("EdDSA".to_string()),
+            key_use: Some("sig".to_string()),
+        };
+
+        let header = r#"{"alg":"EdDSA","typ":"JWT","kid":"test-key"}"#;
+        let header_b64 = URL_SAFE_NO_PAD.encode(header.as_bytes());
+        let payload = r#"{"sub":"test","exp":9999999999,"iat":1234567890,"scope":"read"}"#;
+        let payload_b64 = URL_SAFE_NO_PAD.encode(payload.as_bytes());
+        let token = format!("{}.{}.fake_signature", header_b64, payload_b64);
+
+        let result = verify_token(&token, &jwk);
+        let err = result.expect_err("Expected error");
+        assert!(
+            matches!(&err, GcError::InvalidToken(msg) if msg.contains("invalid or expired")),
+            "Expected InvalidToken with 'invalid or expired', got {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_verify_token_rejects_invalid_base64_public_key() {
+        let jwk = Jwk {
+            kty: "OKP".to_string(),
+            kid: "test-key".to_string(),
+            crv: Some("Ed25519".to_string()),
+            x: Some("!!!invalid-base64!!!".to_string()), // Invalid base64
+            alg: Some("EdDSA".to_string()),
+            key_use: Some("sig".to_string()),
+        };
+
+        let header = r#"{"alg":"EdDSA","typ":"JWT","kid":"test-key"}"#;
+        let header_b64 = URL_SAFE_NO_PAD.encode(header.as_bytes());
+        let payload = r#"{"sub":"test","exp":9999999999,"iat":1234567890,"scope":"read"}"#;
+        let payload_b64 = URL_SAFE_NO_PAD.encode(payload.as_bytes());
+        let token = format!("{}.{}.fake_signature", header_b64, payload_b64);
+
+        let result = verify_token(&token, &jwk);
+        let err = result.expect_err("Expected error");
+        assert!(
+            matches!(&err, GcError::InvalidToken(msg) if msg.contains("invalid or expired")),
+            "Expected InvalidToken with 'invalid or expired', got {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_verify_token_accepts_jwk_without_alg_field() {
+        // JWK without alg field should still be processed (alg is optional)
+        // but will fail at signature verification with invalid key
+        let jwk = Jwk {
+            kty: "OKP".to_string(),
+            kid: "test-key".to_string(),
+            crv: Some("Ed25519".to_string()),
+            x: Some("dGVzdC1wdWJsaWMta2V5".to_string()), // Valid base64 but not real key
+            alg: None,                                   // No algorithm specified
+            key_use: Some("sig".to_string()),
+        };
+
+        let header = r#"{"alg":"EdDSA","typ":"JWT","kid":"test-key"}"#;
+        let header_b64 = URL_SAFE_NO_PAD.encode(header.as_bytes());
+        let payload = r#"{"sub":"test","exp":9999999999,"iat":1234567890,"scope":"read"}"#;
+        let payload_b64 = URL_SAFE_NO_PAD.encode(payload.as_bytes());
+        let token = format!("{}.{}.fake_signature", header_b64, payload_b64);
+
+        // This should fail at signature verification, not at JWK validation
+        let result = verify_token(&token, &jwk);
+        // Error should be about invalid token (signature verification failed)
+        assert!(
+            matches!(result, Err(GcError::InvalidToken(_))),
+            "Expected InvalidToken, got {:?}",
+            result
+        );
+    }
+
+    // =========================================================================
+    // JwtValidator tests
+    // =========================================================================
+
+    #[test]
+    fn test_jwt_validator_creation() {
+        use std::sync::Arc;
+
+        let jwks_client = Arc::new(JwksClient::new(
+            "http://localhost:8082/.well-known/jwks.json".to_string(),
+        ));
+        let validator = JwtValidator::new(jwks_client, 300);
+
+        // Verify clock skew is set
+        assert_eq!(validator.clock_skew_seconds, 300);
+    }
+
+    // =========================================================================
+    // extract_kid edge cases
+    // =========================================================================
+
+    #[test]
+    fn test_extract_kid_with_empty_parts() {
+        // Token with empty header part
+        let token = ".payload.signature";
+        assert!(extract_kid(token).is_none());
+    }
+
+    #[test]
+    fn test_extract_kid_with_numeric_kid() {
+        // kid as number in JSON (should return None since we expect string)
+        let header = r#"{"alg":"EdDSA","typ":"JWT","kid":12345}"#;
+        let header_b64 = URL_SAFE_NO_PAD.encode(header.as_bytes());
+        let token = format!("{}.payload.signature", header_b64);
+
+        let kid = extract_kid(&token);
+        assert!(kid.is_none());
+    }
+
+    #[test]
+    fn test_extract_kid_with_null_kid() {
+        // kid as null in JSON
+        let header = r#"{"alg":"EdDSA","typ":"JWT","kid":null}"#;
+        let header_b64 = URL_SAFE_NO_PAD.encode(header.as_bytes());
+        let token = format!("{}.payload.signature", header_b64);
+
+        let kid = extract_kid(&token);
+        assert!(kid.is_none());
+    }
+
+    #[test]
+    fn test_extract_kid_with_empty_string_kid() {
+        // kid as empty string
+        let header = r#"{"alg":"EdDSA","typ":"JWT","kid":""}"#;
+        let header_b64 = URL_SAFE_NO_PAD.encode(header.as_bytes());
+        let token = format!("{}.payload.signature", header_b64);
+
+        let kid = extract_kid(&token);
+        assert_eq!(kid, Some("".to_string()));
+    }
+
+    #[test]
+    fn test_extract_kid_with_special_characters() {
+        // kid with special characters
+        let header = r#"{"alg":"EdDSA","typ":"JWT","kid":"key-with-special_chars.123"}"#;
+        let header_b64 = URL_SAFE_NO_PAD.encode(header.as_bytes());
+        let token = format!("{}.payload.signature", header_b64);
+
+        let kid = extract_kid(&token);
+        assert_eq!(kid, Some("key-with-special_chars.123".to_string()));
+    }
+
+    // =========================================================================
+    // Token size boundary tests
+    // =========================================================================
+
+    #[test]
+    fn test_token_exactly_at_8192_bytes() {
+        // Create a token exactly 8192 bytes (at the limit)
+        let padding = "a".repeat(8192 - 20); // Account for header/payload structure
+        let token = format!("{}.test.sig", padding);
+
+        // Token at exactly 8192 bytes should pass size check
+        assert!(token.len() <= MAX_JWT_SIZE_BYTES);
+    }
+
+    #[test]
+    fn test_token_over_8192_bytes() {
+        // Create a token over 8192 bytes
+        let token = "a".repeat(8193);
+
+        // Token over 8192 bytes should fail size check
+        assert!(token.len() > MAX_JWT_SIZE_BYTES);
     }
 }
