@@ -81,3 +81,19 @@ Generate guest IDs using `ring::rand::SystemRandom` for CSPRNG security. Fill 16
 For host-only endpoints (settings, kick participant), compare `meeting.created_by_user_id` against `claims.sub`. Return 403 Forbidden if mismatch. This check happens AFTER meeting lookup to avoid leaking meeting existence via 403 vs 404.
 
 ---
+
+## Pattern: Testing JWKS Cache with Short TTL
+**Added**: 2026-01-18
+**Related files**: `crates/global-controller/src/auth/jwks.rs`
+
+To test cache expiration behavior, create JwksClient with very short TTL (1ms) and use `tokio::time::sleep()` to trigger expiration. Use wiremock's `expect(N)` to verify cache hits vs fetches. This avoids flaky time-dependent tests while still exercising cache expiration paths.
+
+---
+
+## Pattern: HTTP Status Code Branch Coverage
+**Added**: 2026-01-18
+**Related files**: `crates/global-controller/src/services/ac_client.rs`
+
+When testing HTTP client response handling, test ALL status code branches: success (200), client errors (400, 401, 403, 404), server errors (500, 502), and unexpected codes (418). Use wiremock to return each status and verify error mapping. This ensures full branch coverage of `handle_response()` logic.
+
+---

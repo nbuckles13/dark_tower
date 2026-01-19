@@ -365,35 +365,57 @@ mod tests {
     /// Verifies that authentication attempts with non-existent client_ids
     /// take roughly the same time as valid client_ids to prevent username enumeration.
     ///
+    /// Uses warmup + multiple iterations with median comparison to reduce flakiness
+    /// from cold-start effects and system noise.
+    ///
     /// Note: Ignored under coverage builds because instrumentation adds significant
     /// overhead that makes timing comparisons meaningless.
     #[sqlx::test(migrations = "../../migrations")]
     #[cfg_attr(coverage, ignore)]
     async fn test_timing_attack_prevention_invalid_client_id(pool: PgPool) -> Result<(), AcError> {
+        use std::time::Duration;
+
+        const ITERATIONS: usize = 5;
+
+        // Helper to compute median of durations
+        fn median(times: &mut [Duration]) -> Duration {
+            times.sort();
+            let mid = times.len() / 2;
+            if times.len().is_multiple_of(2) {
+                (times[mid - 1] + times[mid]) / 2
+            } else {
+                times[mid]
+            }
+        }
+
         // Setup: Create master key (32 bytes for AES-256-GCM) and signing key
         let master_key = crypto::generate_random_bytes(32)?;
         key_management_service::initialize_signing_key(&pool, &master_key, "test").await?;
 
-        // Create valid credential
+        // Create multiple valid credentials (one per iteration + warmup) to avoid rate limiting
+        // Rate limiting kicks in after 5 failures per client_id, which would cause early returns
+        // and invalidate timing measurements
         let valid_secret = "valid-secret-12345";
         let valid_hash = crypto::hash_client_secret(valid_secret, DEFAULT_BCRYPT_COST)?;
-        service_credentials::create_service_credential(
-            &pool,
-            "valid-client",
-            &valid_hash,
-            "global-controller",
-            None,
-            &["test:scope".to_string()],
-        )
-        .await?;
 
-        // Measure time for valid client_id with wrong password
-        let start = Instant::now();
+        for i in 0..=ITERATIONS {
+            service_credentials::create_service_credential(
+                &pool,
+                &format!("valid-client-{}", i),
+                &valid_hash,
+                "global-controller",
+                None,
+                &["test:scope".to_string()],
+            )
+            .await?;
+        }
+
+        // Warmup: Run both paths once to warm up CPU caches, connection pools, etc.
         let _ = issue_service_token(
             &pool,
             &master_key,
             &master_key,
-            "valid-client",
+            "valid-client-0",
             "wrong-password",
             "client_credentials",
             None,
@@ -401,15 +423,11 @@ mod tests {
             None,
         )
         .await;
-        let valid_client_duration = start.elapsed();
-
-        // Measure time for invalid client_id
-        let start = Instant::now();
         let _ = issue_service_token(
             &pool,
             &master_key,
             &master_key,
-            "nonexistent-client",
+            "nonexistent-client-0",
             "some-password",
             "client_credentials",
             None,
@@ -417,31 +435,73 @@ mod tests {
             None,
         )
         .await;
-        let invalid_client_duration = start.elapsed();
 
-        // Both should take similar time due to dummy hash verification
-        // Use proportional check instead of absolute timing to avoid flakiness in CI
-        let time_diff = valid_client_duration.abs_diff(invalid_client_duration);
-        let max_time = valid_client_duration.max(invalid_client_duration);
+        // Measure multiple iterations using unique client IDs to avoid rate limiting
+        let mut valid_times = Vec::with_capacity(ITERATIONS);
+        let mut invalid_times = Vec::with_capacity(ITERATIONS);
+
+        for i in 1..=ITERATIONS {
+            // Measure valid client with wrong password (unique client_id per iteration)
+            let start = Instant::now();
+            let _ = issue_service_token(
+                &pool,
+                &master_key,
+                &master_key,
+                &format!("valid-client-{}", i),
+                "wrong-password",
+                "client_credentials",
+                None,
+                None,
+                None,
+            )
+            .await;
+            valid_times.push(start.elapsed());
+
+            // Measure invalid client (unique client_id per iteration)
+            let start = Instant::now();
+            let _ = issue_service_token(
+                &pool,
+                &master_key,
+                &master_key,
+                &format!("nonexistent-client-{}", i),
+                "some-password",
+                "client_credentials",
+                None,
+                None,
+                None,
+            )
+            .await;
+            invalid_times.push(start.elapsed());
+        }
+
+        // Compare medians (more robust than mean against outliers)
+        let valid_median = median(&mut valid_times);
+        let invalid_median = median(&mut invalid_times);
+
+        let time_diff = valid_median.abs_diff(invalid_median);
+        let max_time = valid_median.max(invalid_median);
         let diff_percentage = (time_diff.as_millis() as f64 / max_time.as_millis() as f64) * 100.0;
 
         // Timing difference should be less than 30% of the longer operation
         // Tightened from 50% based on security review to reduce timing attack surface.
         // bcrypt operations have inherent variance, but 30% tolerance is acceptable
         // while still catching timing vulnerabilities.
-
         assert!(
             diff_percentage < MAX_TIMING_VARIANCE_PERCENT,
             "Timing difference too large: {}ms ({:.1}% of {}ms) - potential timing attack vulnerability.\n  \
-             Valid client: {:?}\n  \
-             Invalid client: {:?}\n  \
-             Max allowed variance: {:.1}%",
+             Valid client median: {:?}\n  \
+             Invalid client median: {:?}\n  \
+             Max allowed variance: {:.1}%\n  \
+             All valid times: {:?}\n  \
+             All invalid times: {:?}",
             time_diff.as_millis(),
             diff_percentage,
             max_time.as_millis(),
-            valid_client_duration,
-            invalid_client_duration,
-            MAX_TIMING_VARIANCE_PERCENT
+            valid_median,
+            invalid_median,
+            MAX_TIMING_VARIANCE_PERCENT,
+            valid_times,
+            invalid_times
         );
 
         Ok(())
