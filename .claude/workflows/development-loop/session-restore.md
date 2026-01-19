@@ -80,20 +80,41 @@ Continue from where you left off. Based on your working notes, {specific instruc
 
 ---
 
-## Resume Fallback Pattern
+## Resume Strategies
 
-When using the Task tool's `resume` parameter fails (API errors, concurrency issues), fall back to checkpoint injection:
+There are two complementary resume mechanisms:
 
-1. **Attempt resume first** - Use `resume: "{agent_id}"` parameter
-2. **If resume fails** - Don't use `/rewind`; instead:
-   - Read the specialist's checkpoint file
-   - Invoke a fresh agent with checkpoint context injected
-   - Use the "Restore Context Template" format above
+### 1. Session Resume (Short-term)
 
-**Example fallback prompt**:
+Step-runners invoke specialists via `claude --print` which returns a `session_id`. For iteration 2+ (fixing findings), use:
+
+```bash
+claude --print --resume "$session_id" --model opus --output-format json ...
 ```
-The resume failed. Using checkpoint recovery instead.
 
+**Benefits**: Full context preserved, ~100x cost reduction via prompt caching.
+
+**Limitation**: Only works within same CLI session. session_id may expire.
+
+**Session tracking** in `main.md`:
+```markdown
+## Session Tracking
+
+| Specialist | Session ID | Iteration | Status |
+|------------|------------|-----------|--------|
+| auth-controller | 9e956e47-... | 2 | fixing-findings |
+```
+
+### 2. Checkpoint Recovery (Long-term)
+
+For full session restarts (context compression, computer restart), use checkpoint injection:
+
+1. Read the specialist's checkpoint file
+2. Invoke a fresh specialist with checkpoint context injected
+3. Use the "Restore Context Template" format above
+
+**Example checkpoint-based recovery prompt**:
+```
 # Context Recovery for {Specialist}
 
 You are continuing work that was interrupted. Here's your previous context:
@@ -107,7 +128,16 @@ You are continuing work that was interrupted. Here's your previous context:
 {original task description}
 ```
 
-This ensures the fresh agent has meaningful context even without the original agent's full memory.
+This ensures the fresh specialist has meaningful context even without the original session.
+
+### Choosing a Strategy
+
+| Scenario | Strategy |
+|----------|----------|
+| Iteration 2+ within same run | Session resume (`--resume`) |
+| Orchestrator context compressed | Checkpoint injection |
+| New session started | Checkpoint injection |
+| Session resume fails | Fall back to checkpoint injection |
 
 ---
 

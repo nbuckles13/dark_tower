@@ -2,6 +2,8 @@
 
 This file is read when entering the `implementation` step of the dev-loop.
 
+**Invocation mechanism**: See `specialist-invocation.md` for how to invoke specialists via `claude --print`.
+
 ---
 
 ## Context Injection
@@ -90,15 +92,36 @@ When invoking an implementing specialist, include these sections in order:
 - Run all 7 verification layers and fix failures before returning
 - Write output to `docs/dev-loop-outputs/YYYY-MM-DD-{task-slug}/main.md`
 - Write checkpoint to `docs/dev-loop-outputs/YYYY-MM-DD-{task-slug}/{your-name}.md`
+- End response with structured `---RESULT---` block (see specialist-invocation.md)
 
 **Templates**: See `docs/dev-loop-outputs/_template/` for output and checkpoint formats.
 
+### Required Output Format
+
+All specialist responses must end with:
+
+```
+---RESULT---
+STATUS: SUCCESS or FAILURE
+SUMMARY: Brief description of what was done
+FILES_MODIFIED: Comma-separated list of files changed
+TESTS_ADDED: Number of tests added (0 if none)
+VERIFICATION: PASSED or FAILED (did all 7 layers pass?)
+ERROR: Error message if FAILURE, or "none" if SUCCESS
+---END---
+```
+
+This enables step-runners to reliably detect success/failure.
+
 ### Resume for Fixes
+
+Use `--resume "$session_id"` to continue the specialist's session (preserves context, reduces cost).
 
 When resuming to fix code review findings, provide:
 - Iteration number (N of 5)
 - List of findings with severity, file:line, description, suggested fix
 - Instruction: Fix all → re-run verification → update output → return
+- Reminder to end with `---RESULT---` block
 
 ### Resume for Reflection
 
@@ -121,3 +144,20 @@ During implementation, specialists write to checkpoint files:
 - **Status** - Current step, timestamp
 
 This enables session recovery if context is compressed mid-loop.
+
+## Session Tracking
+
+Step-runners must log session_id to `main.md` after each specialist invocation:
+
+```markdown
+## Session Tracking
+
+| Specialist | Session ID | Iteration | Status |
+|------------|------------|-----------|--------|
+| auth-controller | 9e956e47-... | 1 | SUCCESS |
+```
+
+This enables:
+- Resume capability for iteration 2+ (fixing findings)
+- Orchestrator recovery after context compression
+- Cost tracking (resumed sessions use cached prompts)
