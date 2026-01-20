@@ -1,6 +1,16 @@
 # Development Loop Workflow
 
-The Development Loop is the primary workflow for implementing features. It combines specialist ownership, context injection, verification, code review, and reflection.
+The Development Loop is the primary workflow for implementing features. It uses an interactive model where the **user orchestrates** and **Claude executes steps**.
+
+---
+
+## Roles
+
+| Role | Who | Responsibilities |
+|------|-----|------------------|
+| **Orchestrator** | User | Initiates loop, approves steps, decides when to proceed |
+| **Step-Runner** | Claude | Prepares prompts, spawns specialists, runs validation |
+| **Specialist** | Task agents | Domain expertise, implements code, reviews changes |
 
 ---
 
@@ -14,345 +24,201 @@ The Development Loop is the primary workflow for implementing features. It combi
 | Documentation only | No | No verification needed |
 | Exploration/research | No | No code to verify |
 
-When starting, announce:
-> *"Starting development loop (specialist-owned verification, max 5 iterations)"*
+---
 
-Record the start time for duration tracking.
+## The Process
+
+### Step 0: Initiation
+
+**User says**: "Let's work on task X in a dev-loop"
+
+**Claude (step-runner)**:
+1. Creates output directory: `docs/dev-loop-outputs/YYYY-MM-DD-{task-slug}/`
+2. Creates `main.md` with task overview and loop state
+3. Identifies implementing specialist
+4. Matches task to principle categories
+5. Prepares specialist prompt and shows user:
+   - Matched principles (file paths)
+   - Task description
+   - Expected output format
+
+**User reviews** and says: "That looks good, run step 1"
 
 ---
 
-## Step Announcements
+### Step 1: Implementation
 
-Announce each step transition to keep the user informed of progress.
+**Claude (step-runner)**:
+1. Spawns implementing specialist via Task tool
+2. Specialist prompt includes:
+   - Specialist definition (from `.claude/agents/{specialist}.md`)
+   - Accumulated knowledge (from `docs/specialist-knowledge/{specialist}/`)
+   - Matched principles (from `docs/principles/`)
+   - Task description
+3. Waits for specialist to complete
+4. Updates `main.md` with implementation summary
+5. Reports results to user
 
-### Format
+**Specialist responsibilities**:
+- Implement the task
+- Run verification (cargo check, tests, clippy)
+- Create checkpoint file at `{output_dir}/{specialist}.md`
+- End response with structured output block
 
-> **[Step Name]** | Duration: {elapsed} | {status info}
-
-### Step-Specific Announcements
-
-| Transition | Announcement |
-|------------|--------------|
-| → Implementation | **Implementation** \| Duration: 0m \| Iteration 1, invoking {specialist} specialist |
-| → Validation | **Validation** \| Duration: {elapsed} \| Specialist returned, re-running verification |
-| → Code Review | **Code Review** \| Duration: {elapsed} \| Validation passed, invoking reviewers |
-| → Reflection | **Reflection** \| Duration: {elapsed} \| Code review approved, capturing learnings |
-| → Complete | **Complete** \| Duration: {elapsed} \| All steps passed |
-
-### Iteration Announcements
-
-When returning to implementation after findings:
-> **Implementation** | Duration: {elapsed} | Iteration {n}, fixing {count} findings from {reviewer}
-
-### Failure Announcements
-
-| Scenario | Announcement |
-|----------|--------------|
-| Validation failed | **Validation Failed** \| Duration: {elapsed} \| Layer {n} failed, resuming specialist |
-| Code review blocked | **Code Review Blocked** \| Duration: {elapsed} \| {reviewer} raised BLOCKER, returning to implementation |
-| Max iterations | **Loop Aborted** \| Duration: {elapsed} \| Max 5 iterations reached, escalating to user |
+**User reviews** and says: "That looks good, run step 2"
 
 ---
 
-## Loop States
+### Step 2: Validation
 
-| State | Description | Next State | Step File |
-|-------|-------------|------------|-----------|
-| `implementation` | Specialist implements + verifies | `validation` | `development-loop/step-implementation.md` |
-| `validation` | Orchestrator re-runs verification | `code_review` (pass) or `implementation` (fail) | `development-loop/step-validation.md` |
-| `code_review` | 4 specialists review | `reflection` (approved) or `implementation` (findings) | `code-review.md` |
-| `reflection` | Update knowledge files | `complete` | `development-loop/step-reflection.md` |
-| `complete` | Done | - | - |
+**Claude (step-runner)** runs directly (no Task spawn):
+1. Layer 1: `cargo check --workspace`
+2. Layer 2: `cargo fmt --all --check`
+3. Layer 3: `./scripts/guards/run-guards.sh`
+4. Layer 4: `cargo test --workspace --lib`
+5. Layer 5: `cargo test --workspace` (all tests)
+6. Layer 6: `cargo clippy --workspace --lib --bins -- -D warnings`
+7. Layer 7: Semantic guards (if applicable)
 
----
+Updates `main.md` with verification results.
 
-## Step Reference
+**If failed**: Reports which layer failed, user decides whether to resume specialist or fix directly.
 
-| Step | File | When to Read |
-|------|------|--------------|
-| Implementation | `development-loop/step-implementation.md` | Starting a dev-loop |
-| Validation | `development-loop/step-validation.md` | After implementation |
-| Code Review | `code-review.md` | After validation passes |
-| Reflection | `development-loop/step-reflection.md` | After code review approves |
-| Output Format | `development-loop/output-documentation.md` | Creating output files |
-| Recovery | `development-loop/session-restore.md` | Resuming interrupted loops |
+**User reviews** and says: "That looks good, run step 3"
 
 ---
 
-## Before Switching Tasks
+### Step 3: Code Review
 
-If user requests a different task while a dev-loop is in progress:
-1. Check Loop State in the current output file
-2. If Current Step is NOT `complete`:
-   - Ask user: "We have an incomplete dev-loop at step '{step}'. Complete it first or pause?"
+**Claude (step-runner)**:
+1. Spawns 4 reviewers in parallel via Task tool:
+   - Security specialist
+   - Test specialist
+   - Code-reviewer specialist
+   - DRY-reviewer specialist
+2. Each reviewer gets: files changed, implementation summary
+3. Collects verdicts and findings
+4. Updates `main.md` with code review results
 
----
+**Verdicts**:
+- `APPROVED` - No issues
+- `FINDINGS` - Issues to fix (blocks if Security/Test/Code-reviewer)
+- `TECH_DEBT` - DRY-reviewer non-blocking findings
 
-## Deadlock Handling
+**If findings**: User decides whether to resume implementing specialist or fix directly.
 
-If specialists deadlock (e.g., code review disagreements that can't be resolved):
-- Exit the loop
-- Present the situation to the user
-- Let the user decide how to proceed
-
----
-
-## Step-Runner Architecture
-
-The dev-loop uses a three-level agent architecture:
-
-| Level | Role | Context |
-|-------|------|---------|
-| Orchestrator | State machine, step sequencing | This file only |
-| Step-Runner | Execute one step | Step-specific file only |
-| Specialist | Domain expertise | Specialist definition + dynamic knowledge |
-
-**Key principle**: Each level only knows what it needs. Orchestrator doesn't know step details. Step-runners don't know overall state. Specialists don't know process.
+**User reviews** and says: "That looks good, run step 4"
 
 ---
 
-## Orchestrator Responsibilities
+### Step 4: Reflection
 
-Before invoking step-runners, the orchestrator must prepare:
+**Claude (step-runner)**:
+1. Resumes implementing specialist for reflection
+2. Specialist reviews their work and updates knowledge files:
+   - `docs/specialist-knowledge/{specialist}/patterns.md`
+   - `docs/specialist-knowledge/{specialist}/gotchas.md`
+   - `docs/specialist-knowledge/{specialist}/integration.md`
+3. Optionally resumes reviewers for their reflections
+4. Updates `main.md` with lessons learned
 
-1. **Match task to principle categories** using regex patterns in `.claude/DEVELOPMENT_WORKFLOW.md` (Contextual Injection section)
-2. **Check for knowledge files** at `docs/specialist-knowledge/{specialist}/*.md`
-3. **Fill in step-runner input** with paths to matched files
-
-The orchestrator passes file paths to the step-runner; the step-runner reads and injects them.
+**User reviews** and says: "Complete the loop"
 
 ---
 
-## Step-Runner Invocation
+### Step 5: Complete
 
-### Standard Format
+**Claude (step-runner)**:
+1. Updates loop state to `complete`
+2. Summarizes the dev-loop outcome
 
-All step-runners are general-purpose agents invoked with this structure:
+---
+
+## Loop State
+
+Tracked in `main.md`:
 
 ```markdown
-## Step-Runner: {step_name}
+## Loop State (Internal)
 
-**Your job**: Execute the {step_name} step of the dev-loop.
-
-### CRITICAL CONSTRAINTS
-
-You are a **process orchestrator**, not a designer or implementer.
-
-**Do NOT**:
-- Design the solution or suggest implementation approaches
-- Specify function names, patterns, or architecture
-- Tell the specialist HOW to solve the problem
-- Write or modify code yourself (except main.md updates)
-
-**DO**:
-- Pass the task description and findings VERBATIM to the specialist
-- Let the specialist determine the approach based on their domain expertise
-- Verify the specialist created their checkpoint file
-- Update main.md with step results
-- Return structured output
-
-### Instructions
-
-Read and follow these files:
-1. `.claude/workflows/development-loop/specialist-invocation.md` - How to invoke specialists
-2. `.claude/workflows/{step_file}` - Step-specific instructions
-
-### Input
-
-Task: {task_description}
-Specialist: {specialist_name}
-Specialist definition: `.claude/agents/{specialist_name}.md`
-Matched principles: {list of paths to docs/principles/*.md files}
-Knowledge files: {list of paths to docs/specialist-knowledge/{specialist}/*.md, if exist}
-Output directory: {output_dir}
-Action: {Start new specialist | Resume specialist {id}}
-Findings to address: {list, if iteration 2+}
-
-### Your Responsibilities
-
-1. Read the step instructions file
-2. Execute the action (start new or resume specialist)
-3. Ensure specialist creates checkpoint at `{output_dir}/{specialist}.md`
-4. Update `{output_dir}/main.md` with your step's section
-5. Return structured output (see below)
-
-### Expected Output
-
-Respond with exactly this format:
-
-status: success | failed
-specialist_id: {agent ID from specialist you invoked}
-files_created: {list of new files}
-files_modified: {list of modified files}
-checkpoint_exists: true | false
-error: {if failed, explanation}
-```
-
-### Step-Specific Inputs
-
-| Step | Step File | Specialist | Additional Input |
-|------|-----------|------------|------------------|
-| Implementation | `development-loop/step-implementation.md` | Domain specialist | Findings (iteration 2+) |
-| Validation | `development-loop/step-validation.md` | None (runs commands) | Files to validate |
-| Code Review | `code-review.md` | security, test, code-reviewer, dry-reviewer | Files to review |
-| Reflection | `development-loop/step-reflection.md` | Same as implementation + reviewers | Agent IDs to resume |
-
-### Validation Step (No Specialist)
-
-Validation doesn't invoke specialists - it runs verification commands directly:
-
-```markdown
-## Step-Runner: Validation
-
-**Your job**: Execute the validation step of the dev-loop.
-
-### Instructions
-
-Read and follow: `.claude/workflows/development-loop/step-validation.md`
-
-### Input
-
-Output directory: {output_dir}
-Files to validate: {list from implementation step}
-
-### Your Responsibilities
-
-1. Read the step instructions file
-2. Run the 7-layer verification
-3. Update `{output_dir}/main.md` with Dev-Loop Verification Steps section
-4. Return structured output
-
-### Expected Output
-
-status: success | failed
-layer_failed: {if failed, which layer: 1-7}
-error_details: {if failed, what went wrong}
-```
-
-### Code Review Step (Multiple Specialists)
-
-Code review invokes 4 specialists and collects their verdicts:
-
-```markdown
-## Step-Runner: Code Review
-
-**Your job**: Execute the code review step of the dev-loop.
-
-### Instructions
-
-Read and follow: `.claude/workflows/code-review.md`
-
-### Input
-
-Output directory: {output_dir}
-Files to review: {list}
-Iteration: {n}
-
-### Your Responsibilities
-
-1. Read the code review workflow
-2. Invoke all 4 reviewers (security, test, code-reviewer, dry-reviewer)
-3. Ensure each reviewer creates checkpoint at `{output_dir}/{reviewer}.md`
-4. Update `{output_dir}/main.md` with Code Review Results section
-5. Return structured output with all verdicts
-
-### Expected Output
-
-status: approved | needs_fixes | blocked
-reviewer_ids:
-  security: {id}
-  test: {id}
-  code_reviewer: {id}
-  dry_reviewer: {id}
-findings: {list of findings if needs_fixes}
-blocker_count: {number of blocking findings}
-```
-
-### Reflection Step (Resume Specialists)
-
-Reflection resumes previously-invoked specialists:
-
-```markdown
-## Step-Runner: Reflection
-
-**Your job**: Execute the reflection step of the dev-loop.
-
-### Instructions
-
-Read and follow: `.claude/workflows/development-loop/step-reflection.md`
-
-### Input
-
-Output directory: {output_dir}
-Implementing specialist to resume: {id}
-Reviewers to resume:
-  security: {id}
-  test: {id}
-  code_reviewer: {id}
-  dry_reviewer: {id}
-
-### Your Responsibilities
-
-1. Read the step instructions file
-2. Resume each specialist sequentially (not in parallel)
-3. Each specialist updates their knowledge files and checkpoint
-4. Update `{output_dir}/main.md` with Reflection section
-5. Return structured output
-
-### Expected Output
-
-status: success | failed
-knowledge_files_updated: {list of files updated}
-error: {if failed}
+| Field | Value |
+|-------|-------|
+| Implementing Specialist | `{specialist-name}` |
+| Current Step | `{step}` |
+| Iteration | `{n}` |
+| Implementing Agent ID | `{id}` |
+| Security Reviewer ID | `{id or pending}` |
+| Test Reviewer ID | `{id or pending}` |
+| Code Reviewer ID | `{id or pending}` |
+| DRY Reviewer ID | `{id or pending}` |
 ```
 
 ---
 
-## Orchestrator State Management
+## Iteration (Fixing Issues)
 
-The orchestrator maintains minimal state between steps:
+When validation fails or code review has findings:
 
-```
-{
-  task: "description",
-  output_dir: "docs/dev-loop-outputs/YYYY-MM-DD-{task}",
-  step: "implementation | validation | code_review | reflection | complete",
-  iteration: 1,
-  specialist_ids: {
-    implementing: "abc123",
-    security: "def456",
-    test: "ghi789",
-    code_reviewer: "jkl012",
-    dry_reviewer: "mno345"
-  }
-}
-```
-
-**State transitions based on step-runner output**:
-
-| Current Step | Output | Next Step |
-|--------------|--------|-----------|
-| implementation | success | validation |
-| validation | success | code_review |
-| validation | failed | implementation (resume specialist with errors) |
-| code_review | approved | reflection |
-| code_review | needs_fixes | implementation (resume specialist with findings) |
-| reflection | success | **run validation script** → complete |
-
-**Before marking complete**: Run output validation script:
-```bash
-./scripts/workflow/verify-dev-loop.sh --output-dir {output_dir} --verbose
-```
-
-If validation fails, fix issues before announcing completion.
+1. User decides: "Resume specialist to fix" or "I'll fix directly"
+2. If resuming: Claude resumes the specialist via Task with findings
+3. Increment iteration counter (max 5)
+4. Return to validation step
 
 ---
 
-## Related Workflows
+## Specialist Prompt Structure
 
-| Workflow | When to Use | Relationship |
-|----------|-------------|--------------|
-| `multi-agent-debate.md` | Cross-cutting design | Happens BEFORE loop, produces ADR |
-| `code-review.md` | Quality gate | Integrated INTO loop (step 4) |
-| `orchestrator-guide.md` | General orchestration | This loop is a key subprocess |
-| `process-review-record.md` | Process failures | Use when loop reveals gaps |
+When spawning a specialist, include:
+
+```markdown
+{Contents of .claude/agents/{specialist}.md}
+
+## Principles
+
+{Contents of matched docs/principles/*.md files}
+
+## Accumulated Knowledge
+
+{Contents of docs/specialist-knowledge/{specialist}/*.md if exists}
+
+## Task
+
+{Task description - VERBATIM from user}
+
+## Your Responsibilities
+
+1. Implement the task
+2. Run verification (cargo check, test, clippy)
+3. Create checkpoint at `{output_dir}/{specialist}.md`
+4. End with structured output:
+
+---RESULT---
+STATUS: SUCCESS or FAILURE
+SUMMARY: Brief description of what was done
+FILES_MODIFIED: Comma-separated list
+TESTS_ADDED: Number (0 if none)
+VERIFICATION: PASSED or FAILED
+ERROR: Error message if FAILURE, or "none"
+---END---
+```
+
+---
+
+## What Claude Shows Before Each Step
+
+Before spawning specialists, Claude shows:
+- **Matched principles**: File paths that will be injected
+- **Task prompt**: Exactly what the specialist will see
+
+User can adjust before approving.
+
+---
+
+## Related Files
+
+| File | Purpose |
+|------|---------|
+| `development-loop/step-validation.md` | Detailed validation layer instructions |
+| `development-loop/session-restore.md` | Recovery from interrupted loops |
+| `code-review.md` | Code review process details |
+| `docs/dev-loop-outputs/_template/` | Output file templates |
