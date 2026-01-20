@@ -191,7 +191,7 @@ After implementing fixes:
 
 **Fix**: Added explicit `uid: prometheus` to `infra/grafana/provisioning/datasources/datasources.yaml`
 
-**Prevention**: Created CI lint script (`scripts/lint-grafana-dashboards.sh`) that validates:
+**Prevention**: Created CI guard (`scripts/guards/simple/grafana-datasources.sh`) that validates:
 - All datasource UIDs referenced in dashboards exist in datasource provisioning configs
 - Added to `.github/workflows/ci.yml` to run on every PR
 
@@ -199,7 +199,7 @@ After implementing fixes:
 | File | Type | Description |
 |------|------|-------------|
 | `infra/grafana/provisioning/datasources/datasources.yaml` | FIX | Add explicit `uid: prometheus` and `uid: loki` |
-| `scripts/lint-grafana-dashboards.sh` | NEW | CI lint script for dashboard validation |
+| `scripts/guards/simple/grafana-datasources.sh` | NEW | CI guard for dashboard validation |
 | `.github/workflows/ci.yml` | UPDATE | Add Grafana dashboard lint step |
 
 **Process Improvement**: When creating datasource configs, always specify explicit UIDs to match dashboard references. The CI lint will now catch any mismatches before merge.

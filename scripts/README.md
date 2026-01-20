@@ -6,32 +6,28 @@ This directory contains utility scripts for Dark Tower development and operation
 
 ```
 scripts/
-├── dev/              # Development and testing scripts
-│   ├── start-local-stack.sh    # Start local development environment
-│   ├── reset-database.sh       # Reset test database
-│   ├── seed-test-data.sh       # Populate test data
-│   └── README.md               # Development scripts documentation
+├── guards/           # Verification guards (simple + semantic)
 └── README.md         # This file
 ```
 
-## Available Script Categories
+## Local Development
 
-### Development Scripts (`dev/`)
+Local development scripts are in `infra/kind/scripts/`. See ADR-0013 for details.
 
-Scripts for local development, testing, and database management.
-
-**Quick Start:**
 ```bash
-# First time setup
-cd /home/nathan/code/dark_tower
-./scripts/dev/start-local-stack.sh
-./scripts/dev/seed-test-data.sh
+# Start kind cluster with infrastructure
+./infra/kind/scripts/setup.sh
 
-# Start AC service
-./scripts/dev/start-local-stack.sh --start-service
+# Run AC service locally
+export DATABASE_URL="postgresql://darktower:dev_password_change_in_production@localhost:5432/dark_tower"
+cargo run --bin auth-controller
+
+# Telepresence iteration (route cluster traffic to local process)
+./infra/kind/scripts/iterate.sh ac
+
+# Teardown when done
+./infra/kind/scripts/teardown.sh
 ```
-
-See [`dev/README.md`](dev/README.md) for detailed documentation.
 
 ## Script Conventions
 
