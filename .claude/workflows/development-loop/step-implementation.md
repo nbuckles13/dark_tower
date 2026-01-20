@@ -1,8 +1,8 @@
 # Step: Implementation
 
-This file is read when entering the `implementation` step of the dev-loop.
+This file covers the implementation step of the dev-loop.
 
-**Invocation mechanism**: See `specialist-invocation.md` for how to invoke specialists via `claude --print`.
+**Invocation mechanism**: See `specialist-invocation.md` for how to invoke specialists via Task tool.
 
 ---
 
@@ -13,8 +13,8 @@ When building specialist prompts, inject context in this order:
 1. **Specialist definition** - From `.claude/agents/{specialist}.md`
 2. **Matched principles** - From `docs/principles/` based on task keywords
 3. **Specialist knowledge** - From `docs/specialist-knowledge/{specialist}/` (if exists)
-4. **Design context** - ADR summary + file path if from debate (e.g., `docs/decisions/adr-0020-...`)
-5. **Task context** - The actual task description and existing patterns
+4. **Design context** - ADR summary + file path if from debate
+5. **Task context** - The actual task description
 
 ## Specialist Knowledge Files
 
@@ -25,7 +25,7 @@ Each specialist may have accumulated knowledge in `docs/specialist-knowledge/{sp
 
 **If these files exist**: Inject their contents after principles, before task context.
 
-**If these files don't exist**: Skip this step (specialist will bootstrap them during first reflection).
+**If these files don't exist**: Skip (specialist will bootstrap them during first reflection).
 
 ---
 
@@ -72,92 +72,74 @@ task_patterns:
 
 ---
 
-## Specialist Prompts
+## What to Show User Before Spawning
 
-### Initial Invocation
+Before invoking the specialist, show the user:
 
-When invoking an implementing specialist, include these sections in order:
+1. **Matched principles** (file paths):
+   ```
+   - docs/principles/errors.md
+   - docs/principles/testing.md
+   ```
 
-1. **Specialist definition** - From `.claude/agents/{specialist}.md`
-2. **Implementation mode header** - "You are being invoked to IMPLEMENT" + expected behavior
-3. **Project principles** - Matched category files from `docs/principles/`
-4. **Accumulated knowledge** - From `docs/specialist-knowledge/{specialist}/*.md` (if exists)
-5. **Design context** - ADR summary + file path if from debate (so specialist can reference full ADR)
-6. **Existing patterns** - Relevant code snippets
-7. **Task description** - The actual task
-8. **Responsibilities** - Implement → verify (7 layers) → fix → write output + checkpoint → return
+2. **Task prompt** (what specialist will see):
+   ```
+   Replace all #[allow(...)] attributes with #[expect(...)] in AC service
+   production code. Test code may continue to use #[allow(...)] as needed.
+   ```
 
-**Key instructions to include**:
-- If requirements unclear: Return to orchestrator with questions (don't guess)
-- Run all 7 verification layers and fix failures before returning
-- Write output to `docs/dev-loop-outputs/YYYY-MM-DD-{task-slug}/main.md`
-- Write checkpoint to `docs/dev-loop-outputs/YYYY-MM-DD-{task-slug}/{your-name}.md`
-- End response with structured `---RESULT---` block (see specialist-invocation.md)
-
-**Templates**: See `docs/dev-loop-outputs/_template/` for output and checkpoint formats.
-
-### Required Output Format
-
-All specialist responses must end with:
-
-```
----RESULT---
-STATUS: SUCCESS or FAILURE
-SUMMARY: Brief description of what was done
-FILES_MODIFIED: Comma-separated list of files changed
-TESTS_ADDED: Number of tests added (0 if none)
-VERIFICATION: PASSED or FAILED (did all 7 layers pass?)
-ERROR: Error message if FAILURE, or "none" if SUCCESS
----END---
-```
-
-This enables step-runners to reliably detect success/failure.
-
-### Resume for Fixes
-
-Use `--resume "$session_id"` to continue the specialist's session (preserves context, reduces cost).
-
-When resuming to fix code review findings, provide:
-- Iteration number (N of 5)
-- List of findings with severity, file:line, description, suggested fix
-- Instruction: Fix all → re-run verification → update output → return
-- Reminder to end with `---RESULT---` block
-
-### Resume for Reflection
-
-When resuming for reflection (after code review clean):
-- Instruction: Review knowledge files → add/update/remove entries → append reflection to output
-- Reference: `docs/specialist-knowledge/{specialist}/*.md`
+User approves, then spawn the specialist.
 
 ---
 
-## Checkpoint Writes
+## Resume for Fixes
 
-During implementation, specialists write to checkpoint files:
+When resuming a specialist to fix code review findings:
+
+```markdown
+## Findings to Address
+
+Iteration 2 of 5.
+
+### Security Specialist Findings
+1. [BLOCKER] Missing input validation in `src/handlers/auth.rs:45`
+   - Suggested fix: Add length check before processing
+
+### Test Specialist Findings
+1. [REQUIRED] No test coverage for error path in `src/services/token.rs:120`
+   - Suggested fix: Add test for invalid token case
+
+Fix all findings, re-run verification, update output, and return with ---RESULT--- block.
+```
+
+---
+
+## Resume for Reflection
+
+When resuming for reflection (after code review clean):
+
+```markdown
+## Reflection
+
+Code review passed. Please:
+1. Review your checkpoint file for patterns/gotchas discovered
+2. Update `docs/specialist-knowledge/{specialist}/patterns.md` with new patterns
+3. Update `docs/specialist-knowledge/{specialist}/gotchas.md` with new gotchas
+4. Append reflection summary to main.md
+```
+
+---
+
+## Checkpoint Files
+
+Specialists write checkpoints during implementation:
 
 **Location**: `docs/dev-loop-outputs/YYYY-MM-DD-{task}/{specialist}.md`
 
-**Content** (written as work progresses):
-- **Patterns Discovered** - What approaches worked well
-- **Gotchas Encountered** - What was tricky, what to warn others about
-- **Key Decisions** - Choices made and why
-- **Status** - Current step, timestamp
+**Content**:
+- Patterns Discovered
+- Gotchas Encountered
+- Key Decisions
+- Status
 
-This enables session recovery if context is compressed mid-loop.
-
-## Session Tracking
-
-Step-runners must log session_id to `main.md` after each specialist invocation:
-
-```markdown
-## Session Tracking
-
-| Specialist | Session ID | Iteration | Status |
-|------------|------------|-----------|--------|
-| auth-controller | 9e956e47-... | 1 | SUCCESS |
-```
-
-This enables:
-- Resume capability for iteration 2+ (fixing findings)
-- Orchestrator recovery after context compression
-- Cost tracking (resumed sessions use cached prompts)
+This enables recovery if session is interrupted.

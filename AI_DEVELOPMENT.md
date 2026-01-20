@@ -22,14 +22,20 @@ This isn't a flaw to work around - it's a fundamental constraint to design for. 
 
 ---
 
-## The Core Idea: Specialists, Not a Single AI
+## The Core Idea: Human-Orchestrated AI Specialists
 
-Instead of one AI doing everything, we use **specialist agents** - each with deep expertise in a specific domain. The orchestrating AI (Claude Code) doesn't write code directly; it coordinates specialists like a tech lead managing a team.
+Instead of one AI doing everything autonomously, we use a **human-in-the-loop model** with **specialist agents** - each with deep expertise in a specific domain.
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                      ORCHESTRATOR                           │
-│         (Coordinates, doesn't implement directly)           │
+│                    HUMAN ORCHESTRATOR                       │
+│         (Initiates tasks, approves steps, decides)          │
+└────────────────────────────┬────────────────────────────────┘
+                             │
+                             ▼
+┌─────────────────────────────────────────────────────────────┐
+│                   CLAUDE (STEP-RUNNER)                      │
+│         (Prepares prompts, spawns specialists)              │
 └────────────────────────────┬────────────────────────────────┘
                              │
         ┌────────────────────┼────────────────────┐
@@ -46,11 +52,12 @@ Instead of one AI doing everything, we use **specialist agents** - each with dee
 └───────────────┘  └─────────────────┘  └─────────────────────┘
 ```
 
-**Why specialists?**
+**Why this structure?**
+- **Human oversight**: Each step requires explicit approval before execution
 - **Bounded context**: Each specialist only needs to understand their domain, not the entire system
 - **Focused prompts**: We inject only relevant knowledge, not everything we know
 - **Parallel execution**: Independent tasks run simultaneously, each with fresh context
-- **Cross-cutting review**: Security and Test specialists catch what domain experts miss (because domain experts are focused on their domain)
+- **Cross-cutting review**: Security and Test specialists catch what domain experts miss
 
 ---
 
@@ -182,50 +189,63 @@ This ensures specialists follow project-specific security and quality standards,
 
 ## The Development Loop
 
-Putting it all together, here's how a feature gets implemented:
+Putting it all together, here's how a feature gets implemented. The key insight: **humans approve each step before it runs**.
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│  1. TASK ANALYSIS                                           │
-│     Orchestrator identifies specialists and principles      │
-└────────────────────────────────┬────────────────────────────┘
-                                 ▼
+│  0. INITIATION                                              │
+│     Human: "Let's work on task X"                           │
+│     Claude: Prepares specialist prompt, shows principles    │
+│     Human: Reviews and approves                             │
+└────────────────────────────┬────────────────────────────────┘
+                             ▼
 ┌─────────────────────────────────────────────────────────────┐
-│  2. SPECIALIST IMPLEMENTATION                               │
-│     Domain specialist implements with injected:             │
+│  1. IMPLEMENTATION                                          │
+│     Claude: Spawns specialist with:                         │
 │     - Specialist definition (role, responsibilities)        │
 │     - Dynamic knowledge (patterns, gotchas, integration)    │
 │     - Matched principles (crypto, logging, etc.)            │
-└────────────────────────────────┬────────────────────────────┘
-                                 ▼
+│     Human: Reviews results, approves next step              │
+└────────────────────────────┬────────────────────────────────┘
+                             ▼
 ┌─────────────────────────────────────────────────────────────┐
-│  3. VERIFICATION (7 LAYERS)                                 │
+│  2. VERIFICATION (7 LAYERS)                                 │
+│     Claude runs directly:                                   │
 │     check → fmt → guards → tests → clippy → semantic        │
-│     Specialist owns fixing any failures                     │
-└────────────────────────────────┬────────────────────────────┘
-                                 ▼
+│     Human: Reviews failures, decides how to fix             │
+└────────────────────────────┬────────────────────────────────┘
+                             ▼
 ┌─────────────────────────────────────────────────────────────┐
-│  4. CODE REVIEW                                             │
-│     Four specialists review in parallel:                    │
+│  3. CODE REVIEW                                             │
+│     Claude: Spawns 4 reviewers in parallel:                 │
 │     - Security Specialist (vulnerabilities, crypto)         │
 │     - Test Specialist (coverage, edge cases)                │
 │     - Code Quality Reviewer (idioms, maintainability)       │
-│     - DRY Reviewer (cross-service duplication detection)    │
-└────────────────────────────────┬────────────────────────────┘
-                                 ▼
+│     - DRY Reviewer (cross-service duplication)              │
+│     Human: Reviews findings, decides what to fix            │
+└────────────────────────────┬────────────────────────────────┘
+                             ▼
 ┌─────────────────────────────────────────────────────────────┐
-│  5. REFLECTION                                              │
-│     Capture learnings to dynamic knowledge files:           │
+│  4. REFLECTION                                              │
+│     Claude: Captures learnings to dynamic knowledge files:  │
 │     - New patterns discovered                               │
 │     - Gotchas encountered                                   │
 │     - Integration insights                                  │
-└────────────────────────────────┬────────────────────────────┘
-                                 ▼
+│     Human: Reviews and completes loop                       │
+└────────────────────────────┬────────────────────────────────┘
+                             ▼
 ┌─────────────────────────────────────────────────────────────┐
-│  6. COMMIT                                                  │
+│  5. COMMIT                                                  │
 │     With full audit trail in docs/dev-loop-outputs/         │
 └─────────────────────────────────────────────────────────────┘
 ```
+
+**Why human approval at each step?**
+- Prevents runaway AI loops that waste time or go in wrong directions
+- Gives visibility into what specialists are being asked to do
+- Allows course-correction before expensive operations
+- Human can fix simple issues directly without re-invoking specialists
+- Keeps the AI step-runner focused: autonomous orchestration leads to context overload, confusion, and loops
 
 ---
 

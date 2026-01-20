@@ -1,39 +1,18 @@
-# Specialist Invocation (for Step-Runners)
+# Specialist Invocation
 
-This file describes how step-runners invoke specialists during the dev-loop.
+This file describes how Claude (step-runner) invokes specialists during the dev-loop.
 
 ---
 
 ## How to Invoke
 
-Use `claude --print` via Bash to invoke specialists.
+Use the **Task tool** with `subagent_type="general-purpose"` to spawn specialists.
 
-**Why `claude --print` (not Task tool)**:
-- Task sub-agents cannot spawn nested agents (Task tool not available to them)
-- `claude --print` with `--allowedTools` gives specialists full tool access
-- `--resume` enables iteration cycles without losing context
-- `--output-format json` provides structured metadata (cost, turns, session_id)
-
-**Command Structure**:
-
-```bash
-claude --print \
-  --model opus \
-  --output-format json \
-  --allowedTools "Read,Edit,Write,Bash,Grep,Glob" \
-  "$specialist_prompt"
-```
-
-**For iteration 2+ (fixing findings)**:
-
-```bash
-claude --print \
-  --model opus \
-  --output-format json \
-  --allowedTools "Read,Edit,Write,Bash,Grep,Glob" \
-  --resume "$session_id" \
-  "$findings_prompt"
-```
+**Benefits**:
+- Real-time visibility into specialist progress
+- Automatic tool access (Read, Edit, Write, Bash, Grep, Glob)
+- Resume capability via agent ID
+- No orphaned processes
 
 ---
 
@@ -44,39 +23,38 @@ Read and concatenate these inputs:
 | Input | Source | Required |
 |-------|--------|----------|
 | Specialist definition | `.claude/agents/{specialist}.md` | Yes |
-| Matched principles | `docs/principles/*.md` (paths provided by orchestrator) | Yes |
-| Accumulated knowledge | `docs/specialist-knowledge/{specialist}/*.md` (if exists) | If exists |
-| Task description | Provided by orchestrator | Yes |
-| Findings to address | Provided by orchestrator (iteration 2+) | If iteration 2+ |
+| Accumulated knowledge | `docs/specialist-knowledge/{specialist}/*.md` | If exists |
+| Matched principles | `docs/principles/*.md` (matched by task keywords) | Yes |
+| Task description | From user/orchestrator | Yes |
+| Findings to address | From previous iteration | If iteration 2+ |
 
 ### Prompt Structure
 
 ```markdown
-{contents of specialist definition file}
+{Contents of specialist definition file}
 
 ## Principles
 
-{contents of each matched principle file}
+{Contents of each matched principle file}
 
 ## Accumulated Knowledge
 
-{contents of patterns.md, gotchas.md, integration.md if they exist}
+{Contents of patterns.md, gotchas.md, integration.md if they exist}
 
 ## Task
 
-{task description - VERBATIM from orchestrator}
+{Task description - VERBATIM from orchestrator}
 
 ## Findings to Address
 
-{findings - VERBATIM from orchestrator, or omit section if iteration 1}
+{Findings from code review - VERBATIM, or omit section if iteration 1}
 
 ## Your Responsibilities
 
 1. Implement the task (or fix the findings)
-2. Run all 7 verification layers
-3. Fix any failures before returning
-4. Write checkpoint to `{output_dir}/{specialist}.md`
-5. Update `{output_dir}/main.md` with Implementation Summary
+2. Run verification (cargo check, test, clippy)
+3. Create checkpoint at `{output_dir}/{specialist}.md`
+4. Update `{output_dir}/main.md` with Implementation Summary
 
 ## Required Output Format
 
@@ -87,56 +65,52 @@ STATUS: SUCCESS or FAILURE
 SUMMARY: Brief description of what was done
 FILES_MODIFIED: Comma-separated list of files changed
 TESTS_ADDED: Number of tests added (0 if none)
-VERIFICATION: PASSED or FAILED (did all 7 layers pass?)
+VERIFICATION: PASSED or FAILED (did verification pass?)
 ERROR: Error message if FAILURE, or "none" if SUCCESS
 ---END---
 ```
 
 ---
 
-## Parsing Specialist Response
+## Example Task Invocation
 
-The JSON output contains:
-
-```json
-{
-  "session_id": "uuid-for-resume",
-  "result": "specialist's full response including ---RESULT--- block",
-  "num_turns": 5,
-  "total_cost_usd": 0.15,
-  "is_error": false
-}
 ```
-
-**Extract status from result**:
-
-```bash
-result=$(echo "$json_output" | jq -r '.result')
-status=$(echo "$result" | grep "STATUS:" | awk '{print $2}')
-session_id=$(echo "$json_output" | jq -r '.session_id')
-
-if [ "$status" = "FAILURE" ]; then
-  # Report failure to orchestrator
-fi
+Task tool call:
+  description: "AC specialist: implement feature X"
+  subagent_type: "general-purpose"
+  prompt: "{assembled prompt from above}"
 ```
-
-**Important**: Do NOT trust `is_error` field - it's always `false`. Use the `STATUS:` line from the structured output block instead.
 
 ---
 
-## Session Management
+## Parsing Specialist Response
 
-**Capture session_id** after first invocation and log it to `main.md`:
+The Task tool returns:
+- The specialist's full response (including `---RESULT---` block)
+- An agent ID for resume capability
 
-```markdown
-## Session Tracking
+**Extract status**:
+- Look for `STATUS: SUCCESS` or `STATUS: FAILURE` in the response
+- If `FAILURE`, report error to user
 
-| Specialist | Session ID | Status |
-|------------|------------|--------|
-| auth-controller | 9e956e47-4f9a-436a-88ad-5c60c80827ce | iteration-1 |
+**Save agent ID**:
+- Record in `main.md` Loop State for potential resume
+
+---
+
+## Resuming Specialists
+
+To resume a specialist (for fixing findings or reflection):
+
+```
+Task tool call:
+  description: "Resume AC specialist: fix findings"
+  subagent_type: "general-purpose"
+  resume: "{agent_id}"
+  prompt: "{findings or reflection instructions}"
 ```
 
-**Resume for iterations**: Use `--resume "$session_id"` for iteration 2+ to preserve context and reduce costs (prompt caching gives ~100x cost reduction).
+The resumed specialist retains full context from previous invocation.
 
 ---
 
@@ -147,17 +121,13 @@ fi
 - Add implementation suggestions or design guidance
 - Specify function names, patterns, or architecture
 - Write code yourself - the specialist writes code
-- **Implement directly if specialist invocation fails** - return error to orchestrator instead
 
 **DO**:
 - Read and concatenate the files as specified
-- Pass task and findings exactly as received from orchestrator
-- Capture and log session_id for resume capability
+- Pass task and findings exactly as received
+- Record agent ID for resume capability
 - Parse the `---RESULT---` block for status
-- Verify checkpoint exists after specialist returns
-- **If invocation fails**: Return `status: failed` with error details. Do NOT fall back to implementing yourself.
-
-**Why no fallback implementation**: Step-runners have full tool access, so they *could* implement directly. But this bypasses specialist expertise, principles injection, and creates confusion about who did the work. Always return errors to orchestrator.
+- Report results to user for approval before proceeding
 
 ---
 
@@ -166,28 +136,5 @@ fi
 After specialist returns, verify:
 1. `STATUS: SUCCESS` in the `---RESULT---` block
 2. Checkpoint file exists at `{output_dir}/{specialist}.md`
-3. Checkpoint has "Prompt Received" section filled in (for audit trail)
 
-If checkpoint is missing or status is FAILURE, report failure to orchestrator.
-
----
-
-## Specialist Checkpoint Template
-
-Specialists should record what prompt they received. See `docs/dev-loop-outputs/_template/specialist.md` for the template with "Prompt Received" section.
-
----
-
-## JSON Output Reference
-
-Full JSON structure from `claude --print --output-format json`:
-
-| Field | Description | Use |
-|-------|-------------|-----|
-| `session_id` | UUID for session resume | Log to main.md, use with `--resume` |
-| `result` | Specialist's full response | Parse for `---RESULT---` block |
-| `num_turns` | Number of tool calls | Audit/debugging |
-| `total_cost_usd` | Cost of invocation | Cost tracking |
-| `duration_ms` | Wall-clock time | Performance monitoring |
-| `is_error` | Always false (unreliable) | Do NOT use for error detection |
-| `permission_denials` | Array of denied permissions | Check if non-empty = permission issue |
+If checkpoint is missing or status is FAILURE, report to user.
