@@ -28,6 +28,12 @@ chrono = { workspace = true }
 bcrypt = { workspace = true }
 jsonwebtoken = { workspace = true }
 
+# gRPC server for MC registration
+tonic = { workspace = true }
+
+# Cancellation tokens for graceful shutdown
+tokio-util = { workspace = true }
+
 # HTTP client for JWKS fetching and AC communication
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 

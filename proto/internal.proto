@@ -70,12 +70,14 @@ message ControllerCapacity {
 
 // Health status of a controller
 enum HealthStatus {
-  HEALTHY = 0;
-  DEGRADED = 1;
-  UNHEALTHY = 2;
+  PENDING = 0;    // Just registered, not yet verified
+  HEALTHY = 1;
+  DEGRADED = 2;
+  UNHEALTHY = 3;
+  DRAINING = 4;   // Graceful shutdown in progress
 }
 
-// Request to register a meeting controller with global controller
+// Request to register a meeting controller with global controller (legacy)
 message RegisterMeetingController {
   string controller_id = 1;
   string region = 2;
@@ -83,11 +85,44 @@ message RegisterMeetingController {
   ControllerCapacity capacity = 4;
 }
 
-// Heartbeat from meeting controller to global controller
+// Heartbeat from meeting controller to global controller (legacy)
 message Heartbeat {
   string controller_id = 1;
   ControllerCapacity capacity = 2;
   HealthStatus health = 3;
+}
+
+// MC registration request with both endpoints per ADR-0010
+message RegisterMCRequest {
+  string id = 1;                      // Unique controller ID
+  string region = 2;                  // Deployment region (e.g., "us-east-1")
+  string grpc_endpoint = 3;           // gRPC endpoint for GC→MC calls
+  string webtransport_endpoint = 4;   // WebTransport endpoint for clients
+  uint32 max_meetings = 5;            // Maximum concurrent meetings
+  uint32 max_participants = 6;        // Maximum total participants
+}
+
+message RegisterMCResponse {
+  bool accepted = 1;
+  string message = 2;
+  uint64 fast_heartbeat_interval_ms = 3;          // 10000ms
+  uint64 comprehensive_heartbeat_interval_ms = 4; // 30000ms
+}
+
+// Fast heartbeat (10s) - capacity only, minimal payload
+message FastHeartbeatRequest {
+  string controller_id = 1;
+  ControllerCapacity capacity = 2;
+  HealthStatus health = 3;
+}
+
+// Comprehensive heartbeat (30s) - full metrics
+message ComprehensiveHeartbeatRequest {
+  string controller_id = 1;
+  ControllerCapacity capacity = 2;
+  HealthStatus health = 3;
+  float cpu_usage_percent = 4;
+  float memory_usage_percent = 5;
 }
 
 // Meeting configuration
@@ -135,6 +170,13 @@ service MeetingControllerService {
   rpc RegisterController(RegisterMeetingController) returns (RegistrationResponse);
   rpc SendHeartbeat(Heartbeat) returns (HeartbeatResponse);
   rpc Assign(AssignMeeting) returns (AssignMeetingResponse);
+}
+
+// MC→GC service (MCs call this to register and heartbeat)
+service GlobalControllerService {
+  rpc RegisterMC(RegisterMCRequest) returns (RegisterMCResponse);
+  rpc FastHeartbeat(FastHeartbeatRequest) returns (HeartbeatResponse);
+  rpc ComprehensiveHeartbeat(ComprehensiveHeartbeatRequest) returns (HeartbeatResponse);
 }
 
 message RegistrationResponse {

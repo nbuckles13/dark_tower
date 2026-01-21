@@ -17,6 +17,12 @@ pub const MAX_JWT_CLOCK_SKEW_SECONDS: i64 = 600;
 /// Default rate limit in requests per minute.
 pub const DEFAULT_RATE_LIMIT_RPM: u32 = 100;
 
+/// Default gRPC bind address.
+pub const DEFAULT_GRPC_BIND_ADDRESS: &str = "0.0.0.0:50051";
+
+/// Default MC staleness threshold in seconds.
+pub const DEFAULT_MC_STALENESS_THRESHOLD_SECONDS: u64 = 30;
+
 /// Global Controller configuration.
 ///
 /// Loaded from environment variables with sensible defaults.
@@ -43,6 +49,13 @@ pub struct Config {
 
     /// Rate limit in requests per minute per client.
     pub rate_limit_rpm: u32,
+
+    /// gRPC server bind address (default: "0.0.0.0:50051").
+    pub grpc_bind_address: String,
+
+    /// MC staleness threshold in seconds (default: 30).
+    /// Controllers that haven't sent a heartbeat within this time are marked unhealthy.
+    pub mc_staleness_threshold_seconds: u64,
 }
 
 /// Custom Debug implementation that redacts sensitive fields.
@@ -56,6 +69,11 @@ impl fmt::Debug for Config {
             .field("ac_internal_url", &self.ac_internal_url)
             .field("jwt_clock_skew_seconds", &self.jwt_clock_skew_seconds)
             .field("rate_limit_rpm", &self.rate_limit_rpm)
+            .field("grpc_bind_address", &self.grpc_bind_address)
+            .field(
+                "mc_staleness_threshold_seconds",
+                &self.mc_staleness_threshold_seconds,
+            )
             .finish()
     }
 }
@@ -153,6 +171,22 @@ impl Config {
             DEFAULT_RATE_LIMIT_RPM
         };
 
+        // Parse gRPC bind address
+        let grpc_bind_address = vars
+            .get("GC_GRPC_BIND_ADDRESS")
+            .cloned()
+            .unwrap_or_else(|| DEFAULT_GRPC_BIND_ADDRESS.to_string());
+
+        // Parse MC staleness threshold
+        let mc_staleness_threshold_seconds =
+            if let Some(value_str) = vars.get("MC_STALENESS_THRESHOLD_SECONDS") {
+                value_str
+                    .parse()
+                    .unwrap_or(DEFAULT_MC_STALENESS_THRESHOLD_SECONDS)
+            } else {
+                DEFAULT_MC_STALENESS_THRESHOLD_SECONDS
+            };
+
         Ok(Config {
             database_url,
             bind_address,
@@ -161,6 +195,8 @@ impl Config {
             ac_internal_url,
             jwt_clock_skew_seconds,
             rate_limit_rpm,
+            grpc_bind_address,
+            mc_staleness_threshold_seconds,
         })
     }
 }
@@ -196,6 +232,11 @@ mod tests {
             DEFAULT_JWT_CLOCK_SKEW_SECONDS
         );
         assert_eq!(config.rate_limit_rpm, DEFAULT_RATE_LIMIT_RPM);
+        assert_eq!(config.grpc_bind_address, DEFAULT_GRPC_BIND_ADDRESS);
+        assert_eq!(
+            config.mc_staleness_threshold_seconds,
+            DEFAULT_MC_STALENESS_THRESHOLD_SECONDS
+        );
     }
 
     #[test]
@@ -213,6 +254,14 @@ mod tests {
         );
         vars.insert("JWT_CLOCK_SKEW_SECONDS".to_string(), "120".to_string());
         vars.insert("RATE_LIMIT_RPM".to_string(), "500".to_string());
+        vars.insert(
+            "GC_GRPC_BIND_ADDRESS".to_string(),
+            "127.0.0.1:50052".to_string(),
+        );
+        vars.insert(
+            "MC_STALENESS_THRESHOLD_SECONDS".to_string(),
+            "60".to_string(),
+        );
 
         let config = Config::from_vars(&vars).expect("Config should load successfully");
 
@@ -225,6 +274,8 @@ mod tests {
         assert_eq!(config.ac_internal_url, "https://auth.internal.example.com");
         assert_eq!(config.jwt_clock_skew_seconds, 120);
         assert_eq!(config.rate_limit_rpm, 500);
+        assert_eq!(config.grpc_bind_address, "127.0.0.1:50052");
+        assert_eq!(config.mc_staleness_threshold_seconds, 60);
     }
 
     #[test]

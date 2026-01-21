@@ -100,3 +100,66 @@ Meeting API endpoints:
 Join endpoint returns AC-issued meeting token for WebTransport connection. Guest endpoint allows unauthenticated access with captcha verification (placeholder). Settings endpoint allows host to toggle allow_guests, allow_external_participants, waiting_room_enabled.
 
 ---
+
+## Integration: gRPC Auth Layer for MC Communication
+**Added**: 2026-01-20
+**Related files**: `crates/global-controller/src/grpc/auth_layer.rs`, `crates/global-controller/src/grpc/mc_service.rs`
+
+MCs authenticate to GC gRPC endpoints using AC-issued JWT tokens:
+1. MC obtains service token from AC (Client Credentials flow)
+2. MC sends gRPC request with `authorization: Bearer <token>` metadata
+3. GC's `AuthLayer` extracts token, validates async via `JwksClient`
+4. Validated claims injected into request extensions
+5. gRPC handlers extract claims: `req.extensions().get::<Claims>()`
+
+The same `JwksClient` and validation logic used for HTTP auth is reused for gRPC. This ensures consistent security policy across transport protocols.
+
+---
+
+## Integration: MC Registration Flow
+**Added**: 2026-01-20
+**Related files**: `crates/global-controller/src/grpc/mc_service.rs`, `crates/global-controller/src/repositories/meeting_controllers.rs`
+
+MC registration with GC:
+1. MC calls `RegisterMc` RPC with: hostname, grpc_port, region, version, max_capacity
+2. GC validates input (character whitelist, length limits)
+3. GC upserts into `meeting_controllers` table (atomic insert-or-update)
+4. GC returns registration_id (UUID) for future reference
+
+On MC restart, re-registration updates existing row (matched by hostname). Health status set to `healthy` on registration. GC assigns MC to appropriate region pool for load balancing.
+
+---
+
+## Integration: Heartbeat Protocols
+**Added**: 2026-01-20
+**Related files**: `crates/global-controller/src/grpc/mc_service.rs`
+
+Two heartbeat types for MC health reporting:
+
+**FastHeartbeat** (10s interval):
+- Request: `mc_id`, `current_participants`, `max_capacity`
+- Updates: `last_heartbeat`, capacity fields
+- Use case: Load balancing needs fresh capacity data
+
+**ComprehensiveHeartbeat** (30s interval):
+- Request: All of fast heartbeat plus: `cpu_usage`, `memory_usage`, `bandwidth_usage`, `error_rate`, `latency_p50/p95/p99`
+- Updates: All fields including metrics
+- Use case: Observability dashboards, alerting
+
+Both maintain the `last_heartbeat` timestamp. Health checker marks MCs unhealthy if no heartbeat received within staleness threshold (default 60s).
+
+---
+
+## Integration: Health Checker Task
+**Added**: 2026-01-20
+**Related files**: `crates/global-controller/src/tasks/health_checker.rs`
+
+Background task marks stale MCs as unhealthy:
+- Runs every 5 seconds (configurable)
+- Queries: `UPDATE meeting_controllers SET health_status = 'unhealthy' WHERE last_heartbeat < NOW() - threshold`
+- Staleness threshold: 60 seconds default (configurable via `mc_staleness_threshold_seconds`)
+- Graceful shutdown via `CancellationToken`
+
+Other services querying healthy MCs should filter: `WHERE health_status = 'healthy'`. The health checker is the single source of truth for MC health transitions.
+
+---
