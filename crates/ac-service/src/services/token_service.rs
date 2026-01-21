@@ -373,20 +373,7 @@ mod tests {
     #[sqlx::test(migrations = "../../migrations")]
     #[cfg_attr(coverage, ignore)]
     async fn test_timing_attack_prevention_invalid_client_id(pool: PgPool) -> Result<(), AcError> {
-        use std::time::Duration;
-
         const ITERATIONS: usize = 5;
-
-        // Helper to compute median of durations
-        fn median(times: &mut [Duration]) -> Duration {
-            times.sort();
-            let mid = times.len() / 2;
-            if times.len().is_multiple_of(2) {
-                (times[mid - 1] + times[mid]) / 2
-            } else {
-                times[mid]
-            }
-        }
 
         // Setup: Create master key (32 bytes for AES-256-GCM) and signing key
         let master_key = crypto::generate_random_bytes(32)?;
@@ -474,12 +461,13 @@ mod tests {
             invalid_times.push(start.elapsed());
         }
 
-        // Compare medians (more robust than mean against outliers)
-        let valid_median = median(&mut valid_times);
-        let invalid_median = median(&mut invalid_times);
+        // Compare minimum times - CI noise only makes things slower, not faster,
+        // so the fastest times represent the true operation time without resource contention.
+        let valid_min = valid_times.iter().min().copied().unwrap();
+        let invalid_min = invalid_times.iter().min().copied().unwrap();
 
-        let time_diff = valid_median.abs_diff(invalid_median);
-        let max_time = valid_median.max(invalid_median);
+        let time_diff = valid_min.abs_diff(invalid_min);
+        let max_time = valid_min.max(invalid_min);
         let diff_percentage = (time_diff.as_millis() as f64 / max_time.as_millis() as f64) * 100.0;
 
         // Timing difference should be less than 30% of the longer operation
@@ -489,16 +477,16 @@ mod tests {
         assert!(
             diff_percentage < MAX_TIMING_VARIANCE_PERCENT,
             "Timing difference too large: {}ms ({:.1}% of {}ms) - potential timing attack vulnerability.\n  \
-             Valid client median: {:?}\n  \
-             Invalid client median: {:?}\n  \
+             Valid client min: {:?}\n  \
+             Invalid client min: {:?}\n  \
              Max allowed variance: {:.1}%\n  \
              All valid times: {:?}\n  \
              All invalid times: {:?}",
             time_diff.as_millis(),
             diff_percentage,
             max_time.as_millis(),
-            valid_median,
-            invalid_median,
+            valid_min,
+            invalid_min,
             MAX_TIMING_VARIANCE_PERCENT,
             valid_times,
             invalid_times
