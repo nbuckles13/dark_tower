@@ -97,3 +97,90 @@ To test cache expiration behavior, create JwksClient with very short TTL (1ms) a
 When testing HTTP client response handling, test ALL status code branches: success (200), client errors (400, 401, 403, 404), server errors (500, 502), and unexpected codes (418). Use wiremock to return each status and verify error mapping. This ensures full branch coverage of `handle_response()` logic.
 
 ---
+
+## Pattern: Tower Layer for Async gRPC Auth
+**Added**: 2026-01-20
+**Related files**: `crates/global-controller/src/grpc/auth_layer.rs`
+
+Use Tower's `Layer` + `Service` traits for async JWT validation on gRPC endpoints instead of tonic's sync interceptor. This pattern:
+1. Define `AuthLayer` holding `Arc<JwksClient>` and `Arc<GcConfig>`
+2. Define `AuthService<S>` wrapping inner service with auth state
+3. Implement `Service<Request<Body>>` with async `call()` that validates JWT
+4. Use `PendingTokenValidation` struct to hold state between poll phases
+5. Extract Bearer token from `authorization` metadata, validate async, then forward
+
+Benefits: async JWKS fetching, shared cache across requests, proper backpressure via Tower semantics. Tonic interceptors are sync-only and can't await.
+
+---
+
+## Pattern: UPSERT for Service Registration
+**Added**: 2026-01-20
+**Related files**: `crates/global-controller/src/repositories/meeting_controllers.rs`
+
+Use UPSERT (INSERT ON CONFLICT UPDATE) for MC registration instead of separate check-then-insert:
+```sql
+INSERT INTO meeting_controllers (...)
+VALUES ($1, ...)
+ON CONFLICT (hostname) DO UPDATE SET
+    grpc_port = EXCLUDED.grpc_port,
+    last_heartbeat = NOW(),
+    health_status = 'healthy'
+RETURNING id
+```
+Benefits: atomic operation, handles MC restarts cleanly (re-registration updates existing row), eliminates race conditions, returns ID for both insert and update cases.
+
+---
+
+## Pattern: Dual Heartbeat Design (Fast vs Comprehensive)
+**Added**: 2026-01-20
+**Related files**: `crates/global-controller/src/grpc/mc_service.rs`
+
+Implement two heartbeat types for service health monitoring:
+- **Fast heartbeat** (10s interval): Lightweight, sends only capacity (current/max participants). Used for load balancing decisions.
+- **Comprehensive heartbeat** (30s interval): Full metrics (CPU, memory, bandwidth, error rates, latency percentiles). Used for observability and alerting.
+
+Both update `last_heartbeat` timestamp. This design reduces network overhead while maintaining fresh capacity data for routing and detailed metrics for monitoring.
+
+---
+
+## Pattern: Background Health Checker with CancellationToken
+**Added**: 2026-01-20
+**Related files**: `crates/global-controller/src/tasks/health_checker.rs`, `crates/global-controller/src/main.rs`
+
+Decouple health checking from heartbeat processing using a background task:
+1. Spawn `tokio::spawn(run_health_checker(pool, config, cancel_token.clone()))`
+2. Task loops: sleep interval, mark stale MCs unhealthy, check cancellation
+3. Use `tokio::select!` to race sleep vs cancellation for responsive shutdown
+4. Staleness threshold (e.g., 60s) is configurable in GcConfig
+
+Benefits: health checking runs even if heartbeats stop arriving, single point of staleness logic, graceful shutdown via CancellationToken.
+
+---
+
+## Pattern: Dual Server Graceful Shutdown
+**Added**: 2026-01-20
+**Related files**: `crates/global-controller/src/main.rs`
+
+Running HTTP (axum) + gRPC (tonic) servers requires coordinated shutdown:
+1. Create `CancellationToken` from `tokio_util::sync`
+2. Wrap each server in `tokio::select!` racing with `cancel_token.cancelled()`
+3. Use `tokio::select!` at top level to await first completion
+4. When any server exits, `cancel_token.cancel()` triggers others
+5. Background tasks (health checker) also check the token
+
+This ensures all components shut down cleanly on SIGTERM or server error.
+
+---
+
+## Pattern: Input Validation with Character Whitelist
+**Added**: 2026-01-20
+**Related files**: `crates/global-controller/src/grpc/mc_service.rs`
+
+Validate gRPC request fields using whitelist characters to prevent injection:
+- Hostname: `c.is_ascii_alphanumeric() || c == '-' || c == '.'` (DNS-safe)
+- Region: alphanumeric only
+- Version: alphanumeric, dot, dash (semver-safe)
+
+Combine with length limits. Return generic validation error without echoing bad input. This prevents log injection and downstream parsing issues.
+
+---

@@ -2,22 +2,42 @@
 //!
 //! Entry point for the Dark Tower video conferencing platform.
 //! Handles global routing, meeting discovery, and load balancing.
+//!
+//! # Servers
+//!
+//! The Global Controller runs two servers:
+//! - HTTP/REST API server for client requests (default: 0.0.0.0:8080)
+//! - gRPC server for MC registration and heartbeat (default: 0.0.0.0:50051)
+//!
+//! # Background Tasks
+//!
+//! - Health checker: Monitors MC heartbeats and marks stale controllers unhealthy
 
 mod auth;
 mod config;
 mod errors;
+mod grpc;
 mod handlers;
 mod middleware;
 mod models;
+mod repositories;
 mod routes;
 mod services;
+mod tasks;
 
+use auth::{JwksClient, JwtValidator};
 use config::Config;
+use grpc::auth_layer::async_auth::GrpcAuthLayer;
+use grpc::McService;
+use proto_gen::internal::global_controller_service_server::GlobalControllerServiceServer;
 use routes::AppState;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
+use tasks::start_health_checker;
 use tokio::signal;
+use tokio_util::sync::CancellationToken;
+use tonic::transport::Server as TonicServer;
 use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -43,7 +63,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!(
         region = %config.region,
         bind_address = %config.bind_address,
+        grpc_bind_address = %config.grpc_bind_address,
         jwt_clock_skew_seconds = config.jwt_clock_skew_seconds,
+        mc_staleness_threshold_seconds = config.mc_staleness_threshold_seconds,
         "Configuration loaded successfully"
     );
 
@@ -65,34 +87,97 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Database connection established");
 
-    // Parse bind address before moving config
-    let bind_address = config.bind_address.clone();
+    // Parse bind addresses before moving config
+    let http_bind_address = config.bind_address.clone();
+    let grpc_bind_address = config.grpc_bind_address.clone();
+    let mc_staleness_threshold = config.mc_staleness_threshold_seconds;
 
     // Create application state
     let state = Arc::new(AppState {
-        pool: db_pool,
+        pool: db_pool.clone(),
         config,
     });
 
-    // Build application routes
-    let app = routes::build_routes(state);
+    // Create JWT validator for gRPC auth
+    let jwks_client = Arc::new(JwksClient::new(state.config.ac_jwks_url.clone()));
+    let jwt_validator = Arc::new(JwtValidator::new(
+        jwks_client,
+        state.config.jwt_clock_skew_seconds,
+    ));
 
-    // Parse bind address
-    let addr: SocketAddr = bind_address.parse().map_err(|e| {
-        error!("Invalid bind address: {}", e);
+    // Build HTTP application routes
+    let http_app = routes::build_routes(state.clone());
+
+    // Create gRPC service with auth layer
+    let mc_service = McService::new(state.clone());
+    let grpc_auth_layer = GrpcAuthLayer::new(jwt_validator);
+
+    // Create cancellation token for graceful shutdown
+    let cancel_token = CancellationToken::new();
+
+    // Start health checker background task
+    let health_checker_pool = db_pool.clone();
+    let health_checker_token = cancel_token.clone();
+    let health_checker_handle = tokio::spawn(async move {
+        start_health_checker(
+            health_checker_pool,
+            mc_staleness_threshold,
+            health_checker_token,
+        )
+        .await;
+    });
+
+    // Parse HTTP bind address
+    let http_addr: SocketAddr = http_bind_address.parse().map_err(|e| {
+        error!("Invalid HTTP bind address: {}", e);
         e
     })?;
 
-    info!("Global Controller listening on {}", addr);
+    // Parse gRPC bind address
+    let grpc_addr: SocketAddr = grpc_bind_address.parse().map_err(|e| {
+        error!("Invalid gRPC bind address: {}", e);
+        e
+    })?;
 
-    // Start server with graceful shutdown support
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown(shutdown_signal())
-    .await?;
+    info!("Global Controller HTTP server listening on {}", http_addr);
+    info!("Global Controller gRPC server listening on {}", grpc_addr);
+
+    // Start HTTP server
+    let http_listener = tokio::net::TcpListener::bind(http_addr).await?;
+    let http_server = axum::serve(
+        http_listener,
+        http_app.into_make_service_with_connect_info::<SocketAddr>(),
+    );
+
+    // Start gRPC server with auth layer
+    let grpc_server = TonicServer::builder()
+        .layer(grpc_auth_layer)
+        .add_service(GlobalControllerServiceServer::new(mc_service))
+        .serve(grpc_addr);
+
+    // Run both servers concurrently with graceful shutdown
+    let cancel_for_shutdown = cancel_token.clone();
+    tokio::select! {
+        result = http_server.with_graceful_shutdown(shutdown_signal(cancel_for_shutdown.clone())) => {
+            if let Err(e) = result {
+                error!("HTTP server error: {}", e);
+            }
+        }
+        result = grpc_server => {
+            if let Err(e) = result {
+                error!("gRPC server error: {}", e);
+            }
+        }
+    }
+
+    // Cancel background tasks
+    cancel_token.cancel();
+
+    // Wait for health checker to finish
+    info!("Waiting for background tasks to complete...");
+    if let Err(e) = health_checker_handle.await {
+        error!("Health checker task error: {}", e);
+    }
 
     info!("Global Controller shutdown complete");
 
@@ -101,7 +186,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Listens for shutdown signals (SIGTERM, SIGINT).
 /// Returns when a shutdown signal is received and drain period is complete.
-async fn shutdown_signal() {
+/// Also triggers the cancellation token for coordinated shutdown.
+async fn shutdown_signal(cancel_token: CancellationToken) {
     let ctrl_c = async {
         match signal::ctrl_c().await {
             Ok(()) => info!("Received SIGINT, starting graceful shutdown..."),
@@ -130,6 +216,9 @@ async fn shutdown_signal() {
         _ = ctrl_c => {}
         _ = terminate => {}
     }
+
+    // Trigger cancellation for all tasks
+    cancel_token.cancel();
 
     // Graceful shutdown drain period
     let drain_secs: u64 = std::env::var("GC_DRAIN_SECONDS")

@@ -23,6 +23,105 @@ BOLD='\033[1m'
 NC='\033[0m' # No Color
 
 # =============================================================================
+# Changed File Detection
+# =============================================================================
+
+# Get files modified compared to HEAD (tracked files only)
+# Usage: get_modified_files [path] [extension]
+# Example: get_modified_files . ".rs"
+get_modified_files() {
+    local path="${1:-.}"
+    local ext="${2:-}"
+
+    local files
+    files=$(git diff --name-only HEAD -- "$path" 2>/dev/null || true)
+
+    if [[ -n "$ext" ]]; then
+        echo "$files" | grep "${ext}$" || true
+    else
+        echo "$files"
+    fi
+}
+
+# Get untracked files (new files not yet added to git)
+# Usage: get_untracked_files [path] [extension]
+# Example: get_untracked_files . ".rs"
+get_untracked_files() {
+    local path="${1:-.}"
+    local ext="${2:-}"
+
+    local files
+    files=$(git ls-files --others --exclude-standard -- "$path" 2>/dev/null || true)
+
+    if [[ -n "$ext" ]]; then
+        echo "$files" | grep "${ext}$" || true
+    else
+        echo "$files"
+    fi
+}
+
+# Get files added compared to HEAD (new tracked files)
+# Usage: get_added_files [path] [extension]
+get_added_files() {
+    local path="${1:-.}"
+    local ext="${2:-}"
+
+    local files
+    files=$(git diff --name-only --diff-filter=A HEAD -- "$path" 2>/dev/null || true)
+
+    if [[ -n "$ext" ]]; then
+        echo "$files" | grep "${ext}$" || true
+    else
+        echo "$files"
+    fi
+}
+
+# Get files deleted compared to HEAD
+# Usage: get_deleted_files [path] [extension]
+get_deleted_files() {
+    local path="${1:-.}"
+    local ext="${2:-}"
+
+    local files
+    files=$(git diff --name-only --diff-filter=D HEAD -- "$path" 2>/dev/null || true)
+
+    if [[ -n "$ext" ]]; then
+        echo "$files" | grep "${ext}$" || true
+    else
+        echo "$files"
+    fi
+}
+
+# Get all changed files (modified + untracked, deduplicated)
+# This is the most common use case for guards
+# Usage: get_all_changed_files [path] [extension]
+# Example: get_all_changed_files . ".rs"
+get_all_changed_files() {
+    local path="${1:-.}"
+    local ext="${2:-}"
+
+    local modified untracked
+    modified=$(get_modified_files "$path" "$ext")
+    untracked=$(get_untracked_files "$path" "$ext")
+
+    # Combine and deduplicate, filter empty lines
+    echo -e "${modified}\n${untracked}" | grep -v '^$' | sort -u || true
+}
+
+# Check if there are any changed files
+# Usage: has_changed_files [path] [extension]
+# Returns 0 if there are changes, 1 if not
+has_changed_files() {
+    local path="${1:-.}"
+    local ext="${2:-}"
+
+    local changed
+    changed=$(get_all_changed_files "$path" "$ext")
+
+    [[ -n "$changed" ]]
+}
+
+# =============================================================================
 # Test Code Detection
 # =============================================================================
 

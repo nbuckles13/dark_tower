@@ -89,3 +89,52 @@ Guest token endpoint has TODO placeholder for captcha validation. Currently acce
 The `extract_kid()` function returns `None` (not an error) when the JWT header contains a `kid` that is not a JSON string - including numeric values, null, or empty strings. This is by design: attackers may send malformed headers to probe error handling. Always handle `None` as "key not found" and return generic error message.
 
 ---
+
+## Gotcha: PendingTokenValidation Debug Can Expose Tokens
+**Added**: 2026-01-20
+**Related files**: `crates/global-controller/src/grpc/auth_layer.rs`
+
+Deriving `Debug` on structs holding tokens exposes them in logs/panics. The `PendingTokenValidation` struct holds the raw Bearer token during async validation. Either:
+1. Use custom `Debug` impl that redacts the token field
+2. Wrap token in `SecretString` from `secrecy` crate
+3. Mark field with `#[debug(skip)]` if using `derivative` crate
+
+Current implementation uses derived Debug - this is a [LOW] finding to address.
+
+---
+
+## Gotcha: Capacity Overflow Silently Clamps to i32::MAX
+**Added**: 2026-01-20
+**Related files**: `crates/global-controller/src/grpc/mc_service.rs`
+
+When converting MC capacity from u32 (proto) to i32 (database), values > i32::MAX are clamped:
+```rust
+let capacity: i32 = request.max_capacity.min(i32::MAX as u32) as i32;
+```
+This is intentional (MC can't have 2B+ capacity), but consider logging a warning when clamping occurs. Current implementation silently clamps - unexpected behavior if MC misconfigures capacity.
+
+---
+
+## Gotcha: Runtime vs Compile-Time SQL Query Tradeoff
+**Added**: 2026-01-20
+**Related files**: `crates/global-controller/src/repositories/meeting_controllers.rs`
+
+The MC registration uses runtime queries (`sqlx::query()`) instead of compile-time macros (`sqlx::query!()`). Tradeoffs:
+- **Runtime**: More flexible, no sqlx prepare step needed, but SQL errors only caught at runtime
+- **Compile-time**: Catches SQL errors at build, but requires DB connection for `cargo check`
+
+Current choice (runtime) was pragmatic for initial implementation. Consider migrating to compile-time queries for stronger guarantees once schema stabilizes.
+
+---
+
+## Gotcha: Timestamp Casts Use `as` Instead of `try_into()`
+**Added**: 2026-01-20
+**Related files**: `crates/global-controller/src/grpc/mc_service.rs`
+
+Proto timestamps are i64, but some DB/API contexts use i32 or other types. Using `as` for casting:
+```rust
+let timestamp = chrono::Utc::now().timestamp() as i64;
+```
+This works for timestamps (always positive, fits i64), but `try_into()` is safer for untrusted input. For internal timestamps `as` is acceptable; for MC-provided timestamps consider validation.
+
+---

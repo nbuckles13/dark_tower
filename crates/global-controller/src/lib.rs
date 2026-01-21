@@ -30,8 +30,11 @@
 pub mod auth;
 pub mod config;
 pub mod errors;
+pub mod grpc;
 pub mod handlers;
 pub mod middleware;
 pub mod models;
+pub mod repositories;
 pub mod routes;
 pub mod services;
+pub mod tasks;

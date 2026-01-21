@@ -3,19 +3,17 @@
 # Simple Guard: Test Coverage
 #
 # Two modes:
-#   1. Pre-commit (default): Quick check - warns if new production code
-#      lacks corresponding test additions
-#   2. CI (--full): Runs cargo llvm-cov and checks coverage thresholds
+#   1. Quick check (default): Warns if new production code lacks corresponding tests
+#   2. Full (--full): Runs cargo llvm-cov and checks coverage thresholds
 #
 # Exit codes:
-#   0 - Coverage adequate (or warnings only in pre-commit mode)
-#   1 - Coverage below threshold (CI mode only)
+#   0 - Coverage adequate (or warnings only in quick mode)
+#   1 - Coverage below threshold (full mode only)
 #   2 - Script error
 #
 # Usage:
-#   ./test-coverage.sh              # Quick pre-commit check
-#   ./test-coverage.sh --full       # Full coverage analysis (CI)
-#   ./test-coverage.sh [path]       # Skip (not applicable for path scans)
+#   ./test-coverage.sh [path]        # Quick check for new code without tests (default: .)
+#   ./test-coverage.sh --full        # Full coverage analysis (CI)
 #
 # Thresholds (from docs/principles/testing.md):
 #   - 100% for crypto code
@@ -31,15 +29,15 @@ source "$SCRIPT_DIR/../common.sh"
 
 # Parse arguments
 FULL_MODE=false
+SEARCH_PATH="."
+
 for arg in "$@"; do
     case $arg in
         --full)
             FULL_MODE=true
             ;;
         *)
-            # If any non-flag argument (path), skip this guard
-            echo "Skipping test-coverage guard (only runs on staged changes, not path scans)"
-            exit 0
+            SEARCH_PATH="$arg"
             ;;
     esac
 done
@@ -49,25 +47,34 @@ init_violations
 start_timer
 
 # -----------------------------------------------------------------------------
-# Pre-commit Mode: Quick heuristic check
+# Quick Mode: Heuristic check for new code without tests
 # -----------------------------------------------------------------------------
 if [[ "$FULL_MODE" == false ]]; then
-    print_header "Guard: Test Coverage (Quick Check)"
+    print_header "Guard: Test Coverage (Quick Check)
+Path: $SEARCH_PATH
 
-    # Get staged production code files (excluding tests)
-    NEW_PROD_FILES=$(git diff --cached --name-only --diff-filter=A 2>/dev/null | \
-        grep '\.rs$' | \
+Checks if new production code has corresponding tests."
+
+    # Get new Rust files (added + untracked) using common helpers
+    ADDED_FILES=$(get_added_files "$SEARCH_PATH" ".rs")
+    UNTRACKED_FILES=$(get_untracked_files "$SEARCH_PATH" ".rs")
+
+    # Combine both lists
+    ALL_NEW_FILES=$(echo -e "${ADDED_FILES}\n${UNTRACKED_FILES}" | grep -v '^$' | sort -u || true)
+
+    # Filter to production code (exclude tests)
+    NEW_PROD_FILES=$(echo "$ALL_NEW_FILES" | \
         grep -v '_test\.rs$' | \
         grep -v '/tests/' | \
         grep -v 'test_' | \
         grep -v '/fuzz/' || true)
 
-    NEW_TEST_FILES=$(git diff --cached --name-only --diff-filter=A 2>/dev/null | \
-        grep '\.rs$' | \
+    # Filter to test files
+    NEW_TEST_FILES=$(echo "$ALL_NEW_FILES" | \
         grep -E '(_test\.rs$|/tests/|test_|/fuzz/)' || true)
 
     if [[ -z "$NEW_PROD_FILES" ]]; then
-        echo -e "${GREEN}No new production code files in staged changes${NC}"
+        echo -e "${GREEN}No new production code files found${NC}"
         print_elapsed_time
         exit 0
     fi
@@ -78,6 +85,9 @@ if [[ "$FULL_MODE" == false ]]; then
     print_section "New production code without test additions"
 
     for prod_file in $NEW_PROD_FILES; do
+        # Skip if file doesn't exist
+        [[ ! -f "$prod_file" ]] && continue
+
         # Check if there's a corresponding test file added
         base_name=$(basename "$prod_file" .rs)
         dir_name=$(dirname "$prod_file")
@@ -95,8 +105,8 @@ if [[ "$FULL_MODE" == false ]]; then
             has_test=true
         fi
 
-        # Check if file itself has #[cfg(test)] module (added in same commit)
-        if git show :"$prod_file" 2>/dev/null | grep -q '#\[cfg(test)\]'; then
+        # Check if file itself has #[cfg(test)] module
+        if grep -q '#\[cfg(test)\]' "$prod_file" 2>/dev/null; then
             has_test=true
         fi
 
@@ -123,18 +133,18 @@ if [[ "$FULL_MODE" == false ]]; then
         echo "Consider adding tests for new production code."
         echo "This is a reminder, not a blocker."
         echo ""
-        echo "For full coverage analysis, run in CI with --full flag."
+        echo "For full coverage analysis, run with --full flag."
         echo "────────────────────────────────────────────────────────────────"
     else
         echo -e "${GREEN}Coverage check passed${NC}"
     fi
 
-    # Pre-commit mode always exits 0 (warning only)
+    # Quick mode always exits 0 (warning only)
     exit 0
 fi
 
 # -----------------------------------------------------------------------------
-# CI Mode: Full coverage analysis
+# Full Mode: Full coverage analysis
 # -----------------------------------------------------------------------------
 print_header "Guard: Test Coverage (Full Analysis)"
 

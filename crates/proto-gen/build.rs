@@ -1,8 +1,8 @@
-// Build script to compile Protocol Buffer definitions
+// Build script to compile Protocol Buffer definitions with gRPC service traits
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Compile protobuf files
-    prost_build::Config::new()
+    // Compile protobuf files with tonic for gRPC service generation
+    tonic_build::configure()
         .out_dir("src/generated")
         .compile_protos(
             &["../../proto/signaling.proto", "../../proto/internal.proto"],

@@ -30,7 +30,10 @@ set -euo pipefail
 # Script directory
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Colors
+# Source common library for helper functions
+source "$SCRIPT_DIR/common.sh"
+
+# Colors (already defined in common.sh, but keep for standalone use)
 RED='\033[0;31m'
 YELLOW='\033[1;33m'
 GREEN='\033[0;32m'
@@ -160,35 +163,49 @@ if $RUN_SEMANTIC; then
 
     SEMANTIC_GUARDS_DIR="$SCRIPT_DIR/semantic"
     if [[ -d "$SEMANTIC_GUARDS_DIR" ]]; then
-        # Find Rust files in the search path
-        # For semantic guards, we analyze individual files
-        while IFS= read -r -d '' rust_file; do
-            for guard in "$SEMANTIC_GUARDS_DIR"/*.sh; do
-                if [[ -x "$guard" ]]; then
-                    GUARD_NAME=$(basename "$guard" .sh)
-                    ((TOTAL_GUARDS++)) || true
+        # Get changed Rust files using common helper
+        CHANGED_RS_FILES=$(get_all_changed_files "$SEARCH_PATH" ".rs")
 
-                    echo -e "${BLUE}Analyzing:${NC} $rust_file with $GUARD_NAME"
+        if [[ -z "$CHANGED_RS_FILES" ]]; then
+            echo -e "${GREEN}No changed Rust files to analyze${NC}"
+            echo ""
+        else
+            FILE_COUNT=$(echo "$CHANGED_RS_FILES" | wc -l)
+            echo "Found $FILE_COUNT changed Rust file(s)"
+            echo ""
 
-                    if "$guard" "$rust_file"; then
-                        echo -e "${GREEN}PASSED${NC}"
-                        ((PASSED_GUARDS++)) || true
-                    else
-                        EXIT_CODE=$?
-                        if [[ $EXIT_CODE -eq 2 ]]; then
-                            echo -e "${YELLOW}UNCLEAR${NC} - Manual review recommended"
-                            # Count unclear as passed but note it
+            # Analyze each changed file with each semantic guard
+            for rust_file in $CHANGED_RS_FILES; do
+                # Skip if file doesn't exist (was deleted)
+                [[ ! -f "$rust_file" ]] && continue
+
+                for guard in "$SEMANTIC_GUARDS_DIR"/*.sh; do
+                    if [[ -x "$guard" ]]; then
+                        GUARD_NAME=$(basename "$guard" .sh)
+                        ((TOTAL_GUARDS++)) || true
+
+                        echo -e "${BLUE}Analyzing:${NC} $rust_file with $GUARD_NAME"
+
+                        if "$guard" "$rust_file"; then
+                            echo -e "${GREEN}PASSED${NC}"
                             ((PASSED_GUARDS++)) || true
                         else
-                            echo -e "${RED}FAILED${NC}"
-                            ((FAILED_GUARDS++)) || true
-                            FAILED_GUARD_NAMES+=("$GUARD_NAME:$rust_file")
+                            EXIT_CODE=$?
+                            if [[ $EXIT_CODE -eq 2 ]]; then
+                                echo -e "${YELLOW}UNCLEAR${NC} - Manual review recommended"
+                                # Count unclear as passed but note it
+                                ((PASSED_GUARDS++)) || true
+                            else
+                                echo -e "${RED}FAILED${NC}"
+                                ((FAILED_GUARDS++)) || true
+                                FAILED_GUARD_NAMES+=("$GUARD_NAME:$rust_file")
+                            fi
                         fi
+                        echo ""
                     fi
-                    echo ""
-                fi
+                done
             done
-        done < <(find "$SEARCH_PATH" -name "*.rs" -type f -print0 2>/dev/null)
+        fi
     else
         echo "No semantic guards found in $SEMANTIC_GUARDS_DIR"
     fi
