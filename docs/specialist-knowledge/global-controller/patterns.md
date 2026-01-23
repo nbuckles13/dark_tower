@@ -184,3 +184,24 @@ Validate gRPC request fields using whitelist characters to prevent injection:
 Combine with length limits. Return generic validation error without echoing bad input. This prevents log injection and downstream parsing issues.
 
 ---
+
+## Pattern: INSERT ON CONFLICT for Atomic Assignment
+**Added**: 2026-01-21
+**Related files**: `crates/global-controller/src/repositories/meeting_assignments.rs`
+
+Use INSERT ON CONFLICT DO UPDATE for atomic meeting-to-MC assignment instead of CTEs with separate SELECT and INSERT:
+```sql
+INSERT INTO meeting_mc_assignments (meeting_id, mc_id, assigned_at)
+SELECT $1, mc.id, NOW()
+FROM meeting_controllers mc
+WHERE mc.health_status = 'healthy'
+ORDER BY RANDOM() * weight DESC
+LIMIT 1
+ON CONFLICT (meeting_id) DO UPDATE SET
+    mc_id = EXCLUDED.mc_id,
+    assigned_at = NOW()
+RETURNING mc_id
+```
+Benefits: Single atomic operation, avoids CTE snapshot isolation issues where separate CTEs don't see each other's modifications, handles re-assignment cleanly.
+
+---

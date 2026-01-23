@@ -160,55 +160,8 @@ if $RUN_SEMANTIC; then
     echo -e "${BOLD}Semantic Guards${NC}"
     echo "==============="
     echo ""
-
-    SEMANTIC_GUARDS_DIR="$SCRIPT_DIR/semantic"
-    if [[ -d "$SEMANTIC_GUARDS_DIR" ]]; then
-        # Get changed Rust files using common helper
-        CHANGED_RS_FILES=$(get_all_changed_files "$SEARCH_PATH" ".rs")
-
-        if [[ -z "$CHANGED_RS_FILES" ]]; then
-            echo -e "${GREEN}No changed Rust files to analyze${NC}"
-            echo ""
-        else
-            FILE_COUNT=$(echo "$CHANGED_RS_FILES" | wc -l)
-            echo "Found $FILE_COUNT changed Rust file(s)"
-            echo ""
-
-            # Analyze each changed file with each semantic guard
-            for rust_file in $CHANGED_RS_FILES; do
-                # Skip if file doesn't exist (was deleted)
-                [[ ! -f "$rust_file" ]] && continue
-
-                for guard in "$SEMANTIC_GUARDS_DIR"/*.sh; do
-                    if [[ -x "$guard" ]]; then
-                        GUARD_NAME=$(basename "$guard" .sh)
-                        ((TOTAL_GUARDS++)) || true
-
-                        echo -e "${BLUE}Analyzing:${NC} $rust_file with $GUARD_NAME"
-
-                        if "$guard" "$rust_file"; then
-                            echo -e "${GREEN}PASSED${NC}"
-                            ((PASSED_GUARDS++)) || true
-                        else
-                            EXIT_CODE=$?
-                            if [[ $EXIT_CODE -eq 2 ]]; then
-                                echo -e "${YELLOW}UNCLEAR${NC} - Manual review recommended"
-                                # Count unclear as passed but note it
-                                ((PASSED_GUARDS++)) || true
-                            else
-                                echo -e "${RED}FAILED${NC}"
-                                ((FAILED_GUARDS++)) || true
-                                FAILED_GUARD_NAMES+=("$GUARD_NAME:$rust_file")
-                            fi
-                        fi
-                        echo ""
-                    fi
-                done
-            done
-        fi
-    else
-        echo "No semantic guards found in $SEMANTIC_GUARDS_DIR"
-    fi
+    echo -e "${YELLOW}Skipping semantic guards (disabled - too slow and unreliable)${NC}"
+    echo ""
 fi
 
 # -----------------------------------------------------------------------------

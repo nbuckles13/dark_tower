@@ -238,6 +238,58 @@ This allows tests to run even during phased rollouts where not all services are 
 
 ---
 
+## Pattern: Concurrent Race Condition Testing with Barrier
+**Added**: 2026-01-21
+**Related files**: `crates/global-controller/tests/meeting_assignment_tests.rs`
+
+For testing atomic operations under concurrent load, use `tokio::sync::Barrier` to synchronize multiple tasks before they all attempt the same operation:
+
+```rust
+use std::sync::Arc;
+use tokio::sync::Barrier;
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn test_concurrent_race_condition(pool: PgPool) -> Result<(), anyhow::Error> {
+    let pool = Arc::new(pool);
+    let num_concurrent = 10;
+    let barrier = Arc::new(Barrier::new(num_concurrent));
+
+    let handles: Vec<_> = (0..num_concurrent)
+        .map(|i| {
+            let pool = Arc::clone(&pool);
+            let barrier = Arc::clone(&barrier);
+            tokio::spawn(async move {
+                // Wait for all tasks to be ready
+                barrier.wait().await;
+                // All tasks now proceed simultaneously
+                some_atomic_operation(&pool, &format!("caller-{}", i)).await
+            })
+        })
+        .collect();
+
+    let results: Vec<_> = futures::future::join_all(handles)
+        .await
+        .into_iter()
+        .map(|r| r.expect("task should not panic"))
+        .collect();
+
+    // Assert all succeeded AND returned consistent results
+    let unique_results: HashSet<_> = results.iter().collect();
+    assert_eq!(unique_results.len(), 1, "Atomic operation should be consistent");
+}
+```
+
+Key elements:
+- `Barrier::new(N)` ensures N tasks synchronize before proceeding
+- `Arc` wrapping for pool and barrier to share across tasks
+- Verify ALL concurrent attempts succeed (not just some)
+- Verify ALL return the same result (consistency check)
+- Verify database state matches expectations (e.g., only one row created)
+
+This pattern is essential for validating atomic CTEs, distributed locks, and idempotent operations.
+
+---
+
 ## Pattern: Error Body Sanitization in Test Clients
 **Added**: 2026-01-18
 **Related files**: `crates/env-tests/src/fixtures/gc_client.rs`

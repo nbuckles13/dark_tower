@@ -153,6 +153,27 @@ pub struct JoinMeetingResponse {
 
     /// Meeting display name.
     pub meeting_name: String,
+
+    /// Assigned meeting controller information.
+    pub mc_assignment: McAssignmentInfo,
+}
+
+/// Meeting controller assignment information.
+///
+/// Returned as part of the join meeting response to direct the client
+/// to the assigned meeting controller.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McAssignmentInfo {
+    /// Assigned meeting controller ID.
+    pub mc_id: String,
+
+    /// WebTransport endpoint for client connections (preferred).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub webtransport_endpoint: Option<String>,
+
+    /// gRPC endpoint for fallback connections.
+    pub grpc_endpoint: String,
 }
 
 /// Request for guest token.
@@ -345,6 +366,11 @@ mod tests {
             expires_in: 900,
             meeting_id: Uuid::nil(),
             meeting_name: "Test Meeting".to_string(),
+            mc_assignment: McAssignmentInfo {
+                mc_id: "mc-001".to_string(),
+                webtransport_endpoint: Some("https://mc.example.com:443".to_string()),
+                grpc_endpoint: "https://mc.example.com:50051".to_string(),
+            },
         };
 
         let json = serde_json::to_string(&response).expect("serialization should succeed");
@@ -352,6 +378,37 @@ mod tests {
         assert!(json.contains("\"token\":\"eyJ"));
         assert!(json.contains("\"expires_in\":900"));
         assert!(json.contains("\"meeting_name\":\"Test Meeting\""));
+        assert!(json.contains("\"mc_id\":\"mc-001\""));
+        assert!(json.contains("\"grpc_endpoint\":\"https://mc.example.com:50051\""));
+    }
+
+    #[test]
+    fn test_mc_assignment_info_serialization() {
+        let assignment = McAssignmentInfo {
+            mc_id: "mc-test".to_string(),
+            webtransport_endpoint: Some("https://mc:443".to_string()),
+            grpc_endpoint: "https://mc:50051".to_string(),
+        };
+
+        let json = serde_json::to_string(&assignment).expect("serialization should succeed");
+        assert!(json.contains("\"mc_id\":\"mc-test\""));
+        assert!(json.contains("\"webtransport_endpoint\":\"https://mc:443\""));
+        assert!(json.contains("\"grpc_endpoint\":\"https://mc:50051\""));
+    }
+
+    #[test]
+    fn test_mc_assignment_info_serialization_no_webtransport() {
+        let assignment = McAssignmentInfo {
+            mc_id: "mc-test".to_string(),
+            webtransport_endpoint: None,
+            grpc_endpoint: "https://mc:50051".to_string(),
+        };
+
+        let json = serde_json::to_string(&assignment).expect("serialization should succeed");
+        assert!(json.contains("\"mc_id\":\"mc-test\""));
+        // webtransport_endpoint should be omitted when None
+        assert!(!json.contains("webtransport_endpoint"));
+        assert!(json.contains("\"grpc_endpoint\":\"https://mc:50051\""));
     }
 
     #[test]
