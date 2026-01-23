@@ -209,6 +209,42 @@ When reviewing test client fixtures, verify error handling includes body sanitiz
 
 ---
 
+## For Service Specialists: State Machine Transition Tests
+**Added**: 2026-01-21
+**Related files**: `crates/global-controller/tests/meeting_assignment_tests.rs`
+
+When services track entity state (e.g., MC health, meeting status), test coverage must include state TRANSITIONS, not just happy-path states:
+
+1. **Initial state behavior**: What happens when no state exists yet?
+2. **State change handling**: When entity transitions (healthy → unhealthy), does the system respond correctly?
+3. **Concurrent state access**: Multiple callers accessing during transition?
+
+Example: MC assignment tests must cover:
+- Assignment to healthy MC (happy path)
+- Behavior when assigned MC becomes unhealthy (transition)
+- Reassignment to different healthy MC after unhealthy transition
+
+The transition test pattern:
+```rust
+// 1. Create initial state (assignment to MC-1)
+let first = assign_meeting(&pool, meeting_id).await?;
+
+// 2. Trigger state transition (MC-1 becomes unhealthy)
+update_mc_health(&pool, &first.mc_id, HealthStatus::Unhealthy).await?;
+
+// 3. Verify system behavior after transition (reassigned to MC-2)
+let second = assign_meeting(&pool, meeting_id).await?;
+assert_ne!(second.mc_id, first.mc_id, "Should assign to different MC");
+
+// 4. Verify database state consistency
+let count = count_active_assignments(&pool, meeting_id).await?;
+assert_eq!(count, 1, "Should have exactly one active assignment");
+```
+
+Without transition tests, bugs in failover logic remain hidden until production incidents.
+
+---
+
 ## For All Specialists: Cross-Service Test Client Consistency
 **Added**: 2026-01-18
 **Related files**: `crates/env-tests/src/fixtures/gc_client.rs`, `crates/env-tests/src/fixtures/auth_client.rs`

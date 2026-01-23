@@ -138,3 +138,19 @@ let timestamp = chrono::Utc::now().timestamp() as i64;
 This works for timestamps (always positive, fits i64), but `try_into()` is safer for untrusted input. For internal timestamps `as` is acceptable; for MC-provided timestamps consider validation.
 
 ---
+
+## Gotcha: PostgreSQL CTE Snapshot Isolation
+**Added**: 2026-01-21
+**Related files**: `crates/global-controller/src/repositories/meeting_assignments.rs`
+
+In PostgreSQL, CTEs with data-modifying statements (INSERT, UPDATE, DELETE) all execute with the same snapshot - they don't see each other's changes. If you have a CTE that updates `health_status` and another CTE that selects healthy MCs, the SELECT won't see the UPDATE's changes. Solution: Use single INSERT ON CONFLICT statements or explicit transactions with separate queries. This is different from standard CTE behavior where read-only CTEs can reference each other.
+
+---
+
+## Gotcha: #[expect(dead_code)] vs #[allow(dead_code)]
+**Added**: 2026-01-21
+**Related files**: `crates/global-controller/src/repositories/meeting_controllers.rs`
+
+Use `#[allow(dead_code)]` not `#[expect(dead_code)]` for code that's only used in tests. The `#[expect(...)]` attribute generates a warning if the lint would NOT have fired (i.e., if the code IS used). When test modules use helper functions, the code is technically "used" during test compilation, causing `#[expect(dead_code)]` to warn. Use `#[allow(dead_code)]` which silently permits unused code without complaining when it's actually used.
+
+---

@@ -83,7 +83,7 @@ Exit code 0 = PASS
 #### Layer 6: Clippy Lints
 
 ```bash
-cargo clippy --workspace -- -D warnings
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
 Exit code 0 = PASS

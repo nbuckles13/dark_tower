@@ -16,13 +16,14 @@
 use crate::auth::Claims;
 use crate::errors::GcError;
 use crate::models::{
-    GuestJoinRequest, JoinMeetingResponse, MeetingResponse, MeetingRow,
+    GuestJoinRequest, JoinMeetingResponse, McAssignmentInfo, MeetingResponse, MeetingRow,
     UpdateMeetingSettingsRequest,
 };
 use crate::routes::AppState;
 use crate::services::ac_client::{
     AcClient, GuestTokenRequest, MeetingRole, MeetingTokenRequest, ParticipantType,
 };
+use crate::services::McAssignmentService;
 use axum::{
     extract::{Path, State},
     Extension, Json,
@@ -110,6 +111,15 @@ pub async fn join_meeting(
         MeetingRole::Participant
     };
 
+    // Assign meeting to MC (or get existing assignment)
+    let mc_assignment = McAssignmentService::assign_meeting(
+        &state.pool,
+        &meeting.meeting_id.to_string(),
+        &state.config.region,
+        &state.config.gc_id,
+    )
+    .await?;
+
     // Create AC client and request meeting token
     let ac_client = create_ac_client(&state)?;
     let token_request = MeetingTokenRequest {
@@ -132,6 +142,7 @@ pub async fn join_meeting(
         target: "gc.handlers.meetings",
         meeting_id = %meeting.meeting_id,
         user_id = %user_id,
+        mc_id = %mc_assignment.mc_id,
         participant_type = ?participant_type,
         "User joined meeting"
     );
@@ -141,6 +152,11 @@ pub async fn join_meeting(
         expires_in: token_response.expires_in,
         meeting_id: meeting.meeting_id,
         meeting_name: meeting.display_name,
+        mc_assignment: McAssignmentInfo {
+            mc_id: mc_assignment.mc_id,
+            webtransport_endpoint: mc_assignment.webtransport_endpoint,
+            grpc_endpoint: mc_assignment.grpc_endpoint,
+        },
     }))
 }
 
@@ -213,6 +229,15 @@ pub async fn get_guest_token(
     // Generate guest ID using CSPRNG
     let guest_id = generate_guest_id()?;
 
+    // Assign meeting to MC (or get existing assignment)
+    let mc_assignment = McAssignmentService::assign_meeting(
+        &state.pool,
+        &meeting.meeting_id.to_string(),
+        &state.config.region,
+        &state.config.gc_id,
+    )
+    .await?;
+
     // Create AC client and request guest token
     let ac_client = create_ac_client(&state)?;
     let token_request = GuestTokenRequest {
@@ -230,6 +255,7 @@ pub async fn get_guest_token(
         target: "gc.handlers.meetings",
         meeting_id = %meeting.meeting_id,
         guest_id = %guest_id,
+        mc_id = %mc_assignment.mc_id,
         waiting_room = meeting.waiting_room_enabled,
         "Guest joined meeting"
     );
@@ -239,6 +265,11 @@ pub async fn get_guest_token(
         expires_in: token_response.expires_in,
         meeting_id: meeting.meeting_id,
         meeting_name: meeting.display_name,
+        mc_assignment: McAssignmentInfo {
+            mc_id: mc_assignment.mc_id,
+            webtransport_endpoint: mc_assignment.webtransport_endpoint,
+            grpc_endpoint: mc_assignment.grpc_endpoint,
+        },
     }))
 }
 

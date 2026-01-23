@@ -23,6 +23,9 @@ pub const DEFAULT_GRPC_BIND_ADDRESS: &str = "0.0.0.0:50051";
 /// Default MC staleness threshold in seconds.
 pub const DEFAULT_MC_STALENESS_THRESHOLD_SECONDS: u64 = 30;
 
+/// Default GC instance ID prefix.
+pub const DEFAULT_GC_ID_PREFIX: &str = "gc";
+
 /// Global Controller configuration.
 ///
 /// Loaded from environment variables with sensible defaults.
@@ -56,6 +59,10 @@ pub struct Config {
     /// MC staleness threshold in seconds (default: 30).
     /// Controllers that haven't sent a heartbeat within this time are marked unhealthy.
     pub mc_staleness_threshold_seconds: u64,
+
+    /// Unique identifier for this GC instance.
+    /// Used for assignment tracking and debugging.
+    pub gc_id: String,
 }
 
 /// Custom Debug implementation that redacts sensitive fields.
@@ -74,6 +81,7 @@ impl fmt::Debug for Config {
                 "mc_staleness_threshold_seconds",
                 &self.mc_staleness_threshold_seconds,
             )
+            .field("gc_id", &self.gc_id)
             .finish()
     }
 }
@@ -187,6 +195,16 @@ impl Config {
                 DEFAULT_MC_STALENESS_THRESHOLD_SECONDS
             };
 
+        // Generate GC instance ID
+        let gc_id = vars.get("GC_ID").cloned().unwrap_or_else(|| {
+            // Generate a unique ID based on hostname and UUID suffix
+            let hostname = std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".to_string());
+            // Use first 8 chars of UUID for uniqueness
+            let uuid_suffix = uuid::Uuid::new_v4().to_string();
+            let short_suffix = uuid_suffix.get(..8).unwrap_or("00000000");
+            format!("{}-{}-{}", DEFAULT_GC_ID_PREFIX, hostname, short_suffix)
+        });
+
         Ok(Config {
             database_url,
             bind_address,
@@ -197,6 +215,7 @@ impl Config {
             rate_limit_rpm,
             grpc_bind_address,
             mc_staleness_threshold_seconds,
+            gc_id,
         })
     }
 }
@@ -237,6 +256,8 @@ mod tests {
             config.mc_staleness_threshold_seconds,
             DEFAULT_MC_STALENESS_THRESHOLD_SECONDS
         );
+        // GC ID should be auto-generated
+        assert!(config.gc_id.starts_with("gc-"));
     }
 
     #[test]
@@ -276,6 +297,15 @@ mod tests {
         assert_eq!(config.rate_limit_rpm, 500);
         assert_eq!(config.grpc_bind_address, "127.0.0.1:50052");
         assert_eq!(config.mc_staleness_threshold_seconds, 60);
+    }
+
+    #[test]
+    fn test_gc_id_custom_value() {
+        let mut vars = base_vars();
+        vars.insert("GC_ID".to_string(), "gc-custom-001".to_string());
+
+        let config = Config::from_vars(&vars).expect("Config should load successfully");
+        assert_eq!(config.gc_id, "gc-custom-001");
     }
 
     #[test]

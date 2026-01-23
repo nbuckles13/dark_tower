@@ -109,3 +109,49 @@ When tests verify JWT claims, the base64 decode + JSON parse pattern gets duplic
 **Related files**: `crates/env-tests/src/fixtures/gc_client.rs`, `crates/env-tests/src/fixtures/auth_client.rs`
 
 When reviewing new code that follows an existing pattern but adds improvements, flag the improvement for backporting. Example: `GcClient` added `sanitize_error_body()` which `AuthClient` lacks. Don't block the review, but document as a suggestion or add to TODO.md. Pattern: "GcClient adds [feature] which AuthClient does not have - consider backporting."
+
+---
+
+## Gotcha: #[expect(dead_code)] vs #[allow(dead_code)]
+**Added**: 2026-01-22
+**Related files**: `crates/global-controller/src/`
+
+Use `#[allow(dead_code)]` with a comment explaining future use, not `#[expect(dead_code)]`. The `#[expect]` attribute causes "unfulfilled lint expectation" warnings when the code is actually used (e.g., by tests or future features). This creates noise in CI and can mask real warnings.
+
+```rust
+// BAD: Causes warning when tests use this code
+#[expect(dead_code)]
+fn future_feature() { ... }
+
+// GOOD: Silent suppression with documentation
+#[allow(dead_code)] // Used by MC registration (Phase 6)
+fn future_feature() { ... }
+```
+
+This is particularly common when scaffolding code for future phases or writing repository methods ahead of their service-layer callers.
+
+---
+
+## Gotcha: Duplicate Logging Between Repository and Service Layers
+**Added**: 2026-01-22
+**Related files**: `crates/global-controller/src/repositories/`, `crates/global-controller/src/services/`
+
+Logging the same operation at both repository and service layers creates duplicate log entries that clutter observability and make debugging harder. Choose ONE layer for logging:
+
+- **Repository layer**: Log database-specific details (query timing, row counts)
+- **Service layer**: Log business operations (user actions, workflow steps)
+
+Typically prefer service layer logging because it captures business context. Repository layer should only log if there's database-specific diagnostic value not available at service layer.
+
+```rust
+// BAD: Both layers log the same operation
+// In repository:
+tracing::info!("Assigning meeting {} to MC {}", meeting_id, mc_id);
+// In service:
+tracing::info!("Assigned meeting {} to MC {}", meeting_id, mc_id);
+
+// GOOD: Service layer only (has business context)
+// In repository: (no logging)
+// In service:
+tracing::info!(meeting_id = %meeting_id, mc_id = %mc_id, "Meeting assigned to MC");
+```

@@ -454,6 +454,34 @@ async fn create_test_meeting(
     meeting_id
 }
 
+/// Register a healthy Meeting Controller for testing.
+///
+/// MC assignment is required for meeting join operations. This helper
+/// creates a healthy MC in the test-region that can handle assignments.
+async fn register_healthy_mc_for_region(pool: &PgPool, region: &str) {
+    let grpc_endpoint = format!("https://mc-test-{}.example.com:50051", region);
+    sqlx::query(
+        r#"
+        INSERT INTO meeting_controllers (
+            controller_id, region, endpoint, grpc_endpoint, webtransport_endpoint,
+            max_meetings, max_participants, current_meetings, current_participants,
+            health_status, last_heartbeat_at, created_at
+        )
+        VALUES ($1, $2, $3, $3, $4, 100, 1000, 0, 0, 'healthy', NOW(), NOW())
+        ON CONFLICT (controller_id) DO UPDATE SET
+            last_heartbeat_at = NOW(),
+            health_status = 'healthy'
+        "#,
+    )
+    .bind(format!("mc-test-{}", region))
+    .bind(region)
+    .bind(&grpc_endpoint)
+    .bind(format!("https://mc-test-{}.example.com:443", region))
+    .execute(pool)
+    .await
+    .expect("Failed to register healthy MC for testing");
+}
+
 // ============================================================================
 // Meeting Join Flow Tests - GET /v1/meetings/{code}
 // ============================================================================
@@ -463,6 +491,9 @@ async fn create_test_meeting(
 async fn test_join_meeting_authenticated_success(pool: PgPool) -> Result<()> {
     let server = TestMeetingServer::spawn(pool.clone()).await?;
     let client = reqwest::Client::new();
+
+    // Register a healthy MC for the test region (required for meeting join)
+    register_healthy_mc_for_region(&server.pool, "test-region").await;
 
     // Create test fixtures
     let org_id = create_test_org(&server.pool, "test-org", "Test Organization").await;
@@ -495,6 +526,15 @@ async fn test_join_meeting_authenticated_success(pool: PgPool) -> Result<()> {
     assert!(body["expires_in"].is_number(), "Should return expires_in");
     assert!(body["meeting_id"].is_string(), "Should return meeting_id");
     assert_eq!(body["meeting_name"], "Test Meeting");
+    // Verify MC assignment is present
+    assert!(
+        body["mc_assignment"]["mc_id"].is_string(),
+        "Should return mc_assignment with mc_id"
+    );
+    assert!(
+        body["mc_assignment"]["grpc_endpoint"].is_string(),
+        "Should return mc_assignment with grpc_endpoint"
+    );
 
     Ok(())
 }
@@ -651,6 +691,9 @@ async fn test_join_meeting_cross_org_allowed(pool: PgPool) -> Result<()> {
     let server = TestMeetingServer::spawn(pool.clone()).await?;
     let client = reqwest::Client::new();
 
+    // Register a healthy MC for the test region
+    register_healthy_mc_for_region(&server.pool, "test-region").await;
+
     // Create two organizations
     let org1_id = create_test_org(&server.pool, "org-one-ext", "Organization One").await;
     let org2_id = create_test_org(&server.pool, "org-two-ext", "Organization Two").await;
@@ -698,6 +741,9 @@ async fn test_join_meeting_host_success(pool: PgPool) -> Result<()> {
     let server = TestMeetingServer::spawn(pool.clone()).await?;
     let client = reqwest::Client::new();
 
+    // Register a healthy MC for the test region
+    register_healthy_mc_for_region(&server.pool, "test-region").await;
+
     let org_id = create_test_org(&server.pool, "host-org", "Host Organization").await;
     let host_id = create_test_user(&server.pool, org_id, "host@test.com", "Meeting Host").await;
 
@@ -732,6 +778,9 @@ async fn test_join_meeting_host_success(pool: PgPool) -> Result<()> {
 async fn test_join_meeting_non_host_member(pool: PgPool) -> Result<()> {
     let server = TestMeetingServer::spawn(pool.clone()).await?;
     let client = reqwest::Client::new();
+
+    // Register a healthy MC for the test region
+    register_healthy_mc_for_region(&server.pool, "test-region").await;
 
     let org_id = create_test_org(&server.pool, "member-org", "Member Organization").await;
     let host_id = create_test_user(&server.pool, org_id, "host@test.com", "Meeting Host").await;
@@ -842,6 +891,9 @@ async fn test_join_meeting_invalid_auth(pool: PgPool) -> Result<()> {
 async fn test_guest_token_success(pool: PgPool) -> Result<()> {
     let server = TestMeetingServer::spawn(pool.clone()).await?;
     let client = reqwest::Client::new();
+
+    // Register a healthy MC for the test region
+    register_healthy_mc_for_region(&server.pool, "test-region").await;
 
     let org_id = create_test_org(&server.pool, "guest-org", "Guest Organization").await;
     let host_id = create_test_user(&server.pool, org_id, "host@test.com", "Host").await;
@@ -1731,6 +1783,9 @@ async fn test_guest_token_max_display_name_boundary(pool: PgPool) -> Result<()> 
 async fn test_concurrent_guest_requests_succeed(pool: PgPool) -> Result<()> {
     let server = TestMeetingServer::spawn(pool.clone()).await?;
     let client = reqwest::Client::new();
+
+    // Register a healthy MC for the test region
+    register_healthy_mc_for_region(&server.pool, "test-region").await;
 
     let org_id = create_test_org(&server.pool, "conc-org", "Concurrent Org").await;
     let host_id = create_test_user(&server.pool, org_id, "host@test.com", "Host").await;

@@ -163,3 +163,17 @@ Background task marks stale MCs as unhealthy:
 Other services querying healthy MCs should filter: `WHERE health_status = 'healthy'`. The health checker is the single source of truth for MC health transitions.
 
 ---
+
+## Integration: Meeting-to-MC Assignment via Load Balancing
+**Added**: 2026-01-21
+**Related files**: `crates/global-controller/src/services/mc_assignment.rs`, `crates/global-controller/src/repositories/meeting_assignments.rs`
+
+When a participant joins a meeting, GC assigns an MC using weighted random selection:
+1. Query healthy MCs with available capacity (`current_participants < max_capacity`)
+2. Apply weighted random selection using CSPRNG (weight based on available capacity)
+3. Atomic assignment via INSERT ON CONFLICT (handles concurrent joins)
+4. Return assigned MC's connection info (hostname, grpc_port)
+
+Prerequisites for tests: Register at least one healthy MC before attempting to join a meeting. The legacy `endpoint` column in `meeting_controllers` is NOT NULL, so test helpers must populate it even though it's deprecated.
+
+---
