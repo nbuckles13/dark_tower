@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Dev-loop verification script
-# Extracted from .claude/workflows/development-loop.md
+# Used by /dev-loop-validate skill (see .claude/skills/dev-loop-validate/SKILL.md)
 
 # Note: Don't use set -e because we want all checks to run even if some fail
 

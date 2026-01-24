@@ -16,7 +16,7 @@
 |-------|-------|
 | Implementing Agent | `{agent_id}` |
 | Implementing Specialist | `{specialist-name}` |
-| Current Step | `{implementation|validation|code_review|reflection|complete}` |
+| Current Step | `{init|planning|implementation|validation|code_review|reflection|complete}` |
 | Iteration | `{1-5}` |
 | Security Reviewer | `{agent_id or pending}` |
 | Test Reviewer | `{agent_id or pending}` |
@@ -24,12 +24,13 @@
 | DRY Reviewer | `{agent_id or pending}` |
 
 <!-- ORCHESTRATOR REMINDER:
-     - Update this table at EVERY state transition (see development-loop.md "Orchestrator Checklist")
+     - Update this table at EVERY state transition
      - Capture reviewer agent IDs AS SOON as you invoke each reviewer
      - When step is code_review and all reviewers approve, MUST advance to reflection
      - Only mark complete after ALL reflections are done
      - Before switching to a new user request, check if Current Step != complete
      - Each specialist writes to their own checkpoint file (see _template/specialist.md)
+     - Use /dev-loop-status to check state, /dev-loop-restore to recover from interruption
 -->
 
 ---
@@ -48,6 +49,38 @@
 {NEEDED/NOT NEEDED} - {Brief justification}
 
 {If debate was needed, link to debate record: `docs/debates/YYYY-MM-DD-{topic}.md`}
+
+---
+
+## Planning Proposal
+
+<!-- This section is populated by /dev-loop-plan when planning mode is used. -->
+<!-- Delete this section if planning was not used (standard flow). -->
+
+**Status**: {Ready for implementation | Needs clarification | Recommend escalation}
+
+### Approach
+{Multi-line description of proposed implementation approach}
+
+### Files to Modify
+| File | Changes |
+|------|---------|
+| `path/to/file.rs` | {Brief description} |
+
+### Files to Create
+| File | Purpose |
+|------|---------|
+| `path/to/new_file.rs` | {Brief description} |
+
+### Key Decisions
+| Decision | Rationale |
+|----------|-----------|
+| {Decision description} | {Why this approach} |
+
+### Discussion Notes
+{Any questions raised during planning and their resolutions}
+
+{Or "No planning phase - direct implementation" if standard flow was used}
 
 ---
 

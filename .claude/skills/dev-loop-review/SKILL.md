@@ -92,12 +92,11 @@ Review the following files for this implementation task:
 
 1. Read each modified file
 2. Check against your domain expertise and the principles above
-3. Identify issues with severity:
-   - **BLOCKER**: Must fix before merge
-   - **CRITICAL**: Should fix before merge
-   - **MAJOR**: Important to address
-   - **MINOR**: Nice to fix
-   - **SUGGESTION**: Future improvement
+3. Identify issues with severity (ALL except TECH_DEBT require fixes):
+   - **BLOCKER**: Fundamental flaw, requires redesign
+   - **CRITICAL**: Security or correctness issue, must fix
+   - **MAJOR**: Significant issue, must fix
+   - **MINOR**: Small issue, must fix (NOT optional)
    - **TECH_DEBT**: (DRY/Code Reviewer only) Non-blocking, document for later
 4. Write checkpoint to `{output_dir}/{reviewer-name}.md` with:
    - Observations
@@ -107,11 +106,13 @@ Review the following files for this implementation task:
 
 ---
 
-## Verdict Rules
+## Verdict Rules (STRICT - follow exactly)
 
-- **APPROVED**: No findings (or only TECH_DEBT)
-- **REQUEST_CHANGES**: Any BLOCKER, CRITICAL, MAJOR, or MINOR findings
-- **BLOCKED**: Fundamental issues requiring redesign
+- **APPROVED**: No findings, OR only TECH_DEBT findings. Nothing else qualifies.
+- **REQUEST_CHANGES**: ANY finding of BLOCKER, CRITICAL, MAJOR, or MINOR severity. Even one MINOR = REQUEST_CHANGES.
+- **BLOCKED**: Fundamental architectural issues requiring complete redesign.
+
+**IMPORTANT**: MINOR findings ARE blocking. Do NOT mark APPROVED if you have ANY non-TECH_DEBT findings.
 
 ---
 
@@ -235,7 +236,11 @@ All 4 reviewers approved:
 
 #### If REQUEST_CHANGES or BLOCKED
 
-Keep Loop State at `code_review`.
+Update Loop State:
+
+| Field | Value |
+|-------|-------|
+| Current Step | `fix` |
 
 Collect all findings into a list:
 

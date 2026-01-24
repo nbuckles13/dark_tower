@@ -274,7 +274,8 @@ dark_tower/
 
 ### Development Process
 - **.claude/DEVELOPMENT_WORKFLOW.md** - Orchestrator rules, specialist usage
-- **.claude/workflows/development-loop.md** - Implementation workflow with verification
+- **.claude/skills/dev-loop/SKILL.md** - Dev-loop overview and available steps
+- **.claude/skills/dev-loop-*/SKILL.md** - Individual dev-loop step skills
 - **.claude/workflows/multi-agent-debate.md** - Debate mechanics
 - **.claude/workflows/code-review.md** - Code review process
 - **docs/dev-loop-outputs/** - Implementation output tracking
@@ -287,10 +288,10 @@ dark_tower/
 ## Common Development Tasks
 
 ### Implementing a Feature or Refactor
-1. Follow the **Development Loop** workflow
-2. See `.claude/workflows/development-loop.md` for full process
-3. Key steps: specialist implements → verification → code review → reflection
-4. Track progress in `docs/dev-loop-outputs/YYYY-MM-DD-{task}.md`
+1. Follow the **Development Loop** workflow via skills
+2. Start with `/dev-loop-init "task description"` to initialize
+3. Run `/dev-loop-implement`, `/dev-loop-validate`, `/dev-loop-review`, `/dev-loop-reflect`
+4. Track progress in `docs/dev-loop-outputs/YYYY-MM-DD-{task}/main.md`
 
 ### Adding a Database Table
 1. Create migration: `sqlx migrate add create_table_name`
@@ -346,26 +347,39 @@ dark_tower/
 
 ## Development Loop Workflow
 
-For implementation tasks, follow the **Development Loop** workflow:
+For implementation tasks, use the **Development Loop** via skills:
 
-1. **Specialist implements** with principles + dynamic knowledge injected
-2. **7-layer verification** runs automatically (check → fmt → guards → tests → clippy → semantic)
-3. **Code review** by Security, Test, Code Quality, and DRY specialists
-4. **Reflection** captures learnings to specialist knowledge files
-5. **State checkpointing** enables recovery after context compression
+```
+/dev-loop-init "task description"   # Initialize loop, match principles
+/dev-loop-implement                  # Spawn specialist with context
+/dev-loop-validate                   # Run 7-layer verification
+/dev-loop-review                     # Code review (4 reviewers in parallel)
+/dev-loop-reflect                    # Capture learnings
+/dev-loop-complete                   # Mark loop done
+```
+
+**Utility skills**:
+- `/dev-loop-status` - Check current state of any dev-loop
+- `/dev-loop-fix` - Resume specialist to fix validation or review findings
+- `/dev-loop-restore` - Recover interrupted loop from checkpoints
+
+**Key aspects**:
+- **Same agent continuity**: Planning and implementation use the same agent
+- **Context injection**: Principles + specialist knowledge automatically included
+- **7-layer verification**: check → fmt → guards → tests → clippy → semantic
+- **State checkpointing**: Enables recovery after interruption (ADR-0018)
 
 **Code review blocking behavior**:
 - Security, Test, Code Quality: ALL findings must be fixed
 - DRY Reviewer: Only BLOCKER blocks; non-BLOCKERs documented as tech debt (see ADR-0019)
 
 **Key Files**:
-- `.claude/workflows/development-loop.md` - Full workflow mechanics
+- `.claude/skills/dev-loop/SKILL.md` - Overview and navigation
 - `docs/dev-loop-outputs/` - Output files tracking each implementation
-- `docs/dev-loop-outputs/_template.md` - Template with Loop State for recovery
 
 **When to use**: Any implementation task (features, tests, refactors, security changes)
 
-**See**: ADR-0016 for design rationale
+**See**: ADR-0016 for original design, ADR-0022 for skill-based migration
 
 ---
 

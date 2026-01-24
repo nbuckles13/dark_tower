@@ -2,6 +2,8 @@
 
 **Status**: Accepted (Updated 2026-01-10)
 
+**Superseded By**: ADR-0022 (Skill-Based Development Loop) - The workflow files described below have been replaced by executable skills. See ADR-0022 for the current approach.
+
 **Date**: 2026-01-08
 
 **Deciders**: Nathan, Claude Code Orchestrator

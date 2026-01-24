@@ -2,6 +2,8 @@
 
 **Status**: Accepted
 
+**Note**: Restore is now invoked via the `/dev-loop-restore` skill. See ADR-0022 for the skill-based approach.
+
 **Date**: 2026-01-14
 
 **Deciders**: Development team

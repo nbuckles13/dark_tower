@@ -12,7 +12,8 @@ The dev-loop is a multi-step workflow for implementing features with specialist 
 | Step | Skill | Purpose |
 |------|-------|---------|
 | 0 | `/dev-loop-init` | Initialize a new dev-loop: create output dir, match principles, preview specialist prompt |
-| 1 | `/dev-loop-implement` | Spawn the implementing specialist with injected context |
+| 0.5 | `/dev-loop-plan` | (Optional) Spawn specialist for exploration and planning before implementation |
+| 1 | `/dev-loop-implement` | Spawn (or resume) the implementing specialist with injected context |
 | 2 | `/dev-loop-validate` | Run 7-layer verification on specialist's work |
 | 3 | `/dev-loop-review` | Spawn 4 code reviewers in parallel |
 | 4 | `/dev-loop-reflect` | Resume specialists sequentially for reflection |
@@ -28,6 +29,8 @@ The dev-loop is a multi-step workflow for implementing features with specialist 
 
 ## Typical Flow
 
+### Standard Flow (no planning)
+
 ```
 /dev-loop-init "task description"
     ↓
@@ -42,19 +45,51 @@ The dev-loop is a multi-step workflow for implementing features with specialist 
 /dev-loop-complete
 ```
 
+### Planning Flow (for complex tasks)
+
+```
+/dev-loop-init --plan
+    ↓
+/dev-loop-plan  ←─────────────┐
+    ↓                         │
+    ├─ (needs clarification) ─┘
+    ├─ (recommend escalation) → consider debate workflow
+    ↓ (ready)
+/dev-loop-implement (resumes same specialist with planning context)
+    ↓
+... (same as standard flow)
+```
+
+The same specialist handles both planning and implementation, preserving context.
+
 ## Starting a New Dev-Loop
 
-To start a new dev-loop, run:
+### Standard Start (direct to implementation)
 
 ```
 /dev-loop-init "your task description here"
+```
+
+### With Planning Phase (for complex tasks)
+
+```
+/dev-loop-init "your task description here" --plan
+# or just:
+/dev-loop-init --plan
 ```
 
 The init step will:
 1. Create an output directory at `docs/dev-loop-outputs/YYYY-MM-DD-{task-slug}/`
 2. Match your task to principle categories
 3. Show you the specialist prompt that will be used
-4. Tell you to run `/dev-loop-implement` next
+4. Tell you to run `/dev-loop-plan` (if `--plan`) or `/dev-loop-implement` next
+
+### When to Use Planning
+
+Use `--plan` when:
+- Task scope is unclear and needs exploration
+- You want the specialist to propose an approach before implementing
+- Task might be too large and need escalation to debate workflow
 
 ## Checking Current State
 
@@ -73,14 +108,15 @@ This will show you:
 ## Reference Documentation
 
 For full workflow details, see:
-- `.claude/workflows/development-loop.md` - State machine and step details
-- `.claude/workflows/development-loop/*.md` - Step-specific instructions
+- `.claude/skills/dev-loop-*/SKILL.md` - Individual step instructions
 - `.claude/workflows/code-review.md` - Code review process
 - `docs/dev-loop-outputs/_template/main.md` - Output file format
+- `docs/decisions/adr-0022-skill-based-dev-loop.md` - Design rationale
 
 ---
 
 **Next step**: Based on what you need:
 - Starting new work? → Run `/dev-loop-init "task description"`
+- Complex task needing exploration? → Run `/dev-loop-init --plan`
 - Checking status? → Run `/dev-loop-status`
 - Resuming work? → Run `/dev-loop-restore`

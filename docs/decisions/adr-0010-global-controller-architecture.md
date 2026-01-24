@@ -1005,6 +1005,33 @@ Must test and handle:
 - **mTLS overhead**: ~1-2ms per connection (acceptable for internal traffic)
 - **Message signing**: ~1ms per Pub/Sub message (acceptable for cross-region events)
 
+## Implementation Status
+
+| Section | Component | Status | Commit/PR | Notes |
+|---------|-----------|--------|-----------|-------|
+| 1 | MC Assignment Flow | ✅ Done | ffa5c93 | Load balancing + atomic assignment |
+| 2 | Load Balancing Algorithm | ✅ Done | ffa5c93 | Weighted random from top 5 |
+| 3 | Assignment Cleanup - Soft Delete | ✅ Done | pending | `end_assignment()` via gRPC |
+| 3 | Assignment Cleanup - Hard Delete | ✅ Done | pending | Background task |
+| 4 | GC-MC Communication - Registration | ✅ Done | 2b2a5ab | gRPC `RegisterMc` |
+| 4 | GC-MC Communication - Heartbeat | ✅ Done | 2b2a5ab | gRPC `Heartbeat` |
+| 5 | Outbox Table Schema | ❌ Pending | | `meeting_peer_events_outbox` |
+| 5 | Publisher Background Job | ❌ Pending | | Outbox → Redis + cross-region gRPC |
+| 5 | Cross-Region GC gRPC | ❌ Pending | | `NotifyMeetingEventsBatch` |
+| 5 | Redis Streams Integration | ❌ Pending | | MC subscription to events |
+| 5 | MC-to-MC gRPC | ❌ Pending | | `MeetingControllerPeer` service |
+| 6 | JWT Claims Validation | ✅ Done | 5bbd003 | Full claim validation in auth middleware |
+| 7 | Token Denylist Table | ❌ Pending | | Schema + Redis cache |
+| 7 | Denylist Check in Validation | ❌ Pending | | |
+| 7 | Meeting-Scoped Tokens | ✅ Done | 9e477dc | AC endpoints + GC integration |
+| 8 | Database Schema - MCs | ✅ Done | 2b2a5ab | `meeting_controllers` table |
+| 8 | Database Schema - Assignments | ✅ Done | ffa5c93 | `meeting_assignments` table |
+| 8 | Database Schema - Transitions | ❌ Pending | | `meeting_state_transitions` (audit) |
+| 8 | Database Schema - Denylist | ❌ Pending | | `token_denylist` table |
+| 9 | Heartbeat System | ✅ Done | 2b2a5ab | Health checker background task |
+| 10 | Performance SLOs | ⏸️ Deferred | | Targets defined, not instrumented |
+| 11 | Chaos Engineering | ⏸️ Deferred | | Requirements defined, not implemented |
+
 ## Debate Summary
 
 ### Initial Debate (Rounds 1-3): GC Architecture

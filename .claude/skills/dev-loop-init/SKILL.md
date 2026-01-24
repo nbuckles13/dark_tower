@@ -20,11 +20,23 @@ Initialize a new dev-loop. This skill:
 The task description is passed via `$ARGUMENTS`:
 
 ```
-/dev-loop-init "task description" [specialist-name]
+/dev-loop-init "task description" [specialist-name] [--plan]
+/dev-loop-init --plan [specialist-name]
 ```
 
-- **task description** (required): The implementation task (passed VERBATIM to specialist)
+- **task description** (optional if `--plan`): The implementation task (passed VERBATIM to specialist)
 - **specialist-name** (optional): Override auto-detected specialist
+- **--plan** (optional): Route to planning phase before implementation
+
+### Invocation Patterns
+
+| Invocation | Behavior |
+|------------|----------|
+| `/dev-loop-init "task"` | Ready for `/dev-loop-implement` (standard flow) |
+| `/dev-loop-init "task" --plan` | Sets objective, routes to planning first |
+| `/dev-loop-init --plan` | No objective yet, requires `/dev-loop-plan` to define |
+| `/dev-loop-init "task" specialist-name` | Standard flow with explicit specialist |
+| `/dev-loop-init "task" specialist-name --plan` | Planning flow with explicit specialist |
 
 ## Instructions
 
@@ -118,13 +130,17 @@ Create the directory:
 mkdir -p docs/dev-loop-outputs/YYYY-MM-DD-{task-slug}
 ```
 
+Determine initial state based on `--plan` flag:
+- If `--plan` used: `Current Step = planning`
+- Otherwise: `Current Step = init`
+
 Create `main.md` from template with Loop State initialized:
 
 ```markdown
 # Dev-Loop Output: {Task Title}
 
 **Date**: YYYY-MM-DD
-**Task**: {task description - VERBATIM}
+**Task**: {task description - VERBATIM, or "To be defined during planning" if --plan only}
 **Branch**: `{current git branch}`
 **Duration**: ~0m (in progress)
 
@@ -138,7 +154,7 @@ Create `main.md` from template with Loop State initialized:
 |-------|-------|
 | Implementing Agent | `pending` |
 | Implementing Specialist | `{specialist-name}` |
-| Current Step | `init` |
+| Current Step | `{init or planning}` |
 | Iteration | `1` |
 | Security Reviewer | `pending` |
 | Test Reviewer | `pending` |
@@ -150,7 +166,7 @@ Create `main.md` from template with Loop State initialized:
 ## Task Overview
 
 ### Objective
-{task description - VERBATIM}
+{task description - VERBATIM, or "To be defined during planning" if --plan only}
 
 ### Scope
 - **Service(s)**: {inferred from specialist}
@@ -207,6 +223,8 @@ Output directory:
 
 ### Step 8: Report Completion
 
+#### If standard flow (no --plan):
+
 ```
 **Dev-Loop Initialized**
 
@@ -218,6 +236,20 @@ Knowledge files: {count} files (or "none - will bootstrap on first reflection")
 **Next step**: Run `/dev-loop-implement` to spawn the specialist
 ```
 
+#### If planning flow (--plan used):
+
+```
+**Dev-Loop Initialized (Planning Mode)**
+
+Output directory: docs/dev-loop-outputs/YYYY-MM-DD-{task-slug}/
+Specialist: {specialist-name}
+Matched principles: {count} categories
+Knowledge files: {count} files (or "none - will bootstrap on first reflection")
+Mode: Planning first
+
+**Next step**: Run `/dev-loop-plan` to explore and propose approach
+```
+
 ## Critical Constraints
 
 - **VERBATIM task description**: Never paraphrase, summarize, or modify the task description
@@ -226,4 +258,4 @@ Knowledge files: {count} files (or "none - will bootstrap on first reflection")
 
 ---
 
-**Next step**: Run `/dev-loop-implement`
+**Next step**: Run `/dev-loop-plan` (if planning mode) or `/dev-loop-implement` (if standard mode)

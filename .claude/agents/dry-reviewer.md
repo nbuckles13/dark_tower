@@ -109,10 +109,12 @@ During code review, search for patterns in the new/modified code that already ex
 
 ## Integration with Dev-Loop
 
+The DRY Reviewer is invoked during the `/dev-loop-review` step alongside Security, Test, and Code Reviewer specialists.
+
 ### Blocking Behavior
 
 The dev-loop uses severity-based blocking:
-- **BLOCKING** findings → Must fix before approval
+- **BLOCKING** findings → Must fix before approval (run `/dev-loop-fix`)
 - **TECH_DEBT** findings → Documented, don't block
 
 TECH_DEBT findings are documented in the dev-loop output under "Tech Debt" and result in follow-up tasks.

@@ -3,7 +3,7 @@
 **CRITICAL**: Read this file at the start of every session. These are mandatory development practices for Dark Tower.
 
 > **Note**: This file defines **orchestrator rules** (what you can/cannot do, when to use specialists).
-> For **implementation mechanics** (verification layers, code review, reflection), see `.claude/workflows/development-loop.md`.
+> For **implementation mechanics**, use the dev-loop skills: `/dev-loop`, `/dev-loop-init`, `/dev-loop-implement`, etc.
 
 ## Core Principle: Specialist-Led Development
 
@@ -90,8 +90,8 @@ Use a **single message with multiple Task tool calls** for parallel execution.
 
 ### For New Features
 
-**Recommended**: Use the **Development Loop** workflow for implementation tasks.
-See `.claude/workflows/development-loop.md` for the full process with:
+**Recommended**: Use the **Development Loop** skills for implementation tasks.
+Run `/dev-loop` for overview, or start with `/dev-loop-init "task description"`:
 - Specialist-owned verification (7-layer: check → fmt → guards → tests → clippy → semantic)
 - Code review by Security, Test, and Code Quality specialists
 - Reflection step to capture learnings
@@ -207,29 +207,28 @@ At the beginning of each session:
 
 ### Checking for Incomplete Dev-Loops
 
-**Procedure**:
-1. Scan `docs/dev-loop-outputs/` for directories (not single `.md` files)
-2. For each directory, check `main.md` for the Loop State section
-3. If `Current Step` is NOT `complete`, offer restore to user
+**Use the `/dev-loop-status` skill** to check for incomplete loops:
 
-**Restore prompt**:
 ```
-Found incomplete dev-loop: {task-slug}
-- Current step: {step}
-- Iteration: {iteration}
-- Implementing specialist: {name from Loop State}
-
-Checkpoint files available:
-- {list .md files in directory besides main.md}
-
-Restore and continue? (Specialists will be re-invoked with checkpoint context)
+/dev-loop-status
 ```
 
-**If user accepts restore**:
+This will show:
+- Active dev-loops (if any)
+- Current step
+- Iteration count
+- What to run next
+
+**If incomplete loop found and user wants to restore**:
+
+```
+/dev-loop-restore
+```
+
+The restore skill will:
 1. Read all checkpoint files in the directory
 2. Re-invoke specialists with their checkpoint content as context
 3. Continue from the interrupted step
-4. See `.claude/workflows/development-loop.md` Part 10 for restore context template
 
 **If user declines restore**:
 - Continue with new work
@@ -250,25 +249,34 @@ When starting the dev-loop, match task keywords to principle categories and pass
 
 **Your job**: Match patterns, pass file paths to step-runner. Step-runner handles injection.
 
-See `.claude/workflows/development-loop/step-implementation.md` for full category list.
+See `.claude/skills/dev-loop-init/SKILL.md` for full category list.
 
 ---
 
 ## Related Files
 
-**Workflow Files** (`.claude/workflows/`):
-- `development-loop.md` - Dev-loop state machine and step-runner format
-- `development-loop/step-implementation.md` - Implementation step details
-- `development-loop/specialist-invocation.md` - How step-runners invoke specialists
+**Dev-Loop Skills** (`.claude/skills/`):
+- `dev-loop/SKILL.md` - Overview and navigation
+- `dev-loop-init/SKILL.md` - Initialize loop, match principles
+- `dev-loop-implement/SKILL.md` - Spawn specialist with context
+- `dev-loop-validate/SKILL.md` - 7-layer verification
+- `dev-loop-review/SKILL.md` - Code review (4 reviewers)
+- `dev-loop-reflect/SKILL.md` - Capture learnings
+- `dev-loop-fix/SKILL.md` - Fix validation/review findings
+- `dev-loop-restore/SKILL.md` - Recover from checkpoints
+- `dev-loop-status/SKILL.md` - Check loop state
+
+**Other Workflows** (`.claude/workflows/`):
 - `multi-agent-debate.md` - Debate mechanics
 - `code-review.md` - Code review process
 
 **ADRs** (`docs/decisions/`):
 - **ADR-0015** - Principles & guards methodology
-- **ADR-0016** - Development loop design (specialist-owned verification)
+- **ADR-0016** - Development loop design (original workflow approach)
 - **ADR-0017** - Specialist knowledge architecture (dynamic knowledge files)
 - **ADR-0018** - Dev-loop checkpointing and restore (session recovery)
 - **ADR-0021** - Step-runner architecture for dev-loop reliability
+- **ADR-0022** - Skill-based development loop (supersedes workflow approach)
 
 ---
 

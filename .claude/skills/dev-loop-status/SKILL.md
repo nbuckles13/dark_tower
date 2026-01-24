@@ -25,7 +25,7 @@ For each directory found, read `main.md` and extract the Loop State table:
 |-------|-------|
 | Implementing Agent | `{agent_id}` |
 | Implementing Specialist | `{specialist-name}` |
-| Current Step | `{implementation|validation|code_review|reflection|complete}` |
+| Current Step | `{init|planning|implementation|validation|code_review|reflection|complete}` |
 | Iteration | `{1-5}` |
 | Security Reviewer | `{agent_id or pending}` |
 | Test Reviewer | `{agent_id or pending}` |
@@ -89,6 +89,8 @@ Based on Current Step, recommend:
 
 | Current Step | Next Action |
 |--------------|-------------|
+| `init` | `Run /dev-loop-implement to spawn the specialist.` |
+| `planning` | `Run /dev-loop-plan to continue planning, or /dev-loop-implement if plan is approved.` |
 | `implementation` | `Specialist still running or interrupted. Run /dev-loop-restore if interrupted.` |
 | `validation` | `Run /dev-loop-validate to verify the implementation.` |
 | `code_review` | `Run /dev-loop-review to complete code review.` |
@@ -105,6 +107,16 @@ When other dev-loop skills need to find the "current" output directory, they use
 5. If no active loops: error (no loop in progress)
 
 Skills can accept an explicit path argument to override auto-detection.
+
+### Planning State Detection
+
+When `Current Step = planning`:
+- Check if `Implementing Agent` is set (not `pending`)
+  - If set: Planning in progress, can resume with `/dev-loop-plan` or proceed with `/dev-loop-implement`
+  - If `pending`: Ready to start planning with `/dev-loop-plan`
+- Check for `Planning Proposal` section in main.md
+  - If present: Plan has been proposed, ready for `/dev-loop-implement`
+  - If absent: Planning not yet started or in progress
 
 ---
 
