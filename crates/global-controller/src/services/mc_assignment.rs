@@ -142,8 +142,6 @@ impl McAssignmentService {
     /// # Returns
     ///
     /// Number of assignments ended.
-    // Allow: Used in tests; will be called from meeting end handler
-    #[allow(dead_code)]
     #[instrument(skip(pool), fields(meeting_id = %meeting_id))]
     pub async fn end_assignment(
         pool: &PgPool,

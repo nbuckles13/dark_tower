@@ -10,10 +10,11 @@
 
 use crate::repositories::{HealthStatus, MeetingControllersRepository};
 use crate::routes::AppState;
+use crate::services::McAssignmentService;
 use proto_gen::internal::global_controller_service_server::GlobalControllerService;
 use proto_gen::internal::{
-    ComprehensiveHeartbeatRequest, FastHeartbeatRequest, HeartbeatResponse, RegisterMcRequest,
-    RegisterMcResponse,
+    ComprehensiveHeartbeatRequest, FastHeartbeatRequest, HeartbeatResponse,
+    NotifyMeetingEndedRequest, NotifyMeetingEndedResponse, RegisterMcRequest, RegisterMcResponse,
 };
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
@@ -27,6 +28,9 @@ const DEFAULT_COMPREHENSIVE_HEARTBEAT_INTERVAL_MS: u64 = 30_000;
 
 /// Maximum allowed controller ID length.
 const MAX_CONTROLLER_ID_LENGTH: usize = 255;
+
+/// Maximum allowed meeting ID length.
+const MAX_MEETING_ID_LENGTH: usize = 255;
 
 /// Maximum allowed region length.
 const MAX_REGION_LENGTH: usize = 50;
@@ -66,6 +70,30 @@ impl McService {
         {
             return Err(Status::invalid_argument(
                 "controller_id contains invalid characters",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Validate a meeting ID.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Status is the standard gRPC error type"
+    )]
+    fn validate_meeting_id(id: &str) -> Result<(), Status> {
+        if id.is_empty() {
+            return Err(Status::invalid_argument("meeting_id is required"));
+        }
+        if id.len() > MAX_MEETING_ID_LENGTH {
+            return Err(Status::invalid_argument("meeting_id is too long"));
+        }
+        // Allow alphanumeric, hyphens, and underscores (same as controller_id)
+        if !id
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+        {
+            return Err(Status::invalid_argument(
+                "meeting_id contains invalid characters",
             ));
         }
         Ok(())
@@ -317,6 +345,57 @@ impl GlobalControllerService for McService {
             timestamp,
         }))
     }
+
+    /// Handle meeting ended notification from a Meeting Controller.
+    ///
+    /// Called when a meeting ends (last participant leaves). Marks the
+    /// assignment as ended (soft delete) for audit trail.
+    #[instrument(skip_all, name = "gc.grpc.notify_meeting_ended")]
+    async fn notify_meeting_ended(
+        &self,
+        request: Request<NotifyMeetingEndedRequest>,
+    ) -> Result<Response<NotifyMeetingEndedResponse>, Status> {
+        let req = request.into_inner();
+
+        // Validate meeting_id (including character validation)
+        Self::validate_meeting_id(&req.meeting_id)?;
+
+        // Validate region
+        Self::validate_region(&req.region)?;
+
+        // End the assignment
+        let count = McAssignmentService::end_assignment(
+            &self.state.pool,
+            &req.meeting_id,
+            Some(&req.region),
+        )
+        .await
+        .map_err(|e| {
+            tracing::error!(
+                target: "gc.grpc.notify_meeting_ended",
+                error = %e,
+                meeting_id = %req.meeting_id,
+                region = %req.region,
+                "Failed to end meeting assignment"
+            );
+            Status::internal("Failed to end meeting assignment")
+        })?;
+
+        // Note: Service layer logs with count, so we only log here for debug-level
+        // when no assignment was found.
+        if count == 0 {
+            tracing::debug!(
+                target: "gc.grpc.notify_meeting_ended",
+                meeting_id = %req.meeting_id,
+                region = %req.region,
+                "No active assignment found to end (may already be ended)"
+            );
+        }
+
+        Ok(Response::new(NotifyMeetingEndedResponse {
+            acknowledged: true,
+        }))
+    }
 }
 
 #[cfg(test)]
@@ -492,6 +571,62 @@ mod tests {
         assert!(
             McService::validate_endpoint("http://a", "test").is_ok(),
             "Minimum valid endpoint should pass"
+        );
+    }
+
+    // === Meeting ID Validation Tests ===
+
+    #[test]
+    fn test_validate_meeting_id_valid() {
+        assert!(McService::validate_meeting_id("meeting-123").is_ok());
+        assert!(McService::validate_meeting_id("meeting_abc_123").is_ok());
+        assert!(McService::validate_meeting_id("MEETING-XYZ").is_ok());
+    }
+
+    #[test]
+    fn test_validate_meeting_id_empty() {
+        let err = McService::validate_meeting_id("").unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("required"));
+    }
+
+    #[test]
+    fn test_validate_meeting_id_too_long() {
+        let long_id = "m".repeat(256);
+        let err = McService::validate_meeting_id(&long_id).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("too long"));
+    }
+
+    #[test]
+    fn test_validate_meeting_id_at_255_chars() {
+        let id_255 = "m".repeat(255);
+        assert!(
+            McService::validate_meeting_id(&id_255).is_ok(),
+            "Meeting ID at 255 chars should pass"
+        );
+    }
+
+    #[test]
+    fn test_validate_meeting_id_invalid_chars() {
+        let err = McService::validate_meeting_id("meeting/invalid").unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("invalid characters"));
+
+        let err = McService::validate_meeting_id("meeting with space").unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("invalid characters"));
+
+        let err = McService::validate_meeting_id("meeting@special").unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("invalid characters"));
+    }
+
+    #[test]
+    fn test_validate_meeting_id_at_1_char() {
+        assert!(
+            McService::validate_meeting_id("m").is_ok(),
+            "Meeting ID with 1 char should pass"
         );
     }
 }

@@ -34,7 +34,7 @@ use routes::AppState;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use tasks::start_health_checker;
+use tasks::{start_assignment_cleanup, start_health_checker, AssignmentCleanupConfig};
 use tokio::signal;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::Server as TonicServer;
@@ -127,6 +127,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await;
     });
 
+    // Start assignment cleanup background task
+    let cleanup_pool = db_pool.clone();
+    let cleanup_token = cancel_token.clone();
+    let cleanup_config = AssignmentCleanupConfig::from_env();
+    info!(
+        cleanup_interval_seconds = cleanup_config.check_interval_seconds,
+        inactivity_hours = cleanup_config.inactivity_hours,
+        retention_days = cleanup_config.retention_days,
+        "Assignment cleanup configuration loaded"
+    );
+    let cleanup_handle = tokio::spawn(async move {
+        start_assignment_cleanup(cleanup_pool, cleanup_config, cleanup_token).await;
+    });
+
     // Parse HTTP bind address
     let http_addr: SocketAddr = http_bind_address.parse().map_err(|e| {
         error!("Invalid HTTP bind address: {}", e);
@@ -173,10 +187,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Cancel background tasks
     cancel_token.cancel();
 
-    // Wait for health checker to finish
+    // Wait for background tasks to finish
     info!("Waiting for background tasks to complete...");
     if let Err(e) = health_checker_handle.await {
         error!("Health checker task error: {}", e);
+    }
+    if let Err(e) = cleanup_handle.await {
+        error!("Assignment cleanup task error: {}", e);
     }
 
     info!("Global Controller shutdown complete");

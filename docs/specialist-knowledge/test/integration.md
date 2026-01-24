@@ -209,6 +209,26 @@ When reviewing test client fixtures, verify error handling includes body sanitiz
 
 ---
 
+## For Code Reviewer Specialist: Deferred Test Gaps
+**Added**: 2026-01-23
+
+When reviewing test coverage, some gaps are intentionally deferred rather than fixed:
+- **sqlx error paths**: Functions using sqlx cannot easily test database error paths (no mock layer)
+- **External service failures**: Testing behavior when AC/MC/MH returns errors requires test infrastructure
+- **Race conditions**: Some timing-dependent tests are too flaky to include
+
+When flagging test gaps during review:
+1. Check if the gap is already documented (search for "Deferred:" in PR description)
+2. If undocumented, ask implementer if it's intentional deferral or oversight
+3. For legitimate deferrals, ensure they're tracked (tech debt file or comment)
+
+Acceptable documentation formats:
+- `// TODO: Error path test deferred - requires sqlx mocking (ADR-XXXX)`
+- PR description: "Deferred: error path tests for run_cleanup() - requires sqlx mocking"
+- Entry in `.claude/TODO.md` under test gaps section
+
+---
+
 ## For Service Specialists: State Machine Transition Tests
 **Added**: 2026-01-21
 **Related files**: `crates/global-controller/tests/meeting_assignment_tests.rs`

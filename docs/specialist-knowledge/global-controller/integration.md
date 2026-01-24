@@ -177,3 +177,19 @@ When a participant joins a meeting, GC assigns an MC using weighted random selec
 Prerequisites for tests: Register at least one healthy MC before attempting to join a meeting. The legacy `endpoint` column in `meeting_controllers` is NOT NULL, so test helpers must populate it even though it's deprecated.
 
 ---
+
+## Integration: Assignment Cleanup Lifecycle
+**Added**: 2026-01-23
+**Related files**: `crates/global-controller/src/tasks/assignment_cleanup.rs`, `crates/global-controller/src/repositories/meeting_assignments.rs`
+
+Meeting assignments follow a soft-delete then hard-delete lifecycle:
+
+**Soft-delete (end_assignment)**: Sets `ended_at` timestamp. Triggered by:
+- `end_stale_assignments()`: Assignments where MC is unhealthy AND assigned > N hours ago
+- Direct `end_assignment()` call when meeting ends normally
+
+**Hard-delete (cleanup_old_assignments)**: Removes row entirely. Only deletes assignments where `ended_at` is older than retention period (default 7 days).
+
+Background task `start_assignment_cleanup()` runs both operations periodically. Uses batch limits to prevent large transactions. Important: stale detection requires MC health status join - only ends assignments where the MC has become unhealthy, not just old assignments.
+
+---

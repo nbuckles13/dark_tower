@@ -22,6 +22,10 @@ const DEFAULT_HEARTBEAT_STALENESS_SECONDS: i64 = 30;
 /// Number of candidate MCs to select for weighted random load balancing.
 const LOAD_BALANCING_CANDIDATE_COUNT: i64 = 5;
 
+/// Default batch size for cleanup operations.
+/// Prevents long-running transactions in pathological cases.
+const DEFAULT_CLEANUP_BATCH_SIZE: i64 = 1000;
+
 /// Meeting assignment record from database.
 // Allow: Fields used in tests; struct will be used by future query handlers
 #[allow(dead_code)]
@@ -299,8 +303,6 @@ impl MeetingAssignmentsRepository {
     /// * `pool` - Database connection pool
     /// * `meeting_id` - Meeting identifier
     /// * `region` - Deployment region (if None, ends all regional assignments)
-    // Allow: Used in tests; will be called from meeting end handler
-    #[allow(dead_code)]
     #[instrument(skip_all, fields(meeting_id = %meeting_id))]
     pub async fn end_assignment(
         pool: &PgPool,
@@ -353,24 +355,106 @@ impl MeetingAssignmentsRepository {
         Ok(count)
     }
 
+    /// End stale assignments (meetings with no activity).
+    ///
+    /// Soft-deletes assignments where the meeting has had no activity
+    /// (defined as `assigned_at` being older than the inactivity threshold).
+    /// This handles meetings where the MC crashed or failed to notify GC.
+    ///
+    /// # Arguments
+    ///
+    /// * `pool` - Database connection pool
+    /// * `inactivity_hours` - Hours of inactivity before considering stale
+    /// * `batch_size` - Optional batch size limit (defaults to 1000)
+    ///
+    /// # Returns
+    ///
+    /// Number of assignments ended.
+    #[instrument(skip_all, fields(inactivity_hours = inactivity_hours))]
+    pub async fn end_stale_assignments(
+        pool: &PgPool,
+        inactivity_hours: i32,
+        batch_size: Option<i64>,
+    ) -> Result<u64, GcError> {
+        let limit = batch_size.unwrap_or(DEFAULT_CLEANUP_BATCH_SIZE);
+
+        // Mark as ended any assignment that:
+        // 1. Is still active (ended_at IS NULL)
+        // 2. Was assigned more than `inactivity_hours` ago
+        // 3. Has an unhealthy MC (MC hasn't sent heartbeat)
+        //
+        // Note: We only end assignments with unhealthy MCs to avoid
+        // incorrectly ending active meetings.
+        // LIMIT prevents long-running transactions in pathological cases.
+        let result = sqlx::query(
+            r#"
+            UPDATE meeting_assignments ma
+            SET ended_at = NOW()
+            WHERE ma.meeting_id IN (
+                SELECT inner_ma.meeting_id
+                FROM meeting_assignments inner_ma
+                WHERE inner_ma.ended_at IS NULL
+                  AND inner_ma.assigned_at < NOW() - ($1 || ' hours')::INTERVAL
+                  AND EXISTS (
+                      SELECT 1 FROM meeting_controllers mc
+                      WHERE mc.controller_id = inner_ma.meeting_controller_id
+                        AND mc.health_status != 'healthy'
+                  )
+                LIMIT $2
+            )
+            "#,
+        )
+        .bind(inactivity_hours.to_string())
+        .bind(limit)
+        .execute(pool)
+        .await?;
+
+        let count = result.rows_affected();
+
+        if count > 0 {
+            tracing::info!(
+                target: "gc.repository.assignments",
+                inactivity_hours = inactivity_hours,
+                count = count,
+                batch_size = limit,
+                "Ended stale assignments"
+            );
+        }
+
+        Ok(count)
+    }
+
     /// Clean up old ended assignments.
     ///
     /// Deletes assignments that ended more than `retention_days` ago.
     /// Run periodically as a background job.
-    // Allow: Used in tests; will be called from background cleanup task
-    #[allow(dead_code)]
+    ///
+    /// # Arguments
+    ///
+    /// * `pool` - Database connection pool
+    /// * `retention_days` - Days of retention before hard-deleting
+    /// * `batch_size` - Optional batch size limit (defaults to 1000)
     #[instrument(skip_all, fields(retention_days = retention_days))]
     pub async fn cleanup_old_assignments(
         pool: &PgPool,
         retention_days: i32,
+        batch_size: Option<i64>,
     ) -> Result<u64, GcError> {
+        let limit = batch_size.unwrap_or(DEFAULT_CLEANUP_BATCH_SIZE);
+
+        // LIMIT via subquery prevents long-running transactions in pathological cases.
         let result = sqlx::query(
             r#"
             DELETE FROM meeting_assignments
-            WHERE ended_at < NOW() - ($1 || ' days')::INTERVAL
+            WHERE meeting_id IN (
+                SELECT meeting_id FROM meeting_assignments
+                WHERE ended_at < NOW() - ($1 || ' days')::INTERVAL
+                LIMIT $2
+            )
             "#,
         )
         .bind(retention_days.to_string())
+        .bind(limit)
         .execute(pool)
         .await?;
 
@@ -381,6 +465,7 @@ impl MeetingAssignmentsRepository {
                 target: "gc.repository.assignments",
                 retention_days = retention_days,
                 count = count,
+                batch_size = limit,
                 "Cleaned up old assignments"
             );
         }
