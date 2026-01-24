@@ -29,13 +29,15 @@ Instead of one AI doing everything autonomously, we use a **human-in-the-loop mo
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                    HUMAN ORCHESTRATOR                       │
-│         (Initiates tasks, approves steps, decides)          │
+│         (Invokes skills, approves results, decides)         │
 └────────────────────────────┬────────────────────────────────┘
+                             │
+            Invokes: /dev-loop-init, /dev-loop-implement, etc.
                              │
                              ▼
 ┌─────────────────────────────────────────────────────────────┐
-│                   CLAUDE (STEP-RUNNER)                      │
-│         (Prepares prompts, spawns specialists)              │
+│                 CLAUDE (SKILL EXECUTOR)                     │
+│     (Follows skill procedures, spawns specialists)          │
 └────────────────────────────┬────────────────────────────────┘
                              │
         ┌────────────────────┼────────────────────┐
@@ -53,7 +55,7 @@ Instead of one AI doing everything autonomously, we use a **human-in-the-loop mo
 ```
 
 **Why this structure?**
-- **Human oversight**: Each step requires explicit approval before execution
+- **Human controls flow**: User invokes skills explicitly; Claude executes but doesn't decide what's next
 - **Bounded context**: Each specialist only needs to understand their domain, not the entire system
 - **Focused prompts**: We inject only relevant knowledge, not everything we know
 - **Parallel execution**: Independent tasks run simultaneously, each with fresh context
@@ -191,6 +193,8 @@ This ensures specialists follow project-specific security and quality standards,
 
 Putting it all together, here's how a feature gets implemented. The key insight: **humans approve each step before it runs**.
 
+> **Evolution Note**: The dev-loop went through several iterations before arriving at the current design. See [Evolution of the Dev-Loop](#evolution-of-the-dev-loop) below for why earlier approaches failed.
+
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │  0. INITIATION                                              │
@@ -240,12 +244,142 @@ Putting it all together, here's how a feature gets implemented. The key insight:
 └─────────────────────────────────────────────────────────────┘
 ```
 
-**Why human approval at each step?**
-- Prevents runaway AI loops that waste time or go in wrong directions
-- Gives visibility into what specialists are being asked to do
-- Allows course-correction before expensive operations
-- Human can fix simple issues directly without re-invoking specialists
-- Keeps the AI step-runner focused: autonomous orchestration leads to context overload, confusion, and loops
+**Why human control of flow?**
+- **Prevents skipped steps**: When Claude orchestrates, it "helpfully" skips steps that seem unnecessary
+- **Prevents runaway loops**: Without human checkpoints, Claude iterates endlessly on minor issues
+- **Consistent execution**: Skills define exact procedures; no interpretation variance between sessions
+- **Bounded context**: Each skill invocation starts fresh; conversation doesn't accumulate indefinitely
+- **Course correction**: Human can fix simple issues directly or adjust approach before expensive operations
+
+See [Evolution of the Dev-Loop](#evolution-of-the-dev-loop) for why earlier autonomous approaches failed.
+
+---
+
+## Evolution of the Dev-Loop
+
+The current skill-based dev-loop is the result of several iterations. Each version taught us something about working with AI agents.
+
+### Version 1: Autonomous Orchestrator (Jan 9, 2026)
+
+**Approach**: Claude acted as an autonomous orchestrator, running the entire dev-loop without human intervention between steps.
+
+```
+Human: "Implement feature X"
+    ↓
+Claude (autonomously):
+    → Identifies specialist
+    → Spawns specialist
+    → Runs verification
+    → Spawns reviewers
+    → Does reflection
+    → Reports results
+```
+
+**What went wrong**:
+- **Skipped steps**: In trying to be helpful, Claude would skip verification or code review when the implementation "looked good"
+- **Lost context**: As the conversation grew with verification output and reviewer feedback, Claude lost track of the overall state
+- **Over-optimization**: Instead of following the documented process, Claude would improvise "shortcuts" that missed important checks
+- **Runaway loops**: Without human checkpoints, Claude would sometimes iterate endlessly on minor issues
+
+**Files at this version**: [.claude/workflows/development-loop.md @ 64d200e](https://github.com/nbuckles13/dark_tower/blob/64d200e/.claude/workflows/development-loop.md)
+
+**Relevant ADR**: [ADR-0016: Development Loop](https://github.com/nbuckles13/dark_tower/blob/64d200e/docs/decisions/adr-0016-development-loop.md)
+
+---
+
+### Version 2: Step-Runner Architecture (Jan 17, 2026)
+
+**Approach**: Introduced a three-tier hierarchy to contain context. Orchestrator reads minimal state machine; step-runners handle details; specialists do domain work.
+
+```
+┌─────────────────────────────────────┐
+│  ORCHESTRATOR (Claude)              │
+│  Reads: development-loop.md only    │
+│  Does: State transitions            │
+└────────────────┬────────────────────┘
+                 ↓
+┌─────────────────────────────────────┐
+│  STEP-RUNNER (claude --print)       │
+│  Reads: step-*.md for current step  │
+│  Does: Execute one step completely  │
+└────────────────┬────────────────────┘
+                 ↓
+┌─────────────────────────────────────┐
+│  SPECIALIST (Task agent)            │
+│  Reads: agent definition + knowledge│
+│  Does: Domain expertise             │
+└─────────────────────────────────────┘
+```
+
+**What went wrong**:
+- **Still Claude as orchestrator**: The fundamental problem remained - Claude was deciding when and how to run steps
+- **Context still accumulated**: Even with step-runners, the orchestrator conversation grew with each step's output
+- **Inconsistent execution**: Claude would interpret the workflow docs differently across sessions, leading to non-reproducible behavior
+- **Process drift**: Claude would "helpfully" deviate from the documented process, missing critical steps
+
+**Files at this version**: [.claude/workflows/development-loop/ @ 0759656](https://github.com/nbuckles13/dark_tower/tree/0759656/.claude/workflows/development-loop)
+
+**Relevant ADR**: [ADR-0021: Step-Runner Architecture](https://github.com/nbuckles13/dark_tower/blob/0759656/docs/decisions/adr-0021-step-runner-architecture.md)
+
+---
+
+### Version 2.5: User as Orchestrator (Jan 19, 2026)
+
+**Approach**: Shifted orchestration to the human. User explicitly approves each step; Claude prepares prompts and spawns specialists but doesn't decide what to run next.
+
+**Improvement**: Human approval points prevented skipped steps and runaway loops.
+
+**Remaining problems**:
+- **Workflow docs as source of truth**: Claude still had to read and interpret workflow documentation
+- **Interpretation variance**: Different sessions interpreted the same docs differently
+- **Context overhead**: Workflow docs loaded into context took space away from actual work
+
+**Files at this version**: [.claude/workflows/development-loop.md @ 215f233](https://github.com/nbuckles13/dark_tower/blob/215f233/.claude/workflows/development-loop.md)
+
+---
+
+### Version 3: Skill-Based Dev-Loop (Jan 21, 2026 - Current)
+
+**Approach**: Each step is an executable skill. User invokes skills directly via `/dev-loop-*` commands. Skills are procedures, not docs to interpret.
+
+```
+User: /dev-loop-init "implement feature X"
+    ↓
+Claude: Executes skill procedure (creates output dir, matches principles)
+    ↓
+User: /dev-loop-implement
+    ↓
+Claude: Executes skill procedure (spawns specialist with context)
+    ↓
+User: /dev-loop-validate
+    ↓
+... and so on
+```
+
+**Why this works**:
+- **No interpretation needed**: Skills define exact steps, not prose to parse
+- **User controls flow**: Each skill explicitly tells the user what to run next
+- **Bounded context**: Each skill loads only what it needs
+- **Same agent continuity**: Planning and implementation can use the same agent, preserving context
+- **Reproducible**: Same skill invocation produces same behavior
+
+**Current files**: [.claude/skills/dev-loop/](https://github.com/nbuckles13/dark_tower/tree/main/.claude/skills)
+
+**Relevant ADR**: [ADR-0022: Skill-Based Development Loop](docs/decisions/adr-0022-skill-based-dev-loop.md)
+
+---
+
+### The Root Cause
+
+All three failed approaches shared a common failure mode: **putting Claude in charge of process flow**.
+
+When Claude orchestrates:
+1. **Context accumulates** - Each step adds output to the conversation
+2. **Helpfulness backfires** - Claude tries to optimize the process, skipping "unnecessary" steps
+3. **Interpretation varies** - Same documentation, different behavior across sessions
+4. **Complex beats simple** - When faced with a choice, Claude picks the "smarter" approach even when the simple one is correct
+
+The fix wasn't better documentation or more guardrails - it was **removing Claude from the decision loop entirely**. The human decides what to run; Claude just executes.
 
 ---
 
@@ -279,7 +413,7 @@ Using this methodology, Dark Tower has achieved:
 - **83% test coverage** (targeting 95%) with 65+ security tests
 - **Zero known security vulnerabilities** in implemented components
 - **Consistent code quality** across 10,000+ lines of Rust
-- **Clear architectural decisions** documented in 17 ADRs
+- **Clear architectural decisions** documented in 22 ADRs
 
 The codebase handles authentication, JWT issuance, key rotation, rate limiting, and encryption - all generated by AI following this structured methodology.
 
@@ -291,7 +425,7 @@ The codebase handles authentication, JWT issuance, key rotation, rate limiting, 
 |-------|----------|
 | Project overview | [README.md](README.md) |
 | Full architecture | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) |
-| Development workflow | [.claude/workflows/development-loop.md](.claude/workflows/development-loop.md) |
+| Development workflow | [.claude/skills/dev-loop/SKILL.md](.claude/skills/dev-loop/SKILL.md) |
 | Specialist definitions | [.claude/agents/](.claude/agents/) |
 | Principles | [docs/principles/](docs/principles/) |
 | Architecture decisions | [docs/decisions/](docs/decisions/) |

@@ -37,6 +37,14 @@
 - [x] Knowledge injected into specialist prompts
 - **Specialists with knowledge**: auth-controller, security, test, code-reviewer
 
+### Skill-Based Dev-Loop Migration ✅ (ADR-0022)
+- [x] Migrated from workflow docs to executable skills
+- [x] Created skills: dev-loop-init, dev-loop-implement, dev-loop-validate, etc.
+- [x] Deleted obsolete `.claude/workflows/development-loop/` directory and files
+- [x] Updated CLAUDE.md, DEVELOPMENT_WORKFLOW.md, PROJECT_STATUS.md
+- [x] Added supersession notes to ADR-0016 and ADR-0018
+- **Commit**: TBD
+
 ---
 
 ## Phase 4: P1 Security Test Improvements

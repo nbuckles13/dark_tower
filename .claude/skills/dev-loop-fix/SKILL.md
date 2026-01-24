@@ -30,10 +30,10 @@ Used after:
 If output-dir not provided, auto-detect:
 
 1. List directories in `docs/dev-loop-outputs/` (excluding `_template`)
-2. Filter to `Current Step` in (`validation`, `code_review`)
+2. Filter to `Current Step` = `fix`
 3. If exactly one: use it
 4. If multiple: ask user which one
-5. If none: error - "No dev-loop has failures to fix."
+5. If none: error - "No dev-loop in fix state. Run `/dev-loop-validate` or `/dev-loop-review` first."
 
 ### Step 2: Check Iteration Count
 
@@ -133,6 +133,7 @@ The implementation has {validation failures | code review findings} that need to
    - Updated Implementation Summary
    - Updated Files Modified
    - New verification results
+   - **Note**: Do NOT modify `Implementing Agent` in Loop State - that is managed by the orchestrator
 4. **Update your checkpoint** with fix details
 5. **Return** with structured output
 
@@ -208,14 +209,18 @@ Add to "Issues Encountered & Resolutions" section:
 
 #### If Fixes Applied Successfully
 
+Update Loop State:
+
+| Field | Value |
+|-------|-------|
+| Current Step | `validation` |
+
 ```
 **Fixes Applied - Iteration {N}**
 
 Specialist: {name}
 Fixes made:
 {list of fixes}
-
-Verification re-run: {passed/failed}
 
 **Next step**: Run `/dev-loop-validate`
 ```
@@ -243,20 +248,26 @@ Options:
 - **Filter TECH_DEBT**: Tech debt findings don't require fixes
 - **--workspace flag**: All cargo commands must use --workspace
 
-## Iteration Flow
+## State Machine
 
 ```
-/dev-loop-validate fails (iteration 1)
-    ↓
-/dev-loop-fix (increments to iteration 2)
-    ↓
-/dev-loop-validate (re-check)
-    ↓ (pass)           ↓ (fail)
-/dev-loop-review    /dev-loop-fix (iteration 3)
-                        ↓
-                    ... up to iteration 5
+implementation
+     ↓
+validation ←─────────┐
+     ↓ pass   ↓ fail │
+code_review   fix ───┘
+     ↓ pass   ↓ fail
+reflection    fix ───→ validation → code_review → ...
 ```
+
+| Current Step | Event | Next Step |
+|--------------|-------|-----------|
+| `validation` | passes | `code_review` |
+| `validation` | fails | `fix` |
+| `code_review` | APPROVED | `reflection` |
+| `code_review` | REQUEST_CHANGES | `fix` |
+| `fix` | fix completes | `validation` |
 
 ---
 
-**Next step**: Run `/dev-loop-validate`
+**Next step**: Always run `/dev-loop-validate` after fix (then `/dev-loop-review` after validation passes)

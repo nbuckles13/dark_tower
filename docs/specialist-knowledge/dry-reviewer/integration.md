@@ -26,6 +26,14 @@ Both services implement EdDSA public key decoding from base64url and DecodingKey
 
 ---
 
+### TD-3: ID Validation Function Patterns
+**Added**: 2026-01-23
+**Related files**: `crates/global-controller/src/auth/`, `crates/ac-service/src/`
+
+`validate_meeting_id` (GC) duplicates structural logic from `validate_controller_id` (AC) - both validate identifier format with similar length/character checks. Severity: Low (validation is intentionally strict per-type). Improvement path: Consider extracting to `common::validation::id` trait when Meeting Controller adds its own ID validation. Timeline: Phase 6+ (when MC implementation begins). Note: Different ID types have different semantic requirements, so some duplication may be acceptable.
+
+---
+
 ## Specialist Coordination
 **Added**: 2026-01-15
 **Related files**: `.claude/agents/security.md`, `.claude/agents/code-reviewer.md`, `.claude/agents/test.md`

@@ -337,12 +337,13 @@ dark_tower/
 | Document | Description | Status |
 |----------|-------------|--------|
 | [.claude/DEVELOPMENT_WORKFLOW.md](../.claude/DEVELOPMENT_WORKFLOW.md) | Specialist-led development rules | ✅ Current |
-| [.claude/workflows/development-loop.md](../.claude/workflows/development-loop.md) | **Implementation workflow mechanics** | ✅ New |
+| [.claude/skills/dev-loop/SKILL.md](../.claude/skills/dev-loop/SKILL.md) | **Dev-loop overview and navigation** | ✅ Current |
+| [.claude/skills/dev-loop-*/SKILL.md](../.claude/skills/) | **Individual dev-loop step skills** | ✅ Current |
 | [.claude/workflows/multi-agent-debate.md](../.claude/workflows/multi-agent-debate.md) | Debate mechanics | ✅ Current |
 | [.claude/workflows/code-review.md](../.claude/workflows/code-review.md) | Code review process | ✅ Current |
 | [.claude/workflows/process-review-record.md](../.claude/workflows/process-review-record.md) | Process review workflow | ✅ Current |
 | [docs/process-reviews/](process-reviews/) | Process review records (PRRs) | ✅ Current |
-| [docs/dev-loop-outputs/](dev-loop-outputs/) | **Development loop output records** | ✅ New |
+| [docs/dev-loop-outputs/](dev-loop-outputs/) | **Development loop output records** | ✅ Current |
 
 ### Specialist Knowledge
 | Location | Description | Status |
@@ -364,6 +365,7 @@ dark_tower/
 | ADR-0015 | Principles & Guards Methodology |
 | ADR-0016 | Development Loop Workflow |
 | ADR-0017 | Specialist Knowledge Architecture |
+| ADR-0022 | Skill-Based Development Loop |
 
 ## Future Phases
 
@@ -458,6 +460,11 @@ dark_tower/
 
 ## Recent Achievements (January 2026)
 
+- ✅ **Skill-Based Dev-Loop Migration** (ADR-0022)
+  - Migrated from workflow docs to executable skills
+  - Skills: `/dev-loop-init`, `/dev-loop-implement`, `/dev-loop-validate`, etc.
+  - Same agent preserves context across planning → implementation
+  - Deleted obsolete `.claude/workflows/development-loop/` files
 - ✅ **SecretBox/SecretString Refactor**
   - Wrapped all sensitive cryptographic data with secrecy crate
   - Config master_key, hash_secret → SecretBox<Vec<u8>>

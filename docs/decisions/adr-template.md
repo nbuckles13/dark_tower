@@ -42,6 +42,19 @@ What becomes easier or more difficult to do because of this change?
 **Neutral**:
 - Changes that are neither clearly positive nor negative
 
+## Implementation Status
+
+Track implementation progress by section/component:
+
+| Section | Component | Status | Commit/PR | Notes |
+|---------|-----------|--------|-----------|-------|
+| 1 | Component Name | ❌ Pending | | |
+| 2 | Another Component | ❌ Pending | | |
+
+**Status values**: ✅ Done | 🚧 In Progress | ❌ Pending | ⏸️ Deferred
+
+Update this table as implementation progresses. Link commits/PRs for traceability.
+
 ## Alternatives Considered
 
 What other options did we evaluate?

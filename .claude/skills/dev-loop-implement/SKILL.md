@@ -29,7 +29,7 @@ The specialist implements the task, runs 7-layer verification, and writes checkp
 If output-dir not provided, auto-detect:
 
 1. List directories in `docs/dev-loop-outputs/` (excluding `_template`)
-2. Filter to `Current Step` in (`init`, `implementation`)
+2. Filter to `Current Step` in (`init`, `planning`, `implementation`)
 3. If exactly one: use it
 4. If multiple: ask user which one
 5. If none: error - "No active dev-loop. Run `/dev-loop-init` first."
@@ -37,16 +37,29 @@ If output-dir not provided, auto-detect:
 Read the `main.md` to get:
 - Task description (from Task Overview > Objective)
 - Implementing Specialist name (from Loop State)
+- Implementing Agent ID (from Loop State - may be set from planning)
 - Matched principles (from Matched Principles section)
+- Planning Proposal section (if exists - from `/dev-loop-plan`)
 
-### Step 2: Update Loop State
+### Step 2: Determine Resume vs Fresh Spawn
+
+Check the `Implementing Agent` field from Loop State:
+
+**If agent ID exists (not `pending`)**: Planning was used
+- Will resume the existing agent with full context
+- The agent already explored the codebase during planning
+- Inject the approved plan as implementation instructions
+
+**If agent ID is `pending`**: Fresh spawn needed
+- Standard flow, no planning was done
+- Will spawn new agent with full prompt
 
 Update `main.md` Loop State:
 
 | Field | Value |
 |-------|-------|
 | Current Step | `implementation` |
-| Implementing Agent | `pending` (will update after spawn) |
+| Implementing Agent | `{keep existing if resuming, or pending if fresh}` |
 
 ### Step 3: Build Specialist Prompt
 
@@ -92,7 +105,7 @@ Then add the task section:
    - Layer 4: `./scripts/test.sh --workspace --lib` (unit tests)
    - Layer 5: `./scripts/test.sh --workspace` (all tests)
    - Layer 6: `cargo clippy --workspace -- -D warnings`
-   - Layer 7: Semantic guards on modified `.rs` files
+   - Layer 7: `./scripts/guards/run-guards.sh --semantic`
 3. **Write checkpoint** to `{output_dir}/{specialist}.md` with:
    - Patterns Discovered
    - Gotchas Encountered
@@ -102,6 +115,7 @@ Then add the task section:
    - Implementation Summary section
    - Files Modified section
    - Dev-Loop Verification Steps section (results of 7 layers)
+   - **Note**: You may update `Current Step` in Loop State, but do NOT modify `Implementing Agent` - that is managed by the orchestrator
 5. **Return** with structured output
 
 **CRITICAL**: Use `--workspace` for all cargo commands. Changes in one crate can break others.
@@ -134,6 +148,46 @@ error: {if failed, explanation}
 
 ### Step 4: Invoke Specialist
 
+#### If Resuming from Planning (agent ID exists and not `pending`)
+
+Resume the existing agent with implementation instructions:
+
+```
+Task tool parameters:
+- subagent_type: "general-purpose"
+- description: "Implement: {first 30 chars of task}"
+- prompt: {resume prompt - see below}
+- resume: "{existing_agent_id}"
+```
+
+**Resume prompt**:
+
+```markdown
+## Implementation Phase
+
+Planning is complete. Proceed with implementation based on the approved plan.
+
+{Include Planning Proposal section from main.md if available}
+
+### Your Responsibilities
+
+1. **Implement** the task as planned
+2. **Run all 7 verification layers** and fix any failures before returning:
+   - Layer 1: `cargo check --workspace`
+   - Layer 2: `cargo fmt --all --check`
+   - Layer 3: `./scripts/guards/run-guards.sh`
+   - Layer 4: `./scripts/test.sh --workspace --lib` (unit tests)
+   - Layer 5: `./scripts/test.sh --workspace` (all tests)
+   - Layer 6: `cargo clippy --workspace -- -D warnings`
+   - Layer 7: `./scripts/guards/run-guards.sh --semantic`
+3. **Write checkpoint** to `{output_dir}/{specialist}.md`
+4. **Update main.md** with implementation results
+
+**CRITICAL**: You have full context from planning. Use it.
+```
+
+#### If Fresh Spawn (agent ID is `pending`)
+
 Use the **Task tool** with `general-purpose` subagent_type:
 
 ```
@@ -145,15 +199,19 @@ Task tool parameters:
 
 **Why Task tool**: Task sub-agents inherit session permissions. Using `claude --print` would spawn a separate process that cannot get user approval.
 
-### Step 5: Capture Agent ID
+### Step 5: Update Loop State
 
-After Task tool returns, capture the agent ID from the response.
+After Task tool returns:
+
+**If fresh spawn**: Capture the agent ID from the response.
+
+**If resumed**: Agent ID already set from planning.
 
 Update `main.md` Loop State:
 
 | Field | Value |
 |-------|-------|
-| Implementing Agent | `{agent_id}` |
+| Implementing Agent | `{agent_id}` (new or existing) |
 | Current Step | `implementation` |
 
 ### Step 6: Verify Checkpoint Exists
@@ -228,8 +286,8 @@ cargo fmt --all --check
 # Layer 6: Lints
 cargo clippy --workspace -- -D warnings
 
-# Layer 7: Semantic guards on modified files
-git diff --name-only HEAD | grep '\.rs$' | xargs ./scripts/guards/semantic/credential-leak.sh
+# Layer 7: Semantic guards
+./scripts/guards/run-guards.sh --semantic
 ```
 
 ---

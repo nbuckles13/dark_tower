@@ -93,7 +93,7 @@ Exit code 0 = PASS
 Get list of modified Rust files and run semantic guards:
 
 ```bash
-git diff --name-only HEAD~1 | grep '\.rs$' | xargs ./scripts/guards/semantic/credential-leak.sh
+./scripts/guards/run-guards.sh --semantic
 ```
 
 Exit codes:
@@ -151,7 +151,11 @@ All 7 verification layers passed:
 
 #### If Any Layer Fails
 
-Keep Loop State at `validation` (do not advance).
+Update Loop State:
+
+| Field | Value |
+|-------|-------|
+| Current Step | `fix` |
 
 Report:
 
