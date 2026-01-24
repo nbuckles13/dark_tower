@@ -393,8 +393,8 @@ async fn test_cleanup_old_assignments(pool: PgPool) -> Result<(), anyhow::Error>
     .execute(&pool)
     .await?;
 
-    // Cleanup with 7 day retention
-    let cleaned = MeetingAssignmentsRepository::cleanup_old_assignments(&pool, 7).await?;
+    // Cleanup with 7 day retention (None uses default batch size)
+    let cleaned = MeetingAssignmentsRepository::cleanup_old_assignments(&pool, 7, None).await?;
     assert_eq!(cleaned, 1);
 
     Ok(())

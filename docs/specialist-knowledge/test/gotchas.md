@@ -259,3 +259,21 @@ if !status.is_success() {
 ```
 
 ---
+
+## Gotcha: Database Error Paths Require sqlx Mocking (Often Deferred)
+**Added**: 2026-01-23
+**Related files**: `crates/global-controller/src/gc_assignment_cleanup.rs`
+
+Testing error paths in functions that use sqlx database operations is difficult because:
+1. sqlx compile-time checked queries connect to real databases
+2. No built-in mocking layer for sqlx - you cannot easily inject "return error on next query"
+3. Creating actual database errors (constraint violations, connection failures) requires complex test setup
+
+Common workarounds:
+- **Trait abstraction**: Define a repository trait, implement it for sqlx, mock in tests (significant refactor)
+- **Test containers**: Use testcontainers to kill/pause database mid-operation (slow, flaky)
+- **Integration-level errors**: Test at HTTP layer where you can return error responses
+
+Result: Error path tests for internal database functions often get **deferred** to tech debt. Document the gap explicitly (e.g., "Deferred: error path tests for run_cleanup() - requires sqlx mocking"). This prevents future reviewers from flagging the same gap without understanding why.
+
+---

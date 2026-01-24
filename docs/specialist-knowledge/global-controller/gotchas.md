@@ -154,3 +154,11 @@ In PostgreSQL, CTEs with data-modifying statements (INSERT, UPDATE, DELETE) all 
 Use `#[allow(dead_code)]` not `#[expect(dead_code)]` for code that's only used in tests. The `#[expect(...)]` attribute generates a warning if the lint would NOT have fired (i.e., if the code IS used). When test modules use helper functions, the code is technically "used" during test compilation, causing `#[expect(dead_code)]` to warn. Use `#[allow(dead_code)]` which silently permits unused code without complaining when it's actually used.
 
 ---
+
+## Gotcha: PostgreSQL Dynamic Interval Casting
+**Added**: 2026-01-23
+**Related files**: `crates/global-controller/src/repositories/meeting_assignments.rs`
+
+PostgreSQL does not allow parameterized intervals directly (e.g., `INTERVAL $1 hours` fails). Use string concatenation with explicit cast: `($1 || ' hours')::INTERVAL` where `$1` is an integer. This pattern works for hours, days, minutes, etc. The parameter must be text or castable to text. Example: `WHERE assigned_at < NOW() - ($1 || ' hours')::INTERVAL` with bind value of integer hours.
+
+---

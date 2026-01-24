@@ -172,11 +172,23 @@ service MeetingControllerService {
   rpc Assign(AssignMeeting) returns (AssignMeetingResponse);
 }
 
+// Request to notify GC that a meeting has ended
+message NotifyMeetingEndedRequest {
+  string meeting_id = 1;  // Meeting that ended
+  string region = 2;      // Region where the meeting was hosted
+}
+
+// Response to meeting ended notification
+message NotifyMeetingEndedResponse {
+  bool acknowledged = 1;
+}
+
 // MC→GC service (MCs call this to register and heartbeat)
 service GlobalControllerService {
   rpc RegisterMC(RegisterMCRequest) returns (RegisterMCResponse);
   rpc FastHeartbeat(FastHeartbeatRequest) returns (HeartbeatResponse);
   rpc ComprehensiveHeartbeat(ComprehensiveHeartbeatRequest) returns (HeartbeatResponse);
+  rpc NotifyMeetingEnded(NotifyMeetingEndedRequest) returns (NotifyMeetingEndedResponse);
 }
 
 message RegistrationResponse {
