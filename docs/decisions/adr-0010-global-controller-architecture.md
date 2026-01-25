@@ -287,6 +287,105 @@ let mut client = GlobalControllerServiceClient::with_interceptor(
 );
 ```
 
+### 4a. Meeting Assignment Notification (GC → MC)
+
+When GC assigns a meeting to an MC, it proactively notifies the MC rather than waiting for client connection. This allows MC to reject assignments when at capacity (backpressure) and to receive MH assignments from GC.
+
+**Assignment Flow**:
+```
+T=0    Client → GC: JoinMeeting { meeting_id }
+
+T=1    GC: Selects MC-1 (load balancing per Section 2)
+       GC: Selects MH-A, MH-B for this region (per ADR-0023 Section 5)
+
+T=2    GC → MC-1: AssignMeeting {
+           meeting_id,
+           mh_assignments: [MH-A, MH-B],
+           requesting_gc_id
+       }
+
+T=3    MC-1: Accepts or rejects
+
+T=4    If accepted:
+           GC records assignment (Section 1 atomic INSERT)
+           GC → Client: JoinResponse { mc_endpoint }
+           Client connects to MC-1
+
+       If rejected:
+           GC selects MC-2, repeats from T=2
+           (Max 3 retries before returning 503)
+```
+
+**Protocol**:
+```protobuf
+service McAssignment {
+    rpc AssignMeeting(AssignMeetingRequest) returns (AssignMeetingResponse);
+    rpc RequestMhReplacement(MhReplacementRequest) returns (MhReplacementResponse);
+}
+
+message AssignMeetingRequest {
+    string meeting_id = 1;
+    repeated MhAssignment mh_assignments = 2;
+    string requesting_gc_id = 3;
+}
+
+message MhAssignment {
+    string mh_id = 1;
+    string webtransport_endpoint = 2;
+    MhRole role = 3;
+}
+
+enum MhRole {
+    MH_ROLE_UNSPECIFIED = 0;
+    MH_ROLE_PRIMARY = 1;
+    MH_ROLE_BACKUP = 2;
+}
+
+message AssignMeetingResponse {
+    bool accepted = 1;
+    RejectionReason rejection_reason = 2;  // Only set if accepted=false
+}
+
+enum RejectionReason {
+    REJECTION_REASON_UNSPECIFIED = 0;
+    REJECTION_REASON_AT_CAPACITY = 1;
+    REJECTION_REASON_DRAINING = 2;
+    REJECTION_REASON_UNHEALTHY = 3;
+}
+
+// MC requests replacement when assigned MH rejects or fails
+message MhReplacementRequest {
+    string meeting_id = 1;
+    string failed_mh_id = 2;
+    MhReplacementReason reason = 3;
+}
+
+enum MhReplacementReason {
+    MH_REPLACEMENT_REASON_UNSPECIFIED = 0;
+    MH_REPLACEMENT_REASON_CAPACITY_EXCEEDED = 1;
+    MH_REPLACEMENT_REASON_UNHEALTHY = 2;
+    MH_REPLACEMENT_REASON_CONNECTION_FAILED = 3;
+}
+
+message MhReplacementResponse {
+    MhAssignment new_mh = 1;
+}
+```
+
+**Why MC can reject**:
+- MC knows its true capacity better than GC's heartbeat-based view (heartbeats can lag)
+- Provides backpressure during load spikes
+- Prevents overload cascades
+
+**Order of operations**: GC notifies MC BEFORE writing to database. This ensures MC has accepted before the assignment is recorded. If MC rejects, GC selects another MC without creating a failed assignment row.
+
+**MH assignments via GC**: GC assigns MHs alongside MC assignment rather than having MC discover MHs directly. This allows:
+- Cross-region MH coordination (MH registry synced via existing GC-to-GC infrastructure)
+- Centralized MH load balancing with global visibility
+- MC can request MH replacement if assigned MH fails (via `RequestMhReplacement`)
+
+See ADR-0023 Section 5 for detailed MH selection algorithm and cross-region meeting MH coordination.
+
 ### 5. Inter-Region MC Discovery
 
 **How do MCs in different regions hosting the same meeting find each other?**
@@ -975,6 +1074,49 @@ CREATE INDEX idx_denylist_expires ON token_denylist(expires_at);
 | MC Assignment | P95 ≤ 20ms |
 | Token Validation | P99 ≤ 2ms |
 
+### 10a. Observability and Trace Propagation
+
+**W3C Trace Context** must be propagated across all GC service boundaries for end-to-end distributed tracing (per ADR-0011):
+
+```
+traceparent: 00-{trace-id}-{parent-id}-{flags}
+
+Example: 00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01
+```
+
+**Propagation flow**:
+```
+Client → GC:  traceparent in HTTP headers
+GC → AC:      traceparent in token validation requests
+GC → MC:      traceparent in gRPC metadata (AssignMeeting, etc.)
+GC → GC:      traceparent in cross-region gRPC (NotifyMeetingEventsBatch)
+GC → DB:      trace_id in query comments for correlation
+```
+
+**Implementation**:
+```rust
+// Extract from incoming HTTP request
+let parent_context = TraceContextPropagator::extract(&request.headers());
+
+// Create span with parent
+let span = tracing::info_span!(
+    "gc.http.request",
+    trace_id = %parent_context.trace_id(),
+    method = %request.method(),
+);
+
+// Propagate to outgoing gRPC
+let mut metadata = tonic::metadata::MetadataMap::new();
+TraceContextPropagator::inject(&span.context(), &mut metadata);
+```
+
+**Current state**: GC has basic `#[instrument]` macros but not W3C Trace Context propagation. Requires:
+- `tracing-opentelemetry` layer
+- OTLP exporter configuration
+- Header extraction/injection middleware
+
+See ADR-0011 for full observability framework and ADR-0023 Section 11 for MC-specific trace propagation.
+
 ### 11. Chaos Engineering Requirements
 
 Must test and handle:
@@ -1015,6 +1157,11 @@ Must test and handle:
 | 3 | Assignment Cleanup - Hard Delete | ✅ Done | pending | Background task |
 | 4 | GC-MC Communication - Registration | ✅ Done | 2b2a5ab | gRPC `RegisterMc` |
 | 4 | GC-MC Communication - Heartbeat | ✅ Done | 2b2a5ab | gRPC `Heartbeat` |
+| 4a | GC→MC AssignMeeting RPC | ❌ Pending | | MC accepts/rejects meeting |
+| 4a | MC Rejection Handling in GC | ❌ Pending | | Retry with different MC |
+| 4a | MH Registry in GC | ❌ Pending | | MH registration + load reports |
+| 4a | MH Cross-Region Sync | ❌ Pending | | Sync MH registry via GC-to-GC |
+| 4a | RequestMhReplacement RPC | ❌ Pending | | MC requests MH replacement |
 | 5 | Outbox Table Schema | ❌ Pending | | `meeting_peer_events_outbox` |
 | 5 | Publisher Background Job | ❌ Pending | | Outbox → Redis + cross-region gRPC |
 | 5 | Cross-Region GC gRPC | ❌ Pending | | `NotifyMeetingEventsBatch` |
@@ -1030,6 +1177,7 @@ Must test and handle:
 | 8 | Database Schema - Denylist | ❌ Pending | | `token_denylist` table |
 | 9 | Heartbeat System | ✅ Done | 2b2a5ab | Health checker background task |
 | 10 | Performance SLOs | ⏸️ Deferred | | Targets defined, not instrumented |
+| 10a | W3C Trace Context Propagation | ❌ Pending | | `tracing-opentelemetry` + OTLP exporter |
 | 11 | Chaos Engineering | ⏸️ Deferred | | Requirements defined, not implemented |
 
 ## Debate Summary
@@ -1081,6 +1229,7 @@ A subsequent debate addressed remaining concerns with a fundamentally simpler ar
 - [ADR-0003: Service Authentication](adr-0003-service-authentication.md) - JWT format and scopes
 - [ADR-0007: Token Lifetime Strategy](adr-0007-token-lifetime-strategy.md) - Denylist implementation
 - [ADR-0009: Integration Test Infrastructure](adr-0009-integration-test-infrastructure.md) - Test harness
+- [ADR-0023: Meeting Controller Architecture](adr-0023-meeting-controller-architecture.md) - MC receives meeting/MH assignments from GC
 
 ## Files to Create/Modify
 

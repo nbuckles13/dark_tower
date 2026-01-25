@@ -129,10 +129,14 @@
 
 ### Observability (ADR-0011 Phase 5)
 
-- [ ] **OpenTelemetry Integration**: Add OTel SDK to AC service for trace propagation
+- [ ] **OpenTelemetry Integration (AC)**: Add OTel SDK to AC service for trace propagation
   - Currently: Basic `tracing` crate with `#[instrument]` macros
   - Needed: `tracing-opentelemetry` layer, OTLP exporter
   - Ref: ADR-0011 Implementation Plan Phase 5
+- [ ] **OpenTelemetry Integration (GC)**: Add W3C Trace Context propagation to GC
+  - Currently: Basic `tracing` crate with `#[instrument]` macros
+  - Needed: Extract traceparent from HTTP, propagate to MC/AC gRPC calls
+  - Ref: ADR-0010 Section 10a, ADR-0011
 - [ ] **Trace ID in Logs**: Once OTel is integrated, `test_logs_have_trace_ids` in env-tests should pass
   - Currently: Test is a soft check (warns but doesn't fail)
   - Location: `crates/env-tests/tests/30_observability.rs`
