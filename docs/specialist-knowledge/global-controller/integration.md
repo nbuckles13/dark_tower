@@ -193,3 +193,24 @@ Meeting assignments follow a soft-delete then hard-delete lifecycle:
 Background task `start_assignment_cleanup()` runs both operations periodically. Uses batch limits to prevent large transactions. Important: stale detection requires MC health status join - only ends assignments where the MC has become unhealthy, not just old assignments.
 
 ---
+
+## Integration: GC-to-MC Assignment RPC Flow
+**Added**: 2026-01-24
+**Related files**: `crates/global-controller/src/services/mc_client.rs`, `crates/global-controller/src/handlers/meetings.rs`
+
+After assigning an MC to a meeting, GC notifies the MC via gRPC:
+
+1. GC selects MC via load balancer (weighted random by available capacity)
+2. GC persists assignment in `meeting_mc_assignments` table
+3. GC calls `McClient::assign_meeting(mc_endpoint, meeting_id, meeting_code)`
+4. MC receives `AssignMeetingRequest`, creates internal meeting state
+5. MC responds with success or rejection reason
+
+**Rejection handling**: If MC rejects (over capacity, shutting down):
+1. GC marks current assignment as ended (`end_assignment`)
+2. GC retries assignment with different MC (exclude rejected MC)
+3. After N retries, return error to client
+
+**Client configuration**: MC client uses `SecretString` for service token, lazy channel connection, and cached channels per endpoint.
+
+---

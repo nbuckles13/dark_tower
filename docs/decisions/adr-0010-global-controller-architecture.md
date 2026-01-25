@@ -1157,9 +1157,11 @@ Must test and handle:
 | 3 | Assignment Cleanup - Hard Delete | ✅ Done | pending | Background task |
 | 4 | GC-MC Communication - Registration | ✅ Done | 2b2a5ab | gRPC `RegisterMc` |
 | 4 | GC-MC Communication - Heartbeat | ✅ Done | 2b2a5ab | gRPC `Heartbeat` |
-| 4a | GC→MC AssignMeeting RPC | ❌ Pending | | MC accepts/rejects meeting |
-| 4a | MC Rejection Handling in GC | ❌ Pending | | Retry with different MC |
-| 4a | MH Registry in GC | ❌ Pending | | MH registration + load reports |
+| 4a | GC→MC AssignMeeting RPC | ✅ Done | 921ebb6 | MC accepts/rejects meeting |
+| 4a | MC Rejection Handling in GC | ✅ Done | 921ebb6 | Retry with different MC (max 3) |
+| 4a | MH Registry in GC | ✅ Done | 921ebb6 | MH registration + load reports |
+| 4a | Wire MH/MC Components | ❌ Pending | | Wire MhService, health checker, assign_meeting_with_mh into handlers/main.rs |
+| 4a | env-tests for MH Registry + Assignment RPC | ❌ Pending | | End-to-end tests with real GC/MC/MH: MH registration, load reports, assignment with MH selection, MC accept/reject |
 | 4a | MH Cross-Region Sync | ❌ Pending | | Sync MH registry via GC-to-GC |
 | 4a | RequestMhReplacement RPC | ❌ Pending | | MC requests MH replacement |
 | 5 | Outbox Table Schema | ❌ Pending | | `meeting_peer_events_outbox` |

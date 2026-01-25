@@ -170,6 +170,8 @@ service MeetingControllerService {
   rpc RegisterController(RegisterMeetingController) returns (RegistrationResponse);
   rpc SendHeartbeat(Heartbeat) returns (HeartbeatResponse);
   rpc Assign(AssignMeeting) returns (AssignMeetingResponse);
+  // ADR-0010 Section 4a: GC notifies MC of meeting assignment with MH assignments
+  rpc AssignMeetingWithMh(AssignMeetingWithMhRequest) returns (AssignMeetingWithMhResponse);
 }
 
 // Request to notify GC that a meeting has ended
@@ -191,12 +193,95 @@ service GlobalControllerService {
   rpc NotifyMeetingEnded(NotifyMeetingEndedRequest) returns (NotifyMeetingEndedResponse);
 }
 
+// MH→GC service (MHs call this to register and send load reports)
+service MediaHandlerRegistryService {
+  // Register a new media handler with the global controller
+  rpc RegisterMH(RegisterMHRequest) returns (RegisterMHResponse);
+  // Send a load report (heartbeat with capacity/health info)
+  rpc SendLoadReport(MHLoadReportRequest) returns (MHLoadReportResponse);
+}
+
 message RegistrationResponse {
   bool accepted = 1;
   string controller_id = 2;
 }
 
 message HeartbeatResponse {
+  bool acknowledged = 1;
+  uint64 timestamp = 2;
+}
+
+// ============================================================================
+// ADR-0010 Section 4a: GC→MC Meeting Assignment with MH Assignments
+// ============================================================================
+
+// Role of a media handler in a meeting
+enum MhRole {
+  MH_ROLE_UNSPECIFIED = 0;
+  MH_ROLE_PRIMARY = 1;
+  MH_ROLE_BACKUP = 2;
+}
+
+// Reason for MC rejecting a meeting assignment
+enum RejectionReason {
+  REJECTION_REASON_UNSPECIFIED = 0;
+  REJECTION_REASON_AT_CAPACITY = 1;
+  REJECTION_REASON_DRAINING = 2;
+  REJECTION_REASON_UNHEALTHY = 3;
+}
+
+// Media handler assignment for a meeting
+message MhAssignment {
+  string mh_id = 1;                   // Media handler ID
+  string webtransport_endpoint = 2;    // WebTransport endpoint for clients
+  MhRole role = 3;                     // Primary or backup role
+}
+
+// Request from GC to MC to assign a meeting with MH assignments
+message AssignMeetingWithMhRequest {
+  string meeting_id = 1;               // Meeting being assigned
+  repeated MhAssignment mh_assignments = 2;  // MH assignments for this meeting
+  string requesting_gc_id = 3;         // ID of the GC making the request
+}
+
+// Response from MC to GC for meeting assignment
+message AssignMeetingWithMhResponse {
+  bool accepted = 1;                   // Whether the MC accepted the assignment
+  RejectionReason rejection_reason = 2; // Reason if not accepted
+}
+
+// ============================================================================
+// ADR-0010 Section 4a: MH Registration and Load Reports
+// ============================================================================
+
+// Request to register a media handler with the global controller
+message RegisterMHRequest {
+  string handler_id = 1;               // Unique handler identifier
+  string region = 2;                   // Deployment region (e.g., "us-east-1")
+  string webtransport_endpoint = 3;    // WebTransport endpoint for client connections
+  string grpc_endpoint = 4;            // gRPC endpoint for MC→MH communication
+  uint32 max_streams = 5;              // Maximum concurrent streams
+}
+
+// Response to MH registration
+message RegisterMHResponse {
+  bool accepted = 1;
+  string message = 2;
+  uint64 load_report_interval_ms = 3;  // How often to send load reports (e.g., 10000ms)
+}
+
+// Load report from MH to GC (heartbeat with capacity info)
+message MHLoadReportRequest {
+  string handler_id = 1;               // Handler sending the report
+  uint32 current_streams = 2;          // Current number of active streams
+  HealthStatus health = 3;             // Current health status
+  float cpu_usage_percent = 4;         // CPU usage (0-100)
+  float memory_usage_percent = 5;      // Memory usage (0-100)
+  float bandwidth_usage_percent = 6;   // Bandwidth usage (0-100)
+}
+
+// Response to load report
+message MHLoadReportResponse {
   bool acknowledged = 1;
   uint64 timestamp = 2;
 }

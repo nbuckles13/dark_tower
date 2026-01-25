@@ -28,8 +28,11 @@ chrono = { workspace = true }
 bcrypt = { workspace = true }
 jsonwebtoken = { workspace = true }
 
-# gRPC server for MC registration
+# gRPC server/client for MC registration
 tonic = { workspace = true }
+
+# Async trait for mock implementations
+async-trait = "0.1"
 
 # Cancellation tokens for graceful shutdown
 tokio-util = { workspace = true }

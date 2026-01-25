@@ -43,3 +43,11 @@ Before classifying duplication: (1) Identify all duplication points in changeset
 When new code follows an existing pattern but adds enhancements, classify as IMPROVEMENT, not duplication. Example: `GcClient.sanitize_error_body()` is an enhancement not in `AuthClient`. The assessment should be: "This is an improvement - consider backporting" not "This duplicates AuthClient." Improvements flow forward (new code is better), duplication flows both ways (same code, neither better).
 
 ---
+
+## Pattern: Mock Trait Pattern for gRPC Clients
+**Added**: 2026-01-24
+**Related files**: `crates/global-controller/src/mc_client.rs`
+
+When reviewing gRPC client code, recognize the mock trait pattern: Define a trait (`McClientTrait`) with async methods, implement it for both the real client (`McClient`) and a mock (`MockMcClient`). This is NOT duplication - it's a standard testability pattern. The trait defines the contract, the real impl uses tonic channels, and the mock returns configurable responses. Mark as ACCEPTABLE when reviewing similar patterns for other gRPC clients (future MhClient, etc.).
+
+---

@@ -205,3 +205,56 @@ RETURNING mc_id
 Benefits: Single atomic operation, avoids CTE snapshot isolation issues where separate CTEs don't see each other's modifications, handles re-assignment cleanly.
 
 ---
+
+## Pattern: Tonic Channel Caching for gRPC Clients
+**Added**: 2026-01-24
+**Related files**: `crates/global-controller/src/services/mc_client.rs`
+
+Cache Tonic `Channel` connections to downstream gRPC services instead of creating new connections per-request:
+1. Store `Arc<RwLock<HashMap<String, Channel>>>` in client struct
+2. On request, check cache for existing channel to target endpoint
+3. If miss, create new channel with `Channel::from_shared(endpoint)?.connect_lazy()`
+4. `connect_lazy()` defers actual connection until first RPC, avoiding blocking during cache population
+5. Channels handle HTTP/2 multiplexing and connection pooling internally
+
+Benefits: Reduces connection overhead, enables HTTP/2 stream reuse, prevents connection exhaustion under load.
+
+---
+
+## Pattern: Mock Trait for Testing gRPC Clients
+**Added**: 2026-01-24
+**Related files**: `crates/global-controller/src/services/mc_client.rs`
+
+Define async trait for gRPC client operations and implement both real and mock versions:
+```rust
+#[async_trait]
+pub trait McClientTrait: Send + Sync {
+    async fn assign_meeting(&self, mc_endpoint: &str, meeting_id: Uuid) -> Result<(), GcError>;
+}
+
+pub struct McClient { /* real implementation */ }
+pub struct MockMcClient { /* test implementation */ }
+```
+Use `Arc<dyn McClientTrait>` in service layer. Tests inject `MockMcClient` that returns configured responses without network calls. This avoids `#[cfg(test)]` coupling and works in both unit and integration tests.
+
+---
+
+## Pattern: SecretString for Service Credentials in Clients
+**Added**: 2026-01-24
+**Related files**: `crates/global-controller/src/services/mc_client.rs`
+
+Wrap service-to-service auth tokens in `secrecy::SecretString` within client structs:
+```rust
+pub struct McClient {
+    service_token: SecretString,
+    // ...
+}
+```
+Use `service_token.expose_secret()` only when building the Authorization header. This ensures:
+- Tokens never appear in Debug output
+- Tokens can't be accidentally logged
+- Memory is zeroized on drop (if using zeroize feature)
+
+Consistent with project-wide sensitive data handling per SecretBox/SecretString refactor.
+
+---

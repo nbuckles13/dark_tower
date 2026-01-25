@@ -290,6 +290,153 @@ This pattern is essential for validating atomic CTEs, distributed locks, and ide
 
 ---
 
+## Pattern: RPC Retry Testing with Mixed Success/Failure Sequences
+**Added**: 2026-01-24
+**Related files**: `crates/global-controller/tests/meeting_assignment_tests.rs`
+
+When testing RPC retry logic, test sequences where some calls fail before eventual success - not just all-fail or all-succeed:
+
+```rust
+#[test]
+async fn test_retry_with_mixed_rejection_then_accept(pool: PgPool) {
+    // Setup: 3 MHs - first two will reject, third will accept
+    let mh1 = create_mh(&pool, "mh-1", HealthStatus::Healthy).await;
+    let mh2 = create_mh(&pool, "mh-2", HealthStatus::Healthy).await;
+    let mh3 = create_mh(&pool, "mh-3", HealthStatus::Healthy).await;
+
+    // Mock RPC responses: mh-1 rejects, mh-2 rejects, mh-3 accepts
+    let mock = MockRpcClient::new()
+        .when_called(&mh1.id).return_error(RpcError::Rejected)
+        .when_called(&mh2.id).return_error(RpcError::Rejected)
+        .when_called(&mh3.id).return_ok(AssignmentResponse::Accepted);
+
+    let result = assign_with_retry(&pool, meeting_id, &mock).await;
+
+    // Verify: assignment succeeded to third MH
+    assert!(result.is_ok());
+    assert_eq!(result.unwrap().mh_id, mh3.id);
+
+    // Verify: first two MHs were tried before success
+    assert_eq!(mock.call_count(&mh1.id), 1);
+    assert_eq!(mock.call_count(&mh2.id), 1);
+    assert_eq!(mock.call_count(&mh3.id), 1);
+}
+```
+
+Key test scenarios for retry logic:
+- All succeed on first try (happy path)
+- All fail (exhausts retries)
+- **Mixed: some fail, eventual success** (the often-missed case)
+- Fail with different error types (transient vs permanent)
+
+The mixed scenario catches bugs where retry counter is incorrectly updated or candidate list isn't properly iterated.
+
+---
+
+## Pattern: Enum State Boundary Value Testing
+**Added**: 2026-01-24
+**Related files**: `crates/global-controller/tests/meeting_assignment_tests.rs`
+
+When code handles multiple enum states (health status, meeting status), test boundary/transitional states explicitly:
+
+```rust
+#[derive(Debug, Clone, PartialEq)]
+pub enum HealthStatus {
+    Healthy,
+    Degraded,  // <-- Often forgotten in tests
+    Unhealthy,
+}
+
+#[test]
+async fn test_load_report_with_degraded_health_status(pool: PgPool) {
+    // Setup: MC with Degraded status (not Healthy, not Unhealthy)
+    let mc = create_mc(&pool, "mc-1", HealthStatus::Degraded).await;
+
+    // Action: Update load (should work for Degraded)
+    let result = update_mc_load(&pool, &mc.id, LoadReport { cpu: 50.0 }).await;
+
+    // Assert: Degraded MCs can report load (they're still functional)
+    assert!(result.is_ok());
+
+    // Verify: Load was actually updated
+    let updated = get_mc(&pool, &mc.id).await?;
+    assert_eq!(updated.current_load.cpu, 50.0);
+}
+```
+
+Why this matters:
+- `Degraded` is a boundary state - not fully healthy, not fully unhealthy
+- Code often has `if status == Healthy` or `if status != Unhealthy` - these handle Degraded differently
+- Without explicit tests, Degraded behavior is undefined and may break silently
+
+Pattern for multi-state enums:
+1. Test each state in isolation (Healthy, Degraded, Unhealthy)
+2. Test state transitions (Healthy -> Degraded -> Unhealthy)
+3. Test operations that should work in boundary states
+4. Test operations that should fail in boundary states
+
+---
+
+## Pattern: Weighted Selection Algorithm Edge Case Testing
+**Added**: 2026-01-24
+**Related files**: `crates/global-controller/tests/meeting_assignment_tests.rs`
+
+When testing weighted random selection (load balancing, capacity allocation), test these edge cases:
+
+```rust
+// Edge case 1: All candidates at maximum capacity
+#[test]
+async fn test_get_candidate_mhs_all_at_max_capacity(pool: PgPool) {
+    // All MHs at 100% capacity
+    create_mh_with_load(&pool, "mh-1", 100.0).await;
+    create_mh_with_load(&pool, "mh-2", 100.0).await;
+    create_mh_with_load(&pool, "mh-3", 100.0).await;
+
+    let candidates = get_candidate_mhs(&pool).await?;
+
+    // Behavior should be defined: empty list, error, or all included with equal weight
+    assert!(candidates.is_empty() || candidates.len() == 3);
+}
+
+// Edge case 2: Load ratio at exact boundary
+#[test]
+async fn test_candidate_selection_load_ratio_boundary(pool: PgPool) {
+    // Test at exact threshold boundary (e.g., 80% threshold)
+    create_mh_with_load(&pool, "mh-at-79", 79.0).await;   // Just below
+    create_mh_with_load(&pool, "mh-at-80", 80.0).await;   // At threshold
+    create_mh_with_load(&pool, "mh-at-81", 81.0).await;   // Just above
+
+    let candidates = get_candidate_mhs(&pool).await?;
+
+    // Verify boundary behavior is consistent
+    // If threshold is "< 80%", only 79 should be included
+    // If threshold is "<= 80%", both 79 and 80 should be included
+    assert!(candidates.iter().any(|c| c.id == "mh-at-79"));
+    // Document expected behavior for at-threshold case
+}
+
+// Edge case 3: Single candidate with weight calculation
+#[test]
+async fn test_single_candidate_weighted_selection(pool: PgPool) {
+    // Only one MH available
+    create_mh_with_load(&pool, "mh-only", 50.0).await;
+
+    let selected = select_mh_weighted(&pool).await?;
+
+    // Must return the only candidate, regardless of weight
+    assert_eq!(selected.id, "mh-only");
+}
+```
+
+Key edge cases for weighted selection:
+1. **All at max capacity**: Division by zero in weight calculation?
+2. **Boundary values**: Off-by-one in threshold comparisons
+3. **Single candidate**: Weight calculation degenerates but should still work
+4. **Zero weight**: What if weight formula produces 0 for some candidates?
+5. **Equal weights**: Selection should be uniform random
+
+---
+
 ## Pattern: Error Body Sanitization in Test Clients
 **Added**: 2026-01-18
 **Related files**: `crates/env-tests/src/fixtures/gc_client.rs`
