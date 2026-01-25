@@ -957,17 +957,104 @@ crates/mc-test-utils/
 
 ## Implementation Status
 
-| Component | Status | Notes |
-|-----------|--------|-------|
-| Actor model hierarchy | Pending | Phase 6 (MC) |
-| Session binding tokens | Pending | Phase 6 (MC) |
-| Fencing token validation | Pending | Phase 6 (MC) |
-| Client unreachability reporting | Pending | Phase 6 (MC) |
-| MH load reporting | Pending | Phase 6 (MC) |
-| Redis Sentinel setup | Pending | Infrastructure |
-| Health endpoints | Pending | Phase 6 (MC) |
-| McTestUtils crate | Pending | Phase 6 (MC) |
-| Runbook content | Pending | Post-implementation |
+### Phase 6a: Foundation (Proto + Skeleton)
+
+| Task | Status | Commit | Notes |
+|------|--------|--------|-------|
+| MC proto messages | ❌ Pending | | JoinRequest, JoinResponse, SignalingMessage |
+| Migration proto messages | ❌ Pending | | McDraining, MigrateMeetings, PrepareMeetingMigration, RedirectToMc |
+| Load management proto | ❌ Pending | | McOverloaded, RequestDrain |
+| MH coordination proto | ❌ Pending | | MhLoadNotification, EnforceMute |
+| Client reporting proto | ❌ Pending | | ReportMcUnreachable |
+| MC crate skeleton | ❌ Pending | | Basic structure, Cargo.toml, main.rs |
+| McTestUtils crate | ❌ Pending | | mock_gc, mock_mh, mock_redis, mock_webtransport |
+
+### Phase 6b: Actor Model + Session Management
+
+| Task | Status | Commit | Notes |
+|------|--------|--------|-------|
+| MeetingControllerActor | ❌ Pending | | Singleton, supervises MeetingActors |
+| MeetingActor | ❌ Pending | | One per meeting, owns state |
+| ConnectionActor | ❌ Pending | | One per WebTransport connection |
+| CancellationToken propagation | ❌ Pending | | Parent→child token hierarchy |
+| Mailbox monitoring | ❌ Pending | | Depth thresholds, metrics |
+| Session binding tokens | ❌ Pending | | HMAC-SHA256, HKDF key derivation |
+| Nonce management | ❌ Pending | | Redis SETNX, TTL handling |
+| Reconnection validation | ❌ Pending | | JWT + binding token verification |
+| Participant disconnect handling | ❌ Pending | | 30s grace period, cleanup |
+
+### Phase 6c: GC Integration
+
+| Task | Status | Commit | Notes |
+|------|--------|--------|-------|
+| MC registration with GC | ❌ Pending | | RegisterMc RPC (GC side exists) |
+| MC heartbeat to GC | ❌ Pending | | Heartbeat RPC (GC side exists) |
+| AssignMeeting handling | ❌ Pending | | Accept/reject logic, MH assignment storage |
+| Fencing token validation | ❌ Pending | | Lua script, generation checks |
+
+### Phase 6d: MH Integration
+
+| Task | Status | Commit | Notes |
+|------|--------|--------|-------|
+| MhLoadNotification handling | ❌ Pending | | Proactive MH health updates |
+| RequestMhReplacement RPC | ❌ Pending | | When all ranked MHs exhausted |
+| EnforceMute to MH | ❌ Pending | | Host-mute enforcement |
+| Cross-region MH coordination | ❌ Pending | | Peer MH connections |
+
+### Phase 6e: Graceful Shutdown + Migration
+
+| Task | Status | Commit | Notes |
+|------|--------|--------|-------|
+| McDraining notification | ❌ Pending | | MC → GC on SIGTERM |
+| Meeting migration state machine | ❌ Pending | | Active → ShuttingDown → Migrating → Complete |
+| PrepareMeetingMigration RPC | ❌ Pending | | MC → MC state handoff |
+| RedirectToMc client notification | ❌ Pending | | Client reconnect to new MC |
+| McDrained final notification | ❌ Pending | | MC → GC on exit |
+
+### Phase 6f: Resilience
+
+| Task | Status | Commit | Notes |
+|------|--------|--------|-------|
+| Redis circuit breaker | ❌ Pending | | 5s timeout, fallback behavior |
+| Load shedding | ❌ Pending | | Capacity-based rejection |
+| Proactive migration | ❌ Pending | | McOverloaded → GC at 95%+ |
+| Actor panic recovery | ❌ Pending | | JoinHandle monitoring, migration trigger |
+
+### Phase 6g: Signaling + Client Features
+
+| Task | Status | Commit | Notes |
+|------|--------|--------|-------|
+| WebTransport connection handling | ❌ Pending | | QUIC/HTTP3 setup |
+| SignalingMessage routing | ❌ Pending | | Sequence numbers, message types |
+| Mute state model | ❌ Pending | | Self-mute (informational) vs host-mute (enforced) |
+| Client unreachability handling | ❌ Pending | | GC forwards reports, MC validates |
+
+### Phase 6h: Observability
+
+| Task | Status | Commit | Notes |
+|------|--------|--------|-------|
+| Health endpoints | ❌ Pending | | /health/live, /health/ready |
+| Degraded state handling | ❌ Pending | | High latency, capacity 80-95% |
+| Metrics | ❌ Pending | | mc_connections_active, mc_meetings_active, etc. |
+| W3C trace context | ❌ Pending | | traceparent propagation |
+
+### Infrastructure
+
+| Task | Status | Commit | Notes |
+|------|--------|--------|-------|
+| Redis Sentinel setup | ❌ Pending | | 3 nodes, quorum 2 |
+| AZ distribution | ❌ Pending | | Topology spread constraints |
+
+### Post-Implementation
+
+| Task | Status | Commit | Notes |
+|------|--------|--------|-------|
+| Runbook: mc-high-memory | ❌ Pending | | Memory > 80% |
+| Runbook: mc-redis-failover | ❌ Pending | | Sentinel failover |
+| Runbook: mc-split-brain | ❌ Pending | | FENCED_OUT events |
+| Runbook: mc-high-latency | ❌ Pending | | P99 > 100ms |
+| Runbook: mc-drain-stuck | ❌ Pending | | Drain timeout |
+| env-tests for MC | ❌ Pending | | End-to-end with real GC/MC/MH |
 
 ## Debate Summary
 
