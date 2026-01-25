@@ -162,3 +162,24 @@ Use `#[allow(dead_code)]` not `#[expect(dead_code)]` for code that's only used i
 PostgreSQL does not allow parameterized intervals directly (e.g., `INTERVAL $1 hours` fails). Use string concatenation with explicit cast: `($1 || ' hours')::INTERVAL` where `$1` is an integer. This pattern works for hours, days, minutes, etc. The parameter must be text or castable to text. Example: `WHERE assigned_at < NOW() - ($1 || ' hours')::INTERVAL` with bind value of integer hours.
 
 ---
+
+## Gotcha: prost Generates Simplified Enum Variant Names
+**Added**: 2026-01-24
+**Related files**: `crates/proto-gen/src/`, `crates/global-controller/src/services/mh_service.rs`
+
+When prost generates Rust code from Protocol Buffers, enum variants are simplified - the enum name prefix is NOT repeated. For example, proto `enum MhRole { MH_ROLE_PRIMARY = 0; }` generates Rust `MhRole::Primary`, not `MhRole::MhRolePrimary`. This catches developers who expect the full proto name. Check generated code in `proto-gen` crate when unsure about variant names.
+
+---
+
+## Gotcha: #[cfg(test)] Helpers Unavailable in Integration Tests
+**Added**: 2026-01-24
+**Related files**: `crates/global-controller/src/services/mc_client.rs`, `crates/global-controller/tests/`
+
+Functions defined in `#[cfg(test)] mod tests { ... }` within a library crate are NOT visible to integration tests (`tests/*.rs`). Integration tests compile as separate crates and only see the public API. Solutions:
+1. Move test helpers to a `-test-utils` crate (preferred for reuse)
+2. Define mock traits in main code, implement in integration tests
+3. Use feature flags (`#[cfg(feature = "test-helpers")]`) for test-only exports
+
+The mock trait pattern (see patterns.md) avoids this issue entirely by keeping test infrastructure in the public API.
+
+---

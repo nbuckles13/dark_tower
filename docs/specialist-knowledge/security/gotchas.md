@@ -99,3 +99,11 @@ When testing JWKS endpoints for private key leakage, DON'T rely on typed deseria
 Custom Debug implementations only activate when `{:?}` formatting is used. Credentials stored in error enum variants can leak through: (1) `assert_eq!` comparisons (uses Debug but also compares values), (2) `Display` impl that includes the body, (3) Direct string interpolation `format!("{}", body)`. The semantic guard flagged this as HIGH risk. Solution: Sanitize bodies BEFORE storing in error variants, not just in Debug output. This is defense-in-depth - never assume callers will use the "safe" formatting path.
 
 ---
+
+## Gotcha: Service Tokens in Registration Structs Often Missed
+**Added**: 2026-01-24
+**Related files**: `crates/global-controller/src/services/media_handler_registry.rs`
+
+When implementing service registration (handlers, workers, external services), the authentication token field is often stored as plain `String` because the focus is on the registration logic rather than data protection. This is especially common in: (1) Registry structs that cache registered services, (2) DTO structs for registration requests, (3) Handler metadata stored in HashMaps. Pattern: When reviewing registration flows, explicitly check for token/secret fields and verify they use `SecretString`. The field names vary: `service_token`, `auth_token`, `bearer_token`, `api_key`, `secret`.
+
+---

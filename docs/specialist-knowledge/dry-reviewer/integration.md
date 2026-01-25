@@ -11,10 +11,10 @@ Tracked duplication patterns with assigned IDs for consistent classification.
 ---
 
 ### TD-1: JWT Validation Duplication (AC vs GC)
-**Added**: 2026-01-15
+**Added**: 2026-01-15 | **Updated**: 2026-01-24
 **Related files**: `crates/ac-service/src/crypto/mod.rs`, `crates/global-controller/src/auth/jwt.rs`
 
-JWT validation logic duplicated between AC and GC: `extract_jwt_kid` (AC) vs `extract_kid` (GC), `verify_jwt` (AC) vs `verify_token` (GC), and `MAX_JWT_SIZE_BYTES` constant (4KB in AC, 8KB in GC). Severity: Medium. Improvement path: Extract to `common::crypto::jwt` utilities module. Timeline: Phase 5+ (post-Phase 4 hardening). Note: GC uses JWKS client for key fetching while AC uses database - extraction must preserve these different key sources.
+JWT validation logic duplicated between AC and GC: `extract_jwt_kid` (AC) vs `extract_kid` (GC), `verify_jwt` (AC) vs `verify_token` (GC), and `MAX_JWT_SIZE_BYTES` constant (4KB in AC, 8KB in GC). Additionally, JWT clock skew constants (e.g., `CLOCK_SKEW_SECONDS`) are duplicated in both services for `iat`/`exp` validation. Severity: Medium. Improvement path: Extract to `common::crypto::jwt` utilities module with configurable constants. Timeline: Phase 5+ (post-Phase 4 hardening). Note: GC uses JWKS client for key fetching while AC uses database - extraction must preserve these different key sources.
 
 ---
 
@@ -31,6 +31,14 @@ Both services implement EdDSA public key decoding from base64url and DecodingKey
 **Related files**: `crates/global-controller/src/auth/`, `crates/ac-service/src/`
 
 `validate_meeting_id` (GC) duplicates structural logic from `validate_controller_id` (AC) - both validate identifier format with similar length/character checks. Severity: Low (validation is intentionally strict per-type). Improvement path: Consider extracting to `common::validation::id` trait when Meeting Controller adds its own ID validation. Timeline: Phase 6+ (when MC implementation begins). Note: Different ID types have different semantic requirements, so some duplication may be acceptable.
+
+---
+
+### TD-4: Weighted Random Selection for Load Balancing
+**Added**: 2026-01-24
+**Related files**: `crates/global-controller/src/repositories/media_handlers.rs`, `crates/global-controller/src/repositories/meeting_controllers.rs`
+
+Both MH selection and MC selection use weighted random selection based on inverse load ratio: calculate weight as `(1.0 - load_ratio) * 100`, use weighted distribution to select instance. Severity: Low (algorithm is simple, 5-10 lines). Improvement path: Consider extracting to `common::load_balancing::WeightedSelector<T>` trait if a third use case appears (e.g., client load balancing). Timeline: Phase 7+ (when Media Handler internal routing is implemented). Note: Current duplication is acceptable as both implementations are in the same crate (GC) and the code is small.
 
 ---
 

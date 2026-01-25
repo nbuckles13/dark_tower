@@ -35,3 +35,11 @@ Never compromise security checks to reduce duplication. When duplication involve
 Only recommend trait extraction when 3+ similar implementations exist. Rust trait bounds increase complexity (generics, associated types, where clauses) that may outweigh DRY benefits for just 2 implementations. For 2 implementations, classify as TECH_DEBT and reassess when a third appears.
 
 ---
+
+## Gotcha: Tokio Background Task Shutdown Patterns
+**Added**: 2026-01-24
+**Related files**: `crates/global-controller/src/mh_health_checker.rs`, `crates/ac-service/src/background/`
+
+Background tasks using Tokio typically share similar shutdown patterns: `select!` on cancellation token + task loop, cleanup on shutdown, tracing spans. Do NOT flag these as duplication requiring extraction - the similarity is inherent to the Tokio async runtime model. Mark as ACCEPTABLE. Only flag if business logic within the task is duplicated, not the infrastructure pattern around it.
+
+---

@@ -88,3 +88,17 @@ HTTP error responses can contain credentials (JWTs in error messages, Bearer tok
 This provides defense-in-depth beyond custom Debug implementations, catching credentials in assertion output, Display formatting, and log messages.
 
 ---
+
+## Pattern: External Resource Registration Validation
+**Added**: 2026-01-24
+**Related files**: `crates/global-controller/src/services/media_handler_registry.rs`
+
+When services register external resources (handlers, endpoints, callback URLs), validate both identifier format AND URL security:
+
+1. **Identifier format validation**: Use allowlist regex patterns (e.g., `^[a-zA-Z0-9_-]+$` for handler IDs). Reject inputs with path traversal, null bytes, or injection characters. Short max lengths (64-128 chars) prevent DoS via long identifiers.
+
+2. **Endpoint URL validation**: Require HTTPS scheme (reject HTTP, FTP, file://). Validate URL parsability. Consider allowlisting domains/IP ranges for internal services. Reject localhost/127.0.0.1 in production to prevent SSRF to internal services.
+
+This pattern applies to: Media Handler registration, webhook callbacks, federation endpoints, any user-supplied URLs stored for later use.
+
+---

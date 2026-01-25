@@ -230,7 +230,7 @@ Acceptable documentation formats:
 ---
 
 ## For Service Specialists: State Machine Transition Tests
-**Added**: 2026-01-21
+**Added**: 2026-01-21, **Updated**: 2026-01-24
 **Related files**: `crates/global-controller/tests/meeting_assignment_tests.rs`
 
 When services track entity state (e.g., MC health, meeting status), test coverage must include state TRANSITIONS, not just happy-path states:
@@ -238,11 +238,13 @@ When services track entity state (e.g., MC health, meeting status), test coverag
 1. **Initial state behavior**: What happens when no state exists yet?
 2. **State change handling**: When entity transitions (healthy → unhealthy), does the system respond correctly?
 3. **Concurrent state access**: Multiple callers accessing during transition?
+4. **Boundary states**: Degraded/transitional states between extremes (added 2026-01-24)
 
 Example: MC assignment tests must cover:
 - Assignment to healthy MC (happy path)
 - Behavior when assigned MC becomes unhealthy (transition)
 - Reassignment to different healthy MC after unhealthy transition
+- **Behavior with Degraded health status** (boundary state - not healthy, not unhealthy)
 
 The transition test pattern:
 ```rust
