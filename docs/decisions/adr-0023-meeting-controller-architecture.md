@@ -973,15 +973,15 @@ crates/mc-test-utils/
 
 | Task | Status | Commit | Notes |
 |------|--------|--------|-------|
-| MeetingControllerActor | ❌ Pending | | Singleton, supervises MeetingActors |
-| MeetingActor | ❌ Pending | | One per meeting, owns state |
-| ConnectionActor | ❌ Pending | | One per WebTransport connection |
-| CancellationToken propagation | ❌ Pending | | Parent→child token hierarchy |
-| Mailbox monitoring | ❌ Pending | | Depth thresholds, metrics |
-| Session binding tokens | ❌ Pending | | HMAC-SHA256, HKDF key derivation |
-| Nonce management | ❌ Pending | | Redis SETNX, TTL handling |
-| Reconnection validation | ❌ Pending | | JWT + binding token verification |
-| Participant disconnect handling | ❌ Pending | | 30s grace period, cleanup |
+| MeetingControllerActor | ✅ Done | 2026-01-25 | Singleton, supervises MeetingActors |
+| MeetingActor | ✅ Done | 2026-01-25 | One per meeting, owns state |
+| ConnectionActor | ✅ Done | 2026-01-25 | One per WebTransport connection |
+| CancellationToken propagation | ✅ Done | 2026-01-25 | Parent→child token hierarchy |
+| Mailbox monitoring | ✅ Done | 2026-01-25 | Depth thresholds (Meeting: 100/500, Connection: 50/200) |
+| Session binding tokens | ✅ Done | 2026-01-25 | HMAC-SHA256, HKDF key derivation in session.rs (in-memory only) |
+| Nonce management | ❌ Pending | | Redis SETNX, TTL handling (requires Phase 6c Redis integration) |
+| Reconnection validation | ⚠️ Partial | 2026-01-25 | In-memory validation done; Redis nonce check pending |
+| Participant disconnect handling | ⚠️ Partial | 2026-01-25 | 30s grace period logic + tests; Redis state cleanup pending |
 
 ### Phase 6c: GC Integration
 

@@ -33,18 +33,19 @@
 //!
 //! # Modules
 //!
-//! - `config` - Service configuration from environment
-//! - `errors` - Error types with appropriate error codes
+//! - [`actors`] - Actor model implementation (Phase 6b)
+//! - [`config`] - Service configuration from environment
+//! - [`errors`] - Error types with appropriate error codes
 //!
 //! # Reference
 //!
 //! See ADR-0023 (Meeting Controller Architecture) for the full design specification.
 
+pub mod actors;
 pub mod config;
 pub mod errors;
 
-// Future modules (Phase 6b+):
-// pub mod actors;         // Actor model implementation
+// Future modules (Phase 6c+):
 // pub mod grpc;           // gRPC handlers for GC communication
 // pub mod handlers;       // WebTransport message handlers
 // pub mod redis;          // Redis state management

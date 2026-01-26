@@ -143,7 +143,7 @@ Write exploration notes to: `{output_dir}/planning-notes.md` (optional, for your
 
 ### Step 4: Invoke Specialist in Planning Mode
 
-Use the **Task tool** with `general-purpose` subagent_type:
+Use the **Task tool** with `general-purpose` subagent_type and model `Opus`:
 
 ```
 Task tool parameters:

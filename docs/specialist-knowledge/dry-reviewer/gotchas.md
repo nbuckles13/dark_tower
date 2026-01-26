@@ -43,3 +43,11 @@ Only recommend trait extraction when 3+ similar implementations exist. Rust trai
 Background tasks using Tokio typically share similar shutdown patterns: `select!` on cancellation token + task loop, cleanup on shutdown, tracing spans. Do NOT flag these as duplication requiring extraction - the similarity is inherent to the Tokio async runtime model. Mark as ACCEPTABLE. Only flag if business logic within the task is duplicated, not the infrastructure pattern around it.
 
 ---
+
+## Gotcha: Tokio Actor Pattern is Service-Specific
+**Added**: 2026-01-25
+**Related files**: `crates/meeting-controller/src/session/actor.rs`
+
+Do NOT flag Tokio actor implementations (task + mpsc channel + message enum) as candidates for extraction to common/. Actor patterns are inherently service-specific: the message types, state machine logic, and business rules are unique to each service's domain. The infrastructure pattern (spawn task, receive messages, handle each variant) is idiomatic Tokio, not duplication. Only flag if two services have identical business logic within their actors.
+
+---

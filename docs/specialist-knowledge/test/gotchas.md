@@ -260,6 +260,39 @@ if !status.is_success() {
 
 ---
 
+## Gotcha: Time-Based Tests Without pause() Are Flaky
+**Added**: 2026-01-25
+**Related files**: `crates/meeting-controller/tests/session_actor_tests.rs`
+
+Tests that check time-dependent behavior (timeouts, grace periods, TTL) can be flaky if they use real time:
+
+```rust
+// FLAKY: depends on actual timing
+#[tokio::test]
+async fn test_grace_period_flaky() {
+    let handle = spawn_with_30s_grace_period();
+    tokio::time::sleep(Duration::from_secs(31)).await;  // Actually waits 31 seconds!
+    assert!(!handle.is_active());  // Sometimes fails under load
+}
+
+// CORRECT: use pause() for deterministic control
+#[tokio::test(start_paused = true)]
+async fn test_grace_period_deterministic() {
+    let handle = spawn_with_30s_grace_period();
+    tokio::time::advance(Duration::from_secs(31)).await;  // Instant
+    assert!(!handle.is_active());  // Always passes
+}
+```
+
+Without `pause()`, time-based tests either:
+1. Run slowly (actually waiting 30+ seconds)
+2. Are flaky (timing depends on system load)
+3. Use loose tolerances that miss boundary bugs
+
+Always use `#[tokio::test(start_paused = true)]` or call `tokio::time::pause()` for time-sensitive tests.
+
+---
+
 ## Gotcha: Database Error Paths Require sqlx Mocking (Often Deferred)
 **Added**: 2026-01-23
 **Related files**: `crates/global-controller/src/gc_assignment_cleanup.rs`

@@ -472,6 +472,113 @@ Also test:
 
 ---
 
+## Pattern: Deterministic Time-Based Tests with tokio::time::pause
+**Added**: 2026-01-25
+**Related files**: `crates/meeting-controller/tests/session_actor_tests.rs`
+
+For testing time-dependent behavior (grace periods, timeouts, expiration), use `tokio::time::pause()` to gain deterministic control over time:
+
+```rust
+#[tokio::test(start_paused = true)]
+async fn test_grace_period_boundary() {
+    let timeout = Duration::from_secs(30);
+
+    // Start operation that has a 30s grace period
+    let handle = spawn_with_grace_period(timeout);
+
+    // Advance to just before timeout (29s) - should still be active
+    tokio::time::advance(Duration::from_secs(29)).await;
+    assert!(handle.is_active(), "Should be active at 29s");
+
+    // Advance past timeout (35s total) - should have expired
+    tokio::time::advance(Duration::from_secs(6)).await;
+    assert!(!handle.is_active(), "Should expire after 30s");
+}
+```
+
+Key benefits:
+- Tests run instantly (no waiting 30 real seconds)
+- Deterministic behavior (no race conditions)
+- Precise boundary testing (exactly at threshold)
+- Works with tokio::time::timeout, sleep, interval
+
+Use `start_paused = true` in test attribute OR call `tokio::time::pause()` at test start.
+
+---
+
+## Pattern: HMAC/Cryptographic Validation Exhaustive Testing
+**Added**: 2026-01-25
+**Related files**: `crates/meeting-controller/src/session/binding.rs`
+
+When testing HMAC or cryptographic token validation, test each field that contributes to the signature independently:
+
+```rust
+// Token binds: session_id + correlation_id + nonce
+fn test_token_validation_exhaustive() {
+    let valid_token = create_valid_token(session_id, correlation_id, nonce);
+
+    // Test each bound field independently
+    assert!(validate(wrong_session_id, correlation_id, nonce, &valid_token).is_err());
+    assert!(validate(session_id, wrong_correlation_id, nonce, &valid_token).is_err());
+    assert!(validate(session_id, correlation_id, wrong_nonce, &valid_token).is_err());
+
+    // Also test combined mismatches
+    assert!(validate(wrong_session_id, wrong_correlation_id, nonce, &valid_token).is_err());
+}
+```
+
+Each field mismatch should return an error, and the error type should be consistent (e.g., `InvalidToken`) to avoid leaking which field failed. This pattern catches bugs where only some fields are actually included in the signature.
+
+---
+
+## Pattern: Actor Lifecycle Testing (spawn, shutdown, cancellation)
+**Added**: 2026-01-25
+**Related files**: `crates/meeting-controller/src/session/actor.rs`
+
+For actor-based systems, test the full lifecycle explicitly:
+
+```rust
+// 1. Spawn test: actor starts and is responsive
+#[tokio::test]
+async fn test_actor_spawn_and_handle_valid() {
+    let (handle, rx) = spawn_actor(config).await;
+    assert!(!handle.is_finished());
+    handle.send(Ping).await.expect("should be responsive");
+}
+
+// 2. Graceful shutdown: actor processes pending work before stopping
+#[tokio::test]
+async fn test_actor_graceful_shutdown() {
+    let (handle, _) = spawn_actor(config).await;
+    handle.shutdown().await;
+    assert!(handle.is_finished());
+    // Verify cleanup occurred (resources released, connections closed)
+}
+
+// 3. Cancellation: actor handles abrupt termination
+#[tokio::test]
+async fn test_actor_cancellation() {
+    let (handle, _) = spawn_actor(config).await;
+    handle.abort();
+    let result = handle.await;
+    assert!(result.is_err()); // JoinError::Cancelled
+}
+
+// 4. Recovery: actor restarts after failure
+#[tokio::test]
+async fn test_actor_restart_after_panic() {
+    let (handle, _) = spawn_actor_with_supervision(config).await;
+    handle.send(CausePanic).await;
+    // Wait for supervisor to restart
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!handle.is_finished()); // Supervisor restarted actor
+}
+```
+
+This ensures actors behave correctly at boundaries, not just during normal operation.
+
+---
+
 ## Pattern: Error Body Sanitization in Test Clients
 **Added**: 2026-01-18
 **Related files**: `crates/env-tests/src/fixtures/gc_client.rs`

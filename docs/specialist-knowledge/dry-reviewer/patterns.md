@@ -51,3 +51,19 @@ When new code follows an existing pattern but adds enhancements, classify as IMP
 When reviewing gRPC client code, recognize the mock trait pattern: Define a trait (`McClientTrait`) with async methods, implement it for both the real client (`McClient`) and a mock (`MockMcClient`). This is NOT duplication - it's a standard testability pattern. The trait defines the contract, the real impl uses tonic channels, and the mock returns configurable responses. Mark as ACCEPTABLE when reviewing similar patterns for other gRPC clients (future MhClient, etc.).
 
 ---
+
+## Pattern: Same Crypto Primitive, Different Purpose
+**Added**: 2026-01-25
+**Related files**: `crates/ac-service/src/crypto/`, `crates/meeting-controller/src/session/`
+
+When the same cryptographic algorithm (e.g., HMAC-SHA256) appears in multiple services, assess semantic purpose before flagging as duplication. Example: AC uses HMAC-SHA256 for full session binding (security-critical token integrity), MC uses HMAC-SHA256 truncated for log correlation IDs (operational convenience). Same primitive, different purposes - NOT candidates for extraction. Mark as ACCEPTABLE and document the semantic distinction.
+
+---
+
+## Pattern: Dev-Dependency Precedent Check
+**Added**: 2026-01-25
+**Related files**: `crates/meeting-controller/Cargo.toml`, `crates/ac-service/Cargo.toml`
+
+Before flagging dev-dependencies as duplication or questioning their necessity, check if existing services use the same pattern. Example: `tokio = { features = ["test-util"] }` in MC Cargo.toml matches AC's existing dev-dependencies. When a pattern follows established precedent in the codebase, classify as ACCEPTABLE. This prevents false positives on legitimate test infrastructure patterns.
+
+---
