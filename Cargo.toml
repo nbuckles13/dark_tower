@@ -8,6 +8,7 @@ members = [
     "crates/ac-service",
     "crates/ac-test-utils",
     "crates/gc-test-utils",
+    "crates/mc-test-utils",
     "crates/common",
     "crates/proto-gen",
     "crates/media-protocol",

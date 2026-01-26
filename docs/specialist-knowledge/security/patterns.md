@@ -102,3 +102,16 @@ When services register external resources (handlers, endpoints, callback URLs), 
 This pattern applies to: Media Handler registration, webhook callbacks, federation endpoints, any user-supplied URLs stored for later use.
 
 ---
+
+## Pattern: Authorization State Separation with Audit Trail
+**Added**: 2026-01-25
+**Related files**: `docs/decisions/adr-0023-mc-architecture.md`
+
+When multiple actors can affect the same state (e.g., mute), maintain separate state per actor:
+1. **Self-initiated state**: User controls (e.g., `self_muted: bool`)
+2. **Host-initiated state**: Admin/host controls (e.g., `host_muted: bool`)
+3. **Effective state**: Computed from both (muted if either is true)
+
+Benefits: (1) Clear audit trail - who caused the mute, (2) Proper restoration - self-unmute doesn't override host-mute, (3) Authorization clarity - different permission checks per actor. Store `muted_by` enum or field for audit: `Self`, `Host`, `System`. This pattern applies to: mute/unmute, visibility, permissions, feature access controlled by multiple authorities.
+
+---

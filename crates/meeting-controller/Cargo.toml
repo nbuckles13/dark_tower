@@ -5,6 +5,7 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+description = "Dark Tower Meeting Controller - stateful WebTransport signaling server"
 
 [lints]
 workspace = true
@@ -12,9 +13,11 @@ workspace = true
 [dependencies]
 # Workspace dependencies
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 quinn = { workspace = true }
 wtransport = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 prost = { workspace = true }
 prost-types = { workspace = true }
 redis = { workspace = true }
@@ -23,7 +26,14 @@ tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
+chrono = { workspace = true }
 bytes = { workspace = true }
+
+# gRPC for GC communication
+tonic = { workspace = true }
+
+# Cryptography for session binding tokens (ADR-0023)
+ring = { workspace = true }
 
 # Local dependencies
 common = { path = "../common" }
@@ -32,3 +42,12 @@ media-protocol = { path = "../media-protocol" }
 
 [dev-dependencies]
 criterion = { workspace = true }
+mc-test-utils = { path = "../mc-test-utils" }
+
+[lib]
+name = "meeting_controller"
+path = "src/lib.rs"
+
+[[bin]]
+name = "meeting-controller"
+path = "src/main.rs"

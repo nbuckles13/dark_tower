@@ -10,6 +10,7 @@
 #![allow(clippy::doc_markdown)] // Generated code has various doc formatting
 #![allow(clippy::default_trait_access)] // Generated code uses Default::default()
 #![allow(clippy::too_many_lines)] // Generated code has long functions
+#![allow(clippy::struct_excessive_bools)] // Generated protobuf structs may have many bool fields
 
 // Re-export prost traits for convenience
 pub use prost::Message;

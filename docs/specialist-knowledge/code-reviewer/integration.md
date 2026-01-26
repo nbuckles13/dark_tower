@@ -77,3 +77,18 @@ When code review identifies DRY violations in test code (duplicated JWT decoding
 4. Ensure helpers return `Result` for ADR-0002 compliance
 
 Flag as tech debt if not immediately addressable per ADR-0019.
+
+---
+
+## Integration: Meeting Controller Service Foundation
+**Added**: 2026-01-25
+**Related files**: `crates/meeting-controller/`, `crates/mc-test-utils/`
+
+MC Phase 6a establishes the foundation for WebTransport signaling. Key patterns for future reviewers:
+1. Config uses builder pattern with `#[must_use]` for fluent test configuration
+2. Custom Debug implementations redact sensitive fields (WebTransport secrets, session tokens)
+3. Error types follow ADR-0003 with From implementations for clean conversions
+4. ADR-0023 references appear in doc comments for traceability
+5. mc-test-utils provides MockRedis for session state testing (note: uses std::sync::Mutex - tech debt)
+
+When reviewing future MC features (session management, participant coordination), ensure they follow these established patterns and reference ADR-0023 sections.

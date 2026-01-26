@@ -281,3 +281,24 @@ env-tests now has two service client fixtures: `AuthClient` (AC) and `GcClient` 
 The `GcClient` pattern is more complete than `AuthClient` - use it as the reference.
 
 ---
+
+## For Meeting Controller Specialist: Mock Infrastructure Testing
+**Added**: 2026-01-25
+**Related files**: `crates/mc-test-utils/src/mock_redis.rs`
+
+When implementing MC features that depend on Redis (session binding, fencing tokens, nonce validation):
+
+1. Use `MockRedis` for unit tests - no async complexity, immediate feedback
+2. Builder pattern for test setup: `.with_session().with_fencing_generation()`
+3. Test atomic operations explicitly:
+   - Fencing validation: current generation, higher (ok), lower (rejected)
+   - Nonce consumption: first use (ok), second use (NonceReused error)
+   - Fenced writes: validate generation before write
+
+Tech debt noted in Phase 6a:
+- TD-1: Integration tests for main binary (Phase 6b)
+- TD-2: MockRedis async interface (Phase 6b) - current interface is synchronous
+
+When Phase 6b implements async Redis traits, update test patterns to use async mocks for integration-level testing.
+
+---

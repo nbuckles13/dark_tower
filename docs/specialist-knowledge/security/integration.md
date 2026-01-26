@@ -67,3 +67,11 @@ GC validates JWTs from AC via JWKS. Requirements: (1) Fetch JWKS from AC_JWKS_UR
 When Media Handlers register with GC, validate: (1) handler_id format (alphanumeric + underscore/hyphen only, max 64 chars), (2) endpoint URL scheme (HTTPS required), (3) service_token stored as SecretString not plain String. Registration endpoints should be authenticated - only services with valid AC tokens can register handlers. Consider IP allowlisting for handler registration in production.
 
 ---
+
+## Integration: Meeting Controller - Session Binding Security
+**Added**: 2026-01-25
+**Related files**: `docs/decisions/adr-0023-mc-architecture.md`
+
+MC binds WebTransport sessions to authenticated users. Requirements: (1) `MC_BINDING_TOKEN_SECRET` must be configured - service should fail startup without it, (2) Binding tokens tie session_id to user via HMAC, (3) correlation_id links join flow across GC→MC for tracing, (4) Session binding errors use typed variants (InvalidToken, SessionNotFound, AlreadyBound) but expose generic messages to clients. Host actions (mute others, kick) require separate authorization checks from self-actions.
+
+---
