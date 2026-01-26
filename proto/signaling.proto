@@ -10,12 +10,19 @@ message ParticipantCapabilities {
   uint32 max_video_streams = 4;
 }
 
-// Request to join a meeting
+// Request to join a meeting (ADR-0023 Session Binding Token Pattern)
+//
+// First connection: correlation_id and binding_token are empty.
+// Reconnection: Client provides previous correlation_id and binding_token
+// for session recovery.
 message JoinRequest {
   string meeting_id = 1;
-  string join_token = 2;
+  string join_token = 2;              // JWT from GC (always required, must be fresh)
   string participant_name = 3;
   ParticipantCapabilities capabilities = 4;
+  // Session recovery fields (ADR-0023)
+  string correlation_id = 5;          // UUIDv7, empty for first join
+  string binding_token = 6;           // HMAC-SHA256 binding token, empty for first join
 }
 
 // Encryption keys for end-to-end encryption
@@ -75,13 +82,20 @@ message Participant {
   uint64 joined_at = 4;
 }
 
-// Response to join request
+// Response to join request (ADR-0023 Session Binding Token Pattern)
+//
+// For first join: MC generates new correlation_id and binding_token.
+// For reconnection: MC issues new binding_token (nonce rotates on success).
+// Client must store correlation_id and binding_token for reconnection.
 message JoinResponse {
   string participant_id = 1;
   uint64 user_id = 2;  // 8-byte user ID for media frames
   repeated Participant existing_participants = 3;
   repeated MediaServerInfo media_servers = 4;  // Multiple handlers
   EncryptionKeys encryption_keys = 5;
+  // Session recovery fields (ADR-0023)
+  string correlation_id = 6;          // UUIDv7, client stores for reconnection
+  string binding_token = 7;           // Client stores for reconnection (30s TTL)
 }
 
 // Reason for participant leaving
@@ -90,6 +104,60 @@ enum LeaveReason {
   KICKED = 1;
   CONNECTION_LOST = 2;
   MEETING_ENDED = 3;
+  TIMEOUT = 4;  // ADR-0023: 30s disconnect grace period expired
+}
+
+// ============================================================================
+// ADR-0023: Mute State (Self-mute vs Host-mute)
+// ============================================================================
+
+// Request to update self-mute status (informational, not enforced by MH)
+message MuteRequest {
+  bool audio_muted = 1;
+  bool video_muted = 2;
+}
+
+// Notification of participant mute state change
+message ParticipantMuteUpdate {
+  string participant_id = 1;
+  bool audio_self_muted = 2;      // Informational: participant muted themselves
+  bool video_self_muted = 3;      // Informational: participant muted themselves
+  bool audio_host_muted = 4;      // Enforced: host muted participant
+  bool video_host_muted = 5;      // Enforced: host muted participant
+  string host_muted_by = 6;       // user_id of host who applied mute (if host-muted)
+}
+
+// Host request to mute a participant (enforced by MC + MH)
+message HostMuteRequest {
+  string participant_id = 1;
+  bool audio_muted = 2;
+  bool video_muted = 3;
+  string reason = 4;              // Optional reason shown to participant
+}
+
+// Participant request to unmute after being host-muted
+message UnmuteRequest {
+  bool request_audio = 1;
+  bool request_video = 2;
+}
+
+// Host response to unmute request
+message UnmuteResponse {
+  string participant_id = 1;
+  bool audio_approved = 2;
+  bool video_approved = 3;
+}
+
+// ============================================================================
+// ADR-0023: MC Migration / Redirect
+// ============================================================================
+
+// Server notification to client to reconnect to a different MC
+// Sent during graceful shutdown, load shedding, or rebalancing
+message RedirectToMc {
+  string new_mc_endpoint = 1;     // WebTransport endpoint of target MC
+  string meeting_id = 2;
+  string reason = 3;              // "migration", "rebalance", "capacity"
 }
 
 // Notification of participant joining
@@ -215,6 +283,11 @@ message ClientMessage {
     UpdateLayout update_layout = 4;
     UnsubscribeLayout unsubscribe_layout = 5;
     StreamQualityUpdate stream_quality_update = 6;
+    // ADR-0023: Mute messages
+    MuteRequest mute_request = 7;
+    HostMuteRequest host_mute_request = 8;
+    UnmuteRequest unmute_request = 9;
+    UnmuteResponse unmute_response = 10;
   }
 }
 
@@ -228,5 +301,10 @@ message ServerMessage {
     StreamAssignments stream_assignments = 5;
     StreamQualityUpdate stream_quality_update = 6;
     ErrorMessage error = 7;
+    // ADR-0023: Additional server messages
+    ParticipantMuteUpdate participant_mute_update = 8;
+    UnmuteRequest unmute_request = 9;    // Host receives participant's request
+    UnmuteResponse unmute_response = 10; // Participant receives host's response
+    RedirectToMc redirect_to_mc = 11;    // MC migration redirect
   }
 }

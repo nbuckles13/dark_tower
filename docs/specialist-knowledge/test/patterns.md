@@ -437,6 +437,41 @@ Key edge cases for weighted selection:
 
 ---
 
+## Pattern: Exhaustive Error Variant Testing
+**Added**: 2026-01-25
+**Related files**: `crates/meeting-controller/src/errors.rs`
+
+When error enums map to protocol codes or client messages, test EVERY variant exhaustively:
+
+```rust
+#[test]
+fn test_error_code_mapping() {
+    // Internal errors -> 6
+    assert_eq!(McError::Redis("conn failed".to_string()).error_code(), 6);
+    assert_eq!(McError::Config("bad config".to_string()).error_code(), 6);
+    assert_eq!(McError::Internal.error_code(), 6);
+    assert_eq!(McError::FencedOut("stale".to_string()).error_code(), 6);
+
+    // Auth errors -> 2
+    assert_eq!(McError::SessionBinding(SessionBindingError::TokenExpired).error_code(), 2);
+    assert_eq!(McError::JwtValidation("expired".to_string()).error_code(), 2);
+
+    // ... every single variant ...
+}
+```
+
+Why exhaustive testing matters:
+- New variants added later get no test coverage if match arms have wildcards
+- Protocol codes must be stable (client depends on them)
+- Missing test = silent regression when someone changes a match arm
+
+Also test:
+- `Display` formatting for each variant
+- `client_message()` doesn't leak internal details (IP addresses, secret names, etc.)
+- `From` trait implementations (e.g., `SessionBindingError` into `McError`)
+
+---
+
 ## Pattern: Error Body Sanitization in Test Clients
 **Added**: 2026-01-18
 **Related files**: `crates/env-tests/src/fixtures/gc_client.rs`

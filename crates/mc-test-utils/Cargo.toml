@@ -1,0 +1,53 @@
+[package]
+name = "mc-test-utils"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Test utilities for the Dark Tower Meeting Controller"
+
+# Note: mc-test-utils is a test utility library providing mocks and fixtures.
+# Test assertion methods intentionally use unwrap/expect/panic to fail tests.
+# Unlike production crates, this crate does NOT inherit workspace lints because
+# test utilities need to use unwrap/expect/panic for assertions.
+
+[dependencies]
+# Async runtime
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+
+# Redis mocking
+redis = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Protobuf
+prost = { workspace = true }
+
+# gRPC for mock services
+tonic = { workspace = true }
+
+# Utilities
+uuid = { workspace = true }
+chrono = { workspace = true }
+bytes = { workspace = true }
+
+# Cryptography for test fixtures
+ring = { workspace = true }
+base64 = "0.22"
+
+# Error handling
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+# Local dependencies
+meeting-controller = { path = "../meeting-controller" }
+proto-gen = { path = "../proto-gen" }
+common = { path = "../common" }
+
+[lib]
+name = "mc_test_utils"
+path = "src/lib.rs"

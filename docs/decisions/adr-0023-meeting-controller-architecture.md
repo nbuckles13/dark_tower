@@ -961,13 +961,13 @@ crates/mc-test-utils/
 
 | Task | Status | Commit | Notes |
 |------|--------|--------|-------|
-| MC proto messages | ❌ Pending | | JoinRequest, JoinResponse, SignalingMessage |
-| Migration proto messages | ❌ Pending | | McDraining, MigrateMeetings, PrepareMeetingMigration, RedirectToMc |
-| Load management proto | ❌ Pending | | McOverloaded, RequestDrain |
-| MH coordination proto | ❌ Pending | | MhLoadNotification, EnforceMute |
-| Client reporting proto | ❌ Pending | | ReportMcUnreachable |
-| MC crate skeleton | ❌ Pending | | Basic structure, Cargo.toml, main.rs |
-| McTestUtils crate | ❌ Pending | | mock_gc, mock_mh, mock_redis, mock_webtransport |
+| MC proto messages | ✅ Done | 2026-01-25 | JoinRequest/Response session binding, mute messages |
+| Migration proto messages | ❌ Pending | | McDraining, MigrateMeetings, PrepareMeetingMigration (Phase 6e) |
+| Load management proto | ❌ Pending | | McOverloaded, RequestDrain (Phase 6f) |
+| MH coordination proto | ❌ Pending | | MhLoadNotification, EnforceMute (Phase 6d) |
+| Client reporting proto | ❌ Pending | | ReportMcUnreachable (Phase 6g) |
+| MC crate skeleton | ✅ Done | 2026-01-25 | config.rs, errors.rs, lib.rs, main.rs |
+| McTestUtils crate | ✅ Done | 2026-01-25 | mock_gc, mock_mh, mock_redis, fixtures |
 
 ### Phase 6b: Actor Model + Session Management
 

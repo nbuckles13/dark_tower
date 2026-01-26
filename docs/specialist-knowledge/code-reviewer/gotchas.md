@@ -155,3 +155,52 @@ tracing::info!("Assigned meeting {} to MC {}", meeting_id, mc_id);
 // In service:
 tracing::info!(meeting_id = %meeting_id, mc_id = %mc_id, "Meeting assigned to MC");
 ```
+
+---
+
+## Gotcha: Silent Config Fallback to Defaults
+**Added**: 2026-01-25
+**Related files**: `crates/meeting-controller/src/config.rs`
+
+Config parsing that silently falls back to default values when environment variables are invalid can mask configuration errors in production. The service may appear to work but with unintended settings:
+
+```rust
+// BAD: Silent fallback hides misconfiguration
+let timeout = env::var("MC_TIMEOUT")
+    .ok()
+    .and_then(|v| v.parse().ok())
+    .unwrap_or(DEFAULT_TIMEOUT);
+
+// GOOD: Log warning when falling back
+let timeout = match env::var("MC_TIMEOUT") {
+    Ok(v) => v.parse().unwrap_or_else(|e| {
+        tracing::warn!("Invalid MC_TIMEOUT '{}': {}. Using default.", v, e);
+        DEFAULT_TIMEOUT
+    }),
+    Err(_) => DEFAULT_TIMEOUT,
+};
+```
+
+At minimum, log a warning when falling back. For security-critical settings, consider failing instead of falling back.
+
+---
+
+## Gotcha: std::sync::Mutex in Async Test Mocks
+**Added**: 2026-01-25
+**Related files**: `crates/mc-test-utils/src/mock_redis.rs`
+
+Using `std::sync::Mutex` in mock implementations for async code can cause deadlocks or poor performance:
+
+```rust
+// PROBLEMATIC: Blocks async runtime threads
+pub struct MockRedis {
+    data: std::sync::Mutex<HashMap<String, String>>,
+}
+
+// BETTER: Use async-aware mutex
+pub struct MockRedis {
+    data: tokio::sync::Mutex<HashMap<String, String>>,
+}
+```
+
+While `std::sync::Mutex` may work in simple test scenarios, it can cause subtle issues when tests run concurrently or when mock methods are called from multiple async contexts. Flag as tech debt if found in test-utils crates.

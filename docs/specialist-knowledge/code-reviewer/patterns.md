@@ -226,3 +226,47 @@ Test API clients should follow this complete pattern (GcClient is the reference)
 Key insight: Sanitize error bodies at capture time (in `handle_response()`), not in Debug output. This prevents credential leaks through all code paths including assertions and error chains.
 
 ---
+
+## Pattern: Builder Pattern with #[must_use] for Complex Structs
+**Added**: 2026-01-25
+**Related files**: `crates/meeting-controller/src/config.rs`
+
+For configuration structs with many optional fields, use the builder pattern with `#[must_use]` on the builder methods. This provides:
+1. Compile-time enforcement that builder results are used
+2. Fluent, readable configuration in tests
+3. Clear defaults without Option-wrapping every field
+
+```rust
+#[derive(Default)]
+pub struct McConfigBuilder { ... }
+
+impl McConfigBuilder {
+    #[must_use]
+    pub fn bind_address(mut self, addr: SocketAddr) -> Self {
+        self.bind_address = Some(addr);
+        self
+    }
+
+    pub fn build(self) -> McConfig { ... }
+}
+```
+
+Benefits: Unused builder chains trigger compiler warnings, preventing accidental configuration omissions.
+
+---
+
+## Pattern: ADR References in Doc Comments
+**Added**: 2026-01-25
+**Related files**: `crates/meeting-controller/src/`
+
+Document code that implements ADR requirements with explicit references in doc comments:
+```rust
+/// Session state for active participants.
+///
+/// See ADR-0023 Section 4.2 for state machine requirements.
+pub struct SessionState { ... }
+```
+
+This creates bidirectional traceability: ADRs reference code locations, code references ADR sections. Makes compliance audits easier and helps future reviewers understand design rationale.
+
+---
