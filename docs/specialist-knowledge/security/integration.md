@@ -69,9 +69,18 @@ When Media Handlers register with GC, validate: (1) handler_id format (alphanume
 ---
 
 ## Integration: Meeting Controller - Session Binding Security
-**Added**: 2026-01-25
+**Added**: 2026-01-25 (Updated: 2026-01-25)
 **Related files**: `docs/decisions/adr-0023-mc-architecture.md`
 
-MC binds WebTransport sessions to authenticated users. Requirements: (1) `MC_BINDING_TOKEN_SECRET` must be configured - service should fail startup without it, (2) Binding tokens tie session_id to user via HMAC, (3) correlation_id links join flow across GC→MC for tracing, (4) Session binding errors use typed variants (InvalidToken, SessionNotFound, AlreadyBound) but expose generic messages to clients. Host actions (mute others, kick) require separate authorization checks from self-actions.
+MC binds WebTransport sessions to authenticated users. Requirements:
+
+1. **Key hierarchy**: Use HKDF to derive per-meeting keys from `MC_BINDING_TOKEN_SECRET`. Never use master secret directly for token generation.
+2. **Token structure**: HMAC-SHA256 over (session_id || user_id || timestamp). Include TTL for expiration (default 5 minutes, configurable 1-60 min).
+3. **Token validation**: Use `ring::hmac::verify()` for constant-time comparison. Never compute expected HMAC and compare with `==`.
+4. **Reconnection**: Validate binding token on reconnect attempts. Reject if TTL expired or session_id mismatch.
+5. **Host authorization**: Check `is_host` field before allowing privileged actions (mute others, kick). Self-actions (self-mute) don't require host check.
+6. **Error sanitization**: Return generic errors to clients ("Invalid session" not "Session abc123 not found").
+
+Service must fail startup if `MC_BINDING_TOKEN_SECRET` is not configured.
 
 ---

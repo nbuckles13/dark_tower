@@ -115,3 +115,17 @@ When multiple actors can affect the same state (e.g., mute), maintain separate s
 Benefits: (1) Clear audit trail - who caused the mute, (2) Proper restoration - self-unmute doesn't override host-mute, (3) Authorization clarity - different permission checks per actor. Store `muted_by` enum or field for audit: `Self`, `Host`, `System`. This pattern applies to: mute/unmute, visibility, permissions, feature access controlled by multiple authorities.
 
 ---
+
+## Pattern: HKDF Key Derivation for Scoped Tokens
+**Added**: 2026-01-25
+**Related files**: `docs/decisions/adr-0023-mc-architecture.md`
+
+When generating tokens scoped to a resource (meeting, session, room), derive per-resource keys using HKDF rather than using a single master key directly:
+
+1. **Master secret**: `MC_BINDING_TOKEN_SECRET` - service-level secret
+2. **Key derivation**: HKDF-SHA256 with resource ID as info parameter: `HKDF(master, salt=nil, info=meeting_id)`
+3. **Token generation**: HMAC-SHA256 with derived key over (session_id || user_id)
+
+Benefits: (1) Compromise of one meeting's tokens doesn't reveal master secret, (2) Key material is deterministic - can regenerate without storage, (3) Follows cryptographic best practices for key hierarchy. Use `ring::hkdf` for derivation. Include TTL in token payload for expiration enforcement.
+
+---

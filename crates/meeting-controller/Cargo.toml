@@ -34,6 +34,7 @@ tonic = { workspace = true }
 
 # Cryptography for session binding tokens (ADR-0023)
 ring = { workspace = true }
+hex = { workspace = true }
 
 # Local dependencies
 common = { path = "../common" }
@@ -43,6 +44,8 @@ media-protocol = { path = "../media-protocol" }
 [dev-dependencies]
 criterion = { workspace = true }
 mc-test-utils = { path = "../mc-test-utils" }
+# Need test-util feature for tokio::time::pause/advance in tests
+tokio = { version = "1.40", features = ["full", "test-util"] }
 
 [lib]
 name = "meeting_controller"

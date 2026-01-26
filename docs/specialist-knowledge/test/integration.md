@@ -283,8 +283,8 @@ The `GcClient` pattern is more complete than `AuthClient` - use it as the refere
 ---
 
 ## For Meeting Controller Specialist: Mock Infrastructure Testing
-**Added**: 2026-01-25
-**Related files**: `crates/mc-test-utils/src/mock_redis.rs`
+**Added**: 2026-01-25, **Updated**: 2026-01-25
+**Related files**: `crates/mc-test-utils/src/mock_redis.rs`, `crates/meeting-controller/tests/session_actor_tests.rs`
 
 When implementing MC features that depend on Redis (session binding, fencing tokens, nonce validation):
 
@@ -295,10 +295,14 @@ When implementing MC features that depend on Redis (session binding, fencing tok
    - Nonce consumption: first use (ok), second use (NonceReused error)
    - Fenced writes: validate generation before write
 
-Tech debt noted in Phase 6a:
-- TD-1: Integration tests for main binary (Phase 6b)
-- TD-2: MockRedis async interface (Phase 6b) - current interface is synchronous
+**Phase 6b additions**:
+- Actor lifecycle tests: spawn, shutdown, cancellation
+- Session binding token validation: test EACH bound field independently (session_id, correlation_id, nonce)
+- Time-based tests: use `#[tokio::test(start_paused = true)]` for grace period testing
+- Host authorization: verify host-only operations reject non-host participants
 
-When Phase 6b implements async Redis traits, update test patterns to use async mocks for integration-level testing.
+Tech debt noted in Phase 6a (now completed in Phase 6b):
+- ~~TD-1: Integration tests for main binary~~ (completed: 64 actor tests)
+- ~~TD-2: MockRedis async interface~~ (completed: async traits implemented)
 
 ---

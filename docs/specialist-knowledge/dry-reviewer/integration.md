@@ -50,6 +50,14 @@ Instance ID generation pattern duplicated between GC and MC (~6 lines each): gen
 
 ---
 
+### TD-6: ActorMetrics Pattern (MC)
+**Added**: 2026-01-25
+**Related files**: `crates/meeting-controller/src/session/actor.rs`
+
+MC's SessionActor uses an ActorMetrics struct to track actor lifecycle metrics (message counts, processing times, queue depths). Severity: Low (first implementation, MC-specific). Improvement path: Consider extracting to `common::metrics::ActorMetrics<T>` trait if GC or MH implement similar actor patterns with metrics. Timeline: Phase 7+ (when second actor implementation appears). Note: Single implementation - do not extract prematurely. Monitor for pattern emergence in other services.
+
+---
+
 ## Specialist Coordination
 **Added**: 2026-01-15
 **Related files**: `.claude/agents/security.md`, `.claude/agents/code-reviewer.md`, `.claude/agents/test.md`

@@ -107,3 +107,19 @@ Custom Debug implementations only activate when `{:?}` formatting is used. Crede
 When implementing service registration (handlers, workers, external services), the authentication token field is often stored as plain `String` because the focus is on the registration logic rather than data protection. This is especially common in: (1) Registry structs that cache registered services, (2) DTO structs for registration requests, (3) Handler metadata stored in HashMaps. Pattern: When reviewing registration flows, explicitly check for token/secret fields and verify they use `SecretString`. The field names vary: `service_token`, `auth_token`, `bearer_token`, `api_key`, `secret`.
 
 ---
+
+## Gotcha: Token Comparison Must Use Constant-Time Operations
+**Added**: 2026-01-25
+**Related files**: `docs/decisions/adr-0023-mc-architecture.md`
+
+Direct byte comparison of tokens (`==`) leaks timing information that can reveal valid tokens character-by-character. For HMAC tokens, use `ring::hmac::verify()` which performs constant-time comparison internally. For non-HMAC tokens, use `ring::constant_time::verify_slices_are_equal()` or `subtle::ConstantTimeEq`. Common mistake: verifying HMAC by computing expected tag and comparing with `==`. The fix: `hmac::verify(&key, message, received_tag)` returns `Ok(())` or `Err(Unspecified)` safely. This applies to: binding tokens, session tokens, CSRF tokens, any security-sensitive comparison.
+
+---
+
+## Gotcha: Error Messages Leaking Internal Identifiers
+**Added**: 2026-01-25
+**Related files**: `docs/decisions/adr-0023-mc-architecture.md`
+
+Error messages returned to clients should never include internal identifiers (session IDs, user IDs, meeting IDs, participant IDs). These identifiers: (1) Enable enumeration attacks - probe which IDs exist, (2) Aid correlation attacks - link sessions across requests, (3) Leak implementation details. Pattern: Use typed error variants internally (e.g., `ParticipantNotFound(participant_id)`) but convert to generic messages at the API boundary: "Participant not found" without the ID. Log the full error server-side with the ID for debugging. Applies to: 401/403/404 responses, WebSocket/WebTransport error frames, error bodies in any client-facing response.
+
+---

@@ -270,3 +270,70 @@ pub struct SessionState { ... }
 This creates bidirectional traceability: ADRs reference code locations, code references ADR sections. Makes compliance audits easier and helps future reviewers understand design rationale.
 
 ---
+
+## Pattern: Actor Handle/Task Separation
+**Added**: 2026-01-25
+**Related files**: `crates/meeting-controller/src/actors/meeting.rs`, `crates/meeting-controller/src/actors/controller.rs`
+
+When implementing the actor pattern (ADR-0001), separate the public API (`Handle`) from the private implementation (`Actor`). The handle contains only `mpsc::Sender` and `CancellationToken`, providing async methods that send messages and await responses via oneshot channels. The actor struct owns all state and runs the message loop. This creates a clean API surface and ensures all state mutations happen within the actor task.
+
+```rust
+pub struct MeetingActorHandle {
+    sender: mpsc::Sender<MeetingMessage>,
+    cancel_token: CancellationToken,
+}
+
+impl MeetingActorHandle {
+    pub async fn get_state(&self) -> Result<MeetingState, McError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.sender.send(MeetingMessage::GetState { respond_to: tx }).await?;
+        rx.await.map_err(|_| McError::Internal)
+    }
+}
+```
+
+---
+
+## Pattern: Async State Queries for Accurate Status
+**Added**: 2026-01-25
+**Related files**: `crates/meeting-controller/src/actors/controller.rs`
+
+When an actor needs to report the state of its children (e.g., participant counts), query the child actor asynchronously rather than caching stale values. This ensures status reflects actual state. Provide graceful fallback when the child actor is unavailable:
+
+```rust
+async fn get_meeting(&self, meeting_id: &str) -> Result<MeetingInfo, McError> {
+    match managed.handle.get_state().await {
+        Ok(state) => Ok(MeetingInfo {
+            participant_count: state.participants.len(),  // Actual count
+            ...
+        }),
+        Err(_) => {
+            warn!("Failed to query meeting actor, returning cached info");
+            Ok(MeetingInfo { participant_count: 0, ... })  // Graceful fallback
+        }
+    }
+}
+```
+
+---
+
+## Pattern: #[allow(clippy::expect_used)] with ADR-0002 Justification
+**Added**: 2026-01-25
+**Related files**: `crates/meeting-controller/src/actors/session.rs`
+
+When `expect()` is unavoidable (e.g., CSPRNG operations, HKDF with fixed parameters), use `#[allow(clippy::expect_used)]` with an inline comment explaining why this is an unreachable invariant per ADR-0002. The comment should explain the technical reason the operation cannot fail:
+
+```rust
+#[allow(clippy::expect_used)] // ADR-0002: CSPRNG fill is an unreachable invariant
+pub fn generate_token(&self, ...) -> (String, String) {
+    // ADR-0002: CSPRNG fill on 16 bytes is an unreachable failure condition
+    // SystemRandom uses OS-level entropy sources (getrandom/urandom) which
+    // only fail if the OS itself is catastrophically broken
+    rand::SecureRandom::fill(&rng, &mut nonce_bytes)
+        .expect("CSPRNG should not fail on 16 bytes");
+}
+```
+
+This documents the security rationale while maintaining ADR-0002 compliance.
+
+---

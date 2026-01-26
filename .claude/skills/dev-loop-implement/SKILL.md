@@ -188,7 +188,7 @@ Planning is complete. Proceed with implementation based on the approved plan.
 
 #### If Fresh Spawn (agent ID is `pending`)
 
-Use the **Task tool** with `general-purpose` subagent_type:
+Use the **Task tool** with `general-purpose` subagent_type and model `Opus`:
 
 ```
 Task tool parameters:

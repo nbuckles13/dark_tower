@@ -4,6 +4,22 @@ What other services need to know when integrating with the Meeting Controller.
 
 ---
 
+## Integration: Actor Hierarchy for MC State Queries
+**Added**: 2026-01-25
+**Related files**: `crates/meeting-controller/src/actors/controller.rs`, `crates/meeting-controller/src/actors/meeting.rs`
+
+When GC queries MC status (for health checks or load balancing), the controller queries child meeting actors to get accurate state. `MeetingControllerActorHandle::get_status()` returns sync cached counts, but `get_meeting(meeting_id)` calls `MeetingActorHandle::get_state()` to get real-time participant count and fencing generation. This ensures consistency but adds latency. For high-frequency health checks, use `get_status()` which uses cached metrics. For assignment decisions, use `get_meeting()` for accuracy.
+
+---
+
+## Integration: CancellationToken Propagation from GC
+**Added**: 2026-01-25
+**Related files**: `crates/meeting-controller/src/actors/controller.rs`
+
+When MC receives shutdown signal (SIGTERM or GC command), it cancels the root `CancellationToken`. This propagates to all meetings, then to all connections. Connections have 50ms to send close frames. Meetings wait up to 5s per connection. Controller waits up to 30s per meeting. GC should set appropriate deadline and retry if MC doesn't acknowledge shutdown within deadline.
+
+---
+
 ## Integration: Session Binding Flow
 **Added**: 2026-01-25
 **Related files**: `proto/signaling.proto`, `crates/meeting-controller/src/session/`

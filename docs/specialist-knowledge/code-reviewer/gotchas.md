@@ -204,3 +204,51 @@ pub struct MockRedis {
 ```
 
 While `std::sync::Mutex` may work in simple test scenarios, it can cause subtle issues when tests run concurrently or when mock methods are called from multiple async contexts. Flag as tech debt if found in test-utils crates.
+
+---
+
+## Gotcha: Synchronous get_* Methods in Actor Handles
+**Added**: 2026-01-25
+**Related files**: `crates/meeting-controller/src/actors/controller.rs`
+
+When an actor handle provides a method to retrieve state that depends on child actors, the method MUST be async. A synchronous getter that returns cached/stale values leads to incorrect status reporting:
+
+```rust
+// BAD: Returns stale cached value
+pub fn get_meeting(&self, meeting_id: &str) -> MeetingInfo {
+    // participant_count is always 0 because we're not querying the actor
+    MeetingInfo { participant_count: self.cached_count, ... }
+}
+
+// GOOD: Async query to child actor for live state
+pub async fn get_meeting(&self, meeting_id: &str) -> Result<MeetingInfo, McError> {
+    let state = self.meeting_handle.get_state().await?;
+    Ok(MeetingInfo { participant_count: state.participants.len(), ... })
+}
+```
+
+This was MINOR-001 in the Phase 6b review - participant_count was always 0 because the method didn't query the MeetingActor.
+
+---
+
+## Gotcha: Missing Graceful Fallback When Actor Communication Fails
+**Added**: 2026-01-25
+**Related files**: `crates/meeting-controller/src/actors/controller.rs`
+
+When querying child actors that may have shut down, always handle the error case gracefully. Returning an error when the actor is unavailable can break status endpoints or cause cascading failures:
+
+```rust
+// BAD: Propagates error when child actor is shutting down
+let state = managed.handle.get_state().await?;
+
+// GOOD: Graceful fallback with logging
+match managed.handle.get_state().await {
+    Ok(state) => Ok(MeetingInfo { participant_count: state.participants.len(), ... }),
+    Err(_) => {
+        warn!("Failed to query meeting actor state, returning cached info");
+        Ok(MeetingInfo { participant_count: 0, ... })  // Safe default
+    }
+}
+```
+
+The graceful fallback ensures status queries don't fail during graceful shutdown or actor restarts.

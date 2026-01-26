@@ -82,13 +82,21 @@ Flag as tech debt if not immediately addressable per ADR-0019.
 
 ## Integration: Meeting Controller Service Foundation
 **Added**: 2026-01-25
+**Updated**: 2026-01-25 (Phase 6b actor implementation)
 **Related files**: `crates/meeting-controller/`, `crates/mc-test-utils/`
 
-MC Phase 6a establishes the foundation for WebTransport signaling. Key patterns for future reviewers:
+MC Phase 6a/6b establishes the foundation for WebTransport signaling. Key patterns for future reviewers:
 1. Config uses builder pattern with `#[must_use]` for fluent test configuration
 2. Custom Debug implementations redact sensitive fields (WebTransport secrets, session tokens)
 3. Error types follow ADR-0003 with From implementations for clean conversions
 4. ADR-0023 references appear in doc comments for traceability
 5. mc-test-utils provides MockRedis for session state testing (note: uses std::sync::Mutex - tech debt)
+
+**Actor Hierarchy (Phase 6b)**:
+- `MeetingControllerActorHandle` (singleton) supervises N `MeetingActorHandle` instances
+- `MeetingActorHandle` supervises N `ConnectionActorHandle` instances
+- Handle/Actor separation per ADR-0001: Handle has `mpsc::Sender` + `CancellationToken`, Actor owns state
+- State queries must be async to get live values from child actors (see MINOR-001 fix)
+- Session binding tokens use HKDF + HMAC-SHA256 per ADR-0023 Section 1
 
 When reviewing future MC features (session management, participant coordination), ensure they follow these established patterns and reference ADR-0023 sections.

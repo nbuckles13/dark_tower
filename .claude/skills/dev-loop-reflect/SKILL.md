@@ -137,7 +137,7 @@ Task tool parameters:
 Fall back to checkpoint injection:
 
 1. Read the specialist's checkpoint file: `{output_dir}/{specialist}.md`
-2. Invoke fresh agent with checkpoint context:
+2. Invoke fresh agent with `general-purpose` subagent_type, model `Opus`, and checkpoint context:
 
 ```markdown
 # Context Recovery for {Specialist}

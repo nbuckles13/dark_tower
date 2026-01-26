@@ -133,7 +133,7 @@ summary: {2-3 sentence summary}
 
 ### Step 5: Invoke All 4 Reviewers in Parallel
 
-Use the **Task tool** with `general-purpose` subagent_type for each reviewer.
+Use the **Task tool** with `general-purpose` subagent_type and model `Opus` for each reviewer.
 
 **CRITICAL**: Invoke all 4 in a single message with multiple Task tool calls for parallel execution.
 
@@ -194,15 +194,15 @@ Add or update the "Code Review Results" section:
 
 ### Security Specialist
 **Verdict**: {verdict}
-{findings summary}
+{list of findings}
 
 ### Test Specialist
 **Verdict**: {verdict}
-{findings summary}
+{list of findings}
 
 ### Code Quality Reviewer
 **Verdict**: {verdict}
-{findings summary}
+{list of findings}
 
 ### DRY Reviewer
 **Verdict**: {verdict}
