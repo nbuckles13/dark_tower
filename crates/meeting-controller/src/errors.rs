@@ -11,7 +11,7 @@ use thiserror::Error;
 /// - `SessionBinding` errors: `UNAUTHORIZED` (2)
 /// - `NotFound`: `NOT_FOUND` (4)
 /// - `Conflict`: `CONFLICT` (5)
-/// - Internal, Redis, Config: `INTERNAL_ERROR` (6)
+/// - Internal, Redis, Config, Grpc: `INTERNAL_ERROR` (6)
 /// - `CapacityExceeded`: `CAPACITY_EXCEEDED` (7)
 #[derive(Debug, Error)]
 #[allow(dead_code)] // Error types used in Phase 6b+
@@ -19,6 +19,10 @@ pub enum McError {
     /// Redis operation failed.
     #[error("Redis error: {0}")]
     Redis(String),
+
+    /// gRPC communication error (MC<->GC, MC<->MH).
+    #[error("gRPC error: {0}")]
+    Grpc(String),
 
     /// Configuration error.
     #[error("Configuration error: {0}")]
@@ -103,7 +107,11 @@ impl McError {
     #[allow(dead_code)] // Used in Phase 6b+
     pub fn error_code(&self) -> i32 {
         match self {
-            McError::Redis(_) | McError::Config(_) | McError::Internal | McError::FencedOut(_) => {
+            McError::Redis(_)
+            | McError::Grpc(_)
+            | McError::Config(_)
+            | McError::Internal
+            | McError::FencedOut(_) => {
                 6 // INTERNAL_ERROR
             }
             McError::SessionBinding(_) | McError::JwtValidation(_) => 2, // UNAUTHORIZED
@@ -121,7 +129,7 @@ impl McError {
     #[allow(dead_code)] // Used in Phase 6b+
     pub fn client_message(&self) -> String {
         match self {
-            McError::Redis(_) | McError::Config(_) | McError::Internal => {
+            McError::Redis(_) | McError::Grpc(_) | McError::Config(_) | McError::Internal => {
                 "An internal error occurred".to_string()
             }
             McError::SessionBinding(e) => e.to_string(),
@@ -153,6 +161,10 @@ mod tests {
     fn test_error_code_mapping() {
         // Internal errors -> 6
         assert_eq!(McError::Redis("conn failed".to_string()).error_code(), 6);
+        assert_eq!(
+            McError::Grpc("connection refused".to_string()).error_code(),
+            6
+        );
         assert_eq!(McError::Config("bad config".to_string()).error_code(), 6);
         assert_eq!(McError::Internal.error_code(), 6);
         assert_eq!(McError::FencedOut("stale".to_string()).error_code(), 6);

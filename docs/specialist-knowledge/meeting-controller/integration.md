@@ -79,21 +79,78 @@ UI should distinguish: self-muted shows mute icon, host-muted shows lock icon. C
 
 ## Integration: Redis Session Storage
 **Added**: 2026-01-25
-**Related files**: `crates/meeting-controller/src/session/`, `crates/mc-test-utils/src/`
+**Related files**: `crates/meeting-controller/src/redis/client.rs`, `crates/mc-test-utils/src/`
 
 MC uses Redis for ephemeral session state:
 
 **Keys**:
-- `session:{session_id}` - Participant session data (TTL: session timeout)
-- `meeting:{meeting_id}:participants` - Set of participant IDs
-- `meeting:{meeting_id}:fence` - Fencing token for assignment validation
-- `nonce:{participant_id}` - Last seen nonce for replay protection
+- `meeting:{meeting_id}:generation` - Fencing generation counter (monotonic)
+- `meeting:{meeting_id}:mh` - MH assignment data (JSON)
+- `meeting:{meeting_id}:state` - Meeting metadata (HASH)
+- `meeting:{meeting_id}:participants` - Set of participant IDs (Phase 6d+)
+- `session:{session_id}` - Participant session data (Phase 6d+)
 
 **Patterns**:
 - All keys have TTL (no orphaned data)
 - Use Lua scripts for atomic multi-key operations
 - Fencing tokens prevent split-brain during MC failover
+- `FencedRedisClient` wraps all writes with generation checks
 
 For testing, `mc-test-utils` provides `MockRedis` that simulates these patterns in-memory.
+
+---
+
+## Integration: MC Registration with GC
+**Added**: 2026-01-25
+**Related files**: `crates/meeting-controller/src/grpc/gc_client.rs`, `proto/internal.proto`
+
+On startup, MC registers with GC via `RegisterMc` RPC:
+
+1. MC builds `RegisterMcRequest` with: id, region, gRPC endpoint, WebTransport endpoint, max_meetings, max_participants
+2. MC calls GC with exponential backoff on failure (max 5 retries, 1s-30s delays)
+3. GC responds with: accepted, heartbeat intervals (fast=10s, comprehensive=30s)
+4. MC stores intervals in atomics, sets `is_registered = true`
+5. MC starts background heartbeat tasks
+
+If GC rejects registration (e.g., duplicate ID), MC should fail startup. Clear the cached channel on connection failure to force reconnection on retry.
+
+---
+
+## Integration: Heartbeat Intervals from GC
+**Added**: 2026-01-25
+**Related files**: `crates/meeting-controller/src/grpc/gc_client.rs`
+
+GC can override default heartbeat intervals in the registration response:
+
+- **Fast heartbeat** (default 10s): Capacity updates only (`current_meetings`, `current_participants`, `health`)
+- **Comprehensive heartbeat** (default 30s): Full metrics (`cpu_usage_percent`, `memory_usage_percent`)
+
+MC stores GC-provided intervals in `AtomicU64` and uses them for scheduling. If GC returns 0, use defaults. This allows GC to tune monitoring frequency based on fleet size or operational mode without MC redeployment.
+
+---
+
+## Integration: MC Accept/Reject for Meeting Assignment
+**Added**: 2026-01-25
+**Related files**: `crates/meeting-controller/src/grpc/mc_service.rs`, `proto/internal.proto`
+
+When GC calls `AssignMeetingWithMh`, MC checks capacity before accepting:
+
+**Rejection reasons** (in order of priority):
+1. `DRAINING` - MC is shutting down gracefully
+2. `AT_CAPACITY` - At meeting limit OR estimated participants would exceed limit
+3. `UNHEALTHY` - Redis/actor errors during assignment
+
+**On acceptance**:
+1. Store MH assignments in Redis (with fencing token)
+2. Create meeting actor
+3. Increment `current_meetings` counter
+4. Return `accepted=true`
+
+**On failure after partial work**:
+- Clean up MH assignments from Redis
+- Don't increment counters
+- Return rejection with appropriate reason
+
+GC should retry with a different MC on any rejection except `DRAINING` (where GC should not retry to this MC until drain completes).
 
 ---

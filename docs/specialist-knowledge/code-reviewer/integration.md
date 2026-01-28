@@ -82,7 +82,7 @@ Flag as tech debt if not immediately addressable per ADR-0019.
 
 ## Integration: Meeting Controller Service Foundation
 **Added**: 2026-01-25
-**Updated**: 2026-01-25 (Phase 6b actor implementation)
+**Updated**: 2026-01-27 (Phase 6c GC integration)
 **Related files**: `crates/meeting-controller/`, `crates/mc-test-utils/`
 
 MC Phase 6a/6b establishes the foundation for WebTransport signaling. Key patterns for future reviewers:
@@ -98,5 +98,11 @@ MC Phase 6a/6b establishes the foundation for WebTransport signaling. Key patter
 - Handle/Actor separation per ADR-0001: Handle has `mpsc::Sender` + `CancellationToken`, Actor owns state
 - State queries must be async to get live values from child actors (see MINOR-001 fix)
 - Session binding tokens use HKDF + HMAC-SHA256 per ADR-0023 Section 1
+
+**GC Integration (Phase 6c)**:
+- Error variants must match communication protocol (McError::Grpc for gRPC calls, not McError::Redis)
+- Service methods that call GC should have doc comments explaining the interaction pattern
+- Estimation constants (e.g., participants per meeting) need doc comments explaining derivation
+- Code prepared for Phase 6d uses `#[allow(dead_code)]` with phase reference comment
 
 When reviewing future MC features (session management, participant coordination), ensure they follow these established patterns and reference ADR-0023 sections.

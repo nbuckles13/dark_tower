@@ -293,6 +293,40 @@ Always use `#[tokio::test(start_paused = true)]` or call `tokio::time::pause()` 
 
 ---
 
+## Gotcha: Lua Script Structural Tests Miss Logic Errors
+**Added**: 2026-01-25
+**Related files**: `crates/meeting-controller/src/redis_scripts.rs`, `crates/meeting-controller/tests/redis_lua_tests.rs`
+
+Testing that a Lua script "runs without error" catches syntax errors but misses logic errors:
+
+```rust
+// INSUFFICIENT: only catches syntax errors
+#[test]
+fn test_lua_script_loads() {
+    let script = Script::new(FENCING_SCRIPT);
+    let result = script.invoke(&mut conn).await;
+    assert!(result.is_ok()); // Script ran... but did it do the right thing?
+}
+
+// REQUIRED: verify actual behavior
+#[test]
+fn test_lua_script_rejects_stale_generation() {
+    set_generation(&mut conn, "key", 5).await;
+    let result = fenced_write(&mut conn, "key", /*generation=*/3, "value").await;
+    assert!(result.is_err()); // Verify fencing WORKS, not just runs
+}
+```
+
+This gotcha appeared in Phase 6c review: 11 behavioral tests were added for Lua scripts that had only structural coverage. The structural tests passed even when fencing logic was incorrect because the scripts would run but return wrong values.
+
+Test matrix for fencing Lua scripts:
+- Generation higher than current (should accept and update)
+- Generation equal to current (should accept)
+- Generation lower than current (should reject)
+- No existing generation (first write, should accept)
+
+---
+
 ## Gotcha: Database Error Paths Require sqlx Mocking (Often Deferred)
 **Added**: 2026-01-23
 **Related files**: `crates/global-controller/src/gc_assignment_cleanup.rs`

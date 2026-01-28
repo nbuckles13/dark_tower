@@ -94,3 +94,35 @@ Create dedicated `mc-test-utils` crate with builder pattern for mock services. `
 This mirrors `ac-test-utils` pattern and enables both unit and integration tests to use the same mock infrastructure without `#[cfg(test)]` limitations.
 
 ---
+
+## Pattern: Fenced Redis Writes with Lua Scripts
+**Added**: 2026-01-25
+**Related files**: `crates/meeting-controller/src/redis/lua_scripts.rs`, `crates/meeting-controller/src/redis/client.rs`
+
+For split-brain prevention in distributed systems, use Lua scripts for atomic fenced operations. Each write includes a monotonically-increasing generation counter (fencing token). The Lua script atomically: (1) reads current generation, (2) compares with provided generation, (3) writes only if generation is current or newer. Return codes indicate success (1), fenced-out (0), or error (-1). Store scripts as `const &str` and precompile with `redis::Script::new()` at client construction time.
+
+---
+
+## Pattern: AtomicU32/AtomicBool for Lock-Free Capacity Checks
+**Added**: 2026-01-25
+**Related files**: `crates/meeting-controller/src/grpc/mc_service.rs`
+
+For capacity-based accept/reject decisions in gRPC handlers, use atomic types (`AtomicU32`, `AtomicBool`) with `Ordering::SeqCst`. Pattern: check draining state first (instant rejection), then meeting capacity, then estimate participant headroom using a constant (e.g., `ESTIMATED_PARTICIPANTS_PER_MEETING = 10`). Return specific `RejectionReason` enum variants so the calling service can make informed retry decisions. This avoids mutex contention on the hot path.
+
+---
+
+## Pattern: gRPC Client with Channel Caching and Exponential Backoff
+**Added**: 2026-01-25
+**Related files**: `crates/meeting-controller/src/grpc/gc_client.rs`
+
+For inter-service gRPC communication, cache the `tonic::Channel` in `Arc<RwLock<Option<Channel>>>` and reuse across calls. On connection failure, clear the cache via `clear_channel()` to force reconnection. For registration/startup, implement exponential backoff: start at 1s base delay, double on each retry (capped at 30s max), with maximum retry count. Store heartbeat intervals from the registration response in `AtomicU64` for runtime adjustment.
+
+---
+
+## Pattern: gRPC Auth Interceptor for Bearer Token Validation
+**Added**: 2026-01-25
+**Related files**: `crates/meeting-controller/src/grpc/auth_interceptor.rs`
+
+Implement `tonic::service::Interceptor` for authorization validation on incoming gRPC requests. Pattern: extract `authorization` metadata, validate `Bearer ` prefix (case-sensitive), check token is non-empty and within size limits (8KB max). Return generic error messages (e.g., "Invalid token") to prevent information leakage. Include `#[cfg(test)] pub fn disabled()` constructor for testing without auth.
+
+---

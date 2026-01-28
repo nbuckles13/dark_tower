@@ -67,3 +67,11 @@ When the same cryptographic algorithm (e.g., HMAC-SHA256) appears in multiple se
 Before flagging dev-dependencies as duplication or questioning their necessity, check if existing services use the same pattern. Example: `tokio = { features = ["test-util"] }` in MC Cargo.toml matches AC's existing dev-dependencies. When a pattern follows established precedent in the codebase, classify as ACCEPTABLE. This prevents false positives on legitimate test infrastructure patterns.
 
 ---
+
+## Pattern: Defer Extraction When Implementations Differ
+**Added**: 2026-01-27
+**Related files**: `crates/meeting-controller/src/grpc/gc_client.rs`, `crates/global-controller/src/services/mc_client.rs`
+
+When similar code exists in two services but with meaningful implementation differences, classify as TECH_DEBT rather than BLOCKER and defer extraction. Example: MC's GcClient uses single-channel caching, GC's McClient uses multi-channel pool - similar pattern, different strategies. The third implementation (e.g., MH client) will reveal which approach is canonical. Deferring allows: (1) implementations to mature independently, (2) third consumer to inform the right abstraction, (3) feature velocity to continue. Only consider extraction when a third consumer appears AND implementations have converged on a common approach.
+
+---

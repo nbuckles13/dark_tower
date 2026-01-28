@@ -123,3 +123,17 @@ Direct byte comparison of tokens (`==`) leaks timing information that can reveal
 Error messages returned to clients should never include internal identifiers (session IDs, user IDs, meeting IDs, participant IDs). These identifiers: (1) Enable enumeration attacks - probe which IDs exist, (2) Aid correlation attacks - link sessions across requests, (3) Leak implementation details. Pattern: Use typed error variants internally (e.g., `ParticipantNotFound(participant_id)`) but convert to generic messages at the API boundary: "Participant not found" without the ID. Log the full error server-side with the ID for debugging. Applies to: 401/403/404 responses, WebSocket/WebTransport error frames, error bodies in any client-facing response.
 
 ---
+
+## Gotcha: Connection URLs with Embedded Credentials in Logs
+**Added**: 2026-01-25
+**Related files**: `crates/meeting-controller/src/main.rs`, `crates/global-controller/src/main.rs`
+
+Database and cache connection URLs often contain credentials (e.g., `redis://user:password@host:6379`). These URLs are commonly logged during startup for debugging ("Connecting to redis://..."). Never log the full URL. Pattern:
+
+1. **Parse before logging**: Extract host/port only, not userinfo
+2. **Use placeholder**: Log "Connecting to Redis at {host}:{port}" instead of full URL
+3. **Structured logging**: If using structured logs, never include `url` field with credentials
+
+Common locations where this appears: (1) `main.rs` startup logs, (2) Connection pool initialization, (3) Health check failure messages, (4) Configuration dump on startup. The `url` crate's `Url::host_str()` and `Url::port()` methods are safe; `Url::as_str()` or `to_string()` are not.
+
+---

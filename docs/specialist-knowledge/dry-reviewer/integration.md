@@ -58,6 +58,22 @@ MC's SessionActor uses an ActorMetrics struct to track actor lifecycle metrics (
 
 ---
 
+### TD-7: gRPC Client Channel Caching Pattern
+**Added**: 2026-01-26
+**Related files**: `crates/meeting-controller/src/grpc/gc_client.rs`, `crates/global-controller/src/services/mc_client.rs`
+
+Both MC and GC implement gRPC clients with channel caching and auth header injection. Pattern includes: `get_channel()` with RwLock-protected cache, `add_auth()` helper for Bearer token, configurable timeouts. Severity: Low (implementations differ in cache strategy - single vs pool). Improvement path: Consider `common::grpc::AuthenticatedClient<C>` trait when third gRPC client appears (MH). Timeline: Phase 7+ (when MH implementation begins). Note: Current duplication acceptable - implementations differ (single-channel vs multi-channel pool) and extraction cost exceeds benefit for 2 implementations.
+
+---
+
+### TD-8: gRPC Auth Interceptor Pattern
+**Added**: 2026-01-27
+**Related files**: `crates/meeting-controller/src/grpc/gc_client.rs`, `crates/global-controller/src/services/mc_client.rs`
+
+Both MC and GC implement similar `add_auth()` helper functions for injecting Bearer tokens into gRPC request metadata. Pattern includes: create `MetadataValue` from token string, insert into request metadata with "authorization" key. Severity: Low (parallel evolution, ~5 lines each). Improvement path: Consider extracting to `common::grpc::auth_interceptor()` or `common::grpc::BearerAuth` trait when third gRPC client appears (MH). Timeline: Phase 7+ (when MH implementation begins). Note: Current duplication acceptable - small code, parallel evolution. Could be combined with TD-7 extraction into unified `common::grpc::AuthenticatedClient` module.
+
+---
+
 ## Specialist Coordination
 **Added**: 2026-01-15
 **Related files**: `.claude/agents/security.md`, `.claude/agents/code-reviewer.md`, `.claude/agents/test.md`

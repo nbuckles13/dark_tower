@@ -3,6 +3,7 @@
 //! Configuration is loaded from environment variables. All sensitive
 //! fields are redacted in Debug output.
 
+use common::secret::SecretString;
 use std::collections::HashMap;
 use std::env;
 use std::fmt;
@@ -40,7 +41,8 @@ pub const DEFAULT_MC_ID_PREFIX: &str = "mc";
 #[allow(dead_code)] // Fields used in Phase 6b+
 pub struct Config {
     /// Redis connection URL (for session state).
-    pub redis_url: String,
+    /// Protected by `SecretString` to prevent accidental logging.
+    pub redis_url: SecretString,
 
     /// WebTransport server bind address (default: "0.0.0.0:4433").
     pub webtransport_bind_address: String,
@@ -56,6 +58,9 @@ pub struct Config {
 
     /// URL to Global Controller for registration.
     pub gc_grpc_url: String,
+
+    /// GC gRPC endpoint (alias for `gc_grpc_url` for API compatibility).
+    pub gc_grpc_endpoint: String,
 
     /// Unique identifier for this MC instance.
     pub mc_id: String,
@@ -80,7 +85,8 @@ pub struct Config {
 
     /// Master secret for binding token HMAC (base64-encoded).
     /// Rotates on each deployment for defense-in-depth.
-    pub binding_token_secret: String,
+    /// Protected by `SecretString` to prevent accidental logging.
+    pub binding_token_secret: SecretString,
 }
 
 /// Custom Debug implementation that redacts sensitive fields.
@@ -93,6 +99,7 @@ impl fmt::Debug for Config {
             .field("health_bind_address", &self.health_bind_address)
             .field("region", &self.region)
             .field("gc_grpc_url", &self.gc_grpc_url)
+            .field("gc_grpc_endpoint", &self.gc_grpc_endpoint)
             .field("mc_id", &self.mc_id)
             .field("max_meetings", &self.max_meetings)
             .field("max_participants", &self.max_participants)
@@ -129,15 +136,17 @@ impl Config {
 
     /// Load configuration from a `HashMap` (for testing).
     pub fn from_vars(vars: &HashMap<String, String>) -> Result<Self, ConfigError> {
-        let redis_url = vars
-            .get("REDIS_URL")
-            .ok_or_else(|| ConfigError::MissingEnvVar("REDIS_URL".to_string()))?
-            .clone();
+        let redis_url = SecretString::from(
+            vars.get("REDIS_URL")
+                .ok_or_else(|| ConfigError::MissingEnvVar("REDIS_URL".to_string()))?
+                .clone(),
+        );
 
-        let binding_token_secret = vars
-            .get("MC_BINDING_TOKEN_SECRET")
-            .ok_or_else(|| ConfigError::MissingEnvVar("MC_BINDING_TOKEN_SECRET".to_string()))?
-            .clone();
+        let binding_token_secret = SecretString::from(
+            vars.get("MC_BINDING_TOKEN_SECRET")
+                .ok_or_else(|| ConfigError::MissingEnvVar("MC_BINDING_TOKEN_SECRET".to_string()))?
+                .clone(),
+        );
 
         let webtransport_bind_address = vars
             .get("MC_WEBTRANSPORT_BIND_ADDRESS")
@@ -210,6 +219,7 @@ impl Config {
             grpc_bind_address,
             health_bind_address,
             region,
+            gc_grpc_endpoint: gc_grpc_url.clone(),
             gc_grpc_url,
             mc_id,
             max_meetings,
@@ -227,6 +237,7 @@ impl Config {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use common::secret::ExposeSecret;
 
     fn base_vars() -> HashMap<String, String> {
         HashMap::from([
@@ -247,7 +258,7 @@ mod tests {
 
         let config = Config::from_vars(&vars).expect("Config should load successfully");
 
-        assert_eq!(config.redis_url, "redis://localhost:6379");
+        assert_eq!(config.redis_url.expose_secret(), "redis://localhost:6379");
         assert_eq!(
             config.webtransport_bind_address,
             DEFAULT_WEBTRANSPORT_BIND_ADDRESS

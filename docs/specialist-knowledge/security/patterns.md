@@ -129,3 +129,41 @@ When generating tokens scoped to a resource (meeting, session, room), derive per
 Benefits: (1) Compromise of one meeting's tokens doesn't reveal master secret, (2) Key material is deterministic - can regenerate without storage, (3) Follows cryptographic best practices for key hierarchy. Use `ring::hkdf` for derivation. Include TTL in token payload for expiration enforcement.
 
 ---
+
+## Pattern: gRPC Interceptor for Authorization Validation
+**Added**: 2026-01-25
+**Related files**: `crates/meeting-controller/src/grpc/interceptor.rs`
+
+Use gRPC interceptors (tonic middleware) to enforce authorization on incoming service-to-service calls. Pattern:
+
+1. **Interceptor struct**: `McAuthInterceptor` holds AC client reference and required scopes
+2. **Metadata extraction**: Extract `authorization` header from gRPC request metadata
+3. **Token validation**: Validate JWT signature + claims via AC JWKS endpoint
+4. **Scope enforcement**: Verify token contains required scope (e.g., `mc:assign`)
+5. **Early rejection**: Return `Status::unauthenticated()` or `Status::permission_denied()` before handler runs
+
+Benefits: (1) Centralized auth logic - not scattered in handlers, (2) Defense-in-depth - even if handler forgets auth, interceptor catches it, (3) Consistent error responses. Apply interceptor via `Server::builder().layer()` or per-service via `ServiceBuilder`.
+
+---
+
+## Pattern: Token Size Limits for DoS Prevention
+**Added**: 2026-01-25
+**Related files**: `crates/meeting-controller/src/grpc/interceptor.rs`
+
+Enforce maximum token size before parsing to prevent memory exhaustion attacks. Pattern:
+
+1. **Size check first**: Before Base64 decode or JWT parse, check raw string length
+2. **Limit**: 8KB (8192 bytes) is reasonable for JWTs - valid tokens are typically 1-2KB
+3. **Early rejection**: Return error immediately if exceeded, before any parsing
+4. **Logging**: Log oversized token attempt (without the token itself) for monitoring
+
+```rust
+const MAX_TOKEN_SIZE: usize = 8192; // 8KB
+if token.len() > MAX_TOKEN_SIZE {
+    return Err(Status::invalid_argument("token exceeds maximum size"));
+}
+```
+
+This prevents: (1) Memory exhaustion from giant Base64 decode, (2) CPU exhaustion from parsing huge JSON claims, (3) Log injection via oversized tokens in error messages.
+
+---
