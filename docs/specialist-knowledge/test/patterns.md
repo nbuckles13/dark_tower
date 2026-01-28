@@ -291,8 +291,8 @@ This pattern is essential for validating atomic CTEs, distributed locks, and ide
 ---
 
 ## Pattern: RPC Retry Testing with Mixed Success/Failure Sequences
-**Added**: 2026-01-24
-**Related files**: `crates/global-controller/tests/meeting_assignment_tests.rs`
+**Added**: 2026-01-24, **Updated**: 2026-01-25
+**Related files**: `crates/global-controller/tests/meeting_assignment_tests.rs`, `crates/meeting-controller/tests/grpc_client_tests.rs`
 
 When testing RPC retry logic, test sequences where some calls fail before eventual success - not just all-fail or all-succeed:
 
@@ -328,8 +328,10 @@ Key test scenarios for retry logic:
 - All fail (exhausts retries)
 - **Mixed: some fail, eventual success** (the often-missed case)
 - Fail with different error types (transient vs permanent)
+- **Backoff timing**: Verify exponential backoff delays (use tokio::time::pause for determinism)
+- **Circuit breaker integration**: If using circuit breakers, verify they open after failures
 
-The mixed scenario catches bugs where retry counter is incorrectly updated or candidate list isn't properly iterated.
+The mixed scenario catches bugs where retry counter is incorrectly updated or candidate list isn't properly iterated. Also applied in Phase 6c MC review for gRPC client retry testing.
 
 ---
 
@@ -531,6 +533,91 @@ Each field mismatch should return an error, and the error type should be consist
 
 ---
 
+## Pattern: Lua Script Behavioral Testing (Not Just Structural)
+**Added**: 2026-01-25
+**Related files**: `crates/meeting-controller/tests/redis_lua_tests.rs`, `crates/meeting-controller/src/redis_scripts.rs`
+
+When testing Redis Lua scripts, behavioral tests are more valuable than structural tests. Don't just verify the script runs - verify it produces correct results under various conditions:
+
+```rust
+// Structural test (weak): script returns something
+#[test]
+fn test_script_executes() {
+    let result = script.invoke(&mut conn).await;
+    assert!(result.is_ok());
+}
+
+// Behavioral test (strong): script fences correctly
+#[test]
+fn test_fencing_script_rejects_stale_generation() {
+    // Setup: current fencing generation is 5
+    redis.set_fencing_generation("session-1", 5).await?;
+
+    // Action: try to write with generation 3 (stale)
+    let result = fenced_write_script(&mut conn, "session-1", 3, "data").await;
+
+    // Assert: write rejected because generation is stale
+    assert_eq!(result, Err(FencingError::StaleGeneration { current: 5, attempted: 3 }));
+}
+```
+
+Test matrix for fencing scripts:
+- Current generation (accept)
+- Higher generation (accept, update)
+- Lower generation (reject as stale)
+- No existing generation (first write, accept)
+
+This caught real bugs where scripts would silently fail validation checks.
+
+---
+
+## Pattern: Capacity Check Testing with Atomics
+**Added**: 2026-01-25
+**Related files**: `crates/meeting-controller/tests/capacity_tests.rs`
+
+When testing capacity enforcement with atomic counters, verify both the business logic and atomic semantics:
+
+```rust
+// Test 1: Single capacity check (basic)
+#[test]
+fn test_capacity_allows_under_limit() {
+    let capacity = AtomicCapacity::new(100);
+    assert!(capacity.try_reserve(1).is_ok());
+}
+
+// Test 2: Concurrent capacity exhaustion (atomics behavior)
+#[test]
+fn test_concurrent_reservations_respect_limit() {
+    let capacity = Arc::new(AtomicCapacity::new(10));
+    let barrier = Arc::new(Barrier::new(20)); // More requesters than capacity
+
+    let handles: Vec<_> = (0..20).map(|_| {
+        let cap = Arc::clone(&capacity);
+        let bar = Arc::clone(&barrier);
+        tokio::spawn(async move {
+            bar.wait().await;
+            cap.try_reserve(1)
+        })
+    }).collect();
+
+    let results: Vec<_> = join_all(handles).await;
+    let successes = results.iter().filter(|r| r.is_ok()).count();
+    assert_eq!(successes, 10, "Exactly capacity reservations should succeed");
+}
+
+// Test 3: Draining state behavior
+#[test]
+fn test_draining_rejects_new_reservations() {
+    let capacity = AtomicCapacity::new(100);
+    capacity.set_draining(true);
+    assert!(capacity.try_reserve(1).is_err(), "Draining should reject new work");
+}
+```
+
+Draining is often overlooked - test that capacity checks respect draining state separate from numeric limits.
+
+---
+
 ## Pattern: Actor Lifecycle Testing (spawn, shutdown, cancellation)
 **Added**: 2026-01-25
 **Related files**: `crates/meeting-controller/src/session/actor.rs`
@@ -576,6 +663,53 @@ async fn test_actor_restart_after_panic() {
 ```
 
 This ensures actors behave correctly at boundaries, not just during normal operation.
+
+---
+
+## Pattern: gRPC/tonic Interceptor Testing
+**Added**: 2026-01-25
+**Related files**: `crates/meeting-controller/tests/grpc_interceptor_tests.rs`, `crates/meeting-controller/src/grpc/auth_interceptor.rs`
+
+When testing gRPC interceptors (auth, tracing, rate limiting), cover these edge cases that are often missed:
+
+```rust
+// Edge case 1: Empty Authorization header
+#[test]
+fn test_interceptor_rejects_empty_auth_header() {
+    let mut request = Request::new(());
+    request.metadata_mut().insert("authorization", "".parse().unwrap());
+    assert!(interceptor.call(request).is_err());
+}
+
+// Edge case 2: Malformed Bearer prefix (wrong case, extra spaces)
+#[test]
+fn test_interceptor_rejects_malformed_bearer() {
+    for malformed in ["bearer token", "BEARER token", "Bearer  token", "Bearer\ttoken"] {
+        let mut request = Request::new(());
+        request.metadata_mut().insert("authorization", malformed.parse().unwrap());
+        // Should reject - only "Bearer <token>" (single space, proper case) is valid
+        assert!(interceptor.call(request).is_err());
+    }
+}
+
+// Edge case 3: Valid format but expired/invalid token
+#[test]
+fn test_interceptor_validates_token_contents() {
+    let mut request = Request::new(());
+    let expired_token = create_expired_jwt();
+    request.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", expired_token).parse().unwrap()
+    );
+    assert!(interceptor.call(request).is_err());
+}
+```
+
+Common bugs caught:
+- Case-sensitive "Bearer" parsing (HTTP headers are case-insensitive, but token format isn't)
+- Multiple space handling
+- Empty token after "Bearer " prefix
+- Missing validation of token contents (just checking format is present)
 
 ---
 

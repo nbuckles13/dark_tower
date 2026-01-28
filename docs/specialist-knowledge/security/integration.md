@@ -84,3 +84,19 @@ MC binds WebTransport sessions to authenticated users. Requirements:
 Service must fail startup if `MC_BINDING_TOKEN_SECRET` is not configured.
 
 ---
+
+## Integration: Meeting Controller - GC Communication Security
+**Added**: 2026-01-25
+**Related files**: `crates/meeting-controller/src/grpc/interceptor.rs`, `crates/meeting-controller/src/grpc/gc_client.rs`
+
+GC-to-MC communication uses authenticated gRPC. Security requirements:
+
+1. **Inbound (GC → MC)**: Use `McAuthInterceptor` to validate all incoming gRPC calls. Require `mc:assign` scope for AssignMeeting RPC. Reject requests without valid AC-issued JWT.
+2. **Token size limit**: Enforce 8KB max on incoming tokens before parsing (DoS prevention).
+3. **Outbound (MC → GC)**: Store GC service token as `SecretString`, not plain `String`. Use `SecretString` throughout config and client structs.
+4. **Connection URLs**: Never log Redis/database URLs with credentials. Parse URL and log only host:port.
+5. **Startup validation**: Fail fast if required secrets (`MC_BINDING_TOKEN_SECRET`, `GC_SERVICE_TOKEN`) are not configured.
+
+The gRPC interceptor pattern ensures authorization is checked before handler code runs, providing defense-in-depth even if individual handlers forget auth checks.
+
+---

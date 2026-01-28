@@ -301,6 +301,15 @@ When implementing MC features that depend on Redis (session binding, fencing tok
 - Time-based tests: use `#[tokio::test(start_paused = true)]` for grace period testing
 - Host authorization: verify host-only operations reject non-host participants
 
+**Phase 6c additions** (GC Integration):
+- Lua script behavioral tests: 11 tests covering fencing logic (not just structural "script runs")
+- Capacity/draining tests: 8 tests for atomic capacity checks and draining state
+- Auth interceptor edge cases: empty header, malformed Bearer, case sensitivity
+- gRPC retry/backoff: mixed success/failure sequences (not just all-succeed or all-fail)
+- Error code exhaustive testing: every McError variant mapped to protocol codes
+
+Test count: 115 tests in meeting-controller (up from 71 pre-Phase 6c)
+
 Tech debt noted in Phase 6a (now completed in Phase 6b):
 - ~~TD-1: Integration tests for main binary~~ (completed: 64 actor tests)
 - ~~TD-2: MockRedis async interface~~ (completed: async traits implemented)

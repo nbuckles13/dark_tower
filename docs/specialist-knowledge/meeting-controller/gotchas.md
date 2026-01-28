@@ -59,3 +59,35 @@ Rustdoc markdown linter requires backticks around code identifiers in doc commen
 When creating new crates like `mc-test-utils`, you must add them to the workspace `members` array in the root `Cargo.toml`. Forgetting this causes: `cargo build` ignores the crate, `cargo test --workspace` skips its tests, and inter-crate dependencies fail to resolve. Always verify with `cargo metadata --no-deps | jq '.workspace_members'` after adding a new crate.
 
 ---
+
+## Gotcha: Redis Script Fluent API and Borrow Checker
+**Added**: 2026-01-25
+**Related files**: `crates/meeting-controller/src/redis/client.rs`
+
+The `redis::Script` fluent API (`.key().key().arg().arg()`) creates temporary values that conflict with Rust's borrow checker when building complex invocations with many KEYS/ARGV. Solution: For scripts with variable-length arguments (e.g., HSET with multiple field/value pairs), use raw `redis::cmd("EVALSHA")` with `.arg()` in a loop. Try EVALSHA first, fall back to EVAL if script not cached (handling `ErrorKind::NoScriptError`).
+
+---
+
+## Gotcha: Don't Log Redis URLs with Credentials
+**Added**: 2026-01-25
+**Related files**: `crates/meeting-controller/src/redis/client.rs`
+
+Redis URLs may contain credentials (e.g., `redis://:password@host:port`). Never include `redis_url` in error logs or tracing spans. Log the error message without the URL: `error!(error = %e, "Failed to connect to Redis")`. Store the URL as `SecretString` in config and avoid exposing it anywhere in logs, even on connection failures where including the URL seems helpful for debugging.
+
+---
+
+## Gotcha: Config Fields Must Be SecretString for Credentials
+**Added**: 2026-01-25
+**Related files**: `crates/meeting-controller/src/config.rs`
+
+All config fields containing credentials or secrets must use `SecretString` from `common::secret`, not plain `String`. This includes: `redis_url` (may contain password), `binding_token_secret` (HMAC key), and any future service tokens. Update the manual `Debug` impl to show `[REDACTED]` for these fields. Tests need `ExposeSecret` trait import to access the inner value.
+
+---
+
+## Gotcha: Bearer Token Prefix is Case-Sensitive
+**Added**: 2026-01-25
+**Related files**: `crates/meeting-controller/src/grpc/auth_interceptor.rs`
+
+The `Bearer ` prefix in authorization headers is case-sensitive per RFC 6750. Use `strip_prefix("Bearer ")` not case-insensitive matching. Reject `bearer `, `BEARER `, etc. as invalid format. This is important for security - being permissive about case could lead to unexpected behavior if mixed with systems that ARE case-sensitive.
+
+---

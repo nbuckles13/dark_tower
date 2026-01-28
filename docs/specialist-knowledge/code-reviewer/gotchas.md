@@ -14,9 +14,23 @@ If security parameters are only validated at config parse time, bugs or programm
 
 ## Gotcha: Magic Numbers Without Constants
 **Added**: 2026-01-11
-**Related files**: `crates/ac-service/src/config.rs`
+**Updated**: 2026-01-27 (expanded scope)
+**Related files**: `crates/ac-service/src/config.rs`, `crates/meeting-controller/src/services/gc_integration.rs`
 
-Security-critical numeric values (cost factors, timeouts, limits) should be defined as named constants with documentation, not inline literals. Bad: `if cost < 4`. Good: `if cost < BCRYPT_COST_MIN` with constant documenting why 4 is minimum.
+Numeric values that represent domain-specific meanings (security parameters, estimation factors, capacity limits) should be defined as named constants with doc comments explaining their derivation. This applies beyond security-critical values:
+
+```rust
+// BAD: Inline magic number
+let estimated_participants = 10;
+
+// GOOD: Named constant with rationale
+/// Estimated participants per meeting for capacity planning.
+/// Based on typical meeting sizes observed in production (P50 = 4, P90 = 8).
+/// Using 10 provides ~20% headroom above P90.
+const ESTIMATED_PARTICIPANTS_PER_MEETING: u32 = 10;
+```
+
+The doc comment should explain the "why" - how was this value chosen? What happens if it's wrong?
 
 ---
 
@@ -204,6 +218,30 @@ pub struct MockRedis {
 ```
 
 While `std::sync::Mutex` may work in simple test scenarios, it can cause subtle issues when tests run concurrently or when mock methods are called from multiple async contexts. Flag as tech debt if found in test-utils crates.
+
+---
+
+## Gotcha: Wrong Error Variant for Communication Type
+**Added**: 2026-01-27
+**Related files**: `crates/meeting-controller/src/services/gc_integration.rs`
+
+When a service communicates with external systems via different protocols (Redis, gRPC, HTTP), use semantically correct error variants. Using the wrong variant (e.g., `McError::Redis` for a gRPC call) confuses debugging and breaks error handling logic that branches on variant:
+
+```rust
+// BAD: Using Redis error for gRPC call
+async fn get_assignment(&self, meeting_id: &str) -> Result<MeetingAssignment, McError> {
+    self.gc_client.get_assignment(meeting_id).await
+        .map_err(|e| McError::Redis(e.to_string()))  // Wrong! This is gRPC
+}
+
+// GOOD: Correct error variant for the protocol
+async fn get_assignment(&self, meeting_id: &str) -> Result<MeetingAssignment, McError> {
+    self.gc_client.get_assignment(meeting_id).await
+        .map_err(|e| McError::Grpc(e.to_string()))  // Correct variant
+}
+```
+
+This matters for observability (error dashboards) and error handling (different retry strategies per protocol).
 
 ---
 
