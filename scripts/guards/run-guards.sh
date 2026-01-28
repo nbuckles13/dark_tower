@@ -160,8 +160,52 @@ if $RUN_SEMANTIC; then
     echo -e "${BOLD}Semantic Guards${NC}"
     echo "==============="
     echo ""
-    echo -e "${YELLOW}Skipping semantic guards (disabled - too slow and unreliable)${NC}"
-    echo ""
+
+    SEMANTIC_RUNNER="$SCRIPT_DIR/run-semantic-guards.sh"
+    if [[ -x "$SEMANTIC_RUNNER" ]]; then
+        ((TOTAL_GUARDS++)) || true
+
+        echo -e "${BLUE}Running:${NC} semantic-analysis (diff-based)"
+
+        if $VERBOSE; then
+            if "$SEMANTIC_RUNNER" --verbose; then
+                echo -e "${GREEN}PASSED${NC}: semantic-analysis"
+                ((PASSED_GUARDS++)) || true
+            else
+                SEMANTIC_EXIT=$?
+                if [[ $SEMANTIC_EXIT -eq 2 ]]; then
+                    # UNCLEAR - treat as warning, not failure
+                    echo -e "${YELLOW}UNCLEAR${NC}: semantic-analysis (manual review recommended)"
+                    ((PASSED_GUARDS++)) || true
+                else
+                    echo -e "${RED}FAILED${NC}: semantic-analysis"
+                    ((FAILED_GUARDS++)) || true
+                    FAILED_GUARD_NAMES+=("semantic-analysis")
+                fi
+            fi
+        else
+            if OUTPUT=$("$SEMANTIC_RUNNER" 2>&1); then
+                echo -e "${GREEN}PASSED${NC}: semantic-analysis"
+                ((PASSED_GUARDS++)) || true
+            else
+                SEMANTIC_EXIT=$?
+                if [[ $SEMANTIC_EXIT -eq 2 ]]; then
+                    echo -e "${YELLOW}UNCLEAR${NC}: semantic-analysis (manual review recommended)"
+                    ((PASSED_GUARDS++)) || true
+                else
+                    echo -e "${RED}FAILED${NC}: semantic-analysis"
+                    ((FAILED_GUARDS++)) || true
+                    FAILED_GUARD_NAMES+=("semantic-analysis")
+                    # Show failure details
+                    echo "$OUTPUT" | grep -E "(FINDING|UNSAFE|VERDICT)" | head -10
+                fi
+            fi
+        fi
+        echo ""
+    else
+        echo -e "${YELLOW}Semantic runner not found at $SEMANTIC_RUNNER${NC}"
+        echo ""
+    fi
 fi
 
 # -----------------------------------------------------------------------------
