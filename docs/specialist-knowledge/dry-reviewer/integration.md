@@ -74,6 +74,14 @@ Both MC and GC implement similar `add_auth()` helper functions for injecting Bea
 
 ---
 
+### TD-9: IntoResponse/ErrorResponse Boilerplate (HTTP Services)
+**Added**: 2026-01-28
+**Related files**: `crates/global-controller/src/errors.rs`, `crates/ac-service/src/errors.rs`
+
+Both GC and AC implement similar `IntoResponse` trait impls for their error types with `ErrorResponse` JSON structures. Pattern includes: match on error variant, determine status code/error code/message, build JSON response, add service-specific headers (WWW-Authenticate, Retry-After). Severity: Low (implementations differ slightly - AC has scope fields, GC logs internal errors). Improvement path: Consider extracting shared `ErrorResponse` JSON structure and base `IntoResponse` logic to `common::http::errors` when third HTTP service appears or when implementations converge. Timeline: Phase 5+ (when more HTTP services exist beyond GC and AC). Note: Current duplication acceptable - services have different header requirements and error metadata. Premature extraction would add complexity for marginal benefit.
+
+---
+
 ## Specialist Coordination
 **Added**: 2026-01-15
 **Related files**: `.claude/agents/security.md`, `.claude/agents/code-reviewer.md`, `.claude/agents/test.md`
@@ -83,10 +91,10 @@ Security specialist handoff: Escalate duplication in cryptographic code to Secur
 ---
 
 ## Acceptable Duplication Patterns
-**Added**: 2026-01-15
+**Added**: 2026-01-15 | **Updated**: 2026-01-28
 **Related files**: `crates/*/src/config.rs`, `crates/*/src/errors.rs`
 
-These patterns are acceptable and should NOT be flagged: (1) Per-service configuration loading (each service has different env vars), (2) Service-specific error types (each service defines its own error.rs), (3) Protocol message handling (each service may interpret messages differently), (4) Logging/metrics initialization (boilerplate is expected per OWASP guidelines).
+These patterns are acceptable and should NOT be flagged: (1) Per-service configuration loading (each service has different env vars), (2) Service-specific error types (each service defines its own error.rs), (3) Protocol message handling (each service may interpret messages differently), (4) Logging/metrics initialization (boilerplate is expected per OWASP guidelines), (5) Tracing instrument attributes (`#[instrument(skip_all, ...)]` - service-specific observability), (6) Error preservation patterns (`.map_err(|e| Error::variant(format!("context: {}", e)))` - idiomatic Rust).
 
 ---
 
@@ -105,5 +113,15 @@ Escalate to Architecture specialist if: duplication spans 3+ services, extractio
 **Files reviewed**: `crates/ac-service/src/models/mod.rs`, `crates/ac-service/src/crypto/mod.rs`, `crates/ac-service/src/config.rs`
 **Patterns identified**: Security wrapper response types, SecretBox field patterns in config, custom Clone for SecretBox fields
 **Notes for future reviews**: When SecretBox/SecretString patterns appear in global-controller or meeting-controller response types, use this AC review as precedent for determining single-service vs cross-service duplication threshold.
+
+---
+
+## Review Checkpoint: GC Code Quality Guards (2026-01-28)
+**Task**: Fix GC code quality issues: 7 error hiding + 16 instrument skip-all violations
+**DRY Finding**: APPROVED - 1 minor tech debt (TD-9), 0 blockers
+**Key Observation**: GC's `Internal(String)` error variant now matches MC pattern, establishing consistency across services. Both services align with `common::error::DarkTowerError::Internal(String)`. AC still uses unit variant (pre-existing debt). IntoResponse pattern duplicated between GC and AC (TD-9) - acceptable for 2 HTTP services, reassess when third appears.
+**Files reviewed**: `crates/global-controller/src/errors.rs`, `crates/global-controller/src/config.rs`, `crates/global-controller/src/handlers/meetings.rs`, `crates/global-controller/src/services/*.rs`, `crates/global-controller/src/grpc/*.rs`, `crates/global-controller/src/auth/*.rs`, `crates/global-controller/src/middleware/auth.rs`
+**Patterns identified**: Error variant convergence (GC+MC aligned), instrument skip_all (standard tracing), error preservation (idiomatic Rust), IntoResponse boilerplate (new TD-9)
+**Notes for future reviews**: When AC undergoes similar code quality refactor, expect convergence to `Internal(String)` pattern. Instrument and error preservation patterns are NOT duplication - they're infrastructure and idiomatic Rust.
 
 ---

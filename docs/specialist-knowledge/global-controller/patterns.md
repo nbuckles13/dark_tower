@@ -258,3 +258,58 @@ Use `service_token.expose_secret()` only when building the Authorization header.
 Consistent with project-wide sensitive data handling per SecretBox/SecretString refactor.
 
 ---
+
+## Pattern: Error Variant Context Migration
+**Added**: 2026-01-28
+**Related files**: `crates/global-controller/src/errors.rs`
+
+When migrating error enums from unit variants to context-carrying variants:
+1. Change variant: `Internal,` → `Internal(String),`
+2. Update error message: `#[error("...")]` → `#[error("...: {0}")]`
+3. Update all match arms: `GcError::Internal` → `GcError::Internal(_)`
+4. Update error construction: `GcError::Internal` → `GcError::Internal(format!("context: {}", e))`
+5. In `IntoResponse` or similar: log full context server-side, return generic message to client
+
+This pattern preserves debugging context while preventing information leakage to clients. Tests use `_` pattern matching to remain resilient to context changes.
+
+---
+
+## Pattern: Error Context Preservation in map_err
+**Added**: 2026-01-28
+**Related files**: Multiple files in `crates/global-controller/src/`
+
+Always preserve original error context when mapping errors:
+```rust
+// Bad: discards error details
+.map_err(|_| GcError::Internal)?
+
+// Good: preserves context
+.map_err(|e| GcError::Internal(format!("Failed to parse: {}", e)))?
+
+// For security-sensitive paths: log internally, return generic message
+.map_err(|e| {
+    tracing::debug!(target: "gc.module", error = %e, "Parse failed");
+    GcError::InvalidToken("Invalid input".to_string())
+})
+```
+
+Guards detect `.map_err(|_| ...)` patterns. Use `format!()` to include both context and original error in the message. For user-facing errors, log details internally at debug level but return generic messages.
+
+---
+
+## Pattern: Tracing Instrument Allowlist Approach
+**Added**: 2026-01-28
+**Related files**: Multiple files in `crates/global-controller/src/`
+
+Use allowlist approach for tracing to prevent accidental data leaks:
+```rust
+// Bad: denylist (must remember to skip each sensitive param)
+#[instrument(skip(self, password), fields(user_id = %user_id))]
+
+// Good: allowlist (skip everything, explicitly opt-in safe fields)
+#[instrument(skip_all, fields(user_id = %user_id))]
+```
+
+The `skip_all` prevents all parameters from being captured by default. Safe fields are explicitly included via `fields()`. This ensures new parameters don't accidentally leak into traces. Guards enforce this pattern project-wide.
+
+---

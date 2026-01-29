@@ -50,8 +50,8 @@ pub enum GcError {
     #[error("Service unavailable: {0}")]
     ServiceUnavailable(String),
 
-    #[error("Internal server error")]
-    Internal,
+    #[error("Internal server error: {0}")]
+    Internal(String),
 }
 
 impl GcError {
@@ -59,7 +59,7 @@ impl GcError {
     #[allow(dead_code)] // Will be used for metrics in Phase 2+
     pub fn status_code(&self) -> u16 {
         match self {
-            GcError::Database(_) | GcError::Internal => 500,
+            GcError::Database(_) | GcError::Internal(_) => 500,
             GcError::InvalidToken(_) => 401,
             GcError::NotFound(_) => 404,
             GcError::Conflict(_) => 409,
@@ -115,11 +115,15 @@ impl IntoResponse for GcError {
                     "Service temporarily unavailable".to_string(),
                 )
             }
-            GcError::Internal => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "INTERNAL_ERROR",
-                "An internal error occurred".to_string(),
-            ),
+            GcError::Internal(reason) => {
+                // Log actual reason server-side, return generic message to client
+                tracing::error!(target: "gc.internal", reason = %reason, "Internal error");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "INTERNAL_ERROR",
+                    "An internal error occurred".to_string(),
+                )
+            }
         };
 
         let error_response = ErrorResponse {
@@ -216,8 +220,8 @@ mod tests {
 
     #[test]
     fn test_display_internal() {
-        let error = GcError::Internal;
-        assert_eq!(format!("{}", error), "Internal server error");
+        let error = GcError::Internal("test reason".to_string());
+        assert_eq!(format!("{}", error), "Internal server error: test reason");
     }
 
     #[test]
@@ -233,7 +237,7 @@ mod tests {
             GcError::ServiceUnavailable("test".to_string()).status_code(),
             503
         );
-        assert_eq!(GcError::Internal.status_code(), 500);
+        assert_eq!(GcError::Internal("test".to_string()).status_code(), 500);
     }
 
     #[tokio::test]
@@ -346,7 +350,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_into_response_internal() {
-        let error = GcError::Internal;
+        let error = GcError::Internal("test reason".to_string());
         let response = error.into_response();
 
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);

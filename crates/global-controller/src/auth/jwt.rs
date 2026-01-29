@@ -68,7 +68,7 @@ impl JwtValidator {
     ///
     /// Returns `GcError::InvalidToken` for all validation failures with a generic
     /// message to prevent information leakage.
-    #[instrument(skip(self, token))]
+    #[instrument(skip_all)]
     pub async fn validate(&self, token: &str) -> Result<Claims, GcError> {
         // 1. Check token size BEFORE any parsing (DoS prevention)
         if token.len() > MAX_JWT_SIZE_BYTES {

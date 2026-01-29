@@ -744,26 +744,28 @@ Apply sanitization in error handling paths. This caught credential leaks that cu
 
 ## Pattern: Type-Level Refactor Verification (Compiler-Verified)
 **Added**: 2026-01-28
-**Related files**: `crates/meeting-controller/tests/`, `crates/ac-service/tests/`
+**Related files**: `crates/meeting-controller/tests/`, `crates/ac-service/tests/`, `crates/global-controller/tests/`
 
-When refactoring raw types to wrapped types (e.g., `Vec<u8>` → `SecretBox<Vec<u8>>`), the test verification approach differs from behavior changes. Type-level refactors are primarily **compiler-verified**:
+When refactoring raw types to wrapped types (e.g., `Vec<u8>` → `SecretBox<Vec<u8>>`, `Internal` → `Internal(String)`), the test verification approach differs from behavior changes. Type-level refactors are primarily **compiler-verified**:
 
-**Phase 6c Learning**: Reviewed SecretBox migration for `master_secret` in MC actors.
+**Phase 6c Learning (SecretBox)**: Reviewed SecretBox migration for `master_secret` in MC actors.
+**Phase 4 Learning (Error Variants)**: Reviewed GcError::Internal unit variant → tuple variant migration.
+
+Both migrations show the same pattern:
 - All type mismatches caught by compiler (no silent failures)
-- Test updates are mechanical: wrap at construction, expose at usage
+- Test updates are mechanical: wrap at construction, pattern match at usage
 - Existing test cases remain valid without modification
 - No new test cases required
-- All 115 MC tests execute successfully after type updates
+- All tests execute successfully after type updates (GC: 259 → 259, MC: 115 → 115)
 
 **Verification checklist for type-level refactors**:
 1. **Compiler passes**: `cargo check --workspace` - all type mismatches resolved
-2. **Test count preserved**: Same number of tests execute before/after (e.g., 115 → 115)
-3. **No blocking patterns**: Verify no new synchronous operations in async contexts (e.g., `.expose_secret()` in async hot paths should not block)
-4. **Semantic equivalence**: SecretBox is transparent - behavior is identical, just with added zeroing and redaction
+2. **Test count preserved**: Same number of tests execute before/after
+3. **Pattern matching used**: Tests use `matches!(err, Error::Variant(_))` instead of exact equality
+4. **Semantic equivalence**: Wrapper is transparent - behavior identical, just with added properties
 
-This differs from behavioral changes where you'd add/update test cases. For SecretBox specifically:
-- `.expose_secret()` is transparent (just derefs to &T)
-- Memory zeroing is automatic on drop (unobservable in tests)
-- Debug redaction is best tested separately (not during type refactor review)
+Examples of type-level refactors:
+- **SecretBox**: `.expose_secret()` is transparent (just derefs to &T), memory zeroing automatic on drop
+- **Error variant context**: `Internal` → `Internal(String)` adds debuggability, client sees same generic message
 
-Result: Type-level refactors are low-risk from test coverage perspective. Focus review on compiler correctness and no perf regressions.
+Result: Type-level refactors are low-risk from test coverage perspective. Focus review on compiler correctness and no perf regressions. Test updates are mechanical, not behavioral.

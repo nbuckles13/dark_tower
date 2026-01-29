@@ -136,7 +136,7 @@ impl AcClient {
             .build()
             .map_err(|e| {
                 error!(target: "gc.services.ac_client", error = %e, "Failed to build HTTP client");
-                GcError::Internal
+                GcError::Internal(format!("Failed to build HTTP client: {}", e))
             })?;
 
         Ok(Self {
@@ -157,7 +157,7 @@ impl AcClient {
     /// - `GcError::ServiceUnavailable` if AC is unreachable or returns 5xx
     /// - `GcError::Forbidden` if the request is rejected
     /// - `GcError::BadRequest` if the request parameters are invalid
-    #[instrument(skip(self, request), fields(meeting_id = %request.meeting_id, user_id = %request.subject_user_id))]
+    #[instrument(skip_all, fields(meeting_id = %request.meeting_id, user_id = %request.subject_user_id))]
     pub async fn request_meeting_token(
         &self,
         request: &MeetingTokenRequest,
@@ -191,7 +191,7 @@ impl AcClient {
     /// - `GcError::ServiceUnavailable` if AC is unreachable or returns 5xx
     /// - `GcError::Forbidden` if the request is rejected
     /// - `GcError::BadRequest` if the request parameters are invalid
-    #[instrument(skip(self, request), fields(meeting_id = %request.meeting_id, guest_id = %request.guest_id))]
+    #[instrument(skip_all, fields(meeting_id = %request.meeting_id, guest_id = %request.guest_id))]
     pub async fn request_guest_token(
         &self,
         request: &GuestTokenRequest,
@@ -221,7 +221,7 @@ impl AcClient {
         if status.is_success() {
             response.json().await.map_err(|e| {
                 error!(target: "gc.services.ac_client", error = %e, "Failed to parse AC response");
-                GcError::Internal
+                GcError::Internal(format!("Failed to parse AC response: {}", e))
             })
         } else if status.is_server_error() {
             warn!(target: "gc.services.ac_client", status = %status, "AC returned server error");
@@ -238,10 +238,15 @@ impl AcClient {
             Err(GcError::BadRequest("Invalid token request".to_string()))
         } else if status.as_u16() == 401 {
             error!(target: "gc.services.ac_client", "GC service token rejected by AC");
-            Err(GcError::Internal)
+            Err(GcError::Internal(
+                "GC service token rejected by AC".to_string(),
+            ))
         } else {
             warn!(target: "gc.services.ac_client", status = %status, "Unexpected AC response");
-            Err(GcError::Internal)
+            Err(GcError::Internal(format!(
+                "Unexpected AC response: {}",
+                status
+            )))
         }
     }
 }
@@ -565,7 +570,7 @@ mod tests {
 
         let result = client.request_meeting_token(&request).await;
         assert!(
-            matches!(result, Err(GcError::Internal)),
+            matches!(result, Err(GcError::Internal(_))),
             "Expected Internal (for 401), got {:?}",
             result
         );
@@ -596,7 +601,7 @@ mod tests {
 
         let result = client.request_meeting_token(&request).await;
         assert!(
-            matches!(result, Err(GcError::Internal)),
+            matches!(result, Err(GcError::Internal(_))),
             "Expected Internal for unexpected status, got {:?}",
             result
         );
@@ -627,7 +632,7 @@ mod tests {
 
         let result = client.request_meeting_token(&request).await;
         assert!(
-            matches!(result, Err(GcError::Internal)),
+            matches!(result, Err(GcError::Internal(_))),
             "Expected Internal for invalid JSON, got {:?}",
             result
         );

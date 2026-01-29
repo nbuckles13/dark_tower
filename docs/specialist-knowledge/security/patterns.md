@@ -189,3 +189,47 @@ When distributing a master secret to multiple actor instances, create isolated S
 **Cost**: Additional memory proportional to number of actors (typically negligible: N actors × 32 bytes = ~3KB for 100 meetings)
 
 ---
+
+## Pattern: Explicit Instrument Field Allowlists for Privacy-by-Default
+**Added**: 2026-01-28
+**Related files**: `crates/global-controller/src/auth/jwt.rs`, `crates/global-controller/src/middleware/auth.rs`, `crates/global-controller/src/services/ac_client.rs`
+
+Use `#[instrument(skip_all, fields(...))]` with explicit field allowlists rather than `skip_all` alone. Pattern:
+
+1. **Skip sensitive parameters**: Use `skip_all` to prevent automatic parameter capture
+2. **Allowlist safe fields**: Explicitly list only safe identifiers: `meeting_id`, `user_id`, `region`, `kid`
+3. **Never include**: tokens, credentials, authorization headers, private keys, database URLs
+4. **Server-side only**: Even "safe" fields are only for server-side tracing, not client responses
+
+**Example**:
+```rust
+#[instrument(skip_all, fields(meeting_id = %request.meeting_id, user_id = %request.user_id))]
+async fn request_meeting_token(&self, request: &MeetingTokenRequest) -> Result<TokenResponse>
+```
+
+**Benefits**: Privacy-by-default prevents accidental credential logging when functions are refactored or parameters are added. Explicit allowlists make it clear which fields are safe to trace.
+
+---
+
+## Pattern: Server-Side Error Context with Generic Client Messages
+**Added**: 2026-01-28
+**Related files**: `crates/global-controller/src/errors.rs`, `crates/global-controller/src/handlers/meetings.rs`, `crates/global-controller/src/grpc/mc_service.rs`
+
+Preserve error context for debugging via server-side logging while returning generic messages to clients. Pattern:
+
+1. **Error type with context**: Enum variant accepts String: `Internal(String)`, `Database(String)`
+2. **Server-side logging**: In `IntoResponse` impl, log the full error with `tracing::error!(reason = %reason, ...)`
+3. **Client response**: Return only generic message: `"An internal error occurred"`
+4. **Context in logs**: Include operational context (parse error type, service name) but NEVER secrets
+
+**Example**:
+```rust
+GcError::Internal(reason) => {
+    tracing::error!(target: "gc.internal", reason = %reason, "Internal error");
+    (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", "An internal error occurred".to_string())
+}
+```
+
+**Benefits**: Debugging gets full context, clients get minimal info (prevents enumeration/info disclosure). Common pattern for database errors, service communication failures, parsing errors.
+
+---

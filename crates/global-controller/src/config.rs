@@ -96,6 +96,9 @@ pub enum ConfigError {
 
     #[error("Invalid rate limit configuration: {0}")]
     InvalidRateLimit(String),
+
+    #[error("Invalid MC staleness threshold configuration: {0}")]
+    InvalidMcStalenessThreshold(String),
 }
 
 impl Config {
@@ -133,10 +136,10 @@ impl Config {
 
         // Parse JWT clock skew tolerance with validation
         let jwt_clock_skew_seconds = if let Some(value_str) = vars.get("JWT_CLOCK_SKEW_SECONDS") {
-            let value: i64 = value_str.parse().map_err(|_| {
+            let value: i64 = value_str.parse().map_err(|e| {
                 ConfigError::InvalidJwtClockSkew(format!(
-                    "JWT_CLOCK_SKEW_SECONDS must be a valid integer, got '{}'",
-                    value_str
+                    "JWT_CLOCK_SKEW_SECONDS must be a valid integer, got '{}': {}",
+                    value_str, e
                 ))
             })?;
 
@@ -161,10 +164,10 @@ impl Config {
 
         // Parse rate limit with validation
         let rate_limit_rpm = if let Some(value_str) = vars.get("RATE_LIMIT_RPM") {
-            let value: u32 = value_str.parse().map_err(|_| {
+            let value: u32 = value_str.parse().map_err(|e| {
                 ConfigError::InvalidRateLimit(format!(
-                    "RATE_LIMIT_RPM must be a valid positive integer, got '{}'",
-                    value_str
+                    "RATE_LIMIT_RPM must be a valid positive integer, got '{}': {}",
+                    value_str, e
                 ))
             })?;
 
@@ -185,12 +188,23 @@ impl Config {
             .cloned()
             .unwrap_or_else(|| DEFAULT_GRPC_BIND_ADDRESS.to_string());
 
-        // Parse MC staleness threshold
+        // Parse MC staleness threshold with validation
         let mc_staleness_threshold_seconds =
             if let Some(value_str) = vars.get("MC_STALENESS_THRESHOLD_SECONDS") {
-                value_str
-                    .parse()
-                    .unwrap_or(DEFAULT_MC_STALENESS_THRESHOLD_SECONDS)
+                let value: u64 = value_str.parse().map_err(|e| {
+                    ConfigError::InvalidMcStalenessThreshold(format!(
+                    "MC_STALENESS_THRESHOLD_SECONDS must be a valid positive integer, got '{}': {}",
+                    value_str, e
+                ))
+                })?;
+
+                if value == 0 {
+                    return Err(ConfigError::InvalidMcStalenessThreshold(
+                        "MC_STALENESS_THRESHOLD_SECONDS must be greater than 0".to_string(),
+                    ));
+                }
+
+                value
             } else {
                 DEFAULT_MC_STALENESS_THRESHOLD_SECONDS
             };
@@ -402,6 +416,34 @@ mod tests {
         let result = Config::from_vars(&vars);
         assert!(
             matches!(result, Err(ConfigError::InvalidRateLimit(msg)) if msg.contains("must be a valid positive integer"))
+        );
+    }
+
+    #[test]
+    fn test_mc_staleness_threshold_rejects_zero() {
+        let mut vars = base_vars();
+        vars.insert(
+            "MC_STALENESS_THRESHOLD_SECONDS".to_string(),
+            "0".to_string(),
+        );
+
+        let result = Config::from_vars(&vars);
+        assert!(
+            matches!(result, Err(ConfigError::InvalidMcStalenessThreshold(msg)) if msg.contains("must be greater than 0"))
+        );
+    }
+
+    #[test]
+    fn test_mc_staleness_threshold_rejects_non_numeric() {
+        let mut vars = base_vars();
+        vars.insert(
+            "MC_STALENESS_THRESHOLD_SECONDS".to_string(),
+            "thirty".to_string(),
+        );
+
+        let result = Config::from_vars(&vars);
+        assert!(
+            matches!(result, Err(ConfigError::InvalidMcStalenessThreshold(msg)) if msg.contains("must be a valid positive integer"))
         );
     }
 

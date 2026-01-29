@@ -126,7 +126,7 @@ impl JwksClient {
     ///
     /// Returns `GcError::ServiceUnavailable` if JWKS cannot be fetched.
     /// Returns `GcError::InvalidToken` if key ID is not found.
-    #[instrument(skip(self), fields(kid = %kid))]
+    #[instrument(skip_all, fields(kid = %kid))]
     pub async fn get_key(&self, kid: &str) -> Result<Jwk, GcError> {
         // Check cache first
         {
@@ -165,7 +165,7 @@ impl JwksClient {
     }
 
     /// Refresh the JWKS cache by fetching from Auth Controller.
-    #[instrument(skip(self))]
+    #[instrument(skip_all)]
     async fn refresh_cache(&self) -> Result<(), GcError> {
         tracing::debug!(target: "gc.auth.jwks", url = %self.jwks_url, "Fetching JWKS from AC");
 

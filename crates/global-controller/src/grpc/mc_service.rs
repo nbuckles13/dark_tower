@@ -188,10 +188,12 @@ impl GlobalControllerService for McService {
         Self::validate_capacity(req.max_meetings, req.max_participants)?;
 
         // Convert capacity to i32 for database (validated as positive above)
-        let max_meetings = i32::try_from(req.max_meetings)
-            .map_err(|_| Status::invalid_argument("max_meetings value too large"))?;
-        let max_participants = i32::try_from(req.max_participants)
-            .map_err(|_| Status::invalid_argument("max_participants value too large"))?;
+        let max_meetings = i32::try_from(req.max_meetings).map_err(|e| {
+            Status::invalid_argument(format!("max_meetings value too large: {}", e))
+        })?;
+        let max_participants = i32::try_from(req.max_participants).map_err(|e| {
+            Status::invalid_argument(format!("max_participants value too large: {}", e))
+        })?;
 
         // Register in database
         let webtransport_endpoint = if req.webtransport_endpoint.is_empty() {
