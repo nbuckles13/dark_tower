@@ -13,6 +13,7 @@
 //! - 30-second TTL limits exposure window
 //! - Binding tokens are defense-in-depth (also requires valid JWT)
 
+use common::secret::{ExposeSecret, SecretBox};
 use ring::{hkdf, hmac, rand};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -24,8 +25,8 @@ const BINDING_TOKEN_TTL: Duration = Duration::from_secs(30);
 ///
 /// Handles generation and validation of binding tokens per ADR-0023 Section 1.
 pub struct SessionBindingManager {
-    /// Master secret for HKDF key derivation.
-    master_secret: Vec<u8>,
+    /// Master secret for HKDF key derivation (wrapped in SecretBox for security).
+    master_secret: SecretBox<Vec<u8>>,
 }
 
 impl SessionBindingManager {
@@ -33,15 +34,16 @@ impl SessionBindingManager {
     ///
     /// # Arguments
     ///
-    /// * `master_secret` - Must be at least 32 bytes for security.
+    /// * `master_secret` - Must be at least 32 bytes for security. Wrapped in SecretBox
+    ///   to ensure secure memory handling (zeroization on drop, redacted Debug output).
     ///
     /// # Panics
     ///
     /// Panics if master_secret is less than 32 bytes (security requirement).
     #[must_use]
-    pub fn new(master_secret: Vec<u8>) -> Self {
+    pub fn new(master_secret: SecretBox<Vec<u8>>) -> Self {
         assert!(
-            master_secret.len() >= 32,
+            master_secret.expose_secret().len() >= 32,
             "Master secret must be at least 32 bytes"
         );
         Self { master_secret }
@@ -154,7 +156,7 @@ impl SessionBindingManager {
     #[allow(clippy::expect_used)]
     fn derive_meeting_key(&self, meeting_id: &str) -> [u8; 32] {
         let salt = hkdf::Salt::new(hkdf::HKDF_SHA256, meeting_id.as_bytes());
-        let prk = salt.extract(&self.master_secret);
+        let prk = salt.extract(self.master_secret.expose_secret());
         let okm = prk
             .expand(&[b"session-binding"], MeetingKeyLen)
             .expect("HKDF expand with fixed info and 32-byte output cannot fail");
@@ -231,7 +233,7 @@ mod tests {
     use super::*;
 
     fn test_manager() -> SessionBindingManager {
-        SessionBindingManager::new(vec![0u8; 32])
+        SessionBindingManager::new(SecretBox::new(Box::new(vec![0u8; 32])))
     }
 
     #[test]
@@ -317,8 +319,8 @@ mod tests {
 
     #[test]
     fn test_different_secrets_produce_different_tokens() {
-        let manager1 = SessionBindingManager::new(vec![1u8; 32]);
-        let manager2 = SessionBindingManager::new(vec![2u8; 32]);
+        let manager1 = SessionBindingManager::new(SecretBox::new(Box::new(vec![1u8; 32])));
+        let manager2 = SessionBindingManager::new(SecretBox::new(Box::new(vec![2u8; 32])));
 
         // Use same meeting/correlation/participant but we can't use same nonce
         // since it's randomly generated. Instead, validate that tokens are not interchangeable.
@@ -359,6 +361,6 @@ mod tests {
     #[test]
     #[should_panic(expected = "Master secret must be at least 32 bytes")]
     fn test_manager_requires_32_byte_secret() {
-        let _ = SessionBindingManager::new(vec![0u8; 16]);
+        let _ = SessionBindingManager::new(SecretBox::new(Box::new(vec![0u8; 16])));
     }
 }

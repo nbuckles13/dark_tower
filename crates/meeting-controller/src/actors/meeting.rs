@@ -23,6 +23,7 @@ use super::messages::{
 use super::metrics::{ActorMetrics, ActorType, MailboxMonitor};
 use super::session::{SessionBindingManager, StoredBinding};
 
+use common::secret::SecretBox;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -78,9 +79,10 @@ impl MeetingActorHandle {
                 respond_to: tx,
             })
             .await
-            .map_err(|_| McError::Internal)?;
+            .map_err(|e| McError::Internal(format!("channel send failed: {e}")))?;
 
-        rx.await.map_err(|_| McError::Internal)?
+        rx.await
+            .map_err(|e| McError::Internal(format!("response receive failed: {e}")))?
     }
 
     /// Notify of a connection disconnect.
@@ -95,7 +97,7 @@ impl MeetingActorHandle {
                 participant_id,
             })
             .await
-            .map_err(|_| McError::Internal)
+            .map_err(|e| McError::Internal(format!("channel send failed: {e}")))
     }
 
     /// Attempt to reconnect with binding token.
@@ -114,9 +116,10 @@ impl MeetingActorHandle {
                 respond_to: tx,
             })
             .await
-            .map_err(|_| McError::Internal)?;
+            .map_err(|e| McError::Internal(format!("channel send failed: {e}")))?;
 
-        rx.await.map_err(|_| McError::Internal)?
+        rx.await
+            .map_err(|e| McError::Internal(format!("response receive failed: {e}")))?
     }
 
     /// Participant leaves the meeting (explicit leave).
@@ -128,9 +131,10 @@ impl MeetingActorHandle {
                 respond_to: tx,
             })
             .await
-            .map_err(|_| McError::Internal)?;
+            .map_err(|e| McError::Internal(format!("channel send failed: {e}")))?;
 
-        rx.await.map_err(|_| McError::Internal)?
+        rx.await
+            .map_err(|e| McError::Internal(format!("response receive failed: {e}")))?
     }
 
     /// Forward a signaling message.
@@ -145,7 +149,7 @@ impl MeetingActorHandle {
                 message,
             })
             .await
-            .map_err(|_| McError::Internal)
+            .map_err(|e| McError::Internal(format!("channel send failed: {e}")))
     }
 
     /// Get current meeting state.
@@ -154,9 +158,10 @@ impl MeetingActorHandle {
         self.sender
             .send(MeetingMessage::GetState { respond_to: tx })
             .await
-            .map_err(|_| McError::Internal)?;
+            .map_err(|e| McError::Internal(format!("channel send failed: {e}")))?;
 
-        rx.await.map_err(|_| McError::Internal)
+        rx.await
+            .map_err(|e| McError::Internal(format!("response receive failed: {e}")))
     }
 
     /// Update self-mute status (informational).
@@ -173,7 +178,7 @@ impl MeetingActorHandle {
                 video_muted,
             })
             .await
-            .map_err(|_| McError::Internal)
+            .map_err(|e| McError::Internal(format!("channel send failed: {e}")))
     }
 
     /// Host mutes a participant (enforced).
@@ -194,9 +199,10 @@ impl MeetingActorHandle {
                 respond_to: tx,
             })
             .await
-            .map_err(|_| McError::Internal)?;
+            .map_err(|e| McError::Internal(format!("channel send failed: {e}")))?;
 
-        rx.await.map_err(|_| McError::Internal)?
+        rx.await
+            .map_err(|e| McError::Internal(format!("response receive failed: {e}")))?
     }
 
     /// End the meeting.
@@ -208,9 +214,10 @@ impl MeetingActorHandle {
                 respond_to: tx,
             })
             .await
-            .map_err(|_| McError::Internal)?;
+            .map_err(|e| McError::Internal(format!("channel send failed: {e}")))?;
 
-        rx.await.map_err(|_| McError::Internal)?
+        rx.await
+            .map_err(|e| McError::Internal(format!("response receive failed: {e}")))?
     }
 
     /// Cancel the meeting actor.
@@ -326,12 +333,13 @@ impl MeetingActor {
     /// * `meeting_id` - Unique meeting identifier
     /// * `cancel_token` - Cancellation token (child of controller's token)
     /// * `metrics` - Shared actor metrics
-    /// * `master_secret` - Master secret for HKDF key derivation (ADR-0023)
+    /// * `master_secret` - Master secret for HKDF key derivation (ADR-0023). Wrapped in
+    ///   SecretBox to ensure secure memory handling (zeroization on drop, redacted Debug).
     pub fn spawn(
         meeting_id: String,
         cancel_token: CancellationToken,
         metrics: Arc<ActorMetrics>,
-        master_secret: Vec<u8>,
+        master_secret: SecretBox<Vec<u8>>,
     ) -> (MeetingActorHandle, JoinHandle<()>) {
         let (sender, receiver) = mpsc::channel(MEETING_CHANNEL_BUFFER);
 
@@ -363,7 +371,7 @@ impl MeetingActor {
     }
 
     /// Run the actor message loop.
-    #[instrument(skip(self), name = "mc.actor.meeting", fields(meeting_id = %self.meeting_id))]
+    #[instrument(skip_all, name = "mc.actor.meeting", fields(meeting_id = %self.meeting_id))]
     async fn run(mut self) {
         info!(
             target: "mc.actor.meeting",
@@ -1215,8 +1223,8 @@ mod tests {
     use super::*;
 
     /// Test secret for session binding (32 bytes as required by ADR-0023).
-    fn test_secret() -> Vec<u8> {
-        vec![0u8; 32]
+    fn test_secret() -> SecretBox<Vec<u8>> {
+        SecretBox::new(Box::new(vec![0u8; 32]))
     }
 
     #[tokio::test]

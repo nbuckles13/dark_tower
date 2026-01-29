@@ -75,3 +75,11 @@ Before flagging dev-dependencies as duplication or questioning their necessity, 
 When similar code exists in two services but with meaningful implementation differences, classify as TECH_DEBT rather than BLOCKER and defer extraction. Example: MC's GcClient uses single-channel caching, GC's McClient uses multi-channel pool - similar pattern, different strategies. The third implementation (e.g., MH client) will reveal which approach is canonical. Deferring allows: (1) implementations to mature independently, (2) third consumer to inform the right abstraction, (3) feature velocity to continue. Only consider extraction when a third consumer appears AND implementations have converged on a common approach.
 
 ---
+
+## Pattern: Secret Wrapper Duplication Across Response Types
+**Added**: 2026-01-28
+**Related files**: `crates/ac-service/src/models/mod.rs`
+
+When a single service wraps sensitive fields with SecretString or SecretBox across multiple response types, evaluate duplication based on scope. Example: `RegisterServiceResponse`, `CreateClientResponse`, and `RotateSecretResponse` all have `client_secret: SecretString` with identical custom Debug/Serialize impls. Scope = 3 types within single service (ac-service). Assessment: NOT BLOCKER - this is acceptable duplication for 3 response types in the same service. Only consider extraction to `common::secret` if: (1) a second service also needs identical response patterns, (2) the impl pattern becomes standardized across 4+ types in same service. Rationale: Custom Debug/Serialize impls for security wrappers are intentionally terse and service-specific; extracting prematurely creates coupling and makes intent less clear.
+
+---

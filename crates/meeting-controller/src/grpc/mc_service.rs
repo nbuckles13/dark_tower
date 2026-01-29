@@ -186,7 +186,7 @@ impl MeetingControllerService for McAssignmentService {
     ///
     /// This is the primary assignment endpoint. GC calls this BEFORE writing
     /// the assignment to its database, allowing MC to reject if at capacity.
-    #[instrument(skip(self, request), fields(mc_id = %self.mc_id))]
+    #[instrument(skip_all, fields(mc_id = %self.mc_id))]
     async fn assign_meeting_with_mh(
         &self,
         request: Request<AssignMeetingWithMhRequest>,

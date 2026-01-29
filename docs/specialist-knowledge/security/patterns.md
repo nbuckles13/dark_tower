@@ -167,3 +167,25 @@ if token.len() > MAX_TOKEN_SIZE {
 This prevents: (1) Memory exhaustion from giant Base64 decode, (2) CPU exhaustion from parsing huge JSON claims, (3) Log injection via oversized tokens in error messages.
 
 ---
+
+## Pattern: Multiple SecretBox Copies with Isolated Lifecycles
+**Added**: 2026-01-28
+**Related files**: `crates/meeting-controller/src/actors/controller.rs`, `crates/meeting-controller/src/actors/meeting.rs`, `crates/meeting-controller/src/actors/session.rs`
+
+When distributing a master secret to multiple actor instances, create isolated SecretBox copies for each. Pattern:
+
+1. **Central holder**: Controller or main actor holds original SecretBox
+2. **Copy pattern**: When passing to child actors, use: `SecretBox::new(Box::new(self.master_secret.expose_secret().clone()))`
+3. **Scope**: The `expose_secret()` call is immediately followed by `.clone()` and re-wrapped - minimal exposure window
+4. **Independent lifecycle**: Each SecretBox independently zeroizes on drop
+5. **Memory trade-off**: Multiple copies increase memory usage but provide isolation - acceptable for small actor counts (typical <100 concurrent meetings)
+
+**Benefits**:
+- Each actor can independently manage its secret copy
+- Compromise of one actor's memory doesn't expose controller's master secret
+- Each SecretBox independently zeroizes on drop
+- Clear separation of concerns
+
+**Cost**: Additional memory proportional to number of actors (typically negligible: N actors × 32 bytes = ~3KB for 100 meetings)
+
+---

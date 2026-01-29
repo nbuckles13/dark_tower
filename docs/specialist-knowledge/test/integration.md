@@ -64,14 +64,19 @@ Include load tests that verify authentication latency SLOs with configured cost.
 ---
 
 ## For Security Specialist: SecretBox/SecretString Refactors
-**Added**: 2026-01-12
-**Related files**: `crates/ac-service/src/crypto/mod.rs`, `crates/ac-service/src/config.rs`, `crates/ac-service/src/models/mod.rs`
+**Added**: 2026-01-12, **Updated**: 2026-01-28
+**Related files**: `crates/ac-service/src/crypto/mod.rs`, `crates/ac-service/src/config.rs`, `crates/ac-service/src/models/mod.rs`, `crates/meeting-controller/src/actors/`
 
 When reviewing SecretBox/SecretString refactors, verify tests cover:
 1. **Debug redaction**: Test that `format!("{:?}", struct_with_secret)` contains `[REDACTED]` and NOT the actual value
 2. **expose_secret() usage**: Tests must call `.expose_secret()` to access values - compiler enforces this
 3. **Custom Clone impls**: If struct has `SecretBox` field, verify Clone test exists (SecretBox requires explicit handling)
 4. **Custom Serialize impls**: If intentionally exposing secret in API response (e.g., one-time credential display), test and document this
+
+**2026-01-28 update**: Phase 6c showed that type-level refactors (Vec<u8> → SecretBox<Vec<u8>>) are primarily compiler-verified. Test helper updates are mechanical (wrapping at construction, exposing at usage). No new test cases required - existing tests remain valid after type updates. This is a feature of SecretBox: transparent wrapping that preserves semantics while adding security properties. Verify only that:
+- Compiler checks pass (all type mismatches resolved)
+- All existing tests still execute (same count before/after)
+- No new >1 second access patterns introduced (could block async contexts)
 
 ---
 

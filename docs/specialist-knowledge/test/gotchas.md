@@ -53,8 +53,8 @@ When adding new integration test files, they MUST be added to `mod.rs` (e.g., `m
 ---
 
 ## Gotcha: SecretBox/SecretString Type Mismatches After Refactor
-**Added**: 2026-01-12
-**Related files**: `crates/ac-service/src/crypto/mod.rs`, integration tests
+**Added**: 2026-01-12, **Updated**: 2026-01-28
+**Related files**: `crates/ac-service/src/crypto/mod.rs`, `crates/meeting-controller/tests/`, integration tests
 
 When refactoring fields to use `SecretBox<T>` or `SecretString`, existing test code that constructs those structs will have type mismatches. Example: if `EncryptedKey.encrypted_data` changes from `Vec<u8>` to `SecretBox<Vec<u8>>`, tests must change from:
 ```rust
@@ -65,6 +65,12 @@ to:
 encrypted_data: SecretBox::new(Box::new(signing_key.private_key_encrypted.clone()))
 ```
 The compiler catches this, but orphaned test files (not in mod.rs) won't be compiled.
+
+**2026-01-28 update**: Phase 6c review confirmed this pattern holds for MC test helpers. When `SessionBindingManager.master_secret` changed from `Vec<u8>` to `SecretBox<Vec<u8>>`, test files needed:
+- Constructor call wrapping: `SecretBox::new(Box::new(master_secret_bytes))`
+- HKDF access sites: `.expose_secret()` to derive keys
+- No NEW test cases needed - existing tests remain valid after type updates
+This is intentional - SecretBox is a transparent wrapper that preserves semantics while adding memory zeroing and redaction. The refactor is ~100% mechanical.
 
 ---
 

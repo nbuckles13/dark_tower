@@ -337,3 +337,29 @@ pub fn generate_token(&self, ...) -> (String, String) {
 This documents the security rationale while maintaining ADR-0002 compliance.
 
 ---
+
+## Pattern: SecretBox Performance Trade-off for Type Safety
+**Added**: 2026-01-28
+**Related files**: `crates/meeting-controller/src/actors/session.rs`, `crates/meeting-controller/src/actors/controller.rs`
+
+When using `SecretBox<T>` for cryptographic secrets, be aware that `SecretBox` intentionally doesn't implement `Clone` to prevent accidental secret duplication. This creates a tradeoff: type-safe protection against secret leaks vs. occasional performance cost when secrets must be passed to child actors or stored in arrays.
+
+Pattern for per-entity secret storage (e.g., meeting-specific secrets):
+```rust
+// In controller actor, for each meeting, create a new SecretBox
+pub fn create_meeting(&mut self, meeting_id: String) -> Result<MeetingInfo, McError> {
+    let meeting_secret = SecretBox::new(Box::new(
+        self.master_secret.expose_secret().clone()  // Minimal, justified clone
+    ));
+    let handle = MeetingActor::spawn(meeting_id.clone(), meeting_secret, ...);
+    // ...
+}
+```
+
+**Why this is correct**: The per-meeting clone is necessary because `SecretBox` doesn't clone. The clone happens only when creating new meetings (not hot path), and is isolated to the single use site. Document this pattern with comments referencing ADR-0023.
+
+**When this becomes a problem**: If the same secret needs cloning at multiple hot-path callsites, escalate to tech debt for `Arc<SecretBox<T>>` consideration (Phase 6d).
+
+This pattern balances type safety (catching accidental secret leaks at compile time) with pragmatic performance (accepting minimal clones at strategic points).
+
+---

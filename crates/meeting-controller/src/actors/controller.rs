@@ -22,6 +22,7 @@ use super::meeting::{MeetingActor, MeetingActorHandle};
 use super::messages::{ControllerMessage, ControllerStatus, MeetingInfo};
 use super::metrics::{ActorMetrics, ActorType, MailboxMonitor};
 
+use common::secret::{ExposeSecret, SecretBox};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -52,9 +53,15 @@ impl MeetingControllerActorHandle {
     ///
     /// * `mc_id` - MC instance ID
     /// * `metrics` - Shared actor metrics
-    /// * `master_secret` - Master secret for session binding tokens (must be >= 32 bytes)
+    /// * `master_secret` - Master secret for session binding tokens (must be >= 32 bytes).
+    ///   Wrapped in SecretBox to ensure secure memory handling (zeroization on drop,
+    ///   redacted Debug output).
     #[must_use]
-    pub fn new(mc_id: String, metrics: Arc<ActorMetrics>, master_secret: Vec<u8>) -> Self {
+    pub fn new(
+        mc_id: String,
+        metrics: Arc<ActorMetrics>,
+        master_secret: SecretBox<Vec<u8>>,
+    ) -> Self {
         let (sender, receiver) = mpsc::channel(CONTROLLER_CHANNEL_BUFFER);
         let cancel_token = CancellationToken::new();
 
@@ -85,9 +92,10 @@ impl MeetingControllerActorHandle {
                 respond_to: tx,
             })
             .await
-            .map_err(|_| McError::Internal)?;
+            .map_err(|e| McError::Internal(format!("channel send failed: {e}")))?;
 
-        rx.await.map_err(|_| McError::Internal)?
+        rx.await
+            .map_err(|e| McError::Internal(format!("response receive failed: {e}")))?
     }
 
     /// Get information about an existing meeting.
@@ -99,9 +107,10 @@ impl MeetingControllerActorHandle {
                 respond_to: tx,
             })
             .await
-            .map_err(|_| McError::Internal)?;
+            .map_err(|e| McError::Internal(format!("channel send failed: {e}")))?;
 
-        rx.await.map_err(|_| McError::Internal)?
+        rx.await
+            .map_err(|e| McError::Internal(format!("response receive failed: {e}")))?
     }
 
     /// Remove a meeting (called when all participants leave).
@@ -113,9 +122,10 @@ impl MeetingControllerActorHandle {
                 respond_to: tx,
             })
             .await
-            .map_err(|_| McError::Internal)?;
+            .map_err(|e| McError::Internal(format!("channel send failed: {e}")))?;
 
-        rx.await.map_err(|_| McError::Internal)?
+        rx.await
+            .map_err(|e| McError::Internal(format!("response receive failed: {e}")))?
     }
 
     /// Get the current controller status.
@@ -124,9 +134,10 @@ impl MeetingControllerActorHandle {
         self.sender
             .send(ControllerMessage::GetStatus { respond_to: tx })
             .await
-            .map_err(|_| McError::Internal)?;
+            .map_err(|e| McError::Internal(format!("channel send failed: {e}")))?;
 
-        rx.await.map_err(|_| McError::Internal)
+        rx.await
+            .map_err(|e| McError::Internal(format!("response receive failed: {e}")))
     }
 
     /// Initiate graceful shutdown.
@@ -138,9 +149,10 @@ impl MeetingControllerActorHandle {
                 respond_to: tx,
             })
             .await
-            .map_err(|_| McError::Internal)?;
+            .map_err(|e| McError::Internal(format!("channel send failed: {e}")))?;
 
-        rx.await.map_err(|_| McError::Internal)?
+        rx.await
+            .map_err(|e| McError::Internal(format!("response receive failed: {e}")))?
     }
 
     /// Cancel the actor (for immediate shutdown).
@@ -190,7 +202,8 @@ pub struct MeetingControllerActor {
     /// Mailbox monitor.
     mailbox: MailboxMonitor,
     /// Master secret for session binding tokens (ADR-0023).
-    master_secret: Vec<u8>,
+    /// Wrapped in SecretBox to ensure secure memory handling.
+    master_secret: SecretBox<Vec<u8>>,
 }
 
 impl MeetingControllerActor {
@@ -202,13 +215,14 @@ impl MeetingControllerActor {
     /// * `receiver` - Message receiver channel
     /// * `cancel_token` - Root cancellation token
     /// * `metrics` - Shared actor metrics
-    /// * `master_secret` - Master secret for session binding tokens (must be >= 32 bytes)
+    /// * `master_secret` - Master secret for session binding tokens (must be >= 32 bytes).
+    ///   Wrapped in SecretBox to ensure secure memory handling.
     fn new(
         mc_id: String,
         receiver: mpsc::Receiver<ControllerMessage>,
         cancel_token: CancellationToken,
         metrics: Arc<ActorMetrics>,
-        master_secret: Vec<u8>,
+        master_secret: SecretBox<Vec<u8>>,
     ) -> Self {
         let mailbox = MailboxMonitor::new(ActorType::Controller, &mc_id);
 
@@ -225,7 +239,7 @@ impl MeetingControllerActor {
     }
 
     /// Run the actor message loop.
-    #[instrument(skip(self), name = "mc.actor.controller", fields(mc_id = %self.mc_id))]
+    #[instrument(skip_all, name = "mc.actor.controller", fields(mc_id = %self.mc_id))]
     async fn run(mut self) {
         info!(
             target: "mc.actor.controller",
@@ -346,11 +360,13 @@ impl MeetingControllerActor {
         let meeting_token = self.cancel_token.child_token();
 
         // Create the meeting actor (with master_secret for session binding tokens)
+        // Create a new SecretBox from the exposed secret bytes for each meeting
+        let meeting_secret = SecretBox::new(Box::new(self.master_secret.expose_secret().clone()));
         let (handle, task_handle) = MeetingActor::spawn(
             meeting_id.clone(),
             meeting_token,
             Arc::clone(&self.metrics),
-            self.master_secret.clone(),
+            meeting_secret,
         );
 
         let created_at = chrono::Utc::now().timestamp();
@@ -413,6 +429,10 @@ impl MeetingControllerActor {
     }
 
     /// Remove a meeting.
+    ///
+    /// This method initiates meeting removal but does not block waiting for
+    /// the meeting actor task to complete. The cleanup is spawned as a
+    /// background task to avoid blocking the message loop (ADR-0023).
     async fn remove_meeting(&mut self, meeting_id: &str) -> Result<(), McError> {
         match self.meetings.remove(meeting_id) {
             Some(managed) => {
@@ -426,8 +446,38 @@ impl MeetingControllerActor {
                 // Cancel the meeting actor
                 managed.handle.cancel();
 
-                // Wait for the task to complete (with timeout)
-                let _ = tokio::time::timeout(Duration::from_secs(5), managed.task_handle).await;
+                // Spawn background task to wait for cleanup - don't block the message loop
+                let meeting_id_owned = meeting_id.to_string();
+                let mc_id = self.mc_id.clone();
+                tokio::spawn(async move {
+                    match tokio::time::timeout(Duration::from_secs(5), managed.task_handle).await {
+                        Ok(Ok(())) => {
+                            debug!(
+                                target: "mc.actor.controller",
+                                mc_id = %mc_id,
+                                meeting_id = %meeting_id_owned,
+                                "Meeting actor task completed cleanly"
+                            );
+                        }
+                        Ok(Err(e)) => {
+                            warn!(
+                                target: "mc.actor.controller",
+                                mc_id = %mc_id,
+                                meeting_id = %meeting_id_owned,
+                                error = ?e,
+                                "Meeting actor task panicked during removal"
+                            );
+                        }
+                        Err(_) => {
+                            warn!(
+                                target: "mc.actor.controller",
+                                mc_id = %mc_id,
+                                meeting_id = %meeting_id_owned,
+                                "Meeting actor task cleanup timed out"
+                            );
+                        }
+                    }
+                });
 
                 self.metrics.meeting_removed();
 
@@ -593,8 +643,8 @@ mod tests {
     use super::*;
 
     /// Test secret for session binding (32 bytes as required by ADR-0023).
-    fn test_secret() -> Vec<u8> {
-        vec![0u8; 32]
+    fn test_secret() -> SecretBox<Vec<u8>> {
+        SecretBox::new(Box::new(vec![0u8; 32]))
     }
 
     #[tokio::test]

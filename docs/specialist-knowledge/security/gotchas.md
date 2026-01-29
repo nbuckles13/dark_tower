@@ -137,3 +137,21 @@ Database and cache connection URLs often contain credentials (e.g., `redis://use
 Common locations where this appears: (1) `main.rs` startup logs, (2) Connection pool initialization, (3) Health check failure messages, (4) Configuration dump on startup. The `url` crate's `Url::host_str()` and `Url::port()` methods are safe; `Url::as_str()` or `to_string()` are not.
 
 ---
+
+## Gotcha: Validation Scope for SecretBox Size Checks
+**Added**: 2026-01-28
+**Related files**: `crates/meeting-controller/src/actors/session.rs`
+
+When validating SecretBox size (e.g., asserting minimum length for HKDF), call `.expose_secret().len()` ONLY for the validation. The exposed bytes should not be stored, manipulated, or copied outside the validation context. Pattern:
+
+```rust
+// CORRECT: Validation only
+assert!(master_secret.expose_secret().len() >= 32, "...");
+
+// INCORRECT: Storing or manipulating exposed bytes
+let raw_bytes = master_secret.expose_secret(); // Don't store this!
+```
+
+**Why**: Calling `.expose_secret()` returns a reference valid only for the current scope. If stored in a local variable, the reference could be reused after the SecretBox mutates or drops, creating a use-after-free. Keep `.expose_secret()` calls inline with their usage (validation, HKDF input, HMAC computation).
+
+---
