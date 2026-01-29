@@ -21,11 +21,13 @@ The task description is passed via `$ARGUMENTS`:
 ```
 /dev-loop-init "task description" [specialist-name] [--plan]
 /dev-loop-init --plan [specialist-name]
+/dev-loop-init --from-plan [path]
 ```
 
-- **task description** (optional if `--plan`): The implementation task (passed VERBATIM to specialist)
+- **task description** (optional if `--plan` or `--from-plan`): The implementation task
 - **specialist-name** (optional): Override auto-detected specialist
 - **--plan** (optional): Route to planning phase before implementation
+- **--from-plan** (optional): Import from an existing plan file (from plan mode)
 
 ### Invocation Patterns
 
@@ -36,6 +38,8 @@ The task description is passed via `$ARGUMENTS`:
 | `/dev-loop-init --plan` | No objective yet, requires `/dev-loop-plan` to define |
 | `/dev-loop-init "task" specialist-name` | Standard flow with explicit specialist |
 | `/dev-loop-init "task" specialist-name --plan` | Planning flow with explicit specialist |
+| `/dev-loop-init --from-plan` | Import from most recent plan in `~/.claude/plans/` |
+| `/dev-loop-init --from-plan /path/to/plan.md` | Import from specific plan file |
 
 ## Instructions
 
@@ -61,6 +65,24 @@ Which would you like to do?
 ```
 
 Wait for user response before proceeding.
+
+### Step 1b: Handle --from-plan (if provided)
+
+If `--from-plan` was specified:
+
+1. **Locate the plan file**:
+   - If a path was provided: use that path
+   - If no path: find the most recently modified `.md` file in `~/.claude/plans/`
+
+2. **Read and parse the plan file**:
+   - Extract the title from `# Plan: {title}` header → use as brief objective
+   - Extract the content (especially Requirements/Overview sections) → use as detailed requirements
+
+3. **Store for later steps**:
+   - `plan_title` → will become the Objective
+   - `plan_content` → will become the Detailed Requirements section
+
+Continue to Step 2 with the extracted title for slug generation.
 
 ### Step 2: Generate Output Directory Name
 
@@ -133,6 +155,12 @@ Determine initial state based on `--plan` flag:
 - If `--plan` used: `Current Step = planning`
 - Otherwise: `Current Step = init`
 
+**Populate Detailed Requirements**:
+- If `--from-plan` was used: copy the plan content (from Step 1b) into the Detailed Requirements section
+- If the user provided detailed context in the conversation, structure it into the Detailed Requirements section
+- If only a brief task description was given, expand it into actionable requirements by analyzing what the task entails
+- This section is critical for recovery - if the loop is interrupted, `dev-loop-implement` reads from here
+
 Create `main.md` from template with Loop State initialized:
 
 ```markdown
@@ -165,7 +193,19 @@ Create `main.md` from template with Loop State initialized:
 ## Task Overview
 
 ### Objective
-{task description - VERBATIM, or "To be defined during planning" if --plan only}
+{brief task description}
+
+### Detailed Requirements
+
+{Structured breakdown of the task. Include:
+- Specific requirements with code examples (good/bad patterns)
+- File locations where changes are needed
+- Violation counts or scope estimates
+- Acceptance criteria
+
+This section is read by dev-loop-implement and passed to the specialist.
+If the user provided detailed context, structure it here.
+If only a brief description was given, expand it into actionable requirements.}
 
 ### Scope
 - **Service(s)**: {inferred from specialist}
@@ -213,8 +253,11 @@ Knowledge files to inject:
 - docs/specialist-knowledge/{specialist}/gotchas.md (if exists)
 - docs/specialist-knowledge/{specialist}/integration.md (if exists)
 
-Task (VERBATIM):
-> {task description exactly as provided}
+Task:
+> {brief task description}
+
+Detailed Requirements:
+> {summary of what's in the Detailed Requirements section - e.g., "3 issue types, 48 total violations, 5 files"}
 
 Output directory:
 > docs/dev-loop-outputs/YYYY-MM-DD-{task-slug}/
@@ -249,9 +292,23 @@ Mode: Planning first
 **Next step**: Run `/dev-loop-plan` to explore and propose approach
 ```
 
+#### If imported from plan (--from-plan used):
+
+```
+**Dev-Loop Initialized (From Plan)**
+
+Output directory: docs/dev-loop-outputs/YYYY-MM-DD-{task-slug}/
+Specialist: {specialist-name}
+Matched principles: {count} categories
+Knowledge files: {count} files (or "none - will bootstrap on first reflection")
+Plan imported: Yes (content now in main.md Detailed Requirements)
+
+**Next step**: Run `/dev-loop-implement` to spawn the specialist
+```
+
 ## Critical Constraints
 
-- **VERBATIM task description**: Never paraphrase, summarize, or modify the task description
+- **Persist detailed requirements**: The Detailed Requirements section must contain enough context for a fresh agent to complete the task if the loop is interrupted and restarted
 - **No implementation**: This skill prepares but does not implement
 - **User approval point**: After showing the preview, user explicitly runs `/dev-loop-implement`
 

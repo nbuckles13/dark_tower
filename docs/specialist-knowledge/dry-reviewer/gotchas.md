@@ -51,3 +51,11 @@ Background tasks using Tokio typically share similar shutdown patterns: `select!
 Do NOT flag Tokio actor implementations (task + mpsc channel + message enum) as candidates for extraction to common/. Actor patterns are inherently service-specific: the message types, state machine logic, and business rules are unique to each service's domain. The infrastructure pattern (spawn task, receive messages, handle each variant) is idiomatic Tokio, not duplication. Only flag if two services have identical business logic within their actors.
 
 ---
+
+## Gotcha: Security Wrapper Response Types Need Duplication Context
+**Added**: 2026-01-28
+**Related files**: `crates/ac-service/src/models/mod.rs`
+
+When reviewing custom Debug/Serialize implementations for SecretString/SecretBox response fields, DO NOT automatically flag as duplication when the same pattern appears across multiple response types (e.g., 3 response types with identical client_secret handling). This is acceptable single-service duplication. The implementations are intentionally simple (2-3 lines each) to maintain security clarity. Only escalate to TECH_DEBT if: (1) the pattern spans a SECOND service, or (2) more than 4 response types in same service require identical handling. Context: Security-critical boilerplate is intentionally terse per OWASP guidelines; extracting prematurely obscures intent.
+
+---

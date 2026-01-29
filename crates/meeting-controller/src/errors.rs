@@ -72,9 +72,9 @@ pub enum McError {
     #[error("Permission denied: {0}")]
     PermissionDenied(String),
 
-    /// Internal error.
-    #[error("Internal error")]
-    Internal,
+    /// Internal error with context.
+    #[error("Internal error: {0}")]
+    Internal(String),
 }
 
 /// Session binding token validation errors (ADR-0023).
@@ -110,7 +110,7 @@ impl McError {
             McError::Redis(_)
             | McError::Grpc(_)
             | McError::Config(_)
-            | McError::Internal
+            | McError::Internal(_)
             | McError::FencedOut(_) => {
                 6 // INTERNAL_ERROR
             }
@@ -129,7 +129,7 @@ impl McError {
     #[allow(dead_code)] // Used in Phase 6b+
     pub fn client_message(&self) -> String {
         match self {
-            McError::Redis(_) | McError::Grpc(_) | McError::Config(_) | McError::Internal => {
+            McError::Redis(_) | McError::Grpc(_) | McError::Config(_) | McError::Internal(_) => {
                 "An internal error occurred".to_string()
             }
             McError::SessionBinding(e) => e.to_string(),
@@ -166,7 +166,7 @@ mod tests {
             6
         );
         assert_eq!(McError::Config("bad config".to_string()).error_code(), 6);
-        assert_eq!(McError::Internal.error_code(), 6);
+        assert_eq!(McError::Internal("test".to_string()).error_code(), 6);
         assert_eq!(McError::FencedOut("stale".to_string()).error_code(), 6);
 
         // Auth errors -> 2

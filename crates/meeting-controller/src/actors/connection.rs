@@ -54,7 +54,7 @@ impl ConnectionActorHandle {
         self.sender
             .send(ConnectionMessage::Send { message })
             .await
-            .map_err(|_| McError::Internal)
+            .map_err(|e| McError::Internal(format!("channel send failed: {e}")))
     }
 
     /// Send a participant state update to the client.
@@ -62,7 +62,7 @@ impl ConnectionActorHandle {
         self.sender
             .send(ConnectionMessage::ParticipantUpdate { update })
             .await
-            .map_err(|_| McError::Internal)
+            .map_err(|e| McError::Internal(format!("channel send failed: {e}")))
     }
 
     /// Close the connection.
@@ -70,7 +70,7 @@ impl ConnectionActorHandle {
         self.sender
             .send(ConnectionMessage::Close { reason })
             .await
-            .map_err(|_| McError::Internal)
+            .map_err(|e| McError::Internal(format!("channel send failed: {e}")))
     }
 
     /// Ping the connection to check liveness.
@@ -79,9 +79,10 @@ impl ConnectionActorHandle {
         self.sender
             .send(ConnectionMessage::Ping { respond_to: tx })
             .await
-            .map_err(|_| McError::Internal)?;
+            .map_err(|e| McError::Internal(format!("channel send failed: {e}")))?;
 
-        rx.await.map_err(|_| McError::Internal)
+        rx.await
+            .map_err(|e| McError::Internal(format!("response receive failed: {e}")))
     }
 
     /// Cancel the connection actor.
@@ -154,7 +155,7 @@ impl ConnectionActor {
 
     /// Run the actor message loop.
     #[instrument(
-        skip(self),
+        skip_all,
         name = "mc.actor.connection",
         fields(
             connection_id = %self.connection_id,

@@ -10,7 +10,7 @@ Spawn the implementing specialist with:
 - Specialist definition
 - Matched principles
 - Accumulated knowledge files
-- Task description (VERBATIM)
+- Task objective and detailed requirements
 
 The specialist implements the task, runs 7-layer verification, and writes checkpoint files.
 
@@ -35,7 +35,8 @@ If output-dir not provided, auto-detect:
 5. If none: error - "No active dev-loop. Run `/dev-loop-init` first."
 
 Read the `main.md` to get:
-- Task description (from Task Overview > Objective)
+- Task objective (from Task Overview > Objective)
+- Detailed requirements (from Task Overview > Detailed Requirements)
 - Implementing Specialist name (from Loop State)
 - Implementing Agent ID (from Loop State - may be set from planning)
 - Matched principles (from Matched Principles section)
@@ -91,7 +92,11 @@ Then add the task section:
 
 ## Task
 
-{task description - VERBATIM from main.md}
+{task objective from main.md}
+
+### Detailed Requirements
+
+{detailed requirements section from main.md - this contains the full context needed to complete the task, including code examples, file locations, and acceptance criteria}
 
 ---
 
@@ -258,7 +263,7 @@ Error: {error details}
 
 ## Critical Constraints
 
-- **VERBATIM task description**: Copy exactly from main.md, never paraphrase
+- **Include full requirements**: Copy both Objective and Detailed Requirements from main.md - this is the source of truth for task context
 - **No implementation by orchestrator**: If Task invocation fails, return error. Do NOT fall back to implementing yourself.
 - **Checkpoint required**: Specialist must create checkpoint file
 - **--workspace flag**: All cargo commands must use --workspace

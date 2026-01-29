@@ -290,3 +290,31 @@ match managed.handle.get_state().await {
 ```
 
 The graceful fallback ensures status queries don't fail during graceful shutdown or actor restarts.
+
+---
+
+## Gotcha: SecretBox Clone Performance vs Type Safety Trade-off
+**Added**: 2026-01-28
+**Related files**: `crates/meeting-controller/src/actors/controller.rs`
+
+When reviewing code that calls `.expose_secret().clone()`, don't immediately flag as performance waste. `SecretBox` intentionally prevents cloning to protect against secret leaks. Occasional clones at key points (per-entity initialization) are acceptable if:
+
+1. The clone happens in initialization code, not hot paths
+2. A comment explains the pattern and references ADR-0023
+3. Security specialist has approved the tradeoff
+4. DRY reviewer confirms no duplicate patterns elsewhere
+
+Red flag if you see many clones across multiple callsites - escalate to tech debt for `Arc<SecretBox<T>>` consideration.
+
+```rust
+// ACCEPTABLE: Single clone during initialization
+let meeting_secret = SecretBox::new(Box::new(
+    self.master_secret.expose_secret().clone()  // Minimal, justified
+));
+
+// NOT ACCEPTABLE: Multiple clones across hot path
+for meeting in meetings {
+    let secret = self.master_secret.expose_secret().clone();  // Flag this
+    // ... repeated many times per request
+}
+```

@@ -97,3 +97,13 @@ These patterns are acceptable and should NOT be flagged: (1) Per-service configu
 Escalate to Architecture specialist if: duplication spans 3+ services, extraction requires database schema changes, pattern impacts protocol or API contracts, uncertainty about service boundary placement. Escalate to Security specialist if: duplication involves cryptography, authentication, or authorization, or pattern impacts threat model.
 
 ---
+
+## Review Checkpoint: SecretBox Migration (2026-01-28)
+**Task**: SecretBox/SecretString refactor for ac-service credential protection
+**DRY Finding**: No issues - approved for "DRY enough for current scope (3 response types)"
+**Key Observation**: Custom Debug/Serialize implementations for SecretString in 3 response types (RegisterServiceResponse, CreateClientResponse, RotateSecretResponse) are acceptable duplication within a single service. The implementations are intentionally terse (2-3 lines each) to maintain clarity. Only escalate if patterns appear in a second service or if single-service scope exceeds 4 types.
+**Files reviewed**: `crates/ac-service/src/models/mod.rs`, `crates/ac-service/src/crypto/mod.rs`, `crates/ac-service/src/config.rs`
+**Patterns identified**: Security wrapper response types, SecretBox field patterns in config, custom Clone for SecretBox fields
+**Notes for future reviews**: When SecretBox/SecretString patterns appear in global-controller or meeting-controller response types, use this AC review as precedent for determining single-service vs cross-service duplication threshold.
+
+---

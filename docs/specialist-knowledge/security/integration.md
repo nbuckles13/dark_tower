@@ -86,8 +86,8 @@ Service must fail startup if `MC_BINDING_TOKEN_SECRET` is not configured.
 ---
 
 ## Integration: Meeting Controller - GC Communication Security
-**Added**: 2026-01-25
-**Related files**: `crates/meeting-controller/src/grpc/interceptor.rs`, `crates/meeting-controller/src/grpc/gc_client.rs`
+**Added**: 2026-01-25 (Updated: 2026-01-28)
+**Related files**: `crates/meeting-controller/src/grpc/interceptor.rs`, `crates/meeting-controller/src/grpc/gc_client.rs`, `crates/meeting-controller/src/actors/controller.rs`
 
 GC-to-MC communication uses authenticated gRPC. Security requirements:
 
@@ -98,5 +98,22 @@ GC-to-MC communication uses authenticated gRPC. Security requirements:
 5. **Startup validation**: Fail fast if required secrets (`MC_BINDING_TOKEN_SECRET`, `GC_SERVICE_TOKEN`) are not configured.
 
 The gRPC interceptor pattern ensures authorization is checked before handler code runs, providing defense-in-depth even if individual handlers forget auth checks.
+
+---
+
+## Integration: Meeting Controller - Session Binding Token Security
+**Added**: 2026-01-28
+**Related files**: `crates/meeting-controller/src/actors/session.rs`, `crates/meeting-controller/src/actors/meeting.rs`
+
+Session binding tokens provide recovery after connection drops. Security requirements:
+
+1. **Master secret storage**: Wrap in `SecretBox<Vec<u8>>`, pass through actor hierarchy. Each actor clones into own SecretBox for isolated lifecycle.
+2. **Key derivation**: HKDF-SHA256 with `meeting_id` as salt, `"session-binding"` as info. Per-meeting keys prevent key reuse across meetings.
+3. **Token generation**: `HMAC-SHA256(meeting_key, correlation_id || participant_id || nonce)`. One-time nonce prevents replay.
+4. **Token validation**: Use `hmac::verify()` for constant-time comparison, NOT `==` operator.
+5. **TTL**: Bind tokens have 30-second TTL. Enforce expiration on reconnect validation.
+6. **No secret leakage**: Never log binding tokens, nonces, or master secret. Only log correlation_id and participant_id (safe identifiers).
+
+Per ADR-0023 Section 1, binding tokens are defense-in-depth (also require valid JWT). The HKDF-derived-per-meeting-key pattern ensures meeting compromise doesn't reveal master secret.
 
 ---

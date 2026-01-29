@@ -132,7 +132,7 @@ impl FencedRedisClient {
     /// Get the current generation for a meeting.
     ///
     /// Returns 0 if no generation exists (new meeting).
-    #[instrument(skip(self), fields(meeting_id = %meeting_id))]
+    #[instrument(skip_all, fields(meeting_id = %meeting_id))]
     pub async fn get_generation(&self, meeting_id: &str) -> Result<u64, McError> {
         // Clone the connection (cheap operation) for this request
         let mut conn = self.connection.clone();
@@ -152,7 +152,7 @@ impl FencedRedisClient {
     }
 
     /// Increment the generation for a meeting and return new value.
-    #[instrument(skip(self), fields(meeting_id = %meeting_id))]
+    #[instrument(skip_all, fields(meeting_id = %meeting_id))]
     pub async fn increment_generation(&self, meeting_id: &str) -> Result<u64, McError> {
         // Clone the connection (cheap operation) for this request
         let mut conn = self.connection.clone();
@@ -215,7 +215,7 @@ impl FencedRedisClient {
     ///
     /// Returns `McError::FencedOut` if another MC has written a higher generation.
     /// Returns `McError::Redis` for connection or serialization errors.
-    #[instrument(skip(self), fields(meeting_id = %meeting_id, primary_mh_id = %primary_mh_id))]
+    #[instrument(skip_all, fields(meeting_id = %meeting_id, primary_mh_id = %primary_mh_id))]
     pub async fn store_mh_assignment(
         &self,
         meeting_id: &str,
@@ -240,7 +240,7 @@ impl FencedRedisClient {
                 error = %e,
                 "Failed to serialize MH assignment"
             );
-            McError::Internal
+            McError::Internal(format!("serialization failed: {e}"))
         })?;
 
         // Clone the connection (cheap operation) for this request
@@ -300,7 +300,7 @@ impl FencedRedisClient {
     }
 
     /// Get MH assignment for a meeting.
-    #[instrument(skip(self), fields(meeting_id = %meeting_id))]
+    #[instrument(skip_all, fields(meeting_id = %meeting_id))]
     pub async fn get_mh_assignment(
         &self,
         meeting_id: &str,
@@ -336,7 +336,7 @@ impl FencedRedisClient {
     }
 
     /// Delete MH assignment for a meeting.
-    #[instrument(skip(self), fields(meeting_id = %meeting_id))]
+    #[instrument(skip_all, fields(meeting_id = %meeting_id))]
     pub async fn delete_mh_assignment(&self, meeting_id: &str) -> Result<(), McError> {
         // Get current generation
         let generation = self.get_generation(meeting_id).await?;
@@ -387,7 +387,7 @@ impl FencedRedisClient {
     /// * `meeting_id` - Meeting identifier
     /// * `generation` - Expected generation (fencing token)
     /// * `fields` - Field-value pairs to store
-    #[instrument(skip(self, fields), fields(meeting_id = %meeting_id, generation = generation))]
+    #[instrument(skip_all, fields(meeting_id = %meeting_id, generation = generation))]
     pub async fn store_meeting_state(
         &self,
         meeting_id: &str,
@@ -488,7 +488,7 @@ impl FencedRedisClient {
     }
 
     /// Delete all meeting data (cleanup on meeting end).
-    #[instrument(skip(self), fields(meeting_id = %meeting_id))]
+    #[instrument(skip_all, fields(meeting_id = %meeting_id))]
     pub async fn delete_meeting(&self, meeting_id: &str) -> Result<(), McError> {
         let mut conn = self.connection.clone();
 

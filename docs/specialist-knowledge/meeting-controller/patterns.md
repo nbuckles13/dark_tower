@@ -134,3 +134,11 @@ For critical infrastructure connections (like MC→GC), prefer eager initializat
 Implement `tonic::service::Interceptor` for authorization validation on incoming gRPC requests. Pattern: extract `authorization` metadata, validate `Bearer ` prefix (case-sensitive), check token is non-empty and within size limits (8KB max). Return generic error messages (e.g., "Invalid token") to prevent information leakage. Include `#[cfg(test)] pub fn disabled()` constructor for testing without auth.
 
 ---
+
+## Pattern: SecretBox with expose_secret().clone() for Non-Clone Types
+**Added**: 2026-01-28
+**Related files**: `crates/meeting-controller/src/config.rs`, `crates/meeting-controller/src/actors/session.rs`
+
+When storing non-Clone types (like `ring::hkdf::Prk`) in `SecretBox<T>`, the standard pattern of deriving Clone fails. Solution: (1) Don't derive Clone on the config struct, or (2) Manually implement Clone with `expose_secret().clone()` to access the inner value. This is intentionally explicit and grep-able. Pattern: `SecretBox::new(prk)` for storage, then `config.master_secret.expose_secret().clone()` for cloning. This maintains security (debug redaction) while working with non-Clone cryptographic types. Import `secrecy::ExposeSecret` trait to access the method.
+
+---

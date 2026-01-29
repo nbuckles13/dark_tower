@@ -141,9 +141,9 @@ impl GcClient {
             "authorization",
             format!("Bearer {}", self.service_token.expose_secret())
                 .parse()
-                .map_err(|_| {
-                    error!(target: "mc.grpc.gc_client", "Invalid service token format");
-                    McError::Config("Invalid service token format".to_string())
+                .map_err(|e| {
+                    error!(target: "mc.grpc.gc_client", error = %e, "Invalid service token format");
+                    McError::Config(format!("Invalid service token format: {e}"))
                 })?,
         );
         Ok(grpc_request)
@@ -158,7 +158,7 @@ impl GcClient {
     /// # Errors
     ///
     /// Returns `McError::Config` if registration fails after all retries.
-    #[instrument(skip(self), fields(mc_id = %self.config.mc_id, region = %self.config.region))]
+    #[instrument(skip_all, fields(mc_id = %self.config.mc_id, region = %self.config.region))]
     pub async fn register(&self) -> Result<(), McError> {
         let request = RegisterMcRequest {
             id: self.config.mc_id.clone(),
@@ -280,7 +280,7 @@ impl GcClient {
     /// * `current_meetings` - Current number of active meetings
     /// * `current_participants` - Current total participants
     /// * `health` - Current health status
-    #[instrument(skip(self), fields(mc_id = %self.config.mc_id))]
+    #[instrument(skip_all, fields(mc_id = %self.config.mc_id))]
     pub async fn fast_heartbeat(
         &self,
         current_meetings: u32,
@@ -342,7 +342,7 @@ impl GcClient {
     /// * `health` - Current health status
     /// * `cpu_usage_percent` - CPU usage (0-100)
     /// * `memory_usage_percent` - Memory usage (0-100)
-    #[instrument(skip(self), fields(mc_id = %self.config.mc_id))]
+    #[instrument(skip_all, fields(mc_id = %self.config.mc_id))]
     pub async fn comprehensive_heartbeat(
         &self,
         current_meetings: u32,

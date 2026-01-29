@@ -105,5 +105,16 @@ MC Phase 6a/6b establishes the foundation for WebTransport signaling. Key patter
 - Error variants must match communication protocol (McError::Grpc for gRPC calls, not McError::Redis)
 - Estimation constants (e.g., ESTIMATED_PARTICIPANTS_PER_MEETING in mc_service.rs) need doc comments explaining derivation
 - Code prepared for Phase 6d uses `#[allow(dead_code)]` with phase reference comment
+- All `#[instrument]` attributes use `skip_all` pattern for security (prevents future parameter leaks)
+- Error context is preserved in error types (McError::Internal(String)) to aid debugging
+- Non-blocking actor design: background cleanup spawned as separate task instead of blocking message loop
+
+**Code Quality Review Insights (2026-01-28)**:
+After Phase 6c code quality fixes, verified that:
+- Error hiding violations (31 total) fixed by adding context to error variants
+- Instrument skip-all pattern (16 total) switched from denylist to allowlist for forward compatibility
+- Actor blocking (1 violation) fixed by spawning background tasks instead of awaiting in message loop
+- All changes maintain ADR-0002 (no panics) and ADR-0023 compliance
+- SecretBox migration for master_secret adds security property (memory zeroing) without behavioral change
 
 When reviewing future MC features (session management, participant coordination), ensure they follow these established patterns and reference ADR-0023 sections.
