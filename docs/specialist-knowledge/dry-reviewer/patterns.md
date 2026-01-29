@@ -83,3 +83,19 @@ When similar code exists in two services but with meaningful implementation diff
 When a single service wraps sensitive fields with SecretString or SecretBox across multiple response types, evaluate duplication based on scope. Example: `RegisterServiceResponse`, `CreateClientResponse`, and `RotateSecretResponse` all have `client_secret: SecretString` with identical custom Debug/Serialize impls. Scope = 3 types within single service (ac-service). Assessment: NOT BLOCKER - this is acceptable duplication for 3 response types in the same service. Only consider extraction to `common::secret` if: (1) a second service also needs identical response patterns, (2) the impl pattern becomes standardized across 4+ types in same service. Rationale: Custom Debug/Serialize impls for security wrappers are intentionally terse and service-specific; extracting prematurely creates coupling and makes intent less clear.
 
 ---
+
+## Pattern: Service Error Enum Convergence Check
+**Added**: 2026-01-28
+**Related files**: `crates/global-controller/src/errors.rs`, `crates/meeting-controller/src/errors.rs`, `crates/ac-service/src/errors.rs`
+
+When reviewing error enum changes across services, check for convergence on shared patterns from `common::error::DarkTowerError`. Example: GC and MC both use `Internal(String)` variant (matches common), while AC still uses `Internal` unit variant. This indicates parallel evolution toward a standard. Assessment: NOT BLOCKER when services converge on the common pattern - this is healthy architecture alignment. Only flag as TECH_DEBT if a service diverges from the established common pattern without justification. Rationale: Services cannot share error enums due to domain-specific variants, but should align on shared variant signatures (Internal, Database, etc.).
+
+---
+
+## Pattern: Tracing Instrument Patterns Are Infrastructure
+**Added**: 2026-01-28
+**Related files**: Code quality guard violations across services
+
+When reviewing `#[instrument]` attribute patterns (e.g., `skip_all`, `skip(field1, field2)`, `fields(...)`), recognize these as infrastructure patterns, not business logic duplication. Each service will have service-specific span names (`gc.handler`, `mc.actor`, `ac.endpoint`) and field selections. Assessment: ACCEPTABLE - tracing patterns are intrinsic to observability infrastructure. Do not flag similar `skip_all` or `skip(...)` patterns across services as duplication requiring extraction. Only escalate if the actual instrumented business logic is duplicated, not the tracing boilerplate.
+
+---

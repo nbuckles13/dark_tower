@@ -35,7 +35,7 @@ pub struct AuthState {
 ///
 /// - Returns 401 Unauthorized with WWW-Authenticate header if token is missing or invalid
 /// - Continues to next handler with claims in extensions if token is valid
-#[instrument(skip(state, req, next), name = "gc.middleware.auth")]
+#[instrument(skip_all, name = "gc.middleware.auth")]
 pub async fn require_auth(
     State(state): State<Arc<AuthState>>,
     mut req: Request,

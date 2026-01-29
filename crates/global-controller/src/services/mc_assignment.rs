@@ -69,7 +69,7 @@ impl McAssignmentService {
     ///
     /// - `GcError::ServiceUnavailable` - No healthy MCs available
     /// - `GcError::Database` - Database operation failed
-    #[instrument(skip(pool), fields(meeting_id = %meeting_id, region = %region, gc_id = %gc_id))]
+    #[instrument(skip_all, fields(meeting_id = %meeting_id, region = %region, gc_id = %gc_id))]
     pub async fn assign_meeting(
         pool: &PgPool,
         meeting_id: &str,
@@ -163,7 +163,7 @@ impl McAssignmentService {
     /// # Returns
     ///
     /// Number of assignments ended.
-    #[instrument(skip(pool), fields(meeting_id = %meeting_id))]
+    #[instrument(skip_all, fields(meeting_id = %meeting_id))]
     pub async fn end_assignment(
         pool: &PgPool,
         meeting_id: &str,
@@ -195,7 +195,7 @@ impl McAssignmentService {
     /// * `region` - Region to look up in
     // Allow: Used in tests; will be used for future status endpoints
     #[allow(dead_code)]
-    #[instrument(skip(pool), fields(meeting_id = %meeting_id, region = %region))]
+    #[instrument(skip_all, fields(meeting_id = %meeting_id, region = %region))]
     pub async fn get_assignment(
         pool: &PgPool,
         meeting_id: &str,
@@ -227,7 +227,7 @@ impl McAssignmentService {
     ///
     /// - `GcError::ServiceUnavailable` - No healthy MCs/MHs or all MCs rejected
     /// - `GcError::Database` - Database operation failed
-    #[instrument(skip(pool, mc_client), fields(meeting_id = %meeting_id, region = %region, gc_id = %gc_id))]
+    #[instrument(skip_all, fields(meeting_id = %meeting_id, region = %region, gc_id = %gc_id))]
     pub async fn assign_meeting_with_mh<C: McClientTrait>(
         pool: &PgPool,
         mc_client: Arc<C>,

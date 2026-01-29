@@ -174,7 +174,8 @@ tracing::info!(meeting_id = %meeting_id, mc_id = %mc_id, "Meeting assigned to MC
 
 ## Gotcha: Silent Config Fallback to Defaults
 **Added**: 2026-01-25
-**Related files**: `crates/meeting-controller/src/config.rs`
+**Updated**: 2026-01-28 (added GC example)
+**Related files**: `crates/meeting-controller/src/config.rs`, `crates/global-controller/src/config.rs`
 
 Config parsing that silently falls back to default values when environment variables are invalid can mask configuration errors in production. The service may appear to work but with unintended settings:
 
@@ -185,17 +186,16 @@ let timeout = env::var("MC_TIMEOUT")
     .and_then(|v| v.parse().ok())
     .unwrap_or(DEFAULT_TIMEOUT);
 
-// GOOD: Log warning when falling back
+// GOOD: Return error for incorrect values
 let timeout = match env::var("MC_TIMEOUT") {
-    Ok(v) => v.parse().unwrap_or_else(|e| {
-        tracing::warn!("Invalid MC_TIMEOUT '{}': {}. Using default.", v, e);
-        DEFAULT_TIMEOUT
-    }),
+    Ok(v) => v.parse().map_err(|e|
+        ConfigError::InvalidTimeout(format!("Must be valid integer, got '{}': {}", v, e))
+    )?,
     Err(_) => DEFAULT_TIMEOUT,
 };
 ```
 
-At minimum, log a warning when falling back. For security-critical settings, consider failing instead of falling back.
+For security-critical settings (JWT clock skew, rate limits, bcrypt cost), always fail instead of falling back. For operational settings (timeouts, capacity), log a warning at minimum. GC's JWT clock skew parsing is the reference implementation - it returns ConfigError on invalid input.
 
 ---
 

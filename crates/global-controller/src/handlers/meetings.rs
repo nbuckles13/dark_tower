@@ -61,7 +61,7 @@ const DEFAULT_PARTICIPANT_CAPABILITIES: &[&str] = &["audio", "video", "screen_sh
 /// - 403 Forbidden: User not allowed to join
 /// - 404 Not Found: Meeting not found
 /// - 503 Service Unavailable: AC unreachable
-#[instrument(skip(state, claims), fields(meeting_code = %code))]
+#[instrument(skip_all, fields(meeting_code = %code))]
 pub async fn join_meeting(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
@@ -190,7 +190,7 @@ pub async fn join_meeting(
 /// - 404 Not Found: Meeting not found
 /// - 429 Too Many Requests: Rate limit exceeded
 /// - 503 Service Unavailable: AC unreachable
-#[instrument(skip(state, request), fields(meeting_code = %code))]
+#[instrument(skip_all, fields(meeting_code = %code))]
 pub async fn get_guest_token(
     State(state): State<Arc<AppState>>,
     Path(code): Path<String>,
@@ -300,7 +300,7 @@ pub async fn get_guest_token(
 /// - 401 Unauthorized: Invalid or missing token
 /// - 403 Forbidden: User is not the host
 /// - 404 Not Found: Meeting not found
-#[instrument(skip(state, claims, request), fields(meeting_id = %meeting_id))]
+#[instrument(skip_all, fields(meeting_id = %meeting_id))]
 pub async fn update_meeting_settings(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
@@ -504,8 +504,10 @@ fn map_row_to_meeting(row: sqlx::postgres::PgRow) -> Result<MeetingRow, GcError>
 /// Supports both plain UUID and "user:{uuid}" formats.
 fn parse_user_id(sub: &str) -> Result<Uuid, GcError> {
     let uuid_str = sub.strip_prefix("user:").unwrap_or(sub);
-    Uuid::parse_str(uuid_str)
-        .map_err(|_| GcError::InvalidToken("Invalid user identifier in token".to_string()))
+    Uuid::parse_str(uuid_str).map_err(|e| {
+        tracing::debug!(target: "gc.handlers.meetings", error = %e, "Failed to parse user ID from token");
+        GcError::InvalidToken("Invalid user identifier in token".to_string())
+    })
 }
 
 /// Generate a cryptographically secure guest ID.
@@ -513,9 +515,9 @@ fn generate_guest_id() -> Result<Uuid, GcError> {
     let rng = SystemRandom::new();
     let mut bytes = [0u8; 16];
 
-    rng.fill(&mut bytes).map_err(|_| {
-        tracing::error!(target: "gc.handlers.meetings", "Failed to generate random bytes");
-        GcError::Internal
+    rng.fill(&mut bytes).map_err(|e| {
+        tracing::error!(target: "gc.handlers.meetings", error = %e, "Failed to generate random bytes");
+        GcError::Internal(format!("RNG failure: {}", e))
     })?;
 
     // Set UUID version 4 and variant bits

@@ -110,11 +110,20 @@ MC Phase 6a/6b establishes the foundation for WebTransport signaling. Key patter
 - Non-blocking actor design: background cleanup spawned as separate task instead of blocking message loop
 
 **Code Quality Review Insights (2026-01-28)**:
-After Phase 6c code quality fixes, verified that:
-- Error hiding violations (31 total) fixed by adding context to error variants
-- Instrument skip-all pattern (16 total) switched from denylist to allowlist for forward compatibility
-- Actor blocking (1 violation) fixed by spawning background tasks instead of awaiting in message loop
+After Phase 6c code quality fixes (Meeting Controller) and GC guard fixes, verified that:
+- Error hiding violations fixed by adding context to error variants (MC: 31, GC: 7)
+- Instrument skip-all pattern switched from denylist to allowlist for forward compatibility (MC: 16, GC: 16)
+- Actor blocking (MC: 1 violation) fixed by spawning background tasks instead of awaiting in message loop
 - All changes maintain ADR-0002 (no panics) and ADR-0023 compliance
 - SecretBox migration for master_secret adds security property (memory zeroing) without behavioral change
+
+**GC Error Handling Pattern (2026-01-28)**:
+GC code quality fixes established consistent error context patterns:
+- Configuration errors: Include invalid value and parse error in message
+- User input errors (UUID parsing): Log at debug level, return generic user-facing message
+- Internal errors: Preserve context in error variant, log server-side, return generic message to client
+- gRPC validation errors: Include field name in error message for clarity
+
+The GC fix was cleaner than MC because GcError::Internal was already a String variant in most locations - only 3 additional updates needed in ac_client.rs.
 
 When reviewing future MC features (session management, participant coordination), ensure they follow these established patterns and reference ADR-0023 sections.

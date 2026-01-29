@@ -363,3 +363,29 @@ pub fn create_meeting(&mut self, meeting_id: String) -> Result<MeetingInfo, McEr
 This pattern balances type safety (catching accidental secret leaks at compile time) with pragmatic performance (accepting minimal clones at strategic points).
 
 ---
+
+## Pattern: GcError::Internal Variant Evolution
+**Added**: 2026-01-28
+**Related files**: `crates/global-controller/src/errors.rs`
+
+When evolving error variants from unit variants to tuple variants for better error context, follow this pattern:
+
+```rust
+// Before
+#[error("Internal server error")]
+Internal,
+
+// After
+#[error("Internal server error: {0}")]
+Internal(String),
+```
+
+Then update all usages:
+1. **Production code creating errors**: `GcError::Internal(format!("context: {}", e))`
+2. **Test pattern matching**: `GcError::Internal(_)` (use wildcard to avoid brittle tests)
+3. **status_code() match arm**: `GcError::Internal(_)` (context doesn't affect status)
+4. **IntoResponse implementation**: Log context server-side, return generic message to client
+
+This preserves error context for debugging while preventing information leakage to clients. The pattern works for any error variant that needs contextual information.
+
+---

@@ -183,3 +183,36 @@ Functions defined in `#[cfg(test)] mod tests { ... }` within a library crate are
 The mock trait pattern (see patterns.md) avoids this issue entirely by keeping test infrastructure in the public API.
 
 ---
+
+## Gotcha: Error Variant Migration Requires Test Updates
+**Added**: 2026-01-28
+**Related files**: `crates/global-controller/src/errors.rs`, `crates/global-controller/src/services/ac_client.rs`
+
+When changing an error variant from unit to tuple (e.g., `Internal` → `Internal(String)`), ALL usages must be updated:
+- Production code creating errors: `GcError::Internal` → `GcError::Internal(format!("...", e))`
+- Test assertions: `assert!(matches!(err, GcError::Internal))` → `assert!(matches!(err, GcError::Internal(_)))`
+- Match arms: `GcError::Internal =>` → `GcError::Internal(_) =>`
+- Error construction in tests: `GcError::Internal` → `GcError::Internal("test".to_string())`
+
+Rust compiler catches most of these, but test pattern matching can be subtle. Use `_` wildcard in tests to avoid coupling to exact error messages.
+
+---
+
+## Gotcha: Formatter Splits Long map_err Closures
+**Added**: 2026-01-28
+**Related files**: Multiple files in `crates/global-controller/src/`
+
+When adding error parameter to `.map_err(|e| ...)`, the line may exceed rustfmt's default 100-char limit:
+```rust
+// Before formatting
+.map_err(|e| GcError::Internal(format!("Long context message: {}", e)))?
+
+// After cargo fmt
+.map_err(|e| {
+    GcError::Internal(format!("Long context message: {}", e))
+})?
+```
+
+Always run `cargo fmt` after fixing error hiding violations. The formatter will handle line breaks consistently. Don't fight the formatter - accept the multi-line closure style.
+
+---

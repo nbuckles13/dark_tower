@@ -143,7 +143,7 @@ impl McClient {
     ///
     /// - `GcError::ServiceUnavailable` - MC unreachable or connection failed
     /// - `GcError::Internal` - Unexpected error
-    #[instrument(skip(self, mh_assignments), fields(mc_endpoint = %mc_endpoint, meeting_id = %meeting_id, gc_id = %gc_id))]
+    #[instrument(skip_all, fields(mc_endpoint = %mc_endpoint, meeting_id = %meeting_id, gc_id = %gc_id))]
     pub async fn assign_meeting(
         &self,
         mc_endpoint: &str,
@@ -180,9 +180,9 @@ impl McClient {
             "authorization",
             format!("Bearer {}", self.service_token.expose_secret())
                 .parse()
-                .map_err(|_| {
-                    error!(target: "gc.services.mc_client", "Invalid service token format");
-                    GcError::Internal
+                .map_err(|e| {
+                    error!(target: "gc.services.mc_client", error = %e, "Invalid service token format");
+                    GcError::Internal(format!("Invalid service token format: {}", e))
                 })?,
         );
 

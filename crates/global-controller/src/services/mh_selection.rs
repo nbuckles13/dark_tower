@@ -59,7 +59,7 @@ impl MhSelectionService {
     ///
     /// - `GcError::ServiceUnavailable` - No healthy MHs available
     /// - `GcError::Database` - Database operation failed
-    #[instrument(skip(pool), fields(region = %region))]
+    #[instrument(skip_all, fields(region = %region))]
     pub async fn select_mhs_for_meeting(
         pool: &PgPool,
         region: &str,
