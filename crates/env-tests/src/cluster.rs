@@ -121,12 +121,17 @@ impl ClusterConnection {
         let addr = format!("127.0.0.1:{}", port);
 
         TcpStream::connect_timeout(
-            &addr.parse().map_err(|_| ClusterError::HealthCheckFailed {
-                message: format!("Invalid address: {}", addr),
+            &addr.parse().map_err(|e| ClusterError::HealthCheckFailed {
+                message: format!("Invalid address '{}': {}", addr, e),
             })?,
             Duration::from_secs(5),
         )
-        .map_err(|_| ClusterError::PortForwardNotFound { port })?;
+        .map_err(|e| ClusterError::HealthCheckFailed {
+            message: format!(
+                "Port-forward not detected on localhost:{}. Run './infra/kind/scripts/setup.sh' to start port-forwards. TCP error: {}",
+                port, e
+            ),
+        })?;
 
         Ok(())
     }

@@ -45,26 +45,26 @@ The task description is passed via `$ARGUMENTS`:
 
 ### Step 1: Check for Existing Active Loops
 
-Before creating a new loop, check for active loops:
+Before creating a new loop, check for active loops using the status script:
 
-1. List directories in `docs/dev-loop-outputs/` (excluding `_template`)
-2. Check each `main.md` for `Current Step != complete`
-3. If active loop found:
+1. Run `./scripts/workflow/dev-loop-status.sh --active-only`
+2. If any active loops are found (script shows loops in the "Active Loops:" section):
 
 ```
-**Warning**: Active dev-loop already exists at:
-  docs/dev-loop-outputs/{existing-dir}/
+**Warning**: Active dev-loop(s) detected:
 
-Current step: {step}
+{output from dev-loop-status.sh --active-only}
 
 Options:
-1. Complete or abandon the existing loop first
+1. Complete or abandon the existing loop(s) first
 2. Continue anyway (will create a new parallel loop)
 
 Which would you like to do?
 ```
 
 Wait for user response before proceeding.
+
+3. If no active loops (script shows "No active dev-loops."), proceed to Step 1b.
 
 ### Step 1b: Handle --from-plan (if provided)
 
