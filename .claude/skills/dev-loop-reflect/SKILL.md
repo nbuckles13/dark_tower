@@ -22,8 +22,8 @@ After code review is approved, resume each specialist to reflect on learnings. S
 
 If output-dir not provided, auto-detect:
 
-1. List directories in `docs/dev-loop-outputs/` (excluding `_template`)
-2. Filter to `Current Step` = `reflection`
+1. Run `./scripts/workflow/dev-loop-status.sh --active-only`
+2. Filter output to loops with `Current Step` = `reflection`
 3. If exactly one: use it
 4. If multiple: ask user which one
 5. If none: error - "No dev-loop ready for reflection. Run `/dev-loop-review` first."

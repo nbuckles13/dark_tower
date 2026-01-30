@@ -22,8 +22,8 @@ Run the orchestrator's "trust but verify" check on the specialist's work. Even t
 
 If output-dir not provided, auto-detect:
 
-1. List directories in `docs/dev-loop-outputs/` (excluding `_template`)
-2. Filter to `Current Step` in (`implementation`, `validation`)
+1. Run `./scripts/workflow/dev-loop-status.sh --active-only`
+2. Filter output to loops with `Current Step` in (`implementation`, `validation`)
 3. If exactly one: use it
 4. If multiple: ask user which one
 5. If none: error - "No dev-loop ready for validation."
