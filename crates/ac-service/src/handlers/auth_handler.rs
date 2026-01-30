@@ -300,17 +300,21 @@ fn extract_client_credentials(
 ) -> Result<(String, String), AcError> {
     // Try Basic Auth first
     if let Some(auth_header) = headers.get("authorization") {
-        let auth_str = auth_header
-            .to_str()
-            .map_err(|_| AcError::InvalidCredentials)?;
+        let auth_str = auth_header.to_str().map_err(|e| {
+            tracing::debug!(target: "auth", error = %e, "Invalid authorization header encoding");
+            AcError::InvalidCredentials
+        })?;
 
         if let Some(basic_auth) = auth_str.strip_prefix("Basic ") {
-            let decoded = general_purpose::STANDARD
-                .decode(basic_auth)
-                .map_err(|_| AcError::InvalidCredentials)?;
+            let decoded = general_purpose::STANDARD.decode(basic_auth).map_err(|e| {
+                tracing::debug!(target: "auth", error = %e, "Invalid base64 in authorization header");
+                AcError::InvalidCredentials
+            })?;
 
-            let credentials =
-                String::from_utf8(decoded).map_err(|_| AcError::InvalidCredentials)?;
+            let credentials = String::from_utf8(decoded).map_err(|e| {
+                tracing::debug!(target: "auth", error = %e, "Invalid UTF-8 in authorization header");
+                AcError::InvalidCredentials
+            })?;
 
             return match credentials.splitn(2, ':').collect::<Vec<_>>().as_slice() {
                 [username, password] => Ok((username.to_string(), password.to_string())),

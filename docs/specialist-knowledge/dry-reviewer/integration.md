@@ -82,6 +82,22 @@ Both GC and AC implement similar `IntoResponse` trait impls for their error type
 
 ---
 
+### TD-10: JWT Clock Skew Configuration Validation
+**Added**: 2026-01-29
+**Related files**: `crates/ac-service/src/config.rs:184-219`, `crates/global-controller/src/config.rs:138-163`
+
+Both AC and GC implement nearly identical JWT clock skew validation: `DEFAULT_JWT_CLOCK_SKEW_SECONDS` (300), `MAX_JWT_CLOCK_SKEW_SECONDS` (600), and validation logic (positive, under max, parse errors). Pattern includes: parse from env var, validate range, return ConfigError if invalid. ~40 lines duplicated. Severity: Low (small code, straightforward). Improvement path: Extract to `common::config::parse_jwt_clock_skew(vars: &HashMap, key: &str) -> Result<i64, ConfigError>`. Timeline: Phase 5+ (when third service requires JWT clock skew config). Note: Current duplication acceptable for 2 services - defer extraction until third consumer appears.
+
+---
+
+### TD-11: Config Validation Utilities
+**Added**: 2026-01-29
+**Related files**: `crates/ac-service/src/config.rs`, `crates/global-controller/src/config.rs`, `crates/meeting-controller/src/config.rs`
+
+All three services implement similar config validation patterns: parse from env var, validate range/constraints, return service-specific ConfigError. Examples: `parse().map_err(|e| ConfigError::Invalid...)`, zero-checks, range checks. Pattern is consistent but types differ (i64, u32, u64). Severity: Low (pattern is simple). Improvement path: Consider extracting generic validation helpers to `common::config`: `parse_positive_i64(key, min, max)`, `parse_bounded_u32(key, min, max)`. Timeline: Phase 5+ (when config validation logic becomes more complex or fourth service appears). Note: Current duplication acceptable - simple pattern, service-specific error types prevent trivial extraction.
+
+---
+
 ## Specialist Coordination
 **Added**: 2026-01-15
 **Related files**: `.claude/agents/security.md`, `.claude/agents/code-reviewer.md`, `.claude/agents/test.md`
@@ -123,5 +139,16 @@ Escalate to Architecture specialist if: duplication spans 3+ services, extractio
 **Files reviewed**: `crates/global-controller/src/errors.rs`, `crates/global-controller/src/config.rs`, `crates/global-controller/src/handlers/meetings.rs`, `crates/global-controller/src/services/*.rs`, `crates/global-controller/src/grpc/*.rs`, `crates/global-controller/src/auth/*.rs`, `crates/global-controller/src/middleware/auth.rs`
 **Patterns identified**: Error variant convergence (GC+MC aligned), instrument skip_all (standard tracing), error preservation (idiomatic Rust), IntoResponse boilerplate (new TD-9)
 **Notes for future reviews**: When AC undergoes similar code quality refactor, expect convergence to `Internal(String)` pattern. Instrument and error preservation patterns are NOT duplication - they're infrastructure and idiomatic Rust.
+
+---
+
+## Review Checkpoint: AC Code Quality Guards (2026-01-29)
+**Task**: Fix AC code quality issues: 28 error hiding + 4 instrument skip-all violations
+**DRY Finding**: APPROVED - 2 TECH_DEBT items, 0 blockers
+**Key Observation**: Error handling pattern in AC matches MC/GC: `.map_err(|e| { tracing::error!(...); Error::Variant(...) })`. All three services now follow consistent error preservation approach. Two cross-service config duplication patterns identified: (1) JWT clock skew validation (~40 lines duplicated AC+GC), (2) ConfigError enum patterns (similar validation logic across services). Both classified as TECH_DEBT, not BLOCKER - defer extraction until third service requires the pattern.
+**Files reviewed**: `crates/ac-service/src/crypto/mod.rs`, `crates/ac-service/src/handlers/internal_tokens.rs`, `crates/ac-service/src/handlers/auth_handler.rs`, `crates/ac-service/src/config.rs`
+**Patterns identified**: Error preservation (AC now aligned with MC/GC), JWT clock skew validation (AC+GC duplication), config validation patterns (AC+GC+MC similar approaches), PKCS8 key validation (AC-specific, acceptable)
+**Tech debt documented**: TD-10 (JWT clock skew validation), TD-11 (shared config validation utilities)
+**Notes for future reviews**: Error preservation pattern is now established across all three services (AC, MC, GC) - mark as ACCEPTABLE in future reviews. Config validation duplication should be reassessed when fourth service appears or when validation complexity increases.
 
 ---

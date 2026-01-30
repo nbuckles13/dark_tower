@@ -273,8 +273,8 @@ fn sign_meeting_jwt(
     use ring::signature::Ed25519KeyPair;
 
     // Validate the private key format
-    let _key_pair = Ed25519KeyPair::from_pkcs8(private_key_pkcs8).map_err(|_| {
-        tracing::error!(target: "crypto", "Invalid private key format");
+    let _key_pair = Ed25519KeyPair::from_pkcs8(private_key_pkcs8).map_err(|e| {
+        tracing::error!(target: "crypto", error = %e, "Invalid private key format");
         AcError::Crypto("JWT signing failed".to_string())
     })?;
 
@@ -284,8 +284,8 @@ fn sign_meeting_jwt(
     header.typ = Some("JWT".to_string());
     header.kid = Some(key_id.to_string());
 
-    encode(&header, claims, &encoding_key).map_err(|_| {
-        tracing::error!(target: "crypto", "JWT signing operation failed");
+    encode(&header, claims, &encoding_key).map_err(|e| {
+        tracing::error!(target: "crypto", error = %e, "JWT signing operation failed");
         AcError::Crypto("JWT signing failed".to_string())
     })
 }
@@ -300,8 +300,8 @@ fn sign_guest_jwt(
     use ring::signature::Ed25519KeyPair;
 
     // Validate the private key format
-    let _key_pair = Ed25519KeyPair::from_pkcs8(private_key_pkcs8).map_err(|_| {
-        tracing::error!(target: "crypto", "Invalid private key format");
+    let _key_pair = Ed25519KeyPair::from_pkcs8(private_key_pkcs8).map_err(|e| {
+        tracing::error!(target: "crypto", error = %e, "Invalid private key format");
         AcError::Crypto("JWT signing failed".to_string())
     })?;
 
@@ -311,8 +311,8 @@ fn sign_guest_jwt(
     header.typ = Some("JWT".to_string());
     header.kid = Some(key_id.to_string());
 
-    encode(&header, claims, &encoding_key).map_err(|_| {
-        tracing::error!(target: "crypto", "JWT signing operation failed");
+    encode(&header, claims, &encoding_key).map_err(|e| {
+        tracing::error!(target: "crypto", error = %e, "JWT signing operation failed");
         AcError::Crypto("JWT signing failed".to_string())
     })
 }

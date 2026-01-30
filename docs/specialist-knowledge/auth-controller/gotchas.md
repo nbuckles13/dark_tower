@@ -112,3 +112,11 @@ The handler uses `claims.scope.split_whitespace().collect()` to extract scopes f
 Tests should verify empty scope rejection, not just "wrong scope" rejection. An empty token scope should fail authorization even if the handler has a default behavior.
 
 ---
+
+## Gotcha: Multi-line Instrument Attributes and Guard False Positives
+**Added**: 2026-01-28
+**Related files**: `crates/ac-service/src/handlers/internal_tokens.rs`, `crates/ac-service/src/handlers/auth_handler.rs`
+
+The `instrument-skip-all` guard uses grep to detect `#[instrument` without `skip_all` on the same line. When attributes span multiple lines, the guard sees `#[instrument(` on line N without `skip_all` (which appears on line N+2) and flags it as a violation. These are false positives. The code is correct if `skip_all` appears anywhere in the attribute. Manually verify flagged functions before making changes.
+
+---

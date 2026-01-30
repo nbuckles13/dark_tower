@@ -212,8 +212,8 @@ async fn request_meeting_token(&self, request: &MeetingTokenRequest) -> Result<T
 ---
 
 ## Pattern: Server-Side Error Context with Generic Client Messages
-**Added**: 2026-01-28
-**Related files**: `crates/global-controller/src/errors.rs`, `crates/global-controller/src/handlers/meetings.rs`, `crates/global-controller/src/grpc/mc_service.rs`
+**Added**: 2026-01-28 (Updated: 2026-01-29)
+**Related files**: `crates/global-controller/src/errors.rs`, `crates/global-controller/src/handlers/meetings.rs`, `crates/global-controller/src/grpc/mc_service.rs`, `crates/ac-service/src/crypto/mod.rs`
 
 Preserve error context for debugging via server-side logging while returning generic messages to clients. Pattern:
 
@@ -224,12 +224,15 @@ Preserve error context for debugging via server-side logging while returning gen
 
 **Example**:
 ```rust
-GcError::Internal(reason) => {
-    tracing::error!(target: "gc.internal", reason = %reason, "Internal error");
-    (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", "An internal error occurred".to_string())
-}
+// Error handling pattern
+.map_err(|e| {
+    tracing::error!(target: "crypto", error = %e, "Operation failed");
+    AcError::Crypto("Generic message".to_string())
+})
 ```
 
-**Benefits**: Debugging gets full context, clients get minimal info (prevents enumeration/info disclosure). Common pattern for database errors, service communication failures, parsing errors.
+**Safe library errors**: Crypto library errors (ring, bcrypt, jsonwebtoken) are safe to log via `error = %e` because they only indicate operation failure type (KeyRejected, InvalidSignature), not key material or plaintext content. Configuration parsing errors (base64::DecodeError) are also safe - they indicate format issues, not the value being parsed.
+
+**Benefits**: Debugging gets full context, clients get minimal info (prevents enumeration/info disclosure). Common pattern for database errors, service communication failures, parsing errors, crypto operations.
 
 ---

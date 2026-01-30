@@ -9,92 +9,52 @@ This skill checks for active or incomplete dev-loops and reports their current s
 
 ## Instructions
 
-### Step 1: Scan for Dev-Loop Directories
+### Step 1: Run the Status Script
 
-List all directories in `docs/dev-loop-outputs/` (excluding `_template`):
+Use the helper script to scan all dev-loop directories and extract their state:
 
 ```bash
-ls -d docs/dev-loop-outputs/*/ 2>/dev/null | grep -v _template
+./scripts/workflow/dev-loop-status.sh
 ```
 
-### Step 2: Check Each Directory for Loop State
+**Options**:
+- `--active-only` - Only show active (non-complete) loops
+- `--complete-only` - Only show completed loops
+- `--format tsv` - Tab-separated output for parsing
+- `--format json` - JSON output
 
-For each directory found, read `main.md` and extract the Loop State table:
+The script extracts from each `main.md`:
+- Current Step (init, planning, implementation, validation, code_review, reflection, complete)
+- Implementing Specialist
+- Iteration number
+- Agent ID
+- Task description
 
-| Field | Value |
-|-------|-------|
-| Implementing Agent | `{agent_id}` |
-| Implementing Specialist | `{specialist-name}` |
-| Current Step | `{init|planning|implementation|validation|code_review|reflection|complete}` |
-| Iteration | `{1-5}` |
-| Security Reviewer | `{agent_id or pending}` |
-| Test Reviewer | `{agent_id or pending}` |
-| Code Reviewer | `{agent_id or pending}` |
-| DRY Reviewer | `{agent_id or pending}` |
+### Step 2: Interpret Results and Recommend Next Action
 
-### Step 3: Classify Each Loop
-
-- **Active**: Current Step is NOT `complete`
-- **Complete**: Current Step is `complete`
-
-### Step 4: Report Results
-
-#### If No Dev-Loops Found
-
-```
-**Dev-Loop Status**: No dev-loops found
-
-To start a new dev-loop, run:
-  /dev-loop-init "task description"
-```
-
-#### If All Loops Are Complete
-
-```
-**Dev-Loop Status**: No active dev-loops
-
-Completed loops:
-- docs/dev-loop-outputs/2026-01-15-example-task/ (complete)
-- ...
-
-To start a new dev-loop, run:
-  /dev-loop-init "task description"
-```
-
-#### If Active Loop(s) Found
-
-For each active loop, report:
-
-```
-**Dev-Loop Status**: Active loop found
-
-**Directory**: docs/dev-loop-outputs/YYYY-MM-DD-{task-slug}/
-**Task**: {from main.md Task Overview section}
-**Current Step**: {current_step}
-**Iteration**: {iteration}
-**Implementing Specialist**: {specialist-name}
-
-**Checkpoint Files**:
-- main.md
-- {specialist}.md (if exists)
-- {reviewer}.md (if exists for each reviewer)
-
-**Next Action**:
-{Based on Current Step, recommend next skill to run}
-```
-
-### Step 5: Recommend Next Action
-
-Based on Current Step, recommend:
+The script will show active and completed loops. Based on the **Current Step** of active loops, recommend:
 
 | Current Step | Next Action |
 |--------------|-------------|
-| `init` | `Run /dev-loop-implement to spawn the specialist.` |
-| `planning` | `Run /dev-loop-plan to continue planning, or /dev-loop-implement if plan is approved.` |
-| `implementation` | `Specialist still running or interrupted. Run /dev-loop-restore if interrupted.` |
-| `validation` | `Run /dev-loop-validate to verify the implementation.` |
-| `code_review` | `Run /dev-loop-review to complete code review.` |
-| `reflection` | `Run /dev-loop-reflect to capture learnings.` |
+| `init` | Run `/dev-loop-implement` to spawn the specialist |
+| `planning` | Run `/dev-loop-plan` to continue, or `/dev-loop-implement` if plan approved |
+| `implementation` | Specialist running or interrupted. Run `/dev-loop-restore` if interrupted |
+| `validation` | Run `/dev-loop-validate` to verify the implementation |
+| `code_review` | Run `/dev-loop-review` to complete code review |
+| `reflection` | Run `/dev-loop-reflect` to capture learnings |
+
+### Step 3: Check Checkpoint Files (if needed)
+
+For active loops, you can list checkpoint files:
+
+```bash
+ls docs/dev-loop-outputs/{directory}/
+```
+
+Expected files:
+- `main.md` - Primary tracking document
+- `{specialist}.md` - Specialist checkpoint (if implementation started)
+- `{reviewer}.md` - Reviewer checkpoints (security.md, test.md, code-reviewer.md, dry-reviewer.md)
 
 ## Auto-Detection Logic
 
@@ -120,4 +80,4 @@ When `Current Step = planning`:
 
 ---
 
-**Next step**: {recommended action based on state}
+After running the script, report the status to the user and recommend the appropriate next skill based on the current step.

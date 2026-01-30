@@ -182,10 +182,10 @@ impl Config {
         // Default: 300 seconds (5 minutes) per NIST SP 800-63B
         // Max: 600 seconds (10 minutes) to prevent security misconfiguration
         let jwt_clock_skew_seconds = if let Some(value_str) = vars.get("JWT_CLOCK_SKEW_SECONDS") {
-            let value: i64 = value_str.parse().map_err(|_| {
+            let value: i64 = value_str.parse().map_err(|e| {
                 ConfigError::InvalidJwtClockSkew(format!(
-                    "JWT_CLOCK_SKEW_SECONDS must be a valid integer, got '{}'",
-                    value_str
+                    "JWT_CLOCK_SKEW_SECONDS must be a valid integer, got '{}': {}",
+                    value_str, e
                 ))
             })?;
 
@@ -223,10 +223,10 @@ impl Config {
         // Min: 10 (OWASP 2024 security floor)
         // Max: 14 (prevent excessive latency)
         let bcrypt_cost = if let Some(value_str) = vars.get("BCRYPT_COST") {
-            let value: u32 = value_str.parse().map_err(|_| {
+            let value: u32 = value_str.parse().map_err(|e| {
                 ConfigError::InvalidBcryptCost(format!(
-                    "BCRYPT_COST must be a valid positive integer, got '{}'",
-                    value_str
+                    "BCRYPT_COST must be a valid positive integer, got '{}': {}",
+                    value_str, e
                 ))
             })?;
 

@@ -103,3 +103,25 @@ When testing scope-based authorization, cover multiple attack vectors beyond hap
 This pattern prevents subtle authorization bypass where similar-looking scopes are accepted.
 
 ---
+
+## Pattern: Error Context Preservation with Security-Aware Logging
+**Added**: 2026-01-28
+**Related files**: `crates/ac-service/src/crypto/mod.rs`, `crates/ac-service/src/handlers/auth_handler.rs`
+
+Preserve error context in `.map_err()` while maintaining security boundaries. For crypto operations, log actual error server-side but return generic message to clients:
+```rust
+.map_err(|e| {
+    tracing::error!(target: "crypto", error = %e, "Keypair generation failed");
+    AcError::Crypto("Key generation failed".to_string())
+})
+```
+For credential parsing, use debug-level to prevent enumeration:
+```rust
+.map_err(|e| {
+    tracing::debug!(target: "auth", error = %e, "Invalid base64");
+    AcError::InvalidCredentials
+})
+```
+This enables server-side debugging without leaking information to attackers.
+
+---
