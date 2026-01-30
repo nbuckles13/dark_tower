@@ -1,6 +1,17 @@
-# DRY Reviewer - Cross-Service Integration Notes
+# DRY Reviewer - Integration Notes
 
-Known duplication patterns and cross-service coordination for Dark Tower.
+This file captures how the DRY Reviewer integrates with other specialists and components.
+
+---
+
+## ADR-0019 Blocking Behavior
+
+**Added**: 2026-01-29
+**Related files**: `docs/decisions/adr-0019-dry-reviewer-blocking.md`
+
+**Integration Point**: Per ADR-0019, the DRY Reviewer has specific blocking behavior:
+- **BLOCKER severity**: Blocks dev-loop completion (e.g., shared code requiring extraction)
+- **TECH_DEBT severity**: Non-blocking, documented for future work
 
 ---
 
@@ -88,67 +99,21 @@ Both GC and AC implement similar `IntoResponse` trait impls for their error type
 
 Both AC and GC implement nearly identical JWT clock skew validation: `DEFAULT_JWT_CLOCK_SKEW_SECONDS` (300), `MAX_JWT_CLOCK_SKEW_SECONDS` (600), and validation logic (positive, under max, parse errors). Pattern includes: parse from env var, validate range, return ConfigError if invalid. ~40 lines duplicated. Severity: Low (small code, straightforward). Improvement path: Extract to `common::config::parse_jwt_clock_skew(vars: &HashMap, key: &str) -> Result<i64, ConfigError>`. Timeline: Phase 5+ (when third service requires JWT clock skew config). Note: Current duplication acceptable for 2 services - defer extraction until third consumer appears.
 
+This differs from Security, Test, and Code Quality reviewers where ALL findings block. Only genuine shared code requiring extraction should be classified as BLOCKER.
+
+**When to block**: Copy-pasted business logic, duplicate utilities that should be in `common/`, identical algorithms across services.
+
+**When NOT to block**: Convention-based patterns, domain-specific error handling, consistent logging/metrics approaches.
+
 ---
 
-### TD-11: Config Validation Utilities
+## Principles Documentation Recommendations
+
 **Added**: 2026-01-29
-**Related files**: `crates/ac-service/src/config.rs`, `crates/global-controller/src/config.rs`, `crates/meeting-controller/src/config.rs`
+**Related files**: `docs/principles/errors.md`
 
-All three services implement similar config validation patterns: parse from env var, validate range/constraints, return service-specific ConfigError. Examples: `parse().map_err(|e| ConfigError::Invalid...)`, zero-checks, range checks. Pattern is consistent but types differ (i64, u32, u64). Severity: Low (pattern is simple). Improvement path: Consider extracting generic validation helpers to `common::config`: `parse_positive_i64(key, min, max)`, `parse_bounded_u32(key, min, max)`. Timeline: Phase 5+ (when config validation logic becomes more complex or fourth service appears). Note: Current duplication acceptable - simple pattern, service-specific error types prevent trivial extraction.
+**Integration Point**: When discovering widely-used patterns that aren't yet documented in principles files, add TECH_DEBT findings recommending documentation updates. This helps future contributors understand established conventions without needing to search the codebase.
 
----
-
-## Specialist Coordination
-**Added**: 2026-01-15
-**Related files**: `.claude/agents/security.md`, `.claude/agents/code-reviewer.md`, `.claude/agents/test.md`
-
-Security specialist handoff: Escalate duplication in cryptographic code to Security specialist. Security may accept duplication if it reduces coupling - document their rationale. Code reviewer handoff: DRY reviewer focuses on cross-service duplication; Code Quality specialist focuses on single-service structure. Share findings if both identify the same issue. Test specialist handoff: Test utility duplication (e.g., ac-test-utils) may warrant extraction; Test specialist has final say on test code organization.
-
----
-
-## Acceptable Duplication Patterns
-**Added**: 2026-01-15 | **Updated**: 2026-01-28
-**Related files**: `crates/*/src/config.rs`, `crates/*/src/errors.rs`
-
-These patterns are acceptable and should NOT be flagged: (1) Per-service configuration loading (each service has different env vars), (2) Service-specific error types (each service defines its own error.rs), (3) Protocol message handling (each service may interpret messages differently), (4) Logging/metrics initialization (boilerplate is expected per OWASP guidelines), (5) Tracing instrument attributes (`#[instrument(skip_all, ...)]` - service-specific observability), (6) Error preservation patterns (`.map_err(|e| Error::variant(format!("context: {}", e)))` - idiomatic Rust).
-
----
-
-## Escalation Criteria
-**Added**: 2026-01-15
-**Related files**: `.claude/agents/security.md`
-
-Escalate to Architecture specialist if: duplication spans 3+ services, extraction requires database schema changes, pattern impacts protocol or API contracts, uncertainty about service boundary placement. Escalate to Security specialist if: duplication involves cryptography, authentication, or authorization, or pattern impacts threat model.
-
----
-
-## Review Checkpoint: SecretBox Migration (2026-01-28)
-**Task**: SecretBox/SecretString refactor for ac-service credential protection
-**DRY Finding**: No issues - approved for "DRY enough for current scope (3 response types)"
-**Key Observation**: Custom Debug/Serialize implementations for SecretString in 3 response types (RegisterServiceResponse, CreateClientResponse, RotateSecretResponse) are acceptable duplication within a single service. The implementations are intentionally terse (2-3 lines each) to maintain clarity. Only escalate if patterns appear in a second service or if single-service scope exceeds 4 types.
-**Files reviewed**: `crates/ac-service/src/models/mod.rs`, `crates/ac-service/src/crypto/mod.rs`, `crates/ac-service/src/config.rs`
-**Patterns identified**: Security wrapper response types, SecretBox field patterns in config, custom Clone for SecretBox fields
-**Notes for future reviews**: When SecretBox/SecretString patterns appear in global-controller or meeting-controller response types, use this AC review as precedent for determining single-service vs cross-service duplication threshold.
-
----
-
-## Review Checkpoint: GC Code Quality Guards (2026-01-28)
-**Task**: Fix GC code quality issues: 7 error hiding + 16 instrument skip-all violations
-**DRY Finding**: APPROVED - 1 minor tech debt (TD-9), 0 blockers
-**Key Observation**: GC's `Internal(String)` error variant now matches MC pattern, establishing consistency across services. Both services align with `common::error::DarkTowerError::Internal(String)`. AC still uses unit variant (pre-existing debt). IntoResponse pattern duplicated between GC and AC (TD-9) - acceptable for 2 HTTP services, reassess when third appears.
-**Files reviewed**: `crates/global-controller/src/errors.rs`, `crates/global-controller/src/config.rs`, `crates/global-controller/src/handlers/meetings.rs`, `crates/global-controller/src/services/*.rs`, `crates/global-controller/src/grpc/*.rs`, `crates/global-controller/src/auth/*.rs`, `crates/global-controller/src/middleware/auth.rs`
-**Patterns identified**: Error variant convergence (GC+MC aligned), instrument skip_all (standard tracing), error preservation (idiomatic Rust), IntoResponse boilerplate (new TD-9)
-**Notes for future reviews**: When AC undergoes similar code quality refactor, expect convergence to `Internal(String)` pattern. Instrument and error preservation patterns are NOT duplication - they're infrastructure and idiomatic Rust.
-
----
-
-## Review Checkpoint: AC Code Quality Guards (2026-01-29)
-**Task**: Fix AC code quality issues: 28 error hiding + 4 instrument skip-all violations
-**DRY Finding**: APPROVED - 2 TECH_DEBT items, 0 blockers
-**Key Observation**: Error handling pattern in AC matches MC/GC: `.map_err(|e| { tracing::error!(...); Error::Variant(...) })`. All three services now follow consistent error preservation approach. Two cross-service config duplication patterns identified: (1) JWT clock skew validation (~40 lines duplicated AC+GC), (2) ConfigError enum patterns (similar validation logic across services). Both classified as TECH_DEBT, not BLOCKER - defer extraction until third service requires the pattern.
-**Files reviewed**: `crates/ac-service/src/crypto/mod.rs`, `crates/ac-service/src/handlers/internal_tokens.rs`, `crates/ac-service/src/handlers/auth_handler.rs`, `crates/ac-service/src/config.rs`
-**Patterns identified**: Error preservation (AC now aligned with MC/GC), JWT clock skew validation (AC+GC duplication), config validation patterns (AC+GC+MC similar approaches), PKCS8 key validation (AC-specific, acceptable)
-**Tech debt documented**: TD-10 (JWT clock skew validation), TD-11 (shared config validation utilities)
-**Notes for future reviews**: Error preservation pattern is now established across all three services (AC, MC, GC) - mark as ACCEPTABLE in future reviews. Config validation duplication should be reassessed when fourth service appears or when validation complexity increases.
+**Example**: The error preservation pattern `.map_err(|e| Error(format!("...: {}", e)))` is used 40+ times across services but may not be documented in `docs/principles/errors.md`.
 
 ---
