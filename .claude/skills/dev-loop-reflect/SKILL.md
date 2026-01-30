@@ -1,14 +1,12 @@
 ---
 name: dev-loop-reflect
-description: Resume specialists sequentially to capture learnings in knowledge files. Run after /dev-loop-review approves.
+description: Resume specialists in parallel to capture learnings in knowledge files. Run after /dev-loop-review approves.
 disable-model-invocation: true
 ---
 
 # Dev-Loop Reflect
 
 After code review is approved, resume each specialist to reflect on learnings. Specialists update their knowledge files in `docs/specialist-knowledge/{specialist}/`.
-
-**CRITICAL**: Specialists must be resumed **sequentially**, not in parallel. Parallel resume operations cause API errors due to tool use concurrency issues.
 
 ## Arguments
 
@@ -108,11 +106,8 @@ summary: {2-3 sentence reflection}
 ```
 ```
 
-### Step 4: Resume Specialists SEQUENTIALLY
+### Step 4: Resume Specialists
 
-**CRITICAL**: Resume ONE at a time, waiting for completion before the next.
-
-**Order**:
 1. Implementing specialist (first - has most context)
 2. Security reviewer
 3. Test reviewer
@@ -221,8 +216,6 @@ Knowledge files updated:
 
 ## Critical Constraints
 
-- **SEQUENTIAL resumes**: Never resume multiple specialists in parallel
-- **Resume order**: Implementing specialist first, then reviewers
 - **Checkpoint fallback**: If resume fails, use checkpoint injection (don't retry same ID)
 - **No forcing entries**: "No changes" is a valid reflection outcome
 

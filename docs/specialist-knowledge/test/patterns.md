@@ -743,20 +743,21 @@ Apply sanitization in error handling paths. This caught credential leaks that cu
 ---
 
 ## Pattern: Type-Level Refactor Verification (Compiler-Verified)
-**Added**: 2026-01-28
+**Added**: 2026-01-28, **Updated**: 2026-01-29
 **Related files**: `crates/meeting-controller/tests/`, `crates/ac-service/tests/`, `crates/global-controller/tests/`
 
 When refactoring raw types to wrapped types (e.g., `Vec<u8>` → `SecretBox<Vec<u8>>`, `Internal` → `Internal(String)`), the test verification approach differs from behavior changes. Type-level refactors are primarily **compiler-verified**:
 
 **Phase 6c Learning (SecretBox)**: Reviewed SecretBox migration for `master_secret` in MC actors.
 **Phase 4 Learning (Error Variants)**: Reviewed GcError::Internal unit variant → tuple variant migration.
+**AC Code Quality Learning (Error Hiding)**: Reviewed error hiding fixes (`|_|` → `|e|` with `error = %e` logging).
 
-Both migrations show the same pattern:
+All type-level refactors show the same pattern:
 - All type mismatches caught by compiler (no silent failures)
 - Test updates are mechanical: wrap at construction, pattern match at usage
 - Existing test cases remain valid without modification
 - No new test cases required
-- All tests execute successfully after type updates (GC: 259 → 259, MC: 115 → 115)
+- All tests execute successfully after type updates (GC: 259 → 259, MC: 115 → 115, AC: 447 → 447)
 
 **Verification checklist for type-level refactors**:
 1. **Compiler passes**: `cargo check --workspace` - all type mismatches resolved
@@ -767,5 +768,33 @@ Both migrations show the same pattern:
 Examples of type-level refactors:
 - **SecretBox**: `.expose_secret()` is transparent (just derefs to &T), memory zeroing automatic on drop
 - **Error variant context**: `Internal` → `Internal(String)` adds debuggability, client sees same generic message
+- **Error hiding fixes**: `|_|` → `|e|` with `error = %e` logging adds observability, error types unchanged
 
 Result: Type-level refactors are low-risk from test coverage perspective. Focus review on compiler correctness and no perf regressions. Test updates are mechanical, not behavioral.
+
+---
+
+## Pattern: Error Path Testing for Pure Refactors
+**Added**: 2026-01-29
+**Related files**: `crates/ac-service/src/crypto/mod.rs`, `crates/ac-service/src/handlers/`, `crates/ac-service/src/config.rs`
+
+When reviewing error hiding fixes (`.map_err(|_| ...)` → `.map_err(|e| ...)` with logging), test coverage assessment differs from new feature implementation. The refactor preserves error types while adding observability:
+
+**What to verify**:
+- Existing tests cover the error paths being modified
+- Tests verify error type returned, not internal error message text
+- All tests pass without modification (confirms behavioral preservation)
+
+**What NOT to require**:
+- New tests for the error context logging itself (internal observability change)
+- Tests that assert on log output (use `tracing_test` if truly needed, but rarely is)
+- Modification to existing error assertions (error types unchanged)
+
+**AC code quality review pattern**:
+- 28 error paths modified across 4 files
+- All error paths already tested (crypto: 90+ tests, handlers: 20+ tests, config: 35+ tests)
+- Tests verify correct error type returned (e.g., `AcError::Crypto`, `AcError::InvalidCredentials`)
+- 447 tests pass unchanged (370 unit + 77 integration)
+- No new test cases needed - existing coverage validates error paths work correctly
+
+Result: Error hiding fixes are observability improvements, not behavioral changes. Existing error path tests remain sufficient. Optionally note as tech debt: "Consider adding log assertion tests using `tracing_test` to verify error context is captured" - but this is enhancement, not blocker.

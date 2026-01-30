@@ -83,50 +83,42 @@ print_section "Check 2: instrument on functions with sensitive parameters"
 # This is a heuristic check. We look for functions that:
 # 1. Have #[instrument] (or #[instrument(...)])
 # 2. Have parameters named password, secret, token, key, credential, etc.
-# 3. Don't have skip_all
+# 3. Don't have skip_all (checking within 3 lines to handle multi-line attributes)
 #
-# This requires looking at consecutive lines, which is harder in bash.
-# For now, we look for instrument attributes and check if they contain skip_all
-# when on functions that might have sensitive params.
+# Strategy: For each #[instrument, check the next 3 lines for skip_all.
+# This handles multi-line attributes formatted by cargo fmt.
 
-# Get all instrument attributes without skip_all
-instruments_without_skip_all=$(grep -rn --include="*.rs" \
-    '#\[instrument' \
-    "$SEARCH_PATH" 2>/dev/null | \
-    grep -v 'skip_all' | \
-    filter_test_code || true)
+# Use a simpler approach: collect violations to temp file to avoid subshell issues
+temp_file=$(mktemp)
+trap "rm -f $temp_file" EXIT
 
-if [[ -n "$instruments_without_skip_all" ]]; then
-    # Check if the next few lines contain sensitive parameter names
-    sensitive_findings=""
-    while IFS= read -r line; do
-        file=$(echo "$line" | cut -d: -f1)
-        line_num=$(echo "$line" | cut -d: -f2)
+find "$SEARCH_PATH" -type f -name "*.rs" ! -path "*/test*" 2>/dev/null | while IFS= read -r file; do
+    # For each #[instrument in this file
+    grep -n '#\[instrument' "$file" 2>/dev/null | cut -d: -f1 | while read -r line_num; do
+        # Get 4 lines starting from the instrument line
+        context=$(sed -n "${line_num},$((line_num + 3))p" "$file" 2>/dev/null)
 
-        # Read a few lines after the instrument attribute to find the fn signature
-        # Using sed to get lines N through N+5
-        fn_context=$(sed -n "${line_num},$((line_num + 5))p" "$file" 2>/dev/null || true)
+        # If skip_all is found in those 4 lines, skip to next
+        echo "$context" | grep -q 'skip_all' && continue
 
-        # Check if context contains sensitive parameter names
-        if echo "$fn_context" | grep -qEi '(password|secret|token|credential|private_key|client_secret|auth_code)[^a-z_]'; then
-            sensitive_findings="${sensitive_findings}${line}\n"
+        # Otherwise, check for sensitive params in next few lines
+        extended=$(sed -n "${line_num},$((line_num + 8))p" "$file" 2>/dev/null)
+        if echo "$extended" | grep -qEi '(password|secret|token|credential|private_key|client_secret|auth_code)[^a-z_]'; then
+            echo "${file}:${line_num}:#[instrument(" >> "$temp_file"
         fi
-    done <<< "$instruments_without_skip_all"
+    done
+done || true
 
-    if [[ -n "$sensitive_findings" ]]; then
-        echo -e "${YELLOW}POTENTIAL VIOLATIONS (functions with sensitive params but no skip_all):${NC}"
-        echo -e "$sensitive_findings" | grep -v '^$' | while read -r line; do
-            echo "  $line"
-            # Increment as violation since this is a security concern
-            increment_violations
-        done
-        echo ""
-    else
-        print_ok "No sensitive parameter exposure risks"
-        echo ""
-    fi
+# Now process the results outside the subshell
+if [[ -s "$temp_file" ]]; then
+    echo -e "${YELLOW}POTENTIAL VIOLATIONS (functions with sensitive params but no skip_all):${NC}"
+    while IFS= read -r line; do
+        echo "  $line"
+        increment_violations
+    done < "$temp_file"
+    echo ""
 else
-    print_ok "All instrument attributes use skip_all or have no parameters"
+    print_ok "All instrument attributes use skip_all or have no sensitive parameters"
     echo ""
 fi
 

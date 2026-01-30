@@ -99,3 +99,19 @@ When reviewing error enum changes across services, check for convergence on shar
 When reviewing `#[instrument]` attribute patterns (e.g., `skip_all`, `skip(field1, field2)`, `fields(...)`), recognize these as infrastructure patterns, not business logic duplication. Each service will have service-specific span names (`gc.handler`, `mc.actor`, `ac.endpoint`) and field selections. Assessment: ACCEPTABLE - tracing patterns are intrinsic to observability infrastructure. Do not flag similar `skip_all` or `skip(...)` patterns across services as duplication requiring extraction. Only escalate if the actual instrumented business logic is duplicated, not the tracing boilerplate.
 
 ---
+
+## Pattern: Error Preservation with Logging (Established)
+**Added**: 2026-01-29
+**Related files**: `crates/ac-service/src/crypto/mod.rs`, `crates/global-controller/src/auth/jwt.rs`, `crates/meeting-controller/src/config.rs`
+
+The pattern `.map_err(|e| { tracing::error!(...); ServiceError::Variant(...) })` is now established across all three services (AC, MC, GC) as of Phase 4. This is idiomatic Rust for preserving error context while logging internal details before returning user-facing messages. Assessment: ACCEPTABLE - this is not duplication requiring extraction. Each service has its own error types, logging targets, and user messages. Only flag as duplication if the business logic inside the closure is identical across services.
+
+---
+
+## Pattern: Config Validation Duplication Threshold
+**Added**: 2026-01-29
+**Related files**: `crates/*/src/config.rs`
+
+When reviewing config validation code (parsing env vars, range checks, error messages), apply the "3+ services" extraction threshold. For 2 services with similar validation patterns, classify as TECH_DEBT. For 3+ services, consider extraction to `common::config`. Rationale: Config validation is simple (~5-10 lines per field) and extraction requires generic error handling that may add more complexity than it removes. Defer until third consumer appears or validation logic becomes significantly more complex.
+
+---

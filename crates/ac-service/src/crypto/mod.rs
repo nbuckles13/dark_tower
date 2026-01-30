@@ -109,13 +109,13 @@ pub fn generate_signing_key() -> Result<(String, Vec<u8>), AcError> {
     let rng = SystemRandom::new();
 
     // Generate Ed25519 keypair in PKCS8 format
-    let pkcs8_bytes = Ed25519KeyPair::generate_pkcs8(&rng).map_err(|_| {
-        tracing::error!(target: "crypto", "Keypair generation failed");
+    let pkcs8_bytes = Ed25519KeyPair::generate_pkcs8(&rng).map_err(|e| {
+        tracing::error!(target: "crypto", error = %e, "Keypair generation failed");
         AcError::Crypto("Key generation failed".to_string())
     })?;
 
-    let key_pair = Ed25519KeyPair::from_pkcs8(pkcs8_bytes.as_ref()).map_err(|_| {
-        tracing::error!(target: "crypto", "Keypair parsing failed");
+    let key_pair = Ed25519KeyPair::from_pkcs8(pkcs8_bytes.as_ref()).map_err(|e| {
+        tracing::error!(target: "crypto", error = %e, "Keypair parsing failed");
         AcError::Crypto("Key generation failed".to_string())
     })?;
 
@@ -145,16 +145,16 @@ pub fn encrypt_private_key(private_key: &[u8], master_key: &[u8]) -> Result<Encr
 
     // Generate random 96-bit nonce (12 bytes)
     let mut nonce_bytes = [0u8; 12];
-    rng.fill(&mut nonce_bytes).map_err(|_| {
-        tracing::error!(target: "crypto", "Nonce generation failed");
+    rng.fill(&mut nonce_bytes).map_err(|e| {
+        tracing::error!(target: "crypto", error = %e, "Nonce generation failed");
         AcError::Crypto("Encryption failed".to_string())
     })?;
 
     let nonce = Nonce::assume_unique_for_key(nonce_bytes);
 
     // Create AES-256-GCM cipher
-    let unbound_key = UnboundKey::new(&AES_256_GCM, master_key).map_err(|_| {
-        tracing::error!(target: "crypto", "Cipher key creation failed");
+    let unbound_key = UnboundKey::new(&AES_256_GCM, master_key).map_err(|e| {
+        tracing::error!(target: "crypto", error = %e, "Cipher key creation failed");
         AcError::Crypto("Encryption failed".to_string())
     })?;
     let sealing_key = LessSafeKey::new(unbound_key);
@@ -163,8 +163,8 @@ pub fn encrypt_private_key(private_key: &[u8], master_key: &[u8]) -> Result<Encr
     let mut in_out = private_key.to_vec();
     sealing_key
         .seal_in_place_append_tag(nonce, Aad::empty(), &mut in_out)
-        .map_err(|_| {
-            tracing::error!(target: "crypto", "Encryption operation failed");
+        .map_err(|e| {
+            tracing::error!(target: "crypto", error = %e, "Encryption operation failed");
             AcError::Crypto("Encryption failed".to_string())
         })?;
 
@@ -215,15 +215,15 @@ pub fn decrypt_private_key(
     let mut in_out = encrypted.encrypted_data.expose_secret().clone();
     in_out.extend_from_slice(&encrypted.tag);
 
-    let nonce_bytes: [u8; 12] = encrypted.nonce.as_slice().try_into().map_err(|_| {
-        tracing::error!(target: "crypto", "Invalid nonce format");
+    let nonce_bytes: [u8; 12] = encrypted.nonce.as_slice().try_into().map_err(|e| {
+        tracing::error!(target: "crypto", error = %e, "Invalid nonce format");
         AcError::Crypto("Decryption failed".to_string())
     })?;
     let nonce = Nonce::assume_unique_for_key(nonce_bytes);
 
     // Create AES-256-GCM cipher
-    let unbound_key = UnboundKey::new(&AES_256_GCM, master_key).map_err(|_| {
-        tracing::error!(target: "crypto", "Cipher key creation failed");
+    let unbound_key = UnboundKey::new(&AES_256_GCM, master_key).map_err(|e| {
+        tracing::error!(target: "crypto", error = %e, "Cipher key creation failed");
         AcError::Crypto("Decryption failed".to_string())
     })?;
     let opening_key = LessSafeKey::new(unbound_key);
@@ -231,8 +231,8 @@ pub fn decrypt_private_key(
     // Decrypt in place
     let decrypted = opening_key
         .open_in_place(nonce, Aad::empty(), &mut in_out)
-        .map_err(|_| {
-            tracing::error!(target: "crypto", "Decryption operation failed");
+        .map_err(|e| {
+            tracing::error!(target: "crypto", error = %e, "Decryption operation failed");
             AcError::Crypto("Decryption failed".to_string())
         })?;
 
@@ -247,8 +247,8 @@ pub fn sign_jwt(
     key_id: &str,
 ) -> Result<String, AcError> {
     // Validate the private key format
-    let _key_pair = Ed25519KeyPair::from_pkcs8(private_key_pkcs8).map_err(|_| {
-        tracing::error!(target: "crypto", "Invalid private key format");
+    let _key_pair = Ed25519KeyPair::from_pkcs8(private_key_pkcs8).map_err(|e| {
+        tracing::error!(target: "crypto", error = %e, "Invalid private key format");
         AcError::Crypto("JWT signing failed".to_string())
     })?;
 
@@ -260,8 +260,8 @@ pub fn sign_jwt(
     header.typ = Some("JWT".to_string());
     header.kid = Some(key_id.to_string());
 
-    let token = encode(&header, claims, &encoding_key).map_err(|_| {
-        tracing::error!(target: "crypto", "JWT signing operation failed");
+    let token = encode(&header, claims, &encoding_key).map_err(|e| {
+        tracing::error!(target: "crypto", error = %e, "JWT signing operation failed");
         AcError::Crypto("JWT signing failed".to_string())
     })?;
 
@@ -352,8 +352,8 @@ pub fn verify_jwt(
 
     let public_key_bytes = general_purpose::STANDARD
         .decode(&public_key_b64)
-        .map_err(|_| {
-            tracing::debug!(target: "crypto", "Invalid public key encoding");
+        .map_err(|e| {
+            tracing::debug!(target: "crypto", error = %e, "Invalid public key encoding");
             AcError::InvalidToken("The access token is invalid or expired".to_string())
         })?;
 
@@ -362,8 +362,8 @@ pub fn verify_jwt(
     let mut validation = Validation::new(Algorithm::EdDSA);
     validation.validate_exp = true;
 
-    let token_data = decode::<Claims>(token, &decoding_key, &validation).map_err(|_| {
-        tracing::debug!(target: "crypto", "Token verification failed");
+    let token_data = decode::<Claims>(token, &decoding_key, &validation).map_err(|e| {
+        tracing::debug!(target: "crypto", error = %e, "Token verification failed");
         AcError::InvalidToken("The access token is invalid or expired".to_string())
     })?;
 
@@ -427,8 +427,8 @@ pub fn hash_client_secret(secret: &str, cost: u32) -> Result<String, AcError> {
         )));
     }
 
-    bcrypt::hash(secret, cost).map_err(|_| {
-        tracing::error!(target: "crypto", cost = cost, "Password hashing failed");
+    bcrypt::hash(secret, cost).map_err(|e| {
+        tracing::error!(target: "crypto", error = %e, cost = cost, "Password hashing failed");
         AcError::Crypto("Password hashing failed".to_string())
     })
 }
@@ -436,8 +436,8 @@ pub fn hash_client_secret(secret: &str, cost: u32) -> Result<String, AcError> {
 /// Verify client secret against bcrypt hash
 #[instrument(skip_all)]
 pub fn verify_client_secret(secret: &str, hash: &str) -> Result<bool, AcError> {
-    bcrypt::verify(secret, hash).map_err(|_| {
-        tracing::error!(target: "crypto", "Password verification failed");
+    bcrypt::verify(secret, hash).map_err(|e| {
+        tracing::error!(target: "crypto", error = %e, "Password verification failed");
         AcError::Crypto("Password verification failed".to_string())
     })
 }
@@ -446,8 +446,8 @@ pub fn verify_client_secret(secret: &str, hash: &str) -> Result<bool, AcError> {
 pub fn generate_random_bytes(len: usize) -> Result<Vec<u8>, AcError> {
     let rng = SystemRandom::new();
     let mut bytes = vec![0u8; len];
-    rng.fill(&mut bytes).map_err(|_| {
-        tracing::error!(target: "crypto", "Random bytes generation failed");
+    rng.fill(&mut bytes).map_err(|e| {
+        tracing::error!(target: "crypto", error = %e, "Random bytes generation failed");
         AcError::Crypto("Random generation failed".to_string())
     })?;
     Ok(bytes)
@@ -521,8 +521,8 @@ pub fn sign_user_jwt(
     use ring::signature::Ed25519KeyPair;
 
     // Validate the private key format
-    let _key_pair = Ed25519KeyPair::from_pkcs8(private_key_pkcs8).map_err(|_| {
-        tracing::error!(target: "crypto", "Invalid private key format");
+    let _key_pair = Ed25519KeyPair::from_pkcs8(private_key_pkcs8).map_err(|e| {
+        tracing::error!(target: "crypto", error = %e, "Invalid private key format");
         AcError::Crypto("JWT signing failed".to_string())
     })?;
 
@@ -532,8 +532,8 @@ pub fn sign_user_jwt(
     header.typ = Some("JWT".to_string());
     header.kid = Some(key_id.to_string());
 
-    let token = encode(&header, claims, &encoding_key).map_err(|_| {
-        tracing::error!(target: "crypto", "JWT signing operation failed");
+    let token = encode(&header, claims, &encoding_key).map_err(|e| {
+        tracing::error!(target: "crypto", error = %e, "JWT signing operation failed");
         AcError::Crypto("JWT signing failed".to_string())
     })?;
 
@@ -575,8 +575,8 @@ pub fn verify_user_jwt(
 
     let public_key_bytes = general_purpose::STANDARD
         .decode(&public_key_b64)
-        .map_err(|_| {
-            tracing::debug!(target: "crypto", "Invalid public key encoding");
+        .map_err(|e| {
+            tracing::debug!(target: "crypto", error = %e, "Invalid public key encoding");
             AcError::InvalidToken("The access token is invalid or expired".to_string())
         })?;
 
@@ -585,8 +585,8 @@ pub fn verify_user_jwt(
     let mut validation = Validation::new(Algorithm::EdDSA);
     validation.validate_exp = true;
 
-    let token_data = decode::<UserClaims>(token, &decoding_key, &validation).map_err(|_| {
-        tracing::debug!(target: "crypto", "User token verification failed");
+    let token_data = decode::<UserClaims>(token, &decoding_key, &validation).map_err(|e| {
+        tracing::debug!(target: "crypto", error = %e, "User token verification failed");
         AcError::InvalidToken("The access token is invalid or expired".to_string())
     })?;
 

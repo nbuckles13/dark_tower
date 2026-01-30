@@ -389,3 +389,34 @@ Then update all usages:
 This preserves error context for debugging while preventing information leakage to clients. The pattern works for any error variant that needs contextual information.
 
 ---
+
+## Pattern: Error Context Preservation with Security-Aware Logging
+**Added**: 2026-01-29
+**Related files**: `crates/ac-service/src/crypto/mod.rs`, `crates/ac-service/src/handlers/auth_handler.rs`, `crates/ac-service/src/config.rs`
+
+When mapping errors, preserve the original error for debugging while maintaining generic client-facing messages. Use structured logging to capture context without leaking internal details:
+
+```rust
+// For internal cryptographic failures (tracing::error!)
+.map_err(|e| {
+    tracing::error!(target: "crypto", error = %e, "Nonce generation failed");
+    AcError::Crypto("Encryption failed".to_string())
+})
+
+// For input validation failures (tracing::debug!)
+.map_err(|e| {
+    tracing::debug!(target: "auth", error = %e, "Invalid base64 in authorization header");
+    AcError::InvalidCredentials
+})
+```
+
+**Key distinctions:**
+- Use `tracing::error!` for internal operation failures (crypto, database, network)
+- Use `tracing::debug!` for expected input validation failures from external requests
+- Always include `error = %e` for structured logging
+- Use appropriate tracing targets (`crypto`, `auth`, etc.) for filtering
+- Client-facing error message should be generic and non-revealing
+
+This pattern balances debugging needs (detailed server-side logs) with security (generic client messages).
+
+---
