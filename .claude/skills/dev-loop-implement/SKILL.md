@@ -28,8 +28,8 @@ The specialist implements the task, runs 7-layer verification, and writes checkp
 
 If output-dir not provided, auto-detect:
 
-1. List directories in `docs/dev-loop-outputs/` (excluding `_template`)
-2. Filter to `Current Step` in (`init`, `planning`, `implementation`)
+1. Run `./scripts/workflow/dev-loop-status.sh --active-only`
+2. Filter output to loops with `Current Step` in (`init`, `planning`, `implementation`)
 3. If exactly one: use it
 4. If multiple: ask user which one
 5. If none: error - "No active dev-loop. Run `/dev-loop-init` first."
@@ -120,7 +120,7 @@ Then add the task section:
    - Implementation Summary section
    - Files Modified section
    - Dev-Loop Verification Steps section (results of 7 layers)
-   - **Note**: You may update `Current Step` in Loop State, but do NOT modify `Implementing Agent` - that is managed by the orchestrator
+   - **Note**: You may update `Current Step` in Loop State to "validation" when complete, but do NOT modify `Implementing Agent` - that is managed by the orchestrator
 5. **Return** with structured output
 
 **CRITICAL**: Use `--workspace` for all cargo commands. Changes in one crate can break others.

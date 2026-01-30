@@ -27,9 +27,9 @@ Restore a dev-loop that was interrupted (session ended, context compressed, proc
 
 If output-dir not provided:
 
-1. List directories in `docs/dev-loop-outputs/` (excluding `_template`)
-2. For each directory, read `main.md` and check Loop State
-3. Filter to `Current Step != complete`
+1. Run `./scripts/workflow/dev-loop-status.sh --active-only`
+2. This returns all loops with `Current Step != complete`
+3. Display the list to the user
 
 ### Step 2: Show Restore Options
 

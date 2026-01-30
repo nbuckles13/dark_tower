@@ -29,8 +29,8 @@ Used after:
 
 If output-dir not provided, auto-detect:
 
-1. List directories in `docs/dev-loop-outputs/` (excluding `_template`)
-2. Filter to `Current Step` = `fix`
+1. Run `./scripts/workflow/dev-loop-status.sh --active-only`
+2. Filter output to loops with `Current Step` = `fix`
 3. If exactly one: use it
 4. If multiple: ask user which one
 5. If none: error - "No dev-loop in fix state. Run `/dev-loop-validate` or `/dev-loop-review` first."
