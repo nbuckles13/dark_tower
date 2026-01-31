@@ -3,16 +3,14 @@
 //! Configuration is loaded from environment variables. All sensitive
 //! fields are redacted in Debug output.
 
+use common::jwt::{
+    DEFAULT_CLOCK_SKEW_SECONDS as DEFAULT_JWT_CLOCK_SKEW_SECONDS,
+    MAX_CLOCK_SKEW_SECONDS as MAX_JWT_CLOCK_SKEW_SECONDS,
+};
 use std::collections::HashMap;
 use std::env;
 use std::fmt;
 use thiserror::Error;
-
-/// Default JWT clock skew tolerance in seconds (5 minutes per NIST SP 800-63B).
-pub const DEFAULT_JWT_CLOCK_SKEW_SECONDS: i64 = 300;
-
-/// Maximum allowed JWT clock skew tolerance in seconds (10 minutes).
-pub const MAX_JWT_CLOCK_SKEW_SECONDS: i64 = 600;
 
 /// Default rate limit in requests per minute.
 pub const DEFAULT_RATE_LIMIT_RPM: u32 = 100;

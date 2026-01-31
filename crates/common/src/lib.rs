@@ -13,3 +13,6 @@ pub mod config;
 
 /// Module for secret types that prevent accidental logging
 pub mod secret;
+
+/// Module for JWT utilities (validation, claims, constants)
+pub mod jwt;

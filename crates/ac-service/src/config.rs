@@ -1,17 +1,15 @@
 use base64::{engine::general_purpose, Engine as _};
+// Re-export clock skew constants from common for backwards compatibility
+pub use common::jwt::{
+    DEFAULT_CLOCK_SKEW_SECONDS as DEFAULT_JWT_CLOCK_SKEW_SECONDS,
+    MAX_CLOCK_SKEW_SECONDS as MAX_JWT_CLOCK_SKEW_SECONDS,
+};
 use common::secret::{ExposeSecret, SecretBox};
 use std::collections::HashMap;
 use std::env;
 use std::fmt;
 use thiserror::Error;
 use tracing::warn;
-
-/// Default JWT clock skew tolerance in seconds (5 minutes per NIST SP 800-63B).
-pub const DEFAULT_JWT_CLOCK_SKEW_SECONDS: i64 = 300;
-
-/// Maximum allowed JWT clock skew tolerance in seconds (10 minutes).
-/// This prevents misconfiguration that could weaken security.
-pub const MAX_JWT_CLOCK_SKEW_SECONDS: i64 = 600;
 
 /// Default bcrypt cost factor (12 per ADR-0003).
 ///

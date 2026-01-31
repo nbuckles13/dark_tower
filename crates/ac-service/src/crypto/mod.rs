@@ -1,9 +1,10 @@
 #[cfg(test)]
-use crate::config::{DEFAULT_BCRYPT_COST, DEFAULT_JWT_CLOCK_SKEW_SECONDS};
+use crate::config::DEFAULT_BCRYPT_COST;
 use crate::config::{MAX_BCRYPT_COST, MIN_BCRYPT_COST};
 use crate::errors::AcError;
 use crate::observability::metrics::record_token_validation;
 use base64::{engine::general_purpose, Engine as _};
+use common::jwt::{decode_ed25519_public_key_pem, validate_iat, MAX_JWT_SIZE_BYTES};
 use common::secret::{ExposeSecret, SecretBox, SecretString};
 use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use ring::{
@@ -15,25 +16,9 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use tracing::instrument;
 
-/// Maximum allowed JWT size in bytes (4KB).
-///
-/// This limit prevents Denial-of-Service (DoS) attacks via oversized tokens.
-/// JWTs larger than this size are rejected before any parsing or cryptographic
-/// operations, providing defense-in-depth against resource exhaustion attacks.
-///
-/// Rationale:
-/// - Typical JWTs are 200-500 bytes (header + claims + signature)
-/// - Our standard token: ~350 bytes (EdDSA sig, basic claims)
-/// - 4KB limit allows for reasonable future expansion while preventing abuse
-/// - Checked BEFORE base64 decode and signature verification for efficiency
-///
-/// Attack scenario:
-/// - Attacker sends 10MB JWT to /token/verify endpoint
-/// - Without size limit: Base64 decode allocates large buffer, wastes CPU/memory
-/// - With size limit: Rejected immediately with minimal resource usage
-///
-/// Per OWASP API Security Top 10 - API4:2023 (Unrestricted Resource Consumption)
-const MAX_JWT_SIZE_BYTES: usize = 4096; // 4KB
+// Re-export ServiceClaims as Claims for backwards compatibility within AC
+// AC has its own Claims type that matches ServiceClaims but is used throughout the codebase.
+// We keep the local Claims type to avoid a large refactor, but it's structurally identical.
 
 /// JWT Claims structure.
 ///
@@ -270,27 +255,12 @@ pub fn sign_jwt(
 /// SECURITY NOTE: This function does NOT validate the token. It only extracts
 /// the `kid` claim for key lookup. The token MUST still be verified after
 /// fetching the key.
+///
+/// Note: This is a thin wrapper around `common::jwt::extract_kid` that converts
+/// the Result to Option for backwards compatibility with existing callers.
 #[instrument(skip_all)]
 pub fn extract_jwt_kid(token: &str) -> Option<String> {
-    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-
-    // Check token size first (same as verify_jwt)
-    if token.len() > MAX_JWT_SIZE_BYTES {
-        return None;
-    }
-
-    // JWT format: header.payload.signature
-    let parts: Vec<&str> = token.split('.').collect();
-    if parts.len() != 3 {
-        return None;
-    }
-
-    // Decode the header (first part)
-    let header_bytes = URL_SAFE_NO_PAD.decode(parts.first()?).ok()?;
-    let header: serde_json::Value = serde_json::from_slice(&header_bytes).ok()?;
-
-    // Extract kid as string
-    header.get("kid")?.as_str().map(|s| s.to_string())
+    common::jwt::extract_kid(token).ok()
 }
 
 /// Verify JWT with EdDSA public key
@@ -299,11 +269,10 @@ pub fn extract_jwt_kid(token: &str) -> Option<String> {
 /// - Token size (must be <= MAX_JWT_SIZE_BYTES)
 /// - Signature (EdDSA/Ed25519)
 /// - Expiration (`exp` claim)
-/// - Issued-at time (`iat` claim) with clock skew tolerance and maximum age
+/// - Issued-at time (`iat` claim) with clock skew tolerance
 ///
 /// The `iat` claim is validated to prevent token pre-generation and replay attacks:
 /// - Tokens with `iat` more than `clock_skew_seconds` in the future are rejected
-/// - Tokens with `iat` more than `MAX_TOKEN_AGE_SECONDS` in the past are rejected
 ///
 /// The size check is performed BEFORE any parsing to prevent DoS attacks
 /// via oversized tokens.
@@ -333,18 +302,11 @@ pub fn verify_jwt(
         ));
     }
 
-    // Extract base64 from PEM format
-    let public_key_b64 = public_key_pem
-        .lines()
-        .filter(|line| !line.starts_with("-----"))
-        .collect::<String>();
-
-    let public_key_bytes = general_purpose::STANDARD
-        .decode(&public_key_b64)
-        .map_err(|e| {
-            tracing::debug!(target: "crypto", error = %e, "Invalid public key encoding");
-            AcError::InvalidToken("The access token is invalid or expired".to_string())
-        })?;
+    // Decode public key from PEM format using common utility
+    let public_key_bytes = decode_ed25519_public_key_pem(public_key_pem).map_err(|e| {
+        tracing::debug!(target: "crypto", error = %e, "Invalid public key encoding");
+        AcError::InvalidToken("The access token is invalid or expired".to_string())
+    })?;
 
     let decoding_key = DecodingKey::from_ed_der(&public_key_bytes);
 
@@ -356,20 +318,9 @@ pub fn verify_jwt(
         AcError::InvalidToken("The access token is invalid or expired".to_string())
     })?;
 
-    // Validate iat (issued-at) claim with clock skew tolerance
-    // Reject tokens with iat too far in the future (potential pre-generation attack)
-    let now = chrono::Utc::now().timestamp();
-    let max_iat = now + clock_skew_seconds;
-
-    if token_data.claims.iat > max_iat {
-        tracing::debug!(
-            target: "crypto",
-            iat = token_data.claims.iat,
-            now = now,
-            max_allowed = max_iat,
-            clock_skew_seconds = clock_skew_seconds,
-            "Token rejected: iat too far in the future"
-        );
+    // Validate iat using common utility
+    // We still record metrics here for AC-specific observability
+    if let Err(_e) = validate_iat(token_data.claims.iat, clock_skew_seconds) {
         // Record metric for clock skew rejection (enables alerting on clock drift issues)
         record_token_validation("error", Some("clock_skew"));
         return Err(AcError::InvalidToken(
@@ -539,18 +490,11 @@ pub fn verify_user_jwt(
         ));
     }
 
-    // Extract base64 from PEM format
-    let public_key_b64 = public_key_pem
-        .lines()
-        .filter(|line| !line.starts_with("-----"))
-        .collect::<String>();
-
-    let public_key_bytes = general_purpose::STANDARD
-        .decode(&public_key_b64)
-        .map_err(|e| {
-            tracing::debug!(target: "crypto", error = %e, "Invalid public key encoding");
-            AcError::InvalidToken("The access token is invalid or expired".to_string())
-        })?;
+    // Decode public key from PEM format using common utility
+    let public_key_bytes = decode_ed25519_public_key_pem(public_key_pem).map_err(|e| {
+        tracing::debug!(target: "crypto", error = %e, "Invalid public key encoding");
+        AcError::InvalidToken("The access token is invalid or expired".to_string())
+    })?;
 
     let decoding_key = DecodingKey::from_ed_der(&public_key_bytes);
 
@@ -562,19 +506,8 @@ pub fn verify_user_jwt(
         AcError::InvalidToken("The access token is invalid or expired".to_string())
     })?;
 
-    // Validate iat (issued-at) claim with clock skew tolerance
-    let now = chrono::Utc::now().timestamp();
-    let max_iat = now + clock_skew_seconds;
-
-    if token_data.claims.iat > max_iat {
-        tracing::debug!(
-            target: "crypto",
-            iat = token_data.claims.iat,
-            now = now,
-            max_allowed = max_iat,
-            clock_skew_seconds = clock_skew_seconds,
-            "User token rejected: iat too far in the future"
-        );
+    // Validate iat using common utility
+    if let Err(_e) = validate_iat(token_data.claims.iat, clock_skew_seconds) {
         record_token_validation("error", Some("clock_skew"));
         return Err(AcError::InvalidToken(
             "The access token is invalid or expired".to_string(),
@@ -588,6 +521,7 @@ pub fn verify_user_jwt(
 #[allow(clippy::panic, clippy::assertions_on_constants)]
 mod tests {
     use super::*;
+    use crate::config::DEFAULT_JWT_CLOCK_SKEW_SECONDS;
 
     #[test]
     fn test_key_generation() {
@@ -1450,11 +1384,12 @@ mod tests {
     /// Test JWT size limit constant value
     ///
     /// Documents the MAX_JWT_SIZE_BYTES constant for security review.
+    /// Changed from 4KB to 8KB to align with GC and MC (common::jwt).
     #[test]
     fn test_max_jwt_size_constant() {
         assert_eq!(
-            MAX_JWT_SIZE_BYTES, 4096,
-            "Max JWT size must be 4096 bytes (4KB) for DoS protection"
+            MAX_JWT_SIZE_BYTES, 8192,
+            "Max JWT size must be 8192 bytes (8KB) for DoS protection"
         );
     }
 
