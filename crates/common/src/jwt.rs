@@ -28,7 +28,7 @@
 //! let kid = extract_kid(token)?;
 //!
 //! // After signature verification, validate iat
-//! validate_iat(claims.iat, DEFAULT_CLOCK_SKEW_SECONDS)?;
+//! validate_iat(claims.iat, DEFAULT_CLOCK_SKEW)?;
 //! ```
 //!
 //! **ADRs**: ADR-0003 (Service Auth), ADR-0007 (Token Lifetime)
@@ -36,6 +36,7 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::time::Duration;
 use thiserror::Error;
 
 // =============================================================================
@@ -64,17 +65,17 @@ use thiserror::Error;
 /// Per OWASP API Security Top 10 - API4:2023 (Unrestricted Resource Consumption)
 pub const MAX_JWT_SIZE_BYTES: usize = 8192; // 8KB
 
-/// Default JWT clock skew tolerance in seconds (5 minutes per NIST SP 800-63B).
+/// Default JWT clock skew tolerance (5 minutes per NIST SP 800-63B).
 ///
 /// This tolerance accounts for clock drift between servers. Tokens with `iat`
 /// (issued-at) timestamps more than this amount in the future are rejected.
-pub const DEFAULT_CLOCK_SKEW_SECONDS: i64 = 300;
+pub const DEFAULT_CLOCK_SKEW: Duration = Duration::from_secs(300);
 
-/// Maximum allowed JWT clock skew tolerance in seconds (10 minutes).
+/// Maximum allowed JWT clock skew tolerance (10 minutes).
 ///
 /// This prevents misconfiguration that could weaken security by allowing
 /// excessively large clock skew tolerance.
-pub const MAX_CLOCK_SKEW_SECONDS: i64 = 600;
+pub const MAX_CLOCK_SKEW: Duration = Duration::from_secs(600);
 
 // =============================================================================
 // Error Types
@@ -310,29 +311,32 @@ pub fn extract_kid(token: &str) -> Result<String, JwtValidationError> {
 /// # Arguments
 ///
 /// * `iat` - The issued-at timestamp from the JWT claims (Unix epoch seconds)
-/// * `clock_skew_seconds` - Maximum allowed clock skew tolerance
+/// * `clock_skew` - Maximum allowed clock skew tolerance
 ///
 /// # Returns
 ///
 /// - `Ok(())` - The iat claim is valid
-/// - `Err(IatTooFarInFuture)` - The iat is more than `clock_skew_seconds` in the future
+/// - `Err(IatTooFarInFuture)` - The iat is more than `clock_skew` in the future
 ///
 /// # Errors
 ///
 /// Returns `JwtValidationError::IatTooFarInFuture` if the iat timestamp is more than
-/// `clock_skew_seconds` in the future.
+/// `clock_skew` in the future.
 ///
 /// # Example
 ///
 /// ```rust,ignore
-/// use common::jwt::{validate_iat, DEFAULT_CLOCK_SKEW_SECONDS};
+/// use common::jwt::{validate_iat, DEFAULT_CLOCK_SKEW};
 ///
 /// // After verifying signature and extracting claims
-/// validate_iat(claims.iat, DEFAULT_CLOCK_SKEW_SECONDS)?;
+/// validate_iat(claims.iat, DEFAULT_CLOCK_SKEW)?;
 /// ```
-pub fn validate_iat(iat: i64, clock_skew_seconds: i64) -> Result<(), JwtValidationError> {
+pub fn validate_iat(iat: i64, clock_skew: Duration) -> Result<(), JwtValidationError> {
     let now = chrono::Utc::now().timestamp();
-    let max_iat = now + clock_skew_seconds;
+    // Safe cast: clock_skew is bounded to MAX_CLOCK_SKEW (600 seconds), well within i64 range
+    #[allow(clippy::cast_possible_wrap)]
+    let clock_skew_secs = clock_skew.as_secs() as i64;
+    let max_iat = now + clock_skew_secs;
 
     if iat > max_iat {
         tracing::debug!(
@@ -340,7 +344,7 @@ pub fn validate_iat(iat: i64, clock_skew_seconds: i64) -> Result<(), JwtValidati
             iat = iat,
             now = now,
             max_allowed = max_iat,
-            clock_skew_seconds = clock_skew_seconds,
+            clock_skew_secs = clock_skew_secs,
             "Token rejected: iat too far in the future"
         );
         return Err(JwtValidationError::IatTooFarInFuture);
@@ -421,7 +425,7 @@ pub fn decode_ed25519_public_key_jwk(x_b64url: &str) -> Result<Vec<u8>, base64::
 // =============================================================================
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::cast_possible_wrap)]
 mod tests {
     use super::*;
 
@@ -436,12 +440,12 @@ mod tests {
 
     #[test]
     fn test_default_clock_skew_is_5_minutes() {
-        assert_eq!(DEFAULT_CLOCK_SKEW_SECONDS, 300);
+        assert_eq!(DEFAULT_CLOCK_SKEW, Duration::from_secs(300));
     }
 
     #[test]
     fn test_max_clock_skew_is_10_minutes() {
-        assert_eq!(MAX_CLOCK_SKEW_SECONDS, 600);
+        assert_eq!(MAX_CLOCK_SKEW, Duration::from_secs(600));
     }
 
     // -------------------------------------------------------------------------
@@ -555,42 +559,42 @@ mod tests {
     #[test]
     fn test_validate_iat_current_time() {
         let now = chrono::Utc::now().timestamp();
-        let result = validate_iat(now, DEFAULT_CLOCK_SKEW_SECONDS);
+        let result = validate_iat(now, DEFAULT_CLOCK_SKEW);
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_validate_iat_past_time() {
         let past = chrono::Utc::now().timestamp() - 3600; // 1 hour ago
-        let result = validate_iat(past, DEFAULT_CLOCK_SKEW_SECONDS);
+        let result = validate_iat(past, DEFAULT_CLOCK_SKEW);
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_validate_iat_within_clock_skew() {
         let future = chrono::Utc::now().timestamp() + 200; // 200s in future (< 300s skew)
-        let result = validate_iat(future, DEFAULT_CLOCK_SKEW_SECONDS);
+        let result = validate_iat(future, DEFAULT_CLOCK_SKEW);
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_validate_iat_at_clock_skew_boundary() {
-        let future = chrono::Utc::now().timestamp() + DEFAULT_CLOCK_SKEW_SECONDS;
-        let result = validate_iat(future, DEFAULT_CLOCK_SKEW_SECONDS);
+        let future = chrono::Utc::now().timestamp() + DEFAULT_CLOCK_SKEW.as_secs() as i64;
+        let result = validate_iat(future, DEFAULT_CLOCK_SKEW);
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_validate_iat_beyond_clock_skew() {
-        let future = chrono::Utc::now().timestamp() + DEFAULT_CLOCK_SKEW_SECONDS + 10;
-        let result = validate_iat(future, DEFAULT_CLOCK_SKEW_SECONDS);
+        let future = chrono::Utc::now().timestamp() + DEFAULT_CLOCK_SKEW.as_secs() as i64 + 10;
+        let result = validate_iat(future, DEFAULT_CLOCK_SKEW);
         assert!(matches!(result, Err(JwtValidationError::IatTooFarInFuture)));
     }
 
     #[test]
     fn test_validate_iat_far_future() {
         let far_future = chrono::Utc::now().timestamp() + 86400; // 1 day in future
-        let result = validate_iat(far_future, DEFAULT_CLOCK_SKEW_SECONDS);
+        let result = validate_iat(far_future, DEFAULT_CLOCK_SKEW);
         assert!(matches!(result, Err(JwtValidationError::IatTooFarInFuture)));
     }
 

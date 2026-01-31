@@ -3,7 +3,7 @@
 //! These tests validate the key rotation endpoint with proper authentication,
 //! authorization, and rate limiting enforcement.
 
-use ac_service::config::{DEFAULT_BCRYPT_COST, DEFAULT_JWT_CLOCK_SKEW_SECONDS};
+use ac_service::config::{DEFAULT_BCRYPT_COST, DEFAULT_JWT_CLOCK_SKEW};
 use ac_service::crypto;
 use ac_service::repositories::{service_credentials, signing_keys};
 use ac_service::services::token_service;
@@ -689,7 +689,7 @@ async fn test_old_key_tokens_valid_after_rotation(pool: PgPool) -> Result<(), an
     // can still be parsed correctly by our verification logic
 
     // Actually, let's verify the old key is still in the database and valid
-    let old_key_kid = crypto::extract_jwt_kid(&old_token).expect("Token should have kid");
+    let old_key_kid = common::jwt::extract_kid(&old_token).expect("Token should have kid");
     let old_key = signing_keys::get_by_key_id(&pool, &old_key_kid)
         .await?
         .expect("Old key should still exist in database");
@@ -707,11 +707,7 @@ async fn test_old_key_tokens_valid_after_rotation(pool: PgPool) -> Result<(), an
     );
 
     // Verify the token can be parsed and verified with the old key
-    let claims = crypto::verify_jwt(
-        &old_token,
-        &old_key.public_key,
-        DEFAULT_JWT_CLOCK_SKEW_SECONDS,
-    )?;
+    let claims = crypto::verify_jwt(&old_token, &old_key.public_key, DEFAULT_JWT_CLOCK_SKEW)?;
     assert_eq!(
         claims.sub, "overlap-test-client",
         "Token claims should be intact"

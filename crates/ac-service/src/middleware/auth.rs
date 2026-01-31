@@ -48,7 +48,11 @@ pub async fn require_service_auth(
         .ok_or_else(|| AcError::Crypto("No active signing key available".to_string()))?;
 
     // Verify JWT with configured clock skew tolerance
-    let claims = crypto::verify_jwt(token, &signing_key.public_key, state.jwt_clock_skew_seconds)?;
+    let claims = crypto::verify_jwt(
+        token,
+        &signing_key.public_key,
+        std::time::Duration::from_secs(state.jwt_clock_skew_seconds as u64),
+    )?;
 
     // Store claims in request extensions for downstream handlers
     req.extensions_mut().insert(claims);
@@ -88,7 +92,11 @@ pub async fn require_admin_scope(
         .ok_or_else(|| AcError::Crypto("No active signing key available".to_string()))?;
 
     // Verify JWT with configured clock skew tolerance
-    let claims = crypto::verify_jwt(token, &signing_key.public_key, state.jwt_clock_skew_seconds)?;
+    let claims = crypto::verify_jwt(
+        token,
+        &signing_key.public_key,
+        std::time::Duration::from_secs(state.jwt_clock_skew_seconds as u64),
+    )?;
 
     // Check if token has required scope (admin:services)
     let required_scope = "admin:services";

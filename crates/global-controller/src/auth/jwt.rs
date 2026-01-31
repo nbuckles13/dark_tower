@@ -74,7 +74,10 @@ impl JwtValidator {
         let claims = verify_token(token, &jwk)?;
 
         // 4. Validate iat claim with clock skew tolerance using common utility
-        if let Err(e) = validate_iat(claims.iat, self.clock_skew_seconds) {
+        if let Err(e) = validate_iat(
+            claims.iat,
+            std::time::Duration::from_secs(self.clock_skew_seconds as u64),
+        ) {
             tracing::debug!(target: "gc.auth.jwt", error = ?e, "Token iat validation failed");
             return Err(GcError::InvalidToken(
                 "The access token is invalid or expired".to_string(),

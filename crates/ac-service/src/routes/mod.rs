@@ -384,7 +384,7 @@ mod tests {
             master_key: common::secret::SecretBox::new(Box::new(master_key.clone())),
             hash_secret: common::secret::SecretBox::new(Box::new(master_key.clone())),
             otlp_endpoint: None,
-            jwt_clock_skew_seconds: crate::config::DEFAULT_JWT_CLOCK_SKEW_SECONDS,
+            jwt_clock_skew_seconds: crate::config::DEFAULT_JWT_CLOCK_SKEW.as_secs() as i64,
             bcrypt_cost: crate::config::DEFAULT_BCRYPT_COST,
         };
         let state = Arc::new(auth_handler::AppState {
@@ -428,7 +428,7 @@ mod tests {
             master_key: common::secret::SecretBox::new(Box::new(vec![0u8; 32])), // Dummy key (won't be used)
             hash_secret: common::secret::SecretBox::new(Box::new(vec![0u8; 32])), // Dummy hash secret for tests
             otlp_endpoint: None,
-            jwt_clock_skew_seconds: crate::config::DEFAULT_JWT_CLOCK_SKEW_SECONDS,
+            jwt_clock_skew_seconds: crate::config::DEFAULT_JWT_CLOCK_SKEW.as_secs() as i64,
             bcrypt_cost: crate::config::DEFAULT_BCRYPT_COST,
         };
         let state = Arc::new(auth_handler::AppState {

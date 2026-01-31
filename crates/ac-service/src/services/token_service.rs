@@ -1,5 +1,5 @@
 #[cfg(test)]
-use crate::config::{DEFAULT_BCRYPT_COST, DEFAULT_JWT_CLOCK_SKEW_SECONDS};
+use crate::config::{DEFAULT_BCRYPT_COST, DEFAULT_JWT_CLOCK_SKEW};
 use crate::crypto::{self, Claims, EncryptedKey, UserClaims};
 use crate::errors::AcError;
 use crate::models::{AuthEventType, TokenResponse};
@@ -970,7 +970,7 @@ mod tests {
         let result = crypto::verify_jwt(
             &tampered_token,
             &signing_key.public_key,
-            DEFAULT_JWT_CLOCK_SKEW_SECONDS,
+            DEFAULT_JWT_CLOCK_SKEW,
         );
 
         // Should be rejected due to signature mismatch
@@ -1018,7 +1018,7 @@ mod tests {
         let result = crypto::verify_jwt(
             &token_wrong_key,
             &correct_key.public_key,
-            DEFAULT_JWT_CLOCK_SKEW_SECONDS,
+            DEFAULT_JWT_CLOCK_SKEW,
         );
 
         // Should be rejected - signature won't match
@@ -1029,11 +1029,8 @@ mod tests {
 
         // Also verify that verifying with the wrong public key would succeed
         // (to prove the token itself is valid, just not for our system)
-        let verify_with_wrong_key = crypto::verify_jwt(
-            &token_wrong_key,
-            &wrong_public_key,
-            DEFAULT_JWT_CLOCK_SKEW_SECONDS,
-        );
+        let verify_with_wrong_key =
+            crypto::verify_jwt(&token_wrong_key, &wrong_public_key, DEFAULT_JWT_CLOCK_SKEW);
         assert!(
             verify_with_wrong_key.is_ok(),
             "Token should be valid for the key it was signed with"
@@ -1088,7 +1085,7 @@ mod tests {
         let result = crypto::verify_jwt(
             &stripped_token,
             &signing_key.public_key,
-            DEFAULT_JWT_CLOCK_SKEW_SECONDS,
+            DEFAULT_JWT_CLOCK_SKEW,
         );
 
         // Should be rejected - invalid JWT format
@@ -1165,7 +1162,7 @@ mod tests {
         let result = crypto::verify_jwt(
             &tampered_token,
             &signing_key.public_key,
-            DEFAULT_JWT_CLOCK_SKEW_SECONDS,
+            DEFAULT_JWT_CLOCK_SKEW,
         );
 
         // Should be rejected due to algorithm mismatch
@@ -1237,11 +1234,8 @@ mod tests {
         let signing_key = signing_keys::get_active_key(&pool)
             .await?
             .expect("No active signing key found");
-        let result = crypto::verify_jwt(
-            &none_token,
-            &signing_key.public_key,
-            DEFAULT_JWT_CLOCK_SKEW_SECONDS,
-        );
+        let result =
+            crypto::verify_jwt(&none_token, &signing_key.public_key, DEFAULT_JWT_CLOCK_SKEW);
 
         // Should be rejected - "none" algorithm not allowed
         assert!(
@@ -1294,7 +1288,7 @@ mod tests {
         let result = crypto::verify_jwt(
             &expired_token,
             &signing_key_model.public_key,
-            DEFAULT_JWT_CLOCK_SKEW_SECONDS,
+            DEFAULT_JWT_CLOCK_SKEW,
         );
 
         // Should be rejected due to expiration
@@ -1361,7 +1355,7 @@ mod tests {
         let result = crypto::verify_jwt(
             &future_token,
             &signing_key_model.public_key,
-            DEFAULT_JWT_CLOCK_SKEW_SECONDS,
+            DEFAULT_JWT_CLOCK_SKEW,
         );
 
         // Should be rejected - iat too far in the future
@@ -1419,7 +1413,7 @@ mod tests {
         let result = crypto::verify_jwt(
             &token,
             &signing_key_model.public_key,
-            DEFAULT_JWT_CLOCK_SKEW_SECONDS,
+            DEFAULT_JWT_CLOCK_SKEW,
         );
 
         assert!(
@@ -1454,7 +1448,7 @@ mod tests {
         let claims_at_boundary = crypto::Claims {
             sub: "boundary-client".to_string(),
             exp: Utc::now().timestamp() + TOKEN_EXPIRY_SECONDS_I64,
-            iat: Utc::now().timestamp() + DEFAULT_JWT_CLOCK_SKEW_SECONDS, // Exactly at 5 min boundary
+            iat: Utc::now().timestamp() + DEFAULT_JWT_CLOCK_SKEW.as_secs() as i64, // Exactly at 5 min boundary
             scope: "meeting:create".to_string(),
             service_type: Some("global-controller".to_string()),
         };
@@ -1476,7 +1470,7 @@ mod tests {
         let result = crypto::verify_jwt(
             &token,
             &signing_key_model.public_key,
-            DEFAULT_JWT_CLOCK_SKEW_SECONDS,
+            DEFAULT_JWT_CLOCK_SKEW,
         );
 
         assert!(
@@ -1510,7 +1504,7 @@ mod tests {
         let claims_beyond_boundary = crypto::Claims {
             sub: "beyond-boundary-client".to_string(),
             exp: Utc::now().timestamp() + TOKEN_EXPIRY_SECONDS_I64,
-            iat: Utc::now().timestamp() + DEFAULT_JWT_CLOCK_SKEW_SECONDS + 1, // 1 second beyond 5 min
+            iat: Utc::now().timestamp() + DEFAULT_JWT_CLOCK_SKEW.as_secs() as i64 + 1, // 1 second beyond 5 min
             scope: "meeting:create".to_string(),
             service_type: Some("global-controller".to_string()),
         };
@@ -1536,7 +1530,7 @@ mod tests {
         let result = crypto::verify_jwt(
             &token,
             &signing_key_model.public_key,
-            DEFAULT_JWT_CLOCK_SKEW_SECONDS,
+            DEFAULT_JWT_CLOCK_SKEW,
         );
 
         assert!(
@@ -1615,7 +1609,7 @@ mod tests {
         let result = crypto::verify_jwt(
             &token_at_jwt,
             &signing_key_model.public_key,
-            DEFAULT_JWT_CLOCK_SKEW_SECONDS,
+            DEFAULT_JWT_CLOCK_SKEW,
         );
         assert!(
             result.is_ok(),
@@ -1631,7 +1625,7 @@ mod tests {
         let result = crypto::verify_jwt(
             &token_lowercase,
             &signing_key_model.public_key,
-            DEFAULT_JWT_CLOCK_SKEW_SECONDS,
+            DEFAULT_JWT_CLOCK_SKEW,
         );
         assert!(
             result.is_ok(),
@@ -1647,7 +1641,7 @@ mod tests {
         let result = crypto::verify_jwt(
             &token_custom,
             &signing_key_model.public_key,
-            DEFAULT_JWT_CLOCK_SKEW_SECONDS,
+            DEFAULT_JWT_CLOCK_SKEW,
         );
         assert!(
             result.is_ok(),
@@ -1664,7 +1658,7 @@ mod tests {
         let result = crypto::verify_jwt(
             &token_no_typ,
             &signing_key_model.public_key,
-            DEFAULT_JWT_CLOCK_SKEW_SECONDS,
+            DEFAULT_JWT_CLOCK_SKEW,
         );
         assert!(
             result.is_ok(),
@@ -1765,7 +1759,7 @@ mod tests {
         let result = crypto::verify_jwt(
             &tampered_token,
             &signing_key.public_key,
-            DEFAULT_JWT_CLOCK_SKEW_SECONDS,
+            DEFAULT_JWT_CLOCK_SKEW,
         );
 
         // Should be rejected - algorithm mismatch
@@ -1783,7 +1777,7 @@ mod tests {
         let result = crypto::verify_jwt(
             &tampered_token_rs256,
             &signing_key.public_key,
-            DEFAULT_JWT_CLOCK_SKEW_SECONDS,
+            DEFAULT_JWT_CLOCK_SKEW,
         );
         assert!(
             matches!(result, Err(AcError::InvalidToken(_))),
@@ -1863,7 +1857,7 @@ mod tests {
         let result = crypto::verify_jwt(
             &attacker_token,
             &legitimate_key.public_key,
-            DEFAULT_JWT_CLOCK_SKEW_SECONDS,
+            DEFAULT_JWT_CLOCK_SKEW,
         );
 
         // Should be REJECTED - signature won't match our public key
@@ -1877,7 +1871,7 @@ mod tests {
         let attacker_verification = crypto::verify_jwt(
             &attacker_token,
             &attacker_public_key,
-            DEFAULT_JWT_CLOCK_SKEW_SECONDS,
+            DEFAULT_JWT_CLOCK_SKEW,
         );
         assert!(
             attacker_verification.is_ok(),
@@ -1930,7 +1924,7 @@ mod tests {
         let result = crypto::verify_jwt(
             &tampered_token,
             &legitimate_key.public_key,
-            DEFAULT_JWT_CLOCK_SKEW_SECONDS,
+            DEFAULT_JWT_CLOCK_SKEW,
         );
 
         // Token should be REJECTED because changing the header invalidates the signature
@@ -2005,7 +1999,7 @@ mod tests {
         let verified = crypto::verify_jwt(
             &token_with_extra,
             &signing_key_model.public_key,
-            DEFAULT_JWT_CLOCK_SKEW_SECONDS,
+            DEFAULT_JWT_CLOCK_SKEW,
         )?;
 
         // Should successfully parse the standard fields
@@ -2068,7 +2062,7 @@ mod tests {
         let result = crypto::verify_jwt(
             &incomplete_token,
             &signing_key_model.public_key,
-            DEFAULT_JWT_CLOCK_SKEW_SECONDS,
+            DEFAULT_JWT_CLOCK_SKEW,
         );
 
         assert!(
@@ -2138,7 +2132,7 @@ mod tests {
         let result = crypto::verify_jwt(
             &tampered_token,
             &signing_key.public_key,
-            DEFAULT_JWT_CLOCK_SKEW_SECONDS,
+            DEFAULT_JWT_CLOCK_SKEW,
         );
 
         // Should be rejected due to signature mismatch
@@ -2246,7 +2240,7 @@ mod tests {
         let result = crypto::verify_jwt(
             &oversized_token,
             &signing_key_model.public_key,
-            DEFAULT_JWT_CLOCK_SKEW_SECONDS,
+            DEFAULT_JWT_CLOCK_SKEW,
         );
 
         // Should be rejected due to size limit
@@ -2278,7 +2272,7 @@ mod tests {
         let result = crypto::verify_jwt(
             &normal_token,
             &signing_key_model.public_key,
-            DEFAULT_JWT_CLOCK_SKEW_SECONDS,
+            DEFAULT_JWT_CLOCK_SKEW,
         );
         assert!(
             result.is_ok(),
@@ -2597,7 +2591,7 @@ mod tests {
         let claims = crypto::verify_user_jwt(
             &result.access_token,
             &signing_key.public_key,
-            DEFAULT_JWT_CLOCK_SKEW_SECONDS,
+            DEFAULT_JWT_CLOCK_SKEW,
         )?;
 
         assert_eq!(claims.org_id, org_id.to_string());
@@ -2850,7 +2844,7 @@ mod tests {
         let claims = crypto::verify_user_jwt(
             &result.access_token,
             &signing_key.public_key,
-            DEFAULT_JWT_CLOCK_SKEW_SECONDS,
+            DEFAULT_JWT_CLOCK_SKEW,
         )?;
 
         assert!(claims.roles.contains(&"user".to_string()));

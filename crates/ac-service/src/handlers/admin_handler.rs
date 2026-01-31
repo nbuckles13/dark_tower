@@ -132,9 +132,9 @@ pub async fn handle_rotate_keys(
     // This is required for key rotation support: during the overlap period,
     // tokens signed with the old key are still valid but we need to verify
     // them with the old key, not the new "active" key.
-    let kid = crate::crypto::extract_jwt_kid(token).ok_or(AcError::InvalidToken(
-        "Missing or invalid key ID in token header".to_string(),
-    ))?;
+    let kid = common::jwt::extract_kid(token).map_err(|_| {
+        AcError::InvalidToken("Missing or invalid key ID in token header".to_string())
+    })?;
 
     // Look up the signing key by kid (not just "active" key)
     // This ensures tokens signed with old keys (still in validity window) work
@@ -175,7 +175,7 @@ pub async fn handle_rotate_keys(
     let claims = crate::crypto::verify_jwt(
         token,
         &signing_key.public_key,
-        state.config.jwt_clock_skew_seconds,
+        std::time::Duration::from_secs(state.config.jwt_clock_skew_seconds as u64),
     )?;
 
     // SECURITY: Require service token (must have service_type)
