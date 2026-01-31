@@ -109,15 +109,11 @@ pub fn generate_signing_key() -> Result<(String, Vec<u8>), AcError> {
     let rng = SystemRandom::new();
 
     // Generate Ed25519 keypair in PKCS8 format
-    let pkcs8_bytes = Ed25519KeyPair::generate_pkcs8(&rng).map_err(|e| {
-        tracing::error!(target: "crypto", error = %e, "Keypair generation failed");
-        AcError::Crypto("Key generation failed".to_string())
-    })?;
+    let pkcs8_bytes = Ed25519KeyPair::generate_pkcs8(&rng)
+        .map_err(|e| AcError::Crypto(format!("Keypair generation failed: {}", e)))?;
 
-    let key_pair = Ed25519KeyPair::from_pkcs8(pkcs8_bytes.as_ref()).map_err(|e| {
-        tracing::error!(target: "crypto", error = %e, "Keypair parsing failed");
-        AcError::Crypto("Key generation failed".to_string())
-    })?;
+    let key_pair = Ed25519KeyPair::from_pkcs8(pkcs8_bytes.as_ref())
+        .map_err(|e| AcError::Crypto(format!("Keypair parsing failed: {}", e)))?;
 
     // Get public key bytes
     let public_key_bytes = key_pair.public_key().as_ref();
@@ -137,36 +133,31 @@ pub fn generate_signing_key() -> Result<(String, Vec<u8>), AcError> {
 #[instrument(skip_all)]
 pub fn encrypt_private_key(private_key: &[u8], master_key: &[u8]) -> Result<EncryptedKey, AcError> {
     if master_key.len() != 32 {
-        tracing::error!(target: "crypto", "Invalid master key length: {}", master_key.len());
-        return Err(AcError::Crypto("Invalid encryption key".to_string()));
+        return Err(AcError::Crypto(format!(
+            "Invalid master key length: {} (expected 32)",
+            master_key.len()
+        )));
     }
 
     let rng = SystemRandom::new();
 
     // Generate random 96-bit nonce (12 bytes)
     let mut nonce_bytes = [0u8; 12];
-    rng.fill(&mut nonce_bytes).map_err(|e| {
-        tracing::error!(target: "crypto", error = %e, "Nonce generation failed");
-        AcError::Crypto("Encryption failed".to_string())
-    })?;
+    rng.fill(&mut nonce_bytes)
+        .map_err(|e| AcError::Crypto(format!("Nonce generation failed: {}", e)))?;
 
     let nonce = Nonce::assume_unique_for_key(nonce_bytes);
 
     // Create AES-256-GCM cipher
-    let unbound_key = UnboundKey::new(&AES_256_GCM, master_key).map_err(|e| {
-        tracing::error!(target: "crypto", error = %e, "Cipher key creation failed");
-        AcError::Crypto("Encryption failed".to_string())
-    })?;
+    let unbound_key = UnboundKey::new(&AES_256_GCM, master_key)
+        .map_err(|e| AcError::Crypto(format!("Cipher key creation failed: {}", e)))?;
     let sealing_key = LessSafeKey::new(unbound_key);
 
     // Encrypt the private key (in-place operation requires mutable buffer)
     let mut in_out = private_key.to_vec();
     sealing_key
         .seal_in_place_append_tag(nonce, Aad::empty(), &mut in_out)
-        .map_err(|e| {
-            tracing::error!(target: "crypto", error = %e, "Encryption operation failed");
-            AcError::Crypto("Encryption failed".to_string())
-        })?;
+        .map_err(|e| AcError::Crypto(format!("Encryption operation failed: {}", e)))?;
 
     // Split ciphertext and tag (last 16 bytes are the tag)
     // After seal_in_place_append_tag, the buffer contains original data + 16-byte tag
@@ -197,44 +188,46 @@ pub fn decrypt_private_key(
     master_key: &[u8],
 ) -> Result<Vec<u8>, AcError> {
     if master_key.len() != 32 {
-        tracing::error!(target: "crypto", "Invalid master key length: {}", master_key.len());
-        return Err(AcError::Crypto("Invalid decryption key".to_string()));
+        return Err(AcError::Crypto(format!(
+            "Invalid master key length: {} (expected 32)",
+            master_key.len()
+        )));
     }
 
     if encrypted.nonce.len() != 12 {
-        tracing::error!(target: "crypto", "Invalid nonce length: {}", encrypted.nonce.len());
-        return Err(AcError::Crypto("Decryption failed".to_string()));
+        return Err(AcError::Crypto(format!(
+            "Invalid nonce length: {} (expected 12)",
+            encrypted.nonce.len()
+        )));
     }
 
     if encrypted.tag.len() != 16 {
-        tracing::error!(target: "crypto", "Invalid tag length: {}", encrypted.tag.len());
-        return Err(AcError::Crypto("Decryption failed".to_string()));
+        return Err(AcError::Crypto(format!(
+            "Invalid tag length: {} (expected 16)",
+            encrypted.tag.len()
+        )));
     }
 
     // Reconstruct ciphertext with tag
     let mut in_out = encrypted.encrypted_data.expose_secret().clone();
     in_out.extend_from_slice(&encrypted.tag);
 
-    let nonce_bytes: [u8; 12] = encrypted.nonce.as_slice().try_into().map_err(|e| {
-        tracing::error!(target: "crypto", error = %e, "Invalid nonce format");
-        AcError::Crypto("Decryption failed".to_string())
-    })?;
+    let nonce_bytes: [u8; 12] = encrypted
+        .nonce
+        .as_slice()
+        .try_into()
+        .map_err(|e| AcError::Crypto(format!("Invalid nonce format: {}", e)))?;
     let nonce = Nonce::assume_unique_for_key(nonce_bytes);
 
     // Create AES-256-GCM cipher
-    let unbound_key = UnboundKey::new(&AES_256_GCM, master_key).map_err(|e| {
-        tracing::error!(target: "crypto", error = %e, "Cipher key creation failed");
-        AcError::Crypto("Decryption failed".to_string())
-    })?;
+    let unbound_key = UnboundKey::new(&AES_256_GCM, master_key)
+        .map_err(|e| AcError::Crypto(format!("Cipher key creation failed: {}", e)))?;
     let opening_key = LessSafeKey::new(unbound_key);
 
     // Decrypt in place
     let decrypted = opening_key
         .open_in_place(nonce, Aad::empty(), &mut in_out)
-        .map_err(|e| {
-            tracing::error!(target: "crypto", error = %e, "Decryption operation failed");
-            AcError::Crypto("Decryption failed".to_string())
-        })?;
+        .map_err(|e| AcError::Crypto(format!("Decryption operation failed: {}", e)))?;
 
     Ok(decrypted.to_vec())
 }
@@ -247,10 +240,8 @@ pub fn sign_jwt(
     key_id: &str,
 ) -> Result<String, AcError> {
     // Validate the private key format
-    let _key_pair = Ed25519KeyPair::from_pkcs8(private_key_pkcs8).map_err(|e| {
-        tracing::error!(target: "crypto", error = %e, "Invalid private key format");
-        AcError::Crypto("JWT signing failed".to_string())
-    })?;
+    let _key_pair = Ed25519KeyPair::from_pkcs8(private_key_pkcs8)
+        .map_err(|e| AcError::Crypto(format!("Invalid private key format: {}", e)))?;
 
     // Get the raw private key bytes for jsonwebtoken
     // Ed25519KeyPair doesn't expose the seed directly, so we need to use the PKCS8 format
@@ -260,10 +251,8 @@ pub fn sign_jwt(
     header.typ = Some("JWT".to_string());
     header.kid = Some(key_id.to_string());
 
-    let token = encode(&header, claims, &encoding_key).map_err(|e| {
-        tracing::error!(target: "crypto", error = %e, "JWT signing operation failed");
-        AcError::Crypto("JWT signing failed".to_string())
-    })?;
+    let token = encode(&header, claims, &encoding_key)
+        .map_err(|e| AcError::Crypto(format!("JWT signing operation failed: {}", e)))?;
 
     Ok(token)
 }
@@ -414,42 +403,29 @@ pub fn hash_client_secret(secret: &str, cost: u32) -> Result<String, AcError> {
     // Defense-in-depth: Validate cost even though config should have already validated.
     // This prevents insecure hashing if this function is called directly with invalid cost.
     if !(MIN_BCRYPT_COST..=MAX_BCRYPT_COST).contains(&cost) {
-        tracing::error!(
-            target: "crypto",
-            cost = cost,
-            min = MIN_BCRYPT_COST,
-            max = MAX_BCRYPT_COST,
-            "Bcrypt cost outside valid range"
-        );
         return Err(AcError::Crypto(format!(
             "Invalid bcrypt cost: {} (must be {}-{})",
             cost, MIN_BCRYPT_COST, MAX_BCRYPT_COST
         )));
     }
 
-    bcrypt::hash(secret, cost).map_err(|e| {
-        tracing::error!(target: "crypto", error = %e, cost = cost, "Password hashing failed");
-        AcError::Crypto("Password hashing failed".to_string())
-    })
+    bcrypt::hash(secret, cost)
+        .map_err(|e| AcError::Crypto(format!("Password hashing failed: {}", e)))
 }
 
 /// Verify client secret against bcrypt hash
 #[instrument(skip_all)]
 pub fn verify_client_secret(secret: &str, hash: &str) -> Result<bool, AcError> {
-    bcrypt::verify(secret, hash).map_err(|e| {
-        tracing::error!(target: "crypto", error = %e, "Password verification failed");
-        AcError::Crypto("Password verification failed".to_string())
-    })
+    bcrypt::verify(secret, hash)
+        .map_err(|e| AcError::Crypto(format!("Password verification failed: {}", e)))
 }
 
 /// Generate cryptographically secure random bytes
 pub fn generate_random_bytes(len: usize) -> Result<Vec<u8>, AcError> {
     let rng = SystemRandom::new();
     let mut bytes = vec![0u8; len];
-    rng.fill(&mut bytes).map_err(|e| {
-        tracing::error!(target: "crypto", error = %e, "Random bytes generation failed");
-        AcError::Crypto("Random generation failed".to_string())
-    })?;
+    rng.fill(&mut bytes)
+        .map_err(|e| AcError::Crypto(format!("Random bytes generation failed: {}", e)))?;
     Ok(bytes)
 }
 
@@ -521,10 +497,8 @@ pub fn sign_user_jwt(
     use ring::signature::Ed25519KeyPair;
 
     // Validate the private key format
-    let _key_pair = Ed25519KeyPair::from_pkcs8(private_key_pkcs8).map_err(|e| {
-        tracing::error!(target: "crypto", error = %e, "Invalid private key format");
-        AcError::Crypto("JWT signing failed".to_string())
-    })?;
+    let _key_pair = Ed25519KeyPair::from_pkcs8(private_key_pkcs8)
+        .map_err(|e| AcError::Crypto(format!("Invalid private key format: {}", e)))?;
 
     let encoding_key = EncodingKey::from_ed_der(private_key_pkcs8);
 
@@ -532,10 +506,8 @@ pub fn sign_user_jwt(
     header.typ = Some("JWT".to_string());
     header.kid = Some(key_id.to_string());
 
-    let token = encode(&header, claims, &encoding_key).map_err(|e| {
-        tracing::error!(target: "crypto", error = %e, "JWT signing operation failed");
-        AcError::Crypto("JWT signing failed".to_string())
-    })?;
+    let token = encode(&header, claims, &encoding_key)
+        .map_err(|e| AcError::Crypto(format!("JWT signing operation failed: {}", e)))?;
 
     Ok(token)
 }
@@ -689,7 +661,9 @@ mod tests {
 
         let result = encrypt_private_key(data, &wrong_key);
         let err = result.expect_err("Expected Crypto error");
-        assert!(matches!(err, AcError::Crypto(msg) if msg == "Invalid encryption key"));
+        assert!(
+            matches!(err, AcError::Crypto(msg) if msg.starts_with("Invalid master key length:"))
+        );
     }
 
     #[test]
@@ -701,7 +675,9 @@ mod tests {
         let encrypted = encrypt_private_key(data, &master_key).unwrap();
         let result = decrypt_private_key(&encrypted, &wrong_key);
         let err = result.expect_err("Expected Crypto error");
-        assert!(matches!(err, AcError::Crypto(msg) if msg == "Decryption failed"));
+        assert!(
+            matches!(err, AcError::Crypto(msg) if msg.starts_with("Decryption operation failed:"))
+        );
     }
 
     #[test]
@@ -713,7 +689,9 @@ mod tests {
         let encrypted = encrypt_private_key(data, &master_key).unwrap();
         let result = decrypt_private_key(&encrypted, &wrong_key);
         let err = result.expect_err("Expected Crypto error");
-        assert!(matches!(err, AcError::Crypto(msg) if msg == "Invalid decryption key"));
+        assert!(
+            matches!(err, AcError::Crypto(msg) if msg.starts_with("Invalid master key length:"))
+        );
     }
 
     #[test]
@@ -726,7 +704,7 @@ mod tests {
 
         let result = decrypt_private_key(&encrypted, &master_key);
         let err = result.expect_err("Expected Crypto error");
-        assert!(matches!(err, AcError::Crypto(msg) if msg == "Decryption failed"));
+        assert!(matches!(err, AcError::Crypto(msg) if msg.starts_with("Invalid nonce length:")));
     }
 
     #[test]
@@ -739,7 +717,7 @@ mod tests {
 
         let result = decrypt_private_key(&encrypted, &master_key);
         let err = result.expect_err("Expected Crypto error");
-        assert!(matches!(err, AcError::Crypto(msg) if msg == "Decryption failed"));
+        assert!(matches!(err, AcError::Crypto(msg) if msg.starts_with("Invalid tag length:")));
     }
 
     #[test]
@@ -799,7 +777,9 @@ mod tests {
         // Try to verify against an invalid bcrypt hash
         let result = verify_client_secret("password", "not-a-valid-hash");
         let err = result.expect_err("Expected Crypto error");
-        assert!(matches!(err, AcError::Crypto(msg) if msg == "Password verification failed"));
+        assert!(
+            matches!(err, AcError::Crypto(msg) if msg.starts_with("Password verification failed:"))
+        );
     }
 
     /// P1-SECURITY: Test that bcrypt cost factor is 12 (per ADR-0003)
@@ -1085,7 +1065,9 @@ mod tests {
 
         let result = sign_jwt(&claims, &invalid_key, "test-key-01");
         let err = result.expect_err("Invalid private key should be rejected");
-        assert!(matches!(err, AcError::Crypto(msg) if msg == "JWT signing failed"));
+        assert!(
+            matches!(err, AcError::Crypto(msg) if msg.starts_with("Invalid private key format:"))
+        );
     }
 
     /// Test verify_jwt with invalid public key PEM format
@@ -1513,7 +1495,9 @@ mod tests {
         let result = decrypt_private_key(&corrupted_encrypted, &master_key);
 
         let err = result.expect_err("Corrupted ciphertext should fail authentication");
-        assert!(matches!(err, AcError::Crypto(msg) if msg == "Decryption failed"));
+        assert!(
+            matches!(err, AcError::Crypto(msg) if msg.starts_with("Decryption operation failed:"))
+        );
     }
 
     /// Test decrypt with corrupted tag
@@ -1532,7 +1516,9 @@ mod tests {
         let result = decrypt_private_key(&encrypted, &master_key);
 
         let err = result.expect_err("Corrupted tag should fail authentication");
-        assert!(matches!(err, AcError::Crypto(msg) if msg == "Decryption failed"));
+        assert!(
+            matches!(err, AcError::Crypto(msg) if msg.starts_with("Decryption operation failed:"))
+        );
     }
 
     // ============================================================================
