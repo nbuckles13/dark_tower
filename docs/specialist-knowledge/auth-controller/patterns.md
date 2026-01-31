@@ -104,24 +104,22 @@ This pattern prevents subtle authorization bypass where similar-looking scopes a
 
 ---
 
-## Pattern: Error Context Preservation with Security-Aware Logging
+## Pattern: Error Context in Returned Error (Not Logged Separately)
 **Added**: 2026-01-28
-**Related files**: `crates/ac-service/src/crypto/mod.rs`, `crates/ac-service/src/handlers/auth_handler.rs`
+**Updated**: 2026-01-30
+**Related files**: `crates/ac-service/src/crypto/mod.rs`, `crates/ac-service/src/handlers/internal_tokens.rs`
 
-Preserve error context in `.map_err()` while maintaining security boundaries. For crypto operations, log actual error server-side but return generic message to clients:
+Include error context directly in the returned error type, NOT via separate logging. The `IntoResponse` implementation sanitizes errors at the API boundary - clients get generic messages while full context is preserved for server-side error chains:
 ```rust
+// CORRECT: Context in returned error
+.map_err(|e| AcError::Crypto(format!("Keypair generation failed: {}", e)))
+
+// WRONG: Logging separately then returning generic
 .map_err(|e| {
-    tracing::error!(target: "crypto", error = %e, "Keypair generation failed");
-    AcError::Crypto("Key generation failed".to_string())
+    tracing::error!(error = %e, "Keypair generation failed");  // Redundant!
+    AcError::Crypto("Key generation failed".to_string())  // Context lost
 })
 ```
-For credential parsing, use debug-level to prevent enumeration:
-```rust
-.map_err(|e| {
-    tracing::debug!(target: "auth", error = %e, "Invalid base64");
-    AcError::InvalidCredentials
-})
-```
-This enables server-side debugging without leaking information to attackers.
+Crypto library errors (ring, bcrypt, jsonwebtoken) are safe to include - they don't expose sensitive material. Exception: For `InvalidCredentials`, use `|_|` to prevent information leakage about authentication failures.
 
 ---

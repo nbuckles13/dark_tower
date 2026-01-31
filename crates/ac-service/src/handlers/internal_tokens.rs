@@ -273,10 +273,8 @@ fn sign_meeting_jwt(
     use ring::signature::Ed25519KeyPair;
 
     // Validate the private key format
-    let _key_pair = Ed25519KeyPair::from_pkcs8(private_key_pkcs8).map_err(|e| {
-        tracing::error!(target: "crypto", error = %e, "Invalid private key format");
-        AcError::Crypto("JWT signing failed".to_string())
-    })?;
+    let _key_pair = Ed25519KeyPair::from_pkcs8(private_key_pkcs8)
+        .map_err(|e| AcError::Crypto(format!("Invalid private key format: {}", e)))?;
 
     let encoding_key = EncodingKey::from_ed_der(private_key_pkcs8);
 
@@ -284,10 +282,8 @@ fn sign_meeting_jwt(
     header.typ = Some("JWT".to_string());
     header.kid = Some(key_id.to_string());
 
-    encode(&header, claims, &encoding_key).map_err(|e| {
-        tracing::error!(target: "crypto", error = %e, "JWT signing operation failed");
-        AcError::Crypto("JWT signing failed".to_string())
-    })
+    encode(&header, claims, &encoding_key)
+        .map_err(|e| AcError::Crypto(format!("JWT signing operation failed: {}", e)))
 }
 
 /// Sign a guest token JWT.
@@ -300,10 +296,8 @@ fn sign_guest_jwt(
     use ring::signature::Ed25519KeyPair;
 
     // Validate the private key format
-    let _key_pair = Ed25519KeyPair::from_pkcs8(private_key_pkcs8).map_err(|e| {
-        tracing::error!(target: "crypto", error = %e, "Invalid private key format");
-        AcError::Crypto("JWT signing failed".to_string())
-    })?;
+    let _key_pair = Ed25519KeyPair::from_pkcs8(private_key_pkcs8)
+        .map_err(|e| AcError::Crypto(format!("Invalid private key format: {}", e)))?;
 
     let encoding_key = EncodingKey::from_ed_der(private_key_pkcs8);
 
@@ -311,10 +305,8 @@ fn sign_guest_jwt(
     header.typ = Some("JWT".to_string());
     header.kid = Some(key_id.to_string());
 
-    encode(&header, claims, &encoding_key).map_err(|e| {
-        tracing::error!(target: "crypto", error = %e, "JWT signing operation failed");
-        AcError::Crypto("JWT signing failed".to_string())
-    })
+    encode(&header, claims, &encoding_key)
+        .map_err(|e| AcError::Crypto(format!("JWT signing operation failed: {}", e)))
 }
 
 #[cfg(test)]
@@ -566,8 +558,8 @@ mod tests {
 
         let err = result.expect_err("Expected error");
         assert!(
-            matches!(&err, AcError::Crypto(msg) if msg == "JWT signing failed"),
-            "Expected AcError::Crypto with 'JWT signing failed', got {:?}",
+            matches!(&err, AcError::Crypto(msg) if msg.starts_with("Invalid private key format:")),
+            "Expected AcError::Crypto with 'Invalid private key format:', got {:?}",
             err
         );
     }
@@ -610,8 +602,8 @@ mod tests {
 
         let err = result.expect_err("Expected error");
         assert!(
-            matches!(&err, AcError::Crypto(msg) if msg == "JWT signing failed"),
-            "Expected AcError::Crypto with 'JWT signing failed', got {:?}",
+            matches!(&err, AcError::Crypto(msg) if msg.starts_with("Invalid private key format:")),
+            "Expected AcError::Crypto with 'Invalid private key format:', got {:?}",
             err
         );
     }

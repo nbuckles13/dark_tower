@@ -4,11 +4,12 @@ Mistakes to avoid and edge cases discovered in the Auth Controller codebase.
 
 ---
 
-## Gotcha: Bcrypt Cost vs Library Minimum
+## Gotcha: Bcrypt Cost Validated at Multiple Layers
 **Added**: 2026-01-11
-**Related files**: `crates/ac-service/src/crypto/mod.rs`
+**Updated**: 2026-01-30
+**Related files**: `crates/ac-service/src/crypto/mod.rs`, `crates/ac-service/src/config.rs`
 
-Bcrypt library accepts cost 4-31, but OWASP requires minimum 10. Config enforces 10-14, but crypto function does not re-validate. Always pass config-validated cost.
+Bcrypt library accepts cost 4-31, but OWASP requires minimum 10. Config enforces 10-14, AND `hash_client_secret()` re-validates as defense-in-depth. If called directly with invalid cost, it returns an error with context: `"Invalid bcrypt cost: N (must be 10-14)"`.
 
 ---
 
@@ -118,5 +119,21 @@ Tests should verify empty scope rejection, not just "wrong scope" rejection. An 
 **Related files**: `crates/ac-service/src/handlers/internal_tokens.rs`, `crates/ac-service/src/handlers/auth_handler.rs`
 
 The `instrument-skip-all` guard uses grep to detect `#[instrument` without `skip_all` on the same line. When attributes span multiple lines, the guard sees `#[instrument(` on line N without `skip_all` (which appears on line N+2) and flags it as a violation. These are false positives. The code is correct if `skip_all` appears anywhere in the attribute. Manually verify flagged functions before making changes.
+
+---
+
+## Gotcha: Test Assertions for Dynamic Error Messages
+**Added**: 2026-01-30
+**Related files**: `crates/ac-service/src/crypto/mod.rs`
+
+When error messages include underlying error context (e.g., `format!("Operation failed: {}", e)`), test assertions must use `starts_with()` not exact matching. The underlying library's error text may vary across versions:
+```rust
+// WRONG: Breaks when library error text changes
+assert!(matches!(err, AcError::Crypto(msg) if msg == "Decryption failed"));
+
+// CORRECT: Matches our prefix, ignores library suffix
+assert!(matches!(err, AcError::Crypto(msg) if msg.starts_with("Decryption operation failed:")));
+```
+This pattern ensures tests verify our error handling logic without being fragile to dependency changes.
 
 ---

@@ -8,6 +8,7 @@
 # Checks:
 #   - credential-leak: Secrets in logs, missing skip in instrument, etc.
 #   - actor-blocking: Long-running operations blocking actor message loops
+#   - error-context-preservation: Error context properly included in returned errors
 #   - all: Run all checks (default)
 #
 # Exit codes:
@@ -20,6 +21,7 @@
 #   ./analyze-diff.sh <diff-file>                    # All checks
 #   ./analyze-diff.sh <diff-file> --check credential-leak
 #   ./analyze-diff.sh <diff-file> --check actor-blocking
+#   ./analyze-diff.sh <diff-file> --check error-context-preservation
 #   cat diff.txt | ./analyze-diff.sh -              # Read from stdin
 #
 # Requirements:
@@ -42,6 +44,11 @@ while [[ $# -gt 0 ]]; do
         --check)
             CHECK="$2"
             shift 2
+            ;;
+        -)
+            # Stdin indicator, treat as filename
+            DIFF_FILE="-"
+            shift
             ;;
         -*)
             echo "Unknown option: $1" >&2
@@ -164,6 +171,67 @@ FINDING [actor-blocking]: <file>:<line> - <description> - Suggested fix: <fix>
 
 '
 
+# Error context preservation check
+ERROR_CONTEXT_CHECK='## Error Context Preservation Check
+
+Look for `.map_err(|e| ...)` patterns in the ADDED code where error context may be lost:
+
+**UNSAFE patterns** (flag these):
+
+1. **Error logged but not included in returned error**:
+```rust
+.map_err(|e| {
+    tracing::error!("Operation failed: {}", e);
+    MyError::Internal  // ❌ Error context logged but not in returned error
+})
+```
+
+2. **Generic error message without original context**:
+```rust
+.map_err(|e| MyError::Crypto("Encryption failed".to_string()))  // ❌ No context from e
+```
+
+3. **Error variable captured but not used**:
+```rust
+.map_err(|e| MyError::Internal("Something failed".to_string()))  // ❌ e captured but unused
+```
+
+**SAFE patterns** (do not flag):
+
+1. **Error context included in returned error**:
+```rust
+.map_err(|e| MyError::Internal(format!("Operation failed: {}", e)))  // ✅ Context preserved
+```
+
+2. **Error context in structured error type**:
+```rust
+.map_err(|e| MyError::CryptoError {
+    msg: "Encryption failed".to_string(),
+    source: e.to_string()
+})  // ✅ Context preserved
+```
+
+3. **Error context with additional context**:
+```rust
+.map_err(|e| MyError::InvalidAddress {
+    addr: addr.clone(),
+    reason: e.to_string()
+})  // ✅ Context preserved
+```
+
+**Special considerations**:
+
+- **Validation errors**: For client input validation (auth failures, invalid tokens), logging MAY be appropriate for monitoring, but error context should still be included in the returned error for server-side debugging.
+
+- **Internal vs External**: Server-side errors should preserve full context. Client-facing errors can use generic messages, but the underlying error should capture full context for server logs.
+
+**Key principle**: The error variable `e` should be included in the RETURNED error type, not just logged and discarded.
+
+Report findings as:
+FINDING [error-context-preservation]: <file>:<line> - <description> - Current: <current-code> - Should be: <suggested-fix>
+
+'
+
 # Verdict section
 VERDICT_SECTION='## Final Verdict
 
@@ -190,12 +258,15 @@ case "$CHECK" in
     "actor-blocking")
         PROMPT="${PROMPT_HEADER}${ACTOR_BLOCKING_CHECK}${VERDICT_SECTION}"
         ;;
+    "error-context-preservation")
+        PROMPT="${PROMPT_HEADER}${ERROR_CONTEXT_CHECK}${VERDICT_SECTION}"
+        ;;
     "all")
-        PROMPT="${PROMPT_HEADER}${CREDENTIAL_LEAK_CHECK}${ACTOR_BLOCKING_CHECK}${VERDICT_SECTION}"
+        PROMPT="${PROMPT_HEADER}${CREDENTIAL_LEAK_CHECK}${ACTOR_BLOCKING_CHECK}${ERROR_CONTEXT_CHECK}${VERDICT_SECTION}"
         ;;
     *)
         echo "Unknown check: $CHECK" >&2
-        echo "Valid checks: credential-leak, actor-blocking, all" >&2
+        echo "Valid checks: credential-leak, actor-blocking, error-context-preservation, all" >&2
         exit 3
         ;;
 esac
