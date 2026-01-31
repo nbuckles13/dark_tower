@@ -352,6 +352,17 @@ impl GcClient {
                 Ok(())
             }
             Err(e) => {
+                // Check for NOT_FOUND status - means GC doesn't recognize this MC
+                // (e.g., after GC restart or network partition)
+                if e.code() == tonic::Code::NotFound {
+                    warn!(
+                        target: "mc.grpc.gc_client",
+                        "GC returned NOT_FOUND - MC not registered"
+                    );
+                    self.is_registered.store(false, Ordering::SeqCst);
+                    return Err(McError::NotRegistered);
+                }
+
                 warn!(
                     target: "mc.grpc.gc_client",
                     error = %e,
@@ -420,6 +431,17 @@ impl GcClient {
                 Ok(())
             }
             Err(e) => {
+                // Check for NOT_FOUND status - means GC doesn't recognize this MC
+                // (e.g., after GC restart or network partition)
+                if e.code() == tonic::Code::NotFound {
+                    warn!(
+                        target: "mc.grpc.gc_client",
+                        "GC returned NOT_FOUND - MC not registered"
+                    );
+                    self.is_registered.store(false, Ordering::SeqCst);
+                    return Err(McError::NotRegistered);
+                }
+
                 warn!(
                     target: "mc.grpc.gc_client",
                     error = %e,
@@ -429,6 +451,80 @@ impl GcClient {
                 Err(McError::Grpc(format!(
                     "Comprehensive heartbeat failed: {e}"
                 )))
+            }
+        }
+    }
+
+    /// Attempt re-registration with GC (single attempt, used by heartbeat loop).
+    ///
+    /// Unlike `register()`, this does not retry internally - the caller handles retry logic.
+    /// Used when heartbeat returns NOT_FOUND.
+    ///
+    /// # Errors
+    ///
+    /// Returns `McError::Grpc` if RPC fails.
+    /// Returns `McError::Config` if GC rejects registration.
+    #[instrument(skip_all, fields(mc_id = %self.config.mc_id))]
+    pub async fn attempt_reregistration(&self) -> Result<(), McError> {
+        info!(target: "mc.grpc.gc_client", "Attempting re-registration with GC");
+
+        let request = RegisterMcRequest {
+            id: self.config.mc_id.clone(),
+            region: self.config.region.clone(),
+            grpc_endpoint: format!(
+                "http://{}",
+                self.config
+                    .grpc_bind_address
+                    .replace("0.0.0.0", "localhost")
+            ),
+            webtransport_endpoint: format!(
+                "https://{}",
+                self.config
+                    .webtransport_bind_address
+                    .replace("0.0.0.0", "localhost")
+            ),
+            max_meetings: self.config.max_meetings,
+            max_participants: self.config.max_participants,
+        };
+
+        match self.try_register(&request).await {
+            Ok(response) => {
+                if response.accepted {
+                    info!(
+                        target: "mc.grpc.gc_client",
+                        message = %response.message,
+                        "Successfully re-registered with GC"
+                    );
+
+                    // Store intervals from GC
+                    if response.fast_heartbeat_interval_ms > 0 {
+                        self.fast_heartbeat_interval_ms
+                            .store(response.fast_heartbeat_interval_ms, Ordering::SeqCst);
+                    }
+                    if response.comprehensive_heartbeat_interval_ms > 0 {
+                        self.comprehensive_heartbeat_interval_ms.store(
+                            response.comprehensive_heartbeat_interval_ms,
+                            Ordering::SeqCst,
+                        );
+                    }
+
+                    self.is_registered.store(true, Ordering::SeqCst);
+                    Ok(())
+                } else {
+                    warn!(
+                        target: "mc.grpc.gc_client",
+                        message = %response.message,
+                        "GC rejected re-registration"
+                    );
+                    Err(McError::Config(format!(
+                        "GC rejected re-registration: {}",
+                        response.message
+                    )))
+                }
+            }
+            Err(e) => {
+                warn!(target: "mc.grpc.gc_client", error = %e, "Re-registration attempt failed");
+                Err(e)
             }
         }
     }

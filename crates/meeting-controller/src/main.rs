@@ -27,10 +27,9 @@
 //! 1. Load configuration from environment
 //! 2. Initialize Redis connection (`FencedRedisClient`)
 //! 3. Initialize actor system (`MeetingControllerActorHandle`)
-//! 4. Create `GcClient` and register with GC
-//! 5. Spawn heartbeat tasks (fast: 10s, comprehensive: 30s)
-//! 6. Start gRPC server for GC->MC communication
-//! 7. Wait for shutdown signal
+//! 4. Start gRPC server for GC->MC communication
+//! 5. Create `GcClient` and spawn GC task (registration + heartbeats)
+//! 6. Wait for shutdown signal
 
 #![warn(clippy::pedantic)]
 #![allow(clippy::too_many_lines)] // main.rs orchestrates startup, naturally longer
@@ -41,12 +40,14 @@ use std::time::Duration;
 use common::secret::{ExposeSecret, SecretBox};
 use meeting_controller::actors::{ActorMetrics, ControllerMetrics, MeetingControllerActorHandle};
 use meeting_controller::config::Config;
+use meeting_controller::errors::McError;
 use meeting_controller::grpc::{GcClient, McAssignmentService};
 use meeting_controller::redis::FencedRedisClient;
 use meeting_controller::system_info::gather_system_info;
 use proto_gen::internal::meeting_controller_service_server::MeetingControllerServiceServer;
 use proto_gen::internal::HealthStatus;
 use tokio::signal;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -110,120 +111,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ));
     info!("Actor system initialized");
 
-    // Create GcClient and register with GC (Phase 6c)
-    info!("Connecting to Global Controller...");
-    let gc_client = GcClient::new(
-        config.gc_grpc_url.clone(),
-        config.service_token.clone(),
-        config.clone(),
-    )
-    .await
-    .map_err(|e| {
-        error!(error = %e, "Failed to connect to GC");
-        e
-    })?;
-    info!("Connected to Global Controller");
-
-    // Register with GC (has exponential backoff built in)
-    info!("Registering with Global Controller...");
-    gc_client.register().await.map_err(|e| {
-        error!(error = %e, "Failed to register with GC");
-        e
-    })?;
-    info!("Registered with Global Controller");
-
     // Create shutdown token as child of controller's token
-    // This ensures heartbeat tasks are cancelled when the controller shuts down
+    // This ensures all tasks are cancelled when the controller shuts down
     let shutdown_token = controller_handle.child_token();
 
-    // Spawn heartbeat tasks (Phase 6c)
-    // Use child tokens so they're cancelled when controller shuts down
-    let gc_client_for_fast = Arc::new(gc_client);
-    let gc_client_for_comprehensive = Arc::clone(&gc_client_for_fast);
-    let metrics_for_fast = Arc::clone(&controller_metrics);
-    let metrics_for_comprehensive = Arc::clone(&controller_metrics);
-    let fast_heartbeat_token = shutdown_token.child_token();
-    let comprehensive_heartbeat_token = shutdown_token.child_token();
-
-    // Fast heartbeat task (every 10s)
-    let fast_interval_ms = gc_client_for_fast.fast_heartbeat_interval_ms();
-    tokio::spawn(async move {
-        let interval = Duration::from_millis(fast_interval_ms);
-        let mut ticker = tokio::time::interval(interval);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-        loop {
-            tokio::select! {
-                () = fast_heartbeat_token.cancelled() => {
-                    info!("Fast heartbeat task shutting down");
-                    break;
-                }
-                _ = ticker.tick() => {
-                    let meetings = metrics_for_fast.meetings();
-                    let participants = metrics_for_fast.participants();
-
-                    if let Err(e) = gc_client_for_fast
-                        .fast_heartbeat(meetings, participants, HealthStatus::Healthy)
-                        .await
-                    {
-                        warn!(error = %e, "Fast heartbeat failed");
-                    }
-                }
-            }
-        }
-    });
-    info!(
-        "Fast heartbeat task started (interval: {}ms)",
-        fast_interval_ms
-    );
-
-    // Comprehensive heartbeat task (every 30s)
-    let comprehensive_interval_ms =
-        gc_client_for_comprehensive.comprehensive_heartbeat_interval_ms();
-    tokio::spawn(async move {
-        let interval = Duration::from_millis(comprehensive_interval_ms);
-        let mut ticker = tokio::time::interval(interval);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-        loop {
-            tokio::select! {
-                () = comprehensive_heartbeat_token.cancelled() => {
-                    info!("Comprehensive heartbeat task shutting down");
-                    break;
-                }
-                _ = ticker.tick() => {
-                    let meetings = metrics_for_comprehensive.meetings();
-                    let participants = metrics_for_comprehensive.participants();
-                    let sys_info = gather_system_info();
-
-                    // CPU and memory are 0-100, no precision loss in f32 range
-                    #[allow(clippy::cast_precision_loss)]
-                    let cpu = sys_info.cpu_percent as f32;
-                    #[allow(clippy::cast_precision_loss)]
-                    let memory = sys_info.memory_percent as f32;
-
-                    if let Err(e) = gc_client_for_comprehensive
-                        .comprehensive_heartbeat(
-                            meetings,
-                            participants,
-                            HealthStatus::Healthy,
-                            cpu,
-                            memory,
-                        )
-                        .await
-                    {
-                        warn!(error = %e, "Comprehensive heartbeat failed");
-                    }
-                }
-            }
-        }
-    });
-    info!(
-        "Comprehensive heartbeat task started (interval: {}ms)",
-        comprehensive_interval_ms
-    );
-
-    // Create and start gRPC server for GC->MC communication (Phase 6c)
+    // Start gRPC server BEFORE GC registration (correct ordering)
+    // This prevents race condition where GC tries to call MC before server is ready
     let grpc_addr = config.grpc_bind_address.parse().map_err(|e| {
         error!(error = %e, addr = %config.grpc_bind_address, "Invalid gRPC bind address");
         e
@@ -254,6 +147,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     info!(addr = %grpc_addr, "gRPC server started");
 
+    // Create GcClient and spawn unified GC task (Phase 6c)
+    // This task owns gc_client directly (no Arc needed)
+    info!("Connecting to Global Controller...");
+    let gc_client = GcClient::new(
+        config.gc_grpc_url.clone(),
+        config.service_token.clone(),
+        config.clone(),
+    )
+    .await
+    .map_err(|e| {
+        error!(error = %e, "Failed to connect to GC");
+        e
+    })?;
+    info!("Connected to Global Controller");
+
+    // Spawn unified GC task (registration + dual heartbeats)
+    let gc_task_token = shutdown_token.child_token();
+    let gc_task_metrics = Arc::clone(&controller_metrics);
+    tokio::spawn(async move {
+        run_gc_task(gc_client, gc_task_metrics, gc_task_token).await;
+    });
+    info!("GC task started");
+
     info!("Meeting Controller Phase 6c: GC integration complete");
 
     // TODO (Phase 6g): Start WebTransport server
@@ -264,7 +180,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     shutdown_signal().await;
 
     // Trigger graceful shutdown via cancellation token
-    // This propagates to all child tokens (heartbeats, gRPC server)
+    // This propagates to all child tokens (GC task, gRPC server)
     info!("Shutdown signal received, initiating graceful shutdown...");
     shutdown_token.cancel();
 
@@ -278,6 +194,132 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Meeting Controller shutdown complete");
     Ok(())
+}
+
+/// Unified GC task: registration + dual heartbeat loop.
+///
+/// This task owns `gc_client` directly (no Arc needed).
+/// It never exits on GC connectivity issues - keeps retrying to protect active meetings.
+///
+/// Operational model:
+/// - Initial registration: Retry forever until success (with exponential backoff)
+/// - Dual heartbeats: Fast (10s) + comprehensive (30s) in single select loop
+/// - Re-registration: Detect `NOT_FOUND` from heartbeat, automatically re-register
+/// - Never exit: Protects active meetings during GC outages/restarts
+async fn run_gc_task(
+    gc_client: GcClient,
+    metrics: Arc<ControllerMetrics>,
+    cancel_token: CancellationToken,
+) {
+    info!("GC task: Starting initial registration");
+
+    // Initial registration (retry forever, never exit)
+    loop {
+        tokio::select! {
+            () = cancel_token.cancelled() => {
+                info!("GC task: Cancelled before registration completed");
+                return;
+            }
+            result = gc_client.register() => {
+                match result {
+                    Ok(()) => {
+                        info!("GC task: Initial registration successful");
+                        break; // Proceed to heartbeat loop
+                    }
+                    Err(e) => {
+                        // Log but never exit - keep retrying
+                        // GC may be temporarily unavailable during rolling updates
+                        warn!(error = %e, "GC task: Initial registration failed, will retry");
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                    }
+                }
+            }
+        }
+    }
+
+    // Dual heartbeat loop (fast + comprehensive in one select)
+    let fast_interval = Duration::from_millis(gc_client.fast_heartbeat_interval_ms());
+    let comprehensive_interval =
+        Duration::from_millis(gc_client.comprehensive_heartbeat_interval_ms());
+
+    let mut fast_ticker = tokio::time::interval(fast_interval);
+    fast_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    let mut comprehensive_ticker = tokio::time::interval(comprehensive_interval);
+    comprehensive_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    info!(
+        fast_interval_ms = fast_interval.as_millis(),
+        comprehensive_interval_ms = comprehensive_interval.as_millis(),
+        "GC task: Entering dual heartbeat loop"
+    );
+
+    loop {
+        tokio::select! {
+            () = cancel_token.cancelled() => {
+                info!("GC task: Shutting down");
+                break;
+            }
+            _ = fast_ticker.tick() => {
+                let snapshot = metrics.snapshot();
+
+                if let Err(e) = gc_client
+                    .fast_heartbeat(snapshot.meetings, snapshot.participants, HealthStatus::Healthy)
+                    .await
+                {
+                    handle_heartbeat_error(&gc_client, e).await;
+                }
+            }
+            _ = comprehensive_ticker.tick() => {
+                let snapshot = metrics.snapshot();
+                let sys_info = gather_system_info();
+
+                // CPU and memory are 0-100, no precision loss in f32 range
+                #[allow(clippy::cast_precision_loss)]
+                let cpu = sys_info.cpu_percent as f32;
+                #[allow(clippy::cast_precision_loss)]
+                let memory = sys_info.memory_percent as f32;
+
+                if let Err(e) = gc_client
+                    .comprehensive_heartbeat(
+                        snapshot.meetings,
+                        snapshot.participants,
+                        HealthStatus::Healthy,
+                        cpu,
+                        memory,
+                    )
+                    .await
+                {
+                    handle_heartbeat_error(&gc_client, e).await;
+                }
+            }
+        }
+    }
+
+    info!("GC task: Stopped");
+}
+
+/// Handle heartbeat errors, including re-registration on `NOT_FOUND`.
+///
+/// Never exits - logs error and attempts re-registration if needed.
+async fn handle_heartbeat_error(gc_client: &GcClient, error: McError) {
+    match error {
+        McError::NotRegistered => {
+            // GC doesn't recognize this MC (e.g., after GC restart)
+            // Attempt re-registration (single attempt, task loop will retry)
+            warn!("Heartbeat failed: MC not registered with GC, attempting re-registration");
+
+            if let Err(e) = gc_client.attempt_reregistration().await {
+                warn!(error = %e, "Re-registration failed, will retry on next heartbeat");
+            } else {
+                info!("Re-registration successful");
+            }
+        }
+        other => {
+            // Other errors (network, timeout, etc.) - log and continue
+            warn!(error = %other, "Heartbeat failed");
+        }
+    }
 }
 
 /// Wait for shutdown signal (Ctrl+C or SIGTERM).

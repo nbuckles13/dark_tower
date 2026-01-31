@@ -227,6 +227,15 @@ pub struct ControllerMetrics {
     current_participants: AtomicU32,
 }
 
+/// Snapshot of controller metrics at a point in time.
+#[derive(Debug, Clone, Copy)]
+pub struct ControllerMetricsSnapshot {
+    /// Current number of active meetings.
+    pub meetings: u32,
+    /// Current number of active participants.
+    pub participants: u32,
+}
+
 impl ControllerMetrics {
     /// Create a new shared metrics instance.
     #[must_use]
@@ -274,6 +283,17 @@ impl ControllerMetrics {
     /// Decrement the participant count atomically.
     pub fn decrement_participants(&self) {
         self.current_participants.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    /// Take an atomic snapshot of current metrics.
+    ///
+    /// This reads both counters atomically for consistent reporting in heartbeats.
+    #[must_use]
+    pub fn snapshot(&self) -> ControllerMetricsSnapshot {
+        ControllerMetricsSnapshot {
+            meetings: self.current_meetings.load(Ordering::SeqCst),
+            participants: self.current_participants.load(Ordering::SeqCst),
+        }
     }
 }
 
@@ -513,6 +533,33 @@ mod tests {
 
         metrics.decrement_meetings();
         assert_eq!(metrics.meetings(), 10);
+    }
+
+    #[test]
+    fn test_controller_metrics_snapshot() {
+        let metrics = ControllerMetrics::new();
+
+        // Initial snapshot should be zero
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.meetings, 0);
+        assert_eq!(snapshot.participants, 0);
+
+        // Update metrics
+        metrics.set_meetings(5);
+        metrics.set_participants(42);
+
+        // Snapshot should reflect current values
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.meetings, 5);
+        assert_eq!(snapshot.participants, 42);
+
+        // Test atomic operations through snapshot
+        metrics.increment_meetings();
+        metrics.increment_participants();
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.meetings, 6);
+        assert_eq!(snapshot.participants, 43);
     }
 
     #[test]

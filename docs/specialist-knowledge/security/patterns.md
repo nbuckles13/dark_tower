@@ -236,3 +236,29 @@ Preserve error context for debugging via server-side logging while returning gen
 **Benefits**: Debugging gets full context, clients get minimal info (prevents enumeration/info disclosure). Common pattern for database errors, service communication failures, parsing errors, crypto operations.
 
 ---
+
+## Pattern: Test Infrastructure Security (Mock Credentials)
+**Added**: 2026-01-31
+**Related files**: `crates/meeting-controller/tests/gc_integration.rs`, `crates/global-controller/tests/api_tests.rs`
+
+Test infrastructure (mocks, fixtures, integration tests) should use obviously fake credentials to prevent confusion with production values. Pattern:
+
+1. **Naming convention**: Use prefixes/suffixes that clearly indicate test usage: `test-service-token`, `test-mc-001`, `test-secret`
+2. **Base64 test secrets**: If encoding required, use base64 of human-readable strings: `dGVzdC1zZWNyZXQ=` (base64 of "test-secret")
+3. **Localhost URLs**: Use `redis://localhost:6379`, `http://127.0.0.1:50051` for connection strings
+4. **Mock behavior**: Test mocks should NOT validate actual credentials (appropriate for unit tests), but should validate structural format (token format, URL parsability)
+5. **SecretString wrapping**: Even in tests, wrap credentials in `SecretString` to validate production code paths
+
+**Example**:
+```rust
+Config {
+    service_token: SecretString::from("test-service-token"),
+    binding_token_secret: SecretString::from("dGVzdC1zZWNyZXQ="),
+    redis_url: SecretString::from("redis://localhost:6379"),
+    // ...
+}
+```
+
+**Benefits**: (1) No risk of credential leakage if test code is committed, (2) Clear separation from production values, (3) Validates production code paths without security bypass. Common mistake: using production-like secrets in tests (e.g., realistic-looking JWTs, actual API keys from docs).
+
+---

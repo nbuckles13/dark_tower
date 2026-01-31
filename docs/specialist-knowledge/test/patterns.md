@@ -798,3 +798,69 @@ When reviewing error hiding fixes (`.map_err(|_| ...)` → `.map_err(|e| ...)` w
 - No new test cases needed - existing coverage validates error paths work correctly
 
 Result: Error hiding fixes are observability improvements, not behavioral changes. Existing error path tests remain sufficient. Optionally note as tech debt: "Consider adding log assertion tests using `tracing_test` to verify error context is captured" - but this is enhancement, not blocker.
+
+---
+
+## Pattern: MockBehavior Enum for gRPC Test Server State Machines
+**Added**: 2026-01-31
+**Related files**: `crates/meeting-controller/tests/gc_integration.rs`
+
+When testing gRPC client interactions with recovery flows, use a `MockBehavior` enum to model different server response patterns:
+
+```rust
+#[derive(Debug, Clone, Copy)]
+enum MockBehavior {
+    Accept,                 // Normal operation
+    Reject,                 // Registration rejected
+    NotFound,               // Always return NOT_FOUND (simulates lost state)
+    NotFoundThenAccept,     // First request NOT_FOUND, subsequent requests accept
+}
+
+struct MockGcServer {
+    behavior: MockBehavior,
+    // ... other fields
+}
+
+#[tonic::async_trait]
+impl GlobalControllerService for MockGcServer {
+    async fn fast_heartbeat(&self, req: Request<FastHeartbeatRequest>)
+        -> Result<Response<HeartbeatResponse>, Status>
+    {
+        match self.behavior {
+            MockBehavior::NotFound => {
+                Err(Status::not_found("MC not registered with GC"))
+            }
+            MockBehavior::NotFoundThenAccept => {
+                let count = self.heartbeat_count.fetch_add(1, Ordering::SeqCst);
+                if count == 0 {
+                    Err(Status::not_found("MC not registered"))
+                } else {
+                    Ok(Response::new(HeartbeatResponse { acknowledged: true, ... }))
+                }
+            }
+            _ => Ok(Response::new(HeartbeatResponse { ... }))
+        }
+    }
+}
+```
+
+**Key benefits**:
+- Single mock server handles multiple test scenarios (no duplicate server code)
+- Clearly models state transitions (NotFoundThenAccept simulates re-registration recovery)
+- Extensible: add new behaviors without changing existing tests
+- Stateful variants (NotFoundThenAccept) use atomic counters to track request count
+
+**Test scenarios enabled**:
+- `MockBehavior::Accept`: Happy path (registration, heartbeats succeed)
+- `MockBehavior::Reject`: Error handling (registration rejected by GC)
+- `MockBehavior::NotFound`: NOT_FOUND detection (heartbeat returns `McError::NotRegistered`)
+- `MockBehavior::NotFoundThenAccept`: Full recovery flow (heartbeat fails → re-register → heartbeat succeeds)
+
+**Phase 6c MC review**: This pattern enabled testing the full re-registration flow without a real GC deployment. 4 integration tests cover NOT_FOUND detection and recovery using MockBehavior variants.
+
+Alternative patterns considered and rejected:
+- **Separate mock per scenario**: Duplicates code, harder to maintain
+- **Runtime configuration flags**: Less type-safe, behavior changes implicit
+- **Trait-based mocking**: Overkill for simple state machine, adds complexity
+
+Use MockBehavior when testing client retry/recovery logic against unreliable services.

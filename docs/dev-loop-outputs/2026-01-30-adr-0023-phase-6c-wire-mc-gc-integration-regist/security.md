@@ -8,6 +8,8 @@
 
 - **Round 1**: Initial review - APPROVED with 2 TECH_DEBT items
 - **Round 2**: Delta review of updated files - APPROVED (no new issues)
+- **Round 3**: Iteration 3 review (re-registration, unified GC task) - APPROVED
+- **Round 4**: Iteration 4 review (test coverage additions) - APPROVED
 
 ## Files Reviewed
 
@@ -268,3 +270,287 @@ The two TECH_DEBT items from Round 1 remain unchanged and acceptable for the cur
 - Token size limits (8KB) correctly implemented per documented pattern
 - Connection URL credential protection (gotchas.md) properly followed in Redis client
 - SecretString usage throughout config matched documented practices
+
+---
+
+## Round 3 (Iteration 3): Re-registration and Unified GC Task
+
+**Date**: 2026-01-31
+**Reviewer**: Security Specialist
+
+### Files Reviewed (Iteration 3 Deltas)
+
+1. `crates/meeting-controller/src/errors.rs` - Added McError::NotRegistered variant
+2. `crates/meeting-controller/src/grpc/gc_client.rs` - NOT_FOUND detection, attempt_reregistration()
+3. `crates/meeting-controller/src/main.rs` - Unified GC task refactor
+4. `crates/meeting-controller/src/actors/metrics.rs` - Added snapshot() method
+5. `crates/meeting-controller/src/actors/mod.rs` - Export ControllerMetricsSnapshot
+
+### Security Analysis
+
+#### 1. McError::NotRegistered (errors.rs)
+
+**GOOD**: New error variant has secure client-facing behavior:
+```rust
+McError::NotRegistered => 6 // INTERNAL_ERROR
+// ...
+McError::NotRegistered => "An internal error occurred".to_string()
+```
+- Maps to generic INTERNAL_ERROR (6), not a specific code
+- Client message hides registration state from external observers
+- No information leakage about MC-GC relationship
+
+#### 2. NOT_FOUND Detection and Re-registration (gc_client.rs)
+
+**GOOD**: Status code-based detection (not message parsing):
+```rust
+if e.code() == tonic::Code::NotFound {
+    warn!(target: "mc.grpc.gc_client", "GC returned NOT_FOUND - MC not registered");
+    self.is_registered.store(false, Ordering::SeqCst);
+    return Err(McError::NotRegistered);
+}
+```
+- Uses gRPC status code enum, not string matching (no injection risk)
+- Logs only non-sensitive operational info
+- Sets registration state atomically
+
+**GOOD**: `attempt_reregistration()` reuses secure patterns:
+- Calls `add_auth()` which uses `ExposeSecret` correctly
+- Same registration request structure as initial registration
+- No credential logging in error paths
+- Single-attempt design prevents retry amplification (caller controls retry)
+
+**SECURITY NOTE**: Re-registration does not introduce timing oracle:
+- Re-registration attempts happen at heartbeat intervals (10s/30s)
+- Not observable by external clients
+- No security-sensitive timing variations
+
+#### 3. Unified GC Task - Never-Exit Resilience (main.rs)
+
+**GOOD**: Task continues operating during GC outages:
+```rust
+loop {
+    tokio::select! {
+        () = cancel_token.cancelled() => { ... return; }
+        result = gc_client.register() => {
+            match result {
+                Ok(()) => break, // Proceed to heartbeat loop
+                Err(e) => {
+                    warn!(error = %e, "GC task: Initial registration failed, will retry");
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
+            }
+        }
+    }
+}
+```
+- Protects active meetings during GC unavailability
+- All errors are logged for observability
+- Properly responds to cancellation token
+- Not a security vulnerability - correct operational behavior
+
+**GOOD**: Startup order preserved (security-relevant):
+- gRPC server starts BEFORE GC registration
+- Prevents race condition where GC calls MC before ready
+- Code comments document this ordering requirement
+
+**GOOD**: No credentials in error messages or logs
+
+#### 4. ControllerMetrics::snapshot() (metrics.rs)
+
+**GOOD**: Helper method is trivially safe:
+```rust
+pub fn snapshot(&self) -> ControllerMetricsSnapshot {
+    ControllerMetricsSnapshot {
+        meetings: self.current_meetings.load(Ordering::SeqCst),
+        participants: self.current_participants.load(Ordering::SeqCst),
+    }
+}
+```
+- Reads atomic counters (no sensitive data)
+- Consistent ordering with SeqCst
+- No security implications
+
+#### 5. Module Export (mod.rs)
+
+**GOOD**: Simple type re-export, no security implications
+
+### Findings
+
+No new security issues identified in Iteration 3. All changes maintain existing security posture.
+
+| Severity   | Count | Details |
+|------------|-------|---------|
+| BLOCKER    | 0     | -       |
+| CRITICAL   | 0     | -       |
+| MAJOR      | 0     | -       |
+| MINOR      | 0     | -       |
+| TECH_DEBT  | 0     | No new tech debt (previous 2 items unchanged) |
+
+### Cumulative Tech Debt (from previous rounds)
+
+1. **[TECH_DEBT] Hardcoded master secret placeholder** (main.rs:105)
+2. **[TECH_DEBT] JWT cryptographic validation deferred** (auth_interceptor.rs:14-16)
+
+### Round 3 Verdict
+
+**APPROVED**
+
+### Summary
+
+Iteration 3 introduces no new security concerns:
+
+1. **McError::NotRegistered**: Properly maps to generic internal error for clients, preventing information leakage about MC-GC registration state.
+
+2. **Re-registration support**: Uses status code detection (not message parsing), reuses secure `add_auth()` pattern, and single-attempt design prevents retry amplification.
+
+3. **Unified GC task**: Never-exit resilience is the correct operational choice for protecting active meetings. All errors are logged for observability. Startup order (gRPC before registration) is preserved.
+
+4. **Metrics snapshot**: Trivially safe helper method with no security implications.
+
+The implementation correctly follows established security patterns and introduces no new attack vectors.
+
+---
+
+## Round 4 (Iteration 4): Test Coverage Additions
+
+**Date**: 2026-01-31
+**Reviewer**: Security Specialist
+
+### Files Reviewed (Iteration 4 Deltas)
+
+1. `crates/meeting-controller/src/errors.rs` - Enhanced test for NotRegistered.client_message()
+2. `crates/meeting-controller/src/actors/metrics.rs` - Added test_controller_metrics_snapshot()
+3. `crates/meeting-controller/tests/gc_integration.rs` - Added MockBehavior enum, 4 re-registration tests
+
+### Security Analysis
+
+#### 1. Enhanced Error Tests (errors.rs)
+
+**GOOD**: Added explicit security validation test:
+```rust
+// NotRegistered should also hide internal details
+let not_registered_err = McError::NotRegistered;
+assert_eq!(
+    not_registered_err.client_message(),
+    "An internal error occurred"
+);
+```
+- This test validates that `NotRegistered` error does not leak registration state
+- Adds test coverage for security-relevant error handling behavior
+
+#### 2. Metrics Snapshot Test (metrics.rs)
+
+**GOOD**: Test covers `test_controller_metrics_snapshot()`:
+- Tests atomic counter reads and consistency
+- No sensitive data involved (just meeting/participant counts)
+- No security implications
+
+#### 3. MockBehavior Enum and Re-registration Tests (gc_integration.rs)
+
+**GOOD**: MockBehavior enum is cleanly designed:
+```rust
+enum MockBehavior {
+    Accept,
+    Reject,
+    NotFound,
+    NotFoundThenAccept,
+}
+```
+- Clear separation of mock behaviors
+- No production security bypass
+
+**GOOD**: Test credentials use obviously fake values:
+```rust
+redis_url: SecretString::from("redis://localhost:6379"),
+binding_token_secret: SecretString::from("dGVzdC1zZWNyZXQ="),
+service_token: SecretString::from("test-service-token"),
+```
+- `dGVzdC1zZWNyZXQ=` is base64 for "test-secret"
+- All credentials are clearly test values, not production-like
+- No risk of credential confusion
+
+**GOOD**: MockGcServer implementation:
+- Does not validate authentication (appropriate for unit tests)
+- Returns proper gRPC status codes (NOT_FOUND, etc.)
+- No security bypass of production validation
+
+**GOOD**: Re-registration test cases:
+- `test_heartbeat_not_found_detection`: Validates that NOT_FOUND sets `is_registered=false`
+- `test_comprehensive_heartbeat_not_found_detection`: Same for comprehensive heartbeat
+- `test_attempt_reregistration_success`: Tests re-registration flow
+- `test_attempt_reregistration_after_not_found`: Full re-registration flow test
+
+These tests validate correct security behavior:
+- Registration state properly tracked
+- Error types correctly detected
+- Re-registration follows secure patterns
+
+### Findings
+
+No new security issues. The test code:
+1. Uses obviously fake credentials
+2. Does not bypass production security
+3. Validates security-relevant behavior (error message hiding)
+
+| Severity   | Count | Details |
+|------------|-------|---------|
+| BLOCKER    | 0     | -       |
+| CRITICAL   | 0     | -       |
+| MAJOR      | 0     | -       |
+| MINOR      | 0     | -       |
+| TECH_DEBT  | 0     | No new tech debt |
+
+### Cumulative Tech Debt (unchanged from previous rounds)
+
+1. **[TECH_DEBT] Hardcoded master secret placeholder** (main.rs:105)
+2. **[TECH_DEBT] JWT cryptographic validation deferred** (auth_interceptor.rs:14-16)
+
+### Round 4 Verdict
+
+**APPROVED**
+
+### Summary
+
+Iteration 4 adds test coverage with no security concerns:
+
+1. **Error test enhancement**: Explicitly validates that `NotRegistered.client_message()` returns generic error, confirming no information leakage.
+
+2. **Mock infrastructure**: `MockBehavior` enum and `MockGcServer` use obviously fake credentials and do not bypass production security validation.
+
+3. **Re-registration tests**: Four new integration tests validate correct registration state management and error detection, which are security-positive additions.
+
+All test code follows security best practices for test infrastructure.
+
+---
+
+## Post-Review Reflection
+
+**Date**: 2026-01-31
+
+### Knowledge Analysis
+
+Reviewed 4 iterations of MC-GC integration (registration, heartbeats, re-registration, test coverage). All rounds approved with 0 new security findings.
+
+**Existing patterns validated**:
+1. ✅ **Error message hiding** (patterns.md): `McError::NotRegistered.client_message()` correctly returns generic "An internal error occurred"
+2. ✅ **Token size limits** (patterns.md): 8KB limit enforced in auth interceptor
+3. ✅ **SecretString usage** (patterns.md): All credentials wrapped in `SecretString` throughout config and client
+4. ✅ **Connection URL credential protection** (gotchas.md): Redis URL not logged in error paths
+5. ✅ **gRPC interceptor pattern** (patterns.md): Authorization validated before handler execution
+6. ✅ **Status code-based detection** (no prior pattern, but good practice): NOT_FOUND detection uses `e.code() == tonic::Code::NotFound`, not message parsing
+
+**New pattern identified**:
+1. ➕ **Test infrastructure security**: Test credentials use obviously fake values (`test-service-token`, `dGVzdC1zZWNyZXQ=`), mocks don't bypass production security, SecretString wrapping maintained even in tests. Added to patterns.md.
+
+### Implementation Quality
+
+The implementation correctly applied all existing security patterns without needing remediation. No security anti-patterns were introduced. The test infrastructure (MockGcServer, MockBehavior) demonstrates good separation between test behavior control and production security validation.
+
+### Knowledge File Updates
+
+**Added**: 1 new pattern (Test Infrastructure Security)
+**Updated**: 0 patterns
+**Pruned**: 0 patterns
+
+Existing security knowledge was sufficient for this implementation. The new pattern fills a gap in documenting test infrastructure best practices that were implicitly followed but not explicitly documented.

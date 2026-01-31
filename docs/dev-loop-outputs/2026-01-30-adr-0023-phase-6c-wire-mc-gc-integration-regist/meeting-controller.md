@@ -205,3 +205,125 @@ All components wired together in main.rs:
 - MC Registration with GC - Updated retry duration from 5 retries to 20 retries with 5-minute deadline
 
 **Key Takeaway**: The watch channel for shutdown was a deviation from established CancellationToken pattern. Always check patterns.md before introducing alternative approaches - the existing pattern was designed for this exact use case and provides automatic parent-child propagation.
+
+---
+
+## Iteration 3 Fixes (PR #34 Findings)
+
+**Date**: 2026-01-31
+**Source**: PR #34 code review
+
+### Fixes Applied
+
+1. **MAJOR-001: Missing re-registration support**
+   - Added `McError::NotRegistered` variant
+   - Detect `Status::not_found` in heartbeats, map to `NotRegistered`
+   - Added `attempt_reregistration()` method to `GcClient`
+   - Integrated re-registration in unified GC task
+
+2. **MAJOR-002: Refactor to unified GC task**
+   - Removed `Arc<GcClient>` - task owns directly (no Arc needed)
+   - Fixed startup order: gRPC server BEFORE GC registration
+   - Never exits on GC issues - protects active meetings
+   - Single `run_gc_task()` with dual heartbeat loop
+
+3. **MINOR-003: Add ControllerMetrics::snapshot() helper**
+   - Added `ControllerMetricsSnapshot` struct
+   - Added `snapshot()` method for atomic reads
+   - Cleaner heartbeat code
+
+### Architectural Changes
+
+**Before**:
+- Two separate heartbeat tasks with `Arc<GcClient>`
+- Registration before gRPC server (race condition)
+- Exit on registration failure
+
+**After**:
+- Single unified GC task owns `GcClient` directly
+- gRPC server starts BEFORE registration
+- Never exits - retry forever, protect active meetings
+- Automatic re-registration on `NOT_FOUND`
+
+### Operational Model
+
+The new model provides production-grade resilience:
+- **Startup**: MC starts, gRPC ready, keeps trying to register (never exits)
+- **Network partition**: Serve existing meetings, keep trying to heartbeat
+- **GC restart**: Next heartbeat gets `NOT_FOUND` → automatic re-registration
+- **Never exit**: Protects active meetings during GC outages
+
+### Verification
+
+All 7 layers passed with 138 tests (125 unit + 9 integration + 4 heartbeat).
+
+---
+
+## Iteration 4 Fixes (Round 3 Test Coverage)
+
+**Date**: 2026-01-31
+**Source**: Round 3 code review
+
+### Test Coverage Gaps Fixed
+
+1. **CRITICAL-001: Re-registration flow untested**
+   - Added 4 integration tests for re-registration scenarios
+   - Enhanced MockGcServer with MockBehavior enum (Accept, Reject, NotFound, NotFoundThenAccept)
+   - Full coverage of NOT_FOUND detection and re-registration flow
+
+2. **MAJOR-001: NOT_FOUND detection untested**
+   - MockGcServer now supports returning NOT_FOUND status
+   - Both fast and comprehensive heartbeat detection tested
+
+3. **MAJOR-002: ControllerMetrics::snapshot() untested**
+   - Added unit test for snapshot() method
+   - Verifies atomic capture of both metrics
+
+4. **MINOR-001: McError::NotRegistered.client_message() untested**
+   - Enhanced existing test to cover NotRegistered
+   - Confirms no internal details leaked
+
+### Test Count
+
+- **Before**: 138 tests (125 unit + 9 integration + 4 heartbeat)
+- **After**: 143 tests (126 unit + 13 integration + 4 heartbeat)
+- **Added**: 5 new tests
+
+### Files Modified
+
+- `src/errors.rs` - Enhanced test
+- `src/actors/metrics.rs` - Added snapshot test
+- `tests/gc_integration.rs` - Added 4 re-registration tests, MockBehavior enum
+
+### Key Achievement
+
+Complete test coverage for the never-exit operational model introduced in Iteration 3. All critical paths (re-registration, NOT_FOUND detection, automatic recovery) are now verified.
+
+---
+
+## Final Reflection (4 Iterations Complete)
+
+**Knowledge Updated**: 2026-01-31
+
+**Patterns Added**:
+- MockBehavior Enum for Stateful Mock Servers - State machine for complex test scenarios
+- Unified Service Integration Task (Never-Exit Resilience) - Single task owns client, infinite retry, automatic re-registration
+- Atomic Metrics Snapshot for Consistent Reporting - snapshot() method for consistent multi-counter reads
+
+**Gotchas Added**:
+- Start gRPC Server BEFORE Client Registration - Prevents race conditions during startup
+
+**Integration Added**:
+- MC Re-registration After NOT_FOUND - Automatic recovery from GC restarts/network partitions
+
+**Key Learnings**:
+
+1. **Simplicity wins**: Iteration 3's refactor from two Arc-wrapped tasks to one owned-client task removed complexity and improved resilience. Always question if Arc is truly needed.
+
+2. **Never-exit > fail-fast for stateful services**: MC protects active meetings by never exiting on GC issues. The unified task with infinite retry provides production-grade resilience without manual intervention.
+
+3. **Comprehensive testing enables confidence**: The 4-iteration cycle (wire → fix issues → refactor → test coverage) ensured the never-exit model actually works. MockBehavior enum was key to testing state transitions.
+
+4. **Startup ordering matters**: gRPC server must start before registration to prevent race conditions. Document operational dependencies explicitly.
+
+5. **Test what you build**: Iteration 4 added 5 tests for features built in Iteration 3. Build and test together, not sequentially.

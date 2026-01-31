@@ -315,10 +315,25 @@ When implementing MC features that depend on Redis (session binding, fencing tok
 - **MockGcServer pattern**: 9 integration tests using configurable mock gRPC server (see `crates/meeting-controller/tests/gc_integration.rs`)
 - **Heartbeat task testing**: 4 tests using `#[tokio::test(start_paused = true)]` with `tokio::time::advance()` for deterministic interval testing
 
-Test count: 138 tests in meeting-controller (125 unit + 13 integration/heartbeat, up from 113 pre-Phase 6c round 2)
+**Phase 6c iteration 3-4 (Re-registration recovery)**:
+- **MockBehavior enum**: Added 4 states (Accept, Reject, NotFound, NotFoundThenAccept) for modeling GC response patterns
+- **Re-registration flow tests**: 2 tests covering recovery from lost GC state (attempt_reregistration success, full NOT_FOUND → re-register → heartbeat flow)
+- **NOT_FOUND detection tests**: 2 tests verifying both fast and comprehensive heartbeats detect NOT_FOUND and return McError::NotRegistered
+- **snapshot() method test**: Unit test for ControllerMetrics::snapshot() (caught gap where integration tests exercised method but didn't verify API)
+- **McError::NotRegistered client_message test**: Explicit verification that NotRegistered doesn't leak internal details
+
+Test count: **143 tests** in meeting-controller (126 unit + 13 integration + 4 heartbeat, up from 138 in round 2)
+
+Review learnings:
+- Round 1-2: Initial implementation with good unit test coverage but missing integration tests for MC-GC flow
+- Round 3: Identified 4 test gaps (CRITICAL/MAJOR/MINOR) after iteration 3 added re-registration code
+- Round 4: All gaps resolved via MockBehavior pattern + targeted unit tests
 
 Tech debt noted in Phase 6a (now completed in Phase 6b):
 - ~~TD-1: Integration tests for main binary~~ (completed: 64 actor tests)
 - ~~TD-2: MockRedis async interface~~ (completed: async traits implemented)
+
+Tech debt remaining (acceptable):
+- TECH_DEBT-003: `run_gc_task` and `handle_heartbeat_error` in main.rs not directly testable (acceptable - comprehensive component coverage exists)
 
 ---
