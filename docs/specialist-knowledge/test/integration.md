@@ -308,7 +308,7 @@ When implementing MC features that depend on Redis (session binding, fencing tok
 - gRPC retry/backoff: mixed success/failure sequences (not just all-succeed or all-fail)
 - Error code exhaustive testing: every McError variant mapped to protocol codes
 
-Test count: 115 tests in meeting-controller (up from 71 pre-Phase 6c)
+Test count: 113 tests in meeting-controller (up from 71 pre-Phase 6c)
 
 Tech debt noted in Phase 6a (now completed in Phase 6b):
 - ~~TD-1: Integration tests for main binary~~ (completed: 64 actor tests)

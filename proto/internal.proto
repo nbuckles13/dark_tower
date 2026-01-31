@@ -77,21 +77,6 @@ enum HealthStatus {
   DRAINING = 4;   // Graceful shutdown in progress
 }
 
-// Request to register a meeting controller with global controller (legacy)
-message RegisterMeetingController {
-  string controller_id = 1;
-  string region = 2;
-  string endpoint = 3;
-  ControllerCapacity capacity = 4;
-}
-
-// Heartbeat from meeting controller to global controller (legacy)
-message Heartbeat {
-  string controller_id = 1;
-  ControllerCapacity capacity = 2;
-  HealthStatus health = 3;
-}
-
 // MC registration request with both endpoints per ADR-0010
 message RegisterMCRequest {
   string id = 1;                      // Unique controller ID
@@ -125,26 +110,6 @@ message ComprehensiveHeartbeatRequest {
   float memory_usage_percent = 5;
 }
 
-// Meeting configuration
-message MeetingConfig {
-  string display_name = 1;
-  uint32 max_participants = 2;
-  bool enable_e2e_encryption = 3;
-  bool recording_enabled = 4;
-}
-
-// Request to assign a meeting to a controller
-message AssignMeeting {
-  string meeting_id = 1;
-  MeetingConfig config = 2;
-}
-
-// Response to meeting assignment
-message AssignMeetingResponse {
-  bool accepted = 1;
-  string reason = 2;  // If not accepted
-}
-
 // ============================================================================
 // Service Definitions
 // ============================================================================
@@ -167,9 +132,6 @@ message TelemetryAck {
 
 // Meeting controller service (Global Controller -> Meeting Controller)
 service MeetingControllerService {
-  rpc RegisterController(RegisterMeetingController) returns (RegistrationResponse);
-  rpc SendHeartbeat(Heartbeat) returns (HeartbeatResponse);
-  rpc Assign(AssignMeeting) returns (AssignMeetingResponse);
   // ADR-0010 Section 4a: GC notifies MC of meeting assignment with MH assignments
   rpc AssignMeetingWithMh(AssignMeetingWithMhRequest) returns (AssignMeetingWithMhResponse);
 }
@@ -199,11 +161,6 @@ service MediaHandlerRegistryService {
   rpc RegisterMH(RegisterMHRequest) returns (RegisterMHResponse);
   // Send a load report (heartbeat with capacity/health info)
   rpc SendLoadReport(MHLoadReportRequest) returns (MHLoadReportResponse);
-}
-
-message RegistrationResponse {
-  bool accepted = 1;
-  string controller_id = 2;
 }
 
 message HeartbeatResponse {

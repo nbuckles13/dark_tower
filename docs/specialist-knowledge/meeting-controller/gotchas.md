@@ -91,3 +91,11 @@ All config fields containing credentials or secrets must use `SecretString` from
 The `Bearer ` prefix in authorization headers is case-sensitive per RFC 6750. Use `strip_prefix("Bearer ")` not case-insensitive matching. Reject `bearer `, `BEARER `, etc. as invalid format. This is important for security - being permissive about case could lead to unexpected behavior if mixed with systems that ARE case-sensitive.
 
 ---
+
+## Gotcha: Connection Types Are Not Stateful Components
+**Added**: 2026-01-29
+**Related files**: `crates/meeting-controller/src/grpc/gc_client.rs`, `crates/meeting-controller/src/redis/client.rs`
+
+The project principle "NEVER use `Arc<Mutex<State>>`" applies to actor-owned state, NOT connection handles. Types like tonic `Channel` and redis-rs `MultiplexedConnection` are explicitly designed to be cloned and shared concurrently - they're connection handles, not stateful components. Do not wrap them in `Arc<RwLock>`. The principle prevents lock contention on hot-path actor state; connection types already handle internal synchronization.
+
+---
