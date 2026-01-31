@@ -12,19 +12,10 @@
 use crate::auth::claims::Claims;
 use crate::auth::jwks::{Jwk, JwksClient};
 use crate::errors::GcError;
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use common::jwt::{decode_ed25519_public_key_jwk, extract_kid, validate_iat};
 use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
 use std::sync::Arc;
 use tracing::instrument;
-
-/// Maximum allowed JWT size in bytes (8KB).
-///
-/// This limit prevents Denial-of-Service (DoS) attacks via oversized tokens.
-/// JWTs larger than this size are rejected BEFORE any parsing or cryptographic
-/// operations, providing defense-in-depth against resource exhaustion attacks.
-///
-/// Per OWASP API Security Top 10 - API4:2023 (Unrestricted Resource Consumption)
-const MAX_JWT_SIZE_BYTES: usize = 8192; // 8KB
 
 /// JWT validator using JWKS from Auth Controller.
 pub struct JwtValidator {
@@ -70,44 +61,21 @@ impl JwtValidator {
     /// message to prevent information leakage.
     #[instrument(skip_all)]
     pub async fn validate(&self, token: &str) -> Result<Claims, GcError> {
-        // 1. Check token size BEFORE any parsing (DoS prevention)
-        if token.len() > MAX_JWT_SIZE_BYTES {
-            tracing::debug!(
-                target: "gc.auth.jwt",
-                token_size = token.len(),
-                max_size = MAX_JWT_SIZE_BYTES,
-                "Token rejected: size exceeds maximum allowed"
-            );
-            return Err(GcError::InvalidToken(
-                "The access token is invalid or expired".to_string(),
-            ));
-        }
-
-        // 2. Extract kid from JWT header
-        let kid = extract_kid(token).ok_or_else(|| {
-            tracing::debug!(target: "gc.auth.jwt", "Token missing kid header");
+        // 1. Extract kid from JWT header (includes size check via common::jwt)
+        let kid = extract_kid(token).map_err(|e| {
+            tracing::debug!(target: "gc.auth.jwt", error = ?e, "Token kid extraction failed");
             GcError::InvalidToken("The access token is invalid or expired".to_string())
         })?;
 
-        // 3. Fetch public key from JWKS
+        // 2. Fetch public key from JWKS
         let jwk = self.jwks_client.get_key(&kid).await?;
 
-        // 4. Verify signature and extract claims
+        // 3. Verify signature and extract claims
         let claims = verify_token(token, &jwk)?;
 
-        // 5. Validate iat claim with clock skew tolerance
-        let now = chrono::Utc::now().timestamp();
-        let max_iat = now + self.clock_skew_seconds;
-
-        if claims.iat > max_iat {
-            tracing::debug!(
-                target: "gc.auth.jwt",
-                iat = claims.iat,
-                now = now,
-                max_allowed = max_iat,
-                clock_skew_seconds = self.clock_skew_seconds,
-                "Token rejected: iat too far in the future"
-            );
+        // 4. Validate iat claim with clock skew tolerance using common utility
+        if let Err(e) = validate_iat(claims.iat, self.clock_skew_seconds) {
+            tracing::debug!(target: "gc.auth.jwt", error = ?e, "Token iat validation failed");
             return Err(GcError::InvalidToken(
                 "The access token is invalid or expired".to_string(),
             ));
@@ -116,27 +84,6 @@ impl JwtValidator {
         tracing::debug!(target: "gc.auth.jwt", "Token validated successfully");
         Ok(claims)
     }
-}
-
-/// Extract the `kid` (key ID) from a JWT header without verifying the signature.
-///
-/// # Security Note
-///
-/// This function does NOT validate the token. It only extracts the `kid` claim
-/// for key lookup. The token MUST still be verified after fetching the key.
-fn extract_kid(token: &str) -> Option<String> {
-    // JWT format: header.payload.signature
-    let parts: Vec<&str> = token.split('.').collect();
-    if parts.len() != 3 {
-        return None;
-    }
-
-    // Decode the header (first part)
-    let header_bytes = URL_SAFE_NO_PAD.decode(parts.first()?).ok()?;
-    let header: serde_json::Value = serde_json::from_slice(&header_bytes).ok()?;
-
-    // Extract kid as string
-    header.get("kid")?.as_str().map(|s| s.to_string())
 }
 
 /// Verify JWT signature and extract claims.
@@ -165,8 +112,8 @@ fn verify_token(token: &str, jwk: &Jwk) -> Result<Claims, GcError> {
         GcError::InvalidToken("The access token is invalid or expired".to_string())
     })?;
 
-    // Decode public key from base64url
-    let public_key_bytes = URL_SAFE_NO_PAD.decode(public_key_b64).map_err(|e| {
+    // Decode public key from base64url using common utility
+    let public_key_bytes = decode_ed25519_public_key_jwk(public_key_b64).map_err(|e| {
         tracing::error!(target: "gc.auth.jwt", error = %e, "Invalid public key encoding");
         GcError::InvalidToken("The access token is invalid or expired".to_string())
     })?;
@@ -193,6 +140,8 @@ fn verify_token(token: &str, jwk: &Jwk) -> Result<Claims, GcError> {
 mod tests {
     use super::*;
     use crate::auth::jwks::Jwk;
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    use common::jwt::MAX_JWT_SIZE_BYTES;
 
     #[test]
     fn test_extract_kid_valid_token() {
@@ -202,7 +151,7 @@ mod tests {
         let token = format!("{}.payload.signature", header_b64);
 
         let kid = extract_kid(&token);
-        assert_eq!(kid, Some("test-key-01".to_string()));
+        assert_eq!(kid.unwrap(), "test-key-01".to_string());
     }
 
     #[test]
@@ -212,29 +161,29 @@ mod tests {
         let token = format!("{}.payload.signature", header_b64);
 
         let kid = extract_kid(&token);
-        assert!(kid.is_none());
+        assert!(kid.is_err());
     }
 
     #[test]
     fn test_extract_kid_malformed_token() {
         // Wrong number of parts
-        assert!(extract_kid("not.a.valid.jwt.format").is_none());
-        assert!(extract_kid("only.two").is_none());
-        assert!(extract_kid("single").is_none());
-        assert!(extract_kid("").is_none());
+        assert!(extract_kid("not.a.valid.jwt.format").is_err());
+        assert!(extract_kid("only.two").is_err());
+        assert!(extract_kid("single").is_err());
+        assert!(extract_kid("").is_err());
     }
 
     #[test]
     fn test_extract_kid_invalid_base64() {
         let token = "!!!invalid!!!.payload.signature";
-        assert!(extract_kid(token).is_none());
+        assert!(extract_kid(token).is_err());
     }
 
     #[test]
     fn test_extract_kid_invalid_json() {
         let header_b64 = URL_SAFE_NO_PAD.encode("not valid json".as_bytes());
         let token = format!("{}.payload.signature", header_b64);
-        assert!(extract_kid(&token).is_none());
+        assert!(extract_kid(&token).is_err());
     }
 
     #[test]
@@ -408,18 +357,18 @@ mod tests {
     fn test_extract_kid_with_empty_parts() {
         // Token with empty header part
         let token = ".payload.signature";
-        assert!(extract_kid(token).is_none());
+        assert!(extract_kid(token).is_err());
     }
 
     #[test]
     fn test_extract_kid_with_numeric_kid() {
-        // kid as number in JSON (should return None since we expect string)
+        // kid as number in JSON (should return Err since we expect string)
         let header = r#"{"alg":"EdDSA","typ":"JWT","kid":12345}"#;
         let header_b64 = URL_SAFE_NO_PAD.encode(header.as_bytes());
         let token = format!("{}.payload.signature", header_b64);
 
         let kid = extract_kid(&token);
-        assert!(kid.is_none());
+        assert!(kid.is_err());
     }
 
     #[test]
@@ -430,18 +379,18 @@ mod tests {
         let token = format!("{}.payload.signature", header_b64);
 
         let kid = extract_kid(&token);
-        assert!(kid.is_none());
+        assert!(kid.is_err());
     }
 
     #[test]
     fn test_extract_kid_with_empty_string_kid() {
-        // kid as empty string
+        // kid as empty string - rejected for defense-in-depth
         let header = r#"{"alg":"EdDSA","typ":"JWT","kid":""}"#;
         let header_b64 = URL_SAFE_NO_PAD.encode(header.as_bytes());
         let token = format!("{}.payload.signature", header_b64);
 
-        let kid = extract_kid(&token);
-        assert_eq!(kid, Some("".to_string()));
+        let result = extract_kid(&token);
+        assert!(result.is_err(), "Empty kid should be rejected");
     }
 
     #[test]
@@ -452,7 +401,7 @@ mod tests {
         let token = format!("{}.payload.signature", header_b64);
 
         let kid = extract_kid(&token);
-        assert_eq!(kid, Some("key-with-special_chars.123".to_string()));
+        assert_eq!(kid.unwrap(), "key-with-special_chars.123".to_string());
     }
 
     // =========================================================================

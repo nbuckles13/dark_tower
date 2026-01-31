@@ -15,11 +15,9 @@
 //! Full cryptographic validation will be added when MC JWKS integration is
 //! implemented in Phase 6h.
 
+use common::jwt::MAX_JWT_SIZE_BYTES;
 use tonic::{service::Interceptor, Request, Status};
 use tracing::instrument;
-
-/// Maximum token size in bytes (8KB) per security requirements.
-const MAX_TOKEN_SIZE: usize = 8192;
 
 /// gRPC authentication interceptor for MC service.
 ///
@@ -97,7 +95,7 @@ impl Interceptor for McAuthInterceptor {
         }
 
         // Check token size limit (8KB max per security requirements)
-        if token.len() > MAX_TOKEN_SIZE {
+        if token.len() > MAX_JWT_SIZE_BYTES {
             tracing::debug!(
                 target: "mc.grpc.auth",
                 token_size = token.len(),
@@ -257,7 +255,7 @@ mod tests {
     #[test]
     fn test_max_token_size_constant() {
         // Verify constant matches security requirements
-        assert_eq!(MAX_TOKEN_SIZE, 8192);
+        assert_eq!(MAX_JWT_SIZE_BYTES, 8192);
     }
 
     #[test]

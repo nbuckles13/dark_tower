@@ -108,3 +108,32 @@ These serve different purposes and are NOT duplication even if both involve the 
 **When reviewing**: If tests have identical setup patterns (>5 lines), recommend extracting to helper function. But don't recommend over-engineering (e.g., builder patterns for simple config).
 
 ---
+
+## Re-Export with Rename for Backwards Compatibility
+
+**Added**: 2026-01-31
+**Related files**: `crates/ac-service/src/config.rs`, `crates/common/src/jwt.rs`
+
+When extracting duplicated code to a common crate, use `pub use` with rename to maintain backwards compatibility in consuming crates:
+
+```rust
+// In common/src/jwt.rs (new canonical location)
+pub const DEFAULT_CLOCK_SKEW_SECONDS: i64 = 300;
+pub const MAX_CLOCK_SKEW_SECONDS: i64 = 600;
+
+// In ac-service/src/config.rs (backwards compat re-export)
+pub use common::jwt::{
+    DEFAULT_CLOCK_SKEW_SECONDS as DEFAULT_JWT_CLOCK_SKEW_SECONDS,
+    MAX_CLOCK_SKEW_SECONDS as MAX_JWT_CLOCK_SKEW_SECONDS,
+};
+```
+
+**Benefits**:
+1. Existing code using `ac_service::config::DEFAULT_JWT_CLOCK_SKEW_SECONDS` continues to work
+2. New code can use canonical `common::jwt::DEFAULT_CLOCK_SKEW_SECONDS`
+3. No breaking changes to public API
+4. Clear migration path - rename can be deprecated later
+
+**When to use**: Consolidating constants, types, or functions into common while maintaining API stability.
+
+---

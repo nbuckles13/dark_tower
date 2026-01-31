@@ -333,6 +333,29 @@ Test matrix for fencing Lua scripts:
 
 ---
 
+## Gotcha: Boundary Tests That Pass For Wrong Reasons
+**Added**: 2026-01-31
+**Related files**: `crates/common/src/jwt.rs`
+
+A boundary test can pass even when broken if the failure mode differs from what's asserted. Example: A JWT size limit test created a 2-part token (`header.payload`) instead of valid 3-part (`header.payload.signature`). The test asserted "not TokenTooLarge" and passed - but only because the token was rejected as `MalformedToken` before the size check.
+
+**Prevention pattern**:
+1. Assert the EXACT boundary value: `assert_eq!(token.len(), MAX_SIZE)`
+2. Assert SUCCESS, not just "not this specific error": `assert!(result.is_ok())`
+3. Verify the expected value was extracted: `assert_eq!(result.unwrap(), "expected")`
+
+```rust
+// BAD: Passes even when test is broken
+assert!(!matches!(result, Err(TokenTooLarge)));
+
+// GOOD: Verifies exact behavior
+assert_eq!(token.len(), MAX_JWT_SIZE_BYTES);
+assert!(result.is_ok());
+assert_eq!(result.unwrap(), "key");
+```
+
+---
+
 ## Gotcha: Database Error Paths Require sqlx Mocking (Often Deferred)
 **Added**: 2026-01-23
 **Related files**: `crates/global-controller/src/gc_assignment_cleanup.rs`
