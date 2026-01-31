@@ -1182,9 +1182,9 @@ topk(10, sum by (error_message) (rate({namespace="dark-tower",app="ac-service"} 
 - **ADR-0008:** Key Rotation Strategy
 - **ADR-0011:** Observability Framework
 - **ADR-0012:** Infrastructure Architecture
-- **Source Code:** `/home/nathan/code/dark_tower/crates/ac-service/`
-- **Kubernetes Manifests:** `/home/nathan/code/dark_tower/infra/services/ac-service/`
-- **Database Migrations:** `/home/nathan/code/dark_tower/migrations/`
+- **Source Code:** `crates/ac-service/`
+- **Kubernetes Manifests:** `infra/services/ac-service/`
+- **Database Migrations:** `migrations/`
 
 ---
 
