@@ -350,3 +350,52 @@ Common workarounds:
 Result: Error path tests for internal database functions often get **deferred** to tech debt. Document the gap explicitly (e.g., "Deferred: error path tests for run_cleanup() - requires sqlx mocking"). This prevents future reviewers from flagging the same gap without understanding why.
 
 ---
+
+## Gotcha: Integration Tests Can Miss Component Method Tests
+**Added**: 2026-01-31
+**Related files**: `crates/meeting-controller/tests/gc_integration.rs`, `crates/meeting-controller/src/actors/metrics.rs`
+
+Integration tests exercise full flows but may not cover individual helper methods directly. Example from Phase 6c:
+
+**What was tested**: Heartbeat integration tests verified metrics were reported to GC (values appeared in heartbeat requests)
+**What was missed**: The `ControllerMetrics::snapshot()` method itself had no unit test
+
+The gotcha: Integration tests confirmed snapshot() worked indirectly (heartbeats sent correct values), but the method's API wasn't explicitly tested. If snapshot() had a bug like swapping fields:
+```rust
+pub fn snapshot(&self) -> ControllerMetricsSnapshot {
+    ControllerMetricsSnapshot {
+        meetings: self.current_participants.load(...),      // BUG: wrong field!
+        participants: self.current_meetings.load(...),      // BUG: swapped!
+    }
+}
+```
+...integration tests might not catch it if both counts happened to be similar values.
+
+**Solution**: Add focused unit tests for helper methods even when integration tests exercise them:
+```rust
+#[test]
+fn test_controller_metrics_snapshot() {
+    let metrics = ControllerMetrics::new();
+    metrics.set_meetings(5);
+    metrics.set_participants(42);
+
+    let snapshot = metrics.snapshot();
+    assert_eq!(snapshot.meetings, 5);        // Explicit field verification
+    assert_eq!(snapshot.participants, 42);
+}
+```
+
+This caught in Round 3 review: snapshot() method used in production (main.rs lines 264, 274) but had zero direct tests. Integration tests proved it "worked" but didn't verify the method's contract.
+
+**When to add unit tests for methods covered by integration tests**:
+1. Method has complex logic (field mappings, calculations, conditionals)
+2. Method is public API used by multiple callers
+3. Method has edge cases that integration tests might not hit
+4. Failure would be subtle (swapped fields, off-by-one, wrong units)
+
+**When integration coverage is sufficient**:
+1. Method is simple delegation (e.g., `pub fn value(&self) -> T { self.inner.value() }`)
+2. Method is private and called by exactly one tested code path
+3. Failure would be obvious (type error, crash, clearly wrong result)
+
+---

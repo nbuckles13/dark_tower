@@ -127,3 +127,19 @@ GC code quality fixes established consistent error context patterns:
 The GC fix was cleaner than MC because GcError::Internal was already a String variant in most locations - only 3 additional updates needed in ac_client.rs.
 
 When reviewing future MC features (session management, participant coordination), ensure they follow these established patterns and reference ADR-0023 sections.
+
+**Phase 6c GC Integration Patterns (2026-01-31)**:
+Round 3 refactor (Iteration 3) established clean task ownership patterns:
+- Unified GC task owns gc_client directly (no Arc) - single consumer, no sharing needed
+- Never-exit resilience: registration loop retries forever, heartbeat errors trigger re-registration
+- NOT_FOUND detection returns McError::NotRegistered for heartbeat loop to handle
+- Single tokio::select! for dual heartbeat intervals (fast + comprehensive)
+- handle_heartbeat_error() encapsulates re-registration logic cleanly
+
+Round 4 (test infrastructure) established MockBehavior enum pattern:
+- Four variants: Accept, Reject, NotFound, NotFoundThenAccept
+- Stateful behavior via atomic counters (first call fails, subsequent succeed)
+- Backward-compatible helpers (accepting(), rejecting())
+- Enables comprehensive re-registration testing (NOT_FOUND -> attempt_reregistration -> subsequent heartbeats work)
+
+These patterns simplified code from Round 2 (removed Arc, unified tasks) and provided excellent test coverage.

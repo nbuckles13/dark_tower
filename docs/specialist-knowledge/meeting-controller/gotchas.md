@@ -115,3 +115,11 @@ The `sysinfo` crate API changed between versions. Version 0.30 uses `sys.global_
 When testing interval-based tasks with `tokio::time::advance()`, using `MissedTickBehavior::Skip` (production default) can cause flaky tests - advancing by 3 seconds doesn't guarantee 3 ticks because missed ticks are skipped. Use `MissedTickBehavior::Burst` in tests to ensure all ticks fire, making assertions predictable. Production code should still use Skip to avoid thundering-herd on wake.
 
 ---
+
+## Gotcha: Start gRPC Server BEFORE Client Registration
+**Added**: 2026-01-31
+**Related files**: `crates/meeting-controller/src/main.rs`
+
+When integrating services via gRPC, start your inbound gRPC server BEFORE attempting outbound registration with the peer service. If you register with GC before starting the MC's gRPC server, GC may immediately try to call MC (e.g., `AssignMeeting`) and fail because the server isn't ready yet. Correct order: (1) Redis/actors, (2) Start gRPC server, (3) Register with GC, (4) Spawn background tasks. This prevents race conditions during startup.
+
+---

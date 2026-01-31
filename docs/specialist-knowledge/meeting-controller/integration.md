@@ -155,3 +155,30 @@ When GC calls `AssignMeetingWithMh`, MC checks capacity before accepting:
 GC should retry with a different MC on any rejection except `DRAINING` (where GC should not retry to this MC until drain completes).
 
 ---
+
+## Integration: MC Re-registration After NOT_FOUND
+**Added**: 2026-01-31
+**Related files**: `crates/meeting-controller/src/main.rs`, `crates/meeting-controller/src/grpc/gc_client.rs`
+
+MC automatically re-registers if heartbeat returns `Status::not_found` (indicates GC doesn't recognize the MC):
+
+**Scenarios triggering NOT_FOUND**:
+1. GC restart/rolling update cleared its MC registry
+2. Network partition caused GC to remove MC as unresponsive
+3. GC database failover lost ephemeral MC registration data
+
+**MC Behavior**:
+1. Heartbeat (fast or comprehensive) receives NOT_FOUND status
+2. MC sets `is_registered = false` and returns `McError::NotRegistered`
+3. Unified GC task detects error and calls `attempt_reregistration()`
+4. Re-registration succeeds → heartbeats resume normally
+5. MC never exits - continues serving active meetings throughout
+
+**GC Considerations**:
+- GC must accept re-registration from previously registered MCs
+- GC should preserve meeting assignments in persistent storage
+- Return NOT_FOUND for heartbeats from unknown MCs to trigger re-registration
+
+This provides production-grade resilience: MC survives GC restarts without losing active meetings.
+
+---

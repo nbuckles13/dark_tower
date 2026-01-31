@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use meeting_controller::actors::{ActorMetrics, ControllerMetrics, MeetingControllerActorHandle};
 use meeting_controller::config::Config;
+use meeting_controller::errors::McError;
 use meeting_controller::grpc::GcClient;
 
 use common::secret::{SecretBox, SecretString};
@@ -19,7 +20,7 @@ use proto_gen::internal::global_controller_service_server::{
     GlobalControllerService, GlobalControllerServiceServer,
 };
 use proto_gen::internal::{
-    ComprehensiveHeartbeatRequest, FastHeartbeatRequest, HeartbeatResponse,
+    ComprehensiveHeartbeatRequest, FastHeartbeatRequest, HealthStatus, HeartbeatResponse,
     NotifyMeetingEndedRequest, NotifyMeetingEndedResponse, RegisterMcRequest, RegisterMcResponse,
 };
 use tokio::sync::mpsc;
@@ -31,10 +32,23 @@ use tonic::{Request, Response, Status};
 // Mock GC Server
 // ============================================================================
 
+/// Behavior mode for MockGcServer.
+#[derive(Debug, Clone, Copy)]
+enum MockBehavior {
+    /// Accept all requests normally.
+    Accept,
+    /// Reject registrations.
+    Reject,
+    /// Return NOT_FOUND for heartbeats (simulates MC not registered).
+    NotFound,
+    /// Return NOT_FOUND for first heartbeat, then accept (simulates re-registration).
+    NotFoundThenAccept,
+}
+
 /// Mock GC server for testing MC registration and heartbeats.
 struct MockGcServer {
-    /// Whether to accept registrations.
-    accept_registration: bool,
+    /// Behavior mode.
+    behavior: MockBehavior,
     /// Fast heartbeat interval to return (ms).
     fast_heartbeat_interval_ms: u64,
     /// Comprehensive heartbeat interval to return (ms).
@@ -54,9 +68,9 @@ struct MockGcServer {
 }
 
 impl MockGcServer {
-    fn accepting() -> Self {
+    fn new() -> Self {
         Self {
-            accept_registration: true,
+            behavior: MockBehavior::Accept,
             fast_heartbeat_interval_ms: 10_000,
             comprehensive_heartbeat_interval_ms: 30_000,
             registration_count: AtomicU32::new(0),
@@ -68,11 +82,19 @@ impl MockGcServer {
         }
     }
 
-    fn rejecting() -> Self {
+    fn new_with_behavior(behavior: MockBehavior) -> Self {
         Self {
-            accept_registration: false,
-            ..Self::accepting()
+            behavior,
+            ..Self::new()
         }
+    }
+
+    fn accepting() -> Self {
+        Self::new()
+    }
+
+    fn rejecting() -> Self {
+        Self::new_with_behavior(MockBehavior::Reject)
     }
 
     fn with_registration_channel(mut self, tx: mpsc::Sender<RegisterMcRequest>) -> Self {
@@ -113,20 +135,21 @@ impl GlobalControllerService for MockGcServer {
             let _ = tx.send(inner.clone()).await;
         }
 
-        if self.accept_registration {
-            Ok(Response::new(RegisterMcResponse {
-                accepted: true,
-                message: "Registration accepted".to_string(),
-                fast_heartbeat_interval_ms: self.fast_heartbeat_interval_ms,
-                comprehensive_heartbeat_interval_ms: self.comprehensive_heartbeat_interval_ms,
-            }))
-        } else {
-            Ok(Response::new(RegisterMcResponse {
+        match self.behavior {
+            MockBehavior::Accept | MockBehavior::NotFound | MockBehavior::NotFoundThenAccept => {
+                Ok(Response::new(RegisterMcResponse {
+                    accepted: true,
+                    message: "Registration accepted".to_string(),
+                    fast_heartbeat_interval_ms: self.fast_heartbeat_interval_ms,
+                    comprehensive_heartbeat_interval_ms: self.comprehensive_heartbeat_interval_ms,
+                }))
+            }
+            MockBehavior::Reject => Ok(Response::new(RegisterMcResponse {
                 accepted: false,
                 message: "Registration rejected by mock".to_string(),
                 fast_heartbeat_interval_ms: 0,
                 comprehensive_heartbeat_interval_ms: 0,
-            }))
+            })),
         }
     }
 
@@ -135,16 +158,33 @@ impl GlobalControllerService for MockGcServer {
         request: Request<FastHeartbeatRequest>,
     ) -> Result<Response<HeartbeatResponse>, Status> {
         let inner = request.into_inner();
-        self.fast_heartbeat_count.fetch_add(1, Ordering::SeqCst);
+        let count = self.fast_heartbeat_count.fetch_add(1, Ordering::SeqCst);
 
         if let Some(tx) = &self.fast_heartbeat_tx {
             let _ = tx.send(inner).await;
         }
 
-        Ok(Response::new(HeartbeatResponse {
-            acknowledged: true,
-            timestamp: chrono::Utc::now().timestamp() as u64,
-        }))
+        match self.behavior {
+            MockBehavior::NotFound => {
+                // Return NOT_FOUND status
+                Err(Status::not_found("MC not registered with GC"))
+            }
+            MockBehavior::NotFoundThenAccept => {
+                // First heartbeat returns NOT_FOUND, subsequent ones accept
+                if count == 0 {
+                    Err(Status::not_found("MC not registered with GC"))
+                } else {
+                    Ok(Response::new(HeartbeatResponse {
+                        acknowledged: true,
+                        timestamp: chrono::Utc::now().timestamp() as u64,
+                    }))
+                }
+            }
+            MockBehavior::Accept | MockBehavior::Reject => Ok(Response::new(HeartbeatResponse {
+                acknowledged: true,
+                timestamp: chrono::Utc::now().timestamp() as u64,
+            })),
+        }
     }
 
     async fn comprehensive_heartbeat(
@@ -152,17 +192,35 @@ impl GlobalControllerService for MockGcServer {
         request: Request<ComprehensiveHeartbeatRequest>,
     ) -> Result<Response<HeartbeatResponse>, Status> {
         let inner = request.into_inner();
-        self.comprehensive_heartbeat_count
+        let count = self
+            .comprehensive_heartbeat_count
             .fetch_add(1, Ordering::SeqCst);
 
         if let Some(tx) = &self.comprehensive_heartbeat_tx {
             let _ = tx.send(inner).await;
         }
 
-        Ok(Response::new(HeartbeatResponse {
-            acknowledged: true,
-            timestamp: chrono::Utc::now().timestamp() as u64,
-        }))
+        match self.behavior {
+            MockBehavior::NotFound => {
+                // Return NOT_FOUND status
+                Err(Status::not_found("MC not registered with GC"))
+            }
+            MockBehavior::NotFoundThenAccept => {
+                // First heartbeat returns NOT_FOUND, subsequent ones accept
+                if count == 0 {
+                    Err(Status::not_found("MC not registered with GC"))
+                } else {
+                    Ok(Response::new(HeartbeatResponse {
+                        acknowledged: true,
+                        timestamp: chrono::Utc::now().timestamp() as u64,
+                    }))
+                }
+            }
+            MockBehavior::Accept | MockBehavior::Reject => Ok(Response::new(HeartbeatResponse {
+                acknowledged: true,
+                timestamp: chrono::Utc::now().timestamp() as u64,
+            })),
+        }
     }
 
     async fn notify_meeting_ended(
@@ -479,4 +537,140 @@ async fn test_actor_handle_creation() {
 
     // Controller should be created without error
     // Actual operation tests are in unit tests
+}
+
+// ============================================================================
+// Re-registration Tests (Iteration 4)
+// ============================================================================
+
+#[tokio::test]
+async fn test_heartbeat_not_found_detection() {
+    // Test that heartbeat returns NotRegistered error when GC returns NOT_FOUND
+
+    // Create a mock GC that returns NOT_FOUND for heartbeats
+    let mock_gc = MockGcServer::new_with_behavior(MockBehavior::NotFound);
+    let (addr, cancel_token) = start_mock_gc_server(mock_gc).await;
+
+    let gc_url = format!("http://{addr}");
+    let config = test_config(&gc_url);
+
+    let gc_client = GcClient::new(gc_url, SecretString::from("test-token"), config)
+        .await
+        .unwrap();
+
+    // Mark as registered (bypass registration)
+    gc_client.register().await.unwrap();
+
+    // Fast heartbeat should detect NOT_FOUND and return NotRegistered error
+    let result = gc_client.fast_heartbeat(5, 10, HealthStatus::Healthy).await;
+
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert!(
+        matches!(err, McError::NotRegistered),
+        "Expected NotRegistered, got: {err:?}"
+    );
+
+    // After NOT_FOUND, is_registered should be false
+    assert!(!gc_client.is_registered());
+
+    cancel_token.cancel();
+}
+
+#[tokio::test]
+async fn test_comprehensive_heartbeat_not_found_detection() {
+    // Test that comprehensive heartbeat also detects NOT_FOUND
+
+    let mock_gc = MockGcServer::new_with_behavior(MockBehavior::NotFound);
+    let (addr, cancel_token) = start_mock_gc_server(mock_gc).await;
+
+    let gc_url = format!("http://{addr}");
+    let config = test_config(&gc_url);
+
+    let gc_client = GcClient::new(gc_url, SecretString::from("test-token"), config)
+        .await
+        .unwrap();
+
+    gc_client.register().await.unwrap();
+
+    // Comprehensive heartbeat should detect NOT_FOUND
+    let result = gc_client
+        .comprehensive_heartbeat(5, 10, HealthStatus::Healthy, 50.0, 75.0)
+        .await;
+
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert!(
+        matches!(err, McError::NotRegistered),
+        "Expected NotRegistered, got: {err:?}"
+    );
+
+    assert!(!gc_client.is_registered());
+
+    cancel_token.cancel();
+}
+
+#[tokio::test]
+async fn test_attempt_reregistration_success() {
+    // Test that attempt_reregistration works after NOT_FOUND
+
+    let mock_gc = MockGcServer::new();
+    let (addr, cancel_token) = start_mock_gc_server(mock_gc).await;
+
+    let gc_url = format!("http://{addr}");
+    let config = test_config(&gc_url);
+
+    let gc_client = GcClient::new(gc_url, SecretString::from("test-token"), config)
+        .await
+        .unwrap();
+
+    // Don't call register() initially - simulate MC that lost registration
+
+    // attempt_reregistration should succeed
+    let result = gc_client.attempt_reregistration().await;
+    assert!(result.is_ok(), "Re-registration should succeed");
+
+    // Should be marked as registered
+    assert!(gc_client.is_registered());
+
+    // Subsequent heartbeats should work
+    let result = gc_client.fast_heartbeat(5, 10, HealthStatus::Healthy).await;
+    assert!(result.is_ok());
+
+    cancel_token.cancel();
+}
+
+#[tokio::test]
+async fn test_attempt_reregistration_after_not_found() {
+    // Test the full flow: heartbeat gets NOT_FOUND, then re-registration
+
+    let mock_gc = MockGcServer::new_with_behavior(MockBehavior::NotFoundThenAccept);
+    let (addr, cancel_token) = start_mock_gc_server(mock_gc).await;
+
+    let gc_url = format!("http://{addr}");
+    let config = test_config(&gc_url);
+
+    let gc_client = GcClient::new(gc_url, SecretString::from("test-token"), config)
+        .await
+        .unwrap();
+
+    // Initial registration
+    gc_client.register().await.unwrap();
+    assert!(gc_client.is_registered());
+
+    // First heartbeat gets NOT_FOUND
+    let result = gc_client.fast_heartbeat(5, 10, HealthStatus::Healthy).await;
+    assert!(matches!(result.unwrap_err(), McError::NotRegistered));
+    assert!(!gc_client.is_registered());
+
+    // Re-registration should succeed (mock switches to Accept behavior)
+    let result = gc_client.attempt_reregistration().await;
+    assert!(result.is_ok());
+    assert!(gc_client.is_registered());
+
+    // Subsequent heartbeats should work
+    let result = gc_client.fast_heartbeat(5, 10, HealthStatus::Healthy).await;
+    assert!(result.is_ok());
+
+    cancel_token.cancel();
 }

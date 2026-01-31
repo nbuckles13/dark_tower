@@ -125,6 +125,22 @@ This differs from Security, Test, and Code Quality reviewers where ALL findings 
 
 ---
 
+## Refactors That Improve DRY
+
+**Added**: 2026-01-31
+**Related files**: ADR-0023 Phase 6c Iteration 3
+
+**Integration Point**: When reviewing implementation iterations, track whether refactors improve or worsen DRY. In Iteration 3:
+- **Removed Arc<GcClient> duplication**: Unified task now owns client directly
+- **Centralized re-registration logic**: `handle_heartbeat_error()` helper eliminates duplication in caller
+- **Single registration/heartbeat loop**: `run_gc_task()` consolidates what could have been separate tasks
+
+**Note in reviews**: Explicitly call out DRY improvements in checkpoint positive observations. This reinforces good refactoring patterns.
+
+**Tracking**: Compare rounds - if Round N has fewer TECH_DEBT items than Round N-1 (and no new blockers), the iteration improved DRY.
+
+---
+
 ## Principles Documentation Recommendations
 
 **Added**: 2026-01-29

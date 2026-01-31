@@ -40,3 +40,71 @@ These serve different purposes and are NOT duplication even if both involve the 
 **When reviewing**: If a new service uses `watch::channel` or similar for shutdown, recommend aligning with the CancellationToken pattern used by GC and MC.
 
 ---
+
+## MockBehavior Enum for Test Flexibility
+
+**Added**: 2026-01-31
+**Related files**: `crates/meeting-controller/tests/gc_integration.rs:36-46`
+
+**Pattern**: Use an enum to centralize mock server behavior configuration instead of creating separate mock implementations. The `MockBehavior` enum allows a single `MockGcServer` to simulate different scenarios:
+- `Accept` - Normal operation
+- `Reject` - Reject registrations
+- `NotFound` - Return NOT_FOUND for heartbeats
+- `NotFoundThenAccept` - First heartbeat fails, then succeeds (re-registration flow)
+
+**Benefits**:
+- Eliminates need for separate mock classes (`MockGcServerReject`, `MockGcServerNotFound`, etc.)
+- Tests specify exact behavior declaratively: `MockGcServer::new_with_behavior(MockBehavior::NotFound)`
+- Implementation uses pattern matching on the enum in `fast_heartbeat()` and `comprehensive_heartbeat()`
+- Easy to add new behaviors without creating new mock types
+
+**Alternative (anti-pattern)**: Creating separate mock structs for each scenario or using conditional flags scattered in tests.
+
+**When reviewing**: If a test suite creates multiple mock implementations of the same trait, recommend consolidating into a single mock with behavior enum.
+
+---
+
+## Unified Task Pattern for Concurrent Responsibilities
+
+**Added**: 2026-01-31
+**Related files**: `crates/meeting-controller/src/main.rs:199-300`
+
+**Pattern**: When a component has multiple related responsibilities (e.g., registration + dual heartbeats), use a unified task with `tokio::select!` instead of spawning separate tasks. The MC's `run_gc_task()` demonstrates:
+- Single task owns `GcClient` directly (no Arc needed)
+- Initial registration loop with cancellation
+- Dual heartbeat loop (fast + comprehensive) in single select with separate tickers
+- Never exits on transient errors (protects active meetings during GC outages)
+- Helper function (`handle_heartbeat_error`) centralizes error handling for both heartbeat types
+
+**Benefits**:
+- Reduces duplication (single registration/heartbeat logic)
+- Simplifies ownership (task owns client, no Arc)
+- Centralizes error handling (NOT_FOUND detection in one place)
+- Clear lifecycle (registration → heartbeat loop → shutdown)
+
+**When NOT to use**: If responsibilities are truly independent and don't share state/client.
+
+**When reviewing**: If you see multiple spawned tasks sharing Arc-wrapped clients and handling similar errors, suggest unifying into single task with select.
+
+---
+
+## Test Helper Functions for Setup Boilerplate
+
+**Added**: 2026-01-31
+**Related files**: `crates/meeting-controller/tests/gc_integration.rs:240-283`
+
+**Pattern**: Extract common test setup into helper functions to eliminate boilerplate:
+- `test_config(gc_url: &str) -> Config` - Creates test configuration with consistent defaults
+- `start_mock_gc_server(mock: MockGcServer) -> (SocketAddr, CancellationToken)` - Starts mock server, returns address and cleanup token
+
+**Benefits**:
+- Tests focus on behavior, not setup
+- Consistent configuration across tests
+- Easy to update defaults (change in one place)
+- Automatic cleanup via CancellationToken
+
+**When NOT to use**: For test fixtures requiring complex state or lifecycle management (consider `TestContext` struct with `Drop` impl instead).
+
+**When reviewing**: If tests have identical setup patterns (>5 lines), recommend extracting to helper function. But don't recommend over-engineering (e.g., builder patterns for simple config).
+
+---

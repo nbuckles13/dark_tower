@@ -24,6 +24,10 @@ pub enum McError {
     #[error("gRPC error: {0}")]
     Grpc(String),
 
+    /// MC is not registered with GC (heartbeat returned NOT_FOUND).
+    #[error("Not registered with GC")]
+    NotRegistered,
+
     /// Configuration error.
     #[error("Configuration error: {0}")]
     Config(String),
@@ -111,7 +115,8 @@ impl McError {
             | McError::Grpc(_)
             | McError::Config(_)
             | McError::Internal(_)
-            | McError::FencedOut(_) => {
+            | McError::FencedOut(_)
+            | McError::NotRegistered => {
                 6 // INTERNAL_ERROR
             }
             McError::SessionBinding(_) | McError::JwtValidation(_) => 2, // UNAUTHORIZED
@@ -129,9 +134,11 @@ impl McError {
     #[allow(dead_code)] // Used in Phase 6b+
     pub fn client_message(&self) -> String {
         match self {
-            McError::Redis(_) | McError::Grpc(_) | McError::Config(_) | McError::Internal(_) => {
-                "An internal error occurred".to_string()
-            }
+            McError::Redis(_)
+            | McError::Grpc(_)
+            | McError::Config(_)
+            | McError::Internal(_)
+            | McError::NotRegistered => "An internal error occurred".to_string(),
             McError::SessionBinding(e) => e.to_string(),
             McError::MeetingNotFound(_) => "Meeting not found".to_string(),
             McError::ParticipantNotFound(_) => "Participant not found".to_string(),
@@ -168,6 +175,7 @@ mod tests {
         assert_eq!(McError::Config("bad config".to_string()).error_code(), 6);
         assert_eq!(McError::Internal("test".to_string()).error_code(), 6);
         assert_eq!(McError::FencedOut("stale".to_string()).error_code(), 6);
+        assert_eq!(McError::NotRegistered.error_code(), 6);
 
         // Auth errors -> 2
         assert_eq!(
@@ -227,6 +235,13 @@ mod tests {
         let config_err = McError::Config("missing secret key".to_string());
         assert!(!config_err.client_message().contains("secret"));
         assert_eq!(config_err.client_message(), "An internal error occurred");
+
+        // NotRegistered should also hide internal details
+        let not_registered_err = McError::NotRegistered;
+        assert_eq!(
+            not_registered_err.client_message(),
+            "An internal error occurred"
+        );
     }
 
     #[test]

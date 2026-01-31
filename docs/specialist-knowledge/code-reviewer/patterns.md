@@ -420,3 +420,155 @@ When mapping errors, preserve the original error for debugging while maintaining
 This pattern balances debugging needs (detailed server-side logs) with security (generic client messages).
 
 ---
+
+## Pattern: Unified Task Ownership (No Arc for Single Consumer)
+**Added**: 2026-01-31
+**Related files**: `crates/meeting-controller/src/main.rs` (unified GC task)
+
+When a task is the sole owner of a resource, avoid wrapping it in Arc. Let the task own the value directly. This simplifies code, removes unnecessary reference counting overhead, and makes ownership clear:
+
+```rust
+// BEFORE (Round 2): Arc wrapper with no actual sharing
+let gc_client = Arc::new(GcClient::new(...).await?);
+let gc_client_clone = Arc::clone(&gc_client);
+tokio::spawn(async move {
+    run_heartbeat_task(gc_client_clone, ...).await;
+});
+
+// AFTER (Round 3): Direct ownership
+let gc_client = GcClient::new(...).await?;
+tokio::spawn(async move {
+    run_gc_task(gc_client, ...).await;  // Task owns gc_client
+});
+```
+
+**When to apply:**
+- Task is the only user of the resource (no sharing needed)
+- Resource is already cheaply cloneable (tonic Channel) for internal use
+- Refactoring opportunity: multiple separate tasks → single unified task
+
+**Benefits:**
+- Clearer ownership semantics (move vs Arc::clone)
+- Reduced cognitive load (no Arc in type signatures)
+- Eliminates unnecessary atomic reference counting
+- Enables better borrow checker reasoning
+
+**Related refactor:** Iteration 3 unified separate registration/heartbeat tasks into single task that owns gc_client.
+
+---
+
+## Pattern: Never-Exit Resilience for Critical Background Tasks
+**Added**: 2026-01-31
+**Related files**: `crates/meeting-controller/src/main.rs` (GC task)
+
+Background tasks managing critical infrastructure (GC registration, health monitoring) should never exit on transient failures. Exiting leaves the service in a degraded state with no recovery path. Instead, log and retry indefinitely:
+
+```rust
+// Initial registration - retry forever until success or shutdown
+loop {
+    tokio::select! {
+        () = cancel_token.cancelled() => {
+            info!("GC task: Cancelled before registration completed");
+            return;
+        }
+        result = gc_client.register() => {
+            match result {
+                Ok(()) => {
+                    info!("GC task: Initial registration successful");
+                    break; // Proceed to heartbeat loop
+                }
+                Err(e) => {
+                    // Log but never exit - keep retrying
+                    warn!(error = %e, "GC task: Initial registration failed, will retry");
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
+            }
+        }
+    }
+}
+
+// Heartbeat loop - handle errors, re-register if needed
+loop {
+    tokio::select! {
+        () = cancel_token.cancelled() => { break; }
+        _ = ticker.tick() => {
+            if let Err(e) = send_heartbeat().await {
+                handle_heartbeat_error(&gc_client, e).await;  // Never exits
+            }
+        }
+    }
+}
+```
+
+**Key properties:**
+- Only exit on explicit cancellation signal
+- Log failures at warn level (not error - these are transient)
+- Re-registration on NOT_FOUND (GC restart recovery)
+- Fixed delay between retries (prevent tight loop)
+- Protect active meetings/sessions during GC outages
+
+**Why this matters:** If the GC task exits on failure, active meetings lose heartbeat updates and may be fenced out incorrectly. Never-exit design keeps meetings alive during transient GC unavailability.
+
+---
+
+## Pattern: MockBehavior Enum for Test Configuration
+**Added**: 2026-01-31
+**Related files**: `crates/meeting-controller/tests/gc_integration.rs`
+
+For mock servers that need to simulate different behaviors (success, failure, retry scenarios), use a `MockBehavior` enum to configure behavior centrally. This is cleaner than boolean flags or multiple mock implementations:
+
+```rust
+#[derive(Debug, Clone, Copy)]
+enum MockBehavior {
+    /// Accept all requests normally.
+    Accept,
+    /// Reject registrations.
+    Reject,
+    /// Return NOT_FOUND for heartbeats (simulates MC not registered).
+    NotFound,
+    /// Return NOT_FOUND for first heartbeat, then accept (simulates re-registration).
+    NotFoundThenAccept,
+}
+
+struct MockGcServer {
+    behavior: MockBehavior,
+    // ... counters, channels, etc.
+}
+
+impl MockGcServer {
+    fn new_with_behavior(behavior: MockBehavior) -> Self { ... }
+    fn accepting() -> Self { Self::new_with_behavior(MockBehavior::Accept) }
+    fn rejecting() -> Self { Self::new_with_behavior(MockBehavior::Reject) }
+}
+
+#[tonic::async_trait]
+impl GlobalControllerService for MockGcServer {
+    async fn fast_heartbeat(&self, ...) -> Result<...> {
+        match self.behavior {
+            MockBehavior::NotFound => Err(Status::not_found("MC not registered")),
+            MockBehavior::NotFoundThenAccept => {
+                if self.count.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Err(Status::not_found("MC not registered"))
+                } else {
+                    Ok(Response::new(...))
+                }
+            }
+            MockBehavior::Accept | MockBehavior::Reject => Ok(Response::new(...)),
+        }
+    }
+}
+```
+
+**Benefits:**
+- Single configuration point (constructor)
+- Semantic variant names describe test scenarios
+- Enables stateful behaviors (NotFoundThenAccept)
+- Backward compatible (accepting()/rejecting() helpers)
+- Clear in test code: `MockGcServer::new_with_behavior(MockBehavior::NotFound)`
+
+**When to apply:**
+- Mock needs 3+ distinct behaviors
+- Tests require stateful behavior (first call fails, subsequent succeed)
+- Behavior affects multiple RPC methods consistently
+
+---

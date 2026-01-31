@@ -150,3 +150,27 @@ When storing non-Clone types (like `ring::hkdf::Prk`) in `SecretBox<T>`, the sta
 For testing gRPC client code, create a mock server implementing the service trait. Pattern: (1) Bind `TcpListener::bind("127.0.0.1:0")` to get a random port, (2) Wrap listener with `tokio_stream::wrappers::TcpListenerStream`, (3) Use `Server::builder().add_service(...).serve_with_incoming_shutdown(incoming, token)`, (4) Spawn in background task, (5) Create client pointing to `listener.local_addr()`. Use channels (`mpsc`, `AtomicU32`) to track calls and verify behavior. Add `tokio-stream` as dev-dependency.
 
 ---
+
+## Pattern: MockBehavior Enum for Stateful Mock Servers
+**Added**: 2026-01-31
+**Related files**: `crates/meeting-controller/tests/gc_integration.rs`
+
+For testing complex interaction flows (like re-registration), use a behavior enum to control mock responses. Define states like `Accept`, `Reject`, `NotFound`, `NotFoundThenAccept`. Use atomic counters to track call count and switch behavior based on state + count. Example: `NotFoundThenAccept` returns NOT_FOUND on first heartbeat, then accepts subsequent ones - perfect for testing recovery flows. This avoids separate mocks for each test scenario and enables testing state transitions.
+
+---
+
+## Pattern: Unified Service Integration Task (Never-Exit Resilience)
+**Added**: 2026-01-31
+**Related files**: `crates/meeting-controller/src/main.rs`, `crates/meeting-controller/src/grpc/gc_client.rs`
+
+For critical service dependencies (like MC→GC), create a single unified task that owns the client directly (no Arc). Pattern: (1) Initial registration with infinite retry loop (never exits), (2) Dual operations in single `tokio::select!` (e.g., fast/comprehensive heartbeats), (3) Detect NOT_FOUND errors and re-register automatically, (4) Never exit on connectivity issues - protects active state. This provides production-grade resilience: service survives dependency restarts, network partitions, and rolling updates without manual intervention.
+
+---
+
+## Pattern: Atomic Metrics Snapshot for Consistent Reporting
+**Added**: 2026-01-31
+**Related files**: `crates/meeting-controller/src/actors/metrics.rs`
+
+For reporting multiple related metrics atomically, provide a `snapshot()` method that returns a struct with all values read in sequence. While individual atomics with `SeqCst` ordering are consistent, reading multiple atomics separately can see inconsistent intermediate states during concurrent updates. A snapshot struct (with `meetings` and `participants`) ensures both counters are read together, providing cleaner API and consistent reporting in heartbeats or logs.
+
+---
