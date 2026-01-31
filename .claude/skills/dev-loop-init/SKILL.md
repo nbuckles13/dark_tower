@@ -1,7 +1,6 @@
 ---
 name: dev-loop-init
 description: Initialize a new dev-loop with output directory and matched principles. First step when starting implementation work.
-disable-model-invocation: true
 ---
 
 # Dev-Loop Initialize

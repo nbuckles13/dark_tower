@@ -1,7 +1,7 @@
 # AC Service Metrics Catalog
 
 **Service**: Authentication Controller (ac-service)
-**Implementation**: `/home/nathan/code/dark_tower/crates/ac-service/src/observability/metrics.rs`
+**Implementation**: `crates/ac-service/src/observability/metrics.rs`
 **Job Label**: `ac-service-local` (local development), `ac-service` (production)
 
 All AC service metrics follow ADR-0011 naming conventions with the `ac_` prefix.
@@ -208,7 +208,7 @@ sum(rate(ac_jwks_requests_total{job="ac-service-local"}[5m]))
 
 ## Dashboard Panels
 
-The AC service Grafana dashboard (`/home/nathan/code/dark_tower/infra/grafana/dashboards/ac-service.json`) includes:
+The AC service Grafana dashboard (`infra/grafana/dashboards/ac-service.json`) includes:
 
 1. **Request Rate**: Combined token issuance + JWKS requests
 2. **Error Rate**: Errors / Total requests
@@ -259,6 +259,6 @@ All AC service metrics follow strict cardinality bounds per ADR-0011:
 ## References
 
 - **ADR-0011**: Observability standards and metric naming conventions
-- **Implementation**: `/home/nathan/code/dark_tower/crates/ac-service/src/observability/metrics.rs`
-- **Dashboard**: `/home/nathan/code/dark_tower/infra/grafana/dashboards/ac-service.json`
+- **Implementation**: `crates/ac-service/src/observability/metrics.rs`
+- **Dashboard**: `infra/grafana/dashboards/ac-service.json`
 - **PRR-0001**: Post-release review identifying dashboard metric name mismatches

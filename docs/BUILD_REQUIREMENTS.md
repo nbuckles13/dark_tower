@@ -286,7 +286,7 @@ sudo dnf groupinstall "Development Tools"
 error: failed to run custom build command for `proto-gen v0.1.0`
 
 Caused by:
-  process didn't exit successfully: `/home/nathan/code/dark_tower/target/debug/build/proto-gen-xxx/build-script-build`
+  process didn't exit successfully: `<project>/target/debug/build/proto-gen-xxx/build-script-build`
 --- stderr
 Error: Custom { kind: NotFound, error: "protoc failed: No such file or directory (os error 2)" }
 ```
@@ -340,13 +340,13 @@ brew install pkg-config
 **Solution**:
 ```bash
 # Ensure project is in WSL2 home directory
-cd /home/nathan/code/dark_tower  # ✓ Correct
+cd <project>  # ✓ Correct (e.g., /home/user/code/dark_tower)
 
 # NOT on Windows mount
-# /mnt/c/Users/nathan/code/dark_tower  # ✗ Slow
+# /mnt/c/Users/.../dark_tower  # ✗ Slow
 ```
 
-**Current project location**: `/home/nathan/code/dark_tower` ✓ Correct
+**Verify your project location** is in WSL2's native filesystem (not `/mnt/c/...`)
 
 **Optional optimizations**:
 ```bash
