@@ -27,9 +27,7 @@ use crate::errors::McError;
 use crate::redis::FencedRedisClient;
 use proto_gen::internal::meeting_controller_service_server::MeetingControllerService;
 use proto_gen::internal::{
-    AssignMeeting, AssignMeetingResponse, AssignMeetingWithMhRequest, AssignMeetingWithMhResponse,
-    Heartbeat, HeartbeatResponse, MhAssignment, RegisterMeetingController, RegistrationResponse,
-    RejectionReason,
+    AssignMeetingWithMhRequest, AssignMeetingWithMhResponse, MhAssignment, RejectionReason,
 };
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
@@ -184,63 +182,6 @@ impl McAssignmentService {
 
 #[tonic::async_trait]
 impl MeetingControllerService for McAssignmentService {
-    /// Handle legacy controller registration (deprecated).
-    #[instrument(skip(self, request), fields(mc_id = %self.mc_id))]
-    async fn register_controller(
-        &self,
-        request: Request<RegisterMeetingController>,
-    ) -> Result<Response<RegistrationResponse>, Status> {
-        let inner = request.into_inner();
-        warn!(
-            target: "mc.grpc.mc_service",
-            controller_id = %inner.controller_id,
-            "Legacy RegisterController called - this is deprecated"
-        );
-
-        Ok(Response::new(RegistrationResponse {
-            accepted: false,
-            controller_id: inner.controller_id,
-        }))
-    }
-
-    /// Handle legacy heartbeat (deprecated).
-    #[instrument(skip(self, request), fields(mc_id = %self.mc_id))]
-    async fn send_heartbeat(
-        &self,
-        request: Request<Heartbeat>,
-    ) -> Result<Response<HeartbeatResponse>, Status> {
-        let inner = request.into_inner();
-        debug!(
-            target: "mc.grpc.mc_service",
-            controller_id = %inner.controller_id,
-            "Legacy SendHeartbeat called - this is deprecated"
-        );
-
-        Ok(Response::new(HeartbeatResponse {
-            acknowledged: true,
-            timestamp: chrono::Utc::now().timestamp() as u64,
-        }))
-    }
-
-    /// Handle legacy meeting assignment (deprecated).
-    #[instrument(skip(self, request), fields(mc_id = %self.mc_id))]
-    async fn assign(
-        &self,
-        request: Request<AssignMeeting>,
-    ) -> Result<Response<AssignMeetingResponse>, Status> {
-        let inner = request.into_inner();
-        warn!(
-            target: "mc.grpc.mc_service",
-            meeting_id = %inner.meeting_id,
-            "Legacy Assign called - use AssignMeetingWithMh instead"
-        );
-
-        Ok(Response::new(AssignMeetingResponse {
-            accepted: false,
-            reason: "Use AssignMeetingWithMh API".to_string(),
-        }))
-    }
-
     /// Handle meeting assignment with MH assignments (ADR-0010 Section 4a).
     ///
     /// This is the primary assignment endpoint. GC calls this BEFORE writing

@@ -111,11 +111,19 @@ For capacity-based accept/reject decisions in gRPC handlers, use atomic types (`
 
 ---
 
-## Pattern: gRPC Client with Channel Caching and Exponential Backoff
-**Added**: 2026-01-25
+## Pattern: Cheaply Cloneable Connection Types (Channel, MultiplexedConnection)
+**Added**: 2026-01-29
+**Related files**: `crates/meeting-controller/src/grpc/gc_client.rs`, `crates/meeting-controller/src/redis/client.rs`
+
+Both tonic `Channel` and redis-rs `MultiplexedConnection` are designed to be cheaply cloneable and used concurrently without external locking. Do NOT wrap them in `Arc<Mutex>` or `Arc<RwLock>`. Instead, store directly and clone for each request. For `GcClient`, create the channel eagerly at startup (fail fast) and make the constructor async/fallible. For `FencedRedisClient`, derive `Clone` on the struct so actors can own their own copy. These types handle reconnection internally.
+
+---
+
+## Pattern: Eager vs Lazy Connection Initialization
+**Added**: 2026-01-29
 **Related files**: `crates/meeting-controller/src/grpc/gc_client.rs`
 
-For inter-service gRPC communication, cache the `tonic::Channel` in `Arc<RwLock<Option<Channel>>>` and reuse across calls. On connection failure, clear the cache via `clear_channel()` to force reconnection. For registration/startup, implement exponential backoff: start at 1s base delay, double on each retry (capped at 30s max), with maximum retry count. Store heartbeat intervals from the registration response in `AtomicU64` for runtime adjustment.
+For critical infrastructure connections (like MC→GC), prefer eager initialization: create the connection at startup and fail fast if unreachable. This reveals configuration issues immediately and simplifies code (no `Option<T>` or lazy init logic). The constructor becomes `async fn new(...) -> Result<Self, Error>`. For non-critical connections where startup shouldn't block, lazy init may still be appropriate.
 
 ---
 

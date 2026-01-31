@@ -58,11 +58,11 @@ MC's SessionActor uses an ActorMetrics struct to track actor lifecycle metrics (
 
 ---
 
-### TD-7: gRPC Client Channel Caching Pattern
-**Added**: 2026-01-26
+### TD-7: gRPC Client Channel Pattern
+**Added**: 2026-01-26 | **Updated**: 2026-01-30
 **Related files**: `crates/meeting-controller/src/grpc/gc_client.rs`, `crates/global-controller/src/services/mc_client.rs`
 
-Both MC and GC implement gRPC clients with channel caching and auth header injection. Pattern includes: `get_channel()` with RwLock-protected cache, `add_auth()` helper for Bearer token, configurable timeouts. Severity: Low (implementations differ in cache strategy - single vs pool). Improvement path: Consider `common::grpc::AuthenticatedClient<C>` trait when third gRPC client appears (MH). Timeline: Phase 7+ (when MH implementation begins). Note: Current duplication acceptable - implementations differ (single-channel vs multi-channel pool) and extraction cost exceeds benefit for 2 implementations.
+Both MC and GC implement gRPC clients with channel management and auth header injection. Pattern includes: `add_auth()` helper for Bearer token, configurable timeouts, channel clone for concurrent use. Severity: Low (implementations differ in strategy). MC uses direct `Channel` (eager init, single endpoint), GC uses `HashMap<String, Channel>` pool (multiple MC endpoints). Improvement path: Consider `common::grpc::AuthenticatedClient<C>` trait when third gRPC client appears (MH). Timeline: Phase 7+ (when MH implementation begins). Note: Current duplication acceptable - different strategies are appropriate for their use cases and extraction cost exceeds benefit for 2 implementations.
 
 ---
 

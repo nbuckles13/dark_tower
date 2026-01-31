@@ -100,9 +100,10 @@ MC Phase 6a/6b establishes the foundation for WebTransport signaling. Key patter
 - Session binding tokens use HKDF + HMAC-SHA256 per ADR-0023 Section 1
 
 **GC Integration (Phase 6c)**:
+- GcClient uses tonic Channel directly (cheap clone, no locking needed) - see `gc_client.rs` module docs
+- FencedRedisClient is Clone - uses MultiplexedConnection directly (cheap clone pattern)
 - Error variants must match communication protocol (McError::Grpc for gRPC calls, not McError::Redis)
-- Service methods that call GC should have doc comments explaining the interaction pattern
-- Estimation constants (e.g., participants per meeting) need doc comments explaining derivation
+- Estimation constants (e.g., ESTIMATED_PARTICIPANTS_PER_MEETING in mc_service.rs) need doc comments explaining derivation
 - Code prepared for Phase 6d uses `#[allow(dead_code)]` with phase reference comment
 
 When reviewing future MC features (session management, participant coordination), ensure they follow these established patterns and reference ADR-0023 sections.

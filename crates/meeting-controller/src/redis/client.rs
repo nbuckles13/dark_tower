@@ -8,6 +8,12 @@
 //! - `meeting:{id}:mh` - MH assignment data (JSON)
 //! - `meeting:{id}:state` - Meeting metadata (HASH)
 //!
+//! # Connection Pattern
+//!
+//! The redis-rs `MultiplexedConnection` is designed to be cloned cheaply and used
+//! concurrently. From the docs: "cheap to clone and can be used safely concurrently".
+//! No locking is needed - just clone the connection for each operation.
+//!
 //! # Usage
 //!
 //! ```rust,ignore
@@ -47,12 +53,17 @@ pub struct MhAssignmentData {
 /// Fenced Redis client for Meeting Controller.
 ///
 /// All write operations use fencing tokens to prevent split-brain.
+///
+/// This struct is cheaply cloneable - the underlying `MultiplexedConnection`
+/// is designed to be shared across tasks. Each actor should clone this client
+/// rather than sharing via `Arc<Mutex>`.
+#[derive(Clone)]
 pub struct FencedRedisClient {
-    /// Redis client (kept for reconnection).
+    /// Redis client (kept for potential reconnection scenarios).
     #[allow(dead_code)]
     client: Client,
-    /// Multiplexed connection (thread-safe).
-    connection: Arc<RwLock<MultiplexedConnection>>,
+    /// Multiplexed connection (cheaply cloneable, designed for concurrent use).
+    connection: MultiplexedConnection,
     /// Local generation cache per meeting (optimization).
     /// Format: meeting_id -> generation
     ///
@@ -78,6 +89,11 @@ impl FencedRedisClient {
     /// # Errors
     ///
     /// Returns `McError::Redis` if connection fails.
+    ///
+    /// # Note
+    ///
+    /// The returned client is cheaply cloneable. The underlying `MultiplexedConnection`
+    /// is designed for concurrent use without locking.
     pub async fn new(redis_url: &str) -> Result<Self, McError> {
         let client = Client::open(redis_url).map_err(|e| {
             // Note: Do NOT log redis_url as it may contain credentials
@@ -104,7 +120,7 @@ impl FencedRedisClient {
 
         Ok(Self {
             client,
-            connection: Arc::new(RwLock::new(connection)),
+            connection,
             local_generation: Arc::new(RwLock::new(std::collections::HashMap::new())),
             fenced_write_script: Script::new(lua_scripts::FENCED_WRITE),
             fenced_hset_script: Script::new(lua_scripts::FENCED_HSET),
@@ -113,45 +129,13 @@ impl FencedRedisClient {
         })
     }
 
-    /// Get a connection, reconnecting if necessary.
-    async fn get_connection(&self) -> Result<MultiplexedConnection, McError> {
-        let conn = self.connection.read().await;
-        Ok(conn.clone())
-    }
-
-    /// Ensure we're still connected, reconnect if not.
-    #[allow(dead_code)]
-    async fn ensure_connected(&self) -> Result<(), McError> {
-        let mut conn = self.connection.write().await;
-
-        // Try a simple PING to check connection
-        let result: Result<String, _> = redis::cmd("PING").query_async(&mut *conn).await;
-
-        if result.is_err() {
-            // Reconnect
-            *conn = self
-                .client
-                .get_multiplexed_async_connection()
-                .await
-                .map_err(|e| {
-                    error!(
-                        target: "mc.redis.client",
-                        error = %e,
-                        "Failed to reconnect to Redis"
-                    );
-                    McError::Redis(format!("Failed to reconnect to Redis: {e}"))
-                })?;
-        }
-
-        Ok(())
-    }
-
     /// Get the current generation for a meeting.
     ///
     /// Returns 0 if no generation exists (new meeting).
     #[instrument(skip(self), fields(meeting_id = %meeting_id))]
     pub async fn get_generation(&self, meeting_id: &str) -> Result<u64, McError> {
-        let mut conn = self.get_connection().await?;
+        // Clone the connection (cheap operation) for this request
+        let mut conn = self.connection.clone();
         let key = format!("meeting:{meeting_id}:generation");
 
         let result: Option<String> = conn.get(&key).await.map_err(|e| {
@@ -170,7 +154,8 @@ impl FencedRedisClient {
     /// Increment the generation for a meeting and return new value.
     #[instrument(skip(self), fields(meeting_id = %meeting_id))]
     pub async fn increment_generation(&self, meeting_id: &str) -> Result<u64, McError> {
-        let mut conn = self.get_connection().await?;
+        // Clone the connection (cheap operation) for this request
+        let mut conn = self.connection.clone();
         let key = format!("meeting:{meeting_id}:generation");
 
         let new_gen: i64 = self
@@ -258,7 +243,8 @@ impl FencedRedisClient {
             McError::Internal
         })?;
 
-        let mut conn = self.get_connection().await?;
+        // Clone the connection (cheap operation) for this request
+        let mut conn = self.connection.clone();
         let gen_key = format!("meeting:{meeting_id}:generation");
         let data_key = format!("meeting:{meeting_id}:mh");
 
@@ -319,7 +305,7 @@ impl FencedRedisClient {
         &self,
         meeting_id: &str,
     ) -> Result<Option<MhAssignmentData>, McError> {
-        let mut conn = self.get_connection().await?;
+        let mut conn = self.connection.clone();
         let key = format!("meeting:{meeting_id}:mh");
 
         let result: Option<String> = conn.get(&key).await.map_err(|e| {
@@ -355,7 +341,7 @@ impl FencedRedisClient {
         // Get current generation
         let generation = self.get_generation(meeting_id).await?;
 
-        let mut conn = self.get_connection().await?;
+        let mut conn = self.connection.clone();
         let gen_key = format!("meeting:{meeting_id}:generation");
         let data_key = format!("meeting:{meeting_id}:mh");
 
@@ -408,7 +394,7 @@ impl FencedRedisClient {
         generation: u64,
         fields: &[(&str, &str)],
     ) -> Result<(), McError> {
-        let mut conn = self.get_connection().await?;
+        let mut conn = self.connection.clone();
         let gen_key = format!("meeting:{meeting_id}:generation");
         let state_key = format!("meeting:{meeting_id}:state");
 
@@ -504,7 +490,7 @@ impl FencedRedisClient {
     /// Delete all meeting data (cleanup on meeting end).
     #[instrument(skip(self), fields(meeting_id = %meeting_id))]
     pub async fn delete_meeting(&self, meeting_id: &str) -> Result<(), McError> {
-        let mut conn = self.get_connection().await?;
+        let mut conn = self.connection.clone();
 
         // Delete all meeting keys
         let keys = vec![

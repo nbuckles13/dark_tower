@@ -15,7 +15,7 @@ If security parameters are only validated at config parse time, bugs or programm
 ## Gotcha: Magic Numbers Without Constants
 **Added**: 2026-01-11
 **Updated**: 2026-01-27 (expanded scope)
-**Related files**: `crates/ac-service/src/config.rs`, `crates/meeting-controller/src/services/gc_integration.rs`
+**Related files**: `crates/ac-service/src/config.rs`, `crates/meeting-controller/src/grpc/mc_service.rs`
 
 Numeric values that represent domain-specific meanings (security parameters, estimation factors, capacity limits) should be defined as named constants with doc comments explaining their derivation. This applies beyond security-critical values:
 
@@ -223,7 +223,7 @@ While `std::sync::Mutex` may work in simple test scenarios, it can cause subtle 
 
 ## Gotcha: Wrong Error Variant for Communication Type
 **Added**: 2026-01-27
-**Related files**: `crates/meeting-controller/src/services/gc_integration.rs`
+**Related files**: `crates/meeting-controller/src/grpc/gc_client.rs`
 
 When a service communicates with external systems via different protocols (Redis, gRPC, HTTP), use semantically correct error variants. Using the wrong variant (e.g., `McError::Redis` for a gRPC call) confuses debugging and breaks error handling logic that branches on variant:
 

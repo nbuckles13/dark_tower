@@ -8,9 +8,15 @@
 //! # Security
 //!
 //! - Service tokens authenticate MC to GC
-//! - Connection reuse via channel caching
-//! - Automatic reconnection on failure
+//! - Channel is cheaply cloneable (backed by tower_buffer::Buffer with mpsc)
+//! - tonic handles reconnection internally
 //! - Exponential backoff for retries
+//!
+//! # Connection Pattern
+//!
+//! The tonic `Channel` is designed to be cloned cheaply and used concurrently.
+//! From the docs: "Channel provides a Clone implementation that is cheap".
+//! No locking is needed - just clone the channel for each request.
 
 use crate::config::Config;
 use crate::errors::McError;
@@ -21,42 +27,39 @@ use proto_gen::internal::{
     RegisterMcRequest,
 };
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::RwLock;
 use tonic::transport::{Channel, Endpoint};
 use tonic::Request;
 use tracing::{debug, error, info, instrument, warn};
 
-/// Default timeout for GC RPC calls in seconds.
-const GC_RPC_TIMEOUT_SECS: u64 = 10;
+/// Default timeout for GC RPC calls.
+const GC_RPC_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Default connect timeout in seconds.
-const GC_CONNECT_TIMEOUT_SECS: u64 = 5;
+/// Default connect timeout.
+const GC_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Default fast heartbeat interval (10 seconds per ADR-0010).
-const DEFAULT_FAST_HEARTBEAT_INTERVAL_MS: u64 = 10_000;
+const DEFAULT_FAST_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Default comprehensive heartbeat interval (30 seconds per ADR-0010).
-const DEFAULT_COMPREHENSIVE_HEARTBEAT_INTERVAL_MS: u64 = 30_000;
+const DEFAULT_COMPREHENSIVE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Maximum retries for registration.
 const MAX_REGISTRATION_RETRIES: u32 = 5;
 
-/// Base delay for exponential backoff in milliseconds.
-const BACKOFF_BASE_MS: u64 = 1000;
+/// Base delay for exponential backoff.
+const BACKOFF_BASE: Duration = Duration::from_secs(1);
 
-/// Maximum backoff delay in milliseconds.
-const BACKOFF_MAX_MS: u64 = 30_000;
+/// Maximum backoff delay.
+const BACKOFF_MAX: Duration = Duration::from_secs(30);
 
 /// GC client with connection management.
 ///
-/// Maintains a cached gRPC channel and handles registration/heartbeat.
+/// Uses a tonic `Channel` which is cheaply cloneable and handles
+/// connection management internally. No locking needed.
 pub struct GcClient {
-    /// GC gRPC endpoint.
-    gc_endpoint: String,
-    /// Cached channel.
-    channel: Arc<RwLock<Option<Channel>>>,
+    /// gRPC channel to GC (cheaply cloneable, handles reconnection).
+    channel: Channel,
     /// Service token for authenticating to GC (protected by SecretString).
     service_token: SecretString,
     /// MC configuration.
@@ -70,76 +73,65 @@ pub struct GcClient {
 }
 
 impl GcClient {
-    /// Create a new GC client.
+    /// Create a new GC client with eager channel initialization.
     ///
     /// # Arguments
     ///
     /// * `gc_endpoint` - gRPC endpoint of the Global Controller
     /// * `service_token` - MC's service token for authenticating to GC
     /// * `config` - MC configuration
-    #[must_use]
-    pub fn new(gc_endpoint: String, service_token: SecretString, config: Config) -> Self {
-        Self {
-            gc_endpoint,
-            channel: Arc::new(RwLock::new(None)),
-            service_token,
-            config,
-            is_registered: AtomicBool::new(false),
-            fast_heartbeat_interval_ms: AtomicU64::new(DEFAULT_FAST_HEARTBEAT_INTERVAL_MS),
-            comprehensive_heartbeat_interval_ms: AtomicU64::new(
-                DEFAULT_COMPREHENSIVE_HEARTBEAT_INTERVAL_MS,
-            ),
-        }
-    }
-
-    /// Get or create a channel to the GC.
-    async fn get_channel(&self) -> Result<Channel, McError> {
-        // Check cache first
-        {
-            let channel_guard = self.channel.read().await;
-            if let Some(channel) = channel_guard.as_ref() {
-                return Ok(channel.clone());
-            }
-        }
-
-        // Create new channel
-        let channel = Endpoint::from_shared(self.gc_endpoint.clone())
+    ///
+    /// # Errors
+    ///
+    /// Returns `McError::Config` if the endpoint is invalid.
+    /// Returns `McError::Grpc` if the initial connection fails.
+    ///
+    /// # Note
+    ///
+    /// The channel is created eagerly at startup (fail fast). tonic's `Channel`
+    /// is cheaply cloneable and handles reconnection internally, so no locking
+    /// is needed for concurrent use.
+    pub async fn new(
+        gc_endpoint: String,
+        service_token: SecretString,
+        config: Config,
+    ) -> Result<Self, McError> {
+        let channel = Endpoint::from_shared(gc_endpoint.clone())
             .map_err(|e| {
                 error!(
                     target: "mc.grpc.gc_client",
                     error = %e,
-                    endpoint = %self.gc_endpoint,
+                    endpoint = %gc_endpoint,
                     "Invalid GC endpoint"
                 );
                 McError::Config(format!("Invalid GC endpoint: {e}"))
             })?
-            .connect_timeout(Duration::from_secs(GC_CONNECT_TIMEOUT_SECS))
-            .timeout(Duration::from_secs(GC_RPC_TIMEOUT_SECS))
+            .connect_timeout(GC_CONNECT_TIMEOUT)
+            .timeout(GC_RPC_TIMEOUT)
             .connect()
             .await
             .map_err(|e| {
                 warn!(
                     target: "mc.grpc.gc_client",
                     error = %e,
-                    endpoint = %self.gc_endpoint,
+                    endpoint = %gc_endpoint,
                     "Failed to connect to GC"
                 );
                 McError::Grpc(format!("Failed to connect to GC: {e}"))
             })?;
 
-        // Cache the channel
-        {
-            let mut channel_guard = self.channel.write().await;
-            *channel_guard = Some(channel.clone());
-        }
-
-        Ok(channel)
-    }
-
-    /// Clear the cached channel (on connection failure).
-    async fn clear_channel(&self) {
-        let mut channel_guard = self.channel.write().await;
-        *channel_guard = None;
+        Ok(Self {
+            channel,
+            service_token,
+            config,
+            is_registered: AtomicBool::new(false),
+            fast_heartbeat_interval_ms: AtomicU64::new(
+                DEFAULT_FAST_HEARTBEAT_INTERVAL.as_millis() as u64
+            ),
+            comprehensive_heartbeat_interval_ms: AtomicU64::new(
+                DEFAULT_COMPREHENSIVE_HEARTBEAT_INTERVAL.as_millis() as u64,
+            ),
+        })
     }
 
     /// Add authorization header to a request.
@@ -160,6 +152,8 @@ impl GcClient {
     /// Register with the Global Controller.
     ///
     /// Called on startup. Retries with exponential backoff on failure.
+    /// Note: Since the channel handles reconnection internally, we just
+    /// retry the RPC on failure without clearing the channel.
     ///
     /// # Errors
     ///
@@ -186,7 +180,7 @@ impl GcClient {
         };
 
         let mut retry_count = 0;
-        let mut delay_ms = BACKOFF_BASE_MS;
+        let mut delay = BACKOFF_BASE;
 
         loop {
             match self.try_register(&request).await {
@@ -242,16 +236,13 @@ impl GcClient {
                         target: "mc.grpc.gc_client",
                         error = %e,
                         retry_count = retry_count,
-                        delay_ms = delay_ms,
+                        delay_ms = delay.as_millis(),
                         "Registration failed, retrying"
                     );
 
-                    // Clear channel to force reconnection
-                    self.clear_channel().await;
-
-                    // Exponential backoff
-                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-                    delay_ms = (delay_ms * 2).min(BACKOFF_MAX_MS);
+                    // Exponential backoff (tonic Channel handles reconnection internally)
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(BACKOFF_MAX);
                 }
             }
         }
@@ -262,8 +253,8 @@ impl GcClient {
         &self,
         request: &RegisterMcRequest,
     ) -> Result<proto_gen::internal::RegisterMcResponse, McError> {
-        let channel = self.get_channel().await?;
-        let mut client = GlobalControllerServiceClient::new(channel);
+        // Clone the channel (cheap operation) for this request
+        let mut client = GlobalControllerServiceClient::new(self.channel.clone());
         let grpc_request = self.add_auth(request.clone())?;
 
         client
@@ -312,8 +303,8 @@ impl GcClient {
             health: health.into(),
         };
 
-        let channel = self.get_channel().await?;
-        let mut client = GlobalControllerServiceClient::new(channel);
+        // Clone the channel (cheap operation) for this request
+        let mut client = GlobalControllerServiceClient::new(self.channel.clone());
         let grpc_request = self.add_auth(request)?;
 
         match client.fast_heartbeat(grpc_request).await {
@@ -334,8 +325,7 @@ impl GcClient {
                     error = %e,
                     "Fast heartbeat failed"
                 );
-                // Clear channel to force reconnection on next call
-                self.clear_channel().await;
+                // tonic Channel handles reconnection internally, no need to clear
                 Err(McError::Grpc(format!("Fast heartbeat failed: {e}")))
             }
         }
@@ -379,8 +369,8 @@ impl GcClient {
             memory_usage_percent,
         };
 
-        let channel = self.get_channel().await?;
-        let mut client = GlobalControllerServiceClient::new(channel);
+        // Clone the channel (cheap operation) for this request
+        let mut client = GlobalControllerServiceClient::new(self.channel.clone());
         let grpc_request = self.add_auth(request)?;
 
         match client.comprehensive_heartbeat(grpc_request).await {
@@ -403,8 +393,7 @@ impl GcClient {
                     error = %e,
                     "Comprehensive heartbeat failed"
                 );
-                // Clear channel to force reconnection on next call
-                self.clear_channel().await;
+                // tonic Channel handles reconnection internally, no need to clear
                 Err(McError::Grpc(format!(
                     "Comprehensive heartbeat failed: {e}"
                 )))
@@ -437,8 +426,74 @@ impl GcClient {
 mod tests {
     use super::*;
 
-    fn test_config() -> Config {
-        Config {
+    // Note: GcClient::new() is now async and connects eagerly.
+    // Tests that require a GcClient instance need a running gRPC server.
+    // These tests verify constants and calculations that don't require a client.
+
+    #[test]
+    fn test_default_intervals() {
+        assert_eq!(DEFAULT_FAST_HEARTBEAT_INTERVAL, Duration::from_secs(10));
+        assert_eq!(
+            DEFAULT_COMPREHENSIVE_HEARTBEAT_INTERVAL,
+            Duration::from_secs(30)
+        );
+    }
+
+    #[test]
+    fn test_retry_constants() {
+        // Verify retry configuration is reasonable
+        assert_eq!(MAX_REGISTRATION_RETRIES, 5);
+        assert_eq!(BACKOFF_BASE, Duration::from_secs(1));
+        assert_eq!(BACKOFF_MAX, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn test_exponential_backoff_calculation() {
+        // Verify the backoff calculation pattern used in register()
+        let base = BACKOFF_BASE;
+        let max = BACKOFF_MAX;
+
+        // First retry: 1s
+        let delay1 = base;
+        assert_eq!(delay1, Duration::from_secs(1));
+
+        // Second retry: 2s
+        let delay2 = (delay1 * 2).min(max);
+        assert_eq!(delay2, Duration::from_secs(2));
+
+        // Third retry: 4s
+        let delay3 = (delay2 * 2).min(max);
+        assert_eq!(delay3, Duration::from_secs(4));
+
+        // Fourth retry: 8s
+        let delay4 = (delay3 * 2).min(max);
+        assert_eq!(delay4, Duration::from_secs(8));
+
+        // Fifth retry: 16s
+        let delay5 = (delay4 * 2).min(max);
+        assert_eq!(delay5, Duration::from_secs(16));
+
+        // Sixth retry: 32s -> capped at 30s
+        let delay6 = (delay5 * 2).min(max);
+        assert_eq!(delay6, Duration::from_secs(30));
+
+        // Further retries stay at max
+        let delay7 = (delay6 * 2).min(max);
+        assert_eq!(delay7, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn test_rpc_timeout_constants() {
+        // Verify timeouts are reasonable for production use
+        assert_eq!(GC_RPC_TIMEOUT, Duration::from_secs(10));
+        assert_eq!(GC_CONNECT_TIMEOUT, Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn test_new_with_invalid_endpoint() {
+        use common::secret::SecretString;
+
+        let config = Config {
             mc_id: "mc-test-001".to_string(),
             region: "us-east-1".to_string(),
             webtransport_bind_address: "0.0.0.0:4433".to_string(),
@@ -446,7 +501,6 @@ mod tests {
             health_bind_address: "0.0.0.0:8081".to_string(),
             redis_url: SecretString::from("redis://localhost:6379"),
             gc_grpc_url: "http://localhost:50051".to_string(),
-            gc_grpc_endpoint: "http://localhost:50051".to_string(),
             max_meetings: 1000,
             max_participants: 10000,
             binding_token_ttl_seconds: 30,
@@ -454,157 +508,57 @@ mod tests {
             nonce_grace_window_seconds: 5,
             disconnect_grace_period_seconds: 30,
             binding_token_secret: SecretString::from("dGVzdC1zZWNyZXQ="),
-        }
-    }
+        };
 
-    #[test]
-    fn test_gc_client_new() {
-        let client = GcClient::new(
-            "http://localhost:50051".to_string(),
+        // Empty endpoint should fail with Config error
+        let result = GcClient::new(
+            String::new(), // Empty string is clearly invalid
             SecretString::from("test-token"),
-            test_config(),
-        );
-        assert!(!client.is_registered());
-        assert_eq!(
-            client.fast_heartbeat_interval_ms(),
-            DEFAULT_FAST_HEARTBEAT_INTERVAL_MS
-        );
-        assert_eq!(
-            client.comprehensive_heartbeat_interval_ms(),
-            DEFAULT_COMPREHENSIVE_HEARTBEAT_INTERVAL_MS
-        );
-    }
+            config.clone(),
+        )
+        .await;
 
-    #[test]
-    fn test_default_intervals() {
-        assert_eq!(DEFAULT_FAST_HEARTBEAT_INTERVAL_MS, 10_000);
-        assert_eq!(DEFAULT_COMPREHENSIVE_HEARTBEAT_INTERVAL_MS, 30_000);
-    }
-
-    #[test]
-    fn test_retry_constants() {
-        // Verify retry configuration is reasonable
-        assert_eq!(MAX_REGISTRATION_RETRIES, 5);
-        assert_eq!(BACKOFF_BASE_MS, 1000);
-        assert_eq!(BACKOFF_MAX_MS, 30_000);
-    }
-
-    #[test]
-    fn test_exponential_backoff_calculation() {
-        // Verify the backoff calculation pattern used in register()
-        let base = BACKOFF_BASE_MS;
-        let max = BACKOFF_MAX_MS;
-
-        // First retry: 1000ms
-        let delay1 = base;
-        assert_eq!(delay1, 1000);
-
-        // Second retry: 2000ms
-        let delay2 = (delay1 * 2).min(max);
-        assert_eq!(delay2, 2000);
-
-        // Third retry: 4000ms
-        let delay3 = (delay2 * 2).min(max);
-        assert_eq!(delay3, 4000);
-
-        // Fourth retry: 8000ms
-        let delay4 = (delay3 * 2).min(max);
-        assert_eq!(delay4, 8000);
-
-        // Fifth retry: 16000ms
-        let delay5 = (delay4 * 2).min(max);
-        assert_eq!(delay5, 16000);
-
-        // Sixth retry: 32000ms -> capped at 30000ms
-        let delay6 = (delay5 * 2).min(max);
-        assert_eq!(delay6, 30_000);
-
-        // Further retries stay at max
-        let delay7 = (delay6 * 2).min(max);
-        assert_eq!(delay7, 30_000);
+        // Should fail with either Config or Grpc error depending on tonic's parsing
+        let is_expected_error = matches!(result, Err(McError::Config(_)) | Err(McError::Grpc(_)));
+        assert!(is_expected_error, "Expected Config or Grpc error");
     }
 
     #[tokio::test]
-    async fn test_heartbeat_skipped_when_not_registered() {
-        let client = GcClient::new(
-            "http://localhost:50051".to_string(),
+    async fn test_new_with_unreachable_endpoint() {
+        use common::secret::SecretString;
+
+        let config = Config {
+            mc_id: "mc-test-001".to_string(),
+            region: "us-east-1".to_string(),
+            webtransport_bind_address: "0.0.0.0:4433".to_string(),
+            grpc_bind_address: "0.0.0.0:50052".to_string(),
+            health_bind_address: "0.0.0.0:8081".to_string(),
+            redis_url: SecretString::from("redis://localhost:6379"),
+            gc_grpc_url: "http://localhost:50051".to_string(),
+            max_meetings: 1000,
+            max_participants: 10000,
+            binding_token_ttl_seconds: 30,
+            clock_skew_seconds: 5,
+            nonce_grace_window_seconds: 5,
+            disconnect_grace_period_seconds: 30,
+            binding_token_secret: SecretString::from("dGVzdC1zZWNyZXQ="),
+        };
+
+        // Valid endpoint but no server running - should fail with Grpc error
+        let result = GcClient::new(
+            "http://127.0.0.1:59999".to_string(), // Unlikely to have a server
             SecretString::from("test-token"),
-            test_config(),
+            config,
+        )
+        .await;
+
+        let is_expected_error = matches!(
+            &result,
+            Err(McError::Grpc(msg)) if msg.contains("Failed to connect to GC")
         );
-
-        // Not registered yet
-        assert!(!client.is_registered());
-
-        // Fast heartbeat should return Ok but not actually do anything
-        let result = client.fast_heartbeat(0, 0, HealthStatus::Healthy).await;
-        assert!(result.is_ok());
-
-        // Comprehensive heartbeat should also return Ok but skip
-        let result = client
-            .comprehensive_heartbeat(0, 0, HealthStatus::Healthy, 50.0, 60.0)
-            .await;
-        assert!(result.is_ok());
-
-        // Still not registered (heartbeats don't change registration state)
-        assert!(!client.is_registered());
-    }
-
-    #[test]
-    fn test_gc_client_interval_accessors() {
-        let client = GcClient::new(
-            "http://localhost:50051".to_string(),
-            SecretString::from("test-token"),
-            test_config(),
+        assert!(
+            is_expected_error,
+            "Expected Grpc error with 'Failed to connect to GC'"
         );
-
-        // Initial values should be defaults
-        assert_eq!(
-            client.fast_heartbeat_interval_ms(),
-            DEFAULT_FAST_HEARTBEAT_INTERVAL_MS
-        );
-        assert_eq!(
-            client.comprehensive_heartbeat_interval_ms(),
-            DEFAULT_COMPREHENSIVE_HEARTBEAT_INTERVAL_MS
-        );
-
-        // Manually update via atomics (simulating what register() does)
-        client
-            .fast_heartbeat_interval_ms
-            .store(5000, std::sync::atomic::Ordering::SeqCst);
-        client
-            .comprehensive_heartbeat_interval_ms
-            .store(15000, std::sync::atomic::Ordering::SeqCst);
-
-        assert_eq!(client.fast_heartbeat_interval_ms(), 5000);
-        assert_eq!(client.comprehensive_heartbeat_interval_ms(), 15000);
-    }
-
-    #[tokio::test]
-    async fn test_channel_caching() {
-        let client = GcClient::new(
-            "http://localhost:50051".to_string(),
-            SecretString::from("test-token"),
-            test_config(),
-        );
-
-        // Initially no channel cached
-        {
-            let cache = client.channel.read().await;
-            assert!(cache.is_none());
-        }
-
-        // After clear_channel, still None
-        client.clear_channel().await;
-        {
-            let cache = client.channel.read().await;
-            assert!(cache.is_none());
-        }
-    }
-
-    #[test]
-    fn test_rpc_timeout_constants() {
-        // Verify timeouts are reasonable for production use
-        assert_eq!(GC_RPC_TIMEOUT_SECS, 10);
-        assert_eq!(GC_CONNECT_TIMEOUT_SECS, 5);
     }
 }

@@ -59,9 +59,6 @@ pub struct Config {
     /// URL to Global Controller for registration.
     pub gc_grpc_url: String,
 
-    /// GC gRPC endpoint (alias for `gc_grpc_url` for API compatibility).
-    pub gc_grpc_endpoint: String,
-
     /// Unique identifier for this MC instance.
     pub mc_id: String,
 
@@ -99,7 +96,6 @@ impl fmt::Debug for Config {
             .field("health_bind_address", &self.health_bind_address)
             .field("region", &self.region)
             .field("gc_grpc_url", &self.gc_grpc_url)
-            .field("gc_grpc_endpoint", &self.gc_grpc_endpoint)
             .field("mc_id", &self.mc_id)
             .field("max_meetings", &self.max_meetings)
             .field("max_participants", &self.max_participants)
@@ -219,7 +215,6 @@ impl Config {
             grpc_bind_address,
             health_bind_address,
             region,
-            gc_grpc_endpoint: gc_grpc_url.clone(),
             gc_grpc_url,
             mc_id,
             max_meetings,
