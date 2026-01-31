@@ -62,10 +62,10 @@ Instance ID generation pattern duplicated between GC and MC (~6 lines each): gen
 ---
 
 ### TD-6: ActorMetrics Pattern (MC)
-**Added**: 2026-01-25
-**Related files**: `crates/meeting-controller/src/session/actor.rs`
+**Added**: 2026-01-25 | **Updated**: 2026-01-30
+**Related files**: `crates/meeting-controller/src/actors/metrics.rs`
 
-MC's SessionActor uses an ActorMetrics struct to track actor lifecycle metrics (message counts, processing times, queue depths). Severity: Low (first implementation, MC-specific). Improvement path: Consider extracting to `common::metrics::ActorMetrics<T>` trait if GC or MH implement similar actor patterns with metrics. Timeline: Phase 7+ (when second actor implementation appears). Note: Single implementation - do not extract prematurely. Monitor for pattern emergence in other services.
+MC's actor system uses `ActorMetrics` and `ControllerMetrics` structs to track actor lifecycle metrics (message counts, processing times, queue depths) and heartbeat reporting metrics (meetings, participants). Severity: Low (MC-specific actor model). Improvement path: Consider extracting to `common::metrics::ActorMetrics<T>` trait if GC or MH implement similar actor patterns with metrics. Timeline: Phase 7+ (when second actor implementation appears). Note: Single implementation - do not extract prematurely. Monitor for pattern emergence in other services.
 
 ---
 
@@ -98,6 +98,24 @@ Both GC and AC implement similar `IntoResponse` trait impls for their error type
 **Related files**: `crates/ac-service/src/config.rs:184-219`, `crates/global-controller/src/config.rs:138-163`
 
 Both AC and GC implement nearly identical JWT clock skew validation: `DEFAULT_JWT_CLOCK_SKEW_SECONDS` (300), `MAX_JWT_CLOCK_SKEW_SECONDS` (600), and validation logic (positive, under max, parse errors). Pattern includes: parse from env var, validate range, return ConfigError if invalid. ~40 lines duplicated. Severity: Low (small code, straightforward). Improvement path: Extract to `common::config::parse_jwt_clock_skew(vars: &HashMap, key: &str) -> Result<i64, ConfigError>`. Timeline: Phase 5+ (when third service requires JWT clock skew config). Note: Current duplication acceptable for 2 services - defer extraction until third consumer appears.
+
+---
+
+### TD-11: Shutdown Signal Handler
+**Added**: 2026-01-30
+**Related files**: `crates/meeting-controller/src/main.rs:289-319`, `crates/global-controller/src/main.rs:204-253`, `crates/ac-service/src/main.rs:136-189`
+
+All three services implement nearly identical `shutdown_signal()` async functions (~30 lines each): listen for SIGINT/SIGTERM, handle Unix vs non-Unix conditionally with `#[cfg(unix)]`, optional drain period with env var override. Severity: Low (small code, straightforward). Improvement path: Extract to `common::shutdown::shutdown_signal()` with optional drain period parameter. Timeline: Phase 5+ (infrastructure cleanup). Note: Current duplication acceptable - extraction would provide minor benefit. MC's version is slightly simpler (no drain period).
+
+---
+
+### TD-12: Tracing Initialization
+**Added**: 2026-01-30
+**Related files**: `crates/meeting-controller/src/main.rs:56-62`, `crates/global-controller/src/main.rs:46-53`, `crates/ac-service/src/main.rs:24-32`
+
+All three services have identical tracing_subscriber initialization (~7 lines each): `registry().with(EnvFilter).with(fmt::layer()).init()`. Only difference is the default filter string (service name). Severity: Low (small code, boilerplate). Improvement path: Extract to `common::observability::init_tracing(default_filter: &str)`. Timeline: Phase 5+ (infrastructure cleanup). Note: Very low priority - the code is small and unlikely to diverge.
+
+---
 
 This differs from Security, Test, and Code Quality reviewers where ALL findings block. Only genuine shared code requiring extraction should be classified as BLOCKER.
 

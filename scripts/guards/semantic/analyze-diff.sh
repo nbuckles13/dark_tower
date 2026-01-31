@@ -295,7 +295,8 @@ echo "$ANALYSIS"
 echo ""
 
 # Extract verdict from the response
-VERDICT=$(echo "$ANALYSIS" | grep -oiE '^(SAFE|UNSAFE|UNCLEAR):' | tail -1 | tr -d ':' | tr '[:lower:]' '[:upper:]')
+# Handle both formats: "SAFE:" and "**VERDICT**: SAFE:"
+VERDICT=$(echo "$ANALYSIS" | grep -iE '(SAFE|UNSAFE|UNCLEAR):' | grep -oiE '(SAFE|UNSAFE|UNCLEAR)' | tail -1 | tr '[:lower:]' '[:upper:]')
 VERDICT="${VERDICT:-UNCLEAR}"
 
 # Count findings

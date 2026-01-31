@@ -142,3 +142,11 @@ Implement `tonic::service::Interceptor` for authorization validation on incoming
 When storing non-Clone types (like `ring::hkdf::Prk`) in `SecretBox<T>`, the standard pattern of deriving Clone fails. Solution: (1) Don't derive Clone on the config struct, or (2) Manually implement Clone with `expose_secret().clone()` to access the inner value. This is intentionally explicit and grep-able. Pattern: `SecretBox::new(prk)` for storage, then `config.master_secret.expose_secret().clone()` for cloning. This maintains security (debug redaction) while working with non-Clone cryptographic types. Import `secrecy::ExposeSecret` trait to access the method.
 
 ---
+
+## Pattern: Mock gRPC Server for Integration Tests
+**Added**: 2026-01-31
+**Related files**: `crates/meeting-controller/tests/gc_integration.rs`
+
+For testing gRPC client code, create a mock server implementing the service trait. Pattern: (1) Bind `TcpListener::bind("127.0.0.1:0")` to get a random port, (2) Wrap listener with `tokio_stream::wrappers::TcpListenerStream`, (3) Use `Server::builder().add_service(...).serve_with_incoming_shutdown(incoming, token)`, (4) Spawn in background task, (5) Create client pointing to `listener.local_addr()`. Use channels (`mpsc`, `AtomicU32`) to track calls and verify behavior. Add `tokio-stream` as dev-dependency.
+
+---

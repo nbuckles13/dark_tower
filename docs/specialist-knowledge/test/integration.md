@@ -312,8 +312,10 @@ When implementing MC features that depend on Redis (session binding, fencing tok
 - Auth interceptor edge cases: empty header, malformed Bearer, case sensitivity
 - gRPC retry/backoff: mixed success/failure sequences (not just all-succeed or all-fail)
 - Error code exhaustive testing: every McError variant mapped to protocol codes
+- **MockGcServer pattern**: 9 integration tests using configurable mock gRPC server (see `crates/meeting-controller/tests/gc_integration.rs`)
+- **Heartbeat task testing**: 4 tests using `#[tokio::test(start_paused = true)]` with `tokio::time::advance()` for deterministic interval testing
 
-Test count: 113 tests in meeting-controller (up from 71 pre-Phase 6c)
+Test count: 138 tests in meeting-controller (125 unit + 13 integration/heartbeat, up from 113 pre-Phase 6c round 2)
 
 Tech debt noted in Phase 6a (now completed in Phase 6b):
 - ~~TD-1: Integration tests for main binary~~ (completed: 64 actor tests)

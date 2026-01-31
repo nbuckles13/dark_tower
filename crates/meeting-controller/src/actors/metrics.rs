@@ -9,7 +9,7 @@
 //!
 //! All metrics are emitted with the `mc_` prefix per ADR-0023 naming conventions.
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tracing::{debug, warn};
 
@@ -211,6 +211,69 @@ impl MailboxMonitor {
         } else {
             MailboxLevel::Normal
         }
+    }
+}
+
+/// Metrics for heartbeat reporting to Global Controller.
+///
+/// This struct is shared between the actor system (which updates values)
+/// and heartbeat tasks (which read values for reporting to GC).
+/// All fields are atomic for lock-free concurrent access.
+#[derive(Debug, Default)]
+pub struct ControllerMetrics {
+    /// Current number of active meetings on this MC.
+    current_meetings: AtomicU32,
+    /// Current number of active participants across all meetings.
+    current_participants: AtomicU32,
+}
+
+impl ControllerMetrics {
+    /// Create a new shared metrics instance.
+    #[must_use]
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Update the current meeting count.
+    pub fn set_meetings(&self, count: u32) {
+        self.current_meetings.store(count, Ordering::SeqCst);
+    }
+
+    /// Update the current participant count.
+    pub fn set_participants(&self, count: u32) {
+        self.current_participants.store(count, Ordering::SeqCst);
+    }
+
+    /// Get the current meeting count.
+    #[must_use]
+    pub fn meetings(&self) -> u32 {
+        self.current_meetings.load(Ordering::SeqCst)
+    }
+
+    /// Get the current participant count.
+    #[must_use]
+    pub fn participants(&self) -> u32 {
+        self.current_participants.load(Ordering::SeqCst)
+    }
+
+    /// Increment the meeting count atomically.
+    pub fn increment_meetings(&self) {
+        self.current_meetings.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Decrement the meeting count atomically.
+    pub fn decrement_meetings(&self) {
+        self.current_meetings.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    /// Increment the participant count atomically.
+    pub fn increment_participants(&self) {
+        self.current_participants.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Decrement the participant count atomically.
+    pub fn decrement_participants(&self) {
+        self.current_participants.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -434,5 +497,44 @@ mod tests {
         assert_eq!(MailboxLevel::Normal, MailboxLevel::Normal);
         assert_ne!(MailboxLevel::Normal, MailboxLevel::Warning);
         assert_ne!(MailboxLevel::Warning, MailboxLevel::Critical);
+    }
+
+    #[test]
+    fn test_controller_metrics_meetings() {
+        let metrics = ControllerMetrics::new();
+
+        assert_eq!(metrics.meetings(), 0);
+
+        metrics.set_meetings(10);
+        assert_eq!(metrics.meetings(), 10);
+
+        metrics.increment_meetings();
+        assert_eq!(metrics.meetings(), 11);
+
+        metrics.decrement_meetings();
+        assert_eq!(metrics.meetings(), 10);
+    }
+
+    #[test]
+    fn test_controller_metrics_participants() {
+        let metrics = ControllerMetrics::new();
+
+        assert_eq!(metrics.participants(), 0);
+
+        metrics.set_participants(100);
+        assert_eq!(metrics.participants(), 100);
+
+        metrics.increment_participants();
+        assert_eq!(metrics.participants(), 101);
+
+        metrics.decrement_participants();
+        assert_eq!(metrics.participants(), 100);
+    }
+
+    #[test]
+    fn test_controller_metrics_default() {
+        let metrics = ControllerMetrics::default();
+        assert_eq!(metrics.meetings(), 0);
+        assert_eq!(metrics.participants(), 0);
     }
 }

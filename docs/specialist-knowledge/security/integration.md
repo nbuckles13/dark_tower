@@ -86,8 +86,8 @@ Service must fail startup if `MC_BINDING_TOKEN_SECRET` is not configured.
 ---
 
 ## Integration: Meeting Controller - GC Communication Security
-**Added**: 2026-01-25 (Updated: 2026-01-28)
-**Related files**: `crates/meeting-controller/src/grpc/interceptor.rs`, `crates/meeting-controller/src/grpc/gc_client.rs`, `crates/meeting-controller/src/actors/controller.rs`
+**Added**: 2026-01-25 (Updated: 2026-01-30)
+**Related files**: `crates/meeting-controller/src/grpc/auth_interceptor.rs`, `crates/meeting-controller/src/grpc/gc_client.rs`, `crates/meeting-controller/src/actors/controller.rs`
 
 GC-to-MC communication uses authenticated gRPC. Security requirements:
 
