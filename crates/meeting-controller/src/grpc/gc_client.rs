@@ -45,7 +45,16 @@ const DEFAULT_FAST_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 const DEFAULT_COMPREHENSIVE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Maximum retries for registration.
-const MAX_REGISTRATION_RETRIES: u32 = 5;
+///
+/// With exponential backoff (1s -> 2s -> 4s -> ... -> 30s max), this gives
+/// approximately 5 minutes of retry time, sufficient for GC rolling updates.
+const MAX_REGISTRATION_RETRIES: u32 = 20;
+
+/// Maximum duration for registration attempts.
+///
+/// Registration will stop after this duration even if retries remain.
+/// This handles cases where backoff is slower than expected.
+const MAX_REGISTRATION_DURATION: Duration = Duration::from_secs(300); // 5 minutes
 
 /// Base delay for exponential backoff.
 const BACKOFF_BASE: Duration = Duration::from_secs(1);
@@ -152,12 +161,18 @@ impl GcClient {
     /// Register with the Global Controller.
     ///
     /// Called on startup. Retries with exponential backoff on failure.
+    /// Registration continues until:
+    /// - Success (GC accepts)
+    /// - GC explicitly rejects (e.g., duplicate ID)
+    /// - Max retries exceeded (20 retries)
+    /// - Max duration exceeded (5 minutes)
+    ///
     /// Note: Since the channel handles reconnection internally, we just
     /// retry the RPC on failure without clearing the channel.
     ///
     /// # Errors
     ///
-    /// Returns `McError::Config` if registration fails after all retries.
+    /// Returns `McError::Config` if registration fails after all retries or timeout.
     #[instrument(skip_all, fields(mc_id = %self.config.mc_id, region = %self.config.region))]
     pub async fn register(&self) -> Result<(), McError> {
         let request = RegisterMcRequest {
@@ -181,8 +196,23 @@ impl GcClient {
 
         let mut retry_count = 0;
         let mut delay = BACKOFF_BASE;
+        let deadline = tokio::time::Instant::now() + MAX_REGISTRATION_DURATION;
 
         loop {
+            // Check duration deadline
+            if tokio::time::Instant::now() >= deadline {
+                error!(
+                    target: "mc.grpc.gc_client",
+                    duration_secs = MAX_REGISTRATION_DURATION.as_secs(),
+                    retries = retry_count,
+                    "Registration failed: exceeded maximum duration"
+                );
+                return Err(McError::Config(format!(
+                    "Registration failed after {}s deadline",
+                    MAX_REGISTRATION_DURATION.as_secs()
+                )));
+            }
+
             match self.try_register(&request).await {
                 Ok(response) => {
                     if response.accepted {
@@ -191,6 +221,7 @@ impl GcClient {
                             message = %response.message,
                             fast_heartbeat_ms = response.fast_heartbeat_interval_ms,
                             comprehensive_heartbeat_ms = response.comprehensive_heartbeat_interval_ms,
+                            retries = retry_count,
                             "Successfully registered with GC"
                         );
 
@@ -236,6 +267,7 @@ impl GcClient {
                         target: "mc.grpc.gc_client",
                         error = %e,
                         retry_count = retry_count,
+                        max_retries = MAX_REGISTRATION_RETRIES,
                         delay_ms = delay.as_millis(),
                         "Registration failed, retrying"
                     );
@@ -441,8 +473,10 @@ mod tests {
 
     #[test]
     fn test_retry_constants() {
-        // Verify retry configuration is reasonable
-        assert_eq!(MAX_REGISTRATION_RETRIES, 5);
+        // Verify retry configuration provides ~5 minutes of resilience
+        // for GC rolling updates or temporary unavailability
+        assert_eq!(MAX_REGISTRATION_RETRIES, 20);
+        assert_eq!(MAX_REGISTRATION_DURATION, Duration::from_secs(300));
         assert_eq!(BACKOFF_BASE, Duration::from_secs(1));
         assert_eq!(BACKOFF_MAX, Duration::from_secs(30));
     }
@@ -508,6 +542,7 @@ mod tests {
             nonce_grace_window_seconds: 5,
             disconnect_grace_period_seconds: 30,
             binding_token_secret: SecretString::from("dGVzdC1zZWNyZXQ="),
+            service_token: SecretString::from("test-service-token"),
         };
 
         // Empty endpoint should fail with Config error
@@ -542,6 +577,7 @@ mod tests {
             nonce_grace_window_seconds: 5,
             disconnect_grace_period_seconds: 30,
             binding_token_secret: SecretString::from("dGVzdC1zZWNyZXQ="),
+            service_token: SecretString::from("test-service-token"),
         };
 
         // Valid endpoint but no server running - should fail with Grpc error
@@ -559,6 +595,47 @@ mod tests {
         assert!(
             is_expected_error,
             "Expected Grpc error with 'Failed to connect to GC'"
+        );
+    }
+
+    #[test]
+    fn test_total_retry_duration_sufficient() {
+        // Verify that total retry duration is at least 3 minutes
+        // This is important for surviving GC rolling updates
+        let mut total_delay = Duration::ZERO;
+        let mut delay = BACKOFF_BASE;
+
+        for _ in 0..MAX_REGISTRATION_RETRIES {
+            total_delay += delay;
+            delay = (delay * 2).min(BACKOFF_MAX);
+        }
+
+        // Should provide at least 3 minutes of retry time
+        assert!(
+            total_delay >= Duration::from_secs(180),
+            "Total retry duration should be at least 3 minutes, got {:?}",
+            total_delay
+        );
+
+        // MAX_REGISTRATION_DURATION should be the primary limit
+        assert!(
+            MAX_REGISTRATION_DURATION >= Duration::from_secs(180),
+            "MAX_REGISTRATION_DURATION should be at least 3 minutes"
+        );
+    }
+
+    #[test]
+    fn test_backoff_eventually_caps() {
+        // Verify backoff caps at BACKOFF_MAX and stays there
+        let mut delay = BACKOFF_BASE;
+
+        for _ in 0..100 {
+            delay = (delay * 2).min(BACKOFF_MAX);
+        }
+
+        assert_eq!(
+            delay, BACKOFF_MAX,
+            "Backoff should cap at BACKOFF_MAX after many iterations"
         );
     }
 }

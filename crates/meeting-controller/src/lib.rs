@@ -46,6 +46,7 @@ pub mod config;
 pub mod errors;
 pub mod grpc;
 pub mod redis;
+pub mod system_info;
 
 // Future modules (Phase 6d+):
 // pub mod handlers;       // WebTransport message handlers

@@ -131,8 +131,8 @@ Benefits: (1) Compromise of one meeting's tokens doesn't reveal master secret, (
 ---
 
 ## Pattern: gRPC Interceptor for Authorization Validation
-**Added**: 2026-01-25
-**Related files**: `crates/meeting-controller/src/grpc/interceptor.rs`
+**Added**: 2026-01-25 (Updated: 2026-01-30)
+**Related files**: `crates/meeting-controller/src/grpc/auth_interceptor.rs`
 
 Use gRPC interceptors (tonic middleware) to enforce authorization on incoming service-to-service calls. Pattern:
 
@@ -147,8 +147,8 @@ Benefits: (1) Centralized auth logic - not scattered in handlers, (2) Defense-in
 ---
 
 ## Pattern: Token Size Limits for DoS Prevention
-**Added**: 2026-01-25
-**Related files**: `crates/meeting-controller/src/grpc/interceptor.rs`
+**Added**: 2026-01-25 (Updated: 2026-01-30)
+**Related files**: `crates/meeting-controller/src/grpc/auth_interceptor.rs`
 
 Enforce maximum token size before parsing to prevent memory exhaustion attacks. Pattern:
 

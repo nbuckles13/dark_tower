@@ -40,5 +40,5 @@ pub use connection::{ConnectionActor, ConnectionActorHandle};
 pub use controller::{MeetingControllerActor, MeetingControllerActorHandle};
 pub use meeting::{MeetingActor, MeetingActorHandle};
 pub use messages::*;
-pub use metrics::{ActorMetrics, MailboxMonitor};
+pub use metrics::{ActorMetrics, ControllerMetrics, MailboxMonitor};
 pub use session::{SessionBindingManager, StoredBinding};

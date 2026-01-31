@@ -84,6 +84,10 @@ pub struct Config {
     /// Rotates on each deployment for defense-in-depth.
     /// Protected by `SecretString` to prevent accidental logging.
     pub binding_token_secret: SecretString,
+
+    /// Service token for authenticating to Global Controller.
+    /// Protected by `SecretString` to prevent accidental logging.
+    pub service_token: SecretString,
 }
 
 /// Custom Debug implementation that redacts sensitive fields.
@@ -110,6 +114,7 @@ impl fmt::Debug for Config {
                 &self.disconnect_grace_period_seconds,
             )
             .field("binding_token_secret", &"[REDACTED]")
+            .field("service_token", &"[REDACTED]")
             .finish()
     }
 }
@@ -141,6 +146,12 @@ impl Config {
         let binding_token_secret = SecretString::from(
             vars.get("MC_BINDING_TOKEN_SECRET")
                 .ok_or_else(|| ConfigError::MissingEnvVar("MC_BINDING_TOKEN_SECRET".to_string()))?
+                .clone(),
+        );
+
+        let service_token = SecretString::from(
+            vars.get("MC_SERVICE_TOKEN")
+                .ok_or_else(|| ConfigError::MissingEnvVar("MC_SERVICE_TOKEN".to_string()))?
                 .clone(),
         );
 
@@ -224,6 +235,7 @@ impl Config {
             nonce_grace_window_seconds,
             disconnect_grace_period_seconds,
             binding_token_secret,
+            service_token,
         })
     }
 }
@@ -243,6 +255,10 @@ mod tests {
             (
                 "MC_BINDING_TOKEN_SECRET".to_string(),
                 "dGVzdC1zZWNyZXQtMTIzNDU2Nzg5MA==".to_string(),
+            ),
+            (
+                "MC_SERVICE_TOKEN".to_string(),
+                "test-service-token".to_string(),
             ),
         ])
     }
@@ -348,6 +364,15 @@ mod tests {
         assert!(
             matches!(result, Err(ConfigError::MissingEnvVar(v)) if v == "MC_BINDING_TOKEN_SECRET")
         );
+    }
+
+    #[test]
+    fn test_from_vars_missing_service_token() {
+        let mut vars = base_vars();
+        vars.remove("MC_SERVICE_TOKEN");
+
+        let result = Config::from_vars(&vars);
+        assert!(matches!(result, Err(ConfigError::MissingEnvVar(v)) if v == "MC_SERVICE_TOKEN"));
     }
 
     #[test]

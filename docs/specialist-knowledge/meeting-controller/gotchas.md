@@ -99,3 +99,19 @@ The `Bearer ` prefix in authorization headers is case-sensitive per RFC 6750. Us
 The project principle "NEVER use `Arc<Mutex<State>>`" applies to actor-owned state, NOT connection handles. Types like tonic `Channel` and redis-rs `MultiplexedConnection` are explicitly designed to be cloned and shared concurrently - they're connection handles, not stateful components. Do not wrap them in `Arc<RwLock>`. The principle prevents lock contention on hot-path actor state; connection types already handle internal synchronization.
 
 ---
+
+## Gotcha: sysinfo API Differences Between Versions
+**Added**: 2026-01-31
+**Related files**: `crates/meeting-controller/src/system_info.rs`
+
+The `sysinfo` crate API changed between versions. Version 0.30 uses `sys.global_cpu_info().cpu_usage()` (not `sys.global_cpu_usage()` which doesn't exist). The method returns `f32`, not a struct with a field. Always check the specific version's documentation when using sysinfo, especially when upgrading.
+
+---
+
+## Gotcha: MissedTickBehavior::Burst for Deterministic Test Tick Counts
+**Added**: 2026-01-31
+**Related files**: `crates/meeting-controller/tests/heartbeat_tasks.rs`
+
+When testing interval-based tasks with `tokio::time::advance()`, using `MissedTickBehavior::Skip` (production default) can cause flaky tests - advancing by 3 seconds doesn't guarantee 3 ticks because missed ticks are skipped. Use `MissedTickBehavior::Burst` in tests to ensure all ticks fire, making assertions predictable. Production code should still use Skip to avoid thundering-herd on wake.
+
+---

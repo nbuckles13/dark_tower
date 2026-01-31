@@ -300,6 +300,10 @@ fn extract_client_credentials(
 ) -> Result<(String, String), AcError> {
     // Try Basic Auth first
     if let Some(auth_header) = headers.get("authorization") {
+        // SECURITY: Intentionally discard error details to prevent information leakage.
+        // Revealing whether the failure was due to invalid UTF-8, base64 decode error,
+        // or other parsing issues would help attackers enumerate valid vs invalid formats.
+        // Return generic InvalidCredentials for all authentication parsing failures.
         let auth_str = auth_header
             .to_str()
             .map_err(|_| AcError::InvalidCredentials)?;

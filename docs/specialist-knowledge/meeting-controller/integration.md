@@ -101,19 +101,19 @@ For testing, `mc-test-utils` provides `MockRedis` that simulates these patterns 
 ---
 
 ## Integration: MC Registration with GC
-**Added**: 2026-01-25, **Updated**: 2026-01-29
+**Added**: 2026-01-25, **Updated**: 2026-01-31
 **Related files**: `crates/meeting-controller/src/grpc/gc_client.rs`, `proto/internal.proto`
 
 On startup, MC registers with GC via `RegisterMc` RPC:
 
 1. MC creates `GcClient` with eager channel initialization (fails fast if GC unreachable)
 2. MC builds `RegisterMcRequest` with: id, region, gRPC endpoint, WebTransport endpoint, max_meetings, max_participants
-3. MC calls GC with exponential backoff on failure (max 5 retries, 1s-30s delays)
+3. MC calls GC with exponential backoff on failure (max 20 retries, 1s-30s delays, 5-minute total deadline)
 4. GC responds with: accepted, heartbeat intervals (fast=10s, comprehensive=30s)
 5. MC stores intervals in atomics, sets `is_registered = true`
 6. MC starts background heartbeat tasks
 
-If GC rejects registration (e.g., duplicate ID), MC should fail startup. The tonic `Channel` handles reconnection internally - no manual cache clearing needed.
+The 5-minute retry duration accommodates GC rolling updates where GC pods may be temporarily unavailable. If GC rejects registration (e.g., duplicate ID), MC should fail startup. The tonic `Channel` handles reconnection internally - no manual cache clearing needed.
 
 ---
 

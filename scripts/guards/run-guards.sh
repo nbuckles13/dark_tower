@@ -198,7 +198,7 @@ if $RUN_SEMANTIC; then
                     ((FAILED_GUARDS++)) || true
                     FAILED_GUARD_NAMES+=("semantic-analysis")
                     # Show failure details
-                    echo "$OUTPUT" | grep -E "(FINDING|UNSAFE|VERDICT)" | head -10
+                    echo "$OUTPUT" | grep -E "(FINDING|UNSAFE|VERDICT)" | head -10 || true
                 fi
             fi
         fi
