@@ -1,8 +1,7 @@
 use base64::{engine::general_purpose, Engine as _};
 // Re-export clock skew constants from common for backwards compatibility
 pub use common::jwt::{
-    DEFAULT_CLOCK_SKEW_SECONDS as DEFAULT_JWT_CLOCK_SKEW_SECONDS,
-    MAX_CLOCK_SKEW_SECONDS as MAX_JWT_CLOCK_SKEW_SECONDS,
+    DEFAULT_CLOCK_SKEW as DEFAULT_JWT_CLOCK_SKEW, MAX_CLOCK_SKEW as MAX_JWT_CLOCK_SKEW,
 };
 use common::secret::{ExposeSecret, SecretBox};
 use std::collections::HashMap;
@@ -194,10 +193,11 @@ impl Config {
                 )));
             }
 
-            if value > MAX_JWT_CLOCK_SKEW_SECONDS {
+            if value > MAX_JWT_CLOCK_SKEW.as_secs() as i64 {
                 return Err(ConfigError::InvalidJwtClockSkew(format!(
                     "JWT_CLOCK_SKEW_SECONDS must not exceed {} seconds (10 minutes), got {}",
-                    MAX_JWT_CLOCK_SKEW_SECONDS, value
+                    MAX_JWT_CLOCK_SKEW.as_secs(),
+                    value
                 )));
             }
 
@@ -213,7 +213,7 @@ impl Config {
 
             value
         } else {
-            DEFAULT_JWT_CLOCK_SKEW_SECONDS
+            DEFAULT_JWT_CLOCK_SKEW.as_secs() as i64
         };
 
         // Parse bcrypt cost factor with validation
@@ -555,7 +555,8 @@ mod tests {
 
         let config = Config::from_vars(&vars).expect("Config should load successfully");
         assert_eq!(
-            config.jwt_clock_skew_seconds, DEFAULT_JWT_CLOCK_SKEW_SECONDS,
+            config.jwt_clock_skew_seconds,
+            DEFAULT_JWT_CLOCK_SKEW.as_secs() as i64,
             "Default JWT clock skew should be 300 seconds (5 minutes)"
         );
         assert_eq!(config.jwt_clock_skew_seconds, 300);

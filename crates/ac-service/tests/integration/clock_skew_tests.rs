@@ -3,7 +3,7 @@
 //! These tests validate the configurable JWT_CLOCK_SKEW_SECONDS feature,
 //! ensuring the entire pipeline works correctly with custom clock skew values.
 
-use ac_service::config::DEFAULT_JWT_CLOCK_SKEW_SECONDS;
+use ac_service::config::DEFAULT_JWT_CLOCK_SKEW;
 use ac_service::crypto;
 use ac_service::models::SigningKey;
 use ac_service::repositories::signing_keys;
@@ -11,6 +11,7 @@ use ac_service::services::key_management_service;
 use chrono::Utc;
 use common::secret::SecretBox;
 use sqlx::PgPool;
+use std::time::Duration;
 
 // ============================================================================
 // Helper Functions
@@ -69,7 +70,7 @@ async fn test_custom_clock_skew_accepts_within_tolerance(
     let token = crypto::sign_jwt(&claims, &private_key, &signing_key.key_id)?;
 
     // Act: Verify with custom clock skew of 60 seconds
-    let custom_clock_skew: i64 = 60;
+    let custom_clock_skew = Duration::from_secs(60);
     let result = crypto::verify_jwt(&token, &signing_key.public_key, custom_clock_skew);
 
     // Assert: Token should be accepted (iat is within 60 second tolerance)
@@ -115,7 +116,7 @@ async fn test_custom_clock_skew_rejects_beyond_tolerance(
     let token = crypto::sign_jwt(&claims, &private_key, &signing_key.key_id)?;
 
     // Act: Verify with custom clock skew of 60 seconds
-    let custom_clock_skew: i64 = 60;
+    let custom_clock_skew = Duration::from_secs(60);
     let result = crypto::verify_jwt(&token, &signing_key.public_key, custom_clock_skew);
 
     // Assert: Token should be rejected (iat is beyond 60 second tolerance)
@@ -153,11 +154,7 @@ async fn test_default_clock_skew_behavior_unchanged(pool: PgPool) -> Result<(), 
     let token = crypto::sign_jwt(&claims, &private_key, &signing_key.key_id)?;
 
     // Act: Verify with DEFAULT clock skew
-    let result = crypto::verify_jwt(
-        &token,
-        &signing_key.public_key,
-        DEFAULT_JWT_CLOCK_SKEW_SECONDS,
-    );
+    let result = crypto::verify_jwt(&token, &signing_key.public_key, DEFAULT_JWT_CLOCK_SKEW);
 
     // Assert: Token should be accepted with default clock skew
     assert!(
@@ -197,7 +194,7 @@ async fn test_minimum_clock_skew_edge_case(pool: PgPool) -> Result<(), anyhow::E
         crypto::sign_jwt(&claims_at_boundary, &private_key, &signing_key.key_id)?;
 
     // Act & Assert: Token at boundary should be accepted
-    let min_clock_skew: i64 = 1;
+    let min_clock_skew = Duration::from_secs(1);
     let result = crypto::verify_jwt(&token_at_boundary, &signing_key.public_key, min_clock_skew);
     assert!(
         result.is_ok(),
@@ -251,7 +248,7 @@ async fn test_maximum_clock_skew_edge_case(pool: PgPool) -> Result<(), anyhow::E
         crypto::sign_jwt(&claims_at_boundary, &private_key, &signing_key.key_id)?;
 
     // Act & Assert: Token at max boundary should be accepted
-    let max_clock_skew: i64 = 600;
+    let max_clock_skew = Duration::from_secs(600);
     let result = crypto::verify_jwt(&token_at_boundary, &signing_key.public_key, max_clock_skew);
     assert!(
         result.is_ok(),
@@ -270,7 +267,11 @@ async fn test_maximum_clock_skew_edge_case(pool: PgPool) -> Result<(), anyhow::E
     let token_beyond = crypto::sign_jwt(&claims_beyond, &private_key, &signing_key.key_id)?;
 
     // Act & Assert: Token beyond max boundary should be rejected
-    let result = crypto::verify_jwt(&token_beyond, &signing_key.public_key, max_clock_skew);
+    let result = crypto::verify_jwt(
+        &token_beyond,
+        &signing_key.public_key,
+        Duration::from_secs(600),
+    );
     assert!(
         result.is_err(),
         "Token with iat 601 seconds in future should be rejected with 600s clock skew"

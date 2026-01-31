@@ -317,3 +317,70 @@ Exploration completed - see detailed duplication analysis above.
 **DRY Pattern: Re-Export with Rename for Backwards Compatibility**
 - File: `docs/specialist-knowledge/dry-reviewer/patterns.md`
 - Pattern: Use `pub use X as Y` when moving code to common crate to maintain API stability
+
+---
+
+## PR Feedback Changes (PR #33)
+
+After the initial implementation, the following changes were made based on PR review feedback:
+
+### Change 1: Replace local `Claims` struct with type alias
+
+**Feedback**: Remove the local `Claims` struct in AC and use `ServiceClaims` from common.
+
+**Implementation**: Changed `crates/ac-service/src/crypto/mod.rs` to use a type alias:
+```rust
+pub type Claims = ServiceClaims;
+```
+
+This eliminates the duplicate struct definition while maintaining backwards compatibility for all existing code that uses `crypto::Claims`.
+
+### Change 2: Remove `extract_jwt_kid` wrapper function
+
+**Feedback**: Remove the `extract_jwt_kid` wrapper and update callers to use `common::jwt::extract_kid` directly.
+
+**Implementation**:
+- Removed `extract_jwt_kid()` function from `crates/ac-service/src/crypto/mod.rs`
+- Removed all associated tests (functionality is tested in `common/src/jwt.rs`)
+- Updated callers:
+  - `crates/ac-service/src/handlers/admin_handler.rs`: Now uses `common::jwt::extract_kid(token).map_err(...)`
+  - `crates/ac-service/tests/integration/key_rotation_tests.rs`: Now uses `common::jwt::extract_kid()`
+
+### Change 3: Clock skew constants to Duration
+
+**Feedback**: Change `DEFAULT_CLOCK_SKEW_SECONDS` and `MAX_CLOCK_SKEW_SECONDS` from `i64` to `Duration`.
+
+**Implementation**:
+- `crates/common/src/jwt.rs`: Constants now use `Duration::from_secs()`
+  ```rust
+  pub const DEFAULT_CLOCK_SKEW: Duration = Duration::from_secs(300);
+  pub const MAX_CLOCK_SKEW: Duration = Duration::from_secs(600);
+  ```
+- `validate_iat()` signature changed to accept `Duration` instead of `i64`
+- All callers updated to pass `Duration` or convert `i64` config values using `Duration::from_secs()`
+- Test assertions updated to compare with `Duration::from_secs(300)` instead of raw integer
+
+### Files Modified in PR Feedback
+
+| File | Change |
+|------|--------|
+| `crates/common/src/jwt.rs` | Constants to Duration, updated `validate_iat` signature |
+| `crates/ac-service/src/crypto/mod.rs` | Claims type alias, removed `extract_jwt_kid`, Duration usage |
+| `crates/ac-service/src/config.rs` | Updated re-exports and comparisons |
+| `crates/ac-service/src/handlers/admin_handler.rs` | Use `common::jwt::extract_kid` directly |
+| `crates/ac-service/src/middleware/auth.rs` | Duration conversion for `verify_jwt` calls |
+| `crates/ac-service/src/routes/mod.rs` | Duration conversion |
+| `crates/ac-service/src/main.rs` | Duration conversion |
+| `crates/ac-service/src/services/token_service.rs` | Updated constant name and Duration usage |
+| `crates/ac-service/tests/integration/clock_skew_tests.rs` | Duration usage in test assertions |
+| `crates/ac-service/tests/integration/key_rotation_tests.rs` | Updated imports and `extract_kid` usage |
+| `crates/ac-test-utils/src/server_harness.rs` | Duration conversion |
+| `crates/global-controller/src/config.rs` | Updated imports and comparisons |
+| `crates/global-controller/src/auth/jwt.rs` | Duration conversion for `validate_iat` |
+
+### Benefits of PR Feedback Changes
+
+1. **Type Safety**: `Duration` is self-documenting and prevents confusion between seconds/milliseconds
+2. **Less Duplication**: Single `Claims` definition in common, type alias in AC
+3. **Cleaner API**: `extract_kid` callers use the common implementation directly
+4. **Consistency**: All services now use the same Duration-based clock skew constants

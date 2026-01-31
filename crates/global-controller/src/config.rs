@@ -3,10 +3,7 @@
 //! Configuration is loaded from environment variables. All sensitive
 //! fields are redacted in Debug output.
 
-use common::jwt::{
-    DEFAULT_CLOCK_SKEW_SECONDS as DEFAULT_JWT_CLOCK_SKEW_SECONDS,
-    MAX_CLOCK_SKEW_SECONDS as MAX_JWT_CLOCK_SKEW_SECONDS,
-};
+use common::jwt::{DEFAULT_CLOCK_SKEW, MAX_CLOCK_SKEW};
 use std::collections::HashMap;
 use std::env;
 use std::fmt;
@@ -148,16 +145,17 @@ impl Config {
                 )));
             }
 
-            if value > MAX_JWT_CLOCK_SKEW_SECONDS {
+            if value > MAX_CLOCK_SKEW.as_secs() as i64 {
                 return Err(ConfigError::InvalidJwtClockSkew(format!(
                     "JWT_CLOCK_SKEW_SECONDS must not exceed {} seconds, got {}",
-                    MAX_JWT_CLOCK_SKEW_SECONDS, value
+                    MAX_CLOCK_SKEW.as_secs(),
+                    value
                 )));
             }
 
             value
         } else {
-            DEFAULT_JWT_CLOCK_SKEW_SECONDS
+            DEFAULT_CLOCK_SKEW.as_secs() as i64
         };
 
         // Parse rate limit with validation
@@ -260,7 +258,7 @@ mod tests {
         assert_eq!(config.ac_internal_url, "http://localhost:8082");
         assert_eq!(
             config.jwt_clock_skew_seconds,
-            DEFAULT_JWT_CLOCK_SKEW_SECONDS
+            DEFAULT_CLOCK_SKEW.as_secs() as i64
         );
         assert_eq!(config.rate_limit_rpm, DEFAULT_RATE_LIMIT_RPM);
         assert_eq!(config.grpc_bind_address, DEFAULT_GRPC_BIND_ADDRESS);

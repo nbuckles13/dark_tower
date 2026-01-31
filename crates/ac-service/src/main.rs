@@ -49,7 +49,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Log whether clock skew was explicitly configured or using default
     let is_default_clock_skew =
-        config.jwt_clock_skew_seconds == config::DEFAULT_JWT_CLOCK_SKEW_SECONDS;
+        config.jwt_clock_skew_seconds == config::DEFAULT_JWT_CLOCK_SKEW.as_secs() as i64;
     info!(
         jwt_clock_skew_seconds = config.jwt_clock_skew_seconds,
         is_default = is_default_clock_skew,
