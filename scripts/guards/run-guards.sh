@@ -78,13 +78,14 @@ done
 
 # Default to repository root
 if [[ -z "$SEARCH_PATH" ]]; then
-    # Find repository root (go up until we find .git)
+    # Find repository root (go up until we find .git directory or file)
+    # Note: In worktrees, .git is a file pointing to the main repo
     REPO_ROOT="$SCRIPT_DIR"
-    while [[ ! -d "$REPO_ROOT/.git" ]] && [[ "$REPO_ROOT" != "/" ]]; do
+    while [[ ! -d "$REPO_ROOT/.git" ]] && [[ ! -f "$REPO_ROOT/.git" ]] && [[ "$REPO_ROOT" != "/" ]]; do
         REPO_ROOT="$(dirname "$REPO_ROOT")"
     done
     if [[ "$REPO_ROOT" == "/" ]]; then
-        echo "Error: Could not find repository root"
+        echo "Error: Could not find repository root (.git directory or file)"
         exit 2
     fi
     SEARCH_PATH="$REPO_ROOT"
