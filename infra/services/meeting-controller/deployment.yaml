@@ -1,0 +1,129 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: meeting-controller
+  namespace: dark-tower
+  labels:
+    app: meeting-controller
+    component: signaling
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: meeting-controller
+      component: signaling
+  template:
+    metadata:
+      labels:
+        app: meeting-controller
+        component: signaling
+    spec:
+      terminationGracePeriodSeconds: 35
+      securityContext:
+        runAsNonRoot: true
+        # Match distroless nonroot user (uid 65532)
+        runAsUser: 65532
+        fsGroup: 65532
+      containers:
+      - name: meeting-controller
+        image: localhost/meeting-controller:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - name: grpc
+          containerPort: 50052
+          protocol: TCP
+        - name: health
+          containerPort: 8081
+          protocol: TCP
+        - name: webtransport
+          containerPort: 4433
+          protocol: UDP
+        env:
+        - name: MC_GRPC_BIND_ADDRESS
+          valueFrom:
+            configMapKeyRef:
+              name: meeting-controller-config
+              key: MC_GRPC_BIND_ADDRESS
+        - name: MC_HEALTH_BIND_ADDRESS
+          valueFrom:
+            configMapKeyRef:
+              name: meeting-controller-config
+              key: MC_HEALTH_BIND_ADDRESS
+        - name: MC_WEBTRANSPORT_BIND_ADDRESS
+          valueFrom:
+            configMapKeyRef:
+              name: meeting-controller-config
+              key: MC_WEBTRANSPORT_BIND_ADDRESS
+        - name: MC_REGION
+          valueFrom:
+            configMapKeyRef:
+              name: meeting-controller-config
+              key: MC_REGION
+        - name: GC_GRPC_URL
+          valueFrom:
+            configMapKeyRef:
+              name: meeting-controller-config
+              key: GC_GRPC_URL
+        - name: REDIS_URL
+          valueFrom:
+            secretKeyRef:
+              name: meeting-controller-secrets
+              key: REDIS_URL
+        - name: MC_BINDING_TOKEN_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: meeting-controller-secrets
+              key: MC_BINDING_TOKEN_SECRET
+        - name: MC_SERVICE_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: meeting-controller-secrets
+              key: MC_SERVICE_TOKEN
+        - name: RUST_LOG
+          value: "info,meeting_controller=debug"
+        resources:
+          requests:
+            cpu: 200m
+            memory: 512Mi
+          limits:
+            cpu: 1000m
+            memory: 1Gi
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 65532
+          readOnlyRootFilesystem: true
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+        livenessProbe:
+          httpGet:
+            path: /health/live
+            port: 8081
+            scheme: HTTP
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 5
+          successThreshold: 1
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /health/ready
+            port: 8081
+            scheme: HTTP
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 3
+          successThreshold: 1
+          failureThreshold: 3
+        volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+      volumes:
+      - name: tmp
+        emptyDir: {}

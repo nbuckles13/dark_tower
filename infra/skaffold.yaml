@@ -24,6 +24,18 @@ build:
         dockerfile: infra/docker/ac-service/Dockerfile
         buildArgs:
           RUST_VERSION: "1.83"
+    - image: dark-tower/global-controller
+      context: ..
+      docker:
+        dockerfile: infra/docker/global-controller/Dockerfile
+        buildArgs:
+          RUST_VERSION: "1.83"
+    - image: dark-tower/meeting-controller
+      context: ..
+      docker:
+        dockerfile: infra/docker/meeting-controller/Dockerfile
+        buildArgs:
+          RUST_VERSION: "1.83"
 
 # Deployment configuration
 deploy:
@@ -33,7 +45,10 @@ deploy:
         - host:
             command: ["sh", "-c", "echo 'Deploying to kind cluster...'"]
     manifests:
+      - services/redis/*.yaml
       - services/ac-service/*.yaml
+      - services/global-controller/*.yaml
+      - services/meeting-controller/*.yaml
 
 # Port forwarding for local access
 portForward:
@@ -42,6 +57,21 @@ portForward:
     namespace: dark-tower
     port: 8082
     localPort: 8083  # Use 8083 to avoid conflict with local cargo run on 8082
+  - resourceType: service
+    resourceName: global-controller
+    namespace: dark-tower
+    port: 8080
+    localPort: 8080  # GC HTTP API
+  - resourceType: service
+    resourceName: global-controller
+    namespace: dark-tower
+    port: 50051
+    localPort: 50051  # GC gRPC
+  - resourceType: service
+    resourceName: meeting-controller
+    namespace: dark-tower
+    port: 8081
+    localPort: 8084  # MC health endpoint (avoid conflict with other services)
   - resourceType: service
     resourceName: grafana
     namespace: dark-tower-observability

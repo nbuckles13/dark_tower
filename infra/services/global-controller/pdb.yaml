@@ -1,0 +1,14 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: global-controller
+  namespace: dark-tower
+  labels:
+    app: global-controller
+    component: gateway
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: global-controller
+      component: gateway
