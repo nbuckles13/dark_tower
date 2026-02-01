@@ -801,6 +801,20 @@ Result: Error hiding fixes are observability improvements, not behavioral change
 
 ---
 
+## Pattern: User POV Testing for Cross-Service env-tests
+**Added**: 2026-01-31
+**Related files**: `crates/env-tests/tests/22_mc_gc_integration.rs`, `crates/env-tests/tests/21_cross_service_flows.rs`
+
+When testing cross-service integration in env-tests, always test from the **user's perspective** via HTTP APIs, NOT from internal service perspective via gRPC. Wrong approach: "Test GC's internal gRPC API by mocking what MC does" (belongs in `crates/global-controller/tests/`). Correct approach: "Test what the user sees when they call `GET /v1/meetings/{code}`".
+
+Key distinction:
+- **env-tests**: User-facing HTTP APIs, end-to-end flows visible to clients
+- **crate integration tests**: Internal gRPC APIs, service-to-service contracts
+
+For MC-GC integration, this means testing that `JoinMeetingResponse` includes `mc_assignment` (user sees MC endpoint), NOT testing that GC's `RegisterMC` gRPC handler stores MC correctly (internal). This scope separation prevents duplicate test coverage and ensures env-tests validate the actual user experience.
+
+---
+
 ## Pattern: MockBehavior Enum for gRPC Test Server State Machines
 **Added**: 2026-01-31
 **Related files**: `crates/meeting-controller/tests/gc_integration.rs`

@@ -75,6 +75,34 @@ impl std::fmt::Debug for GuestTokenRequest {
     }
 }
 
+/// MC assignment details returned in join meeting response.
+///
+/// Contains the assigned meeting controller's endpoints for the client
+/// to connect to via WebTransport or gRPC fallback.
+#[derive(Clone, Deserialize)]
+pub struct McAssignment {
+    /// Assigned meeting controller ID.
+    pub mc_id: String,
+
+    /// WebTransport endpoint for client connections (preferred).
+    /// May be None if MC doesn't support WebTransport.
+    #[serde(default)]
+    pub webtransport_endpoint: Option<String>,
+
+    /// gRPC endpoint for fallback connections.
+    pub grpc_endpoint: String,
+}
+
+impl std::fmt::Debug for McAssignment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McAssignment")
+            .field("mc_id", &self.mc_id)
+            .field("webtransport_endpoint", &self.webtransport_endpoint)
+            .field("grpc_endpoint", &self.grpc_endpoint)
+            .finish()
+    }
+}
+
 /// Response from meeting join or guest token endpoints.
 #[derive(Clone, Deserialize)]
 pub struct JoinMeetingResponse {
@@ -89,6 +117,10 @@ pub struct JoinMeetingResponse {
 
     /// Meeting display name.
     pub meeting_name: String,
+
+    /// MC assignment info for connecting to the meeting controller.
+    /// Present when an MC is assigned and healthy.
+    pub mc_assignment: McAssignment,
 }
 
 impl std::fmt::Debug for JoinMeetingResponse {
@@ -98,6 +130,7 @@ impl std::fmt::Debug for JoinMeetingResponse {
             .field("expires_in", &self.expires_in)
             .field("meeting_id", &self.meeting_id)
             .field("meeting_name", &self.meeting_name)
+            .field("mc_assignment", &self.mc_assignment)
             .finish()
     }
 }
@@ -438,13 +471,66 @@ mod tests {
             "token": "eyJ...",
             "expires_in": 900,
             "meeting_id": "00000000-0000-0000-0000-000000000001",
-            "meeting_name": "Test Meeting"
+            "meeting_name": "Test Meeting",
+            "mc_assignment": {
+                "mc_id": "mc-001",
+                "webtransport_endpoint": "https://mc.example.com:443",
+                "grpc_endpoint": "https://mc.example.com:50051"
+            }
         }"#;
 
         let response: JoinMeetingResponse = serde_json::from_str(json).unwrap();
         assert_eq!(response.token, "eyJ...");
         assert_eq!(response.expires_in, 900);
         assert_eq!(response.meeting_name, "Test Meeting");
+        assert_eq!(response.mc_assignment.mc_id, "mc-001");
+        assert_eq!(
+            response.mc_assignment.webtransport_endpoint,
+            Some("https://mc.example.com:443".to_string())
+        );
+        assert_eq!(
+            response.mc_assignment.grpc_endpoint,
+            "https://mc.example.com:50051"
+        );
+    }
+
+    #[test]
+    fn test_join_meeting_response_deserialization_no_webtransport() {
+        let json = r#"{
+            "token": "eyJ...",
+            "expires_in": 900,
+            "meeting_id": "00000000-0000-0000-0000-000000000001",
+            "meeting_name": "Test Meeting",
+            "mc_assignment": {
+                "mc_id": "mc-002",
+                "grpc_endpoint": "https://mc.example.com:50051"
+            }
+        }"#;
+
+        let response: JoinMeetingResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.mc_assignment.mc_id, "mc-002");
+        assert_eq!(response.mc_assignment.webtransport_endpoint, None);
+        assert_eq!(
+            response.mc_assignment.grpc_endpoint,
+            "https://mc.example.com:50051"
+        );
+    }
+
+    #[test]
+    fn test_mc_assignment_deserialization() {
+        let json = r#"{
+            "mc_id": "mc-test-001",
+            "webtransport_endpoint": "https://mc:443",
+            "grpc_endpoint": "https://mc:50051"
+        }"#;
+
+        let assignment: McAssignment = serde_json::from_str(json).unwrap();
+        assert_eq!(assignment.mc_id, "mc-test-001");
+        assert_eq!(
+            assignment.webtransport_endpoint,
+            Some("https://mc:443".to_string())
+        );
+        assert_eq!(assignment.grpc_endpoint, "https://mc:50051");
     }
 
     #[test]
@@ -529,6 +615,11 @@ mod tests {
             expires_in: 900,
             meeting_id: Uuid::nil(),
             meeting_name: "Test Meeting".to_string(),
+            mc_assignment: McAssignment {
+                mc_id: "mc-001".to_string(),
+                webtransport_endpoint: Some("https://mc:443".to_string()),
+                grpc_endpoint: "https://mc:50051".to_string(),
+            },
         };
 
         let debug_output = format!("{:?}", response);
@@ -541,6 +632,10 @@ mod tests {
         assert!(
             debug_output.contains("900"),
             "expires_in should be visible in debug output"
+        );
+        assert!(
+            debug_output.contains("mc-001"),
+            "mc_id should be visible in debug output"
         );
         // token should be redacted
         assert!(
