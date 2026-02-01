@@ -216,3 +216,11 @@ When adding error parameter to `.map_err(|e| ...)`, the line may exceed rustfmt'
 Always run `cargo fmt` after fixing error hiding violations. The formatter will handle line breaks consistently. Don't fight the formatter - accept the multi-line closure style.
 
 ---
+
+## Gotcha: Optional Dependencies with Fallback Hide Production Code in Tests
+**Added**: 2026-01-31
+**Related files**: `crates/global-controller/src/routes/mod.rs`, `crates/global-controller/src/handlers/meetings.rs`
+
+When making a dependency optional (e.g., `mc_client: Option<Arc<dyn McClientTrait>>`) with fallback logic for tests, integration tests may exercise the fallback path instead of production code. This creates false confidence - tests pass but production code is untested. Solution: Make dependencies required (`mc_client: Arc<dyn McClientTrait>`), inject mocks in tests. All code paths then use the same logic, just with different implementations.
+
+---

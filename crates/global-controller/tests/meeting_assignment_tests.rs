@@ -9,8 +9,9 @@
 use global_controller::repositories::{
     HealthStatus, McCandidate, MeetingAssignmentsRepository, MeetingControllersRepository,
 };
-use global_controller::services::McAssignmentService;
+use global_controller::services::{McAssignmentService, MockMcClient};
 use sqlx::PgPool;
+use std::sync::Arc;
 
 /// Helper to register a healthy MC for testing.
 async fn register_healthy_mc(
@@ -38,6 +39,51 @@ async fn register_healthy_mc(
         current_meetings * 10,
         HealthStatus::Healthy,
     )
+    .await?;
+
+    Ok(())
+}
+
+/// Helper to register healthy MHs for testing.
+async fn register_healthy_mhs_for_region(pool: &PgPool, region: &str) -> Result<(), anyhow::Error> {
+    // Register primary MH
+    sqlx::query(
+        r#"
+        INSERT INTO media_handlers (
+            handler_id, region, webtransport_endpoint, grpc_endpoint,
+            max_streams, current_streams, health_status, last_heartbeat_at, registered_at
+        )
+        VALUES ($1, $2, $3, $4, 1000, 0, 'healthy', NOW(), NOW())
+        ON CONFLICT (handler_id) DO UPDATE SET
+            last_heartbeat_at = NOW(),
+            health_status = 'healthy'
+        "#,
+    )
+    .bind(format!("mh-primary-{}", region))
+    .bind(region)
+    .bind(format!("https://mh-primary-{}.example.com:443", region))
+    .bind(format!("grpc://mh-primary-{}.example.com:50051", region))
+    .execute(pool)
+    .await?;
+
+    // Register backup MH
+    sqlx::query(
+        r#"
+        INSERT INTO media_handlers (
+            handler_id, region, webtransport_endpoint, grpc_endpoint,
+            max_streams, current_streams, health_status, last_heartbeat_at, registered_at
+        )
+        VALUES ($1, $2, $3, $4, 1000, 0, 'healthy', NOW(), NOW())
+        ON CONFLICT (handler_id) DO UPDATE SET
+            last_heartbeat_at = NOW(),
+            health_status = 'healthy'
+        "#,
+    )
+    .bind(format!("mh-backup-{}", region))
+    .bind(region)
+    .bind(format!("https://mh-backup-{}.example.com:443", region))
+    .bind(format!("grpc://mh-backup-{}.example.com:50051", region))
+    .execute(pool)
     .await?;
 
     Ok(())
@@ -401,12 +447,25 @@ async fn test_cleanup_old_assignments(pool: PgPool) -> Result<(), anyhow::Error>
 }
 
 // ============================================================================
-// Service Tests
+// Service Tests (using assign_meeting_with_mh with MockMcClient)
 // ============================================================================
 
 #[sqlx::test(migrations = "../../migrations")]
-async fn test_service_assign_meeting_no_healthy_mcs(pool: PgPool) -> Result<(), anyhow::Error> {
-    let result = McAssignmentService::assign_meeting(&pool, "meeting-1", "us-east-1", "gc-1").await;
+async fn test_service_assign_meeting_with_mh_no_healthy_mcs(
+    pool: PgPool,
+) -> Result<(), anyhow::Error> {
+    // Register MHs but no MCs
+    register_healthy_mhs_for_region(&pool, "us-east-1").await?;
+
+    let mc_client = Arc::new(MockMcClient::accepting());
+    let result = McAssignmentService::assign_meeting_with_mh(
+        &pool,
+        mc_client,
+        "meeting-1",
+        "us-east-1",
+        "gc-1",
+    )
+    .await;
 
     assert!(result.is_err());
     // Should be ServiceUnavailable error
@@ -415,34 +474,60 @@ async fn test_service_assign_meeting_no_healthy_mcs(pool: PgPool) -> Result<(), 
 }
 
 #[sqlx::test(migrations = "../../migrations")]
-async fn test_service_assign_meeting_success(pool: PgPool) -> Result<(), anyhow::Error> {
+async fn test_service_assign_meeting_with_mh_success(pool: PgPool) -> Result<(), anyhow::Error> {
     register_healthy_mc(&pool, "mc-1", "us-east-1", 10, 100).await?;
+    register_healthy_mhs_for_region(&pool, "us-east-1").await?;
 
-    let assignment =
-        McAssignmentService::assign_meeting(&pool, "meeting-1", "us-east-1", "gc-1").await?;
+    let mc_client = Arc::new(MockMcClient::accepting());
+    let assignment = McAssignmentService::assign_meeting_with_mh(
+        &pool,
+        mc_client,
+        "meeting-1",
+        "us-east-1",
+        "gc-1",
+    )
+    .await?;
 
-    assert_eq!(assignment.mc_id, "mc-1");
-    assert!(!assignment.grpc_endpoint.is_empty());
+    assert_eq!(assignment.mc_assignment.mc_id, "mc-1");
+    assert!(!assignment.mc_assignment.grpc_endpoint.is_empty());
+    assert!(!assignment.mh_selection.primary.mh_id.is_empty());
 
     Ok(())
 }
 
 #[sqlx::test(migrations = "../../migrations")]
-async fn test_service_assign_meeting_reuses_healthy(pool: PgPool) -> Result<(), anyhow::Error> {
+async fn test_service_assign_meeting_with_mh_reuses_healthy(
+    pool: PgPool,
+) -> Result<(), anyhow::Error> {
     register_healthy_mc(&pool, "mc-1", "us-east-1", 10, 100).await?;
     register_healthy_mc(&pool, "mc-2", "us-east-1", 5, 100).await?;
+    register_healthy_mhs_for_region(&pool, "us-east-1").await?;
+
+    let mc_client = Arc::new(MockMcClient::accepting());
 
     // First assignment
-    let first =
-        McAssignmentService::assign_meeting(&pool, "meeting-1", "us-east-1", "gc-1").await?;
-    let first_mc = first.mc_id.clone();
+    let first = McAssignmentService::assign_meeting_with_mh(
+        &pool,
+        mc_client.clone(),
+        "meeting-1",
+        "us-east-1",
+        "gc-1",
+    )
+    .await?;
+    let first_mc = first.mc_assignment.mc_id.clone();
 
-    // Second assignment should return the same
-    let second =
-        McAssignmentService::assign_meeting(&pool, "meeting-1", "us-east-1", "gc-2").await?;
+    // Second assignment should return the same MC
+    let second = McAssignmentService::assign_meeting_with_mh(
+        &pool,
+        mc_client,
+        "meeting-1",
+        "us-east-1",
+        "gc-2",
+    )
+    .await?;
 
     assert_eq!(
-        second.mc_id, first_mc,
+        second.mc_assignment.mc_id, first_mc,
         "Should reuse existing healthy assignment"
     );
 
@@ -452,9 +537,12 @@ async fn test_service_assign_meeting_reuses_healthy(pool: PgPool) -> Result<(), 
 #[sqlx::test(migrations = "../../migrations")]
 async fn test_service_end_assignment(pool: PgPool) -> Result<(), anyhow::Error> {
     register_healthy_mc(&pool, "mc-1", "us-east-1", 10, 100).await?;
+    register_healthy_mhs_for_region(&pool, "us-east-1").await?;
 
-    // Create assignment
-    McAssignmentService::assign_meeting(&pool, "meeting-1", "us-east-1", "gc-1").await?;
+    // Create assignment using assign_meeting_with_mh
+    let mc_client = Arc::new(MockMcClient::accepting());
+    McAssignmentService::assign_meeting_with_mh(&pool, mc_client, "meeting-1", "us-east-1", "gc-1")
+        .await?;
 
     // End assignment
     let ended = McAssignmentService::end_assignment(&pool, "meeting-1", Some("us-east-1")).await?;
@@ -470,13 +558,16 @@ async fn test_service_end_assignment(pool: PgPool) -> Result<(), anyhow::Error> 
 #[sqlx::test(migrations = "../../migrations")]
 async fn test_service_get_assignment(pool: PgPool) -> Result<(), anyhow::Error> {
     register_healthy_mc(&pool, "mc-1", "us-east-1", 10, 100).await?;
+    register_healthy_mhs_for_region(&pool, "us-east-1").await?;
 
     // No assignment yet
     let none = McAssignmentService::get_assignment(&pool, "meeting-1", "us-east-1").await?;
     assert!(none.is_none());
 
     // Create assignment
-    McAssignmentService::assign_meeting(&pool, "meeting-1", "us-east-1", "gc-1").await?;
+    let mc_client = Arc::new(MockMcClient::accepting());
+    McAssignmentService::assign_meeting_with_mh(&pool, mc_client, "meeting-1", "us-east-1", "gc-1")
+        .await?;
 
     // Should find it now
     let some = McAssignmentService::get_assignment(&pool, "meeting-1", "us-east-1").await?;
@@ -497,13 +588,13 @@ async fn test_service_get_assignment(pool: PgPool) -> Result<(), anyhow::Error> 
 #[sqlx::test(migrations = "../../migrations")]
 async fn test_concurrent_assignment_race_condition(pool: PgPool) -> Result<(), anyhow::Error> {
     use std::collections::HashSet;
-    use std::sync::Arc;
     use tokio::sync::Barrier;
 
-    // Register multiple healthy MCs
+    // Register multiple healthy MCs and MHs
     register_healthy_mc(&pool, "mc-1", "us-east-1", 10, 100).await?;
     register_healthy_mc(&pool, "mc-2", "us-east-1", 20, 100).await?;
     register_healthy_mc(&pool, "mc-3", "us-east-1", 30, 100).await?;
+    register_healthy_mhs_for_region(&pool, "us-east-1").await?;
 
     let pool = Arc::new(pool);
     let num_concurrent = 10;
@@ -514,13 +605,15 @@ async fn test_concurrent_assignment_race_condition(pool: PgPool) -> Result<(), a
         .map(|i| {
             let pool = Arc::clone(&pool);
             let barrier = Arc::clone(&barrier);
+            let mc_client = Arc::new(MockMcClient::accepting());
             tokio::spawn(async move {
                 // Wait for all tasks to be ready before proceeding
                 barrier.wait().await;
 
                 // All tasks attempt to assign the same meeting
-                McAssignmentService::assign_meeting(
+                McAssignmentService::assign_meeting_with_mh(
                     &pool,
+                    mc_client,
                     "meeting-concurrent-test",
                     "us-east-1",
                     &format!("gc-{}", i),
@@ -549,7 +642,7 @@ async fn test_concurrent_assignment_race_condition(pool: PgPool) -> Result<(), a
     let mc_ids: HashSet<String> = results
         .iter()
         .filter_map(|r| r.as_ref().ok())
-        .map(|a| a.mc_id.clone())
+        .map(|a| a.mc_assignment.mc_id.clone())
         .collect();
 
     assert_eq!(
@@ -584,16 +677,24 @@ async fn test_concurrent_assignment_race_condition(pool: PgPool) -> Result<(), a
 async fn test_mc_health_transition_creates_new_assignment(
     pool: PgPool,
 ) -> Result<(), anyhow::Error> {
-    // Register two healthy MCs
+    // Register two healthy MCs and MHs
     register_healthy_mc(&pool, "mc-healthy-1", "us-east-1", 10, 100).await?;
     register_healthy_mc(&pool, "mc-healthy-2", "us-east-1", 20, 100).await?;
+    register_healthy_mhs_for_region(&pool, "us-east-1").await?;
+
+    let mc_client = Arc::new(MockMcClient::accepting());
 
     // First assignment goes to one of the healthy MCs
-    let first_assignment =
-        McAssignmentService::assign_meeting(&pool, "meeting-health-test", "us-east-1", "gc-1")
-            .await?;
+    let first_assignment = McAssignmentService::assign_meeting_with_mh(
+        &pool,
+        mc_client.clone(),
+        "meeting-health-test",
+        "us-east-1",
+        "gc-1",
+    )
+    .await?;
 
-    let first_mc = first_assignment.mc_id.clone();
+    let first_mc = first_assignment.mc_assignment.mc_id.clone();
 
     // Now mark the assigned MC as unhealthy
     MeetingControllersRepository::update_heartbeat(
@@ -606,13 +707,18 @@ async fn test_mc_health_transition_creates_new_assignment(
     .await?;
 
     // Second assignment attempt should get a different (healthy) MC
-    let second_assignment =
-        McAssignmentService::assign_meeting(&pool, "meeting-health-test", "us-east-1", "gc-2")
-            .await?;
+    let second_assignment = McAssignmentService::assign_meeting_with_mh(
+        &pool,
+        mc_client,
+        "meeting-health-test",
+        "us-east-1",
+        "gc-2",
+    )
+    .await?;
 
     // The assignment should now be to the remaining healthy MC
     assert_ne!(
-        second_assignment.mc_id, first_mc,
+        second_assignment.mc_assignment.mc_id, first_mc,
         "Should assign to a different MC after first became unhealthy"
     );
 

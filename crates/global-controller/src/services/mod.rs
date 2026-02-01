@@ -16,8 +16,11 @@ pub mod mc_client;
 pub mod mh_selection;
 
 pub use mc_assignment::McAssignmentService;
-// MC client and MH selection types will be used in handlers in future phase
+// MC client types exposed for external use
+pub use mc_client::{McClient, McClientTrait};
+// Mock MC client for testing (exposed for integration tests)
 #[allow(unused_imports)]
-pub use mc_client::{McAssignmentResult, McClient, McClientTrait, McRejectionReason};
+pub use mc_client::mock::MockMcClient;
+// MH selection types exposed for external/test use
 #[allow(unused_imports)]
 pub use mh_selection::{MhAssignmentInfo, MhSelection, MhSelectionService};

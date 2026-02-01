@@ -8,7 +8,8 @@ use global_controller::repositories::{
     HealthStatus, MediaHandlersRepository, MeetingControllersRepository,
 };
 use global_controller::services::mc_client::mock::MockMcClient;
-use global_controller::services::{McAssignmentService, McRejectionReason};
+use global_controller::services::mc_client::{McAssignmentResult, McRejectionReason};
+use global_controller::services::McAssignmentService;
 use sqlx::PgPool;
 use std::sync::Arc;
 
@@ -110,9 +111,9 @@ async fn test_assign_meeting_with_mh_retries_on_rejection(pool: PgPool) {
 
     // Create mock that rejects first 2 calls, then accepts
     let mock_client = Arc::new(MockMcClient::with_responses(vec![
-        global_controller::services::McAssignmentResult::Rejected(McRejectionReason::AtCapacity),
-        global_controller::services::McAssignmentResult::Rejected(McRejectionReason::Draining),
-        global_controller::services::McAssignmentResult::Accepted,
+        McAssignmentResult::Rejected(McRejectionReason::AtCapacity),
+        McAssignmentResult::Rejected(McRejectionReason::Draining),
+        McAssignmentResult::Accepted,
     ]));
 
     // Assign meeting
@@ -271,7 +272,7 @@ async fn test_assign_meeting_with_mh_retries_on_rpc_error(pool: PgPool) {
     // Create mock that fails first, then succeeds
     // Note: MockMcClient::failing() returns errors, then we need a custom one
     let mock_client = Arc::new(MockMcClient::with_responses(vec![
-        global_controller::services::McAssignmentResult::Accepted,
+        McAssignmentResult::Accepted,
     ]));
 
     // This test is a bit limited since our mock doesn't support mixed errors/success
@@ -300,8 +301,8 @@ async fn test_assign_meeting_with_mh_mixed_rejection_then_accept(pool: PgPool) {
 
     // Create mock that rejects once then accepts
     let mock_client = Arc::new(MockMcClient::with_responses(vec![
-        global_controller::services::McAssignmentResult::Rejected(McRejectionReason::AtCapacity),
-        global_controller::services::McAssignmentResult::Accepted,
+        McAssignmentResult::Rejected(McRejectionReason::AtCapacity),
+        McAssignmentResult::Accepted,
     ]));
 
     // Assign meeting

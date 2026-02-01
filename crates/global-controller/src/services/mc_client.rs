@@ -10,10 +10,6 @@
 //! - Timeouts prevent hanging connections
 //! - Error messages are generic to prevent information leakage
 
-// Allow dead code during incremental development - will be wired into handlers
-// in a future phase.
-#![allow(dead_code)]
-
 use crate::errors::GcError;
 use crate::services::mh_selection::MhAssignmentInfo;
 use common::secret::{ExposeSecret, SecretString};
@@ -251,6 +247,8 @@ impl McClientTrait for McClient {
 /// Mock MC client module for testing.
 ///
 /// This module provides mock implementations of the MC client for use in tests.
+/// Note: This is `pub` to allow integration tests in `tests/` to use it.
+#[allow(dead_code)]
 pub mod mock {
 
     use super::*;

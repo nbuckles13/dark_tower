@@ -59,3 +59,18 @@ This file captures pitfalls and anti-patterns discovered during DRY reviews.
 **When reviewing**: For test code, ask "Does this test a different code path?" If yes, structural similarity is fine. If no, suggest consolidation.
 
 ---
+
+## Health Status Conversion Must Be Fail-Closed Consistent
+
+**Added**: 2026-01-31
+**Related files**: `crates/meeting-controller/src/grpc/health.rs`, `crates/media-handler/src/grpc/health.rs`
+
+**Gotcha**: When services convert internal health status to gRPC health status (or vice versa), ensure **fail-closed** semantics are consistent across all services. If one service returns `Serving` when unknown and another returns `NotServing`, the system has inconsistent failure semantics - this is a security concern.
+
+**Pattern**: Always default to the most restrictive status (`NotServing` or `Unknown`) when conversion is ambiguous. The safer pattern is:
+- Unknown internal state -> `NotServing` (fail-closed)
+- NOT: Unknown internal state -> `Serving` (fail-open, dangerous)
+
+**When reviewing**: Flag inconsistent failure semantics as Priority 1 TECH_DEBT even if the duplication itself is minor. Escalate to Security specialist if production-critical.
+
+---

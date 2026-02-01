@@ -9,10 +9,6 @@
 //! The task supports graceful shutdown via a cancellation token. When the token
 //! is cancelled, the task completes its current iteration and exits cleanly.
 
-// Allow dead code during incremental development - will be spawned in main.rs
-// in a future phase.
-#![allow(dead_code)]
-
 use crate::repositories::MediaHandlersRepository;
 use sqlx::PgPool;
 use std::time::Duration;

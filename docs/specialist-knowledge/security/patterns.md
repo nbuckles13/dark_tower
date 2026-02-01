@@ -90,8 +90,8 @@ This provides defense-in-depth beyond custom Debug implementations, catching cre
 ---
 
 ## Pattern: External Resource Registration Validation
-**Added**: 2026-01-24
-**Related files**: `crates/global-controller/src/services/media_handler_registry.rs`
+**Added**: 2026-01-24 (Updated: 2026-01-31)
+**Related files**: `crates/global-controller/src/grpc/mh_service.rs`, `crates/global-controller/src/repositories/media_handlers.rs`
 
 When services register external resources (handlers, endpoints, callback URLs), validate both identifier format AND URL security:
 
@@ -105,7 +105,7 @@ This pattern applies to: Media Handler registration, webhook callbacks, federati
 
 ## Pattern: Authorization State Separation with Audit Trail
 **Added**: 2026-01-25
-**Related files**: `docs/decisions/adr-0023-mc-architecture.md`
+**Related files**: `docs/decisions/adr-0023-meeting-controller-architecture.md`
 
 When multiple actors can affect the same state (e.g., mute), maintain separate state per actor:
 1. **Self-initiated state**: User controls (e.g., `self_muted: bool`)
@@ -118,7 +118,7 @@ Benefits: (1) Clear audit trail - who caused the mute, (2) Proper restoration - 
 
 ## Pattern: HKDF Key Derivation for Scoped Tokens
 **Added**: 2026-01-25
-**Related files**: `docs/decisions/adr-0023-mc-architecture.md`
+**Related files**: `docs/decisions/adr-0023-meeting-controller-architecture.md`
 
 When generating tokens scoped to a resource (meeting, session, room), derive per-resource keys using HKDF rather than using a single master key directly:
 
@@ -239,7 +239,7 @@ Preserve error context for debugging via server-side logging while returning gen
 
 ## Pattern: Test Infrastructure Security (Mock Credentials)
 **Added**: 2026-01-31
-**Related files**: `crates/meeting-controller/tests/gc_integration.rs`, `crates/global-controller/tests/api_tests.rs`
+**Related files**: `crates/meeting-controller/tests/gc_integration.rs`, `crates/global-controller/tests/meeting_tests.rs`
 
 Test infrastructure (mocks, fixtures, integration tests) should use obviously fake credentials to prevent confusion with production values. Pattern:
 

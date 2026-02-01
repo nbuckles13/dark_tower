@@ -194,23 +194,20 @@ Background task `start_assignment_cleanup()` runs both operations periodically. 
 
 ---
 
-## Integration: GC-to-MC Assignment RPC Flow
-**Added**: 2026-01-24
-**Related files**: `crates/global-controller/src/services/mc_client.rs`, `crates/global-controller/src/handlers/meetings.rs`
+## Integration: GC-to-MC Assignment RPC Flow with MH Selection
+**Added**: 2026-01-24, **Updated**: 2026-01-31
+**Related files**: `crates/global-controller/src/services/mc_client.rs`, `crates/global-controller/src/services/mc_assignment.rs`, `crates/global-controller/src/handlers/meetings.rs`
 
-After assigning an MC to a meeting, GC notifies the MC via gRPC:
+Meeting join triggers MC assignment with MH selection (ADR-0010 Section 4a):
 
-1. GC selects MC via load balancer (weighted random by available capacity)
-2. GC persists assignment in `meeting_mc_assignments` table
-3. GC calls `McClient::assign_meeting(mc_endpoint, meeting_id, meeting_code)`
-4. MC receives `AssignMeetingRequest`, creates internal meeting state
-5. MC responds with success or rejection reason
+1. GC selects MHs for the meeting via `MhSelectionService::select_mhs_for_meeting()` (primary + backup in different AZs)
+2. GC selects MC via load balancer (weighted random by available capacity)
+3. GC calls `McClient::assign_meeting(mc_endpoint, meeting_id, mh_assignments, gc_id)` - notifies MC BEFORE DB write
+4. On MC acceptance: GC persists assignment in `meeting_assignments` table
+5. On MC rejection: GC retries with different MC (up to 3 attempts)
 
-**Rejection handling**: If MC rejects (over capacity, shutting down):
-1. GC marks current assignment as ended (`end_assignment`)
-2. GC retries assignment with different MC (exclude rejected MC)
-3. After N retries, return error to client
+**Key change from legacy**: `assign_meeting_with_mh()` replaced `assign_meeting()`. The old function (no MH selection, no MC RPC) was removed. All handlers now use the new flow.
 
-**Client configuration**: MC client uses `SecretString` for service token, lazy channel connection, and cached channels per endpoint.
+**Client configuration**: MC client uses `SecretString` for service token, lazy channel connection, and cached channels per endpoint. Inject `MockMcClient::accepting()` for tests.
 
 ---

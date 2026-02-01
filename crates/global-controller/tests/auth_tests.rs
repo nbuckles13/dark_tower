@@ -10,6 +10,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chrono::Utc;
 use global_controller::config::Config;
 use global_controller::routes::{self, AppState};
+use global_controller::services::MockMcClient;
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use ring::signature::{Ed25519KeyPair, KeyPair};
 use serde::{Deserialize, Serialize};
@@ -152,10 +153,12 @@ impl TestAuthServer {
         let config = Config::from_vars(&vars)
             .map_err(|e| anyhow::anyhow!("Failed to create config: {}", e))?;
 
-        // Create application state
+        // Create application state with MockMcClient
+        let mock_mc_client = Arc::new(MockMcClient::accepting());
         let state = Arc::new(AppState {
             pool: pool.clone(),
             config: config.clone(),
+            mc_client: mock_mc_client,
         });
 
         // Build routes

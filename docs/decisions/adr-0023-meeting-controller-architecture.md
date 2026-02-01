@@ -987,10 +987,10 @@ crates/mc-test-utils/
 
 | Task | Status | Commit | Notes |
 |------|--------|--------|-------|
-| MC registration with GC | ❌ Pending | | RegisterMc RPC (GC side exists) |
-| MC heartbeat to GC | ❌ Pending | | Heartbeat RPC (GC side exists) |
-| AssignMeeting handling | ❌ Pending | | Accept/reject logic, MH assignment storage |
-| Fencing token validation | ❌ Pending | | Lua script, generation checks |
+| MC registration with GC | ✅ Done | 1175888 | RegisterMc RPC wiring |
+| MC heartbeat to GC | ✅ Done | 1175888 | Heartbeat RPC wiring |
+| AssignMeeting handling | ✅ Done | ddb6ddc | Accept/reject logic, MH assignment storage, resilience |
+| Fencing token validation | ✅ Done | ddb6ddc | Lua script, generation checks |
 
 ### Phase 6d: MH Integration
 
@@ -1033,7 +1033,7 @@ crates/mc-test-utils/
 
 | Task | Status | Commit | Notes |
 |------|--------|--------|-------|
-| Health endpoints | ❌ Pending | | /health/live, /health/ready |
+| Health endpoints | ❌ Pending | | /health, /ready |
 | Degraded state handling | ❌ Pending | | High latency, capacity 80-95% |
 | Metrics | ❌ Pending | | mc_connections_active, mc_meetings_active, etc. |
 | W3C trace context | ❌ Pending | | traceparent propagation |

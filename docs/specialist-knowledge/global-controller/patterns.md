@@ -222,8 +222,8 @@ Benefits: Reduces connection overhead, enables HTTP/2 stream reuse, prevents con
 ---
 
 ## Pattern: Mock Trait for Testing gRPC Clients
-**Added**: 2026-01-24
-**Related files**: `crates/global-controller/src/services/mc_client.rs`
+**Added**: 2026-01-24, **Updated**: 2026-01-31
+**Related files**: `crates/global-controller/src/services/mc_client.rs`, `crates/global-controller/src/routes/mod.rs`
 
 Define async trait for gRPC client operations and implement both real and mock versions:
 ```rust
@@ -235,7 +235,7 @@ pub trait McClientTrait: Send + Sync {
 pub struct McClient { /* real implementation */ }
 pub struct MockMcClient { /* test implementation */ }
 ```
-Use `Arc<dyn McClientTrait>` in service layer. Tests inject `MockMcClient` that returns configured responses without network calls. This avoids `#[cfg(test)]` coupling and works in both unit and integration tests.
+Store as **required** field in AppState: `mc_client: Arc<dyn McClientTrait>` (NOT `Option<Arc<...>>`). Tests inject `MockMcClient::accepting()` which returns configured responses without network calls. Avoid optional dependencies with fallback logic - this can cause tests to exercise different code than production. Making the dependency required ensures all code paths use the same logic.
 
 ---
 

@@ -111,9 +111,10 @@ pub async fn join_meeting(
         MeetingRole::Participant
     };
 
-    // Assign meeting to MC (or get existing assignment)
-    let mc_assignment = McAssignmentService::assign_meeting(
+    // Assign meeting to MC with MH selection (ADR-0010 Section 4a)
+    let assignment_with_mh = McAssignmentService::assign_meeting_with_mh(
         &state.pool,
+        state.mc_client.clone(),
         &meeting.meeting_id.to_string(),
         &state.config.region,
         &state.config.gc_id,
@@ -142,7 +143,8 @@ pub async fn join_meeting(
         target: "gc.handlers.meetings",
         meeting_id = %meeting.meeting_id,
         user_id = %user_id,
-        mc_id = %mc_assignment.mc_id,
+        mc_id = %assignment_with_mh.mc_assignment.mc_id,
+        primary_mh_id = %assignment_with_mh.mh_selection.primary.mh_id,
         participant_type = ?participant_type,
         "User joined meeting"
     );
@@ -153,9 +155,9 @@ pub async fn join_meeting(
         meeting_id: meeting.meeting_id,
         meeting_name: meeting.display_name,
         mc_assignment: McAssignmentInfo {
-            mc_id: mc_assignment.mc_id,
-            webtransport_endpoint: mc_assignment.webtransport_endpoint,
-            grpc_endpoint: mc_assignment.grpc_endpoint,
+            mc_id: assignment_with_mh.mc_assignment.mc_id,
+            webtransport_endpoint: assignment_with_mh.mc_assignment.webtransport_endpoint,
+            grpc_endpoint: assignment_with_mh.mc_assignment.grpc_endpoint,
         },
     }))
 }
@@ -229,9 +231,10 @@ pub async fn get_guest_token(
     // Generate guest ID using CSPRNG
     let guest_id = generate_guest_id()?;
 
-    // Assign meeting to MC (or get existing assignment)
-    let mc_assignment = McAssignmentService::assign_meeting(
+    // Assign meeting to MC with MH selection (ADR-0010 Section 4a)
+    let assignment_with_mh = McAssignmentService::assign_meeting_with_mh(
         &state.pool,
+        state.mc_client.clone(),
         &meeting.meeting_id.to_string(),
         &state.config.region,
         &state.config.gc_id,
@@ -255,7 +258,8 @@ pub async fn get_guest_token(
         target: "gc.handlers.meetings",
         meeting_id = %meeting.meeting_id,
         guest_id = %guest_id,
-        mc_id = %mc_assignment.mc_id,
+        mc_id = %assignment_with_mh.mc_assignment.mc_id,
+        primary_mh_id = %assignment_with_mh.mh_selection.primary.mh_id,
         waiting_room = meeting.waiting_room_enabled,
         "Guest joined meeting"
     );
@@ -266,9 +270,9 @@ pub async fn get_guest_token(
         meeting_id: meeting.meeting_id,
         meeting_name: meeting.display_name,
         mc_assignment: McAssignmentInfo {
-            mc_id: mc_assignment.mc_id,
-            webtransport_endpoint: mc_assignment.webtransport_endpoint,
-            grpc_endpoint: mc_assignment.grpc_endpoint,
+            mc_id: assignment_with_mh.mc_assignment.mc_id,
+            webtransport_endpoint: assignment_with_mh.mc_assignment.webtransport_endpoint,
+            grpc_endpoint: assignment_with_mh.mc_assignment.grpc_endpoint,
         },
     }))
 }

@@ -28,13 +28,17 @@ mod tasks;
 use auth::{JwksClient, JwtValidator};
 use config::Config;
 use grpc::auth_layer::async_auth::GrpcAuthLayer;
-use grpc::McService;
+use grpc::{McService, MhService};
 use proto_gen::internal::global_controller_service_server::GlobalControllerServiceServer;
+use proto_gen::internal::media_handler_registry_service_server::MediaHandlerRegistryServiceServer;
 use routes::AppState;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use tasks::{start_assignment_cleanup, start_health_checker, AssignmentCleanupConfig};
+use tasks::{
+    start_assignment_cleanup, start_health_checker, start_mh_health_checker,
+    AssignmentCleanupConfig,
+};
 use tokio::signal;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::Server as TonicServer;
@@ -92,10 +96,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let grpc_bind_address = config.grpc_bind_address.clone();
     let mc_staleness_threshold = config.mc_staleness_threshold_seconds;
 
+    // Create MC client for GC->MC communication
+    let gc_service_token = std::env::var("GC_SERVICE_TOKEN")
+        .map_err(|_| "GC_SERVICE_TOKEN environment variable is required")?;
+    let mc_client: Arc<dyn services::McClientTrait> = Arc::new(services::McClient::new(
+        common::secret::SecretString::from(gc_service_token),
+    ));
+
     // Create application state
     let state = Arc::new(AppState {
         pool: db_pool.clone(),
         config,
+        mc_client,
     });
 
     // Create JWT validator for gRPC auth
@@ -108,8 +120,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Build HTTP application routes
     let http_app = routes::build_routes(state.clone());
 
-    // Create gRPC service with auth layer
+    // Create gRPC services with auth layer
     let mc_service = McService::new(state.clone());
+    let mh_service = MhService::new(Arc::new(db_pool.clone()));
     let grpc_auth_layer = GrpcAuthLayer::new(jwt_validator);
 
     // Create cancellation token for graceful shutdown
@@ -141,6 +154,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         start_assignment_cleanup(cleanup_pool, cleanup_config, cleanup_token).await;
     });
 
+    // Start MH health checker background task
+    let mh_health_checker_pool = db_pool.clone();
+    let mh_health_checker_token = cancel_token.clone();
+    let mh_staleness_threshold = mc_staleness_threshold; // Use same threshold as MC health checker
+    let mh_health_checker_handle = tokio::spawn(async move {
+        start_mh_health_checker(
+            mh_health_checker_pool,
+            mh_staleness_threshold,
+            mh_health_checker_token,
+        )
+        .await;
+    });
+
     // Parse HTTP bind address
     let http_addr: SocketAddr = http_bind_address.parse().map_err(|e| {
         error!("Invalid HTTP bind address: {}", e);
@@ -163,10 +189,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         http_app.into_make_service_with_connect_info::<SocketAddr>(),
     );
 
-    // Start gRPC server with auth layer
+    // Start gRPC server with auth layer and both MC and MH services
     let grpc_server = TonicServer::builder()
         .layer(grpc_auth_layer)
         .add_service(GlobalControllerServiceServer::new(mc_service))
+        .add_service(MediaHandlerRegistryServiceServer::new(mh_service))
         .serve(grpc_addr);
 
     // Run both servers concurrently with graceful shutdown
@@ -194,6 +221,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Err(e) = cleanup_handle.await {
         error!("Assignment cleanup task error: {}", e);
+    }
+    if let Err(e) = mh_health_checker_handle.await {
+        error!("MH health checker task error: {}", e);
     }
 
     info!("Global Controller shutdown complete");
