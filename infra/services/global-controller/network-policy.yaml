@@ -1,0 +1,76 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: global-controller
+  namespace: dark-tower
+  labels:
+    app: global-controller
+    component: gateway
+spec:
+  podSelector:
+    matchLabels:
+      app: global-controller
+      component: gateway
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  # Allow ingress from Meeting Controller (gRPC registration/heartbeat)
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: dark-tower
+      podSelector:
+        matchLabels:
+          app: meeting-controller
+    ports:
+    - protocol: TCP
+      port: 50051
+  # Allow ingress from external clients (via ingress controller)
+  # In Kind, we use port-forward so this allows any source on HTTP port
+  - from: []
+    ports:
+    - protocol: TCP
+      port: 8080
+  # Allow ingress from Prometheus for metrics scraping
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: dark-tower-observability
+      podSelector:
+        matchLabels:
+          app: prometheus
+    ports:
+    - protocol: TCP
+      port: 8080
+  egress:
+  # Allow egress to Auth Controller
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: dark-tower
+      podSelector:
+        matchLabels:
+          app: ac-service
+    ports:
+    - protocol: TCP
+      port: 8082
+  # Allow egress to PostgreSQL
+  - to:
+    - podSelector:
+        matchLabels:
+          app: postgres
+    ports:
+    - protocol: TCP
+      port: 5432
+  # Allow DNS resolution
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: kube-system
+      podSelector:
+        matchLabels:
+          k8s-app: kube-dns
+    ports:
+    - protocol: UDP
+      port: 53

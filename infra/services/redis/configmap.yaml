@@ -1,0 +1,48 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: redis-config
+  namespace: dark-tower
+  labels:
+    app: redis
+    component: cache
+data:
+  redis.conf: |
+    # Redis configuration for Dark Tower MC session state
+    # Single instance for local Kind development (production uses Sentinel)
+
+    # Bind to all interfaces (container network)
+    bind 0.0.0.0
+
+    # Standard Redis port
+    port 6379
+
+    # Password is set via command line --requirepass flag
+    # This avoids needing to template the config file
+
+    # Persistence: Append Only File for durability
+    appendonly yes
+    appendfsync everysec
+    auto-aof-rewrite-percentage 100
+    auto-aof-rewrite-min-size 64mb
+
+    # RDB snapshots (backup in addition to AOF)
+    save 900 1
+    save 300 10
+    save 60 10000
+
+    # Memory management
+    maxmemory 200mb
+    maxmemory-policy allkeys-lru
+
+    # Logging
+    loglevel notice
+
+    # Performance tuning for Kind/local development
+    tcp-keepalive 300
+    timeout 0
+
+    # Disable dangerous commands in production-like environments
+    rename-command FLUSHDB ""
+    rename-command FLUSHALL ""
+    rename-command DEBUG ""

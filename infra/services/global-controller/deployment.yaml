@@ -1,0 +1,116 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: global-controller
+  namespace: dark-tower
+  labels:
+    app: global-controller
+    component: gateway
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: global-controller
+      component: gateway
+  template:
+    metadata:
+      labels:
+        app: global-controller
+        component: gateway
+    spec:
+      terminationGracePeriodSeconds: 35
+      securityContext:
+        runAsNonRoot: true
+        # Match distroless nonroot user (uid 65532)
+        runAsUser: 65532
+        fsGroup: 65532
+      containers:
+      - name: global-controller
+        image: localhost/global-controller:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - name: http
+          containerPort: 8080
+          protocol: TCP
+        - name: grpc
+          containerPort: 50051
+          protocol: TCP
+        env:
+        - name: BIND_ADDRESS
+          valueFrom:
+            configMapKeyRef:
+              name: global-controller-config
+              key: BIND_ADDRESS
+        - name: GC_GRPC_BIND_ADDRESS
+          valueFrom:
+            configMapKeyRef:
+              name: global-controller-config
+              key: GC_GRPC_BIND_ADDRESS
+        - name: GC_REGION
+          valueFrom:
+            configMapKeyRef:
+              name: global-controller-config
+              key: GC_REGION
+        - name: AC_JWKS_URL
+          valueFrom:
+            configMapKeyRef:
+              name: global-controller-config
+              key: AC_JWKS_URL
+        - name: AC_INTERNAL_URL
+          valueFrom:
+            configMapKeyRef:
+              name: global-controller-config
+              key: AC_INTERNAL_URL
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: global-controller-secrets
+              key: DATABASE_URL
+        - name: RUST_LOG
+          value: "info,global_controller=debug"
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 65532
+          readOnlyRootFilesystem: true
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+            scheme: HTTP
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 5
+          successThreshold: 1
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8080
+            scheme: HTTP
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 3
+          successThreshold: 1
+          failureThreshold: 3
+        volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+      volumes:
+      - name: tmp
+        emptyDir: {}
