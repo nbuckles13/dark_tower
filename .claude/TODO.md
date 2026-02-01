@@ -286,6 +286,47 @@ All major attack vectors now covered:
 - [x] Missing required claims
 - [x] Clock skew boundary conditions (added in configurable clock skew work)
 
+## Cross-Service Duplication (DRY)
+
+### From ADR-0010 Phase 4a Review (2026-01-31)
+
+#### Priority 1: Health Status Conversion Inconsistency
+- [ ] **Standardize HealthStatus::from_proto() usage**: MH service uses inline match with `Pending` default, MC uses centralized method with `Unhealthy` default
+  - Location: `crates/global-controller/src/grpc/mh_service.rs:202-209`
+  - Security concern: Fail-closed (Unhealthy) is safer than Pending
+  - Action: Update MH service to use `HealthStatus::from_proto()` method
+  - Document rationale for `Unhealthy` default in method docs
+
+#### Priority 2: Generic Health Checker Extraction
+- [ ] **Extract generic health checker task**: MC and MH health checkers are 95% identical (~300 lines duplicated)
+  - Locations: `crates/global-controller/src/tasks/health_checker.rs`, `crates/global-controller/src/tasks/mh_health_checker.rs`
+  - Common pattern: Same interval, same tokio::select loop, same graceful shutdown, same error handling
+  - Proposal: Create `generic_health_checker.rs` with parameterized entity type
+  - Would eliminate 300+ lines of duplication
+
+#### Priority 3: gRPC Validation Utilities
+- [ ] **Extract gRPC input validation to common module**: MC and MH services duplicate validation logic (~100 lines)
+  - Locations: `crates/global-controller/src/grpc/mc_service.rs:54-163`, `crates/global-controller/src/grpc/mh_service.rs:46-121`
+  - Duplicate constants: `MAX_REGION_LENGTH`, `MAX_ENDPOINT_LENGTH`, `MAX_ID_LENGTH`
+  - Duplicate functions: `validate_region()`, `validate_endpoint()`, `validate_*_id()`
+  - Proposal: Create `crates/common/src/grpc_validation.rs` or `crates/global-controller/src/validation.rs`
+  - Would centralize gRPC input validation standards
+
+#### Priority 4: Heartbeat Interval Constants
+- [ ] **Centralize heartbeat interval constants**: Defined in 3 different places
+  - Locations: `mc_service.rs:24-27`, `mh_service.rs:24`, `meeting-controller/gc_client.rs:42-45`
+  - Same values (10s fast, 30s comprehensive) but different constant names/units
+  - Risk: Client/server drift if changed independently
+  - Proposal: Extract to `crates/common/src/config.rs` heartbeat module
+  - Ensures protocol-level agreement on intervals
+
+#### Priority 5: gRPC Channel Pooling Pattern
+- [ ] **Monitor for channel pooling duplication**: Currently only MC client uses this pattern
+  - Location: `crates/global-controller/src/services/mc_client.rs:70-122`
+  - Pattern: `Arc<RwLock<HashMap<String, Channel>>>` with get_channel() method
+  - Action: If MH client or GC-to-GC client implemented, extract to `crates/common/src/grpc_client.rs`
+  - Not urgent (only one instance exists), but worth tracking
+
 ## Low Priority
 
 ### Clean up dead_code lints (Phase 5+)

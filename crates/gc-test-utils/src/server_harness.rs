@@ -4,6 +4,7 @@
 
 use global_controller::config::Config;
 use global_controller::routes::{self, AppState};
+use global_controller::services::MockMcClient;
 use sqlx::PgPool;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -66,10 +67,12 @@ impl TestGcServer {
         let config = Config::from_vars(&vars)
             .map_err(|e| anyhow::anyhow!("Failed to create config: {}", e))?;
 
-        // Create application state
+        // Create application state with MockMcClient
+        let mock_mc_client = Arc::new(MockMcClient::accepting());
         let state = Arc::new(AppState {
             pool: pool.clone(),
             config: config.clone(),
+            mc_client: mock_mc_client,
         });
 
         // Build routes using global-controller's real route builder

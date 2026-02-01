@@ -14,6 +14,4 @@ pub mod mh_health_checker;
 
 pub use assignment_cleanup::{start_assignment_cleanup, AssignmentCleanupConfig};
 pub use health_checker::start_health_checker;
-// MH health checker will be spawned in main.rs in future phase
-#[allow(unused_imports)]
 pub use mh_health_checker::start_mh_health_checker;

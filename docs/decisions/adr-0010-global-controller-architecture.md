@@ -1160,7 +1160,8 @@ Must test and handle:
 | 4a | GC→MC AssignMeeting RPC | ✅ Done | 921ebb6 | MC accepts/rejects meeting |
 | 4a | MC Rejection Handling in GC | ✅ Done | 921ebb6 | Retry with different MC (max 3) |
 | 4a | MH Registry in GC | ✅ Done | 921ebb6 | MH registration + load reports |
-| 4a | Wire MH/MC Components | ❌ Pending | | Wire MhService, health checker, assign_meeting_with_mh into handlers/main.rs |
+| 4a | Wire MH/MC Components | ✅ Done | pending | Wire MhService, health checker, assign_meeting_with_mh into handlers/main.rs |
+| 4a | Captcha Validation for Guest Access | ❌ Pending | | Implement reCAPTCHA v3 or Cloudflare Turnstile validation in `get_guest_token` endpoint to prevent automated abuse (currently accepts any non-empty token) |
 | 4a | env-tests for MH Registry + Assignment RPC | ❌ Pending | | End-to-end tests with real GC/MC/MH: MH registration, load reports, assignment with MH selection, MC accept/reject |
 | 4a | MH Cross-Region Sync | ❌ Pending | | Sync MH registry via GC-to-GC |
 | 4a | RequestMhReplacement RPC | ❌ Pending | | MC requests MH replacement |

@@ -21,19 +21,19 @@ Tracked duplication patterns with assigned IDs for consistent classification.
 
 ---
 
-### TD-1: JWT Validation Duplication (AC vs GC)
-**Added**: 2026-01-15 | **Updated**: 2026-01-24
-**Related files**: `crates/ac-service/src/crypto/mod.rs`, `crates/global-controller/src/auth/jwt.rs`
+### TD-1: JWT Validation Duplication (AC vs GC) - RESOLVED
+**Added**: 2026-01-15 | **Resolved**: 2026-01-31
+**Related files**: `crates/common/src/jwt.rs` (canonical location)
 
-JWT validation logic duplicated between AC and GC: `extract_jwt_kid` (AC) vs `extract_kid` (GC), `verify_jwt` (AC) vs `verify_token` (GC), and `MAX_JWT_SIZE_BYTES` constant (4KB in AC, 8KB in GC). Additionally, JWT clock skew constants (e.g., `CLOCK_SKEW_SECONDS`) are duplicated in both services for `iat`/`exp` validation. Severity: Medium. Improvement path: Extract to `common::crypto::jwt` utilities module with configurable constants. Timeline: Phase 5+ (post-Phase 4 hardening). Note: GC uses JWKS client for key fetching while AC uses database - extraction must preserve these different key sources.
+**RESOLVED**: JWT utilities extracted to `crates/common/src/jwt.rs` per commits babd7f7 and 2b4b70f. Includes `extract_kid()`, clock skew constants (`DEFAULT_CLOCK_SKEW_SECONDS`, `MAX_CLOCK_SKEW_SECONDS`), and `MAX_JWT_SIZE_BYTES`. AC and GC now re-export from common for backwards compatibility.
 
 ---
 
-### TD-2: EdDSA Key Handling Patterns
-**Added**: 2026-01-15
-**Related files**: `crates/ac-service/src/crypto/mod.rs`, `crates/global-controller/src/auth/jwt.rs`
+### TD-2: EdDSA Key Handling Patterns - RESOLVED
+**Added**: 2026-01-15 | **Resolved**: 2026-01-31
+**Related files**: `crates/common/src/jwt.rs` (canonical location)
 
-Both services implement EdDSA public key decoding from base64url and DecodingKey creation. Severity: Low (small code). Improvement path: Consider extraction when a third service (MC or MH) needs the same pattern. Timeline: Phase 5+ or when third consumer appears.
+**RESOLVED**: EdDSA key handling consolidated into `crates/common/src/jwt.rs` as part of JWT utilities extraction (commits babd7f7, 2b4b70f). Public key decoding from base64url and DecodingKey creation now shared.
 
 ---
 
@@ -114,6 +114,14 @@ All three services implement nearly identical `shutdown_signal()` async function
 **Related files**: `crates/meeting-controller/src/main.rs:56-62`, `crates/global-controller/src/main.rs:46-53`, `crates/ac-service/src/main.rs:24-32`
 
 All three services have identical tracing_subscriber initialization (~7 lines each): `registry().with(EnvFilter).with(fmt::layer()).init()`. Only difference is the default filter string (service name). Severity: Low (small code, boilerplate). Improvement path: Extract to `common::observability::init_tracing(default_filter: &str)`. Timeline: Phase 5+ (infrastructure cleanup). Note: Very low priority - the code is small and unlikely to diverge.
+
+---
+
+### TD-13: Health Checker Background Task Pattern
+**Added**: 2026-01-31
+**Related files**: `crates/meeting-controller/src/health/checker.rs`, `crates/media-handler/src/health/checker.rs`
+
+Both MC and MH implement similar health checker background tasks (~150 lines each, ~300 total): spawn tokio task, periodic check loop with configurable interval, aggregate component health into overall status, expose via gRPC health service. Pattern includes: `HealthChecker` struct with `CancellationToken`, check interval, and atomic health state. Severity: Low (infrastructure, acceptable for 2 services). Improvement path: Consider `common::health::HealthChecker<T: HealthCheckable>` trait when third service needs same pattern. Timeline: Phase 5+ (infrastructure cleanup). Note: Current duplication acceptable - services have different components to check and different aggregation strategies.
 
 ---
 

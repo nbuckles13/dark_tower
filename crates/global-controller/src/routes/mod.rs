@@ -6,6 +6,7 @@ use crate::auth::{JwksClient, JwtValidator};
 use crate::config::Config;
 use crate::handlers;
 use crate::middleware::{require_auth, AuthState};
+use crate::services::mc_client::McClientTrait;
 use axum::{
     middleware,
     routing::{get, patch, post},
@@ -24,6 +25,9 @@ pub struct AppState {
 
     /// Service configuration.
     pub config: Config,
+
+    /// MC client for GC->MC communication.
+    pub mc_client: Arc<dyn McClientTrait>,
 }
 
 /// Build the application routes.

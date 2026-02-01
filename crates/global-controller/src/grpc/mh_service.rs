@@ -9,10 +9,6 @@
 //! - Handler IDs are validated for format
 //! - Sensitive fields are not logged
 
-// Allow dead code during incremental development - this module will be wired
-// into the gRPC server in a future phase.
-#![allow(dead_code)]
-
 use crate::repositories::{HealthStatus, MediaHandlersRepository};
 use chrono::Utc;
 use proto_gen::internal::{

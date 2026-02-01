@@ -9,10 +9,6 @@
 //! - All database operations use parameterized queries
 //! - Error messages are generic to prevent information leakage
 
-// Allow dead code during incremental development - will be used by mc_assignment
-// service when wired into handlers.
-#![allow(dead_code)]
-
 use crate::errors::GcError;
 use crate::repositories::{MediaHandlersRepository, MhCandidate};
 use ring::rand::{SecureRandom, SystemRandom};

@@ -101,8 +101,8 @@ Custom Debug implementations only activate when `{:?}` formatting is used. Crede
 ---
 
 ## Gotcha: Service Tokens in Registration Structs Often Missed
-**Added**: 2026-01-24
-**Related files**: `crates/global-controller/src/services/media_handler_registry.rs`
+**Added**: 2026-01-24 (Updated: 2026-01-31)
+**Related files**: `crates/global-controller/src/grpc/mh_service.rs`, `crates/global-controller/src/repositories/media_handlers.rs`
 
 When implementing service registration (handlers, workers, external services), the authentication token field is often stored as plain `String` because the focus is on the registration logic rather than data protection. This is especially common in: (1) Registry structs that cache registered services, (2) DTO structs for registration requests, (3) Handler metadata stored in HashMaps. Pattern: When reviewing registration flows, explicitly check for token/secret fields and verify they use `SecretString`. The field names vary: `service_token`, `auth_token`, `bearer_token`, `api_key`, `secret`.
 
@@ -110,7 +110,7 @@ When implementing service registration (handlers, workers, external services), t
 
 ## Gotcha: Token Comparison Must Use Constant-Time Operations
 **Added**: 2026-01-25
-**Related files**: `docs/decisions/adr-0023-mc-architecture.md`
+**Related files**: `docs/decisions/adr-0023-meeting-controller-architecture.md`
 
 Direct byte comparison of tokens (`==`) leaks timing information that can reveal valid tokens character-by-character. For HMAC tokens, use `ring::hmac::verify()` which performs constant-time comparison internally. For non-HMAC tokens, use `ring::constant_time::verify_slices_are_equal()` or `subtle::ConstantTimeEq`. Common mistake: verifying HMAC by computing expected tag and comparing with `==`. The fix: `hmac::verify(&key, message, received_tag)` returns `Ok(())` or `Err(Unspecified)` safely. This applies to: binding tokens, session tokens, CSRF tokens, any security-sensitive comparison.
 
@@ -118,7 +118,7 @@ Direct byte comparison of tokens (`==`) leaks timing information that can reveal
 
 ## Gotcha: Error Messages Leaking Internal Identifiers
 **Added**: 2026-01-25
-**Related files**: `docs/decisions/adr-0023-mc-architecture.md`
+**Related files**: `docs/decisions/adr-0023-meeting-controller-architecture.md`
 
 Error messages returned to clients should never include internal identifiers (session IDs, user IDs, meeting IDs, participant IDs). These identifiers: (1) Enable enumeration attacks - probe which IDs exist, (2) Aid correlation attacks - link sessions across requests, (3) Leak implementation details. Pattern: Use typed error variants internally (e.g., `ParticipantNotFound(participant_id)`) but convert to generic messages at the API boundary: "Participant not found" without the ID. Log the full error server-side with the ID for debugging. Applies to: 401/403/404 responses, WebSocket/WebTransport error frames, error bodies in any client-facing response.
 
@@ -153,5 +153,31 @@ let raw_bytes = master_secret.expose_secret(); // Don't store this!
 ```
 
 **Why**: Calling `.expose_secret()` returns a reference valid only for the current scope. If stored in a local variable, the reference could be reused after the SecretBox mutates or drops, creating a use-after-free. Keep `.expose_secret()` calls inline with their usage (validation, HKDF input, HMAC computation).
+
+---
+
+## Gotcha: Credential Fallbacks Bypass Fail-Fast Security
+**Added**: 2026-01-31
+**Related files**: `crates/global-controller/src/main.rs`
+
+Using `.unwrap_or_default()`, `.unwrap_or("")`, or similar fallback patterns on required credentials silently allows services to start with empty/invalid authentication. Pattern to avoid:
+
+```rust
+// DANGEROUS: Service starts with empty token if env var missing
+let token = std::env::var("SERVICE_TOKEN").unwrap_or_default();
+
+// DANGEROUS: Option<SecretString> with fallback to empty
+let token = config.service_token.unwrap_or(SecretString::from(""));
+```
+
+**Impact**: Violates zero-trust architecture by allowing unauthenticated service-to-service calls. The service appears healthy but all outbound requests will fail authentication.
+
+**Correct pattern**:
+```rust
+let token = std::env::var("SERVICE_TOKEN")
+    .map_err(|_| "SERVICE_TOKEN is required")?;
+```
+
+**Detection during review**: Search for `.unwrap_or`, `.unwrap_or_default()`, `.unwrap_or_else(|| ...)` near `SecretString`, `service_token`, `api_key`, `bearer_token`, `GC_SERVICE_TOKEN`, `MC_SERVICE_TOKEN`. Each instance needs verification that the fallback value is acceptable (usually it's not for credentials).
 
 ---

@@ -10,6 +10,4 @@ pub mod mh_service;
 #[allow(unused_imports)] // Alternative API
 pub use auth_layer::GrpcAuthInterceptor;
 pub use mc_service::McService;
-// MhService will be wired into gRPC server in future phase
-#[allow(unused_imports)]
 pub use mh_service::MhService;

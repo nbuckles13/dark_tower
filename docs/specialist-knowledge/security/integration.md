@@ -61,8 +61,8 @@ GC validates JWTs from AC via JWKS. Requirements: (1) Fetch JWKS from AC_JWKS_UR
 ---
 
 ## Integration: Global Controller - Media Handler Registration Security
-**Added**: 2026-01-24
-**Related files**: `crates/global-controller/src/services/media_handler_registry.rs`
+**Added**: 2026-01-24 (Updated: 2026-01-31)
+**Related files**: `crates/global-controller/src/grpc/mh_service.rs`, `crates/global-controller/src/repositories/media_handlers.rs`
 
 When Media Handlers register with GC, validate: (1) handler_id format (alphanumeric + underscore/hyphen only, max 64 chars), (2) endpoint URL scheme (HTTPS required), (3) service_token stored as SecretString not plain String. Registration endpoints should be authenticated - only services with valid AC tokens can register handlers. Consider IP allowlisting for handler registration in production.
 
@@ -70,7 +70,7 @@ When Media Handlers register with GC, validate: (1) handler_id format (alphanume
 
 ## Integration: Meeting Controller - Session Binding Security
 **Added**: 2026-01-25 (Updated: 2026-01-25)
-**Related files**: `docs/decisions/adr-0023-mc-architecture.md`
+**Related files**: `docs/decisions/adr-0023-meeting-controller-architecture.md`
 
 MC binds WebTransport sessions to authenticated users. Requirements:
 
