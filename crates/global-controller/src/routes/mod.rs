@@ -33,11 +33,11 @@ pub struct AppState {
 /// Build the application routes.
 ///
 /// Creates an Axum router with:
-/// - `/v1/health` - Health check endpoint (database ping) - public
-/// - `/v1/me` - Current user endpoint - requires authentication
-/// - `/v1/meetings/{code}` - Join meeting (authenticated)
-/// - `/v1/meetings/{code}/guest-token` - Get guest token (public)
-/// - `/v1/meetings/{id}/settings` - Update meeting settings (authenticated, host only)
+/// - `/health` - Health check endpoint (database ping) - public, unversioned
+/// - `/api/v1/me` - Current user endpoint - requires authentication
+/// - `/api/v1/meetings/{code}` - Join meeting (authenticated)
+/// - `/api/v1/meetings/{code}/guest-token` - Get guest token (public)
+/// - `/api/v1/meetings/{id}/settings` - Update meeting settings (authenticated, host only)
 /// - TraceLayer for request logging
 /// - 30 second request timeout
 pub fn build_routes(state: Arc<AppState>) -> Router {
@@ -51,11 +51,11 @@ pub fn build_routes(state: Arc<AppState>) -> Router {
 
     // Public routes (no authentication required)
     let public_routes = Router::new()
-        // Health check endpoint
-        .route("/v1/health", get(handlers::health_check))
+        // Health check endpoint (unversioned operational endpoint)
+        .route("/health", get(handlers::health_check))
         // Guest token endpoint (public, rate limited)
         .route(
-            "/v1/meetings/:code/guest-token",
+            "/api/v1/meetings/:code/guest-token",
             post(handlers::get_guest_token),
         )
         .with_state(state.clone());
@@ -63,12 +63,12 @@ pub fn build_routes(state: Arc<AppState>) -> Router {
     // Protected routes (authentication required)
     let protected_routes = Router::new()
         // Current user endpoint
-        .route("/v1/me", get(handlers::get_me))
+        .route("/api/v1/me", get(handlers::get_me))
         // Meeting join endpoint
-        .route("/v1/meetings/:code", get(handlers::join_meeting))
+        .route("/api/v1/meetings/:code", get(handlers::join_meeting))
         // Meeting settings endpoint
         .route(
-            "/v1/meetings/:id/settings",
+            "/api/v1/meetings/:id/settings",
             patch(handlers::update_meeting_settings),
         )
         .route_layer(middleware::from_fn_with_state(

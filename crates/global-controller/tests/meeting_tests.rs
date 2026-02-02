@@ -2,9 +2,9 @@
 //!
 //! Tests the meeting join, guest token, and settings update endpoints:
 //!
-//! - `GET /v1/meetings/{code}` - Join meeting (authenticated)
-//! - `POST /v1/meetings/{code}/guest-token` - Get guest token (public)
-//! - `PATCH /v1/meetings/{id}/settings` - Update meeting settings (host only)
+//! - `GET /api/v1/meetings/{code}` - Join meeting (authenticated)
+//! - `POST /api/v1/meetings/{code}/guest-token` - Get guest token (public)
+//! - `PATCH /api/v1/meetings/{id}/settings` - Update meeting settings (host only)
 //!
 //! # Test Setup
 //!
@@ -534,7 +534,7 @@ async fn register_healthy_mhs_for_region(pool: &PgPool, region: &str) {
 }
 
 // ============================================================================
-// Meeting Join Flow Tests - GET /v1/meetings/{code}
+// Meeting Join Flow Tests - GET /api/v1/meetings/{code}
 // ============================================================================
 
 /// Test that valid authenticated user can join a meeting.
@@ -566,7 +566,7 @@ async fn test_join_meeting_authenticated_success(pool: PgPool) -> Result<()> {
     let token = server.create_token_for_user(user_id);
 
     let response = client
-        .get(format!("{}/v1/meetings/ABC123", server.url()))
+        .get(format!("{}/api/v1/meetings/ABC123", server.url()))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await?;
@@ -604,7 +604,7 @@ async fn test_join_meeting_not_found(pool: PgPool) -> Result<()> {
     let token = server.create_token_for_user(user_id);
 
     let response = client
-        .get(format!("{}/v1/meetings/NOTFOUND", server.url()))
+        .get(format!("{}/api/v1/meetings/NOTFOUND", server.url()))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await?;
@@ -640,7 +640,7 @@ async fn test_join_meeting_cancelled_returns_not_found(pool: PgPool) -> Result<(
     let token = server.create_token_for_user(user_id);
 
     let response = client
-        .get(format!("{}/v1/meetings/CANCEL1", server.url()))
+        .get(format!("{}/api/v1/meetings/CANCEL1", server.url()))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await?;
@@ -677,7 +677,7 @@ async fn test_join_meeting_ended_returns_not_found(pool: PgPool) -> Result<()> {
     let token = server.create_token_for_user(user_id);
 
     let response = client
-        .get(format!("{}/v1/meetings/ENDED1", server.url()))
+        .get(format!("{}/api/v1/meetings/ENDED1", server.url()))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await?;
@@ -720,7 +720,7 @@ async fn test_join_meeting_cross_org_denied(pool: PgPool) -> Result<()> {
     let token = server.create_token_for_user(external_user_id);
 
     let response = client
-        .get(format!("{}/v1/meetings/NOEXT1", server.url()))
+        .get(format!("{}/api/v1/meetings/NOEXT1", server.url()))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await?;
@@ -774,7 +774,7 @@ async fn test_join_meeting_cross_org_allowed(pool: PgPool) -> Result<()> {
     let token = server.create_token_for_user(external_user_id);
 
     let response = client
-        .get(format!("{}/v1/meetings/EXT001", server.url()))
+        .get(format!("{}/api/v1/meetings/EXT001", server.url()))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await?;
@@ -817,7 +817,7 @@ async fn test_join_meeting_host_success(pool: PgPool) -> Result<()> {
     let token = server.create_token_for_user(host_id);
 
     let response = client
-        .get(format!("{}/v1/meetings/HOST01", server.url()))
+        .get(format!("{}/api/v1/meetings/HOST01", server.url()))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await?;
@@ -858,7 +858,7 @@ async fn test_join_meeting_non_host_member(pool: PgPool) -> Result<()> {
     let token = server.create_token_for_user(member_id);
 
     let response = client
-        .get(format!("{}/v1/meetings/MEMBER1", server.url()))
+        .get(format!("{}/api/v1/meetings/MEMBER1", server.url()))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await?;
@@ -894,7 +894,7 @@ async fn test_join_meeting_missing_auth(pool: PgPool) -> Result<()> {
 
     // No Authorization header
     let response = client
-        .get(format!("{}/v1/meetings/NOAUTH1", server.url()))
+        .get(format!("{}/api/v1/meetings/NOAUTH1", server.url()))
         .send()
         .await?;
 
@@ -927,7 +927,7 @@ async fn test_join_meeting_invalid_auth(pool: PgPool) -> Result<()> {
     let token = server.create_expired_token();
 
     let response = client
-        .get(format!("{}/v1/meetings/BADAUTH", server.url()))
+        .get(format!("{}/api/v1/meetings/BADAUTH", server.url()))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await?;
@@ -938,7 +938,7 @@ async fn test_join_meeting_invalid_auth(pool: PgPool) -> Result<()> {
 }
 
 // ============================================================================
-// Guest Token Flow Tests - POST /v1/meetings/{code}/guest-token
+// Guest Token Flow Tests - POST /api/v1/meetings/{code}/guest-token
 // ============================================================================
 
 /// Test that valid guest request returns token.
@@ -966,7 +966,10 @@ async fn test_guest_token_success(pool: PgPool) -> Result<()> {
     .await;
 
     let response = client
-        .post(format!("{}/v1/meetings/GUEST01/guest-token", server.url()))
+        .post(format!(
+            "{}/api/v1/meetings/GUEST01/guest-token",
+            server.url()
+        ))
         .json(&serde_json::json!({
             "display_name": "John Guest",
             "captcha_token": "valid-captcha-token"
@@ -990,7 +993,10 @@ async fn test_guest_token_meeting_not_found(pool: PgPool) -> Result<()> {
     let client = reqwest::Client::new();
 
     let response = client
-        .post(format!("{}/v1/meetings/NOSUCH/guest-token", server.url()))
+        .post(format!(
+            "{}/api/v1/meetings/NOSUCH/guest-token",
+            server.url()
+        ))
         .json(&serde_json::json!({
             "display_name": "John Guest",
             "captcha_token": "valid-captcha-token"
@@ -1028,7 +1034,10 @@ async fn test_guest_token_guests_not_allowed(pool: PgPool) -> Result<()> {
     .await;
 
     let response = client
-        .post(format!("{}/v1/meetings/NOGUEST/guest-token", server.url()))
+        .post(format!(
+            "{}/api/v1/meetings/NOGUEST/guest-token",
+            server.url()
+        ))
         .json(&serde_json::json!({
             "display_name": "John Guest",
             "captcha_token": "valid-captcha-token"
@@ -1070,7 +1079,10 @@ async fn test_guest_token_empty_display_name(pool: PgPool) -> Result<()> {
 
     // Empty display_name
     let response = client
-        .post(format!("{}/v1/meetings/EMPTY01/guest-token", server.url()))
+        .post(format!(
+            "{}/api/v1/meetings/EMPTY01/guest-token",
+            server.url()
+        ))
         .json(&serde_json::json!({
             "display_name": "",
             "captcha_token": "valid-captcha-token"
@@ -1112,7 +1124,10 @@ async fn test_guest_token_whitespace_display_name(pool: PgPool) -> Result<()> {
 
     // Whitespace-only display_name
     let response = client
-        .post(format!("{}/v1/meetings/WS0001/guest-token", server.url()))
+        .post(format!(
+            "{}/api/v1/meetings/WS0001/guest-token",
+            server.url()
+        ))
         .json(&serde_json::json!({
             "display_name": "   ",
             "captcha_token": "valid-captcha-token"
@@ -1151,7 +1166,10 @@ async fn test_guest_token_short_display_name(pool: PgPool) -> Result<()> {
 
     // Single character display_name (min is 2)
     let response = client
-        .post(format!("{}/v1/meetings/SHORT1/guest-token", server.url()))
+        .post(format!(
+            "{}/api/v1/meetings/SHORT1/guest-token",
+            server.url()
+        ))
         .json(&serde_json::json!({
             "display_name": "J",
             "captcha_token": "valid-captcha-token"
@@ -1190,7 +1208,10 @@ async fn test_guest_token_empty_captcha(pool: PgPool) -> Result<()> {
 
     // Empty captcha_token
     let response = client
-        .post(format!("{}/v1/meetings/CAPT01/guest-token", server.url()))
+        .post(format!(
+            "{}/api/v1/meetings/CAPT01/guest-token",
+            server.url()
+        ))
         .json(&serde_json::json!({
             "display_name": "John Guest",
             "captcha_token": ""
@@ -1228,7 +1249,10 @@ async fn test_guest_token_cancelled_meeting(pool: PgPool) -> Result<()> {
     .await;
 
     let response = client
-        .post(format!("{}/v1/meetings/GCAN01/guest-token", server.url()))
+        .post(format!(
+            "{}/api/v1/meetings/GCAN01/guest-token",
+            server.url()
+        ))
         .json(&serde_json::json!({
             "display_name": "John Guest",
             "captcha_token": "valid-captcha-token"
@@ -1246,7 +1270,7 @@ async fn test_guest_token_cancelled_meeting(pool: PgPool) -> Result<()> {
 }
 
 // ============================================================================
-// Update Meeting Settings Tests - PATCH /v1/meetings/{id}/settings
+// Update Meeting Settings Tests - PATCH /api/v1/meetings/{id}/settings
 // ============================================================================
 
 /// Test that host can update allow_guests setting.
@@ -1273,7 +1297,7 @@ async fn test_update_settings_allow_guests(pool: PgPool) -> Result<()> {
 
     let response = client
         .patch(format!(
-            "{}/v1/meetings/{}/settings",
+            "{}/api/v1/meetings/{}/settings",
             server.url(),
             meeting_id
         ))
@@ -1316,7 +1340,7 @@ async fn test_update_settings_allow_external(pool: PgPool) -> Result<()> {
 
     let response = client
         .patch(format!(
-            "{}/v1/meetings/{}/settings",
+            "{}/api/v1/meetings/{}/settings",
             server.url(),
             meeting_id
         ))
@@ -1362,7 +1386,7 @@ async fn test_update_settings_waiting_room(pool: PgPool) -> Result<()> {
 
     let response = client
         .patch(format!(
-            "{}/v1/meetings/{}/settings",
+            "{}/api/v1/meetings/{}/settings",
             server.url(),
             meeting_id
         ))
@@ -1411,7 +1435,7 @@ async fn test_update_settings_non_host_forbidden(pool: PgPool) -> Result<()> {
 
     let response = client
         .patch(format!(
-            "{}/v1/meetings/{}/settings",
+            "{}/api/v1/meetings/{}/settings",
             server.url(),
             meeting_id
         ))
@@ -1444,7 +1468,7 @@ async fn test_update_settings_meeting_not_found(pool: PgPool) -> Result<()> {
 
     let response = client
         .patch(format!(
-            "{}/v1/meetings/{}/settings",
+            "{}/api/v1/meetings/{}/settings",
             server.url(),
             non_existent_id
         ))
@@ -1489,7 +1513,7 @@ async fn test_update_settings_empty_update(pool: PgPool) -> Result<()> {
     // Empty update body (no fields set)
     let response = client
         .patch(format!(
-            "{}/v1/meetings/{}/settings",
+            "{}/api/v1/meetings/{}/settings",
             server.url(),
             meeting_id
         ))
@@ -1535,7 +1559,7 @@ async fn test_update_settings_partial_update(pool: PgPool) -> Result<()> {
     // Only update allow_guests
     let response = client
         .patch(format!(
-            "{}/v1/meetings/{}/settings",
+            "{}/api/v1/meetings/{}/settings",
             server.url(),
             meeting_id
         ))
@@ -1589,7 +1613,7 @@ async fn test_update_settings_multiple_fields(pool: PgPool) -> Result<()> {
     // Update all three settings
     let response = client
         .patch(format!(
-            "{}/v1/meetings/{}/settings",
+            "{}/api/v1/meetings/{}/settings",
             server.url(),
             meeting_id
         ))
@@ -1639,7 +1663,7 @@ async fn test_update_settings_requires_auth(pool: PgPool) -> Result<()> {
     // No authorization header
     let response = client
         .patch(format!(
-            "{}/v1/meetings/{}/settings",
+            "{}/api/v1/meetings/{}/settings",
             server.url(),
             meeting_id
         ))
@@ -1685,7 +1709,7 @@ async fn test_jwt_wrong_algorithm_returns_401(pool: PgPool) -> Result<()> {
     let token = server.create_hs256_token_for_user(user_id);
 
     let response = client
-        .get(format!("{}/v1/meetings/JWTALG", server.url()))
+        .get(format!("{}/api/v1/meetings/JWTALG", server.url()))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await?;
@@ -1726,7 +1750,7 @@ async fn test_jwt_wrong_key_returns_401(pool: PgPool) -> Result<()> {
     let token = server.create_token_with_wrong_key(user_id);
 
     let response = client
-        .get(format!("{}/v1/meetings/JWTKEY", server.url()))
+        .get(format!("{}/api/v1/meetings/JWTKEY", server.url()))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await?;
@@ -1768,7 +1792,7 @@ async fn test_jwt_tampered_payload_returns_401(pool: PgPool) -> Result<()> {
     let token = server.create_tampered_token(user_id);
 
     let response = client
-        .get(format!("{}/v1/meetings/JWTAMP", server.url()))
+        .get(format!("{}/api/v1/meetings/JWTAMP", server.url()))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await?;
@@ -1808,7 +1832,10 @@ async fn test_guest_token_max_display_name_boundary(pool: PgPool) -> Result<()> 
     let long_name = "a".repeat(101);
 
     let response = client
-        .post(format!("{}/v1/meetings/MAXNAM/guest-token", server.url()))
+        .post(format!(
+            "{}/api/v1/meetings/MAXNAM/guest-token",
+            server.url()
+        ))
         .json(&serde_json::json!({
             "display_name": long_name,
             "captcha_token": "valid-captcha-token"
@@ -1859,7 +1886,7 @@ async fn test_concurrent_guest_requests_succeed(pool: PgPool) -> Result<()> {
     .await;
 
     let num_requests = 20;
-    let url = format!("{}/v1/meetings/CONCUR/guest-token", server.url());
+    let url = format!("{}/api/v1/meetings/CONCUR/guest-token", server.url());
 
     // Spawn concurrent guest token requests
     let mut handles = Vec::new();
@@ -1945,7 +1972,7 @@ async fn test_join_meeting_user_not_found(pool: PgPool) -> Result<()> {
     let token = server.create_token_for_user(non_existent_user_id);
 
     let response = client
-        .get(format!("{}/v1/meetings/NOUSER", server.url()))
+        .get(format!("{}/api/v1/meetings/NOUSER", server.url()))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await?;
@@ -1994,7 +2021,7 @@ async fn test_join_meeting_inactive_user_denied(pool: PgPool) -> Result<()> {
     let token = server.create_token_for_user(inactive_user_id);
 
     let response = client
-        .get(format!("{}/v1/meetings/INACTV", server.url()))
+        .get(format!("{}/api/v1/meetings/INACTV", server.url()))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await?;

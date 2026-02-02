@@ -1,6 +1,6 @@
 //! Health endpoint integration tests.
 //!
-//! Tests the `/v1/health` endpoint using the `TestGcServer` harness.
+//! Tests the `/health` endpoint using the `TestGcServer` harness.
 
 use gc_test_utils::TestGcServer;
 use sqlx::PgPool;
@@ -12,7 +12,7 @@ async fn test_health_endpoint_returns_200(pool: PgPool) -> Result<(), anyhow::Er
     let client = reqwest::Client::new();
 
     let response = client
-        .get(format!("{}/v1/health", server.url()))
+        .get(format!("{}/health", server.url()))
         .send()
         .await?;
 
@@ -33,7 +33,7 @@ async fn test_health_endpoint_returns_json(pool: PgPool) -> Result<(), anyhow::E
     let client = reqwest::Client::new();
 
     let response = client
-        .get(format!("{}/v1/health", server.url()))
+        .get(format!("{}/health", server.url()))
         .send()
         .await?;
 

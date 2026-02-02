@@ -239,77 +239,19 @@ EOF
     log_info "PostgreSQL deployed successfully."
 }
 
-# Deploy Redis
+# Deploy Redis (using manifests from infra/services/redis/)
 deploy_redis() {
     log_step "Deploying Redis..."
 
-    kubectl apply -f - <<EOF
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: redis-config
-  namespace: dark-tower
-data:
-  redis.conf: |
-    requirepass dev_password_change_in_production
-    maxmemory 256mb
-    maxmemory-policy allkeys-lru
----
-apiVersion: apps/v1
-kind: StatefulSet
-metadata:
-  name: redis
-  namespace: dark-tower
-spec:
-  serviceName: redis
-  replicas: 1
-  selector:
-    matchLabels:
-      app: redis
-  template:
-    metadata:
-      labels:
-        app: redis
-    spec:
-      containers:
-        - name: redis
-          image: redis:7-alpine
-          command:
-            - redis-server
-            - /etc/redis/redis.conf
-          ports:
-            - containerPort: 6379
-          volumeMounts:
-            - name: config
-              mountPath: /etc/redis
-          readinessProbe:
-            exec:
-              command:
-                - redis-cli
-                - --raw
-                - -a
-                - dev_password_change_in_production
-                - ping
-            initialDelaySeconds: 5
-            periodSeconds: 5
-      volumes:
-        - name: config
-          configMap:
-            name: redis-config
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: redis
-  namespace: dark-tower
-spec:
-  selector:
-    app: redis
-  ports:
-    - port: 6379
-      targetPort: 6379
-  clusterIP: None
-EOF
+    # Apply Redis manifests from our infrastructure directory
+    # (excludes network-policy.yaml and service-monitor.yaml which require CRDs)
+    for f in "${PROJECT_ROOT}/infra/services/redis/"*.yaml; do
+        local basename
+        basename="$(basename "$f")"
+        [[ "$basename" == "service-monitor.yaml" ]] && continue
+        [[ "$basename" == "network-policy.yaml" ]] && continue
+        kubectl apply -f "$f"
+    done
 
     log_info "Waiting for Redis to be ready..."
     kubectl wait --for=condition=Ready pod -l app=redis -n dark-tower --timeout=120s
@@ -351,6 +293,36 @@ data:
           - source_labels: [__meta_kubernetes_pod_container_port_number]
             action: keep
             regex: "8082"
+
+      # Scrape Global Controller pods
+      - job_name: 'global-controller'
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              names:
+                - dark-tower
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_label_app]
+            action: keep
+            regex: global-controller
+          - source_labels: [__meta_kubernetes_pod_container_port_number]
+            action: keep
+            regex: "8080"
+
+      # Scrape Meeting Controller pods (metrics on health port)
+      - job_name: 'meeting-controller'
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              names:
+                - dark-tower
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_label_app]
+            action: keep
+            regex: meeting-controller
+          - source_labels: [__meta_kubernetes_pod_container_port_number]
+            action: keep
+            regex: "8081"
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -579,38 +551,15 @@ data:
         kubernetes_sd_configs:
           - role: pod
         relabel_configs:
-          # Only scrape pods with the annotation prometheus.io/scrape: "true"
-          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
-            action: keep
-            regex: true
-          # Use pod namespace as label
-          - source_labels: [__meta_kubernetes_namespace]
-            action: replace
-            target_label: namespace
-          # Use pod name as label
-          - source_labels: [__meta_kubernetes_pod_name]
-            action: replace
-            target_label: pod
-          # Use container name as label
-          - source_labels: [__meta_kubernetes_pod_container_name]
-            action: replace
-            target_label: container
-          # Use app label if present
-          - source_labels: [__meta_kubernetes_pod_label_app]
-            action: replace
-            target_label: app
-        pipeline_stages:
-          - docker: {}
-
-      - job_name: kubernetes-pods-all
-        kubernetes_sd_configs:
-          - role: pod
-        relabel_configs:
-          # Drop pods without a name label
+          # Drop pods without a name
           - source_labels: [__meta_kubernetes_pod_name]
             action: drop
             regex: ''
-          # Set the __path__ to the pod log directory (containerd format)
+          # Drop pods in kube-system to reduce noise (optional)
+          - source_labels: [__meta_kubernetes_namespace]
+            action: drop
+            regex: kube-system
+          # Set the __path__ to the pod log directory (containerd/CRI format)
           - source_labels: [__meta_kubernetes_pod_uid, __meta_kubernetes_pod_container_name]
             target_label: __path__
             separator: /
@@ -627,10 +576,14 @@ data:
           - source_labels: [__meta_kubernetes_pod_container_name]
             action: replace
             target_label: container
-          # Set app label if present
+          # Set app label from pod label
           - source_labels: [__meta_kubernetes_pod_label_app]
             action: replace
             target_label: app
+          # Set component label from pod label
+          - source_labels: [__meta_kubernetes_pod_label_component]
+            action: replace
+            target_label: component
         pipeline_stages:
           - cri: {}
 ---
@@ -932,6 +885,94 @@ deploy_ac_service() {
     log_info "AC service deployed successfully."
 }
 
+# Build and deploy Global Controller service
+deploy_gc_service() {
+    log_step "Building Global Controller container image..."
+
+    # Detect container runtime command
+    local CONTAINER_CMD
+    if [[ "${KIND_EXPERIMENTAL_PROVIDER:-}" == "podman" ]]; then
+        CONTAINER_CMD="podman"
+    else
+        CONTAINER_CMD="docker"
+    fi
+
+    # Build from project root
+    pushd "${PROJECT_ROOT}" > /dev/null
+    ${CONTAINER_CMD} build \
+        -t localhost/global-controller:latest \
+        -f infra/docker/global-controller/Dockerfile \
+        .
+    popd > /dev/null
+
+    log_step "Loading image into kind cluster..."
+    if [[ "${KIND_EXPERIMENTAL_PROVIDER:-}" == "podman" ]]; then
+        local TMPFILE
+        TMPFILE=$(mktemp /tmp/global-controller-image.XXXXXX.tar)
+        podman save localhost/global-controller:latest -o "${TMPFILE}"
+        kind load image-archive "${TMPFILE}" --name "${CLUSTER_NAME}"
+        rm -f "${TMPFILE}"
+    else
+        kind load docker-image localhost/global-controller:latest --name "${CLUSTER_NAME}"
+    fi
+
+    log_step "Deploying Global Controller to cluster..."
+    # Apply GC manifests, excluding service-monitor.yaml (requires Prometheus Operator CRD)
+    for f in "${PROJECT_ROOT}/infra/services/global-controller/"*.yaml; do
+        [[ "$(basename "$f")" == "service-monitor.yaml" ]] && continue
+        kubectl apply -f "$f"
+    done
+
+    log_info "Waiting for Global Controller to be ready..."
+    kubectl rollout status deployment/global-controller -n dark-tower --timeout=180s
+
+    log_info "Global Controller deployed successfully."
+}
+
+# Build and deploy Meeting Controller service
+deploy_mc_service() {
+    log_step "Building Meeting Controller container image..."
+
+    # Detect container runtime command
+    local CONTAINER_CMD
+    if [[ "${KIND_EXPERIMENTAL_PROVIDER:-}" == "podman" ]]; then
+        CONTAINER_CMD="podman"
+    else
+        CONTAINER_CMD="docker"
+    fi
+
+    # Build from project root
+    pushd "${PROJECT_ROOT}" > /dev/null
+    ${CONTAINER_CMD} build \
+        -t localhost/meeting-controller:latest \
+        -f infra/docker/meeting-controller/Dockerfile \
+        .
+    popd > /dev/null
+
+    log_step "Loading image into kind cluster..."
+    if [[ "${KIND_EXPERIMENTAL_PROVIDER:-}" == "podman" ]]; then
+        local TMPFILE
+        TMPFILE=$(mktemp /tmp/meeting-controller-image.XXXXXX.tar)
+        podman save localhost/meeting-controller:latest -o "${TMPFILE}"
+        kind load image-archive "${TMPFILE}" --name "${CLUSTER_NAME}"
+        rm -f "${TMPFILE}"
+    else
+        kind load docker-image localhost/meeting-controller:latest --name "${CLUSTER_NAME}"
+    fi
+
+    log_step "Deploying Meeting Controller to cluster..."
+    # Apply MC manifests, excluding service-monitor.yaml (requires Prometheus Operator CRD)
+    for f in "${PROJECT_ROOT}/infra/services/meeting-controller/"*.yaml; do
+        [[ "$(basename "$f")" == "service-monitor.yaml" ]] && continue
+        kubectl apply -f "$f"
+    done
+
+    log_info "Waiting for Meeting Controller to be ready..."
+    kubectl rollout status deployment/meeting-controller -n dark-tower --timeout=180s
+
+    log_info "Meeting Controller deployed successfully."
+}
+
 # Install Telepresence traffic-manager (optional)
 install_telepresence() {
     log_step "Checking Telepresence..."
@@ -962,6 +1003,7 @@ setup_port_forwards() {
     # Start port-forwards in background
     kubectl port-forward -n dark-tower svc/postgres 5432:5432 &>/dev/null &
     kubectl port-forward -n dark-tower svc/ac-service 8082:8082 &>/dev/null &
+    kubectl port-forward -n dark-tower svc/global-controller 8080:8080 &>/dev/null &
     kubectl port-forward -n dark-tower-observability svc/prometheus 9090:9090 &>/dev/null &
     kubectl port-forward -n dark-tower-observability svc/grafana 3000:3000 &>/dev/null &
     kubectl port-forward -n dark-tower-observability svc/loki 3100:3100 &>/dev/null &
@@ -981,6 +1023,16 @@ print_access_info() {
     echo ""
     echo "  AC Service (Auth Controller):"
     echo "    URL: http://localhost:8082"
+    echo "    Status: Running in-cluster (2 replicas)"
+    echo ""
+    echo "  GC Service (Global Controller):"
+    echo "    HTTP API: http://localhost:8080"
+    echo "    gRPC: localhost:50051 (cluster-internal)"
+    echo "    Status: Running in-cluster (2 replicas)"
+    echo ""
+    echo "  MC Service (Meeting Controller):"
+    echo "    gRPC: localhost:50052 (cluster-internal)"
+    echo "    Health: localhost:8081 (cluster-internal)"
     echo "    Status: Running in-cluster (2 replicas)"
     echo ""
     echo "  Grafana:"
@@ -1061,6 +1113,8 @@ main() {
     seed_test_data
     create_ac_secrets
     deploy_ac_service
+    deploy_gc_service
+    deploy_mc_service
     install_telepresence
     setup_port_forwards
     print_access_info
