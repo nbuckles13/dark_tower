@@ -16,7 +16,8 @@
 # ========================================
 # Stage 1: Chef base (install cargo-chef)
 # ========================================
-FROM docker.io/library/rust:1.91-slim AS chef
+ARG RUST_VERSION=1.91
+FROM docker.io/library/rust:${RUST_VERSION}-slim AS chef
 
 RUN cargo install cargo-chef
 

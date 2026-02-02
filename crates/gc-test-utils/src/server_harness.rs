@@ -21,7 +21,7 @@ use tokio::task::JoinHandle;
 ///     let client = reqwest::Client::new();
 ///
 ///     let response = client
-///         .get(&format!("{}/v1/health", server.url()))
+///         .get(&format!("{}/health", server.url()))
 ///         .send()
 ///         .await?;
 ///
@@ -145,7 +145,7 @@ mod tests {
         assert!(server.url().starts_with("http://127.0.0.1:"));
 
         // Verify health endpoint works
-        let response = reqwest::get(&format!("{}/v1/health", server.url())).await?;
+        let response = reqwest::get(&format!("{}/health", server.url())).await?;
         assert_eq!(response.status(), 200);
 
         // Verify response body
@@ -216,7 +216,7 @@ mod tests {
             addr = server.addr();
 
             // Verify server is running
-            let response = reqwest::get(&format!("http://{}/v1/health", addr)).await?;
+            let response = reqwest::get(&format!("http://{}/health", addr)).await?;
             assert_eq!(response.status(), 200);
 
             // Server will be dropped here
@@ -242,10 +242,10 @@ mod tests {
         assert_ne!(server1.addr(), server2.addr());
 
         // Verify both servers are accessible
-        let response1 = reqwest::get(&format!("{}/v1/health", server1.url())).await?;
+        let response1 = reqwest::get(&format!("{}/health", server1.url())).await?;
         assert_eq!(response1.status(), 200);
 
-        let response2 = reqwest::get(&format!("{}/v1/health", server2.url())).await?;
+        let response2 = reqwest::get(&format!("{}/health", server2.url())).await?;
         assert_eq!(response2.status(), 200);
 
         Ok(())

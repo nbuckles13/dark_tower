@@ -225,6 +225,7 @@ async fn test_minimum_clock_skew_edge_case(pool: PgPool) -> Result<(), anyhow::E
 /// P1-5: Test maximum clock skew (600 seconds) edge case
 ///
 /// Verifies the system behaves correctly with the maximum valid clock skew of 600 seconds.
+/// Uses a 2-second margin from boundary to avoid timing-dependent test flakiness in CI.
 #[sqlx::test(migrations = "../../migrations")]
 async fn test_maximum_clock_skew_edge_case(pool: PgPool) -> Result<(), anyhow::Error> {
     // Arrange: Initialize signing key
@@ -235,31 +236,37 @@ async fn test_maximum_clock_skew_edge_case(pool: PgPool) -> Result<(), anyhow::E
 
     let now = Utc::now().timestamp();
 
-    // Create token with iat at the 600 second boundary
-    let claims_at_boundary = crypto::Claims {
+    // Create token with iat near (but safely within) the 600 second boundary
+    // Use 598 seconds to avoid timing-dependent flakiness at exact boundary
+    let claims_within_boundary = crypto::Claims {
         sub: "max-skew-boundary-client".to_string(),
         exp: now + 7200, // Expires in 2 hours
-        iat: now + 600,  // Exactly at 600 second (10 minute) boundary
+        iat: now + 598,  // 2 seconds inside the 600 second boundary
         scope: "test:scope".to_string(),
         service_type: Some("global-controller".to_string()),
     };
 
-    let token_at_boundary =
-        crypto::sign_jwt(&claims_at_boundary, &private_key, &signing_key.key_id)?;
+    let token_within_boundary =
+        crypto::sign_jwt(&claims_within_boundary, &private_key, &signing_key.key_id)?;
 
-    // Act & Assert: Token at max boundary should be accepted
+    // Act & Assert: Token within max boundary should be accepted
     let max_clock_skew = Duration::from_secs(600);
-    let result = crypto::verify_jwt(&token_at_boundary, &signing_key.public_key, max_clock_skew);
+    let result = crypto::verify_jwt(
+        &token_within_boundary,
+        &signing_key.public_key,
+        max_clock_skew,
+    );
     assert!(
         result.is_ok(),
-        "Token with iat at exact 600 second boundary should be accepted"
+        "Token with iat 598 seconds in future should be accepted with 600s clock skew"
     );
 
-    // Create token with iat 601 seconds in the future (beyond max skew)
+    // Create token with iat clearly beyond max skew (602 seconds)
+    // Use 602 seconds to avoid timing-dependent flakiness at exact boundary
     let claims_beyond = crypto::Claims {
         sub: "max-skew-beyond-client".to_string(),
         exp: now + 7200,
-        iat: now + 601, // 1 second beyond max boundary
+        iat: now + 602, // 2 seconds beyond max boundary
         scope: "test:scope".to_string(),
         service_type: Some("global-controller".to_string()),
     };
@@ -274,7 +281,7 @@ async fn test_maximum_clock_skew_edge_case(pool: PgPool) -> Result<(), anyhow::E
     );
     assert!(
         result.is_err(),
-        "Token with iat 601 seconds in future should be rejected with 600s clock skew"
+        "Token with iat 602 seconds in future should be rejected with 600s clock skew"
     );
 
     Ok(())

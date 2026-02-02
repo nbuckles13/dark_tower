@@ -256,13 +256,16 @@ impl Drop for TestAuthServer {
 // Tests
 // =============================================================================
 
-/// Test that /v1/me returns 401 without authentication.
+/// Test that /api/v1/me returns 401 without authentication.
 #[sqlx::test(migrations = "../../migrations")]
 async fn test_me_endpoint_requires_auth(pool: PgPool) -> Result<()> {
     let server = TestAuthServer::spawn(pool).await?;
     let client = reqwest::Client::new();
 
-    let response = client.get(format!("{}/v1/me", server.url())).send().await?;
+    let response = client
+        .get(format!("{}/api/v1/me", server.url()))
+        .send()
+        .await?;
 
     assert_eq!(response.status(), 401);
 
@@ -273,14 +276,14 @@ async fn test_me_endpoint_requires_auth(pool: PgPool) -> Result<()> {
     Ok(())
 }
 
-/// Test that /v1/me returns 401 with invalid Bearer format.
+/// Test that /api/v1/me returns 401 with invalid Bearer format.
 #[sqlx::test(migrations = "../../migrations")]
 async fn test_me_endpoint_rejects_invalid_auth_format(pool: PgPool) -> Result<()> {
     let server = TestAuthServer::spawn(pool).await?;
     let client = reqwest::Client::new();
 
     let response = client
-        .get(format!("{}/v1/me", server.url()))
+        .get(format!("{}/api/v1/me", server.url()))
         .header("Authorization", "Basic abc123") // Wrong format
         .send()
         .await?;
@@ -290,7 +293,7 @@ async fn test_me_endpoint_rejects_invalid_auth_format(pool: PgPool) -> Result<()
     Ok(())
 }
 
-/// Test that /v1/me returns 200 with valid token.
+/// Test that /api/v1/me returns 200 with valid token.
 #[sqlx::test(migrations = "../../migrations")]
 async fn test_me_endpoint_with_valid_token(pool: PgPool) -> Result<()> {
     let server = TestAuthServer::spawn(pool).await?;
@@ -299,7 +302,7 @@ async fn test_me_endpoint_with_valid_token(pool: PgPool) -> Result<()> {
     let token = server.create_valid_token();
 
     let response = client
-        .get(format!("{}/v1/me", server.url()))
+        .get(format!("{}/api/v1/me", server.url()))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await?;
@@ -314,7 +317,7 @@ async fn test_me_endpoint_with_valid_token(pool: PgPool) -> Result<()> {
     Ok(())
 }
 
-/// Test that /v1/me rejects expired tokens.
+/// Test that /api/v1/me rejects expired tokens.
 #[sqlx::test(migrations = "../../migrations")]
 async fn test_me_endpoint_rejects_expired_token(pool: PgPool) -> Result<()> {
     let server = TestAuthServer::spawn(pool).await?;
@@ -323,7 +326,7 @@ async fn test_me_endpoint_rejects_expired_token(pool: PgPool) -> Result<()> {
     let token = server.create_expired_token();
 
     let response = client
-        .get(format!("{}/v1/me", server.url()))
+        .get(format!("{}/api/v1/me", server.url()))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await?;
@@ -333,7 +336,7 @@ async fn test_me_endpoint_rejects_expired_token(pool: PgPool) -> Result<()> {
     Ok(())
 }
 
-/// Test that /v1/me rejects tokens with future iat.
+/// Test that /api/v1/me rejects tokens with future iat.
 #[sqlx::test(migrations = "../../migrations")]
 async fn test_me_endpoint_rejects_future_iat_token(pool: PgPool) -> Result<()> {
     let server = TestAuthServer::spawn(pool).await?;
@@ -342,7 +345,7 @@ async fn test_me_endpoint_rejects_future_iat_token(pool: PgPool) -> Result<()> {
     let token = server.create_future_iat_token();
 
     let response = client
-        .get(format!("{}/v1/me", server.url()))
+        .get(format!("{}/api/v1/me", server.url()))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await?;
@@ -352,7 +355,7 @@ async fn test_me_endpoint_rejects_future_iat_token(pool: PgPool) -> Result<()> {
     Ok(())
 }
 
-/// Test that /v1/me rejects tokens with unknown kid.
+/// Test that /api/v1/me rejects tokens with unknown kid.
 #[sqlx::test(migrations = "../../migrations")]
 async fn test_me_endpoint_rejects_unknown_kid(pool: PgPool) -> Result<()> {
     let server = TestAuthServer::spawn(pool).await?;
@@ -365,7 +368,7 @@ async fn test_me_endpoint_rejects_unknown_kid(pool: PgPool) -> Result<()> {
     let token = server.create_valid_token();
 
     let response = client
-        .get(format!("{}/v1/me", server.url()))
+        .get(format!("{}/api/v1/me", server.url()))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await?;
@@ -375,7 +378,7 @@ async fn test_me_endpoint_rejects_unknown_kid(pool: PgPool) -> Result<()> {
     Ok(())
 }
 
-/// Test that /v1/me rejects oversized tokens.
+/// Test that /api/v1/me rejects oversized tokens.
 #[sqlx::test(migrations = "../../migrations")]
 async fn test_me_endpoint_rejects_oversized_token(pool: PgPool) -> Result<()> {
     let server = TestAuthServer::spawn(pool).await?;
@@ -385,7 +388,7 @@ async fn test_me_endpoint_rejects_oversized_token(pool: PgPool) -> Result<()> {
     let oversized_token = "a".repeat(9000);
 
     let response = client
-        .get(format!("{}/v1/me", server.url()))
+        .get(format!("{}/api/v1/me", server.url()))
         .header("Authorization", format!("Bearer {}", oversized_token))
         .send()
         .await?;
@@ -395,14 +398,14 @@ async fn test_me_endpoint_rejects_oversized_token(pool: PgPool) -> Result<()> {
     Ok(())
 }
 
-/// Test that /v1/me rejects malformed tokens.
+/// Test that /api/v1/me rejects malformed tokens.
 #[sqlx::test(migrations = "../../migrations")]
 async fn test_me_endpoint_rejects_malformed_token(pool: PgPool) -> Result<()> {
     let server = TestAuthServer::spawn(pool).await?;
     let client = reqwest::Client::new();
 
     let response = client
-        .get(format!("{}/v1/me", server.url()))
+        .get(format!("{}/api/v1/me", server.url()))
         .header("Authorization", "Bearer not.a.valid.jwt")
         .send()
         .await?;
@@ -412,14 +415,14 @@ async fn test_me_endpoint_rejects_malformed_token(pool: PgPool) -> Result<()> {
     Ok(())
 }
 
-/// Test that /v1/health is public (no auth required).
+/// Test that /health is public (no auth required).
 #[sqlx::test(migrations = "../../migrations")]
 async fn test_health_endpoint_is_public(pool: PgPool) -> Result<()> {
     let server = TestAuthServer::spawn(pool).await?;
     let client = reqwest::Client::new();
 
     let response = client
-        .get(format!("{}/v1/health", server.url()))
+        .get(format!("{}/health", server.url()))
         .send()
         .await?;
 
@@ -437,7 +440,10 @@ async fn test_auth_error_response_format(pool: PgPool) -> Result<()> {
     let server = TestAuthServer::spawn(pool).await?;
     let client = reqwest::Client::new();
 
-    let response = client.get(format!("{}/v1/me", server.url())).send().await?;
+    let response = client
+        .get(format!("{}/api/v1/me", server.url()))
+        .send()
+        .await?;
 
     assert_eq!(response.status(), 401);
 
@@ -502,7 +508,7 @@ async fn test_token_exactly_at_8kb_limit_accepted(pool: PgPool) -> Result<()> {
     // - We verify this with a large but valid token
     if padded_token.len() <= 8192 {
         let response = client
-            .get(format!("{}/v1/me", server.url()))
+            .get(format!("{}/api/v1/me", server.url()))
             .header("Authorization", format!("Bearer {}", padded_token))
             .send()
             .await?;
@@ -532,7 +538,7 @@ async fn test_token_exactly_at_8kb_limit_accepted(pool: PgPool) -> Result<()> {
         );
 
         let response = client
-            .get(format!("{}/v1/me", server.url()))
+            .get(format!("{}/api/v1/me", server.url()))
             .header("Authorization", format!("Bearer {}", smaller_token))
             .send()
             .await?;
@@ -558,7 +564,7 @@ async fn test_token_at_8193_bytes_rejected(pool: PgPool) -> Result<()> {
     let token_8193 = "a".repeat(8193);
 
     let response = client
-        .get(format!("{}/v1/me", server.url()))
+        .get(format!("{}/api/v1/me", server.url()))
         .header("Authorization", format!("Bearer {}", token_8193))
         .send()
         .await?;
@@ -598,7 +604,7 @@ async fn test_token_with_alg_none_rejected(pool: PgPool) -> Result<()> {
     let malicious_token = format!("{}..{}", header_b64, claims_b64);
 
     let response = client
-        .get(format!("{}/v1/me", server.url()))
+        .get(format!("{}/api/v1/me", server.url()))
         .header("Authorization", format!("Bearer {}", malicious_token))
         .send()
         .await?;
@@ -636,7 +642,7 @@ async fn test_token_with_alg_hs256_rejected(pool: PgPool) -> Result<()> {
     let malicious_token = format!("{}.{}.{}", header_b64, claims_b64, fake_signature);
 
     let response = client
-        .get(format!("{}/v1/me", server.url()))
+        .get(format!("{}/api/v1/me", server.url()))
         .header("Authorization", format!("Bearer {}", malicious_token))
         .send()
         .await?;
@@ -660,7 +666,7 @@ async fn test_only_eddsa_algorithm_accepted(pool: PgPool) -> Result<()> {
     let valid_token = server.create_valid_token();
 
     let response = client
-        .get(format!("{}/v1/me", server.url()))
+        .get(format!("{}/api/v1/me", server.url()))
         .header("Authorization", format!("Bearer {}", valid_token))
         .send()
         .await?;

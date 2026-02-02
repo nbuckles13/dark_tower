@@ -1,17 +1,18 @@
 #!/bin/bash
 #
-# Simple Guard: API Version Check
+# Simple Guard: API Route Pattern Check
 #
-# Detects API route definitions without version prefix.
-# Enforces api-design.md principle: "Include version in all API paths"
+# Enforces consistent API route patterns across all services.
 #
-# What it checks:
-#   - Axum .route() calls must have /api/v{N}/ or /v{N}/ prefix
+# Route patterns:
+#   - /api/v{N}/* - Versioned API endpoints (REQUIRED for all API routes)
+#   - /health, /ready, /metrics - Operational endpoints (NO version prefix)
+#   - /.well-known/* - RFC-defined paths (NO version prefix)
+#   - /internal/* - Internal-only endpoints (NO version prefix)
 #
-# Allowed exceptions:
-#   - /.well-known/* (RFC-defined paths)
-#   - /health, /ready, /metrics (operational endpoints)
-#   - /internal/* (internal-only endpoints)
+# What it catches:
+#   - API routes without /api/v{N}/ prefix (e.g., /v1/users is WRONG)
+#   - Operational endpoints with version prefix (e.g., /v1/health is WRONG)
 #
 # Exit codes:
 #   0 - No violations found
@@ -40,19 +41,11 @@ print_header "Guard: API Version Check
 Path: $SEARCH_PATH"
 
 # -----------------------------------------------------------------------------
-# Check 1: Route definitions without version prefix
+# Check 1: API routes must use /api/v{N}/ prefix
 # -----------------------------------------------------------------------------
-print_section "Check 1: Unversioned API routes"
+print_section "Check 1: API routes without /api/v{N}/ prefix"
 
-# Find .route( calls and check for version prefix
-# We look for .route("/something" where the path doesn't start with:
-# - /api/v followed by digit
-# - /v followed by digit
-# - /.well-known
-# - /health, /ready, /metrics
-# - /internal
-
-# First, find all route definitions
+# Find .route( calls
 route_definitions=$(grep -rn --include="*.rs" '\.route\s*(' "$SEARCH_PATH" 2>/dev/null | \
     grep -E '\.route\s*\(\s*"/' | \
     filter_test_code || true)
@@ -61,34 +54,35 @@ if [[ -z "$route_definitions" ]]; then
     print_ok "No route definitions found"
     echo ""
 else
-    # Check each route for version prefix
+    # Check each route for correct pattern
     violations=""
     while IFS= read -r line; do
         # Extract the path from the route call
-        # Match patterns like: .route("/path", ...)
         path=$(echo "$line" | grep -oE '\.route\s*\(\s*"[^"]*"' | grep -oE '"[^"]*"' | tr -d '"')
 
         if [[ -z "$path" ]]; then
             continue
         fi
 
-        # Check if path is an allowed exception
+        # Allowed unversioned paths (operational/standard endpoints)
         if [[ "$path" =~ ^/.well-known ]]; then
             continue
         fi
-        if [[ "$path" =~ ^/health$ || "$path" =~ ^/ready$ || "$path" =~ ^/metrics ]]; then
+        if [[ "$path" =~ ^/health$ || "$path" =~ ^/ready$ || "$path" =~ ^/metrics$ || "$path" =~ ^/metrics/ ]]; then
             continue
         fi
         if [[ "$path" =~ ^/internal ]]; then
             continue
         fi
 
-        # Check if path has version prefix
-        if [[ "$path" =~ ^/api/v[0-9]+ || "$path" =~ ^/v[0-9]+ ]]; then
+        # API routes MUST use /api/v{N}/ prefix
+        if [[ "$path" =~ ^/api/v[0-9]+/ ]]; then
             continue
         fi
 
-        # This is a violation
+        # This is a violation - either:
+        # - Uses /v{N}/ without /api prefix (wrong pattern)
+        # - Has no version at all (missing version)
         violations="$violations$line\n"
     done <<< "$route_definitions"
 
@@ -102,15 +96,42 @@ else
         done
         echo ""
     else
-        print_ok "All routes have version prefix or are allowed exceptions"
+        print_ok "All API routes use /api/v{N}/ prefix"
         echo ""
     fi
 fi
 
 # -----------------------------------------------------------------------------
-# Check 2: Format string routes without version
+# Check 2: Operational endpoints must NOT have version prefix
 # -----------------------------------------------------------------------------
-print_section "Check 2: Format string routes"
+print_section "Check 2: Versioned operational endpoints"
+
+# Look for versioned health/ready/metrics endpoints (wrong pattern)
+# Matches: /v1/health, /api/v1/health, /v2/ready, etc.
+# Does NOT match: /health, /ready, /metrics (correct unversioned)
+versioned_ops=$(grep -rn --include="*.rs" '\.route\s*(' "$SEARCH_PATH" 2>/dev/null | \
+    grep -E '\.route\s*\(\s*"/(api/)?v[0-9]+/(health|ready|metrics)' | \
+    filter_test_code || true)
+
+if [[ -n "$versioned_ops" ]]; then
+    echo -e "${RED}VIOLATIONS FOUND:${NC}"
+    echo "  Operational endpoints should not have version prefix."
+    echo "  Use /health, /ready, /metrics (not /v1/health, /api/v1/health, etc.)"
+    echo ""
+    echo "$versioned_ops" | while read -r line; do
+        echo "  $line"
+        increment_violations
+    done
+    echo ""
+else
+    print_ok "Operational endpoints are unversioned"
+    echo ""
+fi
+
+# -----------------------------------------------------------------------------
+# Check 3: Format string routes (manual review)
+# -----------------------------------------------------------------------------
+print_section "Check 3: Dynamic format routes"
 
 # Look for format! or format_args! used in route paths
 format_routes=$(grep -rn --include="*.rs" -E '\.route\s*\(\s*&?format!' "$SEARCH_PATH" 2>/dev/null | \
@@ -122,8 +143,8 @@ if [[ -n "$format_routes" ]]; then
         echo "  $line"
     done
     echo ""
-    echo "  Dynamic routes cannot be statically checked for version prefix."
-    echo "  Please verify manually that these include /api/v{N}/ or /v{N}/."
+    echo "  Dynamic routes cannot be statically checked."
+    echo "  Please verify manually that API routes use /api/v{N}/ prefix."
     echo ""
 else
     print_ok "No dynamic format routes found"
@@ -142,16 +163,21 @@ echo ""
 if [[ $TOTAL_VIOLATIONS -gt 0 ]]; then
     echo -e "${RED}Found $TOTAL_VIOLATIONS violation(s)${NC}"
     echo ""
-    echo "All API routes must include a version prefix. Options:"
-    echo "  1. Use /api/v1/endpoint for external APIs"
-    echo "  2. Use /v1/endpoint for simpler versioning"
+    echo "Route pattern rules:"
     echo ""
-    echo "Allowed exceptions (no version required):"
-    echo "  - /.well-known/* (RFC-defined paths)"
-    echo "  - /health, /ready, /metrics (operational)"
-    echo "  - /internal/* (internal-only endpoints)"
+    echo "  API routes (versioned):"
+    echo "    CORRECT: /api/v1/users, /api/v1/meetings/:id"
+    echo "    WRONG:   /v1/users, /users"
     echo ""
-    echo "See docs/principles/api-design.md for versioning guidelines."
+    echo "  Operational endpoints (unversioned):"
+    echo "    CORRECT: /health, /ready, /metrics"
+    echo "    WRONG:   /v1/health, /api/v1/health"
+    echo ""
+    echo "  Other unversioned (allowed):"
+    echo "    /.well-known/* (RFC-defined)"
+    echo "    /internal/* (internal-only)"
+    echo ""
+    echo "See docs/principles/api-design.md for details."
     echo ""
     exit 1
 else
