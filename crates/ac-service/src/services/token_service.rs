@@ -1445,10 +1445,12 @@ mod tests {
             .expect("No active signing key found");
 
         // Create a token with iat exactly at the clock skew boundary (5 minutes)
+        // Capture `now` once to avoid timing race conditions in CI
+        let now = Utc::now();
         let claims_at_boundary = crypto::Claims {
             sub: "boundary-client".to_string(),
-            exp: Utc::now().timestamp() + TOKEN_EXPIRY_SECONDS_I64,
-            iat: Utc::now().timestamp() + DEFAULT_JWT_CLOCK_SKEW.as_secs() as i64, // Exactly at 5 min boundary
+            exp: now.timestamp() + TOKEN_EXPIRY_SECONDS_I64,
+            iat: now.timestamp() + DEFAULT_JWT_CLOCK_SKEW.as_secs() as i64, // Exactly at 5 min boundary
             scope: "meeting:create".to_string(),
             service_type: Some("global-controller".to_string()),
         };
@@ -1501,10 +1503,12 @@ mod tests {
             .expect("No active signing key found");
 
         // Create a token with iat 1 second beyond the clock skew boundary
+        // Capture `now` once to avoid timing race conditions in CI
+        let now = Utc::now();
         let claims_beyond_boundary = crypto::Claims {
             sub: "beyond-boundary-client".to_string(),
-            exp: Utc::now().timestamp() + TOKEN_EXPIRY_SECONDS_I64,
-            iat: Utc::now().timestamp() + DEFAULT_JWT_CLOCK_SKEW.as_secs() as i64 + 1, // 1 second beyond 5 min
+            exp: now.timestamp() + TOKEN_EXPIRY_SECONDS_I64,
+            iat: now.timestamp() + DEFAULT_JWT_CLOCK_SKEW.as_secs() as i64 + 1, // 1 second beyond 5 min
             scope: "meeting:create".to_string(),
             service_type: Some("global-controller".to_string()),
         };
