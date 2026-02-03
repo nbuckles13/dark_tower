@@ -16,3 +16,6 @@ pub mod secret;
 
 /// Module for JWT utilities (validation, claims, constants)
 pub mod jwt;
+
+/// Module for OAuth 2.0 token management with automatic refresh
+pub mod token_manager;

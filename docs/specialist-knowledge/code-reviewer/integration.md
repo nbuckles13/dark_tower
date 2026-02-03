@@ -143,3 +143,26 @@ Round 4 (test infrastructure) established MockBehavior enum pattern:
 - Enables comprehensive re-registration testing (NOT_FOUND -> attempt_reregistration -> subsequent heartbeats work)
 
 These patterns simplified code from Round 2 (removed Arc, unified tasks) and provided excellent test coverage.
+
+---
+
+## Integration: Common Crate Shared Utilities
+**Added**: 2026-02-02
+**Related files**: `crates/common/src/token_manager.rs`, `crates/common/src/secret.rs`, `crates/common/src/jwt.rs`
+
+The common crate provides shared utilities used across multiple services. Key modules for code reviewers:
+
+1. **token_manager.rs** - OAuth 2.0 client credentials flow with automatic refresh
+   - Uses `tokio::sync::watch` for thread-safe token access (not `Arc<Mutex<>>`)
+   - Spawn-and-wait API: `spawn_token_manager()` returns `(JoinHandle, TokenReceiver)`
+   - Exponential backoff on failures (1s -> 30s max)
+   - Custom Debug implementations redact secrets
+
+2. **secret.rs** - `SecretString` wrapper preventing accidental logging
+   - All credentials/tokens MUST use this type
+   - Verify custom Debug implementations use `[REDACTED]`
+
+3. **jwt.rs** - JWT validation utilities and constants
+   - Size limits, clock skew tolerance, algorithm enforcement
+
+When reviewing code that needs token management, check if it can use `TokenManager` from common crate instead of implementing its own. Services (MC, MH) should share this implementation rather than duplicating OAuth 2.0 logic.

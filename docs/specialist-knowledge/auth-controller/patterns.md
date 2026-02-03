@@ -123,3 +123,27 @@ Include error context directly in the returned error type, NOT via separate logg
 Crypto library errors (ring, bcrypt, jsonwebtoken) are safe to include - they don't expose sensitive material. Exception: For `InvalidCredentials`, use `|_|` to prevent information leakage about authentication failures.
 
 ---
+
+## Pattern: Function-Based Async Spawning (JoinHandle + Receiver)
+**Added**: 2026-02-02
+**Related files**: `crates/common/src/token_manager.rs`
+
+For background tasks that produce continuously updated values, return `(JoinHandle<()>, Receiver)` tuple. The function blocks until initialization succeeds, guaranteeing the receiver contains a valid value on return. This pattern avoids Arc wrappers since the spawned task owns all data directly. Caller controls lifecycle via `handle.abort()` or dropping the handle.
+
+---
+
+## Pattern: Empty Sentinel for Watch Channel Initialization
+**Added**: 2026-02-02
+**Related files**: `crates/common/src/token_manager.rs`
+
+When using `tokio::sync::watch` for async value broadcasting, initialize with an "empty" sentinel value (e.g., empty string for tokens). The spawning function waits for `changed()` before returning, ensuring callers receive a valid value. Include a defensive check after `changed()` to verify the value is no longer the sentinel.
+
+---
+
+## Pattern: Constructor Variants for Security Enforcement
+**Added**: 2026-02-02
+**Related files**: `crates/common/src/token_manager.rs`
+
+Provide both `new()` (permissive for development) and `new_secure()` (validates HTTPS, returns Result) constructors. Document security warnings on the permissive variant. This allows easy local development while enforcing production security through explicit constructor choice.
+
+---

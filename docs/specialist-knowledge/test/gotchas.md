@@ -422,3 +422,23 @@ This caught in Round 3 review: snapshot() method used in production (main.rs lin
 3. Failure would be obvious (type error, crash, clearly wrong result)
 
 ---
+
+## Gotcha: Explicitly-Handled Error Paths Often Lack Tests
+**Added**: 2026-02-02
+**Related files**: `crates/common/src/token_manager.rs`
+
+When reviewing code with explicit error handling (match arms, if-else branches for error statuses), don't assume the error paths have tests just because the code explicitly handles them. The TokenManager review found 3 MAJOR gaps where error branches were written but untested:
+
+- 401/400 status handling: Code explicitly matched `status.as_u16() == 401 || status.as_u16() == 400` but no test verified this path
+- Invalid JSON: Code had `.json().await.map_err(|e| TokenError::InvalidResponse(...))` but no test triggered it
+- Missing OAuth fields: Deserialize would fail on missing `access_token` but no test covered this
+
+**Review checklist for error handling code**:
+1. For each explicit error branch in the code, search for a corresponding test
+2. Pay special attention to HTTP status code handling (4xx, 5xx branches)
+3. Check JSON/deserialization error paths
+4. Verify timeout/connection error paths
+
+**Why this happens**: Developers write defensive error handling during implementation, then only write happy-path tests. The code "looks complete" with explicit error handling, masking the missing test coverage.
+
+---

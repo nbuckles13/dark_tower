@@ -125,6 +125,22 @@ Both MC and MH implement similar health checker background tasks (~150 lines eac
 
 ---
 
+### TD-14: Exponential Backoff Pattern
+**Added**: 2026-02-02
+**Related files**: `crates/common/src/token_manager.rs:68-71`, `crates/meeting-controller/src/grpc/gc_client.rs:60-63`
+
+TokenManager and GcClient both implement exponential backoff with similar constants (1s base, 30s max) and calculation `(delay * 2).min(max)`. Severity: Low (different semantics - TokenManager uses infinite retry for OAuth acquisition, GcClient uses bounded retry with deadline). Improvement path: Consider `common::retry::ExponentialBackoff` struct or helper when third use case appears (e.g., MH-AC integration). Timeline: Phase 7+ (when MH implementation begins). Note: Current duplication acceptable - different types (`u64` ms vs `Duration`), different retry semantics, extraction would require complex generalization.
+
+---
+
+### TD-15: HTTP Client Builder Boilerplate
+**Added**: 2026-02-02
+**Related files**: `crates/common/src/token_manager.rs:319-324`, `crates/global-controller/src/services/ac_client.rs:133-136`
+
+TokenManager and AcClient both construct reqwest clients with similar pattern: `Client::builder().timeout(...).connect_timeout(Duration::from_secs(5)).build()`. Severity: Low (~4 lines each, different timeout configuration). Improvement path: Consider `common::http::build_client(timeout, connect_timeout)` helper when third HTTP client appears. Timeline: Phase 5+ (when more HTTP clients needed). Note: Current duplication acceptable - small code, TokenManager uses configurable timeout while AcClient uses constant.
+
+---
+
 This differs from Security, Test, and Code Quality reviewers where ALL findings block. Only genuine shared code requiring extraction should be classified as BLOCKER.
 
 **When to block**: Copy-pasted business logic, duplicate utilities that should be in `common/`, identical algorithms across services.

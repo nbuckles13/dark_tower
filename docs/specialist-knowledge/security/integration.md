@@ -117,3 +117,19 @@ Session binding tokens provide recovery after connection drops. Security require
 Per ADR-0023 Section 1, binding tokens are defense-in-depth (also require valid JWT). The HKDF-derived-per-meeting-key pattern ensures meeting compromise doesn't reveal master secret.
 
 ---
+
+## Integration: Common Crate - TokenManager Security
+**Added**: 2026-02-02
+**Related files**: `crates/common/src/token_manager.rs`
+
+Services using `TokenManager` for OAuth 2.0 token acquisition must follow these security requirements:
+
+1. **Production configuration**: Use `TokenManagerConfig::new_secure()` which enforces HTTPS. The `new()` constructor allows HTTP but is only appropriate for local development.
+2. **Clock synchronization**: TokenManager includes a 30-second clock drift margin, but proper NTP synchronization on all hosts is strongly recommended for production.
+3. **Secret handling**: `client_secret` is stored as `SecretString`. The returned `TokenReceiver` provides tokens wrapped in `SecretString` - callers must use `.expose_secret()` explicitly when constructing Authorization headers.
+4. **Error handling**: Token acquisition errors are logged server-side with details; error messages returned to callers contain only status codes, no response bodies (prevents credential echo in verbose error messages).
+5. **Shutdown**: Services should call `handle.abort()` on the returned `JoinHandle` during graceful shutdown to stop the background refresh task.
+
+Services that require OAuth tokens (GC, MC when calling AC) should initialize TokenManager at startup and fail fast if initial token acquisition fails (don't start serving requests without valid service credentials).
+
+---
