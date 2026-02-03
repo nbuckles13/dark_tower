@@ -9,6 +9,11 @@ repository.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = []
+# Enable test utilities (e.g., TokenReceiver::from_test_channel)
+test-utils = []
+
 [dependencies]
 # Workspace dependencies
 tokio = { workspace = true }

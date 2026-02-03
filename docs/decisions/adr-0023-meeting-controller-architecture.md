@@ -991,6 +991,8 @@ crates/mc-test-utils/
 | MC heartbeat to GC | ✅ Done | 1175888 | Heartbeat RPC wiring |
 | AssignMeeting handling | ✅ Done | ddb6ddc | Accept/reject logic, MH assignment storage, resilience |
 | Fencing token validation | ✅ Done | ddb6ddc | Lua script, generation checks |
+| OAuth TokenManager integration | ✅ Done | 2026-02-02 | Dynamic token acquisition from AC, replaced MC_SERVICE_TOKEN |
+| env-tests for TokenManager startup failures | ❌ Pending | | AC unreachable (timeout), HTTP endpoint rejected (HTTPS enforcement), invalid credentials, token refresh failures |
 
 ### Phase 6d: MH Integration
 

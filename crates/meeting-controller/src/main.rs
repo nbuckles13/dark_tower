@@ -22,14 +22,15 @@
 //! - Fencing tokens prevent split-brain during failover
 //! - Session binding tokens enable secure reconnection
 //!
-//! # Startup Flow (ADR-0023 Phase 6c)
+//! # Startup Flow (ADR-0023 Phase 6c, ADR-0010)
 //!
 //! 1. Load configuration from environment
 //! 2. Initialize Redis connection (`FencedRedisClient`)
-//! 3. Initialize actor system (`MeetingControllerActorHandle`)
-//! 4. Start gRPC server for GC->MC communication
-//! 5. Create `GcClient` and spawn GC task (registration + heartbeats)
-//! 6. Wait for shutdown signal
+//! 3. Spawn `TokenManager` for OAuth token acquisition from AC (ADR-0010)
+//! 4. Initialize actor system (`MeetingControllerActorHandle`)
+//! 5. Start gRPC server for GC->MC communication
+//! 6. Create `GcClient` with `TokenReceiver` and spawn GC task (registration + heartbeats)
+//! 7. Wait for shutdown signal
 
 #![warn(clippy::pedantic)]
 #![allow(clippy::too_many_lines)] // main.rs orchestrates startup, naturally longer
@@ -38,6 +39,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::secret::{ExposeSecret, SecretBox};
+use common::token_manager::{spawn_token_manager, TokenManagerConfig};
 use meeting_controller::actors::{ActorMetrics, ControllerMetrics, MeetingControllerActorHandle};
 use meeting_controller::config::Config;
 use meeting_controller::errors::McError;
@@ -50,6 +52,12 @@ use tokio::signal;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+/// Default timeout for initial token acquisition.
+const TOKEN_ACQUISITION_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Minimum secret length for HMAC-SHA256 (32 bytes).
+const MIN_SECRET_LENGTH: usize = 32;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -93,6 +101,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let redis_client = Arc::new(redis_client);
     info!("Redis connection established");
 
+    // Spawn TokenManager for OAuth token acquisition (ADR-0010)
+    info!(
+        ac_endpoint = %config.ac_endpoint,
+        client_id = %config.client_id,
+        "Spawning TokenManager for AC authentication..."
+    );
+
+    let token_config = TokenManagerConfig::new_secure(
+        config.ac_endpoint.clone(),
+        config.client_id.clone(),
+        config.client_secret.clone(),
+    )
+    .map_err(|e| {
+        error!(error = %e, "Failed to create TokenManager config");
+        McError::TokenAcquisition(format!("TokenManager config error: {e}"))
+    })?;
+
+    let (token_task_handle, token_rx) =
+        tokio::time::timeout(TOKEN_ACQUISITION_TIMEOUT, spawn_token_manager(token_config))
+            .await
+            .map_err(|_| {
+                error!(
+                    timeout_secs = TOKEN_ACQUISITION_TIMEOUT.as_secs(),
+                    "Token acquisition timed out - AC may be unreachable"
+                );
+                McError::TokenAcquisitionTimeout
+            })?
+            .map_err(|e| {
+                error!(error = %e, "Failed to acquire initial token from AC");
+                McError::TokenAcquisition(format!("Initial token acquisition failed: {e}"))
+            })?;
+
+    info!("TokenManager spawned successfully, initial token acquired");
+
     // Initialize shared metrics for heartbeat reporting
     let controller_metrics = ControllerMetrics::new();
 
@@ -100,9 +142,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Initializing actor system...");
     let actor_metrics = ActorMetrics::new();
 
-    // Create master secret for session binding tokens
-    // In production, this should be loaded from secure config
-    let master_secret = SecretBox::new(Box::new(vec![0u8; 32])); // TODO: Load from config
+    // Decode master secret for session binding tokens from base64 config
+    let master_secret = {
+        use base64::Engine;
+        let decoder = base64::engine::general_purpose::STANDARD;
+        let secret_bytes = decoder
+            .decode(config.binding_token_secret.expose_secret())
+            .map_err(|e| {
+                error!(error = %e, "MC_BINDING_TOKEN_SECRET is not valid base64");
+                format!("Invalid base64 in MC_BINDING_TOKEN_SECRET: {e}")
+            })?;
+
+        if secret_bytes.len() < MIN_SECRET_LENGTH {
+            error!(
+                length = secret_bytes.len(),
+                min_length = MIN_SECRET_LENGTH,
+                "MC_BINDING_TOKEN_SECRET is too short"
+            );
+            return Err(format!(
+                "MC_BINDING_TOKEN_SECRET must be at least {MIN_SECRET_LENGTH} bytes, got {}",
+                secret_bytes.len()
+            )
+            .into());
+        }
+
+        SecretBox::new(Box::new(secret_bytes))
+    };
 
     let controller_handle = Arc::new(MeetingControllerActorHandle::new(
         config.mc_id.clone(),
@@ -147,19 +212,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     info!(addr = %grpc_addr, "gRPC server started");
 
-    // Create GcClient and spawn unified GC task (Phase 6c)
+    // Create GcClient with TokenReceiver and spawn unified GC task (Phase 6c, ADR-0010)
     // This task owns gc_client directly (no Arc needed)
     info!("Connecting to Global Controller...");
-    let gc_client = GcClient::new(
-        config.gc_grpc_url.clone(),
-        config.service_token.clone(),
-        config.clone(),
-    )
-    .await
-    .map_err(|e| {
-        error!(error = %e, "Failed to connect to GC");
-        e
-    })?;
+    let gc_client = GcClient::new(config.gc_grpc_url.clone(), token_rx.clone(), config.clone())
+        .await
+        .map_err(|e| {
+            error!(error = %e, "Failed to connect to GC");
+            e
+        })?;
     info!("Connected to Global Controller");
 
     // Spawn unified GC task (registration + dual heartbeats)
@@ -191,6 +252,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Err(e) = controller_handle.shutdown(Duration::from_secs(30)).await {
         warn!(error = %e, "Actor system shutdown error");
     }
+
+    // Abort TokenManager background task (ADR-0010)
+    info!("Stopping TokenManager...");
+    token_task_handle.abort();
 
     info!("Meeting Controller shutdown complete");
     Ok(())

@@ -5,9 +5,10 @@
 //! - Fast heartbeat (10s) - capacity updates
 //! - Comprehensive heartbeat (30s) - full metrics
 //!
-//! # Security
+//! # Security (ADR-0010)
 //!
-//! - Service tokens authenticate MC to GC
+//! - OAuth 2.0 tokens authenticate MC to GC (acquired via TokenManager)
+//! - Tokens are automatically refreshed by TokenManager background task
 //! - Channel is cheaply cloneable (backed by tower_buffer::Buffer with mpsc)
 //! - tonic handles reconnection internally
 //! - Exponential backoff for retries
@@ -20,7 +21,8 @@
 
 use crate::config::Config;
 use crate::errors::McError;
-use common::secret::{ExposeSecret, SecretString};
+use common::secret::ExposeSecret;
+use common::token_manager::TokenReceiver;
 use proto_gen::internal::global_controller_service_client::GlobalControllerServiceClient;
 use proto_gen::internal::{
     ComprehensiveHeartbeatRequest, ControllerCapacity, FastHeartbeatRequest, HealthStatus,
@@ -66,11 +68,17 @@ const BACKOFF_MAX: Duration = Duration::from_secs(30);
 ///
 /// Uses a tonic `Channel` which is cheaply cloneable and handles
 /// connection management internally. No locking needed.
+///
+/// # Token Management (ADR-0010)
+///
+/// Tokens are obtained from `TokenReceiver` which provides automatically
+/// refreshed OAuth 2.0 tokens from the `TokenManager` background task.
+/// The receiver is cloneable and thread-safe.
 pub struct GcClient {
     /// gRPC channel to GC (cheaply cloneable, handles reconnection).
     channel: Channel,
-    /// Service token for authenticating to GC (protected by SecretString).
-    service_token: SecretString,
+    /// Token receiver for dynamically refreshed OAuth tokens (ADR-0010).
+    token_rx: TokenReceiver,
     /// MC configuration.
     config: Config,
     /// Whether registration has succeeded.
@@ -87,7 +95,7 @@ impl GcClient {
     /// # Arguments
     ///
     /// * `gc_endpoint` - gRPC endpoint of the Global Controller
-    /// * `service_token` - MC's service token for authenticating to GC
+    /// * `token_rx` - Token receiver for dynamically refreshed OAuth tokens (ADR-0010)
     /// * `config` - MC configuration
     ///
     /// # Errors
@@ -100,9 +108,15 @@ impl GcClient {
     /// The channel is created eagerly at startup (fail fast). tonic's `Channel`
     /// is cheaply cloneable and handles reconnection internally, so no locking
     /// is needed for concurrent use.
+    ///
+    /// # Token Refresh (ADR-0010)
+    ///
+    /// The `TokenReceiver` provides automatically refreshed tokens from the
+    /// `TokenManager` background task. Tokens are acquired on each request
+    /// via `token_rx.token()`, ensuring the latest valid token is always used.
     pub async fn new(
         gc_endpoint: String,
-        service_token: SecretString,
+        token_rx: TokenReceiver,
         config: Config,
     ) -> Result<Self, McError> {
         let channel = Endpoint::from_shared(gc_endpoint.clone())
@@ -131,7 +145,7 @@ impl GcClient {
 
         Ok(Self {
             channel,
-            service_token,
+            token_rx,
             config,
             is_registered: AtomicBool::new(false),
             fast_heartbeat_interval_ms: AtomicU64::new(
@@ -144,15 +158,21 @@ impl GcClient {
     }
 
     /// Add authorization header to a request.
+    ///
+    /// Retrieves the current token from `TokenReceiver` which provides
+    /// automatically refreshed tokens from the `TokenManager` background task.
     fn add_auth<T>(&self, request: T) -> Result<Request<T>, McError> {
         let mut grpc_request = Request::new(request);
+        // Get current token from TokenReceiver (always valid after spawn_token_manager)
+        let current_token = self.token_rx.token();
         grpc_request.metadata_mut().insert(
             "authorization",
-            format!("Bearer {}", self.service_token.expose_secret())
+            format!("Bearer {}", current_token.expose_secret())
                 .parse()
                 .map_err(|e| {
-                    error!(target: "mc.grpc.gc_client", error = %e, "Invalid service token format");
-                    McError::Config(format!("Invalid service token format: {e}"))
+                    // Log parse error without token content (e only contains "invalid header value" type message)
+                    error!(target: "mc.grpc.gc_client", error = %e, "Authorization header parse failed");
+                    McError::Config(format!("Authorization header parse failed: {e}"))
                 })?,
         );
         Ok(grpc_request)
@@ -619,6 +639,25 @@ mod tests {
         assert_eq!(GC_CONNECT_TIMEOUT, Duration::from_secs(5));
     }
 
+    /// Helper to create a mock TokenReceiver for testing.
+    ///
+    /// Uses a static sender to avoid memory leaks from `mem::forget`.
+    fn mock_token_receiver() -> TokenReceiver {
+        use common::secret::SecretString;
+        use std::sync::OnceLock;
+        use tokio::sync::watch;
+
+        // Static sender keeps the channel alive without memory leak
+        static TOKEN_SENDER: OnceLock<watch::Sender<SecretString>> = OnceLock::new();
+
+        let sender = TOKEN_SENDER.get_or_init(|| {
+            let (tx, _rx) = watch::channel(SecretString::from("test-token"));
+            tx
+        });
+
+        TokenReceiver::from_test_channel(sender.subscribe())
+    }
+
     #[tokio::test]
     async fn test_new_with_invalid_endpoint() {
         use common::secret::SecretString;
@@ -638,13 +677,17 @@ mod tests {
             nonce_grace_window_seconds: 5,
             disconnect_grace_period_seconds: 30,
             binding_token_secret: SecretString::from("dGVzdC1zZWNyZXQ="),
-            service_token: SecretString::from("test-service-token"),
+            ac_endpoint: "https://ac.example.com".to_string(),
+            client_id: "mc-service".to_string(),
+            client_secret: SecretString::from("test-client-secret"),
         };
+
+        let token_rx = mock_token_receiver();
 
         // Empty endpoint should fail with Config error
         let result = GcClient::new(
             String::new(), // Empty string is clearly invalid
-            SecretString::from("test-token"),
+            token_rx,
             config.clone(),
         )
         .await;
@@ -673,13 +716,17 @@ mod tests {
             nonce_grace_window_seconds: 5,
             disconnect_grace_period_seconds: 30,
             binding_token_secret: SecretString::from("dGVzdC1zZWNyZXQ="),
-            service_token: SecretString::from("test-service-token"),
+            ac_endpoint: "https://ac.example.com".to_string(),
+            client_id: "mc-service".to_string(),
+            client_secret: SecretString::from("test-client-secret"),
         };
+
+        let token_rx = mock_token_receiver();
 
         // Valid endpoint but no server running - should fail with Grpc error
         let result = GcClient::new(
             "http://127.0.0.1:59999".to_string(), // Unlikely to have a server
-            SecretString::from("test-token"),
+            token_rx,
             config,
         )
         .await;

@@ -616,3 +616,39 @@ pub async fn spawn_token_manager(
 - Composable: caller decides how to manage the handle
 
 ---
+
+## Pattern: OnceLock for Test Watch Channel Senders
+**Added**: 2026-02-02
+**Related files**: `crates/meeting-controller/src/grpc/gc_client.rs`, `crates/meeting-controller/tests/gc_integration.rs`
+
+When tests need a `watch::Receiver` that stays valid for the test duration, use `OnceLock` to hold the sender statically instead of `mem::forget`. This avoids intentional memory leaks while keeping the channel alive:
+
+```rust
+fn mock_token_receiver() -> TokenReceiver {
+    use std::sync::OnceLock;
+    use tokio::sync::watch;
+
+    // Static sender keeps the channel alive without memory leak
+    static TOKEN_SENDER: OnceLock<watch::Sender<SecretString>> = OnceLock::new();
+
+    let sender = TOKEN_SENDER.get_or_init(|| {
+        let (tx, _rx) = watch::channel(SecretString::from("test-token"));
+        tx
+    });
+
+    TokenReceiver::from_test_channel(sender.subscribe())
+}
+```
+
+**Why OnceLock over mem::forget:**
+- No intentional memory leak (sender is properly cleaned up at process exit)
+- Thread-safe initialization (stable since Rust 1.70.0)
+- Self-documenting intent: "this is static, not leaked"
+- Works correctly with parallel test execution
+
+**When to apply:**
+- Test helpers creating watch::Receiver for mock values
+- Any test fixture that needs a channel sender to outlive the test function
+- Replacing existing `mem::forget(tx)` patterns in test code
+
+---

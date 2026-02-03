@@ -258,6 +258,29 @@ impl std::fmt::Debug for TokenReceiver {
     }
 }
 
+impl TokenReceiver {
+    /// Create a `TokenReceiver` from a watch channel for testing purposes.
+    ///
+    /// **Note**: This is only for testing. In production, use `spawn_token_manager`
+    /// which ensures the token is valid before returning.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use common::secret::SecretString;
+    /// use common::token_manager::TokenReceiver;
+    /// use tokio::sync::watch;
+    ///
+    /// let (tx, rx) = watch::channel(SecretString::from("test-token"));
+    /// let receiver = TokenReceiver::from_test_channel(rx);
+    /// ```
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub fn from_test_channel(rx: watch::Receiver<SecretString>) -> Self {
+        Self(rx)
+    }
+}
+
 // =============================================================================
 // OAuth Response Types
 // =============================================================================

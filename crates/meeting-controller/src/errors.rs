@@ -79,6 +79,14 @@ pub enum McError {
     /// Internal error with context.
     #[error("Internal error: {0}")]
     Internal(String),
+
+    /// Token acquisition failed during startup.
+    #[error("Token acquisition failed: {0}")]
+    TokenAcquisition(String),
+
+    /// Token acquisition timed out during startup.
+    #[error("Token acquisition timed out")]
+    TokenAcquisitionTimeout,
 }
 
 /// Session binding token validation errors (ADR-0023).
@@ -116,7 +124,9 @@ impl McError {
             | McError::Config(_)
             | McError::Internal(_)
             | McError::FencedOut(_)
-            | McError::NotRegistered => {
+            | McError::NotRegistered
+            | McError::TokenAcquisition(_)
+            | McError::TokenAcquisitionTimeout => {
                 6 // INTERNAL_ERROR
             }
             McError::SessionBinding(_) | McError::JwtValidation(_) => 2, // UNAUTHORIZED
@@ -138,7 +148,9 @@ impl McError {
             | McError::Grpc(_)
             | McError::Config(_)
             | McError::Internal(_)
-            | McError::NotRegistered => "An internal error occurred".to_string(),
+            | McError::NotRegistered
+            | McError::TokenAcquisition(_)
+            | McError::TokenAcquisitionTimeout => "An internal error occurred".to_string(),
             McError::SessionBinding(e) => e.to_string(),
             McError::MeetingNotFound(_) => "Meeting not found".to_string(),
             McError::ParticipantNotFound(_) => "Participant not found".to_string(),
@@ -176,6 +188,13 @@ mod tests {
         assert_eq!(McError::Internal("test".to_string()).error_code(), 6);
         assert_eq!(McError::FencedOut("stale".to_string()).error_code(), 6);
         assert_eq!(McError::NotRegistered.error_code(), 6);
+
+        // Token acquisition errors -> 6 (INTERNAL_ERROR)
+        assert_eq!(
+            McError::TokenAcquisition("failed".to_string()).error_code(),
+            6
+        );
+        assert_eq!(McError::TokenAcquisitionTimeout.error_code(), 6);
 
         // Auth errors -> 2
         assert_eq!(
@@ -242,6 +261,15 @@ mod tests {
             not_registered_err.client_message(),
             "An internal error occurred"
         );
+
+        // Token errors should hide details
+        let token_err =
+            McError::TokenAcquisition("AC connection refused at 192.168.1.1".to_string());
+        assert!(!token_err.client_message().contains("192.168"));
+        assert_eq!(token_err.client_message(), "An internal error occurred");
+
+        let timeout_err = McError::TokenAcquisitionTimeout;
+        assert_eq!(timeout_err.client_message(), "An internal error occurred");
     }
 
     #[test]
@@ -276,6 +304,19 @@ mod tests {
                 }
             ),
             "Meeting is migrating: mc2.example.com:4433"
+        );
+
+        // Token error display formatting
+        assert_eq!(
+            format!(
+                "{}",
+                McError::TokenAcquisition("AC unreachable".to_string())
+            ),
+            "Token acquisition failed: AC unreachable"
+        );
+        assert_eq!(
+            format!("{}", McError::TokenAcquisitionTimeout),
+            "Token acquisition timed out"
         );
     }
 }

@@ -16,6 +16,7 @@ use meeting_controller::errors::McError;
 use meeting_controller::grpc::GcClient;
 
 use common::secret::{SecretBox, SecretString};
+use common::token_manager::TokenReceiver;
 use proto_gen::internal::global_controller_service_server::{
     GlobalControllerService, GlobalControllerServiceServer,
 };
@@ -23,7 +24,7 @@ use proto_gen::internal::{
     ComprehensiveHeartbeatRequest, FastHeartbeatRequest, HealthStatus, HeartbeatResponse,
     NotifyMeetingEndedRequest, NotifyMeetingEndedResponse, RegisterMcRequest, RegisterMcResponse,
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
@@ -253,8 +254,28 @@ fn test_config(gc_url: &str) -> Config {
         nonce_grace_window_seconds: 5,
         disconnect_grace_period_seconds: 30,
         binding_token_secret: SecretString::from("dGVzdC1zZWNyZXQ="),
-        service_token: SecretString::from("test-service-token"),
+        ac_endpoint: "https://ac.example.com".to_string(),
+        client_id: "mc-service".to_string(),
+        client_secret: SecretString::from("test-client-secret"),
     }
+}
+
+/// Create a mock TokenReceiver for testing.
+///
+/// Uses a static sender to avoid memory leaks from `mem::forget`.
+/// The sender is kept alive for the duration of the test process.
+fn mock_token_receiver() -> TokenReceiver {
+    use std::sync::OnceLock;
+
+    // Static sender keeps the channel alive without memory leak
+    static TOKEN_SENDER: OnceLock<watch::Sender<SecretString>> = OnceLock::new();
+
+    let sender = TOKEN_SENDER.get_or_init(|| {
+        let (tx, _rx) = watch::channel(SecretString::from("test-service-token"));
+        tx
+    });
+
+    TokenReceiver::from_test_channel(sender.subscribe())
 }
 
 async fn start_mock_gc_server(mock_gc: MockGcServer) -> (SocketAddr, CancellationToken) {
@@ -293,10 +314,9 @@ async fn test_gc_client_registration_success() {
 
     let gc_url = format!("http://{}", addr);
     let config = test_config(&gc_url);
+    let token_rx = mock_token_receiver();
 
-    let gc_client = GcClient::new(gc_url, SecretString::from("test-token"), config)
-        .await
-        .unwrap();
+    let gc_client = GcClient::new(gc_url, token_rx, config).await.unwrap();
 
     assert!(!gc_client.is_registered());
 
@@ -314,10 +334,9 @@ async fn test_gc_client_registration_rejected() {
 
     let gc_url = format!("http://{}", addr);
     let config = test_config(&gc_url);
+    let token_rx = mock_token_receiver();
 
-    let gc_client = GcClient::new(gc_url, SecretString::from("test-token"), config)
-        .await
-        .unwrap();
+    let gc_client = GcClient::new(gc_url, token_rx, config).await.unwrap();
 
     let result = gc_client.register().await;
     assert!(result.is_err());
@@ -334,8 +353,9 @@ async fn test_gc_client_registration_content() {
 
     let gc_url = format!("http://{}", addr);
     let config = test_config(&gc_url);
+    let token_rx = mock_token_receiver();
 
-    let gc_client = GcClient::new(gc_url, SecretString::from("test-token"), config.clone())
+    let gc_client = GcClient::new(gc_url, token_rx, config.clone())
         .await
         .unwrap();
 
@@ -362,8 +382,9 @@ async fn test_gc_client_fast_heartbeat() {
 
     let gc_url = format!("http://{}", addr);
     let config = test_config(&gc_url);
+    let token_rx = mock_token_receiver();
 
-    let gc_client = GcClient::new(gc_url, SecretString::from("test-token"), config.clone())
+    let gc_client = GcClient::new(gc_url, token_rx, config.clone())
         .await
         .unwrap();
 
@@ -392,8 +413,9 @@ async fn test_gc_client_comprehensive_heartbeat() {
 
     let gc_url = format!("http://{}", addr);
     let config = test_config(&gc_url);
+    let token_rx = mock_token_receiver();
 
-    let gc_client = GcClient::new(gc_url, SecretString::from("test-token"), config.clone())
+    let gc_client = GcClient::new(gc_url, token_rx, config.clone())
         .await
         .unwrap();
 
@@ -429,10 +451,9 @@ async fn test_gc_client_heartbeat_skipped_when_not_registered() {
 
     let gc_url = format!("http://{}", addr);
     let config = test_config(&gc_url);
+    let token_rx = mock_token_receiver();
 
-    let gc_client = GcClient::new(gc_url, SecretString::from("test-token"), config)
-        .await
-        .unwrap();
+    let gc_client = GcClient::new(gc_url, token_rx, config).await.unwrap();
 
     // Don't register - heartbeat should be skipped
     assert!(!gc_client.is_registered());
@@ -464,10 +485,9 @@ async fn test_gc_client_heartbeat_intervals_from_gc() {
 
     let gc_url = format!("http://{}", addr);
     let config = test_config(&gc_url);
+    let token_rx = mock_token_receiver();
 
-    let gc_client = GcClient::new(gc_url, SecretString::from("test-token"), config)
-        .await
-        .unwrap();
+    let gc_client = GcClient::new(gc_url, token_rx, config).await.unwrap();
 
     gc_client.register().await.unwrap();
 
@@ -553,10 +573,9 @@ async fn test_heartbeat_not_found_detection() {
 
     let gc_url = format!("http://{addr}");
     let config = test_config(&gc_url);
+    let token_rx = mock_token_receiver();
 
-    let gc_client = GcClient::new(gc_url, SecretString::from("test-token"), config)
-        .await
-        .unwrap();
+    let gc_client = GcClient::new(gc_url, token_rx, config).await.unwrap();
 
     // Mark as registered (bypass registration)
     gc_client.register().await.unwrap();
@@ -586,10 +605,9 @@ async fn test_comprehensive_heartbeat_not_found_detection() {
 
     let gc_url = format!("http://{addr}");
     let config = test_config(&gc_url);
+    let token_rx = mock_token_receiver();
 
-    let gc_client = GcClient::new(gc_url, SecretString::from("test-token"), config)
-        .await
-        .unwrap();
+    let gc_client = GcClient::new(gc_url, token_rx, config).await.unwrap();
 
     gc_client.register().await.unwrap();
 
@@ -619,10 +637,9 @@ async fn test_attempt_reregistration_success() {
 
     let gc_url = format!("http://{addr}");
     let config = test_config(&gc_url);
+    let token_rx = mock_token_receiver();
 
-    let gc_client = GcClient::new(gc_url, SecretString::from("test-token"), config)
-        .await
-        .unwrap();
+    let gc_client = GcClient::new(gc_url, token_rx, config).await.unwrap();
 
     // Don't call register() initially - simulate MC that lost registration
 
@@ -649,10 +666,9 @@ async fn test_attempt_reregistration_after_not_found() {
 
     let gc_url = format!("http://{addr}");
     let config = test_config(&gc_url);
+    let token_rx = mock_token_receiver();
 
-    let gc_client = GcClient::new(gc_url, SecretString::from("test-token"), config)
-        .await
-        .unwrap();
+    let gc_client = GcClient::new(gc_url, token_rx, config).await.unwrap();
 
     // Initial registration
     gc_client.register().await.unwrap();

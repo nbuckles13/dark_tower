@@ -60,6 +60,25 @@ This file captures pitfalls and anti-patterns discovered during DRY reviews.
 
 ---
 
+## Proactive Common Code Placement Validates Pattern
+
+**Added**: 2026-02-02
+**Related files**: `crates/common/src/token_manager.rs`, `crates/meeting-controller/src/main.rs`
+
+**Gotcha**: When shared code is placed in `common` proactively (before second consumer exists), don't flag the single-consumer case as "premature extraction." Instead, verify proper usage and note as validation.
+
+**Example**: TokenManager was extracted to `common` on 2026-02-01 with only AC as consumer. MC integrated on 2026-02-02 and correctly used the shared code - no duplication occurred. The proactive placement was validated.
+
+**How to review**:
+1. Check that consumer uses `common` imports (not copy-paste)
+2. Verify service-specific wrappers are appropriate (e.g., `McError::TokenAcquisition` wrapping `TokenError`)
+3. Note as "Positive: Correct Use of Shared Code" in review
+4. Track any patterns that emerged that should have been in common but weren't
+
+**Anti-pattern**: Flagging proactive extractions as "over-engineering" - the whole point is to prevent duplication before it happens.
+
+---
+
 ## Health Status Conversion Must Be Fail-Closed Consistent
 
 **Added**: 2026-01-31
