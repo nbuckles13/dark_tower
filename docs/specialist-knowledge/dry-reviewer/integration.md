@@ -141,6 +141,30 @@ TokenManager and AcClient both construct reqwest clients with similar pattern: `
 
 ---
 
+### TD-16: Mock TokenReceiver Test Helper
+**Added**: 2026-02-02 | **Updated**: 2026-02-02
+**Related files**: `crates/meeting-controller/src/grpc/gc_client.rs:642-659`, `crates/meeting-controller/tests/gc_integration.rs:264-279`
+
+Two `mock_token_receiver()` helper functions exist within MC (unit tests and integration tests). Both now use OnceLock pattern for proper memory management. Severity: Low (internal to MC, 2 occurrences). Improvement path: Extract to `common::token_manager::test_helpers::mock_receiver()` when GC integrates TokenManager. Timeline: GC TokenManager integration (Phase 5+). Note: Pattern is ready for extraction - both implementations are nearly identical.
+
+---
+
+### TD-17: OAuth Config Fields Pattern
+**Added**: 2026-02-02
+**Related files**: `crates/meeting-controller/src/config.rs:96-105`
+
+MC's Config struct contains OAuth credential fields (`ac_endpoint`, `client_id`, `client_secret`). GC currently uses static `GC_SERVICE_TOKEN` but will need similar fields when migrating to dynamic TokenManager. Severity: Low (single occurrence). Improvement path: Evaluate `OAuthCredentialConfig` extraction if GC config is >90% similar. Timeline: GC TokenManager integration (Phase 5+). Note: Monitor during GC migration - may be acceptable service-specific config.
+
+---
+
+### TD-18: Master Secret Loading Pattern
+**Added**: 2026-02-02
+**Related files**: `crates/meeting-controller/src/main.rs:145-170`
+
+MC loads session binding token master secret via: base64 decode -> length validation (32 bytes min) -> wrap in SecretBox. First occurrence of this pattern. Severity: Low (single occurrence, MC-specific). Improvement path: Consider `common::secret::load_master_secret()` if GC/MH need similar secret loading. Timeline: Phase 7+ (if MH needs secrets). Note: Session binding is MC-specific per ADR-0023, so duplication may not occur.
+
+---
+
 This differs from Security, Test, and Code Quality reviewers where ALL findings block. Only genuine shared code requiring extraction should be classified as BLOCKER.
 
 **When to block**: Copy-pasted business logic, duplicate utilities that should be in `common/`, identical algorithms across services.

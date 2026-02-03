@@ -881,6 +881,44 @@ Use MockBehavior when testing client retry/recovery logic against unreliable ser
 
 ---
 
+## Pattern: OnceLock for Test Channel Senders (Avoiding mem::forget)
+**Added**: 2026-02-02
+**Related files**: `crates/meeting-controller/src/grpc/gc_client.rs`, `crates/meeting-controller/tests/gc_integration.rs`
+
+When tests need a `watch::Receiver` that outlives the test function (e.g., for `TokenReceiver`), use `OnceLock` to keep the sender alive without memory leaks:
+
+```rust
+fn mock_token_receiver() -> TokenReceiver {
+    use std::sync::OnceLock;
+    use tokio::sync::watch;
+
+    // Static sender keeps the channel alive without memory leak
+    static TOKEN_SENDER: OnceLock<watch::Sender<SecretString>> = OnceLock::new();
+
+    let sender = TOKEN_SENDER.get_or_init(|| {
+        let (tx, _rx) = watch::channel(SecretString::from("test-token"));
+        tx
+    });
+
+    TokenReceiver::from_test_channel(sender.subscribe())
+}
+```
+
+**Why not `mem::forget`**: The old pattern `mem::forget(tx)` intentionally leaks the sender, which works but:
+- Creates actual memory leaks (tools like Valgrind/MIRI will flag it)
+- Violates Rust idioms (forget is almost always wrong)
+- Confuses readers about intent
+
+**Why OnceLock works**:
+- Static lifetime keeps sender alive for entire test process
+- `get_or_init()` is thread-safe (parallel tests share same sender)
+- Sender is initialized once, reused across test functions
+- No leak - static is dropped at process exit (normal cleanup)
+
+**When to use**: Any test helper that creates a channel where sender must outlive the returned receiver.
+
+---
+
 ## Pattern: Testing Infinite Retry Loops with Timeout Wrappers
 **Added**: 2026-02-02
 **Related files**: `crates/common/src/token_manager.rs`

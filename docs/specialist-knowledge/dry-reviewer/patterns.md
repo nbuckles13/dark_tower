@@ -109,6 +109,37 @@ These serve different purposes and are NOT duplication even if both involve the 
 
 ---
 
+## OnceLock for Static Test Fixtures
+
+**Added**: 2026-02-02
+**Related files**: `crates/meeting-controller/src/grpc/gc_client.rs:648-658`, `crates/meeting-controller/tests/gc_integration.rs:268-278`
+
+**Pattern**: When creating test helper functions that return cloneable handles (e.g., `TokenReceiver`, channel receivers), use `std::sync::OnceLock` to hold a static sender that keeps the channel alive across test invocations:
+
+```rust
+fn mock_token_receiver() -> TokenReceiver {
+    use std::sync::OnceLock;
+    static TOKEN_SENDER: OnceLock<watch::Sender<SecretString>> = OnceLock::new();
+    let sender = TOKEN_SENDER.get_or_init(|| {
+        let (tx, _rx) = watch::channel(SecretString::from("test-token"));
+        tx
+    });
+    TokenReceiver::from_test_channel(sender.subscribe())
+}
+```
+
+**Benefits**:
+- Avoids memory leaks from `mem::forget` (anti-pattern)
+- Sender lives for process lifetime (static)
+- Multiple test invocations share the same channel
+- Thread-safe initialization via OnceLock
+
+**When to use**: Test helpers returning watch/broadcast receivers, test fixtures needing process-wide singletons.
+
+**When NOT to use**: Production code (prefer explicit lifetime management), test fixtures needing per-test isolation.
+
+---
+
 ## Re-Export with Rename for Backwards Compatibility
 
 **Added**: 2026-01-31

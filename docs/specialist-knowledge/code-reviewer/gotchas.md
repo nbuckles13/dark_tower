@@ -339,3 +339,39 @@ let body = response.text().await.unwrap_or_else(|e| {
 ```
 
 The `unwrap_or_else` pattern logs the actual error at an appropriate level (trace for expected failures, warn for unexpected) while still providing a fallback value. This ensures diagnostic information isn't lost during debugging.
+
+---
+
+## Gotcha: Hardcoded Placeholder Secrets with TODO Comments
+**Added**: 2026-02-02
+**Related files**: `crates/meeting-controller/src/main.rs`
+
+Hardcoded placeholder secrets (e.g., `vec![0u8; 32]`) with TODO comments are easy to miss during code review because they compile and run. Flag as MINOR finding requiring immediate fix before merge:
+
+```rust
+// BAD: Placeholder that works but is insecure
+let master_secret = SecretBox::new(Box::new(vec![0u8; 32])); // TODO: Load from config
+
+// GOOD: Load from config with validation
+let master_secret = {
+    use base64::Engine;
+    let decoder = base64::engine::general_purpose::STANDARD;
+    let secret_bytes = decoder
+        .decode(config.binding_token_secret.expose_secret())
+        .map_err(|e| format!("Invalid base64 in MC_BINDING_TOKEN_SECRET: {e}"))?;
+
+    if secret_bytes.len() < MIN_SECRET_LENGTH {
+        return Err(format!(
+            "MC_BINDING_TOKEN_SECRET must be at least {MIN_SECRET_LENGTH} bytes"
+        ).into());
+    }
+
+    SecretBox::new(Box::new(secret_bytes))
+};
+```
+
+**Key validation points:**
+- Decode from config (base64 for binary secrets)
+- Validate minimum length (32 bytes for HMAC-SHA256)
+- Provide clear, actionable error messages
+- Use constants for magic numbers (`MIN_SECRET_LENGTH = 32`)

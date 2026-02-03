@@ -2,6 +2,14 @@
 //!
 //! Configuration is loaded from environment variables. All sensitive
 //! fields are redacted in Debug output.
+//!
+//! ## OAuth Configuration (ADR-0010)
+//!
+//! MC uses OAuth 2.0 client credentials for authenticating to GC via AC.
+//! Required environment variables:
+//! - `AC_ENDPOINT`: Authentication Controller endpoint (e.g., `https://ac.example.com`)
+//! - `MC_CLIENT_ID`: OAuth client ID for MC
+//! - `MC_CLIENT_SECRET`: OAuth client secret for MC
 
 use common::secret::SecretString;
 use std::collections::HashMap;
@@ -85,9 +93,16 @@ pub struct Config {
     /// Protected by `SecretString` to prevent accidental logging.
     pub binding_token_secret: SecretString,
 
-    /// Service token for authenticating to Global Controller.
+    /// Authentication Controller endpoint for OAuth token acquisition.
+    /// Must use HTTPS in production (enforced by TokenManager::new_secure).
+    pub ac_endpoint: String,
+
+    /// OAuth client ID for MC (used for client credentials flow to AC).
+    pub client_id: String,
+
+    /// OAuth client secret for MC (used for client credentials flow to AC).
     /// Protected by `SecretString` to prevent accidental logging.
-    pub service_token: SecretString,
+    pub client_secret: SecretString,
 }
 
 /// Custom Debug implementation that redacts sensitive fields.
@@ -114,7 +129,9 @@ impl fmt::Debug for Config {
                 &self.disconnect_grace_period_seconds,
             )
             .field("binding_token_secret", &"[REDACTED]")
-            .field("service_token", &"[REDACTED]")
+            .field("ac_endpoint", &self.ac_endpoint)
+            .field("client_id", &self.client_id)
+            .field("client_secret", &"[REDACTED]")
             .finish()
     }
 }
@@ -149,9 +166,19 @@ impl Config {
                 .clone(),
         );
 
-        let service_token = SecretString::from(
-            vars.get("MC_SERVICE_TOKEN")
-                .ok_or_else(|| ConfigError::MissingEnvVar("MC_SERVICE_TOKEN".to_string()))?
+        let ac_endpoint = vars
+            .get("AC_ENDPOINT")
+            .ok_or_else(|| ConfigError::MissingEnvVar("AC_ENDPOINT".to_string()))?
+            .clone();
+
+        let client_id = vars
+            .get("MC_CLIENT_ID")
+            .ok_or_else(|| ConfigError::MissingEnvVar("MC_CLIENT_ID".to_string()))?
+            .clone();
+
+        let client_secret = SecretString::from(
+            vars.get("MC_CLIENT_SECRET")
+                .ok_or_else(|| ConfigError::MissingEnvVar("MC_CLIENT_SECRET".to_string()))?
                 .clone(),
         );
 
@@ -235,7 +262,9 @@ impl Config {
             nonce_grace_window_seconds,
             disconnect_grace_period_seconds,
             binding_token_secret,
-            service_token,
+            ac_endpoint,
+            client_id,
+            client_secret,
         })
     }
 }
@@ -257,8 +286,13 @@ mod tests {
                 "dGVzdC1zZWNyZXQtMTIzNDU2Nzg5MA==".to_string(),
             ),
             (
-                "MC_SERVICE_TOKEN".to_string(),
-                "test-service-token".to_string(),
+                "AC_ENDPOINT".to_string(),
+                "https://ac.example.com".to_string(),
+            ),
+            ("MC_CLIENT_ID".to_string(), "mc-service".to_string()),
+            (
+                "MC_CLIENT_SECRET".to_string(),
+                "test-client-secret".to_string(),
             ),
         ])
     }
@@ -367,12 +401,40 @@ mod tests {
     }
 
     #[test]
-    fn test_from_vars_missing_service_token() {
+    fn test_from_vars_missing_ac_endpoint() {
         let mut vars = base_vars();
-        vars.remove("MC_SERVICE_TOKEN");
+        vars.remove("AC_ENDPOINT");
 
         let result = Config::from_vars(&vars);
-        assert!(matches!(result, Err(ConfigError::MissingEnvVar(v)) if v == "MC_SERVICE_TOKEN"));
+        assert!(matches!(result, Err(ConfigError::MissingEnvVar(v)) if v == "AC_ENDPOINT"));
+    }
+
+    #[test]
+    fn test_from_vars_missing_client_id() {
+        let mut vars = base_vars();
+        vars.remove("MC_CLIENT_ID");
+
+        let result = Config::from_vars(&vars);
+        assert!(matches!(result, Err(ConfigError::MissingEnvVar(v)) if v == "MC_CLIENT_ID"));
+    }
+
+    #[test]
+    fn test_from_vars_missing_client_secret() {
+        let mut vars = base_vars();
+        vars.remove("MC_CLIENT_SECRET");
+
+        let result = Config::from_vars(&vars);
+        assert!(matches!(result, Err(ConfigError::MissingEnvVar(v)) if v == "MC_CLIENT_SECRET"));
+    }
+
+    #[test]
+    fn test_oauth_config_loaded_correctly() {
+        let vars = base_vars();
+        let config = Config::from_vars(&vars).expect("Config should load successfully");
+
+        assert_eq!(config.ac_endpoint, "https://ac.example.com");
+        assert_eq!(config.client_id, "mc-service");
+        assert_eq!(config.client_secret.expose_secret(), "test-client-secret");
     }
 
     #[test]
@@ -386,5 +448,9 @@ mod tests {
         assert!(debug_output.contains("[REDACTED]"));
         assert!(!debug_output.contains("redis://"));
         assert!(!debug_output.contains("dGVzdC1zZWNyZXQ"));
+        assert!(!debug_output.contains("test-client-secret"));
+        // ac_endpoint and client_id are not sensitive
+        assert!(debug_output.contains("https://ac.example.com"));
+        assert!(debug_output.contains("mc-service"));
     }
 }

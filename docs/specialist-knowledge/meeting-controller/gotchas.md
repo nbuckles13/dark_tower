@@ -123,3 +123,19 @@ When testing interval-based tasks with `tokio::time::advance()`, using `MissedTi
 When integrating services via gRPC, start your inbound gRPC server BEFORE attempting outbound registration with the peer service. If you register with GC before starting the MC's gRPC server, GC may immediately try to call MC (e.g., `AssignMeeting`) and fail because the server isn't ready yet. Correct order: (1) Redis/actors, (2) Start gRPC server, (3) Register with GC, (4) Spawn background tasks. This prevents race conditions during startup.
 
 ---
+
+## Gotcha: Base64 Secrets Need Length Validation After Decoding
+**Added**: 2026-02-02
+**Related files**: `crates/meeting-controller/src/main.rs`
+
+When loading secrets from environment variables as base64, validate BOTH the base64 format AND the decoded length. A valid base64 string might decode to insufficient bytes for cryptographic use. Pattern: decode first, then check `decoded.len() >= MIN_LENGTH`. For HMAC-SHA256 keys, require at least 32 bytes. Log descriptive errors without revealing the actual secret: `error!("MC_BINDING_TOKEN_SECRET must be at least {MIN_LENGTH} bytes")`. This catches configuration errors at startup rather than cryptographic failures at runtime.
+
+---
+
+## Gotcha: Semantic Guard False Positive on Error Context
+**Added**: 2026-02-02
+**Related files**: `crates/meeting-controller/src/main.rs`, `scripts/guards/semantic-guard.sh`
+
+The semantic guard's `error-context-preservation` check flags `e.to_string()` as potentially losing context, but this can false-positive when the string IS preserving context (e.g., `format!("Failed to decode: {e}")`). Similarly, `credential-leak-prevention` may flag error messages containing words like "token" or "invalid" even when no actual credentials are present. Fix by rewording the error message to avoid trigger patterns, or if truly a false positive, document why in a comment. Don't disable the guard entirely - it catches real issues.
+
+---

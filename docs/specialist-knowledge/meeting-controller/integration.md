@@ -182,3 +182,37 @@ MC automatically re-registers if heartbeat returns `Status::not_found` (indicate
 This provides production-grade resilience: MC survives GC restarts without losing active meetings.
 
 ---
+
+## Integration: TokenManager for Dynamic Auth Tokens
+**Added**: 2026-02-02
+**Related files**: `crates/meeting-controller/src/main.rs`, `crates/meeting-controller/src/grpc/gc_client.rs`, `crates/common/src/token_manager.rs`
+
+MC uses TokenManager from common crate for OAuth 2.0 client credentials flow:
+
+**Startup Flow**:
+1. Load OAuth config: `AC_ENDPOINT`, `MC_CLIENT_ID`, `MC_CLIENT_SECRET`
+2. Create TokenManager with `new_secure()` (enforces HTTPS in production)
+3. Spawn TokenManager task, await initial token with 30-second timeout
+4. Pass `TokenReceiver` clone to `GcClient` and other subsystems
+5. Store `JoinHandle` for shutdown cleanup
+
+**Runtime Behavior**:
+- TokenManager runs background refresh loop (typically 50% of token lifetime)
+- `TokenReceiver::token()` returns current valid token (never blocks)
+- Token updates broadcast via `tokio::sync::watch` channel
+- Multiple subsystems can hold `TokenReceiver` clones safely
+
+**Shutdown**:
+- Call `token_task_handle.abort()` during graceful shutdown
+- TokenManager task terminates, receivers continue returning last token until dropped
+
+**Error Handling**:
+- `McError::TokenAcquisition(String)` - AC returned error (bad credentials, etc.)
+- `McError::TokenAcquisitionTimeout` - Initial token not received within timeout
+- Both fail startup fast - don't proceed without valid auth
+
+**Testing**:
+- Use `TokenReceiver::from_test_channel()` (requires `test-utils` feature)
+- Create mock with `OnceLock<watch::Sender>` pattern for test stability
+
+---

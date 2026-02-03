@@ -174,3 +174,27 @@ For critical service dependencies (like MC→GC), create a single unified task t
 For reporting multiple related metrics atomically, provide a `snapshot()` method that returns a struct with all values read in sequence. While individual atomics with `SeqCst` ordering are consistent, reading multiple atomics separately can see inconsistent intermediate states during concurrent updates. A snapshot struct (with `meetings` and `participants`) ensures both counters are read together, providing cleaner API and consistent reporting in heartbeats or logs.
 
 ---
+
+## Pattern: OnceLock for Test Helper Singletons
+**Added**: 2026-02-02
+**Related files**: `crates/meeting-controller/src/grpc/gc_client.rs` (tests), `crates/meeting-controller/tests/gc_integration.rs`
+
+When tests need a long-lived sender (e.g., `watch::Sender`) that outlives the test function to keep receivers valid, use `std::sync::OnceLock` instead of `mem::forget`. Pattern: `static SENDER: OnceLock<watch::Sender<T>> = OnceLock::new(); let sender = SENDER.get_or_init(|| { let (tx, _rx) = watch::channel(initial_value); tx }); receiver_from(sender.subscribe())`. This avoids memory leaks, is more idiomatic, and the static ensures the sender lives for the program duration. Works well with `TokenReceiver::from_test_channel()` pattern.
+
+---
+
+## Pattern: Feature-Gated Test Constructors
+**Added**: 2026-02-02
+**Related files**: `crates/common/src/token_manager.rs`, `crates/meeting-controller/Cargo.toml`
+
+When a type needs a test-only constructor that bypasses normal initialization (e.g., `TokenReceiver` without spawning `TokenManager`), gate it behind a feature flag: `#[cfg(any(test, feature = "test-utils"))] pub fn from_test_channel(rx: watch::Receiver<SecretString>) -> Self`. Consumers add the feature in dev-dependencies: `common = { path = "../common", features = ["test-utils"] }`. This keeps test utilities out of production builds while allowing integration tests in other crates to use them.
+
+---
+
+## Pattern: Timeout-Wrapped Startup for Fail-Fast Behavior
+**Added**: 2026-02-02
+**Related files**: `crates/meeting-controller/src/main.rs`
+
+For critical startup dependencies (like TokenManager acquiring initial token), wrap the operation in `tokio::time::timeout()` to fail fast rather than hang indefinitely. Pattern: `let token_rx = tokio::time::timeout(Duration::from_secs(30), token_manager.subscribe()).await.map_err(|_| "Timeout acquiring token")?.map_err(|e| format!("Token error: {e}"))?;`. This reveals configuration issues (wrong endpoint, invalid credentials) immediately at startup rather than during first request.
+
+---
