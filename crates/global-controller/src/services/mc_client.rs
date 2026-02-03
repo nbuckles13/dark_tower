@@ -12,7 +12,8 @@
 
 use crate::errors::GcError;
 use crate::services::mh_selection::MhAssignmentInfo;
-use common::secret::{ExposeSecret, SecretString};
+use common::secret::ExposeSecret;
+use common::token_manager::TokenReceiver;
 use proto_gen::internal::meeting_controller_service_client::MeetingControllerServiceClient;
 use proto_gen::internal::{
     AssignMeetingWithMhRequest, AssignMeetingWithMhResponse, MhAssignment, MhRole,
@@ -70,8 +71,8 @@ pub enum McAssignmentResult {
 pub struct McClient {
     /// Cached channels by endpoint.
     channels: Arc<RwLock<HashMap<String, Channel>>>,
-    /// Service token for authenticating to MCs (protected by SecretString).
-    service_token: SecretString,
+    /// Token receiver for dynamic OAuth tokens from TokenManager.
+    token_receiver: TokenReceiver,
 }
 
 impl McClient {
@@ -79,11 +80,11 @@ impl McClient {
     ///
     /// # Arguments
     ///
-    /// * `service_token` - GC's service token for authenticating to MCs
-    pub fn new(service_token: SecretString) -> Self {
+    /// * `token_receiver` - Receiver for dynamically refreshed OAuth tokens
+    pub fn new(token_receiver: TokenReceiver) -> Self {
         Self {
             channels: Arc::new(RwLock::new(HashMap::new())),
-            service_token,
+            token_receiver,
         }
     }
 
@@ -170,11 +171,11 @@ impl McClient {
             requesting_gc_id: gc_id.to_string(),
         };
 
-        // Add authorization header (token accessed via ExposeSecret)
+        // Add authorization header (token accessed via ExposeSecret from TokenReceiver)
         let mut grpc_request = Request::new(request);
         grpc_request.metadata_mut().insert(
             "authorization",
-            format!("Bearer {}", self.service_token.expose_secret())
+            format!("Bearer {}", self.token_receiver.token().expose_secret())
                 .parse()
                 .map_err(|e| {
                     error!(target: "gc.services.mc_client", error = %e, "Invalid service token format");
@@ -431,6 +432,8 @@ pub mod mock {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use common::secret::SecretString;
+    use tokio::sync::watch;
 
     #[test]
     fn test_rejection_reason_from_proto() {
@@ -443,7 +446,9 @@ mod tests {
 
     #[test]
     fn test_mc_client_new() {
-        let client = McClient::new(SecretString::from("test-token"));
-        assert_eq!(client.service_token.expose_secret(), "test-token");
+        let (_tx, rx) = watch::channel(SecretString::from("test-token"));
+        let token_receiver = TokenReceiver::from_watch_receiver(rx);
+        let client = McClient::new(token_receiver);
+        assert_eq!(client.token_receiver.token().expose_secret(), "test-token");
     }
 }

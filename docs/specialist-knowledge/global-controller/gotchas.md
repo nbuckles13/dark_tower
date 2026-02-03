@@ -66,11 +66,11 @@ The jsonwebtoken library defaults to accepting `alg:none` if not explicitly pinn
 
 ---
 
-## Gotcha: GC_SERVICE_TOKEN Required for AC Communication
-**Added**: 2026-01-15
-**Related files**: `crates/global-controller/src/config.rs`, `crates/global-controller/src/services/ac_client.rs`
+## Gotcha: GC_CLIENT_ID and GC_CLIENT_SECRET Required for AC Communication
+**Added**: 2026-01-15, **Updated**: 2026-02-02
+**Related files**: `crates/global-controller/src/config.rs`, `crates/global-controller/src/main.rs`
 
-GC_SERVICE_TOKEN env var is required for internal AC endpoint calls (meeting tokens, guest tokens). Empty string default causes silent 401 failures from AC. In tests, mock the AC endpoints or provide valid test token. Production MUST set this via secrets management.
+GC_CLIENT_ID and GC_CLIENT_SECRET env vars are required for OAuth 2.0 client credentials flow with AC. TokenManager spawns at startup with 30-second timeout - missing credentials cause startup failure. In tests, add both vars to test config maps and create mock TokenReceiver via `TokenReceiver::from_watch_receiver()`. Production MUST set these via secrets management. (Replaced legacy GC_SERVICE_TOKEN static token approach.)
 
 ---
 

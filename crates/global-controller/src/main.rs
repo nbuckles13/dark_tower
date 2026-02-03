@@ -26,6 +26,7 @@ mod services;
 mod tasks;
 
 use auth::{JwksClient, JwtValidator};
+use common::token_manager::{spawn_token_manager, TokenManagerConfig};
 use config::Config;
 use grpc::auth_layer::async_auth::GrpcAuthLayer;
 use grpc::{McService, MhService};
@@ -40,6 +41,7 @@ use tasks::{
     AssignmentCleanupConfig,
 };
 use tokio::signal;
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::Server as TonicServer;
 use tracing::{error, info, warn};
@@ -96,18 +98,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let grpc_bind_address = config.grpc_bind_address.clone();
     let mc_staleness_threshold = config.mc_staleness_threshold_seconds;
 
+    // Spawn TokenManager for OAuth 2.0 client credentials flow
+    let token_config = TokenManagerConfig::new(
+        config.ac_internal_url.clone(),
+        config.gc_client_id.clone(),
+        config.gc_client_secret.clone(),
+    );
+
+    info!("Starting token manager...");
+    let (token_task_handle, token_rx): (JoinHandle<()>, _) =
+        tokio::time::timeout(Duration::from_secs(30), spawn_token_manager(token_config))
+            .await
+            .map_err(|_| "Token manager startup timed out after 30 seconds")?
+            .map_err(|e| format!("Token manager failed to start: {}", e))?;
+
+    info!("Token manager started successfully");
+
     // Create MC client for GC->MC communication
-    let gc_service_token = std::env::var("GC_SERVICE_TOKEN")
-        .map_err(|_| "GC_SERVICE_TOKEN environment variable is required")?;
-    let mc_client: Arc<dyn services::McClientTrait> = Arc::new(services::McClient::new(
-        common::secret::SecretString::from(gc_service_token),
-    ));
+    let mc_client: Arc<dyn services::McClientTrait> =
+        Arc::new(services::McClient::new(token_rx.clone()));
 
     // Create application state
     let state = Arc::new(AppState {
         pool: db_pool.clone(),
         config,
         mc_client,
+        token_receiver: token_rx,
     });
 
     // Create JWT validator for gRPC auth
@@ -213,6 +229,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Cancel background tasks
     cancel_token.cancel();
+
+    // Abort token manager task (it doesn't use CancellationToken)
+    token_task_handle.abort();
 
     // Wait for background tasks to finish
     info!("Waiting for background tasks to complete...");

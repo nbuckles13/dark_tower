@@ -19,6 +19,8 @@
 use anyhow::Result;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chrono::Utc;
+use common::secret::SecretString;
+use common::token_manager::TokenReceiver;
 use futures::future::join_all;
 use global_controller::config::Config;
 use global_controller::routes::{self, AppState};
@@ -30,6 +32,7 @@ use sqlx::PgPool;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 use wiremock::matchers::{header, method, path};
@@ -198,7 +201,7 @@ impl TestMeetingServer {
         // Set up AC internal meeting-token endpoint (default success)
         Mock::given(method("POST"))
             .and(path("/api/v1/auth/internal/meeting-token"))
-            .and(header("Authorization", "Bearer test-service-token"))
+            .and(header("Authorization", "Bearer test-token"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "token": "eyJ0eXAiOiJKV1QiLCJhbGciOiJFZERTQSJ9.test-meeting-token",
                 "expires_in": 900
@@ -209,7 +212,7 @@ impl TestMeetingServer {
         // Set up AC internal guest-token endpoint (default success)
         Mock::given(method("POST"))
             .and(path("/api/v1/auth/internal/guest-token"))
-            .and(header("Authorization", "Bearer test-service-token"))
+            .and(header("Authorization", "Bearer test-token"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "token": "eyJ0eXAiOiJKV1QiLCJhbGciOiJFZERTQSJ9.test-guest-token",
                 "expires_in": 900
@@ -230,10 +233,16 @@ impl TestMeetingServer {
                 format!("{}/.well-known/jwks.json", mock_server.uri()),
             ),
             ("AC_INTERNAL_URL".to_string(), mock_server.uri()),
+            ("GC_CLIENT_ID".to_string(), "test-gc-client".to_string()),
+            ("GC_CLIENT_SECRET".to_string(), "test-gc-secret".to_string()),
         ]);
 
         let config = Config::from_vars(&vars)
             .map_err(|e| anyhow::anyhow!("Failed to create config: {}", e))?;
+
+        // Create a mock TokenReceiver for testing
+        let (_tx, rx) = watch::channel(SecretString::from("test-token"));
+        let token_receiver = TokenReceiver::from_watch_receiver(rx);
 
         // Create application state with MockMcClient (tests production code path)
         let mock_mc_client = Arc::new(MockMcClient::accepting());
@@ -241,6 +250,7 @@ impl TestMeetingServer {
             pool: pool.clone(),
             config: config.clone(),
             mc_client: mock_mc_client,
+            token_receiver,
         });
 
         // Build routes
@@ -254,9 +264,6 @@ impl TestMeetingServer {
         let addr = listener
             .local_addr()
             .map_err(|e| anyhow::anyhow!("Failed to get local address: {}", e))?;
-
-        // Set the GC_SERVICE_TOKEN environment variable for the test
-        std::env::set_var("GC_SERVICE_TOKEN", "test-service-token");
 
         // Spawn server in background
         let server_handle = tokio::spawn(async move {

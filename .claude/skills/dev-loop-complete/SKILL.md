@@ -101,15 +101,7 @@ Update `main.md` Loop State:
 |-------|-------|
 | Current Step | `complete` |
 
-### Step 6: Run Output Validation Script (if exists)
-
-```bash
-./scripts/workflow/verify-dev-loop.sh --output-dir {output_dir} --verbose
-```
-
-Report any warnings but continue.
-
-### Step 7: Generate Summary
+### Step 6: Generate Summary
 
 Create a summary of the completed work:
 
@@ -139,7 +131,7 @@ Create a summary of the completed work:
 - {list from Tech Debt section}
 ```
 
-### Step 8: Suggest Commit
+### Step 7: Suggest Commit
 
 ```
 **Ready to Commit**

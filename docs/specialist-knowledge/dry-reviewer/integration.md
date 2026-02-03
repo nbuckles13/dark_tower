@@ -143,17 +143,17 @@ TokenManager and AcClient both construct reqwest clients with similar pattern: `
 
 ### TD-16: Mock TokenReceiver Test Helper
 **Added**: 2026-02-02 | **Updated**: 2026-02-02
-**Related files**: `crates/meeting-controller/src/grpc/gc_client.rs:642-659`, `crates/meeting-controller/tests/gc_integration.rs:264-279`
+**Related files**: `crates/meeting-controller/src/grpc/gc_client.rs:642-659`, `crates/meeting-controller/tests/gc_integration.rs:264-279`, `crates/global-controller/src/services/ac_client.rs` (GC integration)
 
-Two `mock_token_receiver()` helper functions exist within MC (unit tests and integration tests). Both now use OnceLock pattern for proper memory management. Severity: Low (internal to MC, 2 occurrences). Improvement path: Extract to `common::token_manager::test_helpers::mock_receiver()` when GC integrates TokenManager. Timeline: GC TokenManager integration (Phase 5+). Note: Pattern is ready for extraction - both implementations are nearly identical.
+Mock TokenReceiver helper functions now exist in both MC (unit tests and integration tests) and GC. All use OnceLock pattern for proper memory management. Severity: Low (3 occurrences across services). Improvement path: Extract to `common::token_manager::test_helpers::mock_receiver()` since both services now use the pattern. Timeline: Next refactoring sprint. Note: Pattern is identical across services and ready for extraction.
 
 ---
 
 ### TD-17: OAuth Config Fields Pattern
-**Added**: 2026-02-02
-**Related files**: `crates/meeting-controller/src/config.rs:96-105`
+**Added**: 2026-02-02 | **Updated**: 2026-02-02 | **RESOLVED**
+**Related files**: `crates/meeting-controller/src/config.rs:96-105`, `crates/global-controller/src/config.rs`
 
-MC's Config struct contains OAuth credential fields (`ac_endpoint`, `client_id`, `client_secret`). GC currently uses static `GC_SERVICE_TOKEN` but will need similar fields when migrating to dynamic TokenManager. Severity: Low (single occurrence). Improvement path: Evaluate `OAuthCredentialConfig` extraction if GC config is >90% similar. Timeline: GC TokenManager integration (Phase 5+). Note: Monitor during GC migration - may be acceptable service-specific config.
+Both MC and GC now have OAuth credential fields (`ac_endpoint`, `client_id`, `client_secret`). Severity: Low (acceptable service-specific config). Status: RESOLVED - Both services integrated. No extraction needed - credentials are service-specific (MC authenticates to GC, GC authenticates to AC). Note: This is expected duplication, not a DRY violation.
 
 ---
 

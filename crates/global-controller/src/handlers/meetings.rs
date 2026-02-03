@@ -533,11 +533,10 @@ fn generate_guest_id() -> Result<Uuid, GcError> {
 
 /// Create AC client with configuration from state.
 fn create_ac_client(state: &AppState) -> Result<AcClient, GcError> {
-    // TODO: Get service token from config or token refresh service
-    // For now, use a placeholder that will need to be configured
-    let service_token = std::env::var("GC_SERVICE_TOKEN").unwrap_or_default();
-
-    AcClient::new(state.config.ac_internal_url.clone(), service_token)
+    AcClient::new(
+        state.config.ac_internal_url.clone(),
+        state.token_receiver.clone(),
+    )
 }
 
 #[cfg(test)]

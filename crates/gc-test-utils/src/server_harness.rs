@@ -2,6 +2,8 @@
 //!
 //! Provides `TestGcServer` for spawning real GC server instances in tests.
 
+use common::secret::SecretString;
+use common::token_manager::TokenReceiver;
 use global_controller::config::Config;
 use global_controller::routes::{self, AppState};
 use global_controller::services::MockMcClient;
@@ -9,6 +11,7 @@ use sqlx::PgPool;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 /// Test harness for spawning Global Controller server in E2E tests.
@@ -62,10 +65,16 @@ impl TestGcServer {
                 "AC_JWKS_URL".to_string(),
                 "http://localhost:8082/.well-known/jwks.json".to_string(),
             ),
+            ("GC_CLIENT_ID".to_string(), "test-gc-client".to_string()),
+            ("GC_CLIENT_SECRET".to_string(), "test-gc-secret".to_string()),
         ]);
 
         let config = Config::from_vars(&vars)
             .map_err(|e| anyhow::anyhow!("Failed to create config: {}", e))?;
+
+        // Create a mock TokenReceiver for testing
+        let (_tx, rx) = watch::channel(SecretString::from("test-token"));
+        let token_receiver = TokenReceiver::from_watch_receiver(rx);
 
         // Create application state with MockMcClient
         let mock_mc_client = Arc::new(MockMcClient::accepting());
@@ -73,6 +82,7 @@ impl TestGcServer {
             pool: pool.clone(),
             config: config.clone(),
             mc_client: mock_mc_client,
+            token_receiver,
         });
 
         // Build routes using global-controller's real route builder

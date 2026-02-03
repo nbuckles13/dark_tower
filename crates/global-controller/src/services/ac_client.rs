@@ -5,12 +5,14 @@
 //!
 //! # Security
 //!
-//! - GC authenticates using its own service token (client credentials)
+//! - GC authenticates using dynamically refreshed OAuth tokens via TokenManager
 //! - All requests use HTTPS in production
 //! - Timeouts prevent hanging connections
 //! - Errors are logged server-side with generic messages returned
 
 use crate::errors::GcError;
+use common::secret::ExposeSecret;
+use common::token_manager::TokenReceiver;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -114,8 +116,8 @@ pub struct AcClient {
     /// Base URL for AC internal API.
     base_url: String,
 
-    /// GC's service token for authenticating to AC.
-    service_token: String,
+    /// Token receiver for dynamically refreshed OAuth tokens from TokenManager.
+    token_receiver: TokenReceiver,
 }
 
 impl AcClient {
@@ -124,12 +126,12 @@ impl AcClient {
     /// # Arguments
     ///
     /// * `base_url` - Base URL for AC internal API (e.g., "http://localhost:8082")
-    /// * `service_token` - GC's service token for client credentials auth
+    /// * `token_receiver` - Receiver for dynamically refreshed OAuth tokens
     ///
     /// # Errors
     ///
     /// Returns `GcError::Internal` if the HTTP client cannot be built.
-    pub fn new(base_url: String, service_token: String) -> Result<Self, GcError> {
+    pub fn new(base_url: String, token_receiver: TokenReceiver) -> Result<Self, GcError> {
         let client = Client::builder()
             .timeout(Duration::from_secs(AC_REQUEST_TIMEOUT_SECS))
             .connect_timeout(Duration::from_secs(5))
@@ -142,7 +144,7 @@ impl AcClient {
         Ok(Self {
             client,
             base_url,
-            service_token,
+            token_receiver,
         })
     }
 
@@ -167,7 +169,10 @@ impl AcClient {
         let response = self
             .client
             .post(&url)
-            .header("Authorization", format!("Bearer {}", self.service_token))
+            .header(
+                "Authorization",
+                format!("Bearer {}", self.token_receiver.token().expose_secret()),
+            )
             .header("Content-Type", "application/json")
             .json(request)
             .send()
@@ -201,7 +206,10 @@ impl AcClient {
         let response = self
             .client
             .post(&url)
-            .header("Authorization", format!("Bearer {}", self.service_token))
+            .header(
+                "Authorization",
+                format!("Bearer {}", self.token_receiver.token().expose_secret()),
+            )
             .header("Content-Type", "application/json")
             .json(request)
             .send()
@@ -255,8 +263,16 @@ impl AcClient {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use common::secret::SecretString;
+    use tokio::sync::watch;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// Create a TokenReceiver for testing with a fixed token value.
+    fn test_token_receiver(token: &str) -> TokenReceiver {
+        let (_tx, rx) = watch::channel(SecretString::from(token));
+        TokenReceiver::from_watch_receiver(rx)
+    }
 
     #[test]
     fn test_participant_type_serialization() {
@@ -375,10 +391,8 @@ mod tests {
 
     #[test]
     fn test_ac_client_creation_success() {
-        let client = AcClient::new(
-            "http://localhost:8082".to_string(),
-            "test-service-token".to_string(),
-        );
+        let token_receiver = test_token_receiver("test-service-token");
+        let client = AcClient::new("http://localhost:8082".to_string(), token_receiver);
         assert!(client.is_ok());
     }
 
@@ -403,7 +417,8 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let client = AcClient::new(mock_server.uri(), "test-service-token".to_string()).unwrap();
+        let token_receiver = test_token_receiver("test-service-token");
+        let client = AcClient::new(mock_server.uri(), token_receiver).unwrap();
 
         let request = MeetingTokenRequest {
             subject_user_id: Uuid::from_u128(1),
@@ -426,8 +441,8 @@ mod tests {
     #[tokio::test]
     async fn test_request_meeting_token_network_error() {
         // Point to a non-existent server
-        let client =
-            AcClient::new("http://127.0.0.1:1".to_string(), "test-token".to_string()).unwrap();
+        let token_receiver = test_token_receiver("test-token");
+        let client = AcClient::new("http://127.0.0.1:1".to_string(), token_receiver).unwrap();
 
         let request = MeetingTokenRequest {
             subject_user_id: Uuid::from_u128(1),
@@ -459,7 +474,8 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let client = AcClient::new(mock_server.uri(), "test-service-token".to_string()).unwrap();
+        let token_receiver = test_token_receiver("test-service-token");
+        let client = AcClient::new(mock_server.uri(), token_receiver).unwrap();
 
         let request = MeetingTokenRequest {
             subject_user_id: Uuid::from_u128(1),
@@ -491,7 +507,8 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let client = AcClient::new(mock_server.uri(), "test-service-token".to_string()).unwrap();
+        let token_receiver = test_token_receiver("test-service-token");
+        let client = AcClient::new(mock_server.uri(), token_receiver).unwrap();
 
         let request = MeetingTokenRequest {
             subject_user_id: Uuid::from_u128(1),
@@ -523,7 +540,8 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let client = AcClient::new(mock_server.uri(), "test-service-token".to_string()).unwrap();
+        let token_receiver = test_token_receiver("test-service-token");
+        let client = AcClient::new(mock_server.uri(), token_receiver).unwrap();
 
         let request = MeetingTokenRequest {
             subject_user_id: Uuid::from_u128(1),
@@ -555,7 +573,8 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let client = AcClient::new(mock_server.uri(), "invalid-token".to_string()).unwrap();
+        let token_receiver = test_token_receiver("invalid-token");
+        let client = AcClient::new(mock_server.uri(), token_receiver).unwrap();
 
         let request = MeetingTokenRequest {
             subject_user_id: Uuid::from_u128(1),
@@ -586,7 +605,8 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let client = AcClient::new(mock_server.uri(), "test-service-token".to_string()).unwrap();
+        let token_receiver = test_token_receiver("test-service-token");
+        let client = AcClient::new(mock_server.uri(), token_receiver).unwrap();
 
         let request = MeetingTokenRequest {
             subject_user_id: Uuid::from_u128(1),
@@ -617,7 +637,8 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let client = AcClient::new(mock_server.uri(), "test-service-token".to_string()).unwrap();
+        let token_receiver = test_token_receiver("test-service-token");
+        let client = AcClient::new(mock_server.uri(), token_receiver).unwrap();
 
         let request = MeetingTokenRequest {
             subject_user_id: Uuid::from_u128(1),
@@ -658,7 +679,8 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let client = AcClient::new(mock_server.uri(), "test-service-token".to_string()).unwrap();
+        let token_receiver = test_token_receiver("test-service-token");
+        let client = AcClient::new(mock_server.uri(), token_receiver).unwrap();
 
         let request = GuestTokenRequest {
             guest_id: Uuid::from_u128(100),
@@ -679,8 +701,8 @@ mod tests {
     #[tokio::test]
     async fn test_request_guest_token_network_error() {
         // Point to a non-existent server
-        let client =
-            AcClient::new("http://127.0.0.1:1".to_string(), "test-token".to_string()).unwrap();
+        let token_receiver = test_token_receiver("test-token");
+        let client = AcClient::new("http://127.0.0.1:1".to_string(), token_receiver).unwrap();
 
         let request = GuestTokenRequest {
             guest_id: Uuid::from_u128(100),
@@ -710,7 +732,8 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let client = AcClient::new(mock_server.uri(), "test-service-token".to_string()).unwrap();
+        let token_receiver = test_token_receiver("test-service-token");
+        let client = AcClient::new(mock_server.uri(), token_receiver).unwrap();
 
         let request = GuestTokenRequest {
             guest_id: Uuid::from_u128(100),
@@ -739,7 +762,8 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let client = AcClient::new(mock_server.uri(), "test-service-token".to_string()).unwrap();
+        let token_receiver = test_token_receiver("test-service-token");
+        let client = AcClient::new(mock_server.uri(), token_receiver).unwrap();
 
         let request = GuestTokenRequest {
             guest_id: Uuid::from_u128(100),
@@ -768,7 +792,8 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let client = AcClient::new(mock_server.uri(), "test-service-token".to_string()).unwrap();
+        let token_receiver = test_token_receiver("test-service-token");
+        let client = AcClient::new(mock_server.uri(), token_receiver).unwrap();
 
         let request = GuestTokenRequest {
             guest_id: Uuid::from_u128(100),
