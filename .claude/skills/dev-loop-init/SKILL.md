@@ -167,6 +167,7 @@ Create `main.md` from template with Loop State initialized:
 # Dev-Loop Output: {Task Title}
 
 **Date**: YYYY-MM-DD
+**Start Time**: HH:MM (24-hour format)
 **Task**: {task description - VERBATIM, or "To be defined during planning" if --plan only}
 **Branch**: `{current git branch}`
 **Duration**: ~0m (in progress)

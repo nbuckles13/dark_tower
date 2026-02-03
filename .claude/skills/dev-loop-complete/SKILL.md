@@ -78,13 +78,20 @@ Wait for user input.
 
 ### Step 4: Calculate Duration
 
-Get the start time from `main.md` header (`**Date**:`) and calculate elapsed time.
+Get the start time from `main.md` header (`**Date**:` and `**Start Time**:`) and calculate elapsed time from start to current time.
+
+Example calculation:
+- Start: 2026-02-02 14:30
+- End: 2026-02-02 16:45
+- Duration: 2h 15m
 
 Update the Duration field:
 
 ```markdown
-**Duration**: ~{X}m
+**Duration**: ~{X}h {Y}m
 ```
+
+For durations under 1 hour, use minutes only: `~{X}m`
 
 ### Step 5: Update Loop State to Complete
 
