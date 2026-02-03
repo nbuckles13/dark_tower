@@ -8,6 +8,8 @@
 use anyhow::Result;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chrono::Utc;
+use common::secret::SecretString;
+use common::token_manager::TokenReceiver;
 use global_controller::config::Config;
 use global_controller::routes::{self, AppState};
 use global_controller::services::MockMcClient;
@@ -18,6 +20,7 @@ use sqlx::PgPool;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -148,10 +151,16 @@ impl TestAuthServer {
                 "AC_JWKS_URL".to_string(),
                 format!("{}/.well-known/jwks.json", mock_server.uri()),
             ),
+            ("GC_CLIENT_ID".to_string(), "test-gc-client".to_string()),
+            ("GC_CLIENT_SECRET".to_string(), "test-gc-secret".to_string()),
         ]);
 
         let config = Config::from_vars(&vars)
             .map_err(|e| anyhow::anyhow!("Failed to create config: {}", e))?;
+
+        // Create a mock TokenReceiver for testing
+        let (_tx, rx) = watch::channel(SecretString::from("test-token"));
+        let token_receiver = TokenReceiver::from_watch_receiver(rx);
 
         // Create application state with MockMcClient
         let mock_mc_client = Arc::new(MockMcClient::accepting());
@@ -159,6 +168,7 @@ impl TestAuthServer {
             pool: pool.clone(),
             config: config.clone(),
             mc_client: mock_mc_client,
+            token_receiver,
         });
 
         // Build routes

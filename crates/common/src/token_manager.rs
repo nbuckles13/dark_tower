@@ -224,6 +224,19 @@ impl TokenManagerConfig {
 pub struct TokenReceiver(watch::Receiver<SecretString>);
 
 impl TokenReceiver {
+    /// Create a `TokenReceiver` from a watch receiver.
+    ///
+    /// This is primarily useful for testing purposes where you want to
+    /// create a `TokenReceiver` without spawning a full `TokenManager`.
+    ///
+    /// # Arguments
+    ///
+    /// * `receiver` - The watch receiver to wrap
+    #[must_use]
+    pub fn from_watch_receiver(receiver: watch::Receiver<SecretString>) -> Self {
+        Self(receiver)
+    }
+
     /// Get the current token.
     ///
     /// This always clones the token to avoid blocking the sender.

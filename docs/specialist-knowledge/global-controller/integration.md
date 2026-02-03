@@ -77,14 +77,14 @@ Integration tests use wiremock to mock AC's JWKS endpoint:
 ---
 
 ## Integration: AC Internal Token Endpoints
-**Added**: 2026-01-15
-**Related files**: `crates/global-controller/src/services/ac_client.rs`
+**Added**: 2026-01-15, **Updated**: 2026-02-02
+**Related files**: `crates/global-controller/src/services/ac_client.rs`, `crates/common/src/token_manager.rs`
 
 GC calls AC internal endpoints for meeting tokens:
 - `POST /api/v1/auth/internal/meeting-token` - Issue token for authenticated user joining meeting
 - `POST /api/v1/auth/internal/guest-token` - Issue token for guest participant
 
-Both require `Authorization: Bearer <GC_SERVICE_TOKEN>`. Request body includes meeting_code, user_id/guest_id, participant_type, role. Response contains signed JWT for WebTransport connection to MC.
+GC authenticates using OAuth 2.0 client credentials. At startup, TokenManager acquires token from `AC/api/v1/auth/service/token` using GC_CLIENT_ID/GC_CLIENT_SECRET and auto-refreshes before expiration. AcClient uses `state.token_receiver.token()` for Authorization header. Request body includes meeting_code, user_id/guest_id, participant_type, role. Response contains signed JWT for WebTransport connection to MC.
 
 ---
 

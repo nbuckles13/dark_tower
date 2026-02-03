@@ -4,6 +4,7 @@
 //! fields are redacted in Debug output.
 
 use common::jwt::{DEFAULT_CLOCK_SKEW, MAX_CLOCK_SKEW};
+use common::secret::SecretString;
 use std::collections::HashMap;
 use std::env;
 use std::fmt;
@@ -58,6 +59,12 @@ pub struct Config {
     /// Unique identifier for this GC instance.
     /// Used for assignment tracking and debugging.
     pub gc_id: String,
+
+    /// OAuth client ID for GC to authenticate with AC.
+    pub gc_client_id: String,
+
+    /// OAuth client secret for GC to authenticate with AC (SecretString prevents logging).
+    pub gc_client_secret: SecretString,
 }
 
 /// Custom Debug implementation that redacts sensitive fields.
@@ -77,6 +84,8 @@ impl fmt::Debug for Config {
                 &self.mc_staleness_threshold_seconds,
             )
             .field("gc_id", &self.gc_id)
+            .field("gc_client_id", &self.gc_client_id)
+            .field("gc_client_secret", &"[REDACTED]")
             .finish()
     }
 }
@@ -215,6 +224,17 @@ impl Config {
             format!("{}-{}-{}", DEFAULT_GC_ID_PREFIX, hostname, short_suffix)
         });
 
+        // Parse OAuth client credentials (required for TokenManager)
+        let gc_client_id = vars
+            .get("GC_CLIENT_ID")
+            .ok_or_else(|| ConfigError::MissingEnvVar("GC_CLIENT_ID".to_string()))?
+            .clone();
+
+        let gc_client_secret = vars
+            .get("GC_CLIENT_SECRET")
+            .ok_or_else(|| ConfigError::MissingEnvVar("GC_CLIENT_SECRET".to_string()))?
+            .clone();
+
         Ok(Config {
             database_url,
             bind_address,
@@ -226,6 +246,8 @@ impl Config {
             grpc_bind_address,
             mc_staleness_threshold_seconds,
             gc_id,
+            gc_client_id,
+            gc_client_secret: SecretString::from(gc_client_secret),
         })
     }
 }
@@ -234,12 +256,17 @@ impl Config {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use common::secret::ExposeSecret;
 
     fn base_vars() -> HashMap<String, String> {
-        HashMap::from([(
-            "DATABASE_URL".to_string(),
-            "postgresql://localhost/gc_test".to_string(),
-        )])
+        HashMap::from([
+            (
+                "DATABASE_URL".to_string(),
+                "postgresql://localhost/gc_test".to_string(),
+            ),
+            ("GC_CLIENT_ID".to_string(), "test-gc-client".to_string()),
+            ("GC_CLIENT_SECRET".to_string(), "test-gc-secret".to_string()),
+        ])
     }
 
     #[test]
@@ -268,6 +295,9 @@ mod tests {
         );
         // GC ID should be auto-generated
         assert!(config.gc_id.starts_with("gc-"));
+        // OAuth client credentials should be loaded
+        assert_eq!(config.gc_client_id, "test-gc-client");
+        assert_eq!(config.gc_client_secret.expose_secret(), "test-gc-secret");
     }
 
     #[test]
@@ -324,6 +354,24 @@ mod tests {
 
         let result = Config::from_vars(&vars);
         assert!(matches!(result, Err(ConfigError::MissingEnvVar(v)) if v == "DATABASE_URL"));
+    }
+
+    #[test]
+    fn test_from_vars_missing_gc_client_id() {
+        let mut vars = base_vars();
+        vars.remove("GC_CLIENT_ID");
+
+        let result = Config::from_vars(&vars);
+        assert!(matches!(result, Err(ConfigError::MissingEnvVar(v)) if v == "GC_CLIENT_ID"));
+    }
+
+    #[test]
+    fn test_from_vars_missing_gc_client_secret() {
+        let mut vars = base_vars();
+        vars.remove("GC_CLIENT_SECRET");
+
+        let result = Config::from_vars(&vars);
+        assert!(matches!(result, Err(ConfigError::MissingEnvVar(v)) if v == "GC_CLIENT_SECRET"));
     }
 
     #[test]
@@ -453,5 +501,20 @@ mod tests {
         assert!(debug_output.contains("[REDACTED]"));
         assert!(!debug_output.contains("postgresql://"));
         assert!(!debug_output.contains("gc_test"));
+    }
+
+    #[test]
+    fn test_debug_redacts_gc_client_secret() {
+        let vars = base_vars();
+        let config = Config::from_vars(&vars).expect("Config should load successfully");
+
+        let debug_output = format!("{:?}", config);
+
+        // gc_client_id should be visible, gc_client_secret should be redacted
+        assert!(debug_output.contains("test-gc-client"));
+        assert!(!debug_output.contains("test-gc-secret"));
+        // Should have two [REDACTED] entries (database_url and gc_client_secret)
+        let redacted_count = debug_output.matches("[REDACTED]").count();
+        assert_eq!(redacted_count, 2);
     }
 }

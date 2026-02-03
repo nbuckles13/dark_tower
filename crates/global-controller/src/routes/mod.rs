@@ -12,6 +12,7 @@ use axum::{
     routing::{get, patch, post},
     Router,
 };
+use common::token_manager::TokenReceiver;
 use sqlx::PgPool;
 use std::sync::Arc;
 use std::time::Duration;
@@ -28,6 +29,9 @@ pub struct AppState {
 
     /// MC client for GC->MC communication.
     pub mc_client: Arc<dyn McClientTrait>,
+
+    /// Token receiver for dynamically refreshed OAuth tokens from TokenManager.
+    pub token_receiver: TokenReceiver,
 }
 
 /// Build the application routes.

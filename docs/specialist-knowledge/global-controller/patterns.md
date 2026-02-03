@@ -59,10 +59,10 @@ This avoids full JWT parsing before signature validation - kid selection is data
 ---
 
 ## Pattern: AC Client Service for Internal Endpoints
-**Added**: 2026-01-15
+**Added**: 2026-01-15, **Updated**: 2026-02-02
 **Related files**: `crates/global-controller/src/services/ac_client.rs`
 
-HTTP client for calling AC internal token endpoints. Uses Bearer auth with GC_SERVICE_TOKEN, configurable timeout (default 10s), and proper error mapping (network errors -> ServiceUnavailable, 4xx -> Unauthorized/Forbidden). Client is reusable via Arc in AppState.
+HTTP client for calling AC internal token endpoints. Uses Bearer auth with dynamically refreshed OAuth token from TokenReceiver, configurable timeout (default 10s), and proper error mapping (network errors -> ServiceUnavailable, 4xx -> Unauthorized/Forbidden). Create per-request in handlers using `state.token_receiver.clone()`.
 
 ---
 
@@ -239,23 +239,18 @@ Store as **required** field in AppState: `mc_client: Arc<dyn McClientTrait>` (NO
 
 ---
 
-## Pattern: SecretString for Service Credentials in Clients
-**Added**: 2026-01-24
-**Related files**: `crates/global-controller/src/services/mc_client.rs`
+## Pattern: TokenReceiver for Dynamic OAuth in Service Clients
+**Added**: 2026-01-24, **Updated**: 2026-02-02
+**Related files**: `crates/global-controller/src/services/mc_client.rs`, `crates/global-controller/src/services/ac_client.rs`, `crates/global-controller/src/routes/mod.rs`
 
-Wrap service-to-service auth tokens in `secrecy::SecretString` within client structs:
+Use `TokenReceiver` from `common::token_manager` for dynamic OAuth token access in service clients:
 ```rust
 pub struct McClient {
-    service_token: SecretString,
-    // ...
+    token_receiver: TokenReceiver,  // Clone, provides .token()
 }
+// In request: format!("Bearer {}", self.token_receiver.token().expose_secret())
 ```
-Use `service_token.expose_secret()` only when building the Authorization header. This ensures:
-- Tokens never appear in Debug output
-- Tokens can't be accidentally logged
-- Memory is zeroized on drop (if using zeroize feature)
-
-Consistent with project-wide sensitive data handling per SecretBox/SecretString refactor.
+Store `TokenReceiver` in AppState for handler-level access. TokenReceiver wraps a watch channel - cheap to clone, always returns current valid token. For tests, use `TokenReceiver::from_watch_receiver()` with a fixed token value. This replaces static `SecretString` tokens with auto-refreshing OAuth tokens.
 
 ---
 
