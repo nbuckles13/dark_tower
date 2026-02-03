@@ -237,6 +237,14 @@ Preserve error context for debugging via server-side logging while returning gen
 
 ---
 
+## Pattern: Constructor Variants for Security Enforcement
+**Added**: 2026-02-02
+**Related files**: `crates/common/src/token_manager.rs`
+
+When a configuration accepts potentially insecure values (HTTP URLs, weak parameters), provide two constructors: (1) `new()` - permissive, with clear security warnings in documentation, allows HTTP for local development/testing; (2) `new_secure()` - enforcing, returns `Result` with error on security violations (e.g., non-HTTPS URLs). This pattern enables secure-by-default in production while allowing flexibility in development. The `new_secure()` variant should be the recommended constructor in documentation.
+
+---
+
 ## Pattern: Test Infrastructure Security (Mock Credentials)
 **Added**: 2026-01-31
 **Related files**: `crates/meeting-controller/tests/gc_integration.rs`, `crates/global-controller/tests/meeting_tests.rs`

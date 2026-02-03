@@ -318,3 +318,24 @@ for meeting in meetings {
     // ... repeated many times per request
 }
 ```
+
+---
+
+## Gotcha: unwrap_or_default() Discards Error Context
+**Added**: 2026-02-02
+**Related files**: `crates/common/src/token_manager.rs`
+
+Using `.unwrap_or_default()` on `Result` types silently discards the error, violating ADR-0002's guidance on error context preservation. This is particularly problematic for async operations where you want to know *why* something failed:
+
+```rust
+// BAD: Silently discards error context
+let body = response.text().await.unwrap_or_default();
+
+// GOOD: Preserve error context with trace logging
+let body = response.text().await.unwrap_or_else(|e| {
+    trace!(target: "service", error = %e, "Failed to read response body");
+    "<failed to read body>".to_string()
+});
+```
+
+The `unwrap_or_else` pattern logs the actual error at an appropriate level (trace for expected failures, warn for unexpected) while still providing a fallback value. This ensures diagnostic information isn't lost during debugging.

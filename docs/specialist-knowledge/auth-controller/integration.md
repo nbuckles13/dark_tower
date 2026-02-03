@@ -103,3 +103,11 @@ Endpoint: `POST /internal/rotate-keys`. Scopes: `service.rotate-keys.ac` (6-day 
 User-facing endpoints (`/api/v1/auth/register`, `/api/v1/auth/user/token`) require organization subdomain in Host header. Requests to these endpoints without valid subdomain receive 400 Bad Request. Integration tests must set Host header: `Host: acme.example.com`. The subdomain identifies the organization context for user operations.
 
 ---
+
+## Integration: TokenManager for Service-to-Service Auth
+**Added**: 2026-02-02
+**Related files**: `crates/common/src/token_manager.rs`
+
+GC and MC use `spawn_token_manager()` to acquire and refresh OAuth tokens from AC. The function blocks until first token is acquired (wrap in timeout for startup limits). Returns `(JoinHandle, TokenReceiver)` - pass `token_rx.clone()` to any task needing tokens. Token is automatically refreshed before expiration with 30-second clock drift margin. Use `TokenManagerConfig::new_secure()` in production to enforce HTTPS.
+
+---

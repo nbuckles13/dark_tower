@@ -572,3 +572,47 @@ impl GlobalControllerService for MockGcServer {
 - Behavior affects multiple RPC methods consistently
 
 ---
+
+## Pattern: Spawn-and-Wait Function API with (JoinHandle, Receiver) Tuple
+**Added**: 2026-02-02
+**Related files**: `crates/common/src/token_manager.rs`
+
+For background tasks that produce continuously-updated values (token managers, config watchers, health monitors), use a function that spawns the task and waits for the first value before returning. Return `(JoinHandle<()>, Receiver)` tuple:
+
+```rust
+pub async fn spawn_token_manager(
+    config: TokenManagerConfig,
+) -> Result<(JoinHandle<()>, TokenReceiver), TokenError> {
+    // Create watch channel with sentinel value
+    let (sender, mut receiver) = watch::channel(SecretString::from(""));
+
+    // Spawn background task
+    let task_handle = tokio::spawn(async move {
+        token_refresh_loop(config, sender).await;
+    });
+
+    // Wait for first real value before returning
+    receiver.changed().await.map_err(|_| TokenError::ChannelClosed)?;
+
+    // Verify value is valid (defensive)
+    if receiver.borrow().expose_secret().is_empty() {
+        return Err(TokenError::AcquisitionFailed("Empty token".into()));
+    }
+
+    Ok((task_handle, TokenReceiver(receiver)))
+}
+```
+
+**Key properties:**
+- Caller gets `JoinHandle` for lifecycle control (abort, await completion)
+- Caller gets typed receiver for value access
+- Function only returns after first valid value (no "not ready yet" state)
+- Sentinel value distinguishes "never set" from "empty"
+- `TokenReceiver` wrapper can enforce safe access patterns (clone on read)
+
+**Benefits over struct with internal task:**
+- Clear ownership: caller controls task lifetime via handle
+- Testable: can create receiver without spawning task
+- Composable: caller decides how to manage the handle
+
+---

@@ -878,3 +878,43 @@ Alternative patterns considered and rejected:
 - **Trait-based mocking**: Overkill for simple state machine, adds complexity
 
 Use MockBehavior when testing client retry/recovery logic against unreliable services.
+
+---
+
+## Pattern: Testing Infinite Retry Loops with Timeout Wrappers
+**Added**: 2026-02-02
+**Related files**: `crates/common/src/token_manager.rs`
+
+When testing components with intentional infinite retry (background token refresh, reconnection loops), use `tokio::time::timeout` to wrap the operation and verify retry behavior:
+
+```rust
+#[tokio::test]
+async fn test_401_triggers_infinite_retry() {
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&mock_server)
+        .await;
+
+    let config = test_config(&mock_server.uri());
+
+    // Operation retries forever on 401 - use timeout to verify this behavior
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        spawn_token_manager(config)
+    ).await;
+
+    // Timeout proves infinite retry is working as designed
+    assert!(result.is_err(), "Should timeout on 401 (infinite retry)");
+}
+```
+
+Key insight: The test verifies **design intent** (infinite retry) rather than testing a single error occurrence. This is the correct pattern for:
+- Token refresh loops that should never give up
+- Service reconnection that persists through transient failures
+- Background tasks that must recover automatically
+
+Alternative approaches and when to use them:
+- **wiremock `up_to_n_times(N)`**: When you want to test eventual success after N failures
+- **AtomicU32 call counter**: When you need to verify specific retry counts
+- **`#[tokio::test(start_paused = true)]`**: When testing backoff timing deterministically

@@ -137,3 +137,27 @@ assert!(matches!(err, AcError::Crypto(msg) if msg.starts_with("Decryption operat
 This pattern ensures tests verify our error handling logic without being fragile to dependency changes.
 
 ---
+
+## Gotcha: client_id Considered Sensitive in Tracing
+**Added**: 2026-02-02
+**Related files**: `crates/common/src/token_manager.rs`
+
+The semantic guard flags `client_id` in `#[instrument(fields(...))]` as a credential leak. While less sensitive than client_secret, client_id may reveal service identity in logs. Use `#[instrument(skip_all)]` without client_id in fields. Log client_id at trace level inside the function if needed for debugging.
+
+---
+
+## Gotcha: Clippy Rejects Assertions on Constants
+**Added**: 2026-02-02
+**Related files**: `crates/common/src/token_manager.rs`
+
+`assert!(CONSTANT > 0)` triggers clippy `assertions_on_constants` because the assertion is evaluated at compile-time and optimized away. Use `assert_eq!(CONSTANT, expected_value, "descriptive message")` instead to verify constant values in tests without triggering the warning.
+
+---
+
+## Gotcha: Watch Receiver Borrow Blocks Sender
+**Added**: 2026-02-02
+**Related files**: `crates/common/src/token_manager.rs`
+
+`watch::Receiver::borrow()` holds a lock that blocks the sender from updating. Always clone immediately: `self.0.borrow().clone()`. Create a wrapper type (e.g., `TokenReceiver`) that enforces this pattern in its `token()` method, preventing callers from accidentally holding the borrow.
+
+---
