@@ -1290,4 +1290,230 @@ mod tests {
             "Clock drift margin should be 30 seconds"
         );
     }
+
+    // =========================================================================
+    // from_url() Tests (Critical for OAuth flow - PR coverage requirement)
+    // =========================================================================
+
+    #[test]
+    fn test_from_url_with_https() {
+        let config = TokenManagerConfig::from_url(
+            "https://ac-service:8082".to_string(),
+            "client-id".to_string(),
+            SecretString::from("secret"),
+        )
+        .expect("HTTPS URL should be valid");
+
+        assert_eq!(config.ac_endpoint, "https://ac-service:8082");
+        assert_eq!(config.client_id, "client-id");
+    }
+
+    #[test]
+    fn test_from_url_with_http() {
+        let config = TokenManagerConfig::from_url(
+            "http://localhost:8082".to_string(),
+            "client-id".to_string(),
+            SecretString::from("secret"),
+        )
+        .expect("HTTP URL should be valid for local dev");
+
+        assert_eq!(config.ac_endpoint, "http://localhost:8082");
+        assert_eq!(config.client_id, "client-id");
+    }
+
+    #[test]
+    fn test_from_url_with_invalid_scheme() {
+        let err = TokenManagerConfig::from_url(
+            "ftp://ac-service:8082".to_string(),
+            "client-id".to_string(),
+            SecretString::from("secret"),
+        )
+        .expect_err("FTP scheme should be rejected");
+
+        assert!(matches!(err, TokenError::Configuration(_)));
+    }
+
+    #[test]
+    fn test_from_url_with_no_scheme() {
+        let err = TokenManagerConfig::from_url(
+            "ac-service:8082".to_string(),
+            "client-id".to_string(),
+            SecretString::from("secret"),
+        )
+        .expect_err("URL without scheme should be rejected");
+
+        assert!(matches!(err, TokenError::Configuration(_)));
+        assert!(err.to_string().contains("expected http:// or https://"));
+    }
+
+    #[test]
+    fn test_from_url_with_empty_string() {
+        let err = TokenManagerConfig::from_url(
+            String::new(),
+            "client-id".to_string(),
+            SecretString::from("secret"),
+        )
+        .expect_err("Empty URL should be rejected");
+
+        assert!(matches!(err, TokenError::Configuration(_)));
+    }
+
+    #[test]
+    fn test_from_url_with_websocket_scheme() {
+        let err = TokenManagerConfig::from_url(
+            "ws://ac-service:8082".to_string(),
+            "client-id".to_string(),
+            SecretString::from("secret"),
+        )
+        .expect_err("ws:// scheme should be rejected");
+        assert!(matches!(err, TokenError::Configuration(_)));
+
+        let err = TokenManagerConfig::from_url(
+            "wss://ac-service:8082".to_string(),
+            "client-id".to_string(),
+            SecretString::from("secret"),
+        )
+        .expect_err("wss:// scheme should be rejected");
+        assert!(matches!(err, TokenError::Configuration(_)));
+    }
+
+    #[test]
+    fn test_from_url_case_sensitivity() {
+        let err = TokenManagerConfig::from_url(
+            "HTTP://localhost:8082".to_string(),
+            "client-id".to_string(),
+            SecretString::from("secret"),
+        )
+        .expect_err("HTTP (uppercase) should be rejected");
+        assert!(matches!(err, TokenError::Configuration(_)));
+
+        let err = TokenManagerConfig::from_url(
+            "HTTPS://localhost:8082".to_string(),
+            "client-id".to_string(),
+            SecretString::from("secret"),
+        )
+        .expect_err("HTTPS (uppercase) should be rejected");
+        assert!(matches!(err, TokenError::Configuration(_)));
+    }
+
+    #[test]
+    fn test_from_url_preserves_defaults() {
+        let config = TokenManagerConfig::from_url(
+            "https://ac-service:8082".to_string(),
+            "client-id".to_string(),
+            SecretString::from("secret"),
+        )
+        .expect("Valid HTTPS URL");
+
+        assert_eq!(config.refresh_threshold, DEFAULT_REFRESH_THRESHOLD);
+        assert_eq!(config.http_timeout, DEFAULT_HTTP_TIMEOUT);
+    }
+
+    #[test]
+    fn test_from_url_builder_pattern_works() {
+        let config = TokenManagerConfig::from_url(
+            "https://ac-service:8082".to_string(),
+            "client-id".to_string(),
+            SecretString::from("secret"),
+        )
+        .expect("Valid HTTPS URL")
+        .with_refresh_threshold(Duration::from_secs(120))
+        .with_http_timeout(Duration::from_secs(5));
+
+        assert_eq!(config.refresh_threshold, Duration::from_secs(120));
+        assert_eq!(config.http_timeout, Duration::from_secs(5));
+    }
+
+    // =========================================================================
+    // TokenReceiver::from_watch_receiver() Tests
+    // =========================================================================
+
+    #[test]
+    fn test_from_watch_receiver_creates_working_receiver() {
+        let (_tx, rx) = watch::channel(SecretString::from("test-token-123"));
+        let receiver = TokenReceiver::from_watch_receiver(rx);
+
+        assert_eq!(receiver.token().expose_secret(), "test-token-123");
+    }
+
+    #[test]
+    fn test_from_watch_receiver_clone_works() {
+        let (_tx, rx) = watch::channel(SecretString::from("test-token"));
+        let receiver = TokenReceiver::from_watch_receiver(rx);
+        let cloned = receiver.clone();
+
+        assert_eq!(
+            receiver.token().expose_secret(),
+            cloned.token().expose_secret()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_from_watch_receiver_changed_works() {
+        let (tx, rx) = watch::channel(SecretString::from("initial"));
+        let mut receiver = TokenReceiver::from_watch_receiver(rx);
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let _ = tx.send(SecretString::from("updated"));
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), receiver.changed())
+            .await
+            .expect("Should receive change notification within timeout")
+            .expect("Changed should succeed");
+
+        assert_eq!(receiver.token().expose_secret(), "updated");
+    }
+
+    // =========================================================================
+    // Additional Error Path Coverage
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_unexpected_status_code() {
+        let mock_server = MockServer::start().await;
+
+        // Test various unexpected status codes (should all trigger retry)
+        for status in [418, 301, 302, 403, 404, 429] {
+            Mock::given(method("POST"))
+                .and(path("/api/v1/auth/service/token"))
+                .respond_with(ResponseTemplate::new(status))
+                .up_to_n_times(1)
+                .mount(&mock_server)
+                .await;
+        }
+
+        let config = test_config(&mock_server.uri()).with_http_timeout(Duration::from_millis(500));
+
+        let result =
+            tokio::time::timeout(Duration::from_secs(2), spawn_token_manager(config)).await;
+
+        assert!(
+            result.is_err(),
+            "Should timeout on unexpected status codes (infinite retry)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_empty_token_in_response() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/v1/auth/service/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "",
+                "token_type": "Bearer",
+                "expires_in": 3600
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let config = test_config(&mock_server.uri());
+        let err = spawn_token_manager(config)
+            .await
+            .expect_err("Empty token should be rejected");
+
+        assert!(matches!(err, TokenError::AcquisitionFailed(_)));
+    }
 }
