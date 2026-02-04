@@ -197,6 +197,57 @@ impl TokenManagerConfig {
         Ok(Self::new(ac_endpoint, client_id, client_secret))
     }
 
+    /// Create a configuration that automatically selects HTTP or HTTPS based on the URL.
+    ///
+    /// This is a convenience method that:
+    /// - Allows HTTP for local development (http://...)
+    /// - Enforces HTTPS for production (https://...)
+    ///
+    /// # Arguments
+    ///
+    /// * `ac_endpoint` - The AC endpoint URL (http:// or https://)
+    /// * `client_id` - The OAuth client ID
+    /// * `client_secret` - The OAuth client secret
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// // Local development - HTTP allowed
+    /// let config = TokenManagerConfig::from_url(
+    ///     "http://localhost:8082".to_string(),
+    ///     "service".to_string(),
+    ///     secret,
+    /// );
+    ///
+    /// // Production - HTTPS enforced
+    /// let config = TokenManagerConfig::from_url(
+    ///     "https://ac-service:8082".to_string(),
+    ///     "service".to_string(),
+    ///     secret,
+    /// );
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns `TokenError::Configuration` if the URL scheme is neither http nor https.
+    pub fn from_url(
+        ac_endpoint: String,
+        client_id: String,
+        client_secret: SecretString,
+    ) -> Result<Self, TokenError> {
+        if ac_endpoint.starts_with("https://") {
+            // Production HTTPS - use secure constructor
+            Self::new_secure(ac_endpoint, client_id, client_secret)
+        } else if ac_endpoint.starts_with("http://") {
+            // Local development HTTP - use regular constructor
+            Ok(Self::new(ac_endpoint, client_id, client_secret))
+        } else {
+            Err(TokenError::Configuration(format!(
+                "Invalid AC endpoint URL scheme (expected http:// or https://): {ac_endpoint}"
+            )))
+        }
+    }
+
     /// Set the refresh threshold.
     #[must_use]
     pub fn with_refresh_threshold(mut self, threshold: Duration) -> Self {
@@ -504,16 +555,17 @@ async fn acquire_token(
         "Requesting token from AC"
     );
 
-    // Build form body for client credentials grant
-    let form_body = [
-        ("grant_type", "client_credentials"),
-        ("client_id", &config.client_id),
-        ("client_secret", config.client_secret.expose_secret()),
-    ];
+    // Build JSON body for client credentials grant
+    // AC expects JSON (application/json), not form-urlencoded
+    let json_body = serde_json::json!({
+        "grant_type": "client_credentials",
+        "client_id": config.client_id,
+        "client_secret": config.client_secret.expose_secret(),
+    });
 
     let response = http_client
         .post(&url)
-        .form(&form_body)
+        .json(&json_body)
         .send()
         .await
         .map_err(|e| {
@@ -686,11 +738,14 @@ mod tests {
     async fn test_spawn_token_manager_success() {
         let mock_server = MockServer::start().await;
 
+        // TokenManager now sends JSON instead of form-urlencoded
         Mock::given(method("POST"))
             .and(path("/api/v1/auth/service/token"))
-            .and(body_string_contains("grant_type=client_credentials"))
-            .and(body_string_contains("client_id=test-client"))
-            .and(body_string_contains("client_secret=test-secret"))
+            .and(body_string_contains(
+                "\"grant_type\":\"client_credentials\"",
+            ))
+            .and(body_string_contains("\"client_id\":\"test-client\""))
+            .and(body_string_contains("\"client_secret\":\"test-secret\""))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "access_token": "acquired-token",
                 "token_type": "Bearer",

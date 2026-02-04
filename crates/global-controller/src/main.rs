@@ -99,11 +99,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mc_staleness_threshold = config.mc_staleness_threshold_seconds;
 
     // Spawn TokenManager for OAuth 2.0 client credentials flow
-    let token_config = TokenManagerConfig::new(
+    // Use from_url() to automatically handle HTTP (local dev) or HTTPS (production)
+    let token_config = TokenManagerConfig::from_url(
         config.ac_internal_url.clone(),
         config.gc_client_id.clone(),
         config.gc_client_secret.clone(),
-    );
+    )
+    .map_err(|e| format!("Token manager config error: {}", e))?;
 
     info!("Starting token manager...");
     let (token_task_handle, token_rx): (JoinHandle<()>, _) =

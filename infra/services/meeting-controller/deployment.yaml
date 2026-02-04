@@ -79,11 +79,16 @@ spec:
             secretKeyRef:
               name: meeting-controller-secrets
               key: MC_BINDING_TOKEN_SECRET
-        - name: MC_SERVICE_TOKEN
+        # OAuth 2.0 client credentials for AC authentication (ADR-0010)
+        - name: AC_ENDPOINT
+          value: "http://ac-service.dark-tower:8082"
+        - name: MC_CLIENT_ID
+          value: "meeting-controller"
+        - name: MC_CLIENT_SECRET
           valueFrom:
             secretKeyRef:
               name: meeting-controller-secrets
-              key: MC_SERVICE_TOKEN
+              key: MC_CLIENT_SECRET
         - name: RUST_LOG
           value: "info,meeting_controller=debug"
         resources:
