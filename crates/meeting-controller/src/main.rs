@@ -108,7 +108,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Spawning TokenManager for AC authentication..."
     );
 
-    let token_config = TokenManagerConfig::new_secure(
+    // Use from_url() to automatically handle HTTP (local dev) or HTTPS (production)
+    let token_config = TokenManagerConfig::from_url(
         config.ac_endpoint.clone(),
         config.client_id.clone(),
         config.client_secret.clone(),

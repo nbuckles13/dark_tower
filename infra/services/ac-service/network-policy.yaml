@@ -15,7 +15,7 @@ spec:
   - Ingress
   - Egress
   ingress:
-  # Allow ingress from Global Controller
+  # Allow ingress from Global Controller (for JWT validation and token acquisition)
   - from:
     - namespaceSelector:
         matchLabels:
@@ -23,6 +23,17 @@ spec:
       podSelector:
         matchLabels:
           app: global-controller
+    ports:
+    - protocol: TCP
+      port: 8082
+  # Allow ingress from Meeting Controller (for token acquisition)
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: dark-tower
+      podSelector:
+        matchLabels:
+          app: meeting-controller
     ports:
     - protocol: TCP
       port: 8082

@@ -66,6 +66,17 @@ spec:
     ports:
     - protocol: TCP
       port: 6379
+  # Allow egress to AC (OAuth token acquisition)
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: dark-tower
+      podSelector:
+        matchLabels:
+          app: ac-service
+    ports:
+    - protocol: TCP
+      port: 8082
   # Allow DNS resolution
   - to:
     - namespaceSelector:

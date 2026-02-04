@@ -71,6 +71,14 @@ spec:
             secretKeyRef:
               name: global-controller-secrets
               key: DATABASE_URL
+        # OAuth 2.0 client credentials for AC authentication (ADR-0010)
+        - name: GC_CLIENT_ID
+          value: "global-controller"
+        - name: GC_CLIENT_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: global-controller-secrets
+              key: GC_CLIENT_SECRET
         - name: RUST_LOG
           value: "info,global_controller=debug"
         resources:
