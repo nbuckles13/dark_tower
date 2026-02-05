@@ -308,3 +308,25 @@ Use allowlist approach for tracing to prevent accidental data leaks:
 The `skip_all` prevents all parameters from being captured by default. Safe fields are explicitly included via `fields()`. This ensures new parameters don't accidentally leak into traces. Guards enforce this pattern project-wide.
 
 ---
+
+## Pattern: OnceLock for Test Metrics Registry Sharing
+**Added**: 2026-02-04
+**Related files**: `crates/gc-test-utils/src/server_harness.rs`, `crates/global-controller/tests/auth_tests.rs`
+
+Prometheus recorder can only be installed once per process. For test harnesses spawning multiple servers, use `OnceLock<PrometheusHandle>` to share a single registry:
+```rust
+static TEST_METRICS_HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
+
+fn get_or_init_metrics_handle() -> PrometheusHandle {
+    TEST_METRICS_HANDLE.get_or_init(|| {
+        let builder = PrometheusBuilder::new();
+        builder.install_recorder().unwrap_or_else(|_| {
+            // Already installed, create fallback
+            PrometheusBuilder::new().build_recorder().handle()
+        })
+    }).clone()
+}
+```
+The fallback chain handles cases where another test already installed the recorder. This pattern enables metrics endpoint testing without per-test registry conflicts.
+
+---

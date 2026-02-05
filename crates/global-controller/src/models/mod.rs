@@ -41,8 +41,11 @@ impl MeetingStatus {
 
 /// Health check response.
 ///
-/// Returned by the `/v1/health` endpoint.
+/// Returned by the `/health` endpoint (liveness probe).
+/// Note: Currently unused as /health returns plain text "OK" per ADR-0012.
+/// Kept for potential future use if detailed health check is needed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct HealthResponse {
     /// Service health status ("healthy" or "unhealthy").
     pub status: String,
@@ -53,6 +56,27 @@ pub struct HealthResponse {
     /// Database connectivity status (optional, for detailed health).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub database: Option<String>,
+}
+
+/// Readiness check response.
+///
+/// Returned by the `/ready` endpoint (readiness probe).
+#[derive(Debug, Clone, Serialize)]
+pub struct ReadinessResponse {
+    /// Service readiness status ("ready" or "not_ready").
+    pub status: &'static str,
+
+    /// Database connectivity status.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub database: Option<&'static str>,
+
+    /// AC JWKS endpoint reachability.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ac_jwks: Option<&'static str>,
+
+    /// Error message (generic, no infrastructure details).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 // ============================================================================

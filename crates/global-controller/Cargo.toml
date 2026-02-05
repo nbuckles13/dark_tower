@@ -46,6 +46,10 @@ base64 = "0.22"
 # CSPRNG for guest ID generation
 ring = { workspace = true }
 
+# Metrics (ADR-0011 Observability)
+metrics = "0.24"
+metrics-exporter-prometheus = "0.16"
+
 # Local dependencies
 common = { path = "../common" }
 proto-gen = { path = "../proto-gen" }
@@ -57,3 +61,7 @@ anyhow = { workspace = true }
 http-body-util = "0.1"
 wiremock = "0.6"
 futures = "0.3"
+tower = { workspace = true, features = ["util"] }
+metrics-util = "0.18"
+# Re-export for integration tests (metrics-exporter-prometheus is also in deps)
+metrics-exporter-prometheus = "0.16"
