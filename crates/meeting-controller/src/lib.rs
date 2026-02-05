@@ -45,6 +45,7 @@ pub mod actors;
 pub mod config;
 pub mod errors;
 pub mod grpc;
+pub mod observability;
 pub mod redis;
 pub mod system_info;
 

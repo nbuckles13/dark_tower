@@ -216,3 +216,34 @@ MC uses TokenManager from common crate for OAuth 2.0 client credentials flow:
 - Create mock with `OnceLock<watch::Sender>` pattern for test stability
 
 ---
+
+## Integration: Observability Module Structure (Matching AC)
+**Added**: 2026-02-05
+**Related files**: `crates/meeting-controller/src/observability/mod.rs`, `crates/meeting-controller/src/observability/metrics.rs`, `crates/meeting-controller/src/observability/health.rs`
+
+MC's observability module mirrors AC's structure for cross-service consistency:
+
+**Module Layout**:
+```
+src/observability/
+  mod.rs       - Re-exports (pub use metrics::*; pub use health::*;)
+  metrics.rs   - Metric wrapper functions using metrics crate
+  health.rs    - Health endpoints (/health, /ready) and HealthState
+```
+
+**Metrics (11 wrapper functions)**:
+- WebSocket connections: `record_websocket_connection()`, `record_websocket_disconnection()`
+- Session operations: `record_session_created()`, `record_session_resumed()`, `record_session_expired()`
+- Meeting lifecycle: `record_meeting_created()`, `record_meeting_ended()`
+- Active gauges: `set_active_meetings()`, `set_active_participants()`
+- Latency histograms: `record_redis_latency()`, `record_message_latency()`
+
+**Health State Integration**:
+- `HealthState::new()` creates state with `registered: false`
+- GC registration task calls `health_state.set_registered(true)` on success
+- `/ready` endpoint returns `{"status": "not_ready", "registered": false}` until registration
+- `/health` always returns 200 OK if server is running
+
+This structure enables future consolidation into a shared observability crate if patterns prove stable.
+
+---
