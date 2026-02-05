@@ -93,3 +93,21 @@ This file captures pitfalls and anti-patterns discovered during DRY reviews.
 **When reviewing**: Flag inconsistent failure semantics as Priority 1 TECH_DEBT even if the duplication itself is minor. Escalate to Security specialist if production-critical.
 
 ---
+
+## Service-Prefixed Metrics Are Convention, Not Duplication
+
+**Added**: 2026-02-04
+**Related files**: `crates/global-controller/src/observability/metrics.rs`, `crates/ac-service/src/observability/metrics.rs`, `crates/meeting-controller/src/actors/metrics.rs`
+
+**Gotcha**: Don't flag service-prefixed metric names (`gc_http_requests_total`, `ac_http_requests_total`, `mc_mailbox_depth`) as duplication. Each service MUST have its own metric prefix per Prometheus best practices. The prefix enables:
+- Service identification in federated queries
+- Per-service SLO alerting
+- Isolation of cardinality explosions
+
+**What IS duplication**: The recording helper functions (`record_http_request`, `record_db_query`, etc.) when they have identical signatures and logic. The middleware that calls them. The path normalization algorithms.
+
+**What is NOT duplication**: Different metric names, different service prefixes, different label sets appropriate to service domain.
+
+**When reviewing**: Focus on function/algorithm duplication, not metric naming conventions.
+
+---

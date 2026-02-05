@@ -269,6 +269,114 @@ Default-deny with explicit allow:
 
 **Note**: MH will multiplex all media connections (clients + other MH instances) onto a single UDP:443 port. Design details deferred to MH implementation phase.
 
+## Standard Operational Endpoints
+
+All services MUST implement the following HTTP endpoints for Kubernetes health checks and observability:
+
+### Health Check Endpoints
+
+| Endpoint | Purpose | Kubernetes Probe | Implementation | Status Code |
+|----------|---------|------------------|----------------|-------------|
+| `/health` | Liveness probe | `livenessProbe` | Simple "OK" response, no dependencies checked | 200 |
+| `/ready` | Readiness probe | `readinessProbe` | Check critical dependencies (DB, external services) | 200 (ready) / 503 (not ready) |
+
+**Liveness Probe** (`/health`):
+- **Purpose**: Detects if the process is hung or deadlocked
+- **Implementation**: Returns "OK" immediately without checking any dependencies
+- **Failure action**: Kubernetes kills and restarts the pod
+- **Example**:
+  ```rust
+  async fn health_check() -> &'static str {
+      "OK"
+  }
+  ```
+
+**Readiness Probe** (`/ready`):
+- **Purpose**: Determines if the service can handle traffic
+- **Implementation**: Checks critical dependencies are available
+- **Failure action**: Kubernetes removes pod from service load balancer
+- **Response format**: JSON with component status
+- **Example response**:
+  ```json
+  {
+    "status": "ready",
+    "database": "healthy",
+    "signing_key": "available"
+  }
+  ```
+
+**Service-Specific Readiness Checks**:
+
+| Service | Dependencies Checked |
+|---------|---------------------|
+| AC | Database connectivity, Active signing key availability |
+| GC | Database connectivity, AC JWKS endpoint reachable |
+| MC | Redis connectivity, GC registration successful |
+| MH | MC registration successful, Media port binding |
+
+### Observability Endpoints
+
+| Endpoint | Purpose | Authentication | Format | Cardinality |
+|----------|---------|----------------|--------|-------------|
+| `/metrics` | Prometheus scraping | None (internal network only) | Prometheus text format | Per ADR-0011 limits |
+
+**Metrics Endpoint** (`/metrics`):
+- **Purpose**: Export operational metrics for Prometheus scraping
+- **Authentication**: None (Prometheus ServiceMonitor runs in-cluster on internal network)
+- **Format**: Prometheus text format
+- **Cardinality**: Must comply with ADR-0011 limits (<1,000 unique label combinations per metric)
+- **Security**: No PII in metric labels (see ADR-0011 privacy-by-default)
+
+**Network Policy**: The `/metrics` endpoint is accessible only within the Kubernetes cluster via ServiceMonitor. External access is blocked by default-deny NetworkPolicy.
+
+### Probe Configuration
+
+**Liveness Probe Settings** (all services):
+```yaml
+livenessProbe:
+  httpGet:
+    path: /health
+    port: 8080  # or service-specific HTTP port
+    scheme: HTTP
+  initialDelaySeconds: 10
+  periodSeconds: 10
+  timeoutSeconds: 5
+  successThreshold: 1
+  failureThreshold: 3  # Restart after 30s of failures
+```
+
+**Readiness Probe Settings** (all services):
+```yaml
+readinessProbe:
+  httpGet:
+    path: /ready
+    port: 8080  # or service-specific HTTP port
+    scheme: HTTP
+  initialDelaySeconds: 5
+  periodSeconds: 5
+  timeoutSeconds: 3
+  successThreshold: 1
+  failureThreshold: 3  # Remove from LB after 15s of failures
+```
+
+**Timing Rationale**:
+- Liveness has longer timeout (5s vs 3s) since dependency checks may be slow
+- Readiness has shorter period (5s vs 10s) for faster traffic routing decisions
+- Readiness has lower initial delay (5s vs 10s) since services should be ready quickly
+
+### Implementation Status
+
+| Service | /health | /ready | /metrics | Notes |
+|---------|---------|--------|----------|-------|
+| AC | ✅ | ✅ | ✅ | Reference implementation |
+| GC | ✅ | ⚠️ | ✅ | Missing /ready endpoint (uses /health for both probes) |
+| MC | ❌ | ❌ | ❌ | Not yet implemented |
+| MH | ❌ | ❌ | ❌ | Not yet implemented |
+
+**Action Items**:
+- GC: Add `/ready` endpoint with database + AC JWKS checks
+- MC/MH: Implement all operational endpoints when services reach deployment phase
+
 ## Operational Thresholds
 
 | Threshold | Value | Action |

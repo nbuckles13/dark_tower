@@ -5,14 +5,41 @@
 use common::secret::SecretString;
 use common::token_manager::TokenReceiver;
 use global_controller::config::Config;
-use global_controller::routes::{self, AppState};
+use global_controller::routes::{self, init_metrics_recorder, AppState};
 use global_controller::services::MockMcClient;
 use sqlx::PgPool;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
+
+/// Global metrics handle shared across all test servers.
+/// We can only install a Prometheus recorder once per process, so we reuse
+/// the handle for all test servers.
+static METRICS_HANDLE: OnceLock<metrics_exporter_prometheus::PrometheusHandle> = OnceLock::new();
+
+/// Initialize or get the global metrics handle for tests.
+fn get_or_init_metrics_handle() -> metrics_exporter_prometheus::PrometheusHandle {
+    METRICS_HANDLE
+        .get_or_init(|| {
+            init_metrics_recorder().unwrap_or_else(|_| {
+                // If recorder is already installed (by another test process),
+                // create a minimal recorder just for the handle
+                metrics_exporter_prometheus::PrometheusBuilder::new()
+                    .install_recorder()
+                    .unwrap_or_else(|_| {
+                        // Last resort: build a handle without installing
+                        // This should never happen in practice
+                        metrics_exporter_prometheus::PrometheusBuilder::new()
+                            .build_recorder()
+                            .handle()
+                    })
+            })
+        })
+        .clone()
+}
 
 /// Test harness for spawning Global Controller server in E2E tests.
 ///
@@ -85,8 +112,11 @@ impl TestGcServer {
             token_receiver,
         });
 
+        // Get or initialize the metrics handle (shared across all test servers)
+        let metrics_handle = get_or_init_metrics_handle();
+
         // Build routes using global-controller's real route builder
-        let app = routes::build_routes(state);
+        let app = routes::build_routes(state, metrics_handle);
 
         // Bind to random port
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")

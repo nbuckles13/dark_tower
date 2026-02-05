@@ -652,3 +652,42 @@ fn mock_token_receiver() -> TokenReceiver {
 - Replacing existing `mem::forget(tx)` patterns in test code
 
 ---
+
+## Pattern: Metrics Cardinality Control via Path Normalization
+**Added**: 2026-02-04
+**Related files**: `crates/global-controller/src/observability/metrics.rs`
+
+When recording HTTP metrics with path labels, normalize dynamic path segments to prevent label cardinality explosion. Replace UUIDs, meeting codes, and other high-cardinality values with placeholders:
+
+```rust
+fn normalize_endpoint(path: &str) -> String {
+    match path {
+        "/" | "/health" | "/metrics" | "/api/v1/me" => path.to_string(),
+        _ if path.starts_with("/api/v1/meetings/") => {
+            let parts: Vec<&str> = path.split('/').collect();
+            match parts.len() {
+                5 => "/api/v1/meetings/{code}".to_string(),
+                6 if parts[5] == "guest-token" => "/api/v1/meetings/{code}/guest-token".to_string(),
+                6 if parts[5] == "settings" => "/api/v1/meetings/{id}/settings".to_string(),
+                _ => "/other".to_string(),
+            }
+        }
+        _ => "/other".to_string(),  // Unknown paths normalized to bound cardinality
+    }
+}
+```
+
+**Key properties:**
+- Known static paths returned as-is (exact match)
+- Dynamic segments replaced with `{placeholder}` format
+- Unknown paths fall through to `/other` (bounded cardinality)
+- Tests should verify all known routes are normalized correctly
+
+**ADR-0011 compliance:**
+- Maximum unique label combinations per metric: 1,000
+- Total cardinality budget: 5,000,000 time series
+- Use indexed values instead of UUIDs for high-cardinality identifiers
+
+This pattern applies to all services implementing metrics (AC, GC, MC, MH).
+
+---

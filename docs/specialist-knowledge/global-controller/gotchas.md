@@ -224,3 +224,11 @@ Always run `cargo fmt` after fixing error hiding violations. The formatter will 
 When making a dependency optional (e.g., `mc_client: Option<Arc<dyn McClientTrait>>`) with fallback logic for tests, integration tests may exercise the fallback path instead of production code. This creates false confidence - tests pass but production code is untested. Solution: Make dependencies required (`mc_client: Arc<dyn McClientTrait>`), inject mocks in tests. All code paths then use the same logic, just with different implementations.
 
 ---
+
+## Gotcha: Binary vs Library Module Trees Are Separate
+**Added**: 2026-02-04
+**Related files**: `crates/global-controller/src/main.rs`, `crates/global-controller/src/lib.rs`
+
+Rust binaries (`main.rs`) have their own module tree separate from the library (`lib.rs`). Adding `pub mod observability;` to `lib.rs` does NOT make it available in `main.rs`. You must ALSO add `mod observability;` to `main.rs` for the binary to see the module. Symptom: `unresolved import` errors when trying to use modules that exist in lib.rs. Solution: Declare modules in both files, or import from the library crate (`use global_controller::observability;`).
+
+---

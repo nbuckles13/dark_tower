@@ -23,8 +23,25 @@ use common::secret::SecretString;
 use common::token_manager::TokenReceiver;
 use futures::future::join_all;
 use global_controller::config::Config;
-use global_controller::routes::{self, AppState};
+use global_controller::routes::{self, init_metrics_recorder, AppState};
 use global_controller::services::MockMcClient;
+use std::sync::OnceLock;
+
+/// Global metrics handle for test servers
+static TEST_METRICS_HANDLE: OnceLock<metrics_exporter_prometheus::PrometheusHandle> =
+    OnceLock::new();
+
+fn get_test_metrics_handle() -> metrics_exporter_prometheus::PrometheusHandle {
+    TEST_METRICS_HANDLE
+        .get_or_init(|| {
+            init_metrics_recorder().unwrap_or_else(|_| {
+                metrics_exporter_prometheus::PrometheusBuilder::new()
+                    .build_recorder()
+                    .handle()
+            })
+        })
+        .clone()
+}
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use ring::signature::{Ed25519KeyPair, KeyPair};
 use serde::{Deserialize, Serialize};
@@ -253,8 +270,9 @@ impl TestMeetingServer {
             token_receiver,
         });
 
-        // Build routes
-        let app = routes::build_routes(state);
+        // Build routes with metrics handle
+        let metrics_handle = get_test_metrics_handle();
+        let app = routes::build_routes(state, metrics_handle);
 
         // Bind to random port
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")

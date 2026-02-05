@@ -168,3 +168,25 @@ pub use common::jwt::{
 **When to use**: Consolidating constants, types, or functions into common while maintaining API stability.
 
 ---
+
+## Check Common Crate First for BLOCKING vs TECH_DEBT Classification
+
+**Added**: 2026-02-04
+**Related files**: `crates/common/src/lib.rs`
+
+**Pattern**: When reviewing new service code, always check what modules exist in `crates/common/src/` BEFORE classifying duplication severity:
+
+1. **Read `common/src/lib.rs`** to see exported modules (error, types, config, secret, jwt, token_manager)
+2. **If pattern exists in common but wasn't imported** -> BLOCKING (mistake, should have used shared code)
+3. **If pattern exists in another service but NOT in common** -> TECH_DEBT (opportunity for future extraction)
+
+**Example from GC metrics review**: Common crate has NO observability module. GC correctly implemented its own metrics. This is TECH_DEBT (extraction opportunity), not BLOCKING (mistake).
+
+**Why this matters**: BLOCKING stops the dev-loop and requires immediate fixes. TECH_DEBT is documented for follow-up. Incorrect classification wastes time (false BLOCKING) or misses extraction opportunities (missed BLOCKING).
+
+**Checklist before marking BLOCKING**:
+- [ ] Pattern exists in `crates/common/src/`
+- [ ] Service did not import from common
+- [ ] Import would have worked (correct signature/types)
+
+---

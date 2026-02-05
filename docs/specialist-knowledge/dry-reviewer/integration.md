@@ -165,6 +165,24 @@ MC loads session binding token master secret via: base64 decode -> length valida
 
 ---
 
+### TD-19: HTTP Metrics Middleware + Path Normalization
+**Added**: 2026-02-04
+**Related files**: `crates/global-controller/src/middleware/http_metrics.rs`, `crates/ac-service/src/middleware/http_metrics.rs`, `crates/global-controller/src/observability/metrics.rs`, `crates/ac-service/src/observability/metrics.rs`
+
+**HTTP Middleware** (~95% identical): Both GC and AC have identical `http_metrics_middleware` functions - capture start time, method, path, execute request, record metrics with duration. Only difference is import path for `record_http_request`.
+
+**Path Normalization** (~80% similar): Both services implement the same algorithm: check known static paths, normalize dynamic segments with placeholders, return `/other` for unknown. AC has `normalize_path()` + `normalize_dynamic_path()` + `is_uuid()`, GC has `normalize_endpoint()` + `normalize_dynamic_endpoint()` + `categorize_status_code()`.
+
+Severity: Medium (significant code, affects maintainability across services). Improvement path: Extract to `common::observability`:
+1. `common::middleware::http_metrics_middleware<R: HttpMetricsRecorder>` with trait-based recorder
+2. `common::observability::PathNormalizer` struct with configurable static paths and dynamic patterns
+3. `common::observability::is_uuid()` utility
+4. `common::observability::categorize_status_code()` utility
+
+Timeline: Phase 5+ (before third HTTP service). Note: First significant observability duplication - common crate currently has NO observability module, so this establishes the pattern for future extraction.
+
+---
+
 This differs from Security, Test, and Code Quality reviewers where ALL findings block. Only genuine shared code requiring extraction should be classified as BLOCKER.
 
 **When to block**: Copy-pasted business logic, duplicate utilities that should be in `common/`, identical algorithms across services.

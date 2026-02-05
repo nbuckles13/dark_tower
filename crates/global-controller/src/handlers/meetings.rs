@@ -61,7 +61,15 @@ const DEFAULT_PARTICIPANT_CAPABILITIES: &[&str] = &["audio", "video", "screen_sh
 /// - 403 Forbidden: User not allowed to join
 /// - 404 Not Found: Meeting not found
 /// - 503 Service Unavailable: AC unreachable
-#[instrument(skip_all, fields(meeting_code = %code))]
+#[instrument(
+    skip_all,
+    name = "gc.meeting.join",
+    fields(
+        method = "GET",
+        endpoint = "/api/v1/meetings/{code}",
+        status = tracing::field::Empty,
+    )
+)]
 pub async fn join_meeting(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
@@ -192,7 +200,15 @@ pub async fn join_meeting(
 /// - 404 Not Found: Meeting not found
 /// - 429 Too Many Requests: Rate limit exceeded
 /// - 503 Service Unavailable: AC unreachable
-#[instrument(skip_all, fields(meeting_code = %code))]
+#[instrument(
+    skip_all,
+    name = "gc.meeting.guest_token",
+    fields(
+        method = "POST",
+        endpoint = "/api/v1/meetings/{code}/guest-token",
+        status = tracing::field::Empty,
+    )
+)]
 pub async fn get_guest_token(
     State(state): State<Arc<AppState>>,
     Path(code): Path<String>,
@@ -304,7 +320,15 @@ pub async fn get_guest_token(
 /// - 401 Unauthorized: Invalid or missing token
 /// - 403 Forbidden: User is not the host
 /// - 404 Not Found: Meeting not found
-#[instrument(skip_all, fields(meeting_id = %meeting_id))]
+#[instrument(
+    skip_all,
+    name = "gc.meeting.update_settings",
+    fields(
+        method = "PATCH",
+        endpoint = "/api/v1/meetings/{id}/settings",
+        status = tracing::field::Empty,
+    )
+)]
 pub async fn update_meeting_settings(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,

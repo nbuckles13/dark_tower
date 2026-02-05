@@ -48,7 +48,15 @@ pub struct MeResponse {
 ///   "iat": 1234567800
 /// }
 /// ```
-#[instrument(skip_all, name = "gc.handlers.me")]
+#[instrument(
+    skip_all,
+    name = "gc.handlers.me",
+    fields(
+        method = "GET",
+        endpoint = "/api/v1/me",
+        status = tracing::field::Empty,
+    )
+)]
 pub async fn get_me(Extension(claims): Extension<Claims>) -> Json<MeResponse> {
     tracing::debug!(target: "gc.handlers.me", "Returning user claims");
 

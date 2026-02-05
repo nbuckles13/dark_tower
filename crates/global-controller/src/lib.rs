@@ -22,8 +22,9 @@
 //! - `config` - Service configuration from environment
 //! - `errors` - Error types with HTTP status code mapping
 //! - `handlers` - HTTP request handlers
-//! - `middleware` - HTTP middleware (authentication)
+//! - `middleware` - HTTP middleware (authentication, metrics)
 //! - `models` - Data models
+//! - `observability` - Metrics and instrumentation (ADR-0011)
 //! - `routes` - Axum router setup
 //! - `services` - External service clients (AC, etc.)
 
@@ -34,6 +35,7 @@ pub mod grpc;
 pub mod handlers;
 pub mod middleware;
 pub mod models;
+pub mod observability;
 pub mod repositories;
 pub mod routes;
 pub mod services;

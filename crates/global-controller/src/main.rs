@@ -20,6 +20,7 @@ mod grpc;
 mod handlers;
 mod middleware;
 mod models;
+mod observability;
 mod repositories;
 mod routes;
 mod services;
@@ -59,6 +60,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     info!("Starting Global Controller");
+
+    // Initialize Prometheus metrics recorder (ADR-0011)
+    // Must be done before any metrics are recorded
+    let metrics_handle = routes::init_metrics_recorder().map_err(|e| {
+        error!("Failed to initialize metrics recorder: {}", e);
+        e
+    })?;
+    info!("Prometheus metrics recorder initialized");
 
     // Load configuration
     let config = Config::from_env().map_err(|e| {
@@ -135,8 +144,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         state.config.jwt_clock_skew_seconds,
     ));
 
-    // Build HTTP application routes
-    let http_app = routes::build_routes(state.clone());
+    // Build HTTP application routes with metrics endpoint (ADR-0011)
+    let http_app = routes::build_routes(state.clone(), metrics_handle);
 
     // Create gRPC services with auth layer
     let mc_service = McService::new(state.clone());
