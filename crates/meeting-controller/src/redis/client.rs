@@ -27,11 +27,13 @@
 //! ```
 
 use crate::errors::McError;
+use crate::observability::metrics::{record_fenced_out, record_redis_latency};
 use crate::redis::lua_scripts;
 use redis::aio::MultiplexedConnection;
 use redis::{AsyncCommands, Client, Script};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::RwLock;
 use tracing::{debug, error, instrument, warn};
 
@@ -138,7 +140,9 @@ impl FencedRedisClient {
         let mut conn = self.connection.clone();
         let key = format!("meeting:{meeting_id}:generation");
 
+        let start = Instant::now();
         let result: Option<String> = conn.get(&key).await.map_err(|e| {
+            record_redis_latency("get", start.elapsed());
             warn!(
                 target: "mc.redis.client",
                 error = %e,
@@ -147,6 +151,7 @@ impl FencedRedisClient {
             );
             McError::Redis(format!("Failed to get generation: {e}"))
         })?;
+        record_redis_latency("get", start.elapsed());
 
         Ok(result.and_then(|s| s.parse().ok()).unwrap_or(0))
     }
@@ -158,12 +163,14 @@ impl FencedRedisClient {
         let mut conn = self.connection.clone();
         let key = format!("meeting:{meeting_id}:generation");
 
+        let start = Instant::now();
         let new_gen: i64 = self
             .increment_gen_script
             .key(&key)
             .invoke_async(&mut conn)
             .await
             .map_err(|e| {
+                record_redis_latency("incr", start.elapsed());
                 warn!(
                     target: "mc.redis.client",
                     error = %e,
@@ -172,6 +179,7 @@ impl FencedRedisClient {
                 );
                 McError::Redis(format!("Failed to increment generation: {e}"))
             })?;
+        record_redis_latency("incr", start.elapsed());
 
         let new_gen = new_gen as u64;
 
@@ -248,6 +256,7 @@ impl FencedRedisClient {
         let gen_key = format!("meeting:{meeting_id}:generation");
         let data_key = format!("meeting:{meeting_id}:mh");
 
+        let start = Instant::now();
         let result: i64 = self
             .fenced_write_script
             .key(&gen_key)
@@ -257,6 +266,7 @@ impl FencedRedisClient {
             .invoke_async(&mut conn)
             .await
             .map_err(|e| {
+                record_redis_latency("eval", start.elapsed());
                 warn!(
                     target: "mc.redis.client",
                     error = %e,
@@ -265,6 +275,7 @@ impl FencedRedisClient {
                 );
                 McError::Redis(format!("Failed to store MH assignment: {e}"))
             })?;
+        record_redis_latency("eval", start.elapsed());
 
         match result {
             1 => {
@@ -277,6 +288,7 @@ impl FencedRedisClient {
                 Ok(())
             }
             0 => {
+                record_fenced_out("stale_generation");
                 warn!(
                     target: "mc.redis.client",
                     meeting_id = %meeting_id,
@@ -308,7 +320,9 @@ impl FencedRedisClient {
         let mut conn = self.connection.clone();
         let key = format!("meeting:{meeting_id}:mh");
 
+        let start = Instant::now();
         let result: Option<String> = conn.get(&key).await.map_err(|e| {
+            record_redis_latency("get", start.elapsed());
             warn!(
                 target: "mc.redis.client",
                 error = %e,
@@ -317,6 +331,7 @@ impl FencedRedisClient {
             );
             McError::Redis(format!("Failed to get MH assignment: {e}"))
         })?;
+        record_redis_latency("get", start.elapsed());
 
         match result {
             Some(json) => {
@@ -345,6 +360,7 @@ impl FencedRedisClient {
         let gen_key = format!("meeting:{meeting_id}:generation");
         let data_key = format!("meeting:{meeting_id}:mh");
 
+        let start = Instant::now();
         let result: i64 = self
             .fenced_delete_script
             .key(&gen_key)
@@ -353,6 +369,7 @@ impl FencedRedisClient {
             .invoke_async(&mut conn)
             .await
             .map_err(|e| {
+                record_redis_latency("eval", start.elapsed());
                 warn!(
                     target: "mc.redis.client",
                     error = %e,
@@ -361,6 +378,7 @@ impl FencedRedisClient {
                 );
                 McError::Redis(format!("Failed to delete MH assignment: {e}"))
             })?;
+        record_redis_latency("eval", start.elapsed());
 
         if result >= 0 {
             debug!(
@@ -413,9 +431,13 @@ impl FencedRedisClient {
         }
 
         // Try EVALSHA first, fall back to EVAL if script not cached
+        let start = Instant::now();
         let result: Result<i64, _> = cmd.query_async(&mut conn).await;
         let result = match result {
-            Ok(r) => r,
+            Ok(r) => {
+                record_redis_latency("hset", start.elapsed());
+                r
+            }
             Err(e) if e.kind() == redis::ErrorKind::NoScriptError => {
                 // Script not cached, use EVAL
                 let mut eval_cmd = redis::cmd("EVAL");
@@ -430,7 +452,9 @@ impl FencedRedisClient {
                     eval_cmd.arg(*field).arg(*value);
                 }
 
-                eval_cmd.query_async(&mut conn).await.map_err(|e| {
+                let eval_start = Instant::now();
+                let eval_result = eval_cmd.query_async(&mut conn).await.map_err(|e| {
+                    record_redis_latency("hset", eval_start.elapsed());
                     warn!(
                         target: "mc.redis.client",
                         error = %e,
@@ -438,9 +462,12 @@ impl FencedRedisClient {
                         "Failed to store meeting state"
                     );
                     McError::Redis(format!("Failed to store meeting state: {e}"))
-                })?
+                })?;
+                record_redis_latency("hset", eval_start.elapsed());
+                eval_result
             }
             Err(e) => {
+                record_redis_latency("hset", start.elapsed());
                 warn!(
                     target: "mc.redis.client",
                     error = %e,
@@ -465,6 +492,7 @@ impl FencedRedisClient {
                 Ok(())
             }
             0 => {
+                record_fenced_out("stale_generation");
                 warn!(
                     target: "mc.redis.client",
                     meeting_id = %meeting_id,
@@ -500,7 +528,9 @@ impl FencedRedisClient {
             format!("meeting:{meeting_id}:participants"),
         ];
 
+        let start = Instant::now();
         let _: () = conn.del(&keys).await.map_err(|e| {
+            record_redis_latency("del", start.elapsed());
             warn!(
                 target: "mc.redis.client",
                 error = %e,
@@ -509,6 +539,7 @@ impl FencedRedisClient {
             );
             McError::Redis(format!("Failed to delete meeting data: {e}"))
         })?;
+        record_redis_latency("del", start.elapsed());
 
         // Clear local cache
         {

@@ -40,6 +40,14 @@ base64 = { workspace = true }
 # System information for comprehensive heartbeats (ADR-0023 Phase 6c)
 sysinfo = "0.30"
 
+# Metrics (ADR-0011 Observability, ADR-0023 Section 11)
+metrics = "0.24"
+metrics-exporter-prometheus = "0.16"
+
+# HTTP server for health endpoints and metrics
+axum = { workspace = true }
+tower-http = { workspace = true, features = ["trace"] }
+
 # Local dependencies
 common = { path = "../common" }
 proto-gen = { path = "../proto-gen" }
@@ -48,6 +56,11 @@ media-protocol = { path = "../media-protocol" }
 [dev-dependencies]
 criterion = { workspace = true }
 mc-test-utils = { path = "../mc-test-utils" }
+# Metrics testing
+metrics-util = "0.18"
+# HTTP testing for health endpoint integration tests
+tower = { workspace = true }
+http-body-util = "0.1"
 # Need test-util feature for tokio::time::pause/advance in tests
 tokio = { version = "1.40", features = ["full", "test-util"] }
 # For wrapping TcpListener as tonic-compatible stream in integration tests

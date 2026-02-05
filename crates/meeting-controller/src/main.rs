@@ -25,27 +25,33 @@
 //! # Startup Flow (ADR-0023 Phase 6c, ADR-0010)
 //!
 //! 1. Load configuration from environment
-//! 2. Initialize Redis connection (`FencedRedisClient`)
-//! 3. Spawn `TokenManager` for OAuth token acquisition from AC (ADR-0010)
-//! 4. Initialize actor system (`MeetingControllerActorHandle`)
-//! 5. Start gRPC server for GC->MC communication
-//! 6. Create `GcClient` with `TokenReceiver` and spawn GC task (registration + heartbeats)
-//! 7. Wait for shutdown signal
+//! 2. Initialize Prometheus metrics recorder (ADR-0011)
+//! 3. Initialize Redis connection (`FencedRedisClient`)
+//! 4. Spawn `TokenManager` for OAuth token acquisition from AC (ADR-0010)
+//! 5. Initialize actor system (`MeetingControllerActorHandle`)
+//! 6. Start health HTTP server (liveness, readiness, metrics)
+//! 7. Start gRPC server for GC->MC communication
+//! 8. Create `GcClient` with `TokenReceiver` and spawn GC task (registration + heartbeats)
+//! 9. Wait for shutdown signal
 
 #![warn(clippy::pedantic)]
 #![allow(clippy::too_many_lines)] // main.rs orchestrates startup, naturally longer
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::Router;
 use common::secret::{ExposeSecret, SecretBox};
 use common::token_manager::{spawn_token_manager, TokenManagerConfig};
 use meeting_controller::actors::{ActorMetrics, ControllerMetrics, MeetingControllerActorHandle};
 use meeting_controller::config::Config;
 use meeting_controller::errors::McError;
 use meeting_controller::grpc::{GcClient, McAssignmentService};
+use meeting_controller::observability::{health_router, HealthState};
 use meeting_controller::redis::FencedRedisClient;
 use meeting_controller::system_info::gather_system_info;
+use metrics_exporter_prometheus::PrometheusBuilder;
 use proto_gen::internal::meeting_controller_service_server::MeetingControllerServiceServer;
 use proto_gen::internal::HealthStatus;
 use tokio::signal;
@@ -89,6 +95,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         binding_token_ttl_seconds = config.binding_token_ttl_seconds,
         "Configuration loaded successfully"
     );
+
+    // Initialize Prometheus metrics recorder (ADR-0011)
+    // This must happen before any metrics are recorded
+    info!("Initializing Prometheus metrics recorder...");
+    let prometheus_handle = PrometheusBuilder::new().install_recorder().map_err(|e| {
+        error!(error = %e, "Failed to install Prometheus metrics recorder");
+        format!("Failed to install Prometheus metrics recorder: {e}")
+    })?;
+    info!("Prometheus metrics recorder initialized");
+
+    // Initialize health state
+    let health_state = Arc::new(HealthState::new());
 
     // Initialize Redis connection (Phase 6b)
     info!("Connecting to Redis...");
@@ -181,6 +199,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // This ensures all tasks are cancelled when the controller shuts down
     let shutdown_token = controller_handle.child_token();
 
+    // Start health HTTP server (MUST succeed - fail startup if it doesn't)
+    // This provides liveness/readiness probes and Prometheus /metrics endpoint
+    let health_addr: SocketAddr = config.health_bind_address.parse().map_err(|e| {
+        error!(error = %e, addr = %config.health_bind_address, "Invalid health bind address");
+        format!("Invalid health bind address: {e}")
+    })?;
+
+    let health_router = health_router(Arc::clone(&health_state));
+
+    // Add /metrics endpoint served by Prometheus exporter
+    let metrics_router = Router::new().route(
+        "/metrics",
+        axum::routing::get(move || {
+            let handle = prometheus_handle.clone();
+            async move { handle.render() }
+        }),
+    );
+
+    let app = health_router.merge(metrics_router);
+
+    // Bind listener BEFORE spawning to fail fast on bind errors
+    let listener = tokio::net::TcpListener::bind(health_addr)
+        .await
+        .map_err(|e| {
+            error!(error = %e, addr = %health_addr, "Failed to bind health server");
+            format!("Failed to bind health server to {health_addr}: {e}")
+        })?;
+    info!(addr = %health_addr, "Health server bound successfully");
+
+    // Spawn health server task
+    let health_shutdown_token = shutdown_token.child_token();
+    tokio::spawn(async move {
+        info!(addr = %health_addr, "Health server starting");
+        let server = axum::serve(listener, app).with_graceful_shutdown(async move {
+            health_shutdown_token.cancelled().await;
+            info!("Health server shutting down");
+        });
+        if let Err(e) = server.await {
+            error!(error = %e, "Health server failed");
+        }
+    });
+    info!(addr = %health_addr, "Health server started");
+
     // Start gRPC server BEFORE GC registration (correct ordering)
     // This prevents race condition where GC tries to call MC before server is ready
     let grpc_addr = config.grpc_bind_address.parse().map_err(|e| {
@@ -227,8 +288,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Spawn unified GC task (registration + dual heartbeats)
     let gc_task_token = shutdown_token.child_token();
     let gc_task_metrics = Arc::clone(&controller_metrics);
+    let gc_task_health = Arc::clone(&health_state);
     tokio::spawn(async move {
-        run_gc_task(gc_client, gc_task_metrics, gc_task_token).await;
+        run_gc_task(gc_client, gc_task_metrics, gc_task_health, gc_task_token).await;
     });
     info!("GC task started");
 
@@ -242,8 +304,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     shutdown_signal().await;
 
     // Trigger graceful shutdown via cancellation token
-    // This propagates to all child tokens (GC task, gRPC server)
+    // This propagates to all child tokens (GC task, gRPC server, health server)
     info!("Shutdown signal received, initiating graceful shutdown...");
+
+    // Mark as not ready immediately so k8s stops sending traffic
+    health_state.set_not_ready();
+
     shutdown_token.cancel();
 
     // Give tasks time to shut down
@@ -275,6 +341,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn run_gc_task(
     gc_client: GcClient,
     metrics: Arc<ControllerMetrics>,
+    health_state: Arc<HealthState>,
     cancel_token: CancellationToken,
 ) {
     info!("GC task: Starting initial registration");
@@ -290,6 +357,8 @@ async fn run_gc_task(
                 match result {
                     Ok(()) => {
                         info!("GC task: Initial registration successful");
+                        // Mark as ready now that we're registered with GC
+                        health_state.set_ready();
                         break; // Proceed to heartbeat loop
                     }
                     Err(e) => {

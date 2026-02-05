@@ -198,3 +198,35 @@ When a type needs a test-only constructor that bypasses normal initialization (e
 For critical startup dependencies (like TokenManager acquiring initial token), wrap the operation in `tokio::time::timeout()` to fail fast rather than hang indefinitely. Pattern: `let token_rx = tokio::time::timeout(Duration::from_secs(30), token_manager.subscribe()).await.map_err(|_| "Timeout acquiring token")?.map_err(|e| format!("Token error: {e}"))?;`. This reveals configuration issues (wrong endpoint, invalid credentials) immediately at startup rather than during first request.
 
 ---
+
+## Pattern: Metrics Crate Facade with Wrapper Functions
+**Added**: 2026-02-05
+**Related files**: `crates/meeting-controller/src/observability/metrics.rs`
+
+Use the `metrics` crate facade pattern (matching AC per ADR-0011) instead of the `prometheus` crate directly. Create thin wrapper functions for each metric: `pub fn record_websocket_connection() { counter!("mc_websocket_connections_total").increment(1); }`. This provides: (1) type-safe metric recording, (2) centralized metric naming, (3) consistent labels, (4) easy testing (mock the wrapper, not the crate). Requires `PrometheusBuilder::new().install()` at startup before any metric recording.
+
+---
+
+## Pattern: Fail-Fast Server Binding Before Task Spawn
+**Added**: 2026-02-05
+**Related files**: `crates/meeting-controller/src/observability/health.rs`, `crates/meeting-controller/src/main.rs`
+
+For internal servers (health endpoints, metrics), bind the TCP listener synchronously BEFORE spawning the server task. Pattern: `let listener = TcpListener::bind(addr).await?; tokio::spawn(async move { serve(listener).await });`. This ensures startup fails immediately if the port is unavailable, rather than spawning a task that silently fails later. The bound listener is passed to the spawned task, guaranteeing the port is reserved.
+
+---
+
+## Pattern: Health Endpoints Matching AC Structure
+**Added**: 2026-02-05
+**Related files**: `crates/meeting-controller/src/observability/health.rs`, `crates/ac-service/src/health.rs`
+
+For consistency across services, use AC's health endpoint pattern: `/health` for liveness (always returns 200 OK if server is running) and `/ready` for readiness (checks dependencies like GC registration, Redis connection). Do NOT use Kubernetes-style paths like `/health/live` and `/health/ready`. Health responses use JSON: `{"status": "healthy"}` or `{"status": "ready", "registered": true}`. The `HealthState` struct tracks readiness and is shared via `Arc<HealthState>` across tasks.
+
+---
+
+## Pattern: Integration Tests with tower::util::ServiceExt::oneshot()
+**Added**: 2026-02-05
+**Related files**: `crates/meeting-controller/tests/health_integration.rs`
+
+For testing HTTP services without starting a full server, use tower's `ServiceExt::oneshot()` method. Pattern: `let response = app.clone().oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap()).await.unwrap();`. This executes a single request through the service stack synchronously. Requires `tower = { version = "0.5", features = ["util"] }` and `http-body-util` for body collection. This is faster and more deterministic than spawning a server and making HTTP requests.
+
+---

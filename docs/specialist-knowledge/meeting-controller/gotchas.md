@@ -139,3 +139,27 @@ When loading secrets from environment variables as base64, validate BOTH the bas
 The semantic guard's `error-context-preservation` check flags `e.to_string()` as potentially losing context, but this can false-positive when the string IS preserving context (e.g., `format!("Failed to decode: {e}")`). Similarly, `credential-leak-prevention` may flag error messages containing words like "token" or "invalid" even when no actual credentials are present. Fix by rewording the error message to avoid trigger patterns, or if truly a false positive, document why in a comment. Don't disable the guard entirely - it catches real issues.
 
 ---
+
+## Gotcha: Don't Use Kubernetes-Style Health Paths
+**Added**: 2026-02-05
+**Related files**: `crates/meeting-controller/src/observability/health.rs`
+
+Use `/health` and `/ready` endpoints (matching AC pattern), NOT Kubernetes-style paths like `/health/live` and `/health/ready`. While Kubernetes probes are configurable, the AC pattern is the established standard across all Dark Tower services. Consistency makes debugging and documentation easier. Kubernetes probe configs can point to `/health` and `/ready` directly.
+
+---
+
+## Gotcha: PrometheusBuilder Must Install Before Metric Recording
+**Added**: 2026-02-05
+**Related files**: `crates/meeting-controller/src/main.rs`, `crates/meeting-controller/src/observability/metrics.rs`
+
+The `metrics_exporter_prometheus::PrometheusBuilder::new().install()` call must execute BEFORE any `counter!()`, `gauge!()`, or `histogram!()` macros are invoked. If metrics are recorded before the exporter is installed, they are silently dropped and won't appear in Prometheus scrapes. In main.rs, call PrometheusBuilder install as one of the first async operations, before creating actors or services that might record metrics on construction.
+
+---
+
+## Gotcha: Arc<HealthState> Required for Cross-Task Sharing
+**Added**: 2026-02-05
+**Related files**: `crates/meeting-controller/src/observability/health.rs`, `crates/meeting-controller/src/main.rs`
+
+The `HealthState` struct must be wrapped in `Arc` when shared between the health server and tasks that update state (like the GC registration task). Pattern: `let health_state = Arc::new(HealthState::new()); let health_clone = Arc::clone(&health_state);`. The health server owns one Arc, and the registration task owns another to call `health_state.set_registered(true)` when GC registration succeeds. Using bare `HealthState` without Arc causes ownership/borrow issues across async task boundaries.
+
+---
