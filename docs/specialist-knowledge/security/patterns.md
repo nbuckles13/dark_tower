@@ -314,3 +314,31 @@ Config {
 **Benefits**: (1) No risk of credential leakage if test code is committed, (2) Clear separation from production values, (3) Validates production code paths without security bypass. Common mistake: using production-like secrets in tests (e.g., realistic-looking JWTs, actual API keys from docs).
 
 ---
+
+## Pattern: Bounded Label Values for Cardinality Safety in Observability
+**Added**: 2026-02-05
+**Related files**: `crates/meeting-controller/src/actors/metrics.rs`, `crates/meeting-controller/src/observability/metrics.rs`
+
+Prometheus metrics with labels must use bounded, enumerated values to prevent cardinality explosion that can crash monitoring systems. Pattern:
+
+1. **Enum-backed labels**: Use Rust enums for label values, implement `as_str()` returning `&'static str`. Guarantees only valid values exist. Example: `ActorType::Controller`, `ActorType::Meeting`, `ActorType::Connection` → 3 max values.
+
+2. **No user-supplied labels**: Never use user IDs, meeting IDs, session IDs, or any unbounded identifiers as label values. These should be stored internally (in tracing logs if needed) but NOT in Prometheus.
+
+3. **Aggregate metrics only**: Track counts and aggregates (active meetings total, connections total) without per-entity labels. Example: `mc_meetings_active: 42` (gauge, no labels) not `mc_meetings_active{meeting_id="abc"}: 1` (unbounded cardinality).
+
+4. **Label documentation**: Document all labels and their allowed values in metric function comments, with cardinality count. Pattern:
+```rust
+/// Metric: `mc_actor_mailbox_depth`
+/// Labels: `actor_type` (controller, meeting, connection)
+/// Cardinality: 3 (bounded by ActorType enum)
+pub fn set_actor_mailbox_depth(actor_type: &str, depth: usize) { ... }
+```
+
+5. **Validation at boundaries**: Only Prometheus-facing functions should receive label values (e.g., `record_actor_panic(actor_type.as_str())`). The `.as_str()` conversion happens at the callsite, making valid values clear.
+
+**Benefits**: (1) Prevents memory exhaustion in Prometheus from infinite label combinations, (2) Makes cardinality bounds explicit and auditable, (3) Prevents accidental PII exposure via labels, (4) Improves observability system reliability.
+
+**Common mistake**: Accepting arbitrary string parameters: `record_metric("some_label", value)` where callers pass user IDs. The fix: Use enums with `as_str()` conversion enforced at type level.
+
+---

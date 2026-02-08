@@ -136,3 +136,24 @@ This file captures pitfalls and anti-patterns discovered during DRY reviews.
 **When reviewing**: If new service follows AC/GC pattern exactly but with different service name and metrics, mark as "Positive: Follows Reference Pattern" not as duplication. Only flag TECH_DEBT for boilerplate that would benefit from templating.
 
 ---
+
+## Clear Responsibility Separation Means Different Data Types May Coexist
+
+**Added**: 2026-02-05
+**Related files**: `crates/meeting-controller/src/actors/metrics.rs:248-323` (ControllerMetrics), `crates/meeting-controller/src/actors/metrics.rs:325-425` (ActorMetrics)
+
+**Gotcha**: Don't flag two very similar metric structs as DRY violation if they serve fundamentally different purposes and are used by different subsystems. In MC:
+- `ControllerMetrics` (u32): For heartbeat reporting to GC, reported via RPC
+- `ActorMetrics` (usize/u64): For Prometheus emission and internal tracking
+
+They happen to both track `meetings` and `connections`, but:
+- ControllerMetrics uses atomic u32 and `SeqCst` ordering (cross-thread visibility for heartbeat)
+- ActorMetrics uses atomic usize and `Relaxed` ordering (fast internal tracking)
+- ControllerMetrics.current_participants never flows to Prometheus
+- ActorMetrics flows only to Prometheus, not to GC
+
+**Rule**: If two metrics structs serve different consumers with different synchronization needs, they're not duplication. Document the purpose of each and explain why they can't be merged.
+
+**When reviewing**: Ask "What system consumes this metric?" If different, separation is intentional.
+
+---

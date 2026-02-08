@@ -190,3 +190,33 @@ pub use common::jwt::{
 - [ ] Import would have worked (correct signature/types)
 
 ---
+
+## Dual Metrics Facades (Internal Tracking + Prometheus Emission)
+
+**Added**: 2026-02-05
+**Related files**: `crates/meeting-controller/src/actors/metrics.rs`, `crates/meeting-controller/src/observability/metrics.rs`
+
+**Pattern**: Separate internal atomic metrics tracking (in actor structs) from Prometheus emission (in observability module):
+- **Internal tier**: `ActorMetrics`, `MailboxMonitor` - Atomic counters for fast lock-free updates
+- **Emission tier**: `prom::set_*()`, `prom::record_*()` - Low-level Prometheus metric calls
+
+Each actor method updates internal state AND calls the corresponding `prom::*()` function:
+
+```rust
+pub fn meeting_created(&self) {
+    let count = self.active_meetings.fetch_add(1, Ordering::Relaxed) + 1;
+    prom::set_meetings_active(count as u64);  // Dual emission
+}
+```
+
+**Benefits**:
+- Clean separation: Business logic owns internal counters, observability owns Prometheus wiring
+- No complex cascading calls - direct update + direct emission is clear
+- Pattern validated across multiple metric types (gauges, counters, histograms)
+- Ordered consistency: Internal state updated first, then Prometheus
+
+**When to use**: Services with actor systems or background tasks that emit metrics. Each lifecycle event (create/destroy/update) should update both tiers.
+
+**When NOT to use**: Simple request/response metrics (no internal state needed) - emit directly to Prometheus.
+
+---

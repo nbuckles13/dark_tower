@@ -20,7 +20,7 @@ use super::messages::{
     JoinResult, LeaveReason, MeetingMessage, MeetingState, ParticipantInfo, ParticipantStateUpdate,
     ParticipantStatus, ReconnectResult, SignalingPayload,
 };
-use super::metrics::{ActorMetrics, ActorType, MailboxMonitor};
+use super::metrics::{ActorMetrics, ActorType, ControllerMetrics, MailboxMonitor};
 use super::session::{SessionBindingManager, StoredBinding};
 
 use common::secret::SecretBox;
@@ -317,8 +317,10 @@ pub struct MeetingActor {
     created_at: i64,
     /// Whether the meeting is shutting down.
     is_shutting_down: bool,
-    /// Shared metrics.
+    /// Shared actor metrics.
     metrics: Arc<ActorMetrics>,
+    /// Controller metrics for GC heartbeat reporting (participant count).
+    controller_metrics: Arc<ControllerMetrics>,
     /// Mailbox monitor.
     mailbox: MailboxMonitor,
 }
@@ -333,12 +335,14 @@ impl MeetingActor {
     /// * `meeting_id` - Unique meeting identifier
     /// * `cancel_token` - Cancellation token (child of controller's token)
     /// * `metrics` - Shared actor metrics
+    /// * `controller_metrics` - Controller metrics for GC heartbeat reporting (participant count)
     /// * `master_secret` - Master secret for HKDF key derivation (ADR-0023). Wrapped in
     ///   SecretBox to ensure secure memory handling (zeroization on drop, redacted Debug).
     pub fn spawn(
         meeting_id: String,
         cancel_token: CancellationToken,
         metrics: Arc<ActorMetrics>,
+        controller_metrics: Arc<ControllerMetrics>,
         master_secret: SecretBox<Vec<u8>>,
     ) -> (MeetingActorHandle, JoinHandle<()>) {
         let (sender, receiver) = mpsc::channel(MEETING_CHANNEL_BUFFER);
@@ -356,6 +360,7 @@ impl MeetingActor {
             created_at: chrono::Utc::now().timestamp(),
             is_shutting_down: false,
             metrics,
+            controller_metrics,
             mailbox: MailboxMonitor::new(ActorType::Meeting, &meeting_id),
         };
 
@@ -610,6 +615,7 @@ impl MeetingActor {
             .insert(correlation_id.clone(), participant_id.clone());
 
         self.metrics.connection_created();
+        self.controller_metrics.increment_participants();
 
         // Get list of other participants
         let participants: Vec<ParticipantInfo> = self
@@ -858,6 +864,9 @@ impl MeetingActor {
                 conn_handle.cancel();
             }
 
+            // Decrement participant count for GC heartbeat reporting
+            self.controller_metrics.decrement_participants();
+
             // Broadcast leave
             self.broadcast_update(
                 participant_id,
@@ -1096,6 +1105,9 @@ impl MeetingActor {
                 self.correlation_to_participant
                     .remove(&participant.correlation_id);
 
+                // Decrement participant count for GC heartbeat reporting
+                self.controller_metrics.decrement_participants();
+
                 self.broadcast_update(
                     &participant_id,
                     ParticipantStateUpdate::Left {
@@ -1230,12 +1242,14 @@ mod tests {
     #[tokio::test]
     async fn test_meeting_actor_spawn() {
         let metrics = ActorMetrics::new();
+        let controller_metrics = ControllerMetrics::new();
         let cancel_token = CancellationToken::new();
 
         let (handle, _task) = MeetingActor::spawn(
             "meeting-123".to_string(),
             cancel_token.clone(),
             metrics,
+            controller_metrics,
             test_secret(),
         );
 
@@ -1249,12 +1263,14 @@ mod tests {
     #[tokio::test]
     async fn test_meeting_actor_join() {
         let metrics = ActorMetrics::new();
+        let controller_metrics = ControllerMetrics::new();
         let cancel_token = CancellationToken::new();
 
         let (handle, _task) = MeetingActor::spawn(
             "meeting-join-test".to_string(),
             cancel_token.clone(),
             metrics,
+            controller_metrics,
             test_secret(),
         );
 
@@ -1280,12 +1296,14 @@ mod tests {
     #[tokio::test]
     async fn test_meeting_actor_duplicate_join() {
         let metrics = ActorMetrics::new();
+        let controller_metrics = ControllerMetrics::new();
         let cancel_token = CancellationToken::new();
 
         let (handle, _task) = MeetingActor::spawn(
             "meeting-dup-test".to_string(),
             cancel_token.clone(),
             metrics,
+            controller_metrics,
             test_secret(),
         );
 
@@ -1315,12 +1333,14 @@ mod tests {
     #[tokio::test]
     async fn test_meeting_actor_get_state() {
         let metrics = ActorMetrics::new();
+        let controller_metrics = ControllerMetrics::new();
         let cancel_token = CancellationToken::new();
 
         let (handle, _task) = MeetingActor::spawn(
             "meeting-state-test".to_string(),
             cancel_token.clone(),
             metrics,
+            controller_metrics,
             test_secret(),
         );
 
@@ -1347,12 +1367,14 @@ mod tests {
     #[tokio::test]
     async fn test_meeting_actor_leave() {
         let metrics = ActorMetrics::new();
+        let controller_metrics = ControllerMetrics::new();
         let cancel_token = CancellationToken::new();
 
         let (handle, _task) = MeetingActor::spawn(
             "meeting-leave-test".to_string(),
             cancel_token.clone(),
             metrics,
+            controller_metrics,
             test_secret(),
         );
 
@@ -1380,12 +1402,14 @@ mod tests {
     #[tokio::test]
     async fn test_meeting_actor_reconnect() {
         let metrics = ActorMetrics::new();
+        let controller_metrics = ControllerMetrics::new();
         let cancel_token = CancellationToken::new();
 
         let (handle, _task) = MeetingActor::spawn(
             "meeting-reconnect-test".to_string(),
             cancel_token.clone(),
             metrics,
+            controller_metrics,
             test_secret(),
         );
 
@@ -1429,12 +1453,14 @@ mod tests {
     #[tokio::test]
     async fn test_meeting_actor_reconnect_invalid_token() {
         let metrics = ActorMetrics::new();
+        let controller_metrics = ControllerMetrics::new();
         let cancel_token = CancellationToken::new();
 
         let (handle, _task) = MeetingActor::spawn(
             "meeting-reconnect-invalid".to_string(),
             cancel_token.clone(),
             metrics,
+            controller_metrics,
             test_secret(),
         );
 
@@ -1477,12 +1503,14 @@ mod tests {
     #[tokio::test]
     async fn test_meeting_actor_self_mute() {
         let metrics = ActorMetrics::new();
+        let controller_metrics = ControllerMetrics::new();
         let cancel_token = CancellationToken::new();
 
         let (handle, _task) = MeetingActor::spawn(
             "meeting-mute-test".to_string(),
             cancel_token.clone(),
             metrics,
+            controller_metrics,
             test_secret(),
         );
 
@@ -1518,12 +1546,14 @@ mod tests {
     #[tokio::test]
     async fn test_meeting_actor_host_mute() {
         let metrics = ActorMetrics::new();
+        let controller_metrics = ControllerMetrics::new();
         let cancel_token = CancellationToken::new();
 
         let (handle, _task) = MeetingActor::spawn(
             "meeting-host-mute-test".to_string(),
             cancel_token.clone(),
             metrics,
+            controller_metrics,
             test_secret(),
         );
 
@@ -1567,12 +1597,14 @@ mod tests {
     #[tokio::test]
     async fn test_meeting_actor_host_mute_denied_for_non_host() {
         let metrics = ActorMetrics::new();
+        let controller_metrics = ControllerMetrics::new();
         let cancel_token = CancellationToken::new();
 
         let (handle, _task) = MeetingActor::spawn(
             "meeting-host-mute-denied".to_string(),
             cancel_token.clone(),
             metrics,
+            controller_metrics,
             test_secret(),
         );
 
@@ -1606,12 +1638,14 @@ mod tests {
     #[tokio::test]
     async fn test_meeting_actor_child_token() {
         let metrics = ActorMetrics::new();
+        let controller_metrics = ControllerMetrics::new();
         let cancel_token = CancellationToken::new();
 
         let (handle, _task) = MeetingActor::spawn(
             "meeting-token-test".to_string(),
             cancel_token.clone(),
             metrics,
+            controller_metrics,
             test_secret(),
         );
 
@@ -1631,12 +1665,14 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn test_disconnect_grace_period_expires() {
         let metrics = ActorMetrics::new();
+        let controller_metrics = ControllerMetrics::new();
         let cancel_token = CancellationToken::new();
 
         let (handle, _task) = MeetingActor::spawn(
             "meeting-grace-period-test".to_string(),
             cancel_token.clone(),
             metrics,
+            controller_metrics,
             test_secret(),
         );
 
@@ -1708,12 +1744,14 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn test_reconnect_within_grace_period() {
         let metrics = ActorMetrics::new();
+        let controller_metrics = ControllerMetrics::new();
         let cancel_token = CancellationToken::new();
 
         let (handle, _task) = MeetingActor::spawn(
             "meeting-reconnect-grace-test".to_string(),
             cancel_token.clone(),
             metrics,
+            controller_metrics,
             test_secret(),
         );
 

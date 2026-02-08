@@ -375,3 +375,28 @@ let master_secret = {
 - Validate minimum length (32 bytes for HMAC-SHA256)
 - Provide clear, actionable error messages
 - Use constants for magic numbers (`MIN_SECRET_LENGTH = 32`)
+
+---
+
+## Gotcha: Unexpressed Metric Availability Assumptions
+**Added**: 2026-02-05
+**Related files**: `crates/meeting-controller/src/actors/metrics.rs`
+
+When structs have increment/decrement methods (like `ControllerMetrics.increment_participants()`), developers naturally assume those values are exposed via Prometheus. However, not all metrics are wired - some may be for internal reporting only (like GC heartbeats).
+
+This causes two problems:
+1. Developers add calls to `increment_participants()` expecting Prometheus updates, but nothing appears in dashboards
+2. Missing documentation means the assumption isn't discovered until dashboards are built
+
+**Pattern**: Always document at module level which metrics ARE wired and which are NOT. Example:
+```rust
+/// Metrics for heartbeat reporting to Global Controller.
+///
+/// IMPORTANT: These metrics are NOT wired to Prometheus. They are internal
+/// to MC and used only for GC heartbeat reporting. Prometheus metrics for
+/// participants come from ActorMetrics instead.
+#[derive(Debug, Default)]
+pub struct ControllerMetrics { ... }
+```
+
+This prevents assumptions and makes the design intent explicit. Particularly important when a struct has methods that *look* like metrics but serve a different purpose.

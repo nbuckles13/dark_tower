@@ -489,3 +489,35 @@ Sometimes metrics CAN'T be wired due to architecture. Example: `record_token_ref
 3. Track as tech debt with options: callback mechanism, feature flag, or metrics trait in common crate
 
 ---
+
+## Gotcha: Observability Wiring May Not Need Explicit Prometheus Mocking
+**Added**: 2026-02-05
+**Related files**: `crates/meeting-controller/src/actors/metrics.rs`
+
+When adding Prometheus wiring to existing code, don't require explicit tests that mock Prometheus and assert it was called. For simple wiring (direct function calls, no branching logic), existing behavior tests provide sufficient coverage:
+
+```rust
+// INSUFFICIENT REQUIREMENT (too strict for simple wiring):
+// "Add test that explicitly mocks prom::set_meetings_active() and verifies it was called"
+
+// SUFFICIENT (what existing tests already verify):
+#[test]
+fn test_actor_metrics() {
+    let metrics = ActorMetrics::new();
+    metrics.meeting_created();
+    assert_eq!(metrics.meeting_count(), 1);  // Behavior verified, Prometheus call executes
+}
+```
+
+Why this works:
+- Wiring is simple (direct calls, no conditions)
+- Wrapper module has its own comprehensive tests (14 tests for observability::metrics)
+- Behavior tests exercise the code paths (functions called = Prometheus emitted)
+- Risk of regression is low (compiler catches if function is removed)
+
+When to require explicit Prometheus tests:
+- If wiring code has conditional emission (only emit if X > threshold)
+- If wiring aggregates/batches metrics
+- If wiring has error handling that might suppress emission
+
+For simple direct-call wiring like MC metrics, behavior verification is sufficient.

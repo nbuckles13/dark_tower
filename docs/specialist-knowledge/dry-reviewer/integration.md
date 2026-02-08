@@ -183,6 +183,14 @@ Timeline: Phase 5+ (before third HTTP service). Note: First significant observab
 
 ---
 
+### TD-20: Increment/Decrement Pattern in Actor Metrics
+**Added**: 2026-02-05
+**Related files**: `crates/meeting-controller/src/actors/metrics.rs:348-389`
+
+ActorMetrics uses identical increment/decrement pattern in 4 methods (`meeting_created`, `meeting_removed`, `connection_created`, `connection_closed`): fetch_add/sub with Ordering::Relaxed, cast to u64, emit to Prometheus gauge. Severity: Low (code is clear, minor repetition ~6 lines × 4 = 24 lines). Improvement path: Could extract to generic helper `fn emit_metric_change(&self, field: &AtomicUsize, metric_fn: impl Fn(u64))` but the explicit form is actually clearer for readers. Timeline: Future cleanup only if this pattern adds 5+ methods. Note: Type safety and clarity of explicit form outweigh minor duplication. Do not extract prematurely.
+
+---
+
 This differs from Security, Test, and Code Quality reviewers where ALL findings block. Only genuine shared code requiring extraction should be classified as BLOCKER.
 
 **When to block**: Copy-pasted business logic, duplicate utilities that should be in `common/`, identical algorithms across services.

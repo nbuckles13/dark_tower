@@ -548,10 +548,12 @@ async fn test_controller_metrics_concurrent_updates() {
 #[tokio::test]
 async fn test_actor_handle_creation() {
     let actor_metrics = ActorMetrics::new();
+    let controller_metrics = ControllerMetrics::new();
     let master_secret = SecretBox::new(Box::new(vec![0u8; 32]));
     let _controller_handle = Arc::new(MeetingControllerActorHandle::new(
         "mc-test".to_string(),
         Arc::clone(&actor_metrics),
+        Arc::clone(&controller_metrics),
         master_secret,
     ));
 

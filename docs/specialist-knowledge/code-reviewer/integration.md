@@ -166,3 +166,23 @@ The common crate provides shared utilities used across multiple services. Key mo
    - Size limits, clock skew tolerance, algorithm enforcement
 
 When reviewing code that needs token management, check if it can use `TokenManager` from common crate instead of implementing its own. Services (MC, MH) should share this implementation rather than duplicating OAuth 2.0 logic.
+
+---
+
+## Integration: Observability Specialist (Prometheus Wiring)
+**Added**: 2026-02-05
+**Related files**: `crates/meeting-controller/src/actors/metrics.rs`, `crates/meeting-controller/src/observability/metrics.rs`
+
+When reviewing code that implements internal metrics, coordinate with observability specialist on Prometheus wiring strategy. Key considerations:
+
+1. **Module-level documentation**: Clarify which structs ARE wired and which are NOT (prevents assumptions)
+2. **Naming conventions**: Metric names should follow ADR-0023 naming (e.g., `mc_` prefix for Meeting Controller)
+3. **Label cardinality**: Ensure bounded labels per ADR-0011 (e.g., actor_type has 3 values max)
+4. **Emission frequency**: High-frequency updates (per-message) may require different patterns than low-frequency (per-meeting)
+
+When a struct has increment/decrement methods that aren't wired to Prometheus, flag as documentation gap. The `ControllerMetrics.increment_participants()` pattern (internal-only, not Prometheus) is valid but must be explicitly documented to prevent assumptions about metric availability.
+
+Ask observability specialist:
+- Is this metric needed in Prometheus dashboards?
+- Should internal tracking be separate from Prometheus emission (current pattern with two metrics structs)?
+- Are there cardinality or performance concerns with the proposed metric?

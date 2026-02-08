@@ -691,3 +691,65 @@ fn normalize_endpoint(path: &str) -> String {
 This pattern applies to all services implementing metrics (AC, GC, MC, MH).
 
 ---
+
+## Pattern: Module-Level Prometheus Documentation
+**Added**: 2026-02-05
+**Related files**: `crates/meeting-controller/src/actors/metrics.rs`, `crates/meeting-controller/src/observability/metrics.rs`
+
+When adding Prometheus integration to internal tracking structs, document the module-level behavior clearly:
+
+```rust
+//! Internal metrics are wired to Prometheus via the observability module:
+//! - `ActorMetrics` updates `mc_meetings_active`, `mc_connections_active`, `mc_actor_panics_total`
+//! - `MailboxMonitor` updates `mc_actor_mailbox_depth`, `mc_messages_dropped_total`
+//! - `ControllerMetrics` is for GC heartbeat reporting only (no Prometheus emission)
+```
+
+This pattern clarifies:
+1. Which types emit to Prometheus
+2. Which metrics each type produces
+3. Which types are NOT wired (prevents assumptions about metric availability)
+
+Particularly useful when a struct has methods that look like they should be metrics (e.g., `increment_participants()`) but aren't actually wired. Prevents future developers from assuming automatic Prometheus emission.
+
+---
+
+## Pattern: Atomic Operation Style Consistency
+**Added**: 2026-02-05
+**Related files**: `crates/meeting-controller/src/actors/metrics.rs`
+
+When using atomic operations to calculate current values, prefer consistent patterns across a module:
+
+```rust
+// Pattern 1: fetch_add(1) + 1
+let new_depth = self.depth.fetch_add(1, Ordering::Relaxed) + 1;
+
+// Pattern 2: fetch_sub(1).saturating_sub(1)
+let new_depth = self.depth.fetch_sub(1, Ordering::Relaxed).saturating_sub(1);
+```
+
+Both are correct - `fetch_*` returns the *previous* value. However, mixing styles in the same module reduces clarity. Pick one pattern and document with inline comments explaining the difference between the returned value and the current value. The comment should clarify: "fetch_add returns previous value, adding 1 gives current value after increment."
+
+This is a minor code clarity issue but helps maintainers quickly understand atomic value calculations.
+
+---
+
+## Pattern: Warn vs Debug Log Thresholds in Monitoring
+**Added**: 2026-02-05
+**Related files**: `crates/meeting-controller/src/actors/metrics.rs`
+
+For mailbox depth monitoring, use a tiered logging strategy:
+
+```rust
+if level == MailboxLevel::Critical {
+    warn!(..., "Mailbox depth critical");      // High visibility, system overloaded
+} else if level == MailboxLevel::Warning {
+    debug!(..., "Mailbox depth elevated");     // Debug only, normal operation
+}
+```
+
+Key insight: Log at WARN when crossing into Critical (> threshold), and at DEBUG when first entering Warning zone. This prevents spamming warn logs during normal operation while ensuring critical issues surface immediately. The boundary condition (exact threshold) is a natural trigger point for the transition log.
+
+**Gotcha to avoid**: Exact threshold checks (`== normal_threshold`) can miss batched updates. If messages arrive in bursts, the exact boundary may be skipped. Document this trade-off or use `>=` comparison instead.
+
+---

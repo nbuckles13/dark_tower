@@ -20,7 +20,7 @@ use crate::errors::McError;
 
 use super::meeting::{MeetingActor, MeetingActorHandle};
 use super::messages::{ControllerMessage, ControllerStatus, MeetingInfo};
-use super::metrics::{ActorMetrics, ActorType, MailboxMonitor};
+use super::metrics::{ActorMetrics, ActorType, ControllerMetrics, MailboxMonitor};
 
 use common::secret::{ExposeSecret, SecretBox};
 use std::collections::HashMap;
@@ -53,6 +53,7 @@ impl MeetingControllerActorHandle {
     ///
     /// * `mc_id` - MC instance ID
     /// * `metrics` - Shared actor metrics
+    /// * `controller_metrics` - Controller metrics for GC heartbeat reporting (participant count)
     /// * `master_secret` - Master secret for session binding tokens (must be >= 32 bytes).
     ///   Wrapped in SecretBox to ensure secure memory handling (zeroization on drop,
     ///   redacted Debug output).
@@ -60,6 +61,7 @@ impl MeetingControllerActorHandle {
     pub fn new(
         mc_id: String,
         metrics: Arc<ActorMetrics>,
+        controller_metrics: Arc<ControllerMetrics>,
         master_secret: SecretBox<Vec<u8>>,
     ) -> Self {
         let (sender, receiver) = mpsc::channel(CONTROLLER_CHANNEL_BUFFER);
@@ -70,6 +72,7 @@ impl MeetingControllerActorHandle {
             receiver,
             cancel_token.clone(),
             Arc::clone(&metrics),
+            Arc::clone(&controller_metrics),
             master_secret,
         );
 
@@ -197,8 +200,10 @@ pub struct MeetingControllerActor {
     meetings: HashMap<String, ManagedMeeting>,
     /// Whether the controller is accepting new meetings.
     accepting_new: bool,
-    /// Shared metrics.
+    /// Shared actor metrics.
     metrics: Arc<ActorMetrics>,
+    /// Controller metrics for GC heartbeat reporting (participant count).
+    controller_metrics: Arc<ControllerMetrics>,
     /// Mailbox monitor.
     mailbox: MailboxMonitor,
     /// Master secret for session binding tokens (ADR-0023).
@@ -215,6 +220,7 @@ impl MeetingControllerActor {
     /// * `receiver` - Message receiver channel
     /// * `cancel_token` - Root cancellation token
     /// * `metrics` - Shared actor metrics
+    /// * `controller_metrics` - Controller metrics for GC heartbeat reporting (participant count)
     /// * `master_secret` - Master secret for session binding tokens (must be >= 32 bytes).
     ///   Wrapped in SecretBox to ensure secure memory handling.
     fn new(
@@ -222,6 +228,7 @@ impl MeetingControllerActor {
         receiver: mpsc::Receiver<ControllerMessage>,
         cancel_token: CancellationToken,
         metrics: Arc<ActorMetrics>,
+        controller_metrics: Arc<ControllerMetrics>,
         master_secret: SecretBox<Vec<u8>>,
     ) -> Self {
         let mailbox = MailboxMonitor::new(ActorType::Controller, &mc_id);
@@ -233,6 +240,7 @@ impl MeetingControllerActor {
             meetings: HashMap::new(),
             accepting_new: true,
             metrics,
+            controller_metrics,
             mailbox,
             master_secret,
         }
@@ -366,6 +374,7 @@ impl MeetingControllerActor {
             meeting_id.clone(),
             meeting_token,
             Arc::clone(&self.metrics),
+            Arc::clone(&self.controller_metrics),
             meeting_secret,
         );
 
@@ -650,8 +659,13 @@ mod tests {
     #[tokio::test]
     async fn test_controller_handle_create_meeting() {
         let metrics = ActorMetrics::new();
-        let handle =
-            MeetingControllerActorHandle::new("mc-test-001".to_string(), metrics, test_secret());
+        let controller_metrics = ControllerMetrics::new();
+        let handle = MeetingControllerActorHandle::new(
+            "mc-test-001".to_string(),
+            metrics,
+            controller_metrics,
+            test_secret(),
+        );
 
         // Create a meeting
         let result = handle.create_meeting("meeting-123".to_string()).await;
@@ -670,8 +684,13 @@ mod tests {
     #[tokio::test]
     async fn test_controller_handle_duplicate_meeting() {
         let metrics = ActorMetrics::new();
-        let handle =
-            MeetingControllerActorHandle::new("mc-test-002".to_string(), metrics, test_secret());
+        let controller_metrics = ControllerMetrics::new();
+        let handle = MeetingControllerActorHandle::new(
+            "mc-test-002".to_string(),
+            metrics,
+            controller_metrics,
+            test_secret(),
+        );
 
         // Create first meeting
         let result = handle.create_meeting("meeting-456".to_string()).await;
@@ -688,8 +707,13 @@ mod tests {
     #[tokio::test]
     async fn test_controller_handle_get_nonexistent_meeting() {
         let metrics = ActorMetrics::new();
-        let handle =
-            MeetingControllerActorHandle::new("mc-test-003".to_string(), metrics, test_secret());
+        let controller_metrics = ControllerMetrics::new();
+        let handle = MeetingControllerActorHandle::new(
+            "mc-test-003".to_string(),
+            metrics,
+            controller_metrics,
+            test_secret(),
+        );
 
         let result = handle.get_meeting("nonexistent".to_string()).await;
         assert!(matches!(result, Err(McError::MeetingNotFound(_))));
@@ -701,8 +725,13 @@ mod tests {
     #[tokio::test]
     async fn test_controller_handle_remove_meeting() {
         let metrics = ActorMetrics::new();
-        let handle =
-            MeetingControllerActorHandle::new("mc-test-004".to_string(), metrics, test_secret());
+        let controller_metrics = ControllerMetrics::new();
+        let handle = MeetingControllerActorHandle::new(
+            "mc-test-004".to_string(),
+            metrics,
+            controller_metrics,
+            test_secret(),
+        );
 
         // Create a meeting
         let result = handle.create_meeting("meeting-789".to_string()).await;
@@ -723,8 +752,13 @@ mod tests {
     #[tokio::test]
     async fn test_controller_handle_status() {
         let metrics = ActorMetrics::new();
-        let handle =
-            MeetingControllerActorHandle::new("mc-test-005".to_string(), metrics, test_secret());
+        let controller_metrics = ControllerMetrics::new();
+        let handle = MeetingControllerActorHandle::new(
+            "mc-test-005".to_string(),
+            metrics,
+            controller_metrics,
+            test_secret(),
+        );
 
         // Get initial status
         let status = handle.get_status().await;
@@ -747,8 +781,13 @@ mod tests {
     #[tokio::test]
     async fn test_controller_handle_shutdown() {
         let metrics = ActorMetrics::new();
-        let handle =
-            MeetingControllerActorHandle::new("mc-test-006".to_string(), metrics, test_secret());
+        let controller_metrics = ControllerMetrics::new();
+        let handle = MeetingControllerActorHandle::new(
+            "mc-test-006".to_string(),
+            metrics,
+            controller_metrics,
+            test_secret(),
+        );
 
         // Create a meeting
         let _ = handle.create_meeting("meeting-shutdown".to_string()).await;
@@ -770,8 +809,13 @@ mod tests {
     #[tokio::test]
     async fn test_controller_cancellation_token() {
         let metrics = ActorMetrics::new();
-        let handle =
-            MeetingControllerActorHandle::new("mc-test-007".to_string(), metrics, test_secret());
+        let controller_metrics = ControllerMetrics::new();
+        let handle = MeetingControllerActorHandle::new(
+            "mc-test-007".to_string(),
+            metrics,
+            controller_metrics,
+            test_secret(),
+        );
 
         assert!(!handle.is_cancelled());
 

@@ -191,6 +191,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let controller_handle = Arc::new(MeetingControllerActorHandle::new(
         config.mc_id.clone(),
         Arc::clone(&actor_metrics),
+        Arc::clone(&controller_metrics),
         master_secret,
     ));
     info!("Actor system initialized");

@@ -956,3 +956,31 @@ Alternative approaches and when to use them:
 - **wiremock `up_to_n_times(N)`**: When you want to test eventual success after N failures
 - **AtomicU32 call counter**: When you need to verify specific retry counts
 - **`#[tokio::test(start_paused = true)]`**: When testing backoff timing deterministically
+
+---
+
+## Pattern: Observability Wiring Tests - Implicit vs Explicit Verification
+**Added**: 2026-02-05
+**Related files**: `crates/meeting-controller/src/actors/metrics.rs`, `crates/meeting-controller/src/observability/metrics.rs`
+
+When adding Prometheus wiring to existing code (ActorMetrics, MailboxMonitor, error counters), the test verification approach differs from new feature tests. The wiring itself is simple (direct function calls, no branching), so comprehensive testing of the wrapper functions is more valuable than testing individual call sites:
+
+**Pattern**:
+1. **Existing tests verify behavior changes** (internal counters update correctly)
+2. **Wrapper module tests verify Prometheus emission** (metrics are recorded)
+3. **Wiring is "exercised" indirectly** when behavior tests pass (functions called = Prometheus emitted)
+
+Example from MC metrics wiring:
+- `test_actor_metrics()` exercises `meeting_created()`, `connection_created()`, etc. - the Prometheus calls inside execute
+- `observability::metrics::tests::test_set_meetings_active()` verifies the Prometheus wrapper works correctly
+- Combined: Metrics wiring is validated without explicit "mock Prometheus and assert it was called" tests
+
+**Why this approach works**:
+- Wrapper functions are simple (gauge/counter emission, no logic)
+- Wiring is simple (direct calls, no conditions)
+- Risk of regression is low (compiler catches if function is removed)
+- Tests remain independent (test suite doesn't depend on metrics infrastructure)
+
+**Gotcha**: This approach works for simple wiring. For complex observability logic (conditional emission, aggregation, batching), add explicit tests that verify the Prometheus calls. Indicator: If the wiring code has if-else branches or complex logic, add dedicated tests for those paths.
+
+**Cardinality risk**: When adding labeled metrics, verify label values are bounded (test explicitly that only expected label values are used, not unbounded user input). The observability module has a `test_cardinality_bounds` test that validates this - leverage existing tests rather than adding new ones.

@@ -247,3 +247,30 @@ src/observability/
 This structure enables future consolidation into a shared observability crate if patterns prove stable.
 
 ---
+
+## Integration: Dual Metrics Systems (ActorMetrics vs ControllerMetrics)
+**Added**: 2026-02-05
+**Related files**: `crates/meeting-controller/src/actors/metrics.rs`, `crates/meeting-controller/src/observability/metrics.rs`
+
+MC uses two separate metrics systems with different consumers:
+
+**ActorMetrics** (Prometheus-facing):
+- Tracks: `active_meetings`, `active_connections`, `actor_panics`, `total_messages_processed`
+- Emits to Prometheus via `prom::set_meetings_active()`, `prom::set_connections_active()`, etc.
+- Consumed by: Grafana dashboards, alerting
+- Updated by: `MeetingControllerActor` (meetings), `MeetingActor` (connections), actor run loops
+
+**ControllerMetrics** (GC heartbeat-facing):
+- Tracks: `current_meetings`, `current_participants`
+- Consumed by: GC heartbeat task via `snapshot()` method
+- NOT emitted to Prometheus (avoids duplicate gauges)
+- Updated by: `MeetingControllerActor` (meetings), `MeetingActor` (participants)
+
+**Why two systems?**
+- Different granularity: ActorMetrics is per-actor-type, ControllerMetrics is aggregate
+- Different consumers: Prometheus scrapes vs GC heartbeat RPC
+- Different update patterns: ActorMetrics from actor lifecycle, ControllerMetrics from meeting operations
+
+**Key rule**: Both track meetings, but only `ActorMetrics` emits to Prometheus. `ControllerMetrics` is solely for GC heartbeats.
+
+---
