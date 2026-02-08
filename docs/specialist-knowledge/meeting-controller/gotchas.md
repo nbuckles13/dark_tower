@@ -163,3 +163,19 @@ The `metrics_exporter_prometheus::PrometheusBuilder::new().install()` call must 
 The `HealthState` struct must be wrapped in `Arc` when shared between the health server and tasks that update state (like the GC registration task). Pattern: `let health_state = Arc::new(HealthState::new()); let health_clone = Arc::clone(&health_state);`. The health server owns one Arc, and the registration task owns another to call `health_state.set_registered(true)` when GC registration succeeds. Using bare `HealthState` without Arc causes ownership/borrow issues across async task boundaries.
 
 ---
+
+## Gotcha: Participant Count Decrement on BOTH Leave AND Disconnect Timeout
+**Added**: 2026-02-05
+**Related files**: `crates/meeting-controller/src/actors/meeting.rs`
+
+When tracking participant counts with `ControllerMetrics`, remember to decrement in TWO places: (1) `handle_leave()` for explicit participant leave, and (2) `check_disconnect_timeouts()` when the 30-second grace period expires and participant is removed. Missing either causes count drift. Note: do NOT decrement on reconnect - reconnection reuses the existing participant slot, so the count stays the same. Pattern: call `controller_metrics.decrement_participants()` anywhere `self.participants.remove()` is called.
+
+---
+
+## Gotcha: fetch_sub Returns Previous Value, Not New Value
+**Added**: 2026-02-05
+**Related files**: `crates/meeting-controller/src/actors/metrics.rs`
+
+Atomic `fetch_sub(1)` returns the value BEFORE subtraction, not after. When emitting the new count to Prometheus after decrement: `let count = self.active_meetings.fetch_sub(1, Ordering::Relaxed).saturating_sub(1);`. The `saturating_sub(1)` calculates the actual new value. Use `saturating_sub` instead of plain subtraction to handle the edge case where the previous value was already 0 (shouldn't happen in correct code, but prevents underflow panic in debug builds).
+
+---

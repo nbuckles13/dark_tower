@@ -337,3 +337,19 @@ Tech debt remaining (acceptable):
 - TECH_DEBT-003: `run_gc_task` and `handle_heartbeat_error` in main.rs not directly testable (acceptable - comprehensive component coverage exists)
 
 ---
+
+## For Observability Specialist: Metrics Wiring Verification
+**Added**: 2026-02-05
+**Related files**: `crates/meeting-controller/src/actors/metrics.rs`, `crates/meeting-controller/src/observability/metrics.rs`
+
+When wiring internal metrics to Prometheus:
+
+1. **Simple wiring** (direct calls): Existing behavior tests provide sufficient coverage - verify the wrapper module has its own tests
+2. **Complex wiring** (conditional emission, aggregation): Add explicit tests for the conditional paths
+3. **Cardinality bounds**: Ensure label values are bounded (verify in wrapper module tests, don't add per-caller tests)
+4. **Missing updates** (tech debt): Document cases where metrics should be updated but aren't (e.g., "ControllerMetrics.current_participants never incremented by MeetingActor")
+
+For MC Phase 4 metrics wiring:
+- ActorMetrics and MailboxMonitor: 100% covered by existing tests exercising the methods
+- ControllerMetrics: Wired methods tested, but discovered `current_participants` is never updated in production (tech debt)
+- Known issue: MeetingActor doesn't call `Arc<ControllerMetrics>::increment/decrement_participants()` on join/leave events

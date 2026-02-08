@@ -230,3 +230,19 @@ For consistency across services, use AC's health endpoint pattern: `/health` for
 For testing HTTP services without starting a full server, use tower's `ServiceExt::oneshot()` method. Pattern: `let response = app.clone().oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap()).await.unwrap();`. This executes a single request through the service stack synchronously. Requires `tower = { version = "0.5", features = ["util"] }` and `http-body-util` for body collection. This is faster and more deterministic than spawning a server and making HTTP requests.
 
 ---
+
+## Pattern: Shared Metrics Propagation Through Actor Hierarchy
+**Added**: 2026-02-05
+**Related files**: `crates/meeting-controller/src/actors/controller.rs`, `crates/meeting-controller/src/actors/meeting.rs`, `crates/meeting-controller/src/main.rs`
+
+When metrics need to be updated from child actors but aggregated at a higher level (e.g., participant count for GC heartbeats), pass `Arc<Metrics>` through the actor hierarchy. Pattern: create shared metrics in main.rs, pass to controller constructor, controller passes clone to each meeting actor's spawn(). Each actor stores its own `Arc` clone. This enables child actors to call `increment()`/`decrement()` methods that update the shared counter atomically. Works for both `ActorMetrics` (Prometheus emission) and `ControllerMetrics` (GC heartbeat reporting).
+
+---
+
+## Pattern: Module Alias for Observability Calls
+**Added**: 2026-02-05
+**Related files**: `crates/meeting-controller/src/actors/metrics.rs`, `crates/meeting-controller/src/observability/metrics.rs`
+
+When internal metrics structs have methods like `meeting_created()` that also need to emit to Prometheus, use a module alias to distinguish the observability call: `use crate::observability::metrics as prom;`. Then internal tracking and Prometheus emission are clearly separated: `self.active_meetings.fetch_add(1, Ordering::Relaxed); prom::set_meetings_active(count as u64);`. This makes code self-documenting and grep-able - all Prometheus emissions use the `prom::` prefix.
+
+---

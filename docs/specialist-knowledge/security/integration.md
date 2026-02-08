@@ -133,3 +133,23 @@ Services using `TokenManager` for OAuth 2.0 token acquisition must follow these 
 Services that require OAuth tokens (GC, MC when calling AC) should initialize TokenManager at startup and fail fast if initial token acquisition fails (don't start serving requests without valid service credentials).
 
 ---
+
+## Integration: Meeting Controller - Observability Metrics Security
+**Added**: 2026-02-05
+**Related files**: `crates/meeting-controller/src/actors/metrics.rs`, `crates/meeting-controller/src/observability/metrics.rs`
+
+MC exposes internal metrics to Prometheus per ADR-0023. Security requirements to prevent PII leakage:
+
+1. **No user-identifiable labels**: Metric labels must use only bounded enum values (`actor_type`: controller, meeting, connection). Never use meeting IDs, user IDs, session IDs, or participant IDs as label values.
+
+2. **Aggregate counts only**: Track total active meetings/connections without per-entity breakdown. Prometheus cardinality explosion from unbounded identifiers can crash monitoring.
+
+3. **Internal state separate**: `ControllerMetrics` (used for GC heartbeats) is intentionally NOT exposed to Prometheus to avoid exposing internal operational state.
+
+4. **Cardinality bounds documented**: Each metric function documents allowed label values and cardinality count. All label sources must be type-safe (enums with `as_str()`).
+
+5. **Tracing logs vs metrics**: Actor IDs (e.g., "meeting-123") appear in structured tracing logs for debugging but NEVER in Prometheus labels.
+
+The separation ensures internal operational metrics go to GC (trusted service boundary) while public `/metrics` endpoint exposes only aggregate, PII-free data.
+
+---

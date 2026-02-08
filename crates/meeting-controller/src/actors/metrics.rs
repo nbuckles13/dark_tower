@@ -8,10 +8,19 @@
 //! | Connection | < 50   | 50-200  | > 200    |
 //!
 //! All metrics are emitted with the `mc_` prefix per ADR-0023 naming conventions.
+//!
+//! # Prometheus Integration
+//!
+//! Internal metrics are wired to Prometheus via the observability module:
+//! - `ActorMetrics` updates `mc_meetings_active`, `mc_connections_active`, `mc_actor_panics_total`
+//! - `MailboxMonitor` updates `mc_actor_mailbox_depth`, `mc_messages_dropped_total`
+//! - `ControllerMetrics` is for GC heartbeat reporting only (no Prometheus emission)
 
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tracing::{debug, warn};
+
+use crate::observability::metrics as prom;
 
 /// Mailbox depth thresholds for meeting actors.
 pub const MEETING_MAILBOX_NORMAL: usize = 100;
@@ -107,6 +116,8 @@ impl MailboxMonitor {
     }
 
     /// Record a message being added to the mailbox.
+    ///
+    /// Updates internal tracking and emits to Prometheus gauge.
     pub fn record_enqueue(&self) {
         let new_depth = self.depth.fetch_add(1, Ordering::Relaxed) + 1;
 
@@ -123,6 +134,9 @@ impl MailboxMonitor {
                 Err(actual) => current_peak = actual,
             }
         }
+
+        // Emit to Prometheus
+        prom::set_actor_mailbox_depth(self.actor_type.as_str(), new_depth);
 
         // Check thresholds and log warnings
         let level = self.level_for_depth(new_depth);
@@ -149,14 +163,25 @@ impl MailboxMonitor {
     }
 
     /// Record a message being removed from the mailbox (processed).
+    ///
+    /// Updates internal tracking and emits to Prometheus gauge.
     pub fn record_dequeue(&self) {
-        self.depth.fetch_sub(1, Ordering::Relaxed);
+        let new_depth = self.depth.fetch_sub(1, Ordering::Relaxed).saturating_sub(1);
         self.messages_processed.fetch_add(1, Ordering::Relaxed);
+
+        // Emit to Prometheus
+        prom::set_actor_mailbox_depth(self.actor_type.as_str(), new_depth);
     }
 
     /// Record a message being dropped due to backpressure.
+    ///
+    /// Increments internal counter and emits to Prometheus counter.
     pub fn record_drop(&self) {
         self.messages_dropped.fetch_add(1, Ordering::Relaxed);
+
+        // Emit to Prometheus
+        prom::record_message_dropped(self.actor_type.as_str());
+
         warn!(
             target: "mc.actor.mailbox",
             actor_type = self.actor_type.as_str(),
@@ -318,28 +343,60 @@ impl ActorMetrics {
     }
 
     /// Increment active meeting count.
+    ///
+    /// Updates internal counter and emits to Prometheus gauge.
     pub fn meeting_created(&self) {
-        self.active_meetings.fetch_add(1, Ordering::Relaxed);
+        let count = self.active_meetings.fetch_add(1, Ordering::Relaxed) + 1;
+
+        // Emit to Prometheus (count is u64-safe for realistic meeting counts)
+        prom::set_meetings_active(count as u64);
     }
 
     /// Decrement active meeting count.
+    ///
+    /// Updates internal counter and emits to Prometheus gauge.
     pub fn meeting_removed(&self) {
-        self.active_meetings.fetch_sub(1, Ordering::Relaxed);
+        let count = self
+            .active_meetings
+            .fetch_sub(1, Ordering::Relaxed)
+            .saturating_sub(1);
+
+        // Emit to Prometheus
+        prom::set_meetings_active(count as u64);
     }
 
     /// Increment active connection count.
+    ///
+    /// Updates internal counter and emits to Prometheus gauge.
     pub fn connection_created(&self) {
-        self.active_connections.fetch_add(1, Ordering::Relaxed);
+        let count = self.active_connections.fetch_add(1, Ordering::Relaxed) + 1;
+
+        // Emit to Prometheus
+        prom::set_connections_active(count as u64);
     }
 
     /// Decrement active connection count.
+    ///
+    /// Updates internal counter and emits to Prometheus gauge.
     pub fn connection_closed(&self) {
-        self.active_connections.fetch_sub(1, Ordering::Relaxed);
+        let count = self
+            .active_connections
+            .fetch_sub(1, Ordering::Relaxed)
+            .saturating_sub(1);
+
+        // Emit to Prometheus
+        prom::set_connections_active(count as u64);
     }
 
     /// Record an actor panic.
+    ///
+    /// Increments internal counter and emits to Prometheus counter.
     pub fn record_panic(&self, actor_type: ActorType) {
         self.actor_panics.fetch_add(1, Ordering::Relaxed);
+
+        // Emit to Prometheus
+        prom::record_actor_panic(actor_type.as_str());
+
         tracing::error!(
             target: "mc.actor.panic",
             actor_type = actor_type.as_str(),
