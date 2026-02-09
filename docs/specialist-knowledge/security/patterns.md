@@ -245,6 +245,24 @@ When a configuration accepts potentially insecure values (HTTP URLs, weak parame
 
 ---
 
+## Pattern: Observability Asset Security Review
+**Added**: 2026-02-08
+**Related files**: `infra/grafana/dashboards/*.json`, `infra/docker/prometheus/rules/*.yaml`, `docs/runbooks/*.md`
+
+When reviewing observability assets (dashboards, alerts, runbooks), check for:
+
+1. **Dashboard queries**: Verify PromQL uses only bounded labels (endpoint, status_code, operation), never unbounded PII labels (user_id, meeting_id, email, IP). Aggregate with `sum by(label)` to control cardinality.
+
+2. **Alert annotations**: Annotations should contain only metric values (`{{ $value }}`) and infrastructure identifiers (pod names). Never include user/session identifiers. Pod names like `global-controller-7d9f5b8c4d-abc12` are infrastructure identifiers, not PII.
+
+3. **Runbook commands**: All shell commands should use environment variables for credentials (`$DATABASE_URL`, `${GC_CLIENT_SECRET}`), never hardcoded values. Password placeholders should be obvious (`<password>`, `REPLACE_PASSWORD`). Check for command injection via variable expansion.
+
+4. **Runbook URLs in alerts**: Use HTTPS, section anchors are safe. Placeholder org names need deployment-time replacement.
+
+This pattern applies to all service observability: GC, AC, MC, MH dashboards and runbooks.
+
+---
+
 ## Pattern: Test Infrastructure Security (Mock Credentials)
 **Added**: 2026-01-31
 **Related files**: `crates/meeting-controller/tests/gc_integration.rs`, `crates/global-controller/tests/meeting_tests.rs`

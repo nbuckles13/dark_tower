@@ -456,8 +456,9 @@ async fn test_health_endpoint_is_public(pool: PgPool) -> Result<()> {
 
     assert_eq!(response.status(), 200);
 
-    let body: serde_json::Value = response.json().await?;
-    assert_eq!(body["status"], "healthy");
+    // /health returns plain text "OK" for Kubernetes liveness probes
+    let body = response.text().await?;
+    assert_eq!(body, "OK");
 
     Ok(())
 }

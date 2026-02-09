@@ -1,0 +1,239 @@
+# Prometheus alerting rules for Global Controller
+#
+# Severity levels:
+# - critical: Page on-call immediately, service degradation or outage
+# - warning: Notify but don't page, investigate during business hours
+#
+# All alerts link to sections in the consolidated incident response runbook:
+# docs/runbooks/gc-incident-response.md
+
+groups:
+  - name: gc-service-critical
+    interval: 30s
+    rules:
+      # ====================================================================
+      # CRITICAL ALERTS - Page on-call immediately
+      # ====================================================================
+
+      - alert: GCDown
+        expr: |
+          up{job="global-controller"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          service: global-controller
+          component: infrastructure
+        annotations:
+          summary: "Global Controller service is down"
+          description: "Global Controller has no running pods for 1 minute. All meeting join requests are failing."
+          impact: "Users cannot join meetings. Complete service outage."
+          runbook_url: "https://github.com/yourorg/dark_tower/blob/main/docs/runbooks/gc-incident-response.md#scenario-4-complete-service-outage"
+
+      - alert: GCHighErrorRate
+        expr: |
+          (
+            sum(rate(gc_http_requests_total{status_code=~"[45].."}[5m]))
+            /
+            sum(rate(gc_http_requests_total[5m]))
+          ) > 0.01
+        for: 5m
+        labels:
+          severity: critical
+          service: global-controller
+          component: http
+        annotations:
+          summary: "GC error rate above SLO ({{ $value | humanizePercentage }})"
+          description: "Global Controller error rate is {{ $value | humanizePercentage }}, exceeding 1% SLO threshold for 5 minutes. This violates the 99.9% availability SLO."
+          impact: "Increased user errors. Error budget burning rapidly."
+          runbook_url: "https://github.com/yourorg/dark_tower/blob/main/docs/runbooks/gc-incident-response.md#scenario-5-high-error-rate"
+
+      - alert: GCHighLatency
+        expr: |
+          histogram_quantile(0.95,
+            sum by(le) (rate(gc_http_request_duration_seconds_bucket[5m]))
+          ) > 0.200
+        for: 5m
+        labels:
+          severity: critical
+          service: global-controller
+          component: http
+        annotations:
+          summary: "GC p95 latency above SLO ({{ $value }}s > 200ms)"
+          description: "Global Controller p95 HTTP latency is {{ $value }}s, exceeding 200ms SLO for 5 minutes."
+          impact: "Slow user experience during meeting join. SLO violation."
+          runbook_url: "https://github.com/yourorg/dark_tower/blob/main/docs/runbooks/gc-incident-response.md#scenario-2-high-latency--slow-responses"
+
+      - alert: GCMCAssignmentSlow
+        expr: |
+          histogram_quantile(0.95,
+            sum by(le) (rate(gc_mc_assignment_duration_seconds_bucket[5m]))
+          ) > 0.020
+        for: 5m
+        labels:
+          severity: critical
+          service: global-controller
+          component: mc-assignment
+        annotations:
+          summary: "MC assignment p95 latency above SLO ({{ $value }}s > 20ms)"
+          description: "MC assignment latency is {{ $value }}s, exceeding 20ms SLO for 5 minutes. This is the critical path for meeting joins."
+          impact: "Slow meeting join experience. May indicate MC capacity or database issues."
+          runbook_url: "https://github.com/yourorg/dark_tower/blob/main/docs/runbooks/gc-incident-response.md#scenario-3-mc-assignment-failures"
+
+      - alert: GCDatabaseDown
+        expr: |
+          (
+            sum(rate(gc_db_queries_total{status="error"}[1m]))
+            /
+            sum(rate(gc_db_queries_total[1m]))
+          ) > 0.5
+        for: 1m
+        labels:
+          severity: critical
+          service: global-controller
+          component: database
+        annotations:
+          summary: "GC database connection failure ({{ $value | humanizePercentage }} error rate)"
+          description: "Global Controller cannot connect to PostgreSQL. Database query error rate is {{ $value | humanizePercentage }} for 1 minute."
+          impact: "All GC operations failing. Complete service outage."
+          runbook_url: "https://github.com/yourorg/dark_tower/blob/main/docs/runbooks/gc-incident-response.md#scenario-1-database-connection-failures"
+
+      - alert: GCErrorBudgetBurnRateCritical
+        expr: |
+          (
+            sum(rate(gc_http_requests_total{status_code=~"[45].."}[1h]))
+            /
+            sum(rate(gc_http_requests_total[1h]))
+          ) / 0.001 > 10
+        for: 1h
+        labels:
+          severity: critical
+          service: global-controller
+          component: slo
+        annotations:
+          summary: "GC error budget burning at {{ $value }}x rate"
+          description: "Error budget is burning at {{ $value }}x the sustainable rate. At this rate, the 30-day error budget will be exhausted in less than 3 days."
+          impact: "SLO at risk. Urgent investigation required."
+          runbook_url: "https://github.com/yourorg/dark_tower/blob/main/docs/runbooks/gc-incident-response.md#scenario-5-high-error-rate"
+
+  - name: gc-service-warning
+    interval: 60s
+    rules:
+      # ====================================================================
+      # WARNING ALERTS - Notify but don't page
+      # ====================================================================
+
+      - alert: GCHighMemory
+        expr: |
+          (
+            container_memory_usage_bytes{pod=~"global-controller-.*"}
+            /
+            container_spec_memory_limit_bytes{pod=~"global-controller-.*"}
+          ) > 0.85
+        for: 10m
+        labels:
+          severity: warning
+          service: global-controller
+          component: infrastructure
+        annotations:
+          summary: "GC memory usage high ({{ $value | humanizePercentage }})"
+          description: "Global Controller pod {{ $labels.pod }} memory usage is {{ $value | humanizePercentage }} for 10 minutes."
+          impact: "Risk of OOM kill. May need to increase memory limits or investigate leak."
+          runbook_url: "https://github.com/yourorg/dark_tower/blob/main/docs/runbooks/gc-incident-response.md#scenario-6-resource-pressure"
+
+      - alert: GCHighCPU
+        expr: |
+          rate(container_cpu_usage_seconds_total{pod=~"global-controller-.*"}[5m]) > 0.80
+        for: 5m
+        labels:
+          severity: warning
+          service: global-controller
+          component: infrastructure
+        annotations:
+          summary: "GC CPU usage high ({{ $value | humanizePercentage }})"
+          description: "Global Controller pod {{ $labels.pod }} CPU usage is {{ $value | humanizePercentage }} for 5 minutes."
+          impact: "High CPU may increase latency. Consider scaling horizontally."
+          runbook_url: "https://github.com/yourorg/dark_tower/blob/main/docs/runbooks/gc-incident-response.md#scenario-6-resource-pressure"
+
+      - alert: GCMCAssignmentFailures
+        expr: |
+          (
+            sum(rate(gc_mc_assignments_total{status!="success"}[5m]))
+            /
+            sum(rate(gc_mc_assignments_total[5m]))
+          ) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+          service: global-controller
+          component: mc-assignment
+        annotations:
+          summary: "MC assignment failure rate high ({{ $value | humanizePercentage }})"
+          description: "MC assignment failures are {{ $value | humanizePercentage }} for 5 minutes. This may indicate MC capacity or connectivity issues."
+          impact: "Some users unable to join meetings. Investigate MC health and capacity."
+          runbook_url: "https://github.com/yourorg/dark_tower/blob/main/docs/runbooks/gc-incident-response.md#scenario-3-mc-assignment-failures"
+
+      - alert: GCDatabaseSlow
+        expr: |
+          histogram_quantile(0.99,
+            sum by(le) (rate(gc_db_query_duration_seconds_bucket[5m]))
+          ) > 0.050
+        for: 5m
+        labels:
+          severity: warning
+          service: global-controller
+          component: database
+        annotations:
+          summary: "GC database queries slow (p99: {{ $value }}s > 50ms)"
+          description: "Database query p99 latency is {{ $value }}s, exceeding 50ms threshold for 5 minutes."
+          impact: "Slow database queries may cause HTTP latency SLO violations. Investigate slow queries."
+          runbook_url: "https://github.com/yourorg/dark_tower/blob/main/docs/runbooks/gc-incident-response.md#scenario-1-database-connection-failures"
+
+      - alert: GCTokenRefreshFailures
+        expr: |
+          (
+            sum(rate(gc_token_refresh_total{status="error"}[5m]))
+            /
+            sum(rate(gc_token_refresh_total[5m]))
+          ) > 0.10
+        for: 5m
+        labels:
+          severity: warning
+          service: global-controller
+          component: auth
+        annotations:
+          summary: "GC token refresh failure rate high ({{ $value | humanizePercentage }})"
+          description: "Token refresh failures are {{ $value | humanizePercentage }} for 5 minutes. GC may lose ability to call MC/MH if token expires."
+          impact: "Risk of authentication failures for GC->MC/MH calls. Check AC service health."
+          runbook_url: "https://github.com/yourorg/dark_tower/blob/main/docs/runbooks/gc-incident-response.md#scenario-7-token-refresh-failures"
+
+      - alert: GCErrorBudgetBurnRateWarning
+        expr: |
+          (
+            sum(rate(gc_http_requests_total{status_code=~"[45].."}[6h]))
+            /
+            sum(rate(gc_http_requests_total[6h]))
+          ) / 0.001 > 5
+        for: 6h
+        labels:
+          severity: warning
+          service: global-controller
+          component: slo
+        annotations:
+          summary: "GC error budget burning at {{ $value }}x rate"
+          description: "Error budget is burning at {{ $value }}x the sustainable rate for 6 hours. At this rate, the 30-day error budget will be exhausted in less than 6 days."
+          impact: "SLO at risk if trend continues. Investigate error causes."
+          runbook_url: "https://github.com/yourorg/dark_tower/blob/main/docs/runbooks/gc-incident-response.md#scenario-5-high-error-rate"
+
+      - alert: GCPodRestartingFrequently
+        expr: |
+          rate(kube_pod_container_status_restarts_total{pod=~"global-controller-.*"}[1h]) > 0.016
+        for: 5m
+        labels:
+          severity: warning
+          service: global-controller
+          component: infrastructure
+        annotations:
+          summary: "GC pod {{ $labels.pod }} restarting frequently"
+          description: "Pod {{ $labels.pod }} has restarted {{ $value }} times per hour. This may indicate crashes, OOM kills, or liveness probe failures."
+          impact: "Service instability. Investigate logs for crash causes."
+          runbook_url: "https://github.com/yourorg/dark_tower/blob/main/docs/runbooks/gc-incident-response.md#scenario-4-complete-service-outage"

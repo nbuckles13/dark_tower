@@ -178,21 +178,41 @@ mod tests {
     use super::*;
 
     #[sqlx::test(migrations = "../../migrations")]
-    async fn test_server_spawns_successfully(pool: PgPool) -> Result<(), anyhow::Error> {
+    async fn test_health_endpoint_liveness(pool: PgPool) -> Result<(), anyhow::Error> {
         let server = TestGcServer::spawn(pool).await?;
 
         // Verify server is accessible
         assert!(server.url().starts_with("http://127.0.0.1:"));
 
-        // Verify health endpoint works
+        // Verify liveness endpoint returns plain text "OK"
         let response = reqwest::get(&format!("{}/health", server.url())).await?;
         assert_eq!(response.status(), 200);
 
-        // Verify response body
+        // Verify response is plain text "OK" (not JSON)
+        let body = response.text().await?;
+        assert_eq!(body, "OK");
+
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_readiness_endpoint_checks_dependencies(
+        pool: PgPool,
+    ) -> Result<(), anyhow::Error> {
+        let server = TestGcServer::spawn(pool).await?;
+
+        // Verify readiness endpoint returns JSON with dependency status
+        let response = reqwest::get(&format!("{}/ready", server.url())).await?;
+        assert_eq!(response.status(), 200);
+
+        // Verify response body contains expected fields
         let body: serde_json::Value = response.json().await?;
-        assert_eq!(body["status"], "healthy");
-        assert_eq!(body["region"], "test-region");
+        assert_eq!(body["status"], "ready");
         assert_eq!(body["database"], "healthy");
+        assert_eq!(body["ac_jwks"], "available");
+
+        // Error field should be null or absent when ready
+        assert!(body.get("error").is_none() || body["error"].is_null());
 
         Ok(())
     }

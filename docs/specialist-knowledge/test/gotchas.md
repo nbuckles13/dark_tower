@@ -442,3 +442,22 @@ When reviewing code with explicit error handling (match arms, if-else branches f
 **Why this happens**: Developers write defensive error handling during implementation, then only write happy-path tests. The code "looks complete" with explicit error handling, masking the missing test coverage.
 
 ---
+
+## Gotcha: Endpoint Behavior Changes Require Multi-File Test Updates
+**Added**: 2026-02-08
+**Related files**: `crates/global-controller/tests/auth_tests.rs`, `crates/global-controller/tests/health_tests.rs`
+
+When endpoint behavior changes (e.g., `/health` from JSON to plain text "OK"), tests may exist in MULTIPLE test files that all need updating. In the GC observability review, the `/health` endpoint was tested in:
+- `auth_tests.rs`: `test_health_endpoint_is_public`
+- `health_tests.rs`: `test_health_endpoint_returns_200`, `test_health_endpoint_returns_json`
+
+All three tests expected JSON response but endpoint now returns plain text for Kubernetes liveness probes. The gotcha: fixing one test file and assuming you're done.
+
+**Prevention pattern**:
+1. When changing endpoint behavior, search all test files: `grep -r "health" crates/*/tests/`
+2. Check for both direct endpoint tests AND tests that use the endpoint as setup
+3. Verify test names match updated behavior (rename `test_health_endpoint_returns_json` to `test_ready_endpoint_returns_json` when testing `/ready` instead)
+
+This is especially common for health/ready endpoints which are often tested as "works without auth" examples in auth test suites.
+
+---
