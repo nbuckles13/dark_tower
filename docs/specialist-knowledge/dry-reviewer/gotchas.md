@@ -111,3 +111,28 @@ This file captures pitfalls and anti-patterns discovered during DRY reviews.
 **When reviewing**: Focus on function/algorithm duplication, not metric naming conventions.
 
 ---
+
+## Infrastructure Artifacts Follow Reference Pattern, Not DRY
+
+**Added**: 2026-02-08
+**Related files**: `infra/grafana/dashboards/gc-overview.json`, `infra/docker/prometheus/rules/gc-alerts.yaml`, `docs/runbooks/gc-deployment.md`, `docs/runbooks/gc-incident-response.md`
+
+**Gotcha**: Infrastructure artifacts (Grafana dashboards, Prometheus alerts, operational runbooks) follow a **reference pattern** approach where:
+- First implementation (AC) establishes the pattern
+- Subsequent implementations (GC, MC, MH) follow the same structure with service-specific content
+- Structural similarity is **intentional consistency**, not harmful duplication
+
+**This differs from code DRY because**:
+- These artifacts are configuration, not executable code
+- Operators benefit from consistent structure across services
+- Templating tools (Grafonnet, Jsonnet) add build complexity
+- No common crate equivalent exists for infrastructure config
+
+**Classification**:
+- BLOCKER: Never for following the established pattern
+- TECH_DEBT: Boilerplate that could be templated (dashboard JSON, alert YAML)
+- NOT duplication: Service-specific metrics, scenarios, configuration values
+
+**When reviewing**: If new service follows AC/GC pattern exactly but with different service name and metrics, mark as "Positive: Follows Reference Pattern" not as duplication. Only flag TECH_DEBT for boilerplate that would benefit from templating.
+
+---

@@ -38,7 +38,8 @@ This ADR establishes **requirements and patterns**. Living documentation is main
 |----------|-------|----------|---------|
 | Service Metrics Catalog | Observability + Service specialists | `docs/observability/metrics/` | Definitive list of all metrics |
 | SLO Definitions | Observability + Operations | `docs/observability/slos.md` | Current SLO targets |
-| Alert Definitions | Operations | `docs/runbooks/alerts/` | Alert configs + runbooks together |
+| Alert Definitions | Operations | `infra/docker/prometheus/rules/` | Prometheus alert rule files (YAML) |
+| Runbooks | Operations | `docs/runbooks/` | Operational runbooks (linked from alerts) |
 | Dashboard Specs | Observability | `infra/grafana/dashboards/` | JSON dashboard definitions |
 | Span Catalog | Observability + Service specialists | `docs/observability/spans/` | Per-service span documentation |
 
@@ -274,15 +275,52 @@ mh.packet.receive
 
 ### 5. Alert Requirements
 
-> **Note**: Alert definitions and runbooks are maintained together in `docs/runbooks/alerts/`. Each alert file contains the alert configuration and its runbook.
+#### File Organization (REQUIRED)
+
+- **Alert definitions**: `infra/docker/prometheus/rules/{service}-alerts.yaml` (Prometheus YAML format)
+- **Runbooks**: `docs/runbooks/{service}-*.md` (Markdown format)
+- **Linking**: Alert annotations include `runbook_url` pointing to relevant runbook
+
+**Rationale**: Prometheus requires YAML alert rule files. Co-locating alerts and runbooks in a single file would require custom tooling to split them. Separate files allow standard Prometheus tooling (promtool, Alertmanager) while maintaining clear links via annotations.
+
+#### Runbook Organization Pattern (REQUIRED)
+
+Each service should have **two primary runbooks** following the AC service pattern:
+
+1. **Deployment Runbook**: `{service}-deployment.md`
+   - Pre-deployment checklist
+   - Deployment steps (rolling update procedures)
+   - Rollback procedures
+   - Configuration reference (environment variables, secrets, ConfigMaps)
+   - Common deployment issues and fixes
+   - Smoke tests
+   - Monitoring and verification
+
+2. **Incident Response Runbook**: `{service}-incident-response.md`
+   - Severity classification matrix
+   - Escalation paths and contact information
+   - Common failure scenarios (typically 5-10 scenarios per service)
+   - Diagnostic commands for each scenario
+   - Recovery procedures
+   - Postmortem template
+
+**Additional runbooks** may be created for:
+- Cross-service concerns (e.g., `database-backup-restore.md`, `kubernetes-pod-crashes.md`)
+- Complex subsystems requiring detailed procedures (e.g., `{service}-key-rotation.md`)
+
+**Rationale**: Two mega-runbooks provide comprehensive operational coverage while remaining navigable. Each failure scenario is a section within the incident response runbook, with table of contents for quick access. This pattern reduces maintenance burden (one place to update) while providing complete operational guidance.
 
 #### Alert Structure (REQUIRED)
 
 Every alert must include:
-- **Alert name**: Following pattern `{SERVICE}-{NUMBER}` (e.g., AC-001)
-- **Severity**: Critical, Warning, or Info
-- **Condition**: PromQL expression
-- **Runbook**: Investigation steps and remediation actions (in same file)
+- **Alert name**: Following pattern `{Service}{Condition}` (e.g., ACHighLatency, GCDown)
+- **Severity**: critical or warning (labels: `severity: critical` or `severity: warning`)
+- **Condition**: PromQL expression with appropriate threshold
+- **Annotations**:
+  - `summary`: Brief description of what fired
+  - `description`: Detailed description with metric values
+  - `runbook_url`: Link to relevant section in incident response runbook
+  - `impact`: User/business impact statement
 
 #### Alert Routing Matrix (REQUIRED)
 
@@ -298,20 +336,49 @@ Every alert must include:
 - Severity bumping: Warning → Critical if firing > 30 minutes
 - Volume limit: Max 20 alerts/hour, then suppress and page SRE lead
 
-#### Initial Alerts
+#### Example Alert with Runbook Link
 
-> **Note**: This is the initial set. Operations specialist maintains the full list in `docs/runbooks/alerts/`.
+```yaml
+# infra/docker/prometheus/rules/ac-alerts.yaml
+groups:
+  - name: ac-service-critical
+    interval: 30s
+    rules:
+      - alert: ACHighLatency
+        expr: |
+          histogram_quantile(0.99,
+            rate(ac_token_issuance_duration_seconds_bucket[5m])
+          ) > 0.5
+        for: 5m
+        labels:
+          severity: critical
+          service: ac-service
+          component: token-issuance
+        annotations:
+          summary: "AC token issuance latency exceeded SLO"
+          description: "p99 latency is {{ $value | humanizeDuration }}, exceeding 350ms SLO"
+          impact: "Slow authentication for all services, cascading latency to GC/MC/MH"
+          runbook_url: "https://github.com/{ORG}/{REPO}/blob/main/docs/runbooks/ac-service-incident-response.md#scenario-3-high-latency--slow-responses"
+```
 
-- `AC-001`: Token issuance latency SLO breach
-- `AC-002`: Token validation error rate high
-- `AC-003`: Key rotation failed
-- `SYS-001`: Error budget burn rate critical
-- `SYS-002`: Load shedding active
-- `SEC-001`: High rate limit denials
+**Alert Naming Convention**: `{Service}{Condition}` format (e.g., ACHighLatency, GCDown, MCSessionFailures, MHHighJitter)
+
+**Initial Alert Catalog** (maintained in alert rule files):
+- AC: `ACDown`, `ACHighLatency`, `ACHighErrorRate`, `ACKeyRotationFailed`, `ACDatabaseConnectionFailed`
+- GC: `GCDown`, `GCHighLatency`, `GCHighErrorRate`, `GCMCAssignmentFailures`, `GCDatabaseIssues`
+- MC: (to be defined during MC implementation)
+- MH: (to be defined during MH implementation)
 
 ### 6. Dashboard Requirements
 
-> **Note**: Dashboard JSON files are maintained in `infra/grafana/dashboards/`. The following establishes requirements, not the definitive list.
+#### File Organization (REQUIRED)
+
+- **Location**: `infra/grafana/dashboards/{service}-{purpose}.json`
+- **Format**: Grafana JSON dashboard definition (raw JSON, not Grafonnet)
+- **Datasources**: Reference datasource UIDs from `infra/grafana/provisioning/datasources/datasources.yaml`
+- **Documentation**: Catalog maintained in `docs/observability/dashboards.md`
+
+**Rationale**: Raw JSON dashboards work in both Docker Compose (volume-mounted) and Kubernetes (ConfigMap-mounted) without additional build steps. Grafana provisioning auto-loads dashboards from this directory.
 
 #### Required Dashboards
 

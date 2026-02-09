@@ -100,11 +100,30 @@ echo ""
 # -----------------------------------------------------------------------------
 print_section "Check 4: All referenced datasource UIDs are defined"
 
-# Extract referenced UIDs from dashboards (excluding built-in "-- Grafana --" and dashboard IDs)
-referenced_uids=$(grep -rho '"uid": "[^"]*"' "$DASHBOARD_DIR"/*.json 2>/dev/null | \
-    sed 's/"uid": "//g; s/"//g' | \
+# Check if jq is available for proper JSON parsing
+if ! command -v jq &> /dev/null; then
+    print_warning "jq not found - skipping datasource UID validation"
+    echo "Install jq for proper Grafana dashboard validation"
+    echo ""
+    print_header "Summary"
+    print_elapsed_time
+    echo ""
+    echo -e "${GREEN}Skipped - jq not available${NC}"
+    exit 0
+fi
+
+# Extract datasource UIDs from panels using jq (proper JSON parsing)
+# This extracts only UIDs from "datasource": {"uid": "..."} contexts,
+# excluding dashboard UIDs at root level and other non-datasource UIDs
+referenced_uids=$(find "$DASHBOARD_DIR" -name "*.json" -exec jq -r '
+    .. |
+    objects |
+    select(has("datasource")) |
+    .datasource |
+    select(type == "object") |
+    .uid // empty
+' {} \; 2>/dev/null | \
     grep -v "^-- Grafana --$" | \
-    grep -v "^ac-service-dashboard$" | \
     sort -u || true)
 
 if [ -z "$referenced_uids" ]; then
