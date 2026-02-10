@@ -263,6 +263,32 @@ This pattern applies to all service observability: GC, AC, MC, MH dashboards and
 
 ---
 
+## Pattern: Metric Label Security for Cardinality and Privacy
+**Added**: 2026-02-09
+**Related files**: `crates/global-controller/src/observability/metrics.rs`, `crates/global-controller/src/services/mh_selection.rs`
+
+When instrumenting code with metrics (Prometheus counters/histograms), enforce cardinality bounds and privacy at the metric recording site:
+
+1. **Label value bounding**: Use only enum-derived or fixed string values for labels. Never use unbounded strings (user IDs, meeting codes, raw error messages). Example: `status: "success" | "error" | "timeout"`, not `status: error.to_string()`.
+
+2. **Dynamic path normalization**: For endpoint labels, normalize dynamic segments to placeholders BEFORE recording: `/api/v1/meetings/{code}` not `/api/v1/meetings/abc123`. Implement `normalize_endpoint()` function at the metrics layer.
+
+3. **Boolean labels as strings**: Prometheus labels are strings, so boolean flags become `"true"/"false"`. This is inherently bounded (2 values).
+
+4. **Maximum cardinality calculation**: Document expected cardinality per metric. Example: `gc_mh_selections_total` with `status` (3 values) x `has_backup` (2 values) = 6 unique combinations max.
+
+5. **Error semantics preservation**: Record metrics BEFORE error propagation (`?` operator). Pattern:
+   ```rust
+   let result = operation().await;
+   let status = if result.is_ok() { "success" } else { "error" };
+   metrics::record_operation(status, start.elapsed());
+   result? // Propagate after recording
+   ```
+
+**ADR-0011 limits**: Max 1,000 unique label combinations per metric, 5M total time series. Exceeding causes Prometheus scrape failures or memory exhaustion.
+
+---
+
 ## Pattern: Test Infrastructure Security (Mock Credentials)
 **Added**: 2026-01-31
 **Related files**: `crates/meeting-controller/tests/gc_integration.rs`, `crates/global-controller/tests/meeting_tests.rs`

@@ -461,3 +461,31 @@ All three tests expected JSON response but endpoint now returns plain text for K
 This is especially common for health/ready endpoints which are often tested as "works without auth" examples in auth test suites.
 
 ---
+
+## Gotcha: #[allow(dead_code)] on Metrics Functions Signals Missing Wiring
+**Added**: 2026-02-09
+**Related files**: `crates/global-controller/src/observability/metrics.rs`, `crates/global-controller/src/services/mh_selection.rs`
+
+When reviewing observability implementations, `#[allow(dead_code)]` on metric recording functions is a red flag that metrics are defined but NOT wired into production code paths.
+
+**Detection pattern**:
+1. Search metrics.rs for `#[allow(dead_code)]` annotations
+2. For each flagged function, search for call sites in services/repositories
+3. If no call sites exist, the metric is "defined but not wired" (coverage gap)
+
+**GC observability review example**:
+- `record_mh_selection` was defined with `#[allow(dead_code)]`
+- `MhSelectionService::select_mhs_for_meeting` did NOT call it
+- Fix: Wire `record_mh_selection` calls for success (with has_backup label) and error paths
+
+**Contrast with intentional skeleton code**:
+- Skeleton code (Gotcha from 2026-01-14) uses `#[allow(dead_code)]` on enum variants and types planned for future phases
+- Metrics functions are NOT skeleton code - they're defined for immediate use but forgotten during implementation
+
+**Cross-crate dependency exception**:
+Sometimes metrics CAN'T be wired due to architecture. Example: `record_token_refresh` metrics for TokenManager (lives in `common` crate) cannot depend on `global-controller`. In this case:
+1. Remove the unwirable functions from metrics.rs
+2. Document the architectural constraint in code comments
+3. Track as tech debt with options: callback mechanism, feature flag, or metrics trait in common crate
+
+---

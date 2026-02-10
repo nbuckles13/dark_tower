@@ -20,11 +20,13 @@
 //! - Error messages are generic to prevent information leakage
 
 use crate::errors::GcError;
+use crate::observability::metrics;
 use crate::repositories::{weighted_random_select, McAssignment, MeetingAssignmentsRepository};
 use crate::services::mc_client::{McAssignmentResult, McClientTrait, McRejectionReason};
 use crate::services::mh_selection::{MhSelection, MhSelectionService};
 use sqlx::PgPool;
 use std::sync::Arc;
+use std::time::Instant;
 use tracing::instrument;
 
 /// Maximum number of retry attempts for MC rejection per ADR-0010.
@@ -129,6 +131,9 @@ impl McAssignmentService {
         region: &str,
         gc_id: &str,
     ) -> Result<AssignmentWithMh, GcError> {
+        // Start timing for metrics (ADR-0011)
+        let start = Instant::now();
+
         // Step 1: Check for existing healthy assignment
         if let Some(existing) =
             MeetingAssignmentsRepository::get_healthy_assignment(pool, meeting_id, region).await?
@@ -143,6 +148,9 @@ impl McAssignmentService {
             // For existing assignments, we need to return MH info too
             // Select MHs (they may have changed since original assignment)
             let mh_selection = MhSelectionService::select_mhs_for_meeting(pool, region).await?;
+
+            // Record success metrics for reusing existing assignment
+            metrics::record_mc_assignment("success", None, start.elapsed());
 
             return Ok(AssignmentWithMh {
                 mc_assignment: existing,
@@ -240,6 +248,9 @@ impl McAssignmentService {
                         "Meeting assigned to MC with MH"
                     );
 
+                    // Record success metrics (ADR-0011)
+                    metrics::record_mc_assignment("success", None, start.elapsed());
+
                     return Ok(AssignmentWithMh {
                         mc_assignment: assignment,
                         mh_selection,
@@ -273,7 +284,16 @@ impl McAssignmentService {
             }
         }
 
-        // All retries exhausted
+        // All retries exhausted - record rejection/error metrics
+        let (status, rejection_reason) = match last_rejection_reason {
+            Some(McRejectionReason::AtCapacity) => ("rejected", Some("at_capacity")),
+            Some(McRejectionReason::Draining) => ("rejected", Some("draining")),
+            Some(McRejectionReason::Unhealthy) => ("rejected", Some("unhealthy")),
+            Some(McRejectionReason::Unspecified) => ("rejected", Some("unspecified")),
+            None => ("error", Some("no_mcs_available")),
+        };
+        metrics::record_mc_assignment(status, rejection_reason, start.elapsed());
+
         let reason_str = match last_rejection_reason {
             Some(McRejectionReason::AtCapacity) => "All meeting controllers are at capacity",
             Some(McRejectionReason::Draining) => "All meeting controllers are draining",

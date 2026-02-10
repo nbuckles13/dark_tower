@@ -131,10 +131,6 @@ fn normalize_dynamic_endpoint(path: &str) -> String {
 /// Labels: `status`, `rejection_reason`
 ///
 /// SLO target: p95 < 20ms (ADR-0010)
-///
-/// NOTE: Defined per ADR-0011 for MC assignment metrics. Will be wired in as
-/// instrumentation is expanded across services.
-#[allow(dead_code)]
 pub fn record_mc_assignment(status: &str, rejection_reason: Option<&str>, duration: Duration) {
     let reason = rejection_reason.unwrap_or("none");
 
@@ -161,10 +157,6 @@ pub fn record_mc_assignment(status: &str, rejection_reason: Option<&str>, durati
 ///
 /// Operations: select_mc, insert_assignment, update_heartbeat, get_healthy_assignment,
 ///             get_candidate_mcs, atomic_assign, end_assignment, etc.
-///
-/// NOTE: Defined per ADR-0011 for database metrics. Will be wired in as
-/// instrumentation is expanded across repositories.
-#[allow(dead_code)]
 pub fn record_db_query(operation: &str, status: &str, duration: Duration) {
     histogram!("gc_db_query_duration_seconds",
         "operation" => operation.to_string()
@@ -181,38 +173,14 @@ pub fn record_db_query(operation: &str, status: &str, duration: Duration) {
 // ============================================================================
 // Token Manager Metrics (ADR-0010 Section 4a)
 // ============================================================================
-
-/// Record token refresh attempt
-///
-/// Metric: `gc_token_refresh_total`, `gc_token_refresh_duration_seconds`
-/// Labels: `status`
-///
-/// NOTE: Defined per ADR-0010 Section 4a for TokenManager metrics.
-/// Will be wired into common/token_manager.rs.
-#[allow(dead_code)]
-pub fn record_token_refresh(status: &str, duration: Duration) {
-    histogram!("gc_token_refresh_duration_seconds").record(duration.as_secs_f64());
-
-    counter!("gc_token_refresh_total",
-        "status" => status.to_string()
-    )
-    .increment(1);
-}
-
-/// Record token refresh failure by error type
-///
-/// Metric: `gc_token_refresh_failures_total`
-/// Labels: `error_type`
-///
-/// NOTE: Defined per ADR-0010 Section 4a for TokenManager metrics.
-/// Will be wired into common/token_manager.rs.
-#[allow(dead_code)]
-pub fn record_token_refresh_failure(error_type: &str) {
-    counter!("gc_token_refresh_failures_total",
-        "error_type" => error_type.to_string()
-    )
-    .increment(1);
-}
+//
+// NOTE: Token refresh metrics (record_token_refresh, record_token_refresh_failure)
+// were removed because TokenManager lives in the `common` crate which cannot
+// depend on global-controller. Implementing these metrics requires architectural
+// changes (callback mechanism, feature flag, or metrics trait in common crate).
+//
+// See tech debt TD-GC-001 for tracking.
+// ============================================================================
 
 // ============================================================================
 // Error Metrics
@@ -268,10 +236,6 @@ pub fn record_grpc_mc_call(method: &str, status: &str, duration: Duration) {
 ///
 /// Metric: `gc_mh_selection_duration_seconds`, `gc_mh_selections_total`
 /// Labels: `status`, `has_backup`
-///
-/// NOTE: Defined per ADR-0011 for MH selection metrics. Will be wired into
-/// services/mh_selection.rs as instrumentation is expanded.
-#[allow(dead_code)]
 pub fn record_mh_selection(status: &str, has_backup: bool, duration: Duration) {
     histogram!("gc_mh_selection_duration_seconds",
         "status" => status.to_string()
@@ -438,19 +402,8 @@ mod tests {
         record_db_query("update_heartbeat", "error", Duration::from_millis(50));
     }
 
-    #[test]
-    fn test_record_token_refresh() {
-        record_token_refresh("success", Duration::from_millis(100));
-        record_token_refresh("error", Duration::from_millis(500));
-    }
-
-    #[test]
-    fn test_record_token_refresh_failure() {
-        record_token_refresh_failure("http_error");
-        record_token_refresh_failure("auth_rejected");
-        record_token_refresh_failure("invalid_response");
-        record_token_refresh_failure("timeout");
-    }
+    // Note: Token refresh metrics tests removed - functions moved out of scope
+    // (TokenManager is in common crate, requires architectural changes)
 
     #[test]
     fn test_record_error() {

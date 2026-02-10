@@ -10,8 +10,10 @@
 //! - Uses transactions for multi-step operations where needed
 
 use crate::errors::GcError;
+use crate::observability::metrics;
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
+use std::time::Instant;
 use tracing::instrument;
 
 /// Health status values matching the database enum.
@@ -114,9 +116,11 @@ impl MeetingControllersRepository {
         max_meetings: i32,
         max_participants: i32,
     ) -> Result<(), GcError> {
+        let start = Instant::now();
+
         // Use UPSERT pattern: INSERT ... ON CONFLICT DO UPDATE
         // Using runtime query to avoid compile-time database connection requirement
-        sqlx::query(
+        let query_result = sqlx::query(
             r#"
             INSERT INTO meeting_controllers (
                 controller_id, region, endpoint, grpc_endpoint, webtransport_endpoint,
@@ -143,7 +147,17 @@ impl MeetingControllersRepository {
         .bind(max_meetings)
         .bind(max_participants)
         .execute(pool)
-        .await?;
+        .await;
+
+        // Record DB query metrics (ADR-0011)
+        let status = if query_result.is_ok() {
+            "success"
+        } else {
+            "error"
+        };
+        metrics::record_db_query("register_mc", status, start.elapsed());
+
+        query_result?;
 
         tracing::info!(
             target: "gc.repository.mc",
@@ -180,7 +194,9 @@ impl MeetingControllersRepository {
         current_participants: i32,
         health_status: HealthStatus,
     ) -> Result<bool, GcError> {
-        let result = sqlx::query(
+        let start = Instant::now();
+
+        let query_result = sqlx::query(
             r#"
             UPDATE meeting_controllers
             SET
@@ -197,9 +213,16 @@ impl MeetingControllersRepository {
         .bind(current_participants)
         .bind(health_status.as_db_str())
         .execute(pool)
-        .await?;
+        .await;
 
-        let updated = result.rows_affected() > 0;
+        // Record DB query metrics (ADR-0011)
+        let (status, result) = match query_result {
+            Ok(r) => ("success", Ok(r)),
+            Err(e) => ("error", Err(e)),
+        };
+        metrics::record_db_query("update_heartbeat", status, start.elapsed());
+
+        let updated = result?.rows_affected() > 0;
 
         if updated {
             tracing::debug!(
@@ -239,7 +262,9 @@ impl MeetingControllersRepository {
         pool: &PgPool,
         staleness_threshold_seconds: i64,
     ) -> Result<u64, GcError> {
-        let result = sqlx::query(
+        let start = Instant::now();
+
+        let query_result = sqlx::query(
             r#"
             UPDATE meeting_controllers
             SET
@@ -253,9 +278,16 @@ impl MeetingControllersRepository {
         )
         .bind(staleness_threshold_seconds.to_string())
         .execute(pool)
-        .await?;
+        .await;
 
-        let count = result.rows_affected();
+        // Record DB query metrics (ADR-0011)
+        let (status, result) = match query_result {
+            Ok(r) => ("success", Ok(r)),
+            Err(e) => ("error", Err(e)),
+        };
+        metrics::record_db_query("mark_stale_controllers_unhealthy", status, start.elapsed());
+
+        let count = result?.rows_affected();
 
         if count > 0 {
             tracing::warn!(
@@ -285,8 +317,10 @@ impl MeetingControllersRepository {
         pool: &PgPool,
         controller_id: &str,
     ) -> Result<Option<MeetingController>, GcError> {
+        let start = Instant::now();
+
         // Use sqlx::query_as with explicit struct mapping
-        let row: Option<MeetingControllerRow> = sqlx::query_as(
+        let query_result: Result<Option<MeetingControllerRow>, sqlx::Error> = sqlx::query_as(
             r#"
             SELECT
                 controller_id,
@@ -308,9 +342,16 @@ impl MeetingControllersRepository {
         )
         .bind(controller_id)
         .fetch_optional(pool)
-        .await?;
+        .await;
 
-        Ok(row.map(|r| MeetingController {
+        // Record DB query metrics (ADR-0011)
+        let (status, row) = match query_result {
+            Ok(r) => ("success", Ok(r)),
+            Err(e) => ("error", Err(e)),
+        };
+        metrics::record_db_query("get_controller", status, start.elapsed());
+
+        Ok(row?.map(|r| MeetingController {
             controller_id: r.controller_id,
             region: r.region,
             endpoint: r.endpoint,
