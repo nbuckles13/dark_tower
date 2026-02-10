@@ -1,0 +1,238 @@
+# Prometheus alerting rules for Meeting Controller
+#
+# Severity levels:
+# - critical: Page on-call immediately, service degradation or outage
+# - warning: Notify but don't page, investigate during business hours
+#
+# All alerts link to sections in the consolidated incident response runbook:
+# docs/runbooks/mc-incident-response.md
+
+groups:
+  - name: mc-service-critical
+    interval: 30s
+    rules:
+      # ====================================================================
+      # CRITICAL ALERTS - Page on-call immediately
+      # ====================================================================
+
+      - alert: MCDown
+        expr: |
+          up{job="meeting-controller"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          service: meeting-controller
+          component: infrastructure
+        annotations:
+          summary: "Meeting Controller service is down"
+          description: "Meeting Controller has no running pods for 1 minute. All active meetings are affected."
+          impact: "Users in active meetings may be disconnected. New meeting joins will fail."
+          runbook_url: "https://github.com/yourorg/dark_tower/blob/main/docs/runbooks/mc-incident-response.md#scenario-4-complete-service-outage"
+
+      - alert: MCActorPanic
+        expr: |
+          increase(mc_actor_panics_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+          service: meeting-controller
+          component: actor-system
+        annotations:
+          summary: "MC actor panic detected ({{ $labels.actor_type }})"
+          description: "Actor {{ $labels.actor_type }} has panicked. This is a critical bug that needs immediate investigation."
+          impact: "Affected meetings may be disrupted. Actor supervision should restart the actor, but root cause needs investigation."
+          runbook_url: "https://github.com/yourorg/dark_tower/blob/main/docs/runbooks/mc-incident-response.md#scenario-2-actor-panics"
+
+      - alert: MCHighMailboxDepthCritical
+        expr: |
+          sum by(actor_type) (mc_actor_mailbox_depth) > 500
+        for: 2m
+        labels:
+          severity: critical
+          service: meeting-controller
+          component: actor-system
+        annotations:
+          summary: "MC mailbox depth critical ({{ $labels.actor_type }}: {{ $value }})"
+          description: "Actor {{ $labels.actor_type }} has mailbox depth {{ $value }} (>500) for 2 minutes. Severe backpressure - messages will be dropped."
+          impact: "Message processing severely delayed. Active meetings experiencing significant lag or failures."
+          runbook_url: "https://github.com/yourorg/dark_tower/blob/main/docs/runbooks/mc-incident-response.md#scenario-1-high-mailbox-depth"
+
+      - alert: MCHighLatency
+        expr: |
+          histogram_quantile(0.95,
+            sum by(le) (rate(mc_message_processing_duration_seconds_bucket[5m]))
+          ) > 0.500
+        for: 5m
+        labels:
+          severity: critical
+          service: meeting-controller
+          component: message-processing
+        annotations:
+          summary: "MC p95 message processing latency above SLO ({{ $value }}s > 500ms)"
+          description: "Meeting Controller p95 message processing latency is {{ $value }}s, exceeding 500ms SLO for 5 minutes."
+          impact: "Slow meeting experience. Participants experiencing noticeable delays."
+          runbook_url: "https://github.com/yourorg/dark_tower/blob/main/docs/runbooks/mc-incident-response.md#scenario-5-high-latency"
+
+      - alert: MCHighMessageDropRate
+        expr: |
+          (
+            sum(rate(mc_messages_dropped_total[5m]))
+            /
+            (sum(rate(mc_messages_dropped_total[5m])) + sum(rate(mc_message_processing_duration_seconds_count[5m])))
+          ) > 0.01
+        for: 5m
+        labels:
+          severity: critical
+          service: meeting-controller
+          component: message-processing
+        annotations:
+          summary: "MC message drop rate above SLO ({{ $value | humanizePercentage }})"
+          description: "Meeting Controller is dropping {{ $value | humanizePercentage }} of messages, exceeding 1% SLO threshold for 5 minutes."
+          impact: "Messages being lost. Active meetings affected - participants may miss updates."
+          runbook_url: "https://github.com/yourorg/dark_tower/blob/main/docs/runbooks/mc-incident-response.md#scenario-1-high-mailbox-depth"
+
+      - alert: MCGCHeartbeatFailure
+        expr: |
+          (
+            sum(rate(mc_gc_heartbeat_total{status="error"}[5m]))
+            /
+            sum(rate(mc_gc_heartbeat_total[5m]))
+          ) > 0.5
+        for: 2m
+        labels:
+          severity: critical
+          service: meeting-controller
+          component: gc-integration
+        annotations:
+          summary: "MC-GC heartbeat failures ({{ $value | humanizePercentage }} error rate)"
+          description: "Meeting Controller failing to send heartbeats to Global Controller. Error rate {{ $value | humanizePercentage }} for 2 minutes."
+          impact: "GC may mark MC as unhealthy. New meeting assignments may fail."
+          runbook_url: "https://github.com/yourorg/dark_tower/blob/main/docs/runbooks/mc-incident-response.md#scenario-6-gc-integration-failures"
+
+  - name: mc-service-warning
+    interval: 60s
+    rules:
+      # ====================================================================
+      # WARNING ALERTS - Notify but don't page
+      # ====================================================================
+
+      - alert: MCHighMailboxDepthWarning
+        expr: |
+          sum by(actor_type) (mc_actor_mailbox_depth) > 100
+        for: 5m
+        labels:
+          severity: warning
+          service: meeting-controller
+          component: actor-system
+        annotations:
+          summary: "MC mailbox depth elevated ({{ $labels.actor_type }}: {{ $value }})"
+          description: "Actor {{ $labels.actor_type }} has mailbox depth {{ $value }} (>100) for 5 minutes. Investigate backpressure cause."
+          impact: "Message processing delayed. May escalate to critical if not addressed."
+          runbook_url: "https://github.com/yourorg/dark_tower/blob/main/docs/runbooks/mc-incident-response.md#scenario-1-high-mailbox-depth"
+
+      - alert: MCHighMemory
+        expr: |
+          (
+            container_memory_usage_bytes{pod=~"meeting-controller-.*"}
+            /
+            container_spec_memory_limit_bytes{pod=~"meeting-controller-.*"}
+          ) > 0.85
+        for: 10m
+        labels:
+          severity: warning
+          service: meeting-controller
+          component: infrastructure
+        annotations:
+          summary: "MC memory usage high ({{ $value | humanizePercentage }})"
+          description: "Meeting Controller pod {{ $labels.pod }} memory usage is {{ $value | humanizePercentage }} for 10 minutes."
+          impact: "Risk of OOM kill. May need to investigate memory usage or increase limits."
+          runbook_url: "https://github.com/yourorg/dark_tower/blob/main/docs/runbooks/mc-incident-response.md#scenario-7-resource-pressure"
+
+      - alert: MCHighCPU
+        expr: |
+          rate(container_cpu_usage_seconds_total{pod=~"meeting-controller-.*"}[5m]) > 0.80
+        for: 5m
+        labels:
+          severity: warning
+          service: meeting-controller
+          component: infrastructure
+        annotations:
+          summary: "MC CPU usage high ({{ $value | humanizePercentage }})"
+          description: "Meeting Controller pod {{ $labels.pod }} CPU usage is {{ $value | humanizePercentage }} for 5 minutes."
+          impact: "High CPU may increase message processing latency. Consider scaling horizontally."
+          runbook_url: "https://github.com/yourorg/dark_tower/blob/main/docs/runbooks/mc-incident-response.md#scenario-7-resource-pressure"
+
+      - alert: MCLowConnectionCount
+        expr: |
+          sum(mc_connections_active) < 1 and sum(mc_meetings_active) > 0
+        for: 5m
+        labels:
+          severity: warning
+          service: meeting-controller
+          component: webtransport
+        annotations:
+          summary: "MC has active meetings but no connections"
+          description: "Meeting Controller has {{ $value }} active meetings but no WebTransport connections for 5 minutes."
+          impact: "Meetings may be orphaned. Investigate connection issues."
+          runbook_url: "https://github.com/yourorg/dark_tower/blob/main/docs/runbooks/mc-incident-response.md#scenario-3-meeting-lifecycle-issues"
+
+      - alert: MCMeetingStale
+        expr: |
+          sum(mc_meetings_active) > 0 and
+          sum(rate(mc_message_processing_duration_seconds_count[10m])) == 0
+        for: 10m
+        labels:
+          severity: warning
+          service: meeting-controller
+          component: meeting-lifecycle
+        annotations:
+          summary: "MC has meetings but no message processing"
+          description: "Meeting Controller has active meetings but no messages processed in 10 minutes."
+          impact: "Meetings may be stuck. Investigate meeting state."
+          runbook_url: "https://github.com/yourorg/dark_tower/blob/main/docs/runbooks/mc-incident-response.md#scenario-3-meeting-lifecycle-issues"
+
+      - alert: MCGCHeartbeatWarning
+        expr: |
+          (
+            sum(rate(mc_gc_heartbeat_total{status="error"}[5m]))
+            /
+            sum(rate(mc_gc_heartbeat_total[5m]))
+          ) > 0.10
+        for: 5m
+        labels:
+          severity: warning
+          service: meeting-controller
+          component: gc-integration
+        annotations:
+          summary: "MC-GC heartbeat failure rate elevated ({{ $value | humanizePercentage }})"
+          description: "Meeting Controller heartbeat failures to Global Controller at {{ $value | humanizePercentage }} for 5 minutes."
+          impact: "GC integration may be degraded. Investigate connectivity."
+          runbook_url: "https://github.com/yourorg/dark_tower/blob/main/docs/runbooks/mc-incident-response.md#scenario-6-gc-integration-failures"
+
+      - alert: MCPodRestartingFrequently
+        expr: |
+          rate(kube_pod_container_status_restarts_total{pod=~"meeting-controller-.*"}[1h]) > 0.016
+        for: 5m
+        labels:
+          severity: warning
+          service: meeting-controller
+          component: infrastructure
+        annotations:
+          summary: "MC pod {{ $labels.pod }} restarting frequently"
+          description: "Pod {{ $labels.pod }} has restarted {{ $value }} times per hour. This may indicate crashes, OOM kills, or liveness probe failures."
+          impact: "Service instability. Investigate logs for crash causes."
+          runbook_url: "https://github.com/yourorg/dark_tower/blob/main/docs/runbooks/mc-incident-response.md#scenario-4-complete-service-outage"
+
+      - alert: MCCapacityWarning
+        expr: |
+          sum(mc_meetings_active) > 80
+        for: 10m
+        labels:
+          severity: warning
+          service: meeting-controller
+          component: capacity
+        annotations:
+          summary: "MC approaching capacity ({{ $value }} active meetings)"
+          description: "Meeting Controller has {{ $value }} active meetings, approaching capacity threshold."
+          impact: "May need to scale out or reject new meetings soon."
+          runbook_url: "https://github.com/yourorg/dark_tower/blob/main/docs/runbooks/mc-incident-response.md#scenario-7-resource-pressure"
