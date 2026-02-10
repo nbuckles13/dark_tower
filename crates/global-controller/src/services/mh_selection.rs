@@ -10,9 +10,11 @@
 //! - Error messages are generic to prevent information leakage
 
 use crate::errors::GcError;
+use crate::observability::metrics;
 use crate::repositories::{MediaHandlersRepository, MhCandidate};
 use ring::rand::{SecureRandom, SystemRandom};
 use sqlx::PgPool;
+use std::time::Instant;
 use tracing::instrument;
 
 /// Result of MH selection for a meeting.
@@ -60,6 +62,8 @@ impl MhSelectionService {
         pool: &PgPool,
         region: &str,
     ) -> Result<MhSelection, GcError> {
+        let start = Instant::now();
+
         // Get candidate MHs
         let candidates = MediaHandlersRepository::get_candidate_mhs(pool, region).await?;
 
@@ -69,6 +73,7 @@ impl MhSelectionService {
                 region = %region,
                 "No healthy MHs available for selection"
             );
+            metrics::record_mh_selection("error", false, start.elapsed());
             return Err(GcError::ServiceUnavailable(
                 "No media handlers available in this region".to_string(),
             ));
@@ -126,6 +131,9 @@ impl MhSelectionService {
         } else {
             None
         };
+
+        let has_backup = backup.is_some();
+        metrics::record_mh_selection("success", has_backup, start.elapsed());
 
         Ok(MhSelection {
             primary: primary_info,

@@ -46,10 +46,10 @@ Tracked duplication patterns with assigned IDs for consistent classification.
 ---
 
 ### TD-4: Weighted Random Selection for Load Balancing
-**Added**: 2026-01-24
-**Related files**: `crates/global-controller/src/repositories/media_handlers.rs`, `crates/global-controller/src/repositories/meeting_controllers.rs`
+**Added**: 2026-01-24 | **Updated**: 2026-02-09
+**Related files**: `crates/global-controller/src/services/mh_selection.rs`, `crates/global-controller/src/repositories/meeting_controllers.rs`
 
-Both MH selection and MC selection use weighted random selection based on inverse load ratio: calculate weight as `(1.0 - load_ratio) * 100`, use weighted distribution to select instance. Severity: Low (algorithm is simple, 5-10 lines). Improvement path: Consider extracting to `common::load_balancing::WeightedSelector<T>` trait if a third use case appears (e.g., client load balancing). Timeline: Phase 7+ (when Media Handler internal routing is implemented). Note: Current duplication is acceptable as both implementations are in the same crate (GC) and the code is small.
+Both MH selection and MC selection use weighted random selection based on inverse load ratio: calculate weight as `(1.0 - load_ratio)`, use weighted distribution to select instance. Severity: Low (algorithm is simple, 15-20 lines). Improvement path: Consider extracting to `common::load_balancing::WeightedSelector<T>` trait if a third use case appears (e.g., client load balancing). Timeline: Phase 7+ (when Media Handler internal routing is implemented). Note: Current duplication is acceptable as both implementations are in the same crate (GC) and the code is small. Update 2026-02-09: MH selection now has dedicated service (`mh_selection.rs`) with `weighted_random_select()` function using CSPRNG, confirming pattern stability.
 
 ---
 

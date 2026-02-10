@@ -10,9 +10,11 @@
 //! - Uses atomic operations to prevent race conditions
 
 use crate::errors::GcError;
+use crate::observability::metrics;
 use chrono::{DateTime, Utc};
 use ring::rand::{SecureRandom, SystemRandom};
 use sqlx::PgPool;
+use std::time::Instant;
 use tracing::instrument;
 
 /// Default heartbeat staleness threshold in seconds.
@@ -89,7 +91,9 @@ impl MeetingAssignmentsRepository {
         meeting_id: &str,
         region: &str,
     ) -> Result<Option<McAssignment>, GcError> {
-        let row: Option<McAssignmentRow> = sqlx::query_as(
+        let start = Instant::now();
+
+        let result: Result<Option<McAssignmentRow>, sqlx::Error> = sqlx::query_as(
             r#"
             SELECT
                 ma.meeting_controller_id,
@@ -108,9 +112,16 @@ impl MeetingAssignmentsRepository {
         .bind(region)
         .bind(DEFAULT_HEARTBEAT_STALENESS_SECONDS.to_string())
         .fetch_optional(pool)
-        .await?;
+        .await;
 
-        Ok(row.map(|r| McAssignment {
+        // Record DB query metrics (ADR-0011)
+        let (status, row) = match result {
+            Ok(r) => ("success", Ok(r)),
+            Err(e) => ("error", Err(e)),
+        };
+        metrics::record_db_query("get_healthy_assignment", status, start.elapsed());
+
+        Ok(row?.map(|r| McAssignment {
             mc_id: r.meeting_controller_id,
             grpc_endpoint: r.grpc_endpoint,
             webtransport_endpoint: r.webtransport_endpoint,
@@ -130,7 +141,9 @@ impl MeetingAssignmentsRepository {
         pool: &PgPool,
         region: &str,
     ) -> Result<Vec<McCandidate>, GcError> {
-        let rows: Vec<McCandidateRow> = sqlx::query_as(
+        let start = Instant::now();
+
+        let result: Result<Vec<McCandidateRow>, sqlx::Error> = sqlx::query_as(
             r#"
             SELECT
                 controller_id,
@@ -153,9 +166,16 @@ impl MeetingAssignmentsRepository {
         .bind(DEFAULT_HEARTBEAT_STALENESS_SECONDS.to_string())
         .bind(LOAD_BALANCING_CANDIDATE_COUNT)
         .fetch_all(pool)
-        .await?;
+        .await;
 
-        Ok(rows
+        // Record DB query metrics (ADR-0011)
+        let (status, rows) = match result {
+            Ok(r) => ("success", Ok(r)),
+            Err(e) => ("error", Err(e)),
+        };
+        metrics::record_db_query("get_candidate_mcs", status, start.elapsed());
+
+        Ok(rows?
             .into_iter()
             .map(|r| McCandidate {
                 controller_id: r.controller_id,
@@ -188,6 +208,8 @@ impl MeetingAssignmentsRepository {
         selected_mc: &McCandidate,
         gc_id: &str,
     ) -> Result<McAssignment, GcError> {
+        let start = Instant::now();
+
         // Use INSERT ... ON CONFLICT DO UPDATE to atomically handle:
         // - New assignments (no existing row)
         // - Replacing unhealthy assignments (existing row with unhealthy MC)
@@ -195,7 +217,7 @@ impl MeetingAssignmentsRepository {
         //
         // Note: We use ON CONFLICT DO UPDATE (not DO NOTHING) so that we can
         // conditionally update the row if the existing MC is unhealthy.
-        let result: Option<AtomicAssignResult> = sqlx::query_as(
+        let query_result: Result<Option<AtomicAssignResult>, sqlx::Error> = sqlx::query_as(
             r#"
             INSERT INTO meeting_assignments (meeting_id, meeting_controller_id, region, assigned_by_gc_id)
             VALUES ($1, $3, $2, $4)
@@ -219,9 +241,16 @@ impl MeetingAssignmentsRepository {
         .bind(gc_id)
         .bind(DEFAULT_HEARTBEAT_STALENESS_SECONDS.to_string())
         .fetch_optional(pool)
-        .await?;
+        .await;
 
-        match result {
+        // Record DB query metrics (ADR-0011)
+        let (status, result) = match query_result {
+            Ok(r) => ("success", Ok(r)),
+            Err(e) => ("error", Err(e)),
+        };
+        metrics::record_db_query("atomic_assign", status, start.elapsed());
+
+        match result? {
             Some(_) => {
                 // We won the race - return our assignment
                 // Note: Logging happens at service layer to avoid duplication
@@ -269,7 +298,9 @@ impl MeetingAssignmentsRepository {
         meeting_id: &str,
         region: &str,
     ) -> Result<Option<McAssignment>, GcError> {
-        let row: Option<McAssignmentRow> = sqlx::query_as(
+        let start = Instant::now();
+
+        let query_result: Result<Option<McAssignmentRow>, sqlx::Error> = sqlx::query_as(
             r#"
             SELECT
                 ma.meeting_controller_id,
@@ -285,9 +316,16 @@ impl MeetingAssignmentsRepository {
         .bind(meeting_id)
         .bind(region)
         .fetch_optional(pool)
-        .await?;
+        .await;
 
-        Ok(row.map(|r| McAssignment {
+        // Record DB query metrics (ADR-0011)
+        let (status, row) = match query_result {
+            Ok(r) => ("success", Ok(r)),
+            Err(e) => ("error", Err(e)),
+        };
+        metrics::record_db_query("get_current_assignment", status, start.elapsed());
+
+        Ok(row?.map(|r| McAssignment {
             mc_id: r.meeting_controller_id,
             grpc_endpoint: r.grpc_endpoint,
             webtransport_endpoint: r.webtransport_endpoint,
@@ -309,7 +347,9 @@ impl MeetingAssignmentsRepository {
         meeting_id: &str,
         region: Option<&str>,
     ) -> Result<u64, GcError> {
-        let result = match region {
+        let start = Instant::now();
+
+        let query_result = match region {
             Some(r) => {
                 sqlx::query(
                     r#"
@@ -323,7 +363,7 @@ impl MeetingAssignmentsRepository {
                 .bind(meeting_id)
                 .bind(r)
                 .execute(pool)
-                .await?
+                .await
             }
             None => {
                 sqlx::query(
@@ -336,11 +376,18 @@ impl MeetingAssignmentsRepository {
                 )
                 .bind(meeting_id)
                 .execute(pool)
-                .await?
+                .await
             }
         };
 
-        let count = result.rows_affected();
+        // Record DB query metrics (ADR-0011)
+        let (status, result) = match query_result {
+            Ok(r) => ("success", Ok(r)),
+            Err(e) => ("error", Err(e)),
+        };
+        metrics::record_db_query("end_assignment", status, start.elapsed());
+
+        let count = result?.rows_affected();
 
         if count > 0 {
             tracing::info!(
@@ -376,6 +423,7 @@ impl MeetingAssignmentsRepository {
         inactivity_hours: i32,
         batch_size: Option<i64>,
     ) -> Result<u64, GcError> {
+        let start = Instant::now();
         let limit = batch_size.unwrap_or(DEFAULT_CLEANUP_BATCH_SIZE);
 
         // Mark as ended any assignment that:
@@ -386,7 +434,7 @@ impl MeetingAssignmentsRepository {
         // Note: We only end assignments with unhealthy MCs to avoid
         // incorrectly ending active meetings.
         // LIMIT prevents long-running transactions in pathological cases.
-        let result = sqlx::query(
+        let query_result = sqlx::query(
             r#"
             UPDATE meeting_assignments ma
             SET ended_at = NOW()
@@ -407,9 +455,16 @@ impl MeetingAssignmentsRepository {
         .bind(inactivity_hours.to_string())
         .bind(limit)
         .execute(pool)
-        .await?;
+        .await;
 
-        let count = result.rows_affected();
+        // Record DB query metrics (ADR-0011)
+        let (status, result) = match query_result {
+            Ok(r) => ("success", Ok(r)),
+            Err(e) => ("error", Err(e)),
+        };
+        metrics::record_db_query("end_stale_assignments", status, start.elapsed());
+
+        let count = result?.rows_affected();
 
         if count > 0 {
             tracing::info!(
@@ -440,10 +495,11 @@ impl MeetingAssignmentsRepository {
         retention_days: i32,
         batch_size: Option<i64>,
     ) -> Result<u64, GcError> {
+        let start = Instant::now();
         let limit = batch_size.unwrap_or(DEFAULT_CLEANUP_BATCH_SIZE);
 
         // LIMIT via subquery prevents long-running transactions in pathological cases.
-        let result = sqlx::query(
+        let query_result = sqlx::query(
             r#"
             DELETE FROM meeting_assignments
             WHERE meeting_id IN (
@@ -456,9 +512,16 @@ impl MeetingAssignmentsRepository {
         .bind(retention_days.to_string())
         .bind(limit)
         .execute(pool)
-        .await?;
+        .await;
 
-        let count = result.rows_affected();
+        // Record DB query metrics (ADR-0011)
+        let (status, result) = match query_result {
+            Ok(r) => ("success", Ok(r)),
+            Err(e) => ("error", Err(e)),
+        };
+        metrics::record_db_query("cleanup_old_assignments", status, start.elapsed());
+
+        let count = result?.rows_affected();
 
         if count > 0 {
             tracing::info!(

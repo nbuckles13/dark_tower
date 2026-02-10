@@ -232,3 +232,42 @@ When making a dependency optional (e.g., `mc_client: Option<Arc<dyn McClientTrai
 Rust binaries (`main.rs`) have their own module tree separate from the library (`lib.rs`). Adding `pub mod observability;` to `lib.rs` does NOT make it available in `main.rs`. You must ALSO add `mod observability;` to `main.rs` for the binary to see the module. Symptom: `unresolved import` errors when trying to use modules that exist in lib.rs. Solution: Declare modules in both files, or import from the library crate (`use global_controller::observability;`).
 
 ---
+
+## Gotcha: Cross-Crate Metrics Cannot Use Crate-Local Recording Functions
+**Added**: 2026-02-09, **Updated**: 2026-02-09
+**Related files**: `crates/global-controller/src/observability/metrics.rs`, `crates/common/src/token_manager.rs`
+
+Metrics recording functions in one crate cannot be called from another crate without creating a dependency cycle. Example: GC's `record_token_refresh` cannot instrument `common::TokenManager` because `common` cannot depend on `global-controller` (would be circular).
+
+**Resolution chosen**: Remove unwireable metric functions rather than leaving dead code. The `record_token_refresh` and `record_token_refresh_failure` functions were deleted from `metrics.rs` since they couldn't be wired without architectural changes.
+
+**Future solutions** (when cross-crate metrics are needed):
+1. **Callback mechanism**: Pass a closure/trait object to TokenManager for metrics emission
+2. **Metrics trait**: Define a trait in `common`, implement in consuming crates
+3. **Event observer**: TokenManager emits events, GC subscribes and records metrics
+
+Tech debt TD-GC-001 tracks this for future implementation. The chosen approach should be decided at the architectural level as it affects all cross-crate metrics.
+
+---
+
+## Gotcha: Duration Import Not Needed with start.elapsed()
+**Added**: 2026-02-09
+**Related files**: `crates/global-controller/src/services/mc_assignment.rs`
+
+When timing operations with `Instant::now()` + `start.elapsed()`, you do NOT need to import `std::time::Duration`. The `elapsed()` method returns `Duration` automatically. Importing `Duration` when you only use `elapsed()` triggers a `unused_imports` warning:
+
+```rust
+// Wrong: causes unused import warning
+use std::time::{Duration, Instant};
+
+// Correct: Duration not needed
+use std::time::Instant;
+
+let start = Instant::now();
+// ...
+metrics::record_db_query("op", "success", start.elapsed()); // Returns Duration
+```
+
+Only import `Duration` if you're constructing durations explicitly (e.g., `Duration::from_secs(5)`).
+
+---

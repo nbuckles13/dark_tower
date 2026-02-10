@@ -156,6 +156,24 @@ let raw_bytes = master_secret.expose_secret(); // Don't store this!
 
 ---
 
+## Gotcha: Cross-Crate Metrics Dependencies Create Observability Gaps
+**Added**: 2026-02-09
+**Related files**: `crates/global-controller/src/observability/metrics.rs`, `crates/common/src/token_manager.rs`
+
+Shared crates (e.g., `common`) cannot depend on service-specific observability modules (e.g., `global-controller/observability`). This creates gaps where security-relevant operations in shared code lack metrics.
+
+**Example**: `TokenManager` in `common` crate handles OAuth token refresh. GC's `metrics.rs` defined `record_token_refresh()` but couldn't wire it because `common` can't import `global-controller`.
+
+**Solutions** (choose based on complexity):
+1. **Callback mechanism**: Pass a metrics callback to shared code
+2. **Metrics trait**: Define trait in `common`, implement in service
+3. **Feature flag**: Service-specific metrics behind compile-time feature
+4. **Accept gap**: Document as tech debt (TD-GC-001 pattern)
+
+**Security implication**: Missing metrics means no alerting on token refresh failures, which could indicate credential compromise or AC unavailability. When reviewing shared crate changes, explicitly ask: "What security-relevant operations lack observability?"
+
+---
+
 ## Gotcha: Credential Fallbacks Bypass Fail-Fast Security
 **Added**: 2026-01-31
 **Related files**: `crates/global-controller/src/main.rs`

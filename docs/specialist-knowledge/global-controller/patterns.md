@@ -330,3 +330,79 @@ fn get_or_init_metrics_handle() -> PrometheusHandle {
 The fallback chain handles cases where another test already installed the recorder. This pattern enables metrics endpoint testing without per-test registry conflicts.
 
 ---
+
+## Pattern: Instant::now() for Operation Duration Metrics
+**Added**: 2026-02-09
+**Related files**: `crates/global-controller/src/repositories/*.rs`, `crates/global-controller/src/services/mc_assignment.rs`
+
+Capture operation duration using `std::time::Instant` before the operation, then call `start.elapsed()` after:
+```rust
+use std::time::Instant;
+
+async fn some_operation(&self) -> Result<T, E> {
+    let start = Instant::now();
+    let result = self.do_work().await;
+    let status = if result.is_ok() { "success" } else { "error" };
+    metrics::record_db_query("operation_name", status, start.elapsed());
+    result
+}
+```
+
+Key benefits:
+- `elapsed()` returns `Duration` directly, no need to calculate difference
+- Works across `await` points (Instant is Copy)
+- Nanosecond precision, suitable for histogram buckets
+- Pattern avoids `Duration` import when only timing is needed
+
+---
+
+## Pattern: Repository Layer for DB Query Metrics
+**Added**: 2026-02-09
+**Related files**: `crates/global-controller/src/repositories/meeting_assignments.rs`, `crates/global-controller/src/repositories/meeting_controllers.rs`, `crates/global-controller/src/repositories/media_handlers.rs`
+
+Instrument database queries at the repository layer, not the service layer:
+```rust
+// In repository method
+pub async fn get_something(&self, id: Uuid) -> Result<Thing, GcError> {
+    let start = Instant::now();
+    let result = sqlx::query_as!(...)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| GcError::Database(format!("...: {e}")));
+    let status = if result.is_ok() { "success" } else { "error" };
+    metrics::record_db_query("get_something", status, start.elapsed());
+    result
+}
+```
+
+Benefits:
+- Captures actual DB latency (not including service-layer logic)
+- Single place to instrument each query type
+- Consistent operation naming across the codebase
+- Repository is the "single source of truth" for DB operations
+
+---
+
+## Pattern: Status Label Determination from Result
+**Added**: 2026-02-09
+**Related files**: `crates/global-controller/src/services/mc_assignment.rs`
+
+Derive metric status labels from operation outcomes, handling both success variants and error variants:
+```rust
+let (status, rejection_reason) = match &result {
+    Ok(Some(_)) => ("success", None),
+    Ok(None) => ("rejected", Some("no_healthy_mc")),
+    Err(e) => match e {
+        GcError::McRejected(reason) => ("rejected", Some(reason.as_str())),
+        _ => ("error", None),
+    },
+};
+metrics::record_mc_assignment(status, rejection_reason, start.elapsed());
+```
+
+This pattern enables:
+- Rich label cardinality for debugging (rejection reasons)
+- Dashboard panels can filter by status or drill into rejection types
+- Error states clearly distinguished from business rejections
+
+---

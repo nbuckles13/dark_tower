@@ -211,3 +211,28 @@ Meeting join triggers MC assignment with MH selection (ADR-0010 Section 4a):
 **Client configuration**: MC client uses `SecretString` for service token, lazy channel connection, and cached channels per endpoint. Inject `MockMcClient::accepting()` for tests.
 
 ---
+
+## Integration: Observability Metrics Layering
+**Added**: 2026-02-09, **Updated**: 2026-02-09
+**Related files**: `crates/global-controller/src/observability/metrics.rs`, `crates/global-controller/src/repositories/*.rs`, `crates/global-controller/src/services/mc_assignment.rs`, `crates/global-controller/src/services/mh_selection.rs`
+
+Metrics are recorded at different layers depending on what they measure:
+
+**Repository Layer** (DB operations):
+- `record_db_query(operation, status, duration)` - Called in each repository method
+- Operations: `get_healthy_assignment`, `get_candidate_mcs`, `atomic_assign`, `register_mc`, `update_heartbeat`, etc.
+- Captures actual database latency without service-layer overhead
+
+**Service Layer** (business operations):
+- `record_mc_assignment(status, rejection_reason, duration)` - Called in `assign_meeting_with_mh()`
+- `record_mh_selection(status, has_backup, duration)` - Called in `select_mhs_for_meeting()`
+- Captures end-to-end operation time including RPCs, retries, and DB writes
+- Status values: `success`, `rejected`, `error`
+
+**Out of Scope** (cross-crate dependency - TD-GC-001):
+- Token refresh metrics were removed from `metrics.rs` because TokenManager lives in `common` crate
+- See gotchas.md for cross-crate metrics challenge and solution options
+
+**Dashboard panels**: Grafana dashboard at `infra/grafana/dashboards/gc-overview.json` has panels for each metric type.
+
+---

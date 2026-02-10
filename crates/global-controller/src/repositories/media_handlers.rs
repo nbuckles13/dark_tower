@@ -14,9 +14,11 @@
 #![allow(dead_code)]
 
 use crate::errors::GcError;
+use crate::observability::metrics;
 use crate::repositories::HealthStatus;
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
+use std::time::Instant;
 use tracing::instrument;
 
 /// Default heartbeat staleness threshold in seconds.
@@ -87,7 +89,9 @@ impl MediaHandlersRepository {
         grpc_endpoint: &str,
         max_streams: i32,
     ) -> Result<(), GcError> {
-        sqlx::query(
+        let start = Instant::now();
+
+        let query_result = sqlx::query(
             r#"
             INSERT INTO media_handlers (
                 handler_id, region, webtransport_endpoint, grpc_endpoint,
@@ -110,7 +114,17 @@ impl MediaHandlersRepository {
         .bind(grpc_endpoint)
         .bind(max_streams)
         .execute(pool)
-        .await?;
+        .await;
+
+        // Record DB query metrics (ADR-0011)
+        let status = if query_result.is_ok() {
+            "success"
+        } else {
+            "error"
+        };
+        metrics::record_db_query("register_mh", status, start.elapsed());
+
+        query_result?;
 
         tracing::info!(
             target: "gc.repository.mh",
@@ -147,7 +161,9 @@ impl MediaHandlersRepository {
         memory_usage: Option<f32>,
         bandwidth_usage: Option<f32>,
     ) -> Result<bool, GcError> {
-        let result = sqlx::query(
+        let start = Instant::now();
+
+        let query_result = sqlx::query(
             r#"
             UPDATE media_handlers
             SET
@@ -168,9 +184,16 @@ impl MediaHandlersRepository {
         .bind(memory_usage)
         .bind(bandwidth_usage)
         .execute(pool)
-        .await?;
+        .await;
 
-        let updated = result.rows_affected() > 0;
+        // Record DB query metrics (ADR-0011)
+        let (status, result) = match query_result {
+            Ok(r) => ("success", Ok(r)),
+            Err(e) => ("error", Err(e)),
+        };
+        metrics::record_db_query("update_load_report", status, start.elapsed());
+
+        let updated = result?.rows_affected() > 0;
 
         if updated {
             tracing::debug!(
@@ -209,7 +232,9 @@ impl MediaHandlersRepository {
         pool: &PgPool,
         staleness_threshold_seconds: i64,
     ) -> Result<u64, GcError> {
-        let result = sqlx::query(
+        let start = Instant::now();
+
+        let query_result = sqlx::query(
             r#"
             UPDATE media_handlers
             SET
@@ -223,9 +248,16 @@ impl MediaHandlersRepository {
         )
         .bind(staleness_threshold_seconds.to_string())
         .execute(pool)
-        .await?;
+        .await;
 
-        let count = result.rows_affected();
+        // Record DB query metrics (ADR-0011)
+        let (status, result) = match query_result {
+            Ok(r) => ("success", Ok(r)),
+            Err(e) => ("error", Err(e)),
+        };
+        metrics::record_db_query("mark_stale_mh_unhealthy", status, start.elapsed());
+
+        let count = result?.rows_affected();
 
         if count > 0 {
             tracing::warn!(
@@ -252,7 +284,9 @@ impl MediaHandlersRepository {
         pool: &PgPool,
         region: &str,
     ) -> Result<Vec<MhCandidate>, GcError> {
-        let rows: Vec<MhCandidateRow> = sqlx::query_as(
+        let start = Instant::now();
+
+        let query_result: Result<Vec<MhCandidateRow>, sqlx::Error> = sqlx::query_as(
             r#"
             SELECT
                 handler_id,
@@ -275,9 +309,16 @@ impl MediaHandlersRepository {
         .bind(DEFAULT_HEARTBEAT_STALENESS_SECONDS.to_string())
         .bind(LOAD_BALANCING_CANDIDATE_COUNT)
         .fetch_all(pool)
-        .await?;
+        .await;
 
-        Ok(rows
+        // Record DB query metrics (ADR-0011)
+        let (status, rows) = match query_result {
+            Ok(r) => ("success", Ok(r)),
+            Err(e) => ("error", Err(e)),
+        };
+        metrics::record_db_query("get_candidate_mhs", status, start.elapsed());
+
+        Ok(rows?
             .into_iter()
             .map(|r| MhCandidate {
                 handler_id: r.handler_id,
@@ -304,7 +345,9 @@ impl MediaHandlersRepository {
         pool: &PgPool,
         handler_id: &str,
     ) -> Result<Option<MediaHandler>, GcError> {
-        let row: Option<MediaHandlerRow> = sqlx::query_as(
+        let start = Instant::now();
+
+        let query_result: Result<Option<MediaHandlerRow>, sqlx::Error> = sqlx::query_as(
             r#"
             SELECT
                 handler_id,
@@ -326,9 +369,16 @@ impl MediaHandlersRepository {
         )
         .bind(handler_id)
         .fetch_optional(pool)
-        .await?;
+        .await;
 
-        Ok(row.map(|r| MediaHandler {
+        // Record DB query metrics (ADR-0011)
+        let (status, row) = match query_result {
+            Ok(r) => ("success", Ok(r)),
+            Err(e) => ("error", Err(e)),
+        };
+        metrics::record_db_query("get_handler", status, start.elapsed());
+
+        Ok(row?.map(|r| MediaHandler {
             handler_id: r.handler_id,
             region: r.region,
             webtransport_endpoint: r.webtransport_endpoint,
