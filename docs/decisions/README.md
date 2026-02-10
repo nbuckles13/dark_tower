@@ -28,16 +28,6 @@ Each ADR follows this structure:
 **References**: Links to relevant docs, discussions, or code
 ```
 
-## ADR Index
-
-| ADR | Title | Status | Date |
-|-----|-------|--------|------|
-| [0001](./adr-0001-actor-pattern.md) | Actor Pattern for Concurrency | Accepted | 2025-01-22 |
-| [0002](./adr-0002-no-panic-policy.md) | No-Panic Error Handling Policy | Accepted | 2025-01-22 |
-| [0003](./adr-0003-service-authentication.md) | Service Authentication & Federation | Accepted | 2025-01-22 |
-| [0004](./adr-0004-api-versioning.md) | API Versioning Strategy | Accepted | 2025-01-22 |
-| [0005](./adr-0005-integration-testing-strategy.md) | Integration and End-to-End Testing Strategy | Accepted | 2025-01-28 |
-
 ## Creating a New ADR
 
 1. Copy the template: `cp adr-template.md adr-NNNN-short-title.md`
