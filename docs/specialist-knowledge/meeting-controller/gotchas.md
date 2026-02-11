@@ -179,3 +179,11 @@ When tracking participant counts with `ControllerMetrics`, remember to decrement
 Atomic `fetch_sub(1)` returns the value BEFORE subtraction, not after. When emitting the new count to Prometheus after decrement: `let count = self.active_meetings.fetch_sub(1, Ordering::Relaxed).saturating_sub(1);`. The `saturating_sub(1)` calculates the actual new value. Use `saturating_sub` instead of plain subtraction to handle the edge case where the previous value was already 0 (shouldn't happen in correct code, but prevents underflow panic in debug builds).
 
 ---
+
+## Gotcha: Dashboard Metric Names Must Match Code Exactly
+**Added**: 2026-02-10
+**Related files**: `infra/grafana/dashboards/mc-overview.json`, `crates/meeting-controller/src/observability/metrics.rs`
+
+Grafana dashboard queries must use the exact metric name defined in code - the `metrics` crate uses the literal string passed to `counter!()`, `gauge!()`, or `histogram!()`. Common mistake: singular vs plural (e.g., `mc_gc_heartbeat_total` vs `mc_gc_heartbeats_total`). When adding new metrics, grep the dashboard JSON for the metric name to ensure consistency. If panels show "No data", verify the query matches the code exactly, including suffixes like `_total` for counters and `_seconds` for duration histograms.
+
+---

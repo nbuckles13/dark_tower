@@ -753,3 +753,50 @@ Key insight: Log at WARN when crossing into Critical (> threshold), and at DEBUG
 **Gotcha to avoid**: Exact threshold checks (`== normal_threshold`) can miss batched updates. If messages arrive in bursts, the exact boundary may be skipped. Document this trade-off or use `>=` comparison instead.
 
 ---
+
+## Pattern: Complete Metric Instrumentation for Async RPC Calls
+**Added**: 2026-02-10
+**Related files**: `crates/meeting-controller/src/grpc/gc_client.rs`
+
+For async RPC calls (gRPC, HTTP), follow the complete observability pattern: record both counter and histogram metrics in both success and error branches, measure duration before the async call:
+
+```rust
+pub async fn heartbeat(&self, ...) -> Result<(), McError> {
+    // Start timer BEFORE the async call (captures total latency including network)
+    let start = Instant::now();
+
+    match client.heartbeat(request).await {
+        Ok(response) => {
+            let duration = start.elapsed();
+            // Record success metrics: both counter and histogram
+            record_heartbeat("success", "fast");
+            record_heartbeat_latency("fast", duration);
+            // ... process response
+            Ok(())
+        }
+        Err(e) => {
+            let duration = start.elapsed();
+            // Record error metrics: both counter and histogram
+            record_heartbeat("error", "fast");
+            record_heartbeat_latency("fast", duration);
+            // ... handle error
+            Err(McError::Grpc(format!("Heartbeat failed: {e}")))
+        }
+    }
+}
+```
+
+**Key properties:**
+- Timer starts before the async call (captures network latency)
+- Counter metric records result status (success/error)
+- Histogram metric records latency for both paths
+- Pattern works for gRPC, HTTP, and any async operation
+- Enables SLO tracking (p99 latency, error rate)
+
+**ADR-0011 compliance:**
+- Labels are bounded (`status`: 2 values, `type`: 2-3 values)
+- Histogram buckets should match SLO targets (e.g., 0.1s target → buckets include 0.05, 0.1, 0.5)
+
+This pattern ensures complete observability for external dependencies, critical for debugging latency and reliability issues.
+
+---

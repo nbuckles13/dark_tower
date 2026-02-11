@@ -96,19 +96,27 @@ This file captures pitfalls and anti-patterns discovered during DRY reviews.
 
 ## Service-Prefixed Metrics Are Convention, Not Duplication
 
-**Added**: 2026-02-04
-**Related files**: `crates/global-controller/src/observability/metrics.rs`, `crates/ac-service/src/observability/metrics.rs`, `crates/meeting-controller/src/actors/metrics.rs`
+**Added**: 2026-02-04 | **Updated**: 2026-02-10
+**Related files**: `crates/global-controller/src/observability/metrics.rs`, `crates/ac-service/src/observability/metrics.rs`, `crates/meeting-controller/src/observability/metrics.rs`
 
-**Gotcha**: Don't flag service-prefixed metric names (`gc_http_requests_total`, `ac_http_requests_total`, `mc_mailbox_depth`) as duplication. Each service MUST have its own metric prefix per Prometheus best practices. The prefix enables:
+**Gotcha**: Don't flag service-prefixed metric names (`gc_http_requests_total`, `ac_http_requests_total`, `mc_gc_heartbeats_total`) as duplication. Each service MUST have its own metric prefix per Prometheus best practices (ADR-0011). The prefix enables:
 - Service identification in federated queries
 - Per-service SLO alerting
 - Isolation of cardinality explosions
 
 **What IS duplication**: The recording helper functions (`record_http_request`, `record_db_query`, etc.) when they have identical signatures and logic. The middleware that calls them. The path normalization algorithms.
 
-**What is NOT duplication**: Different metric names, different service prefixes, different label sets appropriate to service domain.
+**What is NOT duplication**:
+- Different metric names with service prefixes (`mc_gc_heartbeats_total` vs `gc_http_requests_total`)
+- Different label sets appropriate to service domain (MC uses `type` label for heartbeat type, GC uses `endpoint` for HTTP paths)
+- Service-specific observability modules in each crate (`crates/meeting-controller/src/observability/`, `crates/global-controller/src/observability/`)
 
-**When reviewing**: Focus on function/algorithm duplication, not metric naming conventions.
+**Architectural context**: Per ADR-0011, each service maintains its own observability module. There is NO shared metrics infrastructure in `crates/common/`. This is intentional - metrics are service-specific.
+
+**When reviewing**:
+1. Check if `crates/common/` has the pattern (if yes and not imported → BLOCKER)
+2. If pattern exists only in other services (not in common) → TECH_DEBT
+3. Focus on function/algorithm duplication, not metric naming conventions
 
 ---
 

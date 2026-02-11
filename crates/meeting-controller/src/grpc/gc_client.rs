@@ -21,6 +21,7 @@
 
 use crate::config::Config;
 use crate::errors::McError;
+use crate::observability::{record_gc_heartbeat, record_gc_heartbeat_latency};
 use common::secret::ExposeSecret;
 use common::token_manager::TokenReceiver;
 use proto_gen::internal::global_controller_service_client::GlobalControllerServiceClient;
@@ -29,7 +30,7 @@ use proto_gen::internal::{
     RegisterMcRequest,
 };
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tonic::transport::{Channel, Endpoint};
 use tonic::Request;
 use tracing::{debug, error, info, instrument, warn};
@@ -359,8 +360,16 @@ impl GcClient {
         let mut client = GlobalControllerServiceClient::new(self.channel.clone());
         let grpc_request = self.add_auth(request)?;
 
+        // Start timer for latency measurement (ADR-0011)
+        let start = Instant::now();
+
         match client.fast_heartbeat(grpc_request).await {
             Ok(response) => {
+                let duration = start.elapsed();
+                // Record success metrics per ADR-0011: both counter and histogram
+                record_gc_heartbeat("success", "fast");
+                record_gc_heartbeat_latency("fast", duration);
+
                 let inner = response.into_inner();
                 if inner.acknowledged {
                     debug!(
@@ -372,6 +381,11 @@ impl GcClient {
                 Ok(())
             }
             Err(e) => {
+                let duration = start.elapsed();
+                // Record error metrics per ADR-0011: both counter and histogram
+                record_gc_heartbeat("error", "fast");
+                record_gc_heartbeat_latency("fast", duration);
+
                 // Check for NOT_FOUND status - means GC doesn't recognize this MC
                 // (e.g., after GC restart or network partition)
                 if e.code() == tonic::Code::NotFound {
@@ -436,8 +450,16 @@ impl GcClient {
         let mut client = GlobalControllerServiceClient::new(self.channel.clone());
         let grpc_request = self.add_auth(request)?;
 
+        // Start timer for latency measurement (ADR-0011)
+        let start = Instant::now();
+
         match client.comprehensive_heartbeat(grpc_request).await {
             Ok(response) => {
+                let duration = start.elapsed();
+                // Record success metrics per ADR-0011: both counter and histogram
+                record_gc_heartbeat("success", "comprehensive");
+                record_gc_heartbeat_latency("comprehensive", duration);
+
                 let inner = response.into_inner();
                 if inner.acknowledged {
                     debug!(
@@ -451,6 +473,11 @@ impl GcClient {
                 Ok(())
             }
             Err(e) => {
+                let duration = start.elapsed();
+                // Record error metrics per ADR-0011: both counter and histogram
+                record_gc_heartbeat("error", "comprehensive");
+                record_gc_heartbeat_latency("comprehensive", duration);
+
                 // Check for NOT_FOUND status - means GC doesn't recognize this MC
                 // (e.g., after GC restart or network partition)
                 if e.code() == tonic::Code::NotFound {
