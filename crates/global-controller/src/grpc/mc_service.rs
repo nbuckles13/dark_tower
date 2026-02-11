@@ -8,6 +8,7 @@
 //! - Input validation performed on all requests
 //! - Generic error messages returned to prevent information leakage
 
+use crate::observability::metrics;
 use crate::repositories::{HealthStatus, MeetingControllersRepository};
 use crate::routes::AppState;
 use crate::services::McAssignmentService;
@@ -49,6 +50,31 @@ impl McService {
     /// Create a new MC service with the given application state.
     pub fn new(state: Arc<AppState>) -> Self {
         Self { state }
+    }
+
+    /// Refresh the registered controllers gauge metric.
+    ///
+    /// Queries the database for current controller counts by status
+    /// and updates the `gc_registered_controllers` gauge.
+    async fn refresh_controller_metrics(&self) {
+        match MeetingControllersRepository::get_controller_counts_by_status(&self.state.pool).await
+        {
+            Ok(counts) => {
+                // Convert to the format expected by the metrics helper
+                let counts: Vec<(String, u64)> = counts
+                    .into_iter()
+                    .map(|(status, count)| (status.as_db_str().to_string(), count as u64))
+                    .collect();
+                metrics::update_registered_controller_gauges("meeting", &counts);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "gc.grpc.mc_service",
+                    error = %e,
+                    "Failed to refresh controller metrics"
+                );
+            }
+        }
     }
 
     /// Validate a controller ID.
@@ -224,6 +250,9 @@ impl GlobalControllerService for McService {
             "MC registered successfully"
         );
 
+        // Refresh the registered controllers metric
+        self.refresh_controller_metrics().await;
+
         Ok(Response::new(RegisterMcResponse {
             accepted: true,
             message: "Registration successful".to_string(),
@@ -275,6 +304,9 @@ impl GlobalControllerService for McService {
         if !updated {
             return Err(Status::not_found("Controller not registered"));
         }
+
+        // Refresh the registered controllers metric (status may have changed)
+        self.refresh_controller_metrics().await;
 
         let timestamp = chrono::Utc::now().timestamp() as u64;
 
@@ -339,6 +371,9 @@ impl GlobalControllerService for McService {
         if !updated {
             return Err(Status::not_found("Controller not registered"));
         }
+
+        // Refresh the registered controllers metric (status may have changed)
+        self.refresh_controller_metrics().await;
 
         let timestamp = chrono::Utc::now().timestamp() as u64;
 

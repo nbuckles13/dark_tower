@@ -33,6 +33,7 @@ use grpc::auth_layer::async_auth::GrpcAuthLayer;
 use grpc::{McService, MhService};
 use proto_gen::internal::global_controller_service_server::GlobalControllerServiceServer;
 use proto_gen::internal::media_handler_registry_service_server::MediaHandlerRegistryServiceServer;
+use repositories::MeetingControllersRepository;
 use routes::AppState;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -101,6 +102,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })?;
 
     info!("Database connection established");
+
+    // Initialize registered controllers metric from database (ADR-0011)
+    // Query current controller counts before accepting traffic
+    init_registered_controllers_metric(&db_pool).await;
 
     // Parse bind addresses before moving config
     let http_bind_address = config.bind_address.clone();
@@ -259,6 +264,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Global Controller shutdown complete");
 
     Ok(())
+}
+
+/// Initialize the registered controllers metric from database.
+///
+/// Queries current controller counts by status and sets the gauge values.
+/// This ensures the metric is accurate after GC restart when MCs are already registered.
+async fn init_registered_controllers_metric(pool: &sqlx::PgPool) {
+    use repositories::HealthStatus;
+
+    match MeetingControllersRepository::get_controller_counts_by_status(pool).await {
+        Ok(counts) => {
+            // Convert to the format expected by the metrics helper
+            let counts: Vec<(String, u64)> = counts
+                .into_iter()
+                .map(|(status, count)| {
+                    let status_str = match status {
+                        HealthStatus::Pending => "pending",
+                        HealthStatus::Healthy => "healthy",
+                        HealthStatus::Degraded => "degraded",
+                        HealthStatus::Unhealthy => "unhealthy",
+                        HealthStatus::Draining => "draining",
+                    };
+                    (status_str.to_string(), count as u64)
+                })
+                .collect();
+
+            observability::metrics::update_registered_controller_gauges("meeting", &counts);
+
+            // Log the initial counts
+            let total: u64 = counts.iter().map(|(_, c)| c).sum();
+            info!(
+                target: "gc.startup",
+                total_controllers = total,
+                "Initialized registered controllers metric"
+            );
+        }
+        Err(e) => {
+            // Log warning but don't fail startup - metric will be populated on first heartbeat
+            warn!(
+                "Failed to initialize registered controllers metric: {}. Metric will be populated on first heartbeat.",
+                e
+            );
+        }
+    }
 }
 
 /// Listens for shutdown signals (SIGTERM, SIGINT).

@@ -406,3 +406,22 @@ This pattern enables:
 - Error states clearly distinguished from business rejections
 
 ---
+
+## Pattern: Gauge Metric Initialization from Database State
+**Added**: 2026-02-10
+**Related files**: `crates/global-controller/src/main.rs`, `crates/global-controller/src/observability/metrics.rs`
+
+Initialize gauge metrics from database on startup to ensure accurate values after service restart:
+```rust
+// In main.rs after DB connection established
+let counts = Repository::get_counts_by_status(&pool).await?;
+let counts_vec: Vec<(String, u64)> = counts
+    .into_iter()
+    .map(|(status, count)| (status.as_db_str().to_string(), count as u64))
+    .collect();
+metrics::update_gauges("controller_type", &counts_vec);
+```
+
+For gauges tracking external state (registered controllers, active sessions, queue depth), query the source of truth on startup. Create a helper function that sets all possible label combinations (including zeros) to ensure consistent time series in Prometheus. This prevents gauge values starting at 0 after restart when actual state is non-zero. Pattern is especially important for multi-instance services where metric state isn't shared.
+
+---
