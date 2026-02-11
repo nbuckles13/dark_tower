@@ -9,6 +9,7 @@
 //! The task supports graceful shutdown via a cancellation token. When the token
 //! is cancelled, the task completes its current iteration and exits cleanly.
 
+use crate::observability::metrics;
 use crate::repositories::MeetingControllersRepository;
 use sqlx::PgPool;
 use std::time::Duration;
@@ -17,6 +18,40 @@ use tracing::{info, instrument, warn};
 
 /// Default health check interval in seconds.
 const DEFAULT_CHECK_INTERVAL_SECONDS: u64 = 5;
+
+/// Refresh the registered controllers gauge metric.
+///
+/// Queries the database for current controller counts by status
+/// and updates the `gc_registered_controllers` gauge.
+async fn refresh_controller_metrics(pool: &PgPool) {
+    match MeetingControllersRepository::get_controller_counts_by_status(pool).await {
+        Ok(counts) => {
+            // Convert to the format expected by the metrics helper
+            let counts: Vec<(String, u64)> = counts
+                .into_iter()
+                .map(|(status, count)| {
+                    use crate::repositories::HealthStatus;
+                    let status_str = match status {
+                        HealthStatus::Pending => "pending",
+                        HealthStatus::Healthy => "healthy",
+                        HealthStatus::Degraded => "degraded",
+                        HealthStatus::Unhealthy => "unhealthy",
+                        HealthStatus::Draining => "draining",
+                    };
+                    (status_str.to_string(), count as u64)
+                })
+                .collect();
+            metrics::update_registered_controller_gauges("meeting", &counts);
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: "gc.task.health_checker",
+                error = %e,
+                "Failed to refresh controller metrics"
+            );
+        }
+    }
+}
 
 /// Start the health checker background task.
 ///
@@ -63,6 +98,8 @@ pub async fn start_health_checker(
                                 "Marked stale controllers as unhealthy"
                             );
                         }
+                        // Refresh the registered controllers metric
+                        refresh_controller_metrics(&pool).await;
                     }
                     Err(e) => {
                         // Log error but continue - database might recover

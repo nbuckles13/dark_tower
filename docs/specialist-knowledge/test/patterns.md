@@ -960,8 +960,8 @@ Alternative approaches and when to use them:
 ---
 
 ## Pattern: Observability Wiring Tests - Implicit vs Explicit Verification
-**Added**: 2026-02-05
-**Related files**: `crates/meeting-controller/src/actors/metrics.rs`, `crates/meeting-controller/src/observability/metrics.rs`
+**Added**: 2026-02-05, **Updated**: 2026-02-10
+**Related files**: `crates/meeting-controller/src/actors/metrics.rs`, `crates/meeting-controller/src/observability/metrics.rs`, `crates/global-controller/src/observability/metrics.rs`
 
 When adding Prometheus wiring to existing code (ActorMetrics, MailboxMonitor, error counters), the test verification approach differs from new feature tests. The wiring itself is simple (direct function calls, no branching), so comprehensive testing of the wrapper functions is more valuable than testing individual call sites:
 
@@ -975,6 +975,13 @@ Example from MC metrics wiring:
 - `observability::metrics::tests::test_set_meetings_active()` verifies the Prometheus wrapper works correctly
 - Combined: Metrics wiring is validated without explicit "mock Prometheus and assert it was called" tests
 
+**GC registered controllers metric example** (2026-02-10):
+- New gauge metric: `gc_registered_controllers{controller_type, status}`
+- **Unit tests** cover metric functions: `test_set_registered_controllers`, `test_update_registered_controller_gauges`, `test_controller_statuses_constant`
+- **Integration tests** in health_checker exercise refresh flow after marking controllers unhealthy
+- **Database query** (`get_controller_counts_by_status`) lacks dedicated integration test BUT uses established patterns and is exercised indirectly
+- **Wiring calls** in mc_service.rs and health_checker.rs verified by existing flow tests, error paths log and continue (correct non-critical behavior)
+
 **Why this approach works**:
 - Wrapper functions are simple (gauge/counter emission, no logic)
 - Wiring is simple (direct calls, no conditions)
@@ -984,3 +991,7 @@ Example from MC metrics wiring:
 **Gotcha**: This approach works for simple wiring. For complex observability logic (conditional emission, aggregation, batching), add explicit tests that verify the Prometheus calls. Indicator: If the wiring code has if-else branches or complex logic, add dedicated tests for those paths.
 
 **Cardinality risk**: When adding labeled metrics, verify label values are bounded (test explicitly that only expected label values are used, not unbounded user input). The observability module has a `test_cardinality_bounds` test that validates this - leverage existing tests rather than adding new ones.
+
+**Acceptable tech debt for simple gauge metrics**:
+- Repository query lacks dedicated integration test (if uses established patterns and exercised indirectly)
+- Metric refresh calls not explicitly verified (if wrapper module has comprehensive tests and wiring is exercised by flow tests)

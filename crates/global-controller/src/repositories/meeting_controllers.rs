@@ -367,6 +367,55 @@ impl MeetingControllersRepository {
             updated_at: r.updated_at,
         }))
     }
+
+    /// Get counts of meeting controllers grouped by health status.
+    ///
+    /// Used to initialize the `gc_registered_controllers` gauge on startup
+    /// and to refresh after registration/heartbeat changes.
+    ///
+    /// # Returns
+    ///
+    /// A vector of (status, count) pairs for all statuses that have at least
+    /// one controller. Statuses with zero controllers are not included in
+    /// the result (the caller should set those to 0).
+    #[instrument(skip_all)]
+    pub async fn get_controller_counts_by_status(
+        pool: &PgPool,
+    ) -> Result<Vec<(HealthStatus, i64)>, GcError> {
+        let start = Instant::now();
+
+        let query_result: Result<Vec<ControllerCountRow>, sqlx::Error> = sqlx::query_as(
+            r#"
+            SELECT health_status, COUNT(*) as count
+            FROM meeting_controllers
+            GROUP BY health_status
+            "#,
+        )
+        .fetch_all(pool)
+        .await;
+
+        // Record DB query metrics (ADR-0011)
+        let (status, rows) = match query_result {
+            Ok(r) => ("success", Ok(r)),
+            Err(e) => ("error", Err(e)),
+        };
+        metrics::record_db_query("get_controller_counts_by_status", status, start.elapsed());
+
+        let rows = rows?;
+        let counts: Vec<(HealthStatus, i64)> = rows
+            .into_iter()
+            .map(|r| (HealthStatus::from_db_str(&r.health_status), r.count))
+            .collect();
+
+        Ok(counts)
+    }
+}
+
+/// Database row for controller count queries.
+#[derive(sqlx::FromRow)]
+struct ControllerCountRow {
+    health_status: String,
+    count: i64,
 }
 
 /// Database row representation for meeting controllers.

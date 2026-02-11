@@ -21,7 +21,7 @@
 //! - MC assignment p95 < 20ms
 //! - DB query p99 < 50ms
 
-use metrics::{counter, histogram};
+use metrics::{counter, gauge, histogram};
 use std::time::Duration;
 
 // ============================================================================
@@ -250,6 +250,68 @@ pub fn record_mh_selection(status: &str, has_backup: bool, duration: Duration) {
 }
 
 // ============================================================================
+// Registered Controllers Gauge (Fleet Monitoring)
+// ============================================================================
+
+/// Set the count of registered controllers by type and status.
+///
+/// Metric: `gc_registered_controllers`
+/// Type: Gauge
+/// Labels: `controller_type`, `status`
+///
+/// Cardinality: controller_type (2 values: "meeting", "media") × status (5 values:
+/// "pending", "healthy", "degraded", "unhealthy", "draining") = 10 combinations.
+///
+/// This gauge is set:
+/// - On GC startup (query DB for current counts)
+/// - After MC/MH registration (re-query current counts)
+/// - After heartbeat updates that change status (re-query affected status counts)
+/// - After health checker marks stale controllers unhealthy
+///
+/// # Arguments
+///
+/// * `controller_type` - Type of controller: "meeting" or "media"
+/// * `status` - Health status: "pending", "healthy", "degraded", "unhealthy", "draining"
+/// * `count` - Current count of controllers with this type and status
+pub fn set_registered_controllers(controller_type: &str, status: &str, count: u64) {
+    gauge!("gc_registered_controllers",
+        "controller_type" => controller_type.to_string(),
+        "status" => status.to_string()
+    )
+    .set(count as f64);
+}
+
+/// All valid health status values for controller metrics.
+///
+/// Used to ensure all status gauges are set (including zeros) when updating
+/// the registered controllers metric.
+pub const CONTROLLER_STATUSES: [&str; 5] =
+    ["pending", "healthy", "degraded", "unhealthy", "draining"];
+
+/// Update all registered controller gauges for a given controller type.
+///
+/// Takes a list of (status, count) pairs and sets the corresponding gauges.
+/// For any status not in the list, sets the gauge to 0.
+///
+/// # Arguments
+///
+/// * `controller_type` - Type of controller: "meeting" or "media"
+/// * `counts` - List of (status, count) pairs from database query
+pub fn update_registered_controller_gauges(controller_type: &str, counts: &[(String, u64)]) {
+    // Create a map from status to count
+    let count_map: std::collections::HashMap<&str, u64> = counts
+        .iter()
+        .map(|(status, count)| (status.as_str(), *count))
+        .collect();
+
+    // Set gauge for each status, defaulting to 0 if not in map
+    for status in CONTROLLER_STATUSES {
+        let count = count_map.get(status).copied().unwrap_or(0);
+        set_registered_controllers(controller_type, status, count);
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -426,5 +488,56 @@ mod tests {
         record_mh_selection("success", true, Duration::from_millis(8));
         record_mh_selection("success", false, Duration::from_millis(5));
         record_mh_selection("error", false, Duration::from_millis(3));
+    }
+
+    #[test]
+    fn test_set_registered_controllers() {
+        // Test all valid controller types and statuses (cardinality: 2 * 5 = 10)
+        // Meeting controllers
+        set_registered_controllers("meeting", "pending", 0);
+        set_registered_controllers("meeting", "healthy", 5);
+        set_registered_controllers("meeting", "degraded", 1);
+        set_registered_controllers("meeting", "unhealthy", 2);
+        set_registered_controllers("meeting", "draining", 1);
+
+        // Media handlers (future)
+        set_registered_controllers("media", "pending", 0);
+        set_registered_controllers("media", "healthy", 10);
+        set_registered_controllers("media", "degraded", 0);
+        set_registered_controllers("media", "unhealthy", 1);
+        set_registered_controllers("media", "draining", 0);
+    }
+
+    #[test]
+    fn test_update_registered_controller_gauges() {
+        // Test with partial counts (some statuses missing)
+        let counts = vec![("healthy".to_string(), 5), ("degraded".to_string(), 2)];
+
+        // Should set all 5 statuses, with missing ones set to 0
+        update_registered_controller_gauges("meeting", &counts);
+
+        // Test with all statuses
+        let full_counts = vec![
+            ("pending".to_string(), 1),
+            ("healthy".to_string(), 10),
+            ("degraded".to_string(), 3),
+            ("unhealthy".to_string(), 2),
+            ("draining".to_string(), 1),
+        ];
+        update_registered_controller_gauges("meeting", &full_counts);
+
+        // Test with empty counts
+        update_registered_controller_gauges("media", &[]);
+    }
+
+    #[test]
+    fn test_controller_statuses_constant() {
+        // Verify we have all expected statuses
+        assert_eq!(CONTROLLER_STATUSES.len(), 5);
+        assert!(CONTROLLER_STATUSES.contains(&"pending"));
+        assert!(CONTROLLER_STATUSES.contains(&"healthy"));
+        assert!(CONTROLLER_STATUSES.contains(&"degraded"));
+        assert!(CONTROLLER_STATUSES.contains(&"unhealthy"));
+        assert!(CONTROLLER_STATUSES.contains(&"draining"));
     }
 }
