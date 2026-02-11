@@ -246,3 +246,11 @@ When metrics need to be updated from child actors but aggregated at a higher lev
 When internal metrics structs have methods like `meeting_created()` that also need to emit to Prometheus, use a module alias to distinguish the observability call: `use crate::observability::metrics as prom;`. Then internal tracking and Prometheus emission are clearly separated: `self.active_meetings.fetch_add(1, Ordering::Relaxed); prom::set_meetings_active(count as u64);`. This makes code self-documenting and grep-able - all Prometheus emissions use the `prom::` prefix.
 
 ---
+
+## Pattern: Metric Recording in Both Success and Error Paths
+**Added**: 2026-02-10
+**Related files**: `crates/meeting-controller/src/grpc/gc_client.rs`, `crates/meeting-controller/src/observability/metrics.rs`
+
+When instrumenting operations with metrics, record BOTH success and error outcomes using consistent label values. Pattern: start timer before operation (`let start = Instant::now();`), then in both match arms: record counter with status label and histogram with duration. Example: `record_gc_heartbeat("success", "fast")` + `record_gc_heartbeat_latency("fast", duration)` on Ok, same with `"error"` on Err. This ensures complete observability - error paths are just as important as success paths for monitoring and alerting. Recording latency even on error helps diagnose slow failures vs fast failures.
+
+---

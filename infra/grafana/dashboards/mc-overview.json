@@ -1351,7 +1351,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by(status) (rate(mc_gc_heartbeat_total[5m]))",
+          "expr": "sum by(status) (rate(mc_gc_heartbeats_total[5m]))",
           "legendFormat": "heartbeat-{{status}}",
           "range": true,
           "refId": "A"

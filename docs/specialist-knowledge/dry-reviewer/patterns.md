@@ -220,3 +220,42 @@ pub fn meeting_created(&self) {
 **When NOT to use**: Simple request/response metrics (no internal state needed) - emit directly to Prometheus.
 
 ---
+
+## Metrics Recording at Operation Boundaries
+
+**Added**: 2026-02-10
+**Related files**: `crates/meeting-controller/src/grpc/gc_client.rs:363-388, 453-479`, `crates/global-controller/src/repositories/meeting_controllers.rs:119-158`
+
+**Pattern**: Record metrics immediately at success/error branches with timing captured via `Instant::now()` before operation and `start.elapsed()` after. Common for gRPC calls, database queries, and external service interactions:
+
+```rust
+let start = Instant::now();
+match operation().await {
+    Ok(result) => {
+        let duration = start.elapsed();
+        record_counter("success", type);
+        record_histogram(type, duration);
+        // handle success
+    }
+    Err(e) => {
+        let duration = start.elapsed();
+        record_counter("error", type);
+        record_histogram(type, duration);
+        // handle error
+    }
+}
+```
+
+**Benefits**:
+- Records both success and error latencies (important for SLO tracking)
+- Counter increments track operation frequency
+- Histogram captures latency distribution
+- No metrics missed even on error paths
+
+**Variations**:
+- **Combined function** (AC/GC): Single `record_http_request(method, endpoint, status, duration)` records counter + histogram
+- **Separate functions** (MC): `record_gc_heartbeat(status, type)` for counter, `record_gc_heartbeat_latency(type, duration)` for histogram
+
+**When reviewing**: Both patterns are valid per ADR-0011. Separate functions allow recording only counter OR only histogram if needed. Combined functions reduce duplication at call sites. Note as TECH_DEBT (not BLOCKER) if inconsistent across services.
+
+---

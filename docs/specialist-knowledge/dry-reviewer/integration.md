@@ -191,6 +191,14 @@ ActorMetrics uses identical increment/decrement pattern in 4 methods (`meeting_c
 
 ---
 
+### TD-21: Counter+Histogram Recording Pattern Inconsistency
+**Added**: 2026-02-10
+**Related files**: `crates/meeting-controller/src/observability/metrics.rs:154-174`, `crates/global-controller/src/observability/metrics.rs:43-63`, `crates/ac-service/src/observability/metrics.rs:30-35`
+
+MC uses separate functions for counter and histogram recording (`record_gc_heartbeat()` + `record_gc_heartbeat_latency()`), while AC and GC combine them into single functions (`record_token_issuance()`, `record_http_request()` record both counter and histogram). Severity: Low (both approaches work correctly, stylistic inconsistency only). Improvement path: Consider unifying pattern across services when establishing shared metric patterns (if ever moved to common crate). Timeline: Phase 5+ (infrastructure cleanup). Note: MC pattern allows recording only counter OR only histogram if needed (flexibility), while AC/GC pattern reduces duplication at call sites (convenience). Both are valid per ADR-0011.
+
+---
+
 This differs from Security, Test, and Code Quality reviewers where ALL findings block. Only genuine shared code requiring extraction should be classified as BLOCKER.
 
 **When to block**: Copy-pasted business logic, duplicate utilities that should be in `common/`, identical algorithms across services.
