@@ -1,15 +1,5 @@
 # Operations Integration Notes
 
-*This file captures how Operations coordinates with other specialists.*
+*Captures non-obvious coordination points between Operations and other specialists. Only add entries for things that broke or surprised you during cross-specialist work.*
 
-## With Observability
-
-<!-- Add integration notes as they're established -->
-
-## With Infrastructure
-
-<!-- Add integration notes as they're established -->
-
-## With Service Specialists
-
-<!-- Add integration notes as they're established -->
+---

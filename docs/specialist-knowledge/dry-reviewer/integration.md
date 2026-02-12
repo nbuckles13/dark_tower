@@ -21,27 +21,31 @@ Tracked duplication patterns with assigned IDs for consistent classification.
 
 ---
 
-### TD-1: JWT Validation Duplication (AC vs GC) - RESOLVED
+## Resolved Tech Debt
+
+### TD-1: JWT Validation Duplication (AC vs GC)
 **Added**: 2026-01-15 | **Resolved**: 2026-01-31
 **Related files**: `crates/common/src/jwt.rs` (canonical location)
 
-**RESOLVED**: JWT utilities extracted to `crates/common/src/jwt.rs` per commits babd7f7 and 2b4b70f. Includes `extract_kid()`, clock skew constants (`DEFAULT_CLOCK_SKEW_SECONDS`, `MAX_CLOCK_SKEW_SECONDS`), and `MAX_JWT_SIZE_BYTES`. AC and GC now re-export from common for backwards compatibility.
+JWT utilities extracted to `crates/common/src/jwt.rs` on 2026-01-30. Includes `extract_kid()`, clock skew constants (`DEFAULT_CLOCK_SKEW`, `MAX_CLOCK_SKEW`), `MAX_JWT_SIZE_BYTES`, and `validate_iat()`. AC and GC now import from common instead of duplicating.
 
 ---
 
-### TD-2: EdDSA Key Handling Patterns - RESOLVED
+### TD-2: EdDSA Key Handling Patterns
 **Added**: 2026-01-15 | **Resolved**: 2026-01-31
 **Related files**: `crates/common/src/jwt.rs` (canonical location)
 
-**RESOLVED**: EdDSA key handling consolidated into `crates/common/src/jwt.rs` as part of JWT utilities extraction (commits babd7f7, 2b4b70f). Public key decoding from base64url and DecodingKey creation now shared.
+EdDSA key decoding functions (`decode_ed25519_public_key_pem`, `decode_ed25519_public_key_jwk`) extracted to `crates/common/src/jwt.rs` on 2026-01-30 as part of JWT utilities consolidation. AC and GC use shared implementation for public key decoding from PEM and JWK formats.
 
 ---
 
-### TD-3: ID Validation Function Patterns
+## Active Tech Debt
+
+### TD-3: Enum Duplication (ParticipantType, MeetingRole)
 **Added**: 2026-01-23
-**Related files**: `crates/global-controller/src/auth/`, `crates/ac-service/src/`
+**Related files**: `crates/global-controller/src/services/ac_client.rs:28-45`, `crates/ac-service/src/models/mod.rs:75-110`
 
-`validate_meeting_id` (GC) duplicates structural logic from `validate_controller_id` (AC) - both validate identifier format with similar length/character checks. Severity: Low (validation is intentionally strict per-type). Improvement path: Consider extracting to `common::validation::id` trait when Meeting Controller adds its own ID validation. Timeline: Phase 6+ (when MC implementation begins). Note: Different ID types have different semantic requirements, so some duplication may be acceptable.
+Both `ParticipantType` and `MeetingRole` enums are duplicated between AC and GC. AC defines canonical versions in models, GC duplicates for client requests. Severity: Low (small enums, 3 variants each). Improvement path: Extract to `common::types::ParticipantType` and `common::types::MeetingRole` when third service needs them. Timeline: Phase 7+ (when MH or MC needs participant/role concepts). Note: Current duplication acceptable - extraction cost exceeds benefit for 2 implementations.
 
 ---
 
@@ -118,10 +122,10 @@ All three services have identical tracing_subscriber initialization (~7 lines ea
 ---
 
 ### TD-13: Health Checker Background Task Pattern
-**Added**: 2026-01-31
-**Related files**: `crates/meeting-controller/src/health/checker.rs`, `crates/media-handler/src/health/checker.rs`
+**Added**: 2026-01-31 | **Updated**: 2026-02-11
+**Related files**: `crates/global-controller/src/tasks/health_checker.rs` (381 lines), `crates/global-controller/src/tasks/mh_health_checker.rs` (320 lines)
 
-Both MC and MH implement similar health checker background tasks (~150 lines each, ~300 total): spawn tokio task, periodic check loop with configurable interval, aggregate component health into overall status, expose via gRPC health service. Pattern includes: `HealthChecker` struct with `CancellationToken`, check interval, and atomic health state. Severity: Low (infrastructure, acceptable for 2 services). Improvement path: Consider `common::health::HealthChecker<T: HealthCheckable>` trait when third service needs same pattern. Timeline: Phase 5+ (infrastructure cleanup). Note: Current duplication acceptable - services have different components to check and different aggregation strategies.
+GC implements two nearly-identical health checker background tasks (total ~700 lines): one for Meeting Controllers, one for Media Handlers. Both spawn tokio task, periodic check loop (5s interval), mark stale instances as unhealthy via repository calls, graceful shutdown via CancellationToken. Pattern includes: `DEFAULT_CHECK_INTERVAL_SECONDS`, `tokio::select!` with interval.tick() and cancel_token.cancelled(), extensive integration tests. Severity: Medium (95% structural similarity, significant LOC). Improvement path: Extract to `common::health::StalenessChecker::new(repo, threshold, interval)` generic over repository trait. Timeline: Phase 5+ (infrastructure cleanup). Note: High extraction value - pattern is nearly identical, only repository methods differ.
 
 ---
 
@@ -142,18 +146,18 @@ TokenManager and AcClient both construct reqwest clients with similar pattern: `
 ---
 
 ### TD-16: Mock TokenReceiver Test Helper
-**Added**: 2026-02-02 | **Updated**: 2026-02-02
-**Related files**: `crates/meeting-controller/src/grpc/gc_client.rs:642-659`, `crates/meeting-controller/tests/gc_integration.rs:264-279`, `crates/global-controller/src/services/ac_client.rs` (GC integration)
+**Added**: 2026-02-02 | **Updated**: 2026-02-11
+**Related files**: `crates/meeting-controller/src/grpc/gc_client.rs:645-659`, `crates/meeting-controller/tests/gc_integration.rs:267-279`
 
-Mock TokenReceiver helper functions now exist in both MC (unit tests and integration tests) and GC. All use OnceLock pattern for proper memory management. Severity: Low (3 occurrences across services). Improvement path: Extract to `common::token_manager::test_helpers::mock_receiver()` since both services now use the pattern. Timeline: Next refactoring sprint. Note: Pattern is identical across services and ready for extraction.
+Mock TokenReceiver helper function duplicated within MC (unit tests and integration tests). Uses OnceLock pattern for proper memory management. Severity: Low (2 occurrences in same service). Improvement path: Extract to `common::token_manager::test_helpers::mock_receiver()` when third occurrence appears (e.g., GC tests). Timeline: Next refactoring sprint or when GC adds similar test helper. Note: GC does not currently have this pattern - MC-only duplication.
 
 ---
 
-### TD-17: OAuth Config Fields Pattern
-**Added**: 2026-02-02 | **Updated**: 2026-02-02 | **RESOLVED**
-**Related files**: `crates/meeting-controller/src/config.rs:96-105`, `crates/global-controller/src/config.rs`
+### TD-17: OAuth Config Fields Pattern - NOT A VIOLATION
+**Added**: 2026-02-02 | **Updated**: 2026-02-11 | **Status**: Closed (expected duplication)
+**Related files**: `crates/meeting-controller/src/config.rs`, `crates/global-controller/src/config.rs`
 
-Both MC and GC now have OAuth credential fields (`ac_endpoint`, `client_id`, `client_secret`). Severity: Low (acceptable service-specific config). Status: RESOLVED - Both services integrated. No extraction needed - credentials are service-specific (MC authenticates to GC, GC authenticates to AC). Note: This is expected duplication, not a DRY violation.
+Both MC and GC have OAuth credential fields for TokenManager integration. Severity: N/A (intentional, not a violation). Status: This is EXPECTED duplication, not a DRY violation. Each service authenticates to a different upstream (MC → GC, GC → AC), so separate configuration is architecturally correct. Closing as "not a tech debt item".
 
 ---
 

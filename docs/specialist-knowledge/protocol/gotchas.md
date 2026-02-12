@@ -1,15 +1,5 @@
 # Protocol Gotchas
 
-*This file accumulates protocol design pitfalls to avoid. Updated from experience.*
+*Accumulates protocol design pitfalls discovered during implementation. Only add entries for things that actually caused wire-format bugs, backward-compatibility breaks, or wasted debugging time.*
 
-## Protobuf Gotchas
-
-<!-- Add gotchas as they're discovered -->
-
-## Versioning Gotchas
-
-<!-- Add gotchas as they're discovered -->
-
-## Binary Format Gotchas
-
-<!-- Add gotchas as they're discovered -->
+---

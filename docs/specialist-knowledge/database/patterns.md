@@ -1,15 +1,5 @@
 # Database Patterns
 
-*This file accumulates successful database patterns. Updated after each implementation.*
+*Accumulates non-obvious database patterns learned through implementation. Don't describe what the schema does — capture what surprised you, what broke, what wasn't obvious from reading the migrations.*
 
-## Schema Patterns
-
-<!-- Add patterns as they're established -->
-
-## Migration Patterns
-
-<!-- Add patterns as they're established -->
-
-## Query Patterns
-
-<!-- Add patterns as they're established -->
+---

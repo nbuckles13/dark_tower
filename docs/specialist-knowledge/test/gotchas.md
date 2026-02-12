@@ -1,6 +1,6 @@
 # Test Specialist - Gotchas
 
-Common test coverage gaps and pitfalls to watch for.
+Project-specific test pitfalls for Dark Tower. Coverage gaps and surprising behaviors.
 
 ---
 
@@ -8,246 +8,95 @@ Common test coverage gaps and pitfalls to watch for.
 **Added**: 2026-01-11
 **Related files**: `crates/ac-service/src/config.rs`
 
-The `validate_tls_config()` function returns early when `cfg!(test)` is true. This means TLS warning tests cannot be written as unit tests. Requires integration test with real tracing subscriber or manual E2E testing.
+TLS validation returns early in cfg(test). TLS warning tests need integration tests with real tracing, can't be unit tests.
 
 ---
 
-## Gotcha: Bcrypt Timing Makes Higher Cost Tests Slow
+## Gotcha: Bcrypt Timing Makes Tests Slow
 **Added**: 2026-01-11
 **Related files**: `crates/ac-service/src/crypto/mod.rs`
 
-Bcrypt cost 14 takes ~800ms per hash. Tests like `test_hash_verification_works_across_cost_factors` that hash at all valid costs (10-14) take several seconds. Consider using `#[ignore]` for slow tests or only testing min/default/max in CI.
+Cost 14 takes ~800ms per hash. Cross-cost tests take seconds. Use #[ignore] for slow tests or test only min/default/max.
 
 ---
 
-## Gotcha: Database Tests Need Migrations
+## Gotcha: Database Tests Need Migrations Attribute
 **Added**: 2026-01-11
 **Related files**: `crates/ac-service/src/handlers/admin_handler.rs`
 
-Handler integration tests use `#[sqlx::test(migrations = "../../migrations")]`. Without this attribute, tests get empty database without tables. Always use migration attribute for database-dependent tests.
+Always use `#[sqlx::test(migrations = "../../migrations")]` for database tests. Without it, empty database with no tables.
 
 ---
 
-## Gotcha: Auth Events Foreign Key Constraint
-**Added**: 2026-01-11
-**Related files**: `crates/ac-service/src/handlers/admin_handler.rs`
-
-Delete client tests create credentials directly via repository to avoid creating `auth_events` records. Using `handle_create_client` creates audit records which may cause FK constraint issues on delete in some test scenarios.
-
----
-
-## Gotcha: Config from_vars vs from_env
-**Added**: 2026-01-11
-**Related files**: `crates/ac-service/src/config.rs`
-
-Tests use `Config::from_vars()` with HashMap, but production uses `Config::from_env()`. Ensure both paths are tested. Currently `from_env()` is a thin wrapper around `from_vars()`, but if that changes, tests could miss bugs.
-
----
-
-## Gotcha: Integration Test Modules Must Be Included
+## Gotcha: Integration Test Modules Must Be Included in mod.rs
 **Added**: 2026-01-12
 **Related files**: `crates/ac-service/tests/integration/mod.rs`
 
-When adding new integration test files, they MUST be added to `mod.rs` (e.g., `mod clock_skew_tests;`). Otherwise, the test file is never compiled or executed, and test failures are silently ignored. Symptom: file exists but `cargo test` shows 0 tests from that module.
+Add new test files to mod.rs or they're never compiled. Symptom: file exists, cargo test shows 0 tests from module. Silent failure.
 
 ---
 
-## Gotcha: SecretBox/SecretString Type Mismatches After Refactor
+## Gotcha: SecretBox Type Mismatches After Refactor
 **Added**: 2026-01-12, **Updated**: 2026-01-28
-**Related files**: `crates/ac-service/src/crypto/mod.rs`, `crates/meeting-controller/tests/`, integration tests
+**Related files**: `crates/ac-service/src/crypto/mod.rs`
 
-When refactoring fields to use `SecretBox<T>` or `SecretString`, existing test code that constructs those structs will have type mismatches. Example: if `EncryptedKey.encrypted_data` changes from `Vec<u8>` to `SecretBox<Vec<u8>>`, tests must change from:
-```rust
-encrypted_data: signing_key.private_key_encrypted.clone()
-```
-to:
-```rust
-encrypted_data: SecretBox::new(Box::new(signing_key.private_key_encrypted.clone()))
-```
-The compiler catches this, but orphaned test files (not in mod.rs) won't be compiled.
-
-**2026-01-28 update**: Phase 6c review confirmed this pattern holds for MC test helpers. When `SessionBindingManager.master_secret` changed from `Vec<u8>` to `SecretBox<Vec<u8>>`, test files needed:
-- Constructor call wrapping: `SecretBox::new(Box::new(master_secret_bytes))`
-- HKDF access sites: `.expose_secret()` to derive keys
-- No NEW test cases needed - existing tests remain valid after type updates
-This is intentional - SecretBox is a transparent wrapper that preserves semantics while adding memory zeroing and redaction. The refactor is ~100% mechanical.
-
----
-
-## Gotcha: Database Models vs Crypto Structs Have Different Types
-**Added**: 2026-01-12
-**Related files**: `crates/ac-service/src/models/mod.rs`, `crates/ac-service/src/crypto/mod.rs`
-
-Database models (e.g., `SigningKey` from sqlx) store raw `Vec<u8>` for encrypted data. Crypto structs (e.g., `EncryptedKey`) may use `SecretBox<Vec<u8>>`. When constructing crypto structs from DB models, always wrap with `SecretBox::new(Box::new(...))`. This is intentional - DB layer is raw bytes, crypto layer protects them.
+SecretBox refactors need wrapping at construction (`SecretBox::new(Box::new(...))`), unwrapping at access (`.expose_secret()`). Compiler catches, but orphaned test files (not in mod.rs) won't compile. Updates mechanical, no new test cases needed.
 
 ---
 
 ## Gotcha: env-tests Feature Gates Require Explicit Flags
 **Added**: 2026-01-13
-**Related files**: `crates/env-tests/Cargo.toml`, `crates/env-tests/tests/*.rs`
+**Related files**: `crates/env-tests/Cargo.toml`
 
-env-tests has no default features - tests require explicit `--features` flag:
-```bash
-cargo test -p env-tests                     # Runs 0 tests!
-cargo test -p env-tests --features smoke    # Runs smoke tests (~30s)
-cargo test -p env-tests --features flows    # Runs flow tests (~2-3min)
-cargo test -p env-tests --features all      # Runs all tests (~8-10min)
-```
-Symptom: `cargo test --workspace` shows env-tests compiles but runs 0 tests. This is intentional - env-tests require cluster infrastructure.
+env-tests has no default features. `cargo test -p env-tests` runs 0 tests. Must use `--features smoke/flows/all`. Intentional - requires cluster.
 
 ---
 
-## Gotcha: NetworkPolicy Tests Require Matching Pod Labels
-**Added**: 2026-01-13
-**Related files**: `crates/env-tests/tests/40_resilience.rs`
-
-When testing that same-namespace traffic is ALLOWED by NetworkPolicy, the canary pod must have labels that match the NetworkPolicy's ingress rules. If AC service's NetworkPolicy only allows `app=global-controller`, a canary with `app=canary` will be blocked even in the same namespace.
-
-Solution: Make canary pod labels configurable. Positive tests use allowed labels, negative tests use non-matching labels.
-
----
-
-## Gotcha: Synchronous kubectl in Async Context
-**Added**: 2026-01-13
-**Related files**: `crates/env-tests/src/canary.rs`
-
-`std::process::Command` is synchronous but used in async test functions. This works but blocks the executor during kubectl calls. For test code this is acceptable - test execution is sequential anyway.
-
-For production async code, consider:
-- `tokio::process::Command` for async subprocess
-- `kube` crate for native async Kubernetes API
-- Spawning blocking task: `tokio::task::spawn_blocking(...)`
-
----
-
-## Gotcha: TestGcServer Random Port Binding
+## Gotcha: TestServer Random Port Only Known After Bind
 **Added**: 2026-01-14
 **Related files**: `crates/gc-test-utils/src/server_harness.rs`
 
-TestGcServer binds to "127.0.0.1:0" which gives a random available port. This is correct and intentional for:
-- Parallel test execution (no port conflicts)
-- Running tests on systems where specific ports are unavailable
-
-However, the address is ONLY available AFTER binding:
-```rust
-// WRONG: addr is not determined yet
-let config = build_config(8000);  // Hardcoded port
-
-// RIGHT: get addr after binding
-let listener = TcpListener::bind("127.0.0.1:0").await?;
-let addr = listener.local_addr()?;  // Now we know the port
-```
-
-Also remember: Drop impl calls `_handle.abort()` which stops the background server when test ends.
-
----
-
-## Gotcha: IntoResponse Body Reading Requires Full Buffering
-**Added**: 2026-01-14
-**Related files**: `crates/global-controller/src/errors.rs` (tests)
-
-Reading response body from axum IntoResponse:
-```rust
-// Helper needed:
-async fn read_body_json(body: Body) -> serde_json::Value {
-    let bytes = body.collect().await.unwrap().to_bytes();
-    serde_json::from_slice(&bytes).unwrap()
-}
-
-// WRONG: body.to_string() - body is not a String
-// RIGHT: use collect().to_bytes() to buffer full body
-let json: serde_json::Value = read_body_json(response.into_body()).await;
-assert_eq!(json["error"]["code"], "DATABASE_ERROR");
-```
-
-Body is a stream that must be fully buffered before JSON parsing. The `http_body_util::BodyExt` trait provides `.collect()` which buffers the full body into bytes.
-
----
-
-## Gotcha: #[allow(dead_code)] on Skeleton Code
-**Added**: 2026-01-14
-**Related files**: `crates/global-controller/src/models/mod.rs`, `crates/global-controller/src/errors.rs`
-
-GC Phase 1 defines enum variants and methods that won't be used until Phase 2+:
-- `MeetingStatus::Active` (used in Phase 2 meeting lifecycle)
-- `GcError::Conflict` (used when managing concurrent operations)
-- Methods like `MeetingStatus::as_str()` that aren't called in Phase 1
-
-These require `#[allow(dead_code)]` to prevent clippy warnings. Document the phase when they'll be used. This is intentional skeleton code - DO NOT remove these.
+TestServer binds to 127.0.0.1:0 for random port. Address only available AFTER binding. Get with `listener.local_addr()`, not before. Drop impl aborts server.
 
 ---
 
 ## Gotcha: JWT Size Boundary Off-by-One Errors
 **Added**: 2026-01-14
-**Related files**: `crates/global-controller/src/auth/jwt.rs`, `crates/global-controller/tests/auth_tests.rs`
+**Related files**: `crates/global-controller/tests/auth_tests.rs`
 
-Size checks like "token.len() > 8192" can be error-prone:
-- `> 8192` means 8192 is accepted but 8193 is rejected (correct for 8KB limit)
-- `>= 8192` means 8192 is rejected (off by one - 8191 is max)
-- `> 8191` means 8192 is accepted (correct, but confusing - prefer `> 8192`)
-
-The gotcha: Tests that only check "small tokens pass, large tokens fail" won't catch off-by-one errors. You need explicit boundary tests:
-- Exactly at limit (should pass)
-- One byte over (should fail)
-
-Without these tests, an attacker could exploit an off-by-one to bypass the limit and cause DoS.
+Test exact boundary (should pass) and one byte over (should fail). Tests checking only "small pass, large fail" miss off-by-one that attackers exploit for DoS.
 
 ---
 
-## Gotcha: Algorithm Confusion Tests Need Multiple Attack Vectors
+## Gotcha: Algorithm Confusion Needs Multiple Attack Vectors
 **Added**: 2026-01-14
 **Related files**: `crates/global-controller/tests/auth_tests.rs`
 
-Testing that "EdDSA tokens are accepted" is not enough. You must also test:
-1. **alg:none** - Attacker removes signature requirement (CVE-2016-10555)
-2. **alg:HS256** - Attacker uses symmetric algorithm (CVE-2017-11424)
-3. **Missing alg** - Attacker removes algorithm header
-
-Each attack vector can be exploited independently. Testing only "alg:none" won't catch "alg:HS256" vulnerabilities.
+Test alg:none, alg:HS256, missing alg separately. Each exploitable independently. Testing only one vector misses others (CVE-2016-10555, CVE-2017-11424).
 
 ---
 
-## Gotcha: JWK Structure Validation vs Signature Validation
+## Gotcha: JWK Structure Validation Required
 **Added**: 2026-01-14
 **Related files**: `crates/global-controller/src/auth/jwt.rs`
 
-Don't assume a JWK from a JWKS endpoint is valid just because it's in the endpoint response:
-- JWKS endpoint could be compromised
-- JWKS endpoint could be misconfigured
-- A man-in-the-middle could modify the response
-
-Always validate JWK structure BEFORE using it:
-- Check `kty` (key type) matches expected value
-- Check `alg` (if present) matches expected value
-- Check required fields are present (e.g., `x`, `y` for OKP/EdDSA)
-
-Silent failures here lead to accepting invalid signatures from the wrong key type.
+Validate JWK structure before use (kty, alg, required fields). JWKS endpoint could be compromised/misconfigured or MITM'd. Silent failures accept invalid signatures.
 
 ---
 
-## Gotcha: Integration Test Database Setup Isolation
+## Gotcha: sqlx::test Isolation Prevents Cross-Test Data Sharing
 **Added**: 2026-01-15
 **Related files**: `crates/ac-service/tests/integration/user_service_tests.rs`
 
-Each test using `#[sqlx::test(migrations = "...")]` gets its own database transaction that rolls back at test completion. This is excellent for isolation BUT creates a gotcha:
-- Tests can see data from within their own transaction
-- Tests CANNOT see data from other tests (each runs in separate transaction)
-- Migrations run for EACH test (not once for test suite)
-
-This means:
-1. You CANNOT have one test create a user and another test fetch it - separate transactions
-2. If a test inserts 100 records and rolls back, the next test doesn't see them (correct isolation)
-3. Never write tests that depend on state from a previous test
-
-This is by design and catches invalid test dependencies early.
+Each `#[sqlx::test]` gets separate transaction, rolls back at completion. Tests can't see data from other tests. Migrations run per test. Never write tests depending on state from previous test. By design, catches invalid dependencies.
 
 ---
 
-## Gotcha: Custom Debug Not Sufficient for Error Response Bodies
+## Gotcha: Custom Debug Not Sufficient for Error Bodies
 **Added**: 2026-01-18
 **Related files**: `crates/env-tests/src/fixtures/gc_client.rs`
 
-Custom Debug implementations only redact when Debug formatting is used. Error response bodies stored in error variants (e.g., `RequestFailed { status, body }`) can still leak credentials through other paths: (1) Test assertions with `assert_eq!`, (2) Error `Display` implementations, (3) Logging with `{:?}` on the body directly. Solution: Sanitize error bodies at capture time, not just in Debug. The `sanitize_error_body()` pattern removes JWTs and Bearer tokens before storing in error variants.
+Custom Debug only redacts in Debug formatting. Error bodies leak through assert_eq!, Display, direct logging. Sanitize at capture time, not just Debug. Remove JWTs/Bearer tokens before storing in error variants.
 
 ---
 
@@ -255,14 +104,7 @@ Custom Debug implementations only redact when Debug formatting is used. Error re
 **Added**: 2026-01-18
 **Related files**: `crates/env-tests/src/fixtures/gc_client.rs`
 
-`response.text().await` consumes the response body. If you try to check `response.status()` afterward, you get a borrow-after-move error. Solution: Store status before consuming body:
-```rust
-let status = response.status();  // Get status first
-let body = response.text().await?;  // Then consume body
-if !status.is_success() {
-    return Err(Error::RequestFailed { status, body: sanitize_error_body(&body) });
-}
-```
+`response.text().await` consumes body. Store `response.status()` before consuming, else borrow-after-move error.
 
 ---
 
@@ -270,156 +112,39 @@ if !status.is_success() {
 **Added**: 2026-01-25
 **Related files**: `crates/meeting-controller/tests/session_actor_tests.rs`
 
-Tests that check time-dependent behavior (timeouts, grace periods, TTL) can be flaky if they use real time:
-
-```rust
-// FLAKY: depends on actual timing
-#[tokio::test]
-async fn test_grace_period_flaky() {
-    let handle = spawn_with_30s_grace_period();
-    tokio::time::sleep(Duration::from_secs(31)).await;  // Actually waits 31 seconds!
-    assert!(!handle.is_active());  // Sometimes fails under load
-}
-
-// CORRECT: use pause() for deterministic control
-#[tokio::test(start_paused = true)]
-async fn test_grace_period_deterministic() {
-    let handle = spawn_with_30s_grace_period();
-    tokio::time::advance(Duration::from_secs(31)).await;  // Instant
-    assert!(!handle.is_active());  // Always passes
-}
-```
-
-Without `pause()`, time-based tests either:
-1. Run slowly (actually waiting 30+ seconds)
-2. Are flaky (timing depends on system load)
-3. Use loose tolerances that miss boundary bugs
-
-Always use `#[tokio::test(start_paused = true)]` or call `tokio::time::pause()` for time-sensitive tests.
+Real time tests are flaky or slow. Use `#[tokio::test(start_paused = true)]` and `tokio::time::advance()` for deterministic, instant, boundary-precise tests.
 
 ---
 
 ## Gotcha: Lua Script Structural Tests Miss Logic Errors
 **Added**: 2026-01-25
-**Related files**: `crates/meeting-controller/src/redis_scripts.rs`, `crates/meeting-controller/tests/redis_lua_tests.rs`
+**Related files**: `crates/meeting-controller/tests/redis_lua_tests.rs`
 
-Testing that a Lua script "runs without error" catches syntax errors but misses logic errors:
-
-```rust
-// INSUFFICIENT: only catches syntax errors
-#[test]
-fn test_lua_script_loads() {
-    let script = Script::new(FENCING_SCRIPT);
-    let result = script.invoke(&mut conn).await;
-    assert!(result.is_ok()); // Script ran... but did it do the right thing?
-}
-
-// REQUIRED: verify actual behavior
-#[test]
-fn test_lua_script_rejects_stale_generation() {
-    set_generation(&mut conn, "key", 5).await;
-    let result = fenced_write(&mut conn, "key", /*generation=*/3, "value").await;
-    assert!(result.is_err()); // Verify fencing WORKS, not just runs
-}
-```
-
-This gotcha appeared in Phase 6c review: 11 behavioral tests were added for Lua scripts that had only structural coverage. The structural tests passed even when fencing logic was incorrect because the scripts would run but return wrong values.
-
-Test matrix for fencing Lua scripts:
-- Generation higher than current (should accept and update)
-- Generation equal to current (should accept)
-- Generation lower than current (should reject)
-- No existing generation (first write, should accept)
+"Script runs without error" catches syntax, misses logic. Test actual behavior: current generation (accept), higher (accept+update), lower (reject), no generation (first write, accept). Structural tests passed in Phase 6c even when fencing logic wrong.
 
 ---
 
-## Gotcha: Boundary Tests That Pass For Wrong Reasons
+## Gotcha: Boundary Tests Pass For Wrong Reasons
 **Added**: 2026-01-31
 **Related files**: `crates/common/src/jwt.rs`
 
-A boundary test can pass even when broken if the failure mode differs from what's asserted. Example: A JWT size limit test created a 2-part token (`header.payload`) instead of valid 3-part (`header.payload.signature`). The test asserted "not TokenTooLarge" and passed - but only because the token was rejected as `MalformedToken` before the size check.
-
-**Prevention pattern**:
-1. Assert the EXACT boundary value: `assert_eq!(token.len(), MAX_SIZE)`
-2. Assert SUCCESS, not just "not this specific error": `assert!(result.is_ok())`
-3. Verify the expected value was extracted: `assert_eq!(result.unwrap(), "expected")`
-
-```rust
-// BAD: Passes even when test is broken
-assert!(!matches!(result, Err(TokenTooLarge)));
-
-// GOOD: Verifies exact behavior
-assert_eq!(token.len(), MAX_JWT_SIZE_BYTES);
-assert!(result.is_ok());
-assert_eq!(result.unwrap(), "key");
-```
+Boundary test can pass with broken test if failure mode differs from assertion. Example: JWT size test created 2-part token, asserted "not TokenTooLarge", passed because rejected as MalformedToken first. Prevention: (1) assert exact boundary value, (2) assert SUCCESS not "not error", (3) verify extracted value.
 
 ---
 
-## Gotcha: Database Error Paths Require sqlx Mocking (Often Deferred)
+## Gotcha: Database Error Paths Hard to Test (Often Deferred)
 **Added**: 2026-01-23
 **Related files**: `crates/global-controller/src/gc_assignment_cleanup.rs`
 
-Testing error paths in functions that use sqlx database operations is difficult because:
-1. sqlx compile-time checked queries connect to real databases
-2. No built-in mocking layer for sqlx - you cannot easily inject "return error on next query"
-3. Creating actual database errors (constraint violations, connection failures) requires complex test setup
-
-Common workarounds:
-- **Trait abstraction**: Define a repository trait, implement it for sqlx, mock in tests (significant refactor)
-- **Test containers**: Use testcontainers to kill/pause database mid-operation (slow, flaky)
-- **Integration-level errors**: Test at HTTP layer where you can return error responses
-
-Result: Error path tests for internal database functions often get **deferred** to tech debt. Document the gap explicitly (e.g., "Deferred: error path tests for run_cleanup() - requires sqlx mocking"). This prevents future reviewers from flagging the same gap without understanding why.
+sqlx compile-time queries need real database, no built-in mocking. Workarounds (trait abstraction, testcontainers) complex/slow. Error path tests for internal DB functions often deferred to tech debt. Document explicitly to prevent re-flagging.
 
 ---
 
-## Gotcha: Integration Tests Can Miss Component Method Tests
-**Added**: 2026-01-31
-**Related files**: `crates/meeting-controller/tests/gc_integration.rs`, `crates/meeting-controller/src/actors/metrics.rs`
+## Gotcha: Integration Tests Can Miss Helper Method Tests
+**Added**: 2026-01-31, **Updated**: 2026-02-10
+**Related files**: `crates/meeting-controller/src/actors/metrics.rs`
 
-Integration tests exercise full flows but may not cover individual helper methods directly. Example from Phase 6c:
-
-**What was tested**: Heartbeat integration tests verified metrics were reported to GC (values appeared in heartbeat requests)
-**What was missed**: The `ControllerMetrics::snapshot()` method itself had no unit test
-
-The gotcha: Integration tests confirmed snapshot() worked indirectly (heartbeats sent correct values), but the method's API wasn't explicitly tested. If snapshot() had a bug like swapping fields:
-```rust
-pub fn snapshot(&self) -> ControllerMetricsSnapshot {
-    ControllerMetricsSnapshot {
-        meetings: self.current_participants.load(...),      // BUG: wrong field!
-        participants: self.current_meetings.load(...),      // BUG: swapped!
-    }
-}
-```
-...integration tests might not catch it if both counts happened to be similar values.
-
-**Solution**: Add focused unit tests for helper methods even when integration tests exercise them:
-```rust
-#[test]
-fn test_controller_metrics_snapshot() {
-    let metrics = ControllerMetrics::new();
-    metrics.set_meetings(5);
-    metrics.set_participants(42);
-
-    let snapshot = metrics.snapshot();
-    assert_eq!(snapshot.meetings, 5);        // Explicit field verification
-    assert_eq!(snapshot.participants, 42);
-}
-```
-
-This caught in Round 3 review: snapshot() method used in production (main.rs lines 264, 274) but had zero direct tests. Integration tests proved it "worked" but didn't verify the method's contract.
-
-**When to add unit tests for methods covered by integration tests**:
-1. Method has complex logic (field mappings, calculations, conditionals)
-2. Method is public API used by multiple callers
-3. Method has edge cases that integration tests might not hit
-4. Failure would be subtle (swapped fields, off-by-one, wrong units)
-
-**When integration coverage is sufficient**:
-1. Method is simple delegation (e.g., `pub fn value(&self) -> T { self.inner.value() }`)
-2. Method is private and called by exactly one tested code path
-3. Failure would be obvious (type error, crash, clearly wrong result)
+Integration tests exercise flows but may miss helper methods. Phase 6c: heartbeat tests verified metrics reported but `snapshot()` method itself untested. Add unit tests when: (1) complex logic, (2) public API, (3) subtle failures (swapped fields). Skip when: (1) simple delegation, (2) private single-caller, (3) obvious failures.
 
 ---
 
@@ -427,19 +152,7 @@ This caught in Round 3 review: snapshot() method used in production (main.rs lin
 **Added**: 2026-02-02
 **Related files**: `crates/common/src/token_manager.rs`
 
-When reviewing code with explicit error handling (match arms, if-else branches for error statuses), don't assume the error paths have tests just because the code explicitly handles them. The TokenManager review found 3 MAJOR gaps where error branches were written but untested:
-
-- 401/400 status handling: Code explicitly matched `status.as_u16() == 401 || status.as_u16() == 400` but no test verified this path
-- Invalid JSON: Code had `.json().await.map_err(|e| TokenError::InvalidResponse(...))` but no test triggered it
-- Missing OAuth fields: Deserialize would fail on missing `access_token` but no test covered this
-
-**Review checklist for error handling code**:
-1. For each explicit error branch in the code, search for a corresponding test
-2. Pay special attention to HTTP status code handling (4xx, 5xx branches)
-3. Check JSON/deserialization error paths
-4. Verify timeout/connection error paths
-
-**Why this happens**: Developers write defensive error handling during implementation, then only write happy-path tests. The code "looks complete" with explicit error handling, masking the missing test coverage.
+Don't assume error paths tested just because code handles them explicitly. TokenManager had 3 MAJOR gaps: 401/400 status handling, invalid JSON, missing OAuth fields. Review checklist: (1) search for test per error branch, (2) check HTTP status handling, (3) verify JSON/deserialization paths, (4) verify timeout/connection paths. Happens when developers write defensive handling then only write happy-path tests.
 
 ---
 
@@ -447,18 +160,7 @@ When reviewing code with explicit error handling (match arms, if-else branches f
 **Added**: 2026-02-08
 **Related files**: `crates/global-controller/tests/auth_tests.rs`, `crates/global-controller/tests/health_tests.rs`
 
-When endpoint behavior changes (e.g., `/health` from JSON to plain text "OK"), tests may exist in MULTIPLE test files that all need updating. In the GC observability review, the `/health` endpoint was tested in:
-- `auth_tests.rs`: `test_health_endpoint_is_public`
-- `health_tests.rs`: `test_health_endpoint_returns_200`, `test_health_endpoint_returns_json`
-
-All three tests expected JSON response but endpoint now returns plain text for Kubernetes liveness probes. The gotcha: fixing one test file and assuming you're done.
-
-**Prevention pattern**:
-1. When changing endpoint behavior, search all test files: `grep -r "health" crates/*/tests/`
-2. Check for both direct endpoint tests AND tests that use the endpoint as setup
-3. Verify test names match updated behavior (rename `test_health_endpoint_returns_json` to `test_ready_endpoint_returns_json` when testing `/ready` instead)
-
-This is especially common for health/ready endpoints which are often tested as "works without auth" examples in auth test suites.
+When endpoint behavior changes (e.g., `/health` from JSON to plain text "OK"), tests may exist in MULTIPLE test files that all need updating. Search all test files: `grep -r "health" crates/*/tests/`. Check for both direct endpoint tests AND tests that use the endpoint as setup. This is especially common for health/ready endpoints tested as "works without auth" examples in auth test suites.
 
 ---
 
@@ -466,58 +168,14 @@ This is especially common for health/ready endpoints which are often tested as "
 **Added**: 2026-02-09
 **Related files**: `crates/global-controller/src/observability/metrics.rs`, `crates/global-controller/src/services/mh_selection.rs`
 
-When reviewing observability implementations, `#[allow(dead_code)]` on metric recording functions is a red flag that metrics are defined but NOT wired into production code paths.
-
-**Detection pattern**:
-1. Search metrics.rs for `#[allow(dead_code)]` annotations
-2. For each flagged function, search for call sites in services/repositories
-3. If no call sites exist, the metric is "defined but not wired" (coverage gap)
-
-**GC observability review example**:
-- `record_mh_selection` was defined with `#[allow(dead_code)]`
-- `MhSelectionService::select_mhs_for_meeting` did NOT call it
-- Fix: Wire `record_mh_selection` calls for success (with has_backup label) and error paths
-
-**Contrast with intentional skeleton code**:
-- Skeleton code (Gotcha from 2026-01-14) uses `#[allow(dead_code)]` on enum variants and types planned for future phases
-- Metrics functions are NOT skeleton code - they're defined for immediate use but forgotten during implementation
-
-**Cross-crate dependency exception**:
-Sometimes metrics CAN'T be wired due to architecture. Example: `record_token_refresh` metrics for TokenManager (lives in `common` crate) cannot depend on `global-controller`. In this case:
-1. Remove the unwirable functions from metrics.rs
-2. Document the architectural constraint in code comments
-3. Track as tech debt with options: callback mechanism, feature flag, or metrics trait in common crate
+`#[allow(dead_code)]` on metric recording functions is a red flag that metrics are defined but NOT wired into production code paths. Detection: search metrics.rs for the annotation, then search for call sites. Contrast with intentional skeleton code which uses `#[allow(dead_code)]` on enum variants planned for future phases — metrics functions are defined for immediate use but forgotten during implementation.
 
 ---
 
-## Gotcha: Observability Wiring May Not Need Explicit Prometheus Mocking
-**Added**: 2026-02-05
+## Gotcha: Observability Wiring May Not Need Prometheus Mocking
+**Added**: 2026-02-05, **Updated**: 2026-02-10
 **Related files**: `crates/meeting-controller/src/actors/metrics.rs`
 
-When adding Prometheus wiring to existing code, don't require explicit tests that mock Prometheus and assert it was called. For simple wiring (direct function calls, no branching logic), existing behavior tests provide sufficient coverage:
+Simple wiring (direct calls, no branching) doesn't need explicit "mock Prometheus and assert called" tests. Existing behavior tests + wrapper module tests sufficient. Require explicit tests only for: conditional emission, aggregation/batching, error handling that might suppress. For simple wiring, behavior verification sufficient.
 
-```rust
-// INSUFFICIENT REQUIREMENT (too strict for simple wiring):
-// "Add test that explicitly mocks prom::set_meetings_active() and verifies it was called"
-
-// SUFFICIENT (what existing tests already verify):
-#[test]
-fn test_actor_metrics() {
-    let metrics = ActorMetrics::new();
-    metrics.meeting_created();
-    assert_eq!(metrics.meeting_count(), 1);  // Behavior verified, Prometheus call executes
-}
-```
-
-Why this works:
-- Wiring is simple (direct calls, no conditions)
-- Wrapper module has its own comprehensive tests (14 tests for observability::metrics)
-- Behavior tests exercise the code paths (functions called = Prometheus emitted)
-- Risk of regression is low (compiler catches if function is removed)
-
-When to require explicit Prometheus tests:
-- If wiring code has conditional emission (only emit if X > threshold)
-- If wiring aggregates/batches metrics
-- If wiring has error handling that might suppress emission
-
-For simple direct-call wiring like MC metrics, behavior verification is sufficient.
+---

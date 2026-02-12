@@ -1,15 +1,5 @@
 # Database Integration Notes
 
-*This file captures how Database specialist coordinates with services.*
+*Captures non-obvious coordination points between Database specialist and other services. Only add entries for things that broke or surprised you during cross-service work.*
 
-## With Auth Controller
-
-<!-- Add integration notes as they're established -->
-
-## With Global Controller
-
-<!-- Add integration notes as they're established -->
-
-## With Operations
-
-<!-- Add integration notes as they're established -->
+---

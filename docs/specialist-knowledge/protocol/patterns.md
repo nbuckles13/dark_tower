@@ -1,15 +1,5 @@
 # Protocol Patterns
 
-*This file accumulates successful protocol design patterns. Updated after each implementation.*
+*Accumulates non-obvious protocol design patterns learned through implementation. Don't describe what the .proto files say — capture what surprised you, backward-compatibility traps, and things ADR-0004 doesn't cover.*
 
-## Message Design Patterns
-
-<!-- Add patterns as they're established -->
-
-## Versioning Patterns
-
-<!-- Add patterns as they're established -->
-
-## Backward Compatibility Patterns
-
-<!-- Add patterns as they're established -->
+---

@@ -11,6 +11,8 @@ Next review: 2027-02-10
 | Symmetric encryption | AES-256-GCM | ring | AEAD |
 | Password hashing | bcrypt | bcrypt crate | cost=12 (~250ms) |
 | Random generation | CSPRNG | ring::rand::SystemRandom | Required for all secrets |
+| Key derivation | HKDF-SHA256 | ring::hkdf | Per-resource key scoping |
+| Message authentication | HMAC-SHA256 | ring::hmac | Session binding tokens |
 
 ## Deprecated (do not use)
 
@@ -20,13 +22,17 @@ Next review: 2027-02-10
 | RSA < 2048 | Weak key size | Ed25519 |
 | MD5, SHA1 | Collision attacks | SHA-256+ |
 | DES, 3DES, RC4 | Weak algorithms | AES-256-GCM |
+| Direct master key usage | No isolation | HKDF for per-resource keys |
 
 ## Usage Guidelines
 
 - Always use ring crate for new crypto operations
-- Use constant-time comparisons via `subtle` crate
+- Use constant-time comparisons via `ring::constant_time::verify_slices_are_equal()` or `subtle::ConstantTimeEq`
+- For HMAC verification, use `ring::hmac::verify()` which performs constant-time comparison internally
 - Generate all secrets with SystemRandom, never rand crate
 - Tune bcrypt cost for ~250ms on target hardware
+- Use HKDF to derive per-resource keys from master secrets
+- Wrap all secrets in `SecretBox<T>` or `SecretString` for automatic redaction
 
 ## Review Triggers
 

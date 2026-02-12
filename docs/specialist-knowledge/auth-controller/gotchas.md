@@ -154,6 +154,30 @@ The semantic guard flags `client_id` in `#[instrument(fields(...))]` as a creden
 
 ---
 
+## Gotcha: SecretBox Requires Manual Clone Implementation
+**Added**: 2026-02-10
+**Related files**: `crates/ac-service/src/config.rs`, `crates/ac-service/src/crypto/mod.rs`
+
+Structs containing `SecretBox` fields cannot `#[derive(Clone)]` because SecretBox deliberately doesn't implement Clone automatically. Implement Clone manually by exposing, cloning, and re-wrapping: `SecretBox::new(Box::new(self.field.expose_secret().clone()))`. Same applies to custom Debug implementations for redaction.
+
+---
+
+## Gotcha: HMAC Hash Prefix Distinguishes Algorithm
+**Added**: 2026-02-10
+**Related files**: `crates/ac-service/src/observability/mod.rs`
+
+Correlation hashes use `h:` prefix (e.g., `h:a1b2c3d4`) to distinguish HMAC-SHA256 from legacy SHA-256 hashes. The prefix prevents confusion when analyzing logs that may contain both hash types. Always include prefix when formatting hash output: `format!("h:{}", hex::encode(prefix))`.
+
+---
+
+## Gotcha: Metrics Middleware Must Be Outermost Layer
+**Added**: 2026-02-10
+**Related files**: `crates/ac-service/src/middleware/http_metrics.rs`, `crates/ac-service/src/routes/mod.rs`
+
+HTTP metrics middleware must be applied as the outermost layer (last in code, first in execution) to capture framework-level errors (404, 405, 415) that never reach inner middleware or handlers. Apply via `.layer(middleware::from_fn(http_metrics_middleware))` AFTER all route definitions and BEFORE any application middleware.
+
+---
+
 ## Gotcha: Watch Receiver Borrow Blocks Sender
 **Added**: 2026-02-02
 **Related files**: `crates/common/src/token_manager.rs`

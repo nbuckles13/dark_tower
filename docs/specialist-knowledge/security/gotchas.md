@@ -109,10 +109,24 @@ When implementing service registration (handlers, workers, external services), t
 ---
 
 ## Gotcha: Token Comparison Must Use Constant-Time Operations
-**Added**: 2026-01-25
-**Related files**: `docs/decisions/adr-0023-meeting-controller-architecture.md`
+**Added**: 2026-01-25 (Updated: 2026-02-10)
+**Related files**: `docs/decisions/adr-0023-meeting-controller-architecture.md`, `docs/specialist-knowledge/security/approved-crypto.md`
 
-Direct byte comparison of tokens (`==`) leaks timing information that can reveal valid tokens character-by-character. For HMAC tokens, use `ring::hmac::verify()` which performs constant-time comparison internally. For non-HMAC tokens, use `ring::constant_time::verify_slices_are_equal()` or `subtle::ConstantTimeEq`. Common mistake: verifying HMAC by computing expected tag and comparing with `==`. The fix: `hmac::verify(&key, message, received_tag)` returns `Ok(())` or `Err(Unspecified)` safely. This applies to: binding tokens, session tokens, CSRF tokens, any security-sensitive comparison.
+Direct byte comparison of tokens (`==`) leaks timing information that can reveal valid tokens character-by-character. For HMAC tokens, use `ring::hmac::verify()` which performs constant-time comparison internally. For non-HMAC tokens, use `ring::constant_time::verify_slices_are_equal()` or `subtle::ConstantTimeEq`.
+
+**Common mistake**: Computing expected HMAC tag and comparing with `==`:
+```rust
+// WRONG: Timing leak
+let expected_tag = hmac::sign(&key, message);
+if expected_tag.as_ref() == received_tag { ... }
+
+// CORRECT: Constant-time
+hmac::verify(&key, message, received_tag)?;
+```
+
+**Why ring::hmac::verify() is safe**: It calls `constant_time::verify_slices_are_equal()` internally, preventing timing attacks even if tag length mismatches.
+
+This applies to: binding tokens (ADR-0023), session tokens, CSRF tokens, password reset tokens, any security-sensitive byte comparison. Timing attacks can reveal secrets over network even with TLS—attack measures CPU time, not network latency.
 
 ---
 
@@ -197,5 +211,27 @@ let token = std::env::var("SERVICE_TOKEN")
 ```
 
 **Detection during review**: Search for `.unwrap_or`, `.unwrap_or_default()`, `.unwrap_or_else(|| ...)` near `SecretString`, `service_token`, `api_key`, `bearer_token`, `GC_SERVICE_TOKEN`, `MC_SERVICE_TOKEN`. Each instance needs verification that the fallback value is acceptable (usually it's not for credentials).
+
+---
+
+## Gotcha: JWT Size Constants Must Be Consistent Across Services
+**Added**: 2026-02-10
+**Related files**: `crates/common/src/jwt.rs`, `crates/ac-service/src/crypto/mod.rs`
+
+`MAX_JWT_SIZE_BYTES` is defined in `common::jwt` (8KB) and should be used consistently by all services. AC's `crypto/mod.rs` imports and uses this constant. Gotcha: If services define their own JWT size limits, they can diverge—AC might accept 8KB tokens while GC rejects them at 4KB, causing hard-to-debug failures.
+
+**Pattern**: Always import from `common::jwt::MAX_JWT_SIZE_BYTES`, never redefine locally:
+```rust
+// CORRECT
+use common::jwt::MAX_JWT_SIZE_BYTES;
+if token.len() > MAX_JWT_SIZE_BYTES { ... }
+
+// WRONG: Local redefinition can diverge
+const MAX_JWT_SIZE: usize = 4096; // Different from common!
+```
+
+**Why 8KB?** Balance security (prevent DoS) with functionality (allow reasonable claim expansion). Typical JWTs are 200-500 bytes; 8KB is 16x typical size. Changed from 4KB to 8KB to align all services (AC, GC, MC).
+
+**Detection during review**: Grep for `MAX_JWT_SIZE` or similar constants. Verify all JWT size checks use `common::jwt::MAX_JWT_SIZE_BYTES`.
 
 ---

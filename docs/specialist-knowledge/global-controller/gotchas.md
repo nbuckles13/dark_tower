@@ -67,10 +67,10 @@ The jsonwebtoken library defaults to accepting `alg:none` if not explicitly pinn
 ---
 
 ## Gotcha: GC_CLIENT_ID and GC_CLIENT_SECRET Required for AC Communication
-**Added**: 2026-01-15, **Updated**: 2026-02-02
+**Added**: 2026-01-15, **Updated**: 2026-02-11
 **Related files**: `crates/global-controller/src/config.rs`, `crates/global-controller/src/main.rs`
 
-GC_CLIENT_ID and GC_CLIENT_SECRET env vars are required for OAuth 2.0 client credentials flow with AC. TokenManager spawns at startup with 30-second timeout - missing credentials cause startup failure. In tests, add both vars to test config maps and create mock TokenReceiver via `TokenReceiver::from_watch_receiver()`. Production MUST set these via secrets management. (Replaced legacy GC_SERVICE_TOKEN static token approach.)
+GC_CLIENT_ID and GC_CLIENT_SECRET env vars are required for OAuth 2.0 client credentials flow with AC. TokenManager spawns at startup with 30-second timeout - missing credentials cause startup failure. In tests, create mock TokenReceiver via `TokenReceiver::from_watch_receiver()`. Production MUST set these via secrets management (Kubernetes secrets, AWS Secrets Manager, etc.). The legacy GC_SERVICE_TOKEN static token approach was fully replaced in February 2026.
 
 ---
 
@@ -217,11 +217,32 @@ Always run `cargo fmt` after fixing error hiding violations. The formatter will 
 
 ---
 
+## Gotcha: TokenManager Startup Timeout Blocks Server Start
+**Added**: 2026-02-11
+**Related files**: `crates/global-controller/src/main.rs`
+
+TokenManager spawns during GC startup with a 30-second timeout. If AC is unreachable or credentials are invalid, GC fails to start (returns error before binding HTTP/gRPC ports). This is intentional - GC cannot function without valid service credentials. In local dev, ensure AC is running before starting GC. In production, health checks should verify AC connectivity before routing traffic to GC. The timeout is configurable but should remain < 60s to fail fast during pod startup.
+
+---
+
+## Gotcha: gRPC Channel Cache Has No TTL or Failure Invalidation
+**Added**: 2026-02-11
+**Related files**: `crates/global-controller/src/services/mc_client.rs`
+
+McClient caches gRPC Channels indefinitely (`Arc<RwLock<HashMap<String, Channel>>>`). If an MC endpoint becomes permanently unreachable, the cached channel persists forever. Current implementation has no:
+- TTL-based eviction (channels never expire)
+- Failure-based invalidation (connection errors don't remove from cache)
+- Health-based eviction (unhealthy MCs in DB but cached channel remains)
+
+Workaround: MC registration with new endpoint creates new channel; old endpoint's cached channel is orphaned but harmless (tonic handles reconnection internally). Future improvement: Add TTL (e.g., 5 minutes) or evict on persistent connection failures. ADR-0010 Section 4a notes actor pattern as potential refactor to handle lifecycle cleanly.
+
+---
+
 ## Gotcha: Optional Dependencies with Fallback Hide Production Code in Tests
-**Added**: 2026-01-31
+**Added**: 2026-01-31, **Updated**: 2026-02-11
 **Related files**: `crates/global-controller/src/routes/mod.rs`, `crates/global-controller/src/handlers/meetings.rs`
 
-When making a dependency optional (e.g., `mc_client: Option<Arc<dyn McClientTrait>>`) with fallback logic for tests, integration tests may exercise the fallback path instead of production code. This creates false confidence - tests pass but production code is untested. Solution: Make dependencies required (`mc_client: Arc<dyn McClientTrait>`), inject mocks in tests. All code paths then use the same logic, just with different implementations.
+When making a dependency optional (e.g., `mc_client: Option<Arc<dyn McClientTrait>>`) with fallback logic for tests, integration tests may exercise the fallback path instead of production code. This creates false confidence - tests pass but production code is untested. Solution: Make dependencies required in AppState (`mc_client: Arc<dyn McClientTrait>`), inject mocks in tests via the trait. All code paths then use the same logic, just with different implementations. Current GC implementation uses required dependencies - McClient and AcClient are always present in AppState.
 
 ---
 

@@ -1,6 +1,6 @@
 # Known Shared Patterns in Common Crate
 
-Last updated: 2026-02-10
+Last updated: 2026-02-11
 
 ## Currently in `crates/common/`
 
@@ -13,7 +13,7 @@ Last updated: 2026-02-10
 | JWT utilities (`extract_kid`, `validate_iat`) | `common::jwt` | AC, GC |
 | JWT constants (`MAX_JWT_SIZE_BYTES`, clock skew) | `common::jwt` | AC, GC, MC |
 | `ServiceClaims` struct | `common::jwt` | AC, GC |
-| EdDSA key decoding | `common::crypto` | AC, GC |
+| EdDSA key decoding (`decode_ed25519_public_key_pem/jwk`) | `common::jwt` | AC, GC |
 | `TokenManager` (OAuth 2.0 client) | `common::token_manager` | GC, MC |
 
 ## Outstanding Tech Debt (Candidates for Extraction)
@@ -31,8 +31,8 @@ Source: `docs/dev-loop-outputs/*/main.md` Tech Debt sections
 
 | Pattern | Locations | Notes |
 |---------|-----------|-------|
-| `ParticipantType` enum | GC `ac_client.rs`, AC `models/mod.rs` | TD-1 from 2026-01-15 |
-| `MeetingRole` enum | GC `ac_client.rs`, AC `models/mod.rs` | TD-2 from 2026-01-15 |
+| `ParticipantType` enum | GC `services/ac_client.rs`, AC `models/mod.rs` | TD-3 from 2026-01-23 |
+| `MeetingRole` enum | GC `services/ac_client.rs`, AC `models/mod.rs` | TD-3 from 2026-01-23 |
 | Token TTL constants (900s) | GC, AC, MC | Multiple places define same TTL |
 | Rate limiting patterns | AC, GC | Similar middleware structure |
 
@@ -50,7 +50,7 @@ Source: `docs/dev-loop-outputs/*/main.md` Tech Debt sections
 | JWT `extract_kid` duplication | Extracted to `common::jwt` | 2026-01-30 |
 | JWT Claims struct | Extracted to `common::jwt::ServiceClaims` | 2026-01-30 |
 | Clock skew constants | Extracted to `common::jwt` | 2026-01-30 |
-| EdDSA key handling | Extracted to `common::crypto` | 2026-01-30 |
+| EdDSA key handling | Extracted to `common::jwt` | 2026-01-30 |
 | Static service tokens | Replaced with `TokenManager` | 2026-02-02 |
 
 ## False Positives

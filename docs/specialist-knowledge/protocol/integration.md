@@ -1,15 +1,5 @@
 # Protocol Integration Notes
 
-*This file captures how Protocol specialist coordinates with services.*
+*Captures non-obvious coordination points between Protocol specialist and services. Only add entries for things that broke or surprised you during cross-service protocol work.*
 
-## With Meeting Controller
-
-<!-- Add integration notes as they're established -->
-
-## With Media Handler
-
-<!-- Add integration notes as they're established -->
-
-## With Global Controller
-
-<!-- Add integration notes as they're established -->
+---

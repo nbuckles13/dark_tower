@@ -45,10 +45,16 @@ When reviewing code with secrets: (1) Grep for `.expose_secret()` - each call is
 ---
 
 ## Integration: Infrastructure - Key Management
-**Added**: 2026-01-11
-**Related files**: `crates/ac-service/src/config.rs`
+**Added**: 2026-01-11 (Updated: 2026-02-10)
+**Related files**: `crates/ac-service/src/config.rs`, `docs/decisions/adr-0008-key-rotation-strategy.md`, `docs/decisions/adr-0012-infrastructure-architecture.md`
 
-Master keys via environment variables or secrets manager. Never in code/config files. Key rotation: `POST /internal/rotate-keys` with proper scopes. Old keys valid 24 hours post-rotation.
+Master keys via environment variables or secrets manager (external-secrets-operator in K8s per ADR-0012). Never in code/config files.
+
+**AC signing key rotation** (ADR-0008): `POST /internal/rotate-keys` with proper scopes (`service.rotate-keys.ac` or `admin.force-rotate-keys.ac`). Old keys valid 1 week post-rotation (not 24 hours—updated per ADR-0008). Rate limits: 1 per 6 days (normal) or 1 per hour (force).
+
+**MC master secret rotation**: Rotates on each deployment via environment variable injection. 1-hour grace period for in-flight tokens during rolling deploys.
+
+**K8s secrets management**: Use external-secrets-operator to sync from cloud provider (AWS Secrets Manager, GCP Secret Manager, Azure Key Vault, HashiCorp Vault). Secrets automatically injected as environment variables or mounted files. Never store plaintext secrets in Git or ConfigMaps.
 
 ---
 
@@ -102,19 +108,22 @@ The gRPC interceptor pattern ensures authorization is checked before handler cod
 ---
 
 ## Integration: Meeting Controller - Session Binding Token Security
-**Added**: 2026-01-28
-**Related files**: `crates/meeting-controller/src/actors/session.rs`, `crates/meeting-controller/src/actors/meeting.rs`
+**Added**: 2026-01-28 (Updated: 2026-02-10)
+**Related files**: `crates/meeting-controller/src/actors/session.rs`, `crates/meeting-controller/src/actors/meeting.rs`, `docs/decisions/adr-0023-meeting-controller-architecture.md`
 
-Session binding tokens provide recovery after connection drops. Security requirements:
+Session binding tokens provide recovery after connection drops per ADR-0023 Section 1. Security requirements:
 
 1. **Master secret storage**: Wrap in `SecretBox<Vec<u8>>`, pass through actor hierarchy. Each actor clones into own SecretBox for isolated lifecycle.
-2. **Key derivation**: HKDF-SHA256 with `meeting_id` as salt, `"session-binding"` as info. Per-meeting keys prevent key reuse across meetings.
+2. **Key derivation**: HKDF-SHA256 with `meeting_id` as salt, `b"session-binding"` as info. Per-meeting keys prevent key reuse across meetings.
 3. **Token generation**: `HMAC-SHA256(meeting_key, correlation_id || participant_id || nonce)`. One-time nonce prevents replay.
-4. **Token validation**: Use `hmac::verify()` for constant-time comparison, NOT `==` operator.
-5. **TTL**: Bind tokens have 30-second TTL. Enforce expiration on reconnect validation.
-6. **No secret leakage**: Never log binding tokens, nonces, or master secret. Only log correlation_id and participant_id (safe identifiers).
+4. **Token validation**: Use `ring::hmac::verify()` for constant-time comparison, NOT `==` operator.
+5. **TTL**: Bind tokens have 30-second TTL. Enforce expiration on reconnect validation. Aligns with participant disconnect grace period.
+6. **Nonce grace window**: 5 seconds to handle in-flight retransmits. Nonce storage TTL is 35 seconds (token TTL + grace window).
+7. **No secret leakage**: Never log binding tokens, nonces, or master secret. Only log correlation_id and participant_id (safe identifiers).
 
-Per ADR-0023 Section 1, binding tokens are defense-in-depth (also require valid JWT). The HKDF-derived-per-meeting-key pattern ensures meeting compromise doesn't reveal master secret.
+**Security note**: Binding tokens are defense-in-depth, not primary authentication. Attackers need both a valid binding token AND a valid JWT for the same `user_id` to hijack a session. The 30-second TTL is the primary protection; even with a compromised master secret, attackers have only a 30-second window and still need a valid JWT.
+
+**Master secret rotation**: MC rotates master secret on each deployment (~weekly). 1-hour grace period covers in-flight tokens during rolling deploys. Emergency rotation is possible via forced redeploy.
 
 ---
 

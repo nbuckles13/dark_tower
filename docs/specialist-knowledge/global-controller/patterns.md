@@ -59,10 +59,10 @@ This avoids full JWT parsing before signature validation - kid selection is data
 ---
 
 ## Pattern: AC Client Service for Internal Endpoints
-**Added**: 2026-01-15, **Updated**: 2026-02-02
+**Added**: 2026-01-15, **Updated**: 2026-02-11
 **Related files**: `crates/global-controller/src/services/ac_client.rs`
 
-HTTP client for calling AC internal token endpoints. Uses Bearer auth with dynamically refreshed OAuth token from TokenReceiver, configurable timeout (default 10s), and proper error mapping (network errors -> ServiceUnavailable, 4xx -> Unauthorized/Forbidden). Create per-request in handlers using `state.token_receiver.clone()`.
+HTTP client for calling AC internal token endpoints (`/api/v1/auth/internal/meeting-token`, `/api/v1/auth/internal/guest-token`). Uses Bearer auth with dynamically refreshed OAuth token from TokenReceiver, configurable timeout (default 10s connect, 10s request), and proper error mapping (network/timeout -> ServiceUnavailable, 4xx -> Unauthorized/Forbidden, 5xx -> ServiceUnavailable). Constructed once in main.rs (not per-request) - reqwest Client handles connection pooling internally.
 
 ---
 
@@ -207,17 +207,17 @@ Benefits: Single atomic operation, avoids CTE snapshot isolation issues where se
 ---
 
 ## Pattern: Tonic Channel Caching for gRPC Clients
-**Added**: 2026-01-24
+**Added**: 2026-01-24, **Updated**: 2026-02-11
 **Related files**: `crates/global-controller/src/services/mc_client.rs`
 
 Cache Tonic `Channel` connections to downstream gRPC services instead of creating new connections per-request:
 1. Store `Arc<RwLock<HashMap<String, Channel>>>` in client struct
 2. On request, check cache for existing channel to target endpoint
-3. If miss, create new channel with `Channel::from_shared(endpoint)?.connect_lazy()`
-4. `connect_lazy()` defers actual connection until first RPC, avoiding blocking during cache population
+3. If miss, create new channel with `Endpoint::from_shared(endpoint)?.connect().await?`
+4. Connection happens immediately (eager connection) with configurable timeouts
 5. Channels handle HTTP/2 multiplexing and connection pooling internally
 
-Benefits: Reduces connection overhead, enables HTTP/2 stream reuse, prevents connection exhaustion under load.
+Benefits: Reduces connection overhead, enables HTTP/2 stream reuse, prevents connection exhaustion under load. Note: No TTL or failure-based eviction (see gotchas.md).
 
 ---
 
@@ -240,17 +240,17 @@ Store as **required** field in AppState: `mc_client: Arc<dyn McClientTrait>` (NO
 ---
 
 ## Pattern: TokenReceiver for Dynamic OAuth in Service Clients
-**Added**: 2026-01-24, **Updated**: 2026-02-02
-**Related files**: `crates/global-controller/src/services/mc_client.rs`, `crates/global-controller/src/services/ac_client.rs`, `crates/global-controller/src/routes/mod.rs`
+**Added**: 2026-01-24, **Updated**: 2026-02-11
+**Related files**: `crates/global-controller/src/services/mc_client.rs`, `crates/global-controller/src/services/ac_client.rs`, `crates/global-controller/src/main.rs`
 
 Use `TokenReceiver` from `common::token_manager` for dynamic OAuth token access in service clients:
 ```rust
 pub struct McClient {
-    token_receiver: TokenReceiver,  // Clone, provides .token()
+    token_receiver: TokenReceiver,  // Cheap to clone, provides .token()
 }
 // In request: format!("Bearer {}", self.token_receiver.token().expose_secret())
 ```
-Store `TokenReceiver` in AppState for handler-level access. TokenReceiver wraps a watch channel - cheap to clone, always returns current valid token. For tests, use `TokenReceiver::from_watch_receiver()` with a fixed token value. This replaces static `SecretString` tokens with auto-refreshing OAuth tokens.
+TokenManager spawns in main.rs with 30-second startup timeout. Store `TokenReceiver` in AppState and pass to service clients (McClient, AcClient). TokenReceiver wraps a watch channel - always returns current valid token, auto-refreshed by background task before expiration. For tests, use `TokenReceiver::from_watch_receiver()` with a fixed token. This fully replaced static `GC_SERVICE_TOKEN` in February 2026.
 
 ---
 
@@ -309,119 +309,40 @@ The `skip_all` prevents all parameters from being captured by default. Safe fiel
 
 ---
 
-## Pattern: OnceLock for Test Metrics Registry Sharing
-**Added**: 2026-02-04
-**Related files**: `crates/gc-test-utils/src/server_harness.rs`, `crates/global-controller/tests/auth_tests.rs`
+## Pattern: Dual-Server Architecture (HTTP + gRPC)
+**Added**: 2026-02-11
+**Related files**: `crates/global-controller/src/main.rs`
 
-Prometheus recorder can only be installed once per process. For test harnesses spawning multiple servers, use `OnceLock<PrometheusHandle>` to share a single registry:
+GC runs two servers concurrently: HTTP (Axum) for client API and gRPC (Tonic) for MC/MH registration. Coordinate shutdown using `CancellationToken`:
 ```rust
-static TEST_METRICS_HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
+let cancel_token = CancellationToken::new();
 
-fn get_or_init_metrics_handle() -> PrometheusHandle {
-    TEST_METRICS_HANDLE.get_or_init(|| {
-        let builder = PrometheusBuilder::new();
-        builder.install_recorder().unwrap_or_else(|_| {
-            // Already installed, create fallback
-            PrometheusBuilder::new().build_recorder().handle()
-        })
-    }).clone()
-}
-```
-The fallback chain handles cases where another test already installed the recorder. This pattern enables metrics endpoint testing without per-test registry conflicts.
+// HTTP server
+tokio::spawn({
+    let cancel = cancel_token.clone();
+    async move {
+        tokio::select! {
+            result = axum::serve(listener, app) => result,
+            _ = cancel.cancelled() => Ok(()),
+        }
+    }
+});
 
----
+// gRPC server
+tokio::spawn({
+    let cancel = cancel_token.clone();
+    async move {
+        tokio::select! {
+            result = tonic_server.serve_with_shutdown(addr, cancel.cancelled()) => result,
+        }
+    }
+});
 
-## Pattern: Instant::now() for Operation Duration Metrics
-**Added**: 2026-02-09
-**Related files**: `crates/global-controller/src/repositories/*.rs`, `crates/global-controller/src/services/mc_assignment.rs`
-
-Capture operation duration using `std::time::Instant` before the operation, then call `start.elapsed()` after:
-```rust
-use std::time::Instant;
-
-async fn some_operation(&self) -> Result<T, E> {
-    let start = Instant::now();
-    let result = self.do_work().await;
-    let status = if result.is_ok() { "success" } else { "error" };
-    metrics::record_db_query("operation_name", status, start.elapsed());
-    result
-}
+// Signal handler cancels both on SIGTERM
+signal::ctrl_c().await?;
+cancel_token.cancel();
 ```
 
-Key benefits:
-- `elapsed()` returns `Duration` directly, no need to calculate difference
-- Works across `await` points (Instant is Copy)
-- Nanosecond precision, suitable for histogram buckets
-- Pattern avoids `Duration` import when only timing is needed
-
----
-
-## Pattern: Repository Layer for DB Query Metrics
-**Added**: 2026-02-09
-**Related files**: `crates/global-controller/src/repositories/meeting_assignments.rs`, `crates/global-controller/src/repositories/meeting_controllers.rs`, `crates/global-controller/src/repositories/media_handlers.rs`
-
-Instrument database queries at the repository layer, not the service layer:
-```rust
-// In repository method
-pub async fn get_something(&self, id: Uuid) -> Result<Thing, GcError> {
-    let start = Instant::now();
-    let result = sqlx::query_as!(...)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| GcError::Database(format!("...: {e}")));
-    let status = if result.is_ok() { "success" } else { "error" };
-    metrics::record_db_query("get_something", status, start.elapsed());
-    result
-}
-```
-
-Benefits:
-- Captures actual DB latency (not including service-layer logic)
-- Single place to instrument each query type
-- Consistent operation naming across the codebase
-- Repository is the "single source of truth" for DB operations
-
----
-
-## Pattern: Status Label Determination from Result
-**Added**: 2026-02-09
-**Related files**: `crates/global-controller/src/services/mc_assignment.rs`
-
-Derive metric status labels from operation outcomes, handling both success variants and error variants:
-```rust
-let (status, rejection_reason) = match &result {
-    Ok(Some(_)) => ("success", None),
-    Ok(None) => ("rejected", Some("no_healthy_mc")),
-    Err(e) => match e {
-        GcError::McRejected(reason) => ("rejected", Some(reason.as_str())),
-        _ => ("error", None),
-    },
-};
-metrics::record_mc_assignment(status, rejection_reason, start.elapsed());
-```
-
-This pattern enables:
-- Rich label cardinality for debugging (rejection reasons)
-- Dashboard panels can filter by status or drill into rejection types
-- Error states clearly distinguished from business rejections
-
----
-
-## Pattern: Gauge Metric Initialization from Database State
-**Added**: 2026-02-10
-**Related files**: `crates/global-controller/src/main.rs`, `crates/global-controller/src/observability/metrics.rs`
-
-Initialize gauge metrics from database on startup to ensure accurate values after service restart:
-```rust
-// In main.rs after DB connection established
-let counts = Repository::get_counts_by_status(&pool).await?;
-let counts_vec: Vec<(String, u64)> = counts
-    .into_iter()
-    .map(|(status, count)| (status.as_db_str().to_string(), count as u64))
-    .collect();
-metrics::update_gauges("controller_type", &counts_vec);
-```
-
-For gauges tracking external state (registered controllers, active sessions, queue depth), query the source of truth on startup. Create a helper function that sets all possible label combinations (including zeros) to ensure consistent time series in Prometheus. This prevents gauge values starting at 0 after restart when actual state is non-zero. Pattern is especially important for multi-instance services where metric state isn't shared.
+Benefits: Both servers gracefully shut down on SIGTERM, background tasks (health checker, assignment cleanup) also respect the token. Each server binds to separate address (e.g., :8080 for HTTP, :50051 for gRPC).
 
 ---

@@ -1,15 +1,5 @@
 # Media Handler Integration Notes
 
-*This file captures how Media Handler integrates with other components.*
+*Captures non-obvious coordination points between Media Handler and other components. Only add entries for things that broke or surprised you during cross-service work.*
 
-## With Meeting Controller
-
-<!-- Add integration notes as they're established -->
-
-## With Protocol
-
-<!-- Add integration notes as they're established -->
-
-## With Observability
-
-<!-- Add integration notes as they're established -->
+---

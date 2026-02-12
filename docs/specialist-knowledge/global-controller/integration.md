@@ -77,14 +77,14 @@ Integration tests use wiremock to mock AC's JWKS endpoint:
 ---
 
 ## Integration: AC Internal Token Endpoints
-**Added**: 2026-01-15, **Updated**: 2026-02-02
+**Added**: 2026-01-15, **Updated**: 2026-02-11
 **Related files**: `crates/global-controller/src/services/ac_client.rs`, `crates/common/src/token_manager.rs`
 
 GC calls AC internal endpoints for meeting tokens:
 - `POST /api/v1/auth/internal/meeting-token` - Issue token for authenticated user joining meeting
 - `POST /api/v1/auth/internal/guest-token` - Issue token for guest participant
 
-GC authenticates using OAuth 2.0 client credentials. At startup, TokenManager acquires token from `AC/api/v1/auth/service/token` using GC_CLIENT_ID/GC_CLIENT_SECRET and auto-refreshes before expiration. AcClient uses `state.token_receiver.token()` for Authorization header. Request body includes meeting_code, user_id/guest_id, participant_type, role. Response contains signed JWT for WebTransport connection to MC.
+GC authenticates using OAuth 2.0 client credentials. At startup, TokenManager acquires initial token from `POST /api/v1/auth/service/token` using GC_CLIENT_ID/GC_CLIENT_SECRET and auto-refreshes before expiration (background task). AcClient uses `self.token_receiver.token().expose_secret()` for Authorization header. Request body includes `subject_user_id`/`guest_id`, `meeting_id`, `meeting_org_id`, `participant_type`, `role`, `capabilities`, `ttl_seconds`. Response contains signed JWT for WebTransport connection to MC (default 900s TTL).
 
 ---
 
@@ -195,7 +195,7 @@ Background task `start_assignment_cleanup()` runs both operations periodically. 
 ---
 
 ## Integration: GC-to-MC Assignment RPC Flow with MH Selection
-**Added**: 2026-01-24, **Updated**: 2026-01-31
+**Added**: 2026-01-24, **Updated**: 2026-02-11
 **Related files**: `crates/global-controller/src/services/mc_client.rs`, `crates/global-controller/src/services/mc_assignment.rs`, `crates/global-controller/src/handlers/meetings.rs`
 
 Meeting join triggers MC assignment with MH selection (ADR-0010 Section 4a):
@@ -206,9 +206,34 @@ Meeting join triggers MC assignment with MH selection (ADR-0010 Section 4a):
 4. On MC acceptance: GC persists assignment in `meeting_assignments` table
 5. On MC rejection: GC retries with different MC (up to 3 attempts)
 
-**Key change from legacy**: `assign_meeting_with_mh()` replaced `assign_meeting()`. The old function (no MH selection, no MC RPC) was removed. All handlers now use the new flow.
+**Key change from legacy**: `assign_meeting()` now includes MH assignments as parameter. The old function signature (no MH selection, no MC RPC) was removed. All handlers now use the new flow.
 
-**Client configuration**: MC client uses `SecretString` for service token, lazy channel connection, and cached channels per endpoint. Inject `MockMcClient::accepting()` for tests.
+**Client configuration**: MC client uses `TokenReceiver` for dynamic OAuth tokens, eager channel connection (`.connect().await`), and cached channels per endpoint (Arc<RwLock<HashMap<String, Channel>>>). Inject `MockMcClient::accepting()` for tests.
+
+---
+
+## Integration: MH (Media Handler) Registry
+**Added**: 2026-02-11
+**Related files**: `crates/global-controller/src/grpc/mh_service.rs`, `crates/global-controller/src/services/mh_selection.rs`, `crates/global-controller/src/tasks/mh_health_checker.rs`
+
+MHs register with GC via gRPC similar to MC registration:
+
+**Registration Flow**:
+1. MH calls `RegisterMh` RPC with: hostname, grpc_port, webtransport_port, region, availability_zone, version, max_capacity
+2. GC validates input (character whitelist, length limits)
+3. GC upserts into `media_handlers` table (atomic insert-or-update by hostname)
+4. GC returns registration_id (UUID)
+
+**Health Reporting**:
+- MH sends periodic load reports: current_sessions, max_sessions, bandwidth metrics
+- GC health checker marks MHs unhealthy if no report within staleness threshold (default 60s)
+
+**MH Selection**:
+- GC selects primary + backup MHs per meeting in different AZs (anti-affinity)
+- Load-based selection: prefer MHs with lower `current_sessions / max_sessions` ratio
+- Region-aware: prefer MHs in same region as MC
+
+**Database Schema**: `media_handlers` table mirrors `meeting_controllers` with additional `availability_zone` field for anti-affinity.
 
 ---
 
