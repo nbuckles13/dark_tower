@@ -1,6 +1,6 @@
 # Observability Patterns
 
-*This file accumulates successful observability patterns. Updated after each implementation.*
+*Accumulates non-obvious observability patterns learned through implementation. Don't restate ADR-0011 — capture what worked that wasn't obvious, or deviations from the ADR that were necessary.*
 
 ---
 

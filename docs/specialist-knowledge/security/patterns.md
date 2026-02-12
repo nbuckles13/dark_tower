@@ -117,16 +117,26 @@ Benefits: (1) Clear audit trail - who caused the mute, (2) Proper restoration - 
 ---
 
 ## Pattern: HKDF Key Derivation for Scoped Tokens
-**Added**: 2026-01-25
+**Added**: 2026-01-25 (Updated: 2026-02-10)
 **Related files**: `docs/decisions/adr-0023-meeting-controller-architecture.md`
 
 When generating tokens scoped to a resource (meeting, session, room), derive per-resource keys using HKDF rather than using a single master key directly:
 
-1. **Master secret**: `MC_BINDING_TOKEN_SECRET` - service-level secret
-2. **Key derivation**: HKDF-SHA256 with resource ID as info parameter: `HKDF(master, salt=nil, info=meeting_id)`
-3. **Token generation**: HMAC-SHA256 with derived key over (session_id || user_id)
+1. **Master secret**: `MC_BINDING_TOKEN_SECRET` - service-level secret owned by MC (distinct from AC signing keys)
+2. **Key derivation**: HKDF-SHA256 with resource ID as salt and constant info string:
+```rust
+meeting_key = HKDF-SHA256(
+    ikm: master_secret,
+    salt: meeting_id,
+    info: b"session-binding"
+)
+```
+3. **Token generation**: HMAC-SHA256 with derived key over (correlation_id || participant_id || nonce)
+4. **Rotation schedule**: Master secret rotates on each MC deployment (~weekly). 1-hour grace period allows in-flight tokens during rolling deploys.
 
-Benefits: (1) Compromise of one meeting's tokens doesn't reveal master secret, (2) Key material is deterministic - can regenerate without storage, (3) Follows cryptographic best practices for key hierarchy. Use `ring::hkdf` for derivation. Include TTL in token payload for expiration enforcement.
+Benefits: (1) Compromise of one meeting's tokens doesn't reveal master secret, (2) Key material is deterministic - can regenerate without storage, (3) Follows cryptographic best practices for key hierarchy, (4) Per-meeting isolation limits blast radius. Use `ring::hkdf` for derivation.
+
+**Security note (ADR-0023)**: Binding tokens are defense-in-depth, not primary authentication. A stolen binding token alone cannot hijack a session—attacker also needs a valid JWT for the same `user_id`. The 30-second TTL is primary protection; even with compromised master secret, attackers have only 30-second window and still need valid JWT.
 
 ---
 
@@ -208,6 +218,34 @@ async fn request_meeting_token(&self, request: &MeetingTokenRequest) -> Result<T
 ```
 
 **Benefits**: Privacy-by-default prevents accidental credential logging when functions are refactored or parameters are added. Explicit allowlists make it clear which fields are safe to trace.
+
+---
+
+## Pattern: Simple Guards for Fast Credential Leak Detection
+**Added**: 2026-02-10
+**Related files**: `scripts/guards/simple/no-secrets-in-logs.sh`, `scripts/guards/simple/instrument-skip-all.sh`
+
+Use grep-based simple guards as first-pass checks in CI/development to catch obvious credential leaks before code review. Pattern:
+
+1. **Check #[instrument] without skip**: Flag functions with secret-sounding parameters (`password`, `secret`, `token`, `key`, `credential`) that lack `skip_all` or specific skip annotations
+2. **Check expose_secret() in log macros**: Detect `info!`, `debug!`, `warn!`, `error!`, `trace!` calls containing `.expose_secret()`, which defeats `SecretString` protection
+3. **Check secret variable names in logs**: Pattern match log macro arguments against common secret variable names (password, token, secret, key, etc.)
+4. **Filter test code**: Guards should skip `#[cfg(test)]`, `mod tests {`, and test files to avoid false positives
+
+**Example violation caught**:
+```rust
+// VIOLATION: password parameter without skip
+#[instrument]
+pub fn hash_client_secret(secret: &str, cost: u32) -> Result<String> { ... }
+
+// FIX: Add skip_all
+#[instrument(skip_all)]
+pub fn hash_client_secret(secret: &str, cost: u32) -> Result<String> { ... }
+```
+
+**Benefits**: (1) Fast execution (grep-based, no compilation), (2) Catches common mistakes before review, (3) Supplements semantic guards for defense-in-depth, (4) Educational—developers learn patterns by seeing violations. Guards run in CI and can be invoked manually during development.
+
+**Limitation**: Simple guards have false negatives (complex cases) and false positives (names that sound like secrets but aren't). Use semantic guards (AST-based analysis) for comprehensive checks.
 
 ---
 
@@ -316,12 +354,19 @@ Config {
 ---
 
 ## Pattern: Bounded Label Values for Cardinality Safety in Observability
-**Added**: 2026-02-05
+**Added**: 2026-02-05 (Updated: 2026-02-10)
 **Related files**: `crates/meeting-controller/src/actors/metrics.rs`, `crates/meeting-controller/src/observability/metrics.rs`
 
 Prometheus metrics with labels must use bounded, enumerated values to prevent cardinality explosion that can crash monitoring systems. Pattern:
 
-1. **Enum-backed labels**: Use Rust enums for label values, implement `as_str()` returning `&'static str`. Guarantees only valid values exist. Example: `ActorType::Controller`, `ActorType::Meeting`, `ActorType::Connection` → 3 max values.
+1. **Enum-backed labels**: Use Rust enums for label values, implement `as_str()` returning `&'static str`. Guarantees only valid values exist. Example: `ActorType::Controller`, `ActorType::Meeting`, `ActorType::Connection` → 3 max values. The enum variant methods ensure compile-time enforcement:
+```rust
+impl ActorType {
+    pub const fn as_str(&self) -> &'static str {
+        match self { /* bounded variants */ }
+    }
+}
+```
 
 2. **No user-supplied labels**: Never use user IDs, meeting IDs, session IDs, or any unbounded identifiers as label values. These should be stored internally (in tracing logs if needed) but NOT in Prometheus.
 
@@ -335,10 +380,12 @@ Prometheus metrics with labels must use bounded, enumerated values to prevent ca
 pub fn set_actor_mailbox_depth(actor_type: &str, depth: usize) { ... }
 ```
 
-5. **Validation at boundaries**: Only Prometheus-facing functions should receive label values (e.g., `record_actor_panic(actor_type.as_str())`). The `.as_str()` conversion happens at the callsite, making valid values clear.
+5. **Type-safe callsites**: Callers pass enums, conversion to `&str` happens at callsite: `prom::record_actor_panic(actor_type.as_str())`. This makes valid values explicit at every usage point.
 
 **Benefits**: (1) Prevents memory exhaustion in Prometheus from infinite label combinations, (2) Makes cardinality bounds explicit and auditable, (3) Prevents accidental PII exposure via labels, (4) Improves observability system reliability.
 
 **Common mistake**: Accepting arbitrary string parameters: `record_metric("some_label", value)` where callers pass user IDs. The fix: Use enums with `as_str()` conversion enforced at type level.
+
+**Implementation note**: Internal tracking structures (like `MailboxMonitor`) store actor IDs (e.g., meeting IDs) for tracing logs, but these are NOT passed to Prometheus metric functions. The separation ensures operational debugging without cardinality explosion.
 
 ---

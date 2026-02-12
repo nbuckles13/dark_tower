@@ -1,6 +1,6 @@
 # Observability Gotchas
 
-*This file accumulates observability pitfalls to avoid. Updated from experience.*
+*Accumulates observability pitfalls discovered during implementation. Only add entries for things that actually caused bugs, silent failures, or wasted debugging time.*
 
 ---
 

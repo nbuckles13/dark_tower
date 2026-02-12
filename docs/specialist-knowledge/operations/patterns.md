@@ -1,15 +1,5 @@
 # Operations Patterns
 
-*This file accumulates successful operational patterns. Updated after each implementation.*
+*Accumulates non-obvious operational patterns learned through deployment and incident response. Don't describe what the K8s manifests say — capture what surprised you, what broke in practice, what the YAML doesn't tell you.*
 
-## Deployment Patterns
-
-<!-- Add patterns as they're established -->
-
-## Rollback Patterns
-
-<!-- Add patterns as they're established -->
-
-## Incident Response Patterns
-
-<!-- Add patterns as they're established -->
+---

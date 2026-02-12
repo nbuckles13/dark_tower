@@ -147,3 +147,51 @@ When using `tokio::sync::watch` for async value broadcasting, initialize with an
 Provide both `new()` (permissive for development) and `new_secure()` (validates HTTPS, returns Result) constructors. Document security warnings on the permissive variant. This allows easy local development while enforcing production security through explicit constructor choice.
 
 ---
+
+## Pattern: HTTP Metrics Middleware for Comprehensive Observability
+**Added**: 2026-02-10
+**Related files**: `crates/ac-service/src/middleware/http_metrics.rs`
+
+Wrap all routes with HTTP metrics middleware as the outermost layer to capture ALL responses including framework-level errors (415, 400, 404, 405) that never reach handlers. Middleware records method, path, status code, and duration. Apply via `.layer(middleware::from_fn(http_metrics_middleware))` AFTER defining routes but BEFORE application-specific middleware.
+
+---
+
+## Pattern: HMAC-SHA256 Correlation Hashing for PII-Safe Logging
+**Added**: 2026-02-10
+**Related files**: `crates/ac-service/src/observability/mod.rs`
+
+Use HMAC-SHA256 with per-service secret key (not plain SHA-256) for correlation hashing of PII fields like `client_id`. Hash with `hash_for_correlation(value, secret)`, which truncates to first 4 bytes (8 hex chars) and prefixes with `h:` to distinguish from legacy hashes. This enables log correlation without storing plaintext PII while preventing rainbow table attacks.
+
+---
+
+## Pattern: SecretBox for Non-String Sensitive Data
+**Added**: 2026-02-10
+**Related files**: `crates/ac-service/src/config.rs`, `crates/ac-service/src/crypto/mod.rs`
+
+Use `SecretBox<Vec<u8>>` for binary sensitive data (keys, encrypted material) and `SecretString` for text secrets (passwords, tokens). Both types provide Debug redaction and require explicit `.expose_secret()` to access values. Custom Clone implementation needed: `SecretBox::new(Box::new(self.field.expose_secret().clone()))`. EncryptedKey struct wraps encrypted_data in SecretBox despite being ciphertext to prevent accidental exposure of encrypted key material.
+
+---
+
+## Pattern: Error Category Mapping for Bounded Cardinality Metrics
+**Added**: 2026-02-10
+**Related files**: `crates/ac-service/src/observability/mod.rs`
+
+Map domain-specific errors to 4 bounded categories (Authentication, Authorization, Cryptographic, Internal) via `impl From<&AcError> for ErrorCategory`. This prevents cardinality explosion in Prometheus labels while preserving useful error classification. Use `ErrorCategory::from(&err).as_str()` for metric labels.
+
+---
+
+## Pattern: Metrics Recording in Handler Body (Not Middleware)
+**Added**: 2026-02-10
+**Related files**: `crates/ac-service/src/handlers/internal_tokens.rs`, `crates/ac-service/src/handlers/auth_handler.rs`
+
+Record domain-specific metrics (token_issuance, error categories) inside handler functions, not middleware. Use `Instant::now()` at handler start, record metrics before returning. Update span status via `tracing::Span::current().record("status", ...)` to correlate traces with metrics. Generic HTTP metrics go in middleware; domain metrics go in handlers.
+
+---
+
+## Pattern: Path Normalization for Cardinality Control
+**Added**: 2026-02-10
+**Related files**: `crates/ac-service/src/observability/metrics.rs`
+
+HTTP metrics normalize paths by replacing UUIDs and numeric IDs with placeholders (e.g., `/clients/{id}` instead of `/clients/550e8400-...`) to prevent cardinality explosion in Prometheus labels. Use `normalize_path()` function that applies regex substitution. Without normalization, each unique ID creates a new time series.
+
+---

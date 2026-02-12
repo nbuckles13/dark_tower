@@ -247,10 +247,10 @@ When internal metrics structs have methods like `meeting_created()` that also ne
 
 ---
 
-## Pattern: Metric Recording in Both Success and Error Paths
-**Added**: 2026-02-10
-**Related files**: `crates/meeting-controller/src/grpc/gc_client.rs`, `crates/meeting-controller/src/observability/metrics.rs`
+## Pattern: Comprehensive Module-Level Metric Documentation
+**Added**: 2026-02-11
+**Related files**: `crates/meeting-controller/src/actors/metrics.rs`, `crates/meeting-controller/src/observability/metrics.rs`
 
-When instrumenting operations with metrics, record BOTH success and error outcomes using consistent label values. Pattern: start timer before operation (`let start = Instant::now();`), then in both match arms: record counter with status label and histogram with duration. Example: `record_gc_heartbeat("success", "fast")` + `record_gc_heartbeat_latency("fast", duration)` on Ok, same with `"error"` on Err. This ensures complete observability - error paths are just as important as success paths for monitoring and alerting. Recording latency even on error helps diagnose slow failures vs fast failures.
+Document metric relationships and integration patterns at the module level, not just in individual function docs. The `actors/metrics.rs` module doc explains three key integrations: (1) How ActorMetrics maps to Prometheus gauges/counters, (2) How MailboxMonitor thresholds map to ADR-0023 alerting, (3) That ControllerMetrics is GC-only (no Prometheus). This prevents confusion when maintaining either system - the module doc is the source of truth for "which metrics go where". Individual function docs focus on per-metric semantics (labels, cardinality, SLO targets).
 
 ---

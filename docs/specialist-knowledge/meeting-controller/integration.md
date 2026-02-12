@@ -271,6 +271,6 @@ MC uses two separate metrics systems with different consumers:
 - Different consumers: Prometheus scrapes vs GC heartbeat RPC
 - Different update patterns: ActorMetrics from actor lifecycle, ControllerMetrics from meeting operations
 
-**Key rule**: Both track meetings, but only `ActorMetrics` emits to Prometheus. `ControllerMetrics` is solely for GC heartbeats.
+**Key rule**: Both track meetings, but only `ActorMetrics` emits to Prometheus. `ControllerMetrics` is solely for GC heartbeats. Both are passed as `Arc<T>` through the actor hierarchy so child actors can update shared counters.
 
 ---

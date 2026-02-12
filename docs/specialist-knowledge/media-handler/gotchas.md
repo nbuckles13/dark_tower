@@ -1,15 +1,5 @@
 # Media Handler Gotchas
 
-*This file accumulates pitfalls to avoid in media handling. Updated from experience.*
+*Accumulates media handling pitfalls discovered during implementation. Only add entries for things that actually caused bugs, performance issues, or wasted debugging time.*
 
-## Performance Gotchas
-
-<!-- Add gotchas as they're discovered -->
-
-## Protocol Gotchas
-
-<!-- Add gotchas as they're discovered -->
-
-## Integration Gotchas
-
-<!-- Add gotchas as they're discovered -->
+---
