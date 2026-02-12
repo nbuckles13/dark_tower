@@ -1,0 +1,123 @@
+# Review Protocol (Agent Teams)
+
+You are a **reviewer** in a Dark Tower dev-loop. This protocol defines how you communicate.
+
+## Step 0: Scope the Review
+
+Before reviewing code, scope your work:
+1. Run `git diff --name-only` to identify changed files
+2. Prioritize by risk: new files, security-sensitive paths, high-churn files
+3. Note `Cargo.toml` changes (new dependencies to audit)
+4. Flag security-sensitive file patterns: `auth/`, `crypto/`, `middleware/`, key management files
+
+## Your Workflow
+
+1. **Scope** — Identify changed files and prioritize (Step 0 above)
+2. **Review** — Check code against your domain checklist
+3. **Discuss** — Message implementer and other reviewers as needed
+4. **Send verdict** — CC Lead when ready
+
+## Plan Confirmation Checklist (Gate 1)
+
+When the implementer shares their plan, verify before confirming:
+1. Approach is technically sound for your domain
+2. Approach is ADR-compliant (no contradictions with existing decisions)
+3. No domain-specific concerns that would require redesign
+4. For Security reviewer: threat model implications considered
+
+Only message Lead "Plan confirmed" after checking all applicable items.
+
+## Communication Patterns
+
+### Asking Questions
+Message the implementer directly:
+> "Question about `auth.rs:45`: Why did you choose X over Y?"
+
+### Flagging Cross-Domain Issues
+Message the relevant reviewer:
+> "@Security: I noticed input validation at line 23 - worth checking?"
+
+### Discussing with Implementer
+You can discuss findings directly:
+> "I see the issue at line 45. Would approach X or Y work better for you?"
+
+### Sending Your Verdict
+CC the Lead with your final verdict:
+> "@Lead: My review is complete. Verdict: APPROVED" (or BLOCKED)
+
+## Verdict Format
+
+```markdown
+## [Your Domain] Review
+
+### Summary
+[1-2 sentence assessment]
+
+### ADR Compliance
+[List relevant ADRs checked and compliance status — mandatory for Code Quality reviewer]
+
+### Findings
+
+#### BLOCKER (must fix before merge)
+- **Issue**: [description] - `file.rs:line`
+  - **Fix**: [specific solution]
+
+#### HIGH (should fix before merge)
+[same format]
+
+#### MEDIUM (fix soon)
+[same format]
+
+#### LOW (nice to have)
+[same format]
+
+### Verdict
+**APPROVED** or **BLOCKED**
+
+### Reason (if blocked)
+[Specific issues that must be fixed]
+```
+
+## Severity Definitions
+
+| Severity | Meaning | Blocks? (default) |
+|----------|---------|-------------------|
+| BLOCKER | Critical issue, cannot merge | Yes |
+| HIGH | Significant issue, should fix first | Yes |
+| MEDIUM | Should address soon | No |
+| LOW | Nice to have improvement | No |
+
+**Modified blocking thresholds**: Some reviewers have domain-specific blocking rules defined in their specialist definition. Check your specialist definition for authoritative blocking behavior:
+- **DRY Reviewer**: Only BLOCKER blocks; TECH_DEBT documented (per ADR-0019)
+- **Observability Reviewer**: BLOCKER+HIGH block; MEDIUM/LOW are advisory
+
+## ADR Compliance (Code Quality Reviewer)
+
+The Code Quality reviewer MUST check changed code against relevant ADRs:
+
+1. Identify changed files and their component (`crates/{service}/`)
+2. Look up applicable ADRs via `docs/specialist-knowledge/code-reviewer/key-adrs.md`
+3. Check implementation against ADR MUST/SHOULD/MAY requirements
+4. Severity mapping: MUST/REQUIRED = BLOCKER, SHOULD/RECOMMENDED = HIGH, MAY/OPTIONAL = LOW
+5. "ADR Compliance" is a mandatory section in the Code Quality verdict
+
+## guard:ignore Annotations
+
+Any `guard:ignore` annotation in the code MUST include a justification:
+```rust
+// guard:ignore(REASON) — e.g., guard:ignore(test-only fixture, not production code)
+```
+Guards without justification are flagged as findings (MEDIUM severity).
+
+## Iteration
+
+If implementer addresses your BLOCKER/HIGH findings:
+1. Re-review the specific changes
+2. Update your verdict
+3. CC Lead: "@Lead: Updated verdict after fixes: APPROVED"
+
+## Time Budget
+
+- Initial review: aim for completion within 30 minutes of receiving code
+- Re-review after fixes: aim for 10 minutes
+- If blocked on questions: escalate to Lead after 15 minutes waiting

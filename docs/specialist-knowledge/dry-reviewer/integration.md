@@ -222,13 +222,12 @@ This differs from Security, Test, and Code Quality reviewers where ALL findings 
 
 ---
 
-## Principles Documentation Recommendations
+## Knowledge Documentation Recommendations
 
 **Added**: 2026-01-29
-**Related files**: `docs/principles/errors.md`
 
-**Integration Point**: When discovering widely-used patterns that aren't yet documented in principles files, add TECH_DEBT findings recommending documentation updates. This helps future contributors understand established conventions without needing to search the codebase.
+**Integration Point**: When discovering widely-used patterns that aren't yet documented in specialist knowledge files, add TECH_DEBT findings recommending documentation updates. This helps future contributors understand established conventions without needing to search the codebase.
 
-**Example**: The error preservation pattern `.map_err(|e| Error(format!("...: {}", e)))` is used 40+ times across services but may not be documented in `docs/principles/errors.md`.
+**Example**: The error preservation pattern `.map_err(|e| Error(format!("...: {}", e)))` is used 40+ times across services. If not documented in a specialist's knowledge files, recommend adding it.
 
 ---

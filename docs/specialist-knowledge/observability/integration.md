@@ -1,6 +1,6 @@
-# Observability Integration Guide
+# Observability Integration Notes
 
-What other services and specialists need to know when working with observability infrastructure.
+*This file captures how Observability coordinates with other specialists.*
 
 ---
 
@@ -40,46 +40,5 @@ Labels must not contain PII or unbounded values:
 - **Forbidden**: `user_id`, `email`, `meeting_id`, `participant_id`, UUIDs
 
 Paths with dynamic segments are normalized: `/api/v1/meetings/abc123` becomes `/api/v1/meetings/{code}`. This prevents cardinality explosion while maintaining debuggability.
-
----
-
-## Integration: Dashboard Catalog Location
-**Added**: 2026-02-06
-**Related files**: `docs/observability/dashboards.md`
-
-All Grafana dashboards are cataloged in `docs/observability/dashboards.md` with:
-- Dashboard name and file location
-- Purpose description
-- Panel inventory
-- Owner and last review date
-
-When adding new dashboards, update the catalog. Dashboard JSON files live in `infra/grafana/dashboards/{service}-*.json`.
-
----
-
-## Integration: Alert Catalog Location
-**Added**: 2026-02-06
-**Related files**: `docs/observability/alerts.md`
-
-All Prometheus alerts are cataloged in `docs/observability/alerts.md` with:
-- Alert name and severity
-- Trigger condition
-- Runbook link
-- Response procedure summary
-
-When adding new alerts, update the catalog. Alert rule files live in `infra/docker/prometheus/rules/{service}-alerts.yaml`.
-
----
-
-## Integration: Runbook Catalog Location
-**Added**: 2026-02-06
-**Related files**: `docs/observability/runbooks.md`
-
-All runbooks are cataloged in `docs/observability/runbooks.md` with:
-- Runbook name and file location
-- Service ownership
-- Alert mapping table (which alerts link to which runbook sections)
-
-When adding new runbooks or scenarios, update the catalog and ensure alert annotations point to correct anchors.
 
 ---

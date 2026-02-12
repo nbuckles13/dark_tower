@@ -92,11 +92,17 @@ for dir in "$DEV_LOOP_DIR"/*/; do
     # Read the Loop State section (first 50 lines should be enough)
     loop_state=$(head -50 "$main_file")
 
-    # Extract fields
-    current_step=$(extract_field "Current Step" "$loop_state")
+    # Extract fields - try Phase first (Agent Teams format), fall back to Current Step (legacy)
+    current_step=$(extract_field "Phase" "$loop_state")
+    if [[ -z "$current_step" ]]; then
+        current_step=$(extract_field "Current Step" "$loop_state")
+    fi
     specialist=$(extract_field "Implementing Specialist" "$loop_state")
     iteration=$(extract_field "Iteration" "$loop_state")
-    agent_id=$(extract_field "Implementing Agent" "$loop_state")
+    agent_id=$(extract_field "Implementer" "$loop_state")
+    if [[ -z "$agent_id" ]]; then
+        agent_id=$(extract_field "Implementing Agent" "$loop_state")
+    fi
 
     # Get directory name (strip trailing slash and path)
     dir_name=$(basename "$dir")
@@ -210,7 +216,7 @@ case "$FORMAT" in
             echo "No active dev-loops."
             echo ""
             echo "To start a new dev-loop, run:"
-            echo "  /dev-loop-init \"task description\""
+            echo "  /dev-loop \"task description\""
         fi
         ;;
 esac

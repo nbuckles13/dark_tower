@@ -4,7 +4,7 @@
 **Start Time**: 22:32
 **Task**: Update infrastructure for GC/MC OAuth credentials. Add Kubernetes secrets and deployment configs for OAuth 2.0 client credentials that GC and MC need to authenticate with AC. Specifically: (1) Add AC database entries for gc-service and mc-service OAuth clients, (2) Create Kubernetes secrets (gc-oauth-credentials, mc-oauth-credentials) with client_secret values, (3) Update GC deployment to add AC_ENDPOINT, GC_CLIENT_ID, GC_CLIENT_SECRET environment variables, (4) Update MC deployment to add AC_ENDPOINT, MC_CLIENT_ID, MC_CLIENT_SECRET environment variables, (5) Remove deprecated GC_SERVICE_TOKEN and MC_SERVICE_TOKEN environment variables from both deployments. Reference infra/services/global-controller/deployment.yaml and infra/services/meeting-controller/deployment.yaml for deployment updates, infra/services/*/secret.yaml for secrets.
 **Branch**: `feature/infra-gc-mc-oauth-config`
-**Duration**: ~0m (in progress)
+**Duration**: Complete (committed as 3461b51)
 
 ---
 

@@ -1,6 +1,8 @@
 # ADR-0022: Skill-Based Development Loop
 
-**Status**: Accepted
+**Status**: Superseded
+
+**Superseded by**: ADR-0024 (Agent Teams Development Workflow) — see `docs/decisions/adr-0024-agent-teams-workflow.md`
 
 **Date**: 2026-01-23
 
