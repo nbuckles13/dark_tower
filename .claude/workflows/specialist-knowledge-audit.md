@@ -183,7 +183,7 @@ After each audit, create a result file:
 
 ## Related Documents
 
-- `.claude/skills/dev-loop-reflect/SKILL.md` - Reflection step for knowledge capture
+- `.claude/skills/dev-loop/SKILL.md` - Dev-loop workflow (reflection phase captures knowledge)
 - `.claude/skills/dev-loop-restore/SKILL.md` - Session restore patterns
 - ADR-0017 - Specialist knowledge architecture
 - `docs/specialist-knowledge/audits/` - Previous audit results

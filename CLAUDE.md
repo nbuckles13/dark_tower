@@ -99,7 +99,7 @@ The platform consists of **five main components**:
 - `code-reviewer` - Code quality, Rust idioms, ADR compliance
 - `dry-reviewer` - Cross-service duplication detection (see ADR-0019)
 
-**Cross-Cutting Specialists** (MANDATORY in ALL debates):
+**Cross-Cutting Specialists** (MANDATORY in ALL dev-loops AND debates — see ADR-0024):
 - `test` - E2E tests, coverage, chaos testing, quality gates
 - `security` - Security architecture, threat modeling, cryptography
 - `observability` - Metrics, logging, tracing, SLOs, error budgets
@@ -142,7 +142,7 @@ The platform consists of **five main components**:
 4. Create ADR when consensus reached
 5. Implement via specialists
 
-**See**: `.claude/workflows/multi-agent-debate.md`
+**See**: `.claude/skills/debate/SKILL.md`
 
 ## Critical Conventions
 
@@ -274,10 +274,8 @@ dark_tower/
 
 ### Development Process
 - **.claude/DEVELOPMENT_WORKFLOW.md** - Orchestrator rules, specialist usage
-- **.claude/skills/dev-loop/SKILL.md** - Dev-loop overview and available steps
-- **.claude/skills/dev-loop-*/SKILL.md** - Individual dev-loop step skills
-- **.claude/workflows/multi-agent-debate.md** - Debate mechanics
-- **.claude/workflows/code-review.md** - Code review process
+- **.claude/skills/dev-loop/SKILL.md** - Dev-loop Agent Teams workflow
+- **.claude/skills/debate/SKILL.md** - Multi-agent debate workflow
 - **docs/dev-loop-outputs/** - Implementation output tracking
 - **FUZZING.md** - Fuzzing strategy and setup
 
@@ -288,10 +286,9 @@ dark_tower/
 ## Common Development Tasks
 
 ### Implementing a Feature or Refactor
-1. Follow the **Development Loop** workflow via skills
-2. Start with `/dev-loop-init "task description"` to initialize
-3. Run `/dev-loop-implement`, `/dev-loop-validate`, `/dev-loop-review`, `/dev-loop-reflect`
-4. Track progress in `docs/dev-loop-outputs/YYYY-MM-DD-{task}/main.md`
+1. Run `/dev-loop "task description"` to start the Agent Teams workflow
+2. Lead spawns teammates, they handle planning → implementation → review → reflection
+3. Track progress in `docs/dev-loop-outputs/YYYY-MM-DD-{task}/main.md`
 
 ### Adding a Database Table
 1. Create migration: `sqlx migrate add create_table_name`
@@ -347,39 +344,68 @@ dark_tower/
 
 ## Development Loop Workflow
 
-For implementation tasks, use the **Development Loop** via skills:
+Single-command workflow with autonomous teammates:
 
 ```
-/dev-loop-init "task description"   # Initialize loop, match principles
-/dev-loop-implement                  # Spawn specialist with context
-/dev-loop-validate                   # Run 7-layer verification
-/dev-loop-review                     # Code review (4 reviewers in parallel)
-/dev-loop-reflect                    # Capture learnings
-/dev-loop-complete                   # Mark loop done
+/dev-loop "task description" --specialist={name}
 ```
 
-**Utility skills**:
+**How it works**:
+- Lead spawns 7 teammates (1 implementer + 6 reviewers)
+- Teammates communicate directly with each other
+- Lead only intervenes at gates (plan approval, validation, final approval)
+- Minimal context accumulation in Lead; teammates preserve full context
+
+**Team composition**: Implementer + Security + Test + Observability + Code Quality + DRY + Operations
+
+### Utility Skills
+
 - `/dev-loop-status` - Check current state of any dev-loop
-- `/dev-loop-fix` - Resume specialist to fix validation or review findings
 - `/dev-loop-restore` - Recover interrupted loop from checkpoints
 
-**Key aspects**:
-- **Same agent continuity**: Planning and implementation use the same agent
-- **Context injection**: Principles + specialist knowledge automatically included
-- **7-layer verification**: check → fmt → guards → tests → clippy → semantic
+### Key Aspects
+
+- **Context injection**: Specialist knowledge automatically included
+- **Validation pipeline**: check → fmt → guards → tests → clippy → audit + coverage (reported) + artifact-specific layers (see ADR-0024)
 - **State checkpointing**: Enables recovery after interruption (ADR-0018)
+- **Git state tracking**: Start commit recorded for rollback (see ADR-0024)
 
 **Code review blocking behavior**:
-- Security, Test, Code Quality: ALL findings must be fixed
+- Security, Test, Code Quality, Operations: ALL findings must be fixed
+- Observability: BLOCKER+HIGH block; MEDIUM/LOW are advisory
 - DRY Reviewer: Only BLOCKER blocks; non-BLOCKERs documented as tech debt (see ADR-0019)
 
 **Key Files**:
-- `.claude/skills/dev-loop/SKILL.md` - Overview and navigation
+- `.claude/skills/dev-loop/SKILL.md` - Agent Teams workflow
+- `.claude/agent-teams/` - Specialist and protocol templates
 - `docs/dev-loop-outputs/` - Output files tracking each implementation
 
 **When to use**: Any implementation task (features, tests, refactors, security changes)
 
-**See**: ADR-0016 for original design, ADR-0022 for skill-based migration
+---
+
+## Debate Workflow
+
+For design decisions affecting multiple services, use debates to reach consensus:
+
+```
+/debate "design question"
+```
+
+**How it works**:
+- Lead spawns domain + cross-cutting specialists as teammates
+- Specialists discuss and update satisfaction scores (0-100)
+- Consensus at 90%+ all participants
+- Creates ADR when consensus reached
+
+**When to use**: Protocol changes, schema changes, cross-service features, architectural decisions
+
+**Output**: Architecture Decision Record (ADR) only - implementation is separate `/dev-loop`
+
+**Key Files**:
+- `.claude/skills/debate/SKILL.md` - Debate workflow
+- `.claude/agent-teams/protocols/debate.md` - Debate communication protocol
+- `docs/debates/` - Debate records
 
 ---
 
@@ -394,7 +420,7 @@ docs/specialist-knowledge/{specialist}/
 └── integration.md   # How to work with other components
 ```
 
-**Current specialists with knowledge**: auth-controller, security, test, code-reviewer
+**Current specialists with knowledge**: auth-controller, global-controller, meeting-controller, security, test, code-reviewer, dry-reviewer, operations, infrastructure, database, protocol, observability, media-handler
 
 **How it works**:
 - Knowledge files are injected into specialist prompts at invocation

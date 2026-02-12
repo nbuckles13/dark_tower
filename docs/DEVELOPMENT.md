@@ -465,10 +465,10 @@ info!("Key rotation complete");  // guard:ignore
 
 #### Adding New Guards
 
-See `docs/principles/` for principle definitions that guards enforce. Each principle document explains:
+See guard script comments and `docs/specialist-knowledge/security/` for the standards that guards enforce. Each guard script documents:
 - What counts as a violation
 - Acceptable patterns
-- Code examples
+- False positive handling (`guard:ignore`)
 
 ## Environment Variables
 

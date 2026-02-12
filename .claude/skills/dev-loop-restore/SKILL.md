@@ -9,7 +9,7 @@ disable-model-invocation: true
 Restore a dev-loop that was interrupted (session ended, context compressed, process killed). This skill:
 1. Finds incomplete dev-loops
 2. Shows checkpoint context
-3. Allows user to resume from current step
+3. Guides user to resume from current state
 
 **Key principle**: Agent context is lost, but checkpoint files preserve working notes. Restored specialists have "good enough" context to continue.
 
@@ -28,7 +28,7 @@ Restore a dev-loop that was interrupted (session ended, context compressed, proc
 If output-dir not provided:
 
 1. Run `./scripts/workflow/dev-loop-status.sh --active-only`
-2. This returns all loops with `Current Step != complete`
+2. This returns all loops with `Phase != complete`
 3. Display the list to the user
 
 ### Step 2: Show Restore Options
@@ -41,7 +41,7 @@ If output-dir not provided:
 All dev-loops in `docs/dev-loop-outputs/` are complete.
 
 To start a new dev-loop, run:
-  /dev-loop-init "task description"
+  /dev-loop "task description"
 ```
 
 #### If One Incomplete Loop
@@ -51,7 +51,7 @@ To start a new dev-loop, run:
 
 Directory: {output_dir}
 Task: {task from main.md}
-Current step: {current_step}
+Phase: {phase}
 Iteration: {iteration}
 Implementing specialist: {specialist}
 
@@ -68,10 +68,10 @@ Wait for user confirmation.
 ```
 **Found multiple incomplete dev-loops**
 
-| # | Directory | Task | Step | Iteration |
-|---|-----------|------|------|-----------|
-| 1 | {dir1} | {task1} | {step1} | {iter1} |
-| 2 | {dir2} | {task2} | {step2} | {iter2} |
+| # | Directory | Task | Phase | Iteration |
+|---|-----------|------|-------|-----------|
+| 1 | {dir1} | {task1} | {phase1} | {iter1} |
+| 2 | {dir2} | {task2} | {phase2} | {iter2} |
 ...
 
 Which loop would you like to restore? (1-N, or 'none')
@@ -85,7 +85,7 @@ For the selected loop, read all checkpoint files:
 
 - `main.md` - Loop State, task context
 - `{specialist}.md` - Implementing specialist's working notes
-- `security.md`, `test.md`, `code-reviewer.md`, `dry-reviewer.md` - Reviewer checkpoints (if they exist)
+- `security.md`, `test.md`, `code-reviewer.md`, `dry-reviewer.md`, `operations.md` - Reviewer checkpoints (if they exist)
 
 ### Step 4: Show Restoration Context
 
@@ -97,7 +97,7 @@ For the selected loop, read all checkpoint files:
 **Loop State**:
 | Field | Value |
 |-------|-------|
-| Current Step | {step} |
+| Phase | {phase} |
 | Iteration | {iter} |
 | Implementing Specialist | {specialist} |
 
@@ -109,21 +109,24 @@ For the selected loop, read all checkpoint files:
 - Test: {exists/missing} - {verdict if exists}
 - Code Reviewer: {exists/missing} - {verdict if exists}
 - DRY Reviewer: {exists/missing} - {verdict if exists}
+- Operations: {exists/missing} - {verdict if exists}
 
-**Recommended action**: Based on current step, run `{recommended skill}`
+**Recommended action**: Based on current phase, run `/dev-loop --restore {output-dir}`
 ```
 
 ### Step 5: Recommend Next Action
 
-Based on Current Step:
+Based on Phase:
 
-| Current Step | Recommendation |
-|--------------|----------------|
-| `init` | Run `/dev-loop-implement` |
-| `implementation` | Specialist was interrupted. Run `/dev-loop-implement` to re-invoke with checkpoint context |
-| `validation` | Run `/dev-loop-validate` |
-| `code_review` | Run `/dev-loop-review` |
-| `reflection` | Run `/dev-loop-reflect` |
+| Phase | Recommendation |
+|-------|----------------|
+| `setup` | Run `/dev-loop` again with checkpoint injection |
+| `planning` | Spawn new team, inject checkpoint, resume planning |
+| `implementation` | Spawn new team, inject checkpoint, resume implementation |
+| `review` | Spawn new team, inject checkpoint, resume review |
+| `reflection` | Spawn new team, complete reflection |
+
+**Restoration** requires re-spawning the full team with checkpoint context. See "Restoration Process" section below.
 
 ### Step 6: Update for New Session
 
@@ -135,7 +138,7 @@ Since agent IDs from previous session are no longer valid:
 ```
 **Note**: Previous agent IDs are no longer valid (session ended).
 
-When you run the next skill, specialists will be re-invoked fresh with their checkpoint context injected. This preserves most working knowledge.
+When you run `/dev-loop`, specialists will be re-invoked fresh with their checkpoint context injected. This preserves most working knowledge.
 
 Ready to continue?
 ```
@@ -145,12 +148,9 @@ Ready to continue?
 ```
 **Restoration Ready**
 
-Current step: {step}
+Phase: {phase}
 
-**Next step**: Run `{recommended skill}`
-
-Example:
-  {skill command}
+**Next step**: Run `/dev-loop --restore {output-dir}`
 ```
 
 ## Checkpoint Injection Pattern
@@ -168,7 +168,7 @@ You are continuing a dev-loop that was interrupted. Here's your previous context
 
 ## Current Loop State
 
-- Step: {current_step}
+- Phase: {phase}
 - Iteration: {iteration}
 
 ## What's Already Complete
@@ -177,8 +177,65 @@ You are continuing a dev-loop that was interrupted. Here's your previous context
 
 ## Your Task
 
-Continue from where you left off. Based on your working notes, {specific instruction for current step}.
+Continue from where you left off. Based on your working notes, {specific instruction for current phase}.
 ```
+
+## Restoration Process
+
+1. **Read all checkpoint files**:
+   - `main.md` - Loop state, task context, decisions
+   - `{implementing-specialist}.md` - Implementer notes
+   - `security.md`, `test.md`, `code-reviewer.md`, `dry-reviewer.md`, `operations.md` - Reviewer states
+
+2. **Compose restoration prompts** with checkpoint injection:
+
+**For Implementer**:
+```
+You are resuming an interrupted dev-loop.
+
+## Previous Context
+
+{paste from main.md: Task Overview, Implementation Summary}
+
+## Your Previous Working Notes
+
+{paste from {specialist}.md checkpoint}
+
+## Current State
+
+Phase: {phase}
+Iteration: {iteration}
+What's been done: {summary}
+What's remaining: {based on phase}
+
+## Your Task
+
+Continue from phase "{phase}". Based on your notes:
+{specific instructions for current phase}
+```
+
+**For Reviewers** (if review phase):
+```
+You are resuming an interrupted review.
+
+## Your Previous Review
+
+{paste from {reviewer}.md if exists}
+
+## Current State
+
+Your verdict: {pending or previous verdict}
+Other reviewers: {status}
+
+## Your Task
+
+{Continue review / Re-send verdict / etc.}
+```
+
+3. **Re-spawn team** via `/dev-loop` with `--restore` flag:
+   - Lead spawns all 7 teammates with restoration prompts
+   - Team resumes from current phase
+   - Checkpoints continue accumulating
 
 ## Critical Constraints
 
@@ -191,12 +248,13 @@ Continue from where you left off. Based on your working notes, {specific instruc
 
 ```
 {output_dir}/
-├── main.md                       # Loop State, task context
-├── {implementing-specialist}.md  # Implementing specialist checkpoint
-├── security.md                   # Security reviewer (if review started)
-├── test.md                       # Test reviewer (if review started)
-├── code-reviewer.md              # Code reviewer (if review started)
-└── dry-reviewer.md               # DRY reviewer (if review started)
+├── main.md                       # Loop State with Phase field
+├── {implementing-specialist}.md  # Implementer checkpoint
+├── security.md                   # Security reviewer
+├── test.md                       # Test reviewer
+├── code-reviewer.md              # Code Quality reviewer
+├── dry-reviewer.md               # DRY reviewer
+└── operations.md                 # Operations reviewer
 ```
 
 ## Limitations
@@ -208,6 +266,14 @@ Restored specialists have checkpoint context but not full memory from the origin
 
 It may miss nuances from the original session. This is acceptable - the alternative is starting over completely.
 
+### Limitations
+
+- Team composition must match original (same 7 roles)
+- Reviewer-to-reviewer discussions from original session are lost
+- Implementer-reviewer discussions from original session are lost
+- Verdicts and confirmations from checkpoint files are preserved
+
 ---
 
-**Next step**: Run `/{recommended-skill}`
+**Next step**: Run the recommended action
+- `/dev-loop --restore {output-dir}` (re-spawns team with context)

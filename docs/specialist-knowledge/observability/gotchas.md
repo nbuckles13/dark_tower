@@ -1,6 +1,6 @@
 # Observability Gotchas
 
-Mistakes to avoid and edge cases discovered in observability infrastructure.
+*This file accumulates observability pitfalls to avoid. Updated from experience.*
 
 ---
 
@@ -14,14 +14,6 @@ When `/health` endpoint behavior changes (e.g., from JSON to plain text "OK" for
 3. Any test that calls the endpoint
 
 Search for all usages: `grep -r "/health" crates/*/tests/`. The `/ready` endpoint returns JSON with detailed health status; use that for tests requiring structured responses.
-
----
-
-## Gotcha: Runbook Section Anchors Must Use Lowercase-Hyphenated Format
-**Added**: 2026-02-06
-**Related files**: `infra/docker/prometheus/rules/gc-alerts.yaml`, `docs/runbooks/gc-incident-response.md`
-
-GitHub/GitLab auto-generate anchors from markdown headings using lowercase with hyphens. A heading like `## Scenario 1: Database Connection Failures` becomes `#scenario-1-database-connection-failures`. Special characters are stripped. Verify anchors work by testing the URL before finalizing alert annotations.
 
 ---
 
@@ -50,18 +42,5 @@ Guidelines:
 - Warning alerts: 5-10 minutes (reduce noise for non-urgent issues)
 
 Tune based on production data after deployment. Initial values are estimates.
-
----
-
-## Gotcha: Prometheus Rule File Must Be Added to Config
-**Added**: 2026-02-06
-**Related files**: `infra/docker/prometheus/prometheus.yml`, `infra/docker/prometheus/rules/gc-alerts.yaml`
-
-Creating alert rules YAML file is not sufficient. The file path must be added to `prometheus.yml`:
-```yaml
-rule_files:
-  - /etc/prometheus/rules/*.yaml
-```
-And the rules directory must be mounted in the container. Without this, Prometheus ignores the alert definitions.
 
 ---

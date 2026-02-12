@@ -2,34 +2,46 @@
 
 **Date**: YYYY-MM-DD
 **Task**: Brief description of what was implemented
+**Specialist**: {specialist-name}
+**Mode**: Agent Teams (v2)
 **Branch**: `branch-name`
 **Duration**: ~Xm (approximate total time)
 
 ---
 
-## Loop State (Internal)
-
-<!-- This section is maintained by the orchestrator for state recovery after context compression. -->
-<!-- Do not edit manually - the orchestrator updates this as the loop progresses. -->
+## Loop Metadata
 
 | Field | Value |
 |-------|-------|
-| Implementing Agent | `{agent_id}` |
-| Implementing Specialist | `{specialist-name}` |
-| Current Step | `{init|planning|implementation|validation|code_review|reflection|complete}` |
-| Iteration | `{1-5}` |
-| Security Reviewer | `{agent_id or pending}` |
-| Test Reviewer | `{agent_id or pending}` |
-| Code Reviewer | `{agent_id or pending}` |
-| DRY Reviewer | `{agent_id or pending}` |
+| Start Commit | `{git rev-parse HEAD at setup}` |
+| Branch | `{current branch}` |
 
-<!-- ORCHESTRATOR REMINDER:
-     - Update this table at EVERY state transition
-     - Capture reviewer agent IDs AS SOON as you invoke each reviewer
-     - When step is code_review and all reviewers approve, MUST advance to reflection
+---
+
+## Loop State (Internal)
+
+<!-- This section is maintained by the Lead for state recovery after interruption. -->
+<!-- Do not edit manually - the Lead updates this as the loop progresses. -->
+
+| Field | Value |
+|-------|-------|
+| Phase | `{setup|planning|implementation|review|reflection|complete}` |
+| Implementer | `{agent_id or pending}` |
+| Implementing Specialist | `{specialist-name}` |
+| Iteration | `{1-5}` |
+| Security | `{agent_id or pending}` |
+| Test | `{agent_id or pending}` |
+| Observability | `{agent_id or pending}` |
+| Code Quality | `{agent_id or pending}` |
+| DRY | `{agent_id or pending}` |
+| Operations | `{agent_id or pending}` |
+
+<!-- LEAD REMINDER:
+     - Update this table at EVERY phase transition
+     - Capture teammate IDs AS SOON as you spawn them
+     - When phase is review and all reviewers approve, advance to reflection
      - Only mark complete after ALL reflections are done
-     - Before switching to a new user request, check if Current Step != complete
-     - Each specialist writes to their own checkpoint file (see _template/specialist.md)
+     - Each specialist writes to their own checkpoint file
      - Use /dev-loop-status to check state, /dev-loop-restore to recover from interruption
 -->
 
@@ -52,35 +64,9 @@
 
 ---
 
-## Planning Proposal
+## Planning
 
-<!-- This section is populated by /dev-loop-plan when planning mode is used. -->
-<!-- Delete this section if planning was not used (standard flow). -->
-
-**Status**: {Ready for implementation | Needs clarification | Recommend escalation}
-
-### Approach
-{Multi-line description of proposed implementation approach}
-
-### Files to Modify
-| File | Changes |
-|------|---------|
-| `path/to/file.rs` | {Brief description} |
-
-### Files to Create
-| File | Purpose |
-|------|---------|
-| `path/to/new_file.rs` | {Brief description} |
-
-### Key Decisions
-| Decision | Rationale |
-|----------|-----------|
-| {Decision description} | {Why this approach} |
-
-### Discussion Notes
-{Any questions raised during planning and their resolutions}
-
-{Or "No planning phase - direct implementation" if standard flow was used}
+TBD
 
 ---
 
@@ -188,6 +174,11 @@
 
 {Key findings or "No issues found"}
 
+### Observability Specialist
+**Verdict**: APPROVED / FINDINGS
+
+{Key findings or "No issues found"}
+
 ### Code Quality Reviewer
 **Verdict**: APPROVED / FINDINGS
 
@@ -202,7 +193,10 @@
 **Tech debt findings** (TECH_DEBT - opportunities for extraction):
 {List findings documented below, or "None"}
 
-{Add other reviewers as applicable: Observability, Operations, Infrastructure}
+### Operations Reviewer
+**Verdict**: APPROVED / FINDINGS
+
+{Key findings or "No issues found"}
 
 ---
 
@@ -225,6 +219,24 @@
 | {endpoint/function} | `path/to/file.rs:line` | {Why it's temporary} | {Remove when X} |
 
 {Or "No temporary code detected" if Code Reviewer found nothing}
+
+---
+
+## Rollback Procedure
+
+If this dev-loop needs to be reverted:
+1. Verify start commit from Loop Metadata: `{start_commit}`
+2. Review all changes: `git diff {start_commit}..HEAD`
+3. Soft reset (preserves changes): `git reset --soft {start_commit}`
+4. Hard reset (clean revert): `git reset --hard {start_commit}`
+5. For schema changes: rollback requires a forward migration — `git reset` alone is insufficient if migrations were applied
+6. For infrastructure changes: may require `skaffold delete` or `kubectl delete -f` if manifests were applied
+
+---
+
+## Reflection
+
+TBD
 
 ---
 

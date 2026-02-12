@@ -3,7 +3,7 @@
 **CRITICAL**: Read this file at the start of every session. These are mandatory development practices for Dark Tower.
 
 > **Note**: This file defines **orchestrator rules** (what you can/cannot do, when to use specialists).
-> For **implementation mechanics**, use the dev-loop skills: `/dev-loop`, `/dev-loop-init`, `/dev-loop-implement`, etc.
+> For **implementation mechanics**, use `/dev-loop` to start the Agent Teams workflow.
 
 ## Core Principle: Specialist-Led Development
 
@@ -90,10 +90,10 @@ Use a **single message with multiple Task tool calls** for parallel execution.
 
 ### For New Features
 
-**Recommended**: Use the **Development Loop** skills for implementation tasks.
-Run `/dev-loop` for overview, or start with `/dev-loop-init "task description"`:
-- Specialist-owned verification (7-layer: check → fmt → guards → tests → clippy → semantic)
-- Code review by Security, Test, and Code Quality specialists
+**Recommended**: Use `/dev-loop "task description"` for implementation tasks:
+- Spawns 7 autonomous teammates (1 implementer + 6 reviewers)
+- Specialist-owned verification pipeline: check → fmt → guards → tests → clippy → audit + coverage (reported) + artifact-specific layers
+- Code review by Security, Test, Observability, Code Quality, DRY, and Operations specialists
 - Reflection step to capture learnings
 - State checkpointing for context recovery
 
@@ -236,47 +236,25 @@ The restore skill will:
 
 ## Contextual Injection
 
-When starting the dev-loop, match task keywords to principle categories and pass to step-runners.
+When starting the dev-loop, specialist knowledge is automatically injected into each teammate's prompt. The Lead reads ALL `.md` files from `docs/specialist-knowledge/{name}/` for each specialist and includes them in the composed prompt.
 
-**Task-to-Category Mapping** (regex patterns):
-- `password|hash|bcrypt|encrypt|decrypt|key|secret` → crypto, logging
-- `query|select|database|migration|sql` → queries, logging
-- `jwt|token|auth|oauth|bearer` → crypto, jwt, logging
-- `handler|endpoint|route|api` → logging, errors, input
-- `test|coverage|fuzz|e2e` → testing, errors
-
-**Category Files**: `docs/principles/*.md`
-
-**Your job**: Match patterns, pass file paths to step-runner. Step-runner handles injection.
-
-See `.claude/skills/dev-loop-init/SKILL.md` for full category list.
+See `.claude/skills/dev-loop/SKILL.md` for auto-detection patterns that determine which specialist to invoke.
 
 ---
 
 ## Related Files
 
 **Dev-Loop Skills** (`.claude/skills/`):
-- `dev-loop/SKILL.md` - Overview and navigation
-- `dev-loop-init/SKILL.md` - Initialize loop, match principles
-- `dev-loop-implement/SKILL.md` - Spawn specialist with context
-- `dev-loop-validate/SKILL.md` - 7-layer verification
-- `dev-loop-review/SKILL.md` - Code review (4 reviewers)
-- `dev-loop-reflect/SKILL.md` - Capture learnings
-- `dev-loop-fix/SKILL.md` - Fix validation/review findings
+- `dev-loop/SKILL.md` - Agent Teams workflow (single command)
 - `dev-loop-restore/SKILL.md` - Recover from checkpoints
 - `dev-loop-status/SKILL.md` - Check loop state
-
-**Other Workflows** (`.claude/workflows/`):
-- `multi-agent-debate.md` - Debate mechanics
-- `code-review.md` - Code review process
+- `debate/SKILL.md` - Multi-agent debate workflow
 
 **ADRs** (`docs/decisions/`):
 - **ADR-0015** - Principles & guards methodology
 - **ADR-0016** - Development loop design (original workflow approach)
 - **ADR-0017** - Specialist knowledge architecture (dynamic knowledge files)
 - **ADR-0018** - Dev-loop checkpointing and restore (session recovery)
-- **ADR-0021** - Step-runner architecture for dev-loop reliability
-- **ADR-0022** - Skill-based development loop (supersedes workflow approach)
 
 ---
 
