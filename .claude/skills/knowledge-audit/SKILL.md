@@ -63,20 +63,12 @@ If `--specialists` provided, audit only those. Otherwise, audit all specialists 
 
 ### Step 3: Compose Specialist Prompts
 
-For each specialist, compose a prompt with:
-
-1. **Specialist identity**: `.claude/agent-teams/specialists/{name}.md`
-2. **Their knowledge files**: ALL `.md` files from `docs/specialist-knowledge/{name}/`
-3. **Audit instructions** (see template below)
+For each specialist, spawn with `subagent_type: "{name}"` (identity auto-loaded from `.claude/agents/{name}.md`). The prompt includes their knowledge files and audit instructions:
 
 **Audit prompt template**:
 
 ```
-You are the {Name} specialist for Dark Tower. Audit your knowledge files against the actual codebase.
-
-## Your Identity
-
-{contents of .claude/agent-teams/specialists/{name}.md}
+Audit your knowledge files against the actual codebase.
 
 ## Your Current Knowledge Files
 
@@ -152,7 +144,7 @@ A good audit deletes more than it adds.
 
 ### Step 4: Spawn Audit Team
 
-Spawn all specialists in parallel as Task agents. Each specialist only edits their own knowledge directory — no conflicts.
+Spawn all specialists in parallel using `subagent_type: "{name}"` in the Task tool. Each specialist only edits their own knowledge directory — no conflicts.
 
 Lead monitors for completion and collects summaries.
 
@@ -240,5 +232,5 @@ Report: docs/specialist-knowledge/audits/YYYY-MM-DD-{slug}.md
 ## Related
 
 - ADR-0017 — Specialist knowledge architecture
-- `.claude/agent-teams/specialists/` — Specialist definitions
+- `.claude/agents/` — Specialist definitions (auto-loaded via `subagent_type`)
 - `/dev-loop` reflection phase — How knowledge gets captured during implementation

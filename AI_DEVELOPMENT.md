@@ -515,7 +515,7 @@ The codebase handles authentication, JWT issuance, key rotation, rate limiting, 
 | Dev-loop overview | [.claude/skills/dev-loop/SKILL.md](.claude/skills/dev-loop/SKILL.md) |
 | Agent Teams dev-loop | [.claude/skills/dev-loop/SKILL.md](.claude/skills/dev-loop/SKILL.md) |
 | Debate workflow | [.claude/skills/debate/SKILL.md](.claude/skills/debate/SKILL.md) |
-| Specialist definitions | [.claude/agent-teams/specialists/](.claude/agent-teams/specialists/) |
+| Specialist definitions | [.claude/agents/](.claude/agents/) |
 | Specialist knowledge | [docs/specialist-knowledge/](docs/specialist-knowledge/) |
 | Architecture decisions | [docs/decisions/](docs/decisions/) |
 | Debate records | [docs/debates/](docs/debates/) |

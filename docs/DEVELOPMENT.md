@@ -120,6 +120,10 @@ pacman -S mingw-w64-x86_64-gcc mingw-w64-x86_64-pkg-config mingw-w64-x86_64-prot
   gh auth login
   ```
 
+- **Cargo Audit**: Check dependencies for known vulnerabilities
+  ```bash
+  cargo install cargo-audit
+  ```
 - **Cargo Watch**: Auto-rebuild on file changes
   ```bash
   cargo install cargo-watch

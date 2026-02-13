@@ -376,7 +376,7 @@ Single-command workflow with autonomous teammates:
 
 **Key Files**:
 - `.claude/skills/dev-loop/SKILL.md` - Agent Teams workflow
-- `.claude/agent-teams/` - Specialist and protocol templates
+- `.claude/agents/` - Specialist definitions (auto-loaded via `subagent_type`)
 - `docs/dev-loop-outputs/` - Output files tracking each implementation
 
 **When to use**: Any implementation task (features, tests, refactors, security changes)
@@ -403,7 +403,7 @@ For design decisions affecting multiple services, use debates to reach consensus
 
 **Key Files**:
 - `.claude/skills/debate/SKILL.md` - Debate workflow
-- `.claude/agent-teams/protocols/debate.md` - Debate communication protocol
+- `.claude/skills/debate/debate-protocol.md` - Debate communication protocol
 - `docs/debates/` - Debate records
 
 ---

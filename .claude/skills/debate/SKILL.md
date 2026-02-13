@@ -116,18 +116,18 @@ TBD - ADR will be created when consensus reached
 
 For each specialist, compose:
 
-1. **Specialist identity**: `.claude/agent-teams/specialists/{name}.md`
-2. **Debate protocol**: `.claude/agent-teams/protocols/debate.md`
-3. **Dynamic knowledge**: Read ALL `.md` files from `docs/specialist-knowledge/{name}/` (not just patterns/gotchas/integration - include any domain-specific files)
+1. **Debate protocol**: `.claude/skills/debate/debate-protocol.md`
 
-**Prompt template**:
+**NOTE**: Specialist identity is auto-loaded via `subagent_type` parameter. Do NOT manually read or inject `.claude/agents/{name}.md`. Specialists self-load their own knowledge from `docs/specialist-knowledge/{name}/` as their first step.
+
+Spawn with `subagent_type: "{name}"` and this prompt:
 
 ```
 You are participating in a Dark Tower design debate.
 
-## Your Identity
+## Step 0: Load Knowledge (MANDATORY)
 
-{contents of specialists/{name}.md}
+**Before doing ANY other work**, read ALL `.md` files from `docs/specialist-knowledge/{your-specialist-name}/` to load your accumulated knowledge. This includes patterns, gotchas, integration notes, and any domain-specific files. Do NOT skip this step.
 
 ## Debate Protocol
 
@@ -155,19 +155,10 @@ CC the Lead with satisfaction updates after each substantive exchange.
 
 **IMPORTANT**: This step requires Agent Teams to be enabled.
 
-Spawn all specialists as teammates:
+Spawn all specialists as teammates using `subagent_type: "{name}"` in the Task tool:
 - Enable delegate mode (Lead coordinates, doesn't participate in debate content)
-- Each specialist gets their composed prompt
+- Identity auto-loaded from `.claude/agents/{name}.md`
 - Specialists can message each other directly
-
-```
-Lead spawns:
-- {domain specialist} with composed prompt
-- Security specialist with composed prompt
-- Test specialist with composed prompt
-- Observability specialist with composed prompt
-- Operations specialist with composed prompt
-```
 
 ### Step 6: Monitor Debate
 
