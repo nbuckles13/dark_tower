@@ -24,8 +24,9 @@ When the implementer shares their plan, verify before confirming:
 2. Approach is ADR-compliant (no contradictions with existing decisions)
 3. No domain-specific concerns that would require redesign
 4. For Security reviewer: threat model implications considered
+5. All technical questions you raised with the implementer are resolved — no pending concerns
 
-Only message Lead "Plan confirmed" after checking all applicable items.
+Only message Lead "Plan confirmed" after checking all applicable items. **Do NOT confirm if you have unresolved questions or outstanding discussions with the implementer.**
 
 ## Communication Patterns
 

@@ -17,17 +17,26 @@ Use `/dev-loop` for:
 
 For design decisions needing consensus first, use `/debate` to create an ADR, then use this for implementation.
 
+**All specialist implementation work MUST go through `/dev-loop`**. Never manually spawn a specialist via the Task tool — use `/dev-loop` (full) or `/dev-loop --light` to ensure consistent identity and knowledge loading.
+
 ## Arguments
 
 ```
-/dev-loop "task description" --specialist={name}
-/dev-loop "task description"  # auto-detect specialist
+/dev-loop "task description"                                        # new, full, auto-detect specialist
+/dev-loop "task description" --specialist={name}                    # new, full, explicit specialist
+/dev-loop "task description" --light                                # new, light (3 teammates)
+/dev-loop "feedback" --continue=YYYY-MM-DD-slug                     # reopen completed loop, full
+/dev-loop "feedback" --continue=YYYY-MM-DD-slug --light             # reopen completed loop, light
 ```
 
 - **task description**: What to implement (required)
 - **--specialist**: Implementing specialist (optional, auto-detected from task)
+- **--light**: Lightweight mode — 3 teammates, skip planning gate and reflection (see Lightweight Mode)
+- **--continue**: Reopen a completed dev-loop to address human review feedback (see Continue Mode)
 
 ## Team Composition
+
+### Full Mode (default)
 
 Every dev-loop spawns **7 teammates** (Lead + Implementer + 6 reviewers):
 
@@ -43,6 +52,38 @@ Every dev-loop spawns **7 teammates** (Lead + Implementer + 6 reviewers):
 
 **Conditional domain reviewer**: When the task touches database patterns (`migration|schema|sql`) but the implementer is NOT the Database specialist, add Database as a conditional 8th reviewer. Same for Protocol when API contracts are affected by a non-Protocol implementer.
 
+### Lightweight Mode (`--light`)
+
+For small, contained changes (typically 10-30 lines):
+
+| Role | Specialist | Purpose |
+|------|------------|---------|
+| Implementer | Specified or auto-detected | Does the work |
+| Security Reviewer | security | Always present |
+| Context Reviewer | Lead chooses | One reviewer based on change type |
+
+**Third reviewer selection** (Lead decides):
+- Code Quality — for style/idiom changes
+- Observability — for metrics/tracing changes
+- Test — for test changes
+- Operations — for deployment/config changes
+- DRY — for shared code changes
+
+**Skips**: Gate 1 (plan approval), reflection phase
+**Keeps**: Full validation pipeline (Gate 2), review verdicts
+
+**Not eligible** (must use full mode):
+- Changes touching auth, crypto, session paths, security-critical code
+- Schema/migration changes
+- Protocol changes
+- Deployment manifests (K8s, Docker)
+- `Cargo.toml` dependency changes
+- `crates/common/` (affects all services)
+- Instrumentation code (`tracing::`, `metrics::`, `#[instrument]`)
+
+**Escalation**: Any reviewer can request upgrade to full dev-loop.
+**Ambiguity rule**: When in doubt, use full mode.
+
 ## Workflow Overview
 
 ```
@@ -51,15 +92,15 @@ Lead (minimal involvement)
 ├── SETUP
 │   ├── Create output directory
 │   ├── Record git state: `git rev-parse HEAD` in main.md
-│   ├── Spawn 7 teammates with composed prompts
+│   ├── Spawn teammates via subagent_type (identity auto-loaded)
 │   └── Send task to implementer
 │
-├── PLANNING (Implementer + Reviewers collaborate)
+├── PLANNING (Implementer + Reviewers collaborate) [SKIPPED in --light]
 │   ├── Implementer drafts approach
 │   ├── Reviewers provide input directly
 │   └── All reviewers confirm → GATE 1
 │
-├── GATE 1: PLAN APPROVAL (Lead)
+├── GATE 1: PLAN APPROVAL (Lead) [SKIPPED in --light]
 │   └── Check all reviewers confirmed (see Plan Confirmation Checklist in review protocol)
 │
 ├── IMPLEMENTATION (Implementer drives)
@@ -77,11 +118,11 @@ Lead (minimal involvement)
 ├── GATE 3: FINAL APPROVAL (Lead)
 │   └── Check all verdicts APPROVED
 │
-├── REFLECTION (All teammates)
+├── REFLECTION (All teammates) [SKIPPED in --light]
 │   └── Each captures learnings in knowledge files
 │
 └── COMPLETE
-    └── Lead writes summary, documents rollback procedure
+    └── Lead writes summary, invites human review feedback
 ```
 
 ## Instructions
@@ -91,6 +132,7 @@ Lead (minimal involvement)
 Extract:
 - Task description
 - Specialist (if provided, else detect from keywords)
+- Mode flags: `--light`, `--continue`
 
 **Auto-detection patterns**:
 | Pattern | Specialist |
@@ -107,6 +149,10 @@ Extract:
 
 **Disambiguation**: When a task matches multiple specialist patterns, the more specific match takes precedence. If ambiguity remains, Lead prompts the user to choose. Example: "fix meeting assignment load balancing" matches both `meeting` (MC) and `assignment` (GC) — Lead asks user.
 
+**If `--continue` is specified**: See Continue Mode section below. Skip to that workflow.
+
+**If `--light` is specified**: Validate eligibility against the exclusion list. If not eligible, inform user and run full mode instead.
+
 ### Step 2: Create Output Directory
 
 ```bash
@@ -116,8 +162,9 @@ mkdir -p docs/dev-loop-outputs/YYYY-MM-DD-{task-slug}
 Create `main.md` (see `docs/dev-loop-outputs/_template/main.md` for the full template). Key fields to populate at setup:
 
 - **Loop Metadata**: Record `git rev-parse HEAD` as Start Commit and current branch
-- **Loop State**: All 7 reviewers (including Observability) set to `pending`
+- **Loop State**: All reviewers set to `pending`
 - **Phase**: `setup`
+- **Mode**: `full` or `light`
 
 For security-critical implementations, the implementer should maintain a "Security Decisions" table in main.md:
 
@@ -127,21 +174,18 @@ For security-critical implementations, the implementer should maintain a "Securi
 | RNG source | SystemRandom | CSPRNG required | ADR-0002 |
 ```
 
-### Step 3: Compose Teammate Prompts
+### Step 3: Spawn Teammates
 
-**For Implementer**, compose:
-1. Specialist identity: `.claude/agent-teams/specialists/{name}.md`
-2. Dynamic knowledge: Read ALL `.md` files from `docs/specialist-knowledge/{name}/` (not just patterns/gotchas/integration - include any domain-specific files)
-3. Task context
+**IMPORTANT**: All teammates are spawned using the `subagent_type` parameter in the Task tool, which auto-loads their identity from `.claude/agents/{name}.md`. Do NOT manually read or inject specialist identity files — the agent system handles this.
 
-**Implementer prompt**:
+**For Implementer**, spawn with `subagent_type: "{specialist-name}"` and this prompt:
 
 ```
 You are implementing a feature for Dark Tower.
 
-## Your Identity
+## Step 0: Load Knowledge (MANDATORY)
 
-{contents of specialists/{name}.md}
+**Before doing ANY other work**, read ALL `.md` files from `docs/specialist-knowledge/{your-specialist-name}/` to load your accumulated knowledge. This includes patterns, gotchas, integration notes, and any domain-specific files. Do NOT skip this step.
 
 ## Your Task
 
@@ -164,29 +208,20 @@ You are implementing a feature for Dark Tower.
 - CC Lead only for phase transitions ("Ready for validation", etc.)
 - Discuss review findings with reviewers directly
 - **Do NOT start implementing until Lead says "Plan approved"**
-
-## Dynamic Knowledge
-
-{injected knowledge files}
 ```
 
-**For Reviewers**, compose:
-1. Specialist identity: `.claude/agent-teams/specialists/{name}.md`
-2. Review protocol: `.claude/agent-teams/protocols/review.md`
-3. Dynamic knowledge: Read ALL `.md` files from `docs/specialist-knowledge/{name}/` (not just patterns/gotchas/integration - include any domain-specific files)
-
-**Reviewer prompt**:
+**For Reviewers**, spawn with `subagent_type: "{reviewer-name}"` and this prompt:
 
 ```
 You are a reviewer in a Dark Tower dev-loop.
 
-## Your Identity
+## Step 0: Load Knowledge (MANDATORY)
 
-{contents of specialists/{name}.md}
+**Before doing ANY other work**, read ALL `.md` files from `docs/specialist-knowledge/{your-specialist-name}/` to load your accumulated knowledge. This includes patterns, gotchas, integration notes, and any domain-specific files. Do NOT skip this step.
 
 ## Review Protocol
 
-{contents of protocols/review.md}
+{contents of .claude/skills/dev-loop/review-protocol.md}
 
 ## Your Workflow
 
@@ -203,19 +238,11 @@ You are a reviewer in a Dark Tower dev-loop.
 - Message other reviewers if you spot issues in their domain
 - CC Lead for confirmations and verdicts
 - **Do NOT start reviewing code until Lead says "Start Review"**
-
-## Dynamic Knowledge
-
-{injected knowledge files}
 ```
 
-### Step 4: Spawn Team
+**For `--light` mode**: Skip workflow steps 1-2 for the implementer (no planning gate). Implementer starts implementing immediately. Reviewer prompt omits planning steps.
 
-**IMPORTANT**: Requires Agent Teams enabled.
-
-Spawn all 7 teammates (+ conditional domain reviewer if applicable):
-- Lead enables delegate mode (cannot implement directly)
-- Each teammate gets their composed prompt
+### Step 4: Send Task to Implementer
 
 Send initial message to implementer:
 ```
@@ -226,18 +253,19 @@ Requirements:
 
 Team:
 - Security Reviewer: @security
-- Test Reviewer: @test
-- Observability Reviewer: @observability
-- Code Quality: @code-reviewer
-- DRY Reviewer: @dry-reviewer
-- Operations: @operations
+- Test Reviewer: @test (full mode only)
+- Observability Reviewer: @observability (full mode only)
+- Code Quality: @code-reviewer (full mode only)
+- DRY Reviewer: @dry-reviewer (full mode only)
+- Operations: @operations (full mode only)
+{list only the teammates actually spawned}
 
 Start by drafting your approach and getting reviewer input.
 ```
 
-Update main.md: Phase = planning
+Update main.md: Phase = planning (full) or implementation (light)
 
-### Step 5: Gate 1 - Plan Approval
+### Step 5: Gate 1 - Plan Approval [FULL MODE ONLY]
 
 Wait for all reviewers to confirm plan.
 
@@ -334,11 +362,12 @@ Track verdicts in main.md:
 - Max 3 review→implementation iterations
 
 **If all APPROVED**:
-- Update main.md: Phase = reflection
+- Update main.md: Phase = reflection (full) or complete (light)
 - Document any non-blocking findings as TECH_DEBT in main.md (findings below reviewer's blocking threshold that were not fixed)
-- Message team: "All approved. Please capture reflections."
+- Full mode: Message team: "All approved. Please capture reflections."
+- Light mode: Skip to Step 9.
 
-### Step 8: Reflection
+### Step 8: Reflection [FULL MODE ONLY]
 
 Allow 15 minutes for teammates to document learnings.
 
@@ -371,9 +400,61 @@ Results:
 Files changed:
 {summary}
 
-**Next steps**:
-- Review changes: `git diff`
-- Commit when ready: `git add . && git commit`
+**To address review feedback**:
+- Small fix: `/dev-loop --light "description" --continue=YYYY-MM-DD-{slug}`
+- Larger change: `/dev-loop "description" --continue=YYYY-MM-DD-{slug}`
+```
+
+## Continue Mode (`--continue`)
+
+Reopens a completed dev-loop to address human review feedback. All work is tracked in the same `main.md` as additional iterations.
+
+### How It Works
+
+1. **Parse**: Extract feedback description and dev-loop slug from `--continue=YYYY-MM-DD-slug`
+2. **Load context**: Read `docs/dev-loop-outputs/{slug}/main.md` to get:
+   - Original task description
+   - Which specialist implemented
+   - What was done
+   - Previous reviewer verdicts
+3. **Record feedback**: Add a "Human Review" section to main.md:
+   ```markdown
+   ## Human Review (Iteration {N})
+
+   **Feedback**: "{user's feedback}"
+   ```
+4. **Spawn implementer**: Use the same specialist as the original dev-loop, via `subagent_type`. Prompt includes:
+   - The original task context (from main.md)
+   - The human review feedback
+   - Reference to the previous implementation
+5. **Determine mode**: `--light` or full is controlled by the user's flags, same rules as new dev-loops
+6. **Run workflow**: Same gates as a new dev-loop (validation + review), tracked as additional iterations in the same main.md
+7. **Update main.md**: Record implementation changes, validation results, and reviewer verdicts for this iteration
+
+### Continue Prompt (Implementer)
+
+Spawn with `subagent_type: "{original-specialist}"`:
+
+```
+You are continuing work on a previous dev-loop implementation.
+
+## Original Task
+
+{original task description from main.md}
+
+## What Was Done
+
+{summary of previous implementation from main.md}
+
+## Human Review Feedback
+
+{user's feedback}
+
+## Your Task
+
+Address the feedback above. The previous implementation is already in the codebase.
+
+When done, message Lead: "Ready for validation"
 ```
 
 ## Limits
@@ -385,6 +466,7 @@ Files changed:
 | Validation | 3 attempts | Escalate |
 | Review→Impl loop | 3 iterations | Escalate |
 | Reflection | 15 min | Proceed without |
+| Human review rounds | 3 per dev-loop | Escalate ("is this task well-scoped?") |
 
 ## Recovery
 
@@ -392,5 +474,7 @@ If a session is interrupted, restart the dev-loop from the beginning. The main.m
 
 ## Files
 
+- **Specialist definitions**: `.claude/agents/{name}.md` (auto-loaded via `subagent_type`)
+- **Review protocol**: `.claude/skills/dev-loop/review-protocol.md`
 - **Output**: `docs/dev-loop-outputs/YYYY-MM-DD-{slug}/main.md`
 - **Knowledge updates**: `docs/specialist-knowledge/{name}/*.md`
