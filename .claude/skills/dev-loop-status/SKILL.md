@@ -35,11 +35,11 @@ The script will show active and completed loops. Based on the **Phase** of activ
 
 | Phase | Next Action |
 |-------|-------------|
-| `setup` | Run `/dev-loop` again to continue setup |
-| `planning` | Run `/dev-loop-restore` to resume with checkpoint context |
-| `implementation` | Run `/dev-loop-restore` to resume with checkpoint context |
-| `review` | Run `/dev-loop-restore` to resume with checkpoint context |
-| `reflection` | Run `/dev-loop-restore` to complete reflection |
+| `setup` | Run `/dev-loop` again to restart |
+| `planning` | Run `/dev-loop` again to restart (main.md records start commit for rollback) |
+| `implementation` | Run `/dev-loop` again to restart |
+| `review` | Run `/dev-loop` again to restart |
+| `reflection` | Run `/dev-loop` again to restart |
 
 ### Step 3: Check Checkpoint Files (if needed)
 

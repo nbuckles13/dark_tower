@@ -34,12 +34,12 @@ Every dev-loop spawns **7 teammates** (Lead + Implementer + 6 reviewers):
 | Role | Specialist | Purpose | Blocking |
 |------|------------|---------|----------|
 | Implementer | Specified or auto-detected | Does the work | N/A |
-| Security Reviewer | security | Vulnerabilities, crypto, auth | Yes (all findings) |
-| Test Reviewer | test | Coverage, test quality, regression | Yes (all findings) |
-| Observability Reviewer | observability | Metrics, logging, tracing, PII, SLOs | Yes (BLOCKER/HIGH); advisory (MEDIUM/LOW) |
-| Code Quality Reviewer | code-reviewer | Rust idioms, ADR compliance | Yes (all findings) |
-| DRY Reviewer | dry-reviewer | Cross-service duplication | BLOCKER only; TECH_DEBT documented (per ADR-0019) |
-| Operations Reviewer | operations | Deployment safety, rollback, runbooks | Yes (all findings) |
+| Security Reviewer | security | Vulnerabilities, crypto, auth | MINOR+ blocks; rest TECH_DEBT |
+| Test Reviewer | test | Coverage, test quality, regression | MAJOR+ blocks; rest TECH_DEBT |
+| Observability Reviewer | observability | Metrics, logging, tracing, PII, SLOs | MINOR+ blocks; rest TECH_DEBT |
+| Code Quality Reviewer | code-reviewer | Rust idioms, ADR compliance | MAJOR+ blocks; rest TECH_DEBT |
+| DRY Reviewer | dry-reviewer | Cross-service duplication | BLOCKER only; rest TECH_DEBT (per ADR-0019) |
+| Operations Reviewer | operations | Deployment safety, rollback, runbooks | MAJOR+ blocks; rest TECH_DEBT |
 
 **Conditional domain reviewer**: When the task touches database patterns (`migration|schema|sql`) but the implementer is NOT the Database specialist, add Database as a conditional 8th reviewer. Same for Protocol when API contracts are affected by a non-Protocol implementer.
 
@@ -152,7 +152,7 @@ You are implementing a feature for Dark Tower.
 ## Your Workflow
 
 1. PLANNING: Draft your approach, message reviewers for input
-2. Once all reviewers confirm, proceed to implementation
+2. **WAIT for Lead to message you "Plan approved" before implementing.** Individual reviewer confirmations are not sufficient — the Lead is the gatekeeper.
 3. IMPLEMENTATION: Do the work, message reviewers if questions arise
 4. When done, message Lead: "Ready for validation"
 5. REVIEW: Respond to reviewer feedback, fix issues
@@ -163,6 +163,7 @@ You are implementing a feature for Dark Tower.
 - Message reviewers directly with your plan and questions
 - CC Lead only for phase transitions ("Ready for validation", etc.)
 - Discuss review findings with reviewers directly
+- **Do NOT start implementing until Lead says "Plan approved"**
 
 ## Dynamic Knowledge
 
@@ -191,8 +192,8 @@ You are a reviewer in a Dark Tower dev-loop.
 
 1. PLANNING: Review implementer's approach, provide input
 2. When satisfied with plan, message Lead: "Plan confirmed"
-3. REVIEW: When validation passes, examine the code
-4. Discuss findings with implementer
+3. **WAIT for Lead to message you "Start Review" before examining code.** Do NOT review code during planning or implementation phases.
+4. REVIEW: Examine the code, discuss findings with implementer
 5. Send verdict to Lead: "APPROVED" or "BLOCKED: {reason}"
 6. REFLECTION: Document learnings when complete
 
@@ -201,6 +202,7 @@ You are a reviewer in a Dark Tower dev-loop.
 - Message implementer directly with feedback
 - Message other reviewers if you spot issues in their domain
 - CC Lead for confirmations and verdicts
+- **Do NOT start reviewing code until Lead says "Start Review"**
 
 ## Dynamic Knowledge
 
@@ -281,7 +283,7 @@ When implementer signals "Ready for validation", run the validation pipeline:
 | 1. Compile | `cargo check --workspace` | Type errors, sqlx compile-time failures |
 | 2. Format | `cargo fmt --all -- --check` | Style violations |
 | 3. Guards | `./scripts/guards/run-guards.sh` | Credential leaks, PII, instrument-skip-all, test-coverage, api-version-check |
-| 4. Tests | `cargo test --workspace` | Regressions; report P0 security test count |
+| 4. Tests | `./scripts/test.sh --workspace` | Regressions; ensures DB setup + migrations; report P0 security test count |
 | 5. Clippy | `cargo clippy --workspace --lib --bins -- -D warnings` | Lint warnings |
 | 6. Audit | `cargo audit` | Known dependency vulnerabilities |
 
@@ -303,7 +305,7 @@ When implementer signals "Ready for validation", run the validation pipeline:
 
 **If pass**:
 - Update main.md: Phase = review
-- Message reviewers: "Validation passed. Please review the changes."
+- Message reviewers: "Start Review. Validation passed — please examine the changes and send your verdict."
 
 **If fail**:
 - Send failure details to implementer
@@ -333,6 +335,7 @@ Track verdicts in main.md:
 
 **If all APPROVED**:
 - Update main.md: Phase = reflection
+- Document any non-blocking findings as TECH_DEBT in main.md (findings below reviewer's blocking threshold that were not fixed)
 - Message team: "All approved. Please capture reflections."
 
 ### Step 8: Reflection
@@ -347,7 +350,7 @@ Update main.md:
 - Phase = complete
 - Duration
 - Final summary
-- Tech debt section (from DRY reviewer)
+- Tech debt section (all non-blocking findings from all reviewers that were not fixed)
 
 Report to user:
 ```
@@ -378,24 +381,16 @@ Files changed:
 | Phase | Limit | Action |
 |-------|-------|--------|
 | Planning | 30 min / 3 rounds | Escalate |
-| Implementation | Checkpoint every 30 min | Lead checks progress |
+| Implementation | No limit | Lead monitors progress |
 | Validation | 3 attempts | Escalate |
 | Review→Impl loop | 3 iterations | Escalate |
 | Reflection | 15 min | Proceed without |
 
-## Checkpoints
+## Recovery
 
-main.md is updated at each phase for recovery:
-- After planning: decisions captured
-- After implementation: summary written
-- After validation: results recorded
-- After review: verdicts documented
-- After reflection: learnings captured
-
-If session interrupted, use `/dev-loop-restore` to resume.
+If a session is interrupted, restart the dev-loop from the beginning. The main.md file records the start commit for rollback if needed.
 
 ## Files
 
 - **Output**: `docs/dev-loop-outputs/YYYY-MM-DD-{slug}/main.md`
-- **Review files**: `docs/dev-loop-outputs/YYYY-MM-DD-{slug}/{reviewer}.md`
 - **Knowledge updates**: `docs/specialist-knowledge/{name}/*.md`
