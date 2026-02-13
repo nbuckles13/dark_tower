@@ -41,8 +41,8 @@
      - Capture teammate IDs AS SOON as you spawn them
      - When phase is review and all reviewers approve, advance to reflection
      - Only mark complete after ALL reflections are done
-     - Each specialist writes to their own checkpoint file
-     - Use /dev-loop-status to check state, /dev-loop-restore to recover from interruption
+     - Use /dev-loop-status to check state
+     - If interrupted, restart the dev-loop; main.md records start commit for rollback
 -->
 
 ---

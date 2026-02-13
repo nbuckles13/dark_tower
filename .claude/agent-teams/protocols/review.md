@@ -58,17 +58,14 @@ CC the Lead with your final verdict:
 
 ### Findings
 
-#### BLOCKER (must fix before merge)
+#### BLOCKER (critical, cannot merge)
 - **Issue**: [description] - `file.rs:line`
   - **Fix**: [specific solution]
 
-#### HIGH (should fix before merge)
+#### MAJOR (significant, should fix before merge)
 [same format]
 
-#### MEDIUM (fix soon)
-[same format]
-
-#### LOW (nice to have)
+#### MINOR (should address)
 [same format]
 
 ### Verdict
@@ -76,20 +73,32 @@ CC the Lead with your final verdict:
 
 ### Reason (if blocked)
 [Specific issues that must be fixed]
+
+### Tech Debt (if any non-blocking findings)
+[Any findings below your blocking threshold that were not fixed — these are tracked as TECH_DEBT]
 ```
 
 ## Severity Definitions
 
-| Severity | Meaning | Blocks? (default) |
-|----------|---------|-------------------|
-| BLOCKER | Critical issue, cannot merge | Yes |
-| HIGH | Significant issue, should fix first | Yes |
-| MEDIUM | Should address soon | No |
-| LOW | Nice to have improvement | No |
+| Severity | Meaning |
+|----------|---------|
+| BLOCKER | Critical issue, cannot merge under any threshold |
+| MAJOR | Significant issue, should fix before merge |
+| MINOR | Should address, lower impact |
 
-**Modified blocking thresholds**: Some reviewers have domain-specific blocking rules defined in their specialist definition. Check your specialist definition for authoritative blocking behavior:
-- **DRY Reviewer**: Only BLOCKER blocks; TECH_DEBT documented (per ADR-0019)
-- **Observability Reviewer**: BLOCKER+HIGH block; MEDIUM/LOW are advisory
+**Anything not fixed is documented as TECH_DEBT** in the dev-loop output.
+
+## Blocking Thresholds by Reviewer
+
+| Reviewer | Blocks on | Non-blocking → TECH_DEBT |
+|----------|-----------|--------------------------|
+| Security | MINOR+ (all findings) | — |
+| Observability | MINOR+ (all findings) | — |
+| Infrastructure | MINOR+ (all findings) | — |
+| Test | MAJOR+ | MINOR → TECH_DEBT |
+| Code Quality | MAJOR+ | MINOR → TECH_DEBT |
+| Operations | MAJOR+ | MINOR → TECH_DEBT |
+| DRY | BLOCKER only | MAJOR, MINOR → TECH_DEBT (per ADR-0019) |
 
 ## ADR Compliance (Code Quality Reviewer)
 
@@ -98,7 +107,7 @@ The Code Quality reviewer MUST check changed code against relevant ADRs:
 1. Identify changed files and their component (`crates/{service}/`)
 2. Look up applicable ADRs via `docs/specialist-knowledge/code-reviewer/key-adrs.md`
 3. Check implementation against ADR MUST/SHOULD/MAY requirements
-4. Severity mapping: MUST/REQUIRED = BLOCKER, SHOULD/RECOMMENDED = HIGH, MAY/OPTIONAL = LOW
+4. Severity mapping: MUST/REQUIRED = BLOCKER, SHOULD/RECOMMENDED = MAJOR, MAY/OPTIONAL = MINOR
 5. "ADR Compliance" is a mandatory section in the Code Quality verdict
 
 ## guard:ignore Annotations
@@ -107,11 +116,11 @@ Any `guard:ignore` annotation in the code MUST include a justification:
 ```rust
 // guard:ignore(REASON) — e.g., guard:ignore(test-only fixture, not production code)
 ```
-Guards without justification are flagged as findings (MEDIUM severity).
+Guards without justification are flagged as findings (MINOR severity).
 
 ## Iteration
 
-If implementer addresses your BLOCKER/HIGH findings:
+If implementer addresses your blocking findings:
 1. Re-review the specific changes
 2. Update your verdict
 3. CC Lead: "@Lead: Updated verdict after fixes: APPROVED"

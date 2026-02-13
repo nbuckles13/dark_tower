@@ -24,7 +24,7 @@ The v3 skills have been retired. `/dev-loop` and `/debate` are now the sole work
 - **Lead is a coordinator, not implementer** — Lead only acts at gates (plan approval, validation, final approval)
 - **Teammates communicate peer-to-peer** — Reviewers message the implementer directly, reducing Lead context load
 - **Specialist-owned verification** — Each reviewer owns their domain; findings are blocking unless otherwise specified
-- **State checkpointing** — `main.md` tracks phase for recovery via `/dev-loop-restore`
+- **Simple recovery** — `main.md` records start commit; if interrupted, restart the dev-loop from the beginning
 
 ## Decision
 
@@ -37,21 +37,27 @@ Every dev-loop spawns **7 teammates** (Lead + Implementer + 6 reviewers):
 | Role | Specialist | Purpose | Blocking |
 |------|------------|---------|----------|
 | Implementer | Auto-detected or specified | Does the work | N/A |
-| Security Reviewer | security | Vulnerabilities, crypto, auth | Yes (all findings) |
-| Test Reviewer | test | Coverage, test quality, regression | Yes (all findings) |
-| **Observability Reviewer** | observability | Metrics, logging, tracing, PII, SLOs | Yes (BLOCKER/HIGH); advisory (MEDIUM/LOW) |
-| Code Quality Reviewer | code-reviewer | Rust idioms, ADR compliance | Yes (all findings) |
-| DRY Reviewer | dry-reviewer | Cross-service duplication | BLOCKER only; TECH_DEBT documented (per ADR-0019) |
-| Operations Reviewer | operations | Deployment safety, rollback, runbooks | Yes (all findings) |
+| Security Reviewer | security | Vulnerabilities, crypto, auth | MINOR+ blocks; rest TECH_DEBT |
+| Test Reviewer | test | Coverage, test quality, regression | MAJOR+ blocks; rest TECH_DEBT |
+| Observability Reviewer | observability | Metrics, logging, tracing, PII, SLOs | MINOR+ blocks; rest TECH_DEBT |
+| Code Quality Reviewer | code-reviewer | Rust idioms, ADR compliance | MAJOR+ blocks; rest TECH_DEBT |
+| DRY Reviewer | dry-reviewer | Cross-service duplication | BLOCKER only; rest TECH_DEBT (per ADR-0019) |
+| Operations Reviewer | operations | Deployment safety, rollback, runbooks | MAJOR+ blocks; rest TECH_DEBT |
 
 **Rationale for 7 teammates**: All four mandatory cross-cutting specialists (Security, Test, Observability, Operations) are now included alongside Code Quality and DRY. This resolves a policy inconsistency where CLAUDE.md listed Observability as mandatory but the dev-loop excluded it. Each reviewer covers a distinct, non-overlapping domain — no natural combination exists without diluting expertise. Reviewers work in parallel, so the added teammate does not significantly increase wall-clock time.
 
 **Conditional domain reviewer**: When the task touches database patterns (`migration|schema|sql`) but the implementer is NOT the Database specialist, add Database as a conditional 8th reviewer for that loop. This prevents schema changes landing without database-aware review. The same principle applies to Protocol when API contracts are affected by a non-Protocol implementer.
 
-**Observability blocking authority**:
+**Observability blocking authority** (blocks on MINOR+):
 - **BLOCKER**: PII in logs/traces without visibility wrapper, secrets leaked via `#[instrument]` Debug, unbounded metric cardinality, missing `skip_all` on public handlers
-- **HIGH**: Missing instrumentation on critical paths, naming convention violations, no structured logging on error paths
-- **MEDIUM/LOW** (advisory): Non-critical spans, histogram bucket alignment, verbosity tuning
+- **MAJOR**: Missing instrumentation on critical paths, naming convention violations, no structured logging on error paths
+- **MINOR**: Non-critical spans, histogram bucket alignment, verbosity tuning
+
+**Severity definitions** (used across all reviewers):
+- **BLOCKER**: Critical issue, cannot merge under any threshold
+- **MAJOR**: Significant issue, should fix before merge
+- **MINOR**: Should address, lower impact
+- Anything not fixed is documented as **TECH_DEBT** in the dev-loop output
 
 #### Workflow Phases
 
@@ -70,16 +76,17 @@ Lead (minimal involvement)
 │   └── All reviewers confirm → GATE 1
 │
 ├── GATE 1: PLAN APPROVAL (Lead)
-│   └── Check all reviewers confirmed
+│   └── Check all reviewers confirmed → Lead messages implementer "Plan approved"
 │
-├── IMPLEMENTATION (Implementer drives)
+├── IMPLEMENTATION (Implementer drives — waits for "Plan approved" from Lead)
 │   ├── Implementer does the work
 │   └── Ready → request validation
 │
 ├── GATE 2: VALIDATION (Lead)
 │   └── Run validation pipeline (see below)
+│   └── On pass → Lead messages reviewers "Start Review"
 │
-├── REVIEW (Reviewers + Implementer collaborate)
+├── REVIEW (Reviewers examine code — waits for "Start Review" from Lead)
 │   ├── Reviewers examine code (scoped via git diff)
 │   ├── Discuss findings with implementer
 │   └── Send verdicts to Lead
@@ -105,7 +112,7 @@ Concrete, tiered verification replacing the aspirational "7-layer" reference:
 | 1. Compile | `cargo check --workspace` | Type errors, sqlx compile-time failures |
 | 2. Format | `cargo fmt --all -- --check` | Style violations |
 | 3. Guards | `./scripts/guards/run-guards.sh` | Credential leaks, PII, instrument-skip-all, test-coverage, api-version-check, metrics-naming, cardinality bounds |
-| 4. Tests | `cargo test --workspace` | Regressions; report P0 security test count |
+| 4. Tests | `./scripts/test.sh --workspace` | Regressions; ensures DB setup + migrations; report P0 security test count |
 | 5. Clippy | `cargo clippy --workspace --lib --bins -- -D warnings` | Lint warnings |
 | 6. Audit | `cargo audit` | Known dependency vulnerabilities |
 
@@ -304,15 +311,22 @@ Code Quality reviewer MUST check changed code against relevant ADRs:
 1. Identify changed files and their component (`crates/{service}/`)
 2. Look up applicable ADRs via `docs/specialist-knowledge/code-reviewer/key-adrs.md`
 3. Check implementation against ADR MUST/SHOULD/MAY requirements
-4. Severity mapping: MUST/REQUIRED = BLOCKER, SHOULD/RECOMMENDED = HIGH, MAY/OPTIONAL = LOW
+4. Severity mapping: MUST/REQUIRED = BLOCKER, SHOULD/RECOMMENDED = MAJOR, MAY/OPTIONAL = MINOR
 5. "ADR Compliance" is a mandatory section in the Code Quality verdict
 
-#### Blocking Behavior Documentation
+#### Blocking Behavior by Reviewer
 
-By default, BLOCKER and HIGH severity findings block approval. Individual reviewers may have modified blocking thresholds defined in their specialist definition. Check the specialist definition for the authoritative blocking rules:
-- DRY Reviewer: Only BLOCKER blocks; TECH_DEBT documented (per ADR-0019)
-- Observability Reviewer: BLOCKER+HIGH block; MEDIUM/LOW are advisory
-- Future reviewers with modified thresholds follow the same pattern
+| Reviewer | Blocks on | Non-blocking → TECH_DEBT |
+|----------|-----------|-----------------------------|
+| Security | MINOR+ (all findings) | — |
+| Observability | MINOR+ (all findings) | — |
+| Infrastructure | MINOR+ (all findings) | — |
+| Test | MAJOR+ | MINOR → TECH_DEBT |
+| Code Quality | MAJOR+ | MINOR → TECH_DEBT |
+| Operations | MAJOR+ | MINOR → TECH_DEBT |
+| DRY | BLOCKER only | MAJOR, MINOR → TECH_DEBT (per ADR-0019) |
+
+Anything not fixed is documented as TECH_DEBT in the dev-loop output's Tech Debt section.
 
 #### guard:ignore Justification
 
@@ -322,13 +336,9 @@ Any `guard:ignore` annotation MUST include a reason:
 ```
 Guards without justification are flagged as findings.
 
-### 4. Restore Pre-Flight Verification
+### 4. Recovery Model
 
-When resuming a dev-loop via `/dev-loop-restore`:
-1. Verify `git status` — code-on-disk matches checkpoint expectations
-2. `git diff {checkpoint_commit}..HEAD` — check for unexpected changes
-3. If security-critical phase: re-verify security assumptions still hold
-4. Inject checkpoint context into all reviewer prompts
+If a dev-loop is interrupted, restart from the beginning with `/dev-loop`. The `main.md` file records the start commit for rollback if needed. No checkpoint/restore mechanism is required — restarting is simpler and avoids stale context.
 
 ### 5. CLAUDE.md Consistency
 
@@ -356,7 +366,7 @@ Update CLAUDE.md to explicitly state: **All 4 cross-cutting specialists (Securit
 
 1. **Knowledge files unchanged** — Specialist knowledge architecture (ADR-0017) unaffected
 2. **Output format compatible** — `docs/dev-loop-outputs/` structure preserved with additions
-3. **Restore mechanism compatible** — `/dev-loop-restore` enhanced, not replaced
+3. **Simpler recovery** — `/dev-loop-restore` removed in favor of restart-from-beginning model
 
 ## Implementation Items
 
@@ -379,7 +389,7 @@ Update CLAUDE.md to explicitly state: **All 4 cross-cutting specialists (Securit
 12. Implement `--light` flag in dev-loop skill with explicit exclusion criteria
 13. Add cross-service implementation model (Tier A/B) documentation to dev-loop skill
 14. Add Protocol Constraints and Migration Plan conditional sections to debate ADR template
-15. Add restore pre-flight verification to `/dev-loop-restore`
+15. ~~Add restore pre-flight verification~~ — Removed; restart-from-beginning model adopted instead
 16. Add per-crate benchmark layer for performance-critical services (future)
 
 ## Participants
@@ -389,7 +399,7 @@ Update CLAUDE.md to explicitly state: **All 4 cross-cutting specialists (Securit
 | Security | Sound with veto protection, verification layers, inline decision checkpointing | 93 |
 | Test | Sound with concrete pipeline, coverage reporting, debate veto | 92 |
 | Observability | Sound with inclusion as 7th reviewer, validation checks, guard specs | 95 |
-| Operations | Operationally sound with rollback, veto weight, restore pre-flight | 95 |
+| Operations | Operationally sound with rollback, veto weight, recovery model | 95 |
 | Code-Reviewer | Sound with ADR compliance checklist, Step 0 scoping, blocking behavior | 93 |
 | DRY-Reviewer | Well-positioned with generalized blocking behavior documentation | 93 |
 | Auth-Controller | Practical with observability fix, expanded patterns, security checkpointing | 95 |

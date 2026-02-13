@@ -361,19 +361,18 @@ Single-command workflow with autonomous teammates:
 ### Utility Skills
 
 - `/dev-loop-status` - Check current state of any dev-loop
-- `/dev-loop-restore` - Recover interrupted loop from checkpoints
 
 ### Key Aspects
 
 - **Context injection**: Specialist knowledge automatically included
 - **Validation pipeline**: check → fmt → guards → tests → clippy → audit + coverage (reported) + artifact-specific layers (see ADR-0024)
-- **State checkpointing**: Enables recovery after interruption (ADR-0018)
 - **Git state tracking**: Start commit recorded for rollback (see ADR-0024)
+- **Recovery**: Restart from beginning if interrupted; main.md records start commit for rollback
 
-**Code review blocking behavior**:
-- Security, Test, Code Quality, Operations: ALL findings must be fixed
-- Observability: BLOCKER+HIGH block; MEDIUM/LOW are advisory
-- DRY Reviewer: Only BLOCKER blocks; non-BLOCKERs documented as tech debt (see ADR-0019)
+**Code review blocking behavior** (severities: BLOCKER > MAJOR > MINOR; unresolved → TECH_DEBT):
+- Security, Observability, Infrastructure: MINOR+ blocks (all findings); non-fixed → TECH_DEBT
+- Test, Code Quality, Operations: MAJOR+ blocks; MINOR → TECH_DEBT
+- DRY Reviewer: BLOCKER only; MAJOR/MINOR → TECH_DEBT (per ADR-0019)
 
 **Key Files**:
 - `.claude/skills/dev-loop/SKILL.md` - Agent Teams workflow

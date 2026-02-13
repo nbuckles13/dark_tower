@@ -219,20 +219,9 @@ This will show:
 - Iteration count
 - What to run next
 
-**If incomplete loop found and user wants to restore**:
-
-```
-/dev-loop-restore
-```
-
-The restore skill will:
-1. Read all checkpoint files in the directory
-2. Re-invoke specialists with their checkpoint content as context
-3. Continue from the interrupted step
-
-**If user declines restore**:
-- Continue with new work
-- Incomplete dev-loop can be resumed later or abandoned
+**If incomplete loop found**:
+- Restart with `/dev-loop` — main.md records start commit for rollback if needed
+- Incomplete dev-loop output remains for reference
 
 ## Contextual Injection
 
@@ -246,7 +235,6 @@ See `.claude/skills/dev-loop/SKILL.md` for auto-detection patterns that determin
 
 **Dev-Loop Skills** (`.claude/skills/`):
 - `dev-loop/SKILL.md` - Agent Teams workflow (single command)
-- `dev-loop-restore/SKILL.md` - Recover from checkpoints
 - `dev-loop-status/SKILL.md` - Check loop state
 - `debate/SKILL.md` - Multi-agent debate workflow
 
