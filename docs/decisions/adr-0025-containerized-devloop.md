@@ -21,11 +21,11 @@ Running on the host (even inside WSL2) exposes:
 
 Claude Code's `/sandbox` feature (bubblewrap on Linux) provides defense-in-depth but is not a hard security boundary — it allows read-only access to the entire filesystem by default, is vulnerable to domain fronting, and has documented escape paths.
 
-We need a development environment where Claude can operate with full autonomy (`--dangerously-skip-permissions`) while limiting blast radius to the current task's worktree.
+We need a development environment where Claude can operate with full autonomy (`--dangerously-skip-permissions`) while limiting blast radius to the current task's clone.
 
 ### Requirements
 
-1. Claude must be able to run the full validation pipeline (compile, format, guards, tests, clippy, audit, coverage)
+1. Claude must be able to run the full validation pipeline (compile, format, guards, tests, clippy, audit, semantic analysis)
 2. No GitHub credentials or SSH keys exposed to the container
 3. Parallel dev-loops must be possible (multiple tasks simultaneously)
 4. Accidental session exit (Ctrl-D) must not destroy state
@@ -37,34 +37,36 @@ We need a development environment where Claude can operate with full autonomy (`
 
 ### 1. Containerized Execution via Podman
 
-Each dev-loop runs inside a **podman pod** containing:
+Each dev-loop runs two **podman containers** sharing a network namespace:
 - A **dev container** with the full Rust toolchain, Claude Code CLI, and development tools
-- A **PostgreSQL 16 sidecar** for integration tests
+- A **PostgreSQL 16 container** for integration tests (accessible at `localhost:5432` via `--network container:`)
 
 The dev container's entrypoint is `sleep infinity` (keeps the container alive). Users interact via `podman exec -it <container> claude --dangerously-skip-permissions`.
 
-### 2. Git Worktree Isolation
+### 2. Git Clone Isolation
 
-Each task gets its own git worktree, bind-mounted into the container as `/work`. This provides:
-- Filesystem isolation (Claude can only see the worktree)
+Each task gets its own `git clone --local` (hardlinked objects, self-contained `.git`), bind-mounted into the container as `/work`. This provides:
+- Filesystem isolation (Claude can only see the clone)
 - Build artifact persistence (`target/` lives on the bind mount)
 - Clean separation between parallel tasks
+- No cross-directory `.git` references (unlike worktrees, which reference the main repo's `.git` directory and break inside containers)
 
 ### 3. Credential Separation
 
 | Credential | Location | Exposed to Claude? |
 |---|---|---|
-| `ANTHROPIC_API_KEY` | Container env var | Yes (required for Claude to function) |
+| OAuth credentials | Container (read-only mount) | Yes (required for Claude to function) |
+| `ANTHROPIC_API_KEY` | Container env var (if set) | Yes (optional, OAuth preferred) |
 | GitHub PAT / `gh` auth | Host only | No |
 | SSH keys | Host only | No |
 | Git identity | Container env vars (`GIT_AUTHOR_*`, `GIT_COMMITTER_*`) | Yes (name/email, not secrets) |
 | `AC_MASTER_KEY` | Container env var | Yes (test fixture, not production) |
 
-The `ANTHROPIC_API_KEY` is the only real credential exposed. This is unavoidable — Claude needs it to function. The risk is limited to API charge abuse; it cannot access the user's repositories, infrastructure, or personal data.
+OAuth credentials (`~/.claude/.credentials.json`) are mounted read-only. The risk is limited to API charge abuse; Claude cannot access the user's repositories, infrastructure, or personal data.
 
 ### 4. PR Metadata File
 
-Since GitHub credentials are not available inside the container, Claude writes a `.devloop-pr.json` file to the worktree root during dev-loop completion (Step 9). The host-side wrapper script reads this file to push and create the PR using the host's credentials.
+Since GitHub credentials are not available inside the container, Claude writes a `.devloop-pr.json` file to the clone root during dev-loop completion (Step 9). The host-side wrapper script reads this file to push and create the PR using the host's credentials.
 
 ```json
 {
@@ -77,12 +79,12 @@ This preserves Claude's context (task description, reviewer verdicts, files chan
 
 ### 5. Shared Cargo Registry, Isolated Target
 
-- `cargo-registry` and `cargo-git` are named podman volumes shared across all dev-loops (safe — cargo uses file locking)
-- `target/` lives inside the worktree bind mount (isolated per task, persists between sessions)
+- `cargo-registry` and `cargo-git` are named podman volumes mounted at `$CARGO_HOME` (`/tmp/cargo-home`), shared across all dev-loops (safe — cargo uses file locking)
+- `target/` lives inside the clone bind mount (isolated per task, persists between sessions)
 
-### 6. Persistent Pod with Attach/Detach
+### 6. Persistent Containers with Attach/Detach
 
-The pod runs in the background. Users attach via `podman exec` and detach freely. This means:
+The containers run in the background. Users attach via `podman exec` and detach freely. This means:
 - Ctrl-D exits the Claude session, not the container
 - PostgreSQL keeps its state (migrations, test data) between sessions
 - Build artifacts in `target/` persist
@@ -98,8 +100,8 @@ A `devloop.sh` script manages the full lifecycle:
 ./devloop.sh <task-slug> [base-branch]
 ```
 
-1. Creates git worktree (idempotent)
-2. Starts pod in background (idempotent)
+1. Creates git clone (idempotent)
+2. Starts containers in background (idempotent)
 3. Runs migrations, copies Claude settings
 4. Drops into container via `podman exec`
 5. On exit, checks for commits and PR metadata
@@ -121,7 +123,7 @@ Rebuilt weekly or when toolchain changes. ~3-4 GB.
 **Positive**:
 - Full `--dangerously-skip-permissions` autonomy with container-level blast radius
 - No GitHub/SSH credentials exposed to Claude
-- Parallel dev-loops via separate worktrees and pods
+- Parallel dev-loops via separate clones and container pairs
 - Session resilience (Ctrl-D doesn't destroy state)
 - PR descriptions written by Claude with full task context
 - Aligns with existing podman requirement (test database)
@@ -130,8 +132,8 @@ Rebuilt weekly or when toolchain changes. ~3-4 GB.
 - ~3-4 GB container image to maintain
 - First build in a new container is slower (cargo registry cache helps after first run)
 - Claude conversation context lost on session exit (code/DB state preserved)
-- `ANTHROPIC_API_KEY` is still exposed inside the container
-- Additional tooling to learn (podman pods, wrapper script)
+- OAuth credentials are still exposed inside the container (read-only)
+- Additional tooling to learn (podman containers, wrapper script)
 
 **Neutral**:
 - `--userns=keep-id` maps container UID to host UID (proper file ownership)
@@ -142,12 +144,12 @@ Rebuilt weekly or when toolchain changes. ~3-4 GB.
 
 | Section | Component | Status | Notes |
 |---------|-----------|--------|-------|
-| 1 | Dockerfile | 🚧 In Progress | `infra/devloop/Dockerfile` |
-| 2 | Entrypoint script | 🚧 In Progress | `infra/devloop/entrypoint.sh` |
-| 3 | Wrapper script | 🚧 In Progress | `infra/devloop/devloop.sh` |
-| 4 | SKILL.md Step 9 update | 🚧 In Progress | `.devloop-pr.json` output |
-| 5 | .gitignore update | 🚧 In Progress | Add `.devloop-pr.json` |
-| 6 | Documentation updates | 🚧 In Progress | AI_DEVELOPMENT.md, CLAUDE.md, DEVELOPMENT_WORKFLOW.md |
+| 1 | Dockerfile | ✅ Done | `infra/devloop/Dockerfile` |
+| 2 | Entrypoint script | ✅ Done | `infra/devloop/entrypoint.sh` |
+| 3 | Wrapper script | ✅ Done | `infra/devloop/devloop.sh` |
+| 4 | SKILL.md Step 9 update | ✅ Done | `.devloop-pr.json` output |
+| 5 | .gitignore update | ✅ Done | Add `.devloop-pr.json` |
+| 6 | Documentation updates | ✅ Done | AI_DEVELOPMENT.md, CLAUDE.md, DEVELOPMENT_WORKFLOW.md |
 
 ## Alternatives Considered
 
@@ -155,7 +157,8 @@ Rebuilt weekly or when toolchain changes. ~3-4 GB.
 - **Docker instead of Podman**: Requires daemon, rootful by default. Podman is rootless, daemonless, and already a project requirement.
 - **Devcontainer spec**: More complex, IDE-coupled. The wrapper script is simpler and works from any terminal.
 - **GitHub credentials in container with repo-scoped PAT**: Simpler PR workflow, but any credential in a `--dangerously-skip-permissions` container should be considered compromised. Host-side PR creation is safer.
-- **Ephemeral containers (--rm)**: Simpler but Ctrl-D destroys everything. Persistent pods with attach/detach are more resilient.
+- **Ephemeral containers (--rm)**: Simpler but Ctrl-D destroys everything. Persistent containers with attach/detach are more resilient.
+- **Podman pods**: Originally attempted, but `--pod` is incompatible with `--userns=keep-id`. Replaced with `--network container:` to share the network namespace while preserving UID mapping.
 
 ## References
 

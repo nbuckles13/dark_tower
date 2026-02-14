@@ -101,7 +101,7 @@ The specialists debated directly - Security raising concerns about key lifecycle
 
 ## Dynamic Knowledge: AI That Learns
 
-Each specialist maintains a **knowledge directory** that compounds over time:
+We can't inject every best practice into every prompt — that would overwhelm the AI and dilute focus. Instead, each specialist accumulates **dynamic knowledge files** that they read as their first step on every task:
 
 ```
 docs/specialist-knowledge/{specialist}/
@@ -111,20 +111,14 @@ docs/specialist-knowledge/{specialist}/
 └── {domain-specific}.md # Specialist-created files for their domain
 ```
 
-The three standard files are common across all specialists, but specialists can create additional domain-specific files during reflection. For example:
-
-| Specialist | Extra Files | Purpose |
-|------------|-------------|---------|
-| Security | `approved-crypto.md` | Reviewed/approved cryptographic algorithms |
-| Test | `coverage-targets.md` | Per-component coverage thresholds |
-| Code Reviewer | `key-adrs.md` | ADRs to check code against |
-| DRY Reviewer | `common-patterns.md` | Known shared code in `crates/common/` |
+The three standard files are common across all specialists, but specialists can create additional domain-specific files during reflection. For example, the Security specialist tracks `approved-crypto.md` for reviewed cryptographic algorithms, while the DRY Reviewer maintains `common-patterns.md` for known shared code in `crates/common/`.
 
 **How it works**:
-1. After each implementation, a **reflection step** captures learnings
-2. Specialists create or update any `.md` files in their knowledge directory
-3. On future invocations, **all files** in the directory are injected into the specialist's context (via `{{inject-all:}}` directive)
-4. The specialist gets smarter with each task - and can organize knowledge however makes sense for their domain
+1. Each specialist's [agent definition](.claude/agents/) includes "FIRST STEP: Read ALL `.md` files from your knowledge directory"
+2. After each implementation, a **reflection step** captures learnings into knowledge files
+3. The specialist gets smarter with each task — and can organize knowledge however makes sense for their domain
+
+**Reflection quality gates**: Not every observation warrants a knowledge entry. Entries must be **surprising or corrective** (not expected behavior), **project-specific** (not generic Rust/async knowledge), and **within the specialist's ownership lane** (Security doesn't write about Rust idioms, Code Quality doesn't write about crypto). This prevents knowledge bloat from parallel reflection where multiple specialists record the same insight.
 
 **Example from `security/gotchas.md`**:
 ```markdown
@@ -134,7 +128,9 @@ The three standard files are common across all specialists, but specialists can 
 - This is intentional - prevents accidental exposure of borrowed references
 ```
 
-This knowledge persists across sessions. A specialist that encountered this issue once won't make the same mistake again. And because specialists can create new files freely, knowledge organization evolves naturally - a Security specialist might start tracking `approved-crypto.md` separately because it has a different review cadence than general patterns.
+This knowledge persists across sessions. A specialist that encountered this issue once won't make the same mistake again. And because specialists can create new files freely, knowledge organization evolves naturally.
+
+> **Historical note**: An earlier approach used static `docs/principles/` files (crypto.md, jwt.md, etc.) with keyword-based injection. This was superseded by specialist knowledge files which are more targeted and evolve organically. See ADR-0017 for the knowledge architecture.
 
 ---
 
@@ -151,55 +147,39 @@ Before any code is committed, it passes through a **validation pipeline** (see A
 | 1 | `cargo check` | Basic compilation |
 | 2 | `cargo fmt` | Consistent formatting |
 | 3 | Simple guards | Pattern-based security checks |
-| 4 | Unit tests | Isolated functionality |
-| 5 | Integration tests | Cross-component behavior |
-| 6 | `cargo clippy` | Linting and best practices |
-| 7 | Semantic guards | AI-powered analysis |
+| 4 | Tests | Unit + integration via `scripts/test.sh` |
+| 5 | `cargo clippy` | Linting and best practices |
+| 6 | `cargo audit` | Known dependency vulnerabilities |
+| 7 | Semantic guards | AI-powered diff analysis |
 
 ### Simple Guards (Pattern Matching)
 
-Fast, deterministic checks that catch common issues:
+Fast, deterministic checks that catch common issues. Examples:
 
 | Guard | What it catches |
 |-------|-----------------|
 | `no-hardcoded-secrets` | API keys, passwords in source code |
 | `no-secrets-in-logs` | Sensitive data in log statements |
 | `no-pii-in-logs` | Email, IP addresses in logs |
-| `no-test-removal` | Accidental deletion of tests |
-| `api-version-check` | API versioning compliance |
-| `test-coverage` | Coverage regression detection |
+| `instrument-skip-all` | `#[instrument]` using denylist `skip()` instead of allowlist `skip_all` |
+| `test-registration` | Test files not registered in entry point (silently never run) |
+
+See [`scripts/guards/simple/`](scripts/guards/simple/) for the full set.
 
 ### Semantic Guards (AI-Powered)
 
-For issues that patterns can't catch, we use Claude to analyze code:
+For issues that patterns can't catch, we use Claude to analyze the diff:
 
 ```bash
-./scripts/guards/semantic/credential-leak.sh src/auth/token.rs
+./scripts/guards/run-semantic-guards.sh          # Analyze diff against HEAD
+./scripts/guards/run-semantic-guards.sh --base main  # Analyze diff against main
 ```
 
-The AI reviews the code against our principles and returns:
-- **SAFE** - No credential leak risks detected
-- **UNSAFE** - Specific concerns with line numbers and explanations
+The entire diff is analyzed in one Claude call across multiple checks (credential leaks, actor blocking, error context preservation). The result is one of:
+- **SAFE** - No issues found
+- **UNSAFE** - Specific findings with file, line number, and explanation
 
 This catches subtle issues like "this function logs a struct that contains a field that could contain sensitive data."
-
----
-
-## Specialist Knowledge: Right Knowledge at the Right Time
-
-We can't inject every best practice into every prompt — that would overwhelm the AI and dilute focus. Instead, each specialist accumulates **dynamic knowledge files** that are injected into their prompts at invocation:
-
-```
-docs/specialist-knowledge/{specialist}/
-├── patterns.md      # What works well (successful approaches)
-├── gotchas.md       # What to avoid (pitfalls encountered)
-├── integration.md   # How to work with other components
-└── {domain}.md      # Domain-specific knowledge (e.g., approved-crypto.md)
-```
-
-Knowledge compounds over time — after each implementation, the reflection phase captures new learnings. This ensures specialists follow project-specific standards that evolve with the codebase, not just generic best practices.
-
-> **Historical note**: An earlier approach used static `docs/principles/` files (crypto.md, jwt.md, etc.) with keyword-based injection. This was superseded by specialist knowledge files which are more targeted and evolve organically. See ADR-0017 for the knowledge architecture.
 
 ---
 
@@ -450,15 +430,15 @@ Teammates drive autonomously:
 
 #### Containerized Execution (Preferred)
 
-For maximum autonomy, dev-loops run inside isolated **podman containers** where Claude Code operates with `--dangerously-skip-permissions` (all permission prompts disabled). The container boundary limits blast radius to the current task's worktree.
+For maximum autonomy, dev-loops run inside isolated **podman containers** where Claude Code operates with `--dangerously-skip-permissions` (all permission prompts disabled). The container boundary limits blast radius to the current task's clone.
 
 ```
-Host (WSL2)                              Container (podman pod)
+Host (WSL2)                              Containers (podman)
 ┌──────────────────────┐                 ┌──────────────────────────┐
 │ GitHub credentials   │                 │ Claude Code (autonomous) │
 │ SSH keys             │  bind mount     │ Rust toolchain + tools   │
-│ Git worktree ────────┼────────────────►│ /work (worktree only)    │
-│ devloop.sh wrapper   │                 │ PostgreSQL sidecar       │
+│ Git clone ───────────┼────────────────►│ /work (clone only)       │
+│ devloop.sh wrapper   │                 │ PostgreSQL (shared net)  │
 │                      │                 │                          │
 │ Push + PR creation ◄─┼── .devloop-pr  │ No GitHub credentials    │
 │ (host credentials)   │    .json        │ No SSH keys              │
@@ -467,13 +447,13 @@ Host (WSL2)                              Container (podman pod)
 
 **Why containerize?**
 - `--dangerously-skip-permissions` enables fully autonomous Claude Code execution — no approval prompts interrupting the dev-loop
-- Container isolation means Claude can only access the mounted worktree, not SSH keys, GitHub credentials, or other projects
-- The only credential exposed is `ANTHROPIC_API_KEY` (unavoidable — Claude needs it to function)
+- Container isolation means Claude can only access the mounted clone, not SSH keys, GitHub credentials, or other projects
+- OAuth credentials are mounted read-only for Claude API access; no API keys needed
 - PR descriptions are written by Claude (which has the full task context) to a `.devloop-pr.json` file, then the host-side wrapper creates the actual PR using the host's GitHub credentials
 
 **Workflow**:
 ```bash
-# One command: creates worktree, starts pod, drops into Claude
+# One command: creates clone, starts containers, drops into Claude
 ./infra/devloop/devloop.sh td-42-rate-limiting
 
 # Inside container:
@@ -512,7 +492,7 @@ Every design decision works within AI's context limitations rather than fighting
 Each specialist only sees what they need: their domain knowledge, relevant principles, and the specific task. No cognitive overload.
 
 ### 3. Knowledge Compounds Without Bloating
-Dynamic knowledge files grow over time, but we inject only what's relevant to each task. The system learns without each prompt getting larger.
+Dynamic knowledge files grow over time, but each specialist only loads their own domain knowledge. The system learns without any single prompt getting larger.
 
 ### 4. Guards Assume Failure
 We don't trust any single AI interaction to be perfect. Seven verification layers catch inevitable oversights before they reach production.
