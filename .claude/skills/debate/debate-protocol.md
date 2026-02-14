@@ -12,26 +12,28 @@ You are a **participant** in a Dark Tower design debate. This protocol defines h
 
 ## Communication Patterns
 
+All teammate communication MUST use the SendMessage tool. Plain text output is not visible to other teammates.
+
 ### Stating Your Position
-Message all participants:
+Use SendMessage (broadcast) to share with all participants:
 > "My initial position on [topic]: I favor X because..."
 
 ### Responding to Others
-Message the specialist directly (others can see):
-> "@Protocol: I see your concern about latency. What if we..."
+Use SendMessage to message the specialist directly:
+> "I see your concern about latency. What if we..."
 
 ### Raising Concerns
 Be specific about what would change your mind:
 > "I'm concerned about Y. If we addressed it via Z, I could support this."
 
 ### Updating Satisfaction
-CC the Lead periodically with your score:
-> "@Lead: SATISFACTION UPDATE"
+Use SendMessage to tell @team-lead your score periodically:
+> "SATISFACTION UPDATE"
 > (then include the format below)
 
 ## Satisfaction Score Format
 
-After substantive exchanges, CC the Lead:
+After substantive exchanges, use SendMessage to tell @team-lead:
 
 ```
 SATISFACTION: [0-100]

@@ -389,3 +389,36 @@ pub fn set_actor_mailbox_depth(actor_type: &str, depth: usize) { ... }
 **Implementation note**: Internal tracking structures (like `MailboxMonitor`) store actor IDs (e.g., meeting IDs) for tracing logs, but these are NOT passed to Prometheus metric functions. The separation ensures operational debugging without cardinality explosion.
 
 ---
+
+## Pattern: Security Review of Generic Abstractions (Refactoring)
+**Added**: 2026-02-12 (Updated: 2026-02-12)
+**Related files**: `crates/global-controller/src/tasks/generic_health_checker.rs`, `crates/global-controller/src/tasks/health_checker.rs`
+
+When reviewing refactorings that extract generic/shared abstractions from concrete implementations, verify these security properties are preserved:
+
+1. **Tracing instrumentation safety**: Two patterns are security-equivalent for preventing parameter capture:
+   - `#[instrument(skip_all)]` on a function — explicitly skips all parameters from the tracing span
+   - `.instrument(tracing::info_span!("name"))` chained on the function's future — does NOT auto-capture any variables from the caller's scope (only `#[instrument]` proc macro does auto-capture)
+
+   Either pattern is safe. When reviewing, the key question is: "Is there an `#[instrument]` (without `skip_all`) on a function that receives `PgPool`, tokens, or other infrastructure types?" If no `#[instrument]` attribute exists at all, parameters are not captured regardless of `.instrument()` chaining.
+
+2. **Config field types**: Generic abstractions that accept configuration (log targets, entity names, display strings) should use `&'static str` rather than `String` to ensure compile-time values only. This eliminates any possibility of user-supplied input flowing into log targets or format strings.
+
+3. **Closure capture analysis**: When closures are passed as function parameters, verify they capture nothing sensitive from the enclosing scope. The closure parameters themselves (what the generic function passes in) should also be non-sensitive.
+
+4. **Error type preservation**: The generic function should use the same error type as the concrete implementations. Introducing a new generic error type could change what information is logged via `Display`/`Debug` formatting.
+
+5. **Public API surface**: Verify that wrapper functions maintain identical signatures — the refactoring should be invisible to callers, adding no new attack surface. Removing types from the public API (e.g., config structs) is a net positive.
+
+6. **`.instrument()` span contents**: When `.instrument(info_span!(...))` is used, verify the span macro uses only literal strings with no dynamic fields that could accept user input. Example safe pattern: `tracing::info_span!("gc.task.health_checker")`.
+
+**Quick review checklist for refactoring PRs**:
+- [ ] No new `expose_secret()` calls
+- [ ] No `#[instrument]` without `skip_all` on functions receiving `PgPool` or sensitive types (`.instrument()` chaining is safe — it does not auto-capture)
+- [ ] `.instrument()` spans contain only literal names, no dynamic fields
+- [ ] No new public API surface
+- [ ] No new SQL or query changes
+- [ ] Error handling chain unchanged
+- [ ] Test coverage preserved (same tests, testing through wrappers)
+
+---

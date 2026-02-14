@@ -235,3 +235,40 @@ const MAX_JWT_SIZE: usize = 4096; // Different from common!
 **Detection during review**: Grep for `MAX_JWT_SIZE` or similar constants. Verify all JWT size checks use `common::jwt::MAX_JWT_SIZE_BYTES`.
 
 ---
+
+## Gotcha: Staleness Threshold u64-to-i64 Cast Can Bypass Health Checks
+**Added**: 2026-02-12
+**Related files**: `crates/global-controller/src/tasks/generic_health_checker.rs`, `crates/global-controller/src/tasks/health_checker.rs`
+
+The health checker functions accept `staleness_threshold_seconds: u64` but cast to `i64` before passing to the repository (`staleness_threshold_seconds as i64`). If the value exceeds `i64::MAX` (2^63 - 1), the cast wraps to a negative number, which would cause the SQL `NOW() - INTERVAL '{threshold} seconds'` comparison to look into the future, effectively marking ALL entities as stale (or none, depending on the query logic).
+
+**Current risk**: LOW — the threshold comes from configuration, not user input, and realistic values are small (5-60 seconds). However, if configuration is ever loaded from environment variables without validation, a malformed value could trigger this.
+
+**Proper fix** (future tech debt): Validate at the boundary:
+```rust
+let threshold: i64 = staleness_threshold_seconds
+    .try_into()
+    .map_err(|_| GcError::BadRequest("staleness threshold too large".into()))?;
+```
+
+Or use `i64` throughout the API. This is pre-existing tech debt, not introduced by the generic refactoring.
+
+---
+
+## Gotcha: `.instrument()` vs `#[instrument]` — Different Security Implications
+**Added**: 2026-02-12
+**Related files**: `crates/global-controller/src/tasks/health_checker.rs`, `crates/global-controller/src/tasks/mh_health_checker.rs`
+
+These two tracing patterns have different security behavior:
+
+- **`#[instrument]`** (proc macro): Automatically captures ALL function parameters as span fields unless `skip_all` or `skip(param)` is used. This is where credential leakage happens if `skip_all` is forgotten on functions receiving `PgPool`, tokens, or secrets.
+
+- **`.instrument(info_span!("name"))`** (method chaining): Creates a named span and attaches it to a future. Does NOT auto-capture any variables from the surrounding scope. Only captures what you explicitly put in the `info_span!()` macro.
+
+**Implication for security reviews**: When a function has NO `#[instrument]` attribute but uses `.instrument()` chaining on an inner call, there is no parameter auto-capture risk. The absence of `#[instrument]` is itself sufficient — you do not need `skip_all` because there is nothing to skip.
+
+**Common false alarm**: Seeing a function that takes `PgPool` without `#[instrument(skip_all)]` and flagging it. If the function never has `#[instrument]`, parameters are not captured. Only flag if `#[instrument]` is present WITHOUT `skip_all`.
+
+**Risk if someone adds `#[instrument]` later**: If a developer adds `#[instrument]` to the wrapper for debugging and forgets `skip_all`, `PgPool` would be captured. This is LOW risk because `PgPool`'s `Debug` impl does not contain credentials, but it's worth noting in code review comments when this pattern is used.
+
+---

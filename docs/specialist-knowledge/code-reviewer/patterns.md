@@ -199,5 +199,27 @@ pub async fn heartbeat(&self, ...) -> Result<(), McError> {
 - Histogram buckets should match SLO targets (e.g., 0.1s target → buckets include 0.05, 0.1, 0.5)
 
 This pattern ensures complete observability for external dependencies, critical for debugging latency and reliability issues.
+## Pattern: Generic Background Task with Closure + Plain Parameters
+**Added**: 2026-02-12
+**Updated**: 2026-02-12
+**Related files**: `crates/global-controller/src/tasks/generic_health_checker.rs`, `crates/global-controller/src/tasks/health_checker.rs`, `crates/global-controller/src/tasks/mh_health_checker.rs`
+
+When multiple background tasks share the same loop structure (interval tick, select with cancellation, error handling) but differ in the operation performed, extract a generic function parameterized by `Fn(PgPool, i64) -> Fut` closure. Pass entity-specific metadata as plain parameters (e.g., `entity_name: &'static str`) rather than a config struct -- a struct is overhead when there is only one field. The generic function should NOT carry `#[instrument]`; instead, callers chain `.instrument(tracing::info_span!("span.name"))` on the returned future. This gives each wrapper full control over its span name without nested spans. Wrapper functions handle startup/shutdown lifecycle logs with literal `target:` values. Zero-cost (monomorphized at compile time), no trait object overhead.
+
+---
+
+## Pattern: Wrapper Function Preserving Public API During Refactoring
+**Added**: 2026-02-12
+**Related files**: `crates/global-controller/src/tasks/health_checker.rs`, `crates/global-controller/src/tasks/mh_health_checker.rs`
+
+When extracting shared logic into a generic function, keep thin wrapper functions with identical signatures to the originals. This means: no changes to `main.rs` call sites, no changes to test call sites, existing integration tests exercise the full pipeline through the wrapper. The wrapper is responsible for: providing the closure, chaining `.instrument(info_span!(...))` for tracing span context, and emitting lifecycle log lines with literal `target:` values. Tests stay in the wrapper module (not the generic module) since they test the specific entity behavior.
+
+---
+
+## Pattern: `.instrument()` Chaining for Caller-Controlled Spans
+**Added**: 2026-02-12
+**Related files**: `crates/global-controller/src/tasks/health_checker.rs`, `crates/global-controller/src/tasks/mh_health_checker.rs`
+
+When a generic/shared async function is called by multiple wrappers that each need different span names, prefer `.instrument(tracing::info_span!("caller.span.name"))` chaining on the `.await` over `#[instrument(skip_all, name = "...")]` on the generic function. Benefits: (1) no nested spans (generic + wrapper), (2) each caller fully controls its own span name, (3) the `Instrument` trait import (`use tracing::Instrument`) is lightweight, (4) avoids the `instrument-skip-all` validation guard on the generic function since `.instrument()` is a runtime method call, not a proc-macro attribute. Use `tracing::info_span!` for the span level.
 
 ---

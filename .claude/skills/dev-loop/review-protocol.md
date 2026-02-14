@@ -15,7 +15,7 @@ Before reviewing code, scope your work:
 1. **Scope** — Identify changed files and prioritize (Step 0 above)
 2. **Review** — Check code against your domain checklist
 3. **Discuss** — Message implementer and other reviewers as needed
-4. **Send verdict** — CC Lead when ready
+4. **Send verdict** — use SendMessage to tell @team-lead when ready
 
 ## Plan Confirmation Checklist (Gate 1)
 
@@ -26,25 +26,27 @@ When the implementer shares their plan, verify before confirming:
 4. For Security reviewer: threat model implications considered
 5. All technical questions you raised with the implementer are resolved — no pending concerns
 
-Only message Lead "Plan confirmed" after checking all applicable items. **Do NOT confirm if you have unresolved questions or outstanding discussions with the implementer.**
+Only use SendMessage to tell @team-lead "Plan confirmed" after checking all applicable items. **Do NOT confirm if you have unresolved questions or outstanding discussions with the implementer.**
 
 ## Communication Patterns
 
+All teammate communication MUST use the SendMessage tool. Plain text output is not visible to other teammates.
+
 ### Asking Questions
-Message the implementer directly:
+Use SendMessage to ask @implementer directly:
 > "Question about `auth.rs:45`: Why did you choose X over Y?"
 
 ### Flagging Cross-Domain Issues
-Message the relevant reviewer:
-> "@Security: I noticed input validation at line 23 - worth checking?"
+Use SendMessage to message the relevant reviewer:
+> "I noticed input validation at line 23 - worth checking?"
 
 ### Discussing with Implementer
-You can discuss findings directly:
+Use SendMessage to discuss findings with @implementer:
 > "I see the issue at line 45. Would approach X or Y work better for you?"
 
 ### Sending Your Verdict
-CC the Lead with your final verdict:
-> "@Lead: My review is complete. Verdict: APPROVED" (or BLOCKED)
+Use SendMessage to tell @team-lead your final verdict:
+> "My review is complete. Verdict: APPROVED" (or BLOCKED)
 
 ## Verdict Format
 
@@ -124,10 +126,10 @@ Guards without justification are flagged as findings (MINOR severity).
 If implementer addresses your blocking findings:
 1. Re-review the specific changes
 2. Update your verdict
-3. CC Lead: "@Lead: Updated verdict after fixes: APPROVED"
+3. Use SendMessage to tell @team-lead: "Updated verdict after fixes: APPROVED"
 
 ## Time Budget
 
 - Initial review: aim for completion within 30 minutes of receiving code
 - Re-review after fixes: aim for 10 minutes
-- If blocked on questions: escalate to Lead after 15 minutes waiting
+- If blocked on questions: use SendMessage to escalate to @team-lead after 15 minutes waiting

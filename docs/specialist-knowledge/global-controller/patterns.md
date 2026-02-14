@@ -346,3 +346,49 @@ cancel_token.cancel();
 Benefits: Both servers gracefully shut down on SIGTERM, background tasks (health checker, assignment cleanup) also respect the token. Each server binds to separate address (e.g., :8080 for HTTP, :50051 for gRPC).
 
 ---
+
+## Pattern: Generic Background Task via Closure + `.instrument()` Chaining
+**Added**: 2026-02-12, **Updated**: 2026-02-12
+**Related files**: `crates/global-controller/src/tasks/generic_health_checker.rs`, `crates/global-controller/src/tasks/health_checker.rs`, `crates/global-controller/src/tasks/mh_health_checker.rs`
+
+When multiple background tasks share identical structure (loop, select, error handling) but differ only in the repository call and log messages, extract a generic function parameterized by:
+1. `Fn(PgPool, i64) -> Fut` closure for the domain-specific operation (takes owned PgPool to avoid async lifetime issues)
+2. `entity_name: &'static str` for log message parameterization (prefer simple parameters over config structs for 1-2 fields)
+3. Thin wrapper functions that chain `.instrument(tracing::info_span!(...))` on the generic call and emit lifecycle logs with literal `target:` values
+
+The closure takes owned `PgPool` (not `&PgPool`) because async closures that borrow from their arguments create lifetime issues — the returned future must outlive the borrow. Since `PgPool` is `Arc`-wrapped internally, cloning is a cheap reference count bump.
+
+Wrapper functions preserve the original public API signatures, so call sites (main.rs, tests) need zero changes.
+
+---
+
+## Pattern: `.instrument()` Chaining Instead of `#[instrument]` for Generic Functions
+**Added**: 2026-02-12
+**Related files**: `crates/global-controller/src/tasks/health_checker.rs`, `crates/global-controller/src/tasks/mh_health_checker.rs`
+
+When a generic/shared function is called from multiple thin wrappers that each need distinct span names, prefer `.instrument()` chaining over `#[instrument]` attributes:
+
+```rust
+// In wrapper — no #[instrument] attribute on the function
+pub async fn start_health_checker(pool: PgPool, threshold: u64, cancel: CancellationToken) {
+    info!(target: "gc.task.health_checker", "Starting health checker task");
+
+    start_generic_health_checker(pool, threshold, cancel, "controllers", |pool, t| async move {
+        MeetingControllersRepository::mark_stale_controllers_unhealthy(&pool, t).await
+    })
+    .instrument(tracing::info_span!("gc.task.health_checker"))
+    .await;
+
+    info!(target: "gc.task.health_checker", "Health checker task stopped");
+}
+```
+
+Benefits over `#[instrument]` on both wrapper + generic:
+- **No nested spans**: Only one span exists (the `.instrument()` one), avoiding the redundant inner span from `#[instrument]` on the generic function
+- **No auto-capture risk**: `.instrument(info_span!(...))` creates a named span with zero fields — it never auto-captures function parameters like `PgPool` (unlike `#[instrument]` which requires `skip_all` for safety)
+- **Caller controls span naming**: Each wrapper chooses its own span name without the generic function needing to know
+- **Lifecycle logs outside span**: Start/stop logs in the wrapper are outside the span (they use explicit `target:` literals), while loop logs inside the generic function inherit the span — this is clean separation
+
+Requires `use tracing::Instrument;` (the trait, not the macro).
+
+---

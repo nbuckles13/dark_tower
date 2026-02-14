@@ -165,3 +165,36 @@ They happen to both track `meetings` and `connections`, but:
 **When reviewing**: Ask "What system consumes this metric?" If different, separation is intentional.
 
 ---
+
+## Thin Wrapper Similarity After Extraction is Healthy Convention
+
+**Added**: 2026-02-12 | **Updated**: 2026-02-12 (iteration 2)
+**Related files**: `crates/global-controller/src/tasks/health_checker.rs:37-65`, `crates/global-controller/src/tasks/mh_health_checker.rs:37-65`
+
+**Gotcha**: After extracting shared logic into a generic function, the remaining thin wrappers will still look structurally similar (~25 lines each: startup log, delegation call with `.instrument()` chaining, shutdown log). Do NOT flag this residual similarity as duplication requiring further extraction. The wrappers differ in:
+- `.instrument(tracing::info_span!("..."))` span names (string literals)
+- `target:` values in lifecycle logs (must be string literals for tracing)
+- Entity name parameter (e.g., `"controllers"` vs `"handlers"`)
+- Closure body (different repository method)
+
+These differences cannot be further extracted without macros or losing tracing fidelity. The wrapper layer is the minimum viable domain-specific surface.
+
+**Rule**: After a successful extraction, verify the wrappers contain ONLY domain-specific configuration and delegation. If they still contain shared logic (loops, error handling, control flow), the extraction is incomplete. If they contain only config + delegation, the extraction is complete and the wrapper similarity is acceptable.
+
+---
+
+## Config Struct vs Plain Parameters in Generic Extractions
+
+**Added**: 2026-02-12
+**Related files**: `crates/global-controller/src/tasks/generic_health_checker.rs`
+
+**Gotcha**: When extracting a generic function, resist the temptation to group domain-differentiating values into a config struct if there are only 1-2 parameters. A `HealthCheckerConfig { display_name, entity_name }` struct was introduced in iteration 1 and removed in iteration 2 because:
+- It added indirection (callers had to construct a struct just to pass 2 strings)
+- The `display_name` field led to fragile API conventions (empty string `""` vs `"MH "` with trailing space)
+- A plain `entity_name: &'static str` parameter is clearer and avoids the struct boilerplate
+
+**Rule of thumb**: Use a config struct when 3+ domain-specific parameters differentiate wrappers. For 1-2 parameters, use plain function arguments. If a "display name" is only used to prefix log messages, consider whether the wrapper's own lifecycle logs (with literal strings) already handle differentiation, making the field unnecessary.
+
+**When a config struct IS appropriate**: `AssignmentCleanupConfig` in the same crate has 4+ fields with meaningful semantics beyond simple string differentiation. That level of parameterization justifies a struct.
+
+---

@@ -122,10 +122,9 @@ All three services have identical tracing_subscriber initialization (~7 lines ea
 ---
 
 ### TD-13: Health Checker Background Task Pattern
-**Added**: 2026-01-31 | **Updated**: 2026-02-11
-**Related files**: `crates/global-controller/src/tasks/health_checker.rs` (381 lines), `crates/global-controller/src/tasks/mh_health_checker.rs` (320 lines)
+**Added**: 2026-01-31 | **Updated**: 2026-02-12 (iteration 2) | **Status**: Resolved
 
-GC implements two nearly-identical health checker background tasks (total ~700 lines): one for Meeting Controllers, one for Media Handlers. Both spawn tokio task, periodic check loop (5s interval), mark stale instances as unhealthy via repository calls, graceful shutdown via CancellationToken. Pattern includes: `DEFAULT_CHECK_INTERVAL_SECONDS`, `tokio::select!` with interval.tick() and cancel_token.cancelled(), extensive integration tests. Severity: Medium (95% structural similarity, significant LOC). Improvement path: Extract to `common::health::StalenessChecker::new(repo, threshold, interval)` generic over repository trait. Timeline: Phase 5+ (infrastructure cleanup). Note: High extraction value - pattern is nearly identical, only repository methods differ.
+Extracted to `generic_health_checker.rs` with closure-based generic function. Iteration 2 simplified the API: removed `HealthCheckerConfig` struct in favor of plain `entity_name: &'static str` parameter, removed `#[instrument]` from generic function in favor of `.instrument(tracing::info_span!(...))` chaining on wrappers. `health_checker.rs` and `mh_health_checker.rs` are now thin wrappers (~65 lines each, down from ~380/320). Approach used `Fn(PgPool, i64) -> Fut` closure (zero-cost, monomorphized) rather than trait objects. Wrapper function signatures unchanged -- no call site modifications needed.
 
 ---
 
@@ -188,6 +187,15 @@ Timeline: Phase 5+ (before third HTTP service). Note: First significant observab
 ---
 
 ### TD-20: Increment/Decrement Pattern in Actor Metrics
+### TD-20: Redundant test_default_check_interval in Health Checker Wrappers
+**Added**: 2026-02-12
+**Related files**: `crates/global-controller/src/tasks/generic_health_checker.rs:100`, `crates/global-controller/src/tasks/health_checker.rs:78`, `crates/global-controller/src/tasks/mh_health_checker.rs:78`
+
+`test_default_check_interval` appears in 3 modules: the generic module (canonical) and both wrappers. Wrappers import `DEFAULT_CHECK_INTERVAL_SECONDS` from generic via `pub use`, so all three tests assert the same value. Severity: Low (trivial test, 1 line each). Improvement path: Remove `test_default_check_interval` from both wrapper test modules. Timeline: Next cleanup sprint. Note: Deferred in TD-13 PR to minimize diff and avoid changing test count mid-review.
+
+---
+
+### TD-19: Increment/Decrement Pattern in Actor Metrics
 **Added**: 2026-02-05
 **Related files**: `crates/meeting-controller/src/actors/metrics.rs:348-389`
 

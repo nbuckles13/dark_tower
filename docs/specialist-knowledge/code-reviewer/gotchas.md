@@ -141,3 +141,28 @@ Placeholder secrets (e.g., `vec![0u8; 32]` with TODO) compile but are insecure. 
 Structs with increment methods naturally suggest Prometheus wiring. Not all metrics are wired - some are internal-only. Document at module level which types ARE wired, which are NOT. See `ControllerMetrics` (internal, not Prometheus) vs `ActorMetrics` (wired). Prevents dashboard confusion.
 
 ---
+
+## Gotcha: tracing `target:` Requires String Literal
+**Added**: 2026-02-12
+**Related files**: `crates/global-controller/src/tasks/generic_health_checker.rs`
+
+The `target:` argument in tracing macros (`info!`, `warn!`, `error!`) must be a **string literal** at compile time. Even `&'static str` variables will not compile. This blocks a common generic/reusable function pattern where you want to parameterize log targets. Workarounds: (1) drop custom `target:` and rely on `#[instrument(name = "...")]` spans on caller for filtering, (2) keep `target:` log lines in caller wrappers and only extract non-logging logic into the generic, (3) use `tracing::span!` with dynamic name at caller level. Discovered during TD-13 health checker extraction.
+
+---
+
+## Gotcha: `display_name` Fields with Baked-In Formatting (RESOLVED)
+**Added**: 2026-02-12
+**Resolved**: 2026-02-12
+**Related files**: `crates/global-controller/src/tasks/generic_health_checker.rs`
+
+Config struct fields used in `format!` strings that require trailing spaces or specific formatting (e.g., `display_name: "MH "` with trailing space, vs `display_name: ""` for no prefix) are fragile API design. **Resolution**: TD-13 iteration 2 removed the config struct and `display_name` entirely, using `entity_name: &'static str` as a plain parameter. Entity differentiation now comes from the structured `entity` field in log events and the parent span set by the wrapper's `.instrument()`. Prefer this approach when a "display prefix" field is the only differentiator.
+
+---
+
+## Gotcha: `#[instrument]` Attribute vs `.instrument()` Method -- Guard Behavior
+**Added**: 2026-02-12
+**Related files**: `crates/global-controller/src/tasks/generic_health_checker.rs`
+
+The `instrument-skip-all` validation guard pattern-matches on `#[instrument(` proc-macro attributes only. The `.instrument(info_span!(...))` runtime method call (from `tracing::Instrument` trait) is NOT detected by the guard. This means removing `#[instrument]` from a generic function and having callers use `.instrument()` chaining will NOT trigger the guard. Important distinction when choosing between attribute-based and method-based instrumentation in generic functions.
+
+---

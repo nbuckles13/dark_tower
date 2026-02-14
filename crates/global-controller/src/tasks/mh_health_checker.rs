@@ -4,19 +4,21 @@
 //! Handlers are considered stale if they haven't sent a load report within
 //! the configured threshold.
 //!
+//! This is a thin wrapper around the generic health checker, parameterized for
+//! Media Handlers.
+//!
 //! # Graceful Shutdown
 //!
 //! The task supports graceful shutdown via a cancellation token. When the token
 //! is cancelled, the task completes its current iteration and exits cleanly.
 
 use crate::repositories::MediaHandlersRepository;
+use crate::tasks::generic_health_checker::{
+    start_generic_health_checker, DEFAULT_CHECK_INTERVAL_SECONDS,
+};
 use sqlx::PgPool;
-use std::time::Duration;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, instrument, warn};
-
-/// Default health check interval in seconds.
-const DEFAULT_CHECK_INTERVAL_SECONDS: u64 = 5;
+use tracing::{info, Instrument};
 
 /// Start the MH health checker background task.
 ///
@@ -32,7 +34,6 @@ const DEFAULT_CHECK_INTERVAL_SECONDS: u64 = 5;
 /// # Returns
 ///
 /// Returns when the cancellation token is triggered.
-#[instrument(skip_all, name = "gc.task.mh_health_checker")]
 pub async fn start_mh_health_checker(
     pool: PgPool,
     staleness_threshold_seconds: u64,
@@ -45,44 +46,17 @@ pub async fn start_mh_health_checker(
         "Starting MH health checker task"
     );
 
-    let mut interval = tokio::time::interval(Duration::from_secs(DEFAULT_CHECK_INTERVAL_SECONDS));
-
-    loop {
-        tokio::select! {
-            _ = interval.tick() => {
-                // Check for stale handlers
-                match MediaHandlersRepository::mark_stale_handlers_unhealthy(
-                    &pool,
-                    staleness_threshold_seconds as i64,
-                ).await {
-                    Ok(count) => {
-                        if count > 0 {
-                            warn!(
-                                target: "gc.task.mh_health_checker",
-                                stale_count = count,
-                                "Marked stale handlers as unhealthy"
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        // Log error but continue - database might recover
-                        tracing::error!(
-                            target: "gc.task.mh_health_checker",
-                            error = %e,
-                            "Failed to check for stale handlers"
-                        );
-                    }
-                }
-            }
-            _ = cancel_token.cancelled() => {
-                info!(
-                    target: "gc.task.mh_health_checker",
-                    "MH health checker task received shutdown signal, exiting"
-                );
-                break;
-            }
-        }
-    }
+    start_generic_health_checker(
+        pool,
+        staleness_threshold_seconds,
+        cancel_token,
+        "handlers",
+        |pool, threshold| async move {
+            MediaHandlersRepository::mark_stale_handlers_unhealthy(&pool, threshold).await
+        },
+    )
+    .instrument(tracing::info_span!("gc.task.mh_health_checker"))
+    .await;
 
     info!(
         target: "gc.task.mh_health_checker",

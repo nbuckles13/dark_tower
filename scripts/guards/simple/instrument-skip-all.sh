@@ -52,6 +52,7 @@ print_section "Check 1: instrument with skip() but not skip_all"
 # Strategy:
 # 1. Find all lines with #[instrument( that contain skip(
 # 2. Exclude lines that have skip_all
+# 3. Exclude comment lines (// and /// doc comments)
 #
 # Note: This handles multi-line attributes poorly, but covers most cases.
 # For complex multi-line cases, semantic analysis would be needed.
@@ -59,6 +60,7 @@ print_section "Check 1: instrument with skip() but not skip_all"
 denylist_violations=$(grep -rn --include="*.rs" \
     '#\[instrument(' \
     "$SEARCH_PATH" 2>/dev/null | \
+    grep -v '^\s*[^:]*:[0-9]*:\s*//' | \
     grep 'skip(' | \
     grep -v 'skip_all' | \
     filter_test_code || true)
@@ -93,8 +95,8 @@ temp_file=$(mktemp)
 trap "rm -f $temp_file" EXIT
 
 find "$SEARCH_PATH" -type f -name "*.rs" ! -path "*/test*" 2>/dev/null | while IFS= read -r file; do
-    # For each #[instrument in this file
-    grep -n '#\[instrument' "$file" 2>/dev/null | cut -d: -f1 | while read -r line_num; do
+    # For each #[instrument in this file (excluding comment lines)
+    grep -n '#\[instrument' "$file" 2>/dev/null | grep -v '^\s*[0-9]*:\s*//' | cut -d: -f1 | while read -r line_num; do
         # Get 4 lines starting from the instrument line
         context=$(sed -n "${line_num},$((line_num + 3))p" "$file" 2>/dev/null)
 

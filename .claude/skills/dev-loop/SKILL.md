@@ -178,7 +178,21 @@ For security-critical implementations, the implementer should maintain a "Securi
 
 **IMPORTANT**: All teammates are spawned using the `subagent_type` parameter in the Task tool, which auto-loads their identity from `.claude/agents/{name}.md`. Do NOT manually read or inject specialist identity files — the agent system handles this.
 
-**For Implementer**, spawn with `subagent_type: "{specialist-name}"` and this prompt:
+**Naming convention**: Use the `name` parameter in the Task tool to set each teammate's SendMessage recipient name. These names MUST match the `@` references used in teammate prompts:
+
+| Role | `name` | `subagent_type` |
+|------|--------|-----------------|
+| Implementer | `implementer` | `{specialist-name}` (e.g., `global-controller`) |
+| Security Reviewer | `security` | `security` |
+| Test Reviewer | `test` | `test` |
+| Observability Reviewer | `observability` | `observability` |
+| Code Quality Reviewer | `code-reviewer` | `code-reviewer` |
+| DRY Reviewer | `dry-reviewer` | `dry-reviewer` |
+| Operations Reviewer | `operations` | `operations` |
+
+The Lead (orchestrator) is automatically named `team-lead` in the team config.
+
+**For Implementer**, spawn with `name: "implementer"`, `subagent_type: "{specialist-name}"` and this prompt:
 
 ```
 You are implementing a feature for Dark Tower.
@@ -195,22 +209,24 @@ You are implementing a feature for Dark Tower.
 
 ## Your Workflow
 
-1. PLANNING: Draft your approach, message reviewers for input
-2. **WAIT for Lead to message you "Plan approved" before implementing.** Individual reviewer confirmations are not sufficient — the Lead is the gatekeeper.
-3. IMPLEMENTATION: Do the work, message reviewers if questions arise
-4. When done, message Lead: "Ready for validation"
+1. PLANNING: Draft your approach, use SendMessage to share your plan with reviewers for input
+2. **WAIT for @team-lead to send you "Plan approved" before implementing.** Individual reviewer confirmations are not sufficient — @team-lead is the gatekeeper.
+3. IMPLEMENTATION: Do the work, use SendMessage to ask reviewers if questions arise
+4. When done, use SendMessage to tell @team-lead: "Ready for validation"
 5. REVIEW: Respond to reviewer feedback, fix issues
 6. REFLECTION: Document learnings when complete
 
 ## Communication
 
-- Message reviewers directly with your plan and questions
-- CC Lead only for phase transitions ("Ready for validation", etc.)
-- Discuss review findings with reviewers directly
-- **Do NOT start implementing until Lead says "Plan approved"**
+All teammate communication MUST use the SendMessage tool. Plain text output is not visible to other teammates.
+
+- Use SendMessage to message reviewers directly with your plan and questions
+- Use SendMessage to tell @team-lead for phase transitions ("Ready for validation", etc.)
+- Use SendMessage to discuss review findings with reviewers directly
+- **Do NOT start implementing until @team-lead sends you "Plan approved"**
 ```
 
-**For Reviewers**, spawn with `subagent_type: "{reviewer-name}"` and this prompt:
+**For Reviewers**, spawn with `name: "{reviewer-name}"`, `subagent_type: "{reviewer-name}"` and this prompt:
 
 ```
 You are a reviewer in a Dark Tower dev-loop.
@@ -226,18 +242,20 @@ You are a reviewer in a Dark Tower dev-loop.
 ## Your Workflow
 
 1. PLANNING: Review implementer's approach, provide input
-2. When satisfied with plan, message Lead: "Plan confirmed"
-3. **WAIT for Lead to message you "Start Review" before examining code.** Do NOT review code during planning or implementation phases.
-4. REVIEW: Examine the code, discuss findings with implementer
-5. Send verdict to Lead: "APPROVED" or "BLOCKED: {reason}"
+2. When satisfied with plan, use SendMessage to tell @team-lead: "Plan confirmed"
+3. **WAIT for @team-lead to send you "Start Review" before examining code.** Do NOT review code during planning or implementation phases.
+4. REVIEW: Examine the code, use SendMessage to discuss findings with @implementer
+5. Use SendMessage to tell @team-lead your verdict: "APPROVED" or "BLOCKED: {reason}"
 6. REFLECTION: Document learnings when complete
 
 ## Communication
 
-- Message implementer directly with feedback
-- Message other reviewers if you spot issues in their domain
-- CC Lead for confirmations and verdicts
-- **Do NOT start reviewing code until Lead says "Start Review"**
+All teammate communication MUST use the SendMessage tool. Plain text output is not visible to other teammates.
+
+- Use SendMessage to message @implementer directly with feedback
+- Use SendMessage to message other reviewers if you spot issues in their domain
+- Use SendMessage to tell @team-lead for confirmations and verdicts
+- **Do NOT start reviewing code until @team-lead sends you "Start Review"**
 ```
 
 **For `--light` mode**: Skip workflow steps 1-2 for the implementer (no planning gate). Implementer starts implementing immediately. Reviewer prompt omits planning steps.
@@ -433,10 +451,14 @@ Reopens a completed dev-loop to address human review feedback. All work is track
 
 ### Continue Prompt (Implementer)
 
-Spawn with `subagent_type: "{original-specialist}"`:
+Spawn with `name: "implementer"`, `subagent_type: "{original-specialist}"`:
 
 ```
 You are continuing work on a previous dev-loop implementation.
+
+## Step 0: Load Knowledge (MANDATORY)
+
+**Before doing ANY other work**, read ALL `.md` files from `docs/specialist-knowledge/{your-specialist-name}/` to load your accumulated knowledge. This includes patterns, gotchas, integration notes, and any domain-specific files. Do NOT skip this step.
 
 ## Original Task
 
@@ -454,7 +476,23 @@ You are continuing work on a previous dev-loop implementation.
 
 Address the feedback above. The previous implementation is already in the codebase.
 
-When done, message Lead: "Ready for validation"
+## Your Workflow
+
+1. PLANNING: Draft your approach, use SendMessage to share your plan with reviewers for input
+2. **WAIT for @team-lead to send you "Plan approved" before implementing.** Individual reviewer confirmations are not sufficient — @team-lead is the gatekeeper.
+3. IMPLEMENTATION: Do the work, use SendMessage to ask reviewers if questions arise
+4. When done, use SendMessage to tell @team-lead: "Ready for validation"
+5. REVIEW: Respond to reviewer feedback, fix issues
+6. REFLECTION: Document learnings when complete
+
+## Communication
+
+All teammate communication MUST use the SendMessage tool. Plain text output is not visible to other teammates.
+
+- Use SendMessage to message reviewers directly with your plan and questions
+- Use SendMessage to tell @team-lead for phase transitions ("Ready for validation", etc.)
+- Use SendMessage to discuss review findings with reviewers directly
+- **Do NOT start implementing until @team-lead sends you "Plan approved"**
 ```
 
 ## Limits

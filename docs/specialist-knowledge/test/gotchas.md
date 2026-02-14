@@ -179,3 +179,19 @@ When endpoint behavior changes (e.g., `/health` from JSON to plain text "OK"), t
 Simple wiring (direct calls, no branching) doesn't need explicit "mock Prometheus and assert called" tests. Existing behavior tests + wrapper module tests sufficient. Require explicit tests only for: conditional emission, aggregation/batching, error handling that might suppress. For simple wiring, behavior verification sufficient.
 
 ---
+
+## Gotcha: tracing `target:` Requires String Literals
+**Added**: 2026-02-12
+**Related files**: `crates/global-controller/src/tasks/generic_health_checker.rs`
+
+`tracing` macros require `target:` values to be string literals or `&'static str` known at compile time. You cannot pass a runtime `config.log_target` field as `target:`. This means generic/shared functions cannot parameterize log targets. Workarounds: (1) omit explicit `target:` and let it default to module path (preferred — works with `EnvFilter`), (2) keep `target:` in wrapper functions for lifecycle logs only. Note: dot-separated targets like `gc.task.health_checker` are silently filtered by `EnvFilter` directives like `global_controller=debug` — module-path targets are more compatible.
+
+---
+
+## Gotcha: Dot-Separated Log Targets Silently Filtered by EnvFilter
+**Added**: 2026-02-12
+**Related files**: `crates/global-controller/src/tasks/health_checker.rs`
+
+Custom dot-separated `target:` values (e.g., `"gc.task.health_checker"`) don't match module-path-based `EnvFilter` directives (e.g., `"global_controller=debug"`). Events with these targets are silently dropped under default config. Tests won't catch this because they don't assert on log visibility. When reviewing code with custom `target:` values, verify they're actually reachable under the configured `EnvFilter`. Module-path-based targets (default when `target:` is omitted) are always compatible.
+
+---
