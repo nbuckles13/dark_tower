@@ -341,12 +341,7 @@ When implementer signals "Ready for validation", run the validation pipeline:
 | 4. Tests | `./scripts/test.sh --workspace` | Regressions; ensures DB setup + migrations; report P0 security test count |
 | 5. Clippy | `cargo clippy --workspace --lib --bins -- -D warnings` | Lint warnings |
 | 6. Audit | `cargo audit` | Known dependency vulnerabilities |
-
-**REPORTED** (tracked in main.md, not blocking):
-
-| Layer | Command | Purpose |
-|-------|---------|---------|
-| 7. Coverage | `cargo llvm-cov --workspace` | Coverage vs thresholds; flag security-critical files < 95% |
+| 7. Semantic | `./scripts/guards/run-semantic-guards.sh` | AI-powered diff analysis: credential leaks, actor blocking, error context |
 
 **ARTIFACT-SPECIFIC** (mandatory when detected file types are in the changeset):
 
