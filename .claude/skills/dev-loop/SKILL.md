@@ -400,6 +400,25 @@ Allow 15 minutes for teammates to document learnings.
 
 Each teammate updates their knowledge directory at `docs/specialist-knowledge/{name}/`. Teammates can create or update any `.md` files in their directory - common files include `patterns.md`, `gotchas.md`, and `integration.md`, but specialists may also maintain domain-specific files (e.g., `approved-crypto.md`, `coverage-targets.md`, `common-patterns.md`).
 
+**When to add an entry — ALL criteria must be met:**
+1. **Surprising or corrective**: You were wrong, something failed unexpectedly, or an existing entry needs correcting. Do NOT document things that worked as expected.
+2. **Project-specific**: The insight is specific to this codebase, its patterns, or its tooling. General Rust/tokio/SQL knowledge belongs in official docs, not here.
+3. **In your lane**: The insight falls squarely within your specialist domain. Testing patterns → test specialist only. Credential handling → security only. If another specialist would naturally own the insight, leave it to them.
+
+**When to update an existing entry:**
+- The entry is incomplete, incorrect, or misleading based on what you learned this loop. Add an "Updated: YYYY-MM-DD" line. Do NOT add a new entry that restates an existing one with a different example.
+
+**When to remove an entry:**
+- The code it references has been deleted or substantially rewritten
+- It describes a workaround for a problem that has since been properly fixed
+- It contradicts current project patterns or ADRs
+- It documents general knowledge that is not project-specific (clean up past bloat)
+
+**Do NOT write:**
+- Patterns the implementer used successfully (expected behavior is not a learning)
+- The same insight framed from your perspective that another specialist would also write
+- New examples for existing entries that are already correct
+
 ### Step 9: Complete
 
 Update main.md:
