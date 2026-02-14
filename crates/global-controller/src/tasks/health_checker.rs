@@ -87,7 +87,13 @@ pub async fn start_health_checker(
         cancel_token,
         "controllers",
         |pool, threshold| async move {
-            MeetingControllersRepository::mark_stale_controllers_unhealthy(&pool, threshold).await
+            let result =
+                MeetingControllersRepository::mark_stale_controllers_unhealthy(&pool, threshold)
+                    .await;
+            if result.is_ok() {
+                refresh_controller_metrics(&pool).await;
+            }
+            result
         },
     )
     .instrument(tracing::info_span!("gc.task.health_checker"))
