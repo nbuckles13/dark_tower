@@ -258,156 +258,37 @@ deploy_redis() {
     log_info "Redis deployed successfully."
 }
 
+# Deploy kube-state-metrics
+deploy_kube_state_metrics() {
+    log_step "Deploying kube-state-metrics for cluster metrics..."
+
+    # Apply kube-state-metrics manifests from extracted config files
+    kubectl apply -f "${PROJECT_ROOT}/infra/kubernetes/observability/kube-state-metrics.yaml"
+
+    log_info "Waiting for kube-state-metrics to be ready..."
+    kubectl wait --for=condition=available --timeout=60s \
+        deployment/kube-state-metrics -n dark-tower-observability
+    log_info "kube-state-metrics deployed successfully."
+}
+
+# Deploy node-exporter
+deploy_node_exporter() {
+    log_step "Deploying node-exporter for node metrics..."
+
+    # Apply node-exporter manifests from extracted config files
+    kubectl apply -f "${PROJECT_ROOT}/infra/kubernetes/observability/node-exporter.yaml"
+
+    log_info "Waiting for node-exporter to be ready..."
+    kubectl rollout status daemonset/node-exporter -n dark-tower-observability --timeout=60s
+    log_info "node-exporter deployed successfully."
+}
+
 # Deploy Prometheus
 deploy_prometheus() {
     log_step "Deploying Prometheus..."
 
-    kubectl apply -f - <<EOF
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: prometheus-config
-  namespace: dark-tower-observability
-data:
-  prometheus.yml: |
-    global:
-      scrape_interval: 15s
-      evaluation_interval: 15s
-
-    scrape_configs:
-      - job_name: 'prometheus'
-        static_configs:
-          - targets: ['localhost:9090']
-
-      # Scrape AC service pods running in-cluster
-      - job_name: 'ac-service'
-        kubernetes_sd_configs:
-          - role: pod
-            namespaces:
-              names:
-                - dark-tower
-        relabel_configs:
-          - source_labels: [__meta_kubernetes_pod_label_app]
-            action: keep
-            regex: ac-service
-          - source_labels: [__meta_kubernetes_pod_container_port_number]
-            action: keep
-            regex: "8082"
-
-      # Scrape Global Controller pods
-      - job_name: 'global-controller'
-        kubernetes_sd_configs:
-          - role: pod
-            namespaces:
-              names:
-                - dark-tower
-        relabel_configs:
-          - source_labels: [__meta_kubernetes_pod_label_app]
-            action: keep
-            regex: global-controller
-          - source_labels: [__meta_kubernetes_pod_container_port_number]
-            action: keep
-            regex: "8080"
-
-      # Scrape Meeting Controller pods (metrics on health port)
-      - job_name: 'meeting-controller'
-        kubernetes_sd_configs:
-          - role: pod
-            namespaces:
-              names:
-                - dark-tower
-        relabel_configs:
-          - source_labels: [__meta_kubernetes_pod_label_app]
-            action: keep
-            regex: meeting-controller
-          - source_labels: [__meta_kubernetes_pod_container_port_number]
-            action: keep
-            regex: "8081"
----
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: prometheus
-  namespace: dark-tower-observability
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
-metadata:
-  name: prometheus
-rules:
-  - apiGroups: [""]
-    resources:
-      - nodes
-      - nodes/proxy
-      - services
-      - endpoints
-      - pods
-    verbs: ["get", "watch", "list"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: prometheus
-subjects:
-  - kind: ServiceAccount
-    name: prometheus
-    namespace: dark-tower-observability
-roleRef:
-  kind: ClusterRole
-  name: prometheus
-  apiGroup: rbac.authorization.k8s.io
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: prometheus
-  namespace: dark-tower-observability
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: prometheus
-  template:
-    metadata:
-      labels:
-        app: prometheus
-    spec:
-      serviceAccountName: prometheus
-      containers:
-        - name: prometheus
-          image: prom/prometheus:v2.48.0
-          args:
-            - "--config.file=/etc/prometheus/prometheus.yml"
-            - "--storage.tsdb.path=/prometheus"
-            - "--web.enable-lifecycle"
-          ports:
-            - containerPort: 9090
-          volumeMounts:
-            - name: config
-              mountPath: /etc/prometheus
-            - name: data
-              mountPath: /prometheus
-      volumes:
-        - name: config
-          configMap:
-            name: prometheus-config
-        - name: data
-          emptyDir: {}
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: prometheus
-  namespace: dark-tower-observability
-spec:
-  selector:
-    app: prometheus
-  ports:
-    - port: 9090
-      targetPort: 9090
-      nodePort: 30090
-  type: NodePort
-EOF
+    # Apply Prometheus manifests from extracted config files
+    kubectl apply -f "${PROJECT_ROOT}/infra/kubernetes/observability/prometheus-config.yaml"
 
     log_info "Waiting for Prometheus to be ready..."
     kubectl wait --for=condition=Ready pod -l app=prometheus -n dark-tower-observability --timeout=120s
@@ -418,106 +299,8 @@ EOF
 deploy_loki() {
     log_step "Deploying Loki for log aggregation..."
 
-    kubectl apply -f - <<EOF
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: loki-config
-  namespace: dark-tower-observability
-data:
-  loki.yaml: |
-    auth_enabled: false
-
-    server:
-      http_listen_port: 3100
-
-    common:
-      path_prefix: /loki
-      storage:
-        filesystem:
-          chunks_directory: /loki/chunks
-          rules_directory: /loki/rules
-      replication_factor: 1
-      ring:
-        kvstore:
-          store: inmemory
-
-    schema_config:
-      configs:
-        - from: 2023-01-01
-          store: boltdb-shipper
-          object_store: filesystem
-          schema: v11
-          index:
-            prefix: index_
-            period: 24h
-
-    storage_config:
-      boltdb_shipper:
-        active_index_directory: /loki/index
-        cache_location: /loki/cache
-        shared_store: filesystem
-      filesystem:
-        directory: /loki/chunks
-
-    compactor:
-      working_directory: /loki/compactor
-      shared_store: filesystem
-
-    limits_config:
-      enforce_metric_name: false
-      reject_old_samples: true
-      reject_old_samples_max_age: 168h
----
-apiVersion: apps/v1
-kind: StatefulSet
-metadata:
-  name: loki
-  namespace: dark-tower-observability
-spec:
-  serviceName: loki
-  replicas: 1
-  selector:
-    matchLabels:
-      app: loki
-  template:
-    metadata:
-      labels:
-        app: loki
-    spec:
-      containers:
-        - name: loki
-          image: grafana/loki:2.9.3
-          args:
-            - "-config.file=/etc/loki/loki.yaml"
-          ports:
-            - containerPort: 3100
-          volumeMounts:
-            - name: config
-              mountPath: /etc/loki
-            - name: data
-              mountPath: /loki
-      volumes:
-        - name: config
-          configMap:
-            name: loki-config
-        - name: data
-          emptyDir: {}
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: loki
-  namespace: dark-tower-observability
-spec:
-  selector:
-    app: loki
-  ports:
-    - port: 3100
-      targetPort: 3100
-      nodePort: 30080
-  type: NodePort
-EOF
+    # Apply Loki manifests from extracted config files
+    kubectl apply -f "${PROJECT_ROOT}/infra/kubernetes/observability/loki-config.yaml"
 
     log_info "Waiting for Loki to be ready..."
     kubectl wait --for=condition=Ready pod -l app=loki -n dark-tower-observability --timeout=120s
@@ -528,143 +311,8 @@ EOF
 deploy_promtail() {
     log_step "Deploying Promtail for log shipping to Loki..."
 
-    kubectl apply -f - <<'EOF'
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: promtail-config
-  namespace: dark-tower-observability
-data:
-  promtail.yaml: |
-    server:
-      http_listen_port: 9080
-      grpc_listen_port: 0
-
-    positions:
-      filename: /tmp/positions.yaml
-
-    clients:
-      - url: http://loki:3100/loki/api/v1/push
-
-    scrape_configs:
-      - job_name: kubernetes-pods
-        kubernetes_sd_configs:
-          - role: pod
-        relabel_configs:
-          # Drop pods without a name
-          - source_labels: [__meta_kubernetes_pod_name]
-            action: drop
-            regex: ''
-          # Drop pods in kube-system to reduce noise (optional)
-          - source_labels: [__meta_kubernetes_namespace]
-            action: drop
-            regex: kube-system
-          # Set the __path__ to the pod log directory (containerd/CRI format)
-          - source_labels: [__meta_kubernetes_pod_uid, __meta_kubernetes_pod_container_name]
-            target_label: __path__
-            separator: /
-            replacement: /var/log/pods/*$1/$2/*.log
-          # Set namespace label
-          - source_labels: [__meta_kubernetes_namespace]
-            action: replace
-            target_label: namespace
-          # Set pod label
-          - source_labels: [__meta_kubernetes_pod_name]
-            action: replace
-            target_label: pod
-          # Set container label
-          - source_labels: [__meta_kubernetes_pod_container_name]
-            action: replace
-            target_label: container
-          # Set app label from pod label
-          - source_labels: [__meta_kubernetes_pod_label_app]
-            action: replace
-            target_label: app
-          # Set component label from pod label
-          - source_labels: [__meta_kubernetes_pod_label_component]
-            action: replace
-            target_label: component
-        pipeline_stages:
-          - cri: {}
----
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: promtail
-  namespace: dark-tower-observability
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
-metadata:
-  name: promtail
-rules:
-  - apiGroups: [""]
-    resources:
-      - nodes
-      - nodes/proxy
-      - services
-      - endpoints
-      - pods
-    verbs: ["get", "watch", "list"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: promtail
-subjects:
-  - kind: ServiceAccount
-    name: promtail
-    namespace: dark-tower-observability
-roleRef:
-  kind: ClusterRole
-  name: promtail
-  apiGroup: rbac.authorization.k8s.io
----
-apiVersion: apps/v1
-kind: DaemonSet
-metadata:
-  name: promtail
-  namespace: dark-tower-observability
-spec:
-  selector:
-    matchLabels:
-      app: promtail
-  template:
-    metadata:
-      labels:
-        app: promtail
-    spec:
-      serviceAccountName: promtail
-      containers:
-        - name: promtail
-          image: grafana/promtail:2.9.3
-          args:
-            - "-config.file=/etc/promtail/promtail.yaml"
-          volumeMounts:
-            - name: config
-              mountPath: /etc/promtail
-            - name: varlog
-              mountPath: /var/log
-              readOnly: true
-            - name: varlibdockercontainers
-              mountPath: /var/lib/docker/containers
-              readOnly: true
-          env:
-            - name: HOSTNAME
-              valueFrom:
-                fieldRef:
-                  fieldPath: spec.nodeName
-      volumes:
-        - name: config
-          configMap:
-            name: promtail-config
-        - name: varlog
-          hostPath:
-            path: /var/log
-        - name: varlibdockercontainers
-          hostPath:
-            path: /var/lib/docker/containers
-EOF
+    # Apply Promtail manifests from extracted config files
+    kubectl apply -f "${PROJECT_ROOT}/infra/kubernetes/observability/promtail-config.yaml"
 
     log_info "Waiting for Promtail to be ready..."
     kubectl wait --for=condition=Ready pod -l app=promtail -n dark-tower-observability --timeout=120s
@@ -1108,6 +756,8 @@ main() {
     create_namespaces
     deploy_postgres
     deploy_redis
+    deploy_kube_state_metrics
+    deploy_node_exporter
     deploy_prometheus
     deploy_loki
     deploy_promtail

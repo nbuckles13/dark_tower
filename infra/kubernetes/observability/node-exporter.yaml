@@ -1,0 +1,107 @@
+# node-exporter Configuration for Dark Tower
+#
+# node-exporter exposes node-level hardware and OS metrics:
+# - CPU usage (node_cpu_seconds_total)
+# - Memory usage (node_memory_MemAvailable_bytes, node_memory_MemTotal_bytes)
+# - Disk I/O (node_disk_io_time_seconds_total)
+# - Network traffic (node_network_receive_bytes_total, node_network_transmit_bytes_total)
+# - Filesystem usage (node_filesystem_avail_bytes, node_filesystem_size_bytes)
+#
+# Runs as a DaemonSet to ensure one instance per node.
+#
+# For production, consider:
+# - Mounting host paths as read-only
+# - Disabling unnecessary collectors
+# - Adjusting resource limits based on node size
+#
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: node-exporter
+  namespace: dark-tower-observability
+  labels:
+    app: node-exporter
+    component: monitoring
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: node-exporter
+  namespace: dark-tower-observability
+  labels:
+    app: node-exporter
+    component: monitoring
+spec:
+  selector:
+    matchLabels:
+      app: node-exporter
+  template:
+    metadata:
+      labels:
+        app: node-exporter
+        component: monitoring
+    spec:
+      serviceAccountName: node-exporter
+      hostNetwork: true
+      hostPID: true
+      containers:
+        - name: node-exporter
+          image: prom/node-exporter:v1.7.0
+          args:
+            - "--path.procfs=/host/proc"
+            - "--path.sysfs=/host/sys"
+            - "--path.rootfs=/host/root"
+            - "--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)"
+          ports:
+            - name: metrics
+              containerPort: 9100
+              hostPort: 9100
+          resources:
+            limits:
+              cpu: 200m
+              memory: 128Mi
+            requests:
+              cpu: 100m
+              memory: 64Mi
+          volumeMounts:
+            - name: proc
+              mountPath: /host/proc
+              readOnly: true
+            - name: sys
+              mountPath: /host/sys
+              readOnly: true
+            - name: root
+              mountPath: /host/root
+              readOnly: true
+              mountPropagation: HostToContainer
+      volumes:
+        - name: proc
+          hostPath:
+            path: /proc
+        - name: sys
+          hostPath:
+            path: /sys
+        - name: root
+          hostPath:
+            path: /
+      tolerations:
+        - effect: NoSchedule
+          operator: Exists
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: node-exporter
+  namespace: dark-tower-observability
+  labels:
+    app: node-exporter
+    component: monitoring
+spec:
+  selector:
+    app: node-exporter
+  ports:
+    - name: metrics
+      port: 9100
+      targetPort: 9100
+  clusterIP: None

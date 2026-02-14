@@ -358,7 +358,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "100 * sum(rate(mc_messages_dropped_total[5m])) / (sum(rate(mc_messages_dropped_total[5m])) + sum(rate(mc_message_processing_duration_seconds_count[5m])))",
+          "expr": "100 * sum(rate(mc_messages_dropped_total[5m])) / (sum(rate(mc_messages_dropped_total[5m])) + sum(rate(mc_message_latency_seconds_count[5m])))",
           "legendFormat": "Drop Rate",
           "range": true,
           "refId": "A"
@@ -644,7 +644,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.50, sum by(le) (rate(mc_message_processing_duration_seconds_bucket[5m])))",
+          "expr": "histogram_quantile(0.50, sum by(le) (rate(mc_message_latency_seconds_bucket[5m])))",
           "legendFormat": "p50",
           "range": true,
           "refId": "A"
@@ -655,7 +655,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by(le) (rate(mc_message_processing_duration_seconds_bucket[5m])))",
+          "expr": "histogram_quantile(0.95, sum by(le) (rate(mc_message_latency_seconds_bucket[5m])))",
           "legendFormat": "p95",
           "range": true,
           "refId": "B"
@@ -666,7 +666,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum by(le) (rate(mc_message_processing_duration_seconds_bucket[5m])))",
+          "expr": "histogram_quantile(0.99, sum by(le) (rate(mc_message_latency_seconds_bucket[5m])))",
           "legendFormat": "p99",
           "range": true,
           "refId": "C"
@@ -1065,7 +1065,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by(actor_type) (rate(mc_message_processing_duration_seconds_count[5m]))",
+          "expr": "sum by(actor_type) (rate(mc_message_latency_seconds_count[5m]))",
           "legendFormat": "{{actor_type}}",
           "range": true,
           "refId": "A"
@@ -1155,7 +1155,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "container_memory_usage_bytes{pod=~\"meeting-controller-.*\"}",
+          "expr": "container_memory_working_set_bytes{namespace=\"dark-tower\", pod=~\"meeting-controller.*\"}",
           "legendFormat": "{{pod}}",
           "range": true,
           "refId": "A"
@@ -1245,7 +1245,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "rate(container_cpu_usage_seconds_total{pod=~\"meeting-controller-.*\"}[5m])",
+          "expr": "rate(container_cpu_usage_seconds_total{namespace=\"dark-tower\", pod=~\"meeting-controller.*\"}[5m])",
           "legendFormat": "{{pod}}",
           "range": true,
           "refId": "A"
