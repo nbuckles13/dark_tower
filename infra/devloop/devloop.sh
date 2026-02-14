@@ -10,14 +10,17 @@
 #
 # Usage:
 #   ./devloop.sh [--rebuild] <task-slug> [base-branch]
+#   ./devloop.sh --refresh-creds <task-slug>
 #
 # Options:
-#   --rebuild   Force rebuild the dev container image
+#   --rebuild         Force rebuild the dev container image
+#   --refresh-creds   Copy fresh OAuth credentials into a running container
 #
 # Examples:
 #   ./devloop.sh td-42-rate-limiting
 #   ./devloop.sh td-42-rate-limiting main
 #   ./devloop.sh --rebuild td-42-rate-limiting
+#   ./devloop.sh --refresh-creds td-42-rate-limiting   # from another terminal
 #
 # Prerequisites:
 #   - podman installed
@@ -30,9 +33,11 @@ set -euo pipefail
 # ─── Configuration ──────────────────────────────────────────────
 
 REBUILD_IMAGE=false
+REFRESH_CREDS=false
 while [[ "${1:-}" == --* ]]; do
     case "$1" in
         --rebuild) REBUILD_IMAGE=true; shift ;;
+        --refresh-creds) REFRESH_CREDS=true; shift ;;
         *) echo "Unknown option: $1" >&2; exit 1 ;;
     esac
 done
@@ -52,6 +57,26 @@ GITHUB_REMOTE="$(git -C "$REPO_ROOT" remote get-url origin)"
 # Git identity — defaults to your git config
 GIT_AUTHOR_NAME="${GIT_AUTHOR_NAME:-$(git config user.name)}"
 GIT_AUTHOR_EMAIL="${GIT_AUTHOR_EMAIL:-$(git config user.email)}"
+
+# ─── Quick actions (early exit) ───────────────────────────────────
+
+refresh_credentials() {
+    if [ ! -f "${HOME}/.claude/.credentials.json" ]; then
+        echo "No credentials file found at ${HOME}/.claude/.credentials.json" >&2
+        exit 1
+    fi
+    if ! podman container exists "$DEV_CONTAINER" 2>/dev/null; then
+        echo "Container not running: ${DEV_CONTAINER}" >&2
+        exit 1
+    fi
+    podman cp "${HOME}/.claude/.credentials.json" "${DEV_CONTAINER}:/home/dev/.claude/.credentials.json"
+    echo "Credentials refreshed in ${DEV_CONTAINER}"
+}
+
+if $REFRESH_CREDS; then
+    refresh_credentials
+    exit 0
+fi
 
 # ─── Helper Functions ────────────────────────────────────────────
 
@@ -215,6 +240,12 @@ echo ""
 echo "Dropping into Claude Code..."
 echo "(Ctrl-D or /exit to detach — containers stay running)"
 echo ""
+
+# Refresh OAuth credentials before each attach (host sessions may have rotated
+# the refresh token since the container started, invalidating the container's copy).
+if [ -f "${HOME}/.claude/.credentials.json" ]; then
+    podman cp "${HOME}/.claude/.credentials.json" "${DEV_CONTAINER}:/home/dev/.claude/.credentials.json"
+fi
 
 podman exec -it "$DEV_CONTAINER" claude --dangerously-skip-permissions || true
 
