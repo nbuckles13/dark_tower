@@ -150,17 +150,25 @@ Both maintain the `last_heartbeat` timestamp. Health checker marks MCs unhealthy
 
 ---
 
-## Integration: Health Checker Task
-**Added**: 2026-01-20
-**Related files**: `crates/global-controller/src/tasks/health_checker.rs`
+## Integration: Health Checker Tasks (MC + MH, Generic)
+**Added**: 2026-01-20, **Updated**: 2026-02-12
+**Related files**: `crates/global-controller/src/tasks/generic_health_checker.rs`, `crates/global-controller/src/tasks/health_checker.rs`, `crates/global-controller/src/tasks/mh_health_checker.rs`
 
-Background task marks stale MCs as unhealthy:
-- Runs every 5 seconds (configurable)
-- Queries: `UPDATE meeting_controllers SET health_status = 'unhealthy' WHERE last_heartbeat < NOW() - threshold`
-- Staleness threshold: 60 seconds default (configurable via `mc_staleness_threshold_seconds`)
+Both MC and MH health checkers use a shared generic health checker loop (`start_generic_health_checker`). Each is a thin wrapper that provides:
+- The repository staleness-check function as a closure
+- `entity_name` as a `&'static str` parameter (e.g., `"controllers"`, `"handlers"`)
+- `.instrument(tracing::info_span!("gc.task.health_checker"))` chaining for span context
+- Lifecycle logs (start/stop) with literal `target:` values (outside the span)
+
+Common behavior:
+- Runs every 5 seconds (`DEFAULT_CHECK_INTERVAL_SECONDS`)
+- Marks stale entities unhealthy via repository method
+- Staleness threshold configurable (default 60s via `mc_staleness_threshold_seconds`)
 - Graceful shutdown via `CancellationToken`
+- Error resilience: logs DB errors but continues loop
+- All loop logs include `entity = entity_name` structured field for filtering
 
-Other services querying healthy MCs should filter: `WHERE health_status = 'healthy'`. The health checker is the single source of truth for MC health transitions.
+Other services querying healthy MCs/MHs should filter: `WHERE health_status = 'healthy'`. The health checkers are the single source of truth for health status transitions.
 
 ---
 

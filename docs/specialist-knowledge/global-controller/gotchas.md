@@ -290,5 +290,77 @@ metrics::record_db_query("op", "success", start.elapsed()); // Returns Duration
 ```
 
 Only import `Duration` if you're constructing durations explicitly (e.g., `Duration::from_secs(5)`).
+## Gotcha: Tracing `target:` Requires String Literal, Not `&'static str` Variable
+**Added**: 2026-02-12
+**Related files**: `crates/global-controller/src/tasks/generic_health_checker.rs`
+
+The `target:` parameter in tracing macros (`info!`, `warn!`, `error!`) must be a compile-time string literal or `const`. A `&'static str` field from a struct does NOT work — the macro expands `target:` into a `static __CALLSITE` initializer that requires const-evaluable expressions. This means you cannot parameterize log targets via struct fields or function arguments.
+
+```rust
+// FAILS: error[E0435]: attempt to use a non-constant value in a constant
+info!(target: config.log_target, "message");
+
+// WORKS: string literal
+info!(target: "gc.task.health_checker", "message");
+
+// WORKS: const
+const TARGET: &str = "gc.task.health_checker";
+info!(target: TARGET, "message");
+```
+
+Workarounds: (1) Keep `target:` logs in thin wrappers with hardcoded literals, (2) use `macro_rules!` to splice literal tokens, or (3) omit `target:` and rely on `#[instrument]` span names for differentiation.
+
+---
+
+## Gotcha: Custom `gc.task.*` Log Targets Silently Filtered by Default EnvFilter
+**Added**: 2026-02-12
+**Related files**: `crates/global-controller/src/main.rs`, `crates/global-controller/src/tasks/`
+
+The default `EnvFilter` in main.rs is `"global_controller=debug,tower_http=debug"`, which filters by target prefix using `::` module path hierarchy. Custom dot-separated targets like `target: "gc.task.health_checker"` are in a completely different namespace and do NOT match the `global_controller` directive. This means log events with custom `gc.task.*` targets were silently filtered out and never visible in default configuration.
+
+Using the default `module_path!()` target (e.g., `global_controller::tasks::generic_health_checker`) makes logs visible under the `global_controller` filter directive. When refactoring, prefer module-path targets over custom targets unless the `EnvFilter` is explicitly configured to match them.
+
+---
+
+## Gotcha: Config Structs for 1-2 Fields Are Overkill
+**Added**: 2026-02-12
+**Related files**: `crates/global-controller/src/tasks/generic_health_checker.rs`
+
+Avoid creating a config struct when a function only needs 1-2 simple parameters for differentiation. For example, `HealthCheckerConfig { display_name: &'static str, entity_name: &'static str }` was unnecessary when `entity_name: &'static str` as a plain parameter suffices. The `display_name` field only existed to prefix log messages (e.g., "MH " prefix), which is fragile (trailing space convention) and better handled by separate log messages in wrappers.
+
+Rule of thumb: If a "config" struct has fewer than 3 fields and all are simple types, pass them as individual parameters. Structs add indirection (import, construction, field access) without proportional benefit.
+
+---
+
+## Gotcha: `#[instrument]` on Both Wrapper and Inner Function Creates Nested Spans
+**Added**: 2026-02-12
+**Related files**: `crates/global-controller/src/tasks/generic_health_checker.rs`, `crates/global-controller/src/tasks/health_checker.rs`
+
+If a wrapper function has `#[instrument(skip_all, name = "gc.task.health_checker")]` and the inner generic function also has `#[instrument(skip_all)]`, every log event inside the generic function will have TWO nested spans: the wrapper's named span and the generic function's `start_generic_health_checker` span. This adds noise to traces without value.
+
+Fix: Remove `#[instrument]` from the generic function entirely. Either keep it on the wrapper OR (preferred) use `.instrument(info_span!(...))` chaining on the call site, which gives the caller full control and avoids auto-capture of function parameters.
+
+---
+
+## Gotcha: Async Closure Lifetime Issues with `&PgPool` Parameter
+**Added**: 2026-02-12
+**Related files**: `crates/global-controller/src/tasks/generic_health_checker.rs`
+
+When passing a closure `Fn(&PgPool, i64) -> Fut` where `Fut` is an async future, Rust cannot express the lifetime relationship between the `&PgPool` borrow and the returned future in the `Fn` trait bound. This causes `lifetime may not live long enough` errors.
+
+Fix: Change the closure to take owned `PgPool` instead of `&PgPool`. Since `PgPool` wraps an `Arc` internally, cloning is cheap (reference count bump). The caller clones before each invocation, and the closure can take a reference inside:
+
+```rust
+// Generic function signature
+F: Fn(PgPool, i64) -> Fut + Send,
+
+// Caller clones
+mark_stale_fn(pool.clone(), threshold).await
+
+// Closure creates reference inside
+|pool, threshold| async move {
+    Repository::mark_stale(&pool, threshold).await
+}
+```
 
 ---

@@ -65,3 +65,11 @@ Check if code can use shared TokenManager instead of implementing OAuth logic.
 When reviewing internal metrics, coordinate on: (1) module-level docs clarifying which structs ARE wired, (2) naming conventions (ADR-0023), (3) label cardinality (ADR-0011), (4) emission frequency patterns. Flag missing docs when struct has increment methods but isn't wired (e.g., ControllerMetrics for GC heartbeat vs ActorMetrics for Prometheus).
 
 ---
+
+## Integration: Validation Guards vs Plan Agreements
+**Added**: 2026-02-12
+**Updated**: 2026-02-12
+
+Project-wide validation guards (e.g., `instrument-skip-all` requiring all async functions with parameters to have `#[instrument(skip_all)]`) may conflict with plan-phase agreements. During TD-13 iteration 1, we agreed the generic function should not have `#[instrument]`, but the guard required it. **Resolution in iteration 2**: removing `#[instrument]` entirely from the generic function and using `.instrument()` chaining in callers avoids the guard entirely, since the guard only pattern-matches on `#[instrument(` attributes, not the `Instrument` trait method. This is the preferred resolution when the goal is caller-controlled spans. When reviewing, still check whether deviations from the plan are due to guard requirements before flagging them.
+
+---

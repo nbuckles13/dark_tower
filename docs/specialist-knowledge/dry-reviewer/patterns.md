@@ -243,6 +243,39 @@ match operation().await {
         record_histogram(type, duration);
         // handle error
     }
+## Closure-Based Generic Extraction for Same-Crate Duplication
+
+**Added**: 2026-02-12 | **Updated**: 2026-02-12 (iteration 2: simplified API)
+**Related files**: `crates/global-controller/src/tasks/generic_health_checker.rs`, `crates/global-controller/src/tasks/health_checker.rs`, `crates/global-controller/src/tasks/mh_health_checker.rs`
+
+**Pattern**: When two modules in the same crate have 90%+ structural similarity differing only in which repository/function they call, extract the shared logic into a generic function parameterized by a closure, with thin wrapper functions preserving the original API. Pass domain-differentiating values as plain parameters, not config structs:
+
+```rust
+// Generic: closure-based, zero-cost abstraction, plain parameters
+pub async fn start_generic_health_checker<F, Fut>(
+    pool: PgPool,
+    staleness_threshold_seconds: u64,
+    cancel_token: CancellationToken,
+    entity_name: &'static str,
+    mark_stale_fn: F,
+) where
+    F: Fn(PgPool, i64) -> Fut + Send,
+    Fut: Future<Output = Result<u64, GcError>> + Send,
+{ /* shared loop logic */ }
+
+// Thin wrapper: preserves original signature, uses .instrument() chaining
+pub async fn start_health_checker(pool: PgPool, threshold: u64, cancel: CancellationToken) {
+    // lifecycle log with literal target:
+    info!(target: "gc.task.health_checker", "Starting health checker task");
+    start_generic_health_checker(pool, threshold, cancel, "controllers",
+        |pool, threshold| async move {
+            MeetingControllersRepository::mark_stale_controllers_unhealthy(&pool, threshold).await
+        },
+    )
+    .instrument(tracing::info_span!("gc.task.health_checker"))
+    .await;
+    // lifecycle log with literal target:
+    info!(target: "gc.task.health_checker", "Health checker task stopped");
 }
 ```
 
@@ -257,5 +290,19 @@ match operation().await {
 - **Separate functions** (MC): `record_gc_heartbeat(status, type)` for counter, `record_gc_heartbeat_latency(type, duration)` for histogram
 
 **When reviewing**: Both patterns are valid per ADR-0011. Separate functions allow recording only counter OR only histogram if needed. Combined functions reduce duplication at call sites. Note as TECH_DEBT (not BLOCKER) if inconsistent across services.
+- Zero-cost: monomorphized at compile time, no trait objects or dynamic dispatch
+- No breaking changes: wrapper signatures identical to originals, call sites untouched
+- Tests remain in wrapper modules, exercising full pipeline through the wrappers
+- Plain `&'static str` parameter instead of config struct -- simpler API, no boilerplate
+
+**When to use**: Same-crate modules with 90%+ structural similarity where differences are limited to which function is called and what strings appear in logs. Repository method signatures must be compatible.
+
+**When NOT to use**: Cross-crate duplication (use trait in `common` instead). Modules with <80% similarity or different control flow (not just different function calls). Cases where the generic function would need complex trait bounds or lifetime gymnastics.
+
+**Design notes**:
+- Use `.instrument(tracing::info_span!("name"))` chaining on wrappers, NOT `#[instrument]` on the generic function -- avoids nested spans and keeps the generic function free of tracing concerns
+- Use `&'static str` for log targets since tracing macros require static strings
+- Lifecycle logs (startup/shutdown) stay in wrappers with literal `target:` values; inner loop logs use structured fields (`entity = entity_name`)
+- Prefer plain parameters over config structs when 1-2 domain values differentiate the generic -- config structs add indirection for no benefit (see "Config Struct vs Plain Parameters" gotcha)
 
 ---

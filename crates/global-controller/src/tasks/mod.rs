@@ -6,9 +6,11 @@
 //!
 //! - `health_checker` - Monitors MC heartbeats and marks stale controllers unhealthy
 //! - `mh_health_checker` - Monitors MH heartbeats and marks stale handlers unhealthy
+//! - `generic_health_checker` - Shared health checker loop used by MC and MH checkers
 //! - `assignment_cleanup` - Cleans up stale and old meeting assignments
 
 pub mod assignment_cleanup;
+pub mod generic_health_checker;
 pub mod health_checker;
 pub mod mh_health_checker;
 

@@ -4,6 +4,9 @@
 //! Controllers are considered stale if they haven't sent a heartbeat within
 //! the configured threshold.
 //!
+//! This is a thin wrapper around the generic health checker, parameterized for
+//! Meeting Controllers.
+//!
 //! # Graceful Shutdown
 //!
 //! The task supports graceful shutdown via a cancellation token. When the token
@@ -11,13 +14,12 @@
 
 use crate::observability::metrics;
 use crate::repositories::MeetingControllersRepository;
+use crate::tasks::generic_health_checker::{
+    start_generic_health_checker, DEFAULT_CHECK_INTERVAL_SECONDS,
+};
 use sqlx::PgPool;
-use std::time::Duration;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, instrument, warn};
-
-/// Default health check interval in seconds.
-const DEFAULT_CHECK_INTERVAL_SECONDS: u64 = 5;
+use tracing::{info, Instrument};
 
 /// Refresh the registered controllers gauge metric.
 ///
@@ -67,7 +69,6 @@ async fn refresh_controller_metrics(pool: &PgPool) {
 /// # Returns
 ///
 /// Returns when the cancellation token is triggered.
-#[instrument(skip_all, name = "gc.task.health_checker")]
 pub async fn start_health_checker(
     pool: PgPool,
     staleness_threshold_seconds: u64,
@@ -80,46 +81,17 @@ pub async fn start_health_checker(
         "Starting health checker task"
     );
 
-    let mut interval = tokio::time::interval(Duration::from_secs(DEFAULT_CHECK_INTERVAL_SECONDS));
-
-    loop {
-        tokio::select! {
-            _ = interval.tick() => {
-                // Check for stale controllers
-                match MeetingControllersRepository::mark_stale_controllers_unhealthy(
-                    &pool,
-                    staleness_threshold_seconds as i64,
-                ).await {
-                    Ok(count) => {
-                        if count > 0 {
-                            warn!(
-                                target: "gc.task.health_checker",
-                                stale_count = count,
-                                "Marked stale controllers as unhealthy"
-                            );
-                        }
-                        // Refresh the registered controllers metric
-                        refresh_controller_metrics(&pool).await;
-                    }
-                    Err(e) => {
-                        // Log error but continue - database might recover
-                        tracing::error!(
-                            target: "gc.task.health_checker",
-                            error = %e,
-                            "Failed to check for stale controllers"
-                        );
-                    }
-                }
-            }
-            _ = cancel_token.cancelled() => {
-                info!(
-                    target: "gc.task.health_checker",
-                    "Health checker task received shutdown signal, exiting"
-                );
-                break;
-            }
-        }
-    }
+    start_generic_health_checker(
+        pool,
+        staleness_threshold_seconds,
+        cancel_token,
+        "controllers",
+        |pool, threshold| async move {
+            MeetingControllersRepository::mark_stale_controllers_unhealthy(&pool, threshold).await
+        },
+    )
+    .instrument(tracing::info_span!("gc.task.health_checker"))
+    .await;
 
     info!(
         target: "gc.task.health_checker",

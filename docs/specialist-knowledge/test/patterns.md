@@ -219,3 +219,35 @@ Verify infinite retry design with `tokio::time::timeout`. Timeout proves retry w
 For simple Prometheus wiring (direct calls, no branching): (1) existing tests verify behavior, (2) wrapper module tests verify emission, (3) wiring exercised indirectly. Don't require explicit "mock Prometheus" tests for simple wiring. For complex logic (conditionals, aggregation), add explicit tests. Verify cardinality bounds in wrapper module, not per-caller.
 
 ---
+
+## Pattern: Test Inventory Before DRY Refactor
+**Added**: 2026-02-12
+**Related files**: `crates/global-controller/src/tasks/health_checker.rs`, `crates/global-controller/src/tasks/mh_health_checker.rs`
+
+Before reviewing a DRY extraction refactor, catalog every test by name and type (unit/integration/sqlx::test) across all affected files. Track: (1) total count, (2) which wrapper function each test calls, (3) what `super::*` brings into scope. After implementation, verify count >= original. Wrapper-preserving refactors (same public signatures) require zero test changes — the safest DRY pattern. Also note asymmetric coverage gaps between parallel implementations (e.g., MH missing "skips already unhealthy" test that MC has) as pre-existing tech debt.
+
+---
+
+## Pattern: Constant Re-Export for Test Module Compatibility
+**Added**: 2026-02-12
+**Related files**: `crates/global-controller/src/tasks/generic_health_checker.rs`
+
+When extracting shared constants to a new module, wrapper modules should `use` the constant at module scope so test modules accessing `super::CONSTANT` continue to work without changes. Example: `use crate::tasks::generic_health_checker::DEFAULT_CHECK_INTERVAL_SECONDS;` in the wrapper, then tests use `super::DEFAULT_CHECK_INTERVAL_SECONDS` unchanged. Avoids test code churn in pure refactors.
+
+---
+
+## Pattern: .instrument() Chaining Keeps Generic Functions Test-Neutral
+**Added**: 2026-02-12
+**Related files**: `crates/global-controller/src/tasks/health_checker.rs`, `crates/global-controller/src/tasks/mh_health_checker.rs`
+
+When extracting a generic async function used by multiple callers, prefer callers chaining `.instrument(tracing::info_span!("name"))` on the returned future over `#[instrument]` on the generic function. Test impact: zero — tests don't assert on span names, so moving span creation from generic to caller is invisible to tests. Also enables callers to use different span names (e.g., `gc.task.health_checker` vs `gc.task.mh_health_checker`). Verify by confirming: (1) no test references span names, (2) wrapper signatures unchanged, (3) `Instrument` trait imported in wrappers.
+
+---
+
+## Pattern: Config Struct Removal is Safe When Tests Use Wrappers
+**Added**: 2026-02-12
+**Related files**: `crates/global-controller/src/tasks/generic_health_checker.rs`
+
+Removing a config struct from a generic function's API (replacing with plain parameters) has zero test impact when all tests go through wrapper functions that construct the config internally. Checklist: (1) grep tests for config struct type name — if zero hits, safe to remove, (2) verify wrapper signatures unchanged, (3) verify parameter count/types in generic function match what wrappers pass. Two-iteration pattern: first extract with config struct for clarity, then simplify to plain parameters once the API is validated.
+
+---

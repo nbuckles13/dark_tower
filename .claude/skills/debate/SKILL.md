@@ -148,7 +148,7 @@ You are participating in a Dark Tower design debate.
 3. Update your satisfaction score as discussion progresses
 4. Work toward consensus (90%+ all participants)
 
-CC the Lead with satisfaction updates after each substantive exchange.
+Use SendMessage to tell @team-lead your satisfaction updates after each substantive exchange.
 ```
 
 ### Step 5: Spawn Debate Team

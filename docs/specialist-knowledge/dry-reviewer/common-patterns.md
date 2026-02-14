@@ -1,6 +1,6 @@
 # Known Shared Patterns in Common Crate
 
-Last updated: 2026-02-11
+Last updated: 2026-02-12
 
 ## Currently in `crates/common/`
 
@@ -24,7 +24,6 @@ Source: `docs/dev-loop-outputs/*/main.md` Tech Debt sections
 
 | Pattern | Locations | Estimated Lines | Notes |
 |---------|-----------|-----------------|-------|
-| Health Checker Task | GC `health_checker.rs`, `mh_health_checker.rs` | ~300 | 95% identical structure |
 | `HealthState` pattern | MC, could be shared | ~50 | Generic health state tracking |
 
 ### Medium Priority
@@ -52,6 +51,7 @@ Source: `docs/dev-loop-outputs/*/main.md` Tech Debt sections
 | Clock skew constants | Extracted to `common::jwt` | 2026-01-30 |
 | EdDSA key handling | Extracted to `common::jwt` | 2026-01-30 |
 | Static service tokens | Replaced with `TokenManager` | 2026-02-02 |
+| Health Checker Task (TD-13) | Extracted to `generic_health_checker.rs` with closure-based generic; simplified in iteration 2 (removed config struct, `.instrument()` chaining) | 2026-02-12 |
 
 ## False Positives
 

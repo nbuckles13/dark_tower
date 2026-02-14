@@ -115,3 +115,11 @@ MockRedis for unit tests (builder pattern), actor lifecycle tests (spawn, shutdo
 Simple wiring (direct calls): behavior tests + wrapper module tests sufficient. Complex wiring (conditionals, aggregation): explicit tests required. Cardinality bounds in wrapper module. Document missing updates as tech debt (e.g., current_participants never incremented).
 
 ---
+
+## For DRY Reviewer: Test Preservation in Extract-Generic Refactors
+**Added**: 2026-02-12, **Updated**: 2026-02-12
+**Related files**: `crates/global-controller/src/tasks/generic_health_checker.rs`
+
+When extracting shared logic into a generic module with thin wrappers, verify: (1) wrapper public signatures unchanged (tests call wrappers, not generic), (2) constants re-exported so `super::CONSTANT` still resolves in test modules, (3) test count >= original (no silent drops from missing mod.rs entries). Wrapper-preserving pattern is safest for test preservation — zero test code changes. Flag asymmetric test coverage between parallel implementations as pre-existing tech debt (not caused by refactor). Iterative simplification (e.g., config struct → plain parameters) is safe when tests only touch wrappers. Also: `.instrument()` chaining vs `#[instrument]` attribute is invisible to tests — neither requires test changes.
+
+---
