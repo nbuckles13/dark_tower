@@ -683,6 +683,22 @@ X-RateLimit-Reset: 1234567890
 }
 ```
 
+## Implementation Status
+
+| Component | Status | Commit/PR | Notes |
+|-----------|--------|-----------|-------|
+| OAuth 2.0 Client Credentials | ✅ Done | | Token issuance for service-to-service auth |
+| JWT EdDSA Signatures | ✅ Done | | Ed25519 signing with JWKS |
+| JWKS Endpoint | ✅ Done | | Public key distribution |
+| Token Validation | ✅ Done | | Claim validation with clock skew tolerance |
+| Rate Limiting | ✅ Done | | Token bucket algorithm |
+| Bcrypt Password Hashing | ✅ Done | | Cost factor 12 |
+| AES-256-GCM Key Encryption | ✅ Done | | Private key encryption at rest |
+| Error Counter Metrics | ❌ Pending | | Add `ac_errors_total` (counter by error_type, endpoint) to enable error budget calculations in SLO dashboards. Track token issuance errors, validation errors, JWKS errors, HTTP 4xx/5xx responses. Required for `ac-slos.json` error budget panels which currently show -74914% due to missing metrics. Label dimensions: `error_type` (validation_failed, token_expired, rate_limited, internal_error), `endpoint` (/token, /jwks, /validate). Align with ADR-0011 observability framework. |
+| Redis-based Rate Limiting | ❌ Pending | | Multi-instance distributed rate limiting |
+| CAPTCHA Integration | ❌ Pending | | After 3 failed attempts (Layer 4) |
+| Failed Login Alerting | ❌ Pending | | Email user, alert ops team (Layer 5) |
+
 ## References
 
 - OAuth 2.0 RFC 6749: https://datatracker.ietf.org/doc/html/rfc6749

@@ -1,0 +1,227 @@
+# Prometheus Configuration for Dark Tower
+#
+# Prometheus scrapes metrics from Dark Tower services.
+# Each service exposes a /metrics endpoint on its health port.
+#
+# Scrape jobs:
+# - prometheus: Self-monitoring
+# - ac-service: Auth Controller (port 8082)
+# - global-controller: Global Controller (port 8080)
+# - meeting-controller: Meeting Controller (port 8081)
+# - kube-state-metrics: Cluster-level metrics (pod states, deployments, etc.)
+# - node-exporter: Node-level metrics (CPU, memory, disk, network)
+# - kubelet: Container-level metrics (container_cpu_usage_seconds_total, etc.)
+#
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: dark-tower-observability
+  labels:
+    app: prometheus
+    component: monitoring
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 15s
+      evaluation_interval: 15s
+
+    scrape_configs:
+      - job_name: 'prometheus'
+        static_configs:
+          - targets: ['localhost:9090']
+
+      # Scrape AC service pods running in-cluster
+      - job_name: 'ac-service'
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              names:
+                - dark-tower
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_label_app]
+            action: keep
+            regex: ac-service
+          - source_labels: [__meta_kubernetes_pod_container_port_number]
+            action: keep
+            regex: "8082"
+
+      # Scrape Global Controller pods
+      - job_name: 'global-controller'
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              names:
+                - dark-tower
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_label_app]
+            action: keep
+            regex: global-controller
+          - source_labels: [__meta_kubernetes_pod_container_port_number]
+            action: keep
+            regex: "8080"
+
+      # Scrape Meeting Controller pods (metrics on health port)
+      - job_name: 'meeting-controller'
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              names:
+                - dark-tower
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_label_app]
+            action: keep
+            regex: meeting-controller
+          - source_labels: [__meta_kubernetes_pod_container_port_number]
+            action: keep
+            regex: "8081"
+
+      # Scrape kube-state-metrics for cluster-level metrics
+      - job_name: 'kube-state-metrics'
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              names:
+                - dark-tower-observability
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_label_app]
+            action: keep
+            regex: kube-state-metrics
+          - source_labels: [__meta_kubernetes_pod_container_port_number]
+            action: keep
+            regex: "8080"
+
+      # Scrape node-exporter for node-level metrics
+      - job_name: 'node-exporter'
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              names:
+                - dark-tower-observability
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_label_app]
+            action: keep
+            regex: node-exporter
+          - source_labels: [__meta_kubernetes_pod_container_port_number]
+            action: keep
+            regex: "9100"
+
+      # Scrape kubelet for container metrics
+      - job_name: 'kubelet'
+        scheme: https
+        tls_config:
+          ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+          insecure_skip_verify: true
+        bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+        kubernetes_sd_configs:
+          - role: node
+        relabel_configs:
+          - action: labelmap
+            regex: __meta_kubernetes_node_label_(.+)
+          - target_label: __address__
+            replacement: kubernetes.default.svc:443
+          - source_labels: [__meta_kubernetes_node_name]
+            regex: (.+)
+            target_label: __metrics_path__
+            replacement: /api/v1/nodes/$1/proxy/metrics/cadvisor
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: prometheus
+  namespace: dark-tower-observability
+  labels:
+    app: prometheus
+    component: monitoring
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: prometheus
+  labels:
+    app: prometheus
+    component: monitoring
+rules:
+  - apiGroups: [""]
+    resources:
+      - nodes
+      - nodes/proxy
+      - services
+      - endpoints
+      - pods
+    verbs: ["get", "watch", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: prometheus
+  labels:
+    app: prometheus
+    component: monitoring
+subjects:
+  - kind: ServiceAccount
+    name: prometheus
+    namespace: dark-tower-observability
+roleRef:
+  kind: ClusterRole
+  name: prometheus
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+  namespace: dark-tower-observability
+  labels:
+    app: prometheus
+    component: monitoring
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: prometheus
+  template:
+    metadata:
+      labels:
+        app: prometheus
+        component: monitoring
+    spec:
+      serviceAccountName: prometheus
+      containers:
+        - name: prometheus
+          image: prom/prometheus:v2.48.0
+          args:
+            - "--config.file=/etc/prometheus/prometheus.yml"
+            - "--storage.tsdb.path=/prometheus"
+            - "--web.enable-lifecycle"
+          ports:
+            - containerPort: 9090
+          volumeMounts:
+            - name: config
+              mountPath: /etc/prometheus
+            - name: data
+              mountPath: /prometheus
+      volumes:
+        - name: config
+          configMap:
+            name: prometheus-config
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  namespace: dark-tower-observability
+  labels:
+    app: prometheus
+    component: monitoring
+spec:
+  selector:
+    app: prometheus
+  ports:
+    - port: 9090
+      targetPort: 9090
+      nodePort: 30090
+  type: NodePort

@@ -1277,7 +1277,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "container_memory_usage_bytes{pod=~\"global-controller-.*\"}",
+          "expr": "container_memory_working_set_bytes{namespace=\"dark-tower\", pod=~\"global-controller.*\"}",
           "legendFormat": "{{pod}}",
           "range": true,
           "refId": "A"
@@ -1367,7 +1367,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "rate(container_cpu_usage_seconds_total{pod=~\"global-controller-.*\"}[5m])",
+          "expr": "rate(container_cpu_usage_seconds_total{namespace=\"dark-tower\", pod=~\"global-controller.*\"}[5m])",
           "legendFormat": "{{pod}}",
           "range": true,
           "refId": "A"

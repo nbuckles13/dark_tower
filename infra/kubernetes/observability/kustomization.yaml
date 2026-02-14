@@ -1,0 +1,35 @@
+# Kustomization for Dark Tower Observability Stack
+#
+# This directory contains the observability infrastructure:
+# - Promtail: Log shipping agent (DaemonSet)
+# - Loki: Log aggregation (StatefulSet)
+# - Prometheus: Metrics collection (Deployment)
+# - kube-state-metrics: Cluster-level metrics (Deployment)
+# - node-exporter: Node-level metrics (DaemonSet)
+#
+# Note: Grafana is deployed separately with dashboard provisioning.
+# See: infra/grafana/ for dashboards and datasources.
+#
+# Usage:
+#   kubectl apply -k infra/kubernetes/observability/
+#
+# Or apply individual files:
+#   kubectl apply -f infra/kubernetes/observability/promtail-config.yaml
+#   kubectl apply -f infra/kubernetes/observability/loki-config.yaml
+#   kubectl apply -f infra/kubernetes/observability/prometheus-config.yaml
+#   kubectl apply -f infra/kubernetes/observability/kube-state-metrics.yaml
+#   kubectl apply -f infra/kubernetes/observability/node-exporter.yaml
+#
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - promtail-config.yaml
+  - loki-config.yaml
+  - prometheus-config.yaml
+  - kube-state-metrics.yaml
+  - node-exporter.yaml
+
+commonLabels:
+  managed-by: dark-tower
+  environment: dev

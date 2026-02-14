@@ -67,13 +67,14 @@ const MIN_SECRET_LENGTH: usize = 32;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize tracing
+    // Initialize tracing with JSON structured logging
+    // JSON format enables robust parsing in Promtail without brittle regex
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "meeting_controller=debug,tower_http=debug".into()),
         )
-        .with(tracing_subscriber::fmt::layer())
+        .with(tracing_subscriber::fmt::layer().json())
         .init();
 
     info!("Starting Meeting Controller");

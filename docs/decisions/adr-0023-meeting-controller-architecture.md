@@ -1038,6 +1038,7 @@ crates/mc-test-utils/
 | Health endpoints | ❌ Pending | | /health, /ready |
 | Degraded state handling | ❌ Pending | | High latency, capacity 80-95% |
 | Metrics | ❌ Pending | | mc_connections_active, mc_meetings_active, etc. |
+| Error Counter Metrics | ❌ Pending | | Add `mc_errors_total` (counter by error_type, operation) to enable error budget calculations in SLO dashboards. Track actor panics, message drops, WebTransport errors, GC RPC errors. Required for `mc-slos.json` error budget panels which currently show no data. Align with ADR-0011 observability framework. |
 | W3C trace context | ❌ Pending | | traceparent propagation |
 
 ### Infrastructure
