@@ -448,6 +448,45 @@ Teammates drive autonomously:
 
 **Version 3 skills have been retired.** The Agent Teams workflow (`/dev-loop`) is the current and only implementation.
 
+#### Containerized Execution (Preferred)
+
+For maximum autonomy, dev-loops run inside isolated **podman containers** where Claude Code operates with `--dangerously-skip-permissions` (all permission prompts disabled). The container boundary limits blast radius to the current task's worktree.
+
+```
+Host (WSL2)                              Container (podman pod)
+┌──────────────────────┐                 ┌──────────────────────────┐
+│ GitHub credentials   │                 │ Claude Code (autonomous) │
+│ SSH keys             │  bind mount     │ Rust toolchain + tools   │
+│ Git worktree ────────┼────────────────►│ /work (worktree only)    │
+│ devloop.sh wrapper   │                 │ PostgreSQL sidecar       │
+│                      │                 │                          │
+│ Push + PR creation ◄─┼── .devloop-pr  │ No GitHub credentials    │
+│ (host credentials)   │    .json        │ No SSH keys              │
+└──────────────────────┘                 └──────────────────────────┘
+```
+
+**Why containerize?**
+- `--dangerously-skip-permissions` enables fully autonomous Claude Code execution — no approval prompts interrupting the dev-loop
+- Container isolation means Claude can only access the mounted worktree, not SSH keys, GitHub credentials, or other projects
+- The only credential exposed is `ANTHROPIC_API_KEY` (unavoidable — Claude needs it to function)
+- PR descriptions are written by Claude (which has the full task context) to a `.devloop-pr.json` file, then the host-side wrapper creates the actual PR using the host's GitHub credentials
+
+**Workflow**:
+```bash
+# One command: creates worktree, starts pod, drops into Claude
+./infra/devloop/devloop.sh td-42-rate-limiting
+
+# Inside container:
+claude> /dev-loop "implement rate limiting on GC endpoints"
+# ... autonomous implementation, review, commit ...
+claude> /exit
+
+# Back on host — wrapper offers to push and create PR
+# using .devloop-pr.json that Claude wrote
+```
+
+**See**: [ADR-0025](docs/decisions/adr-0025-containerized-devloop.md) for the full design and security model.
+
 ---
 
 ### The Root Cause (Versions 1-3)
@@ -513,14 +552,13 @@ The codebase handles authentication, JWT issuance, key rotation, rate limiting, 
 | Project overview | [README.md](README.md) |
 | Full architecture | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) |
 | Dev-loop overview | [.claude/skills/dev-loop/SKILL.md](.claude/skills/dev-loop/SKILL.md) |
-| Agent Teams dev-loop | [.claude/skills/dev-loop/SKILL.md](.claude/skills/dev-loop/SKILL.md) |
+| Containerized dev-loop | [infra/devloop/](infra/devloop/) and [ADR-0025](docs/decisions/adr-0025-containerized-devloop.md) |
 | Debate workflow | [.claude/skills/debate/SKILL.md](.claude/skills/debate/SKILL.md) |
 | Specialist definitions | [.claude/agents/](.claude/agents/) |
 | Specialist knowledge | [docs/specialist-knowledge/](docs/specialist-knowledge/) |
 | Architecture decisions | [docs/decisions/](docs/decisions/) |
 | Debate records | [docs/debates/](docs/debates/) |
 | Dev-loop outputs | [docs/dev-loop-outputs/](docs/dev-loop-outputs/) |
-| Specialist knowledge | [docs/specialist-knowledge/](docs/specialist-knowledge/) |
 | Current progress | [docs/PROJECT_STATUS.md](docs/PROJECT_STATUS.md) |
 
 ---
