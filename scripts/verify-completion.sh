@@ -22,7 +22,7 @@
 # Layers:
 #   quick    - cargo check + fmt + simple guards (~10s)
 #   standard - quick + unit tests (~45s)
-#   full     - standard + all tests + clippy + semantic guards (~3-6min)
+#   full     - standard + all tests + clippy (~1-3min)
 #
 # Examples:
 #   ./verify-completion.sh                    # Full verification
@@ -248,29 +248,8 @@ verify_clippy() {
         "Fix clippy warnings"
 }
 
-verify_semantic_guards() {
-    if $VERBOSE; then
-        echo -e "\n${BOLD}Layer 7: Semantic Guards${NC}"
-        echo "─────────────────────────"
-    fi
-
-    local guard_output
-    local exit_code=0
-    guard_output=$("$SCRIPT_DIR/guards/run-guards.sh" --semantic "$SEARCH_PATH" 2>&1) || exit_code=$?
-
-    if [[ $exit_code -ne 0 ]]; then
-        # Extract violation details from guard output
-        local violations
-        violations=$(echo "$guard_output" | grep -E "(VIOLATION|violation|FAILED|Failed guards:)" | head -20 || true)
-        add_failure "guard" "semantic-guards" "$violations" "Review semantic guard output and fix violations"
-        return 1
-    fi
-
-    if $VERBOSE; then
-        echo -e "${GREEN}PASSED${NC}: semantic-guards"
-    fi
-    return 0
-}
+# Note: Semantic guards are handled by the semantic-guard agent during
+# dev-loops, not by this script. See .claude/agents/semantic-guard.md.
 
 # -----------------------------------------------------------------------------
 # Output Functions
@@ -429,10 +408,8 @@ main() {
         verify_clippy || true
     fi
 
-    # Layer 7: Semantic guards (full only, after all other checks pass)
-    if [[ ${#FAILURES[@]} -eq 0 ]]; then
-        verify_semantic_guards || true
-    fi
+    # Note: Semantic guards (layer 7) are handled by the semantic-guard agent
+    # during dev-loops. See .claude/agents/semantic-guard.md.
 
     # Output results
     if [[ "$FORMAT" == "json" ]]; then
