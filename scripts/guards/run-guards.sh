@@ -1,9 +1,9 @@
 #!/bin/bash
 #
-# Guard Runner: Execute all guards in the pipeline
+# Guard Runner: Execute all simple (pattern-based) guards
 #
-# Runs simple guards first (fast), then optionally semantic guards (slower).
-# Designed for CI integration and local development.
+# Semantic guards are handled by the semantic-guard agent during dev-loops,
+# not by this script. See .claude/agents/semantic-guard.md.
 #
 # Exit codes:
 #   0 - All guards passed
@@ -14,15 +14,12 @@
 #   ./run-guards.sh [options] [path]
 #
 # Options:
-#   --simple-only     Only run simple (grep-based) guards
-#   --semantic        Also run semantic (LLM-based) guards
 #   --verbose         Show detailed output
 #   --help            Show this help message
 #
 # Examples:
 #   ./run-guards.sh                              # Run simple guards on entire repo
 #   ./run-guards.sh crates/ac-service/src/       # Run on specific directory
-#   ./run-guards.sh --semantic src/auth.rs       # Run with semantic analysis
 #
 
 set -euo pipefail
@@ -42,27 +39,18 @@ BOLD='\033[1m'
 NC='\033[0m'
 
 # Default options
-RUN_SEMANTIC=false
 VERBOSE=false
 SEARCH_PATH=""
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
     case $1 in
-        --simple-only)
-            RUN_SEMANTIC=false
-            shift
-            ;;
-        --semantic)
-            RUN_SEMANTIC=true
-            shift
-            ;;
         --verbose)
             VERBOSE=true
             shift
             ;;
         --help)
-            head -30 "$0" | tail -25
+            head -25 "$0" | tail -20
             exit 0
             ;;
         -*)
@@ -79,7 +67,7 @@ done
 # Default to repository root
 if [[ -z "$SEARCH_PATH" ]]; then
     # Find repository root (go up until we find .git directory or file)
-    # Note: In worktrees, .git is a file pointing to the main repo
+    # Note: In worktrees/clones, .git may be a file pointing to the main repo
     REPO_ROOT="$SCRIPT_DIR"
     while [[ ! -d "$REPO_ROOT/.git" ]] && [[ ! -f "$REPO_ROOT/.git" ]] && [[ "$REPO_ROOT" != "/" ]]; do
         REPO_ROOT="$(dirname "$REPO_ROOT")"
@@ -96,7 +84,6 @@ echo "Guard Pipeline Runner"
 echo "==========================================${NC}"
 echo ""
 echo "Path: $SEARCH_PATH"
-echo "Semantic: $RUN_SEMANTIC"
 echo ""
 
 # Track results
@@ -224,60 +211,8 @@ if [[ -x "$APP_METRICS_GUARD" ]]; then
     echo ""
 fi
 
-# -----------------------------------------------------------------------------
-# Run Semantic Guards (if enabled)
-# -----------------------------------------------------------------------------
-if $RUN_SEMANTIC; then
-    echo -e "${BOLD}Semantic Guards${NC}"
-    echo "==============="
-    echo ""
-
-    SEMANTIC_RUNNER="$SCRIPT_DIR/run-semantic-guards.sh"
-    if [[ -x "$SEMANTIC_RUNNER" ]]; then
-        ((TOTAL_GUARDS++)) || true
-
-        echo -e "${BLUE}Running:${NC} semantic-analysis (diff-based)"
-
-        if $VERBOSE; then
-            if "$SEMANTIC_RUNNER" --verbose; then
-                echo -e "${GREEN}PASSED${NC}: semantic-analysis"
-                ((PASSED_GUARDS++)) || true
-            else
-                SEMANTIC_EXIT=$?
-                if [[ $SEMANTIC_EXIT -eq 2 ]]; then
-                    # UNCLEAR - treat as warning, not failure
-                    echo -e "${YELLOW}UNCLEAR${NC}: semantic-analysis (manual review recommended)"
-                    ((PASSED_GUARDS++)) || true
-                else
-                    echo -e "${RED}FAILED${NC}: semantic-analysis"
-                    ((FAILED_GUARDS++)) || true
-                    FAILED_GUARD_NAMES+=("semantic-analysis")
-                fi
-            fi
-        else
-            if OUTPUT=$("$SEMANTIC_RUNNER" 2>&1); then
-                echo -e "${GREEN}PASSED${NC}: semantic-analysis"
-                ((PASSED_GUARDS++)) || true
-            else
-                SEMANTIC_EXIT=$?
-                if [[ $SEMANTIC_EXIT -eq 2 ]]; then
-                    echo -e "${YELLOW}UNCLEAR${NC}: semantic-analysis (manual review recommended)"
-                    ((PASSED_GUARDS++)) || true
-                else
-                    echo -e "${RED}FAILED${NC}: semantic-analysis"
-                    ((FAILED_GUARDS++)) || true
-                    FAILED_GUARD_NAMES+=("semantic-analysis")
-                    # Show failure details
-                    echo "$OUTPUT" | grep -E "(FINDING|UNSAFE|VERDICT)" | head -10 || true
-                fi
-            fi
-        fi
-        echo ""
-    else
-        echo -e "${YELLOW}Semantic runner not found at $SEMANTIC_RUNNER${NC}"
-        echo ""
-    fi
-fi
+# NOTE: Semantic guards are now handled by the semantic-guard agent,
+# spawned during dev-loop validation (see .claude/agents/semantic-guard.md)
 
 # -----------------------------------------------------------------------------
 # Summary

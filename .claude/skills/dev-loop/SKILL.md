@@ -341,7 +341,19 @@ When implementer signals "Ready for validation", run the validation pipeline:
 | 4. Tests | `./scripts/test.sh --workspace` | Regressions; ensures DB setup + migrations; report P0 security test count |
 | 5. Clippy | `cargo clippy --workspace --lib --bins -- -D warnings` | Lint warnings |
 | 6. Audit | `cargo audit` | Known dependency vulnerabilities |
-| 7. Semantic | `./scripts/guards/run-semantic-guards.sh` | AI-powered diff analysis: credential leaks, actor blocking, error context |
+| 7. Semantic | Spawn `semantic-guard` agent (see below) | AI-powered diff analysis: credential leaks, actor blocking, error context |
+
+**Layer 7 — Semantic Guard Agent**:
+
+After layers 1-6 pass, spawn the semantic-guard agent to analyze the diff:
+
+```
+name: "semantic-guard"
+subagent_type: "semantic-guard"
+prompt: "Analyze the current diff for semantic issues. Report your verdict to @team-lead."
+```
+
+Wait for the agent's verdict message. If UNSAFE, treat as a validation failure (send findings to implementer, increment iteration). If SAFE, proceed.
 
 **ARTIFACT-SPECIFIC** (mandatory when detected file types are in the changeset):
 

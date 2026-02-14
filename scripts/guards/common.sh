@@ -11,9 +11,6 @@
 # Configuration
 # =============================================================================
 
-# Semantic guard model (change this to switch models for all semantic guards)
-GUARD_SEMANTIC_MODEL="${GUARD_SEMANTIC_MODEL:-claude-sonnet-4-20250514}"
-
 # Colors for output
 RED='\033[0;31m'
 YELLOW='\033[1;33m'

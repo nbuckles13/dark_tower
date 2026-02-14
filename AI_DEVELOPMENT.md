@@ -168,18 +168,13 @@ See [`scripts/guards/simple/`](scripts/guards/simple/) for the full set.
 
 ### Semantic Guards (AI-Powered)
 
-For issues that patterns can't catch, we use Claude to analyze the diff:
+For issues that patterns can't catch, a dedicated **semantic-guard agent** analyzes the diff during dev-loop validation. The agent reads check definitions from [`scripts/guards/semantic/checks.md`](scripts/guards/semantic/checks.md), examines the current diff, and can read full source files for context when needed.
 
-```bash
-./scripts/guards/run-semantic-guards.sh          # Analyze diff against HEAD
-./scripts/guards/run-semantic-guards.sh --base main  # Analyze diff against main
-```
+Current checks: credential leaks, actor blocking, error context preservation.
 
-The entire diff is analyzed in one Claude call across multiple checks (credential leaks, actor blocking, error context preservation). The result is one of:
-- **SAFE** - No issues found
-- **UNSAFE** - Specific findings with file, line number, and explanation
+The agent reports SAFE or UNSAFE with specific findings (file, line number, explanation). This catches subtle issues like "this function logs a struct that contains a field that could contain sensitive data."
 
-This catches subtle issues like "this function logs a struct that contains a field that could contain sensitive data."
+Unlike the simple guards (which run as shell scripts), semantic guards run as a teammate agent — this avoids the Claude-in-Claude problems of shell-based LLM invocation and gives the agent access to the full codebase for context.
 
 ---
 
