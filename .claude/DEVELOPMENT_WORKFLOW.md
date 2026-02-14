@@ -90,7 +90,13 @@ Use a **single message with multiple Task tool calls** for parallel execution.
 
 ### For New Features
 
-**Recommended**: Use `/dev-loop "task description"` for implementation tasks:
+**Preferred**: Use containerized dev-loop for isolated execution with full autonomy:
+```bash
+./infra/devloop/devloop.sh <task-slug> [base-branch]
+```
+This creates a git worktree + podman pod, drops you into Claude Code with `--dangerously-skip-permissions`. No GitHub credentials exposed. See ADR-0025.
+
+**Alternative** (direct, no container): Use `/dev-loop "task description"` for implementation tasks:
 - Spawns 7 autonomous teammates (1 implementer + 6 reviewers)
 - Specialist-owned verification pipeline: check → fmt → guards → tests → clippy → audit + coverage (reported) + artifact-specific layers
 - Code review by Security, Test, Observability, Code Quality, DRY, and Operations specialists
@@ -243,6 +249,12 @@ See `.claude/skills/dev-loop/SKILL.md` for auto-detection patterns that determin
 - **ADR-0016** - Development loop design (original workflow approach)
 - **ADR-0017** - Specialist knowledge architecture (dynamic knowledge files)
 - **ADR-0018** - Dev-loop checkpointing and restore (session recovery)
+- **ADR-0025** - Containerized dev-loop execution (podman isolation)
+
+**Container Infrastructure** (`infra/devloop/`):
+- `Dockerfile` - Dev container image (Rust + tools + Claude CLI)
+- `entrypoint.sh` - Container init (migrations, settings)
+- `devloop.sh` - Host-side wrapper (lifecycle, push, PR creation)
 
 ---
 

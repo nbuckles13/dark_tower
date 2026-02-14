@@ -285,7 +285,13 @@ dark_tower/
 
 ## Common Development Tasks
 
-### Implementing a Feature or Refactor
+### Implementing a Feature or Refactor (Containerized — Preferred)
+1. Run `./infra/devloop/devloop.sh <task-slug>` to create worktree + isolated pod
+2. Inside the container: `/dev-loop "task description"` runs with full autonomy
+3. On exit, the wrapper script offers to push and create PR from `.devloop-pr.json`
+4. See ADR-0025 for the containerized execution model
+
+### Implementing a Feature or Refactor (Direct)
 1. Run `/dev-loop "task description"` to start the Agent Teams workflow
 2. Lead spawns teammates, they handle planning → implementation → review → reflection
 3. Track progress in `docs/dev-loop-outputs/YYYY-MM-DD-{task}/main.md`
@@ -344,7 +350,19 @@ dark_tower/
 
 ## Development Loop Workflow
 
-Single-command workflow with autonomous teammates:
+### Containerized Execution (Preferred)
+
+Isolated dev-loop inside a podman container with `--dangerously-skip-permissions`:
+
+```
+./infra/devloop/devloop.sh <task-slug> [base-branch]
+```
+
+Creates a git worktree + podman pod (dev container + PostgreSQL). Claude operates with full autonomy inside the container. No GitHub credentials or SSH keys exposed. PR metadata written to `.devloop-pr.json` for host-side push + PR creation. See ADR-0025.
+
+### Direct Execution
+
+Single-command workflow with autonomous teammates (no container isolation):
 
 ```
 /dev-loop "task description" --specialist={name}

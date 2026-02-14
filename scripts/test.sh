@@ -14,7 +14,7 @@ set -e
 # Configuration
 CONTAINER_NAME="dark-tower-postgres-test"
 COMPOSE_FILE="docker-compose.test.yml"
-DATABASE_URL="postgresql://postgres:postgres@localhost:5433/dark_tower_test"
+DEFAULT_DATABASE_URL="postgresql://postgres:postgres@localhost:5433/dark_tower_test"
 MAX_WAIT_SECONDS=30
 
 # Colors
@@ -124,20 +124,41 @@ run_migrations_if_needed() {
     fi
 }
 
+# Check if an external database is already reachable (e.g., dev-loop pod sidecar)
+check_external_db() {
+    if [ -z "${DATABASE_URL:-}" ]; then
+        return 1
+    fi
+    # Extract host and port from DATABASE_URL
+    local host_port
+    host_port=$(echo "$DATABASE_URL" | sed -n 's|.*@\([^/]*\)/.*|\1|p')
+    local host="${host_port%%:*}"
+    local port="${host_port##*:}"
+    pg_isready -h "$host" -p "$port" -U postgres -q 2>/dev/null
+}
+
 # Main
 main() {
-    local runtime
-    local compose
+    # If DATABASE_URL is already set and the DB is reachable, skip container management.
+    # This supports the containerized dev-loop where a postgres sidecar is already running.
+    if check_external_db; then
+        log_info "External database reachable at ${DATABASE_URL} — skipping container management"
+    else
+        DATABASE_URL="$DEFAULT_DATABASE_URL"
 
-    runtime=$(detect_runtime)
-    compose=$(detect_compose "$runtime")
+        local runtime
+        local compose
 
-    # Check if DB is running
-    if ! is_container_running "$runtime"; then
-        start_db "$compose"
-        wait_for_db "$runtime"
-    elif ! is_db_ready "$runtime"; then
-        wait_for_db "$runtime"
+        runtime=$(detect_runtime)
+        compose=$(detect_compose "$runtime")
+
+        # Check if DB is running
+        if ! is_container_running "$runtime"; then
+            start_db "$compose"
+            wait_for_db "$runtime"
+        elif ! is_db_ready "$runtime"; then
+            wait_for_db "$runtime"
+        fi
     fi
 
     # Check and apply migrations if needed

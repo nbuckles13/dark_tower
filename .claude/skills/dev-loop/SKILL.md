@@ -283,6 +283,15 @@ Start by drafting your approach and getting reviewer input.
 
 Update main.md: Phase = planning (full) or implementation (light)
 
+### Gate Management: Idle ≠ Done
+
+**CRITICAL**: Teammates go idle after every turn — this is normal. An idle notification does NOT mean the teammate has finished their task. Teammates may go idle because:
+- They sent a message and are waiting for a response
+- The user sent them a message, they responded, and their turn ended
+- They are waiting for input from another teammate
+
+**Only treat a task as complete when the teammate explicitly signals completion** (e.g., implementer sends "Ready for validation", reviewer sends their verdict). Never advance the workflow based solely on an idle notification.
+
 ### Step 5: Gate 1 - Plan Approval [FULL MODE ONLY]
 
 Wait for all reviewers to confirm plan.
@@ -399,6 +408,16 @@ Update main.md:
 - Final summary
 - Tech debt section (all non-blocking findings from all reviewers that were not fixed)
 
+Write `.devloop-pr.json` to the worktree root with PR metadata for the host wrapper script:
+```json
+{
+  "title": "Short PR title (under 70 chars)",
+  "body": "## Summary\n- bullet points\n\n## Review\n- reviewer verdicts\n\n## Test plan\n- [ ] verification steps\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)"
+}
+```
+
+The `title` should summarize the change. The `body` should include the task summary, reviewer verdicts, files changed, and a test plan. This file is read by the host-side `devloop.sh` wrapper to create the GitHub PR with proper context. See ADR-0025.
+
 Report to user:
 ```
 **Dev-Loop Complete**
@@ -417,6 +436,8 @@ Results:
 
 Files changed:
 {summary}
+
+PR metadata written to .devloop-pr.json
 
 **To address review feedback**:
 - Small fix: `/dev-loop --light "description" --continue=YYYY-MM-DD-{slug}`

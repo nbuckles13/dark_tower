@@ -22,6 +22,8 @@ crates/proto-gen/src/generated/*.rs
 
 # Claude Code
 .claude/settings.local.json
+.devloop-pr.json
+.pr-body-draft.md
 
 # Environment
 .env
