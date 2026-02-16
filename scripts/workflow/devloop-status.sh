@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # Dev-loop status scanner
-# Used by /dev-loop-status skill (see .claude/skills/dev-loop-status/SKILL.md)
+# Used by /devloop-status skill (see .claude/skills/devloop-status/SKILL.md)
 #
-# Scans all dev-loop output directories and reports their current state.
+# Scans all devloop output directories and reports their current state.
 # Exit codes:
 #   0 - Success (output written)
 #   1 - Error
 #
 # Usage:
-#   ./dev-loop-status.sh [OPTIONS]
+#   ./devloop-status.sh [OPTIONS]
 #
 # Options:
 #   --format FORMAT   Output format: text (default), json, tsv
@@ -20,7 +20,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-DEV_LOOP_DIR="$REPO_ROOT/docs/dev-loop-outputs"
+DEVLOOP_DIR="$REPO_ROOT/docs/devloop-outputs"
 
 # Default options
 FORMAT="text"
@@ -71,8 +71,8 @@ extract_field() {
 }
 
 # Check if directory exists
-if [[ ! -d "$DEV_LOOP_DIR" ]]; then
-    echo "No dev-loop outputs directory found at: $DEV_LOOP_DIR" >&2
+if [[ ! -d "$DEVLOOP_DIR" ]]; then
+    echo "No devloop outputs directory found at: $DEVLOOP_DIR" >&2
     exit 1
 fi
 
@@ -81,7 +81,7 @@ declare -a LOOPS=()
 declare -a ACTIVE_LOOPS=()
 declare -a COMPLETE_LOOPS=()
 
-for dir in "$DEV_LOOP_DIR"/*/; do
+for dir in "$DEVLOOP_DIR"/*/; do
     # Skip template directory
     [[ "$dir" == *_template* ]] && continue
 
@@ -213,10 +213,10 @@ case "$FORMAT" in
         fi
 
         if [[ ${#ACTIVE_LOOPS[@]} -eq 0 ]]; then
-            echo "No active dev-loops."
+            echo "No active devloops."
             echo ""
-            echo "To start a new dev-loop, run:"
-            echo "  /dev-loop \"task description\""
+            echo "To start a new devloop, run:"
+            echo "  /devloop \"task description\""
         fi
         ;;
 esac

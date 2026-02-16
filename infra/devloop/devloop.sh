@@ -1,5 +1,5 @@
 #!/bin/bash
-# devloop.sh — Isolated dev-loop execution with persistent containers.
+# devloop.sh — Isolated devloop execution with persistent containers.
 #
 # Creates a local git clone, spins up a dev container + postgres
 # (sharing a network namespace), and drops you into Claude Code with
@@ -302,7 +302,7 @@ elif [ -n "$COMMITS" ]; then
         esac
     else
         echo "No PR metadata found (.devloop-pr.json)."
-        echo "Re-enter the container to complete the dev-loop and generate PR metadata."
+        echo "Re-enter the container to complete the devloop and generate PR metadata."
         echo ""
         menu_reenter_or_cleanup
     fi

@@ -18,7 +18,7 @@ Last updated: 2026-02-12
 
 ## Outstanding Tech Debt (Candidates for Extraction)
 
-Source: `docs/dev-loop-outputs/*/main.md` Tech Debt sections
+Source: `docs/devloop-outputs/*/main.md` Tech Debt sections
 
 ### High Priority
 
@@ -72,9 +72,9 @@ These look like duplication but are intentionally separate:
 ## Finding More Tech Debt
 
 ```bash
-# Search dev-loop outputs for tech debt
-grep -r "Tech Debt" docs/dev-loop-outputs/*/main.md
+# Search devloop outputs for tech debt
+grep -r "Tech Debt" docs/devloop-outputs/*/main.md
 
 # Search for TECH_DEBT findings in reviews
-grep -r "TECH_DEBT" docs/dev-loop-outputs/
+grep -r "TECH_DEBT" docs/devloop-outputs/
 ```

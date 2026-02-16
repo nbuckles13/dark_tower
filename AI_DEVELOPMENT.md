@@ -32,7 +32,7 @@ Instead of one AI doing everything, we use **specialist agent teams** - each age
 │              (Invokes skills, approves gates)                │
 └────────────────────────────┬────────────────────────────────┘
                              │
-                  Invokes: /dev-loop or /debate
+                  Invokes: /devloop or /debate
                              │
                              ▼
 ┌─────────────────────────────────────────────────────────────┐
@@ -95,7 +95,7 @@ The specialists debated directly - Security raising concerns about key lifecycle
 
 **Invoke with**: `/debate "design question"`
 
-**Output**: ADR only - implementation is a separate `/dev-loop` invocation.
+**Output**: ADR only - implementation is a separate `/devloop` invocation.
 
 ---
 
@@ -168,7 +168,7 @@ See [`scripts/guards/simple/`](scripts/guards/simple/) for the full set.
 
 ### Semantic Guards (AI-Powered)
 
-For issues that patterns can't catch, a dedicated **semantic-guard agent** analyzes the diff during dev-loop validation. The agent reads check definitions from [`scripts/guards/semantic/checks.md`](scripts/guards/semantic/checks.md), examines the current diff, and can read full source files for context when needed.
+For issues that patterns can't catch, a dedicated **semantic-guard agent** analyzes the diff during devloop validation. The agent reads check definitions from [`scripts/guards/semantic/checks.md`](scripts/guards/semantic/checks.md), examines the current diff, and can read full source files for context when needed.
 
 Current checks: credential leaks, actor blocking, error context preservation.
 
@@ -182,12 +182,12 @@ Unlike the simple guards (which run as shell scripts), semantic guards run as a 
 
 Putting it all together, here's how a feature gets implemented. The key insight: **autonomous teammates drive the work; the Lead only enforces gates**.
 
-> **Evolution Note**: The dev-loop went through several iterations before arriving at the current design. See [Evolution of the Dev-Loop](#evolution-of-the-dev-loop) below for why earlier approaches failed.
+> **Evolution Note**: The devloop went through several iterations before arriving at the current design. See [Evolution of the Devloop](#evolution-of-the-devloop) below for why earlier approaches failed.
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │  SETUP (Lead)                                               │
-│     Human: /dev-loop "implement feature X"               │
+│     Human: /devloop "implement feature X"               │
 │     Lead: Spawns 7 teammates (1 implementer + 6 reviewers)  │
 │     Lead: Composes prompts with specialist identity +        │
 │           dynamic knowledge + task context                   │
@@ -231,11 +231,11 @@ Putting it all together, here's how a feature gets implemented. The key insight:
                              ▼
 ┌─────────────────────────────────────────────────────────────┐
 │  COMMIT                                                      │
-│     With full audit trail in docs/dev-loop-outputs/          │
+│     With full audit trail in docs/devloop-outputs/          │
 └─────────────────────────────────────────────────────────────┘
 ```
 
-**Team composition** (every dev-loop):
+**Team composition** (every devloop):
 
 | Teammate | Role |
 |----------|------|
@@ -251,7 +251,7 @@ Putting it all together, here's how a feature gets implemented. The key insight:
 - **Minimal Lead context**: Lead is idle during planning, implementation, and review - only wakes at gates
 - **Natural collaboration**: Reviewers discuss findings with the implementer directly, not through a coordinator
 - **Self-organizing**: Implementer drives pace, gets reviewer buy-in directly, asks questions as needed
-- **Graceful recovery**: Checkpoint files in `docs/dev-loop-outputs/` enable restart if session dies
+- **Graceful recovery**: Checkpoint files in `docs/devloop-outputs/` enable restart if session dies
 
 **Code review blocking behavior**:
 - Security, Test, Code Quality, Operations: ALL findings must be fixed
@@ -259,13 +259,13 @@ Putting it all together, here's how a feature gets implemented. The key insight:
 
 ---
 
-## Evolution of the Dev-Loop
+## Evolution of the Devloop
 
-The current Agent Teams dev-loop is the result of several iterations. Each version taught us something about working with AI agents.
+The current Agent Teams devloop is the result of several iterations. Each version taught us something about working with AI agents.
 
 ### Version 1: Autonomous Orchestrator (Jan 9, 2026)
 
-**Approach**: Claude acted as an autonomous orchestrator, running the entire dev-loop without human intervention between steps.
+**Approach**: Claude acted as an autonomous orchestrator, running the entire devloop without human intervention between steps.
 
 ```
 Human: "Implement feature X"
@@ -342,36 +342,36 @@ Claude (autonomously):
 
 ---
 
-### Version 3: Skill-Based Dev-Loop (Jan 21, 2026)
+### Version 3: Skill-Based Devloop (Jan 21, 2026)
 
-**Approach**: Each step became an executable skill. User invokes skills directly via `/dev-loop-*` commands. Skills are procedures, not docs to interpret.
+**Approach**: Each step became an executable skill. User invokes skills directly via `/devloop-*` commands. Skills are procedures, not docs to interpret.
 
 ```
-User: /dev-loop-init "implement feature X"
+User: /devloop-init "implement feature X"
     ↓
 Claude: Executes skill procedure (creates output dir, matches principles)
     ↓
-User: /dev-loop-implement
+User: /devloop-implement
     ↓
 Claude: Executes skill procedure (spawns specialist with context)
     ↓
-User: /dev-loop-validate
+User: /devloop-validate
     ↓
-... and so on through /dev-loop-review, /dev-loop-reflect, /dev-loop-complete
+... and so on through /devloop-review, /devloop-reflect, /devloop-complete
 ```
 
 **Available skills**:
 | Step | Skill | Purpose |
 |------|-------|---------|
-| 0 | `/dev-loop-init` | Initialize: create output dir, match principles, preview specialist prompt |
-| 0.5 | `/dev-loop-plan` | (Optional) Spawn specialist for exploration before implementation |
-| 1 | `/dev-loop-implement` | Spawn implementing specialist with injected context |
-| 2 | `/dev-loop-validate` | Run 7-layer verification |
-| 3 | `/dev-loop-review` | Spawn 4 code reviewers in parallel |
-| 4 | `/dev-loop-reflect` | Resume specialists for reflection |
-| 5 | `/dev-loop-complete` | Mark loop complete, summarize results |
+| 0 | `/devloop-init` | Initialize: create output dir, match principles, preview specialist prompt |
+| 0.5 | `/devloop-plan` | (Optional) Spawn specialist for exploration before implementation |
+| 1 | `/devloop-implement` | Spawn implementing specialist with injected context |
+| 2 | `/devloop-validate` | Run 7-layer verification |
+| 3 | `/devloop-review` | Spawn 4 code reviewers in parallel |
+| 4 | `/devloop-reflect` | Resume specialists for reflection |
+| 5 | `/devloop-complete` | Mark loop complete, summarize results |
 
-**Utilities**: `/dev-loop-status`, `/dev-loop-fix`, `/dev-loop-restore`
+**Utilities**: `/devloop-status`, `/devloop-fix`, `/devloop-restore`
 
 **What it solved**:
 - **No interpretation needed**: Skills define exact steps, not prose to parse
@@ -385,18 +385,18 @@ User: /dev-loop-validate
 - **Manual message passing**: The coordinator had to shuttle messages between specialists during review
 - **Sequential bottleneck**: Each step waited for the previous one; no parallel planning/review collaboration
 
-**Files at this version**: [.claude/skills/dev-loop/](.claude/skills/dev-loop/)
+**Files at this version**: [.claude/skills/devloop/](.claude/skills/devloop/)
 
 **Relevant ADR**: [ADR-0022: Skill-Based Development Loop](docs/decisions/adr-0022-skill-based-dev-loop.md)
 
 ---
 
-### Version 4: Agent Teams Dev-Loop (Feb 2026 - Current)
+### Version 4: Agent Teams Devloop (Feb 2026 - Current)
 
 **Approach**: Replaced subagent-based orchestration with Claude Code Agent Teams. Specialists are spawned as autonomous teammates that communicate directly with each other. The Lead only intervenes at gates.
 
 ```
-User: /dev-loop "implement feature X" --specialist=meeting-controller
+User: /devloop "implement feature X" --specialist=meeting-controller
     ↓
 Lead: Spawns 7 teammates (1 implementer + 6 reviewers)
 Lead: Records git state, goes idle
@@ -410,22 +410,22 @@ Teammates drive autonomously:
 - **Subagent invocations → Teammate spawning**: Specialists stay alive with full context throughout the entire loop instead of reporting back and being discarded
 - **One-way reporting → Peer-to-peer messaging**: Reviewers discuss findings directly with the implementer, and with each other
 - **Coordinator-driven → Teammate-driven**: Implementer drives pace, gets reviewer buy-in directly, asks questions as needed
-- **Multi-step skills → Single command**: One `/dev-loop` invocation handles the entire workflow
+- **Multi-step skills → Single command**: One `/devloop` invocation handles the entire workflow
 - **Lead context accumulation → Lead mostly idle**: Lead only wakes at 3 brief gate checks, avoiding the context rot that plagued earlier versions
 
 **Why this works**:
 - **Teammates preserve context**: Each specialist keeps their full history for the entire loop
 - **Natural collaboration**: Reviewers and implementer have real discussions, not coordinator-mediated exchanges
 - **Minimal Lead overhead**: ~4 brief gate checks vs continuous orchestration
-- **Graceful recovery**: Checkpoint files enable restart via `/dev-loop-restore` if session dies
+- **Graceful recovery**: Checkpoint files enable restart via `/devloop-restore` if session dies
 
-**Current files**: [.claude/skills/dev-loop/SKILL.md](.claude/skills/dev-loop/SKILL.md)
+**Current files**: [.claude/skills/devloop/SKILL.md](.claude/skills/devloop/SKILL.md)
 
-**Version 3 skills have been retired.** The Agent Teams workflow (`/dev-loop`) is the current and only implementation.
+**Version 3 skills have been retired.** The Agent Teams workflow (`/devloop`) is the current and only implementation.
 
 #### Containerized Execution (Preferred)
 
-For maximum autonomy, dev-loops run inside isolated **podman containers** where Claude Code operates with `--dangerously-skip-permissions` (all permission prompts disabled). The container boundary limits blast radius to the current task's clone.
+For maximum autonomy, devloops run inside isolated **podman containers** where Claude Code operates with `--dangerously-skip-permissions` (all permission prompts disabled). The container boundary limits blast radius to the current task's clone.
 
 ```
 Host (WSL2)                              Containers (podman)
@@ -441,7 +441,7 @@ Host (WSL2)                              Containers (podman)
 ```
 
 **Why containerize?**
-- `--dangerously-skip-permissions` enables fully autonomous Claude Code execution — no approval prompts interrupting the dev-loop
+- `--dangerously-skip-permissions` enables fully autonomous Claude Code execution — no approval prompts interrupting the devloop
 - Container isolation means Claude can only access the mounted clone, not SSH keys, GitHub credentials, or other projects
 - OAuth credentials are mounted read-only for Claude API access; no API keys needed
 - PR descriptions are written by Claude (which has the full task context) to a `.devloop-pr.json` file, then the host-side wrapper creates the actual PR using the host's GitHub credentials
@@ -452,7 +452,7 @@ Host (WSL2)                              Containers (podman)
 ./infra/devloop/devloop.sh td-42-rate-limiting
 
 # Inside container:
-claude> /dev-loop "implement rate limiting on GC endpoints"
+claude> /devloop "implement rate limiting on GC endpoints"
 # ... autonomous implementation, review, commit ...
 claude> /exit
 
@@ -526,14 +526,14 @@ The codebase handles authentication, JWT issuance, key rotation, rate limiting, 
 |-------|----------|
 | Project overview | [README.md](README.md) |
 | Full architecture | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) |
-| Dev-loop overview | [.claude/skills/dev-loop/SKILL.md](.claude/skills/dev-loop/SKILL.md) |
-| Containerized dev-loop | [infra/devloop/](infra/devloop/) and [ADR-0025](docs/decisions/adr-0025-containerized-devloop.md) |
+| Devloop overview | [.claude/skills/devloop/SKILL.md](.claude/skills/devloop/SKILL.md) |
+| Containerized devloop | [infra/devloop/](infra/devloop/) and [ADR-0025](docs/decisions/adr-0025-containerized-devloop.md) |
 | Debate workflow | [.claude/skills/debate/SKILL.md](.claude/skills/debate/SKILL.md) |
 | Specialist definitions | [.claude/agents/](.claude/agents/) |
 | Specialist knowledge | [docs/specialist-knowledge/](docs/specialist-knowledge/) |
 | Architecture decisions | [docs/decisions/](docs/decisions/) |
 | Debate records | [docs/debates/](docs/debates/) |
-| Dev-loop outputs | [docs/dev-loop-outputs/](docs/dev-loop-outputs/) |
+| Devloop outputs | [docs/devloop-outputs/](docs/devloop-outputs/) |
 | Current progress | [docs/PROJECT_STATUS.md](docs/PROJECT_STATUS.md) |
 
 ---

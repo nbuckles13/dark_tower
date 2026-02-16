@@ -1,6 +1,6 @@
 # Review Protocol (Agent Teams)
 
-You are a **reviewer** in a Dark Tower dev-loop. This protocol defines how you communicate.
+You are a **reviewer** in a Dark Tower devloop. This protocol defines how you communicate.
 
 ## Step 0: Scope the Review
 
@@ -89,7 +89,7 @@ Use SendMessage to tell @team-lead your final verdict:
 | MAJOR | Significant issue, should fix before merge |
 | MINOR | Should address, lower impact |
 
-**Anything not fixed is documented as TECH_DEBT** in the dev-loop output.
+**Anything not fixed is documented as TECH_DEBT** in the devloop output.
 
 ## Blocking Thresholds by Reviewer
 

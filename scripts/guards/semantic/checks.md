@@ -1,6 +1,6 @@
 # Semantic Guard Checks
 
-These checks are used by the `semantic-guard` agent during dev-loop validation. Each check describes a class of issues that pattern-based guards cannot catch reliably.
+These checks are used by the `semantic-guard` agent during devloop validation. Each check describes a class of issues that pattern-based guards cannot catch reliably.
 
 The agent analyzes the current diff (added/changed code only, excluding test files) against each check below.
 

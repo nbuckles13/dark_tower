@@ -337,11 +337,11 @@ dark_tower/
 | Document | Description | Status |
 |----------|-------------|--------|
 | [.claude/DEVELOPMENT_WORKFLOW.md](../.claude/DEVELOPMENT_WORKFLOW.md) | Specialist-led development rules | ✅ Current |
-| [.claude/skills/dev-loop/SKILL.md](../.claude/skills/dev-loop/SKILL.md) | **Dev-loop Agent Teams workflow** | ✅ Current |
+| [.claude/skills/devloop/SKILL.md](../.claude/skills/devloop/SKILL.md) | **Devloop Agent Teams workflow** | ✅ Current |
 | [.claude/skills/debate/SKILL.md](../.claude/skills/debate/SKILL.md) | **Multi-agent debate workflow** | ✅ Current |
 | [.claude/workflows/process-review-record.md](../.claude/workflows/process-review-record.md) | Process review workflow | ✅ Current |
 | [docs/process-reviews/](process-reviews/) | Process review records (PRRs) | ✅ Current |
-| [docs/dev-loop-outputs/](dev-loop-outputs/) | **Development loop output records** | ✅ Current |
+| [docs/devloop-outputs/](devloop-outputs/) | **Development loop output records** | ✅ Current |
 
 ### Specialist Knowledge
 | Location | Description | Status |
@@ -458,9 +458,9 @@ dark_tower/
 
 ## Recent Achievements (January 2026)
 
-- ✅ **Skill-Based Dev-Loop Migration** (ADR-0022)
+- ✅ **Skill-Based Devloop Migration** (ADR-0022)
   - Migrated from workflow docs to executable skills
-  - Further consolidated into single `/dev-loop` command with Agent Teams
+  - Further consolidated into single `/devloop` command with Agent Teams
   - Autonomous teammates drive planning → implementation → review → reflection
   - Lead only intervenes at gates
 - ✅ **SecretBox/SecretString Refactor**

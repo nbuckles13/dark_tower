@@ -10,7 +10,7 @@ This file captures how the DRY Reviewer integrates with other specialists and co
 **Related files**: `docs/decisions/adr-0019-dry-reviewer-blocking.md`
 
 **Integration Point**: Per ADR-0019, the DRY Reviewer has specific blocking behavior:
-- **BLOCKER severity**: Blocks dev-loop completion (e.g., shared code requiring extraction)
+- **BLOCKER severity**: Blocks devloop completion (e.g., shared code requiring extraction)
 - **TECH_DEBT severity**: Non-blocking, documented for future work
 
 ---

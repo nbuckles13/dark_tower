@@ -1,4 +1,4 @@
-# ADR-0021: Step-Runner Architecture for Dev-Loop Reliability
+# ADR-0021: Step-Runner Architecture for Devloop Reliability
 
 **Status**: Accepted
 
@@ -12,7 +12,7 @@
 
 The Development Loop (ADR-0016) establishes a workflow for implementing features: implementation → validation → code review → reflection. The orchestrator (Claude Code) was responsible for executing all steps directly, tracking state, invoking specialists, and following step-specific rules.
 
-**Problem observed**: Each dev-loop run surfaced different process errors:
+**Problem observed**: Each devloop run surfaced different process errors:
 - Not running workspace-wide tests (only package-specific)
 - Code review findings not acted upon (misinterpreting blocking rules)
 - Missing checkpoint files
