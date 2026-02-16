@@ -23,6 +23,10 @@
 //! | `mc_redis_latency_seconds` | Histogram | `operation` | Redis operation latency |
 //! | `mc_fenced_out_total` | Counter | `reason` | Split-brain fencing events |
 //! | `mc_recovery_duration_seconds` | Histogram | none | Session recovery time |
+//! | `mc_token_refresh_total` | Counter | `status` | Token refresh attempts |
+//! | `mc_token_refresh_duration_seconds` | Histogram | none | Token refresh latency |
+//! | `mc_token_refresh_failures_total` | Counter | `error_type` | Token refresh failures by type |
+//! | `mc_errors_total` | Counter | `operation`, `error_type`, `status_code` | Errors by category |
 
 pub mod health;
 pub mod metrics;
@@ -30,8 +34,8 @@ pub mod metrics;
 // Re-exports for convenience
 pub use health::{health_router, HealthState};
 pub use metrics::{
-    init_metrics_recorder, record_actor_panic, record_fenced_out, record_gc_heartbeat,
-    record_gc_heartbeat_latency, record_message_dropped, record_message_latency,
-    record_recovery_duration, record_redis_latency, set_actor_mailbox_depth,
-    set_connections_active, set_meetings_active,
+    init_metrics_recorder, record_actor_panic, record_error, record_fenced_out,
+    record_gc_heartbeat, record_gc_heartbeat_latency, record_message_dropped,
+    record_message_latency, record_recovery_duration, record_redis_latency, record_token_refresh,
+    set_actor_mailbox_depth, set_connections_active, set_meetings_active,
 };

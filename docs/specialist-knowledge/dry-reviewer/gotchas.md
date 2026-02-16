@@ -183,6 +183,23 @@ These differences cannot be further extracted without macros or losing tracing f
 
 ---
 
+## Same Label Name with Different Semantics Across Services
+
+**Added**: 2026-02-16
+**Related files**: `crates/mc-service/src/errors.rs` (`status_code()`), `crates/gc-service/src/errors.rs` (`IntoResponse`)
+
+**Gotcha**: The `status_code` label in `mc_errors_total` and `gc_errors_total` has different semantics:
+- **GC**: HTTP status codes (200, 400, 401, 403, 404, 429, 500, 503) — standard HTTP semantics
+- **MC**: Signaling error codes (2, 3, 4, 5, 6, 7) — WebTransport signaling protocol codes
+
+Both use `status_code` as the label name, but the values are incomparable. GC uses HTTP because it's an HTTP/3 gateway. MC uses signaling codes because it communicates via WebTransport, not HTTP.
+
+**This is NOT duplication or a DRY violation.** The label name alignment is a convention (both track "what kind of error code"), but the value domains are domain-appropriate. Do NOT flag this as needing unification.
+
+**When reviewing**: If a dashboard or alert query joins `status_code` across GC and MC metrics, flag it — the values are not comparable. Each service's dashboards should interpret `status_code` in the context of that service's protocol.
+
+---
+
 ## Config Struct vs Plain Parameters in Generic Extractions
 
 **Added**: 2026-02-12

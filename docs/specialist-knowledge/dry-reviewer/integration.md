@@ -204,10 +204,10 @@ ActorMetrics uses identical increment/decrement pattern in 4 methods (`meeting_c
 ---
 
 ### TD-21: Counter+Histogram Recording Pattern Inconsistency
-**Added**: 2026-02-10
-**Related files**: `crates/mc-service/src/observability/metrics.rs:154-174`, `crates/gc-service/src/observability/metrics.rs:43-63`, `crates/ac-service/src/observability/metrics.rs:30-35`
+**Added**: 2026-02-10 | **Updated**: 2026-02-16
+**Related files**: `crates/mc-service/src/observability/metrics.rs:154-174, 253-291`, `crates/gc-service/src/observability/metrics.rs:43-63`, `crates/ac-service/src/observability/metrics.rs:30-35`
 
-MC uses separate functions for counter and histogram recording (`record_gc_heartbeat()` + `record_gc_heartbeat_latency()`), while AC and GC combine them into single functions (`record_token_issuance()`, `record_http_request()` record both counter and histogram). Severity: Low (both approaches work correctly, stylistic inconsistency only). Improvement path: Consider unifying pattern across services when establishing shared metric patterns (if ever moved to common crate). Timeline: Phase 5+ (infrastructure cleanup). Note: MC pattern allows recording only counter OR only histogram if needed (flexibility), while AC/GC pattern reduces duplication at call sites (convenience). Both are valid per ADR-0011.
+MC uses separate functions for counter and histogram recording (`record_gc_heartbeat()` + `record_gc_heartbeat_latency()`), while AC and GC combine them into single functions (`record_token_issuance()`, `record_http_request()` record both counter and histogram). Severity: Low (both approaches work correctly, stylistic inconsistency only). Improvement path: Consider unifying pattern across services when establishing shared metric patterns (if ever moved to common crate). Timeline: Phase 5+ (infrastructure cleanup). Note: MC pattern allows recording only counter OR only histogram if needed (flexibility), while AC/GC pattern reduces duplication at call sites (convenience). Both are valid per ADR-0011. **Update 2026-02-16**: MC's new `record_token_refresh()` and `record_error()` follow the combined style (matching GC), partially resolving this inconsistency. MC now has both styles: old separate functions for heartbeats, new combined functions for token refresh/errors.
 
 ---
 

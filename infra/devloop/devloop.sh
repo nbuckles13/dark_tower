@@ -257,7 +257,7 @@ PR_META="${CLONE_DIR}/.devloop-pr.json"
 COMMITS=$(git -C "$CLONE_DIR" log --oneline "${BASE_BRANCH}..HEAD" 2>/dev/null || true)
 
 # Check if a PR already exists for this branch
-PR_URL=$(cd "$CLONE_DIR" && gh pr view --json url -q .url 2>/dev/null || true)
+PR_URL=$(cd "$CLONE_DIR" && gh pr list --head "$BRANCH_NAME" --state open --json url -q '.[0].url' 2>/dev/null || true)
 
 if [ -n "$PR_URL" ]; then
     echo "=== PR exists: ${PR_URL} ==="

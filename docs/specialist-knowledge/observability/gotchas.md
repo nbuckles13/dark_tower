@@ -71,6 +71,28 @@ The `metrics` crate's `histogram!` macro only records values -- it does NOT acce
 
 ---
 
+### MC `status_code` Label Uses Signaling Codes, Not HTTP Codes
+**Discovered**: 2026-02-16 (mc-token-metrics)
+**Related files**: `crates/mc-service/src/errors.rs`, `crates/mc-service/src/observability/metrics.rs`
+
+When mirroring metrics patterns from GC to MC, the `status_code` label in `mc_errors_total` uses WebTransport signaling error codes (2-7), NOT HTTP status codes (4xx/5xx). GC uses HTTP status codes because it's an HTTP/3 API gateway, but MC communicates via WebTransport signaling and maps errors to `ErrorCode` enum values: UNAUTHORIZED(2), FORBIDDEN(3), NOT_FOUND(4), CONFLICT(5), INTERNAL_ERROR(6), CAPACITY_EXCEEDED(7).
+
+**Impact**: Tests and dashboard queries for MC error metrics must use signaling code values. A test using `record_error("meeting_join", "capacity_exceeded", 429)` is wrong — the correct call is `record_error("meeting_join", "capacity_exceeded", 7)`. Similarly, Grafana panels filtering MC errors by status_code should use `status_code="6"` not `status_code="500"`.
+
+---
+
+### `mod.rs` Re-Exports Go Stale Silently When New Metric Functions Are Added
+**Discovered**: 2026-02-16 (mc-token-metrics)
+**Related files**: `crates/mc-service/src/observability/mod.rs`, `crates/gc-service/src/observability/mod.rs`
+
+Each service's `observability/mod.rs` re-exports all public metric functions via `pub use metrics::{...}`. When new functions are added to `metrics.rs` (e.g., `record_token_refresh`, `record_error`), the re-export list in `mod.rs` must be updated manually. If forgotten, the build does NOT fail because callers can use full module paths (e.g., `mc_service::observability::metrics::record_token_refresh`). However, this breaks the convention that all metric functions are available directly from `mc_service::observability::*`.
+
+**Why it's silent**: `main.rs` and other callers tend to use the full path to the `metrics` submodule rather than the re-exported shorthand, so missing re-exports cause no compilation error. The gap is only visible during code review or when someone tries to use the re-exported path.
+
+**Prevention**: When adding new public functions to any `observability/metrics.rs`, always check and update the corresponding `observability/mod.rs` re-export list and the module doc comment table.
+
+---
+
 ### Multi-Value Regex Fields Survive Partial Renames
 **Discovered**: 2026-02-16 (service rename: global-controller -> gc-service, meeting-controller -> mc-service)
 
