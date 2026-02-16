@@ -85,7 +85,7 @@ impl TestAuthServer {
         // Initialize metrics recorder for test server
         // Note: This may fail if already installed in the test process.
         // In that case, we create a new recorder without installing it globally.
-        let metrics_handle = match routes::init_metrics_recorder() {
+        let metrics_handle = match ac_service::observability::metrics::init_metrics_recorder() {
             Ok(handle) => handle,
             Err(_) => {
                 // If metrics recorder already installed globally, create a standalone recorder

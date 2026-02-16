@@ -16,7 +16,59 @@
 //! Maximum 1,000 unique label combinations per metric.
 
 use metrics::{counter, gauge, histogram};
+use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 use std::time::Duration;
+
+/// Initialize Prometheus metrics recorder and return the handle
+/// for serving metrics via HTTP.
+///
+/// ADR-0011: Must be called before any metrics are recorded.
+/// Configures histogram buckets aligned with SLO targets:
+/// - GC heartbeat p95 < 100ms
+/// - Message latency p99 < 100ms
+/// - Recovery duration p99 < 500ms
+/// - Redis latency p99 < 10ms
+///
+/// # Errors
+///
+/// Returns error if Prometheus recorder fails to install (e.g., already installed).
+pub fn init_metrics_recorder() -> Result<PrometheusHandle, String> {
+    PrometheusBuilder::new()
+        // GC heartbeat latency buckets - internal service call (p95 < 100ms)
+        .set_buckets_for_metric(
+            Matcher::Prefix("mc_gc_heartbeat".to_string()),
+            &[
+                0.001, 0.005, 0.010, 0.025, 0.050, 0.100, 0.250, 0.500, 1.000,
+            ],
+        )
+        .map_err(|e| format!("Failed to set GC heartbeat buckets: {e}"))?
+        // Message latency buckets - internal service call
+        .set_buckets_for_metric(
+            Matcher::Prefix("mc_message".to_string()),
+            &[
+                0.001, 0.005, 0.010, 0.025, 0.050, 0.100, 0.250, 0.500, 1.000,
+            ],
+        )
+        .map_err(|e| format!("Failed to set message latency buckets: {e}"))?
+        // Recovery duration buckets - longer operations, HTTP-style
+        .set_buckets_for_metric(
+            Matcher::Prefix("mc_recovery".to_string()),
+            &[
+                0.005, 0.010, 0.025, 0.050, 0.100, 0.250, 0.500, 1.000, 2.500, 5.000, 10.000,
+            ],
+        )
+        .map_err(|e| format!("Failed to set recovery duration buckets: {e}"))?
+        // Redis latency buckets - internal service call (like DB queries)
+        .set_buckets_for_metric(
+            Matcher::Prefix("mc_redis".to_string()),
+            &[
+                0.001, 0.005, 0.010, 0.025, 0.050, 0.100, 0.250, 0.500, 1.000,
+            ],
+        )
+        .map_err(|e| format!("Failed to set Redis latency buckets: {e}"))?
+        .install_recorder()
+        .map_err(|e| format!("Failed to install Prometheus metrics recorder: {e}"))
+}
 
 // ============================================================================
 // Connection & Meeting Metrics (Gauges)

@@ -13,7 +13,7 @@ use axum::{
     Router,
 };
 use common::token_manager::TokenReceiver;
-use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
+use metrics_exporter_prometheus::PrometheusHandle;
 use sqlx::PgPool;
 use std::sync::Arc;
 use std::time::Duration;
@@ -33,70 +33,6 @@ pub struct AppState {
 
     /// Token receiver for dynamically refreshed OAuth tokens from TokenManager.
     pub token_receiver: TokenReceiver,
-}
-
-/// Initialize Prometheus metrics recorder and return the handle
-/// for serving metrics via HTTP.
-///
-/// ADR-0011: Must be called before any metrics are recorded.
-/// Configures histogram buckets aligned with SLO targets:
-/// - HTTP request p95 < 200ms
-/// - MC assignment p95 < 20ms
-/// - DB queries p99 < 50ms
-///
-/// # Errors
-///
-/// Returns error if Prometheus recorder fails to install (e.g., already installed).
-pub fn init_metrics_recorder() -> Result<PrometheusHandle, String> {
-    use metrics_exporter_prometheus::Matcher;
-
-    PrometheusBuilder::new()
-        // HTTP request buckets aligned with 200ms p95 SLO target
-        .set_buckets_for_metric(
-            Matcher::Prefix("gc_http_request".to_string()),
-            &[
-                0.005, 0.010, 0.025, 0.050, 0.100, 0.150, 0.200, 0.300, 0.500, 1.000, 2.000,
-            ],
-        )
-        .map_err(|e| format!("Failed to set HTTP request buckets: {e}"))?
-        // MC assignment buckets aligned with 20ms p95 SLO target (ADR-0010)
-        .set_buckets_for_metric(
-            Matcher::Prefix("gc_mc_assignment".to_string()),
-            &[
-                0.005, 0.010, 0.015, 0.020, 0.030, 0.050, 0.100, 0.250, 0.500,
-            ],
-        )
-        .map_err(|e| format!("Failed to set MC assignment buckets: {e}"))?
-        // DB query buckets aligned with 50ms p99 SLO target
-        .set_buckets_for_metric(
-            Matcher::Prefix("gc_db_query".to_string()),
-            &[
-                0.001, 0.002, 0.005, 0.010, 0.020, 0.050, 0.100, 0.250, 0.500, 1.000,
-            ],
-        )
-        .map_err(|e| format!("Failed to set DB query buckets: {e}"))?
-        // gRPC MC call buckets
-        .set_buckets_for_metric(
-            Matcher::Prefix("gc_grpc_mc".to_string()),
-            &[
-                0.005, 0.010, 0.025, 0.050, 0.100, 0.200, 0.500, 1.000, 2.500,
-            ],
-        )
-        .map_err(|e| format!("Failed to set gRPC MC buckets: {e}"))?
-        // MH selection buckets
-        .set_buckets_for_metric(
-            Matcher::Prefix("gc_mh_selection".to_string()),
-            &[0.002, 0.005, 0.010, 0.020, 0.050, 0.100, 0.250],
-        )
-        .map_err(|e| format!("Failed to set MH selection buckets: {e}"))?
-        // Token refresh buckets
-        .set_buckets_for_metric(
-            Matcher::Prefix("gc_token_refresh".to_string()),
-            &[0.010, 0.050, 0.100, 0.250, 0.500, 1.000, 2.500, 5.000],
-        )
-        .map_err(|e| format!("Failed to set token refresh buckets: {e}"))?
-        .install_recorder()
-        .map_err(|e| format!("Failed to install Prometheus recorder: {e}"))
 }
 
 /// Build the application routes.

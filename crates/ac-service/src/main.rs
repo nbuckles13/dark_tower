@@ -36,7 +36,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Initialize Prometheus metrics recorder (ADR-0011)
     // Must be done before any metrics are recorded
-    let metrics_handle = routes::init_metrics_recorder().map_err(|e| {
+    let metrics_handle = observability::metrics::init_metrics_recorder().map_err(|e| {
         error!("Failed to initialize metrics recorder: {}", e);
         e
     })?;

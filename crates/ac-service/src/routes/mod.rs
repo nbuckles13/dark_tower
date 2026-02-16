@@ -11,54 +11,11 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
+use metrics_exporter_prometheus::PrometheusHandle;
 use serde::Serialize;
 use std::sync::Arc;
 use std::time::Duration;
 use tower_http::{timeout::TimeoutLayer, trace::TraceLayer};
-
-/// Initialize Prometheus metrics recorder and return the handle
-/// for serving metrics via HTTP.
-///
-/// ADR-0011: Must be called before any metrics are recorded.
-/// Configures histogram buckets aligned with SLO targets:
-/// - Token issuance p99 < 350ms
-/// - DB queries p99 < 50ms
-///
-/// # Errors
-///
-/// Returns error if Prometheus recorder fails to install (e.g., already installed).
-pub fn init_metrics_recorder() -> Result<PrometheusHandle, String> {
-    use metrics_exporter_prometheus::Matcher;
-
-    PrometheusBuilder::new()
-        // Token issuance buckets aligned with 350ms SLO target
-        .set_buckets_for_metric(
-            Matcher::Prefix("ac_token_issuance".to_string()),
-            &[
-                0.010, 0.025, 0.050, 0.100, 0.150, 0.200, 0.250, 0.300, 0.350, 0.500, 1.000, 2.000,
-            ],
-        )
-        .map_err(|e| format!("Failed to set token issuance buckets: {}", e))?
-        // DB query buckets aligned with 50ms SLO target
-        .set_buckets_for_metric(
-            Matcher::Prefix("ac_db_query".to_string()),
-            &[
-                0.001, 0.002, 0.005, 0.010, 0.020, 0.050, 0.100, 0.250, 0.500, 1.000,
-            ],
-        )
-        .map_err(|e| format!("Failed to set DB query buckets: {}", e))?
-        // Bcrypt buckets - coarse (50ms minimum) to prevent timing side-channel attacks
-        .set_buckets_for_metric(
-            Matcher::Prefix("ac_bcrypt".to_string()),
-            &[
-                0.050, 0.100, 0.150, 0.200, 0.250, 0.300, 0.400, 0.500, 1.000,
-            ],
-        )
-        .map_err(|e| format!("Failed to set bcrypt buckets: {}", e))?
-        .install_recorder()
-        .map_err(|e| format!("Failed to install Prometheus recorder: {}", e))
-}
 
 pub fn build_routes(
     state: Arc<auth_handler::AppState>,
@@ -320,7 +277,7 @@ mod tests {
         //
         // This test verifies the function doesn't panic, regardless of
         // whether it succeeds or fails due to already-installed recorder.
-        let result = init_metrics_recorder();
+        let result = crate::observability::metrics::init_metrics_recorder();
 
         // Either succeeds (first call in process) or fails gracefully
         match result {
@@ -346,7 +303,7 @@ mod tests {
     #[tokio::test]
     async fn test_metrics_endpoint() {
         // Initialize metrics recorder (may fail if already installed in process)
-        let handle = match init_metrics_recorder() {
+        let handle = match crate::observability::metrics::init_metrics_recorder() {
             Ok(h) => h,
             Err(_) => {
                 // If recorder already installed, we can't test this in isolation.
