@@ -333,6 +333,18 @@ pub fn extract_kid(token: &str) -> Result<String, JwtValidationError> {
 /// ```
 pub fn validate_iat(iat: i64, clock_skew: Duration) -> Result<(), JwtValidationError> {
     let now = chrono::Utc::now().timestamp();
+    validate_iat_at(iat, clock_skew, now)
+}
+
+/// Deterministic `iat` validation against an explicit `now` timestamp.
+///
+/// Prefer [`validate_iat`] in production code. This variant exists so that
+/// boundary conditions can be unit-tested without wall-clock dependence.
+pub(crate) fn validate_iat_at(
+    iat: i64,
+    clock_skew: Duration,
+    now: i64,
+) -> Result<(), JwtValidationError> {
     // Safe cast: clock_skew is bounded to MAX_CLOCK_SKEW (600 seconds), well within i64 range
     #[allow(clippy::cast_possible_wrap)]
     let clock_skew_secs = clock_skew.as_secs() as i64;
@@ -596,6 +608,35 @@ mod tests {
         let far_future = chrono::Utc::now().timestamp() + 86400; // 1 day in future
         let result = validate_iat(far_future, DEFAULT_CLOCK_SKEW);
         assert!(matches!(result, Err(JwtValidationError::IatTooFarInFuture)));
+    }
+
+    #[test]
+    fn test_validate_iat_at_minimum_skew_boundary() {
+        let now = 1_700_000_000_i64;
+        let one_sec = Duration::from_secs(1);
+
+        // iat exactly at boundary (now + skew) — accepted
+        assert!(validate_iat_at(now + 1, one_sec, now).is_ok());
+
+        // iat one second beyond boundary — rejected
+        assert!(matches!(
+            validate_iat_at(now + 2, one_sec, now),
+            Err(JwtValidationError::IatTooFarInFuture)
+        ));
+    }
+
+    #[test]
+    fn test_validate_iat_at_boundary_exact() {
+        let now = 1_700_000_000_i64;
+
+        // iat == now + skew is the last accepted value
+        assert!(validate_iat_at(now + 300, DEFAULT_CLOCK_SKEW, now).is_ok());
+
+        // iat == now + skew + 1 is the first rejected value
+        assert!(matches!(
+            validate_iat_at(now + 301, DEFAULT_CLOCK_SKEW, now),
+            Err(JwtValidationError::IatTooFarInFuture)
+        ));
     }
 
     // -------------------------------------------------------------------------

@@ -168,55 +168,48 @@ async fn test_default_clock_skew_behavior_unchanged(pool: PgPool) -> Result<(), 
     Ok(())
 }
 
-/// P1-4: Test minimum clock skew (1 second) edge case
+/// P1-4: Test minimum clock skew (1 second) via the full verify_jwt pipeline
 ///
-/// Verifies the system behaves correctly with the minimum valid clock skew of 1 second.
+/// Boundary arithmetic is tested deterministically in common::jwt::tests
+/// (via `validate_iat_at`). This integration test only confirms that verify_jwt
+/// correctly threads a 1-second clock skew through the pipeline.
 #[sqlx::test(migrations = "../../migrations")]
 async fn test_minimum_clock_skew_edge_case(pool: PgPool) -> Result<(), anyhow::Error> {
-    // Arrange: Initialize signing key
     let master_key = crypto::generate_random_bytes(32)?;
     key_management_service::initialize_signing_key(&pool, &master_key, "test").await?;
-
     let (signing_key, private_key) = get_signing_key_and_private(&pool, &master_key).await?;
 
     let now = Utc::now().timestamp();
+    let min_clock_skew = Duration::from_secs(1);
 
-    // Create token with iat exactly at the 1 second boundary
-    let claims_at_boundary = crypto::Claims {
-        sub: "min-skew-boundary-client".to_string(),
+    // Token at current time — well within any positive skew, no timing risk
+    let claims_within = crypto::Claims {
+        sub: "min-skew-within-client".to_string(),
         exp: now + 3600,
-        iat: now + 1, // Exactly at 1 second boundary
+        iat: now, // current time
         scope: "test:scope".to_string(),
         service_type: Some("global-controller".to_string()),
     };
-
-    let token_at_boundary =
-        crypto::sign_jwt(&claims_at_boundary, &private_key, &signing_key.key_id)?;
-
-    // Act & Assert: Token at boundary should be accepted
-    let min_clock_skew = Duration::from_secs(1);
-    let result = crypto::verify_jwt(&token_at_boundary, &signing_key.public_key, min_clock_skew);
+    let token_within = crypto::sign_jwt(&claims_within, &private_key, &signing_key.key_id)?;
+    let result = crypto::verify_jwt(&token_within, &signing_key.public_key, min_clock_skew);
     assert!(
         result.is_ok(),
-        "Token with iat at exact 1 second boundary should be accepted"
+        "Token with iat at current time should be accepted with 1s clock skew"
     );
 
-    // Create token with iat 2 seconds in the future (beyond 1 second skew)
+    // Token 60 seconds in the future — clearly beyond 1s skew, no timing risk
     let claims_beyond = crypto::Claims {
         sub: "min-skew-beyond-client".to_string(),
         exp: now + 3600,
-        iat: now + 2, // 1 second beyond the boundary
+        iat: now + 60,
         scope: "test:scope".to_string(),
         service_type: Some("global-controller".to_string()),
     };
-
     let token_beyond = crypto::sign_jwt(&claims_beyond, &private_key, &signing_key.key_id)?;
-
-    // Act & Assert: Token beyond boundary should be rejected
     let result = crypto::verify_jwt(&token_beyond, &signing_key.public_key, min_clock_skew);
     assert!(
         result.is_err(),
-        "Token with iat 2 seconds in future should be rejected with 1s clock skew"
+        "Token with iat 60 seconds in future should be rejected with 1s clock skew"
     );
 
     Ok(())
