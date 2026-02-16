@@ -11,6 +11,7 @@
 //! - Error messages are generic to prevent information leakage
 
 use crate::errors::GcError;
+use crate::observability::metrics;
 use crate::services::mh_selection::MhAssignmentInfo;
 use common::secret::ExposeSecret;
 use common::token_manager::TokenReceiver;
@@ -20,7 +21,7 @@ use proto_gen::internal::{
 };
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tonic::transport::{Channel, Endpoint};
 use tonic::Request;
@@ -148,7 +149,18 @@ impl McClient {
         mh_assignments: &[MhAssignmentInfo],
         gc_id: &str,
     ) -> Result<McAssignmentResult, GcError> {
-        let channel = self.get_channel(mc_endpoint).await?;
+        // Start timing before get_channel so connection failures are included in metrics
+        let rpc_start = Instant::now();
+
+        let channel = match self.get_channel(mc_endpoint).await {
+            Ok(ch) => ch,
+            Err(e) => {
+                let duration = rpc_start.elapsed();
+                metrics::record_grpc_mc_call("assign_meeting_with_mh", "error", duration);
+                metrics::record_error("mc_grpc", "connection_failed", 503);
+                return Err(e);
+            }
+        };
 
         // Build the request
         let proto_assignments: Vec<MhAssignment> = mh_assignments
@@ -185,17 +197,20 @@ impl McClient {
 
         // Make the RPC call
         let mut client = MeetingControllerServiceClient::new(channel);
-        let response = client
-            .assign_meeting_with_mh(grpc_request)
-            .await
-            .map_err(|e| {
-                warn!(target: "gc.services.mc_client", error = %e, mc_endpoint = %mc_endpoint, "MC RPC failed");
-                GcError::ServiceUnavailable("Meeting controller unavailable".to_string())
-            })?;
+        let response = client.assign_meeting_with_mh(grpc_request).await;
+        let rpc_duration = rpc_start.elapsed();
+
+        let response = response.map_err(|e| {
+            metrics::record_grpc_mc_call("assign_meeting_with_mh", "error", rpc_duration);
+            metrics::record_error("mc_grpc", "service_unavailable", 503);
+            warn!(target: "gc.services.mc_client", error = %e, mc_endpoint = %mc_endpoint, "MC RPC failed");
+            GcError::ServiceUnavailable("Meeting controller unavailable".to_string())
+        })?;
 
         let inner: AssignMeetingWithMhResponse = response.into_inner();
 
         if inner.accepted {
+            metrics::record_grpc_mc_call("assign_meeting_with_mh", "success", rpc_duration);
             tracing::info!(
                 target: "gc.services.mc_client",
                 meeting_id = %meeting_id,
@@ -205,6 +220,7 @@ impl McClient {
             Ok(McAssignmentResult::Accepted)
         } else {
             let reason = McRejectionReason::from(inner.rejection_reason);
+            metrics::record_grpc_mc_call("assign_meeting_with_mh", "rejected", rpc_duration);
             tracing::warn!(
                 target: "gc.services.mc_client",
                 meeting_id = %meeting_id,

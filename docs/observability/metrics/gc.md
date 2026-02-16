@@ -143,13 +143,45 @@ All GC service metrics follow ADR-0011 naming conventions with the `gc_` prefix.
 - **Type**: Counter
 - **Description**: Token refresh failures by error type
 - **Labels**:
-  - `error_type`: Type of failure (http_error, auth_rejected, invalid_response, timeout)
-- **Cardinality**: Low (~4 error types)
+  - `error_type`: Type of failure (http, auth_rejected, invalid_response, acquisition_failed, configuration, channel_closed)
+- **Cardinality**: Low (6 error types)
 - **Alert**: High rate indicates AC connectivity issues
 - **Usage**: Diagnose token refresh failures
 - **Example**:
   ```promql
   sum(rate(gc_token_refresh_failures_total[5m])) by (error_type)
+  ```
+
+---
+
+## AC Client Metrics
+
+### `gc_ac_requests_total`
+- **Type**: Counter
+- **Description**: Total requests to Auth Controller internal endpoints
+- **Labels**:
+  - `operation`: Token operation (meeting_token, guest_token)
+  - `status`: Request outcome (success, error)
+- **Cardinality**: Low (4 combinations)
+- **Usage**: Track AC request rate and errors by operation
+- **Example**:
+  ```promql
+  rate(gc_ac_requests_total{status="error"}[5m])
+  ```
+
+### `gc_ac_request_duration_seconds`
+- **Type**: Histogram
+- **Description**: AC client request duration
+- **Labels**:
+  - `operation`: Token operation (meeting_token, guest_token)
+- **Buckets**: Default histogram buckets
+- **Cardinality**: Low (2 operations)
+- **Usage**: Monitor AC request latency, detect degraded AC performance
+- **Example**:
+  ```promql
+  histogram_quantile(0.95,
+    sum(rate(gc_ac_request_duration_seconds_bucket[5m])) by (le, operation)
+  )
   ```
 
 ---
@@ -225,8 +257,8 @@ All GC service metrics follow ADR-0011 naming conventions with the `gc_` prefix.
 - **Type**: Counter
 - **Description**: Total errors by operation and type
 - **Labels**:
-  - `operation`: Operation that failed (join_meeting, guest_token, update_settings, mc_assignment)
-  - `error_type`: Error classification (not_found, forbidden, unauthorized, rate_limit, service_unavailable, internal)
+  - `operation`: Operation that failed (join_meeting, guest_token, update_settings, mc_assignment, ac_meeting_token, ac_guest_token, mc_grpc)
+  - `error_type`: Error classification (not_found, forbidden, unauthorized, rate_limit, service_unavailable, internal, bad_request, database, invalid_token, conflict)
   - `status_code`: HTTP status code
 - **Cardinality**: Medium (~80 combinations, bounded by operations and error types)
 - **Usage**: Track error rates by type, identify patterns in failures
@@ -310,9 +342,9 @@ All GC service metrics follow strict cardinality bounds per ADR-0011:
 | `endpoint` | ~10 | /health, /metrics, /api/v1/me, /api/v1/meetings/{code}, etc. |
 | `status` | 3 | success, error, timeout |
 | `status_code` | ~15 | 200, 201, 400, 401, 403, 404, 429, 500, 503, etc. |
-| `operation` | ~15 | select_mc, atomic_assign, update_heartbeat, etc. |
+| `operation` | ~18 | select_mc, atomic_assign, update_heartbeat, ac_meeting_token, ac_guest_token, mc_grpc, etc. |
 | `rejection_reason` | 5 | at_capacity, draining, unhealthy, rpc_failed, none |
-| `error_type` | ~6 | not_found, forbidden, unauthorized, rate_limit, etc. |
+| `error_type` | ~10 | not_found, forbidden, unauthorized, rate_limit, service_unavailable, internal, etc. |
 
 **Total Estimated Cardinality**: ~400 time series (well within Prometheus limits)
 

@@ -48,7 +48,8 @@
 
 use crate::secret::{ExposeSecret, SecretString};
 use serde::Deserialize;
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -119,6 +120,50 @@ pub enum TokenError {
 }
 
 // =============================================================================
+// Refresh Callback Types
+// =============================================================================
+
+/// Event emitted after each token refresh attempt.
+///
+/// Contains only non-sensitive metadata about the refresh operation.
+/// No tokens, secrets, or credentials are included.
+#[derive(Debug, Clone)]
+pub struct TokenRefreshEvent {
+    /// Whether the refresh was successful.
+    pub success: bool,
+
+    /// Duration of the refresh operation (`acquire_token` call only, excludes backoff).
+    pub duration: Duration,
+
+    /// Error category for failed refreshes (bounded static string, not raw error message).
+    ///
+    /// Values: `"http"`, `"auth_rejected"`, `"invalid_response"`,
+    /// `"acquisition_failed"`, `"configuration"`, `"channel_closed"`.
+    pub error_category: Option<&'static str>,
+}
+
+/// Callback type for observing token refresh events.
+///
+/// Services can inject a callback to record metrics, emit events, etc.
+/// without the `common` crate needing to depend on any metrics library.
+pub type TokenRefreshCallback = Arc<dyn Fn(TokenRefreshEvent) + Send + Sync>;
+
+/// Map a `TokenError` to a bounded error category string.
+///
+/// Returns a `&'static str` to ensure label cardinality is bounded.
+/// Never returns raw error messages.
+fn error_category(err: &TokenError) -> &'static str {
+    match err {
+        TokenError::HttpError(_) => "http",
+        TokenError::AuthenticationRejected(_) => "auth_rejected",
+        TokenError::InvalidResponse(_) => "invalid_response",
+        TokenError::AcquisitionFailed(_) => "acquisition_failed",
+        TokenError::Configuration(_) => "configuration",
+        TokenError::ChannelClosed => "channel_closed",
+    }
+}
+
+// =============================================================================
 // Configuration
 // =============================================================================
 
@@ -139,6 +184,12 @@ pub struct TokenManagerConfig {
 
     /// HTTP request timeout.
     pub http_timeout: Duration,
+
+    /// Optional callback invoked after each token refresh attempt.
+    ///
+    /// Enables services to record metrics without the `common` crate
+    /// depending on any metrics library.
+    pub on_refresh: Option<TokenRefreshCallback>,
 }
 
 impl std::fmt::Debug for TokenManagerConfig {
@@ -149,6 +200,10 @@ impl std::fmt::Debug for TokenManagerConfig {
             .field("client_secret", &"[REDACTED]")
             .field("refresh_threshold", &self.refresh_threshold)
             .field("http_timeout", &self.http_timeout)
+            .field(
+                "on_refresh",
+                &self.on_refresh.as_ref().map(|_| "<callback>"),
+            )
             .finish()
     }
 }
@@ -174,6 +229,7 @@ impl TokenManagerConfig {
             client_secret,
             refresh_threshold: DEFAULT_REFRESH_THRESHOLD,
             http_timeout: DEFAULT_HTTP_TIMEOUT,
+            on_refresh: None,
         }
     }
 
@@ -259,6 +315,21 @@ impl TokenManagerConfig {
     #[must_use]
     pub fn with_http_timeout(mut self, timeout: Duration) -> Self {
         self.http_timeout = timeout;
+        self
+    }
+
+    /// Set a callback to be invoked after each token refresh attempt.
+    ///
+    /// The callback receives a [`TokenRefreshEvent`] with non-sensitive metadata
+    /// about the refresh operation (success/failure, duration, error category).
+    ///
+    /// # Panics
+    ///
+    /// The callback must not panic. A panic inside the callback will
+    /// abort the token refresh loop, causing token expiration.
+    #[must_use]
+    pub fn with_on_refresh(mut self, callback: TokenRefreshCallback) -> Self {
+        self.on_refresh = Some(callback);
         self
     }
 }
@@ -464,8 +535,22 @@ async fn token_refresh_loop(
         };
 
         if needs_refresh {
-            match acquire_token(&config, &http_client).await {
+            // Time the acquire_token call only (excludes backoff sleep)
+            let refresh_start = Instant::now();
+            let result = acquire_token(&config, &http_client).await;
+            let refresh_duration = refresh_start.elapsed();
+
+            match result {
                 Ok((token, new_expires_at)) => {
+                    // Invoke callback for successful refresh
+                    if let Some(ref callback) = config.on_refresh {
+                        callback(TokenRefreshEvent {
+                            success: true,
+                            duration: refresh_duration,
+                            error_category: None,
+                        });
+                    }
+
                     // Update expiration tracking
                     expires_at = Some(new_expires_at);
 
@@ -499,6 +584,15 @@ async fn token_refresh_loop(
                     backoff = INITIAL_BACKOFF_MS;
                 }
                 Err(e) => {
+                    // Invoke callback for failed refresh
+                    if let Some(ref callback) = config.on_refresh {
+                        callback(TokenRefreshEvent {
+                            success: false,
+                            duration: refresh_duration,
+                            error_category: Some(error_category(&e)),
+                        });
+                    }
+
                     warn!(
                         target: "common.token_manager",
                         client_id = %config.client_id,
@@ -1515,5 +1609,210 @@ mod tests {
             .expect_err("Empty token should be rejected");
 
         assert!(matches!(err, TokenError::AcquisitionFailed(_)));
+    }
+
+    // =========================================================================
+    // Callback Mechanism Tests
+    // =========================================================================
+
+    #[test]
+    fn test_error_category_mapping() {
+        assert_eq!(
+            error_category(&TokenError::HttpError("test".to_string())),
+            "http"
+        );
+        assert_eq!(
+            error_category(&TokenError::AuthenticationRejected("test".to_string())),
+            "auth_rejected"
+        );
+        assert_eq!(
+            error_category(&TokenError::InvalidResponse("test".to_string())),
+            "invalid_response"
+        );
+        assert_eq!(
+            error_category(&TokenError::AcquisitionFailed("test".to_string())),
+            "acquisition_failed"
+        );
+        assert_eq!(
+            error_category(&TokenError::Configuration("test".to_string())),
+            "configuration"
+        );
+        assert_eq!(error_category(&TokenError::ChannelClosed), "channel_closed");
+    }
+
+    #[tokio::test]
+    async fn test_callback_invoked_on_success() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/v1/auth/service/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "callback-test-token",
+                "token_type": "Bearer",
+                "expires_in": 3600
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let events: Arc<std::sync::Mutex<Vec<TokenRefreshEvent>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let events_clone = events.clone();
+
+        let config = test_config(&mock_server.uri()).with_on_refresh(Arc::new(move |event| {
+            events_clone.lock().unwrap().push(event);
+        }));
+
+        let (handle, receiver) = spawn_token_manager(config).await.unwrap();
+
+        // Token should be available
+        assert_eq!(receiver.token().expose_secret(), "callback-test-token");
+
+        // Callback should have been invoked at least once with success
+        let captured = events.lock().unwrap();
+        assert!(!captured.is_empty(), "Callback should have been invoked");
+
+        let success_event = captured
+            .iter()
+            .find(|e| e.success)
+            .expect("Expected a success event");
+        assert!(success_event.duration > Duration::ZERO);
+        assert!(success_event.error_category.is_none());
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_callback_invoked_on_failure_then_success() {
+        let mock_server = MockServer::start().await;
+
+        // First 2 requests fail with 500, then succeed
+        Mock::given(method("POST"))
+            .and(path("/api/v1/auth/service/token"))
+            .respond_with(ResponseTemplate::new(500))
+            .up_to_n_times(2)
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/v1/auth/service/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "recovered-token",
+                "token_type": "Bearer",
+                "expires_in": 3600
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let events: Arc<std::sync::Mutex<Vec<TokenRefreshEvent>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let events_clone = events.clone();
+
+        let config = test_config(&mock_server.uri()).with_on_refresh(Arc::new(move |event| {
+            events_clone.lock().unwrap().push(event);
+        }));
+
+        let (handle, receiver) = spawn_token_manager(config).await.unwrap();
+
+        assert_eq!(receiver.token().expose_secret(), "recovered-token");
+
+        let captured = events.lock().unwrap();
+
+        // Should have failure events (from 500s) and at least one success
+        let failures: Vec<_> = captured.iter().filter(|e| !e.success).collect();
+        let successes: Vec<_> = captured.iter().filter(|e| e.success).collect();
+
+        assert!(
+            !failures.is_empty(),
+            "Should have at least one failure event"
+        );
+        assert!(
+            !successes.is_empty(),
+            "Should have at least one success event"
+        );
+
+        // Verify failure events have correct error category
+        for failure in &failures {
+            assert_eq!(
+                failure.error_category,
+                Some("http"),
+                "500 errors should map to 'http' category"
+            );
+            assert!(failure.duration > Duration::ZERO);
+        }
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_no_callback_still_works() {
+        // Verify existing behavior is unchanged when on_refresh is None
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/v1/auth/service/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "no-callback-token",
+                "token_type": "Bearer",
+                "expires_in": 3600
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // Config without on_refresh (default None)
+        let config = test_config(&mock_server.uri());
+        assert!(config.on_refresh.is_none());
+
+        let (handle, receiver) = spawn_token_manager(config).await.unwrap();
+        assert_eq!(receiver.token().expose_secret(), "no-callback-token");
+
+        handle.abort();
+    }
+
+    #[test]
+    fn test_config_debug_includes_callback_info() {
+        let config_without = TokenManagerConfig::new(
+            "http://localhost:8082".to_string(),
+            "client".to_string(),
+            SecretString::from("secret"),
+        );
+        let debug_str = format!("{:?}", config_without);
+        assert!(debug_str.contains("on_refresh: None"));
+
+        let config_with = config_without.with_on_refresh(Arc::new(|_| {}));
+        let debug_str = format!("{:?}", config_with);
+        assert!(debug_str.contains("<callback>"));
+    }
+
+    #[test]
+    fn test_with_on_refresh_builder() {
+        let config = TokenManagerConfig::new(
+            "http://localhost:8082".to_string(),
+            "client".to_string(),
+            SecretString::from("secret"),
+        )
+        .with_on_refresh(Arc::new(|_| {}));
+
+        assert!(config.on_refresh.is_some());
+    }
+
+    #[test]
+    fn test_token_refresh_event_debug() {
+        let event = TokenRefreshEvent {
+            success: true,
+            duration: Duration::from_millis(42),
+            error_category: None,
+        };
+        let debug_str = format!("{:?}", event);
+        assert!(debug_str.contains("success: true"));
+        assert!(debug_str.contains("error_category: None"));
+
+        let error_event = TokenRefreshEvent {
+            success: false,
+            duration: Duration::from_millis(100),
+            error_category: Some("http"),
+        };
+        let debug_str = format!("{:?}", error_event);
+        assert!(debug_str.contains("success: false"));
+        assert!(debug_str.contains("http"));
     }
 }

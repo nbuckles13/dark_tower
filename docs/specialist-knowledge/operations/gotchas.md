@@ -12,9 +12,13 @@ The tracing crate's `info!`/`warn!`/`error!` macros place the `target:` value in
 
 The GC default `EnvFilter` is `"global_controller=debug,tower_http=debug"`, which filters by target prefix. Custom targets like `gc.task.health_checker` do NOT match `global_controller` — they are silently invisible. Before raising log target drift as an issue during refactoring, verify whether the existing targets were actually reachable under the configured filter. In this case, switching to the default module-path target (`global_controller::tasks::*`) was a net improvement because it made the logs visible.
 
+## Cross-cutting vs per-subsystem metric operation labels use different naming (gc-token-metrics, 2026-02-15)
+
+`gc_errors_total` is a cross-cutting error counter shared across all GC subsystems. Its `operation` label uses subsystem prefixes for global uniqueness: `"ac_meeting_token"`, `"ac_guest_token"`, `"mc_grpc"`. But per-subsystem metrics like `gc_ac_requests_total` use unprefixed operations: `"meeting_token"`, `"guest_token"`. During incident response, if you're correlating `gc_errors_total{operation="meeting_token"}` you'll get zero results — the correct query is `gc_errors_total{operation="ac_meeting_token"}`. This convention is documented in the `record_error()` doc comment in `metrics.rs` but is easy to forget under pressure.
+
 ## NetworkPolicy cross-references span more services than you expect (service-rename, 2026-02-16)
 
-When renaming a service's `app:` label, the obvious NetworkPolicy updates are the service's own policy and its direct peers (GC↔MC). But third-party services also have ingress rules referencing the renamed service. In this project, `infra/services/redis/network-policy.yaml` allows ingress only from `app: meeting-controller` — missing this during the MC rename would have silently broken Redis connectivity for MC pods. Checklist for service renames: grep ALL NetworkPolicy files for the old `app:` label, not just the renamed service's own directory. The zero-trust architecture means every allowed connection is an explicit rule that must be updated.
+When renaming a service's `app:` label, the obvious NetworkPolicy updates are the service's own policy and its direct peers (GC↔MC). But third-party services also have ingress rules referencing the renamed service. In this project, `infra/services/redis/network-policy.yaml` allows ingress only from `app: mc-service` — missing this during the MC rename would have silently broken Redis connectivity for MC pods. Checklist for service renames: grep ALL NetworkPolicy files for the old `app:` label, not just the renamed service's own directory. The zero-trust architecture means every allowed connection is an explicit rule that must be updated.
 
 ## Grafana dashboard Loki queries use app label selectors that mirror K8s labels (service-rename, 2026-02-16)
 

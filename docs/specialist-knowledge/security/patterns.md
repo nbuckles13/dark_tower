@@ -422,3 +422,21 @@ When reviewing refactorings that extract generic/shared abstractions from concre
 - [ ] Test coverage preserved (same tests, testing through wrappers)
 
 ---
+
+## Pattern: Bounded Error Labels via `&'static str` Match Arms
+**Added**: 2026-02-15
+**Related files**: `crates/global-controller/src/errors.rs`, `crates/common/src/token_manager.rs`
+
+When wiring error types into Prometheus metrics, the error variant must be mapped to a bounded `&'static str` label — never the error's `Display`/`to_string()` output, which can contain dynamic content (URLs, status codes, response fragments).
+
+Two implementations of this pattern now exist in the codebase:
+
+1. **`GcError::error_type_label()`** (`errors.rs`): Maps each `GcError` enum variant to a static string like `"database"`, `"forbidden"`, `"service_unavailable"`. Used by `record_error()` in AC client and MC client metric callsites.
+
+2. **`error_category()`** (`token_manager.rs`): Maps each `TokenError` variant to a static string like `"http"`, `"auth_rejected"`. Used by `TokenRefreshEvent` callback.
+
+**Security review rule**: When a new variant is added to `GcError` or `TokenError`, the corresponding `&'static str` match arm MUST be added. A missing arm is a compile error (exhaustive match), but the label value chosen must also be reviewed for information leakage — it should be a generic category name, not a value derived from user input or error content.
+
+**Anti-pattern**: `record_error("operation", &err.to_string(), status)` — this passes the full error message as a Prometheus label, causing both cardinality explosion and potential information leakage.
+
+---

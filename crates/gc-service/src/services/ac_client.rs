@@ -11,11 +11,12 @@
 //! - Errors are logged server-side with generic messages returned
 
 use crate::errors::GcError;
+use crate::observability::metrics;
 use common::secret::ExposeSecret;
 use common::token_manager::TokenReceiver;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{error, instrument, warn};
 use uuid::Uuid;
 
@@ -164,6 +165,7 @@ impl AcClient {
         &self,
         request: &MeetingTokenRequest,
     ) -> Result<TokenResponse, GcError> {
+        let start = Instant::now();
         let url = format!("{}/api/v1/auth/internal/meeting-token", self.base_url);
 
         let response = self
@@ -178,11 +180,21 @@ impl AcClient {
             .send()
             .await
             .map_err(|e| {
+                metrics::record_ac_request("meeting_token", "error", start.elapsed());
+                metrics::record_error("ac_meeting_token", "service_unavailable", 503);
                 warn!(target: "gc.services.ac_client", error = %e, "AC request failed");
                 GcError::ServiceUnavailable("Auth Controller is unavailable".to_string())
             })?;
 
-        self.handle_response(response).await
+        let result = self.handle_response(response).await;
+        match &result {
+            Ok(_) => metrics::record_ac_request("meeting_token", "success", start.elapsed()),
+            Err(e) => {
+                metrics::record_ac_request("meeting_token", "error", start.elapsed());
+                metrics::record_error("ac_meeting_token", e.error_type_label(), e.status_code());
+            }
+        }
+        result
     }
 
     /// Request a guest token from AC for an anonymous user.
@@ -201,6 +213,7 @@ impl AcClient {
         &self,
         request: &GuestTokenRequest,
     ) -> Result<TokenResponse, GcError> {
+        let start = Instant::now();
         let url = format!("{}/api/v1/auth/internal/guest-token", self.base_url);
 
         let response = self
@@ -215,11 +228,21 @@ impl AcClient {
             .send()
             .await
             .map_err(|e| {
+                metrics::record_ac_request("guest_token", "error", start.elapsed());
+                metrics::record_error("ac_guest_token", "service_unavailable", 503);
                 warn!(target: "gc.services.ac_client", error = %e, "AC request failed");
                 GcError::ServiceUnavailable("Auth Controller is unavailable".to_string())
             })?;
 
-        self.handle_response(response).await
+        let result = self.handle_response(response).await;
+        match &result {
+            Ok(_) => metrics::record_ac_request("guest_token", "success", start.elapsed()),
+            Err(e) => {
+                metrics::record_ac_request("guest_token", "error", start.elapsed());
+                metrics::record_error("ac_guest_token", e.error_type_label(), e.status_code());
+            }
+        }
+        result
     }
 
     /// Handle AC response and map status codes to errors.

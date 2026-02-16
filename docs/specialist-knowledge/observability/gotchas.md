@@ -62,6 +62,15 @@ Custom log targets using dot separators (e.g., `target: "gc.task.health_checker"
 
 ---
 
+### `histogram!` Macro Does Not Accept Bucket Configuration
+**Discovered**: 2026-02-15 (gc-token-metrics)
+
+The `metrics` crate's `histogram!` macro only records values -- it does NOT accept bucket configuration. Bucket boundaries are configured at the **recorder** level (e.g., `metrics_exporter_prometheus::PrometheusBuilder`), not at the call site. Suggesting SLO-aligned bucket values as code changes to `histogram!()` calls is incorrect; bucket tuning belongs in the recorder setup or Prometheus/Grafana configuration.
+
+**Impact**: When reviewing metrics code, do not flag missing bucket configuration on `histogram!` calls. Instead, note bucket requirements for the recorder setup or dashboard configuration phase.
+
+---
+
 ### Multi-Value Regex Fields Survive Partial Renames
 **Discovered**: 2026-02-16 (service rename: global-controller -> gc-service, meeting-controller -> mc-service)
 

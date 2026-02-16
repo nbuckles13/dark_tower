@@ -210,6 +210,14 @@ ActorMetrics uses identical increment/decrement pattern in 4 methods (`meeting_c
 MC uses separate functions for counter and histogram recording (`record_gc_heartbeat()` + `record_gc_heartbeat_latency()`), while AC and GC combine them into single functions (`record_token_issuance()`, `record_http_request()` record both counter and histogram). Severity: Low (both approaches work correctly, stylistic inconsistency only). Improvement path: Consider unifying pattern across services when establishing shared metric patterns (if ever moved to common crate). Timeline: Phase 5+ (infrastructure cleanup). Note: MC pattern allows recording only counter OR only histogram if needed (flexibility), while AC/GC pattern reduces duplication at call sites (convenience). Both are valid per ADR-0011.
 
 ---
+
+### TD-22: refresh_controller_metrics Duplication (Same Crate)
+**Added**: 2026-02-15
+**Related files**: `crates/global-controller/src/tasks/health_checker.rs:28-56`, `crates/global-controller/src/grpc/mc_service.rs:59-78`
+
+Both implement identical logic: query `get_controller_counts_by_status`, convert `HealthStatus` to `(String, u64)`, call `update_registered_controller_gauges("meeting", &counts)`, warn on error. Only differences: (1) health_checker uses explicit match on `HealthStatus` variants while mc_service uses `.as_db_str()`, (2) different tracing `target:` strings, (3) standalone fn vs method. Severity: Low (2 occurrences, same crate, ~20 lines each). Improvement path: Extract to a shared function (e.g., `fn refresh_controller_metrics(pool: &PgPool, target: &str)`) in a common GC module, or make the health_checker version `pub` and import it from mc_service. Timeline: Next cleanup sprint. Note: Discovered during gc-token-metrics review where health_checker wired in its version; mc_service version is older.
+
+---
 This differs from Security, Test, and Code Quality reviewers where ALL findings block. Only genuine shared code requiring extraction should be classified as BLOCKER.
 
 **When to block**: Copy-pasted business logic, duplicate utilities that should be in `common/`, identical algorithms across services.

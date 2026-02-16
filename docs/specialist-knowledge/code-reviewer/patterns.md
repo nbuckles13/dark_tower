@@ -223,3 +223,11 @@ When extracting shared logic into a generic function, keep thin wrapper function
 When a generic/shared async function is called by multiple wrappers that each need different span names, prefer `.instrument(tracing::info_span!("caller.span.name"))` chaining on the `.await` over `#[instrument(skip_all, name = "...")]` on the generic function. Benefits: (1) no nested spans (generic + wrapper), (2) each caller fully controls its own span name, (3) the `Instrument` trait import (`use tracing::Instrument`) is lightweight, (4) avoids the `instrument-skip-all` validation guard on the generic function since `.instrument()` is a runtime method call, not a proc-macro attribute. Use `tracing::info_span!` for the span level.
 
 ---
+
+## Pattern: `&'static str` for Metric Label Fields in Cross-Crate Event Structs
+**Added**: 2026-02-15
+**Related files**: `crates/common/src/token_manager.rs` (`TokenRefreshEvent`), `crates/global-controller/src/errors.rs` (`error_type_label()`)
+
+When a struct field is used exclusively to carry bounded metric labels (e.g., error categories passed to Prometheus counters), use `Option<&'static str>` instead of `Option<String>`. Benefits: (1) enforces bounded cardinality at the type level -- callers cannot pass arbitrary runtime strings, (2) eliminates per-event `String` allocation on error paths, (3) makes the contract self-documenting. This is especially important for cross-crate event structs (like `TokenRefreshEvent` in `common`) where the producing crate cannot depend on the consuming crate's metrics library. The paired pattern is a private `fn error_category(err: &Error) -> &'static str` that maps error variants to bounded label values via exhaustive `match`.
+
+---

@@ -14,8 +14,9 @@ Before reviewing code, scope your work:
 
 1. **Scope** — Identify changed files and prioritize (Step 0 above)
 2. **Review** — Check code against your domain checklist
-3. **Discuss** — Message implementer and other reviewers as needed
-4. **Send verdict** — use SendMessage to tell @team-lead when ready
+3. **Send findings** — Message @implementer with each finding. Discuss fixes.
+4. **Triage deferrals** — If the implementer defers a finding, accept or escalate (see Fix-or-Defer below)
+5. **Send verdict** — use SendMessage to tell @team-lead when all findings are resolved
 
 ## Plan Confirmation Checklist (Gate 1)
 
@@ -46,7 +47,38 @@ Use SendMessage to discuss findings with @implementer:
 
 ### Sending Your Verdict
 Use SendMessage to tell @team-lead your final verdict:
-> "My review is complete. Verdict: APPROVED" (or BLOCKED)
+> "My review is complete. Verdict: CLEAR" (or RESOLVED, or ESCALATED)
+
+## Fix-or-Defer Model
+
+**Every finding defaults to "fix it."** There are no severity levels. If you find an issue, send it to the implementer as a finding.
+
+The implementer will either:
+1. **Fix it** — the expected default
+2. **Defer with justification** — explain why the fix is too expensive for this PR
+
+### Valid deferral justifications
+- Requires changing files outside the PR's changeset
+- Requires a design decision or architectural change that warrants its own planning
+- Introduces significant regression risk requiring its own test cycle
+- Needs cross-service coordination (e.g., common crate change affecting multiple consumers)
+
+### Invalid deferral justifications
+- "It's minor" / "it's low priority" / "it's not important"
+- "It works as-is" (if it's a finding, there's something to improve)
+- "We can do it later" (without explaining WHY it can't be done now)
+
+### Your response to a deferral
+- **Accept**: The justification is legitimate — the fix genuinely can't be done in this PR without disproportionate cost or risk. Mark as "accepted deferral" in your verdict.
+- **Escalate**: The justification is not convincing — you believe the fix should happen in this PR. Send your verdict as ESCALATED and explain why to @team-lead.
+
+**When in doubt, lean toward "fix it."** The bar for deferral should be high.
+
+## DRY Reviewer Exception (ADR-0019)
+
+The DRY reviewer operates on a hybrid model:
+- **True duplication** (code exists in `common` or another service and was reimplemented): Send to @implementer as a finding, enters the fix-or-defer flow.
+- **Extraction opportunities** (similar patterns across services that could be shared but aren't yet): Document directly as tech debt observations in your verdict. These do NOT enter the fix-or-defer flow because they typically require cross-service coordination beyond the current PR's scope.
 
 ## Verdict Format
 
@@ -61,47 +93,21 @@ Use SendMessage to tell @team-lead your final verdict:
 
 ### Findings
 
-#### BLOCKER (critical, cannot merge)
-- **Issue**: [description] - `file.rs:line`
+- **Finding**: [description] - `file.rs:line`
   - **Fix**: [specific solution]
-
-#### MAJOR (significant, should fix before merge)
-[same format]
-
-#### MINOR (should address)
-[same format]
+  - **Status**: Fixed / Deferred (accepted) / Escalated
+  - **Deferral justification**: [if deferred — implementer's justification]
 
 ### Verdict
-**APPROVED** or **BLOCKED**
+**CLEAR** (no findings) or **RESOLVED** (all findings fixed or acceptably deferred) or **ESCALATED** (unresolved disagreement on a deferral)
 
-### Reason (if blocked)
-[Specific issues that must be fixed]
+### Escalation reason (if escalated)
+[Which finding, why the deferral justification is insufficient]
 
-### Tech Debt (if any non-blocking findings)
-[Any findings below your blocking threshold that were not fixed — these are tracked as TECH_DEBT]
+### Tech Debt
+[Accepted deferrals that need follow-up tracking]
+[DRY reviewer: extraction opportunities observed]
 ```
-
-## Severity Definitions
-
-| Severity | Meaning |
-|----------|---------|
-| BLOCKER | Critical issue, cannot merge under any threshold |
-| MAJOR | Significant issue, should fix before merge |
-| MINOR | Should address, lower impact |
-
-**Anything not fixed is documented as TECH_DEBT** in the devloop output.
-
-## Blocking Thresholds by Reviewer
-
-| Reviewer | Blocks on | Non-blocking → TECH_DEBT |
-|----------|-----------|--------------------------|
-| Security | MINOR+ (all findings) | — |
-| Observability | MINOR+ (all findings) | — |
-| Infrastructure | MINOR+ (all findings) | — |
-| Test | MAJOR+ | MINOR → TECH_DEBT |
-| Code Quality | MAJOR+ | MINOR → TECH_DEBT |
-| Operations | MAJOR+ | MINOR → TECH_DEBT |
-| DRY | BLOCKER only | MAJOR, MINOR → TECH_DEBT (per ADR-0019) |
 
 ## ADR Compliance (Code Quality Reviewer)
 
@@ -110,7 +116,7 @@ The Code Quality reviewer MUST check changed code against relevant ADRs:
 1. Identify changed files and their component (`crates/{service}/`)
 2. Look up applicable ADRs via `docs/specialist-knowledge/code-reviewer/key-adrs.md`
 3. Check implementation against ADR MUST/SHOULD/MAY requirements
-4. Severity mapping: MUST/REQUIRED = BLOCKER, SHOULD/RECOMMENDED = MAJOR, MAY/OPTIONAL = MINOR
+4. ADR violations are findings — MUST/REQUIRED violations should be called out as particularly important in the finding description
 5. "ADR Compliance" is a mandatory section in the Code Quality verdict
 
 ## guard:ignore Annotations
@@ -119,14 +125,18 @@ Any `guard:ignore` annotation in the code MUST include a justification:
 ```rust
 // guard:ignore(REASON) — e.g., guard:ignore(test-only fixture, not production code)
 ```
-Guards without justification are flagged as findings (MINOR severity).
+Guards without justification are flagged as findings.
 
 ## Iteration
 
-If implementer addresses your blocking findings:
+If implementer fixes your findings:
 1. Re-review the specific changes
 2. Update your verdict
-3. Use SendMessage to tell @team-lead: "Updated verdict after fixes: APPROVED"
+3. Use SendMessage to tell @team-lead: "Updated verdict: RESOLVED"
+
+If implementer defers with justification you accept:
+1. Mark finding as "Deferred (accepted)" in your verdict
+2. Use SendMessage to tell @team-lead: "Verdict: RESOLVED — {N} findings fixed, {M} acceptably deferred"
 
 ## Time Budget
 

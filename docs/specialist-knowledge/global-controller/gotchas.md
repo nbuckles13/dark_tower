@@ -254,20 +254,18 @@ Rust binaries (`main.rs`) have their own module tree separate from the library (
 
 ---
 
-## Gotcha: Cross-Crate Metrics Cannot Use Crate-Local Recording Functions
-**Added**: 2026-02-09, **Updated**: 2026-02-09
-**Related files**: `crates/gc-service/src/observability/metrics.rs`, `crates/common/src/token_manager.rs`
+## Gotcha: Cross-Crate Metrics Require Callback Injection (Not Direct Calls)
+**Added**: 2026-02-09, **Updated**: 2026-02-15
+**Related files**: `crates/gc-service/src/observability/metrics.rs`, `crates/common/src/token_manager.rs`, `crates/gc-service/src/main.rs`
 
-Metrics recording functions in one crate cannot be called from another crate without creating a dependency cycle. Example: GC's `record_token_refresh` cannot instrument `common::TokenManager` because `common` cannot depend on `global-controller` (would be circular).
+Metrics recording functions in one crate cannot be called from another crate without creating a dependency cycle. Example: GC's `record_token_refresh` cannot be called directly from `common::TokenManager` because `common` cannot depend on `global-controller`.
 
-**Resolution chosen**: Remove unwireable metric functions rather than leaving dead code. The `record_token_refresh` and `record_token_refresh_failure` functions were deleted from `metrics.rs` since they couldn't be wired without architectural changes.
+**Resolution implemented**: Callback injection via `TokenRefreshCallback` (`Arc<dyn Fn(TokenRefreshEvent) + Send + Sync>`). The `common` crate defines `TokenRefreshEvent` (with `Option<&'static str>` for bounded error categories) and invokes the callback after each refresh attempt. GC wires the callback in `main.rs` via `.with_on_refresh()` to route events to `metrics::record_token_refresh()`. This resolved TD-GC-001.
 
-**Future solutions** (when cross-crate metrics are needed):
-1. **Callback mechanism**: Pass a closure/trait object to TokenManager for metrics emission
-2. **Metrics trait**: Define a trait in `common`, implement in consuming crates
-3. **Event observer**: TokenManager emits events, GC subscribes and records metrics
-
-Tech debt TD-GC-001 tracks this for future implementation. The chosen approach should be decided at the architectural level as it affects all cross-crate metrics.
+Key design decisions:
+- `error_category` uses `Option<&'static str>` (not `String`) to enforce bounded cardinality at the type level
+- Callback timing excludes backoff sleep (only measures `acquire_token()` duration)
+- `error_category()` maps each `TokenError` variant to a bounded label (never raw error messages)
 
 ---
 

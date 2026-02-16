@@ -65,7 +65,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Initialize Prometheus metrics recorder (ADR-0011)
     // Must be done before any metrics are recorded
-    let metrics_handle = routes::init_metrics_recorder().map_err(|e| {
+    let metrics_handle = observability::metrics::init_metrics_recorder().map_err(|e| {
         error!("Failed to initialize metrics recorder: {}", e);
         e
     })?;
@@ -120,7 +120,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.gc_client_id.clone(),
         config.gc_client_secret.clone(),
     )
-    .map_err(|e| format!("Token manager config error: {}", e))?;
+    .map_err(|e| format!("Token manager config error: {}", e))?
+    .with_on_refresh(Arc::new(|event| {
+        let status = if event.success { "success" } else { "error" };
+        let error_type = event.error_category;
+        observability::metrics::record_token_refresh(status, error_type, event.duration);
+    }));
 
     info!("Starting token manager...");
     let (token_task_handle, token_rx): (JoinHandle<()>, _) =

@@ -262,9 +262,15 @@ Metrics are recorded at different layers depending on what they measure:
 - Captures end-to-end operation time including RPCs, retries, and DB writes
 - Status values: `success`, `rejected`, `error`
 
-**Out of Scope** (cross-crate dependency - TD-GC-001):
-- Token refresh metrics were removed from `metrics.rs` because TokenManager lives in `common` crate
-- See gotchas.md for cross-crate metrics challenge and solution options
+**Token Manager Layer** (cross-crate via callback - resolved TD-GC-001):
+- `record_token_refresh(status, error_type, duration)` - Called from `TokenRefreshCallback` wired in `main.rs`
+- Emits 3 metrics: `gc_token_refresh_total`, `gc_token_refresh_duration_seconds`, `gc_token_refresh_failures_total`
+- Uses callback injection pattern to bridge `common` crate to GC metrics without circular dependency
+
+**AC Client Layer** (HTTP to Auth Controller):
+- `record_ac_request(operation, status, duration)` - Called in `request_meeting_token()` and `request_guest_token()`
+- Operations: `meeting_token`, `guest_token`
+- `record_error(operation, error_type, status_code)` - Called on error paths with `ac_` prefix for disambiguation
 
 **Dashboard panels**: Grafana dashboard at `infra/grafana/dashboards/gc-overview.json` has panels for each metric type.
 
