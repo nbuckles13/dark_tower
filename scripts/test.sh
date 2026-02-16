@@ -124,7 +124,7 @@ run_migrations_if_needed() {
     fi
 }
 
-# Check if an external database is already reachable (e.g., dev-loop pod sidecar)
+# Check if an external database is already reachable (e.g., devloop pod sidecar)
 check_external_db() {
     if [ -z "${DATABASE_URL:-}" ]; then
         return 1
@@ -140,7 +140,7 @@ check_external_db() {
 # Main
 main() {
     # If DATABASE_URL is already set and the DB is reachable, skip container management.
-    # This supports the containerized dev-loop where a postgres sidecar is already running.
+    # This supports the containerized devloop where a postgres sidecar is already running.
     if check_external_db; then
         log_info "External database reachable at ${DATABASE_URL} — skipping container management"
     else

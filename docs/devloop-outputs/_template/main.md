@@ -1,4 +1,4 @@
-# Dev-Loop Output: {Task Title}
+# Devloop Output: {Task Title}
 
 **Date**: YYYY-MM-DD
 **Task**: Brief description of what was implemented
@@ -41,8 +41,8 @@
      - Capture teammate IDs AS SOON as you spawn them
      - When phase is review and all reviewers approve, advance to reflection
      - Only mark complete after ALL reflections are done
-     - Use /dev-loop-status to check state
-     - If interrupted, restart the dev-loop; main.md records start commit for rollback
+     - Use /devloop-status to check state
+     - If interrupted, restart the devloop; main.md records start commit for rollback
 -->
 
 ---
@@ -106,7 +106,7 @@ TBD
 
 ---
 
-## Dev-Loop Verification Steps
+## Devloop Verification Steps
 
 ### Layer 1: cargo check
 **Status**: PASS/FAIL
@@ -224,7 +224,7 @@ TBD
 
 ## Rollback Procedure
 
-If this dev-loop needs to be reverted:
+If this devloop needs to be reverted:
 1. Verify start commit from Loop Metadata: `{start_commit}`
 2. Review all changes: `git diff {start_commit}..HEAD`
 3. Soft reset (preserves changes): `git reset --soft {start_commit}`

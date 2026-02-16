@@ -3,7 +3,7 @@
 **CRITICAL**: Read this file at the start of every session. These are mandatory development practices for Dark Tower.
 
 > **Note**: This file defines **orchestrator rules** (what you can/cannot do, when to use specialists).
-> For **implementation mechanics**, use `/dev-loop` to start the Agent Teams workflow.
+> For **implementation mechanics**, use `/devloop` to start the Agent Teams workflow.
 
 ## Core Principle: Specialist-Led Development
 
@@ -90,13 +90,13 @@ Use a **single message with multiple Task tool calls** for parallel execution.
 
 ### For New Features
 
-**Preferred**: Use containerized dev-loop for isolated execution with full autonomy:
+**Preferred**: Use containerized devloop for isolated execution with full autonomy:
 ```bash
 ./infra/devloop/devloop.sh <task-slug> [base-branch]
 ```
 This creates a git worktree + podman pod, drops you into Claude Code with `--dangerously-skip-permissions`. No GitHub credentials exposed. See ADR-0025.
 
-**Alternative** (direct, no container): Use `/dev-loop "task description"` for implementation tasks:
+**Alternative** (direct, no container): Use `/devloop "task description"` for implementation tasks:
 - Spawns 7 autonomous teammates (1 implementer + 6 reviewers)
 - Specialist-owned verification pipeline: check → fmt → guards → tests → clippy → audit + coverage (reported) + artifact-specific layers
 - Code review by Security, Test, Observability, Code Quality, DRY, and Operations specialists
@@ -113,7 +113,7 @@ This creates a git worktree + podman pod, drops you into Claude Code with `--dan
 6. Reach consensus (90%+ satisfaction)
 7. Create ADR file (Architecture Decision Record)
 8. Invoke specialists to implement → **Follow Development Loop**
-9. Commit and document (output file in docs/dev-loop-outputs/)
+9. Commit and document (output file in docs/devloop-outputs/)
 ```
 
 ### For Bug Fixes
@@ -207,41 +207,41 @@ At the beginning of each session:
 - [ ] Read this file
 - [ ] Review specialist agent definitions (`.claude/agents/`)
 - [ ] Check existing ADRs (`docs/decisions/`)
-- [ ] **Check for incomplete dev-loops** (see procedure below)
+- [ ] **Check for incomplete devloops** (see procedure below)
 - [ ] Understand current todo list
 - [ ] Identify which specialists needed for today's work
 
-### Checking for Incomplete Dev-Loops
+### Checking for Incomplete Devloops
 
-**Use the `/dev-loop-status` skill** to check for incomplete loops:
+**Use the `/devloop-status` skill** to check for incomplete loops:
 
 ```
-/dev-loop-status
+/devloop-status
 ```
 
 This will show:
-- Active dev-loops (if any)
+- Active devloops (if any)
 - Current step
 - Iteration count
 - What to run next
 
 **If incomplete loop found**:
-- Restart with `/dev-loop` — main.md records start commit for rollback if needed
-- Incomplete dev-loop output remains for reference
+- Restart with `/devloop` — main.md records start commit for rollback if needed
+- Incomplete devloop output remains for reference
 
 ## Contextual Injection
 
-When starting the dev-loop, specialist knowledge is automatically injected into each teammate's prompt. The Lead reads ALL `.md` files from `docs/specialist-knowledge/{name}/` for each specialist and includes them in the composed prompt.
+When starting the devloop, specialist knowledge is automatically injected into each teammate's prompt. The Lead reads ALL `.md` files from `docs/specialist-knowledge/{name}/` for each specialist and includes them in the composed prompt.
 
-See `.claude/skills/dev-loop/SKILL.md` for auto-detection patterns that determine which specialist to invoke.
+See `.claude/skills/devloop/SKILL.md` for auto-detection patterns that determine which specialist to invoke.
 
 ---
 
 ## Related Files
 
-**Dev-Loop Skills** (`.claude/skills/`):
-- `dev-loop/SKILL.md` - Agent Teams workflow (single command)
-- `dev-loop-status/SKILL.md` - Check loop state
+**Devloop Skills** (`.claude/skills/`):
+- `devloop/SKILL.md` - Agent Teams workflow (single command)
+- `devloop-status/SKILL.md` - Check loop state
 - `debate/SKILL.md` - Multi-agent debate workflow
 
 **ADRs** (`docs/decisions/`):
@@ -249,7 +249,7 @@ See `.claude/skills/dev-loop/SKILL.md` for auto-detection patterns that determin
 - **ADR-0016** - Development loop design (original workflow approach)
 - **ADR-0017** - Specialist knowledge architecture (dynamic knowledge files)
 - **ADR-0018** - Dev-loop checkpointing and restore (session recovery)
-- **ADR-0025** - Containerized dev-loop execution (podman isolation)
+- **ADR-0025** - Containerized devloop execution (podman isolation)
 
 **Container Infrastructure** (`infra/devloop/`):
 - `Dockerfile` - Dev container image (Rust + tools + Claude CLI)

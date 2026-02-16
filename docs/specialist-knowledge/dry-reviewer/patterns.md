@@ -182,7 +182,7 @@ pub use common::jwt::{
 
 **Example from GC metrics review**: Common crate has NO observability module. GC correctly implemented its own metrics. This is TECH_DEBT (extraction opportunity), not BLOCKING (mistake).
 
-**Why this matters**: BLOCKING stops the dev-loop and requires immediate fixes. TECH_DEBT is documented for follow-up. Incorrect classification wastes time (false BLOCKING) or misses extraction opportunities (missed BLOCKING).
+**Why this matters**: BLOCKING stops the devloop and requires immediate fixes. TECH_DEBT is documented for follow-up. Incorrect classification wastes time (false BLOCKING) or misses extraction opportunities (missed BLOCKING).
 
 **Checklist before marking BLOCKING**:
 - [ ] Pattern exists in `crates/common/src/`

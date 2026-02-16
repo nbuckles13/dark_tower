@@ -99,7 +99,7 @@ The platform consists of **five main components**:
 - `code-reviewer` - Code quality, Rust idioms, ADR compliance
 - `dry-reviewer` - Cross-service duplication detection (see ADR-0019)
 
-**Cross-Cutting Specialists** (MANDATORY in ALL dev-loops AND debates — see ADR-0024):
+**Cross-Cutting Specialists** (MANDATORY in ALL devloops AND debates — see ADR-0024):
 - `test` - E2E tests, coverage, chaos testing, quality gates
 - `security` - Security architecture, threat modeling, cryptography
 - `observability` - Metrics, logging, tracing, SLOs, error budgets
@@ -274,9 +274,9 @@ dark_tower/
 
 ### Development Process
 - **.claude/DEVELOPMENT_WORKFLOW.md** - Orchestrator rules, specialist usage
-- **.claude/skills/dev-loop/SKILL.md** - Dev-loop Agent Teams workflow
+- **.claude/skills/devloop/SKILL.md** - Devloop Agent Teams workflow
 - **.claude/skills/debate/SKILL.md** - Multi-agent debate workflow
-- **docs/dev-loop-outputs/** - Implementation output tracking
+- **docs/devloop-outputs/** - Implementation output tracking
 - **FUZZING.md** - Fuzzing strategy and setup
 
 ### Current Status
@@ -287,14 +287,14 @@ dark_tower/
 
 ### Implementing a Feature or Refactor (Containerized — Preferred)
 1. Run `./infra/devloop/devloop.sh <task-slug>` to create worktree + isolated pod
-2. Inside the container: `/dev-loop "task description"` runs with full autonomy
+2. Inside the container: `/devloop "task description"` runs with full autonomy
 3. On exit, the wrapper script offers to push and create PR from `.devloop-pr.json`
 4. See ADR-0025 for the containerized execution model
 
 ### Implementing a Feature or Refactor (Direct)
-1. Run `/dev-loop "task description"` to start the Agent Teams workflow
+1. Run `/devloop "task description"` to start the Agent Teams workflow
 2. Lead spawns teammates, they handle planning → implementation → review → reflection
-3. Track progress in `docs/dev-loop-outputs/YYYY-MM-DD-{task}/main.md`
+3. Track progress in `docs/devloop-outputs/YYYY-MM-DD-{task}/main.md`
 
 ### Adding a Database Table
 1. Create migration: `sqlx migrate add create_table_name`
@@ -352,7 +352,7 @@ dark_tower/
 
 ### Containerized Execution (Preferred)
 
-Isolated dev-loop inside a podman container with `--dangerously-skip-permissions`:
+Isolated devloop inside a podman container with `--dangerously-skip-permissions`:
 
 ```
 ./infra/devloop/devloop.sh <task-slug> [base-branch]
@@ -365,7 +365,7 @@ Creates a git worktree + podman pod (dev container + PostgreSQL). Claude operate
 Single-command workflow with autonomous teammates (no container isolation):
 
 ```
-/dev-loop "task description" --specialist={name}
+/devloop "task description" --specialist={name}
 ```
 
 **How it works**:
@@ -378,7 +378,7 @@ Single-command workflow with autonomous teammates (no container isolation):
 
 ### Utility Skills
 
-- `/dev-loop-status` - Check current state of any dev-loop
+- `/devloop-status` - Check current state of any devloop
 
 ### Key Aspects
 
@@ -393,9 +393,9 @@ Single-command workflow with autonomous teammates (no container isolation):
 - DRY Reviewer: BLOCKER only; MAJOR/MINOR → TECH_DEBT (per ADR-0019)
 
 **Key Files**:
-- `.claude/skills/dev-loop/SKILL.md` - Agent Teams workflow
+- `.claude/skills/devloop/SKILL.md` - Agent Teams workflow
 - `.claude/agents/` - Specialist definitions (auto-loaded via `subagent_type`)
-- `docs/dev-loop-outputs/` - Output files tracking each implementation
+- `docs/devloop-outputs/` - Output files tracking each implementation
 
 **When to use**: Any implementation task (features, tests, refactors, security changes)
 
@@ -417,7 +417,7 @@ For design decisions affecting multiple services, use debates to reach consensus
 
 **When to use**: Protocol changes, schema changes, cross-service features, architectural decisions
 
-**Output**: Architecture Decision Record (ADR) only - implementation is separate `/dev-loop`
+**Output**: Architecture Decision Record (ADR) only - implementation is separate `/devloop`
 
 **Key Files**:
 - `.claude/skills/debate/SKILL.md` - Debate workflow

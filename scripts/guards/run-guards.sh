@@ -2,7 +2,7 @@
 #
 # Guard Runner: Execute all simple (pattern-based) guards
 #
-# Semantic guards are handled by the semantic-guard agent during dev-loops,
+# Semantic guards are handled by the semantic-guard agent during devloops,
 # not by this script. See .claude/agents/semantic-guard.md.
 #
 # Exit codes:
@@ -212,7 +212,7 @@ if [[ -x "$APP_METRICS_GUARD" ]]; then
 fi
 
 # NOTE: Semantic guards are now handled by the semantic-guard agent,
-# spawned during dev-loop validation (see .claude/agents/semantic-guard.md)
+# spawned during devloop validation (see .claude/agents/semantic-guard.md)
 
 # -----------------------------------------------------------------------------
 # Summary

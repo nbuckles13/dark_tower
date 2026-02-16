@@ -1,5 +1,5 @@
 ---
-name: dev-loop
+name: devloop
 description: Single-command implementation workflow using Agent Teams. Autonomous teammates handle planning, implementation, and review with minimal Lead involvement.
 ---
 
@@ -9,7 +9,7 @@ A unified implementation workflow where autonomous teammates drive the process. 
 
 ## When to Use
 
-Use `/dev-loop` for:
+Use `/devloop` for:
 - Any implementation task
 - Bug fixes
 - Refactoring
@@ -17,28 +17,28 @@ Use `/dev-loop` for:
 
 For design decisions needing consensus first, use `/debate` to create an ADR, then use this for implementation.
 
-**All specialist implementation work MUST go through `/dev-loop`**. Never manually spawn a specialist via the Task tool — use `/dev-loop` (full) or `/dev-loop --light` to ensure consistent identity and knowledge loading.
+**All specialist implementation work MUST go through `/devloop`**. Never manually spawn a specialist via the Task tool — use `/devloop` (full) or `/devloop --light` to ensure consistent identity and knowledge loading.
 
 ## Arguments
 
 ```
-/dev-loop "task description"                                        # new, full, auto-detect specialist
-/dev-loop "task description" --specialist={name}                    # new, full, explicit specialist
-/dev-loop "task description" --light                                # new, light (3 teammates)
-/dev-loop "feedback" --continue=YYYY-MM-DD-slug                     # reopen completed loop, full
-/dev-loop "feedback" --continue=YYYY-MM-DD-slug --light             # reopen completed loop, light
+/devloop "task description"                                        # new, full, auto-detect specialist
+/devloop "task description" --specialist={name}                    # new, full, explicit specialist
+/devloop "task description" --light                                # new, light (3 teammates)
+/devloop "feedback" --continue=YYYY-MM-DD-slug                     # reopen completed loop, full
+/devloop "feedback" --continue=YYYY-MM-DD-slug --light             # reopen completed loop, light
 ```
 
 - **task description**: What to implement (required)
 - **--specialist**: Implementing specialist (optional, auto-detected from task)
 - **--light**: Lightweight mode — 3 teammates, skip planning gate and reflection (see Lightweight Mode)
-- **--continue**: Reopen a completed dev-loop to address human review feedback (see Continue Mode)
+- **--continue**: Reopen a completed devloop to address human review feedback (see Continue Mode)
 
 ## Team Composition
 
 ### Full Mode (default)
 
-Every dev-loop spawns **7 teammates** (Lead + Implementer + 6 reviewers):
+Every devloop spawns **7 teammates** (Lead + Implementer + 6 reviewers):
 
 | Role | Specialist | Purpose | Blocking |
 |------|------------|---------|----------|
@@ -81,7 +81,7 @@ For small, contained changes (typically 10-30 lines):
 - `crates/common/` (affects all services)
 - Instrumentation code (`tracing::`, `metrics::`, `#[instrument]`)
 
-**Escalation**: Any reviewer can request upgrade to full dev-loop.
+**Escalation**: Any reviewer can request upgrade to full devloop.
 **Ambiguity rule**: When in doubt, use full mode.
 
 ## Workflow Overview
@@ -156,10 +156,10 @@ Extract:
 ### Step 2: Create Output Directory
 
 ```bash
-mkdir -p docs/dev-loop-outputs/YYYY-MM-DD-{task-slug}
+mkdir -p docs/devloop-outputs/YYYY-MM-DD-{task-slug}
 ```
 
-Create `main.md` (see `docs/dev-loop-outputs/_template/main.md` for the full template). Key fields to populate at setup:
+Create `main.md` (see `docs/devloop-outputs/_template/main.md` for the full template). Key fields to populate at setup:
 
 - **Loop Metadata**: Record `git rev-parse HEAD` as Start Commit and current branch
 - **Loop State**: All reviewers set to `pending`
@@ -229,7 +229,7 @@ All teammate communication MUST use the SendMessage tool. Plain text output is n
 **For Reviewers**, spawn with `name: "{reviewer-name}"`, `subagent_type: "{reviewer-name}"` and this prompt:
 
 ```
-You are a reviewer in a Dark Tower dev-loop.
+You are a reviewer in a Dark Tower devloop.
 
 ## Step 0: Load Knowledge (MANDATORY)
 
@@ -237,7 +237,7 @@ You are a reviewer in a Dark Tower dev-loop.
 
 ## Review Protocol
 
-{contents of .claude/skills/dev-loop/review-protocol.md}
+{contents of .claude/skills/devloop/review-protocol.md}
 
 ## Your Workflow
 
@@ -466,18 +466,18 @@ Files changed:
 PR metadata written to .devloop-pr.json
 
 **To address review feedback**:
-- Small fix: `/dev-loop --light "description" --continue=YYYY-MM-DD-{slug}`
-- Larger change: `/dev-loop "description" --continue=YYYY-MM-DD-{slug}`
+- Small fix: `/devloop --light "description" --continue=YYYY-MM-DD-{slug}`
+- Larger change: `/devloop "description" --continue=YYYY-MM-DD-{slug}`
 ```
 
 ## Continue Mode (`--continue`)
 
-Reopens a completed dev-loop to address human review feedback. All work is tracked in the same `main.md` as additional iterations.
+Reopens a completed devloop to address human review feedback. All work is tracked in the same `main.md` as additional iterations.
 
 ### How It Works
 
-1. **Parse**: Extract feedback description and dev-loop slug from `--continue=YYYY-MM-DD-slug`
-2. **Load context**: Read `docs/dev-loop-outputs/{slug}/main.md` to get:
+1. **Parse**: Extract feedback description and devloop slug from `--continue=YYYY-MM-DD-slug`
+2. **Load context**: Read `docs/devloop-outputs/{slug}/main.md` to get:
    - Original task description
    - Which specialist implemented
    - What was done
@@ -488,12 +488,12 @@ Reopens a completed dev-loop to address human review feedback. All work is track
 
    **Feedback**: "{user's feedback}"
    ```
-4. **Spawn implementer**: Use the same specialist as the original dev-loop, via `subagent_type`. Prompt includes:
+4. **Spawn implementer**: Use the same specialist as the original devloop, via `subagent_type`. Prompt includes:
    - The original task context (from main.md)
    - The human review feedback
    - Reference to the previous implementation
-5. **Determine mode**: `--light` or full is controlled by the user's flags, same rules as new dev-loops
-6. **Run workflow**: Same gates as a new dev-loop (validation + review), tracked as additional iterations in the same main.md
+5. **Determine mode**: `--light` or full is controlled by the user's flags, same rules as new devloops
+6. **Run workflow**: Same gates as a new devloop (validation + review), tracked as additional iterations in the same main.md
 7. **Update main.md**: Record implementation changes, validation results, and reviewer verdicts for this iteration
 
 ### Continue Prompt (Implementer)
@@ -501,7 +501,7 @@ Reopens a completed dev-loop to address human review feedback. All work is track
 Spawn with `name: "implementer"`, `subagent_type: "{original-specialist}"`:
 
 ```
-You are continuing work on a previous dev-loop implementation.
+You are continuing work on a previous devloop implementation.
 
 ## Step 0: Load Knowledge (MANDATORY)
 
@@ -551,15 +551,15 @@ All teammate communication MUST use the SendMessage tool. Plain text output is n
 | Validation | 3 attempts | Escalate |
 | Review→Impl loop | 3 iterations | Escalate |
 | Reflection | 15 min | Proceed without |
-| Human review rounds | 3 per dev-loop | Escalate ("is this task well-scoped?") |
+| Human review rounds | 3 per devloop | Escalate ("is this task well-scoped?") |
 
 ## Recovery
 
-If a session is interrupted, restart the dev-loop from the beginning. The main.md file records the start commit for rollback if needed.
+If a session is interrupted, restart the devloop from the beginning. The main.md file records the start commit for rollback if needed.
 
 ## Files
 
 - **Specialist definitions**: `.claude/agents/{name}.md` (auto-loaded via `subagent_type`)
-- **Review protocol**: `.claude/skills/dev-loop/review-protocol.md`
-- **Output**: `docs/dev-loop-outputs/YYYY-MM-DD-{slug}/main.md`
+- **Review protocol**: `.claude/skills/devloop/review-protocol.md`
+- **Output**: `docs/devloop-outputs/YYYY-MM-DD-{slug}/main.md`
 - **Knowledge updates**: `docs/specialist-knowledge/{name}/*.md`

@@ -14,17 +14,17 @@ Dark Tower's development process evolved through four iterations:
 
 1. **Autonomous orchestrator** (v1) — Claude drives everything. Failed: skipped steps, inconsistent execution.
 2. **Step-runner architecture** (v2) — Structured pipeline. Failed: context accumulation in coordinator.
-3. **Skill-based multi-step** (v3) — User invokes `/dev-loop-init`, `/dev-loop-implement`, etc. Worked but coordinator context still rotted across steps.
-4. **Agent Teams** (v4, current) — Single `/dev-loop` command spawns autonomous teammates. Lead only intervenes at gates. Minimal context accumulation.
+3. **Skill-based multi-step** (v3) — User invokes `/devloop-init`, `/devloop-implement`, etc. Worked but coordinator context still rotted across steps.
+4. **Agent Teams** (v4, current) — Single `/devloop` command spawns autonomous teammates. Lead only intervenes at gates. Minimal context accumulation.
 
-The v3 skills have been retired. `/dev-loop` and `/debate` are now the sole workflows. This ADR documents the v4 design and improvements agreed through a 13-specialist debate (see `docs/debates/2026-02-10-agent-teams-workflow-review/debate.md`).
+The v3 skills have been retired. `/devloop` and `/debate` are now the sole workflows. This ADR documents the v4 design and improvements agreed through a 13-specialist debate (see `docs/debates/2026-02-10-agent-teams-workflow-review/debate.md`).
 
 ### Key Design Principles
 
 - **Lead is a coordinator, not implementer** — Lead only acts at gates (plan approval, validation, final approval)
 - **Teammates communicate peer-to-peer** — Reviewers message the implementer directly, reducing Lead context load
 - **Specialist-owned verification** — Each reviewer owns their domain; findings are blocking unless otherwise specified
-- **Simple recovery** — `main.md` records start commit; if interrupted, restart the dev-loop from the beginning
+- **Simple recovery** — `main.md` records start commit; if interrupted, restart the devloop from the beginning
 
 ## Decision
 
@@ -32,7 +32,7 @@ The v3 skills have been retired. `/dev-loop` and `/debate` are now the sole work
 
 #### Team Composition: 7 Teammates
 
-Every dev-loop spawns **7 teammates** (Lead + Implementer + 6 reviewers):
+Every devloop spawns **7 teammates** (Lead + Implementer + 6 reviewers):
 
 | Role | Specialist | Purpose | Blocking |
 |------|------------|---------|----------|
@@ -44,7 +44,7 @@ Every dev-loop spawns **7 teammates** (Lead + Implementer + 6 reviewers):
 | DRY Reviewer | dry-reviewer | Cross-service duplication | BLOCKER only; rest TECH_DEBT (per ADR-0019) |
 | Operations Reviewer | operations | Deployment safety, rollback, runbooks | MAJOR+ blocks; rest TECH_DEBT |
 
-**Rationale for 7 teammates**: All four mandatory cross-cutting specialists (Security, Test, Observability, Operations) are now included alongside Code Quality and DRY. This resolves a policy inconsistency where CLAUDE.md listed Observability as mandatory but the dev-loop excluded it. Each reviewer covers a distinct, non-overlapping domain — no natural combination exists without diluting expertise. Reviewers work in parallel, so the added teammate does not significantly increase wall-clock time.
+**Rationale for 7 teammates**: All four mandatory cross-cutting specialists (Security, Test, Observability, Operations) are now included alongside Code Quality and DRY. This resolves a policy inconsistency where CLAUDE.md listed Observability as mandatory but the devloop excluded it. Each reviewer covers a distinct, non-overlapping domain — no natural combination exists without diluting expertise. Reviewers work in parallel, so the added teammate does not significantly increase wall-clock time.
 
 **Conditional domain reviewer**: When the task touches database patterns (`migration|schema|sql`) but the implementer is NOT the Database specialist, add Database as a conditional 8th reviewer for that loop. This prevents schema changes landing without database-aware review. The same principle applies to Protocol when API contracts are affected by a non-Protocol implementer.
 
@@ -57,7 +57,7 @@ Every dev-loop spawns **7 teammates** (Lead + Implementer + 6 reviewers):
 - **BLOCKER**: Critical issue, cannot merge under any threshold
 - **MAJOR**: Significant issue, should fix before merge
 - **MINOR**: Should address, lower impact
-- Anything not fixed is documented as **TECH_DEBT** in the dev-loop output
+- Anything not fixed is documented as **TECH_DEBT** in the devloop output
 
 #### Workflow Phases
 
@@ -200,7 +200,7 @@ For small, contained changes (typically 10-30 lines):
 - **Skips**: Gate 1 (plan approval), reflection phase
 - **Keeps**: Full validation pipeline (Gate 2), review verdicts
 - **Not eligible**: Changes touching auth, crypto, session paths, security-critical code, schema/migration changes, protocol changes, deployment manifests (K8s, Docker), `Cargo.toml` dependency changes, `crates/common/` (affects all services), or instrumentation code (`tracing::`, `metrics::`, `#[instrument]`)
-- **Escalation**: Any reviewer can request upgrade to full dev-loop
+- **Escalation**: Any reviewer can request upgrade to full devloop
 - **Ambiguity rule**: When in doubt, use full mode. Lead errs on the side of full.
 
 #### Cross-Service Implementation Model
@@ -209,20 +209,20 @@ For features spanning multiple services, use tiered approach:
 
 **Tier A — New cross-service patterns** (debate required):
 1. Debate defines the interface contract (proto, performance budgets, error semantics)
-2. Proto/shared-spec dev-loop implements the shared interface (locks the contract)
-3. Per-service dev-loops run in parallel against the locked contract
-4. Integration dev-loop verifies the full cross-service flow
+2. Proto/shared-spec devloop implements the shared interface (locks the contract)
+3. Per-service devloops run in parallel against the locked contract
+4. Integration devloop verifies the full cross-service flow
 
 **Tier B — Extensions of established patterns** (coordination brief, no debate):
 1. Lead provides coordination brief referencing existing integration knowledge files
-2. Parallel dev-loops for each affected service
+2. Parallel devloops for each affected service
 3. Shared review team validates cross-service consistency
 
 **Differentiator**: Does `docs/specialist-knowledge/{service}/integration.md` already document the pattern? If yes → Tier B. If no → Tier A.
 
-**Exception**: Features involving shared crypto context (e.g., connection tokens where MC issues and MH validates) expand the proto dev-loop to include a crypto spec, co-owned by Protocol + Security.
+**Exception**: Features involving shared crypto context (e.g., connection tokens where MC issues and MH validates) expand the proto devloop to include a crypto spec, co-owned by Protocol + Security.
 
-**Context handoff**: When a dev-loop implements an ADR, the implementer prompt MUST reference both the ADR and the debate record:
+**Context handoff**: When a devloop implements an ADR, the implementer prompt MUST reference both the ADR and the debate record:
 ```
 ## Context
 ADR: docs/decisions/adr-NNNN-{topic}.md
@@ -258,7 +258,7 @@ Debate-produced ADRs include new optional sections:
 ```markdown
 ## Implementation Guidance
 - Suggested specialist: {name}
-- Task breakdown: {if multi-loop, list sequential dev-loops}
+- Task breakdown: {if multi-loop, list sequential devloops}
 - Key files: {primary files to modify}
 - Dependencies: {order constraints between implementation steps}
 ```
@@ -284,7 +284,7 @@ Debate-produced ADRs include new optional sections:
 
 #### Debate Trigger Clarification
 
-"Protocol or contract changes" means **breaking changes, semantic changes, or new message categories** — NOT simple additive fields. Per ADR-0004, safe changes (new optional fields, new enum values, new RPCs, new message types) use a standard `/dev-loop` without debate.
+"Protocol or contract changes" means **breaking changes, semantic changes, or new message categories** — NOT simple additive fields. Per ADR-0004, safe changes (new optional fields, new enum values, new RPCs, new message types) use a standard `/devloop` without debate.
 
 ### 3. Review Protocol Improvements
 
@@ -326,7 +326,7 @@ Code Quality reviewer MUST check changed code against relevant ADRs:
 | Operations | MAJOR+ | MINOR → TECH_DEBT |
 | DRY | BLOCKER only | MAJOR, MINOR → TECH_DEBT (per ADR-0019) |
 
-Anything not fixed is documented as TECH_DEBT in the dev-loop output's Tech Debt section.
+Anything not fixed is documented as TECH_DEBT in the devloop output's Tech Debt section.
 
 #### guard:ignore Justification
 
@@ -338,56 +338,56 @@ Guards without justification are flagged as findings.
 
 ### 4. Recovery Model
 
-If a dev-loop is interrupted, restart from the beginning with `/dev-loop`. The `main.md` file records the start commit for rollback if needed. No checkpoint/restore mechanism is required — restarting is simpler and avoids stale context.
+If a devloop is interrupted, restart from the beginning with `/devloop`. The `main.md` file records the start commit for rollback if needed. No checkpoint/restore mechanism is required — restarting is simpler and avoids stale context.
 
 ### 5. CLAUDE.md Consistency
 
-Update CLAUDE.md to explicitly state: **All 4 cross-cutting specialists (Security, Test, Observability, Operations) are mandatory in both dev-loops and debates.** This closes the policy inconsistency.
+Update CLAUDE.md to explicitly state: **All 4 cross-cutting specialists (Security, Test, Observability, Operations) are mandatory in both devloops and debates.** This closes the policy inconsistency.
 
 ## Consequences
 
 ### Positive
 
-1. **Policy consistency** — Observability now included in dev-loop, matching CLAUDE.md's mandate
+1. **Policy consistency** — Observability now included in devloop, matching CLAUDE.md's mandate
 2. **Concrete verification** — Validation pipeline defined with specific commands, not aspirational descriptions
 3. **Informed risk acceptance** — Security/Ops dissent in debates requires explicit user acknowledgment
-4. **Scalable cross-service model** — Tiered approach (debate → sequential dev-loops) handles multi-service features
+4. **Scalable cross-service model** — Tiered approach (debate → sequential devloops) handles multi-service features
 5. **Lightweight option** — `--light` reduces overhead for small, safe changes
 6. **Artifact-aware verification** — Pipeline extensible to non-Rust artifacts (proto, K8s, Docker)
-7. **Rollback safety** — Git state tracked, rollback procedure documented per dev-loop
+7. **Rollback safety** — Git state tracked, rollback procedure documented per devloop
 
 ### Negative
 
-1. **Larger review team** — 7 teammates instead of 6 increases resource usage per dev-loop
+1. **Larger review team** — 7 teammates instead of 6 increases resource usage per devloop
 2. **More complex verification** — Artifact-specific layers add implementation work
 3. **Stricter debate escalation** — Cross-cutting veto may slow consensus on contentious decisions
 
 ### Neutral
 
 1. **Knowledge files unchanged** — Specialist knowledge architecture (ADR-0017) unaffected
-2. **Output format compatible** — `docs/dev-loop-outputs/` structure preserved with additions
-3. **Simpler recovery** — `/dev-loop-restore` removed in favor of restart-from-beginning model
+2. **Output format compatible** — `docs/devloop-outputs/` structure preserved with additions
+3. **Simpler recovery** — `/devloop-restore` removed in favor of restart-from-beginning model
 
 ## Implementation Items
 
-### Immediate (before next dev-loop)
+### Immediate (before next devloop)
 
-1. Update `.claude/skills/dev-loop/SKILL.md` — Add Observability reviewer, update team to 7, add conditional domain reviewer, add auto-detection disambiguation
-2. Update `CLAUDE.md` — Clarify all 4 cross-cutting specialists mandatory in dev-loops AND debates
+1. Update `.claude/skills/devloop/SKILL.md` — Add Observability reviewer, update team to 7, add conditional domain reviewer, add auto-detection disambiguation
+2. Update `CLAUDE.md` — Clarify all 4 cross-cutting specialists mandatory in devloops AND debates
 3. Update `.claude/agent-teams/protocols/review.md` — Add Step 0 scoping, plan confirmation checklist, ADR compliance procedure, blocking behavior generalized note, guard:ignore(REASON) requirement
 4. Update `.claude/skills/debate/SKILL.md` — Veto protection in escalation, debate trigger clarification, Implementation Guidance section in ADR template
 5. Add `protocol` row to auto-detection table with expanded patterns for all specialists
-6. Add git state tracking + inline security decision checkpointing to dev-loop setup phase
-7. Update dev-loop output template with Observability status field, rollback procedure section, Loop Metadata
+6. Add git state tracking + inline security decision checkpointing to devloop setup phase
+7. Update devloop output template with Observability status field, rollback procedure section, Loop Metadata
 
-### Follow-Up (subsequent dev-loops)
+### Follow-Up (subsequent devloops)
 
 8. Create `scripts/workflow/verify-all.sh` with artifact-type detection (mandatory infra/proto/migration layers)
 9. Create observability guards: `metrics-naming.sh`, `cardinality-guard.sh`, `no-pii-in-tracing.sh`
 10. Add proto freshness check to verification pipeline (regenerate + diff proto-gen/)
 11. Add migration safety check to verification pipeline (sequential numbering, sqlx prepare --check)
-12. Implement `--light` flag in dev-loop skill with explicit exclusion criteria
-13. Add cross-service implementation model (Tier A/B) documentation to dev-loop skill
+12. Implement `--light` flag in devloop skill with explicit exclusion criteria
+13. Add cross-service implementation model (Tier A/B) documentation to devloop skill
 14. Add Protocol Constraints and Migration Plan conditional sections to debate ADR template
 15. ~~Add restore pre-flight verification~~ — Removed; restart-from-beginning model adopted instead
 16. Add per-crate benchmark layer for performance-critical services (future)
@@ -404,7 +404,7 @@ Update CLAUDE.md to explicitly state: **All 4 cross-cutting specialists (Securit
 | DRY-Reviewer | Well-positioned with generalized blocking behavior documentation | 93 |
 | Auth-Controller | Practical with observability fix, expanded patterns, security checkpointing | 95 |
 | Global-Controller | Improved with cross-service model, lightweight variant, disambiguation rule | 93 |
-| Meeting-Controller | Resolved with sequential dev-loops, Tier A/B model, observability | 95 |
+| Meeting-Controller | Resolved with sequential devloops, Tier A/B model, observability | 95 |
 | Media-Handler | Improved with observability, benchmark future item, sequential loops | 94 |
 | Database | Improved with migration safety layers, expanded auto-detection, migration plan template | 92 |
 | Protocol | Improved with proto freshness check, auto-detection row, Protocol Constraints template | 95 |

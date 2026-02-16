@@ -92,7 +92,7 @@ Read the actual code, ADRs, and scripts relevant to your domain:
 - Source code in your domain (see your specialist definition for file paths)
 - Relevant ADRs in docs/decisions/
 - Guard scripts in scripts/guards/ (if security/observability/test)
-- Recent dev-loop outputs that involved your domain
+- Recent devloop outputs that involved your domain
 
 ### Phase 2: Verify and Prune (PRIMARY TASK)
 
@@ -114,7 +114,7 @@ Only add a new entry if you found something that:
 
 **Do NOT add entries just because you read code and can describe what it does.** That's documentation, not knowledge.
 
-**If your knowledge files are empty or near-empty**: That's fine. It means this specialist hasn't been through enough implementation cycles yet. Knowledge accumulates through `/dev-loop` reflection, not through audits. Do not bulk-populate empty files.
+**If your knowledge files are empty or near-empty**: That's fine. It means this specialist hasn't been through enough implementation cycles yet. Knowledge accumulates through `/devloop` reflection, not through audits. Do not bulk-populate empty files.
 
 ### Phase 4: Edit Your Files
 
@@ -233,4 +233,4 @@ Report: docs/specialist-knowledge/audits/YYYY-MM-DD-{slug}.md
 
 - ADR-0017 — Specialist knowledge architecture
 - `.claude/agents/` — Specialist definitions (auto-loaded via `subagent_type`)
-- `/dev-loop` reflection phase — How knowledge gets captured during implementation
+- `/devloop` reflection phase — How knowledge gets captured during implementation

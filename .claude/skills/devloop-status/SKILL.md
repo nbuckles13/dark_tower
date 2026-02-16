@@ -1,20 +1,20 @@
 ---
-name: dev-loop-status
-description: Check current state of dev-loops. Read-only utility to see active loops and their progress.
+name: devloop-status
+description: Check current state of devloops. Read-only utility to see active loops and their progress.
 ---
 
 # Dev-Loop Status Check
 
-This skill checks for active or incomplete dev-loops and reports their current state. It's read-only and safe to run at any time.
+This skill checks for active or incomplete devloops and reports their current state. It's read-only and safe to run at any time.
 
 ## Instructions
 
 ### Step 1: Run the Status Script
 
-Use the helper script to scan all dev-loop directories and extract their state:
+Use the helper script to scan all devloop directories and extract their state:
 
 ```bash
-./scripts/workflow/dev-loop-status.sh
+./scripts/workflow/devloop-status.sh
 ```
 
 **Options**:
@@ -35,18 +35,18 @@ The script will show active and completed loops. Based on the **Phase** of activ
 
 | Phase | Next Action |
 |-------|-------------|
-| `setup` | Run `/dev-loop` again to restart |
-| `planning` | Run `/dev-loop` again to restart (main.md records start commit for rollback) |
-| `implementation` | Run `/dev-loop` again to restart |
-| `review` | Run `/dev-loop` again to restart |
-| `reflection` | Run `/dev-loop` again to restart |
+| `setup` | Run `/devloop` again to restart |
+| `planning` | Run `/devloop` again to restart (main.md records start commit for rollback) |
+| `implementation` | Run `/devloop` again to restart |
+| `review` | Run `/devloop` again to restart |
+| `reflection` | Run `/devloop` again to restart |
 
 ### Step 3: Check Checkpoint Files (if needed)
 
 For active loops, you can list checkpoint files:
 
 ```bash
-ls docs/dev-loop-outputs/{directory}/
+ls docs/devloop-outputs/{directory}/
 ```
 
 Expected files:
@@ -56,9 +56,9 @@ Expected files:
 
 ## Auto-Detection Logic
 
-When other dev-loop skills need to find the "current" output directory, they use this logic:
+When other devloop skills need to find the "current" output directory, they use this logic:
 
-1. List directories in `docs/dev-loop-outputs/` (excluding `_template`)
+1. List directories in `docs/devloop-outputs/` (excluding `_template`)
 2. Filter to those with `Phase != complete` in `main.md`
 3. If exactly one active loop: use it
 4. If multiple active loops: ask user which one

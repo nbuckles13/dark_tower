@@ -27,7 +27,7 @@
 - [x] Code review integration with resume for fixes
 - [x] Reflection step for knowledge capture
 - [x] State checkpointing for context compression recovery
-- [x] Output file as proof-of-work (docs/dev-loop-outputs/)
+- [x] Output file as proof-of-work (docs/devloop-outputs/)
 - **Commits**: b949052, 14dbf44
 
 ### Specialist Knowledge Architecture ✅ (ADR-0017)
@@ -37,9 +37,9 @@
 - [x] Knowledge injected into specialist prompts
 - **Specialists with knowledge**: auth-controller, security, test, code-reviewer
 
-### Skill-Based Dev-Loop Migration ✅ (ADR-0022)
+### Skill-Based Devloop Migration ✅ (ADR-0022)
 - [x] Migrated from workflow docs to executable skills
-- [x] Created skills: dev-loop-init, dev-loop-implement, dev-loop-validate, etc.
+- [x] Created skills: devloop-init, devloop-implement, devloop-validate, etc.
 - [x] Deleted obsolete `.claude/workflows/development-loop/` directory and files
 - [x] Updated CLAUDE.md, DEVELOPMENT_WORKFLOW.md, PROJECT_STATUS.md
 - [x] Added supersession notes to ADR-0016 and ADR-0018

@@ -67,7 +67,7 @@ This is the critical distinction:
 
 When DRY Reviewer flags duplication (non-BLOCKER):
 
-1. Finding documented in dev-loop output under "Tech Debt: Cross-Service Duplication"
+1. Finding documented in devloop output under "Tech Debt: Cross-Service Duplication"
 2. Current task completes with known duplication
 3. New task created: "Extract shared {pattern} to common crate"
 4. Orchestrator executes extraction task (not scoped to single service)
@@ -110,7 +110,7 @@ The orchestrator handles cross-service refactoring because:
 - `.claude/workflows/development-loop.md` - Mention DRY reviewer, tech debt handling
 - `AI_DEVELOPMENT.md` - Add to specialist list
 - `CLAUDE.md` - Mention in code review section
-- `docs/dev-loop-outputs/_template.md` - Add Tech Debt section
+- `docs/devloop-outputs/_template.md` - Add Tech Debt section
 
 ## References
 

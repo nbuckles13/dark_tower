@@ -10,7 +10,7 @@
 
 ## Context
 
-The Agent Teams dev-loop (ADR-0024) runs Claude Code with autonomous specialist teammates. For maximum autonomy, Claude Code supports `--dangerously-skip-permissions` which disables all permission prompts — but this is only safe in isolated environments where damage cannot escape.
+The Agent Teams devloop (ADR-0024) runs Claude Code with autonomous specialist teammates. For maximum autonomy, Claude Code supports `--dangerously-skip-permissions` which disables all permission prompts — but this is only safe in isolated environments where damage cannot escape.
 
 Running on the host (even inside WSL2) exposes:
 - SSH keys and git credentials
@@ -27,7 +27,7 @@ We need a development environment where Claude can operate with full autonomy (`
 
 1. Claude must be able to run the full validation pipeline (compile, format, guards, tests, clippy, audit, semantic analysis)
 2. No GitHub credentials or SSH keys exposed to the container
-3. Parallel dev-loops must be possible (multiple tasks simultaneously)
+3. Parallel devloops must be possible (multiple tasks simultaneously)
 4. Accidental session exit (Ctrl-D) must not destroy state
 5. Build cache should persist across sessions to avoid rebuilding ~400 crates each time
 6. Git commits inside the container must have proper user attribution
@@ -37,7 +37,7 @@ We need a development environment where Claude can operate with full autonomy (`
 
 ### 1. Containerized Execution via Podman
 
-Each dev-loop runs two **podman containers** sharing a network namespace:
+Each devloop runs two **podman containers** sharing a network namespace:
 - A **dev container** with the full Rust toolchain, Claude Code CLI, and development tools
 - A **PostgreSQL 16 container** for integration tests (accessible at `localhost:5432` via `--network container:`)
 
@@ -66,7 +66,7 @@ OAuth credentials (`~/.claude/.credentials.json`) are mounted read-only. The ris
 
 ### 4. PR Metadata File
 
-Since GitHub credentials are not available inside the container, Claude writes a `.devloop-pr.json` file to the clone root during dev-loop completion (Step 9). The host-side wrapper script reads this file to push and create the PR using the host's credentials.
+Since GitHub credentials are not available inside the container, Claude writes a `.devloop-pr.json` file to the clone root during devloop completion (Step 9). The host-side wrapper script reads this file to push and create the PR using the host's credentials.
 
 ```json
 {
@@ -79,7 +79,7 @@ This preserves Claude's context (task description, reviewer verdicts, files chan
 
 ### 5. Shared Cargo Registry, Isolated Target
 
-- `cargo-registry` and `cargo-git` are named podman volumes mounted at `$CARGO_HOME` (`/tmp/cargo-home`), shared across all dev-loops (safe — cargo uses file locking)
+- `cargo-registry` and `cargo-git` are named podman volumes mounted at `$CARGO_HOME` (`/tmp/cargo-home`), shared across all devloops (safe — cargo uses file locking)
 - `target/` lives inside the clone bind mount (isolated per task, persists between sessions)
 
 ### 6. Persistent Containers with Attach/Detach
@@ -123,7 +123,7 @@ Rebuilt weekly or when toolchain changes. ~3-4 GB.
 **Positive**:
 - Full `--dangerously-skip-permissions` autonomy with container-level blast radius
 - No GitHub/SSH credentials exposed to Claude
-- Parallel dev-loops via separate clones and container pairs
+- Parallel devloops via separate clones and container pairs
 - Session resilience (Ctrl-D doesn't destroy state)
 - PR descriptions written by Claude with full task context
 - Aligns with existing podman requirement (test database)

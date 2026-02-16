@@ -11,13 +11,13 @@ Run a multi-agent design debate to reach consensus on cross-cutting design decis
 
 Use `/debate` when:
 - Design decision affects 2+ services
-- Protocol or contract **breaking changes, semantic changes, or new message categories** (NOT simple additive fields — per ADR-0004, safe changes like new optional fields, new enum values, new RPCs use a standard `/dev-loop` without debate)
+- Protocol or contract **breaking changes, semantic changes, or new message categories** (NOT simple additive fields — per ADR-0004, safe changes like new optional fields, new enum values, new RPCs use a standard `/devloop` without debate)
 - Database schema changes with cross-service impact
 - Performance/scalability trade-offs need discussion
 - Core pattern modifications
 
 Do NOT use for:
-- Single-service implementation (use `/dev-loop`)
+- Single-service implementation (use `/devloop`)
 - Research/exploration (use Task tool with Explore agent)
 - Simple questions (just answer directly)
 
@@ -41,7 +41,7 @@ Confirm the question is appropriate for debate:
 - Would multiple specialists have opinions?
 
 If not appropriate, suggest alternatives:
-- Single-service → `/dev-loop`
+- Single-service → `/devloop`
 - Need exploration → Explore agent
 - Simple question → Answer directly
 
@@ -233,7 +233,7 @@ Accepted
 ## Implementation Guidance
 
 - Suggested specialist: {name}
-- Task breakdown: {if multi-loop, list sequential dev-loops}
+- Task breakdown: {if multi-loop, list sequential devloops}
 - Key files: {primary files to modify}
 - Dependencies: {order constraints between implementation steps}
 
@@ -293,7 +293,7 @@ ADR created: docs/decisions/adr-NNNN-{topic}.md
 Participants:
 - {name}: {final satisfaction}% - {one-line position}
 
-**Next step**: If implementation needed, run `/dev-loop "implement ADR-NNNN"`
+**Next step**: If implementation needed, run `/devloop "implement ADR-NNNN"`
 ```
 
 ## Limits
@@ -314,7 +314,7 @@ Participants:
 
 ## Notes
 
-- Debate produces an ADR only - implementation is a separate `/dev-loop`
+- Debate produces an ADR only - implementation is a separate `/devloop`
 - Lead uses delegate mode (coordinates, doesn't implement)
 - Specialists message each other directly for natural debate flow
 - Satisfaction scoring enables tracking progress toward consensus

@@ -249,7 +249,7 @@ verify_clippy() {
 }
 
 # Note: Semantic guards are handled by the semantic-guard agent during
-# dev-loops, not by this script. See .claude/agents/semantic-guard.md.
+# devloops, not by this script. See .claude/agents/semantic-guard.md.
 
 # -----------------------------------------------------------------------------
 # Output Functions
@@ -409,7 +409,7 @@ main() {
     fi
 
     # Note: Semantic guards (layer 7) are handled by the semantic-guard agent
-    # during dev-loops. See .claude/agents/semantic-guard.md.
+    # during devloops. See .claude/agents/semantic-guard.md.
 
     # Output results
     if [[ "$FORMAT" == "json" ]]; then

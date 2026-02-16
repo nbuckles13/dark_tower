@@ -9,7 +9,7 @@ Create a new git worktree configured for parallel Claude Code development. This 
 
 ## Purpose
 
-Git worktrees allow you to work on multiple branches simultaneously without switching contexts. This is perfect for running parallel dev-loops on different features.
+Git worktrees allow you to work on multiple branches simultaneously without switching contexts. This is perfect for running parallel devloops on different features.
 
 ## Arguments
 
@@ -198,7 +198,7 @@ By symlinking this file, the worktree inherits all permissions from the main rep
 
 ### Why Validate After Setup?
 
-Early validation catches issues before you start a dev-loop:
+Early validation catches issues before you start a devloop:
 - Missing dependencies
 - Guard violations (e.g., from branch state)
 - Compilation errors
@@ -223,4 +223,4 @@ The symlink approach works regardless of location.
 
 - Git worktrees: `git worktree --help`
 - Claude Code documentation: https://code.claude.com/docs/en/common-workflows.md (Git worktrees section)
-- Dev-loop workflow: `.claude/skills/dev-loop/SKILL.md`
+- Devloop workflow: `.claude/skills/devloop/SKILL.md`
