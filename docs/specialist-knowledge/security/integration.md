@@ -21,10 +21,16 @@ Production deployments MUST set: `AC_MASTER_KEY` (32-byte base64), `AC_HASH_SECR
 ---
 
 ## Integration: Observability - Security Metrics
-**Added**: 2026-01-11
-**Related files**: `crates/ac-service/src/observability/metrics.rs`
+**Added**: 2026-01-11 (Updated: 2026-02-16)
+**Related files**: `crates/ac-service/src/observability/metrics.rs`, `docs/observability/metrics/*.md`, `infra/grafana/dashboards/*.json`
 
 Track: auth failures (rate), rate limit triggers, bcrypt latency (p99), JWT validation errors. Alert thresholds: >10 auth failures/min, bcrypt p99 >500ms, rate limit bursts. Never include secrets in traces.
+
+**Metric catalog docs** (`docs/observability/metrics/`): Security must review new catalog entries for information leakage. Catalogs describe what metrics measure and their label values -- they must NOT document security policy constants (rotation periods, rate limit windows, token TTLs, key sizes). These constants belong in ADRs and specialist knowledge only.
+
+**Dashboard panel descriptions**: Grafana panel `description` fields are visible to all dashboard viewers. Describe the metric's operational purpose, not the security threat it mitigates. Example: "Bcrypt operation latency" (good) vs "Uses coarse buckets to prevent timing side-channel attacks" (leaks mitigation rationale).
+
+**Guard enforcement**: `validate-application-metrics.sh` Steps 4-5 now hard-fail on missing dashboard panels and catalog entries. This is security-positive: it ensures all security-relevant metrics (bcrypt timing, rate limiting, audit failures, key rotation) are visible in dashboards and documented, preventing observability blind spots.
 
 ---
 

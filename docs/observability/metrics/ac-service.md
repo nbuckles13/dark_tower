@@ -171,6 +171,46 @@ All AC service metrics follow ADR-0011 naming conventions with the `ac_` prefix.
 
 ---
 
+## Admin Operations Metrics
+
+### `ac_admin_operations_total`
+- **Type**: Counter
+- **Description**: Total number of admin client management operations
+- **Labels**:
+  - `operation`: Admin operation type (`list`, `get`, `create`, `update`, `delete`, `rotate_secret`)
+  - `status`: Operation outcome (`success`, `error`)
+- **Cardinality**: Low (6 operations x 2 statuses = 12 series)
+- **Usage**: Track admin API usage patterns and failure rates
+
+---
+
+## HTTP Request Metrics
+
+### `ac_http_requests_total`
+- **Type**: Counter
+- **Description**: Total HTTP requests received across all endpoints
+- **Labels**:
+  - `method`: HTTP method (GET, POST, DELETE, etc.)
+  - `path`: Normalized request path (e.g., `/api/v1/auth/service/token`, `/api/v1/admin/clients/{id}`)
+  - `status_code`: HTTP response status code (200, 400, 401, 404, 415, 500, etc.)
+- **Cardinality**: Medium (~50 combinations, bounded by known paths and status codes)
+- **Usage**: Track total request rate, error distribution by path and status code
+- **Note**: Captures ALL HTTP responses including framework-level errors (415, 400, 404, 405)
+
+### `ac_http_request_duration_seconds`
+- **Type**: Histogram
+- **Description**: HTTP request duration across all endpoints
+- **Labels**:
+  - `method`: HTTP method
+  - `path`: Normalized request path
+  - `status_code`: HTTP response status code
+- **Buckets**: [0.005, 0.010, 0.025, 0.050, 0.100, 0.250, 0.500, 1.000, 2.500, 5.000, 10.000]
+- **SLO Target**: p95 < 200ms
+- **Cardinality**: Medium (~50 combinations)
+- **Usage**: Monitor request latency by endpoint, calculate percentiles for SLO tracking
+
+---
+
 ## Prometheus Query Examples
 
 ### Request Rate (Total)

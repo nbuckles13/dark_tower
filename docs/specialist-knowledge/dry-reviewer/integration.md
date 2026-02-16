@@ -218,6 +218,30 @@ MC uses separate functions for counter and histogram recording (`record_gc_heart
 Both implement identical logic: query `get_controller_counts_by_status`, convert `HealthStatus` to `(String, u64)`, call `update_registered_controller_gauges("meeting", &counts)`, warn on error. Only differences: (1) health_checker uses explicit match on `HealthStatus` variants while mc_service uses `.as_db_str()`, (2) different tracing `target:` strings, (3) standalone fn vs method. Severity: Low (2 occurrences, same crate, ~20 lines each). Improvement path: Extract to a shared function (e.g., `fn refresh_controller_metrics(pool: &PgPool, target: &str)`) in a common GC module, or make the health_checker version `pub` and import it from mc_service. Timeline: Next cleanup sprint. Note: Discovered during gc-token-metrics review where health_checker wired in its version; mc_service version is older.
 
 ---
+
+### TD-23: SLO Visual Pattern Inconsistency Across Dashboards
+**Added**: 2026-02-16
+**Related files**: `infra/grafana/dashboards/mc-overview.json`, `infra/grafana/dashboards/ac-overview.json`, `infra/grafana/dashboards/gc-overview.json`
+
+MC latency panels use `vector()` query targets with styled overrides (dashed red SLO reference line). AC latency panels use `thresholds` with `thresholdsStyle: "line"`. GC latency panels have no SLO visual markers. Severity: Low (both approaches are valid Grafana patterns; MC's approach is arguably better for operator clarity with explicit legend labels like "SLO (10ms)"). Improvement path: Normalize all service dashboards to use the MC `vector()` pattern. Timeline: Next dashboard cleanup sprint.
+
+---
+
+### TD-24: Target Field Inconsistency (editorMode/range) in AC Dashboard
+**Added**: 2026-02-16
+**Related files**: `infra/grafana/dashboards/ac-overview.json`, `infra/grafana/dashboards/gc-overview.json`, `infra/grafana/dashboards/mc-overview.json`
+
+New AC panels lack `editorMode` and `range` fields on targets, while new GC and MC panels include them. These are optional Grafana JSON fields that default correctly, but create inconsistency within AC's own dashboard (some existing panels have `editorMode`, new ones don't). Severity: Low (cosmetic, no functional impact). Improvement path: Add `"editorMode": "code"` and `"range": true` to all panel targets for consistency, or remove from all. Timeline: Next dashboard cleanup sprint.
+
+---
+
+### TD-25: Catalog File Naming Inconsistency
+**Added**: 2026-02-16
+**Related files**: `docs/observability/metrics/ac-service.md`, `docs/observability/metrics/gc.md`, `docs/observability/metrics/mc.md`
+
+AC catalog is `ac-service.md` while GC is `gc.md` and MC is `mc.md`. Guard script discovers files by globbing `*.md` so naming doesn't affect functionality. Severity: Low. Improvement path: Rename to consistent pattern (recommend `ac.md`, `gc.md`, `mc.md` to match the shorter convention established by GC/MC). Timeline: Next cleanup sprint.
+
+---
 This differs from Security, Test, and Code Quality reviewers where ALL findings block. Only genuine shared code requiring extraction should be classified as BLOCKER.
 
 **When to block**: Copy-pasted business logic, duplicate utilities that should be in `common/`, identical algorithms across services.

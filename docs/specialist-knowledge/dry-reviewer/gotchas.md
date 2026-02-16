@@ -200,6 +200,34 @@ Both use `status_code` as the label name, but the values are incomparable. GC us
 
 ---
 
+## Guard Script Structural Similarity is Convention When Data Sources Differ
+
+**Added**: 2026-02-16
+**Related files**: `scripts/guards/simple/validate-application-metrics.sh:259-370`
+
+**Gotcha**: Guard/validation scripts often have multiple check functions with the same iteration structure: "build lookup table from source X, iterate SERVICE_METRICS, report misses." Don't flag this as duplication when:
+1. The data sources differ (JSON dashboards vs Markdown catalog files)
+2. The extraction logic differs (jq/grep on JSON `expr` fields vs regex on `### \`metric_name\`` headings)
+3. The error messages differ (different remediation instructions)
+4. Extracting a shared "check coverage against lookup" helper would require passing extraction callbacks, making the code harder to read than the repetition
+
+**Rule**: Same loop structure + different data population = healthy convention. Same loop structure + same data population = consider extraction.
+
+---
+
+## SLO Visual Markers Have Two Valid Grafana Patterns
+
+**Added**: 2026-02-16
+**Related files**: `infra/grafana/dashboards/mc-overview.json`, `infra/grafana/dashboards/ac-overview.json`
+
+**Gotcha**: Grafana supports two approaches for SLO reference lines on latency panels, and both are valid:
+1. **Threshold markers**: `thresholdsStyle: "line"` with threshold step (AC pattern). Simpler JSON, but unlabeled in legend.
+2. **Vector query targets**: `vector(0.01)` with styled override (MC pattern). More JSON, but explicitly labeled in legend ("SLO (10ms)") and visible as a distinct series.
+
+When reviewing dashboards, don't flag inconsistency between these two approaches as a blocker. Note as TECH_DEBT with recommendation to normalize (MC's vector pattern is arguably better for operator clarity). The key question is whether SLO thresholds are visualized at all, not which Grafana mechanism is used.
+
+---
+
 ## Config Struct vs Plain Parameters in Generic Extractions
 
 **Added**: 2026-02-12

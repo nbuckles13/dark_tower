@@ -259,3 +259,11 @@ Removing a config struct from a generic function's API (replacing with plain par
 When a shared crate (e.g., `common`) can't depend on a service's metrics library, use `Option<Arc<dyn Fn(Event) + Send + Sync>>` callback defaulting to `None`. Test implications: (1) all existing tests pass unchanged (None = no callback invoked), (2) test callback invocation with `Arc<Mutex<Vec<Event>>>` to collect events, then assert on the vec contents after the operation completes, (3) test both success and failure events in the callback, (4) test error category mapping as a separate unit test (no async needed). Future services using `TokenManager` (meeting-controller, media-handler) will wire their own callbacks the same way — test pattern is reusable.
 
 ---
+
+## Pattern: Guard Script as Automated Test for Dashboard/Catalog Completeness
+**Added**: 2026-02-16
+**Related files**: `scripts/guards/simple/validate-application-metrics.sh`, `docs/observability/metrics/*.md`
+
+For JSON-and-Markdown-only changes (dashboards, catalog docs), the guard script itself serves as the primary test. Review checklist: (1) validate JSON with `python3 -c "import json; json.load(open(f))"`, (2) check panel ID uniqueness per dashboard, (3) run guard script to verify all 5 steps pass, (4) cross-reference metrics from code against both dashboards and catalogs to ensure 100% bidirectional coverage, (5) run adjacent guards (histogram buckets, infrastructure metrics, datasource validation) to verify no regressions. Histogram suffix stripping (`_bucket`, `_count`, `_sum`) in the guard is critical — without it, `histogram_quantile(0.95, rate(foo_bucket[5m]))` won't count as coverage for metric `foo`.
+
+---

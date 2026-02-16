@@ -182,3 +182,11 @@ The `instrument-skip-all` validation guard pattern-matches on `#[instrument(` pr
 When renaming crate directories/packages (e.g., `global-controller` → `gc-service`), distinguish between **crate-level names** (Cargo.toml package, lib, bin, `use` paths, directory paths) and **domain-level identifiers** (AC `service_type` values like `"global-controller"` stored in the database, used in JWT claims, validated in API handlers). Crate names change; domain identifiers do NOT -- they are part of the API contract and DB schema. However, **K8s labels** (`app=gc-service`) referenced in test code (env-tests canary pods) MUST match the renamed K8s manifests. The env-tests are an easy-to-miss location because they're Rust code containing K8s label strings, not YAML manifests.
 
 ---
+
+## Gotcha: Inconsistent `job=` Filter Convention Across Service Dashboards
+**Added**: 2026-02-16
+**Related files**: `infra/grafana/dashboards/ac-overview.json`, `infra/grafana/dashboards/gc-overview.json`, `infra/grafana/dashboards/mc-overview.json`
+
+AC dashboard panels include `job="ac-service"` filters in PromQL expressions for application metrics, but GC and MC dashboards omit `job=` filters entirely on application metrics. Both conventions are valid (service-prefixed metric names like `gc_*` are already scoped to a single service, making `job=` redundant). This is pre-existing -- when reviewing new dashboard panels, follow the existing convention for that specific dashboard file rather than enforcing cross-dashboard uniformity. If a future PR standardizes this, it should be a separate cleanup across all dashboards simultaneously.
+
+---

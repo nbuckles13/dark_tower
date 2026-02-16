@@ -87,3 +87,10 @@ When a metrics pattern is established in one service (e.g., GC's `record_token_r
 Project-wide validation guards (e.g., `instrument-skip-all` requiring all async functions with parameters to have `#[instrument(skip_all)]`) may conflict with plan-phase agreements. During TD-13 iteration 1, we agreed the generic function should not have `#[instrument]`, but the guard required it. **Resolution in iteration 2**: removing `#[instrument]` entirely from the generic function and using `.instrument()` chaining in callers avoids the guard entirely, since the guard only pattern-matches on `#[instrument(` attributes, not the `Instrument` trait method. This is the preferred resolution when the goal is caller-controlled spans. When reviewing, still check whether deviations from the plan are due to guard requirements before flagging them.
 
 ---
+
+## Integration: Metrics Guard Now Enforces Dashboard + Catalog Coverage
+**Added**: 2026-02-16
+
+`scripts/guards/simple/validate-application-metrics.sh` Step 4 (dashboard coverage) is now a **hard fail** (was soft warning). Step 5 (catalog documentation) is a new **hard fail**. This means: any metric added to `metrics.rs` MUST also be added to a Grafana dashboard AND documented in `docs/observability/metrics/`. The guard handles histogram suffixes correctly (`_bucket`, `_count`, `_sum` in PromQL are recognized as coverage for the base metric). When reviewing PRs that add new metrics, the guard pipeline will catch coverage gaps automatically -- focus code review effort on quality (correct PromQL, appropriate panel types, accurate catalog descriptions) rather than completeness.
+
+---

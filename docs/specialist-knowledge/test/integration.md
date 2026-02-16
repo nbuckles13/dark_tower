@@ -123,3 +123,11 @@ Simple wiring (direct calls): behavior tests + wrapper module tests sufficient. 
 When extracting shared logic into a generic module with thin wrappers, verify: (1) wrapper public signatures unchanged (tests call wrappers, not generic), (2) constants re-exported so `super::CONSTANT` still resolves in test modules, (3) test count >= original (no silent drops from missing mod.rs entries). Wrapper-preserving pattern is safest for test preservation — zero test code changes. Flag asymmetric test coverage between parallel implementations as pre-existing tech debt (not caused by refactor). Iterative simplification (e.g., config struct → plain parameters) is safe when tests only touch wrappers. Also: `.instrument()` chaining vs `#[instrument]` attribute is invisible to tests — neither requires test changes.
 
 ---
+
+## For Observability Specialist: Dashboard + Catalog Changes Are Guard-Tested
+**Added**: 2026-02-16
+**Related files**: `scripts/guards/simple/validate-application-metrics.sh`, `docs/observability/metrics/*.md`
+
+When adding dashboard panels or catalog entries (no Rust code changes), the guard script `validate-application-metrics.sh` is the primary verification. It enforces: (1) every metric in code has a dashboard panel, (2) every metric in code has a catalog entry, (3) dashboard queries reference real metrics, (4) metric prefixes match service convention. Test reviewer validates by running the guard + checking JSON validity + cross-referencing coverage. No Rust tests needed for JSON/Markdown-only changes. When adding a new service's catalog file, ensure the `### \`metric_name\`` heading format is followed exactly — the guard parses this pattern.
+
+---
