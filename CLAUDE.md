@@ -55,17 +55,17 @@ The platform consists of **five main components**:
 ### 2. Global Controller 🚧 SKELETON
 - **Status**: Planned for Phase 5
 - **Purpose**: HTTP/3 API gateway, geographic routing, meeting management
-- **Location**: `crates/global-controller/`
+- **Location**: `crates/gc-service/`
 
 ### 3. Meeting Controller 🚧 SKELETON
 - **Status**: Planned for Phase 6
 - **Purpose**: WebTransport signaling, session management, participant coordination
-- **Location**: `crates/meeting-controller/`
+- **Location**: `crates/mc-service/`
 
 ### 4. Media Handler 🚧 SKELETON
 - **Status**: Planned for Phase 7
 - **Purpose**: SFU (Selective Forwarding Unit) media routing, quality adaptation
-- **Location**: `crates/media-handler/`
+- **Location**: `crates/mh-service/`
 
 ### 5. Client 📋 PLANNED
 - **Status**: Planned for Phase 8
@@ -236,9 +236,9 @@ dark_tower/
 │   ├── common/              # Shared types and utilities
 │   ├── proto-gen/           # Generated Protocol Buffer code
 │   ├── media-protocol/      # Proprietary media protocol
-│   ├── global-controller/   # Global API gateway (SKELETON)
-│   ├── meeting-controller/  # Meeting signaling (SKELETON)
-│   └── media-handler/       # Media routing SFU (SKELETON)
+│   ├── gc-service/          # Global API gateway (SKELETON)
+│   ├── mc-service/          # Meeting signaling (SKELETON)
+│   └── mh-service/          # Media routing SFU (SKELETON)
 ├── client/                  # Svelte web application (PLANNED)
 ├── proto/                   # Protocol Buffer definitions
 │   ├── signaling.proto      # Client ↔ Meeting Controller messages

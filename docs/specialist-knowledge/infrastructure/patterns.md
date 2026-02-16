@@ -14,7 +14,7 @@ Deploy minimal test pods to validate NetworkPolicy enforcement from within the c
 
 ## Pattern: Multi-Stage Dockerfile with cargo-chef
 **Added**: 2026-02-11
-**Related files**: `infra/docker/ac-service/Dockerfile`, `infra/docker/global-controller/Dockerfile`, `infra/docker/meeting-controller/Dockerfile`
+**Related files**: `infra/docker/ac-service/Dockerfile`, `infra/docker/gc-service/Dockerfile`, `infra/docker/mc-service/Dockerfile`
 
 Use cargo-chef for efficient dependency caching in multi-stage Docker builds. Four stages: chef (install cargo-chef + build deps), planner (generate recipe.json), builder (cache deps separately from source), runtime (minimal distroless). Dependencies are cached in a separate layer that only rebuilds when Cargo.toml/Cargo.lock changes. Binary is stripped to reduce size. Production uses gcr.io/distroless/cc-debian12 (minimal, no HEALTHCHECK), debug variant uses :debug tag with busybox for HEALTHCHECK support.
 
@@ -22,7 +22,7 @@ Use cargo-chef for efficient dependency caching in multi-stage Docker builds. Fo
 
 ## Pattern: Kubernetes Service Manifests - Standard Seven Files
 **Added**: 2026-02-11
-**Related files**: `infra/services/ac-service/`, `infra/services/global-controller/`, `infra/services/meeting-controller/`, `infra/services/redis/`
+**Related files**: `infra/services/ac-service/`, `infra/services/gc-service/`, `infra/services/mc-service/`, `infra/services/redis/`
 
 Every Dark Tower service follows a standard 7-file manifest pattern: deployment.yaml or statefulset.yaml (workload), service.yaml (ClusterIP for internal routing), configmap.yaml (non-secret config), secret.yaml (credentials, generated from templates), network-policy.yaml (ingress/egress rules per ADR-0012), service-monitor.yaml (Prometheus scraping, commented until metrics implemented), pdb.yaml (PodDisruptionBudget with minAvailable: 1 for HA). This pattern ensures consistency across all services and simplifies operations.
 
@@ -54,7 +54,7 @@ Handle namespace creation race conditions in parallel test runs. Check if namesp
 
 ## Pattern: Deployment Strategies - StatefulSet vs Deployment
 **Added**: 2026-02-11
-**Related files**: `infra/services/ac-service/statefulset.yaml`, `infra/services/global-controller/deployment.yaml`, `infra/services/redis/statefulset.yaml`
+**Related files**: `infra/services/ac-service/statefulset.yaml`, `infra/services/gc-service/deployment.yaml`, `infra/services/redis/statefulset.yaml`
 
 AC service uses StatefulSet (not Deployment) because it needs stable identity for key management and coordination, even though it doesn't use persistent volumes. GC and MC use Deployment because they are stateless and benefit from flexible scheduling. Redis and PostgreSQL use StatefulSet for stable network identity and persistent storage. Rule: Use StatefulSet only when you need stable pod identity or persistent volumes, otherwise prefer Deployment for better scheduling flexibility.
 
@@ -62,7 +62,7 @@ AC service uses StatefulSet (not Deployment) because it needs stable identity fo
 
 ## Pattern: Security Context - Distroless and Rootless
 **Added**: 2026-02-11
-**Related files**: `infra/services/global-controller/deployment.yaml`, `infra/services/redis/statefulset.yaml`
+**Related files**: `infra/services/gc-service/deployment.yaml`, `infra/services/redis/statefulset.yaml`
 
 All service pods enforce security hardening: runAsNonRoot: true, runAsUser: 65532 (distroless nonroot) or 999 (Redis), readOnlyRootFilesystem: true, allowPrivilegeEscalation: false, capabilities drop ALL. Volumes use emptyDir for /tmp since root filesystem is read-only. This defense-in-depth approach limits container escape even if the application is compromised.
 

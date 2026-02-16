@@ -37,7 +37,7 @@ kubectl get pods -n dark-tower
 echo ""
 
 info "1.2 Checking GC token acquisition..."
-GC_TOKEN_LOGS=$(kubectl logs -n dark-tower -l app=global-controller --tail=50 2>/dev/null | grep -i "token\|415" || true)
+GC_TOKEN_LOGS=$(kubectl logs -n dark-tower -l app=gc-service --tail=50 2>/dev/null | grep -i "token\|415" || true)
 if echo "$GC_TOKEN_LOGS" | grep -q "Token acquired successfully\|token acquired"; then
     pass "GC acquired OAuth token"
 elif echo "$GC_TOKEN_LOGS" | grep -q "415"; then
@@ -50,7 +50,7 @@ fi
 echo ""
 
 info "1.3 Checking MC token acquisition..."
-MC_TOKEN_LOGS=$(kubectl logs -n dark-tower -l app=meeting-controller --tail=50 2>/dev/null | grep -i "token\|415" || true)
+MC_TOKEN_LOGS=$(kubectl logs -n dark-tower -l app=mc-service --tail=50 2>/dev/null | grep -i "token\|415" || true)
 if echo "$MC_TOKEN_LOGS" | grep -q "Token acquired successfully\|token acquired"; then
     pass "MC acquired OAuth token"
 elif echo "$MC_TOKEN_LOGS" | grep -q "415"; then
@@ -86,7 +86,7 @@ fi
 echo ""
 
 info "2.2 Checking MC registration with GC..."
-MC_REG_LOGS=$(kubectl logs -n dark-tower -l app=global-controller --tail=50 2>/dev/null | grep -iE "controller.*register|heartbeat" || true)
+MC_REG_LOGS=$(kubectl logs -n dark-tower -l app=gc-service --tail=50 2>/dev/null | grep -iE "controller.*register|heartbeat" || true)
 if [ -n "$MC_REG_LOGS" ]; then
     pass "MC is communicating with GC"
     echo "$MC_REG_LOGS" | head -5
@@ -103,7 +103,7 @@ echo ""
 info "3.1 Checking if port-forward is needed..."
 if ! curl -s http://localhost:8080/health > /dev/null 2>&1; then
     info "GC not accessible on localhost:8080"
-    info "To test API, run: kubectl port-forward -n dark-tower svc/global-controller 8080:8080"
+    info "To test API, run: kubectl port-forward -n dark-tower svc/gc-service 8080:8080"
 else
     pass "GC accessible on localhost:8080"
 
@@ -126,7 +126,7 @@ echo "To run comprehensive tests:"
 echo "  cargo test -p env-tests --features smoke,flows,resilience"
 echo ""
 echo "To test meeting creation (requires port-forward):"
-echo "  kubectl port-forward -n dark-tower svc/global-controller 8080:8080"
+echo "  kubectl port-forward -n dark-tower svc/gc-service 8080:8080"
 echo "  curl -X POST http://localhost:8080/api/v1/meetings \\"
 echo "    -H 'Content-Type: application/json' \\"
 echo "    -d '{\"meeting_id\": \"test-oauth-meeting-001\"}'"

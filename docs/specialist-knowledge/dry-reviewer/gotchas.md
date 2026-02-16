@@ -22,7 +22,7 @@ This file captures pitfalls and anti-patterns discovered during DRY reviews.
 ## Acceptable Internal Duplication (Same-File, Same-Purpose)
 
 **Added**: 2026-01-31
-**Related files**: `crates/meeting-controller/src/grpc/gc_client.rs:357-363, 436-442` (NOT_FOUND detection), `crates/meeting-controller/src/grpc/gc_client.rs:178-195, 471-488` (RegisterMcRequest construction)
+**Related files**: `crates/mc-service/src/grpc/gc_client.rs:357-363, 436-442` (NOT_FOUND detection), `crates/mc-service/src/grpc/gc_client.rs:178-195, 471-488` (RegisterMcRequest construction)
 
 **Gotcha**: Don't immediately flag duplication within a single file if:
 1. Only 2 occurrences (not N occurrences)
@@ -45,7 +45,7 @@ This file captures pitfalls and anti-patterns discovered during DRY reviews.
 ## Test Code Structural Similarity is Often Justified
 
 **Added**: 2026-01-31
-**Related files**: `crates/meeting-controller/tests/gc_integration.rs:547-611` (test_heartbeat_not_found_detection vs test_comprehensive_heartbeat_not_found_detection)
+**Related files**: `crates/mc-service/tests/gc_integration.rs:547-611` (test_heartbeat_not_found_detection vs test_comprehensive_heartbeat_not_found_detection)
 
 **Gotcha**: Don't flag test code duplication if tests are structurally similar but test different code paths. Tests should prioritize clarity over DRY.
 
@@ -63,7 +63,7 @@ This file captures pitfalls and anti-patterns discovered during DRY reviews.
 ## Proactive Common Code Placement Validates Pattern
 
 **Added**: 2026-02-02
-**Related files**: `crates/common/src/token_manager.rs`, `crates/meeting-controller/src/main.rs`
+**Related files**: `crates/common/src/token_manager.rs`, `crates/mc-service/src/main.rs`
 
 **Gotcha**: When shared code is placed in `common` proactively (before second consumer exists), don't flag the single-consumer case as "premature extraction." Instead, verify proper usage and note as validation.
 
@@ -82,7 +82,7 @@ This file captures pitfalls and anti-patterns discovered during DRY reviews.
 ## Health Status Conversion Must Be Fail-Closed Consistent
 
 **Added**: 2026-01-31
-**Related files**: `crates/meeting-controller/src/grpc/health.rs`, `crates/media-handler/src/grpc/health.rs`
+**Related files**: `crates/mc-service/src/grpc/health.rs`, `crates/mh-service/src/grpc/health.rs`
 
 **Gotcha**: When services convert internal health status to gRPC health status (or vice versa), ensure **fail-closed** semantics are consistent across all services. If one service returns `Serving` when unknown and another returns `NotServing`, the system has inconsistent failure semantics - this is a security concern.
 
@@ -97,7 +97,7 @@ This file captures pitfalls and anti-patterns discovered during DRY reviews.
 ## Service-Prefixed Metrics Are Convention, Not Duplication
 
 **Added**: 2026-02-04 | **Updated**: 2026-02-10
-**Related files**: `crates/global-controller/src/observability/metrics.rs`, `crates/ac-service/src/observability/metrics.rs`, `crates/meeting-controller/src/observability/metrics.rs`
+**Related files**: `crates/gc-service/src/observability/metrics.rs`, `crates/ac-service/src/observability/metrics.rs`, `crates/mc-service/src/observability/metrics.rs`
 
 **Gotcha**: Don't flag service-prefixed metric names (`gc_http_requests_total`, `ac_http_requests_total`, `mc_gc_heartbeats_total`) as duplication. Each service MUST have its own metric prefix per Prometheus best practices (ADR-0011). The prefix enables:
 - Service identification in federated queries
@@ -109,7 +109,7 @@ This file captures pitfalls and anti-patterns discovered during DRY reviews.
 **What is NOT duplication**:
 - Different metric names with service prefixes (`mc_gc_heartbeats_total` vs `gc_http_requests_total`)
 - Different label sets appropriate to service domain (MC uses `type` label for heartbeat type, GC uses `endpoint` for HTTP paths)
-- Service-specific observability modules in each crate (`crates/meeting-controller/src/observability/`, `crates/global-controller/src/observability/`)
+- Service-specific observability modules in each crate (`crates/mc-service/src/observability/`, `crates/gc-service/src/observability/`)
 
 **Architectural context**: Per ADR-0011, each service maintains its own observability module. There is NO shared metrics infrastructure in `crates/common/`. This is intentional - metrics are service-specific.
 
@@ -148,7 +148,7 @@ This file captures pitfalls and anti-patterns discovered during DRY reviews.
 ## Clear Responsibility Separation Means Different Data Types May Coexist
 
 **Added**: 2026-02-05
-**Related files**: `crates/meeting-controller/src/actors/metrics.rs:248-323` (ControllerMetrics), `crates/meeting-controller/src/actors/metrics.rs:325-425` (ActorMetrics)
+**Related files**: `crates/mc-service/src/actors/metrics.rs:248-323` (ControllerMetrics), `crates/mc-service/src/actors/metrics.rs:325-425` (ActorMetrics)
 
 **Gotcha**: Don't flag two very similar metric structs as DRY violation if they serve fundamentally different purposes and are used by different subsystems. In MC:
 - `ControllerMetrics` (u32): For heartbeat reporting to GC, reported via RPC
@@ -169,7 +169,7 @@ They happen to both track `meetings` and `connections`, but:
 ## Thin Wrapper Similarity After Extraction is Healthy Convention
 
 **Added**: 2026-02-12 | **Updated**: 2026-02-12 (iteration 2)
-**Related files**: `crates/global-controller/src/tasks/health_checker.rs:37-65`, `crates/global-controller/src/tasks/mh_health_checker.rs:37-65`
+**Related files**: `crates/gc-service/src/tasks/health_checker.rs:37-65`, `crates/gc-service/src/tasks/mh_health_checker.rs:37-65`
 
 **Gotcha**: After extracting shared logic into a generic function, the remaining thin wrappers will still look structurally similar (~25 lines each: startup log, delegation call with `.instrument()` chaining, shutdown log). Do NOT flag this residual similarity as duplication requiring further extraction. The wrappers differ in:
 - `.instrument(tracing::info_span!("..."))` span names (string literals)
@@ -186,7 +186,7 @@ These differences cannot be further extracted without macros or losing tracing f
 ## Config Struct vs Plain Parameters in Generic Extractions
 
 **Added**: 2026-02-12
-**Related files**: `crates/global-controller/src/tasks/generic_health_checker.rs`
+**Related files**: `crates/gc-service/src/tasks/generic_health_checker.rs`
 
 **Gotcha**: When extracting a generic function, resist the temptation to group domain-differentiating values into a config struct if there are only 1-2 parameters. A `HealthCheckerConfig { display_name, entity_name }` struct was introduced in iteration 1 and removed in iteration 2 because:
 - It added indirection (callers had to construct a struct just to pass 2 strings)

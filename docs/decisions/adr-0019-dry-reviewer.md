@@ -12,7 +12,7 @@
 
 Dark Tower uses a specialist-led development model where each specialist is scoped to a single service:
 - Auth Controller specialist owns `crates/ac-service/`
-- Global Controller specialist owns `crates/global-controller/`
+- Global Controller specialist owns `crates/gc-service/`
 - etc.
 
 This scoping is intentional and necessary to keep context manageable. However, it creates blind spots for cross-service code duplication.

@@ -24,16 +24,16 @@ build:
         dockerfile: infra/docker/ac-service/Dockerfile
         buildArgs:
           RUST_VERSION: "1.83"
-    - image: dark-tower/global-controller
+    - image: dark-tower/gc-service
       context: ..
       docker:
-        dockerfile: infra/docker/global-controller/Dockerfile
+        dockerfile: infra/docker/gc-service/Dockerfile
         buildArgs:
           RUST_VERSION: "1.83"
-    - image: dark-tower/meeting-controller
+    - image: dark-tower/mc-service
       context: ..
       docker:
-        dockerfile: infra/docker/meeting-controller/Dockerfile
+        dockerfile: infra/docker/mc-service/Dockerfile
         buildArgs:
           RUST_VERSION: "1.83"
 
@@ -47,8 +47,8 @@ deploy:
     manifests:
       - services/redis/*.yaml
       - services/ac-service/*.yaml
-      - services/global-controller/*.yaml
-      - services/meeting-controller/*.yaml
+      - services/gc-service/*.yaml
+      - services/mc-service/*.yaml
 
 # Port forwarding for local access
 portForward:
@@ -58,17 +58,17 @@ portForward:
     port: 8082
     localPort: 8083  # Use 8083 to avoid conflict with local cargo run on 8082
   - resourceType: service
-    resourceName: global-controller
+    resourceName: gc-service
     namespace: dark-tower
     port: 8080
     localPort: 8080  # GC HTTP API
   - resourceType: service
-    resourceName: global-controller
+    resourceName: gc-service
     namespace: dark-tower
     port: 50051
     localPort: 50051  # GC gRPC
   - resourceType: service
-    resourceName: meeting-controller
+    resourceName: mc-service
     namespace: dark-tower
     port: 8081
     localPort: 8084  # MC health endpoint (avoid conflict with other services)

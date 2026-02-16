@@ -23,23 +23,23 @@ scrape_configs:
       - targets: ['localhost:9090']
 
   # Global Controller (when implemented)
-  - job_name: 'global-controller'
+  - job_name: 'gc-service'
     static_configs:
-      - targets: ['global-controller:8000']
+      - targets: ['gc-service:8000']
     metrics_path: '/metrics'
     scrape_interval: 10s
 
   # Meeting Controller (when implemented)
-  - job_name: 'meeting-controller'
+  - job_name: 'mc-service'
     static_configs:
-      - targets: ['meeting-controller:9100']
+      - targets: ['mc-service:9100']
     metrics_path: '/metrics'
     scrape_interval: 10s
 
   # Media Handler (when implemented)
-  - job_name: 'media-handler'
+  - job_name: 'mh-service'
     static_configs:
-      - targets: ['media-handler:9100']
+      - targets: ['mh-service:9100']
     metrics_path: '/metrics'
     scrape_interval: 5s  # More frequent for real-time media metrics
 

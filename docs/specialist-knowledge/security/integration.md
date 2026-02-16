@@ -60,7 +60,7 @@ Master keys via environment variables or secrets manager (external-secrets-opera
 
 ## Integration: Global Controller - JWT/JWKS Validation
 **Added**: 2026-01-14
-**Related files**: `crates/global-controller/src/auth/jwt.rs`, `crates/global-controller/src/auth/jwks.rs`
+**Related files**: `crates/gc-service/src/auth/jwt.rs`, `crates/gc-service/src/auth/jwks.rs`
 
 GC validates JWTs from AC via JWKS. Requirements: (1) Fetch JWKS from AC_JWKS_URL with caching (5 min TTL), (2) Validate token `alg` is `EdDSA`, (3) Extract `kid` and find matching JWK, (4) Validate JWK fields: `kty == "OKP"` and `alg == "EdDSA"`, (5) Verify signature, (6) Check `iat` with clock skew tolerance, (7) Return generic error messages on failure.
 
@@ -68,7 +68,7 @@ GC validates JWTs from AC via JWKS. Requirements: (1) Fetch JWKS from AC_JWKS_UR
 
 ## Integration: Global Controller - Media Handler Registration Security
 **Added**: 2026-01-24 (Updated: 2026-01-31)
-**Related files**: `crates/global-controller/src/grpc/mh_service.rs`, `crates/global-controller/src/repositories/media_handlers.rs`
+**Related files**: `crates/gc-service/src/grpc/mh_service.rs`, `crates/gc-service/src/repositories/media_handlers.rs`
 
 When Media Handlers register with GC, validate: (1) handler_id format (alphanumeric + underscore/hyphen only, max 64 chars), (2) endpoint URL scheme (HTTPS required), (3) service_token stored as SecretString not plain String. Registration endpoints should be authenticated - only services with valid AC tokens can register handlers. Consider IP allowlisting for handler registration in production.
 
@@ -93,7 +93,7 @@ Service must fail startup if `MC_BINDING_TOKEN_SECRET` is not configured.
 
 ## Integration: Meeting Controller - GC Communication Security
 **Added**: 2026-01-25 (Updated: 2026-01-30)
-**Related files**: `crates/meeting-controller/src/grpc/auth_interceptor.rs`, `crates/meeting-controller/src/grpc/gc_client.rs`, `crates/meeting-controller/src/actors/controller.rs`
+**Related files**: `crates/mc-service/src/grpc/auth_interceptor.rs`, `crates/mc-service/src/grpc/gc_client.rs`, `crates/mc-service/src/actors/controller.rs`
 
 GC-to-MC communication uses authenticated gRPC. Security requirements:
 
@@ -109,7 +109,7 @@ The gRPC interceptor pattern ensures authorization is checked before handler cod
 
 ## Integration: Meeting Controller - Session Binding Token Security
 **Added**: 2026-01-28 (Updated: 2026-02-10)
-**Related files**: `crates/meeting-controller/src/actors/session.rs`, `crates/meeting-controller/src/actors/meeting.rs`, `docs/decisions/adr-0023-meeting-controller-architecture.md`
+**Related files**: `crates/mc-service/src/actors/session.rs`, `crates/mc-service/src/actors/meeting.rs`, `docs/decisions/adr-0023-meeting-controller-architecture.md`
 
 Session binding tokens provide recovery after connection drops per ADR-0023 Section 1. Security requirements:
 
@@ -145,7 +145,7 @@ Services that require OAuth tokens (GC, MC when calling AC) should initialize To
 
 ## Integration: Meeting Controller - Observability Metrics Security
 **Added**: 2026-02-05
-**Related files**: `crates/meeting-controller/src/actors/metrics.rs`, `crates/meeting-controller/src/observability/metrics.rs`
+**Related files**: `crates/mc-service/src/actors/metrics.rs`, `crates/mc-service/src/observability/metrics.rs`
 
 MC exposes internal metrics to Prometheus per ADR-0023. Security requirements to prevent PII leakage:
 

@@ -226,7 +226,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "up{job=\"meeting-controller\"}",
+          "expr": "up{job=\"mc-service\"}",
           "legendFormat": "Status",
           "range": true,
           "refId": "A"
@@ -425,7 +425,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "count(up{job=\"meeting-controller\"} == 1)",
+          "expr": "count(up{job=\"mc-service\"} == 1)",
           "legendFormat": "Pod Count",
           "range": true,
           "refId": "A"
@@ -1155,7 +1155,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "container_memory_working_set_bytes{namespace=\"dark-tower\", pod=~\"meeting-controller.*\"}",
+          "expr": "container_memory_working_set_bytes{namespace=\"dark-tower\", pod=~\"mc-service.*\"}",
           "legendFormat": "{{pod}}",
           "range": true,
           "refId": "A"
@@ -1245,7 +1245,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "rate(container_cpu_usage_seconds_total{namespace=\"dark-tower\", pod=~\"meeting-controller.*\"}[5m])",
+          "expr": "rate(container_cpu_usage_seconds_total{namespace=\"dark-tower\", pod=~\"mc-service.*\"}[5m])",
           "legendFormat": "{{pod}}",
           "range": true,
           "refId": "A"
@@ -1364,7 +1364,7 @@
   "refresh": "10s",
   "schemaVersion": 38,
   "style": "dark",
-  "tags": ["meeting-controller", "service-overview"],
+  "tags": ["mc-service", "service-overview"],
   "templating": {
     "list": []
   },

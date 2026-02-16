@@ -62,7 +62,7 @@ When testing JWKS endpoints for private key leakage, check for ALL private key f
 
 ## Pattern: Query Timeout via Connection URL Parameters
 **Added**: 2026-01-14
-**Related files**: `crates/global-controller/src/main.rs`
+**Related files**: `crates/gc-service/src/main.rs`
 
 Prevent hung queries and DoS attacks by setting database statement_timeout at connection time, not per-query. Pattern: append `?options=-c%20statement_timeout%3D{seconds}` to the PostgreSQL connection URL. This ensures ALL queries timeout after N seconds, preventing resource exhaustion. Combine with application-level request timeout for defense-in-depth. Set timeout low enough (e.g., 5 seconds) to catch expensive operations, high enough for legitimate slow queries.
 
@@ -70,7 +70,7 @@ Prevent hung queries and DoS attacks by setting database statement_timeout at co
 
 ## Pattern: JWK Field Validation as Defense-in-Depth
 **Added**: 2026-01-14
-**Related files**: `crates/global-controller/src/auth/jwt.rs`
+**Related files**: `crates/gc-service/src/auth/jwt.rs`
 
 JWT validation includes algorithm pinning (token must have `alg: EdDSA`), but defense-in-depth also requires validating JWK fields: (1) `kty` (key type) must be `"OKP"` (Octet Key Pair) for Ed25519 keys, (2) `alg` field in JWK, if present, must be `"EdDSA"`. This prevents accepting keys from wrong cryptosystems. Pattern: Validate JWK fields at start of token verification before any crypto operations.
 
@@ -91,7 +91,7 @@ This provides defense-in-depth beyond custom Debug implementations, catching cre
 
 ## Pattern: External Resource Registration Validation
 **Added**: 2026-01-24 (Updated: 2026-01-31)
-**Related files**: `crates/global-controller/src/grpc/mh_service.rs`, `crates/global-controller/src/repositories/media_handlers.rs`
+**Related files**: `crates/gc-service/src/grpc/mh_service.rs`, `crates/gc-service/src/repositories/media_handlers.rs`
 
 When services register external resources (handlers, endpoints, callback URLs), validate both identifier format AND URL security:
 
@@ -142,7 +142,7 @@ Benefits: (1) Compromise of one meeting's tokens doesn't reveal master secret, (
 
 ## Pattern: gRPC Interceptor for Authorization Validation
 **Added**: 2026-01-25 (Updated: 2026-01-30)
-**Related files**: `crates/meeting-controller/src/grpc/auth_interceptor.rs`
+**Related files**: `crates/mc-service/src/grpc/auth_interceptor.rs`
 
 Use gRPC interceptors (tonic middleware) to enforce authorization on incoming service-to-service calls. Pattern:
 
@@ -158,7 +158,7 @@ Benefits: (1) Centralized auth logic - not scattered in handlers, (2) Defense-in
 
 ## Pattern: Token Size Limits for DoS Prevention
 **Added**: 2026-01-25 (Updated: 2026-01-30)
-**Related files**: `crates/meeting-controller/src/grpc/auth_interceptor.rs`
+**Related files**: `crates/mc-service/src/grpc/auth_interceptor.rs`
 
 Enforce maximum token size before parsing to prevent memory exhaustion attacks. Pattern:
 
@@ -180,7 +180,7 @@ This prevents: (1) Memory exhaustion from giant Base64 decode, (2) CPU exhaustio
 
 ## Pattern: Multiple SecretBox Copies with Isolated Lifecycles
 **Added**: 2026-01-28
-**Related files**: `crates/meeting-controller/src/actors/controller.rs`, `crates/meeting-controller/src/actors/meeting.rs`, `crates/meeting-controller/src/actors/session.rs`
+**Related files**: `crates/mc-service/src/actors/controller.rs`, `crates/mc-service/src/actors/meeting.rs`, `crates/mc-service/src/actors/session.rs`
 
 When distributing a master secret to multiple actor instances, create isolated SecretBox copies for each. Pattern:
 
@@ -202,7 +202,7 @@ When distributing a master secret to multiple actor instances, create isolated S
 
 ## Pattern: Explicit Instrument Field Allowlists for Privacy-by-Default
 **Added**: 2026-01-28
-**Related files**: `crates/global-controller/src/auth/jwt.rs`, `crates/global-controller/src/middleware/auth.rs`, `crates/global-controller/src/services/ac_client.rs`
+**Related files**: `crates/gc-service/src/auth/jwt.rs`, `crates/gc-service/src/middleware/auth.rs`, `crates/gc-service/src/services/ac_client.rs`
 
 Use `#[instrument(skip_all, fields(...))]` with explicit field allowlists rather than `skip_all` alone. Pattern:
 
@@ -251,7 +251,7 @@ pub fn hash_client_secret(secret: &str, cost: u32) -> Result<String> { ... }
 
 ## Pattern: Server-Side Error Context with Generic Client Messages
 **Added**: 2026-01-28 (Updated: 2026-01-29)
-**Related files**: `crates/global-controller/src/errors.rs`, `crates/global-controller/src/handlers/meetings.rs`, `crates/global-controller/src/grpc/mc_service.rs`, `crates/ac-service/src/crypto/mod.rs`
+**Related files**: `crates/gc-service/src/errors.rs`, `crates/gc-service/src/handlers/meetings.rs`, `crates/gc-service/src/grpc/mc_service.rs`, `crates/ac-service/src/crypto/mod.rs`
 
 Preserve error context for debugging via server-side logging while returning generic messages to clients. Pattern:
 
@@ -303,7 +303,7 @@ This pattern applies to all service observability: GC, AC, MC, MH dashboards and
 
 ## Pattern: Metric Label Security for Cardinality and Privacy
 **Added**: 2026-02-09
-**Related files**: `crates/global-controller/src/observability/metrics.rs`, `crates/global-controller/src/services/mh_selection.rs`
+**Related files**: `crates/gc-service/src/observability/metrics.rs`, `crates/gc-service/src/services/mh_selection.rs`
 
 When instrumenting code with metrics (Prometheus counters/histograms), enforce cardinality bounds and privacy at the metric recording site:
 
@@ -329,7 +329,7 @@ When instrumenting code with metrics (Prometheus counters/histograms), enforce c
 
 ## Pattern: Test Infrastructure Security (Mock Credentials)
 **Added**: 2026-01-31
-**Related files**: `crates/meeting-controller/tests/gc_integration.rs`, `crates/global-controller/tests/meeting_tests.rs`
+**Related files**: `crates/mc-service/tests/gc_integration.rs`, `crates/gc-service/tests/meeting_tests.rs`
 
 Test infrastructure (mocks, fixtures, integration tests) should use obviously fake credentials to prevent confusion with production values. Pattern:
 
@@ -355,7 +355,7 @@ Config {
 
 ## Pattern: Bounded Label Values for Cardinality Safety in Observability
 **Added**: 2026-02-05 (Updated: 2026-02-10)
-**Related files**: `crates/meeting-controller/src/actors/metrics.rs`, `crates/meeting-controller/src/observability/metrics.rs`
+**Related files**: `crates/mc-service/src/actors/metrics.rs`, `crates/mc-service/src/observability/metrics.rs`
 
 Prometheus metrics with labels must use bounded, enumerated values to prevent cardinality explosion that can crash monitoring systems. Pattern:
 
@@ -392,7 +392,7 @@ pub fn set_actor_mailbox_depth(actor_type: &str, depth: usize) { ... }
 
 ## Pattern: Security Review of Generic Abstractions (Refactoring)
 **Added**: 2026-02-12 (Updated: 2026-02-12)
-**Related files**: `crates/global-controller/src/tasks/generic_health_checker.rs`, `crates/global-controller/src/tasks/health_checker.rs`
+**Related files**: `crates/gc-service/src/tasks/generic_health_checker.rs`, `crates/gc-service/src/tasks/health_checker.rs`
 
 When reviewing refactorings that extract generic/shared abstractions from concrete implementations, verify these security properties are preserved:
 

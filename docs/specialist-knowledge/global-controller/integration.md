@@ -6,7 +6,7 @@ What other services need to know when integrating with the Global Controller.
 
 ## Integration: JWT Validation Flow
 **Added**: 2026-01-14
-**Related files**: `crates/global-controller/src/auth/`, `crates/global-controller/src/middleware/auth.rs`
+**Related files**: `crates/gc-service/src/auth/`, `crates/gc-service/src/middleware/auth.rs`
 
 End-to-end JWT validation in GC:
 1. Client sends: `Authorization: Bearer <token>`
@@ -25,7 +25,7 @@ End-to-end JWT validation in GC:
 
 ## Integration: Protected Routes Pattern
 **Added**: 2026-01-14
-**Related files**: `crates/global-controller/src/routes/mod.rs`
+**Related files**: `crates/gc-service/src/routes/mod.rs`
 
 Protected routes use `middleware::from_fn_with_state`:
 ```rust
@@ -49,7 +49,7 @@ The middleware chain:
 
 ## Integration: Claims Structure
 **Added**: 2026-01-14
-**Related files**: `crates/global-controller/src/auth/claims.rs`
+**Related files**: `crates/gc-service/src/auth/claims.rs`
 
 JWT claims struct from AC tokens:
 ```
@@ -65,7 +65,7 @@ Handlers extract via request extensions. Claims implement Debug with redacted `s
 
 ## Integration: Testing with Mocked JWKS
 **Added**: 2026-01-14
-**Related files**: `crates/global-controller/tests/auth_tests.rs`
+**Related files**: `crates/gc-service/tests/auth_tests.rs`
 
 Integration tests use wiremock to mock AC's JWKS endpoint:
 - Start mock server with `wiremock::MockServer::new()`
@@ -78,7 +78,7 @@ Integration tests use wiremock to mock AC's JWKS endpoint:
 
 ## Integration: AC Internal Token Endpoints
 **Added**: 2026-01-15, **Updated**: 2026-02-11
-**Related files**: `crates/global-controller/src/services/ac_client.rs`, `crates/common/src/token_manager.rs`
+**Related files**: `crates/gc-service/src/services/ac_client.rs`, `crates/common/src/token_manager.rs`
 
 GC calls AC internal endpoints for meeting tokens:
 - `POST /api/v1/auth/internal/meeting-token` - Issue token for authenticated user joining meeting
@@ -90,7 +90,7 @@ GC authenticates using OAuth 2.0 client credentials. At startup, TokenManager ac
 
 ## Integration: Meeting API Endpoints
 **Added**: 2026-01-15
-**Related files**: `crates/global-controller/src/routes/mod.rs`, `crates/global-controller/src/handlers/meetings.rs`
+**Related files**: `crates/gc-service/src/routes/mod.rs`, `crates/gc-service/src/handlers/meetings.rs`
 
 Meeting API endpoints:
 - `GET /v1/meetings/{code}` - Join meeting (authenticated, returns meeting token)
@@ -103,7 +103,7 @@ Join endpoint returns AC-issued meeting token for WebTransport connection. Guest
 
 ## Integration: gRPC Auth Layer for MC Communication
 **Added**: 2026-01-20
-**Related files**: `crates/global-controller/src/grpc/auth_layer.rs`, `crates/global-controller/src/grpc/mc_service.rs`
+**Related files**: `crates/gc-service/src/grpc/auth_layer.rs`, `crates/gc-service/src/grpc/mc_service.rs`
 
 MCs authenticate to GC gRPC endpoints using AC-issued JWT tokens:
 1. MC obtains service token from AC (Client Credentials flow)
@@ -118,7 +118,7 @@ The same `JwksClient` and validation logic used for HTTP auth is reused for gRPC
 
 ## Integration: MC Registration Flow
 **Added**: 2026-01-20
-**Related files**: `crates/global-controller/src/grpc/mc_service.rs`, `crates/global-controller/src/repositories/meeting_controllers.rs`
+**Related files**: `crates/gc-service/src/grpc/mc_service.rs`, `crates/gc-service/src/repositories/meeting_controllers.rs`
 
 MC registration with GC:
 1. MC calls `RegisterMc` RPC with: hostname, grpc_port, region, version, max_capacity
@@ -132,7 +132,7 @@ On MC restart, re-registration updates existing row (matched by hostname). Healt
 
 ## Integration: Heartbeat Protocols
 **Added**: 2026-01-20
-**Related files**: `crates/global-controller/src/grpc/mc_service.rs`
+**Related files**: `crates/gc-service/src/grpc/mc_service.rs`
 
 Two heartbeat types for MC health reporting:
 
@@ -152,7 +152,7 @@ Both maintain the `last_heartbeat` timestamp. Health checker marks MCs unhealthy
 
 ## Integration: Health Checker Tasks (MC + MH, Generic)
 **Added**: 2026-01-20, **Updated**: 2026-02-12
-**Related files**: `crates/global-controller/src/tasks/generic_health_checker.rs`, `crates/global-controller/src/tasks/health_checker.rs`, `crates/global-controller/src/tasks/mh_health_checker.rs`
+**Related files**: `crates/gc-service/src/tasks/generic_health_checker.rs`, `crates/gc-service/src/tasks/health_checker.rs`, `crates/gc-service/src/tasks/mh_health_checker.rs`
 
 Both MC and MH health checkers use a shared generic health checker loop (`start_generic_health_checker`). Each is a thin wrapper that provides:
 - The repository staleness-check function as a closure
@@ -174,7 +174,7 @@ Other services querying healthy MCs/MHs should filter: `WHERE health_status = 'h
 
 ## Integration: Meeting-to-MC Assignment via Load Balancing
 **Added**: 2026-01-21
-**Related files**: `crates/global-controller/src/services/mc_assignment.rs`, `crates/global-controller/src/repositories/meeting_assignments.rs`
+**Related files**: `crates/gc-service/src/services/mc_assignment.rs`, `crates/gc-service/src/repositories/meeting_assignments.rs`
 
 When a participant joins a meeting, GC assigns an MC using weighted random selection:
 1. Query healthy MCs with available capacity (`current_participants < max_capacity`)
@@ -188,7 +188,7 @@ Prerequisites for tests: Register at least one healthy MC before attempting to j
 
 ## Integration: Assignment Cleanup Lifecycle
 **Added**: 2026-01-23
-**Related files**: `crates/global-controller/src/tasks/assignment_cleanup.rs`, `crates/global-controller/src/repositories/meeting_assignments.rs`
+**Related files**: `crates/gc-service/src/tasks/assignment_cleanup.rs`, `crates/gc-service/src/repositories/meeting_assignments.rs`
 
 Meeting assignments follow a soft-delete then hard-delete lifecycle:
 
@@ -204,7 +204,7 @@ Background task `start_assignment_cleanup()` runs both operations periodically. 
 
 ## Integration: GC-to-MC Assignment RPC Flow with MH Selection
 **Added**: 2026-01-24, **Updated**: 2026-02-11
-**Related files**: `crates/global-controller/src/services/mc_client.rs`, `crates/global-controller/src/services/mc_assignment.rs`, `crates/global-controller/src/handlers/meetings.rs`
+**Related files**: `crates/gc-service/src/services/mc_client.rs`, `crates/gc-service/src/services/mc_assignment.rs`, `crates/gc-service/src/handlers/meetings.rs`
 
 Meeting join triggers MC assignment with MH selection (ADR-0010 Section 4a):
 
@@ -222,7 +222,7 @@ Meeting join triggers MC assignment with MH selection (ADR-0010 Section 4a):
 
 ## Integration: MH (Media Handler) Registry
 **Added**: 2026-02-11
-**Related files**: `crates/global-controller/src/grpc/mh_service.rs`, `crates/global-controller/src/services/mh_selection.rs`, `crates/global-controller/src/tasks/mh_health_checker.rs`
+**Related files**: `crates/gc-service/src/grpc/mh_service.rs`, `crates/gc-service/src/services/mh_selection.rs`, `crates/gc-service/src/tasks/mh_health_checker.rs`
 
 MHs register with GC via gRPC similar to MC registration:
 
@@ -247,7 +247,7 @@ MHs register with GC via gRPC similar to MC registration:
 
 ## Integration: Observability Metrics Layering
 **Added**: 2026-02-09, **Updated**: 2026-02-09
-**Related files**: `crates/global-controller/src/observability/metrics.rs`, `crates/global-controller/src/repositories/*.rs`, `crates/global-controller/src/services/mc_assignment.rs`, `crates/global-controller/src/services/mh_selection.rs`
+**Related files**: `crates/gc-service/src/observability/metrics.rs`, `crates/gc-service/src/repositories/*.rs`, `crates/gc-service/src/services/mc_assignment.rs`, `crates/gc-service/src/services/mh_selection.rs`
 
 Metrics are recorded at different layers depending on what they measure:
 

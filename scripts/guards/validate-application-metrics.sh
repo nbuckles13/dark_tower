@@ -49,9 +49,9 @@ NC='\033[0m'
 
 declare -A CANONICAL_SERVICES=(
     [ac]="ac-service:ac-service"
-    [gc]="global-controller:global-controller"
-    [mc]="meeting-controller:meeting-controller"
-    [mh]="media-handler:media-handler"
+    [gc]="gc-service:gc-service"
+    [mc]="mc-service:mc-service"
+    [mh]="mh-service:mh-service"
 )
 
 # Parse into separate arrays
@@ -77,7 +77,7 @@ validate_service_registration() {
     # Find all metrics.rs files in crates directory only
     local found_services=()
     while IFS= read -r metrics_file; do
-        # Extract directory name: crates/global-controller/... → global-controller
+        # Extract directory name: crates/gc-service/... → gc-service
         # Make path relative to repo root first
         metrics_file="${metrics_file#$REPO_ROOT/}"
         local dir_name

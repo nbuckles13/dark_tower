@@ -774,7 +774,7 @@
   "refresh": "10s",
   "schemaVersion": 38,
   "style": "dark",
-  "tags": ["global-controller", "slo"],
+  "tags": ["gc-service", "slo"],
   "templating": {
     "list": []
   },

@@ -95,21 +95,21 @@ Complete ALL items before deploying to production:
 
 ```bash
 # Check current deployment status
-kubectl get deployment meeting-controller -n dark-tower
+kubectl get deployment mc-service -n dark-tower
 
 # Check current pod status
-kubectl get pods -n dark-tower -l app=meeting-controller
+kubectl get pods -n dark-tower -l app=mc-service
 
 # Check current resource utilization
-kubectl top pods -n dark-tower -l app=meeting-controller
+kubectl top pods -n dark-tower -l app=mc-service
 
 # Check active meetings (critical - do not deploy if high)
-kubectl port-forward -n dark-tower deployment/meeting-controller 8080:8080 &
+kubectl port-forward -n dark-tower deployment/mc-service 8080:8080 &
 curl -s http://localhost:8080/metrics | grep mc_meetings_active
 kill %1
 
 # Verify readiness of current pods
-kubectl get pods -n dark-tower -l app=meeting-controller -o json | jq '.items[].status.conditions[] | select(.type=="Ready")'
+kubectl get pods -n dark-tower -l app=mc-service -o json | jq '.items[].status.conditions[] | select(.type=="Ready")'
 ```
 
 **Expected output:**
@@ -126,11 +126,11 @@ kubectl get pods -n dark-tower -l app=meeting-controller -o json | jq '.items[].
 ```bash
 # Mark MC as draining in GC (stops new meeting assignments)
 # This is done via GC admin API or database update
-kubectl exec -it deployment/global-controller -n dark-tower -- \
+kubectl exec -it deployment/gc-service -n dark-tower -- \
   psql $DATABASE_URL -c "UPDATE meeting_controllers SET status = 'draining' WHERE id = '<MC_ID>';"
 
 # Wait for active meetings to decrease
-watch -n 10 'kubectl port-forward -n dark-tower deployment/meeting-controller 8080:8080 2>/dev/null & sleep 1; curl -s http://localhost:8080/metrics | grep mc_meetings_active; kill %1 2>/dev/null'
+watch -n 10 'kubectl port-forward -n dark-tower deployment/mc-service 8080:8080 2>/dev/null & sleep 1; curl -s http://localhost:8080/metrics | grep mc_meetings_active; kill %1 2>/dev/null'
 
 # Proceed when active meetings reach acceptable level (e.g., <10)
 ```
@@ -144,32 +144,32 @@ watch -n 10 'kubectl port-forward -n dark-tower deployment/meeting-controller 80
 export NEW_VERSION="v1.2.3"  # Replace with actual version tag
 
 # Update Deployment with new image
-kubectl set image deployment/meeting-controller \
-  meeting-controller=mc-service:${NEW_VERSION} \
+kubectl set image deployment/mc-service \
+  mc-service=mc-service:${NEW_VERSION} \
   -n dark-tower
 
 # Verify image updated
-kubectl describe deployment meeting-controller -n dark-tower | grep Image:
+kubectl describe deployment mc-service -n dark-tower | grep Image:
 ```
 
 **Option B: Using kubectl apply (declarative)**
 
 ```bash
-# Update infra/services/meeting-controller/deployment.yaml
+# Update infra/services/mc-service/deployment.yaml
 # Change image tag: mc-service:latest → mc-service:v1.2.3
 
 # Apply updated manifest
-kubectl apply -f infra/services/meeting-controller/deployment.yaml
+kubectl apply -f infra/services/mc-service/deployment.yaml
 
 # Verify change
-kubectl describe deployment meeting-controller -n dark-tower | grep Image:
+kubectl describe deployment mc-service -n dark-tower | grep Image:
 ```
 
 **Option C: Using Skaffold (development)**
 
 ```bash
 # Build and deploy with Skaffold
-skaffold run -p meeting-controller
+skaffold run -p mc-service
 ```
 
 ### 4. Rolling Update Monitoring
@@ -180,13 +180,13 @@ Deployments update pods via rolling strategy (maxSurge=1, maxUnavailable=0 for z
 
 ```bash
 # Watch pod status (Ctrl+C to exit)
-kubectl get pods -n dark-tower -l app=meeting-controller -w
+kubectl get pods -n dark-tower -l app=mc-service -w
 
 # Check rollout status
-kubectl rollout status deployment/meeting-controller -n dark-tower
+kubectl rollout status deployment/mc-service -n dark-tower
 
 # Monitor logs from new pod
-kubectl logs -f deployment/meeting-controller -n dark-tower
+kubectl logs -f deployment/mc-service -n dark-tower
 ```
 
 **Expected sequence:**
@@ -209,20 +209,20 @@ kubectl logs -f deployment/meeting-controller -n dark-tower
 
 ```bash
 # All pods Running and Ready
-kubectl get pods -n dark-tower -l app=meeting-controller
+kubectl get pods -n dark-tower -l app=mc-service
 
 # Check pod events for errors
-kubectl get events -n dark-tower --field-selector involvedObject.kind=Pod,involvedObject.name=meeting-controller-<pod-suffix>
+kubectl get events -n dark-tower --field-selector involvedObject.kind=Pod,involvedObject.name=mc-service-<pod-suffix>
 ```
 
 **Logs review:**
 
 ```bash
 # Check for startup errors
-kubectl logs deployment/meeting-controller -n dark-tower --tail=50
+kubectl logs deployment/mc-service -n dark-tower --tail=50
 
 # Look for error patterns
-kubectl logs -n dark-tower -l app=meeting-controller --tail=100 | grep -i "error\|panic\|fatal"
+kubectl logs -n dark-tower -l app=mc-service --tail=100 | grep -i "error\|panic\|fatal"
 ```
 
 **Expected log messages:**
@@ -253,7 +253,7 @@ Minimum required smoke tests:
 
 ```bash
 # Check MC registration in GC database
-kubectl exec -it deployment/global-controller -n dark-tower -- \
+kubectl exec -it deployment/gc-service -n dark-tower -- \
   psql $DATABASE_URL -c "SELECT id, region, capacity, current_sessions, last_heartbeat, status FROM meeting_controllers WHERE last_heartbeat > NOW() - INTERVAL '30 seconds' ORDER BY last_heartbeat DESC;"
 
 # Verify MC is marked as healthy
@@ -266,7 +266,7 @@ kubectl exec -it deployment/global-controller -n dark-tower -- \
 
 ```bash
 # Port-forward to access metrics endpoint
-kubectl port-forward -n dark-tower deployment/meeting-controller 8080:8080 &
+kubectl port-forward -n dark-tower deployment/mc-service 8080:8080 &
 
 # Fetch metrics
 curl http://localhost:8080/metrics
@@ -334,30 +334,30 @@ kill %1
 
 ```bash
 # Find previous image version
-kubectl rollout history deployment/meeting-controller -n dark-tower
+kubectl rollout history deployment/mc-service -n dark-tower
 
 # Get image from previous revision
-kubectl rollout history deployment/meeting-controller -n dark-tower --revision=<PREVIOUS_REVISION>
+kubectl rollout history deployment/mc-service -n dark-tower --revision=<PREVIOUS_REVISION>
 ```
 
 **Step 2: Rollback Deployment**
 
 ```bash
 # Rollback to previous revision
-kubectl rollout undo deployment/meeting-controller -n dark-tower
+kubectl rollout undo deployment/mc-service -n dark-tower
 
 # Or rollback to specific revision
-kubectl rollout undo deployment/meeting-controller -n dark-tower --to-revision=<REVISION>
+kubectl rollout undo deployment/mc-service -n dark-tower --to-revision=<REVISION>
 
 # Monitor rollback
-kubectl rollout status deployment/meeting-controller -n dark-tower
+kubectl rollout status deployment/mc-service -n dark-tower
 ```
 
 **Step 3: Verify rollback success**
 
 ```bash
 # Check pods running previous version
-kubectl get pods -n dark-tower -l app=meeting-controller -o jsonpath='{.items[*].spec.containers[0].image}'
+kubectl get pods -n dark-tower -l app=mc-service -o jsonpath='{.items[*].spec.containers[0].image}'
 
 # Run smoke tests (see Smoke Tests section)
 # Verify health, ready, metrics endpoints
@@ -367,7 +367,7 @@ kubectl get pods -n dark-tower -l app=meeting-controller -o jsonpath='{.items[*]
 
 ```bash
 # If MC was in draining status, re-enable
-kubectl exec -it deployment/global-controller -n dark-tower -- \
+kubectl exec -it deployment/gc-service -n dark-tower -- \
   psql $DATABASE_URL -c "UPDATE meeting_controllers SET status = 'active' WHERE id = '<MC_ID>';"
 ```
 
@@ -395,7 +395,7 @@ kubectl exec -it deployment/global-controller -n dark-tower -- \
 
 | Variable | Required | Description | Default | Example |
 |----------|----------|-------------|---------|---------|
-| `GC_REGISTRATION_URL` | **Yes** | Global Controller registration endpoint | None | `http://global-controller.dark-tower.svc.cluster.local:8080/api/v1/mc/register` |
+| `GC_REGISTRATION_URL` | **Yes** | Global Controller registration endpoint | None | `http://gc-service.dark-tower.svc.cluster.local:8080/api/v1/mc/register` |
 | `MC_REGION` | **Yes** | Geographic region for this MC | None | `us-west-2` |
 | `MC_CAPACITY` | No | Maximum concurrent meetings | `100` | `100` |
 | `WEBTRANSPORT_BIND_ADDRESS` | No | WebTransport bind address | `0.0.0.0:4433` | `0.0.0.0:4433` |
@@ -431,7 +431,7 @@ metadata:
   name: mc-service-config
   namespace: dark-tower
 data:
-  GC_REGISTRATION_URL: "http://global-controller.dark-tower.svc.cluster.local:8080/api/v1/mc/register"
+  GC_REGISTRATION_URL: "http://gc-service.dark-tower.svc.cluster.local:8080/api/v1/mc/register"
   MC_REGION: "us-west-2"
   MC_CAPACITY: "100"
   GC_HEARTBEAT_INTERVAL_SECS: "10"
@@ -478,14 +478,14 @@ resources:
 
 ```bash
 # Check GC service is running
-kubectl get pods -n dark-tower -l app=global-controller
+kubectl get pods -n dark-tower -l app=gc-service
 
 # Test GC endpoint directly from MC pod
-kubectl exec -it deployment/meeting-controller -n dark-tower -- \
+kubectl exec -it deployment/mc-service -n dark-tower -- \
   curl -i $GC_REGISTRATION_URL
 
 # Check MC logs for registration errors
-kubectl logs deployment/meeting-controller -n dark-tower --tail=100 | grep -i "register\|gc"
+kubectl logs deployment/mc-service -n dark-tower --tail=100 | grep -i "register\|gc"
 
 # Verify GC_REGISTRATION_URL in ConfigMap
 kubectl get configmap mc-service-config -n dark-tower -o yaml | grep GC_REGISTRATION_URL
@@ -513,14 +513,14 @@ kubectl get configmap mc-service-config -n dark-tower -o yaml | grep GC_REGISTRA
 
 ```bash
 # Check for port conflicts
-kubectl get pods -n dark-tower -l app=meeting-controller -o wide
+kubectl get pods -n dark-tower -l app=mc-service -o wide
 # Multiple pods on same node may conflict
 
 # Check TLS secrets are mounted
 kubectl describe pod <mc-pod> -n dark-tower | grep -A 5 "Mounts:"
 
 # Check logs for TLS errors
-kubectl logs deployment/meeting-controller -n dark-tower --tail=100 | grep -i "tls\|cert\|webtransport"
+kubectl logs deployment/mc-service -n dark-tower --tail=100 | grep -i "tls\|cert\|webtransport"
 ```
 
 **Fix:**
@@ -574,10 +574,10 @@ kubectl get events -n dark-tower --field-selector involvedObject.name=<mc-pod>
 
 ```bash
 # Monitor memory usage
-kubectl top pods -n dark-tower -l app=meeting-controller
+kubectl top pods -n dark-tower -l app=mc-service
 
 # Check for mailbox buildup
-kubectl port-forward -n dark-tower deployment/meeting-controller 8080:8080 &
+kubectl port-forward -n dark-tower deployment/mc-service 8080:8080 &
 curl http://localhost:8080/metrics | grep mc_actor_mailbox_depth
 kill %1
 
@@ -602,7 +602,7 @@ Run these tests immediately after deployment to verify core functionality.
 
 ```bash
 # Port-forward to pod
-kubectl port-forward -n dark-tower deployment/meeting-controller 8080:8080 &
+kubectl port-forward -n dark-tower deployment/mc-service 8080:8080 &
 
 # Test health endpoint
 curl -i http://localhost:8080/health
@@ -628,7 +628,7 @@ kill %1
 
 ```bash
 # Port-forward to pod
-kubectl port-forward -n dark-tower deployment/meeting-controller 8080:8080 &
+kubectl port-forward -n dark-tower deployment/mc-service 8080:8080 &
 
 # Test readiness endpoint
 curl -i http://localhost:8080/ready
@@ -656,7 +656,7 @@ kill %1
 
 ```bash
 # Port-forward to pod
-kubectl port-forward -n dark-tower deployment/meeting-controller 8080:8080 &
+kubectl port-forward -n dark-tower deployment/mc-service 8080:8080 &
 
 # Fetch metrics
 curl -s http://localhost:8080/metrics | head -50
@@ -686,7 +686,7 @@ kill %1
 
 ```bash
 # Check GC database for MC registration
-kubectl exec -it deployment/global-controller -n dark-tower -- \
+kubectl exec -it deployment/gc-service -n dark-tower -- \
   psql $DATABASE_URL -c "SELECT id, region, capacity, current_sessions, last_heartbeat, status FROM meeting_controllers ORDER BY last_heartbeat DESC LIMIT 5;"
 
 # Expected: MC entry with:
@@ -710,10 +710,10 @@ kubectl exec -it deployment/global-controller -n dark-tower -- \
 
 ```promql
 # Pod restart count (should be 0 after initial deployment)
-kube_pod_container_status_restarts_total{namespace="dark-tower",pod=~"meeting-controller-.*"}
+kube_pod_container_status_restarts_total{namespace="dark-tower",pod=~"mc-service-.*"}
 
 # Pod readiness (should be 1 for all pods)
-kube_pod_status_ready{namespace="dark-tower",pod=~"meeting-controller-.*"}
+kube_pod_status_ready{namespace="dark-tower",pod=~"mc-service-.*"}
 ```
 
 **Actor system health:**
@@ -795,8 +795,8 @@ See `infra/docker/prometheus/rules/mc-alerts.yaml` for full list.
 - **ADR-0010:** Global Controller Architecture (MC registration)
 - **ADR-0011:** Observability Framework
 - **ADR-0012:** Infrastructure Architecture
-- **Source Code:** `crates/meeting-controller/`
-- **Kubernetes Manifests:** `infra/services/meeting-controller/`
+- **Source Code:** `crates/mc-service/`
+- **Kubernetes Manifests:** `infra/services/mc-service/`
 
 ---
 

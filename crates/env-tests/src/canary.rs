@@ -111,7 +111,7 @@ impl CanaryPod {
     /// ```ignore
     /// // Deploy with custom labels to match NetworkPolicy ingress rules
     /// let config = CanaryConfig {
-    ///     labels: "app=global-controller,test=network-policy".to_string(),
+    ///     labels: "app=gc-service,test=network-policy".to_string(),
     /// };
     /// let canary = CanaryPod::deploy_with_config("dark-tower", config).await?;
     /// ```

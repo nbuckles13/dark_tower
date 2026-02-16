@@ -1,0 +1,28 @@
+# ServiceMonitor for Prometheus metrics scraping
+# NOTE: /metrics endpoint will be implemented in Phase 3 (Observability)
+# Until then, this ServiceMonitor is disabled to avoid 404 errors from Prometheus.
+#
+# To enable after Phase 3:
+# 1. Uncomment the spec section below
+# 2. Verify /metrics endpoint returns Prometheus-formatted metrics
+# 3. Apply the manifest: kubectl apply -f service-monitor.yaml
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: mc-service
+  namespace: dark-tower
+  labels:
+    app: mc-service
+    component: signaling
+# TODO: Uncomment after Phase 3 (Observability) implements /metrics endpoint
+# spec:
+#   selector:
+#     matchLabels:
+#       app: mc-service
+#       component: signaling
+#   endpoints:
+#   - port: health
+#     path: /metrics
+#     interval: 30s
+#     scrapeTimeout: 10s
+#     scheme: http

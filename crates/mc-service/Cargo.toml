@@ -1,0 +1,77 @@
+[package]
+name = "mc-service"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Dark Tower Meeting Controller - stateful WebTransport signaling server"
+
+[lints]
+workspace = true
+
+[dependencies]
+# Workspace dependencies
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+quinn = { workspace = true }
+wtransport = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+prost = { workspace = true }
+prost-types = { workspace = true }
+redis = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+bytes = { workspace = true }
+
+# gRPC for GC communication
+tonic = { workspace = true }
+
+# Cryptography for session binding tokens (ADR-0023)
+ring = { workspace = true }
+hex = { workspace = true }
+base64 = { workspace = true }
+
+# System information for comprehensive heartbeats (ADR-0023 Phase 6c)
+sysinfo = "0.30"
+
+# Metrics (ADR-0011 Observability, ADR-0023 Section 11)
+metrics = "0.24"
+metrics-exporter-prometheus = "0.16"
+
+# HTTP server for health endpoints and metrics
+axum = { workspace = true }
+tower-http = { workspace = true, features = ["trace"] }
+
+# Local dependencies
+common = { path = "../common" }
+proto-gen = { path = "../proto-gen" }
+media-protocol = { path = "../media-protocol" }
+
+[dev-dependencies]
+criterion = { workspace = true }
+mc-test-utils = { path = "../mc-test-utils" }
+# Metrics testing
+metrics-util = "0.18"
+# HTTP testing for health endpoint integration tests
+tower = { workspace = true }
+http-body-util = "0.1"
+# Need test-util feature for tokio::time::pause/advance in tests
+tokio = { version = "1.40", features = ["full", "test-util"] }
+# For wrapping TcpListener as tonic-compatible stream in integration tests
+tokio-stream = "0.1"
+# Enable test-utils feature for common (e.g., TokenReceiver::from_test_channel)
+common = { path = "../common", features = ["test-utils"] }
+
+[lib]
+name = "mc_service"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mc-service"
+path = "src/main.rs"

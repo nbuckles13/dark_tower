@@ -1,0 +1,36 @@
+[package]
+name = "mh-service"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# Workspace dependencies
+tokio = { workspace = true }
+quinn = { workspace = true }
+wtransport = { workspace = true }
+serde = { workspace = true }
+prost = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+bytes = { workspace = true }
+
+# Local dependencies
+common = { path = "../common" }
+proto-gen = { path = "../proto-gen" }
+media-protocol = { path = "../media-protocol" }
+
+[[bin]]
+name = "mh-service"
+path = "src/main.rs"
+
+[dev-dependencies]
+criterion = { workspace = true }

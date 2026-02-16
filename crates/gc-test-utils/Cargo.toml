@@ -40,7 +40,7 @@ thiserror = { workspace = true }
 metrics-exporter-prometheus = "0.16"
 
 # Local dependencies
-global-controller = { path = "../global-controller" }
+gc-service = { path = "../gc-service" }
 common = { path = "../common" }
 
 [lib]

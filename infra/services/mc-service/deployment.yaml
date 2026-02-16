@@ -1,0 +1,135 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mc-service
+  namespace: dark-tower
+  labels:
+    app: mc-service
+    component: signaling
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: mc-service
+      component: signaling
+  template:
+    metadata:
+      labels:
+        app: mc-service
+        component: signaling
+    spec:
+      terminationGracePeriodSeconds: 35
+      securityContext:
+        runAsNonRoot: true
+        # Match distroless nonroot user (uid 65532)
+        runAsUser: 65532
+        fsGroup: 65532
+      containers:
+      - name: mc-service
+        image: localhost/mc-service:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - name: grpc
+          containerPort: 50052
+          protocol: TCP
+        - name: health
+          containerPort: 8081
+          protocol: TCP
+        - name: webtransport
+          containerPort: 4433
+          protocol: UDP
+        env:
+        - name: MC_GRPC_BIND_ADDRESS
+          valueFrom:
+            configMapKeyRef:
+              name: mc-service-config
+              key: MC_GRPC_BIND_ADDRESS
+        - name: MC_HEALTH_BIND_ADDRESS
+          valueFrom:
+            configMapKeyRef:
+              name: mc-service-config
+              key: MC_HEALTH_BIND_ADDRESS
+        - name: MC_WEBTRANSPORT_BIND_ADDRESS
+          valueFrom:
+            configMapKeyRef:
+              name: mc-service-config
+              key: MC_WEBTRANSPORT_BIND_ADDRESS
+        - name: MC_REGION
+          valueFrom:
+            configMapKeyRef:
+              name: mc-service-config
+              key: MC_REGION
+        - name: GC_GRPC_URL
+          valueFrom:
+            configMapKeyRef:
+              name: mc-service-config
+              key: GC_GRPC_URL
+        - name: REDIS_URL
+          valueFrom:
+            secretKeyRef:
+              name: mc-service-secrets
+              key: REDIS_URL
+        - name: MC_BINDING_TOKEN_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: mc-service-secrets
+              key: MC_BINDING_TOKEN_SECRET
+        # OAuth 2.0 client credentials for AC authentication (ADR-0010)
+        - name: AC_ENDPOINT
+          value: "http://ac-service.dark-tower:8082"
+        - name: MC_CLIENT_ID
+          value: "meeting-controller"
+        - name: MC_CLIENT_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: mc-service-secrets
+              key: MC_CLIENT_SECRET
+        - name: RUST_LOG
+          value: "info,mc_service=debug"
+        resources:
+          requests:
+            cpu: 200m
+            memory: 512Mi
+          limits:
+            cpu: 1000m
+            memory: 1Gi
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 65532
+          readOnlyRootFilesystem: true
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+        # TODO: Re-enable probes when MC health endpoints are implemented (Phase 6h)
+        # livenessProbe:
+        #   httpGet:
+        #     path: /health/live
+        #     port: 8081
+        #     scheme: HTTP
+        #   initialDelaySeconds: 10
+        #   periodSeconds: 10
+        #   timeoutSeconds: 5
+        #   successThreshold: 1
+        #   failureThreshold: 3
+        # readinessProbe:
+        #   httpGet:
+        #     path: /health/ready
+        #     port: 8081
+        #     scheme: HTTP
+        #   initialDelaySeconds: 5
+        #   periodSeconds: 5
+        #   timeoutSeconds: 3
+        #   successThreshold: 1
+        #   failureThreshold: 3
+        volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+      volumes:
+      - name: tmp
+        emptyDir: {}

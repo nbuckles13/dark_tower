@@ -6,7 +6,7 @@ Reusable patterns discovered and established in the Global Controller codebase.
 
 ## Pattern: Token Size Check Before Parsing (DoS Prevention)
 **Added**: 2026-01-14
-**Related files**: `crates/global-controller/src/auth/jwt.rs`
+**Related files**: `crates/gc-service/src/auth/jwt.rs`
 
 ALWAYS check token size in bytes BEFORE any parsing or cryptographic operations. Set MAX_JWT_SIZE_BYTES constant (8KB default), check `token.len() > MAX_JWT_SIZE_BYTES` at function entry. Prevents DoS via oversized tokens consuming CPU/memory. Return generic error message to avoid info leakage.
 
@@ -14,7 +14,7 @@ ALWAYS check token size in bytes BEFORE any parsing or cryptographic operations.
 
 ## Pattern: JWK Validation Before Signature Verification
 **Added**: 2026-01-14
-**Related files**: `crates/global-controller/src/auth/jwt.rs`
+**Related files**: `crates/gc-service/src/auth/jwt.rs`
 
 Validate JWK structure BEFORE using it for signature verification:
 - Check `jwk.kty == "OKP"` (reject if not, log warning)
@@ -25,7 +25,7 @@ Validate JWK structure BEFORE using it for signature verification:
 
 ## Pattern: Algorithm Pinning in jsonwebtoken Validation
 **Added**: 2026-01-14
-**Related files**: `crates/global-controller/src/auth/jwt.rs`
+**Related files**: `crates/gc-service/src/auth/jwt.rs`
 
 Use `Validation::new(Algorithm::EdDSA)` to explicitly set the expected algorithm BEFORE calling `decode()`. Never use `Validation::default()` which accepts multiple algorithms. Pinning prevents algorithm confusion attacks from alg:none or alg:HS256 tokens.
 
@@ -33,7 +33,7 @@ Use `Validation::new(Algorithm::EdDSA)` to explicitly set the expected algorithm
 
 ## Pattern: JWKS Caching with TTL and Refresh
 **Added**: 2026-01-14
-**Related files**: `crates/global-controller/src/auth/jwks.rs`
+**Related files**: `crates/gc-service/src/auth/jwks.rs`
 
 Implement JWKS caching with:
 - In-memory cache (HashMap<kid, Jwk>) wrapped in Arc<RwLock<Option<CachedJwks>>>
@@ -46,7 +46,7 @@ Implement JWKS caching with:
 
 ## Pattern: kid Extraction Without Full Token Parsing
 **Added**: 2026-01-14
-**Related files**: `crates/global-controller/src/auth/jwt.rs`
+**Related files**: `crates/gc-service/src/auth/jwt.rs`
 
 Extract kid for key lookup by:
 - Split token on '.' to get exactly 3 parts
@@ -60,7 +60,7 @@ This avoids full JWT parsing before signature validation - kid selection is data
 
 ## Pattern: AC Client Service for Internal Endpoints
 **Added**: 2026-01-15, **Updated**: 2026-02-11
-**Related files**: `crates/global-controller/src/services/ac_client.rs`
+**Related files**: `crates/gc-service/src/services/ac_client.rs`
 
 HTTP client for calling AC internal token endpoints (`/api/v1/auth/internal/meeting-token`, `/api/v1/auth/internal/guest-token`). Uses Bearer auth with dynamically refreshed OAuth token from TokenReceiver, configurable timeout (default 10s connect, 10s request), and proper error mapping (network/timeout -> ServiceUnavailable, 4xx -> Unauthorized/Forbidden, 5xx -> ServiceUnavailable). Constructed once in main.rs (not per-request) - reqwest Client handles connection pooling internally.
 
@@ -68,7 +68,7 @@ HTTP client for calling AC internal token endpoints (`/api/v1/auth/internal/meet
 
 ## Pattern: CSPRNG Guest ID Generation
 **Added**: 2026-01-15
-**Related files**: `crates/global-controller/src/handlers/meetings.rs`
+**Related files**: `crates/gc-service/src/handlers/meetings.rs`
 
 Generate guest IDs using `ring::rand::SystemRandom` for CSPRNG security. Fill 16-byte buffer, then apply UUID v4 bit manipulation (version nibble = 4, variant bits = 10xx). Format as hyphenated UUID string. Never use thread_rng() for security-critical IDs.
 
@@ -76,7 +76,7 @@ Generate guest IDs using `ring::rand::SystemRandom` for CSPRNG security. Fill 16
 
 ## Pattern: Host-Only Authorization Check
 **Added**: 2026-01-15
-**Related files**: `crates/global-controller/src/handlers/meetings.rs`
+**Related files**: `crates/gc-service/src/handlers/meetings.rs`
 
 For host-only endpoints (settings, kick participant), compare `meeting.created_by_user_id` against `claims.sub`. Return 403 Forbidden if mismatch. This check happens AFTER meeting lookup to avoid leaking meeting existence via 403 vs 404.
 
@@ -84,7 +84,7 @@ For host-only endpoints (settings, kick participant), compare `meeting.created_b
 
 ## Pattern: Testing JWKS Cache with Short TTL
 **Added**: 2026-01-18
-**Related files**: `crates/global-controller/src/auth/jwks.rs`
+**Related files**: `crates/gc-service/src/auth/jwks.rs`
 
 To test cache expiration behavior, create JwksClient with very short TTL (1ms) and use `tokio::time::sleep()` to trigger expiration. Use wiremock's `expect(N)` to verify cache hits vs fetches. This avoids flaky time-dependent tests while still exercising cache expiration paths.
 
@@ -92,7 +92,7 @@ To test cache expiration behavior, create JwksClient with very short TTL (1ms) a
 
 ## Pattern: HTTP Status Code Branch Coverage
 **Added**: 2026-01-18
-**Related files**: `crates/global-controller/src/services/ac_client.rs`
+**Related files**: `crates/gc-service/src/services/ac_client.rs`
 
 When testing HTTP client response handling, test ALL status code branches: success (200), client errors (400, 401, 403, 404), server errors (500, 502), and unexpected codes (418). Use wiremock to return each status and verify error mapping. This ensures full branch coverage of `handle_response()` logic.
 
@@ -100,7 +100,7 @@ When testing HTTP client response handling, test ALL status code branches: succe
 
 ## Pattern: Tower Layer for Async gRPC Auth
 **Added**: 2026-01-20
-**Related files**: `crates/global-controller/src/grpc/auth_layer.rs`
+**Related files**: `crates/gc-service/src/grpc/auth_layer.rs`
 
 Use Tower's `Layer` + `Service` traits for async JWT validation on gRPC endpoints instead of tonic's sync interceptor. This pattern:
 1. Define `AuthLayer` holding `Arc<JwksClient>` and `Arc<GcConfig>`
@@ -115,7 +115,7 @@ Benefits: async JWKS fetching, shared cache across requests, proper backpressure
 
 ## Pattern: UPSERT for Service Registration
 **Added**: 2026-01-20
-**Related files**: `crates/global-controller/src/repositories/meeting_controllers.rs`
+**Related files**: `crates/gc-service/src/repositories/meeting_controllers.rs`
 
 Use UPSERT (INSERT ON CONFLICT UPDATE) for MC registration instead of separate check-then-insert:
 ```sql
@@ -133,7 +133,7 @@ Benefits: atomic operation, handles MC restarts cleanly (re-registration updates
 
 ## Pattern: Dual Heartbeat Design (Fast vs Comprehensive)
 **Added**: 2026-01-20
-**Related files**: `crates/global-controller/src/grpc/mc_service.rs`
+**Related files**: `crates/gc-service/src/grpc/mc_service.rs`
 
 Implement two heartbeat types for service health monitoring:
 - **Fast heartbeat** (10s interval): Lightweight, sends only capacity (current/max participants). Used for load balancing decisions.
@@ -145,7 +145,7 @@ Both update `last_heartbeat` timestamp. This design reduces network overhead whi
 
 ## Pattern: Background Health Checker with CancellationToken
 **Added**: 2026-01-20
-**Related files**: `crates/global-controller/src/tasks/health_checker.rs`, `crates/global-controller/src/main.rs`
+**Related files**: `crates/gc-service/src/tasks/health_checker.rs`, `crates/gc-service/src/main.rs`
 
 Decouple health checking from heartbeat processing using a background task:
 1. Spawn `tokio::spawn(run_health_checker(pool, config, cancel_token.clone()))`
@@ -159,7 +159,7 @@ Benefits: health checking runs even if heartbeats stop arriving, single point of
 
 ## Pattern: Dual Server Graceful Shutdown
 **Added**: 2026-01-20
-**Related files**: `crates/global-controller/src/main.rs`
+**Related files**: `crates/gc-service/src/main.rs`
 
 Running HTTP (axum) + gRPC (tonic) servers requires coordinated shutdown:
 1. Create `CancellationToken` from `tokio_util::sync`
@@ -174,7 +174,7 @@ This ensures all components shut down cleanly on SIGTERM or server error.
 
 ## Pattern: Input Validation with Character Whitelist
 **Added**: 2026-01-20
-**Related files**: `crates/global-controller/src/grpc/mc_service.rs`
+**Related files**: `crates/gc-service/src/grpc/mc_service.rs`
 
 Validate gRPC request fields using whitelist characters to prevent injection:
 - Hostname: `c.is_ascii_alphanumeric() || c == '-' || c == '.'` (DNS-safe)
@@ -187,7 +187,7 @@ Combine with length limits. Return generic validation error without echoing bad 
 
 ## Pattern: INSERT ON CONFLICT for Atomic Assignment
 **Added**: 2026-01-21
-**Related files**: `crates/global-controller/src/repositories/meeting_assignments.rs`
+**Related files**: `crates/gc-service/src/repositories/meeting_assignments.rs`
 
 Use INSERT ON CONFLICT DO UPDATE for atomic meeting-to-MC assignment instead of CTEs with separate SELECT and INSERT:
 ```sql
@@ -208,7 +208,7 @@ Benefits: Single atomic operation, avoids CTE snapshot isolation issues where se
 
 ## Pattern: Tonic Channel Caching for gRPC Clients
 **Added**: 2026-01-24, **Updated**: 2026-02-11
-**Related files**: `crates/global-controller/src/services/mc_client.rs`
+**Related files**: `crates/gc-service/src/services/mc_client.rs`
 
 Cache Tonic `Channel` connections to downstream gRPC services instead of creating new connections per-request:
 1. Store `Arc<RwLock<HashMap<String, Channel>>>` in client struct
@@ -223,7 +223,7 @@ Benefits: Reduces connection overhead, enables HTTP/2 stream reuse, prevents con
 
 ## Pattern: Mock Trait for Testing gRPC Clients
 **Added**: 2026-01-24, **Updated**: 2026-01-31
-**Related files**: `crates/global-controller/src/services/mc_client.rs`, `crates/global-controller/src/routes/mod.rs`
+**Related files**: `crates/gc-service/src/services/mc_client.rs`, `crates/gc-service/src/routes/mod.rs`
 
 Define async trait for gRPC client operations and implement both real and mock versions:
 ```rust
@@ -241,7 +241,7 @@ Store as **required** field in AppState: `mc_client: Arc<dyn McClientTrait>` (NO
 
 ## Pattern: TokenReceiver for Dynamic OAuth in Service Clients
 **Added**: 2026-01-24, **Updated**: 2026-02-11
-**Related files**: `crates/global-controller/src/services/mc_client.rs`, `crates/global-controller/src/services/ac_client.rs`, `crates/global-controller/src/main.rs`
+**Related files**: `crates/gc-service/src/services/mc_client.rs`, `crates/gc-service/src/services/ac_client.rs`, `crates/gc-service/src/main.rs`
 
 Use `TokenReceiver` from `common::token_manager` for dynamic OAuth token access in service clients:
 ```rust
@@ -256,7 +256,7 @@ TokenManager spawns in main.rs with 30-second startup timeout. Store `TokenRecei
 
 ## Pattern: Error Variant Context Migration
 **Added**: 2026-01-28
-**Related files**: `crates/global-controller/src/errors.rs`
+**Related files**: `crates/gc-service/src/errors.rs`
 
 When migrating error enums from unit variants to context-carrying variants:
 1. Change variant: `Internal,` → `Internal(String),`
@@ -271,7 +271,7 @@ This pattern preserves debugging context while preventing information leakage to
 
 ## Pattern: Error Context Preservation in map_err
 **Added**: 2026-01-28
-**Related files**: Multiple files in `crates/global-controller/src/`
+**Related files**: Multiple files in `crates/gc-service/src/`
 
 Always preserve original error context when mapping errors:
 ```rust
@@ -294,7 +294,7 @@ Guards detect `.map_err(|_| ...)` patterns. Use `format!()` to include both cont
 
 ## Pattern: Tracing Instrument Allowlist Approach
 **Added**: 2026-01-28
-**Related files**: Multiple files in `crates/global-controller/src/`
+**Related files**: Multiple files in `crates/gc-service/src/`
 
 Use allowlist approach for tracing to prevent accidental data leaks:
 ```rust
@@ -311,7 +311,7 @@ The `skip_all` prevents all parameters from being captured by default. Safe fiel
 
 ## Pattern: Dual-Server Architecture (HTTP + gRPC)
 **Added**: 2026-02-11
-**Related files**: `crates/global-controller/src/main.rs`
+**Related files**: `crates/gc-service/src/main.rs`
 
 GC runs two servers concurrently: HTTP (Axum) for client API and gRPC (Tonic) for MC/MH registration. Coordinate shutdown using `CancellationToken`:
 ```rust
@@ -349,7 +349,7 @@ Benefits: Both servers gracefully shut down on SIGTERM, background tasks (health
 
 ## Pattern: Generic Background Task via Closure + `.instrument()` Chaining
 **Added**: 2026-02-12, **Updated**: 2026-02-12
-**Related files**: `crates/global-controller/src/tasks/generic_health_checker.rs`, `crates/global-controller/src/tasks/health_checker.rs`, `crates/global-controller/src/tasks/mh_health_checker.rs`
+**Related files**: `crates/gc-service/src/tasks/generic_health_checker.rs`, `crates/gc-service/src/tasks/health_checker.rs`, `crates/gc-service/src/tasks/mh_health_checker.rs`
 
 When multiple background tasks share identical structure (loop, select, error handling) but differ only in the repository call and log messages, extract a generic function parameterized by:
 1. `Fn(PgPool, i64) -> Fut` closure for the domain-specific operation (takes owned PgPool to avoid async lifetime issues)
@@ -364,7 +364,7 @@ Wrapper functions preserve the original public API signatures, so call sites (ma
 
 ## Pattern: `.instrument()` Chaining Instead of `#[instrument]` for Generic Functions
 **Added**: 2026-02-12
-**Related files**: `crates/global-controller/src/tasks/health_checker.rs`, `crates/global-controller/src/tasks/mh_health_checker.rs`
+**Related files**: `crates/gc-service/src/tasks/health_checker.rs`, `crates/gc-service/src/tasks/mh_health_checker.rs`
 
 When a generic/shared function is called from multiple thin wrappers that each need distinct span names, prefer `.instrument()` chaining over `#[instrument]` attributes:
 

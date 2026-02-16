@@ -1097,7 +1097,7 @@ crates/mc-test-utils/
 ## Files to Create/Modify
 
 1. `proto/internal.proto` - Add MC-specific messages (MhLoadReport, RequestDrain, etc.)
-2. `crates/meeting-controller/src/` - MC implementation
+2. `crates/mc-service/src/` - MC implementation
 3. `crates/mc-test-utils/` - Test utilities crate
 4. `docs/runbooks/meeting-controller/` - Runbook directory
 

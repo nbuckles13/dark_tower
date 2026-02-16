@@ -22,7 +22,7 @@ spec:
           kubernetes.io/metadata.name: dark-tower
       podSelector:
         matchLabels:
-          app: global-controller
+          app: gc-service
     ports:
     - protocol: TCP
       port: 8082
@@ -33,7 +33,7 @@ spec:
           kubernetes.io/metadata.name: dark-tower
       podSelector:
         matchLabels:
-          app: meeting-controller
+          app: mc-service
     ports:
     - protocol: TCP
       port: 8082

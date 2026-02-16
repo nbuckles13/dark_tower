@@ -96,16 +96,16 @@ Complete ALL items before deploying to production:
 
 ```bash
 # Check current deployment status
-kubectl get deployment global-controller -n dark-tower
+kubectl get deployment gc-service -n dark-tower
 
 # Check current pod status
-kubectl get pods -n dark-tower -l app=global-controller
+kubectl get pods -n dark-tower -l app=gc-service
 
 # Check current resource utilization
-kubectl top pods -n dark-tower -l app=global-controller
+kubectl top pods -n dark-tower -l app=gc-service
 
 # Verify readiness of current pods
-kubectl get pods -n dark-tower -l app=global-controller -o json | jq '.items[].status.conditions[] | select(.type=="Ready")'
+kubectl get pods -n dark-tower -l app=gc-service -o json | jq '.items[].status.conditions[] | select(.type=="Ready")'
 ```
 
 **Expected output:**
@@ -154,32 +154,32 @@ psql $DATABASE_URL -f migrations/<MIGRATION_FILE>.sql
 export NEW_VERSION="v1.2.3"  # Replace with actual version tag
 
 # Update Deployment with new image
-kubectl set image deployment/global-controller \
-  global-controller=gc-service:${NEW_VERSION} \
+kubectl set image deployment/gc-service \
+  gc-service=gc-service:${NEW_VERSION} \
   -n dark-tower
 
 # Verify image updated
-kubectl describe deployment global-controller -n dark-tower | grep Image:
+kubectl describe deployment gc-service -n dark-tower | grep Image:
 ```
 
 **Option B: Using kubectl apply (declarative)**
 
 ```bash
-# Update infra/services/global-controller/deployment.yaml
+# Update infra/services/gc-service/deployment.yaml
 # Change image tag: gc-service:latest → gc-service:v1.2.3
 
 # Apply updated manifest
-kubectl apply -f infra/services/global-controller/deployment.yaml
+kubectl apply -f infra/services/gc-service/deployment.yaml
 
 # Verify change
-kubectl describe deployment global-controller -n dark-tower | grep Image:
+kubectl describe deployment gc-service -n dark-tower | grep Image:
 ```
 
 **Option C: Using Skaffold (development)**
 
 ```bash
 # Build and deploy with Skaffold
-skaffold run -p global-controller
+skaffold run -p gc-service
 ```
 
 ### 4. Rolling Update Monitoring
@@ -190,13 +190,13 @@ Deployments update pods via rolling strategy (maxSurge=1, maxUnavailable=0 for z
 
 ```bash
 # Watch pod status (Ctrl+C to exit)
-kubectl get pods -n dark-tower -l app=global-controller -w
+kubectl get pods -n dark-tower -l app=gc-service -w
 
 # Check rollout status
-kubectl rollout status deployment/global-controller -n dark-tower
+kubectl rollout status deployment/gc-service -n dark-tower
 
 # Monitor logs from new pod
-kubectl logs -f deployment/global-controller -n dark-tower
+kubectl logs -f deployment/gc-service -n dark-tower
 ```
 
 **Expected sequence:**
@@ -217,20 +217,20 @@ kubectl logs -f deployment/global-controller -n dark-tower
 
 ```bash
 # All pods Running and Ready
-kubectl get pods -n dark-tower -l app=global-controller
+kubectl get pods -n dark-tower -l app=gc-service
 
 # Check pod events for errors
-kubectl get events -n dark-tower --field-selector involvedObject.kind=Pod,involvedObject.name=global-controller-<pod-suffix>
+kubectl get events -n dark-tower --field-selector involvedObject.kind=Pod,involvedObject.name=gc-service-<pod-suffix>
 ```
 
 **Logs review:**
 
 ```bash
 # Check for startup errors
-kubectl logs deployment/global-controller -n dark-tower --tail=50
+kubectl logs deployment/gc-service -n dark-tower --tail=50
 
 # Look for error patterns
-kubectl logs -n dark-tower -l app=global-controller --tail=100 | grep -i "error\|panic\|fatal"
+kubectl logs -n dark-tower -l app=gc-service --tail=100 | grep -i "error\|panic\|fatal"
 ```
 
 **Expected log messages:**
@@ -262,7 +262,7 @@ Minimum required smoke tests:
 
 ```bash
 # Port-forward to access metrics endpoint
-kubectl port-forward -n dark-tower deployment/global-controller 8080:8080 &
+kubectl port-forward -n dark-tower deployment/gc-service 8080:8080 &
 
 # Fetch metrics
 curl http://localhost:8080/metrics
@@ -295,10 +295,10 @@ sum(rate(gc_mc_assignments_total{status="success"}[5m])) / sum(rate(gc_mc_assign
 
 ```bash
 # Check Service endpoints
-kubectl get endpoints global-controller -n dark-tower
+kubectl get endpoints gc-service -n dark-tower
 
 # Verify traffic reaching pods (requires metrics)
-kubectl port-forward -n dark-tower deployment/global-controller 8080:8080 &
+kubectl port-forward -n dark-tower deployment/gc-service 8080:8080 &
 curl http://localhost:8080/metrics | grep gc_http_requests_total
 kill %1
 ```
@@ -357,30 +357,30 @@ Expected: `gc_http_requests_total` counter increasing over time.
 
 ```bash
 # Find previous image version
-kubectl rollout history deployment/global-controller -n dark-tower
+kubectl rollout history deployment/gc-service -n dark-tower
 
 # Get image from previous revision
-kubectl rollout history deployment/global-controller -n dark-tower --revision=<PREVIOUS_REVISION>
+kubectl rollout history deployment/gc-service -n dark-tower --revision=<PREVIOUS_REVISION>
 ```
 
 **Step 2: Rollback Deployment**
 
 ```bash
 # Rollback to previous revision
-kubectl rollout undo deployment/global-controller -n dark-tower
+kubectl rollout undo deployment/gc-service -n dark-tower
 
 # Or rollback to specific revision
-kubectl rollout undo deployment/global-controller -n dark-tower --to-revision=<REVISION>
+kubectl rollout undo deployment/gc-service -n dark-tower --to-revision=<REVISION>
 
 # Monitor rollback
-kubectl rollout status deployment/global-controller -n dark-tower
+kubectl rollout status deployment/gc-service -n dark-tower
 ```
 
 **Step 3: Verify rollback success**
 
 ```bash
 # Check pods running previous version
-kubectl get pods -n dark-tower -l app=global-controller -o jsonpath='{.items[*].spec.containers[0].image}'
+kubectl get pods -n dark-tower -l app=gc-service -o jsonpath='{.items[*].spec.containers[0].image}'
 
 # Run smoke tests (see Smoke Tests section)
 # Verify health, ready, metrics endpoints
@@ -497,7 +497,7 @@ kubectl create secret generic gc-service-secrets \
   --dry-run=client -o yaml | kubectl apply -f -
 
 # Restart pods to pick up new secret
-kubectl rollout restart deployment/global-controller -n dark-tower
+kubectl rollout restart deployment/gc-service -n dark-tower
 ```
 
 ### Kubernetes ConfigMap
@@ -581,7 +581,7 @@ kubectl logs -n dark-tower postgres-0 --tail=100 | grep -i "connection\|authenti
 
 # Verify network policy allows traffic
 kubectl get networkpolicy -n dark-tower
-kubectl describe networkpolicy global-controller -n dark-tower
+kubectl describe networkpolicy gc-service -n dark-tower
 ```
 
 **Fix:**
@@ -612,7 +612,7 @@ kubectl get pods -n dark-tower -l app=ac-service
 kubectl exec -it <gc-pod> -n dark-tower -- curl -i $AC_JWKS_URL
 
 # Check GC logs for JWKS errors
-kubectl logs deployment/global-controller -n dark-tower --tail=100 | grep -i "jwks"
+kubectl logs deployment/gc-service -n dark-tower --tail=100 | grep -i "jwks"
 
 # Verify AC_JWKS_URL in ConfigMap
 kubectl get configmap gc-service-config -n dark-tower -o yaml | grep AC_JWKS_URL
@@ -640,7 +640,7 @@ kubectl get configmap gc-service-config -n dark-tower -o yaml | grep AC_JWKS_URL
 
 ```bash
 # Check TokenManager logs
-kubectl logs deployment/global-controller -n dark-tower --tail=100 | grep -i "token"
+kubectl logs deployment/gc-service -n dark-tower --tail=100 | grep -i "token"
 
 # Test token endpoint directly
 kubectl exec -it <gc-pod> -n dark-tower -- curl -X POST $AC_TOKEN_URL \
@@ -710,17 +710,17 @@ kubectl describe node <node-name>
 
 ```bash
 # Check MC pods are running
-kubectl get pods -n dark-tower -l app=meeting-controller
+kubectl get pods -n dark-tower -l app=mc-service
 
 # Check MC registrations in database
 kubectl exec -it <gc-pod> -n dark-tower -- psql $DATABASE_URL -c \
   "SELECT id, region, capacity, current_sessions, last_heartbeat FROM meeting_controllers WHERE last_heartbeat > NOW() - INTERVAL '30 seconds';"
 
 # Test gRPC connectivity to MC
-kubectl exec -it <gc-pod> -n dark-tower -- grpcurl -plaintext meeting-controller.dark-tower.svc.cluster.local:9090 list
+kubectl exec -it <gc-pod> -n dark-tower -- grpcurl -plaintext mc-service.dark-tower.svc.cluster.local:9090 list
 
 # Check database query latency
-kubectl logs deployment/global-controller -n dark-tower --tail=100 | grep "select_mc\|mc_assignment"
+kubectl logs deployment/gc-service -n dark-tower --tail=100 | grep "select_mc\|mc_assignment"
 ```
 
 **Fix:**
@@ -741,7 +741,7 @@ Run these tests immediately after deployment to verify core functionality.
 
 ```bash
 # Port-forward to pod
-kubectl port-forward -n dark-tower deployment/global-controller 8080:8080 &
+kubectl port-forward -n dark-tower deployment/gc-service 8080:8080 &
 
 # Test health endpoint
 curl -i http://localhost:8080/health
@@ -767,7 +767,7 @@ kill %1
 
 ```bash
 # Port-forward to pod
-kubectl port-forward -n dark-tower deployment/global-controller 8080:8080 &
+kubectl port-forward -n dark-tower deployment/gc-service 8080:8080 &
 
 # Test readiness endpoint
 curl -i http://localhost:8080/ready
@@ -795,7 +795,7 @@ kill %1
 
 ```bash
 # Port-forward to pod
-kubectl port-forward -n dark-tower deployment/global-controller 8080:8080 &
+kubectl port-forward -n dark-tower deployment/gc-service 8080:8080 &
 
 # Fetch metrics
 curl -s http://localhost:8080/metrics | head -50
@@ -822,7 +822,7 @@ kill %1
 
 ```bash
 # Port-forward to pod
-kubectl port-forward -n dark-tower deployment/global-controller 8080:8080 &
+kubectl port-forward -n dark-tower deployment/gc-service 8080:8080 &
 
 # Get a service token from AC (requires test credentials)
 TOKEN=$(curl -s -X POST http://ac-service.dark-tower.svc.cluster.local:8082/api/v1/auth/service/token \
@@ -854,7 +854,7 @@ kill %1
 
 ```bash
 # Port-forward to pod
-kubectl port-forward -n dark-tower deployment/global-controller 8080:8080 &
+kubectl port-forward -n dark-tower deployment/gc-service 8080:8080 &
 
 # Test meeting join (requires valid meeting code and token)
 curl -i http://localhost:8080/api/v1/meetings/TEST-CODE \
@@ -886,10 +886,10 @@ kill %1
 
 ```promql
 # Pod restart count (should be 0 after initial deployment)
-kube_pod_container_status_restarts_total{namespace="dark-tower",pod=~"global-controller-.*"}
+kube_pod_container_status_restarts_total{namespace="dark-tower",pod=~"gc-service-.*"}
 
 # Pod readiness (should be 1 for all pods)
-kube_pod_status_ready{namespace="dark-tower",pod=~"global-controller-.*"}
+kube_pod_status_ready{namespace="dark-tower",pod=~"gc-service-.*"}
 ```
 
 **Error rate:**
@@ -921,10 +921,10 @@ histogram_quantile(0.99, sum by(le) (rate(gc_db_query_duration_seconds_bucket[5m
 
 ```promql
 # CPU usage (should be <70% sustained)
-rate(container_cpu_usage_seconds_total{namespace="dark-tower",pod=~"global-controller-.*"}[5m])
+rate(container_cpu_usage_seconds_total{namespace="dark-tower",pod=~"gc-service-.*"}[5m])
 
 # Memory usage (should be <70% of limit)
-container_memory_working_set_bytes{namespace="dark-tower",pod=~"global-controller-.*"}
+container_memory_working_set_bytes{namespace="dark-tower",pod=~"gc-service-.*"}
 / container_spec_memory_limit_bytes * 100
 ```
 
@@ -953,16 +953,16 @@ See `infra/docker/prometheus/rules/gc-alerts.yaml` for full list.
 
 ```bash
 # Errors in last hour
-kubectl logs -n dark-tower -l app=global-controller --since=1h | grep -i "error"
+kubectl logs -n dark-tower -l app=gc-service --since=1h | grep -i "error"
 
 # Failed meeting joins
-kubectl logs -n dark-tower -l app=global-controller --since=1h | grep "join.*failed"
+kubectl logs -n dark-tower -l app=gc-service --since=1h | grep "join.*failed"
 
 # Database connection issues
-kubectl logs -n dark-tower -l app=global-controller --since=1h | grep -i "database.*error"
+kubectl logs -n dark-tower -l app=gc-service --since=1h | grep -i "database.*error"
 
 # MC assignment failures
-kubectl logs -n dark-tower -l app=global-controller --since=1h | grep -i "mc_assignment.*error"
+kubectl logs -n dark-tower -l app=gc-service --since=1h | grep -i "mc_assignment.*error"
 ```
 
 ---
@@ -989,8 +989,8 @@ kubectl logs -n dark-tower -l app=global-controller --since=1h | grep -i "mc_ass
 - **ADR-0010:** Global Controller Architecture
 - **ADR-0011:** Observability Framework
 - **ADR-0012:** Infrastructure Architecture
-- **Source Code:** `crates/global-controller/`
-- **Kubernetes Manifests:** `infra/services/global-controller/`
+- **Source Code:** `crates/gc-service/`
+- **Kubernetes Manifests:** `infra/services/gc-service/`
 - **Database Migrations:** `migrations/`
 
 ---

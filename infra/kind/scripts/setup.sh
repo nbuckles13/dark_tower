@@ -548,31 +548,31 @@ deploy_gc_service() {
     # Build from project root
     pushd "${PROJECT_ROOT}" > /dev/null
     ${CONTAINER_CMD} build \
-        -t localhost/global-controller:latest \
-        -f infra/docker/global-controller/Dockerfile \
+        -t localhost/gc-service:latest \
+        -f infra/docker/gc-service/Dockerfile \
         .
     popd > /dev/null
 
     log_step "Loading image into kind cluster..."
     if [[ "${KIND_EXPERIMENTAL_PROVIDER:-}" == "podman" ]]; then
         local TMPFILE
-        TMPFILE=$(mktemp /tmp/global-controller-image.XXXXXX.tar)
-        podman save localhost/global-controller:latest -o "${TMPFILE}"
+        TMPFILE=$(mktemp /tmp/gc-service-image.XXXXXX.tar)
+        podman save localhost/gc-service:latest -o "${TMPFILE}"
         kind load image-archive "${TMPFILE}" --name "${CLUSTER_NAME}"
         rm -f "${TMPFILE}"
     else
-        kind load docker-image localhost/global-controller:latest --name "${CLUSTER_NAME}"
+        kind load docker-image localhost/gc-service:latest --name "${CLUSTER_NAME}"
     fi
 
     log_step "Deploying Global Controller to cluster..."
     # Apply GC manifests, excluding service-monitor.yaml (requires Prometheus Operator CRD)
-    for f in "${PROJECT_ROOT}/infra/services/global-controller/"*.yaml; do
+    for f in "${PROJECT_ROOT}/infra/services/gc-service/"*.yaml; do
         [[ "$(basename "$f")" == "service-monitor.yaml" ]] && continue
         kubectl apply -f "$f"
     done
 
     log_info "Waiting for Global Controller to be ready..."
-    kubectl rollout status deployment/global-controller -n dark-tower --timeout=180s
+    kubectl rollout status deployment/gc-service -n dark-tower --timeout=180s
 
     log_info "Global Controller deployed successfully."
 }
@@ -592,31 +592,31 @@ deploy_mc_service() {
     # Build from project root
     pushd "${PROJECT_ROOT}" > /dev/null
     ${CONTAINER_CMD} build \
-        -t localhost/meeting-controller:latest \
-        -f infra/docker/meeting-controller/Dockerfile \
+        -t localhost/mc-service:latest \
+        -f infra/docker/mc-service/Dockerfile \
         .
     popd > /dev/null
 
     log_step "Loading image into kind cluster..."
     if [[ "${KIND_EXPERIMENTAL_PROVIDER:-}" == "podman" ]]; then
         local TMPFILE
-        TMPFILE=$(mktemp /tmp/meeting-controller-image.XXXXXX.tar)
-        podman save localhost/meeting-controller:latest -o "${TMPFILE}"
+        TMPFILE=$(mktemp /tmp/mc-service-image.XXXXXX.tar)
+        podman save localhost/mc-service:latest -o "${TMPFILE}"
         kind load image-archive "${TMPFILE}" --name "${CLUSTER_NAME}"
         rm -f "${TMPFILE}"
     else
-        kind load docker-image localhost/meeting-controller:latest --name "${CLUSTER_NAME}"
+        kind load docker-image localhost/mc-service:latest --name "${CLUSTER_NAME}"
     fi
 
     log_step "Deploying Meeting Controller to cluster..."
     # Apply MC manifests, excluding service-monitor.yaml (requires Prometheus Operator CRD)
-    for f in "${PROJECT_ROOT}/infra/services/meeting-controller/"*.yaml; do
+    for f in "${PROJECT_ROOT}/infra/services/mc-service/"*.yaml; do
         [[ "$(basename "$f")" == "service-monitor.yaml" ]] && continue
         kubectl apply -f "$f"
     done
 
     log_info "Waiting for Meeting Controller to be ready..."
-    kubectl rollout status deployment/meeting-controller -n dark-tower --timeout=180s
+    kubectl rollout status deployment/mc-service -n dark-tower --timeout=180s
 
     log_info "Meeting Controller deployed successfully."
 }
@@ -651,7 +651,7 @@ setup_port_forwards() {
     # Start port-forwards in background
     kubectl port-forward -n dark-tower svc/postgres 5432:5432 &>/dev/null &
     kubectl port-forward -n dark-tower svc/ac-service 8082:8082 &>/dev/null &
-    kubectl port-forward -n dark-tower svc/global-controller 8080:8080 &>/dev/null &
+    kubectl port-forward -n dark-tower svc/gc-service 8080:8080 &>/dev/null &
     kubectl port-forward -n dark-tower-observability svc/prometheus 9090:9090 &>/dev/null &
     kubectl port-forward -n dark-tower-observability svc/grafana 3000:3000 &>/dev/null &
     kubectl port-forward -n dark-tower-observability svc/loki 3100:3100 &>/dev/null &

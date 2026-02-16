@@ -264,9 +264,9 @@ dark_tower/
 │   ├── common/              # Shared types and utilities
 │   ├── proto-gen/           # Generated Protocol Buffer code
 │   ├── media-protocol/      # Proprietary media protocol
-│   ├── global-controller/   # Global API gateway 🚧 SKELETON
-│   ├── meeting-controller/  # Meeting signaling 🚧 SKELETON
-│   └── media-handler/       # Media routing (SFU) 🚧 SKELETON
+│   ├── gc-service/          # Global API gateway 🚧 SKELETON
+│   ├── mc-service/          # Meeting signaling 🚧 SKELETON
+│   └── mh-service/          # Media routing (SFU) 🚧 SKELETON
 ├── client/                  # Svelte web application 📋 PLANNED
 ├── proto/                   # Protocol Buffer definitions
 │   ├── signaling.proto      # Client ↔ Meeting Controller

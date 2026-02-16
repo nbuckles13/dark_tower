@@ -330,17 +330,17 @@ Each component runs as a Kubernetes Deployment:
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: meeting-controller
+  name: mc-service
 spec:
   replicas: 10  # Auto-scaled
   selector:
     matchLabels:
-      app: meeting-controller
+      app: mc-service
   template:
     spec:
       containers:
-      - name: meeting-controller
-        image: darktower/meeting-controller:v0.1.0
+      - name: mc-service
+        image: darktower/mc-service:v0.1.0
         resources:
           requests:
             cpu: "2000m"
@@ -713,12 +713,12 @@ Media Handlers benefit from vertical scaling:
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:
-  name: meeting-controller-hpa
+  name: mc-service-hpa
 spec:
   scaleTargetRef:
     apiVersion: apps/v1
     kind: Deployment
-    name: meeting-controller
+    name: mc-service
   minReplicas: 5
   maxReplicas: 50
   metrics:
@@ -949,7 +949,7 @@ join_meeting (250ms)
 Structured JSON logs with fields:
 - `timestamp`
 - `level` (info, warn, error)
-- `component` (global-controller, meeting-controller, etc.)
+- `component` (gc-service, mc-service, etc.)
 - `trace_id`
 - `span_id`
 - `meeting_id`

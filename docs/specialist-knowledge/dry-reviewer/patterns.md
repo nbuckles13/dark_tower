@@ -7,7 +7,7 @@ This file captures successful patterns and approaches discovered during DRY revi
 ## Architectural Alignment vs. Harmful Duplication
 
 **Added**: 2026-01-29
-**Related files**: `crates/env-tests/src/cluster.rs`, `crates/ac-service/src/repositories/*.rs`, `crates/global-controller/src/services/*.rs`
+**Related files**: `crates/env-tests/src/cluster.rs`, `crates/ac-service/src/repositories/*.rs`, `crates/gc-service/src/services/*.rs`
 
 **Pattern**: The `.map_err(|e| ErrorType::Variant(format!("context: {}", e)))` error preservation pattern appears across all services (AC, MC, GC, env-tests) with 40+ instances. This is **healthy architectural alignment**, NOT harmful duplication requiring extraction. Each crate should define its own domain-specific error types (`AcError`, `GcError`, `ClusterError`) while following the same error preservation convention. Extracting this to a macro or shared utility would add complexity without reducing maintenance burden.
 
@@ -18,7 +18,7 @@ This file captures successful patterns and approaches discovered during DRY revi
 ## Mock vs Real Test Server Distinction
 
 **Added**: 2026-01-30
-**Related files**: `crates/meeting-controller/tests/gc_integration.rs`, `crates/gc-test-utils/src/server_harness.rs`
+**Related files**: `crates/mc-service/tests/gc_integration.rs`, `crates/gc-test-utils/src/server_harness.rs`
 
 **Pattern**: When reviewing test infrastructure, distinguish between:
 - **Mock servers** (e.g., `MockGcServer`): Fake implementations of service interfaces for testing client code
@@ -33,7 +33,7 @@ These serve different purposes and are NOT duplication even if both involve the 
 ## CancellationToken for Hierarchical Shutdown
 
 **Added**: 2026-01-30
-**Related files**: `crates/meeting-controller/src/main.rs`, `crates/global-controller/src/main.rs`
+**Related files**: `crates/mc-service/src/main.rs`, `crates/gc-service/src/main.rs`
 
 **Pattern**: Both MC and GC use `tokio_util::sync::CancellationToken` with child tokens for graceful shutdown propagation. This is a healthy alignment - both services now follow the same shutdown pattern. Child tokens enable hierarchical cancellation where parent token cancellation automatically propagates to all children.
 
@@ -44,7 +44,7 @@ These serve different purposes and are NOT duplication even if both involve the 
 ## MockBehavior Enum for Test Flexibility
 
 **Added**: 2026-01-31
-**Related files**: `crates/meeting-controller/tests/gc_integration.rs:36-46`
+**Related files**: `crates/mc-service/tests/gc_integration.rs:36-46`
 
 **Pattern**: Use an enum to centralize mock server behavior configuration instead of creating separate mock implementations. The `MockBehavior` enum allows a single `MockGcServer` to simulate different scenarios:
 - `Accept` - Normal operation
@@ -67,7 +67,7 @@ These serve different purposes and are NOT duplication even if both involve the 
 ## Unified Task Pattern for Concurrent Responsibilities
 
 **Added**: 2026-01-31
-**Related files**: `crates/meeting-controller/src/main.rs:199-300`
+**Related files**: `crates/mc-service/src/main.rs:199-300`
 
 **Pattern**: When a component has multiple related responsibilities (e.g., registration + dual heartbeats), use a unified task with `tokio::select!` instead of spawning separate tasks. The MC's `run_gc_task()` demonstrates:
 - Single task owns `GcClient` directly (no Arc needed)
@@ -91,7 +91,7 @@ These serve different purposes and are NOT duplication even if both involve the 
 ## Test Helper Functions for Setup Boilerplate
 
 **Added**: 2026-01-31
-**Related files**: `crates/meeting-controller/tests/gc_integration.rs:240-283`
+**Related files**: `crates/mc-service/tests/gc_integration.rs:240-283`
 
 **Pattern**: Extract common test setup into helper functions to eliminate boilerplate:
 - `test_config(gc_url: &str) -> Config` - Creates test configuration with consistent defaults
@@ -112,7 +112,7 @@ These serve different purposes and are NOT duplication even if both involve the 
 ## OnceLock for Static Test Fixtures
 
 **Added**: 2026-02-02
-**Related files**: `crates/meeting-controller/src/grpc/gc_client.rs:648-658`, `crates/meeting-controller/tests/gc_integration.rs:268-278`
+**Related files**: `crates/mc-service/src/grpc/gc_client.rs:648-658`, `crates/mc-service/tests/gc_integration.rs:268-278`
 
 **Pattern**: When creating test helper functions that return cloneable handles (e.g., `TokenReceiver`, channel receivers), use `std::sync::OnceLock` to hold a static sender that keeps the channel alive across test invocations:
 
@@ -194,7 +194,7 @@ pub use common::jwt::{
 ## Dual Metrics Facades (Internal Tracking + Prometheus Emission)
 
 **Added**: 2026-02-05
-**Related files**: `crates/meeting-controller/src/actors/metrics.rs`, `crates/meeting-controller/src/observability/metrics.rs`
+**Related files**: `crates/mc-service/src/actors/metrics.rs`, `crates/mc-service/src/observability/metrics.rs`
 
 **Pattern**: Separate internal atomic metrics tracking (in actor structs) from Prometheus emission (in observability module):
 - **Internal tier**: `ActorMetrics`, `MailboxMonitor` - Atomic counters for fast lock-free updates
@@ -224,7 +224,7 @@ pub fn meeting_created(&self) {
 ## Metrics Recording at Operation Boundaries
 
 **Added**: 2026-02-10
-**Related files**: `crates/meeting-controller/src/grpc/gc_client.rs:363-388, 453-479`, `crates/global-controller/src/repositories/meeting_controllers.rs:119-158`
+**Related files**: `crates/mc-service/src/grpc/gc_client.rs:363-388, 453-479`, `crates/gc-service/src/repositories/meeting_controllers.rs:119-158`
 
 **Pattern**: Record metrics immediately at success/error branches with timing captured via `Instant::now()` before operation and `start.elapsed()` after. Common for gRPC calls, database queries, and external service interactions:
 
@@ -246,7 +246,7 @@ match operation().await {
 ## Closure-Based Generic Extraction for Same-Crate Duplication
 
 **Added**: 2026-02-12 | **Updated**: 2026-02-12 (iteration 2: simplified API)
-**Related files**: `crates/global-controller/src/tasks/generic_health_checker.rs`, `crates/global-controller/src/tasks/health_checker.rs`, `crates/global-controller/src/tasks/mh_health_checker.rs`
+**Related files**: `crates/gc-service/src/tasks/generic_health_checker.rs`, `crates/gc-service/src/tasks/health_checker.rs`, `crates/gc-service/src/tasks/mh_health_checker.rs`
 
 **Pattern**: When two modules in the same crate have 90%+ structural similarity differing only in which repository/function they call, extract the shared logic into a generic function parameterized by a closure, with thin wrapper functions preserving the original API. Pass domain-differentiating values as plain parameters, not config structs:
 

@@ -108,7 +108,7 @@ Infrastructure Team / SRE Lead
 
 ```bash
 # 1. Check mailbox depth by actor type
-kubectl port-forward -n dark-tower deployment/meeting-controller 8080:8080 &
+kubectl port-forward -n dark-tower deployment/mc-service 8080:8080 &
 curl http://localhost:8080/metrics | grep mc_actor_mailbox_depth
 kill %1
 
@@ -128,7 +128,7 @@ histogram_quantile(0.99, sum by(le, actor_type) (rate(mc_message_processing_dura
 curl http://localhost:8080/metrics | grep -E "mc_meetings_active|mc_connections_active"
 
 # 6. Check pod resource usage
-kubectl top pods -n dark-tower -l app=meeting-controller
+kubectl top pods -n dark-tower -l app=mc-service
 
 # 7. Check for message drops
 curl http://localhost:8080/metrics | grep mc_messages_dropped_total
@@ -160,7 +160,7 @@ curl http://localhost:8080/metrics | grep mc_messages_dropped_total
 
 ```bash
 # Option 1: Scale horizontally to distribute load
-kubectl scale deployment/meeting-controller -n dark-tower --replicas=5
+kubectl scale deployment/mc-service -n dark-tower --replicas=5
 
 # Expected recovery time: 30-60 seconds
 
@@ -206,7 +206,7 @@ curl http://localhost:8080/metrics | grep mc_actor_mailbox_depth
 
 ```bash
 # 1. Check panic metrics
-kubectl port-forward -n dark-tower deployment/meeting-controller 8080:8080 &
+kubectl port-forward -n dark-tower deployment/mc-service 8080:8080 &
 curl http://localhost:8080/metrics | grep mc_actor_panics_total
 kill %1
 
@@ -215,15 +215,15 @@ kill %1
 sum by(actor_type) (increase(mc_actor_panics_total[5m]))
 
 # 3. Find panic in logs (look for stack trace)
-kubectl logs -n dark-tower -l app=meeting-controller --tail=500 | grep -A 50 "panic\|PANIC"
+kubectl logs -n dark-tower -l app=mc-service --tail=500 | grep -A 50 "panic\|PANIC"
 
 # 4. Find correlation with meetings
 # Look for meeting-related context in panic logs
-kubectl logs -n dark-tower -l app=meeting-controller --tail=500 | grep -B 10 "panic" | grep -i "meeting\|session"
+kubectl logs -n dark-tower -l app=mc-service --tail=500 | grep -B 10 "panic" | grep -i "meeting\|session"
 
 # 5. Check if panic is recurring
 # Watch panic counter
-watch -n 5 'kubectl port-forward -n dark-tower deployment/meeting-controller 8080:8080 2>/dev/null & sleep 1; curl -s http://localhost:8080/metrics | grep mc_actor_panics_total; kill %1 2>/dev/null'
+watch -n 5 'kubectl port-forward -n dark-tower deployment/mc-service 8080:8080 2>/dev/null & sleep 1; curl -s http://localhost:8080/metrics | grep mc_actor_panics_total; kill %1 2>/dev/null'
 ```
 
 **Common Root Causes**:
@@ -257,10 +257,10 @@ sum by(actor_type) (increase(mc_actor_panics_total[5m]))
 
 # Step 2: If panic is in critical actor and recurring, consider rollback
 # Check if recent deployment
-kubectl rollout history deployment/meeting-controller -n dark-tower
+kubectl rollout history deployment/mc-service -n dark-tower
 
 # If panic started after deployment:
-kubectl rollout undo deployment/meeting-controller -n dark-tower
+kubectl rollout undo deployment/mc-service -n dark-tower
 
 # Expected recovery time: 2-3 minutes
 
@@ -270,7 +270,7 @@ kubectl delete pod <MC_POD_NAME> -n dark-tower
 # Expected recovery time: 30 seconds
 
 # Step 4: Monitor for recurrence
-watch -n 10 'kubectl port-forward -n dark-tower deployment/meeting-controller 8080:8080 2>/dev/null & sleep 1; curl -s http://localhost:8080/metrics | grep mc_actor_panics_total; kill %1 2>/dev/null'
+watch -n 10 'kubectl port-forward -n dark-tower deployment/mc-service 8080:8080 2>/dev/null & sleep 1; curl -s http://localhost:8080/metrics | grep mc_actor_panics_total; kill %1 2>/dev/null'
 
 # Verify recovery
 # Panic count should stop incrementing
@@ -300,7 +300,7 @@ curl http://localhost:8080/metrics | grep mc_actor_panics_total
 
 ```bash
 # 1. Check meeting and connection counts
-kubectl port-forward -n dark-tower deployment/meeting-controller 8080:8080 &
+kubectl port-forward -n dark-tower deployment/mc-service 8080:8080 &
 curl http://localhost:8080/metrics | grep -E "mc_meetings_active|mc_connections_active"
 kill %1
 
@@ -308,13 +308,13 @@ kill %1
 curl http://localhost:8080/metrics | grep mc_message_processing_duration_seconds
 
 # 3. Look for meeting-related errors in logs
-kubectl logs -n dark-tower -l app=meeting-controller --tail=500 | grep -i "meeting\|session\|lifecycle"
+kubectl logs -n dark-tower -l app=mc-service --tail=500 | grep -i "meeting\|session\|lifecycle"
 
 # 4. Check for connection issues
-kubectl logs -n dark-tower -l app=meeting-controller --tail=500 | grep -i "connection\|disconnect\|webtransport"
+kubectl logs -n dark-tower -l app=mc-service --tail=500 | grep -i "connection\|disconnect\|webtransport"
 
 # 5. Check GC perspective on meetings
-kubectl exec -it deployment/global-controller -n dark-tower -- \
+kubectl exec -it deployment/gc-service -n dark-tower -- \
   psql $DATABASE_URL -c "SELECT meeting_id, mc_id, status, participant_count, created_at FROM meetings WHERE status = 'active' ORDER BY created_at DESC LIMIT 10;"
 ```
 
@@ -355,7 +355,7 @@ kubectl delete pod <MC_POD_NAME> -n dark-tower
 
 # Option 3: Update GC to mark meetings as ended
 # Requires database intervention
-kubectl exec -it deployment/global-controller -n dark-tower -- \
+kubectl exec -it deployment/gc-service -n dark-tower -- \
   psql $DATABASE_URL -c "UPDATE meetings SET status = 'ended' WHERE mc_id = '<MC_ID>' AND status = 'active' AND updated_at < NOW() - INTERVAL '1 hour';"
 
 # This cleans up stale meetings in GC
@@ -380,7 +380,7 @@ curl http://localhost:8080/metrics | grep mc_meetings_active
 
 **Symptoms**:
 - All MC pods in CrashLoopBackOff or Pending state
-- No healthy pods in `kubectl get pods -l app=meeting-controller`
+- No healthy pods in `kubectl get pods -l app=mc-service`
 - Alert: `MCDown` firing
 - Active meetings disrupted, users disconnected
 
@@ -388,16 +388,16 @@ curl http://localhost:8080/metrics | grep mc_meetings_active
 
 ```bash
 # 1. Check pod status
-kubectl get pods -n dark-tower -l app=meeting-controller
+kubectl get pods -n dark-tower -l app=mc-service
 
 # 2. Check pod events
-kubectl describe pods -n dark-tower -l app=meeting-controller
+kubectl describe pods -n dark-tower -l app=mc-service
 
 # 3. Check recent logs before crash
-kubectl logs -n dark-tower -l app=meeting-controller --previous --tail=100
+kubectl logs -n dark-tower -l app=mc-service --previous --tail=100
 
 # 4. Check deployment status
-kubectl describe deployment meeting-controller -n dark-tower
+kubectl describe deployment mc-service -n dark-tower
 
 # 5. Check resource quotas
 kubectl describe resourcequota -n dark-tower
@@ -407,7 +407,7 @@ kubectl get nodes
 kubectl describe node <node-name>
 
 # 7. Check for recent deployments
-kubectl rollout history deployment/meeting-controller -n dark-tower
+kubectl rollout history deployment/mc-service -n dark-tower
 ```
 
 **Common Root Causes**:
@@ -440,13 +440,13 @@ kubectl rollout history deployment/meeting-controller -n dark-tower
 
 ```bash
 # Option 1: Rollback deployment to last known good version
-kubectl rollout undo deployment/meeting-controller -n dark-tower
-kubectl rollout status deployment/meeting-controller -n dark-tower
+kubectl rollout undo deployment/mc-service -n dark-tower
+kubectl rollout status deployment/mc-service -n dark-tower
 
 # Expected recovery time: 2-3 minutes
 
 # Option 2: Force reschedule pods
-kubectl delete pods -n dark-tower -l app=meeting-controller
+kubectl delete pods -n dark-tower -l app=mc-service
 # Deployment will recreate them
 
 # Expected recovery time: 30-60 seconds
@@ -457,13 +457,13 @@ kubectl get configmap -n dark-tower mc-service-config
 # If missing, recreate from secure backup
 
 # Option 4: Increase resource limits (if OOMKilled)
-kubectl patch deployment/meeting-controller -n dark-tower -p '{"spec":{"template":{"spec":{"containers":[{"name":"meeting-controller","resources":{"limits":{"memory":"2Gi"}}}]}}}}'
+kubectl patch deployment/mc-service -n dark-tower -p '{"spec":{"template":{"spec":{"containers":[{"name":"mc-service","resources":{"limits":{"memory":"2Gi"}}}]}}}}'
 
 # Expected recovery time: 2-3 minutes
 
 # Verify recovery
-kubectl get pods -n dark-tower -l app=meeting-controller
-kubectl logs -n dark-tower -l app=meeting-controller --tail=50
+kubectl get pods -n dark-tower -l app=mc-service
+kubectl logs -n dark-tower -l app=mc-service --tail=50
 ```
 
 **Escalation**:
@@ -489,7 +489,7 @@ kubectl logs -n dark-tower -l app=meeting-controller --tail=50
 
 ```bash
 # 1. Check current latency metrics
-kubectl port-forward -n dark-tower deployment/meeting-controller 8080:8080 &
+kubectl port-forward -n dark-tower deployment/mc-service 8080:8080 &
 curl http://localhost:8080/metrics | grep mc_message_processing_duration_seconds
 kill %1
 
@@ -501,16 +501,16 @@ histogram_quantile(0.95, sum by(actor_type, le) (rate(mc_message_processing_dura
 sum by(actor_type) (mc_actor_mailbox_depth)
 
 # 4. Check pod resource utilization
-kubectl top pods -n dark-tower -l app=meeting-controller
+kubectl top pods -n dark-tower -l app=mc-service
 
 # 5. Check for GC heartbeat latency (slow GC can cause delays)
 histogram_quantile(0.95, sum by(le) (rate(mc_gc_heartbeat_duration_seconds_bucket[5m])))
 
 # 6. Check for garbage collection pauses (if applicable)
-kubectl logs -n dark-tower -l app=meeting-controller --tail=500 | grep -i "gc\|pause"
+kubectl logs -n dark-tower -l app=mc-service --tail=500 | grep -i "gc\|pause"
 
 # 7. Check network latency between pods
-kubectl exec -it deployment/meeting-controller -n dark-tower -- ping global-controller.dark-tower.svc.cluster.local
+kubectl exec -it deployment/mc-service -n dark-tower -- ping gc-service.dark-tower.svc.cluster.local
 ```
 
 **Common Root Causes**:
@@ -543,7 +543,7 @@ kubectl exec -it deployment/meeting-controller -n dark-tower -- ping global-cont
 
 ```bash
 # Scenario A: CPU Bound (CPU >80%)
-kubectl scale deployment/meeting-controller -n dark-tower --replicas=5
+kubectl scale deployment/mc-service -n dark-tower --replicas=5
 
 # Expected recovery time: 30-60 seconds
 
@@ -551,7 +551,7 @@ kubectl scale deployment/meeting-controller -n dark-tower --replicas=5
 # See Scenario 1 remediation
 
 # Scenario C: Memory Pressure
-kubectl patch deployment/meeting-controller -n dark-tower -p '{"spec":{"template":{"spec":{"containers":[{"name":"meeting-controller","resources":{"limits":{"memory":"2Gi"}}}]}}}}'
+kubectl patch deployment/mc-service -n dark-tower -p '{"spec":{"template":{"spec":{"containers":[{"name":"mc-service","resources":{"limits":{"memory":"2Gi"}}}]}}}}'
 
 # Expected recovery time: 2-3 minutes
 
@@ -589,33 +589,33 @@ histogram_quantile(0.95, sum by(le) (rate(mc_message_processing_duration_seconds
 
 ```bash
 # 1. Check heartbeat metrics
-kubectl port-forward -n dark-tower deployment/meeting-controller 8080:8080 &
+kubectl port-forward -n dark-tower deployment/mc-service 8080:8080 &
 curl http://localhost:8080/metrics | grep mc_gc_heartbeat
 kill %1
 
 # 2. Check GC service health
-kubectl get pods -n dark-tower -l app=global-controller
+kubectl get pods -n dark-tower -l app=gc-service
 
 # 3. Check MC registration status in GC
-kubectl exec -it deployment/global-controller -n dark-tower -- \
+kubectl exec -it deployment/gc-service -n dark-tower -- \
   psql $DATABASE_URL -c "SELECT id, region, capacity, current_sessions, last_heartbeat, status FROM meeting_controllers ORDER BY last_heartbeat DESC LIMIT 10;"
 
 # 4. Test GC connectivity from MC pod
-kubectl exec -it deployment/meeting-controller -n dark-tower -- \
-  curl -i http://global-controller.dark-tower.svc.cluster.local:8080/health
+kubectl exec -it deployment/mc-service -n dark-tower -- \
+  curl -i http://gc-service.dark-tower.svc.cluster.local:8080/health
 
 # 5. Check MC logs for GC errors
-kubectl logs -n dark-tower -l app=meeting-controller --tail=100 | grep -i "gc\|heartbeat\|register"
+kubectl logs -n dark-tower -l app=mc-service --tail=100 | grep -i "gc\|heartbeat\|register"
 
 # 6. Check network policy
 kubectl get networkpolicy -n dark-tower
-kubectl describe networkpolicy meeting-controller -n dark-tower
+kubectl describe networkpolicy mc-service -n dark-tower
 ```
 
 **Common Root Causes**:
 
 1. **GC Service Down**: GC not running or unhealthy
-   - Check: `kubectl get pods -l app=global-controller`
+   - Check: `kubectl get pods -l app=gc-service`
    - Fix: Escalate to GC Team
 
 2. **Network Connectivity**: NetworkPolicy blocking MC -> GC
@@ -638,26 +638,26 @@ kubectl describe networkpolicy meeting-controller -n dark-tower
 
 ```bash
 # Option 1: Restart MC to force re-registration
-kubectl rollout restart deployment/meeting-controller -n dark-tower
+kubectl rollout restart deployment/mc-service -n dark-tower
 
 # Expected recovery time: 2-3 minutes
 
 # Option 2: Check and restart GC if unhealthy
-kubectl get pods -n dark-tower -l app=global-controller
-kubectl rollout restart deployment/global-controller -n dark-tower
+kubectl get pods -n dark-tower -l app=gc-service
+kubectl rollout restart deployment/gc-service -n dark-tower
 
 # Expected recovery time: 2-3 minutes
 # Escalate to GC Team before restarting GC
 
 # Option 3: Verify NetworkPolicy
-kubectl get networkpolicy meeting-controller -n dark-tower -o yaml
-# Ensure egress to global-controller:8080 is allowed
+kubectl get networkpolicy mc-service -n dark-tower -o yaml
+# Ensure egress to gc-service:8080 is allowed
 
 # Option 4: Manual re-registration (if MC has admin API)
 # TODO: Implement admin API for re-registration
 
 # Verify recovery
-kubectl exec -it deployment/global-controller -n dark-tower -- \
+kubectl exec -it deployment/gc-service -n dark-tower -- \
   psql $DATABASE_URL -c "SELECT id, last_heartbeat, status FROM meeting_controllers WHERE last_heartbeat > NOW() - INTERVAL '30 seconds';"
 # MC should appear with recent heartbeat and 'active' status
 ```
@@ -686,23 +686,23 @@ kubectl exec -it deployment/global-controller -n dark-tower -- \
 
 ```bash
 # 1. Check current resource usage
-kubectl top pods -n dark-tower -l app=meeting-controller
+kubectl top pods -n dark-tower -l app=mc-service
 
 # 2. Check resource limits
-kubectl describe deployment meeting-controller -n dark-tower | grep -A 10 "Limits:"
+kubectl describe deployment mc-service -n dark-tower | grep -A 10 "Limits:"
 
 # 3. Check for OOMKilled events
 kubectl get events -n dark-tower --field-selector involvedObject.kind=Pod | grep -i "oom\|killed"
 
 # 4. Check memory usage trend in Prometheus
-container_memory_working_set_bytes{pod=~"meeting-controller-.*"}
-container_spec_memory_limit_bytes{pod=~"meeting-controller-.*"}
+container_memory_working_set_bytes{pod=~"mc-service-.*"}
+container_spec_memory_limit_bytes{pod=~"mc-service-.*"}
 
 # 5. Check CPU usage trend
-rate(container_cpu_usage_seconds_total{pod=~"meeting-controller-.*"}[5m])
+rate(container_cpu_usage_seconds_total{pod=~"mc-service-.*"}[5m])
 
 # 6. Check meeting/connection load
-kubectl port-forward -n dark-tower deployment/meeting-controller 8080:8080 &
+kubectl port-forward -n dark-tower deployment/mc-service 8080:8080 &
 curl http://localhost:8080/metrics | grep -E "mc_meetings_active|mc_connections_active"
 kill %1
 
@@ -736,27 +736,27 @@ curl http://localhost:8080/metrics | grep mc_actor_mailbox_depth
 
 ```bash
 # Option 1: Scale horizontally to distribute load
-kubectl scale deployment/meeting-controller -n dark-tower --replicas=5
+kubectl scale deployment/mc-service -n dark-tower --replicas=5
 
 # Expected recovery time: 30-60 seconds
 
 # Option 2: Increase resource limits
-kubectl patch deployment/meeting-controller -n dark-tower -p '{"spec":{"template":{"spec":{"containers":[{"name":"meeting-controller","resources":{"limits":{"cpu":"4000m","memory":"2Gi"},"requests":{"cpu":"1000m","memory":"1Gi"}}}]}}}}'
+kubectl patch deployment/mc-service -n dark-tower -p '{"spec":{"template":{"spec":{"containers":[{"name":"mc-service","resources":{"limits":{"cpu":"4000m","memory":"2Gi"},"requests":{"cpu":"1000m","memory":"1Gi"}}}]}}}}'
 
 # Expected recovery time: 2-3 minutes (rolling update)
 
 # Option 3: Restart pods (temporary fix for memory issues)
-kubectl rollout restart deployment/meeting-controller -n dark-tower
+kubectl rollout restart deployment/mc-service -n dark-tower
 
 # Expected recovery time: 2-3 minutes
 
 # Option 4: Mark MC as draining (stop new assignments)
-kubectl exec -it deployment/global-controller -n dark-tower -- \
+kubectl exec -it deployment/gc-service -n dark-tower -- \
   psql $DATABASE_URL -c "UPDATE meeting_controllers SET status = 'draining' WHERE id = '<MC_ID>';"
 # This stops new meetings from being assigned while allowing current ones to finish
 
 # Verify recovery
-kubectl top pods -n dark-tower -l app=meeting-controller
+kubectl top pods -n dark-tower -l app=mc-service
 # CPU should be <70%, memory should be <70%
 ```
 
@@ -773,22 +773,22 @@ kubectl top pods -n dark-tower -l app=meeting-controller
 
 ```bash
 # Check service health
-kubectl port-forward -n dark-tower deployment/meeting-controller 8080:8080 &
+kubectl port-forward -n dark-tower deployment/mc-service 8080:8080 &
 curl http://localhost:8080/health      # Liveness
 curl http://localhost:8080/ready       # Readiness
 kill %1
 
 # Check pod status
-kubectl get pods -n dark-tower -l app=meeting-controller
+kubectl get pods -n dark-tower -l app=mc-service
 
 # Check recent errors in logs
-kubectl logs -n dark-tower -l app=meeting-controller --tail=100 | grep -i error
+kubectl logs -n dark-tower -l app=mc-service --tail=100 | grep -i error
 ```
 
 ### Metrics Analysis
 
 ```bash
-kubectl port-forward -n dark-tower deployment/meeting-controller 8080:8080 &
+kubectl port-forward -n dark-tower deployment/mc-service 8080:8080 &
 
 # Get all metrics
 curl http://localhost:8080/metrics
@@ -815,41 +815,41 @@ kill %1
 
 ```bash
 # Stream logs in real-time
-kubectl logs -n dark-tower -l app=meeting-controller -f
+kubectl logs -n dark-tower -l app=mc-service -f
 
 # Get logs from all pods
-kubectl logs -n dark-tower -l app=meeting-controller --all-containers --tail=200
+kubectl logs -n dark-tower -l app=mc-service --all-containers --tail=200
 
 # Get logs from previous pod instance (after crash)
 kubectl logs -n dark-tower <pod-name> --previous
 
 # Search for specific errors
-kubectl logs -n dark-tower -l app=meeting-controller --tail=1000 | grep -E "error|panic|fatal"
+kubectl logs -n dark-tower -l app=mc-service --tail=1000 | grep -E "error|panic|fatal"
 
 # Search for actor panics
-kubectl logs -n dark-tower -l app=meeting-controller --tail=1000 | grep -A 30 "panic\|PANIC"
+kubectl logs -n dark-tower -l app=mc-service --tail=1000 | grep -A 30 "panic\|PANIC"
 
 # Search for GC integration issues
-kubectl logs -n dark-tower -l app=meeting-controller --tail=1000 | grep -i "gc\|heartbeat\|register"
+kubectl logs -n dark-tower -l app=mc-service --tail=1000 | grep -i "gc\|heartbeat\|register"
 
 # Search for meeting lifecycle events
-kubectl logs -n dark-tower -l app=meeting-controller --tail=1000 | grep -i "meeting\|session\|participant"
+kubectl logs -n dark-tower -l app=mc-service --tail=1000 | grep -i "meeting\|session\|participant"
 ```
 
 ### Resource Utilization
 
 ```bash
 # Check CPU and memory usage
-kubectl top pods -n dark-tower -l app=meeting-controller
+kubectl top pods -n dark-tower -l app=mc-service
 
 # Check node resources
 kubectl top nodes
 
 # Check resource limits
-kubectl describe deployment meeting-controller -n dark-tower | grep -A 5 "Limits:"
+kubectl describe deployment mc-service -n dark-tower | grep -A 5 "Limits:"
 
 # Check events for resource issues
-kubectl get events -n dark-tower --field-selector involvedObject.name=meeting-controller --sort-by='.lastTimestamp'
+kubectl get events -n dark-tower --field-selector involvedObject.name=mc-service --sort-by='.lastTimestamp'
 ```
 
 ### Network Debugging
@@ -858,18 +858,18 @@ kubectl get events -n dark-tower --field-selector involvedObject.name=meeting-co
 # Test service connectivity
 kubectl run -it --rm debug --image=nicolaka/netshoot --restart=Never -- /bin/bash
 # From debug pod:
-curl http://meeting-controller.dark-tower.svc.cluster.local:8080/health
-nslookup meeting-controller.dark-tower.svc.cluster.local
+curl http://mc-service.dark-tower.svc.cluster.local:8080/health
+nslookup mc-service.dark-tower.svc.cluster.local
 
 # Check service endpoints
-kubectl get endpoints -n dark-tower meeting-controller
+kubectl get endpoints -n dark-tower mc-service
 
 # Check network policies
 kubectl get networkpolicies -n dark-tower
 
 # Test GC connectivity
-kubectl exec -it deployment/meeting-controller -n dark-tower -- \
-  curl -i http://global-controller.dark-tower.svc.cluster.local:8080/health
+kubectl exec -it deployment/mc-service -n dark-tower -- \
+  curl -i http://gc-service.dark-tower.svc.cluster.local:8080/health
 ```
 
 ---
@@ -882,30 +882,30 @@ kubectl exec -it deployment/meeting-controller -n dark-tower -- \
 
 ```bash
 # 1. Verify current state
-kubectl get pods -n dark-tower -l app=meeting-controller
+kubectl get pods -n dark-tower -l app=mc-service
 
 # 2. Check active meetings (will be affected)
-kubectl port-forward -n dark-tower deployment/meeting-controller 8080:8080 &
+kubectl port-forward -n dark-tower deployment/mc-service 8080:8080 &
 curl http://localhost:8080/metrics | grep mc_meetings_active
 kill %1
 
 # 3. Perform rolling restart (zero-downtime if multiple pods)
-kubectl rollout restart deployment/meeting-controller -n dark-tower
+kubectl rollout restart deployment/mc-service -n dark-tower
 
 # 4. Monitor rollout
-kubectl rollout status deployment/meeting-controller -n dark-tower
+kubectl rollout status deployment/mc-service -n dark-tower
 
 # 5. Verify recovery
-kubectl get pods -n dark-tower -l app=meeting-controller
-curl http://meeting-controller.dark-tower.svc.cluster.local:8080/ready
+kubectl get pods -n dark-tower -l app=mc-service
+curl http://mc-service.dark-tower.svc.cluster.local:8080/ready
 
 # 6. Check logs for startup errors
-kubectl logs -n dark-tower -l app=meeting-controller --tail=50
+kubectl logs -n dark-tower -l app=mc-service --tail=50
 ```
 
 **Rollback on failure**:
 ```bash
-kubectl rollout undo deployment/meeting-controller -n dark-tower
+kubectl rollout undo deployment/mc-service -n dark-tower
 ```
 
 ---
@@ -916,16 +916,16 @@ kubectl rollout undo deployment/meeting-controller -n dark-tower
 
 ```bash
 # 1. Mark MC as draining in GC
-kubectl exec -it deployment/global-controller -n dark-tower -- \
+kubectl exec -it deployment/gc-service -n dark-tower -- \
   psql $DATABASE_URL -c "UPDATE meeting_controllers SET status = 'draining' WHERE id = '<MC_ID>';"
 
 # 2. Wait for active meetings to complete (monitor metric)
-watch -n 30 'kubectl port-forward -n dark-tower deployment/meeting-controller 8080:8080 2>/dev/null & sleep 1; curl -s http://localhost:8080/metrics | grep mc_meetings_active; kill %1 2>/dev/null'
+watch -n 30 'kubectl port-forward -n dark-tower deployment/mc-service 8080:8080 2>/dev/null & sleep 1; curl -s http://localhost:8080/metrics | grep mc_meetings_active; kill %1 2>/dev/null'
 
 # 3. When meetings are zero, proceed with maintenance
 
 # 4. After maintenance, re-enable
-kubectl exec -it deployment/global-controller -n dark-tower -- \
+kubectl exec -it deployment/gc-service -n dark-tower -- \
   psql $DATABASE_URL -c "UPDATE meeting_controllers SET status = 'active' WHERE id = '<MC_ID>';"
 ```
 

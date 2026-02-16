@@ -7,7 +7,7 @@ Notes on working with other services and specialists in Dark Tower.
 ## Integration: env-tests Cluster Requirements
 **Added**: 2026-01-13
 **Updated**: 2026-02-11
-**Related services**: env-tests, ac-service, global-controller, meeting-controller
+**Related services**: env-tests, ac-service, gc-service, mc-service
 **Coordination with**: Test Specialist, Security Specialist
 
 The env-tests crate requires a running Kubernetes cluster with specific infrastructure. Prerequisites: Kind cluster (./infra/kind/scripts/setup.sh), services deployed in dark-tower namespace, port-forwards established (AC 8082, Prometheus 9090, Grafana 3000, Loki 3100), kubectl configured for target cluster. NetworkPolicy tests require AC NetworkPolicy deployed, ability to create/delete pods in arbitrary namespaces. Feature gates: smoke (cluster health 30s), flows (service flows 2-3min), observability (metrics/logs validation), resilience (NetworkPolicy, pod restart 5min+).
@@ -62,7 +62,7 @@ Infrastructure provides: PostgreSQL 16-alpine StatefulSet with 1 replica, PVC fo
 
 ## Integration: Service Specialists - Manifest Ownership
 **Added**: 2026-02-11
-**Related files**: `infra/services/ac-service/`, `infra/services/global-controller/`, `infra/services/meeting-controller/`
+**Related files**: `infra/services/ac-service/`, `infra/services/gc-service/`, `infra/services/mc-service/`
 **Coordination with**: AC, GC, MC service specialists
 
 Infrastructure owns: K8s manifest structure (Deployment/StatefulSet, Service, ConfigMap, Secret templates, NetworkPolicy, PDB, ServiceMonitor), resource requests/limits, security contexts, probe configurations. Service specialists own: application configuration values (environment variables in ConfigMap), service-specific port numbers, health endpoint paths, replica counts (in coordination with Operations for capacity planning). Changes to manifests require coordination between Infrastructure and respective service specialist.

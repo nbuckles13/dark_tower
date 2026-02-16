@@ -54,7 +54,7 @@ For HTTP service testing, create test harness that: (1) binds to random port (12
 
 ## Pattern: Layered JWT Testing (Defense-in-Depth)
 **Added**: 2026-01-15
-**Related files**: `crates/global-controller/tests/auth_tests.rs`
+**Related files**: `crates/gc-service/tests/auth_tests.rs`
 
 JWT security requires testing 4 independent layers: (1) algorithm (reject alg:none, HS256), (2) JWK structure (reject wrong kty), (3) signature verification (reject tampering), (4) claims validation (reject expired). Test each separately - JWKS compromise could bypass token-level checks. Covers CVE-2016-10555, CVE-2017-11424.
 
@@ -70,7 +70,7 @@ Test rate limiting by looping until lockout triggers. Assert correct status befo
 
 ## Pattern: Concurrent Race Condition Testing with Barrier
 **Added**: 2026-01-21
-**Related files**: `crates/global-controller/tests/meeting_assignment_tests.rs`
+**Related files**: `crates/gc-service/tests/meeting_assignment_tests.rs`
 
 Test atomic operations under concurrent load using `tokio::sync::Barrier`. Barrier synchronizes N tasks before they all attempt same operation simultaneously. Verify: (1) all attempts succeed, (2) all return same result (consistency), (3) database state correct. Essential for atomic CTEs, distributed locks, idempotency.
 
@@ -78,7 +78,7 @@ Test atomic operations under concurrent load using `tokio::sync::Barrier`. Barri
 
 ## Pattern: RPC Retry Testing with Mixed Success/Failure
 **Added**: 2026-01-24
-**Related files**: `crates/global-controller/tests/meeting_assignment_tests.rs`
+**Related files**: `crates/gc-service/tests/meeting_assignment_tests.rs`
 
 Test RPC retry with mixed sequences (some fail, eventual success) - not just all-succeed or all-fail. Catches bugs in retry counter updates and candidate iteration. Also test backoff timing with `tokio::time::pause` for determinism.
 
@@ -86,7 +86,7 @@ Test RPC retry with mixed sequences (some fail, eventual success) - not just all
 
 ## Pattern: Enum State Boundary Value Testing
 **Added**: 2026-01-24
-**Related files**: `crates/global-controller/tests/meeting_assignment_tests.rs`
+**Related files**: `crates/gc-service/tests/meeting_assignment_tests.rs`
 
 Test boundary/transitional enum states explicitly (e.g., Degraded between Healthy/Unhealthy). Code often handles boundaries differently (`if status == Healthy` vs `if status != Unhealthy`). Test: (1) each state in isolation, (2) state transitions, (3) operations in boundary states.
 
@@ -94,7 +94,7 @@ Test boundary/transitional enum states explicitly (e.g., Degraded between Health
 
 ## Pattern: Weighted Selection Edge Case Testing
 **Added**: 2026-01-24
-**Related files**: `crates/global-controller/tests/meeting_assignment_tests.rs`
+**Related files**: `crates/gc-service/tests/meeting_assignment_tests.rs`
 
 For weighted random selection, test: (1) all candidates at max capacity (division by zero?), (2) exact boundary values (off-by-one?), (3) single candidate (degenerate case), (4) zero weight handling, (5) equal weights (uniform random).
 
@@ -102,7 +102,7 @@ For weighted random selection, test: (1) all candidates at max capacity (divisio
 
 ## Pattern: Exhaustive Error Variant Testing
 **Added**: 2026-01-25
-**Related files**: `crates/meeting-controller/src/errors.rs`
+**Related files**: `crates/mc-service/src/errors.rs`
 
 When error enums map to protocol codes, test EVERY variant. Prevents silent regressions from wildcard match arms. Also test Display formatting and client_message() doesn't leak internals. Essential for client-stable protocol codes.
 
@@ -110,7 +110,7 @@ When error enums map to protocol codes, test EVERY variant. Prevents silent regr
 
 ## Pattern: Deterministic Time-Based Tests with tokio::time::pause
 **Added**: 2026-01-25
-**Related files**: `crates/meeting-controller/tests/session_actor_tests.rs`
+**Related files**: `crates/mc-service/tests/session_actor_tests.rs`
 
 Use `#[tokio::test(start_paused = true)]` for timeout/grace period tests. Advance time with `tokio::time::advance()` for instant, deterministic, boundary-precise testing. Works with timeout, sleep, interval.
 
@@ -118,7 +118,7 @@ Use `#[tokio::test(start_paused = true)]` for timeout/grace period tests. Advanc
 
 ## Pattern: HMAC/Cryptographic Validation Exhaustive Testing
 **Added**: 2026-01-25
-**Related files**: `crates/meeting-controller/src/session/binding.rs`
+**Related files**: `crates/mc-service/src/session/binding.rs`
 
 Test each HMAC-bound field independently. If token binds session_id + correlation_id + nonce, test wrong value for EACH field separately. Catches bugs where only some fields are included in signature. Error type should be consistent to avoid leaking which field failed.
 
@@ -126,7 +126,7 @@ Test each HMAC-bound field independently. If token binds session_id + correlatio
 
 ## Pattern: Lua Script Behavioral Testing
 **Added**: 2026-01-25
-**Related files**: `crates/meeting-controller/tests/redis_lua_tests.rs`
+**Related files**: `crates/mc-service/tests/redis_lua_tests.rs`
 
 Test Lua script behavior, not just structure. Don't just verify script runs - verify correct results. For fencing: test current generation (accept), higher (accept+update), lower (reject), no generation (first write, accept). Structural tests miss logic errors.
 
@@ -134,7 +134,7 @@ Test Lua script behavior, not just structure. Don't just verify script runs - ve
 
 ## Pattern: Capacity Check Testing with Atomics
 **Added**: 2026-01-25
-**Related files**: `crates/meeting-controller/tests/capacity_tests.rs`
+**Related files**: `crates/mc-service/tests/capacity_tests.rs`
 
 Test capacity enforcement with: (1) basic under-limit check, (2) concurrent exhaustion (barrier + more requesters than capacity, verify exactly N succeed), (3) draining state (rejects new work regardless of numeric limit). Draining often overlooked.
 
@@ -142,7 +142,7 @@ Test capacity enforcement with: (1) basic under-limit check, (2) concurrent exha
 
 ## Pattern: Actor Lifecycle Testing
 **Added**: 2026-01-25
-**Related files**: `crates/meeting-controller/src/session/actor.rs`
+**Related files**: `crates/mc-service/src/session/actor.rs`
 
 Test actor full lifecycle: (1) spawn (responsive), (2) graceful shutdown (pending work processed, cleanup occurs), (3) cancellation (handles abort), (4) recovery (supervisor restarts after panic). Ensures correct behavior at boundaries, not just normal operation.
 
@@ -150,7 +150,7 @@ Test actor full lifecycle: (1) spawn (responsive), (2) graceful shutdown (pendin
 
 ## Pattern: gRPC Interceptor Edge Case Testing
 **Added**: 2026-01-25
-**Related files**: `crates/meeting-controller/tests/grpc_interceptor_tests.rs`
+**Related files**: `crates/mc-service/tests/grpc_interceptor_tests.rs`
 
 Test gRPC interceptor edge cases: (1) empty Authorization header, (2) malformed Bearer prefix (case, multiple spaces, tabs), (3) valid format but expired/invalid token. Catches: case-sensitive parsing, whitespace handling, format-only validation without content check.
 
@@ -166,7 +166,7 @@ Sanitize error response bodies in test client fixtures using regex to redact JWT
 
 ## Pattern: Type-Level Refactor Verification
 **Added**: 2026-01-28
-**Related files**: `crates/meeting-controller/tests/`, `crates/ac-service/tests/`
+**Related files**: `crates/mc-service/tests/`, `crates/ac-service/tests/`
 
 Type-level refactors (Vec<u8> → SecretBox, Internal → Internal(String)) are compiler-verified. Checklist: (1) cargo check passes, (2) test count preserved, (3) tests use pattern matching not equality, (4) semantic equivalence. Test updates mechanical (wrap/unwrap), not behavioral. Low-risk, focus on compiler + no perf regressions.
 
@@ -190,7 +190,7 @@ env-tests test user-facing HTTP APIs, not internal gRPC. Test what user sees (`J
 
 ## Pattern: MockBehavior Enum for gRPC Test Server State Machines
 **Added**: 2026-01-31
-**Related files**: `crates/meeting-controller/tests/gc_integration.rs`
+**Related files**: `crates/mc-service/tests/gc_integration.rs`
 
 Model gRPC server behavior with enum (Accept, Reject, NotFound, NotFoundThenAccept). Single mock handles multiple scenarios, clearly models state transitions, extensible. Stateful variants use atomics. Enables testing recovery flows without real service. Simpler than separate mocks per scenario or trait-based mocking.
 
@@ -198,7 +198,7 @@ Model gRPC server behavior with enum (Accept, Reject, NotFound, NotFoundThenAcce
 
 ## Pattern: OnceLock for Test Channel Senders
 **Added**: 2026-02-02
-**Related files**: `crates/meeting-controller/tests/gc_integration.rs`
+**Related files**: `crates/mc-service/tests/gc_integration.rs`
 
 Use `OnceLock` for test channels where receiver must outlive sender. Static sender keeps channel alive without mem::forget leaks. Thread-safe, reused across tests, dropped at process exit. Cleaner than mem::forget which creates actual leaks and violates Rust idioms.
 
@@ -214,7 +214,7 @@ Verify infinite retry design with `tokio::time::timeout`. Timeout proves retry w
 
 ## Pattern: Observability Wiring Tests - Implicit Verification
 **Added**: 2026-02-05, **Updated**: 2026-02-10
-**Related files**: `crates/meeting-controller/src/actors/metrics.rs`
+**Related files**: `crates/mc-service/src/actors/metrics.rs`
 
 For simple Prometheus wiring (direct calls, no branching): (1) existing tests verify behavior, (2) wrapper module tests verify emission, (3) wiring exercised indirectly. Don't require explicit "mock Prometheus" tests for simple wiring. For complex logic (conditionals, aggregation), add explicit tests. Verify cardinality bounds in wrapper module, not per-caller.
 
@@ -222,7 +222,7 @@ For simple Prometheus wiring (direct calls, no branching): (1) existing tests ve
 
 ## Pattern: Test Inventory Before DRY Refactor
 **Added**: 2026-02-12
-**Related files**: `crates/global-controller/src/tasks/health_checker.rs`, `crates/global-controller/src/tasks/mh_health_checker.rs`
+**Related files**: `crates/gc-service/src/tasks/health_checker.rs`, `crates/gc-service/src/tasks/mh_health_checker.rs`
 
 Before reviewing a DRY extraction refactor, catalog every test by name and type (unit/integration/sqlx::test) across all affected files. Track: (1) total count, (2) which wrapper function each test calls, (3) what `super::*` brings into scope. After implementation, verify count >= original. Wrapper-preserving refactors (same public signatures) require zero test changes — the safest DRY pattern. Also note asymmetric coverage gaps between parallel implementations (e.g., MH missing "skips already unhealthy" test that MC has) as pre-existing tech debt.
 
@@ -230,7 +230,7 @@ Before reviewing a DRY extraction refactor, catalog every test by name and type 
 
 ## Pattern: Constant Re-Export for Test Module Compatibility
 **Added**: 2026-02-12
-**Related files**: `crates/global-controller/src/tasks/generic_health_checker.rs`
+**Related files**: `crates/gc-service/src/tasks/generic_health_checker.rs`
 
 When extracting shared constants to a new module, wrapper modules should `use` the constant at module scope so test modules accessing `super::CONSTANT` continue to work without changes. Example: `use crate::tasks::generic_health_checker::DEFAULT_CHECK_INTERVAL_SECONDS;` in the wrapper, then tests use `super::DEFAULT_CHECK_INTERVAL_SECONDS` unchanged. Avoids test code churn in pure refactors.
 
@@ -238,7 +238,7 @@ When extracting shared constants to a new module, wrapper modules should `use` t
 
 ## Pattern: .instrument() Chaining Keeps Generic Functions Test-Neutral
 **Added**: 2026-02-12
-**Related files**: `crates/global-controller/src/tasks/health_checker.rs`, `crates/global-controller/src/tasks/mh_health_checker.rs`
+**Related files**: `crates/gc-service/src/tasks/health_checker.rs`, `crates/gc-service/src/tasks/mh_health_checker.rs`
 
 When extracting a generic async function used by multiple callers, prefer callers chaining `.instrument(tracing::info_span!("name"))` on the returned future over `#[instrument]` on the generic function. Test impact: zero — tests don't assert on span names, so moving span creation from generic to caller is invisible to tests. Also enables callers to use different span names (e.g., `gc.task.health_checker` vs `gc.task.mh_health_checker`). Verify by confirming: (1) no test references span names, (2) wrapper signatures unchanged, (3) `Instrument` trait imported in wrappers.
 
@@ -246,7 +246,7 @@ When extracting a generic async function used by multiple callers, prefer caller
 
 ## Pattern: Config Struct Removal is Safe When Tests Use Wrappers
 **Added**: 2026-02-12
-**Related files**: `crates/global-controller/src/tasks/generic_health_checker.rs`
+**Related files**: `crates/gc-service/src/tasks/generic_health_checker.rs`
 
 Removing a config struct from a generic function's API (replacing with plain parameters) has zero test impact when all tests go through wrapper functions that construct the config internally. Checklist: (1) grep tests for config struct type name — if zero hits, safe to remove, (2) verify wrapper signatures unchanged, (3) verify parameter count/types in generic function match what wrappers pass. Two-iteration pattern: first extract with config struct for clarity, then simplify to plain parameters once the API is validated.
 
