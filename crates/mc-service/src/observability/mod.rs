@@ -30,7 +30,8 @@ pub mod metrics;
 // Re-exports for convenience
 pub use health::{health_router, HealthState};
 pub use metrics::{
-    record_actor_panic, record_fenced_out, record_gc_heartbeat, record_gc_heartbeat_latency,
-    record_message_dropped, record_message_latency, record_recovery_duration, record_redis_latency,
-    set_actor_mailbox_depth, set_connections_active, set_meetings_active,
+    init_metrics_recorder, record_actor_panic, record_fenced_out, record_gc_heartbeat,
+    record_gc_heartbeat_latency, record_message_dropped, record_message_latency,
+    record_recovery_duration, record_redis_latency, set_actor_mailbox_depth,
+    set_connections_active, set_meetings_active,
 };

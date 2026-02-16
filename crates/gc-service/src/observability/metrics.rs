@@ -22,7 +22,78 @@
 //! - DB query p99 < 50ms
 
 use metrics::{counter, gauge, histogram};
+use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 use std::time::Duration;
+
+/// Initialize Prometheus metrics recorder and return the handle
+/// for serving metrics via HTTP.
+///
+/// ADR-0011: Must be called before any metrics are recorded.
+/// Configures histogram buckets aligned with SLO targets:
+/// - HTTP request p95 < 200ms
+/// - MC assignment p95 < 20ms
+/// - DB queries p99 < 50ms
+///
+/// # Errors
+///
+/// Returns error if Prometheus recorder fails to install (e.g., already installed).
+pub fn init_metrics_recorder() -> Result<PrometheusHandle, String> {
+    PrometheusBuilder::new()
+        // HTTP request buckets aligned with 200ms p95 SLO target
+        .set_buckets_for_metric(
+            Matcher::Prefix("gc_http_request".to_string()),
+            &[
+                0.005, 0.010, 0.025, 0.050, 0.100, 0.150, 0.200, 0.300, 0.500, 1.000, 2.000,
+            ],
+        )
+        .map_err(|e| format!("Failed to set HTTP request buckets: {e}"))?
+        // MC assignment buckets aligned with 20ms p95 SLO target (ADR-0010)
+        .set_buckets_for_metric(
+            Matcher::Prefix("gc_mc_assignment".to_string()),
+            &[
+                0.005, 0.010, 0.015, 0.020, 0.030, 0.050, 0.100, 0.250, 0.500,
+            ],
+        )
+        .map_err(|e| format!("Failed to set MC assignment buckets: {e}"))?
+        // DB query buckets aligned with 50ms p99 SLO target
+        .set_buckets_for_metric(
+            Matcher::Prefix("gc_db_query".to_string()),
+            &[
+                0.001, 0.002, 0.005, 0.010, 0.020, 0.050, 0.100, 0.250, 0.500, 1.000,
+            ],
+        )
+        .map_err(|e| format!("Failed to set DB query buckets: {e}"))?
+        // gRPC MC call buckets
+        .set_buckets_for_metric(
+            Matcher::Prefix("gc_grpc_mc".to_string()),
+            &[
+                0.005, 0.010, 0.025, 0.050, 0.100, 0.200, 0.500, 1.000, 2.500,
+            ],
+        )
+        .map_err(|e| format!("Failed to set gRPC MC buckets: {e}"))?
+        // MH selection buckets
+        .set_buckets_for_metric(
+            Matcher::Prefix("gc_mh_selection".to_string()),
+            &[0.002, 0.005, 0.010, 0.020, 0.050, 0.100, 0.250],
+        )
+        .map_err(|e| format!("Failed to set MH selection buckets: {e}"))?
+        // AC request buckets - sub-second granularity for p95 latency detection
+        .set_buckets_for_metric(
+            Matcher::Prefix("gc_ac_request".to_string()),
+            &[
+                0.010, 0.025, 0.050, 0.100, 0.200, 0.500, 1.000, 2.000, 5.000,
+            ],
+        )
+        .map_err(|e| format!("Failed to set AC request buckets: {e}"))?
+        // Token refresh buckets
+        .set_buckets_for_metric(
+            Matcher::Prefix("gc_token_refresh".to_string()),
+            &[0.010, 0.050, 0.100, 0.250, 0.500, 1.000, 2.500, 5.000],
+        )
+        .map_err(|e| format!("Failed to set token refresh buckets: {e}"))?
+        .install_recorder()
+        .map_err(|e| format!("Failed to install Prometheus recorder: {e}"))
+}
 
 // ============================================================================
 // HTTP Request Metrics
@@ -173,27 +244,74 @@ pub fn record_db_query(operation: &str, status: &str, duration: Duration) {
 // ============================================================================
 // Token Manager Metrics (ADR-0010 Section 4a)
 // ============================================================================
-//
-// NOTE: Token refresh metrics (record_token_refresh, record_token_refresh_failure)
-// were removed because TokenManager lives in the `common` crate which cannot
-// depend on global-controller. Implementing these metrics requires architectural
-// changes (callback mechanism, feature flag, or metrics trait in common crate).
-//
-// See tech debt TD-GC-001 for tracking.
+
+/// Record token refresh attempt.
+///
+/// Emits three metrics per the metrics catalog (`docs/observability/metrics/gc.md`):
+/// - `gc_token_refresh_total` counter (labels: `status`)
+/// - `gc_token_refresh_duration_seconds` histogram (no labels)
+/// - `gc_token_refresh_failures_total` counter (labels: `error_type`, on failure only)
+///
+/// Called from the `TokenRefreshCallback` wired in `main.rs`.
+///
+/// # Arguments
+///
+/// * `status` - "success" or "error"
+/// * `error_type` - Error category for failures (e.g., "http", "auth_rejected")
+/// * `duration` - Duration of the acquire_token call (excludes backoff)
+pub fn record_token_refresh(status: &str, error_type: Option<&str>, duration: Duration) {
+    histogram!("gc_token_refresh_duration_seconds").record(duration.as_secs_f64());
+
+    counter!("gc_token_refresh_total",
+        "status" => status.to_string()
+    )
+    .increment(1);
+
+    if let Some(err_type) = error_type {
+        counter!("gc_token_refresh_failures_total",
+            "error_type" => err_type.to_string()
+        )
+        .increment(1);
+    }
+}
+
 // ============================================================================
+// AC Client Metrics
+// ============================================================================
+
+/// Record AC client request duration and outcome.
+///
+/// Metric: `gc_ac_request_duration_seconds`, `gc_ac_requests_total`
+/// Labels: `operation`, `status`
+///
+/// Operations: "meeting_token", "guest_token"
+/// Status: "success", "error"
+pub fn record_ac_request(operation: &str, status: &str, duration: Duration) {
+    histogram!("gc_ac_request_duration_seconds",
+        "operation" => operation.to_string()
+    )
+    .record(duration.as_secs_f64());
+
+    counter!("gc_ac_requests_total",
+        "operation" => operation.to_string(),
+        "status" => status.to_string()
+    )
+    .increment(1);
+}
 
 // ============================================================================
 // Error Metrics
 // ============================================================================
 
-/// Record error by category
+/// Record error by category.
 ///
 /// Metric: `gc_errors_total`
 /// Labels: `operation`, `error_type`, `status_code`
 ///
-/// NOTE: Defined per ADR-0011 for error tracking. Will be wired into
-/// error handlers as instrumentation is expanded.
-#[allow(dead_code)]
+/// The `operation` label uses a subsystem prefix to disambiguate across
+/// the global error counter (e.g., `"ac_meeting_token"`, `"ac_guest_token"`,
+/// `"mc_grpc"`). This differs from per-subsystem metrics like
+/// `gc_ac_requests_total` where the operation is already scoped.
 pub fn record_error(operation: &str, error_type: &str, status_code: u16) {
     counter!("gc_errors_total",
         "operation" => operation.to_string(),
@@ -212,9 +330,7 @@ pub fn record_error(operation: &str, error_type: &str, status_code: u16) {
 /// Metric: `gc_grpc_mc_calls_total`, `gc_grpc_mc_call_duration_seconds`
 /// Labels: `method`, `status`
 ///
-/// NOTE: Defined per ADR-0011 for gRPC metrics. Will be wired into
-/// services/mc_client.rs as instrumentation is expanded.
-#[allow(dead_code)]
+/// Status values: "success", "rejected", "error"
 pub fn record_grpc_mc_call(method: &str, status: &str, duration: Duration) {
     histogram!("gc_grpc_mc_call_duration_seconds",
         "method" => method.to_string()
@@ -464,8 +580,32 @@ mod tests {
         record_db_query("update_heartbeat", "error", Duration::from_millis(50));
     }
 
-    // Note: Token refresh metrics tests removed - functions moved out of scope
-    // (TokenManager is in common crate, requires architectural changes)
+    #[test]
+    fn test_record_token_refresh() {
+        // Success path
+        record_token_refresh("success", None, Duration::from_millis(50));
+
+        // Error paths with different error types
+        record_token_refresh("error", Some("http"), Duration::from_millis(100));
+        record_token_refresh("error", Some("auth_rejected"), Duration::from_millis(200));
+        record_token_refresh("error", Some("invalid_response"), Duration::from_millis(30));
+        record_token_refresh(
+            "error",
+            Some("acquisition_failed"),
+            Duration::from_millis(10),
+        );
+    }
+
+    #[test]
+    fn test_record_ac_request() {
+        // Success paths for both operations
+        record_ac_request("meeting_token", "success", Duration::from_millis(100));
+        record_ac_request("guest_token", "success", Duration::from_millis(80));
+
+        // Error paths
+        record_ac_request("meeting_token", "error", Duration::from_millis(200));
+        record_ac_request("guest_token", "error", Duration::from_millis(150));
+    }
 
     #[test]
     fn test_record_error() {

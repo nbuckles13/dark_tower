@@ -15,7 +15,57 @@
 //! - `table`: bounded by schema (~5 tables)
 
 use metrics::{counter, gauge, histogram};
+use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 use std::time::Duration;
+
+/// Initialize Prometheus metrics recorder and return the handle
+/// for serving metrics via HTTP.
+///
+/// ADR-0011: Must be called before any metrics are recorded.
+/// Configures histogram buckets aligned with SLO targets:
+/// - Token issuance p99 < 350ms
+/// - DB queries p99 < 50ms
+///
+/// # Errors
+///
+/// Returns error if Prometheus recorder fails to install (e.g., already installed).
+pub fn init_metrics_recorder() -> Result<PrometheusHandle, String> {
+    PrometheusBuilder::new()
+        // Token issuance buckets aligned with 350ms SLO target
+        .set_buckets_for_metric(
+            Matcher::Prefix("ac_token_issuance".to_string()),
+            &[
+                0.010, 0.025, 0.050, 0.100, 0.150, 0.200, 0.250, 0.300, 0.350, 0.500, 1.000, 2.000,
+            ],
+        )
+        .map_err(|e| format!("Failed to set token issuance buckets: {}", e))?
+        // DB query buckets aligned with 50ms SLO target
+        .set_buckets_for_metric(
+            Matcher::Prefix("ac_db_query".to_string()),
+            &[
+                0.001, 0.002, 0.005, 0.010, 0.020, 0.050, 0.100, 0.250, 0.500, 1.000,
+            ],
+        )
+        .map_err(|e| format!("Failed to set DB query buckets: {}", e))?
+        // Bcrypt buckets - coarse (50ms minimum) to prevent timing side-channel attacks
+        .set_buckets_for_metric(
+            Matcher::Prefix("ac_bcrypt".to_string()),
+            &[
+                0.050, 0.100, 0.150, 0.200, 0.250, 0.300, 0.400, 0.500, 1.000,
+            ],
+        )
+        .map_err(|e| format!("Failed to set bcrypt buckets: {}", e))?
+        // HTTP request buckets aligned with 200ms p95 SLO target
+        .set_buckets_for_metric(
+            Matcher::Prefix("ac_http_request".to_string()),
+            &[
+                0.005, 0.010, 0.025, 0.050, 0.100, 0.250, 0.500, 1.000, 2.500, 5.000, 10.000,
+            ],
+        )
+        .map_err(|e| format!("Failed to set HTTP request buckets: {}", e))?
+        .install_recorder()
+        .map_err(|e| format!("Failed to install Prometheus recorder: {}", e))
+}
 
 // ============================================================================
 // Token Metrics

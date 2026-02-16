@@ -11,7 +11,8 @@ use chrono::Utc;
 use common::secret::SecretString;
 use common::token_manager::TokenReceiver;
 use gc_service::config::Config;
-use gc_service::routes::{self, init_metrics_recorder, AppState};
+use gc_service::observability::metrics::init_metrics_recorder;
+use gc_service::routes::{self, AppState};
 use gc_service::services::MockMcClient;
 use std::sync::OnceLock;
 

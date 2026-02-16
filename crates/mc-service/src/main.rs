@@ -51,7 +51,6 @@ use mc_service::grpc::{GcClient, McAssignmentService};
 use mc_service::observability::{health_router, HealthState};
 use mc_service::redis::FencedRedisClient;
 use mc_service::system_info::gather_system_info;
-use metrics_exporter_prometheus::PrometheusBuilder;
 use proto_gen::internal::meeting_controller_service_server::MeetingControllerServiceServer;
 use proto_gen::internal::HealthStatus;
 use tokio::signal;
@@ -100,10 +99,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize Prometheus metrics recorder (ADR-0011)
     // This must happen before any metrics are recorded
     info!("Initializing Prometheus metrics recorder...");
-    let prometheus_handle = PrometheusBuilder::new().install_recorder().map_err(|e| {
-        error!(error = %e, "Failed to install Prometheus metrics recorder");
-        format!("Failed to install Prometheus metrics recorder: {e}")
-    })?;
+    let prometheus_handle =
+        mc_service::observability::metrics::init_metrics_recorder().map_err(|e| {
+            error!(error = %e, "Failed to install Prometheus metrics recorder");
+            e
+        })?;
     info!("Prometheus metrics recorder initialized");
 
     // Initialize health state
