@@ -8,8 +8,9 @@
 
 FROM docker.io/library/rust:1.91-slim-bookworm
 
-# System packages required for building (ring, bcrypt, protobuf), guards (jq, bc),
-# and database tools (postgresql-client for pg_isready used by entrypoint + test.sh)
+# System packages required for building (ring, bcrypt, protobuf), guards (jq, bc,
+# python3-yaml for validate-infrastructure-metrics), and database tools
+# (postgresql-client for pg_isready used by entrypoint + test.sh)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     pkg-config \
@@ -20,6 +21,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     jq \
     bc \
     postgresql-client \
+    python3-yaml \
     && rm -rf /var/lib/apt/lists/*
 
 # Nightly toolchain (required by guards/strip-test-code.sh)
