@@ -1,6 +1,6 @@
 # Known Shared Patterns in Common Crate
 
-Last updated: 2026-02-12
+Last updated: 2026-02-15
 
 ## Currently in `crates/common/`
 
@@ -15,6 +15,7 @@ Last updated: 2026-02-12
 | `ServiceClaims` struct | `common::jwt` | AC, GC |
 | EdDSA key decoding (`decode_ed25519_public_key_pem/jwk`) | `common::jwt` | AC, GC |
 | `TokenManager` (OAuth 2.0 client) | `common::token_manager` | GC, MC |
+| `TokenRefreshCallback` + `TokenRefreshEvent` | `common::token_manager` | GC (MC can adopt) |
 
 ## Outstanding Tech Debt (Candidates for Extraction)
 

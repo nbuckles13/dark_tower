@@ -171,18 +171,19 @@ let raw_bytes = master_secret.expose_secret(); // Don't store this!
 ---
 
 ## Gotcha: Cross-Crate Metrics Dependencies Create Observability Gaps
-**Added**: 2026-02-09
+**Added**: 2026-02-09 (Updated: 2026-02-15)
 **Related files**: `crates/gc-service/src/observability/metrics.rs`, `crates/common/src/token_manager.rs`
 
 Shared crates (e.g., `common`) cannot depend on service-specific observability modules (e.g., `global-controller/observability`). This creates gaps where security-relevant operations in shared code lack metrics.
 
-**Example**: `TokenManager` in `common` crate handles OAuth token refresh. GC's `metrics.rs` defined `record_token_refresh()` but couldn't wire it because `common` can't import `global-controller`.
+**Resolved for TokenManager**: The callback mechanism was implemented (TD-GC-001 closed). `TokenManagerConfig::with_on_refresh()` accepts an `Arc<dyn Fn(TokenRefreshEvent) + Send + Sync>`. GC injects a closure in `main.rs` that calls `metrics::record_token_refresh()`.
 
-**Solutions** (choose based on complexity):
-1. **Callback mechanism**: Pass a metrics callback to shared code
+**Critical security boundary**: The `error_category()` function in `token_manager.rs` maps `TokenError` variants to `&'static str` constants. This is the security boundary between raw error messages (which could contain URLs, status codes, or response body fragments) and bounded Prometheus labels. When reviewing future changes to `TokenError`, verify that `error_category()` is updated to match and still returns only `&'static str`.
+
+**For other shared crates**: The same pattern applies. Solutions by complexity:
+1. **Callback mechanism**: Pass a metrics callback to shared code (proven pattern)
 2. **Metrics trait**: Define trait in `common`, implement in service
 3. **Feature flag**: Service-specific metrics behind compile-time feature
-4. **Accept gap**: Document as tech debt (TD-GC-001 pattern)
 
 **Security implication**: Missing metrics means no alerting on token refresh failures, which could indicate credential compromise or AC unavailability. When reviewing shared crate changes, explicitly ask: "What security-relevant operations lack observability?"
 

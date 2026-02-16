@@ -56,7 +56,6 @@ pub enum GcError {
 
 impl GcError {
     /// Returns the HTTP status code for this error (for metrics recording).
-    #[allow(dead_code)] // Will be used for metrics in Phase 2+
     pub fn status_code(&self) -> u16 {
         match self {
             GcError::Database(_) | GcError::Internal(_) => 500,
@@ -67,6 +66,23 @@ impl GcError {
             GcError::Forbidden(_) => 403,
             GcError::BadRequest(_) => 400,
             GcError::ServiceUnavailable(_) => 503,
+        }
+    }
+
+    /// Returns a bounded label string for the error variant (for metrics).
+    ///
+    /// Uses enum variant names, not error message content.
+    pub fn error_type_label(&self) -> &'static str {
+        match self {
+            GcError::Database(_) => "database",
+            GcError::InvalidToken(_) => "invalid_token",
+            GcError::NotFound(_) => "not_found",
+            GcError::Conflict(_) => "conflict",
+            GcError::RateLimitExceeded => "rate_limit",
+            GcError::Forbidden(_) => "forbidden",
+            GcError::BadRequest(_) => "bad_request",
+            GcError::ServiceUnavailable(_) => "service_unavailable",
+            GcError::Internal(_) => "internal",
         }
     }
 }
@@ -238,6 +254,34 @@ mod tests {
             503
         );
         assert_eq!(GcError::Internal("test".to_string()).status_code(), 500);
+    }
+
+    #[test]
+    fn test_error_type_labels() {
+        assert_eq!(GcError::Database("t".into()).error_type_label(), "database");
+        assert_eq!(
+            GcError::InvalidToken("t".into()).error_type_label(),
+            "invalid_token"
+        );
+        assert_eq!(
+            GcError::NotFound("t".into()).error_type_label(),
+            "not_found"
+        );
+        assert_eq!(GcError::Conflict("t".into()).error_type_label(), "conflict");
+        assert_eq!(GcError::RateLimitExceeded.error_type_label(), "rate_limit");
+        assert_eq!(
+            GcError::Forbidden("t".into()).error_type_label(),
+            "forbidden"
+        );
+        assert_eq!(
+            GcError::BadRequest("t".into()).error_type_label(),
+            "bad_request"
+        );
+        assert_eq!(
+            GcError::ServiceUnavailable("t".into()).error_type_label(),
+            "service_unavailable"
+        );
+        assert_eq!(GcError::Internal("t".into()).error_type_label(), "internal");
     }
 
     #[tokio::test]

@@ -387,10 +387,11 @@ Single-command workflow with autonomous teammates (no container isolation):
 - **Git state tracking**: Start commit recorded for rollback (see ADR-0024)
 - **Recovery**: Restart from beginning if interrupted; main.md records start commit for rollback
 
-**Code review blocking behavior** (severities: BLOCKER > MAJOR > MINOR; unresolved → TECH_DEBT):
-- Security, Observability, Infrastructure: MINOR+ blocks (all findings); non-fixed → TECH_DEBT
-- Test, Code Quality, Operations: MAJOR+ blocks; MINOR → TECH_DEBT
-- DRY Reviewer: BLOCKER only; MAJOR/MINOR → TECH_DEBT (per ADR-0019)
+**Code review model** (fix-or-defer, no severity levels):
+- All findings default to "fix it" — implementer fixes or defers with justification
+- Valid deferrals: requires files outside PR scope, requires design decision, regression risk, cross-service coordination
+- Reviewers accept deferrals or escalate to Lead; accepted deferrals become tech debt
+- DRY exception (ADR-0019): true duplication → fix-or-defer flow; extraction opportunities → tech debt directly
 
 **Key Files**:
 - `.claude/skills/devloop/SKILL.md` - Agent Teams workflow

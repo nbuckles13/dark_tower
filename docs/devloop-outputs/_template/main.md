@@ -165,44 +165,57 @@ TBD
 ## Code Review Results
 
 ### Security Specialist
-**Verdict**: APPROVED / FINDINGS
+**Verdict**: CLEAR / RESOLVED / ESCALATED
+**Findings**: {count} found, {count} fixed, {count} deferred
 
-{Key findings or "No issues found"}
+{Key findings and resolutions, or "No findings"}
 
 ### Test Specialist
-**Verdict**: APPROVED / FINDINGS
+**Verdict**: CLEAR / RESOLVED / ESCALATED
+**Findings**: {count} found, {count} fixed, {count} deferred
 
-{Key findings or "No issues found"}
+{Key findings and resolutions, or "No findings"}
 
 ### Observability Specialist
-**Verdict**: APPROVED / FINDINGS
+**Verdict**: CLEAR / RESOLVED / ESCALATED
+**Findings**: {count} found, {count} fixed, {count} deferred
 
-{Key findings or "No issues found"}
+{Key findings and resolutions, or "No findings"}
 
 ### Code Quality Reviewer
-**Verdict**: APPROVED / FINDINGS
+**Verdict**: CLEAR / RESOLVED / ESCALATED
+**Findings**: {count} found, {count} fixed, {count} deferred
 
-{Key findings or "No issues found"}
+{Key findings and resolutions, or "No findings"}
 
 ### DRY Reviewer
-**Verdict**: APPROVED / FINDINGS
+**Verdict**: CLEAR / RESOLVED / ESCALATED
 
-**Blocking findings** (BLOCKING - code exists in common but wasn't used):
-{List any BLOCKINGs that must be fixed, or "None"}
+**True duplication findings** (entered fix-or-defer flow):
+{List findings sent to implementer, or "None"}
 
-**Tech debt findings** (TECH_DEBT - opportunities for extraction):
-{List findings documented below, or "None"}
+**Extraction opportunities** (tech debt observations):
+{List opportunities documented below, or "None"}
 
 ### Operations Reviewer
-**Verdict**: APPROVED / FINDINGS
+**Verdict**: CLEAR / RESOLVED / ESCALATED
+**Findings**: {count} found, {count} fixed, {count} deferred
 
-{Key findings or "No issues found"}
+{Key findings and resolutions, or "No findings"}
 
 ---
 
 ## Tech Debt
 
-<!-- Document all TECH_DEBT findings here. These are non-blocking and tracked for follow-up. -->
+<!-- Document all accepted deferrals and DRY extraction opportunities here. -->
+
+### Deferred Findings
+
+| Finding | Reviewer | Location | Deferral Justification | Follow-up Task |
+|---------|----------|----------|------------------------|----------------|
+| {description} | {reviewer} | `file.rs:line` | {implementer's justification for deferral} | {task ref} |
+
+{Or "No deferred findings" if all findings were fixed}
 
 ### Cross-Service Duplication (from DRY Reviewer)
 

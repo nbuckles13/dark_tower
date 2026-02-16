@@ -66,6 +66,13 @@ When reviewing internal metrics, coordinate on: (1) module-level docs clarifying
 
 ---
 
+## Integration: Cross-Crate Callback for Metrics (TokenManager Pattern)
+**Added**: 2026-02-15
+
+When `common` crate components (e.g., `TokenManager`) need service-specific metrics but cannot depend on the service crate, use the callback injection pattern: `Arc<dyn Fn(Event) + Send + Sync>` stored as an `Option` field with a builder method. The callback event struct should use `&'static str` for label fields (not `String`) to enforce cardinality bounds at the type level. The service wires the callback in `main.rs` to bridge into its own metrics module. Coordinate with Observability reviewer on metric naming and with Security reviewer that no secrets leak through the event struct.
+
+---
+
 ## Integration: Validation Guards vs Plan Agreements
 **Added**: 2026-02-12
 **Updated**: 2026-02-12

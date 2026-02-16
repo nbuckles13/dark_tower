@@ -251,3 +251,11 @@ When extracting a generic async function used by multiple callers, prefer caller
 Removing a config struct from a generic function's API (replacing with plain parameters) has zero test impact when all tests go through wrapper functions that construct the config internally. Checklist: (1) grep tests for config struct type name — if zero hits, safe to remove, (2) verify wrapper signatures unchanged, (3) verify parameter count/types in generic function match what wrappers pass. Two-iteration pattern: first extract with config struct for clarity, then simplify to plain parameters once the API is validated.
 
 ---
+
+## Pattern: Optional Callback for Cross-Crate Observability Testing
+**Added**: 2026-02-15
+**Related files**: `crates/common/src/token_manager.rs`, `crates/global-controller/src/main.rs`
+
+When a shared crate (e.g., `common`) can't depend on a service's metrics library, use `Option<Arc<dyn Fn(Event) + Send + Sync>>` callback defaulting to `None`. Test implications: (1) all existing tests pass unchanged (None = no callback invoked), (2) test callback invocation with `Arc<Mutex<Vec<Event>>>` to collect events, then assert on the vec contents after the operation completes, (3) test both success and failure events in the callback, (4) test error category mapping as a separate unit test (no async needed). Future services using `TokenManager` (meeting-controller, media-handler) will wire their own callbacks the same way — test pattern is reusable.
+
+---

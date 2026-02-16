@@ -40,15 +40,17 @@ For design decisions needing consensus first, use `/debate` to create an ADR, th
 
 Every devloop spawns **7 teammates** (Lead + Implementer + 6 reviewers):
 
-| Role | Specialist | Purpose | Blocking |
-|------|------------|---------|----------|
-| Implementer | Specified or auto-detected | Does the work | N/A |
-| Security Reviewer | security | Vulnerabilities, crypto, auth | MINOR+ blocks; rest TECH_DEBT |
-| Test Reviewer | test | Coverage, test quality, regression | MAJOR+ blocks; rest TECH_DEBT |
-| Observability Reviewer | observability | Metrics, logging, tracing, PII, SLOs | MINOR+ blocks; rest TECH_DEBT |
-| Code Quality Reviewer | code-reviewer | Rust idioms, ADR compliance | MAJOR+ blocks; rest TECH_DEBT |
-| DRY Reviewer | dry-reviewer | Cross-service duplication | BLOCKER only; rest TECH_DEBT (per ADR-0019) |
-| Operations Reviewer | operations | Deployment safety, rollback, runbooks | MAJOR+ blocks; rest TECH_DEBT |
+| Role | Specialist | Purpose |
+|------|------------|---------|
+| Implementer | Specified or auto-detected | Does the work |
+| Security Reviewer | security | Vulnerabilities, crypto, auth |
+| Test Reviewer | test | Coverage, test quality, regression |
+| Observability Reviewer | observability | Metrics, logging, tracing, PII, SLOs |
+| Code Quality Reviewer | code-reviewer | Rust idioms, ADR compliance |
+| DRY Reviewer | dry-reviewer | Cross-service duplication (see DRY exception in review protocol) |
+| Operations Reviewer | operations | Deployment safety, rollback, runbooks |
+
+**Review model**: All findings default to "fix it." Implementer may defer with justification. See review protocol for details.
 
 **Conditional domain reviewer**: When the task touches database patterns (`migration|schema|sql`) but the implementer is NOT the Database specialist, add Database as a conditional 8th reviewer. Same for Protocol when API contracts are affected by a non-Protocol implementer.
 
@@ -111,12 +113,13 @@ Lead (minimal involvement)
 │   └── Run validation pipeline (see below)
 │
 ├── REVIEW (Reviewers + Implementer collaborate)
-│   ├── Reviewers examine code (scoped via git diff)
-│   ├── Discuss findings with implementer
-│   └── Send verdicts to Lead
+│   ├── Reviewers examine code, send findings to implementer
+│   ├── Implementer fixes findings or defers with justification
+│   ├── Reviewers accept deferrals or escalate to Lead
+│   └── Send verdicts to Lead (CLEAR / RESOLVED / ESCALATED)
 │
 ├── GATE 3: FINAL APPROVAL (Lead)
-│   └── Check all verdicts APPROVED
+│   └── Check all verdicts CLEAR or RESOLVED; resolve any ESCALATED
 │
 ├── REFLECTION (All teammates) [SKIPPED in --light]
 │   └── Each captures learnings in knowledge files
@@ -213,7 +216,7 @@ You are implementing a feature for Dark Tower.
 2. **WAIT for @team-lead to send you "Plan approved" before implementing.** Individual reviewer confirmations are not sufficient — @team-lead is the gatekeeper.
 3. IMPLEMENTATION: Do the work, use SendMessage to ask reviewers if questions arise
 4. When done, use SendMessage to tell @team-lead: "Ready for validation"
-5. REVIEW: Respond to reviewer feedback, fix issues
+5. REVIEW: Respond to reviewer findings — fix each one or defer with justification (see review protocol for valid/invalid justifications)
 6. REFLECTION: Document learnings when complete
 
 ## Communication
@@ -244,9 +247,10 @@ You are a reviewer in a Dark Tower devloop.
 1. PLANNING: Review implementer's approach, provide input
 2. When satisfied with plan, use SendMessage to tell @team-lead: "Plan confirmed"
 3. **WAIT for @team-lead to send you "Start Review" before examining code.** Do NOT review code during planning or implementation phases.
-4. REVIEW: Examine the code, use SendMessage to discuss findings with @implementer
-5. Use SendMessage to tell @team-lead your verdict: "APPROVED" or "BLOCKED: {reason}"
-6. REFLECTION: Document learnings when complete
+4. REVIEW: Examine the code, send findings to @implementer. Each finding defaults to "fix it."
+5. TRIAGE: If implementer defers a finding with justification, accept or escalate per review protocol.
+6. Use SendMessage to tell @team-lead your verdict: "CLEAR", "RESOLVED", or "ESCALATED: {reason}"
+7. REFLECTION: Document learnings when complete
 
 ## Communication
 
@@ -254,7 +258,7 @@ All teammate communication MUST use the SendMessage tool. Plain text output is n
 
 - Use SendMessage to message @implementer directly with feedback
 - Use SendMessage to message other reviewers if you spot issues in their domain
-- Use SendMessage to tell @team-lead for confirmations and verdicts
+- Use SendMessage to tell @team-lead for confirmations and verdicts (CLEAR / RESOLVED / ESCALATED)
 - **Do NOT start reviewing code until @team-lead sends you "Start Review"**
 ```
 
@@ -380,24 +384,24 @@ Wait for all reviewer verdicts.
 
 Track verdicts in main.md:
 ```
-| Reviewer | Verdict | Notes |
-|----------|---------|-------|
-| Security | APPROVED / BLOCKED | {reason if blocked} |
-| Test | APPROVED / BLOCKED | |
-| Observability | APPROVED / BLOCKED | |
-| Code Quality | APPROVED / BLOCKED | |
-| DRY | APPROVED / BLOCKED | |
-| Operations | APPROVED / BLOCKED | |
+| Reviewer | Verdict | Findings | Fixed | Deferred | Notes |
+|----------|---------|----------|-------|----------|-------|
+| Security | CLEAR / RESOLVED / ESCALATED | {count} | {count} | {count} | |
+| Test | CLEAR / RESOLVED / ESCALATED | | | | |
+| Observability | CLEAR / RESOLVED / ESCALATED | | | | |
+| Code Quality | CLEAR / RESOLVED / ESCALATED | | | | |
+| DRY | CLEAR / RESOLVED / ESCALATED | | | | |
+| Operations | CLEAR / RESOLVED / ESCALATED | | | | |
 ```
 
-**If any BLOCKED**:
-- Route blockers to implementer
-- Return to implementation phase
-- Max 3 review→implementation iterations
+**If any ESCALATED**:
+- Lead reviews the specific finding and the implementer's deferral justification
+- Lead decides: fix it (route back to implementer) or accept the deferral (override)
+- If routed back: return to implementation phase, max 3 review→implementation iterations
 
-**If all APPROVED**:
+**If all CLEAR or RESOLVED**:
 - Update main.md: Phase = reflection (full) or complete (light)
-- Document any non-blocking findings as TECH_DEBT in main.md (findings below reviewer's blocking threshold that were not fixed)
+- Document accepted deferrals as tech debt in main.md (with implementer's justification)
 - Full mode: Message team: "All approved. Please capture reflections."
 - Light mode: Skip to Step 9.
 
@@ -432,7 +436,7 @@ Update main.md:
 - Phase = complete
 - Duration
 - Final summary
-- Tech debt section (all non-blocking findings from all reviewers that were not fixed)
+- Tech debt section (all accepted deferrals with justifications, plus DRY extraction opportunities)
 
 Write `.devloop-pr.json` to the worktree root with PR metadata for the host wrapper script:
 ```json
@@ -453,12 +457,12 @@ Duration: {time}
 Iterations: {count}
 
 Results:
-- Security: APPROVED
-- Test: APPROVED
-- Observability: APPROVED
-- Code Quality: APPROVED
-- DRY: APPROVED ({N} tech debt items documented)
-- Operations: APPROVED
+- Security: CLEAR/RESOLVED ({N} findings, {M} fixed, {K} deferred)
+- Test: CLEAR/RESOLVED
+- Observability: CLEAR/RESOLVED
+- Code Quality: CLEAR/RESOLVED
+- DRY: CLEAR/RESOLVED ({N} tech debt observations)
+- Operations: CLEAR/RESOLVED
 
 Files changed:
 {summary}
@@ -529,7 +533,7 @@ Address the feedback above. The previous implementation is already in the codeba
 2. **WAIT for @team-lead to send you "Plan approved" before implementing.** Individual reviewer confirmations are not sufficient — @team-lead is the gatekeeper.
 3. IMPLEMENTATION: Do the work, use SendMessage to ask reviewers if questions arise
 4. When done, use SendMessage to tell @team-lead: "Ready for validation"
-5. REVIEW: Respond to reviewer feedback, fix issues
+5. REVIEW: Respond to reviewer findings — fix each one or defer with justification (see review protocol for valid/invalid justifications)
 6. REFLECTION: Document learnings when complete
 
 ## Communication
