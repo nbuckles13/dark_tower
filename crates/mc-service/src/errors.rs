@@ -140,6 +140,45 @@ impl McError {
         }
     }
 
+    /// Returns the signaling error code as a u16 (for metrics recording).
+    ///
+    /// Maps signaling `ErrorCode` values to u16 for the `status_code` label
+    /// in `mc_errors_total`. MC uses signaling codes (not HTTP status codes)
+    /// since it communicates via WebTransport, not HTTP.
+    #[allow(dead_code)] // Used in Phase 6b+
+    #[allow(clippy::cast_sign_loss)] // error_code() returns well-known positive values 2-7
+    pub fn status_code(&self) -> u16 {
+        self.error_code() as u16
+    }
+
+    /// Returns a bounded label string for the error variant (for metrics).
+    ///
+    /// Uses enum variant names, not error message content.
+    /// Ensures label cardinality is bounded (ADR-0011).
+    #[allow(dead_code)] // Used in Phase 6b+
+    pub fn error_type_label(&self) -> &'static str {
+        match self {
+            McError::Redis(_) => "redis",
+            McError::Grpc(_) => "grpc",
+            McError::NotRegistered => "not_registered",
+            McError::Config(_) => "config",
+            McError::SessionBinding(_) => "session_binding",
+            McError::MeetingNotFound(_) => "meeting_not_found",
+            McError::ParticipantNotFound(_) => "participant_not_found",
+            McError::MeetingCapacityExceeded(_) => "meeting_capacity_exceeded",
+            McError::McCapacityExceeded => "mc_capacity_exceeded",
+            McError::Draining => "draining",
+            McError::Migrating { .. } => "migrating",
+            McError::FencedOut(_) => "fenced_out",
+            McError::Conflict(_) => "conflict",
+            McError::JwtValidation(_) => "jwt_validation",
+            McError::PermissionDenied(_) => "permission_denied",
+            McError::Internal(_) => "internal",
+            McError::TokenAcquisition(_) => "token_acquisition",
+            McError::TokenAcquisitionTimeout => "token_acquisition_timeout",
+        }
+    }
+
     /// Returns a client-safe error message (no internal details).
     #[allow(dead_code)] // Used in Phase 6b+
     pub fn client_message(&self) -> String {
@@ -279,6 +318,137 @@ mod tests {
 
         assert!(matches!(mc_err, McError::SessionBinding(_)));
         assert_eq!(mc_err.error_code(), 2);
+    }
+
+    #[test]
+    fn test_status_code_mapping() {
+        // status_code() returns signaling error codes as u16 (not HTTP codes)
+        // MC uses WebTransport, not HTTP (see status_code() doc comment)
+
+        // Internal errors -> 6
+        assert_eq!(McError::Redis("test".to_string()).status_code(), 6);
+        assert_eq!(McError::Grpc("test".to_string()).status_code(), 6);
+        assert_eq!(McError::Config("test".to_string()).status_code(), 6);
+        assert_eq!(McError::Internal("test".to_string()).status_code(), 6);
+        assert_eq!(McError::FencedOut("test".to_string()).status_code(), 6);
+        assert_eq!(McError::NotRegistered.status_code(), 6);
+        assert_eq!(
+            McError::TokenAcquisition("test".to_string()).status_code(),
+            6
+        );
+        assert_eq!(McError::TokenAcquisitionTimeout.status_code(), 6);
+
+        // Auth errors -> 2
+        assert_eq!(
+            McError::SessionBinding(SessionBindingError::TokenExpired).status_code(),
+            2
+        );
+        assert_eq!(McError::JwtValidation("test".to_string()).status_code(), 2);
+
+        // Forbidden -> 3
+        assert_eq!(
+            McError::PermissionDenied("test".to_string()).status_code(),
+            3
+        );
+
+        // Not found -> 4
+        assert_eq!(
+            McError::MeetingNotFound("test".to_string()).status_code(),
+            4
+        );
+        assert_eq!(
+            McError::ParticipantNotFound("test".to_string()).status_code(),
+            4
+        );
+
+        // Conflict -> 5
+        assert_eq!(McError::Conflict("test".to_string()).status_code(), 5);
+
+        // Capacity exceeded -> 7
+        assert_eq!(
+            McError::MeetingCapacityExceeded("test".to_string()).status_code(),
+            7
+        );
+        assert_eq!(McError::McCapacityExceeded.status_code(), 7);
+        assert_eq!(McError::Draining.status_code(), 7);
+        assert_eq!(
+            McError::Migrating {
+                new_mc_endpoint: "mc2:4433".to_string()
+            }
+            .status_code(),
+            7
+        );
+    }
+
+    #[test]
+    fn test_error_type_label_exhaustive() {
+        // Verify all 18 McError variants map to bounded &'static str labels
+        assert_eq!(
+            McError::Redis("test".to_string()).error_type_label(),
+            "redis"
+        );
+        assert_eq!(McError::Grpc("test".to_string()).error_type_label(), "grpc");
+        assert_eq!(McError::NotRegistered.error_type_label(), "not_registered");
+        assert_eq!(
+            McError::Config("test".to_string()).error_type_label(),
+            "config"
+        );
+        assert_eq!(
+            McError::SessionBinding(SessionBindingError::TokenExpired).error_type_label(),
+            "session_binding"
+        );
+        assert_eq!(
+            McError::MeetingNotFound("test".to_string()).error_type_label(),
+            "meeting_not_found"
+        );
+        assert_eq!(
+            McError::ParticipantNotFound("test".to_string()).error_type_label(),
+            "participant_not_found"
+        );
+        assert_eq!(
+            McError::MeetingCapacityExceeded("test".to_string()).error_type_label(),
+            "meeting_capacity_exceeded"
+        );
+        assert_eq!(
+            McError::McCapacityExceeded.error_type_label(),
+            "mc_capacity_exceeded"
+        );
+        assert_eq!(McError::Draining.error_type_label(), "draining");
+        assert_eq!(
+            McError::Migrating {
+                new_mc_endpoint: "mc2:4433".to_string()
+            }
+            .error_type_label(),
+            "migrating"
+        );
+        assert_eq!(
+            McError::FencedOut("test".to_string()).error_type_label(),
+            "fenced_out"
+        );
+        assert_eq!(
+            McError::Conflict("test".to_string()).error_type_label(),
+            "conflict"
+        );
+        assert_eq!(
+            McError::JwtValidation("test".to_string()).error_type_label(),
+            "jwt_validation"
+        );
+        assert_eq!(
+            McError::PermissionDenied("test".to_string()).error_type_label(),
+            "permission_denied"
+        );
+        assert_eq!(
+            McError::Internal("test".to_string()).error_type_label(),
+            "internal"
+        );
+        assert_eq!(
+            McError::TokenAcquisition("test".to_string()).error_type_label(),
+            "token_acquisition"
+        );
+        assert_eq!(
+            McError::TokenAcquisitionTimeout.error_type_label(),
+            "token_acquisition_timeout"
+        );
     }
 
     #[test]

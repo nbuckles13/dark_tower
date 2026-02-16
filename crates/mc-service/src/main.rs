@@ -136,7 +136,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .map_err(|e| {
         error!(error = %e, "Failed to create TokenManager config");
         McError::TokenAcquisition(format!("TokenManager config error: {e}"))
-    })?;
+    })?
+    .with_on_refresh(Arc::new(|event| {
+        let status = if event.success { "success" } else { "error" };
+        let error_type = event.error_category;
+        mc_service::observability::metrics::record_token_refresh(
+            status,
+            error_type,
+            event.duration,
+        );
+    }));
 
     let (token_task_handle, token_rx) =
         tokio::time::timeout(TOKEN_ACQUISITION_TIMEOUT, spawn_token_manager(token_config))

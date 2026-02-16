@@ -73,6 +73,13 @@ When `common` crate components (e.g., `TokenManager`) need service-specific metr
 
 ---
 
+## Integration: Replicating Metrics Patterns Across Services (GC -> MC)
+**Added**: 2026-02-16
+
+When a metrics pattern is established in one service (e.g., GC's `record_token_refresh()`, `error_type_label()`, `record_error()`, `.with_on_refresh()` wiring), replicating it to another service (MC) should match the pattern exactly in structure but adapt semantics to the service's protocol. Key review checklist: (1) function signatures match (`record_token_refresh(status, error_type, duration)`), (2) metric name prefix changes (`gc_` -> `mc_`), (3) histogram buckets match when SLOs are shared (token refresh uses identical buckets), (4) `error_type_label()` return type is `&'static str` with exhaustive match, (5) dashboard PromQL uses correct prefix, (6) SLO thresholds are consistent. The `status_code()` method signature is kept identical but returns protocol-specific values (HTTP for GC, signaling for MC) -- verify dashboard interpretation.
+
+---
+
 ## Integration: Validation Guards vs Plan Agreements
 **Added**: 2026-02-12
 **Updated**: 2026-02-12

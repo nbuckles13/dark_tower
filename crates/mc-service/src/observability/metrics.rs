@@ -66,6 +66,12 @@ pub fn init_metrics_recorder() -> Result<PrometheusHandle, String> {
             ],
         )
         .map_err(|e| format!("Failed to set Redis latency buckets: {e}"))?
+        // Token refresh buckets - SLO-aligned (matches GC buckets)
+        .set_buckets_for_metric(
+            Matcher::Prefix("mc_token_refresh".to_string()),
+            &[0.010, 0.050, 0.100, 0.250, 0.500, 1.000, 2.500, 5.000],
+        )
+        .map_err(|e| format!("Failed to set token refresh buckets: {e}"))?
         .install_recorder()
         .map_err(|e| format!("Failed to install Prometheus metrics recorder: {e}"))
 }
@@ -225,6 +231,61 @@ pub fn record_gc_heartbeat_latency(heartbeat_type: &str, duration: Duration) {
         .record(duration.as_secs_f64());
 }
 
+// ============================================================================
+// Token Manager Metrics (ADR-0010 Section 4a)
+// ============================================================================
+
+/// Record token refresh attempt.
+///
+/// Emits three metrics per the metrics catalog (`docs/observability/metrics/mc.md`):
+/// - `mc_token_refresh_total` counter (labels: `status`)
+/// - `mc_token_refresh_duration_seconds` histogram (no labels)
+/// - `mc_token_refresh_failures_total` counter (labels: `error_type`, on failure only)
+///
+/// Called from the `TokenRefreshCallback` wired in `main.rs`.
+///
+/// # Arguments
+///
+/// * `status` - "success" or "error"
+/// * `error_type` - Error category for failures (e.g., "http", "auth_rejected")
+/// * `duration` - Duration of the acquire_token call (excludes backoff)
+pub fn record_token_refresh(status: &str, error_type: Option<&str>, duration: Duration) {
+    histogram!("mc_token_refresh_duration_seconds").record(duration.as_secs_f64());
+
+    counter!("mc_token_refresh_total",
+        "status" => status.to_string()
+    )
+    .increment(1);
+
+    if let Some(err_type) = error_type {
+        counter!("mc_token_refresh_failures_total",
+            "error_type" => err_type.to_string()
+        )
+        .increment(1);
+    }
+}
+
+// ============================================================================
+// Error Metrics
+// ============================================================================
+
+/// Record error by category.
+///
+/// Metric: `mc_errors_total`
+/// Labels: `operation`, `error_type`, `status_code`
+///
+/// The `operation` label uses a subsystem prefix to disambiguate across
+/// the global error counter (e.g., `"token_refresh"`, `"gc_heartbeat"`,
+/// `"redis_session"`).
+pub fn record_error(operation: &str, error_type: &str, status_code: u16) {
+    counter!("mc_errors_total",
+        "operation" => operation.to_string(),
+        "error_type" => error_type.to_string(),
+        "status_code" => status_code.to_string()
+    )
+    .increment(1);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -334,6 +395,32 @@ mod tests {
     }
 
     #[test]
+    fn test_record_token_refresh() {
+        // Success path
+        record_token_refresh("success", None, Duration::from_millis(50));
+
+        // Error paths with different error types
+        record_token_refresh("error", Some("http"), Duration::from_millis(100));
+        record_token_refresh("error", Some("auth_rejected"), Duration::from_millis(200));
+        record_token_refresh("error", Some("invalid_response"), Duration::from_millis(30));
+        record_token_refresh(
+            "error",
+            Some("acquisition_failed"),
+            Duration::from_millis(10),
+        );
+    }
+
+    #[test]
+    fn test_record_error() {
+        // MC uses signaling error codes (2-7), not HTTP status codes
+        record_error("token_refresh", "http", 6); // INTERNAL_ERROR
+        record_error("gc_heartbeat", "grpc", 6); // INTERNAL_ERROR
+        record_error("redis_session", "redis", 6); // INTERNAL_ERROR
+        record_error("meeting_join", "capacity_exceeded", 7); // CAPACITY_EXCEEDED
+        record_error("session_binding", "session_binding", 2); // UNAUTHORIZED
+    }
+
+    #[test]
     fn test_cardinality_bounds() {
         // Verify actor_type labels are bounded
         let valid_actor_types = ["controller", "meeting", "connection"];
@@ -391,6 +478,13 @@ mod tests {
         record_message_dropped("connection");
         record_gc_heartbeat("success", "fast");
         record_gc_heartbeat_latency("fast", Duration::from_millis(10));
+
+        // Record token refresh metrics
+        record_token_refresh("success", None, Duration::from_millis(50));
+        record_token_refresh("error", Some("http"), Duration::from_millis(100));
+
+        // Record error metrics
+        record_error("token_refresh", "http", 500);
 
         // Take a snapshot and verify metrics were recorded
         let snapshot = snapshotter.snapshot();

@@ -20,12 +20,14 @@ Service prefixes: `gc_` (Global Controller), `ac_` (Auth Controller), `mc_` (Mee
 
 ## Integration: SLO-Aligned Histogram Buckets
 **Added**: 2026-02-06
-**Related files**: `crates/gc-service/src/routes/mod.rs`
+**Updated**: 2026-02-16 (mc-token-metrics — added MC/token refresh buckets)
+**Related files**: `crates/gc-service/src/observability/metrics.rs`, `crates/mc-service/src/observability/metrics.rs`
 
-Histogram buckets must align with SLO targets to enable accurate percentile measurement:
+Histogram buckets must align with SLO targets to enable accurate percentile measurement. Buckets are configured at the **recorder** level via `PrometheusBuilder` with `Matcher::Prefix`, not at `histogram!` call sites:
 - **HTTP requests**: Buckets around 200ms (p95 target) - [5ms, 10ms, 25ms, 50ms, 100ms, 200ms, 300ms, 500ms, 1s, 2s]
 - **MC assignment**: Buckets around 20ms (p95 target) - [5ms, 10ms, 15ms, 20ms, 30ms, 50ms, 100ms, 500ms]
 - **Database queries**: Buckets around 50ms (p99 target) - [1ms, 5ms, 10ms, 25ms, 50ms, 100ms, 250ms, 1s]
+- **Token refresh** (GC + MC): Buckets around 1s (p99 SLO <2s) - [10ms, 50ms, 100ms, 250ms, 500ms, 1s, 2.5s, 5s]
 
 When adding new metrics with SLO targets, ensure buckets have resolution around the target value.
 

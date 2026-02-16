@@ -292,3 +292,17 @@ Renaming a service's OAuth client_id requires synchronized changes across 4 laye
 **Detection during review**: For any rename touching OAuth credentials, verify the chain: `deployment CLIENT_ID` == `setup.sh INSERT client_id` AND `secret.yaml plaintext` hashes to `setup.sh client_secret_hash`. The bcrypt hashes MUST be regenerated when the plaintext secret changes.
 
 ---
+
+## Gotcha: `status_code` Metric Label Has Different Domains Across Services
+**Added**: 2026-02-16
+**Related files**: `crates/mc-service/src/errors.rs`, `crates/gc-service/src/errors.rs`
+
+The `status_code` label in `mc_errors_total` uses WebTransport signaling error codes (values 2-7), while `gc_errors_total` uses HTTP status codes (200, 400, 401, 403, 404, 429, 500, 503). The same Prometheus label name has completely different value domains across services.
+
+**Why this matters for security**: Cross-service alerting rules that filter on `status_code` values will silently mismatch. For example, an alert on `status_code="401"` catches GC authentication failures but misses MC authentication failures (which use `status_code="2"` for UNAUTHORIZED). This could create blind spots in security monitoring.
+
+**Detection during review**: When adding `status_code` labels to new services, verify the alert rules and dashboard queries account for the service-specific code domain. Consider documenting the mapping in the metrics catalog and ensuring alert rules use service-specific filters (`job="mc-service"` vs `job="gc-service"`).
+
+**MC signaling codes**: 2=UNAUTHORIZED, 3=FORBIDDEN, 4=NOT_FOUND, 5=CONFLICT, 6=INTERNAL_ERROR, 7=CAPACITY_EXCEEDED.
+
+---

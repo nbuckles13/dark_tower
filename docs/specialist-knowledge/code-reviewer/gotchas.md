@@ -167,6 +167,14 @@ The `instrument-skip-all` validation guard pattern-matches on `#[instrument(` pr
 
 ---
 
+## Gotcha: `status_code()` Semantic Divergence Across Services
+**Added**: 2026-02-16
+**Related files**: `crates/mc-service/src/errors.rs`, `crates/gc-service/src/errors.rs`
+
+`GcError::status_code()` and `McError::status_code()` share identical signatures (`&self -> u16`) for metrics recording consistency, but return semantically different values. GC returns HTTP status codes (200-503) because it serves HTTP/REST. MC returns signaling error codes (2-7) because it uses WebTransport. MC's `status_code()` wraps the existing `error_code() -> i32` with an `i32 as u16` cast. A reviewer seeing `status_code` on an MC error might mistakenly expect HTTP codes. The doc comment on `McError::status_code()` explains this, but when reviewing metrics dashboards, verify that `status_code` label values are interpreted correctly for each service (6 = INTERNAL_ERROR in MC, 500 = Internal Server Error in GC).
+
+---
+
 ## Gotcha: Crate Rename vs Domain-Level Identifiers
 **Added**: 2026-02-16
 **Related files**: `crates/ac-service/src/models/mod.rs`, `crates/env-tests/tests/40_resilience.rs`

@@ -161,4 +161,6 @@ MC exposes internal metrics to Prometheus per ADR-0023. Security requirements to
 
 The separation ensures internal operational metrics go to GC (trusted service boundary) while public `/metrics` endpoint exposes only aggregate, PII-free data.
 
+6. **Cross-service `status_code` label divergence**: MC uses signaling codes (2-7) while GC uses HTTP codes (200-503) for the same `status_code` metric label. Security alerting rules must use `job=` filters to scope correctly. An alert on `status_code="401"` only catches GC auth failures; MC auth failures emit `status_code="2"`.
+
 ---

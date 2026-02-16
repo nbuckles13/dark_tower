@@ -42,6 +42,7 @@ Source: `docs/devloop-outputs/*/main.md` Tech Debt sections
 |---------|-----------|-------|
 | Redis ConnectionManager wrapper | MC | Optional enhancement |
 | Histogram bucket configuration | MC metrics | Align with SLO targets |
+| Token refresh histogram buckets | GC `metrics.rs`, MC `metrics.rs` | Identical `[0.010..5.000]` SLO-aligned buckets; extract to `common::observability::TOKEN_REFRESH_BUCKETS` if 3rd service needs them |
 
 ## Resolved Tech Debt
 
@@ -64,6 +65,8 @@ These look like duplication but are intentionally separate:
 | Config structs with same field names | Service-specific defaults and validation |
 | Test utilities in `*-test-utils` crates | Intentionally service-scoped |
 | Service-specific health endpoints | Different readiness criteria |
+| `error_type_label()` on error enums | GC (9 variants) and MC (18 variants) have same method name but different match arms; domain-specific |
+| `status_code` label semantics | GC uses HTTP codes, MC uses signaling codes; same label name, different value domains |
 
 ## When to Flag
 
