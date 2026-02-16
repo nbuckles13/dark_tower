@@ -312,3 +312,22 @@ print_warning() {
     local message="$1"
     echo -e "${YELLOW}WARNING${NC}: $message"
 }
+
+# =============================================================================
+# Canonical Service Mapping
+# =============================================================================
+
+# Source of truth for service structure.
+# When adding a new service, you MUST add it here.
+#
+# Format: [prefix]="directory:app-label"
+# - prefix: Metric prefix (e.g., "ac" for ac_*)
+# - directory: Crate directory name (e.g., "ac-service")
+# - app-label: Kubernetes app label (e.g., "ac-service")
+
+declare -A CANONICAL_SERVICES=(
+    [ac]="ac-service:ac-service"
+    [gc]="gc-service:gc-service"
+    [mc]="mc-service:mc-service"
+    [mh]="mh-service:mh-service"
+)
