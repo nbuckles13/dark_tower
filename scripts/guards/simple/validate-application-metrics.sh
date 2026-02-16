@@ -19,10 +19,10 @@ set -euo pipefail
 
 # Script directory
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 
-# Source common library
-source "$SCRIPT_DIR/common.sh"
+# Source common library (CANONICAL_SERVICES defined there)
+source "$SCRIPT_DIR/../common.sh"
 
 # Configuration
 CRATES_DIR="$REPO_ROOT/crates"
@@ -35,26 +35,7 @@ GREEN='\033[0;32m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
-# ============================================================================
-# CANONICAL SERVICE MAPPING
-#
-# This is the source of truth for service structure.
-# When adding a new service, you MUST add it here.
-#
-# Format: [prefix]="directory:app-label"
-# - prefix: Metric prefix (e.g., "ac" for ac_*)
-# - directory: Crate directory name (e.g., "ac-service")
-# - app-label: Kubernetes app label (e.g., "ac-service")
-# ============================================================================
-
-declare -A CANONICAL_SERVICES=(
-    [ac]="ac-service:ac-service"
-    [gc]="gc-service:gc-service"
-    [mc]="mc-service:mc-service"
-    [mh]="mh-service:mh-service"
-)
-
-# Parse into separate arrays
+# Parse canonical mapping into separate arrays
 declare -A SERVICE_DIRS
 declare -A SERVICE_APPS
 declare -A SERVICE_METRICS
@@ -97,7 +78,7 @@ validate_service_registration() {
             echo -e "${RED}❌ ERROR: Found service directory '$dir_name' with src/observability/metrics.rs${NC}"
             echo "   but it's not in the canonical mapping table!"
             echo ""
-            echo "   Add to CANONICAL_SERVICES in $(basename "$0"):"
+            echo "   Add to CANONICAL_SERVICES in scripts/guards/common.sh:"
             echo "   [??]=\"$dir_name:app-label-here\""
             echo ""
             echo "   where [??] is the metric prefix (e.g., 'mh' for mh_*)"

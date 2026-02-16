@@ -90,3 +90,27 @@ Look for `.map_err(|e| ...)` patterns where error context may be lost:
 ```
 
 **Key principle**: The error variable `e` should be included in the RETURNED error type, not just logged and discarded. Client-facing errors can use generic messages, but the underlying error should capture full context.
+
+---
+
+## Check: Metrics Path Completeness
+
+When a function records metrics (counter!, histogram!, gauge!) on some code paths,
+verify that ALL exit paths record equivalent metrics.
+
+UNSAFE patterns (flag these):
+1. Early return via `?` that bypasses metric recording when other paths in the
+   same function record metrics
+2. `match`/`if let` branches where some arms record metrics and others don't
+3. Error paths that `return Err(...)` before reaching metric recording calls
+
+SAFE patterns (do not flag):
+- Pure metrics functions (functions whose only purpose is recording metrics)
+- Functions that record metrics unconditionally (all paths go through recording)
+- Test code
+- Functions where the early return is before any business logic (e.g., input
+  validation at function start, before the operation being measured)
+
+Key insight: Look for functions where `histogram!`, `counter!`, or `gauge!` calls
+appear deep in the function body, then check whether earlier `?` or `return`
+statements can exit the function before reaching those calls.
