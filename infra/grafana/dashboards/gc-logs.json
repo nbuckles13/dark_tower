@@ -151,7 +151,7 @@
             "uid": "loki"
           },
           "editorMode": "code",
-          "expr": "sum by(level) (count_over_time({app=\"global-controller\"}[5m]))",
+          "expr": "sum by(level) (count_over_time({app=\"gc-service\"}[5m]))",
           "legendFormat": "{{level}}",
           "queryType": "range",
           "refId": "A"
@@ -190,7 +190,7 @@
             "uid": "loki"
           },
           "editorMode": "code",
-          "expr": "{app=\"global-controller\", pod=~\"$pod\", level=~\"$level\"}",
+          "expr": "{app=\"gc-service\", pod=~\"$pod\", level=~\"$level\"}",
           "queryType": "range",
           "refId": "A"
         }
@@ -228,7 +228,7 @@
             "uid": "loki"
           },
           "editorMode": "code",
-          "expr": "{app=\"global-controller\", level=\"ERROR\"}",
+          "expr": "{app=\"gc-service\", level=\"ERROR\"}",
           "queryType": "range",
           "refId": "A"
         }
@@ -266,7 +266,7 @@
             "uid": "loki"
           },
           "editorMode": "code",
-          "expr": "{app=\"global-controller\", level=\"WARN\"}",
+          "expr": "{app=\"gc-service\", level=\"WARN\"}",
           "queryType": "range",
           "refId": "A"
         }
@@ -279,7 +279,7 @@
   "schemaVersion": 38,
   "style": "dark",
   "tags": [
-    "global-controller",
+    "gc-service",
     "logs"
   ],
   "templating": {
@@ -299,7 +299,7 @@
         "query": {
           "label": "pod",
           "refId": "LokiVariableQueryEditor-VariableQuery",
-          "stream": "{app=\"global-controller\"}",
+          "stream": "{app=\"gc-service\"}",
           "type": 1
         },
         "refresh": 1,

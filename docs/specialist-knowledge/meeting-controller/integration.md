@@ -6,7 +6,7 @@ What other services need to know when integrating with the Meeting Controller.
 
 ## Integration: Actor Hierarchy for MC State Queries
 **Added**: 2026-01-25
-**Related files**: `crates/meeting-controller/src/actors/controller.rs`, `crates/meeting-controller/src/actors/meeting.rs`
+**Related files**: `crates/mc-service/src/actors/controller.rs`, `crates/mc-service/src/actors/meeting.rs`
 
 When GC queries MC status (for health checks or load balancing), the controller queries child meeting actors to get accurate state. `MeetingControllerActorHandle::get_status()` returns sync cached counts, but `get_meeting(meeting_id)` calls `MeetingActorHandle::get_state()` to get real-time participant count and fencing generation. This ensures consistency but adds latency. For high-frequency health checks, use `get_status()` which uses cached metrics. For assignment decisions, use `get_meeting()` for accuracy.
 
@@ -14,7 +14,7 @@ When GC queries MC status (for health checks or load balancing), the controller 
 
 ## Integration: CancellationToken Propagation from GC
 **Added**: 2026-01-25
-**Related files**: `crates/meeting-controller/src/actors/controller.rs`
+**Related files**: `crates/mc-service/src/actors/controller.rs`
 
 When MC receives shutdown signal (SIGTERM or GC command), it cancels the root `CancellationToken`. This propagates to all meetings, then to all connections. Connections have 50ms to send close frames. Meetings wait up to 5s per connection. Controller waits up to 30s per meeting. GC should set appropriate deadline and retry if MC doesn't acknowledge shutdown within deadline.
 
@@ -22,7 +22,7 @@ When MC receives shutdown signal (SIGTERM or GC command), it cancels the root `C
 
 ## Integration: Session Binding Flow
 **Added**: 2026-01-25
-**Related files**: `proto/signaling.proto`, `crates/meeting-controller/src/session/`
+**Related files**: `proto/signaling.proto`, `crates/mc-service/src/session/`
 
 Session binding enables reconnection after network disruption:
 
@@ -40,7 +40,7 @@ Session tokens are bound to participant + meeting. Expiry defaults to 5 minutes 
 
 ## Integration: GC-to-MC Assignment Notification
 **Added**: 2026-01-25
-**Related files**: `proto/internal.proto`, `crates/meeting-controller/src/grpc/`
+**Related files**: `proto/internal.proto`, `crates/mc-service/src/grpc/`
 
 When GC assigns a meeting to MC, it notifies via gRPC:
 
@@ -79,7 +79,7 @@ UI should distinguish: self-muted shows mute icon, host-muted shows lock icon. C
 
 ## Integration: Redis Session Storage
 **Added**: 2026-01-25
-**Related files**: `crates/meeting-controller/src/redis/client.rs`, `crates/mc-test-utils/src/`
+**Related files**: `crates/mc-service/src/redis/client.rs`, `crates/mc-test-utils/src/`
 
 MC uses Redis for ephemeral session state:
 
@@ -102,7 +102,7 @@ For testing, `mc-test-utils` provides `MockRedis` that simulates these patterns 
 
 ## Integration: MC Registration with GC
 **Added**: 2026-01-25, **Updated**: 2026-01-31
-**Related files**: `crates/meeting-controller/src/grpc/gc_client.rs`, `proto/internal.proto`
+**Related files**: `crates/mc-service/src/grpc/gc_client.rs`, `proto/internal.proto`
 
 On startup, MC registers with GC via `RegisterMc` RPC:
 
@@ -119,7 +119,7 @@ The 5-minute retry duration accommodates GC rolling updates where GC pods may be
 
 ## Integration: Heartbeat Intervals from GC
 **Added**: 2026-01-25
-**Related files**: `crates/meeting-controller/src/grpc/gc_client.rs`
+**Related files**: `crates/mc-service/src/grpc/gc_client.rs`
 
 GC can override default heartbeat intervals in the registration response:
 
@@ -132,7 +132,7 @@ MC stores GC-provided intervals in `AtomicU64` and uses them for scheduling. If 
 
 ## Integration: MC Accept/Reject for Meeting Assignment
 **Added**: 2026-01-25
-**Related files**: `crates/meeting-controller/src/grpc/mc_service.rs`, `proto/internal.proto`
+**Related files**: `crates/mc-service/src/grpc/mc_service.rs`, `proto/internal.proto`
 
 When GC calls `AssignMeetingWithMh`, MC checks capacity before accepting:
 
@@ -158,7 +158,7 @@ GC should retry with a different MC on any rejection except `DRAINING` (where GC
 
 ## Integration: MC Re-registration After NOT_FOUND
 **Added**: 2026-01-31
-**Related files**: `crates/meeting-controller/src/main.rs`, `crates/meeting-controller/src/grpc/gc_client.rs`
+**Related files**: `crates/mc-service/src/main.rs`, `crates/mc-service/src/grpc/gc_client.rs`
 
 MC automatically re-registers if heartbeat returns `Status::not_found` (indicates GC doesn't recognize the MC):
 
@@ -185,7 +185,7 @@ This provides production-grade resilience: MC survives GC restarts without losin
 
 ## Integration: TokenManager for Dynamic Auth Tokens
 **Added**: 2026-02-02
-**Related files**: `crates/meeting-controller/src/main.rs`, `crates/meeting-controller/src/grpc/gc_client.rs`, `crates/common/src/token_manager.rs`
+**Related files**: `crates/mc-service/src/main.rs`, `crates/mc-service/src/grpc/gc_client.rs`, `crates/common/src/token_manager.rs`
 
 MC uses TokenManager from common crate for OAuth 2.0 client credentials flow:
 
@@ -219,7 +219,7 @@ MC uses TokenManager from common crate for OAuth 2.0 client credentials flow:
 
 ## Integration: Observability Module Structure (Matching AC)
 **Added**: 2026-02-05
-**Related files**: `crates/meeting-controller/src/observability/mod.rs`, `crates/meeting-controller/src/observability/metrics.rs`, `crates/meeting-controller/src/observability/health.rs`
+**Related files**: `crates/mc-service/src/observability/mod.rs`, `crates/mc-service/src/observability/metrics.rs`, `crates/mc-service/src/observability/health.rs`
 
 MC's observability module mirrors AC's structure for cross-service consistency:
 
@@ -250,7 +250,7 @@ This structure enables future consolidation into a shared observability crate if
 
 ## Integration: Dual Metrics Systems (ActorMetrics vs ControllerMetrics)
 **Added**: 2026-02-05
-**Related files**: `crates/meeting-controller/src/actors/metrics.rs`, `crates/meeting-controller/src/observability/metrics.rs`
+**Related files**: `crates/mc-service/src/actors/metrics.rs`, `crates/mc-service/src/observability/metrics.rs`
 
 MC uses two separate metrics systems with different consumers:
 

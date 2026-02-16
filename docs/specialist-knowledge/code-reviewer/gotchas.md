@@ -15,7 +15,7 @@ Security parameters validated only at config parse time can be bypassed via prog
 ## Gotcha: Magic Numbers Without Constants
 **Added**: 2026-01-11
 **Updated**: 2026-01-27
-**Related files**: `crates/meeting-controller/src/grpc/mc_service.rs`
+**Related files**: `crates/mc-service/src/grpc/mc_service.rs`
 
 Numeric values with domain meaning (security parameters, capacity estimates) need named constants with doc comments explaining derivation. Example: `ESTIMATED_PARTICIPANTS_PER_MEETING` should document: "Based on P50=4, P90=8. Using 10 provides 20% headroom." Explains "why" and consequences if wrong.
 
@@ -39,7 +39,7 @@ Use consistent `"[REDACTED]"` across all Debug implementations. Inconsistent pla
 
 ## Gotcha: Health Check HTTP 200 vs Error Status
 **Added**: 2026-01-14
-**Related files**: `crates/global-controller/src/handlers/health.rs`
+**Related files**: `crates/gc-service/src/handlers/health.rs`
 
 Returning error status (500) when probe fails causes HTTP request failure and probe timeout. K8s expects to parse response body. BAD: `.map_err(|_| GcError::DatabaseUnavailable)`. GOOD: `let db_healthy = sqlx::query().await.is_ok()` then return 200 with status field.
 
@@ -63,7 +63,7 @@ Use `#[allow(dead_code)]` with comment explaining future use, not `#[expect(dead
 
 ## Gotcha: Duplicate Logging Between Repository and Service Layers
 **Added**: 2026-01-22
-**Related files**: `crates/global-controller/src/`
+**Related files**: `crates/gc-service/src/`
 
 Choose ONE layer for logging. Repository: database-specific details. Service: business operations. Typically prefer service layer (business context). Duplicate logging clutters observability.
 
@@ -72,7 +72,7 @@ Choose ONE layer for logging. Repository: database-specific details. Service: bu
 ## Gotcha: Silent Config Fallback to Defaults
 **Added**: 2026-01-25
 **Updated**: 2026-01-28
-**Related files**: `crates/meeting-controller/src/config.rs`, `crates/global-controller/src/config.rs`
+**Related files**: `crates/mc-service/src/config.rs`, `crates/gc-service/src/config.rs`
 
 Config parsing that silently falls back to defaults when env vars are invalid masks misconfiguration in production. For security-critical settings (JWT clock skew, bcrypt cost), always fail. For operational settings, log warning minimum. GC's JWT clock skew parsing is reference: returns ConfigError on invalid input.
 
@@ -88,7 +88,7 @@ Config parsing that silently falls back to defaults when env vars are invalid ma
 
 ## Gotcha: Wrong Error Variant for Communication Type
 **Added**: 2026-01-27
-**Related files**: `crates/meeting-controller/src/grpc/gc_client.rs`
+**Related files**: `crates/mc-service/src/grpc/gc_client.rs`
 
 Use semantically correct error variants for protocol (Redis, gRPC, HTTP). Wrong variant (e.g., `McError::Redis` for gRPC call) confuses debugging and breaks error handling. Matters for observability dashboards and retry strategies.
 
@@ -96,7 +96,7 @@ Use semantically correct error variants for protocol (Redis, gRPC, HTTP). Wrong 
 
 ## Gotcha: Synchronous get_* Methods in Actor Handles
 **Added**: 2026-01-25
-**Related files**: `crates/meeting-controller/src/actors/controller.rs`
+**Related files**: `crates/mc-service/src/actors/controller.rs`
 
 Actor handle methods retrieving state from child actors MUST be async. Synchronous getters return stale cached values, leading to incorrect status (e.g., participant_count always 0). Query child actor asynchronously for live state.
 
@@ -104,7 +104,7 @@ Actor handle methods retrieving state from child actors MUST be async. Synchrono
 
 ## Gotcha: Missing Graceful Fallback When Actor Communication Fails
 **Added**: 2026-01-25
-**Related files**: `crates/meeting-controller/src/actors/controller.rs`
+**Related files**: `crates/mc-service/src/actors/controller.rs`
 
 When querying child actors that may have shut down, handle error gracefully. Returning error breaks status endpoints during graceful shutdown. Log warning and return safe default (e.g., participant_count: 0).
 
@@ -112,7 +112,7 @@ When querying child actors that may have shut down, handle error gracefully. Ret
 
 ## Gotcha: SecretBox Clone Performance vs Type Safety Trade-off
 **Added**: 2026-01-28
-**Related files**: `crates/meeting-controller/src/actors/controller.rs`
+**Related files**: `crates/mc-service/src/actors/controller.rs`
 
 Don't immediately flag `.expose_secret().clone()` as waste. `SecretBox` prevents cloning to protect against leaks. Occasional clones at initialization (per-entity) acceptable if: (1) not hot path, (2) comment explains pattern with ADR reference, (3) Security approved. Red flag: many clones across hot-path callsites - escalate for `Arc<SecretBox<T>>` consideration.
 
@@ -136,7 +136,7 @@ Placeholder secrets (e.g., `vec![0u8; 32]` with TODO) compile but are insecure. 
 
 ## Gotcha: Unexpressed Metric Availability Assumptions
 **Added**: 2026-02-05
-**Related files**: `crates/meeting-controller/src/actors/metrics.rs`
+**Related files**: `crates/mc-service/src/actors/metrics.rs`
 
 Structs with increment methods naturally suggest Prometheus wiring. Not all metrics are wired - some are internal-only. Document at module level which types ARE wired, which are NOT. See `ControllerMetrics` (internal, not Prometheus) vs `ActorMetrics` (wired). Prevents dashboard confusion.
 
@@ -144,7 +144,7 @@ Structs with increment methods naturally suggest Prometheus wiring. Not all metr
 
 ## Gotcha: tracing `target:` Requires String Literal
 **Added**: 2026-02-12
-**Related files**: `crates/global-controller/src/tasks/generic_health_checker.rs`
+**Related files**: `crates/gc-service/src/tasks/generic_health_checker.rs`
 
 The `target:` argument in tracing macros (`info!`, `warn!`, `error!`) must be a **string literal** at compile time. Even `&'static str` variables will not compile. This blocks a common generic/reusable function pattern where you want to parameterize log targets. Workarounds: (1) drop custom `target:` and rely on `#[instrument(name = "...")]` spans on caller for filtering, (2) keep `target:` log lines in caller wrappers and only extract non-logging logic into the generic, (3) use `tracing::span!` with dynamic name at caller level. Discovered during TD-13 health checker extraction.
 
@@ -153,7 +153,7 @@ The `target:` argument in tracing macros (`info!`, `warn!`, `error!`) must be a 
 ## Gotcha: `display_name` Fields with Baked-In Formatting (RESOLVED)
 **Added**: 2026-02-12
 **Resolved**: 2026-02-12
-**Related files**: `crates/global-controller/src/tasks/generic_health_checker.rs`
+**Related files**: `crates/gc-service/src/tasks/generic_health_checker.rs`
 
 Config struct fields used in `format!` strings that require trailing spaces or specific formatting (e.g., `display_name: "MH "` with trailing space, vs `display_name: ""` for no prefix) are fragile API design. **Resolution**: TD-13 iteration 2 removed the config struct and `display_name` entirely, using `entity_name: &'static str` as a plain parameter. Entity differentiation now comes from the structured `entity` field in log events and the parent span set by the wrapper's `.instrument()`. Prefer this approach when a "display prefix" field is the only differentiator.
 
@@ -161,8 +161,16 @@ Config struct fields used in `format!` strings that require trailing spaces or s
 
 ## Gotcha: `#[instrument]` Attribute vs `.instrument()` Method -- Guard Behavior
 **Added**: 2026-02-12
-**Related files**: `crates/global-controller/src/tasks/generic_health_checker.rs`
+**Related files**: `crates/gc-service/src/tasks/generic_health_checker.rs`
 
 The `instrument-skip-all` validation guard pattern-matches on `#[instrument(` proc-macro attributes only. The `.instrument(info_span!(...))` runtime method call (from `tracing::Instrument` trait) is NOT detected by the guard. This means removing `#[instrument]` from a generic function and having callers use `.instrument()` chaining will NOT trigger the guard. Important distinction when choosing between attribute-based and method-based instrumentation in generic functions.
+
+---
+
+## Gotcha: Crate Rename vs Domain-Level Identifiers
+**Added**: 2026-02-16
+**Related files**: `crates/ac-service/src/models/mod.rs`, `crates/env-tests/tests/40_resilience.rs`
+
+When renaming crate directories/packages (e.g., `global-controller` → `gc-service`), distinguish between **crate-level names** (Cargo.toml package, lib, bin, `use` paths, directory paths) and **domain-level identifiers** (AC `service_type` values like `"global-controller"` stored in the database, used in JWT claims, validated in API handlers). Crate names change; domain identifiers do NOT -- they are part of the API contract and DB schema. However, **K8s labels** (`app=gc-service`) referenced in test code (env-tests canary pods) MUST match the renamed K8s manifests. The env-tests are an easy-to-miss location because they're Rust code containing K8s label strings, not YAML manifests.
 
 ---

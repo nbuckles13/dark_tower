@@ -31,9 +31,9 @@ log_step() { echo -e "${BLUE}[STEP]${NC} $1"; }
 # Service configuration: key="statefulset:binary:port"
 declare -A SERVICES=(
     ["ac"]="ac-service:auth-controller:8082"
-    ["gc"]="global-controller:global-controller:8080"
-    ["mc"]="meeting-controller:meeting-controller:8081"
-    ["mh"]="media-handler:media-handler:8083"
+    ["gc"]="gc-service:gc-service:8080"
+    ["mc"]="mc-service:mc-service:8081"
+    ["mh"]="mh-service:mh-service:8083"
 )
 
 NAMESPACE="dark-tower"

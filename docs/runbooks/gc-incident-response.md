@@ -109,22 +109,22 @@ Infrastructure Team / SRE Lead
 
 ```bash
 # 1. Check readiness endpoint
-kubectl port-forward -n dark-tower deployment/global-controller 8080:8080 &
+kubectl port-forward -n dark-tower deployment/gc-service 8080:8080 &
 curl http://localhost:8080/ready
 kill %1
 # Expected if failing: {"status":"not_ready","database":"unhealthy","error":"..."}
 
 # 2. Check pod status
-kubectl get pods -n dark-tower -l app=global-controller
+kubectl get pods -n dark-tower -l app=gc-service
 
 # 3. Check recent logs for DB errors
-kubectl logs -n dark-tower -l app=global-controller --tail=100 | grep -i "database\|connection\|sqlx"
+kubectl logs -n dark-tower -l app=gc-service --tail=100 | grep -i "database\|connection\|sqlx"
 
 # 4. Check database connectivity from pod
-kubectl exec -it deployment/global-controller -n dark-tower -- psql $DATABASE_URL -c "SELECT 1"
+kubectl exec -it deployment/gc-service -n dark-tower -- psql $DATABASE_URL -c "SELECT 1"
 
 # 5. Check connection pool metrics
-kubectl port-forward -n dark-tower deployment/global-controller 8080:8080 &
+kubectl port-forward -n dark-tower deployment/gc-service 8080:8080 &
 curl http://localhost:8080/metrics | grep -E "gc_db_"
 kill %1
 
@@ -163,14 +163,14 @@ kubectl get endpoints -n dark-tower postgresql
 
 ```bash
 # Option 1: Restart pods to clear stuck connections (quick fix)
-kubectl rollout restart deployment/global-controller -n dark-tower
+kubectl rollout restart deployment/gc-service -n dark-tower
 
 # Expected recovery time: 30-60 seconds
 
 # Option 2: Scale down and up to force new connections
-kubectl scale deployment/global-controller -n dark-tower --replicas=0
+kubectl scale deployment/gc-service -n dark-tower --replicas=0
 sleep 5
-kubectl scale deployment/global-controller -n dark-tower --replicas=3
+kubectl scale deployment/gc-service -n dark-tower --replicas=3
 
 # Expected recovery time: 60-90 seconds
 
@@ -183,7 +183,7 @@ kubectl exec -it -n dark-tower postgres-0 -- psql -c "SELECT pg_terminate_backen
 # Expected recovery time: Immediate
 
 # After remediation, verify recovery
-kubectl get pods -n dark-tower -l app=global-controller
+kubectl get pods -n dark-tower -l app=gc-service
 curl http://localhost:8080/ready
 curl http://localhost:8080/metrics | grep gc_db_queries_total
 ```
@@ -208,7 +208,7 @@ curl http://localhost:8080/metrics | grep gc_db_queries_total
 
 ```bash
 # 1. Check current latency metrics
-kubectl port-forward -n dark-tower deployment/global-controller 8080:8080 &
+kubectl port-forward -n dark-tower deployment/gc-service 8080:8080 &
 curl http://localhost:8080/metrics | grep gc_http_request_duration_seconds
 kill %1
 
@@ -226,10 +226,10 @@ histogram_quantile(0.95, sum by(le) (rate(gc_mc_assignment_duration_seconds_buck
 histogram_quantile(0.95, sum by(le) (rate(gc_token_refresh_duration_seconds_bucket[5m])))
 
 # 6. Check pod resource utilization
-kubectl top pods -n dark-tower -l app=global-controller
+kubectl top pods -n dark-tower -l app=gc-service
 
 # 7. Check for slow queries in logs
-kubectl logs -n dark-tower -l app=global-controller --tail=1000 | grep -E "duration_ms|slow"
+kubectl logs -n dark-tower -l app=gc-service --tail=1000 | grep -E "duration_ms|slow"
 ```
 
 **Common Root Causes**:
@@ -263,7 +263,7 @@ kubectl logs -n dark-tower -l app=global-controller --tail=1000 | grep -E "durat
 ```bash
 # Scenario A: CPU Bound (CPU >80%)
 # Scale horizontally to distribute load
-kubectl scale deployment/global-controller -n dark-tower --replicas=5
+kubectl scale deployment/gc-service -n dark-tower --replicas=5
 
 # Expected recovery time: 30-60 seconds
 
@@ -278,8 +278,8 @@ kubectl exec -it -n dark-tower postgres-0 -- psql -c "SELECT pg_terminate_backen
 
 # Scenario C: MC Assignment Slow
 # Check MC pod health and scale if needed
-kubectl get pods -n dark-tower -l app=meeting-controller
-kubectl scale deployment/meeting-controller -n dark-tower --replicas=5
+kubectl get pods -n dark-tower -l app=mc-service
+kubectl scale deployment/mc-service -n dark-tower --replicas=5
 
 # Expected recovery time: 30-60 seconds
 
@@ -324,7 +324,7 @@ histogram_quantile(0.95, sum by(le) (rate(gc_http_request_duration_seconds_bucke
 
 ```bash
 # 1. Check MC assignment metrics
-kubectl port-forward -n dark-tower deployment/global-controller 8080:8080 &
+kubectl port-forward -n dark-tower deployment/gc-service 8080:8080 &
 curl http://localhost:8080/metrics | grep gc_mc_assignment
 kill %1
 
@@ -333,20 +333,20 @@ kill %1
 sum by(rejection_reason) (rate(gc_mc_assignments_total{status!="success"}[5m]))
 
 # 3. Check MC pod availability
-kubectl get pods -n dark-tower -l app=meeting-controller
+kubectl get pods -n dark-tower -l app=mc-service
 
 # 4. Check MC registrations in database
-kubectl exec -it deployment/global-controller -n dark-tower -- psql $DATABASE_URL -c \
+kubectl exec -it deployment/gc-service -n dark-tower -- psql $DATABASE_URL -c \
   "SELECT id, region, capacity, current_sessions, last_heartbeat FROM meeting_controllers WHERE last_heartbeat > NOW() - INTERVAL '30 seconds' ORDER BY last_heartbeat DESC;"
 
 # 5. Check GC→MC gRPC connectivity
-kubectl exec -it deployment/global-controller -n dark-tower -- grpcurl -plaintext meeting-controller.dark-tower.svc.cluster.local:9090 list
+kubectl exec -it deployment/gc-service -n dark-tower -- grpcurl -plaintext mc-service.dark-tower.svc.cluster.local:9090 list
 
 # 6. Check GC logs for assignment errors
-kubectl logs -n dark-tower -l app=global-controller --tail=100 | grep "mc_assignment"
+kubectl logs -n dark-tower -l app=gc-service --tail=100 | grep "mc_assignment"
 
 # 7. Check MC logs for rejections
-kubectl logs -n dark-tower -l app=meeting-controller --tail=100 | grep -i "reject\|capacity\|assignment"
+kubectl logs -n dark-tower -l app=mc-service --tail=100 | grep -i "reject\|capacity\|assignment"
 ```
 
 **Common Rejection Reasons** (from ADR-0010):
@@ -360,7 +360,7 @@ kubectl logs -n dark-tower -l app=meeting-controller --tail=100 | grep -i "rejec
 ```bash
 # Scenario A: No Healthy MCs (all at_capacity or unhealthy)
 # Scale up MC pods
-kubectl scale deployment/meeting-controller -n dark-tower --replicas=5
+kubectl scale deployment/mc-service -n dark-tower --replicas=5
 
 # Expected recovery time: 30-60 seconds
 
@@ -376,22 +376,22 @@ kubectl delete pod <MC_POD_NAME> -n dark-tower
 
 # Scenario C: MC Heartbeats Failing (stale last_heartbeat)
 # Test database connection from MC pod
-kubectl exec -it deployment/meeting-controller -n dark-tower -- psql $DATABASE_URL -c "SELECT NOW();"
+kubectl exec -it deployment/mc-service -n dark-tower -- psql $DATABASE_URL -c "SELECT NOW();"
 
 # Check MC logs for heartbeat errors
-kubectl logs -n dark-tower -l app=meeting-controller --tail=100 | grep -i "heartbeat"
+kubectl logs -n dark-tower -l app=mc-service --tail=100 | grep -i "heartbeat"
 
 # Restart MC to force re-registration
-kubectl rollout restart deployment/meeting-controller -n dark-tower
+kubectl rollout restart deployment/mc-service -n dark-tower
 
 # Expected recovery time: 60 seconds
 
 # Scenario D: gRPC Call Failures (rpc_failed)
 # Check NetworkPolicy allows GC→MC traffic
-kubectl get networkpolicy -n dark-tower -o yaml | grep -A20 "meeting-controller"
+kubectl get networkpolicy -n dark-tower -o yaml | grep -A20 "mc-service"
 
 # Verify MC service endpoints are populated
-kubectl get endpoints meeting-controller -n dark-tower
+kubectl get endpoints mc-service -n dark-tower
 
 # Expected recovery time: Immediate if config fix
 
@@ -425,23 +425,23 @@ sum(rate(gc_mc_assignments_total{status="success"}[5m])) / sum(rate(gc_mc_assign
 **Symptoms**:
 - All GC pods in CrashLoopBackOff or Pending state
 - 503 Service Unavailable on all endpoints
-- No healthy pods in `kubectl get pods -l app=global-controller`
+- No healthy pods in `kubectl get pods -l app=gc-service`
 - Alert: `GCDown` firing
 
 **Diagnosis**:
 
 ```bash
 # 1. Check pod status
-kubectl get pods -n dark-tower -l app=global-controller
+kubectl get pods -n dark-tower -l app=gc-service
 
 # 2. Check pod events
-kubectl describe pods -n dark-tower -l app=global-controller
+kubectl describe pods -n dark-tower -l app=gc-service
 
 # 3. Check recent logs before crash
-kubectl logs -n dark-tower -l app=global-controller --previous --tail=100
+kubectl logs -n dark-tower -l app=gc-service --previous --tail=100
 
 # 4. Check deployment status
-kubectl describe deployment global-controller -n dark-tower
+kubectl describe deployment gc-service -n dark-tower
 
 # 5. Check resource quotas
 kubectl describe resourcequota -n dark-tower
@@ -451,7 +451,7 @@ kubectl get nodes
 kubectl describe node <node-name>
 
 # 7. Check for recent deployments
-kubectl rollout history deployment/global-controller -n dark-tower
+kubectl rollout history deployment/gc-service -n dark-tower
 ```
 
 **Common Root Causes**:
@@ -492,19 +492,19 @@ kubectl rollout history deployment/global-controller -n dark-tower
 
 ```bash
 # Option 1: Rollback deployment to last known good version
-kubectl rollout undo deployment/global-controller -n dark-tower
-kubectl rollout status deployment/global-controller -n dark-tower
+kubectl rollout undo deployment/gc-service -n dark-tower
+kubectl rollout status deployment/gc-service -n dark-tower
 
 # Expected recovery time: 2-3 minutes
 
 # Option 2: Force reschedule pods
-kubectl delete pods -n dark-tower -l app=global-controller
+kubectl delete pods -n dark-tower -l app=gc-service
 # Deployment will recreate them
 
 # Expected recovery time: 30-60 seconds
 
 # Option 3: Manually scale up from zero (if scaled down accidentally)
-kubectl scale deployment/global-controller -n dark-tower --replicas=3
+kubectl scale deployment/gc-service -n dark-tower --replicas=3
 
 # Expected recovery time: 30-60 seconds
 
@@ -513,14 +513,14 @@ kubectl get secret -n dark-tower gc-service-secrets
 # If missing, recreate from secure backup
 
 # Option 5: Bypass resource limits (emergency only)
-kubectl patch deployment/global-controller -n dark-tower -p '{"spec":{"template":{"spec":{"containers":[{"name":"global-controller","resources":{"limits":{"memory":"1Gi"}}}]}}}}'
+kubectl patch deployment/gc-service -n dark-tower -p '{"spec":{"template":{"spec":{"containers":[{"name":"gc-service","resources":{"limits":{"memory":"1Gi"}}}]}}}}'
 
 # Expected recovery time: 2-3 minutes
 
 # Verify recovery
-kubectl get pods -n dark-tower -l app=global-controller
-kubectl logs -n dark-tower -l app=global-controller --tail=50
-curl http://global-controller.dark-tower.svc.cluster.local:8080/ready
+kubectl get pods -n dark-tower -l app=gc-service
+kubectl logs -n dark-tower -l app=gc-service --tail=50
+curl http://gc-service.dark-tower.svc.cluster.local:8080/ready
 ```
 
 **Escalation**:
@@ -546,7 +546,7 @@ curl http://global-controller.dark-tower.svc.cluster.local:8080/ready
 
 ```bash
 # 1. Check error rate and breakdown by status code
-kubectl port-forward -n dark-tower deployment/global-controller 8080:8080 &
+kubectl port-forward -n dark-tower deployment/gc-service 8080:8080 &
 curl http://localhost:8080/metrics | grep gc_http_requests_total
 kill %1
 
@@ -564,14 +564,14 @@ sum by(endpoint, status_code) (rate(gc_http_requests_total{status_code=~"[45].."
 curl http://localhost:8080/metrics | grep gc_errors_total
 
 # 3. Check logs for error patterns
-kubectl logs -n dark-tower -l app=global-controller --tail=200 | grep -i "error\|failed\|panic"
+kubectl logs -n dark-tower -l app=gc-service --tail=200 | grep -i "error\|failed\|panic"
 
 # 4. Check recent deployments
-kubectl rollout history deployment/global-controller -n dark-tower
+kubectl rollout history deployment/gc-service -n dark-tower
 
 # 5. Check dependency health
 curl http://ac-service.dark-tower.svc.cluster.local:8082/ready
-curl http://meeting-controller.dark-tower.svc.cluster.local:8080/ready
+curl http://mc-service.dark-tower.svc.cluster.local:8080/ready
 ```
 
 **Common Root Causes**:
@@ -610,29 +610,29 @@ sum by(status_code) (rate(gc_http_requests_total{status_code=~"[45].."}[5m]))
 # If mostly 4xx: Likely client-side or invalid requests
 
 # Step 2: For 5xx errors - check for recent deployments
-kubectl rollout history deployment/global-controller -n dark-tower
+kubectl rollout history deployment/gc-service -n dark-tower
 
 # If recent deployment correlates with error spike:
-kubectl rollout undo deployment/global-controller -n dark-tower
+kubectl rollout undo deployment/gc-service -n dark-tower
 
 # Expected recovery time: 2-3 minutes
 
 # Step 3: For 5xx errors - check dependency health
 # Database
-kubectl exec -it deployment/global-controller -n dark-tower -- psql $DATABASE_URL -c "SELECT 1"
+kubectl exec -it deployment/gc-service -n dark-tower -- psql $DATABASE_URL -c "SELECT 1"
 
 # AC Service
 curl http://ac-service.dark-tower.svc.cluster.local:8082/ready
 
 # MC Service
-curl http://meeting-controller.dark-tower.svc.cluster.local:8080/ready
+curl http://mc-service.dark-tower.svc.cluster.local:8080/ready
 
 # Step 4: For 4xx errors - analyze request patterns
 # Check logs for validation errors
-kubectl logs -n dark-tower -l app=global-controller --tail=200 | grep "400\|validation\|invalid"
+kubectl logs -n dark-tower -l app=gc-service --tail=200 | grep "400\|validation\|invalid"
 
 # Step 5: Scale up if under load
-kubectl scale deployment/global-controller -n dark-tower --replicas=5
+kubectl scale deployment/gc-service -n dark-tower --replicas=5
 
 # Verify recovery
 sum(rate(gc_http_requests_total{status_code=~"[45].."}[5m])) / sum(rate(gc_http_requests_total[5m]))
@@ -663,20 +663,20 @@ sum(rate(gc_http_requests_total{status_code=~"[45].."}[5m])) / sum(rate(gc_http_
 
 ```bash
 # 1. Check current resource usage
-kubectl top pods -n dark-tower -l app=global-controller
+kubectl top pods -n dark-tower -l app=gc-service
 
 # 2. Check resource limits
-kubectl describe deployment global-controller -n dark-tower | grep -A 10 "Limits:"
+kubectl describe deployment gc-service -n dark-tower | grep -A 10 "Limits:"
 
 # 3. Check for OOMKilled events
 kubectl get events -n dark-tower --field-selector involvedObject.kind=Pod | grep -i "oom\|killed"
 
 # 4. Check memory usage trend in Prometheus
-container_memory_working_set_bytes{pod=~"global-controller-.*"}
-container_spec_memory_limit_bytes{pod=~"global-controller-.*"}
+container_memory_working_set_bytes{pod=~"gc-service-.*"}
+container_spec_memory_limit_bytes{pod=~"gc-service-.*"}
 
 # 5. Check CPU usage trend
-rate(container_cpu_usage_seconds_total{pod=~"global-controller-.*"}[5m])
+rate(container_cpu_usage_seconds_total{pod=~"gc-service-.*"}[5m])
 
 # 6. Check request rate (is load increasing?)
 sum(rate(gc_http_requests_total[5m]))
@@ -711,17 +711,17 @@ sum(rate(gc_http_requests_total[5m]))
 
 ```bash
 # Option 1: Scale horizontally to distribute load
-kubectl scale deployment/global-controller -n dark-tower --replicas=5
+kubectl scale deployment/gc-service -n dark-tower --replicas=5
 
 # Expected recovery time: 30-60 seconds
 
 # Option 2: Increase resource limits
-kubectl patch deployment/global-controller -n dark-tower -p '{"spec":{"template":{"spec":{"containers":[{"name":"global-controller","resources":{"limits":{"cpu":"2000m","memory":"1Gi"},"requests":{"cpu":"500m","memory":"512Mi"}}}]}}}}'
+kubectl patch deployment/gc-service -n dark-tower -p '{"spec":{"template":{"spec":{"containers":[{"name":"gc-service","resources":{"limits":{"cpu":"2000m","memory":"1Gi"},"requests":{"cpu":"500m","memory":"512Mi"}}}]}}}}'
 
 # Expected recovery time: 2-3 minutes (rolling update)
 
 # Option 3: Restart pods (temporary fix for memory issues)
-kubectl rollout restart deployment/global-controller -n dark-tower
+kubectl rollout restart deployment/gc-service -n dark-tower
 
 # Expected recovery time: 2-3 minutes
 
@@ -731,7 +731,7 @@ kubectl delete pod <POD_NAME> -n dark-tower
 # Expected recovery time: 30 seconds
 
 # Verify recovery
-kubectl top pods -n dark-tower -l app=global-controller
+kubectl top pods -n dark-tower -l app=gc-service
 # CPU should be <70%, memory should be <70%
 ```
 
@@ -758,19 +758,19 @@ kubectl top pods -n dark-tower -l app=global-controller
 
 ```bash
 # 1. Check token refresh metrics
-kubectl port-forward -n dark-tower deployment/global-controller 8080:8080 &
+kubectl port-forward -n dark-tower deployment/gc-service 8080:8080 &
 curl http://localhost:8080/metrics | grep gc_token_refresh
 kill %1
 
 # 2. Check TokenManager logs
-kubectl logs deployment/global-controller -n dark-tower --tail=100 | grep -i "token"
+kubectl logs deployment/gc-service -n dark-tower --tail=100 | grep -i "token"
 
 # 3. Check AC service health
 kubectl get pods -n dark-tower -l app=ac-service
 curl http://ac-service.dark-tower.svc.cluster.local:8082/ready
 
 # 4. Test token endpoint directly from GC pod
-kubectl exec -it deployment/global-controller -n dark-tower -- curl -X POST $AC_TOKEN_URL \
+kubectl exec -it deployment/gc-service -n dark-tower -- curl -X POST $AC_TOKEN_URL \
   -u "${GC_CLIENT_ID}:${GC_CLIENT_SECRET}" \
   -d "grant_type=client_credentials"
 
@@ -820,19 +820,19 @@ kubectl create secret generic gc-service-secrets \
   --namespace dark-tower \
   --dry-run=client -o yaml | kubectl apply -f -
 
-kubectl rollout restart deployment/global-controller -n dark-tower
+kubectl rollout restart deployment/gc-service -n dark-tower
 
 # Expected recovery time: 2-3 minutes
 
 # Option 3: Verify AC client registration
 kubectl exec -it deployment/ac-service -n dark-tower -- psql $DATABASE_URL -c \
-  "SELECT client_id, is_active FROM service_credentials WHERE client_id = 'gc-service';"
+  "SELECT client_id, is_active FROM service_credentials WHERE client_id = 'global-controller';"
 
 # If not found or inactive, create/activate (requires admin access)
 
 # Option 4: Check and fix NetworkPolicy
 kubectl get networkpolicy -n dark-tower
-kubectl describe networkpolicy global-controller -n dark-tower
+kubectl describe networkpolicy gc-service -n dark-tower
 
 # Ensure egress to ac-service:8082 is allowed
 
@@ -854,22 +854,22 @@ curl http://localhost:8080/metrics | grep 'gc_token_refresh_total{status="succes
 
 ```bash
 # Check service health
-kubectl port-forward -n dark-tower deployment/global-controller 8080:8080 &
+kubectl port-forward -n dark-tower deployment/gc-service 8080:8080 &
 curl http://localhost:8080/health      # Liveness (should always return "OK")
 curl http://localhost:8080/ready       # Readiness (checks DB + JWKS)
 kill %1
 
 # Check pod status
-kubectl get pods -n dark-tower -l app=global-controller
+kubectl get pods -n dark-tower -l app=gc-service
 
 # Check recent errors in logs
-kubectl logs -n dark-tower -l app=global-controller --tail=100 | grep -i error
+kubectl logs -n dark-tower -l app=gc-service --tail=100 | grep -i error
 ```
 
 ### Metrics Analysis
 
 ```bash
-kubectl port-forward -n dark-tower deployment/global-controller 8080:8080 &
+kubectl port-forward -n dark-tower deployment/gc-service 8080:8080 &
 
 # Get all metrics
 curl http://localhost:8080/metrics
@@ -896,14 +896,14 @@ kill %1
 
 ```bash
 # Connect to database from pod
-kubectl exec -it deployment/global-controller -n dark-tower -- psql $DATABASE_URL
+kubectl exec -it deployment/gc-service -n dark-tower -- psql $DATABASE_URL
 
 # Check healthy MC registrations
-kubectl exec -it deployment/global-controller -n dark-tower -- psql $DATABASE_URL -c \
+kubectl exec -it deployment/gc-service -n dark-tower -- psql $DATABASE_URL -c \
   "SELECT id, region, capacity, current_sessions, last_heartbeat FROM meeting_controllers WHERE last_heartbeat > NOW() - INTERVAL '30 seconds' ORDER BY last_heartbeat DESC;"
 
 # Check active meetings (if applicable)
-kubectl exec -it deployment/global-controller -n dark-tower -- psql $DATABASE_URL -c \
+kubectl exec -it deployment/gc-service -n dark-tower -- psql $DATABASE_URL -c \
   "SELECT COUNT(*) FROM meetings WHERE status = 'active';"
 
 # Check for slow queries (requires pg_stat_statements)
@@ -914,41 +914,41 @@ kubectl exec -it deployment/global-controller -n dark-tower -- psql $DATABASE_UR
 
 ```bash
 # Stream logs in real-time
-kubectl logs -n dark-tower -l app=global-controller -f
+kubectl logs -n dark-tower -l app=gc-service -f
 
 # Get logs from all pods
-kubectl logs -n dark-tower -l app=global-controller --all-containers --tail=200
+kubectl logs -n dark-tower -l app=gc-service --all-containers --tail=200
 
 # Get logs from previous pod instance (after crash)
 kubectl logs -n dark-tower <pod-name> --previous
 
 # Search for specific errors
-kubectl logs -n dark-tower -l app=global-controller --tail=1000 | grep -E "error|panic|fatal"
+kubectl logs -n dark-tower -l app=gc-service --tail=1000 | grep -E "error|panic|fatal"
 
 # Search for HTTP errors
-kubectl logs -n dark-tower -l app=global-controller --tail=1000 | grep -E "status.*[45][0-9][0-9]"
+kubectl logs -n dark-tower -l app=gc-service --tail=1000 | grep -E "status.*[45][0-9][0-9]"
 
 # Search for database errors
-kubectl logs -n dark-tower -l app=global-controller --tail=1000 | grep -i "database\|sqlx"
+kubectl logs -n dark-tower -l app=gc-service --tail=1000 | grep -i "database\|sqlx"
 
 # Search for MC assignment errors
-kubectl logs -n dark-tower -l app=global-controller --tail=1000 | grep -i "mc_assignment\|meeting_controller"
+kubectl logs -n dark-tower -l app=gc-service --tail=1000 | grep -i "mc_assignment\|meeting_controller"
 ```
 
 ### Resource Utilization
 
 ```bash
 # Check CPU and memory usage
-kubectl top pods -n dark-tower -l app=global-controller
+kubectl top pods -n dark-tower -l app=gc-service
 
 # Check node resources
 kubectl top nodes
 
 # Check resource limits
-kubectl describe deployment global-controller -n dark-tower | grep -A 5 "Limits:"
+kubectl describe deployment gc-service -n dark-tower | grep -A 5 "Limits:"
 
 # Check events for resource issues
-kubectl get events -n dark-tower --field-selector involvedObject.name=global-controller --sort-by='.lastTimestamp'
+kubectl get events -n dark-tower --field-selector involvedObject.name=gc-service --sort-by='.lastTimestamp'
 ```
 
 ### Network Debugging
@@ -957,24 +957,24 @@ kubectl get events -n dark-tower --field-selector involvedObject.name=global-con
 # Test service connectivity
 kubectl run -it --rm debug --image=nicolaka/netshoot --restart=Never -- /bin/bash
 # From debug pod:
-curl http://global-controller.dark-tower.svc.cluster.local:8080/health
-nslookup global-controller.dark-tower.svc.cluster.local
-ping global-controller.dark-tower.svc.cluster.local
+curl http://gc-service.dark-tower.svc.cluster.local:8080/health
+nslookup gc-service.dark-tower.svc.cluster.local
+ping gc-service.dark-tower.svc.cluster.local
 
 # Check service endpoints
-kubectl get endpoints -n dark-tower global-controller
+kubectl get endpoints -n dark-tower gc-service
 
 # Check network policies
 kubectl get networkpolicies -n dark-tower
 
 # Test database connectivity
-kubectl exec -it deployment/global-controller -n dark-tower -- psql $DATABASE_URL -c "SELECT 1"
+kubectl exec -it deployment/gc-service -n dark-tower -- psql $DATABASE_URL -c "SELECT 1"
 
 # Test AC connectivity
-kubectl exec -it deployment/global-controller -n dark-tower -- curl -i $AC_JWKS_URL
+kubectl exec -it deployment/gc-service -n dark-tower -- curl -i $AC_JWKS_URL
 
 # Test MC connectivity
-kubectl exec -it deployment/global-controller -n dark-tower -- grpcurl -plaintext meeting-controller.dark-tower.svc.cluster.local:9090 list
+kubectl exec -it deployment/gc-service -n dark-tower -- grpcurl -plaintext mc-service.dark-tower.svc.cluster.local:9090 list
 ```
 
 ---
@@ -987,28 +987,28 @@ kubectl exec -it deployment/global-controller -n dark-tower -- grpcurl -plaintex
 
 ```bash
 # 1. Verify current state
-kubectl get pods -n dark-tower -l app=global-controller
-kubectl port-forward -n dark-tower deployment/global-controller 8080:8080 &
+kubectl get pods -n dark-tower -l app=gc-service
+kubectl port-forward -n dark-tower deployment/gc-service 8080:8080 &
 curl http://localhost:8080/metrics | grep gc_http_requests_total
 kill %1
 
 # 2. Perform rolling restart (zero downtime)
-kubectl rollout restart deployment/global-controller -n dark-tower
+kubectl rollout restart deployment/gc-service -n dark-tower
 
 # 3. Monitor rollout
-kubectl rollout status deployment/global-controller -n dark-tower
+kubectl rollout status deployment/gc-service -n dark-tower
 
 # 4. Verify recovery
-kubectl get pods -n dark-tower -l app=global-controller
-curl http://global-controller.dark-tower.svc.cluster.local:8080/ready
+kubectl get pods -n dark-tower -l app=gc-service
+curl http://gc-service.dark-tower.svc.cluster.local:8080/ready
 
 # 5. Check logs for startup errors
-kubectl logs -n dark-tower -l app=global-controller --tail=50
+kubectl logs -n dark-tower -l app=gc-service --tail=50
 ```
 
 **Rollback on failure**:
 ```bash
-kubectl rollout undo deployment/global-controller -n dark-tower
+kubectl rollout undo deployment/gc-service -n dark-tower
 ```
 
 ---
@@ -1024,17 +1024,17 @@ kubectl rollout undo deployment/global-controller -n dark-tower
 # Escalate to Database Team - they handle failover
 
 # 2. After Database Team completes failover, verify new connection
-kubectl exec -it deployment/global-controller -n dark-tower -- psql $DATABASE_URL -c "SELECT 1"
+kubectl exec -it deployment/gc-service -n dark-tower -- psql $DATABASE_URL -c "SELECT 1"
 
 # 3. If pods have stale connections, restart them
-kubectl rollout restart deployment/global-controller -n dark-tower
+kubectl rollout restart deployment/gc-service -n dark-tower
 
 # 4. Verify recovery
-curl http://global-controller.dark-tower.svc.cluster.local:8080/ready
+curl http://gc-service.dark-tower.svc.cluster.local:8080/ready
 # Should show database: "healthy"
 
 # 5. Monitor metrics for 15 minutes
-watch -n 10 'kubectl port-forward -n dark-tower deployment/global-controller 8080:8080 & curl -s http://localhost:8080/metrics | grep -E "gc_http_request|gc_db_query|gc_errors"; kill %1'
+watch -n 10 'kubectl port-forward -n dark-tower deployment/gc-service 8080:8080 & curl -s http://localhost:8080/metrics | grep -E "gc_http_request|gc_db_query|gc_errors"; kill %1'
 ```
 
 ---
@@ -1045,17 +1045,17 @@ watch -n 10 'kubectl port-forward -n dark-tower deployment/global-controller 808
 
 ```bash
 # Option 1: Scale horizontally (handles legitimate traffic increases)
-kubectl scale deployment/global-controller -n dark-tower --replicas=10
+kubectl scale deployment/gc-service -n dark-tower --replicas=10
 
 # Option 2: Increase resource limits (if CPU/memory constrained)
-kubectl patch deployment/global-controller -n dark-tower -p '{"spec":{"template":{"spec":{"containers":[{"name":"global-controller","resources":{"limits":{"cpu":"2000m","memory":"1Gi"}}}]}}}}'
+kubectl patch deployment/gc-service -n dark-tower -p '{"spec":{"template":{"spec":{"containers":[{"name":"gc-service","resources":{"limits":{"cpu":"2000m","memory":"1Gi"}}}]}}}}'
 
 # Option 3: Emergency IP blocking (Infrastructure Team)
 # If under attack, provide attacker IPs to Infrastructure Team
 # They update ingress rules or network policies
 
 # Verify traffic levels
-kubectl port-forward -n dark-tower deployment/global-controller 8080:8080 &
+kubectl port-forward -n dark-tower deployment/gc-service 8080:8080 &
 curl http://localhost:8080/metrics | grep gc_http_requests_total
 kill %1
 ```
@@ -1126,7 +1126,7 @@ All times in UTC. Link to relevant Slack threads, PagerDuty incidents, and dashb
 [Detailed explanation of what caused the incident]
 
 **Technical Details**:
-- Component: [e.g., global-controller, database, meeting-controller]
+- Component: [e.g., gc-service, database, mc-service]
 - Failure mode: [e.g., connection pool exhaustion, OOMKill, MC assignment stuck]
 - Why it happened: [e.g., traffic spike exceeded capacity, bug in X, config change Y]
 

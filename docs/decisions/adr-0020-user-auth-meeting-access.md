@@ -375,9 +375,9 @@ Require all users to have accounts.
 - `crates/ac-service/src/routes.rs` (add user and internal routes)
 
 **GC Changes**:
-- `crates/global-controller/src/handlers/meetings.rs`
-- `crates/global-controller/src/handlers/guest_token.rs` (new)
-- `crates/global-controller/src/services/ac_client.rs` (new - client for AC internal endpoints)
+- `crates/gc-service/src/handlers/meetings.rs`
+- `crates/gc-service/src/handlers/guest_token.rs` (new)
+- `crates/gc-service/src/services/ac_client.rs` (new - client for AC internal endpoints)
 
 **MC Changes** (future):
 - Token validation against AC JWKS

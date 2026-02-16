@@ -6,8 +6,8 @@
 # Scrape jobs:
 # - prometheus: Self-monitoring
 # - ac-service: Auth Controller (port 8082)
-# - global-controller: Global Controller (port 8080)
-# - meeting-controller: Meeting Controller (port 8081)
+# - gc-service: Global Controller (port 8080)
+# - mc-service: Meeting Controller (port 8081)
 # - kube-state-metrics: Cluster-level metrics (pod states, deployments, etc.)
 # - node-exporter: Node-level metrics (CPU, memory, disk, network)
 # - kubelet: Container-level metrics (container_cpu_usage_seconds_total, etc.)
@@ -48,7 +48,7 @@ data:
             regex: "8082"
 
       # Scrape Global Controller pods
-      - job_name: 'global-controller'
+      - job_name: 'gc-service'
         kubernetes_sd_configs:
           - role: pod
             namespaces:
@@ -57,13 +57,13 @@ data:
         relabel_configs:
           - source_labels: [__meta_kubernetes_pod_label_app]
             action: keep
-            regex: global-controller
+            regex: gc-service
           - source_labels: [__meta_kubernetes_pod_container_port_number]
             action: keep
             regex: "8080"
 
       # Scrape Meeting Controller pods (metrics on health port)
-      - job_name: 'meeting-controller'
+      - job_name: 'mc-service'
         kubernetes_sd_configs:
           - role: pod
             namespaces:
@@ -72,7 +72,7 @@ data:
         relabel_configs:
           - source_labels: [__meta_kubernetes_pod_label_app]
             action: keep
-            regex: meeting-controller
+            regex: mc-service
           - source_labels: [__meta_kubernetes_pod_container_port_number]
             action: keep
             regex: "8081"

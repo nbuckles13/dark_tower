@@ -4,9 +4,9 @@
 
 use common::secret::SecretString;
 use common::token_manager::TokenReceiver;
-use global_controller::config::Config;
-use global_controller::routes::{self, init_metrics_recorder, AppState};
-use global_controller::services::MockMcClient;
+use gc_service::config::Config;
+use gc_service::routes::{self, init_metrics_recorder, AppState};
+use gc_service::services::MockMcClient;
 use sqlx::PgPool;
 use std::collections::HashMap;
 use std::net::SocketAddr;

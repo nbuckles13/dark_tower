@@ -17,11 +17,11 @@ groups:
 
       - alert: GCDown
         expr: |
-          up{job="global-controller"} == 0
+          up{job="gc-service"} == 0
         for: 1m
         labels:
           severity: critical
-          service: global-controller
+          service: gc-service
           component: infrastructure
         annotations:
           summary: "Global Controller service is down"
@@ -39,7 +39,7 @@ groups:
         for: 5m
         labels:
           severity: critical
-          service: global-controller
+          service: gc-service
           component: http
         annotations:
           summary: "GC error rate above SLO ({{ $value | humanizePercentage }})"
@@ -55,7 +55,7 @@ groups:
         for: 5m
         labels:
           severity: critical
-          service: global-controller
+          service: gc-service
           component: http
         annotations:
           summary: "GC p95 latency above SLO ({{ $value }}s > 200ms)"
@@ -71,7 +71,7 @@ groups:
         for: 5m
         labels:
           severity: critical
-          service: global-controller
+          service: gc-service
           component: mc-assignment
         annotations:
           summary: "MC assignment p95 latency above SLO ({{ $value }}s > 20ms)"
@@ -89,7 +89,7 @@ groups:
         for: 1m
         labels:
           severity: critical
-          service: global-controller
+          service: gc-service
           component: database
         annotations:
           summary: "GC database connection failure ({{ $value | humanizePercentage }} error rate)"
@@ -107,7 +107,7 @@ groups:
         for: 1h
         labels:
           severity: critical
-          service: global-controller
+          service: gc-service
           component: slo
         annotations:
           summary: "GC error budget burning at {{ $value }}x rate"
@@ -125,14 +125,14 @@ groups:
       - alert: GCHighMemory
         expr: |
           (
-            container_memory_usage_bytes{pod=~"global-controller-.*"}
+            container_memory_usage_bytes{pod=~"gc-service-.*"}
             /
-            container_spec_memory_limit_bytes{pod=~"global-controller-.*"}
+            container_spec_memory_limit_bytes{pod=~"gc-service-.*"}
           ) > 0.85
         for: 10m
         labels:
           severity: warning
-          service: global-controller
+          service: gc-service
           component: infrastructure
         annotations:
           summary: "GC memory usage high ({{ $value | humanizePercentage }})"
@@ -142,11 +142,11 @@ groups:
 
       - alert: GCHighCPU
         expr: |
-          rate(container_cpu_usage_seconds_total{pod=~"global-controller-.*"}[5m]) > 0.80
+          rate(container_cpu_usage_seconds_total{pod=~"gc-service-.*"}[5m]) > 0.80
         for: 5m
         labels:
           severity: warning
-          service: global-controller
+          service: gc-service
           component: infrastructure
         annotations:
           summary: "GC CPU usage high ({{ $value | humanizePercentage }})"
@@ -164,7 +164,7 @@ groups:
         for: 5m
         labels:
           severity: warning
-          service: global-controller
+          service: gc-service
           component: mc-assignment
         annotations:
           summary: "MC assignment failure rate high ({{ $value | humanizePercentage }})"
@@ -180,7 +180,7 @@ groups:
         for: 5m
         labels:
           severity: warning
-          service: global-controller
+          service: gc-service
           component: database
         annotations:
           summary: "GC database queries slow (p99: {{ $value }}s > 50ms)"
@@ -198,7 +198,7 @@ groups:
         for: 5m
         labels:
           severity: warning
-          service: global-controller
+          service: gc-service
           component: auth
         annotations:
           summary: "GC token refresh failure rate high ({{ $value | humanizePercentage }})"
@@ -216,7 +216,7 @@ groups:
         for: 6h
         labels:
           severity: warning
-          service: global-controller
+          service: gc-service
           component: slo
         annotations:
           summary: "GC error budget burning at {{ $value }}x rate"
@@ -226,11 +226,11 @@ groups:
 
       - alert: GCPodRestartingFrequently
         expr: |
-          rate(kube_pod_container_status_restarts_total{pod=~"global-controller-.*"}[1h]) > 0.016
+          rate(kube_pod_container_status_restarts_total{pod=~"gc-service-.*"}[1h]) > 0.016
         for: 5m
         labels:
           severity: warning
-          service: global-controller
+          service: gc-service
           component: infrastructure
         annotations:
           summary: "GC pod {{ $labels.pod }} restarting frequently"

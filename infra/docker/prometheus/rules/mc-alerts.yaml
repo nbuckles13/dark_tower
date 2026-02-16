@@ -17,11 +17,11 @@ groups:
 
       - alert: MCDown
         expr: |
-          up{job="meeting-controller"} == 0
+          up{job="mc-service"} == 0
         for: 1m
         labels:
           severity: critical
-          service: meeting-controller
+          service: mc-service
           component: infrastructure
         annotations:
           summary: "Meeting Controller service is down"
@@ -35,7 +35,7 @@ groups:
         for: 0m
         labels:
           severity: critical
-          service: meeting-controller
+          service: mc-service
           component: actor-system
         annotations:
           summary: "MC actor panic detected ({{ $labels.actor_type }})"
@@ -49,7 +49,7 @@ groups:
         for: 2m
         labels:
           severity: critical
-          service: meeting-controller
+          service: mc-service
           component: actor-system
         annotations:
           summary: "MC mailbox depth critical ({{ $labels.actor_type }}: {{ $value }})"
@@ -65,7 +65,7 @@ groups:
         for: 5m
         labels:
           severity: critical
-          service: meeting-controller
+          service: mc-service
           component: message-processing
         annotations:
           summary: "MC p95 message processing latency above SLO ({{ $value }}s > 500ms)"
@@ -83,7 +83,7 @@ groups:
         for: 5m
         labels:
           severity: critical
-          service: meeting-controller
+          service: mc-service
           component: message-processing
         annotations:
           summary: "MC message drop rate above SLO ({{ $value | humanizePercentage }})"
@@ -101,7 +101,7 @@ groups:
         for: 2m
         labels:
           severity: critical
-          service: meeting-controller
+          service: mc-service
           component: gc-integration
         annotations:
           summary: "MC-GC heartbeat failures ({{ $value | humanizePercentage }} error rate)"
@@ -122,7 +122,7 @@ groups:
         for: 5m
         labels:
           severity: warning
-          service: meeting-controller
+          service: mc-service
           component: actor-system
         annotations:
           summary: "MC mailbox depth elevated ({{ $labels.actor_type }}: {{ $value }})"
@@ -133,14 +133,14 @@ groups:
       - alert: MCHighMemory
         expr: |
           (
-            container_memory_usage_bytes{pod=~"meeting-controller-.*"}
+            container_memory_usage_bytes{pod=~"mc-service-.*"}
             /
-            container_spec_memory_limit_bytes{pod=~"meeting-controller-.*"}
+            container_spec_memory_limit_bytes{pod=~"mc-service-.*"}
           ) > 0.85
         for: 10m
         labels:
           severity: warning
-          service: meeting-controller
+          service: mc-service
           component: infrastructure
         annotations:
           summary: "MC memory usage high ({{ $value | humanizePercentage }})"
@@ -150,11 +150,11 @@ groups:
 
       - alert: MCHighCPU
         expr: |
-          rate(container_cpu_usage_seconds_total{pod=~"meeting-controller-.*"}[5m]) > 0.80
+          rate(container_cpu_usage_seconds_total{pod=~"mc-service-.*"}[5m]) > 0.80
         for: 5m
         labels:
           severity: warning
-          service: meeting-controller
+          service: mc-service
           component: infrastructure
         annotations:
           summary: "MC CPU usage high ({{ $value | humanizePercentage }})"
@@ -168,7 +168,7 @@ groups:
         for: 5m
         labels:
           severity: warning
-          service: meeting-controller
+          service: mc-service
           component: webtransport
         annotations:
           summary: "MC has active meetings but no connections"
@@ -183,7 +183,7 @@ groups:
         for: 10m
         labels:
           severity: warning
-          service: meeting-controller
+          service: mc-service
           component: meeting-lifecycle
         annotations:
           summary: "MC has meetings but no message processing"
@@ -201,7 +201,7 @@ groups:
         for: 5m
         labels:
           severity: warning
-          service: meeting-controller
+          service: mc-service
           component: gc-integration
         annotations:
           summary: "MC-GC heartbeat failure rate elevated ({{ $value | humanizePercentage }})"
@@ -211,11 +211,11 @@ groups:
 
       - alert: MCPodRestartingFrequently
         expr: |
-          rate(kube_pod_container_status_restarts_total{pod=~"meeting-controller-.*"}[1h]) > 0.016
+          rate(kube_pod_container_status_restarts_total{pod=~"mc-service-.*"}[1h]) > 0.016
         for: 5m
         labels:
           severity: warning
-          service: meeting-controller
+          service: mc-service
           component: infrastructure
         annotations:
           summary: "MC pod {{ $labels.pod }} restarting frequently"
@@ -229,7 +229,7 @@ groups:
         for: 10m
         labels:
           severity: warning
-          service: meeting-controller
+          service: mc-service
           component: capacity
         annotations:
           summary: "MC approaching capacity ({{ $value }} active meetings)"

@@ -151,7 +151,7 @@
             "uid": "loki"
           },
           "editorMode": "code",
-          "expr": "sum by(level) (count_over_time({app=\"meeting-controller\"}[5m]))",
+          "expr": "sum by(level) (count_over_time({app=\"mc-service\"}[5m]))",
           "legendFormat": "{{level}}",
           "queryType": "range",
           "refId": "A"
@@ -190,7 +190,7 @@
             "uid": "loki"
           },
           "editorMode": "code",
-          "expr": "{app=\"meeting-controller\", pod=~\"$pod\", level=~\"$level\"}",
+          "expr": "{app=\"mc-service\", pod=~\"$pod\", level=~\"$level\"}",
           "queryType": "range",
           "refId": "A"
         }
@@ -228,7 +228,7 @@
             "uid": "loki"
           },
           "editorMode": "code",
-          "expr": "{app=\"meeting-controller\", level=\"ERROR\"}",
+          "expr": "{app=\"mc-service\", level=\"ERROR\"}",
           "queryType": "range",
           "refId": "A"
         }
@@ -266,7 +266,7 @@
             "uid": "loki"
           },
           "editorMode": "code",
-          "expr": "{app=\"meeting-controller\", level=\"WARN\"}",
+          "expr": "{app=\"mc-service\", level=\"WARN\"}",
           "queryType": "range",
           "refId": "A"
         }
@@ -279,7 +279,7 @@
   "schemaVersion": 38,
   "style": "dark",
   "tags": [
-    "meeting-controller",
+    "mc-service",
     "logs"
   ],
   "templating": {
@@ -299,7 +299,7 @@
         "query": {
           "label": "pod",
           "refId": "LokiVariableQueryEditor-VariableQuery",
-          "stream": "{app=\"meeting-controller\"}",
+          "stream": "{app=\"mc-service\"}",
           "type": 1
         },
         "refresh": 1,

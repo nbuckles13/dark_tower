@@ -1,7 +1,7 @@
 # Global Controller Metrics Catalog
 
-**Service**: Global Controller (global-controller)
-**Implementation**: `crates/global-controller/src/observability/metrics.rs`
+**Service**: Global Controller (gc-service)
+**Implementation**: `crates/gc-service/src/observability/metrics.rs`
 **Job Label**: `gc-service-local` (local development), `gc-service` (production)
 
 All GC service metrics follow ADR-0011 naming conventions with the `gc_` prefix.
@@ -322,5 +322,5 @@ All GC service metrics follow strict cardinality bounds per ADR-0011:
 
 - **ADR-0011**: Observability standards and metric naming conventions
 - **ADR-0010**: GC-MC integration and SLO requirements
-- **Implementation**: `crates/global-controller/src/observability/metrics.rs`
+- **Implementation**: `crates/gc-service/src/observability/metrics.rs`
 - **Dashboard**: `infra/grafana/dashboards/gc-service.json` (TODO)

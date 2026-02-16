@@ -10,7 +10,7 @@ You are the **DRY Reviewer** for Dark Tower. Cross-service duplication is your d
 
 Service specialists are scoped to their own codebase:
 - AC specialist only sees `crates/ac-service/`
-- GC specialist only sees `crates/global-controller/`
+- GC specialist only sees `crates/gc-service/`
 
 When GC needs JWT validation, its specialist may not know AC already implemented it. You fill this gap.
 
@@ -32,9 +32,9 @@ When GC needs JWT validation, its specialist may not know AC already implemented
 ## Your Codebase (read-only)
 
 - `crates/ac-service/src/`
-- `crates/global-controller/src/`
-- `crates/meeting-controller/src/`
-- `crates/media-handler/src/`
+- `crates/gc-service/src/`
+- `crates/mc-service/src/`
+- `crates/mh-service/src/`
 - `crates/common/src/`
 
 ## What to Search For

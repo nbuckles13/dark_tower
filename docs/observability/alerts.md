@@ -68,13 +68,13 @@ All alert rules are stored in `infra/docker/prometheus/rules/` and loaded by Pro
 
 **PromQL**:
 ```promql
-up{job="global-controller"} == 0
+up{job="gc-service"} == 0
 for: 1m
 ```
 
 **Response**:
 1. Check GC pod status (`kubectl get pods`)
-2. Check deployment status (`kubectl describe deployment global-controller`)
+2. Check deployment status (`kubectl describe deployment gc-service`)
 3. Review logs from crashed pods
 4. Escalate to platform team if Kubernetes issue
 
@@ -213,9 +213,9 @@ for: 1h
 **PromQL**:
 ```promql
 (
-  container_memory_usage_bytes{pod=~"global-controller-.*"}
+  container_memory_usage_bytes{pod=~"gc-service-.*"}
   /
-  container_spec_memory_limit_bytes{pod=~"global-controller-.*"}
+  container_spec_memory_limit_bytes{pod=~"gc-service-.*"}
 ) > 0.85
 for: 10m
 ```
@@ -237,7 +237,7 @@ for: 10m
 
 **PromQL**:
 ```promql
-rate(container_cpu_usage_seconds_total{pod=~"global-controller-.*"}[5m]) > 0.80
+rate(container_cpu_usage_seconds_total{pod=~"gc-service-.*"}[5m]) > 0.80
 for: 5m
 ```
 
@@ -355,7 +355,7 @@ for: 6h
 
 **PromQL**:
 ```promql
-rate(kube_pod_container_status_restarts_total{pod=~"global-controller-.*"}[1h]) > 0.016
+rate(kube_pod_container_status_restarts_total{pod=~"gc-service-.*"}[1h]) > 0.016
 for: 5m
 ```
 
@@ -557,14 +557,14 @@ Before deploying alerts, test:
    ```bash
    # Test query against Prometheus
    curl -G 'http://localhost:9090/api/v1/query' \
-     --data-urlencode 'query=up{job="global-controller"} == 0'
+     --data-urlencode 'query=up{job="gc-service"} == 0'
    ```
 
 2. **Alert Simulation**: Use `amtool` to simulate alerts
    ```bash
    amtool alert add alertname=GCDown \
      severity=critical \
-     service=global-controller
+     service=gc-service
    ```
 
 3. **Runbook Validation**: Verify runbook exists and is accessible

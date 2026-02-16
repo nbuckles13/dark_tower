@@ -6,7 +6,7 @@
 
 ## Gotcha: Health Endpoint Changes Break Tests in Multiple Locations
 **Added**: 2026-02-06
-**Related files**: `crates/global-controller/tests/auth_tests.rs`, `crates/global-controller/tests/health_tests.rs`, `crates/gc-test-utils/src/server_harness.rs`
+**Related files**: `crates/gc-service/tests/auth_tests.rs`, `crates/gc-service/tests/health_tests.rs`, `crates/gc-test-utils/src/server_harness.rs`
 
 When `/health` endpoint behavior changes (e.g., from JSON to plain text "OK" for Kubernetes liveness probes), tests in multiple locations may break:
 1. Test utilities (`*-test-utils/src/server_harness.rs`)
@@ -59,5 +59,16 @@ Custom log targets using dot separators (e.g., `target: "gc.task.health_checker"
 **Impact in Dark Tower**: All GC background task logs using `target: "gc.task.*"` are **silently filtered out** under the default `EnvFilter` (`"global_controller=debug,tower_http=debug"`). This affects `health_checker.rs`, `mh_health_checker.rs`, and `assignment_cleanup.rs`. The logs only appear if someone explicitly sets `RUST_LOG=gc.task.health_checker=debug`. This means startup/shutdown lifecycle logs for background tasks have never been visible under default configuration.
 
 **Recommendation**: Either (a) add `gc=debug` to the default filter directive, or (b) stop using custom dot-separated targets and let logs use the default `module_path!()` target, which naturally falls under the `global_controller` hierarchy.
+
+---
+
+### Multi-Value Regex Fields Survive Partial Renames
+**Discovered**: 2026-02-16 (service rename: global-controller -> gc-service, meeting-controller -> mc-service)
+
+Grafana dashboard queries that match multiple services in a single regex (e.g., `{app=~"ac-service|global-controller|meeting-controller"}`) are vulnerable to partial renames. During the service rename, `meeting-controller` was correctly updated to `mc-service` in `errors-overview.json` line 418, but `global-controller` in the same regex was missed. A simple find-and-replace for one old name does not guarantee the adjacent old name in the same field was also caught.
+
+**Why it happens**: When doing bulk renames, each old name is typically searched/replaced independently. If the regex contains multiple old names on a single line, each replacement pass must independently match its target -- but a reviewer (or automated tool) checking "did we rename all `meeting-controller` references?" will see this line as clean, while a check for `global-controller` might also pass if the tool stops at the first match per line.
+
+**Prevention**: After any service rename, grep the entire `infra/grafana/` directory for ALL old names simultaneously (e.g., `grep -E "global-controller|meeting-controller|media-handler"`), not one at a time. Pay special attention to multi-service dashboards like `errors-overview.json` that aggregate across services.
 
 ---

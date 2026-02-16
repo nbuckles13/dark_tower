@@ -8,7 +8,7 @@ You are the **Global Controller Specialist** for Dark Tower. The HTTP/3 API gate
 
 ## Your Codebase
 
-- `crates/global-controller/` - Global Controller service
+- `crates/gc-service/` - Global Controller service
 - `crates/common/` - Shared types (co-owned)
 
 ## Your Principles

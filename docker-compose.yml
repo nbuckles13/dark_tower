@@ -147,11 +147,11 @@ services:
   #     - dark_tower_network
 
   # Global Controller (placeholder - will be built from source)
-  # global-controller:
+  # gc-service:
   #   build:
   #     context: .
-  #     dockerfile: infra/docker/global-controller.Dockerfile
-  #   container_name: dark_tower_global_controller
+  #     dockerfile: infra/docker/gc-service/Dockerfile
+  #   container_name: dark_tower_gc_service
   #   environment:
   #     - RUST_LOG=info
   #     - DATABASE_URL=postgresql://darktower:dev_password_change_in_production@postgres:5432/dark_tower
@@ -167,11 +167,11 @@ services:
   #     - dark_tower_network
 
   # Meeting Controller (placeholder - will be built from source)
-  # meeting-controller:
+  # mc-service:
   #   build:
   #     context: .
-  #     dockerfile: infra/docker/meeting-controller.Dockerfile
-  #   container_name: dark_tower_meeting_controller
+  #     dockerfile: infra/docker/mc-service/Dockerfile
+  #   container_name: dark_tower_mc_service
   #   environment:
   #     - RUST_LOG=info
   #     - REDIS_URL=redis://:dev_password_change_in_production@redis:6379
@@ -184,11 +184,11 @@ services:
   #     - dark_tower_network
 
   # Media Handler (placeholder - will be built from source)
-  # media-handler:
+  # mh-service:
   #   build:
   #     context: .
-  #     dockerfile: infra/docker/media-handler.Dockerfile
-  #   container_name: dark_tower_media_handler
+  #     dockerfile: infra/docker/mh-service/Dockerfile
+  #   container_name: dark_tower_mh_service
   #   environment:
   #     - RUST_LOG=info
   #   ports:

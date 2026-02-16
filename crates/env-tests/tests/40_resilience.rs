@@ -68,20 +68,20 @@ async fn test_redis_connection_loss_recovery() {
 /// Test that pods with allowed labels can reach the AC service.
 /// This is a POSITIVE test to verify NetworkPolicy allows expected traffic.
 ///
-/// The canary uses `app=global-controller` label to match the NetworkPolicy's
-/// ingress rules, which allow traffic from global-controller pods.
+/// The canary uses `app=gc-service` label to match the NetworkPolicy's
+/// ingress rules, which allow traffic from gc-service pods.
 ///
 /// If this test fails, it indicates either:
 /// 1. The AC service is not running or not healthy
-/// 2. The NetworkPolicy ingress rules don't allow global-controller traffic
+/// 2. The NetworkPolicy ingress rules don't allow gc-service traffic
 /// 3. The canary pod deployment failed
 #[tokio::test]
 #[serial]
 async fn test_same_namespace_connectivity() {
     // Deploy a canary pod with labels that match the NetworkPolicy ingress rules
-    // The AC NetworkPolicy allows traffic from pods with app=global-controller
+    // The AC NetworkPolicy allows traffic from pods with app=gc-service
     let config = CanaryConfig {
-        labels: "app=global-controller,test=network-policy".to_string(),
+        labels: "app=gc-service,test=network-policy".to_string(),
     };
 
     let canary = CanaryPod::deploy_with_config("dark-tower", config)
@@ -99,7 +99,7 @@ async fn test_same_namespace_connectivity() {
     // Now assert
     assert!(
         can_reach,
-        "Canary pod with app=global-controller label should be able to reach AC service at {}. \
+        "Canary pod with app=gc-service label should be able to reach AC service at {}. \
          This validates NetworkPolicy allows expected ingress traffic. \
          If this fails, check: 1) AC service is running, 2) NetworkPolicy ingress rules, \
          3) Pod labels match NetworkPolicy selectors.",

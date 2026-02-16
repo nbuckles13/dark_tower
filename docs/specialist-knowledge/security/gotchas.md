@@ -102,7 +102,7 @@ Custom Debug implementations only activate when `{:?}` formatting is used. Crede
 
 ## Gotcha: Service Tokens in Registration Structs Often Missed
 **Added**: 2026-01-24 (Updated: 2026-01-31)
-**Related files**: `crates/global-controller/src/grpc/mh_service.rs`, `crates/global-controller/src/repositories/media_handlers.rs`
+**Related files**: `crates/gc-service/src/grpc/mh_service.rs`, `crates/gc-service/src/repositories/media_handlers.rs`
 
 When implementing service registration (handlers, workers, external services), the authentication token field is often stored as plain `String` because the focus is on the registration logic rather than data protection. This is especially common in: (1) Registry structs that cache registered services, (2) DTO structs for registration requests, (3) Handler metadata stored in HashMaps. Pattern: When reviewing registration flows, explicitly check for token/secret fields and verify they use `SecretString`. The field names vary: `service_token`, `auth_token`, `bearer_token`, `api_key`, `secret`.
 
@@ -140,7 +140,7 @@ Error messages returned to clients should never include internal identifiers (se
 
 ## Gotcha: Connection URLs with Embedded Credentials in Logs
 **Added**: 2026-01-25
-**Related files**: `crates/meeting-controller/src/main.rs`, `crates/global-controller/src/main.rs`
+**Related files**: `crates/mc-service/src/main.rs`, `crates/gc-service/src/main.rs`
 
 Database and cache connection URLs often contain credentials (e.g., `redis://user:password@host:6379`). These URLs are commonly logged during startup for debugging ("Connecting to redis://..."). Never log the full URL. Pattern:
 
@@ -154,7 +154,7 @@ Common locations where this appears: (1) `main.rs` startup logs, (2) Connection 
 
 ## Gotcha: Validation Scope for SecretBox Size Checks
 **Added**: 2026-01-28
-**Related files**: `crates/meeting-controller/src/actors/session.rs`
+**Related files**: `crates/mc-service/src/actors/session.rs`
 
 When validating SecretBox size (e.g., asserting minimum length for HKDF), call `.expose_secret().len()` ONLY for the validation. The exposed bytes should not be stored, manipulated, or copied outside the validation context. Pattern:
 
@@ -172,7 +172,7 @@ let raw_bytes = master_secret.expose_secret(); // Don't store this!
 
 ## Gotcha: Cross-Crate Metrics Dependencies Create Observability Gaps
 **Added**: 2026-02-09
-**Related files**: `crates/global-controller/src/observability/metrics.rs`, `crates/common/src/token_manager.rs`
+**Related files**: `crates/gc-service/src/observability/metrics.rs`, `crates/common/src/token_manager.rs`
 
 Shared crates (e.g., `common`) cannot depend on service-specific observability modules (e.g., `global-controller/observability`). This creates gaps where security-relevant operations in shared code lack metrics.
 
@@ -190,7 +190,7 @@ Shared crates (e.g., `common`) cannot depend on service-specific observability m
 
 ## Gotcha: Credential Fallbacks Bypass Fail-Fast Security
 **Added**: 2026-01-31
-**Related files**: `crates/global-controller/src/main.rs`
+**Related files**: `crates/gc-service/src/main.rs`
 
 Using `.unwrap_or_default()`, `.unwrap_or("")`, or similar fallback patterns on required credentials silently allows services to start with empty/invalid authentication. Pattern to avoid:
 
@@ -238,7 +238,7 @@ const MAX_JWT_SIZE: usize = 4096; // Different from common!
 
 ## Gotcha: Staleness Threshold u64-to-i64 Cast Can Bypass Health Checks
 **Added**: 2026-02-12
-**Related files**: `crates/global-controller/src/tasks/generic_health_checker.rs`, `crates/global-controller/src/tasks/health_checker.rs`
+**Related files**: `crates/gc-service/src/tasks/generic_health_checker.rs`, `crates/gc-service/src/tasks/health_checker.rs`
 
 The health checker functions accept `staleness_threshold_seconds: u64` but cast to `i64` before passing to the repository (`staleness_threshold_seconds as i64`). If the value exceeds `i64::MAX` (2^63 - 1), the cast wraps to a negative number, which would cause the SQL `NOW() - INTERVAL '{threshold} seconds'` comparison to look into the future, effectively marking ALL entities as stale (or none, depending on the query logic).
 
@@ -257,7 +257,7 @@ Or use `i64` throughout the API. This is pre-existing tech debt, not introduced 
 
 ## Gotcha: `.instrument()` vs `#[instrument]` — Different Security Implications
 **Added**: 2026-02-12
-**Related files**: `crates/global-controller/src/tasks/health_checker.rs`, `crates/global-controller/src/tasks/mh_health_checker.rs`
+**Related files**: `crates/gc-service/src/tasks/health_checker.rs`, `crates/gc-service/src/tasks/mh_health_checker.rs`
 
 These two tracing patterns have different security behavior:
 
@@ -270,5 +270,24 @@ These two tracing patterns have different security behavior:
 **Common false alarm**: Seeing a function that takes `PgPool` without `#[instrument(skip_all)]` and flagging it. If the function never has `#[instrument]`, parameters are not captured. Only flag if `#[instrument]` is present WITHOUT `skip_all`.
 
 **Risk if someone adds `#[instrument]` later**: If a developer adds `#[instrument]` to the wrapper for debugging and forgets `skip_all`, `PgPool` would be captured. This is LOW risk because `PgPool`'s `Debug` impl does not contain credentials, but it's worth noting in code review comments when this pattern is used.
+
+---
+
+## Gotcha: Service Rename Breaks 4-Layer Credential Chain
+**Added**: 2026-02-16
+**Related files**: `infra/kind/scripts/setup.sh`, `infra/services/gc-service/secret.yaml`, `infra/services/gc-service/deployment.yaml`, `infra/services/mc-service/secret.yaml`, `infra/services/mc-service/deployment.yaml`
+
+Renaming a service's OAuth client_id requires synchronized changes across 4 layers, and a mismatch at any layer causes silent authentication failures:
+
+1. **SQL seed** (`setup.sh`): `client_id` column + new bcrypt hash for new plaintext secret
+2. **K8s Secret** (`secret.yaml`): Plaintext secret value matching what was hashed
+3. **K8s Deployment** (`deployment.yaml`): `CLIENT_ID` env var matching the SQL `client_id`
+4. **K8s Deployment** (`deployment.yaml`): `CLIENT_SECRET` env var referencing the correct Secret key
+
+**Why this is dangerous**: If the `client_id` in the deployment doesn't match the SQL seed, the service starts successfully but all OAuth token requests fail with `invalid_client`. The service appears healthy (health probes pass) but cannot authenticate to other services. This violates zero-trust silently.
+
+**What happened**: The semantic guard caught a mismatch between the credential SQL and the secret.yaml values during this rename. Without that guard, the credentials would have been inconsistent.
+
+**Detection during review**: For any rename touching OAuth credentials, verify the chain: `deployment CLIENT_ID` == `setup.sh INSERT client_id` AND `secret.yaml plaintext` hashes to `setup.sh client_secret_hash`. The bcrypt hashes MUST be regenerated when the plaintext secret changes.
 
 ---

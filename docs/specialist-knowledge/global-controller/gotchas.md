@@ -6,7 +6,7 @@ Mistakes to avoid and edge cases discovered in the Global Controller codebase.
 
 ## Gotcha: AC JWKS URL Must Be Reachable
 **Added**: 2026-01-14
-**Related files**: `crates/global-controller/src/config.rs`
+**Related files**: `crates/gc-service/src/config.rs`
 
 GC validates JWTs using AC's JWKS endpoint. AC_JWKS_URL must be reachable at runtime. In tests, use wiremock to mock the endpoint. In production, ensure network connectivity to AC.
 
@@ -14,7 +14,7 @@ GC validates JWTs using AC's JWKS endpoint. AC_JWKS_URL must be reachable at run
 
 ## Gotcha: Clock Skew Must Match AC Configuration
 **Added**: 2026-01-14
-**Related files**: `crates/global-controller/src/config.rs`
+**Related files**: `crates/gc-service/src/config.rs`
 
 JWT_CLOCK_SKEW_SECONDS should match AC's value (default 300s). Mismatched skew can cause valid tokens to be rejected. Both services should read from a shared configuration source in production.
 
@@ -22,7 +22,7 @@ JWT_CLOCK_SKEW_SECONDS should match AC's value (default 300s). Mismatched skew c
 
 ## Gotcha: kid Extraction Happens BEFORE Signature Validation
 **Added**: 2026-01-14
-**Related files**: `crates/global-controller/src/auth/jwt.rs`
+**Related files**: `crates/gc-service/src/auth/jwt.rs`
 
 The kid is extracted from JWT header without signature verification. This is correct for key lookup but:
 - Never trust kid value
@@ -34,7 +34,7 @@ If JWK doesn't exist, return "invalid or expired" not "kid not found" (info leak
 
 ## Gotcha: JWKS Cache TTL Affects Key Rotation Latency
 **Added**: 2026-01-14
-**Related files**: `crates/global-controller/src/auth/jwks.rs`
+**Related files**: `crates/gc-service/src/auth/jwks.rs`
 
 5-minute cache TTL means AC key rotations take up to 5 minutes to propagate. If AC rotates keys and GC still has old key cached, tokens signed with new key will fail until cache expires. This is intentional tradeoff:
 - Shorter TTL (1 min): Faster rotation but higher load on AC
@@ -45,7 +45,7 @@ Verify TTL matches operational requirements during deployment.
 
 ## Gotcha: Generic Error Messages Hide JWT Validation Details
 **Added**: 2026-01-14
-**Related files**: `crates/global-controller/src/auth/jwt.rs`
+**Related files**: `crates/gc-service/src/auth/jwt.rs`
 
 All JWT validation failures return "The access token is invalid or expired" to clients. This is intentional - don't leak:
 - Whether kid was found
@@ -57,7 +57,7 @@ Log detailed error internally, but never include in HTTP response. This prevents
 
 ## Gotcha: Algorithm Confusion Attacks via alg:none
 **Added**: 2026-01-14
-**Related files**: `crates/global-controller/src/auth/jwt.rs`
+**Related files**: `crates/gc-service/src/auth/jwt.rs`
 
 The jsonwebtoken library defaults to accepting `alg:none` if not explicitly pinned. ALWAYS use `Validation::new(Algorithm::EdDSA)` - never `Validation::default()`. Test for this specifically:
 - Token with `alg:none` should be rejected
@@ -68,7 +68,7 @@ The jsonwebtoken library defaults to accepting `alg:none` if not explicitly pinn
 
 ## Gotcha: GC_CLIENT_ID and GC_CLIENT_SECRET Required for AC Communication
 **Added**: 2026-01-15, **Updated**: 2026-02-11
-**Related files**: `crates/global-controller/src/config.rs`, `crates/global-controller/src/main.rs`
+**Related files**: `crates/gc-service/src/config.rs`, `crates/gc-service/src/main.rs`
 
 GC_CLIENT_ID and GC_CLIENT_SECRET env vars are required for OAuth 2.0 client credentials flow with AC. TokenManager spawns at startup with 30-second timeout - missing credentials cause startup failure. In tests, create mock TokenReceiver via `TokenReceiver::from_watch_receiver()`. Production MUST set these via secrets management (Kubernetes secrets, AWS Secrets Manager, etc.). The legacy GC_SERVICE_TOKEN static token approach was fully replaced in February 2026.
 
@@ -76,7 +76,7 @@ GC_CLIENT_ID and GC_CLIENT_SECRET env vars are required for OAuth 2.0 client cre
 
 ## Gotcha: Captcha Validation is Placeholder
 **Added**: 2026-01-15
-**Related files**: `crates/global-controller/src/handlers/meetings.rs`
+**Related files**: `crates/gc-service/src/handlers/meetings.rs`
 
 Guest token endpoint has TODO placeholder for captcha validation. Currently accepts any captcha_token value. Phase 3+ must integrate real captcha provider (reCAPTCHA, hCaptcha). Do not deploy guest access without implementing this security control.
 
@@ -84,7 +84,7 @@ Guest token endpoint has TODO placeholder for captcha validation. Currently acce
 
 ## Gotcha: JWT kid Extraction Returns None for Non-String Values
 **Added**: 2026-01-18
-**Related files**: `crates/global-controller/src/auth/jwt.rs`
+**Related files**: `crates/gc-service/src/auth/jwt.rs`
 
 The `extract_kid()` function returns `None` (not an error) when the JWT header contains a `kid` that is not a JSON string - including numeric values, null, or empty strings. This is by design: attackers may send malformed headers to probe error handling. Always handle `None` as "key not found" and return generic error message.
 
@@ -92,7 +92,7 @@ The `extract_kid()` function returns `None` (not an error) when the JWT header c
 
 ## Gotcha: PendingTokenValidation Debug Can Expose Tokens
 **Added**: 2026-01-20
-**Related files**: `crates/global-controller/src/grpc/auth_layer.rs`
+**Related files**: `crates/gc-service/src/grpc/auth_layer.rs`
 
 Deriving `Debug` on structs holding tokens exposes them in logs/panics. The `PendingTokenValidation` struct holds the raw Bearer token during async validation. Either:
 1. Use custom `Debug` impl that redacts the token field
@@ -105,7 +105,7 @@ Current implementation uses derived Debug - this is a [LOW] finding to address.
 
 ## Gotcha: Capacity Overflow Silently Clamps to i32::MAX
 **Added**: 2026-01-20
-**Related files**: `crates/global-controller/src/grpc/mc_service.rs`
+**Related files**: `crates/gc-service/src/grpc/mc_service.rs`
 
 When converting MC capacity from u32 (proto) to i32 (database), values > i32::MAX are clamped:
 ```rust
@@ -117,7 +117,7 @@ This is intentional (MC can't have 2B+ capacity), but consider logging a warning
 
 ## Gotcha: Runtime vs Compile-Time SQL Query Tradeoff
 **Added**: 2026-01-20
-**Related files**: `crates/global-controller/src/repositories/meeting_controllers.rs`
+**Related files**: `crates/gc-service/src/repositories/meeting_controllers.rs`
 
 The MC registration uses runtime queries (`sqlx::query()`) instead of compile-time macros (`sqlx::query!()`). Tradeoffs:
 - **Runtime**: More flexible, no sqlx prepare step needed, but SQL errors only caught at runtime
@@ -129,7 +129,7 @@ Current choice (runtime) was pragmatic for initial implementation. Consider migr
 
 ## Gotcha: Timestamp Casts Use `as` Instead of `try_into()`
 **Added**: 2026-01-20
-**Related files**: `crates/global-controller/src/grpc/mc_service.rs`
+**Related files**: `crates/gc-service/src/grpc/mc_service.rs`
 
 Proto timestamps are i64, but some DB/API contexts use i32 or other types. Using `as` for casting:
 ```rust
@@ -141,7 +141,7 @@ This works for timestamps (always positive, fits i64), but `try_into()` is safer
 
 ## Gotcha: PostgreSQL CTE Snapshot Isolation
 **Added**: 2026-01-21
-**Related files**: `crates/global-controller/src/repositories/meeting_assignments.rs`
+**Related files**: `crates/gc-service/src/repositories/meeting_assignments.rs`
 
 In PostgreSQL, CTEs with data-modifying statements (INSERT, UPDATE, DELETE) all execute with the same snapshot - they don't see each other's changes. If you have a CTE that updates `health_status` and another CTE that selects healthy MCs, the SELECT won't see the UPDATE's changes. Solution: Use single INSERT ON CONFLICT statements or explicit transactions with separate queries. This is different from standard CTE behavior where read-only CTEs can reference each other.
 
@@ -149,7 +149,7 @@ In PostgreSQL, CTEs with data-modifying statements (INSERT, UPDATE, DELETE) all 
 
 ## Gotcha: #[expect(dead_code)] vs #[allow(dead_code)]
 **Added**: 2026-01-21
-**Related files**: `crates/global-controller/src/repositories/meeting_controllers.rs`
+**Related files**: `crates/gc-service/src/repositories/meeting_controllers.rs`
 
 Use `#[allow(dead_code)]` not `#[expect(dead_code)]` for code that's only used in tests. The `#[expect(...)]` attribute generates a warning if the lint would NOT have fired (i.e., if the code IS used). When test modules use helper functions, the code is technically "used" during test compilation, causing `#[expect(dead_code)]` to warn. Use `#[allow(dead_code)]` which silently permits unused code without complaining when it's actually used.
 
@@ -157,7 +157,7 @@ Use `#[allow(dead_code)]` not `#[expect(dead_code)]` for code that's only used i
 
 ## Gotcha: PostgreSQL Dynamic Interval Casting
 **Added**: 2026-01-23
-**Related files**: `crates/global-controller/src/repositories/meeting_assignments.rs`
+**Related files**: `crates/gc-service/src/repositories/meeting_assignments.rs`
 
 PostgreSQL does not allow parameterized intervals directly (e.g., `INTERVAL $1 hours` fails). Use string concatenation with explicit cast: `($1 || ' hours')::INTERVAL` where `$1` is an integer. This pattern works for hours, days, minutes, etc. The parameter must be text or castable to text. Example: `WHERE assigned_at < NOW() - ($1 || ' hours')::INTERVAL` with bind value of integer hours.
 
@@ -165,7 +165,7 @@ PostgreSQL does not allow parameterized intervals directly (e.g., `INTERVAL $1 h
 
 ## Gotcha: prost Generates Simplified Enum Variant Names
 **Added**: 2026-01-24
-**Related files**: `crates/proto-gen/src/`, `crates/global-controller/src/services/mh_service.rs`
+**Related files**: `crates/proto-gen/src/`, `crates/gc-service/src/services/mh_service.rs`
 
 When prost generates Rust code from Protocol Buffers, enum variants are simplified - the enum name prefix is NOT repeated. For example, proto `enum MhRole { MH_ROLE_PRIMARY = 0; }` generates Rust `MhRole::Primary`, not `MhRole::MhRolePrimary`. This catches developers who expect the full proto name. Check generated code in `proto-gen` crate when unsure about variant names.
 
@@ -173,7 +173,7 @@ When prost generates Rust code from Protocol Buffers, enum variants are simplifi
 
 ## Gotcha: #[cfg(test)] Helpers Unavailable in Integration Tests
 **Added**: 2026-01-24
-**Related files**: `crates/global-controller/src/services/mc_client.rs`, `crates/global-controller/tests/`
+**Related files**: `crates/gc-service/src/services/mc_client.rs`, `crates/gc-service/tests/`
 
 Functions defined in `#[cfg(test)] mod tests { ... }` within a library crate are NOT visible to integration tests (`tests/*.rs`). Integration tests compile as separate crates and only see the public API. Solutions:
 1. Move test helpers to a `-test-utils` crate (preferred for reuse)
@@ -186,7 +186,7 @@ The mock trait pattern (see patterns.md) avoids this issue entirely by keeping t
 
 ## Gotcha: Error Variant Migration Requires Test Updates
 **Added**: 2026-01-28
-**Related files**: `crates/global-controller/src/errors.rs`, `crates/global-controller/src/services/ac_client.rs`
+**Related files**: `crates/gc-service/src/errors.rs`, `crates/gc-service/src/services/ac_client.rs`
 
 When changing an error variant from unit to tuple (e.g., `Internal` → `Internal(String)`), ALL usages must be updated:
 - Production code creating errors: `GcError::Internal` → `GcError::Internal(format!("...", e))`
@@ -200,7 +200,7 @@ Rust compiler catches most of these, but test pattern matching can be subtle. Us
 
 ## Gotcha: Formatter Splits Long map_err Closures
 **Added**: 2026-01-28
-**Related files**: Multiple files in `crates/global-controller/src/`
+**Related files**: Multiple files in `crates/gc-service/src/`
 
 When adding error parameter to `.map_err(|e| ...)`, the line may exceed rustfmt's default 100-char limit:
 ```rust
@@ -219,7 +219,7 @@ Always run `cargo fmt` after fixing error hiding violations. The formatter will 
 
 ## Gotcha: TokenManager Startup Timeout Blocks Server Start
 **Added**: 2026-02-11
-**Related files**: `crates/global-controller/src/main.rs`
+**Related files**: `crates/gc-service/src/main.rs`
 
 TokenManager spawns during GC startup with a 30-second timeout. If AC is unreachable or credentials are invalid, GC fails to start (returns error before binding HTTP/gRPC ports). This is intentional - GC cannot function without valid service credentials. In local dev, ensure AC is running before starting GC. In production, health checks should verify AC connectivity before routing traffic to GC. The timeout is configurable but should remain < 60s to fail fast during pod startup.
 
@@ -227,7 +227,7 @@ TokenManager spawns during GC startup with a 30-second timeout. If AC is unreach
 
 ## Gotcha: gRPC Channel Cache Has No TTL or Failure Invalidation
 **Added**: 2026-02-11
-**Related files**: `crates/global-controller/src/services/mc_client.rs`
+**Related files**: `crates/gc-service/src/services/mc_client.rs`
 
 McClient caches gRPC Channels indefinitely (`Arc<RwLock<HashMap<String, Channel>>>`). If an MC endpoint becomes permanently unreachable, the cached channel persists forever. Current implementation has no:
 - TTL-based eviction (channels never expire)
@@ -240,7 +240,7 @@ Workaround: MC registration with new endpoint creates new channel; old endpoint'
 
 ## Gotcha: Optional Dependencies with Fallback Hide Production Code in Tests
 **Added**: 2026-01-31, **Updated**: 2026-02-11
-**Related files**: `crates/global-controller/src/routes/mod.rs`, `crates/global-controller/src/handlers/meetings.rs`
+**Related files**: `crates/gc-service/src/routes/mod.rs`, `crates/gc-service/src/handlers/meetings.rs`
 
 When making a dependency optional (e.g., `mc_client: Option<Arc<dyn McClientTrait>>`) with fallback logic for tests, integration tests may exercise the fallback path instead of production code. This creates false confidence - tests pass but production code is untested. Solution: Make dependencies required in AppState (`mc_client: Arc<dyn McClientTrait>`), inject mocks in tests via the trait. All code paths then use the same logic, just with different implementations. Current GC implementation uses required dependencies - McClient and AcClient are always present in AppState.
 
@@ -248,15 +248,15 @@ When making a dependency optional (e.g., `mc_client: Option<Arc<dyn McClientTrai
 
 ## Gotcha: Binary vs Library Module Trees Are Separate
 **Added**: 2026-02-04
-**Related files**: `crates/global-controller/src/main.rs`, `crates/global-controller/src/lib.rs`
+**Related files**: `crates/gc-service/src/main.rs`, `crates/gc-service/src/lib.rs`
 
-Rust binaries (`main.rs`) have their own module tree separate from the library (`lib.rs`). Adding `pub mod observability;` to `lib.rs` does NOT make it available in `main.rs`. You must ALSO add `mod observability;` to `main.rs` for the binary to see the module. Symptom: `unresolved import` errors when trying to use modules that exist in lib.rs. Solution: Declare modules in both files, or import from the library crate (`use global_controller::observability;`).
+Rust binaries (`main.rs`) have their own module tree separate from the library (`lib.rs`). Adding `pub mod observability;` to `lib.rs` does NOT make it available in `main.rs`. You must ALSO add `mod observability;` to `main.rs` for the binary to see the module. Symptom: `unresolved import` errors when trying to use modules that exist in lib.rs. Solution: Declare modules in both files, or import from the library crate (`use gc_service::observability;`).
 
 ---
 
 ## Gotcha: Cross-Crate Metrics Cannot Use Crate-Local Recording Functions
 **Added**: 2026-02-09, **Updated**: 2026-02-09
-**Related files**: `crates/global-controller/src/observability/metrics.rs`, `crates/common/src/token_manager.rs`
+**Related files**: `crates/gc-service/src/observability/metrics.rs`, `crates/common/src/token_manager.rs`
 
 Metrics recording functions in one crate cannot be called from another crate without creating a dependency cycle. Example: GC's `record_token_refresh` cannot instrument `common::TokenManager` because `common` cannot depend on `global-controller` (would be circular).
 
@@ -273,7 +273,7 @@ Tech debt TD-GC-001 tracks this for future implementation. The chosen approach s
 
 ## Gotcha: Duration Import Not Needed with start.elapsed()
 **Added**: 2026-02-09
-**Related files**: `crates/global-controller/src/services/mc_assignment.rs`
+**Related files**: `crates/gc-service/src/services/mc_assignment.rs`
 
 When timing operations with `Instant::now()` + `start.elapsed()`, you do NOT need to import `std::time::Duration`. The `elapsed()` method returns `Duration` automatically. Importing `Duration` when you only use `elapsed()` triggers a `unused_imports` warning:
 
@@ -292,7 +292,7 @@ metrics::record_db_query("op", "success", start.elapsed()); // Returns Duration
 Only import `Duration` if you're constructing durations explicitly (e.g., `Duration::from_secs(5)`).
 ## Gotcha: Tracing `target:` Requires String Literal, Not `&'static str` Variable
 **Added**: 2026-02-12
-**Related files**: `crates/global-controller/src/tasks/generic_health_checker.rs`
+**Related files**: `crates/gc-service/src/tasks/generic_health_checker.rs`
 
 The `target:` parameter in tracing macros (`info!`, `warn!`, `error!`) must be a compile-time string literal or `const`. A `&'static str` field from a struct does NOT work — the macro expands `target:` into a `static __CALLSITE` initializer that requires const-evaluable expressions. This means you cannot parameterize log targets via struct fields or function arguments.
 
@@ -314,7 +314,7 @@ Workarounds: (1) Keep `target:` logs in thin wrappers with hardcoded literals, (
 
 ## Gotcha: Custom `gc.task.*` Log Targets Silently Filtered by Default EnvFilter
 **Added**: 2026-02-12
-**Related files**: `crates/global-controller/src/main.rs`, `crates/global-controller/src/tasks/`
+**Related files**: `crates/gc-service/src/main.rs`, `crates/gc-service/src/tasks/`
 
 The default `EnvFilter` in main.rs is `"global_controller=debug,tower_http=debug"`, which filters by target prefix using `::` module path hierarchy. Custom dot-separated targets like `target: "gc.task.health_checker"` are in a completely different namespace and do NOT match the `global_controller` directive. This means log events with custom `gc.task.*` targets were silently filtered out and never visible in default configuration.
 
@@ -324,7 +324,7 @@ Using the default `module_path!()` target (e.g., `global_controller::tasks::gene
 
 ## Gotcha: Config Structs for 1-2 Fields Are Overkill
 **Added**: 2026-02-12
-**Related files**: `crates/global-controller/src/tasks/generic_health_checker.rs`
+**Related files**: `crates/gc-service/src/tasks/generic_health_checker.rs`
 
 Avoid creating a config struct when a function only needs 1-2 simple parameters for differentiation. For example, `HealthCheckerConfig { display_name: &'static str, entity_name: &'static str }` was unnecessary when `entity_name: &'static str` as a plain parameter suffices. The `display_name` field only existed to prefix log messages (e.g., "MH " prefix), which is fragile (trailing space convention) and better handled by separate log messages in wrappers.
 
@@ -334,7 +334,7 @@ Rule of thumb: If a "config" struct has fewer than 3 fields and all are simple t
 
 ## Gotcha: `#[instrument]` on Both Wrapper and Inner Function Creates Nested Spans
 **Added**: 2026-02-12
-**Related files**: `crates/global-controller/src/tasks/generic_health_checker.rs`, `crates/global-controller/src/tasks/health_checker.rs`
+**Related files**: `crates/gc-service/src/tasks/generic_health_checker.rs`, `crates/gc-service/src/tasks/health_checker.rs`
 
 If a wrapper function has `#[instrument(skip_all, name = "gc.task.health_checker")]` and the inner generic function also has `#[instrument(skip_all)]`, every log event inside the generic function will have TWO nested spans: the wrapper's named span and the generic function's `start_generic_health_checker` span. This adds noise to traces without value.
 
@@ -344,7 +344,7 @@ Fix: Remove `#[instrument]` from the generic function entirely. Either keep it o
 
 ## Gotcha: Async Closure Lifetime Issues with `&PgPool` Parameter
 **Added**: 2026-02-12
-**Related files**: `crates/global-controller/src/tasks/generic_health_checker.rs`
+**Related files**: `crates/gc-service/src/tasks/generic_health_checker.rs`
 
 When passing a closure `Fn(&PgPool, i64) -> Fut` where `Fut` is an async future, Rust cannot express the lifetime relationship between the `&PgPool` borrow and the returned future in the `Fn` trait bound. This causes `lifetime may not live long enough` errors.
 

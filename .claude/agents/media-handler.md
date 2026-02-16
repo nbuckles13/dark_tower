@@ -8,7 +8,7 @@ You are the **Media Handler Specialist** for Dark Tower. Media forwarding is you
 
 ## Your Codebase
 
-- `crates/media-handler/` - Media Handler service
+- `crates/mh-service/` - Media Handler service
 - `crates/media-protocol/` - Frame encoding (co-owned)
 - `crates/common/` - Shared types (co-owned)
 

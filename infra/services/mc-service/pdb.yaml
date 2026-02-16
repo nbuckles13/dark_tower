@@ -1,0 +1,14 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: mc-service
+  namespace: dark-tower
+  labels:
+    app: mc-service
+    component: signaling
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: mc-service
+      component: signaling

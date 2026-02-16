@@ -6,9 +6,10 @@ Mistakes to avoid, learned from experience in Dark Tower infrastructure work.
 
 ## Gotcha: NetworkPolicy Tests Require Matching Pod Labels
 **Added**: 2026-01-13
+**Updated**: 2026-02-16
 **Related files**: `crates/env-tests/tests/40_resilience.rs`, `infra/services/ac-service/network-policy.yaml`
 
-NetworkPolicy selects pods by label, not by namespace alone. A canary pod with app=canary label will be blocked by a NetworkPolicy that only allows app=global-controller in podSelector.matchLabels. Symptom: positive test fails (same-namespace connectivity blocked). Solution: configure canary pod labels to match allowed ingress. Lesson: review actual NetworkPolicy rules before writing connectivity tests.
+NetworkPolicy selects pods by label, not by namespace alone. A canary pod with app=canary label will be blocked by a NetworkPolicy that only allows app=gc-service in podSelector.matchLabels. Symptom: positive test fails (same-namespace connectivity blocked). Solution: configure canary pod labels to match allowed ingress. Lesson: review actual NetworkPolicy rules before writing connectivity tests.
 
 ---
 
@@ -22,7 +23,7 @@ Using redis-cli -a $REDIS_PASSWORD in liveness/readiness probes exposes the pass
 
 ## Gotcha: UDP Services Require Explicit Protocol in K8s Service
 **Added**: 2026-01-31
-**Related files**: `infra/services/meeting-controller/service.yaml`
+**Related files**: `infra/services/mc-service/service.yaml`
 
 Kubernetes Services default to TCP protocol. For UDP-based services like WebTransport (QUIC), you must explicitly specify protocol: UDP in the Service port definition, or traffic will not route correctly. Symptom: UDP clients cannot connect via ClusterIP; works with hostNetwork but not via Service. Solution: explicitly declare UDP protocol in ports section. Lesson: when adding non-HTTP services, always verify the protocol field matches the actual transport.
 
@@ -54,6 +55,14 @@ When running local development with Telepresence or direct port-forwards, old po
 
 ## Gotcha: Service Readiness Probes Must Match Actual Endpoints
 **Added**: 2026-02-11
-**Related files**: `infra/services/global-controller/deployment.yaml`
+**Related files**: `infra/services/gc-service/deployment.yaml`
 
 Kubernetes readiness probes fail if the path/port doesn't exist, preventing pod from receiving traffic. Symptom: pods Running but not Ready, service has no endpoints. Solution: ensure readinessProbe httpGet path matches actual health endpoint (e.g., /health on correct port), and service starts health endpoint before probe initialDelaySeconds expires. Lesson: verify probe configuration matches actual application endpoints, use adequate initialDelaySeconds to allow service startup.
+
+---
+
+## Gotcha: Cross-Cutting Renames Must Distinguish Infrastructure Names from Runtime Identifiers
+**Added**: 2026-02-16
+**Related files**: `infra/services/gc-service/secret.yaml`, `infra/services/gc-service/deployment.yaml`, `infra/kind/scripts/setup.sh`
+
+When renaming services across K8s manifests, `replace_all` on YAML files will change both infrastructure identifiers (metadata.name, labels, image refs) AND runtime values (OAuth client_id, client_secret plaintext). These are different concerns: infrastructure names are K8s resource identifiers, while runtime values are database-seeded credentials. If you change credential values in secret.yaml/deployment.yaml, you must also update the seed SQL in setup.sh (including regenerating bcrypt hashes for new plaintext secrets). Symptom: services start but fail OAuth authentication because client_id/client_secret in K8s secrets don't match what was seeded in the database. Lesson: for cross-cutting renames, review each `replace_all` target to ensure runtime credential values are handled consistently across all injection points (K8s manifests, setup scripts, test fixtures).

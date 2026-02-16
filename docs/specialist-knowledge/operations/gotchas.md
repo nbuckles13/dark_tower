@@ -12,6 +12,14 @@ The tracing crate's `info!`/`warn!`/`error!` macros place the `target:` value in
 
 The GC default `EnvFilter` is `"global_controller=debug,tower_http=debug"`, which filters by target prefix. Custom targets like `gc.task.health_checker` do NOT match `global_controller` — they are silently invisible. Before raising log target drift as an issue during refactoring, verify whether the existing targets were actually reachable under the configured filter. In this case, switching to the default module-path target (`global_controller::tasks::*`) was a net improvement because it made the logs visible.
 
+## NetworkPolicy cross-references span more services than you expect (service-rename, 2026-02-16)
+
+When renaming a service's `app:` label, the obvious NetworkPolicy updates are the service's own policy and its direct peers (GC↔MC). But third-party services also have ingress rules referencing the renamed service. In this project, `infra/services/redis/network-policy.yaml` allows ingress only from `app: meeting-controller` — missing this during the MC rename would have silently broken Redis connectivity for MC pods. Checklist for service renames: grep ALL NetworkPolicy files for the old `app:` label, not just the renamed service's own directory. The zero-trust architecture means every allowed connection is an explicit rule that must be updated.
+
+## Grafana dashboard Loki queries use app label selectors that mirror K8s labels (service-rename, 2026-02-16)
+
+The errors-overview dashboard uses `{app=~"ac-service|gc-service|mc-service"}` to aggregate error logs across services. When renaming services, these Loki query regexes must be updated to match the new K8s pod `app:` labels. In this rename, a partial update occurred: `meeting-controller` was changed to `mc-service` but `global-controller` was left unchanged in the same regex on the same line. The fix is mechanical, but the failure mode is silent — the dashboard simply shows no GC errors, which looks like "healthy" rather than "broken query." Always verify Grafana JSON dashboards with a targeted grep after service renames.
+
 ## Nested `#[instrument]` spans are easy to miss in generic extraction (TD-13, 2026-02-12)
 
 When extracting a generic function from wrapper functions that each have `#[instrument(skip_all, name = "...")]`, putting `#[instrument(skip_all)]` on the generic function too creates a nested span that is invisible during normal operation but inflates trace storage. In TD-13 iteration 1, this was retained because the `instrument-skip-all` guard required it. Iteration 2 resolved this by removing `#[instrument]` from the generic function entirely and having callers chain `.instrument(tracing::info_span!(...))` on the future instead — satisfying the guard at the call site while keeping a single span per invocation. If you see `#[instrument]` on both a wrapper and its delegate, check whether the nesting is intentional.

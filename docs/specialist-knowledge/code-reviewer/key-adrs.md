@@ -26,13 +26,13 @@ Last updated: 2026-02-10
 | ADR-0007 | Token Lifetime Strategy | Token TTL, refresh patterns |
 | ADR-0008 | Key Rotation Strategy | JWKS, key overlap, rotation timing |
 
-### Global Controller (`crates/global-controller/`)
+### Global Controller (`crates/gc-service/`)
 | ADR | Title | When to Check |
 |-----|-------|---------------|
 | ADR-0010 | GC Architecture | OAuth integration, TokenManager, service clients |
 | ADR-0020 | User Auth & Meeting Access | User tokens, meeting access patterns |
 
-### Meeting Controller (`crates/meeting-controller/`)
+### Meeting Controller (`crates/mc-service/`)
 | ADR | Title | When to Check |
 |-----|-------|---------------|
 | ADR-0011 | Observability Framework | Metrics naming, SLO definitions |

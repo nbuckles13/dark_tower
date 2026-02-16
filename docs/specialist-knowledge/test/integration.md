@@ -62,7 +62,7 @@ Requires: Kind cluster, port-forwards (AC, Prometheus, Grafana, Loki), kubectl c
 
 ## For Security Specialist: JWT Security Test Matrix
 **Added**: 2026-01-14, **Updated**: 2026-02-10
-**Related files**: `crates/global-controller/tests/auth_tests.rs`
+**Related files**: `crates/gc-service/tests/auth_tests.rs`
 
 Cover: (1) size limits (exact boundary), (2) algorithm (alg:none, HS256, missing), (3) JWK structure (kty, alg, fields), (4) iat validation (clock skew), (5) time sanity (exp > iat), (6) header injection (kid, jwk, jku), (7) JWKS caching, (8) error messages (generic, no leak). Use descriptive test names for vulnerabilities.
 
@@ -86,7 +86,7 @@ Some gaps deferred: sqlx error paths (no mock layer), external service failures,
 
 ## For Service Specialists: State Machine Transition Tests
 **Added**: 2026-01-21, **Updated**: 2026-01-24
-**Related files**: `crates/global-controller/tests/meeting_assignment_tests.rs`
+**Related files**: `crates/gc-service/tests/meeting_assignment_tests.rs`
 
 Test state transitions, not just happy paths: (1) initial state, (2) state change handling, (3) concurrent access, (4) boundary states (Degraded). Without transition tests, failover bugs hidden until production.
 
@@ -102,7 +102,7 @@ Follow GcClient pattern for new service clients: Error enum (HttpError, RequestF
 
 ## For Meeting Controller Specialist: Test Infrastructure
 **Added**: 2026-01-25, **Updated**: 2026-02-10
-**Related files**: `crates/mc-test-utils/src/mock_redis.rs`, `crates/meeting-controller/tests/`
+**Related files**: `crates/mc-test-utils/src/mock_redis.rs`, `crates/mc-service/tests/`
 
 MockRedis for unit tests (builder pattern), actor lifecycle tests (spawn, shutdown, cancellation), MockBehavior enum for gRPC server states, start_paused for time-based tests. Phase 6c: 143 tests (126 unit + 13 integration + 4 heartbeat), MockGcServer pattern, Lua behavioral tests, capacity/draining tests.
 
@@ -110,7 +110,7 @@ MockRedis for unit tests (builder pattern), actor lifecycle tests (spawn, shutdo
 
 ## For Observability Specialist: Metrics Wiring Review
 **Added**: 2026-02-05, **Updated**: 2026-02-10
-**Related files**: `crates/meeting-controller/src/observability/metrics.rs`
+**Related files**: `crates/mc-service/src/observability/metrics.rs`
 
 Simple wiring (direct calls): behavior tests + wrapper module tests sufficient. Complex wiring (conditionals, aggregation): explicit tests required. Cardinality bounds in wrapper module. Document missing updates as tech debt (e.g., current_participants never incremented).
 
@@ -118,7 +118,7 @@ Simple wiring (direct calls): behavior tests + wrapper module tests sufficient. 
 
 ## For DRY Reviewer: Test Preservation in Extract-Generic Refactors
 **Added**: 2026-02-12, **Updated**: 2026-02-12
-**Related files**: `crates/global-controller/src/tasks/generic_health_checker.rs`
+**Related files**: `crates/gc-service/src/tasks/generic_health_checker.rs`
 
 When extracting shared logic into a generic module with thin wrappers, verify: (1) wrapper public signatures unchanged (tests call wrappers, not generic), (2) constants re-exported so `super::CONSTANT` still resolves in test modules, (3) test count >= original (no silent drops from missing mod.rs entries). Wrapper-preserving pattern is safest for test preservation — zero test code changes. Flag asymmetric test coverage between parallel implementations as pre-existing tech debt (not caused by refactor). Iterative simplification (e.g., config struct → plain parameters) is safe when tests only touch wrappers. Also: `.instrument()` chaining vs `#[instrument]` attribute is invisible to tests — neither requires test changes.
 

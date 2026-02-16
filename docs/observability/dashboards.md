@@ -19,7 +19,7 @@ All dashboard JSON files are stored in `infra/grafana/dashboards/` and auto-load
 
 **File**: `infra/grafana/dashboards/gc-overview.json`
 **UID**: `gc-overview`
-**Tags**: `global-controller`, `service-overview`
+**Tags**: `gc-service`, `service-overview`
 
 **Purpose**: Primary operational dashboard for Global Controller service.
 
@@ -45,7 +45,7 @@ All dashboard JSON files are stored in `infra/grafana/dashboards/` and auto-load
 - `gc_mc_assignment_duration_seconds`
 - `gc_db_queries_total`
 - `gc_db_query_duration_seconds`
-- `up{job="global-controller"}`
+- `up{job="gc-service"}`
 - `container_memory_usage_bytes`
 - `container_cpu_usage_seconds_total`
 
@@ -60,7 +60,7 @@ All dashboard JSON files are stored in `infra/grafana/dashboards/` and auto-load
 
 **File**: `infra/grafana/dashboards/gc-slos.json`
 **UID**: `gc-slos`
-**Tags**: `global-controller`, `slo`
+**Tags**: `gc-service`, `slo`
 
 **Purpose**: SLO compliance tracking and error budget monitoring for Global Controller.
 
@@ -262,7 +262,7 @@ Before deploying dashboards, validate:
 3. **Metric Existence**: Verify all metrics exist in codebase
    ```bash
    # Cross-reference dashboard queries against metrics.rs files
-   grep "gc_http_requests_total" crates/global-controller/src/observability/metrics.rs
+   grep "gc_http_requests_total" crates/gc-service/src/observability/metrics.rs
    ```
 
 4. **Cardinality**: Check for unbounded labels

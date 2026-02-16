@@ -1120,7 +1120,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "up{job=\"global-controller\"}",
+          "expr": "up{job=\"gc-service\"}",
           "legendFormat": "Status",
           "range": true,
           "refId": "A"
@@ -1187,7 +1187,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "count(up{job=\"global-controller\"} == 1)",
+          "expr": "count(up{job=\"gc-service\"} == 1)",
           "legendFormat": "Pod Count",
           "range": true,
           "refId": "A"
@@ -1277,7 +1277,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "container_memory_working_set_bytes{namespace=\"dark-tower\", pod=~\"global-controller.*\"}",
+          "expr": "container_memory_working_set_bytes{namespace=\"dark-tower\", pod=~\"gc-service.*\"}",
           "legendFormat": "{{pod}}",
           "range": true,
           "refId": "A"
@@ -1367,7 +1367,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "rate(container_cpu_usage_seconds_total{namespace=\"dark-tower\", pod=~\"global-controller.*\"}[5m])",
+          "expr": "rate(container_cpu_usage_seconds_total{namespace=\"dark-tower\", pod=~\"gc-service.*\"}[5m])",
           "legendFormat": "{{pod}}",
           "range": true,
           "refId": "A"
@@ -1380,7 +1380,7 @@
   "refresh": "10s",
   "schemaVersion": 38,
   "style": "dark",
-  "tags": ["global-controller", "service-overview"],
+  "tags": ["gc-service", "service-overview"],
   "templating": {
     "list": []
   },

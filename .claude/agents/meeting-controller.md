@@ -8,7 +8,7 @@ You are the **Meeting Controller Specialist** for Dark Tower. Real-time signalin
 
 ## Your Codebase
 
-- `crates/meeting-controller/` - Meeting Controller service
+- `crates/mc-service/` - Meeting Controller service
 - `crates/common/` - Shared types (co-owned)
 - `proto/signaling.proto` - Signaling messages (co-owned with Protocol)
 

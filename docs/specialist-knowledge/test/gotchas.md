@@ -62,7 +62,7 @@ TestServer binds to 127.0.0.1:0 for random port. Address only available AFTER bi
 
 ## Gotcha: JWT Size Boundary Off-by-One Errors
 **Added**: 2026-01-14
-**Related files**: `crates/global-controller/tests/auth_tests.rs`
+**Related files**: `crates/gc-service/tests/auth_tests.rs`
 
 Test exact boundary (should pass) and one byte over (should fail). Tests checking only "small pass, large fail" miss off-by-one that attackers exploit for DoS.
 
@@ -70,7 +70,7 @@ Test exact boundary (should pass) and one byte over (should fail). Tests checkin
 
 ## Gotcha: Algorithm Confusion Needs Multiple Attack Vectors
 **Added**: 2026-01-14
-**Related files**: `crates/global-controller/tests/auth_tests.rs`
+**Related files**: `crates/gc-service/tests/auth_tests.rs`
 
 Test alg:none, alg:HS256, missing alg separately. Each exploitable independently. Testing only one vector misses others (CVE-2016-10555, CVE-2017-11424).
 
@@ -78,7 +78,7 @@ Test alg:none, alg:HS256, missing alg separately. Each exploitable independently
 
 ## Gotcha: JWK Structure Validation Required
 **Added**: 2026-01-14
-**Related files**: `crates/global-controller/src/auth/jwt.rs`
+**Related files**: `crates/gc-service/src/auth/jwt.rs`
 
 Validate JWK structure before use (kty, alg, required fields). JWKS endpoint could be compromised/misconfigured or MITM'd. Silent failures accept invalid signatures.
 
@@ -110,7 +110,7 @@ Custom Debug only redacts in Debug formatting. Error bodies leak through assert_
 
 ## Gotcha: Time-Based Tests Without pause() Are Flaky
 **Added**: 2026-01-25
-**Related files**: `crates/meeting-controller/tests/session_actor_tests.rs`
+**Related files**: `crates/mc-service/tests/session_actor_tests.rs`
 
 Real time tests are flaky or slow. Use `#[tokio::test(start_paused = true)]` and `tokio::time::advance()` for deterministic, instant, boundary-precise tests.
 
@@ -118,7 +118,7 @@ Real time tests are flaky or slow. Use `#[tokio::test(start_paused = true)]` and
 
 ## Gotcha: Lua Script Structural Tests Miss Logic Errors
 **Added**: 2026-01-25
-**Related files**: `crates/meeting-controller/tests/redis_lua_tests.rs`
+**Related files**: `crates/mc-service/tests/redis_lua_tests.rs`
 
 "Script runs without error" catches syntax, misses logic. Test actual behavior: current generation (accept), higher (accept+update), lower (reject), no generation (first write, accept). Structural tests passed in Phase 6c even when fencing logic wrong.
 
@@ -134,7 +134,7 @@ Boundary test can pass with broken test if failure mode differs from assertion. 
 
 ## Gotcha: Database Error Paths Hard to Test (Often Deferred)
 **Added**: 2026-01-23
-**Related files**: `crates/global-controller/src/gc_assignment_cleanup.rs`
+**Related files**: `crates/gc-service/src/gc_assignment_cleanup.rs`
 
 sqlx compile-time queries need real database, no built-in mocking. Workarounds (trait abstraction, testcontainers) complex/slow. Error path tests for internal DB functions often deferred to tech debt. Document explicitly to prevent re-flagging.
 
@@ -142,7 +142,7 @@ sqlx compile-time queries need real database, no built-in mocking. Workarounds (
 
 ## Gotcha: Integration Tests Can Miss Helper Method Tests
 **Added**: 2026-01-31, **Updated**: 2026-02-10
-**Related files**: `crates/meeting-controller/src/actors/metrics.rs`
+**Related files**: `crates/mc-service/src/actors/metrics.rs`
 
 Integration tests exercise flows but may miss helper methods. Phase 6c: heartbeat tests verified metrics reported but `snapshot()` method itself untested. Add unit tests when: (1) complex logic, (2) public API, (3) subtle failures (swapped fields). Skip when: (1) simple delegation, (2) private single-caller, (3) obvious failures.
 
@@ -158,7 +158,7 @@ Don't assume error paths tested just because code handles them explicitly. Token
 
 ## Gotcha: Endpoint Behavior Changes Require Multi-File Test Updates
 **Added**: 2026-02-08
-**Related files**: `crates/global-controller/tests/auth_tests.rs`, `crates/global-controller/tests/health_tests.rs`
+**Related files**: `crates/gc-service/tests/auth_tests.rs`, `crates/gc-service/tests/health_tests.rs`
 
 When endpoint behavior changes (e.g., `/health` from JSON to plain text "OK"), tests may exist in MULTIPLE test files that all need updating. Search all test files: `grep -r "health" crates/*/tests/`. Check for both direct endpoint tests AND tests that use the endpoint as setup. This is especially common for health/ready endpoints tested as "works without auth" examples in auth test suites.
 
@@ -166,7 +166,7 @@ When endpoint behavior changes (e.g., `/health` from JSON to plain text "OK"), t
 
 ## Gotcha: #[allow(dead_code)] on Metrics Functions Signals Missing Wiring
 **Added**: 2026-02-09
-**Related files**: `crates/global-controller/src/observability/metrics.rs`, `crates/global-controller/src/services/mh_selection.rs`
+**Related files**: `crates/gc-service/src/observability/metrics.rs`, `crates/gc-service/src/services/mh_selection.rs`
 
 `#[allow(dead_code)]` on metric recording functions is a red flag that metrics are defined but NOT wired into production code paths. Detection: search metrics.rs for the annotation, then search for call sites. Contrast with intentional skeleton code which uses `#[allow(dead_code)]` on enum variants planned for future phases — metrics functions are defined for immediate use but forgotten during implementation.
 
@@ -174,7 +174,7 @@ When endpoint behavior changes (e.g., `/health` from JSON to plain text "OK"), t
 
 ## Gotcha: Observability Wiring May Not Need Prometheus Mocking
 **Added**: 2026-02-05, **Updated**: 2026-02-10
-**Related files**: `crates/meeting-controller/src/actors/metrics.rs`
+**Related files**: `crates/mc-service/src/actors/metrics.rs`
 
 Simple wiring (direct calls, no branching) doesn't need explicit "mock Prometheus and assert called" tests. Existing behavior tests + wrapper module tests sufficient. Require explicit tests only for: conditional emission, aggregation/batching, error handling that might suppress. For simple wiring, behavior verification sufficient.
 
@@ -182,7 +182,7 @@ Simple wiring (direct calls, no branching) doesn't need explicit "mock Prometheu
 
 ## Gotcha: tracing `target:` Requires String Literals
 **Added**: 2026-02-12
-**Related files**: `crates/global-controller/src/tasks/generic_health_checker.rs`
+**Related files**: `crates/gc-service/src/tasks/generic_health_checker.rs`
 
 `tracing` macros require `target:` values to be string literals or `&'static str` known at compile time. You cannot pass a runtime `config.log_target` field as `target:`. This means generic/shared functions cannot parameterize log targets. Workarounds: (1) omit explicit `target:` and let it default to module path (preferred — works with `EnvFilter`), (2) keep `target:` in wrapper functions for lifecycle logs only. Note: dot-separated targets like `gc.task.health_checker` are silently filtered by `EnvFilter` directives like `global_controller=debug` — module-path targets are more compatible.
 
@@ -190,8 +190,16 @@ Simple wiring (direct calls, no branching) doesn't need explicit "mock Prometheu
 
 ## Gotcha: Dot-Separated Log Targets Silently Filtered by EnvFilter
 **Added**: 2026-02-12
-**Related files**: `crates/global-controller/src/tasks/health_checker.rs`
+**Related files**: `crates/gc-service/src/tasks/health_checker.rs`
 
 Custom dot-separated `target:` values (e.g., `"gc.task.health_checker"`) don't match module-path-based `EnvFilter` directives (e.g., `"global_controller=debug"`). Events with these targets are silently dropped under default config. Tests won't catch this because they don't assert on log visibility. When reviewing code with custom `target:` values, verify they're actually reachable under the configured `EnvFilter`. Module-path-based targets (default when `target:` is omitted) are always compatible.
+
+---
+
+## Gotcha: Crate Rename Silently Breaks EnvFilter Defaults
+**Added**: 2026-02-16
+**Related files**: `crates/gc-service/src/main.rs`, `crates/mc-service/src/main.rs`, `crates/mh-service/src/main.rs`
+
+When renaming crates (e.g., `global-controller` → `gc-service`), the `EnvFilter` fallback string in `main.rs` must be updated to match the new crate name (e.g., `"global_controller=debug"` → `"gc_service=debug"`). Compiler cannot catch this — it's a runtime string. Tests don't catch it either since they don't assert on log visibility. Result: all debug/info logs silently dropped in production when `RUST_LOG` is not set. Review checklist for crate renames: (1) grep for old crate name in EnvFilter strings, (2) verify default filter matches `[lib] name` or `[[bin]] name` in Cargo.toml.
 
 ---

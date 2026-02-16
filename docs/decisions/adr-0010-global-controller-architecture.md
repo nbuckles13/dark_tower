@@ -1241,7 +1241,7 @@ A subsequent debate addressed remaining concerns with a fundamentally simpler ar
 
 1. `proto/gc_mc_internal.proto` - gRPC service definitions
 2. `migrations/NNNN_gc_schema.sql` - Database schema
-3. `crates/global-controller/` - GC implementation
+3. `crates/gc-service/` - GC implementation
 4. AC changes: Add `jti`, `org_id` to JWT claims
 
 ---

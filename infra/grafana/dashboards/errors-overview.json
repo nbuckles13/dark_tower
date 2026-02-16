@@ -415,7 +415,7 @@
             "uid": "loki"
           },
           "editorMode": "code",
-          "expr": "{app=~\"ac-service|global-controller|meeting-controller\"} | level=\"error\"",
+          "expr": "{app=~\"ac-service|gc-service|mc-service\"} | level=\"error\"",
           "queryType": "range",
           "refId": "A"
         }

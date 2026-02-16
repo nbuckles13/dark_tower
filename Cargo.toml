@@ -2,9 +2,9 @@
 resolver = "2"
 
 members = [
-    "crates/global-controller",
-    "crates/meeting-controller",
-    "crates/media-handler",
+    "crates/gc-service",
+    "crates/mc-service",
+    "crates/mh-service",
     "crates/ac-service",
     "crates/ac-test-utils",
     "crates/gc-test-utils",

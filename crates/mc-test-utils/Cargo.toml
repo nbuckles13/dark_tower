@@ -44,7 +44,7 @@ anyhow = { workspace = true }
 thiserror = { workspace = true }
 
 # Local dependencies
-meeting-controller = { path = "../meeting-controller" }
+mc-service = { path = "../mc-service" }
 proto-gen = { path = "../proto-gen" }
 common = { path = "../common" }
 
