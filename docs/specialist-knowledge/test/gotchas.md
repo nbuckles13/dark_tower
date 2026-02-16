@@ -203,3 +203,11 @@ Custom dot-separated `target:` values (e.g., `"gc.task.health_checker"`) don't m
 When renaming crates (e.g., `global-controller` → `gc-service`), the `EnvFilter` fallback string in `main.rs` must be updated to match the new crate name (e.g., `"global_controller=debug"` → `"gc_service=debug"`). Compiler cannot catch this — it's a runtime string. Tests don't catch it either since they don't assert on log visibility. Result: all debug/info logs silently dropped in production when `RUST_LOG` is not set. Review checklist for crate renames: (1) grep for old crate name in EnvFilter strings, (2) verify default filter matches `[lib] name` or `[[bin]] name` in Cargo.toml.
 
 ---
+
+## Gotcha: Guard Step 4 Soft-Fail Masks Dashboard Coverage Gaps
+**Added**: 2026-02-16
+**Related files**: `scripts/guards/simple/validate-application-metrics.sh`
+
+Before this session, Step 4 (metric coverage in dashboards) was a soft warning, not a hard fail. This allowed 32 metrics to exist in code without any dashboard panel — silently. The guard passed, giving false confidence. When promoting guards from warning to hard-fail, audit the current state first: soft warnings may have been accumulating for weeks. Similarly, when adding new guard steps (Step 5: catalog coverage), verify the catalog actually exists for all services before enabling the check.
+
+---

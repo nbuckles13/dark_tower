@@ -251,6 +251,24 @@ All GC service metrics follow ADR-0011 naming conventions with the `gc_` prefix.
 
 ---
 
+## Fleet Health Metrics
+
+### `gc_registered_controllers`
+- **Type**: Gauge
+- **Description**: Number of registered controllers by type and health status
+- **Labels**:
+  - `controller_type`: Type of controller (`meeting`, `media`)
+  - `status`: Health status (`pending`, `healthy`, `degraded`, `unhealthy`, `draining`)
+- **Cardinality**: Low (2 types x 5 statuses = 10 series)
+- **Usage**: Monitor fleet composition and health distribution. Detect capacity issues when healthy count drops.
+- **Update Triggers**: GC startup, MC/MH registration, heartbeat status changes, health checker stale detection
+- **Example**:
+  ```promql
+  sum by(controller_type, status) (gc_registered_controllers)
+  ```
+
+---
+
 ## Error Metrics
 
 ### `gc_errors_total`
@@ -262,6 +280,7 @@ All GC service metrics follow ADR-0011 naming conventions with the `gc_` prefix.
   - `status_code`: HTTP status code
 - **Cardinality**: Medium (~80 combinations, bounded by operations and error types)
 - **Usage**: Track error rates by type, identify patterns in failures
+- **Note**: Operation labels use subsystem prefixes (e.g., `ac_meeting_token`, `mc_grpc`) unlike per-subsystem metrics (`gc_ac_requests_total`) which use unprefixed operation names (`meeting_token`). Use prefixed values when filtering this metric.
 - **Example**:
   ```promql
   sum(rate(gc_errors_total[5m])) by (operation, error_type)

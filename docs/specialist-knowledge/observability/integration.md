@@ -55,6 +55,19 @@ The `instrument-skip-all` guard (`scripts/guards/simple/instrument-skip-all.sh`)
 
 ---
 
+### Dead-Code Metrics Require Dashboard Panels with Instrumentation Notes
+**Discovered**: 2026-02-16 (AC dashboard coverage gaps, operations review)
+**Coordination**: Observability + Operations
+**Related files**: `crates/ac-service/src/observability/metrics.rs`, `infra/grafana/dashboards/ac-overview.json`
+
+The `validate-application-metrics.sh` guard greps `counter!`/`histogram!`/`gauge!` macro invocations from `metrics.rs` files, regardless of whether the recording functions are wired to call sites. Functions marked `#[allow(dead_code)]` still register their metrics as "defined" and require dashboard coverage and catalog entries.
+
+This creates a tension: the guard requires panels, but the panels will show "No data" until instrumentation is wired. The agreed approach is to add "Pending instrumentation." to the panel `description` field so on-call understands "No data" is expected, not a scrape failure. Operations strongly prefers this annotation to avoid wasted incident debugging time.
+
+**AC service has 10 dead-code metrics as of 2026-02-16**: `ac_active_signing_keys`, `ac_signing_key_age_days`, `ac_key_rotation_last_success_timestamp`, `ac_token_validations_total`, `ac_rate_limit_decisions_total`, `ac_db_queries_total`, `ac_db_query_duration_seconds`, `ac_bcrypt_duration_seconds`, `ac_audit_log_failures_total`, `ac_admin_operations_total`. When these are wired to call sites, remove the "Pending instrumentation." note from their panel descriptions.
+
+---
+
 ### DRY Extraction Triggers Observability Review for Target/Span Changes
 **Discovered**: 2026-02-12 (TD-13 health checker extraction)
 **Coordination**: Observability + DRY Reviewer

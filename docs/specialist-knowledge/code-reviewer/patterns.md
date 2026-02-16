@@ -231,3 +231,11 @@ When a generic/shared async function is called by multiple wrappers that each ne
 When a struct field is used exclusively to carry bounded metric labels (e.g., error categories passed to Prometheus counters), use `Option<&'static str>` instead of `Option<String>`. Benefits: (1) enforces bounded cardinality at the type level -- callers cannot pass arbitrary runtime strings, (2) eliminates per-event `String` allocation on error paths, (3) makes the contract self-documenting. This is especially important for cross-crate event structs (like `TokenRefreshEvent` in `common`) where the producing crate cannot depend on the consuming crate's metrics library. The paired pattern is a private `fn error_category(err: &Error) -> &'static str` that maps error variants to bounded label values via exhaustive `match`.
 
 ---
+
+## Pattern: Automated Cross-Referencing for Dashboard/Catalog Reviews
+**Added**: 2026-02-16
+**Related files**: `infra/grafana/dashboards/*.json`, `docs/observability/metrics/*.md`, `crates/*/src/observability/metrics.rs`
+
+When reviewing Grafana dashboard or metrics catalog changes, use scripted cross-referencing rather than manual inspection. Extract metric names from three sources (source code via regex on `counter!/histogram!/gauge!`, dashboard JSON via regex on PromQL expressions, catalog markdown via `### \`metric_name\`` headings) and compute set differences. Catches: metrics in dashboards not in source (phantom panels), metrics in source not in dashboards (coverage gaps), metrics in source not in catalogs (documentation gaps). Also verify: panel ID uniqueness within each dashboard, JSON validity, consistent datasource UIDs (`"prometheus"`), and SLO reference line styling consistency across panels. This approach scales to 45+ metrics across 3 services in minutes and is more reliable than visual inspection of large JSON diffs.
+
+---

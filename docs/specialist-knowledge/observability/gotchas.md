@@ -93,6 +93,26 @@ Each service's `observability/mod.rs` re-exports all public metric functions via
 
 ---
 
+### Guard Metric Extraction Treats Histogram Suffixes as Distinct Metrics
+**Discovered**: 2026-02-16 (dashboard coverage gaps)
+**Related files**: `scripts/guards/simple/validate-application-metrics.sh`, `infra/grafana/dashboards/*.json`
+
+The `validate-application-metrics.sh` guard extracts metric names from dashboard PromQL using `grep -oP '\b(ac|gc|mc|mh)_[a-z_]+'`. When a dashboard references `histogram_quantile(0.95, rate(foo_bucket[5m]))`, the regex extracts `foo_bucket` -- NOT the base metric name `foo` defined in source code. Without suffix stripping, every histogram metric referenced only via `_bucket`/`_count`/`_sum` in dashboards appears uncovered, inflating gap counts.
+
+The guard was updated to strip `_bucket`, `_count`, and `_sum` suffixes and register base metric names. When adding new histogram panels, the PromQL will naturally reference `_bucket` variants, and the guard now correctly maps those back to the source metric. No special PromQL workarounds are needed.
+
+---
+
+### Cross-Cutting Error Counters Use Subsystem-Prefixed Operation Labels
+**Discovered**: 2026-02-16 (gc_errors_total dashboard panel, operations review)
+**Related files**: `crates/gc-service/src/observability/metrics.rs`, `infra/grafana/dashboards/gc-overview.json`
+
+The `gc_errors_total` cross-cutting error counter uses subsystem-prefixed operation labels (e.g., `ac_meeting_token`, `ac_guest_token`, `mc_grpc`), while per-subsystem metrics like `gc_ac_requests_total` use unprefixed operation names (`meeting_token`, `guest_token`). This inconsistency means correlating errors across metrics requires knowing which prefix convention applies to which metric.
+
+**Impact**: During incidents, on-call may filter `gc_errors_total{operation="meeting_token"}` and get zero results when the correct value is `operation="ac_meeting_token"`. Always document the label convention in panel descriptions and catalog entries for cross-cutting error counters.
+
+---
+
 ### Multi-Value Regex Fields Survive Partial Renames
 **Discovered**: 2026-02-16 (service rename: global-controller -> gc-service, meeting-controller -> mc-service)
 

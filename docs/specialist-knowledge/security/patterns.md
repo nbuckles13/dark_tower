@@ -297,6 +297,10 @@ When reviewing observability assets (dashboards, alerts, runbooks), check for:
 
 4. **Runbook URLs in alerts**: Use HTTPS, section anchors are safe. Placeholder org names need deployment-time replacement.
 
+5. **Panel descriptions and catalog docs**: Dashboard panel `description` fields and metric catalog Markdown are visible to anyone with Grafana/repo access. Do not explain *why* a security mitigation exists (e.g., "coarse buckets to prevent timing side-channel attacks"). State *what* the metric measures, not the threat model behind its design. Security rationale belongs in ADRs and specialist knowledge files, not in operator-facing dashboards.
+
+6. **Catalog documentation scope**: Metric catalog files (`docs/observability/metrics/*.md`) should document metric type, labels, cardinality, and usage. Do NOT document: rotation grace periods, rate limit thresholds/windows, binding token TTL, key derivation parameters, or any security policy constants. An attacker with repo read access could use these to time exploitation windows.
+
 This pattern applies to all service observability: GC, AC, MC, MH dashboards and runbooks.
 
 ---

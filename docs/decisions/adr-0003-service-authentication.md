@@ -695,6 +695,13 @@ X-RateLimit-Reset: 1234567890
 | Bcrypt Password Hashing | ✅ Done | | Cost factor 12 |
 | AES-256-GCM Key Encryption | ✅ Done | | Private key encryption at rest |
 | Error Counter Metrics | ❌ Pending | | Add `ac_errors_total` (counter by error_type, endpoint) to enable error budget calculations in SLO dashboards. Track token issuance errors, validation errors, JWKS errors, HTTP 4xx/5xx responses. Required for `ac-slos.json` error budget panels which currently show -74914% due to missing metrics. Label dimensions: `error_type` (validation_failed, token_expired, rate_limited, internal_error), `endpoint` (/token, /jwks, /validate). Align with ADR-0011 observability framework. |
+| Token Validation Metrics | ❌ Pending | | Wire `ac_token_validations_total` at call sites. Recording function exists in `metrics.rs` (`#[allow(dead_code)]`) but is not called from token validation code paths. |
+| Key Management Metrics | ❌ Pending | | Wire `ac_signing_key_age_days`, `ac_active_signing_keys`, `ac_key_rotation_last_success_timestamp` at call sites. Recording functions exist in `metrics.rs` (`#[allow(dead_code)]`) but are not called from key rotation code paths. |
+| Rate Limit Metrics | ❌ Pending | | Wire `ac_rate_limit_decisions_total` at call sites. Recording function exists in `metrics.rs` (`#[allow(dead_code)]`) but is not called from rate limiting middleware. |
+| Database Query Metrics | ❌ Pending | | Wire `ac_db_queries_total` and `ac_db_query_duration_seconds` at call sites. Recording function exists in `metrics.rs` (`#[allow(dead_code)]`) but is not called from repository query methods. |
+| Bcrypt Duration Metrics | ❌ Pending | | Wire `ac_bcrypt_duration_seconds` at call sites. Recording function exists in `metrics.rs` (`#[allow(dead_code)]`) but is not called from password hashing code paths. |
+| Audit Log Metrics | ❌ Pending | | Wire `ac_audit_log_failures_total` at call sites. Recording function exists in `metrics.rs` (`#[allow(dead_code)]`) but audit logging is not yet implemented. |
+| Admin Operations Metrics | ❌ Pending | | Wire `ac_admin_operations_total` at call sites. Recording function exists in `metrics.rs` (`#[allow(dead_code)]`) but admin endpoints are not yet instrumented. |
 | Redis-based Rate Limiting | ❌ Pending | | Multi-instance distributed rate limiting |
 | CAPTCHA Integration | ❌ Pending | | After 3 failed attempts (Layer 4) |
 | Failed Login Alerting | ❌ Pending | | Email user, alert ops team (Layer 5) |

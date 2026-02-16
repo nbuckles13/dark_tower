@@ -67,6 +67,9 @@ These look like duplication but are intentionally separate:
 | Service-specific health endpoints | Different readiness criteria |
 | `error_type_label()` on error enums | GC (9 variants) and MC (18 variants) have same method name but different match arms; domain-specific |
 | `status_code` label semantics | GC uses HTTP codes, MC uses signaling codes; same label name, different value domains |
+| Dashboard JSON panel structures across services | Reference pattern (see gotchas) |
+| Metrics catalog doc structure across services | Intentional consistency for operators |
+| Guard script check functions with similar iteration loops | Different data sources and extraction logic |
 
 ## When to Flag
 
