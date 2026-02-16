@@ -66,8 +66,8 @@ jobs:
           AC_BIND_ADDRESS: 127.0.0.1:8082
         run: cargo test --workspace --verbose
 
-      - name: Build release
-        run: cargo build --release --workspace
+      - name: Build binaries
+        run: cargo build --workspace
 
   coverage:
     name: Code Coverage
