@@ -178,10 +178,42 @@ HTTP metrics middleware must be applied as the outermost layer (last in code, fi
 
 ---
 
+## Gotcha: rotate_signing_key vs rotate_signing_key_tx Have Different Gauge Behavior
+**Added**: 2026-02-17
+**Related files**: `crates/ac-service/src/services/key_management_service.rs`, `crates/ac-service/src/handlers/admin_handler.rs`
+
+`rotate_signing_key` (non-tx) sets key management gauges (`set_active_signing_keys`, `set_signing_key_age_days`, `set_key_rotation_last_success`) internally. `rotate_signing_key_tx` (transactional, used by admin API) does NOT set gauges — the caller (`handle_rotate_keys`) must set them after the transaction commits. Removing gauge calls from the handler as "duplicates" silently breaks the admin API rotation path. Always check which variant the handler calls before removing "duplicate" metric recording.
+
+---
+
+## Gotcha: Key Management Gauges Zero After Restart Without init_key_metrics
+**Added**: 2026-02-18
+**Related files**: `crates/ac-service/src/services/key_management_service.rs`, `crates/ac-service/src/main.rs`
+
+Prometheus gauges (`ac_active_signing_keys`, `ac_signing_key_age_days`, `ac_key_rotation_last_success_timestamp`) reset to zero on process restart because they are in-memory. Without `init_key_metrics()` at startup, dashboards and alerts see zero values until the next key rotation event, which could be days away. Always call `init_key_metrics(&pool)` during startup to hydrate gauges from the database. Use `valid_from` for age calculation and `created_at` for last rotation timestamp.
+
+---
+
 ## Gotcha: Watch Receiver Borrow Blocks Sender
 **Added**: 2026-02-02
 **Related files**: `crates/common/src/token_manager.rs`
 
 `watch::Receiver::borrow()` holds a lock that blocks the sender from updating. Always clone immediately: `self.0.borrow().clone()`. Create a wrapper type (e.g., `TokenReceiver`) that enforces this pattern in its `token()` method, preventing callers from accidentally holding the borrow.
+
+---
+
+## Gotcha: Service Tokens Cannot Join Meetings (sub is Not a UUID)
+**Added**: 2026-02-18
+**Related files**: `crates/gc-service/src/handlers/meetings.rs`, `crates/ac-service/src/crypto/mod.rs`
+
+AC service tokens have `sub` = client_id string (e.g., "test-client", "gc-service-001"), NOT a UUID. GC's `join_meeting` handler calls `parse_user_id(&claims.sub)` which does `Uuid::parse_str()` and fails on non-UUID strings. GC auth middleware accepts both service and user tokens (same `Claims` struct), but the handler-level logic rejects service tokens. This is correct security behavior — service tokens should not be usable to join meetings. Env-tests that attempt authenticated meeting joins with service tokens will always get an error, not just when meetings are unseeded.
+
+---
+
+## Gotcha: Env-Test Token Scope Must Match Registered Credential Scopes
+**Added**: 2026-02-18
+**Related files**: `crates/env-tests/tests/21_cross_service_flows.rs`, `infra/kind/scripts/setup.sh`
+
+When env-tests request tokens from AC, the requested scope must match what the client credential is registered with. The `test-client` in `setup.sh` is registered with `ARRAY['test:all']`. Requesting `test:scope0`, `test:scope1`, etc. will fail because AC only issues scopes the client is authorized for. Always cross-reference requested scopes against the seed data in `infra/kind/scripts/setup.sh`.
 
 ---

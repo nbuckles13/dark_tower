@@ -1,7 +1,9 @@
 use crate::errors::AcError;
 use crate::models::SigningKey;
+use crate::observability::metrics::record_db_query;
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
+use std::time::Instant;
 
 /// Create a new signing key
 #[expect(clippy::too_many_arguments)] // Represents all signing_keys table columns
@@ -16,7 +18,8 @@ pub async fn create_signing_key(
     valid_from: DateTime<Utc>,
     valid_until: DateTime<Utc>,
 ) -> Result<SigningKey, AcError> {
-    let key = sqlx::query_as::<_, SigningKey>(
+    let start = Instant::now();
+    let result = sqlx::query_as::<_, SigningKey>(
         r#"
         INSERT INTO signing_keys (
             key_id, public_key, private_key_encrypted, encryption_nonce, encryption_tag,
@@ -39,15 +42,19 @@ pub async fn create_signing_key(
     .bind(valid_from)
     .bind(valid_until)
     .fetch_one(pool)
-    .await
-    .map_err(|e| AcError::Database(format!("Failed to create signing key: {}", e)))?;
+    .await;
+    let status = if result.is_ok() { "success" } else { "error" };
+    record_db_query("insert", "signing_keys", status, start.elapsed());
+    let key =
+        result.map_err(|e| AcError::Database(format!("Failed to create signing key: {}", e)))?;
 
     Ok(key)
 }
 
 /// Get the currently active signing key
 pub async fn get_active_key(pool: &PgPool) -> Result<Option<SigningKey>, AcError> {
-    let key = sqlx::query_as::<_, SigningKey>(
+    let start = Instant::now();
+    let result = sqlx::query_as::<_, SigningKey>(
         r#"
         SELECT
             key_id, public_key, private_key_encrypted, encryption_nonce, encryption_tag,
@@ -62,8 +69,11 @@ pub async fn get_active_key(pool: &PgPool) -> Result<Option<SigningKey>, AcError
         "#,
     )
     .fetch_optional(pool)
-    .await
-    .map_err(|e| AcError::Database(format!("Failed to fetch active key: {}", e)))?;
+    .await;
+    let status = if result.is_ok() { "success" } else { "error" };
+    record_db_query("select", "signing_keys", status, start.elapsed());
+    let key =
+        result.map_err(|e| AcError::Database(format!("Failed to fetch active key: {}", e)))?;
 
     Ok(key)
 }
@@ -133,7 +143,8 @@ pub async fn rotate_key(pool: &PgPool, new_key_id: &str) -> Result<(), AcError> 
 
 /// Get all active public keys (for JWKS endpoint)
 pub async fn get_all_active_keys(pool: &PgPool) -> Result<Vec<SigningKey>, AcError> {
-    let keys = sqlx::query_as::<_, SigningKey>(
+    let start = Instant::now();
+    let result = sqlx::query_as::<_, SigningKey>(
         r#"
         SELECT
             key_id, public_key, private_key_encrypted, encryption_nonce, encryption_tag,
@@ -147,8 +158,11 @@ pub async fn get_all_active_keys(pool: &PgPool) -> Result<Vec<SigningKey>, AcErr
         "#,
     )
     .fetch_all(pool)
-    .await
-    .map_err(|e| AcError::Database(format!("Failed to fetch active keys: {}", e)))?;
+    .await;
+    let status = if result.is_ok() { "success" } else { "error" };
+    record_db_query("select", "signing_keys", status, start.elapsed());
+    let keys =
+        result.map_err(|e| AcError::Database(format!("Failed to fetch active keys: {}", e)))?;
 
     Ok(keys)
 }

@@ -126,17 +126,13 @@ async fn test_network_policy_blocks_cross_namespace() {
     let test_namespace = "canary-test-isolated";
 
     // Deploy a canary pod in a DIFFERENT namespace from AC service
-    let canary = match CanaryPod::deploy(test_namespace).await {
-        Ok(c) => c,
-        Err(e) => {
-            // If we can't deploy the canary, skip the test gracefully
-            eprintln!(
-                "Skipping NetworkPolicy test: Failed to deploy canary in {}: {}",
-                test_namespace, e
-            );
-            return;
-        }
-    };
+    let canary = CanaryPod::deploy(test_namespace).await.unwrap_or_else(|e| {
+        panic!(
+            "Failed to deploy canary pod in {}: {}. \
+                 Ensure kubectl is configured and has permissions to create namespaces/pods.",
+            test_namespace, e
+        )
+    });
 
     // Try to reach AC service from the different namespace
     // Using fully-qualified service DNS: <service>.<namespace>.svc.cluster.local

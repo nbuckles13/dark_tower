@@ -1,6 +1,10 @@
 use crate::crypto;
 use crate::errors::AcError;
 use crate::models::{AuthEventType, JsonWebKey, Jwks};
+use crate::observability::metrics::{
+    record_audit_log_failure, set_active_signing_keys, set_key_rotation_last_success,
+    set_signing_key_age_days,
+};
 use crate::repositories::{auth_events, signing_keys};
 use base64::{engine::general_purpose, Engine as _};
 use chrono::{Duration, Utc};
@@ -89,7 +93,13 @@ pub async fn initialize_signing_key(
     .await
     {
         tracing::warn!("Failed to log auth event: {}", e);
+        record_audit_log_failure("key_generated", "db_write_failed");
     }
+
+    // Update key management gauges
+    set_active_signing_keys(1);
+    set_signing_key_age_days(0.0);
+    set_key_rotation_last_success(Utc::now().timestamp() as f64);
 
     Ok(())
 }
@@ -153,7 +163,13 @@ pub async fn rotate_signing_key(
     .await
     {
         tracing::warn!("Failed to log auth event: {}", e);
+        record_audit_log_failure("key_rotated", "db_write_failed");
     }
+
+    // Update key management gauges
+    set_active_signing_keys(1);
+    set_signing_key_age_days(0.0);
+    set_key_rotation_last_success(Utc::now().timestamp() as f64);
 
     Ok(key_id)
 }
@@ -304,6 +320,23 @@ pub async fn get_jwks(pool: &PgPool) -> Result<Jwks, AcError> {
     })
 }
 
+/// Initialize key management metric gauges from current database state.
+///
+/// Called at startup to ensure gauges reflect actual state after restarts.
+/// Without this, gauges would show 0 until the next key rotation event.
+pub async fn init_key_metrics(pool: &PgPool) -> Result<(), AcError> {
+    let active_keys = signing_keys::get_all_active_keys(pool).await?;
+    set_active_signing_keys(active_keys.len() as u64);
+
+    if let Some(key) = active_keys.first() {
+        let age_days = (Utc::now() - key.valid_from).num_seconds() as f64 / 86400.0;
+        set_signing_key_age_days(age_days);
+        set_key_rotation_last_success(key.created_at.timestamp() as f64);
+    }
+
+    Ok(())
+}
+
 /// Check and mark expired keys as inactive
 ///
 /// Finds all keys where `valid_until < NOW()` and `is_active = true`,
@@ -348,6 +381,7 @@ pub async fn expire_old_keys(pool: &PgPool) -> Result<Vec<String>, AcError> {
         .await
         {
             tracing::warn!("Failed to log key expiration event: {}", e);
+            record_audit_log_failure("key_expired", "db_write_failed");
         }
     }
 

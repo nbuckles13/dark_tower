@@ -301,6 +301,8 @@ When reviewing observability assets (dashboards, alerts, runbooks), check for:
 
 6. **Catalog documentation scope**: Metric catalog files (`docs/observability/metrics/*.md`) should document metric type, labels, cardinality, and usage. Do NOT document: rotation grace periods, rate limit thresholds/windows, binding token TTL, key derivation parameters, or any security policy constants. An attacker with repo read access could use these to time exploitation windows.
 
+7. **Rust doc comments on metric functions**: `///` doc comments on metric recording functions (e.g., `record_bcrypt_duration`) are visible in the repo and via `cargo doc`. Apply the same rule as panel descriptions: state what the metric measures, not the security threat it mitigates. Example: `/// Note: Uses coarse buckets (50ms minimum).` (good) vs `/// Note: Uses coarse buckets to prevent timing side-channel attacks.` (leaks rationale).
+
 This pattern applies to all service observability: GC, AC, MC, MH dashboards and runbooks.
 
 ---
@@ -442,5 +444,20 @@ Two implementations of this pattern now exist in the codebase:
 **Security review rule**: When a new variant is added to `GcError` or `TokenError`, the corresponding `&'static str` match arm MUST be added. A missing arm is a compile error (exhaustive match), but the label value chosen must also be reviewed for information leakage — it should be a generic category name, not a value derived from user input or error content.
 
 **Anti-pattern**: `record_error("operation", &err.to_string(), status)` — this passes the full error message as a Prometheus label, causing both cardinality explosion and potential information leakage.
+
+---
+
+## Pattern: Guaranteed Error Path for Sanitization Tests
+**Added**: 2026-02-18
+**Related files**: `crates/env-tests/tests/22_mc_gc_integration.rs`
+
+Error sanitization tests must guarantee they exercise an error path, not conditionally skip validation when the happy path succeeds. Pattern:
+
+1. **Use public endpoints**: Guest-token endpoints require no authentication, removing token type as a failure variable.
+2. **Use guaranteed-nonexistent resource IDs**: Meeting codes like `"nonexistent-00000000"` will always 404, ensuring the error response body is always available for validation.
+3. **Panic on unexpected success**: If the "nonexistent" resource unexpectedly returns 200, panic with a clear message -- this catches test data contamination.
+4. **Check comprehensive sensitive patterns**: Validate the error body does not contain internal details (`grpc://`, `postgres://`, `DATABASE_URL`, `.rs:` line references, `RUST_BACKTRACE`, stack traces, panic info).
+
+**Why**: A sanitization test that only validates errors "if they occur" provides zero security coverage when the service is fully operational (200 responses). The test appears to pass but has validated nothing.
 
 ---

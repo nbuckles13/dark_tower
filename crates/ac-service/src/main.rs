@@ -93,6 +93,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Signing keys initialized");
 
+    // Initialize key management metric gauges from current DB state
+    // This ensures gauges reflect actual state after restarts (not zero)
+    if let Err(e) = key_management_service::init_key_metrics(&db_pool).await {
+        warn!("Failed to initialize key management metrics: {}", e);
+    }
+
     // Parse bind address before moving config
     let bind_address = config.bind_address.clone();
 

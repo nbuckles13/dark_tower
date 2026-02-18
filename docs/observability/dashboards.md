@@ -231,16 +231,21 @@ services:
 
 ### Kubernetes (Staging/Production)
 
-Dashboards are loaded via ConfigMap and Grafana sidecar:
+Dashboards are loaded via **dynamic ConfigMap discovery** using `kiwigrid/k8s-sidecar`:
+
+**How it works**:
+1. The setup script dynamically discovers dashboard JSON files from `infra/grafana/dashboards/`
+2. Files are grouped by service prefix (e.g., `ac-*.json` -> `grafana-dashboards-ac`)
+3. Files without a `{prefix}-*` pattern go into `grafana-dashboards-common`
+4. Each ConfigMap is labeled with `grafana_dashboard=1` and applied with `--server-side` (avoids the 262KB annotation limit)
+5. A `kiwigrid/k8s-sidecar` init container discovers labeled ConfigMaps and writes them to a shared `emptyDir` volume at `/var/lib/grafana/dashboards`
+
+**Adding a new dashboard**: Simply place the JSON file in `infra/grafana/dashboards/` following the `{service}-{name}.json` naming convention. Re-run `setup.sh` and the file will be automatically picked up -- no script edits required.
 
 ```bash
-# Create ConfigMap from dashboard files
-kubectl create configmap grafana-dashboards \
-  --from-file=infra/grafana/dashboards \
-  -n dark-tower
-
-# Grafana deployment mounts ConfigMap
-# Sidecar auto-discovers dashboards with label: grafana_dashboard=1
+# Example: adding a new mc-latency.json dashboard
+cp my-dashboard.json infra/grafana/dashboards/mc-latency.json
+# Re-run setup.sh -- it auto-discovers the new file and adds it to grafana-dashboards-mc
 ```
 
 ---

@@ -157,8 +157,11 @@ impl ClusterConnection {
     }
 
     /// Check if the GC service health endpoint is responding.
+    ///
+    /// GC health endpoint is at `/health` (not versioned).
+    /// Source of truth: `crates/gc-service/src/routes/mod.rs`
     pub async fn check_gc_health(&self) -> Result<(), ClusterError> {
-        let health_url = format!("{}/v1/health", self.gc_base_url);
+        let health_url = format!("{}/health", self.gc_base_url);
 
         let response = self.http_client.get(&health_url).send().await?;
 

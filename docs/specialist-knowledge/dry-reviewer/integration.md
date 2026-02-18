@@ -204,10 +204,10 @@ ActorMetrics uses identical increment/decrement pattern in 4 methods (`meeting_c
 ---
 
 ### TD-21: Counter+Histogram Recording Pattern Inconsistency
-**Added**: 2026-02-10 | **Updated**: 2026-02-16
+**Added**: 2026-02-10 | **Updated**: 2026-02-17
 **Related files**: `crates/mc-service/src/observability/metrics.rs:154-174, 253-291`, `crates/gc-service/src/observability/metrics.rs:43-63`, `crates/ac-service/src/observability/metrics.rs:30-35`
 
-MC uses separate functions for counter and histogram recording (`record_gc_heartbeat()` + `record_gc_heartbeat_latency()`), while AC and GC combine them into single functions (`record_token_issuance()`, `record_http_request()` record both counter and histogram). Severity: Low (both approaches work correctly, stylistic inconsistency only). Improvement path: Consider unifying pattern across services when establishing shared metric patterns (if ever moved to common crate). Timeline: Phase 5+ (infrastructure cleanup). Note: MC pattern allows recording only counter OR only histogram if needed (flexibility), while AC/GC pattern reduces duplication at call sites (convenience). Both are valid per ADR-0011. **Update 2026-02-16**: MC's new `record_token_refresh()` and `record_error()` follow the combined style (matching GC), partially resolving this inconsistency. MC now has both styles: old separate functions for heartbeats, new combined functions for token refresh/errors.
+MC uses separate functions for counter and histogram recording (`record_gc_heartbeat()` + `record_gc_heartbeat_latency()`), while AC and GC combine them into single functions (`record_token_issuance()`, `record_http_request()` record both counter and histogram). Severity: Low (both approaches work correctly, stylistic inconsistency only). Improvement path: Consider unifying pattern across services when establishing shared metric patterns (if ever moved to common crate). Timeline: Phase 5+ (infrastructure cleanup). Note: MC pattern allows recording only counter OR only histogram if needed (flexibility), while AC/GC pattern reduces duplication at call sites (convenience). Both are valid per ADR-0011. **Update 2026-02-16**: MC's new `record_token_refresh()` and `record_error()` follow the combined style (matching GC), partially resolving this inconsistency. MC now has both styles: old separate functions for heartbeats, new combined functions for token refresh/errors. **Update 2026-02-17**: AC's new `record_db_query()` takes 4 params `(operation, table, status, duration)` with a `table` label, while GC's takes 3 params `(operation, status, duration)`. AC's per-table granularity is appropriate given fewer query call sites (~5 vs GC's ~15). Not a bug, but note for future `common` extraction: the interface will need to decide whether `table` is optional or required.
 
 ---
 
@@ -240,6 +240,46 @@ New AC panels lack `editorMode` and `range` fields on targets, while new GC and 
 **Related files**: `docs/observability/metrics/ac-service.md`, `docs/observability/metrics/gc.md`, `docs/observability/metrics/mc.md`
 
 AC catalog is `ac-service.md` while GC is `gc.md` and MC is `mc.md`. Guard script discovers files by globbing `*.md` so naming doesn't affect functionality. Severity: Low. Improvement path: Rename to consistent pattern (recommend `ac.md`, `gc.md`, `mc.md` to match the shorter convention established by GC/MC). Timeline: Next cleanup sprint.
+
+---
+
+### TD-26: Duplicate 401 Panic Message in MC-GC Integration Tests
+**Added**: 2026-02-18 | **Status**: Resolved (2026-02-18)
+**Related files**: `crates/env-tests/tests/22_mc_gc_integration.rs`
+
+Originally 4 occurrences of identical 401 panic message. Resolved: the authenticated join tests that contained these messages were removed from file 22 (they required user tokens and seeded meetings that env-tests cannot yet provide). The remaining tests in file 22 use `assert_ne!(status, 401, ...)` instead of panic, which is not duplicated.
+
+---
+
+### TD-27: Claims Struct Duplication in Env-Tests
+**Added**: 2026-02-18
+**Related files**: `crates/env-tests/tests/20_auth_flows.rs:17-23`, `crates/env-tests/tests/25_auth_security.rs:17-24`
+
+Both define identical `Claims { sub, exp, iat, scope, aud }` struct for JWT deserialization. Severity: Low (2 occurrences, test code, small struct). Improvement path: Extract to `env_tests::fixtures::auth_client::Claims` as a shared type. Timeline: Next env-tests cleanup sprint.
+
+---
+
+### TD-28: GC Health Endpoint Path Duplication
+**Added**: 2026-02-18
+**Related files**: `crates/env-tests/src/cluster.rs:164`, `crates/env-tests/src/fixtures/gc_client.rs:262`
+
+Both hardcode `format!("{}/health", ...)` for GC health. Mitigated by "Source of truth" doc comments pointing to `crates/gc-service/src/routes/mod.rs`. Severity: Low (2 occurrences, same crate, doc comments mitigate). Improvement path: `cluster.rs` could delegate to `GcClient::health_check()`, or extract a `GC_HEALTH_PATH` constant. Timeline: Low priority, only if path changes again.
+
+---
+
+### TD-29: Key Management Gauge Update Block (3 occurrences)
+**Added**: 2026-02-18
+**Related files**: `crates/ac-service/src/services/key_management_service.rs:100-102, 170-172`, `crates/ac-service/src/handlers/admin_handler.rs:389-391`
+
+Identical 3-line block: `set_active_signing_keys(1); set_signing_key_age_days(0.0); set_key_rotation_last_success(Utc::now().timestamp() as f64);` in initialize_signing_key, rotate_signing_key, and handle_rotate_keys. Severity: Low (3 occurrences, same crate, different function contexts). The admin handler version exists because `rotate_signing_key_tx` cannot set gauges before transaction commit. `init_key_metrics` has a different variant (reads from DB). Improvement path: Extract to `fn update_key_gauges_after_rotation()` in `key_management_service.rs`. Timeline: Next cleanup sprint.
+
+---
+
+### TD-30: AC DB Query Instrumentation Boilerplate (16 occurrences)
+**Added**: 2026-02-18
+**Related files**: `crates/ac-service/src/repositories/{auth_events,organizations,service_credentials,signing_keys,users}.rs`
+
+Each query function adds a 4-line instrumentation block: `let start = Instant::now(); ... let status = if result.is_ok() { "success" } else { "error" }; record_db_query(op, table, status, start.elapsed());`. 16 occurrences across 5 files. Follows established "Metrics Recording at Operation Boundaries" pattern. AC's `record_db_query` takes 4 params (operation, table, status, duration) vs GC's 3 params (operation, status, duration) -- signature difference tracked in TD-21. Severity: Low (convention, explicit form is clear and greppable). Improvement path: Could reduce with a macro or instrumented query wrapper, but explicit form is preferred for now. Timeline: Only if occurrence count exceeds 25 or a third service adopts the pattern.
 
 ---
 This differs from Security, Test, and Code Quality reviewers where ALL findings block. Only genuine shared code requiring extraction should be classified as BLOCKER.

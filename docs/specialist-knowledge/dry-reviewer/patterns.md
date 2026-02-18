@@ -243,6 +243,33 @@ match operation().await {
         record_histogram(type, duration);
         // handle error
     }
+---
+
+## Test Fixture Helper Variants for Precondition Splits
+
+**Added**: 2026-02-18
+**Related files**: `crates/env-tests/tests/21_cross_service_flows.rs:29-38`, `crates/env-tests/tests/22_mc_gc_integration.rs:30-39`, `crates/env-tests/tests/00_cluster_health.rs:12-16`
+
+**Pattern**: When integration test files share a common setup helper (`cluster()`) but different files require different service preconditions, create two variants of the helper rather than a single parameterized version:
+
+- **Simple variant** (AC-only tests): `ClusterConnection::new().await.expect("...")`
+- **Extended variant** (GC-dependent tests): Simple variant + `cluster.check_gc_health().await.expect("GC must be running...")`
+
+**Benefits**:
+- Each test file declares its preconditions upfront in the helper
+- No silent skips -- missing services cause immediate test failure
+- No unnecessary precondition checks in tests that don't need them
+- The two variants are self-documenting about which services each test file requires
+
+**This is NOT duplication** because:
+- The variants differ semantically (different precondition sets)
+- Extracting a parameterized `cluster_with_services(&[Service::GC])` adds complexity for 2 variants
+- Each variant is used by multiple test files (5 files use simple, 2 use extended)
+
+**When to extract**: If a third variant appears (e.g., MC-dependent tests needing `check_mc_health()`), consider a builder pattern or parameterized helper. Two variants is the sweet spot where explicit code is clearer than abstraction.
+
+---
+
 ## Closure-Based Generic Extraction for Same-Crate Duplication
 
 **Added**: 2026-02-12 | **Updated**: 2026-02-12 (iteration 2: simplified API)

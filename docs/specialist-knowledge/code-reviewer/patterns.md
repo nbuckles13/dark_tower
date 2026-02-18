@@ -232,6 +232,30 @@ When a struct field is used exclusively to carry bounded metric labels (e.g., er
 
 ---
 
+## Pattern: File-Consistent DB Query Instrumentation
+**Added**: 2026-02-17
+**Related files**: `crates/ac-service/src/repositories/signing_keys.rs`
+
+When selectively instrumenting repository functions with `record_db_query`, ensure all **live** (non-`#[allow(dead_code)]`) functions in the same file are instrumented. Instrumenting `create_signing_key` and `get_active_key` but not `get_all_active_keys` in the same file creates a consistency gap that confuses both reviewers and operators (missing data for JWKS queries in dashboards). The rule: if you're adding `record_db_query` to a repository file, instrument all public functions that are actually called in production. Dead-code / future-phase functions can be skipped.
+
+---
+
+## Pattern: Shared Test Helper for Infrastructure Prerequisites (env-tests)
+**Added**: 2026-02-18
+**Related files**: `crates/env-tests/tests/21_cross_service_flows.rs`, `crates/env-tests/tests/22_mc_gc_integration.rs`
+
+When all tests in an env-test file require the same infrastructure dependency (e.g., GC service running), enforce it once in the shared `cluster()` helper rather than with per-test guard clauses. The helper calls `check_gc_health().await.expect("GC service must be running for ...")` so that failure is a single loud panic with an actionable message instead of N silent skips. This eliminates the per-test `if !cluster.is_gc_available() { println!("SKIPPED"); return; }` boilerplate and ensures the prerequisite cannot be accidentally omitted from a new test added to the file. Different test files can have different `cluster()` helpers with file-appropriate prerequisites (e.g., `21_cross_service_flows.rs` requires GC, `00_cluster_health.rs` does not).
+
+---
+
+## Pattern: Module Doc Comments for Intentionally Absent Tests
+**Added**: 2026-02-18
+**Related files**: `crates/env-tests/tests/22_mc_gc_integration.rs`
+
+When tests are intentionally removed or deferred (not just forgotten), document the rationale in the module-level `//!` doc comment with: (1) what was removed and why, (2) specific blockers preventing reimplementation (numbered list), (3) where coverage is maintained instead (e.g., "lives in `crates/gc-service/tests/meeting_tests.rs`"), (4) conditions for re-adding (TODO with concrete criteria). This prevents the next developer from re-adding the same broken tests. The module doc is preferable to inline comments because it's visible at the top of the file and survives test refactoring. Cross-reference a `.claude/TODO.md` tracking entry for discoverability outside the test file.
+
+---
+
 ## Pattern: Automated Cross-Referencing for Dashboard/Catalog Reviews
 **Added**: 2026-02-16
 **Related files**: `infra/grafana/dashboards/*.json`, `docs/observability/metrics/*.md`, `crates/*/src/observability/metrics.rs`

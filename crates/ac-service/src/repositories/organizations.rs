@@ -4,8 +4,10 @@
 //! organization extraction per ADR-0020.
 
 use crate::errors::AcError;
+use crate::observability::metrics::record_db_query;
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
+use std::time::Instant;
 use uuid::Uuid;
 
 /// Organization model (maps to organizations table)
@@ -30,7 +32,8 @@ pub async fn get_by_subdomain(
     pool: &PgPool,
     subdomain: &str,
 ) -> Result<Option<Organization>, AcError> {
-    let org = sqlx::query_as::<_, Organization>(
+    let start = Instant::now();
+    let result = sqlx::query_as::<_, Organization>(
         r#"
         SELECT
             org_id, subdomain, display_name, plan_tier,
@@ -42,8 +45,12 @@ pub async fn get_by_subdomain(
     )
     .bind(subdomain)
     .fetch_optional(pool)
-    .await
-    .map_err(|e| AcError::Database(format!("Failed to fetch organization by subdomain: {}", e)))?;
+    .await;
+    let status = if result.is_ok() { "success" } else { "error" };
+    record_db_query("select", "organizations", status, start.elapsed());
+    let org = result.map_err(|e| {
+        AcError::Database(format!("Failed to fetch organization by subdomain: {}", e))
+    })?;
 
     Ok(org)
 }
@@ -51,7 +58,8 @@ pub async fn get_by_subdomain(
 /// Get organization by org_id.
 #[allow(dead_code)] // Library function - will be used in future phases
 pub async fn get_by_id(pool: &PgPool, org_id: Uuid) -> Result<Option<Organization>, AcError> {
-    let org = sqlx::query_as::<_, Organization>(
+    let start = Instant::now();
+    let result = sqlx::query_as::<_, Organization>(
         r#"
         SELECT
             org_id, subdomain, display_name, plan_tier,
@@ -63,8 +71,11 @@ pub async fn get_by_id(pool: &PgPool, org_id: Uuid) -> Result<Option<Organizatio
     )
     .bind(org_id)
     .fetch_optional(pool)
-    .await
-    .map_err(|e| AcError::Database(format!("Failed to fetch organization by id: {}", e)))?;
+    .await;
+    let status = if result.is_ok() { "success" } else { "error" };
+    record_db_query("select", "organizations", status, start.elapsed());
+    let org = result
+        .map_err(|e| AcError::Database(format!("Failed to fetch organization by id: {}", e)))?;
 
     Ok(org)
 }

@@ -211,3 +211,27 @@ When renaming crates (e.g., `global-controller` → `gc-service`), the `EnvFilte
 Before this session, Step 4 (metric coverage in dashboards) was a soft warning, not a hard fail. This allowed 32 metrics to exist in code without any dashboard panel — silently. The guard passed, giving false confidence. When promoting guards from warning to hard-fail, audit the current state first: soft warnings may have been accumulating for weeks. Similarly, when adding new guard steps (Step 5: catalog coverage), verify the catalog actually exists for all services before enabling the check.
 
 ---
+
+## Gotcha: Silent Skip + Wrong URLs = Invisible Broken Tests
+**Added**: 2026-02-18
+**Related files**: `crates/env-tests/tests/21_cross_service_flows.rs`, `crates/env-tests/src/fixtures/gc_client.rs`
+
+The `is_gc_available()` guard pattern (`if !available { println!("SKIPPED"); return; }`) combined with wrong GC URLs created a feedback loop: (1) `gc_client.rs` used `/v1/health` but GC serves `/health`, (2) `is_gc_available()` always returned false, (3) all 20 GC-dependent tests silently skipped, (4) CI showed green because feature-gated tests need `--features flows`. Root cause was URL mismatch, not missing GC. Fix: remove skip guards entirely, make service availability a hard requirement via `cluster()` helper with `check_gc_health().await.expect(...)`. Source of truth for GC URLs: `crates/gc-service/src/routes/mod.rs`. The `/api/v1/` prefix applies to API endpoints but NOT to `/health` or `/metrics`.
+
+---
+
+## Gotcha: Multi-Status Acceptance Is Silent Skip In Disguise
+**Added**: 2026-02-18
+**Related files**: `crates/env-tests/tests/22_mc_gc_integration.rs`
+
+Tests that accept multiple error codes as "success" (e.g., `assert!(status == 404 || status == 503)`) are the same anti-pattern as silent skips — they hide that the test never validates the intended flow. In MC integration tests, `test_meeting_join_returns_mc_assignment` accepted 404 ("meeting not found") as valid, meaning the test always took the error branch and never tested MC assignment. Similarly, `test_error_responses_sanitized` used `join_meeting` with a service token (string `sub`), which always fails at UUID parse before reaching the error path under test. Fix: either create the preconditions (seed meeting, use proper user token) or remove the test and track coverage elsewhere. For error behavior testing (sanitization, status codes), use public endpoints (guest-token) that don't require complex auth setup — they exercise the same error response middleware.
+
+---
+
+## Gotcha: Partial Repository Instrumentation Creates Invisible Coverage Gaps
+**Added**: 2026-02-17
+**Related files**: `crates/ac-service/src/repositories/users.rs`, `crates/ac-service/src/repositories/organizations.rs`
+
+When wiring `record_db_query` into repositories, it's easy to instrument only the repositories touched by the PR scope (e.g., `auth_events.rs`, `service_credentials.rs`, `signing_keys.rs`) while leaving others uninstrumented (`users.rs` with 15 queries, `organizations.rs` with 5 queries). No guard or lint catches this — `record_db_query` has no `#[allow(dead_code)]` to flag missing call sites since it IS called from some repositories. The gap is only visible by manually comparing repository files against instrumentation call sites. When reviewing DB metric wiring, always `grep -r record_db_query` across ALL repository files and compare against `grep -rl 'sqlx::query'` to find uninstrumented repositories.
+
+---

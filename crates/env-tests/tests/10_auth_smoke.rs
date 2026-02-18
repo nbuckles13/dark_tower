@@ -231,15 +231,11 @@ async fn test_rate_limiting_via_requests(cluster: &ClusterConnection) {
         }
     }
 
-    // If we sent max_requests without hitting rate limit, it might not be enabled
-    // This is a warning, not a hard failure, as rate limits might be very high
-    if !got_rate_limited {
-        // Log warning but don't fail - rate limiting might have high thresholds
-        eprintln!(
-            "WARNING: Sent {} requests without hitting rate limit (429). \
-             Rate limiting may not be enabled or thresholds are very high. \
-             Consider verifying rate limit configuration.",
-            max_requests
-        );
-    }
+    assert!(
+        got_rate_limited,
+        "Sent {} requests without hitting rate limit (429). \
+         Rate limiting appears to not be enabled or configured. \
+         Verify rate limit configuration in AC service.",
+        max_requests
+    );
 }

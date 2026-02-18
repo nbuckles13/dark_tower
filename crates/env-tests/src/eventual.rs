@@ -16,7 +16,7 @@ pub enum ConsistencyCategory {
     /// Prometheus metrics scraping (2x 15s scrape interval = 30s)
     MetricsScrape,
 
-    /// Loki log aggregation (2x 10s flush interval = 20s)
+    /// Loki log aggregation (~3x 10s flush interval = 45s, generous for ingestion lag)
     LogAggregation,
 
     /// Cross-replica synchronization (2x 5s expected = 10s)
@@ -31,7 +31,7 @@ impl ConsistencyCategory {
     pub fn timeout(&self) -> Duration {
         match self {
             ConsistencyCategory::MetricsScrape => Duration::from_secs(30),
-            ConsistencyCategory::LogAggregation => Duration::from_secs(20),
+            ConsistencyCategory::LogAggregation => Duration::from_secs(45),
             ConsistencyCategory::ReplicaSync => Duration::from_secs(10),
             ConsistencyCategory::K8sResourceUpdate => Duration::from_secs(60),
         }
@@ -117,7 +117,7 @@ mod tests {
         );
         assert_eq!(
             ConsistencyCategory::LogAggregation.timeout(),
-            Duration::from_secs(20)
+            Duration::from_secs(45)
         );
         assert_eq!(
             ConsistencyCategory::ReplicaSync.timeout(),

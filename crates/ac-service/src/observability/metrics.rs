@@ -91,7 +91,7 @@ pub fn record_token_issuance(grant_type: &str, status: &str, duration: Duration)
 /// Labels: `status`, `error_category`
 ///
 /// NOTE: Defined per ADR-0011 for future token validation metrics.
-#[allow(dead_code)]
+#[allow(dead_code)] // Will be used in Phase 4 token validation endpoints
 pub fn record_token_validation(status: &str, error_category: Option<&str>) {
     let category = error_category.unwrap_or("none");
     counter!("ac_token_validations_total", "status" => status.to_string(), "error_category" => category.to_string())
@@ -113,7 +113,6 @@ pub fn record_key_rotation(status: &str) {
 /// Update signing key age gauge
 ///
 /// Metric: `ac_signing_key_age_days`
-#[allow(dead_code)]
 pub fn set_signing_key_age_days(age_days: f64) {
     gauge!("ac_signing_key_age_days").set(age_days);
 }
@@ -121,7 +120,6 @@ pub fn set_signing_key_age_days(age_days: f64) {
 /// Update active signing keys count
 ///
 /// Metric: `ac_active_signing_keys`
-#[allow(dead_code)]
 pub fn set_active_signing_keys(count: u64) {
     gauge!("ac_active_signing_keys").set(count as f64);
 }
@@ -129,7 +127,6 @@ pub fn set_active_signing_keys(count: u64) {
 /// Record key rotation last success timestamp
 ///
 /// Metric: `ac_key_rotation_last_success_timestamp`
-#[allow(dead_code)]
 pub fn set_key_rotation_last_success(timestamp_secs: f64) {
     gauge!("ac_key_rotation_last_success_timestamp").set(timestamp_secs);
 }
@@ -142,7 +139,6 @@ pub fn set_key_rotation_last_success(timestamp_secs: f64) {
 ///
 /// Metric: `ac_rate_limit_decisions_total`
 /// Labels: `action` (allowed, rejected)
-#[allow(dead_code)]
 pub fn record_rate_limit_decision(action: &str) {
     counter!("ac_rate_limit_decisions_total", "action" => action.to_string()).increment(1);
 }
@@ -155,7 +151,6 @@ pub fn record_rate_limit_decision(action: &str) {
 ///
 /// Metric: `ac_db_query_duration_seconds`, `ac_db_queries_total`
 /// Labels: `operation`, `table`, `status`
-#[allow(dead_code)]
 pub fn record_db_query(operation: &str, table: &str, status: &str, duration: Duration) {
     histogram!("ac_db_query_duration_seconds", "operation" => operation.to_string(), "table" => table.to_string())
         .record(duration.as_secs_f64());
@@ -173,9 +168,7 @@ pub fn record_db_query(operation: &str, table: &str, status: &str, duration: Dur
 /// Metric: `ac_bcrypt_duration_seconds`
 /// Labels: `operation` (hash, verify)
 ///
-/// Note: Uses coarse buckets (50ms minimum) per Security specialist
-/// to prevent timing side-channel attacks.
-#[allow(dead_code)]
+/// Note: Uses coarse buckets (50ms minimum).
 pub fn record_bcrypt_duration(operation: &str, duration: Duration) {
     histogram!("ac_bcrypt_duration_seconds", "operation" => operation.to_string())
         .record(duration.as_secs_f64());
@@ -203,7 +196,6 @@ pub fn record_jwks_request(cache_status: &str) {
 /// Labels: `event_type`, `reason`
 ///
 /// ALERT: Any non-zero value should trigger oncall page
-#[allow(dead_code)]
 pub fn record_audit_log_failure(event_type: &str, reason: &str) {
     counter!("ac_audit_log_failures_total", "event_type" => event_type.to_string(), "reason" => reason.to_string())
         .increment(1);
@@ -227,21 +219,19 @@ pub fn record_error(operation: &str, error_category: &str, status_code: u16) {
 }
 
 // ============================================================================
-// Admin Operations Metrics
+// Credential Operations Metrics
 // ============================================================================
 
-/// Record admin client management operation
+/// Record service credential management operation
 ///
-/// Metric: `ac_admin_operations_total`
+/// Metric: `ac_credential_operations_total`
 /// Labels: `operation`, `status`
 ///
 /// Operations: list, get, create, update, delete, rotate_secret
 /// Status: success, error
 ///
-/// NOTE: Defined per review feedback O2 for admin operation tracking.
-#[allow(dead_code)]
-pub fn record_admin_operation(operation: &str, status: &str) {
-    counter!("ac_admin_operations_total", "operation" => operation.to_string(), "status" => status.to_string())
+pub fn record_credential_operation(operation: &str, status: &str) {
+    counter!("ac_credential_operations_total", "operation" => operation.to_string(), "status" => status.to_string())
         .increment(1);
 }
 
@@ -688,18 +678,18 @@ mod tests {
     }
 
     #[test]
-    fn test_record_admin_operation() {
+    fn test_record_credential_operation() {
         // Test with various operations and statuses
-        record_admin_operation("list", "success");
-        record_admin_operation("get", "success");
-        record_admin_operation("create", "success");
-        record_admin_operation("update", "success");
-        record_admin_operation("delete", "success");
-        record_admin_operation("rotate_secret", "success");
+        record_credential_operation("list", "success");
+        record_credential_operation("get", "success");
+        record_credential_operation("create", "success");
+        record_credential_operation("update", "success");
+        record_credential_operation("delete", "success");
+        record_credential_operation("rotate_secret", "success");
 
         // Error cases
-        record_admin_operation("create", "error");
-        record_admin_operation("update", "error");
-        record_admin_operation("delete", "error");
+        record_credential_operation("create", "error");
+        record_credential_operation("update", "error");
+        record_credential_operation("delete", "error");
     }
 }

@@ -274,3 +274,24 @@ MC uses two separate metrics systems with different consumers:
 **Key rule**: Both track meetings, but only `ActorMetrics` emits to Prometheus. `ControllerMetrics` is solely for GC heartbeats. Both are passed as `Arc<T>` through the actor hierarchy so child actors can update shared counters.
 
 ---
+
+## Integration: env-tests MC Coverage and Testability Matrix
+**Added**: 2026-02-18
+**Related files**: `crates/env-tests/tests/22_mc_gc_integration.rs`, `.claude/TODO.md`
+
+MC-related env-tests are limited by infrastructure prerequisites. Current testability matrix:
+
+**Testable via env-tests today**:
+- Guest-token endpoint (`POST /api/v1/meetings/{code}/guest-token`): public, no auth needed, exercises GC meeting lookup and error sanitization
+- MC->GC registration and heartbeats: both NetworkPolicies allow this path (MC egress to GC:50051, GC ingress from MC:50051)
+
+**NOT testable via env-tests (blocked)**:
+- Authenticated meeting join (`GET /api/v1/meetings/{code}`): requires user JWT with UUID `sub` (env-tests only have service credentials), seeded meeting data, and healthy MC
+- MC assignment success path: blocked by GC NetworkPolicy missing egress to MC:50052
+- Meeting token issuance: requires AC internal meeting-token endpoint with correct GC service-to-service auth
+
+**Where blocked coverage lives instead**: `crates/gc-service/tests/meeting_tests.rs` provides integration tests using `sqlx::test` with a test harness that seeds meetings, users, orgs, and MCs -- exercising the full join flow without cluster infrastructure.
+
+**Blockers tracked in**: `.claude/TODO.md` under "env-tests: Authenticated Meeting Join Tests (Deferred 2026-02-18)"
+
+---

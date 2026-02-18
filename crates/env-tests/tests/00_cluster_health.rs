@@ -71,24 +71,19 @@ async fn test_secrets_not_in_env_vars() {
         ])
         .output();
 
-    let output = match output {
-        Ok(o) => o,
-        Err(e) => {
-            eprintln!(
-                "Warning: kubectl not available - skipping secret exposure test: {}",
-                e
-            );
-            return;
-        }
-    };
+    let output = output.unwrap_or_else(|e| {
+        panic!(
+            "kubectl not available - cannot verify secret leak protection. \
+             env-tests require kubectl to be installed and configured: {}",
+            e
+        )
+    });
 
-    if !output.status.success() {
-        eprintln!(
-            "Warning: kubectl command failed - skipping secret exposure test: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        return;
-    }
+    assert!(
+        output.status.success(),
+        "kubectl command failed - cannot verify secret leak protection: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     let env_vars = String::from_utf8_lossy(&output.stdout);
 
@@ -121,24 +116,19 @@ async fn test_secrets_not_in_logs() {
         ])
         .output();
 
-    let output = match output {
-        Ok(o) => o,
-        Err(e) => {
-            eprintln!(
-                "Warning: kubectl not available - skipping log exposure test: {}",
-                e
-            );
-            return;
-        }
-    };
+    let output = output.unwrap_or_else(|e| {
+        panic!(
+            "kubectl not available - cannot verify secret leak protection. \
+             env-tests require kubectl to be installed and configured: {}",
+            e
+        )
+    });
 
-    if !output.status.success() {
-        eprintln!(
-            "Warning: kubectl logs command failed - skipping log exposure test: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        return;
-    }
+    assert!(
+        output.status.success(),
+        "kubectl logs command failed - cannot verify secret leak protection: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     let logs = String::from_utf8_lossy(&output.stdout);
 

@@ -19,3 +19,11 @@ When reviewing `with_on_refresh` callback wiring, verify the full data flow from
 When a new service adds metrics that mirror an existing service (e.g., MC adding `record_token_refresh` after GC), compare the implementations side-by-side. Check: (1) function signatures match, (2) metric name prefixes differ correctly (gc_ vs mc_), (3) histogram buckets align where SLOs are shared, (4) test values use the correct service's domain (HTTP codes for GC, signaling codes for MC). The implementations should be structurally identical with only the prefix differing.
 
 ---
+
+## Pattern: Three-Way Consistency Check for Metric Arguments
+**Added**: 2026-02-18
+**Related files**: `crates/mc-service/src/observability/metrics.rs`, `docs/observability/metrics/mc.md`
+
+When reviewing metric recording calls, verify consistency across three sources: (1) the dedicated unit test for that function, (2) any integration test that also calls the function, and (3) the metrics catalog doc. Dedicated unit tests are the most likely to have correct domain values; integration tests are the most likely to have drifted values since their assertions focus on recorder behavior, not label correctness. Flag any disagreement between the three sources.
+
+---

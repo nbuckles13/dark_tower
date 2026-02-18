@@ -1513,7 +1513,7 @@
     },
     {
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "description": "Number of active signing keys in the keystore. Pending instrumentation.",
+      "description": "Number of active signing keys in the keystore.",
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "thresholds" },
@@ -1555,7 +1555,7 @@
     },
     {
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "description": "Age of the current signing key in days. Alert when key age exceeds rotation threshold. Pending instrumentation.",
+      "description": "Age of the current signing key in days. Alert when key age exceeds rotation threshold.",
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "thresholds" },
@@ -1598,7 +1598,7 @@
     },
     {
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "description": "Unix timestamp of the last successful key rotation. Pending instrumentation.",
+      "description": "Unix timestamp of the last successful key rotation.",
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "thresholds" },
@@ -1689,7 +1689,7 @@
     },
     {
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "description": "Database query rate by operation type and status. Pending instrumentation.",
+      "description": "Database query rate by operation type and status.",
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "palette-classic" },
@@ -1731,7 +1731,7 @@
     },
     {
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "description": "Database query latency percentiles (p50, p95, p99). Pending instrumentation.",
+      "description": "Database query latency percentiles (p50, p95, p99).",
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "palette-classic" },
@@ -1838,7 +1838,7 @@
     },
     {
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "description": "Bcrypt operation latency (hash/verify). Pending instrumentation.",
+      "description": "Bcrypt operation latency (hash/verify).",
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "palette-classic" },
@@ -1888,7 +1888,7 @@
     },
     {
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "description": "Rate limiting decisions (allowed vs rejected). Tracks rate limiter effectiveness. Pending instrumentation.",
+      "description": "Rate limiting decisions (allowed vs rejected). Tracks rate limiter effectiveness.",
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "palette-classic" },
@@ -1937,7 +1937,7 @@
     },
     {
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "description": "Audit log write failures. ANY non-zero value is compliance-critical and should trigger investigation. Pending instrumentation.",
+      "description": "Audit log write failures. ANY non-zero value is compliance-critical and should trigger investigation.",
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "thresholds" },
@@ -1979,7 +1979,7 @@
     },
     {
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "description": "Admin client management operations by type and status. Pending instrumentation.",
+      "description": "Service credential management operations by type and status.",
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "palette-classic" },
@@ -2010,13 +2010,13 @@
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
           "editorMode": "code",
-          "expr": "sum by(operation, status) (rate(ac_admin_operations_total{job=\"ac-service\"}[5m]))",
+          "expr": "sum by(operation, status) (rate(ac_credential_operations_total{job=\"ac-service\"}[5m]))",
           "legendFormat": "{{operation}} ({{status}})",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "Admin Operations by Type",
+      "title": "Credential Operations by Type",
       "type": "timeseries"
     },
     {
@@ -2029,7 +2029,7 @@
     },
     {
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "description": "Token validation attempts by status and error category. Pending instrumentation.",
+      "description": "Token validation attempts by status and error category. Partially instrumented (clock_skew errors only).",
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "palette-classic" },

@@ -1,6 +1,8 @@
 use crate::errors::AcError;
 use crate::models::ServiceCredential;
+use crate::observability::metrics::record_db_query;
 use sqlx::PgPool;
+use std::time::Instant;
 use uuid::Uuid;
 
 /// Create a new service credential
@@ -38,7 +40,8 @@ pub async fn get_by_client_id(
     pool: &PgPool,
     client_id: &str,
 ) -> Result<Option<ServiceCredential>, AcError> {
-    let credential = sqlx::query_as::<_, ServiceCredential>(
+    let start = Instant::now();
+    let result = sqlx::query_as::<_, ServiceCredential>(
         r#"
         SELECT
             credential_id, client_id, client_secret_hash, service_type, region, scopes,
@@ -49,8 +52,13 @@ pub async fn get_by_client_id(
     )
     .bind(client_id)
     .fetch_optional(pool)
-    .await
-    .map_err(|e| AcError::Database(format!("Failed to fetch service credential: {}", e)))?;
+    .await;
+
+    let status = if result.is_ok() { "success" } else { "error" };
+    record_db_query("select", "service_credentials", status, start.elapsed());
+
+    let credential = result
+        .map_err(|e| AcError::Database(format!("Failed to fetch service credential: {}", e)))?;
 
     Ok(credential)
 }

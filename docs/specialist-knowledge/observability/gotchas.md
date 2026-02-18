@@ -113,6 +113,53 @@ The `gc_errors_total` cross-cutting error counter uses subsystem-prefixed operat
 
 ---
 
+### Gauge Metrics Reset to Zero on Service Restart
+**Discovered**: 2026-02-17 (ac-metrics-instrumentation)
+**Related files**: `crates/ac-service/src/services/key_management_service.rs`, `crates/ac-service/src/main.rs`
+
+Prometheus gauges (e.g., `ac_active_signing_keys`, `ac_signing_key_age_days`, `ac_key_rotation_last_success_timestamp`) reset to zero when the service restarts. If gauges are only updated on events (e.g., key rotation), they stay at zero until the next event occurs -- which could be days or weeks.
+
+**Impact**: On-call sees `ac_signing_key_age_days=0` and interprets it as "fresh key" when the key is actually 90 days old. `ac_active_signing_keys=0` looks like no keys exist. Both would trigger false alerts.
+
+**Fix**: Always initialize gauges at startup by querying current state from the database (or other source of truth). The pattern is: (1) startup query sets initial gauge values, (2) event-driven updates keep them current thereafter. No periodic refresh needed -- just startup + events.
+
+**Example**: `key_management_service::init_key_metrics()` queries active keys from DB at startup and sets all three key management gauges. Called from `main.rs` after `initialize_signing_key()` with non-fatal error handling.
+
+---
+
+### Silent Test Skips Mask Observability Endpoint Drift
+**Discovered**: 2026-02-18 (env-tests fix)
+**Related files**: `crates/env-tests/src/fixtures/gc_client.rs`, `crates/env-tests/src/cluster.rs`, `crates/env-tests/tests/21_cross_service_flows.rs`, `crates/env-tests/tests/22_mc_gc_integration.rs`
+
+Env-test fixtures that check service availability before running tests (`if !cluster.is_gc_available().await { println!("SKIPPED"); return; }`) can silently mask broken test infrastructure. The GC client fixture had wrong URL paths (`/v1/health` instead of `/health`, `/v1/meetings/{code}` instead of `/api/v1/meetings/{code}`) for an unknown period. Because every test checked GC availability first and silently skipped on failure, the URL mismatch was never surfaced -- the health check itself was hitting the wrong endpoint, getting a 404, and causing the skip.
+
+**Why this is an observability concern**: Tests in `30_observability.rs` that validate Prometheus scraping and metrics endpoints depend on the same `ClusterConnection` infrastructure. If the cluster fixture silently fails, observability validation tests silently skip too. A full green test suite gives false confidence that metrics endpoints, Prometheus scraping, and log aggregation are validated when they may not have been exercised at all.
+
+**Fix applied**: GC availability is now checked once in the `cluster()` helper with a hard `expect()` failure. Only truly optional infrastructure (Loki) retains soft-skip behavior, because `loki: Option<u16>` in `ClusterPorts` makes it explicitly optional.
+
+**Prevention**: When reviewing env-tests, treat any `eprintln!("SKIPPED..."); return;` pattern as suspicious. Ask: "Is this dependency truly optional, or should the test fail to alert that the test environment is broken?" Reserve soft-skips only for infrastructure declared as `Option<T>` in the cluster connection.
+
+---
+
+### Loki `query_range` Without Time Bounds Returns Empty Results Silently
+**Discovered**: 2026-02-18 (env-tests Loki fix, iteration 2)
+**Related files**: `crates/env-tests/tests/30_observability.rs`
+
+Loki's `/loki/api/v1/query_range` endpoint does NOT fail when `start` and `end` parameters are omitted -- it uses a server-side default window that may be extremely narrow or may not cover recently ingested logs. The test `test_logs_appear_in_loki` was timing out at 20s despite logs being visible in Grafana dashboards querying the same `{app="ac-service"}` label. The root cause was that Grafana sends explicit time bounds (from the dashboard time picker), while the test omitted them entirely.
+
+**Why it's silent**: The Loki API returns HTTP 200 with `{"status":"success","data":{"result":[]}}` -- a valid empty result, not an error. The test's retry loop interpreted this as "logs not yet available" and kept retrying until timeout.
+
+**Fix**: Always provide explicit `start` and `end` parameters on `query_range`. Use nanosecond Unix epoch timestamps with a lookback window generous enough to cover Promtail batching + Loki ingestion (5 minutes works well):
+```rust
+let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+let start = now.saturating_sub(5 * 60 * 1_000_000_000);
+format!("...query_range?query={{app=\"ac-service\"}}&start={}&end={}&limit=100", start, now)
+```
+
+**Prevention**: When reviewing any Loki API call in tests or tooling, check for explicit time bounds. Treat `query_range` without `start`/`end` the same way you'd treat a SQL query without a `WHERE` clause on a time-partitioned table.
+
+---
+
 ### Multi-Value Regex Fields Survive Partial Renames
 **Discovered**: 2026-02-16 (service rename: global-controller -> gc-service, meeting-controller -> mc-service)
 

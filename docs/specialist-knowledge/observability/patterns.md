@@ -43,6 +43,25 @@ This pattern works because: (a) `target:` requires compile-time constants so it 
 
 ---
 
+### DB Metric Labels: SQL Verbs + Table Names, Not Function Names
+**Learned**: 2026-02-17 (ac-metrics-instrumentation)
+**Related files**: `crates/ac-service/src/repositories/*.rs`, `docs/observability/metrics/ac-service.md`
+
+When instrumenting database queries with `record_db_query(operation, table, status, duration)`, use SQL verbs (`select`, `insert`, `update`, `delete`) for the `operation` label and actual database table names (`service_credentials`, `signing_keys`, `auth_events`) for the `table` label. Never use function names (e.g., `get_by_client_id`) as label values.
+
+**Why**: Function names are unbounded -- they change during refactoring, new functions are added freely, and the label cardinality grows with code, not with schema. SQL verbs are bounded to ~4 values and table names are bounded by the database schema (~5 tables in AC). This keeps cardinality predictable and aligned with the catalog definition.
+
+**Practical pattern**: Wrap the sqlx query result capture, record the metric before error mapping:
+```rust
+let start = Instant::now();
+let result = sqlx::query_as::<_, T>(sql).bind(...).fetch_one(pool).await;
+let status = if result.is_ok() { "success" } else { "error" };
+record_db_query("select", "signing_keys", status, start.elapsed());
+let value = result.map_err(|e| ...)?;
+```
+
+---
+
 ### Structured Fields as Runtime Differentiators
 **Learned**: 2026-02-12 (TD-13 health checker extraction)
 

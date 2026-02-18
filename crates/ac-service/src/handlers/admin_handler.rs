@@ -1,7 +1,10 @@
 use crate::crypto;
 use crate::errors::AcError;
 use crate::models::RegisterServiceResponse;
-use crate::observability::metrics::{record_error, record_key_rotation};
+use crate::observability::metrics::{
+    record_credential_operation, record_error, record_key_rotation, set_active_signing_keys,
+    set_key_rotation_last_success, set_signing_key_age_days,
+};
 use crate::observability::ErrorCategory;
 use crate::repositories::{service_credentials, signing_keys};
 use crate::services::{key_management_service, registration_service};
@@ -58,6 +61,7 @@ pub async fn handle_register_service(
             ErrorCategory::from(&err).as_str(),
             err.status_code(),
         );
+        record_credential_operation("create", "error");
         return Err(err);
     }
 
@@ -75,10 +79,14 @@ pub async fn handle_register_service(
 
     // ADR-0011: Record error category for failed requests
     match result {
-        Ok(response) => Ok(Json(response)),
+        Ok(response) => {
+            record_credential_operation("create", "success");
+            Ok(Json(response))
+        }
         Err(e) => {
             let category = ErrorCategory::from(&e);
             record_error("register_service", category.as_str(), e.status_code());
+            record_credential_operation("create", "error");
             Err(e)
         }
     }
@@ -376,6 +384,12 @@ pub async fn handle_rotate_keys(
     tracing::Span::current().record("status", "success");
     record_key_rotation("success");
 
+    // Update key management gauges after successful rotation via admin API.
+    // rotate_signing_key_tx does not set gauges, so we set them here.
+    set_active_signing_keys(1);
+    set_signing_key_age_days(0.0);
+    set_key_rotation_last_success(chrono::Utc::now().timestamp() as f64);
+
     Ok(Json(RotateKeysResponse {
         rotated: true,
         new_key_id,
@@ -548,12 +562,14 @@ pub async fn handle_list_clients(
                 "Clients listed successfully"
             );
 
+            record_credential_operation("list", "success");
             Ok(Json(clients))
         }
         Err(e) => {
             tracing::Span::current().record("status", "error");
             let category = ErrorCategory::from(&e);
             record_error("list_clients", category.as_str(), e.status_code());
+            record_credential_operation("list", "error");
 
             // Audit log failed operation
             tracing::warn!(
@@ -608,6 +624,7 @@ pub async fn handle_get_client(
                 "Client retrieved successfully"
             );
 
+            record_credential_operation("get", "success");
             Ok(Json(response))
         }
         Ok(None) => {
@@ -618,6 +635,7 @@ pub async fn handle_get_client(
                 ErrorCategory::from(&err).as_str(),
                 err.status_code(),
             );
+            record_credential_operation("get", "error");
 
             // Audit log failed operation
             tracing::warn!(
@@ -634,6 +652,7 @@ pub async fn handle_get_client(
             tracing::Span::current().record("status", "error");
             let category = ErrorCategory::from(&e);
             record_error("get_client", category.as_str(), e.status_code());
+            record_credential_operation("get", "error");
 
             // Audit log failed operation
             tracing::warn!(
@@ -737,12 +756,14 @@ pub async fn handle_create_client(
                 "Client created successfully"
             );
 
+            record_credential_operation("create", "success");
             Ok(Json(response))
         }
         Err(e) => {
             tracing::Span::current().record("status", "error");
             let category = ErrorCategory::from(&e);
             record_error("create_client", category.as_str(), e.status_code());
+            record_credential_operation("create", "error");
 
             // Audit log failed operation
             tracing::warn!(
@@ -783,6 +804,7 @@ pub async fn handle_update_client(
                 ErrorCategory::from(&err).as_str(),
                 err.status_code(),
             );
+            record_credential_operation("update", "error");
 
             // Audit log failed operation
             tracing::warn!(
@@ -799,6 +821,7 @@ pub async fn handle_update_client(
             tracing::Span::current().record("status", "error");
             let category = ErrorCategory::from(&e);
             record_error("update_client", category.as_str(), e.status_code());
+            record_credential_operation("update", "error");
 
             // Audit log failed operation
             tracing::warn!(
@@ -918,6 +941,7 @@ pub async fn handle_update_client(
         "Client updated successfully"
     );
 
+    record_credential_operation("update", "success");
     Ok(Json(response))
 }
 
@@ -954,12 +978,14 @@ pub async fn handle_delete_client(
                         "Client deleted successfully"
                     );
 
+                    record_credential_operation("delete", "success");
                     Ok(Json(serde_json::json!({ "deleted": true })))
                 }
                 Err(e) => {
                     tracing::Span::current().record("status", "error");
                     let category = ErrorCategory::from(&e);
                     record_error("delete_client", category.as_str(), e.status_code());
+                    record_credential_operation("delete", "error");
 
                     // Audit log failed operation
                     tracing::warn!(
@@ -982,6 +1008,7 @@ pub async fn handle_delete_client(
                 ErrorCategory::from(&err).as_str(),
                 err.status_code(),
             );
+            record_credential_operation("delete", "error");
 
             // Audit log failed operation
             tracing::warn!(
@@ -998,6 +1025,7 @@ pub async fn handle_delete_client(
             tracing::Span::current().record("status", "error");
             let category = ErrorCategory::from(&e);
             record_error("delete_client", category.as_str(), e.status_code());
+            record_credential_operation("delete", "error");
 
             // Audit log failed operation
             tracing::warn!(
@@ -1099,12 +1127,14 @@ pub async fn handle_rotate_client_secret(
                 "Client secret rotated successfully"
             );
 
+            record_credential_operation("rotate_secret", "success");
             Ok(Json(response))
         }
         Err(e) => {
             tracing::Span::current().record("status", "error");
             let category = ErrorCategory::from(&e);
             record_error("rotate_client_secret", category.as_str(), e.status_code());
+            record_credential_operation("rotate_secret", "error");
 
             // Audit log failed operation
             tracing::warn!(

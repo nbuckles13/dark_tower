@@ -4,6 +4,7 @@ use crate::crypto::{self, Claims, EncryptedKey, UserClaims};
 use crate::errors::AcError;
 use crate::models::{AuthEventType, TokenResponse};
 use crate::observability::hash_for_correlation;
+use crate::observability::metrics::{record_audit_log_failure, record_rate_limit_decision};
 use crate::repositories::{auth_events, service_credentials, signing_keys, users};
 use chrono::Utc;
 use common::secret::SecretBox;
@@ -62,8 +63,10 @@ pub async fn issue_service_token(
                 "Account locked due to excessive failed attempts: client_id_hash={}",
                 hash_for_correlation(client_id, hash_secret)
             );
+            record_rate_limit_decision("rejected");
             return Err(AcError::RateLimitExceeded);
         }
+        record_rate_limit_decision("allowed");
     }
 
     // Always run bcrypt to prevent timing attacks
@@ -98,6 +101,7 @@ pub async fn issue_service_token(
         .await
         {
             tracing::warn!("Failed to log auth event: {}", e);
+            record_audit_log_failure("service_token_failed", "db_write_failed");
         }
 
         return Err(AcError::InvalidCredentials);
@@ -164,6 +168,7 @@ pub async fn issue_service_token(
     .await
     {
         tracing::warn!("Failed to log auth event: {}", e);
+        record_audit_log_failure("service_token_issued", "db_write_failed");
     }
 
     Ok(TokenResponse {
@@ -225,11 +230,13 @@ pub async fn issue_user_token(
                 "User account locked due to excessive failed attempts: email_hash={}",
                 hash_for_correlation(email, hash_secret)
             );
+            record_rate_limit_decision("rejected");
             return Err(AcError::TooManyRequests {
                 retry_after_seconds: RATE_LIMIT_WINDOW_MINUTES * 60,
                 message: "Too many failed login attempts. Please try again later.".to_string(),
             });
         }
+        record_rate_limit_decision("allowed");
     }
 
     // Always run bcrypt to prevent timing attacks
@@ -349,6 +356,7 @@ async fn log_user_auth_event(
     .await
     {
         tracing::warn!("Failed to log user auth event: {}", e);
+        record_audit_log_failure(event_type, "db_write_failed");
     }
 }
 
