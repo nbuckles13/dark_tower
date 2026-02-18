@@ -3,6 +3,7 @@ use crate::config::DEFAULT_BCRYPT_COST;
 use crate::crypto;
 use crate::errors::AcError;
 use crate::models::{AuthEventType, RegisterServiceResponse, ServiceType};
+use crate::observability::metrics::record_audit_log_failure;
 use crate::repositories::{auth_events, service_credentials};
 use common::secret::ExposeSecret;
 use sqlx::PgPool;
@@ -74,6 +75,7 @@ pub async fn register_service(
     .await
     {
         tracing::warn!("Failed to log auth event: {}", e);
+        record_audit_log_failure("service_registered", "db_write_failed");
     }
 
     // Return credentials (this is the ONLY time the plaintext client_secret is shown)
@@ -119,6 +121,7 @@ pub async fn update_service_scopes(
     .await
     {
         tracing::warn!("Failed to log auth event: {}", e);
+        record_audit_log_failure("scopes_updated", "db_write_failed");
     }
 
     Ok(())
@@ -152,6 +155,7 @@ pub async fn deactivate_service(pool: &PgPool, client_id: &str) -> Result<(), Ac
     .await
     {
         tracing::warn!("Failed to log auth event: {}", e);
+        record_audit_log_failure("service_deactivated", "db_write_failed");
     }
 
     Ok(())

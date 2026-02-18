@@ -228,6 +228,39 @@ When reviewing dashboards, don't flag inconsistency between these two approaches
 
 ---
 
+## "Source of Truth" Doc Comments Mitigate Cross-File Path Duplication
+
+**Added**: 2026-02-18
+**Related files**: `crates/env-tests/src/cluster.rs:161-162`, `crates/env-tests/src/fixtures/gc_client.rs:259-260`
+
+**Gotcha**: When the same URL path or constant must appear in multiple files (e.g., GC health endpoint `/health` in both `ClusterConnection::check_gc_health()` and `GcClient::health_check()`), adding `/// Source of truth: \`crates/gc-service/src/routes/mod.rs\`` doc comments to both sites is a lightweight duplication mitigation. This doesn't eliminate the duplication but:
+1. Makes future editors aware that another file needs updating
+2. Points to the canonical source if the path changes
+3. Costs nothing compared to extracting a shared constant (which may require restructuring module dependencies)
+
+**When this is sufficient**: 2 occurrences of a simple string literal (URL path, endpoint name) in the same crate's test infrastructure. The doc comment approach works because env-tests is not production code and the path is unlikely to change frequently.
+
+**When to escalate to a constant**: 3+ occurrences, or if the path has already changed once (as happened here with `/v1/health` -> `/health`). At that point the doc comments didn't prevent the bug, so a shared constant is warranted.
+
+**Validated 2026-02-18**: The `/v1/health` -> `/health` migration required updating both `cluster.rs` and `gc_client.rs`. The doc comments were added AFTER the fix, not before. This confirms the escalation rule: if a path has changed once, doc comments are reactive, not preventive. TD-28 tracks the constant extraction.
+
+---
+
+## Transaction Boundary Forces Gauge Duplication
+
+**Added**: 2026-02-18
+**Related files**: `crates/ac-service/src/services/key_management_service.rs:100-102, 170-172`, `crates/ac-service/src/handlers/admin_handler.rs:389-391`
+
+**Gotcha**: When a service function has both a direct version (`rotate_signing_key`) and a transaction-based version (`rotate_signing_key_tx`), side effects like metric gauge updates cannot live inside the tx version (the transaction may roll back). This forces callers of the tx version to duplicate the gauge updates at the call site. Result: the same 3-line gauge block appears in 3 places.
+
+**Why this is easy to miss**: The duplication looks like a simple oversight, but blocking it would require moving gauge updates into `rotate_signing_key_tx`, which is semantically wrong (gauges would report state from a potentially rolled-back transaction).
+
+**When to flag as TECH_DEBT (not BLOCKER)**: The fix is a small helper function (`update_key_gauges_after_rotation()`) that both the direct function and the tx call site can use. This doesn't change semantics, just reduces the copy-paste. But it's not worth blocking a PR for 3 occurrences of a 3-line block.
+
+**Rule**: If duplication exists because of a transaction/side-effect boundary, classify as TECH_DEBT and recommend a helper, not a BLOCKER.
+
+---
+
 ## Config Struct vs Plain Parameters in Generic Extractions
 
 **Added**: 2026-02-12

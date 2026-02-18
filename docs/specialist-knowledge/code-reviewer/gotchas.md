@@ -183,10 +183,50 @@ When renaming crate directories/packages (e.g., `global-controller` → `gc-serv
 
 ---
 
+## Gotcha: Early Returns Missed When Adding Metric Calls to Existing Handlers
+**Added**: 2026-02-17
+**Related files**: `crates/ac-service/src/handlers/admin_handler.rs`
+
+When wiring metric recording calls into existing handler functions, the match arms at the end of the function (Ok/Err) get instrumented, but early-return guard clauses before the main operation are easy to miss. In `handle_register_service`, the invalid `service_type` early return had `record_error()` (pre-existing) but lacked the newly-added `record_credential_operation("create", "error")`. Review checklist: after adding a metric call to a handler's main Ok/Err branches, grep for `return Err` in the same function to find early exits that also need the new call.
+
+---
+
+## Gotcha: Gauge Updates Duplicated Across Handler and Service Layer
+**Added**: 2026-02-17
+**Related files**: `crates/ac-service/src/handlers/admin_handler.rs`, `crates/ac-service/src/services/key_management_service.rs`
+
+When both a handler and the service function it calls set the same gauge metrics, the gauge is set twice per operation. While functionally harmless (gauges are idempotent), it signals unclear ownership. Gauges tracking domain state (active key count, key age, last rotation timestamp) belong in the **service layer**, not the handler, because: (1) the service is closer to the business logic, (2) the service may be called from multiple entry points (handler, startup init, background task), and (3) placing gauges in only one layer makes the metrics source-of-truth obvious. When reviewing, check that gauge `set()` calls appear in exactly one layer per operation.
+
+---
+
 ## Gotcha: Inconsistent `job=` Filter Convention Across Service Dashboards
 **Added**: 2026-02-16
 **Related files**: `infra/grafana/dashboards/ac-overview.json`, `infra/grafana/dashboards/gc-overview.json`, `infra/grafana/dashboards/mc-overview.json`
 
 AC dashboard panels include `job="ac-service"` filters in PromQL expressions for application metrics, but GC and MC dashboards omit `job=` filters entirely on application metrics. Both conventions are valid (service-prefixed metric names like `gc_*` are already scoped to a single service, making `job=` redundant). This is pre-existing -- when reviewing new dashboard panels, follow the existing convention for that specific dashboard file rather than enforcing cross-dashboard uniformity. If a future PR standardizes this, it should be a separate cleanup across all dashboards simultaneously.
+
+---
+
+## Gotcha: env-tests Fixture URLs Drifting from Actual Service Routes
+**Added**: 2026-02-18
+**Related files**: `crates/env-tests/src/fixtures/gc_client.rs`, `crates/env-tests/src/cluster.rs`, `crates/gc-service/src/routes/mod.rs`
+
+The env-tests `GcClient` fixture and `ClusterConnection` had URLs that did not match the actual GC service routes: `/v1/health` instead of `/health`, `/v1/me` instead of `/api/v1/me`, `/v1/meetings/{code}` instead of `/api/v1/meetings/{code}`. These tests were gated behind `cfg(feature = "flows")` and silently skipped when GC was unavailable, so the URL mismatches were never caught at runtime. When reviewing env-tests fixture changes, cross-reference URLs against the source of truth in the service's `routes/mod.rs`. The implementer added `/// Source of truth: crates/gc-service/src/routes/mod.rs` doc comments on the fixture methods, which is a good traceability pattern to enforce going forward.
+
+---
+
+## Gotcha: Silent Skip Patterns in Feature-Gated Integration Tests
+**Added**: 2026-02-18
+**Related files**: `crates/env-tests/tests/21_cross_service_flows.rs`, `crates/env-tests/tests/22_mc_gc_integration.rs`, `crates/env-tests/tests/00_cluster_health.rs`, `crates/env-tests/tests/40_resilience.rs`
+
+Feature-gated test files (`#[cfg(feature = "flows")]`) that silently skip via `println!("SKIPPED"); return;` when an infrastructure dependency is unavailable are a false-confidence anti-pattern: CI shows green while zero assertions ran. Distinguish between **infrastructure prerequisites** (GC running, kubectl available) that should hard-fail, and **data-dependent conditions** (no seeded meeting -> 404, no healthy MCs -> 503) that are legitimate conditional skips. Infrastructure checks should be in a shared `cluster()` helper that panics with an actionable message. Data-dependent returns should have explanatory comments stating what the test *did* validate before returning (e.g., "The test still validated that GC returns appropriate error codes"). When reviewing env-tests, check for `return;` statements in test bodies and classify each as infrastructure (should panic) or data-dependent (acceptable with comment).
+
+---
+
+## Gotcha: Tests That Pass Regardless of Outcome (Accept-Everything Match Arms)
+**Added**: 2026-02-18
+**Related files**: `crates/env-tests/tests/22_mc_gc_integration.rs` (old version, now fixed)
+
+A subtler variant of the silent-skip anti-pattern: tests that execute a real API call but accept every possible status code as a "valid outcome." Example: `test_meeting_join_returns_mc_assignment` matched Ok(200) -> "validates response", Err(404) -> "validates error handling", Err(503) -> "validates graceful degradation", Err(401) -> "validates token flow". The test always passed, no matter what GC returned. Unlike a silent skip (which exits early), these tests *appear* to exercise logic because they contain assertions inside match arms -- but the match is exhaustive over all expected codes, so no arm ever panics. When reviewing env-tests, check whether a match over `status` codes covers the entire expected range. A test should either (a) assert a specific expected status, or (b) if it legitimately handles multiple outcomes, clearly document which arm is the *real* assertion and which are data-dependent early returns with comments explaining what was still validated.
 
 ---

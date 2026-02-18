@@ -5,9 +5,9 @@
 //!
 //! # Test Flows
 //!
-//! 1. **Authenticated User Join**: User token (AC) -> GET /v1/meetings/{code} (GC)
-//! 2. **Guest Token Flow**: POST /v1/meetings/{code}/guest-token (GC)
-//! 3. **Meeting Settings Update**: PATCH /v1/meetings/{id}/settings (GC, host only)
+//! 1. **Authenticated User Join**: User token (AC) -> GET /api/v1/meetings/{code} (GC)
+//! 2. **Guest Token Flow**: POST /api/v1/meetings/{code}/guest-token (GC)
+//! 3. **Meeting Settings Update**: PATCH /api/v1/meetings/{id}/settings (GC, host only)
 //!
 //! # Prerequisites
 //!
@@ -22,11 +22,19 @@ use env_tests::fixtures::auth_client::TokenRequest;
 use env_tests::fixtures::gc_client::{GcClient, GuestTokenRequest, UpdateMeetingSettingsRequest};
 use env_tests::fixtures::AuthClient;
 
-/// Helper to create a cluster connection for tests.
+/// Helper to create a cluster connection and verify GC is available.
+///
+/// GC is a required dependency for all cross-service flow tests.
+/// If GC is not running, tests should fail rather than silently skip.
 async fn cluster() -> ClusterConnection {
-    ClusterConnection::new()
+    let cluster = ClusterConnection::new()
         .await
-        .expect("Failed to connect to cluster - ensure port-forwards are running")
+        .expect("Failed to connect to cluster - ensure port-forwards are running");
+    cluster
+        .check_gc_health()
+        .await
+        .expect("GC service must be running for cross-service flow tests");
+    cluster
 }
 
 // ============================================================================
@@ -49,16 +57,7 @@ async fn test_ac_gc_services_healthy() {
         .await
         .expect("AC service should be healthy");
 
-    // Verify GC is healthy (skip if GC not deployed)
-    if !cluster.is_gc_available().await {
-        println!("SKIPPED: GC not deployed - skipping cross-service tests");
-        return;
-    }
-
-    cluster
-        .check_gc_health()
-        .await
-        .expect("GC service should be healthy");
+    // GC health already verified in cluster() helper
 
     // Verify AC JWKS is accessible (GC needs this for token validation)
     let auth_client = AuthClient::new(&cluster.ac_base_url);
@@ -77,22 +76,16 @@ async fn test_ac_gc_services_healthy() {
 // Flow 1: Authenticated User Join
 // ============================================================================
 
-/// Test: GC `/v1/me` endpoint validates AC-issued tokens correctly.
+/// Test: GC `/api/v1/me` endpoint validates AC-issued tokens correctly.
 ///
 /// This validates the token validation flow:
 /// 1. Client obtains service token from AC
-/// 2. Client calls GC /v1/me with token
+/// 2. Client calls GC /api/v1/me with token
 /// 3. GC validates token against AC JWKS
 /// 4. GC returns user claims from token
 #[tokio::test]
 async fn test_gc_validates_ac_token_via_me_endpoint() {
     let cluster = cluster().await;
-
-    // Skip if GC not deployed
-    if !cluster.is_gc_available().await {
-        println!("SKIPPED: GC not deployed");
-        return;
-    }
 
     let auth_client = AuthClient::new(&cluster.ac_base_url);
     let gc_client = GcClient::new(&cluster.gc_base_url);
@@ -106,7 +99,7 @@ async fn test_gc_validates_ac_token_via_me_endpoint() {
         .await
         .expect("AC should issue token");
 
-    // Step 2: Call GC /v1/me with AC-issued token
+    // Step 2: Call GC /api/v1/me with AC-issued token
     let me_response = gc_client
         .get_me(&token_response.access_token)
         .await
@@ -130,14 +123,9 @@ async fn test_gc_validates_ac_token_via_me_endpoint() {
 async fn test_gc_rejects_unauthenticated_requests() {
     let cluster = cluster().await;
 
-    if !cluster.is_gc_available().await {
-        println!("SKIPPED: GC not deployed");
-        return;
-    }
-
     let gc_client = GcClient::new(&cluster.gc_base_url);
 
-    // Call /v1/me without token
+    // Call /api/v1/me without token
     let result = gc_client.get_me("").await;
 
     assert!(
@@ -160,11 +148,6 @@ async fn test_gc_rejects_unauthenticated_requests() {
 #[tokio::test]
 async fn test_gc_rejects_invalid_token() {
     let cluster = cluster().await;
-
-    if !cluster.is_gc_available().await {
-        println!("SKIPPED: GC not deployed");
-        return;
-    }
 
     let gc_client = GcClient::new(&cluster.gc_base_url);
 
@@ -204,11 +187,6 @@ async fn test_gc_rejects_invalid_token() {
 async fn test_meeting_join_requires_authentication() {
     let cluster = cluster().await;
 
-    if !cluster.is_gc_available().await {
-        println!("SKIPPED: GC not deployed");
-        return;
-    }
-
     let gc_client = GcClient::new(&cluster.gc_base_url);
 
     // Try to join meeting without authentication
@@ -232,11 +210,6 @@ async fn test_meeting_join_requires_authentication() {
 #[tokio::test]
 async fn test_meeting_join_returns_404_for_unknown_meeting() {
     let cluster = cluster().await;
-
-    if !cluster.is_gc_available().await {
-        println!("SKIPPED: GC not deployed");
-        return;
-    }
 
     let auth_client = AuthClient::new(&cluster.ac_base_url);
     let gc_client = GcClient::new(&cluster.gc_base_url);
@@ -287,11 +260,6 @@ async fn test_meeting_join_returns_404_for_unknown_meeting() {
 async fn test_guest_token_endpoint_is_public() {
     let cluster = cluster().await;
 
-    if !cluster.is_gc_available().await {
-        println!("SKIPPED: GC not deployed");
-        return;
-    }
-
     let gc_client = GcClient::new(&cluster.gc_base_url);
 
     // Request guest token without authentication
@@ -337,11 +305,6 @@ async fn test_guest_token_endpoint_is_public() {
 async fn test_guest_token_validates_display_name() {
     let cluster = cluster().await;
 
-    if !cluster.is_gc_available().await {
-        println!("SKIPPED: GC not deployed");
-        return;
-    }
-
     let gc_client = GcClient::new(&cluster.gc_base_url);
 
     // Request with empty display name
@@ -382,11 +345,6 @@ async fn test_guest_token_validates_display_name() {
 async fn test_meeting_settings_requires_authentication() {
     let cluster = cluster().await;
 
-    if !cluster.is_gc_available().await {
-        println!("SKIPPED: GC not deployed");
-        return;
-    }
-
     let gc_client = GcClient::new(&cluster.gc_base_url);
 
     let request = UpdateMeetingSettingsRequest::with_allow_guests(true);
@@ -414,11 +372,6 @@ async fn test_meeting_settings_requires_authentication() {
 #[tokio::test]
 async fn test_meeting_settings_returns_404_for_unknown_meeting() {
     let cluster = cluster().await;
-
-    if !cluster.is_gc_available().await {
-        println!("SKIPPED: GC not deployed");
-        return;
-    }
 
     let auth_client = AuthClient::new(&cluster.ac_base_url);
     let gc_client = GcClient::new(&cluster.gc_base_url);
@@ -471,11 +424,6 @@ async fn test_meeting_settings_returns_404_for_unknown_meeting() {
 async fn test_token_validation_consistency() {
     let cluster = cluster().await;
 
-    if !cluster.is_gc_available().await {
-        println!("SKIPPED: GC not deployed");
-        return;
-    }
-
     let auth_client = AuthClient::new(&cluster.ac_base_url);
     let gc_client = GcClient::new(&cluster.gc_base_url);
 
@@ -507,21 +455,16 @@ async fn test_token_validation_consistency() {
 async fn test_multiple_tokens_validated() {
     let cluster = cluster().await;
 
-    if !cluster.is_gc_available().await {
-        println!("SKIPPED: GC not deployed");
-        return;
-    }
-
     let auth_client = AuthClient::new(&cluster.ac_base_url);
     let gc_client = GcClient::new(&cluster.gc_base_url);
 
-    // Issue multiple tokens
+    // Issue multiple tokens (each with the registered scope, but distinct JWTs)
     let mut tokens = Vec::new();
     for i in 0..3 {
         let token_request = TokenRequest::client_credentials(
             "test-client",
             "test-client-secret-dev-999",
-            format!("test:scope{}", i),
+            "test:all",
         );
 
         let token_response = auth_client
@@ -541,9 +484,8 @@ async fn test_multiple_tokens_validated() {
 
         assert_eq!(me_response.sub, "test-client");
         assert!(
-            me_response.scopes.contains(&format!("test:scope{}", i)),
-            "Token {} should have scope test:scope{}",
-            i,
+            me_response.scopes.contains(&"test:all".to_string()),
+            "Token {} should have scope test:all",
             i
         );
     }

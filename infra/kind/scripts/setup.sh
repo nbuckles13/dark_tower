@@ -334,12 +334,100 @@ deploy_grafana() {
         -n dark-tower-observability \
         --dry-run=client -o yaml | kubectl apply -f -
 
-    kubectl create configmap grafana-dashboards \
-        --from-file="${PROJECT_ROOT}/infra/grafana/dashboards/" \
-        -n dark-tower-observability \
-        --dry-run=client -o yaml | kubectl apply -f -
+    # Clean up legacy monolithic ConfigMap from older versions of this script
+    kubectl delete configmap grafana-dashboards -n dark-tower-observability --ignore-not-found
 
-    kubectl apply -f - <<EOF
+    # Per-service dashboard ConfigMaps, dynamically discovered from filenames.
+    # Files matching {prefix}-*.json are grouped by prefix (e.g., ac, gc, mc).
+    # Files that don't match go into grafana-dashboards-common.
+    # Uses --server-side apply to avoid the 262144-byte annotation limit.
+    local dashboard_dir="${PROJECT_ROOT}/infra/grafana/dashboards"
+    local -A prefix_files  # associative array: prefix -> newline-separated file list
+    local common_files=""
+
+    # Enable nullglob so the glob expands to nothing if no .json files exist
+    local prev_nullglob
+    prev_nullglob="$(shopt -p nullglob || true)"
+    shopt -s nullglob
+
+    for f in "${dashboard_dir}"/*.json; do
+        local basename
+        basename="$(basename "$f")"
+        if [[ "$basename" =~ ^([a-z]+)-.*\.json$ ]]; then
+            local prefix="${BASH_REMATCH[1]}"
+            prefix_files["$prefix"]+=$'\n'"$f"
+        else
+            common_files+=$'\n'"$f"
+        fi
+    done
+
+    # Restore previous nullglob setting
+    ${prev_nullglob}
+
+    # Create per-prefix ConfigMaps
+    for prefix in "${!prefix_files[@]}"; do
+        local from_file_args=()
+        while IFS= read -r f; do
+            [[ -z "$f" ]] && continue
+            from_file_args+=(--from-file="$(basename "$f")=$f")
+        done <<< "${prefix_files[$prefix]}"
+        kubectl create configmap "grafana-dashboards-${prefix}" \
+            "${from_file_args[@]}" \
+            -n dark-tower-observability \
+            --dry-run=client -o yaml \
+            | kubectl label -f - --local --dry-run=client -o yaml grafana_dashboard=1 \
+            | kubectl apply --server-side -f -
+    done
+
+    # Create common ConfigMap for non-prefixed files (if any)
+    if [[ -n "$common_files" ]]; then
+        local from_file_args=()
+        while IFS= read -r f; do
+            [[ -z "$f" ]] && continue
+            from_file_args+=(--from-file="$(basename "$f")=$f")
+        done <<< "${common_files}"
+        kubectl create configmap grafana-dashboards-common \
+            "${from_file_args[@]}" \
+            -n dark-tower-observability \
+            --dry-run=client -o yaml \
+            | kubectl label -f - --local --dry-run=client -o yaml grafana_dashboard=1 \
+            | kubectl apply --server-side -f -
+    fi
+
+    # RBAC for k8s-sidecar to list/get ConfigMaps in the observability namespace
+    kubectl apply --server-side -f - <<EOF
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: grafana
+  namespace: dark-tower-observability
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: grafana-sidecar
+  namespace: dark-tower-observability
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: grafana-sidecar
+  namespace: dark-tower-observability
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: grafana-sidecar
+subjects:
+  - kind: ServiceAccount
+    name: grafana
+    namespace: dark-tower-observability
+EOF
+
+    kubectl apply --server-side -f - <<EOF
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -355,6 +443,30 @@ spec:
       labels:
         app: grafana
     spec:
+      serviceAccountName: grafana
+      initContainers:
+        - name: k8s-sidecar
+          image: kiwigrid/k8s-sidecar:1.26.2
+          securityContext:
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+          env:
+            - name: LABEL
+              value: grafana_dashboard
+            - name: LABEL_VALUE
+              value: "1"
+            - name: FOLDER
+              value: /var/lib/grafana/dashboards
+            - name: NAMESPACE
+              value: dark-tower-observability
+            - name: METHOD
+              value: LIST
+            - name: LOG_LEVEL
+              value: INFO
+          volumeMounts:
+            - name: dashboards
+              mountPath: /var/lib/grafana/dashboards
       containers:
         - name: grafana
           image: grafana/grafana:10.2.2
@@ -382,8 +494,7 @@ spec:
           configMap:
             name: grafana-dashboards-config
         - name: dashboards
-          configMap:
-            name: grafana-dashboards
+          emptyDir: {}
 ---
 apiVersion: v1
 kind: Service

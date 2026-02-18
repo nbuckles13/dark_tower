@@ -2,7 +2,7 @@
 use crate::config::DEFAULT_BCRYPT_COST;
 use crate::config::{MAX_BCRYPT_COST, MIN_BCRYPT_COST};
 use crate::errors::AcError;
-use crate::observability::metrics::record_token_validation;
+use crate::observability::metrics::{record_bcrypt_duration, record_token_validation};
 use base64::{engine::general_purpose, Engine as _};
 use common::jwt::{decode_ed25519_public_key_pem, validate_iat, ServiceClaims, MAX_JWT_SIZE_BYTES};
 use common::secret::{ExposeSecret, SecretBox, SecretString};
@@ -14,6 +14,7 @@ use ring::{
 };
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::time::Instant;
 use tracing::instrument;
 
 /// Re-export ServiceClaims as Claims for backwards compatibility within AC.
@@ -313,15 +314,21 @@ pub fn hash_client_secret(secret: &str, cost: u32) -> Result<String, AcError> {
         )));
     }
 
-    bcrypt::hash(secret, cost)
-        .map_err(|e| AcError::Crypto(format!("Password hashing failed: {}", e)))
+    let start = Instant::now();
+    let result = bcrypt::hash(secret, cost)
+        .map_err(|e| AcError::Crypto(format!("Password hashing failed: {}", e)));
+    record_bcrypt_duration("hash", start.elapsed());
+    result
 }
 
 /// Verify client secret against bcrypt hash
 #[instrument(skip_all)]
 pub fn verify_client_secret(secret: &str, hash: &str) -> Result<bool, AcError> {
-    bcrypt::verify(secret, hash)
-        .map_err(|e| AcError::Crypto(format!("Password verification failed: {}", e)))
+    let start = Instant::now();
+    let result = bcrypt::verify(secret, hash)
+        .map_err(|e| AcError::Crypto(format!("Password verification failed: {}", e)));
+    record_bcrypt_duration("verify", start.elapsed());
+    result
 }
 
 /// Generate cryptographically secure random bytes

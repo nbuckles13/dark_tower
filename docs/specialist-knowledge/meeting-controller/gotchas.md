@@ -187,3 +187,35 @@ Atomic `fetch_sub(1)` returns the value BEFORE subtraction, not after. When emit
 Grafana dashboard queries must use the exact metric name defined in code - the `metrics` crate uses the literal string passed to `counter!()`, `gauge!()`, or `histogram!()`. Common mistake: singular vs plural (e.g., `mc_gc_heartbeat_total` vs `mc_gc_heartbeats_total`). When adding new metrics, grep the dashboard JSON for the metric name to ensure consistency. If panels show "No data", verify the query matches the code exactly, including suffixes like `_total` for counters and `_seconds` for duration histograms.
 
 ---
+
+## Gotcha: CLAUDE.md Says MC is "SKELETON" But It Has Substantial Implementation
+**Added**: 2026-02-18
+**Related files**: `CLAUDE.md`, `crates/mc-service/src/main.rs`
+
+CLAUDE.md lists MC as "SKELETON" (Phase 6), but as of 2026-02 MC has substantial implementation: health endpoints (`/health`, `/ready`), Prometheus metrics (`/metrics`), gRPC server for GC communication (`AssignMeetingWithMh`), GC registration + heartbeat loop, actor system (controller/meeting/connection actors), Redis state management with fencing, and TokenManager OAuth integration. This caused incorrect assumptions during the env-tests fix devloop where the implementer initially proposed removing all MC-GC integration tests thinking they tested skeleton functionality. Always check the actual codebase rather than trusting CLAUDE.md status labels.
+
+---
+
+## Gotcha: GC NetworkPolicy Missing Egress Rule to MC (Port 50052)
+**Added**: 2026-02-18
+**Related files**: `infra/services/gc-service/network-policy.yaml`, `infra/services/mc-service/network-policy.yaml`, `infra/services/mc-service/service.yaml`
+
+GC's network policy allows MC ingress on port 50051 (for MC->GC registration/heartbeats) but has NO egress rule to MC on port 50052. MC listens on 50052 for gRPC (`MC_GRPC_BIND_ADDRESS: "0.0.0.0:50052"`), and MC's ingress policy correctly allows GC on 50052, but the GC side is missing the outbound rule. This means `AssignMeetingWithMh` calls from GC to MC are silently blocked by NetworkPolicy in the Kind cluster, causing meeting joins to always return 503 ("no healthy MCs"). The MC->GC direction (registration, heartbeats on 50051) works fine because both sides have the correct rules. This is a pre-existing infrastructure bug that needs a separate fix to add GC egress to mc-service:50052.
+
+---
+
+## Gotcha: join_meeting Requires User JWT (UUID sub), Not Service Token
+**Added**: 2026-02-18
+**Related files**: `crates/gc-service/src/routes/meetings.rs`, `crates/env-tests/tests/22_mc_gc_integration.rs`
+
+The `GET /api/v1/meetings/{code}` endpoint requires a user JWT with a UUID `sub` claim (for `users` table lookup and `org_id` resolution). Service tokens issued via `TokenRequest::client_credentials` have `sub: "test-client"` (a string, not a UUID), which causes the join endpoint to fail with 401 or 404 before ever reaching the MC assignment logic. This means env-tests using `client_credentials` can never exercise the authenticated meeting join path -- they need user tokens with UUID subjects. The guest-token endpoint (`POST /api/v1/meetings/{code}/guest-token`) does NOT have this requirement since it's a public endpoint that doesn't require authentication at all.
+
+---
+
+## Gotcha: MC Deployment Has Commented-Out Probes with Wrong Paths
+**Added**: 2026-02-18
+**Related files**: `infra/services/mc-service/deployment.yaml`, `crates/mc-service/src/observability/health.rs`
+
+The MC deployment.yaml has Kubernetes liveness and readiness probes commented out with `# TODO: Re-enable probes when MC health endpoints are implemented (Phase 6h)`. However, MC health endpoints ARE implemented (`/health` for liveness, `/ready` for readiness). Additionally, the commented probe paths use incorrect Kubernetes-style paths (`/health/live` and `/health/ready`) instead of the actual MC paths (`/health` and `/ready`), which follow the AC pattern per ADR-0023. When re-enabling probes, use the correct paths and note that `HealthState` is shared via `Arc` across tasks.
+
+---

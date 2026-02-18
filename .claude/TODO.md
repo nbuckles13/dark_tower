@@ -145,6 +145,12 @@
   - e.g., 4 grant_types × 2 statuses = 8 max series for token issuance
 - [ ] **Histogram Bucket Alignment Test**: Verify buckets include SLO threshold (350ms for token issuance)
 
+### env-tests: Authenticated Meeting Join Tests (Deferred 2026-02-18)
+
+Tracked in ADR-0010 under "Create Meeting API Endpoint" (Phase 4a). Five tests removed from
+`22_mc_gc_integration.rs` — blocked on GC create endpoint, user tokens, meeting seeding, MC
+registration, and AC service auth. See ADR-0010 for full details and blocker list.
+
 ### env-tests Enhancements (from Code Review 2025-12-16)
 
 #### Security Specialist Findings (Priority 1 - Before Production)

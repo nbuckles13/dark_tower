@@ -701,7 +701,7 @@ X-RateLimit-Reset: 1234567890
 | Database Query Metrics | ❌ Pending | | Wire `ac_db_queries_total` and `ac_db_query_duration_seconds` at call sites. Recording function exists in `metrics.rs` (`#[allow(dead_code)]`) but is not called from repository query methods. |
 | Bcrypt Duration Metrics | ❌ Pending | | Wire `ac_bcrypt_duration_seconds` at call sites. Recording function exists in `metrics.rs` (`#[allow(dead_code)]`) but is not called from password hashing code paths. |
 | Audit Log Metrics | ❌ Pending | | Wire `ac_audit_log_failures_total` at call sites. Recording function exists in `metrics.rs` (`#[allow(dead_code)]`) but audit logging is not yet implemented. |
-| Admin Operations Metrics | ❌ Pending | | Wire `ac_admin_operations_total` at call sites. Recording function exists in `metrics.rs` (`#[allow(dead_code)]`) but admin endpoints are not yet instrumented. |
+| Credential Operations Metrics | ✅ Done | | `ac_credential_operations_total` (renamed from `ac_admin_operations_total`) wired at all admin handler call sites via `record_credential_operation()`. |
 | Redis-based Rate Limiting | ❌ Pending | | Multi-instance distributed rate limiting |
 | CAPTCHA Integration | ❌ Pending | | After 3 failed attempts (Layer 4) |
 | Failed Login Alerting | ❌ Pending | | Email user, alert ops team (Layer 5) |

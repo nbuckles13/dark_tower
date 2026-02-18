@@ -1,7 +1,9 @@
 use crate::errors::AcError;
 use crate::models::AuthEvent;
+use crate::observability::metrics::record_db_query;
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
+use std::time::Instant;
 use uuid::Uuid;
 
 /// Log an authentication event
@@ -17,7 +19,8 @@ pub async fn log_event(
     user_agent: Option<&str>,
     metadata: Option<serde_json::Value>,
 ) -> Result<AuthEvent, AcError> {
-    let event = sqlx::query_as::<_, AuthEvent>(
+    let start = Instant::now();
+    let result = sqlx::query_as::<_, AuthEvent>(
         r#"
         INSERT INTO auth_events (
             event_type, user_id, credential_id, success, failure_reason,
@@ -38,8 +41,11 @@ pub async fn log_event(
     .bind(user_agent)
     .bind(metadata)
     .fetch_one(pool)
-    .await
-    .map_err(|e| AcError::Database(format!("Failed to log auth event: {}", e)))?;
+    .await;
+    let status = if result.is_ok() { "success" } else { "error" };
+    record_db_query("insert", "auth_events", status, start.elapsed());
+    let event =
+        result.map_err(|e| AcError::Database(format!("Failed to log auth event: {}", e)))?;
 
     Ok(event)
 }
@@ -165,7 +171,8 @@ pub async fn get_failed_attempts_count(
     credential_id: &Uuid,
     since: DateTime<Utc>,
 ) -> Result<i64, AcError> {
-    let count: (i64,) = sqlx::query_as(
+    let start = Instant::now();
+    let result = sqlx::query_as(
         r#"
         SELECT COUNT(*)
         FROM auth_events
@@ -177,8 +184,11 @@ pub async fn get_failed_attempts_count(
     .bind(credential_id)
     .bind(since)
     .fetch_one(pool)
-    .await
-    .map_err(|e| AcError::Database(format!("Failed to count failed attempts: {}", e)))?;
+    .await;
+    let status = if result.is_ok() { "success" } else { "error" };
+    record_db_query("select", "auth_events", status, start.elapsed());
+    let count: (i64,) =
+        result.map_err(|e| AcError::Database(format!("Failed to count failed attempts: {}", e)))?;
 
     Ok(count.0)
 }

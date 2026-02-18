@@ -64,7 +64,29 @@ The `validate-application-metrics.sh` guard greps `counter!`/`histogram!`/`gauge
 
 This creates a tension: the guard requires panels, but the panels will show "No data" until instrumentation is wired. The agreed approach is to add "Pending instrumentation." to the panel `description` field so on-call understands "No data" is expected, not a scrape failure. Operations strongly prefers this annotation to avoid wasted incident debugging time.
 
-**AC service has 10 dead-code metrics as of 2026-02-16**: `ac_active_signing_keys`, `ac_signing_key_age_days`, `ac_key_rotation_last_success_timestamp`, `ac_token_validations_total`, `ac_rate_limit_decisions_total`, `ac_db_queries_total`, `ac_db_query_duration_seconds`, `ac_bcrypt_duration_seconds`, `ac_audit_log_failures_total`, `ac_admin_operations_total`. When these are wired to call sites, remove the "Pending instrumentation." note from their panel descriptions.
+**AC service had 10 dead-code metrics as of 2026-02-16**: `ac_active_signing_keys`, `ac_signing_key_age_days`, `ac_key_rotation_last_success_timestamp`, `ac_token_validations_total`, `ac_rate_limit_decisions_total`, `ac_db_queries_total`, `ac_db_query_duration_seconds`, `ac_bcrypt_duration_seconds`, `ac_audit_log_failures_total`, `ac_credential_operations_total` (renamed from `ac_admin_operations_total`). **As of 2026-02-18, 9 of 10 are wired** and their "Pending instrumentation." notes removed. `ac_token_validations_total` remains partially wired (clock_skew errors only) with annotation "Partially instrumented (clock_skew errors only)."
+
+**Lifecycle**: When wiring a dead-code metric, always: (1) remove `#[allow(dead_code)]` from the function, (2) remove "Pending instrumentation." from the dashboard panel description, (3) update catalog doc to replace "Status: Defined but not currently exported" with "Call Sites: ..." listing where it's used. For partially wired metrics, update the annotation to describe what IS wired (e.g., "Partially instrumented (clock_skew errors only).").
+
+---
+
+### Env-Test Observability Assertions Must Test Content, Not Just Reachability
+**Discovered**: 2026-02-18 (env-tests fix)
+**Updated**: 2026-02-18 (env-tests fix iteration 2 -- Loki JSON parsing)
+**Coordination**: Observability + Test
+**Related files**: `crates/env-tests/tests/30_observability.rs`
+
+When reviewing env-tests that validate observability endpoints, distinguish between tests that verify *reachability* (HTTP 200 from `/metrics`) and tests that verify *content* (metric names, label structure, counter increments via Prometheus queries). Reachability-only tests can pass even when the metrics endpoint returns garbage or an empty response.
+
+The existing `30_observability.rs` suite has good coverage on this spectrum:
+- `test_ac_metrics_exposed`: Verifies content (`# TYPE` comments, `ac_token_issuance_total` metric name)
+- `test_metrics_have_expected_labels`: Verifies label structure (`grant_type=`, `status=`)
+- `test_token_counter_increments_after_issuance`: Verifies Prometheus scrape + counter increment (end-to-end)
+- `test_logs_appear_in_loki`: Parses Loki JSON response, checks `status == "success"` and non-empty `result` array
+
+**Loki assertion improvement**: The Loki test originally used `body.contains("ac-service")` -- a string match on the raw HTTP response body. This was replaced with proper JSON parsing (`serde_json::Value`) that checks the structured response fields. String matching on API responses is fragile: an error response containing "ac-service" in an error message would pass, and a valid response with different JSON formatting might fail. Always parse structured API responses rather than string-matching them.
+
+A removed test (`test_logs_have_trace_ids`) demonstrated the anti-pattern: it queried Loki but never asserted on the result -- every code path was a warning or no-op. Tests that never fail provide false confidence and should be removed or converted to real assertions. When OpenTelemetry trace propagation is implemented, the replacement test should use `assert!` on trace ID presence, not `eprintln!`.
 
 ---
 

@@ -293,6 +293,90 @@ Renaming a service's OAuth client_id requires synchronized changes across 4 laye
 
 ---
 
+## Gotcha: Security Rationale Leaks Through Multiple Documentation Surfaces
+**Added**: 2026-02-17
+**Related files**: `docs/observability/metrics/ac-service.md`, `crates/ac-service/src/observability/metrics.rs`
+
+The "Observability Asset Security Review" pattern covers dashboard descriptions and catalog Markdown, but security rationale can also leak through Rust doc comments (`///`) on metric recording functions. These comments are visible in the repo and in `cargo doc` output.
+
+**What happened**: `record_bcrypt_duration` had `/// Note: Uses coarse buckets (50ms minimum) per Security specialist to prevent timing side-channel attacks.` This told an attacker: (1) we're aware of timing side-channels on bcrypt, (2) our mitigation is coarse histogram buckets, (3) the bucket floor is 50ms. The catalog entry had similar text.
+
+**Detection during review**: When reviewing metric functions, check `///` doc comments in addition to dashboard panel descriptions and catalog entries. All three surfaces are repo-visible. The check is: does this text explain *why* a security design choice was made? If yes, move the rationale to specialist knowledge files or ADRs.
+
+**Surfaces to check** (ranked by visibility):
+1. Grafana panel `description` fields (visible to all dashboard viewers)
+2. Metric catalog docs (`docs/observability/metrics/*.md`, visible to repo readers)
+3. Rust doc comments (`///` on metric functions, visible to repo readers and `cargo doc`)
+4. Code comments (`//`) adjacent to metric configuration (bucket setup, label choices)
+
+---
+
+## Gotcha: Bcrypt Metric Instrumentation Must Be Inside the Crypto Function
+**Added**: 2026-02-17
+**Related files**: `crates/ac-service/src/crypto/mod.rs`, `crates/ac-service/src/services/token_service.rs`
+
+When instrumenting bcrypt operations with timing metrics, place the `Instant::now()` / `record_bcrypt_duration()` calls inside `hash_client_secret` and `verify_client_secret` -- not in callers like `issue_service_token`.
+
+**Why**: The caller includes credential lookup logic that takes different code paths for existing vs non-existent users (real hash vs dummy hash). If you time from the caller, the metric captures both the lookup and the bcrypt work, potentially revealing whether a credential exists via timing differences. Inside the crypto function, only the bcrypt operation is measured, and both real and dummy hashes execute identical bcrypt work at the same cost factor.
+
+**Safe because**: (1) Same-cost bcrypt is constant-time for same-cost hashes, (2) `histogram!().record()` adds negligible nanosecond overhead vs ~250ms bcrypt, (3) Prometheus aggregates across all requests so individual request timing is not observable, (4) 50ms bucket floor prevents fine-grained timing extraction.
+
+---
+
+## Gotcha: Silent Test Skip Is a Fail-Open Anti-Pattern
+**Added**: 2026-02-18 (Updated: 2026-02-18)
+**Related files**: `crates/env-tests/tests/21_cross_service_flows.rs`, `crates/env-tests/tests/22_mc_gc_integration.rs`
+
+Env-tests that silently return `Ok(())` when a prerequisite (kubectl, service availability) is missing are fail-open: the CI pipeline reports "all passed" when no security validation actually ran. This hid ~20 tests silently skipping for an extended period because `is_gc_available()` used the wrong URL path.
+
+**Pattern to reject during review**:
+```rust
+if !cluster.is_gc_available() {
+    println!("SKIPPED: GC not available");
+    return Ok(()); // Fail-open: CI sees "pass"
+}
+```
+
+**Correct pattern**: Hard-fail so CI catches the missing prerequisite:
+```rust
+cluster.check_gc_health().await
+    .expect("GC service must be running for cross-service flow tests");
+```
+
+**Why this is a security issue**: Security-critical tests (`test_gc_rejects_unauthenticated_requests`, `test_gc_rejects_invalid_token`, `test_meeting_join_requires_authentication`) were among the silently skipped tests. The test suite appeared to validate auth enforcement when it was actually testing nothing.
+
+**Subtle variant -- lenient match arms**: Tests that accept multiple HTTP error codes (404, 503) as "valid outcomes" are a more insidious form of this anti-pattern. They look like they're testing error handling, but actually validate nothing about the intended behavior:
+```rust
+// FAIL-OPEN: Looks like it tests error handling, actually tests nothing
+match result {
+    Ok(response) => { /* validate response */ }
+    Err(RequestFailed { status, .. }) if status == 404 || status == 503 => {
+        println!("Expected outcome"); // Passes silently
+    }
+}
+```
+This variant hid 5 broken MC integration tests for an extended period. The tests always hit 401 (wrong token type) or 404 (no seeded data), but the lenient match arms treated these as valid.
+
+**Fix pattern for lenient match arms**: Either (a) ensure test prerequisites exist and assert exact expected outcomes, or (b) remove the test and document why in the module header with a TODO for re-adding when infrastructure supports it.
+
+**Detection during review**: Search for `return Ok(())` or `return;` inside conditional blocks that check service availability, tool presence, or feature flags. Also search for match arms on HTTP status codes that print-and-pass without asserting anything. Each instance should be evaluated: is this a legitimate `#[ignore]` case, or is it hiding a real test?
+
+---
+
+## Gotcha: Service Token `sub` Format Incompatible with User Endpoints
+**Added**: 2026-02-18
+**Related files**: `crates/ac-service/src/services/token_service.rs`, `crates/gc-service/src/handlers/meetings.rs`, `crates/env-tests/tests/22_mc_gc_integration.rs`
+
+AC's client_credentials flow sets `sub: client_id.to_string()` (e.g., `"test-client"`) in the JWT. User-facing GC endpoints like `GET /api/v1/meetings/{code}` call `parse_user_id(&claims.sub)` which requires the `sub` to be a valid UUID (or `"user:{uuid}"` format). Service tokens will always fail at this parsing step before reaching any endpoint logic.
+
+**Why this matters for security testing**: Env-tests that use `TokenRequest::client_credentials()` to obtain tokens and then call user-facing endpoints are aspirational -- they never exercise the intended code path. In this case, 5 MC integration tests appeared to test meeting join, assignment persistence, and response structure, but they always failed at `parse_user_id()` and fell through to lenient match arms that treated the error as a "valid outcome."
+
+**Detection during review**: When reviewing env-tests that call user-facing endpoints, verify the token type matches what the endpoint expects. Service tokens (client_credentials) have string `sub`, user tokens have UUID `sub`. If the test uses `TokenRequest::client_credentials()` but the endpoint calls `parse_user_id()`, the test is broken.
+
+**Long-term fix**: Env-test infrastructure needs a way to obtain user tokens (not just service credentials). Until then, user-facing endpoint tests should live in service-level integration tests (`crates/gc-service/tests/`) where `sqlx::test` and test harnesses can set up the required state.
+
+---
+
 ## Gotcha: `status_code` Metric Label Has Different Domains Across Services
 **Added**: 2026-02-16
 **Related files**: `crates/mc-service/src/errors.rs`, `crates/gc-service/src/errors.rs`

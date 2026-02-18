@@ -188,6 +188,22 @@ Record domain-specific metrics (token_issuance, error categories) inside handler
 
 ---
 
+## Pattern: Repository-Level DB Query Instrumentation
+**Added**: 2026-02-18
+**Related files**: `crates/ac-service/src/repositories/*.rs`
+
+All repository functions instrument DB queries with `record_db_query(operation, table, status, duration)`. The pattern captures timing around the raw sqlx result before error mapping:
+```rust
+let start = Instant::now();
+let result = sqlx::query_as::<_, Model>(SQL).fetch_optional(pool).await;
+let status = if result.is_ok() { "success" } else { "error" };
+record_db_query("select", "table_name", status, start.elapsed());
+let model = result.map_err(|e| AcError::Database(format!("...: {}", e)))?;
+```
+This records duration for both success and error cases. Labels are bounded: `operation` is one of select/insert/update/delete, `table` is bounded by schema (~5 tables), `status` is success/error.
+
+---
+
 ## Pattern: Path Normalization for Cardinality Control
 **Added**: 2026-02-10
 **Related files**: `crates/ac-service/src/observability/metrics.rs`

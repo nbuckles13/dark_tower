@@ -135,7 +135,7 @@ impl std::fmt::Debug for JoinMeetingResponse {
     }
 }
 
-/// Response from `/v1/me` endpoint.
+/// Response from `/api/v1/me` endpoint.
 #[derive(Clone, Deserialize)]
 pub struct MeResponse {
     /// Subject (user or client ID).
@@ -256,9 +256,10 @@ impl GcClient {
 
     /// Check GC health endpoint.
     ///
-    /// Returns Ok(()) if healthy, Err otherwise.
+    /// GC health is at `/health` (not versioned).
+    /// Source of truth: `crates/gc-service/src/routes/mod.rs`
     pub async fn health_check(&self) -> Result<(), GcClientError> {
-        let url = format!("{}/v1/health", self.base_url);
+        let url = format!("{}/health", self.base_url);
 
         let response = self.http_client.get(&url).send().await?;
         let status = response.status();
@@ -274,13 +275,13 @@ impl GcClient {
         Ok(())
     }
 
-    /// Get current user info from `/v1/me` endpoint.
+    /// Get current user info from `/api/v1/me` endpoint.
     ///
     /// # Arguments
     ///
     /// * `token` - Bearer token for authentication
     pub async fn get_me(&self, token: &str) -> Result<MeResponse, GcClientError> {
-        let url = format!("{}/v1/me", self.base_url);
+        let url = format!("{}/api/v1/me", self.base_url);
 
         let response = self
             .http_client
@@ -301,13 +302,13 @@ impl GcClient {
     ///
     /// # Endpoint
     ///
-    /// `GET /v1/meetings/{code}`
+    /// `GET /api/v1/meetings/{code}`
     pub async fn join_meeting(
         &self,
         meeting_code: &str,
         token: &str,
     ) -> Result<JoinMeetingResponse, GcClientError> {
-        let url = format!("{}/v1/meetings/{}", self.base_url, meeting_code);
+        let url = format!("{}/api/v1/meetings/{}", self.base_url, meeting_code);
 
         let response = self
             .http_client
@@ -328,13 +329,16 @@ impl GcClient {
     ///
     /// # Endpoint
     ///
-    /// `POST /v1/meetings/{code}/guest-token`
+    /// `POST /api/v1/meetings/{code}/guest-token`
     pub async fn get_guest_token(
         &self,
         meeting_code: &str,
         request: &GuestTokenRequest,
     ) -> Result<JoinMeetingResponse, GcClientError> {
-        let url = format!("{}/v1/meetings/{}/guest-token", self.base_url, meeting_code);
+        let url = format!(
+            "{}/api/v1/meetings/{}/guest-token",
+            self.base_url, meeting_code
+        );
 
         let response = self.http_client.post(&url).json(request).send().await?;
 
@@ -351,14 +355,14 @@ impl GcClient {
     ///
     /// # Endpoint
     ///
-    /// `PATCH /v1/meetings/{id}/settings`
+    /// `PATCH /api/v1/meetings/{id}/settings`
     pub async fn update_meeting_settings(
         &self,
         meeting_id: Uuid,
         token: &str,
         request: &UpdateMeetingSettingsRequest,
     ) -> Result<MeetingResponse, GcClientError> {
-        let url = format!("{}/v1/meetings/{}/settings", self.base_url, meeting_id);
+        let url = format!("{}/api/v1/meetings/{}/settings", self.base_url, meeting_id);
 
         let response = self
             .http_client
@@ -379,7 +383,7 @@ impl GcClient {
         meeting_code: &str,
         token: Option<&str>,
     ) -> Result<reqwest::Response, GcClientError> {
-        let url = format!("{}/v1/meetings/{}", self.base_url, meeting_code);
+        let url = format!("{}/api/v1/meetings/{}", self.base_url, meeting_code);
 
         let mut request = self.http_client.get(&url);
 
@@ -399,7 +403,7 @@ impl GcClient {
         token: Option<&str>,
         request: &UpdateMeetingSettingsRequest,
     ) -> Result<reqwest::Response, GcClientError> {
-        let url = format!("{}/v1/meetings/{}/settings", self.base_url, meeting_id);
+        let url = format!("{}/api/v1/meetings/{}/settings", self.base_url, meeting_id);
 
         let mut http_request = self.http_client.patch(&url).json(request);
 

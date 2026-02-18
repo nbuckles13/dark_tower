@@ -1,6 +1,6 @@
 # Known Shared Patterns in Common Crate
 
-Last updated: 2026-02-15
+Last updated: 2026-02-18
 
 ## Currently in `crates/common/`
 
@@ -43,6 +43,7 @@ Source: `docs/devloop-outputs/*/main.md` Tech Debt sections
 | Redis ConnectionManager wrapper | MC | Optional enhancement |
 | Histogram bucket configuration | MC metrics | Align with SLO targets |
 | Token refresh histogram buckets | GC `metrics.rs`, MC `metrics.rs` | Identical `[0.010..5.000]` SLO-aligned buckets; extract to `common::observability::TOKEN_REFRESH_BUCKETS` if 3rd service needs them |
+| `record_error()` function | AC, GC, MC `observability/metrics.rs` | All 3 services: `record_error(operation, error_type/error_category, status_code: u16)`. AC uses label name `error_category`, GC/MC use `error_type`. Candidate for `common::observability::record_error()` if 4th service appears. |
 
 ## Resolved Tech Debt
 
@@ -70,6 +71,8 @@ These look like duplication but are intentionally separate:
 | Dashboard JSON panel structures across services | Reference pattern (see gotchas) |
 | Metrics catalog doc structure across services | Intentional consistency for operators |
 | Guard script check functions with similar iteration loops | Different data sources and extraction logic |
+| `cluster()` helper variants across env-test files | Simple (AC-only) vs extended (GC-asserting) serve different precondition needs |
+| 401 panic messages repeated in `22_mc_gc_integration.rs` | Resolved: authenticated join tests removed (TD-26 closed) |
 
 ## When to Flag
 

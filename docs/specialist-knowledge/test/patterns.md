@@ -267,3 +267,11 @@ When a shared crate (e.g., `common`) can't depend on a service's metrics library
 For JSON-and-Markdown-only changes (dashboards, catalog docs), the guard script itself serves as the primary test. Review checklist: (1) validate JSON with `python3 -c "import json; json.load(open(f))"`, (2) check panel ID uniqueness per dashboard, (3) run guard script to verify all 5 steps pass, (4) cross-reference metrics from code against both dashboards and catalogs to ensure 100% bidirectional coverage, (5) run adjacent guards (histogram buckets, infrastructure metrics, datasource validation) to verify no regressions. Histogram suffix stripping (`_bucket`, `_count`, `_sum`) in the guard is critical — without it, `histogram_quantile(0.95, rate(foo_bucket[5m]))` won't count as coverage for metric `foo`.
 
 ---
+
+## Pattern: Dead-Code Wiring PRs Need No New Tests
+**Added**: 2026-02-17
+**Related files**: `crates/ac-service/src/observability/metrics.rs`, `crates/ac-service/src/repositories/*.rs`
+
+When a PR removes `#[allow(dead_code)]` from metrics functions and wires them into production call sites, existing tests are sufficient if: (1) the metrics functions already have unit tests (exercised via no-op recorder), (2) the call sites are in code paths already covered by integration/unit tests, (3) no new behavioral logic is introduced (just `Instant::now()` + `record_*()` calls around existing code). Review checklist: verify test count >= before, verify `#[allow(dead_code)]` removal matches actual call site additions, verify no tests removed or weakened. The wiring itself is simple enough that compilation + existing tests provide adequate coverage.
+
+---

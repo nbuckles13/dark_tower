@@ -69,22 +69,22 @@ All AC service metrics follow ADR-0011 naming conventions with the `ac_` prefix.
 - **Type**: Gauge
 - **Description**: Age of the current signing key in days
 - **Labels**: None
-- **Status**: Defined but not currently exported
 - **Usage**: Alert when key age exceeds threshold (e.g., 90 days)
+- **Call Sites**: `key_management_service::init_key_metrics` (startup), `initialize_signing_key`, `rotate_signing_key`, `handle_rotate_keys`
 
 ### `ac_active_signing_keys`
 - **Type**: Gauge
 - **Description**: Number of active signing keys in the keystore
 - **Labels**: None
-- **Status**: Defined but not currently exported
 - **Usage**: Ensure key rotation doesn't leave orphaned keys
+- **Call Sites**: `key_management_service::init_key_metrics` (startup), `initialize_signing_key`, `rotate_signing_key`, `handle_rotate_keys`
 
 ### `ac_key_rotation_last_success_timestamp`
 - **Type**: Gauge
 - **Description**: Unix timestamp of the last successful key rotation
 - **Labels**: None
-- **Status**: Defined but not currently exported
 - **Usage**: Alert when time since last rotation exceeds threshold
+- **Call Sites**: `key_management_service::init_key_metrics` (startup), `initialize_signing_key`, `rotate_signing_key`, `handle_rotate_keys`
 
 ---
 
@@ -96,8 +96,8 @@ All AC service metrics follow ADR-0011 naming conventions with the `ac_` prefix.
 - **Labels**:
   - `action`: Rate limit decision (`allowed`, `rejected`)
 - **Cardinality**: Low (2 actions = 2 series)
-- **Status**: Defined but not currently exported
 - **Usage**: Monitor rate limiting effectiveness, detect abuse patterns
+- **Call Sites**: `token_service::issue_service_token`, `token_service::issue_user_token`, `user_service::register_user`
 
 ---
 
@@ -110,9 +110,9 @@ All AC service metrics follow ADR-0011 naming conventions with the `ac_` prefix.
   - `operation`: SQL operation type (`select`, `insert`, `update`, `delete`)
   - `table`: Database table name (`service_credentials`, `signing_keys`, etc.)
   - `status`: Query outcome (`success`, `error`)
-- **Cardinality**: Low (4 operations × ~5 tables × 2 statuses = ~40 series)
-- **Status**: Defined but not currently exported
+- **Cardinality**: Low (4 operations × ~7 tables × 2 statuses = ~56 series)
 - **Usage**: Track database query rates and failures by table and operation
+- **Call Sites**: All repository functions in `users.rs`, `organizations.rs`, `service_credentials.rs`, `signing_keys.rs`, `auth_events.rs`
 
 ### `ac_db_query_duration_seconds`
 - **Type**: Histogram
@@ -121,8 +121,7 @@ All AC service metrics follow ADR-0011 naming conventions with the `ac_` prefix.
   - `operation`: SQL operation type
   - `table`: Database table name
 - **Buckets**: Default Prometheus buckets
-- **Cardinality**: Low (4 operations × ~5 tables = ~20 series)
-- **Status**: Defined but not currently exported
+- **Cardinality**: Low (4 operations × ~7 tables = ~28 series)
 - **Usage**: Monitor database query latency, identify slow queries
 
 ---
@@ -134,11 +133,10 @@ All AC service metrics follow ADR-0011 naming conventions with the `ac_` prefix.
 - **Description**: Duration of bcrypt operations (hash, verify)
 - **Labels**:
   - `operation`: Bcrypt operation type (`hash`, `verify`)
-- **Buckets**: Coarse buckets (50ms minimum) to prevent timing side-channel attacks
+- **Buckets**: [0.050, 0.100, 0.150, 0.200, 0.250, 0.300, 0.400, 0.500, 1.000]
 - **Cardinality**: Low (2 operations = 2 series)
-- **Status**: Defined but not currently exported
 - **Usage**: Monitor bcrypt performance, ensure cost factor remains appropriate
-- **Security Note**: Buckets are intentionally coarse per Security specialist guidance
+- **Call Sites**: `crypto::hash_client_secret`, `crypto::verify_client_secret`
 
 ---
 
@@ -151,9 +149,9 @@ All AC service metrics follow ADR-0011 naming conventions with the `ac_` prefix.
   - `event_type`: Type of audit event that failed to log (`token_issued`, `key_rotation`, etc.)
   - `reason`: Reason for failure (`db_write_failed`, `encryption_failed`, etc.)
 - **Cardinality**: Medium (bounded by event types and failure reasons)
-- **Status**: Defined but not currently exported
 - **Alert Threshold**: ANY non-zero value should trigger oncall page
 - **Usage**: Detect audit log failures that could impact compliance
+- **Call Sites**: `token_service`, `user_service`, `key_management_service`, `registration_service`
 
 ---
 
@@ -171,16 +169,17 @@ All AC service metrics follow ADR-0011 naming conventions with the `ac_` prefix.
 
 ---
 
-## Admin Operations Metrics
+## Credential Operations Metrics
 
-### `ac_admin_operations_total`
+### `ac_credential_operations_total`
 - **Type**: Counter
-- **Description**: Total number of admin client management operations
+- **Description**: Total number of service credential management operations
 - **Labels**:
-  - `operation`: Admin operation type (`list`, `get`, `create`, `update`, `delete`, `rotate_secret`)
+  - `operation`: Credential operation type (`list`, `get`, `create`, `update`, `delete`, `rotate_secret`)
   - `status`: Operation outcome (`success`, `error`)
 - **Cardinality**: Low (6 operations x 2 statuses = 12 series)
-- **Usage**: Track admin API usage patterns and failure rates
+- **Usage**: Track credential management API usage patterns and failure rates
+- **Call Sites**: `admin_handler::handle_register_service`, `handle_list_clients`, `handle_get_client`, `handle_create_client`, `handle_update_client`, `handle_delete_client`, `handle_rotate_client_secret`
 
 ---
 
@@ -288,7 +287,7 @@ All AC service metrics follow strict cardinality bounds per ADR-0011:
 | `status` | 2 | `success`, `error` |
 | `error_category` | 4 | `authentication`, `authorization`, `cryptographic`, `internal` |
 | `operation` | Bounded by code | `select`, `insert`, `update`, `delete`, etc. |
-| `table` | Bounded by schema | ~5 tables (`service_credentials`, `signing_keys`, etc.) |
+| `table` | Bounded by schema | ~7 tables (`service_credentials`, `signing_keys`, `auth_events`, `users`, `user_roles`, `organizations`, etc.) |
 | `cache_status` | 3 | `hit`, `miss`, `bypass` |
 | `action` | 2 | `allowed`, `rejected` |
 

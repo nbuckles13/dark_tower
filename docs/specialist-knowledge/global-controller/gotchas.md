@@ -362,3 +362,61 @@ mark_stale_fn(pool.clone(), threshold).await
 ```
 
 ---
+
+## Gotcha: GC URL Path Convention — `/health` vs `/api/v1/...`
+**Added**: 2026-02-18
+**Related files**: `crates/gc-service/src/routes/mod.rs`, `crates/env-tests/src/cluster.rs`, `crates/env-tests/src/fixtures/gc_client.rs`
+
+GC uses TWO different URL prefix conventions:
+- **Operational endpoints** (no prefix): `/health`, `/ready`, `/metrics`
+- **API endpoints** (with `/api/v1` prefix): `/api/v1/me`, `/api/v1/meetings/:code`, `/api/v1/meetings/:code/guest-token`, `/api/v1/meetings/:id/settings`
+
+This is different from AC, which uses `/health` and `/ready` for operational endpoints but `/api/v1/auth/...` for API routes. The key difference is that GC has `/api/v1/...` (with `/api` prefix), NOT just `/v1/...`.
+
+The env-test client fixtures originally used `/v1/health` and `/v1/meetings/...` (no `/api` prefix), which caused ALL GC env-tests to silently skip. The `is_gc_available()` check hit `/v1/health` instead of `/health`, always returned false, and every test printed "SKIPPED: GC not deployed" even when GC was running.
+
+**Lesson**: When writing clients or test fixtures for GC endpoints, always cross-reference `crates/gc-service/src/routes/mod.rs` as the source of truth for URL paths. Do not assume the prefix convention matches other services.
+
+---
+
+## Gotcha: Service Tokens Have String `sub`, Not UUID — Breaks `join_meeting`
+**Added**: 2026-02-18
+**Related files**: `crates/gc-service/src/handlers/meetings.rs`, `crates/ac-service/src/services/token_service.rs`
+
+AC's client credentials flow sets `sub: client_id.to_string()` (e.g., `sub: "test-client"`). GC's `join_meeting` handler calls `parse_user_id(&claims.sub)` which runs `Uuid::parse_str()` on this value. Since `"test-client"` is not a valid UUID, the handler fails immediately with `GcError::InvalidToken` before ever reaching the meeting lookup.
+
+This means env-tests using service tokens (`test-client`) can NEVER exercise the authenticated meeting join flow (`GET /api/v1/meetings/{code}`). The old env-tests accepted 404 as valid, but the actual error was likely a token-level parse failure, not "meeting not found".
+
+**Affected endpoints**: `join_meeting` (requires UUID sub for user lookup), `update_meeting_settings` (requires UUID sub for host authorization check). Guest endpoint is NOT affected (no user lookup).
+
+**Resolution**: Env-tests need user tokens (with UUID `sub` matching a seeded user row) to test authenticated join. Tracked in `.claude/TODO.md`.
+
+---
+
+## Gotcha: GC Service Credentials Missing `internal:meeting-token` Scope
+**Added**: 2026-02-18
+**Related files**: `infra/kind/scripts/setup.sh`, `crates/ac-service/src/handlers/internal_tokens.rs`, `crates/gc-service/src/services/ac_client.rs`
+
+The `global-controller` service credential in `setup.sh` has scopes `['meeting:create', 'meeting:read', 'meeting:update']`, but AC's internal meeting-token endpoint (`POST /api/v1/auth/internal/meeting-token`) requires `internal:meeting-token` scope. GC's `AcClient::request_meeting_token()` will always fail with 403 InsufficientScope because the OAuth token acquired by GC's `TokenManager` lacks the required scope.
+
+This is a separate blocker from the UUID `sub` issue — even with a properly seeded meeting, healthy MC, and user token, the join flow will fail at the AC internal API call step.
+
+**Fix required**: Add `'internal:meeting-token'` to the `global-controller` credentials ARRAY in `setup.sh` seed data.
+
+---
+
+## Gotcha: init.sql Schema Diverges from Migration Schema
+**Added**: 2026-02-18
+**Related files**: `infra/docker/postgres/init.sql`, `migrations/20250118000001_initial_schema.sql`, `migrations/20260115000001_add_meeting_settings.sql`
+
+The Docker dev `init.sql` and the production migration schema have diverged for the `meetings` table:
+
+- Migration schema has `join_token_secret VARCHAR(255) NOT NULL` — init.sql does NOT have this column
+- Migration schema has `recording_enabled` — init.sql has `allow_recording` (different column name)
+- The seeded meeting in init.sql (`dev-test-123`) omits `join_token_secret`, which would fail on the migration schema due to `NOT NULL` constraint
+
+The kind cluster uses migrations (via `sqlx migrate run`), not `init.sql`. The `seed_test_data()` function in `setup.sh` only seeds `service_credentials` — it does NOT seed organizations, users, or meetings for the kind cluster.
+
+**Impact**: Tests running against the kind cluster have no seeded meetings. Tests running against Docker dev may have different column names. Always verify which schema is in use before writing SQL seed data.
+
+---

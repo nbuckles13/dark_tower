@@ -275,3 +275,43 @@ Metrics are recorded at different layers depending on what they measure:
 **Dashboard panels**: Grafana dashboard at `infra/grafana/dashboards/gc-overview.json` has panels for each metric type.
 
 ---
+
+## Integration: env-tests Client Fixtures for GC
+**Added**: 2026-02-18
+**Related files**: `crates/env-tests/src/fixtures/gc_client.rs`, `crates/env-tests/src/cluster.rs`, `crates/gc-service/src/routes/mod.rs`
+
+The env-tests crate has two GC integration points:
+
+1. **`ClusterConnection::check_gc_health()`** (`cluster.rs`): Hits `GET /health` to check if GC is running. Used by `is_gc_available()` which guards GC-dependent tests.
+
+2. **`GcClient`** (`gc_client.rs`): Full HTTP client for GC API endpoints. Methods: `health_check()`, `get_me()`, `join_meeting()`, `get_guest_token()`, `update_meeting_settings()`, plus raw variants for error-case testing.
+
+**Source of truth for URLs**: `crates/gc-service/src/routes/mod.rs`. All GC client URLs MUST match the routes defined there. The routes use:
+- `/health`, `/ready`, `/metrics` (no prefix, operational)
+- `/api/v1/me`, `/api/v1/meetings/:code`, `/api/v1/meetings/:code/guest-token`, `/api/v1/meetings/:id/settings` (with `/api` prefix, versioned API)
+
+**Sensitive data handling**: GcClient sanitizes error response bodies via regex (removes JWT and Bearer token patterns, truncates long bodies). Debug impls on response types redact tokens and user IDs.
+
+---
+
+## Integration: Authenticated Meeting Join Dependency Chain
+**Added**: 2026-02-18
+**Related files**: `crates/gc-service/src/handlers/meetings.rs`, `crates/gc-service/src/services/mc_assignment.rs`, `crates/gc-service/src/services/ac_client.rs`
+
+The `GET /api/v1/meetings/{code}` (authenticated join) endpoint has a 5-step dependency chain that must ALL succeed:
+
+1. **JWT with UUID `sub`**: The token's `sub` claim must be a valid UUID (not a string client_id). `parse_user_id()` calls `Uuid::parse_str()` and returns `GcError::InvalidToken` on failure. Service tokens from client credentials flow have `sub: "test-client"` which fails here.
+
+2. **User row in `users` table**: `get_user_org_id()` looks up the user by UUID to get their `org_id`. Returns `GcError::NotFound("User not found")` if missing.
+
+3. **Meeting row in `meetings` table**: `find_meeting_by_code()` looks up by `meeting_code`. Must have `status` not equal to `cancelled` or `ended`.
+
+4. **Healthy MC with capacity**: `McAssignmentService::assign_meeting_with_mh()` needs at least one healthy MC in `meeting_controllers` with available capacity. Returns `GcError::ServiceUnavailable` (503) if none available.
+
+5. **AC internal meeting-token endpoint**: `ac_client.request_meeting_token()` calls AC to issue a meeting-scoped JWT. Requires GC's service token to have `internal:meeting-token` scope.
+
+The **guest endpoint** (`POST /api/v1/meetings/{code}/guest-token`) skips steps 1-2 (no user lookup), making it usable with service tokens and without seeded users. It still requires steps 3-5.
+
+**For env-tests**: Currently only the guest endpoint is testable. Steps 1 and 5 are the primary blockers for authenticated join testing.
+
+---

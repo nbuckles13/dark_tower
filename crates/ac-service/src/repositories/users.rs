@@ -4,8 +4,10 @@
 //! and role management per ADR-0020.
 
 use crate::errors::AcError;
+use crate::observability::metrics::record_db_query;
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
+use std::time::Instant;
 use uuid::Uuid;
 
 /// User model (maps to users table)
@@ -31,7 +33,8 @@ pub async fn get_by_email(
     org_id: Uuid,
     email: &str,
 ) -> Result<Option<User>, AcError> {
-    let user = sqlx::query_as::<_, User>(
+    let start = Instant::now();
+    let result = sqlx::query_as::<_, User>(
         r#"
         SELECT
             user_id, org_id, email, password_hash, display_name,
@@ -43,8 +46,11 @@ pub async fn get_by_email(
     .bind(org_id)
     .bind(email)
     .fetch_optional(pool)
-    .await
-    .map_err(|e| AcError::Database(format!("Failed to fetch user by email: {}", e)))?;
+    .await;
+    let status = if result.is_ok() { "success" } else { "error" };
+    record_db_query("select", "users", status, start.elapsed());
+    let user =
+        result.map_err(|e| AcError::Database(format!("Failed to fetch user by email: {}", e)))?;
 
     Ok(user)
 }
@@ -52,7 +58,8 @@ pub async fn get_by_email(
 /// Get user by user_id.
 #[allow(dead_code)] // Library function - will be used in future phases
 pub async fn get_by_id(pool: &PgPool, user_id: Uuid) -> Result<Option<User>, AcError> {
-    let user = sqlx::query_as::<_, User>(
+    let start = Instant::now();
+    let result = sqlx::query_as::<_, User>(
         r#"
         SELECT
             user_id, org_id, email, password_hash, display_name,
@@ -63,8 +70,11 @@ pub async fn get_by_id(pool: &PgPool, user_id: Uuid) -> Result<Option<User>, AcE
     )
     .bind(user_id)
     .fetch_optional(pool)
-    .await
-    .map_err(|e| AcError::Database(format!("Failed to fetch user by id: {}", e)))?;
+    .await;
+    let status = if result.is_ok() { "success" } else { "error" };
+    record_db_query("select", "users", status, start.elapsed());
+    let user =
+        result.map_err(|e| AcError::Database(format!("Failed to fetch user by id: {}", e)))?;
 
     Ok(user)
 }
@@ -79,7 +89,8 @@ pub async fn create_user(
     password_hash: &str,
     display_name: &str,
 ) -> Result<User, AcError> {
-    let user = sqlx::query_as::<_, User>(
+    let start = Instant::now();
+    let result = sqlx::query_as::<_, User>(
         r#"
         INSERT INTO users (org_id, email, password_hash, display_name)
         VALUES ($1, $2, $3, $4)
@@ -93,8 +104,10 @@ pub async fn create_user(
     .bind(password_hash)
     .bind(display_name)
     .fetch_one(pool)
-    .await
-    .map_err(|e| {
+    .await;
+    let status = if result.is_ok() { "success" } else { "error" };
+    record_db_query("insert", "users", status, start.elapsed());
+    let user = result.map_err(|e| {
         // Check for unique constraint violation (duplicate email in org)
         if e.to_string().contains("users_org_email_unique") {
             AcError::Database("User with this email already exists in organization".to_string())
@@ -108,7 +121,8 @@ pub async fn create_user(
 
 /// Update the last_login_at timestamp for a user.
 pub async fn update_last_login(pool: &PgPool, user_id: Uuid) -> Result<(), AcError> {
-    sqlx::query(
+    let start = Instant::now();
+    let result = sqlx::query(
         r#"
         UPDATE users
         SET last_login_at = NOW()
@@ -117,8 +131,10 @@ pub async fn update_last_login(pool: &PgPool, user_id: Uuid) -> Result<(), AcErr
     )
     .bind(user_id)
     .execute(pool)
-    .await
-    .map_err(|e| AcError::Database(format!("Failed to update last login: {}", e)))?;
+    .await;
+    let status = if result.is_ok() { "success" } else { "error" };
+    record_db_query("update", "users", status, start.elapsed());
+    result.map_err(|e| AcError::Database(format!("Failed to update last login: {}", e)))?;
 
     Ok(())
 }
@@ -127,7 +143,8 @@ pub async fn update_last_login(pool: &PgPool, user_id: Uuid) -> Result<(), AcErr
 ///
 /// Returns a list of role strings (e.g., ["user", "admin"]).
 pub async fn get_user_roles(pool: &PgPool, user_id: Uuid) -> Result<Vec<String>, AcError> {
-    let roles: Vec<(String,)> = sqlx::query_as(
+    let start = Instant::now();
+    let result = sqlx::query_as(
         r#"
         SELECT role
         FROM user_roles
@@ -137,8 +154,11 @@ pub async fn get_user_roles(pool: &PgPool, user_id: Uuid) -> Result<Vec<String>,
     )
     .bind(user_id)
     .fetch_all(pool)
-    .await
-    .map_err(|e| AcError::Database(format!("Failed to fetch user roles: {}", e)))?;
+    .await;
+    let status = if result.is_ok() { "success" } else { "error" };
+    record_db_query("select", "user_roles", status, start.elapsed());
+    let roles: Vec<(String,)> =
+        result.map_err(|e| AcError::Database(format!("Failed to fetch user roles: {}", e)))?;
 
     Ok(roles.into_iter().map(|(r,)| r).collect())
 }
@@ -152,7 +172,8 @@ pub async fn add_user_role(pool: &PgPool, user_id: Uuid, role: &str) -> Result<(
         return Err(AcError::Database(format!("Invalid role: {}", role)));
     }
 
-    sqlx::query(
+    let start = Instant::now();
+    let result = sqlx::query(
         r#"
         INSERT INTO user_roles (user_id, role)
         VALUES ($1, $2)
@@ -162,8 +183,10 @@ pub async fn add_user_role(pool: &PgPool, user_id: Uuid, role: &str) -> Result<(
     .bind(user_id)
     .bind(role)
     .execute(pool)
-    .await
-    .map_err(|e| AcError::Database(format!("Failed to add user role: {}", e)))?;
+    .await;
+    let status = if result.is_ok() { "success" } else { "error" };
+    record_db_query("insert", "user_roles", status, start.elapsed());
+    result.map_err(|e| AcError::Database(format!("Failed to add user role: {}", e)))?;
 
     Ok(())
 }
@@ -171,7 +194,8 @@ pub async fn add_user_role(pool: &PgPool, user_id: Uuid, role: &str) -> Result<(
 /// Remove a role from a user.
 #[allow(dead_code)] // Library function - will be used in future phases
 pub async fn remove_user_role(pool: &PgPool, user_id: Uuid, role: &str) -> Result<(), AcError> {
-    sqlx::query(
+    let start = Instant::now();
+    let result = sqlx::query(
         r#"
         DELETE FROM user_roles
         WHERE user_id = $1 AND role = $2
@@ -180,8 +204,10 @@ pub async fn remove_user_role(pool: &PgPool, user_id: Uuid, role: &str) -> Resul
     .bind(user_id)
     .bind(role)
     .execute(pool)
-    .await
-    .map_err(|e| AcError::Database(format!("Failed to remove user role: {}", e)))?;
+    .await;
+    let status = if result.is_ok() { "success" } else { "error" };
+    record_db_query("delete", "user_roles", status, start.elapsed());
+    result.map_err(|e| AcError::Database(format!("Failed to remove user role: {}", e)))?;
 
     Ok(())
 }
@@ -194,7 +220,8 @@ pub async fn email_exists_in_org(
     org_id: Uuid,
     email: &str,
 ) -> Result<bool, AcError> {
-    let exists: (bool,) = sqlx::query_as(
+    let start = Instant::now();
+    let result = sqlx::query_as(
         r#"
         SELECT EXISTS(
             SELECT 1 FROM users
@@ -205,8 +232,11 @@ pub async fn email_exists_in_org(
     .bind(org_id)
     .bind(email)
     .fetch_one(pool)
-    .await
-    .map_err(|e| AcError::Database(format!("Failed to check email existence: {}", e)))?;
+    .await;
+    let status = if result.is_ok() { "success" } else { "error" };
+    record_db_query("select", "users", status, start.elapsed());
+    let exists: (bool,) =
+        result.map_err(|e| AcError::Database(format!("Failed to check email existence: {}", e)))?;
 
     Ok(exists.0)
 }

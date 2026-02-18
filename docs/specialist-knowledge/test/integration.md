@@ -93,10 +93,12 @@ Test state transitions, not just happy paths: (1) initial state, (2) state chang
 ---
 
 ## For All Specialists: Cross-Service Test Client Pattern
-**Added**: 2026-01-18
+**Added**: 2026-01-18, **Updated**: 2026-02-18
 **Related files**: `crates/env-tests/src/fixtures/gc_client.rs`
 
-Follow GcClient pattern for new service clients: Error enum (HttpError, RequestFailed, JsonError), custom Debug on sensitive fields, sanitize_error_body(), health_check(), raw_* methods for error testing.
+Follow GcClient pattern for new service clients: Error enum (HttpError, RequestFailed, JsonError), custom Debug on sensitive fields, sanitize_error_body(), health_check(), raw_* methods for error testing. URL source of truth: check the service's `routes/mod.rs` for exact paths. GC uses `/api/v1/` prefix for API endpoints but `/health` and `/metrics` have no prefix. Never use `is_gc_available()` guards — make service availability a hard requirement via the `cluster()` helper.
+
+Current env-test infrastructure limitation (as of 2026-02-18): env-tests can only obtain service tokens (string `sub` like `"test-client"`), not user tokens (UUID `sub`). Authenticated GC endpoints that call `parse_user_id(&claims.sub)` will always fail with service tokens. Until env-tests can generate user tokens or GC has a create-meeting endpoint, test error behavior via public endpoints (guest-token) instead. Coverage for authenticated flows lives in `crates/gc-service/tests/meeting_tests.rs` (sqlx::test with proper fixtures). Tracked in `.claude/TODO.md`.
 
 ---
 

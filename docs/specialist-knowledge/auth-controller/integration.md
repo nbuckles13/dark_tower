@@ -24,9 +24,10 @@ Services validating AC tokens must use same clock skew tolerance (default 300s).
 
 ## Integration: Performance Expectations
 **Added**: 2026-01-11
+**Updated**: 2026-02-18
 **Related files**: `crates/ac-service/src/config.rs`
 
-Bcrypt cost affects `/oauth/token` latency: cost 10 ~50ms, cost 12 ~200ms (default), cost 14 ~800ms. Load balancer timeouts should accommodate. Rate limiting: 5 failures in 15 min triggers lockout (HTTP 429).
+Bcrypt cost affects `/api/v1/auth/service/token` latency: cost 10 ~50ms, cost 12 ~200ms (default), cost 14 ~800ms. Load balancer timeouts should accommodate. Rate limiting: 5 failures in 15 min triggers lockout (HTTP 429).
 
 ---
 
@@ -121,10 +122,26 @@ AC requires `AC_HASH_SECRET` environment variable (base64-encoded, minimum 32 by
 
 ---
 
+## Integration: Env-Tests Fixture URLs Must Match Route Definitions
+**Added**: 2026-02-18
+**Related files**: `crates/env-tests/src/fixtures/auth_client.rs`, `crates/env-tests/src/fixtures/gc_client.rs`, `crates/env-tests/src/cluster.rs`
+
+Env-test fixture clients hard-code endpoint URLs. These MUST match the actual route definitions in the service's `routes/mod.rs`. A mismatch causes `is_gc_available()` or similar health checks to return `false`, silently skipping all dependent tests. The GC client had `/v1/health` but GC serves `/health` -- this silently disabled 12+ cross-service tests. AC fixture URLs are correct: `/api/v1/auth/service/token` and `/.well-known/jwks.json`. When reviewing env-tests, always cross-reference fixture URLs against the service's `routes/mod.rs` as source of truth.
+
+---
+
 ## Integration: Observability Module Structure
 **Added**: 2026-02-10
 **Related files**: `crates/ac-service/src/observability/mod.rs`, `crates/ac-service/src/observability/metrics.rs`
 
 AC observability follows ADR-0011 structure: `observability/mod.rs` contains `ErrorCategory` enum and `hash_for_correlation()`, `observability/metrics.rs` contains Prometheus metric recording functions. Handlers import metrics via `use crate::observability::metrics::*`. All instrumentation uses `#[instrument(skip_all)]` with explicit safe field allow-listing.
+
+---
+
+## Integration: Env-Tests Use Guest Endpoint to Bypass Token Type Mismatch
+**Added**: 2026-02-18
+**Related files**: `crates/env-tests/tests/22_mc_gc_integration.rs`, `crates/gc-service/src/handlers/meetings.rs`
+
+Env-tests cannot test authenticated meeting joins because: (1) AC only issues service tokens to env-test clients, (2) service tokens have string `sub` not UUID, (3) GC's `join_meeting` handler requires UUID `sub` via `parse_user_id()`. Until env-tests can obtain user tokens and seed test meetings, use the guest-token endpoint (`POST /api/v1/meetings/{code}/guest-token`) for MC-GC integration tests. The guest endpoint is public (no auth), so it tests GC routing and error handling without needing AC tokens at all. Authenticated join flow testing remains in `crates/gc-service/tests/meeting_tests.rs` (integration tests with sqlx::test harness).
 
 ---

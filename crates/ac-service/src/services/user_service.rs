@@ -4,6 +4,7 @@
 
 use crate::crypto;
 use crate::errors::AcError;
+use crate::observability::metrics::{record_audit_log_failure, record_rate_limit_decision};
 use crate::repositories::{auth_events, users};
 use crate::services::token_service;
 use sqlx::PgPool;
@@ -80,11 +81,13 @@ pub async fn register_user(
                 "Registration rate limit exceeded for IP (count={})",
                 registration_count
             );
+            record_rate_limit_decision("rejected");
             return Err(AcError::TooManyRequests {
                 retry_after_seconds: REGISTRATION_RATE_LIMIT_WINDOW_MINUTES * 60,
                 message: "Too many registration attempts. Please try again later.".to_string(),
             });
         }
+        record_rate_limit_decision("allowed");
     }
 
     // Validate email format
@@ -137,6 +140,7 @@ pub async fn register_user(
     // Log registration event
     if let Err(e) = log_registration_event(pool, &user.user_id, ip_address, user_agent).await {
         tracing::warn!("Failed to log registration event: {}", e);
+        record_audit_log_failure("user_registered", "db_write_failed");
     }
 
     // Issue token (auto-login)
