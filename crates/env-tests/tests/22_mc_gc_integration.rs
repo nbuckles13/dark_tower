@@ -123,14 +123,20 @@ async fn test_guest_endpoint_does_not_require_auth() {
         captcha_token: "captcha-123".to_string(),
     };
 
-    // Call guest endpoint without any authentication
+    // Call guest endpoint without any authentication.
+    // "any-meeting-code" does not exist, so after validation passes
+    // the meeting lookup returns 404. Crucially, it must NOT return 401.
     let result = gc_client
         .get_guest_token("any-meeting-code", &request)
         .await;
 
     match result {
         Ok(_) => {
-            println!("Guest endpoint returned 200 - meeting exists and allows guests");
+            panic!(
+                "Guest token should NOT succeed for non-existent meeting code. \
+                 If this passes, a meeting with code 'any-meeting-code' \
+                 unexpectedly exists in the database."
+            );
         }
         Err(GcClientError::RequestFailed { status, body }) => {
             // 401 would mean the endpoint incorrectly requires authentication
@@ -140,16 +146,11 @@ async fn test_guest_endpoint_does_not_require_auth() {
                 body
             );
 
-            // Expected error codes for business logic failures
-            assert!(
-                status == 400 || status == 403 || status == 404 || status == 503,
-                "Expected business logic error (400/403/404/503), got {}: {}",
-                status,
-                body
-            );
-
-            println!(
-                "Guest endpoint returned {} (expected for business logic): {}",
+            // Validation passes (valid display_name + captcha), then meeting
+            // lookup returns 404 for non-existent "any-meeting-code".
+            assert_eq!(
+                status, 404,
+                "Expected 404 Not Found for non-existent meeting, got {}: {}",
                 status, body
             );
         }
