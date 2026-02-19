@@ -4,6 +4,8 @@
 
 **Date**: 2025-01-22
 
+> **Scope note**: This ADR covers **service-to-service authentication** (Client Credentials, service tokens, mTLS). For **user authentication and authorization**, see [ADR-0020](adr-0020-user-auth-meeting-access.md).
+
 **Deciders**: Security Specialist, Auth Controller Specialist, Global Controller Specialist, Meeting Controller Specialist, Media Handler Specialist
 
 ---
@@ -48,12 +50,11 @@ Dark Tower is a distributed system with multiple services that need to communica
 - One cluster per continent or customer
 - All instances in cluster share same signing key
 
-### Component 2: OAuth 2.0 Scopes
+### Component 2: OAuth 2.0 Scopes (Service Tokens)
 
 **Scope Format**: `{principal}.{operation}.{component}`
 
 **Principal Types**:
-- `user` - End user tokens
 - `service` - Service-to-service tokens
 
 **Operations**:
@@ -68,27 +69,13 @@ Dark Tower is a distributed system with multiple services that need to communica
 - `ac` - Auth Controller (future)
 
 **Examples**:
-- `user.read.gc` - User can read from GC
-- `user.write.mc` - User can publish streams, subscribe to layouts
 - `service.write.mh` - Service can route media
+- `service.read.gc` - Service can read from GC
 - `service.admin.gc` - Service can perform admin operations
 
 ### Component 3: Token Types
 
-**User Tokens** (issued by Auth Controller):
-```json
-{
-  "sub": "550e8400-e29b-41d4-a716-446655440000",
-  "org_id": "org_123",
-  "scopes": ["user.read.gc", "user.write.gc", "user.read.mc", "user.write.mc"],
-  "iss": "auth.us.dark.com",
-  "iat": 1234567890,
-  "exp": 1234571490,  // 1 hour
-  "aud": "dark-tower-api"
-}
-```
-
-**Note**: `email` field intentionally omitted (PII). Services look up email from database using `sub` if needed.
+**User Tokens**: See [ADR-0020](adr-0020-user-auth-meeting-access.md) for user token format and authorization model.
 
 **Service Tokens** (issued by Auth Controller):
 ```json
@@ -432,17 +419,9 @@ Week 4: Keys [keyC, keyD]    - sign with keyD, validate both
 }
 ```
 
-**User Token Response**:
-```json
-{
-  "access_token": "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9...",
-  "token_type": "Bearer",
-  "expires_in": 3600,
-  "scope": "user.read.gc user.write.gc user.read.mc user.write.mc"
-}
-```
+**User Token Response**: See [ADR-0020](adr-0020-user-auth-meeting-access.md).
 
-**Field Requirements**:
+**Field Requirements** (service tokens):
 - `access_token` (REQUIRED): The JWT token
 - `token_type` (REQUIRED): Always "Bearer"
 - `expires_in` (REQUIRED): Token lifetime in seconds
@@ -514,7 +493,7 @@ Content-Type: application/json
 - gRPC: `metadata["authorization"] = "Bearer <token>"`
 - WebTransport: In protobuf message field
 
-**Scope Validation**:
+**Scope Validation** (service tokens only — user tokens use roles per [ADR-0020](adr-0020-user-auth-meeting-access.md)):
 ```rust
 fn check_scope(claims: &Claims, required: &str) -> Result<(), AuthError> {
     if !claims.scopes.contains(&required.to_string()) {
