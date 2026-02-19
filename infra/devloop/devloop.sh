@@ -262,7 +262,33 @@ PR_URL=$(cd "$CLONE_DIR" && gh pr list --head "$BRANCH_NAME" --state open --json
 if [ -n "$PR_URL" ]; then
     echo "=== PR exists: ${PR_URL} ==="
     echo ""
-    menu_reenter_or_cleanup
+
+    # Check for unpushed commits on the branch
+    UNPUSHED=$(git -C "$CLONE_DIR" log --oneline "origin/${BRANCH_NAME}..HEAD" 2>/dev/null || true)
+    if [ -n "$UNPUSHED" ]; then
+        echo "Unpushed commits:"
+        echo "$UNPUSHED"
+        echo ""
+        echo "  [p] Push to update PR"
+        echo "  [r] Re-enter container"
+        echo "  [d] Destroy containers and clone (un-pushed changes will be lost)"
+        echo "  [q] Quit (containers stay running)"
+        read -p "Choice: " -n 1 -r
+        echo
+        case $REPLY in
+            p|P)
+                git -C "$CLONE_DIR" push origin "$BRANCH_NAME"
+                echo "Pushed. PR updated."
+                echo ""
+                menu_reenter_or_cleanup
+                ;;
+            r|R) exec "$0" "$TASK_SLUG" "$BASE_BRANCH" ;;
+            d|D) cleanup ;;
+            *) echo "Containers still running. Re-enter with: $0 ${TASK_SLUG}" ;;
+        esac
+    else
+        menu_reenter_or_cleanup
+    fi
 
 elif [ -n "$COMMITS" ]; then
     echo "=== Commits on ${BRANCH_NAME} ==="
