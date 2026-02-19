@@ -25,13 +25,9 @@
 | Phase | `complete` |
 | Implementer | `implementer@fix-env-tests` / `implementer@fix-env-tests-2` |
 | Implementing Specialist | `test` |
-| Iteration | `3` |
-| Security | `RESOLVED` |
-| Test | `CLEAR` |
-| Observability | `CLEAR` |
+| Iteration | `4` |
+| Security | `CLEAR` |
 | Code Quality | `CLEAR` |
-| DRY | `CLEAR` |
-| Operations | `CLEAR` |
 
 ---
 
@@ -258,6 +254,58 @@ Env-test fixtures used wrong URL paths. `cluster.rs` checked `/v1/health` but GC
 | ID | Description | Source |
 |----|-------------|--------|
 | TD-31 | LokiClient fixture extraction — 3 inline Loki API calls could be extracted to a fixture parallel to PrometheusClient | DRY reviewer |
+
+---
+
+## Iteration 4: Fix Test Rigidity Guard Violations
+
+**Mode**: Light (3 teammates: implementer + security + code-reviewer)
+
+### Changes
+
+| Step | File(s) | Change |
+|------|---------|--------|
+| 1. Multi-status fixes | `21_cross_service_flows.rs` | 4 multi-status assertions → single `assert_eq!` per GC handler logic |
+| 2. Multi-status fix | `22_mc_gc_integration.rs` | 1 multi-status assertion → `assert_eq!(status, 404)` |
+| 3. Ok arm fixes | `21_cross_service_flows.rs`, `22_mc_gc_integration.rs` | 2 `Ok(_) => println!()` → `Ok(_) => panic!()` |
+| 4. Guard improvements | `test-rigidity.sh` | Check 3: skip comment lines; Check 6: skip `#[ignore]` tests |
+
+### Validation Results (Iteration 4)
+
+| Layer | Command | Result |
+|-------|---------|--------|
+| 1. Compile | `cargo check --workspace` | PASS |
+| 2. Format | `cargo fmt --all -- --check` | PASS (fixed) |
+| 3. Guards | `./scripts/guards/run-guards.sh` | PASS (13/13, incl. test-rigidity) |
+| 4. Tests | `./scripts/test.sh --workspace` | PASS |
+| 5. Clippy | `cargo clippy --workspace --lib --bins -- -D warnings` | PASS |
+| 6. Audit | `cargo audit` | PASS (2 pre-existing) |
+
+### Code Review Results (Iteration 4)
+
+| Reviewer | Verdict | Findings | Fixed | Deferred | Notes |
+|----------|---------|----------|-------|----------|-------|
+| Security | CLEAR | 0 | 0 | 0 | Auth enforcement tests preserved, no blind spots |
+| Code Quality | CLEAR | 0 | 0 | 0 | All status codes verified against GC handler source |
+
+---
+
+## Human Review (Iteration 4)
+
+**Feedback**: "Test rigidity guard (`scripts/guards/simple/test-rigidity.sh`) reports 7 violations across 2 test files. Fix them:
+
+Check 4 — Multi-status acceptance (5 violations): Tests accept contradictory HTTP status codes (e.g., `404 || 401`), making it impossible to verify specific behavior. Each test should assert the single expected status code.
+- `21_cross_service_flows.rs:240`: `status == 404 || status == 401`
+- `21_cross_service_flows.rs:291`: `status == 404 || status == 403 || status == 400`
+- `21_cross_service_flows.rs:328`: `status == 400 || status == 404`
+- `21_cross_service_flows.rs:405`: `status == 404 || status == 400 || status == 401`
+- `22_mc_gc_integration.rs:145`: `status == 400 || status == 403 || status == 404 || status == 503`
+
+Check 5 — Assertion-free match arms (2 violations): `Ok(_)` arms that print and move on without asserting anything.
+- `21_cross_service_flows.rs:278`: `Ok(_) => { println!(...) }`
+- `22_mc_gc_integration.rs:132`: `Ok(_) => { println!(...) }`
+
+Also commit the guard script improvements (check 3: skip comments, check 6: skip #[ignore] tests)."
 
 ---
 

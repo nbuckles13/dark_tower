@@ -234,11 +234,11 @@ async fn test_meeting_join_returns_404_for_unknown_meeting() {
     match result {
         Ok(response) => {
             let status = response.status().as_u16();
-            // Should return 404 Not Found for non-existent meeting
-            // OR 401 if token validation fails (GC can't reach AC JWKS)
-            assert!(
-                status == 404 || status == 401,
-                "Should return 404 (not found) or 401 (if JWKS unreachable), got {}",
+            // Meeting lookup runs before user ID parsing, so non-existent
+            // meeting code always returns 404 regardless of token sub format.
+            assert_eq!(
+                status, 404,
+                "Should return 404 Not Found for non-existent meeting, got {}",
                 status
             );
         }
@@ -272,12 +272,15 @@ async fn test_guest_token_endpoint_is_public() {
         .get_guest_token("test-meeting-code", &request)
         .await;
 
-    // Should fail with 404 (meeting not found) or 403 (guests not allowed),
-    // NOT 401 (unauthorized) - because this is a public endpoint
+    // Should fail with 404 (meeting not found) because "test-meeting-code"
+    // does not exist. The endpoint is public, so 401 would indicate a bug.
     match result {
         Ok(_) => {
-            // If this succeeds, we have a seeded meeting with guests allowed
-            println!("Guest token issued successfully - meeting exists and allows guests");
+            panic!(
+                "Guest token should NOT succeed for non-existent meeting code. \
+                 If this passes, a meeting with code 'test-meeting-code' \
+                 unexpectedly exists in the database."
+            );
         }
         Err(env_tests::fixtures::gc_client::GcClientError::RequestFailed { status, body }) => {
             // Should NOT be 401 (would mean auth is incorrectly required)
@@ -286,12 +289,12 @@ async fn test_guest_token_endpoint_is_public() {
                 "Guest token endpoint should not require authentication. Response: {}",
                 body
             );
-            // 404 (meeting not found) or 403 (guests not allowed) are valid
-            assert!(
-                status == 404 || status == 403 || status == 400,
-                "Expected 404/403/400, got {}: {}",
-                status,
-                body
+            // Validation passes (valid display_name + captcha), so meeting lookup
+            // runs next and returns 404 for non-existent meeting code.
+            assert_eq!(
+                status, 404,
+                "Expected 404 Not Found for non-existent meeting, got {}: {}",
+                status, body
             );
         }
         Err(e) => {
@@ -317,16 +320,17 @@ async fn test_guest_token_validates_display_name() {
         .get_guest_token("test-meeting-code", &request)
         .await;
 
-    // Should fail with 400 Bad Request for empty display name
+    // Should fail with 400 Bad Request for empty display name.
+    // GuestJoinRequest::validate() runs before meeting lookup,
+    // so empty display_name always returns 400 regardless of meeting existence.
     match result {
         Ok(_) => {
             panic!("Should reject empty display name");
         }
         Err(env_tests::fixtures::gc_client::GcClientError::RequestFailed { status, .. }) => {
-            // 400 for validation error, or 404 if meeting lookup happens first
-            assert!(
-                status == 400 || status == 404,
-                "Expected 400 (validation) or 404 (meeting not found), got {}",
+            assert_eq!(
+                status, 400,
+                "Expected 400 Bad Request for empty display name, got {}",
                 status
             );
         }
@@ -399,11 +403,11 @@ async fn test_meeting_settings_returns_404_for_unknown_meeting() {
     match result {
         Ok(response) => {
             let status = response.status().as_u16();
-            // Should return 404 Not Found or 400 Bad Request (no changes)
-            // or 401 if token validation fails
-            assert!(
-                status == 404 || status == 400 || status == 401,
-                "Expected 404/400/401, got {}",
+            // has_changes() passes (allow_guests=true), then find_meeting_by_id()
+            // returns 404 for Uuid::nil() before parse_user_id() is reached.
+            assert_eq!(
+                status, 404,
+                "Expected 404 Not Found for non-existent meeting, got {}",
                 status
             );
         }
