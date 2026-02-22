@@ -1,9 +1,19 @@
-# Approved Cryptographic Algorithms
+# ADR-0027: Approved Cryptographic Algorithms
+
+## Status
+
+Accepted
+
+## Context
+
+Dark Tower requires a curated list of approved cryptographic algorithms to prevent ad-hoc algorithm choices. This reference belongs in an ADR as it represents an architectural decision about which algorithms are permitted.
 
 Last reviewed: 2026-02-10
 Next review: 2027-02-10
 
-## Current Approved Algorithms
+## Decision
+
+### Approved Algorithms
 
 | Purpose | Algorithm | Library | Notes |
 |---------|-----------|---------|-------|
@@ -14,7 +24,7 @@ Next review: 2027-02-10
 | Key derivation | HKDF-SHA256 | ring::hkdf | Per-resource key scoping |
 | Message authentication | HMAC-SHA256 | ring::hmac | Session binding tokens |
 
-## Deprecated (do not use)
+### Deprecated (do not use)
 
 | Algorithm | Reason | Replacement |
 |-----------|--------|-------------|
@@ -24,7 +34,7 @@ Next review: 2027-02-10
 | DES, 3DES, RC4 | Weak algorithms | AES-256-GCM |
 | Direct master key usage | No isolation | HKDF for per-resource keys |
 
-## Usage Guidelines
+### Usage Guidelines
 
 - Always use ring crate for new crypto operations
 - Use constant-time comparisons via `ring::constant_time::verify_slices_are_equal()` or `subtle::ConstantTimeEq`
@@ -36,8 +46,23 @@ Next review: 2027-02-10
 
 ## Review Triggers
 
-Update this list when:
+Update this ADR when:
 - NIST publishes new recommendations
 - Cryptographic weaknesses discovered
 - Performance characteristics change significantly
 - New crate versions with security fixes
+
+## Consequences
+
+### Positive
+- Single authoritative source for algorithm decisions
+- Discoverable via ADR index
+- Version-controlled change history
+
+### Negative
+- Requires ADR update process for algorithm changes (intentionally higher bar)
+
+## Participants
+
+- Security specialist: Primary owner
+- Auth Controller specialist: Primary consumer

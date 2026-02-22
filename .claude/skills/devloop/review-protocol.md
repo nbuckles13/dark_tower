@@ -114,7 +114,7 @@ The DRY reviewer operates on a hybrid model:
 The Code Quality reviewer MUST check changed code against relevant ADRs:
 
 1. Identify changed files and their component (`crates/{service}/`)
-2. Look up applicable ADRs via `docs/specialist-knowledge/code-reviewer/key-adrs.md`
+2. Look up applicable ADRs via `docs/specialist-knowledge/code-reviewer/INDEX.md`
 3. Check implementation against ADR MUST/SHOULD/MAY requirements
 4. ADR violations are findings — MUST/REQUIRED violations should be called out as particularly important in the finding description
 5. "ADR Compliance" is a mandatory section in the Code Quality verdict

@@ -118,16 +118,16 @@ For each specialist, compose:
 
 1. **Debate protocol**: `.claude/skills/debate/debate-protocol.md`
 
-**NOTE**: Specialist identity is auto-loaded via `subagent_type` parameter. Do NOT manually read or inject `.claude/agents/{name}.md`. Specialists self-load their own knowledge from `docs/specialist-knowledge/{name}/` as their first step.
+**NOTE**: Specialist identity is auto-loaded via `subagent_type` parameter. Do NOT manually read or inject `.claude/agents/{name}.md`. Before spawning each specialist, read `docs/specialist-knowledge/{name}/INDEX.md` and include its contents in the specialist's prompt under a `## Navigation` header.
 
 Spawn with `subagent_type: "{name}"` and this prompt:
 
 ```
 You are participating in a Dark Tower design debate.
 
-## Step 0: Load Knowledge (MANDATORY)
+## Navigation
 
-**Before doing ANY other work**, read ALL `.md` files from `docs/specialist-knowledge/{your-specialist-name}/` to load your accumulated knowledge. This includes patterns, gotchas, integration notes, and any domain-specific files. Do NOT skip this step.
+{contents of docs/specialist-knowledge/{specialist-name}/INDEX.md}
 
 ## Debate Protocol
 
@@ -267,13 +267,23 @@ Migration Plan (when debate involves schema changes):
 
 ### Step 8: Reflection
 
-After ADR is created, ask each specialist:
-- What patterns emerged that should be documented?
-- Any gotchas to add to knowledge files?
-- Integration notes with other components?
-- Any new domain-specific knowledge worth capturing in a new file?
+Allow 15 minutes for specialists to update their INDEX.md navigation file.
 
-Each specialist updates their knowledge directory at `docs/specialist-knowledge/{specialist}/`. Specialists can create or update any `.md` files in their directory - common files include `patterns.md`, `gotchas.md`, and `integration.md`, but specialists may also maintain domain-specific files as needed.
+Each specialist maintains ONE file: `docs/specialist-knowledge/{name}/INDEX.md`
+
+**INDEX.md is a navigation map — pointers to code and ADRs, not content.**
+
+Each entry is a pointer: "Topic → `path/to/file.rs:function_name()`" or "Topic → ADR-NNNN (Section X)"
+
+**Add a pointer when**: New ADR created that affects your domain (the ADR from this debate!). New integration seam discovered.
+**Update a pointer when**: Code moved or renamed. ADR superseded.
+**Remove a pointer when**: Referenced code deleted. ADR deprecated.
+
+**INDEX.md MUST NOT contain**: Implementation facts, task status, design decisions (those belong in ADRs), general knowledge, or gotchas (document as code comments instead).
+
+**Exceptions**: Up to 5 one-liner cross-cutting gotchas with evidence pointers.
+
+**Size cap**: 50 lines maximum.
 
 ### Step 9: Complete
 
@@ -310,7 +320,7 @@ Participants:
 
 - **Debate record**: `docs/debates/YYYY-MM-DD-{slug}/debate.md`
 - **ADR**: `docs/decisions/adr-NNNN-{topic}.md` (on consensus)
-- **Knowledge updates**: Updated specialist knowledge files
+- **Navigation updates**: Updated specialist INDEX.md files
 
 ## Notes
 
