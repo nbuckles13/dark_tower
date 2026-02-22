@@ -4,8 +4,7 @@ For: observability, operations
 
 ## Workflow
 
-1. Load knowledge from `docs/specialist-knowledge/{your-name}/` (MANDATORY)
-2. Architecture check + propose requirements from your domain → report to @team-lead
+1. Architecture check + propose requirements from your domain → report to @team-lead
 3. (Wait for requirements to be confirmed by user)
 4. Define requirements for your domain (see your section below)
 5. Propose devloop tasks if substantial work is needed in your domain

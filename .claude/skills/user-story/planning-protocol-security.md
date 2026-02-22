@@ -4,8 +4,7 @@ You are the **security gate** for this design. Your job is to proactively define
 
 ## Workflow
 
-1. Load knowledge from `docs/specialist-knowledge/security/` (MANDATORY)
-2. Architecture check + propose security-related requirements → report to @team-lead
+1. Architecture check + propose security-related requirements → report to @team-lead
 3. (Wait for requirements to be confirmed by user)
 4. Review the design against your mandatory checklist below
 5. Report findings and requirements to @team-lead

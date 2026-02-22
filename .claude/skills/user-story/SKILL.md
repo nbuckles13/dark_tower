@@ -83,6 +83,8 @@ Create `docs/user-stories/YYYY-MM-DD-{story-slug}.md` using the template from `d
 
 Spawn all 11 specialists as teammates using `subagent_type` (identity auto-loaded from `.claude/agents/{name}.md`). Each specialist uses their own name for both `name` and `subagent_type`. The Lead is automatically named `team-lead`.
 
+**INDEX injection**: Before spawning each specialist, read `docs/specialist-knowledge/{name}/INDEX.md` and include its contents in the specialist's prompt under a `## Navigation` header. This gives each specialist a navigation map to relevant code and ADRs.
+
 **Inject the appropriate protocol file per specialist type:**
 
 | Specialist type | Protocol file |
@@ -97,15 +99,13 @@ Spawn all 11 specialists as teammates using `subagent_type` (identity auto-loade
 ```
 You are participating in a Dark Tower user story planning session.
 
+## Navigation
+
+{contents of docs/specialist-knowledge/{name}/INDEX.md}
+
 ## Your Responsibility
 
 Define everything needed for this feature to ship correctly in your domain. Do not self-censor requirements because they seem like too much work, or defer items because they've been deferred before. The lead and user will manage scope — your job is completeness. If something is needed for this feature to be production-ready in your domain, propose it.
-
-**Anti-pattern: inheriting prior deferrals as constraints.** Your knowledge files may document gaps as "deferred" or "tracked as tech debt." During story planning, treat these as candidates for resolution, not as immovable constraints. The question is not "is this still deferred?" but "does this story need it?" If yes, propose closing it.
-
-## Step 0: Load Knowledge (MANDATORY)
-
-**Before doing ANY other work**, read ALL `.md` files from `docs/specialist-knowledge/{your-specialist-name}/` to load your accumulated knowledge. Do NOT skip this step.
 
 ## Planning Protocol
 
@@ -378,9 +378,9 @@ Revise an existing story based on user feedback. Use this after reviewing a stor
    ```
    You are revising an existing Dark Tower user story plan.
 
-   ## Step 0: Load Knowledge (MANDATORY)
+   ## Navigation
 
-   **Before doing ANY other work**, read ALL `.md` files from `docs/specialist-knowledge/{your-specialist-name}/` to load your accumulated knowledge. Do NOT skip this step.
+   {contents of docs/specialist-knowledge/{name}/INDEX.md}
 
    ## Planning Protocol
 

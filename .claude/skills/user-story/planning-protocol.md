@@ -4,8 +4,7 @@ For: auth-controller, global-controller, meeting-controller, media-handler, data
 
 ## Workflow
 
-1. Load knowledge from `docs/specialist-knowledge/{your-name}/` (MANDATORY)
-2. Architecture check + propose requirements → report to @team-lead
+1. Architecture check + propose requirements → report to @team-lead
 3. (Wait for requirements to be confirmed by user)
 4. Design contribution + propose devloop tasks (or opt out)
 5. Interface resolution with other specialists

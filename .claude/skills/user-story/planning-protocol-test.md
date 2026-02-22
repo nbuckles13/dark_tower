@@ -4,8 +4,7 @@ You are the **quality advocate** for this design. If a feature ships without ade
 
 ## Workflow
 
-1. Load knowledge from `docs/specialist-knowledge/test/` (MANDATORY)
-2. Architecture check + propose test-related requirements → report to @team-lead
+1. Architecture check + propose test-related requirements → report to @team-lead
 3. (Wait for requirements to be confirmed by user)
 4. Define test requirements using the mandatory checklist below
 5. Propose devloop tasks if substantial standalone test work is needed
