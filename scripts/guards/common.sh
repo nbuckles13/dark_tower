@@ -23,15 +23,25 @@ NC='\033[0m' # No Color
 # Changed File Detection
 # =============================================================================
 
-# Get files modified compared to HEAD (tracked files only)
+# Determine the git ref to diff against.
+#   - CI (PRs):  GUARD_DIFF_BASE is set to the PR base SHA by the workflow
+#   - Local:     falls back to HEAD (working-tree changes since last commit)
+# Guards and helper functions below use this instead of hardcoding HEAD.
+get_diff_base() {
+    echo "${GUARD_DIFF_BASE:-HEAD}"
+}
+
+# Get files modified compared to diff base (tracked files only)
 # Usage: get_modified_files [path] [extension]
 # Example: get_modified_files . ".rs"
 get_modified_files() {
     local path="${1:-.}"
     local ext="${2:-}"
+    local base
+    base=$(get_diff_base)
 
     local files
-    files=$(git diff --name-only HEAD -- "$path" 2>/dev/null || true)
+    files=$(git diff --name-only "$base" -- "$path" 2>/dev/null || true)
 
     if [[ -n "$ext" ]]; then
         echo "$files" | grep "${ext}$" || true
@@ -57,14 +67,16 @@ get_untracked_files() {
     fi
 }
 
-# Get files added compared to HEAD (new tracked files)
+# Get files added compared to diff base (new tracked files)
 # Usage: get_added_files [path] [extension]
 get_added_files() {
     local path="${1:-.}"
     local ext="${2:-}"
+    local base
+    base=$(get_diff_base)
 
     local files
-    files=$(git diff --name-only --diff-filter=A HEAD -- "$path" 2>/dev/null || true)
+    files=$(git diff --name-only --diff-filter=A "$base" -- "$path" 2>/dev/null || true)
 
     if [[ -n "$ext" ]]; then
         echo "$files" | grep "${ext}$" || true
@@ -73,14 +85,16 @@ get_added_files() {
     fi
 }
 
-# Get files deleted compared to HEAD
+# Get files deleted compared to diff base
 # Usage: get_deleted_files [path] [extension]
 get_deleted_files() {
     local path="${1:-.}"
     local ext="${2:-}"
+    local base
+    base=$(get_diff_base)
 
     local files
-    files=$(git diff --name-only --diff-filter=D HEAD -- "$path" 2>/dev/null || true)
+    files=$(git diff --name-only --diff-filter=D "$base" -- "$path" 2>/dev/null || true)
 
     if [[ -n "$ext" ]]; then
         echo "$files" | grep "${ext}$" || true

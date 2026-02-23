@@ -33,10 +33,12 @@ SEARCH_PATH="${1:-.}"
 init_violations
 start_timer
 
+DIFF_BASE=$(get_diff_base)
+
 print_header "Guard: Test Modification Check
 Path: $SEARCH_PATH
 
-Compares working tree against HEAD to detect test weakening."
+Compares working tree against ${DIFF_BASE} to detect test weakening."
 
 # Track warnings (separate from violations since this is non-blocking)
 WARNINGS=0
@@ -46,7 +48,7 @@ MODIFIED_FILES=$(get_modified_files "$SEARCH_PATH" ".rs")
 DELETED_FILES=$(get_deleted_files "$SEARCH_PATH" ".rs")
 
 if [[ -z "$MODIFIED_FILES" && -z "$DELETED_FILES" ]]; then
-    echo -e "${GREEN}No Rust files modified compared to HEAD${NC}"
+    echo -e "${GREEN}No Rust files modified compared to ${DIFF_BASE}${NC}"
     print_elapsed_time
     exit 0
 fi
@@ -87,7 +89,7 @@ for file in $MODIFIED_FILES; do
     [[ ! -f "$file" ]] && continue
 
     # Count #[test] and #[sqlx::test] in HEAD vs working tree
-    head_count=$(git show HEAD:"$file" 2>/dev/null | grep -cE '#\[(test|sqlx::test|tokio::test)' 2>/dev/null || true)
+    head_count=$(git show "$DIFF_BASE":"$file" 2>/dev/null | grep -cE '#\[(test|sqlx::test|tokio::test)' 2>/dev/null || true)
     head_count=${head_count:-0}
     current_count=$(grep -cE '#\[(test|sqlx::test|tokio::test)' "$file" 2>/dev/null || true)
     current_count=${current_count:-0}
@@ -124,7 +126,7 @@ for file in $MODIFIED_FILES; do
     [[ "$current_has_tests" -eq 0 ]] && continue
 
     # Count assertions in HEAD vs working tree
-    head_count=$(git show HEAD:"$file" 2>/dev/null | grep -cE '\bassert(_eq|_ne|_matches)?!' 2>/dev/null || true)
+    head_count=$(git show "$DIFF_BASE":"$file" 2>/dev/null | grep -cE '\bassert(_eq|_ne|_matches)?!' 2>/dev/null || true)
     head_count=${head_count:-0}
     current_count=$(grep -cE '\bassert(_eq|_ne|_matches)?!' "$file" 2>/dev/null || true)
     current_count=${current_count:-0}
@@ -159,7 +161,7 @@ for file in $MODIFIED_FILES; do
     [[ ! -f "$file" ]] && continue
 
     # Count #[ignore] in HEAD vs working tree
-    head_count=$(git show HEAD:"$file" 2>/dev/null | grep -cE '#\[ignore' 2>/dev/null || true)
+    head_count=$(git show "$DIFF_BASE":"$file" 2>/dev/null | grep -cE '#\[ignore' 2>/dev/null || true)
     head_count=${head_count:-0}
     current_count=$(grep -cE '#\[ignore' "$file" 2>/dev/null || true)
     current_count=${current_count:-0}
