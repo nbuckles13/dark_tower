@@ -141,7 +141,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 if $REBUILD_IMAGE || ! podman image exists "$IMAGE"; then
     echo "Building dev container image..."
+    OLD_IMAGE_ID=$(podman images -q "$IMAGE" 2>/dev/null || true)
     podman build -t "$IMAGE" "$SCRIPT_DIR"
+    if [ -n "$OLD_IMAGE_ID" ] && [ "$OLD_IMAGE_ID" != "$(podman images -q "$IMAGE")" ]; then
+        podman rmi "$OLD_IMAGE_ID" 2>/dev/null || true
+    fi
 fi
 
 # ─── Phase 1: Setup (idempotent) ────────────────────────────────
