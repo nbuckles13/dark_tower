@@ -19,6 +19,7 @@
 - Route composition → `crates/ac-service/src/routes/mod.rs:build_routes()`
 - Repository layer (sqlx queries) → `crates/ac-service/src/repositories/signing_keys.rs`
 - Service layer (business logic) → `crates/ac-service/src/services/key_management_service.rs`
+- Shared JWT claims (ServiceClaims, UserClaims) → `crates/common/src/jwt.rs:ServiceClaims`, `crates/common/src/jwt.rs:UserClaims`
 - SecretString/SecretBox → `crates/common/src/secret.rs`
 - TokenManager (spawn-and-wait, callback) → `crates/common/src/token_manager.rs:spawn_token_manager()`
 

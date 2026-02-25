@@ -12,7 +12,6 @@ use ring::{
     rand::{SecureRandom, SystemRandom},
     signature::{Ed25519KeyPair, KeyPair},
 };
-use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::time::Instant;
 use tracing::instrument;
@@ -22,6 +21,12 @@ use tracing::instrument;
 /// The original AC Claims struct has been consolidated into `common::jwt::ServiceClaims`
 /// to eliminate duplication across services. This type alias maintains API compatibility.
 pub type Claims = ServiceClaims;
+
+/// Re-export UserClaims from common::jwt for backwards compatibility within AC.
+///
+/// The UserClaims struct has been moved to `common::jwt::UserClaims` so that
+/// other services (GC, MC) can import it for user token validation.
+pub use common::jwt::UserClaims;
 
 /// Encrypted key structure (AES-256-GCM)
 ///
@@ -355,45 +360,8 @@ pub fn generate_client_secret() -> Result<SecretString, AcError> {
 // User Token Support (ADR-0020)
 // ============================================================================
 
-/// User JWT Claims structure per ADR-0020.
-///
-/// User tokens are issued by AC for authenticated users and include
-/// organization membership information.
-#[derive(Clone, Serialize, Deserialize)]
-pub struct UserClaims {
-    /// Subject (user UUID)
-    pub sub: String,
-    /// Organization ID the user belongs to
-    pub org_id: String,
-    /// User's email address
-    pub email: String,
-    /// User roles (e.g., ["user"], ["user", "admin"])
-    pub roles: Vec<String>,
-    /// Issued at timestamp
-    pub iat: i64,
-    /// Expiration timestamp
-    pub exp: i64,
-    /// Unique token identifier for revocation
-    pub jti: String,
-}
-
-/// Custom Debug implementation that redacts sensitive fields.
-///
-/// The `sub`, `email`, and `jti` fields are sensitive and should not
-/// be exposed in logs or debug output.
-impl fmt::Debug for UserClaims {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("UserClaims")
-            .field("sub", &"[REDACTED]")
-            .field("org_id", &self.org_id)
-            .field("email", &"[REDACTED]")
-            .field("roles", &self.roles)
-            .field("iat", &self.iat)
-            .field("exp", &self.exp)
-            .field("jti", &"[REDACTED]")
-            .finish()
-    }
-}
+// UserClaims is re-exported from common::jwt (see top of file).
+// sign_user_jwt and verify_user_jwt remain in AC due to AcError and metrics dependencies.
 
 /// Sign a user JWT with EdDSA private key.
 ///

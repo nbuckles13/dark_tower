@@ -6,6 +6,7 @@
 //! - Key ID extraction from JWT headers
 //! - iat validation logic
 //! - Service token claims structure
+//! - User token claims structure (ADR-0020)
 //!
 //! # Security
 //!
@@ -203,6 +204,57 @@ impl ServiceClaims {
     #[must_use]
     pub fn scopes(&self) -> Vec<&str> {
         self.scope.split_whitespace().collect()
+    }
+}
+
+/// User token claims structure per ADR-0020.
+///
+/// Used for user authentication tokens issued by the Auth Controller.
+/// Contains organization membership and role information.
+///
+/// # Fields
+///
+/// - `sub`: Subject (user UUID)
+/// - `org_id`: Organization ID the user belongs to
+/// - `email`: User's email address
+/// - `roles`: User roles (e.g., \["user"\], \["user", "admin"\])
+/// - `iat`: Issued-at timestamp (Unix epoch seconds)
+/// - `exp`: Expiration timestamp (Unix epoch seconds)
+/// - `jti`: Unique token identifier for revocation
+///
+/// # Security
+///
+/// The `sub`, `email`, and `jti` fields are redacted in Debug output
+/// to prevent accidental logging of personally identifiable information.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct UserClaims {
+    /// Subject (user UUID) - redacted in Debug output.
+    pub sub: String,
+    /// Organization ID the user belongs to.
+    pub org_id: String,
+    /// User's email address - redacted in Debug output.
+    pub email: String,
+    /// User roles (e.g., \["user"\], \["user", "admin"\]).
+    pub roles: Vec<String>,
+    /// Issued-at timestamp (Unix epoch seconds).
+    pub iat: i64,
+    /// Expiration timestamp (Unix epoch seconds).
+    pub exp: i64,
+    /// Unique token identifier for revocation - redacted in Debug output.
+    pub jti: String,
+}
+
+impl fmt::Debug for UserClaims {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("UserClaims")
+            .field("sub", &"[REDACTED]")
+            .field("org_id", &self.org_id)
+            .field("email", &"[REDACTED]")
+            .field("roles", &self.roles)
+            .field("iat", &self.iat)
+            .field("exp", &self.exp)
+            .field("jti", &"[REDACTED]")
+            .finish()
     }
 }
 
@@ -745,6 +797,97 @@ mod tests {
             !json.contains("service_type"),
             "service_type should be omitted when None"
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // UserClaims Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_user_claims_debug_redacts_sensitive_fields() {
+        let claims = UserClaims {
+            sub: "user-secret-id".to_string(),
+            org_id: "org-456".to_string(),
+            email: "secret@example.com".to_string(),
+            roles: vec!["user".to_string(), "admin".to_string()],
+            iat: 1_234_567_890,
+            exp: 1_234_571_490,
+            jti: "secret-jti-token".to_string(),
+        };
+
+        let debug_str = format!("{claims:?}");
+
+        // Sensitive fields must be redacted
+        assert!(
+            !debug_str.contains("user-secret-id"),
+            "sub should be redacted"
+        );
+        assert!(
+            !debug_str.contains("secret@example.com"),
+            "email should be redacted"
+        );
+        assert!(
+            !debug_str.contains("secret-jti-token"),
+            "jti should be redacted"
+        );
+        assert!(
+            debug_str.contains("[REDACTED]"),
+            "Should contain [REDACTED] markers"
+        );
+
+        // Non-sensitive fields should be visible
+        assert!(debug_str.contains("org-456"), "org_id should be visible");
+        assert!(debug_str.contains("user"), "roles should be visible");
+        assert!(debug_str.contains("admin"), "roles should be visible");
+        assert!(debug_str.contains("1234567890"), "iat should be visible");
+        assert!(debug_str.contains("1234571490"), "exp should be visible");
+    }
+
+    #[test]
+    fn test_user_claims_serialization_roundtrip() {
+        let claims = UserClaims {
+            sub: "user-123".to_string(),
+            org_id: "org-456".to_string(),
+            email: "user@example.com".to_string(),
+            roles: vec!["user".to_string(), "admin".to_string()],
+            iat: 1_234_567_890,
+            exp: 1_234_571_490,
+            jti: "jti-789".to_string(),
+        };
+
+        let json = serde_json::to_string(&claims).unwrap();
+        let deserialized: UserClaims = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.sub, claims.sub);
+        assert_eq!(deserialized.org_id, claims.org_id);
+        assert_eq!(deserialized.email, claims.email);
+        assert_eq!(deserialized.roles, claims.roles);
+        assert_eq!(deserialized.iat, claims.iat);
+        assert_eq!(deserialized.exp, claims.exp);
+        assert_eq!(deserialized.jti, claims.jti);
+    }
+
+    #[test]
+    fn test_user_claims_clone() {
+        let claims = UserClaims {
+            sub: "user-123".to_string(),
+            org_id: "org-456".to_string(),
+            email: "user@example.com".to_string(),
+            roles: vec!["user".to_string()],
+            iat: 1_234_567_890,
+            exp: 1_234_571_490,
+            jti: "jti-789".to_string(),
+        };
+
+        let cloned = claims.clone();
+
+        assert_eq!(cloned.sub, claims.sub);
+        assert_eq!(cloned.org_id, claims.org_id);
+        assert_eq!(cloned.email, claims.email);
+        assert_eq!(cloned.roles, claims.roles);
+        assert_eq!(cloned.iat, claims.iat);
+        assert_eq!(cloned.exp, claims.exp);
+        assert_eq!(cloned.jti, claims.jti);
     }
 
     // -------------------------------------------------------------------------

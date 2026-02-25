@@ -18,6 +18,7 @@
 - Token issuance (user) → `crates/ac-service/src/services/token_service.rs:issue_user_token()`
 - Security config bounds → `crates/ac-service/src/config.rs`
 - JWT size constant → `crates/common/src/jwt.rs:MAX_JWT_SIZE_BYTES`
+- Shared claims types → `crates/common/src/jwt.rs:ServiceClaims`, `UserClaims` (PII-redacted Debug)
 - Token manager (secure constructor) → `crates/common/src/token_manager.rs:new_secure()`
 - GC JWT validation → `crates/gc-service/src/auth/jwt.rs:validate()`
 - GC JWKS fetching → `crates/gc-service/src/auth/jwks.rs`
@@ -28,6 +29,7 @@
 - AC JWKS endpoint consumed by GC → `crates/gc-service/src/auth/jwks.rs`
 - GC-to-MC authenticated gRPC → `crates/mc-service/src/grpc/auth_interceptor.rs`
 - Token refresh callback (shared-to-service metrics) → `crates/common/src/token_manager.rs:with_on_refresh()`
+- GC default scopes (incl. `internal:meeting-token`) → `crates/ac-service/src/models/mod.rs:ServiceType::default_scopes()`
 - Credential leak guards → `scripts/guards/simple/no-secrets-in-logs.sh`, `instrument-skip-all.sh`
 
 ## Cross-Cutting Gotchas
