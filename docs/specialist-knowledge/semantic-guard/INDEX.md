@@ -14,6 +14,7 @@
 - MC metrics catalog → `docs/observability/metrics/mc-service.md`
 
 ## Cross-Service Boundary Files
+- Shared JWT types (ServiceClaims, UserClaims) → `crates/common/src/jwt.rs`
 - Token refresh event struct → `crates/common/src/token_manager.rs`
 - GC error types → `crates/gc-service/src/errors.rs`
 - MC error types → `crates/mc-service/src/errors.rs`

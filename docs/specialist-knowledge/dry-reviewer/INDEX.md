@@ -7,6 +7,8 @@
 ## Shared Code (Duplication Prevention)
 - Common crate modules -> `crates/common/src/lib.rs`
 - JWT utilities (extracted TD-1/TD-2) -> `crates/common/src/jwt.rs:extract_kid()`
+- ServiceClaims (extracted from AC) -> `crates/common/src/jwt.rs:ServiceClaims`
+- UserClaims (extracted from AC, ADR-0020) -> `crates/common/src/jwt.rs:UserClaims`
 - Token management (prevents static token dup) -> `crates/common/src/token_manager.rs:TokenManagerConfig`
 - Secret types -> `crates/common/src/secret.rs`
 - Domain IDs and shared types -> `crates/common/src/types.rs`
@@ -15,6 +17,8 @@
 - Active duplication tech debt → `.claude/TODO.md` (Cross-Service Duplication section)
 
 ## Successful Extractions (Reference)
+- ServiceClaims to common::jwt (AC re-exports as `Claims`) -> `crates/ac-service/src/crypto/mod.rs:23`
+- UserClaims to common::jwt (AC re-exports) -> `crates/ac-service/src/crypto/mod.rs:29`
 - Closure-based generic extraction -> `crates/gc-service/src/tasks/generic_health_checker.rs:start_generic_health_checker()`
 - Thin wrappers after extraction -> `crates/gc-service/src/tasks/health_checker.rs`, `crates/gc-service/src/tasks/mh_health_checker.rs`
 

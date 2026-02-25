@@ -306,6 +306,7 @@ impl ServiceType {
                 "meeting:list".to_string(),
                 "meeting:read".to_string(),
                 "service:register".to_string(),
+                "internal:meeting-token".to_string(),
             ],
             ServiceType::MeetingController => vec![
                 "meeting:read".to_string(),
@@ -391,6 +392,10 @@ mod tests {
     fn test_service_type_scopes() {
         let gc_scopes = ServiceType::GlobalController.default_scopes();
         assert!(gc_scopes.contains(&"meeting:create".to_string()));
+        assert!(
+            gc_scopes.contains(&"internal:meeting-token".to_string()),
+            "GC must have internal:meeting-token scope for POST /api/v1/auth/internal/meeting-token"
+        );
 
         let mc_scopes = ServiceType::MeetingController.default_scopes();
         assert!(mc_scopes.contains(&"participant:manage".to_string()));
