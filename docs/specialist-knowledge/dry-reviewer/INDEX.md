@@ -26,5 +26,11 @@
 - Actor vs controller metrics (different consumers) -> `crates/mc-service/src/actors/metrics.rs`
 - Service-prefixed metric names (convention) -> per-service `observability/metrics.rs`
 
+## K8s Manifest Patterns
+- NetworkPolicy cross-refs -> `infra/services/{ac,gc,mc}-service/network-policy.yaml`
+- ServiceMonitor cross-refs -> `infra/services/{ac,gc,mc}-service/service-monitor.yaml`
+- GC ServiceMonitor (first enabled, reference pattern) -> `infra/services/gc-service/service-monitor.yaml`
+
 ## Integration Seams
 - Common crate as extraction target -> `crates/common/src/`
+- NetworkPolicy egress/ingress pairs (GC<->MC on 50052, GC<->AC on 8082, MC->AC on 8082) -> `infra/services/*/network-policy.yaml`

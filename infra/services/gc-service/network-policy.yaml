@@ -55,6 +55,17 @@ spec:
     ports:
     - protocol: TCP
       port: 8082
+  # Allow egress to Meeting Controller (meeting creation, participant routing)
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: dark-tower
+      podSelector:
+        matchLabels:
+          app: mc-service
+    ports:
+    - protocol: TCP
+      port: 50052
   # Allow egress to PostgreSQL
   - to:
     - podSelector:
