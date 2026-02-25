@@ -30,6 +30,7 @@
 - GC-to-MC authenticated gRPC → `crates/mc-service/src/grpc/auth_interceptor.rs`
 - Token refresh callback (shared-to-service metrics) → `crates/common/src/token_manager.rs:with_on_refresh()`
 - GC default scopes (incl. `internal:meeting-token`) → `crates/ac-service/src/models/mod.rs:ServiceType::default_scopes()`
+- GC-to-MC NetworkPolicy egress (TCP 50052) → `infra/services/gc-service/network-policy.yaml`
 - Credential leak guards → `scripts/guards/simple/no-secrets-in-logs.sh`, `instrument-skip-all.sh`
 
 ## Cross-Cutting Gotchas
