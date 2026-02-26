@@ -428,13 +428,15 @@ Pointers should be as specific as possible:
 **Remove a pointer when**: Referenced code deleted. ADR deprecated.
 
 **INDEX.md MUST NOT contain:**
-- Implementation facts (how functions work, what parameters they take)
-- Task status or deferred items
-- Design decisions (these belong in ADRs)
-- General Rust/library knowledge
-- Gotchas or warnings (document these as code comments at the decision point)
+- Implementation facts (how functions work, what parameters they take, why a pattern was chosen)
+- Task status, deferred items, or date-stamped feature sections
+- Design decisions or gotchas (document these as code comments at the decision point)
+- General Rust/library/database knowledge (e.g., "modulo bias requires rejection sampling")
+- Duplication findings (DRY reviewer: add these to `.claude/TODO.md`, not your INDEX)
 
-**Exceptions**: Up to 5 one-liner gotchas that are truly cross-cutting (affect multiple files/services) and cannot be documented at a single code location. These must include a pointer to evidence.
+**No exceptions.** If something feels important but isn't a pointer, it belongs as a code comment, an ADR, or a TODO.md entry — not in INDEX.md.
+
+**Organize by architectural concept** (e.g., "Code Locations", "Integration Seams"), not by feature or date.
 
 **Size cap**: 50 lines maximum.
 

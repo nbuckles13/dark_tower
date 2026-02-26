@@ -279,9 +279,16 @@ Each entry is a pointer: "Topic → `path/to/file.rs:function_name()`" or "Topic
 **Update a pointer when**: Code moved or renamed. ADR superseded.
 **Remove a pointer when**: Referenced code deleted. ADR deprecated.
 
-**INDEX.md MUST NOT contain**: Implementation facts, task status, design decisions (those belong in ADRs), general knowledge, or gotchas (document as code comments instead).
+**INDEX.md MUST NOT contain:**
+- Implementation facts (how functions work, what parameters they take, why a pattern was chosen)
+- Task status, deferred items, or date-stamped feature sections
+- Design decisions or gotchas (document these as code comments at the decision point)
+- General Rust/library/database knowledge (e.g., "modulo bias requires rejection sampling")
+- Duplication findings (DRY reviewer: add these to `.claude/TODO.md`, not your INDEX)
 
-**Exceptions**: Up to 5 one-liner cross-cutting gotchas with evidence pointers.
+**No exceptions.** If something feels important but isn't a pointer, it belongs as a code comment, an ADR, or a TODO.md entry — not in INDEX.md.
+
+**Organize by architectural concept** (e.g., "Code Locations", "Integration Seams"), not by feature or date.
 
 **Size cap**: 50 lines maximum.
 
