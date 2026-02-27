@@ -40,6 +40,17 @@
 - Service registration → `scripts/register-service.sh`
 - Devloop status check → `scripts/workflow/devloop-status.sh`
 
+## Code Locations — GC Metrics & Observability
+- GC metrics recorder + histogram buckets → `crates/gc-service/src/observability/metrics.rs:init_metrics_recorder()`
+- GC endpoint normalization (cardinality control) → `crates/gc-service/src/observability/metrics.rs:normalize_endpoint()`
+- GC meeting creation metrics → `crates/gc-service/src/observability/metrics.rs:record_meeting_creation()`
+- GC metrics catalog → `docs/observability/metrics/gc-service.md`
+- GC overview dashboard → `infra/grafana/dashboards/gc-overview.json`
+
+## Code Locations — GC Repositories (DB query metrics)
+- Meeting creation with atomic limit check → `crates/gc-service/src/repositories/meetings.rs:create_meeting_with_limit_check()`
+- Fire-and-forget audit logging → `crates/gc-service/src/repositories/meetings.rs:log_audit_event()`
+
 ## Integration Seams
 - Env-tests (cluster validation) → `crates/env-tests/`
 - Metric catalogs (guard cross-ref) → `docs/observability/metrics/`

@@ -43,8 +43,11 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # Base64 encoding for JWK keys
 base64 = "0.22"
 
-# CSPRNG for guest ID generation
+# CSPRNG for meeting code and join token secret generation
 ring = { workspace = true }
+
+# Hex encoding for join_token_secret
+hex = { workspace = true }
 
 # Metrics (ADR-0011 Observability)
 metrics = "0.24"

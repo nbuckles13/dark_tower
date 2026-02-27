@@ -12,8 +12,9 @@
 use crate::auth::claims::Claims;
 use crate::auth::jwks::{Jwk, JwksClient};
 use crate::errors::GcError;
-use common::jwt::{decode_ed25519_public_key_jwk, extract_kid, validate_iat};
+use common::jwt::{decode_ed25519_public_key_jwk, extract_kid, validate_iat, UserClaims};
 use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
+use serde::de::DeserializeOwned;
 use std::sync::Arc;
 use tracing::instrument;
 
@@ -71,7 +72,7 @@ impl JwtValidator {
         let jwk = self.jwks_client.get_key(&kid).await?;
 
         // 3. Verify signature and extract claims
-        let claims = verify_token(token, &jwk)?;
+        let claims = verify_token::<Claims>(token, &jwk)?;
 
         // 4. Validate iat claim with clock skew tolerance using common utility
         if let Err(e) = validate_iat(
@@ -87,12 +88,51 @@ impl JwtValidator {
         tracing::debug!(target: "gc.auth.jwt", "Token validated successfully");
         Ok(claims)
     }
+
+    /// Validate a user JWT and return the user claims.
+    ///
+    /// Same security checks as `validate()` but deserializes into `UserClaims`
+    /// (org_id, roles, email, jti) instead of service `Claims` (scope, service_type).
+    ///
+    /// # Arguments
+    ///
+    /// * `token` - The JWT string to validate
+    ///
+    /// # Errors
+    ///
+    /// Returns `GcError::InvalidToken` for all validation failures.
+    #[instrument(skip_all)]
+    pub async fn validate_user(&self, token: &str) -> Result<UserClaims, GcError> {
+        let kid = extract_kid(token).map_err(|e| {
+            tracing::debug!(target: "gc.auth.jwt", error = ?e, "User token kid extraction failed");
+            GcError::InvalidToken("The access token is invalid or expired".to_string())
+        })?;
+
+        let jwk = self.jwks_client.get_key(&kid).await?;
+
+        let claims = verify_token::<UserClaims>(token, &jwk)?;
+
+        if let Err(e) = validate_iat(
+            claims.iat,
+            std::time::Duration::from_secs(self.clock_skew_seconds as u64),
+        ) {
+            tracing::debug!(target: "gc.auth.jwt", error = ?e, "User token iat validation failed");
+            return Err(GcError::InvalidToken(
+                "The access token is invalid or expired".to_string(),
+            ));
+        }
+
+        tracing::debug!(target: "gc.auth.jwt", "User token validated successfully");
+        Ok(claims)
+    }
 }
 
 /// Verify JWT signature and extract claims.
 ///
-/// Uses EdDSA (Ed25519) algorithm exclusively per project security requirements.
-fn verify_token(token: &str, jwk: &Jwk) -> Result<Claims, GcError> {
+/// Generic over the claims type — allows both service `Claims` and `UserClaims`
+/// to be decoded from the same EdDSA-signed JWT. The JWK validation and signature
+/// verification are claims-type-independent.
+fn verify_token<T: DeserializeOwned>(token: &str, jwk: &Jwk) -> Result<T, GcError> {
     // Validate JWK is EdDSA key
     if jwk.kty != "OKP" {
         tracing::warn!(target: "gc.auth.jwt", kty = %jwk.kty, "Unexpected JWK key type");
@@ -130,7 +170,7 @@ fn verify_token(token: &str, jwk: &Jwk) -> Result<Claims, GcError> {
     // Don't validate aud - we'll check scopes instead
 
     // Decode and verify
-    let token_data = decode::<Claims>(token, &decoding_key, &validation).map_err(|e| {
+    let token_data = decode::<T>(token, &decoding_key, &validation).map_err(|e| {
         tracing::debug!(target: "gc.auth.jwt", error = %e, "Token verification failed");
         GcError::InvalidToken("The access token is invalid or expired".to_string())
     })?;
@@ -219,7 +259,7 @@ mod tests {
         let payload_b64 = URL_SAFE_NO_PAD.encode(payload.as_bytes());
         let token = format!("{}.{}.fake_signature", header_b64, payload_b64);
 
-        let result = verify_token(&token, &jwk);
+        let result = verify_token::<Claims>(&token, &jwk);
         let err = result.expect_err("Expected error");
         assert!(
             matches!(&err, GcError::InvalidToken(msg) if msg.contains("invalid or expired")),
@@ -245,7 +285,7 @@ mod tests {
         let payload_b64 = URL_SAFE_NO_PAD.encode(payload.as_bytes());
         let token = format!("{}.{}.fake_signature", header_b64, payload_b64);
 
-        let result = verify_token(&token, &jwk);
+        let result = verify_token::<Claims>(&token, &jwk);
         let err = result.expect_err("Expected error");
         assert!(
             matches!(&err, GcError::InvalidToken(msg) if msg.contains("invalid or expired")),
@@ -271,7 +311,7 @@ mod tests {
         let payload_b64 = URL_SAFE_NO_PAD.encode(payload.as_bytes());
         let token = format!("{}.{}.fake_signature", header_b64, payload_b64);
 
-        let result = verify_token(&token, &jwk);
+        let result = verify_token::<Claims>(&token, &jwk);
         let err = result.expect_err("Expected error");
         assert!(
             matches!(&err, GcError::InvalidToken(msg) if msg.contains("invalid or expired")),
@@ -297,7 +337,7 @@ mod tests {
         let payload_b64 = URL_SAFE_NO_PAD.encode(payload.as_bytes());
         let token = format!("{}.{}.fake_signature", header_b64, payload_b64);
 
-        let result = verify_token(&token, &jwk);
+        let result = verify_token::<Claims>(&token, &jwk);
         let err = result.expect_err("Expected error");
         assert!(
             matches!(&err, GcError::InvalidToken(msg) if msg.contains("invalid or expired")),
@@ -326,7 +366,7 @@ mod tests {
         let token = format!("{}.{}.fake_signature", header_b64, payload_b64);
 
         // This should fail at signature verification, not at JWK validation
-        let result = verify_token(&token, &jwk);
+        let result = verify_token::<Claims>(&token, &jwk);
         // Error should be about invalid token (signature verification failed)
         assert!(
             matches!(result, Err(GcError::InvalidToken(_))),

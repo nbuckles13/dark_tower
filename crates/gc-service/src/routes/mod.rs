@@ -5,7 +5,7 @@
 use crate::auth::{JwksClient, JwtValidator};
 use crate::config::Config;
 use crate::handlers;
-use crate::middleware::{http_metrics_middleware, require_auth, AuthState};
+use crate::middleware::{http_metrics_middleware, require_auth, require_user_auth, AuthState};
 use crate::services::mc_client::McClientTrait;
 use axum::{
     middleware,
@@ -41,10 +41,11 @@ pub struct AppState {
 /// - `/health` - Liveness probe (simple "OK") - public, unversioned
 /// - `/ready` - Readiness probe (checks DB + AC JWKS) - public, unversioned
 /// - `/metrics` - Prometheus metrics endpoint (ADR-0011) - public, unversioned
-/// - `/api/v1/me` - Current user endpoint - requires authentication
-/// - `/api/v1/meetings/{code}` - Join meeting (authenticated)
+/// - `/api/v1/me` - Current user endpoint - requires service authentication
+/// - `/api/v1/meetings` - Create meeting (user authenticated)
+/// - `/api/v1/meetings/{code}` - Join meeting (service authenticated)
 /// - `/api/v1/meetings/{code}/guest-token` - Get guest token (public)
-/// - `/api/v1/meetings/{id}/settings` - Update meeting settings (authenticated, host only)
+/// - `/api/v1/meetings/{id}/settings` - Update meeting settings (service authenticated, host only)
 /// - TraceLayer for request logging
 /// - HTTP metrics middleware (ADR-0011)
 /// - 30 second request timeout
@@ -74,7 +75,17 @@ pub fn build_routes(state: Arc<AppState>, metrics_handle: PrometheusHandle) -> R
         .route("/metrics", get(handlers::metrics_handler))
         .with_state(metrics_handle);
 
-    // Protected routes (authentication required)
+    // User-authenticated routes (require user JWT with UserClaims)
+    let user_auth_routes = Router::new()
+        // Meeting creation endpoint
+        .route("/api/v1/meetings", post(handlers::create_meeting))
+        .route_layer(middleware::from_fn_with_state(
+            auth_state.clone(),
+            require_user_auth,
+        ))
+        .with_state(state.clone());
+
+    // Service-authenticated routes (require service JWT with Claims)
     let protected_routes = Router::new()
         // Current user endpoint
         .route("/api/v1/me", get(handlers::get_me))
@@ -98,6 +109,7 @@ pub fn build_routes(state: Arc<AppState>, metrics_handle: PrometheusHandle) -> R
     // 3. http_metrics_middleware - Record ALL responses (outermost)
     public_routes
         .merge(metrics_routes)
+        .merge(user_auth_routes)
         .merge(protected_routes)
         .layer(TraceLayer::new_for_http())
         .layer(TimeoutLayer::new(Duration::from_secs(30)))

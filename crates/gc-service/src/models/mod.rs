@@ -296,6 +296,146 @@ pub struct MeetingResponse {
     pub updated_at: DateTime<Utc>,
 }
 
+// ============================================================================
+// Meeting Create API Models
+// ============================================================================
+
+/// Maximum display name length for meetings (in bytes).
+pub const MAX_MEETING_DISPLAY_NAME_LENGTH: usize = 255;
+
+/// Minimum display name length for meetings (in bytes, after trimming).
+pub const MIN_MEETING_DISPLAY_NAME_LENGTH: usize = 1;
+
+/// Minimum number of participants for a meeting.
+pub const MIN_PARTICIPANTS: i32 = 2;
+
+/// Default maximum participants if not specified in request.
+pub const DEFAULT_MAX_PARTICIPANTS: i32 = 100;
+
+/// Request to create a new meeting.
+///
+/// Sent by authenticated users to create a meeting in their organization.
+/// All settings fields are optional; secure defaults are applied server-side.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateMeetingRequest {
+    /// Meeting display name (required, 1-255 bytes after trimming).
+    pub display_name: String,
+
+    /// Maximum number of participants (optional, default 100, min 2).
+    pub max_participants: Option<i32>,
+
+    /// Scheduled start time (optional, NULL = ad-hoc meeting).
+    pub scheduled_start_time: Option<DateTime<Utc>>,
+
+    /// Whether end-to-end encryption is enabled (default: true).
+    pub enable_e2e_encryption: Option<bool>,
+
+    /// Whether authentication is required to join (default: true).
+    pub require_auth: Option<bool>,
+
+    /// Whether recording is enabled (default: false).
+    pub recording_enabled: Option<bool>,
+
+    /// Whether anonymous guests can join (default: false).
+    pub allow_guests: Option<bool>,
+
+    /// Whether external org users can join (default: false).
+    pub allow_external_participants: Option<bool>,
+
+    /// Whether waiting room is enabled (default: true).
+    pub waiting_room_enabled: Option<bool>,
+}
+
+impl CreateMeetingRequest {
+    /// Validate the request fields.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error message if validation fails.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        let display_name = self.display_name.trim();
+
+        if display_name.len() < MIN_MEETING_DISPLAY_NAME_LENGTH {
+            return Err("Display name is required");
+        }
+
+        if display_name.len() > MAX_MEETING_DISPLAY_NAME_LENGTH {
+            return Err("Display name must be at most 255 characters");
+        }
+
+        if let Some(max_participants) = self.max_participants {
+            if max_participants < MIN_PARTICIPANTS {
+                return Err("Maximum participants must be at least 2");
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// Response after creating a meeting.
+///
+/// Returned by `POST /api/v1/meetings` with status 201 Created.
+/// Excludes `join_token_secret` and other internal fields.
+#[derive(Debug, Clone, Serialize)]
+pub struct CreateMeetingResponse {
+    /// Unique meeting identifier.
+    pub meeting_id: Uuid,
+
+    /// Short meeting code for joining.
+    pub meeting_code: String,
+
+    /// Meeting display name.
+    pub display_name: String,
+
+    /// Current meeting status.
+    pub status: String,
+
+    /// Maximum number of participants.
+    pub max_participants: i32,
+
+    /// Whether end-to-end encryption is enabled.
+    pub enable_e2e_encryption: bool,
+
+    /// Whether authentication is required to join.
+    pub require_auth: bool,
+
+    /// Whether recording is enabled.
+    pub recording_enabled: bool,
+
+    /// Whether anonymous guests can join.
+    pub allow_guests: bool,
+
+    /// Whether external org users can join.
+    pub allow_external_participants: bool,
+
+    /// Whether waiting room is enabled.
+    pub waiting_room_enabled: bool,
+
+    /// Creation timestamp.
+    pub created_at: DateTime<Utc>,
+}
+
+impl From<MeetingRow> for CreateMeetingResponse {
+    fn from(row: MeetingRow) -> Self {
+        Self {
+            meeting_id: row.meeting_id,
+            meeting_code: row.meeting_code,
+            display_name: row.display_name,
+            status: row.status,
+            max_participants: row.max_participants,
+            enable_e2e_encryption: row.enable_e2e_encryption,
+            require_auth: row.require_auth,
+            recording_enabled: row.recording_enabled,
+            allow_guests: row.allow_guests,
+            allow_external_participants: row.allow_external_participants,
+            waiting_room_enabled: row.waiting_room_enabled,
+            created_at: row.created_at,
+        }
+    }
+}
+
 impl From<MeetingRow> for MeetingResponse {
     fn from(row: MeetingRow) -> Self {
         Self {
@@ -550,5 +690,222 @@ mod tests {
             waiting_room_enabled: None,
         };
         assert!(!request_no_changes.has_changes());
+    }
+
+    // ========================================================================
+    // CreateMeetingRequest Tests
+    // ========================================================================
+
+    #[test]
+    fn test_create_meeting_request_deserialization() {
+        let json = r#"{"display_name":"Team Standup","max_participants":10}"#;
+        let request: CreateMeetingRequest =
+            serde_json::from_str(json).expect("deserialization should succeed");
+
+        assert_eq!(request.display_name, "Team Standup");
+        assert_eq!(request.max_participants, Some(10));
+        assert_eq!(request.enable_e2e_encryption, None);
+        assert_eq!(request.require_auth, None);
+    }
+
+    #[test]
+    fn test_create_meeting_request_minimal() {
+        let json = r#"{"display_name":"Quick Call"}"#;
+        let request: CreateMeetingRequest =
+            serde_json::from_str(json).expect("deserialization should succeed");
+
+        assert_eq!(request.display_name, "Quick Call");
+        assert_eq!(request.max_participants, None);
+        assert_eq!(request.scheduled_start_time, None);
+    }
+
+    #[test]
+    fn test_create_meeting_request_rejects_unknown_fields() {
+        let json = r#"{"display_name":"Test","extra_field":"value"}"#;
+        let result: Result<CreateMeetingRequest, _> = serde_json::from_str(json);
+        assert!(result.is_err(), "Should reject unknown fields");
+    }
+
+    #[test]
+    fn test_create_meeting_request_validation_success() {
+        let request = CreateMeetingRequest {
+            display_name: "Team Meeting".to_string(),
+            max_participants: Some(10),
+            scheduled_start_time: None,
+            enable_e2e_encryption: None,
+            require_auth: None,
+            recording_enabled: None,
+            allow_guests: None,
+            allow_external_participants: None,
+            waiting_room_enabled: None,
+        };
+        assert!(request.validate().is_ok());
+    }
+
+    #[test]
+    fn test_create_meeting_request_validation_empty_name() {
+        let request = CreateMeetingRequest {
+            display_name: "".to_string(),
+            max_participants: None,
+            scheduled_start_time: None,
+            enable_e2e_encryption: None,
+            require_auth: None,
+            recording_enabled: None,
+            allow_guests: None,
+            allow_external_participants: None,
+            waiting_room_enabled: None,
+        };
+        let result = request.validate();
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), "Display name is required");
+    }
+
+    #[test]
+    fn test_create_meeting_request_validation_whitespace_name() {
+        let request = CreateMeetingRequest {
+            display_name: "   ".to_string(),
+            max_participants: None,
+            scheduled_start_time: None,
+            enable_e2e_encryption: None,
+            require_auth: None,
+            recording_enabled: None,
+            allow_guests: None,
+            allow_external_participants: None,
+            waiting_room_enabled: None,
+        };
+        let result = request.validate();
+        assert!(result.is_err(), "Should reject whitespace-only name");
+    }
+
+    #[test]
+    fn test_create_meeting_request_validation_long_name() {
+        let request = CreateMeetingRequest {
+            display_name: "a".repeat(256),
+            max_participants: None,
+            scheduled_start_time: None,
+            enable_e2e_encryption: None,
+            require_auth: None,
+            recording_enabled: None,
+            allow_guests: None,
+            allow_external_participants: None,
+            waiting_room_enabled: None,
+        };
+        let result = request.validate();
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err(),
+            "Display name must be at most 255 characters"
+        );
+    }
+
+    #[test]
+    fn test_create_meeting_request_validation_max_participants_too_low() {
+        let request = CreateMeetingRequest {
+            display_name: "Test".to_string(),
+            max_participants: Some(1),
+            scheduled_start_time: None,
+            enable_e2e_encryption: None,
+            require_auth: None,
+            recording_enabled: None,
+            allow_guests: None,
+            allow_external_participants: None,
+            waiting_room_enabled: None,
+        };
+        let result = request.validate();
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err(),
+            "Maximum participants must be at least 2"
+        );
+    }
+
+    #[test]
+    fn test_create_meeting_request_validation_max_participants_minimum() {
+        let request = CreateMeetingRequest {
+            display_name: "Test".to_string(),
+            max_participants: Some(2),
+            scheduled_start_time: None,
+            enable_e2e_encryption: None,
+            require_auth: None,
+            recording_enabled: None,
+            allow_guests: None,
+            allow_external_participants: None,
+            waiting_room_enabled: None,
+        };
+        assert!(request.validate().is_ok(), "max_participants=2 should pass");
+    }
+
+    // ========================================================================
+    // CreateMeetingResponse Tests
+    // ========================================================================
+
+    #[test]
+    fn test_create_meeting_response_serialization() {
+        let response = CreateMeetingResponse {
+            meeting_id: Uuid::nil(),
+            meeting_code: "ABC123def456".to_string(),
+            display_name: "Test Meeting".to_string(),
+            status: "scheduled".to_string(),
+            max_participants: 100,
+            enable_e2e_encryption: true,
+            require_auth: true,
+            recording_enabled: false,
+            allow_guests: false,
+            allow_external_participants: false,
+            waiting_room_enabled: true,
+            created_at: Utc::now(),
+        };
+
+        let json = serde_json::to_string(&response).expect("serialization should succeed");
+
+        assert!(json.contains("\"meeting_code\":\"ABC123def456\""));
+        assert!(json.contains("\"status\":\"scheduled\""));
+        assert!(json.contains("\"enable_e2e_encryption\":true"));
+        assert!(json.contains("\"require_auth\":true"));
+        assert!(json.contains("\"recording_enabled\":false"));
+        assert!(json.contains("\"allow_guests\":false"));
+        assert!(json.contains("\"waiting_room_enabled\":true"));
+        // Must NOT contain join_token_secret
+        assert!(!json.contains("join_token_secret"));
+    }
+
+    #[test]
+    fn test_create_meeting_response_from_meeting_row() {
+        let row = MeetingRow {
+            meeting_id: Uuid::new_v4(),
+            org_id: Uuid::new_v4(),
+            created_by_user_id: Uuid::new_v4(),
+            display_name: "From Row".to_string(),
+            meeting_code: "TestCode1234".to_string(),
+            join_token_secret: "should_not_appear_in_response".to_string(),
+            max_participants: 50,
+            enable_e2e_encryption: true,
+            require_auth: true,
+            recording_enabled: false,
+            meeting_controller_id: None,
+            meeting_controller_region: None,
+            status: "scheduled".to_string(),
+            scheduled_start_time: None,
+            actual_start_time: None,
+            actual_end_time: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            allow_guests: false,
+            allow_external_participants: false,
+            waiting_room_enabled: true,
+        };
+
+        let response = CreateMeetingResponse::from(row.clone());
+
+        assert_eq!(response.meeting_id, row.meeting_id);
+        assert_eq!(response.meeting_code, "TestCode1234");
+        assert_eq!(response.display_name, "From Row");
+        assert_eq!(response.max_participants, 50);
+        assert_eq!(response.status, "scheduled");
+
+        // Serialize and verify no join_token_secret
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(!json.contains("join_token_secret"));
+        assert!(!json.contains("should_not_appear_in_response"));
     }
 }

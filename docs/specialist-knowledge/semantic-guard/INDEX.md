@@ -20,3 +20,17 @@
 - MC error types → `crates/mc-service/src/errors.rs`
 - GC metrics → `crates/gc-service/src/observability/metrics.rs`
 - MC metrics → `crates/mc-service/src/observability/metrics.rs`
+
+## Authentication Seams
+- GC service JWT validation → `crates/gc-service/src/auth/jwt.rs:validate()`
+- GC user JWT validation → `crates/gc-service/src/auth/jwt.rs:validate_user()`
+- GC generic token verifier → `crates/gc-service/src/auth/jwt.rs:verify_token()`
+- GC service auth middleware → `crates/gc-service/src/middleware/auth.rs:require_auth()`
+- GC user auth middleware → `crates/gc-service/src/middleware/auth.rs:require_user_auth()`
+
+## GC Meeting Creation
+- Create meeting handler → `crates/gc-service/src/handlers/meetings.rs:create_meeting()`
+- Meetings repository (CTE query) → `crates/gc-service/src/repositories/meetings.rs:MeetingsRepository`
+- Meeting create models → `crates/gc-service/src/models/mod.rs:CreateMeetingRequest`
+- Route wiring (user auth layer) → `crates/gc-service/src/routes/mod.rs:build_routes()`
+- Meeting creation metrics → `crates/gc-service/src/observability/metrics.rs:record_meeting_creation()`

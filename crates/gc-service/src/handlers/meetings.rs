@@ -1,24 +1,29 @@
 //! Meeting handlers for Global Controller.
 //!
-//! Implements meeting join and settings management endpoints:
+//! Implements meeting endpoints:
 //!
-//! - `GET /v1/meetings/{code}` - Join meeting (authenticated)
-//! - `POST /v1/meetings/{code}/guest-token` - Get guest token (public)
-//! - `PATCH /v1/meetings/{id}/settings` - Update meeting settings (host only)
+//! - `POST /api/v1/meetings` - Create meeting (user authenticated)
+//! - `GET /api/v1/meetings/{code}` - Join meeting (service authenticated)
+//! - `POST /api/v1/meetings/{code}/guest-token` - Get guest token (public)
+//! - `PATCH /api/v1/meetings/{id}/settings` - Update meeting settings (service authenticated)
 //!
 //! # Security
 //!
-//! - Authenticated endpoints validate JWT against AC JWKS
+//! - User-authenticated endpoints validate JWT with UserClaims (org_id, roles)
+//! - Service-authenticated endpoints validate JWT with Claims (scope)
 //! - Guest endpoint is public but rate limited (5 req/min per IP)
-//! - Guest IDs generated using CSPRNG
+//! - Meeting codes and secrets generated using CSPRNG
 //! - Error messages are generic to prevent information leakage
 
 use crate::auth::Claims;
 use crate::errors::GcError;
 use crate::models::{
-    GuestJoinRequest, JoinMeetingResponse, McAssignmentInfo, MeetingResponse, MeetingRow,
-    UpdateMeetingSettingsRequest,
+    CreateMeetingRequest, CreateMeetingResponse, GuestJoinRequest, JoinMeetingResponse,
+    McAssignmentInfo, MeetingResponse, MeetingRow, UpdateMeetingSettingsRequest,
+    DEFAULT_MAX_PARTICIPANTS, MIN_PARTICIPANTS,
 };
+use crate::observability::metrics;
+use crate::repositories::{map_row_to_meeting, MeetingsRepository};
 use crate::routes::AppState;
 use crate::services::ac_client::{
     AcClient, GuestTokenRequest, MeetingRole, MeetingTokenRequest, ParticipantType,
@@ -26,11 +31,14 @@ use crate::services::ac_client::{
 use crate::services::McAssignmentService;
 use axum::{
     extract::{Path, State},
+    http::StatusCode,
     Extension, Json,
 };
+use common::jwt::UserClaims;
 use ring::rand::{SecureRandom, SystemRandom};
 use sqlx::{PgPool, Row};
 use std::sync::Arc;
+use std::time::Instant;
 use tracing::{info, instrument, warn};
 use uuid::Uuid;
 
@@ -39,6 +47,231 @@ const DEFAULT_TOKEN_TTL_SECONDS: u32 = 900;
 
 /// Default capabilities for meeting participants.
 const DEFAULT_PARTICIPANT_CAPABILITIES: &[&str] = &["audio", "video", "screen_share", "chat"];
+
+/// Roles allowed to create meetings (R-3).
+const MEETING_CREATE_ROLES: &[&str] = &["user", "admin", "org_admin"];
+
+/// Base62 alphabet for meeting code generation.
+const BASE62_CHARS: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+
+/// Length of generated meeting codes.
+const MEETING_CODE_LENGTH: usize = 12;
+
+/// Number of random bytes for meeting code generation (72 bits entropy).
+const MEETING_CODE_RANDOM_BYTES: usize = 9;
+
+/// Maximum collision retries for meeting code generation.
+const MAX_CODE_COLLISION_RETRIES: usize = 3;
+
+/// Length of join token secret in bytes (256 bits).
+const JOIN_TOKEN_SECRET_BYTES: usize = 32;
+
+// ============================================================================
+// Handler: POST /api/v1/meetings
+// ============================================================================
+
+/// Handler for POST /api/v1/meetings
+///
+/// Create a new meeting in the authenticated user's organization.
+///
+/// # Authorization
+///
+/// - Requires valid user JWT (via `require_user_auth` middleware)
+/// - User must have at least one of: user, admin, org_admin roles
+///
+/// # Response
+///
+/// - 201 Created: Meeting created successfully
+/// - 400 Bad Request: Invalid request body
+/// - 401 Unauthorized: Invalid or missing user token
+/// - 403 Forbidden: Insufficient role or org meeting limit exceeded
+/// - 500 Internal Server Error: Meeting code collision or database error
+#[instrument(
+    skip_all,
+    name = "gc.meeting.create",
+    fields(
+        method = "POST",
+        endpoint = "/api/v1/meetings",
+        status = tracing::field::Empty,
+    )
+)]
+pub async fn create_meeting(
+    State(state): State<Arc<AppState>>,
+    Extension(user_claims): Extension<UserClaims>,
+    body: axum::body::Bytes,
+) -> Result<(StatusCode, Json<CreateMeetingResponse>), GcError> {
+    let start = Instant::now();
+
+    // Deserialize request body manually to return 400 (not Axum's default 422)
+    let request: CreateMeetingRequest = serde_json::from_slice(&body).map_err(|e| {
+        tracing::debug!(target: "gc.handlers.meetings", error = %e, "Invalid request body");
+        let duration = start.elapsed();
+        metrics::record_meeting_creation("error", Some("bad_request"), duration);
+        GcError::BadRequest("Invalid request body".to_string())
+    })?;
+
+    // 1. Validate role (R-3)
+    let has_required_role = user_claims
+        .roles
+        .iter()
+        .any(|r| MEETING_CREATE_ROLES.contains(&r.as_str()));
+
+    if !has_required_role {
+        let duration = start.elapsed();
+        metrics::record_meeting_creation("error", Some("forbidden"), duration);
+        warn!(
+            target: "gc.handlers.meetings",
+            user_id = %user_claims.sub,
+            roles = ?user_claims.roles,
+            "User lacks required role for meeting creation"
+        );
+        return Err(GcError::Forbidden(
+            "Insufficient permissions to create meetings".to_string(),
+        ));
+    }
+
+    // 2. Validate request (R-7)
+    request.validate().map_err(|e| {
+        let duration = start.elapsed();
+        metrics::record_meeting_creation("error", Some("bad_request"), duration);
+        GcError::BadRequest(e.to_string())
+    })?;
+
+    // 3. Parse user ID and org ID from claims
+    let user_id = parse_user_id(&user_claims.sub).inspect_err(|_| {
+        let duration = start.elapsed();
+        metrics::record_meeting_creation("error", Some("unauthorized"), duration);
+    })?;
+
+    let org_id = Uuid::parse_str(&user_claims.org_id).map_err(|e| {
+        tracing::debug!(target: "gc.handlers.meetings", error = %e, "Failed to parse org_id from token");
+        let duration = start.elapsed();
+        metrics::record_meeting_creation("error", Some("unauthorized"), duration);
+        GcError::InvalidToken("Invalid organization identifier in token".to_string())
+    })?;
+
+    // 4. Apply secure defaults (R-7)
+    let display_name = request.display_name.trim().to_string();
+    let max_participants = request.max_participants.unwrap_or(DEFAULT_MAX_PARTICIPANTS);
+    let enable_e2e_encryption = request.enable_e2e_encryption.unwrap_or(true);
+    let require_auth = request.require_auth.unwrap_or(true);
+    let recording_enabled = request.recording_enabled.unwrap_or(false);
+    let allow_guests = request.allow_guests.unwrap_or(false);
+    let allow_external_participants = request.allow_external_participants.unwrap_or(false);
+    let waiting_room_enabled = request.waiting_room_enabled.unwrap_or(true);
+
+    // 5. Validate max_participants lower bound
+    if max_participants < MIN_PARTICIPANTS {
+        let duration = start.elapsed();
+        metrics::record_meeting_creation("error", Some("bad_request"), duration);
+        return Err(GcError::BadRequest(
+            "Maximum participants must be at least 2".to_string(),
+        ));
+    }
+
+    // 6. Generate join_token_secret (R-5: 256 bits CSPRNG, hex-encoded)
+    let join_token_secret = generate_join_token_secret().inspect_err(|_| {
+        let duration = start.elapsed();
+        metrics::record_meeting_creation("error", Some("internal"), duration);
+    })?;
+
+    // 7. Generate meeting code and create meeting with collision retry (R-4, R-6)
+    let mut meeting_row = None;
+    for attempt in 0..MAX_CODE_COLLISION_RETRIES {
+        let meeting_code = generate_meeting_code().inspect_err(|_| {
+            let duration = start.elapsed();
+            metrics::record_meeting_creation("error", Some("internal"), duration);
+        })?;
+
+        match MeetingsRepository::create_meeting_with_limit_check(
+            &state.pool,
+            org_id,
+            user_id,
+            &display_name,
+            &meeting_code,
+            &join_token_secret,
+            max_participants,
+            enable_e2e_encryption,
+            require_auth,
+            recording_enabled,
+            allow_guests,
+            allow_external_participants,
+            waiting_room_enabled,
+            request.scheduled_start_time,
+        )
+        .await
+        {
+            Ok(Some(row)) => {
+                meeting_row = Some(row);
+                break;
+            }
+            Ok(None) => {
+                // Org limit exceeded (R-6)
+                let duration = start.elapsed();
+                metrics::record_meeting_creation("error", Some("forbidden"), duration);
+                return Err(GcError::Forbidden(
+                    "Organization meeting limit exceeded".to_string(),
+                ));
+            }
+            Err(GcError::Database(ref e))
+                if e.contains("unique constraint") || e.contains("duplicate key") =>
+            {
+                // Meeting code collision — retry with new code
+                tracing::debug!(
+                    target: "gc.handlers.meetings",
+                    attempt = attempt + 1,
+                    "Meeting code collision, retrying"
+                );
+                if attempt == MAX_CODE_COLLISION_RETRIES - 1 {
+                    let duration = start.elapsed();
+                    metrics::record_meeting_creation("error", Some("code_collision"), duration);
+                    return Err(GcError::Internal(
+                        "Failed to generate unique meeting code".to_string(),
+                    ));
+                }
+            }
+            Err(e) => {
+                let duration = start.elapsed();
+                metrics::record_meeting_creation("error", Some("db_error"), duration);
+                return Err(e);
+            }
+        }
+    }
+
+    let row = meeting_row.ok_or_else(|| {
+        let duration = start.elapsed();
+        metrics::record_meeting_creation("error", Some("code_collision"), duration);
+        GcError::Internal("Failed to generate unique meeting code".to_string())
+    })?;
+
+    // 8. Fire-and-forget audit log (R-9)
+    if let Err(e) =
+        MeetingsRepository::log_audit_event(&state.pool, org_id, user_id, row.meeting_id).await
+    {
+        warn!(
+            target: "gc.handlers.meetings",
+            meeting_id = %row.meeting_id,
+            error = %e,
+            "Failed to log audit event for meeting creation"
+        );
+    }
+
+    // 9. Record success metrics (R-10)
+    let duration = start.elapsed();
+    metrics::record_meeting_creation("success", None, duration);
+
+    info!(
+        target: "gc.handlers.meetings",
+        meeting_id = %row.meeting_id,
+        meeting_code = %row.meeting_code,
+        user_id = %user_id,
+        org_id = %org_id,
+        "Meeting created successfully"
+    );
+
+    // 10. Return 201 Created (R-1, R-8)
+    Ok((StatusCode::CREATED, Json(CreateMeetingResponse::from(row))))
+}
 
 // ============================================================================
 // Handler: GET /v1/meetings/{code}
@@ -413,7 +646,7 @@ async fn find_meeting_by_code(pool: &PgPool, code: &str) -> Result<MeetingRow, G
         .await?
         .ok_or_else(|| GcError::NotFound("Meeting not found".to_string()))?;
 
-    map_row_to_meeting(row)
+    Ok(map_row_to_meeting(row))
 }
 
 /// Find a meeting by its ID.
@@ -426,7 +659,7 @@ async fn find_meeting_by_id(pool: &PgPool, meeting_id: Uuid) -> Result<MeetingRo
         .await?
         .ok_or_else(|| GcError::NotFound("Meeting not found".to_string()))?;
 
-    map_row_to_meeting(row)
+    Ok(map_row_to_meeting(row))
 }
 
 /// Get a user's organization ID.
@@ -493,34 +726,7 @@ async fn update_meeting_settings_in_db(
     .await?
     .ok_or_else(|| GcError::NotFound("Meeting not found".to_string()))?;
 
-    map_row_to_meeting(row)
-}
-
-/// Map a database row to MeetingRow struct.
-fn map_row_to_meeting(row: sqlx::postgres::PgRow) -> Result<MeetingRow, GcError> {
-    Ok(MeetingRow {
-        meeting_id: row.get("meeting_id"),
-        org_id: row.get("org_id"),
-        created_by_user_id: row.get("created_by_user_id"),
-        display_name: row.get("display_name"),
-        meeting_code: row.get("meeting_code"),
-        join_token_secret: row.get("join_token_secret"),
-        max_participants: row.get("max_participants"),
-        enable_e2e_encryption: row.get("enable_e2e_encryption"),
-        require_auth: row.get("require_auth"),
-        recording_enabled: row.get("recording_enabled"),
-        meeting_controller_id: row.get("meeting_controller_id"),
-        meeting_controller_region: row.get("meeting_controller_region"),
-        status: row.get("status"),
-        scheduled_start_time: row.get("scheduled_start_time"),
-        actual_start_time: row.get("actual_start_time"),
-        actual_end_time: row.get("actual_end_time"),
-        created_at: row.get("created_at"),
-        updated_at: row.get("updated_at"),
-        allow_guests: row.get("allow_guests"),
-        allow_external_participants: row.get("allow_external_participants"),
-        waiting_room_enabled: row.get("waiting_room_enabled"),
-    })
+    Ok(map_row_to_meeting(row))
 }
 
 // ============================================================================
@@ -561,6 +767,59 @@ fn create_ac_client(state: &AppState) -> Result<AcClient, GcError> {
         state.config.ac_internal_url.clone(),
         state.token_receiver.clone(),
     )
+}
+
+/// Generate a cryptographically secure meeting code.
+///
+/// Produces 12 base62 characters (72 bits entropy) using CSPRNG.
+/// Always returns exactly `MEETING_CODE_LENGTH` characters, left-padded
+/// with '0' if the random value produces fewer digits.
+fn generate_meeting_code() -> Result<String, GcError> {
+    let rng = SystemRandom::new();
+    let mut bytes = [0u8; MEETING_CODE_RANDOM_BYTES];
+
+    rng.fill(&mut bytes).map_err(|e| {
+        tracing::error!(target: "gc.handlers.meetings", error = %e, "Failed to generate random bytes for meeting code");
+        GcError::Internal("RNG failure".to_string())
+    })?;
+
+    // Convert bytes to a big integer (u128 can hold 9 bytes = 72 bits)
+    let mut value: u128 = 0;
+    for &b in &bytes {
+        value = (value << 8) | u128::from(b);
+    }
+
+    // Encode as base62, extracting digits from least-significant end
+    let mut code = Vec::with_capacity(MEETING_CODE_LENGTH);
+    for _ in 0..MEETING_CODE_LENGTH {
+        let idx = (value % 62) as usize;
+        let ch = BASE62_CHARS
+            .get(idx)
+            .ok_or_else(|| GcError::Internal("Base62 index out of range".to_string()))?;
+        code.push(*ch);
+        value /= 62;
+    }
+
+    // Reverse to get most-significant digit first (consistent ordering)
+    code.reverse();
+
+    String::from_utf8(code)
+        .map_err(|_| GcError::Internal("Meeting code contained invalid UTF-8".to_string()))
+}
+
+/// Generate a cryptographically secure join token secret.
+///
+/// Produces 32 random bytes (256 bits) hex-encoded to 64 characters.
+fn generate_join_token_secret() -> Result<String, GcError> {
+    let rng = SystemRandom::new();
+    let mut bytes = [0u8; JOIN_TOKEN_SECRET_BYTES];
+
+    rng.fill(&mut bytes).map_err(|e| {
+        tracing::error!(target: "gc.handlers.meetings", error = %e, "Failed to generate random bytes for join token secret");
+        GcError::Internal("RNG failure".to_string())
+    })?;
+
+    Ok(hex::encode(bytes))
 }
 
 #[cfg(test)]
@@ -614,5 +873,118 @@ mod tests {
         assert!(DEFAULT_PARTICIPANT_CAPABILITIES.contains(&"video"));
         assert!(DEFAULT_PARTICIPANT_CAPABILITIES.contains(&"screen_share"));
         assert!(DEFAULT_PARTICIPANT_CAPABILITIES.contains(&"chat"));
+    }
+
+    // ========================================================================
+    // Meeting Code Generation Tests
+    // ========================================================================
+
+    #[test]
+    fn test_generate_meeting_code_format() {
+        let code = generate_meeting_code().unwrap();
+        assert_eq!(
+            code.len(),
+            MEETING_CODE_LENGTH,
+            "Meeting code must be exactly {} chars",
+            MEETING_CODE_LENGTH
+        );
+
+        // All characters must be base62 (0-9, A-Z, a-z)
+        for ch in code.chars() {
+            assert!(
+                ch.is_ascii_alphanumeric(),
+                "Meeting code char '{}' is not base62",
+                ch
+            );
+        }
+    }
+
+    #[test]
+    fn test_generate_meeting_code_uniqueness() {
+        let code1 = generate_meeting_code().unwrap();
+        let code2 = generate_meeting_code().unwrap();
+        assert_ne!(code1, code2, "Two generated codes should differ");
+    }
+
+    #[test]
+    fn test_generate_meeting_code_always_12_chars() {
+        // Generate many codes to verify padding works even when
+        // random bytes produce small values (leading zeros)
+        for _ in 0..100 {
+            let code = generate_meeting_code().unwrap();
+            assert_eq!(code.len(), 12);
+        }
+    }
+
+    // ========================================================================
+    // Join Token Secret Generation Tests
+    // ========================================================================
+
+    #[test]
+    fn test_generate_join_token_secret_format() {
+        let secret = generate_join_token_secret().unwrap();
+
+        // 32 bytes hex-encoded = 64 hex characters
+        assert_eq!(secret.len(), 64, "Join token secret must be 64 hex chars");
+
+        // All characters must be valid hex
+        for ch in secret.chars() {
+            assert!(
+                ch.is_ascii_hexdigit(),
+                "Join token secret char '{}' is not hex",
+                ch
+            );
+        }
+    }
+
+    #[test]
+    fn test_generate_join_token_secret_uniqueness() {
+        let secret1 = generate_join_token_secret().unwrap();
+        let secret2 = generate_join_token_secret().unwrap();
+        assert_ne!(secret1, secret2, "Two generated secrets should differ");
+    }
+
+    // ========================================================================
+    // Role Validation Tests
+    // ========================================================================
+
+    #[test]
+    fn test_meeting_create_roles_user() {
+        let roles = vec!["user".to_string()];
+        assert!(roles
+            .iter()
+            .any(|r| MEETING_CREATE_ROLES.contains(&r.as_str())));
+    }
+
+    #[test]
+    fn test_meeting_create_roles_admin() {
+        let roles = vec!["admin".to_string()];
+        assert!(roles
+            .iter()
+            .any(|r| MEETING_CREATE_ROLES.contains(&r.as_str())));
+    }
+
+    #[test]
+    fn test_meeting_create_roles_org_admin() {
+        let roles = vec!["org_admin".to_string()];
+        assert!(roles
+            .iter()
+            .any(|r| MEETING_CREATE_ROLES.contains(&r.as_str())));
+    }
+
+    #[test]
+    fn test_meeting_create_roles_viewer_rejected() {
+        let roles = vec!["viewer".to_string()];
+        assert!(!roles
+            .iter()
+            .any(|r| MEETING_CREATE_ROLES.contains(&r.as_str())));
+    }
+
+    #[test]
+    fn test_meeting_create_roles_empty_rejected() {
+        let roles: Vec<String> = vec![];
+        assert!(!roles
+            .iter()
+            .any(|r| MEETING_CREATE_ROLES.contains(&r.as_str())));
     }
 }
