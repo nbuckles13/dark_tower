@@ -406,39 +406,35 @@ Track verdicts in main.md:
 **If all CLEAR or RESOLVED**:
 - Update main.md: Phase = reflection (full) or complete (light)
 - Document accepted deferrals as tech debt in main.md (with implementer's justification)
-- Full mode: Message team: "All approved. Please capture reflections."
+- Full mode: proceed to reflection (Step 8)
 - Light mode: Skip to Step 9.
 
 ### Step 8: Reflection [FULL MODE ONLY]
 
-Allow 15 minutes for teammates to update their INDEX.md navigation file.
+Broadcast the reflection instructions to all teammates:
 
-Each specialist maintains ONE file: `docs/specialist-knowledge/{name}/INDEX.md`
+```
+Reflection: update your INDEX.md at `docs/specialist-knowledge/{your-name}/INDEX.md`.
 
-**INDEX.md is a navigation map — pointers to code and ADRs, not content.**
+INDEX.md is a navigation map — pointers to code and ADRs ONLY.
 
-Each entry is a pointer: "Topic → `path/to/file.rs:function_name()`" or "Topic → ADR-NNNN (Section X)"
+Format: "Topic → `path/to/file.rs:function_name()`" or "Topic → ADR-NNNN"
 
-Pointers should be as specific as possible:
-- Code: point to the function, not just the file (`jwt.rs:validate_token()` not just `jwt.rs`)
-- ADRs: point to the relevant section when the topic is specific ("crypto requirements → ADR-0003 Section 2"), or the whole ADR when the topic is broad ("overall architecture → ADR-0001")
+- Add pointers for new code locations, new ADRs, new integration seams
+- Update pointers for moved/renamed code
+- Remove pointers for deleted code
 
-**Add a pointer when**: New ADR created that affects your domain. Significant new functionality added. New integration seam discovered.
-**Update a pointer when**: Code moved or renamed. ADR superseded.
-**Remove a pointer when**: Referenced code deleted. ADR deprecated.
+DO NOT add implementation facts, gotchas, patterns, design decisions,
+review checklists, task status, or date-stamped sections. If something
+feels important but isn't a pointer, put it as a code comment, an ADR,
+or a TODO.md entry instead.
 
-**INDEX.md MUST NOT contain:**
-- Implementation facts (how functions work, what parameters they take, why a pattern was chosen)
-- Task status, deferred items, or date-stamped feature sections
-- Design decisions or gotchas (document these as code comments at the decision point)
-- General Rust/library/database knowledge (e.g., "modulo bias requires rejection sampling")
-- Duplication findings (DRY reviewer: add these to `.claude/TODO.md`, not your INDEX)
+DRY reviewer: duplication findings go in `.claude/TODO.md`, not INDEX.
 
-**No exceptions.** If something feels important but isn't a pointer, it belongs as a code comment, an ADR, or a TODO.md entry — not in INDEX.md.
+Organize by architectural concept (not by feature or date). Max 50 lines.
+```
 
-**Organize by architectural concept** (e.g., "Code Locations", "Integration Seams"), not by feature or date.
-
-**Size cap**: 50 lines maximum.
+Allow 15 minutes for updates.
 
 ### Step 9: Complete
 

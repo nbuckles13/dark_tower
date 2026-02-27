@@ -267,30 +267,28 @@ Migration Plan (when debate involves schema changes):
 
 ### Step 8: Reflection
 
-Allow 15 minutes for specialists to update their INDEX.md navigation file.
+Broadcast the reflection instructions to all specialists:
 
-Each specialist maintains ONE file: `docs/specialist-knowledge/{name}/INDEX.md`
+```
+Reflection: update your INDEX.md at `docs/specialist-knowledge/{your-name}/INDEX.md`.
 
-**INDEX.md is a navigation map — pointers to code and ADRs, not content.**
+INDEX.md is a navigation map — pointers to code and ADRs ONLY.
 
-Each entry is a pointer: "Topic → `path/to/file.rs:function_name()`" or "Topic → ADR-NNNN (Section X)"
+Format: "Topic → `path/to/file.rs:function_name()`" or "Topic → ADR-NNNN"
 
-**Add a pointer when**: New ADR created that affects your domain (the ADR from this debate!). New integration seam discovered.
-**Update a pointer when**: Code moved or renamed. ADR superseded.
-**Remove a pointer when**: Referenced code deleted. ADR deprecated.
+- Add pointers for new ADRs (especially the ADR from this debate!), new integration seams
+- Update pointers for moved/renamed code
+- Remove pointers for deleted code
 
-**INDEX.md MUST NOT contain:**
-- Implementation facts (how functions work, what parameters they take, why a pattern was chosen)
-- Task status, deferred items, or date-stamped feature sections
-- Design decisions or gotchas (document these as code comments at the decision point)
-- General Rust/library/database knowledge (e.g., "modulo bias requires rejection sampling")
-- Duplication findings (DRY reviewer: add these to `.claude/TODO.md`, not your INDEX)
+DO NOT add implementation facts, gotchas, patterns, design decisions,
+review checklists, task status, or date-stamped sections. If something
+feels important but isn't a pointer, put it as a code comment, an ADR,
+or a TODO.md entry instead.
 
-**No exceptions.** If something feels important but isn't a pointer, it belongs as a code comment, an ADR, or a TODO.md entry — not in INDEX.md.
+Organize by architectural concept (not by feature or date). Max 50 lines.
+```
 
-**Organize by architectural concept** (e.g., "Code Locations", "Integration Seams"), not by feature or date.
-
-**Size cap**: 50 lines maximum.
+Allow 15 minutes for updates.
 
 ### Step 9: Complete
 
