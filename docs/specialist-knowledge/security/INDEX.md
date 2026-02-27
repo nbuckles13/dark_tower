@@ -20,8 +20,15 @@
 - JWT size constant → `crates/common/src/jwt.rs:MAX_JWT_SIZE_BYTES`
 - Shared claims types → `crates/common/src/jwt.rs:ServiceClaims`, `UserClaims` (PII-redacted Debug)
 - Token manager (secure constructor) → `crates/common/src/token_manager.rs:new_secure()`
-- GC JWT validation → `crates/gc-service/src/auth/jwt.rs:validate()`
+- GC JWT validation (service tokens) → `crates/gc-service/src/auth/jwt.rs:validate()`
+- GC JWT validation (user tokens) → `crates/gc-service/src/auth/jwt.rs:validate_user()`
+- GC generic token verification → `crates/gc-service/src/auth/jwt.rs:verify_token::<T>()`
 - GC JWKS fetching → `crates/gc-service/src/auth/jwks.rs`
+- GC service auth middleware → `crates/gc-service/src/middleware/auth.rs:require_auth()`
+- GC user auth middleware → `crates/gc-service/src/middleware/auth.rs:require_user_auth()`
+- GC CSPRNG generators → `crates/gc-service/src/handlers/meetings.rs:generate_meeting_code()`, `generate_join_token_secret()`
+- GC role enforcement constants → `crates/gc-service/src/handlers/meetings.rs:MEETING_CREATE_ROLES`
+- GC atomic org limit CTE → `crates/gc-service/src/repositories/meetings.rs:create_meeting_with_limit_check()`
 - MC gRPC auth interceptor → `crates/mc-service/src/grpc/auth_interceptor.rs`
 - MC session binding actors → `crates/mc-service/src/actors/session.rs`
 
@@ -31,6 +38,7 @@
 - Token refresh callback (shared-to-service metrics) → `crates/common/src/token_manager.rs:with_on_refresh()`
 - GC default scopes (incl. `internal:meeting-token`) → `crates/ac-service/src/models/mod.rs:ServiceType::default_scopes()`
 - GC-to-MC NetworkPolicy egress (TCP 50052) → `infra/services/gc-service/network-policy.yaml`
+- GC user-auth route layer → `crates/gc-service/src/routes/mod.rs:build_routes()` (user_auth_routes)
 - Credential leak guards → `scripts/guards/simple/no-secrets-in-logs.sh`, `instrument-skip-all.sh`
 
 ## Cross-Cutting Gotchas

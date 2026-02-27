@@ -19,8 +19,13 @@
 
 ## Code Locations: GC Service
 - Auth/JWT tests -> `crates/gc-service/tests/auth_tests.rs`
+- Meeting join/guest/settings tests -> `crates/gc-service/tests/meeting_tests.rs`
+- Meeting creation tests -> `crates/gc-service/tests/meeting_create_tests.rs`
 - Meeting assignment tests -> `crates/gc-service/tests/meeting_assignment_tests.rs`
 - Test harness (HTTP seam) -> `crates/gc-test-utils/src/server_harness.rs`
+- User auth middleware (UserClaims) -> `crates/gc-service/src/middleware/auth.rs:require_user_auth()`
+- Generic token verification -> `crates/gc-service/src/auth/jwt.rs:verify_token::<T>()`
+- Meetings repository (CTE limit check) -> `crates/gc-service/src/repositories/meetings.rs`
 
 ## Code Locations: MC Service
 - GC integration tests -> `crates/mc-service/tests/gc_integration.rs`
@@ -37,5 +42,6 @@
 
 ## Code Locations: Shared
 - JWT validation -> `crates/common/src/jwt.rs`
+- UserClaims struct -> `crates/common/src/jwt.rs:UserClaims`
 - Token manager (retry/refresh) -> `crates/common/src/token_manager.rs`
 

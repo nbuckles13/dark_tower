@@ -91,6 +91,14 @@ pub fn init_metrics_recorder() -> Result<PrometheusHandle, String> {
             &[0.010, 0.050, 0.100, 0.250, 0.500, 1.000, 2.500, 5.000],
         )
         .map_err(|e| format!("Failed to set token refresh buckets: {e}"))?
+        // Meeting creation buckets
+        .set_buckets_for_metric(
+            Matcher::Prefix("gc_meeting_creation".to_string()),
+            &[
+                0.005, 0.010, 0.025, 0.050, 0.100, 0.150, 0.200, 0.300, 0.500, 1.000,
+            ],
+        )
+        .map_err(|e| format!("Failed to set meeting creation buckets: {e}"))?
         .install_recorder()
         .map_err(|e| format!("Failed to install Prometheus recorder: {e}"))
 }
@@ -152,6 +160,7 @@ fn normalize_endpoint(path: &str) -> String {
         "/health" => "/health".to_string(),
         "/metrics" => "/metrics".to_string(),
         "/api/v1/me" => "/api/v1/me".to_string(),
+        "/api/v1/meetings" => "/api/v1/meetings".to_string(),
         _ => normalize_dynamic_endpoint(path),
     }
 }
@@ -366,6 +375,42 @@ pub fn record_mh_selection(status: &str, has_backup: bool, duration: Duration) {
 }
 
 // ============================================================================
+// Meeting Creation Metrics
+// ============================================================================
+
+/// Record meeting creation attempt.
+///
+/// Emits three metrics per the metrics catalog:
+/// - `gc_meeting_creation_total` counter (labels: `status`)
+/// - `gc_meeting_creation_duration_seconds` histogram (labels: `status`)
+/// - `gc_meeting_creation_failures_total` counter (labels: `error_type`, on failure only)
+///
+/// # Arguments
+///
+/// * `status` - "success" or "error"
+/// * `error_type` - Error category for failures (e.g., "bad_request", "forbidden",
+///   "db_error", "code_collision", "unauthorized", "internal")
+/// * `duration` - Duration of the creation attempt
+pub fn record_meeting_creation(status: &str, error_type: Option<&str>, duration: Duration) {
+    histogram!("gc_meeting_creation_duration_seconds",
+        "status" => status.to_string()
+    )
+    .record(duration.as_secs_f64());
+
+    counter!("gc_meeting_creation_total",
+        "status" => status.to_string()
+    )
+    .increment(1);
+
+    if let Some(err_type) = error_type {
+        counter!("gc_meeting_creation_failures_total",
+            "error_type" => err_type.to_string()
+        )
+        .increment(1);
+    }
+}
+
+// ============================================================================
 // Registered Controllers Gauge (Fleet Monitoring)
 // ============================================================================
 
@@ -550,7 +595,6 @@ mod tests {
     fn test_normalize_endpoint_unknown_paths() {
         assert_eq!(normalize_endpoint("/unknown"), "/other");
         assert_eq!(normalize_endpoint("/api/v2/something"), "/other");
-        assert_eq!(normalize_endpoint("/api/v1/meetings"), "/other");
         assert_eq!(
             normalize_endpoint("/api/v1/meetings/code/unknown-action"),
             "/other"
@@ -679,5 +723,24 @@ mod tests {
         assert!(CONTROLLER_STATUSES.contains(&"degraded"));
         assert!(CONTROLLER_STATUSES.contains(&"unhealthy"));
         assert!(CONTROLLER_STATUSES.contains(&"draining"));
+    }
+
+    #[test]
+    fn test_record_meeting_creation() {
+        // Success path
+        record_meeting_creation("success", None, Duration::from_millis(50));
+
+        // Error paths with different error types
+        record_meeting_creation("error", Some("bad_request"), Duration::from_millis(5));
+        record_meeting_creation("error", Some("unauthorized"), Duration::from_millis(3));
+        record_meeting_creation("error", Some("forbidden"), Duration::from_millis(8));
+        record_meeting_creation("error", Some("db_error"), Duration::from_millis(100));
+        record_meeting_creation("error", Some("code_collision"), Duration::from_millis(200));
+        record_meeting_creation("error", Some("internal"), Duration::from_millis(10));
+    }
+
+    #[test]
+    fn test_normalize_endpoint_meetings_create() {
+        assert_eq!(normalize_endpoint("/api/v1/meetings"), "/api/v1/meetings");
     }
 }

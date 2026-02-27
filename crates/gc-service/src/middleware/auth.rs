@@ -1,7 +1,11 @@
 //! Authentication middleware for protected routes.
 //!
-//! Extracts Bearer token from Authorization header, validates JWT using
-//! the JWKS client, and injects claims into request extensions.
+//! Provides two middleware functions:
+//! - `require_auth` - For service-to-service authentication (validates `Claims`)
+//! - `require_user_auth` - For user authentication (validates `UserClaims`)
+//!
+//! Both extract Bearer token from Authorization header, validate JWT using
+//! the JWKS client, and inject the appropriate claims into request extensions.
 
 use crate::auth::{Claims, JwtValidator};
 use crate::errors::GcError;
@@ -20,28 +24,10 @@ pub struct AuthState {
     pub jwt_validator: Arc<JwtValidator>,
 }
 
-/// Authentication middleware that validates JWT tokens.
+/// Extract Bearer token from the Authorization header.
 ///
-/// Extracts Bearer token from Authorization header, verifies JWT signature
-/// and claims, then stores the claims in request extensions for handlers.
-///
-/// # Authorization Header Format
-///
-/// ```text
-/// Authorization: Bearer <token>
-/// ```
-///
-/// # Response
-///
-/// - Returns 401 Unauthorized with WWW-Authenticate header if token is missing or invalid
-/// - Continues to next handler with claims in extensions if token is valid
-#[instrument(skip_all, name = "gc.middleware.auth")]
-pub async fn require_auth(
-    State(state): State<Arc<AuthState>>,
-    mut req: Request,
-    next: Next,
-) -> Result<impl IntoResponse, GcError> {
-    // Extract Authorization header
+/// Shared helper used by both `require_auth` and `require_user_auth`.
+fn extract_bearer_token(req: &Request) -> Result<&str, GcError> {
     let auth_header = req
         .headers()
         .get("authorization")
@@ -51,19 +37,61 @@ pub async fn require_auth(
             GcError::InvalidToken("Missing Authorization header".to_string())
         })?;
 
-    // Extract Bearer token
-    let token = auth_header.strip_prefix("Bearer ").ok_or_else(|| {
+    auth_header.strip_prefix("Bearer ").ok_or_else(|| {
         tracing::debug!(target: "gc.middleware.auth", "Invalid Authorization header format");
         GcError::InvalidToken("Invalid Authorization header format".to_string())
-    })?;
+    })
+}
 
-    // Validate JWT
+/// Authentication middleware for service tokens.
+///
+/// Validates JWT and deserializes into `Claims` (with `scope`, `service_type`).
+/// Used for service-to-service authenticated endpoints.
+///
+/// # Response
+///
+/// - Returns 401 Unauthorized if token is missing or invalid
+/// - Continues to next handler with `Claims` in extensions if token is valid
+#[instrument(skip_all, name = "gc.middleware.auth")]
+pub async fn require_auth(
+    State(state): State<Arc<AuthState>>,
+    mut req: Request,
+    next: Next,
+) -> Result<impl IntoResponse, GcError> {
+    let token = extract_bearer_token(&req)?;
+
+    // Validate JWT as service token
     let claims = state.jwt_validator.validate(token).await?;
 
     // Store claims in request extensions for downstream handlers
     req.extensions_mut().insert(claims);
 
-    // Continue to next handler
+    Ok(next.run(req).await)
+}
+
+/// Authentication middleware for user tokens.
+///
+/// Validates JWT and deserializes into `UserClaims` (with `org_id`, `roles`, `email`, `jti`).
+/// Used for user-facing authenticated endpoints.
+///
+/// # Response
+///
+/// - Returns 401 Unauthorized if token is missing or invalid
+/// - Continues to next handler with `UserClaims` in extensions if token is valid
+#[instrument(skip_all, name = "gc.middleware.user_auth")]
+pub async fn require_user_auth(
+    State(state): State<Arc<AuthState>>,
+    mut req: Request,
+    next: Next,
+) -> Result<impl IntoResponse, GcError> {
+    let token = extract_bearer_token(&req)?;
+
+    // Validate JWT as user token
+    let user_claims = state.jwt_validator.validate_user(token).await?;
+
+    // Store user claims in request extensions for downstream handlers
+    req.extensions_mut().insert(user_claims);
+
     Ok(next.run(req).await)
 }
 

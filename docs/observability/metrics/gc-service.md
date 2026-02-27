@@ -154,6 +154,50 @@ All GC service metrics follow ADR-0011 naming conventions with the `gc_` prefix.
 
 ---
 
+## Meeting Creation Metrics
+
+### `gc_meeting_creation_total`
+- **Type**: Counter
+- **Description**: Total meeting creation attempts
+- **Labels**:
+  - `status`: Creation outcome (success, error)
+- **Cardinality**: Low (2 statuses)
+- **Usage**: Track meeting creation rate and success
+- **Example**:
+  ```promql
+  rate(gc_meeting_creation_total{status="error"}[5m])
+  ```
+
+### `gc_meeting_creation_duration_seconds`
+- **Type**: Histogram
+- **Description**: Meeting creation operation duration (end-to-end handler time)
+- **Labels**:
+  - `status`: Creation outcome (success, error)
+- **Buckets**: [0.005, 0.010, 0.025, 0.050, 0.100, 0.150, 0.200, 0.300, 0.500, 1.000]
+- **Cardinality**: Low (2 statuses)
+- **Usage**: Monitor meeting creation latency, identify slow DB or code-generation paths
+- **Example**:
+  ```promql
+  histogram_quantile(0.95,
+    sum(rate(gc_meeting_creation_duration_seconds_bucket{status="success"}[5m])) by (le)
+  )
+  ```
+
+### `gc_meeting_creation_failures_total`
+- **Type**: Counter
+- **Description**: Meeting creation failures by error type
+- **Labels**:
+  - `error_type`: Type of failure (bad_request, forbidden, unauthorized, code_collision, db_error, internal)
+- **Cardinality**: Low (6 error types)
+- **Alert**: High rate may indicate org limit exhaustion or DB issues
+- **Usage**: Diagnose meeting creation failures
+- **Example**:
+  ```promql
+  sum(rate(gc_meeting_creation_failures_total[5m])) by (error_type)
+  ```
+
+---
+
 ## AC Client Metrics
 
 ### `gc_ac_requests_total`
@@ -321,6 +365,19 @@ histogram_quantile(0.95,
 ) * 1000
 ```
 
+### Meeting Creation Success Rate
+```promql
+sum(rate(gc_meeting_creation_total{status="success"}[5m])) /
+sum(rate(gc_meeting_creation_total[5m]))
+```
+
+### Meeting Creation p95 Latency
+```promql
+histogram_quantile(0.95,
+  sum(rate(gc_meeting_creation_duration_seconds_bucket{status="success"}[5m])) by (le)
+)
+```
+
 ### DB Query Latency by Operation
 ```promql
 histogram_quantile(0.99,
@@ -365,7 +422,7 @@ All GC service metrics follow strict cardinality bounds per ADR-0011:
 | `rejection_reason` | 5 | at_capacity, draining, unhealthy, rpc_failed, none |
 | `error_type` | ~10 | not_found, forbidden, unauthorized, rate_limit, service_unavailable, internal, etc. |
 
-**Total Estimated Cardinality**: ~400 time series (well within Prometheus limits)
+**Total Estimated Cardinality**: ~410 time series (well within Prometheus limits)
 
 ---
 
