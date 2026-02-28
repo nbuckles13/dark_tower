@@ -37,6 +37,20 @@ All dashboard JSON files are stored in `infra/grafana/dashboards/` and auto-load
 11. **Pod Count** - Number of running GC pods
 12. **Memory Usage** - Memory consumption per pod
 13. **CPU Usage** - CPU utilization per pod
+14. **Token Refresh Rate by Status** - Token refresh attempts by success/error status
+15. **Token Refresh Latency (P50/P95/P99)** - Token refresh latency percentiles
+16. **Token Refresh Failures by Type** - Token refresh failures by error type
+17. **AC Request Rate by Operation** - Requests to Auth Controller by operation and status
+18. **AC Request Latency (P50/P95/P99)** - AC client request latency percentiles
+19. **gRPC MC Call Rate** - gRPC calls to Meeting Controllers by method and status
+20. **gRPC MC Call Latency (P50/P95/P99)** - gRPC call latency to Meeting Controllers
+21. **MH Selection Rate by Status** - Media Handler selection attempts by status
+22. **MH Selection Latency (P50/P95/P99)** - MH selection latency percentiles
+23. **Meeting Creation Rate by Status** - Meeting creation attempts by success/error status
+24. **Meeting Creation Latency (P50/P95/P99)** - Meeting creation latency percentiles (p50, p95, p99)
+25. **Meeting Creation Failures by Type** - Meeting creation failures by error type (bad_request, forbidden, db_error, etc.)
+26. **Registered Controllers by Type & Status** - Fleet health by controller type and status
+27. **Errors by Operation & Type** - Error rate by operation and error type
 
 **Metrics Used**:
 - `gc_http_requests_total`
@@ -48,6 +62,20 @@ All dashboard JSON files are stored in `infra/grafana/dashboards/` and auto-load
 - `up{job="gc-service"}`
 - `container_memory_usage_bytes`
 - `container_cpu_usage_seconds_total`
+- `gc_token_refresh_total`
+- `gc_token_refresh_duration_seconds`
+- `gc_token_refresh_failures_total`
+- `gc_ac_requests_total`
+- `gc_ac_request_duration_seconds`
+- `gc_grpc_mc_calls_total`
+- `gc_grpc_mc_call_duration_seconds`
+- `gc_mh_selections_total`
+- `gc_mh_selection_duration_seconds`
+- `gc_meeting_creation_total`
+- `gc_meeting_creation_duration_seconds`
+- `gc_meeting_creation_failures_total`
+- `gc_registered_controllers`
+- `gc_errors_total`
 
 **Default Time Range**: Last 1 hour
 **Refresh**: 10 seconds
@@ -296,7 +324,7 @@ To request a new dashboard:
 
 | Dashboard | Owner | Reviewer | Last Updated |
 |-----------|-------|----------|--------------|
-| GC Overview | Observability | GC Team | 2026-02-05 |
+| GC Overview | Observability | GC Team | 2026-02-28 |
 | GC SLOs | Observability | Operations | 2026-02-05 |
 | AC Overview | Observability | AC Team | TBD |
 | MC Overview | Observability | MC Team | TBD |
@@ -306,7 +334,7 @@ To request a new dashboard:
 
 ---
 
-**Last Updated**: 2026-02-05
+**Last Updated**: 2026-02-28
 **Maintained By**: Observability Specialist
 **Related Documents**:
 - [ADR-0011: Observability Framework](../decisions/adr-0011-observability-framework.md)

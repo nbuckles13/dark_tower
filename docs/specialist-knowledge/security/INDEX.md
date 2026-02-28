@@ -22,7 +22,7 @@
 - Token manager (secure constructor) → `crates/common/src/token_manager.rs:new_secure()`
 - GC JWT validation (service tokens) → `crates/gc-service/src/auth/jwt.rs:validate()`
 - GC JWT validation (user tokens) → `crates/gc-service/src/auth/jwt.rs:validate_user()`
-- GC generic token verification → `crates/gc-service/src/auth/jwt.rs:verify_token::<T>()`
+- GC generic token verification → `crates/gc-service/src/auth/jwt.rs:verify_token()`
 - GC JWKS fetching → `crates/gc-service/src/auth/jwks.rs`
 - GC service auth middleware → `crates/gc-service/src/middleware/auth.rs:require_auth()`
 - GC user auth middleware → `crates/gc-service/src/middleware/auth.rs:require_user_auth()`

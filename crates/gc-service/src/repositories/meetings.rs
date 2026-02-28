@@ -49,7 +49,10 @@ impl MeetingsRepository {
     /// * `waiting_room_enabled` - Waiting room setting
     /// * `scheduled_start_time` - Optional scheduled start time
     #[instrument(skip_all, name = "gc.repo.create_meeting")]
-    #[expect(clippy::too_many_arguments, reason = "Represents all meeting table columns for atomic INSERT")]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Represents all meeting table columns for atomic INSERT"
+    )]
     pub async fn create_meeting_with_limit_check(
         pool: &PgPool,
         org_id: Uuid,
