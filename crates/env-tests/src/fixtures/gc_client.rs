@@ -229,6 +229,105 @@ pub struct MeetingResponse {
     pub waiting_room_enabled: bool,
 }
 
+/// Request body for creating a meeting.
+///
+/// Sent to `POST /api/v1/meetings` by authenticated users.
+/// All fields except `display_name` are optional; GC applies secure defaults.
+#[derive(Debug, Clone, Serialize)]
+pub struct CreateMeetingRequest {
+    /// Meeting display name (required, 1-255 bytes after trimming).
+    pub display_name: String,
+
+    /// Maximum number of participants (optional, default 100, min 2).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_participants: Option<i32>,
+
+    /// Whether end-to-end encryption is enabled (default: true).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enable_e2e_encryption: Option<bool>,
+
+    /// Whether authentication is required to join (default: true).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub require_auth: Option<bool>,
+
+    /// Whether recording is enabled (default: false).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recording_enabled: Option<bool>,
+
+    /// Whether anonymous guests can join (default: false).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allow_guests: Option<bool>,
+
+    /// Whether external org users can join (default: false).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allow_external_participants: Option<bool>,
+
+    /// Whether waiting room is enabled (default: true).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub waiting_room_enabled: Option<bool>,
+}
+
+impl CreateMeetingRequest {
+    /// Create a minimal request with just a display name.
+    ///
+    /// GC will apply secure defaults for all other fields.
+    pub fn new(display_name: impl Into<String>) -> Self {
+        Self {
+            display_name: display_name.into(),
+            max_participants: None,
+            enable_e2e_encryption: None,
+            require_auth: None,
+            recording_enabled: None,
+            allow_guests: None,
+            allow_external_participants: None,
+            waiting_room_enabled: None,
+        }
+    }
+}
+
+/// Response from creating a meeting.
+///
+/// Returned by `POST /api/v1/meetings` with status 201 Created.
+/// Excludes `join_token_secret` and other internal fields.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CreateMeetingResponse {
+    /// Unique meeting identifier.
+    pub meeting_id: Uuid,
+
+    /// Short meeting code for joining (12 base62 chars).
+    pub meeting_code: String,
+
+    /// Meeting display name.
+    pub display_name: String,
+
+    /// Current meeting status.
+    pub status: String,
+
+    /// Maximum number of participants.
+    pub max_participants: i32,
+
+    /// Whether end-to-end encryption is enabled.
+    pub enable_e2e_encryption: bool,
+
+    /// Whether authentication is required to join.
+    pub require_auth: bool,
+
+    /// Whether recording is enabled.
+    pub recording_enabled: bool,
+
+    /// Whether anonymous guests can join.
+    pub allow_guests: bool,
+
+    /// Whether external org users can join.
+    pub allow_external_participants: bool,
+
+    /// Whether waiting room is enabled.
+    pub waiting_room_enabled: bool,
+
+    /// Creation timestamp.
+    pub created_at: String,
+}
+
 /// Client for interacting with the Global Controller service.
 pub struct GcClient {
     base_url: String,
@@ -373,6 +472,58 @@ impl GcClient {
             .await?;
 
         self.handle_response(response).await
+    }
+
+    /// Create a new meeting as an authenticated user.
+    ///
+    /// # Arguments
+    ///
+    /// * `token` - User JWT Bearer token (from AC registration or login)
+    /// * `request` - Meeting creation request
+    ///
+    /// # Endpoint
+    ///
+    /// `POST /api/v1/meetings`
+    pub async fn create_meeting(
+        &self,
+        token: &str,
+        request: &CreateMeetingRequest,
+    ) -> Result<CreateMeetingResponse, GcClientError> {
+        let url = format!("{}/api/v1/meetings", self.base_url);
+
+        let response = self
+            .http_client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", token))
+            .json(request)
+            .send()
+            .await?;
+
+        self.handle_response(response).await
+    }
+
+    /// Make a raw request to create a meeting and return the response.
+    ///
+    /// Useful for testing error paths (401 without token, 400 with bad body).
+    /// Sends raw string body with `Content-Type: application/json`.
+    pub async fn raw_create_meeting(
+        &self,
+        token: Option<&str>,
+        body: &str,
+    ) -> Result<reqwest::Response, GcClientError> {
+        let url = format!("{}/api/v1/meetings", self.base_url);
+
+        let mut request = self
+            .http_client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .body(body.to_string());
+
+        if let Some(t) = token {
+            request = request.header("Authorization", format!("Bearer {}", t));
+        }
+
+        Ok(request.send().await?)
     }
 
     /// Make a raw request and return the response for testing error cases.
@@ -765,6 +916,103 @@ mod tests {
         assert!(
             debug_output.contains("1234567890"),
             "exp should be visible in debug output"
+        );
+    }
+
+    #[test]
+    fn test_create_meeting_request_minimal_serialization() {
+        let request = CreateMeetingRequest::new("Team Standup");
+
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("\"display_name\":\"Team Standup\""));
+        // Optional fields should be omitted
+        assert!(!json.contains("max_participants"));
+        assert!(!json.contains("enable_e2e_encryption"));
+        assert!(!json.contains("require_auth"));
+        assert!(!json.contains("recording_enabled"));
+        assert!(!json.contains("allow_guests"));
+        assert!(!json.contains("allow_external_participants"));
+        assert!(!json.contains("waiting_room_enabled"));
+    }
+
+    #[test]
+    fn test_create_meeting_request_full_serialization() {
+        let request = CreateMeetingRequest {
+            display_name: "All Hands".to_string(),
+            max_participants: Some(50),
+            enable_e2e_encryption: Some(true),
+            require_auth: Some(true),
+            recording_enabled: Some(false),
+            allow_guests: Some(false),
+            allow_external_participants: Some(false),
+            waiting_room_enabled: Some(true),
+        };
+
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("\"display_name\":\"All Hands\""));
+        assert!(json.contains("\"max_participants\":50"));
+        assert!(json.contains("\"enable_e2e_encryption\":true"));
+        assert!(json.contains("\"allow_guests\":false"));
+    }
+
+    #[test]
+    fn test_create_meeting_response_deserialization() {
+        let json = r#"{
+            "meeting_id": "00000000-0000-0000-0000-000000000001",
+            "meeting_code": "ABC123def456",
+            "display_name": "Test Meeting",
+            "status": "scheduled",
+            "max_participants": 100,
+            "enable_e2e_encryption": true,
+            "require_auth": true,
+            "recording_enabled": false,
+            "allow_guests": false,
+            "allow_external_participants": false,
+            "waiting_room_enabled": true,
+            "created_at": "2026-02-28T12:00:00Z"
+        }"#;
+
+        let response: CreateMeetingResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            response.meeting_id,
+            Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap()
+        );
+        assert_eq!(response.meeting_code, "ABC123def456");
+        assert_eq!(response.display_name, "Test Meeting");
+        assert_eq!(response.status, "scheduled");
+        assert_eq!(response.max_participants, 100);
+        assert!(response.enable_e2e_encryption);
+        assert!(response.require_auth);
+        assert!(!response.recording_enabled);
+        assert!(!response.allow_guests);
+        assert!(!response.allow_external_participants);
+        assert!(response.waiting_room_enabled);
+    }
+
+    #[test]
+    fn test_create_meeting_response_excludes_join_token_secret() {
+        // Verify that CreateMeetingResponse does not have a join_token_secret field.
+        // The GC service intentionally excludes this from the response.
+        let json = r#"{
+            "meeting_id": "00000000-0000-0000-0000-000000000001",
+            "meeting_code": "ABC123def456",
+            "display_name": "Test",
+            "status": "scheduled",
+            "max_participants": 100,
+            "enable_e2e_encryption": true,
+            "require_auth": true,
+            "recording_enabled": false,
+            "allow_guests": false,
+            "allow_external_participants": false,
+            "waiting_room_enabled": true,
+            "created_at": "2026-02-28T12:00:00Z"
+        }"#;
+
+        let response: CreateMeetingResponse = serde_json::from_str(json).unwrap();
+        let serialized = format!("{:?}", response);
+        assert!(
+            !serialized.contains("join_token_secret"),
+            "Response should not contain join_token_secret"
         );
     }
 }
