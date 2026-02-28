@@ -2,7 +2,7 @@
 
 **Service**: Global Controller (gc-service)
 **Version**: Phase 4 (ADR-0010 Implementation)
-**Last Updated**: 2026-02-05
+**Last Updated**: 2026-02-28
 **Owner**: Operations Team
 
 ---
@@ -876,6 +876,73 @@ kill %1
 - Response includes MC assignment details
 - Response time: <200ms (SLO)
 
+### Test 6: Meeting Creation
+
+**Purpose:** Verify meeting creation endpoint creates meetings with valid codes and secure defaults.
+
+```bash
+# Port-forward to GC pod
+kubectl port-forward -n dark-tower deployment/gc-service 8080:8080 &
+
+# Step 1: Obtain a user JWT via AC register endpoint
+USER_TOKEN=$(curl -s -X POST http://ac-service.dark-tower.svc.cluster.local:8082/api/v1/auth/register \
+  -H "Content-Type: application/json" \
+  -d '{"email":"smoke-test@example.com","password":"SmokeTest123!","display_name":"Smoke Test"}' \
+  | jq -r '.access_token')
+
+# If user already exists, login instead
+if [ -z "$USER_TOKEN" ] || [ "$USER_TOKEN" = "null" ]; then
+  USER_TOKEN=$(curl -s -X POST http://ac-service.dark-tower.svc.cluster.local:8082/api/v1/auth/login \
+    -H "Content-Type: application/json" \
+    -d '{"email":"smoke-test@example.com","password":"SmokeTest123!"}' \
+    | jq -r '.access_token')
+fi
+
+# Step 2: Create a meeting
+RESPONSE=$(curl -s -w "\n%{http_code}" -X POST http://localhost:8080/api/v1/meetings \
+  -H "Authorization: Bearer $USER_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"display_name":"Smoke Test Meeting"}')
+
+HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+BODY=$(echo "$RESPONSE" | sed '$d')
+
+echo "HTTP Status: $HTTP_CODE"
+echo "Response: $BODY"
+
+# Step 3: Verify response
+MEETING_ID=$(echo "$BODY" | jq -r '.meeting_id')
+MEETING_CODE=$(echo "$BODY" | jq -r '.meeting_code')
+
+echo "Meeting ID: $MEETING_ID"
+echo "Meeting Code: $MEETING_CODE"
+
+# Step 4: Verify meeting code format (12 alphanumeric characters)
+if echo "$MEETING_CODE" | grep -qE '^[A-Za-z0-9]{12}$'; then
+  echo "PASS: Meeting code is 12 alphanumeric characters"
+else
+  echo "FAIL: Meeting code format invalid: $MEETING_CODE"
+fi
+
+# Step 5: Verify response does NOT leak sensitive fields
+if echo "$BODY" | jq -e '.join_token_secret' > /dev/null 2>&1; then
+  echo "FAIL: Response contains join_token_secret — sensitive data leak"
+else
+  echo "PASS: Response does not contain join_token_secret"
+fi
+
+# Kill port-forward
+kill %1
+```
+
+**Success criteria:**
+- HTTP 201 status
+- Response body contains `meeting_id` (non-empty UUID)
+- Response body contains `meeting_code` (12 alphanumeric characters)
+- Response includes secure defaults (e.g., meeting status)
+- Response does NOT contain `join_token_secret` or other sensitive fields
+- Response time: <500ms
+
 ---
 
 ## Monitoring and Verification
@@ -947,6 +1014,71 @@ See `infra/grafana/dashboards/gc-overview.json` and `gc-slos.json`.
 
 See `infra/docker/prometheus/rules/gc-alerts.yaml` for full list.
 
+### Post-Deploy Monitoring Checklist: Meeting Creation
+
+Use this checklist after any deployment that touches meeting creation code (handler, repository, migrations, or meeting-related configuration). For routine deployments that do not affect meeting creation, the general monitoring section above is sufficient.
+
+**1-hour observation window** (mandatory for meeting creation changes):
+
+Monitor continuously for the first hour after deployment. Do not declare success until 1 hour has passed without anomalies.
+
+**30-minute check:**
+
+```promql
+# Meeting creation rate > 0 (traffic is flowing)
+sum(rate(gc_meeting_creation_total[5m])) > 0
+
+# Meeting creation error rate < 1%
+sum(rate(gc_meeting_creation_total{status="error"}[5m]))
+/ sum(rate(gc_meeting_creation_total[5m])) < 0.01
+
+# Meeting creation p95 latency < 500ms
+histogram_quantile(0.95,
+  sum by(le) (rate(gc_meeting_creation_duration_seconds_bucket[5m]))
+) < 0.500
+```
+
+- [ ] Meeting creation rate > 0 (confirms endpoint is receiving traffic)
+- [ ] Meeting creation error rate < 1%
+- [ ] Meeting creation p95 latency < 500ms
+- [ ] No `code_collision` errors in `gc_meeting_creation_failures_total{error_type="code_collision"}`
+- [ ] No unexpected `forbidden` errors in `gc_meeting_creation_failures_total{error_type="forbidden"}`
+
+**2-hour check:**
+
+- [ ] No `GCMeetingCreationStopped` alert firing
+- [ ] Meeting creation failure rate trend is stable (not increasing)
+- [ ] No pod restarts since deployment completed
+- [ ] Logs show no repeated error patterns related to meeting creation
+
+**4-hour check:**
+
+- [ ] No limit exhaustion patterns (no spike in `error_type="forbidden"`)
+- [ ] Code collision count = 0 (`gc_meeting_creation_failures_total{error_type="code_collision"}`)
+- [ ] Meeting creation latency trend is stable
+- [ ] Database query latency for meeting operations is within baseline
+
+**24-hour check:**
+
+- [ ] All meeting creation alerts clear (no `GCMeetingCreationStopped`, `GCMeetingCreationFailureRate`, `GCMeetingCreationLatencyHigh`)
+- [ ] Daily meeting creation volume matches pre-deployment baseline expectations
+- [ ] No anomalous patterns in error type distribution
+- [ ] Remove any temporary monitoring overrides or escalation holds
+
+**Rollback criteria** (trigger immediate rollback if any):
+- Meeting creation error rate > 5% for 10 minutes
+- Meeting creation p95 latency > 500ms for 5 minutes (aligned with `GCMeetingCreationLatencyHigh` alert threshold)
+- Pod restart rate > 1/hour
+- Any `code_collision` errors (investigate before rollback — may indicate deeper issue)
+
+```bash
+# Rollback command
+kubectl rollout undo deployment/gc-service -n dark-tower
+
+# Note: Created meetings remain as inert rows in the database.
+# No data cleanup is required after rollback.
+```
+
 ### Logs Analysis
 
 **Useful log queries:**
@@ -995,6 +1127,6 @@ kubectl logs -n dark-tower -l app=gc-service --since=1h | grep -i "mc_assignment
 
 ---
 
-**Document Version:** 1.0
-**Last Reviewed:** 2026-02-05
-**Next Review:** 2026-03-05
+**Document Version:** 1.1
+**Last Reviewed:** 2026-02-28
+**Next Review:** 2026-03-28

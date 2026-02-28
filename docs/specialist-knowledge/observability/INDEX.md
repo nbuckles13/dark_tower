@@ -33,6 +33,9 @@
 
 ## Runbooks
 - Per-service deployment + incident response -> `docs/runbooks/` (two per service)
+- GC meeting creation limit exhaustion -> `docs/runbooks/gc-incident-response.md#scenario-8-meeting-creation-limit-exhaustion`
+- GC meeting code collision -> `docs/runbooks/gc-incident-response.md#scenario-9-meeting-code-collision`
+- GC post-deploy meeting creation checklist -> `docs/runbooks/gc-deployment.md` (Post-Deploy Monitoring Checklist section)
 
 ## Integration Seams
 - Env-tests observability validation -> `crates/env-tests/tests/30_observability.rs`

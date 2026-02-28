@@ -25,7 +25,9 @@
 - Test harness (HTTP seam) -> `crates/gc-test-utils/src/server_harness.rs`
 - User auth middleware (UserClaims) -> `crates/gc-service/src/middleware/auth.rs:require_user_auth()`
 - Generic token verification -> `crates/gc-service/src/auth/jwt.rs:verify_token()`
+- Meeting creation handler -> `crates/gc-service/src/handlers/meetings.rs:create_meeting()`
 - Meetings repository (CTE limit check) -> `crates/gc-service/src/repositories/meetings.rs`
+- Meeting creation metrics -> `crates/gc-service/src/observability/metrics.rs:record_meeting_creation()`
 
 ## Code Locations: MC Service
 - GC integration tests -> `crates/mc-service/tests/gc_integration.rs`
@@ -37,8 +39,10 @@
 - Cluster bootstrap (K8s seam) -> `crates/env-tests/src/cluster.rs`
 - Canary pod helper -> `crates/env-tests/src/canary.rs`
 - GC client fixture -> `crates/env-tests/src/fixtures/gc_client.rs`
+- Auth client fixture -> `crates/env-tests/src/fixtures/auth_client.rs`
 - Auth flows -> `crates/env-tests/tests/20_auth_flows.rs`
 - Cross-service flows -> `crates/env-tests/tests/21_cross_service_flows.rs`
+- Meeting creation env-tests -> `crates/env-tests/tests/23_meeting_creation.rs`
 
 ## Code Locations: Shared
 - JWT validation -> `crates/common/src/jwt.rs`

@@ -396,7 +396,7 @@ for: 5m
 **Severity**: Warning
 **Condition**: Meeting creation failure rate >5% for >5 minutes
 **Impact**: Some users unable to create meetings
-**Runbook**: [docs/runbooks/gc-incident-response.md#scenario-5](../runbooks/gc-incident-response.md#scenario-5-high-error-rate)
+**Runbook**: [Scenario 8: Limit Exhaustion](../runbooks/gc-incident-response.md#scenario-8-meeting-creation-limit-exhaustion), [Scenario 9: Code Collision](../runbooks/gc-incident-response.md#scenario-9-meeting-code-collision)
 
 **PromQL**:
 ```promql
@@ -412,9 +412,10 @@ sum(rate(gc_meeting_creation_total[5m])) > 0
 
 **Response**:
 1. Check "Meeting Creation Failures by Type" dashboard panel for error breakdown
-2. Investigate top error types (db_error, code_collision, forbidden/limit exhaustion)
-3. Check database health and query latency
-4. Check org concurrent meeting limits if `forbidden` errors dominate
+2. If `forbidden` errors dominate → [Scenario 8: Limit Exhaustion](../runbooks/gc-incident-response.md#scenario-8-meeting-creation-limit-exhaustion)
+3. If `code_collision` errors present → [Scenario 9: Code Collision](../runbooks/gc-incident-response.md#scenario-9-meeting-code-collision) (investigate seriously)
+4. If `db_error` errors dominate → [Scenario 1: Database Connection Failures](../runbooks/gc-incident-response.md#scenario-1-database-connection-failures)
+5. Check database health and query latency
 
 ---
 
