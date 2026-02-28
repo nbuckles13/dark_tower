@@ -10,11 +10,9 @@
 
 ## Code Locations — CI & Guards
 - CI pipeline → `.github/workflows/ci.yml`
-- Fuzz nightly job → `.github/workflows/fuzz-nightly.yml`
 - Guard runner → `scripts/guards/run-guards.sh`
 - Guard common lib → `scripts/guards/common.sh`
 - Application metrics guard → `scripts/guards/simple/validate-application-metrics.sh`
-- Credential leak guards → `scripts/guards/simple/no-hardcoded-secrets.sh`
 
 ## Code Locations — Deployment
 - Skaffold config → `infra/skaffold.yaml`
@@ -40,19 +38,13 @@
 - Service registration → `scripts/register-service.sh`
 - Devloop status check → `scripts/workflow/devloop-status.sh`
 
-## Code Locations — GC Metrics & Observability
-- GC metrics recorder + histogram buckets → `crates/gc-service/src/observability/metrics.rs:init_metrics_recorder()`
-- GC endpoint normalization (cardinality control) → `crates/gc-service/src/observability/metrics.rs:normalize_endpoint()`
+## Code Locations — GC Observability
+- GC metrics recorder → `crates/gc-service/src/observability/metrics.rs:init_metrics_recorder()`
 - GC meeting creation metrics → `crates/gc-service/src/observability/metrics.rs:record_meeting_creation()`
 - GC metrics catalog → `docs/observability/metrics/gc-service.md`
-- GC overview dashboard → `infra/grafana/dashboards/gc-overview.json`
-
-## Code Locations — GC Repositories (DB query metrics)
-- Meeting creation with atomic limit check → `crates/gc-service/src/repositories/meetings.rs:create_meeting_with_limit_check()`
-- Fire-and-forget audit logging → `crates/gc-service/src/repositories/meetings.rs:log_audit_event()`
 
 ## Integration Seams
 - Env-tests (cluster validation) → `crates/env-tests/`
 - Metric catalogs (guard cross-ref) → `docs/observability/metrics/`
-- NetworkPolicy cross-refs (service rename blast radius) → `infra/services/*/network-policy.yaml`
+- NetworkPolicy cross-refs → `infra/services/*/network-policy.yaml`
 - ServiceMonitor (Prometheus scrape) → `infra/services/*/service-monitor.yaml`

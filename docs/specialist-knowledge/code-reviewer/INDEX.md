@@ -41,15 +41,10 @@
 
 ## Guard Scripts
 - Guard runner → `scripts/guards/run-guards.sh`
-- Instrument skip-all → `scripts/guards/simple/instrument-skip-all.sh`
-- Metrics validation → `scripts/guards/simple/validate-application-metrics.sh`
 - Semantic checks → `scripts/guards/semantic/checks.md`
 
 ## Integration Seams
 - Review protocol (fix-or-defer) → `.claude/skills/devloop/review-protocol.md`
-- AC handler-to-service boundary → `crates/ac-service/src/handlers/` calls `crates/ac-service/src/services/`
-- AC service-to-repository boundary → `crates/ac-service/src/services/` calls `crates/ac-service/src/repositories/`
-- GC handler-to-repository boundary → `crates/gc-service/src/handlers/` calls `crates/gc-service/src/repositories/`
-- GC middleware-to-auth boundary → `crates/gc-service/src/middleware/auth.rs` calls `crates/gc-service/src/auth/jwt.rs`
+- Handler-to-repository boundaries → `crates/{ac,gc}-service/src/handlers/`
 - Common crate shared by all services → `crates/common/src/`
 - ADR lookup → `docs/decisions/`

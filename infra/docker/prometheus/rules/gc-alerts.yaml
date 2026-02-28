@@ -115,6 +115,22 @@ groups:
           impact: "SLO at risk. Urgent investigation required."
           runbook_url: "https://github.com/yourorg/dark_tower/blob/main/docs/runbooks/gc-incident-response.md#scenario-5-high-error-rate"
 
+      - alert: GCMeetingCreationStopped
+        expr: |
+          sum(rate(gc_meeting_creation_total[15m])) == 0
+          and
+          sum(rate(gc_meeting_creation_total[15m] offset 1h)) > 0
+        for: 15m
+        labels:
+          severity: critical
+          service: gc-service
+          component: meeting-creation
+        annotations:
+          summary: "Meeting creation traffic has stopped"
+          description: "No meeting creation requests in the last 15 minutes, but there was traffic in the prior hour. This may indicate a service issue or routing problem. Note: expected detection delay is ~30 minutes (15m rate window + 15m for clause)."
+          impact: "Users cannot create meetings. Investigate GC health, routing, and upstream dependencies."
+          runbook_url: "https://github.com/yourorg/dark_tower/blob/main/docs/runbooks/gc-incident-response.md#scenario-4-complete-service-outage"
+
   - name: gc-service-warning
     interval: 60s
     rules:
@@ -237,3 +253,39 @@ groups:
           description: "Pod {{ $labels.pod }} has restarted {{ $value }} times per hour. This may indicate crashes, OOM kills, or liveness probe failures."
           impact: "Service instability. Investigate logs for crash causes."
           runbook_url: "https://github.com/yourorg/dark_tower/blob/main/docs/runbooks/gc-incident-response.md#scenario-4-complete-service-outage"
+
+      - alert: GCMeetingCreationFailureRate
+        expr: |
+          (
+            sum(rate(gc_meeting_creation_total{status="error"}[5m]))
+            /
+            sum(rate(gc_meeting_creation_total[5m]))
+          ) > 0.05
+          and
+          sum(rate(gc_meeting_creation_total[5m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+          service: gc-service
+          component: meeting-creation
+        annotations:
+          summary: "Meeting creation failure rate high ({{ $value | humanizePercentage }})"
+          description: "Meeting creation failure rate is {{ $value | humanizePercentage }} for 5 minutes. This may indicate database issues, org limit exhaustion, or code collision problems."
+          impact: "Some users unable to create meetings. Investigate error types in dashboard."
+          runbook_url: "https://github.com/yourorg/dark_tower/blob/main/docs/runbooks/gc-incident-response.md#scenario-5-high-error-rate"
+
+      - alert: GCMeetingCreationLatencyHigh
+        expr: |
+          histogram_quantile(0.95,
+            sum by(le) (rate(gc_meeting_creation_duration_seconds_bucket[5m]))
+          ) > 0.500
+        for: 5m
+        labels:
+          severity: warning
+          service: gc-service
+          component: meeting-creation
+        annotations:
+          summary: "Meeting creation p95 latency high ({{ $value }}s > 500ms)"
+          description: "Meeting creation p95 latency is {{ $value }}s, exceeding 500ms threshold for 5 minutes. This may indicate slow database queries or code generation issues. Note: 500ms threshold is higher than the 200ms aggregate HTTP SLO because meeting creation involves DB writes, CSPRNG code generation, and atomic limit-check CTE. The aggregate GCHighLatency alert covers SLO violations."
+          impact: "Slow meeting creation experience. Investigate database and handler performance."
+          runbook_url: "https://github.com/yourorg/dark_tower/blob/main/docs/runbooks/gc-incident-response.md#scenario-2-high-latency--slow-responses"
