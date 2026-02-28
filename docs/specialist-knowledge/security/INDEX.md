@@ -14,18 +14,14 @@
 - JWT signing/verification → `crates/ac-service/src/crypto/mod.rs:sign_jwt()`, `verify_jwt()`
 - Key encryption at rest → `crates/ac-service/src/crypto/mod.rs:encrypt_private_key()`
 - Bcrypt hash/verify → `crates/ac-service/src/crypto/mod.rs:hash_client_secret()`, `verify_client_secret()`
-- Token issuance (service) → `crates/ac-service/src/services/token_service.rs:issue_service_token()`
-- Token issuance (user) → `crates/ac-service/src/services/token_service.rs:issue_user_token()`
+- Token issuance → `crates/ac-service/src/services/token_service.rs:issue_service_token()`, `issue_user_token()`
 - Security config bounds → `crates/ac-service/src/config.rs`
 - JWT size constant → `crates/common/src/jwt.rs:MAX_JWT_SIZE_BYTES`
 - Shared claims types → `crates/common/src/jwt.rs:ServiceClaims`, `UserClaims` (PII-redacted Debug)
 - Token manager (secure constructor) → `crates/common/src/token_manager.rs:new_secure()`
-- GC JWT validation (service tokens) → `crates/gc-service/src/auth/jwt.rs:validate()`
-- GC JWT validation (user tokens) → `crates/gc-service/src/auth/jwt.rs:validate_user()`
-- GC generic token verification → `crates/gc-service/src/auth/jwt.rs:verify_token()`
+- GC JWT validation → `crates/gc-service/src/auth/jwt.rs:validate()`, `validate_user()`, `verify_token()`
 - GC JWKS fetching → `crates/gc-service/src/auth/jwks.rs`
-- GC service auth middleware → `crates/gc-service/src/middleware/auth.rs:require_auth()`
-- GC user auth middleware → `crates/gc-service/src/middleware/auth.rs:require_user_auth()`
+- GC auth middleware → `crates/gc-service/src/middleware/auth.rs:require_auth()`, `require_user_auth()`
 - GC CSPRNG generators → `crates/gc-service/src/handlers/meetings.rs:generate_meeting_code()`, `generate_join_token_secret()`
 - GC role enforcement constants → `crates/gc-service/src/handlers/meetings.rs:MEETING_CREATE_ROLES`
 - GC atomic org limit CTE → `crates/gc-service/src/repositories/meetings.rs:create_meeting_with_limit_check()`
@@ -40,6 +36,11 @@
 - GC-to-MC NetworkPolicy egress (TCP 50052) → `infra/services/gc-service/network-policy.yaml`
 - GC user-auth route layer → `crates/gc-service/src/routes/mod.rs:build_routes()` (user_auth_routes)
 - Credential leak guards → `scripts/guards/simple/no-secrets-in-logs.sh`, `instrument-skip-all.sh`
+
+## Runbooks (Security-Relevant Scenarios)
+- Resource exhaustion (org limit abuse) → `docs/runbooks/gc-incident-response.md#scenario-8-meeting-creation-limit-exhaustion`
+- CSPRNG failure (code collision) → `docs/runbooks/gc-incident-response.md#scenario-9-meeting-code-collision`
+- Post-deploy join_token_secret leak check → `docs/runbooks/gc-deployment.md` (Test 6)
 
 ## Cross-Cutting Gotchas
 - Dummy bcrypt hash must match production cost factor → `crates/ac-service/src/services/token_service.rs`

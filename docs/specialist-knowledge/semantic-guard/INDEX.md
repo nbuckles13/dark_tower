@@ -34,3 +34,7 @@
 - Meeting create models → `crates/gc-service/src/models/mod.rs:CreateMeetingRequest`
 - Route wiring (user auth layer) → `crates/gc-service/src/routes/mod.rs:build_routes()`
 - Meeting creation metrics → `crates/gc-service/src/observability/metrics.rs:record_meeting_creation()`
+- Meeting creation alert rules → `infra/docker/prometheus/rules/gc-alerts.yaml`
+- Incident response: limit exhaustion → `docs/runbooks/gc-incident-response.md` (Scenario 8)
+- Incident response: code collision → `docs/runbooks/gc-incident-response.md` (Scenario 9)
+- Deployment smoke test & monitoring checklist → `docs/runbooks/gc-deployment.md` (Test 6, Post-Deploy Monitoring)

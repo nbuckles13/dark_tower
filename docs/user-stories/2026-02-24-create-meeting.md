@@ -232,12 +232,12 @@ Notes for GC implementer:
 
 | # | Task | Devloop Output | PR | Status |
 |---|------|---------------|-----|--------|
-| 0 | Move UserClaims to common::jwt + GC default scopes fix | | | Pending |
-| 1 | Fix GC NetworkPolicy MC egress + enable ServiceMonitor | | | Pending |
-| 2 | Implement POST /api/v1/meetings endpoint + repository + middleware + metrics code + tests | | | Pending |
-| 3 | Add meeting creation alert rules, dashboard panels, and metrics catalog | | | Pending |
-| 4 | Add create-meeting env-test scenarios and GcClient fixture | | | Pending |
-| 5 | Add meeting creation runbook scenarios and post-deploy checklist | | | Pending |
+| 0 | Move UserClaims to common::jwt + GC default scopes fix | `docs/devloop-outputs/2026-02-25-userclaims-common-jwt/` | | Done |
+| 1 | Fix GC NetworkPolicy MC egress + enable ServiceMonitor | `docs/devloop-outputs/2026-02-25-gc-networkpolicy-servicemonitor/` | | Done |
+| 2 | Implement POST /api/v1/meetings endpoint + repository + middleware + metrics code + tests | `docs/devloop-outputs/2026-02-27-create-meeting-endpoint/` | | Done |
+| 3 | Add meeting creation alert rules, dashboard panels, and metrics catalog | `docs/devloop-outputs/2026-02-28-meeting-creation-alerts/` | | Done |
+| 4 | Add create-meeting env-test scenarios and GcClient fixture | `docs/devloop-outputs/2026-02-28-create-meeting-env-tests/` | | Done |
+| 5 | Add meeting creation runbook scenarios and post-deploy checklist | `docs/devloop-outputs/2026-02-28-meeting-creation-runbooks/` | | Done |
 
 ---
 

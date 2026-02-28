@@ -272,7 +272,7 @@ groups:
           summary: "Meeting creation failure rate high ({{ $value | humanizePercentage }})"
           description: "Meeting creation failure rate is {{ $value | humanizePercentage }} for 5 minutes. This may indicate database issues, org limit exhaustion, or code collision problems."
           impact: "Some users unable to create meetings. Investigate error types in dashboard."
-          runbook_url: "https://github.com/yourorg/dark_tower/blob/main/docs/runbooks/gc-incident-response.md#scenario-5-high-error-rate"
+          runbook_url: "https://github.com/yourorg/dark_tower/blob/main/docs/runbooks/gc-incident-response.md#scenario-8-meeting-creation-limit-exhaustion"
 
       - alert: GCMeetingCreationLatencyHigh
         expr: |

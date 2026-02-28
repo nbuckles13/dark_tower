@@ -11,12 +11,10 @@
 ## Code Locations — CI & Guards
 - CI pipeline → `.github/workflows/ci.yml`
 - Guard runner → `scripts/guards/run-guards.sh`
-- Guard common lib → `scripts/guards/common.sh`
 - Application metrics guard → `scripts/guards/simple/validate-application-metrics.sh`
 
 ## Code Locations — Deployment
 - Skaffold config → `infra/skaffold.yaml`
-- Docker compose (test) → `docker-compose.test.yml`
 - Kind cluster config → `infra/kind/kind-config.yaml`
 - Kind setup/iterate/teardown → `infra/kind/scripts/`
 - Containerized devloop → `infra/devloop/devloop.sh`
@@ -29,14 +27,16 @@
 - Prometheus scrape config (docker) → `infra/docker/prometheus/prometheus.yml`
 - Alert rules → `infra/docker/prometheus/rules/`
 - Grafana dashboards → `infra/grafana/dashboards/`
-- Grafana provisioning → `infra/grafana/provisioning/`
 - Database migrations → `migrations/`
 
 ## Code Locations — Operational Scripts
 - Dev cert generation → `scripts/generate-dev-certs.sh`
 - Master key generation → `scripts/generate-master-key.sh`
 - Service registration → `scripts/register-service.sh`
-- Devloop status check → `scripts/workflow/devloop-status.sh`
+
+## Runbooks
+- GC incident response (Scenarios 1-9) → `docs/runbooks/gc-incident-response.md`
+- GC deployment, rollback, smoke tests → `docs/runbooks/gc-deployment.md`
 
 ## Code Locations — GC Observability
 - GC metrics recorder → `crates/gc-service/src/observability/metrics.rs:init_metrics_recorder()`

@@ -41,3 +41,4 @@
 - GC repositories (shared row mappers) -> `crates/gc-service/src/repositories/`
 - GC dual auth middleware (service + user) -> `crates/gc-service/src/middleware/auth.rs`
 - NetworkPolicy egress/ingress pairs (GC<->MC on 50052, GC<->AC on 8082, MC->AC on 8082) -> `infra/services/*/network-policy.yaml`
+- Metric names in runbooks must match code -> `crates/gc-service/src/observability/metrics.rs`, `docs/runbooks/gc-incident-response.md`, `docs/runbooks/gc-deployment.md`
