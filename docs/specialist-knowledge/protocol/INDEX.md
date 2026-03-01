@@ -12,8 +12,7 @@
 - Proto codegen build script → `crates/proto-gen/build.rs`
 - Proto codegen crate config → `crates/proto-gen/Cargo.toml`
 - Proto re-exports and module wiring → `crates/proto-gen/src/lib.rs`
-- Generated signaling code → `crates/proto-gen/src/generated/dark_tower.signaling.rs`
-- Generated internal code → `crates/proto-gen/src/generated/dark_tower.internal.rs`
+- Generated code (build script) → `crates/proto-gen/build.rs`
 - Media protocol crate root → `crates/media-protocol/src/lib.rs`
 - Binary frame definitions → `crates/media-protocol/src/frame.rs`
 - Codec encode/decode → `crates/media-protocol/src/codec.rs`

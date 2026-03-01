@@ -598,6 +598,21 @@ ON CONFLICT (client_id) DO UPDATE SET
     else
         log_error "Failed to seed test credentials."
     fi
+
+    # Seed test organization for env-tests (required by user registration flow)
+    # TODO: Replace with AC org provisioning API (see .claude/TODO.md)
+    log_step "Seeding test organization..."
+    kubectl exec -n dark-tower postgres-0 -- psql -U darktower -d dark_tower -c "
+INSERT INTO organizations (subdomain, display_name, plan_tier)
+VALUES ('devtest', 'Development Test Organization', 'enterprise')
+ON CONFLICT (subdomain) DO NOTHING;
+"
+
+    if [ $? -eq 0 ]; then
+        log_info "Test organization seeded successfully."
+    else
+        log_error "Failed to seed test organization."
+    fi
 }
 
 # Create AC service secrets

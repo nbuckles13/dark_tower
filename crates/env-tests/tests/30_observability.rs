@@ -311,14 +311,15 @@ async fn test_all_services_have_logs_in_loki() {
     );
 
     // For each running service, verify Loki has at least one log entry.
-    // Uses start=0 (epoch) so we match any logs ever ingested, not just recent ones.
-    // This avoids flakiness from services that only produce startup logs.
+    // Uses a 29-day window to catch any logs from the cluster's lifetime while
+    // staying within Loki's max_query_length limit (30d1h).
     // limit=1 keeps the query cheap regardless of the wide time window.
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("System clock before UNIX epoch");
     let end_ns = now.as_nanos();
-    let start_ns: u128 = 0;
+    let twenty_nine_days_ns: u128 = 29 * 24 * 3600 * 1_000_000_000;
+    let start_ns = end_ns.saturating_sub(twenty_nine_days_ns);
 
     for app in &running_services {
         let query = format!("{{app=\"{}\"}}", app);
