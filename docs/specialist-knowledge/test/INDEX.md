@@ -23,11 +23,6 @@
 - Meeting creation tests -> `crates/gc-service/tests/meeting_create_tests.rs`
 - Meeting assignment tests -> `crates/gc-service/tests/meeting_assignment_tests.rs`
 - Test harness (HTTP seam) -> `crates/gc-test-utils/src/server_harness.rs`
-- User auth middleware (UserClaims) -> `crates/gc-service/src/middleware/auth.rs:require_user_auth()`
-- Generic token verification -> `crates/gc-service/src/auth/jwt.rs:verify_token()`
-- Meeting creation handler -> `crates/gc-service/src/handlers/meetings.rs:create_meeting()`
-- Meetings repository (CTE limit check) -> `crates/gc-service/src/repositories/meetings.rs`
-- Meeting creation metrics -> `crates/gc-service/src/observability/metrics.rs:record_meeting_creation()`
 
 ## Code Locations: MC Service
 - GC integration tests -> `crates/mc-service/tests/gc_integration.rs`
