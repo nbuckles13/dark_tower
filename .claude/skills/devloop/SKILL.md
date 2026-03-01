@@ -17,7 +17,7 @@ Use `/devloop` for:
 
 For design decisions needing consensus first, use `/debate` to create an ADR, then use this for implementation.
 
-**All specialist implementation work MUST go through `/devloop`**. Never manually spawn a specialist via the Task tool — use `/devloop` (full) or `/devloop --light` to ensure consistent identity and knowledge loading.
+**All specialist implementation work MUST go through `/devloop`**. Never manually spawn a specialist via the Task tool — use `/devloop` (full) or `/devloop --light` to ensure consistent identity and navigation context.
 
 ## Arguments
 
@@ -181,6 +181,10 @@ For security-critical implementations, the implementer should maintain a "Securi
 
 **IMPORTANT**: All teammates are spawned using the `subagent_type` parameter in the Task tool, which auto-loads their identity from `.claude/agents/{name}.md`. Do NOT manually read or inject specialist identity files — the agent system handles this.
 
+**INDEX injection**: Before spawning each teammate, read `docs/specialist-knowledge/{name}/INDEX.md` and include its contents in the teammate's prompt under a `## Navigation` header. This gives each specialist a navigation map to relevant code and ADRs.
+
+**Rule 4**: Give the implementer the big-picture task. Let them decide how to break it down — don't micro-manage subtask decomposition.
+
 **Naming convention**: Use the `name` parameter in the Task tool to set each teammate's SendMessage recipient name. These names MUST match the `@` references used in teammate prompts:
 
 | Role | `name` | `subagent_type` |
@@ -200,9 +204,9 @@ The Lead (orchestrator) is automatically named `team-lead` in the team config.
 ```
 You are implementing a feature for Dark Tower.
 
-## Step 0: Load Knowledge (MANDATORY)
+## Navigation
 
-**Before doing ANY other work**, read ALL `.md` files from `docs/specialist-knowledge/{your-specialist-name}/` to load your accumulated knowledge. This includes patterns, gotchas, integration notes, and any domain-specific files. Do NOT skip this step.
+{contents of docs/specialist-knowledge/{specialist-name}/INDEX.md}
 
 ## Your Task
 
@@ -234,9 +238,9 @@ All teammate communication MUST use the SendMessage tool. Plain text output is n
 ```
 You are a reviewer in a Dark Tower devloop.
 
-## Step 0: Load Knowledge (MANDATORY)
+## Navigation
 
-**Before doing ANY other work**, read ALL `.md` files from `docs/specialist-knowledge/{your-specialist-name}/` to load your accumulated knowledge. This includes patterns, gotchas, integration notes, and any domain-specific files. Do NOT skip this step.
+{contents of docs/specialist-knowledge/{reviewer-name}/INDEX.md}
 
 ## Review Protocol
 
@@ -402,33 +406,35 @@ Track verdicts in main.md:
 **If all CLEAR or RESOLVED**:
 - Update main.md: Phase = reflection (full) or complete (light)
 - Document accepted deferrals as tech debt in main.md (with implementer's justification)
-- Full mode: Message team: "All approved. Please capture reflections."
+- Full mode: proceed to reflection (Step 8)
 - Light mode: Skip to Step 9.
 
 ### Step 8: Reflection [FULL MODE ONLY]
 
-Allow 15 minutes for teammates to document learnings.
+Broadcast the reflection instructions to all teammates:
 
-Each teammate updates their knowledge directory at `docs/specialist-knowledge/{name}/`. Teammates can create or update any `.md` files in their directory - common files include `patterns.md`, `gotchas.md`, and `integration.md`, but specialists may also maintain domain-specific files (e.g., `approved-crypto.md`, `coverage-targets.md`, `common-patterns.md`).
+```
+Reflection: update your INDEX.md at `docs/specialist-knowledge/{your-name}/INDEX.md`.
 
-**When to add an entry — ALL criteria must be met:**
-1. **Surprising or corrective**: You were wrong, something failed unexpectedly, or an existing entry needs correcting. Do NOT document things that worked as expected.
-2. **Project-specific**: The insight is specific to this codebase, its patterns, or its tooling. General Rust/tokio/SQL knowledge belongs in official docs, not here.
-3. **In your lane**: The insight falls squarely within your specialist domain. Testing patterns → test specialist only. Credential handling → security only. If another specialist would naturally own the insight, leave it to them.
+INDEX.md is a navigation map — pointers to code and ADRs ONLY.
 
-**When to update an existing entry:**
-- The entry is incomplete, incorrect, or misleading based on what you learned this loop. Add an "Updated: YYYY-MM-DD" line. Do NOT add a new entry that restates an existing one with a different example.
+Format: "Topic → `path/to/file.rs:function_name()`" or "Topic → ADR-NNNN"
 
-**When to remove an entry:**
-- The code it references has been deleted or substantially rewritten
-- It describes a workaround for a problem that has since been properly fixed
-- It contradicts current project patterns or ADRs
-- It documents general knowledge that is not project-specific (clean up past bloat)
+- Add pointers for new code locations, new ADRs, new integration seams
+- Update pointers for moved/renamed code
+- Remove pointers for deleted code
 
-**Do NOT write:**
-- Patterns the implementer used successfully (expected behavior is not a learning)
-- The same insight framed from your perspective that another specialist would also write
-- New examples for existing entries that are already correct
+DO NOT add implementation facts, gotchas, patterns, design decisions,
+review checklists, task status, or date-stamped sections. If something
+feels important but isn't a pointer, put it as a code comment, an ADR,
+or a TODO.md entry instead.
+
+DRY reviewer: duplication findings go in `.claude/TODO.md`, not INDEX.
+
+Organize by architectural concept (not by feature or date). Max 50 lines.
+```
+
+Allow 15 minutes for updates.
 
 ### Step 9: Complete
 
@@ -507,9 +513,9 @@ Spawn with `name: "implementer"`, `subagent_type: "{original-specialist}"`:
 ```
 You are continuing work on a previous devloop implementation.
 
-## Step 0: Load Knowledge (MANDATORY)
+## Navigation
 
-**Before doing ANY other work**, read ALL `.md` files from `docs/specialist-knowledge/{your-specialist-name}/` to load your accumulated knowledge. This includes patterns, gotchas, integration notes, and any domain-specific files. Do NOT skip this step.
+{contents of docs/specialist-knowledge/{specialist-name}/INDEX.md}
 
 ## Original Task
 
@@ -566,4 +572,4 @@ If a session is interrupted, restart the devloop from the beginning. The main.md
 - **Specialist definitions**: `.claude/agents/{name}.md` (auto-loaded via `subagent_type`)
 - **Review protocol**: `.claude/skills/devloop/review-protocol.md`
 - **Output**: `docs/devloop-outputs/YYYY-MM-DD-{slug}/main.md`
-- **Knowledge updates**: `docs/specialist-knowledge/{name}/*.md`
+- **Navigation**: `docs/specialist-knowledge/{name}/INDEX.md`

@@ -201,6 +201,30 @@ for: 1h
 
 ---
 
+#### GCMeetingCreationStopped
+
+**Severity**: Critical
+**Condition**: Zero meeting creation traffic for >15 minutes, with traffic in the prior hour
+**Detection Delay**: ~30 minutes (15m rate window + 15m `for` clause)
+**Impact**: Users cannot create meetings, possible service outage
+**Runbook**: [docs/runbooks/gc-incident-response.md#scenario-4](../runbooks/gc-incident-response.md#scenario-4-complete-service-outage)
+
+**PromQL**:
+```promql
+sum(rate(gc_meeting_creation_total[15m])) == 0
+and
+sum(rate(gc_meeting_creation_total[15m] offset 1h)) > 0
+```
+`for: 15m`
+
+**Response**:
+1. Check GC pod health and logs
+2. Verify routing to `/api/v1/meetings` endpoint
+3. Check upstream dependencies (database, auth)
+4. Check for recent deployments or config changes
+
+---
+
 ### Warning Alerts
 
 #### GCHighMemory
@@ -364,6 +388,58 @@ for: 5m
 2. Check for OOM kills (memory limits)
 3. Check liveness probe configuration
 4. Investigate panic/crash causes in code
+
+---
+
+#### GCMeetingCreationFailureRate
+
+**Severity**: Warning
+**Condition**: Meeting creation failure rate >5% for >5 minutes
+**Impact**: Some users unable to create meetings
+**Runbook**: [Scenario 8: Limit Exhaustion](../runbooks/gc-incident-response.md#scenario-8-meeting-creation-limit-exhaustion), [Scenario 9: Code Collision](../runbooks/gc-incident-response.md#scenario-9-meeting-code-collision)
+
+**PromQL**:
+```promql
+(
+  sum(rate(gc_meeting_creation_total{status="error"}[5m]))
+  /
+  sum(rate(gc_meeting_creation_total[5m]))
+) > 0.05
+and
+sum(rate(gc_meeting_creation_total[5m])) > 0
+```
+`for: 5m`
+
+**Response**:
+1. Check "Meeting Creation Failures by Type" dashboard panel for error breakdown
+2. If `forbidden` errors dominate → [Scenario 8: Limit Exhaustion](../runbooks/gc-incident-response.md#scenario-8-meeting-creation-limit-exhaustion)
+3. If `code_collision` errors present → [Scenario 9: Code Collision](../runbooks/gc-incident-response.md#scenario-9-meeting-code-collision) (investigate seriously)
+4. If `db_error` errors dominate → [Scenario 1: Database Connection Failures](../runbooks/gc-incident-response.md#scenario-1-database-connection-failures)
+5. Check database health and query latency
+
+---
+
+#### GCMeetingCreationLatencyHigh
+
+**Severity**: Warning
+**Condition**: Meeting creation p95 latency >500ms for >5 minutes
+**Threshold Rationale**: 500ms is higher than the 200ms aggregate HTTP SLO because meeting creation involves DB writes, CSPRNG code generation, and atomic limit-check CTE. The aggregate `GCHighLatency` alert covers SLO violations at 200ms.
+**Impact**: Slow meeting creation experience
+**Runbook**: [docs/runbooks/gc-incident-response.md#scenario-2](../runbooks/gc-incident-response.md#scenario-2-high-latency--slow-responses)
+
+**PromQL**:
+```promql
+histogram_quantile(0.95,
+  sum by(le) (rate(gc_meeting_creation_duration_seconds_bucket[5m]))
+) > 0.500
+```
+`for: 5m`
+
+**Response**:
+1. Check "Meeting Creation Latency" dashboard panel for latency trend
+2. Check database query latency (create_meeting operation)
+3. Investigate code generation performance (collision retries)
+4. Check resource utilization (CPU, memory)
 
 ---
 
@@ -584,8 +660,8 @@ Before deploying alerts, test:
 
 | Alert Group | Owner | Reviewer | Last Updated |
 |-------------|-------|----------|--------------|
-| GC Critical | Observability | GC Team + Operations | 2026-02-05 |
-| GC Warning | Observability | GC Team | 2026-02-05 |
+| GC Critical | Observability | GC Team + Operations | 2026-02-28 |
+| GC Warning | Observability | GC Team | 2026-02-28 |
 | AC Critical | Observability | AC Team + Operations | TBD |
 | MC Critical | Observability | MC Team + Operations | TBD |
 | MH Critical | Observability | MH Team + Operations | TBD |
@@ -594,7 +670,7 @@ Before deploying alerts, test:
 
 ---
 
-**Last Updated**: 2026-02-05
+**Last Updated**: 2026-02-28
 **Maintained By**: Observability Specialist + Operations Team
 **Related Documents**:
 - [ADR-0011: Observability Framework](../decisions/adr-0011-observability-framework.md)

@@ -3,7 +3,7 @@
 **Service**: Global Controller (gc-service)
 **Owner**: SRE Team
 **On-Call Rotation**: PagerDuty - Dark Tower GC Team
-**Last Updated**: 2026-02-05
+**Last Updated**: 2026-02-28
 
 ---
 
@@ -19,6 +19,8 @@
    - [Scenario 5: High Error Rate](#scenario-5-high-error-rate)
    - [Scenario 6: Resource Pressure](#scenario-6-resource-pressure)
    - [Scenario 7: Token Refresh Failures](#scenario-7-token-refresh-failures)
+   - [Scenario 8: Meeting Creation Limit Exhaustion](#scenario-8-meeting-creation-limit-exhaustion)
+   - [Scenario 9: Meeting Code Collision](#scenario-9-meeting-code-collision)
 4. [Diagnostic Commands](#diagnostic-commands)
 5. [Recovery Procedures](#recovery-procedures)
 6. [Postmortem Template](#postmortem-template)
@@ -848,6 +850,230 @@ curl http://localhost:8080/metrics | grep 'gc_token_refresh_total{status="succes
 
 ---
 
+### Scenario 8: Meeting Creation Limit Exhaustion
+
+**Alert**: `GCMeetingCreationFailureRate`
+**Severity**: Warning
+**Runbook Section**: `#scenario-8-meeting-creation-limit-exhaustion`
+
+**Symptoms**:
+- 403 Forbidden responses on `POST /api/v1/meetings`
+- Users unable to create new meetings despite valid authentication
+- Metrics: `gc_meeting_creation_failures_total{error_type="forbidden"}` spiking
+- Logs: `meeting creation forbidden: org concurrent meeting limit reached`
+
+**Diagnosis**:
+
+```bash
+# 1. Check meeting creation failure metrics
+kubectl port-forward -n dark-tower deployment/gc-service 8080:8080 &
+curl http://localhost:8080/metrics | grep gc_meeting_creation
+kill %1
+
+# 2. Check failure rate by error type in Prometheus
+sum by(error_type) (rate(gc_meeting_creation_failures_total[5m]))
+
+# 3. Identify the affected organization(s)
+kubectl logs -n dark-tower -l app=gc-service --tail=200 | grep "meeting creation forbidden"
+
+# 4. Check active and scheduled meeting counts for the org
+kubectl exec -it deployment/gc-service -n dark-tower -- psql $DATABASE_URL -c \
+  "SELECT org_id, COUNT(*) AS active_meetings
+   FROM meetings
+   WHERE status IN ('scheduled', 'active')
+   GROUP BY org_id
+   ORDER BY active_meetings DESC
+   LIMIT 20;"
+
+# 5. Check the org's concurrent meeting limit
+kubectl exec -it deployment/gc-service -n dark-tower -- psql $DATABASE_URL -c \
+  "SELECT org_id, display_name, max_concurrent_meetings
+   FROM organizations
+   WHERE org_id = '<ORG_ID>';"
+
+# 6. Check for orphaned meetings stuck in 'scheduled' status
+kubectl exec -it deployment/gc-service -n dark-tower -- psql $DATABASE_URL -c \
+  "SELECT meeting_id, meeting_code, status, created_at, scheduled_start_time
+   FROM meetings
+   WHERE org_id = '<ORG_ID>'
+     AND status = 'scheduled'
+     AND created_at < NOW() - INTERVAL '24 hours'
+   ORDER BY created_at ASC;"
+```
+
+**Common Root Causes**:
+
+1. **Org Hitting Concurrent Meeting Limit**: Count of scheduled + active meetings >= max_concurrent_meetings
+   - Check: Active meeting count vs org limit (queries above)
+   - Fix: Clean up completed/orphaned meetings or raise org limit
+
+2. **Orphaned Meetings Stuck in 'scheduled' Status**: Meetings created but never started or cancelled, remaining in 'scheduled' status indefinitely
+   - Check: Query for old 'scheduled' meetings (>24h old)
+   - Fix: Transition orphaned meetings to 'cancelled' status
+
+3. **Org Limit Misconfigured**: max_concurrent_meetings set too low for org usage
+   - Check: Compare org limit to typical concurrent meeting volume
+   - Fix: Adjust org limit after business approval
+
+4. **Intentional Resource Exhaustion**: A user or automated process repeatedly creating and abandoning meetings to consume the org's concurrent meeting slots, blocking legitimate users from creating meetings
+   - Check: Look for a single user creating many 'scheduled' meetings that are never started — query `created_by_user_id` on recent orphaned meetings
+   - Fix: Identify the offending user, clean up orphaned meetings, consider per-user meeting creation rate limits; escalate to Security Team if abuse is confirmed
+
+**Remediation**:
+
+```bash
+# Option 1: Clean up orphaned meetings for the affected org
+kubectl exec -it deployment/gc-service -n dark-tower -- psql $DATABASE_URL -c \
+  "UPDATE meetings
+   SET status = 'cancelled', updated_at = NOW()
+   WHERE org_id = '<ORG_ID>'
+     AND status = 'scheduled'
+     AND created_at < NOW() - INTERVAL '24 hours';"
+
+# Verify meetings freed up
+kubectl exec -it deployment/gc-service -n dark-tower -- psql $DATABASE_URL -c \
+  "SELECT COUNT(*) AS active_meetings
+   FROM meetings
+   WHERE org_id = '<ORG_ID>'
+     AND status IN ('scheduled', 'active');"
+
+# Expected: Count should now be below max_concurrent_meetings
+
+# Option 2: Raise org concurrent meeting limit (requires business approval)
+kubectl exec -it deployment/gc-service -n dark-tower -- psql $DATABASE_URL -c \
+  "UPDATE organizations
+   SET max_concurrent_meetings = <NEW_LIMIT>, updated_at = NOW()
+   WHERE org_id = '<ORG_ID>';"
+
+# Expected recovery time: Immediate after limit change or meeting cleanup
+
+# Verify recovery - meeting creation should succeed
+kubectl port-forward -n dark-tower deployment/gc-service 8080:8080 &
+curl http://localhost:8080/metrics | grep 'gc_meeting_creation_failures_total'
+kill %1
+# forbidden error_type rate should drop to 0
+```
+
+**Escalation**:
+- If multiple orgs affected simultaneously, escalate to GC Team for systemic investigation
+- If orphaned meetings are recurring, escalate to GC Team for meeting lifecycle bug investigation
+- If limit changes require business approval, escalate to Product/Business team
+- If intentional resource exhaustion suspected (single user creating many abandoned meetings), escalate to Security Team
+
+---
+
+### Scenario 9: Meeting Code Collision
+
+**Alert**: `GCMeetingCreationFailureRate` (elevated error rate may indicate collisions)
+**Severity**: Warning → Critical if persistent
+**Runbook Section**: `#scenario-9-meeting-code-collision`
+
+> **Important**: Meeting codes use 12 base62 characters with 72-bit CSPRNG entropy and a database unique constraint with 3 retry attempts. Code collisions are extremely unlikely under normal operation. If this scenario occurs, it warrants serious investigation — it may indicate a CSPRNG failure, database corruption, or an extraordinary creation volume anomaly.
+
+**Symptoms**:
+- 500 Internal Server Error responses on `POST /api/v1/meetings` after retry exhaustion
+- Metrics: `gc_meeting_creation_failures_total{error_type="code_collision"}` incrementing
+- Logs: `meeting code collision after 3 retries` or `unique constraint violation on meeting_code`
+- May co-occur with elevated `gc_meeting_creation_duration_seconds` (retries add latency)
+
+**Diagnosis**:
+
+```bash
+# 1. Check code collision metrics
+kubectl port-forward -n dark-tower deployment/gc-service 8080:8080 &
+curl http://localhost:8080/metrics | grep gc_meeting_creation
+kill %1
+
+# 2. Check collision rate in Prometheus
+sum(rate(gc_meeting_creation_failures_total{error_type="code_collision"}[5m]))
+
+# 3. Check logs for collision details
+kubectl logs -n dark-tower -l app=gc-service --tail=500 | grep -i "collision\|unique constraint"
+
+# 4. Check total meeting count (high volume increases collision probability)
+kubectl exec -it deployment/gc-service -n dark-tower -- psql $DATABASE_URL -c \
+  "SELECT COUNT(*) AS total_meetings FROM meetings;"
+
+# 5. Check meeting creation rate (is there an unusual spike?)
+# In Prometheus:
+sum(rate(gc_meeting_creation_total[5m]))
+
+# 6. Verify database unique constraint is intact
+kubectl exec -it deployment/gc-service -n dark-tower -- psql $DATABASE_URL -c \
+  "SELECT indexname, indexdef
+   FROM pg_indexes
+   WHERE tablename = 'meetings' AND indexdef LIKE '%meeting_code%';"
+
+# 7. Check for duplicate meeting codes within an org (should be impossible if constraint is intact)
+kubectl exec -it deployment/gc-service -n dark-tower -- psql $DATABASE_URL -c \
+  "SELECT org_id, meeting_code, COUNT(*) AS cnt
+   FROM meetings
+   GROUP BY org_id, meeting_code
+   HAVING COUNT(*) > 1;"
+```
+
+**Common Root Causes**:
+
+1. **CSPRNG Failure**: `ring::SystemRandom` not producing sufficient entropy
+   - Check: Multiple collisions in rapid succession — statistically near-impossible with healthy CSPRNG
+   - Fix: Restart pods to reinitialize CSPRNG; if persistent, investigate OS entropy source (`/dev/urandom`)
+   - **Security**: Persistent CSPRNG failures should be treated as a potential security incident — a compromised node entropy source could affect all cryptographic operations (JWT signing, token generation, TLS). Escalate to Security Team immediately if collisions persist after pod restart
+
+2. **Extremely High Creation Volume**: Massive spike in meeting creation increasing collision probability
+   - Check: Meeting creation rate and total meeting count
+   - Fix: Scale service horizontally; collisions should resolve as retries succeed
+
+3. **Database Unique Constraint Corruption**: Constraint dropped or not enforced
+   - Check: Verify unique index exists on `meeting_code` column
+   - Fix: Recreate unique constraint (requires database team coordination)
+
+4. **Code Generation Bug**: Code generation producing non-uniform or reduced-entropy output
+   - Check: Review recent code changes to meeting code generation
+   - Fix: Rollback deployment if recent change introduced bug
+
+**Remediation**:
+
+```bash
+# Option 1: Restart pods to reinitialize CSPRNG
+kubectl rollout restart deployment/gc-service -n dark-tower
+kubectl rollout status deployment/gc-service -n dark-tower
+
+# Expected recovery time: 2-3 minutes
+
+# Option 2: Verify and recreate unique constraint (requires Database Team)
+# Check if constraint exists
+kubectl exec -it deployment/gc-service -n dark-tower -- psql $DATABASE_URL -c \
+  "SELECT conname, contype
+   FROM pg_constraint
+   WHERE conrelid = 'meetings'::regclass AND contype = 'u';"
+
+# If missing, recreate (Database Team should execute this)
+kubectl exec -it -n dark-tower postgres-0 -- psql -c \
+  "ALTER TABLE meetings ADD CONSTRAINT meetings_org_code_unique UNIQUE (org_id, meeting_code);"
+
+# Expected recovery time: Immediate after constraint recreation
+
+# Option 3: Rollback if recent deployment introduced code generation bug
+kubectl rollout undo deployment/gc-service -n dark-tower
+kubectl rollout status deployment/gc-service -n dark-tower
+
+# Expected recovery time: 2-3 minutes
+
+# Verify recovery
+kubectl port-forward -n dark-tower deployment/gc-service 8080:8080 &
+curl http://localhost:8080/metrics | grep 'gc_meeting_creation_failures_total'
+kill %1
+# Rate should drop to 0
+```
+
+**Escalation**:
+- **Any** code collision occurrence should be reported to GC Team for investigation — this is not expected under normal operation
+- If CSPRNG failure suspected, escalate to Security Team immediately — persistent entropy failures may indicate a compromised node and affect all cryptographic operations across services on that node
+- If database constraint issues, escalate to Database Team
+- If collisions persist after pod restart, escalate to Engineering Lead and Security Team — may require emergency code length increase and node-level investigation
+
+---
+
 ## Diagnostic Commands
 
 ### Quick Health Check
@@ -1219,7 +1445,7 @@ All times in UTC. Link to relevant Slack threads, PagerDuty incidents, and dashb
 
 **Version History**:
 - 2026-02-05: Initial version (consolidated from gc-high-latency.md, gc-mc-assignment-failures.md, gc-database-issues.md)
-- [Future updates tracked here]
+- 2026-02-28: Added Scenario 8 (Meeting Creation Limit Exhaustion) and Scenario 9 (Meeting Code Collision)
 
 ---
 

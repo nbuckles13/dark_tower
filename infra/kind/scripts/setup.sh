@@ -150,6 +150,24 @@ create_namespaces() {
     log_info "Namespaces created."
 }
 
+# Build a container image, removing the old image if it was replaced.
+# Usage: build_image <tag> <dockerfile> <context-dir>
+build_image() {
+    local TAG="$1" DOCKERFILE="$2" CONTEXT="$3"
+    local CONTAINER_CMD
+    if [[ "${KIND_EXPERIMENTAL_PROVIDER:-}" == "podman" ]]; then
+        CONTAINER_CMD="podman"
+    else
+        CONTAINER_CMD="docker"
+    fi
+    local OLD_IMAGE_ID
+    OLD_IMAGE_ID=$(${CONTAINER_CMD} images -q "$TAG" 2>/dev/null || true)
+    ${CONTAINER_CMD} build -t "$TAG" -f "$DOCKERFILE" "$CONTEXT"
+    if [ -n "$OLD_IMAGE_ID" ] && [ "$OLD_IMAGE_ID" != "$(${CONTAINER_CMD} images -q "$TAG")" ]; then
+        ${CONTAINER_CMD} rmi "$OLD_IMAGE_ID" 2>/dev/null || true
+    fi
+}
+
 # Deploy PostgreSQL
 deploy_postgres() {
     log_step "Deploying PostgreSQL..."
@@ -580,6 +598,21 @@ ON CONFLICT (client_id) DO UPDATE SET
     else
         log_error "Failed to seed test credentials."
     fi
+
+    # Seed test organization for env-tests (required by user registration flow)
+    # TODO: Replace with AC org provisioning API (see .claude/TODO.md)
+    log_step "Seeding test organization..."
+    kubectl exec -n dark-tower postgres-0 -- psql -U darktower -d dark_tower -c "
+INSERT INTO organizations (subdomain, display_name, plan_tier)
+VALUES ('devtest', 'Development Test Organization', 'enterprise')
+ON CONFLICT (subdomain) DO NOTHING;
+"
+
+    if [ $? -eq 0 ]; then
+        log_info "Test organization seeded successfully."
+    else
+        log_error "Failed to seed test organization."
+    fi
 }
 
 # Create AC service secrets
@@ -602,22 +635,7 @@ create_ac_secrets() {
 # Build and deploy AC service
 deploy_ac_service() {
     log_step "Building AC service container image..."
-
-    # Detect container runtime command
-    local CONTAINER_CMD
-    if [[ "${KIND_EXPERIMENTAL_PROVIDER:-}" == "podman" ]]; then
-        CONTAINER_CMD="podman"
-    else
-        CONTAINER_CMD="docker"
-    fi
-
-    # Build from project root
-    pushd "${PROJECT_ROOT}" > /dev/null
-    ${CONTAINER_CMD} build \
-        -t localhost/ac-service:latest \
-        -f infra/docker/ac-service/Dockerfile \
-        .
-    popd > /dev/null
+    build_image localhost/ac-service:latest infra/docker/ac-service/Dockerfile "${PROJECT_ROOT}"
 
     log_step "Loading image into kind cluster..."
     # kind load docker-image has issues with podman, use save/load workaround
@@ -647,22 +665,7 @@ deploy_ac_service() {
 # Build and deploy Global Controller service
 deploy_gc_service() {
     log_step "Building Global Controller container image..."
-
-    # Detect container runtime command
-    local CONTAINER_CMD
-    if [[ "${KIND_EXPERIMENTAL_PROVIDER:-}" == "podman" ]]; then
-        CONTAINER_CMD="podman"
-    else
-        CONTAINER_CMD="docker"
-    fi
-
-    # Build from project root
-    pushd "${PROJECT_ROOT}" > /dev/null
-    ${CONTAINER_CMD} build \
-        -t localhost/gc-service:latest \
-        -f infra/docker/gc-service/Dockerfile \
-        .
-    popd > /dev/null
+    build_image localhost/gc-service:latest infra/docker/gc-service/Dockerfile "${PROJECT_ROOT}"
 
     log_step "Loading image into kind cluster..."
     if [[ "${KIND_EXPERIMENTAL_PROVIDER:-}" == "podman" ]]; then
@@ -691,22 +694,7 @@ deploy_gc_service() {
 # Build and deploy Meeting Controller service
 deploy_mc_service() {
     log_step "Building Meeting Controller container image..."
-
-    # Detect container runtime command
-    local CONTAINER_CMD
-    if [[ "${KIND_EXPERIMENTAL_PROVIDER:-}" == "podman" ]]; then
-        CONTAINER_CMD="podman"
-    else
-        CONTAINER_CMD="docker"
-    fi
-
-    # Build from project root
-    pushd "${PROJECT_ROOT}" > /dev/null
-    ${CONTAINER_CMD} build \
-        -t localhost/mc-service:latest \
-        -f infra/docker/mc-service/Dockerfile \
-        .
-    popd > /dev/null
+    build_image localhost/mc-service:latest infra/docker/mc-service/Dockerfile "${PROJECT_ROOT}"
 
     log_step "Loading image into kind cluster..."
     if [[ "${KIND_EXPERIMENTAL_PROVIDER:-}" == "podman" ]]; then

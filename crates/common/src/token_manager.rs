@@ -1775,11 +1775,11 @@ mod tests {
             "client".to_string(),
             SecretString::from("secret"),
         );
-        let debug_str = format!("{:?}", config_without);
+        let debug_str = format!("{config_without:?}");
         assert!(debug_str.contains("on_refresh: None"));
 
         let config_with = config_without.with_on_refresh(Arc::new(|_| {}));
-        let debug_str = format!("{:?}", config_with);
+        let debug_str = format!("{config_with:?}");
         assert!(debug_str.contains("<callback>"));
     }
 
@@ -1802,7 +1802,7 @@ mod tests {
             duration: Duration::from_millis(42),
             error_category: None,
         };
-        let debug_str = format!("{:?}", event);
+        let debug_str = format!("{event:?}");
         assert!(debug_str.contains("success: true"));
         assert!(debug_str.contains("error_category: None"));
 
@@ -1811,7 +1811,7 @@ mod tests {
             duration: Duration::from_millis(100),
             error_category: Some("http"),
         };
-        let debug_str = format!("{:?}", error_event);
+        let debug_str = format!("{error_event:?}");
         assert!(debug_str.contains("success: false"));
         assert!(debug_str.contains("http"));
     }
