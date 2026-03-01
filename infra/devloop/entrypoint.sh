@@ -37,12 +37,21 @@ if [ -f /tmp/claude-user-settings.json ]; then
 fi
 if [ -f /tmp/claude-user-config.json ]; then
     # Patch installMethod to match how Claude is installed in the container (npm),
-    # and disable auto-updates (pinned version in Dockerfile)
+    # and disable auto-updates (entrypoint handles updates via npm update)
     jq '.installMethod = "npm" | .autoUpdates = false | .autoUpdatesProtectedForNative = false' /tmp/claude-user-config.json > "${HOME}/.claude.json"
 fi
 if [ -f /tmp/claude-credentials.json ]; then
     cp /tmp/claude-credentials.json "${HOME}/.claude/.credentials.json"
 fi
+
+# Activate pre-commit hooks in the clone (git clone --local doesn't copy local config)
+if [ -d /work/.githooks ]; then
+    git -C /work config core.hooksPath /work/.githooks
+fi
+
+# Update Claude Code to latest in the background (non-blocking).
+# The Dockerfile provides a base version; this keeps it current without rebuilds.
+npm update -g @anthropic-ai/claude-code >/dev/null 2>&1 &
 
 echo "=== Container ready. Attach with: podman exec -it <name> claude --dangerously-skip-permissions ==="
 
