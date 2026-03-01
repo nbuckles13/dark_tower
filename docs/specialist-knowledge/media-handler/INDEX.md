@@ -20,7 +20,7 @@
 - MH-to-GC RPC (RegisterMH, SendLoadReport) → `proto/internal.proto`
 - MH assignment messages (MhAssignment, MhRole) → `proto/internal.proto`
 - Client signaling (MediaStream, StreamAssignment, layout) → `proto/signaling.proto`
-- Generated Rust code → `crates/proto-gen/src/generated/dark_tower.internal.rs`
+- Generated Rust code → `crates/proto-gen/build.rs`
 
 ## Integration Seams
 - MH depends on common crate → `crates/common/src/lib.rs`

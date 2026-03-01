@@ -950,7 +950,7 @@ mod tests {
 
     #[test]
     fn test_meeting_create_roles_user() {
-        let roles = vec!["user".to_string()];
+        let roles = ["user".to_string()];
         assert!(roles
             .iter()
             .any(|r| MEETING_CREATE_ROLES.contains(&r.as_str())));
@@ -958,7 +958,7 @@ mod tests {
 
     #[test]
     fn test_meeting_create_roles_admin() {
-        let roles = vec!["admin".to_string()];
+        let roles = ["admin".to_string()];
         assert!(roles
             .iter()
             .any(|r| MEETING_CREATE_ROLES.contains(&r.as_str())));
@@ -966,7 +966,7 @@ mod tests {
 
     #[test]
     fn test_meeting_create_roles_org_admin() {
-        let roles = vec!["org_admin".to_string()];
+        let roles = ["org_admin".to_string()];
         assert!(roles
             .iter()
             .any(|r| MEETING_CREATE_ROLES.contains(&r.as_str())));
@@ -974,7 +974,7 @@ mod tests {
 
     #[test]
     fn test_meeting_create_roles_viewer_rejected() {
-        let roles = vec!["viewer".to_string()];
+        let roles = ["viewer".to_string()];
         assert!(!roles
             .iter()
             .any(|r| MEETING_CREATE_ROLES.contains(&r.as_str())));

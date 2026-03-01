@@ -20,6 +20,8 @@ for index_file in docs/specialist-knowledge/*/INDEX.md; do
         if [[ "$file_path" == docs/* || "$file_path" == crates/* || "$file_path" == proto/* || "$file_path" == scripts/* ]]; then
             if [ ! -e "$file_path" ]; then
                 ERRORS="${ERRORS}STALE POINTER in $index_file: $file_path\n"
+            elif git check-ignore -q "$file_path" 2>/dev/null; then
+                ERRORS="${ERRORS}GITIGNORED POINTER in $index_file: $file_path (won't exist in CI)\n"
             fi
         fi
     done < <(grep -oP '`[^`]+\.(rs|md|proto|toml|sh|sql|yaml|yml|json)[^`]*`' "$index_file")
