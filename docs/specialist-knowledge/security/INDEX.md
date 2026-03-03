@@ -6,9 +6,9 @@
 - Key rotation (signing keys, grace periods) → ADR-0008
 - User auth & meeting access → ADR-0020
 - No-panic policy → ADR-0002
-- Guard methodology → ADR-0015
 - MC session binding & HKDF key hierarchy → ADR-0023 (Section 1)
 - Approved algorithms → ADR-0027
+- Client architecture (E2EE, key management, supply chain) → ADR-0028 (Sections 5, 1)
 
 ## Code Locations
 - JWT signing/verification → `crates/ac-service/src/crypto/mod.rs:sign_jwt()`, `verify_jwt()`

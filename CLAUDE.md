@@ -26,6 +26,7 @@ Architecture: `docs/ARCHITECTURE.md` | Status: `docs/PROJECT_STATUS.md`
 | `protocol` | Protocol Buffers, API contracts, versioning |
 | `infrastructure` | Kubernetes, Terraform, IaC |
 | `code-reviewer` | Code quality, Rust idioms, ADR compliance |
+| `client` | Browser SDK, Svelte web app, media pipeline |
 | `dry-reviewer` | Cross-service duplication detection |
 | `test` | E2E tests, coverage, quality gates (MANDATORY cross-cutting) |
 | `security` | Threat modeling, cryptography (MANDATORY cross-cutting) |
