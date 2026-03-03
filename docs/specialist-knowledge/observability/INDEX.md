@@ -3,6 +3,7 @@
 ## Architecture & Design
 - Observability framework (metrics, tracing, dashboards, alerts, SLOs) -> ADR-0011
 - Validation pipeline (guards including metric guards) -> ADR-0024
+- Client architecture (telemetry, metrics, dashboards, synthetic probe) -> ADR-0028
 
 ## Code Locations
 - AC metrics recording -> `crates/ac-service/src/observability/metrics.rs:init_metrics_recorder()`
