@@ -7,6 +7,7 @@
 - Guard pipeline methodology → ADR-0015
 - Validation pipeline (CI gates) → ADR-0024 (Section: Validation Pipeline)
 - Containerized devloop execution → ADR-0025
+- Client architecture (CI workflow, deployment, canary) → ADR-0028
 
 ## Code Locations — CI & Guards
 - CI pipeline → `.github/workflows/ci.yml`
@@ -37,11 +38,6 @@
 ## Runbooks
 - GC incident response (Scenarios 1-9) → `docs/runbooks/gc-incident-response.md`
 - GC deployment, rollback, smoke tests → `docs/runbooks/gc-deployment.md`
-
-## Code Locations — GC Observability
-- GC metrics recorder → `crates/gc-service/src/observability/metrics.rs:init_metrics_recorder()`
-- GC meeting creation metrics → `crates/gc-service/src/observability/metrics.rs:record_meeting_creation()`
-- GC metrics catalog → `docs/observability/metrics/gc-service.md`
 
 ## Integration Seams
 - Env-tests (cluster validation) → `crates/env-tests/`
