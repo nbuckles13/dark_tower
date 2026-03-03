@@ -8,6 +8,7 @@
 - Environment integration tests -> `docs/decisions/adr-0014-environment-integration-tests.md`
 - Validation pipeline (guards, coverage) -> `docs/decisions/adr-0024-agent-teams-workflow.md`
 - Coverage thresholds -> `.codecov.yml`
+- Client architecture (4-tier testing, test-utils, flaky policy) -> ADR-0028
 
 ## Code Locations: AC Service
 - Integration tests -> `crates/ac-service/tests/integration/`

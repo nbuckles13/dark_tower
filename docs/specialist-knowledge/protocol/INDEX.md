@@ -5,6 +5,7 @@
 - User auth meeting access (protocol implications) → `docs/decisions/adr-0020-user-auth-meeting-access.md`
 - API contracts and component interactions → `docs/API_CONTRACTS.md`
 - WebTransport connection flow and message framing → `docs/WEBTRANSPORT_FLOW.md`
+- Client architecture (frame codec, BigInt/u64, SFrame layering, trace context proto fields) → ADR-0028
 
 ## Code Locations
 - Signaling proto (client-server) → `proto/signaling.proto`

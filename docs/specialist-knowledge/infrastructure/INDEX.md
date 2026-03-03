@@ -4,6 +4,7 @@
 - Infrastructure architecture (networking, zero-trust) -> `docs/decisions/adr-0012-infrastructure-architecture.md`
 - Local dev environment (Kind + Calico) -> `docs/decisions/adr-0013-local-development-environment.md`
 - Containerized devloop execution model -> `docs/decisions/adr-0025-containerized-devloop.md`
+- Client architecture (CDN deployment, Nx build pipeline, synthetic probe sizing) -> ADR-0028
 
 ## Code Locations
 - Service Dockerfiles -> `infra/docker/{ac,gc,mc}-service/Dockerfile`

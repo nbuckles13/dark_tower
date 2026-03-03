@@ -7,6 +7,7 @@
 - Guard pipeline methodology → ADR-0015
 - Validation pipeline (CI gates) → ADR-0024 (Section: Validation Pipeline)
 - Containerized devloop execution → ADR-0025
+- Client architecture (CI workflow, deployment, canary) → ADR-0028
 
 ## Code Locations — CI & Guards
 - CI pipeline → `.github/workflows/ci.yml`
