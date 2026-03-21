@@ -34,8 +34,15 @@
 - Meeting creation metrics → `crates/gc-service/src/observability/metrics.rs:record_meeting_creation()`
 - Route composition (user auth layer) → `crates/gc-service/src/routes/mod.rs:build_routes()`
 
+## Code Locations — GC Service (cont.)
+- Meeting join handler → `crates/gc-service/src/handlers/meetings.rs:join_meeting()`
+- JWKS client (cache + fetch) → `crates/gc-service/src/auth/jwks.rs:JwksClient`
+- GC ParticipantType/MeetingRole enums → `crates/gc-service/src/services/ac_client.rs:ParticipantType`
+
 ## Code Locations — Common
 - Shared JWT claims (ServiceClaims, UserClaims) → `crates/common/src/jwt.rs:ServiceClaims`, `crates/common/src/jwt.rs:UserClaims`
+- Meeting token claims (MeetingTokenClaims, GuestTokenClaims) → `crates/common/src/jwt.rs:MeetingTokenClaims`, `crates/common/src/jwt.rs:GuestTokenClaims`
+- Meeting token enums (ParticipantType, MeetingRole) → `crates/common/src/jwt.rs:ParticipantType`, `crates/common/src/jwt.rs:MeetingRole`
 - SecretString/SecretBox → `crates/common/src/secret.rs`
 - TokenManager (spawn-and-wait, callback) → `crates/common/src/token_manager.rs:spawn_token_manager()`
 

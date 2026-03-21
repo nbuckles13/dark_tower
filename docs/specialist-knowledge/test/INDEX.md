@@ -43,5 +43,8 @@
 ## Code Locations: Shared
 - JWT validation -> `crates/common/src/jwt.rs`
 - UserClaims struct -> `crates/common/src/jwt.rs:UserClaims`
+- MeetingTokenClaims struct -> `crates/common/src/jwt.rs:MeetingTokenClaims`
+- GuestTokenClaims struct -> `crates/common/src/jwt.rs:GuestTokenClaims`
+- ParticipantType/MeetingRole enums -> `crates/common/src/jwt.rs:ParticipantType`
 - Token manager (retry/refresh) -> `crates/common/src/token_manager.rs`
 

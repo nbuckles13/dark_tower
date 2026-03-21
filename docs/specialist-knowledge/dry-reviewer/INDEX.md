@@ -9,6 +9,10 @@
 - JWT utilities (extracted TD-1/TD-2) -> `crates/common/src/jwt.rs:extract_kid()`
 - ServiceClaims (extracted from AC) -> `crates/common/src/jwt.rs:ServiceClaims`
 - UserClaims (extracted from AC, ADR-0020) -> `crates/common/src/jwt.rs:UserClaims`
+- MeetingTokenClaims (ADR-0020) -> `crates/common/src/jwt.rs:MeetingTokenClaims`
+- GuestTokenClaims (ADR-0020) -> `crates/common/src/jwt.rs:GuestTokenClaims`
+- ParticipantType enum -> `crates/common/src/jwt.rs:ParticipantType`
+- MeetingRole enum -> `crates/common/src/jwt.rs:MeetingRole`
 - Token management (prevents static token dup) -> `crates/common/src/token_manager.rs:TokenManagerConfig`
 - Secret types -> `crates/common/src/secret.rs`
 - Domain IDs and shared types -> `crates/common/src/types.rs`
@@ -42,3 +46,5 @@
 - GC dual auth middleware (service + user) -> `crates/gc-service/src/middleware/auth.rs`
 - NetworkPolicy egress/ingress pairs (GC<->MC on 50052, GC<->AC on 8082, MC->AC on 8082) -> `infra/services/*/network-policy.yaml`
 - Metric names in runbooks must match code -> `crates/gc-service/src/observability/metrics.rs`, `docs/runbooks/gc-incident-response.md`, `docs/runbooks/gc-deployment.md`
+- GC JWKS client (extraction target for common, Task 7) -> `crates/gc-service/src/auth/jwks.rs:JwksClient`
+- GC JwtValidator (extraction target for common, Task 7) -> `crates/gc-service/src/auth/jwt.rs:JwtValidator`

@@ -24,6 +24,10 @@
 - Key init at startup -> `crates/ac-service/src/services/key_management_service.rs:initialize_signing_key()`
 - JWKS generation -> `crates/ac-service/src/services/key_management_service.rs:get_jwks()`
 - Route definitions -> `crates/ac-service/src/routes/mod.rs:build_routes()`
+- Meeting token claims (common) -> `crates/common/src/jwt.rs:MeetingTokenClaims`
+- Guest token claims (common) -> `crates/common/src/jwt.rs:GuestTokenClaims`
+- Participant type enum (common) -> `crates/common/src/jwt.rs:ParticipantType`
+- Meeting role enum (common) -> `crates/common/src/jwt.rs:MeetingRole`
 - Error types -> `crates/ac-service/src/errors.rs:AcError`
 - Metrics recording -> `crates/ac-service/src/observability/metrics.rs:record_token_issuance()`
 - Correlation hashing -> `crates/ac-service/src/observability/mod.rs:hash_for_correlation()`
