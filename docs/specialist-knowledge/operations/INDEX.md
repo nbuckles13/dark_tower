@@ -14,21 +14,12 @@
 - Guard runner → `scripts/guards/run-guards.sh`
 - Application metrics guard → `scripts/guards/simple/validate-application-metrics.sh`
 
-## Code Locations — Deployment
-- Skaffold config → `infra/skaffold.yaml`
+## Code Locations — Deployment & K8s
 - Kind cluster config → `infra/kind/kind-config.yaml`
 - Kind setup/iterate/teardown → `infra/kind/scripts/`
-- Containerized devloop → `infra/devloop/devloop.sh`
-- Service Dockerfiles → `infra/docker/{ac,gc,mc}-service/`
-
-## Code Locations — K8s Manifests
 - Per-service manifests (deployment, netpol, PDB) → `infra/services/{ac,gc,mc}-service/`
-- Redis manifests + NetworkPolicy → `infra/services/redis/`
-- Observability stack (Prometheus, Loki, Promtail) → `infra/kubernetes/observability/`
-- Prometheus scrape config (docker) → `infra/docker/prometheus/prometheus.yml`
-- Alert rules → `infra/docker/prometheus/rules/`
+- Alert rules → `infra/docker/prometheus/rules/{gc,mc}-alerts.yaml`
 - Grafana dashboards → `infra/grafana/dashboards/`
-- Database migrations → `migrations/`
 
 ## Code Locations — Operational Scripts
 - Dev cert generation → `scripts/generate-dev-certs.sh`
@@ -38,6 +29,20 @@
 ## Runbooks
 - GC incident response (Scenarios 1-9) → `docs/runbooks/gc-incident-response.md`
 - GC deployment, rollback, smoke tests → `docs/runbooks/gc-deployment.md`
+- MC incident response (Scenarios 1-7) → `docs/runbooks/mc-incident-response.md`
+- MC deployment, rollback, smoke tests → `docs/runbooks/mc-deployment.md`
+- AC incident response → `docs/runbooks/ac-service-incident-response.md`
+- AC deployment → `docs/runbooks/ac-service-deployment.md`
+
+## Code Locations — Observability
+- GC metrics recorder → `crates/gc-service/src/observability/metrics.rs`
+- GC metrics catalog → `docs/observability/metrics/gc-service.md`
+- MC metrics catalog → `docs/observability/metrics/mc-service.md`
+- MC health probes (commented, Phase 6h) → `infra/services/mc-service/deployment.yaml:109`
+
+## Code Locations — Token Claims (shared)
+- Meeting/Guest token claims → `crates/common/src/jwt.rs:MeetingTokenClaims`, `GuestTokenClaims`
+- AC token issuance (meeting/guest) → `crates/ac-service/src/handlers/internal_tokens.rs`
 
 ## Integration Seams
 - Env-tests (cluster validation) → `crates/env-tests/`

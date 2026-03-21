@@ -16,6 +16,7 @@
 - GC meetings repository DB metrics -> `crates/gc-service/src/repositories/meetings.rs:MeetingsRepository`
 - MC metrics recording -> `crates/mc-service/src/observability/metrics.rs:init_metrics_recorder()`
 - MC health state (liveness/readiness) -> `crates/mc-service/src/observability/health.rs:health_router()`
+- PII-redacted claims Debug impls -> `crates/common/src/jwt.rs` (ServiceClaims, UserClaims, MeetingTokenClaims, GuestTokenClaims)
 - Metric catalogs -> `docs/observability/metrics/ac-service.md`, `gc-service.md`, `mc-service.md`
 
 ## Dashboards & Alerts

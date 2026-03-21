@@ -17,7 +17,8 @@
 - Token issuance → `crates/ac-service/src/services/token_service.rs:issue_service_token()`, `issue_user_token()`
 - Security config bounds → `crates/ac-service/src/config.rs`
 - JWT size constant → `crates/common/src/jwt.rs:MAX_JWT_SIZE_BYTES`
-- Shared claims types → `crates/common/src/jwt.rs:ServiceClaims`, `UserClaims` (PII-redacted Debug)
+- Shared claims types → `crates/common/src/jwt.rs:ServiceClaims`, `UserClaims`, `MeetingTokenClaims`, `GuestTokenClaims` (PII-redacted Debug)
+- Meeting token enums → `crates/common/src/jwt.rs:ParticipantType`, `MeetingRole`
 - Token manager (secure constructor) → `crates/common/src/token_manager.rs:new_secure()`
 - GC JWT validation → `crates/gc-service/src/auth/jwt.rs:validate()`, `validate_user()`, `verify_token()`
 - GC JWKS fetching → `crates/gc-service/src/auth/jwks.rs`
