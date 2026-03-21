@@ -23,28 +23,21 @@
 
 ## Code Locations — GC Service
 - Error type reference → `crates/gc-service/src/errors.rs:GcError`
-- Generic JWT verify → `crates/gc-service/src/auth/jwt.rs:verify_token()`
-- User JWT validation → `crates/gc-service/src/auth/jwt.rs:validate_user()`
-- User auth middleware → `crates/gc-service/src/middleware/auth.rs:require_user_auth()`
-- Bearer extraction helper → `crates/gc-service/src/middleware/auth.rs:extract_bearer_token()`
-- Meeting creation handler → `crates/gc-service/src/handlers/meetings.rs:create_meeting()`
-- Meeting code CSPRNG → `crates/gc-service/src/handlers/meetings.rs:generate_meeting_code()`
-- Meeting request/response models → `crates/gc-service/src/models/mod.rs:CreateMeetingRequest`
+- JWT verify/validation → `crates/gc-service/src/auth/jwt.rs:verify_token()`, `validate_user()`
+- JWKS client → `crates/gc-service/src/auth/jwks.rs:JwksClient`
+- Auth middleware → `crates/gc-service/src/middleware/auth.rs:require_user_auth()`, `extract_bearer_token()`
+- Meeting handlers → `crates/gc-service/src/handlers/meetings.rs:create_meeting()`, `join_meeting()`
 - Meetings repository (atomic CTE) → `crates/gc-service/src/repositories/meetings.rs:create_meeting_with_limit_check()`
-- Meeting creation metrics → `crates/gc-service/src/observability/metrics.rs:record_meeting_creation()`
+- Participants repository → `crates/gc-service/src/repositories/participants.rs:ParticipantsRepository`
+- Participant model (FromRow) → `crates/gc-service/src/models/mod.rs:Participant`
+- Participant migration (ALTER TABLE) → `migrations/20260322000001_add_participant_tracking.sql`
 - Route composition (user auth layer) → `crates/gc-service/src/routes/mod.rs:build_routes()`
 
-## Code Locations — GC Service (cont.)
-- Meeting join handler → `crates/gc-service/src/handlers/meetings.rs:join_meeting()`
-- JWKS client (cache + fetch) → `crates/gc-service/src/auth/jwks.rs:JwksClient`
-- GC ParticipantType/MeetingRole enums → `crates/gc-service/src/services/ac_client.rs:ParticipantType`
-
 ## Code Locations — Common
-- Shared JWT claims (ServiceClaims, UserClaims) → `crates/common/src/jwt.rs:ServiceClaims`, `crates/common/src/jwt.rs:UserClaims`
-- Meeting token claims (MeetingTokenClaims, GuestTokenClaims) → `crates/common/src/jwt.rs:MeetingTokenClaims`, `crates/common/src/jwt.rs:GuestTokenClaims`
-- Meeting token enums (ParticipantType, MeetingRole) → `crates/common/src/jwt.rs:ParticipantType`, `crates/common/src/jwt.rs:MeetingRole`
+- Shared JWT claims → `crates/common/src/jwt.rs:ServiceClaims`, `UserClaims`, `MeetingTokenClaims`, `GuestTokenClaims`
+- Meeting token enums → `crates/common/src/jwt.rs:ParticipantType`, `MeetingRole`
 - SecretString/SecretBox → `crates/common/src/secret.rs`
-- TokenManager (spawn-and-wait, callback) → `crates/common/src/token_manager.rs:spawn_token_manager()`
+- TokenManager → `crates/common/src/token_manager.rs:spawn_token_manager()`
 
 ## Guard Scripts
 - Guard runner → `scripts/guards/run-guards.sh`

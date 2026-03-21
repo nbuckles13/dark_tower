@@ -25,10 +25,15 @@
 - MC registration & health → `crates/gc-service/src/repositories/meeting_controllers.rs`
 - MH registration & load → `crates/gc-service/src/repositories/media_handlers.rs`
 - Meeting assignments (weighted round-robin) → `crates/gc-service/src/repositories/meeting_assignments.rs`
-- DB model structs → `crates/gc-service/src/models/mod.rs`
+- Meeting creation (atomic CTE) → `crates/gc-service/src/repositories/meetings.rs`
+- Participant tracking & capacity → `crates/gc-service/src/repositories/participants.rs`
+- Participant migration (ALTER TABLE) → `migrations/20260322000001_add_participant_tracking.sql`
+- DB model structs (MeetingRow, Participant) → `crates/gc-service/src/models/mod.rs`
 
 ## Integration Seams
-- Test DB harness (PgPool fixture) → `crates/ac-test-utils/src/server_harness.rs`
+- Test DB harness (PgPool fixture, AC) → `crates/ac-test-utils/src/server_harness.rs`
+- Test DB harness (PgPool fixture, GC) → `crates/gc-test-utils/src/server_harness.rs`
 - Docker Compose (test DB) → `docker-compose.test.yml`
 - Auth middleware (reads DB via services) → `crates/ac-service/src/middleware/auth.rs`
 - Org extraction middleware → `crates/ac-service/src/middleware/org_extraction.rs`
+- Participant integration tests → `crates/gc-service/tests/participant_tests.rs`

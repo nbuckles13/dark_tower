@@ -26,6 +26,7 @@
 - GC CSPRNG generators → `crates/gc-service/src/handlers/meetings.rs:generate_meeting_code()`, `generate_join_token_secret()`
 - GC role enforcement constants → `crates/gc-service/src/handlers/meetings.rs:MEETING_CREATE_ROLES`
 - GC atomic org limit CTE → `crates/gc-service/src/repositories/meetings.rs:create_meeting_with_limit_check()`
+- GC participant tracking (DB CHECK + partial unique index) → `crates/gc-service/src/repositories/participants.rs`, `migrations/20260322000001_add_participant_tracking.sql`
 - MC gRPC auth interceptor → `crates/mc-service/src/grpc/auth_interceptor.rs`
 - MC session binding actors → `crates/mc-service/src/actors/session.rs`
 
@@ -45,7 +46,5 @@
 
 ## Cross-Cutting Gotchas
 - Dummy bcrypt hash must match production cost factor → `crates/ac-service/src/services/token_service.rs`
-- `.expose_secret()` calls are audit points; grep to find leak sites → `crates/ac-service/src/`
-- `#[instrument]` without `skip_all` auto-captures params; `.instrument()` chaining does not
+- `.expose_secret()` calls are audit points → `crates/ac-service/src/`
 - Silent `return Ok(())` in env-tests is fail-open → `crates/env-tests/tests/`
-- Service token `sub` is a string, not UUID; breaks `parse_user_id()` on user endpoints

@@ -80,6 +80,42 @@ pub struct ReadinessResponse {
 }
 
 // ============================================================================
+// Participant Models
+// ============================================================================
+
+/// Meeting participant record from database.
+///
+/// Represents a participant in a meeting, tracking their type (member/external),
+/// role (host/participant), and active status via `left_at`.
+#[derive(Debug, Clone, sqlx::FromRow)]
+#[allow(dead_code)] // Used by integration tests and future join handler
+pub struct Participant {
+    /// Unique participant record identifier.
+    pub participant_id: Uuid,
+
+    /// Meeting the participant belongs to.
+    pub meeting_id: Uuid,
+
+    /// User identifier (None for anonymous guests).
+    pub user_id: Option<Uuid>,
+
+    /// Participant's display name.
+    pub display_name: String,
+
+    /// Whether participant is a same-org member or external/guest.
+    pub participant_type: String,
+
+    /// Participant role: host or participant.
+    pub role: String,
+
+    /// When the participant joined.
+    pub joined_at: DateTime<Utc>,
+
+    /// When the participant left (None = still active).
+    pub left_at: Option<DateTime<Utc>>,
+}
+
+// ============================================================================
 // Meeting API Models (Phase 2)
 // ============================================================================
 

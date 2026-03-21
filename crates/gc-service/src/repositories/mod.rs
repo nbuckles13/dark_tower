@@ -7,6 +7,7 @@ pub mod media_handlers;
 pub mod meeting_assignments;
 pub mod meeting_controllers;
 pub mod meetings;
+pub mod participants;
 
 // Media handler types will be used in handlers in future phase
 #[allow(unused_imports)]
@@ -17,3 +18,6 @@ pub use meeting_assignments::{weighted_random_select, McAssignment, MeetingAssig
 pub use meeting_assignments::{McCandidate, MeetingAssignment};
 pub use meeting_controllers::{HealthStatus, MeetingControllersRepository};
 pub use meetings::{map_row_to_meeting, MeetingsRepository};
+// ParticipantsRepository will be used in meeting join handler
+#[allow(unused_imports)]
+pub use participants::ParticipantsRepository;

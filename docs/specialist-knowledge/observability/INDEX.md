@@ -14,6 +14,7 @@
 - GC HTTP metrics middleware -> `crates/gc-service/src/middleware/http_metrics.rs:http_metrics_middleware()`
 - GC endpoint normalization -> `crates/gc-service/src/observability/metrics.rs:normalize_endpoint()`
 - GC meetings repository DB metrics -> `crates/gc-service/src/repositories/meetings.rs:MeetingsRepository`
+- GC participants repository DB metrics -> `crates/gc-service/src/repositories/participants.rs:ParticipantsRepository`
 - MC metrics recording -> `crates/mc-service/src/observability/metrics.rs:init_metrics_recorder()`
 - MC health state (liveness/readiness) -> `crates/mc-service/src/observability/health.rs:health_router()`
 - PII-redacted claims Debug impls -> `crates/common/src/jwt.rs` (ServiceClaims, UserClaims, MeetingTokenClaims, GuestTokenClaims)
