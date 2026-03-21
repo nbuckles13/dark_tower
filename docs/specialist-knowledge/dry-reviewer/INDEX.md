@@ -43,8 +43,8 @@
 ## Integration Seams
 - Common crate as extraction target -> `crates/common/src/`
 - GC repositories (shared row mappers) -> `crates/gc-service/src/repositories/`
+- GC ParticipantsRepository -> `crates/gc-service/src/repositories/participants.rs`
 - GC dual auth middleware (service + user) -> `crates/gc-service/src/middleware/auth.rs`
 - NetworkPolicy egress/ingress pairs (GC<->MC on 50052, GC<->AC on 8082, MC->AC on 8082) -> `infra/services/*/network-policy.yaml`
 - Metric names in runbooks must match code -> `crates/gc-service/src/observability/metrics.rs`, `docs/runbooks/gc-incident-response.md`, `docs/runbooks/gc-deployment.md`
-- GC JWKS client (extraction target for common, Task 7) -> `crates/gc-service/src/auth/jwks.rs:JwksClient`
-- GC JwtValidator (extraction target for common, Task 7) -> `crates/gc-service/src/auth/jwt.rs:JwtValidator`
+- GC JWKS/JWT (extraction targets for Task 7) -> `crates/gc-service/src/auth/jwks.rs`, `crates/gc-service/src/auth/jwt.rs`

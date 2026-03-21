@@ -22,6 +22,7 @@
 - Auth/JWT tests -> `crates/gc-service/tests/auth_tests.rs`
 - Meeting join/guest/settings tests -> `crates/gc-service/tests/meeting_tests.rs`
 - Meeting creation tests -> `crates/gc-service/tests/meeting_create_tests.rs`
+- Participant repository tests -> `crates/gc-service/tests/participant_tests.rs`
 - Meeting assignment tests -> `crates/gc-service/tests/meeting_assignment_tests.rs`
 - Test harness (HTTP seam) -> `crates/gc-test-utils/src/server_harness.rs`
 

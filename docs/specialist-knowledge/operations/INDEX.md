@@ -34,6 +34,11 @@
 - AC incident response → `docs/runbooks/ac-service-incident-response.md`
 - AC deployment → `docs/runbooks/ac-service-deployment.md`
 
+## Code Locations — Database & Migrations
+- Participant tracking migration → `migrations/20260322000001_add_participant_tracking.sql`
+- ParticipantsRepository → `crates/gc-service/src/repositories/participants.rs`
+- Participant model → `crates/gc-service/src/models/mod.rs:Participant`
+
 ## Code Locations — Observability
 - GC metrics recorder → `crates/gc-service/src/observability/metrics.rs`
 - GC metrics catalog → `docs/observability/metrics/gc-service.md`
@@ -48,4 +53,3 @@
 - Env-tests (cluster validation) → `crates/env-tests/`
 - Metric catalogs (guard cross-ref) → `docs/observability/metrics/`
 - NetworkPolicy cross-refs → `infra/services/*/network-policy.yaml`
-- ServiceMonitor (Prometheus scrape) → `infra/services/*/service-monitor.yaml`
