@@ -27,7 +27,7 @@ spec:
     - protocol: TCP
       port: 50052
   # Allow ingress from external clients (WebTransport)
-  # In Kind, we use port-forward so this allows any source
+  # In Kind, exposed via NodePort 30433 (mapped to host 4433 in kind-config.yaml)
   - from: []
     ports:
     - protocol: UDP

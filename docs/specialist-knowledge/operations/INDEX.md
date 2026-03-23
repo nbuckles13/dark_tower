@@ -14,11 +14,12 @@
 - Guard runner + application metrics guard → `scripts/guards/run-guards.sh`, `scripts/guards/simple/validate-application-metrics.sh`
 
 ## Code Locations — Deployment & K8s
-- Kind cluster config → `infra/kind/kind-config.yaml`
+- Kind cluster config (TCP/UDP port mappings) → `infra/kind/kind-config.yaml`
 - Kind setup/iterate/teardown → `infra/kind/scripts/`
 - Per-service manifests (deployment, netpol, PDB) → `infra/services/{ac,gc,mc}-service/`
 - Alert rules → `infra/docker/prometheus/rules/{gc,mc}-alerts.yaml`
-- Dev certs, master key, service registration → `scripts/generate-dev-certs.sh`, `generate-master-key.sh`, `register-service.sh`
+- Dev certs (CA + service TLS), master key, service registration → `scripts/generate-dev-certs.sh`, `generate-master-key.sh`, `register-service.sh`
+- MC TLS secret + volume mount → `infra/services/mc-service/tls-secret.yaml`, `deployment.yaml` (volume `mc-tls` at `/etc/mc-tls`)
 
 ## Runbooks
 - GC incident response (Scenarios 1-9) → `docs/runbooks/gc-incident-response.md`

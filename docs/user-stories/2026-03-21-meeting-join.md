@@ -255,6 +255,103 @@ Task 1 also starts immediately; task 7 waits for task 1
 | 17 | Add MC runbook scenarios 8-10 (WebTransport, token validation, Redis/session) + TOC update | operations | 11, 13 | docs |
 | 18 | Add post-deploy monitoring checklist + expand smoke test 5 for join flow | operations | 4, 11 | docs |
 
+### Task Metadata
+
+```yaml
+# task-metadata
+tasks:
+  - id: 1
+    slug: meeting-token-claims
+    description: "Add MeetingTokenClaims and GuestTokenClaims to crates/common/src/jwt.rs"
+    specialist: auth-controller
+    deps: []
+  - id: 2
+    slug: participants-repository
+    description: "Implement ParticipantsRepository with migration for participant tracking + capacity checks"
+    specialist: database
+    deps: []
+  - id: 3
+    slug: meeting-activation
+    description: "Implement meeting activation (scheduled->active on first join) + audit logging"
+    specialist: database
+    deps: []
+  - id: 4
+    slug: gc-join-auth-metrics
+    description: "Fix GC join/settings auth middleware (UserClaims), add status allowlist, add record_meeting_join metrics"
+    specialist: global-controller
+    deps: []
+  - id: 5
+    slug: infra-tls-udp
+    description: "Add TLS cert generation to dev scripts + MC K8s Secret volume mount + Kind UDP port mapping for 4433"
+    specialist: infrastructure
+    deps: []
+  - id: 6
+    slug: mc-health-probes
+    description: "Enable MC liveness/readiness health probes in deployment.yaml"
+    specialist: infrastructure
+    deps: []
+  - id: 7
+    slug: jwks-common-extraction
+    description: "Extract JWKS client + generic JWT validator (JwtValidator::validate<T>) from GC to crates/common/, with JwtError enum and wiremock tests"
+    specialist: auth-controller
+    deps: [1]
+  - id: 8
+    slug: gc-common-jwks
+    description: "Convert GC auth to use common JWKS/JWT code (delete gc-service/src/auth/jwks.rs, thin wrapper mapping JwtError to GcError)"
+    specialist: global-controller
+    deps: [7]
+  - id: 9
+    slug: mc-jwt-validation
+    description: "Implement MC JWT validation using common JwksClient + JwtValidator::validate<MeetingTokenClaims> + MC-specific config (ac_jwks_url)"
+    specialist: meeting-controller
+    deps: [7]
+  - id: 10
+    slug: mc-webtransport-join
+    description: "Implement MC WebTransport server + join flow connection handler (wtransport TLS, accept loop, JoinRequest/Response, ParticipantJoined/Left bridge, CancellationToken wiring)"
+    specialist: meeting-controller
+    deps: [5, 9]
+  - id: 11
+    slug: mc-join-metrics
+    description: "Add MC join flow observability metrics (WebTransport connections, JWT validations, session joins, latency histogram)"
+    specialist: meeting-controller
+    deps: [10]
+  - id: 12
+    slug: gc-join-dashboard
+    description: "Add GC join dashboard panels + alert rules + update metrics catalog"
+    specialist: observability
+    deps: [4]
+  - id: 13
+    slug: mc-join-dashboard
+    description: "Add MC join dashboard panels + alert rules + update metrics catalog"
+    specialist: observability
+    deps: [11]
+  - id: 14
+    slug: gc-join-tests
+    description: "GC join integration tests + test harness updates for user auth"
+    specialist: global-controller
+    deps: [4, 8]
+  - id: 15
+    slug: mc-join-tests
+    description: "MC join integration tests (WebTransport, JWT, signaling bridge)"
+    specialist: meeting-controller
+    deps: [10]
+  - id: 16
+    slug: join-env-tests
+    description: "Join flow end-to-end env-tests in Kind cluster"
+    specialist: test
+    deps: [4, 10]
+  - id: 17
+    slug: mc-runbook-join
+    description: "Add MC runbook scenarios 8-10 (WebTransport, token validation, Redis/session) + TOC update"
+    specialist: operations
+    deps: [11, 13]
+  - id: 18
+    slug: post-deploy-checklist
+    description: "Add post-deploy monitoring checklist + expand smoke test 5 for join flow"
+    specialist: operations
+    deps: [4, 11]
+```
+
 ### Specialist Task Summary
 
 | Specialist | Tasks | Count |
@@ -284,13 +381,13 @@ Task 1 also starts immediately; task 7 waits for task 1
 
 ## Devloop Tracking
 
-| # | Task | Devloop Output | PR | Status |
-|---|------|---------------|-----|--------|
-| 1 | Add MeetingTokenClaims/GuestTokenClaims to common | | | Pending |
-| 2 | Implement ParticipantsRepository + migration | | | Pending |
-| 3 | Implement meeting activation + audit logging | | | Pending |
-| 4 | Fix GC join auth + add join metrics | | | Pending |
-| 5 | Infra: TLS certs + MC Secret + Kind UDP | | | Pending |
+| # | Task | Devloop Output | Commit | Status |
+|---|------|---------------|--------|--------|
+| 1 | Add MeetingTokenClaims/GuestTokenClaims to common | docs/devloop-outputs/2026-03-21-meeting-claims | 3a22a51 | Completed |
+| 2 | Implement ParticipantsRepository + migration | docs/devloop-outputs/2026-03-21-participants-repo | 3c58e10 | Completed |
+| 3 | Implement meeting activation + audit logging | docs/devloop-outputs/2026-03-21-meeting-activation | 15e7b15 | Completed |
+| 4 | Fix GC join auth + add join metrics | docs/devloop-outputs/2026-03-23-gc-join-auth-metrics | 47bfb59 | Completed |
+| 5 | Infra: TLS certs + MC Secret + Kind UDP | docs/devloop-outputs/2026-03-23-infra-tls-udp | a09ce18 | Completed |
 | 6 | Infra: Enable MC health probes | | | Pending |
 | 7 | Extract JWKS client + JWT validation to common | | | Pending |
 | 8 | Convert GC auth to common JWKS/JWT | | | Pending |

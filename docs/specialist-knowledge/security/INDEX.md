@@ -33,18 +33,16 @@
 - MC gRPC auth interceptor → `crates/mc-service/src/grpc/auth_interceptor.rs`
 - MC session binding actors → `crates/mc-service/src/actors/session.rs`
 
+## TLS & Certificates
+- Dev cert generation (ECDSA P-256 CA) → `scripts/generate-dev-certs.sh`
+- MC TLS Secret + volume mount (defaultMode 0400) → `infra/services/mc-service/tls-secret.yaml`, `deployment.yaml`
+- MC WebTransport UDP ingress + Kind mapping → `infra/services/mc-service/network-policy.yaml`, `infra/kind/kind-config.yaml`
+
 ## Integration Seams
-- AC JWKS endpoint consumed by GC → `crates/gc-service/src/auth/jwks.rs`
-- GC-to-MC authenticated gRPC → `crates/mc-service/src/grpc/auth_interceptor.rs`
-- Token refresh callback (shared-to-service metrics) → `crates/common/src/token_manager.rs:with_on_refresh()`
-- GC default scopes (incl. `internal:meeting-token`) → `crates/ac-service/src/models/mod.rs:ServiceType::default_scopes()`
-- GC-to-MC NetworkPolicy egress (TCP 50052) → `infra/services/gc-service/network-policy.yaml`
-- GC user-auth route layer → `crates/gc-service/src/routes/mod.rs:build_routes()` (user_auth_routes)
-- Credential leak guards → `scripts/guards/simple/no-secrets-in-logs.sh`, `instrument-skip-all.sh`
+- AC JWKS → GC → `crates/gc-service/src/auth/jwks.rs`; GC→MC gRPC → `crates/mc-service/src/grpc/auth_interceptor.rs`
+- GC user-auth routes → `crates/gc-service/src/routes/mod.rs:build_routes()`
+- Credential leak guards → `scripts/guards/simple/no-secrets-in-logs.sh`
 
-## Runbooks (Security-Relevant)
-- Resource exhaustion / CSPRNG collision → `docs/runbooks/gc-incident-response.md` (scenarios 8-9)
-- Post-deploy join_token_secret leak check → `docs/runbooks/gc-deployment.md` (Test 6)
-
-## Cross-Cutting Audit Points
-- Bcrypt cost factor & `.expose_secret()` → `crates/ac-service/src/`; fail-open env-tests → `crates/env-tests/tests/`
+## Runbooks & Audit
+- GC security scenarios (8-9) → `docs/runbooks/gc-incident-response.md`
+- Bcrypt cost / `.expose_secret()` → `crates/ac-service/src/`; fail-open env-tests → `crates/env-tests/tests/`
