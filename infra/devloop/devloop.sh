@@ -9,17 +9,22 @@
 # they stay running. Re-run this script to re-attach.
 #
 # Usage:
-#   ./devloop.sh [--rebuild] <task-slug> [base-branch]
+#   ./devloop.sh [--rebuild] [--recreate] <task-slug> [base-branch]
+#   ./devloop.sh --rebuild                              # rebuild image only
 #   ./devloop.sh --refresh-creds <task-slug>
 #
 # Options:
-#   --rebuild         Force rebuild the dev container image
+#   --rebuild         Force rebuild the dev container image (exits if no task-slug)
+#   --recreate        Destroy and recreate containers, preserving the local clone
 #   --refresh-creds   Copy fresh OAuth credentials into a running container
 #
 # Examples:
 #   ./devloop.sh td-42-rate-limiting
 #   ./devloop.sh td-42-rate-limiting main
+#   ./devloop.sh --rebuild                              # just rebuild the image
 #   ./devloop.sh --rebuild td-42-rate-limiting
+#   ./devloop.sh --recreate td-42-rate-limiting         # new containers, same clone
+#   ./devloop.sh --rebuild --recreate td-42-rate-limiting  # rebuild image + recreate
 #   ./devloop.sh --refresh-creds td-42-rate-limiting   # from another terminal
 #
 # Prerequisites:
@@ -34,13 +39,29 @@ set -euo pipefail
 
 REBUILD_IMAGE=false
 REFRESH_CREDS=false
+RECREATE=false
 while [[ "${1:-}" == --* ]]; do
     case "$1" in
         --rebuild) REBUILD_IMAGE=true; shift ;;
         --refresh-creds) REFRESH_CREDS=true; shift ;;
+        --recreate) RECREATE=true; shift ;;
         *) echo "Unknown option: $1" >&2; exit 1 ;;
     esac
 done
+
+# --rebuild with no task-slug: just build the image and exit
+if $REBUILD_IMAGE && [ -z "${1:-}" ]; then
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    IMAGE="darktower-dev:latest"
+    echo "Building dev container image..."
+    OLD_IMAGE_ID=$(podman images -q "$IMAGE" 2>/dev/null || true)
+    podman build --no-cache -t "$IMAGE" "$SCRIPT_DIR"
+    if [ -n "$OLD_IMAGE_ID" ] && [ "$OLD_IMAGE_ID" != "$(podman images -q "$IMAGE")" ]; then
+        podman rmi "$OLD_IMAGE_ID" 2>/dev/null || true
+    fi
+    echo "Image rebuilt: ${IMAGE}"
+    exit 0
+fi
 
 TASK_SLUG="${1:?Usage: devloop.sh [--rebuild] <task-slug> [base-branch]}"
 BASE_BRANCH="${2:-main}"
@@ -142,13 +163,20 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if $REBUILD_IMAGE || ! podman image exists "$IMAGE"; then
     echo "Building dev container image..."
     OLD_IMAGE_ID=$(podman images -q "$IMAGE" 2>/dev/null || true)
-    podman build -t "$IMAGE" "$SCRIPT_DIR"
+    podman build --no-cache -t "$IMAGE" "$SCRIPT_DIR"
     if [ -n "$OLD_IMAGE_ID" ] && [ "$OLD_IMAGE_ID" != "$(podman images -q "$IMAGE")" ]; then
         podman rmi "$OLD_IMAGE_ID" 2>/dev/null || true
     fi
 fi
 
 # ─── Phase 1: Setup (idempotent) ────────────────────────────────
+
+# --recreate: tear down containers but keep the clone
+if $RECREATE && is_container_running "$DEV_CONTAINER"; then
+    echo "Recreating containers (clone preserved)..."
+    podman rm -f "$DEV_CONTAINER" 2>/dev/null || true
+    podman rm -f "$DB_CONTAINER" 2>/dev/null || true
+fi
 
 if ! is_container_running "$DEV_CONTAINER"; then
     echo "=== Setting up clone and containers for: ${TASK_SLUG} ==="
@@ -251,7 +279,7 @@ if [ -f "${HOME}/.claude/.credentials.json" ]; then
     podman cp "${HOME}/.claude/.credentials.json" "${DEV_CONTAINER}:/home/dev/.claude/.credentials.json"
 fi
 
-podman exec -it "$DEV_CONTAINER" claude --dangerously-skip-permissions || true
+podman exec -it "$DEV_CONTAINER" claude --dangerously-skip-permissions --remote-control "$TASK_SLUG" || true
 
 # ─── Phase 3: Post-session ──────────────────────────────────────
 
