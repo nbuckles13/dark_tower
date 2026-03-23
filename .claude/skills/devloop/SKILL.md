@@ -409,6 +409,24 @@ Track verdicts in main.md:
 - Full mode: proceed to reflection (Step 8)
 - Light mode: Skip to Step 9.
 
+### Step 8.5: Commit
+
+After reflection (full mode) or after review (light mode), stage and commit:
+
+1. `git add -A`
+2. Commit with message:
+   ```
+   {task description}
+
+   Devloop: {YYYY-MM-DD-slug}
+   Specialist: {specialist}
+   Mode: {full|light}
+   Verdicts: Security {verdict}, Test {verdict}, ...
+
+   Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+   ```
+3. If nothing to commit, skip silently
+
 ### Step 8: Reflection [FULL MODE ONLY]
 
 Broadcast the reflection instructions to all teammates:
