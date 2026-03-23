@@ -691,6 +691,23 @@ deploy_gc_service() {
     log_info "Global Controller deployed successfully."
 }
 
+# Generate TLS certificates and create MC TLS secret
+create_mc_tls_secret() {
+    log_step "Generating TLS certificates for MC WebTransport..."
+
+    # Generate dev certs (idempotent — reuses CA if it already exists)
+    "${PROJECT_ROOT}/scripts/generate-dev-certs.sh"
+
+    log_step "Creating mc-service-tls Secret from generated certs..."
+    kubectl create secret tls mc-service-tls \
+        --cert="${PROJECT_ROOT}/infra/docker/certs/mc-webtransport.crt" \
+        --key="${PROJECT_ROOT}/infra/docker/certs/mc-webtransport.key" \
+        -n dark-tower \
+        --dry-run=client -o yaml | kubectl apply -f -
+
+    log_info "MC TLS secret created successfully."
+}
+
 # Build and deploy Meeting Controller service
 deploy_mc_service() {
     log_step "Building Meeting Controller container image..."
@@ -778,8 +795,10 @@ print_access_info() {
     echo "    Status: Running in-cluster (2 replicas)"
     echo ""
     echo "  MC Service (Meeting Controller):"
+    echo "    WebTransport: https://localhost:4433 (QUIC/UDP via NodePort)"
     echo "    gRPC: localhost:50052 (cluster-internal)"
     echo "    Health: localhost:8081 (cluster-internal)"
+    echo "    TLS: Self-signed (CA at infra/docker/certs/ca.crt)"
     echo "    Status: Running in-cluster (2 replicas)"
     echo ""
     echo "  Grafana:"
@@ -866,6 +885,7 @@ main() {
     create_ac_secrets
     deploy_ac_service
     deploy_gc_service
+    create_mc_tls_secret
     deploy_mc_service
     install_telepresence
     setup_port_forwards

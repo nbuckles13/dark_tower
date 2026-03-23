@@ -45,3 +45,5 @@
 - GC JWKS/JWT (potential extraction to common) -> `crates/gc-service/src/auth/jwks.rs`, `crates/gc-service/src/auth/jwt.rs`
 - NetworkPolicy + ServiceMonitor cross-refs -> `infra/services/{ac,gc,mc}-service/`
 - Metric names in runbooks must match code -> `crates/gc-service/src/observability/metrics.rs`, `docs/runbooks/gc-incident-response.md`
+- Dev cert generation (shared helper, single CA) -> `scripts/generate-dev-certs.sh:generate_service_cert()`
+- MC TLS secret + volume mount -> `infra/services/mc-service/tls-secret.yaml`, `deployment.yaml`

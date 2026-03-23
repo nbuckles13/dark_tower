@@ -46,6 +46,7 @@
 - Cross-service flows -> `crates/env-tests/tests/21_cross_service_flows.rs`
 - Meeting creation env-tests -> `crates/env-tests/tests/23_meeting_creation.rs`
 
-## Code Locations: Shared
+## Infrastructure & Shared
+- Dev cert generation + MC TLS manifests → `scripts/generate-dev-certs.sh`, `infra/services/mc-service/tls-secret.yaml`
+- Kind UDP mapping + setup integration → `infra/kind/kind-config.yaml`, `infra/kind/scripts/setup.sh:create_mc_tls_secret()`
 - JWT claims (UserClaims, MeetingTokenClaims, GuestTokenClaims) → `crates/common/src/jwt.rs`
-- Token manager, metrics catalog, dashboard → `crates/common/src/token_manager.rs`, `docs/observability/metrics/gc-service.md`

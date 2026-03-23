@@ -27,7 +27,8 @@
 - GC overview dashboard (meeting creation + join panels) -> `infra/grafana/dashboards/gc-overview.json`
 - Cross-service error dashboard -> `infra/grafana/dashboards/errors-overview.json`
 - Grafana provisioning -> `infra/grafana/provisioning/datasources/datasources.yaml`
-- Prometheus config -> `infra/docker/prometheus/prometheus.yml`
+- Prometheus config (docker-compose) -> `infra/docker/prometheus/prometheus.yml`
+- Prometheus config (K8s in-cluster) -> `infra/kubernetes/observability/prometheus-config.yaml`
 - Alert rules -> `infra/docker/prometheus/rules/gc-alerts.yaml`, `mc-alerts.yaml`
 - Alert design docs -> `docs/observability/alerts.md`
 - Dashboard docs -> `docs/observability/dashboards.md`
@@ -45,3 +46,5 @@
 ## Integration Seams
 - Env-tests observability validation -> `crates/env-tests/tests/30_observability.rs`
 - Observability mod re-exports (stale export risk) -> `crates/*/src/observability/mod.rs`
+- MC TLS volume mount (affects health port availability) -> `infra/services/mc-service/deployment.yaml`
+- MC WebTransport UDP NodePort (Kind port mapping) -> `infra/kind/kind-config.yaml`, `infra/services/mc-service/service.yaml`

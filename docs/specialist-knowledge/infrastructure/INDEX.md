@@ -10,7 +10,8 @@
 - Service Dockerfiles -> `infra/docker/{ac,gc,mc}-service/Dockerfile`
 - PostgreSQL init -> `infra/docker/postgres/init.sql`
 - Prometheus config + alert rules -> `infra/docker/prometheus/`
-- K8s service manifests (7-file pattern) -> `infra/services/{ac,gc,mc}-service/`
+- K8s service manifests (7-file pattern + tls-secret) -> `infra/services/{ac,gc,mc}-service/`
+- MC TLS Secret (WebTransport cert/key) -> `infra/services/mc-service/tls-secret.yaml`
 - Redis manifests -> `infra/services/redis/`
 - K8s observability (kustomize) -> `infra/kubernetes/observability/`
 - Grafana dashboards -> `infra/grafana/dashboards/`
@@ -22,6 +23,7 @@
 - Skaffold dev workflow -> `infra/skaffold.yaml`
 - Containerized devloop -> `infra/devloop/devloop.sh`
 - Docker Compose (local tests) -> `docker-compose.test.yml`
+- Dev TLS cert generation (CA + service certs) -> `scripts/generate-dev-certs.sh`
 - CI pipeline -> `.github/workflows/ci.yml`
 - Fuzz nightly -> `.github/workflows/fuzz-nightly.yml`
 

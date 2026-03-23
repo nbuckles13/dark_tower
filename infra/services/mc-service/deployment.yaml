@@ -89,6 +89,17 @@ spec:
             secretKeyRef:
               name: mc-service-secrets
               key: MC_CLIENT_SECRET
+        # TLS certificate paths for WebTransport (QUIC/HTTP3)
+        - name: MC_TLS_CERT_PATH
+          valueFrom:
+            configMapKeyRef:
+              name: mc-service-config
+              key: MC_TLS_CERT_PATH
+        - name: MC_TLS_KEY_PATH
+          valueFrom:
+            configMapKeyRef:
+              name: mc-service-config
+              key: MC_TLS_KEY_PATH
         - name: RUST_LOG
           value: "info,mc_service=debug"
         resources:
@@ -130,6 +141,13 @@ spec:
         volumeMounts:
         - name: tmp
           mountPath: /tmp
+        - name: mc-tls
+          mountPath: /etc/mc-tls
+          readOnly: true
       volumes:
       - name: tmp
         emptyDir: {}
+      - name: mc-tls
+        secret:
+          secretName: mc-service-tls
+          defaultMode: 0400

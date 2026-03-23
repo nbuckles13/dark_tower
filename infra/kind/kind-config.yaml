@@ -25,6 +25,11 @@ nodes:
       - containerPort: 30080
         hostPort: 3100
         protocol: TCP
+      # MC WebTransport (QUIC/UDP) — requires NodePort 30433 on mc-service Service
+      # Note: Kind UDP support is best-effort; use port-forward as fallback
+      - containerPort: 30433
+        hostPort: 4433
+        protocol: UDP
 
 # Use containerd as the container runtime
 containerdConfigPatches:

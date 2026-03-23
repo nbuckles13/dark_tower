@@ -7,7 +7,11 @@ metadata:
     app: mc-service
     component: signaling
 spec:
-  type: ClusterIP
+  # NodePort to expose WebTransport UDP via Kind port mapping (hostPort 4433 -> nodePort 30433).
+  # TCP NodePorts are pinned but NOT mapped in kind-config.yaml, so they are not reachable
+  # from the host. Only WebTransport (UDP 30433) is host-accessible. NetworkPolicy still
+  # restricts gRPC ingress to gc-service pods at the cluster level.
+  type: NodePort
   selector:
     app: mc-service
     component: signaling
@@ -16,14 +20,16 @@ spec:
     protocol: TCP
     port: 50052
     targetPort: 50052
+    nodePort: 30052
   - name: health
     protocol: TCP
     port: 8081
     targetPort: 8081
-  # WebTransport uses QUIC/UDP - note: Kind has limited UDP support
-  # For local dev, clients may need to connect directly via NodePort or port-forward
+    nodePort: 30081
+  # WebTransport QUIC/UDP — NodePort 30433 mapped to host 4433 in Kind config
   - name: webtransport
     protocol: UDP
     port: 4433
     targetPort: 4433
+    nodePort: 30433
   sessionAffinity: None

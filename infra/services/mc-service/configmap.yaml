@@ -17,3 +17,6 @@ data:
   MC_REGION: "local"
   # GC service discovery via Kubernetes DNS
   GC_GRPC_URL: "http://gc-service.dark-tower:50051"
+  # TLS certificate paths for WebTransport (mounted from mc-service-tls Secret)
+  MC_TLS_CERT_PATH: "/etc/mc-tls/tls.crt"
+  MC_TLS_KEY_PATH: "/etc/mc-tls/tls.key"

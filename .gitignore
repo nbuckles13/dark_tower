@@ -34,6 +34,7 @@ crates/proto-gen/src/generated/*.rs
 infra/docker/certs/*.key
 infra/docker/certs/*.crt
 infra/docker/certs/*.pem
+infra/docker/certs/*.srl
 
 # Logs
 *.log
