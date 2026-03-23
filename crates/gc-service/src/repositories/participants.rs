@@ -28,6 +28,16 @@ impl ParticipantsRepository {
     /// Returns the number of participants with `left_at IS NULL`.
     /// Used by MC to enforce `max_participants` capacity locally.
     ///
+    /// # Safety (TOCTOU)
+    ///
+    /// This method returns a point-in-time count. Do **not** use it as a
+    /// standalone capacity gate before calling [`add_participant`] — the
+    /// count can change between the two calls under concurrent joins,
+    /// allowing `max_participants` to be exceeded. The join handler must
+    /// use an atomic CTE (check-and-insert in one statement) to enforce
+    /// capacity safely. See `create_meeting_with_limit_check` in
+    /// `meetings.rs` for the pattern.
+    ///
     /// # Arguments
     ///
     /// * `pool` - Database connection pool
@@ -65,6 +75,13 @@ impl ParticipantsRepository {
     /// Inserts a new active participant record. The partial unique index
     /// on `(meeting_id, user_id) WHERE left_at IS NULL` prevents duplicate
     /// active participants.
+    ///
+    /// # Safety (TOCTOU)
+    ///
+    /// This method does **not** enforce `max_participants` capacity. Callers
+    /// must not rely on a prior [`count_active_participants`] check — use an
+    /// atomic CTE that counts and inserts in one statement instead. See
+    /// `create_meeting_with_limit_check` in `meetings.rs` for the pattern.
     ///
     /// # Arguments
     ///

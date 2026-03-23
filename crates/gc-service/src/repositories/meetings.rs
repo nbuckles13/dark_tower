@@ -137,36 +137,39 @@ impl MeetingsRepository {
         }
     }
 
-    /// Log a meeting creation audit event.
+    /// Log a meeting audit event.
     ///
     /// Fire-and-forget: failures are logged at warn level but do not
-    /// block meeting creation.
+    /// block the calling operation.
     ///
     /// # Arguments
     ///
     /// * `pool` - Database connection pool
     /// * `org_id` - Organization UUID
-    /// * `user_id` - User UUID who created the meeting
-    /// * `meeting_id` - Created meeting UUID
-    #[instrument(skip_all, name = "gc.repo.log_audit_event")]
+    /// * `user_id` - User UUID who triggered the action (None for guests)
+    /// * `meeting_id` - Meeting UUID
+    /// * `action` - Audit action string (e.g., "meeting_created", "meeting_activated")
+    #[instrument(skip_all, name = "gc.repo.log_audit_event", fields(action = %action))]
     pub async fn log_audit_event(
         pool: &PgPool,
         org_id: Uuid,
-        user_id: Uuid,
+        user_id: Option<Uuid>,
         meeting_id: Uuid,
+        action: &str,
     ) -> Result<(), GcError> {
         let start = Instant::now();
 
         sqlx::query(
             r#"
             INSERT INTO audit_logs (org_id, user_id, action, resource_type, resource_id, details)
-            VALUES ($1, $2, 'meeting_created', 'meeting', $3, $4)
+            VALUES ($1, $2, $3, 'meeting', $4, $5)
             "#,
         )
         .bind(org_id)
         .bind(user_id)
+        .bind(action)
         .bind(meeting_id)
-        .bind(serde_json::json!({"action": "meeting_created"}))
+        .bind(serde_json::json!({"action": action}))
         .execute(pool)
         .await
         .map_err(|e| {
@@ -179,6 +182,56 @@ impl MeetingsRepository {
         metrics::record_db_query("log_audit_event", "success", duration);
 
         Ok(())
+    }
+
+    /// Activate a meeting on first participant join.
+    ///
+    /// Atomically transitions the meeting status from `scheduled` to `active`
+    /// and sets `actual_start_time`. The `WHERE status = 'scheduled'` clause
+    /// ensures idempotency — if the meeting is already `active`, `ended`, or
+    /// `cancelled`, this is a no-op returning `None`.
+    ///
+    /// Concurrency-safe: only one concurrent caller will successfully transition
+    /// the row; others will see zero rows affected and get `None`.
+    ///
+    /// # Arguments
+    ///
+    /// * `pool` - Database connection pool
+    /// * `meeting_id` - Meeting UUID to activate
+    ///
+    /// # Returns
+    ///
+    /// `Some((meeting_id, org_id))` if the meeting was activated (was `scheduled`),
+    /// `None` if no transition occurred (already `active`/`ended`/`cancelled`).
+    #[allow(dead_code)] // Used by integration tests and future join handler
+    #[instrument(skip_all, name = "gc.repo.activate_meeting", fields(meeting_id = %meeting_id))]
+    pub async fn activate_meeting(
+        pool: &PgPool,
+        meeting_id: Uuid,
+    ) -> Result<Option<(Uuid, Uuid)>, GcError> {
+        let start = Instant::now();
+
+        let row: Option<(Uuid, Uuid)> = sqlx::query_as(
+            r#"
+            UPDATE meetings
+            SET status = 'active', actual_start_time = NOW()
+            WHERE meeting_id = $1 AND status = 'scheduled'
+            RETURNING meeting_id, org_id
+            "#,
+        )
+        .bind(meeting_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| {
+            let duration = start.elapsed();
+            metrics::record_db_query("activate_meeting", "error", duration);
+            GcError::Database(e.to_string())
+        })?;
+
+        let duration = start.elapsed();
+        metrics::record_db_query("activate_meeting", "success", duration);
+
+        Ok(row)
     }
 }
 

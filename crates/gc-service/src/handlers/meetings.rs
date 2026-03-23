@@ -245,8 +245,14 @@ pub async fn create_meeting(
     })?;
 
     // 8. Fire-and-forget audit log (R-9)
-    if let Err(e) =
-        MeetingsRepository::log_audit_event(&state.pool, org_id, user_id, row.meeting_id).await
+    if let Err(e) = MeetingsRepository::log_audit_event(
+        &state.pool,
+        org_id,
+        Some(user_id),
+        row.meeting_id,
+        "meeting_created",
+    )
+    .await
     {
         warn!(
             target: "gc.handlers.meetings",

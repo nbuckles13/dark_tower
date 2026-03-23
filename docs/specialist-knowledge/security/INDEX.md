@@ -17,7 +17,7 @@
 - Token issuance → `crates/ac-service/src/services/token_service.rs:issue_service_token()`, `issue_user_token()`
 - Security config bounds → `crates/ac-service/src/config.rs`
 - JWT size constant → `crates/common/src/jwt.rs:MAX_JWT_SIZE_BYTES`
-- Shared claims types → `crates/common/src/jwt.rs:ServiceClaims`, `UserClaims`, `MeetingTokenClaims`, `GuestTokenClaims` (PII-redacted Debug)
+- Shared claims types (PII-redacted Debug) → `crates/common/src/jwt.rs:ServiceClaims`, `UserClaims`, `MeetingTokenClaims`, `GuestTokenClaims::validate()`
 - Meeting token enums → `crates/common/src/jwt.rs:ParticipantType`, `MeetingRole`
 - Token manager (secure constructor) → `crates/common/src/token_manager.rs:new_secure()`
 - GC JWT validation → `crates/gc-service/src/auth/jwt.rs:validate()`, `validate_user()`, `verify_token()`
@@ -26,6 +26,7 @@
 - GC CSPRNG generators → `crates/gc-service/src/handlers/meetings.rs:generate_meeting_code()`, `generate_join_token_secret()`
 - GC role enforcement constants → `crates/gc-service/src/handlers/meetings.rs:MEETING_CREATE_ROLES`
 - GC atomic org limit CTE → `crates/gc-service/src/repositories/meetings.rs:create_meeting_with_limit_check()`
+- GC meeting activation + audit logging → `crates/gc-service/src/repositories/meetings.rs:activate_meeting()`, `log_audit_event()`
 - GC participant tracking (DB CHECK + partial unique index) → `crates/gc-service/src/repositories/participants.rs`, `migrations/20260322000001_add_participant_tracking.sql`
 - MC gRPC auth interceptor → `crates/mc-service/src/grpc/auth_interceptor.rs`
 - MC session binding actors → `crates/mc-service/src/actors/session.rs`
@@ -45,6 +46,5 @@
 - Post-deploy join_token_secret leak check → `docs/runbooks/gc-deployment.md` (Test 6)
 
 ## Cross-Cutting Gotchas
-- Dummy bcrypt hash must match production cost factor → `crates/ac-service/src/services/token_service.rs`
-- `.expose_secret()` calls are audit points → `crates/ac-service/src/`
+- Dummy bcrypt hash cost factor / `.expose_secret()` audit → `crates/ac-service/src/`
 - Silent `return Ok(())` in env-tests is fail-open → `crates/env-tests/tests/`
