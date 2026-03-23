@@ -37,19 +37,15 @@
 ## Code Locations — Database & Migrations
 - Participant tracking migration → `migrations/20260322000001_add_participant_tracking.sql`
 - ParticipantsRepository → `crates/gc-service/src/repositories/participants.rs`
-- Participant model → `crates/gc-service/src/models/mod.rs:Participant`
+- Meeting activation (scheduled→active) → `crates/gc-service/src/repositories/meetings.rs:activate_meeting()`
+- Audit event logging + updated_at trigger → `crates/gc-service/src/repositories/meetings.rs:log_audit_event()`
 
-## Code Locations — Observability
+## Code Locations — Observability & Tokens
 - GC metrics recorder → `crates/gc-service/src/observability/metrics.rs`
 - GC metrics catalog → `docs/observability/metrics/gc-service.md`
-- MC metrics catalog → `docs/observability/metrics/mc-service.md`
-- MC health probes (commented, Phase 6h) → `infra/services/mc-service/deployment.yaml:109`
-
-## Code Locations — Token Claims (shared)
-- Meeting/Guest token claims → `crates/common/src/jwt.rs:MeetingTokenClaims`, `GuestTokenClaims`
-- AC token issuance (meeting/guest) → `crates/ac-service/src/handlers/internal_tokens.rs`
+- MC health probes (Phase 6h) → `infra/services/mc-service/deployment.yaml:109`
+- Meeting/Guest token claims + validation → `crates/common/src/jwt.rs:MeetingTokenClaims`, `GuestTokenClaims::validate()`
 
 ## Integration Seams
-- Env-tests (cluster validation) → `crates/env-tests/`
-- Metric catalogs (guard cross-ref) → `docs/observability/metrics/`
+- Env-tests → `crates/env-tests/`
 - NetworkPolicy cross-refs → `infra/services/*/network-policy.yaml`

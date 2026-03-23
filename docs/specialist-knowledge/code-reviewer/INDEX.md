@@ -28,14 +28,14 @@
 - Auth middleware → `crates/gc-service/src/middleware/auth.rs:require_user_auth()`, `extract_bearer_token()`
 - Meeting handlers → `crates/gc-service/src/handlers/meetings.rs:create_meeting()`, `join_meeting()`
 - Meetings repository (atomic CTE) → `crates/gc-service/src/repositories/meetings.rs:create_meeting_with_limit_check()`
-- Participants repository → `crates/gc-service/src/repositories/participants.rs:ParticipantsRepository`
-- Participant model (FromRow) → `crates/gc-service/src/models/mod.rs:Participant`
-- Participant migration (ALTER TABLE) → `migrations/20260322000001_add_participant_tracking.sql`
+- Meeting activation + audit logging → `crates/gc-service/src/repositories/meetings.rs:activate_meeting()`, `log_audit_event()`
+- Participants repo + model → `crates/gc-service/src/repositories/participants.rs:ParticipantsRepository`, `crates/gc-service/src/models/mod.rs:Participant`
+- Participant tests + migration → `crates/gc-service/tests/participant_tests.rs`, `migrations/20260322000001_add_participant_tracking.sql`
 - Route composition (user auth layer) → `crates/gc-service/src/routes/mod.rs:build_routes()`
 
 ## Code Locations — Common
-- Shared JWT claims → `crates/common/src/jwt.rs:ServiceClaims`, `UserClaims`, `MeetingTokenClaims`, `GuestTokenClaims`
-- Meeting token enums → `crates/common/src/jwt.rs:ParticipantType`, `MeetingRole`
+- JWT claims & enums → `crates/common/src/jwt.rs:ServiceClaims`, `UserClaims`, `MeetingTokenClaims`, `GuestTokenClaims`, `ParticipantType`, `MeetingRole`
+- Guest token validation → `crates/common/src/jwt.rs:GuestTokenClaims::validate()`
 - SecretString/SecretBox → `crates/common/src/secret.rs`
 - TokenManager → `crates/common/src/token_manager.rs:spawn_token_manager()`
 

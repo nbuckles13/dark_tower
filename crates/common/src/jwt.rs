@@ -418,6 +418,30 @@ pub struct GuestTokenClaims {
     pub jti: String,
 }
 
+impl GuestTokenClaims {
+    /// Validate that the guest token claims contain expected fixed values.
+    ///
+    /// Guest tokens must have `token_type`, `participant_type`, and `role`
+    /// all set to `"guest"`. This prevents a tampered or malformed token
+    /// from carrying elevated privileges (e.g., `role: "host"`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error message if any of the fixed fields have unexpected values.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.token_type != "guest" {
+            return Err("Guest token must have token_type 'guest'");
+        }
+        if self.participant_type != "guest" {
+            return Err("Guest token must have participant_type 'guest'");
+        }
+        if self.role != "guest" {
+            return Err("Guest token must have role 'guest'");
+        }
+        Ok(())
+    }
+}
+
 impl fmt::Debug for GuestTokenClaims {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("GuestTokenClaims")
@@ -1518,5 +1542,97 @@ mod tests {
         assert_eq!(cloned.sub, claims.sub);
         assert_eq!(cloned.display_name, claims.display_name);
         assert_eq!(cloned.waiting_room, true);
+    }
+
+    #[test]
+    fn test_guest_token_claims_validate_success() {
+        let claims = GuestTokenClaims {
+            sub: "guest-uuid".to_string(),
+            token_type: "guest".to_string(),
+            meeting_id: "meeting-uuid".to_string(),
+            meeting_org_id: "org-uuid".to_string(),
+            participant_type: "guest".to_string(),
+            role: "guest".to_string(),
+            display_name: "Alice".to_string(),
+            waiting_room: true,
+            capabilities: vec!["video".to_string()],
+            iat: 1_234_567_890,
+            exp: 1_234_568_790,
+            jti: "jti-id".to_string(),
+        };
+
+        assert!(claims.validate().is_ok());
+    }
+
+    #[test]
+    fn test_guest_token_claims_validate_rejects_wrong_token_type() {
+        let claims = GuestTokenClaims {
+            sub: "guest-uuid".to_string(),
+            token_type: "meeting".to_string(),
+            meeting_id: "meeting-uuid".to_string(),
+            meeting_org_id: "org-uuid".to_string(),
+            participant_type: "guest".to_string(),
+            role: "guest".to_string(),
+            display_name: "Alice".to_string(),
+            waiting_room: false,
+            capabilities: vec![],
+            iat: 1_234_567_890,
+            exp: 1_234_568_790,
+            jti: "jti-id".to_string(),
+        };
+
+        let result = claims.validate();
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err(),
+            "Guest token must have token_type 'guest'"
+        );
+    }
+
+    #[test]
+    fn test_guest_token_claims_validate_rejects_wrong_participant_type() {
+        let claims = GuestTokenClaims {
+            sub: "guest-uuid".to_string(),
+            token_type: "guest".to_string(),
+            meeting_id: "meeting-uuid".to_string(),
+            meeting_org_id: "org-uuid".to_string(),
+            participant_type: "member".to_string(),
+            role: "guest".to_string(),
+            display_name: "Alice".to_string(),
+            waiting_room: false,
+            capabilities: vec![],
+            iat: 1_234_567_890,
+            exp: 1_234_568_790,
+            jti: "jti-id".to_string(),
+        };
+
+        let result = claims.validate();
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err(),
+            "Guest token must have participant_type 'guest'"
+        );
+    }
+
+    #[test]
+    fn test_guest_token_claims_validate_rejects_wrong_role() {
+        let claims = GuestTokenClaims {
+            sub: "guest-uuid".to_string(),
+            token_type: "guest".to_string(),
+            meeting_id: "meeting-uuid".to_string(),
+            meeting_org_id: "org-uuid".to_string(),
+            participant_type: "guest".to_string(),
+            role: "host".to_string(),
+            display_name: "Alice".to_string(),
+            waiting_room: false,
+            capabilities: vec![],
+            iat: 1_234_567_890,
+            exp: 1_234_568_790,
+            jti: "jti-id".to_string(),
+        };
+
+        let result = claims.validate();
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), "Guest token must have role 'guest'");
     }
 }

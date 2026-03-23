@@ -22,8 +22,10 @@
 - Auth/JWT tests -> `crates/gc-service/tests/auth_tests.rs`
 - Meeting join/guest/settings tests -> `crates/gc-service/tests/meeting_tests.rs`
 - Meeting creation tests -> `crates/gc-service/tests/meeting_create_tests.rs`
-- Participant repository tests -> `crates/gc-service/tests/participant_tests.rs`
+- Participant & activation tests -> `crates/gc-service/tests/participant_tests.rs`
 - Meeting assignment tests -> `crates/gc-service/tests/meeting_assignment_tests.rs`
+- Meeting activation repo -> `crates/gc-service/src/repositories/meetings.rs:activate_meeting()`
+- Audit event logging -> `crates/gc-service/src/repositories/meetings.rs:log_audit_event()`
 - Test harness (HTTP seam) -> `crates/gc-test-utils/src/server_harness.rs`
 
 ## Code Locations: MC Service
@@ -45,7 +47,5 @@
 - JWT validation -> `crates/common/src/jwt.rs`
 - UserClaims struct -> `crates/common/src/jwt.rs:UserClaims`
 - MeetingTokenClaims struct -> `crates/common/src/jwt.rs:MeetingTokenClaims`
-- GuestTokenClaims struct -> `crates/common/src/jwt.rs:GuestTokenClaims`
-- ParticipantType/MeetingRole enums -> `crates/common/src/jwt.rs:ParticipantType`
+- GuestTokenClaims & validate(), ParticipantType, MeetingRole → `crates/common/src/jwt.rs`
 - Token manager (retry/refresh) -> `crates/common/src/token_manager.rs`
-

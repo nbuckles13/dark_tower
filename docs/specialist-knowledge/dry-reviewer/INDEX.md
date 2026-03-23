@@ -10,7 +10,7 @@
 - ServiceClaims (extracted from AC) -> `crates/common/src/jwt.rs:ServiceClaims`
 - UserClaims (extracted from AC, ADR-0020) -> `crates/common/src/jwt.rs:UserClaims`
 - MeetingTokenClaims (ADR-0020) -> `crates/common/src/jwt.rs:MeetingTokenClaims`
-- GuestTokenClaims (ADR-0020) -> `crates/common/src/jwt.rs:GuestTokenClaims`
+- GuestTokenClaims + validate() (ADR-0020) -> `crates/common/src/jwt.rs:GuestTokenClaims`
 - ParticipantType enum -> `crates/common/src/jwt.rs:ParticipantType`
 - MeetingRole enum -> `crates/common/src/jwt.rs:MeetingRole`
 - Token management (prevents static token dup) -> `crates/common/src/token_manager.rs:TokenManagerConfig`
@@ -27,6 +27,7 @@
 - Generic verify_token<T> (service + user tokens, single JWK path) -> `crates/gc-service/src/auth/jwt.rs:verify_token()`
 - Shared bearer token extraction (both auth middlewares) -> `crates/gc-service/src/middleware/auth.rs:extract_bearer_token()`
 - Shared map_row_to_meeting (handler + repo, single definition) -> `crates/gc-service/src/repositories/meetings.rs:map_row_to_meeting()`
+- Parameterized audit logging (action + optional user_id) -> `crates/gc-service/src/repositories/meetings.rs:log_audit_event()`
 - Closure-based generic extraction -> `crates/gc-service/src/tasks/generic_health_checker.rs:start_generic_health_checker()`
 - Thin wrappers after extraction -> `crates/gc-service/src/tasks/health_checker.rs`, `crates/gc-service/src/tasks/mh_health_checker.rs`
 
@@ -36,8 +37,7 @@
 - Per-subsystem metric functions (record_meeting_creation vs record_token_refresh) -> per-service `observability/metrics.rs`
 
 ## K8s Manifest Patterns
-- NetworkPolicy cross-refs -> `infra/services/{ac,gc,mc}-service/network-policy.yaml`
-- ServiceMonitor cross-refs -> `infra/services/{ac,gc,mc}-service/service-monitor.yaml`
+- NetworkPolicy + ServiceMonitor cross-refs -> `infra/services/{ac,gc,mc}-service/`
 - GC ServiceMonitor (first enabled, reference pattern) -> `infra/services/gc-service/service-monitor.yaml`
 
 ## Integration Seams
