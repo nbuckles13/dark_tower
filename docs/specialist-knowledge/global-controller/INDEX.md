@@ -17,8 +17,8 @@
 - HTTP auth middleware (service token) -> `crates/gc-service/src/middleware/auth.rs:require_auth()`
 - HTTP auth middleware (user token) -> `crates/gc-service/src/middleware/auth.rs:require_user_auth()`
 - gRPC auth layer (Tower) -> `crates/gc-service/src/grpc/auth_layer.rs:GrpcAuthLayer`
-- Meeting handlers (create, join, guest, settings) -> `crates/gc-service/src/handlers/meetings.rs`
-- Meeting creation (handler, code gen, token gen) -> `crates/gc-service/src/handlers/meetings.rs:create_meeting()`
+- Meeting handlers (create, join, guest-token, settings) -> `crates/gc-service/src/handlers/meetings.rs`
+- Join/settings (user-auth, status allowlist, metrics) -> `crates/gc-service/src/handlers/meetings.rs:join_meeting()`, `update_meeting_settings()`
 - MC gRPC service (register, heartbeat) -> `crates/gc-service/src/grpc/mc_service.rs:McService`
 - MH gRPC service (register, load report) -> `crates/gc-service/src/grpc/mh_service.rs:MhService`
 - MC assignment + load balancing -> `crates/gc-service/src/services/mc_assignment.rs:McAssignmentService`
@@ -28,11 +28,10 @@
 - MC repository (register, heartbeat, staleness) -> `crates/gc-service/src/repositories/meeting_controllers.rs`
 - MH repository -> `crates/gc-service/src/repositories/media_handlers.rs`
 - Meetings repository (create with limit check, audit log) -> `crates/gc-service/src/repositories/meetings.rs:MeetingsRepository`
-- Meeting row mapper (shared) -> `crates/gc-service/src/repositories/meetings.rs:map_row_to_meeting()`
-- Assignment repository (weighted select, atomic assign) -> `crates/gc-service/src/repositories/meeting_assignments.rs`
+- Assignment repository (weighted select, atomic assign, row mapper) -> `crates/gc-service/src/repositories/meeting_assignments.rs`
 - Generic health checker loop -> `crates/gc-service/src/tasks/generic_health_checker.rs`
 - Assignment cleanup (soft/hard delete) -> `crates/gc-service/src/tasks/assignment_cleanup.rs`
-- Observability metrics -> `crates/gc-service/src/observability/metrics.rs`
+- Observability metrics (incl. join metrics) -> `crates/gc-service/src/observability/metrics.rs`
 - Grafana dashboard -> `infra/grafana/dashboards/gc-overview.json`
 
 ## Integration Seams
@@ -46,5 +45,6 @@
 - env-tests GC client fixture -> `crates/env-tests/src/fixtures/gc_client.rs`
 
 ## Tests
-- Meeting creation integration tests -> `crates/gc-service/tests/meeting_create_tests.rs`
-- Meeting creation metrics catalog -> `docs/observability/metrics/gc-service.md` (Meeting Creation section)
+- Meeting creation tests -> `crates/gc-service/tests/meeting_create_tests.rs`
+- Meeting join/guest/settings tests -> `crates/gc-service/tests/meeting_tests.rs`
+- Metrics catalog (creation + join) -> `docs/observability/metrics/gc-service.md`

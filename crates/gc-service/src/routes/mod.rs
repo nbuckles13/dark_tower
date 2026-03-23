@@ -43,9 +43,9 @@ pub struct AppState {
 /// - `/metrics` - Prometheus metrics endpoint (ADR-0011) - public, unversioned
 /// - `/api/v1/me` - Current user endpoint - requires service authentication
 /// - `/api/v1/meetings` - Create meeting (user authenticated)
-/// - `/api/v1/meetings/{code}` - Join meeting (service authenticated)
+/// - `/api/v1/meetings/{code}` - Join meeting (user authenticated)
 /// - `/api/v1/meetings/{code}/guest-token` - Get guest token (public)
-/// - `/api/v1/meetings/{id}/settings` - Update meeting settings (service authenticated, host only)
+/// - `/api/v1/meetings/{id}/settings` - Update meeting settings (user authenticated, host only)
 /// - TraceLayer for request logging
 /// - HTTP metrics middleware (ADR-0011)
 /// - 30 second request timeout
@@ -79,6 +79,13 @@ pub fn build_routes(state: Arc<AppState>, metrics_handle: PrometheusHandle) -> R
     let user_auth_routes = Router::new()
         // Meeting creation endpoint
         .route("/api/v1/meetings", post(handlers::create_meeting))
+        // Meeting join endpoint
+        .route("/api/v1/meetings/:code", get(handlers::join_meeting))
+        // Meeting settings endpoint
+        .route(
+            "/api/v1/meetings/:id/settings",
+            patch(handlers::update_meeting_settings),
+        )
         .route_layer(middleware::from_fn_with_state(
             auth_state.clone(),
             require_user_auth,
@@ -89,13 +96,6 @@ pub fn build_routes(state: Arc<AppState>, metrics_handle: PrometheusHandle) -> R
     let protected_routes = Router::new()
         // Current user endpoint
         .route("/api/v1/me", get(handlers::get_me))
-        // Meeting join endpoint
-        .route("/api/v1/meetings/:code", get(handlers::join_meeting))
-        // Meeting settings endpoint
-        .route(
-            "/api/v1/meetings/:id/settings",
-            patch(handlers::update_meeting_settings),
-        )
         .route_layer(middleware::from_fn_with_state(
             auth_state.clone(),
             require_auth,

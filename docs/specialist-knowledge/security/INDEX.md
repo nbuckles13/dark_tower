@@ -25,6 +25,8 @@
 - GC auth middleware → `crates/gc-service/src/middleware/auth.rs:require_auth()`, `require_user_auth()`
 - GC CSPRNG generators → `crates/gc-service/src/handlers/meetings.rs:generate_meeting_code()`, `generate_join_token_secret()`
 - GC role enforcement constants → `crates/gc-service/src/handlers/meetings.rs:MEETING_CREATE_ROLES`
+- GC join status allowlist → `crates/gc-service/src/handlers/meetings.rs:join_meeting()`, `get_guest_token()`
+- GC join metrics (bounded error_type labels) → `crates/gc-service/src/observability/metrics.rs:record_meeting_join()`
 - GC atomic org limit CTE → `crates/gc-service/src/repositories/meetings.rs:create_meeting_with_limit_check()`
 - GC meeting activation + audit logging → `crates/gc-service/src/repositories/meetings.rs:activate_meeting()`, `log_audit_event()`
 - GC participant tracking (DB CHECK + partial unique index) → `crates/gc-service/src/repositories/participants.rs`, `migrations/20260322000001_add_participant_tracking.sql`
@@ -40,11 +42,9 @@
 - GC user-auth route layer → `crates/gc-service/src/routes/mod.rs:build_routes()` (user_auth_routes)
 - Credential leak guards → `scripts/guards/simple/no-secrets-in-logs.sh`, `instrument-skip-all.sh`
 
-## Runbooks (Security-Relevant Scenarios)
-- Resource exhaustion (org limit abuse) → `docs/runbooks/gc-incident-response.md#scenario-8-meeting-creation-limit-exhaustion`
-- CSPRNG failure (code collision) → `docs/runbooks/gc-incident-response.md#scenario-9-meeting-code-collision`
+## Runbooks (Security-Relevant)
+- Resource exhaustion / CSPRNG collision → `docs/runbooks/gc-incident-response.md` (scenarios 8-9)
 - Post-deploy join_token_secret leak check → `docs/runbooks/gc-deployment.md` (Test 6)
 
-## Cross-Cutting Gotchas
-- Dummy bcrypt hash cost factor / `.expose_secret()` audit → `crates/ac-service/src/`
-- Silent `return Ok(())` in env-tests is fail-open → `crates/env-tests/tests/`
+## Cross-Cutting Audit Points
+- Bcrypt cost factor & `.expose_secret()` → `crates/ac-service/src/`; fail-open env-tests → `crates/env-tests/tests/`

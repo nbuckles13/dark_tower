@@ -11,20 +11,14 @@
 
 ## Code Locations — CI & Guards
 - CI pipeline → `.github/workflows/ci.yml`
-- Guard runner → `scripts/guards/run-guards.sh`
-- Application metrics guard → `scripts/guards/simple/validate-application-metrics.sh`
+- Guard runner + application metrics guard → `scripts/guards/run-guards.sh`, `scripts/guards/simple/validate-application-metrics.sh`
 
 ## Code Locations — Deployment & K8s
 - Kind cluster config → `infra/kind/kind-config.yaml`
 - Kind setup/iterate/teardown → `infra/kind/scripts/`
 - Per-service manifests (deployment, netpol, PDB) → `infra/services/{ac,gc,mc}-service/`
 - Alert rules → `infra/docker/prometheus/rules/{gc,mc}-alerts.yaml`
-- Grafana dashboards → `infra/grafana/dashboards/`
-
-## Code Locations — Operational Scripts
-- Dev cert generation → `scripts/generate-dev-certs.sh`
-- Master key generation → `scripts/generate-master-key.sh`
-- Service registration → `scripts/register-service.sh`
+- Dev certs, master key, service registration → `scripts/generate-dev-certs.sh`, `generate-master-key.sh`, `register-service.sh`
 
 ## Runbooks
 - GC incident response (Scenarios 1-9) → `docs/runbooks/gc-incident-response.md`
@@ -43,9 +37,14 @@
 ## Code Locations — Observability & Tokens
 - GC metrics recorder → `crates/gc-service/src/observability/metrics.rs`
 - GC metrics catalog → `docs/observability/metrics/gc-service.md`
+- GC meeting join metrics → `crates/gc-service/src/observability/metrics.rs:record_meeting_join()`
+- GC overview dashboard → `infra/grafana/dashboards/gc-overview.json`
 - MC health probes (Phase 6h) → `infra/services/mc-service/deployment.yaml:109`
 - Meeting/Guest token claims + validation → `crates/common/src/jwt.rs:MeetingTokenClaims`, `GuestTokenClaims::validate()`
 
+## Code Locations — GC Routes & Handlers
+- GC route definitions (public, user-auth, service-auth) → `crates/gc-service/src/routes/mod.rs`
+- Meeting handlers (join, guest-token, settings, create) → `crates/gc-service/src/handlers/meetings.rs`
+
 ## Integration Seams
 - Env-tests → `crates/env-tests/`
-- NetworkPolicy cross-refs → `infra/services/*/network-policy.yaml`

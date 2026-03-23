@@ -198,6 +198,50 @@ All GC service metrics follow ADR-0011 naming conventions with the `gc_` prefix.
 
 ---
 
+## Meeting Join Metrics
+
+### `gc_meeting_join_total`
+- **Type**: Counter
+- **Description**: Total meeting join attempts
+- **Labels**:
+  - `status`: Join outcome (success, error)
+- **Cardinality**: Low (2 statuses)
+- **Usage**: Track meeting join rate and success
+- **Example**:
+  ```promql
+  rate(gc_meeting_join_total{status="error"}[5m])
+  ```
+
+### `gc_meeting_join_duration_seconds`
+- **Type**: Histogram
+- **Description**: Meeting join operation duration (end-to-end handler time including MC assignment and AC token request)
+- **Labels**:
+  - `status`: Join outcome (success, error)
+- **Buckets**: [0.010, 0.025, 0.050, 0.100, 0.200, 0.500, 1.000, 2.000, 5.000]
+- **Cardinality**: Low (2 statuses)
+- **Usage**: Monitor meeting join latency, identify slow MC assignment or AC token paths
+- **Example**:
+  ```promql
+  histogram_quantile(0.95,
+    sum(rate(gc_meeting_join_duration_seconds_bucket{status="success"}[5m])) by (le)
+  )
+  ```
+
+### `gc_meeting_join_failures_total`
+- **Type**: Counter
+- **Description**: Meeting join failures by error type
+- **Labels**:
+  - `error_type`: Type of failure (not_found, forbidden, unauthorized, bad_status, mc_assignment, ac_request, internal)
+- **Cardinality**: Low (7 error types)
+- **Alert**: High rate may indicate MC capacity issues or AC connectivity problems
+- **Usage**: Diagnose meeting join failures
+- **Example**:
+  ```promql
+  sum(rate(gc_meeting_join_failures_total[5m])) by (error_type)
+  ```
+
+---
+
 ## AC Client Metrics
 
 ### `gc_ac_requests_total`
@@ -375,6 +419,19 @@ sum(rate(gc_meeting_creation_total[5m]))
 ```promql
 histogram_quantile(0.95,
   sum(rate(gc_meeting_creation_duration_seconds_bucket{status="success"}[5m])) by (le)
+)
+```
+
+### Meeting Join Success Rate
+```promql
+sum(rate(gc_meeting_join_total{status="success"}[5m])) /
+sum(rate(gc_meeting_join_total[5m]))
+```
+
+### Meeting Join p95 Latency
+```promql
+histogram_quantile(0.95,
+  sum(rate(gc_meeting_join_duration_seconds_bucket{status="success"}[5m])) by (le)
 )
 ```
 

@@ -60,7 +60,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 // Test Helpers
 // ============================================================================
 
-/// JWT Claims for test tokens.
+/// JWT Claims for service test tokens (used by /api/v1/me).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct TestClaims {
     sub: String,
@@ -69,6 +69,18 @@ struct TestClaims {
     scope: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     service_type: Option<String>,
+}
+
+/// JWT Claims for user test tokens (used by join/settings/create endpoints).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TestUserClaims {
+    sub: String,
+    org_id: String,
+    email: String,
+    roles: Vec<String>,
+    iat: i64,
+    exp: i64,
+    jti: String,
 }
 
 /// Test keypair for signing tokens.
@@ -107,6 +119,15 @@ impl TestKeypair {
         header.kid = Some(self.kid.clone());
 
         encode(&header, claims, &encoding_key).expect("Failed to sign token")
+    }
+
+    fn sign_user_token(&self, claims: &TestUserClaims) -> String {
+        let encoding_key = EncodingKey::from_ed_der(&self.private_key_pkcs8);
+        let mut header = Header::new(Algorithm::EdDSA);
+        header.typ = Some("JWT".to_string());
+        header.kid = Some(self.kid.clone());
+
+        encode(&header, claims, &encoding_key).expect("Failed to sign user token")
     }
 
     /// Create a token with HS256 algorithm (wrong algorithm attack).
@@ -305,69 +326,99 @@ impl TestMeetingServer {
         format!("http://{}", self.addr)
     }
 
-    /// Create a valid token for a specific user ID.
-    fn create_token_for_user(&self, user_id: Uuid) -> String {
+    /// Create a valid user token for a specific user ID and org ID.
+    fn create_token_for_user(&self, user_id: Uuid, org_id: Uuid) -> String {
         let now = Utc::now().timestamp();
-        let claims = TestClaims {
+        let claims = TestUserClaims {
             sub: user_id.to_string(),
-            exp: now + 3600, // 1 hour
+            org_id: org_id.to_string(),
+            email: format!("{}@test.com", user_id),
+            roles: vec!["user".to_string()],
             iat: now,
-            scope: "read write".to_string(),
-            service_type: Some("global-controller".to_string()),
+            exp: now + 3600, // 1 hour
+            jti: Uuid::new_v4().to_string(),
         };
-        self.keypair.sign_token(&claims)
+        self.keypair.sign_user_token(&claims)
     }
 
-    /// Create an expired token.
+    /// Create an expired user token.
     fn create_expired_token(&self) -> String {
         let now = Utc::now().timestamp();
-        let claims = TestClaims {
+        let claims = TestUserClaims {
             sub: Uuid::new_v4().to_string(),
-            exp: now - 3600, // Expired 1 hour ago
+            org_id: Uuid::new_v4().to_string(),
+            email: "expired@test.com".to_string(),
+            roles: vec!["user".to_string()],
             iat: now - 7200, // Issued 2 hours ago
-            scope: "read write".to_string(),
-            service_type: None,
+            exp: now - 3600, // Expired 1 hour ago
+            jti: Uuid::new_v4().to_string(),
         };
-        self.keypair.sign_token(&claims)
+        self.keypair.sign_user_token(&claims)
     }
 
-    /// Create a token with HS256 algorithm (algorithm confusion attack).
-    fn create_hs256_token_for_user(&self, user_id: Uuid) -> String {
+    /// Create a user token with HS256 algorithm (algorithm confusion attack).
+    fn create_hs256_token_for_user(&self, user_id: Uuid, org_id: Uuid) -> String {
         let now = Utc::now().timestamp();
-        let claims = TestClaims {
+        let claims = TestUserClaims {
             sub: user_id.to_string(),
-            exp: now + 3600,
+            org_id: org_id.to_string(),
+            email: format!("{}@test.com", user_id),
+            roles: vec!["user".to_string()],
             iat: now,
-            scope: "read write".to_string(),
-            service_type: Some("global-controller".to_string()),
+            exp: now + 3600,
+            jti: Uuid::new_v4().to_string(),
         };
-        self.keypair.create_hs256_token(&claims)
+        // Use public key as HMAC secret (algorithm confusion attack)
+        let encoding_key = EncodingKey::from_secret(&self.keypair.public_key_bytes);
+        let mut header = Header::new(Algorithm::HS256);
+        header.typ = Some("JWT".to_string());
+        header.kid = Some(self.keypair.kid.clone());
+        encode(&header, &claims, &encoding_key).expect("Failed to sign HS256 token")
     }
 
-    /// Create a token signed with a different (wrong) key.
-    fn create_token_with_wrong_key(&self, user_id: Uuid) -> String {
+    /// Create a user token signed with a different (wrong) key.
+    fn create_token_with_wrong_key(&self, user_id: Uuid, org_id: Uuid) -> String {
         let now = Utc::now().timestamp();
-        let claims = TestClaims {
+        let claims = TestUserClaims {
             sub: user_id.to_string(),
-            exp: now + 3600,
+            org_id: org_id.to_string(),
+            email: format!("{}@test.com", user_id),
+            roles: vec!["user".to_string()],
             iat: now,
-            scope: "read write".to_string(),
-            service_type: Some("global-controller".to_string()),
+            exp: now + 3600,
+            jti: Uuid::new_v4().to_string(),
         };
-        self.keypair.create_token_with_wrong_key(&claims)
+        // Sign with a different keypair (same kid, different private key)
+        let wrong_keypair = TestKeypair::new(99, &self.keypair.kid);
+        wrong_keypair.sign_user_token(&claims)
     }
 
-    /// Create a tampered token (payload modified after signing).
-    fn create_tampered_token(&self, user_id: Uuid) -> String {
+    /// Create a tampered user token (payload modified after signing).
+    fn create_tampered_token(&self, user_id: Uuid, org_id: Uuid) -> String {
         let now = Utc::now().timestamp();
-        let claims = TestClaims {
+        let claims = TestUserClaims {
             sub: user_id.to_string(),
-            exp: now + 3600,
+            org_id: org_id.to_string(),
+            email: format!("{}@test.com", user_id),
+            roles: vec!["user".to_string()],
             iat: now,
-            scope: "read write".to_string(),
-            service_type: Some("global-controller".to_string()),
+            exp: now + 3600,
+            jti: Uuid::new_v4().to_string(),
         };
-        self.keypair.create_tampered_token(&claims)
+        // Sign the valid token first
+        let valid_token = self.keypair.sign_user_token(&claims);
+        let parts: Vec<&str> = valid_token.split('.').collect();
+        let header = parts.first().expect("JWT missing header");
+        let signature = parts.get(2).expect("JWT missing signature");
+
+        // Modify claims to escalate privileges
+        let mut modified_claims = claims;
+        modified_claims.roles = vec!["admin".to_string(), "superuser".to_string()];
+        let modified_payload =
+            URL_SAFE_NO_PAD.encode(serde_json::to_string(&modified_claims).unwrap().as_bytes());
+
+        // Reassemble with original signature (won't match)
+        format!("{}.{}.{}", header, modified_payload, signature)
     }
 }
 
@@ -416,31 +467,6 @@ async fn create_test_user(pool: &PgPool, org_id: Uuid, email: &str, display_name
     .execute(pool)
     .await
     .expect("Failed to create test user");
-
-    user_id
-}
-
-/// Create an inactive test user in the database.
-async fn create_inactive_test_user(
-    pool: &PgPool,
-    org_id: Uuid,
-    email: &str,
-    display_name: &str,
-) -> Uuid {
-    let user_id = Uuid::new_v4();
-    sqlx::query(
-        r#"
-        INSERT INTO users (user_id, org_id, email, password_hash, display_name, is_active)
-        VALUES ($1, $2, $3, '$2b$12$test_hash_not_real', $4, false)
-        "#,
-    )
-    .bind(user_id)
-    .bind(org_id)
-    .bind(email)
-    .bind(display_name)
-    .execute(pool)
-    .await
-    .expect("Failed to create inactive test user");
 
     user_id
 }
@@ -589,7 +615,7 @@ async fn test_join_meeting_authenticated_success(pool: PgPool) -> Result<()> {
     .await;
 
     // Create token for the user
-    let token = server.create_token_for_user(user_id);
+    let token = server.create_token_for_user(user_id, org_id);
 
     let response = client
         .get(format!("{}/api/v1/meetings/ABC123", server.url()))
@@ -627,7 +653,7 @@ async fn test_join_meeting_not_found(pool: PgPool) -> Result<()> {
     let org_id = create_test_org(&server.pool, "test-org", "Test Organization").await;
     let user_id = create_test_user(&server.pool, org_id, "user@test.com", "Test User").await;
 
-    let token = server.create_token_for_user(user_id);
+    let token = server.create_token_for_user(user_id, org_id);
 
     let response = client
         .get(format!("{}/api/v1/meetings/NOTFOUND", server.url()))
@@ -663,7 +689,7 @@ async fn test_join_meeting_cancelled_returns_not_found(pool: PgPool) -> Result<(
     )
     .await;
 
-    let token = server.create_token_for_user(user_id);
+    let token = server.create_token_for_user(user_id, org_id);
 
     let response = client
         .get(format!("{}/api/v1/meetings/CANCEL1", server.url()))
@@ -700,7 +726,7 @@ async fn test_join_meeting_ended_returns_not_found(pool: PgPool) -> Result<()> {
     )
     .await;
 
-    let token = server.create_token_for_user(user_id);
+    let token = server.create_token_for_user(user_id, org_id);
 
     let response = client
         .get(format!("{}/api/v1/meetings/ENDED1", server.url()))
@@ -742,8 +768,8 @@ async fn test_join_meeting_cross_org_denied(pool: PgPool) -> Result<()> {
     )
     .await;
 
-    // External user tries to join
-    let token = server.create_token_for_user(external_user_id);
+    // External user tries to join (token carries org2_id)
+    let token = server.create_token_for_user(external_user_id, org2_id);
 
     let response = client
         .get(format!("{}/api/v1/meetings/NOEXT1", server.url()))
@@ -796,8 +822,8 @@ async fn test_join_meeting_cross_org_allowed(pool: PgPool) -> Result<()> {
     )
     .await;
 
-    // External user joins
-    let token = server.create_token_for_user(external_user_id);
+    // External user joins (token carries org2_id)
+    let token = server.create_token_for_user(external_user_id, org2_id);
 
     let response = client
         .get(format!("{}/api/v1/meetings/EXT001", server.url()))
@@ -840,7 +866,7 @@ async fn test_join_meeting_host_success(pool: PgPool) -> Result<()> {
     )
     .await;
 
-    let token = server.create_token_for_user(host_id);
+    let token = server.create_token_for_user(host_id, org_id);
 
     let response = client
         .get(format!("{}/api/v1/meetings/HOST01", server.url()))
@@ -881,7 +907,7 @@ async fn test_join_meeting_non_host_member(pool: PgPool) -> Result<()> {
     .await;
 
     // Member joins
-    let token = server.create_token_for_user(member_id);
+    let token = server.create_token_for_user(member_id, org_id);
 
     let response = client
         .get(format!("{}/api/v1/meetings/MEMBER1", server.url()))
@@ -1319,7 +1345,7 @@ async fn test_update_settings_allow_guests(pool: PgPool) -> Result<()> {
     )
     .await;
 
-    let token = server.create_token_for_user(host_id);
+    let token = server.create_token_for_user(host_id, org_id);
 
     let response = client
         .patch(format!(
@@ -1362,7 +1388,7 @@ async fn test_update_settings_allow_external(pool: PgPool) -> Result<()> {
     )
     .await;
 
-    let token = server.create_token_for_user(host_id);
+    let token = server.create_token_for_user(host_id, org_id);
 
     let response = client
         .patch(format!(
@@ -1408,7 +1434,7 @@ async fn test_update_settings_waiting_room(pool: PgPool) -> Result<()> {
     )
     .await;
 
-    let token = server.create_token_for_user(host_id);
+    let token = server.create_token_for_user(host_id, org_id);
 
     let response = client
         .patch(format!(
@@ -1457,7 +1483,7 @@ async fn test_update_settings_non_host_forbidden(pool: PgPool) -> Result<()> {
     .await;
 
     // Other user (not host) tries to update
-    let token = server.create_token_for_user(other_user_id);
+    let token = server.create_token_for_user(other_user_id, org_id);
 
     let response = client
         .patch(format!(
@@ -1489,7 +1515,7 @@ async fn test_update_settings_meeting_not_found(pool: PgPool) -> Result<()> {
     let org_id = create_test_org(&server.pool, "upd-org5", "Update Org 5").await;
     let user_id = create_test_user(&server.pool, org_id, "user@test.com", "User").await;
 
-    let token = server.create_token_for_user(user_id);
+    let token = server.create_token_for_user(user_id, org_id);
     let non_existent_id = Uuid::new_v4();
 
     let response = client
@@ -1534,7 +1560,7 @@ async fn test_update_settings_empty_update(pool: PgPool) -> Result<()> {
     )
     .await;
 
-    let token = server.create_token_for_user(host_id);
+    let token = server.create_token_for_user(host_id, org_id);
 
     // Empty update body (no fields set)
     let response = client
@@ -1580,7 +1606,7 @@ async fn test_update_settings_partial_update(pool: PgPool) -> Result<()> {
     )
     .await;
 
-    let token = server.create_token_for_user(host_id);
+    let token = server.create_token_for_user(host_id, org_id);
 
     // Only update allow_guests
     let response = client
@@ -1634,7 +1660,7 @@ async fn test_update_settings_multiple_fields(pool: PgPool) -> Result<()> {
     )
     .await;
 
-    let token = server.create_token_for_user(host_id);
+    let token = server.create_token_for_user(host_id, org_id);
 
     // Update all three settings
     let response = client
@@ -1732,7 +1758,7 @@ async fn test_jwt_wrong_algorithm_returns_401(pool: PgPool) -> Result<()> {
     .await;
 
     // Create token with HS256 algorithm (should be rejected)
-    let token = server.create_hs256_token_for_user(user_id);
+    let token = server.create_hs256_token_for_user(user_id, org_id);
 
     let response = client
         .get(format!("{}/api/v1/meetings/JWTALG", server.url()))
@@ -1773,7 +1799,7 @@ async fn test_jwt_wrong_key_returns_401(pool: PgPool) -> Result<()> {
     .await;
 
     // Create token signed with a different key (same kid, wrong private key)
-    let token = server.create_token_with_wrong_key(user_id);
+    let token = server.create_token_with_wrong_key(user_id, org_id);
 
     let response = client
         .get(format!("{}/api/v1/meetings/JWTKEY", server.url()))
@@ -1815,7 +1841,7 @@ async fn test_jwt_tampered_payload_returns_401(pool: PgPool) -> Result<()> {
     .await;
 
     // Create tampered token (payload modified after signing)
-    let token = server.create_tampered_token(user_id);
+    let token = server.create_tampered_token(user_id, org_id);
 
     let response = client
         .get(format!("{}/api/v1/meetings/JWTAMP", server.url()))
@@ -1967,17 +1993,24 @@ async fn test_concurrent_guest_requests_succeed(pool: PgPool) -> Result<()> {
 }
 
 // ============================================================================
-// Test Reviewer Findings - User Lookup Edge Cases (MINOR)
+// Token-based Auth Tests (UserClaims)
 // ============================================================================
 
-/// Test that JWT with valid user_id that doesn't exist in database returns 404.
+/// Test that user with valid token but non-existent user_id can still join
+/// (org_id comes from token, not DB lookup).
 ///
-/// This tests the user lookup path when the user_id from the token is valid
-/// but the user doesn't exist in the database.
+/// After migrating from service Claims to UserClaims, the join handler no
+/// longer performs a get_user_org_id DB lookup — org_id is extracted directly
+/// from the JWT. A non-existent user_id in the token is still a valid UUID
+/// and the join proceeds based on the token's org_id claim.
 #[sqlx::test(migrations = "../../migrations")]
-async fn test_join_meeting_user_not_found(pool: PgPool) -> Result<()> {
+async fn test_join_meeting_non_existent_user_succeeds_with_valid_token(pool: PgPool) -> Result<()> {
     let server = TestMeetingServer::spawn(pool.clone()).await?;
     let client = reqwest::Client::new();
+
+    // Register healthy MC and MHs for the test region
+    register_healthy_mc_for_region(&server.pool, "test-region").await;
+    register_healthy_mhs_for_region(&server.pool, "test-region").await;
 
     let org_id = create_test_org(&server.pool, "nouser-org", "No User Org").await;
     let host_id = create_test_user(&server.pool, org_id, "host@test.com", "Host").await;
@@ -1993,9 +2026,10 @@ async fn test_join_meeting_user_not_found(pool: PgPool) -> Result<()> {
     )
     .await;
 
-    // Create token with a user_id that doesn't exist in the database
+    // Token with valid org_id but non-existent user_id — should succeed
+    // because org_id comes from the token, not a DB lookup
     let non_existent_user_id = Uuid::new_v4();
-    let token = server.create_token_for_user(non_existent_user_id);
+    let token = server.create_token_for_user(non_existent_user_id, org_id);
 
     let response = client
         .get(format!("{}/api/v1/meetings/NOUSER", server.url()))
@@ -2005,61 +2039,9 @@ async fn test_join_meeting_user_not_found(pool: PgPool) -> Result<()> {
 
     assert_eq!(
         response.status(),
-        404,
-        "User not found should return 404 (from get_user_org_id)"
+        200,
+        "Non-existent user with valid org_id token should join (no DB user lookup)"
     );
-
-    let body: serde_json::Value = response.json().await?;
-    assert_eq!(body["error"]["code"], "NOT_FOUND");
-
-    Ok(())
-}
-
-/// Test that inactive user attempting to join returns 404.
-///
-/// This tests that the is_active = true check in get_user_org_id correctly
-/// excludes deactivated users.
-#[sqlx::test(migrations = "../../migrations")]
-async fn test_join_meeting_inactive_user_denied(pool: PgPool) -> Result<()> {
-    let server = TestMeetingServer::spawn(pool.clone()).await?;
-    let client = reqwest::Client::new();
-
-    let org_id = create_test_org(&server.pool, "inactive-org", "Inactive User Org").await;
-    let host_id = create_test_user(&server.pool, org_id, "host@test.com", "Host").await;
-
-    // Create an inactive user
-    let inactive_user_id =
-        create_inactive_test_user(&server.pool, org_id, "inactive@test.com", "Inactive User").await;
-
-    let _meeting_id = create_test_meeting(
-        &server.pool,
-        org_id,
-        host_id,
-        "INACTV",
-        "scheduled",
-        false,
-        false,
-        true,
-    )
-    .await;
-
-    // Create valid token for the inactive user
-    let token = server.create_token_for_user(inactive_user_id);
-
-    let response = client
-        .get(format!("{}/api/v1/meetings/INACTV", server.url()))
-        .header("Authorization", format!("Bearer {}", token))
-        .send()
-        .await?;
-
-    assert_eq!(
-        response.status(),
-        404,
-        "Inactive user should return 404 (get_user_org_id checks is_active = true)"
-    );
-
-    let body: serde_json::Value = response.json().await?;
-    assert_eq!(body["error"]["code"], "NOT_FOUND");
 
     Ok(())
 }

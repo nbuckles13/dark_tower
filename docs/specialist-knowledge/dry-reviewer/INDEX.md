@@ -34,17 +34,14 @@
 ## False Positive Boundaries
 - Actor vs controller metrics (different consumers) -> `crates/mc-service/src/actors/metrics.rs`
 - Service-prefixed metric names (convention) -> per-service `observability/metrics.rs`
-- Per-subsystem metric functions (record_meeting_creation vs record_token_refresh) -> per-service `observability/metrics.rs`
-
-## K8s Manifest Patterns
-- NetworkPolicy + ServiceMonitor cross-refs -> `infra/services/{ac,gc,mc}-service/`
-- GC ServiceMonitor (first enabled, reference pattern) -> `infra/services/gc-service/service-monitor.yaml`
+- Per-operation metric functions (record_meeting_creation, record_meeting_join, etc.) -> per-service `observability/metrics.rs`
+- AC API ParticipantType (has Guest variant) vs common::jwt::ParticipantType (no Guest) -> `crates/gc-service/src/services/ac_client.rs`
 
 ## Integration Seams
 - Common crate as extraction target -> `crates/common/src/`
 - GC repositories (shared row mappers) -> `crates/gc-service/src/repositories/`
 - GC ParticipantsRepository -> `crates/gc-service/src/repositories/participants.rs`
 - GC dual auth middleware (service + user) -> `crates/gc-service/src/middleware/auth.rs`
-- NetworkPolicy egress/ingress pairs (GC<->MC on 50052, GC<->AC on 8082, MC->AC on 8082) -> `infra/services/*/network-policy.yaml`
-- Metric names in runbooks must match code -> `crates/gc-service/src/observability/metrics.rs`, `docs/runbooks/gc-incident-response.md`, `docs/runbooks/gc-deployment.md`
-- GC JWKS/JWT (extraction targets for Task 7) -> `crates/gc-service/src/auth/jwks.rs`, `crates/gc-service/src/auth/jwt.rs`
+- GC JWKS/JWT (potential extraction to common) -> `crates/gc-service/src/auth/jwks.rs`, `crates/gc-service/src/auth/jwt.rs`
+- NetworkPolicy + ServiceMonitor cross-refs -> `infra/services/{ac,gc,mc}-service/`
+- Metric names in runbooks must match code -> `crates/gc-service/src/observability/metrics.rs`, `docs/runbooks/gc-incident-response.md`
