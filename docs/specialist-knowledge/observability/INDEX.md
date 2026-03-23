@@ -11,8 +11,10 @@
 - AC HTTP metrics middleware -> `crates/ac-service/src/middleware/http_metrics.rs`
 - GC metrics recording -> `crates/gc-service/src/observability/metrics.rs:init_metrics_recorder()`
 - GC meeting creation metrics -> `crates/gc-service/src/observability/metrics.rs:record_meeting_creation()`
+- GC meeting join metrics -> `crates/gc-service/src/observability/metrics.rs:record_meeting_join()`
 - GC HTTP metrics middleware -> `crates/gc-service/src/middleware/http_metrics.rs:http_metrics_middleware()`
 - GC endpoint normalization -> `crates/gc-service/src/observability/metrics.rs:normalize_endpoint()`
+- GC join handler metrics wiring -> `crates/gc-service/src/handlers/meetings.rs:join_meeting()`
 - GC meetings repository DB metrics -> `crates/gc-service/src/repositories/meetings.rs:MeetingsRepository`
 - GC participants repository DB metrics -> `crates/gc-service/src/repositories/participants.rs:ParticipantsRepository`
 - MC metrics recording -> `crates/mc-service/src/observability/metrics.rs:init_metrics_recorder()`
@@ -22,7 +24,7 @@
 
 ## Dashboards & Alerts
 - Grafana dashboards -> `infra/grafana/dashboards/` (overview, SLOs, logs per service)
-- GC overview dashboard (meeting creation panels) -> `infra/grafana/dashboards/gc-overview.json`
+- GC overview dashboard (meeting creation + join panels) -> `infra/grafana/dashboards/gc-overview.json`
 - Cross-service error dashboard -> `infra/grafana/dashboards/errors-overview.json`
 - Grafana provisioning -> `infra/grafana/provisioning/datasources/datasources.yaml`
 - Prometheus config -> `infra/docker/prometheus/prometheus.yml`

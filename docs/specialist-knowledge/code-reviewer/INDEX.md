@@ -26,12 +26,17 @@
 - JWT verify/validation → `crates/gc-service/src/auth/jwt.rs:verify_token()`, `validate_user()`
 - JWKS client → `crates/gc-service/src/auth/jwks.rs:JwksClient`
 - Auth middleware → `crates/gc-service/src/middleware/auth.rs:require_user_auth()`, `extract_bearer_token()`
-- Meeting handlers → `crates/gc-service/src/handlers/meetings.rs:create_meeting()`, `join_meeting()`
+- Meeting handlers → `crates/gc-service/src/handlers/meetings.rs:create_meeting()`, `join_meeting()`, `get_guest_token()`, `update_meeting_settings()`
 - Meetings repository (atomic CTE) → `crates/gc-service/src/repositories/meetings.rs:create_meeting_with_limit_check()`
 - Meeting activation + audit logging → `crates/gc-service/src/repositories/meetings.rs:activate_meeting()`, `log_audit_event()`
 - Participants repo + model → `crates/gc-service/src/repositories/participants.rs:ParticipantsRepository`, `crates/gc-service/src/models/mod.rs:Participant`
 - Participant tests + migration → `crates/gc-service/tests/participant_tests.rs`, `migrations/20260322000001_add_participant_tracking.sql`
+- Meeting join metrics → `crates/gc-service/src/observability/metrics.rs:record_meeting_join()`
+- AC/MC clients → `crates/gc-service/src/services/ac_client.rs:AcClient`, `mc_client.rs:McClientTrait`
 - Route composition (user auth layer) → `crates/gc-service/src/routes/mod.rs:build_routes()`
+- Meeting integration tests → `crates/gc-service/tests/meeting_tests.rs`
+- Metrics catalog → `docs/observability/metrics/gc-service.md`
+- Grafana dashboard → `infra/grafana/dashboards/gc-overview.json`
 
 ## Code Locations — Common
 - JWT claims & enums → `crates/common/src/jwt.rs:ServiceClaims`, `UserClaims`, `MeetingTokenClaims`, `GuestTokenClaims`, `ParticipantType`, `MeetingRole`
@@ -39,12 +44,7 @@
 - SecretString/SecretBox → `crates/common/src/secret.rs`
 - TokenManager → `crates/common/src/token_manager.rs:spawn_token_manager()`
 
-## Guard Scripts
-- Guard runner → `scripts/guards/run-guards.sh`
-- Semantic checks → `scripts/guards/semantic/checks.md`
-
-## Integration Seams
+## Guards & Integration Seams
+- Guard runner + semantic checks → `scripts/guards/run-guards.sh`, `scripts/guards/semantic/checks.md`
 - Review protocol (fix-or-defer) → `.claude/skills/devloop/review-protocol.md`
 - Handler-to-repository boundaries → `crates/{ac,gc}-service/src/handlers/`
-- Common crate shared by all services → `crates/common/src/`
-- ADR lookup → `docs/decisions/`

@@ -3,19 +3,17 @@
 //! Implements meeting endpoints:
 //!
 //! - `POST /api/v1/meetings` - Create meeting (user authenticated)
-//! - `GET /api/v1/meetings/{code}` - Join meeting (service authenticated)
+//! - `GET /api/v1/meetings/{code}` - Join meeting (user authenticated)
 //! - `POST /api/v1/meetings/{code}/guest-token` - Get guest token (public)
-//! - `PATCH /api/v1/meetings/{id}/settings` - Update meeting settings (service authenticated)
+//! - `PATCH /api/v1/meetings/{id}/settings` - Update meeting settings (user authenticated)
 //!
 //! # Security
 //!
 //! - User-authenticated endpoints validate JWT with UserClaims (org_id, roles)
-//! - Service-authenticated endpoints validate JWT with Claims (scope)
 //! - Guest endpoint is public but rate limited (5 req/min per IP)
 //! - Meeting codes and secrets generated using CSPRNG
 //! - Error messages are generic to prevent information leakage
 
-use crate::auth::Claims;
 use crate::errors::GcError;
 use crate::models::{
     CreateMeetingRequest, CreateMeetingResponse, GuestJoinRequest, JoinMeetingResponse,
@@ -36,7 +34,7 @@ use axum::{
 };
 use common::jwt::UserClaims;
 use ring::rand::{SecureRandom, SystemRandom};
-use sqlx::{PgPool, Row};
+use sqlx::PgPool;
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::{info, instrument, warn};
@@ -311,29 +309,47 @@ pub async fn create_meeting(
 )]
 pub async fn join_meeting(
     State(state): State<Arc<AppState>>,
-    Extension(claims): Extension<Claims>,
+    Extension(user_claims): Extension<UserClaims>,
     Path(code): Path<String>,
 ) -> Result<Json<JoinMeetingResponse>, GcError> {
-    // Look up meeting by code
-    let meeting = find_meeting_by_code(&state.pool, &code).await?;
+    let start = Instant::now();
 
-    // Check meeting status
-    if meeting.status == "cancelled" || meeting.status == "ended" {
+    // Look up meeting by code
+    let meeting = find_meeting_by_code(&state.pool, &code)
+        .await
+        .inspect_err(|_| {
+            let duration = start.elapsed();
+            metrics::record_meeting_join("error", Some("not_found"), duration);
+        })?;
+
+    // Check meeting status (allowlist: only active/scheduled meetings can be joined)
+    if meeting.status != "active" && meeting.status != "scheduled" {
+        let duration = start.elapsed();
+        metrics::record_meeting_join("error", Some("bad_status"), duration);
         return Err(GcError::NotFound(
             "Meeting not found or has ended".to_string(),
         ));
     }
 
-    // Parse user's org_id from claims (assuming sub is in format "user:{user_id}" or just user_id)
-    // For now, we need to look up the user's org_id from the database
-    let user_id = parse_user_id(&claims.sub)?;
-    let user_org_id = get_user_org_id(&state.pool, user_id).await?;
+    // Parse user ID and org ID from user claims
+    let user_id = parse_user_id(&user_claims.sub).inspect_err(|_| {
+        let duration = start.elapsed();
+        metrics::record_meeting_join("error", Some("unauthorized"), duration);
+    })?;
+    let user_org_id = Uuid::parse_str(&user_claims.org_id).map_err(|e| {
+        tracing::debug!(target: "gc.handlers.meetings", error = %e, "Failed to parse org_id from user token");
+        let duration = start.elapsed();
+        metrics::record_meeting_join("error", Some("unauthorized"), duration);
+        GcError::InvalidToken("Invalid organization identifier in token".to_string())
+    })?;
 
     // Check if user is allowed to join
     let is_same_org = user_org_id == meeting.org_id;
     let is_host = meeting.created_by_user_id == user_id;
 
     if !is_same_org && !meeting.allow_external_participants {
+        let duration = start.elapsed();
+        metrics::record_meeting_join("error", Some("forbidden"), duration);
         warn!(
             target: "gc.handlers.meetings",
             user_id = %user_id,
@@ -366,10 +382,17 @@ pub async fn join_meeting(
         &state.config.region,
         &state.config.gc_id,
     )
-    .await?;
+    .await
+    .inspect_err(|_| {
+        let duration = start.elapsed();
+        metrics::record_meeting_join("error", Some("mc_assignment"), duration);
+    })?;
 
     // Create AC client and request meeting token
-    let ac_client = create_ac_client(&state)?;
+    let ac_client = create_ac_client(&state).inspect_err(|_| {
+        let duration = start.elapsed();
+        metrics::record_meeting_join("error", Some("internal"), duration);
+    })?;
     let token_request = MeetingTokenRequest {
         subject_user_id: user_id,
         meeting_id: meeting.meeting_id,
@@ -384,7 +407,17 @@ pub async fn join_meeting(
         ttl_seconds: DEFAULT_TOKEN_TTL_SECONDS,
     };
 
-    let token_response = ac_client.request_meeting_token(&token_request).await?;
+    let token_response = ac_client
+        .request_meeting_token(&token_request)
+        .await
+        .inspect_err(|_| {
+            let duration = start.elapsed();
+            metrics::record_meeting_join("error", Some("ac_request"), duration);
+        })?;
+
+    // Record success metrics
+    let duration = start.elapsed();
+    metrics::record_meeting_join("success", None, duration);
 
     info!(
         target: "gc.handlers.meetings",
@@ -464,8 +497,8 @@ pub async fn get_guest_token(
     // Look up meeting by code
     let meeting = find_meeting_by_code(&state.pool, &code).await?;
 
-    // Check meeting status
-    if meeting.status == "cancelled" || meeting.status == "ended" {
+    // Check meeting status (allowlist: only active/scheduled meetings can be joined)
+    if meeting.status != "active" && meeting.status != "scheduled" {
         return Err(GcError::NotFound(
             "Meeting not found or has ended".to_string(),
         ));
@@ -570,7 +603,7 @@ pub async fn get_guest_token(
 )]
 pub async fn update_meeting_settings(
     State(state): State<Arc<AppState>>,
-    Extension(claims): Extension<Claims>,
+    Extension(user_claims): Extension<UserClaims>,
     Path(meeting_id): Path<Uuid>,
     Json(request): Json<UpdateMeetingSettingsRequest>,
 ) -> Result<Json<MeetingResponse>, GcError> {
@@ -583,7 +616,7 @@ pub async fn update_meeting_settings(
     let meeting = find_meeting_by_id(&state.pool, meeting_id).await?;
 
     // Parse user ID and verify host status
-    let user_id = parse_user_id(&claims.sub)?;
+    let user_id = parse_user_id(&user_claims.sub)?;
 
     if meeting.created_by_user_id != user_id {
         warn!(
@@ -666,23 +699,6 @@ async fn find_meeting_by_id(pool: &PgPool, meeting_id: Uuid) -> Result<MeetingRo
         .ok_or_else(|| GcError::NotFound("Meeting not found".to_string()))?;
 
     Ok(map_row_to_meeting(row))
-}
-
-/// Get a user's organization ID.
-async fn get_user_org_id(pool: &PgPool, user_id: Uuid) -> Result<Uuid, GcError> {
-    let row = sqlx::query(
-        r#"
-        SELECT org_id
-        FROM users
-        WHERE user_id = $1 AND is_active = true
-        "#,
-    )
-    .bind(user_id)
-    .fetch_optional(pool)
-    .await?
-    .ok_or_else(|| GcError::NotFound("User not found".to_string()))?;
-
-    Ok(row.get("org_id"))
 }
 
 /// Update meeting settings in the database.

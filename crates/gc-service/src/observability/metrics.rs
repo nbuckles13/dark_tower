@@ -99,6 +99,14 @@ pub fn init_metrics_recorder() -> Result<PrometheusHandle, String> {
             ],
         )
         .map_err(|e| format!("Failed to set meeting creation buckets: {e}"))?
+        // Meeting join buckets - extended to 5s (join includes MC assignment + AC token request)
+        .set_buckets_for_metric(
+            Matcher::Prefix("gc_meeting_join".to_string()),
+            &[
+                0.010, 0.025, 0.050, 0.100, 0.200, 0.500, 1.000, 2.000, 5.000,
+            ],
+        )
+        .map_err(|e| format!("Failed to set meeting join buckets: {e}"))?
         .install_recorder()
         .map_err(|e| format!("Failed to install Prometheus recorder: {e}"))
 }
@@ -404,6 +412,42 @@ pub fn record_meeting_creation(status: &str, error_type: Option<&str>, duration:
 
     if let Some(err_type) = error_type {
         counter!("gc_meeting_creation_failures_total",
+            "error_type" => err_type.to_string()
+        )
+        .increment(1);
+    }
+}
+
+// ============================================================================
+// Meeting Join Metrics
+// ============================================================================
+
+/// Record meeting join attempt.
+///
+/// Emits three metrics per the metrics catalog:
+/// - `gc_meeting_join_total` counter (labels: `status`)
+/// - `gc_meeting_join_duration_seconds` histogram (labels: `status`)
+/// - `gc_meeting_join_failures_total` counter (labels: `error_type`, on failure only)
+///
+/// # Arguments
+///
+/// * `status` - "success" or "error"
+/// * `error_type` - Error category for failures (e.g., "not_found", "forbidden",
+///   "unauthorized", "bad_status", "mc_assignment", "ac_request", "internal")
+/// * `duration` - Duration of the join attempt
+pub fn record_meeting_join(status: &str, error_type: Option<&str>, duration: Duration) {
+    histogram!("gc_meeting_join_duration_seconds",
+        "status" => status.to_string()
+    )
+    .record(duration.as_secs_f64());
+
+    counter!("gc_meeting_join_total",
+        "status" => status.to_string()
+    )
+    .increment(1);
+
+    if let Some(err_type) = error_type {
+        counter!("gc_meeting_join_failures_total",
             "error_type" => err_type.to_string()
         )
         .increment(1);
@@ -737,6 +781,21 @@ mod tests {
         record_meeting_creation("error", Some("db_error"), Duration::from_millis(100));
         record_meeting_creation("error", Some("code_collision"), Duration::from_millis(200));
         record_meeting_creation("error", Some("internal"), Duration::from_millis(10));
+    }
+
+    #[test]
+    fn test_record_meeting_join() {
+        // Success path
+        record_meeting_join("success", None, Duration::from_millis(200));
+
+        // Error paths with different error types
+        record_meeting_join("error", Some("not_found"), Duration::from_millis(5));
+        record_meeting_join("error", Some("unauthorized"), Duration::from_millis(3));
+        record_meeting_join("error", Some("forbidden"), Duration::from_millis(8));
+        record_meeting_join("error", Some("bad_status"), Duration::from_millis(5));
+        record_meeting_join("error", Some("mc_assignment"), Duration::from_millis(500));
+        record_meeting_join("error", Some("ac_request"), Duration::from_millis(1000));
+        record_meeting_join("error", Some("internal"), Duration::from_millis(10));
     }
 
     #[test]
