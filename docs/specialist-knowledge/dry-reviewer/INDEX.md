@@ -39,7 +39,7 @@
 - Shared GC test harness -> `crates/gc-test-utils/src/server_harness.rs`
 
 ## Tech Debt Registry
-- Active duplication tech debt -> `docs/TODO.md` (Cross-Service Duplication section)
+- Active duplication tech debt → `docs/TODO.md` (Cross-Service Duplication section)
 
 ## Successful Extractions (Reference)
 - ServiceClaims/UserClaims to common::jwt -> `crates/common/src/jwt.rs`
