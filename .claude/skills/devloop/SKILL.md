@@ -484,6 +484,11 @@ Write `.devloop-pr.json` to the worktree root with PR metadata for the host wrap
 
 The `title` should summarize the change. The `body` should include the task summary, reviewer verdicts, files changed, and a test plan. This file is read by the host-side `devloop.sh` wrapper to create the GitHub PR with proper context. See ADR-0025.
 
+If this task is part of a user story, update the Devloop Tracking table
+in the user story file: set Status to Completed, fill in the Devloop
+Output path and commit hash. Include this in the Step 8.5 commit (or
+amend it).
+
 Report to user:
 ```
 **Dev-Loop Complete**
