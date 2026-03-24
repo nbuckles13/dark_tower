@@ -55,7 +55,7 @@ if $REBUILD_IMAGE && [ -z "${1:-}" ]; then
     IMAGE="darktower-dev:latest"
     echo "Building dev container image..."
     OLD_IMAGE_ID=$(podman images -q "$IMAGE" 2>/dev/null || true)
-    podman build --no-cache -t "$IMAGE" "$SCRIPT_DIR"
+    podman build -t "$IMAGE" "$SCRIPT_DIR"
     if [ -n "$OLD_IMAGE_ID" ] && [ "$OLD_IMAGE_ID" != "$(podman images -q "$IMAGE")" ]; then
         podman rmi "$OLD_IMAGE_ID" 2>/dev/null || true
     fi
@@ -163,7 +163,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if $REBUILD_IMAGE || ! podman image exists "$IMAGE"; then
     echo "Building dev container image..."
     OLD_IMAGE_ID=$(podman images -q "$IMAGE" 2>/dev/null || true)
-    podman build --no-cache -t "$IMAGE" "$SCRIPT_DIR"
+    podman build -t "$IMAGE" "$SCRIPT_DIR"
     if [ -n "$OLD_IMAGE_ID" ] && [ "$OLD_IMAGE_ID" != "$(podman images -q "$IMAGE")" ]; then
         podman rmi "$OLD_IMAGE_ID" 2>/dev/null || true
     fi
@@ -278,6 +278,10 @@ echo ""
 if [ -f "${HOME}/.claude/.credentials.json" ]; then
     podman cp "${HOME}/.claude/.credentials.json" "${DEV_CONTAINER}:/home/dev/.claude/.credentials.json"
 fi
+
+# Update Claude Code to latest before each attach
+echo "Updating Claude Code..."
+podman exec "$DEV_CONTAINER" npm install -g @anthropic-ai/claude-code --loglevel=warn
 
 podman exec -it "$DEV_CONTAINER" claude --dangerously-skip-permissions --remote-control "$TASK_SLUG" || true
 
