@@ -61,6 +61,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 // ============================================================================
 
 /// JWT Claims for service test tokens (used by /api/v1/me).
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct TestClaims {
     sub: String,
@@ -90,6 +91,7 @@ struct TestKeypair {
     private_key_pkcs8: Vec<u8>,
 }
 
+#[allow(dead_code)]
 impl TestKeypair {
     fn new(seed: u8, kid: &str) -> Self {
         // Create deterministic seed

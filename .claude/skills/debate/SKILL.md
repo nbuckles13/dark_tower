@@ -285,7 +285,7 @@ review checklists, task status, or date-stamped sections. If something
 feels important but isn't a pointer, put it as a code comment, an ADR,
 or a TODO.md entry instead.
 
-Organize by architectural concept (not by feature or date). Max 50 lines.
+Organize by architectural concept (not by feature or date). Max 75 lines.
 ```
 
 Allow 15 minutes for updates.

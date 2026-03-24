@@ -13,8 +13,8 @@ for index_file in docs/specialist-knowledge/*/INDEX.md; do
         [[ "$path" == *"*"* || "$path" == *"NNNN"* ]] && continue
         # Strip anchor links like #scenario-8-something
         file_path=$(echo "$path" | sed -E 's/#[^#]*$//')
-        # Strip function/type references: :function(), :Type, :Struct::method()
-        file_path=$(echo "$file_path" | sed -E 's/:[A-Za-z_][A-Za-z0-9_:]*([(][)])?$//')
+        # Strip function/type references: :function(), :Type, :Struct::method(), :From<JwtError>
+        file_path=$(echo "$file_path" | sed -E 's/:[A-Za-z_][A-Za-z0-9_:<>,()]*([(][)])?$//')
         # Strip line number references like :34-42
         file_path=$(echo "$file_path" | sed -E 's/:[0-9][-0-9]*$//')
         if [[ "$file_path" == docs/* || "$file_path" == crates/* || "$file_path" == proto/* || "$file_path" == scripts/* ]]; then
@@ -37,8 +37,8 @@ for index_file in docs/specialist-knowledge/*/INDEX.md; do
 
     # Check size cap
     lines=$(wc -l < "$index_file")
-    if [ "$lines" -gt 50 ]; then
-        ERRORS="${ERRORS}SIZE VIOLATION: $index_file has $lines lines (max 50)\n"
+    if [ "$lines" -gt 75 ]; then
+        ERRORS="${ERRORS}SIZE VIOLATION: $index_file has $lines lines (max 75)\n"
     fi
 done
 

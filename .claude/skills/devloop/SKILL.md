@@ -179,6 +179,8 @@ For security-critical implementations, the implementer should maintain a "Securi
 
 ### Step 3: Spawn Teammates
 
+**Defensive cleanup**: Before creating a new team, check for and clean up any stale team from a previous devloop. If a team already exists, send shutdown requests to all teammates and call `TeamDelete`. This handles cases where a previous devloop was interrupted before Step 8.9.
+
 **IMPORTANT**: All teammates are spawned using the `subagent_type` parameter in the Task tool, which auto-loads their identity from `.claude/agents/{name}.md`. Do NOT manually read or inject specialist identity files — the agent system handles this.
 
 **INDEX injection**: Before spawning each teammate, read `docs/specialist-knowledge/{name}/INDEX.md` and include its contents in the teammate's prompt under a `## Navigation` header. This gives each specialist a navigation map to relevant code and ADRs.
@@ -347,7 +349,7 @@ When implementer signals "Ready for validation", run the validation pipeline:
 | 2. Format | `cargo fmt --all -- --check` | Style violations |
 | 3. Guards | `./scripts/guards/run-guards.sh` | Credential leaks, PII, instrument-skip-all, test-coverage, api-version-check |
 | 4. Tests | `./scripts/test.sh --workspace` | Regressions; ensures DB setup + migrations; report P0 security test count |
-| 5. Clippy | `cargo clippy --workspace --lib --bins -- -D warnings` | Lint warnings |
+| 5. Clippy | `cargo clippy --workspace -- -D warnings` | Lint warnings |
 | 6. Audit | `cargo audit` | Known dependency vulnerabilities |
 | 7. Semantic | Spawn `semantic-guard` agent (see below) | AI-powered diff analysis: credential leaks, actor blocking, error context |
 
@@ -375,7 +377,7 @@ Wait for the agent's verdict message. If UNSAFE, treat as a validation failure (
 
 **If pass**:
 - Update main.md: Phase = review
-- Message reviewers: "Start Review. Validation passed — please examine the changes and send your verdict."
+- Message each reviewer individually (unicast, not broadcast): "Start Review. Validation passed — please examine the changes and send your verdict."
 
 **If fail**:
 - Send failure details to implementer
@@ -429,7 +431,7 @@ After reflection (full mode) or after review (light mode), stage and commit:
 
 ### Step 8: Reflection [FULL MODE ONLY]
 
-Broadcast the reflection instructions to all teammates:
+Send the reflection instructions to each teammate individually (unicast, not broadcast):
 
 ```
 Reflection: update your INDEX.md at `docs/specialist-knowledge/{your-name}/INDEX.md`.
@@ -447,12 +449,22 @@ review checklists, task status, or date-stamped sections. If something
 feels important but isn't a pointer, put it as a code comment, an ADR,
 or a TODO.md entry instead.
 
-DRY reviewer: duplication findings go in `.claude/TODO.md`, not INDEX.
+DRY reviewer: duplication findings go in `docs/TODO.md`, not INDEX.
 
-Organize by architectural concept (not by feature or date). Max 50 lines.
+Organize by architectural concept (not by feature or date). Max 75 lines.
 ```
 
 Allow 15 minutes for updates.
+
+### Step 8.9: Cleanup Team
+
+Shut down all teammates and delete the team before completing:
+
+1. Send shutdown requests to all teammates
+2. Call `TeamDelete` to remove the team and task list
+
+This prevents stale team context from leaking into subsequent devloops
+when chained by story-run.
 
 ### Step 9: Complete
 

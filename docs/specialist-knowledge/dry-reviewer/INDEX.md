@@ -18,7 +18,7 @@
 - Domain IDs and shared types -> `crates/common/src/types.rs`
 
 ## Tech Debt Registry
-- Active duplication tech debt → `.claude/TODO.md` (Cross-Service Duplication section)
+- Active duplication tech debt → `docs/TODO.md` (Cross-Service Duplication section)
 
 ## Successful Extractions (Reference)
 - ServiceClaims to common::jwt (AC re-exports as `Claims`) -> `crates/ac-service/src/crypto/mod.rs:23`

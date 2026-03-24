@@ -100,24 +100,6 @@ As a **{persona}**, I want **{goal}** so that **{benefit}**.
 | 4 | {task description} | {specialist} | 2, 3 | {deploy, operations} | Pending |
 | 5 | {task description} | {specialist} | 2, 3, 4 | {tests} | Pending |
 
-### Task Metadata
-
-```yaml
-# task-metadata
-tasks:
-  - id: 1
-    slug: {task-slug}
-    description: "{task description}"
-    specialist: {specialist}
-    deps: []
-  - id: 2
-    slug: {task-slug}
-    description: "{task description}"
-    specialist: {specialist}
-    deps: [1]
-  # ... all tasks
-```
-
 ### Requirements Coverage
 
 | Req | Covered By Tasks |
