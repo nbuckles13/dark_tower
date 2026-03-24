@@ -281,7 +281,7 @@ fi
 
 # Update Claude Code to latest before each attach
 echo "Updating Claude Code..."
-podman exec "$DEV_CONTAINER" npm install -g @anthropic-ai/claude-code --loglevel=warn
+podman exec --user=0 "$DEV_CONTAINER" npm install -g @anthropic-ai/claude-code --loglevel=warn
 
 podman exec -it "$DEV_CONTAINER" claude --dangerously-skip-permissions --remote-control "$TASK_SLUG" || true
 

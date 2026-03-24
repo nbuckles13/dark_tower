@@ -31,7 +31,7 @@ As a **logged-in user**, I want **to join a meeting, be assigned to an MC, and c
 - R-17: UDP port mapping for QUIC in Kind cluster config (from: infrastructure)
 - R-18: GC join integration tests covering auth middleware, failure paths (AC down, MC unavailable), and success path (from: global-controller)
 - R-19: MC join integration tests covering WebTransport connection, JWT validation, JoinRequest processing (from: meeting-controller)
-- R-20: End-to-end env-tests for join flow in Kind cluster (from: test)
+- R-20: End-to-end env-tests for join flow in Kind cluster, including WebTransport client connection to MC with JoinRequest/Response and ParticipantJoined verification (from: test)
 - R-21: MC runbook covers join flow failure scenarios: WebTransport connection failures, JWT validation failures, Redis/session failures (from: operations)
 - R-22: Post-deploy monitoring checklist and smoke test for MC join metrics (from: operations)
 - R-23: JWKS client and generic JWT validation logic extracted to `crates/common/` to avoid code duplication between GC and MC (from: auth-controller, global-controller)
@@ -196,8 +196,7 @@ GC and MC both import from common. Service-specific validation (meeting_id match
 | 3 | JWKS cache TTL of 5 minutes is sufficient for MC | meeting-controller | Matches GC pattern; key rotation has grace period per ADR-0008 |
 | 4 | Self-signed certs acceptable for dev/Kind environment | infrastructure | Production uses real certs via cert-manager |
 | 5 | `max_participants` check at GC can be deferred if DB task delays | global-controller | GC core join flow works without it; capacity is also checked at MC actor level |
-| 6 | MC WebTransport smoke test not possible without QUIC client tooling | operations | GC-side smoke test covers the HTTP join endpoint; MC testing requires separate tooling |
-| 7 | `max_participants` enforcement is eventually consistent across MCs | meeting-controller | MC-to-MC peer connections exchange participant counts; simultaneous cross-MC joins may briefly exceed limit. Acceptable tradeoff for architectural simplicity. |
+| 6 | `max_participants` enforcement is eventually consistent across MCs | meeting-controller | MC-to-MC peer connections exchange participant counts; simultaneous cross-MC joins may briefly exceed limit. Acceptable tradeoff for architectural simplicity. |
 
 ## Clarification Questions
 
@@ -251,106 +250,9 @@ Task 1 also starts immediately; task 7 waits for task 1
 | 13 | Add MC join dashboard panels + alert rules + update metrics catalog | observability | 11 | dashboard, alerts, docs |
 | 14 | GC join integration tests + test harness updates for user auth | global-controller | 4, 8 | tests |
 | 15 | MC join integration tests (WebTransport, JWT, signaling bridge) | meeting-controller | 10 | tests |
-| 16 | Join flow end-to-end env-tests in Kind cluster | test | 4, 10 | tests |
+| 16 | Join flow end-to-end env-tests in Kind cluster (including WebTransport client E2E: connect to MC, JoinRequest/Response, ParticipantJoined) | test | 4, 10 | tests |
 | 17 | Add MC runbook scenarios 8-10 (WebTransport, token validation, Redis/session) + TOC update | operations | 11, 13 | docs |
 | 18 | Add post-deploy monitoring checklist + expand smoke test 5 for join flow | operations | 4, 11 | docs |
-
-### Task Metadata
-
-```yaml
-# task-metadata
-tasks:
-  - id: 1
-    slug: meeting-token-claims
-    description: "Add MeetingTokenClaims and GuestTokenClaims to crates/common/src/jwt.rs"
-    specialist: auth-controller
-    deps: []
-  - id: 2
-    slug: participants-repository
-    description: "Implement ParticipantsRepository with migration for participant tracking + capacity checks"
-    specialist: database
-    deps: []
-  - id: 3
-    slug: meeting-activation
-    description: "Implement meeting activation (scheduled->active on first join) + audit logging"
-    specialist: database
-    deps: []
-  - id: 4
-    slug: gc-join-auth-metrics
-    description: "Fix GC join/settings auth middleware (UserClaims), add status allowlist, add record_meeting_join metrics"
-    specialist: global-controller
-    deps: []
-  - id: 5
-    slug: infra-tls-udp
-    description: "Add TLS cert generation to dev scripts + MC K8s Secret volume mount + Kind UDP port mapping for 4433"
-    specialist: infrastructure
-    deps: []
-  - id: 6
-    slug: mc-health-probes
-    description: "Enable MC liveness/readiness health probes in deployment.yaml"
-    specialist: infrastructure
-    deps: []
-  - id: 7
-    slug: jwks-common-extraction
-    description: "Extract JWKS client + generic JWT validator (JwtValidator::validate<T>) from GC to crates/common/, with JwtError enum and wiremock tests"
-    specialist: auth-controller
-    deps: [1]
-  - id: 8
-    slug: gc-common-jwks
-    description: "Convert GC auth to use common JWKS/JWT code (delete gc-service/src/auth/jwks.rs, thin wrapper mapping JwtError to GcError)"
-    specialist: global-controller
-    deps: [7]
-  - id: 9
-    slug: mc-jwt-validation
-    description: "Implement MC JWT validation using common JwksClient + JwtValidator::validate<MeetingTokenClaims> + MC-specific config (ac_jwks_url)"
-    specialist: meeting-controller
-    deps: [7]
-  - id: 10
-    slug: mc-webtransport-join
-    description: "Implement MC WebTransport server + join flow connection handler (wtransport TLS, accept loop, JoinRequest/Response, ParticipantJoined/Left bridge, CancellationToken wiring)"
-    specialist: meeting-controller
-    deps: [5, 9]
-  - id: 11
-    slug: mc-join-metrics
-    description: "Add MC join flow observability metrics (WebTransport connections, JWT validations, session joins, latency histogram)"
-    specialist: meeting-controller
-    deps: [10]
-  - id: 12
-    slug: gc-join-dashboard
-    description: "Add GC join dashboard panels + alert rules + update metrics catalog"
-    specialist: observability
-    deps: [4]
-  - id: 13
-    slug: mc-join-dashboard
-    description: "Add MC join dashboard panels + alert rules + update metrics catalog"
-    specialist: observability
-    deps: [11]
-  - id: 14
-    slug: gc-join-tests
-    description: "GC join integration tests + test harness updates for user auth"
-    specialist: global-controller
-    deps: [4, 8]
-  - id: 15
-    slug: mc-join-tests
-    description: "MC join integration tests (WebTransport, JWT, signaling bridge)"
-    specialist: meeting-controller
-    deps: [10]
-  - id: 16
-    slug: join-env-tests
-    description: "Join flow end-to-end env-tests in Kind cluster"
-    specialist: test
-    deps: [4, 10]
-  - id: 17
-    slug: mc-runbook-join
-    description: "Add MC runbook scenarios 8-10 (WebTransport, token validation, Redis/session) + TOC update"
-    specialist: operations
-    deps: [11, 13]
-  - id: 18
-    slug: post-deploy-checklist
-    description: "Add post-deploy monitoring checklist + expand smoke test 5 for join flow"
-    specialist: operations
-    deps: [4, 11]
-```
 
 ### Specialist Task Summary
 
@@ -417,7 +319,7 @@ tasks:
 - Reassigned GC integration tests to global-controller (task 14), MC integration tests to meeting-controller (task 15)
 - Added task 7 (extract JWKS to common, auth-controller), task 8 (convert GC, global-controller), task 9 (MC on common, meeting-controller)
 - Added R-23 (JWKS extraction requirement)
-- Added assumption #7 (max_participants eventual consistency)
+- Added assumption #6 (max_participants eventual consistency)
 - Added max_participants enforcement subsection to meeting-controller design
 - Updated R-18/R-19 ownership from test to domain specialists
 - Total tasks: 16 -> 18

@@ -252,7 +252,7 @@ All foundational work completed:
   - Reflection step captures learnings after each implementation
   - Knowledge injected into specialist prompts
 
-**Status**: See [.claude/TODO.md](../.claude/TODO.md) for current work items
+**Status**: See [docs/TODO.md](TODO.md) for current work items
 
 ## Project Structure (Current)
 
@@ -563,12 +563,12 @@ dark_tower/
    ```
 
 3. **Understand Current Work**:
-   - Check [.claude/TODO.md](../.claude/TODO.md) for current priorities
+   - Check [docs/TODO.md](TODO.md) for current priorities
    - Review recent commits for context
    - Read relevant ADRs in [docs/decisions/](decisions/)
 
 4. **Choose a Task**:
-   - Phase 4 security improvements (.claude/TODO.md)
+   - Phase 4 security improvements (docs/TODO.md)
    - Phase 5+ service implementation
    - Documentation improvements
 
@@ -577,7 +577,7 @@ dark_tower/
 1. **CLAUDE.md auto-loads** - No action needed
 2. **Read**: `.claude/DEVELOPMENT_WORKFLOW.md`
 3. **Check**: This file (PROJECT_STATUS.md) for current phase
-4. **Review**: `.claude/TODO.md` for immediate work
+4. **Review**: `docs/TODO.md` for immediate work
 5. **Identify**: Which specialists you'll need
 
 ## Success Criteria

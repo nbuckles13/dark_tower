@@ -1436,7 +1436,7 @@ mod tests {
         assert_eq!(deserialized.participant_type, "guest");
         assert_eq!(deserialized.role, "guest");
         assert_eq!(deserialized.display_name, "Alice");
-        assert_eq!(deserialized.waiting_room, true);
+        assert!(deserialized.waiting_room);
         assert_eq!(deserialized.capabilities, vec!["video", "audio"]);
         assert_eq!(deserialized.iat, claims.iat);
         assert_eq!(deserialized.exp, claims.exp);
@@ -1462,7 +1462,7 @@ mod tests {
 
         let json = serde_json::to_string(&claims).unwrap();
         let deserialized: GuestTokenClaims = serde_json::from_str(&json).unwrap();
-        assert_eq!(deserialized.waiting_room, false);
+        assert!(!deserialized.waiting_room);
     }
 
     #[test]
@@ -1541,7 +1541,7 @@ mod tests {
         let cloned = claims.clone();
         assert_eq!(cloned.sub, claims.sub);
         assert_eq!(cloned.display_name, claims.display_name);
-        assert_eq!(cloned.waiting_room, true);
+        assert!(cloned.waiting_room);
     }
 
     #[test]

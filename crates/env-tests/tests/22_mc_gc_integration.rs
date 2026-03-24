@@ -25,7 +25,7 @@
 //! TODO: Re-add authenticated join env-tests when:
 //!   - GC has a create-meeting endpoint, OR test data seeding is automated
 //!   - env-tests can obtain user tokens (not just service credentials)
-//!   - See: .claude/TODO.md for tracking
+//!   - See: docs/TODO.md for tracking
 //!
 //! # Prerequisites
 //!

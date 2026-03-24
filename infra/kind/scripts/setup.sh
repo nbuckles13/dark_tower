@@ -530,7 +530,7 @@ spec:
 EOF
 
     log_info "Waiting for Grafana to be ready..."
-    kubectl wait --for=condition=Ready pod -l app=grafana -n dark-tower-observability --timeout=120s
+    kubectl wait --for=condition=Ready pod -l app=grafana -n dark-tower-observability --timeout=300s
     log_info "Grafana deployed successfully."
 }
 
@@ -600,7 +600,7 @@ ON CONFLICT (client_id) DO UPDATE SET
     fi
 
     # Seed test organization for env-tests (required by user registration flow)
-    # TODO: Replace with AC org provisioning API (see .claude/TODO.md)
+    # TODO: Replace with AC org provisioning API (see docs/TODO.md)
     log_step "Seeding test organization..."
     kubectl exec -n dark-tower postgres-0 -- psql -U darktower -d dark_tower -c "
 INSERT INTO organizations (subdomain, display_name, plan_tier)
