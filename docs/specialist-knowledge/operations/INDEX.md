@@ -35,13 +35,21 @@
 - Meeting activation (scheduled→active) → `crates/gc-service/src/repositories/meetings.rs:activate_meeting()`
 - Audit event logging + updated_at trigger → `crates/gc-service/src/repositories/meetings.rs:log_audit_event()`
 
-## Code Locations — Observability & Tokens
+## Code Locations — Auth & JWT (common crate)
+- JWKS client, JWT validator, verify_token → `crates/common/src/jwt.rs:JwksClient`, `JwtValidator`, `verify_token()`
+- JWK/JwksResponse types → `crates/common/src/jwt.rs:Jwk`, `JwksResponse`
+- JwtError (unified error type) → `crates/common/src/jwt.rs:JwtError`
+- Meeting/Guest token claims + validation → `crates/common/src/jwt.rs:MeetingTokenClaims`, `GuestTokenClaims::validate()`
+- GC thin wrapper (JwtError→GcError mapping) → `crates/gc-service/src/auth/jwt.rs:JwtValidator`
+- GC JwtError→GcError conversion → `crates/gc-service/src/errors.rs:impl From<JwtError> for GcError`
+- Service auth design → ADR-0003
+
+## Code Locations — Observability
 - GC metrics recorder → `crates/gc-service/src/observability/metrics.rs`
 - GC metrics catalog → `docs/observability/metrics/gc-service.md`
 - GC meeting join metrics → `crates/gc-service/src/observability/metrics.rs:record_meeting_join()`
 - GC overview dashboard → `infra/grafana/dashboards/gc-overview.json`
 - MC health probes (Phase 6h) → `infra/services/mc-service/deployment.yaml:109`
-- Meeting/Guest token claims + validation → `crates/common/src/jwt.rs:MeetingTokenClaims`, `GuestTokenClaims::validate()`
 
 ## Code Locations — GC Routes & Handlers
 - GC route definitions (public, user-auth, service-auth) → `crates/gc-service/src/routes/mod.rs`

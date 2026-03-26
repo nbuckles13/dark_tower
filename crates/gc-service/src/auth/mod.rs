@@ -4,8 +4,8 @@
 //!
 //! # Components
 //!
-//! - `jwks` - JWKS client for fetching and caching public keys from AC
-//! - `jwt` - JWT validation using cached JWKS keys
+//! - `jwks` - JWKS client re-exported from common
+//! - `jwt` - JWT validation wrapper for GC-specific error mapping
 //! - `claims` - JWT claims structure for validated tokens
 
 pub mod claims;

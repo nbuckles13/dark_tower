@@ -2,7 +2,7 @@
 
 ## Architecture & Design
 - Actor handle/task separation → ADR-0001 (Section: Pattern)
-- No-panic policy, `#[allow(clippy::expect_used)]` justification → ADR-0002
+- No-panic policy, `#[expect]` over `#[allow]` → ADR-0002
 - Error handling, service-layer wrapping → ADR-0003
 - Observability naming, label cardinality, SLO targets → ADR-0011
 - Guard pipeline methodology → ADR-0015
@@ -23,8 +23,9 @@
 
 ## Code Locations — GC Service
 - Error type reference → `crates/gc-service/src/errors.rs:GcError`
-- JWT verify/validation → `crates/gc-service/src/auth/jwt.rs:verify_token()`, `validate_user()`
-- JWKS client → `crates/gc-service/src/auth/jwks.rs:JwksClient`
+- `From<JwtError> for GcError` → `crates/gc-service/src/errors.rs` (maps common JWT errors to GC HTTP errors)
+- JWT validator (thin wrapper) → `crates/gc-service/src/auth/jwt.rs:JwtValidator` (delegates to `common::jwt::JwtValidator`)
+- JWKS client (re-export) → `crates/gc-service/src/auth/jwks.rs` (re-exports `common::jwt::JwksClient`)
 - Auth middleware → `crates/gc-service/src/middleware/auth.rs:require_user_auth()`, `extract_bearer_token()`
 - Meeting handlers → `crates/gc-service/src/handlers/meetings.rs:create_meeting()`, `join_meeting()`, `get_guest_token()`, `update_meeting_settings()`
 - Meetings repository (atomic CTE) → `crates/gc-service/src/repositories/meetings.rs:create_meeting_with_limit_check()`
@@ -39,8 +40,14 @@
 - Grafana dashboard → `infra/grafana/dashboards/gc-overview.json`
 
 ## Code Locations — Common
+- JWT error type → `crates/common/src/jwt.rs:JwtError`
 - JWT claims & enums → `crates/common/src/jwt.rs:ServiceClaims`, `UserClaims`, `MeetingTokenClaims`, `GuestTokenClaims`, `ParticipantType`, `MeetingRole`
+- `HasIat` trait (compile-time iat access) → `crates/common/src/jwt.rs:HasIat`
 - Guest token validation → `crates/common/src/jwt.rs:GuestTokenClaims::validate()`
+- JWKS client (fetching + caching) → `crates/common/src/jwt.rs:JwksClient`
+- JWT signature verification → `crates/common/src/jwt.rs:verify_token()`
+- JWT validator (full pipeline) → `crates/common/src/jwt.rs:JwtValidator::validate()`
+- JWK types → `crates/common/src/jwt.rs:Jwk`, `JwksResponse`
 - SecretString/SecretBox → `crates/common/src/secret.rs`
 - TokenManager → `crates/common/src/token_manager.rs:spawn_token_manager()`
 

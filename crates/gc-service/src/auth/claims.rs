@@ -3,6 +3,7 @@
 //! Contains the claims extracted from validated JWTs. The `sub` field is
 //! redacted in Debug output to prevent exposure in logs.
 
+use common::jwt::HasIat;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -42,6 +43,12 @@ impl fmt::Debug for Claims {
             .field("scope", &self.scope)
             .field("service_type", &self.service_type)
             .finish()
+    }
+}
+
+impl HasIat for Claims {
+    fn iat(&self) -> i64 {
+        self.iat
     }
 }
 

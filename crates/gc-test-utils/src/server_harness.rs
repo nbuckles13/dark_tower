@@ -117,7 +117,8 @@ impl TestGcServer {
         let metrics_handle = get_or_init_metrics_handle();
 
         // Build routes using global-controller's real route builder
-        let app = routes::build_routes(state, metrics_handle);
+        let app = routes::build_routes(state, metrics_handle)
+            .map_err(|e| anyhow::anyhow!("Failed to build routes: {}", e))?;
 
         // Bind to random port
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")

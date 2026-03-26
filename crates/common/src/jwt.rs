@@ -35,10 +35,16 @@
 //! **ADRs**: ADR-0003 (Service Auth), ADR-0007 (Token Lifetime)
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fmt;
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use thiserror::Error;
+use tokio::sync::RwLock;
+use tracing::instrument;
 
 // =============================================================================
 // Constants
@@ -87,7 +93,7 @@ pub const MAX_CLOCK_SKEW: Duration = Duration::from_secs(600);
 /// Note: Error messages are intentionally generic to prevent information leakage.
 /// Detailed information is logged at debug level for troubleshooting.
 #[derive(Error, Debug, Clone, PartialEq, Eq)]
-pub enum JwtValidationError {
+pub enum JwtError {
     /// Token size exceeds maximum allowed.
     #[error("The access token is invalid or expired")]
     TokenTooLarge,
@@ -103,6 +109,31 @@ pub enum JwtValidationError {
     /// Token `iat` claim is too far in the future.
     #[error("The access token is invalid or expired")]
     IatTooFarInFuture,
+
+    /// Token signature verification failed (wrong key type, algorithm, or signature).
+    #[error("The access token is invalid or expired")]
+    InvalidSignature,
+
+    /// Signing key not found in JWKS.
+    #[error("The access token is invalid or expired")]
+    KeyNotFound,
+
+    /// JWKS endpoint or auth service is unavailable.
+    #[error("Authentication service unavailable")]
+    ServiceUnavailable(String),
+}
+
+// =============================================================================
+// HasIat Trait
+// =============================================================================
+
+/// Trait for claims types that contain an `iat` (issued-at) field.
+///
+/// Required by [`JwtValidator::validate`] so that iat validation can be
+/// performed without re-parsing the JWT payload.
+pub trait HasIat {
+    /// Return the issued-at timestamp (Unix epoch seconds).
+    fn iat(&self) -> i64;
 }
 
 // =============================================================================
@@ -462,6 +493,34 @@ impl fmt::Debug for GuestTokenClaims {
 }
 
 // =============================================================================
+// HasIat Implementations
+// =============================================================================
+
+impl HasIat for ServiceClaims {
+    fn iat(&self) -> i64 {
+        self.iat
+    }
+}
+
+impl HasIat for UserClaims {
+    fn iat(&self) -> i64 {
+        self.iat
+    }
+}
+
+impl HasIat for MeetingTokenClaims {
+    fn iat(&self) -> i64 {
+        self.iat
+    }
+}
+
+impl HasIat for GuestTokenClaims {
+    fn iat(&self) -> i64 {
+        self.iat
+    }
+}
+
+// =============================================================================
 // Functions
 // =============================================================================
 
@@ -490,7 +549,7 @@ impl fmt::Debug for GuestTokenClaims {
 ///
 /// # Errors
 ///
-/// Returns `JwtValidationError` variants:
+/// Returns `JwtError` variants:
 /// - `TokenTooLarge` - Token exceeds size limit (denial-of-service protection)
 /// - `MalformedToken` - Token format invalid (wrong structure, bad base64, invalid JSON)
 /// - `MissingKid` - Token header missing `kid` field or `kid` is not a string
@@ -510,7 +569,7 @@ impl fmt::Debug for GuestTokenClaims {
 ///     }
 /// }
 /// ```
-pub fn extract_kid(token: &str) -> Result<String, JwtValidationError> {
+pub fn extract_kid(token: &str) -> Result<String, JwtError> {
     // Check token size first (DoS prevention)
     if token.len() > MAX_JWT_SIZE_BYTES {
         tracing::debug!(
@@ -519,7 +578,7 @@ pub fn extract_kid(token: &str) -> Result<String, JwtValidationError> {
             max_size = MAX_JWT_SIZE_BYTES,
             "Token rejected: size exceeds maximum allowed"
         );
-        return Err(JwtValidationError::TokenTooLarge);
+        return Err(JwtError::TokenTooLarge);
     }
 
     // JWT format: header.payload.signature
@@ -530,19 +589,19 @@ pub fn extract_kid(token: &str) -> Result<String, JwtValidationError> {
             parts = parts.len(),
             "Token rejected: invalid JWT format"
         );
-        return Err(JwtValidationError::MalformedToken);
+        return Err(JwtError::MalformedToken);
     }
 
     // Decode the header (first part) - safe indexing since we verified length above
-    let header_part = parts.first().ok_or(JwtValidationError::MalformedToken)?;
+    let header_part = parts.first().ok_or(JwtError::MalformedToken)?;
     let header_bytes = URL_SAFE_NO_PAD.decode(header_part).map_err(|e| {
         tracing::debug!(target: "common.jwt", error = %e, "Failed to decode JWT header base64");
-        JwtValidationError::MalformedToken
+        JwtError::MalformedToken
     })?;
 
     let header: serde_json::Value = serde_json::from_slice(&header_bytes).map_err(|e| {
         tracing::debug!(target: "common.jwt", error = %e, "Failed to parse JWT header JSON");
-        JwtValidationError::MalformedToken
+        JwtError::MalformedToken
     })?;
 
     // Extract kid as string, rejecting empty values for defense-in-depth
@@ -551,7 +610,7 @@ pub fn extract_kid(token: &str) -> Result<String, JwtValidationError> {
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(ToString::to_string)
-        .ok_or(JwtValidationError::MissingKid)?;
+        .ok_or(JwtError::MissingKid)?;
 
     Ok(kid)
 }
@@ -575,7 +634,7 @@ pub fn extract_kid(token: &str) -> Result<String, JwtValidationError> {
 ///
 /// # Errors
 ///
-/// Returns `JwtValidationError::IatTooFarInFuture` if the iat timestamp is more than
+/// Returns `JwtError::IatTooFarInFuture` if the iat timestamp is more than
 /// `clock_skew` in the future.
 ///
 /// # Example
@@ -586,7 +645,7 @@ pub fn extract_kid(token: &str) -> Result<String, JwtValidationError> {
 /// // After verifying signature and extracting claims
 /// validate_iat(claims.iat, DEFAULT_CLOCK_SKEW)?;
 /// ```
-pub fn validate_iat(iat: i64, clock_skew: Duration) -> Result<(), JwtValidationError> {
+pub fn validate_iat(iat: i64, clock_skew: Duration) -> Result<(), JwtError> {
     let now = chrono::Utc::now().timestamp();
     validate_iat_at(iat, clock_skew, now)
 }
@@ -595,11 +654,7 @@ pub fn validate_iat(iat: i64, clock_skew: Duration) -> Result<(), JwtValidationE
 ///
 /// Prefer [`validate_iat`] in production code. This variant exists so that
 /// boundary conditions can be unit-tested without wall-clock dependence.
-pub(crate) fn validate_iat_at(
-    iat: i64,
-    clock_skew: Duration,
-    now: i64,
-) -> Result<(), JwtValidationError> {
+pub(crate) fn validate_iat_at(iat: i64, clock_skew: Duration, now: i64) -> Result<(), JwtError> {
     // Safe cast: clock_skew is bounded to MAX_CLOCK_SKEW (600 seconds), well within i64 range
     #[allow(clippy::cast_possible_wrap)]
     let clock_skew_secs = clock_skew.as_secs() as i64;
@@ -614,7 +669,7 @@ pub(crate) fn validate_iat_at(
             clock_skew_secs = clock_skew_secs,
             "Token rejected: iat too far in the future"
         );
-        return Err(JwtValidationError::IatTooFarInFuture);
+        return Err(JwtError::IatTooFarInFuture);
     }
 
     Ok(())
@@ -688,6 +743,381 @@ pub fn decode_ed25519_public_key_jwk(x_b64url: &str) -> Result<Vec<u8>, base64::
 }
 
 // =============================================================================
+// JWKS Types
+// =============================================================================
+
+/// Default cache TTL in seconds (5 minutes).
+const DEFAULT_CACHE_TTL_SECONDS: u64 = 300;
+
+/// JSON Web Key from JWKS endpoint.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Jwk {
+    /// Key type (always "OKP" for Ed25519).
+    pub kty: String,
+
+    /// Key ID - used to select the correct key for verification.
+    pub kid: String,
+
+    /// Curve name (always "Ed25519" for `EdDSA`).
+    #[serde(default)]
+    pub crv: Option<String>,
+
+    /// Public key value (base64url encoded).
+    #[serde(default)]
+    pub x: Option<String>,
+
+    /// Algorithm (should be "`EdDSA`").
+    #[serde(default)]
+    pub alg: Option<String>,
+
+    /// Key use (should be "sig" for signing).
+    #[serde(default, rename = "use")]
+    pub key_use: Option<String>,
+}
+
+/// JWKS response from Auth Controller.
+#[derive(Debug, Clone, Deserialize)]
+pub struct JwksResponse {
+    /// List of JSON Web Keys.
+    pub keys: Vec<Jwk>,
+}
+
+/// Cached JWKS data with expiry time.
+struct CachedJwks {
+    /// Map of key ID to JWK.
+    keys: HashMap<String, Jwk>,
+
+    /// When this cache entry expires.
+    expires_at: Instant,
+}
+
+// =============================================================================
+// JWKS Client
+// =============================================================================
+
+/// JWKS client for fetching and caching public keys.
+///
+/// Thread-safe client that fetches JWKS from Auth Controller and caches
+/// the keys with configurable TTL.
+pub struct JwksClient {
+    /// URL to the JWKS endpoint.
+    jwks_url: String,
+
+    /// HTTP client for fetching JWKS.
+    http_client: reqwest::Client,
+
+    /// Cached JWKS data.
+    cache: Arc<RwLock<Option<CachedJwks>>>,
+
+    /// Cache TTL duration.
+    cache_ttl: Duration,
+}
+
+impl JwksClient {
+    /// Create a new JWKS client.
+    ///
+    /// # Arguments
+    ///
+    /// * `jwks_url` - URL to the Auth Controller's JWKS endpoint
+    ///
+    /// # Errors
+    ///
+    /// Returns `JwtError::ServiceUnavailable` if the HTTP client cannot be built.
+    pub fn new(jwks_url: String) -> Result<Self, JwtError> {
+        Self::with_ttl(jwks_url, Duration::from_secs(DEFAULT_CACHE_TTL_SECONDS))
+    }
+
+    /// Create a new JWKS client with custom cache TTL.
+    ///
+    /// # Arguments
+    ///
+    /// * `jwks_url` - URL to the Auth Controller's JWKS endpoint
+    /// * `cache_ttl` - How long to cache JWKS before refreshing
+    ///
+    /// # Errors
+    ///
+    /// Returns `JwtError::ServiceUnavailable` if the HTTP client cannot be built.
+    pub fn with_ttl(jwks_url: String, cache_ttl: Duration) -> Result<Self, JwtError> {
+        let http_client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .map_err(|e| {
+                tracing::error!(target: "common.jwt.jwks", error = %e, "Failed to build HTTP client");
+                JwtError::ServiceUnavailable("Failed to initialize JWKS client".to_string())
+            })?;
+
+        Ok(Self {
+            jwks_url,
+            http_client,
+            cache: Arc::new(RwLock::new(None)),
+            cache_ttl,
+        })
+    }
+
+    /// Get a JWK by key ID.
+    ///
+    /// Returns the JWK if found, or fetches from AC if cache is expired/empty.
+    ///
+    /// # Arguments
+    ///
+    /// * `kid` - Key ID to look up
+    ///
+    /// # Errors
+    ///
+    /// Returns `JwtError::ServiceUnavailable` if JWKS cannot be fetched.
+    /// Returns `JwtError::KeyNotFound` if key ID is not found.
+    #[instrument(skip_all, fields(kid = %kid))]
+    pub async fn get_key(&self, kid: &str) -> Result<Jwk, JwtError> {
+        // Check cache first
+        {
+            let cache = self.cache.read().await;
+            if let Some(cached) = cache.as_ref() {
+                if cached.expires_at > Instant::now() {
+                    if let Some(key) = cached.keys.get(kid) {
+                        tracing::debug!(target: "common.jwt.jwks", kid = %kid, "JWKS cache hit");
+                        return Ok(key.clone());
+                    }
+                    // Key not found in valid cache
+                    tracing::debug!(target: "common.jwt.jwks", kid = %kid, "Key not found in JWKS cache");
+                    return Err(JwtError::KeyNotFound);
+                }
+            }
+        }
+
+        // Cache miss or expired - fetch fresh JWKS
+        self.refresh_cache().await?;
+
+        // Try to get key from refreshed cache
+        let cache = self.cache.read().await;
+        if let Some(cached) = cache.as_ref() {
+            if let Some(key) = cached.keys.get(kid) {
+                return Ok(key.clone());
+            }
+        }
+
+        // Key not found even after refresh
+        tracing::warn!(target: "common.jwt.jwks", kid = %kid, "Key not found in JWKS after refresh");
+        Err(JwtError::KeyNotFound)
+    }
+
+    /// Refresh the JWKS cache by fetching from Auth Controller.
+    #[instrument(skip_all)]
+    async fn refresh_cache(&self) -> Result<(), JwtError> {
+        tracing::debug!(target: "common.jwt.jwks", url = %self.jwks_url, "Fetching JWKS from AC");
+
+        let response = self
+            .http_client
+            .get(&self.jwks_url)
+            .send()
+            .await
+            .map_err(|e| {
+                tracing::error!(target: "common.jwt.jwks", error = %e, "Failed to fetch JWKS");
+                JwtError::ServiceUnavailable("Authentication service unavailable".to_string())
+            })?;
+
+        if !response.status().is_success() {
+            tracing::error!(
+                target: "common.jwt.jwks",
+                status = %response.status(),
+                "JWKS endpoint returned error"
+            );
+            return Err(JwtError::ServiceUnavailable(
+                "Authentication service unavailable".to_string(),
+            ));
+        }
+
+        let jwks: JwksResponse = response.json().await.map_err(|e| {
+            tracing::error!(target: "common.jwt.jwks", error = %e, "Failed to parse JWKS response");
+            JwtError::ServiceUnavailable("Authentication service unavailable".to_string())
+        })?;
+
+        // Build key map
+        let keys: HashMap<String, Jwk> = jwks
+            .keys
+            .into_iter()
+            .map(|key| (key.kid.clone(), key))
+            .collect();
+
+        tracing::info!(
+            target: "common.jwt.jwks",
+            key_count = keys.len(),
+            "JWKS cache refreshed"
+        );
+
+        // Update cache
+        let mut cache = self.cache.write().await;
+        *cache = Some(CachedJwks {
+            keys,
+            expires_at: Instant::now() + self.cache_ttl,
+        });
+
+        Ok(())
+    }
+
+    /// Force refresh the cache.
+    ///
+    /// Useful for manual cache invalidation.
+    ///
+    /// # Errors
+    ///
+    /// Returns `JwtError::ServiceUnavailable` if JWKS cannot be fetched.
+    pub async fn force_refresh(&self) -> Result<(), JwtError> {
+        self.refresh_cache().await
+    }
+
+    /// Clear the cache.
+    ///
+    /// Useful for testing.
+    #[cfg(test)]
+    #[allow(dead_code)] // Test utility for cache invalidation
+    pub async fn clear_cache(&self) {
+        let mut cache = self.cache.write().await;
+        *cache = None;
+    }
+}
+
+// =============================================================================
+// JWT Verification
+// =============================================================================
+
+/// Verify JWT signature and extract claims.
+///
+/// Generic over the claims type — allows both service `Claims` and `UserClaims`
+/// to be decoded from the same `EdDSA`-signed JWT. The JWK validation and signature
+/// verification are claims-type-independent.
+///
+/// # Errors
+///
+/// Returns `JwtError::InvalidSignature` if the JWK key type is not OKP, the algorithm
+/// is not `EdDSA`, the public key is missing or invalid, or signature verification fails.
+pub fn verify_token<T: DeserializeOwned>(token: &str, jwk: &Jwk) -> Result<T, JwtError> {
+    // Validate JWK is EdDSA key
+    if jwk.kty != "OKP" {
+        tracing::warn!(target: "common.jwt", kty = %jwk.kty, "Unexpected JWK key type");
+        return Err(JwtError::InvalidSignature);
+    }
+    if let Some(alg) = &jwk.alg {
+        if alg != "EdDSA" {
+            tracing::warn!(target: "common.jwt", alg = %alg, "Unexpected JWK algorithm");
+            return Err(JwtError::InvalidSignature);
+        }
+    }
+
+    // Get public key bytes from JWK
+    let public_key_b64 = jwk.x.as_ref().ok_or_else(|| {
+        tracing::error!(target: "common.jwt", kid = %jwk.kid, "JWK missing x field");
+        JwtError::InvalidSignature
+    })?;
+
+    // Decode public key from base64url using common utility
+    let public_key_bytes = decode_ed25519_public_key_jwk(public_key_b64).map_err(|e| {
+        tracing::error!(target: "common.jwt", error = %e, "Invalid public key encoding");
+        JwtError::InvalidSignature
+    })?;
+
+    // Create decoding key
+    let decoding_key = DecodingKey::from_ed_der(&public_key_bytes);
+
+    // Configure validation
+    let mut validation = Validation::new(Algorithm::EdDSA);
+    validation.validate_exp = true;
+    // Don't validate aud - we'll check scopes instead
+
+    // Decode and verify
+    let token_data = decode::<T>(token, &decoding_key, &validation).map_err(|e| {
+        tracing::debug!(target: "common.jwt", error = %e, "Token verification failed");
+        JwtError::InvalidSignature
+    })?;
+
+    Ok(token_data.claims)
+}
+
+// =============================================================================
+// JWT Validator
+// =============================================================================
+
+/// JWT validator using JWKS from Auth Controller.
+///
+/// Provides a full validation pipeline: size check, kid extraction, JWKS lookup,
+/// `EdDSA` signature verification, and iat validation. Generic over claims types.
+pub struct JwtValidator {
+    /// JWKS client for fetching public keys.
+    jwks_client: Arc<JwksClient>,
+
+    /// Clock skew tolerance in seconds for iat validation.
+    clock_skew_seconds: i64,
+}
+
+impl JwtValidator {
+    /// Create a new JWT validator.
+    ///
+    /// # Arguments
+    ///
+    /// * `jwks_client` - Client for fetching public keys
+    /// * `clock_skew_seconds` - Clock skew tolerance for iat validation
+    #[must_use]
+    #[expect(
+        clippy::cast_possible_wrap,
+        reason = "MAX_CLOCK_SKEW (600s) is well within i64 range"
+    )]
+    pub fn new(jwks_client: Arc<JwksClient>, clock_skew_seconds: i64) -> Self {
+        let clamped = clock_skew_seconds
+            .max(0)
+            .min(MAX_CLOCK_SKEW.as_secs() as i64);
+        Self {
+            jwks_client,
+            clock_skew_seconds: clamped,
+        }
+    }
+
+    /// Validate a JWT and return the claims.
+    ///
+    /// # Security Checks
+    ///
+    /// 1. Size check - reject tokens > 8KB before parsing
+    /// 2. Extract kid from header to find the correct key
+    /// 3. Fetch public key from JWKS
+    /// 4. Verify `EdDSA` signature
+    /// 5. Validate exp claim (reject expired tokens)
+    /// 6. Validate iat claim with clock skew tolerance
+    ///
+    /// # Arguments
+    ///
+    /// * `token` - The JWT string to validate
+    ///
+    /// # Errors
+    ///
+    /// Returns `JwtError` for all validation failures.
+    #[expect(
+        clippy::cast_sign_loss,
+        reason = "clock_skew_seconds clamped non-negative at construction"
+    )]
+    #[instrument(skip_all)]
+    pub async fn validate<T: DeserializeOwned + HasIat>(&self, token: &str) -> Result<T, JwtError> {
+        // 1. Extract kid from JWT header (includes size check)
+        let kid = extract_kid(token).map_err(|e| {
+            tracing::debug!(target: "common.jwt", error = ?e, "Token kid extraction failed");
+            e
+        })?;
+
+        // 2. Fetch public key from JWKS
+        let jwk = self.jwks_client.get_key(&kid).await?;
+
+        // 3. Verify signature and extract claims
+        let claims = verify_token::<T>(token, &jwk)?;
+
+        // 4. Validate iat claim with clock skew tolerance
+        validate_iat(
+            claims.iat(),
+            Duration::from_secs(self.clock_skew_seconds as u64),
+        )?;
+
+        tracing::debug!(target: "common.jwt", "Token validated successfully");
+        Ok(claims)
+    }
+}
+
+// =============================================================================
 // Tests
 // =============================================================================
 
@@ -739,27 +1169,27 @@ mod tests {
         let token = format!("{header_b64}.payload.signature");
 
         let result = extract_kid(&token);
-        assert!(matches!(result, Err(JwtValidationError::MissingKid)));
+        assert!(matches!(result, Err(JwtError::MissingKid)));
     }
 
     #[test]
     fn test_extract_kid_malformed_token() {
         // Not a valid JWT format
         let result = extract_kid("not-a-jwt");
-        assert!(matches!(result, Err(JwtValidationError::MalformedToken)));
+        assert!(matches!(result, Err(JwtError::MalformedToken)));
     }
 
     #[test]
     fn test_extract_kid_empty_token() {
         // Empty string should be rejected as malformed
         let result = extract_kid("");
-        assert!(matches!(result, Err(JwtValidationError::MalformedToken)));
+        assert!(matches!(result, Err(JwtError::MalformedToken)));
     }
 
     #[test]
     fn test_extract_kid_invalid_base64() {
         let result = extract_kid("!!!invalid!!!.payload.signature");
-        assert!(matches!(result, Err(JwtValidationError::MalformedToken)));
+        assert!(matches!(result, Err(JwtError::MalformedToken)));
     }
 
     #[test]
@@ -768,7 +1198,7 @@ mod tests {
         let token = format!("{header_b64}.payload.signature");
 
         let result = extract_kid(&token);
-        assert!(matches!(result, Err(JwtValidationError::MalformedToken)));
+        assert!(matches!(result, Err(JwtError::MalformedToken)));
     }
 
     #[test]
@@ -776,7 +1206,7 @@ mod tests {
         // Create a token larger than MAX_JWT_SIZE_BYTES
         let oversized = "a".repeat(MAX_JWT_SIZE_BYTES + 1);
         let result = extract_kid(&oversized);
-        assert!(matches!(result, Err(JwtValidationError::TokenTooLarge)));
+        assert!(matches!(result, Err(JwtError::TokenTooLarge)));
     }
 
     #[test]
@@ -816,7 +1246,7 @@ mod tests {
         let token = format!("{header_b64}.payload.signature");
 
         let result = extract_kid(&token);
-        assert!(matches!(result, Err(JwtValidationError::MissingKid)));
+        assert!(matches!(result, Err(JwtError::MissingKid)));
     }
 
     // -------------------------------------------------------------------------
@@ -855,14 +1285,14 @@ mod tests {
     fn test_validate_iat_beyond_clock_skew() {
         let future = chrono::Utc::now().timestamp() + DEFAULT_CLOCK_SKEW.as_secs() as i64 + 10;
         let result = validate_iat(future, DEFAULT_CLOCK_SKEW);
-        assert!(matches!(result, Err(JwtValidationError::IatTooFarInFuture)));
+        assert!(matches!(result, Err(JwtError::IatTooFarInFuture)));
     }
 
     #[test]
     fn test_validate_iat_far_future() {
         let far_future = chrono::Utc::now().timestamp() + 86400; // 1 day in future
         let result = validate_iat(far_future, DEFAULT_CLOCK_SKEW);
-        assert!(matches!(result, Err(JwtValidationError::IatTooFarInFuture)));
+        assert!(matches!(result, Err(JwtError::IatTooFarInFuture)));
     }
 
     #[test]
@@ -876,7 +1306,7 @@ mod tests {
         // iat one second beyond boundary — rejected
         assert!(matches!(
             validate_iat_at(now + 2, one_sec, now),
-            Err(JwtValidationError::IatTooFarInFuture)
+            Err(JwtError::IatTooFarInFuture)
         ));
     }
 
@@ -890,7 +1320,7 @@ mod tests {
         // iat == now + skew + 1 is the first rejected value
         assert!(matches!(
             validate_iat_at(now + 301, DEFAULT_CLOCK_SKEW, now),
-            Err(JwtValidationError::IatTooFarInFuture)
+            Err(JwtError::IatTooFarInFuture)
         ));
     }
 
@@ -1634,5 +2064,936 @@ mod tests {
         let result = claims.validate();
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), "Guest token must have role 'guest'");
+    }
+
+    // -------------------------------------------------------------------------
+    // JwtError Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_jwt_error_display_messages_are_uniform() {
+        // All validation errors should show the same generic message
+        let errors = vec![
+            JwtError::TokenTooLarge,
+            JwtError::MalformedToken,
+            JwtError::MissingKid,
+            JwtError::IatTooFarInFuture,
+            JwtError::InvalidSignature,
+            JwtError::KeyNotFound,
+        ];
+        for err in &errors {
+            assert_eq!(
+                format!("{err}"),
+                "The access token is invalid or expired",
+                "All validation errors should have uniform message, got variant: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_jwt_error_service_unavailable_display() {
+        let err = JwtError::ServiceUnavailable("auth down".to_string());
+        assert_eq!(format!("{err}"), "Authentication service unavailable");
+    }
+
+    #[test]
+    fn test_jwt_error_clone_and_eq() {
+        let err = JwtError::InvalidSignature;
+        let cloned = err.clone();
+        assert_eq!(err, cloned);
+    }
+
+    // -------------------------------------------------------------------------
+    // Jwk / JwksResponse Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_jwk_deserialization() {
+        let json = r#"{
+            "kty": "OKP",
+            "kid": "test-key-01",
+            "crv": "Ed25519",
+            "x": "dGVzdC1wdWJsaWMta2V5LWRhdGE",
+            "alg": "EdDSA",
+            "use": "sig"
+        }"#;
+
+        let jwk: Jwk = serde_json::from_str(json).unwrap();
+
+        assert_eq!(jwk.kty, "OKP");
+        assert_eq!(jwk.kid, "test-key-01");
+        assert_eq!(jwk.crv, Some("Ed25519".to_string()));
+        assert_eq!(jwk.x, Some("dGVzdC1wdWJsaWMta2V5LWRhdGE".to_string()));
+        assert_eq!(jwk.alg, Some("EdDSA".to_string()));
+        assert_eq!(jwk.key_use, Some("sig".to_string()));
+    }
+
+    #[test]
+    fn test_jwk_deserialization_minimal() {
+        let json = r#"{
+            "kty": "OKP",
+            "kid": "test-key-02"
+        }"#;
+
+        let jwk: Jwk = serde_json::from_str(json).unwrap();
+
+        assert_eq!(jwk.kty, "OKP");
+        assert_eq!(jwk.kid, "test-key-02");
+        assert!(jwk.crv.is_none());
+        assert!(jwk.x.is_none());
+        assert!(jwk.alg.is_none());
+        assert!(jwk.key_use.is_none());
+    }
+
+    #[test]
+    fn test_jwks_response_deserialization() {
+        let json = r#"{
+            "keys": [
+                {"kty": "OKP", "kid": "key-1"},
+                {"kty": "OKP", "kid": "key-2"}
+            ]
+        }"#;
+
+        let jwks: JwksResponse = serde_json::from_str(json).unwrap();
+
+        assert_eq!(jwks.keys.len(), 2);
+        assert_eq!(jwks.keys.first().unwrap().kid, "key-1");
+        assert_eq!(jwks.keys.get(1).unwrap().kid, "key-2");
+    }
+
+    // -------------------------------------------------------------------------
+    // JwksClient Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_jwks_client_creation() {
+        let client =
+            JwksClient::new("http://localhost:8082/.well-known/jwks.json".to_string()).unwrap();
+        assert_eq!(
+            client.jwks_url,
+            "http://localhost:8082/.well-known/jwks.json"
+        );
+    }
+
+    #[test]
+    fn test_jwks_client_custom_ttl() {
+        let client = JwksClient::with_ttl(
+            "http://localhost:8082/.well-known/jwks.json".to_string(),
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        assert_eq!(client.cache_ttl, Duration::from_secs(60));
+    }
+
+    #[tokio::test]
+    async fn test_jwks_get_key_success_from_fetch() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        let jwks_response = serde_json::json!({
+            "keys": [
+                {
+                    "kty": "OKP",
+                    "kid": "test-key-01",
+                    "crv": "Ed25519",
+                    "x": "dGVzdC1wdWJsaWMta2V5LWRhdGE",
+                    "alg": "EdDSA",
+                    "use": "sig"
+                }
+            ]
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jwks.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&jwks_response))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let client =
+            JwksClient::new(format!("{}/.well-known/jwks.json", mock_server.uri())).unwrap();
+
+        let key = client.get_key("test-key-01").await;
+        assert!(key.is_ok());
+        let jwk = key.unwrap();
+        assert_eq!(jwk.kid, "test-key-01");
+        assert_eq!(jwk.kty, "OKP");
+    }
+
+    #[tokio::test]
+    async fn test_jwks_get_key_cache_hit() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        let jwks_response = serde_json::json!({
+            "keys": [
+                {
+                    "kty": "OKP",
+                    "kid": "cached-key",
+                    "crv": "Ed25519",
+                    "x": "dGVzdA",
+                    "alg": "EdDSA"
+                }
+            ]
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jwks.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&jwks_response))
+            .expect(1) // Should only be called once due to caching
+            .mount(&mock_server)
+            .await;
+
+        let client =
+            JwksClient::new(format!("{}/.well-known/jwks.json", mock_server.uri())).unwrap();
+
+        // First call - fetches from server
+        let key1 = client.get_key("cached-key").await;
+        assert!(key1.is_ok());
+
+        // Second call - should hit cache
+        let key2 = client.get_key("cached-key").await;
+        assert!(key2.is_ok());
+
+        assert_eq!(key1.unwrap().kid, key2.unwrap().kid);
+    }
+
+    #[tokio::test]
+    async fn test_jwks_get_key_not_found_in_valid_cache() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        let jwks_response = serde_json::json!({
+            "keys": [
+                {
+                    "kty": "OKP",
+                    "kid": "existing-key",
+                    "crv": "Ed25519",
+                    "x": "dGVzdA",
+                    "alg": "EdDSA"
+                }
+            ]
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jwks.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&jwks_response))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let client =
+            JwksClient::new(format!("{}/.well-known/jwks.json", mock_server.uri())).unwrap();
+
+        // Populate cache
+        let _ = client.get_key("existing-key").await;
+
+        // Request non-existent key from valid cache
+        let result = client.get_key("non-existent-key").await;
+        assert!(matches!(result, Err(JwtError::KeyNotFound)));
+    }
+
+    #[tokio::test]
+    async fn test_jwks_get_key_not_found_after_refresh() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        let jwks_response = serde_json::json!({
+            "keys": [
+                {
+                    "kty": "OKP",
+                    "kid": "different-key",
+                    "crv": "Ed25519",
+                    "x": "dGVzdA",
+                    "alg": "EdDSA"
+                }
+            ]
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jwks.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&jwks_response))
+            .mount(&mock_server)
+            .await;
+
+        let client = JwksClient::with_ttl(
+            format!("{}/.well-known/jwks.json", mock_server.uri()),
+            Duration::from_millis(1),
+        )
+        .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let result = client.get_key("non-existent-key").await;
+        assert!(matches!(result, Err(JwtError::KeyNotFound)));
+    }
+
+    #[tokio::test]
+    async fn test_jwks_refresh_cache_network_error() {
+        let client =
+            JwksClient::new("http://127.0.0.1:1/.well-known/jwks.json".to_string()).unwrap();
+
+        let result = client.get_key("any-key").await;
+        assert!(
+            matches!(result, Err(JwtError::ServiceUnavailable(_))),
+            "Expected ServiceUnavailable, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_jwks_refresh_cache_non_success_status() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jwks.json"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&mock_server)
+            .await;
+
+        let client =
+            JwksClient::new(format!("{}/.well-known/jwks.json", mock_server.uri())).unwrap();
+
+        let result = client.get_key("any-key").await;
+        assert!(matches!(result, Err(JwtError::ServiceUnavailable(_))));
+    }
+
+    #[tokio::test]
+    async fn test_jwks_refresh_cache_invalid_json() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jwks.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("not valid json"))
+            .mount(&mock_server)
+            .await;
+
+        let client =
+            JwksClient::new(format!("{}/.well-known/jwks.json", mock_server.uri())).unwrap();
+
+        let result = client.get_key("any-key").await;
+        assert!(matches!(result, Err(JwtError::ServiceUnavailable(_))));
+    }
+
+    #[tokio::test]
+    async fn test_jwks_refresh_cache_404() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jwks.json"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&mock_server)
+            .await;
+
+        let client =
+            JwksClient::new(format!("{}/.well-known/jwks.json", mock_server.uri())).unwrap();
+
+        let result = client.get_key("any-key").await;
+        assert!(matches!(result, Err(JwtError::ServiceUnavailable(_))));
+    }
+
+    #[tokio::test]
+    async fn test_jwks_force_refresh_success() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        let jwks_response = serde_json::json!({
+            "keys": [
+                {
+                    "kty": "OKP",
+                    "kid": "force-refresh-key",
+                    "crv": "Ed25519",
+                    "x": "dGVzdA",
+                    "alg": "EdDSA"
+                }
+            ]
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jwks.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&jwks_response))
+            .mount(&mock_server)
+            .await;
+
+        let client =
+            JwksClient::new(format!("{}/.well-known/jwks.json", mock_server.uri())).unwrap();
+
+        let result = client.force_refresh().await;
+        assert!(result.is_ok());
+
+        let key = client.get_key("force-refresh-key").await;
+        assert!(key.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_jwks_clear_cache() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        let jwks_response = serde_json::json!({
+            "keys": [
+                {
+                    "kty": "OKP",
+                    "kid": "clear-cache-key",
+                    "crv": "Ed25519",
+                    "x": "dGVzdA",
+                    "alg": "EdDSA"
+                }
+            ]
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jwks.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&jwks_response))
+            .expect(2) // Should be called twice - once before clear, once after
+            .mount(&mock_server)
+            .await;
+
+        let client =
+            JwksClient::new(format!("{}/.well-known/jwks.json", mock_server.uri())).unwrap();
+
+        let _ = client.get_key("clear-cache-key").await;
+        client.clear_cache().await;
+
+        let key = client.get_key("clear-cache-key").await;
+        assert!(key.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_jwks_multiple_keys() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        let jwks_response = serde_json::json!({
+            "keys": [
+                {"kty": "OKP", "kid": "key-1", "crv": "Ed25519", "x": "a2V5LTE", "alg": "EdDSA"},
+                {"kty": "OKP", "kid": "key-2", "crv": "Ed25519", "x": "a2V5LTI", "alg": "EdDSA"},
+                {"kty": "OKP", "kid": "key-3", "crv": "Ed25519", "x": "a2V5LTM", "alg": "EdDSA"}
+            ]
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jwks.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&jwks_response))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let client =
+            JwksClient::new(format!("{}/.well-known/jwks.json", mock_server.uri())).unwrap();
+
+        let key1 = client.get_key("key-1").await.unwrap();
+        assert_eq!(key1.kid, "key-1");
+
+        let key2 = client.get_key("key-2").await.unwrap();
+        assert_eq!(key2.kid, "key-2");
+
+        let key3 = client.get_key("key-3").await.unwrap();
+        assert_eq!(key3.kid, "key-3");
+    }
+
+    #[tokio::test]
+    async fn test_jwks_cache_expiration_triggers_refresh() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        let jwks_response = serde_json::json!({
+            "keys": [
+                {"kty": "OKP", "kid": "expiring-key", "crv": "Ed25519", "x": "dGVzdA", "alg": "EdDSA"}
+            ]
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jwks.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&jwks_response))
+            .expect(2) // Should be called twice due to expiration
+            .mount(&mock_server)
+            .await;
+
+        let client = JwksClient::with_ttl(
+            format!("{}/.well-known/jwks.json", mock_server.uri()),
+            Duration::from_millis(1),
+        )
+        .unwrap();
+
+        let _ = client.get_key("expiring-key").await;
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let key = client.get_key("expiring-key").await;
+        assert!(key.is_ok());
+    }
+
+    // -------------------------------------------------------------------------
+    // verify_token Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_verify_token_rejects_non_okp_key_type() {
+        let jwk = Jwk {
+            kty: "RSA".to_string(),
+            kid: "test-key".to_string(),
+            crv: Some("Ed25519".to_string()),
+            x: Some("dGVzdC1wdWJsaWMta2V5".to_string()),
+            alg: Some("EdDSA".to_string()),
+            key_use: Some("sig".to_string()),
+        };
+
+        let header = r#"{"alg":"EdDSA","typ":"JWT","kid":"test-key"}"#;
+        let header_b64 = URL_SAFE_NO_PAD.encode(header.as_bytes());
+        let payload = r#"{"sub":"test","exp":9999999999,"iat":1234567890,"scope":"read"}"#;
+        let payload_b64 = URL_SAFE_NO_PAD.encode(payload.as_bytes());
+        let token = format!("{header_b64}.{payload_b64}.fake_signature");
+
+        let result = verify_token::<serde_json::Value>(&token, &jwk);
+        assert!(matches!(result, Err(JwtError::InvalidSignature)));
+    }
+
+    #[test]
+    fn test_verify_token_rejects_non_eddsa_algorithm() {
+        let jwk = Jwk {
+            kty: "OKP".to_string(),
+            kid: "test-key".to_string(),
+            crv: Some("Ed25519".to_string()),
+            x: Some("dGVzdC1wdWJsaWMta2V5".to_string()),
+            alg: Some("RS256".to_string()),
+            key_use: Some("sig".to_string()),
+        };
+
+        let header = r#"{"alg":"EdDSA","typ":"JWT","kid":"test-key"}"#;
+        let header_b64 = URL_SAFE_NO_PAD.encode(header.as_bytes());
+        let payload = r#"{"sub":"test","exp":9999999999,"iat":1234567890,"scope":"read"}"#;
+        let payload_b64 = URL_SAFE_NO_PAD.encode(payload.as_bytes());
+        let token = format!("{header_b64}.{payload_b64}.fake_signature");
+
+        let result = verify_token::<serde_json::Value>(&token, &jwk);
+        assert!(matches!(result, Err(JwtError::InvalidSignature)));
+    }
+
+    #[test]
+    fn test_verify_token_rejects_missing_x_field() {
+        let jwk = Jwk {
+            kty: "OKP".to_string(),
+            kid: "test-key".to_string(),
+            crv: Some("Ed25519".to_string()),
+            x: None,
+            alg: Some("EdDSA".to_string()),
+            key_use: Some("sig".to_string()),
+        };
+
+        let header = r#"{"alg":"EdDSA","typ":"JWT","kid":"test-key"}"#;
+        let header_b64 = URL_SAFE_NO_PAD.encode(header.as_bytes());
+        let payload = r#"{"sub":"test","exp":9999999999,"iat":1234567890}"#;
+        let payload_b64 = URL_SAFE_NO_PAD.encode(payload.as_bytes());
+        let token = format!("{header_b64}.{payload_b64}.fake_signature");
+
+        let result = verify_token::<serde_json::Value>(&token, &jwk);
+        assert!(matches!(result, Err(JwtError::InvalidSignature)));
+    }
+
+    #[test]
+    fn test_verify_token_rejects_invalid_base64_public_key() {
+        let jwk = Jwk {
+            kty: "OKP".to_string(),
+            kid: "test-key".to_string(),
+            crv: Some("Ed25519".to_string()),
+            x: Some("!!!invalid-base64!!!".to_string()),
+            alg: Some("EdDSA".to_string()),
+            key_use: Some("sig".to_string()),
+        };
+
+        let header = r#"{"alg":"EdDSA","typ":"JWT","kid":"test-key"}"#;
+        let header_b64 = URL_SAFE_NO_PAD.encode(header.as_bytes());
+        let payload = r#"{"sub":"test","exp":9999999999,"iat":1234567890}"#;
+        let payload_b64 = URL_SAFE_NO_PAD.encode(payload.as_bytes());
+        let token = format!("{header_b64}.{payload_b64}.fake_signature");
+
+        let result = verify_token::<serde_json::Value>(&token, &jwk);
+        assert!(matches!(result, Err(JwtError::InvalidSignature)));
+    }
+
+    #[test]
+    fn test_verify_token_accepts_jwk_without_alg_field() {
+        let jwk = Jwk {
+            kty: "OKP".to_string(),
+            kid: "test-key".to_string(),
+            crv: Some("Ed25519".to_string()),
+            x: Some("dGVzdC1wdWJsaWMta2V5".to_string()),
+            alg: None,
+            key_use: Some("sig".to_string()),
+        };
+
+        let header = r#"{"alg":"EdDSA","typ":"JWT","kid":"test-key"}"#;
+        let header_b64 = URL_SAFE_NO_PAD.encode(header.as_bytes());
+        let payload = r#"{"sub":"test","exp":9999999999,"iat":1234567890}"#;
+        let payload_b64 = URL_SAFE_NO_PAD.encode(payload.as_bytes());
+        let token = format!("{header_b64}.{payload_b64}.fake_signature");
+
+        // This should fail at signature verification, not at JWK validation
+        let result = verify_token::<serde_json::Value>(&token, &jwk);
+        assert!(matches!(result, Err(JwtError::InvalidSignature)));
+    }
+
+    // -------------------------------------------------------------------------
+    // JwtValidator + verify_token Round-Trip Tests (Real Ed25519 Keys)
+    // -------------------------------------------------------------------------
+
+    /// Test helper: generates an Ed25519 keypair and returns (kid, pkcs8 bytes, public key bytes).
+    fn generate_ed25519_keypair() -> (String, Vec<u8>, Vec<u8>) {
+        use ring::signature::{Ed25519KeyPair, KeyPair};
+
+        let kid = "test-kid-01".to_string();
+        let rng = ring::rand::SystemRandom::new();
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+        let keypair = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+        let public_key = keypair.public_key().as_ref().to_vec();
+
+        (kid, pkcs8.as_ref().to_vec(), public_key)
+    }
+
+    /// Sign a JWT with the given claims using the Ed25519 private key.
+    fn sign_jwt<T: Serialize>(claims: &T, kid: &str, pkcs8_bytes: &[u8]) -> String {
+        use jsonwebtoken::{encode, EncodingKey, Header as JwtHeader};
+
+        let mut header = JwtHeader::new(Algorithm::EdDSA);
+        header.kid = Some(kid.to_string());
+
+        let encoding_key = EncodingKey::from_ed_der(pkcs8_bytes);
+        encode(&header, claims, &encoding_key).unwrap()
+    }
+
+    #[test]
+    fn test_verify_token_roundtrip_with_real_keys() {
+        let (kid, pkcs8_bytes, public_key_bytes) = generate_ed25519_keypair();
+
+        let claims = ServiceClaims::new(
+            "test-service".to_string(),
+            chrono::Utc::now().timestamp() + 3600,
+            chrono::Utc::now().timestamp(),
+            "read write".to_string(),
+            Some("global-controller".to_string()),
+        );
+
+        let token = sign_jwt(&claims, &kid, &pkcs8_bytes);
+
+        // Create JWK from public key
+        let x_b64 = URL_SAFE_NO_PAD.encode(&public_key_bytes);
+        let jwk = Jwk {
+            kty: "OKP".to_string(),
+            kid: kid.clone(),
+            crv: Some("Ed25519".to_string()),
+            x: Some(x_b64),
+            alg: Some("EdDSA".to_string()),
+            key_use: Some("sig".to_string()),
+        };
+
+        let result = verify_token::<ServiceClaims>(&token, &jwk);
+        assert!(result.is_ok(), "verify_token should succeed: {result:?}");
+
+        let decoded = result.unwrap();
+        assert_eq!(decoded.sub, "test-service");
+        assert_eq!(decoded.scope, "read write");
+        assert_eq!(decoded.service_type, Some("global-controller".to_string()));
+    }
+
+    #[test]
+    fn test_verify_token_roundtrip_user_claims() {
+        let (kid, pkcs8_bytes, public_key_bytes) = generate_ed25519_keypair();
+
+        let claims = UserClaims {
+            sub: "user-123".to_string(),
+            org_id: "org-456".to_string(),
+            email: "user@example.com".to_string(),
+            roles: vec!["user".to_string(), "admin".to_string()],
+            iat: chrono::Utc::now().timestamp(),
+            exp: chrono::Utc::now().timestamp() + 3600,
+            jti: "jti-789".to_string(),
+        };
+
+        let token = sign_jwt(&claims, &kid, &pkcs8_bytes);
+
+        let x_b64 = URL_SAFE_NO_PAD.encode(&public_key_bytes);
+        let jwk = Jwk {
+            kty: "OKP".to_string(),
+            kid,
+            crv: Some("Ed25519".to_string()),
+            x: Some(x_b64),
+            alg: Some("EdDSA".to_string()),
+            key_use: Some("sig".to_string()),
+        };
+
+        let result = verify_token::<UserClaims>(&token, &jwk);
+        assert!(result.is_ok());
+
+        let decoded = result.unwrap();
+        assert_eq!(decoded.sub, "user-123");
+        assert_eq!(decoded.org_id, "org-456");
+        assert_eq!(decoded.email, "user@example.com");
+        assert_eq!(decoded.roles, vec!["user", "admin"]);
+        assert_eq!(decoded.jti, "jti-789");
+    }
+
+    #[test]
+    fn test_verify_token_rejects_wrong_key() {
+        let (kid, pkcs8_bytes, _) = generate_ed25519_keypair();
+        let (_, _, wrong_public_key) = generate_ed25519_keypair();
+
+        let claims = ServiceClaims::new(
+            "test".to_string(),
+            chrono::Utc::now().timestamp() + 3600,
+            chrono::Utc::now().timestamp(),
+            "read".to_string(),
+            None,
+        );
+
+        let token = sign_jwt(&claims, &kid, &pkcs8_bytes);
+
+        // Use wrong public key for verification
+        let x_b64 = URL_SAFE_NO_PAD.encode(&wrong_public_key);
+        let jwk = Jwk {
+            kty: "OKP".to_string(),
+            kid,
+            crv: Some("Ed25519".to_string()),
+            x: Some(x_b64),
+            alg: Some("EdDSA".to_string()),
+            key_use: Some("sig".to_string()),
+        };
+
+        let result = verify_token::<ServiceClaims>(&token, &jwk);
+        assert!(matches!(result, Err(JwtError::InvalidSignature)));
+    }
+
+    #[tokio::test]
+    async fn test_jwt_validator_validate_roundtrip() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let (kid, pkcs8_bytes, public_key_bytes) = generate_ed25519_keypair();
+        let x_b64 = URL_SAFE_NO_PAD.encode(&public_key_bytes);
+
+        let mock_server = MockServer::start().await;
+
+        let jwks_response = serde_json::json!({
+            "keys": [
+                {
+                    "kty": "OKP",
+                    "kid": kid,
+                    "crv": "Ed25519",
+                    "x": x_b64,
+                    "alg": "EdDSA",
+                    "use": "sig"
+                }
+            ]
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jwks.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&jwks_response))
+            .mount(&mock_server)
+            .await;
+
+        let jwks_client = Arc::new(
+            JwksClient::new(format!("{}/.well-known/jwks.json", mock_server.uri())).unwrap(),
+        );
+        let validator = JwtValidator::new(jwks_client, 300);
+
+        let claims = ServiceClaims::new(
+            "test-service".to_string(),
+            chrono::Utc::now().timestamp() + 3600,
+            chrono::Utc::now().timestamp(),
+            "read write".to_string(),
+            None,
+        );
+
+        let token = sign_jwt(&claims, &kid, &pkcs8_bytes);
+
+        let result: Result<ServiceClaims, JwtError> = validator.validate(&token).await;
+        assert!(result.is_ok(), "Validation should succeed: {result:?}");
+
+        let decoded = result.unwrap();
+        assert_eq!(decoded.sub, "test-service");
+        assert_eq!(decoded.scope, "read write");
+    }
+
+    #[tokio::test]
+    async fn test_jwt_validator_validate_user_claims_roundtrip() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let (kid, pkcs8_bytes, public_key_bytes) = generate_ed25519_keypair();
+        let x_b64 = URL_SAFE_NO_PAD.encode(&public_key_bytes);
+
+        let mock_server = MockServer::start().await;
+
+        let jwks_response = serde_json::json!({
+            "keys": [{"kty": "OKP", "kid": kid, "crv": "Ed25519", "x": x_b64, "alg": "EdDSA", "use": "sig"}]
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jwks.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&jwks_response))
+            .mount(&mock_server)
+            .await;
+
+        let jwks_client = Arc::new(
+            JwksClient::new(format!("{}/.well-known/jwks.json", mock_server.uri())).unwrap(),
+        );
+        let validator = JwtValidator::new(jwks_client, 300);
+
+        let claims = UserClaims {
+            sub: "user-abc".to_string(),
+            org_id: "org-xyz".to_string(),
+            email: "test@example.com".to_string(),
+            roles: vec!["user".to_string()],
+            iat: chrono::Utc::now().timestamp(),
+            exp: chrono::Utc::now().timestamp() + 3600,
+            jti: "jti-unique".to_string(),
+        };
+
+        let token = sign_jwt(&claims, &kid, &pkcs8_bytes);
+
+        let result: Result<UserClaims, JwtError> = validator.validate(&token).await;
+        assert!(result.is_ok());
+
+        let decoded = result.unwrap();
+        assert_eq!(decoded.sub, "user-abc");
+        assert_eq!(decoded.org_id, "org-xyz");
+    }
+
+    #[tokio::test]
+    async fn test_jwt_validator_rejects_expired_token() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let (kid, pkcs8_bytes, public_key_bytes) = generate_ed25519_keypair();
+        let x_b64 = URL_SAFE_NO_PAD.encode(&public_key_bytes);
+
+        let mock_server = MockServer::start().await;
+
+        let jwks_response = serde_json::json!({
+            "keys": [{"kty": "OKP", "kid": kid, "crv": "Ed25519", "x": x_b64, "alg": "EdDSA", "use": "sig"}]
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jwks.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&jwks_response))
+            .mount(&mock_server)
+            .await;
+
+        let jwks_client = Arc::new(
+            JwksClient::new(format!("{}/.well-known/jwks.json", mock_server.uri())).unwrap(),
+        );
+        let validator = JwtValidator::new(jwks_client, 300);
+
+        // Create an expired token (exp in the past)
+        let claims = ServiceClaims::new(
+            "test".to_string(),
+            chrono::Utc::now().timestamp() - 3600, // expired 1 hour ago
+            chrono::Utc::now().timestamp() - 7200,
+            "read".to_string(),
+            None,
+        );
+
+        let token = sign_jwt(&claims, &kid, &pkcs8_bytes);
+
+        let result: Result<ServiceClaims, JwtError> = validator.validate(&token).await;
+        assert!(
+            matches!(result, Err(JwtError::InvalidSignature)),
+            "Expired token should be rejected: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_jwt_validator_rejects_future_iat() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let (kid, pkcs8_bytes, public_key_bytes) = generate_ed25519_keypair();
+        let x_b64 = URL_SAFE_NO_PAD.encode(&public_key_bytes);
+
+        let mock_server = MockServer::start().await;
+
+        let jwks_response = serde_json::json!({
+            "keys": [{"kty": "OKP", "kid": kid, "crv": "Ed25519", "x": x_b64, "alg": "EdDSA", "use": "sig"}]
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jwks.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&jwks_response))
+            .mount(&mock_server)
+            .await;
+
+        let jwks_client = Arc::new(
+            JwksClient::new(format!("{}/.well-known/jwks.json", mock_server.uri())).unwrap(),
+        );
+        // Use very small clock skew (1 second) to easily test iat rejection
+        let validator = JwtValidator::new(jwks_client, 1);
+
+        // Create token with iat far in the future
+        let claims = ServiceClaims::new(
+            "test".to_string(),
+            chrono::Utc::now().timestamp() + 7200,
+            chrono::Utc::now().timestamp() + 3600, // iat 1 hour in the future
+            "read".to_string(),
+            None,
+        );
+
+        let token = sign_jwt(&claims, &kid, &pkcs8_bytes);
+
+        let result: Result<ServiceClaims, JwtError> = validator.validate(&token).await;
+        assert!(
+            matches!(result, Err(JwtError::IatTooFarInFuture)),
+            "Future iat should be rejected: {result:?}"
+        );
+    }
+
+    // Note: Missing-iat validation is enforced at compile time via the HasIat trait bound
+    // on JwtValidator::validate<T: DeserializeOwned + HasIat>. Types without HasIat
+    // cannot be passed to validate().
+
+    #[test]
+    fn test_jwt_validator_clamps_negative_clock_skew() {
+        let jwks_client = Arc::new(
+            JwksClient::new("http://localhost/.well-known/jwks.json".to_string()).unwrap(),
+        );
+        let validator = JwtValidator::new(jwks_client, -100);
+        assert_eq!(validator.clock_skew_seconds, 0);
+    }
+
+    #[test]
+    fn test_jwt_validator_clamps_excessive_clock_skew() {
+        let jwks_client = Arc::new(
+            JwksClient::new("http://localhost/.well-known/jwks.json".to_string()).unwrap(),
+        );
+        // MAX_CLOCK_SKEW is 600 seconds
+        let validator = JwtValidator::new(jwks_client, 99999);
+        assert_eq!(
+            validator.clock_skew_seconds,
+            MAX_CLOCK_SKEW.as_secs() as i64
+        );
     }
 }

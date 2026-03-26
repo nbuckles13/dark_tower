@@ -19,6 +19,10 @@
 - GC participants repository DB metrics -> `crates/gc-service/src/repositories/participants.rs:ParticipantsRepository`
 - MC metrics recording -> `crates/mc-service/src/observability/metrics.rs:init_metrics_recorder()`
 - MC health state (liveness/readiness) -> `crates/mc-service/src/observability/health.rs:health_router()`
+- Common JWKS client (target: `common.jwt.jwks`) -> `crates/common/src/jwt.rs:JwksClient`
+- Common JWT validator (target: `common.jwt`) -> `crates/common/src/jwt.rs:JwtValidator`
+- Common JWT verify_token (target: `common.jwt`) -> `crates/common/src/jwt.rs:verify_token()`
+- GC auth wrapper (delegates logging to common) -> `crates/gc-service/src/auth/jwt.rs:JwtValidator`
 - PII-redacted claims Debug impls -> `crates/common/src/jwt.rs` (ServiceClaims, UserClaims, MeetingTokenClaims, GuestTokenClaims)
 - Metric catalogs -> `docs/observability/metrics/ac-service.md`, `gc-service.md`, `mc-service.md`
 

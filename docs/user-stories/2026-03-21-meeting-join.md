@@ -291,8 +291,8 @@ Task 1 also starts immediately; task 7 waits for task 1
 | 4 | Fix GC join auth + add join metrics | docs/devloop-outputs/2026-03-23-gc-join-auth-metrics | 47bfb59 | Completed |
 | 5 | Infra: TLS certs + MC Secret + Kind UDP | docs/devloop-outputs/2026-03-23-infra-tls-udp | a09ce18 | Completed |
 | 6 | Infra: Enable MC health probes | | | Pending |
-| 7 | Extract JWKS client + JWT validation to common | | | Pending |
-| 8 | Convert GC auth to common JWKS/JWT | | | Pending |
+| 7 | Extract JWKS client + JWT validation to common | docs/devloop-outputs/2026-03-26-jwks-extraction | 375be71 | Completed |
+| 8 | Convert GC auth to common JWKS/JWT | docs/devloop-outputs/2026-03-26-jwks-extraction | aa99fee | Completed (in task 7) |
 | 9 | MC JWT validation on common code | | | Pending |
 | 10 | MC WebTransport server + join flow handler | | | Pending |
 | 11 | MC join flow observability metrics | | | Pending |

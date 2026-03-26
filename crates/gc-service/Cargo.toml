@@ -26,7 +26,6 @@ thiserror = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 bcrypt = { workspace = true }
-jsonwebtoken = { workspace = true }
 
 # gRPC server/client for MC registration
 tonic = { workspace = true }
@@ -39,9 +38,6 @@ tokio-util = { workspace = true }
 
 # HTTP client for JWKS fetching and AC communication
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-
-# Base64 encoding for JWK keys
-base64 = "0.22"
 
 # CSPRNG for meeting code and join token secret generation
 ring = { workspace = true }
@@ -76,3 +72,6 @@ tower = { workspace = true, features = ["util"] }
 metrics-util = "0.18"
 # Re-export for integration tests (metrics-exporter-prometheus is also in deps)
 metrics-exporter-prometheus = "0.16"
+# JWT/base64 used in test code (auth_layer async_tests)
+jsonwebtoken = { workspace = true }
+base64 = "0.22"

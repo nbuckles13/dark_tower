@@ -261,9 +261,10 @@ mod tests {
     fn create_interceptor() -> GrpcAuthInterceptor {
         // Create a minimal JwtValidator for the interceptor
         // The interceptor doesn't actually validate JWT - it just extracts and stores
-        let jwks_client = Arc::new(crate::auth::JwksClient::new(
-            "http://localhost:8082/.well-known/jwks.json".to_string(),
-        ));
+        let jwks_client = Arc::new(
+            crate::auth::JwksClient::new("http://localhost:8082/.well-known/jwks.json".to_string())
+                .expect("Failed to create JWKS client"),
+        );
         let jwt_validator = Arc::new(JwtValidator::new(jwks_client, 300));
         GrpcAuthInterceptor::new(jwt_validator)
     }
@@ -456,9 +457,10 @@ mod tests {
 
     #[test]
     fn test_grpc_auth_layer_creation() {
-        let jwks_client = Arc::new(crate::auth::JwksClient::new(
-            "http://localhost:8082/.well-known/jwks.json".to_string(),
-        ));
+        let jwks_client = Arc::new(
+            crate::auth::JwksClient::new("http://localhost:8082/.well-known/jwks.json".to_string())
+                .expect("Failed to create JWKS client"),
+        );
         let jwt_validator = Arc::new(JwtValidator::new(jwks_client, 300));
 
         let _layer = async_auth::GrpcAuthLayer::new(jwt_validator);
@@ -611,7 +613,8 @@ mod async_tests {
     }
 
     fn create_auth_service(jwks_url: String) -> GrpcAuthService<MockInnerService> {
-        let jwks_client = Arc::new(crate::auth::JwksClient::new(jwks_url));
+        let jwks_client =
+            Arc::new(crate::auth::JwksClient::new(jwks_url).expect("Failed to create JWKS client"));
         let jwt_validator = Arc::new(JwtValidator::new(jwks_client, 300));
         let layer = GrpcAuthLayer::new(jwt_validator);
         layer.layer(MockInnerService)

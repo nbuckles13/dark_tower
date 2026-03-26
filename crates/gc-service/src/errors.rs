@@ -173,6 +173,16 @@ impl From<sqlx::Error> for GcError {
     }
 }
 
+/// Convert common JWT errors to GcError
+impl From<common::jwt::JwtError> for GcError {
+    fn from(err: common::jwt::JwtError) -> Self {
+        match err {
+            common::jwt::JwtError::ServiceUnavailable(msg) => GcError::ServiceUnavailable(msg),
+            _ => GcError::InvalidToken("The access token is invalid or expired".to_string()),
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {

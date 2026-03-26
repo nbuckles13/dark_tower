@@ -49,9 +49,12 @@ pub struct AppState {
 /// - TraceLayer for request logging
 /// - HTTP metrics middleware (ADR-0011)
 /// - 30 second request timeout
-pub fn build_routes(state: Arc<AppState>, metrics_handle: PrometheusHandle) -> Router {
+pub fn build_routes(
+    state: Arc<AppState>,
+    metrics_handle: PrometheusHandle,
+) -> Result<Router, common::jwt::JwtError> {
     // Create JWKS client and JWT validator
-    let jwks_client = Arc::new(JwksClient::new(state.config.ac_jwks_url.clone()));
+    let jwks_client = Arc::new(JwksClient::new(state.config.ac_jwks_url.clone())?);
     let jwt_validator = Arc::new(JwtValidator::new(
         jwks_client,
         state.config.jwt_clock_skew_seconds,
@@ -107,7 +110,7 @@ pub fn build_routes(state: Arc<AppState>, metrics_handle: PrometheusHandle) -> R
     // 1. TimeoutLayer - Timeout the request (innermost)
     // 2. TraceLayer - Log request details
     // 3. http_metrics_middleware - Record ALL responses (outermost)
-    public_routes
+    Ok(public_routes
         .merge(metrics_routes)
         .merge(user_auth_routes)
         .merge(protected_routes)
@@ -115,7 +118,7 @@ pub fn build_routes(state: Arc<AppState>, metrics_handle: PrometheusHandle) -> R
         .layer(TimeoutLayer::new(Duration::from_secs(30)))
         // HTTP metrics layer (outermost) - captures ALL responses including
         // framework-level errors like 415, 400, 404, 405
-        .layer(middleware::from_fn(http_metrics_middleware))
+        .layer(middleware::from_fn(http_metrics_middleware)))
 }
 
 #[cfg(test)]
