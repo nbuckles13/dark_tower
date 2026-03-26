@@ -149,14 +149,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // Create JWT validator for gRPC auth
-    let jwks_client = Arc::new(JwksClient::new(state.config.ac_jwks_url.clone()));
+    let jwks_client = Arc::new(
+        JwksClient::new(state.config.ac_jwks_url.clone()).map_err(|e| {
+            error!("Failed to create JWKS client: {}", e);
+            e
+        })?,
+    );
     let jwt_validator = Arc::new(JwtValidator::new(
         jwks_client,
         state.config.jwt_clock_skew_seconds,
     ));
 
     // Build HTTP application routes with metrics endpoint (ADR-0011)
-    let http_app = routes::build_routes(state.clone(), metrics_handle);
+    let http_app = routes::build_routes(state.clone(), metrics_handle).map_err(|e| {
+        error!("Failed to build routes: {}", e);
+        e
+    })?;
 
     // Create gRPC services with auth layer
     let mc_service = McService::new(state.clone());

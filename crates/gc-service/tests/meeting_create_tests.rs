@@ -218,7 +218,8 @@ impl TestCreateMeetingServer {
         });
 
         let metrics_handle = get_test_metrics_handle();
-        let app = routes::build_routes(state, metrics_handle);
+        let app = routes::build_routes(state, metrics_handle)
+            .map_err(|e| anyhow::anyhow!("Failed to build routes: {}", e))?;
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let addr = listener.local_addr()?;

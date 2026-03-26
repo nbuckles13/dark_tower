@@ -30,6 +30,7 @@ bytes = { workspace = true }
 rand = "0.8"
 secrecy = { workspace = true }
 base64 = { workspace = true }
+jsonwebtoken = { workspace = true }
 
 # HTTP client for token management
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
@@ -38,3 +39,5 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 criterion = { workspace = true }
 serde_json = { workspace = true }
 wiremock = "0.6"
+ring = { workspace = true }
+jsonwebtoken = { workspace = true }

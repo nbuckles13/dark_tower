@@ -6,7 +6,11 @@
 
 ## Shared Code (Duplication Prevention)
 - Common crate modules -> `crates/common/src/lib.rs`
-- JWT utilities (extracted TD-1/TD-2) -> `crates/common/src/jwt.rs:extract_kid()`
+- JWT utilities (extract_kid, validate_iat) -> `crates/common/src/jwt.rs`
+- JwtError enum (auth + infrastructure variants) -> `crates/common/src/jwt.rs:JwtError`
+- JWKS client (extracted from GC, R-23) -> `crates/common/src/jwt.rs:JwksClient`
+- JWT validator (generic, extracted from GC, R-23) -> `crates/common/src/jwt.rs:JwtValidator`
+- verify_token<T> (extracted from GC, R-23) -> `crates/common/src/jwt.rs:verify_token()`
 - ServiceClaims (extracted from AC) -> `crates/common/src/jwt.rs:ServiceClaims`
 - UserClaims (extracted from AC, ADR-0020) -> `crates/common/src/jwt.rs:UserClaims`
 - MeetingTokenClaims (ADR-0020) -> `crates/common/src/jwt.rs:MeetingTokenClaims`
@@ -23,8 +27,10 @@
 ## Successful Extractions (Reference)
 - ServiceClaims to common::jwt (AC re-exports as `Claims`) -> `crates/ac-service/src/crypto/mod.rs:23`
 - UserClaims to common::jwt (AC re-exports) -> `crates/ac-service/src/crypto/mod.rs:29`
-- GC uses UserClaims from common::jwt (not reimplemented) -> `crates/gc-service/src/handlers/meetings.rs`, `crates/gc-service/src/auth/jwt.rs`
-- Generic verify_token<T> (service + user tokens, single JWK path) -> `crates/gc-service/src/auth/jwt.rs:verify_token()`
+- JWKS client to common::jwt (R-23, GC re-exports) -> `crates/gc-service/src/auth/jwks.rs`
+- JwtValidator + verify_token<T> to common::jwt (R-23) -> `crates/common/src/jwt.rs:JwtValidator`
+- GC jwt.rs thin wrapper (delegates to common) -> `crates/gc-service/src/auth/jwt.rs`
+- From<JwtError> for GcError (error mapping) -> `crates/gc-service/src/errors.rs`
 - Shared bearer token extraction (both auth middlewares) -> `crates/gc-service/src/middleware/auth.rs:extract_bearer_token()`
 - Shared map_row_to_meeting (handler + repo, single definition) -> `crates/gc-service/src/repositories/meetings.rs:map_row_to_meeting()`
 - Parameterized audit logging (action + optional user_id) -> `crates/gc-service/src/repositories/meetings.rs:log_audit_event()`
@@ -42,7 +48,7 @@
 - GC repositories (shared row mappers) -> `crates/gc-service/src/repositories/`
 - GC ParticipantsRepository -> `crates/gc-service/src/repositories/participants.rs`
 - GC dual auth middleware (service + user) -> `crates/gc-service/src/middleware/auth.rs`
-- GC JWKS/JWT (potential extraction to common) -> `crates/gc-service/src/auth/jwks.rs`, `crates/gc-service/src/auth/jwt.rs`
+- GC JWT thin wrapper (error mapping only) -> `crates/gc-service/src/auth/jwt.rs`
 - NetworkPolicy + ServiceMonitor cross-refs -> `infra/services/{ac,gc,mc}-service/`
 - Metric names in runbooks must match code -> `crates/gc-service/src/observability/metrics.rs`, `docs/runbooks/gc-incident-response.md`
 - Dev cert generation (shared helper, single CA) -> `scripts/generate-dev-certs.sh:generate_service_cert()`

@@ -20,8 +20,15 @@
 - Shared claims types (PII-redacted Debug) → `crates/common/src/jwt.rs:ServiceClaims`, `UserClaims`, `MeetingTokenClaims`, `GuestTokenClaims::validate()`
 - Meeting token enums → `crates/common/src/jwt.rs:ParticipantType`, `MeetingRole`
 - Token manager (secure constructor) → `crates/common/src/token_manager.rs:new_secure()`
-- GC JWT validation → `crates/gc-service/src/auth/jwt.rs:validate()`, `validate_user()`, `verify_token()`
-- GC JWKS fetching → `crates/gc-service/src/auth/jwks.rs`
+- Common JWKS client → `crates/common/src/jwt.rs:JwksClient`
+- Common JWT validator (generic, EdDSA) → `crates/common/src/jwt.rs:JwtValidator::validate()`
+- Common JWT verify token → `crates/common/src/jwt.rs:verify_token()`
+- Common HasIat trait (compile-time iat enforcement) → `crates/common/src/jwt.rs:HasIat`
+- Common kid extraction (8KB size check first) → `crates/common/src/jwt.rs:extract_kid()`
+- Common iat validation (clock skew bounded) → `crates/common/src/jwt.rs:validate_iat()`
+- GC JWT validation (thin wrapper) → `crates/gc-service/src/auth/jwt.rs:validate()`, `validate_user()`
+- GC JWKS re-export → `crates/gc-service/src/auth/jwks.rs`
+- GC `From<JwtError>` error mapping → `crates/gc-service/src/errors.rs`
 - GC auth middleware → `crates/gc-service/src/middleware/auth.rs:require_auth()`, `require_user_auth()`
 - GC CSPRNG generators → `crates/gc-service/src/handlers/meetings.rs:generate_meeting_code()`, `generate_join_token_secret()`
 - GC role enforcement constants → `crates/gc-service/src/handlers/meetings.rs:MEETING_CREATE_ROLES`
@@ -39,7 +46,7 @@
 - MC WebTransport UDP ingress + Kind mapping → `infra/services/mc-service/network-policy.yaml`, `infra/kind/kind-config.yaml`
 
 ## Integration Seams
-- AC JWKS → GC → `crates/gc-service/src/auth/jwks.rs`; GC→MC gRPC → `crates/mc-service/src/grpc/auth_interceptor.rs`
+- AC JWKS → common `JwksClient` → `crates/common/src/jwt.rs:JwksClient`; GC→MC gRPC → `crates/mc-service/src/grpc/auth_interceptor.rs`
 - GC user-auth routes → `crates/gc-service/src/routes/mod.rs:build_routes()`
 - Credential leak guards → `scripts/guards/simple/no-secrets-in-logs.sh`
 

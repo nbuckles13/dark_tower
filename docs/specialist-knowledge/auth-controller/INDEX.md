@@ -24,6 +24,13 @@
 - Key init at startup -> `crates/ac-service/src/services/key_management_service.rs:initialize_signing_key()`
 - JWKS generation -> `crates/ac-service/src/services/key_management_service.rs:get_jwks()`
 - Route definitions -> `crates/ac-service/src/routes/mod.rs:build_routes()`
+- JWKS client (common) -> `crates/common/src/jwt.rs:JwksClient`
+- JWT validator (common, generic) -> `crates/common/src/jwt.rs:JwtValidator::validate()`
+- HasIat trait (iat access for generic validation) -> `crates/common/src/jwt.rs:HasIat`
+- JWT error types (common) -> `crates/common/src/jwt.rs:JwtError`
+- JWT verify token (EdDSA signature check) -> `crates/common/src/jwt.rs:verify_token()`
+- Service claims (common) -> `crates/common/src/jwt.rs:ServiceClaims`
+- User claims (common) -> `crates/common/src/jwt.rs:UserClaims`
 - Meeting token claims (common) -> `crates/common/src/jwt.rs:MeetingTokenClaims`
 - Guest token claims (common) -> `crates/common/src/jwt.rs:GuestTokenClaims`
 - Participant type enum (common) -> `crates/common/src/jwt.rs:ParticipantType`
@@ -42,9 +49,3 @@
 - DB: credentials repo -> `crates/ac-service/src/repositories/service_credentials.rs`
 - DB: signing keys repo -> `crates/ac-service/src/repositories/signing_keys.rs`
 
-## Cross-Cutting Gotchas
-- Dummy hash cost must match production cost or timing attack protection breaks -> `services/token_service.rs`
-- `rotate_signing_key_tx` does NOT set gauges; caller must -> `services/key_management_service.rs`
-- `init_key_metrics()` required at startup or gauges read zero until next rotation -> `main.rs`
-- Metrics middleware must be outermost layer to capture framework-level errors -> `middleware/http_metrics.rs`
-- Service token `sub` is a string not UUID; handler-level `parse_user_id()` rejects it -> `crypto/mod.rs`
