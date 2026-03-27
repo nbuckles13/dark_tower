@@ -37,16 +37,40 @@ SEARCH_PATH="${1:-.}"
 init_violations
 start_timer
 
+DIFF_BASE=$(get_diff_base)
+
 print_header "Guard: API Version Check
-Path: $SEARCH_PATH"
+Path: $SEARCH_PATH
+Diff base: $DIFF_BASE (only changed files are checked)"
+
+# Get changed Rust files only
+CHANGED_FILES=$(get_all_changed_files "$SEARCH_PATH" ".rs")
+
+if [[ -z "$CHANGED_FILES" ]]; then
+    echo -e "${GREEN}No Rust files changed compared to ${DIFF_BASE}${NC}"
+    print_elapsed_time
+    exit 0
+fi
+
+# Build grep file list from changed files (only existing files)
+FILE_LIST=""
+for f in $CHANGED_FILES; do
+    [[ -f "$f" ]] && [[ "$f" != vendor/* ]] && FILE_LIST="$FILE_LIST $f"
+done
+
+if [[ -z "$FILE_LIST" ]]; then
+    echo -e "${GREEN}No existing Rust files to check${NC}"
+    print_elapsed_time
+    exit 0
+fi
 
 # -----------------------------------------------------------------------------
 # Check 1: API routes must use /api/v{N}/ prefix
 # -----------------------------------------------------------------------------
 print_section "Check 1: API routes without /api/v{N}/ prefix"
 
-# Find .route( calls
-route_definitions=$(grep -rn --include="*.rs" '\.route\s*(' "$SEARCH_PATH" 2>/dev/null | \
+# Find .route( calls in changed files only
+route_definitions=$(grep -n '\.route\s*(' $FILE_LIST 2>/dev/null | \
     grep -E '\.route\s*\(\s*"/' | \
     filter_test_code || true)
 
@@ -109,7 +133,7 @@ print_section "Check 2: Versioned operational endpoints"
 # Look for versioned health/ready/metrics endpoints (wrong pattern)
 # Matches: /v1/health, /api/v1/health, /v2/ready, etc.
 # Does NOT match: /health, /ready, /metrics (correct unversioned)
-versioned_ops=$(grep -rn --include="*.rs" '\.route\s*(' "$SEARCH_PATH" 2>/dev/null | \
+versioned_ops=$(grep -n '\.route\s*(' $FILE_LIST 2>/dev/null | \
     grep -E '\.route\s*\(\s*"/(api/)?v[0-9]+/(health|ready|metrics)' | \
     filter_test_code || true)
 
@@ -134,7 +158,7 @@ fi
 print_section "Check 3: Dynamic format routes"
 
 # Look for format! or format_args! used in route paths
-format_routes=$(grep -rn --include="*.rs" -E '\.route\s*\(\s*&?format!' "$SEARCH_PATH" 2>/dev/null | \
+format_routes=$(grep -n -E '\.route\s*\(\s*&?format!' $FILE_LIST 2>/dev/null | \
     filter_test_code || true)
 
 if [[ -n "$format_routes" ]]; then

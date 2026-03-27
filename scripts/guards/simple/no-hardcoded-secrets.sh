@@ -30,8 +30,32 @@ check_nightly_required
 init_violations
 start_timer
 
+DIFF_BASE=$(get_diff_base)
+
 print_header "Guard: No Hardcoded Secrets
-Path: $SEARCH_PATH"
+Path: $SEARCH_PATH
+Diff base: $DIFF_BASE (only changed files are checked)"
+
+# Get changed Rust files only
+CHANGED_FILES=$(get_all_changed_files "$SEARCH_PATH" ".rs")
+
+if [[ -z "$CHANGED_FILES" ]]; then
+    echo -e "${GREEN}No Rust files changed compared to ${DIFF_BASE}${NC}"
+    print_elapsed_time
+    exit 0
+fi
+
+# Build file list (only existing files)
+FILE_LIST=""
+for f in $CHANGED_FILES; do
+    [[ -f "$f" ]] && [[ "$f" != vendor/* ]] && FILE_LIST="$FILE_LIST $f"
+done
+
+if [[ -z "$FILE_LIST" ]]; then
+    echo -e "${GREEN}No existing Rust files to check${NC}"
+    print_elapsed_time
+    exit 0
+fi
 
 # -----------------------------------------------------------------------------
 # Check 1: Secret variable assignments with string literals
@@ -40,9 +64,9 @@ print_section "Check 1: Secret variable assignments with literals"
 
 # Pattern: password = "...", secret = "...", api_key = "...", etc.
 # Excludes env var lookups, test code
-secret_assignment_violations=$(grep -rn --include="*.rs" -Ei \
+secret_assignment_violations=$(grep -n -Ei \
     '(password|secret|token|api_key|credential|master_key|private_key|client_secret)\s*[=:]\s*"[^"]+' \
-    "$SEARCH_PATH" 2>/dev/null | \
+    $FILE_LIST 2>/dev/null | \
     grep -Ev 'std::env|env::var|dotenvy' | \
     filter_test_code || true)
 
@@ -68,9 +92,9 @@ print_section "Check 2: API key patterns"
 # - AKIA (AWS Access Key ID)
 # - ghp_/gho_ (GitHub tokens)
 # - xox (Slack tokens)
-api_key_violations=$(grep -rn --include="*.rs" -E \
+api_key_violations=$(grep -n -E \
     '"(sk-[a-zA-Z0-9]{20,}|pk-[a-zA-Z0-9]{20,}|AKIA[A-Z0-9]{16}|ghp_[a-zA-Z0-9]{36}|gho_[a-zA-Z0-9]{36}|xox[baprs]-[a-zA-Z0-9-]+)"' \
-    "$SEARCH_PATH" 2>/dev/null | \
+    $FILE_LIST 2>/dev/null | \
     filter_test_code || true)
 
 if [[ -n "$api_key_violations" ]]; then
@@ -92,9 +116,9 @@ print_section "Check 3: Connection strings with credentials"
 
 # Patterns: postgresql://user:password@host, redis://:password@host
 # Note: The password part must have actual content (not just a variable)
-connection_violations=$(grep -rn --include="*.rs" -E \
+connection_violations=$(grep -n -E \
     '"(postgresql|mysql|redis|mongodb|amqp)://[^:]+:[^@{$]+@' \
-    "$SEARCH_PATH" 2>/dev/null | \
+    $FILE_LIST 2>/dev/null | \
     filter_test_code || true)
 
 if [[ -n "$connection_violations" ]]; then
@@ -116,9 +140,9 @@ print_section "Check 4: Authorization headers with tokens"
 
 # Pattern: "Authorization: Bearer ..." or "X-API-Key: ..."
 # Only flag if the token looks like a real value (not a variable reference)
-auth_header_violations=$(grep -rn --include="*.rs" -Ei \
+auth_header_violations=$(grep -n -Ei \
     '"(Authorization:\s*(Bearer|Basic)\s+[A-Za-z0-9+/=_.~-]{20,})"' \
-    "$SEARCH_PATH" 2>/dev/null | \
+    $FILE_LIST 2>/dev/null | \
     filter_test_code || true)
 
 if [[ -n "$auth_header_violations" ]]; then
@@ -140,9 +164,9 @@ print_section "Check 5: Long Base64 strings (potential secrets)"
 
 # Long base64 strings (40+ chars) that might be secrets
 # This is a heuristic - mark as "review manually"
-base64_findings=$(grep -rn --include="*.rs" -E \
+base64_findings=$(grep -n -E \
     '"[A-Za-z0-9+/]{40,}={0,2}"' \
-    "$SEARCH_PATH" 2>/dev/null | \
+    $FILE_LIST 2>/dev/null | \
     filter_test_code || true)
 
 if [[ -n "$base64_findings" ]]; then

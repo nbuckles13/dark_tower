@@ -58,7 +58,7 @@ get_untracked_files() {
     local ext="${2:-}"
 
     local files
-    files=$(git ls-files --others --exclude-standard -- "$path" 2>/dev/null || true)
+    files=$(git ls-files --others --exclude-standard -- "$path" 2>/dev/null | grep -v '^vendor/' || true)
 
     if [[ -n "$ext" ]]; then
         echo "$files" | grep "${ext}$" || true
