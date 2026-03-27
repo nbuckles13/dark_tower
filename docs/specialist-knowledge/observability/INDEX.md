@@ -46,6 +46,8 @@
 ## Dashboards & Alerts
 - Grafana dashboards -> `infra/grafana/dashboards/` (overview, SLOs, logs per service)
 - GC overview dashboard (meeting creation + join panels) -> `infra/grafana/dashboards/gc-overview.json`
+- GC join success rate gauge panel (id:38) -> `infra/grafana/dashboards/gc-overview.json`
+- GC join alert rules (GCHighJoinFailureRate, GCHighJoinLatency) -> `infra/docker/prometheus/rules/gc-alerts.yaml`
 - MC overview dashboard (join flow panels) -> `infra/grafana/dashboards/mc-overview.json`
 - Cross-service error dashboard -> `infra/grafana/dashboards/errors-overview.json`
 - Grafana provisioning -> `infra/grafana/provisioning/datasources/datasources.yaml`
@@ -63,6 +65,7 @@
 - Per-service deployment + incident response -> `docs/runbooks/` (two per service)
 - GC meeting creation limit exhaustion -> `docs/runbooks/gc-incident-response.md#scenario-8-meeting-creation-limit-exhaustion`
 - GC meeting code collision -> `docs/runbooks/gc-incident-response.md#scenario-9-meeting-code-collision`
+- GC meeting join failure triage (mc_assignment, ac_request, not_found) -> `docs/observability/alerts.md` (GCHighJoinFailureRate section)
 - GC post-deploy meeting creation checklist -> `docs/runbooks/gc-deployment.md` (Post-Deploy Monitoring Checklist section)
 
 ## Integration Seams

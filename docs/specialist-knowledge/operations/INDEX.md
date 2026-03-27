@@ -17,7 +17,7 @@
 - Kind cluster config (TCP/UDP port mappings) → `infra/kind/kind-config.yaml`
 - Kind setup/iterate/teardown → `infra/kind/scripts/`
 - Per-service manifests (deployment, netpol, PDB) → `infra/services/{ac,gc,mc}-service/`
-- Alert rules → `infra/docker/prometheus/rules/{gc,mc}-alerts.yaml`
+- Alert rules (incl. GC join: GCHighJoinFailureRate, GCHighJoinLatency) → `infra/docker/prometheus/rules/{gc,mc}-alerts.yaml`
 - Dev certs (CA + service TLS), master key, service registration → `scripts/generate-dev-certs.sh`, `generate-master-key.sh`, `register-service.sh`
 - MC TLS secret + volume mount → `infra/services/mc-service/tls-secret.yaml`, `deployment.yaml` (volume `mc-tls` at `/etc/mc-tls`)
 - MC WebTransport UDP NodePort + Kind mapping → `infra/services/mc-service/service.yaml` (30433), `infra/kind/kind-config.yaml` (hostPort 4433)
@@ -46,9 +46,9 @@
 - Service auth design → ADR-0003
 
 ## Code Locations — Observability
-- GC metrics, catalog, dashboard → `crates/gc-service/src/observability/metrics.rs`, `docs/observability/metrics/gc-service.md`, `infra/grafana/dashboards/gc-overview.json`
-- MC metrics recorder + bucket config → `crates/mc-service/src/observability/metrics.rs:init_metrics_recorder()`
-- MC metrics catalog → `docs/observability/metrics/mc-service.md`
+- GC metrics + catalog + dashboard → `crates/gc-service/src/observability/metrics.rs`, `docs/observability/metrics/gc-service.md`, `infra/grafana/dashboards/gc-overview.json`
+- GC meeting join panels + alerts → dashboard panels 35-38, `docs/observability/dashboards.md`, `docs/observability/alerts.md`
+- MC metrics recorder + catalog → `crates/mc-service/src/observability/metrics.rs`, `docs/observability/metrics/mc-service.md`
 - MC join flow metrics (WT connections, JWT, session join) → `crates/mc-service/src/observability/metrics.rs:record_webtransport_connection()`, `record_jwt_validation()`, `record_session_join()`
 - MC overview dashboard (incl. Join Flow row) → `infra/grafana/dashboards/mc-overview.json`
 - MC health probes (Phase 6h, commented out) → `infra/services/mc-service/deployment.yaml:120`

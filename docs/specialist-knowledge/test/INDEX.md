@@ -28,6 +28,10 @@
 - Guest token handler (public) -> `crates/gc-service/src/handlers/meetings.rs:get_guest_token()`
 - Settings handler (user-auth, host-only) -> `crates/gc-service/src/handlers/meetings.rs:update_meeting_settings()`
 - Join metrics -> `crates/gc-service/src/observability/metrics.rs:record_meeting_join()`
+- GC metrics tests -> `crates/gc-service/src/observability/metrics.rs:tests`
+- GC overview dashboard (join panels: ids 35-38) -> `infra/grafana/dashboards/gc-overview.json`
+- GC alert rules (join: GCHighJoinFailureRate, GCHighJoinLatency) -> `infra/docker/prometheus/rules/gc-alerts.yaml`
+- GC metrics catalog -> `docs/observability/metrics/gc-service.md`
 - Route definitions (public, user-auth, service-auth) -> `crates/gc-service/src/routes/mod.rs`
 - Activation repo -> `crates/gc-service/src/repositories/meetings.rs:activate_meeting()`
 - Audit event logging -> `crates/gc-service/src/repositories/meetings.rs:log_audit_event()`
@@ -63,11 +67,7 @@
 - Meeting creation env-tests -> `crates/env-tests/tests/23_meeting_creation.rs`
 
 ## Code Locations: Common Crate
-- JWT claims (UserClaims, MeetingTokenClaims, GuestTokenClaims) -> `crates/common/src/jwt.rs`
-- JwtError enum (7 variants, uniform Display) -> `crates/common/src/jwt.rs:JwtError`
-- JWKS client (wiremock tests: cache, expiry, network errors) -> `crates/common/src/jwt.rs:JwksClient`
-- JwtValidator + verify_token + HasIat + extract_kid + validate_iat -> `crates/common/src/jwt.rs`
-- Round-trip tests (real Ed25519 sign+verify) -> `crates/common/src/jwt.rs:tests::test_verify_token_roundtrip_*`
+- JWT (claims, JwtError, JwksClient, JwtValidator, round-trip tests) -> `crates/common/src/jwt.rs`
 - GC JwtError->GcError mapping tests (all 7 variants) -> `crates/gc-service/src/auth/jwt.rs:tests`
 - MC JwtError->McError mapping tests (all 7 variants) -> `crates/mc-service/src/errors.rs:tests::test_jwt_error_to_mc_error_*`
 

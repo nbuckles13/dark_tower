@@ -443,6 +443,58 @@ histogram_quantile(0.95,
 
 ---
 
+#### GCHighJoinFailureRate
+
+**Severity**: Warning
+**Condition**: Meeting join failure rate >5% for >5 minutes
+**Impact**: Some users unable to join meetings
+**Runbook**: [Scenario 3: MC Assignment Failures](../runbooks/gc-incident-response.md#scenario-3-mc-assignment-failures)
+
+**PromQL**:
+```promql
+(
+  sum(rate(gc_meeting_join_total{status="error"}[5m]))
+  /
+  sum(rate(gc_meeting_join_total[5m]))
+) > 0.05
+and
+sum(rate(gc_meeting_join_total[5m])) > 0
+```
+`for: 5m`
+
+**Response**:
+1. Check "Meeting Join Failures by Type" dashboard panel for error breakdown
+2. If `mc_assignment` errors dominate → [Scenario 3: MC Assignment Failures](../runbooks/gc-incident-response.md#scenario-3-mc-assignment-failures)
+3. If `ac_request` errors present → check AC service health and token refresh
+4. If `not_found` errors dominate → check meeting lookup and database health
+5. Check "Meeting Join Success Rate (%)" gauge for current success rate
+
+---
+
+#### GCHighJoinLatency
+
+**Severity**: Info
+**Condition**: Meeting join p95 latency >2s for >5 minutes
+**Impact**: Slow meeting join experience
+**Runbook**: [Scenario 2: High Latency](../runbooks/gc-incident-response.md#scenario-2-high-latency--slow-responses)
+
+**PromQL**:
+```promql
+histogram_quantile(0.95,
+  sum by(le) (rate(gc_meeting_join_duration_seconds_bucket[5m]))
+) > 2.0
+```
+`for: 5m`
+
+**Response**:
+1. Check "Meeting Join Latency (P50/P95/P99)" dashboard panel for latency trend
+2. Check MC assignment latency (may be slow MC selection)
+3. Check AC token request latency (may be slow token issuance)
+4. Check database query latency for meeting lookups
+5. Check resource utilization (CPU, memory)
+
+---
+
 ## Authentication Controller Alerts
 
 **Status**: 🚧 To be created

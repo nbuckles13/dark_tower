@@ -26,7 +26,7 @@
 - ParticipantActor (renamed from ConnectionActor) -> `crates/mc-service/src/actors/participant.rs`
   - Calls handler::encode_participant_update() (single impl, not copied) -> line 405
 
-## Per-Service Observability (Metrics)
+## Per-Service Observability (Metrics & Dashboards)
 - AC metrics -> `crates/ac-service/src/observability/metrics.rs`
 - GC metrics -> `crates/gc-service/src/observability/metrics.rs`
   - GC join metrics -> `record_meeting_join()`
@@ -34,6 +34,8 @@
 - MC metrics -> `crates/mc-service/src/observability/metrics.rs`
   - MC join flow metrics -> `record_webtransport_connection()`, `record_jwt_validation()`, `record_session_join()`
   - MC re-exports -> `crates/mc-service/src/observability/mod.rs`
+- MC dashboard "Join Flow" row (panels 28-33) -> `infra/grafana/dashboards/mc-overview.json`
+  - Parallel to GC "Meeting Join" row (panels 34-38) in `gc-overview.json` — different service perspective, not duplication
 
 ## Other Shared Code
 - Common crate modules -> `crates/common/src/lib.rs`

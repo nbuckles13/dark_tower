@@ -207,6 +207,8 @@ All GC service metrics follow ADR-0011 naming conventions with the `gc_` prefix.
   - `status`: Join outcome (success, error)
 - **Cardinality**: Low (2 statuses)
 - **Usage**: Track meeting join rate and success
+- **Dashboard**: "Meeting Join Rate by Status" and "Meeting Join Success Rate (%)" panels in `gc-overview.json`
+- **Alerts**: `GCHighJoinFailureRate` (warning, >5% failure rate for 5m)
 - **Example**:
   ```promql
   rate(gc_meeting_join_total{status="error"}[5m])
@@ -220,6 +222,8 @@ All GC service metrics follow ADR-0011 naming conventions with the `gc_` prefix.
 - **Buckets**: [0.010, 0.025, 0.050, 0.100, 0.200, 0.500, 1.000, 2.000, 5.000]
 - **Cardinality**: Low (2 statuses)
 - **Usage**: Monitor meeting join latency, identify slow MC assignment or AC token paths
+- **Dashboard**: "Meeting Join Latency (P50/P95/P99)" panel in `gc-overview.json`
+- **Alerts**: `GCHighJoinLatency` (info, p95 >2s for 5m)
 - **Example**:
   ```promql
   histogram_quantile(0.95,
@@ -235,6 +239,7 @@ All GC service metrics follow ADR-0011 naming conventions with the `gc_` prefix.
 - **Cardinality**: Low (7 error types)
 - **Alert**: High rate may indicate MC capacity issues or AC connectivity problems
 - **Usage**: Diagnose meeting join failures
+- **Dashboard**: "Meeting Join Failures by Type" panel in `gc-overview.json`
 - **Example**:
   ```promql
   sum(rate(gc_meeting_join_failures_total[5m])) by (error_type)
@@ -488,4 +493,5 @@ All GC service metrics follow strict cardinality bounds per ADR-0011:
 - **ADR-0011**: Observability standards and metric naming conventions
 - **ADR-0010**: GC-MC integration and SLO requirements
 - **Implementation**: `crates/gc-service/src/observability/metrics.rs`
-- **Dashboard**: `infra/grafana/dashboards/gc-service.json` (TODO)
+- **Dashboard**: `infra/grafana/dashboards/gc-overview.json`
+- **Alerts**: `infra/docker/prometheus/rules/gc-alerts.yaml`

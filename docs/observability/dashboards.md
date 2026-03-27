@@ -49,8 +49,12 @@ All dashboard JSON files are stored in `infra/grafana/dashboards/` and auto-load
 23. **Meeting Creation Rate by Status** - Meeting creation attempts by success/error status
 24. **Meeting Creation Latency (P50/P95/P99)** - Meeting creation latency percentiles (p50, p95, p99)
 25. **Meeting Creation Failures by Type** - Meeting creation failures by error type (bad_request, forbidden, db_error, etc.)
-26. **Registered Controllers by Type & Status** - Fleet health by controller type and status
-27. **Errors by Operation & Type** - Error rate by operation and error type
+26. **Meeting Join Rate by Status** - Meeting join attempts by success/error status
+27. **Meeting Join Latency (P50/P95/P99)** - Meeting join latency percentiles (p50, p95, p99)
+28. **Meeting Join Failures by Type** - Meeting join failures by error type (not_found, mc_assignment, ac_request, etc.)
+29. **Meeting Join Success Rate (%)** - Gauge showing join success rate (green >99%, yellow 95-99%, red <95%)
+30. **Registered Controllers by Type & Status** - Fleet health by controller type and status
+31. **Errors by Operation & Type** - Error rate by operation and error type
 
 **Metrics Used**:
 - `gc_http_requests_total`
@@ -74,6 +78,9 @@ All dashboard JSON files are stored in `infra/grafana/dashboards/` and auto-load
 - `gc_meeting_creation_total`
 - `gc_meeting_creation_duration_seconds`
 - `gc_meeting_creation_failures_total`
+- `gc_meeting_join_total`
+- `gc_meeting_join_duration_seconds`
+- `gc_meeting_join_failures_total`
 - `gc_registered_controllers`
 - `gc_errors_total`
 
