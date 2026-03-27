@@ -74,3 +74,11 @@ TBD
 ## Tech Debt
 
 TBD
+
+---
+
+## Human Review (Iteration 2)
+
+**Feedback**: "Revert ac_jwks_url to required config (remove AC_ENDPOINT default derivation). AC_JWKS_URL should be a required env var that fails fast at startup if missing, not silently derived from AC_ENDPOINT. Task 6 will add it to deployment manifests."
+
+**Mode**: light (security + operations)

@@ -105,7 +105,7 @@ pub struct Config {
     pub client_secret: SecretString,
 
     /// URL to Auth Controller's JWKS endpoint for meeting token validation.
-    /// Defaults to `{AC_ENDPOINT}/.well-known/jwks.json` if `AC_JWKS_URL` is not set.
+    /// Required environment variable: `AC_JWKS_URL`.
     pub ac_jwks_url: String,
 }
 
@@ -187,12 +187,10 @@ impl Config {
                 .clone(),
         );
 
-        // AC_JWKS_URL defaults to AC_ENDPOINT + /.well-known/jwks.json if not set,
-        // avoiding crash-loops when deployment manifests haven't been updated yet.
         let ac_jwks_url = vars
             .get("AC_JWKS_URL")
-            .cloned()
-            .unwrap_or_else(|| format!("{}/.well-known/jwks.json", ac_endpoint));
+            .ok_or_else(|| ConfigError::MissingEnvVar("AC_JWKS_URL".to_string()))?
+            .clone();
 
         // Basic validation: JWKS URL must use http:// or https://
         if !ac_jwks_url.starts_with("http://") && !ac_jwks_url.starts_with("https://") {
@@ -313,6 +311,10 @@ mod tests {
             (
                 "MC_CLIENT_SECRET".to_string(),
                 "test-client-secret".to_string(),
+            ),
+            (
+                "AC_JWKS_URL".to_string(),
+                "https://ac.example.com/.well-known/jwks.json".to_string(),
             ),
         ])
     }
@@ -481,14 +483,12 @@ mod tests {
     }
 
     #[test]
-    fn test_ac_jwks_url_defaults_from_ac_endpoint() {
-        let vars = base_vars();
-        // AC_JWKS_URL is not in base_vars, so it should derive from AC_ENDPOINT
-        let config = Config::from_vars(&vars).expect("Config should load successfully");
-        assert_eq!(
-            config.ac_jwks_url,
-            "https://ac.example.com/.well-known/jwks.json"
-        );
+    fn test_from_vars_missing_ac_jwks_url() {
+        let mut vars = base_vars();
+        vars.remove("AC_JWKS_URL");
+
+        let result = Config::from_vars(&vars);
+        assert!(matches!(result, Err(ConfigError::MissingEnvVar(v)) if v == "AC_JWKS_URL"));
     }
 
     #[test]
