@@ -41,12 +41,20 @@
 
 ## Code Locations — MC Service
 - Error type reference → `crates/mc-service/src/errors.rs:McError`
+- Error type labels (bounded cardinality) → `crates/mc-service/src/errors.rs:error_type_label()`
 - `From<JwtError> for McError` → `crates/mc-service/src/errors.rs` (ServiceUnavailable→Internal, all others→JwtValidation)
 - JWT validator (thin wrapper) → `crates/mc-service/src/auth/mod.rs:McJwtValidator` (delegates to `common::jwt::JwtValidator`)
 - Token type enforcement → `crates/mc-service/src/auth/mod.rs:validate_meeting_token()`, `validate_guest_token()`
 - gRPC auth interceptor (structural) → `crates/mc-service/src/grpc/auth_interceptor.rs:McAuthInterceptor`
 - Config (ac_jwks_url) → `crates/mc-service/src/config.rs:Config`
 - Startup wiring (JwksClient + McJwtValidator) → `crates/mc-service/src/main.rs:168-189`
+- WebTransport server (accept loop) → `crates/mc-service/src/webtransport/server.rs:WebTransportServer::accept_loop()`
+- Connection handler (join flow) → `crates/mc-service/src/webtransport/connection.rs:handle_connection()`
+- Join flow metrics → `crates/mc-service/src/observability/metrics.rs:record_session_join()`
+- WebTransport connection metrics → `crates/mc-service/src/observability/metrics.rs:record_webtransport_connection()`
+- JWT validation metrics → `crates/mc-service/src/observability/metrics.rs:record_jwt_validation()`
+- MC metrics init (histogram buckets) → `crates/mc-service/src/observability/metrics.rs:init_metrics_recorder()`
+- Metrics catalog → `docs/observability/metrics/mc-service.md`
 
 ## Code Locations — Common
 - JWT error type → `crates/common/src/jwt.rs:JwtError`

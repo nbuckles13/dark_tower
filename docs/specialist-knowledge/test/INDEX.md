@@ -35,19 +35,20 @@
 
 ## Code Locations: MC Service
 - Auth module (McJwtValidator wrapper) -> `crates/mc-service/src/auth/mod.rs`
-- Meeting token validation (wiremock + Ed25519) -> `crates/mc-service/src/auth/mod.rs:tests::test_validate_meeting_token_*`
-- Guest token validation (wiremock + Ed25519) -> `crates/mc-service/src/auth/mod.rs:tests::test_validate_guest_token_*`
+- Meeting/guest token validation (wiremock + Ed25519) -> `crates/mc-service/src/auth/mod.rs:tests::test_validate_*_token_*`
 - Token confusion (bidirectional: meeting-as-guest, guest-as-meeting, wrong token_type) -> `crates/mc-service/src/auth/mod.rs:tests`
 - From<JwtError> for McError (7 variants, ServiceUnavailable->Internal) -> `crates/mc-service/src/errors.rs:tests::test_jwt_error_to_mc_error_*`
 - Config ac_jwks_url (scheme validation) -> `crates/mc-service/src/config.rs:tests::test_ac_jwks_url_*`
 - Config TLS paths (fail-fast validation) -> `crates/mc-service/src/config.rs:tests::test_from_vars_*tls*`
 - Controller actor tests -> `crates/mc-service/src/actors/controller.rs:tests`
 - Meeting actor tests (join, leave, reconnect, mute, grace period) -> `crates/mc-service/src/actors/meeting.rs:tests`
-- ParticipantActor tests (spawn, send, ping, close, cancellation) -> `crates/mc-service/src/actors/participant.rs:tests`
-- ParticipantActor stream wiring tests (spawn_with_stream) -> `crates/mc-service/src/actors/participant.rs:tests::test_spawn_with_stream_*`
+- ParticipantActor tests (spawn, send, ping, close, stream wiring) -> `crates/mc-service/src/actors/participant.rs:tests`
 - Session binding tests (HMAC, correlation ID, expiration) -> `crates/mc-service/src/actors/session.rs:tests`
 - WebTransport encoding tests (encode_participant_update) -> `crates/mc-service/src/webtransport/handler.rs:tests`
 - WebTransport connection tests (build_join_response) -> `crates/mc-service/src/webtransport/connection.rs:tests`
+- MC metrics tests (unit + DebuggingRecorder integration) -> `crates/mc-service/src/observability/metrics.rs:tests`
+- MC join flow metrics (webtransport_connection, jwt_validation, session_join) -> `crates/mc-service/src/observability/metrics.rs:record_webtransport_connection()`, `record_jwt_validation()`, `record_session_join()`
+- MC metrics catalog -> `docs/observability/metrics/mc-service.md`
 - GC integration tests -> `crates/mc-service/tests/gc_integration.rs`
 - Heartbeat tests -> `crates/mc-service/tests/heartbeat_tasks.rs`
 - Mock Redis -> `crates/mc-test-utils/src/mock_redis.rs`

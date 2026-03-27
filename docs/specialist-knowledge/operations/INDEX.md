@@ -46,18 +46,19 @@
 - Service auth design → ADR-0003
 
 ## Code Locations — Observability
-- GC metrics recorder → `crates/gc-service/src/observability/metrics.rs`
-- GC metrics catalog → `docs/observability/metrics/gc-service.md`
-- GC meeting join metrics → `crates/gc-service/src/observability/metrics.rs:record_meeting_join()`
-- GC overview dashboard → `infra/grafana/dashboards/gc-overview.json`
+- GC metrics, catalog, dashboard → `crates/gc-service/src/observability/metrics.rs`, `docs/observability/metrics/gc-service.md`, `infra/grafana/dashboards/gc-overview.json`
+- MC metrics recorder + bucket config → `crates/mc-service/src/observability/metrics.rs:init_metrics_recorder()`
+- MC metrics catalog → `docs/observability/metrics/mc-service.md`
+- MC join flow metrics (WT connections, JWT, session join) → `crates/mc-service/src/observability/metrics.rs:record_webtransport_connection()`, `record_jwt_validation()`, `record_session_join()`
+- MC overview dashboard (incl. Join Flow row) → `infra/grafana/dashboards/mc-overview.json`
 - MC health probes (Phase 6h, commented out) → `infra/services/mc-service/deployment.yaml:120`
+- Prometheus scrape config (all services) → `infra/docker/prometheus/prometheus.yml`
 
 ## Code Locations — MC WebTransport Server
 - WebTransport server (bind, accept_loop, max_connections guard) → `crates/mc-service/src/webtransport/server.rs`
 - WebTransport connection handler (join flow, bridge loop) → `crates/mc-service/src/webtransport/connection.rs`
 - Protobuf encoding utilities (encode_participant_update) → `crates/mc-service/src/webtransport/handler.rs`
-- MC startup: WebTransport bind-before-spawn → `crates/mc-service/src/main.rs:350`
-- MC startup: shutdown token chain → `crates/mc-service/src/main.rs:237` (child of controller)
+- MC startup (bind-before-spawn, shutdown token chain) → `crates/mc-service/src/main.rs`
 
 ## Code Locations — MC Actor System
 - Controller actor (root, capacity, join_connection) → `crates/mc-service/src/actors/controller.rs`

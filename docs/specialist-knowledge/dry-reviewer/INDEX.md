@@ -26,6 +26,15 @@
 - ParticipantActor (renamed from ConnectionActor) -> `crates/mc-service/src/actors/participant.rs`
   - Calls handler::encode_participant_update() (single impl, not copied) -> line 405
 
+## Per-Service Observability (Metrics)
+- AC metrics -> `crates/ac-service/src/observability/metrics.rs`
+- GC metrics -> `crates/gc-service/src/observability/metrics.rs`
+  - GC join metrics -> `record_meeting_join()`
+  - GC creation metrics -> `record_meeting_creation()`
+- MC metrics -> `crates/mc-service/src/observability/metrics.rs`
+  - MC join flow metrics -> `record_webtransport_connection()`, `record_jwt_validation()`, `record_session_join()`
+  - MC re-exports -> `crates/mc-service/src/observability/mod.rs`
+
 ## Other Shared Code
 - Common crate modules -> `crates/common/src/lib.rs`
 - Token management (prevents static token dup) -> `crates/common/src/token_manager.rs`

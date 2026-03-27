@@ -10,6 +10,7 @@ use crate::actors::messages::JoinResult;
 use crate::actors::MeetingControllerActorHandle;
 use crate::auth::McJwtValidator;
 use crate::errors::McError;
+use crate::observability::metrics;
 
 use bytes::{BufMut, BytesMut};
 use common::jwt::MeetingRole;
@@ -19,6 +20,7 @@ use proto_gen::signaling::{
     ServerMessage,
 };
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, instrument, warn};
@@ -65,6 +67,9 @@ pub async fn handle_connection(
         McError::Internal(format!("Session accept failed: {e}"))
     })?;
 
+    // Start join duration timer after session accept (excludes QUIC handshake)
+    let join_start = Instant::now();
+
     let connection_id = uuid::Uuid::new_v4().to_string();
     tracing::Span::current().record("connection_id", connection_id.as_str());
 
@@ -82,11 +87,27 @@ pub async fn handle_connection(
             error = %e,
             "Failed to accept bidirectional stream"
         );
-        McError::Internal(format!("BiStream accept failed: {e}"))
+        let err = McError::Internal(format!("BiStream accept failed: {e}"));
+        metrics::record_session_join(
+            "failure",
+            Some(err.error_type_label()),
+            join_start.elapsed(),
+        );
+        err
     })?;
 
     // Step 3: Read length-prefixed ClientMessage (max 64KB)
-    let client_msg = read_framed_message(&mut recv_stream).await?;
+    let client_msg = match read_framed_message(&mut recv_stream).await {
+        Ok(msg) => msg,
+        Err(e) => {
+            metrics::record_session_join(
+                "failure",
+                Some(e.error_type_label()),
+                join_start.elapsed(),
+            );
+            return Err(e);
+        }
+    };
 
     let client_message = ClientMessage::decode(client_msg.as_ref()).map_err(|e| {
         warn!(
@@ -95,7 +116,13 @@ pub async fn handle_connection(
             error = %e,
             "Failed to decode ClientMessage"
         );
-        McError::Internal("Invalid message format".to_string())
+        let err = McError::Internal("Invalid message format".to_string());
+        metrics::record_session_join(
+            "failure",
+            Some(err.error_type_label()),
+            join_start.elapsed(),
+        );
+        err
     })?;
 
     // Step 4: Extract JoinRequest
@@ -113,9 +140,13 @@ pub async fn handle_connection(
                 "First message must be JoinRequest",
             )
             .await;
-            return Err(McError::Internal(
-                "Expected JoinRequest as first message".to_string(),
-            ));
+            let err = McError::Internal("Expected JoinRequest as first message".to_string());
+            metrics::record_session_join(
+                "failure",
+                Some(err.error_type_label()),
+                join_start.elapsed(),
+            );
+            return Err(err);
         }
     };
 
@@ -135,7 +166,13 @@ pub async fn handle_connection(
             "Participant name too long",
         )
         .await;
-        return Err(McError::Internal("Participant name too long".to_string()));
+        let err = McError::Internal("Participant name too long".to_string());
+        metrics::record_session_join(
+            "failure",
+            Some(err.error_type_label()),
+            join_start.elapsed(),
+        );
+        return Err(err);
     }
 
     debug!(
@@ -159,15 +196,23 @@ pub async fn handle_connection(
                 error = %e,
                 "JWT validation failed"
             );
+            metrics::record_jwt_validation("failure", "meeting");
             let _ = send_error(
                 &mut send_stream,
                 signaling::ErrorCode::Unauthorized as i32,
                 "Invalid or expired token",
             )
             .await;
+            metrics::record_session_join(
+                "failure",
+                Some(e.error_type_label()),
+                join_start.elapsed(),
+            );
             return Err(e);
         }
     };
+
+    metrics::record_jwt_validation("success", "meeting");
 
     info!(
         target: "mc.webtransport.connection",
@@ -190,9 +235,13 @@ pub async fn handle_connection(
             "Invalid or expired token",
         )
         .await;
-        return Err(McError::JwtValidation(
-            "Token meeting_id mismatch".to_string(),
-        ));
+        let err = McError::JwtValidation("Token meeting_id mismatch".to_string());
+        metrics::record_session_join(
+            "failure",
+            Some(err.error_type_label()),
+            join_start.elapsed(),
+        );
+        return Err(err);
     }
 
     // Step 7: Create outbound channel BEFORE join so ParticipantActor is spawned with stream wired
@@ -223,6 +272,11 @@ pub async fn handle_connection(
                 "Failed to send join to controller"
             );
             let _ = send_error(&mut send_stream, error_code, &client_msg).await;
+            metrics::record_session_join(
+                "failure",
+                Some(e.error_type_label()),
+                join_start.elapsed(),
+            );
             return Err(e);
         }
     };
@@ -241,6 +295,11 @@ pub async fn handle_connection(
                 "Join failed"
             );
             let _ = send_error(&mut send_stream, error_code, &client_msg).await;
+            metrics::record_session_join(
+                "failure",
+                Some(e.error_type_label()),
+                join_start.elapsed(),
+            );
             return Err(e);
         }
         Err(_) => {
@@ -256,9 +315,13 @@ pub async fn handle_connection(
                 "Internal error",
             )
             .await;
-            return Err(McError::Internal(
-                "Join response channel dropped".to_string(),
-            ));
+            let err = McError::Internal("Join response channel dropped".to_string());
+            metrics::record_session_join(
+                "failure",
+                Some(err.error_type_label()),
+                join_start.elapsed(),
+            );
+            return Err(err);
         }
     };
 
@@ -283,9 +346,13 @@ pub async fn handle_connection(
             error = %e,
             "Failed to send JoinResponse"
         );
+        metrics::record_session_join("failure", Some(e.error_type_label()), join_start.elapsed());
         // ParticipantActor will detect disconnect via its handle
         return Err(e);
     }
+
+    // Join flow complete — record success metrics
+    metrics::record_session_join("success", None, join_start.elapsed());
 
     debug!(
         target: "mc.webtransport.connection",

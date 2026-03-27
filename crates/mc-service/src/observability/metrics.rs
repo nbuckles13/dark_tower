@@ -8,7 +8,7 @@
 //! # Cardinality
 //!
 //! Labels are bounded to prevent cardinality explosion (ADR-0011):
-//! - `actor_type`: 3 values max (controller, meeting, connection)
+//! - `actor_type`: 3 values max (controller, meeting, participant)
 //! - `operation`: bounded by Redis commands (~10 values)
 //! - `message_type`: bounded by protobuf types (~20 values)
 //! - `reason`: bounded fencing reasons (2-3 values)
@@ -72,6 +72,14 @@ pub fn init_metrics_recorder() -> Result<PrometheusHandle, String> {
             &[0.010, 0.050, 0.100, 0.250, 0.500, 1.000, 2.500, 5.000],
         )
         .map_err(|e| format!("Failed to set token refresh buckets: {e}"))?
+        // Session join buckets - extended to 5s (join includes actor processing)
+        .set_buckets_for_metric(
+            Matcher::Prefix("mc_session_join".to_string()),
+            &[
+                0.010, 0.025, 0.050, 0.100, 0.200, 0.500, 1.000, 2.000, 5.000,
+            ],
+        )
+        .map_err(|e| format!("Failed to set session join buckets: {e}"))?
         .install_recorder()
         .map_err(|e| format!("Failed to install Prometheus metrics recorder: {e}"))
 }
@@ -266,6 +274,77 @@ pub fn record_token_refresh(status: &str, error_type: Option<&str>, duration: Du
 }
 
 // ============================================================================
+// Join Flow Metrics (R-13)
+// ============================================================================
+
+/// Record a WebTransport connection acceptance or rejection.
+///
+/// Metric: `mc_webtransport_connections_total`
+/// Labels: `status`
+///
+/// Status values: "accepted", "rejected", "error"
+/// Cardinality: 3
+///
+/// Recorded in the WebTransport accept loop (`server.rs`).
+pub fn record_webtransport_connection(status: &str) {
+    counter!("mc_webtransport_connections_total",
+        "status" => status.to_string()
+    )
+    .increment(1);
+}
+
+/// Record a JWT validation attempt.
+///
+/// Metric: `mc_jwt_validations_total`
+/// Labels: `result`, `token_type`
+///
+/// Result values: "success", "failure"
+/// Token type values: "meeting", "guest"
+/// Cardinality: 2 x 2 = 4
+///
+/// Recorded in `connection.rs` after JWT validation.
+pub fn record_jwt_validation(result: &str, token_type: &str) {
+    counter!("mc_jwt_validations_total",
+        "result" => result.to_string(),
+        "token_type" => token_type.to_string()
+    )
+    .increment(1);
+}
+
+/// Record a session join attempt.
+///
+/// Emits three metrics per the GC `record_meeting_join()` pattern:
+/// - `mc_session_joins_total` counter (labels: `status`)
+/// - `mc_session_join_duration_seconds` histogram (labels: `status`)
+/// - `mc_session_join_failures_total` counter (labels: `error_type`, on failure only)
+///
+/// # Arguments
+///
+/// * `status` - "success" or "failure"
+/// * `error_type` - Error category for failures. Bounded by `McError::error_type_label()`
+///   enum variants (e.g., "jwt_validation", "internal", "meeting_not_found",
+///   "mc_capacity_exceeded"). `None` for success.
+/// * `duration` - Duration from session accept to JoinResponse sent (or error).
+pub fn record_session_join(status: &str, error_type: Option<&str>, duration: Duration) {
+    histogram!("mc_session_join_duration_seconds",
+        "status" => status.to_string()
+    )
+    .record(duration.as_secs_f64());
+
+    counter!("mc_session_joins_total",
+        "status" => status.to_string()
+    )
+    .increment(1);
+
+    if let Some(err_type) = error_type {
+        counter!("mc_session_join_failures_total",
+            "error_type" => err_type.to_string()
+        )
+        .increment(1);
+    }
+}
+
+// ============================================================================
 // Error Metrics
 // ============================================================================
 
@@ -421,9 +500,51 @@ mod tests {
     }
 
     #[test]
+    fn test_record_webtransport_connection() {
+        // Test all 3 bounded status values
+        record_webtransport_connection("accepted");
+        record_webtransport_connection("rejected");
+        record_webtransport_connection("error");
+    }
+
+    #[test]
+    fn test_record_jwt_validation() {
+        // Test all 4 bounded combinations (2 results x 2 token types)
+        record_jwt_validation("success", "meeting");
+        record_jwt_validation("success", "guest");
+        record_jwt_validation("failure", "meeting");
+        record_jwt_validation("failure", "guest");
+    }
+
+    #[test]
+    fn test_record_session_join() {
+        // Success path
+        record_session_join("success", None, Duration::from_millis(200));
+
+        // Failure paths with bounded error types from McError::error_type_label()
+        record_session_join("failure", Some("jwt_validation"), Duration::from_millis(5));
+        record_session_join("failure", Some("internal"), Duration::from_millis(10));
+        record_session_join(
+            "failure",
+            Some("meeting_not_found"),
+            Duration::from_millis(3),
+        );
+        record_session_join(
+            "failure",
+            Some("mc_capacity_exceeded"),
+            Duration::from_millis(1),
+        );
+        record_session_join(
+            "failure",
+            Some("meeting_capacity_exceeded"),
+            Duration::from_millis(8),
+        );
+    }
+
+    #[test]
     fn test_cardinality_bounds() {
         // Verify actor_type labels are bounded
-        let valid_actor_types = ["controller", "meeting", "connection"];
+        let valid_actor_types = ["controller", "meeting", "participant"];
         for actor_type in &valid_actor_types {
             set_actor_mailbox_depth(actor_type, 10);
             record_actor_panic(actor_type);
@@ -441,6 +562,25 @@ mod tests {
         let valid_reasons = ["stale_generation", "concurrent_write"];
         for reason in &valid_reasons {
             record_fenced_out(reason);
+        }
+
+        // Verify join flow labels are bounded
+        let valid_connection_statuses = ["accepted", "rejected", "error"];
+        for status in &valid_connection_statuses {
+            record_webtransport_connection(status);
+        }
+
+        let valid_jwt_results = ["success", "failure"];
+        let valid_token_types = ["meeting", "guest"];
+        for result in &valid_jwt_results {
+            for token_type in &valid_token_types {
+                record_jwt_validation(result, token_type);
+            }
+        }
+
+        let valid_join_statuses = ["success", "failure"];
+        for status in &valid_join_statuses {
+            record_session_join(status, None, Duration::from_millis(100));
         }
     }
 
@@ -485,6 +625,14 @@ mod tests {
 
         // Record error metrics
         record_error("token_refresh", "http", 500);
+
+        // Record join flow metrics (R-13)
+        record_webtransport_connection("accepted");
+        record_webtransport_connection("rejected");
+        record_jwt_validation("success", "meeting");
+        record_jwt_validation("failure", "meeting");
+        record_session_join("success", None, Duration::from_millis(200));
+        record_session_join("failure", Some("jwt_validation"), Duration::from_millis(5));
 
         // Take a snapshot and verify metrics were recorded
         let snapshot = snapshotter.snapshot();

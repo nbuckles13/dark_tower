@@ -19,6 +19,12 @@
 - GC DB metrics (meetings) -> `crates/gc-service/src/repositories/meetings.rs:MeetingsRepository`
 - GC DB metrics (participants) -> `crates/gc-service/src/repositories/participants.rs:ParticipantsRepository`
 - MC metrics recording -> `crates/mc-service/src/observability/metrics.rs:init_metrics_recorder()`
+- MC join flow metrics -> `crates/mc-service/src/observability/metrics.rs:record_session_join()`
+- MC WebTransport connection metrics -> `crates/mc-service/src/observability/metrics.rs:record_webtransport_connection()`
+- MC JWT validation metrics -> `crates/mc-service/src/observability/metrics.rs:record_jwt_validation()`
+- MC join metrics recording site (connection handler) -> `crates/mc-service/src/webtransport/connection.rs:handle_connection()`
+- MC connection metrics recording site (accept loop) -> `crates/mc-service/src/webtransport/server.rs:accept_loop()`
+- MC error type labels (bounded cardinality) -> `crates/mc-service/src/errors.rs:error_type_label()`
 
 ## Auth & JWT Tracing
 - Common JWKS client (target: `common.jwt.jwks`) -> `crates/common/src/jwt.rs:JwksClient`
@@ -40,6 +46,7 @@
 ## Dashboards & Alerts
 - Grafana dashboards -> `infra/grafana/dashboards/` (overview, SLOs, logs per service)
 - GC overview dashboard (meeting creation + join panels) -> `infra/grafana/dashboards/gc-overview.json`
+- MC overview dashboard (join flow panels) -> `infra/grafana/dashboards/mc-overview.json`
 - Cross-service error dashboard -> `infra/grafana/dashboards/errors-overview.json`
 - Grafana provisioning -> `infra/grafana/provisioning/datasources/datasources.yaml`
 - Prometheus config (docker-compose) -> `infra/docker/prometheus/prometheus.yml`
