@@ -117,27 +117,26 @@ spec:
           capabilities:
             drop:
             - ALL
-        # TODO: Re-enable probes when MC health endpoints are implemented (Phase 6h)
-        # livenessProbe:
-        #   httpGet:
-        #     path: /health/live
-        #     port: 8081
-        #     scheme: HTTP
-        #   initialDelaySeconds: 10
-        #   periodSeconds: 10
-        #   timeoutSeconds: 5
-        #   successThreshold: 1
-        #   failureThreshold: 3
-        # readinessProbe:
-        #   httpGet:
-        #     path: /health/ready
-        #     port: 8081
-        #     scheme: HTTP
-        #   initialDelaySeconds: 5
-        #   periodSeconds: 5
-        #   timeoutSeconds: 3
-        #   successThreshold: 1
-        #   failureThreshold: 3
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8081
+            scheme: HTTP
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 5
+          successThreshold: 1
+          failureThreshold: 3  # Restart after 30s of failures
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8081
+            scheme: HTTP
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 3
+          successThreshold: 1
+          failureThreshold: 3  # Remove from LB after 15s of failures
         volumeMounts:
         - name: tmp
           mountPath: /tmp
