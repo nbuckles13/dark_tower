@@ -126,7 +126,7 @@ GC and MC both import from common. Service-specific validation (meeting_id match
 **Changes**:
 1. TLS cert generation script addition to `scripts/generate-dev-certs.sh` + `mc-service-tls` Secret in `infra/services/mc-service/`
 2. Kind config: UDP port mapping for port 4433 (QUIC/WebTransport)
-3. MC deployment: Enable commented-out liveness/readiness probes, add volume mount for TLS Secret
+3. MC deployment: Enable commented-out liveness/readiness probes, add volume mount for TLS Secret, add `AC_JWKS_URL` env var to configmap (for MC JWT validation, task 9)
 
 ### security (cross-cutting — no separate tasks)
 
@@ -240,7 +240,7 @@ Task 1 also starts immediately; task 7 waits for task 1
 | 3 | Implement meeting activation (`scheduled`->`active` on first join) + audit logging | database | — | migration, code |
 | 4 | Fix GC join/settings auth middleware (`UserClaims`), add status allowlist, add `record_meeting_join` metrics | global-controller | — | code, metrics |
 | 5 | Add TLS cert generation to dev scripts + MC K8s Secret volume mount + Kind UDP port mapping for 4433 | infrastructure | — | deploy |
-| 6 | Enable MC liveness/readiness health probes in `deployment.yaml` | infrastructure | — | deploy |
+| 6 | Enable MC liveness/readiness health probes in `deployment.yaml` + add `AC_JWKS_URL` env var to MC configmap/deployment (needed by task 9) | infrastructure | — | deploy |
 | 7 | Extract JWKS client + generic JWT validator (`JwtValidator::validate<T>`) from GC to `crates/common/`, with `JwtError` enum and wiremock tests (R-23) | auth-controller | 1 | code |
 | 8 | Convert GC auth to use common JWKS/JWT code (delete `gc-service/src/auth/jwks.rs`, thin wrapper mapping `JwtError` to `GcError`) | global-controller | 7 | code |
 | 9 | Implement MC JWT validation using common `JwksClient` + `JwtValidator::validate<MeetingTokenClaims>` + MC-specific config (`ac_jwks_url`) | meeting-controller | 7 | code |
