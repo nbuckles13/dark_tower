@@ -42,6 +42,7 @@
 //! See ADR-0023 (Meeting Controller Architecture) for the full design specification.
 
 pub mod actors;
+pub mod auth;
 pub mod config;
 pub mod errors;
 pub mod grpc;

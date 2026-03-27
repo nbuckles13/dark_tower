@@ -45,6 +45,7 @@ use axum::Router;
 use common::secret::{ExposeSecret, SecretBox};
 use common::token_manager::{spawn_token_manager, TokenManagerConfig};
 use mc_service::actors::{ActorMetrics, ControllerMetrics, MeetingControllerActorHandle};
+use mc_service::auth::McJwtValidator;
 use mc_service::config::Config;
 use mc_service::errors::McError;
 use mc_service::grpc::{GcClient, McAssignmentService};
@@ -163,6 +164,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             })?;
 
     info!("TokenManager spawned successfully, initial token acquired");
+
+    // Initialize JWKS client + JWT validator for meeting token validation (ADR-0020)
+    // This validates client meeting/guest tokens presented during WebTransport join.
+    // Separate from gRPC McAuthInterceptor which validates GC->MC service tokens.
+    info!(
+        ac_jwks_url = %config.ac_jwks_url,
+        "Initializing JWKS client for meeting token validation..."
+    );
+    let jwks_client = Arc::new(
+        common::jwt::JwksClient::new(config.ac_jwks_url.clone()).map_err(|e| {
+            error!(error = %e, "Failed to create JWKS client");
+            McError::Config(format!("JWKS client initialization failed: {e}"))
+        })?,
+    );
+
+    // Prefixed with _ because not yet consumed until WebTransport join handler (task 10)
+    #[expect(
+        clippy::cast_possible_wrap,
+        reason = "clock_skew_seconds bounded to <=600, safe u64->i64"
+    )]
+    let _jwt_validator = Arc::new(McJwtValidator::new(
+        jwks_client,
+        config.clock_skew_seconds as i64,
+    ));
+    info!("JWKS client initialized for meeting token validation");
 
     // Initialize shared metrics for heartbeat reporting
     let controller_metrics = ControllerMetrics::new();

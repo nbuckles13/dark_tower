@@ -707,6 +707,7 @@ mod tests {
             ac_endpoint: "https://ac.example.com".to_string(),
             client_id: "mc-service".to_string(),
             client_secret: SecretString::from("test-client-secret"),
+            ac_jwks_url: "https://ac.example.com/.well-known/jwks.json".to_string(),
         };
 
         let token_rx = mock_token_receiver();
@@ -746,6 +747,7 @@ mod tests {
             ac_endpoint: "https://ac.example.com".to_string(),
             client_id: "mc-service".to_string(),
             client_secret: SecretString::from("test-client-secret"),
+            ac_jwks_url: "https://ac.example.com/.well-known/jwks.json".to_string(),
         };
 
         let token_rx = mock_token_receiver();

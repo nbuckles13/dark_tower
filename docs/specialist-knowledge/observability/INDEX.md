@@ -5,7 +5,8 @@
 - Validation pipeline (guards including metric guards) -> ADR-0024
 - Client architecture (telemetry, metrics, dashboards, synthetic probe) -> ADR-0028
 
-## Code Locations
+## Metrics
+- Metric catalogs -> `docs/observability/metrics/ac-service.md`, `gc-service.md`, `mc-service.md`
 - AC metrics recording -> `crates/ac-service/src/observability/metrics.rs:init_metrics_recorder()`
 - AC gauge initialization at startup -> `crates/ac-service/src/services/key_management_service.rs:init_key_metrics()`
 - AC HTTP metrics middleware -> `crates/ac-service/src/middleware/http_metrics.rs`
@@ -15,16 +16,20 @@
 - GC HTTP metrics middleware -> `crates/gc-service/src/middleware/http_metrics.rs:http_metrics_middleware()`
 - GC endpoint normalization -> `crates/gc-service/src/observability/metrics.rs:normalize_endpoint()`
 - GC join handler metrics wiring -> `crates/gc-service/src/handlers/meetings.rs:join_meeting()`
-- GC meetings repository DB metrics -> `crates/gc-service/src/repositories/meetings.rs:MeetingsRepository`
-- GC participants repository DB metrics -> `crates/gc-service/src/repositories/participants.rs:ParticipantsRepository`
+- GC DB metrics (meetings) -> `crates/gc-service/src/repositories/meetings.rs:MeetingsRepository`
+- GC DB metrics (participants) -> `crates/gc-service/src/repositories/participants.rs:ParticipantsRepository`
 - MC metrics recording -> `crates/mc-service/src/observability/metrics.rs:init_metrics_recorder()`
-- MC health state (liveness/readiness) -> `crates/mc-service/src/observability/health.rs:health_router()`
+
+## Auth & JWT Tracing
 - Common JWKS client (target: `common.jwt.jwks`) -> `crates/common/src/jwt.rs:JwksClient`
 - Common JWT validator (target: `common.jwt`) -> `crates/common/src/jwt.rs:JwtValidator`
 - Common JWT verify_token (target: `common.jwt`) -> `crates/common/src/jwt.rs:verify_token()`
 - GC auth wrapper (delegates logging to common) -> `crates/gc-service/src/auth/jwt.rs:JwtValidator`
+- MC auth wrapper (target: `mc.auth`, delegates to common) -> `crates/mc-service/src/auth/mod.rs:McJwtValidator`
 - PII-redacted claims Debug impls -> `crates/common/src/jwt.rs` (ServiceClaims, UserClaims, MeetingTokenClaims, GuestTokenClaims)
-- Metric catalogs -> `docs/observability/metrics/ac-service.md`, `gc-service.md`, `mc-service.md`
+
+## Health
+- MC health state (liveness/readiness) -> `crates/mc-service/src/observability/health.rs:health_router()`
 
 ## Dashboards & Alerts
 - Grafana dashboards -> `infra/grafana/dashboards/` (overview, SLOs, logs per service)

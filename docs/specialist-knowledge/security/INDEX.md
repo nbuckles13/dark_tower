@@ -37,7 +37,11 @@
 - GC atomic org limit CTE → `crates/gc-service/src/repositories/meetings.rs:create_meeting_with_limit_check()`
 - GC meeting activation + audit logging → `crates/gc-service/src/repositories/meetings.rs:activate_meeting()`, `log_audit_event()`
 - GC participant tracking (DB CHECK + partial unique index) → `crates/gc-service/src/repositories/participants.rs`, `migrations/20260322000001_add_participant_tracking.sql`
-- MC gRPC auth interceptor → `crates/mc-service/src/grpc/auth_interceptor.rs`
+- MC JWT validation (thin wrapper, meeting + guest) → `crates/mc-service/src/auth/mod.rs:McJwtValidator`
+- MC token_type enforcement (anti-confusion) → `crates/mc-service/src/auth/mod.rs:validate_meeting_token()` (token_type == "meeting"), `validate_guest_token()` (delegates to `GuestTokenClaims::validate()`)
+- MC `From<JwtError>` error mapping → `crates/mc-service/src/errors.rs` (ServiceUnavailable→Internal, others→JwtValidation)
+- MC JWKS config (scheme-validated URL) → `crates/mc-service/src/config.rs:ac_jwks_url`
+- MC gRPC auth interceptor (service tokens, separate from meeting tokens) → `crates/mc-service/src/grpc/auth_interceptor.rs`
 - MC session binding actors → `crates/mc-service/src/actors/session.rs`
 
 ## TLS & Certificates
@@ -46,7 +50,8 @@
 - MC WebTransport UDP ingress + Kind mapping → `infra/services/mc-service/network-policy.yaml`, `infra/kind/kind-config.yaml`
 
 ## Integration Seams
-- AC JWKS → common `JwksClient` → `crates/common/src/jwt.rs:JwksClient`; GC→MC gRPC → `crates/mc-service/src/grpc/auth_interceptor.rs`
+- AC JWKS → common `JwksClient` → GC `JwtValidator` + MC `McJwtValidator` (meeting/guest tokens via WebTransport)
+- GC→MC gRPC service tokens → `crates/mc-service/src/grpc/auth_interceptor.rs` (separate from meeting token path)
 - GC user-auth routes → `crates/gc-service/src/routes/mod.rs:build_routes()`
 - Credential leak guards → `scripts/guards/simple/no-secrets-in-logs.sh`
 

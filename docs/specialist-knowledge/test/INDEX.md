@@ -34,6 +34,12 @@
 - Test harness (HTTP seam) -> `crates/gc-test-utils/src/server_harness.rs`
 
 ## Code Locations: MC Service
+- Auth module (McJwtValidator wrapper) -> `crates/mc-service/src/auth/mod.rs`
+- Meeting token validation (wiremock + Ed25519) -> `crates/mc-service/src/auth/mod.rs:tests::test_validate_meeting_token_*`
+- Guest token validation (wiremock + Ed25519) -> `crates/mc-service/src/auth/mod.rs:tests::test_validate_guest_token_*`
+- Token confusion (bidirectional: meeting-as-guest, guest-as-meeting, wrong token_type) -> `crates/mc-service/src/auth/mod.rs:tests`
+- From<JwtError> for McError (7 variants, ServiceUnavailable->Internal) -> `crates/mc-service/src/errors.rs:tests::test_jwt_error_to_mc_error_*`
+- Config ac_jwks_url (default derivation, scheme validation) -> `crates/mc-service/src/config.rs:tests::test_ac_jwks_url_*`
 - GC integration tests -> `crates/mc-service/tests/gc_integration.rs`
 - Heartbeat tests -> `crates/mc-service/tests/heartbeat_tasks.rs`
 - Mock Redis -> `crates/mc-test-utils/src/mock_redis.rs`
@@ -57,6 +63,7 @@
 - Round-trip tests (real Ed25519 sign+verify) -> `crates/common/src/jwt.rs:tests::test_verify_token_roundtrip_*`
 - extract_kid, validate_iat -> `crates/common/src/jwt.rs`
 - GC JwtError->GcError mapping tests (all 7 variants) -> `crates/gc-service/src/auth/jwt.rs:tests`
+- MC JwtError->McError mapping tests (all 7 variants) -> `crates/mc-service/src/errors.rs:tests::test_jwt_error_to_mc_error_*`
 
 ## Infrastructure & Shared
 - Dev cert generation + MC TLS manifests -> `scripts/generate-dev-certs.sh`, `infra/services/mc-service/tls-secret.yaml`
