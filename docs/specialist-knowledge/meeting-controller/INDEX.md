@@ -28,6 +28,8 @@
 - Redis: Lua scripts (atomic fencing) → `crates/mc-service/src/redis/lua_scripts.rs`
 - Health + readiness endpoints → `crates/mc-service/src/observability/health.rs`
 - Prometheus metric wrappers → `crates/mc-service/src/observability/metrics.rs`
+- Join flow metrics (R-13): record_webtransport_connection, record_jwt_validation, record_session_join → `crates/mc-service/src/observability/metrics.rs`
+- MC metrics catalog → `docs/observability/metrics/mc-service.md`
 - System info (sysinfo) → `crates/mc-service/src/system_info.rs`
 
 ## Protocols

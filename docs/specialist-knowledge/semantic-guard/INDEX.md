@@ -60,8 +60,14 @@
 - Meeting creation metrics → `crates/gc-service/src/observability/metrics.rs:record_meeting_creation()`
 - Meeting join metrics → `crates/gc-service/src/observability/metrics.rs:record_meeting_join()`
 - GC metrics impl → `crates/gc-service/src/observability/metrics.rs`
+- GC alert rules → `infra/docker/prometheus/rules/gc-alerts.yaml`
+
+## MC Metrics & Observability
 - MC metrics impl → `crates/mc-service/src/observability/metrics.rs`
-- Alert rules → `infra/docker/prometheus/rules/gc-alerts.yaml`
+- WebTransport connection counter → `crates/mc-service/src/observability/metrics.rs:record_webtransport_connection()`
+- JWT validation counter → `crates/mc-service/src/observability/metrics.rs:record_jwt_validation()`
+- Session join counter + histogram → `crates/mc-service/src/observability/metrics.rs:record_session_join()`
+- MC alert rules → `infra/docker/prometheus/rules/mc-alerts.yaml`
 
 ## GC Runbooks
 - Incident response: limit exhaustion → `docs/runbooks/gc-incident-response.md` (Scenario 8)

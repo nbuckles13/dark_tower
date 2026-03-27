@@ -11,6 +11,7 @@
 
 use crate::actors::MeetingControllerActorHandle;
 use crate::auth::McJwtValidator;
+use crate::observability::metrics;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -152,10 +153,12 @@ impl WebTransportServer {
                             "Connection rejected: at capacity"
                         );
                         // Drop incoming_session without accepting — client sees connection refused
+                        metrics::record_webtransport_connection("rejected");
                         continue;
                     }
 
                     self.active_connections.fetch_add(1, Ordering::Relaxed);
+                    metrics::record_webtransport_connection("accepted");
                     let active_connections = Arc::clone(&self.active_connections);
                     let controller_handle = Arc::clone(&self.controller_handle);
                     let jwt_validator = Arc::clone(&self.jwt_validator);
@@ -173,6 +176,7 @@ impl WebTransportServer {
                         active_connections.fetch_sub(1, Ordering::Relaxed);
 
                         if let Err(e) = result {
+                            metrics::record_webtransport_connection("error");
                             warn!(
                                 target: "mc.webtransport",
                                 error = %e,

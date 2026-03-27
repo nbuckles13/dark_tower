@@ -134,6 +134,56 @@ All MC service metrics follow ADR-0011 naming conventions with the `mc_` prefix.
 
 ---
 
+## Join Flow Metrics (R-13)
+
+### `mc_webtransport_connections_total`
+- **Type**: Counter
+- **Description**: Total WebTransport connection attempts by outcome
+- **Labels**:
+  - `status`: Connection outcome (`accepted`, `rejected`, `error`)
+- **Cardinality**: Low (3 status values)
+- **Usage**: Monitor connection acceptance rate, capacity rejections, and connection errors
+- **Recorded in**: `server.rs` accept loop
+
+### `mc_jwt_validations_total`
+- **Type**: Counter
+- **Description**: Total JWT validation attempts by result and token type
+- **Labels**:
+  - `result`: Validation outcome (`success`, `failure`)
+  - `token_type`: Token type (`meeting`, `guest`)
+- **Cardinality**: Low (2 results x 2 token types = 4 series)
+- **Usage**: Monitor authentication health, detect token validation failures
+- **Recorded in**: `connection.rs` after JWT validation
+
+### `mc_session_joins_total`
+- **Type**: Counter
+- **Description**: Total session join attempts by outcome
+- **Labels**:
+  - `status`: Join outcome (`success`, `failure`)
+- **Cardinality**: Low (2 status values)
+- **Usage**: Monitor join success rate, overall join volume
+
+### `mc_session_join_duration_seconds`
+- **Type**: Histogram
+- **Description**: Duration from WebTransport session accept to JoinResponse sent (or error)
+- **Labels**:
+  - `status`: Join outcome (`success`, `failure`)
+- **Buckets**: [0.010, 0.025, 0.050, 0.100, 0.200, 0.500, 1.000, 2.000, 5.000]
+- **Cardinality**: Low (2 status values)
+- **Usage**: Monitor join latency, identify slow joins. Extended to 5s because join includes actor processing.
+- **Recorded in**: `connection.rs` measuring full join flow
+
+### `mc_session_join_failures_total`
+- **Type**: Counter
+- **Description**: Total session join failures by error type
+- **Labels**:
+  - `error_type`: Bounded by `McError` enum variants (e.g., `jwt_validation`, `internal`, `meeting_not_found`, `mc_capacity_exceeded`, `meeting_capacity_exceeded`)
+- **Cardinality**: Low (~18 error variants, bounded by `McError` enum)
+- **Usage**: Diagnose join failure root causes, alert on specific failure patterns
+- **Recorded in**: `connection.rs` on join failure only
+
+---
+
 ## Prometheus Query Examples
 
 ### Active Meetings
@@ -165,6 +215,36 @@ histogram_quantile(0.99,
 ```promql
 sum(rate(mc_gc_heartbeats_total{status="success"}[5m])) /
 sum(rate(mc_gc_heartbeats_total[5m]))
+```
+
+### Join Success Rate
+```promql
+sum(rate(mc_session_joins_total{status="success"}[5m])) /
+sum(rate(mc_session_joins_total[5m]))
+```
+
+### Join Duration p95
+```promql
+histogram_quantile(0.95,
+  sum(rate(mc_session_join_duration_seconds_bucket{status="success"}[5m])) by (le)
+)
+```
+
+### JWT Validation Failure Rate
+```promql
+sum(rate(mc_jwt_validations_total{result="failure"}[5m])) /
+sum(rate(mc_jwt_validations_total[5m]))
+```
+
+### Connection Rejection Rate
+```promql
+sum(rate(mc_webtransport_connections_total{status="rejected"}[5m])) /
+sum(rate(mc_webtransport_connections_total[5m]))
+```
+
+### Join Failures by Error Type
+```promql
+sum(rate(mc_session_join_failures_total[5m])) by (error_type)
 ```
 
 ---
@@ -201,10 +281,13 @@ All MC service metrics follow strict cardinality bounds per ADR-0011:
 | `message_type` | ~20 | Bounded by protobuf message types |
 | `operation` | ~10 | Bounded by Redis commands |
 | `reason` | 2-3 | `stale_generation`, `concurrent_write` |
-| `status` | 2 | `success`, `error` |
+| `status` | 2-3 | `success`, `error`/`failure`, `accepted`/`rejected` |
 | `type` | 2 | `fast`, `comprehensive` |
+| `result` | 2 | `success`, `failure` (JWT validation) |
+| `token_type` | 2 | `meeting`, `guest` (JWT validation) |
+| `error_type` | ~18 | Bounded by `McError` enum variants |
 
-**Total Estimated Cardinality**: ~50 time series (well within Prometheus limits)
+**Total Estimated Cardinality**: ~75 time series (well within Prometheus limits)
 
 ---
 

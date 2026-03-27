@@ -34,6 +34,10 @@
 - GC role enforcement constants → `crates/gc-service/src/handlers/meetings.rs:MEETING_CREATE_ROLES`
 - GC join status allowlist → `crates/gc-service/src/handlers/meetings.rs:join_meeting()`, `get_guest_token()`
 - GC join metrics (bounded error_type labels) → `crates/gc-service/src/observability/metrics.rs:record_meeting_join()`
+- MC join flow metrics (bounded labels, no PII) → `crates/mc-service/src/observability/metrics.rs:record_session_join()`, `record_jwt_validation()`, `record_webtransport_connection()`
+- MC error_type_label (static str from enum, not error messages) → `crates/mc-service/src/errors.rs:error_type_label()`
+- MC metrics catalog (cardinality bounds) → `docs/observability/metrics/mc-service.md`
+- MC join flow dashboard panels → `infra/grafana/dashboards/mc-overview.json`
 - GC atomic org limit CTE → `crates/gc-service/src/repositories/meetings.rs:create_meeting_with_limit_check()`
 - GC meeting activation + audit logging → `crates/gc-service/src/repositories/meetings.rs:activate_meeting()`, `log_audit_event()`
 - GC participant tracking (DB CHECK + partial unique index) → `crates/gc-service/src/repositories/participants.rs`, `migrations/20260322000001_add_participant_tracking.sql`

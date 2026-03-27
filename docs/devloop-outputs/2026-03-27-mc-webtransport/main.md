@@ -22,7 +22,7 @@
 
 | Field | Value |
 |-------|-------|
-| Phase | `reflection` |
+| Phase | `complete` |
 | Implementer | `pending` |
 | Implementing Specialist | `meeting-controller` |
 | Iteration | `2` |
@@ -108,9 +108,22 @@ TBD
 
 | Reviewer | Verdict | Findings | Fixed | Deferred | Notes |
 |----------|---------|----------|-------|----------|-------|
-| Security | | | | | |
-| Test | | | | | |
-| Observability | | | | | |
-| Code Quality | | | | | |
-| DRY | | | | | |
-| Operations | | | | | |
+| Security | CLEAR | 3 (iter 1) | 2 | 1 obs | Capacity bound, name length, outbound wiring (resolved in iter 2) |
+| Test | RESOLVED | 4 | 4 | 0 | encode_participant_update, build_join_response, spawn_with_stream tests |
+| Observability | CLEAR | 3 | 3 | 0 | Tracing targets, participant_type field, deferred metrics |
+| Code Quality | CLEAR | 7 | 7 | 0 | Bridge loop wiring, u32 cast, outbound_tx threading |
+| DRY | CLEAR | 0 | 0 | 0 | No duplication introduced |
+| Operations | CLEAR | 1 | 1 | 0 | Bind-before-spawn for fail-fast |
+
+## Architecture Refactor (Iteration 2)
+
+Human review during devloop identified architectural issues:
+1. **ConnectionActor renamed to ParticipantActor** — the actor represents a participant in a meeting, not the connection
+2. **Handler promoted to ConnectionActor** — the bridge loop is the real connection actor (owns socket, typed handle, mailbox)
+3. **Fire-and-forget join** — handler no longer holds MeetingActorHandle; join routed through controller
+4. **ParticipantActor owns disconnect** — notifies meeting on exit via MeetingActorHandle passed at spawn
+5. **outbound_tx threaded through join flow** — R-8 notifications reach the wire end-to-end
+
+## Task 19 Added
+
+New user story task: Move JWT auth from JoinRequest protobuf to HTTP/3 CONNECT headers (enables off-box auth termination). Amend ADR-0023.

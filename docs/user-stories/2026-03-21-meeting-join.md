@@ -296,7 +296,7 @@ Task 1 also starts immediately; task 7 waits for task 1
 | 8 | Convert GC auth to common JWKS/JWT | docs/devloop-outputs/2026-03-26-jwks-extraction | aa99fee | Completed (in task 7) |
 | 9 | MC JWT validation on common code | docs/devloop-outputs/2027-03-27-mc-jwt-validation | b3a4c8d | Completed |
 | 10 | MC WebTransport server + join flow handler | docs/devloop-outputs/2026-03-27-mc-webtransport | dcee11c | Completed |
-| 11 | MC join flow observability metrics | | | Pending |
+| 11 | MC join flow observability metrics | docs/devloop-outputs/2026-03-27-mc-join-metrics | 7213b17 | Completed |
 | 12 | GC join dashboard + alerts + catalog | | | Pending |
 | 13 | MC join dashboard + alerts + catalog | | | Pending |
 | 14 | GC join integration tests | | | Pending |
