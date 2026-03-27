@@ -7,8 +7,11 @@
 
 ## Code Locations
 - Service entry point → `crates/mc-service/src/main.rs`
-- Config (SecretString, env loading) → `crates/mc-service/src/config.rs`
-- Error types (McError hierarchy) → `crates/mc-service/src/errors.rs`
+- Config (SecretString, env loading, ac_jwks_url) → `crates/mc-service/src/config.rs`
+- Error types (McError hierarchy, From<JwtError>) → `crates/mc-service/src/errors.rs`
+- Auth: McJwtValidator (thin wrapper, target: `mc.auth`) → `crates/mc-service/src/auth/mod.rs`
+- Auth: validate_meeting_token (token_type guard) → `crates/mc-service/src/auth/mod.rs:validate_meeting_token()`
+- Auth: validate_guest_token (field enforcement) → `crates/mc-service/src/auth/mod.rs:validate_guest_token()`
 - Actor: controller (root, capacity) → `crates/mc-service/src/actors/controller.rs`
 - Actor: meeting (participants, grace period) → `crates/mc-service/src/actors/meeting.rs`
 - Actor: connection → `crates/mc-service/src/actors/connection.rs`
@@ -31,6 +34,7 @@
 - MC <-> GC registration/heartbeat → `crates/mc-service/src/grpc/gc_client.rs`
 - GC -> MC assignment → `crates/mc-service/src/grpc/mc_service.rs`
 - MC -> AC token management → `crates/common/src/token_manager.rs`
+- MC -> AC JWKS (meeting token validation) → `crates/common/src/jwt.rs:JwksClient`
 - MC -> Redis session/fencing → `crates/mc-service/src/redis/client.rs`
 
 ## Testing

@@ -67,6 +67,9 @@ tokio = { version = "1.40", features = ["full", "test-util"] }
 tokio-stream = "0.1"
 # Enable test-utils feature for common (e.g., TokenReceiver::from_test_channel)
 common = { path = "../common", features = ["test-utils"] }
+# JWT validation testing (Ed25519 signing, JWKS mocking)
+wiremock = "0.6"
+jsonwebtoken = { workspace = true }
 
 [lib]
 name = "mc_service"

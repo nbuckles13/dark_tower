@@ -257,6 +257,7 @@ fn test_config(gc_url: &str) -> Config {
         ac_endpoint: "https://ac.example.com".to_string(),
         client_id: "mc-service".to_string(),
         client_secret: SecretString::from("test-client-secret"),
+        ac_jwks_url: "https://ac.example.com/.well-known/jwks.json".to_string(),
     }
 }
 

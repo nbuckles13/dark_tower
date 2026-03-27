@@ -103,6 +103,10 @@ pub struct Config {
     /// OAuth client secret for MC (used for client credentials flow to AC).
     /// Protected by `SecretString` to prevent accidental logging.
     pub client_secret: SecretString,
+
+    /// URL to Auth Controller's JWKS endpoint for meeting token validation.
+    /// Defaults to `{AC_ENDPOINT}/.well-known/jwks.json` if `AC_JWKS_URL` is not set.
+    pub ac_jwks_url: String,
 }
 
 /// Custom Debug implementation that redacts sensitive fields.
@@ -132,6 +136,7 @@ impl fmt::Debug for Config {
             .field("ac_endpoint", &self.ac_endpoint)
             .field("client_id", &self.client_id)
             .field("client_secret", &"[REDACTED]")
+            .field("ac_jwks_url", &self.ac_jwks_url)
             .finish()
     }
 }
@@ -181,6 +186,20 @@ impl Config {
                 .ok_or_else(|| ConfigError::MissingEnvVar("MC_CLIENT_SECRET".to_string()))?
                 .clone(),
         );
+
+        // AC_JWKS_URL defaults to AC_ENDPOINT + /.well-known/jwks.json if not set,
+        // avoiding crash-loops when deployment manifests haven't been updated yet.
+        let ac_jwks_url = vars
+            .get("AC_JWKS_URL")
+            .cloned()
+            .unwrap_or_else(|| format!("{}/.well-known/jwks.json", ac_endpoint));
+
+        // Basic validation: JWKS URL must use http:// or https://
+        if !ac_jwks_url.starts_with("http://") && !ac_jwks_url.starts_with("https://") {
+            return Err(ConfigError::InvalidValue(
+                "AC_JWKS_URL must start with http:// or https://".to_string(),
+            ));
+        }
 
         let webtransport_bind_address = vars
             .get("MC_WEBTRANSPORT_BIND_ADDRESS")
@@ -265,6 +284,7 @@ impl Config {
             ac_endpoint,
             client_id,
             client_secret,
+            ac_jwks_url,
         })
     }
 }
@@ -329,6 +349,10 @@ mod tests {
         );
         // MC ID should be auto-generated
         assert!(config.mc_id.starts_with("mc-"));
+        assert_eq!(
+            config.ac_jwks_url,
+            "https://ac.example.com/.well-known/jwks.json"
+        );
     }
 
     #[test]
@@ -452,5 +476,42 @@ mod tests {
         // ac_endpoint and client_id are not sensitive
         assert!(debug_output.contains("https://ac.example.com"));
         assert!(debug_output.contains("mc-service"));
+        // ac_jwks_url is not sensitive
+        assert!(debug_output.contains(".well-known/jwks.json"));
+    }
+
+    #[test]
+    fn test_ac_jwks_url_defaults_from_ac_endpoint() {
+        let vars = base_vars();
+        // AC_JWKS_URL is not in base_vars, so it should derive from AC_ENDPOINT
+        let config = Config::from_vars(&vars).expect("Config should load successfully");
+        assert_eq!(
+            config.ac_jwks_url,
+            "https://ac.example.com/.well-known/jwks.json"
+        );
+    }
+
+    #[test]
+    fn test_from_vars_invalid_ac_jwks_url_scheme() {
+        let mut vars = base_vars();
+        vars.insert("AC_JWKS_URL".to_string(), "ftp://bad-scheme".to_string());
+
+        let result = Config::from_vars(&vars);
+        assert!(matches!(result, Err(ConfigError::InvalidValue(msg)) if msg.contains("http")));
+    }
+
+    #[test]
+    fn test_ac_jwks_url_http_allowed() {
+        let mut vars = base_vars();
+        vars.insert(
+            "AC_JWKS_URL".to_string(),
+            "http://localhost:8082/.well-known/jwks.json".to_string(),
+        );
+
+        let config = Config::from_vars(&vars).expect("http should be allowed for local dev");
+        assert_eq!(
+            config.ac_jwks_url,
+            "http://localhost:8082/.well-known/jwks.json"
+        );
     }
 }

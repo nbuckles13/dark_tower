@@ -210,10 +210,22 @@ impl From<SessionBindingError> for McError {
     }
 }
 
+impl From<common::jwt::JwtError> for McError {
+    fn from(err: common::jwt::JwtError) -> Self {
+        match err {
+            common::jwt::JwtError::ServiceUnavailable(_) => {
+                McError::Internal("Authentication service unavailable".to_string())
+            }
+            _ => McError::JwtValidation("The access token is invalid or expired".to_string()),
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use common::jwt::JwtError;
 
     #[test]
     fn test_error_code_mapping() {
@@ -487,6 +499,64 @@ mod tests {
         assert_eq!(
             format!("{}", McError::TokenAcquisitionTimeout),
             "Token acquisition timed out"
+        );
+    }
+
+    #[test]
+    fn test_jwt_error_to_mc_error_token_too_large() {
+        let mc_err: McError = JwtError::TokenTooLarge.into();
+        assert!(
+            matches!(&mc_err, McError::JwtValidation(msg) if msg.contains("invalid or expired"))
+        );
+    }
+
+    #[test]
+    fn test_jwt_error_to_mc_error_malformed_token() {
+        let mc_err: McError = JwtError::MalformedToken.into();
+        assert!(
+            matches!(&mc_err, McError::JwtValidation(msg) if msg.contains("invalid or expired"))
+        );
+    }
+
+    #[test]
+    fn test_jwt_error_to_mc_error_missing_kid() {
+        let mc_err: McError = JwtError::MissingKid.into();
+        assert!(
+            matches!(&mc_err, McError::JwtValidation(msg) if msg.contains("invalid or expired"))
+        );
+    }
+
+    #[test]
+    fn test_jwt_error_to_mc_error_iat_too_far_in_future() {
+        let mc_err: McError = JwtError::IatTooFarInFuture.into();
+        assert!(
+            matches!(&mc_err, McError::JwtValidation(msg) if msg.contains("invalid or expired"))
+        );
+    }
+
+    #[test]
+    fn test_jwt_error_to_mc_error_invalid_signature() {
+        let mc_err: McError = JwtError::InvalidSignature.into();
+        assert!(
+            matches!(&mc_err, McError::JwtValidation(msg) if msg.contains("invalid or expired"))
+        );
+    }
+
+    #[test]
+    fn test_jwt_error_to_mc_error_key_not_found() {
+        let mc_err: McError = JwtError::KeyNotFound.into();
+        assert!(
+            matches!(&mc_err, McError::JwtValidation(msg) if msg.contains("invalid or expired"))
+        );
+    }
+
+    #[test]
+    fn test_jwt_error_to_mc_error_service_unavailable() {
+        let mc_err: McError = JwtError::ServiceUnavailable("auth down".to_string()).into();
+        assert!(
+            matches!(&mc_err, McError::Internal(msg) if msg.contains("Authentication service unavailable")),
+            "Expected Internal, got {:?}",
+            mc_err
         );
     }
 }

@@ -39,6 +39,15 @@
 - Metrics catalog → `docs/observability/metrics/gc-service.md`
 - Grafana dashboard → `infra/grafana/dashboards/gc-overview.json`
 
+## Code Locations — MC Service
+- Error type reference → `crates/mc-service/src/errors.rs:McError`
+- `From<JwtError> for McError` → `crates/mc-service/src/errors.rs` (ServiceUnavailable→Internal, all others→JwtValidation)
+- JWT validator (thin wrapper) → `crates/mc-service/src/auth/mod.rs:McJwtValidator` (delegates to `common::jwt::JwtValidator`)
+- Token type enforcement → `crates/mc-service/src/auth/mod.rs:validate_meeting_token()`, `validate_guest_token()`
+- gRPC auth interceptor (structural) → `crates/mc-service/src/grpc/auth_interceptor.rs:McAuthInterceptor`
+- Config (ac_jwks_url) → `crates/mc-service/src/config.rs:Config`
+- Startup wiring (JwksClient + McJwtValidator) → `crates/mc-service/src/main.rs:168-189`
+
 ## Code Locations — Common
 - JWT error type → `crates/common/src/jwt.rs:JwtError`
 - JWT claims & enums → `crates/common/src/jwt.rs:ServiceClaims`, `UserClaims`, `MeetingTokenClaims`, `GuestTokenClaims`, `ParticipantType`, `MeetingRole`
