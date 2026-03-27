@@ -26,9 +26,9 @@ use crate::observability::metrics as prom;
 pub const MEETING_MAILBOX_NORMAL: usize = 100;
 pub const MEETING_MAILBOX_WARNING: usize = 500;
 
-/// Mailbox depth thresholds for connection actors.
-pub const CONNECTION_MAILBOX_NORMAL: usize = 50;
-pub const CONNECTION_MAILBOX_WARNING: usize = 200;
+/// Mailbox depth thresholds for participant actors.
+pub const PARTICIPANT_MAILBOX_NORMAL: usize = 50;
+pub const PARTICIPANT_MAILBOX_WARNING: usize = 200;
 
 /// Actor type for metrics labeling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,8 +37,8 @@ pub enum ActorType {
     Controller,
     /// MeetingActor (one per meeting).
     Meeting,
-    /// ConnectionActor (one per WebTransport connection).
-    Connection,
+    /// ParticipantActor (one per participant).
+    Participant,
 }
 
 impl ActorType {
@@ -48,7 +48,7 @@ impl ActorType {
         match self {
             ActorType::Controller => "controller",
             ActorType::Meeting => "meeting",
-            ActorType::Connection => "connection",
+            ActorType::Participant => "participant",
         }
     }
 
@@ -58,7 +58,7 @@ impl ActorType {
         match self {
             ActorType::Controller => MEETING_MAILBOX_WARNING, // Use meeting thresholds
             ActorType::Meeting => MEETING_MAILBOX_WARNING,
-            ActorType::Connection => CONNECTION_MAILBOX_WARNING,
+            ActorType::Participant => PARTICIPANT_MAILBOX_WARNING,
         }
     }
 
@@ -68,7 +68,7 @@ impl ActorType {
         match self {
             ActorType::Controller => MEETING_MAILBOX_NORMAL,
             ActorType::Meeting => MEETING_MAILBOX_NORMAL,
-            ActorType::Connection => CONNECTION_MAILBOX_NORMAL,
+            ActorType::Participant => PARTICIPANT_MAILBOX_NORMAL,
         }
     }
 }
@@ -433,15 +433,15 @@ mod tests {
     fn test_actor_type_as_str() {
         assert_eq!(ActorType::Controller.as_str(), "controller");
         assert_eq!(ActorType::Meeting.as_str(), "meeting");
-        assert_eq!(ActorType::Connection.as_str(), "connection");
+        assert_eq!(ActorType::Participant.as_str(), "participant");
     }
 
     #[test]
     fn test_actor_type_thresholds() {
         assert_eq!(ActorType::Meeting.normal_threshold(), 100);
         assert_eq!(ActorType::Meeting.warning_threshold(), 500);
-        assert_eq!(ActorType::Connection.normal_threshold(), 50);
-        assert_eq!(ActorType::Connection.warning_threshold(), 200);
+        assert_eq!(ActorType::Participant.normal_threshold(), 50);
+        assert_eq!(ActorType::Participant.warning_threshold(), 200);
     }
 
     #[test]
@@ -486,8 +486,8 @@ mod tests {
     }
 
     #[test]
-    fn test_mailbox_monitor_connection_thresholds() {
-        let monitor = MailboxMonitor::new(ActorType::Connection, "conn-456");
+    fn test_mailbox_monitor_participant_thresholds() {
+        let monitor = MailboxMonitor::new(ActorType::Participant, "part-456");
 
         // Normal (< 50)
         assert_eq!(monitor.current_level(), MailboxLevel::Normal);
@@ -565,7 +565,7 @@ mod tests {
         metrics.record_panic(ActorType::Meeting);
         assert_eq!(metrics.actor_panics.load(Ordering::Relaxed), 1);
 
-        metrics.record_panic(ActorType::Connection);
+        metrics.record_panic(ActorType::Participant);
         assert_eq!(metrics.actor_panics.load(Ordering::Relaxed), 2);
     }
 

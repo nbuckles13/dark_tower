@@ -3,6 +3,7 @@
 //! All inter-actor communication uses strongly-typed message passing via `tokio::sync::mpsc`.
 //! Response patterns use `tokio::sync::oneshot` for request-reply semantics.
 
+use super::participant::ParticipantActorHandle;
 use crate::errors::McError;
 use std::time::Duration;
 use tokio::sync::oneshot;
@@ -37,6 +38,22 @@ pub enum ControllerMessage {
         respond_to: oneshot::Sender<ControllerStatus>,
     },
 
+    /// Fire-and-forget: route a new connection to the correct meeting.
+    ///
+    /// The controller looks up the meeting and forwards as `ConnectionJoin`.
+    /// The result is sent back to the connection actor via `respond_to`.
+    JoinConnection {
+        meeting_id: String,
+        connection_id: String,
+        user_id: String,
+        participant_id: String,
+        is_host: bool,
+        /// Sender for writing framed protobuf bytes to the WebTransport stream.
+        stream_tx: tokio::sync::mpsc::Sender<bytes::Bytes>,
+        /// Response channel sent back to the WebTransport connection actor.
+        respond_to: oneshot::Sender<Result<JoinResult, McError>>,
+    },
+
     /// Initiate graceful shutdown (SIGTERM received).
     Shutdown {
         /// Deadline for shutdown.
@@ -56,6 +73,8 @@ pub enum MeetingMessage {
         participant_id: String,
         /// Whether this participant has host privileges.
         is_host: bool,
+        /// Sender for writing framed protobuf bytes to the WebTransport stream.
+        stream_tx: Option<tokio::sync::mpsc::Sender<bytes::Bytes>>,
         /// Response channel for join result.
         respond_to: oneshot::Sender<Result<JoinResult, McError>>,
     },
@@ -119,19 +138,19 @@ pub enum MeetingMessage {
     },
 }
 
-/// Messages sent to `ConnectionActor`.
+/// Messages sent to `ParticipantActor`.
 #[derive(Debug)]
-pub enum ConnectionMessage {
+pub enum ParticipantMessage {
     /// Send a signaling message to the connected client.
     Send { message: SignalingPayload },
 
-    /// Notify connection of participant state change.
+    /// Notify participant of a state change.
     ParticipantUpdate { update: ParticipantStateUpdate },
 
-    /// Close the connection gracefully.
+    /// Close the participant actor gracefully.
     Close { reason: String },
 
-    /// Ping the connection to check liveness.
+    /// Ping the participant actor to check liveness.
     Ping { respond_to: oneshot::Sender<()> },
 }
 
@@ -178,6 +197,8 @@ pub struct JoinResult {
     pub participants: Vec<ParticipantInfo>,
     /// Current fencing generation.
     pub fencing_generation: u64,
+    /// Handle to the spawned ParticipantActor.
+    pub participant_handle: ParticipantActorHandle,
 }
 
 /// Result of a successful reconnection.

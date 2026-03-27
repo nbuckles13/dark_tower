@@ -253,6 +253,7 @@ Task 1 also starts immediately; task 7 waits for task 1
 | 16 | Join flow end-to-end env-tests in Kind cluster (including WebTransport client E2E: connect to MC, JoinRequest/Response, ParticipantJoined) | test | 4, 10 | tests |
 | 17 | Add MC runbook scenarios 8-10 (WebTransport, token validation, Redis/session) + TOC update | operations | 11, 13 | docs |
 | 18 | Add post-deploy monitoring checklist + expand smoke test 5 for join flow | operations | 4, 11 | docs |
+| 19 | Move JWT auth from JoinRequest protobuf to HTTP/3 CONNECT headers (enables off-box auth termination), update `signaling.proto`, handler, client SDK, amend ADR-0023 | meeting-controller | 10 | code, proto, docs |
 
 ### Specialist Task Summary
 

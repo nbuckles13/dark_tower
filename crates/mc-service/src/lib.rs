@@ -19,8 +19,8 @@
 //! ├── supervises N MeetingActors
 //! │   └── MeetingActor (one per active meeting)
 //! │       ├── owns meeting state
-//! │       └── supervises N ConnectionActors
-//! │           └── ConnectionActor (one per WebTransport connection)
+//! │       └── supervises N ParticipantActors
+//! │           └── ParticipantActor (one per participant)
 //! └── MhRegistryActor (tracks MH health via heartbeats)
 //! ```
 //!
@@ -49,7 +49,4 @@ pub mod grpc;
 pub mod observability;
 pub mod redis;
 pub mod system_info;
-
-// Future modules (Phase 6d+):
-// pub mod handlers;       // WebTransport message handlers
-// pub mod signaling;      // Signaling message routing
+pub mod webtransport;

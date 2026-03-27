@@ -19,7 +19,7 @@
 use crate::errors::McError;
 
 use super::meeting::{MeetingActor, MeetingActorHandle};
-use super::messages::{ControllerMessage, ControllerStatus, MeetingInfo};
+use super::messages::{ControllerMessage, ControllerStatus, JoinResult, MeetingInfo};
 use super::metrics::{ActorMetrics, ActorType, ControllerMetrics, MailboxMonitor};
 
 use common::secret::{ExposeSecret, SecretBox};
@@ -114,6 +114,35 @@ impl MeetingControllerActorHandle {
 
         rx.await
             .map_err(|e| McError::Internal(format!("response receive failed: {e}")))?
+    }
+
+    /// Fire-and-forget: route a new connection to the correct meeting.
+    ///
+    /// The controller looks up the meeting and forwards the join request.
+    /// Returns a oneshot receiver that the caller can await for the result.
+    pub async fn join_connection(
+        &self,
+        meeting_id: String,
+        connection_id: String,
+        user_id: String,
+        participant_id: String,
+        is_host: bool,
+        stream_tx: tokio::sync::mpsc::Sender<bytes::Bytes>,
+    ) -> Result<tokio::sync::oneshot::Receiver<Result<JoinResult, McError>>, McError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.sender
+            .send(ControllerMessage::JoinConnection {
+                meeting_id,
+                connection_id,
+                user_id,
+                participant_id,
+                is_host,
+                stream_tx,
+                respond_to: tx,
+            })
+            .await
+            .map_err(|e| McError::Internal(format!("channel send failed: {e}")))?;
+        Ok(rx)
     }
 
     /// Remove a meeting (called when all participants leave).
@@ -322,6 +351,37 @@ impl MeetingControllerActor {
                 let _ = respond_to.send(result);
             }
 
+            ControllerMessage::JoinConnection {
+                meeting_id,
+                connection_id,
+                user_id,
+                participant_id,
+                is_host,
+                stream_tx,
+                respond_to,
+            } => {
+                match self.get_meeting_handle(&meeting_id) {
+                    Ok(meeting_handle) => {
+                        // Spawn the join as a background task so we don't block the controller
+                        tokio::spawn(async move {
+                            let result = meeting_handle
+                                .connection_join(
+                                    connection_id,
+                                    user_id,
+                                    participant_id,
+                                    is_host,
+                                    Some(stream_tx),
+                                )
+                                .await;
+                            let _ = respond_to.send(result);
+                        });
+                    }
+                    Err(e) => {
+                        let _ = respond_to.send(Err(e));
+                    }
+                }
+            }
+
             ControllerMessage::RemoveMeeting {
                 meeting_id,
                 respond_to,
@@ -400,6 +460,14 @@ impl MeetingControllerActor {
         );
 
         Ok(())
+    }
+
+    /// Get a cloned handle to a meeting actor for connection handling.
+    fn get_meeting_handle(&self, meeting_id: &str) -> Result<MeetingActorHandle, McError> {
+        match self.meetings.get(meeting_id) {
+            Some(managed) => Ok(managed.handle.clone()),
+            None => Err(McError::MeetingNotFound(meeting_id.to_string())),
+        }
     }
 
     /// Get information about a meeting.

@@ -14,7 +14,7 @@
 //! Uses an actor model hierarchy:
 //! - `MeetingControllerActor` (singleton): Supervises meetings
 //! - `MeetingActor` (per meeting): Owns meeting state
-//! - `ConnectionActor` (per connection): Handles one WebTransport connection
+//! - `ParticipantActor` (per participant): Handles one participant in a meeting
 //!
 //! # State Management
 //!
@@ -52,6 +52,7 @@ use mc_service::grpc::{GcClient, McAssignmentService};
 use mc_service::observability::{health_router, HealthState};
 use mc_service::redis::FencedRedisClient;
 use mc_service::system_info::gather_system_info;
+use mc_service::webtransport::WebTransportServer;
 use proto_gen::internal::meeting_controller_service_server::MeetingControllerServiceServer;
 use proto_gen::internal::HealthStatus;
 use tokio::signal;
@@ -179,12 +180,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })?,
     );
 
-    // Prefixed with _ because not yet consumed until WebTransport join handler (task 10)
     #[expect(
         clippy::cast_possible_wrap,
         reason = "clock_skew_seconds bounded to <=600, safe u64->i64"
     )]
-    let _jwt_validator = Arc::new(McJwtValidator::new(
+    let jwt_validator = Arc::new(McJwtValidator::new(
         jwks_client,
         config.clock_skew_seconds as i64,
     ));
@@ -333,8 +333,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Meeting Controller Phase 6c: GC integration complete");
 
-    // TODO (Phase 6g): Start WebTransport server
-    // TODO (Phase 6h): Start health endpoints
+    // Start WebTransport server (R-5: HTTP/3 over QUIC with TLS 1.3 on port 4433)
+    let wt_server = WebTransportServer::new(
+        config.webtransport_bind_address.clone(),
+        config.tls_cert_path.clone(),
+        config.tls_key_path.clone(),
+        Arc::clone(&controller_handle),
+        jwt_validator,
+        config.max_participants as usize,
+        shutdown_token.child_token(),
+    );
+
+    // Fail-fast: load TLS + bind endpoint BEFORE spawning the accept loop.
+    // If certs are missing/corrupt or the port is in use, crash startup immediately
+    // rather than running an MC that can never accept WebTransport connections.
+    let wt_endpoint = wt_server.bind().await.map_err(|e| {
+        error!(error = %e, "WebTransport server failed to bind");
+        Box::<dyn std::error::Error>::from(e.to_string())
+    })?;
+    info!(
+        addr = %config.webtransport_bind_address,
+        "WebTransport endpoint bound"
+    );
+
+    tokio::spawn(async move {
+        wt_server.accept_loop(wt_endpoint).await;
+        info!("WebTransport accept loop stopped");
+    });
 
     // Wait for shutdown signal
     info!("Meeting Controller running - press Ctrl+C to shutdown");

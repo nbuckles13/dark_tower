@@ -2,7 +2,7 @@
 //!
 //! Each `MeetingActor`:
 //! - Owns all state for one meeting (participants, subscriptions, mute status)
-//! - Supervises N `ConnectionActor` instances
+//! - Supervises N `ParticipantActor` instances
 //! - Handles session binding tokens for reconnection
 //! - Coordinates with Redis for persistent state
 //!
@@ -15,12 +15,12 @@
 
 use crate::errors::McError;
 
-use super::connection::{ConnectionActor, ConnectionActorHandle};
 use super::messages::{
     JoinResult, LeaveReason, MeetingMessage, MeetingState, ParticipantInfo, ParticipantStateUpdate,
     ParticipantStatus, ReconnectResult, SignalingPayload,
 };
 use super::metrics::{ActorMetrics, ActorType, ControllerMetrics, MailboxMonitor};
+use super::participant::{ParticipantActor, ParticipantActorHandle};
 use super::session::{SessionBindingManager, StoredBinding};
 
 use common::secret::SecretBox;
@@ -40,7 +40,7 @@ const MEETING_CHANNEL_BUFFER: usize = 500;
 const DISCONNECT_GRACE_PERIOD: Duration = Duration::from_secs(30);
 
 /// Handle to a `MeetingActor`.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct MeetingActorHandle {
     sender: mpsc::Sender<MeetingMessage>,
     cancel_token: CancellationToken,
@@ -68,6 +68,7 @@ impl MeetingActorHandle {
         user_id: String,
         participant_id: String,
         is_host: bool,
+        stream_tx: Option<tokio::sync::mpsc::Sender<bytes::Bytes>>,
     ) -> Result<JoinResult, McError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.sender
@@ -76,6 +77,7 @@ impl MeetingActorHandle {
                 user_id,
                 participant_id,
                 is_host,
+                stream_tx,
                 respond_to: tx,
             })
             .await
@@ -249,8 +251,8 @@ struct Participant {
     display_name: String,
     /// Correlation ID for reconnection.
     correlation_id: String,
-    /// Current connection actor handle (if connected).
-    connection: Option<ConnectionActorHandle>,
+    /// Current participant actor handle (if connected).
+    connection: Option<ParticipantActorHandle>,
     /// Connection status.
     status: ParticipantStatus,
     /// Timestamp when disconnected (for grace period).
@@ -284,9 +286,9 @@ impl Participant {
 
 /// Managed connection state.
 struct ManagedConnection {
-    /// Handle to the connection actor.
-    #[allow(dead_code)] // Will be used in Phase 6g for signaling
-    handle: ConnectionActorHandle,
+    /// Handle to the participant actor.
+    #[allow(dead_code)] // Used for signaling
+    handle: ParticipantActorHandle,
     /// Join handle for monitoring.
     task_handle: JoinHandle<()>,
     /// Associated participant ID.
@@ -323,6 +325,8 @@ pub struct MeetingActor {
     controller_metrics: Arc<ControllerMetrics>,
     /// Mailbox monitor.
     mailbox: MailboxMonitor,
+    /// Handle to self, for passing to child ParticipantActors.
+    self_handle: MeetingActorHandle,
 }
 
 impl MeetingActor {
@@ -347,10 +351,17 @@ impl MeetingActor {
     ) -> (MeetingActorHandle, JoinHandle<()>) {
         let (sender, receiver) = mpsc::channel(MEETING_CHANNEL_BUFFER);
 
+        // Build the handle first so we can give the actor a clone of it
+        let handle = MeetingActorHandle {
+            sender,
+            cancel_token: cancel_token.clone(),
+            meeting_id: meeting_id.clone(),
+        };
+
         let actor = Self {
             meeting_id: meeting_id.clone(),
             receiver,
-            cancel_token: cancel_token.clone(),
+            cancel_token,
             participants: HashMap::new(),
             connections: HashMap::new(),
             correlation_to_participant: HashMap::new(),
@@ -362,15 +373,10 @@ impl MeetingActor {
             metrics,
             controller_metrics,
             mailbox: MailboxMonitor::new(ActorType::Meeting, &meeting_id),
+            self_handle: handle.clone(),
         };
 
         let task_handle = tokio::spawn(actor.run());
-
-        let handle = MeetingActorHandle {
-            sender,
-            cancel_token,
-            meeting_id,
-        };
 
         (handle, task_handle)
     }
@@ -447,10 +453,11 @@ impl MeetingActor {
                 user_id,
                 participant_id,
                 is_host,
+                stream_tx,
                 respond_to,
             } => {
                 let result = self
-                    .handle_join(connection_id, user_id, participant_id, is_host)
+                    .handle_join(connection_id, user_id, participant_id, is_host, stream_tx)
                     .await;
                 let _ = respond_to.send(result);
             }
@@ -536,6 +543,7 @@ impl MeetingActor {
         user_id: String,
         participant_id: String,
         is_host: bool,
+        stream_tx: Option<tokio::sync::mpsc::Sender<bytes::Bytes>>,
     ) -> Result<JoinResult, McError> {
         if self.is_shutting_down {
             return Err(McError::Draining);
@@ -570,14 +578,16 @@ impl MeetingActor {
         self.stored_bindings
             .insert(correlation_id.clone(), stored_binding);
 
-        // Create connection actor
+        // Create participant actor with stream + meeting handle for disconnect notification
         let connection_token = self.cancel_token.child_token();
-        let (conn_handle, conn_task) = ConnectionActor::spawn(
+        let (conn_handle, conn_task) = ParticipantActor::spawn_inner(
             connection_id.clone(),
             participant_id.clone(),
             self.meeting_id.clone(),
             connection_token,
             Arc::clone(&self.metrics),
+            stream_tx,
+            Some(self.self_handle.clone()),
         );
 
         // Store connection
@@ -592,6 +602,7 @@ impl MeetingActor {
 
         // Create participant (MINOR-003: use generic display name, not derived from user_id)
         let display_name = format!("Participant {}", self.participants.len() + 1);
+        let conn_handle_for_result = conn_handle.clone();
         let participant = Participant {
             participant_id: participant_id.clone(),
             user_id: user_id.clone(),
@@ -644,6 +655,7 @@ impl MeetingActor {
             binding_token,
             participants,
             fencing_generation: self.fencing_generation,
+            participant_handle: conn_handle_for_result,
         })
     }
 
@@ -760,14 +772,15 @@ impl MeetingActor {
             "Participant reconnecting"
         );
 
-        // Create new connection actor
+        // Create new participant actor with meeting handle for disconnect notification
         let connection_token = self.cancel_token.child_token();
-        let (conn_handle, conn_task) = ConnectionActor::spawn(
+        let (conn_handle, conn_task) = ParticipantActor::spawn_with_meeting(
             connection_id.clone(),
             participant_id.clone(),
             self.meeting_id.clone(),
             connection_token,
             Arc::clone(&self.metrics),
+            self.self_handle.clone(),
         );
 
         // Store new connection
@@ -1150,7 +1163,7 @@ impl MeetingActor {
                                 error = ?join_error,
                                 "Connection actor panicked"
                             );
-                            self.metrics.record_panic(ActorType::Connection);
+                            self.metrics.record_panic(ActorType::Participant);
                         }
                     }
                 }
@@ -1280,6 +1293,7 @@ mod tests {
                 "user-1".to_string(),
                 "part-1".to_string(),
                 false, // not host
+                None,
             )
             .await;
 
@@ -1313,6 +1327,7 @@ mod tests {
                 "user-1".to_string(),
                 "part-1".to_string(),
                 false,
+                None,
             )
             .await;
         assert!(result.is_ok());
@@ -1323,6 +1338,7 @@ mod tests {
                 "user-1".to_string(),
                 "part-1".to_string(),
                 false,
+                None,
             )
             .await;
         assert!(matches!(result, Err(McError::Conflict(_))));
@@ -1351,6 +1367,7 @@ mod tests {
                 "user-1".to_string(),
                 "part-1".to_string(),
                 false,
+                None,
             )
             .await;
 
@@ -1385,6 +1402,7 @@ mod tests {
                 "user-1".to_string(),
                 "part-1".to_string(),
                 false,
+                None,
             )
             .await;
 
@@ -1420,6 +1438,7 @@ mod tests {
                 "user-1".to_string(),
                 "part-1".to_string(),
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -1471,6 +1490,7 @@ mod tests {
                 "user-1".to_string(),
                 "part-1".to_string(),
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -1521,6 +1541,7 @@ mod tests {
                 "user-1".to_string(),
                 "part-1".to_string(),
                 false,
+                None,
             )
             .await;
 
@@ -1564,6 +1585,7 @@ mod tests {
                 "user-1".to_string(),
                 "part-1".to_string(),
                 true, // host
+                None,
             )
             .await;
         let _ = handle
@@ -1572,6 +1594,7 @@ mod tests {
                 "user-2".to_string(),
                 "part-2".to_string(),
                 false, // not host
+                None,
             )
             .await;
 
@@ -1615,6 +1638,7 @@ mod tests {
                 "user-1".to_string(),
                 "part-1".to_string(),
                 false, // not host
+                None,
             )
             .await;
         let _ = handle
@@ -1623,6 +1647,7 @@ mod tests {
                 "user-2".to_string(),
                 "part-2".to_string(),
                 false, // not host
+                None,
             )
             .await;
 
@@ -1683,6 +1708,7 @@ mod tests {
                 "user-1".to_string(),
                 "part-1".to_string(),
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -1762,6 +1788,7 @@ mod tests {
                 "user-1".to_string(),
                 "part-1".to_string(),
                 false,
+                None,
             )
             .await
             .unwrap();

@@ -43,6 +43,12 @@
 - MC JWKS config (scheme-validated URL) → `crates/mc-service/src/config.rs:ac_jwks_url`
 - MC gRPC auth interceptor (service tokens, separate from meeting tokens) → `crates/mc-service/src/grpc/auth_interceptor.rs`
 - MC session binding actors → `crates/mc-service/src/actors/session.rs`
+- MC WebTransport connection handler (join flow, JWT gate, framing) → `crates/mc-service/src/webtransport/connection.rs:handle_connection()`
+- MC WebTransport accept loop (capacity bound, TLS termination) → `crates/mc-service/src/webtransport/server.rs:WebTransportServer`
+- MC WebTransport signaling encoding → `crates/mc-service/src/webtransport/handler.rs:encode_participant_update()`
+- MC ParticipantActor (per-participant, disconnect notification) → `crates/mc-service/src/actors/participant.rs:ParticipantActor`
+- MC MeetingActor join + binding token generation → `crates/mc-service/src/actors/meeting.rs:handle_join()`
+- MC JoinConnection routing (controller → meeting) → `crates/mc-service/src/actors/controller.rs:JoinConnection` handler
 
 ## TLS & Certificates
 - Dev cert generation (ECDSA P-256 CA) → `scripts/generate-dev-certs.sh`

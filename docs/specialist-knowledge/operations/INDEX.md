@@ -20,6 +20,8 @@
 - Alert rules → `infra/docker/prometheus/rules/{gc,mc}-alerts.yaml`
 - Dev certs (CA + service TLS), master key, service registration → `scripts/generate-dev-certs.sh`, `generate-master-key.sh`, `register-service.sh`
 - MC TLS secret + volume mount → `infra/services/mc-service/tls-secret.yaml`, `deployment.yaml` (volume `mc-tls` at `/etc/mc-tls`)
+- MC WebTransport UDP NodePort + Kind mapping → `infra/services/mc-service/service.yaml` (30433), `infra/kind/kind-config.yaml` (hostPort 4433)
+- MC NetworkPolicy (UDP 4433 ingress) → `infra/services/mc-service/network-policy.yaml`
 
 ## Runbooks
 - GC incident response (Scenarios 1-9) → `docs/runbooks/gc-incident-response.md`
@@ -35,16 +37,12 @@
 - Meeting activation (scheduled→active) → `crates/gc-service/src/repositories/meetings.rs:activate_meeting()`
 - Audit event logging + updated_at trigger → `crates/gc-service/src/repositories/meetings.rs:log_audit_event()`
 
-## Code Locations — Auth & JWT (common crate)
-- JWKS client, JWT validator, verify_token → `crates/common/src/jwt.rs:JwksClient`, `JwtValidator`, `verify_token()`
-- JWK/JwksResponse types → `crates/common/src/jwt.rs:Jwk`, `JwksResponse`
-- JwtError (unified error type) → `crates/common/src/jwt.rs:JwtError`
-- Meeting/Guest token claims + validation → `crates/common/src/jwt.rs:MeetingTokenClaims`, `GuestTokenClaims::validate()`
-- GC thin wrapper (JwtError→GcError mapping) → `crates/gc-service/src/auth/jwt.rs:JwtValidator`
-- GC JwtError→GcError conversion → `crates/gc-service/src/errors.rs:GcError`
-- MC thin wrapper (JwtError→McError mapping) → `crates/mc-service/src/auth/mod.rs:McJwtValidator`
-- MC JwtError→McError conversion → `crates/mc-service/src/errors.rs:McError`
+## Code Locations — Auth & JWT
+- Common: JWKS client, JWT validator, claims types, JwtError → `crates/common/src/jwt.rs`
+- GC thin wrapper (JwtError→GcError) → `crates/gc-service/src/auth/jwt.rs`, `crates/gc-service/src/errors.rs`
+- MC thin wrapper (JwtError→McError) → `crates/mc-service/src/auth/mod.rs`, `crates/mc-service/src/errors.rs`
 - MC JWKS config (`AC_JWKS_URL`, required) → `crates/mc-service/src/config.rs:ac_jwks_url`
+- MC TLS config (`MC_TLS_CERT_PATH`, `MC_TLS_KEY_PATH`, required + file-exists) → `crates/mc-service/src/config.rs:tls_cert_path`
 - Service auth design → ADR-0003
 
 ## Code Locations — Observability
@@ -52,7 +50,21 @@
 - GC metrics catalog → `docs/observability/metrics/gc-service.md`
 - GC meeting join metrics → `crates/gc-service/src/observability/metrics.rs:record_meeting_join()`
 - GC overview dashboard → `infra/grafana/dashboards/gc-overview.json`
-- MC health probes (Phase 6h) → `infra/services/mc-service/deployment.yaml:109`
+- MC health probes (Phase 6h, commented out) → `infra/services/mc-service/deployment.yaml:120`
+
+## Code Locations — MC WebTransport Server
+- WebTransport server (bind, accept_loop, max_connections guard) → `crates/mc-service/src/webtransport/server.rs`
+- WebTransport connection handler (join flow, bridge loop) → `crates/mc-service/src/webtransport/connection.rs`
+- Protobuf encoding utilities (encode_participant_update) → `crates/mc-service/src/webtransport/handler.rs`
+- MC startup: WebTransport bind-before-spawn → `crates/mc-service/src/main.rs:350`
+- MC startup: shutdown token chain → `crates/mc-service/src/main.rs:237` (child of controller)
+
+## Code Locations — MC Actor System
+- Controller actor (root, capacity, join_connection) → `crates/mc-service/src/actors/controller.rs`
+- Meeting actor (participants, grace period, child tokens for participants) → `crates/mc-service/src/actors/meeting.rs`
+- Participant actor (per-participant, stream_tx, meeting disconnect notify) → `crates/mc-service/src/actors/participant.rs`
+- Actor metrics + mailbox monitoring → `crates/mc-service/src/actors/metrics.rs`
+- Session binding tokens → `crates/mc-service/src/actors/session.rs`
 
 ## Code Locations — GC Routes & Handlers
 - GC route definitions (public, user-auth, service-auth) → `crates/gc-service/src/routes/mod.rs`

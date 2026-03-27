@@ -107,6 +107,14 @@ pub struct Config {
     /// URL to Auth Controller's JWKS endpoint for meeting token validation.
     /// Required environment variable: `AC_JWKS_URL`.
     pub ac_jwks_url: String,
+
+    /// Path to TLS certificate file (PEM) for WebTransport server.
+    /// Required environment variable: `MC_TLS_CERT_PATH`.
+    pub tls_cert_path: String,
+
+    /// Path to TLS private key file (PEM) for WebTransport server.
+    /// Required environment variable: `MC_TLS_KEY_PATH`.
+    pub tls_key_path: String,
 }
 
 /// Custom Debug implementation that redacts sensitive fields.
@@ -137,6 +145,8 @@ impl fmt::Debug for Config {
             .field("client_id", &self.client_id)
             .field("client_secret", &"[REDACTED]")
             .field("ac_jwks_url", &self.ac_jwks_url)
+            .field("tls_cert_path", &self.tls_cert_path)
+            .field("tls_key_path", &self.tls_key_path)
             .finish()
     }
 }
@@ -197,6 +207,28 @@ impl Config {
             return Err(ConfigError::InvalidValue(
                 "AC_JWKS_URL must start with http:// or https://".to_string(),
             ));
+        }
+
+        let tls_cert_path = vars
+            .get("MC_TLS_CERT_PATH")
+            .ok_or_else(|| ConfigError::MissingEnvVar("MC_TLS_CERT_PATH".to_string()))?
+            .clone();
+
+        let tls_key_path = vars
+            .get("MC_TLS_KEY_PATH")
+            .ok_or_else(|| ConfigError::MissingEnvVar("MC_TLS_KEY_PATH".to_string()))?
+            .clone();
+
+        // Validate TLS cert and key files exist at startup (fail-fast)
+        if !std::path::Path::new(&tls_cert_path).exists() {
+            return Err(ConfigError::InvalidValue(format!(
+                "MC_TLS_CERT_PATH file does not exist: {tls_cert_path}"
+            )));
+        }
+        if !std::path::Path::new(&tls_key_path).exists() {
+            return Err(ConfigError::InvalidValue(format!(
+                "MC_TLS_KEY_PATH file does not exist: {tls_key_path}"
+            )));
         }
 
         let webtransport_bind_address = vars
@@ -283,6 +315,8 @@ impl Config {
             client_id,
             client_secret,
             ac_jwks_url,
+            tls_cert_path,
+            tls_key_path,
         })
     }
 }
@@ -316,6 +350,8 @@ mod tests {
                 "AC_JWKS_URL".to_string(),
                 "https://ac.example.com/.well-known/jwks.json".to_string(),
             ),
+            ("MC_TLS_CERT_PATH".to_string(), "/dev/null".to_string()),
+            ("MC_TLS_KEY_PATH".to_string(), "/dev/null".to_string()),
         ])
     }
 
@@ -513,5 +549,60 @@ mod tests {
             config.ac_jwks_url,
             "http://localhost:8082/.well-known/jwks.json"
         );
+    }
+
+    #[test]
+    fn test_from_vars_missing_tls_cert_path() {
+        let mut vars = base_vars();
+        vars.remove("MC_TLS_CERT_PATH");
+
+        let result = Config::from_vars(&vars);
+        assert!(matches!(result, Err(ConfigError::MissingEnvVar(v)) if v == "MC_TLS_CERT_PATH"));
+    }
+
+    #[test]
+    fn test_from_vars_missing_tls_key_path() {
+        let mut vars = base_vars();
+        vars.remove("MC_TLS_KEY_PATH");
+
+        let result = Config::from_vars(&vars);
+        assert!(matches!(result, Err(ConfigError::MissingEnvVar(v)) if v == "MC_TLS_KEY_PATH"));
+    }
+
+    #[test]
+    fn test_from_vars_tls_cert_path_nonexistent() {
+        let mut vars = base_vars();
+        vars.insert(
+            "MC_TLS_CERT_PATH".to_string(),
+            "/nonexistent/cert.pem".to_string(),
+        );
+
+        let result = Config::from_vars(&vars);
+        assert!(
+            matches!(result, Err(ConfigError::InvalidValue(msg)) if msg.contains("does not exist"))
+        );
+    }
+
+    #[test]
+    fn test_from_vars_tls_key_path_nonexistent() {
+        let mut vars = base_vars();
+        vars.insert(
+            "MC_TLS_KEY_PATH".to_string(),
+            "/nonexistent/key.pem".to_string(),
+        );
+
+        let result = Config::from_vars(&vars);
+        assert!(
+            matches!(result, Err(ConfigError::InvalidValue(msg)) if msg.contains("does not exist"))
+        );
+    }
+
+    #[test]
+    fn test_tls_config_loaded_correctly() {
+        let vars = base_vars();
+        let config = Config::from_vars(&vars).expect("Config should load successfully");
+
+        assert_eq!(config.tls_cert_path, "/dev/null");
+        assert_eq!(config.tls_key_path, "/dev/null");
     }
 }
