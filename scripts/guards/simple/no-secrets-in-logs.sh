@@ -32,8 +32,32 @@ check_nightly_required
 init_violations
 start_timer
 
+DIFF_BASE=$(get_diff_base)
+
 print_header "Guard: No Secrets in Logs
-Path: $SEARCH_PATH"
+Path: $SEARCH_PATH
+Diff base: $DIFF_BASE (only changed files are checked)"
+
+# Get changed Rust files only
+CHANGED_FILES=$(get_all_changed_files "$SEARCH_PATH" ".rs")
+
+if [[ -z "$CHANGED_FILES" ]]; then
+    echo -e "${GREEN}No Rust files changed compared to ${DIFF_BASE}${NC}"
+    print_elapsed_time
+    exit 0
+fi
+
+# Build file list (only existing files)
+FILE_LIST=""
+for f in $CHANGED_FILES; do
+    [[ -f "$f" ]] && [[ "$f" != vendor/* ]] && FILE_LIST="$FILE_LIST $f"
+done
+
+if [[ -z "$FILE_LIST" ]]; then
+    echo -e "${GREEN}No existing Rust files to check${NC}"
+    print_elapsed_time
+    exit 0
+fi
 
 # -----------------------------------------------------------------------------
 # Check 1: #[instrument] without skip for secret parameters
@@ -41,7 +65,7 @@ Path: $SEARCH_PATH"
 print_section "Check 1: #[instrument] without skip for secret parameters"
 
 # Find functions with #[instrument] that have secret-sounding parameters
-instrument_violations=$(grep -rn --include="*.rs" -B 3 'fn\s\+\w\+.*\b\(password\|secret\|token\|key\|credential\)\b.*\s*)' "$SEARCH_PATH" 2>/dev/null | \
+instrument_violations=$(grep -n -B 3 'fn\s\+\w\+.*\b\(password\|secret\|token\|key\|credential\)\b.*\s*)' $FILE_LIST 2>/dev/null | \
     grep -B 3 'fn\s' | \
     grep '#\[instrument' | \
     grep -v 'skip.*password\|skip.*secret\|skip.*token\|skip.*key\|skip.*credential\|skip_all' | \
@@ -65,7 +89,7 @@ fi
 print_section "Check 2: Secret variables in log macros"
 
 # Look for info!, debug!, warn!, error!, trace! containing secret patterns
-log_violations=$(grep -rn --include="*.rs" -E '\b(info|debug|warn|error|trace)!\s*\(' "$SEARCH_PATH" 2>/dev/null | \
+log_violations=$(grep -n -E '\b(info|debug|warn|error|trace)!\s*\(' $FILE_LIST 2>/dev/null | \
     grep -Ei "\{[^}]*(${SECRET_PATTERNS})[^}]*\}|\%\s*(${SECRET_PATTERNS})\b|,\s*(${SECRET_PATTERNS})\s*[,\)]" | \
     grep -v '//.*\|REDACTED\|\[REDACTED\]\|skip(' | \
     filter_test_code || true)
@@ -88,7 +112,7 @@ fi
 print_section "Check 3: expose_secret() in log macros"
 
 # expose_secret() is a specific function that unwraps SecretString - logging its result defeats the protection
-expose_violations=$(grep -rn --include="*.rs" -E '\b(info|debug|warn|error|trace)!\s*\(' "$SEARCH_PATH" 2>/dev/null | \
+expose_violations=$(grep -n -E '\b(info|debug|warn|error|trace)!\s*\(' $FILE_LIST 2>/dev/null | \
     grep 'expose_secret\s*(' | \
     grep -v '//.*' | \
     filter_test_code || true)
@@ -113,7 +137,7 @@ fi
 print_section "Check 4: Named tracing fields with secret names"
 
 # Look for patterns like: password = %, token = ?, secret =
-named_field_violations=$(grep -rn --include="*.rs" -E "tracing::(info|debug|warn|error|trace)!\s*\(" "$SEARCH_PATH" 2>/dev/null | \
+named_field_violations=$(grep -n -E "tracing::(info|debug|warn|error|trace)!\s*\(" $FILE_LIST 2>/dev/null | \
     grep -Ei "(${SECRET_PATTERNS})\s*=\s*[%?]" | \
     grep -v 'REDACTED\|\[REDACTED\]\|skip(' | \
     filter_test_code || true)
@@ -136,7 +160,7 @@ fi
 print_section "Check 5: Secrets in error messages"
 
 # Look for Err(), anyhow!(), bail!() containing secret variables
-error_violations=$(grep -rn --include="*.rs" -E '(Err\(|anyhow!|bail!|context\()' "$SEARCH_PATH" 2>/dev/null | \
+error_violations=$(grep -n -E '(Err\(|anyhow!|bail!|context\()' $FILE_LIST 2>/dev/null | \
     grep -Ei "\{[^}]*(${SECRET_PATTERNS})[^}]*\}" | \
     grep -v '//.*\|REDACTED' | \
     filter_test_code || true)
@@ -159,7 +183,7 @@ fi
 print_section "Check 6: Debug formatting with {:?} on request/response objects"
 
 # This is a heuristic - flag {:?} on common struct names that often contain secrets
-debug_violations=$(grep -rn --include="*.rs" -E '\{:\?\}.*\b(request|req|response|res|body|payload|credentials|auth|login)\b|\b(request|req|response|res|body|payload|credentials|auth|login)\b.*\{:\?\}' "$SEARCH_PATH" 2>/dev/null | \
+debug_violations=$(grep -n -E '\{:\?\}.*\b(request|req|response|res|body|payload|credentials|auth|login)\b|\b(request|req|response|res|body|payload|credentials|auth|login)\b.*\{:\?\}' $FILE_LIST 2>/dev/null | \
     grep -v '//.*\|#\[derive' | \
     filter_test_code || true)
 
