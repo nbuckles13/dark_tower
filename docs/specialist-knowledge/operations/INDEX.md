@@ -44,7 +44,7 @@
 - GC JwtError→GcError conversion → `crates/gc-service/src/errors.rs:GcError`
 - MC thin wrapper (JwtError→McError mapping) → `crates/mc-service/src/auth/mod.rs:McJwtValidator`
 - MC JwtError→McError conversion → `crates/mc-service/src/errors.rs:McError`
-- MC JWKS config (`AC_JWKS_URL`, defaults from `AC_ENDPOINT`) → `crates/mc-service/src/config.rs:ac_jwks_url`
+- MC JWKS config (`AC_JWKS_URL`, required) → `crates/mc-service/src/config.rs:ac_jwks_url`
 - Service auth design → ADR-0003
 
 ## Code Locations — Observability
