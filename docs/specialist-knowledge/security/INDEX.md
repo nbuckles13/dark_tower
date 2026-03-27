@@ -37,6 +37,8 @@
 - MC join flow metrics (bounded labels, no PII) → `crates/mc-service/src/observability/metrics.rs:record_session_join()`, `record_jwt_validation()`, `record_webtransport_connection()`
 - MC error_type_label (static str from enum, not error messages) → `crates/mc-service/src/errors.rs:error_type_label()`
 - MC metrics catalog (cardinality bounds) → `docs/observability/metrics/mc-service.md`
+- GC join dashboard panels (PII-free queries, bounded labels) → `infra/grafana/dashboards/gc-overview.json` panels 35-38
+- GC join alert rules (no PII in annotations) → `infra/docker/prometheus/rules/gc-alerts.yaml:GCHighJoinFailureRate`, `GCHighJoinLatency`
 - MC join flow dashboard panels → `infra/grafana/dashboards/mc-overview.json`
 - GC atomic org limit CTE → `crates/gc-service/src/repositories/meetings.rs:create_meeting_with_limit_check()`
 - GC meeting activation + audit logging → `crates/gc-service/src/repositories/meetings.rs:activate_meeting()`, `log_audit_event()`

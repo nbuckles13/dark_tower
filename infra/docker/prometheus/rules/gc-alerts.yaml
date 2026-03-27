@@ -3,6 +3,7 @@
 # Severity levels:
 # - critical: Page on-call immediately, service degradation or outage
 # - warning: Notify but don't page, investigate during business hours
+# - info: Log only, no notification, trend analysis
 #
 # All alerts link to sections in the consolidated incident response runbook:
 # docs/runbooks/gc-incident-response.md
@@ -288,4 +289,47 @@ groups:
           summary: "Meeting creation p95 latency high ({{ $value }}s > 500ms)"
           description: "Meeting creation p95 latency is {{ $value }}s, exceeding 500ms threshold for 5 minutes. This may indicate slow database queries or code generation issues. Note: 500ms threshold is higher than the 200ms aggregate HTTP SLO because meeting creation involves DB writes, CSPRNG code generation, and atomic limit-check CTE. The aggregate GCHighLatency alert covers SLO violations."
           impact: "Slow meeting creation experience. Investigate database and handler performance."
+          runbook_url: "https://github.com/yourorg/dark_tower/blob/main/docs/runbooks/gc-incident-response.md#scenario-2-high-latency--slow-responses"
+
+      - alert: GCHighJoinFailureRate
+        expr: |
+          (
+            sum(rate(gc_meeting_join_total{status="error"}[5m]))
+            /
+            sum(rate(gc_meeting_join_total[5m]))
+          ) > 0.05
+          and
+          sum(rate(gc_meeting_join_total[5m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+          service: gc-service
+          component: meeting-join
+        annotations:
+          summary: "Meeting join failure rate high ({{ $value | humanizePercentage }})"
+          description: "Meeting join failure rate is {{ $value | humanizePercentage }} for 5 minutes. Check 'Meeting Join Failures by Type' dashboard panel to determine root cause. mc_assignment errors → Scenario 3 (MC assignment), ac_request errors → check AC service health (Scenario 7), not_found errors → check meeting lookup and database."
+          impact: "Some users unable to join meetings. Investigate error types in dashboard."
+          runbook_url: "https://github.com/yourorg/dark_tower/blob/main/docs/runbooks/gc-incident-response.md#scenario-3-mc-assignment-failures"
+
+  - name: gc-service-info
+    interval: 60s
+    rules:
+      # ====================================================================
+      # INFO ALERTS - Log only, no notification
+      # ====================================================================
+
+      - alert: GCHighJoinLatency
+        expr: |
+          histogram_quantile(0.95,
+            sum by(le) (rate(gc_meeting_join_duration_seconds_bucket[5m]))
+          ) > 2.0
+        for: 5m
+        labels:
+          severity: info
+          service: gc-service
+          component: meeting-join
+        annotations:
+          summary: "Meeting join p95 latency high ({{ $value }}s > 2s)"
+          description: "Meeting join p95 latency is {{ $value }}s, exceeding 2s threshold for 5 minutes. This may indicate slow MC assignment or AC token request paths. Note: info severity because the aggregate GCHighLatency alert (200ms p95) covers SLO violations; this alert tracks join-specific degradation for observability."
+          impact: "Slow meeting join experience. Investigate MC assignment and AC token request latency."
           runbook_url: "https://github.com/yourorg/dark_tower/blob/main/docs/runbooks/gc-incident-response.md#scenario-2-high-latency--slow-responses"

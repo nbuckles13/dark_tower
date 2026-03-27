@@ -14,11 +14,7 @@
 - MC metrics catalog → `docs/observability/metrics/mc-service.md`
 
 ## Cross-Service Boundary Files
-- Shared JWT types (ServiceClaims, UserClaims, MeetingTokenClaims, GuestTokenClaims) → `crates/common/src/jwt.rs`
-- Meeting token enums & guest validation → `crates/common/src/jwt.rs:ParticipantType`, `MeetingRole`, `GuestTokenClaims::validate()`
-- Common JWKS client & JWT validator → `crates/common/src/jwt.rs:JwksClient`, `JwtValidator`, `verify_token()`
-- JwtError enum (7 variants) → `crates/common/src/jwt.rs:JwtError`
-- HasIat trait (compile-time iat enforcement) → `crates/common/src/jwt.rs:HasIat`
+- Common JWT (types, JWKS, validator, errors, HasIat) → `crates/common/src/jwt.rs`
 - Token refresh → `crates/common/src/token_manager.rs`
 - GC error types & JwtError mapping → `crates/gc-service/src/errors.rs`
 - MC error types & JwtError mapping → `crates/mc-service/src/errors.rs`
@@ -57,19 +53,22 @@
 - Meeting models → `crates/gc-service/src/models/mod.rs:CreateMeetingRequest`, `Participant`
 
 ## GC Metrics & Observability
-- Meeting creation metrics → `crates/gc-service/src/observability/metrics.rs:record_meeting_creation()`
-- Meeting join metrics → `crates/gc-service/src/observability/metrics.rs:record_meeting_join()`
 - GC metrics impl → `crates/gc-service/src/observability/metrics.rs`
-- GC alert rules → `infra/docker/prometheus/rules/gc-alerts.yaml`
+- GC dashboard (join gauge panel 38, join rate/latency/failures) → `infra/grafana/dashboards/gc-overview.json`
+- GC alerts (critical/warning/info tiers) → `infra/docker/prometheus/rules/gc-alerts.yaml`
+- Join alerts: `GCHighJoinFailureRate` (warning), `GCHighJoinLatency` (info)
+- GC metrics catalog (dashboard/alert cross-refs) → `docs/observability/metrics/gc-service.md`
 
 ## MC Metrics & Observability
 - MC metrics impl → `crates/mc-service/src/observability/metrics.rs`
-- WebTransport connection counter → `crates/mc-service/src/observability/metrics.rs:record_webtransport_connection()`
-- JWT validation counter → `crates/mc-service/src/observability/metrics.rs:record_jwt_validation()`
-- Session join counter + histogram → `crates/mc-service/src/observability/metrics.rs:record_session_join()`
 - MC alert rules → `infra/docker/prometheus/rules/mc-alerts.yaml`
+- MC dashboard (overview) → `infra/grafana/dashboards/mc-overview.json`
+
+## Observability Docs
+- Alerts documentation → `docs/observability/alerts.md`
+- Dashboards documentation → `docs/observability/dashboards.md`
 
 ## GC Runbooks
+- Incident response: MC assignment failures → `docs/runbooks/gc-incident-response.md` (Scenario 3)
 - Incident response: limit exhaustion → `docs/runbooks/gc-incident-response.md` (Scenario 8)
-- Incident response: code collision → `docs/runbooks/gc-incident-response.md` (Scenario 9)
-- Deployment checklist → `docs/runbooks/gc-deployment.md` (Test 6, Post-Deploy Monitoring)
+- Deployment checklist → `docs/runbooks/gc-deployment.md`
