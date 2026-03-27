@@ -290,7 +290,7 @@ Task 1 also starts immediately; task 7 waits for task 1
 | 3 | Implement meeting activation + audit logging | docs/devloop-outputs/2026-03-21-meeting-activation | 15e7b15 | Completed |
 | 4 | Fix GC join auth + add join metrics | docs/devloop-outputs/2026-03-23-gc-join-auth-metrics | 47bfb59 | Completed |
 | 5 | Infra: TLS certs + MC Secret + Kind UDP | docs/devloop-outputs/2026-03-23-infra-tls-udp | a09ce18 | Completed |
-| 6 | Infra: Enable MC health probes | | | Pending |
+| 6 | Infra: Enable MC health probes | docs/devloop-outputs/2026-03-26-mc-health-probes | a90e09c | Completed |
 | 7 | Extract JWKS client + JWT validation to common | docs/devloop-outputs/2026-03-26-jwks-extraction | 375be71 | Completed |
 | 8 | Convert GC auth to common JWKS/JWT | docs/devloop-outputs/2026-03-26-jwks-extraction | aa99fee | Completed (in task 7) |
 | 9 | MC JWT validation on common code | docs/devloop-outputs/2027-03-27-mc-jwt-validation | b3a4c8d | Completed |

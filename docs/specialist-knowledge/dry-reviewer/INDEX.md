@@ -47,6 +47,12 @@
 - GC shared helpers -> bearer token, map_row_to_meeting, audit logging, generic health checker
 - TestKeypair + JWKS mock to mc-test-utils (task 15) -> `crates/mc-test-utils/src/jwt_test.rs`
 
+## Health Endpoints (Cross-Service Consistency)
+- MC health routes -> `crates/mc-service/src/observability/health.rs:health_router()`
+- MC health probes (K8s) -> `infra/services/mc-service/deployment.yaml` (livenessProbe, readinessProbe)
+- GC health routes -> `crates/gc-service/src/routes/mod.rs:64-65`
+- GC health probes (K8s) -> `infra/services/gc-service/deployment.yaml` (livenessProbe, readinessProbe)
+
 ## False Positive Boundaries
 - Actor vs controller metrics (different consumers) -> `crates/mc-service/src/actors/metrics.rs`
 - Per-service error mapping (From<JwtError> for GcError vs McError) -> required, not duplication

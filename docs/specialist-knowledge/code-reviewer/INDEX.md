@@ -71,6 +71,12 @@
 - SecretString/SecretBox → `crates/common/src/secret.rs`
 - TokenManager → `crates/common/src/token_manager.rs:spawn_token_manager()`
 
+## Code Locations — MC Service
+- Health probes (liveness/readiness) → `crates/mc-service/src/observability/health.rs:health_router()`
+- MC K8s deployment (probes on port 8081) → `infra/services/mc-service/deployment.yaml`
+
 ## Infrastructure & Guards
+- Standard health endpoints (`/health`, `/ready`) → ADR-0012 (Section: Standard Operational Endpoints)
 - MC TLS + cert generation → `infra/services/mc-service/tls-secret.yaml`, `scripts/generate-dev-certs.sh`
+- GC K8s deployment (probe reference pattern) → `infra/services/gc-service/deployment.yaml`
 - Guard runner → `scripts/guards/run-guards.sh`; Review protocol → `.claude/skills/devloop/review-protocol.md`

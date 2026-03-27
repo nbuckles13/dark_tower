@@ -36,6 +36,12 @@
 - [x] **MC runbook missing join scenarios**: Added Scenario 8 (join failures), Scenario 9 (WebTransport rejections), and Scenario 10 (JWT validation failures) to `mc-incident-response.md`. Anchors match `mc-alerts.yaml` runbook_url references. Fixed in task 17.
 - [ ] **Cross-service status label inconsistency**: GC uses `status="error"` for failures (HTTP convention) while MC uses `status="failure"` (binary convention). Both are internally consistent. Standardize if/when a cross-service alerting layer is added.
 
+## Rate Limiting
+
+- [ ] **AC: Make rate limit constants env-configurable**: `crates/ac-service/src/services/token_service.rs` hardcodes `RATE_LIMIT_WINDOW_MINUTES=15` and `RATE_LIMIT_MAX_ATTEMPTS=5`. Add env vars (`AC_RATE_LIMIT_WINDOW_MINUTES`, `AC_RATE_LIMIT_MAX_ATTEMPTS`) with current values as defaults. Set relaxed values in Kind configmap for dev/test.
+- [ ] **GC: Wire up rate limiting middleware**: `crates/gc-service/src/config.rs` has `RATE_LIMIT_RPM` (default 100) and `GcError::RateLimitExceeded` exists, but no middleware enforces it. Add a tower rate limiting layer (e.g., governor) to routes, especially the public guest token endpoint (`/api/v1/meetings/{code}/guest-token`).
+- [ ] **MC: Evaluate rate limiting needs**: MC has no rate limiting. WebTransport connections are long-lived so per-request limiting is less relevant, but the gRPC endpoint from GC should have some protection against runaway reconnection storms.
+
 ## Code Quality
 
 - [ ] **dead_code lint cleanup**: Review `#[allow(dead_code)]` attributes across `crates/ac-service/src/` once more code paths are exercised by binaries

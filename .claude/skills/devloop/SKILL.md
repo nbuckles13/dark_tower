@@ -346,7 +346,7 @@ When implementer signals "Ready for validation", run the validation pipeline:
 | Layer | Command | What It Catches |
 |-------|---------|-----------------|
 | 1. Compile | `cargo check --workspace` | Type errors, sqlx compile-time failures |
-| 2. Format | `cargo fmt --all -- --check` | Style violations |
+| 2. Format | `cargo fmt --all` | Auto-fix style violations |
 | 3. Guards | `./scripts/guards/run-guards.sh` | Credential leaks, PII, instrument-skip-all, test-coverage, api-version-check |
 | 4. Tests | `./scripts/test.sh --workspace` | Regressions; ensures DB setup + migrations; report P0 security test count |
 | 5. Clippy | `cargo clippy --workspace -- -D warnings` | Lint warnings |
@@ -411,24 +411,6 @@ Track verdicts in main.md:
 - Full mode: proceed to reflection (Step 8)
 - Light mode: Skip to Step 9.
 
-### Step 8.5: Commit
-
-After reflection (full mode) or after review (light mode), stage and commit:
-
-1. `git add -A`
-2. Commit with message:
-   ```
-   {task description}
-
-   Devloop: {YYYY-MM-DD-slug}
-   Specialist: {specialist}
-   Mode: {full|light}
-   Verdicts: Security {verdict}, Test {verdict}, ...
-
-   Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
-   ```
-3. If nothing to commit, skip silently
-
 ### Step 8: Reflection [FULL MODE ONLY]
 
 Send the reflection instructions to each teammate individually (unicast, not broadcast):
@@ -455,6 +437,30 @@ Organize by architectural concept (not by feature or date). Max 75 lines.
 ```
 
 Allow 15 minutes for updates.
+
+After reflection, re-run the INDEX guard to catch any issues introduced:
+```bash
+./scripts/guards/simple/validate-knowledge-index.sh
+```
+If it fails, fix the INDEX files before proceeding.
+
+### Step 8.5: Commit
+
+After reflection (full mode) or after review (light mode), stage and commit:
+
+1. `git add -A`
+2. Commit with message:
+   ```
+   {task description}
+
+   Devloop: {YYYY-MM-DD-slug}
+   Specialist: {specialist}
+   Mode: {full|light}
+   Verdicts: Security {verdict}, Test {verdict}, ...
+
+   Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+   ```
+3. If nothing to commit, skip silently
 
 ### Step 8.9: Cleanup Team
 

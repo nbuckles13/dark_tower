@@ -27,6 +27,11 @@
 - CI pipeline -> `.github/workflows/ci.yml`
 - Fuzz nightly -> `.github/workflows/fuzz-nightly.yml`
 
+## Health Probes
+- MC health endpoints (liveness + readiness) -> `crates/mc-service/src/observability/health.rs:health_router()`
+- MC probe config (K8s deployment) -> `infra/services/mc-service/deployment.yaml` (livenessProbe / readinessProbe)
+- GC probe config (K8s deployment) -> `infra/services/gc-service/deployment.yaml` (livenessProbe / readinessProbe)
+
 ## Integration Seams
 - CanaryPod (NetworkPolicy testing) -> `crates/env-tests/src/canary.rs`
 - Cluster health env-tests -> `crates/env-tests/tests/00_cluster_health.rs`

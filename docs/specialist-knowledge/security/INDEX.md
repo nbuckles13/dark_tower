@@ -52,6 +52,11 @@
 - MC TLS Secret + volume mount (defaultMode 0400) → `infra/services/mc-service/tls-secret.yaml`, `deployment.yaml`
 - MC WebTransport UDP ingress + Kind mapping → `infra/services/mc-service/network-policy.yaml`, `infra/kind/kind-config.yaml`
 
+## Health & Probes
+- MC health state (liveness/readiness) → `crates/mc-service/src/observability/health.rs:health_router()`
+- MC K8s probes (`/health`, `/ready` on port 8081) → `infra/services/mc-service/deployment.yaml`
+- MC health port NetworkPolicy (Prometheus-only ingress) → `infra/services/mc-service/network-policy.yaml`
+
 ## Integration Seams
 - AC JWKS → common `JwksClient` → GC `JwtValidator` + MC `McJwtValidator` (meeting/guest tokens via WebTransport)
 - GC→MC gRPC service tokens → `crates/mc-service/src/grpc/auth_interceptor.rs` (separate from meeting token path)

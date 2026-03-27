@@ -55,10 +55,12 @@
 - MC alert rules (join: MCHighJoinFailureRate, MCHighWebTransportRejections, MCHighJwtValidationFailures, MCHighJoinLatency) -> `infra/docker/prometheus/rules/mc-alerts.yaml`
 - GC integration tests -> `crates/mc-service/tests/gc_integration.rs`
 - Heartbeat tests -> `crates/mc-service/tests/heartbeat_tasks.rs`
+- Health state & router tests -> `crates/mc-service/src/observability/health.rs:health_router()`
 - Mock Redis -> `crates/mc-test-utils/src/mock_redis.rs`
 - Mock GC server (gRPC seam) -> `crates/mc-test-utils/src/mock_gc.rs`
 
 ## Code Locations: Environment Tests
+- Cluster health smoke tests -> `crates/env-tests/tests/00_cluster_health.rs`
 - Cluster bootstrap (K8s seam, ClusterPorts with MC WebTransport) -> `crates/env-tests/src/cluster.rs`
 - GC client fixture -> `crates/env-tests/src/fixtures/gc_client.rs`
 - Auth client fixture -> `crates/env-tests/src/fixtures/auth_client.rs`
@@ -71,4 +73,7 @@
 - MC JwtError->McError mapping tests (all 7 variants) -> `crates/mc-service/src/errors.rs:tests::test_jwt_error_to_mc_error_*`
 
 ## Infrastructure & Shared
-- Dev cert generation + MC TLS manifests -> `scripts/generate-dev-certs.sh`, `infra/services/mc-service/tls-secret.yaml`
+- MC K8s health probes (liveness/readiness) → `infra/services/mc-service/deployment.yaml`
+- Dev cert generation + MC TLS manifests → `scripts/generate-dev-certs.sh`, `infra/services/mc-service/tls-secret.yaml`
+- Kind UDP mapping + setup integration → `infra/kind/kind-config.yaml`, `infra/kind/scripts/setup.sh:create_mc_tls_secret()`
+- JWT claims (UserClaims, MeetingTokenClaims, GuestTokenClaims) → `crates/common/src/jwt.rs`

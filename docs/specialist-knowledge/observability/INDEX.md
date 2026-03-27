@@ -73,4 +73,7 @@
 
 ## Integration Seams
 - Env-tests observability validation -> `crates/env-tests/tests/30_observability.rs`
-- MC infra (TLS mount, WebTransport UDP NodePort) -> `infra/services/mc-service/`, `infra/kind/kind-config.yaml`
+- Observability mod re-exports (stale export risk) -> `crates/*/src/observability/mod.rs`
+- MC K8s health probes (liveness + readiness on port 8081) -> `infra/services/mc-service/deployment.yaml`
+- MC TLS volume mount (affects health port availability) -> `infra/services/mc-service/deployment.yaml`
+- MC WebTransport UDP NodePort (Kind port mapping) -> `infra/kind/kind-config.yaml`, `infra/services/mc-service/service.yaml`
