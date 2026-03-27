@@ -16,13 +16,33 @@
 ## Cross-Service Boundary Files
 - Shared JWT types (ServiceClaims, UserClaims, MeetingTokenClaims, GuestTokenClaims) → `crates/common/src/jwt.rs`
 - Meeting token enums & guest validation → `crates/common/src/jwt.rs:ParticipantType`, `MeetingRole`, `GuestTokenClaims::validate()`
+- Common JWKS client & JWT validator → `crates/common/src/jwt.rs:JwksClient`, `JwtValidator`, `verify_token()`
+- JwtError enum (7 variants) → `crates/common/src/jwt.rs:JwtError`
+- HasIat trait (compile-time iat enforcement) → `crates/common/src/jwt.rs:HasIat`
 - Token refresh → `crates/common/src/token_manager.rs`
-- GC error types → `crates/gc-service/src/errors.rs`
-- MC error types → `crates/mc-service/src/errors.rs`
+- GC error types & JwtError mapping → `crates/gc-service/src/errors.rs`
+- MC error types & JwtError mapping → `crates/mc-service/src/errors.rs`
 
 ## Authentication Seams
-- GC JWT validation → `crates/gc-service/src/auth/jwt.rs:validate()`, `validate_user()`, `verify_token()`
+- GC JWT validation (thin wrapper) → `crates/gc-service/src/auth/jwt.rs:validate()`, `validate_user()`
+- GC JWKS re-export → `crates/gc-service/src/auth/jwks.rs`
 - GC auth middleware → `crates/gc-service/src/middleware/auth.rs:require_auth()`, `require_user_auth()`
+- MC JWT validation (thin wrapper) → `crates/mc-service/src/auth/mod.rs:McJwtValidator`
+- MC meeting token validation → `crates/mc-service/src/auth/mod.rs:validate_meeting_token()`, `validate_guest_token()`
+- MC JWKS config → `crates/mc-service/src/config.rs:ac_jwks_url`
+- MC WebTransport JWT check (pre-actor) → `crates/mc-service/src/webtransport/connection.rs:handle_connection()`
+
+## MC Actor Hierarchy
+- Controller actor (root supervisor) → `crates/mc-service/src/actors/controller.rs:MeetingControllerActor`
+- Meeting actor (per-meeting state) → `crates/mc-service/src/actors/meeting.rs:MeetingActor`
+- Participant actor (per-participant, disconnect notify) → `crates/mc-service/src/actors/participant.rs:ParticipantActor`
+- Actor messages (ControllerMessage, MeetingMessage, ParticipantMessage) → `crates/mc-service/src/actors/messages.rs`
+- Actor metrics (ActorType::Participant) → `crates/mc-service/src/actors/metrics.rs`
+
+## MC WebTransport Layer
+- Server (accept loop, TLS, capacity gate) → `crates/mc-service/src/webtransport/server.rs:WebTransportServer`
+- Connection handler (join flow, bridge loop) → `crates/mc-service/src/webtransport/connection.rs:handle_connection()`
+- Protobuf encoding utilities → `crates/mc-service/src/webtransport/handler.rs:encode_participant_update()`
 
 ## GC Meeting Handlers
 - Create/Join/Guest/Settings handlers → `crates/gc-service/src/handlers/meetings.rs`

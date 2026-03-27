@@ -258,6 +258,8 @@ fn test_config(gc_url: &str) -> Config {
         client_id: "mc-service".to_string(),
         client_secret: SecretString::from("test-client-secret"),
         ac_jwks_url: "https://ac.example.com/.well-known/jwks.json".to_string(),
+        tls_cert_path: "/dev/null".to_string(),
+        tls_key_path: "/dev/null".to_string(),
     }
 }
 

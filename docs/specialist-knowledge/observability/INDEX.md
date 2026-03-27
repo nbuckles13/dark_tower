@@ -28,6 +28,12 @@
 - MC auth wrapper (target: `mc.auth`, delegates to common) -> `crates/mc-service/src/auth/mod.rs:McJwtValidator`
 - PII-redacted claims Debug impls -> `crates/common/src/jwt.rs` (ServiceClaims, UserClaims, MeetingTokenClaims, GuestTokenClaims)
 
+## MC WebTransport Tracing
+- WebTransport server lifecycle (target: `mc.webtransport`) -> `crates/mc-service/src/webtransport/server.rs`
+- WebTransport connection handler (target: `mc.webtransport.connection`) -> `crates/mc-service/src/webtransport/connection.rs:handle_connection()`
+- Protobuf encoding utilities (target: `mc.webtransport.handler`) -> `crates/mc-service/src/webtransport/handler.rs:encode_participant_update()`
+- ParticipantActor tracing (target: `mc.actor.participant`) -> `crates/mc-service/src/actors/participant.rs:run()`
+
 ## Health
 - MC health state (liveness/readiness) -> `crates/mc-service/src/observability/health.rs:health_router()`
 

@@ -19,6 +19,13 @@
   - From<JwtError> for McError -> `crates/mc-service/src/errors.rs:213`
   - ServiceUnavailable maps to McError::Internal (MC has no ServiceUnavailable; uses signaling codes)
 
+## MC WebTransport Layer
+- WebTransport server (accept loop) -> `crates/mc-service/src/webtransport/server.rs`
+- Per-connection join flow + bridge loop + framing -> `crates/mc-service/src/webtransport/connection.rs`
+- Shared encoding utility (encode_participant_update) -> `crates/mc-service/src/webtransport/handler.rs`
+- ParticipantActor (renamed from ConnectionActor) -> `crates/mc-service/src/actors/participant.rs`
+  - Calls handler::encode_participant_update() (single impl, not copied) -> line 405
+
 ## Other Shared Code
 - Common crate modules -> `crates/common/src/lib.rs`
 - Token management (prevents static token dup) -> `crates/common/src/token_manager.rs`
@@ -49,6 +56,7 @@
 - GC repositories (shared row mappers) -> `crates/gc-service/src/repositories/`
 - GC dual auth middleware (service + user) -> `crates/gc-service/src/middleware/auth.rs`
 - JWT thin wrapper pattern (GC + MC) -> `crates/{gc,mc}-service/src/auth/`
+- encode_participant_update (shared across actor + webtransport layers) -> `crates/mc-service/src/webtransport/handler.rs`
 - NetworkPolicy + ServiceMonitor cross-refs -> `infra/services/{ac,gc,mc}-service/`
 - Metric names in runbooks must match code -> `docs/runbooks/gc-incident-response.md`
 - Dev cert generation (shared helper, single CA) -> `scripts/generate-dev-certs.sh`

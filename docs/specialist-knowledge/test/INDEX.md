@@ -39,7 +39,15 @@
 - Guest token validation (wiremock + Ed25519) -> `crates/mc-service/src/auth/mod.rs:tests::test_validate_guest_token_*`
 - Token confusion (bidirectional: meeting-as-guest, guest-as-meeting, wrong token_type) -> `crates/mc-service/src/auth/mod.rs:tests`
 - From<JwtError> for McError (7 variants, ServiceUnavailable->Internal) -> `crates/mc-service/src/errors.rs:tests::test_jwt_error_to_mc_error_*`
-- Config ac_jwks_url (default derivation, scheme validation) -> `crates/mc-service/src/config.rs:tests::test_ac_jwks_url_*`
+- Config ac_jwks_url (scheme validation) -> `crates/mc-service/src/config.rs:tests::test_ac_jwks_url_*`
+- Config TLS paths (fail-fast validation) -> `crates/mc-service/src/config.rs:tests::test_from_vars_*tls*`
+- Controller actor tests -> `crates/mc-service/src/actors/controller.rs:tests`
+- Meeting actor tests (join, leave, reconnect, mute, grace period) -> `crates/mc-service/src/actors/meeting.rs:tests`
+- ParticipantActor tests (spawn, send, ping, close, cancellation) -> `crates/mc-service/src/actors/participant.rs:tests`
+- ParticipantActor stream wiring tests (spawn_with_stream) -> `crates/mc-service/src/actors/participant.rs:tests::test_spawn_with_stream_*`
+- Session binding tests (HMAC, correlation ID, expiration) -> `crates/mc-service/src/actors/session.rs:tests`
+- WebTransport encoding tests (encode_participant_update) -> `crates/mc-service/src/webtransport/handler.rs:tests`
+- WebTransport connection tests (build_join_response) -> `crates/mc-service/src/webtransport/connection.rs:tests`
 - GC integration tests -> `crates/mc-service/tests/gc_integration.rs`
 - Heartbeat tests -> `crates/mc-service/tests/heartbeat_tasks.rs`
 - Mock Redis -> `crates/mc-test-utils/src/mock_redis.rs`
@@ -57,14 +65,10 @@
 - JWT claims (UserClaims, MeetingTokenClaims, GuestTokenClaims) -> `crates/common/src/jwt.rs`
 - JwtError enum (7 variants, uniform Display) -> `crates/common/src/jwt.rs:JwtError`
 - JWKS client (wiremock tests: cache, expiry, network errors) -> `crates/common/src/jwt.rs:JwksClient`
-- verify_token (EdDSA JWK validation, signature check) -> `crates/common/src/jwt.rs:verify_token`
-- JwtValidator (full pipeline: kid, JWKS, sig, iat) -> `crates/common/src/jwt.rs:JwtValidator`
-- HasIat trait (compile-time iat enforcement) -> `crates/common/src/jwt.rs:HasIat`
+- JwtValidator + verify_token + HasIat + extract_kid + validate_iat -> `crates/common/src/jwt.rs`
 - Round-trip tests (real Ed25519 sign+verify) -> `crates/common/src/jwt.rs:tests::test_verify_token_roundtrip_*`
-- extract_kid, validate_iat -> `crates/common/src/jwt.rs`
 - GC JwtError->GcError mapping tests (all 7 variants) -> `crates/gc-service/src/auth/jwt.rs:tests`
 - MC JwtError->McError mapping tests (all 7 variants) -> `crates/mc-service/src/errors.rs:tests::test_jwt_error_to_mc_error_*`
 
 ## Infrastructure & Shared
 - Dev cert generation + MC TLS manifests -> `scripts/generate-dev-certs.sh`, `infra/services/mc-service/tls-secret.yaml`
-- Kind UDP mapping + setup integration -> `infra/kind/kind-config.yaml`, `infra/kind/scripts/setup.sh:create_mc_tls_secret()`

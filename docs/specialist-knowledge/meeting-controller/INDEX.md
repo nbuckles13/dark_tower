@@ -7,14 +7,18 @@
 
 ## Code Locations
 - Service entry point → `crates/mc-service/src/main.rs`
-- Config (SecretString, env loading, ac_jwks_url) → `crates/mc-service/src/config.rs`
+- Config (SecretString, env loading, ac_jwks_url, TLS paths) → `crates/mc-service/src/config.rs`
 - Error types (McError hierarchy, From<JwtError>) → `crates/mc-service/src/errors.rs`
 - Auth: McJwtValidator (thin wrapper, target: `mc.auth`) → `crates/mc-service/src/auth/mod.rs`
 - Auth: validate_meeting_token (token_type guard) → `crates/mc-service/src/auth/mod.rs:validate_meeting_token()`
 - Auth: validate_guest_token (field enforcement) → `crates/mc-service/src/auth/mod.rs:validate_guest_token()`
 - Actor: controller (root, capacity) → `crates/mc-service/src/actors/controller.rs`
 - Actor: meeting (participants, grace period) → `crates/mc-service/src/actors/meeting.rs`
-- Actor: connection → `crates/mc-service/src/actors/connection.rs`
+- Actor: messages (inter-actor types, JoinConnection, JoinResult) → `crates/mc-service/src/actors/messages.rs`
+- Actor: participant (per-participant, disconnect notify) → `crates/mc-service/src/actors/participant.rs`
+- WebTransport: server (accept loop, TLS, capacity) → `crates/mc-service/src/webtransport/server.rs`
+- WebTransport: connection (join flow, bridge loop) → `crates/mc-service/src/webtransport/connection.rs`
+- WebTransport: handler (encode_participant_update) → `crates/mc-service/src/webtransport/handler.rs`
 - Actor: session binding (HMAC, HKDF) → `crates/mc-service/src/actors/session.rs`
 - Actor: metrics (dual system) → `crates/mc-service/src/actors/metrics.rs`
 - gRPC: GC client (registration, heartbeats) → `crates/mc-service/src/grpc/gc_client.rs`
@@ -31,6 +35,7 @@
 - Internal service RPCs (RegisterMc, AssignMeeting) → `proto/internal.proto`
 
 ## Integration Seams
+- Client -> MC WebTransport (join, signaling) → `crates/mc-service/src/webtransport/server.rs`
 - MC <-> GC registration/heartbeat → `crates/mc-service/src/grpc/gc_client.rs`
 - GC -> MC assignment → `crates/mc-service/src/grpc/mc_service.rs`
 - MC -> AC token management → `crates/common/src/token_manager.rs`
