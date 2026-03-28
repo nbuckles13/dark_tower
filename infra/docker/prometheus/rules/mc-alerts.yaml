@@ -3,6 +3,7 @@
 # Severity levels:
 # - critical: Page on-call immediately, service degradation or outage
 # - warning: Notify but don't page, investigate during business hours
+# - info: Log only, no notification, trend analysis
 #
 # All alerts link to sections in the consolidated incident response runbook:
 # docs/runbooks/mc-incident-response.md
@@ -60,7 +61,7 @@ groups:
       - alert: MCHighLatency
         expr: |
           histogram_quantile(0.95,
-            sum by(le) (rate(mc_message_processing_duration_seconds_bucket[5m]))
+            sum by(le) (rate(mc_message_latency_seconds_bucket[5m]))
           ) > 0.500
         for: 5m
         labels:
@@ -78,7 +79,7 @@ groups:
           (
             sum(rate(mc_messages_dropped_total[5m]))
             /
-            (sum(rate(mc_messages_dropped_total[5m])) + sum(rate(mc_message_processing_duration_seconds_count[5m])))
+            (sum(rate(mc_messages_dropped_total[5m])) + sum(rate(mc_message_latency_seconds_count[5m])))
           ) > 0.01
         for: 5m
         labels:
@@ -94,9 +95,9 @@ groups:
       - alert: MCGCHeartbeatFailure
         expr: |
           (
-            sum(rate(mc_gc_heartbeat_total{status="error"}[5m]))
+            sum(rate(mc_gc_heartbeats_total{status="error"}[5m]))
             /
-            sum(rate(mc_gc_heartbeat_total[5m]))
+            sum(rate(mc_gc_heartbeats_total[5m]))
           ) > 0.5
         for: 2m
         labels:
@@ -179,7 +180,7 @@ groups:
       - alert: MCMeetingStale
         expr: |
           sum(mc_meetings_active) > 0 and
-          sum(rate(mc_message_processing_duration_seconds_count[10m])) == 0
+          sum(rate(mc_message_latency_seconds_count[10m])) == 0
         for: 10m
         labels:
           severity: warning
@@ -194,9 +195,9 @@ groups:
       - alert: MCGCHeartbeatWarning
         expr: |
           (
-            sum(rate(mc_gc_heartbeat_total{status="error"}[5m]))
+            sum(rate(mc_gc_heartbeats_total{status="error"}[5m]))
             /
-            sum(rate(mc_gc_heartbeat_total[5m]))
+            sum(rate(mc_gc_heartbeats_total[5m]))
           ) > 0.10
         for: 5m
         labels:
@@ -236,3 +237,86 @@ groups:
           description: "Meeting Controller has {{ $value }} active meetings, approaching capacity threshold."
           impact: "May need to scale out or reject new meetings soon."
           runbook_url: "https://github.com/yourorg/dark_tower/blob/main/docs/runbooks/mc-incident-response.md#scenario-7-resource-pressure"
+
+      - alert: MCHighJoinFailureRate
+        expr: |
+          (
+            sum(rate(mc_session_joins_total{status="failure"}[5m]))
+            /
+            sum(rate(mc_session_joins_total[5m]))
+          ) > 0.05
+          and
+          sum(rate(mc_session_joins_total[5m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+          service: mc-service
+          component: meeting-join
+        annotations:
+          summary: "MC session join failure rate high ({{ $value | humanizePercentage }})"
+          description: "Session join failure rate is {{ $value | humanizePercentage }} for 5 minutes. Check 'Join Failures by Error Type' dashboard panel to determine root cause."
+          impact: "Some users unable to join meetings via WebTransport. Investigate join failure types in MC Overview dashboard."
+          runbook_url: "https://github.com/yourorg/dark_tower/blob/main/docs/runbooks/mc-incident-response.md#scenario-8-join-failures"
+
+      - alert: MCHighWebTransportRejections
+        expr: |
+          (
+            sum(rate(mc_webtransport_connections_total{status="rejected"}[5m]))
+            /
+            sum(rate(mc_webtransport_connections_total[5m]))
+          ) > 0.10
+          and
+          sum(rate(mc_webtransport_connections_total[5m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+          service: mc-service
+          component: meeting-join
+        annotations:
+          summary: "MC WebTransport rejection rate high ({{ $value | humanizePercentage }})"
+          description: "WebTransport connection rejection rate is {{ $value | humanizePercentage }} for 5 minutes. May indicate capacity exhaustion or misconfigured clients."
+          impact: "Users unable to establish WebTransport sessions. Check MC capacity and connection limits."
+          runbook_url: "https://github.com/yourorg/dark_tower/blob/main/docs/runbooks/mc-incident-response.md#scenario-9-webtransport-rejections"
+
+      - alert: MCHighJwtValidationFailures
+        expr: |
+          (
+            sum(rate(mc_jwt_validations_total{result="failure"}[5m]))
+            /
+            sum(rate(mc_jwt_validations_total[5m]))
+          ) > 0.10
+          and
+          sum(rate(mc_jwt_validations_total[5m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+          service: mc-service
+          component: meeting-join
+        annotations:
+          summary: "MC JWT validation failure rate high ({{ $value | humanizePercentage }})"
+          description: "JWT validation failure rate is {{ $value | humanizePercentage }} for 5 minutes. May indicate expired tokens, JWKS rotation issues, or token tampering."
+          impact: "Users unable to authenticate for meeting join. Check AC service health and JWKS endpoint availability."
+          runbook_url: "https://github.com/yourorg/dark_tower/blob/main/docs/runbooks/mc-incident-response.md#scenario-10-jwt-validation-failures"
+
+  - name: mc-service-info
+    interval: 60s
+    rules:
+      # ====================================================================
+      # INFO ALERTS - Log only, no notification
+      # ====================================================================
+
+      - alert: MCHighJoinLatency
+        expr: |
+          histogram_quantile(0.95,
+            sum by(le) (rate(mc_session_join_duration_seconds_bucket{status="success"}[5m]))
+          ) > 2.0
+        for: 5m
+        labels:
+          severity: info
+          service: mc-service
+          component: meeting-join
+        annotations:
+          summary: "MC session join p95 latency high ({{ $value }}s > 2s)"
+          description: "Session join p95 latency is {{ $value }}s, exceeding 2s threshold for 5 minutes. MC SLO is p99 <500ms, so p95 >2s is a leading indicator of degradation. Note: info severity because the aggregate MCHighLatency critical alert covers the processing SLO; this tracks join-specific latency."
+          impact: "Slow meeting join experience. Investigate JWT validation, actor processing, and WebTransport session setup latency."
+          runbook_url: "https://github.com/yourorg/dark_tower/blob/main/docs/runbooks/mc-incident-response.md#scenario-5-high-latency"

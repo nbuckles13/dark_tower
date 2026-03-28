@@ -61,12 +61,13 @@
 
 ## MC Metrics & Observability
 - MC metrics impl → `crates/mc-service/src/observability/metrics.rs`
-- MC alert rules → `infra/docker/prometheus/rules/mc-alerts.yaml`
-- MC dashboard (overview) → `infra/grafana/dashboards/mc-overview.json`
+- MC alert rules (critical/warning/info tiers) → `infra/docker/prometheus/rules/mc-alerts.yaml`
+- Join alerts: `MCHighJoinFailureRate` (warning), `MCHighWebTransportRejections` (warning), `MCHighJwtValidationFailures` (warning), `MCHighJoinLatency` (info)
+- MC dashboard (overview + join flow row) → `infra/grafana/dashboards/mc-overview.json`
+- MC metrics catalog (alert/dashboard cross-refs) → `docs/observability/metrics/mc-service.md`
 
 ## Observability Docs
-- Alerts documentation → `docs/observability/alerts.md`
-- Dashboards documentation → `docs/observability/dashboards.md`
+- Alerts docs → `docs/observability/alerts.md` | Dashboards docs → `docs/observability/dashboards.md`
 
 ## GC Runbooks
 - Incident response: MC assignment failures → `docs/runbooks/gc-incident-response.md` (Scenario 3)

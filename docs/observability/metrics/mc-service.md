@@ -144,6 +144,8 @@ All MC service metrics follow ADR-0011 naming conventions with the `mc_` prefix.
 - **Cardinality**: Low (3 status values)
 - **Usage**: Monitor connection acceptance rate, capacity rejections, and connection errors
 - **Recorded in**: `server.rs` accept loop
+- **Alert**: `MCHighWebTransportRejections` (warning, rejection rate >10% for 5m)
+- **Dashboard**: MC Overview - WebTransport Connections by Status (Join Flow row)
 
 ### `mc_jwt_validations_total`
 - **Type**: Counter
@@ -154,6 +156,8 @@ All MC service metrics follow ADR-0011 naming conventions with the `mc_` prefix.
 - **Cardinality**: Low (2 results x 2 token types = 4 series)
 - **Usage**: Monitor authentication health, detect token validation failures
 - **Recorded in**: `connection.rs` after JWT validation
+- **Alert**: `MCHighJwtValidationFailures` (warning, failure rate >10% for 5m)
+- **Dashboard**: MC Overview - JWT Validations by Result (Join Flow row)
 
 ### `mc_session_joins_total`
 - **Type**: Counter
@@ -162,6 +166,8 @@ All MC service metrics follow ADR-0011 naming conventions with the `mc_` prefix.
   - `status`: Join outcome (`success`, `failure`)
 - **Cardinality**: Low (2 status values)
 - **Usage**: Monitor join success rate, overall join volume
+- **Alert**: `MCHighJoinFailureRate` (warning, failure rate >5% for 5m)
+- **Dashboard**: MC Overview - Session Join Rate by Status (Join Flow row)
 
 ### `mc_session_join_duration_seconds`
 - **Type**: Histogram
@@ -172,6 +178,8 @@ All MC service metrics follow ADR-0011 naming conventions with the `mc_` prefix.
 - **Cardinality**: Low (2 status values)
 - **Usage**: Monitor join latency, identify slow joins. Extended to 5s because join includes actor processing.
 - **Recorded in**: `connection.rs` measuring full join flow
+- **Alert**: `MCHighJoinLatency` (info, p95 >2s for 5m, success only)
+- **Dashboard**: MC Overview - Session Join Latency P50/P95/P99 (Join Flow row)
 
 ### `mc_session_join_failures_total`
 - **Type**: Counter
@@ -181,6 +189,8 @@ All MC service metrics follow ADR-0011 naming conventions with the `mc_` prefix.
 - **Cardinality**: Low (~18 error variants, bounded by `McError` enum)
 - **Usage**: Diagnose join failure root causes, alert on specific failure patterns
 - **Recorded in**: `connection.rs` on join failure only
+- **Alert**: Used indirectly via `MCHighJoinFailureRate` (this metric provides error type breakdown for diagnosis)
+- **Dashboard**: MC Overview - Join Failures by Error Type (Join Flow row)
 
 ---
 

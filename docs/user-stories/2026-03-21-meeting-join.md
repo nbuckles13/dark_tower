@@ -298,7 +298,7 @@ Task 1 also starts immediately; task 7 waits for task 1
 | 10 | MC WebTransport server + join flow handler | docs/devloop-outputs/2026-03-27-mc-webtransport | dcee11c | Completed |
 | 11 | MC join flow observability metrics | docs/devloop-outputs/2026-03-27-mc-join-metrics | 7213b17 | Completed |
 | 12 | GC join dashboard + alerts + catalog | docs/devloop-outputs/2026-03-27-gc-join-dashboard | b111e1e | Completed |
-| 13 | MC join dashboard + alerts + catalog | | | Pending |
+| 13 | MC join dashboard + alerts + catalog | docs/devloop-outputs/2026-03-28-mc-join-dashboard | b1a3328 | Completed |
 | 14 | GC join integration tests | | | Pending |
 | 15 | MC join integration tests | | | Pending |
 | 16 | Join flow env-tests | | | Pending |

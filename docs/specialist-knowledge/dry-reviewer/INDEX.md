@@ -36,6 +36,9 @@
   - MC re-exports -> `crates/mc-service/src/observability/mod.rs`
 - MC dashboard "Join Flow" row (panels 28-33) -> `infra/grafana/dashboards/mc-overview.json`
   - Parallel to GC "Meeting Join" row (panels 34-38) in `gc-overview.json` — different service perspective, not duplication
+- MC join alert rules (4 new: MCHighJoinFailureRate, MCHighWebTransportRejections, MCHighJwtValidationFailures, MCHighJoinLatency) -> `infra/docker/prometheus/rules/mc-alerts.yaml`
+  - Parallel to GC join alerts (GCHighJoinFailureRate, GCHighJoinLatency) in `gc-alerts.yaml` — MC-side perspective, not duplication
+  - All use zero-traffic guard pattern (`and sum(rate(...[5m])) > 0`) matching GC convention
 
 ## Other Shared Code
 - Common crate modules -> `crates/common/src/lib.rs`
@@ -69,6 +72,4 @@
 - JWT thin wrapper pattern (GC + MC) -> `crates/{gc,mc}-service/src/auth/`
 - encode_participant_update (shared across actor + webtransport layers) -> `crates/mc-service/src/webtransport/handler.rs`
 - NetworkPolicy + ServiceMonitor cross-refs -> `infra/services/{ac,gc,mc}-service/`
-- Metric names in runbooks must match code -> `docs/runbooks/gc-incident-response.md`
-- Dev cert generation (shared helper, single CA) -> `scripts/generate-dev-certs.sh`
-- MC TLS secret + volume mount -> `infra/services/mc-service/tls-secret.yaml`
+- Metric names in runbooks must match code -> `docs/runbooks/gc-incident-response.md`, alert rule files

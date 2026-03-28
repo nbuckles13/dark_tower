@@ -148,16 +148,63 @@ All dashboard JSON files are stored in `infra/grafana/dashboards/` and auto-load
 
 ### MC Overview
 
-**Status**: 🚧 To be created
-**File**: `infra/grafana/dashboards/mc-overview.json` (planned)
+**File**: `infra/grafana/dashboards/mc-overview.json`
+**UID**: `mc-overview`
+**Tags**: `mc-service`, `service-overview`
 
-**Planned Panels**:
-- Active sessions
-- Session join rate
-- Session join latency (p99 <500ms SLO)
-- Participant count distribution
-- WebTransport connection status
-- Signaling message rate
+**Purpose**: Primary operational dashboard for Meeting Controller service.
+
+**Panels**:
+1. **Active Meetings** - Gauge showing active meetings (green <80, yellow 80-100, red >100)
+2. **Active Connections** - Gauge showing active WebTransport connections
+3. **Service Status** - Up/down status gauge
+4. **Actor Panics (Total)** - Total actor panic count
+5. **Message Drop Rate (%)** - Message drop rate gauge
+6. **Pod Count** - Number of running MC pods
+7. **Actor Mailbox Depth by Type** - Mailbox depth per actor type
+8. **Message Processing Latency (P50/P95/P99)** - Latency percentiles with 500ms SLO line
+9. **Messages Dropped by Actor Type** - Drop rate by actor type
+10. **Actor Panics by Type** - Panic rate by actor type
+11. **Active Meetings & Connections Over Time** - Time series of meetings and connections
+12. **Message Processing Throughput by Actor Type** - Message rate by actor type
+13. **Memory Usage** - Memory consumption per pod
+14. **CPU Usage** - CPU utilization per pod
+15. **GC Heartbeat Status** - Heartbeat success/error rate
+16. **Token Refresh Rate by Status** - Token refresh attempts by status
+17. **Token Refresh Latency (P50/P95/P99)** - Token refresh latency percentiles
+18. **GC Heartbeat Latency (P99 by Type)** - Heartbeat latency by type
+19. **Redis Latency (P99 by Operation)** - Redis latency by operation
+20. **Redis Latency (P50/P95/P99)** - Aggregate Redis latency percentiles
+21. **Recovery Duration (P50/P95/P99)** - Session recovery latency percentiles
+22. **Fenced-Out Events by Reason** - Fencing events by reason
+23. **GC Heartbeat Latency (P50/P95/P99)** - Aggregate heartbeat latency percentiles
+24. **Errors by Operation & Type** - Error rate by operation and type
+25. **Token Refresh Failures by Type** - Token refresh failures by error type
+
+**Join Flow Row** (5 panels, added for R-13/R-15):
+26. **Session Join Rate by Status** - Join rate (ops/sec) by success/failure
+27. **Session Join Latency (P50/P95/P99)** - Join latency percentiles (success only)
+28. **Session Join Failures by Type** - Join failures by `McError` variant
+29. **WebTransport Connections by Status** - Connection rate by accepted/rejected/error
+30. **JWT Validations by Result & Type** - JWT validation rate by result and token type
+
+**Metrics Used** (Join Flow):
+- `mc_session_joins_total`
+- `mc_session_join_duration_seconds`
+- `mc_session_join_failures_total`
+- `mc_webtransport_connections_total`
+- `mc_jwt_validations_total`
+
+**Default Time Range**: Last 1 hour
+**Refresh**: 10 seconds
+
+**Related Alerts** (Join Flow):
+- `MCHighJoinFailureRate` (fires when join failure rate >5%)
+- `MCHighJoinLatency` (fires when join p95 >2s)
+- `MCHighWebTransportRejections` (fires when rejection rate >10%)
+- `MCHighJwtValidationFailures` (fires when JWT failure rate >10%)
+
+**When to Use**: Day-to-day MC operations, investigating join failures, WebTransport issues, capacity planning
 
 ---
 
@@ -334,14 +381,14 @@ To request a new dashboard:
 | GC Overview | Observability | GC Team | 2026-02-28 |
 | GC SLOs | Observability | Operations | 2026-02-05 |
 | AC Overview | Observability | AC Team | TBD |
-| MC Overview | Observability | MC Team | TBD |
+| MC Overview | Observability | MC Team | 2026-03-27 |
 | MH Overview | Observability | MH Team | TBD |
 
 **Update Frequency**: Review quarterly or after major service changes.
 
 ---
 
-**Last Updated**: 2026-02-28
+**Last Updated**: 2026-03-27
 **Maintained By**: Observability Specialist
 **Related Documents**:
 - [ADR-0011: Observability Framework](../decisions/adr-0011-observability-framework.md)

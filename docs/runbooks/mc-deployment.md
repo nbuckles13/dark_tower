@@ -279,7 +279,7 @@ kill %1
 - `mc_meetings_active` - Active meeting count
 - `mc_connections_active` - Active WebTransport connections
 - `mc_actor_mailbox_depth` - Actor mailbox depth (should be low)
-- `mc_message_processing_duration_seconds` - Message latency (p95 <500ms SLO)
+- `mc_message_latency_seconds` - Message latency (p95 <500ms SLO)
 
 ### 9. Post-Deployment Checklist
 
@@ -726,14 +726,14 @@ sum by(actor_type) (mc_actor_mailbox_depth)
 sum(increase(mc_actor_panics_total[5m]))
 
 # Message drop rate (should be near 0%)
-sum(rate(mc_messages_dropped_total[5m])) / (sum(rate(mc_messages_dropped_total[5m])) + sum(rate(mc_message_processing_duration_seconds_count[5m])))
+sum(rate(mc_messages_dropped_total[5m])) / (sum(rate(mc_messages_dropped_total[5m])) + sum(rate(mc_message_latency_seconds_count[5m])))
 ```
 
 **Latency:**
 
 ```promql
 # p95 message processing latency (SLO: <500ms)
-histogram_quantile(0.95, sum by(le) (rate(mc_message_processing_duration_seconds_bucket[5m])))
+histogram_quantile(0.95, sum by(le) (rate(mc_message_latency_seconds_bucket[5m])))
 ```
 
 **Capacity:**
@@ -750,7 +750,7 @@ sum(mc_connections_active)
 
 ```promql
 # Heartbeat success rate (should be near 100%)
-sum(rate(mc_gc_heartbeat_total{status="success"}[5m])) / sum(rate(mc_gc_heartbeat_total[5m]))
+sum(rate(mc_gc_heartbeats_total{status="success"}[5m])) / sum(rate(mc_gc_heartbeats_total[5m]))
 ```
 
 ### Grafana Dashboards
