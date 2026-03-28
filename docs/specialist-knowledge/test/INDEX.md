@@ -51,8 +51,8 @@
 - WebTransport encoding tests (encode_participant_update) -> `crates/mc-service/src/webtransport/handler.rs:tests`
 - WebTransport connection tests (build_join_response) -> `crates/mc-service/src/webtransport/connection.rs:tests`
 - MC metrics tests (unit + DebuggingRecorder integration) -> `crates/mc-service/src/observability/metrics.rs:tests`
-- MC join flow metrics (webtransport_connection, jwt_validation, session_join) -> `crates/mc-service/src/observability/metrics.rs:record_webtransport_connection()`, `record_jwt_validation()`, `record_session_join()`
-- MC metrics catalog -> `docs/observability/metrics/mc-service.md`
+- MC join flow metrics + catalog -> `crates/mc-service/src/observability/metrics.rs:record_webtransport_connection()`, catalog: `docs/observability/metrics/mc-service.md`
+- MC alert rules (join: MCHighJoinFailureRate, MCHighWebTransportRejections, MCHighJwtValidationFailures, MCHighJoinLatency) -> `infra/docker/prometheus/rules/mc-alerts.yaml`
 - GC integration tests -> `crates/mc-service/tests/gc_integration.rs`
 - Heartbeat tests -> `crates/mc-service/tests/heartbeat_tasks.rs`
 - Mock Redis -> `crates/mc-test-utils/src/mock_redis.rs`

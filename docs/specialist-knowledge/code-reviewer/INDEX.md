@@ -56,7 +56,7 @@
 - JWT validation metrics → `crates/mc-service/src/observability/metrics.rs:record_jwt_validation()`
 - MC metrics init (histogram buckets) → `crates/mc-service/src/observability/metrics.rs:init_metrics_recorder()`
 - Dashboard (join panels id 29-33) → `infra/grafana/dashboards/mc-overview.json`
-- Alert rules → `infra/docker/prometheus/rules/mc-alerts.yaml`
+- Alert rules (join: MCHighJoinFailureRate, MCHighWebTransportRejections, MCHighJwtValidationFailures, MCHighJoinLatency) → `infra/docker/prometheus/rules/mc-alerts.yaml`
 - Metrics catalog → `docs/observability/metrics/mc-service.md`
 
 ## Code Locations — Common

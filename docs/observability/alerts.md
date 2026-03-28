@@ -515,18 +515,122 @@ histogram_quantile(0.95,
 
 ## Meeting Controller Alerts
 
-**Status**: 🚧 To be created
-**File**: `infra/docker/prometheus/rules/mc-alerts.yaml` (planned)
+**File**: `infra/docker/prometheus/rules/mc-alerts.yaml`
 
-**Planned Critical Alerts**:
-- `MCDown` - No MC pods running
-- `MCHighSessionJoinLatency` - Session join p99 >500ms
-- `MCSessionJoinFailureRate` - Join failures >5%
+### Critical Alerts
 
-**Planned Warning Alerts**:
-- `MCHighSessionCount` - Sessions approaching capacity
-- `MCHighCPU` - CPU >80%
-- `MCWebTransportConnectionFailures` - Connection failures >5%
+Existing MC critical alerts: `MCDown`, `MCActorPanic`, `MCHighMailboxDepthCritical`, `MCHighLatency`, `MCHighMessageDropRate`, `MCGCHeartbeatFailure`. See `mc-alerts.yaml` for full definitions.
+
+### Warning Alerts (Join Flow)
+
+#### MCHighJoinFailureRate
+
+**Severity**: Warning
+**Condition**: Session join failure rate >5% for >5 minutes
+**Impact**: Some users unable to join meetings via WebTransport
+**Runbook**: [Scenario 8: Join Failures](../runbooks/mc-incident-response.md#scenario-8-join-failures)
+
+**PromQL**:
+```promql
+(
+  sum(rate(mc_session_joins_total{status="failure"}[5m]))
+  /
+  sum(rate(mc_session_joins_total[5m]))
+) > 0.05
+and
+sum(rate(mc_session_joins_total[5m])) > 0
+```
+`for: 5m`
+
+**Response**:
+1. Check "Join Failures by Error Type" panel in MC Overview dashboard
+2. If `jwt_validation` errors dominate -> check AC service health and JWKS endpoint
+3. If `meeting_not_found` errors -> check GC-MC meeting state synchronization
+4. If `mc_capacity_exceeded` errors -> scale MC horizontally
+5. Check WebTransport connection health and rejection rates
+
+---
+
+#### MCHighWebTransportRejections
+
+**Severity**: Warning
+**Condition**: WebTransport connection rejection rate >10% for >5 minutes
+**Impact**: Users unable to establish WebTransport sessions
+**Runbook**: [Scenario 9: WebTransport Rejections](../runbooks/mc-incident-response.md#scenario-9-webtransport-rejections)
+
+**PromQL**:
+```promql
+(
+  sum(rate(mc_webtransport_connections_total{status="rejected"}[5m]))
+  /
+  sum(rate(mc_webtransport_connections_total[5m]))
+) > 0.10
+and
+sum(rate(mc_webtransport_connections_total[5m])) > 0
+```
+`for: 5m`
+
+**Response**:
+1. Check MC capacity (active meetings count vs limit)
+2. Check "WebTransport Connections by Status" panel in MC Overview dashboard
+3. If capacity-related -> scale MC horizontally
+4. If client errors -> check client SDK version and WebTransport compatibility
+5. Check MC pod resource utilization (CPU, memory)
+
+---
+
+#### MCHighJwtValidationFailures
+
+**Severity**: Warning
+**Condition**: JWT validation failure rate >10% for >5 minutes
+**Impact**: Users unable to authenticate for meeting join
+**Runbook**: [Scenario 10: JWT Validation Failures](../runbooks/mc-incident-response.md#scenario-10-jwt-validation-failures)
+
+**PromQL**:
+```promql
+(
+  sum(rate(mc_jwt_validations_total{result="failure"}[5m]))
+  /
+  sum(rate(mc_jwt_validations_total[5m]))
+) > 0.10
+and
+sum(rate(mc_jwt_validations_total[5m])) > 0
+```
+`for: 5m`
+
+**Response**:
+1. Check AC service health and JWKS endpoint availability
+2. Check "JWT Validations by Result" panel in MC Overview dashboard
+3. If JWKS fetch failures -> check network connectivity to AC
+4. If token expiry issues -> check clock skew between services
+5. If sudden spike -> check for recent AC key rotation or config changes
+
+---
+
+### Info Alerts (Join Flow)
+
+#### MCHighJoinLatency
+
+**Severity**: Info
+**Condition**: Session join p95 latency >2s for >5 minutes (successful joins only)
+**Threshold Rationale**: MC SLO is p99 <500ms for message processing. The join flow is end-to-end (WebTransport accept to JoinResponse) and includes JWT validation and actor processing, so a 2s p95 threshold serves as a leading indicator. The aggregate `MCHighLatency` critical alert covers the processing SLO.
+**Impact**: Slow meeting join experience
+**Runbook**: [Scenario 5: High Latency](../runbooks/mc-incident-response.md#scenario-5-high-latency)
+
+**PromQL**:
+```promql
+histogram_quantile(0.95,
+  sum by(le) (rate(mc_session_join_duration_seconds_bucket{status="success"}[5m]))
+) > 2.0
+```
+`for: 5m`
+
+**Response**:
+1. Check "Session Join Latency P50/P95/P99" panel in MC Overview dashboard
+2. Check JWT validation latency (may be slow JWKS fetch)
+3. Check actor mailbox depth (may be backpressure)
+4. Check WebTransport session setup time
+5. Check MC pod resource utilization (CPU, memory)
 
 ---
 
@@ -715,14 +819,16 @@ Before deploying alerts, test:
 | GC Critical | Observability | GC Team + Operations | 2026-02-28 |
 | GC Warning | Observability | GC Team | 2026-02-28 |
 | AC Critical | Observability | AC Team + Operations | TBD |
-| MC Critical | Observability | MC Team + Operations | TBD |
+| MC Critical | Observability | MC Team + Operations | 2026-03-27 |
+| MC Warning (Join) | Observability | MC Team | 2026-03-27 |
+| MC Info (Join) | Observability | MC Team | 2026-03-27 |
 | MH Critical | Observability | MH Team + Operations | TBD |
 
 **Update Frequency**: Review quarterly or after major SLO changes.
 
 ---
 
-**Last Updated**: 2026-02-28
+**Last Updated**: 2026-03-27
 **Maintained By**: Observability Specialist + Operations Team
 **Related Documents**:
 - [ADR-0011: Observability Framework](../decisions/adr-0011-observability-framework.md)

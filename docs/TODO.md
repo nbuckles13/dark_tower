@@ -30,6 +30,12 @@
 
 - [ ] **Evaluate HTTP/3 for AC**: AC currently serves HTTP/1.1 (TCP-based). For consistency with GC, evaluate adding HTTP/3 support. Low priority — client is protocol-agnostic via `fetch()`. Follow-up to ADR-0003.
 
+## Observability Debt
+
+- [ ] **Stale metric names in MC runbooks**: `docs/runbooks/mc-incident-response.md` (6 refs) and `docs/runbooks/mc-deployment.md` (3 refs) still use `mc_message_processing_duration_seconds` — the actual metric is `mc_message_latency_seconds`. Bug predates the join flow work; discovered during task 13 semantic guard review.
+- [ ] **MC runbook missing join scenarios**: `mc-incident-response.md` is missing Scenario 8 (join failures), Scenario 9 (WebTransport rejections), and Scenario 10 (JWT validation failures). The new MC join alerts reference these anchors.
+- [ ] **Cross-service status label inconsistency**: GC uses `status="error"` for failures (HTTP convention) while MC uses `status="failure"` (binary convention). Both are internally consistent. Standardize if/when a cross-service alerting layer is added.
+
 ## Code Quality
 
 - [ ] **dead_code lint cleanup**: Review `#[allow(dead_code)]` attributes across `crates/ac-service/src/` once more code paths are exercised by binaries
