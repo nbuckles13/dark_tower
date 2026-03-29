@@ -70,6 +70,8 @@ common = { path = "../common", features = ["test-utils"] }
 # JWT validation testing (Ed25519 signing, JWKS mocking)
 wiremock = "0.6"
 jsonwebtoken = { workspace = true }
+# WebTransport client for join integration tests (dangerous-configuration for self-signed certs)
+wtransport = { workspace = true, features = ["dangerous-configuration"] }
 
 [lib]
 name = "mc_service"

@@ -39,6 +39,10 @@ bytes = { workspace = true }
 ring = { workspace = true }
 base64 = "0.22"
 
+# JWT test utilities (Ed25519 signing, JWKS mocking)
+wiremock = "0.6"
+jsonwebtoken = { workspace = true }
+
 # Error handling
 anyhow = { workspace = true }
 thiserror = { workspace = true }
