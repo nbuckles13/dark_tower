@@ -5,7 +5,7 @@
 **Specialist**: observability
 **Mode**: full
 **Branch**: `feature/meeting-join-user-story-devloop-task7`
-**Duration**: ~TBD
+**Duration**: ~45 minutes
 
 ---
 
@@ -15,6 +15,7 @@
 |-------|-------|
 | Start Commit | `bce73a15d39974fccedb4ed3702fe25956be241f` |
 | Branch | `feature/meeting-join-user-story-devloop-task7` |
+| End Commit | `8b94604` |
 
 ---
 
@@ -22,16 +23,9 @@
 
 | Field | Value |
 |-------|-------|
-| Phase | `reflection` |
-| Implementer | `pending` |
+| Phase | `complete` |
 | Implementing Specialist | `observability` |
 | Iteration | `1` |
-| Security | `pending` |
-| Test | `pending` |
-| Observability | `pending` |
-| Code Quality | `pending` |
-| DRY | `pending` |
-| Operations | `pending` |
 
 ---
 
@@ -54,12 +48,50 @@ Add MC join flow alert rules + update metrics catalog and docs. Dashboard panels
 
 | Reviewer | Plan Status |
 |----------|-------------|
-| Security | pending |
-| Test | pending |
-| Observability | pending |
-| Code Quality | pending |
-| DRY | pending |
-| Operations | pending |
+| Security | confirmed |
+| Test | confirmed |
+| Observability | confirmed |
+| Code Quality | confirmed |
+| DRY | confirmed |
+| Operations | confirmed |
+
+---
+
+## Planning
+
+Implementer proposed 4 new alert rules following GC task 12 pattern:
+1. MCHighJoinFailureRate (warning, >5% for 5m) — mc_session_joins_total
+2. MCHighJoinLatency (info, p95 >2s for 5m, filter status="success") — mc_session_join_duration_seconds
+3. MCHighWebTransportRejections (warning, >10% for 5m) — mc_webtransport_connections_total
+4. MCHighJwtValidationFailures (warning, >10% for 5m) — mc_jwt_validations_total
+
+All with div-by-zero guards, runbook_url to mc-incident-response.md scenarios 8-10.
+
+Observability reviewer identified 2 critical pre-existing bugs: `mc_message_processing_duration_seconds` (wrong, should be `mc_message_latency_seconds`) and `mc_gc_heartbeat_total` (wrong, should be `mc_gc_heartbeats_total`) — 5 dead alerts including 2 critical-severity. Mandatory fix in this task.
+
+Test reviewer independently confirmed the same bugs.
+
+---
+
+## Implementation Summary
+
+### Bug Fixes (pre-existing)
+- Fixed `mc_message_processing_duration_seconds` → `mc_message_latency_seconds` in MCHighLatency, MCHighMessageDropRate, MCMeetingStale alerts (3 occurrences)
+- Fixed `mc_gc_heartbeat_total` → `mc_gc_heartbeats_total` in MCGCHeartbeatFailure, MCGCHeartbeatWarning (4 occurrences)
+- Fixed `mc_gc_heartbeat_total` → `mc_gc_heartbeats_total` in mc-deployment.md (1 occurrence)
+- Fixed 3 additional stale `mc_message_processing_duration_seconds` in mc-deployment.md (test reviewer finding)
+
+### New Alert Rules
+- 3 warnings in mc-service-warning group + 1 info in new mc-service-info group
+- Header comment updated with info severity level
+
+### Documentation
+- mc-service.md: alert/dashboard cross-references
+- alerts.md: MC join alert documentation with response steps
+- dashboards.md: MC overview panel listing with Related Alerts section
+
+### Files Changed
+15 files changed (incl. INDEX updates), +387/-58 lines.
 
 ---
 
@@ -67,9 +99,9 @@ Add MC join flow alert rules + update metrics catalog and docs. Dashboard panels
 
 | Reviewer | Verdict | Findings | Fixed | Deferred | Notes |
 |----------|---------|----------|-------|----------|-------|
-| Security | | | | | |
-| Test | | | | | |
-| Observability | | | | | |
-| Code Quality | | | | | |
-| DRY | | | | | |
-| Operations | | | | | |
+| Security | CLEAR | 0 | 0 | 0 | No PII in annotations, bounded labels |
+| Test | CLEAR | 1 | 1 | 0 | Stale metric names in mc-deployment.md |
+| Observability | CLEAR | 0 | 0 | 0 | Bug fixes revived 5 dead alerts |
+| Code Quality | CLEAR | 1 obs | 0 | 0 | Info alert `for` duration matches GC |
+| DRY | CLEAR | 0 | 0 | 0 | No duplication |
+| Operations | CLEAR | 1 | 1 | 0 | mc-deployment.md stale names fixed |
