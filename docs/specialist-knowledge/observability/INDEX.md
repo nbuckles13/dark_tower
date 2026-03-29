@@ -45,15 +45,13 @@
 
 ## Dashboards & Alerts
 - Grafana dashboards -> `infra/grafana/dashboards/` (overview, SLOs, logs per service)
-- GC overview dashboard (meeting creation + join panels) -> `infra/grafana/dashboards/gc-overview.json`
-- GC join success rate gauge panel (id:38) -> `infra/grafana/dashboards/gc-overview.json`
+- GC overview dashboard (creation + join panels, join success gauge id:38) -> `infra/grafana/dashboards/gc-overview.json`
 - GC join alert rules (GCHighJoinFailureRate, GCHighJoinLatency) -> `infra/docker/prometheus/rules/gc-alerts.yaml`
 - MC overview dashboard (join flow panels) -> `infra/grafana/dashboards/mc-overview.json`
 - MC join alert rules (MCHighJoinFailureRate, MCHighWebTransportRejections, MCHighJwtValidationFailures, MCHighJoinLatency) -> `infra/docker/prometheus/rules/mc-alerts.yaml`
 - Cross-service error dashboard -> `infra/grafana/dashboards/errors-overview.json`
 - Grafana provisioning -> `infra/grafana/provisioning/datasources/datasources.yaml`
-- Prometheus config (docker-compose) -> `infra/docker/prometheus/prometheus.yml`
-- Prometheus config (K8s in-cluster) -> `infra/kubernetes/observability/prometheus-config.yaml`
+- Prometheus config -> `infra/docker/prometheus/prometheus.yml` (compose), `infra/kubernetes/observability/prometheus-config.yaml` (K8s)
 - Alert design docs -> `docs/observability/alerts.md`
 - Dashboard docs -> `docs/observability/dashboards.md`
 
@@ -64,12 +62,15 @@
 ## Runbooks
 - Per-service deployment + incident response -> `docs/runbooks/` (two per service)
 - GC scenarios 8-9 (meeting creation limits, code collision) -> `docs/runbooks/gc-incident-response.md`
-- GC join failure triage (mc_assignment, ac_request, not_found) -> `docs/observability/alerts.md` (GCHighJoinFailureRate)
-- MC join failure triage (jwt_validation, meeting_not_found, capacity) -> `docs/observability/alerts.md` (MCHighJoinFailureRate)
+- Join failure triage (GC: mc_assignment/ac_request/not_found, MC: jwt/meeting/capacity) -> `docs/observability/alerts.md`
 - GC post-deploy meeting creation checklist -> `docs/runbooks/gc-deployment.md` (Post-Deploy Monitoring Checklist)
+
+## Test Coverage
+- GC join integration tests (success, AC-down, no-MC, service-token-rejected) -> `crates/gc-service/tests/meeting_tests.rs` (task 14)
+- GC join tests use `get_test_metrics_handle()` but do not assert rendered metric values (pre-existing gap)
+- GC metrics unit tests (no-op recorder, code-path coverage only) -> `crates/gc-service/src/observability/metrics.rs`
 
 ## Integration Seams
 - Env-tests observability validation -> `crates/env-tests/tests/30_observability.rs`
 - Observability mod re-exports (stale export risk) -> `crates/*/src/observability/mod.rs`
-- MC TLS volume mount (affects health port availability) -> `infra/services/mc-service/deployment.yaml`
-- MC WebTransport UDP NodePort (Kind port mapping) -> `infra/kind/kind-config.yaml`, `infra/services/mc-service/service.yaml`
+- MC infra (TLS mount, WebTransport UDP NodePort) -> `infra/services/mc-service/`, `infra/kind/kind-config.yaml`

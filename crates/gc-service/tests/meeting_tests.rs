@@ -325,6 +325,91 @@ impl TestMeetingServer {
         })
     }
 
+    /// Spawn a server variant where the AC meeting-token endpoint returns 500.
+    ///
+    /// JWKS still works (so user auth passes), but the subsequent AC call
+    /// to get a meeting token fails, exercising the AC-down error path.
+    async fn spawn_with_ac_failure(pool: PgPool) -> Result<Self> {
+        let mock_server = MockServer::start().await;
+        let keypair = TestKeypair::new(1, "test-key-01");
+
+        // JWKS endpoint (still works — auth must pass)
+        let jwks_response = serde_json::json!({
+            "keys": [keypair.jwk_json()]
+        });
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jwks.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&jwks_response))
+            .mount(&mock_server)
+            .await;
+
+        // AC meeting-token returns 500 (simulates AC down)
+        Mock::given(method("POST"))
+            .and(path("/api/v1/auth/internal/meeting-token"))
+            .respond_with(ResponseTemplate::new(500).set_body_json(serde_json::json!({
+                "error": "internal server error"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let vars = HashMap::from([
+            (
+                "DATABASE_URL".to_string(),
+                "postgresql://test/test".to_string(),
+            ),
+            ("BIND_ADDRESS".to_string(), "127.0.0.1:0".to_string()),
+            ("GC_REGION".to_string(), "test-region".to_string()),
+            (
+                "AC_JWKS_URL".to_string(),
+                format!("{}/.well-known/jwks.json", mock_server.uri()),
+            ),
+            ("AC_INTERNAL_URL".to_string(), mock_server.uri()),
+            ("GC_CLIENT_ID".to_string(), "test-gc-client".to_string()),
+            ("GC_CLIENT_SECRET".to_string(), "test-gc-secret".to_string()),
+        ]);
+
+        let config = Config::from_vars(&vars)
+            .map_err(|e| anyhow::anyhow!("Failed to create config: {}", e))?;
+
+        let (_tx, rx) = watch::channel(SecretString::from("test-token"));
+        let token_receiver = TokenReceiver::from_watch_receiver(rx);
+
+        let mock_mc_client = Arc::new(MockMcClient::accepting());
+        let state = Arc::new(AppState {
+            pool: pool.clone(),
+            config: config.clone(),
+            mc_client: mock_mc_client,
+            token_receiver,
+        });
+
+        let metrics_handle = get_test_metrics_handle();
+        let app = routes::build_routes(state, metrics_handle)
+            .map_err(|e| anyhow::anyhow!("Failed to build routes: {}", e))?;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to bind test server: {}", e))?;
+
+        let addr = listener
+            .local_addr()
+            .map_err(|e| anyhow::anyhow!("Failed to get local address: {}", e))?;
+
+        let server_handle = tokio::spawn(async move {
+            let make_service = app.into_make_service_with_connect_info::<SocketAddr>();
+            if let Err(e) = axum::serve(listener, make_service).await {
+                eprintln!("Test server error: {}", e);
+            }
+        });
+
+        Ok(Self {
+            addr,
+            _server_handle: server_handle,
+            _mock_server: mock_server,
+            keypair,
+            pool,
+        })
+    }
+
     fn url(&self) -> String {
         format!("http://{}", self.addr)
     }
@@ -394,6 +479,23 @@ impl TestMeetingServer {
         // Sign with a different keypair (same kid, different private key)
         let wrong_keypair = TestKeypair::new(99, &self.keypair.kid);
         wrong_keypair.sign_user_token(&claims)
+    }
+
+    /// Create a service token (wrong claims shape for user auth).
+    ///
+    /// This token has valid EdDSA signature but contains service claims
+    /// (scope, service_type) instead of user claims (org_id, roles, email, jti).
+    /// The user auth middleware should reject it with 401.
+    fn create_service_token(&self) -> String {
+        let now = Utc::now().timestamp();
+        let claims = TestClaims {
+            sub: "gc-service".to_string(),
+            exp: now + 3600,
+            iat: now,
+            scope: "read write".to_string(),
+            service_type: Some("global-controller".to_string()),
+        };
+        self.keypair.sign_token(&claims)
     }
 
     /// Create a tampered user token (payload modified after signing).
@@ -2044,6 +2146,202 @@ async fn test_join_meeting_non_existent_user_succeeds_with_valid_token(pool: PgP
         response.status(),
         200,
         "Non-existent user with valid org_id token should join (no DB user lookup)"
+    );
+
+    Ok(())
+}
+
+// ============================================================================
+// R-18 Join Integration Tests (Task 14)
+// ============================================================================
+
+/// Test that a properly signed service token (wrong claims shape) is rejected
+/// by the user auth middleware on the join endpoint.
+///
+/// The token has a valid EdDSA signature but contains service claims
+/// (scope, service_type) instead of user claims (org_id, roles, email, jti).
+/// The require_user_auth middleware should reject it with 401.
+#[sqlx::test(migrations = "../../migrations")]
+async fn test_join_meeting_service_token_rejected(pool: PgPool) -> Result<()> {
+    let server = TestMeetingServer::spawn(pool.clone()).await?;
+    let client = reqwest::Client::new();
+
+    let org_id = create_test_org(&server.pool, "svctoken-org", "Service Token Org").await;
+    let user_id = create_test_user(&server.pool, org_id, "user@test.com", "Test User").await;
+    let _meeting_id = create_test_meeting(
+        &server.pool,
+        org_id,
+        user_id,
+        "SVCTOK",
+        "scheduled",
+        false,
+        false,
+        true,
+    )
+    .await;
+
+    // Service token: valid signature, but wrong claims shape for user auth
+    let token = server.create_service_token();
+
+    let response = client
+        .get(format!("{}/api/v1/meetings/SVCTOK", server.url()))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await?;
+
+    assert_eq!(
+        response.status(),
+        401,
+        "Service token (wrong claims shape) should return 401 on user-auth endpoint"
+    );
+
+    Ok(())
+}
+
+/// Test that join fails with 503 when AC is unavailable (cannot issue meeting token).
+///
+/// Auth passes (JWKS works), MC assignment succeeds, but the AC meeting-token
+/// endpoint returns 500 — GC should map this to 503 Service Unavailable.
+#[sqlx::test(migrations = "../../migrations")]
+async fn test_join_meeting_ac_unavailable(pool: PgPool) -> Result<()> {
+    let server = TestMeetingServer::spawn_with_ac_failure(pool.clone()).await?;
+    let client = reqwest::Client::new();
+
+    // Register healthy MC and MHs (so assignment succeeds before AC call)
+    register_healthy_mc_for_region(&server.pool, "test-region").await;
+    register_healthy_mhs_for_region(&server.pool, "test-region").await;
+
+    let org_id = create_test_org(&server.pool, "acdown-org", "AC Down Org").await;
+    let user_id = create_test_user(&server.pool, org_id, "user@test.com", "Test User").await;
+    let _meeting_id = create_test_meeting(
+        &server.pool,
+        org_id,
+        user_id,
+        "ACDOWN",
+        "active",
+        false,
+        false,
+        true,
+    )
+    .await;
+
+    let token = server.create_token_for_user(user_id, org_id);
+
+    let response = client
+        .get(format!("{}/api/v1/meetings/ACDOWN", server.url()))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await?;
+
+    assert_eq!(
+        response.status(),
+        503,
+        "AC unavailable should return 503 Service Unavailable"
+    );
+
+    let body: serde_json::Value = response.json().await?;
+    assert_eq!(body["error"]["code"], "SERVICE_UNAVAILABLE");
+
+    Ok(())
+}
+
+/// Test that join fails with 503 when no Meeting Controllers are available.
+///
+/// Auth passes, meeting is found, but MC assignment fails because no healthy
+/// MCs are registered in the database for the test region.
+#[sqlx::test(migrations = "../../migrations")]
+async fn test_join_meeting_no_mc_available(pool: PgPool) -> Result<()> {
+    let server = TestMeetingServer::spawn(pool.clone()).await?;
+    let client = reqwest::Client::new();
+
+    // Deliberately do NOT register any MCs or MHs
+    let org_id = create_test_org(&server.pool, "nomc-org", "No MC Org").await;
+    let user_id = create_test_user(&server.pool, org_id, "user@test.com", "Test User").await;
+    let _meeting_id = create_test_meeting(
+        &server.pool,
+        org_id,
+        user_id,
+        "NOMCAV",
+        "scheduled",
+        false,
+        false,
+        true,
+    )
+    .await;
+
+    let token = server.create_token_for_user(user_id, org_id);
+
+    let response = client
+        .get(format!("{}/api/v1/meetings/NOMCAV", server.url()))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await?;
+
+    assert_eq!(
+        response.status(),
+        503,
+        "No available MCs should return 503 Service Unavailable"
+    );
+
+    let body: serde_json::Value = response.json().await?;
+    assert_eq!(body["error"]["code"], "SERVICE_UNAVAILABLE");
+
+    Ok(())
+}
+
+/// Test that joining an active meeting succeeds with full response validation.
+///
+/// Verifies the complete success path: user joins an active (not just scheduled)
+/// meeting and receives meeting token, MC assignment with webtransport_endpoint.
+#[sqlx::test(migrations = "../../migrations")]
+async fn test_join_meeting_active_status_success(pool: PgPool) -> Result<()> {
+    let server = TestMeetingServer::spawn(pool.clone()).await?;
+    let client = reqwest::Client::new();
+
+    register_healthy_mc_for_region(&server.pool, "test-region").await;
+    register_healthy_mhs_for_region(&server.pool, "test-region").await;
+
+    let org_id = create_test_org(&server.pool, "active-org", "Active Meeting Org").await;
+    let user_id = create_test_user(&server.pool, org_id, "user@test.com", "Test User").await;
+    let _meeting_id = create_test_meeting(
+        &server.pool,
+        org_id,
+        user_id,
+        "ACTIV1",
+        "active", // Active status (not scheduled)
+        false,
+        false,
+        true,
+    )
+    .await;
+
+    let token = server.create_token_for_user(user_id, org_id);
+
+    let response = client
+        .get(format!("{}/api/v1/meetings/ACTIV1", server.url()))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await?;
+
+    assert_eq!(response.status(), 200, "Active meeting should be joinable");
+
+    let body: serde_json::Value = response.json().await?;
+    assert!(body["token"].is_string(), "Should return a meeting token");
+    assert!(body["expires_in"].is_number(), "Should return expires_in");
+    assert!(body["meeting_id"].is_string(), "Should return meeting_id");
+    assert_eq!(body["meeting_name"], "Test Meeting");
+    // Verify MC assignment fields including webtransport_endpoint
+    assert!(
+        body["mc_assignment"]["mc_id"].is_string(),
+        "Should return mc_assignment with mc_id"
+    );
+    assert!(
+        body["mc_assignment"]["grpc_endpoint"].is_string(),
+        "Should return mc_assignment with grpc_endpoint"
+    );
+    assert!(
+        body["mc_assignment"]["webtransport_endpoint"].is_string(),
+        "Should return mc_assignment with webtransport_endpoint"
     );
 
     Ok(())

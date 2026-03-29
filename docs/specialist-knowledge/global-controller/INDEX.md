@@ -47,4 +47,15 @@
 ## Tests
 - Meeting creation tests -> `crates/gc-service/tests/meeting_create_tests.rs`
 - Meeting join/guest/settings tests -> `crates/gc-service/tests/meeting_tests.rs`
+- Auth integration tests -> `crates/gc-service/tests/auth_tests.rs`
+- Test harness -> `crates/gc-test-utils/src/server_harness.rs`
+- Test token helpers -> `crates/gc-service/tests/meeting_tests.rs:TestUserClaims`
 - Metrics catalog (creation + join) -> `docs/observability/metrics/gc-service.md`
+
+### Join endpoint test coverage (R-18)
+- Auth: 401 no token, 401 expired, 401 service token, 401 wrong key/alg/tampered
+- Access: 403 cross-org denied, 200 cross-org allowed (allow_external=true)
+- Status: 404 cancelled, 404 ended, 200 scheduled, 200 active
+- Failure: 503 AC unavailable, 503 no MC available, 404 meeting not found
+- Success: token + MC assignment (mc_id, grpc_endpoint, webtransport_endpoint)
+- AC failure variant: `TestMeetingServer::spawn_with_ac_failure()` (500 on meeting-token)
