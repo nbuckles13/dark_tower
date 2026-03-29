@@ -67,7 +67,7 @@
 - Actor metrics + mailbox monitoring → `crates/mc-service/src/actors/metrics.rs`
 - Session binding tokens → `crates/mc-service/src/actors/session.rs`
 
-## Code Locations — GC Routes & Integration
-- GC route definitions (public, user-auth, service-auth) → `crates/gc-service/src/routes/mod.rs`
-- Meeting handlers (join, guest-token, settings, create) → `crates/gc-service/src/handlers/meetings.rs`
+## Code Locations — GC
+- GC routes + handlers → `crates/gc-service/src/routes/mod.rs`, `crates/gc-service/src/handlers/meetings.rs`
+- GC join tests (R-18: auth, AC-down, no-MC, success) → `crates/gc-service/tests/meeting_tests.rs`
 - Env-tests → `crates/env-tests/`

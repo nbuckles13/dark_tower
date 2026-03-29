@@ -21,24 +21,26 @@
 
 ## MC WebTransport Layer
 - WebTransport server (accept loop) -> `crates/mc-service/src/webtransport/server.rs`
-- Per-connection join flow + bridge loop + framing -> `crates/mc-service/src/webtransport/connection.rs`
-- Shared encoding utility (encode_participant_update) -> `crates/mc-service/src/webtransport/handler.rs`
-- ParticipantActor (renamed from ConnectionActor) -> `crates/mc-service/src/actors/participant.rs`
-  - Calls handler::encode_participant_update() (single impl, not copied) -> line 405
+- Connection handler + bridge loop + framing -> `crates/mc-service/src/webtransport/connection.rs`
+- Shared encode_participant_update() -> `crates/mc-service/src/webtransport/handler.rs`
+- ParticipantActor -> `crates/mc-service/src/actors/participant.rs`
 
 ## Per-Service Observability (Metrics & Dashboards)
 - AC metrics -> `crates/ac-service/src/observability/metrics.rs`
 - GC metrics -> `crates/gc-service/src/observability/metrics.rs`
-  - GC join metrics -> `record_meeting_join()`
-  - GC creation metrics -> `record_meeting_creation()`
 - MC metrics -> `crates/mc-service/src/observability/metrics.rs`
-  - MC join flow metrics -> `record_webtransport_connection()`, `record_jwt_validation()`, `record_session_join()`
-  - MC re-exports -> `crates/mc-service/src/observability/mod.rs`
-- MC dashboard "Join Flow" row (panels 28-33) -> `infra/grafana/dashboards/mc-overview.json`
-  - Parallel to GC "Meeting Join" row (panels 34-38) in `gc-overview.json` — different service perspective, not duplication
-- MC join alert rules (4 new: MCHighJoinFailureRate, MCHighWebTransportRejections, MCHighJwtValidationFailures, MCHighJoinLatency) -> `infra/docker/prometheus/rules/mc-alerts.yaml`
-  - Parallel to GC join alerts (GCHighJoinFailureRate, GCHighJoinLatency) in `gc-alerts.yaml` — MC-side perspective, not duplication
-  - All use zero-traffic guard pattern (`and sum(rate(...[5m])) > 0`) matching GC convention
+  - GC join: `record_meeting_join()` | MC join: `record_webtransport_connection()`, `record_jwt_validation()`, `record_session_join()`
+- MC dashboard "Join Flow" row -> `infra/grafana/dashboards/mc-overview.json` (parallel to GC, not duplication)
+- MC/GC join alert rules -> `infra/docker/prometheus/rules/{mc,gc}-alerts.yaml` (per-service perspective, not duplication)
+
+## GC Integration Test Coverage
+- Join/guest/settings tests (task 14) -> `crates/gc-service/tests/meeting_tests.rs`
+  - TestMeetingServer (spawn, spawn_with_ac_failure) — wiremock JWKS + AC internal mocks
+  - DB fixtures: create_test_org, create_test_user, create_test_meeting, register_healthy_mc/mh
+  - R-18 tests: service token rejected, AC unavailable (503), no MC available (503), active status join
+- Meeting creation tests -> `crates/gc-service/tests/meeting_create_tests.rs`
+- Auth tests (service token JWKS) -> `crates/gc-service/tests/auth_tests.rs`
+- Shared GC test harness (health/E2E only) -> `crates/gc-test-utils/src/server_harness.rs`
 
 ## Other Shared Code
 - Common crate modules -> `crates/common/src/lib.rs`
@@ -68,8 +70,5 @@
 ## Integration Seams
 - Common crate as extraction target -> `crates/common/src/`
 - GC repositories (shared row mappers) -> `crates/gc-service/src/repositories/`
-- GC dual auth middleware (service + user) -> `crates/gc-service/src/middleware/auth.rs`
 - JWT thin wrapper pattern (GC + MC) -> `crates/{gc,mc}-service/src/auth/`
-- encode_participant_update (shared across actor + webtransport layers) -> `crates/mc-service/src/webtransport/handler.rs`
-- NetworkPolicy + ServiceMonitor cross-refs -> `infra/services/{ac,gc,mc}-service/`
-- Metric names in runbooks must match code -> `docs/runbooks/gc-incident-response.md`, alert rule files
+- Metric names in runbooks must match code -> `docs/runbooks/`, alert rule files
