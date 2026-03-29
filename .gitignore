@@ -70,3 +70,4 @@ lcov.info
 # OS
 Thumbs.db
 .env.test
+.devloop-pr.json
