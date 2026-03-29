@@ -30,5 +30,27 @@ if git diff --cached --name-only | grep -q "\.rs$"; then
     fi
 fi
 
+# Check devloop main.md files for unfilled sections
+DEVLOOP_ERRORS=""
+for f in $(git diff --cached --name-only | grep 'docs/devloop-outputs/.*/main\.md$'); do
+    # Check for TBD placeholders (unfilled sections)
+    tbds=$(git show ":$f" | grep -n '^TBD$' || true)
+    if [ -n "$tbds" ]; then
+        DEVLOOP_ERRORS="${DEVLOOP_ERRORS}  $f: has unfilled TBD sections\n"
+    fi
+    # Check for pending reviewers in Loop State table
+    pending=$(git show ":$f" | grep -P '\|\s*`?pending`?\s*\|' || true)
+    if [ -n "$pending" ]; then
+        DEVLOOP_ERRORS="${DEVLOOP_ERRORS}  $f: has pending reviewers in Loop State\n"
+    fi
+done
+if [ -n "$DEVLOOP_ERRORS" ]; then
+    echo ""
+    echo "❌ Devloop output main.md incomplete:"
+    echo -e "$DEVLOOP_ERRORS"
+    echo "   Fill in all TBD sections and reviewer names before committing."
+    exit 1
+fi
+
 echo "✅ All pre-commit checks passed!"
 exit 0
