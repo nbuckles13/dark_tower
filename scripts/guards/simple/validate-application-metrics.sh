@@ -6,9 +6,10 @@
 # 1. All services with metrics.rs are in the canonical mapping
 # 2. Metrics use the correct prefix for their service
 # 3. Dashboard application metrics exist in source code
-# 4. All defined metrics appear in at least one Grafana dashboard
-# 5. All defined metrics are documented in a catalog file (docs/observability/metrics/)
-# 6. All dashboard targets have explicit editorMode and range/instant fields
+# 4. Alert rule metrics exist in source code (prevents dead alerts from stale metric names)
+# 5. All defined metrics appear in at least one Grafana dashboard
+# 6. All defined metrics are documented in a catalog file (docs/observability/metrics/)
+# 7. All dashboard targets have explicit editorMode and range/instant fields
 #
 # Source of truth: crates/*/src/observability/metrics.rs files
 #
@@ -254,7 +255,123 @@ validate_dashboard_metrics() {
 }
 
 # ============================================================================
-# Step 4: Check metric coverage in dashboards (hard fail)
+# Step 4: Validate alert rule metrics against source code
+# ============================================================================
+
+validate_alert_metrics() {
+    echo -e "${BLUE}Validating alert rule metrics against source code...${NC}"
+
+    local errors=0
+    local alerts_dir="$REPO_ROOT/infra/docker/prometheus/rules"
+
+    if [[ ! -d "$alerts_dir" ]]; then
+        echo -e "${YELLOW}⚠️  WARNING: Alert rules directory not found at $alerts_dir${NC}"
+        return 0
+    fi
+
+    # Build a lookup map of all metrics (same as Step 3)
+    declare -A all_metrics
+    for prefix in "${!SERVICE_METRICS[@]}"; do
+        while IFS= read -r metric; do
+            [[ -z "$metric" ]] && continue
+            all_metrics[$metric]="$prefix"
+        done <<< "${SERVICE_METRICS[$prefix]}"
+    done
+
+    # Check each alert rules file
+    for alert_file in "$alerts_dir"/*.yaml "$alerts_dir"/*.yml; do
+        [[ ! -f "$alert_file" ]] && continue
+
+        local alert_name
+        alert_name=$(basename "$alert_file")
+
+        # Extract application metric names from expr: fields only (not annotations/labels)
+        # YAML uses 'expr: |' with indented block content. We capture the indent level
+        # of 'expr:' and include subsequent lines that are more deeply indented.
+        local queries
+        queries=$(awk '
+            /^[[:space:]]*expr:[[:space:]]/ {
+                in_expr=1
+                # Record indent level of expr: line
+                match($0, /^[[:space:]]*/)
+                expr_indent = RLENGTH
+                # If expr has inline value (not |), print it
+                if ($0 !~ /\|[[:space:]]*$/) print
+                next
+            }
+            in_expr {
+                # Check if this line is more deeply indented (continuation of expr block)
+                match($0, /^[[:space:]]*/)
+                line_indent = RLENGTH
+                if (line_indent > expr_indent && $0 !~ /^[[:space:]]*$/) {
+                    print
+                } else {
+                    in_expr=0
+                }
+            }
+        ' "$alert_file" | grep -oP '\b(ac|gc|mc|mh)_[a-z_]+' | sort -u || true)
+
+        while IFS= read -r metric; do
+            [[ -z "$metric" ]] && continue
+
+            # Check if metric exists in any service
+            local metric_exists=false
+
+            if [[ -v all_metrics[$metric] ]]; then
+                metric_exists=true
+            else
+                # Check if this is a histogram-generated metric (_bucket, _count, _sum)
+                for suffix in "_bucket" "_count" "_sum"; do
+                    if [[ "$metric" =~ $suffix$ ]]; then
+                        base_metric="${metric%$suffix}"
+                        if [[ -v all_metrics[$base_metric] ]]; then
+                            metric_exists=true
+                            break
+                        fi
+                    fi
+                done
+            fi
+
+            if ! $metric_exists; then
+                local prefix
+                prefix=$(echo "$metric" | cut -d'_' -f1)
+
+                echo -e "${RED}❌ ERROR: Alert file '$alert_name' uses metric '$metric'${NC}"
+                echo "   which is not defined in crates/${SERVICE_DIRS[$prefix]:-unknown}/src/observability/metrics.rs"
+                echo ""
+
+                # Find similar metrics (fuzzy matching)
+                local similar=""
+                if [[ -v SERVICE_METRICS[$prefix] ]] && [[ -n "${SERVICE_METRICS[$prefix]}" ]]; then
+                    local search_pattern
+                    search_pattern=$(echo "$metric" | sed -E 's/_(bucket|count|sum)$//' | sed 's/_[^_]*$//')
+                    similar=$(echo "${SERVICE_METRICS[$prefix]}" | tr ' ' '\n' | grep -i "$search_pattern" | head -3 || true)
+                fi
+                if [[ -n "$similar" ]]; then
+                    echo "   Similar metrics found:"
+                    while IFS= read -r sim; do
+                        [[ -z "$sim" ]] && continue
+                        echo "   - $sim"
+                    done <<< "$similar"
+                    echo ""
+                fi
+
+                ((errors++)) || true
+            fi
+        done <<< "$queries"
+    done
+
+    if [[ $errors -gt 0 ]]; then
+        return 1
+    fi
+
+    echo -e "${GREEN}✓ All alert rule metrics exist in source code${NC}"
+    return 0
+}
+
+# ============================================================================
+# Step 5: Check metric coverage in dashboards (hard fail)
+# (was Step 4 before alert validation was added)
 # ============================================================================
 
 check_metric_coverage() {
@@ -545,28 +662,35 @@ main() {
 
     echo ""
 
-    # Step 3: Validate dashboard metrics
+    # Step 3: Validate dashboard metrics against source code
     if ! validate_dashboard_metrics; then
         exit_code=1
     fi
 
     echo ""
 
-    # Step 4: Check dashboard coverage (hard fail)
+    # Step 4: Validate alert rule metrics against source code
+    if ! validate_alert_metrics; then
+        exit_code=1
+    fi
+
+    echo ""
+
+    # Step 5: Check dashboard coverage (hard fail)
     if ! check_metric_coverage; then
         exit_code=1
     fi
 
     echo ""
 
-    # Step 5: Check catalog documentation (hard fail)
+    # Step 6: Check catalog documentation (hard fail)
     if ! check_catalog_coverage; then
         exit_code=1
     fi
 
     echo ""
 
-    # Step 6: Validate target query mode fields (hard fail)
+    # Step 7: Validate target query mode fields (hard fail)
     if ! validate_target_query_fields; then
         exit_code=1
     fi
