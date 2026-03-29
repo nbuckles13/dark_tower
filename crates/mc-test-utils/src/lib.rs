@@ -78,6 +78,7 @@
 
 // Placeholder modules for skeleton
 pub mod fixtures;
+pub mod jwt_test;
 pub mod mock_gc;
 pub mod mock_mh;
 pub mod mock_redis;

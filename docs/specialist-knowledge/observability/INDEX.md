@@ -16,8 +16,7 @@
 - GC HTTP metrics middleware -> `crates/gc-service/src/middleware/http_metrics.rs:http_metrics_middleware()`
 - GC endpoint normalization -> `crates/gc-service/src/observability/metrics.rs:normalize_endpoint()`
 - GC join handler metrics wiring -> `crates/gc-service/src/handlers/meetings.rs:join_meeting()`
-- GC DB metrics (meetings) -> `crates/gc-service/src/repositories/meetings.rs:MeetingsRepository`
-- GC DB metrics (participants) -> `crates/gc-service/src/repositories/participants.rs:ParticipantsRepository`
+- GC DB metrics -> `crates/gc-service/src/repositories/` (meetings.rs, participants.rs)
 - MC metrics recording -> `crates/mc-service/src/observability/metrics.rs:init_metrics_recorder()`
 - MC join flow metrics -> `crates/mc-service/src/observability/metrics.rs:record_session_join()`
 - MC WebTransport connection metrics -> `crates/mc-service/src/observability/metrics.rs:record_webtransport_connection()`
@@ -61,16 +60,17 @@
 
 ## Runbooks
 - Per-service deployment + incident response -> `docs/runbooks/` (two per service)
-- GC scenarios 8-9 (meeting creation limits, code collision) -> `docs/runbooks/gc-incident-response.md`
-- Join failure triage (GC: mc_assignment/ac_request/not_found, MC: jwt/meeting/capacity) -> `docs/observability/alerts.md`
-- GC post-deploy meeting creation checklist -> `docs/runbooks/gc-deployment.md` (Post-Deploy Monitoring Checklist)
+- GC scenarios 8-9 (creation limits, code collision) -> `docs/runbooks/gc-incident-response.md`
+- Join failure triage (GC + MC error types) -> `docs/observability/alerts.md`
 
 ## Test Coverage
 - GC join integration tests (success, AC-down, no-MC, service-token-rejected) -> `crates/gc-service/tests/meeting_tests.rs` (task 14)
-- GC join tests use `get_test_metrics_handle()` but do not assert rendered metric values (pre-existing gap)
+- MC join integration tests (WebTransport, JWT, signaling bridge, 11 tests) -> `crates/mc-service/tests/join_tests.rs` (task 15)
+- MC/GC join tests exercise metric call sites but do not assert rendered values (global recorder conflict in parallel tests)
 - GC metrics unit tests (no-op recorder, code-path coverage only) -> `crates/gc-service/src/observability/metrics.rs`
+- MC metrics unit tests (DebuggingRecorder + snapshot) -> `crates/mc-service/src/observability/metrics.rs`
+- TestKeypair (Ed25519 JWT signing for tests) extracted to -> `crates/mc-test-utils/src/jwt_test.rs`
 
 ## Integration Seams
 - Env-tests observability validation -> `crates/env-tests/tests/30_observability.rs`
-- Observability mod re-exports (stale export risk) -> `crates/*/src/observability/mod.rs`
 - MC infra (TLS mount, WebTransport UDP NodePort) -> `infra/services/mc-service/`, `infra/kind/kind-config.yaml`

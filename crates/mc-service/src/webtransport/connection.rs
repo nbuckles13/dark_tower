@@ -525,6 +525,9 @@ async fn write_raw_framed(stream: &mut SendStream, data: &[u8]) -> Result<(), Mc
 }
 
 /// Send an error message to the client before closing.
+///
+/// Finishes the stream after writing to ensure data is flushed
+/// before the function returns and the stream is dropped.
 async fn send_error(
     stream: &mut SendStream,
     error_code: i32,
@@ -537,7 +540,10 @@ async fn send_error(
             details: Default::default(),
         })),
     };
-    write_framed_message(stream, &server_msg).await
+    let result = write_framed_message(stream, &server_msg).await;
+    // Finish the stream to flush buffered data before the caller drops it
+    let _ = stream.finish().await;
+    result
 }
 
 /// Build a protobuf `JoinResponse` from the actor's `JoinResult`.
