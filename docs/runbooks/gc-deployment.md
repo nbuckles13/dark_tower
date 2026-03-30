@@ -2,7 +2,7 @@
 
 **Service**: Global Controller (gc-service)
 **Version**: Phase 4 (ADR-0010 Implementation)
-**Last Updated**: 2026-02-28
+**Last Updated**: 2026-03-27
 **Owner**: Operations Team
 
 ---
@@ -848,32 +848,74 @@ kill %1
 - HTTP 401 with invalid/missing token
 - Response time: <200ms
 
-### Test 5: Meeting Join Endpoint (if test meeting exists)
+### Test 5: Meeting Join Endpoint
 
-**Purpose:** Verify meeting join flow end-to-end.
+**Purpose:** Verify meeting join flow end-to-end — token validation, meeting lookup, MC assignment, and join token issuance.
+
+**Prerequisites:** A valid meeting must exist. Use smoke test 6 (Meeting Creation) first, or use a known test meeting code.
 
 ```bash
 # Port-forward to pod
 kubectl port-forward -n dark-tower deployment/gc-service 8080:8080 &
 
-# Test meeting join (requires valid meeting code and token)
-curl -i http://localhost:8080/api/v1/meetings/TEST-CODE \
-  -H "Authorization: Bearer $TOKEN"
+# Step 1: Obtain a user token (reuse from test 6 or get fresh)
+USER_TOKEN=$(curl -s -X POST http://ac-service.dark-tower.svc.cluster.local:8082/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"smoke-test@example.com","password":"SmokeTest123!"}' \
+  | jq -r '.access_token')
 
-# Expected response:
-# HTTP/1.1 200 OK
-# Content-Type: application/json
-#
-# {"meeting_id":"...","mc_assignment":{"mc_id":"...","mc_url":"..."},"token":"..."}
+# Step 2: Join the meeting
+MEETING_CODE="REPLACE_WITH_VALID_CODE"  # From test 6 output
+JOIN_RESPONSE=$(curl -s -w "\n%{http_code}" http://localhost:8080/api/v1/meetings/${MEETING_CODE} \
+  -H "Authorization: Bearer $USER_TOKEN")
+
+HTTP_CODE=$(echo "$JOIN_RESPONSE" | tail -1)
+BODY=$(echo "$JOIN_RESPONSE" | sed '$d')
+
+echo "HTTP Status: $HTTP_CODE"
+echo "Response: $BODY"
+
+# Step 3: Verify response structure
+MEETING_ID=$(echo "$BODY" | jq -r '.meeting_id')
+MC_ID=$(echo "$BODY" | jq -r '.mc_assignment.mc_id')
+MC_URL=$(echo "$BODY" | jq -r '.mc_assignment.mc_url')
+JOIN_TOKEN=$(echo "$BODY" | jq -r '.token')
+
+echo "Meeting ID: $MEETING_ID"
+echo "MC ID: $MC_ID"
+echo "MC URL: $MC_URL"
+echo "Join token present: $([ -n "$JOIN_TOKEN" ] && [ "$JOIN_TOKEN" != "null" ] && echo 'yes' || echo 'no')"
+
+# Step 4: Verify MC assignment is a healthy MC
+kubectl exec -it deployment/gc-service -n dark-tower -- \
+  psql $DATABASE_URL -c "SELECT id, status, last_heartbeat FROM meeting_controllers WHERE id = '${MC_ID}';"
+
+# Step 5: Verify invalid meeting code returns 404
+INVALID_RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" \
+  http://localhost:8080/api/v1/meetings/INVALID-CODE-999 \
+  -H "Authorization: Bearer $USER_TOKEN")
+echo "Invalid code HTTP status: $INVALID_RESPONSE (expect 404)"
+
+# Step 6: Verify unauthenticated request returns 401
+UNAUTH_RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" \
+  http://localhost:8080/api/v1/meetings/${MEETING_CODE})
+echo "Unauthenticated HTTP status: $UNAUTH_RESPONSE (expect 401)"
+
+# Step 7: Verify join metrics incremented
+curl -s http://localhost:8080/metrics | grep -E "gc_meeting_join_total|gc_meeting_join_duration"
 
 # Kill port-forward
 kill %1
 ```
 
 **Success criteria:**
-- HTTP 200 status for valid meeting code
+- HTTP 200 status for valid meeting code with valid token
+- Response contains `meeting_id` (non-empty UUID)
+- Response contains `mc_assignment` with `mc_id` and `mc_url` (assigned MC is healthy/active)
+- Response contains `token` (join token for MC WebTransport session)
 - HTTP 404 for invalid meeting code
-- Response includes MC assignment details
+- HTTP 401 for missing/invalid token
+- `gc_meeting_join_total` counter incremented
 - Response time: <200ms (SLO)
 
 ### Test 6: Meeting Creation
@@ -1079,6 +1121,59 @@ kubectl rollout undo deployment/gc-service -n dark-tower
 # No data cleanup is required after rollback.
 ```
 
+### Post-Deploy Monitoring Checklist: Join Flow
+
+Use this checklist after any deployment that touches meeting join code (join handler, MC assignment, join token issuance, or join-related configuration). For routine deployments that do not affect the join path, the general monitoring section above is sufficient.
+
+**15-minute check:**
+
+```promql
+# Join rate (should be > 0 if traffic is flowing)
+sum(rate(gc_meeting_join_total[5m]))
+
+# Join failure rate (should be < 1%)
+sum(rate(gc_meeting_join_failures_total[5m]))
+/ sum(rate(gc_meeting_join_total[5m]))
+
+# Join latency p95 (SLO: < 200ms)
+histogram_quantile(0.95,
+  sum by(le) (rate(gc_meeting_join_duration_seconds_bucket[5m]))
+)
+```
+
+- [ ] `gc_meeting_join_total` rate stable (confirms join traffic is flowing)
+- [ ] `gc_meeting_join_duration_seconds` p95 within SLO (<200ms)
+- [ ] `gc_meeting_join_failures_total` not spiking (failure rate <1%)
+- [ ] No new `GCHighJoinFailureRate` or `GCHighJoinLatency` alerts firing
+
+**1-hour check:**
+
+- [ ] Join success rate trend is stable (not degrading)
+- [ ] No pod restarts since deployment completed
+- [ ] MC assignment latency within baseline (`gc_mc_assignment_duration_seconds` p95 <20ms)
+- [ ] Logs show no repeated error patterns related to join flow
+
+**4-hour check:**
+
+- [ ] All join flow alerts clear
+- [ ] Join latency trend is stable (no drift toward SLO boundary)
+- [ ] No anomalous patterns in join failure reasons
+- [ ] Database query latency for join operations within baseline
+
+**Rollback criteria** (trigger immediate rollback if any):
+
+- `gc_meeting_join_failures_total` rate >5% for 10 minutes
+- `gc_meeting_join_duration_seconds` p95 >500ms for 5 minutes (2.5x SLO)
+- `GCHighJoinFailureRate` or `GCHighJoinLatency` alert fires and does not resolve within 5 minutes
+
+```bash
+# Rollback command
+kubectl rollout undo deployment/gc-service -n dark-tower
+
+# Note: In-flight join requests will fail; clients will retry.
+# No data cleanup is required after rollback.
+```
+
 ### Logs Analysis
 
 **Useful log queries:**
@@ -1127,6 +1222,6 @@ kubectl logs -n dark-tower -l app=gc-service --since=1h | grep -i "mc_assignment
 
 ---
 
-**Document Version:** 1.1
-**Last Reviewed:** 2026-02-28
-**Next Review:** 2026-03-28
+**Document Version:** 1.2
+**Last Reviewed:** 2026-03-27
+**Next Review:** 2026-04-27

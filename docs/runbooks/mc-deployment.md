@@ -2,7 +2,7 @@
 
 **Service**: Meeting Controller (mc-service)
 **Version**: Phase 4a (ADR-0010 Implementation)
-**Last Updated**: 2026-02-09
+**Last Updated**: 2026-03-27
 **Owner**: Operations Team
 
 ---
@@ -246,6 +246,7 @@ Minimum required smoke tests:
 - [ ] Readiness check returns 200 OK
 - [ ] Metrics endpoint returns Prometheus format
 - [ ] GC heartbeat succeeding
+- [ ] Join flow works (WebTransport connect, JoinRequest/Response)
 
 ### 7. Verify GC Registration
 
@@ -700,6 +701,60 @@ kubectl exec -it deployment/gc-service -n dark-tower -- \
 - Status is 'active'
 - last_heartbeat is recent (<15 seconds old)
 
+### Test 5: Join Flow (WebTransport + Signaling)
+
+**Purpose:** Verify the full participant join flow — WebTransport connect, JoinRequest/JoinResponse, and participant notifications.
+
+**Prerequisites:** A valid meeting must exist (created via GC). Obtain a participant JWT from GC's join endpoint.
+
+```bash
+# Step 1: Obtain join token via GC
+kubectl port-forward -n dark-tower deployment/gc-service 8080:8080 &
+JOIN_RESPONSE=$(curl -s http://localhost:8080/api/v1/meetings/TEST-CODE \
+  -H "Authorization: Bearer $TOKEN")
+MC_URL=$(echo "$JOIN_RESPONSE" | jq -r '.mc_assignment.mc_url')
+JOIN_TOKEN=$(echo "$JOIN_RESPONSE" | jq -r '.token')
+kill %1
+
+echo "MC URL: $MC_URL"
+echo "Join token obtained: $([ -n "$JOIN_TOKEN" ] && echo 'yes' || echo 'no')"
+
+# Step 2: Verify WebTransport connection to MC
+# Use a WebTransport test client (e.g., webtransport-cli or browser devtools)
+# Connect to: $MC_URL with the join token
+# Expected: Connection established, HTTP/3 CONNECT succeeds
+
+# Step 3: Send JoinRequest over WebTransport session
+# Using the established WebTransport session, send a JoinRequest protobuf message
+# Expected: MC responds with JoinResponse containing:
+#   - participant_id (non-empty UUID)
+#   - session info (meeting_id, current participants)
+#   - media configuration
+
+# Step 4: Verify participant notification
+# Other participants in the meeting (if any) should receive a
+# ParticipantJoined notification via their WebTransport session
+# Expected: Notification contains new participant's display name and ID
+
+# Step 5: Verify join metrics incremented
+kubectl port-forward -n dark-tower deployment/mc-service 8080:8080 &
+curl -s http://localhost:8080/metrics | grep -E "mc_session_joins_total|mc_session_join_duration"
+kill %1
+
+# Expected:
+# mc_session_joins_total should have incremented
+# mc_session_join_duration_seconds should show recent observation
+```
+
+**Success criteria:**
+- WebTransport connection established successfully (HTTP/3 CONNECT 200)
+- JoinRequest accepted, JoinResponse received with valid participant_id
+- Existing participants receive ParticipantJoined notification
+- `mc_session_joins_total` counter incremented
+- `mc_session_join_duration_seconds` recorded (p95 <500ms SLO)
+- No errors in MC logs related to the join flow
+- Response time: JoinRequest to JoinResponse <500ms
+
 ---
 
 ## Monitoring and Verification
@@ -772,6 +827,63 @@ See `infra/grafana/dashboards/mc-overview.json`.
 
 See `infra/docker/prometheus/rules/mc-alerts.yaml` for full list.
 
+### Post-Deploy Monitoring Checklist: Join Flow
+
+Use this checklist after any deployment that touches join flow code (WebTransport session handling, JoinRequest/JoinResponse processing, participant notifications, or JWT validation). For routine deployments that do not affect the join path, the general monitoring section above is sufficient.
+
+**15-minute check:**
+
+```promql
+# Session join rate (should be > 0 if traffic is flowing)
+sum(rate(mc_session_joins_total[5m]))
+
+# Join failure rate (should be < 1%)
+sum(rate(mc_session_join_failures_total[5m]))
+/ sum(rate(mc_session_joins_total[5m]))
+
+# Join latency p95 (SLO: < 500ms)
+histogram_quantile(0.95,
+  sum by(le) (rate(mc_session_join_duration_seconds_bucket[5m]))
+)
+```
+
+- [ ] `mc_session_joins_total` rate stable or increasing (confirms join traffic is flowing)
+- [ ] `mc_session_join_duration_seconds` p95 within SLO (<500ms)
+- [ ] `mc_session_join_failures_total` not spiking (failure rate <1%)
+- [ ] `mc_webtransport_connections_total{status="rejected"}` not elevated vs. pre-deploy baseline
+- [ ] `mc_jwt_validations_total{result="failure"}` not elevated vs. pre-deploy baseline
+- [ ] No new `MCHighJoinFailureRate` or `MCHighJoinLatency` alerts firing
+
+**1-hour check:**
+
+- [ ] Join success rate trend is stable (not degrading)
+- [ ] No pod restarts since deployment completed
+- [ ] WebTransport connection rejection rate steady (no upward trend)
+- [ ] JWT validation failure rate steady (no upward trend)
+- [ ] Logs show no repeated error patterns related to join flow
+
+**4-hour check:**
+
+- [ ] All join flow alerts clear
+- [ ] Join latency trend is stable (no drift toward SLO boundary)
+- [ ] No anomalous patterns in join failure reasons
+- [ ] Actor mailbox depths remain low (<50) under join traffic load
+
+**Rollback criteria** (trigger immediate rollback if any):
+
+- `mc_session_join_failures_total` rate >5% for 10 minutes
+- `mc_session_join_duration_seconds` p95 >1s for 5 minutes (2x SLO)
+- `mc_webtransport_connections_total{status="rejected"}` rate doubles vs. pre-deploy baseline
+- `MCHighJoinFailureRate` or `MCHighJoinLatency` alert fires and does not resolve within 5 minutes
+
+```bash
+# Rollback command
+kubectl rollout undo deployment/mc-service -n dark-tower
+
+# Note: Active sessions on old pods will drain gracefully (60s).
+# New joins will route to rolled-back pods once they register with GC.
+```
+
 ---
 
 ## Emergency Contacts
@@ -800,6 +912,6 @@ See `infra/docker/prometheus/rules/mc-alerts.yaml` for full list.
 
 ---
 
-**Document Version:** 1.0
-**Last Reviewed:** 2026-02-09
-**Next Review:** 2026-03-09
+**Document Version:** 1.1
+**Last Reviewed:** 2026-03-27
+**Next Review:** 2026-04-27
