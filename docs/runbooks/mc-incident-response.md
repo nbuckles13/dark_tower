@@ -3,7 +3,7 @@
 **Service**: Meeting Controller (mc-service)
 **Owner**: SRE Team
 **On-Call Rotation**: PagerDuty - Dark Tower MC Team
-**Last Updated**: 2026-02-09
+**Last Updated**: 2026-03-27
 
 ---
 
@@ -19,6 +19,9 @@
    - [Scenario 5: High Latency](#scenario-5-high-latency)
    - [Scenario 6: GC Integration Failures](#scenario-6-gc-integration-failures)
    - [Scenario 7: Resource Pressure](#scenario-7-resource-pressure)
+   - [Scenario 8: Join Failures](#scenario-8-join-failures)
+   - [Scenario 9: WebTransport Rejections](#scenario-9-webtransport-rejections)
+   - [Scenario 10: JWT Validation Failures](#scenario-10-jwt-validation-failures)
 4. [Diagnostic Commands](#diagnostic-commands)
 5. [Recovery Procedures](#recovery-procedures)
 6. [Postmortem Template](#postmortem-template)
@@ -118,11 +121,11 @@ sum by(actor_type) (mc_actor_mailbox_depth)
 
 # 3. Check message processing rate vs incoming rate
 # Processing rate:
-sum by(actor_type) (rate(mc_message_processing_duration_seconds_count[5m]))
+sum by(actor_type) (rate(mc_message_latency_seconds_count[5m]))
 # If processing rate is lower than mailbox growth, actor is overwhelmed
 
 # 4. Check for slow message processing
-histogram_quantile(0.99, sum by(le, actor_type) (rate(mc_message_processing_duration_seconds_bucket[5m])))
+histogram_quantile(0.99, sum by(le, actor_type) (rate(mc_message_latency_seconds_bucket[5m])))
 
 # 5. Check active meetings and connections
 curl http://localhost:8080/metrics | grep -E "mc_meetings_active|mc_connections_active"
@@ -305,7 +308,7 @@ curl http://localhost:8080/metrics | grep -E "mc_meetings_active|mc_connections_
 kill %1
 
 # 2. Check message processing activity
-curl http://localhost:8080/metrics | grep mc_message_processing_duration_seconds
+curl http://localhost:8080/metrics | grep mc_message_latency_seconds
 
 # 3. Look for meeting-related errors in logs
 kubectl logs -n dark-tower -l app=mc-service --tail=500 | grep -i "meeting\|session\|lifecycle"
@@ -490,12 +493,12 @@ kubectl logs -n dark-tower -l app=mc-service --tail=50
 ```bash
 # 1. Check current latency metrics
 kubectl port-forward -n dark-tower deployment/mc-service 8080:8080 &
-curl http://localhost:8080/metrics | grep mc_message_processing_duration_seconds
+curl http://localhost:8080/metrics | grep mc_message_latency_seconds
 kill %1
 
 # 2. Check latency by actor type
 # In Prometheus:
-histogram_quantile(0.95, sum by(actor_type, le) (rate(mc_message_processing_duration_seconds_bucket[5m])))
+histogram_quantile(0.95, sum by(actor_type, le) (rate(mc_message_latency_seconds_bucket[5m])))
 
 # 3. Check mailbox depth (backpressure causes latency)
 sum by(actor_type) (mc_actor_mailbox_depth)
@@ -504,7 +507,7 @@ sum by(actor_type) (mc_actor_mailbox_depth)
 kubectl top pods -n dark-tower -l app=mc-service
 
 # 5. Check for GC heartbeat latency (slow GC can cause delays)
-histogram_quantile(0.95, sum by(le) (rate(mc_gc_heartbeat_duration_seconds_bucket[5m])))
+histogram_quantile(0.95, sum by(le) (rate(mc_gc_heartbeat_latency_seconds_bucket[5m])))
 
 # 6. Check for garbage collection pauses (if applicable)
 kubectl logs -n dark-tower -l app=mc-service --tail=500 | grep -i "gc\|pause"
@@ -562,7 +565,7 @@ kubectl delete pod <POD_NAME> -n dark-tower
 # WARNING: Active meetings affected
 
 # Verify recovery
-histogram_quantile(0.95, sum by(le) (rate(mc_message_processing_duration_seconds_bucket[5m])))
+histogram_quantile(0.95, sum by(le) (rate(mc_message_latency_seconds_bucket[5m])))
 # Should return value < 0.500
 ```
 
@@ -767,6 +770,391 @@ kubectl top pods -n dark-tower -l app=mc-service
 
 ---
 
+### Scenario 8: Join Failures
+
+**Alert**: `MCHighJoinFailureRate`
+**Severity**: Warning
+**Runbook Section**: `#scenario-8-join-failures`
+
+**Symptoms**:
+- Session join failure rate >5% for 5 minutes
+- Users unable to join meetings
+- `mc_session_join_failures_total` incrementing by `error_type`
+- "Session Join Failures by Type" dashboard panel showing elevated counts
+
+**Diagnosis**:
+
+```bash
+# 1. Check overall join success/failure rate
+kubectl port-forward -n dark-tower deployment/mc-service 8080:8080 &
+curl http://localhost:8080/metrics | grep mc_session_joins_total
+kill %1
+
+# 2. Break down failures by error type (most important diagnostic step)
+# In Prometheus:
+sum by(error_type) (rate(mc_session_join_failures_total[5m]))
+
+# 3. Check join latency (slow joins may indicate upstream issues)
+histogram_quantile(0.95, sum by(le) (rate(mc_session_join_duration_seconds_bucket{status="success"}[5m])))
+
+# 4. Check join failure rate
+(
+  sum(rate(mc_session_joins_total{status="failure"}[5m]))
+  /
+  sum(rate(mc_session_joins_total[5m]))
+)
+
+# 5. Check active meetings and capacity
+kubectl port-forward -n dark-tower deployment/mc-service 8080:8080 &
+curl http://localhost:8080/metrics | grep -E "mc_meetings_active|mc_connections_active"
+kill %1
+
+# 6. Check MC logs for join errors
+kubectl logs -n dark-tower -l app=mc-service --tail=500 | grep -i "join\|JoinRequest\|session"
+
+# 7. Check Redis health (session state depends on Redis)
+kubectl port-forward -n dark-tower deployment/mc-service 8080:8080 &
+curl http://localhost:8080/metrics | grep mc_redis_latency_seconds
+kill %1
+```
+
+**Common Root Causes**:
+
+Triage by the `error_type` label on `mc_session_join_failures_total`:
+
+1. **`jwt_validation`**: Token validation failed during join
+   - Check: See [Scenario 10](#scenario-10-jwt-validation-failures) for full diagnosis
+   - Fix: Resolve JWT/JWKS issues per Scenario 10
+
+2. **`meeting_not_found`**: Client requested a meeting that does not exist on this MC
+   - Check: Verify meeting assignment in GC database, check if meeting ended
+   - Fix: Client may have stale meeting assignment; check GC routing
+
+3. **`mc_capacity_exceeded`**: MC instance at maximum meeting capacity
+   - Check: `mc_meetings_active` metric vs configured capacity limit
+   - Fix: Scale horizontally, check GC load balancing
+
+4. **`meeting_capacity_exceeded`**: Individual meeting at participant limit
+   - Check: Meeting participant count in logs
+   - Fix: Expected behavior if meeting is full; inform user
+
+5. **`redis`**: Redis operation failed during join flow (session binding, fencing)
+   - Check: Redis health, `mc_redis_latency_seconds` metric, connection pool metrics
+   - Fix: Check Redis pod health, connection pool exhaustion, network connectivity
+
+6. **`session_binding`**: Session binding token validation failed
+   - Check: Binding token expiry, secret mismatch between MC instances
+   - Fix: Verify `MC_BINDING_TOKEN_SECRET` is consistent across MC replicas
+
+7. **`fenced_out`**: Stale fencing generation (split-brain protection triggered)
+   - Check: `mc_fenced_out_total` metric, Redis fencing generation
+   - Fix: MC may need restart to acquire fresh generation
+
+8. **`draining` / `migrating`**: MC is draining or migrating meetings away
+   - Check: MC status in GC database
+   - Fix: Expected during maintenance; joins will succeed on another MC
+
+9. **`internal`**: Unexpected internal error (stream failures, decode errors)
+   - Check: MC logs for stack traces or error details
+   - Fix: Investigate logs, may require code fix or rollback
+
+**Remediation**:
+
+```bash
+# Step 1: Identify dominant error_type from dashboard or PromQL
+sum by(error_type) (rate(mc_session_join_failures_total[5m]))
+
+# Step 2: Apply targeted fix based on error_type (see root causes above)
+
+# Step 3: If redis errors — check Redis health
+kubectl get pods -n dark-tower -l app=redis
+kubectl exec -it deployment/redis -n dark-tower -- redis-cli ping
+# Expected: PONG
+
+# Step 4: If capacity exceeded — scale MC
+kubectl scale deployment/mc-service -n dark-tower --replicas=5
+
+# Expected recovery time: 30-60 seconds
+
+# Step 5: If internal errors persist — restart as last resort
+# See Recovery Procedures: #service-restart-procedure
+# WARNING: Active meetings on restarted pods will be affected
+
+# Verify recovery
+kubectl port-forward -n dark-tower deployment/mc-service 8080:8080 &
+curl http://localhost:8080/metrics | grep mc_session_joins_total
+kill %1
+# Failure rate should be decreasing
+```
+
+**Escalation**:
+- If `jwt_validation` errors dominate, escalate to AC Team (JWKS endpoint issue)
+- If `redis` errors dominate, escalate to Infrastructure Team
+- If `internal` errors persist after restart, escalate to MC Team for root cause
+- If failure rate stays >5% for >15 minutes, upgrade to P2
+
+---
+
+### Scenario 9: WebTransport Rejections
+
+**Alert**: `MCHighWebTransportRejections`
+**Severity**: Warning
+**Runbook Section**: `#scenario-9-webtransport-rejections`
+
+**Symptoms**:
+- WebTransport connection rejection rate >10% for 5 minutes
+- Users unable to establish WebTransport sessions
+- `mc_webtransport_connections_total{status="rejected"}` or `{status="error"}` elevated
+- "WebTransport Connections by Status" dashboard panel showing rejected/error spike
+
+**Diagnosis**:
+
+```bash
+# 1. Check WebTransport connection counts by status
+kubectl port-forward -n dark-tower deployment/mc-service 8080:8080 &
+curl http://localhost:8080/metrics | grep mc_webtransport_connections_total
+kill %1
+
+# 2. Break down by status (accepted vs rejected vs error)
+# In Prometheus:
+sum by(status) (rate(mc_webtransport_connections_total[5m]))
+
+# 3. Calculate rejection rate
+(
+  sum(rate(mc_webtransport_connections_total{status="rejected"}[5m]))
+  /
+  sum(rate(mc_webtransport_connections_total[5m]))
+)
+
+# 4. Check TLS certificate validity
+kubectl exec -it deployment/mc-service -n dark-tower -- \
+  openssl x509 -in /certs/tls.crt -noout -dates -subject
+# Verify: notAfter is in the future
+
+# 5. Check MC logs for TLS/QUIC errors
+kubectl logs -n dark-tower -l app=mc-service --tail=500 | grep -iE "tls|quic|certificate|handshake|reject"
+
+# 6. Check UDP port connectivity (WebTransport uses QUIC/UDP)
+kubectl get svc -n dark-tower mc-service -o yaml | grep -A5 "port:"
+# Verify UDP port 4433 is exposed
+
+# 7. Check network policies for UDP traffic
+kubectl get networkpolicy -n dark-tower
+kubectl describe networkpolicy mc-service -n dark-tower
+
+# 8. Check MC capacity (rejections may be due to connection limits)
+kubectl port-forward -n dark-tower deployment/mc-service 8080:8080 &
+curl http://localhost:8080/metrics | grep -E "mc_connections_active|mc_meetings_active"
+kill %1
+
+# 9. Check pod resource pressure (may cause accept loop failures)
+kubectl top pods -n dark-tower -l app=mc-service
+```
+
+**Common Root Causes**:
+
+1. **TLS Certificate Expired or Missing**: QUIC handshake fails before WebTransport session
+   - Check: Certificate dates via `openssl x509 -noout -dates`
+   - Fix: Rotate certificate, verify cert-manager is running
+
+2. **UDP Port Blocked**: Network policy or cloud firewall blocking QUIC/UDP
+   - Check: NetworkPolicy, cloud security groups, `kubectl get svc` for port config
+   - Fix: Update network policy to allow UDP on port 4433
+
+3. **QUIC Listener Crash**: WebTransport accept loop panicked or stopped
+   - Check: MC logs for panic traces, `mc_actor_panics_total` metric
+   - Fix: Restart MC pod; if recurring, escalate for code fix
+
+4. **Connection Capacity Exceeded**: Too many concurrent WebTransport connections
+   - Check: `mc_connections_active` metric vs configured limit
+   - Fix: Scale horizontally to distribute connections
+
+5. **TLS Certificate Mismatch**: Client connecting with wrong SNI or hostname
+   - Check: MC logs for TLS handshake errors mentioning SNI
+   - Fix: Verify DNS resolution and client connection URL
+
+6. **Transport-Level Errors** (`status="error"`): Network interruptions, malformed QUIC packets
+   - Check: `mc_webtransport_connections_total{status="error"}` rate
+   - Fix: Investigate network path; may indicate DDoS or network instability
+
+**Remediation**:
+
+```bash
+# Option 1: Rotate TLS certificate (if expired)
+# Check cert-manager status
+kubectl get certificate -n dark-tower
+kubectl describe certificate mc-service-tls -n dark-tower
+# If cert-manager is not renewing, manually trigger:
+kubectl delete secret mc-service-tls -n dark-tower
+# cert-manager will recreate it
+
+# Expected recovery time: 1-2 minutes (cert issuance + pod restart)
+
+# Option 2: Fix network policy (if UDP blocked)
+kubectl get networkpolicy mc-service -n dark-tower -o yaml
+# Verify ingress allows UDP on port 4433
+# Edit if needed:
+kubectl edit networkpolicy mc-service -n dark-tower
+
+# Expected recovery time: immediate after policy update
+
+# Option 3: Scale horizontally (if capacity exceeded)
+kubectl scale deployment/mc-service -n dark-tower --replicas=5
+
+# Expected recovery time: 30-60 seconds
+
+# Option 4: Restart MC (if QUIC listener crashed)
+# See Recovery Procedures: #service-restart-procedure
+
+# Verify recovery
+kubectl port-forward -n dark-tower deployment/mc-service 8080:8080 &
+curl http://localhost:8080/metrics | grep mc_webtransport_connections_total
+kill %1
+# Rejection rate should be decreasing, accepted rate increasing
+```
+
+**Escalation**:
+- If TLS cert cannot be renewed, escalate to Infrastructure Team
+- If network policy changes needed, escalate to Infrastructure Team
+- If QUIC listener crashes repeatedly, escalate to MC Team
+- If rejection rate stays >10% for >15 minutes, upgrade to P2
+
+---
+
+### Scenario 10: JWT Validation Failures
+
+**Alert**: `MCHighJwtValidationFailures`
+**Severity**: Warning
+**Runbook Section**: `#scenario-10-jwt-validation-failures`
+
+**Symptoms**:
+- JWT validation failure rate >10% for 5 minutes
+- Users unable to authenticate for meeting join
+- `mc_jwt_validations_total{result="failure"}` elevated
+- "JWT Validations by Result & Type" dashboard panel showing failure spike
+- MC logs: "JWT validation failed" (actual failure reason logged at debug level; client receives generic "The access token is invalid or expired" by design)
+
+**Diagnosis**:
+
+```bash
+# 1. Check JWT validation success/failure counts
+kubectl port-forward -n dark-tower deployment/mc-service 8080:8080 &
+curl http://localhost:8080/metrics | grep mc_jwt_validations_total
+kill %1
+
+# 2. Break down failures by token_type (meeting vs guest)
+# In Prometheus:
+sum by(token_type) (rate(mc_jwt_validations_total{result="failure"}[5m]))
+# If "meeting" tokens failing: likely AC JWKS issue
+# If "guest" tokens failing: likely GC token issue
+
+# 3. Calculate failure rate
+(
+  sum(rate(mc_jwt_validations_total{result="failure"}[5m]))
+  /
+  sum(rate(mc_jwt_validations_total[5m]))
+)
+
+# 4. Check AC service health (JWKS source)
+kubectl get pods -n dark-tower -l app=ac-service
+kubectl exec -it deployment/mc-service -n dark-tower -- \
+  curl -s http://ac-service.dark-tower.svc.cluster.local:8080/.well-known/jwks.json | head -c 500
+# Verify: returns JSON with "keys" array containing at least one key
+
+# 5. Check JWKS endpoint returns expected key IDs
+kubectl exec -it deployment/mc-service -n dark-tower -- \
+  curl -s http://ac-service.dark-tower.svc.cluster.local:8080/.well-known/jwks.json | grep '"kid"'
+# Expected format: kid values like "auth-prod-2026-01"
+# During key rotation: should see BOTH old and new kid values (overlap period)
+
+# 6. Check clock skew between MC and AC pods
+kubectl exec -it deployment/mc-service -n dark-tower -- date -u
+kubectl exec -it deployment/ac-service -n dark-tower -- date -u
+# Compare timestamps — drift >5s may cause validation failures
+# (MC allows DEFAULT_CLOCK_SKEW_SECONDS = 5 for binding tokens;
+#  common JWT layer allows 300s for standard tokens per NIST SP 800-63B)
+
+# 7. Check NTP sync on nodes
+kubectl get pods -n dark-tower -l app=mc-service -o wide
+# Note the node, then check NTP on that node
+
+# 8. Check MC logs for JWT failure details (debug level)
+kubectl logs -n dark-tower -l app=mc-service --tail=500 | grep -i "jwt\|jwks\|token\|validation"
+
+# 9. Check if this correlates with join failures
+sum by(error_type) (rate(mc_session_join_failures_total[5m]))
+# If error_type="jwt_validation" dominates, this scenario is the root cause
+```
+
+**Common Root Causes**:
+
+1. **AC JWKS Endpoint Down**: MC cannot fetch public keys for validation
+   - Check: AC pod health, JWKS endpoint response
+   - Fix: Restart AC service, check AC logs
+   - Note: MC caches JWKS keys with a 5-minute TTL (`JwksClient` default 300s). If AC goes down briefly, MC continues validating with cached keys. Failures start after cache expires.
+
+2. **Clock Skew**: MC and AC system clocks diverged beyond tolerance
+   - Check: Compare `date -u` output from MC and AC pods
+   - Fix: Verify NTP sync on underlying nodes; restart chrony/ntpd if needed
+
+3. **Key Rotation In Progress**: AC rotated signing keys but MC has not yet refreshed its JWKS cache
+   - Check: JWKS endpoint should return both old and new `kid` values during rotation overlap period. If only the new key is present, tokens signed with the old key will fail.
+   - Fix: Wait up to 5 minutes for MC JWKS cache to refresh. If AC removed the old key too early, the rotation was misconfigured — escalate to AC Team.
+
+4. **Token Forging / Tampering Attempts**: Invalid signatures from unauthorized tokens
+   - Check: Failure rate pattern — steady low rate suggests probing; sudden spike suggests legitimate issue. Check MC logs at debug level for signature verification vs expiry vs type mismatch failures.
+   - Fix: If confirmed tampering, escalate to Security Team. MC intentionally returns generic error messages to prevent information leakage.
+
+5. **Token Type Mismatch**: Client sending wrong token type (e.g., guest token where meeting token expected)
+   - Check: MC logs for token type validation errors
+   - Fix: Client-side bug — escalate to Client Team
+
+**Remediation**:
+
+```bash
+# Step 1: Verify AC JWKS endpoint is healthy
+kubectl exec -it deployment/mc-service -n dark-tower -- \
+  curl -s -o /dev/null -w "%{http_code}" http://ac-service.dark-tower.svc.cluster.local:8080/.well-known/jwks.json
+# Expected: 200
+
+# Step 2: If AC is down, restart AC
+kubectl get pods -n dark-tower -l app=ac-service
+kubectl rollout restart deployment/ac-service -n dark-tower
+
+# Expected recovery time: 2-3 minutes (AC restart + up to 5 min MC JWKS cache refresh)
+
+# Step 3: If clock skew, fix NTP on affected nodes
+# Identify node:
+kubectl get pods -n dark-tower -l app=mc-service -o wide
+# On the node, restart NTP:
+# systemctl restart chronyd  (or ntpd)
+
+# Expected recovery time: 1-2 minutes after NTP sync
+
+# Step 4: If key rotation issue, wait for JWKS cache refresh
+# MC refreshes JWKS cache every 5 minutes (300s TTL)
+# Monitor validation failures — should resolve within 5 minutes after
+# AC JWKS endpoint serves the correct keys
+
+# Step 5: If tampering suspected, escalate to Security Team immediately
+# Do NOT restart services — preserve logs for forensic analysis
+
+# Verify recovery
+kubectl port-forward -n dark-tower deployment/mc-service 8080:8080 &
+curl http://localhost:8080/metrics | grep mc_jwt_validations_total
+kill %1
+# Failure rate should be decreasing
+```
+
+**Escalation**:
+- If AC is down or JWKS endpoint returns errors, escalate to AC Team
+- If clock skew on nodes, escalate to Infrastructure Team
+- If key rotation misconfigured (old key removed too early), escalate to AC Team
+- If tampering suspected, escalate to Security Team immediately — preserve logs
+- If failure rate stays >10% for >15 minutes, upgrade to P2
+
+---
+
 ## Diagnostic Commands
 
 ### Quick Health Check
@@ -802,8 +1190,8 @@ curl http://localhost:8080/metrics | grep mc_meetings
 # Connection metrics
 curl http://localhost:8080/metrics | grep mc_connections
 
-# Message processing metrics
-curl http://localhost:8080/metrics | grep mc_message_processing
+# Message latency metrics
+curl http://localhost:8080/metrics | grep mc_message_latency
 
 # GC integration metrics
 curl http://localhost:8080/metrics | grep mc_gc
@@ -1017,6 +1405,7 @@ All times in UTC.
 - Quarterly comprehensive review
 
 **Version History**:
+- 2026-03-27: Add Scenarios 8-10 (join failures, WebTransport rejections, JWT validation failures); fix 7 stale metric references
 - 2026-02-09: Initial version
 
 ---
