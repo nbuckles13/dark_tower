@@ -25,6 +25,7 @@ pub enum ClusterError {
 pub struct ClusterPorts {
     pub ac_service: u16,
     pub gc_service: u16,
+    pub mc_webtransport: u16,
     pub prometheus: u16,
     pub grafana: u16,
     pub loki: Option<u16>,
@@ -35,6 +36,7 @@ impl Default for ClusterPorts {
         Self {
             ac_service: 8082,
             gc_service: 8080,
+            mc_webtransport: 4433,
             prometheus: 9090,
             grafana: 3000,
             loki: Some(3100),
@@ -48,6 +50,7 @@ impl Default for ClusterPorts {
 pub struct ClusterConnection {
     pub ac_base_url: String,
     pub gc_base_url: String,
+    pub mc_webtransport_url: String,
     pub prometheus_base_url: String,
     pub grafana_base_url: String,
     pub loki_base_url: Option<String>,
@@ -104,9 +107,13 @@ impl ClusterConnection {
             format!("http://localhost:{}", ports.gc_service)
         };
 
+        // MC WebTransport URL (HTTPS — QUIC/HTTP3)
+        let mc_webtransport_url = format!("https://localhost:{}", ports.mc_webtransport);
+
         Ok(Self {
             ac_base_url: format!("http://localhost:{}", ports.ac_service),
             gc_base_url,
+            mc_webtransport_url,
             prometheus_base_url: format!("http://localhost:{}", ports.prometheus),
             grafana_base_url: format!("http://localhost:{}", ports.grafana),
             loki_base_url,
@@ -179,6 +186,15 @@ impl ClusterConnection {
     /// Returns true if GC port-forward is detected and health check passes.
     pub async fn is_gc_available(&self) -> bool {
         self.check_gc_health().await.is_ok()
+    }
+
+    /// Get the MC WebTransport URL.
+    ///
+    /// MC availability cannot be probed at initialization time because MC
+    /// uses QUIC (UDP), not TCP. Tests that require MC should attempt to
+    /// connect and handle connection failures gracefully.
+    pub fn mc_webtransport_url(&self) -> &str {
+        &self.mc_webtransport_url
     }
 
     /// Check if the AC service ready endpoint is responding.
@@ -254,6 +270,7 @@ mod tests {
         let ports = ClusterPorts::default();
         assert_eq!(ports.ac_service, 8082);
         assert_eq!(ports.gc_service, 8080);
+        assert_eq!(ports.mc_webtransport, 4433);
         assert_eq!(ports.prometheus, 9090);
         assert_eq!(ports.grafana, 3000);
         assert_eq!(ports.loki, Some(3100));

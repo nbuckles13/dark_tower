@@ -51,6 +51,14 @@ serial_test = "3.1"
 # Time utilities for timestamp checks
 chrono = { workspace = true }
 
+# WebTransport client for MC connection tests
+wtransport = { workspace = true, features = ["dangerous-configuration"] }
+
+# Protobuf encoding/decoding for signaling messages
+proto-gen = { path = "../proto-gen" }
+prost = { workspace = true }
+bytes = { workspace = true }
+
 # Note: env-tests is a test crate containing integration tests.
 # Test code intentionally uses expect/unwrap for cleaner assertions.
 # Unlike production crates, this crate does NOT inherit workspace lints.
