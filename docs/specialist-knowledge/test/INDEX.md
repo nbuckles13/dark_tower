@@ -59,12 +59,11 @@
 - Mock GC server (gRPC seam) -> `crates/mc-test-utils/src/mock_gc.rs`
 
 ## Code Locations: Environment Tests
-- Cluster bootstrap (K8s seam) -> `crates/env-tests/src/cluster.rs`
+- Cluster bootstrap (K8s seam, ClusterPorts with MC WebTransport) -> `crates/env-tests/src/cluster.rs`
 - GC client fixture -> `crates/env-tests/src/fixtures/gc_client.rs`
 - Auth client fixture -> `crates/env-tests/src/fixtures/auth_client.rs`
-- Auth flows -> `crates/env-tests/tests/20_auth_flows.rs`
-- Cross-service flows -> `crates/env-tests/tests/21_cross_service_flows.rs`
-- Meeting creation env-tests -> `crates/env-tests/tests/23_meeting_creation.rs`
+- Env-test flows (20-24) -> `crates/env-tests/tests/` (auth, cross-service, meeting creation, join flow)
+- Join flow E2E (GC join API, MC WebTransport, protobuf signaling, bridge) -> `crates/env-tests/tests/24_join_flow.rs`
 
 ## Code Locations: Common Crate
 - JWT (claims, JwtError, JwksClient, JwtValidator, round-trip tests) -> `crates/common/src/jwt.rs`

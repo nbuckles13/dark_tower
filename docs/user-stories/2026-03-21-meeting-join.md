@@ -301,7 +301,7 @@ Task 1 also starts immediately; task 7 waits for task 1
 | 13 | MC join dashboard + alerts + catalog | docs/devloop-outputs/2026-03-28-mc-join-dashboard | b1a3328 | Completed |
 | 14 | GC join integration tests | docs/devloop-outputs/2026-03-29-gc-join-tests | a0dfdc5 | Completed |
 | 15 | MC join integration tests | docs/devloop-outputs/2026-03-29-mc-join-tests | fd14948 | Completed |
-| 16 | Join flow env-tests | | | Pending |
+| 16 | Join flow env-tests | docs/devloop-outputs/2026-03-30-join-env-tests | 00711e8 | Completed |
 | 17 | MC runbook scenarios 8-10 | | | Pending |
 | 18 | Post-deploy checklist + smoke test | | | Pending |
 
