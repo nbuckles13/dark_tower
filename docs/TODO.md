@@ -32,8 +32,8 @@
 
 ## Observability Debt
 
-- [ ] **Stale metric names in MC runbooks**: `docs/runbooks/mc-incident-response.md` (6 refs) and `docs/runbooks/mc-deployment.md` (3 refs) still use `mc_message_processing_duration_seconds` — the actual metric is `mc_message_latency_seconds`. Bug predates the join flow work; discovered during task 13 semantic guard review.
-- [ ] **MC runbook missing join scenarios**: `mc-incident-response.md` is missing Scenario 8 (join failures), Scenario 9 (WebTransport rejections), and Scenario 10 (JWT validation failures). The new MC join alerts reference these anchors.
+- [x] **Stale metric names in MC runbooks**: Fixed in `docs/runbooks/mc-incident-response.md` (8 refs: 6 PromQL `mc_message_processing_duration_seconds`, 1 PromQL `mc_gc_heartbeat_duration_seconds`, 1 grep pattern). `mc-deployment.md` had 0 stale refs (TODO entry was incorrect). Fixed in task 17.
+- [x] **MC runbook missing join scenarios**: Added Scenario 8 (join failures), Scenario 9 (WebTransport rejections), and Scenario 10 (JWT validation failures) to `mc-incident-response.md`. Anchors match `mc-alerts.yaml` runbook_url references. Fixed in task 17.
 - [ ] **Cross-service status label inconsistency**: GC uses `status="error"` for failures (HTTP convention) while MC uses `status="failure"` (binary convention). Both are internally consistent. Standardize if/when a cross-service alerting layer is added.
 
 ## Code Quality
