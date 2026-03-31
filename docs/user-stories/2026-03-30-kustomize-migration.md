@@ -264,7 +264,7 @@ main() {
 
 | # | Task | Devloop Output | PR | Status |
 |---|------|---------------|-----|--------|
-| 1 | Create Kustomize bases + extract manifests | | | Pending |
+| 1 | Create Kustomize bases + extract manifests | `docs/devloop-outputs/2026-03-31-kustomize-bases/` | | Completed |
 | 2 | Create Kind overlay + rewrite setup.sh | | | Pending |
 | 3 | Add validate-kustomize CI guard | | | Pending |
 | 4 | Update deployment runbooks | | | Pending |

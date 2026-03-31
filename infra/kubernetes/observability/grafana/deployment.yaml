@@ -1,0 +1,70 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grafana
+  namespace: dark-tower-observability
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: grafana
+  template:
+    metadata:
+      labels:
+        app: grafana
+    spec:
+      serviceAccountName: grafana
+      initContainers:
+        - name: k8s-sidecar
+          image: kiwigrid/k8s-sidecar:1.26.2
+          securityContext:
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+          env:
+            - name: LABEL
+              value: grafana_dashboard
+            - name: LABEL_VALUE
+              value: "1"
+            - name: FOLDER
+              value: /var/lib/grafana/dashboards
+            - name: NAMESPACE
+              value: dark-tower-observability
+            - name: METHOD
+              value: LIST
+            - name: LOG_LEVEL
+              value: INFO
+          volumeMounts:
+            - name: dashboards
+              mountPath: /var/lib/grafana/dashboards
+      containers:
+        - name: grafana
+          image: grafana/grafana:10.2.2
+          ports:
+            - containerPort: 3000
+          env:
+            - name: GF_SECURITY_ADMIN_USER
+              value: admin
+            - name: GF_SECURITY_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: grafana-secrets
+                  key: GF_SECURITY_ADMIN_PASSWORD
+            - name: GF_PATHS_PROVISIONING
+              value: /etc/grafana/provisioning
+          volumeMounts:
+            - name: datasources
+              mountPath: /etc/grafana/provisioning/datasources
+            - name: dashboards-config
+              mountPath: /etc/grafana/provisioning/dashboards
+            - name: dashboards
+              mountPath: /var/lib/grafana/dashboards
+      volumes:
+        - name: datasources
+          configMap:
+            name: grafana-datasources
+        - name: dashboards-config
+          configMap:
+            name: grafana-dashboards-config
+        - name: dashboards
+          emptyDir: {}

@@ -5,9 +5,8 @@
 - Local development environment → ADR-0013
 - Environment integration tests → ADR-0014
 - Guard pipeline methodology → ADR-0015
-- Validation pipeline (CI gates) → ADR-0024 (Section: Validation Pipeline)
-- Containerized devloop execution → ADR-0025
-- Client architecture (CI workflow, deployment, canary) → ADR-0028
+- Validation pipeline (CI gates) → ADR-0024
+- Containerized devloop execution → ADR-0025, Client architecture → ADR-0028
 
 ## Code Locations — CI & Guards
 - CI pipeline → `.github/workflows/ci.yml`
@@ -15,19 +14,17 @@
 
 ## Code Locations — Deployment & K8s
 - Kind cluster config + scripts → `infra/kind/kind-config.yaml`, `infra/kind/scripts/`
+- Per-service Kustomize bases → `infra/services/{ac,gc,mc}-service/kustomization.yaml`
 - Per-service manifests (deployment, netpol, PDB) → `infra/services/{ac,gc,mc}-service/`
+- PostgreSQL + Redis manifests → `infra/services/postgres/`, `infra/services/redis/`
 - Alert rules (MC join: failure rate, WT rejections, JWT failures, latency) → `infra/docker/prometheus/rules/{gc,mc}-alerts.yaml`
 - Dev certs, master key, service registration → `scripts/generate-dev-certs.sh`, `generate-master-key.sh`, `register-service.sh`
-- MC TLS secret + volume mount → `infra/services/mc-service/tls-secret.yaml`, `deployment.yaml`
-- MC WebTransport UDP NodePort (30433) + NetworkPolicy → `infra/services/mc-service/service.yaml`, `network-policy.yaml`
+- MC TLS secret (imperative, setup.sh) + UDP NodePort (30433) → `infra/services/mc-service/`
 
 ## Runbooks
-- GC incident response (Scenarios 1-9) → `docs/runbooks/gc-incident-response.md`
-- GC deployment, rollback, smoke tests → `docs/runbooks/gc-deployment.md`
-- MC incident response (Scenarios 1-7; 8-10 pending task 17) → `docs/runbooks/mc-incident-response.md`
-- MC deployment, rollback, smoke tests → `docs/runbooks/mc-deployment.md`
-- AC incident response → `docs/runbooks/ac-service-incident-response.md`
-- AC deployment → `docs/runbooks/ac-service-deployment.md`
+- AC incident/deployment → `docs/runbooks/ac-service-incident-response.md`, `ac-service-deployment.md`
+- GC incident/deployment → `docs/runbooks/gc-incident-response.md`, `gc-deployment.md`
+- MC incident/deployment → `docs/runbooks/mc-incident-response.md`, `mc-deployment.md`
 
 ## Code Locations — Database & Migrations
 - Participant tracking migration → `migrations/20260322000001_add_participant_tracking.sql`
@@ -44,6 +41,9 @@
 - Service auth design → ADR-0003
 
 ## Code Locations — Observability
+- Observability Kustomize base → `infra/kubernetes/observability/kustomization.yaml`
+- Grafana manifests + dashboard configMapGenerator → `infra/kubernetes/observability/grafana/`
+- Grafana dashboard JSON files → `infra/grafana/dashboards/`
 - GC metrics + catalog + dashboard → `crates/gc-service/src/observability/metrics.rs`, `docs/observability/metrics/gc-service.md`, `infra/grafana/dashboards/gc-overview.json`
 - MC metrics + catalog + join metrics (WT, JWT, session) → `crates/mc-service/src/observability/metrics.rs`, `docs/observability/metrics/mc-service.md`
 - MC dashboard (Join Flow row) + alerts → `infra/grafana/dashboards/mc-overview.json`, `docs/observability/alerts.md`

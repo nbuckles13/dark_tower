@@ -58,6 +58,15 @@
 - Per-service error mapping (From<JwtError> for GcError vs McError) -> required, not duplication
 - AC API ParticipantType (has Guest) vs common::jwt::ParticipantType (no Guest)
 
+## Kustomize Infrastructure
+- Per-service bases -> `infra/services/{ac,gc,mc}-service/kustomization.yaml`
+- Postgres base (extracted from setup.sh) -> `infra/services/postgres/kustomization.yaml`
+- Redis base -> `infra/services/redis/kustomization.yaml`
+- Grafana manifests (extracted from setup.sh) -> `infra/kubernetes/observability/grafana/`
+- Grafana dashboard configMapGenerator -> `infra/kubernetes/observability/grafana/kustomization.yaml`
+- Observability stack base -> `infra/kubernetes/observability/kustomization.yaml`
+- tls-secret.yaml DELETED; cert instructions in setup.sh `create_mc_tls_secret()`
+
 ## Integration Seams
 - Common crate as extraction target -> `crates/common/src/`
 - JWT thin wrapper pattern (GC + MC) -> `crates/{gc,mc}-service/src/auth/`

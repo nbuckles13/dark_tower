@@ -43,36 +43,32 @@
 
 ## Code Locations — Observability (Security-Relevant)
 - MC join metrics (bounded labels, no PII) → `crates/mc-service/src/observability/metrics.rs`
-- MC error_type_label (static str from enum) → `crates/mc-service/src/errors.rs:error_type_label()`
-- GC/MC alert rules (no PII) → `infra/docker/prometheus/rules/{gc,mc}-alerts.yaml`
-- GC/MC dashboards (PII-free queries) → `infra/grafana/dashboards/{gc,mc}-overview.json`
+- GC/MC alert rules + dashboards (no PII) → `infra/docker/prometheus/rules/`, `infra/grafana/dashboards/`
 
 ## TLS & Certificates
 - Dev cert generation (ECDSA P-256 CA) → `scripts/generate-dev-certs.sh`
-- MC TLS Secret + volume mount (defaultMode 0400) → `infra/services/mc-service/tls-secret.yaml`, `deployment.yaml`
+- MC TLS volume mount (defaultMode 0400) → `infra/services/mc-service/deployment.yaml`
 - MC WebTransport UDP ingress + Kind mapping → `infra/services/mc-service/network-policy.yaml`, `infra/kind/kind-config.yaml`
 
+## Infrastructure Secrets & Network Isolation
+- Grafana admin credentials → `infra/kubernetes/observability/grafana/secret.yaml`
+- Postgres credentials + securityContext (runAsUser 70) → `infra/services/postgres/secret.yaml`, `statefulset.yaml`
+- Postgres NetworkPolicy (AC + GC ingress only) → `infra/services/postgres/network-policy.yaml`
+
 ## Health & Probes
-- MC health state (liveness/readiness) → `crates/mc-service/src/observability/health.rs:health_router()`
-- MC K8s probes (`/health`, `/ready` on port 8081) → `infra/services/mc-service/deployment.yaml`
-- MC health port NetworkPolicy (Prometheus-only ingress) → `infra/services/mc-service/network-policy.yaml`
+- MC health state → `crates/mc-service/src/observability/health.rs:health_router()`
+- MC K8s probes + health port NetworkPolicy → `infra/services/mc-service/deployment.yaml`, `network-policy.yaml`
 
 ## Integration Seams
-- AC JWKS → common `JwksClient` → GC `JwtValidator` + MC `McJwtValidator` (meeting/guest tokens via WebTransport)
-- GC→MC gRPC service tokens → `crates/mc-service/src/grpc/auth_interceptor.rs` (separate from meeting token path)
+- AC JWKS → common `JwksClient` → GC/MC `JwtValidator` (meeting/guest tokens via WebTransport)
+- GC→MC gRPC service tokens → `crates/mc-service/src/grpc/auth_interceptor.rs`
 - Credential leak guards → `scripts/guards/simple/no-secrets-in-logs.sh`
 
 ## Test Coverage (Security-Relevant)
-- MC join integration tests (JWT through full WebTransport path) → `crates/mc-service/tests/join_tests.rs`
-  - Expired, garbage, wrong key, wrong meeting_id → all Unauthorized; error opacity asserted (no "mismatch" leak)
+- MC join integration tests (JWT, error opacity) → `crates/mc-service/tests/join_tests.rs`
 - MC JWT unit tests (token confusion, role tampering) → `crates/mc-service/src/auth/mod.rs` (#[cfg(test)])
 - Shared JWT test fixtures (Ed25519 keypair, JWKS mock) → `crates/mc-test-utils/src/jwt_test.rs`
-  - TestKeypair: deterministic seeds, `dangerous-configuration` scoped to `[dev-dependencies]` only
 - GC join integration tests (service token rejection) → `crates/gc-service/tests/meeting_tests.rs`
-
-## Production Bug Fixes (Security-Adjacent)
-- send_error() stream flush → `crates/mc-service/src/webtransport/connection.rs:543` (stream.finish())
-  - Without flush, Unauthorized/InvalidRequest error responses lost on QUIC stream drop (task 15)
 
 ## Runbooks & Audit
 - GC security scenarios (8-9) → `docs/runbooks/gc-incident-response.md`
