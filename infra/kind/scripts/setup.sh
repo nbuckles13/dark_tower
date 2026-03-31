@@ -172,366 +172,55 @@ build_image() {
 deploy_postgres() {
     log_step "Deploying PostgreSQL..."
 
-    kubectl apply -f - <<EOF
-apiVersion: v1
-kind: Secret
-metadata:
-  name: postgres-secret
-  namespace: dark-tower
-type: Opaque
-stringData:
-  POSTGRES_DB: dark_tower
-  POSTGRES_USER: darktower
-  POSTGRES_PASSWORD: dev_password_change_in_production
----
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: postgres-pvc
-  namespace: dark-tower
-spec:
-  accessModes:
-    - ReadWriteOnce
-  resources:
-    requests:
-      storage: 1Gi
----
-apiVersion: apps/v1
-kind: StatefulSet
-metadata:
-  name: postgres
-  namespace: dark-tower
-spec:
-  serviceName: postgres
-  replicas: 1
-  selector:
-    matchLabels:
-      app: postgres
-  template:
-    metadata:
-      labels:
-        app: postgres
-    spec:
-      containers:
-        - name: postgres
-          image: postgres:16-alpine
-          ports:
-            - containerPort: 5432
-          envFrom:
-            - secretRef:
-                name: postgres-secret
-          volumeMounts:
-            - name: postgres-data
-              mountPath: /var/lib/postgresql/data
-          readinessProbe:
-            exec:
-              command:
-                - pg_isready
-                - -U
-                - darktower
-                - -d
-                - dark_tower
-            initialDelaySeconds: 5
-            periodSeconds: 5
-      volumes:
-        - name: postgres-data
-          persistentVolumeClaim:
-            claimName: postgres-pvc
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: postgres
-  namespace: dark-tower
-spec:
-  selector:
-    app: postgres
-  ports:
-    - port: 5432
-      targetPort: 5432
-  clusterIP: None
-EOF
+    kubectl apply -k "${PROJECT_ROOT}/infra/kubernetes/overlays/kind/services/postgres/"
 
     log_info "Waiting for PostgreSQL to be ready..."
     kubectl wait --for=condition=Ready pod -l app=postgres -n dark-tower --timeout=120s
     log_info "PostgreSQL deployed successfully."
 }
 
-# Deploy Redis (using manifests from infra/services/redis/)
+# Deploy Redis
 deploy_redis() {
     log_step "Deploying Redis..."
 
-    # Apply Redis manifests from our infrastructure directory
-    # (excludes network-policy.yaml and service-monitor.yaml which require CRDs)
-    for f in "${PROJECT_ROOT}/infra/services/redis/"*.yaml; do
-        local basename
-        basename="$(basename "$f")"
-        [[ "$basename" == "service-monitor.yaml" ]] && continue
-        [[ "$basename" == "network-policy.yaml" ]] && continue
-        kubectl apply -f "$f"
-    done
+    kubectl apply -k "${PROJECT_ROOT}/infra/kubernetes/overlays/kind/services/redis/"
 
     log_info "Waiting for Redis to be ready..."
     kubectl wait --for=condition=Ready pod -l app=redis -n dark-tower --timeout=120s
     log_info "Redis deployed successfully."
 }
 
-# Deploy kube-state-metrics
-deploy_kube_state_metrics() {
-    log_step "Deploying kube-state-metrics for cluster metrics..."
-
-    # Apply kube-state-metrics manifests from extracted config files
-    kubectl apply -f "${PROJECT_ROOT}/infra/kubernetes/observability/kube-state-metrics.yaml"
-
-    log_info "Waiting for kube-state-metrics to be ready..."
-    kubectl wait --for=condition=available --timeout=60s \
-        deployment/kube-state-metrics -n dark-tower-observability
-    log_info "kube-state-metrics deployed successfully."
-}
-
-# Deploy node-exporter
-deploy_node_exporter() {
-    log_step "Deploying node-exporter for node metrics..."
-
-    # Apply node-exporter manifests from extracted config files
-    kubectl apply -f "${PROJECT_ROOT}/infra/kubernetes/observability/node-exporter.yaml"
-
-    log_info "Waiting for node-exporter to be ready..."
-    kubectl rollout status daemonset/node-exporter -n dark-tower-observability --timeout=60s
-    log_info "node-exporter deployed successfully."
-}
-
-# Deploy Prometheus
-deploy_prometheus() {
-    log_step "Deploying Prometheus..."
-
-    # Apply Prometheus manifests from extracted config files
-    kubectl apply -f "${PROJECT_ROOT}/infra/kubernetes/observability/prometheus-config.yaml"
-
-    log_info "Waiting for Prometheus to be ready..."
-    kubectl wait --for=condition=Ready pod -l app=prometheus -n dark-tower-observability --timeout=120s
-    log_info "Prometheus deployed successfully."
-}
-
-# Deploy Loki
-deploy_loki() {
-    log_step "Deploying Loki for log aggregation..."
-
-    # Apply Loki manifests from extracted config files
-    kubectl apply -f "${PROJECT_ROOT}/infra/kubernetes/observability/loki-config.yaml"
-
-    log_info "Waiting for Loki to be ready..."
-    kubectl wait --for=condition=Ready pod -l app=loki -n dark-tower-observability --timeout=120s
-    log_info "Loki deployed successfully."
-}
-
-# Deploy Promtail for log shipping
-deploy_promtail() {
-    log_step "Deploying Promtail for log shipping to Loki..."
-
-    # Apply Promtail manifests from extracted config files
-    kubectl apply -f "${PROJECT_ROOT}/infra/kubernetes/observability/promtail-config.yaml"
-
-    log_info "Waiting for Promtail to be ready..."
-    kubectl wait --for=condition=Ready pod -l app=promtail -n dark-tower-observability --timeout=120s
-    log_info "Promtail deployed successfully."
-}
-
-# Deploy Grafana with provisioning
-deploy_grafana() {
-    log_step "Deploying Grafana with pre-configured datasources and dashboards..."
-
-    # Create ConfigMaps from provisioning files
-    kubectl create configmap grafana-datasources \
-        --from-file="${PROJECT_ROOT}/infra/grafana/provisioning/datasources/datasources.yaml" \
-        -n dark-tower-observability \
-        --dry-run=client -o yaml | kubectl apply -f -
-
-    kubectl create configmap grafana-dashboards-config \
-        --from-file="${PROJECT_ROOT}/infra/grafana/provisioning/dashboards/dashboards.yaml" \
-        -n dark-tower-observability \
-        --dry-run=client -o yaml | kubectl apply -f -
+# Deploy observability stack (Prometheus, Loki, Promtail, kube-state-metrics, node-exporter, Grafana)
+deploy_observability() {
+    log_step "Deploying observability stack..."
 
     # Clean up legacy monolithic ConfigMap from older versions of this script
     kubectl delete configmap grafana-dashboards -n dark-tower-observability --ignore-not-found
 
-    # Per-service dashboard ConfigMaps, dynamically discovered from filenames.
-    # Files matching {prefix}-*.json are grouped by prefix (e.g., ac, gc, mc).
-    # Files that don't match go into grafana-dashboards-common.
-    # Uses --server-side apply to avoid the 262144-byte annotation limit.
-    local dashboard_dir="${PROJECT_ROOT}/infra/grafana/dashboards"
-    local -A prefix_files  # associative array: prefix -> newline-separated file list
-    local common_files=""
+    # Apply entire observability stack via Kustomize overlay
+    # (includes Grafana RBAC, deployment, service, and dashboard ConfigMaps via configMapGenerator)
+    kubectl apply -k "${PROJECT_ROOT}/infra/kubernetes/overlays/kind/observability/"
 
-    # Enable nullglob so the glob expands to nothing if no .json files exist
-    local prev_nullglob
-    prev_nullglob="$(shopt -p nullglob || true)"
-    shopt -s nullglob
+    log_info "Waiting for kube-state-metrics to be ready..."
+    kubectl wait --for=condition=available --timeout=60s \
+        deployment/kube-state-metrics -n dark-tower-observability
 
-    for f in "${dashboard_dir}"/*.json; do
-        local basename
-        basename="$(basename "$f")"
-        if [[ "$basename" =~ ^([a-z]+)-.*\.json$ ]]; then
-            local prefix="${BASH_REMATCH[1]}"
-            prefix_files["$prefix"]+=$'\n'"$f"
-        else
-            common_files+=$'\n'"$f"
-        fi
-    done
+    log_info "Waiting for node-exporter to be ready..."
+    kubectl rollout status daemonset/node-exporter -n dark-tower-observability --timeout=60s
 
-    # Restore previous nullglob setting
-    ${prev_nullglob}
+    log_info "Waiting for Prometheus to be ready..."
+    kubectl wait --for=condition=Ready pod -l app=prometheus -n dark-tower-observability --timeout=120s
 
-    # Create per-prefix ConfigMaps
-    for prefix in "${!prefix_files[@]}"; do
-        local from_file_args=()
-        while IFS= read -r f; do
-            [[ -z "$f" ]] && continue
-            from_file_args+=(--from-file="$(basename "$f")=$f")
-        done <<< "${prefix_files[$prefix]}"
-        kubectl create configmap "grafana-dashboards-${prefix}" \
-            "${from_file_args[@]}" \
-            -n dark-tower-observability \
-            --dry-run=client -o yaml \
-            | kubectl label -f - --local --dry-run=client -o yaml grafana_dashboard=1 \
-            | kubectl apply --server-side -f -
-    done
+    log_info "Waiting for Loki to be ready..."
+    kubectl wait --for=condition=Ready pod -l app=loki -n dark-tower-observability --timeout=120s
 
-    # Create common ConfigMap for non-prefixed files (if any)
-    if [[ -n "$common_files" ]]; then
-        local from_file_args=()
-        while IFS= read -r f; do
-            [[ -z "$f" ]] && continue
-            from_file_args+=(--from-file="$(basename "$f")=$f")
-        done <<< "${common_files}"
-        kubectl create configmap grafana-dashboards-common \
-            "${from_file_args[@]}" \
-            -n dark-tower-observability \
-            --dry-run=client -o yaml \
-            | kubectl label -f - --local --dry-run=client -o yaml grafana_dashboard=1 \
-            | kubectl apply --server-side -f -
-    fi
-
-    # RBAC for k8s-sidecar to list/get ConfigMaps in the observability namespace
-    kubectl apply --server-side -f - <<EOF
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: grafana
-  namespace: dark-tower-observability
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: grafana-sidecar
-  namespace: dark-tower-observability
-rules:
-  - apiGroups: [""]
-    resources: ["configmaps"]
-    verbs: ["get", "list", "watch"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: grafana-sidecar
-  namespace: dark-tower-observability
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: Role
-  name: grafana-sidecar
-subjects:
-  - kind: ServiceAccount
-    name: grafana
-    namespace: dark-tower-observability
-EOF
-
-    kubectl apply --server-side -f - <<EOF
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: grafana
-  namespace: dark-tower-observability
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: grafana
-  template:
-    metadata:
-      labels:
-        app: grafana
-    spec:
-      serviceAccountName: grafana
-      initContainers:
-        - name: k8s-sidecar
-          image: kiwigrid/k8s-sidecar:1.26.2
-          securityContext:
-            readOnlyRootFilesystem: true
-            runAsNonRoot: true
-            allowPrivilegeEscalation: false
-          env:
-            - name: LABEL
-              value: grafana_dashboard
-            - name: LABEL_VALUE
-              value: "1"
-            - name: FOLDER
-              value: /var/lib/grafana/dashboards
-            - name: NAMESPACE
-              value: dark-tower-observability
-            - name: METHOD
-              value: LIST
-            - name: LOG_LEVEL
-              value: INFO
-          volumeMounts:
-            - name: dashboards
-              mountPath: /var/lib/grafana/dashboards
-      containers:
-        - name: grafana
-          image: grafana/grafana:10.2.2
-          ports:
-            - containerPort: 3000
-          env:
-            - name: GF_SECURITY_ADMIN_USER
-              value: admin
-            - name: GF_SECURITY_ADMIN_PASSWORD
-              value: admin
-            - name: GF_PATHS_PROVISIONING
-              value: /etc/grafana/provisioning
-          volumeMounts:
-            - name: datasources
-              mountPath: /etc/grafana/provisioning/datasources
-            - name: dashboards-config
-              mountPath: /etc/grafana/provisioning/dashboards
-            - name: dashboards
-              mountPath: /var/lib/grafana/dashboards
-      volumes:
-        - name: datasources
-          configMap:
-            name: grafana-datasources
-        - name: dashboards-config
-          configMap:
-            name: grafana-dashboards-config
-        - name: dashboards
-          emptyDir: {}
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: grafana
-  namespace: dark-tower-observability
-spec:
-  selector:
-    app: grafana
-  ports:
-    - port: 3000
-      targetPort: 3000
-      nodePort: 30030
-  type: NodePort
-EOF
+    log_info "Waiting for Promtail to be ready..."
+    kubectl wait --for=condition=Ready pod -l app=promtail -n dark-tower-observability --timeout=120s
 
     log_info "Waiting for Grafana to be ready..."
     kubectl wait --for=condition=Ready pod -l app=grafana -n dark-tower-observability --timeout=300s
-    log_info "Grafana deployed successfully."
+
+    log_info "Observability stack deployed successfully."
 }
 
 # Run database migrations
@@ -650,11 +339,7 @@ deploy_ac_service() {
     fi
 
     log_step "Deploying AC service to cluster..."
-    # Apply AC service manifests, excluding service-monitor.yaml (requires Prometheus Operator CRD)
-    for f in "${PROJECT_ROOT}/infra/services/ac-service/"*.yaml; do
-        [[ "$(basename "$f")" == "service-monitor.yaml" ]] && continue
-        kubectl apply -f "$f"
-    done
+    kubectl apply -k "${PROJECT_ROOT}/infra/kubernetes/overlays/kind/services/ac-service/"
 
     log_info "Waiting for AC service to be ready..."
     kubectl rollout status statefulset/ac-service -n dark-tower --timeout=180s
@@ -679,11 +364,7 @@ deploy_gc_service() {
     fi
 
     log_step "Deploying Global Controller to cluster..."
-    # Apply GC manifests, excluding service-monitor.yaml (requires Prometheus Operator CRD)
-    for f in "${PROJECT_ROOT}/infra/services/gc-service/"*.yaml; do
-        [[ "$(basename "$f")" == "service-monitor.yaml" ]] && continue
-        kubectl apply -f "$f"
-    done
+    kubectl apply -k "${PROJECT_ROOT}/infra/kubernetes/overlays/kind/services/gc-service/"
 
     log_info "Waiting for Global Controller to be ready..."
     kubectl rollout status deployment/gc-service -n dark-tower --timeout=180s
@@ -725,15 +406,7 @@ deploy_mc_service() {
     fi
 
     log_step "Deploying Meeting Controller to cluster..."
-    # Apply MC manifests, excluding:
-    #   - service-monitor.yaml: requires Prometheus Operator CRD
-    #   - tls-secret.yaml: placeholder only; real secret created by create_mc_tls_secret()
-    for f in "${PROJECT_ROOT}/infra/services/mc-service/"*.yaml; do
-        case "$(basename "$f")" in
-            service-monitor.yaml|tls-secret.yaml) continue ;;
-        esac
-        kubectl apply -f "$f"
-    done
+    kubectl apply -k "${PROJECT_ROOT}/infra/kubernetes/overlays/kind/services/mc-service/"
 
     log_info "Waiting for Meeting Controller to be ready..."
     kubectl rollout status deployment/mc-service -n dark-tower --timeout=180s
@@ -878,12 +551,7 @@ main() {
     create_namespaces
     deploy_postgres
     deploy_redis
-    deploy_kube_state_metrics
-    deploy_node_exporter
-    deploy_prometheus
-    deploy_loki
-    deploy_promtail
-    deploy_grafana
+    deploy_observability
     run_migrations
     seed_test_data
     create_ac_secrets

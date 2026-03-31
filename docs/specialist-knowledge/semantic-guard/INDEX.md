@@ -59,15 +59,16 @@
 - Alerts doc → `docs/observability/alerts.md` | Dashboards doc → `docs/observability/dashboards.md`
 
 ## E2E Env-Tests (`crates/env-tests/`)
-- Cluster infra → `src/cluster.rs:ClusterConnection` (ports: AC 8082, GC 8080, MC WT 4433, Prometheus 9090, Grafana 3000)
-- MC WebTransport URL: `ClusterPorts::mc_webtransport` + `mc_webtransport_url()` accessor (HTTPS/QUIC, no TCP probe)
-- Auth fixture → `src/fixtures/auth_client.rs` (UserRegistrationRequest, TokenRequest) | GC fixture → `src/fixtures/gc_client.rs`
-- Join flow E2E (`tests/24_join_flow.rs`): Tier 1 (GC-level, always run) + Tier 2 (MC WebTransport, skip if unreachable)
-- Tier 1: token issuance, 401 unauth, 404 unknown, service token rejection, guest allow/deny
-- Tier 2: full AC→GC→MC join, invalid JWT rejection (security: no internals leaked), ParticipantJoined bridge notification
-- Wire format helpers: `encode_framed` / `read_server_message` (4-byte BE prefix, matches MC connection.rs)
-- Note: Tier 1 tests overlap with `tests/21_cross_service_flows.rs` (intentional — different token types)
+- Cluster infra → `src/cluster.rs:ClusterConnection` (ports: AC 8082, GC 8080, MC WT 4433)
+- Auth/GC fixtures → `src/fixtures/auth_client.rs`, `gc_client.rs`
+- Join flow E2E → `tests/24_join_flow.rs` (Tier 1: GC-level + Tier 2: MC WebTransport)
+- Wire format helpers: `encode_framed` / `read_server_message` (4-byte BE prefix)
+
+## Kustomize & Kind
+- Kind overlay → `infra/kubernetes/overlays/kind/` (per-service, observability)
+- Observability base + Grafana → `infra/kubernetes/observability/kustomization.yaml`, `grafana/kustomization.yaml`
+- Service bases → `infra/services/{ac-service,gc-service,mc-service,postgres,redis}/kustomization.yaml`
+- Kind setup script → `infra/kind/scripts/setup.sh`
 
 ## Runbooks
-- GC incident response (MC assignment, limit exhaustion) → `docs/runbooks/gc-incident-response.md`
-- GC deployment checklist → `docs/runbooks/gc-deployment.md`
+- GC incident response → `docs/runbooks/gc-incident-response.md`; GC deployment → `docs/runbooks/gc-deployment.md`

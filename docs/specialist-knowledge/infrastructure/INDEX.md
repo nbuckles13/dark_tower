@@ -16,6 +16,12 @@
 - PostgreSQL manifests (Kustomize base) -> `infra/services/postgres/kustomization.yaml`
 - K8s observability (Kustomize) -> `infra/kubernetes/observability/kustomization.yaml`
 - Grafana manifests (RBAC, deployment, dashboards) -> `infra/kubernetes/observability/grafana/kustomization.yaml`
+- Kind overlay (top-level) -> `infra/kubernetes/overlays/kind/kustomization.yaml`
+- Kind overlay (services aggregator) -> `infra/kubernetes/overlays/kind/services/kustomization.yaml`
+- Kind overlay (per-service) -> `infra/kubernetes/overlays/kind/services/{ac,gc,mc}-service/kustomization.yaml`
+- Kind overlay (postgres) -> `infra/kubernetes/overlays/kind/services/postgres/kustomization.yaml`
+- Kind overlay (redis) -> `infra/kubernetes/overlays/kind/services/redis/kustomization.yaml`
+- Kind overlay (observability) -> `infra/kubernetes/overlays/kind/observability/kustomization.yaml`
 - Grafana dashboards -> `infra/grafana/dashboards/`
 - Grafana provisioning -> `infra/grafana/provisioning/`
 - Kind cluster config -> `infra/kind/kind-config.yaml`
