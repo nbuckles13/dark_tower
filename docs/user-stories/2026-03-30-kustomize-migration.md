@@ -266,7 +266,7 @@ main() {
 |---|------|---------------|-----|--------|
 | 1 | Create Kustomize bases + extract manifests | `docs/devloop-outputs/2026-03-31-kustomize-bases/` | | Completed |
 | 2 | Create Kind overlay + rewrite setup.sh | `docs/devloop-outputs/2026-03-31-kind-overlay/` | | Completed |
-| 3 | Add validate-kustomize CI guard | | | Pending |
+| 3 | Add validate-kustomize CI guard | `docs/devloop-outputs/2026-03-31-kustomize-guard/` | | Completed |
 | 4 | Update deployment runbooks | | | Pending |
 
 ---

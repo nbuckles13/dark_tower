@@ -72,3 +72,4 @@
 - Dev cert generation + Kind setup → `scripts/generate-dev-certs.sh`, `infra/kind/scripts/setup.sh`
 - JWT claims (UserClaims, MeetingTokenClaims, GuestTokenClaims) → `crates/common/src/jwt.rs`
 - Kustomize bases + Kind overlay → `infra/services/*/kustomization.yaml`, `infra/kubernetes/overlays/kind/`
+- Kustomize validation guard (R-15 through R-20) → `scripts/guards/simple/validate-kustomize.sh`
