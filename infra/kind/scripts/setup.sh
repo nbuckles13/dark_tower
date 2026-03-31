@@ -725,9 +725,13 @@ deploy_mc_service() {
     fi
 
     log_step "Deploying Meeting Controller to cluster..."
-    # Apply MC manifests, excluding service-monitor.yaml (requires Prometheus Operator CRD)
+    # Apply MC manifests, excluding:
+    #   - service-monitor.yaml: requires Prometheus Operator CRD
+    #   - tls-secret.yaml: placeholder only; real secret created by create_mc_tls_secret()
     for f in "${PROJECT_ROOT}/infra/services/mc-service/"*.yaml; do
-        [[ "$(basename "$f")" == "service-monitor.yaml" ]] && continue
+        case "$(basename "$f")" in
+            service-monitor.yaml|tls-secret.yaml) continue ;;
+        esac
         kubectl apply -f "$f"
     done
 
