@@ -66,9 +66,8 @@
 - GC K8s deployment (probe reference pattern) → `infra/services/gc-service/deployment.yaml`
 - Guard runner → `scripts/guards/run-guards.sh`; Review protocol → `.claude/skills/devloop/review-protocol.md`
 
-## Kustomize Bases
-- Per-service bases → `infra/services/{ac,gc,mc}-service/kustomization.yaml`
-- Data stores → `infra/services/{postgres,redis}/kustomization.yaml`
-- Observability stack → `infra/kubernetes/observability/kustomization.yaml`
-- Grafana (extracted from setup.sh) → `infra/kubernetes/observability/grafana/kustomization.yaml`
+## Kustomize Bases & Overlays
+- Service bases → `infra/services/{ac,gc,mc}-service/kustomization.yaml`, `infra/services/{postgres,redis}/kustomization.yaml`
+- Observability + Grafana → `infra/kubernetes/observability/kustomization.yaml`, `grafana/kustomization.yaml`
+- Kind overlay → `infra/kubernetes/overlays/kind/` (top-level, per-service, observability)
 - Kind setup script → `infra/kind/scripts/setup.sh`

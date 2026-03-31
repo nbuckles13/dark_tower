@@ -13,10 +13,11 @@
 - Guard runner + application metrics guard → `scripts/guards/run-guards.sh`, `scripts/guards/simple/validate-application-metrics.sh`
 
 ## Code Locations — Deployment & K8s
-- Kind cluster config + scripts → `infra/kind/kind-config.yaml`, `infra/kind/scripts/`
+- Kind cluster config + setup script → `infra/kind/kind-config.yaml`, `infra/kind/scripts/setup.sh`
+- Kind overlay (top-level, per-service, observability) → `infra/kubernetes/overlays/kind/`
 - Per-service Kustomize bases → `infra/services/{ac,gc,mc}-service/kustomization.yaml`
 - Per-service manifests (deployment, netpol, PDB) → `infra/services/{ac,gc,mc}-service/`
-- PostgreSQL + Redis manifests → `infra/services/postgres/`, `infra/services/redis/`
+- PostgreSQL + Redis Kustomize bases → `infra/services/postgres/`, `infra/services/redis/`
 - Alert rules (MC join: failure rate, WT rejections, JWT failures, latency) → `infra/docker/prometheus/rules/{gc,mc}-alerts.yaml`
 - Dev certs, master key, service registration → `scripts/generate-dev-certs.sh`, `generate-master-key.sh`, `register-service.sh`
 - MC TLS secret (imperative, setup.sh) + UDP NodePort (30433) → `infra/services/mc-service/`

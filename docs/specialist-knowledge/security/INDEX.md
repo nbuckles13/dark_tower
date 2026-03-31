@@ -51,9 +51,9 @@
 - MC WebTransport UDP ingress + Kind mapping → `infra/services/mc-service/network-policy.yaml`, `infra/kind/kind-config.yaml`
 
 ## Infrastructure Secrets & Network Isolation
-- Grafana admin credentials → `infra/kubernetes/observability/grafana/secret.yaml`
-- Postgres credentials + securityContext (runAsUser 70) → `infra/services/postgres/secret.yaml`, `statefulset.yaml`
-- Postgres NetworkPolicy (AC + GC ingress only) → `infra/services/postgres/network-policy.yaml`
+- Imperative secret creation → `infra/kind/scripts/setup.sh:create_ac_secrets()`, `create_mc_tls_secret()`
+- Kind overlay (no secrets) → `infra/kubernetes/overlays/kind/`
+- Grafana/Postgres/Redis secrets + NetworkPolicy → `infra/kubernetes/observability/grafana/secret.yaml`, `infra/services/{postgres,redis}/`
 
 ## Health & Probes
 - MC health state → `crates/mc-service/src/observability/health.rs:health_router()`
@@ -71,5 +71,4 @@
 - GC join integration tests (service token rejection) → `crates/gc-service/tests/meeting_tests.rs`
 
 ## Runbooks & Audit
-- GC security scenarios (8-9) → `docs/runbooks/gc-incident-response.md`
-- Bcrypt cost / `.expose_secret()` → `crates/ac-service/src/`; fail-open env-tests → `crates/env-tests/tests/`
+- GC security scenarios (8-9) → `docs/runbooks/gc-incident-response.md`; Bcrypt cost → `crates/ac-service/src/`

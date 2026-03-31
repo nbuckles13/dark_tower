@@ -39,15 +39,16 @@
 
 ## Dashboards & Alerts
 - Grafana dashboards -> `infra/grafana/dashboards/` (overview, SLOs, logs per service)
-- Grafana K8s kustomization (configMapGenerator for dashboards) -> `infra/kubernetes/observability/grafana/kustomization.yaml`
-- Grafana K8s deployment (sidecar, RBAC, service) -> `infra/kubernetes/observability/grafana/`
+- Grafana K8s base (configMapGenerator, sidecar, RBAC, service) -> `infra/kubernetes/observability/grafana/`
 - GC overview dashboard (creation + join panels, join success gauge id:38) -> `infra/grafana/dashboards/gc-overview.json`
 - GC join alert rules (GCHighJoinFailureRate, GCHighJoinLatency) -> `infra/docker/prometheus/rules/gc-alerts.yaml`
 - MC overview dashboard (join flow panels) -> `infra/grafana/dashboards/mc-overview.json`
 - MC join alert rules (MCHighJoinFailureRate, MCHighWebTransportRejections, MCHighJwtValidationFailures, MCHighJoinLatency) -> `infra/docker/prometheus/rules/mc-alerts.yaml`
 - Cross-service error dashboard -> `infra/grafana/dashboards/errors-overview.json`
 - Grafana provisioning -> `infra/grafana/provisioning/datasources/datasources.yaml`
-- K8s observability kustomization (includes grafana/) -> `infra/kubernetes/observability/kustomization.yaml`
+- K8s observability base kustomization (includes grafana/) -> `infra/kubernetes/observability/kustomization.yaml`
+- Kind overlay (environment: kind label, observability + services) -> `infra/kubernetes/overlays/kind/kustomization.yaml`
+- Kind observability overlay (references base) -> `infra/kubernetes/overlays/kind/observability/kustomization.yaml`
 - Prometheus config -> `infra/docker/prometheus/prometheus.yml` (compose), `infra/kubernetes/observability/prometheus-config.yaml` (K8s)
 - Alert + dashboard docs -> `docs/observability/alerts.md`, `docs/observability/dashboards.md`
 

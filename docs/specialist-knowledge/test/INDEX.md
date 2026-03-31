@@ -71,5 +71,4 @@
 - MC K8s health probes (liveness/readiness) → `infra/services/mc-service/deployment.yaml`
 - Dev cert generation + Kind setup → `scripts/generate-dev-certs.sh`, `infra/kind/scripts/setup.sh`
 - JWT claims (UserClaims, MeetingTokenClaims, GuestTokenClaims) → `crates/common/src/jwt.rs`
-- Kustomize service bases → `infra/services/{ac,gc,mc}-service/kustomization.yaml`, `infra/services/{postgres,redis}/kustomization.yaml`
-- Observability + Grafana Kustomize → `infra/kubernetes/observability/kustomization.yaml`, `infra/kubernetes/observability/grafana/`
+- Kustomize bases + Kind overlay → `infra/services/*/kustomization.yaml`, `infra/kubernetes/overlays/kind/`
