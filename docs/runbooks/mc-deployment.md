@@ -15,6 +15,34 @@ This runbook covers deployment, rollback, and troubleshooting procedures for the
 
 ---
 
+## Manifest Structure
+
+MC service Kubernetes manifests are managed via Kustomize with a base/overlay pattern:
+
+```
+infra/
+├── services/mc-service/                    # Base manifests
+│   ├── kustomization.yaml                  # Explicit resource list
+│   ├── configmap.yaml
+│   ├── deployment.yaml
+│   ├── service.yaml
+│   ├── secret.yaml
+│   ├── pdb.yaml
+│   ├── network-policy.yaml
+│   └── service-monitor.yaml               # Present in dir but not in kustomization.yaml (needs Prometheus Operator CRD)
+└── kubernetes/overlays/kind/
+    └── services/mc-service/
+        └── kustomization.yaml             # Kind overlay — refs base, adds Kind-specific labels
+```
+
+- **Base** (`infra/services/mc-service/`): Contains all production manifests. The `kustomization.yaml` explicitly lists each resource. Files like `service-monitor.yaml` are present in the directory but omitted from `kustomization.yaml` when they require CRDs not available in all environments.
+- **Kind overlay** (`infra/kubernetes/overlays/kind/services/mc-service/`): References the base and adds Kind-specific labels.
+- Deploy with: `kubectl apply -k infra/kubernetes/overlays/kind/services/mc-service/`
+
+> **Note:** The MC WebTransport TLS secret (`mc-service-tls`) is created imperatively by `setup.sh` (via `create_mc_tls_secret()`), not managed by Kustomize. Ensure TLS secrets are provisioned before deploying MC. See [Common Deployment Issues](#common-deployment-issues) for TLS troubleshooting.
+
+---
+
 ## Table of Contents
 
 1. [Pre-Deployment Checklist](#pre-deployment-checklist)
@@ -152,24 +180,17 @@ kubectl set image deployment/mc-service \
 kubectl describe deployment mc-service -n dark-tower | grep Image:
 ```
 
-**Option B: Using kubectl apply (declarative)**
+**Option B: Using kubectl apply -k (declarative, Kustomize)**
 
 ```bash
 # Update infra/services/mc-service/deployment.yaml
 # Change image tag: mc-service:latest → mc-service:v1.2.3
 
-# Apply updated manifest
-kubectl apply -f infra/services/mc-service/deployment.yaml
+# Apply via Kustomize overlay (Kind environment)
+kubectl apply -k infra/kubernetes/overlays/kind/services/mc-service/
 
 # Verify change
 kubectl describe deployment mc-service -n dark-tower | grep Image:
-```
-
-**Option C: Using Skaffold (development)**
-
-```bash
-# Build and deploy with Skaffold
-skaffold run -p mc-service
 ```
 
 ### 4. Rolling Update Monitoring
@@ -908,10 +929,11 @@ kubectl rollout undo deployment/mc-service -n dark-tower
 - **ADR-0011:** Observability Framework
 - **ADR-0012:** Infrastructure Architecture
 - **Source Code:** `crates/mc-service/`
-- **Kubernetes Manifests:** `infra/services/mc-service/`
+- **Kubernetes Manifests (base):** `infra/services/mc-service/`
+- **Kubernetes Manifests (Kind overlay):** `infra/kubernetes/overlays/kind/services/mc-service/`
 
 ---
 
-**Document Version:** 1.1
-**Last Reviewed:** 2026-03-27
-**Next Review:** 2026-04-27
+**Document Version:** 1.2
+**Last Reviewed:** 2026-03-31
+**Next Review:** 2026-04-30
