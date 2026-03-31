@@ -54,6 +54,7 @@
 
 ## Guards
 - Metric-to-dashboard coverage -> `scripts/guards/simple/validate-application-metrics.sh`
+- Dashboard-to-kustomize coverage (R-20, bidirectional) -> `scripts/guards/simple/validate-kustomize.sh`
 - Instrument skip_all enforcement -> `scripts/guards/simple/instrument-skip-all.sh`
 
 ## Runbooks
@@ -71,5 +72,4 @@
 ## Integration Seams
 - Env-tests observability validation -> `crates/env-tests/tests/30_observability.rs`
 - Observability mod re-exports (stale export risk) -> `crates/*/src/observability/mod.rs`
-- MC K8s health probes + TLS volume mount -> `infra/services/mc-service/deployment.yaml`
-- MC WebTransport UDP NodePort (Kind port mapping) -> `infra/kind/kind-config.yaml`, `infra/services/mc-service/service.yaml`
+- MC K8s health probes + TLS + WebTransport UDP -> `infra/services/mc-service/deployment.yaml`, `infra/kind/kind-config.yaml`

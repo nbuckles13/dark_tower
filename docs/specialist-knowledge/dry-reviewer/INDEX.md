@@ -60,13 +60,12 @@
 
 ## Kustomize Infrastructure
 - Per-service bases -> `infra/services/{ac,gc,mc}-service/kustomization.yaml`
-- Postgres base (extracted from setup.sh) -> `infra/services/postgres/kustomization.yaml`
-- Redis base -> `infra/services/redis/kustomization.yaml`
+- Postgres/Redis bases -> `infra/services/{postgres,redis}/kustomization.yaml`
 - Grafana manifests + dashboard configMapGenerator -> `infra/kubernetes/observability/grafana/`
 - Observability stack base -> `infra/kubernetes/observability/kustomization.yaml`
 - Kind overlay (top-level + per-service + observability) -> `infra/kubernetes/overlays/kind/`
 - setup.sh Kustomize deploy (`kubectl apply -k`) -> `infra/kind/scripts/setup.sh`
-- tls-secret.yaml DELETED; cert instructions in setup.sh `create_mc_tls_secret()`
+- Kustomize CI guard (R-15 through R-20) -> `scripts/guards/simple/validate-kustomize.sh`
 
 ## Integration Seams
 - Common crate as extraction target -> `crates/common/src/`

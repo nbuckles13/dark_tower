@@ -65,6 +65,7 @@
 - MC TLS cert generation → `scripts/generate-dev-certs.sh`
 - GC K8s deployment (probe reference pattern) → `infra/services/gc-service/deployment.yaml`
 - Guard runner → `scripts/guards/run-guards.sh`; Review protocol → `.claude/skills/devloop/review-protocol.md`
+- Kustomize validation guard (R-15–R-20) → `scripts/guards/simple/validate-kustomize.sh`
 
 ## Kustomize Bases & Overlays
 - Service bases → `infra/services/{ac,gc,mc}-service/kustomization.yaml`, `infra/services/{postgres,redis}/kustomization.yaml`

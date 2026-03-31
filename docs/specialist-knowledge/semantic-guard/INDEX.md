@@ -65,10 +65,10 @@
 - Wire format helpers: `encode_framed` / `read_server_message` (4-byte BE prefix)
 
 ## Kustomize & Kind
-- Kind overlay → `infra/kubernetes/overlays/kind/` (per-service, observability)
+- Kind overlay → `infra/kubernetes/overlays/kind/` | Kind setup → `infra/kind/scripts/setup.sh`
 - Observability base + Grafana → `infra/kubernetes/observability/kustomization.yaml`, `grafana/kustomization.yaml`
 - Service bases → `infra/services/{ac-service,gc-service,mc-service,postgres,redis}/kustomization.yaml`
-- Kind setup script → `infra/kind/scripts/setup.sh`
+- Kustomize CI guard (R-15 builds, R-16 orphans, R-17 kubeconform, R-18 secctx, R-19 secrets, R-20 dashboards) → `scripts/guards/simple/validate-kustomize.sh`
 
 ## Runbooks
 - GC incident response → `docs/runbooks/gc-incident-response.md`; GC deployment → `docs/runbooks/gc-deployment.md`

@@ -63,6 +63,7 @@
 - AC JWKS → common `JwksClient` → GC/MC `JwtValidator` (meeting/guest tokens via WebTransport)
 - GC→MC gRPC service tokens → `crates/mc-service/src/grpc/auth_interceptor.rs`
 - Credential leak guards → `scripts/guards/simple/no-secrets-in-logs.sh`
+- Kustomize security guards (R-18 securityContext, R-19 empty secrets) → `scripts/guards/simple/validate-kustomize.sh`
 
 ## Test Coverage (Security-Relevant)
 - MC join integration tests (JWT, error opacity) → `crates/mc-service/tests/join_tests.rs`
