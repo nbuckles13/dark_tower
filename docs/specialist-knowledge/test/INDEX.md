@@ -24,9 +24,7 @@
 - Participant & activation tests -> `crates/gc-service/tests/participant_tests.rs`
 - Meeting assignment tests -> `crates/gc-service/tests/meeting_assignment_tests.rs`
 - Test token helpers (TestUserClaims, TestClaims) -> `crates/gc-service/tests/meeting_tests.rs:TestUserClaims`
-- Join handler (user-auth) -> `crates/gc-service/src/handlers/meetings.rs:join_meeting()`
-- Guest token handler (public) -> `crates/gc-service/src/handlers/meetings.rs:get_guest_token()`
-- Settings handler (user-auth, host-only) -> `crates/gc-service/src/handlers/meetings.rs:update_meeting_settings()`
+- Meeting handlers (join, guest token, settings) -> `crates/gc-service/src/handlers/meetings.rs`
 - Join metrics -> `crates/gc-service/src/observability/metrics.rs:record_meeting_join()`
 - GC metrics tests -> `crates/gc-service/src/observability/metrics.rs:tests`
 - GC overview dashboard (join panels: ids 35-38) -> `infra/grafana/dashboards/gc-overview.json`
@@ -42,8 +40,7 @@
 - Meeting/guest token validation (wiremock + Ed25519) -> `crates/mc-service/src/auth/mod.rs:tests::test_validate_*_token_*`
 - Token confusion (bidirectional: meeting-as-guest, guest-as-meeting, wrong token_type) -> `crates/mc-service/src/auth/mod.rs:tests`
 - From<JwtError> for McError (7 variants, ServiceUnavailable->Internal) -> `crates/mc-service/src/errors.rs:tests::test_jwt_error_to_mc_error_*`
-- Config ac_jwks_url (scheme validation) -> `crates/mc-service/src/config.rs:tests::test_ac_jwks_url_*`
-- Config TLS paths (fail-fast validation) -> `crates/mc-service/src/config.rs:tests::test_from_vars_*tls*`
+- Config tests (ac_jwks_url scheme, TLS paths) -> `crates/mc-service/src/config.rs:tests`
 - Controller actor tests -> `crates/mc-service/src/actors/controller.rs:tests`
 - Meeting actor tests (join, leave, reconnect, mute, grace period) -> `crates/mc-service/src/actors/meeting.rs:tests`
 - ParticipantActor tests (spawn, send, ping, close, stream wiring) -> `crates/mc-service/src/actors/participant.rs:tests`
@@ -69,11 +66,10 @@
 
 ## Code Locations: Common Crate
 - JWT (claims, JwtError, JwksClient, JwtValidator, round-trip tests) -> `crates/common/src/jwt.rs`
-- GC JwtError->GcError mapping tests (all 7 variants) -> `crates/gc-service/src/auth/jwt.rs:tests`
-- MC JwtError->McError mapping tests (all 7 variants) -> `crates/mc-service/src/errors.rs:tests::test_jwt_error_to_mc_error_*`
 
 ## Infrastructure & Shared
 - MC K8s health probes (liveness/readiness) → `infra/services/mc-service/deployment.yaml`
-- Dev cert generation + MC TLS manifests → `scripts/generate-dev-certs.sh`, `infra/services/mc-service/tls-secret.yaml`
-- Kind UDP mapping + setup integration → `infra/kind/kind-config.yaml`, `infra/kind/scripts/setup.sh:create_mc_tls_secret()`
+- Dev cert generation + Kind setup → `scripts/generate-dev-certs.sh`, `infra/kind/scripts/setup.sh`
 - JWT claims (UserClaims, MeetingTokenClaims, GuestTokenClaims) → `crates/common/src/jwt.rs`
+- Kustomize service bases → `infra/services/{ac,gc,mc}-service/kustomization.yaml`, `infra/services/{postgres,redis}/kustomization.yaml`
+- Observability + Grafana Kustomize → `infra/kubernetes/observability/kustomization.yaml`, `infra/kubernetes/observability/grafana/`

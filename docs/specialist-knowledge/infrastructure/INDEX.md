@@ -10,10 +10,12 @@
 - Service Dockerfiles -> `infra/docker/{ac,gc,mc}-service/Dockerfile`
 - PostgreSQL init -> `infra/docker/postgres/init.sql`
 - Prometheus config + alert rules -> `infra/docker/prometheus/`
-- K8s service manifests (7-file pattern + tls-secret) -> `infra/services/{ac,gc,mc}-service/`
-- MC TLS Secret (WebTransport cert/key) -> `infra/services/mc-service/tls-secret.yaml`
-- Redis manifests -> `infra/services/redis/`
-- K8s observability (kustomize) -> `infra/kubernetes/observability/`
+- K8s service manifests (Kustomize bases) -> `infra/services/{ac,gc,mc}-service/kustomization.yaml`
+- MC TLS Secret -> created imperatively by `infra/kind/scripts/setup.sh:create_mc_tls_secret()`
+- Redis manifests (Kustomize base) -> `infra/services/redis/kustomization.yaml`
+- PostgreSQL manifests (Kustomize base) -> `infra/services/postgres/kustomization.yaml`
+- K8s observability (Kustomize) -> `infra/kubernetes/observability/kustomization.yaml`
+- Grafana manifests (RBAC, deployment, dashboards) -> `infra/kubernetes/observability/grafana/kustomization.yaml`
 - Grafana dashboards -> `infra/grafana/dashboards/`
 - Grafana provisioning -> `infra/grafana/provisioning/`
 - Kind cluster config -> `infra/kind/kind-config.yaml`
@@ -37,4 +39,4 @@
 - Cluster health env-tests -> `crates/env-tests/tests/00_cluster_health.rs`
 - Observability env-tests -> `crates/env-tests/tests/30_observability.rs`
 - Resilience / NetworkPolicy env-tests -> `crates/env-tests/tests/40_resilience.rs`
-- NetworkPolicy definitions -> `infra/services/*/network-policy.yaml`
+- NetworkPolicy definitions -> `infra/services/{ac,gc,mc}-service/network-policy.yaml`, `infra/services/{redis,postgres}/network-policy.yaml`

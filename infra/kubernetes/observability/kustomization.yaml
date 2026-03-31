@@ -6,19 +6,10 @@
 # - Prometheus: Metrics collection (Deployment)
 # - kube-state-metrics: Cluster-level metrics (Deployment)
 # - node-exporter: Node-level metrics (DaemonSet)
-#
-# Note: Grafana is deployed separately with dashboard provisioning.
-# See: infra/grafana/ for dashboards and datasources.
+# - Grafana: Dashboards and visualization (Deployment)
 #
 # Usage:
 #   kubectl apply -k infra/kubernetes/observability/
-#
-# Or apply individual files:
-#   kubectl apply -f infra/kubernetes/observability/promtail-config.yaml
-#   kubectl apply -f infra/kubernetes/observability/loki-config.yaml
-#   kubectl apply -f infra/kubernetes/observability/prometheus-config.yaml
-#   kubectl apply -f infra/kubernetes/observability/kube-state-metrics.yaml
-#   kubectl apply -f infra/kubernetes/observability/node-exporter.yaml
 #
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
@@ -29,7 +20,9 @@ resources:
   - prometheus-config.yaml
   - kube-state-metrics.yaml
   - node-exporter.yaml
+  - grafana/
 
-commonLabels:
-  managed-by: dark-tower
-  environment: dev
+labels:
+  - pairs:
+      managed-by: dark-tower
+    includeSelectors: false
