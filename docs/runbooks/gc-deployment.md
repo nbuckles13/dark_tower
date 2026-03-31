@@ -15,6 +15,32 @@ This runbook covers deployment, rollback, and troubleshooting procedures for the
 
 ---
 
+## Manifest Structure
+
+GC service Kubernetes manifests are managed via Kustomize with a base/overlay pattern:
+
+```
+infra/
+├── services/gc-service/                    # Base manifests
+│   ├── kustomization.yaml                  # Explicit resource list
+│   ├── configmap.yaml
+│   ├── deployment.yaml
+│   ├── service.yaml
+│   ├── secret.yaml
+│   ├── pdb.yaml
+│   ├── network-policy.yaml
+│   └── service-monitor.yaml               # Present in dir but not in kustomization.yaml (needs Prometheus Operator CRD)
+└── kubernetes/overlays/kind/
+    └── services/gc-service/
+        └── kustomization.yaml             # Kind overlay — refs base, adds Kind-specific labels
+```
+
+- **Base** (`infra/services/gc-service/`): Contains all production manifests. The `kustomization.yaml` explicitly lists each resource. Files like `service-monitor.yaml` are present in the directory but omitted from `kustomization.yaml` when they require CRDs not available in all environments.
+- **Kind overlay** (`infra/kubernetes/overlays/kind/services/gc-service/`): References the base and adds Kind-specific labels.
+- Deploy with: `kubectl apply -k infra/kubernetes/overlays/kind/services/gc-service/`
+
+---
+
 ## Table of Contents
 
 1. [Pre-Deployment Checklist](#pre-deployment-checklist)
@@ -162,24 +188,17 @@ kubectl set image deployment/gc-service \
 kubectl describe deployment gc-service -n dark-tower | grep Image:
 ```
 
-**Option B: Using kubectl apply (declarative)**
+**Option B: Using kubectl apply -k (declarative, Kustomize)**
 
 ```bash
 # Update infra/services/gc-service/deployment.yaml
 # Change image tag: gc-service:latest → gc-service:v1.2.3
 
-# Apply updated manifest
-kubectl apply -f infra/services/gc-service/deployment.yaml
+# Apply via Kustomize overlay (Kind environment)
+kubectl apply -k infra/kubernetes/overlays/kind/services/gc-service/
 
 # Verify change
 kubectl describe deployment gc-service -n dark-tower | grep Image:
-```
-
-**Option C: Using Skaffold (development)**
-
-```bash
-# Build and deploy with Skaffold
-skaffold run -p gc-service
 ```
 
 ### 4. Rolling Update Monitoring
@@ -1217,11 +1236,12 @@ kubectl logs -n dark-tower -l app=gc-service --since=1h | grep -i "mc_assignment
 - **ADR-0011:** Observability Framework
 - **ADR-0012:** Infrastructure Architecture
 - **Source Code:** `crates/gc-service/`
-- **Kubernetes Manifests:** `infra/services/gc-service/`
+- **Kubernetes Manifests (base):** `infra/services/gc-service/`
+- **Kubernetes Manifests (Kind overlay):** `infra/kubernetes/overlays/kind/services/gc-service/`
 - **Database Migrations:** `migrations/`
 
 ---
 
-**Document Version:** 1.2
-**Last Reviewed:** 2026-03-27
-**Next Review:** 2026-04-27
+**Document Version:** 1.3
+**Last Reviewed:** 2026-03-31
+**Next Review:** 2026-04-30

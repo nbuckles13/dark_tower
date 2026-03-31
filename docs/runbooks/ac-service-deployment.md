@@ -15,6 +15,31 @@ This runbook covers deployment, rollback, and troubleshooting procedures for the
 
 ---
 
+## Manifest Structure
+
+AC service Kubernetes manifests are managed via Kustomize with a base/overlay pattern:
+
+```
+infra/
+├── services/ac-service/                    # Base manifests
+│   ├── kustomization.yaml                  # Explicit resource list
+│   ├── configmap.yaml
+│   ├── statefulset.yaml
+│   ├── service.yaml
+│   ├── pdb.yaml
+│   ├── network-policy.yaml
+│   └── service-monitor.yaml               # Present in dir but not in kustomization.yaml (needs Prometheus Operator CRD)
+└── kubernetes/overlays/kind/
+    └── services/ac-service/
+        └── kustomization.yaml             # Kind overlay — refs base, adds Kind-specific labels
+```
+
+- **Base** (`infra/services/ac-service/`): Contains all production manifests. The `kustomization.yaml` explicitly lists each resource. Files like `service-monitor.yaml` are present in the directory but omitted from `kustomization.yaml` when they require CRDs not available in all environments.
+- **Kind overlay** (`infra/kubernetes/overlays/kind/services/ac-service/`): References the base and adds Kind-specific labels.
+- Deploy with: `kubectl apply -k infra/kubernetes/overlays/kind/services/ac-service/`
+
+---
+
 ## Table of Contents
 
 1. [Pre-Deployment Checklist](#pre-deployment-checklist)
@@ -162,28 +187,17 @@ kubectl set image statefulset/ac-service \
 kubectl describe statefulset ac-service -n dark-tower | grep Image:
 ```
 
-**Option B: Using kubectl apply (declarative)**
+**Option B: Using kubectl apply -k (declarative, Kustomize)**
 
 ```bash
 # Update infra/services/ac-service/statefulset.yaml
 # Change image tag: ac-service:latest → ac-service:v1.2.3
 
-# Apply updated manifest
-kubectl apply -f infra/services/ac-service/statefulset.yaml
+# Apply via Kustomize overlay (Kind environment)
+kubectl apply -k infra/kubernetes/overlays/kind/services/ac-service/
 
 # Verify change
 kubectl describe statefulset ac-service -n dark-tower | grep Image:
-```
-
-**Option C: Using Helm (if Helm chart available)**
-
-```bash
-# Update values.yaml or override
-helm upgrade ac-service ./charts/ac-service \
-  --namespace dark-tower \
-  --set image.tag=v1.2.3 \
-  --wait \
-  --timeout 10m
 ```
 
 ### 4. Rolling Update Monitoring
@@ -527,8 +541,8 @@ data:
 # Edit ConfigMap
 kubectl edit configmap ac-service-config -n dark-tower
 
-# Or apply updated manifest
-kubectl apply -f infra/services/ac-service/configmap.yaml
+# Or apply updated manifest via Kustomize overlay
+kubectl apply -k infra/kubernetes/overlays/kind/services/ac-service/
 
 # Restart pods to pick up changes
 kubectl rollout restart statefulset/ac-service -n dark-tower
@@ -1183,11 +1197,12 @@ topk(10, sum by (error_message) (rate({namespace="dark-tower",app="ac-service"} 
 - **ADR-0011:** Observability Framework
 - **ADR-0012:** Infrastructure Architecture
 - **Source Code:** `crates/ac-service/`
-- **Kubernetes Manifests:** `infra/services/ac-service/`
+- **Kubernetes Manifests (base):** `infra/services/ac-service/`
+- **Kubernetes Manifests (Kind overlay):** `infra/kubernetes/overlays/kind/services/ac-service/`
 - **Database Migrations:** `migrations/`
 
 ---
 
-**Document Version:** 1.0
-**Last Reviewed:** 2025-12-10
-**Next Review:** 2026-01-10
+**Document Version:** 1.1
+**Last Reviewed:** 2026-03-31
+**Next Review:** 2026-04-30
