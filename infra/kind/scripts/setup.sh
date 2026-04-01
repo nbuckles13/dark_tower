@@ -292,9 +292,9 @@ ON CONFLICT (client_id) DO UPDATE SET
     # TODO: Replace with AC org provisioning API (see docs/TODO.md)
     log_step "Seeding test organization..."
     kubectl exec -n dark-tower postgres-0 -- psql -U darktower -d dark_tower -c "
-INSERT INTO organizations (subdomain, display_name, plan_tier)
-VALUES ('devtest', 'Development Test Organization', 'enterprise')
-ON CONFLICT (subdomain) DO NOTHING;
+INSERT INTO organizations (subdomain, display_name, plan_tier, max_concurrent_meetings)
+VALUES ('devtest', 'Development Test Organization', 'enterprise', 1000)
+ON CONFLICT (subdomain) DO UPDATE SET max_concurrent_meetings = 1000;
 "
 
     if [ $? -eq 0 ]; then
