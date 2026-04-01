@@ -300,7 +300,7 @@ kill %1
 
 ```promql
 # Error rate (should be near 0%)
-rate(ac_http_requests_total{status=~"5.."}[5m])
+increase(ac_http_requests_total{status=~"5.."}[5m])
 
 # p99 latency (should be <350ms per ADR-0011)
 histogram_quantile(0.99, rate(ac_token_issuance_duration_seconds_bucket[5m]))
@@ -1058,7 +1058,7 @@ sum(rate(ac_http_requests_total{status=~"5.."}[5m])) by (status)
 / sum(rate(ac_http_requests_total[5m])) * 100
 
 # Database query errors (should be 0)
-rate(ac_db_query_errors_total[5m])
+increase(ac_db_query_errors_total[5m])
 ```
 
 **Latency:**
@@ -1119,7 +1119,7 @@ ac_db_connections_active / ac_db_connections_max * 100
   severity: critical
 
 - alert: ACDatabaseConnectionFailed
-  expr: rate(ac_db_connection_errors_total[5m]) > 0
+  expr: increase(ac_db_connection_errors_total[5m]) > 0
   for: 2m
   severity: critical
 

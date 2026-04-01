@@ -332,7 +332,7 @@ kill %1
 
 # 2. Identify assignment failure reasons
 # In Prometheus:
-sum by(rejection_reason) (rate(gc_mc_assignments_total{status!="success"}[5m]))
+sum by(rejection_reason) (increase(gc_mc_assignments_total{status!="success"}[5m]))
 
 # 3. Check MC pod availability
 kubectl get pods -n dark-tower -l app=mc-service
@@ -557,10 +557,10 @@ kill %1
 sum(rate(gc_http_requests_total{status_code=~"[45].."}[5m])) / sum(rate(gc_http_requests_total[5m]))
 
 # Error breakdown by status code
-sum by(status_code) (rate(gc_http_requests_total{status_code=~"[45].."}[5m]))
+sum by(status_code) (increase(gc_http_requests_total{status_code=~"[45].."}[5m]))
 
 # Error breakdown by endpoint
-sum by(endpoint, status_code) (rate(gc_http_requests_total{status_code=~"[45].."}[5m]))
+sum by(endpoint, status_code) (increase(gc_http_requests_total{status_code=~"[45].."}[5m]))
 
 # 2. Check error types in metrics
 curl http://localhost:8080/metrics | grep gc_errors_total
@@ -606,7 +606,7 @@ curl http://mc-service.dark-tower.svc.cluster.local:8080/ready
 
 ```bash
 # Step 1: Identify if it's 4xx or 5xx errors
-sum by(status_code) (rate(gc_http_requests_total{status_code=~"[45].."}[5m]))
+sum by(status_code) (increase(gc_http_requests_total{status_code=~"[45].."}[5m]))
 
 # If mostly 5xx: Service-side issue
 # If mostly 4xx: Likely client-side or invalid requests
@@ -681,7 +681,7 @@ container_spec_memory_limit_bytes{pod=~"gc-service-.*"}
 rate(container_cpu_usage_seconds_total{pod=~"gc-service-.*"}[5m])
 
 # 6. Check request rate (is load increasing?)
-sum(rate(gc_http_requests_total[5m]))
+sum(increase(gc_http_requests_total[5m]))
 
 # 7. Check for memory leaks (memory continuously growing)
 # Look at memory over last 24h - if steadily increasing, may be leak
@@ -871,7 +871,7 @@ curl http://localhost:8080/metrics | grep gc_meeting_creation
 kill %1
 
 # 2. Check failure rate by error type in Prometheus
-sum by(error_type) (rate(gc_meeting_creation_failures_total[5m]))
+sum by(error_type) (increase(gc_meeting_creation_failures_total[5m]))
 
 # 3. Identify the affected organization(s)
 kubectl logs -n dark-tower -l app=gc-service --tail=200 | grep "meeting creation forbidden"
@@ -985,7 +985,7 @@ curl http://localhost:8080/metrics | grep gc_meeting_creation
 kill %1
 
 # 2. Check collision rate in Prometheus
-sum(rate(gc_meeting_creation_failures_total{error_type="code_collision"}[5m]))
+sum(increase(gc_meeting_creation_failures_total{error_type="code_collision"}[5m]))
 
 # 3. Check logs for collision details
 kubectl logs -n dark-tower -l app=gc-service --tail=500 | grep -i "collision\|unique constraint"
@@ -996,7 +996,7 @@ kubectl exec -it deployment/gc-service -n dark-tower -- psql $DATABASE_URL -c \
 
 # 5. Check meeting creation rate (is there an unusual spike?)
 # In Prometheus:
-sum(rate(gc_meeting_creation_total[5m]))
+sum(increase(gc_meeting_creation_total[5m]))
 
 # 6. Verify database unique constraint is intact
 kubectl exec -it deployment/gc-service -n dark-tower -- psql $DATABASE_URL -c \

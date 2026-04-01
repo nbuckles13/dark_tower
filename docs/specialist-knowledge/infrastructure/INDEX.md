@@ -5,11 +5,15 @@
 - Local dev environment (Kind + Calico) -> `docs/decisions/adr-0013-local-development-environment.md`
 - Containerized devloop execution model -> `docs/decisions/adr-0025-containerized-devloop.md`
 - Client architecture (CDN deployment, Nx build pipeline, synthetic probe sizing) -> ADR-0028
+- Dashboard metric presentation (counters vs rates, $__rate_interval) -> ADR-0029
 
 ## Code Locations
 - Service Dockerfiles -> `infra/docker/{ac,gc,mc}-service/Dockerfile`
 - PostgreSQL init -> `infra/docker/postgres/init.sql`
-- Prometheus config + alert rules -> `infra/docker/prometheus/`
+- Prometheus config (Docker) -> `infra/docker/prometheus/prometheus.yml`
+- Prometheus alert rules (GC) -> `infra/docker/prometheus/rules/gc-alerts.yaml`
+- Prometheus alert rules (MC) -> `infra/docker/prometheus/rules/mc-alerts.yaml`
+- Prometheus config (K8s) -> `infra/kubernetes/observability/prometheus-config.yaml`
 - K8s service manifests (Kustomize bases) -> `infra/services/{ac,gc,mc}-service/kustomization.yaml`
 - MC TLS Secret -> created imperatively by `infra/kind/scripts/setup.sh:create_mc_tls_secret()`
 - Redis manifests (Kustomize base) -> `infra/services/redis/kustomization.yaml`

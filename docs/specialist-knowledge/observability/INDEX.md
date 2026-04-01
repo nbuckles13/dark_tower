@@ -4,6 +4,7 @@
 - Observability framework (metrics, tracing, dashboards, alerts, SLOs) -> ADR-0011
 - Validation pipeline (guards including metric guards) -> ADR-0024
 - Client architecture (telemetry, metrics, dashboards, synthetic probe) -> ADR-0028
+- Dashboard metric presentation (counters vs rates, increase/rate classification) -> ADR-0029
 
 ## Metrics
 - Metric catalogs -> `docs/observability/metrics/ac-service.md`, `gc-service.md`, `mc-service.md`
@@ -44,10 +45,11 @@
 ## Dashboards & Alerts
 - Grafana dashboards -> `infra/grafana/dashboards/` (overview, SLOs, logs per service)
 - Grafana K8s base (configMapGenerator, sidecar, RBAC, service) -> `infra/kubernetes/observability/grafana/`
-- GC overview dashboard (creation + join panels, join success gauge id:38) -> `infra/grafana/dashboards/gc-overview.json`
+- GC overview dashboard (Traffic Summary stat row, creation + join panels) -> `infra/grafana/dashboards/gc-overview.json`
 - GC join alert rules (GCHighJoinFailureRate, GCHighJoinLatency) -> `infra/docker/prometheus/rules/gc-alerts.yaml`
-- MC overview dashboard (join flow panels) -> `infra/grafana/dashboards/mc-overview.json`
+- MC overview dashboard (join flow panels, Traffic Summary + Security Events stat rows) -> `infra/grafana/dashboards/mc-overview.json`
 - MC join alert rules (MCHighJoinFailureRate, MCHighWebTransportRejections, MCHighJwtValidationFailures, MCHighJoinLatency) -> `infra/docker/prometheus/rules/mc-alerts.yaml`
+- AC overview dashboard (Traffic Summary + Security Events stat rows) -> `infra/grafana/dashboards/ac-overview.json`
 - Cross-service error dashboard -> `infra/grafana/dashboards/errors-overview.json`
 - Grafana provisioning -> `infra/grafana/provisioning/datasources/datasources.yaml`
 - K8s observability base kustomization (includes grafana/) -> `infra/kubernetes/observability/kustomization.yaml`

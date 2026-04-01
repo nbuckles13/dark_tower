@@ -792,7 +792,7 @@ kill %1
 
 # 2. Break down failures by error type (most important diagnostic step)
 # In Prometheus:
-sum by(error_type) (rate(mc_session_join_failures_total[5m]))
+sum by(error_type) (increase(mc_session_join_failures_total[5m]))
 
 # 3. Check join latency (slow joins may indicate upstream issues)
 histogram_quantile(0.95, sum by(le) (rate(mc_session_join_duration_seconds_bucket{status="success"}[5m])))
@@ -801,7 +801,7 @@ histogram_quantile(0.95, sum by(le) (rate(mc_session_join_duration_seconds_bucke
 (
   sum(rate(mc_session_joins_total{status="failure"}[5m]))
   /
-  sum(rate(mc_session_joins_total[5m]))
+  sum(increase(mc_session_joins_total[5m]))
 )
 
 # 5. Check active meetings and capacity
@@ -862,7 +862,7 @@ Triage by the `error_type` label on `mc_session_join_failures_total`:
 
 ```bash
 # Step 1: Identify dominant error_type from dashboard or PromQL
-sum by(error_type) (rate(mc_session_join_failures_total[5m]))
+sum by(error_type) (increase(mc_session_join_failures_total[5m]))
 
 # Step 2: Apply targeted fix based on error_type (see root causes above)
 
@@ -917,13 +917,13 @@ kill %1
 
 # 2. Break down by status (accepted vs rejected vs error)
 # In Prometheus:
-sum by(status) (rate(mc_webtransport_connections_total[5m]))
+sum by(status) (increase(mc_webtransport_connections_total[5m]))
 
 # 3. Calculate rejection rate
 (
   sum(rate(mc_webtransport_connections_total{status="rejected"}[5m]))
   /
-  sum(rate(mc_webtransport_connections_total[5m]))
+  sum(increase(mc_webtransport_connections_total[5m]))
 )
 
 # 4. Check TLS certificate validity
@@ -1044,7 +1044,7 @@ kill %1
 
 # 2. Break down failures by token_type (meeting vs guest)
 # In Prometheus:
-sum by(token_type) (rate(mc_jwt_validations_total{result="failure"}[5m]))
+sum by(token_type) (increase(mc_jwt_validations_total{result="failure"}[5m]))
 # If "meeting" tokens failing: likely AC JWKS issue
 # If "guest" tokens failing: likely GC token issue
 
@@ -1052,7 +1052,7 @@ sum by(token_type) (rate(mc_jwt_validations_total{result="failure"}[5m]))
 (
   sum(rate(mc_jwt_validations_total{result="failure"}[5m]))
   /
-  sum(rate(mc_jwt_validations_total[5m]))
+  sum(increase(mc_jwt_validations_total[5m]))
 )
 
 # 4. Check AC service health (JWKS source)
@@ -1082,7 +1082,7 @@ kubectl get pods -n dark-tower -l app=mc-service -o wide
 kubectl logs -n dark-tower -l app=mc-service --tail=500 | grep -i "jwt\|jwks\|token\|validation"
 
 # 9. Check if this correlates with join failures
-sum by(error_type) (rate(mc_session_join_failures_total[5m]))
+sum by(error_type) (increase(mc_session_join_failures_total[5m]))
 # If error_type="jwt_validation" dominates, this scenario is the root cause
 ```
 

@@ -5,6 +5,7 @@
 - No-panic policy, `#[expect]` over `#[allow]` → ADR-0002
 - Error handling, service-layer wrapping → ADR-0003
 - Observability naming, label cardinality, SLO targets → ADR-0011
+- Dashboard metric presentation (counters vs rates, $__rate_interval) → ADR-0029
 - Guard pipeline methodology → ADR-0015
 - DRY cross-service duplication → ADR-0019
 - User auth, three-tier token architecture → ADR-0020
@@ -39,8 +40,7 @@
 - Route composition (user auth layer) → `crates/gc-service/src/routes/mod.rs:build_routes()`
 - Meeting integration tests → `crates/gc-service/tests/meeting_tests.rs`
 - Metrics catalog → `docs/observability/metrics/gc-service.md`
-- Dashboard (join panels id 35-38) → `infra/grafana/dashboards/gc-overview.json`
-- Alert rules (join: GCHighJoinFailureRate, GCHighJoinLatency) → `infra/docker/prometheus/rules/gc-alerts.yaml`
+- Dashboard + alerts (join panels, Traffic Summary) → `infra/grafana/dashboards/gc-overview.json`, `infra/docker/prometheus/rules/gc-alerts.yaml`
 
 ## Code Locations — MC Service
 - Error type reference → `crates/mc-service/src/errors.rs:McError`
@@ -53,8 +53,7 @@
 - WebTransport server (accept loop) → `crates/mc-service/src/webtransport/server.rs:WebTransportServer::accept_loop()`
 - Connection handler (join flow) → `crates/mc-service/src/webtransport/connection.rs:handle_connection()`
 - MC metrics (join, WebTransport, JWT, init) → `crates/mc-service/src/observability/metrics.rs`
-- Dashboard (join panels id 29-33) → `infra/grafana/dashboards/mc-overview.json`
-- Alert rules (join: MCHighJoinFailureRate, MCHighWebTransportRejections, MCHighJwtValidationFailures, MCHighJoinLatency) → `infra/docker/prometheus/rules/mc-alerts.yaml`
+- Dashboard + alerts (join panels, Traffic/Security stat rows) → `infra/grafana/dashboards/mc-overview.json`, `infra/docker/prometheus/rules/mc-alerts.yaml`
 - Metrics catalog → `docs/observability/metrics/mc-service.md`
 - Health probes (liveness/readiness) → `crates/mc-service/src/observability/health.rs:health_router()`
 - MC K8s deployment (probes on port 8081) → `infra/services/mc-service/deployment.yaml`
@@ -69,6 +68,7 @@
 - MC TLS cert generation → `scripts/generate-dev-certs.sh`
 - GC K8s deployment (probe reference pattern) → `infra/services/gc-service/deployment.yaml`
 - Guard runner → `scripts/guards/run-guards.sh`; Review protocol → `.claude/skills/devloop/review-protocol.md`
+- Application metrics guard → `scripts/guards/simple/validate-application-metrics.sh`
 - Kustomize validation guard (R-15–R-20) → `scripts/guards/simple/validate-kustomize.sh`
 
 ## Kustomize & Infrastructure

@@ -8,6 +8,7 @@
 - Validation pipeline (guards, coverage) -> `docs/decisions/adr-0024-agent-teams-workflow.md`
 - Coverage thresholds -> `.codecov.yml`
 - Client architecture (4-tier testing, test-utils, flaky policy) -> ADR-0028
+- Dashboard metric presentation → ADR-0029
 
 ## Code Locations: AC Service
 - Integration tests -> `crates/ac-service/tests/integration/`
@@ -30,7 +31,7 @@
 - Meeting handlers (join, guest token, settings) -> `crates/gc-service/src/handlers/meetings.rs`
 - Join metrics -> `crates/gc-service/src/observability/metrics.rs:record_meeting_join()`
 - GC metrics tests -> `crates/gc-service/src/observability/metrics.rs:tests`
-- GC overview dashboard (join panels: ids 35-38) -> `infra/grafana/dashboards/gc-overview.json`
+- GC overview dashboard → `infra/grafana/dashboards/gc-overview.json`
 - GC alert rules (join: GCHighJoinFailureRate, GCHighJoinLatency) -> `infra/docker/prometheus/rules/gc-alerts.yaml`
 - GC metrics catalog -> `docs/observability/metrics/gc-service.md`
 - Route definitions (public, user-auth, service-auth) -> `crates/gc-service/src/routes/mod.rs`
@@ -52,7 +53,7 @@
 - WebTransport connection tests (build_join_response) -> `crates/mc-service/src/webtransport/connection.rs:tests`
 - MC metrics tests (unit + DebuggingRecorder integration) -> `crates/mc-service/src/observability/metrics.rs:tests`
 - MC join flow metrics + catalog -> `crates/mc-service/src/observability/metrics.rs:record_webtransport_connection()`, catalog: `docs/observability/metrics/mc-service.md`
-- MC alert rules (join: MCHighJoinFailureRate, MCHighWebTransportRejections, MCHighJwtValidationFailures, MCHighJoinLatency) -> `infra/docker/prometheus/rules/mc-alerts.yaml`
+- MC alert rules → `infra/docker/prometheus/rules/mc-alerts.yaml`
 - GC integration tests -> `crates/mc-service/tests/gc_integration.rs`
 - Heartbeat tests -> `crates/mc-service/tests/heartbeat_tasks.rs`
 - Health state & router tests -> `crates/mc-service/src/observability/health.rs:health_router()`
@@ -70,6 +71,5 @@
 
 ## Infrastructure & Shared
 - MC K8s health probes → `infra/services/mc-service/deployment.yaml`
-- Dev cert generation + Kind setup → `scripts/generate-dev-certs.sh`, `infra/kind/scripts/setup.sh`
-- JWT claims → `crates/common/src/jwt.rs`
+- Dev certs + Kind setup → `scripts/generate-dev-certs.sh`, `infra/kind/scripts/setup.sh`
 - Kustomize guard (R-15–R-20) → `scripts/guards/simple/validate-kustomize.sh`
