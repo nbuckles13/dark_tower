@@ -47,6 +47,7 @@
 ## Code Locations — Observability (Security-Relevant)
 - MC join metrics (bounded labels, no PII) → `crates/mc-service/src/observability/metrics.rs`
 - GC/MC alert rules + dashboards (no PII) → `infra/docker/prometheus/rules/`, `infra/grafana/dashboards/`
+- Dashboard metric presentation + security stat panels → ADR-0029
 
 ## TLS & Certificates
 - Dev cert generation (ECDSA P-256 CA) → `scripts/generate-dev-certs.sh`

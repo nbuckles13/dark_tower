@@ -856,7 +856,7 @@ Use this checklist after any deployment that touches join flow code (WebTranspor
 
 ```promql
 # Session join rate (should be > 0 if traffic is flowing)
-sum(rate(mc_session_joins_total[5m]))
+sum(increase(mc_session_joins_total[5m]))
 
 # Join failure rate (should be < 1%)
 sum(rate(mc_session_join_failures_total[5m]))

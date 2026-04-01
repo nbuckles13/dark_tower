@@ -1087,7 +1087,7 @@ Monitor continuously for the first hour after deployment. Do not declare success
 
 ```promql
 # Meeting creation rate > 0 (traffic is flowing)
-sum(rate(gc_meeting_creation_total[5m])) > 0
+sum(increase(gc_meeting_creation_total[5m])) > 0
 
 # Meeting creation error rate < 1%
 sum(rate(gc_meeting_creation_total{status="error"}[5m]))
@@ -1148,7 +1148,7 @@ Use this checklist after any deployment that touches meeting join code (join han
 
 ```promql
 # Join rate (should be > 0 if traffic is flowing)
-sum(rate(gc_meeting_join_total[5m]))
+sum(increase(gc_meeting_join_total[5m]))
 
 # Join failure rate (should be < 1%)
 sum(rate(gc_meeting_join_failures_total[5m]))

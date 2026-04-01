@@ -30,6 +30,12 @@
 
 - [ ] **Evaluate HTTP/3 for AC**: AC currently serves HTTP/1.1 (TCP-based). For consistency with GC, evaluate adding HTTP/3 support. Low priority — client is protocol-agnostic via `fetch()`. Follow-up to ADR-0003.
 
+## Dashboard Presentation Debt (ADR-0029)
+
+- [ ] **AC overview duplicate "Tokens Issued" stat panel**: Panel id=39 (Traffic Summary row) and panel id=5 (Overview row) both show `sum(increase(ac_token_issuance_total{...}[$__range]))`. Remove panel id=5. Location: `infra/grafana/dashboards/ac-overview.json`
+- [ ] **AC overview "Overview" row inconsistent with GC/MC**: AC has a 4-panel Overview stat row (Request Rate, Error Rate, p95 Latency, Tokens Issued) that doesn't exist in GC or MC overviews. Consider removing or aligning. Location: `infra/grafana/dashboards/ac-overview.json`
+- [ ] **Timeseries panel titles say "Rate" for increase() panels**: Many panels across AC/GC/MC overviews still titled "...Rate" (e.g., "Request Rate by Endpoint") while using `increase()`. Units are correct (`short`), but titles are misleading. Large cosmetic rename. Locations: `infra/grafana/dashboards/{ac,gc,mc}-overview.json`
+
 ## Observability Debt
 
 - [x] **Stale metric names in MC runbooks**: Fixed in `docs/runbooks/mc-incident-response.md` (8 refs: 6 PromQL `mc_message_processing_duration_seconds`, 1 PromQL `mc_gc_heartbeat_duration_seconds`, 1 grep pattern). `mc-deployment.md` had 0 stale refs (TODO entry was incorrect). Fixed in task 17.

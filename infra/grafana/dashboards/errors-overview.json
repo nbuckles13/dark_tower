@@ -96,7 +96,10 @@
               {
                 "id": "custom.lineStyle",
                 "value": {
-                  "dash": [10, 10],
+                  "dash": [
+                    10,
+                    10
+                  ],
                   "fill": "dash"
                 }
               },
@@ -117,7 +120,10 @@
       "id": 1,
       "options": {
         "legend": {
-          "calcs": ["mean", "lastNotNull"],
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
           "displayMode": "table",
           "placement": "bottom",
           "showLegend": true
@@ -134,7 +140,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "100 * (sum by(job) (rate(ac_errors_total{job=\"ac-service\"}[5m])) / (sum by(job) (rate(ac_token_issuance_total{job=\"ac-service\"}[5m])) + sum by(job) (rate(ac_jwks_requests_total{job=\"ac-service\"}[5m]))))",
+          "expr": "100 * (sum by(job) (rate(ac_errors_total{job=\"ac-service\"}[$__rate_interval])) / (sum by(job) (rate(ac_token_issuance_total{job=\"ac-service\"}[$__rate_interval])) + sum by(job) (rate(ac_jwks_requests_total{job=\"ac-service\"}[$__rate_interval]))))",
           "legendFormat": "ac-service",
           "range": true,
           "refId": "A"
@@ -145,7 +151,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "100 * (sum by(job) (rate(gc_http_requests_total{job=\"gc-service\", status_code=~\"[45]..\"}[5m])) / sum by(job) (rate(gc_http_requests_total{job=\"gc-service\"}[5m])))",
+          "expr": "100 * (sum by(job) (rate(gc_http_requests_total{job=\"gc-service\", status_code=~\"[45]..\"}[$__rate_interval])) / sum by(job) (rate(gc_http_requests_total{job=\"gc-service\"}[$__rate_interval])))",
           "legendFormat": "gc-service",
           "range": true,
           "refId": "B"
@@ -156,7 +162,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "100 * (sum by(job) (rate(mc_messages_dropped_total{job=\"mc-service\"}[5m])) / (sum by(job) (rate(mc_messages_dropped_total{job=\"mc-service\"}[5m])) + sum by(job) (rate(mc_message_latency_seconds_count{job=\"mc-service\"}[5m]))))",
+          "expr": "100 * (sum by(job) (rate(mc_messages_dropped_total{job=\"mc-service\"}[$__rate_interval])) / (sum by(job) (rate(mc_messages_dropped_total{job=\"mc-service\"}[$__rate_interval])) + sum by(job) (rate(mc_message_latency_seconds_count{job=\"mc-service\"}[$__rate_interval]))))",
           "legendFormat": "mc-service",
           "range": true,
           "refId": "C"
@@ -227,7 +233,9 @@
         "orientation": "auto",
         "reduceOptions": {
           "values": false,
-          "calcs": ["lastNotNull"],
+          "calcs": [
+            "lastNotNull"
+          ],
           "fields": ""
         },
         "showThresholdLabels": false,
@@ -241,7 +249,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "count((100 * (sum by(job) (rate(ac_errors_total{job=\"ac-service\"}[5m])) / (sum by(job) (rate(ac_token_issuance_total{job=\"ac-service\"}[5m])) + sum by(job) (rate(ac_jwks_requests_total{job=\"ac-service\"}[5m])))) > 1) or (100 * (sum by(job) (rate(gc_http_requests_total{job=\"gc-service\", status_code=~\"[45]..\"}[5m])) / sum by(job) (rate(gc_http_requests_total{job=\"gc-service\"}[5m]))) > 1) or (100 * (sum by(job) (rate(mc_messages_dropped_total{job=\"mc-service\"}[5m])) / (sum by(job) (rate(mc_messages_dropped_total{job=\"mc-service\"}[5m])) + sum by(job) (rate(mc_message_latency_seconds_count{job=\"mc-service\"}[5m])))) > 1)) or vector(0)",
+          "expr": "count((100 * (sum by(job) (rate(ac_errors_total{job=\"ac-service\"}[$__rate_interval])) / (sum by(job) (rate(ac_token_issuance_total{job=\"ac-service\"}[$__rate_interval])) + sum by(job) (rate(ac_jwks_requests_total{job=\"ac-service\"}[$__rate_interval])))) > 1) or (100 * (sum by(job) (rate(gc_http_requests_total{job=\"gc-service\", status_code=~\"[45]..\"}[$__rate_interval])) / sum by(job) (rate(gc_http_requests_total{job=\"gc-service\"}[$__rate_interval]))) > 1) or (100 * (sum by(job) (rate(mc_messages_dropped_total{job=\"mc-service\"}[$__rate_interval])) / (sum by(job) (rate(mc_messages_dropped_total{job=\"mc-service\"}[$__rate_interval])) + sum by(job) (rate(mc_message_latency_seconds_count{job=\"mc-service\"}[$__rate_interval])))) > 1)) or vector(0)",
           "legendFormat": "Services Violating SLO",
           "range": true,
           "refId": "A"
@@ -327,7 +335,9 @@
         "footer": {
           "countRows": false,
           "fields": "",
-          "reducer": ["sum"],
+          "reducer": [
+            "sum"
+          ],
           "show": false
         },
         "showHeader": true,
@@ -346,7 +356,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "100 * (sum by(job, status_code) (rate(gc_http_requests_total{job=\"gc-service\", status_code=~\"[45]..\"}[5m])) / sum by(job) (rate(gc_http_requests_total{job=\"gc-service\"}[5m])))",
+          "expr": "100 * (sum by(job, status_code) (rate(gc_http_requests_total{job=\"gc-service\", status_code=~\"[45]..\"}[$__rate_interval])) / sum by(job) (rate(gc_http_requests_total{job=\"gc-service\"}[$__rate_interval])))",
           "format": "table",
           "legendFormat": "{{job}} - {{status_code}}",
           "range": true,
@@ -358,7 +368,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "100 * (sum by(job, error_type) (rate(ac_errors_total{job=\"ac-service\"}[5m])) / (sum by(job) (rate(ac_token_issuance_total{job=\"ac-service\"}[5m])) + sum by(job) (rate(ac_jwks_requests_total{job=\"ac-service\"}[5m]))))",
+          "expr": "100 * (sum by(job, error_type) (rate(ac_errors_total{job=\"ac-service\"}[$__rate_interval])) / (sum by(job) (rate(ac_token_issuance_total{job=\"ac-service\"}[$__rate_interval])) + sum by(job) (rate(ac_jwks_requests_total{job=\"ac-service\"}[$__rate_interval]))))",
           "format": "table",
           "legendFormat": "{{job}} - {{error_type}}",
           "range": true,
@@ -437,7 +447,7 @@
           "custom": {
             "axisCenteredZero": false,
             "axisColorMode": "text",
-            "axisLabel": "Errors/sec",
+            "axisLabel": "Errors",
             "axisPlacement": "auto",
             "barAlignment": 0,
             "drawStyle": "bars",
@@ -474,7 +484,7 @@
               }
             ]
           },
-          "unit": "ops"
+          "unit": "short"
         },
         "overrides": []
       },
@@ -487,7 +497,9 @@
       "id": 5,
       "options": {
         "legend": {
-          "calcs": ["sum"],
+          "calcs": [
+            "sum"
+          ],
           "displayMode": "table",
           "placement": "bottom",
           "showLegend": true
@@ -504,7 +516,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "topk(10, sum by(job, status_code) (rate(gc_http_requests_total{job=\"gc-service\", status_code=~\"[45]..\"}[5m])))",
+          "expr": "topk(10, sum by(job, status_code) (increase(gc_http_requests_total{job=\"gc-service\", status_code=~\"[45]..\"}[$__rate_interval])))",
           "legendFormat": "{{job}} - {{status_code}}",
           "range": true,
           "refId": "A"
@@ -515,7 +527,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "topk(10, sum by(job, error_type) (rate(ac_errors_total{job=\"ac-service\"}[5m])))",
+          "expr": "topk(10, sum by(job, error_type) (increase(ac_errors_total{job=\"ac-service\"}[$__rate_interval])))",
           "legendFormat": "{{job}} - {{error_type}}",
           "range": true,
           "refId": "B"
@@ -526,7 +538,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "topk(10, sum by(job, actor_type) (rate(mc_messages_dropped_total{job=\"mc-service\"}[5m])))",
+          "expr": "topk(10, sum by(job, actor_type) (increase(mc_messages_dropped_total{job=\"mc-service\"}[$__rate_interval])))",
           "legendFormat": "{{job}} - {{actor_type}} drops",
           "range": true,
           "refId": "C"
@@ -539,7 +551,11 @@
   "refresh": "10s",
   "schemaVersion": 38,
   "style": "dark",
-  "tags": ["errors", "cross-service", "slo"],
+  "tags": [
+    "errors",
+    "cross-service",
+    "slo"
+  ],
   "templating": {
     "list": []
   },

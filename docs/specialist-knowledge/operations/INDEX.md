@@ -7,6 +7,7 @@
 - Guard pipeline methodology → ADR-0015
 - Validation pipeline (CI gates) → ADR-0024
 - Containerized devloop execution → ADR-0025
+- Dashboard metric presentation (counters vs rates) → ADR-0029
 
 ## Code Locations — CI & Guards
 - CI pipeline → `.github/workflows/ci.yml`
@@ -20,7 +21,7 @@
 - Per-service Kustomize bases → `infra/services/{ac,gc,mc}-service/kustomization.yaml`
 - Per-service manifests (deployment, netpol, PDB) → `infra/services/{ac,gc,mc}-service/`
 - PostgreSQL + Redis Kustomize bases → `infra/services/postgres/`, `infra/services/redis/`
-- Alert rules (MC join: failure rate, WT rejections, JWT failures, latency) → `infra/docker/prometheus/rules/{gc,mc}-alerts.yaml`
+- Alert rules → `infra/docker/prometheus/rules/{gc,mc}-alerts.yaml`
 - Dev certs, master key, service registration → `scripts/generate-dev-certs.sh`, `generate-master-key.sh`, `register-service.sh`
 - MC TLS secret (imperative, setup.sh) + UDP NodePort (30433) → `infra/services/mc-service/`
 
@@ -48,9 +49,9 @@
 - Observability Kustomize base → `infra/kubernetes/observability/kustomization.yaml`
 - Grafana manifests + dashboard configMapGenerator → `infra/kubernetes/observability/grafana/`
 - Grafana dashboard JSON files → `infra/grafana/dashboards/`
-- GC metrics + catalog + dashboard → `crates/gc-service/src/observability/metrics.rs`, `docs/observability/metrics/gc-service.md`, `infra/grafana/dashboards/gc-overview.json`
+- GC metrics + catalog + dashboard → `crates/gc-service/src/observability/metrics.rs`, `infra/grafana/dashboards/gc-overview.json`
 - MC metrics + catalog + join metrics (WT, JWT, session) → `crates/mc-service/src/observability/metrics.rs`, `docs/observability/metrics/mc-service.md`
-- MC dashboard (Join Flow row) + alerts → `infra/grafana/dashboards/mc-overview.json`, `docs/observability/alerts.md`
+- MC dashboard + alerts → `infra/grafana/dashboards/mc-overview.json`, `docs/observability/alerts.md`
 - Prometheus scrape config → `infra/docker/prometheus/prometheus.yml`
 
 ## Code Locations — MC WebTransport + Actors
@@ -70,6 +71,5 @@
 - GC join tests (R-18: auth, AC-down, no-MC, success) → `crates/gc-service/tests/meeting_tests.rs`
 
 ## Code Locations — Env-Tests (Kind Cluster)
-- Cluster infra (ports, health) → `crates/env-tests/src/cluster.rs` (AC 8082, GC 8080, MC WT 4433/UDP 30433)
-- Join flow E2E → `crates/env-tests/tests/24_join_flow.rs`
+- Cluster infra + join flow E2E → `crates/env-tests/src/cluster.rs`, `tests/24_join_flow.rs`
 - Rate limit (relaxed Kind config) → `infra/services/ac-service/configmap.yaml`

@@ -21,6 +21,8 @@
 ## Per-Service Observability (Metrics & Dashboards)
 - AC/GC/MC metrics -> `crates/*/src/observability/metrics.rs` (per-service, not duplication)
 - MC/GC join alert rules -> `infra/docker/prometheus/rules/{mc,gc}-alerts.yaml`
+- Dashboard metric presentation → ADR-0029
+- Grafana dashboards + configMapGenerator → `infra/grafana/dashboards/`, `infra/kubernetes/observability/grafana/`
 
 ## MC Integration Test Coverage (Task 15)
 - Join flow tests (11 tests) -> `crates/mc-service/tests/join_tests.rs`
@@ -29,8 +31,6 @@
   - T6-T7: invalid protobuf, wrong first message | T8: wrong signing key
   - T9-T11: actor-level join, roster visibility, name length | Bridge: ParticipantJoined
 - JWT test fixtures (shared) -> `crates/mc-test-utils/src/jwt_test.rs`
-  - TestKeypair, build_pkcs8_from_seed, mount_jwks_mock, make_meeting_claims variants
-  - auth/mod.rs #[cfg(test)] inline copy remains (can't import dev-dep from unit tests)
 
 ## GC Integration Test Coverage (Task 14)
 - Join/guest/settings tests -> `crates/gc-service/tests/meeting_tests.rs`
