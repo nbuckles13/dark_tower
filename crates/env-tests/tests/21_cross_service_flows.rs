@@ -18,7 +18,7 @@
 #![cfg(feature = "flows")]
 
 use env_tests::cluster::ClusterConnection;
-use env_tests::fixtures::auth_client::TokenRequest;
+use env_tests::fixtures::auth_client::{TokenRequest, UserRegistrationRequest};
 use env_tests::fixtures::gc_client::{GcClient, GuestTokenRequest, UpdateMeetingSettingsRequest};
 use env_tests::fixtures::AuthClient;
 
@@ -214,20 +214,18 @@ async fn test_meeting_join_returns_404_for_unknown_meeting() {
     let auth_client = AuthClient::new(&cluster.ac_base_url);
     let gc_client = GcClient::new(&cluster.gc_base_url);
 
-    // Get a valid token
-    let token_request =
-        TokenRequest::client_credentials("test-client", "test-client-secret-dev-999", "test:all");
-
-    let token_response = auth_client
-        .issue_token(token_request)
+    // Register a user to get a user token (join requires UserClaims, not service Claims)
+    let request = UserRegistrationRequest::unique("Join 404 Test User");
+    let reg_response = auth_client
+        .register_user(&request)
         .await
-        .expect("AC should issue token");
+        .expect("AC should register test user");
 
     // Try to join non-existent meeting
     let result = gc_client
         .raw_join_meeting(
             "nonexistent-meeting-code-12345",
-            Some(&token_response.access_token),
+            Some(&reg_response.access_token),
         )
         .await;
 
@@ -380,14 +378,12 @@ async fn test_meeting_settings_returns_404_for_unknown_meeting() {
     let auth_client = AuthClient::new(&cluster.ac_base_url);
     let gc_client = GcClient::new(&cluster.gc_base_url);
 
-    // Get a valid token
-    let token_request =
-        TokenRequest::client_credentials("test-client", "test-client-secret-dev-999", "test:all");
-
-    let token_response = auth_client
-        .issue_token(token_request)
+    // Register a user to get a user token (settings requires UserClaims, not service Claims)
+    let reg_request = UserRegistrationRequest::unique("Settings 404 Test User");
+    let reg_response = auth_client
+        .register_user(&reg_request)
         .await
-        .expect("AC should issue token");
+        .expect("AC should register test user");
 
     let request = UpdateMeetingSettingsRequest::with_allow_guests(true);
 
@@ -395,7 +391,7 @@ async fn test_meeting_settings_returns_404_for_unknown_meeting() {
     let result = gc_client
         .raw_update_settings(
             uuid::Uuid::nil(),
-            Some(&token_response.access_token),
+            Some(&reg_response.access_token),
             &request,
         )
         .await;

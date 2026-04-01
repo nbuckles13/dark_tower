@@ -28,6 +28,38 @@ pub const MIN_BCRYPT_COST: u32 = 10;
 /// Cost 14 = 2^14 = 16,384 iterations, approximate hash time: ~800ms.
 pub const MAX_BCRYPT_COST: u32 = 14;
 
+// =============================================================================
+// Rate Limit Configuration Defaults & Bounds
+// =============================================================================
+
+/// Default login rate limit window in minutes (15-minute sliding window per ADR-0003).
+pub const DEFAULT_RATE_LIMIT_WINDOW_MINUTES: i64 = 15;
+/// Minimum login rate limit window (1 minute).
+pub const MIN_RATE_LIMIT_WINDOW_MINUTES: i64 = 1;
+/// Maximum login rate limit window (60 minutes / 1 hour).
+pub const MAX_RATE_LIMIT_WINDOW_MINUTES: i64 = 60;
+
+/// Default login rate limit max attempts before lockout (5 per ADR-0003).
+pub const DEFAULT_RATE_LIMIT_MAX_ATTEMPTS: i64 = 5;
+/// Minimum login rate limit max attempts (1).
+pub const MIN_RATE_LIMIT_MAX_ATTEMPTS: i64 = 1;
+/// Maximum login rate limit max attempts (100).
+pub const MAX_RATE_LIMIT_MAX_ATTEMPTS: i64 = 100;
+
+/// Default registration rate limit window in minutes (60 minutes / 1 hour).
+pub const DEFAULT_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES: i64 = 60;
+/// Minimum registration rate limit window (1 minute).
+pub const MIN_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES: i64 = 1;
+/// Maximum registration rate limit window (1440 minutes / 24 hours).
+pub const MAX_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES: i64 = 1440;
+
+/// Default registration rate limit max attempts (5 per IP per window).
+pub const DEFAULT_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS: i64 = 5;
+/// Minimum registration rate limit max attempts (1).
+pub const MIN_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS: i64 = 1;
+/// Maximum registration rate limit max attempts (100).
+pub const MAX_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS: i64 = 100;
+
 /// Application configuration with secure handling of sensitive fields.
 ///
 /// Sensitive fields (`master_key`, `hash_secret`) are wrapped in `SecretBox`
@@ -61,6 +93,18 @@ pub struct Config {
     /// Minimum: 10 (security floor per OWASP 2024).
     /// Maximum: 14 (prevents excessive latency ~800ms).
     pub bcrypt_cost: u32,
+    /// Login rate limit sliding window in minutes.
+    /// Default: 15 (per ADR-0003). Range: 1-60.
+    pub rate_limit_window_minutes: i64,
+    /// Login rate limit max failed attempts before lockout.
+    /// Default: 5 (per ADR-0003). Range: 1-100.
+    pub rate_limit_max_attempts: i64,
+    /// Registration rate limit sliding window in minutes.
+    /// Default: 60. Range: 1-1440.
+    pub registration_rate_limit_window_minutes: i64,
+    /// Registration rate limit max attempts per IP per window.
+    /// Default: 5. Range: 1-100.
+    pub registration_rate_limit_max_attempts: i64,
 }
 
 /// Clone implementation that explicitly clones SecretBox fields.
@@ -74,6 +118,10 @@ impl Clone for Config {
             otlp_endpoint: self.otlp_endpoint.clone(),
             jwt_clock_skew_seconds: self.jwt_clock_skew_seconds,
             bcrypt_cost: self.bcrypt_cost,
+            rate_limit_window_minutes: self.rate_limit_window_minutes,
+            rate_limit_max_attempts: self.rate_limit_max_attempts,
+            registration_rate_limit_window_minutes: self.registration_rate_limit_window_minutes,
+            registration_rate_limit_max_attempts: self.registration_rate_limit_max_attempts,
         }
     }
 }
@@ -94,6 +142,16 @@ impl fmt::Debug for Config {
             .field("otlp_endpoint", &self.otlp_endpoint)
             .field("jwt_clock_skew_seconds", &self.jwt_clock_skew_seconds)
             .field("bcrypt_cost", &self.bcrypt_cost)
+            .field("rate_limit_window_minutes", &self.rate_limit_window_minutes)
+            .field("rate_limit_max_attempts", &self.rate_limit_max_attempts)
+            .field(
+                "registration_rate_limit_window_minutes",
+                &self.registration_rate_limit_window_minutes,
+            )
+            .field(
+                "registration_rate_limit_max_attempts",
+                &self.registration_rate_limit_max_attempts,
+            )
             .finish()
     }
 }
@@ -117,6 +175,9 @@ pub enum ConfigError {
 
     #[error("Invalid bcrypt cost configuration: {0}")]
     InvalidBcryptCost(String),
+
+    #[error("Invalid rate limit configuration: {0}")]
+    InvalidRateLimitConfig(String),
 }
 
 impl Config {
@@ -259,6 +320,77 @@ impl Config {
             DEFAULT_BCRYPT_COST
         };
 
+        // Parse rate limit configuration
+        let rate_limit_window_minutes = Self::parse_rate_limit_i64(
+            vars,
+            "AC_RATE_LIMIT_WINDOW_MINUTES",
+            DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
+            MIN_RATE_LIMIT_WINDOW_MINUTES,
+            MAX_RATE_LIMIT_WINDOW_MINUTES,
+        )?;
+
+        let rate_limit_max_attempts = Self::parse_rate_limit_i64(
+            vars,
+            "AC_RATE_LIMIT_MAX_ATTEMPTS",
+            DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
+            MIN_RATE_LIMIT_MAX_ATTEMPTS,
+            MAX_RATE_LIMIT_MAX_ATTEMPTS,
+        )?;
+
+        let registration_rate_limit_window_minutes = Self::parse_rate_limit_i64(
+            vars,
+            "AC_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES",
+            DEFAULT_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES,
+            MIN_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES,
+            MAX_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES,
+        )?;
+
+        let registration_rate_limit_max_attempts = Self::parse_rate_limit_i64(
+            vars,
+            "AC_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS",
+            DEFAULT_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS,
+            MIN_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS,
+            MAX_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS,
+        )?;
+
+        // Warn on non-default rate limit values
+        if rate_limit_window_minutes != DEFAULT_RATE_LIMIT_WINDOW_MINUTES {
+            warn!(
+                rate_limit_window_minutes,
+                default = DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
+                "AC_RATE_LIMIT_WINDOW_MINUTES differs from default of {} minutes. \
+                 Shorter windows increase false-positive lockouts; longer windows delay recovery.",
+                DEFAULT_RATE_LIMIT_WINDOW_MINUTES
+            );
+        }
+        if rate_limit_max_attempts != DEFAULT_RATE_LIMIT_MAX_ATTEMPTS {
+            warn!(
+                rate_limit_max_attempts,
+                default = DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
+                "AC_RATE_LIMIT_MAX_ATTEMPTS differs from default of {}. \
+                 Lower values may lock out legitimate users; higher values reduce brute force protection.",
+                DEFAULT_RATE_LIMIT_MAX_ATTEMPTS
+            );
+        }
+        if registration_rate_limit_window_minutes != DEFAULT_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES
+        {
+            warn!(
+                registration_rate_limit_window_minutes,
+                default = DEFAULT_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES,
+                "AC_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES differs from default of {} minutes.",
+                DEFAULT_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES
+            );
+        }
+        if registration_rate_limit_max_attempts != DEFAULT_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS {
+            warn!(
+                registration_rate_limit_max_attempts,
+                default = DEFAULT_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS,
+                "AC_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS differs from default of {}. \
+                 Higher values reduce registration abuse protection.",
+                DEFAULT_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS
+            );
+        }
+
         // ADR-0012: Validate TLS configuration for PostgreSQL
         // Production deployments should use sslmode=verify-full
         // Allow non-TLS for local development but warn
@@ -272,6 +404,10 @@ impl Config {
             otlp_endpoint,
             jwt_clock_skew_seconds,
             bcrypt_cost,
+            rate_limit_window_minutes,
+            rate_limit_max_attempts,
+            registration_rate_limit_window_minutes,
+            registration_rate_limit_max_attempts,
         })
     }
 
@@ -297,6 +433,44 @@ impl Config {
                  for production deployments to ensure proper certificate validation."
             );
         }
+    }
+
+    /// Parse an i64 rate limit config value with min/max bounds validation.
+    fn parse_rate_limit_i64(
+        vars: &HashMap<String, String>,
+        env_var: &str,
+        default: i64,
+        min: i64,
+        max: i64,
+    ) -> Result<i64, ConfigError> {
+        let value = if let Some(value_str) = vars.get(env_var) {
+            let v: i64 = value_str.parse().map_err(|e| {
+                ConfigError::InvalidRateLimitConfig(format!(
+                    "{} must be a valid integer, got '{}': {}",
+                    env_var, value_str, e
+                ))
+            })?;
+
+            if v < min {
+                return Err(ConfigError::InvalidRateLimitConfig(format!(
+                    "{} must be at least {}, got {}",
+                    env_var, min, v
+                )));
+            }
+
+            if v > max {
+                return Err(ConfigError::InvalidRateLimitConfig(format!(
+                    "{} must not exceed {}, got {}",
+                    env_var, max, v
+                )));
+            }
+
+            v
+        } else {
+            default
+        };
+
+        Ok(value)
     }
 }
 
@@ -1028,6 +1202,208 @@ mod tests {
         assert!(
             DEFAULT_BCRYPT_COST <= MAX_BCRYPT_COST,
             "Default must be <= maximum"
+        );
+    }
+
+    // ============================================================================
+    // Rate Limit Configuration Tests
+    // ============================================================================
+
+    #[test]
+    fn test_rate_limit_defaults() {
+        let vars = HashMap::from([
+            (
+                "DATABASE_URL".to_string(),
+                "postgresql://localhost/test".to_string(),
+            ),
+            ("AC_MASTER_KEY".to_string(), test_master_key_base64()),
+        ]);
+
+        let config = Config::from_vars(&vars).expect("Config should load successfully");
+        assert_eq!(config.rate_limit_window_minutes, 15);
+        assert_eq!(config.rate_limit_max_attempts, 5);
+        assert_eq!(config.registration_rate_limit_window_minutes, 60);
+        assert_eq!(config.registration_rate_limit_max_attempts, 5);
+    }
+
+    #[test]
+    fn test_rate_limit_custom_values() {
+        let vars = HashMap::from([
+            (
+                "DATABASE_URL".to_string(),
+                "postgresql://localhost/test".to_string(),
+            ),
+            ("AC_MASTER_KEY".to_string(), test_master_key_base64()),
+            ("AC_RATE_LIMIT_WINDOW_MINUTES".to_string(), "1".to_string()),
+            ("AC_RATE_LIMIT_MAX_ATTEMPTS".to_string(), "100".to_string()),
+            (
+                "AC_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES".to_string(),
+                "1".to_string(),
+            ),
+            (
+                "AC_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS".to_string(),
+                "100".to_string(),
+            ),
+        ]);
+
+        let config = Config::from_vars(&vars).expect("Config should load successfully");
+        assert_eq!(config.rate_limit_window_minutes, 1);
+        assert_eq!(config.rate_limit_max_attempts, 100);
+        assert_eq!(config.registration_rate_limit_window_minutes, 1);
+        assert_eq!(config.registration_rate_limit_max_attempts, 100);
+    }
+
+    #[test]
+    fn test_rate_limit_rejects_zero() {
+        let vars = HashMap::from([
+            (
+                "DATABASE_URL".to_string(),
+                "postgresql://localhost/test".to_string(),
+            ),
+            ("AC_MASTER_KEY".to_string(), test_master_key_base64()),
+            ("AC_RATE_LIMIT_WINDOW_MINUTES".to_string(), "0".to_string()),
+        ]);
+
+        let result = Config::from_vars(&vars);
+        assert!(
+            matches!(result, Err(ConfigError::InvalidRateLimitConfig(msg)) if msg.contains("must be at least 1")),
+            "Zero rate limit window should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_rate_limit_rejects_exceeds_max() {
+        let vars = HashMap::from([
+            (
+                "DATABASE_URL".to_string(),
+                "postgresql://localhost/test".to_string(),
+            ),
+            ("AC_MASTER_KEY".to_string(), test_master_key_base64()),
+            ("AC_RATE_LIMIT_WINDOW_MINUTES".to_string(), "61".to_string()),
+        ]);
+
+        let result = Config::from_vars(&vars);
+        assert!(
+            matches!(result, Err(ConfigError::InvalidRateLimitConfig(msg)) if msg.contains("must not exceed 60")),
+            "Rate limit window > 60 should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_rate_limit_rejects_non_numeric() {
+        let vars = HashMap::from([
+            (
+                "DATABASE_URL".to_string(),
+                "postgresql://localhost/test".to_string(),
+            ),
+            ("AC_MASTER_KEY".to_string(), test_master_key_base64()),
+            ("AC_RATE_LIMIT_MAX_ATTEMPTS".to_string(), "five".to_string()),
+        ]);
+
+        let result = Config::from_vars(&vars);
+        assert!(
+            matches!(result, Err(ConfigError::InvalidRateLimitConfig(msg)) if msg.contains("must be a valid integer")),
+            "Non-numeric rate limit should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_rate_limit_rejects_negative() {
+        let vars = HashMap::from([
+            (
+                "DATABASE_URL".to_string(),
+                "postgresql://localhost/test".to_string(),
+            ),
+            ("AC_MASTER_KEY".to_string(), test_master_key_base64()),
+            ("AC_RATE_LIMIT_WINDOW_MINUTES".to_string(), "-5".to_string()),
+        ]);
+
+        let result = Config::from_vars(&vars);
+        assert!(
+            matches!(result, Err(ConfigError::InvalidRateLimitConfig(msg)) if msg.contains("must be at least 1")),
+            "Negative rate limit window should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_rate_limit_max_attempts_rejects_exceeds_max() {
+        let vars = HashMap::from([
+            (
+                "DATABASE_URL".to_string(),
+                "postgresql://localhost/test".to_string(),
+            ),
+            ("AC_MASTER_KEY".to_string(), test_master_key_base64()),
+            ("AC_RATE_LIMIT_MAX_ATTEMPTS".to_string(), "101".to_string()),
+        ]);
+
+        let result = Config::from_vars(&vars);
+        assert!(
+            matches!(result, Err(ConfigError::InvalidRateLimitConfig(msg)) if msg.contains("must not exceed 100")),
+            "Max attempts > 100 should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_registration_rate_limit_window_max() {
+        let vars = HashMap::from([
+            (
+                "DATABASE_URL".to_string(),
+                "postgresql://localhost/test".to_string(),
+            ),
+            ("AC_MASTER_KEY".to_string(), test_master_key_base64()),
+            (
+                "AC_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES".to_string(),
+                "1440".to_string(),
+            ),
+        ]);
+
+        let config = Config::from_vars(&vars).expect("Config should load successfully");
+        assert_eq!(config.registration_rate_limit_window_minutes, 1440);
+    }
+
+    #[test]
+    fn test_registration_rate_limit_window_rejects_exceeds_max() {
+        let vars = HashMap::from([
+            (
+                "DATABASE_URL".to_string(),
+                "postgresql://localhost/test".to_string(),
+            ),
+            ("AC_MASTER_KEY".to_string(), test_master_key_base64()),
+            (
+                "AC_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES".to_string(),
+                "1441".to_string(),
+            ),
+        ]);
+
+        let result = Config::from_vars(&vars);
+        assert!(
+            matches!(result, Err(ConfigError::InvalidRateLimitConfig(msg)) if msg.contains("must not exceed 1440")),
+            "Registration window > 1440 should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_rate_limit_constants_are_valid() {
+        // Verify ordering: MIN <= DEFAULT <= MAX for all rate limit constants
+        assert!(MIN_RATE_LIMIT_WINDOW_MINUTES <= DEFAULT_RATE_LIMIT_WINDOW_MINUTES);
+        assert!(DEFAULT_RATE_LIMIT_WINDOW_MINUTES <= MAX_RATE_LIMIT_WINDOW_MINUTES);
+        assert!(MIN_RATE_LIMIT_MAX_ATTEMPTS <= DEFAULT_RATE_LIMIT_MAX_ATTEMPTS);
+        assert!(DEFAULT_RATE_LIMIT_MAX_ATTEMPTS <= MAX_RATE_LIMIT_MAX_ATTEMPTS);
+        assert!(
+            MIN_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES
+                <= DEFAULT_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES
+        );
+        assert!(
+            DEFAULT_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES
+                <= MAX_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES
+        );
+        assert!(
+            MIN_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS
+                <= DEFAULT_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS
+        );
+        assert!(
+            DEFAULT_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS
+                <= MAX_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS
         );
     }
 }

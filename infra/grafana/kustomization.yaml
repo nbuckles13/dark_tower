@@ -1,0 +1,51 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: dark-tower-observability
+
+resources:
+  - rbac.yaml
+  - secret.yaml
+  - deployment.yaml
+  - service.yaml
+
+generatorOptions:
+  disableNameSuffixHash: true
+
+configMapGenerator:
+  - name: grafana-datasources
+    files:
+      - datasources.yaml=provisioning/datasources/datasources.yaml
+  - name: grafana-dashboards-config
+    files:
+      - dashboards.yaml=provisioning/dashboards/dashboards.yaml
+  - name: grafana-dashboards-ac
+    options:
+      labels:
+        grafana_dashboard: "1"
+    files:
+      - ac-logs.json=dashboards/ac-logs.json
+      - ac-overview.json=dashboards/ac-overview.json
+      - ac-slos.json=dashboards/ac-slos.json
+  - name: grafana-dashboards-gc
+    options:
+      labels:
+        grafana_dashboard: "1"
+    files:
+      - gc-logs.json=dashboards/gc-logs.json
+      - gc-overview.json=dashboards/gc-overview.json
+      - gc-slos.json=dashboards/gc-slos.json
+  - name: grafana-dashboards-mc
+    options:
+      labels:
+        grafana_dashboard: "1"
+    files:
+      - mc-logs.json=dashboards/mc-logs.json
+      - mc-overview.json=dashboards/mc-overview.json
+      - mc-slos.json=dashboards/mc-slos.json
+  - name: grafana-dashboards-errors
+    options:
+      labels:
+        grafana_dashboard: "1"
+    files:
+      - errors-overview.json=dashboards/errors-overview.json

@@ -17,6 +17,8 @@ data:
   MC_REGION: "local"
   # GC service discovery via Kubernetes DNS
   GC_GRPC_URL: "http://gc-service.dark-tower:50051"
+  # AC JWKS endpoint for JWT validation
+  AC_JWKS_URL: "http://ac-service.dark-tower:8082/.well-known/jwks.json"
   # TLS certificate paths for WebTransport (mounted from mc-service-tls Secret)
   MC_TLS_CERT_PATH: "/etc/mc-tls/tls.crt"
   MC_TLS_KEY_PATH: "/etc/mc-tls/tls.key"

@@ -48,6 +48,8 @@ async fn create_service_with_token(
         None,
         None,
         None,
+        ac_service::config::DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
+        ac_service::config::DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
     )
     .await?;
 

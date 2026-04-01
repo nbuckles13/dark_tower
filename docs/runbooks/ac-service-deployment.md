@@ -471,6 +471,10 @@ psql $DATABASE_URL
 | `OTLP_ENDPOINT` | No | OpenTelemetry collector endpoint (future observability) | None | `http://otel-collector:4317` |
 | `CLUSTER_NAME` | No | Cluster identifier for key ID generation | `us` | `us`, `eu`, `ap` |
 | `RUST_LOG` | No | Logging level | `info` | `info,ac_service=debug` |
+| `AC_RATE_LIMIT_WINDOW_MINUTES` | No | Login rate limit sliding window (minutes). Range: 1-60 | `15` | `1` (dev/test) |
+| `AC_RATE_LIMIT_MAX_ATTEMPTS` | No | Login rate limit max failed attempts before lockout. Range: 1-100 | `5` | `100` (dev/test) |
+| `AC_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES` | No | Registration rate limit sliding window (minutes). Range: 1-1440 | `60` | `1` (dev/test) |
+| `AC_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS` | No | Registration rate limit max attempts per IP per window. Range: 1-100 | `5` | `100` (dev/test) |
 
 ### Kubernetes Secrets
 

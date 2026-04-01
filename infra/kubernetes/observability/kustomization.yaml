@@ -20,7 +20,7 @@ resources:
   - prometheus-config.yaml
   - kube-state-metrics.yaml
   - node-exporter.yaml
-  - grafana/
+  - ../../grafana/
 
 labels:
   - pairs:

@@ -41,6 +41,7 @@
 - MC thin wrapper (JwtError→McError) → `crates/mc-service/src/auth/mod.rs`, `crates/mc-service/src/errors.rs`
 - MC JWKS config (`AC_JWKS_URL`, required) → `crates/mc-service/src/config.rs:ac_jwks_url`
 - MC TLS config (`MC_TLS_CERT_PATH`, `MC_TLS_KEY_PATH`, required + file-exists) → `crates/mc-service/src/config.rs:tls_cert_path`
+- AC rate limit config + threading → `crates/ac-service/src/config.rs:parse_rate_limit_i64()`, `auth_handler.rs`, `token_service.rs`, `user_service.rs`
 - Service auth design → ADR-0003
 
 ## Code Locations — Observability
@@ -70,6 +71,5 @@
 
 ## Code Locations — Env-Tests (Kind Cluster)
 - Cluster infra (ports, health) → `crates/env-tests/src/cluster.rs` (AC 8082, GC 8080, MC WT 4433/UDP 30433)
-- Join flow E2E (Tier 1 GC + Tier 2 MC WT) → `crates/env-tests/tests/24_join_flow.rs`
-- Rate limit: AC caps 5 registrations/IP/hour — all env-tests share 127.0.0.1 via port-forward
-- TLS: `with_no_cert_validation()` for dev certs; Feature gates: `--features flows` for join tests
+- Join flow E2E → `crates/env-tests/tests/24_join_flow.rs`
+- Rate limit (relaxed Kind config) → `infra/services/ac-service/configmap.yaml`

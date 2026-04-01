@@ -15,6 +15,9 @@
 - Fuzz targets -> `crates/ac-service/fuzz/fuzz_targets/jwt_validation.rs`
 - Test harness (HTTP seam) -> `crates/ac-test-utils/src/server_harness.rs`
 - Token builders -> `crates/ac-test-utils/src/token_builders.rs`
+- Rate limit config (defaults, bounds, parsing) -> `crates/ac-service/src/config.rs:parse_rate_limit_i64()`
+- Rate limit config tests -> `crates/ac-service/src/config.rs:tests::test_rate_limit_*`
+- Rate limit K8s wiring -> `infra/services/ac-service/configmap.yaml`, `infra/services/ac-service/statefulset.yaml`
 
 ## Code Locations: GC Service
 - Auth integration tests (HTTP layer, wiremock JWKS) -> `crates/gc-service/tests/auth_tests.rs`
@@ -57,19 +60,16 @@
 - Mock GC server (gRPC seam) -> `crates/mc-test-utils/src/mock_gc.rs`
 
 ## Code Locations: Environment Tests
-- Cluster health smoke tests -> `crates/env-tests/tests/00_cluster_health.rs`
-- Cluster bootstrap (K8s seam, ClusterPorts with MC WebTransport) -> `crates/env-tests/src/cluster.rs`
-- GC client fixture -> `crates/env-tests/src/fixtures/gc_client.rs`
-- Auth client fixture -> `crates/env-tests/src/fixtures/auth_client.rs`
-- Env-test flows (20-24) -> `crates/env-tests/tests/` (auth, cross-service, meeting creation, join flow)
-- Join flow E2E (GC join API, MC WebTransport, protobuf signaling, bridge) -> `crates/env-tests/tests/24_join_flow.rs`
+- Cluster bootstrap → `crates/env-tests/src/cluster.rs`
+- Auth + GC client fixtures → `crates/env-tests/src/fixtures/auth_client.rs`, `gc_client.rs`
+- Env-test flows (20-24) → `crates/env-tests/tests/` (auth, cross-service, creation, join)
+- Join flow E2E → `crates/env-tests/tests/24_join_flow.rs`
 
 ## Code Locations: Common Crate
 - JWT (claims, JwtError, JwksClient, JwtValidator, round-trip tests) -> `crates/common/src/jwt.rs`
 
 ## Infrastructure & Shared
-- MC K8s health probes (liveness/readiness) → `infra/services/mc-service/deployment.yaml`
+- MC K8s health probes → `infra/services/mc-service/deployment.yaml`
 - Dev cert generation + Kind setup → `scripts/generate-dev-certs.sh`, `infra/kind/scripts/setup.sh`
-- JWT claims (UserClaims, MeetingTokenClaims, GuestTokenClaims) → `crates/common/src/jwt.rs`
-- Kustomize bases + Kind overlay → `infra/services/*/kustomization.yaml`, `infra/kubernetes/overlays/kind/`
-- Kustomize validation guard (R-15 through R-20) → `scripts/guards/simple/validate-kustomize.sh`
+- JWT claims → `crates/common/src/jwt.rs`
+- Kustomize guard (R-15–R-20) → `scripts/guards/simple/validate-kustomize.sh`

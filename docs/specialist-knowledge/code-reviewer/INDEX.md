@@ -14,6 +14,8 @@
 ## Code Locations — AC Service
 - Clippy deny list (unwrap, expect, panic, indexing) → `Cargo.toml:34-42`
 - Config constants + defense-in-depth → `crates/ac-service/src/config.rs:from_vars()`
+- Config rate limit parsing helper → `crates/ac-service/src/config.rs:parse_rate_limit_i64()`
+- Rate limit constants (MIN/DEFAULT/MAX) → `crates/ac-service/src/config.rs:32-61`
 - Crypto (EdDSA, AES-256-GCM, bcrypt) → `crates/ac-service/src/crypto/mod.rs:sign_jwt()`
 - Error type reference → `crates/ac-service/src/errors.rs:AcError`
 - Handler pattern (auth flow) → `crates/ac-service/src/handlers/auth_handler.rs:handle_service_token()`
@@ -21,6 +23,8 @@
 - Route composition → `crates/ac-service/src/routes/mod.rs:build_routes()`
 - Repository layer (sqlx queries) → `crates/ac-service/src/repositories/signing_keys.rs`
 - Service layer (business logic) → `crates/ac-service/src/services/key_management_service.rs`
+- Token + user service (rate limit params) → `token_service.rs:issue_service_token()`, `user_service.rs:register_user()`
+- AC K8s rate limit wiring → `infra/services/ac-service/configmap.yaml`, `statefulset.yaml`
 
 ## Code Locations — GC Service
 - Error type reference → `crates/gc-service/src/errors.rs:GcError`
@@ -67,8 +71,5 @@
 - Guard runner → `scripts/guards/run-guards.sh`; Review protocol → `.claude/skills/devloop/review-protocol.md`
 - Kustomize validation guard (R-15–R-20) → `scripts/guards/simple/validate-kustomize.sh`
 
-## Kustomize Bases & Overlays
-- Service bases → `infra/services/{ac,gc,mc}-service/kustomization.yaml`, `infra/services/{postgres,redis}/kustomization.yaml`
-- Observability + Grafana → `infra/kubernetes/observability/kustomization.yaml`, `grafana/kustomization.yaml`
-- Kind overlay → `infra/kubernetes/overlays/kind/` (top-level, per-service, observability)
-- Kind setup script → `infra/kind/scripts/setup.sh`
+## Kustomize & Infrastructure
+- Service bases + Kind overlay → `infra/services/*/kustomization.yaml`, `infra/kubernetes/overlays/kind/`
