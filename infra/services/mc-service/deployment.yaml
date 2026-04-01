@@ -69,6 +69,11 @@ spec:
             configMapKeyRef:
               name: mc-service-config
               key: GC_GRPC_URL
+        - name: AC_JWKS_URL
+          valueFrom:
+            configMapKeyRef:
+              name: mc-service-config
+              key: AC_JWKS_URL
         - name: REDIS_URL
           valueFrom:
             secretKeyRef:

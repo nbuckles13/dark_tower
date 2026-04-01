@@ -113,6 +113,8 @@ pub async fn handle_user_token(
         payload.password.expose_secret(),
         ip_address.as_deref(),
         user_agent.as_deref(),
+        state.config.rate_limit_window_minutes,
+        state.config.rate_limit_max_attempts,
     )
     .await;
 
@@ -171,6 +173,11 @@ pub async fn handle_register(
         request,
         ip_address.as_deref(),
         user_agent.as_deref(),
+        state.config.bcrypt_cost,
+        state.config.registration_rate_limit_window_minutes,
+        state.config.registration_rate_limit_max_attempts,
+        state.config.rate_limit_window_minutes,
+        state.config.rate_limit_max_attempts,
     )
     .await;
 
@@ -274,6 +281,8 @@ pub async fn handle_service_token(
         requested_scopes,
         ip_address.as_deref(),
         user_agent.as_deref(),
+        state.config.rate_limit_window_minutes,
+        state.config.rate_limit_max_attempts,
     )
     .await;
 

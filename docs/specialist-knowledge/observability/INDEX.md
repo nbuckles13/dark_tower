@@ -9,6 +9,10 @@
 - Metric catalogs -> `docs/observability/metrics/ac-service.md`, `gc-service.md`, `mc-service.md`
 - AC metrics recording -> `crates/ac-service/src/observability/metrics.rs:init_metrics_recorder()`
 - AC gauge initialization at startup -> `crates/ac-service/src/services/key_management_service.rs:init_key_metrics()`
+- AC rate limit config startup logging -> `crates/ac-service/src/main.rs` (lines 60-75)
+- AC rate limit config defaults & bounds -> `crates/ac-service/src/config.rs` (DEFAULT_RATE_LIMIT_*, DEFAULT_REGISTRATION_RATE_LIMIT_*)
+- AC rate limit non-default warnings -> `crates/ac-service/src/config.rs:from_vars()` (warn! block)
+- AC rate limit config parsing -> `crates/ac-service/src/config.rs:parse_rate_limit_i64()`
 - AC HTTP metrics middleware -> `crates/ac-service/src/middleware/http_metrics.rs`
 - GC metrics recording -> `crates/gc-service/src/observability/metrics.rs:init_metrics_recorder()`
 - GC meeting metrics (creation, join) -> `crates/gc-service/src/observability/metrics.rs`
@@ -62,14 +66,8 @@
 - GC scenarios 8-9 (creation limits, code collision) -> `docs/runbooks/gc-incident-response.md`
 - Join failure triage (GC + MC error types) -> `docs/observability/alerts.md`
 
-## Test Coverage
-- GC join integration tests (success, AC-down, no-MC, service-token-rejected) -> `crates/gc-service/tests/meeting_tests.rs` (task 14)
-- MC join integration tests (WebTransport, JWT, signaling bridge, 11 tests) -> `crates/mc-service/tests/join_tests.rs` (task 15)
-- GC metrics unit tests (no-op recorder, code-path coverage only) -> `crates/gc-service/src/observability/metrics.rs`
-- MC metrics unit tests (DebuggingRecorder + snapshot) -> `crates/mc-service/src/observability/metrics.rs`
-- TestKeypair (Ed25519 JWT signing for tests) -> `crates/mc-test-utils/src/jwt_test.rs`
-
-## Integration Seams
+## Test Coverage & Integration Seams
+- GC metrics tests -> `crates/gc-service/src/observability/metrics.rs`
+- MC metrics tests -> `crates/mc-service/src/observability/metrics.rs`
 - Env-tests observability validation -> `crates/env-tests/tests/30_observability.rs`
-- Observability mod re-exports (stale export risk) -> `crates/*/src/observability/mod.rs`
-- MC K8s health probes + TLS + WebTransport UDP -> `infra/services/mc-service/deployment.yaml`, `infra/kind/kind-config.yaml`
+- MC K8s health probes + TLS -> `infra/services/mc-service/deployment.yaml`

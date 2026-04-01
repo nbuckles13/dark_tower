@@ -12,11 +12,6 @@ use uuid::Uuid;
 
 // Configuration
 const MIN_PASSWORD_LENGTH: usize = 8;
-const DEFAULT_BCRYPT_COST: u32 = 12;
-
-// Rate limiting for registration (per IP)
-const REGISTRATION_RATE_LIMIT_WINDOW_MINUTES: i64 = 60; // 1 hour window
-const REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS: i64 = 5; // Max registrations per IP per hour
 
 /// Registration request data.
 #[derive(Debug, Clone)]
@@ -53,10 +48,11 @@ pub struct RegistrationResponse {
 ///
 /// # Security
 ///
-/// - Rate limiting prevents abuse (5 registrations per IP per hour)
+/// - Rate limiting prevents abuse
 /// - Password minimum length enforced
 /// - Email uniqueness per organization
 /// - Auto-login provides seamless UX without exposing credentials
+#[expect(clippy::too_many_arguments)]
 pub async fn register_user(
     pool: &PgPool,
     master_key: &[u8],
@@ -65,25 +61,30 @@ pub async fn register_user(
     request: RegistrationRequest,
     ip_address: Option<&str>,
     user_agent: Option<&str>,
+    bcrypt_cost: u32,
+    registration_rate_limit_window_minutes: i64,
+    registration_rate_limit_max_attempts: i64,
+    rate_limit_window_minutes: i64,
+    rate_limit_max_attempts: i64,
 ) -> Result<RegistrationResponse, AcError> {
     // Rate limit by IP (if IP is available)
     if let Some(ip) = ip_address {
         let rate_limit_window_ago =
-            chrono::Utc::now() - chrono::Duration::minutes(REGISTRATION_RATE_LIMIT_WINDOW_MINUTES);
+            chrono::Utc::now() - chrono::Duration::minutes(registration_rate_limit_window_minutes);
 
         // Count registrations (we use a different event type check here)
         // For simplicity, we check auth events. A more robust approach would be
         // to track registration attempts separately.
         let registration_count = count_registrations_from_ip(pool, ip, rate_limit_window_ago).await;
 
-        if registration_count >= REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS {
+        if registration_count >= registration_rate_limit_max_attempts {
             tracing::warn!(
                 "Registration rate limit exceeded for IP (count={})",
                 registration_count
             );
             record_rate_limit_decision("rejected");
             return Err(AcError::TooManyRequests {
-                retry_after_seconds: REGISTRATION_RATE_LIMIT_WINDOW_MINUTES * 60,
+                retry_after_seconds: registration_rate_limit_window_minutes * 60,
                 message: "Too many registration attempts. Please try again later.".to_string(),
             });
         }
@@ -118,8 +119,8 @@ pub async fn register_user(
         ));
     }
 
-    // Hash password with bcrypt cost 12
-    let password_hash = crypto::hash_client_secret(&request.password, DEFAULT_BCRYPT_COST)?;
+    // Hash password with configured bcrypt cost
+    let password_hash = crypto::hash_client_secret(&request.password, bcrypt_cost)?;
 
     // Create user
     let user = users::create_user(pool, org_id, &request.email, &password_hash, display_name)
@@ -153,6 +154,8 @@ pub async fn register_user(
         &request.password,
         ip_address,
         user_agent,
+        rate_limit_window_minutes,
+        rate_limit_max_attempts,
     )
     .await?;
 
@@ -254,6 +257,11 @@ async fn log_registration_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{
+        DEFAULT_BCRYPT_COST, DEFAULT_RATE_LIMIT_MAX_ATTEMPTS, DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
+        DEFAULT_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS,
+        DEFAULT_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES,
+    };
     use crate::crypto;
     use crate::services::key_management_service;
 
@@ -340,6 +348,11 @@ mod tests {
             request,
             Some("192.168.1.1"),
             Some("TestAgent/1.0"),
+            DEFAULT_BCRYPT_COST,
+            DEFAULT_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES,
+            DEFAULT_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS,
+            DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
+            DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
         )
         .await?;
 
@@ -396,6 +409,11 @@ mod tests {
                 request,
                 Some(ip),
                 None,
+                DEFAULT_BCRYPT_COST,
+                DEFAULT_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES,
+                DEFAULT_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS,
+                DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
+                DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
             )
             .await;
 
@@ -456,8 +474,21 @@ mod tests {
                 display_name: "Test".to_string(),
             };
 
-            let result =
-                register_user(&pool, &master_key, &master_key, org_id, request, None, None).await;
+            let result = register_user(
+                &pool,
+                &master_key,
+                &master_key,
+                org_id,
+                request,
+                None,
+                None,
+                DEFAULT_BCRYPT_COST,
+                DEFAULT_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES,
+                DEFAULT_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS,
+                DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
+                DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
+            )
+            .await;
 
             assert!(
                 matches!(result, Err(AcError::InvalidToken(_))),
@@ -486,8 +517,21 @@ mod tests {
                 display_name: "Test".to_string(),
             };
 
-            let result =
-                register_user(&pool, &master_key, &master_key, org_id, request, None, None).await;
+            let result = register_user(
+                &pool,
+                &master_key,
+                &master_key,
+                org_id,
+                request,
+                None,
+                None,
+                DEFAULT_BCRYPT_COST,
+                DEFAULT_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES,
+                DEFAULT_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS,
+                DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
+                DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
+            )
+            .await;
 
             assert!(
                 matches!(result, Err(AcError::InvalidToken(msg)) if msg.contains("8 characters")),
@@ -522,6 +566,11 @@ mod tests {
             request1,
             None,
             None,
+            DEFAULT_BCRYPT_COST,
+            DEFAULT_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES,
+            DEFAULT_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS,
+            DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
+            DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
         )
         .await;
         assert!(result1.is_ok(), "First registration should succeed");
@@ -541,6 +590,11 @@ mod tests {
             request2,
             None,
             None,
+            DEFAULT_BCRYPT_COST,
+            DEFAULT_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES,
+            DEFAULT_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS,
+            DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
+            DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
         )
         .await;
 
@@ -569,8 +623,21 @@ mod tests {
                 display_name: name.to_string(),
             };
 
-            let result =
-                register_user(&pool, &master_key, &master_key, org_id, request, None, None).await;
+            let result = register_user(
+                &pool,
+                &master_key,
+                &master_key,
+                org_id,
+                request,
+                None,
+                None,
+                DEFAULT_BCRYPT_COST,
+                DEFAULT_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES,
+                DEFAULT_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS,
+                DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
+                DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
+            )
+            .await;
 
             assert!(
                 matches!(result, Err(AcError::InvalidToken(msg)) if msg.contains("Display name")),
@@ -596,8 +663,21 @@ mod tests {
             display_name: "Minimum Password User".to_string(),
         };
 
-        let result =
-            register_user(&pool, &master_key, &master_key, org_id, request, None, None).await?;
+        let result = register_user(
+            &pool,
+            &master_key,
+            &master_key,
+            org_id,
+            request,
+            None,
+            None,
+            DEFAULT_BCRYPT_COST,
+            DEFAULT_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES,
+            DEFAULT_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS,
+            DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
+            DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
+        )
+        .await?;
 
         assert_eq!(result.email, "minpass@example.com");
 
@@ -622,8 +702,21 @@ mod tests {
             display_name: "Org 1 User".to_string(),
         };
 
-        let result1 =
-            register_user(&pool, &master_key, &master_key, org1, request1, None, None).await?;
+        let result1 = register_user(
+            &pool,
+            &master_key,
+            &master_key,
+            org1,
+            request1,
+            None,
+            None,
+            DEFAULT_BCRYPT_COST,
+            DEFAULT_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES,
+            DEFAULT_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS,
+            DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
+            DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
+        )
+        .await?;
         assert_eq!(result1.email, email);
 
         // Register same email in org2
@@ -633,8 +726,21 @@ mod tests {
             display_name: "Org 2 User".to_string(),
         };
 
-        let result2 =
-            register_user(&pool, &master_key, &master_key, org2, request2, None, None).await?;
+        let result2 = register_user(
+            &pool,
+            &master_key,
+            &master_key,
+            org2,
+            request2,
+            None,
+            None,
+            DEFAULT_BCRYPT_COST,
+            DEFAULT_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES,
+            DEFAULT_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS,
+            DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
+            DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
+        )
+        .await?;
         assert_eq!(result2.email, email);
 
         // Both should exist independently
@@ -676,6 +782,11 @@ mod tests {
                 request,
                 None, // No IP address
                 None,
+                DEFAULT_BCRYPT_COST,
+                DEFAULT_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES,
+                DEFAULT_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS,
+                DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
+                DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
             )
             .await;
 

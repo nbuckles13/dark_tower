@@ -1,5 +1,8 @@
 #[cfg(test)]
-use crate::config::{DEFAULT_BCRYPT_COST, DEFAULT_JWT_CLOCK_SKEW};
+use crate::config::{
+    DEFAULT_BCRYPT_COST, DEFAULT_JWT_CLOCK_SKEW, DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
+    DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
+};
 use crate::crypto::{self, Claims, EncryptedKey, UserClaims};
 use crate::errors::AcError;
 use crate::models::{AuthEventType, TokenResponse};
@@ -14,10 +17,6 @@ use uuid::Uuid;
 // Token configuration
 const TOKEN_EXPIRY_SECONDS: u64 = 3600; // 1 hour
 const TOKEN_EXPIRY_SECONDS_I64: i64 = 3600; // 1 hour (for timestamp calculations)
-
-// Rate limiting configuration (per ADR-0003)
-const RATE_LIMIT_WINDOW_MINUTES: i64 = 15; // 15-minute sliding window
-const RATE_LIMIT_MAX_ATTEMPTS: i64 = 5; // Maximum failed attempts before lockout
 
 // Security test configuration
 #[cfg(test)]
@@ -37,6 +36,8 @@ pub async fn issue_service_token(
     requested_scopes: Option<Vec<String>>,
     ip_address: Option<&str>,
     user_agent: Option<&str>,
+    rate_limit_window_minutes: i64,
+    rate_limit_max_attempts: i64,
 ) -> Result<TokenResponse, AcError> {
     // Validate grant_type
     if grant_type != "client_credentials" {
@@ -49,7 +50,7 @@ pub async fn issue_service_token(
     // Check for account lockout (prevent brute force)
     if let Some(ref cred) = credential {
         let rate_limit_window_ago =
-            Utc::now() - chrono::Duration::minutes(RATE_LIMIT_WINDOW_MINUTES);
+            Utc::now() - chrono::Duration::minutes(rate_limit_window_minutes);
         let failed_count = auth_events::get_failed_attempts_count(
             pool,
             &cred.credential_id,
@@ -57,7 +58,7 @@ pub async fn issue_service_token(
         )
         .await?;
 
-        if failed_count >= RATE_LIMIT_MAX_ATTEMPTS {
+        if failed_count >= rate_limit_max_attempts {
             // ADR-0011: Log hashed client_id to prevent PII leakage while preserving correlation
             tracing::warn!(
                 "Account locked due to excessive failed attempts: client_id_hash={}",
@@ -209,10 +210,12 @@ pub async fn issue_user_token(
     password: &str,
     ip_address: Option<&str>,
     user_agent: Option<&str>,
+    rate_limit_window_minutes: i64,
+    rate_limit_max_attempts: i64,
 ) -> Result<UserTokenResponse, AcError> {
     // Check for account lockout (prevent brute force)
     // We use email as the identifier for rate limiting in user context
-    let rate_limit_window_ago = Utc::now() - chrono::Duration::minutes(RATE_LIMIT_WINDOW_MINUTES);
+    let rate_limit_window_ago = Utc::now() - chrono::Duration::minutes(rate_limit_window_minutes);
 
     // Get failed attempts for this email (using correlation hash)
     // For user auth, we need to check by email correlation, not credential_id
@@ -225,14 +228,14 @@ pub async fn issue_user_token(
                 .await
                 .unwrap_or(0);
 
-        if failed_count >= RATE_LIMIT_MAX_ATTEMPTS {
+        if failed_count >= rate_limit_max_attempts {
             tracing::warn!(
                 "User account locked due to excessive failed attempts: email_hash={}",
                 hash_for_correlation(email, hash_secret)
             );
             record_rate_limit_decision("rejected");
             return Err(AcError::TooManyRequests {
-                retry_after_seconds: RATE_LIMIT_WINDOW_MINUTES * 60,
+                retry_after_seconds: rate_limit_window_minutes * 60,
                 message: "Too many failed login attempts. Please try again later.".to_string(),
             });
         }
@@ -416,6 +419,8 @@ mod tests {
             None,
             None,
             None,
+            DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
+            DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
         )
         .await;
         let _ = issue_service_token(
@@ -428,6 +433,8 @@ mod tests {
             None,
             None,
             None,
+            DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
+            DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
         )
         .await;
 
@@ -448,6 +455,8 @@ mod tests {
                 None,
                 None,
                 None,
+                DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
+                DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
             )
             .await;
             valid_times.push(start.elapsed());
@@ -464,6 +473,8 @@ mod tests {
                 None,
                 None,
                 None,
+                DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
+                DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
             )
             .await;
             invalid_times.push(start.elapsed());
@@ -536,6 +547,8 @@ mod tests {
             None,
             None,
             None,
+            DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
+            DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
         )
         .await;
 
@@ -550,6 +563,8 @@ mod tests {
             None,
             None,
             None,
+            DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
+            DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
         )
         .await;
 
@@ -584,8 +599,8 @@ mod tests {
         )
         .await?;
 
-        // Attempt RATE_LIMIT_MAX_ATTEMPTS failed logins
-        for _ in 0..RATE_LIMIT_MAX_ATTEMPTS {
+        // Attempt DEFAULT_RATE_LIMIT_MAX_ATTEMPTS failed logins
+        for _ in 0..DEFAULT_RATE_LIMIT_MAX_ATTEMPTS {
             let _ = issue_service_token(
                 &pool,
                 &master_key,
@@ -596,6 +611,8 @@ mod tests {
                 None,
                 Some("192.168.1.1"),
                 None,
+                DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
+                DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
             )
             .await;
         }
@@ -611,6 +628,8 @@ mod tests {
             None,
             Some("192.168.1.1"),
             None,
+            DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
+            DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
         )
         .await;
 
@@ -627,6 +646,8 @@ mod tests {
             None,
             Some("192.168.1.1"),
             None,
+            DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
+            DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
         )
         .await;
 
@@ -671,6 +692,8 @@ mod tests {
                 None,
                 Some("192.168.1.2"),
                 None,
+                DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
+                DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
             )
             .await;
         }
@@ -686,6 +709,8 @@ mod tests {
             None,
             Some("192.168.1.2"),
             None,
+            DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
+            DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
         )
         .await;
 
@@ -729,6 +754,8 @@ mod tests {
             ]),
             None,
             None,
+            DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
+            DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
         )
         .await;
 
@@ -771,6 +798,8 @@ mod tests {
             Some(vec!["meeting:read".to_string()]),
             None,
             None,
+            DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
+            DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
         )
         .await?;
 
@@ -813,6 +842,8 @@ mod tests {
             None,
             None,
             None,
+            DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
+            DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
         )
         .await;
 
@@ -851,6 +882,8 @@ mod tests {
             None,
             None,
             None,
+            DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
+            DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
         )
         .await;
 
@@ -888,6 +921,8 @@ mod tests {
             None,
             Some("192.168.1.100"),
             Some("TestAgent/1.0"),
+            DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
+            DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
         )
         .await?;
 
@@ -947,6 +982,8 @@ mod tests {
             None,
             None,
             None,
+            DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
+            DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
         )
         .await?;
 
@@ -1079,6 +1116,8 @@ mod tests {
             None,
             None,
             None,
+            DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
+            DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
         )
         .await?;
 
@@ -1140,6 +1179,8 @@ mod tests {
             None,
             None,
             None,
+            DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
+            DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
         )
         .await?;
 
@@ -1218,6 +1259,8 @@ mod tests {
             None,
             None,
             None,
+            DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
+            DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
         )
         .await?;
 
@@ -1733,6 +1776,8 @@ mod tests {
             None,
             None,
             None,
+            DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
+            DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
         )
         .await?;
 
@@ -1914,6 +1959,8 @@ mod tests {
             None,
             None,
             None,
+            DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
+            DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
         )
         .await?;
 
@@ -2119,6 +2166,8 @@ mod tests {
             None,
             None,
             None,
+            DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
+            DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
         )
         .await?;
 
@@ -2373,6 +2422,8 @@ mod tests {
                 None,
                 None,
                 None,
+                DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
+                DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
             )
             .await;
 
@@ -2469,6 +2520,8 @@ mod tests {
             None,
             None,
             None,
+            DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
+            DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
         )
         .await;
 
@@ -2482,6 +2535,8 @@ mod tests {
             None,
             None,
             None,
+            DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
+            DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
         )
         .await;
 
@@ -2588,6 +2643,8 @@ mod tests {
             password,
             Some("192.168.1.1"),
             Some("TestAgent/1.0"),
+            DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
+            DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
         )
         .await?;
 
@@ -2636,6 +2693,8 @@ mod tests {
             "wrong-password",
             None,
             None,
+            DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
+            DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
         )
         .await;
 
@@ -2649,6 +2708,8 @@ mod tests {
             "some-password",
             None,
             None,
+            DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
+            DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
         )
         .await;
 
@@ -2698,6 +2759,8 @@ mod tests {
             password,
             None,
             None,
+            DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
+            DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
         )
         .await;
 
@@ -2721,8 +2784,8 @@ mod tests {
         let email = "lockout@example.com";
         let _user_id = create_test_user(&pool, org_id, email, password).await;
 
-        // Attempt 5 failed logins
-        for _ in 0..RATE_LIMIT_MAX_ATTEMPTS {
+        // Attempt DEFAULT_RATE_LIMIT_MAX_ATTEMPTS failed logins
+        for _ in 0..DEFAULT_RATE_LIMIT_MAX_ATTEMPTS {
             let _ = issue_user_token(
                 &pool,
                 &master_key,
@@ -2732,6 +2795,8 @@ mod tests {
                 "wrong-password",
                 Some("192.168.1.1"),
                 None,
+                DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
+                DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
             )
             .await;
         }
@@ -2746,6 +2811,8 @@ mod tests {
             "wrong-password",
             Some("192.168.1.1"),
             None,
+            DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
+            DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
         )
         .await;
 
@@ -2764,6 +2831,8 @@ mod tests {
             password,
             Some("192.168.1.1"),
             None,
+            DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
+            DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
         )
         .await;
 
@@ -2806,6 +2875,8 @@ mod tests {
             password,
             None,
             None,
+            DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
+            DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
         )
         .await?;
 
@@ -2846,6 +2917,8 @@ mod tests {
             password,
             None,
             None,
+            DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
+            DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
         )
         .await?;
 
@@ -2893,6 +2966,8 @@ mod tests {
             "wrong-password",
             None,
             None,
+            DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
+            DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
         )
         .await;
         let existing_user_duration = start.elapsed();
@@ -2908,6 +2983,8 @@ mod tests {
             "some-password",
             None,
             None,
+            DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
+            DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
         )
         .await;
         let nonexistent_user_duration = start.elapsed();

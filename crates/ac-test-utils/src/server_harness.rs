@@ -74,6 +74,12 @@ impl TestAuthServer {
             otlp_endpoint: None,
             jwt_clock_skew_seconds: ac_service::config::DEFAULT_JWT_CLOCK_SKEW.as_secs() as i64,
             bcrypt_cost: DEFAULT_BCRYPT_COST,
+            rate_limit_window_minutes: ac_service::config::DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
+            rate_limit_max_attempts: ac_service::config::DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
+            registration_rate_limit_window_minutes:
+                ac_service::config::DEFAULT_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES,
+            registration_rate_limit_max_attempts:
+                ac_service::config::DEFAULT_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS,
         };
 
         // Create application state
@@ -193,6 +199,8 @@ impl TestAuthServer {
             None,                 // requested_scopes (use credential's scopes)
             None,                 // ip_address
             None,                 // user_agent
+            self.config.rate_limit_window_minutes,
+            self.config.rate_limit_max_attempts,
         )
         .await?;
 

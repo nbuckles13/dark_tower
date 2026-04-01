@@ -49,6 +49,26 @@ spec:
             secretKeyRef:
               name: ac-service-secrets
               key: AC_MASTER_KEY
+        - name: AC_RATE_LIMIT_WINDOW_MINUTES
+          valueFrom:
+            configMapKeyRef:
+              name: ac-service-config
+              key: AC_RATE_LIMIT_WINDOW_MINUTES
+        - name: AC_RATE_LIMIT_MAX_ATTEMPTS
+          valueFrom:
+            configMapKeyRef:
+              name: ac-service-config
+              key: AC_RATE_LIMIT_MAX_ATTEMPTS
+        - name: AC_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES
+          valueFrom:
+            configMapKeyRef:
+              name: ac-service-config
+              key: AC_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES
+        - name: AC_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS
+          valueFrom:
+            configMapKeyRef:
+              name: ac-service-config
+              key: AC_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS
         - name: RUST_LOG
           value: "info,ac_service=debug"
         resources:

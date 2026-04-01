@@ -343,6 +343,12 @@ mod tests {
             otlp_endpoint: None,
             jwt_clock_skew_seconds: crate::config::DEFAULT_JWT_CLOCK_SKEW.as_secs() as i64,
             bcrypt_cost: crate::config::DEFAULT_BCRYPT_COST,
+            rate_limit_window_minutes: crate::config::DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
+            rate_limit_max_attempts: crate::config::DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
+            registration_rate_limit_window_minutes:
+                crate::config::DEFAULT_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES,
+            registration_rate_limit_max_attempts:
+                crate::config::DEFAULT_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS,
         };
         let state = Arc::new(auth_handler::AppState {
             pool: pool.clone(),
@@ -387,6 +393,12 @@ mod tests {
             otlp_endpoint: None,
             jwt_clock_skew_seconds: crate::config::DEFAULT_JWT_CLOCK_SKEW.as_secs() as i64,
             bcrypt_cost: crate::config::DEFAULT_BCRYPT_COST,
+            rate_limit_window_minutes: crate::config::DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
+            rate_limit_max_attempts: crate::config::DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
+            registration_rate_limit_window_minutes:
+                crate::config::DEFAULT_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES,
+            registration_rate_limit_max_attempts:
+                crate::config::DEFAULT_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS,
         };
         let state = Arc::new(auth_handler::AppState {
             pool: pool.clone(),

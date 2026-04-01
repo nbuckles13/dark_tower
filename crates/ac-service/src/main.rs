@@ -57,6 +57,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Configuration loaded successfully"
     );
 
+    // Log rate limit configuration
+    info!(
+        rate_limit_window_minutes = config.rate_limit_window_minutes,
+        rate_limit_window_is_default =
+            (config.rate_limit_window_minutes == config::DEFAULT_RATE_LIMIT_WINDOW_MINUTES),
+        rate_limit_max_attempts = config.rate_limit_max_attempts,
+        rate_limit_attempts_is_default =
+            (config.rate_limit_max_attempts == config::DEFAULT_RATE_LIMIT_MAX_ATTEMPTS),
+        registration_rate_limit_window_minutes = config.registration_rate_limit_window_minutes,
+        reg_rate_limit_window_is_default = (config.registration_rate_limit_window_minutes
+            == config::DEFAULT_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES),
+        registration_rate_limit_max_attempts = config.registration_rate_limit_max_attempts,
+        reg_rate_limit_attempts_is_default = (config.registration_rate_limit_max_attempts
+            == config::DEFAULT_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS),
+        "Rate limit configuration"
+    );
+
     // Initialize database connection pool with query timeout
     // ADR-0012: 5s statement timeout to fail fast on hung queries
     info!("Connecting to database...");

@@ -13,7 +13,10 @@
 - Key encryption at rest → `crates/ac-service/src/crypto/mod.rs:encrypt_private_key()`
 - Bcrypt hash/verify → `crates/ac-service/src/crypto/mod.rs:hash_client_secret()`, `verify_client_secret()`
 - Token issuance → `crates/ac-service/src/services/token_service.rs:issue_service_token()`, `issue_user_token()`
-- Security config bounds → `crates/ac-service/src/config.rs`
+- Security config (bcrypt, JWT clock skew, rate limits) → `crates/ac-service/src/config.rs`
+- Rate limit config + validation → `crates/ac-service/src/config.rs:parse_rate_limit_i64()`
+- Rate limiting (login + registration) → `token_service.rs`, `user_service.rs`, `auth_handler.rs`
+- Rate limit K8s config → `infra/services/ac-service/configmap.yaml`, `statefulset.yaml`
 
 ## Code Locations — Common (JWT Infrastructure)
 - JWT size constant → `crates/common/src/jwt.rs:MAX_JWT_SIZE_BYTES`
@@ -66,10 +69,6 @@
 - Kustomize security guards (R-18 securityContext, R-19 empty secrets) → `scripts/guards/simple/validate-kustomize.sh`
 
 ## Test Coverage (Security-Relevant)
-- MC join integration tests (JWT, error opacity) → `crates/mc-service/tests/join_tests.rs`
-- MC JWT unit tests (token confusion, role tampering) → `crates/mc-service/src/auth/mod.rs` (#[cfg(test)])
-- Shared JWT test fixtures (Ed25519 keypair, JWKS mock) → `crates/mc-test-utils/src/jwt_test.rs`
-- GC join integration tests (service token rejection) → `crates/gc-service/tests/meeting_tests.rs`
-
-## Runbooks & Audit
-- GC security scenarios (8-9) → `docs/runbooks/gc-incident-response.md`; Bcrypt cost → `crates/ac-service/src/`
+- MC join tests (JWT, error opacity) + JWT unit tests → `crates/mc-service/tests/join_tests.rs`, `src/auth/mod.rs`
+- JWT test fixtures (Ed25519, JWKS mock) → `crates/mc-test-utils/src/jwt_test.rs`
+- GC join tests (service token rejection) → `crates/gc-service/tests/meeting_tests.rs`

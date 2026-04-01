@@ -8,3 +8,8 @@ metadata:
     component: auth
 data:
   AC_CLUSTER_NAME: "dark-tower-prod"
+  # Rate limit settings relaxed for Kind dev/test environments
+  AC_RATE_LIMIT_WINDOW_MINUTES: "1"
+  AC_RATE_LIMIT_MAX_ATTEMPTS: "100"
+  AC_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES: "1"
+  AC_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS: "100"

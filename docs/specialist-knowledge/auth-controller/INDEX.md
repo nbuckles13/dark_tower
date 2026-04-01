@@ -10,6 +10,7 @@
 
 ## Code Locations
 - Config loading & validation -> `crates/ac-service/src/config.rs:Config::from_vars()`
+- Rate limit config parsing -> `crates/ac-service/src/config.rs:Config::parse_rate_limit_i64()`
 - JWT signing (service) -> `crates/ac-service/src/crypto/mod.rs:sign_jwt()`
 - JWT signing (user) -> `crates/ac-service/src/crypto/mod.rs:sign_user_jwt()`
 - JWT verification (service) -> `crates/ac-service/src/crypto/mod.rs:verify_jwt()`
@@ -48,4 +49,7 @@
 - Test server harness -> `crates/ac-test-utils/src/server_harness.rs`
 - DB: credentials repo -> `crates/ac-service/src/repositories/service_credentials.rs`
 - DB: signing keys repo -> `crates/ac-service/src/repositories/signing_keys.rs`
+- K8s configmap (rate limits) -> `infra/services/ac-service/configmap.yaml`
+- K8s statefulset -> `infra/services/ac-service/statefulset.yaml`
+- Deployment runbook -> `docs/runbooks/ac-service-deployment.md`
 

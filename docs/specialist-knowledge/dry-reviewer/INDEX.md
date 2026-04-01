@@ -53,22 +53,23 @@
 - GC health routes -> `crates/gc-service/src/routes/mod.rs:64-65`
 - GC health probes (K8s) -> `infra/services/gc-service/deployment.yaml` (livenessProbe, readinessProbe)
 
+## Per-Service Config Parsing
+- AC config (env parse + validation) -> `crates/ac-service/src/config.rs:Config::from_vars()`
+  - Rate limit parse helper -> `crates/ac-service/src/config.rs:parse_rate_limit_i64()`
+  - Rate limit env vars: `AC_RATE_LIMIT_WINDOW_MINUTES`, `AC_RATE_LIMIT_MAX_ATTEMPTS`, `AC_REGISTRATION_RATE_LIMIT_*`
+- GC config (env parse + validation) -> `crates/gc-service/src/config.rs:Config::from_vars()`
+- MC config (env parse + validation) -> `crates/mc-service/src/config.rs:Config::from_vars()`
+- AC K8s configmap (rate limit dev values) -> `infra/services/ac-service/configmap.yaml`
+- AC K8s statefulset (env var wiring) -> `infra/services/ac-service/statefulset.yaml`
+
 ## False Positive Boundaries
 - Actor vs controller metrics (different consumers) -> `crates/mc-service/src/actors/metrics.rs`
 - Per-service error mapping (From<JwtError> for GcError vs McError) -> required, not duplication
 - AC API ParticipantType (has Guest) vs common::jwt::ParticipantType (no Guest)
+- AC rate limiting (DB-backed lockout) vs GC rate limiting (middleware RPM) -> different mechanisms, not duplication
 
-## Kustomize Infrastructure
-- Per-service bases -> `infra/services/{ac,gc,mc}-service/kustomization.yaml`
-- Postgres/Redis bases -> `infra/services/{postgres,redis}/kustomization.yaml`
-- Grafana manifests + dashboard configMapGenerator -> `infra/kubernetes/observability/grafana/`
-- Observability stack base -> `infra/kubernetes/observability/kustomization.yaml`
-- Kind overlay (top-level + per-service + observability) -> `infra/kubernetes/overlays/kind/`
-- setup.sh Kustomize deploy (`kubectl apply -k`) -> `infra/kind/scripts/setup.sh`
-- Kustomize CI guard (R-15 through R-20) -> `scripts/guards/simple/validate-kustomize.sh`
-
-## Integration Seams
-- Common crate as extraction target -> `crates/common/src/`
-- JWT thin wrapper pattern (GC + MC) -> `crates/{gc,mc}-service/src/auth/`
-- Test fixture pattern (mc-test-utils, gc-test-utils) -> `crates/*-test-utils/`
-- Metric names in runbooks must match code -> `docs/runbooks/`, alert rule files
+## Infrastructure & Integration Seams
+- Service Kustomize bases + Kind overlay → `infra/services/*/kustomization.yaml`, `infra/kubernetes/overlays/kind/`
+- Common crate as extraction target → `crates/common/src/`
+- JWT thin wrapper pattern (GC + MC) → `crates/{gc,mc}-service/src/auth/`
+- Test fixture pattern → `crates/*-test-utils/`

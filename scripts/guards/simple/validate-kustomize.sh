@@ -34,13 +34,22 @@ SERVICES_DIR="$REPO_ROOT/infra/services"
 OVERLAYS_DIR="$REPO_ROOT/infra/kubernetes/overlays/kind"
 OBS_BASE_DIR="$REPO_ROOT/infra/kubernetes/observability"
 DASHBOARDS_DIR="$REPO_ROOT/infra/grafana/dashboards"
-GRAFANA_KUSTOMIZATION="$OBS_BASE_DIR/grafana/kustomization.yaml"
+GRAFANA_KUSTOMIZATION="$REPO_ROOT/infra/grafana/kustomization.yaml"
 
-# Service bases to validate
-SERVICE_BASES=(ac-service gc-service mc-service postgres redis)
+# Build service lists from CANONICAL_SERVICES (common.sh) + infrastructure services
+SERVICE_BASES=()
+for prefix in "${!CANONICAL_SERVICES[@]}"; do
+    IFS=':' read -r dir _app <<< "${CANONICAL_SERVICES[$prefix]}"
+    # Only include services that have infra/services/ directories
+    if [[ -d "$SERVICES_DIR/$dir" ]]; then
+        SERVICE_BASES+=("$dir")
+    fi
+done
+# Infrastructure services (no crate, not in CANONICAL_SERVICES)
+SERVICE_BASES+=(postgres redis)
 
-# Service overlays to validate
-SERVICE_OVERLAYS=(ac-service gc-service mc-service postgres redis)
+# Overlays mirror bases
+SERVICE_OVERLAYS=("${SERVICE_BASES[@]}")
 
 # Known exclusions for orphan manifest check (R-16)
 # These files are intentionally NOT listed in kustomization.yaml resources
