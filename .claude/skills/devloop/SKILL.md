@@ -480,15 +480,26 @@ Update main.md:
 - Final summary
 - Tech debt section (all accepted deferrals with justifications, plus DRY extraction opportunities)
 
-Write `.devloop-pr.json` to the worktree root with PR metadata for the host wrapper script:
+Write or update `.devloop-pr.json` with cumulative PR metadata for the host wrapper script.
+
+**If `.devloop-pr.json` already exists** (previous devloop on this branch):
+1. Read the existing file
+2. Write a new version that summarizes ALL devloops on this branch — the previous content (condensed) plus the current devloop
+3. The `title` should be a branch-level summary covering all devloops (under 70 chars)
+4. The `body` should list each devloop as a section with its summary, verdicts, and key changes
+
+**If `.devloop-pr.json` does not exist** (first devloop on this branch):
+1. Write it fresh with this devloop's details
+
+Format:
 ```json
 {
-  "title": "Short PR title (under 70 chars)",
-  "body": "## Summary\n- bullet points\n\n## Review\n- reviewer verdicts\n\n## Test plan\n- [ ] verification steps\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)"
+  "title": "Branch-level summary (under 70 chars)",
+  "body": "## Summary\n\n### Devloop 1: {slug}\n- bullet points\n- Verdicts: ...\n\n### Devloop 2: {slug}\n- bullet points\n- Verdicts: ...\n\n## Test plan\n- [ ] verification steps\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)"
 }
 ```
 
-The `title` should summarize the change. The `body` should include the task summary, reviewer verdicts, files changed, and a test plan. This file is read by the host-side `devloop.sh` wrapper to create the GitHub PR with proper context. See ADR-0025.
+This file is read by the host-side `devloop.sh` wrapper to create the GitHub PR. The format is always a single `{title, body}` object — `devloop.sh` does not need to change. See ADR-0025.
 
 If this task is part of a user story, update the Devloop Tracking table
 in the user story file: set Status to Completed, fill in the Devloop
