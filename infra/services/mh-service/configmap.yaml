@@ -1,0 +1,28 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mh-service-config
+  namespace: dark-tower
+  labels:
+    app: mh-service
+    component: media
+data:
+  # MH_HANDLER_ID intentionally omitted — each pod auto-generates a unique ID
+  # from HOSTNAME + UUID suffix (see config.rs), avoiding conflicts across replicas
+  # gRPC server for MC communication
+  MH_GRPC_BIND_ADDRESS: "0.0.0.0:50053"
+  # Health/metrics endpoint
+  MH_HEALTH_BIND_ADDRESS: "0.0.0.0:8083"
+  # WebTransport server for media streams
+  MH_WEBTRANSPORT_BIND_ADDRESS: "0.0.0.0:4434"
+  # Deployment region (local for Kind)
+  MH_REGION: "local"
+  # GC service discovery via Kubernetes DNS (registration endpoint)
+  GC_GRPC_URL: "http://gc-service.dark-tower:50051"
+  # AC service discovery for OAuth token acquisition
+  AC_ENDPOINT: "http://ac-service.dark-tower:8082"
+  # Maximum concurrent media streams
+  MH_MAX_STREAMS: "100"
+  # TLS certificate paths for WebTransport (mounted from mh-service-tls Secret)
+  MH_TLS_CERT_PATH: "/etc/mh-tls/tls.crt"
+  MH_TLS_KEY_PATH: "/etc/mh-tls/tls.key"

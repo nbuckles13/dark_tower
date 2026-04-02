@@ -51,20 +51,20 @@
 - Alert rules + dashboards → `infra/docker/prometheus/rules/`, `infra/grafana/dashboards/` | ADR-0029
 
 ## TLS & Certificates
-- Dev cert generation (ECDSA P-256 CA) → `scripts/generate-dev-certs.sh`
-- MC TLS volume mount (defaultMode 0400) → `infra/services/mc-service/deployment.yaml`
-- MC WebTransport UDP ingress + Kind mapping → `infra/services/mc-service/network-policy.yaml`, `infra/kind/kind-config.yaml`
+- Dev cert generation (ECDSA P-256 CA, MC + MH certs) → `scripts/generate-dev-certs.sh`
+- MC/MH TLS volume mounts (defaultMode 0400) → `infra/services/{mc,mh}-service/deployment.yaml`
+- WebTransport UDP ingress + Kind mapping → `infra/services/{mc,mh}-service/network-policy.yaml`, `infra/kind/kind-config.yaml`
 
 ## Infrastructure Secrets & Network Isolation
-- Imperative secret creation → `infra/kind/scripts/setup.sh:create_ac_secrets()`, `create_mc_tls_secret()`
+- Imperative secret creation → `setup.sh:create_ac_secrets()`, `create_mc_tls_secret()`, `create_mh_secrets()`, `create_mh_tls_secret()`
+- MH secrets + network policy (MC ingress, GC+AC egress, no DB/Redis) → `infra/services/mh-service/{secret,network-policy}.yaml`
+- AC network policy (allows GC, MC, MH ingress for tokens) → `infra/services/ac-service/network-policy.yaml`
 - Kind overlay (no secrets) + supporting infra → `infra/kubernetes/overlays/kind/`, `infra/services/{postgres,redis}/`
 
 ## Health, Probes & Integration Seams
-- MC health + K8s probes → `crates/mc-service/src/observability/health.rs`, `infra/services/mc-service/deployment.yaml`
-- MH health (no sensitive state) → `crates/mh-service/src/observability/health.rs`
+- MC/MH health + K8s probes → `crates/mc-service/src/observability/health.rs` (+ mh), `infra/services/mc-service/deployment.yaml` (+ mh)
 - AC JWKS → common `JwksClient` → GC/MC `JwtValidator` (meeting/guest tokens via WebTransport)
-- GC→MC gRPC service tokens → `crates/mc-service/src/grpc/auth_interceptor.rs`
-- MC→MH gRPC service tokens → `crates/mh-service/src/grpc/auth_interceptor.rs`
+- gRPC service token chain: GC→MC (`mc/.../auth_interceptor.rs`) → MC→MH (`mh/.../auth_interceptor.rs`)
 - MH→GC OAuth registration → `crates/mh-service/src/grpc/gc_client.rs`
 - Credential leak guards → `scripts/guards/simple/no-secrets-in-logs.sh`
 - Kustomize security guards (R-18, R-19) → `scripts/guards/simple/validate-kustomize.sh`

@@ -62,14 +62,14 @@
 - Auth interceptor tests (Bearer, size limits) -> `crates/mh-service/src/grpc/auth_interceptor.rs:tests`
 - Health state & router tests -> `crates/mh-service/src/observability/health.rs:tests`
 - GC integration tests (registration, load reports, NOT_FOUND) -> `crates/mh-service/tests/gc_integration.rs`
+- MH infra (manifests, Kind overlay, Dockerfile, deploy) -> `infra/services/mh-service/`, `infra/docker/mh-service/`, `setup.sh:deploy_mh_service()`
+- NOTE: `crates/env-tests/src/cluster.rs` lacks MH port/health — add when MH env-tests are written
 
 ## Code Locations: Environment Tests
 - Cluster bootstrap + fixtures → `crates/env-tests/src/cluster.rs`, `crates/env-tests/src/fixtures/`
 - Env-test flows (20-24) + join flow E2E → `crates/env-tests/tests/24_join_flow.rs`
 
-## Code Locations: Common Crate
+## Code Locations: Common & Infrastructure
 - JWT (claims, JwtError, JwksClient, JwtValidator, round-trip tests) -> `crates/common/src/jwt.rs`
-
-## Infrastructure & Shared
-- MC K8s health probes → `infra/services/mc-service/deployment.yaml`
-- Dev certs, Kind setup, Kustomize guard → `scripts/generate-dev-certs.sh`, `infra/kind/scripts/setup.sh`, `scripts/guards/simple/validate-kustomize.sh`
+- MC/MH K8s health probes → `infra/services/{mc,mh}-service/deployment.yaml`
+- Dev certs (AC, MC, MH), Kind setup, Kustomize guard → `scripts/generate-dev-certs.sh`, `infra/kind/scripts/setup.sh`, `scripts/guards/simple/validate-kustomize.sh`

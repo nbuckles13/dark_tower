@@ -414,6 +414,60 @@ deploy_mc_service() {
     log_info "Meeting Controller deployed successfully."
 }
 
+# Create MH service secrets
+create_mh_secrets() {
+    log_step "Creating MH service secrets..."
+
+    kubectl create secret generic mh-service-secrets \
+        --from-literal=MH_CLIENT_SECRET="media-handler-secret-dev-003" \
+        -n dark-tower \
+        --dry-run=client -o yaml | kubectl apply -f -
+
+    log_info "MH service secrets created."
+}
+
+# Generate TLS certificates and create MH TLS secret
+create_mh_tls_secret() {
+    log_step "Generating TLS certificates for MH WebTransport..."
+
+    # Generate dev certs (idempotent — reuses CA if it already exists)
+    "${PROJECT_ROOT}/scripts/generate-dev-certs.sh"
+
+    log_step "Creating mh-service-tls Secret from generated certs..."
+    kubectl create secret tls mh-service-tls \
+        --cert="${PROJECT_ROOT}/infra/docker/certs/mh-webtransport.crt" \
+        --key="${PROJECT_ROOT}/infra/docker/certs/mh-webtransport.key" \
+        -n dark-tower \
+        --dry-run=client -o yaml | kubectl apply -f -
+
+    log_info "MH TLS secret created successfully."
+}
+
+# Build and deploy Media Handler service
+deploy_mh_service() {
+    log_step "Building Media Handler container image..."
+    build_image localhost/mh-service:latest infra/docker/mh-service/Dockerfile "${PROJECT_ROOT}"
+
+    log_step "Loading image into kind cluster..."
+    if [[ "${KIND_EXPERIMENTAL_PROVIDER:-}" == "podman" ]]; then
+        local TMPFILE
+        TMPFILE=$(mktemp /tmp/mh-service-image.XXXXXX.tar)
+        podman save localhost/mh-service:latest -o "${TMPFILE}"
+        kind load image-archive "${TMPFILE}" --name "${CLUSTER_NAME}"
+        rm -f "${TMPFILE}"
+    else
+        kind load docker-image localhost/mh-service:latest --name "${CLUSTER_NAME}"
+    fi
+
+    log_step "Deploying Media Handler to cluster..."
+    kubectl apply -k "${PROJECT_ROOT}/infra/kubernetes/overlays/kind/services/mh-service/"
+
+    log_info "Waiting for Media Handler to be ready..."
+    kubectl rollout status deployment/mh-service -n dark-tower --timeout=180s
+
+    log_info "Media Handler deployed successfully."
+}
+
 # Install Telepresence traffic-manager (optional)
 install_telepresence() {
     log_step "Checking Telepresence..."
@@ -445,6 +499,7 @@ setup_port_forwards() {
     kubectl port-forward -n dark-tower svc/postgres 5432:5432 &>/dev/null &
     kubectl port-forward -n dark-tower svc/ac-service 8082:8082 &>/dev/null &
     kubectl port-forward -n dark-tower svc/gc-service 8080:8080 &>/dev/null &
+    kubectl port-forward -n dark-tower svc/mh-service 8083:8083 &>/dev/null &
     kubectl port-forward -n dark-tower-observability svc/prometheus 9090:9090 &>/dev/null &
     kubectl port-forward -n dark-tower-observability svc/grafana 3000:3000 &>/dev/null &
     kubectl port-forward -n dark-tower-observability svc/loki 3100:3100 &>/dev/null &
@@ -478,6 +533,13 @@ print_access_info() {
     echo "    TLS: Self-signed (CA at infra/docker/certs/ca.crt)"
     echo "    Status: Running in-cluster (2 replicas)"
     echo ""
+    echo "  MH Service (Media Handler):"
+    echo "    WebTransport: https://localhost:4434 (QUIC/UDP via NodePort)"
+    echo "    gRPC: localhost:50053 (cluster-internal)"
+    echo "    Health: http://localhost:8083"
+    echo "    TLS: Self-signed (CA at infra/docker/certs/ca.crt)"
+    echo "    Status: Running in-cluster (2 replicas)"
+    echo ""
     echo "  Grafana:"
     echo "    URL: http://localhost:3000"
     echo "    Credentials: admin/admin"
@@ -502,7 +564,7 @@ print_access_info() {
     echo "  media-handler / media-handler-secret-dev-003  (used by MH)"
     echo "  test-client / test-client-secret-dev-999  (for testing)"
     echo ""
-    echo "  GC and MC use these credentials to obtain OAuth tokens from AC."
+    echo "  GC, MC, and MH use these credentials to obtain OAuth tokens from AC."
     echo "  Tokens are acquired automatically via TokenManager (client credentials flow)."
     echo ""
     echo "Quick Test (AC service is already running):"
@@ -559,6 +621,9 @@ main() {
     deploy_gc_service
     create_mc_tls_secret
     deploy_mc_service
+    create_mh_secrets
+    create_mh_tls_secret
+    deploy_mh_service
     install_telepresence
     setup_port_forwards
     print_access_info

@@ -1,0 +1,35 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: mh-service
+  namespace: dark-tower
+  labels:
+    app: mh-service
+    component: media
+spec:
+  # NodePort to expose WebTransport UDP via Kind port mapping (hostPort 4434 -> nodePort 30434).
+  # TCP NodePorts are pinned but NOT mapped in kind-config.yaml, so they are not reachable
+  # from the host. Only WebTransport (UDP 30434) is host-accessible. NetworkPolicy still
+  # restricts gRPC ingress to mc-service pods at the cluster level.
+  type: NodePort
+  selector:
+    app: mh-service
+    component: media
+  ports:
+  - name: health
+    protocol: TCP
+    port: 8083
+    targetPort: 8083
+    nodePort: 30083
+  - name: grpc
+    protocol: TCP
+    port: 50053
+    targetPort: 50053
+    nodePort: 30053
+  # WebTransport QUIC/UDP — NodePort 30434 mapped to host 4434 in Kind config
+  - name: webtransport
+    protocol: UDP
+    port: 4434
+    targetPort: 4434
+    nodePort: 30434
+  sessionAffinity: None

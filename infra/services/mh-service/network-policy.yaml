@@ -1,37 +1,37 @@
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: mc-service
+  name: mh-service
   namespace: dark-tower
   labels:
-    app: mc-service
-    component: signaling
+    app: mh-service
+    component: media
 spec:
   podSelector:
     matchLabels:
-      app: mc-service
-      component: signaling
+      app: mh-service
+      component: media
   policyTypes:
   - Ingress
   - Egress
   ingress:
-  # Allow ingress from Global Controller (meeting assignments, participant routing)
+  # Allow ingress from Meeting Controller (gRPC media forwarding)
   - from:
     - namespaceSelector:
         matchLabels:
           kubernetes.io/metadata.name: dark-tower
       podSelector:
         matchLabels:
-          app: gc-service
+          app: mc-service
     ports:
     - protocol: TCP
-      port: 50052
-  # Allow ingress from external clients (WebTransport)
-  # In Kind, exposed via NodePort 30433 (mapped to host 4433 in kind-config.yaml)
+      port: 50053
+  # Allow ingress from external clients (WebTransport media)
+  # In Kind, exposed via NodePort 30434 (mapped to host 4434 in kind-config.yaml)
   - from: []
     ports:
     - protocol: UDP
-      port: 4433
+      port: 4434
   # Allow ingress from Prometheus for metrics scraping
   - from:
     - namespaceSelector:
@@ -42,7 +42,7 @@ spec:
           app: prometheus
     ports:
     - protocol: TCP
-      port: 8081
+      port: 8083
   egress:
   # Allow egress to Global Controller (registration, heartbeat)
   - to:
@@ -55,29 +55,7 @@ spec:
     ports:
     - protocol: TCP
       port: 50051
-  # Allow egress to Redis
-  - to:
-    - namespaceSelector:
-        matchLabels:
-          kubernetes.io/metadata.name: dark-tower
-      podSelector:
-        matchLabels:
-          app: redis
-    ports:
-    - protocol: TCP
-      port: 6379
-  # Allow egress to Media Handler (gRPC media forwarding)
-  - to:
-    - namespaceSelector:
-        matchLabels:
-          kubernetes.io/metadata.name: dark-tower
-      podSelector:
-        matchLabels:
-          app: mh-service
-    ports:
-    - protocol: TCP
-      port: 50053
-  # Allow egress to AC (OAuth token acquisition)
+  # Allow egress to Auth Controller (OAuth token acquisition)
   - to:
     - namespaceSelector:
         matchLabels:

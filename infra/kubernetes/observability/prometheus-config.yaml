@@ -77,6 +77,21 @@ data:
             action: keep
             regex: "8081"
 
+      # Scrape Media Handler pods (metrics on health port)
+      - job_name: 'mh-service'
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              names:
+                - dark-tower
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_label_app]
+            action: keep
+            regex: mh-service
+          - source_labels: [__meta_kubernetes_pod_container_port_number]
+            action: keep
+            regex: "8083"
+
       # Scrape kube-state-metrics for cluster-level metrics
       - job_name: 'kube-state-metrics'
         kubernetes_sd_configs:
