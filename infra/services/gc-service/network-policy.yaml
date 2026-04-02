@@ -26,6 +26,17 @@ spec:
     ports:
     - protocol: TCP
       port: 50051
+  # Allow ingress from Media Handler (gRPC registration/heartbeat)
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: dark-tower
+      podSelector:
+        matchLabels:
+          app: mh-service
+    ports:
+    - protocol: TCP
+      port: 50051
   # Allow ingress from external clients (via ingress controller)
   # In Kind, we use port-forward so this allows any source on HTTP port
   - from: []

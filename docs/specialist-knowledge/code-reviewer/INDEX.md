@@ -55,8 +55,10 @@
 - Startup wiring (TokenManager, health, gRPC, GC task) → `crates/mh-service/src/main.rs`
 - Health probes (liveness/readiness, port 8083) → `crates/mh-service/src/observability/health.rs:health_router()`
 - Metrics (mh_ prefix, SLO-aligned buckets) → `crates/mh-service/src/observability/metrics.rs:init_metrics_recorder()`
-- Metrics catalog → `docs/observability/metrics/mh-service.md`
-- Dashboard → `infra/grafana/dashboards/mh-overview.json`
+- Metrics catalog + dashboard → `docs/observability/metrics/mh-service.md`, `infra/grafana/dashboards/mh-overview.json`
+- K8s deployment (probes on 8083, TLS vol, UDP 4434) → `infra/services/mh-service/deployment.yaml`
+- Dockerfile (cargo-chef, protobuf-compiler, distroless) → `infra/docker/mh-service/Dockerfile`
+- NetworkPolicy (MC gRPC ingress, client UDP, GC/AC egress) → `infra/services/mh-service/network-policy.yaml`
 
 ## Code Locations — Common
 - JWT (errors, claims, validator, JWKS, HasIat) → `crates/common/src/jwt.rs`
@@ -65,11 +67,9 @@
 
 ## Infrastructure & Guards
 - Standard health endpoints (`/health`, `/ready`) → ADR-0012 (Section: Standard Operational Endpoints)
-- MC TLS cert generation → `scripts/generate-dev-certs.sh`
-- GC K8s deployment (probe reference pattern) → `infra/services/gc-service/deployment.yaml`
-- Guard runner → `scripts/guards/run-guards.sh`; Review protocol → `.claude/skills/devloop/review-protocol.md`
-- Application metrics guard → `scripts/guards/simple/validate-application-metrics.sh`
-- Kustomize validation guard (R-15–R-20) → `scripts/guards/simple/validate-kustomize.sh`
-
-## Kustomize & Infrastructure
+- MC+MH TLS cert generation → `scripts/generate-dev-certs.sh`
+- Kind config (MC UDP 4433, MH UDP 4434) + setup → `infra/kind/kind-config.yaml`, `infra/kind/scripts/setup.sh`
 - Service bases + Kind overlay → `infra/services/*/kustomization.yaml`, `infra/kubernetes/overlays/kind/`
+- Guard runner → `scripts/guards/run-guards.sh`; Review protocol → `.claude/skills/devloop/review-protocol.md`
+- Kustomize guard (R-15–R-20) → `scripts/guards/simple/validate-kustomize.sh`
+- Application metrics guard → `scripts/guards/simple/validate-application-metrics.sh`

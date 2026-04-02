@@ -30,6 +30,10 @@ nodes:
       - containerPort: 30433
         hostPort: 4433
         protocol: UDP
+      # MH WebTransport (QUIC/UDP) — requires NodePort 30434 on mh-service Service
+      - containerPort: 30434
+        hostPort: 4434
+        protocol: UDP
 
 # Use containerd as the container runtime
 containerdConfigPatches:

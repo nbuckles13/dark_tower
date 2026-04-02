@@ -18,31 +18,31 @@
 ## Code Locations — Deployment & K8s
 - Kind cluster config + setup script → `infra/kind/kind-config.yaml`, `infra/kind/scripts/setup.sh`
 - Kind overlay (top-level, per-service, observability) → `infra/kubernetes/overlays/kind/`
-- Per-service Kustomize bases → `infra/services/{ac,gc,mc}-service/kustomization.yaml`
-- Per-service manifests (deployment, netpol, PDB) → `infra/services/{ac,gc,mc}-service/`
+- Per-service Kustomize bases → `infra/services/{ac,gc,mc,mh}-service/kustomization.yaml`
+- Per-service manifests (deployment, netpol, PDB) → `infra/services/{ac,gc,mc,mh}-service/`
+- Dockerfiles → `infra/docker/{ac,gc,mc,mh}-service/Dockerfile`
 - PostgreSQL + Redis Kustomize bases → `infra/services/postgres/`, `infra/services/redis/`
 - Alert rules → `infra/docker/prometheus/rules/{gc,mc}-alerts.yaml`
-- Dev certs, master key, service registration → `scripts/generate-dev-certs.sh`, `generate-master-key.sh`, `register-service.sh`
-- MC TLS secret (imperative, setup.sh) + UDP NodePort (30433) → `infra/services/mc-service/`
+- Dev certs (AC, MC, MH WebTransport) → `scripts/generate-dev-certs.sh`
+- MC/MH TLS secrets (imperative, setup.sh) + UDP NodePorts (MC=30433, MH=30434) in `kind-config.yaml`
+- setup.sh deploy order: AC → GC → MC → MH (MH after GC — required for GC registration)
+- setup.sh MH: `create_mh_secrets()`, `create_mh_tls_secret()`, `deploy_mh_service()`
+- Cross-service netpol: GC allows MH on 50051, MC allows MH on 50053 → `gc-service/network-policy.yaml`, `mc-service/network-policy.yaml`
 
 ## Runbooks
-- AC incident/deployment → `docs/runbooks/ac-service-incident-response.md`, `ac-service-deployment.md`
-- GC incident/deployment → `docs/runbooks/gc-incident-response.md`, `gc-deployment.md`
-- MC incident/deployment → `docs/runbooks/mc-incident-response.md`, `mc-deployment.md`
+- Per-service incident/deployment → `docs/runbooks/` (ac, gc, mc)
 
 ## Code Locations — Database & Migrations
-- Participant tracking → `migrations/20260322000001_add_participant_tracking.sql`, `crates/gc-service/src/repositories/participants.rs`
-- Meeting activation + audit → `crates/gc-service/src/repositories/meetings.rs`
+- Participant tracking + meetings → `crates/gc-service/src/repositories/participants.rs`, `meetings.rs`
 
 ## Code Locations — Auth & JWT
-- Common JWKS + JWT → `crates/common/src/jwt.rs`; GC wrapper → `gc-service/src/auth/jwt.rs`; MC wrapper → `mc-service/src/auth/mod.rs`
-- MC JWKS + TLS config → `crates/mc-service/src/config.rs` (`AC_JWKS_URL`, `MC_TLS_CERT_PATH`, `MC_TLS_KEY_PATH`)
+- Common JWKS + JWT → `crates/common/src/jwt.rs`; GC/MC wrappers → `gc-service/src/auth/`, `mc-service/src/auth/`
 - AC rate limits → `crates/ac-service/src/config.rs:parse_rate_limit_i64()`; Service auth → ADR-0003
 
 ## Code Locations — Observability
 - Observability Kustomize + Grafana → `infra/kubernetes/observability/`, `infra/grafana/dashboards/`
-- GC metrics → `crates/gc-service/src/observability/metrics.rs`; MC metrics → `crates/mc-service/src/observability/metrics.rs`
-- MC dashboard + alerts → `infra/grafana/dashboards/mc-overview.json`, `docs/observability/alerts.md`
+- Per-service metrics → `crates/gc-service/src/observability/metrics.rs` (+ mc, mh)
+- Dashboards + alerts → `infra/grafana/dashboards/`, `docs/observability/alerts.md`
 - Prometheus scrape config → `infra/docker/prometheus/prometheus.yml`
 
 ## Code Locations — MH Service (Stub)

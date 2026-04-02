@@ -53,10 +53,8 @@
 - MH overview dashboard (registration, heartbeat, token refresh panels, ADR-0029 compliant) -> `infra/grafana/dashboards/mh-overview.json`
 - Cross-service error dashboard -> `infra/grafana/dashboards/errors-overview.json`
 - Grafana provisioning -> `infra/grafana/provisioning/datasources/datasources.yaml`
-- K8s observability base kustomization (includes grafana/) -> `infra/kubernetes/observability/kustomization.yaml`
-- Kind overlay (environment: kind label, observability + services) -> `infra/kubernetes/overlays/kind/kustomization.yaml`
-- Kind observability overlay (references base) -> `infra/kubernetes/overlays/kind/observability/kustomization.yaml`
-- Prometheus config -> `infra/docker/prometheus/prometheus.yml` (compose), `infra/kubernetes/observability/prometheus-config.yaml` (K8s)
+- K8s observability kustomization (base + Kind overlay) -> `infra/kubernetes/observability/kustomization.yaml`, `infra/kubernetes/overlays/kind/`
+- Prometheus config -> `infra/docker/prometheus/prometheus.yml` (compose), `infra/kubernetes/observability/prometheus-config.yaml` (K8s, includes mh-service scrape job)
 - Alert + dashboard docs -> `docs/observability/alerts.md`, `docs/observability/dashboards.md`
 
 ## Guards
@@ -73,3 +71,4 @@
 - GC/MC/MH metrics tests -> `crates/gc-service/src/observability/metrics.rs` (+ mc, mh)
 - Env-tests observability validation -> `crates/env-tests/tests/30_observability.rs`
 - MC K8s health probes + TLS -> `infra/services/mc-service/deployment.yaml`
+- MH K8s health probes (port 8083), metrics scrape via NetworkPolicy -> `infra/services/mh-service/deployment.yaml`

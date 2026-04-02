@@ -1,0 +1,151 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mh-service
+  namespace: dark-tower
+  labels:
+    app: mh-service
+    component: media
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: mh-service
+      component: media
+  template:
+    metadata:
+      labels:
+        app: mh-service
+        component: media
+    spec:
+      terminationGracePeriodSeconds: 35
+      securityContext:
+        runAsNonRoot: true
+        # Match distroless nonroot user (uid 65532)
+        runAsUser: 65532
+        fsGroup: 65532
+      containers:
+      - name: mh-service
+        image: localhost/mh-service:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - name: health
+          containerPort: 8083
+          protocol: TCP
+        - name: grpc
+          containerPort: 50053
+          protocol: TCP
+        - name: webtransport
+          containerPort: 4434
+          protocol: UDP
+        env:
+        # MH_HANDLER_ID omitted — auto-generated per pod from HOSTNAME + UUID
+        - name: MH_REGION
+          valueFrom:
+            configMapKeyRef:
+              name: mh-service-config
+              key: MH_REGION
+        - name: GC_GRPC_URL
+          valueFrom:
+            configMapKeyRef:
+              name: mh-service-config
+              key: GC_GRPC_URL
+        - name: MH_GRPC_BIND_ADDRESS
+          valueFrom:
+            configMapKeyRef:
+              name: mh-service-config
+              key: MH_GRPC_BIND_ADDRESS
+        - name: MH_HEALTH_BIND_ADDRESS
+          valueFrom:
+            configMapKeyRef:
+              name: mh-service-config
+              key: MH_HEALTH_BIND_ADDRESS
+        - name: MH_WEBTRANSPORT_BIND_ADDRESS
+          valueFrom:
+            configMapKeyRef:
+              name: mh-service-config
+              key: MH_WEBTRANSPORT_BIND_ADDRESS
+        - name: MH_MAX_STREAMS
+          valueFrom:
+            configMapKeyRef:
+              name: mh-service-config
+              key: MH_MAX_STREAMS
+        - name: AC_ENDPOINT
+          valueFrom:
+            configMapKeyRef:
+              name: mh-service-config
+              key: AC_ENDPOINT
+        # TLS certificate paths for WebTransport (QUIC/HTTP3)
+        - name: MH_TLS_CERT_PATH
+          valueFrom:
+            configMapKeyRef:
+              name: mh-service-config
+              key: MH_TLS_CERT_PATH
+        - name: MH_TLS_KEY_PATH
+          valueFrom:
+            configMapKeyRef:
+              name: mh-service-config
+              key: MH_TLS_KEY_PATH
+        # OAuth 2.0 client credentials for AC authentication (ADR-0010)
+        - name: MH_CLIENT_ID
+          value: "media-handler"
+        - name: MH_CLIENT_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: mh-service-secrets
+              key: MH_CLIENT_SECRET
+        - name: RUST_LOG
+          value: "info,mh_service=debug"
+        resources:
+          requests:
+            cpu: 200m
+            memory: 512Mi
+          limits:
+            cpu: 1000m
+            memory: 1Gi
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 65532
+          readOnlyRootFilesystem: true
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8083
+            scheme: HTTP
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 5
+          successThreshold: 1
+          failureThreshold: 3  # Restart after 30s of failures
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8083
+            scheme: HTTP
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 3
+          successThreshold: 1
+          failureThreshold: 3  # Remove from LB after 15s of failures
+        volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+        - name: mh-tls
+          mountPath: /etc/mh-tls
+          readOnly: true
+      volumes:
+      - name: tmp
+        emptyDir: {}
+      - name: mh-tls
+        secret:
+          secretName: mh-service-tls
+          defaultMode: 0400

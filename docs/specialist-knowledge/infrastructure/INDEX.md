@@ -8,21 +8,23 @@
 - Dashboard metric presentation (counters vs rates, $__rate_interval) -> ADR-0029
 
 ## Code Locations
-- Service Dockerfiles -> `infra/docker/{ac,gc,mc}-service/Dockerfile`
+- Service Dockerfiles -> `infra/docker/{ac,gc,mc,mh}-service/Dockerfile`
 - PostgreSQL init -> `infra/docker/postgres/init.sql`
 - Prometheus config (Docker) -> `infra/docker/prometheus/prometheus.yml`
 - Prometheus alert rules (GC) -> `infra/docker/prometheus/rules/gc-alerts.yaml`
 - Prometheus alert rules (MC) -> `infra/docker/prometheus/rules/mc-alerts.yaml`
 - Prometheus config (K8s) -> `infra/kubernetes/observability/prometheus-config.yaml`
-- K8s service manifests (Kustomize bases) -> `infra/services/{ac,gc,mc}-service/kustomization.yaml`
+- K8s service manifests (Kustomize bases) -> `infra/services/{ac,gc,mc,mh}-service/kustomization.yaml`
 - MC TLS Secret -> created imperatively by `infra/kind/scripts/setup.sh:create_mc_tls_secret()`
+- MH TLS Secret -> created imperatively by `infra/kind/scripts/setup.sh:create_mh_tls_secret()`
+- MH secrets -> created imperatively by `infra/kind/scripts/setup.sh:create_mh_secrets()`
 - Redis manifests (Kustomize base) -> `infra/services/redis/kustomization.yaml`
 - PostgreSQL manifests (Kustomize base) -> `infra/services/postgres/kustomization.yaml`
 - K8s observability (Kustomize) -> `infra/kubernetes/observability/kustomization.yaml`
 - Grafana manifests (RBAC, deployment, dashboards) -> `infra/kubernetes/observability/grafana/kustomization.yaml`
 - Kind overlay (top-level) -> `infra/kubernetes/overlays/kind/kustomization.yaml`
 - Kind overlay (services aggregator) -> `infra/kubernetes/overlays/kind/services/kustomization.yaml`
-- Kind overlay (per-service) -> `infra/kubernetes/overlays/kind/services/{ac,gc,mc}-service/kustomization.yaml`
+- Kind overlay (per-service) -> `infra/kubernetes/overlays/kind/services/{ac,gc,mc,mh}-service/kustomization.yaml`
 - Kind overlay (postgres) -> `infra/kubernetes/overlays/kind/services/postgres/kustomization.yaml`
 - Kind overlay (redis) -> `infra/kubernetes/overlays/kind/services/redis/kustomization.yaml`
 - Kind overlay (observability) -> `infra/kubernetes/overlays/kind/observability/kustomization.yaml`
@@ -35,7 +37,7 @@
 - Skaffold dev workflow -> `infra/skaffold.yaml`
 - Containerized devloop -> `infra/devloop/devloop.sh`
 - Docker Compose (local tests) -> `docker-compose.test.yml`
-- Dev TLS cert generation (CA + service certs) -> `scripts/generate-dev-certs.sh`
+- Dev TLS cert generation (CA + MC + MH certs) -> `scripts/generate-dev-certs.sh`
 - CI pipeline -> `.github/workflows/ci.yml`
 - Fuzz nightly -> `.github/workflows/fuzz-nightly.yml`
 
@@ -43,10 +45,11 @@
 - MC health endpoints (liveness + readiness) -> `crates/mc-service/src/observability/health.rs:health_router()`
 - MC probe config (K8s deployment) -> `infra/services/mc-service/deployment.yaml` (livenessProbe / readinessProbe)
 - GC probe config (K8s deployment) -> `infra/services/gc-service/deployment.yaml` (livenessProbe / readinessProbe)
+- MH probe config (K8s deployment) -> `infra/services/mh-service/deployment.yaml` (livenessProbe / readinessProbe on :8083)
 
 ## Integration Seams
 - CanaryPod (NetworkPolicy testing) -> `crates/env-tests/src/canary.rs`
 - Cluster health env-tests -> `crates/env-tests/tests/00_cluster_health.rs`
 - Observability env-tests -> `crates/env-tests/tests/30_observability.rs`
 - Resilience / NetworkPolicy env-tests -> `crates/env-tests/tests/40_resilience.rs`
-- NetworkPolicy definitions -> `infra/services/{ac,gc,mc}-service/network-policy.yaml`, `infra/services/{redis,postgres}/network-policy.yaml`
+- NetworkPolicy definitions -> `infra/services/{ac,gc,mc,mh}-service/network-policy.yaml`, `infra/services/{redis,postgres}/network-policy.yaml`

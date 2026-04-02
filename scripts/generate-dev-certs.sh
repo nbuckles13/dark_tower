@@ -5,6 +5,7 @@
 # Creates a self-signed CA and signs service certificates for:
 #   - Auth Controller (auth-localhost) — HTTPS for JWKS endpoints
 #   - Meeting Controller (mc-webtransport) — QUIC/WebTransport on port 4433
+#   - Media Handler (mh-webtransport) — QUIC/WebTransport on port 4434
 #
 # This script is idempotent: re-running regenerates all service certs.
 # If the CA already exists, it is preserved unless --force-ca is passed.
@@ -132,6 +133,15 @@ generate_service_cert "mc-webtransport" "mc-service.dark-tower.svc.cluster.local
   "mc-service.dark-tower.svc.cluster.local"
 
 # ---------------------------------------------------------------------------
+# 4. Media Handler WebTransport certificate
+# ---------------------------------------------------------------------------
+generate_service_cert "mh-webtransport" "mh-service.dark-tower.svc.cluster.local" \
+  "localhost" \
+  "mh-service" \
+  "mh-service.dark-tower" \
+  "mh-service.dark-tower.svc.cluster.local"
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo ""
@@ -148,6 +158,10 @@ echo ""
 echo "Meeting Controller (WebTransport):"
 echo "  export MC_TLS_CERT_PATH=${CERT_DIR}/mc-webtransport.crt"
 echo "  export MC_TLS_KEY_PATH=${CERT_DIR}/mc-webtransport.key"
+echo ""
+echo "Media Handler (WebTransport):"
+echo "  export MH_TLS_CERT_PATH=${CERT_DIR}/mh-webtransport.crt"
+echo "  export MH_TLS_KEY_PATH=${CERT_DIR}/mh-webtransport.key"
 echo ""
 echo "Services should pin the CA cert for MITM protection:"
 echo "  ${CA_CERT}"

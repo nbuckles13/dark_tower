@@ -186,7 +186,7 @@ for prefix in "${!SVC_INFRA_DIR[@]}"; do
     fi
 
     # Extract keys defined in the configmap data section
-    configmap_keys=$(awk '/^data:/{found=1; next} /^[a-zA-Z]/{found=0} found && /^\s+[A-Z_]+:/{print $1}' "$configmap" | \
+    configmap_keys=$(awk '/^data:/{found=1; next} /^[a-zA-Z]/{found=0} found && /^[[:space:]]+[A-Z_]+:/{print $1}' "$configmap" | \
         sed 's/://' | sort -u || true)
 
     while IFS= read -r key; do
@@ -224,7 +224,7 @@ for prefix in "${!SVC_INFRA_DIR[@]}"; do
     fi
 
     # Extract keys defined in the configmap data section
-    configmap_keys=$(awk '/^data:/{found=1; next} /^[a-zA-Z]/{found=0} found && /^\s+[A-Z_]+:/{print $1}' "$configmap" | \
+    configmap_keys=$(awk '/^data:/{found=1; next} /^[a-zA-Z]/{found=0} found && /^[[:space:]]+[A-Z_]+:/{print $1}' "$configmap" | \
         sed 's/://' | sort -u || true)
 
     if [[ -z "$configmap_keys" ]]; then
