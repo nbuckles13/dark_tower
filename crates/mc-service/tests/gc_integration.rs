@@ -260,6 +260,8 @@ fn test_config(gc_url: &str) -> Config {
         ac_jwks_url: "https://ac.example.com/.well-known/jwks.json".to_string(),
         tls_cert_path: "/dev/null".to_string(),
         tls_key_path: "/dev/null".to_string(),
+        grpc_advertise_address: "http://localhost:50052".to_string(),
+        webtransport_advertise_address: "https://localhost:4433".to_string(),
     }
 }
 
@@ -369,6 +371,11 @@ async fn test_gc_client_registration_content() {
     assert_eq!(request.region, config.region);
     assert_eq!(request.max_meetings, config.max_meetings);
     assert_eq!(request.max_participants, config.max_participants);
+    assert_eq!(request.grpc_endpoint, config.grpc_advertise_address);
+    assert_eq!(
+        request.webtransport_endpoint,
+        config.webtransport_advertise_address
+    );
 
     cancel_token.cancel();
 }

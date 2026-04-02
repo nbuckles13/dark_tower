@@ -7,7 +7,7 @@
 
 ## Code Locations
 - Service entry point → `crates/mc-service/src/main.rs`
-- Config (SecretString, env loading, ac_jwks_url, TLS paths) → `crates/mc-service/src/config.rs`
+- Config (SecretString, env loading, ac_jwks_url, TLS paths, advertise addresses) → `crates/mc-service/src/config.rs`
 - Error types (McError hierarchy, From<JwtError>) → `crates/mc-service/src/errors.rs`
 - Auth: McJwtValidator (thin wrapper, target: `mc.auth`) → `crates/mc-service/src/auth/mod.rs`
 - Auth: validate_meeting_token (token_type guard) → `crates/mc-service/src/auth/mod.rs:validate_meeting_token()`
@@ -21,7 +21,7 @@
 - WebTransport: handler (encode_participant_update) → `crates/mc-service/src/webtransport/handler.rs`
 - Actor: session binding (HMAC, HKDF) → `crates/mc-service/src/actors/session.rs`
 - Actor: metrics (dual system) → `crates/mc-service/src/actors/metrics.rs`
-- gRPC: GC client (registration, heartbeats) → `crates/mc-service/src/grpc/gc_client.rs`
+- gRPC: GC client (registration, heartbeats, advertise address usage) → `crates/mc-service/src/grpc/gc_client.rs`
 - gRPC: MC service (AssignMeetingWithMh) → `crates/mc-service/src/grpc/mc_service.rs`
 - gRPC: auth interceptor (Bearer validation) → `crates/mc-service/src/grpc/auth_interceptor.rs`
 - Redis: fenced client (Lua scripts) → `crates/mc-service/src/redis/client.rs`
@@ -50,7 +50,15 @@
 - Test utilities (mock GC/Redis/MH) → `crates/mc-test-utils/src/`
 - Env-tests MC-GC integration → `crates/env-tests/tests/22_mc_gc_integration.rs`
 
+## Advertise Address Config
+- `MC_GRPC_ADVERTISE_ADDRESS` / `MC_WEBTRANSPORT_ADVERTISE_ADDRESS` — required env vars for GC registration endpoints
+- Config fields: `grpc_advertise_address`, `webtransport_advertise_address` → `crates/mc-service/src/config.rs`
+- Used in `register()` and `attempt_reregistration()` → `crates/mc-service/src/grpc/gc_client.rs`
+- Values must include scheme (`http://` or `https://`) — GC validates via `validate_endpoint()`
+- K8s: derived from downward API `status.podIP` via `$(POD_IP)` substitution → `infra/services/mc-service/deployment.yaml`
+- Replaces the old `replace("0.0.0.0", "localhost")` hack in gc_client.rs
+
 ## Infrastructure
-- K8s deployment → `infra/services/mc-service/deployment.yaml`
+- K8s deployment (incl. POD_IP downward API, advertise addresses) → `infra/services/mc-service/deployment.yaml`
 - Network policy → `infra/services/mc-service/network-policy.yaml`
 - Grafana dashboard → `infra/grafana/dashboards/mc-overview.json`

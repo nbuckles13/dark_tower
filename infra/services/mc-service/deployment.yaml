@@ -105,6 +105,17 @@ spec:
             configMapKeyRef:
               name: mc-service-config
               key: MC_TLS_KEY_PATH
+        # Pod IP for advertise addresses (downward API)
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              apiVersion: v1
+              fieldPath: status.podIP
+        # Advertise addresses for GC registration (pod-specific, not from configmap)
+        - name: MC_GRPC_ADVERTISE_ADDRESS
+          value: "http://$(POD_IP):50052"
+        - name: MC_WEBTRANSPORT_ADVERTISE_ADDRESS
+          value: "https://$(POD_IP):4433"
         - name: RUST_LOG
           value: "info,mc_service=debug"
         resources:

@@ -28,6 +28,7 @@
 - setup.sh deploy order: AC → GC → MC → MH (MH after GC — required for GC registration)
 - setup.sh MH: `create_mh_secrets()`, `create_mh_tls_secret()`, `deploy_mh_service()`
 - Cross-service netpol: GC allows MH on 50051, MC allows MH on 50053 → `gc-service/network-policy.yaml`, `mc-service/network-policy.yaml`
+- Downward API pattern: `status.podIP` → `POD_IP` env → `$(POD_IP)` interpolation in advertise addresses (MC/MH deployment.yaml); NOT in configmaps (per-pod values)
 
 ## Runbooks
 - Per-service incident/deployment → `docs/runbooks/` (ac, gc, mc)

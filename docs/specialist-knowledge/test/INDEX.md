@@ -41,7 +41,7 @@
 - Meeting/guest token validation (wiremock + Ed25519) -> `crates/mc-service/src/auth/mod.rs:tests::test_validate_*_token_*`
 - Token confusion (bidirectional: meeting-as-guest, guest-as-meeting, wrong token_type) -> `crates/mc-service/src/auth/mod.rs:tests`
 - From<JwtError> for McError (7 variants, ServiceUnavailable->Internal) -> `crates/mc-service/src/errors.rs:tests::test_jwt_error_to_mc_error_*`
-- Config tests (ac_jwks_url scheme, TLS paths) -> `crates/mc-service/src/config.rs:tests`
+- Config tests (env vars, TLS paths, JWKS scheme, advertise addresses) -> `crates/mc-service/src/config.rs:tests`
 - Controller actor tests -> `crates/mc-service/src/actors/controller.rs:tests`
 - Meeting actor tests (join, leave, reconnect, mute, grace period) -> `crates/mc-service/src/actors/meeting.rs:tests`
 - ParticipantActor tests (spawn, send, ping, close, stream wiring) -> `crates/mc-service/src/actors/participant.rs:tests`
@@ -57,7 +57,7 @@
 - Mock GC server (gRPC seam) -> `crates/mc-test-utils/src/mock_gc.rs`
 
 ## Code Locations: MH Service
-- Config tests (env vars, defaults, TLS validation, debug redaction) -> `crates/mh-service/src/config.rs:tests`
+- Config tests (env vars, defaults, TLS, debug redaction, advertise addresses) -> `crates/mh-service/src/config.rs:tests`
 - Error tests (labels, status codes, client messages) -> `crates/mh-service/src/errors.rs:tests`
 - Auth interceptor tests (Bearer, size limits) -> `crates/mh-service/src/grpc/auth_interceptor.rs:tests`
 - Health state & router tests -> `crates/mh-service/src/observability/health.rs:tests`

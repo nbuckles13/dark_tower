@@ -36,7 +36,7 @@
 - `From<JwtError> for McError` → `crates/mc-service/src/errors.rs`
 - JWT validator + token type enforcement → `crates/mc-service/src/auth/mod.rs:McJwtValidator`
 - gRPC auth interceptor (structural) → `crates/mc-service/src/grpc/auth_interceptor.rs:McAuthInterceptor`
-- Config (ac_jwks_url) → `crates/mc-service/src/config.rs:Config`
+- Config (ac_jwks_url, advertise addresses) → `crates/mc-service/src/config.rs:Config`
 - Startup wiring (JwksClient + McJwtValidator) → `crates/mc-service/src/main.rs:168-189`
 - WebTransport server (accept loop) → `crates/mc-service/src/webtransport/server.rs:WebTransportServer::accept_loop()`
 - Connection handler (join flow) → `crates/mc-service/src/webtransport/connection.rs:handle_connection()`
@@ -47,7 +47,7 @@
 - MC K8s deployment (probes on port 8081) → `infra/services/mc-service/deployment.yaml`
 
 ## Code Locations — MH Service
-- Config (env vars, SecretString, Debug redaction) → `crates/mh-service/src/config.rs:Config`
+- Config (env vars, SecretString, Debug redaction, advertise addresses) → `crates/mh-service/src/config.rs:Config`
 - Error type (thiserror, bounded labels) → `crates/mh-service/src/errors.rs:MhError`
 - GC client (RegisterMH, SendLoadReport, re-registration) → `crates/mh-service/src/grpc/gc_client.rs:GcClient`
 - gRPC stub service (MC→MH: Register, RouteMedia, StreamTelemetry) → `crates/mh-service/src/grpc/mh_service.rs:MhMediaService`

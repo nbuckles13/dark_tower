@@ -67,6 +67,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         grpc_bind_address = %config.grpc_bind_address,
         health_bind_address = %config.health_bind_address,
         webtransport_bind_address = %config.webtransport_bind_address,
+        grpc_advertise_address = %config.grpc_advertise_address,
+        webtransport_advertise_address = %config.webtransport_advertise_address,
         max_streams = config.max_streams,
         "Configuration loaded successfully"
     );

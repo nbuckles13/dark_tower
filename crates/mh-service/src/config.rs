@@ -74,6 +74,16 @@ pub struct Config {
 
     /// Path to TLS private key file (PEM) for WebTransport server.
     pub tls_key_path: String,
+
+    /// Advertised gRPC address for GC registration.
+    /// This is the address GC uses to reach this MH pod (e.g., `grpc://10.244.0.5:50053`).
+    /// Required environment variable: `MH_GRPC_ADVERTISE_ADDRESS`.
+    pub grpc_advertise_address: String,
+
+    /// Advertised WebTransport address for GC registration.
+    /// This is the address GC uses to reach this MH pod (e.g., `https://10.244.0.5:4434`).
+    /// Required environment variable: `MH_WEBTRANSPORT_ADVERTISE_ADDRESS`.
+    pub webtransport_advertise_address: String,
 }
 
 /// Custom Debug implementation that redacts sensitive fields.
@@ -92,6 +102,11 @@ impl fmt::Debug for Config {
             .field("client_secret", &"[REDACTED]")
             .field("tls_cert_path", &self.tls_cert_path)
             .field("tls_key_path", &self.tls_key_path)
+            .field("grpc_advertise_address", &self.grpc_advertise_address)
+            .field(
+                "webtransport_advertise_address",
+                &self.webtransport_advertise_address,
+            )
             .finish()
     }
 }
@@ -161,6 +176,18 @@ impl Config {
             )));
         }
 
+        let grpc_advertise_address = vars
+            .get("MH_GRPC_ADVERTISE_ADDRESS")
+            .ok_or_else(|| ConfigError::MissingEnvVar("MH_GRPC_ADVERTISE_ADDRESS".to_string()))?
+            .clone();
+
+        let webtransport_advertise_address = vars
+            .get("MH_WEBTRANSPORT_ADVERTISE_ADDRESS")
+            .ok_or_else(|| {
+                ConfigError::MissingEnvVar("MH_WEBTRANSPORT_ADVERTISE_ADDRESS".to_string())
+            })?
+            .clone();
+
         let grpc_bind_address = vars
             .get("MH_GRPC_BIND_ADDRESS")
             .cloned()
@@ -212,6 +239,8 @@ impl Config {
             client_secret,
             tls_cert_path,
             tls_key_path,
+            grpc_advertise_address,
+            webtransport_advertise_address,
         })
     }
 }
@@ -235,6 +264,14 @@ mod tests {
             ),
             ("MH_TLS_CERT_PATH".to_string(), "/dev/null".to_string()),
             ("MH_TLS_KEY_PATH".to_string(), "/dev/null".to_string()),
+            (
+                "MH_GRPC_ADVERTISE_ADDRESS".to_string(),
+                "grpc://localhost:50053".to_string(),
+            ),
+            (
+                "MH_WEBTRANSPORT_ADVERTISE_ADDRESS".to_string(),
+                "https://localhost:4434".to_string(),
+            ),
         ])
     }
 
@@ -259,6 +296,11 @@ mod tests {
         assert_eq!(
             config.client_secret.expose_secret(),
             "media-handler-secret-dev-003"
+        );
+        assert_eq!(config.grpc_advertise_address, "grpc://localhost:50053");
+        assert_eq!(
+            config.webtransport_advertise_address,
+            "https://localhost:4434"
         );
     }
 
@@ -410,5 +452,27 @@ mod tests {
 
         assert_eq!(config.tls_cert_path, "/dev/null");
         assert_eq!(config.tls_key_path, "/dev/null");
+    }
+
+    #[test]
+    fn test_from_vars_missing_grpc_advertise_address() {
+        let mut vars = base_vars();
+        vars.remove("MH_GRPC_ADVERTISE_ADDRESS");
+
+        let result = Config::from_vars(&vars);
+        assert!(
+            matches!(result, Err(ConfigError::MissingEnvVar(v)) if v == "MH_GRPC_ADVERTISE_ADDRESS")
+        );
+    }
+
+    #[test]
+    fn test_from_vars_missing_webtransport_advertise_address() {
+        let mut vars = base_vars();
+        vars.remove("MH_WEBTRANSPORT_ADVERTISE_ADDRESS");
+
+        let result = Config::from_vars(&vars);
+        assert!(
+            matches!(result, Err(ConfigError::MissingEnvVar(v)) if v == "MH_WEBTRANSPORT_ADVERTISE_ADDRESS")
+        );
     }
 }

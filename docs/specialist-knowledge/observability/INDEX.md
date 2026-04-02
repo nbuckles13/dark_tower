@@ -38,6 +38,10 @@
 - Protobuf encoding utilities (target: `mc.webtransport.handler`) -> `crates/mc-service/src/webtransport/handler.rs:encode_participant_update()`
 - ParticipantActor tracing (target: `mc.actor.participant`) -> `crates/mc-service/src/actors/participant.rs:run()`
 
+## GC Client Tracing (MC + MH)
+- GcClient tracing (registration, heartbeat, re-registration) -> `crates/mc-service/src/grpc/gc_client.rs` (+ mh)
+- Rule: GcClient::new() must NOT log raw endpoint URLs (IP/DNS leakage); advertise addresses logged at startup only
+
 ## Health
 - MC health state (liveness/readiness) -> `crates/mc-service/src/observability/health.rs:health_router()`
 - MH health state (ready after GC registration) -> `crates/mh-service/src/observability/health.rs:health_router()`
@@ -52,9 +56,8 @@
 - AC overview dashboard (Traffic Summary + Security Events stat rows) -> `infra/grafana/dashboards/ac-overview.json`
 - MH overview dashboard (registration, heartbeat, token refresh panels, ADR-0029 compliant) -> `infra/grafana/dashboards/mh-overview.json`
 - Cross-service error dashboard -> `infra/grafana/dashboards/errors-overview.json`
-- Grafana provisioning -> `infra/grafana/provisioning/datasources/datasources.yaml`
-- K8s observability kustomization (base + Kind overlay) -> `infra/kubernetes/observability/kustomization.yaml`, `infra/kubernetes/overlays/kind/`
-- Prometheus config -> `infra/docker/prometheus/prometheus.yml` (compose), `infra/kubernetes/observability/prometheus-config.yaml` (K8s, includes mh-service scrape job)
+- Grafana provisioning + K8s kustomization -> `infra/grafana/provisioning/`, `infra/kubernetes/observability/`
+- Prometheus config -> `infra/docker/prometheus/prometheus.yml` (compose), `infra/kubernetes/observability/prometheus-config.yaml` (K8s)
 - Alert + dashboard docs -> `docs/observability/alerts.md`, `docs/observability/dashboards.md`
 
 ## Guards
@@ -64,11 +67,9 @@
 
 ## Runbooks
 - Per-service deployment + incident response -> `docs/runbooks/` (two per service)
-- GC scenarios 8-9 (creation limits, code collision) -> `docs/runbooks/gc-incident-response.md`
-- Join failure triage (GC + MC error types) -> `docs/observability/alerts.md`
+- GC scenarios 8-9 + join failure triage -> `docs/runbooks/gc-incident-response.md`, `docs/observability/alerts.md`
 
 ## Test Coverage & Integration Seams
 - GC/MC/MH metrics tests -> `crates/gc-service/src/observability/metrics.rs` (+ mc, mh)
 - Env-tests observability validation -> `crates/env-tests/tests/30_observability.rs`
-- MC K8s health probes + TLS -> `infra/services/mc-service/deployment.yaml`
-- MH K8s health probes (port 8083), metrics scrape via NetworkPolicy -> `infra/services/mh-service/deployment.yaml`
+- MC/MH K8s health probes + metrics scrape -> `infra/services/{mc,mh}-service/deployment.yaml`

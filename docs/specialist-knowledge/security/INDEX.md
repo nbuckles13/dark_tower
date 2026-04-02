@@ -41,31 +41,31 @@
 ## Code Locations — MH (Auth, OAuth, TLS)
 - gRPC auth interceptor (MC→MH) → `crates/mh-service/src/grpc/auth_interceptor.rs:MhAuthInterceptor`
 - OAuth config (SecretString, Debug redaction) → `crates/mh-service/src/config.rs:Config`
-- TLS cert/key validation (fail-fast) + Bearer auth (MH→GC) → `config.rs:152`, `gc_client.rs:add_auth()`
-- TokenManager startup (30s timeout) → `crates/mh-service/src/main.rs:97-129`
+- TLS cert/key validation (fail-fast) + Bearer auth (MH→GC) → `config.rs`, `gc_client.rs:add_auth()`
+- TokenManager startup (30s timeout) → `crates/mh-service/src/main.rs`
 - Error sanitization → `crates/mh-service/src/errors.rs:MhError::client_message()`
 
 ## Code Locations — Observability (Security-Relevant)
-- MC metrics (bounded labels, no PII) → `crates/mc-service/src/observability/metrics.rs`
-- MH metrics (bounded labels, no PII) → `crates/mh-service/src/observability/metrics.rs`
-- Alert rules + dashboards → `infra/docker/prometheus/rules/`, `infra/grafana/dashboards/` | ADR-0029
+- MC/MH metrics (bounded labels, no PII) → `crates/mc-service/src/observability/metrics.rs` (+ mh) | ADR-0029
 
 ## TLS & Certificates
 - Dev cert generation (ECDSA P-256 CA, MC + MH certs) → `scripts/generate-dev-certs.sh`
 - MC/MH TLS volume mounts (defaultMode 0400) → `infra/services/{mc,mh}-service/deployment.yaml`
 - WebTransport UDP ingress + Kind mapping → `infra/services/{mc,mh}-service/network-policy.yaml`, `infra/kind/kind-config.yaml`
 
+## Advertise Addresses (MC + MH → GC Registration)
+- Config-based advertise addresses (non-secret) → `{mc,mh}-service/src/config.rs` + K8s downward API `status.podIP` in deployment.yaml
+- Used in `gc_client.rs:register()` + `attempt_reregistration()` — replaces old hardcoded `format!()`/`.replace()` pattern
+
 ## Infrastructure Secrets & Network Isolation
 - Imperative secret creation → `setup.sh:create_ac_secrets()`, `create_mc_tls_secret()`, `create_mh_secrets()`, `create_mh_tls_secret()`
-- MH secrets + network policy (MC ingress, GC+AC egress, no DB/Redis) → `infra/services/mh-service/{secret,network-policy}.yaml`
-- AC network policy (allows GC, MC, MH ingress for tokens) → `infra/services/ac-service/network-policy.yaml`
+- Network policies (per-service ingress/egress) → `infra/services/{ac,gc,mc,mh}-service/network-policy.yaml`
 - Kind overlay (no secrets) + supporting infra → `infra/kubernetes/overlays/kind/`, `infra/services/{postgres,redis}/`
 
 ## Health, Probes & Integration Seams
 - MC/MH health + K8s probes → `crates/mc-service/src/observability/health.rs` (+ mh), `infra/services/mc-service/deployment.yaml` (+ mh)
 - AC JWKS → common `JwksClient` → GC/MC `JwtValidator` (meeting/guest tokens via WebTransport)
 - gRPC service token chain: GC→MC (`mc/.../auth_interceptor.rs`) → MC→MH (`mh/.../auth_interceptor.rs`)
-- MH→GC OAuth registration → `crates/mh-service/src/grpc/gc_client.rs`
 - Credential leak guards → `scripts/guards/simple/no-secrets-in-logs.sh`
 - Kustomize security guards (R-18, R-19) → `scripts/guards/simple/validate-kustomize.sh`
 

@@ -23,16 +23,20 @@
 
 ## Per-Service Config Parsing
 - AC/GC/MC/MH config -> `crates/*/src/config.rs:Config::from_vars()` (per-service, not duplication)
+- Advertise addresses (MC + MH) -> `grpc_advertise_address` + `webtransport_advertise_address` (consistent pattern)
+- Extraction candidate: `generate_instance_id(prefix)` -> 4-line pattern duplicated in MC + MH config
 
 ## gRPC Auth Interceptors (Cross-Service)
 - MC auth interceptor -> `crates/mc-service/src/grpc/auth_interceptor.rs:McAuthInterceptor`
 - MH auth interceptor -> `crates/mh-service/src/grpc/auth_interceptor.rs:MhAuthInterceptor` (duplicates MC)
 - Shared constant -> `common::jwt::MAX_JWT_SIZE_BYTES`
 
-## MH GC Client (MH->GC Registration + Load Reports)
-- GC client -> `crates/mh-service/src/grpc/gc_client.rs:GcClient`
+## GC Clients (MC + MH -> GC Registration)
+- MC GcClient -> `crates/mc-service/src/grpc/gc_client.rs:GcClient` (bounded retries, fast/comprehensive heartbeats)
+- MH GcClient -> `crates/mh-service/src/grpc/gc_client.rs:GcClient` (unbounded retries, load reports)
+- Shared patterns: channel creation, `add_auth`, backoff constants (acceptable duplication, <2 call sites)
+- Extraction candidate: `add_auth` (~10 lines identical) -> extract to `common` if third service needs it
 - MH gRPC stub service -> `crates/mh-service/src/grpc/mh_service.rs:MhMediaService`
-- MH error types -> `crates/mh-service/src/errors.rs:MhError`
 
 ## Health Endpoints (Cross-Service Consistency)
 - MC health routes -> `crates/mc-service/src/observability/health.rs:health_router()`
@@ -51,7 +55,7 @@
 
 ## False Positive Boundaries
 - Per-service error mapping (GcError vs McError vs MhError) -> required, not duplication
-- MC GcClient vs MH GcClient -> different RPCs (GlobalControllerService vs MediaHandlerRegistryService)
+- MC GcClient vs MH GcClient -> different RPCs, retry strategies, heartbeat models (reviewed 2026-04-01)
 - AC rate limiting (DB-backed lockout) vs GC rate limiting (middleware RPM) -> different mechanisms
 - Per-service K8s manifests/Dockerfiles -> structurally similar but service-specific (ports, env, deps)
 
