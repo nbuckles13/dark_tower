@@ -31,28 +31,29 @@
 - MC incident/deployment → `docs/runbooks/mc-incident-response.md`, `mc-deployment.md`
 
 ## Code Locations — Database & Migrations
-- Participant tracking migration → `migrations/20260322000001_add_participant_tracking.sql`
-- ParticipantsRepository → `crates/gc-service/src/repositories/participants.rs`
-- Meeting activation (scheduled→active) → `crates/gc-service/src/repositories/meetings.rs:activate_meeting()`
-- Audit event logging + updated_at trigger → `crates/gc-service/src/repositories/meetings.rs:log_audit_event()`
+- Participant tracking → `migrations/20260322000001_add_participant_tracking.sql`, `crates/gc-service/src/repositories/participants.rs`
+- Meeting activation + audit → `crates/gc-service/src/repositories/meetings.rs`
 
 ## Code Locations — Auth & JWT
-- Common: JWKS client, JWT validator, claims types, JwtError → `crates/common/src/jwt.rs`
-- GC thin wrapper (JwtError→GcError) → `crates/gc-service/src/auth/jwt.rs`, `crates/gc-service/src/errors.rs`
-- MC thin wrapper (JwtError→McError) → `crates/mc-service/src/auth/mod.rs`, `crates/mc-service/src/errors.rs`
-- MC JWKS config (`AC_JWKS_URL`, required) → `crates/mc-service/src/config.rs:ac_jwks_url`
-- MC TLS config (`MC_TLS_CERT_PATH`, `MC_TLS_KEY_PATH`, required + file-exists) → `crates/mc-service/src/config.rs:tls_cert_path`
-- AC rate limit config + threading → `crates/ac-service/src/config.rs:parse_rate_limit_i64()`, `auth_handler.rs`, `token_service.rs`, `user_service.rs`
-- Service auth design → ADR-0003
+- Common JWKS + JWT → `crates/common/src/jwt.rs`; GC wrapper → `gc-service/src/auth/jwt.rs`; MC wrapper → `mc-service/src/auth/mod.rs`
+- MC JWKS + TLS config → `crates/mc-service/src/config.rs` (`AC_JWKS_URL`, `MC_TLS_CERT_PATH`, `MC_TLS_KEY_PATH`)
+- AC rate limits → `crates/ac-service/src/config.rs:parse_rate_limit_i64()`; Service auth → ADR-0003
 
 ## Code Locations — Observability
-- Observability Kustomize base → `infra/kubernetes/observability/kustomization.yaml`
-- Grafana manifests + dashboard configMapGenerator → `infra/kubernetes/observability/grafana/`
-- Grafana dashboard JSON files → `infra/grafana/dashboards/`
-- GC metrics + catalog + dashboard → `crates/gc-service/src/observability/metrics.rs`, `infra/grafana/dashboards/gc-overview.json`
-- MC metrics + catalog + join metrics (WT, JWT, session) → `crates/mc-service/src/observability/metrics.rs`, `docs/observability/metrics/mc-service.md`
+- Observability Kustomize + Grafana → `infra/kubernetes/observability/`, `infra/grafana/dashboards/`
+- GC metrics → `crates/gc-service/src/observability/metrics.rs`; MC metrics → `crates/mc-service/src/observability/metrics.rs`
 - MC dashboard + alerts → `infra/grafana/dashboards/mc-overview.json`, `docs/observability/alerts.md`
 - Prometheus scrape config → `infra/docker/prometheus/prometheus.yml`
+
+## Code Locations — MH Service (Stub)
+- MH startup (bind-before-spawn, shutdown, GC registration) → `crates/mh-service/src/main.rs`
+- MH config (`MH_` prefix, SecretString, TLS fail-fast) → `crates/mh-service/src/config.rs`
+- MH health (`/health`, `/ready`, `/metrics` on port 8083) → `crates/mh-service/src/observability/health.rs`
+- MH GC client (RegisterMH, SendLoadReport, NOT_FOUND re-reg) → `crates/mh-service/src/grpc/gc_client.rs`
+- MH gRPC stubs → `crates/mh-service/src/grpc/mh_service.rs`
+- MH auth interceptor → `crates/mh-service/src/grpc/auth_interceptor.rs`
+- MH metrics + errors → `crates/mh-service/src/observability/metrics.rs`, `errors.rs`
+- Port map: AC=8082, GC=8080/50051, MC=8081/50052/4433, MH=8083/50053/4434
 
 ## Code Locations — MC WebTransport + Actors
 - WT server (bind, accept_loop, max_connections) → `crates/mc-service/src/webtransport/server.rs`
@@ -72,4 +73,3 @@
 
 ## Code Locations — Env-Tests (Kind Cluster)
 - Cluster infra + join flow E2E → `crates/env-tests/src/cluster.rs`, `tests/24_join_flow.rs`
-- Rate limit (relaxed Kind config) → `infra/services/ac-service/configmap.yaml`

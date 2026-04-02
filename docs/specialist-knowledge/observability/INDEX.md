@@ -7,13 +7,11 @@
 - Dashboard metric presentation (counters vs rates, increase/rate classification) -> ADR-0029
 
 ## Metrics
-- Metric catalogs -> `docs/observability/metrics/ac-service.md`, `gc-service.md`, `mc-service.md`
+- Metric catalogs -> `docs/observability/metrics/ac-service.md`, `gc-service.md`, `mc-service.md`, `mh-service.md`
 - AC metrics recording -> `crates/ac-service/src/observability/metrics.rs:init_metrics_recorder()`
 - AC gauge initialization at startup -> `crates/ac-service/src/services/key_management_service.rs:init_key_metrics()`
 - AC rate limit config startup logging -> `crates/ac-service/src/main.rs` (lines 60-75)
-- AC rate limit config defaults & bounds -> `crates/ac-service/src/config.rs` (DEFAULT_RATE_LIMIT_*, DEFAULT_REGISTRATION_RATE_LIMIT_*)
-- AC rate limit non-default warnings -> `crates/ac-service/src/config.rs:from_vars()` (warn! block)
-- AC rate limit config parsing -> `crates/ac-service/src/config.rs:parse_rate_limit_i64()`
+- AC rate limit config (defaults, bounds, parsing, non-default warnings) -> `crates/ac-service/src/config.rs`
 - AC HTTP metrics middleware -> `crates/ac-service/src/middleware/http_metrics.rs`
 - GC metrics recording -> `crates/gc-service/src/observability/metrics.rs:init_metrics_recorder()`
 - GC meeting metrics (creation, join) -> `crates/gc-service/src/observability/metrics.rs`
@@ -26,6 +24,7 @@
 - MC join metrics recording site (connection handler) -> `crates/mc-service/src/webtransport/connection.rs:handle_connection()`
 - MC connection metrics recording site (accept loop) -> `crates/mc-service/src/webtransport/server.rs:accept_loop()`
 - MC error type labels (bounded cardinality) -> `crates/mc-service/src/errors.rs:error_type_label()`
+- MH metrics (registration, heartbeat, token refresh, gRPC, errors) -> `crates/mh-service/src/observability/metrics.rs`
 
 ## Auth & JWT Tracing
 - Common JWT (JwksClient, JwtValidator, verify_token) -> `crates/common/src/jwt.rs`
@@ -41,6 +40,7 @@
 
 ## Health
 - MC health state (liveness/readiness) -> `crates/mc-service/src/observability/health.rs:health_router()`
+- MH health state (ready after GC registration) -> `crates/mh-service/src/observability/health.rs:health_router()`
 
 ## Dashboards & Alerts
 - Grafana dashboards -> `infra/grafana/dashboards/` (overview, SLOs, logs per service)
@@ -50,6 +50,7 @@
 - MC overview dashboard (join flow panels, Traffic Summary + Security Events stat rows) -> `infra/grafana/dashboards/mc-overview.json`
 - MC join alert rules (MCHighJoinFailureRate, MCHighWebTransportRejections, MCHighJwtValidationFailures, MCHighJoinLatency) -> `infra/docker/prometheus/rules/mc-alerts.yaml`
 - AC overview dashboard (Traffic Summary + Security Events stat rows) -> `infra/grafana/dashboards/ac-overview.json`
+- MH overview dashboard (registration, heartbeat, token refresh panels, ADR-0029 compliant) -> `infra/grafana/dashboards/mh-overview.json`
 - Cross-service error dashboard -> `infra/grafana/dashboards/errors-overview.json`
 - Grafana provisioning -> `infra/grafana/provisioning/datasources/datasources.yaml`
 - K8s observability base kustomization (includes grafana/) -> `infra/kubernetes/observability/kustomization.yaml`
@@ -69,7 +70,6 @@
 - Join failure triage (GC + MC error types) -> `docs/observability/alerts.md`
 
 ## Test Coverage & Integration Seams
-- GC metrics tests -> `crates/gc-service/src/observability/metrics.rs`
-- MC metrics tests -> `crates/mc-service/src/observability/metrics.rs`
+- GC/MC/MH metrics tests -> `crates/gc-service/src/observability/metrics.rs` (+ mc, mh)
 - Env-tests observability validation -> `crates/env-tests/tests/30_observability.rs`
 - MC K8s health probes + TLS -> `infra/services/mc-service/deployment.yaml`

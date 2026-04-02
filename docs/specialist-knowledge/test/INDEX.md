@@ -8,7 +8,6 @@
 - Validation pipeline (guards, coverage) -> `docs/decisions/adr-0024-agent-teams-workflow.md`
 - Coverage thresholds -> `.codecov.yml`
 - Client architecture (4-tier testing, test-utils, flaky policy) -> ADR-0028
-- Dashboard metric presentation → ADR-0029
 
 ## Code Locations: AC Service
 - Integration tests -> `crates/ac-service/tests/integration/`
@@ -31,9 +30,7 @@
 - Meeting handlers (join, guest token, settings) -> `crates/gc-service/src/handlers/meetings.rs`
 - Join metrics -> `crates/gc-service/src/observability/metrics.rs:record_meeting_join()`
 - GC metrics tests -> `crates/gc-service/src/observability/metrics.rs:tests`
-- GC overview dashboard → `infra/grafana/dashboards/gc-overview.json`
-- GC alert rules (join: GCHighJoinFailureRate, GCHighJoinLatency) -> `infra/docker/prometheus/rules/gc-alerts.yaml`
-- GC metrics catalog -> `docs/observability/metrics/gc-service.md`
+- GC metrics catalog, dashboard, alerts -> `docs/observability/metrics/gc-service.md`, `infra/grafana/dashboards/gc-overview.json`, `infra/docker/prometheus/rules/gc-alerts.yaml`
 - Route definitions (public, user-auth, service-auth) -> `crates/gc-service/src/routes/mod.rs`
 - Activation repo -> `crates/gc-service/src/repositories/meetings.rs:activate_meeting()`
 - Audit event logging -> `crates/gc-service/src/repositories/meetings.rs:log_audit_event()`
@@ -52,24 +49,27 @@
 - WebTransport encoding tests (encode_participant_update) -> `crates/mc-service/src/webtransport/handler.rs:tests`
 - WebTransport connection tests (build_join_response) -> `crates/mc-service/src/webtransport/connection.rs:tests`
 - MC metrics tests (unit + DebuggingRecorder integration) -> `crates/mc-service/src/observability/metrics.rs:tests`
-- MC join flow metrics + catalog -> `crates/mc-service/src/observability/metrics.rs:record_webtransport_connection()`, catalog: `docs/observability/metrics/mc-service.md`
-- MC alert rules → `infra/docker/prometheus/rules/mc-alerts.yaml`
+- MC metrics catalog, alerts -> `docs/observability/metrics/mc-service.md`, `infra/docker/prometheus/rules/mc-alerts.yaml`
 - GC integration tests -> `crates/mc-service/tests/gc_integration.rs`
 - Heartbeat tests -> `crates/mc-service/tests/heartbeat_tasks.rs`
 - Health state & router tests -> `crates/mc-service/src/observability/health.rs:health_router()`
 - Mock Redis -> `crates/mc-test-utils/src/mock_redis.rs`
 - Mock GC server (gRPC seam) -> `crates/mc-test-utils/src/mock_gc.rs`
 
+## Code Locations: MH Service
+- Config tests (env vars, defaults, TLS validation, debug redaction) -> `crates/mh-service/src/config.rs:tests`
+- Error tests (labels, status codes, client messages) -> `crates/mh-service/src/errors.rs:tests`
+- Auth interceptor tests (Bearer, size limits) -> `crates/mh-service/src/grpc/auth_interceptor.rs:tests`
+- Health state & router tests -> `crates/mh-service/src/observability/health.rs:tests`
+- GC integration tests (registration, load reports, NOT_FOUND) -> `crates/mh-service/tests/gc_integration.rs`
+
 ## Code Locations: Environment Tests
-- Cluster bootstrap → `crates/env-tests/src/cluster.rs`
-- Auth + GC client fixtures → `crates/env-tests/src/fixtures/auth_client.rs`, `gc_client.rs`
-- Env-test flows (20-24) → `crates/env-tests/tests/` (auth, cross-service, creation, join)
-- Join flow E2E → `crates/env-tests/tests/24_join_flow.rs`
+- Cluster bootstrap + fixtures → `crates/env-tests/src/cluster.rs`, `crates/env-tests/src/fixtures/`
+- Env-test flows (20-24) + join flow E2E → `crates/env-tests/tests/24_join_flow.rs`
 
 ## Code Locations: Common Crate
 - JWT (claims, JwtError, JwksClient, JwtValidator, round-trip tests) -> `crates/common/src/jwt.rs`
 
 ## Infrastructure & Shared
 - MC K8s health probes → `infra/services/mc-service/deployment.yaml`
-- Dev certs + Kind setup → `scripts/generate-dev-certs.sh`, `infra/kind/scripts/setup.sh`
-- Kustomize guard (R-15–R-20) → `scripts/guards/simple/validate-kustomize.sh`
+- Dev certs, Kind setup, Kustomize guard → `scripts/generate-dev-certs.sh`, `infra/kind/scripts/setup.sh`, `scripts/guards/simple/validate-kustomize.sh`
