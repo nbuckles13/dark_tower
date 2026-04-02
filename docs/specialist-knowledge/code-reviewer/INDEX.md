@@ -13,34 +13,22 @@
 - Agent teams validation pipeline → ADR-0024
 
 ## Code Locations — AC Service
-- Clippy deny list (unwrap, expect, panic, indexing) → `Cargo.toml:34-42`
-- Config constants + defense-in-depth → `crates/ac-service/src/config.rs:from_vars()`
-- Config rate limit parsing helper → `crates/ac-service/src/config.rs:parse_rate_limit_i64()`
-- Rate limit constants (MIN/DEFAULT/MAX) → `crates/ac-service/src/config.rs:32-61`
+- Clippy deny list → `Cargo.toml:34-42`
+- Config (rate limits, defense-in-depth) → `crates/ac-service/src/config.rs:from_vars()`, constants at `:32-61`
 - Crypto (EdDSA, AES-256-GCM, bcrypt) → `crates/ac-service/src/crypto/mod.rs:sign_jwt()`
-- Error type reference → `crates/ac-service/src/errors.rs:AcError`
-- Handler pattern (auth flow) → `crates/ac-service/src/handlers/auth_handler.rs:handle_service_token()`
-- Metrics wiring reference → `crates/ac-service/src/observability/metrics.rs:init_metrics_recorder()`
-- Route composition → `crates/ac-service/src/routes/mod.rs:build_routes()`
-- Repository layer (sqlx queries) → `crates/ac-service/src/repositories/signing_keys.rs`
-- Service layer (business logic) → `crates/ac-service/src/services/key_management_service.rs`
-- Token + user service (rate limit params) → `token_service.rs:issue_service_token()`, `user_service.rs:register_user()`
-- AC K8s rate limit wiring → `infra/services/ac-service/configmap.yaml`, `statefulset.yaml`
+- Error type → `crates/ac-service/src/errors.rs:AcError`
+- Handlers/routes → `handlers/auth_handler.rs:handle_service_token()`, `routes/mod.rs:build_routes()`
+- Metrics → `crates/ac-service/src/observability/metrics.rs:init_metrics_recorder()`
+- Repository + service layers → `repositories/signing_keys.rs`, `services/key_management_service.rs`
+- K8s wiring → `infra/services/ac-service/configmap.yaml`, `statefulset.yaml`
 
 ## Code Locations — GC Service
-- Error type reference → `crates/gc-service/src/errors.rs:GcError`
-- `From<JwtError> for GcError` → `crates/gc-service/src/errors.rs`
-- JWT validator/JWKS client (thin wrappers) → `crates/gc-service/src/auth/jwt.rs`, `jwks.rs`
-- Auth middleware → `crates/gc-service/src/middleware/auth.rs:require_user_auth()`, `extract_bearer_token()`
-- Meeting handlers → `crates/gc-service/src/handlers/meetings.rs:create_meeting()`, `join_meeting()`, `get_guest_token()`, `update_meeting_settings()`
-- Meetings repository (atomic CTE, activation, audit) → `crates/gc-service/src/repositories/meetings.rs`
-- Participants repo/model/tests → `crates/gc-service/src/repositories/participants.rs`, `models/mod.rs`, `tests/participant_tests.rs`
-- Meeting join metrics → `crates/gc-service/src/observability/metrics.rs:record_meeting_join()`
-- AC/MC clients → `crates/gc-service/src/services/ac_client.rs:AcClient`, `mc_client.rs:McClientTrait`
-- Route composition (user auth layer) → `crates/gc-service/src/routes/mod.rs:build_routes()`
-- Meeting integration tests → `crates/gc-service/tests/meeting_tests.rs`
-- Metrics catalog → `docs/observability/metrics/gc-service.md`
-- Dashboard + alerts (join panels, Traffic Summary) → `infra/grafana/dashboards/gc-overview.json`, `infra/docker/prometheus/rules/gc-alerts.yaml`
+- Error type, `From<JwtError>` → `crates/gc-service/src/errors.rs:GcError`
+- Auth (JWT/JWKS, middleware) → `auth/jwt.rs`, `jwks.rs`, `middleware/auth.rs:require_user_auth()`
+- Meeting handlers → `handlers/meetings.rs:create_meeting()`, `join_meeting()`, `get_guest_token()`
+- Repositories → `repositories/meetings.rs` (atomic CTE), `participants.rs`
+- AC/MC clients → `services/ac_client.rs:AcClient`, `mc_client.rs:McClientTrait`
+- Metrics/dashboard/alerts → `observability/metrics.rs`, `docs/observability/metrics/gc-service.md`, `infra/grafana/dashboards/gc-overview.json`
 
 ## Code Locations — MC Service
 - Error type reference → `crates/mc-service/src/errors.rs:McError`
@@ -57,6 +45,18 @@
 - Metrics catalog → `docs/observability/metrics/mc-service.md`
 - Health probes (liveness/readiness) → `crates/mc-service/src/observability/health.rs:health_router()`
 - MC K8s deployment (probes on port 8081) → `infra/services/mc-service/deployment.yaml`
+
+## Code Locations — MH Service
+- Config (env vars, SecretString, Debug redaction) → `crates/mh-service/src/config.rs:Config`
+- Error type (thiserror, bounded labels) → `crates/mh-service/src/errors.rs:MhError`
+- GC client (RegisterMH, SendLoadReport, re-registration) → `crates/mh-service/src/grpc/gc_client.rs:GcClient`
+- gRPC stub service (MC→MH: Register, RouteMedia, StreamTelemetry) → `crates/mh-service/src/grpc/mh_service.rs:MhMediaService`
+- gRPC auth interceptor (structural validation) → `crates/mh-service/src/grpc/auth_interceptor.rs:MhAuthInterceptor`
+- Startup wiring (TokenManager, health, gRPC, GC task) → `crates/mh-service/src/main.rs`
+- Health probes (liveness/readiness, port 8083) → `crates/mh-service/src/observability/health.rs:health_router()`
+- Metrics (mh_ prefix, SLO-aligned buckets) → `crates/mh-service/src/observability/metrics.rs:init_metrics_recorder()`
+- Metrics catalog → `docs/observability/metrics/mh-service.md`
+- Dashboard → `infra/grafana/dashboards/mh-overview.json`
 
 ## Code Locations — Common
 - JWT (errors, claims, validator, JWKS, HasIat) → `crates/common/src/jwt.rs`

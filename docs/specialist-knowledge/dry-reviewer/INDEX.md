@@ -13,13 +13,11 @@
 
 ## MC WebTransport Layer
 - WebTransport server (accept loop) -> `crates/mc-service/src/webtransport/server.rs`
-- Connection handler + bridge loop + framing -> `crates/mc-service/src/webtransport/connection.rs`
-  - Bug fix (task 15): send_error() now calls stream.finish().await to flush before drop (line 543)
-- Shared encode_participant_update() -> `crates/mc-service/src/webtransport/handler.rs`
+- Connection handler + bridge loop -> `crates/mc-service/src/webtransport/connection.rs`
 - ParticipantActor -> `crates/mc-service/src/actors/participant.rs`
 
 ## Per-Service Observability (Metrics & Dashboards)
-- AC/GC/MC metrics -> `crates/*/src/observability/metrics.rs` (per-service, not duplication)
+- AC/GC/MC/MH metrics -> `crates/*/src/observability/metrics.rs` (per-service, not duplication)
 - MC/GC join alert rules -> `infra/docker/prometheus/rules/{mc,gc}-alerts.yaml`
 - Dashboard metric presentation → ADR-0029
 - Grafana dashboards + configMapGenerator → `infra/grafana/dashboards/`, `infra/kubernetes/observability/grafana/`
@@ -42,34 +40,36 @@
 - Active duplication tech debt → `docs/TODO.md` (Cross-Service Duplication section)
 
 ## Successful Extractions (Reference)
-- ServiceClaims/UserClaims to common::jwt -> `crates/common/src/jwt.rs`
-- JWKS + JwtValidator to common::jwt (R-23) -> `crates/common/src/jwt.rs:JwtValidator`
-- GC shared helpers -> bearer token, map_row_to_meeting, audit logging, generic health checker
-- TestKeypair + JWKS mock to mc-test-utils (task 15) -> `crates/mc-test-utils/src/jwt_test.rs`
+- ServiceClaims/UserClaims/JWKS/JwtValidator to common::jwt -> `crates/common/src/jwt.rs`
+- TestKeypair + JWKS mock to mc-test-utils -> `crates/mc-test-utils/src/jwt_test.rs`
 
 ## Health Endpoints (Cross-Service Consistency)
 - MC health routes -> `crates/mc-service/src/observability/health.rs:health_router()`
-- MC health probes (K8s) -> `infra/services/mc-service/deployment.yaml` (livenessProbe, readinessProbe)
+- MH health routes -> `crates/mh-service/src/observability/health.rs:health_router()` (duplicates MC)
 - GC health routes -> `crates/gc-service/src/routes/mod.rs:64-65`
-- GC health probes (K8s) -> `infra/services/gc-service/deployment.yaml` (livenessProbe, readinessProbe)
 
 ## Per-Service Config Parsing
-- AC config (env parse + validation) -> `crates/ac-service/src/config.rs:Config::from_vars()`
-  - Rate limit parse helper -> `crates/ac-service/src/config.rs:parse_rate_limit_i64()`
-  - Rate limit env vars: `AC_RATE_LIMIT_WINDOW_MINUTES`, `AC_RATE_LIMIT_MAX_ATTEMPTS`, `AC_REGISTRATION_RATE_LIMIT_*`
-- GC config (env parse + validation) -> `crates/gc-service/src/config.rs:Config::from_vars()`
-- MC config (env parse + validation) -> `crates/mc-service/src/config.rs:Config::from_vars()`
-- AC K8s configmap (rate limit dev values) -> `infra/services/ac-service/configmap.yaml`
-- AC K8s statefulset (env var wiring) -> `infra/services/ac-service/statefulset.yaml`
+- AC config -> `crates/ac-service/src/config.rs:Config::from_vars()`
+- GC config -> `crates/gc-service/src/config.rs:Config::from_vars()`
+- MC config -> `crates/mc-service/src/config.rs:Config::from_vars()`
+- MH config -> `crates/mh-service/src/config.rs:Config::from_vars()`
+
+## gRPC Auth Interceptors (Cross-Service)
+- MC auth interceptor -> `crates/mc-service/src/grpc/auth_interceptor.rs:McAuthInterceptor`
+- MH auth interceptor -> `crates/mh-service/src/grpc/auth_interceptor.rs:MhAuthInterceptor` (duplicates MC)
+- Shared constant -> `common::jwt::MAX_JWT_SIZE_BYTES`
+
+## MH GC Client (MH->GC Registration + Load Reports)
+- GC client -> `crates/mh-service/src/grpc/gc_client.rs:GcClient`
+- MH gRPC stub service -> `crates/mh-service/src/grpc/mh_service.rs:MhMediaService`
+- MH error types -> `crates/mh-service/src/errors.rs:MhError`
 
 ## False Positive Boundaries
-- Actor vs controller metrics (different consumers) -> `crates/mc-service/src/actors/metrics.rs`
-- Per-service error mapping (From<JwtError> for GcError vs McError) -> required, not duplication
-- AC API ParticipantType (has Guest) vs common::jwt::ParticipantType (no Guest)
-- AC rate limiting (DB-backed lockout) vs GC rate limiting (middleware RPM) -> different mechanisms, not duplication
+- Per-service error mapping (GcError vs McError vs MhError) -> required, not duplication
+- MC GcClient (GlobalControllerService) vs MH GcClient (MediaHandlerRegistryService) -> different RPCs
+- AC rate limiting (DB-backed lockout) vs GC rate limiting (middleware RPM) -> different mechanisms
 
 ## Infrastructure & Integration Seams
-- Service Kustomize bases + Kind overlay → `infra/services/*/kustomization.yaml`, `infra/kubernetes/overlays/kind/`
 - Common crate as extraction target → `crates/common/src/`
 - JWT thin wrapper pattern (GC + MC) → `crates/{gc,mc}-service/src/auth/`
 - Test fixture pattern → `crates/*-test-utils/`

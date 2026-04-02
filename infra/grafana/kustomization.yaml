@@ -43,6 +43,12 @@ configMapGenerator:
       - mc-logs.json=dashboards/mc-logs.json
       - mc-overview.json=dashboards/mc-overview.json
       - mc-slos.json=dashboards/mc-slos.json
+  - name: grafana-dashboards-mh
+    options:
+      labels:
+        grafana_dashboard: "1"
+    files:
+      - mh-overview.json=dashboards/mh-overview.json
   - name: grafana-dashboards-errors
     options:
       labels:

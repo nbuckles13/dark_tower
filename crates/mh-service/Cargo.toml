@@ -12,6 +12,7 @@ workspace = true
 [dependencies]
 # Workspace dependencies
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 quinn = { workspace = true }
 wtransport = { workspace = true }
 serde = { workspace = true }
@@ -22,6 +23,16 @@ anyhow = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
 bytes = { workspace = true }
+
+# gRPC for GC communication and MC→MH service
+tonic = { workspace = true }
+
+# Metrics (ADR-0011 Observability)
+metrics = "0.24"
+metrics-exporter-prometheus = "0.16"
+
+# HTTP server for health endpoints and metrics
+axum = { workspace = true }
 
 # Local dependencies
 common = { path = "../common" }
@@ -34,3 +45,9 @@ path = "src/main.rs"
 
 [dev-dependencies]
 criterion = { workspace = true }
+# HTTP testing for health endpoint integration tests
+tower = { workspace = true }
+# Stream utilities for mock gRPC server
+tokio-stream = "0.1"
+# Metrics test recorder for integration tests
+metrics-util = "0.18"
