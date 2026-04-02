@@ -199,18 +199,8 @@ impl GcClient {
         let request = RegisterMcRequest {
             id: self.config.mc_id.clone(),
             region: self.config.region.clone(),
-            grpc_endpoint: format!(
-                "http://{}",
-                self.config
-                    .grpc_bind_address
-                    .replace("0.0.0.0", "localhost")
-            ),
-            webtransport_endpoint: format!(
-                "https://{}",
-                self.config
-                    .webtransport_bind_address
-                    .replace("0.0.0.0", "localhost")
-            ),
+            grpc_endpoint: self.config.grpc_advertise_address.clone(),
+            webtransport_endpoint: self.config.webtransport_advertise_address.clone(),
             max_meetings: self.config.max_meetings,
             max_participants: self.config.max_participants,
         };
@@ -518,18 +508,8 @@ impl GcClient {
         let request = RegisterMcRequest {
             id: self.config.mc_id.clone(),
             region: self.config.region.clone(),
-            grpc_endpoint: format!(
-                "http://{}",
-                self.config
-                    .grpc_bind_address
-                    .replace("0.0.0.0", "localhost")
-            ),
-            webtransport_endpoint: format!(
-                "https://{}",
-                self.config
-                    .webtransport_bind_address
-                    .replace("0.0.0.0", "localhost")
-            ),
+            grpc_endpoint: self.config.grpc_advertise_address.clone(),
+            webtransport_endpoint: self.config.webtransport_advertise_address.clone(),
             max_meetings: self.config.max_meetings,
             max_participants: self.config.max_participants,
         };
@@ -710,6 +690,8 @@ mod tests {
             ac_jwks_url: "https://ac.example.com/.well-known/jwks.json".to_string(),
             tls_cert_path: "/dev/null".to_string(),
             tls_key_path: "/dev/null".to_string(),
+            grpc_advertise_address: "http://localhost:50052".to_string(),
+            webtransport_advertise_address: "https://localhost:4433".to_string(),
         };
 
         let token_rx = mock_token_receiver();
@@ -752,6 +734,8 @@ mod tests {
             ac_jwks_url: "https://ac.example.com/.well-known/jwks.json".to_string(),
             tls_cert_path: "/dev/null".to_string(),
             tls_key_path: "/dev/null".to_string(),
+            grpc_advertise_address: "http://localhost:50052".to_string(),
+            webtransport_advertise_address: "https://localhost:4433".to_string(),
         };
 
         let token_rx = mock_token_receiver();

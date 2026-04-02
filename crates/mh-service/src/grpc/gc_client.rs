@@ -76,7 +76,6 @@ impl GcClient {
                 error!(
                     target: "mh.grpc.gc_client",
                     error = %e,
-                    endpoint = %gc_endpoint,
                     "Invalid GC endpoint"
                 );
                 MhError::Config(format!("Invalid GC endpoint: {e}"))
@@ -89,7 +88,6 @@ impl GcClient {
                 warn!(
                     target: "mh.grpc.gc_client",
                     error = %e,
-                    endpoint = %gc_endpoint,
                     "Failed to connect to GC"
                 );
                 MhError::Grpc(format!("Failed to connect to GC: {e}"))
@@ -136,18 +134,8 @@ impl GcClient {
         let request = RegisterMhRequest {
             handler_id: self.config.handler_id.clone(),
             region: self.config.region.clone(),
-            webtransport_endpoint: format!(
-                "https://{}",
-                self.config
-                    .webtransport_bind_address
-                    .replace("0.0.0.0", "localhost")
-            ),
-            grpc_endpoint: format!(
-                "grpc://{}",
-                self.config
-                    .grpc_bind_address
-                    .replace("0.0.0.0", "localhost")
-            ),
+            webtransport_endpoint: self.config.webtransport_advertise_address.clone(),
+            grpc_endpoint: self.config.grpc_advertise_address.clone(),
             max_streams: self.config.max_streams,
         };
 
@@ -294,22 +282,13 @@ impl GcClient {
     /// # Errors
     ///
     /// Returns `MhError::Grpc` if registration fails or is rejected.
+    #[instrument(skip_all, fields(handler_id = %self.config.handler_id, region = %self.config.region))]
     pub async fn attempt_reregistration(&self) -> Result<(), MhError> {
         let request = RegisterMhRequest {
             handler_id: self.config.handler_id.clone(),
             region: self.config.region.clone(),
-            webtransport_endpoint: format!(
-                "https://{}",
-                self.config
-                    .webtransport_bind_address
-                    .replace("0.0.0.0", "localhost")
-            ),
-            grpc_endpoint: format!(
-                "grpc://{}",
-                self.config
-                    .grpc_bind_address
-                    .replace("0.0.0.0", "localhost")
-            ),
+            webtransport_endpoint: self.config.webtransport_advertise_address.clone(),
+            grpc_endpoint: self.config.grpc_advertise_address.clone(),
             max_streams: self.config.max_streams,
         };
 

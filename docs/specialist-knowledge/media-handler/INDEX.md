@@ -11,7 +11,7 @@
 ## Code Locations
 - Service entry point → `crates/mh-service/src/main.rs`
 - Library root (module declarations) → `crates/mh-service/src/lib.rs`
-- Config (SecretString, env loading, TLS paths) → `crates/mh-service/src/config.rs`
+- Config (SecretString, env loading, TLS paths, advertise addresses) → `crates/mh-service/src/config.rs`
 - Error types (MhError hierarchy) → `crates/mh-service/src/errors.rs`
 - gRPC: GC client (registration, heartbeats, re-registration) → `crates/mh-service/src/grpc/gc_client.rs`
 - gRPC: MH service stub (Register, RouteMedia, StreamTelemetry) → `crates/mh-service/src/grpc/mh_service.rs`
@@ -49,6 +49,15 @@
 - Health endpoint tests → `crates/mh-service/src/observability/health.rs`
 - Metrics unit tests → `crates/mh-service/src/observability/metrics.rs`
 
+## Advertise Address Config
+- `MH_GRPC_ADVERTISE_ADDRESS` / `MH_WEBTRANSPORT_ADVERTISE_ADDRESS` → required env vars in `config.rs`
+- Used directly in GC registration (register + attempt_reregistration) → `gc_client.rs:139-140, 291-292`
+- Must include scheme prefix (`grpc://`, `https://`) — GC validates in `gc-service/src/grpc/mh_service.rs:96-120`
+- K8s: pod IP via downward API (`status.podIP`) → `infra/services/mh-service/deployment.yaml:103-111`
+- Not in configmap — values are pod-specific, constructed from `$(POD_IP)` expansion
+
 ## Infrastructure
+- K8s deployment (ports, probes, env, downward API) → `infra/services/mh-service/deployment.yaml`
+- K8s configmap (bind addresses, region, GC URL) → `infra/services/mh-service/configmap.yaml`
 - Grafana dashboard → `infra/grafana/dashboards/mh-overview.json`
 - Grafana kustomization → `infra/grafana/kustomization.yaml`

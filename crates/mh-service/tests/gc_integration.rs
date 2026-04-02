@@ -167,6 +167,8 @@ fn test_config(gc_url: &str) -> Config {
         client_secret: SecretString::from("test-client-secret"),
         tls_cert_path: "/dev/null".to_string(),
         tls_key_path: "/dev/null".to_string(),
+        grpc_advertise_address: "grpc://localhost:50053".to_string(),
+        webtransport_advertise_address: "https://localhost:4434".to_string(),
     }
 }
 
@@ -270,8 +272,11 @@ async fn test_gc_client_registration_content() {
     assert_eq!(request.handler_id, config.handler_id);
     assert_eq!(request.region, config.region);
     assert_eq!(request.max_streams, config.max_streams);
-    assert!(request.webtransport_endpoint.starts_with("https://"));
-    assert!(request.grpc_endpoint.starts_with("grpc://"));
+    assert_eq!(request.grpc_endpoint, config.grpc_advertise_address);
+    assert_eq!(
+        request.webtransport_endpoint,
+        config.webtransport_advertise_address
+    );
 
     cancel_token.cancel();
 }

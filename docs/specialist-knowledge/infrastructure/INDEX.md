@@ -47,6 +47,19 @@
 - GC probe config (K8s deployment) -> `infra/services/gc-service/deployment.yaml` (livenessProbe / readinessProbe)
 - MH probe config (K8s deployment) -> `infra/services/mh-service/deployment.yaml` (livenessProbe / readinessProbe on :8083)
 
+## Advertise Address Config (GC Registration)
+- MC config fields (`grpc_advertise_address`, `webtransport_advertise_address`) -> `crates/mc-service/src/config.rs`
+- MH config fields (same names) -> `crates/mh-service/src/config.rs`
+- MC registration uses advertise addresses -> `crates/mc-service/src/grpc/gc_client.rs:register()`, `attempt_reregistration()`
+- MH registration uses advertise addresses -> `crates/mh-service/src/grpc/gc_client.rs:register()`, `attempt_reregistration()`
+- MC deployment (POD_IP downward API + advertise env vars) -> `infra/services/mc-service/deployment.yaml`
+- MH deployment (POD_IP downward API + advertise env vars) -> `infra/services/mh-service/deployment.yaml`
+- Pattern: pod-specific values via `$(POD_IP)` in deployment.yaml, NOT in configmap
+- MC env vars: `MC_GRPC_ADVERTISE_ADDRESS`, `MC_WEBTRANSPORT_ADVERTISE_ADDRESS` (required, no default)
+- MH env vars: `MH_GRPC_ADVERTISE_ADDRESS`, `MH_WEBTRANSPORT_ADVERTISE_ADDRESS` (required, no default)
+- MC schemes: `http://` for gRPC, `https://` for WebTransport
+- MH schemes: `grpc://` for gRPC, `https://` for WebTransport
+
 ## Integration Seams
 - CanaryPod (NetworkPolicy testing) -> `crates/env-tests/src/canary.rs`
 - Cluster health env-tests -> `crates/env-tests/tests/00_cluster_health.rs`

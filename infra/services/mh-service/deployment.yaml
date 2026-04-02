@@ -99,6 +99,17 @@ spec:
             secretKeyRef:
               name: mh-service-secrets
               key: MH_CLIENT_SECRET
+        # Pod IP for advertise addresses (downward API)
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              apiVersion: v1
+              fieldPath: status.podIP
+        # Advertise addresses for GC registration (pod-specific, not from configmap)
+        - name: MH_GRPC_ADVERTISE_ADDRESS
+          value: "grpc://$(POD_IP):50053"
+        - name: MH_WEBTRANSPORT_ADVERTISE_ADDRESS
+          value: "https://$(POD_IP):4434"
         - name: RUST_LOG
           value: "info,mh_service=debug"
         resources:
