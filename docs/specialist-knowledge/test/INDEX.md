@@ -23,6 +23,7 @@
 - Auth integration tests (HTTP layer, wiremock JWKS) -> `crates/gc-service/tests/auth_tests.rs`
 - Auth thin wrapper tests (From<JwtError> for GcError) -> `crates/gc-service/src/auth/jwt.rs:tests`
 - Meeting join/guest/settings tests -> `crates/gc-service/tests/meeting_tests.rs`
+- Regression: same-org home_org_id (wiremock inspection) -> `crates/gc-service/tests/meeting_tests.rs:test_same_org_join_sends_home_org_id_equal_to_user_org_id`
 - Meeting creation tests -> `crates/gc-service/tests/meeting_create_tests.rs`
 - Participant & activation tests -> `crates/gc-service/tests/participant_tests.rs`
 - Meeting assignment tests -> `crates/gc-service/tests/meeting_assignment_tests.rs`
@@ -62,14 +63,13 @@
 - Auth interceptor tests (Bearer, size limits) -> `crates/mh-service/src/grpc/auth_interceptor.rs:tests`
 - Health state & router tests -> `crates/mh-service/src/observability/health.rs:tests`
 - GC integration tests (registration, load reports, NOT_FOUND) -> `crates/mh-service/tests/gc_integration.rs`
-- MH infra (manifests, Kind overlay, Dockerfile, deploy) -> `infra/services/mh-service/`, `infra/docker/mh-service/`, `setup.sh:deploy_mh_service()`
-- NOTE: `crates/env-tests/src/cluster.rs` lacks MH port/health — add when MH env-tests are written
+- MH infra (manifests, Kind overlay, Dockerfile) -> `infra/services/mh-service/`, `infra/docker/mh-service/`
 
 ## Code Locations: Environment Tests
-- Cluster bootstrap + fixtures → `crates/env-tests/src/cluster.rs`, `crates/env-tests/src/fixtures/`
-- Env-test flows (20-24) + join flow E2E → `crates/env-tests/tests/24_join_flow.rs`
+- Cluster bootstrap + fixtures → `crates/env-tests/src/`, flows (20-24) → `crates/env-tests/tests/`
 
 ## Code Locations: Common & Infrastructure
 - JWT (claims, JwtError, JwksClient, JwtValidator, round-trip tests) -> `crates/common/src/jwt.rs`
+- Shared meeting token types (GC<->AC contract, serde, defaults) -> `crates/common/src/meeting_token.rs:tests`
 - MC/MH K8s health probes → `infra/services/{mc,mh}-service/deployment.yaml`
 - Dev certs (AC, MC, MH), Kind setup, Kustomize guard → `scripts/generate-dev-certs.sh`, `infra/kind/scripts/setup.sh`, `scripts/guards/simple/validate-kustomize.sh`

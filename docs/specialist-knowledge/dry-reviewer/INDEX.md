@@ -6,6 +6,7 @@
 
 ## JWT Validation (Common + Thin Wrappers)
 - Common JWT code (all shared logic) -> `crates/common/src/jwt.rs`
+- Internal token request types (GC->AC contract) -> `crates/common/src/meeting_token.rs`
 - GC thin wrapper -> `crates/gc-service/src/auth/jwt.rs` (ServiceClaims, UserClaims)
 - MC thin wrapper -> `crates/mc-service/src/auth/mod.rs` (MeetingTokenClaims, GuestTokenClaims)
 
@@ -57,6 +58,8 @@
 - Per-service error mapping (GcError vs McError vs MhError) -> required, not duplication
 - MC GcClient vs MH GcClient -> different RPCs, retry strategies, heartbeat models (reviewed 2026-04-01)
 - AC rate limiting (DB-backed lockout) vs GC rate limiting (middleware RPM) -> different mechanisms
+- common::jwt::{ParticipantType,MeetingRole} (2 variants) vs common::meeting_token (3 variants) -> JWT enums intentionally narrower (no Guest; guests use separate GuestTokenClaims)
+- env-tests GuestTokenRequest vs common::meeting_token::GuestTokenRequest -> different types (public API client vs internal GC->AC request)
 - Per-service K8s manifests/Dockerfiles -> structurally similar but service-specific (ports, env, deps)
 
 ## Tech Debt Registry
@@ -65,8 +68,8 @@
 ## Successful Extractions (Reference)
 - ServiceClaims/UserClaims/JWKS/JwtValidator to common::jwt -> `crates/common/src/jwt.rs`
 - TestKeypair + JWKS mock to mc-test-utils -> `crates/mc-test-utils/src/jwt_test.rs`
+- MeetingTokenRequest/GuestTokenRequest/TokenResponse/ParticipantType/MeetingRole to common::meeting_token -> `crates/common/src/meeting_token.rs` (AC+GC re-export via `pub use`)
 
 ## Infrastructure & Integration Seams
 - Common crate as extraction target -> `crates/common/src/`
 - JWT thin wrapper pattern (GC + MC) -> `crates/{gc,mc}-service/src/auth/`
-- Test fixture pattern -> `crates/*-test-utils/`

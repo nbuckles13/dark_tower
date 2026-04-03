@@ -10,55 +10,13 @@ use uuid::Uuid;
 // Internal Token Request/Response Types (ADR-0020)
 // ============================================================================
 
-/// Request to issue a meeting token for a user via internal endpoint.
-///
-/// Called by GC (with service token having `internal:meeting-token` scope)
-/// to get meeting tokens for authenticated users joining meetings.
-#[derive(Debug, Clone, Deserialize)]
-pub struct MeetingTokenRequest {
-    /// The user ID to issue the token for
-    pub subject_user_id: Uuid,
-    /// The meeting being joined
-    pub meeting_id: Uuid,
-    /// The org that owns the meeting
-    pub meeting_org_id: Uuid,
-    /// The user's home org (may differ for cross-org meetings)
-    pub home_org_id: Uuid,
-    /// Whether this is a member of the meeting org or external participant
-    #[serde(default)]
-    pub participant_type: ParticipantType,
-    /// Role in the meeting (host or participant)
-    #[serde(default)]
-    pub role: MeetingRole,
-    /// Capabilities granted (e.g., video, audio, screen_share)
-    #[serde(default)]
-    pub capabilities: Vec<String>,
-    /// Token TTL in seconds (max 900 = 15 minutes)
-    #[serde(default = "default_meeting_ttl")]
-    pub ttl_seconds: u32,
-}
+// Shared types imported from common crate to ensure compile-time agreement
+// between GC (sender) and AC (receiver).
+pub use common::meeting_token::{GuestTokenRequest, MeetingTokenRequest};
 
-/// Request to issue a guest token via internal endpoint.
-///
-/// Called by GC (with service token having `internal:meeting-token` scope)
-/// to get guest tokens for unauthenticated users joining meetings.
-#[derive(Debug, Clone, Deserialize)]
-pub struct GuestTokenRequest {
-    /// Generated guest ID
-    pub guest_id: Uuid,
-    /// Display name for the guest
-    pub display_name: String,
-    /// The meeting being joined
-    pub meeting_id: Uuid,
-    /// The org that owns the meeting
-    pub meeting_org_id: Uuid,
-    /// Whether guest should wait in waiting room
-    #[serde(default = "default_waiting_room")]
-    pub waiting_room: bool,
-    /// Token TTL in seconds (max 900 = 15 minutes)
-    #[serde(default = "default_meeting_ttl")]
-    pub ttl_seconds: u32,
-}
+// Re-exported for test use (AC handler tests reference these via crate::models).
+#[cfg(test)]
+pub use common::meeting_token::{MeetingRole, ParticipantType};
 
 /// Response for internal token endpoints.
 #[derive(Debug, Clone, Serialize)]
@@ -67,76 +25,6 @@ pub struct InternalTokenResponse {
     pub token: String,
     /// Token lifetime in seconds
     pub expires_in: u32,
-}
-
-/// Participant type in a meeting.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum ParticipantType {
-    /// Member of the meeting organization
-    #[default]
-    Member,
-    /// External user (from a different organization)
-    External,
-    /// Guest (unauthenticated)
-    Guest,
-}
-
-impl ParticipantType {
-    /// Convert to string for JWT claims
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            ParticipantType::Member => "member",
-            ParticipantType::External => "external",
-            ParticipantType::Guest => "guest",
-        }
-    }
-}
-
-impl fmt::Display for ParticipantType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.as_str())
-    }
-}
-
-/// Role in a meeting.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum MeetingRole {
-    /// Meeting host with elevated privileges
-    Host,
-    /// Regular participant
-    #[default]
-    Participant,
-    /// Guest (waiting room or limited privileges)
-    Guest,
-}
-
-impl MeetingRole {
-    /// Convert to string for JWT claims
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            MeetingRole::Host => "host",
-            MeetingRole::Participant => "participant",
-            MeetingRole::Guest => "guest",
-        }
-    }
-}
-
-impl fmt::Display for MeetingRole {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.as_str())
-    }
-}
-
-/// Default TTL for meeting tokens (15 minutes)
-fn default_meeting_ttl() -> u32 {
-    900
-}
-
-/// Default waiting room setting (true)
-fn default_waiting_room() -> bool {
-    true
 }
 
 /// Service credential model (maps to service_credentials table)
@@ -524,15 +412,5 @@ mod tests {
         assert_eq!(req.display_name, "Test Guest");
         assert!(!req.waiting_room);
         assert_eq!(req.ttl_seconds, 300);
-    }
-
-    #[test]
-    fn test_default_ttl_value() {
-        assert_eq!(default_meeting_ttl(), 900);
-    }
-
-    #[test]
-    fn test_default_waiting_room_value() {
-        assert!(default_waiting_room());
     }
 }

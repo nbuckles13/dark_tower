@@ -64,6 +64,7 @@
 - JWT (errors, claims, validator, JWKS, HasIat) → `crates/common/src/jwt.rs`
 - SecretString/SecretBox → `crates/common/src/secret.rs`
 - TokenManager → `crates/common/src/token_manager.rs:spawn_token_manager()`
+- Meeting token shared types (GC↔AC contract, ADR-0020) → `crates/common/src/meeting_token.rs`
 
 ## Infrastructure & Guards
 - Standard health endpoints (`/health`, `/ready`) → ADR-0012 (Section: Standard Operational Endpoints)
@@ -71,5 +72,4 @@
 - Kind config (MC UDP 4433, MH UDP 4434) + setup → `infra/kind/kind-config.yaml`, `infra/kind/scripts/setup.sh`
 - Service bases + Kind overlay → `infra/services/*/kustomization.yaml`, `infra/kubernetes/overlays/kind/`
 - Guard runner → `scripts/guards/run-guards.sh`; Review protocol → `.claude/skills/devloop/review-protocol.md`
-- Kustomize guard (R-15–R-20) → `scripts/guards/simple/validate-kustomize.sh`
-- Application metrics guard → `scripts/guards/simple/validate-application-metrics.sh`
+- Guards: Kustomize (R-15–R-20) → `scripts/guards/simple/validate-kustomize.sh`; App metrics → `validate-application-metrics.sh`

@@ -361,11 +361,11 @@ pub async fn join_meeting(
         ));
     }
 
-    // Determine participant type and role
-    let (participant_type, home_org_id) = if is_same_org {
-        (ParticipantType::Member, None)
+    // Determine participant type (home_org_id is always sent — AC requires it)
+    let participant_type = if is_same_org {
+        ParticipantType::Member
     } else {
-        (ParticipantType::External, Some(user_org_id))
+        ParticipantType::External
     };
 
     let role = if is_host {
@@ -397,7 +397,7 @@ pub async fn join_meeting(
         subject_user_id: user_id,
         meeting_id: meeting.meeting_id,
         meeting_org_id: meeting.org_id,
-        home_org_id,
+        home_org_id: user_org_id,
         participant_type,
         role,
         capabilities: DEFAULT_PARTICIPANT_CAPABILITIES

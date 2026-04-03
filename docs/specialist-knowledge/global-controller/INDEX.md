@@ -37,6 +37,8 @@
 ## Integration Seams
 - GC <-> AC (OAuth token refresh) -> `crates/common/src/token_manager.rs:TokenReceiver`
 - GC <-> AC (meeting/guest token issuance) -> `crates/gc-service/src/services/ac_client.rs`
+- GC <-> AC shared types (MeetingTokenRequest, GuestTokenRequest, TokenResponse, ParticipantType, MeetingRole) -> `crates/common/src/meeting_token.rs`
+- home_org_id is always Uuid (not Option) — set to user_org_id for same-org, user_org_id for cross-org -> `handlers/meetings.rs:400`
 - GC <-> MC (gRPC registration + heartbeat) -> `crates/gc-service/src/grpc/mc_service.rs`
 - GC <-> MC (gRPC assignment RPC) -> `crates/gc-service/src/services/mc_client.rs`
 - GC <-> MH (gRPC registration + load report) -> `crates/gc-service/src/grpc/mh_service.rs`
@@ -59,3 +61,5 @@
 - Failure: 503 AC unavailable, 503 no MC available, 404 meeting not found
 - Success: token + MC assignment (mc_id, grpc_endpoint, webtransport_endpoint)
 - AC failure variant: `TestMeetingServer::spawn_with_ac_failure()` (500 on meeting-token)
+- Regression: same-org join home_org_id invariant -> `meeting_tests.rs:test_same_org_join_sends_home_org_id_equal_to_user_org_id`
+- Shared type unit tests (15 tests) -> `crates/common/src/meeting_token.rs` (#[cfg(test)])
