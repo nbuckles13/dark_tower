@@ -217,7 +217,7 @@ fn build_pkcs8_from_seed(seed: &[u8; 32]) -> Vec<u8> {
 struct TestMeetingServer {
     addr: SocketAddr,
     _server_handle: JoinHandle<()>,
-    _mock_server: MockServer,
+    mock_server: MockServer,
     keypair: TestKeypair,
     pool: PgPool,
 }
@@ -319,7 +319,7 @@ impl TestMeetingServer {
         Ok(Self {
             addr,
             _server_handle: server_handle,
-            _mock_server: mock_server,
+            mock_server,
             keypair,
             pool,
         })
@@ -404,7 +404,7 @@ impl TestMeetingServer {
         Ok(Self {
             addr,
             _server_handle: server_handle,
-            _mock_server: mock_server,
+            mock_server,
             keypair,
             pool,
         })
@@ -2342,6 +2342,103 @@ async fn test_join_meeting_active_status_success(pool: PgPool) -> Result<()> {
     assert!(
         body["mc_assignment"]["webtransport_endpoint"].is_string(),
         "Should return mc_assignment with webtransport_endpoint"
+    );
+
+    Ok(())
+}
+
+// ============================================================================
+// Regression Tests — home_org_id same-org invariant (Bug Fix)
+// ============================================================================
+
+/// Regression test: same-org member join must send home_org_id equal to user_org_id.
+///
+/// Before the fix, GC sent `home_org_id: null` for same-org users (the field was
+/// `Option<Uuid>` with `skip_serializing_if`), causing AC deserialization failure.
+/// Now `home_org_id` is always `Uuid` and set to the user's org_id.
+#[sqlx::test(migrations = "../../migrations")]
+async fn test_same_org_join_sends_home_org_id_equal_to_user_org_id(pool: PgPool) -> Result<()> {
+    let server = TestMeetingServer::spawn(pool.clone()).await?;
+    let client = reqwest::Client::new();
+
+    // Register healthy MC and MHs for the test region
+    register_healthy_mc_for_region(&server.pool, "test-region").await;
+    register_healthy_mhs_for_region(&server.pool, "test-region").await;
+
+    // Create org and user — both in the SAME org as the meeting
+    let org_id = create_test_org(&server.pool, "same-org-test", "Same Org Test").await;
+    let host_id = create_test_user(&server.pool, org_id, "host@sameorg.com", "Host User").await;
+    let member_id = create_test_user(
+        &server.pool,
+        org_id,
+        "member@sameorg.com",
+        "Same Org Member",
+    )
+    .await;
+
+    let _meeting_id = create_test_meeting(
+        &server.pool,
+        org_id,
+        host_id,
+        "HOMEORG1",
+        "scheduled",
+        false,
+        false,
+        true,
+    )
+    .await;
+
+    // Same-org member joins
+    let token = server.create_token_for_user(member_id, org_id);
+
+    let response = client
+        .get(format!("{}/api/v1/meetings/HOMEORG1", server.url()))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await?;
+
+    assert_eq!(response.status(), 200, "Same-org join should succeed");
+
+    // Inspect the request that GC sent to AC's meeting-token endpoint
+    let received = server
+        .mock_server
+        .received_requests()
+        .await
+        .expect("Request recording should be enabled");
+
+    let token_requests: Vec<_> = received
+        .iter()
+        .filter(|r| r.url.path() == "/api/v1/auth/internal/meeting-token")
+        .collect();
+
+    assert_eq!(
+        token_requests.len(),
+        1,
+        "Should have sent exactly one meeting-token request to AC"
+    );
+
+    let body: serde_json::Value =
+        serde_json::from_slice(&token_requests[0].body).expect("Request body should be valid JSON");
+
+    // The core invariant: home_org_id must be present and equal to the user's org_id
+    let home_org_id = body["home_org_id"]
+        .as_str()
+        .expect("home_org_id must be present in request body (not null/missing)");
+
+    assert_eq!(
+        home_org_id,
+        org_id.to_string(),
+        "home_org_id must equal user's org_id for same-org joins"
+    );
+
+    // Also verify meeting_org_id matches (same-org scenario)
+    let meeting_org_id = body["meeting_org_id"]
+        .as_str()
+        .expect("meeting_org_id must be present");
+
+    assert_eq!(
+        home_org_id, meeting_org_id,
+        "For same-org joins, home_org_id must equal meeting_org_id"
     );
 
     Ok(())

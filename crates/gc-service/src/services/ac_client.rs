@@ -15,96 +15,16 @@ use crate::observability::metrics;
 use common::secret::ExposeSecret;
 use common::token_manager::TokenReceiver;
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 use tracing::{error, instrument, warn};
-use uuid::Uuid;
 
 /// Default timeout for AC requests in seconds.
 const AC_REQUEST_TIMEOUT_SECS: u64 = 10;
 
-/// Participant type in a meeting.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ParticipantType {
-    /// Member of the same organization as the meeting.
-    Member,
-    /// User from a different organization.
-    External,
-    /// Anonymous guest (no authentication).
-    Guest,
-}
-
-/// Role within a meeting.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MeetingRole {
-    /// Meeting host with full control.
-    Host,
-    /// Regular participant.
-    Participant,
-}
-
-/// Request to AC for a meeting token.
-#[derive(Debug, Clone, Serialize)]
-pub struct MeetingTokenRequest {
-    /// User ID of the participant.
-    pub subject_user_id: Uuid,
-
-    /// Meeting ID.
-    pub meeting_id: Uuid,
-
-    /// Organization that owns the meeting.
-    pub meeting_org_id: Uuid,
-
-    /// User's home organization (None if same as meeting org).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub home_org_id: Option<Uuid>,
-
-    /// Type of participant.
-    pub participant_type: ParticipantType,
-
-    /// Role in the meeting.
-    pub role: MeetingRole,
-
-    /// Capabilities granted to this participant.
-    pub capabilities: Vec<String>,
-
-    /// Token TTL in seconds (default: 900).
-    pub ttl_seconds: u32,
-}
-
-/// Request to AC for a guest token.
-#[derive(Debug, Clone, Serialize)]
-pub struct GuestTokenRequest {
-    /// CSPRNG-generated guest identifier.
-    pub guest_id: Uuid,
-
-    /// Display name for the guest.
-    pub display_name: String,
-
-    /// Meeting ID.
-    pub meeting_id: Uuid,
-
-    /// Organization that owns the meeting.
-    pub meeting_org_id: Uuid,
-
-    /// Whether the guest should be placed in waiting room.
-    pub waiting_room: bool,
-
-    /// Token TTL in seconds (default: 900).
-    pub ttl_seconds: u32,
-}
-
-/// Response from AC for token requests.
-#[derive(Debug, Clone, Deserialize)]
-pub struct TokenResponse {
-    /// The issued JWT token.
-    pub token: String,
-
-    /// Token expiration in seconds from now.
-    pub expires_in: u32,
-}
+// Re-export shared types so existing imports from `crate::services::ac_client` continue to work.
+pub use common::meeting_token::{
+    GuestTokenRequest, MeetingRole, MeetingTokenRequest, ParticipantType, TokenResponse,
+};
 
 /// HTTP client for Auth Controller internal endpoints.
 ///
@@ -288,6 +208,7 @@ mod tests {
     use super::*;
     use common::secret::SecretString;
     use tokio::sync::watch;
+    use uuid::Uuid;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -350,7 +271,7 @@ mod tests {
             subject_user_id: Uuid::nil(),
             meeting_id: Uuid::nil(),
             meeting_org_id: Uuid::nil(),
-            home_org_id: None,
+            home_org_id: Uuid::nil(),
             participant_type: ParticipantType::Member,
             role: MeetingRole::Participant,
             capabilities: vec!["audio".to_string(), "video".to_string()],
@@ -361,8 +282,8 @@ mod tests {
         assert!(json.contains("\"participant_type\":\"member\""));
         assert!(json.contains("\"role\":\"participant\""));
         assert!(json.contains("\"ttl_seconds\":900"));
-        // home_org_id should be omitted when None
-        assert!(!json.contains("home_org_id"));
+        // home_org_id is always present (required by AC)
+        assert!(json.contains("home_org_id"));
     }
 
     #[test]
@@ -371,7 +292,7 @@ mod tests {
             subject_user_id: Uuid::nil(),
             meeting_id: Uuid::nil(),
             meeting_org_id: Uuid::nil(),
-            home_org_id: Some(Uuid::nil()),
+            home_org_id: Uuid::from_u128(99),
             participant_type: ParticipantType::External,
             role: MeetingRole::Participant,
             capabilities: vec![],
@@ -447,7 +368,7 @@ mod tests {
             subject_user_id: Uuid::from_u128(1),
             meeting_id: Uuid::from_u128(2),
             meeting_org_id: Uuid::from_u128(3),
-            home_org_id: None,
+            home_org_id: Uuid::nil(),
             participant_type: ParticipantType::Member,
             role: MeetingRole::Participant,
             capabilities: vec!["audio".to_string()],
@@ -471,7 +392,7 @@ mod tests {
             subject_user_id: Uuid::from_u128(1),
             meeting_id: Uuid::from_u128(2),
             meeting_org_id: Uuid::from_u128(3),
-            home_org_id: None,
+            home_org_id: Uuid::nil(),
             participant_type: ParticipantType::Member,
             role: MeetingRole::Participant,
             capabilities: vec![],
@@ -504,7 +425,7 @@ mod tests {
             subject_user_id: Uuid::from_u128(1),
             meeting_id: Uuid::from_u128(2),
             meeting_org_id: Uuid::from_u128(3),
-            home_org_id: None,
+            home_org_id: Uuid::nil(),
             participant_type: ParticipantType::Member,
             role: MeetingRole::Participant,
             capabilities: vec![],
@@ -537,7 +458,7 @@ mod tests {
             subject_user_id: Uuid::from_u128(1),
             meeting_id: Uuid::from_u128(2),
             meeting_org_id: Uuid::from_u128(3),
-            home_org_id: None,
+            home_org_id: Uuid::nil(),
             participant_type: ParticipantType::Member,
             role: MeetingRole::Participant,
             capabilities: vec![],
@@ -570,7 +491,7 @@ mod tests {
             subject_user_id: Uuid::from_u128(1),
             meeting_id: Uuid::from_u128(2),
             meeting_org_id: Uuid::from_u128(3),
-            home_org_id: None,
+            home_org_id: Uuid::nil(),
             participant_type: ParticipantType::Member,
             role: MeetingRole::Participant,
             capabilities: vec![],
@@ -603,7 +524,7 @@ mod tests {
             subject_user_id: Uuid::from_u128(1),
             meeting_id: Uuid::from_u128(2),
             meeting_org_id: Uuid::from_u128(3),
-            home_org_id: None,
+            home_org_id: Uuid::nil(),
             participant_type: ParticipantType::Member,
             role: MeetingRole::Participant,
             capabilities: vec![],
@@ -635,7 +556,7 @@ mod tests {
             subject_user_id: Uuid::from_u128(1),
             meeting_id: Uuid::from_u128(2),
             meeting_org_id: Uuid::from_u128(3),
-            home_org_id: None,
+            home_org_id: Uuid::nil(),
             participant_type: ParticipantType::Member,
             role: MeetingRole::Participant,
             capabilities: vec![],
@@ -667,7 +588,7 @@ mod tests {
             subject_user_id: Uuid::from_u128(1),
             meeting_id: Uuid::from_u128(2),
             meeting_org_id: Uuid::from_u128(3),
-            home_org_id: None,
+            home_org_id: Uuid::nil(),
             participant_type: ParticipantType::Member,
             role: MeetingRole::Participant,
             capabilities: vec![],
@@ -859,7 +780,7 @@ mod tests {
             subject_user_id: Uuid::nil(),
             meeting_id: Uuid::nil(),
             meeting_org_id: Uuid::nil(),
-            home_org_id: None,
+            home_org_id: Uuid::nil(),
             participant_type: ParticipantType::Member,
             role: MeetingRole::Participant,
             capabilities: vec![],
@@ -899,7 +820,7 @@ mod tests {
             subject_user_id: Uuid::nil(),
             meeting_id: Uuid::nil(),
             meeting_org_id: Uuid::nil(),
-            home_org_id: Some(Uuid::nil()),
+            home_org_id: Uuid::nil(),
             participant_type: ParticipantType::External,
             role: MeetingRole::Host,
             capabilities: vec!["audio".to_string()],

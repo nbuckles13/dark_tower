@@ -19,3 +19,6 @@ pub mod jwt;
 
 /// Module for OAuth 2.0 token management with automatic refresh
 pub mod token_manager;
+
+/// Shared types for internal meeting/guest token requests (GC <-> AC)
+pub mod meeting_token;

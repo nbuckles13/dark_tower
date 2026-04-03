@@ -15,9 +15,9 @@
 - AC HTTP metrics middleware -> `crates/ac-service/src/middleware/http_metrics.rs`
 - GC metrics recording -> `crates/gc-service/src/observability/metrics.rs:init_metrics_recorder()`
 - GC meeting metrics (creation, join) -> `crates/gc-service/src/observability/metrics.rs`
-- GC HTTP metrics middleware -> `crates/gc-service/src/middleware/http_metrics.rs:http_metrics_middleware()`
-- GC endpoint normalization -> `crates/gc-service/src/observability/metrics.rs:normalize_endpoint()`
+- GC HTTP metrics middleware + endpoint normalization -> `crates/gc-service/src/middleware/http_metrics.rs`, `observability/metrics.rs:normalize_endpoint()`
 - GC join handler metrics wiring -> `crates/gc-service/src/handlers/meetings.rs:join_meeting()`
+- GC guest-token handler: NO metrics instrumentation (gap) -> `crates/gc-service/src/handlers/meetings.rs:get_guest_token()`
 - GC DB metrics -> `crates/gc-service/src/repositories/` (meetings.rs, participants.rs)
 - MC metrics recording -> `crates/mc-service/src/observability/metrics.rs:init_metrics_recorder()`
 - MC metrics (join, WebTransport, JWT validation) -> `crates/mc-service/src/observability/metrics.rs`

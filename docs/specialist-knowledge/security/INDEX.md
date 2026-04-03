@@ -16,11 +16,12 @@
 - Security config + rate limits → `crates/ac-service/src/config.rs` | K8s: `infra/services/ac-service/`
 - Rate limiting (login + registration) → `token_service.rs`, `user_service.rs`, `auth_handler.rs`
 
-## Code Locations — Common (JWT Infrastructure)
+## Code Locations — Common (JWT Infrastructure & Shared Token Types)
 - JWT claims (PII-redacted Debug) → `crates/common/src/jwt.rs:ServiceClaims`, `UserClaims`, `MeetingTokenClaims`, `GuestTokenClaims`
 - JWKS client + JWT validator (EdDSA) → `crates/common/src/jwt.rs:JwksClient`, `JwtValidator::validate()`
 - Size limit, kid extraction, iat validation → `crates/common/src/jwt.rs:MAX_JWT_SIZE_BYTES`
 - Token manager (secure constructor) → `crates/common/src/token_manager.rs:new_secure()`
+- Internal token types (GC→AC contract, `home_org_id` always required) → `crates/common/src/meeting_token.rs` — re-exported by GC `ac_client.rs` + AC `models/mod.rs`
 
 ## Code Locations — GC (Auth & Access Control)
 - JWT validation (thin wrapper) → `crates/gc-service/src/auth/jwt.rs:validate()`, `validate_user()`
@@ -70,6 +71,5 @@
 - Kustomize security guards (R-18, R-19) → `scripts/guards/simple/validate-kustomize.sh`
 
 ## Test Coverage (Security-Relevant)
-- MC join tests (JWT, error opacity) + JWT unit tests → `crates/mc-service/tests/join_tests.rs`, `src/auth/mod.rs`
-- JWT test fixtures (Ed25519, JWKS mock) → `crates/mc-test-utils/src/jwt_test.rs`
-- GC join tests (service token rejection) → `crates/gc-service/tests/meeting_tests.rs`
+- MC join tests (JWT, error opacity) → `crates/mc-service/tests/join_tests.rs` | JWT fixtures → `crates/mc-test-utils/src/jwt_test.rs`
+- GC join tests (service token rejection, home_org_id regression) → `crates/gc-service/tests/meeting_tests.rs`

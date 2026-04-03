@@ -38,6 +38,7 @@
 
 ## Code Locations — Auth & JWT
 - Common JWKS + JWT → `crates/common/src/jwt.rs`; GC/MC wrappers → `gc-service/src/auth/`, `mc-service/src/auth/`
+- Shared GC↔AC token types → `crates/common/src/meeting_token.rs` (re-exported by both `gc-service/src/services/ac_client.rs` and `ac-service/src/models/mod.rs`); deploy order agnostic since AC contract unchanged
 - AC rate limits → `crates/ac-service/src/config.rs:parse_rate_limit_i64()`; Service auth → ADR-0003
 
 ## Code Locations — Observability
@@ -68,9 +69,6 @@
   - CI-safe: self-signed TLS, wiremock JWKS, `dangerous-configuration` in `[dev-dependencies]` only
 - TestKeypair (Ed25519 signing + JWKS mock) → `crates/mc-test-utils/src/jwt_test.rs`
 
-## Code Locations — GC
+## Code Locations — GC & Env-Tests
 - GC routes + handlers → `crates/gc-service/src/routes/mod.rs`, `crates/gc-service/src/handlers/meetings.rs`
-- GC join tests (R-18: auth, AC-down, no-MC, success) → `crates/gc-service/tests/meeting_tests.rs`
-
-## Code Locations — Env-Tests (Kind Cluster)
-- Cluster infra + join flow E2E → `crates/env-tests/src/cluster.rs`, `tests/24_join_flow.rs`
+- GC join tests (R-18) → `crates/gc-service/tests/meeting_tests.rs`; Env-tests (Kind) → `crates/env-tests/`

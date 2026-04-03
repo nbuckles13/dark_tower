@@ -32,13 +32,26 @@
 - JWT verify token (EdDSA signature check) -> `crates/common/src/jwt.rs:verify_token()`
 - Service claims (common) -> `crates/common/src/jwt.rs:ServiceClaims`
 - User claims (common) -> `crates/common/src/jwt.rs:UserClaims`
-- Meeting token claims (common) -> `crates/common/src/jwt.rs:MeetingTokenClaims`
-- Guest token claims (common) -> `crates/common/src/jwt.rs:GuestTokenClaims`
-- Participant type enum (common) -> `crates/common/src/jwt.rs:ParticipantType`
-- Meeting role enum (common) -> `crates/common/src/jwt.rs:MeetingRole`
+- Meeting token claims (common, JWT) -> `crates/common/src/jwt.rs:MeetingTokenClaims`
+- Guest token claims (common, JWT) -> `crates/common/src/jwt.rs:GuestTokenClaims`
+- Participant type enum (common, JWT, 2-variant) -> `crates/common/src/jwt.rs:ParticipantType`
+- Meeting role enum (common, JWT, 2-variant) -> `crates/common/src/jwt.rs:MeetingRole`
+- Meeting token request (shared GC->AC) -> `crates/common/src/meeting_token.rs:MeetingTokenRequest`
+- Guest token request (shared GC->AC) -> `crates/common/src/meeting_token.rs:GuestTokenRequest`
+- Participant type enum (shared, 3-variant) -> `crates/common/src/meeting_token.rs:ParticipantType`
+- Meeting role enum (shared, 3-variant) -> `crates/common/src/meeting_token.rs:MeetingRole`
+- AC re-exports shared types -> `crates/ac-service/src/models/mod.rs` (`pub use common::meeting_token::...`)
+- Internal token response (AC-local) -> `crates/ac-service/src/models/mod.rs:InternalTokenResponse`
 - Error types -> `crates/ac-service/src/errors.rs:AcError`
 - Metrics recording -> `crates/ac-service/src/observability/metrics.rs:record_token_issuance()`
 - Correlation hashing -> `crates/ac-service/src/observability/mod.rs:hash_for_correlation()`
+
+## Internal Token Endpoints (ADR-0020)
+- Meeting token handler -> `crates/ac-service/src/handlers/internal_tokens.rs:handle_meeting_token()`
+- Guest token handler -> `crates/ac-service/src/handlers/internal_tokens.rs:handle_guest_token()`
+- Request types (`MeetingTokenRequest`, `GuestTokenRequest`) are shared via `common::meeting_token`
+- AC re-exports them from `crate::models` so handler imports are unchanged
+- Note: `common::meeting_token::{ParticipantType, MeetingRole}` (3-variant, snake_case) differs from `common::jwt::{ParticipantType, MeetingRole}` (2-variant, lowercase). Wire-compatible but separate Rust types. Unification is a future cleanup item.
 
 ## Integration Seams
 - Auth middleware (service tokens) -> `crates/ac-service/src/middleware/auth.rs:require_service_auth()`
