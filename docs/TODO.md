@@ -1,5 +1,9 @@
 # Technical Debt
 
+## Inter-Service Protocol Inconsistency
+
+- [ ] **AC internal APIs use HTTP/JSON without shared contracts**: All other inter-service communication (GC↔MC, GC↔MH, MC↔MH) uses gRPC with proto-defined contracts in `proto/internal.proto`. AC is the exception — its internal APIs (`/api/v1/auth/internal/meeting-token`, `/api/v1/auth/internal/guest-token`, `/api/v1/auth/token`) are HTTP/JSON with request/response structs defined independently on each side. This caused a production-visible bug: GC's `MeetingTokenRequest` defined `home_org_id: Option<Uuid>` while AC's expects `home_org_id: Uuid` (required), resulting in 422 errors at runtime. No compile-time check catches these mismatches. Options: (a) migrate AC internal APIs to gRPC and add to `internal.proto`, or (b) create a shared `ac-api-types` crate that both AC and GC import. The `common::token_manager` (OAuth token fetch) is already shared but the meeting/guest token request types are not. Locations: `crates/gc-service/src/services/ac_client.rs` (GC's structs), `crates/ac-service/src/models/mod.rs` (AC's structs).
+
 ## Cross-Service Duplication (DRY)
 
 ### From DRY Reviewer (Ongoing)
@@ -27,6 +31,12 @@
 
 - [ ] **AC org provisioning endpoint**: Add an admin/internal API to AC for creating organizations. Env-tests should create their own test org via this endpoint instead of depending on pre-seeded data in `infra/docker/postgres/init.sql`.
 - [ ] **Remove init.sql seed data**: Once the AC provisioning endpoint exists, remove the `devtest` org/user seed logic from `infra/docker/postgres/init.sql` and update env-tests (20, 21, 23) to self-provision via the API.
+
+## Service Credential Management
+
+- [ ] **AC admin API for service credentials**: Add `POST /api/v1/admin/service-credentials` to AC for registering/updating service credentials (client_id, scopes, service_type). Idempotent upsert. Currently service credentials are seeded via raw SQL in `infra/kind/scripts/setup.sh:seed_test_data()`, which has caused bugs (missing `internal:meeting-token` scope for GC) because credential config is decoupled from the code that requires it.
+- [ ] **Per-service credential registration Jobs**: Each service (GC, MC, MH) should own its credential registration via a K8s Job in its Kustomize base. The Job calls the AC admin API to register the service's client_id and required scopes. Deploy pipeline ensures AC is ready before downstream services deploy. This way, adding a new scope (e.g., `internal:meeting-token`) is part of the same PR that adds the endpoint requiring it.
+- [ ] **Remove setup.sh seed_test_data**: Once the admin API and registration Jobs exist, remove the raw SQL credential seeding from `infra/kind/scripts/setup.sh` and `infra/docker/postgres/init.sql`.
 
 ## Client Architecture
 
@@ -57,6 +67,12 @@
 ## Developer Experience
 
 - [ ] **Resumable setup.sh**: Add a `--resume` flag to `infra/kind/scripts/setup.sh` that brings the cluster up to date without destroying it. Skip cluster creation if cluster exists, skip namespace creation if namespaces exist, skip image build+load if image tag unchanged, let `kubectl apply -k` handle idempotent infra updates. Currently any infra change requires a full teardown+rebuild (~5 min), when most steps could be skipped.
+- [x] **Pre-load third-party images into Kind**: Third-party images (postgres, redis, prometheus, grafana, loki, promtail, kube-state-metrics, node-exporter) are pulled from the internet by the Kind node on every cluster creation. Pull to host Docker/Podman cache first, then `kind load` into the cluster. Makes subsequent cluster recreations faster and offline-capable. Location: `infra/kind/scripts/setup.sh:preload_third_party_images()`.
+- [ ] **Skip unchanged service image builds**: `build_image` runs `docker build` for all 4 services on every `setup.sh` invocation, even when source code hasn't changed. The `COPY . .` planner stage uses the entire project root as build context, so changing any file invalidates all services' Docker caches. Two improvements: (a) add `.dockerignore` or narrow build context per service so changing GC doesn't invalidate AC's cache, (b) content-hash the relevant source files (`crates/{service}/`, `crates/common/`, `Cargo.toml`, `Cargo.lock`) and skip `build_image` + `kind load` entirely if the hash matches the previously-built image. Location: `infra/kind/scripts/setup.sh:build_image()`.
+
+## Multi-Cluster Networking (Production)
+
+- [ ] **Per-pod externally-routable addresses for MC/MH**: MC and MH register per-pod advertise addresses with GC (`_ADVERTISE_ADDRESS` config fields, added in `8266acc`). In Kind dev, these use pod IPs via downward API, which works single-cluster. In production, GC/MC/MH may be in different clusters and clients connect directly to MC/MH — pod IPs won't be routable. Needs a `/debate` to choose an infrastructure pattern (headless service + ExternalDNS, per-pod ingress, service mesh, etc.) and design TLS/DNS strategy. Affects: deployment model (StatefulSet vs Deployment), DNS, TLS certificates (wildcard vs per-pod), GC routing logic, client SDK connection. Depends on cloud provider selection. Locations: `crates/mc-service/src/config.rs` (grpc/webtransport_advertise_address), `crates/mh-service/src/config.rs` (same), `infra/services/mc-service/deployment.yaml`, `infra/services/mh-service/deployment.yaml`.
 
 ## Code Quality
 

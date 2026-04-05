@@ -34,20 +34,22 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
+_ts() { date '+%H:%M:%S'; }
+
 log_info() {
-    echo -e "${GREEN}[INFO]${NC} $1"
+    echo -e "${GREEN}[$(_ts) INFO]${NC} $1"
 }
 
 log_warn() {
-    echo -e "${YELLOW}[WARN]${NC} $1"
+    echo -e "${YELLOW}[$(_ts) WARN]${NC} $1"
 }
 
 log_error() {
-    echo -e "${RED}[ERROR]${NC} $1"
+    echo -e "${RED}[$(_ts) ERROR]${NC} $1"
 }
 
 log_step() {
-    echo -e "${BLUE}[STEP]${NC} $1"
+    echo -e "${BLUE}[$(_ts) STEP]${NC} $1"
 }
 
 # Detect container runtime (prefer Podman)
@@ -168,6 +170,75 @@ build_image() {
     fi
 }
 
+# Pre-load third-party images into the Kind cluster.
+# Derives the image list from Kustomize manifests (single source of truth),
+# pulls to host cache if not present, then loads into Kind.
+preload_third_party_images() {
+    log_step "Pre-loading third-party images into Kind cluster..."
+
+    local CONTAINER_CMD
+    if [[ "${KIND_EXPERIMENTAL_PROVIDER:-}" == "podman" ]]; then
+        CONTAINER_CMD="podman"
+    else
+        CONTAINER_CMD="docker"
+    fi
+
+    # Extract third-party images from rendered Kustomize manifests,
+    # qualifying Docker Hub short names for podman compatibility.
+    local IMAGES
+    IMAGES=$(kubectl kustomize "${PROJECT_ROOT}/infra/kubernetes/overlays/kind/" \
+        | grep -oP 'image:\s+\K\S+' \
+        | grep -v '^localhost/' \
+        | sort -u)
+
+    if [ -z "$IMAGES" ]; then
+        log_info "No third-party images found in manifests, skipping."
+        return 0
+    fi
+
+    # Podman requires fully-qualified names; prefix docker.io/ for Docker Hub images
+    if [[ "$CONTAINER_CMD" == "podman" ]]; then
+        local qualified=""
+        local img
+        for img in $IMAGES; do
+            if [[ "$img" != *"."*"/"* ]]; then
+                qualified+="docker.io/$img"$'\n'
+            else
+                qualified+="$img"$'\n'
+            fi
+        done
+        IMAGES=$(echo "$qualified" | sed '/^$/d')
+    fi
+
+    # Pull to host cache if not already present
+    local img
+    for img in $IMAGES; do
+        if ${CONTAINER_CMD} image inspect "$img" >/dev/null 2>&1; then
+            log_info "Cached: $img"
+        else
+            log_info "Pulling: $img"
+            ${CONTAINER_CMD} pull "$img"
+        fi
+    done
+
+    # Load into Kind one at a time — batching multiple images into a single
+    # podman save archive corrupts tag-to-image mapping in kind load.
+    for img in $IMAGES; do
+        log_info "Loading: $img"
+        if [[ "$CONTAINER_CMD" == "podman" ]]; then
+            local TMPFILE
+            TMPFILE=$(mktemp /tmp/kind-image.XXXXXX.tar)
+            ${CONTAINER_CMD} save "$img" -o "${TMPFILE}"
+            kind load image-archive "${TMPFILE}" --name "${CLUSTER_NAME}"
+            rm -f "${TMPFILE}"
+        else
+            kind load docker-image "$img" --name "${CLUSTER_NAME}"
+        fi
+    done
+
+    log_info "Third-party images pre-loaded."
+}
+
 # Deploy PostgreSQL
 deploy_postgres() {
     log_step "Deploying PostgreSQL..."
@@ -202,7 +273,7 @@ deploy_observability() {
     kubectl apply -k "${PROJECT_ROOT}/infra/kubernetes/overlays/kind/observability/"
 
     log_info "Waiting for kube-state-metrics to be ready..."
-    kubectl wait --for=condition=available --timeout=60s \
+    kubectl wait --for=condition=available --timeout=120s \
         deployment/kube-state-metrics -n dark-tower-observability
 
     log_info "Waiting for node-exporter to be ready..."
@@ -269,7 +340,7 @@ seed_test_data() {
     kubectl exec -n dark-tower postgres-0 -- psql -U darktower -d dark_tower -c "
 INSERT INTO service_credentials (client_id, client_secret_hash, service_type, region, scopes, is_active)
 VALUES
-    ('global-controller', '\$2b\$12\$Gcm3fKCVQzVeCKBkVumWeu9MpAqayxTo08p4aS7xScQTCK8Fi6nBu', 'global-controller', 'us-west-2', ARRAY['meeting:create', 'meeting:read', 'meeting:update'], true),
+    ('global-controller', '\$2b\$12\$Gcm3fKCVQzVeCKBkVumWeu9MpAqayxTo08p4aS7xScQTCK8Fi6nBu', 'global-controller', 'us-west-2', ARRAY['meeting:create', 'meeting:read', 'meeting:update', 'internal:meeting-token'], true),
     ('meeting-controller', '\$2b\$12\$BX5OkdvGLfsj6eTM89qkGe/mPpU2nf2aAXDK7v5sedsndrwUmG6dm', 'meeting-controller', 'us-west-2', ARRAY['media:forward', 'session:manage'], true),
     ('media-handler', '\$2b\$12\$DpQDslp37I3UFi.IBC24NOCnMWcPKkdiDO96FEACLVoXqVyYEhyZa', 'media-handler', 'us-west-2', ARRAY['media:receive', 'media:send'], true),
     ('test-client', '\$2b\$12\$DpBLvWIsdO2j3a8dhx0VwOd8kLdZ4/szjsuZVm.TX.z4fxjlWzOny', 'global-controller', NULL, ARRAY['test:all'], true)
@@ -611,6 +682,7 @@ main() {
     create_cluster
     install_calico
     create_namespaces
+    preload_third_party_images
     deploy_postgres
     deploy_redis
     deploy_observability
