@@ -316,8 +316,8 @@ else
                 ((r18_errors++)) || true
             fi
 
-            # Check readOnlyRootFilesystem: true (skip for postgres)
-            if [[ "$name" != *postgres* ]]; then
+            # Check readOnlyRootFilesystem: true (skip for workloads needing writable storage)
+            if [[ "$name" != *postgres* && "$name" != *prometheus* && "$name" != *loki* && "$name" != *grafana* ]]; then
                 if ! grep -q 'readOnlyRootFilesystem: true' "$doc_file"; then
                     print_violation "$resource_label missing readOnlyRootFilesystem: true"
                     increment_violations

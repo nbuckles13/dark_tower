@@ -206,6 +206,12 @@ spec:
       containers:
         - name: prometheus
           image: prom/prometheus:v2.48.0
+          securityContext:
+            readOnlyRootFilesystem: false  # Prometheus writes TSDB to /prometheus
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
           args:
             - "--config.file=/etc/prometheus/prometheus.yml"
             - "--storage.tsdb.path=/prometheus"
