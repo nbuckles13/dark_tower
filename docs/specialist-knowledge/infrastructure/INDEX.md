@@ -15,6 +15,14 @@
 - Prometheus alert rules (MC) -> `infra/docker/prometheus/rules/mc-alerts.yaml`
 - Prometheus config (K8s) -> `infra/kubernetes/observability/prometheus-config.yaml`
 - K8s service manifests (Kustomize bases) -> `infra/services/{ac,gc,mc,mh}-service/kustomization.yaml`
+- AC StatefulSet -> `infra/services/ac-service/statefulset.yaml`
+- GC Deployment -> `infra/services/gc-service/deployment.yaml`
+- MC per-instance Deployments -> `infra/services/mc-service/mc-{0,1}-deployment.yaml`
+- MH per-instance Deployments -> `infra/services/mh-service/mh-{0,1}-deployment.yaml`
+- MC per-instance ConfigMaps (WebTransport advertise address) -> `infra/services/mc-service/mc-{0,1}-configmap.yaml`
+- MH per-instance ConfigMaps (WebTransport advertise address) -> `infra/services/mh-service/mh-{0,1}-configmap.yaml`
+- MC per-instance Services (WebTransport NodePorts) -> `infra/services/mc-service/service.yaml` (ClusterIP + mc-service-0 + mc-service-1)
+- MH per-instance Services (WebTransport NodePorts) -> `infra/services/mh-service/service.yaml` (ClusterIP + mh-service-0 + mh-service-1)
 - MC TLS Secret -> created imperatively by `infra/kind/scripts/setup.sh:create_mc_tls_secret()`
 - MH TLS Secret -> created imperatively by `infra/kind/scripts/setup.sh:create_mh_tls_secret()`
 - MH secrets -> created imperatively by `infra/kind/scripts/setup.sh:create_mh_secrets()`
@@ -43,26 +51,24 @@
 
 ## Health Probes
 - MC health endpoints (liveness + readiness) -> `crates/mc-service/src/observability/health.rs:health_router()`
-- MC probe config (K8s deployment) -> `infra/services/mc-service/deployment.yaml` (livenessProbe / readinessProbe)
-- GC probe config (K8s deployment) -> `infra/services/gc-service/deployment.yaml` (livenessProbe / readinessProbe)
-- MH probe config (K8s deployment) -> `infra/services/mh-service/deployment.yaml` (livenessProbe / readinessProbe on :8083)
+- MC probe config (K8s Deployment) -> `infra/services/mc-service/mc-{0,1}-deployment.yaml` (livenessProbe / readinessProbe)
+- GC probe config (K8s Deployment) -> `infra/services/gc-service/deployment.yaml` (livenessProbe / readinessProbe)
+- MH probe config (K8s Deployment) -> `infra/services/mh-service/mh-{0,1}-deployment.yaml` (livenessProbe / readinessProbe on :8083)
 
 ## Advertise Address Config (GC Registration)
 - MC config fields (`grpc_advertise_address`, `webtransport_advertise_address`) -> `crates/mc-service/src/config.rs`
 - MH config fields (same names) -> `crates/mh-service/src/config.rs`
 - MC registration uses advertise addresses -> `crates/mc-service/src/grpc/gc_client.rs:register()`, `attempt_reregistration()`
 - MH registration uses advertise addresses -> `crates/mh-service/src/grpc/gc_client.rs:register()`, `attempt_reregistration()`
-- MC deployment (POD_IP downward API + advertise env vars) -> `infra/services/mc-service/deployment.yaml`
-- MH deployment (POD_IP downward API + advertise env vars) -> `infra/services/mh-service/deployment.yaml`
-- Pattern: pod-specific values via `$(POD_IP)` in deployment.yaml, NOT in configmap
-- MC env vars: `MC_GRPC_ADVERTISE_ADDRESS`, `MC_WEBTRANSPORT_ADVERTISE_ADDRESS` (required, no default)
-- MH env vars: `MH_GRPC_ADVERTISE_ADDRESS`, `MH_WEBTRANSPORT_ADVERTISE_ADDRESS` (required, no default)
+- gRPC advertise: pod-specific via `$(POD_IP)` downward API in Deployment, NOT in configmap
+- WebTransport advertise: explicit per-instance `*_WEBTRANSPORT_ADVERTISE_ADDRESS` env var from per-instance ConfigMap
+- MC per-instance ConfigMaps -> `infra/services/mc-service/mc-{0,1}-configmap.yaml`
+- MH per-instance ConfigMaps -> `infra/services/mh-service/mh-{0,1}-configmap.yaml`
+- No infrastructure knowledge (port formulas, ordinal parsing) in Rust code — all config is explicit
+- Scaling instances requires: Kind port mappings + per-instance Services + per-instance Deployments + per-instance ConfigMaps
 - MC schemes: `http://` for gRPC, `https://` for WebTransport
 - MH schemes: `grpc://` for gRPC, `https://` for WebTransport
 
 ## Integration Seams
 - CanaryPod (NetworkPolicy testing) -> `crates/env-tests/src/canary.rs`
-- Cluster health env-tests -> `crates/env-tests/tests/00_cluster_health.rs`
-- Observability env-tests -> `crates/env-tests/tests/30_observability.rs`
-- Resilience / NetworkPolicy env-tests -> `crates/env-tests/tests/40_resilience.rs`
-- NetworkPolicy definitions -> `infra/services/{ac,gc,mc,mh}-service/network-policy.yaml`, `infra/services/{redis,postgres}/network-policy.yaml`
+- Env-tests (cluster health, observability, resilience) -> `crates/env-tests/tests/`

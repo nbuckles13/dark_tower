@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mc-1-config
+  namespace: dark-tower
+  labels:
+    app: mc-service
+    component: signaling
+    instance: mc-1
+data:
+  # Per-instance WebTransport advertise address (explicit, no computation needed).
+  # This is the address GC tells clients to connect to for this specific MC pod.
+  MC_WEBTRANSPORT_ADVERTISE_ADDRESS: "https://localhost:4435"

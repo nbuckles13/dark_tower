@@ -24,7 +24,8 @@
 
 ## Per-Service Config Parsing
 - AC/GC/MC/MH config -> `crates/*/src/config.rs:Config::from_vars()` (per-service, not duplication)
-- Advertise addresses (MC + MH) -> `grpc_advertise_address` + `webtransport_advertise_address` (consistent pattern)
+- Advertise addresses (MC + MH) -> gRPC uses POD_IP downward API; WebTransport uses ordinal-based port via `common::config::parse_statefulset_ordinal`
+- StatefulSet ordinal parsing -> `crates/common/src/config.rs:parse_statefulset_ordinal()` (shared, 5 tests)
 - Extraction candidate: `generate_instance_id(prefix)` -> 4-line pattern duplicated in MC + MH config
 
 ## gRPC Auth Interceptors (Cross-Service)
@@ -46,21 +47,20 @@
 
 ## Per-Service Infrastructure (K8s, Docker, Kind)
 - Kustomize bases -> `infra/services/{ac,gc,mc,mh}-service/kustomization.yaml`
+- AC/MC/MH use StatefulSet; GC uses Deployment -> `infra/services/*/statefulset.yaml` or `deployment.yaml`
+- MC/MH per-pod Services (WebTransport NodePort) -> `infra/services/{mc,mh}-service/service.yaml` (headless + ClusterIP + per-pod-0 + per-pod-1; port formula: `base + ordinal*2`)
 - Dockerfiles -> `infra/docker/{ac,gc,mc,mh}-service/Dockerfile` (cargo-chef multi-stage pattern)
-- Kind overlays -> `infra/kubernetes/overlays/kind/services/{ac,gc,mc,mh}-service/`
-- Kind config (port mappings) -> `infra/kind/kind-config.yaml`
-- setup.sh deploy functions -> `infra/kind/scripts/setup.sh` (one per service, uses shared `build_image`)
-- TLS cert generation -> `scripts/generate-dev-certs.sh` (MC + MH WebTransport certs)
+- Kind config + overlays -> `infra/kind/kind-config.yaml` (per-pod UDP), `infra/kubernetes/overlays/kind/`
+- setup.sh + TLS certs -> `infra/kind/scripts/setup.sh`, `scripts/generate-dev-certs.sh`
 - Prometheus scrape targets -> `infra/kubernetes/observability/prometheus-config.yaml`
-- Note: image-load-into-kind pattern repeated per deploy function (pre-existing; candidate for `load_image_to_kind` helper)
+- Note: image-load-into-kind pattern repeated per deploy function (candidate for `load_image_to_kind` helper)
 
 ## False Positive Boundaries
 - Per-service error mapping (GcError vs McError vs MhError) -> required, not duplication
 - MC GcClient vs MH GcClient -> different RPCs, retry strategies, heartbeat models (reviewed 2026-04-01)
 - AC rate limiting (DB-backed lockout) vs GC rate limiting (middleware RPM) -> different mechanisms
 - common::jwt::{ParticipantType,MeetingRole} (2 variants) vs common::meeting_token (3 variants) -> JWT enums intentionally narrower (no Guest; guests use separate GuestTokenClaims)
-- env-tests GuestTokenRequest vs common::meeting_token::GuestTokenRequest -> different types (public API client vs internal GC->AC request)
-- Per-service K8s manifests/Dockerfiles -> structurally similar but service-specific (ports, env, deps)
+- env-tests GuestTokenRequest vs common::meeting_token::GuestTokenRequest -> different types (public API vs internal)
 
 ## Tech Debt Registry
 - Active duplication tech debt -> `docs/TODO.md` (Cross-Service Duplication section)
@@ -69,7 +69,7 @@
 - ServiceClaims/UserClaims/JWKS/JwtValidator to common::jwt -> `crates/common/src/jwt.rs`
 - TestKeypair + JWKS mock to mc-test-utils -> `crates/mc-test-utils/src/jwt_test.rs`
 - MeetingTokenRequest/GuestTokenRequest/TokenResponse/ParticipantType/MeetingRole to common::meeting_token -> `crates/common/src/meeting_token.rs` (AC+GC re-export via `pub use`)
+- parse_statefulset_ordinal to common::config -> `crates/common/src/config.rs` (was duplicated in MC + MH; extracted 2026-04-01)
 
-## Infrastructure & Integration Seams
-- Common crate as extraction target -> `crates/common/src/`
-- JWT thin wrapper pattern (GC + MC) -> `crates/{gc,mc}-service/src/auth/`
+## Integration Seams
+- Common crate as extraction target -> `crates/common/src/` (jwt, config, meeting_token, secret, token_manager)

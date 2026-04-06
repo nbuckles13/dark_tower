@@ -464,8 +464,14 @@ async fn test_mc_webtransport_connect_and_join() {
         .await
         .expect("Should join meeting via GC");
 
-    // Step 2: Connect to MC via WebTransport
-    let conn = connect_mc(cluster.mc_webtransport_url()).await;
+    // Step 2: Connect to the assigned MC pod via WebTransport.
+    // Use the pod-specific endpoint from GC's join response (per-pod StatefulSet routing).
+    let mc_url = gc_join
+        .mc_assignment
+        .webtransport_endpoint
+        .as_ref()
+        .expect("MC assignment should include webtransport_endpoint");
+    let conn = connect_mc(mc_url).await;
 
     // Step 3: Send JoinRequest with the meeting token from GC
     let response = send_join_and_read_response(
@@ -596,8 +602,13 @@ async fn test_second_participant_receives_join_notification() {
         .await
         .expect("User 2 should join meeting via GC");
 
-    // Step 4: User 1 connects to MC and joins
-    let conn1 = connect_mc(cluster.mc_webtransport_url()).await;
+    // Step 4: User 1 connects to assigned MC pod via WebTransport
+    let mc_url1 = gc_join1
+        .mc_assignment
+        .webtransport_endpoint
+        .as_ref()
+        .expect("MC assignment should include webtransport_endpoint");
+    let conn1 = connect_mc(mc_url1).await;
     let (mut send1, mut recv1) = conn1
         .open_bi()
         .await
@@ -638,8 +649,13 @@ async fn test_second_participant_receives_join_notification() {
         response1.message
     );
 
-    // Step 5: User 2 connects to MC and joins
-    let conn2 = connect_mc(cluster.mc_webtransport_url()).await;
+    // Step 5: User 2 connects to assigned MC pod via WebTransport
+    let mc_url2 = gc_join2
+        .mc_assignment
+        .webtransport_endpoint
+        .as_ref()
+        .expect("MC assignment should include webtransport_endpoint");
+    let conn2 = connect_mc(mc_url2).await;
     let response2 =
         send_join_and_read_response(&conn2, &meeting_id_str, &gc_join2.token, &user2_name).await;
 

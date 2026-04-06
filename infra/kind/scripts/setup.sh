@@ -480,7 +480,8 @@ deploy_mc_service() {
     kubectl apply -k "${PROJECT_ROOT}/infra/kubernetes/overlays/kind/services/mc-service/"
 
     log_info "Waiting for Meeting Controller to be ready..."
-    kubectl rollout status deployment/mc-service -n dark-tower --timeout=180s
+    kubectl rollout status deployment/mc-0 -n dark-tower --timeout=180s
+    kubectl rollout status deployment/mc-1 -n dark-tower --timeout=180s
 
     log_info "Meeting Controller deployed successfully."
 }
@@ -534,7 +535,8 @@ deploy_mh_service() {
     kubectl apply -k "${PROJECT_ROOT}/infra/kubernetes/overlays/kind/services/mh-service/"
 
     log_info "Waiting for Media Handler to be ready..."
-    kubectl rollout status deployment/mh-service -n dark-tower --timeout=180s
+    kubectl rollout status deployment/mh-0 -n dark-tower --timeout=180s
+    kubectl rollout status deployment/mh-1 -n dark-tower --timeout=180s
 
     log_info "Media Handler deployed successfully."
 }
@@ -597,19 +599,21 @@ print_access_info() {
     echo "    gRPC: localhost:50051 (cluster-internal)"
     echo "    Status: Running in-cluster (2 replicas)"
     echo ""
-    echo "  MC Service (Meeting Controller):"
-    echo "    WebTransport: https://localhost:4433 (QUIC/UDP via NodePort)"
+    echo "  MC Service (Meeting Controller) — 2 per-instance Deployments:"
+    echo "    WebTransport (per-pod, QUIC/UDP via NodePort):"
+    echo "      mc-service-0: https://localhost:4433"
+    echo "      mc-service-1: https://localhost:4435"
     echo "    gRPC: localhost:50052 (cluster-internal)"
     echo "    Health: localhost:8081 (cluster-internal)"
     echo "    TLS: Self-signed (CA at infra/docker/certs/ca.crt)"
-    echo "    Status: Running in-cluster (2 replicas)"
     echo ""
-    echo "  MH Service (Media Handler):"
-    echo "    WebTransport: https://localhost:4434 (QUIC/UDP via NodePort)"
+    echo "  MH Service (Media Handler) — 2 per-instance Deployments:"
+    echo "    WebTransport (per-pod, QUIC/UDP via NodePort):"
+    echo "      mh-service-0: https://localhost:4434"
+    echo "      mh-service-1: https://localhost:4436"
     echo "    gRPC: localhost:50053 (cluster-internal)"
     echo "    Health: http://localhost:8083"
     echo "    TLS: Self-signed (CA at infra/docker/certs/ca.crt)"
-    echo "    Status: Running in-cluster (2 replicas)"
     echo ""
     echo "  Grafana:"
     echo "    URL: http://localhost:3000"
@@ -662,9 +666,11 @@ print_access_info() {
     echo "  - Navigate to Dashboards > AC Service"
     echo "  - Or Explore > Loki for logs"
     echo ""
-    echo "Restart In-Cluster AC:"
+    echo "Restart In-Cluster Services:"
     echo ""
     echo "  kubectl rollout restart statefulset/ac-service -n dark-tower"
+    echo "  kubectl rollout restart deployment/mc-0 deployment/mc-1 -n dark-tower"
+    echo "  kubectl rollout restart deployment/mh-0 deployment/mh-1 -n dark-tower"
     echo ""
     echo "To tear down:"
     echo "  ./infra/kind/scripts/teardown.sh"

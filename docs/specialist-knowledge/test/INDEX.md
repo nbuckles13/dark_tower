@@ -42,7 +42,7 @@
 - Meeting/guest token validation (wiremock + Ed25519) -> `crates/mc-service/src/auth/mod.rs:tests::test_validate_*_token_*`
 - Token confusion (bidirectional: meeting-as-guest, guest-as-meeting, wrong token_type) -> `crates/mc-service/src/auth/mod.rs:tests`
 - From<JwtError> for McError (7 variants, ServiceUnavailable->Internal) -> `crates/mc-service/src/errors.rs:tests::test_jwt_error_to_mc_error_*`
-- Config tests (env vars, TLS paths, JWKS scheme, advertise addresses) -> `crates/mc-service/src/config.rs:tests`
+- Config tests (env vars, TLS paths, JWKS scheme, advertise addresses, StatefulSet ordinal parsing) -> `crates/mc-service/src/config.rs:tests`
 - Controller actor tests -> `crates/mc-service/src/actors/controller.rs:tests`
 - Meeting actor tests (join, leave, reconnect, mute, grace period) -> `crates/mc-service/src/actors/meeting.rs:tests`
 - ParticipantActor tests (spawn, send, ping, close, stream wiring) -> `crates/mc-service/src/actors/participant.rs:tests`
@@ -58,18 +58,18 @@
 - Mock GC server (gRPC seam) -> `crates/mc-test-utils/src/mock_gc.rs`
 
 ## Code Locations: MH Service
-- Config tests (env vars, defaults, TLS, debug redaction, advertise addresses) -> `crates/mh-service/src/config.rs:tests`
+- Config tests (env vars, defaults, TLS, debug redaction, advertise addresses, StatefulSet ordinal parsing) -> `crates/mh-service/src/config.rs:tests`
 - Error tests (labels, status codes, client messages) -> `crates/mh-service/src/errors.rs:tests`
 - Auth interceptor tests (Bearer, size limits) -> `crates/mh-service/src/grpc/auth_interceptor.rs:tests`
 - Health state & router tests -> `crates/mh-service/src/observability/health.rs:tests`
 - GC integration tests (registration, load reports, NOT_FOUND) -> `crates/mh-service/tests/gc_integration.rs`
-- MH infra (manifests, Kind overlay, Dockerfile) -> `infra/services/mh-service/`, `infra/docker/mh-service/`
 
 ## Code Locations: Environment Tests
-- Cluster bootstrap + fixtures → `crates/env-tests/src/`, flows (20-24) → `crates/env-tests/tests/`
+- Cluster bootstrap + fixtures → `crates/env-tests/src/`; flows → `crates/env-tests/tests/`; join flow → `24_join_flow.rs`
+- **Pattern: pod-specific WebTransport** — positive join tests use `gc_join.mc_assignment.webtransport_endpoint` (per-pod StatefulSet URL); negative tests use `cluster.mc_webtransport_url()` (pod-0 only)
 
 ## Code Locations: Common & Infrastructure
 - JWT (claims, JwtError, JwksClient, JwtValidator, round-trip tests) -> `crates/common/src/jwt.rs`
 - Shared meeting token types (GC<->AC contract, serde, defaults) -> `crates/common/src/meeting_token.rs:tests`
-- MC/MH K8s health probes → `infra/services/{mc,mh}-service/deployment.yaml`
-- Dev certs (AC, MC, MH), Kind setup, Kustomize guard → `scripts/generate-dev-certs.sh`, `infra/kind/scripts/setup.sh`, `scripts/guards/simple/validate-kustomize.sh`
+- MC/MH StatefulSet, per-pod NodePort Services, Kind port mappings (MC 4433/4435, MH 4434/4436) → `infra/services/{mc,mh}-service/`, `infra/kind/kind-config.yaml`
+- Dev certs, Kind setup, Kustomize guard → `scripts/generate-dev-certs.sh`, `infra/kind/scripts/setup.sh`

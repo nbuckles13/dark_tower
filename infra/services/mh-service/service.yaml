@@ -1,3 +1,5 @@
+# ClusterIP Service — for internal gRPC and health access.
+# WebTransport is NOT exposed here; clients use per-pod NodePort Services.
 apiVersion: v1
 kind: Service
 metadata:
@@ -7,11 +9,7 @@ metadata:
     app: mh-service
     component: media
 spec:
-  # NodePort to expose WebTransport UDP via Kind port mapping (hostPort 4434 -> nodePort 30434).
-  # TCP NodePorts are pinned but NOT mapped in kind-config.yaml, so they are not reachable
-  # from the host. Only WebTransport (UDP 30434) is host-accessible. NetworkPolicy still
-  # restricts gRPC ingress to mc-service pods at the cluster level.
-  type: NodePort
+  type: ClusterIP
   selector:
     app: mh-service
     component: media
@@ -20,16 +18,61 @@ spec:
     protocol: TCP
     port: 8083
     targetPort: 8083
-    nodePort: 30083
   - name: grpc
     protocol: TCP
     port: 50053
     targetPort: 50053
-    nodePort: 30053
-  # WebTransport QUIC/UDP — NodePort 30434 mapped to host 4434 in Kind config
+  sessionAffinity: None
+---
+# Per-instance NodePort Services for WebTransport (QUIC/UDP).
+# Each MH instance (Deployment) gets its own host-reachable port via Kind port mapping.
+# Changing instance count requires adding/removing these Services + Kind port mappings
+# + per-instance Deployments and ConfigMaps.
+#
+# mh-0: hostPort 4434 → nodePort 30434 → pod mh-0 port 4434
+apiVersion: v1
+kind: Service
+metadata:
+  name: mh-service-0
+  namespace: dark-tower
+  labels:
+    app: mh-service
+    component: media
+    instance: mh-0
+spec:
+  type: NodePort
+  selector:
+    app: mh-service
+    component: media
+    instance: mh-0
+  ports:
   - name: webtransport
     protocol: UDP
     port: 4434
     targetPort: 4434
     nodePort: 30434
+  sessionAffinity: None
+---
+# mh-1: hostPort 4436 → nodePort 30436 → pod mh-1 port 4434
+apiVersion: v1
+kind: Service
+metadata:
+  name: mh-service-1
+  namespace: dark-tower
+  labels:
+    app: mh-service
+    component: media
+    instance: mh-1
+spec:
+  type: NodePort
+  selector:
+    app: mh-service
+    component: media
+    instance: mh-1
+  ports:
+  - name: webtransport
+    protocol: UDP
+    port: 4434
+    targetPort: 4434
+    nodePort: 30436
   sessionAffinity: None

@@ -25,14 +25,26 @@ nodes:
       - containerPort: 30080
         hostPort: 3100
         protocol: TCP
-      # MC WebTransport (QUIC/UDP) — requires NodePort 30433 on mc-service Service
+      # MC/MH WebTransport (QUIC/UDP) — per-instance NodePorts.
+      # Each MC/MH instance has its own Deployment + NodePort Service.
+      # Changing instance count requires updating these mappings + per-instance manifests.
       # Note: Kind UDP support is best-effort; use port-forward as fallback
+      #
+      # MC-0: hostPort 4433 → nodePort 30433
       - containerPort: 30433
         hostPort: 4433
         protocol: UDP
-      # MH WebTransport (QUIC/UDP) — requires NodePort 30434 on mh-service Service
+      # MC-1: hostPort 4435 → nodePort 30435
+      - containerPort: 30435
+        hostPort: 4435
+        protocol: UDP
+      # MH-0: hostPort 4434 → nodePort 30434
       - containerPort: 30434
         hostPort: 4434
+        protocol: UDP
+      # MH-1: hostPort 4436 → nodePort 30436
+      - containerPort: 30436
+        hostPort: 4436
         protocol: UDP
 
 # Use containerd as the container runtime

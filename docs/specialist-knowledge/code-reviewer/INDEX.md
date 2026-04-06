@@ -36,7 +36,7 @@
 - `From<JwtError> for McError` → `crates/mc-service/src/errors.rs`
 - JWT validator + token type enforcement → `crates/mc-service/src/auth/mod.rs:McJwtValidator`
 - gRPC auth interceptor (structural) → `crates/mc-service/src/grpc/auth_interceptor.rs:McAuthInterceptor`
-- Config (ac_jwks_url, advertise addresses) → `crates/mc-service/src/config.rs:Config`
+- Config (ac_jwks_url, advertise addresses, ordinal parsing) → `crates/mc-service/src/config.rs:Config`, `parse_statefulset_ordinal()`
 - Startup wiring (JwksClient + McJwtValidator) → `crates/mc-service/src/main.rs:168-189`
 - WebTransport server (accept loop) → `crates/mc-service/src/webtransport/server.rs:WebTransportServer::accept_loop()`
 - Connection handler (join flow) → `crates/mc-service/src/webtransport/connection.rs:handle_connection()`
@@ -44,10 +44,10 @@
 - Dashboard + alerts (join panels, Traffic/Security stat rows) → `infra/grafana/dashboards/mc-overview.json`, `infra/docker/prometheus/rules/mc-alerts.yaml`
 - Metrics catalog → `docs/observability/metrics/mc-service.md`
 - Health probes (liveness/readiness) → `crates/mc-service/src/observability/health.rs:health_router()`
-- MC K8s deployment (probes on port 8081) → `infra/services/mc-service/deployment.yaml`
+- MC K8s StatefulSet (probes on port 8081, per-pod NodePort) → `infra/services/mc-service/statefulset.yaml`, `service.yaml`
 
 ## Code Locations — MH Service
-- Config (env vars, SecretString, Debug redaction, advertise addresses) → `crates/mh-service/src/config.rs:Config`
+- Config (env vars, SecretString, Debug redaction, advertise addresses, ordinal parsing) → `crates/mh-service/src/config.rs:Config`, `parse_statefulset_ordinal()`
 - Error type (thiserror, bounded labels) → `crates/mh-service/src/errors.rs:MhError`
 - GC client (RegisterMH, SendLoadReport, re-registration) → `crates/mh-service/src/grpc/gc_client.rs:GcClient`
 - gRPC stub service (MC→MH: Register, RouteMedia, StreamTelemetry) → `crates/mh-service/src/grpc/mh_service.rs:MhMediaService`
@@ -56,7 +56,7 @@
 - Health probes (liveness/readiness, port 8083) → `crates/mh-service/src/observability/health.rs:health_router()`
 - Metrics (mh_ prefix, SLO-aligned buckets) → `crates/mh-service/src/observability/metrics.rs:init_metrics_recorder()`
 - Metrics catalog + dashboard → `docs/observability/metrics/mh-service.md`, `infra/grafana/dashboards/mh-overview.json`
-- K8s deployment (probes on 8083, TLS vol, UDP 4434) → `infra/services/mh-service/deployment.yaml`
+- K8s StatefulSet (probes on 8083, TLS vol, UDP 4434, per-pod NodePort) → `infra/services/mh-service/statefulset.yaml`, `service.yaml`
 - Dockerfile (cargo-chef, protobuf-compiler, distroless) → `infra/docker/mh-service/Dockerfile`
 - NetworkPolicy (MC gRPC ingress, client UDP, GC/AC egress) → `infra/services/mh-service/network-policy.yaml`
 
@@ -69,7 +69,7 @@
 ## Infrastructure & Guards
 - Standard health endpoints (`/health`, `/ready`) → ADR-0012 (Section: Standard Operational Endpoints)
 - MC+MH TLS cert generation → `scripts/generate-dev-certs.sh`
-- Kind config (MC UDP 4433, MH UDP 4434) + setup → `infra/kind/kind-config.yaml`, `infra/kind/scripts/setup.sh`
+- Kind config (per-pod UDP: MC 4433/4435, MH 4434/4436) + setup → `infra/kind/kind-config.yaml`, `infra/kind/scripts/setup.sh`
 - Service bases + Kind overlay → `infra/services/*/kustomization.yaml`, `infra/kubernetes/overlays/kind/`
 - Guard runner → `scripts/guards/run-guards.sh`; Review protocol → `.claude/skills/devloop/review-protocol.md`
 - Guards: Kustomize (R-15–R-20) → `scripts/guards/simple/validate-kustomize.sh`; App metrics → `validate-application-metrics.sh`
