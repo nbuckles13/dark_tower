@@ -1,27 +1,27 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: mh-service
+  name: mh-1
   namespace: dark-tower
   labels:
     app: mh-service
     component: media
+    instance: mh-1
 spec:
-  replicas: 2
+  replicas: 1
   strategy:
     type: RollingUpdate
-    rollingUpdate:
-      maxSurge: 1
-      maxUnavailable: 0
   selector:
     matchLabels:
       app: mh-service
       component: media
+      instance: mh-1
   template:
     metadata:
       labels:
         app: mh-service
         component: media
+        instance: mh-1
     spec:
       terminationGracePeriodSeconds: 35
       securityContext:
@@ -99,17 +99,21 @@ spec:
             secretKeyRef:
               name: mh-service-secrets
               key: MH_CLIENT_SECRET
-        # Pod IP for advertise addresses (downward API)
+        # Pod IP for gRPC advertise address (downward API)
         - name: POD_IP
           valueFrom:
             fieldRef:
               apiVersion: v1
               fieldPath: status.podIP
-        # Advertise addresses for GC registration (pod-specific, not from configmap)
+        # gRPC advertise address uses pod IP (cluster-internal, unchanged)
         - name: MH_GRPC_ADVERTISE_ADDRESS
           value: "grpc://$(POD_IP):50053"
+        # Per-instance explicit WebTransport advertise address from instance ConfigMap
         - name: MH_WEBTRANSPORT_ADVERTISE_ADDRESS
-          value: "https://$(POD_IP):4434"
+          valueFrom:
+            configMapKeyRef:
+              name: mh-1-config
+              key: MH_WEBTRANSPORT_ADVERTISE_ADDRESS
         - name: RUST_LOG
           value: "info,mh_service=debug"
         resources:

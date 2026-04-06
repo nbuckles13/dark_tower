@@ -188,7 +188,14 @@ impl ClusterConnection {
         self.check_gc_health().await.is_ok()
     }
 
-    /// Get the MC WebTransport URL.
+    /// Get the MC WebTransport URL for pod-0 (`mc-service-0`).
+    ///
+    /// This returns a hardcoded URL for pod-0 (port 4433). For positive join
+    /// flow tests, use the pod-specific `webtransport_endpoint` from the GC
+    /// join response instead, since GC may assign the meeting to any MC pod.
+    ///
+    /// This method is appropriate for negative tests (e.g., invalid token
+    /// rejection) that don't go through GC join and just need any MC pod.
     ///
     /// MC availability cannot be probed at initialization time because MC
     /// uses QUIC (UDP), not TCP. Tests that require MC should attempt to

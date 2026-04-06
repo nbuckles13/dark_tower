@@ -19,16 +19,17 @@
 - Kind cluster config + setup script → `infra/kind/kind-config.yaml`, `infra/kind/scripts/setup.sh`
 - Kind overlay (top-level, per-service, observability) → `infra/kubernetes/overlays/kind/`
 - Per-service Kustomize bases → `infra/services/{ac,gc,mc,mh}-service/kustomization.yaml`
-- Per-service manifests (deployment, netpol, PDB) → `infra/services/{ac,gc,mc,mh}-service/`
+- Per-service manifests (statefulset/deployment, netpol, PDB) → `infra/services/{ac,gc,mc,mh}-service/`
 - Dockerfiles → `infra/docker/{ac,gc,mc,mh}-service/Dockerfile`
 - PostgreSQL + Redis Kustomize bases → `infra/services/postgres/`, `infra/services/redis/`
 - Alert rules → `infra/docker/prometheus/rules/{gc,mc}-alerts.yaml`
 - Dev certs (AC, MC, MH WebTransport) → `scripts/generate-dev-certs.sh`
-- MC/MH TLS secrets (imperative, setup.sh) + UDP NodePorts (MC=30433, MH=30434) in `kind-config.yaml`
-- setup.sh deploy order: AC → GC → MC → MH (MH after GC — required for GC registration)
-- setup.sh MH: `create_mh_secrets()`, `create_mh_tls_secret()`, `deploy_mh_service()`
+- MC/MH TLS secrets (imperative, setup.sh); per-pod UDP NodePorts via Kind port formula: `base + ordinal*2` (MC: 4433/4435, MH: 4434/4436) in `kind-config.yaml`
+- setup.sh deploy order: AC → GC → MC → MH; MH functions: `create_mh_secrets()`, `create_mh_tls_secret()`, `deploy_mh_service()`
 - Cross-service netpol: GC allows MH on 50051, MC allows MH on 50053 → `gc-service/network-policy.yaml`, `mc-service/network-policy.yaml`
-- Downward API pattern: `status.podIP` → `POD_IP` env → `$(POD_IP)` interpolation in advertise addresses (MC/MH deployment.yaml); NOT in configmaps (per-pod values)
+- MC/MH are StatefulSets with per-pod NodePort Services (`statefulset.kubernetes.io/pod-name` selector) + headless Service (`clusterIP: None`)
+- Downward API: `status.podIP` → `POD_IP` for gRPC advertise; WebTransport advertise computed from HOSTNAME ordinal via `*_WEBTRANSPORT_ADVERTISE_HOST` configmap key
+- Scaling replicas requires: add/remove per-pod Services, update Kind port mappings (no code changes needed)
 
 ## Runbooks
 - Per-service incident/deployment → `docs/runbooks/` (ac, gc, mc)

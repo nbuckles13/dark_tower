@@ -51,12 +51,14 @@
 
 ## TLS & Certificates
 - Dev cert generation (ECDSA P-256 CA, MC + MH certs) → `scripts/generate-dev-certs.sh`
-- MC/MH TLS volume mounts (defaultMode 0400) → `infra/services/{mc,mh}-service/deployment.yaml`
+- MC/MH TLS volume mounts (defaultMode 0400) → `infra/services/{mc,mh}-service/{mc,mh}-{0,1}-deployment.yaml`
 - WebTransport UDP ingress + Kind mapping → `infra/services/{mc,mh}-service/network-policy.yaml`, `infra/kind/kind-config.yaml`
 
 ## Advertise Addresses (MC + MH → GC Registration)
-- Config-based advertise addresses (non-secret) → `{mc,mh}-service/src/config.rs` + K8s downward API `status.podIP` in deployment.yaml
-- Used in `gc_client.rs:register()` + `attempt_reregistration()` — replaces old hardcoded `format!()`/`.replace()` pattern
+- gRPC advertise: K8s downward API `status.podIP` in per-instance deployment.yaml (non-secret)
+- WebTransport advertise: explicit per-instance `*_WEBTRANSPORT_ADVERTISE_ADDRESS` env var from per-instance ConfigMap (no ordinal computation in Rust)
+- Per-instance NodePort Services (`mc-service-{0,1}`, `mh-service-{0,1}`) expose only UDP WebTransport — no gRPC/health/TCP
+- Used in `gc_client.rs:register()` + `attempt_reregistration()`
 
 ## Infrastructure Secrets & Network Isolation
 - Imperative secret creation → `setup.sh:create_ac_secrets()`, `create_mc_tls_secret()`, `create_mh_secrets()`, `create_mh_tls_secret()`
@@ -64,12 +66,10 @@
 - Kind overlay (no secrets) + supporting infra → `infra/kubernetes/overlays/kind/`, `infra/services/{postgres,redis}/`
 
 ## Health, Probes & Integration Seams
-- MC/MH health + K8s probes → `crates/mc-service/src/observability/health.rs` (+ mh), `infra/services/mc-service/deployment.yaml` (+ mh)
+- MC/MH health + K8s probes → `crates/mc-service/src/observability/health.rs` (+ mh), `infra/services/mc-service/mc-{0,1}-deployment.yaml` (+ mh)
 - AC JWKS → common `JwksClient` → GC/MC `JwtValidator` (meeting/guest tokens via WebTransport)
 - gRPC service token chain: GC→MC (`mc/.../auth_interceptor.rs`) → MC→MH (`mh/.../auth_interceptor.rs`)
 - Credential leak guards → `scripts/guards/simple/no-secrets-in-logs.sh`
 - Kustomize security guards (R-18, R-19) → `scripts/guards/simple/validate-kustomize.sh`
-
 ## Test Coverage (Security-Relevant)
-- MC join tests (JWT, error opacity) → `crates/mc-service/tests/join_tests.rs` | JWT fixtures → `crates/mc-test-utils/src/jwt_test.rs`
-- GC join tests (service token rejection, home_org_id regression) → `crates/gc-service/tests/meeting_tests.rs`
+- MC join + GC join tests → `crates/mc-service/tests/join_tests.rs`, `crates/gc-service/tests/meeting_tests.rs`

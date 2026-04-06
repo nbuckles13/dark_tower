@@ -1,0 +1,172 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mc-0
+  namespace: dark-tower
+  labels:
+    app: mc-service
+    component: signaling
+    instance: mc-0
+spec:
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      app: mc-service
+      component: signaling
+      instance: mc-0
+  template:
+    metadata:
+      labels:
+        app: mc-service
+        component: signaling
+        instance: mc-0
+    spec:
+      terminationGracePeriodSeconds: 35
+      securityContext:
+        runAsNonRoot: true
+        # Match distroless nonroot user (uid 65532)
+        runAsUser: 65532
+        fsGroup: 65532
+      containers:
+      - name: mc-service
+        image: localhost/mc-service:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - name: grpc
+          containerPort: 50052
+          protocol: TCP
+        - name: health
+          containerPort: 8081
+          protocol: TCP
+        - name: webtransport
+          containerPort: 4433
+          protocol: UDP
+        env:
+        - name: MC_GRPC_BIND_ADDRESS
+          valueFrom:
+            configMapKeyRef:
+              name: mc-service-config
+              key: MC_GRPC_BIND_ADDRESS
+        - name: MC_HEALTH_BIND_ADDRESS
+          valueFrom:
+            configMapKeyRef:
+              name: mc-service-config
+              key: MC_HEALTH_BIND_ADDRESS
+        - name: MC_WEBTRANSPORT_BIND_ADDRESS
+          valueFrom:
+            configMapKeyRef:
+              name: mc-service-config
+              key: MC_WEBTRANSPORT_BIND_ADDRESS
+        - name: MC_REGION
+          valueFrom:
+            configMapKeyRef:
+              name: mc-service-config
+              key: MC_REGION
+        - name: GC_GRPC_URL
+          valueFrom:
+            configMapKeyRef:
+              name: mc-service-config
+              key: GC_GRPC_URL
+        - name: AC_JWKS_URL
+          valueFrom:
+            configMapKeyRef:
+              name: mc-service-config
+              key: AC_JWKS_URL
+        - name: REDIS_URL
+          valueFrom:
+            secretKeyRef:
+              name: mc-service-secrets
+              key: REDIS_URL
+        - name: MC_BINDING_TOKEN_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: mc-service-secrets
+              key: MC_BINDING_TOKEN_SECRET
+        # OAuth 2.0 client credentials for AC authentication (ADR-0010)
+        - name: AC_ENDPOINT
+          value: "http://ac-service.dark-tower:8082"
+        - name: MC_CLIENT_ID
+          value: "meeting-controller"
+        - name: MC_CLIENT_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: mc-service-secrets
+              key: MC_CLIENT_SECRET
+        # TLS certificate paths for WebTransport (QUIC/HTTP3)
+        - name: MC_TLS_CERT_PATH
+          valueFrom:
+            configMapKeyRef:
+              name: mc-service-config
+              key: MC_TLS_CERT_PATH
+        - name: MC_TLS_KEY_PATH
+          valueFrom:
+            configMapKeyRef:
+              name: mc-service-config
+              key: MC_TLS_KEY_PATH
+        # Pod IP for gRPC advertise address (downward API)
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              apiVersion: v1
+              fieldPath: status.podIP
+        # gRPC advertise address uses pod IP (cluster-internal, unchanged)
+        - name: MC_GRPC_ADVERTISE_ADDRESS
+          value: "http://$(POD_IP):50052"
+        # Per-instance explicit WebTransport advertise address from instance ConfigMap
+        - name: MC_WEBTRANSPORT_ADVERTISE_ADDRESS
+          valueFrom:
+            configMapKeyRef:
+              name: mc-0-config
+              key: MC_WEBTRANSPORT_ADVERTISE_ADDRESS
+        - name: RUST_LOG
+          value: "info,mc_service=debug"
+        resources:
+          requests:
+            cpu: 200m
+            memory: 512Mi
+          limits:
+            cpu: 1000m
+            memory: 1Gi
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 65532
+          readOnlyRootFilesystem: true
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8081
+            scheme: HTTP
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 5
+          successThreshold: 1
+          failureThreshold: 3  # Restart after 30s of failures
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8081
+            scheme: HTTP
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 3
+          successThreshold: 1
+          failureThreshold: 3  # Remove from LB after 15s of failures
+        volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+        - name: mc-tls
+          mountPath: /etc/mc-tls
+          readOnly: true
+      volumes:
+      - name: tmp
+        emptyDir: {}
+      - name: mc-tls
+        secret:
+          secretName: mc-service-tls
+          defaultMode: 0400

@@ -3,7 +3,10 @@ kind: Kustomization
 
 resources:
   - configmap.yaml
-  - deployment.yaml
+  - mc-0-configmap.yaml
+  - mc-1-configmap.yaml
+  - mc-0-deployment.yaml
+  - mc-1-deployment.yaml
   - service.yaml
   - secret.yaml
   - pdb.yaml
