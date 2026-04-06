@@ -21,6 +21,8 @@ spec:
             readOnlyRootFilesystem: true
             runAsNonRoot: true
             allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
           env:
             - name: LABEL
               value: grafana_dashboard
@@ -40,6 +42,12 @@ spec:
       containers:
         - name: grafana
           image: grafana/grafana:10.2.2
+          securityContext:
+            readOnlyRootFilesystem: false  # Grafana needs writable home dir
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
           ports:
             - containerPort: 3000
           env:
