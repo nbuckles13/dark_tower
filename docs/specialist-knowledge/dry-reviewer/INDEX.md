@@ -24,8 +24,7 @@
 
 ## Per-Service Config Parsing
 - AC/GC/MC/MH config -> `crates/*/src/config.rs:Config::from_vars()` (per-service, not duplication)
-- Env-test cluster config -> `crates/env-tests/src/cluster.rs:ClusterPorts::from_env()` (reads `ENV_TEST_*_URL` vars; different domain from service config, not duplication)
-- URL-to-host:port decomposition -> `crates/env-tests/src/cluster.rs:parse_host_port()` (unique to env-tests, no equivalent elsewhere)
+- Env-test cluster config -> `crates/env-tests/src/cluster.rs:ClusterPorts::from_env()`, `parse_host_port()` (different domain from service config, not duplication)
 - Advertise addresses (MC + MH) -> gRPC uses POD_IP downward API; WebTransport uses ordinal-based port via `common::config::parse_statefulset_ordinal`
 - StatefulSet ordinal parsing -> `crates/common/src/config.rs:parse_statefulset_ordinal()` (shared, 5 tests)
 - Extraction candidate: `generate_instance_id(prefix)` -> 4-line pattern duplicated in GC + MC + MH config
@@ -52,11 +51,9 @@
 - AC/MC/MH use StatefulSet; GC uses Deployment -> `infra/services/*/statefulset.yaml` or `deployment.yaml`
 - MC/MH per-pod Services (WebTransport NodePort) -> `infra/services/{mc,mh}-service/service.yaml` (headless + ClusterIP + per-pod-0 + per-pod-1; port formula: `base + ordinal*2`)
 - Dockerfiles -> `infra/docker/{ac,gc,mc,mh}-service/Dockerfile` (cargo-chef multi-stage pattern)
-- Kind config (static, manual) -> `infra/kind/kind-config.yaml` (per-pod UDP, hardcoded ports)
-- Kind config (template, devloop) -> `infra/kind/kind-config.yaml.tmpl` (envsubst placeholders, ADR-0030)
+- Kind config (static + template) -> `infra/kind/kind-config.yaml`, `kind-config.yaml.tmpl` (per-pod UDP; template uses envsubst, ADR-0030)
 - Kind overlays -> `infra/kubernetes/overlays/kind/`
-- setup.sh (parameterized, ADR-0030) -> `infra/kind/scripts/setup.sh` (`load_image_to_kind()`, `deploy_only_service()`, DT_CLUSTER_NAME/DT_PORT_MAP, --yes/--only/--skip-build)
-- teardown.sh (parameterized) -> `infra/kind/scripts/teardown.sh` (DT_CLUSTER_NAME, context-aware pkill)
+- setup.sh + teardown.sh (parameterized, ADR-0030) -> `infra/kind/scripts/{setup,teardown}.sh` (`load_image_to_kind()`, `deploy_only_service()`, DT_CLUSTER_NAME/DT_PORT_MAP)
 - TLS certs -> `scripts/generate-dev-certs.sh`
 - Prometheus scrape targets -> `infra/kubernetes/observability/prometheus-config.yaml`
 
@@ -71,9 +68,7 @@
 - Active duplication tech debt -> `docs/TODO.md` (Cross-Service Duplication section)
 
 ## Successful Extractions & Integration Seams
-- Common crate (extraction target) -> `crates/common/src/` (jwt, config, meeting_token, secret, token_manager)
-- ServiceClaims/UserClaims/JWKS/JwtValidator to common::jwt -> `crates/common/src/jwt.rs`
+- Common crate (extraction target) -> `crates/common/src/` (jwt, config, meeting_token, secret, token_manager); ServiceClaims/UserClaims/JWKS/JwtValidator -> `jwt.rs`
 - TestKeypair + JWKS mock to mc-test-utils -> `crates/mc-test-utils/src/jwt_test.rs`
-- MeetingTokenRequest/GuestTokenRequest/TokenResponse/ParticipantType/MeetingRole to common::meeting_token -> `crates/common/src/meeting_token.rs` (AC+GC re-export via `pub use`)
-- parse_statefulset_ordinal to common::config -> `crates/common/src/config.rs` (was duplicated in MC + MH; extracted 2026-04-01)
+- MeetingToken types to common::meeting_token -> `crates/common/src/meeting_token.rs` (AC+GC re-export); parse_statefulset_ordinal -> `common/src/config.rs` (extracted from MC+MH)
 - load_image_to_kind to setup.sh helper -> `infra/kind/scripts/setup.sh:load_image_to_kind()`

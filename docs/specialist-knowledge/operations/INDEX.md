@@ -1,14 +1,10 @@
 # Operations Navigation
 
 ## Architecture & Design
-- Infrastructure architecture (Kind, Skaffold, zero-trust) → ADR-0012
-- Local development environment → ADR-0013
-- Environment integration tests → ADR-0014
-- Guard pipeline methodology → ADR-0015
-- Validation pipeline (CI gates) → ADR-0024
-- Containerized devloop execution → ADR-0025
+- Infrastructure architecture (Kind, zero-trust) → ADR-0012; Local dev → ADR-0013
+- Env integration tests → ADR-0014; Guard pipeline → ADR-0015; CI gates → ADR-0024
+- Containerized devloop → ADR-0025; Host-side cluster helper → ADR-0030
 - Dashboard metric presentation (counters vs rates) → ADR-0029
-- Host-side cluster helper for integration testing → ADR-0030
 
 ## CI & Guards
 - CI pipeline → `.github/workflows/ci.yml`
@@ -17,8 +13,6 @@
 - Application metrics guard → `scripts/guards/simple/validate-application-metrics.sh`
 
 ## Devloop Cluster Helper
-- Cluster helper binary (new) → `crates/devloop-helper/src/main.rs`
-- Dev-cluster client CLI (new) → `infra/devloop/dev-cluster`
 - Kind config template (envsubst, 18 port mappings) → `infra/kind/kind-config.yaml.tmpl`
 - Devloop wrapper → `infra/devloop/devloop.sh`, container image → `infra/devloop/Dockerfile`
 - Cluster helper design doc → `docs/debates/2026-04-05-devloop-cluster-sidecar.md`
@@ -27,23 +21,15 @@
 - URL parsing for health checks → `crates/env-tests/src/cluster.rs:parse_host_port()`
 
 ## Deployment & K8s
-- Kind cluster config + setup script → `infra/kind/kind-config.yaml`, `infra/kind/scripts/setup.sh`
-- Kind cluster teardown → `infra/kind/scripts/teardown.sh`
-- Kind overlay (top-level, per-service, observability) → `infra/kubernetes/overlays/kind/`
-- Per-service Kustomize bases → `infra/services/{ac,gc,mc,mh}-service/kustomization.yaml`
-- Per-service manifests (statefulset/deployment, netpol, PDB) → `infra/services/{ac,gc,mc,mh}-service/`
-- Dockerfiles → `infra/docker/{ac,gc,mc,mh}-service/Dockerfile`
-- PostgreSQL + Redis → `infra/services/postgres/`, `infra/services/redis/`
-- Alert rules → `infra/docker/prometheus/rules/{gc,mc}-alerts.yaml`
-- Dev certs (AC, MC, MH WebTransport) → `scripts/generate-dev-certs.sh`
-- MC/MH TLS secrets (imperative, setup.sh); per-pod UDP NodePorts via Kind port formula: `base + ordinal*2` (MC: 4433/4435, MH: 4434/4436) in `kind-config.yaml`
-- MC/MH per-pod NodePort Services → `infra/services/{mc,mh}-service/service.yaml`
-- setup.sh parameterization (ADR-0030) → `load_image_to_kind()`, `deploy_only_service()`, DT_CLUSTER_NAME/DT_PORT_MAP, --yes/--only/--skip-build
-- Cross-service netpol: GC allows MH on 50051, MC allows MH on 50053 → `gc-service/network-policy.yaml`, `mc-service/network-policy.yaml`
-- MC/MH are StatefulSets with per-pod NodePort Services (`statefulset.kubernetes.io/pod-name` selector) + headless Service (`clusterIP: None`)
-- Downward API: `status.podIP` → `POD_IP` for gRPC advertise; WebTransport advertise computed from HOSTNAME ordinal via `*_WEBTRANSPORT_ADVERTISE_HOST` configmap key
-- Port map: AC=8082, GC=8080/50051, MC=8081/50052/4433, MH=8083/50053/4434
-- Scaling replicas requires: add/remove per-pod Services, update Kind port mappings (no code changes needed)
+- Kind cluster: `infra/kind/kind-config.yaml`, `infra/kind/scripts/setup.sh` (ADR-0030: `load_image_to_kind()`, `deploy_only_service()`, --yes/--only/--skip-build), `infra/kind/scripts/teardown.sh`
+- Kind overlay (per-service, observability) → `infra/kubernetes/overlays/kind/`
+- Per-service Kustomize bases + manifests (statefulset/deployment, netpol, PDB) → `infra/services/ac-service/`, `gc-service/`, `mc-service/`, `mh-service/`
+- Dockerfiles → `infra/docker/ac-service/`, `gc-service/`, `mc-service/`, `mh-service/`; PostgreSQL + Redis → `infra/services/postgres/`, `redis/`
+- Dev certs → `scripts/generate-dev-certs.sh`; Alert rules → `infra/docker/prometheus/rules/gc-alerts.yaml`, `mc-alerts.yaml`
+- MC/MH: StatefulSets, per-pod NodePort Services (`statefulset.kubernetes.io/pod-name`), headless Service, TLS secrets (imperative via setup.sh)
+- Per-pod UDP NodePorts: `base + ordinal*2` (MC: 4433/4435, MH: 4434/4436); cross-service netpol in `gc-service/network-policy.yaml`, `mc-service/network-policy.yaml`
+- Downward API: `status.podIP` → `POD_IP`; WebTransport advertise from HOSTNAME ordinal
+- Port map: AC=8082, GC=8080/50051, MC=8081/50052/4433, MH=8083/50053/4434; scaling requires per-pod Services + Kind port mappings
 
 ## Runbooks
 - Per-service incident/deployment → `docs/runbooks/` (ac, gc, mc)
@@ -57,30 +43,22 @@
 - AC rate limits → `crates/ac-service/src/config.rs:parse_rate_limit_i64()`; Service auth → ADR-0003
 
 ## Observability
-- Observability Kustomize + Grafana → `infra/kubernetes/observability/`, `infra/grafana/dashboards/`
-- Dashboards + alerts → `infra/grafana/dashboards/`, `docs/observability/alerts.md`
-- Per-service metrics → `crates/{gc,mc,mh}-service/src/observability/metrics.rs`
-- Prometheus scrape config → `infra/docker/prometheus/prometheus.yml`
+- Observability Kustomize + Grafana → `infra/kubernetes/observability/`, `infra/grafana/dashboards/`; Alerts → `docs/observability/alerts.md`
+- Per-service metrics → `crates/gc-service/src/observability/metrics.rs`, `crates/mc-service/src/observability/metrics.rs`, `crates/mh-service/src/observability/metrics.rs`; Prometheus → `infra/docker/prometheus/prometheus.yml`
 
 ## MH Service
-- MH startup + config + health → `crates/mh-service/src/{main,config,observability/health}.rs`
+- MH startup + config + health → `crates/mh-service/src/main.rs`, `crates/mh-service/src/config.rs`, `crates/mh-service/src/observability/health.rs`
 - MH GC client → `crates/mh-service/src/grpc/gc_client.rs`
 - MH gRPC + auth → `crates/mh-service/src/grpc/mh_service.rs`, `auth_interceptor.rs`
 
 ## MC WebTransport + Actors
-- MC WebTransport → `crates/mc-service/src/webtransport/{server,connection}.rs`
+- MC WebTransport → `crates/mc-service/src/webtransport/server.rs`, `crates/mc-service/src/webtransport/connection.rs`
 - MC startup → `crates/mc-service/src/main.rs`
-- Actors → `crates/mc-service/src/actors/{controller,meeting,participant}.rs`
+- Actors → `crates/mc-service/src/actors/controller.rs`, `crates/mc-service/src/actors/meeting.rs`, `crates/mc-service/src/actors/participant.rs`
 
 ## GC Service
-- GC routes + handlers → `crates/gc-service/src/{routes/mod,handlers/meetings}.rs`
-
-## MC Join Integration Tests
-- MC join tests → `crates/mc-service/tests/join_tests.rs`
-- TestKeypair (Ed25519 + JWKS mock) → `crates/mc-test-utils/src/jwt_test.rs`
+- GC routes + handlers → `crates/gc-service/src/routes/mod.rs`, `crates/gc-service/src/handlers/meetings.rs`
 
 ## Tests
-- MC join tests → `crates/mc-service/tests/join_tests.rs`
-- TestKeypair → `crates/mc-test-utils/src/jwt_test.rs`
-- GC join tests → `crates/gc-service/tests/meeting_tests.rs`
-- Env-tests (Kind) → `crates/env-tests/`
+- MC join tests → `crates/mc-service/tests/join_tests.rs`; TestKeypair (Ed25519 + JWKS mock) → `crates/mc-test-utils/src/jwt_test.rs`
+- GC join tests → `crates/gc-service/tests/meeting_tests.rs`; Env-tests (Kind) → `crates/env-tests/`

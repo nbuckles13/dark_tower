@@ -27,10 +27,10 @@
 ## Code Locations: MC Service
 - Auth + token validation (meeting, guest, confusion tests) -> `crates/mc-service/src/auth/mod.rs:tests`
 - Config + error tests -> `crates/mc-service/src/config.rs:tests`, `crates/mc-service/src/errors.rs:tests`
-- Actor tests (controller, meeting, participant, session) -> `crates/mc-service/src/actors/{controller,meeting,participant,session}.rs:tests`
-- WebTransport tests (encoding, connection) -> `crates/mc-service/src/webtransport/{handler,connection}.rs:tests`
+- Actor tests (controller, meeting, participant, session) -> `crates/mc-service/src/actors/controller.rs:tests`, `meeting.rs`, `participant.rs`, `session.rs`
+- WebTransport tests (encoding, connection) -> `crates/mc-service/src/webtransport/handler.rs:tests`, `connection.rs`
 - GC integration + heartbeat tests -> `crates/mc-service/tests/gc_integration.rs`, `heartbeat_tasks.rs`
-- Health + metrics -> `crates/mc-service/src/observability/{health,metrics}.rs`
+- Health + metrics -> `crates/mc-service/src/observability/health.rs`, `metrics.rs`
 - Test utils (mock Redis, mock GC) -> `crates/mc-test-utils/src/mock_redis.rs`, `mock_gc.rs`
 
 ## Code Locations: MH Service
@@ -58,8 +58,6 @@
 - Image loading (podman/docker) → `infra/kind/scripts/setup.sh:load_image_to_kind()`
 - Env vars: DT_CLUSTER_NAME, DT_PORT_MAP → `infra/kind/scripts/setup.sh` (lines 37, 48-63)
 - Teardown with cluster name support → `infra/kind/scripts/teardown.sh`
-- Helper binary (to be added) → `crates/devloop-helper/src/main.rs`
-- dev-cluster client CLI (to be added) → `infra/devloop/dev-cluster`
 - Kind config template → `infra/kind/kind-config.yaml.tmpl`
 - Port map file → `~/.cache/devloop/devloop-{slug}/ports.json`
 - Cluster sidecar design doc (superseded) → `docs/debates/2026-04-05-devloop-cluster-sidecar.md`
@@ -67,6 +65,6 @@
 ## Code Locations: Common & Infrastructure
 - JWT (claims, JwtError, JwksClient, JwtValidator, round-trip tests) -> `crates/common/src/jwt.rs`
 - Shared meeting token types (GC<->AC contract, serde, defaults) -> `crates/common/src/meeting_token.rs:tests`
-- MC/MH StatefulSet, per-pod NodePort Services, Kind port mappings (MC 4433/4435, MH 4434/4436) → `infra/services/{mc,mh}-service/`, `infra/kind/kind-config.yaml`
+- MC/MH StatefulSet, per-pod NodePort Services, Kind port mappings (MC 4433/4435, MH 4434/4436) → `infra/services/mc-service/`, `mh-service/`, `infra/kind/kind-config.yaml`
 - Dev certs → `scripts/generate-dev-certs.sh`
 - Kind setup (--yes, --only, --skip-build flags) → `infra/kind/scripts/setup.sh`

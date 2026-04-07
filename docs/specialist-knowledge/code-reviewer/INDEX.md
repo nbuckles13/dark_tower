@@ -69,8 +69,6 @@
 - Standard health endpoints (`/health`, `/ready`) → ADR-0012 (Section: Standard Operational Endpoints)
 - MC+MH TLS cert generation → `scripts/generate-dev-certs.sh`
 - Env-tests cluster module → `crates/env-tests/src/cluster.rs`
-- Kind config (per-pod UDP: MC 4433/4435, MH 4434/4436) + setup → `infra/kind/kind-config.yaml`, `infra/kind/scripts/setup.sh`
-- Kind cluster setup (parameterized: ADR-0030) → `infra/kind/kind-config.yaml`, `scripts/setup.sh`, `scripts/teardown.sh`; key fns: `load_image_to_kind()`, `deploy_only_service()`
-- Kind config template (dynamic ports, envsubst) → `infra/kind/kind-config.yaml.tmpl`; Host-side cluster helper → ADR-0030
+- Kind cluster (ADR-0030): config template (`kind-config.yaml.tmpl`, envsubst, per-pod UDP), `infra/kind/scripts/setup.sh` (`load_image_to_kind()`, `deploy_only_service()`), `infra/kind/scripts/teardown.sh`
 - Service bases + Kind overlay → `infra/services/*/kustomization.yaml`, `infra/kubernetes/overlays/kind/`
 - Guards: runner → `scripts/guards/run-guards.sh`; Kustomize (R-15–R-20) → `validate-kustomize.sh`; App metrics → `validate-application-metrics.sh`

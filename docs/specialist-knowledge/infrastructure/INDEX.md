@@ -39,7 +39,6 @@
 - Cluster teardown -> `infra/kind/scripts/teardown.sh`
 - Skaffold dev workflow -> `infra/skaffold.yaml`
 - Containerized devloop -> `infra/devloop/devloop.sh`
-- Cluster helper binary (host-side) -> `crates/devloop-helper/src/main.rs` (new, ADR-0030)
 - dev-cluster client CLI -> `infra/devloop/dev-cluster` (new, ADR-0030)
 - Cluster sidecar design (superseded by ADR-0030) -> `docs/debates/2026-04-05-devloop-cluster-sidecar.md`
 - Docker Compose (local tests) -> `docker-compose.test.yml`
