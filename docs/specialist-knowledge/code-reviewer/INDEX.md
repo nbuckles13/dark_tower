@@ -4,6 +4,7 @@
 - Actor handle/task separation → ADR-0001 (Section: Pattern)
 - No-panic policy, `#[expect]` over `#[allow]` → ADR-0002
 - Error handling, service-layer wrapping → ADR-0003
+- Host-side cluster helper → ADR-0030
 - Observability naming, label cardinality, SLO targets → ADR-0011
 - Dashboard metric presentation (counters vs rates, $__rate_interval) → ADR-0029
 - Guard pipeline methodology → ADR-0015
@@ -31,9 +32,7 @@
 - Metrics/dashboard/alerts → `observability/metrics.rs`, `docs/observability/metrics/gc-service.md`, `infra/grafana/dashboards/gc-overview.json`
 
 ## Code Locations — MC Service
-- Error type reference → `crates/mc-service/src/errors.rs:McError`
-- Error type labels (bounded cardinality) → `crates/mc-service/src/errors.rs:error_type_label()`
-- `From<JwtError> for McError` → `crates/mc-service/src/errors.rs`
+- Error type (McError, bounded labels, From<JwtError>) → `crates/mc-service/src/errors.rs`
 - JWT validator + token type enforcement → `crates/mc-service/src/auth/mod.rs:McJwtValidator`
 - gRPC auth interceptor (structural) → `crates/mc-service/src/grpc/auth_interceptor.rs:McAuthInterceptor`
 - Config (ac_jwks_url, advertise addresses, ordinal parsing) → `crates/mc-service/src/config.rs:Config`, `parse_statefulset_ordinal()`
@@ -69,6 +68,7 @@
 ## Infrastructure & Guards
 - Standard health endpoints (`/health`, `/ready`) → ADR-0012 (Section: Standard Operational Endpoints)
 - MC+MH TLS cert generation → `scripts/generate-dev-certs.sh`
+- Env-tests cluster module → `crates/env-tests/src/cluster.rs`
 - Kind config (per-pod UDP: MC 4433/4435, MH 4434/4436) + setup → `infra/kind/kind-config.yaml`, `infra/kind/scripts/setup.sh`
 - Service bases + Kind overlay → `infra/services/*/kustomization.yaml`, `infra/kubernetes/overlays/kind/`
 - Guard runner → `scripts/guards/run-guards.sh`; Review protocol → `.claude/skills/devloop/review-protocol.md`

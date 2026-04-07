@@ -59,7 +59,7 @@
 - Alerts doc → `docs/observability/alerts.md` | Dashboards doc → `docs/observability/dashboards.md`
 
 ## E2E Env-Tests (`crates/env-tests/`)
-- Cluster infra → `src/cluster.rs:ClusterConnection` (ports: AC 8082, GC 8080, MC WT 4433)
+- Cluster infra → `src/cluster.rs:ClusterConnection`, `ClusterPorts::from_env()`, `parse_host_port()`
 - Auth/GC fixtures → `src/fixtures/auth_client.rs`, `gc_client.rs`
 - Join flow E2E → `tests/24_join_flow.rs` (Tier 1: GC-level + Tier 2: MC WebTransport)
 - Wire format helpers: `encode_framed` / `read_server_message` (4-byte BE prefix)

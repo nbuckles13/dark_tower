@@ -31,7 +31,7 @@
 
 - [ ] **AC org provisioning endpoint**: Add an admin/internal API to AC for creating organizations. Env-tests should create their own test org via this endpoint instead of depending on pre-seeded data in `infra/docker/postgres/init.sql`.
 - [ ] **Remove init.sql seed data**: Once the AC provisioning endpoint exists, remove the `devtest` org/user seed logic from `infra/docker/postgres/init.sql` and update env-tests (20, 21, 23) to self-provision via the API.
-- [ ] **Env-test portability — remove localhost/port hardcoding**: `ClusterConnection` in `crates/env-tests/src/cluster.rs` hardcodes `localhost` and fixed ports (4433, 8080, 8082, etc.) via `ClusterPorts::default()`. This only works against a local Kind cluster. Refactor to: (1) accept base URLs from env vars or config file for AC/GC endpoints, (2) remove `mc_webtransport_url` from `ClusterConnection` entirely — all MC/MH WebTransport endpoints should come from GC join responses (already the pattern for positive tests), (3) tag the invalid-token negative test as local-only or have it discover an MC endpoint dynamically.
+- [-] **Env-test portability — remove localhost/port hardcoding**: Partially resolved. `ClusterPorts::from_env()` (ADR-0030) now reads `ENV_TEST_AC_URL`, `ENV_TEST_GC_URL`, `ENV_TEST_PROMETHEUS_URL`, `ENV_TEST_GRAFANA_URL`, `ENV_TEST_LOKI_URL` with localhost defaults. Remaining: (1) remove `mc_webtransport_url` from `ClusterConnection` — MC/MH endpoints should come from GC join responses, (2) tag the invalid-token negative test as local-only or discover MC endpoint dynamically.
 
 ## Service Credential Management
 
