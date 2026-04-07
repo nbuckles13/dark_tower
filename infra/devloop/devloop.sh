@@ -19,8 +19,8 @@
 #   --refresh-creds   Copy fresh OAuth credentials into a running container
 #
 # Examples:
-#   ./devloop.sh td-42-rate-limiting
-#   ./devloop.sh td-42-rate-limiting main
+#   ./devloop.sh td-42-rate-limiting                     # branches from current branch
+#   ./devloop.sh td-42-rate-limiting main                # branches from main
 #   ./devloop.sh --rebuild                              # just rebuild the image
 #   ./devloop.sh --rebuild td-42-rate-limiting
 #   ./devloop.sh --recreate td-42-rate-limiting         # new containers, same clone
@@ -64,7 +64,7 @@ if $REBUILD_IMAGE && [ -z "${1:-}" ]; then
 fi
 
 TASK_SLUG="${1:?Usage: devloop.sh [--rebuild] <task-slug> [base-branch]}"
-BASE_BRANCH="${2:-main}"
+BASE_BRANCH="${2:-$(git rev-parse --abbrev-ref HEAD)}"
 
 # Resolve paths relative to the repo root
 REPO_ROOT="$(git rev-parse --show-toplevel)"
@@ -338,6 +338,7 @@ elif [ -n "$COMMITS" ]; then
         echo "  [p] Push and create PR"
         echo "  [e] Edit PR description, then push"
         echo "  [r] Re-enter container"
+        echo "  [d] Destroy containers and clone (un-pushed changes will be lost)"
         echo "  [q] Quit (containers stay running)"
         read -p "Choice: " -n 1 -r
         echo
@@ -358,6 +359,7 @@ elif [ -n "$COMMITS" ]; then
             r|R)
                 exec "$0" "$TASK_SLUG" "$BASE_BRANCH"
                 ;;
+            d|D) cleanup ;;
             *)
                 echo "Containers still running. Re-enter with: $0 ${TASK_SLUG}"
                 ;;
