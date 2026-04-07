@@ -11,7 +11,13 @@
 
 set -euo pipefail
 
-CLUSTER_NAME="dark-tower"
+CLUSTER_NAME="${DT_CLUSTER_NAME:-dark-tower}"
+
+# --- Cluster name validation ---
+if [[ ! "${CLUSTER_NAME}" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] || [[ ${#CLUSTER_NAME} -gt 63 ]]; then
+    echo "ERROR: Invalid cluster name '${CLUSTER_NAME}': must be lowercase alphanumeric/hyphens, start and end with alphanumeric, max 63 chars" >&2
+    exit 1
+fi
 
 # Colors for output
 RED='\033[0;31m'
@@ -50,7 +56,7 @@ main() {
 
     # Clean up any orphaned port-forward processes
     log_info "Cleaning up port-forward processes..."
-    pkill -f "kubectl port-forward.*dark-tower" 2>/dev/null || true
+    pkill -f "kubectl --context kind-${CLUSTER_NAME} port-forward" 2>/dev/null || true
 
     log_info "Teardown complete."
     echo ""

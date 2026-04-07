@@ -52,7 +52,12 @@
 - Cluster health + kubectl security checks → `crates/env-tests/tests/00_cluster_health.rs`
 - Observability validation → `crates/env-tests/tests/30_observability.rs`
 
-## Code Locations: Cluster Helper (ADR-0030)
+## Code Locations: Cluster Setup & Helper (ADR-0030)
+- Setup script (arg parsing, TTY detection, cluster name validation) → `infra/kind/scripts/setup.sh`
+- Single-service rebuild+redeploy → `infra/kind/scripts/setup.sh:deploy_only_service()`
+- Image loading (podman/docker) → `infra/kind/scripts/setup.sh:load_image_to_kind()`
+- Env vars: DT_CLUSTER_NAME, DT_PORT_MAP → `infra/kind/scripts/setup.sh` (lines 37, 48-63)
+- Teardown with cluster name support → `infra/kind/scripts/teardown.sh`
 - Helper binary (to be added) → `crates/devloop-helper/src/main.rs`
 - dev-cluster client CLI (to be added) → `infra/devloop/dev-cluster`
 - Kind config template (to be added) → `infra/kind/kind-config.yaml.tmpl`
@@ -63,4 +68,5 @@
 - JWT (claims, JwtError, JwksClient, JwtValidator, round-trip tests) -> `crates/common/src/jwt.rs`
 - Shared meeting token types (GC<->AC contract, serde, defaults) -> `crates/common/src/meeting_token.rs:tests`
 - MC/MH StatefulSet, per-pod NodePort Services, Kind port mappings (MC 4433/4435, MH 4434/4436) → `infra/services/{mc,mh}-service/`, `infra/kind/kind-config.yaml`
-- Dev certs, Kind setup, Kustomize guard → `scripts/generate-dev-certs.sh`, `infra/kind/scripts/setup.sh`
+- Dev certs → `scripts/generate-dev-certs.sh`
+- Kind setup (--yes, --only, --skip-build flags) → `infra/kind/scripts/setup.sh`

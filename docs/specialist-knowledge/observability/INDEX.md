@@ -18,6 +18,7 @@
 - GC HTTP metrics middleware -> `crates/gc-service/src/middleware/http_metrics.rs`
 - GC join handler metrics -> `crates/gc-service/src/handlers/meetings.rs:join_meeting()`
 - GC DB metrics -> `crates/gc-service/src/repositories/` (meetings.rs, participants.rs)
+- GC guest-token handler: NO metrics instrumentation (gap) -> `crates/gc-service/src/handlers/meetings.rs:get_guest_token()`
 - MC metrics recording -> `crates/mc-service/src/observability/metrics.rs:init_metrics_recorder()`
 - MC join/WebTransport/JWT metrics -> `crates/mc-service/src/observability/metrics.rs`
 - MC connection handler metrics -> `crates/mc-service/src/webtransport/connection.rs:handle_connection()`
@@ -45,18 +46,31 @@
 - MH health state (ready after GC registration) -> `crates/mh-service/src/observability/health.rs:health_router()`
 
 ## Dashboards, Alerts & Infrastructure
-- Grafana dashboards -> `infra/grafana/dashboards/` (overview per service, SLOs, logs, errors)
-- Grafana K8s base -> `infra/kubernetes/observability/grafana/`
-- Alert rules -> `infra/docker/prometheus/rules/{gc,mc}-alerts.yaml`
-- Prometheus config -> `infra/docker/prometheus/prometheus.yml`, `infra/kubernetes/observability/prometheus-config.yaml`
+- Grafana dashboards (per-service overview, SLOs, logs, errors) -> `infra/grafana/dashboards/`
+- Grafana K8s base (configMapGenerator, sidecar, RBAC) -> `infra/kubernetes/observability/grafana/`
+- Alert rules (GC, MC) -> `infra/docker/prometheus/rules/{gc,mc}-alerts.yaml`
+- Grafana provisioning + K8s kustomization -> `infra/grafana/provisioning/`, `infra/kubernetes/observability/`
+- Prometheus config -> `infra/docker/prometheus/prometheus.yml` (compose), `infra/kubernetes/observability/prometheus-config.yaml` (K8s)
 - Loki config -> `infra/kubernetes/observability/loki-config.yaml`
-- Observability kustomization -> `infra/kubernetes/observability/kustomization.yaml`
-- Kind observability NodePorts (Prometheus=30090, Grafana=30030, Loki=30080) -> `infra/kind/kind-config.yaml`
 - Alert + dashboard docs -> `docs/observability/alerts.md`, `docs/observability/dashboards.md`
+
+## Kind Cluster Setup (Observability)
+- Observability deploy (full stack) -> `infra/kind/scripts/setup.sh:deploy_observability()`
+- Observability port-forwards (parameterized via DT_PORT_MAP) -> `infra/kind/scripts/setup.sh:setup_port_forwards()`
+- Cluster parameterization (DT_CLUSTER_NAME, DT_PORT_MAP, --yes, --only, --skip-build) -> `infra/kind/scripts/setup.sh`
+- Single-service redeploy -> `infra/kind/scripts/setup.sh:deploy_only_service()`
+- Teardown (parameterized cluster name, scoped pkill) -> `infra/kind/scripts/teardown.sh`
+- Kind observability NodePorts -> `infra/kind/kind-config.yaml`
+
+## Devloop Cluster Helper (Observability)
+- Kind config template (dynamic observability ports) -> `infra/kind/kind-config.yaml.tmpl`
+- Port map (prometheus, grafana, loki port discovery) -> `/tmp/devloop-{slug}/ports.json`
+- Env-test observability URL config -> `crates/env-tests/src/cluster.rs:ClusterPorts::from_env()`
+- Env-tests observability validation -> `crates/env-tests/tests/30_observability.rs`
 
 ## Guards
 - Metric-to-dashboard coverage -> `scripts/guards/simple/validate-application-metrics.sh`
-- Dashboard-to-kustomize coverage (R-20) -> `scripts/guards/simple/validate-kustomize.sh`
+- Dashboard-to-kustomize coverage (R-20, bidirectional) -> `scripts/guards/simple/validate-kustomize.sh`
 - Instrument skip_all enforcement -> `scripts/guards/simple/instrument-skip-all.sh`
 
 ## Env-Test Observability & Cluster Config
@@ -68,3 +82,8 @@
 
 ## Runbooks
 - Per-service deployment + incident response -> `docs/runbooks/` (two per service)
+- GC join failure triage -> `docs/runbooks/gc-incident-response.md`, `docs/observability/alerts.md`
+
+## Test Coverage & Integration Seams
+- GC/MC/MH metrics tests -> `crates/gc-service/src/observability/metrics.rs` (+ mc, mh)
+- MC/MH K8s health probes + metrics scrape -> `infra/services/{mc,mh}-service/deployment.yaml`
