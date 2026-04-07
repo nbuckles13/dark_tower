@@ -11,18 +11,16 @@
 - Metric catalogs -> `docs/observability/metrics/{ac,gc,mc,mh}-service.md`
 - AC metrics recording -> `crates/ac-service/src/observability/metrics.rs:init_metrics_recorder()`
 - AC gauge init at startup -> `crates/ac-service/src/services/key_management_service.rs:init_key_metrics()`
-- AC rate limit config (defaults, bounds, startup logging) -> `crates/ac-service/src/config.rs`, `src/main.rs`
+- AC rate limit config (defaults, bounds, startup logging) -> `crates/ac-service/src/config.rs`, `crates/ac-service/src/main.rs`
 - AC HTTP metrics middleware -> `crates/ac-service/src/middleware/http_metrics.rs`
-- GC metrics recording -> `crates/gc-service/src/observability/metrics.rs:init_metrics_recorder()`
-- GC meeting metrics + endpoint normalization -> `crates/gc-service/src/observability/metrics.rs`
-- GC HTTP metrics middleware -> `crates/gc-service/src/middleware/http_metrics.rs`
-- GC join handler metrics -> `crates/gc-service/src/handlers/meetings.rs:join_meeting()`
+- GC metrics recording (init, meeting creation/join) -> `crates/gc-service/src/observability/metrics.rs`
+- GC HTTP metrics middleware + endpoint normalization -> `crates/gc-service/src/middleware/http_metrics.rs`, `observability/metrics.rs:normalize_endpoint()`
+- GC join handler metrics wiring -> `crates/gc-service/src/handlers/meetings.rs:join_meeting()`
 - GC DB metrics -> `crates/gc-service/src/repositories/` (meetings.rs, participants.rs)
 - GC guest-token handler: NO metrics instrumentation (gap) -> `crates/gc-service/src/handlers/meetings.rs:get_guest_token()`
-- MC metrics recording -> `crates/mc-service/src/observability/metrics.rs:init_metrics_recorder()`
-- MC join/WebTransport/JWT metrics -> `crates/mc-service/src/observability/metrics.rs`
-- MC connection handler metrics -> `crates/mc-service/src/webtransport/connection.rs:handle_connection()`
-- MC accept loop metrics -> `crates/mc-service/src/webtransport/server.rs:accept_loop()`
+- MC metrics recording (join, WebTransport, JWT validation) -> `crates/mc-service/src/observability/metrics.rs`
+- MC join metrics recording site (connection handler) -> `crates/mc-service/src/webtransport/connection.rs:handle_connection()`
+- MC connection metrics recording site (accept loop) -> `crates/mc-service/src/webtransport/server.rs:accept_loop()`
 - MC error type labels (bounded cardinality) -> `crates/mc-service/src/errors.rs:error_type_label()`
 - MH metrics (registration, heartbeat, token refresh, gRPC) -> `crates/mh-service/src/observability/metrics.rs`
 
@@ -47,11 +45,15 @@
 
 ## Dashboards, Alerts & Infrastructure
 - Grafana dashboards (per-service overview, SLOs, logs, errors) -> `infra/grafana/dashboards/`
-- Grafana K8s base (configMapGenerator, sidecar, RBAC) -> `infra/kubernetes/observability/grafana/`
+- Grafana K8s base (configMapGenerator, sidecar, RBAC, service) -> `infra/kubernetes/observability/grafana/`
+- Per-service overview dashboards (AC, GC, MC, MH) -> `infra/grafana/dashboards/{ac,gc,mc,mh}-overview.json`
+- Cross-service error dashboard -> `infra/grafana/dashboards/errors-overview.json`
 - Alert rules (GC, MC) -> `infra/docker/prometheus/rules/{gc,mc}-alerts.yaml`
 - Grafana provisioning + K8s kustomization -> `infra/grafana/provisioning/`, `infra/kubernetes/observability/`
 - Prometheus config -> `infra/docker/prometheus/prometheus.yml` (compose), `infra/kubernetes/observability/prometheus-config.yaml` (K8s)
 - Loki config -> `infra/kubernetes/observability/loki-config.yaml`
+- Observability kustomization -> `infra/kubernetes/observability/kustomization.yaml`
+- Kind observability NodePorts (Prometheus=30090, Grafana=30030, Loki=30080, static/manual) -> `infra/kind/kind-config.yaml`
 - Alert + dashboard docs -> `docs/observability/alerts.md`, `docs/observability/dashboards.md`
 
 ## Kind Cluster Setup (Observability)
@@ -63,7 +65,8 @@
 - Kind observability NodePorts -> `infra/kind/kind-config.yaml`
 
 ## Devloop Cluster Helper (Observability)
-- Kind config template (dynamic observability ports) -> `infra/kind/kind-config.yaml.tmpl`
+- Helper binary (status command, observability.available flag) -> `crates/devloop-helper/src/main.rs`
+- Kind config template (listenAddress: 127.0.0.1, dynamic observability ports) -> `infra/kind/kind-config.yaml.tmpl`
 - Port map (prometheus, grafana, loki port discovery) -> `/tmp/devloop-{slug}/ports.json`
 - Env-test observability URL config -> `crates/env-tests/src/cluster.rs:ClusterPorts::from_env()`
 - Env-tests observability validation -> `crates/env-tests/tests/30_observability.rs`
@@ -82,7 +85,7 @@
 
 ## Runbooks
 - Per-service deployment + incident response -> `docs/runbooks/` (two per service)
-- GC join failure triage -> `docs/runbooks/gc-incident-response.md`, `docs/observability/alerts.md`
+- GC scenarios 8-9 + join failure triage -> `docs/runbooks/gc-incident-response.md`, `docs/observability/alerts.md`
 
 ## Test Coverage & Integration Seams
 - GC/MC/MH metrics tests -> `crates/gc-service/src/observability/metrics.rs` (+ mc, mh)

@@ -55,7 +55,9 @@
 - Env-test URL validation (scheme, credential rejection) → `crates/env-tests/src/cluster.rs:parse_host_port()`
 - Env-test URL from env vars → `crates/env-tests/src/cluster.rs:ClusterPorts::from_env()`
 - Helper binary (Rust, Command::new() arg safety) → `crates/devloop-helper/src/main.rs` (planned)
-- Kind NodePort listen address restriction (127.0.0.1) → `infra/kind/kind-config.yaml.tmpl` (planned)
+- Socket auth token + file permissions → ADR-0030 (Helper Process section)
+- Helper API allowlist (service enum, test filter validation) → ADR-0030 (Helper API section)
+- Kind NodePort listen address restriction (127.0.0.1) → `infra/kind/kind-config.yaml.tmpl`
 - Devloop wrapper script → `infra/devloop/devloop.sh`
 
 ## Infrastructure Secrets & Network Isolation

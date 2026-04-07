@@ -52,7 +52,9 @@
 - AC/MC/MH use StatefulSet; GC uses Deployment -> `infra/services/*/statefulset.yaml` or `deployment.yaml`
 - MC/MH per-pod Services (WebTransport NodePort) -> `infra/services/{mc,mh}-service/service.yaml` (headless + ClusterIP + per-pod-0 + per-pod-1; port formula: `base + ordinal*2`)
 - Dockerfiles -> `infra/docker/{ac,gc,mc,mh}-service/Dockerfile` (cargo-chef multi-stage pattern)
-- Kind config + overlays -> `infra/kind/kind-config.yaml` (per-pod UDP), `infra/kubernetes/overlays/kind/`
+- Kind config (static, manual) -> `infra/kind/kind-config.yaml` (per-pod UDP, hardcoded ports)
+- Kind config (template, devloop) -> `infra/kind/kind-config.yaml.tmpl` (envsubst placeholders, ADR-0030)
+- Kind overlays -> `infra/kubernetes/overlays/kind/`
 - setup.sh (parameterized, ADR-0030) -> `infra/kind/scripts/setup.sh` (`load_image_to_kind()`, `deploy_only_service()`, DT_CLUSTER_NAME/DT_PORT_MAP, --yes/--only/--skip-build)
 - teardown.sh (parameterized) -> `infra/kind/scripts/teardown.sh` (DT_CLUSTER_NAME, context-aware pkill)
 - TLS certs -> `scripts/generate-dev-certs.sh`
