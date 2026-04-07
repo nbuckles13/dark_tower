@@ -53,9 +53,10 @@
 - MC/MH per-pod Services (WebTransport NodePort) -> `infra/services/{mc,mh}-service/service.yaml` (headless + ClusterIP + per-pod-0 + per-pod-1; port formula: `base + ordinal*2`)
 - Dockerfiles -> `infra/docker/{ac,gc,mc,mh}-service/Dockerfile` (cargo-chef multi-stage pattern)
 - Kind config + overlays -> `infra/kind/kind-config.yaml` (per-pod UDP), `infra/kubernetes/overlays/kind/`
-- setup.sh + TLS certs -> `infra/kind/scripts/setup.sh`, `scripts/generate-dev-certs.sh`
+- setup.sh (parameterized, ADR-0030) -> `infra/kind/scripts/setup.sh` (`load_image_to_kind()`, `deploy_only_service()`, DT_CLUSTER_NAME/DT_PORT_MAP, --yes/--only/--skip-build)
+- teardown.sh (parameterized) -> `infra/kind/scripts/teardown.sh` (DT_CLUSTER_NAME, context-aware pkill)
+- TLS certs -> `scripts/generate-dev-certs.sh`
 - Prometheus scrape targets -> `infra/kubernetes/observability/prometheus-config.yaml`
-- Note: image-load-into-kind pattern repeated per deploy function (candidate for `load_image_to_kind` helper)
 
 ## False Positive Boundaries
 - Per-service error mapping (GcError vs McError vs MhError) -> required, not duplication
@@ -69,6 +70,8 @@
 
 ## Successful Extractions & Integration Seams
 - Common crate (extraction target) -> `crates/common/src/` (jwt, config, meeting_token, secret, token_manager)
-- JWT types to common::jwt -> `crates/common/src/jwt.rs`; test keypairs to `crates/mc-test-utils/src/jwt_test.rs`
-- Meeting token types to common::meeting_token -> `crates/common/src/meeting_token.rs` (AC+GC re-export)
-- parse_statefulset_ordinal to common::config -> `crates/common/src/config.rs` (was duplicated in MC + MH)
+- ServiceClaims/UserClaims/JWKS/JwtValidator to common::jwt -> `crates/common/src/jwt.rs`
+- TestKeypair + JWKS mock to mc-test-utils -> `crates/mc-test-utils/src/jwt_test.rs`
+- MeetingTokenRequest/GuestTokenRequest/TokenResponse/ParticipantType/MeetingRole to common::meeting_token -> `crates/common/src/meeting_token.rs` (AC+GC re-export via `pub use`)
+- parse_statefulset_ordinal to common::config -> `crates/common/src/config.rs` (was duplicated in MC + MH; extracted 2026-04-01)
+- load_image_to_kind to setup.sh helper -> `infra/kind/scripts/setup.sh:load_image_to_kind()`
