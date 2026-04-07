@@ -9,19 +9,14 @@
 - Client architecture (E2EE, key management, supply chain) → ADR-0028 (Sections 5, 1)
 
 ## Code Locations — AC (Token Issuance & Crypto)
-- JWT signing/verification → `crates/ac-service/src/crypto/mod.rs:sign_jwt()`, `verify_jwt()`
-- Key encryption at rest → `crates/ac-service/src/crypto/mod.rs:encrypt_private_key()`
-- Bcrypt hash/verify → `crates/ac-service/src/crypto/mod.rs:hash_client_secret()`, `verify_client_secret()`
+- JWT signing/verification, key encryption, bcrypt → `crates/ac-service/src/crypto/mod.rs`
 - Token issuance → `crates/ac-service/src/services/token_service.rs:issue_service_token()`, `issue_user_token()`
 - Security config + rate limits → `crates/ac-service/src/config.rs` | K8s: `infra/services/ac-service/`
-- Rate limiting (login + registration) → `token_service.rs`, `user_service.rs`, `auth_handler.rs`
 
 ## Code Locations — Common (JWT Infrastructure & Shared Token Types)
-- JWT claims (PII-redacted Debug) → `crates/common/src/jwt.rs:ServiceClaims`, `UserClaims`, `MeetingTokenClaims`, `GuestTokenClaims`
-- JWKS client + JWT validator (EdDSA) → `crates/common/src/jwt.rs:JwksClient`, `JwtValidator::validate()`
-- Size limit, kid extraction, iat validation → `crates/common/src/jwt.rs:MAX_JWT_SIZE_BYTES`
+- JWT claims, JWKS client, validator (EdDSA, size limit, kid, iat) → `crates/common/src/jwt.rs`
 - Token manager (secure constructor) → `crates/common/src/token_manager.rs:new_secure()`
-- Internal token types (GC→AC contract, `home_org_id` always required) → `crates/common/src/meeting_token.rs` — re-exported by GC `ac_client.rs` + AC `models/mod.rs`
+- Internal token types (GC→AC, `home_org_id` required) → `crates/common/src/meeting_token.rs`
 
 ## Code Locations — GC (Auth & Access Control)
 - JWT validation (thin wrapper) → `crates/gc-service/src/auth/jwt.rs:validate()`, `validate_user()`
@@ -32,11 +27,9 @@
 - Participant tracking (DB CHECK + partial unique index) → `crates/gc-service/src/repositories/participants.rs`
 
 ## Code Locations — MC (JWT, WebTransport, Actors)
-- MC JWT validation (meeting + guest) → `crates/mc-service/src/auth/mod.rs:McJwtValidator`
-- Token_type anti-confusion → `validate_meeting_token()`, `validate_guest_token()`
-- gRPC auth interceptor (service tokens) → `crates/mc-service/src/grpc/auth_interceptor.rs`
-- WebTransport connection handler (join flow, JWT gate) → `crates/mc-service/src/webtransport/connection.rs:handle_connection()`
-- WebTransport accept loop (capacity bound, TLS) → `crates/mc-service/src/webtransport/server.rs`
+- MC JWT validation + token_type anti-confusion → `crates/mc-service/src/auth/mod.rs:McJwtValidator`
+- gRPC auth interceptor → `crates/mc-service/src/grpc/auth_interceptor.rs`
+- WebTransport (connection handler, accept loop, TLS) → `crates/mc-service/src/webtransport/`
 - Session binding + join → `crates/mc-service/src/actors/session.rs`, `meeting.rs:handle_join()`
 
 ## Code Locations — MH (Auth, OAuth, TLS)
@@ -63,12 +56,9 @@
 ## Devloop Container & Cluster Helper Security
 - Container isolation model → ADR-0025
 - Host-side cluster helper (trust model, socket auth, injection safety) → ADR-0030
-- Helper binary (Rust, Command::new() arg safety) → `crates/devloop-helper/src/main.rs` (planned)
-- Socket auth token + file permissions → ADR-0030 (Helper Process section)
-- Helper API allowlist (service enum, test filter validation) → ADR-0030 (Helper API section)
-- Kind NodePort listen address restriction (127.0.0.1) → `infra/kind/kind-config.yaml.tmpl` (planned)
+- Env-test URL validation (scheme, credential rejection) → `crates/env-tests/src/cluster.rs:parse_host_port()`
+- Env-test URL from env vars → `crates/env-tests/src/cluster.rs:ClusterPorts::from_env()`
 - Devloop wrapper script → `infra/devloop/devloop.sh`
-- Sidecar design (superseded by ADR-0030) → `docs/debates/2026-04-05-devloop-cluster-sidecar.md`
 
 ## Infrastructure Secrets & Network Isolation
 - Imperative secret creation → `setup.sh:create_ac_secrets()`, `create_mc_tls_secret()`, `create_mh_secrets()`, `create_mh_tls_secret()`

@@ -24,9 +24,11 @@
 
 ## Per-Service Config Parsing
 - AC/GC/MC/MH config -> `crates/*/src/config.rs:Config::from_vars()` (per-service, not duplication)
+- Env-test cluster config -> `crates/env-tests/src/cluster.rs:ClusterPorts::from_env()` (reads `ENV_TEST_*_URL` vars; different domain from service config, not duplication)
+- URL-to-host:port decomposition -> `crates/env-tests/src/cluster.rs:parse_host_port()` (unique to env-tests, no equivalent elsewhere)
 - Advertise addresses (MC + MH) -> gRPC uses POD_IP downward API; WebTransport uses ordinal-based port via `common::config::parse_statefulset_ordinal`
 - StatefulSet ordinal parsing -> `crates/common/src/config.rs:parse_statefulset_ordinal()` (shared, 5 tests)
-- Extraction candidate: `generate_instance_id(prefix)` -> 4-line pattern duplicated in MC + MH config
+- Extraction candidate: `generate_instance_id(prefix)` -> 4-line pattern duplicated in GC + MC + MH config
 
 ## gRPC Auth Interceptors (Cross-Service)
 - MC auth interceptor -> `crates/mc-service/src/grpc/auth_interceptor.rs:McAuthInterceptor`
@@ -65,11 +67,8 @@
 ## Tech Debt Registry
 - Active duplication tech debt -> `docs/TODO.md` (Cross-Service Duplication section)
 
-## Successful Extractions (Reference)
-- ServiceClaims/UserClaims/JWKS/JwtValidator to common::jwt -> `crates/common/src/jwt.rs`
-- TestKeypair + JWKS mock to mc-test-utils -> `crates/mc-test-utils/src/jwt_test.rs`
-- MeetingTokenRequest/GuestTokenRequest/TokenResponse/ParticipantType/MeetingRole to common::meeting_token -> `crates/common/src/meeting_token.rs` (AC+GC re-export via `pub use`)
-- parse_statefulset_ordinal to common::config -> `crates/common/src/config.rs` (was duplicated in MC + MH; extracted 2026-04-01)
-
-## Integration Seams
-- Common crate as extraction target -> `crates/common/src/` (jwt, config, meeting_token, secret, token_manager)
+## Successful Extractions & Integration Seams
+- Common crate (extraction target) -> `crates/common/src/` (jwt, config, meeting_token, secret, token_manager)
+- JWT types to common::jwt -> `crates/common/src/jwt.rs`; test keypairs to `crates/mc-test-utils/src/jwt_test.rs`
+- Meeting token types to common::meeting_token -> `crates/common/src/meeting_token.rs` (AC+GC re-export)
+- parse_statefulset_ordinal to common::config -> `crates/common/src/config.rs` (was duplicated in MC + MH)

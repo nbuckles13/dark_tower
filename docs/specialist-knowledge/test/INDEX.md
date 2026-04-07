@@ -43,7 +43,8 @@
 ## Code Locations: Environment Tests
 - Cluster bootstrap + fixtures → `crates/env-tests/src/`, flows (20-24) → `crates/env-tests/tests/`
 - Cluster connection + port config → `crates/env-tests/src/cluster.rs:ClusterPorts`, `ClusterConnection`
-- URL env var entry point (ADR-0030) → `crates/env-tests/src/cluster.rs:ClusterPorts::from_env()` (to be added)
+- URL env var entry point (ADR-0030) → `crates/env-tests/src/cluster.rs:ClusterPorts::from_env()`
+- URL parsing + validation → `crates/env-tests/src/cluster.rs:parse_host_port()`
 - GC client fixture (join, guest token, mc_assignment) → `crates/env-tests/src/fixtures/gc_client.rs`
 - Auth client fixture → `crates/env-tests/src/fixtures/auth_client.rs`
 - Prometheus client fixture → `crates/env-tests/src/fixtures/metrics.rs`
