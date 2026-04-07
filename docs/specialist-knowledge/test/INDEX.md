@@ -8,54 +8,30 @@
 - Validation pipeline (guards, coverage) -> `docs/decisions/adr-0024-agent-teams-workflow.md`
 - Coverage thresholds -> `.codecov.yml`
 - Client architecture (4-tier testing, test-utils, flaky policy) -> ADR-0028
+- Host-side cluster helper (env-test execution, URL config, attempt budgets) -> `docs/decisions/adr-0030-host-side-cluster-helper.md`
 
 ## Code Locations: AC Service
-- Integration tests -> `crates/ac-service/tests/integration/`
-- Fault injection tests -> `crates/ac-service/tests/fault_injection/`
+- Integration + fault injection tests -> `crates/ac-service/tests/integration/`, `crates/ac-service/tests/fault_injection/`
 - Fuzz targets -> `crates/ac-service/fuzz/fuzz_targets/jwt_validation.rs`
-- Test harness (HTTP seam) -> `crates/ac-test-utils/src/server_harness.rs`
-- Token builders -> `crates/ac-test-utils/src/token_builders.rs`
-- Rate limit config (defaults, bounds, parsing) -> `crates/ac-service/src/config.rs:parse_rate_limit_i64()`
-- Rate limit config tests -> `crates/ac-service/src/config.rs:tests::test_rate_limit_*`
-- Rate limit K8s wiring -> `infra/services/ac-service/configmap.yaml`, `infra/services/ac-service/statefulset.yaml`
+- Test harness + token builders -> `crates/ac-test-utils/src/server_harness.rs`, `crates/ac-test-utils/src/token_builders.rs`
+- Rate limit config + tests -> `crates/ac-service/src/config.rs:parse_rate_limit_i64()`, `tests::test_rate_limit_*`
 
 ## Code Locations: GC Service
-- Auth integration tests (HTTP layer, wiremock JWKS) -> `crates/gc-service/tests/auth_tests.rs`
-- Auth thin wrapper tests (From<JwtError> for GcError) -> `crates/gc-service/src/auth/jwt.rs:tests`
-- Meeting join/guest/settings tests -> `crates/gc-service/tests/meeting_tests.rs`
-- Regression: same-org home_org_id (wiremock inspection) -> `crates/gc-service/tests/meeting_tests.rs:test_same_org_join_sends_home_org_id_equal_to_user_org_id`
-- Meeting creation tests -> `crates/gc-service/tests/meeting_create_tests.rs`
+- Auth tests (HTTP + wiremock JWKS, jwt wrapper) -> `crates/gc-service/tests/auth_tests.rs`, `crates/gc-service/src/auth/jwt.rs:tests`
+- Meeting tests (join, guest, settings, creation, assignment) -> `crates/gc-service/tests/meeting_tests.rs`, `meeting_create_tests.rs`, `meeting_assignment_tests.rs`
 - Participant & activation tests -> `crates/gc-service/tests/participant_tests.rs`
-- Meeting assignment tests -> `crates/gc-service/tests/meeting_assignment_tests.rs`
-- Test token helpers (TestUserClaims, TestClaims) -> `crates/gc-service/tests/meeting_tests.rs:TestUserClaims`
-- Meeting handlers (join, guest token, settings) -> `crates/gc-service/src/handlers/meetings.rs`
-- Join metrics -> `crates/gc-service/src/observability/metrics.rs:record_meeting_join()`
-- GC metrics tests -> `crates/gc-service/src/observability/metrics.rs:tests`
-- GC metrics catalog, dashboard, alerts -> `docs/observability/metrics/gc-service.md`, `infra/grafana/dashboards/gc-overview.json`, `infra/docker/prometheus/rules/gc-alerts.yaml`
-- Route definitions (public, user-auth, service-auth) -> `crates/gc-service/src/routes/mod.rs`
-- Activation repo -> `crates/gc-service/src/repositories/meetings.rs:activate_meeting()`
-- Audit event logging -> `crates/gc-service/src/repositories/meetings.rs:log_audit_event()`
-- Test harness (HTTP seam) -> `crates/gc-test-utils/src/server_harness.rs`
+- Meeting handlers + routes -> `crates/gc-service/src/handlers/meetings.rs`, `crates/gc-service/src/routes/mod.rs`
+- Metrics + observability -> `crates/gc-service/src/observability/metrics.rs`, `docs/observability/metrics/gc-service.md`
+- Test harness -> `crates/gc-test-utils/src/server_harness.rs`
 
 ## Code Locations: MC Service
-- Auth module (McJwtValidator wrapper) -> `crates/mc-service/src/auth/mod.rs`
-- Meeting/guest token validation (wiremock + Ed25519) -> `crates/mc-service/src/auth/mod.rs:tests::test_validate_*_token_*`
-- Token confusion (bidirectional: meeting-as-guest, guest-as-meeting, wrong token_type) -> `crates/mc-service/src/auth/mod.rs:tests`
-- From<JwtError> for McError (7 variants, ServiceUnavailable->Internal) -> `crates/mc-service/src/errors.rs:tests::test_jwt_error_to_mc_error_*`
-- Config tests (env vars, TLS paths, JWKS scheme, advertise addresses, StatefulSet ordinal parsing) -> `crates/mc-service/src/config.rs:tests`
-- Controller actor tests -> `crates/mc-service/src/actors/controller.rs:tests`
-- Meeting actor tests (join, leave, reconnect, mute, grace period) -> `crates/mc-service/src/actors/meeting.rs:tests`
-- ParticipantActor tests (spawn, send, ping, close, stream wiring) -> `crates/mc-service/src/actors/participant.rs:tests`
-- Session binding tests (HMAC, correlation ID, expiration) -> `crates/mc-service/src/actors/session.rs:tests`
-- WebTransport encoding tests (encode_participant_update) -> `crates/mc-service/src/webtransport/handler.rs:tests`
-- WebTransport connection tests (build_join_response) -> `crates/mc-service/src/webtransport/connection.rs:tests`
-- MC metrics tests (unit + DebuggingRecorder integration) -> `crates/mc-service/src/observability/metrics.rs:tests`
-- MC metrics catalog, alerts -> `docs/observability/metrics/mc-service.md`, `infra/docker/prometheus/rules/mc-alerts.yaml`
-- GC integration tests -> `crates/mc-service/tests/gc_integration.rs`
-- Heartbeat tests -> `crates/mc-service/tests/heartbeat_tasks.rs`
-- Health state & router tests -> `crates/mc-service/src/observability/health.rs:health_router()`
-- Mock Redis -> `crates/mc-test-utils/src/mock_redis.rs`
-- Mock GC server (gRPC seam) -> `crates/mc-test-utils/src/mock_gc.rs`
+- Auth + token validation (meeting, guest, confusion tests) -> `crates/mc-service/src/auth/mod.rs:tests`
+- Config + error tests -> `crates/mc-service/src/config.rs:tests`, `crates/mc-service/src/errors.rs:tests`
+- Actor tests (controller, meeting, participant, session) -> `crates/mc-service/src/actors/{controller,meeting,participant,session}.rs:tests`
+- WebTransport tests (encoding, connection) -> `crates/mc-service/src/webtransport/{handler,connection}.rs:tests`
+- GC integration + heartbeat tests -> `crates/mc-service/tests/gc_integration.rs`, `heartbeat_tasks.rs`
+- Health + metrics -> `crates/mc-service/src/observability/{health,metrics}.rs`
+- Test utils (mock Redis, mock GC) -> `crates/mc-test-utils/src/mock_redis.rs`, `mock_gc.rs`
 
 ## Code Locations: MH Service
 - Config tests (env vars, defaults, TLS, debug redaction, advertise addresses, StatefulSet ordinal parsing) -> `crates/mh-service/src/config.rs:tests`
@@ -65,8 +41,22 @@
 - GC integration tests (registration, load reports, NOT_FOUND) -> `crates/mh-service/tests/gc_integration.rs`
 
 ## Code Locations: Environment Tests
-- Cluster bootstrap + fixtures → `crates/env-tests/src/`; flows → `crates/env-tests/tests/`; join flow → `24_join_flow.rs`
-- **Pattern: pod-specific WebTransport** — positive join tests use `gc_join.mc_assignment.webtransport_endpoint` (per-pod StatefulSet URL); negative tests use `cluster.mc_webtransport_url()` (pod-0 only)
+- Cluster bootstrap + fixtures → `crates/env-tests/src/`, flows (20-24) → `crates/env-tests/tests/`
+- Cluster connection + port config → `crates/env-tests/src/cluster.rs:ClusterPorts`, `ClusterConnection`
+- URL env var entry point (ADR-0030) → `crates/env-tests/src/cluster.rs:ClusterPorts::from_env()` (to be added)
+- GC client fixture (join, guest token, mc_assignment) → `crates/env-tests/src/fixtures/gc_client.rs`
+- Auth client fixture → `crates/env-tests/src/fixtures/auth_client.rs`
+- Prometheus client fixture → `crates/env-tests/src/fixtures/metrics.rs`
+- Join flow tests (AC→GC→MC e2e) → `crates/env-tests/tests/24_join_flow.rs`
+- Cluster health + kubectl security checks → `crates/env-tests/tests/00_cluster_health.rs`
+- Observability validation → `crates/env-tests/tests/30_observability.rs`
+
+## Code Locations: Cluster Helper (ADR-0030)
+- Helper binary (to be added) → `crates/devloop-helper/src/main.rs`
+- dev-cluster client CLI (to be added) → `infra/devloop/dev-cluster`
+- Kind config template (to be added) → `infra/kind/kind-config.yaml.tmpl`
+- Port map file → `~/.cache/devloop/devloop-{slug}/ports.json`
+- Cluster sidecar design doc (superseded) → `docs/debates/2026-04-05-devloop-cluster-sidecar.md`
 
 ## Code Locations: Common & Infrastructure
 - JWT (claims, JwtError, JwksClient, JwtValidator, round-trip tests) -> `crates/common/src/jwt.rs`

@@ -60,6 +60,16 @@
 - Per-instance NodePort Services (`mc-service-{0,1}`, `mh-service-{0,1}`) expose only UDP WebTransport — no gRPC/health/TCP
 - Used in `gc_client.rs:register()` + `attempt_reregistration()`
 
+## Devloop Container & Cluster Helper Security
+- Container isolation model → ADR-0025
+- Host-side cluster helper (trust model, socket auth, injection safety) → ADR-0030
+- Helper binary (Rust, Command::new() arg safety) → `crates/devloop-helper/src/main.rs` (planned)
+- Socket auth token + file permissions → ADR-0030 (Helper Process section)
+- Helper API allowlist (service enum, test filter validation) → ADR-0030 (Helper API section)
+- Kind NodePort listen address restriction (127.0.0.1) → `infra/kind/kind-config.yaml.tmpl` (planned)
+- Devloop wrapper script → `infra/devloop/devloop.sh`
+- Sidecar design (superseded by ADR-0030) → `docs/debates/2026-04-05-devloop-cluster-sidecar.md`
+
 ## Infrastructure Secrets & Network Isolation
 - Imperative secret creation → `setup.sh:create_ac_secrets()`, `create_mc_tls_secret()`, `create_mh_secrets()`, `create_mh_tls_secret()`
 - Network policies (per-service ingress/egress) → `infra/services/{ac,gc,mc,mh}-service/network-policy.yaml`

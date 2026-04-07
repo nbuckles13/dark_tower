@@ -8,12 +8,23 @@
 - Validation pipeline (CI gates) → ADR-0024
 - Containerized devloop execution → ADR-0025
 - Dashboard metric presentation (counters vs rates) → ADR-0029
+- Host-side cluster helper for integration testing → ADR-0030
 
 ## Code Locations — CI & Guards
 - CI pipeline → `.github/workflows/ci.yml`
 - Guard runner → `scripts/guards/run-guards.sh`, common library → `scripts/guards/common.sh`
 - Kustomize guard (R-15–R-20: build, orphans, kubeconform, secctx, secrets, dashboards) → `scripts/guards/simple/validate-kustomize.sh`
 - Application metrics guard → `scripts/guards/simple/validate-application-metrics.sh`
+
+## Code Locations — Devloop Cluster Helper
+- Cluster helper binary (new) → `crates/devloop-helper/src/main.rs`
+- Dev-cluster client CLI (new) → `infra/devloop/dev-cluster`
+- Kind config template (new) → `infra/kind/kind-config.yaml.tmpl`
+- Devloop wrapper script → `infra/devloop/devloop.sh`
+- Devloop container image → `infra/devloop/Dockerfile`
+- Cluster helper design doc → `docs/debates/2026-04-05-devloop-cluster-sidecar.md`
+- Host state directory → `~/.cache/devloop/` (port-registry.json, per-slug state)
+- Env-test URL config → `crates/env-tests/src/cluster.rs:ClusterPorts::from_env()`
 
 ## Code Locations — Deployment & K8s
 - Kind cluster config + setup script → `infra/kind/kind-config.yaml`, `infra/kind/scripts/setup.sh`
