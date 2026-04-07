@@ -130,6 +130,7 @@ spec:
           securityContext:
             readOnlyRootFilesystem: true
             runAsNonRoot: true
+            runAsUser: 65534  # nobody — image uses string "nobody", K8s needs numeric UID
             allowPrivilegeEscalation: false
             capabilities:
               drop: [ALL]
