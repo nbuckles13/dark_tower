@@ -71,6 +71,6 @@
 - Env-tests cluster module → `crates/env-tests/src/cluster.rs`
 - Kind config (per-pod UDP: MC 4433/4435, MH 4434/4436) + setup → `infra/kind/kind-config.yaml`, `infra/kind/scripts/setup.sh`
 - Kind cluster setup (parameterized: ADR-0030) → `infra/kind/kind-config.yaml`, `scripts/setup.sh`, `scripts/teardown.sh`; key fns: `load_image_to_kind()`, `deploy_only_service()`
+- Kind config template (dynamic ports, envsubst) → `infra/kind/kind-config.yaml.tmpl`; Host-side cluster helper → ADR-0030
 - Service bases + Kind overlay → `infra/services/*/kustomization.yaml`, `infra/kubernetes/overlays/kind/`
-- Guard runner → `scripts/guards/run-guards.sh`; Review protocol → `.claude/skills/devloop/review-protocol.md`
-- Guards: Kustomize (R-15–R-20) → `scripts/guards/simple/validate-kustomize.sh`; App metrics → `validate-application-metrics.sh`
+- Guards: runner → `scripts/guards/run-guards.sh`; Kustomize (R-15–R-20) → `validate-kustomize.sh`; App metrics → `validate-application-metrics.sh`

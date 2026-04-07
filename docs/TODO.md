@@ -29,6 +29,10 @@
 - [ ] **gRPC input validation duplication**: MC and MH services duplicate validation logic (~100 lines). Locations: `crates/gc-service/src/grpc/mc_service.rs`, `crates/gc-service/src/grpc/mh_service.rs`
 - [ ] **Heartbeat interval constants**: Defined in 3 places with different names. Locations: `mc_service.rs`, `mh_service.rs`, `meeting-controller/gc_client.rs`
 
+## Port Constant Scattering (Kind / K8s / Env-Tests)
+
+- [ ] **MC/MH port constants duplicated across 6+ files with no single source of truth**: Host ports (4433, 4434, 4435, 4436), NodePorts (30433, 30434, 30435, 30436), and observability ports (9090/30090, 3000/30030, 3100/30080) are hardcoded independently in `infra/kind/kind-config.yaml`, `infra/services/{mc,mh}-service/service.yaml` (NodePort values), `infra/services/{mc,mh}-service/{mc,mh}-{0,1}-configmap.yaml` (advertise addresses), `infra/services/{mc,mh}-service/configmap.yaml` (bind addresses), `infra/docker/{mc,mh}-service/Dockerfile` (EXPOSE + bind defaults), `infra/kind/scripts/setup.sh` (print output), and `crates/env-tests/src/cluster.rs` (ClusterPorts::default). Changing a port in one file without updating all others causes silent breakage. Consider extracting port assignments to a shared config (e.g., `ports.env` sourced by setup.sh, referenced by Kustomize configMapGenerator). The new `kind-config.yaml.tmpl` (ADR-0030) correctly uses envsubst placeholders for its hostPorts, avoiding this issue for devloop clusters. Low priority — manual workflow only.
+
 ## Env-Test Self-Sufficiency
 
 - [ ] **AC org provisioning endpoint**: Add an admin/internal API to AC for creating organizations. Env-tests should create their own test org via this endpoint instead of depending on pre-seeded data in `infra/docker/postgres/init.sql`.

@@ -19,8 +19,9 @@
 ## Devloop Cluster Helper
 - Cluster helper binary (new) → `crates/devloop-helper/src/main.rs`
 - Dev-cluster client CLI (new) → `infra/devloop/dev-cluster`
-- Kind config template (new) → `infra/kind/kind-config.yaml.tmpl`
+- Kind config template (envsubst, 18 port mappings) → `infra/kind/kind-config.yaml.tmpl`
 - Devloop wrapper → `infra/devloop/devloop.sh`, container image → `infra/devloop/Dockerfile`
+- Cluster helper design doc → `docs/debates/2026-04-05-devloop-cluster-sidecar.md`
 - Host state directory → `~/.cache/devloop/` (port-registry.json, per-slug state)
 - Env-test URL config → `crates/env-tests/src/cluster.rs:ClusterPorts::from_env()`
 - URL parsing for health checks → `crates/env-tests/src/cluster.rs:parse_host_port()`
@@ -36,6 +37,7 @@
 - Alert rules → `infra/docker/prometheus/rules/{gc,mc}-alerts.yaml`
 - Dev certs (AC, MC, MH WebTransport) → `scripts/generate-dev-certs.sh`
 - MC/MH TLS secrets (imperative, setup.sh); per-pod UDP NodePorts via Kind port formula: `base + ordinal*2` (MC: 4433/4435, MH: 4434/4436) in `kind-config.yaml`
+- MC/MH per-pod NodePort Services → `infra/services/{mc,mh}-service/service.yaml`
 - setup.sh parameterization (ADR-0030) → `load_image_to_kind()`, `deploy_only_service()`, DT_CLUSTER_NAME/DT_PORT_MAP, --yes/--only/--skip-build
 - Cross-service netpol: GC allows MH on 50051, MC allows MH on 50053 → `gc-service/network-policy.yaml`, `mc-service/network-policy.yaml`
 - MC/MH are StatefulSets with per-pod NodePort Services (`statefulset.kubernetes.io/pod-name` selector) + headless Service (`clusterIP: None`)
@@ -56,6 +58,7 @@
 
 ## Observability
 - Observability Kustomize + Grafana → `infra/kubernetes/observability/`, `infra/grafana/dashboards/`
+- Dashboards + alerts → `infra/grafana/dashboards/`, `docs/observability/alerts.md`
 - Per-service metrics → `crates/{gc,mc,mh}-service/src/observability/metrics.rs`
 - Prometheus scrape config → `infra/docker/prometheus/prometheus.yml`
 
@@ -71,6 +74,10 @@
 
 ## GC Service
 - GC routes + handlers → `crates/gc-service/src/{routes/mod,handlers/meetings}.rs`
+
+## MC Join Integration Tests
+- MC join tests → `crates/mc-service/tests/join_tests.rs`
+- TestKeypair (Ed25519 + JWKS mock) → `crates/mc-test-utils/src/jwt_test.rs`
 
 ## Tests
 - MC join tests → `crates/mc-service/tests/join_tests.rs`

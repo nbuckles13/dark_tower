@@ -1,0 +1,141 @@
+# Kind cluster configuration template for ADR-0030 host-side cluster helper.
+# This template uses envsubst placeholders for dynamic port allocation,
+# enabling multiple concurrent devloop clusters with isolated ports.
+#
+# Usage (by the devloop helper):
+#   envsubst < kind-config.yaml.tmpl > /tmp/devloop-{slug}/kind-config.yaml
+#   kind create cluster --config=/tmp/devloop-{slug}/kind-config.yaml
+#
+# For manual development with static ports, use kind-config.yaml instead.
+#
+# See: docs/decisions/adr-0030-host-side-cluster-helper.md
+
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: ${CLUSTER_NAME}
+
+nodes:
+  - role: control-plane
+    extraPortMappings:
+      # --- AC (Auth Controller) ---
+      # Offset +0: AC HTTP (containerPort 30082 = future NodePort for AC)
+      - containerPort: 30082
+        hostPort: ${HOST_PORT_AC_HTTP}
+        listenAddress: "127.0.0.1"
+        protocol: TCP
+
+      # --- GC (Global Controller) ---
+      # Offset +1: GC HTTP (containerPort 30180 = future NodePort for GC HTTP)
+      - containerPort: 30180
+        hostPort: ${HOST_PORT_GC_HTTP}
+        listenAddress: "127.0.0.1"
+        protocol: TCP
+      # Offset +2: GC gRPC (containerPort 30051 = future NodePort for GC gRPC)
+      - containerPort: 30051
+        hostPort: ${HOST_PORT_GC_GRPC}
+        listenAddress: "127.0.0.1"
+        protocol: TCP
+
+      # --- MC-0 (Meeting Controller instance 0) ---
+      # Offset +10: MC-0 Health (containerPort 30810 = future NodePort)
+      - containerPort: 30810
+        hostPort: ${HOST_PORT_MC_0_HEALTH}
+        listenAddress: "127.0.0.1"
+        protocol: TCP
+      # Offset +11: MC-0 gRPC (containerPort 30520 = future NodePort)
+      - containerPort: 30520
+        hostPort: ${HOST_PORT_MC_0_GRPC}
+        listenAddress: "127.0.0.1"
+        protocol: TCP
+      # Offset +12: MC-0 WebTransport (containerPort 30433 = existing NodePort from mc-service-0)
+      - containerPort: 30433
+        hostPort: ${HOST_PORT_MC_0_WEBTRANSPORT}
+        listenAddress: "127.0.0.1"
+        protocol: UDP
+
+      # --- MC-1 (Meeting Controller instance 1) ---
+      # Offset +13: MC-1 Health (containerPort 30811 = future NodePort)
+      - containerPort: 30811
+        hostPort: ${HOST_PORT_MC_1_HEALTH}
+        listenAddress: "127.0.0.1"
+        protocol: TCP
+      # Offset +14: MC-1 gRPC (containerPort 30521 = future NodePort)
+      - containerPort: 30521
+        hostPort: ${HOST_PORT_MC_1_GRPC}
+        listenAddress: "127.0.0.1"
+        protocol: TCP
+      # Offset +15: MC-1 WebTransport (containerPort 30435 = existing NodePort from mc-service-1)
+      - containerPort: 30435
+        hostPort: ${HOST_PORT_MC_1_WEBTRANSPORT}
+        listenAddress: "127.0.0.1"
+        protocol: UDP
+
+      # --- MH-0 (Media Handler instance 0) ---
+      # Offset +20: MH-0 Health (containerPort 30830 = future NodePort)
+      - containerPort: 30830
+        hostPort: ${HOST_PORT_MH_0_HEALTH}
+        listenAddress: "127.0.0.1"
+        protocol: TCP
+      # Offset +21: MH-0 gRPC (containerPort 30530 = future NodePort)
+      - containerPort: 30530
+        hostPort: ${HOST_PORT_MH_0_GRPC}
+        listenAddress: "127.0.0.1"
+        protocol: TCP
+      # Offset +22: MH-0 WebTransport (containerPort 30434 = existing NodePort from mh-service-0)
+      - containerPort: 30434
+        hostPort: ${HOST_PORT_MH_0_WEBTRANSPORT}
+        listenAddress: "127.0.0.1"
+        protocol: UDP
+
+      # --- MH-1 (Media Handler instance 1) ---
+      # Offset +23: MH-1 Health (containerPort 30831 = future NodePort)
+      - containerPort: 30831
+        hostPort: ${HOST_PORT_MH_1_HEALTH}
+        listenAddress: "127.0.0.1"
+        protocol: TCP
+      # Offset +24: MH-1 gRPC (containerPort 30531 = future NodePort)
+      - containerPort: 30531
+        hostPort: ${HOST_PORT_MH_1_GRPC}
+        listenAddress: "127.0.0.1"
+        protocol: TCP
+      # Offset +25: MH-1 WebTransport (containerPort 30436 = existing NodePort from mh-service-1)
+      - containerPort: 30436
+        hostPort: ${HOST_PORT_MH_1_WEBTRANSPORT}
+        listenAddress: "127.0.0.1"
+        protocol: UDP
+
+      # --- Observability ---
+      # Offset +100: Prometheus (containerPort 30090 = existing NodePort)
+      - containerPort: 30090
+        hostPort: ${HOST_PORT_PROMETHEUS}
+        listenAddress: "127.0.0.1"
+        protocol: TCP
+      # Offset +101: Grafana (containerPort 30030 = existing NodePort)
+      - containerPort: 30030
+        hostPort: ${HOST_PORT_GRAFANA}
+        listenAddress: "127.0.0.1"
+        protocol: TCP
+      # Offset +102: Loki (containerPort 30080 = existing NodePort)
+      - containerPort: 30080
+        hostPort: ${HOST_PORT_LOKI}
+        listenAddress: "127.0.0.1"
+        protocol: TCP
+
+# Use containerd as the container runtime
+containerdConfigPatches:
+  - |-
+    [plugins."io.containerd.grpc.v1.cri".registry.mirrors."localhost:5001"]
+      endpoint = ["http://kind-registry:5000"]
+
+# Networking configuration for Calico
+networking:
+  # K8s API server on dynamic port, bound to loopback only
+  apiServerAddress: "127.0.0.1"
+  apiServerPort: ${HOST_PORT_K8S_API}
+  # Pod subnet - must match Calico's default
+  podSubnet: "192.168.0.0/16"
+  # Service subnet
+  serviceSubnet: "10.96.0.0/16"
+  # IMPORTANT: Disable default CNI so Calico can be installed
+  # This enables NetworkPolicy enforcement in both dev and CI
+  disableDefaultCNI: true

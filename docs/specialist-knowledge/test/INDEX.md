@@ -60,7 +60,7 @@
 - Teardown with cluster name support → `infra/kind/scripts/teardown.sh`
 - Helper binary (to be added) → `crates/devloop-helper/src/main.rs`
 - dev-cluster client CLI (to be added) → `infra/devloop/dev-cluster`
-- Kind config template (to be added) → `infra/kind/kind-config.yaml.tmpl`
+- Kind config template → `infra/kind/kind-config.yaml.tmpl`
 - Port map file → `~/.cache/devloop/devloop-{slug}/ports.json`
 - Cluster sidecar design doc (superseded) → `docs/debates/2026-04-05-devloop-cluster-sidecar.md`
 
