@@ -5,6 +5,7 @@
 - Validation pipeline (guards including metric guards) -> ADR-0024
 - Client architecture (telemetry, metrics, dashboards, synthetic probe) -> ADR-0028
 - Dashboard metric presentation (counters vs rates, increase/rate classification) -> ADR-0029
+- Host-side cluster helper (observability access, port discovery, health gating) -> ADR-0030
 
 ## Metrics
 - Metric catalogs -> `docs/observability/metrics/ac-service.md`, `gc-service.md`, `mc-service.md`, `mh-service.md`
@@ -58,6 +59,9 @@
 - Cross-service error dashboard -> `infra/grafana/dashboards/errors-overview.json`
 - Grafana provisioning + K8s kustomization -> `infra/grafana/provisioning/`, `infra/kubernetes/observability/`
 - Prometheus config -> `infra/docker/prometheus/prometheus.yml` (compose), `infra/kubernetes/observability/prometheus-config.yaml` (K8s)
+- Loki config -> `infra/kubernetes/observability/loki-config.yaml`
+- Observability kustomization -> `infra/kubernetes/observability/kustomization.yaml`
+- Kind observability NodePorts (Prometheus=30090, Grafana=30030, Loki=30080) -> `infra/kind/kind-config.yaml`
 - Alert + dashboard docs -> `docs/observability/alerts.md`, `docs/observability/dashboards.md`
 
 ## Guards
@@ -68,6 +72,14 @@
 ## Runbooks
 - Per-service deployment + incident response -> `docs/runbooks/` (two per service)
 - GC scenarios 8-9 + join failure triage -> `docs/runbooks/gc-incident-response.md`, `docs/observability/alerts.md`
+
+## Devloop Cluster Helper (Observability)
+- Helper binary (status command, observability.available flag) -> `crates/devloop-helper/src/main.rs`
+- Kind config template (listenAddress: 127.0.0.1, dynamic observability ports) -> `infra/kind/kind-config.yaml.tmpl`
+- Port map (prometheus, grafana, loki port discovery) -> `/tmp/devloop-{slug}/ports.json`
+- Env-test observability URL config -> `crates/env-tests/src/cluster.rs:ClusterPorts::from_env()`
+- Observability feature-gated tests -> `crates/env-tests/tests/30_observability.rs` (`--features observability`)
+- Cluster sidecar design doc (superseded by ADR-0030) -> `docs/debates/2026-04-05-devloop-cluster-sidecar.md`
 
 ## Test Coverage & Integration Seams
 - GC/MC/MH metrics tests -> `crates/gc-service/src/observability/metrics.rs` (+ mc, mh)

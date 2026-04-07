@@ -4,6 +4,7 @@
 - Infrastructure architecture (networking, zero-trust) -> `docs/decisions/adr-0012-infrastructure-architecture.md`
 - Local dev environment (Kind + Calico) -> `docs/decisions/adr-0013-local-development-environment.md`
 - Containerized devloop execution model -> `docs/decisions/adr-0025-containerized-devloop.md`
+- Host-side cluster helper for integration testing -> `docs/decisions/adr-0030-host-side-cluster-helper.md`
 - Client architecture (CDN deployment, Nx build pipeline, synthetic probe sizing) -> ADR-0028
 - Dashboard metric presentation (counters vs rates, $__rate_interval) -> ADR-0029
 
@@ -39,15 +40,26 @@
 - Grafana dashboards -> `infra/grafana/dashboards/`
 - Grafana provisioning -> `infra/grafana/provisioning/`
 - Kind cluster config -> `infra/kind/kind-config.yaml`
+- Kind cluster config template (dynamic ports) -> `infra/kind/kind-config.yaml.tmpl` (new, ADR-0030)
 - Kind cluster setup script -> `infra/kind/scripts/setup.sh`
 - Local iteration (Telepresence) -> `infra/kind/scripts/iterate.sh`
 - Cluster teardown -> `infra/kind/scripts/teardown.sh`
 - Skaffold dev workflow -> `infra/skaffold.yaml`
 - Containerized devloop -> `infra/devloop/devloop.sh`
+- Cluster helper binary (host-side) -> `crates/devloop-helper/src/main.rs` (new, ADR-0030)
+- dev-cluster client CLI -> `infra/devloop/dev-cluster` (new, ADR-0030)
+- Cluster sidecar design (superseded by ADR-0030) -> `docs/debates/2026-04-05-devloop-cluster-sidecar.md`
 - Docker Compose (local tests) -> `docker-compose.test.yml`
 - Dev TLS cert generation (CA + MC + MH certs) -> `scripts/generate-dev-certs.sh`
 - CI pipeline -> `.github/workflows/ci.yml`
 - Fuzz nightly -> `.github/workflows/fuzz-nightly.yml`
+
+## Host-Side Cluster Helper (ADR-0030)
+- Port registry (global, all devloops) -> `~/.cache/devloop/port-registry.json`
+- Per-devloop runtime state -> `~/.cache/devloop/devloop-{slug}/` (PID file, socket, auth token, ports.json, log)
+- Port range: 20000-29999, stride 200, hash-preferred with registry collision resolution
+- Env-test URL config -> `crates/env-tests/src/cluster.rs:ClusterPorts::from_env()`
+- Host-side debate record -> `docs/debates/2026-04-07-host-side-cluster-helper/debate.md`
 
 ## Health Probes
 - MC health endpoints (liveness + readiness) -> `crates/mc-service/src/observability/health.rs:health_router()`
