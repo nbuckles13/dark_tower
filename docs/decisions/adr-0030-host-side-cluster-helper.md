@@ -296,6 +296,25 @@ The purpose of integrating Kind and env-tests into the devloop is to **catch int
 
 **Optional**: `--skip-observability` flag skips Prometheus/Grafana/Loki/Promtail deployment, saving ~1.5 GB per cluster. Observability env-tests automatically skipped when stack not deployed.
 
+### System Limits (inotify)
+
+Running multiple Kind clusters requires increased inotify limits. Each Kind node uses inotify for kubelet, kube-proxy, and controllers. The default `max_user_instances=128` is insufficient for 2+ concurrent clusters — kube-proxy crashes with "too many open files," cascading to Calico and networking failures.
+
+```bash
+# Check current limits
+sysctl fs.inotify.max_user_instances fs.inotify.max_user_watches
+
+# Increase (immediate)
+sudo sysctl fs.inotify.max_user_instances=1024
+sudo sysctl fs.inotify.max_user_watches=1048576
+
+# Persist across reboots (add to /etc/sysctl.conf or /etc/sysctl.d/)
+echo "fs.inotify.max_user_instances=1024" | sudo tee -a /etc/sysctl.d/99-kind.conf
+echo "fs.inotify.max_user_watches=1048576" | sudo tee -a /etc/sysctl.d/99-kind.conf
+```
+
+The helper should check these limits at startup and warn if too low for multi-cluster operation.
+
 ## Implementation Guidance
 
 ### Dependency Order

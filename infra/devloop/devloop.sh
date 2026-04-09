@@ -156,6 +156,17 @@ if [ -z "${ANTHROPIC_API_KEY:-}" ] && [ ! -f "${HOME}/.claude/.credentials.json"
     exit 1
 fi
 
+# Check inotify limits for Kind multi-cluster support
+if [ -f /proc/sys/fs/inotify/max_user_instances ]; then
+    INOTIFY_INSTANCES=$(cat /proc/sys/fs/inotify/max_user_instances)
+    if [ "$INOTIFY_INSTANCES" -lt 512 ]; then
+        echo "WARNING: fs.inotify.max_user_instances=${INOTIFY_INSTANCES} (recommend 1024+)" >&2
+        echo "  Kind clusters may fail with 'too many open files'." >&2
+        echo "  Fix: sudo sysctl fs.inotify.max_user_instances=1024" >&2
+        echo ""
+    fi
+fi
+
 # ─── Build image if needed ───────────────────────────────────────
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

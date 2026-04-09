@@ -95,6 +95,25 @@ sudo sh get-docker.sh
 docker --version
 ```
 
+### System Limits (Linux/WSL2)
+
+Running Kind clusters (especially multiple concurrent clusters for devloop) requires increased inotify limits. The defaults are too low and cause "too many open files" errors in kube-proxy:
+
+```bash
+# Check current limits
+sysctl fs.inotify.max_user_instances fs.inotify.max_user_watches
+
+# Increase (immediate)
+sudo sysctl fs.inotify.max_user_instances=1024
+sudo sysctl fs.inotify.max_user_watches=1048576
+
+# Persist across reboots
+echo "fs.inotify.max_user_instances=1024" | sudo tee -a /etc/sysctl.d/99-kind.conf
+echo "fs.inotify.max_user_watches=1048576" | sudo tee -a /etc/sysctl.d/99-kind.conf
+```
+
+> **Symptom without this fix**: kube-proxy CrashLoopBackOff with "too many open files," Calico init fails, all pods stuck in Pending.
+
 ### Optional Tools
 
 ```bash
@@ -416,6 +435,20 @@ kubectl get pods -A
 # Delete and recreate
 ./infra/kind/scripts/teardown.sh
 ./infra/kind/scripts/setup.sh
+```
+
+### kube-proxy CrashLoopBackOff / "too many open files"
+
+This happens when inotify limits are too low, especially with multiple Kind clusters:
+
+```bash
+# Check if this is the issue
+kubectl logs -n kube-system -l k8s-app=kube-proxy | grep "too many open files"
+
+# Fix: increase inotify limits (see Prerequisites > System Limits above)
+sudo sysctl fs.inotify.max_user_instances=1024
+
+# Existing pods should self-heal after the limit increase
 ```
 
 ### Pods Not Ready
