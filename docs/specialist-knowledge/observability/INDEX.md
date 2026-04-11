@@ -5,7 +5,7 @@
 - Validation pipeline (guards including metric guards) -> ADR-0024
 - Client architecture (telemetry, metrics, dashboards, synthetic probe) -> ADR-0028
 - Dashboard metric presentation (counters vs rates, increase/rate classification) -> ADR-0029
-- Host-side cluster helper (observability access, port discovery, health gating) -> ADR-0030
+- Host-side cluster helper (observability access, port discovery, health gating, listenAddress fix) -> ADR-0030
 
 ## Metrics
 - Metric catalogs -> `docs/observability/metrics/ac-service.md`, `docs/observability/metrics/gc-service.md`, `docs/observability/metrics/mc-service.md`, `docs/observability/metrics/mh-service.md`
@@ -42,7 +42,7 @@
 - Teardown (parameterized cluster name, scoped pkill) -> `infra/kind/scripts/teardown.sh`
 
 ## Devloop Cluster Helper (Observability)
-- Kind config template (listenAddress: 127.0.0.1, dynamic observability ports) -> `infra/kind/kind-config.yaml.tmpl`
+- Kind config template (listenAddress: ${HOST_GATEWAY_IP}, dynamic observability ports) -> `infra/kind/kind-config.yaml.tmpl`
 - Port map (prometheus, grafana, loki port discovery) -> `/tmp/devloop-{slug}/ports.json`
 - Env-test observability URL config -> `crates/env-tests/src/cluster.rs:ClusterPorts::from_env()`
 - Env-tests observability validation -> `crates/env-tests/tests/30_observability.rs`

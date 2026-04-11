@@ -3,7 +3,7 @@
 ## Architecture & Design
 - Infrastructure architecture (Kind, zero-trust) → ADR-0012; Local dev → ADR-0013
 - Env integration tests → ADR-0014; Guard pipeline → ADR-0015; CI gates → ADR-0024
-- Containerized devloop → ADR-0025; Host-side cluster helper → ADR-0030
+- Containerized devloop → ADR-0025; Host-side cluster helper (incl. cluster networking) → ADR-0030
 - Dashboard metric presentation (counters vs rates) → ADR-0029
 
 ## CI & Guards
@@ -13,9 +13,10 @@
 - Application metrics guard → `scripts/guards/simple/validate-application-metrics.sh`
 
 ## Devloop Cluster Helper
-- Kind config template (envsubst, 18 port mappings) → `infra/kind/kind-config.yaml.tmpl`
+- Kind config template (envsubst, host-gateway listenAddress) → `infra/kind/kind-config.yaml.tmpl`
 - Devloop wrapper → `infra/devloop/devloop.sh`, container image → `infra/devloop/Dockerfile`
-- Cluster helper design doc → `docs/debates/2026-04-05-devloop-cluster-sidecar.md`
+- Cluster networking debate → `docs/debates/2026-04-09-devloop-cluster-networking/debate.md`
+- Sidecar design doc (superseded by ADR-0030) → `docs/debates/2026-04-05-devloop-cluster-sidecar.md`
 - Host state directory → `~/.cache/devloop/` (port-registry.json, per-slug state)
 - Env-test URL config → `crates/env-tests/src/cluster.rs:ClusterPorts::from_env()`
 - URL parsing for health checks → `crates/env-tests/src/cluster.rs:parse_host_port()`
