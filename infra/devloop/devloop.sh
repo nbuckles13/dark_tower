@@ -64,6 +64,12 @@ if $REBUILD_IMAGE && [ -z "${1:-}" ]; then
 fi
 
 TASK_SLUG="${1:?Usage: devloop.sh [--rebuild] <task-slug> [base-branch]}"
+# Kind cluster names must be DNS labels (a-z, 0-9, hyphens only).
+if [[ ! "$TASK_SLUG" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]]; then
+    echo "ERROR: Invalid task slug: '${TASK_SLUG}'" >&2
+    echo "  Must be lowercase alphanumeric with hyphens (e.g., 'my-task-42')" >&2
+    exit 1
+fi
 BASE_BRANCH="${2:-$(git rev-parse --abbrev-ref HEAD)}"
 
 # Resolve paths relative to the repo root
