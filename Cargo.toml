@@ -13,6 +13,7 @@ members = [
     "crates/proto-gen",
     "crates/media-protocol",
     "crates/env-tests",
+    "crates/devloop-helper",
 ]
 
 exclude = [

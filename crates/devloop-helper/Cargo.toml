@@ -1,0 +1,31 @@
+[package]
+name = "devloop-helper"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# ADR-0030: Host-side cluster helper for autonomous integration testing.
+# This is a compiled binary that manages Kind cluster lifecycle from the host.
+# It parses untrusted input from a unix socket and executes host-level commands,
+# so workspace lints (no-panic) are enforced to prevent crashes mid-operation.
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "devloop-helper"
+path = "src/main.rs"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+chrono = { workspace = true }
+hex = { workspace = true }
+ring = { workspace = true }
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
