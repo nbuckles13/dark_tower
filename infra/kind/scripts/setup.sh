@@ -398,14 +398,15 @@ deploy_observability() {
 run_migrations() {
     log_step "Running database migrations..."
 
-    # Start port-forward in background
-    ${KUBECTL} port-forward -n dark-tower svc/postgres 5432:5432 &
+    # Start port-forward in background (use dynamic port for multi-cluster support)
+    local pg_port="${POSTGRES_PORT:-5432}"
+    ${KUBECTL} port-forward -n dark-tower svc/postgres "${pg_port}:5432" &
     PF_PID=$!
 
     # Give it a moment to establish
     sleep 3
 
-    export DATABASE_URL="postgresql://darktower:dev_password_change_in_production@localhost:5432/dark_tower"
+    export DATABASE_URL="postgresql://darktower:dev_password_change_in_production@localhost:${pg_port}/dark_tower"
 
     # Check if sqlx is available
     if command -v sqlx &> /dev/null; then
@@ -414,7 +415,7 @@ run_migrations() {
     else
         log_warn "sqlx-cli not installed. Run migrations manually:"
         log_warn "  cargo install sqlx-cli --no-default-features --features postgres"
-        log_warn "  export DATABASE_URL=\"postgresql://darktower:dev_password_change_in_production@localhost:5432/dark_tower\""
+        log_warn "  export DATABASE_URL=\"postgresql://darktower:dev_password_change_in_production@localhost:${pg_port}/dark_tower\""
         log_warn "  sqlx migrate run"
     fi
 

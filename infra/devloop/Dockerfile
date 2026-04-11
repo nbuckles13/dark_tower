@@ -22,6 +22,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     bc \
     postgresql-client \
     python3-yaml \
+    socat \
     && rm -rf /var/lib/apt/lists/*
 
 # Nightly toolchain (required by guards/strip-test-code.sh)
@@ -43,6 +44,17 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
     apt-get update && apt-get install -y --no-install-recommends gh && \
     rm -rf /var/lib/apt/lists/*
 
+# kubectl for Kind cluster access (ADR-0030)
+# Version pinned to match Kind's default K8s version; sha256 verified at build time.
+ARG KUBECTL_VERSION=v1.32.3
+RUN curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl" \
+        -o /usr/local/bin/kubectl \
+    && curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl.sha256" \
+        -o /tmp/kubectl.sha256 \
+    && echo "$(cat /tmp/kubectl.sha256)  /usr/local/bin/kubectl" | sha256sum -c - \
+    && chmod +x /usr/local/bin/kubectl \
+    && rm -f /tmp/kubectl.sha256
+
 # Node.js 22 + Claude Code CLI
 RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
     apt-get install -y --no-install-recommends nodejs && \
@@ -63,6 +75,10 @@ RUN mkdir -p /tmp/cargo-home && chmod 777 /tmp/cargo-home
 # Entrypoint script
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
+
+# dev-cluster client CLI for Kind cluster management (ADR-0030)
+COPY dev-cluster /usr/local/bin/dev-cluster
+RUN chmod +x /usr/local/bin/dev-cluster
 
 WORKDIR /work
 

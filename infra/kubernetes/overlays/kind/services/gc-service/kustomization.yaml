@@ -3,6 +3,7 @@ kind: Kustomization
 
 resources:
   - ../../../../../services/gc-service
+  - nodeport.yaml
 
 labels:
   - pairs:

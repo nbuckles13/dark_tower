@@ -411,7 +411,7 @@ Before any other implementation, the full networking chain was verified:
 5. **Kind NodePort via gateway IP**: Kind cluster with `listenAddress: "${HOST_GATEWAY_IP}"` for NodePort — reachable from container
 6. **K8s API via extraPortMappings**: Dual-port pattern — `apiServerAddress: "127.0.0.1"` for host kubectl + `extraPortMappings` for port 6443 on gateway IP for container kubectl
 
-All tests passed. Verification scripts at `infra/devloop/test-adr0031.sh` and `infra/devloop/test-adr0031-api.sh`.
+All tests passed (verified manually on WSL2 before implementation).
 
 ### Explicit Prohibitions
 

@@ -11,10 +11,15 @@ echo "=== Dark Tower dev container starting ==="
 mkdir -p "${CARGO_HOME:-/tmp/cargo-home}"
 export PATH="/usr/local/cargo/bin:${PATH}"
 
-# Wait for postgres to be ready (sidecar in the same pod)
-echo "Waiting for PostgreSQL..."
+# Wait for postgres to be ready.
+# With named networks (ADR-0030), DB is at $DB_HOST:5432 via container DNS.
+# With --network container: (legacy), DB is at localhost:5432.
+DB_HOST="${DATABASE_URL##*@}"    # strip everything before @
+DB_HOST="${DB_HOST%%:*}"         # strip port and everything after
+DB_HOST="${DB_HOST:-localhost}"   # fallback
+echo "Waiting for PostgreSQL at ${DB_HOST}..."
 for i in $(seq 1 30); do
-    if pg_isready -h localhost -p 5432 -U postgres -q 2>/dev/null; then
+    if pg_isready -h "$DB_HOST" -p 5432 -U postgres -q 2>/dev/null; then
         echo "PostgreSQL ready."
         break
     fi
