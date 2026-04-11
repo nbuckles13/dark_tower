@@ -8,7 +8,7 @@
 - Validation pipeline (guards, coverage) -> `docs/decisions/adr-0024-agent-teams-workflow.md`
 - Coverage thresholds -> `.codecov.yml`
 - Client architecture (4-tier testing, test-utils, flaky policy) -> ADR-0028
-- Host-side cluster helper (env-test execution, URL config, attempt budgets) -> `docs/decisions/adr-0030-host-side-cluster-helper.md`
+- Host-side cluster helper (env-test execution, URL config, attempt budgets, cluster networking) -> `docs/decisions/adr-0030-host-side-cluster-helper.md`
 
 ## Code Locations: AC Service
 - Integration + fault injection tests -> `crates/ac-service/tests/integration/`, `crates/ac-service/tests/fault_injection/`
@@ -58,7 +58,7 @@
 - Image loading (podman/docker) → `infra/kind/scripts/setup.sh:load_image_to_kind()`
 - Env vars: DT_CLUSTER_NAME, DT_PORT_MAP → `infra/kind/scripts/setup.sh` (lines 37, 48-63)
 - Teardown with cluster name support → `infra/kind/scripts/teardown.sh`
-- Kind config template → `infra/kind/kind-config.yaml.tmpl`
+- Kind config template (listenAddress: HOST_GATEWAY_IP per ADR-0030) → `infra/kind/kind-config.yaml.tmpl`
 - Port map file → `~/.cache/devloop/devloop-{slug}/ports.json`
 - Cluster sidecar design doc (superseded) → `docs/debates/2026-04-05-devloop-cluster-sidecar.md`
 

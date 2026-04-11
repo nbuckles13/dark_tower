@@ -2,7 +2,7 @@
 
 **Status**: Accepted
 
-**Date**: 2026-04-07
+**Date**: 2026-04-07 (amended 2026-04-09)
 
 **Deciders**: Infrastructure, Security, Test, Observability, Operations (via design debate)
 
@@ -24,7 +24,7 @@ The original ADR-0030 design proposed a privileged sidecar container running Kin
 
 **Constraints:**
 - ADR-0025 requires `--userns=keep-id` for file ownership (incompatible with `--pod` in podman)
-- Dev container shares DB container's network namespace (cannot reach host ports on localhost)
+- Dev container on a named podman network cannot reach `127.0.0.1`-bound host services (separate loopback binding)
 - Multiple concurrent devloops must be supported with isolated clusters
 - Dev machines range from 16 GB to 64 GB RAM
 
@@ -43,15 +43,15 @@ Host
 │   └── Manages dedicated Kind cluster: devloop-{slug}
 │
 ├── Kind cluster: devloop-{slug} (host-level, normal Kind)
-│   └── NodePorts bound on 127.0.0.1
+│   └── NodePorts bound on ${HOST_GATEWAY_IP} (podman host-gateway address)
 │
-└── Containers (shared network namespace)
+└── Named podman network: devloop-{slug}-net
     ├── Dev container (unprivileged, Claude Code)
     │   ├── kubectl + kubeconfig (read-only, targets devloop cluster)
     │   ├── Runs env-tests directly (cargo test -p env-tests)
-    │   ├── Reaches Kind services via host.containers.internal
+    │   ├── Reaches Kind services via host.containers.internal → ${HOST_GATEWAY_IP}
     │   └── dev-cluster client → unix socket → helper (build/deploy only)
-    └── DB container (postgres)
+    └── DB container (postgres, reachable via container DNS name)
 ```
 
 ### Helper Process
@@ -88,6 +88,7 @@ The helper handles only operations that require the host's container runtime (po
 | `rebuild-all` | Rebuild all service images | Same |
 | `deploy <service>` | Apply manifests only (no image rebuild) | Uses setup.sh which manages kind-specific operations |
 | `teardown` | Delete Kind cluster, clean up all state | Requires `kind delete cluster` |
+| `status` | Report cluster existence, API reachability, port allocations, readiness flag | Helper-internal state + kubectl connectivity check |
 
 **Input validation**: All arguments validated via Rust enums/match. Service names: `ac`, `gc`, `mc`, `mh` (exhaustive enum match). No shell interpolation — all commands use `Command::new().arg()`.
 
@@ -144,7 +145,8 @@ This keeps tests portable and helper-agnostic — the same env-tests work when r
 | +100 | Prometheus | TCP |
 | +101 | Grafana | TCP |
 | +102 | Loki | TCP |
-| +103 | K8s API | TCP |
+| +103 | K8s API (host, 127.0.0.1) | TCP |
+| +104 | K8s API (gateway, ${HOST_GATEWAY_IP}) | TCP |
 
 MC/MH replica counts are read from the deployment manifests at setup time (e.g., `kubectl get deployment mc-service -o jsonpath='{.spec.replicas}'`). Ports are allocated per instance (MC-0, MC-1, etc.) to support per-pod addressing. Observability ports placed at +100 to leave room for additional service instances. 200-port stride accommodates growth.
 
@@ -155,8 +157,8 @@ MC/MH replica counts are read from the deployment manifests at setup time (e.g.,
 ```json
 {
   "cluster_name": "devloop-td-42",
+  "host_gateway_ip": "10.255.255.254",
   "host": "host.containers.internal",
-  "host_fallback": "172.17.0.1",
   "ports": {
     "ac_http": 24200,
     "gc_http": 24201,
@@ -167,25 +169,29 @@ MC/MH replica counts are read from the deployment manifests at setup time (e.g.,
     "prometheus": 24300,
     "grafana": 24301,
     "loki": 24302,
-    "k8s_api": 24303
+    "k8s_api": 24303,
+    "k8s_api_gateway": 24304
   },
   "container_urls": {
     "ac": "http://host.containers.internal:24200",
     "gc": "http://host.containers.internal:24201",
+    "k8s_api": "https://host.containers.internal:24304",
     "prometheus": "http://host.containers.internal:24300",
     "grafana": "http://host.containers.internal:24301"
   },
   "host_urls": {
-    "ac": "http://localhost:24200",
-    "gc": "http://localhost:24201",
-    "grafana": "http://localhost:24301"
+    "ac": "http://10.255.255.254:24200",
+    "gc": "http://10.255.255.254:24201",
+    "k8s_api": "https://127.0.0.1:24303",
+    "grafana": "http://10.255.255.254:24301"
   },
   "created_at": "2026-04-07T10:30:00Z"
 }
 ```
 
-- `container_urls`: for env-tests and kubectl inside the dev container (use `host` address)
-- `host_urls`: for human browser access and host-side tools (use `localhost`)
+- `container_urls`: for env-tests and kubectl inside the dev container (use `host.containers.internal`)
+- `host_urls`: for host-side tools (use `${HOST_GATEWAY_IP}` for NodePorts, `127.0.0.1` for K8s API)
+- Human browser access to Grafana requires `kubectl port-forward` or a separate `127.0.0.1` port mapping
 - Written by helper after cluster creation, read by `dev-cluster` client and `devloop.sh`
 - Host location: `~/.cache/devloop/devloop-{slug}/ports.json` (XDG-compliant, survives reboots)
 - Bind-mounted into dev container at `/tmp/devloop/ports.json`
@@ -198,10 +204,63 @@ With container-side test execution, the dev container needs reliable host access
 - Grafana/Prometheus/Loki access for observability tests and debugging (critical path)
 - Unix socket to helper (bind-mounted, no TCP needed)
 
-**Primary**: `host.containers.internal` — podman's built-in host gateway DNS
-**Fallback**: Gateway IP from `podman inspect` (for older podman or `--network container:` edge cases)
+#### Key Discovery: Host-Gateway Address on Loopback
 
-**CRITICAL: Early verification required.** Since the dev container uses `--network container:$DB_CONTAINER`, DNS resolution may behave differently than standard podman networking. `host.containers.internal` must be verified as **Step 0** of the implementation — if it doesn't resolve in this mode, the gateway IP fallback becomes the primary mechanism. This is a hard blocker for container-side test execution; without a working container→host path, env-tests cannot reach the Kind cluster.
+`host.containers.internal` resolves to `10.255.255.254` (or similar), which podman's slirp4netns binds to the **host's loopback interface**:
+
+```
+$ ip addr show lo
+inet 10.255.255.254/32 brd 10.255.255.254 scope global lo
+```
+
+This means services bound to `${HOST_GATEWAY_IP}` are:
+- **Reachable from containers** via `host.containers.internal` (podman gateway routing)
+- **NOT reachable from `127.0.0.1`** (different loopback binding — other localhost services remain isolated)
+- **NOT reachable from the LAN** (loopback-scoped, not on any routable interface)
+
+By setting Kind NodePort `listenAddress` to `${HOST_GATEWAY_IP}` instead of `127.0.0.1`, all cluster services become reachable from the dev container without `--network=host` or any TCP forwarding layer. Empirically verified on WSL2 with named podman networks.
+
+#### Dynamic Host-Gateway Detection
+
+The host-gateway IP must be detected at runtime, not hardcoded. Detection order:
+
+1. `podman info --format '{{.Host.NetworkBackendInfo.DNS.HostGatewayIP}}'`
+2. Parse `/etc/hosts` for `host.containers.internal` entry
+3. Fail with actionable error if neither works
+
+`devloop.sh` detects the IP once at startup and passes it to the Kind config template via `envsubst`.
+
+#### Named Podman Network
+
+Replace `--network container:$DB_CONTAINER` with a **named podman network** per devloop:
+
+```bash
+podman network create "devloop-${TASK_SLUG}-net" 2>/dev/null || true
+
+podman run -d --name "$DB_CONTAINER" \
+    --network "devloop-${TASK_SLUG}-net" \
+    -e POSTGRES_PASSWORD=postgres \
+    docker.io/library/postgres:16-bookworm
+
+podman run -d --name "$DEV_CONTAINER" \
+    --userns=keep-id \
+    --network "devloop-${TASK_SLUG}-net" \
+    -e DATABASE_URL="postgresql://postgres:postgres@${DB_CONTAINER}:5432/dark_tower_test" \
+    ...
+```
+
+Named networks are strictly better than `--network container:`:
+- **Container DNS**: DB reachable via container name (`$DB_CONTAINER:5432`) instead of `localhost:5432`
+- **Bridge networking**: proper `eth0` interface instead of slirp4netns tap device
+- **Per-devloop isolation**: each devloop gets its own network
+- **`host.containers.internal` works**: resolves to `${HOST_GATEWAY_IP}`, routes to host-gateway-bound ports
+- **`--userns=keep-id` compatible**: empirically verified (unlike `--pod`)
+
+```
+Container (--network devloop-${TASK_SLUG}-net)
+├── $DB_CONTAINER:5432 → PostgreSQL (via container DNS on named network)
+└── host.containers.internal:$PORT → Kind NodePorts (via podman gateway → ${HOST_GATEWAY_IP})
+```
 
 The helper writes the verified host address into `ports.json` so `ClusterPorts::from_env()` and kubeconfig both use the correct address.
 
@@ -215,13 +274,23 @@ nodes:
     extraPortMappings:
       - containerPort: 30090
         hostPort: ${HOST_PORT_PROMETHEUS}
-        listenAddress: "127.0.0.1"
+        listenAddress: "${HOST_GATEWAY_IP}"
         protocol: TCP
+      # K8s API accessible from containers (dual-port pattern)
+      - containerPort: 6443
+        hostPort: ${HOST_PORT_K8S_API_GATEWAY}
+        listenAddress: "${HOST_GATEWAY_IP}"
+        protocol: TCP
+networking:
+  apiServerAddress: "127.0.0.1"
+  apiServerPort: ${HOST_PORT_K8S_API}
 ```
 
 **Generation**: Helper runs `envsubst < kind-config.yaml.tmpl > /tmp/devloop-{slug}/kind-config.yaml`
 
-**Security**: All NodePorts bind to `127.0.0.1` (listenAddress) to prevent LAN exposure.
+**Security**: All NodePorts bind to `${HOST_GATEWAY_IP}` — reachable from containers via `host.containers.internal`, NOT reachable from `127.0.0.1` or the LAN.
+
+**Dual-port K8s API pattern**: `apiServerAddress: "127.0.0.1"` keeps host kubectl working via `localhost:${HOST_PORT_K8S_API}`. A separate `extraPortMappings` entry for port 6443 on `${HOST_GATEWAY_IP}:${HOST_PORT_K8S_API_GATEWAY}` makes the API reachable from containers. The container kubeconfig points to `host.containers.internal:${HOST_PORT_K8S_API_GATEWAY}`.
 
 **Static file preserved**: Existing `kind-config.yaml` kept for manual `setup.sh` usage with default ports.
 
@@ -321,7 +390,7 @@ The helper should check these limits at startup and warn if too low for multi-cl
 
 | Step | Task | Blocked By |
 |------|------|------------|
-| 0 | **Verify `host.containers.internal`** with `--network container:` mode. Quick test: create a DB container, attach a dev container with `--network container:$DB`, run `curl http://host.containers.internal:$SOME_HOST_PORT`. If it fails, implement gateway IP fallback and use that as primary. This is a **hard blocker** for container-side test execution. | — |
+| 0 | **Verify full networking chain** with named podman network and `listenAddress: "${HOST_GATEWAY_IP}"`. See Verification section below. This is a **hard blocker** for container-side test execution. | — |
 | 1 | `ClusterPorts::from_env()` in env-tests | — |
 | 2 | setup.sh parameterization (`--cluster-name`, `--yes`, `--only`) | — |
 | 3 | Kind config template (`kind-config.yaml.tmpl`) with per-instance MC/MH ports | — |
@@ -329,7 +398,43 @@ The helper should check these limits at startup and warn if too low for multi-cl
 | 5 | `devloop.sh` changes (launch helper, bind-mount socket + kubeconfig, port map, kubectl in image) | Step 4 |
 | 6 | Devloop skill Layer 8 integration | Step 5 |
 
-Step 0 is a quick verification (~5 min). Steps 1-3 are independent. Steps 4-6 are sequential.
+Step 0 is verified (see below). Steps 1-3 are independent. Steps 4-6 are sequential.
+
+### Step 0 Verification (Complete)
+
+Before any other implementation, the full networking chain was verified:
+
+1. **Gateway IP on loopback**: `ip addr show lo` confirms `10.255.255.254/32` on loopback
+2. **Named network + container DNS**: DB container reachable from client via container name (`pg_isready -h $DB_CONTAINER`)
+3. **Gateway-IP port binding isolation**: Service bound to `${HOST_GATEWAY_IP}:PORT` — reachable from host via gateway IP, NOT reachable from `127.0.0.1` (isolation preserved)
+4. **Container → gateway-IP-bound port**: Container reaches gateway-IP-bound host port via `host.containers.internal` (THE KEY TEST)
+5. **Kind NodePort via gateway IP**: Kind cluster with `listenAddress: "${HOST_GATEWAY_IP}"` for NodePort — reachable from container
+6. **K8s API via extraPortMappings**: Dual-port pattern — `apiServerAddress: "127.0.0.1"` for host kubectl + `extraPortMappings` for port 6443 on gateway IP for container kubectl
+
+All tests passed. Verification scripts at `infra/devloop/test-adr0031.sh` and `infra/devloop/test-adr0031-api.sh`.
+
+### Explicit Prohibitions
+
+- **`--network=host` MUST NOT be used** for the dev container. It removes network isolation that ADR-0025 relies on for defense-in-depth.
+- **Podman socket MUST NOT be mounted** into the dev container. The podman socket grants full user-level host privileges — a container with socket access can run arbitrary containers with host filesystem mounts, defeating all ADR-0025 isolation guarantees. Build/deploy operations go through the helper's unix socket API with authentication.
+- **`listenAddress: "0.0.0.0"` MUST NOT be used** for Kind NodePorts. It exposes dev services to the LAN.
+
+### Observability Access
+
+Observability endpoint access (Prometheus, Grafana, Loki) from inside the container is a **stated requirement**, not a side effect. The networking solution supports:
+- Ad-hoc Prometheus queries for metric debugging
+- Grafana dashboard validation
+- Loki log searches for failure diagnosis
+
+The `--skip-observability` flag remains supported — when the observability stack isn't deployed, those ports aren't mapped and observability tests are auto-skipped.
+
+### Orphan Cleanup
+
+On `devloop.sh` startup:
+1. Scan port registry (`~/.cache/devloop/port-registry.json`) for entries whose PID is dead (`kill -0 $PID`)
+2. Scan for `devloop-*` Kind clusters with no corresponding running devloop container
+3. Clean up stale PID files (`/tmp/devloop-{slug}/helper.pid`) and state directories when associated clusters and containers are gone
+4. Prompt user to clean up stale clusters and remove dead registry entries
 
 ### Key Files
 
@@ -357,25 +462,28 @@ Step 0 is a quick verification (~5 min). Steps 1-3 are independent. Steps 4-6 ar
 ### Negative
 - Helper runs on the host outside container isolation boundary (accepted risk for dev tooling)
 - Dev container gets kubectl + kubeconfig (dev-only cluster, accepted risk)
-- Container→host networking (`host.containers.internal` or IP fallback) is critical path — must be verified early
+- `${HOST_GATEWAY_IP}` is podman/slirp4netns-specific — may differ on other container runtimes (mitigated by dynamic detection)
+- Human browser access to Grafana requires `kubectl port-forward` or separate `127.0.0.1` port mapping (convenience gap, not a blocker)
 - Orphaned Kind clusters possible on ungraceful exit (mitigated by startup scan)
 
 ### Neutral
 - Kind as cluster tool preserved (no production drift from k3s or alternatives)
 - All Kustomize manifests, Dockerfiles, service code unchanged
 - Existing manual `setup.sh` workflow backward compatible
+- Existing `kind-config.yaml` (static, for manual use) can keep `127.0.0.1` — only the template changes
 
 ## Participants
 
-- **Infrastructure** (95%): Host-native helper, envsubst templating, registry-based port allocation, host-side test execution confirmed, `host.containers.internal` accepted.
-- **Security** (95%): Compiled Rust binary eliminates injection class. Model A (host-side tests) with HOME override. Kubeconfig isolation preserved. Accepted risk documented.
-- **Test** (95%): `ClusterPorts::from_env()` only test code change. Host-side execution simplifies everything. Exit code classification for attempt budgets. MC/MH from GC join response.
-- **Observability** (93%): Flat JSON port map, `host.containers.internal`, `--skip-observability` for resource-constrained, `listenAddress: 127.0.0.1` for security.
-- **Operations** (93%): PID file lifecycle, multi-layer orphan cleanup, 200-stride port allocation, separate `--target-dir` for host builds, resource documentation.
+- **Infrastructure** (97%): Host-native helper, envsubst templating, registry-based port allocation. Verified named podman network + `--userns=keep-id` compatibility, container DNS, and `host.containers.internal` routing. Confirmed Kind passes `listenAddress` to podman `-p` flag.
+- **Security** (95%): Compiled Rust binary eliminates injection class. All ADR-0025 isolation preserved. `--network=host` and podman socket access explicitly prohibited. Container can reach Kind ports but not arbitrary localhost services.
+- **Test** (95%): `ClusterPorts::from_env()` only test code change. Zero test code changes for networking. Same feedback loop as running on host. Exit code classification for attempt budgets.
+- **Observability** (93%): Flat JSON port map, `host.containers.internal`, `--skip-observability` for resource-constrained. Prometheus/Grafana/Loki directly reachable. Observability access documented as a requirement.
+- **Operations** (95%): PID file lifecycle, multi-layer orphan cleanup, 200-stride port allocation. Gateway-IP binding is operationally clean. Dynamic detection, orphan cleanup with PID file and state directory scanning.
 
 ## Debate Reference
 
 See: `docs/debates/2026-04-07-host-side-cluster-helper/debate.md`
+Networking amendment: `docs/debates/2026-04-09-devloop-cluster-networking/debate.md`
 Prior art: `docs/debates/2026-04-05-devloop-cluster-sidecar.md` (sidecar approach, PoC failed)
 
 ## References
