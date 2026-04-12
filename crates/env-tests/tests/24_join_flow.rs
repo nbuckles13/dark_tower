@@ -510,37 +510,89 @@ async fn test_mc_webtransport_connect_and_join() {
     }
 }
 
-/// Test: MC rejects a JoinRequest with an invalid meeting token.
+/// Test: MC rejects JoinRequests with invalid credentials.
 ///
-/// Validates defense-in-depth: MC independently validates JWTs via AC's JWKS,
-/// rejecting tokens that are not properly signed. Uses a structurally valid
-/// but fake JWT (valid base64 header/payload, garbage signature) to exercise
-/// the signature verification path rather than just the malformed-token check.
+/// Validates defense-in-depth: MC independently validates meeting tokens and
+/// meeting IDs, rejecting mismatches and forged tokens. Uses the full
+/// AC→GC→MC flow to obtain a real meeting token, then sends it with:
+/// 1. A wrong meeting ID (valid token, wrong meeting)
+/// 2. A bogus token (forged JWT, correct meeting ID)
 #[tokio::test]
 async fn test_mc_rejects_invalid_meeting_token() {
     let cluster = cluster().await;
 
-    // Connect to MC directly — no need for GC join since we're testing rejection
-    let conn = connect_mc(cluster.mc_webtransport_url()).await;
+    let auth_client = AuthClient::new(&cluster.ac_base_url);
+    let gc_client = GcClient::new(&cluster.gc_base_url);
 
-    // Structurally valid JWT with garbage signature.
-    // Header: {"alg":"EdDSA","typ":"JWT"}
-    // Payload: {"sub":"attacker","meeting_id":"fake","exp":9999999999}
-    // Signature: invalid
+    // Step 1: Register user, create meeting, join via GC to get a real token
+    let (user_token, _display_name) = register_test_user(&auth_client, "Rejection Test User").await;
+
+    let create_request = CreateMeetingRequest::new("Rejection Test Meeting");
+    let created = gc_client
+        .create_meeting(&user_token, &create_request)
+        .await
+        .expect("Should create meeting");
+
+    let gc_join = gc_client
+        .join_meeting(&created.meeting_code, &user_token)
+        .await
+        .expect("Should join meeting via GC");
+
+    let mc_url = gc_join
+        .mc_assignment
+        .webtransport_endpoint
+        .as_ref()
+        .expect("MC assignment should include webtransport_endpoint");
+
+    let real_meeting_id = gc_join.meeting_id.to_string();
+
+    // Step 2: Valid token + wrong meeting ID → MC should reject
+    let conn = connect_mc(mc_url).await;
+    let response = send_join_and_read_response(
+        &conn,
+        "00000000-0000-0000-0000-000000000000",
+        &gc_join.token,
+        "Attacker",
+    )
+    .await;
+
+    match &response.message {
+        Some(server_message::Message::Error(e)) => {
+            assert!(
+                e.code == proto_gen::signaling::ErrorCode::Unauthorized as i32
+                    || e.code == proto_gen::signaling::ErrorCode::InvalidRequest as i32,
+                "MC should reject wrong meeting ID, got code: {} message: {}",
+                e.code,
+                e.message
+            );
+        }
+        Some(server_message::Message::JoinResponse(_)) => {
+            panic!("MC should NOT accept a token for a different meeting");
+        }
+        other => {
+            panic!(
+                "Expected Error from MC for wrong meeting ID, got {:?}",
+                other
+            );
+        }
+    }
+
+    // Step 3: Bogus token + correct meeting ID → MC should reject
+    // Structurally valid JWT with garbage signature to exercise signature verification.
     let fake_token = "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.\
         eyJzdWIiOiJhdHRhY2tlciIsIm1lZXRpbmdfaWQiOiJmYWtlIiwiZXhwIjo5OTk5OTk5OTk5fQ.\
         invalid_signature_that_will_not_verify";
 
-    let response =
-        send_join_and_read_response(&conn, "fake-meeting-id", fake_token, "Attacker").await;
+    let conn2 = connect_mc(mc_url).await;
+    let response2 =
+        send_join_and_read_response(&conn2, &real_meeting_id, fake_token, "Attacker").await;
 
-    // MC should return an error with Unauthorized code
-    match &response.message {
+    match &response2.message {
         Some(server_message::Message::Error(e)) => {
             assert_eq!(
                 e.code,
                 proto_gen::signaling::ErrorCode::Unauthorized as i32,
-                "MC should reject invalid token with Unauthorized, got code: {}",
+                "MC should reject bogus token with Unauthorized, got code: {}",
                 e.code
             );
             // Security: error message should be generic, not reveal validation details
@@ -553,11 +605,11 @@ async fn test_mc_rejects_invalid_meeting_token() {
             );
         }
         Some(server_message::Message::JoinResponse(_)) => {
-            panic!("MC should NOT accept a fake token — JoinResponse returned for invalid JWT");
+            panic!("MC should NOT accept a forged token");
         }
         other => {
             panic!(
-                "Expected Error(Unauthorized) from MC for invalid token, got {:?}",
+                "Expected Error(Unauthorized) from MC for bogus token, got {:?}",
                 other
             );
         }
