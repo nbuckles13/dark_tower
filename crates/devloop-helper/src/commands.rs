@@ -26,6 +26,10 @@ use std::time::{Duration, Instant};
 /// host-gateway IP (e.g., 10.255.255.254) inside containers.
 const CONTAINER_HOST: &str = "host.containers.internal";
 
+/// Default host-gateway IP for Kind NodePort listenAddress (ADR-0030).
+/// Used as fallback when `--host-gateway-ip` is not provided.
+const DEFAULT_HOST_GATEWAY_IP: &str = "10.255.255.254";
+
 /// Runtime context for command execution.
 pub struct Context {
     pub slug: String,
@@ -190,7 +194,10 @@ fn cmd_setup(
         detail: format!("failed to read kind-config template: {e}"),
     })?;
 
-    let gateway_ip = ctx.host_gateway_ip.as_deref().unwrap_or("10.255.255.254");
+    let gateway_ip = ctx
+        .host_gateway_ip
+        .as_deref()
+        .unwrap_or(DEFAULT_HOST_GATEWAY_IP);
     validate_gateway_ip(gateway_ip)?;
     let mut vars = ports::template_env_vars(&alloc, gateway_ip);
     vars.insert("CLUSTER_NAME".to_string(), ctx.cluster_name.clone());
@@ -259,12 +266,15 @@ fn cmd_setup(
     write_port_map_shell(&port_map_shell_path, &alloc)?;
 
     // Run setup.sh
+    // DT_HOST_GATEWAY_IP enables ConfigMap patching in setup.sh for devloop clusters
+    // (advertise addresses use gateway IP + dynamic ports instead of localhost defaults).
     eprintln!("[devloop-helper] setup: running setup.sh...");
     let mut setup_cmd = Command::new(ctx.project_root.join("infra/kind/scripts/setup.sh"));
     setup_cmd
         .arg("--yes")
         .env("DT_CLUSTER_NAME", &ctx.cluster_name)
         .env("DT_PORT_MAP", &port_map_shell_path)
+        .env("DT_HOST_GATEWAY_IP", gateway_ip)
         .env(env_key, env_val);
     if skip_observability {
         // TODO: setup.sh does not yet support --skip-observability;
@@ -313,6 +323,26 @@ fn write_port_map_shell(path: &Path, alloc: &PortAllocation) -> Result<(), Helpe
     )?;
     writeln!(file, "GRAFANA_PORT={}", alloc.port(PortOffsets::GRAFANA))?;
     writeln!(file, "LOKI_PORT={}", alloc.port(PortOffsets::LOKI))?;
+    writeln!(
+        file,
+        "MC_0_WEBTRANSPORT_PORT={}",
+        alloc.port(PortOffsets::MC_0_WEBTRANSPORT)
+    )?;
+    writeln!(
+        file,
+        "MC_1_WEBTRANSPORT_PORT={}",
+        alloc.port(PortOffsets::MC_1_WEBTRANSPORT)
+    )?;
+    writeln!(
+        file,
+        "MH_0_WEBTRANSPORT_PORT={}",
+        alloc.port(PortOffsets::MH_0_WEBTRANSPORT)
+    )?;
+    writeln!(
+        file,
+        "MH_1_WEBTRANSPORT_PORT={}",
+        alloc.port(PortOffsets::MH_1_WEBTRANSPORT)
+    )?;
 
     file.flush()?;
     Ok(())
@@ -399,7 +429,10 @@ fn generate_container_kubeconfig(ctx: &Context, alloc: &PortAllocation) -> Resul
     // server's TLS cert includes the IP as a SAN but not the DNS name.
     // HTTP services (AC, GC, etc.) can use host.containers.internal since they don't
     // do TLS cert validation.
-    let gw_ip = ctx.host_gateway_ip.as_deref().unwrap_or("10.255.255.254");
+    let gw_ip = ctx
+        .host_gateway_ip
+        .as_deref()
+        .unwrap_or(DEFAULT_HOST_GATEWAY_IP);
     let kubeconfig = rewrite_kubeconfig_server(&kubeconfig, gw_ip, gateway_k8s_port)?;
 
     let kubeconfig_path = ctx.runtime_dir.join("kubeconfig");
@@ -460,6 +493,13 @@ fn cmd_deploy(ctx: &Context, svc: Service, writer: &mut dyn Write) -> Result<(),
 
     let (env_key, env_val) = ctx.container_runtime.kind_provider_env();
 
+    // Validate and pass gateway IP so setup.sh can patch ConfigMap advertise addresses.
+    let gateway_ip = ctx
+        .host_gateway_ip
+        .as_deref()
+        .unwrap_or(DEFAULT_HOST_GATEWAY_IP);
+    validate_gateway_ip(gateway_ip)?;
+
     let port_map_shell_path = ctx.runtime_dir.join("port-map.env");
 
     run_command_streaming(
@@ -470,6 +510,7 @@ fn cmd_deploy(ctx: &Context, svc: Service, writer: &mut dyn Write) -> Result<(),
             .arg(svc.as_str())
             .env("DT_CLUSTER_NAME", &ctx.cluster_name)
             .env("DT_PORT_MAP", &port_map_shell_path)
+            .env("DT_HOST_GATEWAY_IP", gateway_ip)
             .env(env_key, env_val),
         &format!("setup.sh --skip-build --only {svc}"),
         writer,
@@ -1244,5 +1285,65 @@ current-context: kind-devloop-test
         assert!(validate_gateway_ip("not-an-ip").is_err());
         assert!(validate_gateway_ip("").is_err());
         assert!(validate_gateway_ip("999.999.999.999").is_err());
+    }
+
+    #[test]
+    fn test_write_port_map_shell() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("port-map.env");
+
+        let alloc = ports::PortAllocation {
+            base_port: 24200,
+            slot_index: 21,
+        };
+        write_port_map_shell(&path, &alloc).unwrap();
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+
+        // Verify all expected variables are present with correct values
+        let expected = [
+            ("AC_HTTP_PORT", alloc.port(PortOffsets::AC_HTTP)),
+            ("GC_HTTP_PORT", alloc.port(PortOffsets::GC_HTTP)),
+            ("MH_HEALTH_PORT", alloc.port(PortOffsets::MH_0_HEALTH)),
+            ("POSTGRES_PORT", alloc.port(PortOffsets::POSTGRES)),
+            ("PROMETHEUS_PORT", alloc.port(PortOffsets::PROMETHEUS)),
+            ("GRAFANA_PORT", alloc.port(PortOffsets::GRAFANA)),
+            ("LOKI_PORT", alloc.port(PortOffsets::LOKI)),
+            (
+                "MC_0_WEBTRANSPORT_PORT",
+                alloc.port(PortOffsets::MC_0_WEBTRANSPORT),
+            ),
+            (
+                "MC_1_WEBTRANSPORT_PORT",
+                alloc.port(PortOffsets::MC_1_WEBTRANSPORT),
+            ),
+            (
+                "MH_0_WEBTRANSPORT_PORT",
+                alloc.port(PortOffsets::MH_0_WEBTRANSPORT),
+            ),
+            (
+                "MH_1_WEBTRANSPORT_PORT",
+                alloc.port(PortOffsets::MH_1_WEBTRANSPORT),
+            ),
+        ];
+        for (name, port) in &expected {
+            let line = format!("{name}={port}");
+            assert!(
+                contents.contains(&line),
+                "port-map.env missing '{line}', contents:\n{contents}"
+            );
+        }
+
+        // Verify every non-comment, non-empty line matches setup.sh validation regex
+        let re = regex::Regex::new(r"^[A-Z_][A-Z0-9_]*=[0-9]+$").unwrap();
+        for line in contents.lines() {
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            assert!(
+                re.is_match(line),
+                "line does not match setup.sh validation regex: '{line}'"
+            );
+        }
     }
 }

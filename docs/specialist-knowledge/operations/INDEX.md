@@ -17,6 +17,8 @@
 - Devloop wrapper → `infra/devloop/devloop.sh`, container image → `infra/devloop/Dockerfile`
 - Cluster networking debate → `docs/debates/2026-04-09-devloop-cluster-networking/debate.md`
 - Sidecar design doc (superseded by ADR-0030) → `docs/debates/2026-04-05-devloop-cluster-sidecar.md`
+- Port-map.env generation (MC/MH WebTransport ports) → `crates/devloop-helper/src/commands.rs:write_port_map_shell()`
+- DT_HOST_GATEWAY_IP propagation → `crates/devloop-helper/src/commands.rs:cmd_setup()`, `cmd_deploy()`
 - Host state directory → `~/.cache/devloop/` (port-registry.json, per-slug state)
 - Env-test URL config → `crates/env-tests/src/cluster.rs:ClusterPorts::from_env()`
 - URL parsing for health checks → `crates/env-tests/src/cluster.rs:parse_host_port()`
@@ -27,9 +29,12 @@
 - Per-service Kustomize bases + manifests (statefulset/deployment, netpol, PDB) → `infra/services/ac-service/`, `gc-service/`, `mc-service/`, `mh-service/`
 - Dockerfiles → `infra/docker/ac-service/`, `gc-service/`, `mc-service/`, `mh-service/`; PostgreSQL + Redis → `infra/services/postgres/`, `redis/`
 - Dev certs → `scripts/generate-dev-certs.sh`; Alert rules → `infra/docker/prometheus/rules/gc-alerts.yaml`, `mc-alerts.yaml`
-- MC/MH: StatefulSets, per-pod NodePort Services (`statefulset.kubernetes.io/pod-name`), headless Service, TLS secrets (imperative via setup.sh)
+- MC/MH: per-instance Deployments, per-pod NodePort Services, TLS secrets (imperative via setup.sh)
+- MC/MH per-instance ConfigMaps (advertise addresses) → `infra/services/mc-service/mc-{0,1}-configmap.yaml`, `mh-service/mh-{0,1}-configmap.yaml`
+- Devloop ConfigMap patching (advertise addresses) → `infra/kind/scripts/setup.sh:deploy_mc_service()`, `deploy_mh_service()` (gated on `DT_HOST_GATEWAY_IP`)
+- DT_HOST_GATEWAY_IP validation → `infra/kind/scripts/setup.sh` (after DT_PORT_MAP sourcing)
 - Per-pod UDP NodePorts: `base + ordinal*2` (MC: 4433/4435, MH: 4434/4436); cross-service netpol in `gc-service/network-policy.yaml`, `mc-service/network-policy.yaml`
-- Downward API: `status.podIP` → `POD_IP`; WebTransport advertise from HOSTNAME ordinal
+- Downward API: `status.podIP` → `POD_IP`; WebTransport advertise from per-instance ConfigMap
 - Port map: AC=8082, GC=8080/50051, MC=8081/50052/4433, MH=8083/50053/4434; scaling requires per-pod Services + Kind port mappings
 
 ## Runbooks

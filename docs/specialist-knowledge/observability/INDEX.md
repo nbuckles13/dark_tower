@@ -39,11 +39,13 @@
 
 ## Kind Cluster Setup (Observability)
 - Setup (deploy_observability, setup_port_forwards, deploy_only_service, DT_CLUSTER_NAME/DT_PORT_MAP) -> `infra/kind/scripts/setup.sh`
+- Devloop ConfigMap patching (MC/MH advertise addresses, DT_HOST_GATEWAY_IP guard) -> `infra/kind/scripts/setup.sh:deploy_mc_service()`, `deploy_mh_service()`
 - Teardown (parameterized cluster name, scoped pkill) -> `infra/kind/scripts/teardown.sh`
 
 ## Devloop Cluster Helper (Observability)
 - Kind config template (listenAddress: ${HOST_GATEWAY_IP}, dynamic observability ports) -> `infra/kind/kind-config.yaml.tmpl`
 - Port map (prometheus, grafana, loki port discovery) -> `/tmp/devloop-{slug}/ports.json`
+- Port-map.env (observability + WebTransport port shell vars) -> `crates/devloop-helper/src/commands.rs:write_port_map_shell()`
 - Env-test observability URL config -> `crates/env-tests/src/cluster.rs:ClusterPorts::from_env()`
 - Env-tests observability validation -> `crates/env-tests/tests/30_observability.rs`
 
