@@ -216,15 +216,12 @@ impl ClusterConnection {
         let (grafana_host, grafana_port) = parse_host_port(&ports.grafana_url)?;
         Self::check_tcp_port(&grafana_host, grafana_port)?;
 
-        // Check optional Loki connectivity
+        // Loki is optional — validate URL format but skip the TCP probe.
+        // Availability is checked at test time via is_loki_available() (HTTP /ready),
+        // which is more reliable than a one-shot TCP probe at init time.
         let loki_base_url = if let Some(ref loki_url) = ports.loki_url {
-            let (loki_host, loki_port) = parse_host_port(loki_url)?;
-            if Self::check_tcp_port(&loki_host, loki_port).is_ok() {
-                Some(loki_url.clone())
-            } else {
-                // Loki is optional - just mark as unavailable
-                None
-            }
+            parse_host_port(loki_url)?; // validate format only
+            Some(loki_url.clone())
         } else {
             None
         };
