@@ -25,7 +25,7 @@
 ## Per-Service Config Parsing
 - AC/GC/MC/MH config -> `crates/*/src/config.rs:Config::from_vars()` (per-service, not duplication)
 - Env-test cluster config -> `crates/env-tests/src/cluster.rs:ClusterPorts::from_env()`, `parse_host_port()` (different domain from service config, not duplication)
-- Advertise addresses (MC + MH) -> gRPC uses POD_IP downward API; WebTransport uses ordinal-based port via `common::config::parse_statefulset_ordinal`
+- Advertise addresses (MC + MH) -> gRPC uses POD_IP downward API; WebTransport uses per-instance ConfigMap (`mc-{0,1}-config`, `mh-{0,1}-config`); devloop patches via `setup.sh` DT_HOST_GATEWAY_IP guard
 - StatefulSet ordinal parsing -> `crates/common/src/config.rs:parse_statefulset_ordinal()` (shared, 5 tests)
 - Extraction candidate: `generate_instance_id(prefix)` -> 4-line pattern duplicated in GC + MC + MH config
 
@@ -51,9 +51,10 @@
 - AC/MC/MH use StatefulSet; GC uses Deployment -> `infra/services/*/statefulset.yaml` or `deployment.yaml`
 - MC/MH per-pod Services (WebTransport NodePort) -> `infra/services/{mc,mh}-service/service.yaml` (headless + ClusterIP + per-pod-0 + per-pod-1; port formula: `base + ordinal*2`)
 - Dockerfiles -> `infra/docker/{ac,gc,mc,mh}-service/Dockerfile` (cargo-chef multi-stage pattern)
-- Kind config (static + template) -> `infra/kind/kind-config.yaml`, `kind-config.yaml.tmpl` (per-pod UDP; template uses envsubst, ADR-0030)
-- Kind overlays -> `infra/kubernetes/overlays/kind/`
-- setup.sh + teardown.sh (parameterized, ADR-0030) -> `infra/kind/scripts/{setup,teardown}.sh` (`load_image_to_kind()`, `deploy_only_service()`, DT_CLUSTER_NAME/DT_PORT_MAP)
+- Kind config (static + template) -> `infra/kind/kind-config.yaml`, `kind-config.yaml.tmpl`; overlays -> `infra/kubernetes/overlays/kind/`
+- setup.sh + teardown.sh (parameterized, ADR-0030) -> `infra/kind/scripts/{setup,teardown}.sh` (DT_CLUSTER_NAME/DT_PORT_MAP/DT_HOST_GATEWAY_IP)
+- ConfigMap patching (devloop advertise addresses) -> `setup.sh:deploy_mc_service()`, `deploy_mh_service()` (DT_HOST_GATEWAY_IP guard)
+- Devloop port map + gateway IP -> `crates/devloop-helper/src/commands.rs:write_port_map_shell()`, `DEFAULT_HOST_GATEWAY_IP`
 - TLS certs -> `scripts/generate-dev-certs.sh`
 - Prometheus scrape targets -> `infra/kubernetes/observability/prometheus-config.yaml`
 

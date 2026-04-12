@@ -56,15 +56,20 @@
 - Setup script (arg parsing, TTY detection, cluster name validation) → `infra/kind/scripts/setup.sh`
 - Single-service rebuild+redeploy → `infra/kind/scripts/setup.sh:deploy_only_service()`
 - Image loading (podman/docker) → `infra/kind/scripts/setup.sh:load_image_to_kind()`
-- Env vars: DT_CLUSTER_NAME, DT_PORT_MAP → `infra/kind/scripts/setup.sh` (lines 37, 48-63)
+- Env vars: DT_CLUSTER_NAME, DT_PORT_MAP, DT_HOST_GATEWAY_IP → `infra/kind/scripts/setup.sh` (lines 37, 48-75)
+- ConfigMap patching (MC/MH advertise addresses, devloop mode) → `infra/kind/scripts/setup.sh:deploy_mc_service()`, `deploy_mh_service()`
 - Teardown with cluster name support → `infra/kind/scripts/teardown.sh`
 - Kind config template (listenAddress: HOST_GATEWAY_IP per ADR-0030) → `infra/kind/kind-config.yaml.tmpl`
+- Port map shell file (MC/MH WebTransport ports) → `crates/devloop-helper/src/commands.rs:write_port_map_shell()`
+- Port map shell test → `crates/devloop-helper/src/commands.rs:test_write_port_map_shell`
 - Port map file → `~/.cache/devloop/devloop-{slug}/ports.json`
+- Task slug validation → `infra/devloop/devloop.sh` (line 66)
 - Cluster sidecar design doc (superseded) → `docs/debates/2026-04-05-devloop-cluster-sidecar.md`
 
 ## Code Locations: Common & Infrastructure
 - JWT (claims, JwtError, JwksClient, JwtValidator, round-trip tests) -> `crates/common/src/jwt.rs`
 - Shared meeting token types (GC<->AC contract, serde, defaults) -> `crates/common/src/meeting_token.rs:tests`
 - MC/MH StatefulSet, per-pod NodePort Services, Kind port mappings (MC 4433/4435, MH 4434/4436) → `infra/services/mc-service/`, `mh-service/`, `infra/kind/kind-config.yaml`
+- MC/MH per-instance ConfigMaps (advertise addresses) → `infra/services/mc-service/mc-{0,1}-configmap.yaml`, `mh-service/mh-{0,1}-configmap.yaml`
 - Dev certs → `scripts/generate-dev-certs.sh`
 - Kind setup (--yes, --only, --skip-build flags) → `infra/kind/scripts/setup.sh`

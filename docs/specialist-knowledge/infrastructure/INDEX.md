@@ -33,7 +33,8 @@
 - Kind cluster config -> `infra/kind/kind-config.yaml`
 - Kind cluster config template (dynamic ports) -> `infra/kind/kind-config.yaml.tmpl` (new, ADR-0030)
 - Kind cluster setup script -> `infra/kind/scripts/setup.sh`
-- setup.sh parameterization (DT_CLUSTER_NAME, DT_PORT_MAP, --yes, --only, --skip-build) -> ADR-0030
+- setup.sh parameterization (DT_CLUSTER_NAME, DT_PORT_MAP, DT_HOST_GATEWAY_IP, --yes, --only, --skip-build) -> ADR-0030
+- setup.sh devloop ConfigMap patching (MC/MH advertise addresses) -> `infra/kind/scripts/setup.sh:deploy_mc_service()`, `deploy_mh_service()`
 - setup.sh helpers -> `load_image_to_kind()`, `deploy_only_service()`
 - Local iteration (Telepresence) -> `infra/kind/scripts/iterate.sh`
 - Cluster teardown -> `infra/kind/scripts/teardown.sh`
@@ -47,6 +48,10 @@
 - Fuzz nightly -> `.github/workflows/fuzz-nightly.yml`
 
 ## Host-Side Cluster Helper (ADR-0030)
+- Devloop helper binary -> `crates/devloop-helper/src/`
+- Port allocation -> `crates/devloop-helper/src/ports.rs`
+- Helper commands (setup, deploy, rebuild, teardown) -> `crates/devloop-helper/src/commands.rs`
+- Port-map.env + DT_HOST_GATEWAY_IP -> `commands.rs:write_port_map_shell()`, `cmd_setup()`, `cmd_deploy()`
 - Port registry (global, all devloops) -> `~/.cache/devloop/port-registry.json`
 - Per-devloop runtime state -> `~/.cache/devloop/devloop-{slug}/` (PID file, socket, auth token, ports.json, log)
 - Port range: 20000-29999, stride 200, hash-preferred with registry collision resolution

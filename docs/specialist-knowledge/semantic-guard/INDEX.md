@@ -65,11 +65,11 @@
 - Wire format helpers: `encode_framed` / `read_server_message` (4-byte BE prefix)
 
 ## Kustomize & Kind
-- Kind overlay → `infra/kubernetes/overlays/kind/` | Setup (DT_CLUSTER_NAME, DT_PORT_MAP, --yes/--only/--skip-build, `load_image_to_kind()`, `deploy_only_service()`) → ADR-0030, `infra/kind/scripts/setup.sh`
+- Kind overlay → `infra/kubernetes/overlays/kind/` | Setup (DT_CLUSTER_NAME, DT_PORT_MAP, DT_HOST_GATEWAY_IP, --yes/--only/--skip-build, `load_image_to_kind()`, `deploy_only_service()`) → ADR-0030, `infra/kind/scripts/setup.sh`
+- Devloop ConfigMap patching (MC/MH advertise addresses) → `infra/kind/scripts/setup.sh:deploy_mc_service()`, `deploy_mh_service()`
+- Devloop-helper gateway IP + port-map.env → `crates/devloop-helper/src/commands.rs:validate_gateway_ip()`, `write_port_map_shell()`
 - Teardown (DT_CLUSTER_NAME-aware) → `infra/kind/scripts/teardown.sh`
-- Observability base + Grafana → `infra/kubernetes/observability/kustomization.yaml`, `grafana/kustomization.yaml`
-- Service bases → `infra/services/{ac-service,gc-service,mc-service,postgres,redis}/kustomization.yaml`
-- Kustomize CI guard (R-15 builds, R-16 orphans, R-17 kubeconform, R-18 secctx, R-19 secrets, R-20 dashboards) → `scripts/guards/simple/validate-kustomize.sh`
+- Observability + service bases → `infra/kubernetes/observability/`, `infra/services/{ac,gc,mc,mh}-service/kustomization.yaml`
+- Kustomize CI guard (R-15–R-20) → `scripts/guards/simple/validate-kustomize.sh`
+- GC runbooks → `docs/runbooks/gc-incident-response.md`, `gc-deployment.md`
 
-## Runbooks
-- GC incident response → `docs/runbooks/gc-incident-response.md`; GC deployment → `docs/runbooks/gc-deployment.md`

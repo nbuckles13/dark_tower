@@ -15,8 +15,9 @@
 #   - podman (preferred) or docker
 #
 # Environment variables:
-#   DT_CLUSTER_NAME  Cluster name (default: dark-tower)
-#   DT_PORT_MAP      Path to shell-sourceable port variable file
+#   DT_CLUSTER_NAME    Cluster name (default: dark-tower)
+#   DT_PORT_MAP        Path to shell-sourceable port variable file
+#   DT_HOST_GATEWAY_IP Host-gateway IP for devloop advertise addresses (optional)
 #
 # Usage:
 #   ./infra/kind/scripts/setup.sh [OPTIONS]
@@ -60,6 +61,18 @@ if [[ -n "${DT_PORT_MAP:-}" ]]; then
         fi
     done < "${DT_PORT_MAP}"
     source "${DT_PORT_MAP}"
+fi
+
+# --- DT_HOST_GATEWAY_IP validation (defense-in-depth, see ADR-0030) ---
+if [[ -n "${DT_HOST_GATEWAY_IP:-}" ]]; then
+    if [[ ! "${DT_HOST_GATEWAY_IP}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        echo "ERROR: DT_HOST_GATEWAY_IP is not a valid IPv4 address: '${DT_HOST_GATEWAY_IP}'" >&2
+        exit 1
+    fi
+    if [[ "${DT_HOST_GATEWAY_IP}" == "0.0.0.0" ]]; then
+        echo "ERROR: DT_HOST_GATEWAY_IP must not be 0.0.0.0 (ADR-0030 prohibits binding to all interfaces)" >&2
+        exit 1
+    fi
 fi
 
 # --- kubectl with explicit context for multi-cluster support ---
@@ -567,6 +580,20 @@ deploy_mc_service() {
     log_step "Deploying Meeting Controller to cluster..."
     ${KUBECTL} apply -k "${PROJECT_ROOT}/infra/kubernetes/overlays/kind/services/mc-service/"
 
+    # Devloop mode: patch MC advertise addresses to use host-gateway IP + dynamic ports.
+    # Static ConfigMaps default to localhost:4433/4435 which are unreachable from the
+    # devloop container. The gateway IP is reachable from both container and host.
+    # TLS SAN coverage is not required — dev-mode clients use cert validation bypass.
+    if [[ -n "${DT_HOST_GATEWAY_IP:-}" ]]; then
+        log_info "Patching MC-0 advertise address: https://${DT_HOST_GATEWAY_IP}:${MC_0_WEBTRANSPORT_PORT}"
+        ${KUBECTL} patch configmap mc-0-config -n dark-tower \
+            --type merge -p "{\"data\":{\"MC_WEBTRANSPORT_ADVERTISE_ADDRESS\":\"https://${DT_HOST_GATEWAY_IP}:${MC_0_WEBTRANSPORT_PORT}\"}}"
+        log_info "Patching MC-1 advertise address: https://${DT_HOST_GATEWAY_IP}:${MC_1_WEBTRANSPORT_PORT}"
+        ${KUBECTL} patch configmap mc-1-config -n dark-tower \
+            --type merge -p "{\"data\":{\"MC_WEBTRANSPORT_ADVERTISE_ADDRESS\":\"https://${DT_HOST_GATEWAY_IP}:${MC_1_WEBTRANSPORT_PORT}\"}}"
+        ${KUBECTL} rollout restart deployment/mc-0 deployment/mc-1 -n dark-tower
+    fi
+
     log_info "Waiting for Meeting Controller to be ready..."
     ${KUBECTL} rollout status deployment/mc-0 -n dark-tower --timeout=180s
     ${KUBECTL} rollout status deployment/mc-1 -n dark-tower --timeout=180s
@@ -617,6 +644,17 @@ deploy_mh_service() {
 
     log_step "Deploying Media Handler to cluster..."
     ${KUBECTL} apply -k "${PROJECT_ROOT}/infra/kubernetes/overlays/kind/services/mh-service/"
+
+    # Devloop mode: patch MH advertise addresses (same pattern as MC above).
+    if [[ -n "${DT_HOST_GATEWAY_IP:-}" ]]; then
+        log_info "Patching MH-0 advertise address: https://${DT_HOST_GATEWAY_IP}:${MH_0_WEBTRANSPORT_PORT}"
+        ${KUBECTL} patch configmap mh-0-config -n dark-tower \
+            --type merge -p "{\"data\":{\"MH_WEBTRANSPORT_ADVERTISE_ADDRESS\":\"https://${DT_HOST_GATEWAY_IP}:${MH_0_WEBTRANSPORT_PORT}\"}}"
+        log_info "Patching MH-1 advertise address: https://${DT_HOST_GATEWAY_IP}:${MH_1_WEBTRANSPORT_PORT}"
+        ${KUBECTL} patch configmap mh-1-config -n dark-tower \
+            --type merge -p "{\"data\":{\"MH_WEBTRANSPORT_ADVERTISE_ADDRESS\":\"https://${DT_HOST_GATEWAY_IP}:${MH_1_WEBTRANSPORT_PORT}\"}}"
+        ${KUBECTL} rollout restart deployment/mh-0 deployment/mh-1 -n dark-tower
+    fi
 
     log_info "Waiting for Media Handler to be ready..."
     ${KUBECTL} rollout status deployment/mh-0 -n dark-tower --timeout=180s
