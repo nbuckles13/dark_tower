@@ -12,8 +12,7 @@
 - Service Dockerfiles -> `infra/docker/{ac,gc,mc,mh}-service/Dockerfile`
 - PostgreSQL init -> `infra/docker/postgres/init.sql`
 - Prometheus config (Docker) -> `infra/docker/prometheus/prometheus.yml`
-- Prometheus alert rules (GC) -> `infra/docker/prometheus/rules/gc-alerts.yaml`
-- Prometheus alert rules (MC) -> `infra/docker/prometheus/rules/mc-alerts.yaml`
+- Prometheus alert rules -> `infra/docker/prometheus/rules/{gc,mc}-alerts.yaml`
 - Prometheus config (K8s) -> `infra/kubernetes/observability/prometheus-config.yaml`
 - K8s service manifests (Kustomize bases) -> `infra/services/{ac,gc,mc,mh}-service/kustomization.yaml`
 - AC StatefulSet -> `infra/services/ac-service/statefulset.yaml`
@@ -28,10 +27,8 @@
 - K8s observability (Kustomize) -> `infra/kubernetes/observability/kustomization.yaml`
 - Grafana manifests (RBAC, deployment, dashboards) -> `infra/kubernetes/observability/grafana/kustomization.yaml`
 - Kind overlays -> `infra/kubernetes/overlays/kind/` (services, observability, per-service)
-- Grafana dashboards -> `infra/grafana/dashboards/`
-- Grafana provisioning -> `infra/grafana/provisioning/`
-- Kind cluster config -> `infra/kind/kind-config.yaml`
-- Kind cluster config template (dynamic ports) -> `infra/kind/kind-config.yaml.tmpl` (new, ADR-0030)
+- Grafana dashboards + provisioning -> `infra/grafana/{dashboards,provisioning}/`
+- Kind cluster config (static + dynamic template) -> `infra/kind/kind-config.yaml`, `kind-config.yaml.tmpl`
 - Kind cluster setup script -> `infra/kind/scripts/setup.sh`
 - setup.sh parameterization (DT_CLUSTER_NAME, DT_PORT_MAP, DT_HOST_GATEWAY_IP, --yes, --only, --skip-build) -> ADR-0030
 - setup.sh devloop ConfigMap patching (MC/MH advertise addresses) -> `infra/kind/scripts/setup.sh:deploy_mc_service()`, `deploy_mh_service()`
@@ -39,8 +36,9 @@
 - Local iteration (Telepresence) -> `infra/kind/scripts/iterate.sh`
 - Cluster teardown -> `infra/kind/scripts/teardown.sh`
 - Skaffold dev workflow -> `infra/skaffold.yaml`
-- Containerized devloop -> `infra/devloop/devloop.sh`
-- dev-cluster client CLI -> `infra/devloop/dev-cluster` (new, ADR-0030)
+- Containerized devloop (health check, eager setup, attach) -> `infra/devloop/devloop.sh`
+- dev-cluster client CLI (status display, setup/status output) -> `infra/devloop/dev-cluster`
+- Devloop Layer 8 (env-tests in validation pipeline) -> `.claude/skills/devloop/SKILL.md`
 - Cluster sidecar design (superseded by ADR-0030) -> `docs/debates/2026-04-05-devloop-cluster-sidecar.md`
 - Docker Compose (local tests) -> `docker-compose.test.yml`
 - Dev TLS cert generation (CA + MC + MH certs) -> `scripts/generate-dev-certs.sh`
@@ -50,10 +48,12 @@
 ## Host-Side Cluster Helper (ADR-0030)
 - Devloop helper binary -> `crates/devloop-helper/src/`
 - Port allocation -> `crates/devloop-helper/src/ports.rs`
-- Helper commands (setup, deploy, rebuild, teardown) -> `crates/devloop-helper/src/commands.rs`
+- Helper commands (setup, deploy, rebuild, teardown, status) -> `crates/devloop-helper/src/commands.rs`
+- Helper protocol (command parsing, NDJSON types) -> `crates/devloop-helper/src/protocol.rs`
+- Status command (cluster health, pod readiness) -> `commands.rs:cmd_status()`, `parse_pod_health()`
 - Port-map.env + DT_HOST_GATEWAY_IP -> `commands.rs:write_port_map_shell()`, `cmd_setup()`, `cmd_deploy()`
 - Port registry (global, all devloops) -> `~/.cache/devloop/port-registry.json`
-- Per-devloop runtime state -> `~/.cache/devloop/devloop-{slug}/` (PID file, socket, auth token, ports.json, log)
+- Per-devloop runtime state -> `/tmp/devloop-{slug}/` (PID file, socket, auth token, ports.json, log)
 - Port range: 20000-29999, stride 200, hash-preferred with registry collision resolution
 - Env-test URL config -> `crates/env-tests/src/cluster.rs:ClusterPorts::from_env()`
 - Host-side debate record -> `docs/debates/2026-04-07-host-side-cluster-helper/debate.md`

@@ -4,6 +4,7 @@
 - Guard methodology & principles → ADR-0015 (`docs/decisions/adr-0015-principles-guards-methodology.md`)
 - Agent Teams validation pipeline → ADR-0024 (`docs/decisions/adr-0024-agent-teams-workflow.md`)
 - Semantic check definitions → `scripts/guards/semantic/checks.md` | Utils → `scripts/guards/common.sh`
+- Validation Layer 8 (env-tests integration) → `.claude/skills/devloop/SKILL.md` ("Layer 8" section)
 
 ## Metrics Catalogs (Label Validation)
 - AC → `docs/observability/metrics/ac-service.md` | GC → `docs/observability/metrics/gc-service.md` | MC → `docs/observability/metrics/mc-service.md`
@@ -67,9 +68,8 @@
 ## Kustomize & Kind
 - Kind overlay → `infra/kubernetes/overlays/kind/` | Setup (DT_CLUSTER_NAME, DT_PORT_MAP, DT_HOST_GATEWAY_IP, --yes/--only/--skip-build, `load_image_to_kind()`, `deploy_only_service()`) → ADR-0030, `infra/kind/scripts/setup.sh`
 - Devloop ConfigMap patching (MC/MH advertise addresses) → `infra/kind/scripts/setup.sh:deploy_mc_service()`, `deploy_mh_service()`
-- Devloop-helper gateway IP + port-map.env → `crates/devloop-helper/src/commands.rs:validate_gateway_ip()`, `write_port_map_shell()`
-- Teardown (DT_CLUSTER_NAME-aware) → `infra/kind/scripts/teardown.sh`
-- Observability + service bases → `infra/kubernetes/observability/`, `infra/services/{ac,gc,mc,mh}-service/kustomization.yaml`
-- Kustomize CI guard (R-15–R-20) → `scripts/guards/simple/validate-kustomize.sh`
-- GC runbooks → `docs/runbooks/gc-incident-response.md`, `gc-deployment.md`
+- Devloop-helper commands → `crates/devloop-helper/src/commands.rs:validate_gateway_ip()`, `write_port_map_shell()`, `cmd_status()`, `parse_pod_health()`
+- Dev-cluster CLI status + display → `infra/devloop/dev-cluster:display_cluster_info()`
+- Teardown → `infra/kind/scripts/teardown.sh` | Observability + service bases → `infra/kubernetes/observability/`, `infra/services/*/kustomization.yaml`
+- Kustomize CI guard (R-15–R-20) → `scripts/guards/simple/validate-kustomize.sh` | GC runbooks → `docs/runbooks/gc-*.md`
 

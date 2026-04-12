@@ -46,8 +46,15 @@
 - Kind config template (listenAddress: ${HOST_GATEWAY_IP}, dynamic observability ports) -> `infra/kind/kind-config.yaml.tmpl`
 - Port map (prometheus, grafana, loki port discovery) -> `/tmp/devloop-{slug}/ports.json`
 - Port-map.env (observability + WebTransport port shell vars) -> `crates/devloop-helper/src/commands.rs:write_port_map_shell()`
+- Status command (cluster health, pod readiness, checked_at) -> `crates/devloop-helper/src/commands.rs:cmd_status()`
+- Pod health parsing (pure function, unit-testable) -> `crates/devloop-helper/src/commands.rs:parse_pod_health()`
+- Status client display (health summary from result data) -> `infra/devloop/dev-cluster` (status post-command section)
+- Helper audit log (JSONL, all commands including status) -> `crates/devloop-helper/src/logging.rs:AuditLog`
+- Devloop.sh infrastructure health check (re-entry) -> `infra/devloop/devloop.sh` (ADR-0030 Step 6 section)
+- Eager setup background log -> `/tmp/devloop-{slug}/eager-setup.log`
 - Env-test observability URL config -> `crates/env-tests/src/cluster.rs:ClusterPorts::from_env()`
 - Env-tests observability validation -> `crates/env-tests/tests/30_observability.rs`
+- Layer 8 env-test integration (validation pipeline) -> `.claude/skills/devloop/SKILL.md` (Layer 8 section)
 
 ## Guards
 - Metric-to-dashboard coverage -> `scripts/guards/simple/validate-application-metrics.sh`

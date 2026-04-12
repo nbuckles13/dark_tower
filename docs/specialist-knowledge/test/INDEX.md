@@ -29,6 +29,7 @@
 - Config + error tests -> `crates/mc-service/src/config.rs:tests`, `crates/mc-service/src/errors.rs:tests`
 - Actor tests (controller, meeting, participant, session) -> `crates/mc-service/src/actors/controller.rs:tests`, `meeting.rs`, `participant.rs`, `session.rs`
 - WebTransport tests (encoding, connection) -> `crates/mc-service/src/webtransport/handler.rs:tests`, `connection.rs`
+- MC error code mapping (JwtValidation → Unauthorized) → `crates/mc-service/src/webtransport/connection.rs:send_error()`
 - GC integration + heartbeat tests -> `crates/mc-service/tests/gc_integration.rs`, `heartbeat_tasks.rs`
 - Health + metrics -> `crates/mc-service/src/observability/health.rs`, `metrics.rs`
 - Test utils (mock Redis, mock GC) -> `crates/mc-test-utils/src/mock_redis.rs`, `mock_gc.rs`
@@ -50,7 +51,8 @@
 - Prometheus client fixture → `crates/env-tests/src/fixtures/metrics.rs`
 - Join flow tests (AC→GC→MC e2e) → `crates/env-tests/tests/24_join_flow.rs`
 - Cluster health + kubectl security checks → `crates/env-tests/tests/00_cluster_health.rs`
-- Observability validation → `crates/env-tests/tests/30_observability.rs`
+- Loki availability (HTTP /ready, deferred from init) → `crates/env-tests/src/cluster.rs:is_loki_available()`
+- Observability validation (EXPECTED_SERVICES constant) → `crates/env-tests/tests/30_observability.rs`
 
 ## Code Locations: Cluster Setup & Helper (ADR-0030)
 - Setup script (arg parsing, TTY detection, cluster name validation) → `infra/kind/scripts/setup.sh`
@@ -60,16 +62,14 @@
 - ConfigMap patching (MC/MH advertise addresses, devloop mode) → `infra/kind/scripts/setup.sh:deploy_mc_service()`, `deploy_mh_service()`
 - Teardown with cluster name support → `infra/kind/scripts/teardown.sh`
 - Kind config template (listenAddress: HOST_GATEWAY_IP per ADR-0030) → `infra/kind/kind-config.yaml.tmpl`
-- Port map shell file (MC/MH WebTransport ports) → `crates/devloop-helper/src/commands.rs:write_port_map_shell()`
-- Port map shell test → `crates/devloop-helper/src/commands.rs:test_write_port_map_shell`
-- Port map file → `~/.cache/devloop/devloop-{slug}/ports.json`
+- Port map shell file + test → `crates/devloop-helper/src/commands.rs:write_port_map_shell()`, `test_write_port_map_shell`
+- Gateway IP validation → `crates/devloop-helper/src/commands.rs:validate_gateway_ip()`
+- Port map file → `/tmp/devloop-{slug}/ports.json`
 - Task slug validation → `infra/devloop/devloop.sh` (line 66)
-- Cluster sidecar design doc (superseded) → `docs/debates/2026-04-05-devloop-cluster-sidecar.md`
 
 ## Code Locations: Common & Infrastructure
 - JWT (claims, JwtError, JwksClient, JwtValidator, round-trip tests) -> `crates/common/src/jwt.rs`
 - Shared meeting token types (GC<->AC contract, serde, defaults) -> `crates/common/src/meeting_token.rs:tests`
-- MC/MH StatefulSet, per-pod NodePort Services, Kind port mappings (MC 4433/4435, MH 4434/4436) → `infra/services/mc-service/`, `mh-service/`, `infra/kind/kind-config.yaml`
-- MC/MH per-instance ConfigMaps (advertise addresses) → `infra/services/mc-service/mc-{0,1}-configmap.yaml`, `mh-service/mh-{0,1}-configmap.yaml`
+- MC/MH per-pod Services, Kind port mappings → `infra/services/mc-service/`, `mh-service/`, `infra/kind/kind-config.yaml`
+- MC/MH per-instance ConfigMaps (advertise addresses) → `infra/services/{mc,mh}-service/{mc,mh}-{0,1}-configmap.yaml`
 - Dev certs → `scripts/generate-dev-certs.sh`
-- Kind setup (--yes, --only, --skip-build flags) → `infra/kind/scripts/setup.sh`
