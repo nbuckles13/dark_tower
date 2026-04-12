@@ -133,6 +133,7 @@ pub fn execute(cmd: &HelperCommand, ctx: &Context, writer: &mut dyn Write) -> Co
         HelperCommand::RebuildAll => cmd_rebuild_all(ctx, writer).map(|()| None),
         HelperCommand::Deploy(svc) => cmd_deploy(ctx, *svc, writer).map(|()| None),
         HelperCommand::Teardown => cmd_teardown(ctx, writer).map(|()| None),
+        HelperCommand::Status => cmd_status(ctx),
     };
 
     let duration_ms = start.elapsed().as_millis() as u64;
@@ -227,12 +228,6 @@ fn cmd_setup(
     );
     let port_map_path = ctx.runtime_dir.join("ports.json");
     ports::write_port_map(&port_map_path, &port_map)?;
-
-    // Also write to XDG cache for persistence across reboots
-    let cache_port_map_dir = ports::cache_dir().join(format!("devloop-{}", ctx.slug));
-    fs::create_dir_all(&cache_port_map_dir)?;
-    let cache_port_map_path = cache_port_map_dir.join("ports.json");
-    ports::write_port_map(&cache_port_map_path, &port_map)?;
 
     // Create Kind cluster (skip if it already exists for idempotent setup)
     let (env_key, env_val) = ctx.container_runtime.kind_provider_env();
@@ -453,6 +448,180 @@ fn generate_container_kubeconfig(ctx: &Context, alloc: &PortAllocation) -> Resul
     Ok(())
 }
 
+/// Summary of pod health in the dark-tower namespace.
+#[derive(Debug, serde::Serialize)]
+struct PodHealthSummary {
+    total: usize,
+    ready: usize,
+    not_ready: Vec<PodStatus>,
+}
+
+/// Status of a single pod.
+#[derive(Debug, serde::Serialize)]
+struct PodStatus {
+    name: String,
+    phase: String,
+    ready: bool,
+}
+
+/// Parse kubectl `get pods -o json` output into a health summary.
+///
+/// Pure function — takes raw JSON string, returns structured summary.
+/// Designed for unit testing without a real cluster.
+fn parse_pod_health(json_str: &str) -> Result<PodHealthSummary, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(json_str).map_err(|e| format!("invalid JSON: {e}"))?;
+
+    let items = value
+        .get("items")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| "missing or invalid 'items' array".to_string())?;
+
+    let mut total = 0;
+    let mut ready_count = 0;
+    let mut not_ready = Vec::new();
+
+    for item in items {
+        let name = item
+            .pointer("/metadata/name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("<unknown>");
+        let phase = item
+            .pointer("/status/phase")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Unknown");
+
+        // A pod is ready if phase is Running AND all containers have ready=true
+        let containers_ready = item
+            .pointer("/status/containerStatuses")
+            .and_then(|v| v.as_array())
+            .map(|statuses| {
+                !statuses.is_empty()
+                    && statuses
+                        .iter()
+                        .all(|s| s.get("ready").and_then(|r| r.as_bool()).unwrap_or(false))
+            })
+            .unwrap_or(false);
+
+        let is_ready = phase == "Running" && containers_ready;
+
+        total += 1;
+        if is_ready {
+            ready_count += 1;
+        } else {
+            not_ready.push(PodStatus {
+                name: name.to_string(),
+                phase: phase.to_string(),
+                ready: false,
+            });
+        }
+    }
+
+    Ok(PodHealthSummary {
+        total,
+        ready: ready_count,
+        not_ready,
+    })
+}
+
+/// Status: read-only health check — cluster exists, pods healthy, ports.json.
+fn cmd_status(ctx: &Context) -> Result<Option<serde_json::Value>, HelperError> {
+    eprintln!("[devloop-helper] status: checking cluster health...");
+
+    // 1. Check if Kind cluster exists
+    let cluster_exists = match cluster_already_exists(&ctx.cluster_name) {
+        Ok(exists) => exists,
+        Err(e) => {
+            eprintln!("[devloop-helper] status: cluster check failed: {e}");
+            false
+        }
+    };
+
+    // 2. Check pod health (only if cluster exists)
+    let (pods_healthy, pod_summary, pod_error) = if cluster_exists {
+        let kubectl_ctx = format!("kind-{}", ctx.cluster_name);
+        match Command::new("kubectl")
+            .arg("get")
+            .arg("pods")
+            .arg("-n")
+            .arg("dark-tower")
+            .arg("--context")
+            .arg(&kubectl_ctx)
+            .arg("-o")
+            .arg("json")
+            .output()
+        {
+            Ok(output) if output.status.success() => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                match parse_pod_health(&stdout) {
+                    Ok(summary) => {
+                        let healthy = summary.not_ready.is_empty() && summary.total > 0;
+                        (healthy, Some(summary), None)
+                    }
+                    Err(e) => (false, None, Some(format!("pod health parse error: {e}"))),
+                }
+            }
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                (
+                    false,
+                    None,
+                    Some(format!("kubectl failed: {}", stderr.trim())),
+                )
+            }
+            Err(e) => (false, None, Some(format!("kubectl spawn failed: {e}"))),
+        }
+    } else {
+        (false, None, None)
+    };
+
+    // 3. Read ports.json if available
+    let ports_path = ctx.runtime_dir.join("ports.json");
+    let ports = if ports_path.exists() {
+        match fs::read_to_string(&ports_path) {
+            Ok(contents) => serde_json::from_str::<serde_json::Value>(&contents).ok(),
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+
+    // 4. Check if setup is in progress (PID file from eager setup)
+    let setup_in_progress = {
+        let setup_pid_path = ctx.runtime_dir.join("setup.pid");
+        if let Ok(pid_str) = fs::read_to_string(&setup_pid_path) {
+            if let Ok(pid) = pid_str.trim().parse::<u32>() {
+                unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+    };
+
+    // Build response data — construct fully to avoid indexing (clippy::indexing_slicing)
+    let pod_summary_val = pod_summary.map(|summary| {
+        serde_json::json!({
+            "total": summary.total,
+            "ready": summary.ready,
+            "not_ready": summary.not_ready,
+        })
+    });
+
+    let data = serde_json::json!({
+        "cluster_exists": cluster_exists,
+        "pods_healthy": pods_healthy,
+        "setup_in_progress": setup_in_progress,
+        "checked_at": now_rfc3339(),
+        "pod_summary": pod_summary_val,
+        "pod_error": pod_error,
+        "ports": ports,
+    });
+
+    Ok(Some(data))
+}
+
 /// Rebuild: build one service image, load into Kind, restart deployment.
 fn cmd_rebuild(ctx: &Context, svc: Service, writer: &mut dyn Write) -> Result<(), HelperError> {
     eprintln!("[devloop-helper] rebuild: building {}...", svc);
@@ -548,12 +717,6 @@ fn cmd_teardown(ctx: &Context, writer: &mut dyn Write) -> Result<(), HelperError
     // Remove from port registry
     if let Err(e) = ports::deallocate_ports(&ctx.slug, &ctx.registry_path) {
         eprintln!("[devloop-helper] teardown: port deallocation warning: {e}");
-    }
-
-    // Clean up cache directory
-    let cache_dir = ports::cache_dir().join(format!("devloop-{}", ctx.slug));
-    if cache_dir.exists() {
-        let _ = fs::remove_dir_all(&cache_dir);
     }
 
     Ok(())
@@ -1345,5 +1508,111 @@ current-context: kind-devloop-test
                 "line does not match setup.sh validation regex: '{line}'"
             );
         }
+    }
+
+    // --- parse_pod_health tests ---
+
+    #[test]
+    fn test_parse_pod_health_all_running() {
+        let json = r#"{
+            "items": [
+                {
+                    "metadata": {"name": "ac-service-0"},
+                    "status": {
+                        "phase": "Running",
+                        "containerStatuses": [{"ready": true}]
+                    }
+                },
+                {
+                    "metadata": {"name": "gc-service-abc123"},
+                    "status": {
+                        "phase": "Running",
+                        "containerStatuses": [{"ready": true}]
+                    }
+                }
+            ]
+        }"#;
+        let summary = parse_pod_health(json).unwrap();
+        assert_eq!(summary.total, 2);
+        assert_eq!(summary.ready, 2);
+        assert!(summary.not_ready.is_empty());
+    }
+
+    #[test]
+    fn test_parse_pod_health_partial() {
+        let json = r#"{
+            "items": [
+                {
+                    "metadata": {"name": "ac-service-0"},
+                    "status": {
+                        "phase": "Running",
+                        "containerStatuses": [{"ready": true}]
+                    }
+                },
+                {
+                    "metadata": {"name": "gc-service-abc123"},
+                    "status": {
+                        "phase": "Running",
+                        "containerStatuses": [{"ready": false}]
+                    }
+                },
+                {
+                    "metadata": {"name": "mc-0-xyz"},
+                    "status": {
+                        "phase": "CrashLoopBackOff",
+                        "containerStatuses": [{"ready": false}]
+                    }
+                }
+            ]
+        }"#;
+        let summary = parse_pod_health(json).unwrap();
+        assert_eq!(summary.total, 3);
+        assert_eq!(summary.ready, 1);
+        assert_eq!(summary.not_ready.len(), 2);
+        assert_eq!(summary.not_ready[0].name, "gc-service-abc123");
+        assert_eq!(summary.not_ready[1].name, "mc-0-xyz");
+        assert_eq!(summary.not_ready[1].phase, "CrashLoopBackOff");
+    }
+
+    #[test]
+    fn test_parse_pod_health_empty_pods() {
+        let json = r#"{"items": []}"#;
+        let summary = parse_pod_health(json).unwrap();
+        assert_eq!(summary.total, 0);
+        assert_eq!(summary.ready, 0);
+        assert!(summary.not_ready.is_empty());
+    }
+
+    #[test]
+    fn test_parse_pod_health_malformed_json() {
+        let result = parse_pod_health("not json at all");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("invalid JSON"));
+    }
+
+    #[test]
+    fn test_parse_pod_health_missing_items() {
+        let result = parse_pod_health(r#"{"kind": "PodList"}"#);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("items"));
+    }
+
+    #[test]
+    fn test_parse_pod_health_pending_pod() {
+        let json = r#"{
+            "items": [
+                {
+                    "metadata": {"name": "gc-service-pending"},
+                    "status": {
+                        "phase": "Pending"
+                    }
+                }
+            ]
+        }"#;
+        let summary = parse_pod_health(json).unwrap();
+        assert_eq!(summary.total, 1);
+        assert_eq!(summary.ready, 0);
+        assert_eq!(summary.not_ready.len(), 1);
+        assert_eq!(summary.not_ready[0].phase, "Pending");
     }
 }

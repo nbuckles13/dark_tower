@@ -70,6 +70,6 @@
 - MC+MH TLS cert generation → `scripts/generate-dev-certs.sh`
 - Env-tests cluster module → `crates/env-tests/src/cluster.rs`
 - Kind cluster (ADR-0030): `kind-config.yaml.tmpl`, `setup.sh` (`deploy_only_service()`, `DT_HOST_GATEWAY_IP`), `{mc,mh}-{0,1}-configmap.yaml`
-- Devloop helper → `crates/devloop-helper/src/commands.rs` (`write_port_map_shell()`, `cmd_setup()`, `cmd_deploy()`), `ports.rs` (`PortOffsets`)
+- Devloop helper → `crates/devloop-helper/src/commands.rs` (`cmd_setup()`, `cmd_status()`, `cmd_deploy()`), `ports.rs`; client → `infra/devloop/dev-cluster`; Layer 8 → `SKILL.md`
 - Service bases + Kind overlay → `infra/services/*/kustomization.yaml`, `infra/kubernetes/overlays/kind/`
 - Guards: runner → `scripts/guards/run-guards.sh`; Kustomize (R-15–R-20) → `validate-kustomize.sh`; App metrics → `validate-application-metrics.sh`

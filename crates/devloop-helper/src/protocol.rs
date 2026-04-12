@@ -94,6 +94,8 @@ pub enum HelperCommand {
     Deploy(Service),
     /// Delete Kind cluster, clean up all state.
     Teardown,
+    /// Read-only health check: cluster exists, pods healthy, ports.json.
+    Status,
 }
 
 impl HelperCommand {
@@ -105,6 +107,7 @@ impl HelperCommand {
             Self::RebuildAll => "rebuild-all",
             Self::Deploy(_) => "deploy",
             Self::Teardown => "teardown",
+            Self::Status => "status",
         }
     }
 
@@ -119,7 +122,7 @@ impl HelperCommand {
                 }
             }
             Self::Rebuild(svc) | Self::Deploy(svc) => vec![svc.to_string()],
-            Self::RebuildAll | Self::Teardown => vec![],
+            Self::RebuildAll | Self::Teardown | Self::Status => vec![],
         }
     }
 }
@@ -138,6 +141,7 @@ impl fmt::Display for HelperCommand {
             Self::RebuildAll => write!(f, "rebuild-all"),
             Self::Deploy(svc) => write!(f, "deploy {svc}"),
             Self::Teardown => write!(f, "teardown"),
+            Self::Status => write!(f, "status"),
         }
     }
 }
@@ -212,6 +216,14 @@ impl Request {
                     ));
                 }
                 Ok(HelperCommand::Teardown)
+            }
+            "status" => {
+                if self.service.is_some() {
+                    return Err(HelperError::InvalidRequest(
+                        "status command does not accept a service argument".to_string(),
+                    ));
+                }
+                Ok(HelperCommand::Status)
             }
             other => Err(HelperError::InvalidCommand(other.to_string())),
         }
@@ -484,6 +496,29 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_command_status() {
+        let req = Request {
+            token: "abc123".to_string(),
+            command: "status".to_string(),
+            service: None,
+            skip_observability: false,
+        };
+        let cmd = req.parse_command().unwrap();
+        assert_eq!(cmd, HelperCommand::Status);
+    }
+
+    #[test]
+    fn test_status_rejects_service_arg() {
+        let req = Request {
+            token: "abc123".to_string(),
+            command: "status".to_string(),
+            service: Some("ac".to_string()),
+            skip_observability: false,
+        };
+        assert!(req.parse_command().is_err());
+    }
+
+    #[test]
     fn test_parse_command_unknown() {
         let req = Request {
             token: "abc123".to_string(),
@@ -611,6 +646,7 @@ mod tests {
         assert_eq!(HelperCommand::RebuildAll.to_string(), "rebuild-all");
         assert_eq!(HelperCommand::Deploy(Service::Gc).to_string(), "deploy gc");
         assert_eq!(HelperCommand::Teardown.to_string(), "teardown");
+        assert_eq!(HelperCommand::Status.to_string(), "status");
     }
 
     // --- Streaming protocol type tests ---

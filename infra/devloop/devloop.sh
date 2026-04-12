@@ -529,6 +529,56 @@ else
     echo "=== Containers already running: ${DEV_CONTAINER} ==="
 fi
 
+# ─── Infrastructure health check (ADR-0030 Step 6) ──────────────
+
+# Verify helper and cluster health on every entry (including re-attach).
+# This ensures the infrastructure is ready for env-tests in the devloop skill.
+if [ -n "$HOST_GATEWAY_IP" ] && command -v kind &>/dev/null; then
+    INFRA_STATUS="ok"
+
+    # 1. Check if helper PID is alive — restart if dead
+    if [ -f "$HELPER_RUNTIME_DIR/helper.pid" ]; then
+        HELPER_PID=$(cat "$HELPER_RUNTIME_DIR/helper.pid")
+        if ! is_helper_process_alive "$HELPER_PID"; then
+            echo "Helper process dead (PID $HELPER_PID), restarting..."
+            build_helper
+            if launch_helper; then
+                INFRA_STATUS="helper=restarted"
+            else
+                echo "WARNING: Failed to restart helper. Cluster features may not work." >&2
+                INFRA_STATUS="helper=failed"
+            fi
+        fi
+    fi
+
+    # 2. Check cluster readiness and trigger eager setup if needed
+    CLUSTER_NAME="devloop-${TASK_SLUG}"
+    PORTS_FILE_PATH="$HELPER_RUNTIME_DIR/ports.json"
+    NEEDS_SETUP=false
+    if ! kind get clusters 2>/dev/null | grep -q "^${CLUSTER_NAME}$"; then
+        echo "No Kind cluster found for ${TASK_SLUG}, starting setup in background..."
+        NEEDS_SETUP=true
+    elif [ ! -f "$PORTS_FILE_PATH" ]; then
+        echo "Ports file missing, running setup in background (idempotent)..."
+        NEEDS_SETUP=true
+    fi
+
+    if $NEEDS_SETUP; then
+        # Subshell ensures setup.pid is cleaned up when setup finishes,
+        # preventing stale PID issues on re-attach (PID recycling).
+        (podman exec "$DEV_CONTAINER" dev-cluster setup \
+            >> "$HELPER_RUNTIME_DIR/eager-setup.log" 2>&1; \
+            rm -f "$HELPER_RUNTIME_DIR/setup.pid") &
+        EAGER_SETUP_PID=$!
+        echo "$EAGER_SETUP_PID" > "$HELPER_RUNTIME_DIR/setup.pid"
+        INFRA_STATUS="cluster=setup-pending"
+    elif [ "$INFRA_STATUS" = "ok" ]; then
+        INFRA_STATUS="helper=alive cluster=ready"
+    fi
+
+    echo "Infrastructure: ${INFRA_STATUS}"
+fi
+
 # ─── Phase 2: Attach ────────────────────────────────────────────
 
 echo ""

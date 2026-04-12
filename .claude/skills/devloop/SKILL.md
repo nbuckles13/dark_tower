@@ -352,6 +352,7 @@ When implementer signals "Ready for validation", run the validation pipeline:
 | 5. Clippy | `cargo clippy --workspace -- -D warnings` | Lint warnings |
 | 6. Audit | `cargo audit` | Known dependency vulnerabilities |
 | 7. Semantic | Spawn `semantic-guard` agent (see below) | AI-powered diff analysis: credential leaks, actor blocking, error context |
+| 8. Env-tests | `dev-cluster rebuild-all` + `cargo test -p env-tests --features all` | Integration test failures against live Kind cluster |
 
 **Layer 7 — Semantic Guard Agent**:
 
@@ -364,6 +365,42 @@ prompt: "Analyze the current diff for semantic issues. Report your verdict to @t
 ```
 
 Wait for the agent's verdict message. If UNSAFE, treat as a validation failure (send findings to implementer, increment iteration). If SAFE, proceed.
+
+**Layer 8 — Env-tests (Integration)**:
+
+After layers 1-7 pass, run integration tests against the live Kind cluster. Layer 8 always runs — intentionally broader than ADR-0030's trigger-path list, because business logic changes can break integration tests too.
+
+1. **Check cluster readiness**: Run `dev-cluster status`. If `cluster_exists` is false or `pods_healthy` is false:
+   - If `setup_in_progress` is true, poll `dev-cluster status` every 30 seconds for up to 8 minutes (first-run setup cost, does NOT count toward attempts).
+   - If still not ready after timeout, or if `setup_in_progress` is false, run `dev-cluster setup` directly (blocks until complete, does NOT count toward attempts).
+   - If setup fails, escalate to user as infrastructure failure.
+
+2. **Infra change detection**: Run `git diff --name-only ${START_COMMIT}..HEAD -- infra/kind/`. If any files changed:
+   - Log which files triggered the rebuild (e.g., `"Layer 8: infra/kind changes detected: infra/kind/kind-config.yaml.tmpl, infra/kind/scripts/setup.sh"`).
+   - Run `dev-cluster teardown` then `dev-cluster setup` (cluster skeleton may be stale). This does NOT count toward attempts.
+
+3. **Rebuild all services**: Run `dev-cluster rebuild-all`. Report wall-clock time (e.g., `"Layer 8: rebuild-all completed in 142s"`).
+
+4. **Run env-tests**: Read `/tmp/devloop/ports.json` and construct environment variables:
+   ```bash
+   ENV_TEST_AC_URL=$(jq -r '.container_urls.ac' /tmp/devloop/ports.json)
+   ENV_TEST_GC_URL=$(jq -r '.container_urls.gc' /tmp/devloop/ports.json)
+   ENV_TEST_PROMETHEUS_URL=$(jq -r '.container_urls.prometheus // empty' /tmp/devloop/ports.json)
+   ENV_TEST_GRAFANA_URL=$(jq -r '.container_urls.grafana // empty' /tmp/devloop/ports.json)
+   ENV_TEST_LOKI_URL=$(jq -r '.container_urls.loki // empty' /tmp/devloop/ports.json)
+   ```
+   Run with 10-minute timeout, capturing full output for post-mortem debugging:
+   ```bash
+   timeout 600 cargo test -p env-tests --features all 2>&1 | tee /tmp/devloop/env-test-output.log
+   ```
+   On failure, forward full output to implementer. The log file at `/tmp/devloop/env-test-output.log` persists across retries for debugging — include its path in failure reports.
+   Report wall-clock time (e.g., `"Layer 8: env-tests completed in 87s"`).
+
+5. **Classify exit code**:
+   - Exit 0 = pass.
+   - Exit non-zero: check stderr for infrastructure patterns (`"connection refused"`, `"timed out"`, `"connection reset"`, `"broken pipe"`). If found, classify as **infrastructure failure** (do NOT consume attempt — retry once, then escalate). If stderr contains assertion failures or test logic errors, classify as **test failure** (consume Layer 8 attempt).
+
+**Layer 8 attempt budget**: 2 attempts (separate from the 3 attempts for layers 1-7). Infrastructure failures (helper socket errors, Kind crash, connection timeouts) do NOT consume attempts — retry once, then escalate. First-run cluster setup (~7 min) does NOT count toward attempts.
 
 **ARTIFACT-SPECIFIC** (mandatory when detected file types are in the changeset):
 
@@ -379,10 +416,16 @@ Wait for the agent's verdict message. If UNSAFE, treat as a validation failure (
 - Update main.md: Phase = review
 - Message each reviewer individually (unicast, not broadcast): "Start Review. Validation passed — please examine the changes and send your verdict."
 
-**If fail**:
+**If fail (layers 1-7)**:
 - Send failure details to implementer
 - Increment iteration count
 - Max 3 attempts before escalation
+
+**If fail (layer 8)**:
+- Send full env-test output (stdout + stderr) to implementer
+- Increment Layer 8 iteration count (separate from layers 1-7)
+- Max 2 attempts before escalation
+- Infrastructure failures do not consume attempts (retry once, then escalate)
 
 ### Step 7: Gate 3 - Final Approval
 
@@ -610,7 +653,10 @@ All teammate communication MUST use the SendMessage tool. Plain text output is n
 |-------|-------|--------|
 | Planning | 30 min / 3 rounds | Escalate |
 | Implementation | No limit | Lead monitors progress |
-| Validation | 3 attempts | Escalate |
+| Validation (L1-7) | 3 attempts | Escalate |
+| Validation (L8) | 2 attempts | Escalate |
+| Infra failures (L8) | Retry once | Escalate (don't consume attempts) |
+| First-run setup (L8) | ~7 min | Does not count toward attempts |
 | Review→Impl loop | 3 iterations | Escalate |
 | Reflection | 15 min | Proceed without |
 | Human review rounds | 3 per devloop | Escalate ("is this task well-scoped?") |

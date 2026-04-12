@@ -53,8 +53,10 @@
 - Container isolation → ADR-0025; Cluster helper (trust, socket auth, injection safety, networking, prohibitions) → ADR-0030
 - Env-test URL validation (scheme, credential rejection) → `crates/env-tests/src/cluster.rs:parse_host_port()`, `ClusterPorts::from_env()`
 - Helper binary (Rust, Command::new() arg safety) → `crates/devloop-helper/src/commands.rs`
-- Gateway IP validation (IpAddr parse, unspecified rejection) → `crates/devloop-helper/src/commands.rs:validate_gateway_ip()`
-- Socket auth token + file permissions → ADR-0030 (Helper Process); API allowlist → ADR-0030 (Helper API)
+- Status command (read-only, auth-gated) → `commands.rs:cmd_status()`, `parse_pod_health()`
+- Auth token (CSPRNG, constant-time compare, 0600) → `crates/devloop-helper/src/auth.rs`
+- Gateway IP validation → `commands.rs:validate_gateway_ip()` | Dev-cluster client → `infra/devloop/dev-cluster`
+- Socket auth + file permissions → ADR-0030 (Helper Process); API allowlist → ADR-0030 (Helper API)
 - Kind NodePort listen address (`${HOST_GATEWAY_IP}`) → `infra/kind/kind-config.yaml.tmpl`; Wrapper → `infra/devloop/devloop.sh`
 - Explicit prohibitions (`--network=host`, podman socket mount, `0.0.0.0` binding) → ADR-0030 (Explicit Prohibitions)
 
@@ -70,6 +72,4 @@
 - MC/MH health + K8s probes → `src/observability/health.rs`, `infra/services/{mc,mh}-service/*-deployment.yaml`
 - Auth chain: AC JWKS → common JwtValidator → GC/MC; gRPC: GC→MC→MH auth interceptors
 - Guards → `scripts/guards/simple/no-secrets-in-logs.sh`, `validate-kustomize.sh`
-
-## Test Coverage (Security-Relevant)
 - MC join + GC join tests → `crates/mc-service/tests/join_tests.rs`, `crates/gc-service/tests/meeting_tests.rs`

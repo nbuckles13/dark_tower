@@ -17,11 +17,17 @@
 - Devloop wrapper → `infra/devloop/devloop.sh`, container image → `infra/devloop/Dockerfile`
 - Cluster networking debate → `docs/debates/2026-04-09-devloop-cluster-networking/debate.md`
 - Sidecar design doc (superseded by ADR-0030) → `docs/debates/2026-04-05-devloop-cluster-sidecar.md`
+- Helper commands (setup, deploy, rebuild, teardown, status) → `crates/devloop-helper/src/commands.rs`
+- Helper protocol (command parsing, streaming) → `crates/devloop-helper/src/protocol.rs`
+- Status command (cluster health, pod readiness, setup-in-progress) → `crates/devloop-helper/src/commands.rs:cmd_status()`
+- Pod health parsing → `crates/devloop-helper/src/commands.rs:parse_pod_health()`
 - Port-map.env generation (MC/MH WebTransport ports) → `crates/devloop-helper/src/commands.rs:write_port_map_shell()`
 - DT_HOST_GATEWAY_IP propagation → `crates/devloop-helper/src/commands.rs:cmd_setup()`, `cmd_deploy()`
-- Host state directory → `~/.cache/devloop/` (port-registry.json, per-slug state)
-- Env-test URL config → `crates/env-tests/src/cluster.rs:ClusterPorts::from_env()`
-- URL parsing for health checks → `crates/env-tests/src/cluster.rs:parse_host_port()`
+- Port registry → `~/.cache/devloop/port-registry.json` (global allocation state)
+- Per-devloop runtime state → `/tmp/devloop-{slug}/` (PID, socket, auth token, ports.json, setup.pid, eager-setup.log)
+- Container-side client → `infra/devloop/dev-cluster` (setup, rebuild, deploy, teardown, status)
+- Health check + eager setup → `infra/devloop/devloop.sh` (Infrastructure health check section)
+- Env-test URL config → `crates/env-tests/src/cluster.rs:ClusterPorts::from_env()`; Layer 8 → `.claude/skills/devloop/SKILL.md`
 
 ## Deployment & K8s
 - Kind cluster: `infra/kind/kind-config.yaml`, `infra/kind/scripts/setup.sh` (ADR-0030: `load_image_to_kind()`, `deploy_only_service()`, --yes/--only/--skip-build), `infra/kind/scripts/teardown.sh`

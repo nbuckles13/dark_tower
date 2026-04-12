@@ -10,6 +10,7 @@
 #   dev-cluster rebuild-all
 #   dev-cluster deploy <service>
 #   dev-cluster teardown
+#   dev-cluster status
 #
 # Services: ac, gc, mc, mh
 #
@@ -34,6 +35,7 @@ if [ $# -lt 1 ]; then
     echo "  rebuild-all                     Rebuild all service images" >&2
     echo "  deploy <service>                Apply manifests only (no rebuild)" >&2
     echo "  teardown                        Delete Kind cluster and clean up" >&2
+    echo "  status                          Check cluster health and readiness" >&2
     echo "" >&2
     echo "Services: ac, gc, mc, mh" >&2
     exit 1
@@ -76,9 +78,12 @@ case "$1" in
     teardown)
         CMD="teardown"
         ;;
+    status)
+        CMD="status"
+        ;;
     *)
         echo "ERROR: Unknown command '$1'" >&2
-        echo "Valid commands: setup, rebuild, rebuild-all, deploy, teardown" >&2
+        echo "Valid commands: setup, rebuild, rebuild-all, deploy, teardown, status" >&2
         exit 1
         ;;
 esac
@@ -150,10 +155,78 @@ else
         '{token: $token, command: $cmd}')
 fi
 
+# ─── Helper functions ─────────────────────────────────────────
+
+# Display cluster info from ports.json (used by both setup and status).
+display_cluster_info() {
+    local ports_file="$1"
+    if [ ! -f "$ports_file" ]; then
+        return
+    fi
+
+    cluster_name=$(jq -r '.cluster_name // "unknown"' "$ports_file")
+    echo "=== Cluster: ${cluster_name} ===" >&2
+    echo "" >&2
+
+    # Service URLs (for use inside the container)
+    ac_url=$(jq -r '.container_urls.ac // empty' "$ports_file")
+    gc_url=$(jq -r '.container_urls.gc // empty' "$ports_file")
+    echo "Service URLs (from container):" >&2
+    [ -n "$ac_url" ] && echo "  AC:         $ac_url" >&2
+    [ -n "$gc_url" ] && echo "  GC:         $gc_url" >&2
+
+    # Observability URLs
+    grafana_url=$(jq -r '.container_urls.grafana // empty' "$ports_file")
+    prometheus_url=$(jq -r '.container_urls.prometheus // empty' "$ports_file")
+    loki_url=$(jq -r '.container_urls.loki // empty' "$ports_file")
+    echo "" >&2
+    if [ -n "$grafana_url" ]; then
+        echo "Observability (from container):" >&2
+        echo "  Grafana:    $grafana_url" >&2
+        echo "  Prometheus: $prometheus_url" >&2
+        echo "  Loki:       $loki_url" >&2
+    else
+        echo "Observability: not deployed (--skip-observability)" >&2
+    fi
+
+    # K8s API
+    k8s_port=$(jq -r '.ports.k8s_api // empty' "$ports_file")
+    host=$(jq -r '.host // "host.containers.internal"' "$ports_file")
+    if [ -n "$k8s_port" ]; then
+        echo "" >&2
+        echo "K8s API:      https://${host}:${k8s_port}" >&2
+    fi
+
+    echo "Kubeconfig:   /tmp/devloop/kubeconfig" >&2
+    echo "Port map:     $ports_file" >&2
+
+    # Env-test variables (copy-paste ready for cargo test -p env-tests)
+    echo "" >&2
+    echo "Env-test variables:" >&2
+    [ -n "$ac_url" ] && echo "  ENV_TEST_AC_URL=$ac_url" >&2
+    [ -n "$gc_url" ] && echo "  ENV_TEST_GC_URL=$gc_url" >&2
+    [ -n "$prometheus_url" ] && echo "  ENV_TEST_PROMETHEUS_URL=$prometheus_url" >&2
+    [ -n "$grafana_url" ] && echo "  ENV_TEST_GRAFANA_URL=$grafana_url" >&2
+    [ -n "$loki_url" ] && echo "  ENV_TEST_LOKI_URL=$loki_url" >&2
+
+    # Host URLs for human browser access (ADR-0030)
+    prometheus_host=$(jq -r '.host_urls.prometheus // empty' "$ports_file")
+    grafana_host=$(jq -r '.host_urls.grafana // empty' "$ports_file")
+    loki_host=$(jq -r '.host_urls.loki // empty' "$ports_file")
+    if [ -n "$grafana_host" ]; then
+        echo "" >&2
+        echo "Browser access (from host):" >&2
+        echo "  Prometheus: $prometheus_host" >&2
+        echo "  Grafana:    $grafana_host" >&2
+        echo "  Loki:       $loki_host" >&2
+    fi
+}
+
 # ─── Send request and process streaming response ───────────────
 
 EXIT_CODE=1
 GOT_RESULT="false"
+RESULT_DATA=""
 
 # socat connects to the unix socket, sends the request, reads streaming NDJSON.
 # -t 600 = 10 minute idle timeout (setup can take ~7 min on first run).
@@ -224,6 +297,11 @@ while IFS= read -r line; do
             error_msg=$(echo "$line" | jq -r '.error // empty')
             duration_s=$(echo "scale=1; ${duration_ms} / 1000" | bc)
 
+            # Capture structured data from status command for post-command display
+            if [ "$CMD" = "status" ]; then
+                RESULT_DATA=$(echo "$line" | jq -r '.data // empty')
+            fi
+
             if [ "$result_status" = "ok" ]; then
                 echo "=== ${CMD} completed (exit ${exit_code}, ${duration_s}s) ===" >&2
                 EXIT_CODE=0
@@ -274,61 +352,43 @@ fi
 # After successful setup, display cluster URLs from port map
 if [ "$CMD" = "setup" ] && [ "$EXIT_CODE" -eq 0 ] && [ -f "$PORTS_FILE" ]; then
     echo "" >&2
-    cluster_name=$(jq -r '.cluster_name // "unknown"' "$PORTS_FILE")
-    echo "=== Cluster ready: ${cluster_name} ===" >&2
-    echo "" >&2
+    display_cluster_info "$PORTS_FILE"
+fi
 
-    # Service URLs (for use inside the container)
-    ac_url=$(jq -r '.container_urls.ac // empty' "$PORTS_FILE")
-    gc_url=$(jq -r '.container_urls.gc // empty' "$PORTS_FILE")
-    echo "Service URLs (from container):" >&2
-    [ -n "$ac_url" ] && echo "  AC:         $ac_url" >&2
-    [ -n "$gc_url" ] && echo "  GC:         $gc_url" >&2
-
-    # Observability URLs
-    grafana_url=$(jq -r '.container_urls.grafana // empty' "$PORTS_FILE")
-    prometheus_url=$(jq -r '.container_urls.prometheus // empty' "$PORTS_FILE")
-    loki_url=$(jq -r '.container_urls.loki // empty' "$PORTS_FILE")
+# After successful status, display health summary from result data, then URLs
+if [ "$CMD" = "status" ] && [ "$EXIT_CODE" -eq 0 ]; then
     echo "" >&2
-    if [ -n "$grafana_url" ]; then
-        echo "Observability (from container):" >&2
-        echo "  Grafana:    $grafana_url" >&2
-        echo "  Prometheus: $prometheus_url" >&2
-        echo "  Loki:       $loki_url" >&2
+    if [ -n "$RESULT_DATA" ]; then
+        cluster_exists=$(echo "$RESULT_DATA" | jq -r '.cluster_exists')
+        pods_healthy=$(echo "$RESULT_DATA" | jq -r '.pods_healthy')
+        setup_in_progress=$(echo "$RESULT_DATA" | jq -r '.setup_in_progress')
+        checked_at=$(echo "$RESULT_DATA" | jq -r '.checked_at')
+
+        echo "=== Cluster Health (${checked_at}) ===" >&2
+        echo "  Cluster exists:     ${cluster_exists}" >&2
+        echo "  Pods healthy:       ${pods_healthy}" >&2
+        echo "  Setup in progress:  ${setup_in_progress}" >&2
+
+        # Show unhealthy pods if any
+        not_ready_count=$(echo "$RESULT_DATA" | jq -r '.pod_summary.not_ready | length // 0')
+        if [ "$not_ready_count" -gt 0 ]; then
+            echo "  Not ready pods:" >&2
+            echo "$RESULT_DATA" | jq -r '.pod_summary.not_ready[] | "    - \(.name): \(.phase)"' >&2
+        fi
+
+        # Show pod error if present
+        pod_error=$(echo "$RESULT_DATA" | jq -r '.pod_error // empty')
+        if [ -n "$pod_error" ]; then
+            echo "  Pod error: ${pod_error}" >&2
+        fi
+
+        echo "" >&2
+    fi
+
+    if [ -f "$PORTS_FILE" ]; then
+        display_cluster_info "$PORTS_FILE"
     else
-        echo "Observability: not deployed (--skip-observability)" >&2
-    fi
-
-    # K8s API
-    k8s_port=$(jq -r '.ports.k8s_api // empty' "$PORTS_FILE")
-    host=$(jq -r '.host // "host.containers.internal"' "$PORTS_FILE")
-    if [ -n "$k8s_port" ]; then
-        echo "" >&2
-        echo "K8s API:      https://${host}:${k8s_port}" >&2
-    fi
-
-    echo "Kubeconfig:   /tmp/devloop/kubeconfig" >&2
-    echo "Port map:     $PORTS_FILE" >&2
-
-    # Env-test variables (copy-paste ready for cargo test -p env-tests)
-    echo "" >&2
-    echo "Env-test variables:" >&2
-    [ -n "$ac_url" ] && echo "  ENV_TEST_AC_URL=$ac_url" >&2
-    [ -n "$gc_url" ] && echo "  ENV_TEST_GC_URL=$gc_url" >&2
-    [ -n "$prometheus_url" ] && echo "  ENV_TEST_PROMETHEUS_URL=$prometheus_url" >&2
-    [ -n "$grafana_url" ] && echo "  ENV_TEST_GRAFANA_URL=$grafana_url" >&2
-    [ -n "$loki_url" ] && echo "  ENV_TEST_LOKI_URL=$loki_url" >&2
-
-    # Host URLs for human browser access (ADR-0030)
-    prometheus_host=$(jq -r '.host_urls.prometheus // empty' "$PORTS_FILE")
-    grafana_host=$(jq -r '.host_urls.grafana // empty' "$PORTS_FILE")
-    loki_host=$(jq -r '.host_urls.loki // empty' "$PORTS_FILE")
-    if [ -n "$grafana_host" ]; then
-        echo "" >&2
-        echo "Browser access (from host):" >&2
-        echo "  Prometheus: $prometheus_host" >&2
-        echo "  Grafana:    $grafana_host" >&2
-        echo "  Loki:       $loki_host" >&2
+        echo "No ports.json found — cluster may not be set up yet." >&2
     fi
 fi
 

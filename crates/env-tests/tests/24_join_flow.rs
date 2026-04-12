@@ -558,10 +558,12 @@ async fn test_mc_rejects_invalid_meeting_token() {
 
     match &response.message {
         Some(server_message::Message::Error(e)) => {
-            assert!(
-                e.code == proto_gen::signaling::ErrorCode::Unauthorized as i32
-                    || e.code == proto_gen::signaling::ErrorCode::InvalidRequest as i32,
-                "MC should reject wrong meeting ID, got code: {} message: {}",
+            // MC validates the token's meeting_id claim against the request's meeting_id.
+            // A mismatch is McError::JwtValidation → ErrorCode::Unauthorized (code 2).
+            assert_eq!(
+                e.code,
+                proto_gen::signaling::ErrorCode::Unauthorized as i32,
+                "MC should reject wrong meeting ID with Unauthorized, got code: {} message: {}",
                 e.code,
                 e.message
             );
