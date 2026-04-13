@@ -19,10 +19,8 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::{fs, process};
-
-/// Global shutdown flag, set by SIGTERM handler.
-static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
 fn main() {
     if let Err(e) = run() {
@@ -68,6 +66,11 @@ fn run() -> Result<(), HelperError> {
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
     // Create execution context
+    // Install signal handlers
+    let shutdown = Arc::new(AtomicBool::new(false));
+    signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&shutdown))?;
+    signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&shutdown))?;
+
     let ctx = commands::Context {
         slug: slug.as_str().to_string(),
         cluster_name: cluster_name.clone(),
@@ -76,6 +79,7 @@ fn run() -> Result<(), HelperError> {
         registry_path: ports::registry_path(),
         container_runtime,
         host_gateway_ip: args.host_gateway_ip,
+        shutdown: Arc::clone(&shutdown),
     };
 
     // Bind socket
@@ -89,9 +93,6 @@ fn run() -> Result<(), HelperError> {
 
     // Set socket timeout so we can check the shutdown flag periodically
     listener.set_nonblocking(false)?;
-
-    // Install SIGTERM handler
-    install_signal_handler()?;
 
     // Log startup (base_port is not yet known — allocation happens in cmd_setup)
     audit_log.log_startup(&cluster_name, &socket_path.to_string_lossy(), process::id());
@@ -107,7 +108,7 @@ fn run() -> Result<(), HelperError> {
     listener.set_nonblocking(true)?;
 
     loop {
-        if SHUTDOWN.load(Ordering::Relaxed) {
+        if shutdown.load(Ordering::Relaxed) {
             eprintln!("[devloop-helper] shutdown requested, exiting...");
             break;
         }
@@ -124,7 +125,7 @@ fn run() -> Result<(), HelperError> {
                     eprintln!("[devloop-helper] connection error: {e}");
                 }
 
-                if SHUTDOWN.load(Ordering::Relaxed) {
+                if shutdown.load(Ordering::Relaxed) {
                     eprintln!("[devloop-helper] shutdown requested after command, exiting...");
                     break;
                 }
@@ -381,21 +382,6 @@ fn write_pid_file(pid_path: &Path) -> Result<(), HelperError> {
     Ok(())
 }
 
-/// Install SIGTERM signal handler.
-fn install_signal_handler() -> Result<(), HelperError> {
-    // SAFETY: Setting an atomic bool from a signal handler is async-signal-safe.
-    unsafe {
-        libc::signal(libc::SIGTERM, sigterm_handler as libc::sighandler_t);
-        libc::signal(libc::SIGINT, sigterm_handler as libc::sighandler_t);
-    }
-    Ok(())
-}
-
-/// Signal handler — sets the shutdown flag.
-extern "C" fn sigterm_handler(_sig: libc::c_int) {
-    SHUTDOWN.store(true, Ordering::Relaxed);
-}
-
 /// Clean up PID file, socket, and auth token on exit.
 fn cleanup(pid_path: &Path, socket_path: &Path, runtime_dir: &Path) {
     let _ = fs::remove_file(pid_path);
@@ -477,6 +463,7 @@ mod tests {
             registry_path,
             container_runtime: commands::ContainerRuntime::Podman,
             host_gateway_ip: None,
+            shutdown: Arc::new(AtomicBool::new(false)),
         };
         let log_path = dir.path().join("helper.log");
         let audit_log = logging::AuditLog::new(&log_path).unwrap();
@@ -551,6 +538,7 @@ mod tests {
             registry_path,
             container_runtime: commands::ContainerRuntime::Podman,
             host_gateway_ip: None,
+            shutdown: Arc::new(AtomicBool::new(false)),
         };
         let log_path = dir.path().join("helper.log");
         let audit_log = logging::AuditLog::new(&log_path).unwrap();
