@@ -26,7 +26,7 @@
 ## Code Locations — GC Service
 - Error type, `From<JwtError>` → `crates/gc-service/src/errors.rs:GcError`
 - Auth (JWT/JWKS, middleware) → `auth/jwt.rs`, `jwks.rs`, `middleware/auth.rs:require_user_auth()`
-- Meeting handlers → `handlers/meetings.rs:create_meeting()`, `join_meeting()`, `get_guest_token()`
+- Meeting handlers → `handlers/meetings.rs:create_meeting()`, `join_meeting()`, `get_guest_token()`, `JoinMeetingResponse::new()`
 - Repositories → `repositories/meetings.rs` (atomic CTE), `participants.rs`
 - AC/MC clients → `services/ac_client.rs:AcClient`, `mc_client.rs:McClientTrait`
 - Metrics/dashboard/alerts → `observability/metrics.rs`, `docs/observability/metrics/gc-service.md`, `infra/grafana/dashboards/gc-overview.json`

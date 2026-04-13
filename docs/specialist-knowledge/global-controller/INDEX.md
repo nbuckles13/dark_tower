@@ -19,6 +19,8 @@
 - gRPC auth layer (Tower) -> `crates/gc-service/src/grpc/auth_layer.rs:GrpcAuthLayer`
 - Meeting handlers (create, join, guest-token, settings) -> `crates/gc-service/src/handlers/meetings.rs`
 - Join/settings (user-auth, status allowlist, metrics) -> `crates/gc-service/src/handlers/meetings.rs:join_meeting()`, `update_meeting_settings()`
+- Join response construction (shared by join + guest-token) -> `crates/gc-service/src/handlers/meetings.rs:JoinMeetingResponse::new()`
+- McAssignment -> McAssignmentInfo conversion -> `crates/gc-service/src/handlers/meetings.rs:From<McAssignment>`
 - MC gRPC service (register, heartbeat) -> `crates/gc-service/src/grpc/mc_service.rs:McService`
 - MH gRPC service (register, load report) -> `crates/gc-service/src/grpc/mh_service.rs:MhService`
 - MC assignment + load balancing -> `crates/gc-service/src/services/mc_assignment.rs:McAssignmentService`

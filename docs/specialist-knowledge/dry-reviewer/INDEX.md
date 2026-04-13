@@ -71,5 +71,5 @@
 
 ## Successful Extractions & Integration Seams
 - Common crate (extraction target) -> `crates/common/src/` (jwt, config, meeting_token, secret, token_manager); ServiceClaims/UserClaims/JWKS/JwtValidator -> `jwt.rs`
-- TestKeypair + JWKS mock -> `crates/mc-test-utils/src/jwt_test.rs`; MeetingToken types -> `common/src/meeting_token.rs`; StatefulSet ordinal -> `common/src/config.rs`
+- TestKeypair + JWKS mock -> `crates/mc-test-utils/src/jwt_test.rs`; MeetingToken types -> `common/src/meeting_token.rs`; StatefulSet ordinal -> `common/src/config.rs`; JoinMeetingResponse::new() + From<McAssignment> -> `crates/gc-service/src/handlers/meetings.rs`
 - load_image_to_kind to setup.sh helper -> `infra/kind/scripts/setup.sh:load_image_to_kind()`

@@ -21,11 +21,12 @@ use crate::models::{
     DEFAULT_MAX_PARTICIPANTS, MIN_PARTICIPANTS,
 };
 use crate::observability::metrics;
-use crate::repositories::{map_row_to_meeting, MeetingsRepository};
+use crate::repositories::{map_row_to_meeting, McAssignment, MeetingsRepository};
 use crate::routes::AppState;
 use crate::services::ac_client::{
-    AcClient, GuestTokenRequest, MeetingRole, MeetingTokenRequest, ParticipantType,
+    AcClient, GuestTokenRequest, MeetingRole, MeetingTokenRequest, ParticipantType, TokenResponse,
 };
+use crate::services::mc_assignment::AssignmentWithMh;
 use crate::services::McAssignmentService;
 use axum::{
     extract::{Path, State},
@@ -63,6 +64,33 @@ const MAX_CODE_COLLISION_RETRIES: usize = 3;
 
 /// Length of join token secret in bytes (256 bits).
 const JOIN_TOKEN_SECRET_BYTES: usize = 32;
+
+impl From<McAssignment> for McAssignmentInfo {
+    fn from(mc: McAssignment) -> Self {
+        Self {
+            mc_id: mc.mc_id,
+            webtransport_endpoint: mc.webtransport_endpoint,
+            grpc_endpoint: mc.grpc_endpoint,
+        }
+    }
+}
+
+impl JoinMeetingResponse {
+    /// Construct a join response from a token, meeting, and MC assignment.
+    pub fn new(
+        token_response: TokenResponse,
+        meeting: MeetingRow,
+        assignment_with_mh: AssignmentWithMh,
+    ) -> Self {
+        Self {
+            token: token_response.token,
+            expires_in: token_response.expires_in,
+            meeting_id: meeting.meeting_id,
+            meeting_name: meeting.display_name,
+            mc_assignment: assignment_with_mh.mc_assignment.into(),
+        }
+    }
+}
 
 // ============================================================================
 // Handler: POST /api/v1/meetings
@@ -429,17 +457,11 @@ pub async fn join_meeting(
         "User joined meeting"
     );
 
-    Ok(Json(JoinMeetingResponse {
-        token: token_response.token,
-        expires_in: token_response.expires_in,
-        meeting_id: meeting.meeting_id,
-        meeting_name: meeting.display_name,
-        mc_assignment: McAssignmentInfo {
-            mc_id: assignment_with_mh.mc_assignment.mc_id,
-            webtransport_endpoint: assignment_with_mh.mc_assignment.webtransport_endpoint,
-            grpc_endpoint: assignment_with_mh.mc_assignment.grpc_endpoint,
-        },
-    }))
+    Ok(Json(JoinMeetingResponse::new(
+        token_response,
+        meeting,
+        assignment_with_mh,
+    )))
 }
 
 // ============================================================================
@@ -552,17 +574,11 @@ pub async fn get_guest_token(
         "Guest joined meeting"
     );
 
-    Ok(Json(JoinMeetingResponse {
-        token: token_response.token,
-        expires_in: token_response.expires_in,
-        meeting_id: meeting.meeting_id,
-        meeting_name: meeting.display_name,
-        mc_assignment: McAssignmentInfo {
-            mc_id: assignment_with_mh.mc_assignment.mc_id,
-            webtransport_endpoint: assignment_with_mh.mc_assignment.webtransport_endpoint,
-            grpc_endpoint: assignment_with_mh.mc_assignment.grpc_endpoint,
-        },
-    }))
+    Ok(Json(JoinMeetingResponse::new(
+        token_response,
+        meeting,
+        assignment_with_mh,
+    )))
 }
 
 // ============================================================================
