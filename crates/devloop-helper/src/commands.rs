@@ -17,8 +17,9 @@ use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Hostname that dev containers use to reach the host via podman's gateway.
@@ -41,6 +42,8 @@ pub struct Context {
     /// Host-gateway IP for Kind NodePort listenAddress (ADR-0030).
     /// Detected by devloop.sh and passed via --host-gateway-ip.
     pub host_gateway_ip: Option<String>,
+    /// Shutdown flag — set by signal handler, checked during long-running commands.
+    pub shutdown: Arc<AtomicBool>,
 }
 
 /// Detected container runtime.
@@ -253,6 +256,7 @@ fn cmd_setup(
                 .env(env_key, env_val),
             "kind create cluster",
             writer,
+            &ctx.shutdown,
         )?;
     }
 
@@ -277,7 +281,7 @@ fn cmd_setup(
         setup_cmd.arg("--skip-observability");
     }
 
-    run_command_streaming(&mut setup_cmd, "setup.sh", writer)?;
+    run_command_streaming(&mut setup_cmd, "setup.sh", writer, &ctx.shutdown)?;
 
     // Generate kubeconfig for container access (ADR-0030/0031).
     // Rewrites the API server URL to use host.containers.internal and the
@@ -637,6 +641,7 @@ fn cmd_rebuild(ctx: &Context, svc: Service, writer: &mut dyn Write) -> Result<()
             .arg(&ctx.project_root),
         &format!("{} build {}", ctx.container_runtime.as_str(), svc),
         writer,
+        &ctx.shutdown,
     )?;
 
     // Load into Kind
@@ -683,6 +688,7 @@ fn cmd_deploy(ctx: &Context, svc: Service, writer: &mut dyn Write) -> Result<(),
             .env(env_key, env_val),
         &format!("setup.sh --skip-build --only {svc}"),
         writer,
+        &ctx.shutdown,
     )?;
 
     Ok(())
@@ -707,6 +713,7 @@ fn cmd_teardown(ctx: &Context, writer: &mut dyn Write) -> Result<(), HelperError
             .env(env_key, env_val),
         "kind delete cluster",
         writer,
+        &ctx.shutdown,
     );
 
     if let Err(ref e) = result {
@@ -742,6 +749,7 @@ fn load_image_to_kind(
                     .arg(&tmp_path),
                 &format!("podman save {image_tag}"),
                 writer,
+                &ctx.shutdown,
             )?;
             let result = run_command_streaming(
                 Command::new("kind")
@@ -753,6 +761,7 @@ fn load_image_to_kind(
                     .env(env_key, env_val),
                 "kind load image-archive",
                 writer,
+                &ctx.shutdown,
             );
             let _ = fs::remove_file(&tmp_path);
             result?;
@@ -768,6 +777,7 @@ fn load_image_to_kind(
                     .env(env_key, env_val),
                 "kind load docker-image",
                 writer,
+                &ctx.shutdown,
             )?;
         }
     }
@@ -795,6 +805,7 @@ fn restart_deployment(
                     .arg("dark-tower"),
                 "kubectl rollout restart ac-service",
                 writer,
+                &ctx.shutdown,
             )?;
         }
         Service::Gc => {
@@ -809,6 +820,7 @@ fn restart_deployment(
                     .arg("dark-tower"),
                 "kubectl rollout restart gc-service",
                 writer,
+                &ctx.shutdown,
             )?;
         }
         Service::Mc => {
@@ -824,6 +836,7 @@ fn restart_deployment(
                         .arg("dark-tower"),
                     &format!("kubectl rollout restart mc-{i}"),
                     writer,
+                    &ctx.shutdown,
                 )?;
             }
         }
@@ -840,6 +853,7 @@ fn restart_deployment(
                         .arg("dark-tower"),
                     &format!("kubectl rollout restart mh-{i}"),
                     writer,
+                    &ctx.shutdown,
                 )?;
             }
         }
@@ -910,7 +924,7 @@ fn pipe_reader(
 ///
 /// Uses an mpsc channel: two reader threads send `StreamMsg` values, and this
 /// function (on the calling thread) receives them and writes JSON lines to the
-/// writer. The calling thread checks the global `SHUTDOWN` flag for SIGTERM.
+/// writer. The calling thread checks the `shutdown` flag for SIGTERM.
 ///
 /// On broken pipe (client disconnect) or SIGTERM: the child is killed via
 /// `Child::kill()` (SIGKILL — immediate, non-catchable). The output is lost
@@ -925,6 +939,7 @@ fn run_command_streaming(
     cmd: &mut Command,
     description: &str,
     writer: &mut dyn Write,
+    shutdown: &AtomicBool,
 ) -> Result<(), HelperError> {
     let mut child = cmd
         .stdout(Stdio::piped())
@@ -998,7 +1013,7 @@ fn run_command_streaming(
         }
 
         // Kill child on SIGTERM
-        if !child_killed && crate::SHUTDOWN.load(Ordering::Relaxed) {
+        if !child_killed && shutdown.load(Ordering::Relaxed) {
             // SIGKILL (not SIGTERM) — immediate termination; idempotent re-run handles recovery
             let _ = child.kill();
             child_killed = true;
@@ -1068,11 +1083,13 @@ mod tests {
     /// Helper: run a command via run_command_streaming, collecting all output
     /// written to the writer as individual JSON lines.
     fn collect_streaming_output(args: &[&str]) -> (Result<(), HelperError>, Vec<String>) {
+        let shutdown = AtomicBool::new(false);
         let mut output = Vec::new();
         let result = run_command_streaming(
             Command::new(args[0]).args(&args[1..]),
             "test command",
             &mut output,
+            &shutdown,
         );
         let lines: Vec<String> = output
             .split(|&b| b == b'\n')
@@ -1205,11 +1222,13 @@ mod tests {
 
     #[test]
     fn test_streaming_nonexistent_binary() {
+        let shutdown = AtomicBool::new(false);
         let mut output = Vec::new();
         let result = run_command_streaming(
             &mut Command::new("/nonexistent/binary/that/does/not/exist"),
             "nonexistent",
             &mut output,
+            &shutdown,
         );
         assert!(result.is_err());
 
@@ -1327,6 +1346,7 @@ mod tests {
             registry_path: dir.path().join("port-registry.json"),
             container_runtime: ContainerRuntime::Podman,
             host_gateway_ip: None,
+            shutdown: Arc::new(AtomicBool::new(false)),
         };
 
         let mut output = Vec::new();
