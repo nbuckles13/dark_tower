@@ -12,20 +12,19 @@
 - AC metrics -> `crates/ac-service/src/observability/metrics.rs:init_metrics_recorder()`, gauge init `services/key_management_service.rs:init_key_metrics()`, HTTP middleware `middleware/http_metrics.rs`, rate limit config `config.rs`
 - GC metrics -> `crates/gc-service/src/observability/metrics.rs`, HTTP middleware `middleware/http_metrics.rs:normalize_endpoint()`, join wiring `handlers/meetings.rs:join_meeting()`, DB metrics `repositories/`; gap: `get_guest_token()` uninstrumented
 - MC metrics -> `crates/mc-service/src/observability/metrics.rs`; recording sites: `webtransport/connection.rs:handle_connection()`, `server.rs:accept_loop()`; bounded labels `errors.rs:error_type_label()`
-- MH metrics (registration, heartbeat, token refresh, gRPC incl. register_meeting) -> `crates/mh-service/src/observability/metrics.rs`
-
-## MC<->MH Coordination Proto
-- RegisterMeeting (MC->MH), MediaCoordinationService (MH->MC), DisconnectReason enum -> `proto/internal.proto`
-- MediaConnectionFailed (client->MC signaling) -> `proto/signaling.proto:MediaConnectionFailed`
-- RegisterMeeting stub (instrumented) -> `crates/mh-service/src/grpc/mh_service.rs:register_meeting()`
+- MH metrics (registration, heartbeat, token refresh, gRPC, WebTransport, JWT) -> `crates/mh-service/src/observability/metrics.rs`; recording sites: `webtransport/server.rs:accept_loop()`, `webtransport/connection.rs:handle_connection()`, `grpc/auth_interceptor.rs:MhAuthService`
 
 ## Auth & JWT Tracing
 - Common JWT (JwksClient, JwtValidator, verify_token, PII-redacted Debug) -> `crates/common/src/jwt.rs`
-- GC/MC auth wrappers -> `crates/gc-service/src/auth/jwt.rs:JwtValidator`, `crates/mc-service/src/auth/mod.rs:McJwtValidator` (target: `mc.auth`)
+- GC/MC/MH auth wrappers -> `crates/gc-service/src/auth/jwt.rs:JwtValidator`, `crates/mc-service/src/auth/mod.rs:McJwtValidator` (target: `mc.auth`), `crates/mh-service/src/auth/mod.rs:MhJwtValidator` (target: `mh.auth`)
+- MH gRPC auth (JWKS-based ServiceClaims validation, tower Layer) -> `crates/mh-service/src/grpc/auth_interceptor.rs:MhAuthLayer` (target: `mh.grpc.auth`)
 
 ## MC WebTransport Tracing
 - Server/connection/handler (targets: `mc.webtransport`, `.connection`, `.handler`) -> `crates/mc-service/src/webtransport/server.rs`, `connection.rs`, `handler.rs`
 - ParticipantActor (target: `mc.actor.participant`) -> `crates/mc-service/src/actors/participant.rs:run()`
+
+## MH WebTransport Tracing
+- Server/connection (targets: `mh.webtransport`, `.connection`) -> `crates/mh-service/src/webtransport/server.rs`, `connection.rs`
 
 ## GC Client Tracing (MC + MH)
 - GcClient tracing (registration, heartbeat, re-registration) -> `crates/mc-service/src/grpc/gc_client.rs` (+ mh)
@@ -57,7 +56,8 @@
 - Helper audit log (JSONL, all commands including status) -> `crates/devloop-helper/src/logging.rs:AuditLog`
 - Devloop.sh infrastructure health check (re-entry) -> `infra/devloop/devloop.sh` (ADR-0030 Step 6 section)
 - Eager setup background log -> `/tmp/devloop-{slug}/eager-setup.log`
-- Env-tests (ClusterPorts, health checks, observability validation) -> `crates/env-tests/src/cluster.rs`, `tests/30_observability.rs`
+- Env-test observability URL config -> `crates/env-tests/src/cluster.rs:ClusterPorts::from_env()`
+- Env-tests observability validation -> `crates/env-tests/tests/30_observability.rs`
 - Layer 8 env-test integration (validation pipeline) -> `.claude/skills/devloop/SKILL.md` (Layer 8 section)
 
 ## Guards
@@ -65,7 +65,7 @@
 - Dashboard-to-kustomize coverage (R-20, bidirectional) -> `scripts/guards/simple/validate-kustomize.sh`
 - Instrument skip_all enforcement -> `scripts/guards/simple/instrument-skip-all.sh`
 
-## Env-Test & K8s Config
+## Env-Test Observability & Cluster Config
 - MC/MH K8s health probes + metrics scrape -> `infra/services/{mc,mh}-service/deployment.yaml`
 
 ## Runbooks

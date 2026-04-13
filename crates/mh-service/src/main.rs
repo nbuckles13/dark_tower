@@ -27,11 +27,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Router;
+use common::jwt::JwksClient;
 use common::token_manager::{spawn_token_manager, TokenManagerConfig};
+use mh_service::auth::MhJwtValidator;
 use mh_service::config::Config;
 use mh_service::errors::MhError;
-use mh_service::grpc::{GcClient, MhAuthInterceptor, MhMediaService};
+use mh_service::grpc::{GcClient, MhAuthLayer, MhMediaService};
 use mh_service::observability::{health_router, HealthState};
+use mh_service::session::SessionManager;
+use mh_service::webtransport::WebTransportServer;
 use proto_gen::internal::media_handler_service_server::MediaHandlerServiceServer;
 use tokio::signal;
 use tokio_util::sync::CancellationToken;
@@ -70,6 +74,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         grpc_advertise_address = %config.grpc_advertise_address,
         webtransport_advertise_address = %config.webtransport_advertise_address,
         max_streams = config.max_streams,
+        max_connections = config.max_connections,
+        register_meeting_timeout_seconds = config.register_meeting_timeout_seconds,
         "Configuration loaded successfully"
     );
 
@@ -132,6 +138,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("TokenManager spawned successfully, initial token acquired");
 
+    // Initialize JWKS client for JWT validation (meeting tokens + service tokens)
+    info!(
+        ac_jwks_url = %config.ac_jwks_url,
+        "Initializing JWKS client..."
+    );
+    let jwks_client = Arc::new(JwksClient::new(config.ac_jwks_url.clone()).map_err(|e| {
+        error!(error = %e, "Failed to create JWKS client");
+        MhError::Config(format!("JWKS client creation failed: {e}"))
+    })?);
+
+    // Create MH JWT validator for meeting tokens (WebTransport connections)
+    let jwt_validator = Arc::new(MhJwtValidator::new(Arc::clone(&jwks_client), 300));
+    info!("JWKS client and JWT validator initialized");
+
+    // Create session manager for meeting registration and connection tracking
+    let session_manager = Arc::new(SessionManager::new());
+    info!("Session manager initialized");
+
     // Start health HTTP server (MUST succeed - fail startup if it doesn't)
     let health_addr: SocketAddr = config.health_bind_address.parse().map_err(|e| {
         error!(error = %e, addr = %config.health_bind_address, "Invalid health bind address");
@@ -182,14 +206,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     })?;
 
     let mh_media_service = MhMediaService::new();
-    let auth_interceptor = MhAuthInterceptor::new();
+    let auth_layer = MhAuthLayer::new(Arc::clone(&jwks_client), 300);
 
     let grpc_shutdown_token = shutdown_token.child_token();
     let grpc_server = tonic::transport::Server::builder()
-        .add_service(MediaHandlerServiceServer::with_interceptor(
-            mh_media_service,
-            auth_interceptor,
-        ))
+        .layer(auth_layer)
+        .add_service(MediaHandlerServiceServer::new(mh_media_service))
         .serve_with_shutdown(grpc_addr, async move {
             grpc_shutdown_token.cancelled().await;
             info!("gRPC server shutting down");
@@ -203,6 +225,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
     info!(addr = %grpc_addr, "gRPC server started");
+
+    // Start WebTransport server BEFORE GC registration (ADR-0010 ordering)
+    // This ensures MH can accept client connections before GC starts routing traffic here
+    let wt_server = WebTransportServer::new(
+        config.webtransport_bind_address.clone(),
+        config.tls_cert_path.clone(),
+        config.tls_key_path.clone(),
+        Arc::clone(&jwt_validator),
+        Arc::clone(&session_manager),
+        Duration::from_secs(config.register_meeting_timeout_seconds),
+        config.max_connections,
+        shutdown_token.child_token(),
+    );
+
+    let wt_endpoint = wt_server.bind().await.map_err(|e| {
+        error!(error = %e, "Failed to bind WebTransport server");
+        format!("WebTransport bind failed: {e}")
+    })?;
+
+    info!(
+        addr = %config.webtransport_bind_address,
+        "WebTransport server bound successfully"
+    );
+
+    tokio::spawn(async move {
+        wt_server.accept_loop(wt_endpoint).await;
+    });
+    info!(
+        addr = %config.webtransport_bind_address,
+        "WebTransport accept loop started"
+    );
 
     // Connect to Global Controller
     info!("Connecting to Global Controller...");
@@ -222,7 +275,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     info!("GC task started");
 
-    info!("Media Handler stub running - press Ctrl+C to shutdown");
+    info!("Media Handler running - press Ctrl+C to shutdown");
 
     // Wait for shutdown signal
     shutdown_signal().await;

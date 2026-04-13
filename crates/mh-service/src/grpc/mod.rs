@@ -22,6 +22,6 @@ pub mod auth_interceptor;
 pub mod gc_client;
 pub mod mh_service;
 
-pub use auth_interceptor::MhAuthInterceptor;
+pub use auth_interceptor::{MhAuthInterceptor, MhAuthLayer};
 pub use gc_client::GcClient;
 pub use mh_service::MhMediaService;
