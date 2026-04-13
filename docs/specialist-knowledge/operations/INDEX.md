@@ -38,7 +38,7 @@
 - MC/MH per-instance ConfigMaps (advertise addresses) → `infra/services/mc-service/mc-{0,1}-configmap.yaml`, `mh-service/mh-{0,1}-configmap.yaml`
 - Devloop ConfigMap patching (advertise addresses) → `infra/kind/scripts/setup.sh:deploy_mc_service()`, `deploy_mh_service()` (gated on `DT_HOST_GATEWAY_IP`)
 - DT_HOST_GATEWAY_IP validation → `infra/kind/scripts/setup.sh` (after DT_PORT_MAP sourcing)
-- Per-pod UDP NodePorts: `base + ordinal*2` (MC: 4433/4435, MH: 4434/4436); cross-service netpol in `gc-service/network-policy.yaml`, `mc-service/network-policy.yaml`
+- Per-pod UDP NodePorts: `base + ordinal*2` (MC: 4433/4435, MH: 4434/4436); cross-service netpol in `gc-service/network-policy.yaml`, `mc-service/network-policy.yaml`, `mh-service/network-policy.yaml`
 - Downward API: `status.podIP` → `POD_IP`; WebTransport advertise from per-instance ConfigMap
 - Port map: AC=8082, GC=8080/50051, MC=8081/50052/4433, MH=8083/50053/4434; scaling requires per-pod Services + Kind port mappings
 

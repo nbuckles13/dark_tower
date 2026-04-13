@@ -21,6 +21,8 @@ data:
   GC_GRPC_URL: "http://gc-service.dark-tower:50051"
   # AC service discovery for OAuth token acquisition
   AC_ENDPOINT: "http://ac-service.dark-tower:8082"
+  # AC JWKS endpoint for JWT validation
+  AC_JWKS_URL: "http://ac-service.dark-tower:8082/.well-known/jwks.json"
   # Maximum concurrent media streams
   MH_MAX_STREAMS: "100"
   # TLS certificate paths for WebTransport (mounted from mh-service-tls Secret)

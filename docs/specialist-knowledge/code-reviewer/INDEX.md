@@ -43,21 +43,21 @@
 - Dashboard + alerts (join panels, Traffic/Security stat rows) → `infra/grafana/dashboards/mc-overview.json`, `infra/docker/prometheus/rules/mc-alerts.yaml`
 - Metrics catalog → `docs/observability/metrics/mc-service.md`
 - Health probes (liveness/readiness) → `crates/mc-service/src/observability/health.rs:health_router()`
-- MC K8s StatefulSet (probes on port 8081, per-pod NodePort) → `infra/services/mc-service/statefulset.yaml`, `service.yaml`
+- K8s (probes on 8081, per-pod NodePort) → `infra/services/mc-service/statefulset.yaml`, `service.yaml`, `network-policy.yaml`
 
 ## Code Locations — MH Service
-- Config (env vars, SecretString, Debug redaction, advertise addresses) → `crates/mh-service/src/config.rs:Config`
-- Error type (thiserror, bounded labels, `From<JwtError>`) → `crates/mh-service/src/errors.rs:MhError`
-- JWT validator + token type enforcement → `crates/mh-service/src/auth/mod.rs:MhJwtValidator`
-- gRPC auth (async JWKS + scope) → `crates/mh-service/src/grpc/auth_interceptor.rs:MhAuthLayer`; legacy → `MhAuthInterceptor`
-- GC client → `crates/mh-service/src/grpc/gc_client.rs:GcClient`; gRPC stub → `mh_service.rs:MhMediaService`
-- Session manager (meeting registration, connection tracking) → `crates/mh-service/src/session/mod.rs:SessionManager`
-- WebTransport server (accept loop) → `crates/mh-service/src/webtransport/server.rs:WebTransportServer`
-- Connection handler (JWT, provisional accept, timeout) → `crates/mh-service/src/webtransport/connection.rs:handle_connection()`
-- Startup wiring (TokenManager, JWKS, health, gRPC, WebTransport, GC task) → `crates/mh-service/src/main.rs`
-- Health probes → `crates/mh-service/src/observability/health.rs`; Metrics → `observability/metrics.rs`
+- Config (env vars, SecretString, Debug redaction, advertise addresses, ordinal parsing) → `crates/mh-service/src/config.rs:Config`, `parse_statefulset_ordinal()`
+- Error type (thiserror, bounded labels) → `crates/mh-service/src/errors.rs:MhError`
+- GC client (RegisterMH, SendLoadReport, re-registration) → `crates/mh-service/src/grpc/gc_client.rs:GcClient`
+- gRPC stub service (MC→MH: Register, RouteMedia, StreamTelemetry) → `crates/mh-service/src/grpc/mh_service.rs:MhMediaService`
+- gRPC auth interceptor (structural validation) → `crates/mh-service/src/grpc/auth_interceptor.rs:MhAuthInterceptor`
+- Startup wiring (TokenManager, health, gRPC, GC task) → `crates/mh-service/src/main.rs`
+- Health probes (liveness/readiness, port 8083) → `crates/mh-service/src/observability/health.rs:health_router()`
+- Metrics (mh_ prefix, SLO-aligned buckets) → `crates/mh-service/src/observability/metrics.rs:init_metrics_recorder()`
 - Metrics catalog + dashboard → `docs/observability/metrics/mh-service.md`, `infra/grafana/dashboards/mh-overview.json`
-- K8s (StatefulSet, Dockerfile, NetworkPolicy) → `infra/services/mh-service/`, `infra/docker/mh-service/Dockerfile`
+- K8s StatefulSet (probes on 8083, TLS vol, UDP 4434, per-pod NodePort) → `infra/services/mh-service/statefulset.yaml`, `service.yaml`
+- Dockerfile (cargo-chef, protobuf-compiler, distroless) → `infra/docker/mh-service/Dockerfile`
+- NetworkPolicy (MC gRPC ingress, client UDP, GC/MC/AC egress) → `infra/services/mh-service/network-policy.yaml`
 
 ## Code Locations — Common
 - JWT (errors, claims, validator, JWKS, HasIat) → `crates/common/src/jwt.rs`

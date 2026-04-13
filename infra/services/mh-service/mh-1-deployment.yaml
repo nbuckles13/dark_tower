@@ -80,6 +80,11 @@ spec:
             configMapKeyRef:
               name: mh-service-config
               key: AC_ENDPOINT
+        - name: AC_JWKS_URL
+          valueFrom:
+            configMapKeyRef:
+              name: mh-service-config
+              key: AC_JWKS_URL
         # TLS certificate paths for WebTransport (QUIC/HTTP3)
         - name: MH_TLS_CERT_PATH
           valueFrom:

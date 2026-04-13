@@ -26,6 +26,17 @@ spec:
     ports:
     - protocol: TCP
       port: 50052
+  # Allow ingress from Media Handler (participant connect/disconnect notifications)
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: dark-tower
+      podSelector:
+        matchLabels:
+          app: mh-service
+    ports:
+    - protocol: TCP
+      port: 50052
   # Allow ingress from external clients (WebTransport)
   # In Kind, exposed via NodePort 30433 (mapped to host 4433 in kind-config.yaml)
   - from: []
