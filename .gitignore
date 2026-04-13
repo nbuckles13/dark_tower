@@ -22,7 +22,6 @@ crates/proto-gen/src/generated/*.rs
 
 # Claude Code
 .claude/settings.local.json
-.devloop-pr.json
 .pr-body-draft.md
 
 # Environment
@@ -70,4 +69,3 @@ lcov.info
 # OS
 Thumbs.db
 .env.test
-.devloop-pr.json

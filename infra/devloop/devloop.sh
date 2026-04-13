@@ -311,23 +311,6 @@ detect_orphan_clusters() {
     done <<< "$clusters"
 }
 
-push_and_create_pr() {
-    local title="$1"
-    local body="$2"
-    git -C "$CLONE_DIR" push -u origin "$BRANCH_NAME"
-    cd "$CLONE_DIR" && gh pr create --title "$title" --body "$body"
-    rm -f "$PR_META"
-    echo ""
-    echo "  [d] Destroy containers and clone (un-pushed changes will be lost)"
-    echo "  [q] Quit (containers stay running)"
-    read -p "Choice: " -n 1 -r
-    echo
-    case $REPLY in
-        d|D) cleanup ;;
-        *) echo "Containers still running. Re-enter with: $0 ${TASK_SLUG}" ;;
-    esac
-}
-
 menu_reenter_or_cleanup() {
     echo "  [r] Re-enter container"
     echo "  [d] Destroy containers and clone (un-pushed changes will be lost)"
@@ -603,7 +586,6 @@ podman exec -it "$DEV_CONTAINER" claude --dangerously-skip-permissions --remote-
 
 echo ""
 
-PR_META="${CLONE_DIR}/.devloop-pr.json"
 COMMITS=$(git -C "$CLONE_DIR" log --oneline "${BASE_BRANCH}..HEAD" 2>/dev/null || true)
 
 # Check if a PR already exists for this branch
@@ -644,46 +626,17 @@ elif [ -n "$COMMITS" ]; then
     echo "=== Commits on ${BRANCH_NAME} ==="
     echo "$COMMITS"
     echo ""
+    echo "  [r] Re-enter container"
+    echo "  [d] Destroy containers and clone (un-pushed changes will be lost)"
+    echo "  [q] Quit (containers stay running)"
+    read -p "Choice: " -n 1 -r
+    echo
 
-    if [ -f "$PR_META" ]; then
-        PR_TITLE=$(jq -r .title "$PR_META")
-        echo "PR ready: ${PR_TITLE}"
-        echo ""
-        echo "  [p] Push and create PR"
-        echo "  [e] Edit PR description, then push"
-        echo "  [r] Re-enter container"
-        echo "  [d] Destroy containers and clone (un-pushed changes will be lost)"
-        echo "  [q] Quit (containers stay running)"
-        read -p "Choice: " -n 1 -r
-        echo
-
-        case $REPLY in
-            p|P)
-                PR_BODY=$(jq -r .body "$PR_META")
-                push_and_create_pr "$PR_TITLE" "$PR_BODY"
-                ;;
-            e|E)
-                DRAFT="${CLONE_DIR}/.pr-body-draft.md"
-                jq -r .body "$PR_META" > "$DRAFT"
-                ${EDITOR:-vi} "$DRAFT"
-                PR_BODY=$(cat "$DRAFT")
-                rm -f "$DRAFT"
-                push_and_create_pr "$PR_TITLE" "$PR_BODY"
-                ;;
-            r|R)
-                exec "$0" "$TASK_SLUG" "$BASE_BRANCH"
-                ;;
-            d|D) cleanup ;;
-            *)
-                echo "Containers still running. Re-enter with: $0 ${TASK_SLUG}"
-                ;;
-        esac
-    else
-        echo "No PR metadata found (.devloop-pr.json)."
-        echo "Re-enter the container to complete the devloop and generate PR metadata."
-        echo ""
-        menu_reenter_or_cleanup
-    fi
+    case $REPLY in
+        r|R) exec "$0" "$TASK_SLUG" "$BASE_BRANCH" ;;
+        d|D) cleanup ;;
+        *) echo "Containers still running. Re-enter with: $0 ${TASK_SLUG}" ;;
+    esac
 
 else
     echo "No new commits on ${BRANCH_NAME}."
