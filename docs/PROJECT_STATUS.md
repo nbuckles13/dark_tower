@@ -471,7 +471,7 @@ dark_tower/
   - Custom Clone/Serialize for SecretBox-containing structs
 - ✅ **Guard Pipeline Phase 1** (ADR-0015)
   - Principles framework: crypto, jwt, logging, queries, errors, input, testing
-  - Simple guards: no-hardcoded-secrets, no-secrets-in-logs, no-pii-in-logs, no-test-removal
+  - Simple guards: no-hardcoded-secrets, no-secrets-in-logs, no-pii-in-logs
   - Semantic guard: credential-leak detection using Claude API
   - 7-layer verification: check → fmt → guards → tests → clippy → semantic
 - ✅ **Development Loop Workflow** (ADR-0016)

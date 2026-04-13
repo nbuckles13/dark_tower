@@ -52,7 +52,6 @@ Automated enforcement of principles. Guards are categorized by speed and capabil
 | Compile-time | sqlx, type system | Build time | Query safety, type constraints |
 | Tests | P0/P1 security tests | CI | Runtime behavior validation |
 | Coverage | `test-coverage.sh` | CI | Ensure changed code is tested |
-| Test Protection | `no-test-removal.sh` | Pre-commit | Warn on test removal/weakening |
 
 ### Tests as Guards
 
