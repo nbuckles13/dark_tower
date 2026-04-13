@@ -101,7 +101,6 @@ For the full architecture and design decisions, see:
 
 ## Future Work
 
-- Complete resilience tests (currently stubs marked with `#[ignore]`)
-- Complete runbook validation tests (currently stubs)
-- NetworkPolicy canary pod implementation for network isolation testing
+- Resilience tests: pod restart recovery, network partition, DB connection loss (see TODO.md)
+- Runbook validation tests: key rotation, graceful drain, scale-up procedures (see TODO.md)
 - In-cluster test Job for CI (eliminate port-forward dependency)
