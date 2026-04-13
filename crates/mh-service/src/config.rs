@@ -32,6 +32,19 @@ pub const DEFAULT_MAX_STREAMS: u32 = 1000;
 /// Default MH instance ID prefix.
 pub const DEFAULT_MH_ID_PREFIX: &str = "mh";
 
+/// Default `RegisterMeeting` timeout in seconds.
+/// Clients connecting to unregistered meetings are provisionally accepted
+/// for this window; if `RegisterMeeting` does not arrive, they are disconnected.
+pub const DEFAULT_REGISTER_MEETING_TIMEOUT_SECONDS: u64 = 15;
+
+/// Maximum allowed `RegisterMeeting` timeout in seconds (5 minutes).
+/// Capped to prevent misconfiguration from effectively disabling the
+/// provisional timeout security control (R-14).
+pub const MAX_REGISTER_MEETING_TIMEOUT_SECONDS: u64 = 300;
+
+/// Default maximum concurrent WebTransport connections.
+pub const DEFAULT_MAX_CONNECTIONS: usize = 10_000;
+
 /// Media Handler configuration.
 ///
 /// Loaded from environment variables with sensible defaults.
@@ -84,6 +97,18 @@ pub struct Config {
     /// This is the address GC uses to reach this MH pod (e.g., `https://10.244.0.5:4434`).
     /// Required environment variable: `MH_WEBTRANSPORT_ADVERTISE_ADDRESS`.
     pub webtransport_advertise_address: String,
+
+    /// AC JWKS endpoint URL for JWT validation.
+    /// Required environment variable: `AC_JWKS_URL`.
+    pub ac_jwks_url: String,
+
+    /// `RegisterMeeting` arrival timeout in seconds (default: 15).
+    /// Clients connecting to unregistered meetings are provisionally accepted
+    /// for this duration; if `RegisterMeeting` does not arrive, they are disconnected.
+    pub register_meeting_timeout_seconds: u64,
+
+    /// Maximum concurrent WebTransport connections (default: 10000).
+    pub max_connections: usize,
 }
 
 /// Custom Debug implementation that redacts sensitive fields.
@@ -107,6 +132,12 @@ impl fmt::Debug for Config {
                 "webtransport_advertise_address",
                 &self.webtransport_advertise_address,
             )
+            .field("ac_jwks_url", &self.ac_jwks_url)
+            .field(
+                "register_meeting_timeout_seconds",
+                &self.register_meeting_timeout_seconds,
+            )
+            .field("max_connections", &self.max_connections)
             .finish()
     }
 }
@@ -137,6 +168,10 @@ impl Config {
     ///
     /// Returns `ConfigError::MissingEnvVar` if a required variable is missing.
     /// Returns `ConfigError::InvalidValue` if a value is invalid.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Sequential env var parsing; splitting would obscure config loading flow"
+    )]
     pub fn from_vars(vars: &HashMap<String, String>) -> Result<Self, ConfigError> {
         let ac_endpoint = vars
             .get("AC_ENDPOINT")
@@ -218,6 +253,29 @@ impl Config {
             .and_then(|s| s.parse().ok())
             .unwrap_or(DEFAULT_MAX_STREAMS);
 
+        let ac_jwks_url = vars
+            .get("AC_JWKS_URL")
+            .ok_or_else(|| ConfigError::MissingEnvVar("AC_JWKS_URL".to_string()))?
+            .clone();
+
+        // Basic validation: JWKS URL must use http:// or https://
+        if !ac_jwks_url.starts_with("http://") && !ac_jwks_url.starts_with("https://") {
+            return Err(ConfigError::InvalidValue(
+                "AC_JWKS_URL must start with http:// or https://".to_string(),
+            ));
+        }
+
+        let register_meeting_timeout_seconds = vars
+            .get("MH_REGISTER_MEETING_TIMEOUT_SECONDS")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DEFAULT_REGISTER_MEETING_TIMEOUT_SECONDS)
+            .min(MAX_REGISTER_MEETING_TIMEOUT_SECONDS);
+
+        let max_connections = vars
+            .get("MH_MAX_CONNECTIONS")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DEFAULT_MAX_CONNECTIONS);
+
         // Generate MH instance ID
         let handler_id = vars.get("MH_HANDLER_ID").cloned().unwrap_or_else(|| {
             let hostname = std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".to_string());
@@ -241,6 +299,9 @@ impl Config {
             tls_key_path,
             grpc_advertise_address,
             webtransport_advertise_address,
+            ac_jwks_url,
+            register_meeting_timeout_seconds,
+            max_connections,
         })
     }
 }
@@ -272,6 +333,10 @@ mod tests {
                 "MH_WEBTRANSPORT_ADVERTISE_ADDRESS".to_string(),
                 "https://localhost:4434".to_string(),
             ),
+            (
+                "AC_JWKS_URL".to_string(),
+                "http://localhost:8082/.well-known/jwks.json".to_string(),
+            ),
         ])
     }
 
@@ -302,6 +367,15 @@ mod tests {
             config.webtransport_advertise_address,
             "https://localhost:4434"
         );
+        assert_eq!(
+            config.ac_jwks_url,
+            "http://localhost:8082/.well-known/jwks.json"
+        );
+        assert_eq!(
+            config.register_meeting_timeout_seconds,
+            DEFAULT_REGISTER_MEETING_TIMEOUT_SECONDS
+        );
+        assert_eq!(config.max_connections, DEFAULT_MAX_CONNECTIONS);
     }
 
     #[test]
@@ -474,5 +548,65 @@ mod tests {
         assert!(
             matches!(result, Err(ConfigError::MissingEnvVar(v)) if v == "MH_WEBTRANSPORT_ADVERTISE_ADDRESS")
         );
+    }
+
+    #[test]
+    fn test_from_vars_missing_ac_jwks_url() {
+        let mut vars = base_vars();
+        vars.remove("AC_JWKS_URL");
+
+        let result = Config::from_vars(&vars);
+        assert!(matches!(result, Err(ConfigError::MissingEnvVar(v)) if v == "AC_JWKS_URL"));
+    }
+
+    #[test]
+    fn test_from_vars_invalid_ac_jwks_url_scheme() {
+        let mut vars = base_vars();
+        vars.insert(
+            "AC_JWKS_URL".to_string(),
+            "ftp://localhost:8082/.well-known/jwks.json".to_string(),
+        );
+
+        let result = Config::from_vars(&vars);
+        assert!(
+            matches!(&result, Err(ConfigError::InvalidValue(msg)) if msg.contains("http://") && msg.contains("https://")),
+            "Expected InvalidValue error for non-http scheme, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_register_meeting_timeout_custom_value() {
+        let mut vars = base_vars();
+        vars.insert(
+            "MH_REGISTER_MEETING_TIMEOUT_SECONDS".to_string(),
+            "30".to_string(),
+        );
+
+        let config = Config::from_vars(&vars).expect("Config should load successfully");
+        assert_eq!(config.register_meeting_timeout_seconds, 30);
+    }
+
+    #[test]
+    fn test_register_meeting_timeout_clamped_to_max() {
+        let mut vars = base_vars();
+        vars.insert(
+            "MH_REGISTER_MEETING_TIMEOUT_SECONDS".to_string(),
+            "999999".to_string(),
+        );
+
+        let config = Config::from_vars(&vars).expect("Config should load successfully");
+        assert_eq!(
+            config.register_meeting_timeout_seconds,
+            MAX_REGISTER_MEETING_TIMEOUT_SECONDS,
+        );
+    }
+
+    #[test]
+    fn test_max_connections_custom_value() {
+        let mut vars = base_vars();
+        vars.insert("MH_MAX_CONNECTIONS".to_string(), "5000".to_string());
+
+        let config = Config::from_vars(&vars).expect("Config should load successfully");
+        assert_eq!(config.max_connections, 5000);
     }
 }

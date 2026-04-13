@@ -169,6 +169,9 @@ fn test_config(gc_url: &str) -> Config {
         tls_key_path: "/dev/null".to_string(),
         grpc_advertise_address: "grpc://localhost:50053".to_string(),
         webtransport_advertise_address: "https://localhost:4434".to_string(),
+        ac_jwks_url: "http://localhost:8082/.well-known/jwks.json".to_string(),
+        register_meeting_timeout_seconds: 15,
+        max_connections: 10_000,
     }
 }
 

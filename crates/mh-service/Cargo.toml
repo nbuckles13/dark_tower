@@ -27,12 +27,18 @@ bytes = { workspace = true }
 # gRPC for GC communication and MC→MH service
 tonic = { workspace = true }
 
+# Tower middleware (for async auth Layer/Service on gRPC requests)
+tower = { workspace = true }
+
 # Metrics (ADR-0011 Observability)
 metrics = "0.24"
 metrics-exporter-prometheus = "0.16"
 
 # HTTP server for health endpoints and metrics
 axum = { workspace = true }
+
+# Time utilities
+chrono = { workspace = true }
 
 # Local dependencies
 common = { path = "../common" }
@@ -45,9 +51,14 @@ path = "src/main.rs"
 
 [dev-dependencies]
 criterion = { workspace = true }
-# HTTP testing for health endpoint integration tests
-tower = { workspace = true }
+# HTTP testing for health endpoint integration tests — tower is now a regular dep
 # Stream utilities for mock gRPC server
 tokio-stream = "0.1"
 # Metrics test recorder for integration tests
 metrics-util = "0.18"
+# JWT validation testing (Ed25519 signing, JWKS mocking)
+wiremock = "0.6"
+jsonwebtoken = { workspace = true }
+ring = { workspace = true }
+base64 = { workspace = true }
+serde_json = { workspace = true }

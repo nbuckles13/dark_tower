@@ -90,6 +90,60 @@ rate(mh_token_refresh_total{status="error"}[5m])
 
 ---
 
+## WebTransport Connection Metrics
+
+### `mh_active_connections`
+- **Type**: Gauge
+- **Description**: Number of active WebTransport connections on this MH instance
+- **Labels**: None
+- **Usage**: Monitor connection load and capacity utilization
+- **Dashboard**: MH Overview - Active Connections gauge
+
+### `mh_webtransport_connections_total`
+- **Type**: Counter
+- **Description**: Total WebTransport connection attempts by outcome
+- **Labels**:
+  - `status`: Connection outcome (`accepted`, `rejected`, `error`)
+- **Cardinality**: Low (3 values)
+- **Usage**: Monitor connection acceptance rate, capacity rejections, and connection errors
+- **Dashboard**: MH Overview - WebTransport Connections by Status
+
+### `mh_webtransport_handshake_duration_seconds`
+- **Type**: Histogram
+- **Description**: Duration from WebTransport session accept through JWT validation
+- **Labels**: None
+- **Buckets**: [0.010, 0.025, 0.050, 0.100, 0.200, 0.500, 1.000, 2.000, 5.000]
+- **Usage**: Monitor handshake latency, detect slow JWKS lookups or TLS issues
+- **Dashboard**: MH Overview - Handshake Latency P50/P95/P99
+
+**PromQL example** - connection rejection rate:
+```promql
+sum(rate(mh_webtransport_connections_total{status="rejected"}[5m])) /
+sum(rate(mh_webtransport_connections_total[5m]))
+```
+
+---
+
+## JWT Validation Metrics
+
+### `mh_jwt_validations_total`
+- **Type**: Counter
+- **Description**: Total JWT validation attempts by result and token type
+- **Labels**:
+  - `result`: Validation outcome (`success`, `failure`)
+  - `token_type`: Token type (`meeting`, `service`)
+- **Cardinality**: Low (2 results x 2 token types = 4 series)
+- **Usage**: Monitor authentication health, detect token validation failures
+- **Dashboard**: MH Overview - JWT Validations by Result
+
+**PromQL example** - JWT failure rate:
+```promql
+sum(rate(mh_jwt_validations_total{result="failure"}[5m])) /
+sum(rate(mh_jwt_validations_total[5m]))
+```
+
+---
+
 ## Incoming gRPC Metrics
 
 ### `mh_grpc_requests_total`

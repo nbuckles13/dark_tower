@@ -24,7 +24,10 @@
 
 #![warn(clippy::pedantic)]
 
+pub mod auth;
 pub mod config;
 pub mod errors;
 pub mod grpc;
 pub mod observability;
+pub mod session;
+pub mod webtransport;

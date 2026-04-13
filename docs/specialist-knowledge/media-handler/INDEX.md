@@ -7,6 +7,7 @@
 - Observability pattern (metrics crate facade) → ADR-0011
 - Dashboard metric presentation (counters vs rates) → ADR-0029
 - Fuzz testing for media frames → ADR-0006
+- Client-to-MH QUIC connection user story → `docs/user-stories/2026-04-12-mh-quic-connection.md`
 
 ## Code Locations
 - Service entry point → `crates/mh-service/src/main.rs`
@@ -15,7 +16,11 @@
 - Error types (MhError hierarchy) → `crates/mh-service/src/errors.rs`
 - gRPC: GC client (registration, heartbeats, re-registration) → `crates/mh-service/src/grpc/gc_client.rs`
 - gRPC: MH service stub (Register, RouteMedia, StreamTelemetry) → `crates/mh-service/src/grpc/mh_service.rs`
-- gRPC: auth interceptor (Bearer validation for MC→MH) → `crates/mh-service/src/grpc/auth_interceptor.rs`
+- gRPC: auth interceptor (legacy sync, MhAuthLayer/MhAuthService async JWKS) → `crates/mh-service/src/grpc/auth_interceptor.rs`
+- JWT validation (MhJwtValidator, meeting token validation) → `crates/mh-service/src/auth/mod.rs`
+- Session management (SessionManager, pending/active connections) → `crates/mh-service/src/session/mod.rs`
+- WebTransport server (TLS, capacity, accept loop) → `crates/mh-service/src/webtransport/server.rs`
+- WebTransport connection handler (JWT read, provisional accept) → `crates/mh-service/src/webtransport/connection.rs`
 - Health + readiness endpoints → `crates/mh-service/src/observability/health.rs`
 - Prometheus metric wrappers → `crates/mh-service/src/observability/metrics.rs`
 - MH metrics catalog → `docs/observability/metrics/mh-service.md`
@@ -38,6 +43,8 @@
 - MH → GC registration/heartbeat → `crates/mh-service/src/grpc/gc_client.rs`
 - MC → MH gRPC service → `crates/mh-service/src/grpc/mh_service.rs`
 - MH → AC token management → `crates/common/src/token_manager.rs`
+- MH → AC JWKS (meeting + service token validation) → `crates/common/src/jwt.rs:JwksClient`
+- Client → MH WebTransport (QUIC/TLS 1.3) → `crates/mh-service/src/webtransport/server.rs`
 - MH depends on common crate → `crates/common/src/lib.rs`
 - MH depends on proto-gen → `crates/proto-gen/src/lib.rs`
 - MH depends on media-protocol → `crates/media-protocol/src/lib.rs`
@@ -45,7 +52,9 @@
 ## Testing
 - GC integration tests (mock server) → `crates/mh-service/tests/gc_integration.rs`
 - Config unit tests → `crates/mh-service/src/config.rs`
-- Auth interceptor unit tests → `crates/mh-service/src/grpc/auth_interceptor.rs`
+- Auth interceptor tests (legacy + MhAuthService async JWKS) → `crates/mh-service/src/grpc/auth_interceptor.rs`
+- JWT validation tests (meeting tokens, JWKS unreachable) → `crates/mh-service/src/auth/mod.rs`
+- Session manager tests → `crates/mh-service/src/session/mod.rs`
 - Health endpoint tests → `crates/mh-service/src/observability/health.rs`
 - Metrics unit tests → `crates/mh-service/src/observability/metrics.rs`
 

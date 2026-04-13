@@ -13,7 +13,7 @@
 //! - `error_type`: ~6 values (bounded by `MhError` variants)
 //! - `operation`: ~5 values (bounded by code paths)
 
-use metrics::{counter, histogram};
+use metrics::{counter, gauge, histogram};
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 use std::time::Duration;
 
@@ -48,6 +48,14 @@ pub fn init_metrics_recorder() -> Result<PrometheusHandle, String> {
             &[0.010, 0.050, 0.100, 0.250, 0.500, 1.000, 2.500, 5.000],
         )
         .map_err(|e| format!("Failed to set token refresh buckets: {e}"))?
+        // WebTransport handshake latency buckets (R-26)
+        .set_buckets_for_metric(
+            Matcher::Prefix("mh_webtransport_handshake".to_string()),
+            &[
+                0.010, 0.025, 0.050, 0.100, 0.200, 0.500, 1.000, 2.000, 5.000,
+            ],
+        )
+        .map_err(|e| format!("Failed to set WebTransport handshake buckets: {e}"))?
         .install_recorder()
         .map_err(|e| format!("Failed to install Prometheus recorder: {e}"))
 }
@@ -137,6 +145,45 @@ pub fn record_error(operation: &str, error_type: &str, status_code: u16) {
     .increment(1);
 }
 
+/// Record a WebTransport connection event (R-26).
+///
+/// Metric: `mh_webtransport_connections_total`
+/// Labels: `status` (accepted | rejected | error)
+/// Cardinality: 3
+pub fn record_webtransport_connection(status: &str) {
+    counter!("mh_webtransport_connections_total", "status" => status.to_string()).increment(1);
+}
+
+/// Record WebTransport handshake duration (R-26).
+///
+/// Metric: `mh_webtransport_handshake_duration_seconds`
+/// Labels: none
+/// Buckets: [0.010, 0.025, 0.050, 0.100, 0.200, 0.500, 1.000, 2.000, 5.000]
+pub fn record_webtransport_handshake_duration(duration: Duration) {
+    histogram!("mh_webtransport_handshake_duration_seconds").record(duration.as_secs_f64());
+}
+
+/// Set the active WebTransport connections gauge (R-26).
+///
+/// Metric: `mh_active_connections`
+/// Labels: none
+pub fn set_active_connections(count: f64) {
+    gauge!("mh_active_connections").set(count);
+}
+
+/// Record a JWT validation attempt (R-27).
+///
+/// Metric: `mh_jwt_validations_total`
+/// Labels: `result` (success | failure), `token_type` (meeting | service)
+/// Cardinality: 4 (2 results x 2 token types)
+pub fn record_jwt_validation(result: &str, token_type: &str) {
+    counter!("mh_jwt_validations_total",
+        "result" => result.to_string(),
+        "token_type" => token_type.to_string()
+    )
+    .increment(1);
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -209,6 +256,35 @@ mod tests {
         record_error("gc_heartbeat", "grpc", 503);
         record_error("token_refresh", "http", 500);
         record_error("grpc_service", "internal", 500);
+    }
+
+    #[test]
+    fn test_record_webtransport_connection() {
+        record_webtransport_connection("accepted");
+        record_webtransport_connection("rejected");
+        record_webtransport_connection("error");
+    }
+
+    #[test]
+    fn test_record_webtransport_handshake_duration() {
+        record_webtransport_handshake_duration(Duration::from_millis(50));
+        record_webtransport_handshake_duration(Duration::from_millis(200));
+        record_webtransport_handshake_duration(Duration::from_secs(1));
+    }
+
+    #[test]
+    fn test_set_active_connections() {
+        set_active_connections(0.0);
+        set_active_connections(42.0);
+        set_active_connections(0.0);
+    }
+
+    #[test]
+    fn test_record_jwt_validation() {
+        record_jwt_validation("success", "meeting");
+        record_jwt_validation("failure", "meeting");
+        record_jwt_validation("success", "service");
+        record_jwt_validation("failure", "service");
     }
 
     #[test]

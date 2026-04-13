@@ -35,11 +35,13 @@
 - Test utils (mock Redis, mock GC) -> `crates/mc-test-utils/src/mock_redis.rs`, `mock_gc.rs`
 
 ## Code Locations: MH Service
-- Config tests (env vars, defaults, TLS, debug redaction, advertise addresses, StatefulSet ordinal parsing) -> `crates/mh-service/src/config.rs:tests`
-- Error tests (labels, status codes, client messages) -> `crates/mh-service/src/errors.rs:tests`
-- Auth interceptor tests (Bearer, size limits) -> `crates/mh-service/src/grpc/auth_interceptor.rs:tests`
-- RegisterMeeting stub (input validation) -> `crates/mh-service/src/grpc/mh_service.rs:register_meeting()`
-- Health state & router tests -> `crates/mh-service/src/observability/health.rs:tests`
+- Config tests (env vars, defaults, TLS, debug redaction, advertise addresses, JWKS URL, timeouts) -> `crates/mh-service/src/config.rs:tests`
+- Error tests (labels, status codes, client messages, JwtError conversion) -> `crates/mh-service/src/errors.rs:tests`
+- Auth tests (legacy structural + JWKS ServiceClaims + scope) -> `crates/mh-service/src/grpc/auth_interceptor.rs:tests`
+- JWT validation tests (MhJwtValidator, meeting tokens, wiremock JWKS) -> `crates/mh-service/src/auth/mod.rs:tests`
+- Session manager tests (registration, connections, pending promotion, notify) -> `crates/mh-service/src/session/mod.rs:tests`
+- WebTransport server + connection handler -> `crates/mh-service/src/webtransport/server.rs`, `connection.rs`
+- Health + metrics tests -> `crates/mh-service/src/observability/health.rs:tests`, `metrics.rs:tests`
 - GC integration tests (registration, load reports, NOT_FOUND) -> `crates/mh-service/tests/gc_integration.rs`
 
 ## Code Locations: Environment Tests
@@ -52,21 +54,19 @@
 - Prometheus client fixture → `crates/env-tests/src/fixtures/metrics.rs`
 - Join flow tests (AC→GC→MC e2e) → `crates/env-tests/tests/24_join_flow.rs`
 - Cluster health + kubectl security checks → `crates/env-tests/tests/00_cluster_health.rs`
-- Observability validation (Loki, Prometheus) → `crates/env-tests/tests/30_observability.rs`, `src/cluster.rs:is_loki_available()`
+- Loki availability (HTTP /ready, deferred from init) → `crates/env-tests/src/cluster.rs:is_loki_available()`
+- Observability validation (EXPECTED_SERVICES constant) → `crates/env-tests/tests/30_observability.rs`
 
 ## Code Locations: Cluster Setup & Helper (ADR-0030)
-- Setup/teardown scripts → `infra/kind/scripts/setup.sh`, `teardown.sh`
+- Setup script (arg parsing, TTY detection, cluster name validation) → `infra/kind/scripts/setup.sh`
 - Single-service rebuild+redeploy → `infra/kind/scripts/setup.sh:deploy_only_service()`
-- Kind config template → `infra/kind/kind-config.yaml.tmpl`
+- Image loading (podman/docker) → `infra/kind/scripts/setup.sh:load_image_to_kind()`
+- Env vars + ConfigMap patching (DT_CLUSTER_NAME, DT_PORT_MAP, advertise addresses) → `infra/kind/scripts/setup.sh`
+- Teardown with cluster name support → `infra/kind/scripts/teardown.sh`
+- Kind config template (listenAddress: HOST_GATEWAY_IP per ADR-0030) → `infra/kind/kind-config.yaml.tmpl`
 - Port map + gateway IP → `crates/devloop-helper/src/commands.rs:write_port_map_shell()`, `validate_gateway_ip()`
-- Task slug validation → `infra/devloop/devloop.sh`
-
-## Code Locations: Proto & Contracts
-- MH assignment (grpc_endpoint, reserved role field) -> `proto/internal.proto:MhAssignment`
-- MC->MH RegisterMeeting RPC -> `proto/internal.proto` (MediaHandlerService)
-- MH->MC coordination (connect/disconnect notifications) -> `proto/internal.proto:MediaCoordinationService`
-- Client media failure signaling -> `proto/signaling.proto:MediaConnectionFailed`
-- GC MH assignment (grpc_endpoint propagation) -> `crates/gc-service/src/services/mh_selection.rs:MhAssignmentInfo`, `mc_client.rs:assign_meeting()`
+- Port map file → `/tmp/devloop-{slug}/ports.json`
+- Task slug validation → `infra/devloop/devloop.sh` (line 66)
 
 ## Code Locations: Common & Infrastructure
 - JWT (claims, JwtError, JwksClient, JwtValidator, round-trip tests) -> `crates/common/src/jwt.rs`

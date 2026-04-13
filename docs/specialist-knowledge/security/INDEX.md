@@ -14,8 +14,8 @@
 - Security config + rate limits → `crates/ac-service/src/config.rs` | K8s: `infra/services/ac-service/`
 
 ## Code Locations — Common (JWT Infrastructure & Shared Token Types)
-- JWT claims (PII-redacted Debug), JWKS client, validator (EdDSA, size limit, kid, iat) → `crates/common/src/jwt.rs`
-- Size limit, kid extraction, iat validation → `jwt.rs:MAX_JWT_SIZE_BYTES` | Token manager → `token_manager.rs:new_secure()`
+- JWT claims (PII-redacted Debug), JWKS client, validator (EdDSA, size limit, kid, iat) → `crates/common/src/jwt.rs:MAX_JWT_SIZE_BYTES`
+- Token manager (secure constructor) → `crates/common/src/token_manager.rs:new_secure()`
 - Internal token types (GC→AC, `home_org_id` required) → `crates/common/src/meeting_token.rs`
 
 ## Code Locations — GC (Auth & Access Control)
@@ -30,11 +30,12 @@
 - WebTransport (connection handler, accept loop, TLS, join flow, JWT gate, capacity) → `crates/mc-service/src/webtransport/`
 - Session binding + join → `crates/mc-service/src/actors/session.rs`, `meeting.rs:handle_join()`
 
-## Code Locations — MH (Auth, OAuth, TLS)
-- gRPC auth interceptor (MC→MH, structural-only — JWKS upgrade planned) → `crates/mh-service/src/grpc/auth_interceptor.rs:MhAuthInterceptor`
-- RegisterMeeting field validation (meeting_id, mc_id, mc_grpc_endpoint) → `crates/mh-service/src/grpc/mh_service.rs:register_meeting()`
-- OAuth config (SecretString, Debug redaction) → `crates/mh-service/src/config.rs:Config`
-- TLS validation + Bearer auth + error sanitization → `config.rs`, `gc_client.rs`, `errors.rs`
+## Code Locations — MH (JWT, WebTransport, Auth, OAuth, TLS)
+- MH JWT validation + token_type anti-confusion → `crates/mh-service/src/auth/mod.rs:MhJwtValidator`
+- gRPC auth layer (JWKS-based ServiceClaims + scope check, async tower::Service) → `crates/mh-service/src/grpc/auth_interceptor.rs:MhAuthLayer`
+- WebTransport (connection handler, accept loop, TLS 1.3, JWT gate, capacity) → `crates/mh-service/src/webtransport/`
+- Session manager (meeting registration, provisional accept, 15s timeout) → `crates/mh-service/src/session/mod.rs:SessionManager`
+- Config (SecretString, Debug redaction, JWKS URL, timeout cap) + error sanitization → `config.rs`, `errors.rs:MhError`
 
 ## Code Locations — Observability (Security-Relevant)
 - MC/MH metrics (bounded labels, no PII) → `crates/mc-service/src/observability/metrics.rs` (+ mh) | ADR-0029
@@ -56,8 +57,8 @@
 - Status command (read-only, auth-gated) → `commands.rs:cmd_status()`, `parse_pod_health()`
 - Auth token (CSPRNG, constant-time compare, 0600) → `crates/devloop-helper/src/auth.rs`
 - Gateway IP validation → `commands.rs:validate_gateway_ip()` | Dev-cluster client → `infra/devloop/dev-cluster`
-- Socket auth, API allowlist, explicit prohibitions → ADR-0030 (Helper Process, Helper API, Explicit Prohibitions)
-- Kind NodePort listen address (`${HOST_GATEWAY_IP}`) → `infra/kind/kind-config.yaml.tmpl`; Wrapper → `infra/devloop/devloop.sh`
+- Socket auth + file permissions → ADR-0030 (Helper Process); API allowlist → ADR-0030 (Helper API)
+- Kind NodePort listen address (`${HOST_GATEWAY_IP}`) → `infra/kind/kind-config.yaml.tmpl` | Explicit prohibitions → ADR-0030
 
 ## Infrastructure Secrets & Network Isolation
 - Imperative secret creation → `setup.sh:create_ac_secrets()`, `create_mc_tls_secret()`, `create_mh_secrets()`, `create_mh_tls_secret()`
@@ -69,7 +70,6 @@
 
 ## Health, Probes & Integration Seams
 - MC/MH health + K8s probes → `src/observability/health.rs`, `infra/services/{mc,mh}-service/*-deployment.yaml`
-- Auth chain: AC JWKS → common JwtValidator → GC/MC; gRPC: GC→MC→MH + MH→MC auth interceptors
-- MC↔MH coordination protos (RegisterMeeting, MediaCoordinationService) → `proto/internal.proto`
+- Auth chain: AC JWKS → common JwtValidator → GC/MC/MH; gRPC: GC→MC→MH auth layers
 - Guards → `scripts/guards/simple/no-secrets-in-logs.sh`, `validate-kustomize.sh`
 - MC join + GC join tests → `crates/mc-service/tests/join_tests.rs`, `crates/gc-service/tests/meeting_tests.rs`
