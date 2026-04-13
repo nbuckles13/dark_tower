@@ -34,7 +34,7 @@ message EncryptionKeys {
 // Information about the media server
 message MediaServerInfo {
   string media_handler_url = 1;
-  string connection_token = 2;
+  reserved 2;  // was: connection_token (removed — client uses meeting JWT)
 }
 
 // Stream type enumeration
@@ -274,6 +274,13 @@ message ErrorMessage {
   map<string, string> details = 3;
 }
 
+// Client report of media connection failure
+message MediaConnectionFailed {
+  string media_handler_url = 1;
+  string error_reason = 2;
+  bool all_handlers_failed = 3;
+}
+
 // Client to server message wrapper
 message ClientMessage {
   oneof message {
@@ -288,6 +295,7 @@ message ClientMessage {
     HostMuteRequest host_mute_request = 8;
     UnmuteRequest unmute_request = 9;
     UnmuteResponse unmute_response = 10;
+    MediaConnectionFailed media_connection_failed = 11;
   }
 }
 

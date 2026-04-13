@@ -111,8 +111,8 @@ pub fn record_token_refresh(status: &str, error_type: Option<&str>, duration: Du
 /// Record an incoming gRPC request from MC.
 ///
 /// Metric: `mh_grpc_requests_total`
-/// Labels: `method` (`register` | `route_media` | `stream_telemetry`), `status` (success | error)
-/// Cardinality: 6 (3 methods x 2 statuses)
+/// Labels: `method` (`register` | `register_meeting` | `route_media` | `stream_telemetry`), `status` (success | error)
+/// Cardinality: 8 (4 methods x 2 statuses)
 pub fn record_grpc_request(method: &str, status: &str) {
     counter!(
         "mh_grpc_requests_total",
@@ -192,9 +192,11 @@ mod tests {
 
     #[test]
     fn test_record_grpc_request() {
-        // All 6 combinations: 3 methods x 2 statuses
+        // All 8 combinations: 4 methods x 2 statuses
         record_grpc_request("register", "success");
         record_grpc_request("register", "error");
+        record_grpc_request("register_meeting", "success");
+        record_grpc_request("register_meeting", "error");
         record_grpc_request("route_media", "success");
         record_grpc_request("route_media", "error");
         record_grpc_request("stream_telemetry", "success");
@@ -218,8 +220,13 @@ mod tests {
             record_gc_heartbeat(status);
         }
 
-        // Verify method labels are bounded to 3 values
-        let valid_methods = ["register", "route_media", "stream_telemetry"];
+        // Verify method labels are bounded to 4 values
+        let valid_methods = [
+            "register",
+            "register_meeting",
+            "route_media",
+            "stream_telemetry",
+        ];
         for method in &valid_methods {
             for status in &valid_statuses {
                 record_grpc_request(method, status);

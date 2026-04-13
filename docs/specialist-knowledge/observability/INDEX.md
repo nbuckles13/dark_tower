@@ -12,7 +12,12 @@
 - AC metrics -> `crates/ac-service/src/observability/metrics.rs:init_metrics_recorder()`, gauge init `services/key_management_service.rs:init_key_metrics()`, HTTP middleware `middleware/http_metrics.rs`, rate limit config `config.rs`
 - GC metrics -> `crates/gc-service/src/observability/metrics.rs`, HTTP middleware `middleware/http_metrics.rs:normalize_endpoint()`, join wiring `handlers/meetings.rs:join_meeting()`, DB metrics `repositories/`; gap: `get_guest_token()` uninstrumented
 - MC metrics -> `crates/mc-service/src/observability/metrics.rs`; recording sites: `webtransport/connection.rs:handle_connection()`, `server.rs:accept_loop()`; bounded labels `errors.rs:error_type_label()`
-- MH metrics (registration, heartbeat, token refresh, gRPC) -> `crates/mh-service/src/observability/metrics.rs`
+- MH metrics (registration, heartbeat, token refresh, gRPC incl. register_meeting) -> `crates/mh-service/src/observability/metrics.rs`
+
+## MC<->MH Coordination Proto
+- RegisterMeeting (MC->MH), MediaCoordinationService (MH->MC), DisconnectReason enum -> `proto/internal.proto`
+- MediaConnectionFailed (client->MC signaling) -> `proto/signaling.proto:MediaConnectionFailed`
+- RegisterMeeting stub (instrumented) -> `crates/mh-service/src/grpc/mh_service.rs:register_meeting()`
 
 ## Auth & JWT Tracing
 - Common JWT (JwksClient, JwtValidator, verify_token, PII-redacted Debug) -> `crates/common/src/jwt.rs`
@@ -52,8 +57,7 @@
 - Helper audit log (JSONL, all commands including status) -> `crates/devloop-helper/src/logging.rs:AuditLog`
 - Devloop.sh infrastructure health check (re-entry) -> `infra/devloop/devloop.sh` (ADR-0030 Step 6 section)
 - Eager setup background log -> `/tmp/devloop-{slug}/eager-setup.log`
-- Env-test observability URL config -> `crates/env-tests/src/cluster.rs:ClusterPorts::from_env()`
-- Env-tests observability validation -> `crates/env-tests/tests/30_observability.rs`
+- Env-tests (ClusterPorts, health checks, observability validation) -> `crates/env-tests/src/cluster.rs`, `tests/30_observability.rs`
 - Layer 8 env-test integration (validation pipeline) -> `.claude/skills/devloop/SKILL.md` (Layer 8 section)
 
 ## Guards
@@ -61,8 +65,7 @@
 - Dashboard-to-kustomize coverage (R-20, bidirectional) -> `scripts/guards/simple/validate-kustomize.sh`
 - Instrument skip_all enforcement -> `scripts/guards/simple/instrument-skip-all.sh`
 
-## Env-Test Observability & Cluster Config
-- ClusterPorts/health checks (from_env, parse_host_port) -> `crates/env-tests/src/cluster.rs`; feature-gated tests -> `tests/30_observability.rs`
+## Env-Test & K8s Config
 - MC/MH K8s health probes + metrics scrape -> `infra/services/{mc,mh}-service/deployment.yaml`
 
 ## Runbooks

@@ -117,8 +117,21 @@ message ComprehensiveHeartbeatRequest {
 // Media handler service (Meeting Controller -> Media Handler)
 service MediaHandlerService {
   rpc Register(RegisterParticipant) returns (RegisterParticipantResponse);
+  rpc RegisterMeeting(RegisterMeetingRequest) returns (RegisterMeetingResponse);
   rpc RouteMedia(RouteMediaCommand) returns (RouteMediaResponse);
   rpc StreamTelemetry(stream MediaTelemetry) returns (TelemetryAck);
+}
+
+// Request to register a meeting with a media handler (MC→MH)
+message RegisterMeetingRequest {
+  string meeting_id = 1;
+  string mc_id = 2;
+  string mc_grpc_endpoint = 3;
+}
+
+// Response to meeting registration
+message RegisterMeetingResponse {
+  bool accepted = 1;
 }
 
 message RouteMediaResponse {
@@ -172,13 +185,6 @@ message HeartbeatResponse {
 // ADR-0010 Section 4a: GC→MC Meeting Assignment with MH Assignments
 // ============================================================================
 
-// Role of a media handler in a meeting
-enum MhRole {
-  MH_ROLE_UNSPECIFIED = 0;
-  MH_ROLE_PRIMARY = 1;
-  MH_ROLE_BACKUP = 2;
-}
-
 // Reason for MC rejecting a meeting assignment
 enum RejectionReason {
   REJECTION_REASON_UNSPECIFIED = 0;
@@ -191,7 +197,8 @@ enum RejectionReason {
 message MhAssignment {
   string mh_id = 1;                   // Media handler ID
   string webtransport_endpoint = 2;    // WebTransport endpoint for clients
-  MhRole role = 3;                     // Primary or backup role
+  reserved 3;                          // was: MhRole role (removed — active/active)
+  string grpc_endpoint = 4;           // MC→MH gRPC endpoint
 }
 
 // Request from GC to MC to assign a meeting with MH assignments
@@ -241,4 +248,47 @@ message MHLoadReportRequest {
 message MHLoadReportResponse {
   bool acknowledged = 1;
   uint64 timestamp = 2;
+}
+
+// ============================================================================
+// Media Coordination Service (MH → MC)
+// ============================================================================
+
+// DisconnectReason for media participant disconnection (bounded enum for metrics cardinality)
+enum DisconnectReason {
+  DISCONNECT_REASON_UNSPECIFIED = 0;
+  DISCONNECT_REASON_CLIENT_CLOSED = 1;
+  DISCONNECT_REASON_TIMEOUT = 2;
+  DISCONNECT_REASON_ERROR = 3;
+}
+
+// MH→MC coordination service for participant media connection lifecycle
+service MediaCoordinationService {
+  rpc NotifyParticipantConnected(ParticipantMediaConnected) returns (ParticipantMediaConnectedResponse);
+  rpc NotifyParticipantDisconnected(ParticipantMediaDisconnected) returns (ParticipantMediaDisconnectedResponse);
+}
+
+// Notification that a participant has connected to a media handler
+message ParticipantMediaConnected {
+  string meeting_id = 1;
+  string participant_id = 2;
+  string handler_id = 3;
+}
+
+// Response to participant connected notification
+message ParticipantMediaConnectedResponse {
+  bool acknowledged = 1;
+}
+
+// Notification that a participant has disconnected from a media handler
+message ParticipantMediaDisconnected {
+  string meeting_id = 1;
+  string participant_id = 2;
+  string handler_id = 3;
+  DisconnectReason reason = 4;
+}
+
+// Response to participant disconnected notification
+message ParticipantMediaDisconnectedResponse {
+  bool acknowledged = 1;
 }

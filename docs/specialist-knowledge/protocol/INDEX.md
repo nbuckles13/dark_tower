@@ -23,6 +23,18 @@
 - Codec decode fuzzer → `crates/media-protocol/fuzz/fuzz_targets/codec_decode.rs`
 - Codec roundtrip fuzzer → `crates/media-protocol/fuzz/fuzz_targets/codec_roundtrip.rs`
 
+## gRPC Services (internal.proto)
+- MediaHandlerService (MC→MH) → `proto/internal.proto` (Register, RegisterMeeting, RouteMedia, StreamTelemetry)
+- MediaCoordinationService (MH→MC) → `proto/internal.proto` (NotifyParticipantConnected, NotifyParticipantDisconnected)
+- MeetingControllerService (GC→MC) → `proto/internal.proto` (AssignMeetingWithMh)
+- GlobalControllerService (MC→GC) → `proto/internal.proto` (RegisterMC, FastHeartbeat, ComprehensiveHeartbeat)
+- MediaHandlerRegistryService (MH→GC) → `proto/internal.proto` (RegisterMH, SendLoadReport)
+- MH stub impl of MediaHandlerService → `crates/mh-service/src/grpc/mh_service.rs`
+- MC impl of MeetingControllerService → `crates/mc-service/src/grpc/mc_service.rs`
+- GC MC client (AssignMeetingWithMh) → `crates/gc-service/src/services/mc_client.rs`
+- GC MH selection (MhAssignmentInfo) → `crates/gc-service/src/services/mh_selection.rs`
+
 ## Integration Seams
 - Proto-gen consumed by services → `crates/proto-gen/src/lib.rs` (re-exports prost::Message, tonic)
 - Media protocol consumed by MH service → `crates/media-protocol/Cargo.toml`
+- MH gRPC metrics (method cardinality) → `crates/mh-service/src/observability/metrics.rs:record_grpc_request()`

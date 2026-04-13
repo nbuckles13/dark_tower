@@ -16,9 +16,7 @@ use crate::services::mh_selection::MhAssignmentInfo;
 use common::secret::ExposeSecret;
 use common::token_manager::TokenReceiver;
 use proto_gen::internal::meeting_controller_service_client::MeetingControllerServiceClient;
-use proto_gen::internal::{
-    AssignMeetingWithMhRequest, AssignMeetingWithMhResponse, MhAssignment, MhRole,
-};
+use proto_gen::internal::{AssignMeetingWithMhRequest, AssignMeetingWithMhResponse, MhAssignment};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -165,15 +163,10 @@ impl McClient {
         // Build the request
         let proto_assignments: Vec<MhAssignment> = mh_assignments
             .iter()
-            .enumerate()
-            .map(|(i, mh)| MhAssignment {
+            .map(|mh| MhAssignment {
                 mh_id: mh.mh_id.clone(),
                 webtransport_endpoint: mh.webtransport_endpoint.clone(),
-                role: if i == 0 {
-                    MhRole::Primary as i32
-                } else {
-                    MhRole::Backup as i32
-                },
+                grpc_endpoint: mh.grpc_endpoint.clone(),
             })
             .collect();
 
