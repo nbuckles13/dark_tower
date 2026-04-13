@@ -33,6 +33,8 @@ pub struct MhAssignmentInfo {
     pub mh_id: String,
     /// WebTransport endpoint for client connections.
     pub webtransport_endpoint: String,
+    /// gRPC endpoint for MC→MH communication.
+    pub grpc_endpoint: String,
 }
 
 /// Service for MH selection operations.
@@ -94,6 +96,7 @@ impl MhSelectionService {
         let primary_info = MhAssignmentInfo {
             mh_id: primary.handler_id.clone(),
             webtransport_endpoint: primary.webtransport_endpoint.clone(),
+            grpc_endpoint: primary.grpc_endpoint.clone(),
         };
 
         tracing::debug!(
@@ -123,6 +126,7 @@ impl MhSelectionService {
                     MhAssignmentInfo {
                         mh_id: backup.handler_id.clone(),
                         webtransport_endpoint: backup.webtransport_endpoint.clone(),
+                        grpc_endpoint: backup.grpc_endpoint.clone(),
                     }
                 })
             } else {
@@ -295,10 +299,12 @@ mod tests {
             primary: MhAssignmentInfo {
                 mh_id: "mh-primary".to_string(),
                 webtransport_endpoint: "https://primary:443".to_string(),
+                grpc_endpoint: "https://primary:50051".to_string(),
             },
             backup: Some(MhAssignmentInfo {
                 mh_id: "mh-backup".to_string(),
                 webtransport_endpoint: "https://backup:443".to_string(),
+                grpc_endpoint: "https://backup:50051".to_string(),
             }),
         };
 
@@ -312,9 +318,11 @@ mod tests {
         let info = MhAssignmentInfo {
             mh_id: "mh-test".to_string(),
             webtransport_endpoint: "https://test:443".to_string(),
+            grpc_endpoint: "https://test:50051".to_string(),
         };
 
         assert_eq!(info.mh_id, "mh-test");
         assert_eq!(info.webtransport_endpoint, "https://test:443");
+        assert_eq!(info.grpc_endpoint, "https://test:50051");
     }
 }

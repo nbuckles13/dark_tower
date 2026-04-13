@@ -38,6 +38,7 @@
 - Config tests (env vars, defaults, TLS, debug redaction, advertise addresses, StatefulSet ordinal parsing) -> `crates/mh-service/src/config.rs:tests`
 - Error tests (labels, status codes, client messages) -> `crates/mh-service/src/errors.rs:tests`
 - Auth interceptor tests (Bearer, size limits) -> `crates/mh-service/src/grpc/auth_interceptor.rs:tests`
+- RegisterMeeting stub (input validation) -> `crates/mh-service/src/grpc/mh_service.rs:register_meeting()`
 - Health state & router tests -> `crates/mh-service/src/observability/health.rs:tests`
 - GC integration tests (registration, load reports, NOT_FOUND) -> `crates/mh-service/tests/gc_integration.rs`
 
@@ -51,25 +52,24 @@
 - Prometheus client fixture → `crates/env-tests/src/fixtures/metrics.rs`
 - Join flow tests (AC→GC→MC e2e) → `crates/env-tests/tests/24_join_flow.rs`
 - Cluster health + kubectl security checks → `crates/env-tests/tests/00_cluster_health.rs`
-- Loki availability (HTTP /ready, deferred from init) → `crates/env-tests/src/cluster.rs:is_loki_available()`
-- Observability validation (EXPECTED_SERVICES constant) → `crates/env-tests/tests/30_observability.rs`
+- Observability validation (Loki, Prometheus) → `crates/env-tests/tests/30_observability.rs`, `src/cluster.rs:is_loki_available()`
 
 ## Code Locations: Cluster Setup & Helper (ADR-0030)
-- Setup script (arg parsing, TTY detection, cluster name validation) → `infra/kind/scripts/setup.sh`
+- Setup/teardown scripts → `infra/kind/scripts/setup.sh`, `teardown.sh`
 - Single-service rebuild+redeploy → `infra/kind/scripts/setup.sh:deploy_only_service()`
-- Image loading (podman/docker) → `infra/kind/scripts/setup.sh:load_image_to_kind()`
-- Env vars: DT_CLUSTER_NAME, DT_PORT_MAP, DT_HOST_GATEWAY_IP → `infra/kind/scripts/setup.sh` (lines 37, 48-75)
-- ConfigMap patching (MC/MH advertise addresses, devloop mode) → `infra/kind/scripts/setup.sh:deploy_mc_service()`, `deploy_mh_service()`
-- Teardown with cluster name support → `infra/kind/scripts/teardown.sh`
-- Kind config template (listenAddress: HOST_GATEWAY_IP per ADR-0030) → `infra/kind/kind-config.yaml.tmpl`
-- Port map shell file + test → `crates/devloop-helper/src/commands.rs:write_port_map_shell()`, `test_write_port_map_shell`
-- Gateway IP validation → `crates/devloop-helper/src/commands.rs:validate_gateway_ip()`
-- Port map file → `/tmp/devloop-{slug}/ports.json`
-- Task slug validation → `infra/devloop/devloop.sh` (line 66)
+- Kind config template → `infra/kind/kind-config.yaml.tmpl`
+- Port map + gateway IP → `crates/devloop-helper/src/commands.rs:write_port_map_shell()`, `validate_gateway_ip()`
+- Task slug validation → `infra/devloop/devloop.sh`
+
+## Code Locations: Proto & Contracts
+- MH assignment (grpc_endpoint, reserved role field) -> `proto/internal.proto:MhAssignment`
+- MC->MH RegisterMeeting RPC -> `proto/internal.proto` (MediaHandlerService)
+- MH->MC coordination (connect/disconnect notifications) -> `proto/internal.proto:MediaCoordinationService`
+- Client media failure signaling -> `proto/signaling.proto:MediaConnectionFailed`
+- GC MH assignment (grpc_endpoint propagation) -> `crates/gc-service/src/services/mh_selection.rs:MhAssignmentInfo`, `mc_client.rs:assign_meeting()`
 
 ## Code Locations: Common & Infrastructure
 - JWT (claims, JwtError, JwksClient, JwtValidator, round-trip tests) -> `crates/common/src/jwt.rs`
 - Shared meeting token types (GC<->AC contract, serde, defaults) -> `crates/common/src/meeting_token.rs:tests`
-- MC/MH per-pod Services, Kind port mappings → `infra/services/mc-service/`, `mh-service/`, `infra/kind/kind-config.yaml`
-- MC/MH per-instance ConfigMaps (advertise addresses) → `infra/services/{mc,mh}-service/{mc,mh}-{0,1}-configmap.yaml`
+- MC/MH per-pod Services, ConfigMaps, Kind port mappings → `infra/services/{mc,mh}-service/`, `infra/kind/kind-config.yaml`
 - Dev certs → `scripts/generate-dev-certs.sh`

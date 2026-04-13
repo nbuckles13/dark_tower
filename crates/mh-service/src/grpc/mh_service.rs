@@ -12,8 +12,8 @@
 use crate::observability::metrics;
 use proto_gen::internal::media_handler_service_server::MediaHandlerService;
 use proto_gen::internal::{
-    MediaTelemetry, RegisterParticipant, RegisterParticipantResponse, RouteMediaCommand,
-    RouteMediaResponse, TelemetryAck,
+    MediaTelemetry, RegisterMeetingRequest, RegisterMeetingResponse, RegisterParticipant,
+    RegisterParticipantResponse, RouteMediaCommand, RouteMediaResponse, TelemetryAck,
 };
 use tonic::{Request, Response, Status, Streaming};
 use tracing::instrument;
@@ -79,6 +79,41 @@ impl MediaHandlerService for MhMediaService {
             media_handler_url: "stub://localhost".to_string(),
         };
         Ok(Response::new(stub_response))
+    }
+
+    /// Register a meeting with the media handler (stub).
+    ///
+    /// Returns accepted without performing any real registration.
+    #[instrument(skip_all)]
+    async fn register_meeting(
+        &self,
+        request: Request<RegisterMeetingRequest>,
+    ) -> Result<Response<RegisterMeetingResponse>, Status> {
+        let req = request.into_inner();
+
+        if req.meeting_id.is_empty() {
+            metrics::record_grpc_request("register_meeting", "error");
+            return Err(Status::invalid_argument("meeting_id is required"));
+        }
+        if req.mc_id.is_empty() {
+            metrics::record_grpc_request("register_meeting", "error");
+            return Err(Status::invalid_argument("mc_id is required"));
+        }
+        if req.mc_grpc_endpoint.is_empty() {
+            metrics::record_grpc_request("register_meeting", "error");
+            return Err(Status::invalid_argument("mc_grpc_endpoint is required"));
+        }
+
+        tracing::info!(
+            target: "mh.grpc.service",
+            meeting_id = %req.meeting_id,
+            mc_id = %req.mc_id,
+            "Meeting registered (stub)"
+        );
+
+        metrics::record_grpc_request("register_meeting", "success");
+
+        Ok(Response::new(RegisterMeetingResponse { accepted: true }))
     }
 
     /// Route media between participants (stub).
