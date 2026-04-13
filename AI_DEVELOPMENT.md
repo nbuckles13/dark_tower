@@ -444,7 +444,7 @@ Host (WSL2)                              Containers (podman)
 - `--dangerously-skip-permissions` enables fully autonomous Claude Code execution — no approval prompts interrupting the devloop
 - Container isolation means Claude can only access the mounted clone, not SSH keys, GitHub credentials, or other projects
 - OAuth credentials are mounted read-only for Claude API access; no API keys needed
-- PR descriptions are written by Claude (which has the full task context) to a `.devloop-pr.json` file, then the host-side wrapper creates the actual PR using the host's GitHub credentials
+- PRs are created from the host side using commit history from the devloop
 
 **Workflow**:
 ```bash
@@ -456,8 +456,7 @@ claude> /devloop "implement rate limiting on GC endpoints"
 # ... autonomous implementation, review, commit ...
 claude> /exit
 
-# Back on host — wrapper offers to push and create PR
-# using .devloop-pr.json that Claude wrote
+# Back on host — commits are in the local clone, ready to cherry-pick or push
 ```
 
 **See**: [ADR-0025](docs/decisions/adr-0025-containerized-devloop.md) for the full design and security model.
