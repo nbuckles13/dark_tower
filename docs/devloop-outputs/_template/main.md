@@ -128,7 +128,6 @@ TBD
 | no-hardcoded-secrets | PASS/FAIL |
 | no-pii-in-logs | PASS/FAIL |
 | no-secrets-in-logs | PASS/FAIL |
-| no-test-removal | PASS/FAIL |
 | test-coverage | PASS/FAIL |
 
 {Details on any failures}

@@ -32,7 +32,7 @@ fi
 
 # Check devloop main.md files for unfilled sections
 DEVLOOP_ERRORS=""
-for f in $(git diff --cached --name-only | grep 'docs/devloop-outputs/.*/main\.md$'); do
+for f in $(git diff --cached --name-only | grep 'docs/devloop-outputs/.*/main\.md$' | grep -v '_template/'); do
     # Check for TBD placeholders (unfilled sections)
     tbds=$(git show ":$f" | grep -n '^TBD$' || true)
     if [ -n "$tbds" ]; then
