@@ -33,6 +33,11 @@
 
 - [ ] **MC/MH port constants duplicated across 6+ files with no single source of truth**: Host ports (4433, 4434, 4435, 4436), NodePorts (30433, 30434, 30435, 30436), and observability ports (9090/30090, 3000/30030, 3100/30080) are hardcoded independently in `infra/kind/kind-config.yaml`, `infra/services/{mc,mh}-service/service.yaml` (NodePort values), `infra/services/{mc,mh}-service/{mc,mh}-{0,1}-configmap.yaml` (advertise addresses), `infra/services/{mc,mh}-service/configmap.yaml` (bind addresses), `infra/docker/{mc,mh}-service/Dockerfile` (EXPOSE + bind defaults), `infra/kind/scripts/setup.sh` (print output), and `crates/env-tests/src/cluster.rs` (ClusterPorts::default). Changing a port in one file without updating all others causes silent breakage. Consider extracting port assignments to a shared config (e.g., `ports.env` sourced by setup.sh, referenced by Kustomize configMapGenerator). The new `kind-config.yaml.tmpl` (ADR-0030) correctly uses envsubst placeholders for its hostPorts, avoiding this issue for devloop clusters. Low priority — manual workflow only.
 
+## Env-Test Resilience & Runbook Validation
+
+- [ ] **Resilience tests** (`40_resilience.rs`): Pod restart recovery, network partition handling, DB connection loss. Should cover AC (StatefulSet rollout), GC (Deployment rolling), MC (graceful drain with GC coordination). NetworkPolicy canary tests already exist and are real.
+- [ ] **Runbook validation tests** (`90_runbook.rs`): Validate documented operational procedures actually work. Coverage needed: AC key rotation (Scenario 2 in `ac-service-incident-response.md`), MC graceful drain before scaling (`mc-deployment.md` §2), MC registration/heartbeat with GC (`mc-deployment.md` §7), GC token refresh from AC, scale-up with load distribution verification. DB backup/restore is CloudNativePG responsibility, not service-level.
+
 ## Env-Test Self-Sufficiency
 
 - [ ] **AC org provisioning endpoint**: Add an admin/internal API to AC for creating organizations. Env-tests should create their own test org via this endpoint instead of depending on pre-seeded data in `infra/docker/postgres/init.sql`.
