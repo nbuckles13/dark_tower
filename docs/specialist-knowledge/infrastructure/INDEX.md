@@ -19,7 +19,8 @@
 - GC Deployment -> `infra/services/gc-service/deployment.yaml`
 - MC per-instance Deployments -> `infra/services/mc-service/mc-{0,1}-deployment.yaml`
 - MH per-instance Deployments -> `infra/services/mh-service/mh-{0,1}-deployment.yaml`
-- MC/MH per-instance ConfigMaps -> `infra/services/{mc,mh}-service/{mc,mh}-{0,1}-configmap.yaml`
+- MC/MH ConfigMaps (shared + per-instance) -> `infra/services/{mc,mh}-service/configmap.yaml`, `{mc,mh}-{0,1}-configmap.yaml`
+- Network policies (per-service ingress/egress) -> `infra/services/{ac,gc,mc,mh}-service/network-policy.yaml`
 - MC/MH per-instance Services (NodePorts) -> `infra/services/{mc,mh}-service/service.yaml`
 - MC/MH TLS + MH secrets -> created imperatively by `setup.sh`
 - Redis manifests (Kustomize base) -> `infra/services/redis/kustomization.yaml`
@@ -39,7 +40,6 @@
 - Containerized devloop (health check, eager setup, attach) -> `infra/devloop/devloop.sh`
 - dev-cluster client CLI (status display, setup/status output) -> `infra/devloop/dev-cluster`
 - Devloop Layer 8 (env-tests in validation pipeline) -> `.claude/skills/devloop/SKILL.md`
-- Cluster sidecar design (superseded by ADR-0030) -> `docs/debates/2026-04-05-devloop-cluster-sidecar.md`
 - Docker Compose (local tests) -> `docker-compose.test.yml`
 - Dev TLS cert generation (CA + MC + MH certs) -> `scripts/generate-dev-certs.sh`
 - CI pipeline -> `.github/workflows/ci.yml`

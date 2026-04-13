@@ -14,7 +14,8 @@
 - Security config + rate limits → `crates/ac-service/src/config.rs` | K8s: `infra/services/ac-service/`
 
 ## Code Locations — Common (JWT Infrastructure & Shared Token Types)
-- JWT claims (PII-redacted Debug), JWKS client, validator (EdDSA, size limit, kid, iat) → `crates/common/src/jwt.rs:MAX_JWT_SIZE_BYTES`
+- JWT claims (PII-redacted Debug), JWKS client, validator (EdDSA, size limit, kid, iat) → `crates/common/src/jwt.rs`
+- Size limit, kid extraction, iat validation → `jwt.rs:MAX_JWT_SIZE_BYTES`
 - Token manager (secure constructor) → `crates/common/src/token_manager.rs:new_secure()`
 - Internal token types (GC→AC, `home_org_id` required) → `crates/common/src/meeting_token.rs`
 
@@ -30,12 +31,11 @@
 - WebTransport (connection handler, accept loop, TLS, join flow, JWT gate, capacity) → `crates/mc-service/src/webtransport/`
 - Session binding + join → `crates/mc-service/src/actors/session.rs`, `meeting.rs:handle_join()`
 
-## Code Locations — MH (JWT, WebTransport, Auth, OAuth, TLS)
-- MH JWT validation + token_type anti-confusion → `crates/mh-service/src/auth/mod.rs:MhJwtValidator`
-- gRPC auth layer (JWKS-based ServiceClaims + scope check, async tower::Service) → `crates/mh-service/src/grpc/auth_interceptor.rs:MhAuthLayer`
-- WebTransport (connection handler, accept loop, TLS 1.3, JWT gate, capacity) → `crates/mh-service/src/webtransport/`
-- Session manager (meeting registration, provisional accept, 15s timeout) → `crates/mh-service/src/session/mod.rs:SessionManager`
-- Config (SecretString, Debug redaction, JWKS URL, timeout cap) + error sanitization → `config.rs`, `errors.rs:MhError`
+## Code Locations — MH (Auth, OAuth, TLS)
+- gRPC auth interceptor (MC→MH) → `crates/mh-service/src/grpc/auth_interceptor.rs:MhAuthInterceptor`
+- OAuth config (SecretString, Debug redaction) → `crates/mh-service/src/config.rs:Config`
+- JWKS config (AC_JWKS_URL for meeting JWT validation) → `infra/services/mh-service/configmap.yaml`
+- TLS validation + Bearer auth + error sanitization → `config.rs`, `gc_client.rs`, `errors.rs`
 
 ## Code Locations — Observability (Security-Relevant)
 - MC/MH metrics (bounded labels, no PII) → `crates/mc-service/src/observability/metrics.rs` (+ mh) | ADR-0029
@@ -58,18 +58,18 @@
 - Auth token (CSPRNG, constant-time compare, 0600) → `crates/devloop-helper/src/auth.rs`
 - Gateway IP validation → `commands.rs:validate_gateway_ip()` | Dev-cluster client → `infra/devloop/dev-cluster`
 - Socket auth + file permissions → ADR-0030 (Helper Process); API allowlist → ADR-0030 (Helper API)
-- Kind NodePort listen address (`${HOST_GATEWAY_IP}`) → `infra/kind/kind-config.yaml.tmpl` | Explicit prohibitions → ADR-0030
+- Kind NodePort listen address (`${HOST_GATEWAY_IP}`) → `infra/kind/kind-config.yaml.tmpl`; Wrapper → `infra/devloop/devloop.sh`
+- Explicit prohibitions (`--network=host`, podman socket mount, `0.0.0.0` binding) → ADR-0030 (Explicit Prohibitions)
 
 ## Infrastructure Secrets & Network Isolation
 - Imperative secret creation → `setup.sh:create_ac_secrets()`, `create_mc_tls_secret()`, `create_mh_secrets()`, `create_mh_tls_secret()`
 - Input validation (cluster name, DT_PORT_MAP, DT_HOST_GATEWAY_IP) → `infra/kind/scripts/setup.sh` (top), `teardown.sh` (top)
 - ConfigMap advertise-address patching (devloop mode) → `infra/kind/scripts/setup.sh:deploy_mc_service()`, `deploy_mh_service()`
 - Single-service rebuild with allowlist → `infra/kind/scripts/setup.sh:deploy_only_service()`
-- Network policies (per-service ingress/egress) → `infra/services/{ac,gc,mc,mh}-service/network-policy.yaml`
+- Network policies (per-service ingress/egress) → `infra/services/{ac,gc,mc,mh}-service/network-policy.yaml`; MC↔MH gRPC: MC→MH:50053, MH→MC:50052
 - Kind overlay (no secrets) + supporting infra → `infra/kubernetes/overlays/kind/`, `infra/services/{postgres,redis}/`
 
 ## Health, Probes & Integration Seams
 - MC/MH health + K8s probes → `src/observability/health.rs`, `infra/services/{mc,mh}-service/*-deployment.yaml`
-- Auth chain: AC JWKS → common JwtValidator → GC/MC/MH; gRPC: GC→MC→MH auth layers
-- Guards → `scripts/guards/simple/no-secrets-in-logs.sh`, `validate-kustomize.sh`
-- MC join + GC join tests → `crates/mc-service/tests/join_tests.rs`, `crates/gc-service/tests/meeting_tests.rs`
+- Auth chain: AC JWKS → common JwtValidator → GC/MC/MH; gRPC: GC→MC→MH auth interceptors
+- Guards → `scripts/guards/simple/no-secrets-in-logs.sh`, `validate-kustomize.sh` | Join tests → `crates/{mc,gc}-service/tests/`

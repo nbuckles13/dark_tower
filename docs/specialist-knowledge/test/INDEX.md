@@ -47,12 +47,12 @@
 ## Code Locations: Environment Tests
 - Cluster bootstrap + fixtures → `crates/env-tests/src/`, flows (20-24) → `crates/env-tests/tests/`
 - Cluster connection + port config → `crates/env-tests/src/cluster.rs:ClusterPorts`, `ClusterConnection`
-- URL env var entry point (ADR-0030) → `crates/env-tests/src/cluster.rs:ClusterPorts::from_env()`
-- URL parsing + validation → `crates/env-tests/src/cluster.rs:parse_host_port()`
+- URL config + parsing (ADR-0030) → `crates/env-tests/src/cluster.rs:ClusterPorts::from_env()`, `parse_host_port()`
 - GC client fixture (join, guest token, mc_assignment) → `crates/env-tests/src/fixtures/gc_client.rs`
 - Auth client fixture → `crates/env-tests/src/fixtures/auth_client.rs`
 - Prometheus client fixture → `crates/env-tests/src/fixtures/metrics.rs`
 - Join flow tests (AC→GC→MC e2e) → `crates/env-tests/tests/24_join_flow.rs`
+- CanaryPod + NetworkPolicy manifests → `crates/env-tests/src/canary.rs`, `infra/services/{ac,gc,mc,mh}-service/network-policy.yaml`
 - Cluster health + kubectl security checks → `crates/env-tests/tests/00_cluster_health.rs`
 - Loki availability (HTTP /ready, deferred from init) → `crates/env-tests/src/cluster.rs:is_loki_available()`
 - Observability validation (EXPECTED_SERVICES constant) → `crates/env-tests/tests/30_observability.rs`
