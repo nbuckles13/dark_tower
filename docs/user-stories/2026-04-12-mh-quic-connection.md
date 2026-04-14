@@ -637,7 +637,7 @@ Phase 6 (after dashboards):
 | 2 | GC: propagate grpc_endpoint, remove role assignment | `docs/devloop-outputs/2026-04-14-gc-propagate-grpc-endpoint/` | `27ea1b3` | Completed |
 | 3 | MH: JWT validation + WebTransport server + connection handler + auth interceptor upgrade | `docs/devloop-outputs/2026-04-13-mh-quic-webtransport/main.md` | `e95e315` | Completed |
 | 4 | MC: Redis gRPC endpoints + media_servers + MhClient | | | Pending |
-| 5 | MH: RegisterMeeting handler + SessionManager | | | Pending |
+| 5 | MH: RegisterMeeting handler + SessionManager | `docs/devloop-outputs/2026-04-14-mh-register-meeting/` | `e6b02b1` | Completed |
 | 6 | MH: MC notification client | | | Pending |
 | 7 | MC: MediaCoordinationService + MhConnectionRegistry + MediaConnectionFailed handler | | | Pending |
 | 8 | MC: async RegisterMeeting trigger | | | Pending |

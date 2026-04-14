@@ -14,8 +14,7 @@
 - Security config + rate limits → `crates/ac-service/src/config.rs` | K8s: `infra/services/ac-service/`
 
 ## Code Locations — Common (JWT Infrastructure & Shared Token Types)
-- JWT claims (PII-redacted Debug), JWKS client, validator (EdDSA, size limit, kid, iat) → `crates/common/src/jwt.rs`
-- Size limit, kid extraction, iat validation → `jwt.rs:MAX_JWT_SIZE_BYTES`
+- JWT claims (PII-redacted Debug), JWKS client, validator (EdDSA, size limit, kid, iat) → `crates/common/src/jwt.rs:MAX_JWT_SIZE_BYTES`
 - Token manager (secure constructor) → `crates/common/src/token_manager.rs:new_secure()`
 - Internal token types (GC→AC, `home_org_id` required) → `crates/common/src/meeting_token.rs`
 
@@ -34,11 +33,12 @@
 - WebTransport (connection handler, accept loop, TLS, join flow, JWT gate, capacity) → `crates/mc-service/src/webtransport/`
 - Session binding + join → `crates/mc-service/src/actors/session.rs`, `meeting.rs:handle_join()`
 
-## Code Locations — MH (Auth, OAuth, TLS)
-- gRPC auth interceptor (MC→MH) → `crates/mh-service/src/grpc/auth_interceptor.rs:MhAuthInterceptor`
-- OAuth config (SecretString, Debug redaction) → `crates/mh-service/src/config.rs:Config`
-- JWKS config (AC_JWKS_URL for meeting JWT validation) → `infra/services/mh-service/configmap.yaml`
-- TLS validation + Bearer auth + error sanitization → `config.rs`, `gc_client.rs`, `errors.rs`
+## Code Locations — MH (Auth, OAuth, TLS, Input Validation)
+- gRPC auth (MC→MH, JWKS) → `auth_interceptor.rs:MhAuthLayer` | RegisterMeeting validation (length, scheme) → `mh_service.rs:register_meeting()`
+- Meeting JWT validation + token_type anti-confusion → `crates/mh-service/src/auth/mod.rs:MhJwtValidator`
+- Session actor (ADR-0001): `SessionManagerHandle`/`SessionManagerActor` (private, no locks, TOCTOU-free, deny-by-default on death) → `crates/mh-service/src/session/mod.rs`
+- WebTransport connection handler (JWT gate, provisional accept, Arc<Notify> promotion) → `crates/mh-service/src/webtransport/connection.rs`
+- OAuth config (SecretString, Debug redaction), error sanitization → `config.rs`, `gc_client.rs`, `errors.rs` | JWKS: `infra/services/mh-service/configmap.yaml`
 
 ## Code Locations — Observability (Security-Relevant)
 - MC/MH metrics (bounded labels, no PII) → `crates/mc-service/src/observability/metrics.rs` (+ mh) | ADR-0029

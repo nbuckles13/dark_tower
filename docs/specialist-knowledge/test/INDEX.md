@@ -40,7 +40,8 @@
 - Error tests (labels, status codes, client messages, JwtError conversion) -> `crates/mh-service/src/errors.rs:tests`
 - Auth tests (legacy structural + JWKS ServiceClaims + scope) -> `crates/mh-service/src/grpc/auth_interceptor.rs:tests`
 - JWT validation tests (MhJwtValidator, meeting tokens, wiremock JWKS) -> `crates/mh-service/src/auth/mod.rs:tests`
-- Session manager tests (registration, connections, pending promotion, notify) -> `crates/mh-service/src/session/mod.rs:tests`
+- gRPC handler tests (RegisterMeeting validation, SessionManagerHandle integration) -> `crates/mh-service/src/grpc/mh_service.rs:tests`
+- Session manager actor tests (handle API, registration, connections, pending promotion, notify via oneshot) -> `crates/mh-service/src/session/mod.rs:tests`
 - WebTransport server + connection handler -> `crates/mh-service/src/webtransport/server.rs`, `connection.rs`
 - Health + metrics tests -> `crates/mh-service/src/observability/health.rs:tests`, `metrics.rs:tests`
 - GC integration tests (registration, load reports, NOT_FOUND) -> `crates/mh-service/tests/gc_integration.rs`
@@ -71,5 +72,4 @@
 ## Code Locations: Common & Infrastructure
 - JWT (claims, JwtError, JwksClient, JwtValidator, round-trip tests) -> `crates/common/src/jwt.rs`
 - Shared meeting token types (GC<->AC contract, serde, defaults) -> `crates/common/src/meeting_token.rs:tests`
-- MC/MH per-pod Services, ConfigMaps, Kind port mappings → `infra/services/{mc,mh}-service/`, `infra/kind/kind-config.yaml`
-- Dev certs → `scripts/generate-dev-certs.sh`
+- MC/MH per-pod Services, ConfigMaps, Kind port mappings → `infra/services/{mc,mh}-service/`, `infra/kind/kind-config.yaml`; Dev certs → `scripts/generate-dev-certs.sh`

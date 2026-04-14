@@ -13,7 +13,7 @@
 use crate::auth::MhJwtValidator;
 use crate::errors::MhError;
 use crate::observability::metrics;
-use crate::session::{ConnectionEntry, PendingConnection, SessionManager};
+use crate::session::{ConnectionEntry, PendingConnection, SessionManagerHandle};
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -42,7 +42,7 @@ const MAX_MESSAGE_SIZE: usize = 64 * 1024;
 pub async fn handle_connection(
     incoming: IncomingSession,
     jwt_validator: Arc<MhJwtValidator>,
-    session_manager: Arc<SessionManager>,
+    session_manager: SessionManagerHandle,
     register_meeting_timeout: Duration,
     cancel_token: CancellationToken,
 ) -> Result<(), MhError> {

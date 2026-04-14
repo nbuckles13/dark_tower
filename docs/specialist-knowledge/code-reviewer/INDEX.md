@@ -48,15 +48,15 @@
 - K8s (probes on 8081, per-pod NodePort) → `infra/services/mc-service/statefulset.yaml`, `service.yaml`, `network-policy.yaml`
 
 ## Code Locations — MH Service
-- Config (env vars, SecretString, Debug redaction, advertise addresses, ordinal parsing) → `crates/mh-service/src/config.rs:Config`, `parse_statefulset_ordinal()`
+- Config (env vars, SecretString, Debug redaction, advertise addresses) → `crates/mh-service/src/config.rs:Config`
 - Error type (thiserror, bounded labels) → `crates/mh-service/src/errors.rs:MhError`
 - GC client (RegisterMH, SendLoadReport, re-registration) → `crates/mh-service/src/grpc/gc_client.rs:GcClient`
-- gRPC stub service (MC→MH: Register, RouteMedia, StreamTelemetry) → `crates/mh-service/src/grpc/mh_service.rs:MhMediaService`
+- gRPC service (MC→MH: register_meeting live, others stub) → `crates/mh-service/src/grpc/mh_service.rs:MhMediaService`
+- Session actor (ADR-0001 handle/task, meetings, connections, pending) → `crates/mh-service/src/session/mod.rs:SessionManagerHandle`
 - gRPC auth interceptor (structural validation) → `crates/mh-service/src/grpc/auth_interceptor.rs:MhAuthInterceptor`
 - Startup wiring (TokenManager, health, gRPC, GC task) → `crates/mh-service/src/main.rs`
 - Health probes (liveness/readiness, port 8083) → `crates/mh-service/src/observability/health.rs:health_router()`
-- Metrics (mh_ prefix, SLO-aligned buckets) → `crates/mh-service/src/observability/metrics.rs:init_metrics_recorder()`
-- Metrics catalog + dashboard → `docs/observability/metrics/mh-service.md`, `infra/grafana/dashboards/mh-overview.json`
+- Metrics + dashboard → `crates/mh-service/src/observability/metrics.rs`, `docs/observability/metrics/mh-service.md`, `infra/grafana/dashboards/mh-overview.json`
 - K8s StatefulSet (probes on 8083, TLS vol, UDP 4434, per-pod NodePort) → `infra/services/mh-service/statefulset.yaml`, `service.yaml`
 - Dockerfile (cargo-chef, protobuf-compiler, distroless) → `infra/docker/mh-service/Dockerfile`
 - NetworkPolicy (MC gRPC ingress, client UDP, GC/MC/AC egress) → `infra/services/mh-service/network-policy.yaml`

@@ -9,13 +9,14 @@
 - Internal token request types (GC->AC contract) -> `crates/common/src/meeting_token.rs`
 - GC thin wrapper -> `crates/gc-service/src/auth/jwt.rs` (ServiceClaims, UserClaims)
 - MC thin wrapper -> `crates/mc-service/src/auth/mod.rs` (MeetingTokenClaims, GuestTokenClaims)
-- MH JWKS config -> `infra/services/mh-service/configmap.yaml:AC_JWKS_URL` (shared configmap, mirrors MC pattern in `mc-service-config`)
+- MH thin wrapper (meeting tokens) -> `crates/mh-service/src/auth/mod.rs:MhJwtValidator`
+- MH JWKS config -> `infra/services/mh-service/configmap.yaml:AC_JWKS_URL`
 
 ## Per-Service Observability (Metrics & Dashboards)
 - AC/GC/MC/MH metrics -> `crates/*/src/observability/metrics.rs` (per-service, not duplication)
 - MC/GC join alert rules -> `infra/docker/prometheus/rules/{mc,gc}-alerts.yaml`
 - Dashboard metric presentation -> ADR-0029
-- Grafana dashboards + configMapGenerator -> `infra/grafana/dashboards/`, `infra/kubernetes/observability/grafana/`
+- Grafana dashboards -> `infra/grafana/dashboards/`, `infra/kubernetes/observability/grafana/`
 
 ## Integration Test Coverage
 - MC join flow (11 tests) -> `crates/mc-service/tests/join_tests.rs`
@@ -27,20 +28,19 @@
 - AC/GC/MC/MH config -> `crates/*/src/config.rs:Config::from_vars()` (per-service, not duplication)
 - Env-test cluster config -> `crates/env-tests/src/cluster.rs:ClusterPorts::from_env()`, `parse_host_port()` (different domain from service config, not duplication)
 - Advertise addresses (MC + MH) -> gRPC uses POD_IP downward API; WebTransport uses per-instance ConfigMap (`mc-{0,1}-config`, `mh-{0,1}-config`); devloop patches via `setup.sh` DT_HOST_GATEWAY_IP guard
-- StatefulSet ordinal parsing -> `crates/common/src/config.rs:parse_statefulset_ordinal()` (shared, 5 tests)
-- Extraction candidate: `generate_instance_id(prefix)` -> 4-line pattern duplicated in GC + MC + MH config
+- StatefulSet ordinal parsing -> `crates/common/src/config.rs:parse_statefulset_ordinal()` (shared, 5 tests); extraction candidate: `generate_instance_id(prefix)` 4-line pattern in GC+MC+MH
 
 ## gRPC Auth Interceptors (Cross-Service)
 - MC auth interceptor -> `crates/mc-service/src/grpc/auth_interceptor.rs:McAuthInterceptor`
-- MH auth interceptor -> `crates/mh-service/src/grpc/auth_interceptor.rs:MhAuthInterceptor` (duplicates MC)
+- MH auth layer (async JWKS) + legacy interceptor -> `crates/mh-service/src/grpc/auth_interceptor.rs:MhAuthLayer`/`MhAuthInterceptor`
 - Shared constant -> `common::jwt::MAX_JWT_SIZE_BYTES`
 
 ## GC Clients (MC + MH -> GC Registration)
 - MC GcClient -> `crates/mc-service/src/grpc/gc_client.rs:GcClient` (bounded retries, fast/comprehensive heartbeats)
 - MH GcClient -> `crates/mh-service/src/grpc/gc_client.rs:GcClient` (unbounded retries, load reports)
-- Shared patterns: channel creation, `add_auth`, backoff constants (acceptable duplication, <2 call sites)
 - Extraction candidate: `add_auth` (~10 lines identical) -> extract to `common` if third service needs it
-- MH gRPC stub service -> `crates/mh-service/src/grpc/mh_service.rs:MhMediaService`
+- MH gRPC service -> `crates/mh-service/src/grpc/mh_service.rs:MhMediaService` (register_meeting + SessionManagerHandle)
+- MH session manager (actor, ADR-0001) -> `crates/mh-service/src/session/mod.rs:SessionManagerHandle`/`SessionManagerActor`/`SessionMessage`
 
 ## Health Endpoints (Cross-Service Consistency)
 - MC health routes -> `crates/mc-service/src/observability/health.rs:health_router()`
@@ -63,9 +63,9 @@
 ## False Positive Boundaries
 - Per-service error mapping (GcError vs McError vs MhError) -> required, not duplication
 - MC GcClient vs MH GcClient -> different RPCs, retry strategies, heartbeat models (reviewed 2026-04-01)
+- MC actor hierarchy (controller/meeting/participant, metrics, supervision) vs MH session actor (simple state owner, no metrics/supervision) -> different complexity levels, shared pattern not duplication (reviewed 2026-04-14)
 - AC rate limiting (DB-backed lockout) vs GC rate limiting (middleware RPM) -> different mechanisms
-- common::jwt::{ParticipantType,MeetingRole} (2 variants) vs common::meeting_token (3 variants) -> JWT enums intentionally narrower (no Guest; guests use separate GuestTokenClaims)
-- env-tests GuestTokenRequest vs common::meeting_token::GuestTokenRequest -> different types (public API vs internal)
+- common::jwt enums (2 variants) vs common::meeting_token (3 variants) -> intentionally narrower; env-tests GuestTokenRequest is public API type
 
 ## Tech Debt Registry
 - Active duplication tech debt -> `docs/TODO.md` (Cross-Service Duplication section)

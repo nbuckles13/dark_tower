@@ -49,7 +49,8 @@
 - Participant tracking + meetings → `crates/gc-service/src/repositories/participants.rs`, `meetings.rs`
 
 ## Auth & JWT
-- Common JWKS + JWT → `crates/common/src/jwt.rs`; GC↔AC token types → `crates/common/src/meeting_token.rs`
+- Common JWKS + JWT → `crates/common/src/jwt.rs`
+- Shared GC↔AC token types → `crates/common/src/meeting_token.rs`
 - AC rate limits → `crates/ac-service/src/config.rs:parse_rate_limit_i64()`; Service auth → ADR-0003
 
 ## Observability
@@ -60,7 +61,8 @@
 - MH startup + config + health → `crates/mh-service/src/main.rs`, `crates/mh-service/src/config.rs`, `crates/mh-service/src/observability/health.rs`
 - MH GC client → `crates/mh-service/src/grpc/gc_client.rs`
 - MH gRPC + JWKS auth layer → `crates/mh-service/src/grpc/mh_service.rs`, `auth_interceptor.rs`; JWT validation → `crates/mh-service/src/auth/mod.rs`
-- MH WebTransport + session mgmt → `crates/mh-service/src/webtransport/server.rs`, `connection.rs`, `crates/mh-service/src/session/mod.rs`
+- MH SessionManager actor (ADR-0001) → `crates/mh-service/src/session/mod.rs`; `SessionManagerHandle` (mpsc+oneshot, buffer=256) replaces `Arc<SessionManager>`; shutdown: gRPC+WebTransport tasks drop handles → channel closes → actor exits
+- MH WebTransport → `crates/mh-service/src/webtransport/server.rs`, `connection.rs`
 
 ## MC WebTransport + Actors
 - MC WebTransport → `crates/mc-service/src/webtransport/server.rs`, `crates/mc-service/src/webtransport/connection.rs`
@@ -69,8 +71,5 @@
 
 ## GC Service
 - GC routes + handlers → `crates/gc-service/src/routes/mod.rs`, `crates/gc-service/src/handlers/meetings.rs`
-- MH selection + MC assignment → `crates/gc-service/src/services/mh_selection.rs`, `mc_assignment.rs`, `mc_client.rs`
-
-## Tests
-- MC join tests → `crates/mc-service/tests/join_tests.rs`; TestKeypair (Ed25519 + JWKS mock) → `crates/mc-test-utils/src/jwt_test.rs`
+- GC join tests → `crates/gc-service/tests/meeting_tests.rs`; MC join tests → `crates/mc-service/tests/join_tests.rs`; TestKeypair → `crates/mc-test-utils/src/jwt_test.rs`
 - GC join tests → `crates/gc-service/tests/meeting_tests.rs`; Env-tests (Kind) → `crates/env-tests/`
