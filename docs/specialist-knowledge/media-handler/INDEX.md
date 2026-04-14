@@ -2,6 +2,7 @@
 
 ## Architecture & Design
 - SFU architecture, MH registration/load reports → ADR-0010 (Section 4a)
+- Actor pattern for concurrency (handle/task, message passing, no locks) → ADR-0001
 - MH assignment, selection algorithm, cross-region coordination → ADR-0023 (Section 5)
 - Service authentication (MH→GC OAuth, MC→MH Bearer) → ADR-0003
 - Observability pattern (metrics crate facade) → ADR-0011
@@ -15,10 +16,10 @@
 - Config (SecretString, env loading, TLS paths, advertise addresses) → `crates/mh-service/src/config.rs`
 - Error types (MhError hierarchy) → `crates/mh-service/src/errors.rs`
 - gRPC: GC client (registration, heartbeats, re-registration) → `crates/mh-service/src/grpc/gc_client.rs`
-- gRPC: MH service stub (Register, RouteMedia, StreamTelemetry) → `crates/mh-service/src/grpc/mh_service.rs`
+- gRPC: MH service (RegisterMeeting via SessionManagerHandle, other RPCs stub) → `crates/mh-service/src/grpc/mh_service.rs`
 - gRPC: auth interceptor (legacy sync, MhAuthLayer/MhAuthService async JWKS) → `crates/mh-service/src/grpc/auth_interceptor.rs`
 - JWT validation (MhJwtValidator, meeting token validation) → `crates/mh-service/src/auth/mod.rs`
-- Session management (SessionManager, pending/active connections) → `crates/mh-service/src/session/mod.rs`
+- Session management (SessionManagerActor/SessionManagerHandle, actor pattern ADR-0001) → `crates/mh-service/src/session/mod.rs`
 - WebTransport server (TLS, capacity, accept loop) → `crates/mh-service/src/webtransport/server.rs`
 - WebTransport connection handler (JWT read, provisional accept) → `crates/mh-service/src/webtransport/connection.rs`
 - Health + readiness endpoints → `crates/mh-service/src/observability/health.rs`
@@ -55,6 +56,7 @@
 - Auth interceptor tests (legacy + MhAuthService async JWKS) → `crates/mh-service/src/grpc/auth_interceptor.rs`
 - JWT validation tests (meeting tokens, JWKS unreachable) → `crates/mh-service/src/auth/mod.rs`
 - Session manager tests → `crates/mh-service/src/session/mod.rs`
+- RegisterMeeting handler tests → `crates/mh-service/src/grpc/mh_service.rs`
 - Health endpoint tests → `crates/mh-service/src/observability/health.rs`
 - Metrics unit tests → `crates/mh-service/src/observability/metrics.rs`
 

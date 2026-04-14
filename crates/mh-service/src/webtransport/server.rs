@@ -11,7 +11,7 @@
 
 use crate::auth::MhJwtValidator;
 use crate::observability::metrics;
-use crate::session::SessionManager;
+use crate::session::SessionManagerHandle;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -33,8 +33,8 @@ pub struct WebTransportServer {
     tls_key_path: String,
     /// JWT validator for meeting tokens.
     jwt_validator: Arc<MhJwtValidator>,
-    /// Session manager for meeting registration and connection tracking.
-    session_manager: Arc<SessionManager>,
+    /// Session manager handle for meeting registration and connection tracking.
+    session_manager: SessionManagerHandle,
     /// `RegisterMeeting` timeout duration.
     register_meeting_timeout: Duration,
     /// Maximum concurrent connections (bounds resource exhaustion).
@@ -57,7 +57,7 @@ impl WebTransportServer {
         tls_cert_path: String,
         tls_key_path: String,
         jwt_validator: Arc<MhJwtValidator>,
-        session_manager: Arc<SessionManager>,
+        session_manager: SessionManagerHandle,
         register_meeting_timeout: Duration,
         max_connections: usize,
         cancel_token: CancellationToken,
@@ -170,7 +170,7 @@ impl WebTransportServer {
                     metrics::record_webtransport_connection("accepted");
                     let active_connections = Arc::clone(&self.active_connections);
                     let jwt_validator = Arc::clone(&self.jwt_validator);
-                    let session_manager = Arc::clone(&self.session_manager);
+                    let session_manager = self.session_manager.clone();
                     let register_meeting_timeout = self.register_meeting_timeout;
                     let connection_token = self.cancel_token.child_token();
 

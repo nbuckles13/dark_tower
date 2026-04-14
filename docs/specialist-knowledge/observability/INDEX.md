@@ -12,7 +12,7 @@
 - AC metrics -> `crates/ac-service/src/observability/metrics.rs:init_metrics_recorder()`, gauge init `services/key_management_service.rs:init_key_metrics()`, HTTP middleware `middleware/http_metrics.rs`, rate limit config `config.rs`
 - GC metrics -> `crates/gc-service/src/observability/metrics.rs`, HTTP middleware `middleware/http_metrics.rs:normalize_endpoint()`, join wiring `handlers/meetings.rs:join_meeting()`, DB metrics `repositories/`; gap: `get_guest_token()` uninstrumented
 - MC metrics -> `crates/mc-service/src/observability/metrics.rs`; recording sites: `webtransport/connection.rs:handle_connection()`, `server.rs:accept_loop()`; bounded labels `errors.rs:error_type_label()`
-- MH metrics (registration, heartbeat, token refresh, gRPC, WebTransport, JWT) -> `crates/mh-service/src/observability/metrics.rs`; recording sites: `webtransport/server.rs:accept_loop()`, `webtransport/connection.rs:handle_connection()`, `grpc/auth_interceptor.rs:MhAuthService`
+- MH metrics (registration, heartbeat, token refresh, gRPC, WebTransport, JWT) -> `crates/mh-service/src/observability/metrics.rs`; recording sites: `webtransport/server.rs:accept_loop()`, `webtransport/connection.rs:handle_connection()`, `grpc/auth_interceptor.rs:MhAuthService`, `grpc/mh_service.rs:register_meeting()`
 
 ## Auth & JWT Tracing
 - Common JWT (JwksClient, JwtValidator, verify_token, PII-redacted Debug) -> `crates/common/src/jwt.rs`
@@ -23,8 +23,9 @@
 - Server/connection/handler (targets: `mc.webtransport`, `.connection`, `.handler`) -> `crates/mc-service/src/webtransport/server.rs`, `connection.rs`, `handler.rs`
 - ParticipantActor (target: `mc.actor.participant`) -> `crates/mc-service/src/actors/participant.rs:run()`
 
-## MH WebTransport Tracing
-- Server/connection (targets: `mh.webtransport`, `.connection`) -> `crates/mh-service/src/webtransport/server.rs`, `connection.rs`
+## MH Tracing
+- WebTransport server/connection (targets: `mh.webtransport`, `.connection`) -> `crates/mh-service/src/webtransport/server.rs`, `connection.rs`
+- SessionManagerActor (target: `mh.session`, debug lifecycle + warn channel-closed) -> `crates/mh-service/src/session/mod.rs`
 
 ## GC Client Tracing (MC + MH)
 - GcClient tracing (registration, heartbeat, re-registration) -> `crates/mc-service/src/grpc/gc_client.rs` (+ mh)
@@ -69,8 +70,7 @@
 - MC/MH K8s health probes + metrics scrape -> `infra/services/{mc,mh}-service/deployment.yaml`
 
 ## Runbooks
-- Per-service deployment + incident response -> `docs/runbooks/` (two per service)
-- GC scenarios 8-9 + join failure triage -> `docs/runbooks/gc-incident-response.md`, `docs/observability/alerts.md`
+- Per-service deployment + incident response -> `docs/runbooks/`; GC scenarios 8-9 + join triage -> `docs/runbooks/gc-incident-response.md`
 
 ## Test Coverage & Integration Seams
 - GC/MC/MH metrics tests -> `crates/gc-service/src/observability/metrics.rs`, `crates/mc-service/src/observability/metrics.rs`, `crates/mh-service/src/observability/metrics.rs`

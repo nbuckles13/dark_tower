@@ -34,7 +34,7 @@ use mh_service::config::Config;
 use mh_service::errors::MhError;
 use mh_service::grpc::{GcClient, MhAuthLayer, MhMediaService};
 use mh_service::observability::{health_router, HealthState};
-use mh_service::session::SessionManager;
+use mh_service::session::SessionManagerHandle;
 use mh_service::webtransport::WebTransportServer;
 use proto_gen::internal::media_handler_service_server::MediaHandlerServiceServer;
 use tokio::signal;
@@ -152,9 +152,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let jwt_validator = Arc::new(MhJwtValidator::new(Arc::clone(&jwks_client), 300));
     info!("JWKS client and JWT validator initialized");
 
-    // Create session manager for meeting registration and connection tracking
-    let session_manager = Arc::new(SessionManager::new());
-    info!("Session manager initialized");
+    // Create session manager actor for meeting registration and connection tracking
+    let session_manager = SessionManagerHandle::new();
+    info!("Session manager actor spawned");
 
     // Start health HTTP server (MUST succeed - fail startup if it doesn't)
     let health_addr: SocketAddr = config.health_bind_address.parse().map_err(|e| {
@@ -205,7 +205,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         format!("Invalid gRPC bind address: {e}")
     })?;
 
-    let mh_media_service = MhMediaService::new();
+    let mh_media_service = MhMediaService::new(session_manager.clone());
     let auth_layer = MhAuthLayer::new(Arc::clone(&jwks_client), 300);
 
     let grpc_shutdown_token = shutdown_token.child_token();
@@ -233,7 +233,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.tls_cert_path.clone(),
         config.tls_key_path.clone(),
         Arc::clone(&jwt_validator),
-        Arc::clone(&session_manager),
+        session_manager,
         Duration::from_secs(config.register_meeting_timeout_seconds),
         config.max_connections,
         shutdown_token.child_token(),
