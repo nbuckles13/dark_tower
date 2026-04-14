@@ -158,15 +158,14 @@ cleanup() {
     echo "Cleaned up."
 }
 
-# Build the devloop-helper binary on first use (ADR-0030).
-# Built from $REPO_ROOT (host source) with a separate --target-dir.
+# Build the devloop-helper binary (ADR-0030).
+# Always rebuilds — cargo no-ops if source unchanged (~0.1s), and stale
+# binaries cause hard-to-debug port-map issues.
 build_helper() {
-    if [ ! -f "$HELPER_BINARY" ] || $REBUILD_IMAGE; then
-        echo "Building devloop-helper..."
-        cargo build --release -p devloop-helper \
-            --target-dir "$HELPER_TARGET_DIR" \
-            --manifest-path "$REPO_ROOT/Cargo.toml"
-    fi
+    echo "Building devloop-helper..."
+    cargo build --release -p devloop-helper \
+        --target-dir "$HELPER_TARGET_DIR" \
+        --manifest-path "$REPO_ROOT/Cargo.toml"
 }
 
 # Detect the podman host-gateway IP address (ADR-0030).
