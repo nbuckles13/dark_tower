@@ -645,9 +645,9 @@ async fn register_healthy_mc_for_region(pool: &PgPool, region: &str) {
 /// Register healthy Media Handlers for testing.
 ///
 /// MH assignment is required for meeting join operations with the new flow.
-/// This helper creates two healthy MHs in the test-region (primary and backup).
+/// This helper creates two healthy MH peers in the test-region.
 async fn register_healthy_mhs_for_region(pool: &PgPool, region: &str) {
-    // Register primary MH
+    // Register first MH peer
     sqlx::query(
         r#"
         INSERT INTO media_handlers (
@@ -660,15 +660,15 @@ async fn register_healthy_mhs_for_region(pool: &PgPool, region: &str) {
             health_status = 'healthy'
         "#,
     )
-    .bind(format!("mh-primary-{}", region))
+    .bind(format!("mh-1-{}", region))
     .bind(region)
-    .bind(format!("https://mh-primary-{}.example.com:443", region))
-    .bind(format!("grpc://mh-primary-{}.example.com:50051", region))
+    .bind(format!("https://mh-1-{}.example.com:443", region))
+    .bind(format!("grpc://mh-1-{}.example.com:50051", region))
     .execute(pool)
     .await
-    .expect("Failed to register primary MH for testing");
+    .expect("Failed to register MH peer 1 for testing");
 
-    // Register backup MH
+    // Register second MH peer
     sqlx::query(
         r#"
         INSERT INTO media_handlers (
@@ -681,13 +681,13 @@ async fn register_healthy_mhs_for_region(pool: &PgPool, region: &str) {
             health_status = 'healthy'
         "#,
     )
-    .bind(format!("mh-backup-{}", region))
+    .bind(format!("mh-2-{}", region))
     .bind(region)
-    .bind(format!("https://mh-backup-{}.example.com:443", region))
-    .bind(format!("grpc://mh-backup-{}.example.com:50051", region))
+    .bind(format!("https://mh-2-{}.example.com:443", region))
+    .bind(format!("grpc://mh-2-{}.example.com:50051", region))
     .execute(pool)
     .await
-    .expect("Failed to register backup MH for testing");
+    .expect("Failed to register MH peer 2 for testing");
 }
 
 // ============================================================================

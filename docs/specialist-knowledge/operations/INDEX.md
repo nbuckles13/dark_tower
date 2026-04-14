@@ -49,8 +49,7 @@
 - Participant tracking + meetings → `crates/gc-service/src/repositories/participants.rs`, `meetings.rs`
 
 ## Auth & JWT
-- Common JWKS + JWT → `crates/common/src/jwt.rs`
-- Shared GC↔AC token types → `crates/common/src/meeting_token.rs`
+- Common JWKS + JWT → `crates/common/src/jwt.rs`; GC↔AC token types → `crates/common/src/meeting_token.rs`
 - AC rate limits → `crates/ac-service/src/config.rs:parse_rate_limit_i64()`; Service auth → ADR-0003
 
 ## Observability
@@ -70,6 +69,7 @@
 
 ## GC Service
 - GC routes + handlers → `crates/gc-service/src/routes/mod.rs`, `crates/gc-service/src/handlers/meetings.rs`
+- MH selection + MC assignment → `crates/gc-service/src/services/mh_selection.rs`, `mc_assignment.rs`, `mc_client.rs`
 
 ## Tests
 - MC join tests → `crates/mc-service/tests/join_tests.rs`; TestKeypair (Ed25519 + JWKS mock) → `crates/mc-test-utils/src/jwt_test.rs`

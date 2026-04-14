@@ -127,7 +127,7 @@ impl McClient {
     ///
     /// * `mc_endpoint` - gRPC endpoint of the MC
     /// * `meeting_id` - Meeting being assigned
-    /// * `mh_assignments` - List of MH assignments (primary + backup)
+    /// * `mh_assignments` - List of MH assignments
     /// * `gc_id` - ID of this GC instance
     ///
     /// # Returns

@@ -24,7 +24,8 @@
 - MC gRPC service (register, heartbeat) -> `crates/gc-service/src/grpc/mc_service.rs:McService`
 - MH gRPC service (register, load report) -> `crates/gc-service/src/grpc/mh_service.rs:MhService`
 - MC assignment + load balancing -> `crates/gc-service/src/services/mc_assignment.rs:McAssignmentService`
-- MH selection (primary + backup AZ) -> `crates/gc-service/src/services/mh_selection.rs:MhSelectionService`
+- MH selection (active/active peers by load/AZ) -> `crates/gc-service/src/services/mh_selection.rs:MhSelectionService`
+- MH selection types (MhSelection, MhAssignmentInfo) -> `crates/gc-service/src/services/mh_selection.rs`
 - MC gRPC client (assign_meeting RPC) -> `crates/gc-service/src/services/mc_client.rs:McClientTrait`
 - AC HTTP client (meeting/guest tokens) -> `crates/gc-service/src/services/ac_client.rs:AcClient`
 - MC repository (register, heartbeat, staleness) -> `crates/gc-service/src/repositories/meeting_controllers.rs`
@@ -44,6 +45,7 @@
 - GC <-> MC (gRPC registration + heartbeat) -> `crates/gc-service/src/grpc/mc_service.rs`
 - GC <-> MC (gRPC assignment RPC) -> `crates/gc-service/src/services/mc_client.rs`
 - GC <-> MH (gRPC registration + load report) -> `crates/gc-service/src/grpc/mh_service.rs`
+- MhAssignmentInfo -> MhAssignment proto mapping -> `crates/gc-service/src/services/mc_client.rs:assign_meeting()`
 - GC <-> Client (HTTP API /api/v1/*) -> `crates/gc-service/src/routes/mod.rs`
 - UserClaims (user JWT claims type) -> `crates/common/src/jwt.rs:UserClaims`
 - env-tests GC client fixture -> `crates/env-tests/src/fixtures/gc_client.rs`
@@ -51,6 +53,8 @@
 ## Tests
 - Meeting creation tests -> `crates/gc-service/tests/meeting_create_tests.rs`
 - Meeting join/guest/settings tests -> `crates/gc-service/tests/meeting_tests.rs`
+- MC assignment + MH selection integration tests -> `crates/gc-service/tests/mc_assignment_rpc_tests.rs`
+- Meeting assignment service tests -> `crates/gc-service/tests/meeting_assignment_tests.rs`
 - Auth integration tests -> `crates/gc-service/tests/auth_tests.rs`
 - Test harness -> `crates/gc-test-utils/src/server_harness.rs`
 - Test token helpers -> `crates/gc-service/tests/meeting_tests.rs:TestUserClaims`

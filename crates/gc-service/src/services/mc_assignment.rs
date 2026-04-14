@@ -40,7 +40,7 @@ pub struct McAssignmentService;
 pub struct AssignmentWithMh {
     /// MC assignment info.
     pub mc_assignment: McAssignment,
-    /// MH selection info (primary + optional backup).
+    /// MH selection info (active/active peers).
     pub mh_selection: MhSelection,
 }
 
@@ -161,19 +161,18 @@ impl McAssignmentService {
         // Step 2: Select MHs for the meeting
         let mh_selection = MhSelectionService::select_mhs_for_meeting(pool, region).await?;
 
+        let mh_ids: Vec<&str> = mh_selection
+            .handlers
+            .iter()
+            .map(|h| h.mh_id.as_str())
+            .collect();
         tracing::debug!(
             target: "gc.service.assignment",
             meeting_id = %meeting_id,
-            primary_mh = %mh_selection.primary.mh_id,
-            backup_mh = mh_selection.backup.as_ref().map(|b| b.mh_id.as_str()),
+            mh_ids = ?mh_ids,
+            mh_count = mh_selection.handlers.len(),
             "Selected MHs for meeting"
         );
-
-        // Build MH assignments list
-        let mut mh_assignments = vec![mh_selection.primary.clone()];
-        if let Some(backup) = &mh_selection.backup {
-            mh_assignments.push(backup.clone());
-        }
 
         // Step 3: Get candidate MCs and try assignment with retry
         let mut tried_mcs: Vec<String> = Vec::new();
@@ -218,7 +217,7 @@ impl McAssignmentService {
 
             // Step 4: Call MC to notify of assignment BEFORE writing to DB
             let result = mc_client
-                .assign_meeting(&mc_endpoint, meeting_id, &mh_assignments, gc_id)
+                .assign_meeting(&mc_endpoint, meeting_id, &mh_selection.handlers, gc_id)
                 .await;
 
             match result {
