@@ -7,9 +7,10 @@ set -euo pipefail
 
 echo "=== Dark Tower dev container starting ==="
 
-# Ensure CARGO_HOME is writable and pre-installed tools remain on PATH
+# Ensure CARGO_HOME is writable and pre-installed tools remain on PATH.
+# Add clone's infra/devloop to PATH so dev-cluster always matches the source.
 mkdir -p "${CARGO_HOME:-/tmp/cargo-home}"
-export PATH="/usr/local/cargo/bin:${PATH}"
+export PATH="/work/infra/devloop:/usr/local/cargo/bin:${PATH}"
 
 # Wait for postgres to be ready.
 # With named networks (ADR-0030), DB is at $DB_HOST:5432 via container DNS.
