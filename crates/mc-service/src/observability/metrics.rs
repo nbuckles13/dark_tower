@@ -376,6 +376,45 @@ pub fn record_register_meeting(status: &str, duration: Duration) {
 }
 
 // ============================================================================
+// MH Coordination Metrics (R-28)
+// ============================================================================
+
+/// Record an MH participant notification received by MC.
+///
+/// Metric: `mc_mh_notifications_received_total`
+/// Labels: `event`
+///
+/// Event values: "connected", "disconnected"
+/// Cardinality: 2
+///
+/// Recorded in `media_coordination.rs` when MH notifies MC
+/// of participant connection/disconnection events.
+pub fn record_mh_notification(event_type: &str) {
+    counter!("mc_mh_notifications_received_total",
+        "event" => event_type.to_string()
+    )
+    .increment(1);
+}
+
+/// Record a client-reported media connection failure.
+///
+/// Metric: `mc_media_connection_failures_total`
+/// Labels: `all_failed`
+///
+/// All-failed values: "true", "false"
+/// Cardinality: 2
+///
+/// Recorded in the WebTransport bridge loop when a client sends
+/// a `MediaConnectionFailed` signaling message. Per R-20, no
+/// reallocation action is taken; the metric is for observability only.
+pub fn record_media_connection_failed(all_failed: bool) {
+    counter!("mc_media_connection_failures_total",
+        "all_failed" => if all_failed { "true" } else { "false" }.to_string()
+    )
+    .increment(1);
+}
+
+// ============================================================================
 // Error Metrics
 // ============================================================================
 
@@ -582,6 +621,20 @@ mod tests {
     }
 
     #[test]
+    fn test_record_mh_notification() {
+        // Test all 2 bounded event values
+        record_mh_notification("connected");
+        record_mh_notification("disconnected");
+    }
+
+    #[test]
+    fn test_record_media_connection_failed() {
+        // Test both boolean states
+        record_media_connection_failed(true);
+        record_media_connection_failed(false);
+    }
+
+    #[test]
     fn test_cardinality_bounds() {
         // Verify actor_type labels are bounded
         let valid_actor_types = ["controller", "meeting", "participant"];
@@ -622,6 +675,16 @@ mod tests {
         for status in &valid_join_statuses {
             record_session_join(status, None, Duration::from_millis(100));
         }
+
+        // Verify MH coordination labels are bounded
+        let valid_mh_events = ["connected", "disconnected"];
+        for event in &valid_mh_events {
+            record_mh_notification(event);
+        }
+
+        // Verify media connection failure labels are bounded
+        record_media_connection_failed(true);
+        record_media_connection_failed(false);
     }
 
     // ========================================================================
@@ -676,6 +739,12 @@ mod tests {
         record_jwt_validation("failure", "meeting");
         record_session_join("success", None, Duration::from_millis(200));
         record_session_join("failure", Some("jwt_validation"), Duration::from_millis(5));
+
+        // Record MH coordination metrics (R-28)
+        record_mh_notification("connected");
+        record_mh_notification("disconnected");
+        record_media_connection_failed(true);
+        record_media_connection_failed(false);
 
         // Take a snapshot and verify metrics were recorded
         let snapshot = snapshotter.snapshot();

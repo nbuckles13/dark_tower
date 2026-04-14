@@ -17,6 +17,7 @@
 //! 4. Reports completion to GC
 
 use crate::errors::McError;
+use crate::mh_connection_registry::MhConnectionRegistry;
 
 use super::meeting::{MeetingActor, MeetingActorHandle};
 use super::messages::{ControllerMessage, ControllerStatus, JoinResult, MeetingInfo};
@@ -57,12 +58,14 @@ impl MeetingControllerActorHandle {
     /// * `master_secret` - Master secret for session binding tokens (must be >= 32 bytes).
     ///   Wrapped in SecretBox to ensure secure memory handling (zeroization on drop,
     ///   redacted Debug output).
+    /// * `mh_connection_registry` - Registry tracking participant-to-MH connections.
     #[must_use]
     pub fn new(
         mc_id: String,
         metrics: Arc<ActorMetrics>,
         controller_metrics: Arc<ControllerMetrics>,
         master_secret: SecretBox<Vec<u8>>,
+        mh_connection_registry: Arc<MhConnectionRegistry>,
     ) -> Self {
         let (sender, receiver) = mpsc::channel(CONTROLLER_CHANNEL_BUFFER);
         let cancel_token = CancellationToken::new();
@@ -74,6 +77,7 @@ impl MeetingControllerActorHandle {
             Arc::clone(&metrics),
             Arc::clone(&controller_metrics),
             master_secret,
+            mh_connection_registry,
         );
 
         tokio::spawn(actor.run());
@@ -238,6 +242,9 @@ pub struct MeetingControllerActor {
     /// Master secret for session binding tokens (ADR-0023).
     /// Wrapped in SecretBox to ensure secure memory handling.
     master_secret: SecretBox<Vec<u8>>,
+    /// Registry tracking participant-to-MH connection state.
+    /// Cleaned up when meetings are removed.
+    mh_connection_registry: Arc<MhConnectionRegistry>,
 }
 
 impl MeetingControllerActor {
@@ -252,6 +259,8 @@ impl MeetingControllerActor {
     /// * `controller_metrics` - Controller metrics for GC heartbeat reporting (participant count)
     /// * `master_secret` - Master secret for session binding tokens (must be >= 32 bytes).
     ///   Wrapped in SecretBox to ensure secure memory handling.
+    /// * `mh_connection_registry` - Registry tracking participant-to-MH connections.
+    ///   Cleaned up when meetings are removed.
     fn new(
         mc_id: String,
         receiver: mpsc::Receiver<ControllerMessage>,
@@ -259,6 +268,7 @@ impl MeetingControllerActor {
         metrics: Arc<ActorMetrics>,
         controller_metrics: Arc<ControllerMetrics>,
         master_secret: SecretBox<Vec<u8>>,
+        mh_connection_registry: Arc<MhConnectionRegistry>,
     ) -> Self {
         let mailbox = MailboxMonitor::new(ActorType::Controller, &mc_id);
 
@@ -272,6 +282,7 @@ impl MeetingControllerActor {
             controller_metrics,
             mailbox,
             master_secret,
+            mh_connection_registry,
         }
     }
 
@@ -558,6 +569,9 @@ impl MeetingControllerActor {
 
                 self.metrics.meeting_removed();
 
+                // Clean up MH connection registry entries for this meeting
+                self.mh_connection_registry.remove_meeting(meeting_id).await;
+
                 info!(
                     target: "mc.actor.controller",
                     mc_id = %self.mc_id,
@@ -724,6 +738,11 @@ mod tests {
         SecretBox::new(Box::new(vec![0u8; 32]))
     }
 
+    /// Test MH connection registry.
+    fn test_registry() -> Arc<MhConnectionRegistry> {
+        Arc::new(MhConnectionRegistry::new())
+    }
+
     #[tokio::test]
     async fn test_controller_handle_create_meeting() {
         let metrics = ActorMetrics::new();
@@ -733,6 +752,7 @@ mod tests {
             metrics,
             controller_metrics,
             test_secret(),
+            test_registry(),
         );
 
         // Create a meeting
@@ -758,6 +778,7 @@ mod tests {
             metrics,
             controller_metrics,
             test_secret(),
+            test_registry(),
         );
 
         // Create first meeting
@@ -781,6 +802,7 @@ mod tests {
             metrics,
             controller_metrics,
             test_secret(),
+            test_registry(),
         );
 
         let result = handle.get_meeting("nonexistent".to_string()).await;
@@ -799,6 +821,7 @@ mod tests {
             metrics,
             controller_metrics,
             test_secret(),
+            test_registry(),
         );
 
         // Create a meeting
@@ -826,6 +849,7 @@ mod tests {
             metrics,
             controller_metrics,
             test_secret(),
+            test_registry(),
         );
 
         // Get initial status
@@ -855,6 +879,7 @@ mod tests {
             metrics,
             controller_metrics,
             test_secret(),
+            test_registry(),
         );
 
         // Create a meeting
@@ -883,6 +908,7 @@ mod tests {
             metrics,
             controller_metrics,
             test_secret(),
+            test_registry(),
         );
 
         assert!(!handle.is_cancelled());

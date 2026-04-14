@@ -14,6 +14,7 @@ use mc_service::actors::{ActorMetrics, ControllerMetrics, MeetingControllerActor
 use mc_service::config::Config;
 use mc_service::errors::McError;
 use mc_service::grpc::GcClient;
+use mc_service::mh_connection_registry::MhConnectionRegistry;
 
 use common::secret::{SecretBox, SecretString};
 use common::token_manager::TokenReceiver;
@@ -565,6 +566,7 @@ async fn test_actor_handle_creation() {
         Arc::clone(&actor_metrics),
         Arc::clone(&controller_metrics),
         master_secret,
+        Arc::new(MhConnectionRegistry::new()),
     ));
 
     // Controller should be created without error

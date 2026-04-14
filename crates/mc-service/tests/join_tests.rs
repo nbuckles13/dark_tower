@@ -23,6 +23,7 @@ use common::secret::SecretBox;
 use mc_service::actors::{ActorMetrics, ControllerMetrics, MeetingControllerActorHandle};
 use mc_service::auth::McJwtValidator;
 use mc_service::errors::McError;
+use mc_service::mh_connection_registry::MhConnectionRegistry;
 use mc_service::redis::{MhAssignmentData, MhAssignmentStore, MhEndpointInfo};
 use mc_service::webtransport::connection;
 use mc_test_utils::jwt_test::{
@@ -112,6 +113,7 @@ impl TestServer {
             metrics,
             controller_metrics,
             master_secret,
+            Arc::new(MhConnectionRegistry::new()),
         ));
 
         let mh_store = Arc::new(MockMhAssignmentStore::new());
@@ -588,6 +590,7 @@ async fn test_actor_level_join_success() {
         metrics,
         controller_metrics,
         master_secret,
+        Arc::new(MhConnectionRegistry::new()),
     );
 
     controller
@@ -636,6 +639,7 @@ async fn test_actor_level_join_meeting_not_found() {
         metrics,
         controller_metrics,
         master_secret,
+        Arc::new(MhConnectionRegistry::new()),
     );
 
     let (outbound_tx, _outbound_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(100);
@@ -682,6 +686,7 @@ async fn test_actor_level_second_joiner_sees_first_in_roster() {
         metrics,
         controller_metrics,
         master_secret,
+        Arc::new(MhConnectionRegistry::new()),
     );
 
     controller

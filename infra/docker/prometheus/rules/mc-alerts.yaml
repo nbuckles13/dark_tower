@@ -238,6 +238,20 @@ groups:
           impact: "May need to scale out or reject new meetings soon."
           runbook_url: "https://github.com/yourorg/dark_tower/blob/main/docs/runbooks/mc-incident-response.md#scenario-7-resource-pressure"
 
+      - alert: MCMediaConnectionAllFailed
+        expr: |
+          sum(increase(mc_media_connection_failures_total{all_failed="true"}[5m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+          service: mc-service
+          component: mh-coordination
+        annotations:
+          summary: "Clients reporting all MH connections failed"
+          description: "One or more clients have reported that all Media Handler candidates failed. This means affected participants have no working media connection."
+          impact: "Affected participants cannot send or receive media. Investigate MH health and network connectivity."
+          runbook_url: "https://github.com/yourorg/dark_tower/blob/main/docs/runbooks/mc-incident-response.md#scenario-11-media-connection-failures"
+
       - alert: MCHighJoinFailureRate
         expr: |
           (

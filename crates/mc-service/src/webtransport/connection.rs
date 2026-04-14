@@ -421,7 +421,6 @@ async fn run_bridge_loop(
     cancel_token: &CancellationToken,
     connection_id: &str,
 ) -> Result<(), McError> {
-    let mut probe_buf = [0u8; 1];
     loop {
         tokio::select! {
             () = cancel_token.cancelled() => {
@@ -457,19 +456,19 @@ async fn run_bridge_loop(
                 }
             }
 
-            // Monitor client stream for closure
-            result = recv_stream.read(&mut probe_buf) => {
+            // Read client messages (framed protobuf)
+            result = read_framed_message(recv_stream) => {
                 match result {
-                    Ok(None) | Err(_) => {
+                    Ok(data) => {
+                        handle_client_message(&data, connection_id);
+                    }
+                    Err(_) => {
                         debug!(
                             target: "mc.webtransport.connection",
                             connection_id = %connection_id,
-                            "Client stream closed"
+                            "Client stream closed or read error"
                         );
                         break;
-                    }
-                    Ok(Some(_)) => {
-                        // Client sent data after join — ignore for now
                     }
                 }
             }
@@ -477,6 +476,55 @@ async fn run_bridge_loop(
     }
 
     Ok(())
+}
+
+/// Handle a post-join client message in the bridge loop.
+///
+/// Currently handles:
+/// - `MediaConnectionFailed` (R-20): Log warning + record metric. No reallocation.
+/// - All other messages: Ignored (logged at debug level).
+fn handle_client_message(data: &[u8], connection_id: &str) {
+    let Ok(client_message) = ClientMessage::decode(data) else {
+        debug!(
+            target: "mc.webtransport.connection",
+            connection_id = %connection_id,
+            "Failed to decode post-join client message, ignoring"
+        );
+        return;
+    };
+
+    match client_message.message {
+        Some(client_message::Message::MediaConnectionFailed(msg)) => {
+            // Truncate client-controlled fields before logging to prevent log injection.
+            // Use floor_char_boundary to avoid panicking on multi-byte UTF-8 boundaries.
+            let truncated_url =
+                &msg.media_handler_url[..msg.media_handler_url.floor_char_boundary(256)];
+            let truncated_reason = &msg.error_reason[..msg.error_reason.floor_char_boundary(256)];
+            warn!(
+                target: "mc.webtransport.connection",
+                connection_id = %connection_id,
+                media_handler_url = %truncated_url,
+                error_reason = %truncated_reason,
+                all_handlers_failed = msg.all_handlers_failed,
+                "Client reported media connection failure (R-20: no reallocation)"
+            );
+            metrics::record_media_connection_failed(msg.all_handlers_failed);
+        }
+        Some(_) => {
+            debug!(
+                target: "mc.webtransport.connection",
+                connection_id = %connection_id,
+                "Received unhandled post-join client message, ignoring"
+            );
+        }
+        None => {
+            debug!(
+                target: "mc.webtransport.connection",
+                connection_id = %connection_id,
+                "Received empty client message, ignoring"
+            );
+        }
+    }
 }
 
 /// Read a length-prefixed protobuf message from a `RecvStream`.
@@ -625,3 +673,70 @@ async fn build_join_response(
 // Note: build_join_response is async and requires a Redis client.
 // Integration tests in tests/join_tests.rs cover the full join flow
 // including Redis MH assignment data population and media_servers verification.
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_handle_media_connection_failed() {
+        let msg = ClientMessage {
+            message: Some(client_message::Message::MediaConnectionFailed(
+                signaling::MediaConnectionFailed {
+                    media_handler_url: "https://mh-1.example.com".to_string(),
+                    error_reason: "timeout".to_string(),
+                    all_handlers_failed: false,
+                },
+            )),
+        };
+        let data = msg.encode_to_vec();
+        // Should not panic
+        handle_client_message(&data, "test-conn-1");
+    }
+
+    #[test]
+    fn test_handle_media_connection_failed_all_handlers() {
+        let msg = ClientMessage {
+            message: Some(client_message::Message::MediaConnectionFailed(
+                signaling::MediaConnectionFailed {
+                    media_handler_url: "https://mh-2.example.com".to_string(),
+                    error_reason: "connection_refused".to_string(),
+                    all_handlers_failed: true,
+                },
+            )),
+        };
+        let data = msg.encode_to_vec();
+        handle_client_message(&data, "test-conn-2");
+    }
+
+    #[test]
+    fn test_handle_client_message_unhandled_type() {
+        let msg = ClientMessage {
+            message: Some(client_message::Message::MuteRequest(
+                signaling::MuteRequest {
+                    audio_muted: true,
+                    video_muted: false,
+                },
+            )),
+        };
+        let data = msg.encode_to_vec();
+        // Should not panic -- exercises the Some(_) branch
+        handle_client_message(&data, "test-conn-3");
+    }
+
+    #[test]
+    fn test_handle_client_message_invalid_data() {
+        let garbage = vec![0xFF, 0xFE, 0xFD, 0xFC, 0xFB];
+        // Should not panic -- exercises the decode error branch
+        handle_client_message(&garbage, "test-conn-4");
+    }
+
+    #[test]
+    fn test_handle_client_message_empty_message() {
+        let msg = ClientMessage { message: None };
+        let data = msg.encode_to_vec();
+        // Should not panic -- exercises the None branch
+        handle_client_message(&data, "test-conn-5");
+    }
+}

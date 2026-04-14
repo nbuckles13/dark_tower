@@ -39,10 +39,8 @@
 - Downward API: `status.podIP` → `POD_IP`; WebTransport advertise from per-instance ConfigMap
 - Port map: AC=8082, GC=8080/50051, MC=8081/50052/4433, MH=8083/50053/4434; scaling requires per-pod Services + Kind port mappings
 
-## Runbooks
+## Runbooks & Database
 - Per-service incident/deployment → `docs/runbooks/` (ac, gc, mc)
-
-## Database & Migrations
 - Participant tracking + meetings → `crates/gc-service/src/repositories/participants.rs`, `meetings.rs`
 
 ## Auth & JWT
@@ -51,25 +49,28 @@
 - AC rate limits → `crates/ac-service/src/config.rs:parse_rate_limit_i64()`; Service auth → ADR-0003
 
 ## Observability
-- Observability Kustomize + Grafana → `infra/kubernetes/observability/`, `infra/grafana/dashboards/`; Alerts → `docs/observability/alerts.md`
+- Kustomize + Grafana → `infra/kubernetes/observability/`, `infra/grafana/dashboards/`; Alerts → `docs/observability/alerts.md`
 - Per-service metrics → `crates/gc-service/src/observability/metrics.rs`, `crates/mc-service/src/observability/metrics.rs`, `crates/mh-service/src/observability/metrics.rs`; Prometheus → `infra/docker/prometheus/prometheus.yml`
 
 ## MH Service
-- MH startup + config + health → `crates/mh-service/src/main.rs`, `crates/mh-service/src/config.rs`, `crates/mh-service/src/observability/health.rs`
-- MH GC client → `crates/mh-service/src/grpc/gc_client.rs`
-- MH gRPC + JWKS auth layer → `crates/mh-service/src/grpc/mh_service.rs`, `auth_interceptor.rs`; JWT validation → `crates/mh-service/src/auth/mod.rs`
-- MH SessionManager actor (ADR-0001) → `crates/mh-service/src/session/mod.rs`; `SessionManagerHandle` (mpsc+oneshot, buffer=256) replaces `Arc<SessionManager>`; shutdown: gRPC+WebTransport tasks drop handles → channel closes → actor exits
-- MH WebTransport → `crates/mh-service/src/webtransport/server.rs`, `connection.rs`
+- MH startup + config + health → `crates/mh-service/src/main.rs`, `config.rs`, `observability/health.rs`
+- MH gRPC (service, GC client, JWKS auth) → `crates/mh-service/src/grpc/mh_service.rs`, `gc_client.rs`, `auth_interceptor.rs`
+- MH WebTransport + session mgmt → `crates/mh-service/src/webtransport/server.rs`, `connection.rs`, `session/mod.rs`
 
 ## MC Service
-- MC startup → `crates/mc-service/src/main.rs`; config → `crates/mc-service/src/config.rs`
+- MC startup + gRPC server wiring → `crates/mc-service/src/main.rs`; config → `crates/mc-service/src/config.rs`
 - MC WebTransport → `crates/mc-service/src/webtransport/server.rs`, `connection.rs`
 - MC GC client → `crates/mc-service/src/grpc/gc_client.rs`; MH client → `crates/mc-service/src/grpc/mh_client.rs`
 - MC gRPC service (GC→MC assignments) → `crates/mc-service/src/grpc/mc_service.rs`
+- MediaCoordinationService (MH→MC :50052) → `crates/mc-service/src/grpc/media_coordination.rs`; JWKS auth → `auth_interceptor.rs:McAuthLayer`
+- MhConnectionRegistry (cleanup wired in controller.rs `remove_meeting()`) → `crates/mc-service/src/mh_connection_registry.rs`
 - Redis (fenced writes, MhAssignmentData, MhAssignmentStore trait) → `crates/mc-service/src/redis/client.rs`
 - Actors → `crates/mc-service/src/actors/controller.rs`, `meeting.rs`, `participant.rs`
+- MCMediaConnectionAllFailed alert → `infra/docker/prometheus/rules/mc-alerts.yaml`
 
 ## GC Service
 - GC routes + handlers → `crates/gc-service/src/routes/mod.rs`, `crates/gc-service/src/handlers/meetings.rs`
-- GC join tests → `crates/gc-service/tests/meeting_tests.rs`; MC join tests → `crates/mc-service/tests/join_tests.rs`; TestKeypair → `crates/mc-test-utils/src/jwt_test.rs`
-- GC join tests → `crates/gc-service/tests/meeting_tests.rs`; Env-tests (Kind) → `crates/env-tests/`
+
+## Tests
+- MC join tests → `crates/mc-service/tests/join_tests.rs`; TestKeypair → `crates/mc-test-utils/src/jwt_test.rs`
+- GC join tests → `crates/gc-service/tests/meeting_tests.rs`; Env-tests → `crates/env-tests/`

@@ -44,6 +44,9 @@ sysinfo = "0.30"
 metrics = "0.24"
 metrics-exporter-prometheus = "0.16"
 
+# Async gRPC auth layer (JWKS-based service token validation)
+tower = { workspace = true }
+
 # HTTP server for health endpoints and metrics
 axum = { workspace = true }
 tower-http = { workspace = true, features = ["trace"] }
@@ -59,7 +62,6 @@ mc-test-utils = { path = "../mc-test-utils" }
 # Metrics testing
 metrics-util = "0.18"
 # HTTP testing for health endpoint integration tests
-tower = { workspace = true }
 http-body-util = "0.1"
 # Need test-util feature for tokio::time::pause/advance in tests
 tokio = { version = "1.40", features = ["full", "test-util"] }

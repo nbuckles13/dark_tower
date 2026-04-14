@@ -639,7 +639,7 @@ Phase 6 (after dashboards):
 | 4 | MC: Redis gRPC endpoints + media_servers + MhClient | | | Pending |
 | 5 | MH: RegisterMeeting handler + SessionManager | `docs/devloop-outputs/2026-04-14-mh-register-meeting/` | `e6b02b1` | Completed |
 | 6 | MH: MC notification client | | | Pending |
-| 7 | MC: MediaCoordinationService + MhConnectionRegistry + MediaConnectionFailed handler | | | Pending |
+| 7 | MC: MediaCoordinationService + MhConnectionRegistry + MediaConnectionFailed handler | `docs/devloop-outputs/2026-04-14-mc-media-coordination-service/` | `938f4cb` | Completed |
 | 8 | MC: async RegisterMeeting trigger | | | Pending |
 | 9 | Infra: network policies + MH AC_JWKS_URL | docs/devloop-outputs/2026-04-13-mh-mc-network-policy/ | 93aa29b | Completed |
 | 10 | MH: observability metrics | | | Pending |

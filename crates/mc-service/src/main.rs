@@ -48,11 +48,13 @@ use mc_service::actors::{ActorMetrics, ControllerMetrics, MeetingControllerActor
 use mc_service::auth::McJwtValidator;
 use mc_service::config::Config;
 use mc_service::errors::McError;
-use mc_service::grpc::{GcClient, McAssignmentService};
+use mc_service::grpc::{GcClient, McAssignmentService, McAuthLayer, McMediaCoordinationService};
+use mc_service::mh_connection_registry::MhConnectionRegistry;
 use mc_service::observability::{health_router, HealthState};
 use mc_service::redis::FencedRedisClient;
 use mc_service::system_info::gather_system_info;
 use mc_service::webtransport::WebTransportServer;
+use proto_gen::internal::media_coordination_service_server::MediaCoordinationServiceServer;
 use proto_gen::internal::meeting_controller_service_server::MeetingControllerServiceServer;
 use proto_gen::internal::HealthStatus;
 use tokio::signal;
@@ -185,7 +187,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         reason = "clock_skew_seconds bounded to <=600, safe u64->i64"
     )]
     let jwt_validator = Arc::new(McJwtValidator::new(
-        jwks_client,
+        Arc::clone(&jwks_client),
         config.clock_skew_seconds as i64,
     ));
     info!("JWKS client initialized for meeting token validation");
@@ -224,11 +226,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         SecretBox::new(Box::new(secret_bytes))
     };
 
+    // Create MH connection registry for tracking participant→MH connections (R-18)
+    let mh_connection_registry = Arc::new(MhConnectionRegistry::new());
+
     let controller_handle = Arc::new(MeetingControllerActorHandle::new(
         config.mc_id.clone(),
         Arc::clone(&actor_metrics),
         Arc::clone(&controller_metrics),
         master_secret,
+        Arc::clone(&mh_connection_registry),
     ));
     info!("Actor system initialized");
 
@@ -294,9 +300,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.max_participants,
     );
 
+    // Create MediaCoordinationService for MH→MC notifications (R-15)
+    let media_coord_service = McMediaCoordinationService::new(Arc::clone(&mh_connection_registry));
+
+    // Create JWKS-based auth layer for gRPC service token validation (R-22)
+    // Applied at the server level: validates JWT signature + expiry for ALL
+    // incoming gRPC calls (both GC→MC and MH→MC). Scope checks are performed
+    // by individual handlers as needed. Reuses the existing JwksClient.
+    #[expect(
+        clippy::cast_possible_wrap,
+        reason = "clock_skew_seconds bounded to <=600, safe u64->i64"
+    )]
+    let mc_auth_layer =
+        McAuthLayer::new(Arc::clone(&jwks_client), config.clock_skew_seconds as i64);
+
     let grpc_shutdown_token = shutdown_token.child_token();
     let grpc_server = tonic::transport::Server::builder()
+        .layer(mc_auth_layer)
         .add_service(MeetingControllerServiceServer::new(mc_assignment_service))
+        .add_service(MediaCoordinationServiceServer::new(media_coord_service))
         .serve_with_shutdown(grpc_addr, async move {
             grpc_shutdown_token.cancelled().await;
             info!("gRPC server shutting down");

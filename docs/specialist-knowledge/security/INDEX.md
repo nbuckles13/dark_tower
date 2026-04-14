@@ -26,8 +26,10 @@
 
 ## Code Locations — MC (JWT, WebTransport, Actors, MH Client)
 - MC JWT validation + token_type anti-confusion → `crates/mc-service/src/auth/mod.rs:McJwtValidator`
-- gRPC auth interceptor → `crates/mc-service/src/grpc/auth_interceptor.rs`
+- gRPC auth: structural `McAuthInterceptor` | JWKS `McAuthLayer` (scope `service.write.mc`) → `crates/mc-service/src/grpc/auth_interceptor.rs`
 - MC→MH OAuth Bearer auth (TokenReceiver, add_auth) → `crates/mc-service/src/grpc/mh_client.rs:MhClient`
+- MediaCoordinationService (MH→MC, input validation) → `crates/mc-service/src/grpc/media_coordination.rs`
+- MH connection registry (bound: 1000/meeting) + UTF-8 safe truncation (`floor_char_boundary`) → `mh_connection_registry.rs`, `webtransport/connection.rs:handle_client_message()`
 - WebTransport (connection handler, accept loop, TLS, join flow, JWT gate, capacity) → `crates/mc-service/src/webtransport/`
 - Join fail-closed on missing MH data (generic client error) → `connection.rs:build_join_response()`, `errors.rs:MhAssignmentMissing`
 - MH assignment store (Redis, no credentials stored) → `crates/mc-service/src/redis/client.rs:MhAssignmentStore`, `MhAssignmentData`
@@ -35,8 +37,8 @@
 
 ## Code Locations — MH (Auth, OAuth, TLS)
 - gRPC auth layer (JWKS, scope `service.write.mh`) → `crates/mh-service/src/grpc/auth_interceptor.rs:MhAuthLayer`
-- OAuth config (SecretString, Debug redaction) → `crates/mh-service/src/config.rs:Config`
-- JWKS config (AC_JWKS_URL) → `infra/services/mh-service/configmap.yaml`
+- OAuth config (SecretString, Debug redaction) → `crates/mh-service/src/config.rs:Config` | JWKS: `infra/services/mh-service/configmap.yaml`
+- TLS validation + Bearer auth + error sanitization → `config.rs`, `gc_client.rs`, `errors.rs`
 
 ## Code Locations — Observability (Security-Relevant)
 - MC/MH metrics (bounded labels, no PII) → `crates/mc-service/src/observability/metrics.rs` (+ mh) | ADR-0029
@@ -71,5 +73,4 @@
 
 ## Health, Probes & Integration Seams
 - MC/MH health + K8s probes → `src/observability/health.rs`, `infra/services/{mc,mh}-service/*-deployment.yaml`
-- Auth chain: AC JWKS → common JwtValidator → GC/MC/MH; gRPC: GC→MC→MH auth interceptors
-- Guards → `scripts/guards/simple/no-secrets-in-logs.sh`, `validate-kustomize.sh` | Join tests → `crates/{mc,gc}-service/tests/`
+- Auth chain: AC JWKS → common JwtValidator → GC/MC/MH | Guards → `scripts/guards/simple/` | Join tests → `crates/{mc,gc}-service/tests/`
