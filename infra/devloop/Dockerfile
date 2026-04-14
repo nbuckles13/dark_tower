@@ -76,10 +76,6 @@ RUN mkdir -p /tmp/cargo-home && chmod 777 /tmp/cargo-home
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
-# dev-cluster client CLI for Kind cluster management (ADR-0030)
-COPY dev-cluster /usr/local/bin/dev-cluster
-RUN chmod +x /usr/local/bin/dev-cluster
-
 WORKDIR /work
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
