@@ -25,15 +25,23 @@
 
 ## Per-Service Config Parsing
 - AC/GC/MC/MH config -> `crates/*/src/config.rs:Config::from_vars()` (per-service, not duplication)
-- Env-test cluster config -> `crates/env-tests/src/cluster.rs:ClusterPorts::from_env()`, `parse_host_port()` (different domain from service config, not duplication)
-- Advertise addresses (MC + MH) -> gRPC uses POD_IP downward API; WebTransport uses per-instance ConfigMap (`mc-{0,1}-config`, `mh-{0,1}-config`); devloop patches via `setup.sh` DT_HOST_GATEWAY_IP guard
-- StatefulSet ordinal parsing -> `crates/common/src/config.rs:parse_statefulset_ordinal()` (shared, 5 tests)
-- Extraction candidate: `generate_instance_id(prefix)` -> 4-line pattern duplicated in GC + MC + MH config
+- Advertise addresses (MC + MH) -> per-instance ConfigMaps; devloop patches via `setup.sh` DT_HOST_GATEWAY_IP guard
+- StatefulSet ordinal parsing -> `crates/common/src/config.rs:parse_statefulset_ordinal()` (shared)
+- Extraction candidate: `generate_instance_id(prefix)` -> 4-line pattern in GC + MC + MH config
 
-## gRPC Auth Interceptors (Cross-Service)
-- MC auth interceptor -> `crates/mc-service/src/grpc/auth_interceptor.rs:McAuthInterceptor`
-- MH auth interceptor -> `crates/mh-service/src/grpc/auth_interceptor.rs:MhAuthInterceptor` (duplicates MC)
+## gRPC Auth (Cross-Service)
+- MC auth layer (async JWKS, R-22) -> `crates/mc-service/src/grpc/auth_interceptor.rs:McAuthLayer` (applied in main.rs)
+- MC auth interceptor (legacy structural) -> same file `:McAuthInterceptor` (dead in production)
+- MH auth layer (async JWKS) -> `crates/mh-service/src/grpc/auth_interceptor.rs:MhAuthLayer`
+- MH auth interceptor (legacy structural) -> same file `:MhAuthInterceptor` (dead in production)
 - Shared constant -> `common::jwt::MAX_JWT_SIZE_BYTES`
+- McAuthLayer/MhAuthLayer are near-identical tower Layer/Service patterns (extraction candidate in TODO.md)
+
+## MC gRPC Services (GC→MC + MH→MC)
+- MC assignment service (GC→MC) -> `crates/mc-service/src/grpc/mc_service.rs:McAssignmentService`
+- MC media coordination (MH→MC, R-15) -> `crates/mc-service/src/grpc/media_coordination.rs:McMediaCoordinationService`
+- MH connection registry -> `crates/mc-service/src/mh_connection_registry.rs:MhConnectionRegistry`
+- MAX_ID_LENGTH constant -> `mh_connection_registry.rs` (single source, imported by media_coordination.rs)
 
 ## gRPC Clients (Cross-Service)
 - MC GcClient -> `crates/mc-service/src/grpc/gc_client.rs:GcClient` (bounded retries, fast/comprehensive heartbeats)
@@ -55,8 +63,8 @@
 ## Per-Service Infrastructure (K8s, Docker, Kind)
 - Kustomize bases -> `infra/services/{ac,gc,mc,mh}-service/kustomization.yaml`; AC/MC/MH StatefulSet, GC Deployment
 - MC/MH per-pod Services + per-instance ConfigMaps -> `infra/services/{mc,mh}-service/` (port formula: `base + ordinal*2`)
-- Network policies → `infra/services/*/network-policy.yaml`; MH->MC egress + MC<-MH ingress on TCP 50052
-- Dockerfiles -> `infra/docker/*/Dockerfile` (cargo-chef multi-stage); Kind -> `infra/kind/`; overlays -> `infra/kubernetes/overlays/kind/`
+- Network policies -> `infra/services/{ac,gc,mc,mh}-service/network-policy.yaml`; MH->MC egress + MC<-MH ingress on TCP 50052
+- Dockerfiles -> `infra/docker/{ac,gc,mc,mh}-service/Dockerfile` (cargo-chef multi-stage); Kind -> `infra/kind/`; overlays -> `infra/kubernetes/overlays/kind/`
 - setup/teardown (ADR-0030) -> `infra/kind/scripts/{setup,teardown}.sh`; devloop -> `infra/devloop/devloop.sh`
 - Helper commands -> `crates/devloop-helper/src/commands.rs`; TLS -> `scripts/generate-dev-certs.sh`
 
@@ -64,12 +72,10 @@
 - Per-service error mapping (GcError vs McError vs MhError) -> required, not duplication
 - MC GcClient vs MH GcClient -> different RPCs, retry strategies, heartbeat models (reviewed 2026-04-01)
 - AC rate limiting (DB-backed lockout) vs GC rate limiting (middleware RPM) -> different mechanisms
-- common::jwt::{ParticipantType,MeetingRole} (2 variants) vs common::meeting_token (3 variants) -> JWT enums intentionally narrower (no Guest; guests use separate GuestTokenClaims)
-- env-tests GuestTokenRequest vs common::meeting_token::GuestTokenRequest -> different types (public API vs internal)
+- common::jwt::{ParticipantType,MeetingRole} vs common::meeting_token -> JWT enums intentionally narrower
+- env-tests GuestTokenRequest vs common::meeting_token::GuestTokenRequest -> different types
 
-## Tech Debt Registry
+## Tech Debt & Extractions
 - Active duplication tech debt -> `docs/TODO.md` (Cross-Service Duplication section)
-
-## Successful Extractions & Integration Seams
-- Common crate (extraction target) -> `crates/common/src/` (jwt, config, meeting_token, secret, token_manager); ServiceClaims/UserClaims/JWKS/JwtValidator -> `jwt.rs`
-- TestKeypair + JWKS mock -> `crates/mc-test-utils/src/jwt_test.rs`; MeetingToken types -> `common/src/meeting_token.rs`; StatefulSet ordinal -> `common/src/config.rs`; JoinMeetingResponse -> `crates/gc-service/src/handlers/meetings.rs`; load_image_to_kind -> `infra/kind/scripts/setup.sh`
+- Common crate (extraction target) -> `crates/common/src/` (jwt, config, meeting_token, secret, token_manager)
+- Test fixtures -> `crates/mc-test-utils/src/jwt_test.rs`, `crates/gc-test-utils/`

@@ -204,7 +204,7 @@ All MC service metrics follow ADR-0011 naming conventions with the `mc_` prefix.
 - **Cardinality**: Low (2 status values)
 - **Usage**: Monitor MC→MH meeting registration reliability, detect MH connectivity issues
 - **Recorded in**: `mh_client.rs` after RegisterMeeting RPC completes
-- **Dashboard**: MC Overview - RegisterMeeting RPC Rate by Status (MH Communication row)
+- **Dashboard**: MC Overview - RegisterMeeting RPC Rate by Status (MH Coordination row)
 
 ### `mc_register_meeting_duration_seconds`
 - **Type**: Histogram
@@ -214,7 +214,30 @@ All MC service metrics follow ADR-0011 naming conventions with the `mc_` prefix.
 - **Cardinality**: 1 (no labels)
 - **Usage**: Monitor MC→MH RPC latency, detect MH performance degradation
 - **Recorded in**: `mh_client.rs` measuring full RPC round-trip
-- **Dashboard**: MC Overview - RegisterMeeting RPC Latency P50/P95/P99 (MH Communication row)
+- **Dashboard**: MC Overview - RegisterMeeting RPC Latency P50/P95/P99 (MH Coordination row)
+
+## MH Coordination Metrics (R-15, R-20)
+
+### `mc_mh_notifications_received_total`
+- **Type**: Counter
+- **Description**: Total MH→MC participant connection/disconnection notifications received
+- **Labels**:
+  - `event`: Notification event type (`connected`, `disconnected`)
+- **Cardinality**: Low (2 event types)
+- **Usage**: Monitor MH→MC notification volume, detect MH connectivity issues
+- **Recorded in**: `grpc/media_coordination.rs` on notification receipt
+- **Dashboard**: MC Overview - MH Notifications by Event (MH Coordination row)
+
+### `mc_media_connection_failures_total`
+- **Type**: Counter
+- **Description**: Total client-reported media connection failures
+- **Labels**:
+  - `all_failed`: Whether all MH candidates failed (`true`, `false`)
+- **Cardinality**: Low (2 values)
+- **Usage**: Monitor media connection health. `all_failed=true` means client has no working MH connection.
+- **Recorded in**: `webtransport/connection.rs` on MediaConnectionFailed message
+- **Alert**: `MCMediaConnectionAllFailed` (warning/P2, all_failed=true > 0 for 5m)
+- **Dashboard**: MC Overview - Media Connection Failures (MH Coordination row)
 
 ---
 
@@ -294,6 +317,16 @@ histogram_quantile(0.99,
 )
 ```
 
+### MH Notification Rate by Event
+```promql
+sum(rate(mc_mh_notifications_received_total[5m])) by (event)
+```
+
+### Media Connection Failures (All Failed)
+```promql
+sum(rate(mc_media_connection_failures_total{all_failed="true"}[5m]))
+```
+
 ---
 
 ## SLO Definitions
@@ -333,6 +366,8 @@ All MC service metrics follow strict cardinality bounds per ADR-0011:
 | `result` | 2 | `success`, `failure` (JWT validation) |
 | `token_type` | 2 | `meeting`, `guest` (JWT validation) |
 | `error_type` | ~19 | Bounded by `McError` enum variants |
+| `event` | 2 | `connected`, `disconnected` (MH notifications) |
+| `all_failed` | 2 | `true`, `false` (media connection failures) |
 
 **Total Estimated Cardinality**: ~79 time series (well within Prometheus limits)
 

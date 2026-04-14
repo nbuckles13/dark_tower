@@ -46,6 +46,7 @@ pub mod auth;
 pub mod config;
 pub mod errors;
 pub mod grpc;
+pub mod mh_connection_registry;
 pub mod observability;
 pub mod redis;
 pub mod system_info;
