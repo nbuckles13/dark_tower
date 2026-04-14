@@ -447,12 +447,18 @@ pub async fn join_meeting(
     let duration = start.elapsed();
     metrics::record_meeting_join("success", None, duration);
 
+    let mh_ids: Vec<&str> = assignment_with_mh
+        .mh_selection
+        .handlers
+        .iter()
+        .map(|h| h.mh_id.as_str())
+        .collect();
     info!(
         target: "gc.handlers.meetings",
         meeting_id = %meeting.meeting_id,
         user_id = %user_id,
         mc_id = %assignment_with_mh.mc_assignment.mc_id,
-        primary_mh_id = %assignment_with_mh.mh_selection.primary.mh_id,
+        mh_ids = ?mh_ids,
         participant_type = ?participant_type,
         "User joined meeting"
     );
@@ -564,12 +570,18 @@ pub async fn get_guest_token(
 
     let token_response = ac_client.request_guest_token(&token_request).await?;
 
+    let mh_ids: Vec<&str> = assignment_with_mh
+        .mh_selection
+        .handlers
+        .iter()
+        .map(|h| h.mh_id.as_str())
+        .collect();
     info!(
         target: "gc.handlers.meetings",
         meeting_id = %meeting.meeting_id,
         guest_id = %guest_id,
         mc_id = %assignment_with_mh.mc_assignment.mc_id,
-        primary_mh_id = %assignment_with_mh.mh_selection.primary.mh_id,
+        mh_ids = ?mh_ids,
         waiting_room = meeting.waiting_room_enabled,
         "Guest joined meeting"
     );

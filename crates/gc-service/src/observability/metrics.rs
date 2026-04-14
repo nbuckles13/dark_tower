@@ -368,8 +368,8 @@ pub fn record_grpc_mc_call(method: &str, status: &str, duration: Duration) {
 /// Record MH selection duration and outcome
 ///
 /// Metric: `gc_mh_selection_duration_seconds`, `gc_mh_selections_total`
-/// Labels: `status`, `has_backup`
-pub fn record_mh_selection(status: &str, has_backup: bool, duration: Duration) {
+/// Labels: `status`, `has_multiple`
+pub fn record_mh_selection(status: &str, has_multiple: bool, duration: Duration) {
     histogram!("gc_mh_selection_duration_seconds",
         "status" => status.to_string()
     )
@@ -377,7 +377,7 @@ pub fn record_mh_selection(status: &str, has_backup: bool, duration: Duration) {
 
     counter!("gc_mh_selections_total",
         "status" => status.to_string(),
-        "has_backup" => has_backup.to_string()
+        "has_multiple" => has_multiple.to_string()
     )
     .increment(1);
 }

@@ -7,7 +7,7 @@
 - Validation Layer 8 (env-tests integration) → `.claude/skills/devloop/SKILL.md` ("Layer 8" section)
 
 ## Metrics Catalogs (Label Validation)
-- AC → `docs/observability/metrics/ac-service.md` | GC → `docs/observability/metrics/gc-service.md` | MC → `docs/observability/metrics/mc-service.md`
+- AC → `docs/observability/metrics/ac-service.md` | GC → `docs/observability/metrics/gc-service.md` | MC → `docs/observability/metrics/mc-service.md` | MH → `docs/observability/metrics/mh-service.md`
 
 ## Cross-Service Boundary Files
 - Common JWT (types, JWKS, validator, errors, HasIat) → `crates/common/src/jwt.rs`
@@ -20,6 +20,8 @@
 - MC JWT validation (McJwtValidator) → `crates/mc-service/src/auth/mod.rs` (meeting + guest token methods)
 - MC JWKS config → `crates/mc-service/src/config.rs:ac_jwks_url`
 - MC WebTransport JWT check (pre-actor) → `crates/mc-service/src/webtransport/connection.rs:handle_connection()`
+- MH gRPC auth interceptor → `crates/mh-service/src/grpc/auth_interceptor.rs:MhAuthInterceptor`
+- MH JWKS config → `infra/services/mh-service/configmap.yaml:AC_JWKS_URL`
 
 ## MC Actor Hierarchy
 - Controller → `actors/controller.rs` | Meeting → `actors/meeting.rs` | Participant → `actors/participant.rs`
@@ -31,6 +33,12 @@
 - Wire format: 4-byte BE length prefix + protobuf; MAX_MESSAGE_SIZE=64KB, MAX_PARTICIPANT_NAME_LEN=256
 - Protobuf encoding utilities → `crates/mc-service/src/webtransport/handler.rs:encode_participant_update()`
 
+## GC MH Selection & Assignment
+- MH selection (active/active peers, weighted random) → `crates/gc-service/src/services/mh_selection.rs:MhSelectionService`
+- MH selection types (MhSelection.handlers, MhAssignmentInfo) → `mh_selection.rs:MhSelection`
+- MC assignment with MH → `crates/gc-service/src/services/mc_assignment.rs:AssignmentWithMh`
+- MH selection metrics (gc_mh_selection_duration_seconds, gc_mh_selections_total) → `crates/gc-service/src/observability/metrics.rs:record_mh_selection()`
+
 ## GC Handlers, Routes & Repositories
 - Create/Join/Guest/Settings handlers → `crates/gc-service/src/handlers/meetings.rs`
 - Route wiring → `crates/gc-service/src/routes/mod.rs:build_routes()`
@@ -38,20 +46,12 @@
 - Models → `crates/gc-service/src/models/mod.rs:CreateMeetingRequest`, `Participant`
 
 ## GC Join Integration Tests (`crates/gc-service/tests/meeting_tests.rs`)
-- Harness: TestMeetingServer (spawn/spawn_with_ac_failure), wiremock JWKS+AC, MockMcClient, `#[sqlx::test]`
-- Join success: scheduled+active, host+member, cross-org | Denied: not found, cancelled, ended, cross-org forbidden
-- Auth: missing/invalid/expired, service token rejected, HS256 confusion, wrong key, tampered → 401
-- Guest: success, not found, forbidden, display_name validation, captcha, concurrency (20 parallel)
-- Settings: host allow_guests/external/waiting_room, partial+multi, non-host 403, not found 404
+- Harness: TestMeetingServer, wiremock JWKS+AC, MockMcClient, `#[sqlx::test]`
+- MH assignment tests → `tests/mc_assignment_rpc_tests.rs`, `tests/meeting_assignment_tests.rs`
 
 ## MC Test Utilities & Join Integration Tests
-- TestKeypair (Ed25519 seed, JWK, signing) → `crates/mc-test-utils/src/jwt_test.rs`
-- JWKS mock → `jwt_test.rs:mount_jwks_mock()` | Claims → `make_meeting_claims()`, `make_expired_*`, `make_host_*`
-- Note: `mc-service/src/auth/mod.rs` `#[cfg(test)]` still has private TestKeypair copy (dedup candidate)
-- **Tests** (`crates/mc-service/tests/join_tests.rs`): TestServer (self-signed TLS, wiremock JWKS, real actors)
-- Happy path: JoinResponse fields, empty roster | JWT: expired, garbage, wrong meeting_id, wrong key → Unauthorized
-- Protocol: invalid protobuf → drop, wrong first msg → InvalidRequest | Validation: name too long → InvalidRequest
-- Actor-level: join success, meeting not found, roster visibility | Bridge: ParticipantJoined (timeout-tolerant)
+- TestKeypair + JWKS mock → `crates/mc-test-utils/src/jwt_test.rs`
+- Join tests → `crates/mc-service/tests/join_tests.rs` (TestServer, self-signed TLS, wiremock JWKS, real actors)
 
 ## Observability
 - GC metrics → `crates/gc-service/src/observability/metrics.rs` | MC metrics → `crates/mc-service/src/observability/metrics.rs`
@@ -65,11 +65,11 @@
 - Join flow E2E → `tests/24_join_flow.rs` (Tier 1: GC-level + Tier 2: MC WebTransport)
 - Wire format helpers: `encode_framed` / `read_server_message` (4-byte BE prefix)
 
-## Kustomize & Kind
-- Kind overlay → `infra/kubernetes/overlays/kind/` | Setup (DT_CLUSTER_NAME, DT_PORT_MAP, DT_HOST_GATEWAY_IP, --yes/--only/--skip-build, `load_image_to_kind()`, `deploy_only_service()`) → ADR-0030, `infra/kind/scripts/setup.sh`
-- Devloop ConfigMap patching (MC/MH advertise addresses) → `infra/kind/scripts/setup.sh:deploy_mc_service()`, `deploy_mh_service()`
-- Devloop-helper commands → `crates/devloop-helper/src/commands.rs:validate_gateway_ip()`, `write_port_map_shell()`, `cmd_status()`, `parse_pod_health()`
-- Dev-cluster CLI status + display → `infra/devloop/dev-cluster:display_cluster_info()`
-- Teardown → `infra/kind/scripts/teardown.sh` | Observability + service bases → `infra/kubernetes/observability/`, `infra/services/*/kustomization.yaml`
-- Kustomize CI guard (R-15–R-20) → `scripts/guards/simple/validate-kustomize.sh` | GC runbooks → `docs/runbooks/gc-*.md`
+## Network Policies
+- Per-service policies → `infra/services/{ac,gc,mc,mh}-service/network-policy.yaml`
+- MC↔MH gRPC: MC→MH:50053, MH→MC:50052 | GC→MC:50052 | GC egress:50051
 
+## Kustomize & Kind
+- Kind overlay → `infra/kubernetes/overlays/kind/` | Setup → ADR-0030, `infra/kind/scripts/setup.sh`
+- ConfigMap patching (MC/MH advertise addresses) → `setup.sh:deploy_mc_service()`, `deploy_mh_service()`
+- Devloop-helper → `crates/devloop-helper/src/commands.rs` | Dev-cluster CLI → `infra/devloop/dev-cluster` | Teardown → `teardown.sh`

@@ -29,6 +29,8 @@
 - Meeting handlers → `handlers/meetings.rs:create_meeting()`, `join_meeting()`, `get_guest_token()`, `JoinMeetingResponse::new()`
 - Repositories → `repositories/meetings.rs` (atomic CTE), `participants.rs`
 - AC/MC clients → `services/ac_client.rs:AcClient`, `mc_client.rs:McClientTrait`
+- MH selection (active/active peers) → `services/mh_selection.rs:MhSelectionService`, `MhSelection { handlers: Vec<MhAssignmentInfo> }`
+- MC assignment with MH → `services/mc_assignment.rs:McAssignmentService::assign_meeting_with_mh()`, `AssignmentWithMh`
 - Metrics/dashboard/alerts → `observability/metrics.rs`, `docs/observability/metrics/gc-service.md`, `infra/grafana/dashboards/gc-overview.json`
 
 ## Code Locations — MC Service
@@ -69,7 +71,5 @@
 - Standard health endpoints (`/health`, `/ready`) → ADR-0012 (Section: Standard Operational Endpoints)
 - MC+MH TLS cert generation → `scripts/generate-dev-certs.sh`
 - Env-tests cluster module → `crates/env-tests/src/cluster.rs`
-- Kind cluster (ADR-0030): `kind-config.yaml.tmpl`, `setup.sh` (`deploy_only_service()`, `DT_HOST_GATEWAY_IP`), `{mc,mh}-{0,1}-configmap.yaml`
-- Devloop helper → `crates/devloop-helper/src/commands.rs` (`cmd_setup()`, `cmd_status()`, `cmd_deploy()`), `ports.rs`; client → `infra/devloop/dev-cluster`; Layer 8 → `SKILL.md`
-- Service bases + Kind overlay → `infra/services/*/kustomization.yaml`, `infra/kubernetes/overlays/kind/`
-- Guards: runner → `scripts/guards/run-guards.sh`; Kustomize (R-15–R-20) → `validate-kustomize.sh`; App metrics → `validate-application-metrics.sh`
+- Kind cluster (ADR-0030): `kind-config.yaml.tmpl`, `setup.sh`, `{mc,mh}-{0,1}-configmap.yaml`; Devloop → `devloop-helper/src/commands.rs`
+- Service bases + Kind overlay → `infra/services/*/kustomization.yaml`, `infra/kubernetes/overlays/kind/`; Guards → `scripts/guards/run-guards.sh`

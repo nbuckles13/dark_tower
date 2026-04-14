@@ -18,7 +18,8 @@
 
 ## Code Locations: GC Service
 - Auth tests (HTTP + wiremock JWKS, jwt wrapper) -> `crates/gc-service/tests/auth_tests.rs`, `crates/gc-service/src/auth/jwt.rs:tests`
-- Meeting tests (join, guest, settings, creation, assignment) -> `crates/gc-service/tests/meeting_tests.rs`, `meeting_create_tests.rs`, `meeting_assignment_tests.rs`
+- Meeting + assignment tests -> `crates/gc-service/tests/meeting_tests.rs`, `meeting_create_tests.rs`, `meeting_assignment_tests.rs`, `mc_assignment_rpc_tests.rs`
+- MH selection unit tests -> `crates/gc-service/src/services/mh_selection.rs:tests`
 - Participant & activation tests -> `crates/gc-service/tests/participant_tests.rs`
 - Meeting handlers + routes -> `crates/gc-service/src/handlers/meetings.rs`, `crates/gc-service/src/routes/mod.rs`
 - Metrics + observability -> `crates/gc-service/src/observability/metrics.rs`, `docs/observability/metrics/gc-service.md`
@@ -46,8 +47,7 @@
 
 ## Code Locations: Environment Tests
 - Cluster bootstrap + fixtures → `crates/env-tests/src/`, flows (20-24) → `crates/env-tests/tests/`
-- Cluster connection + port config → `crates/env-tests/src/cluster.rs:ClusterPorts`, `ClusterConnection`
-- URL config + parsing (ADR-0030) → `crates/env-tests/src/cluster.rs:ClusterPorts::from_env()`, `parse_host_port()`
+- Cluster connection + port config (ADR-0030) → `crates/env-tests/src/cluster.rs:ClusterPorts`, `ClusterConnection`, `from_env()`, `parse_host_port()`
 - GC client fixture (join, guest token, mc_assignment) → `crates/env-tests/src/fixtures/gc_client.rs`
 - Auth client fixture → `crates/env-tests/src/fixtures/auth_client.rs`
 - Prometheus client fixture → `crates/env-tests/src/fixtures/metrics.rs`

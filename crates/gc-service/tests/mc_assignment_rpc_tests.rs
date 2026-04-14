@@ -96,7 +96,8 @@ async fn test_assign_meeting_with_mh_success(pool: PgPool) {
 
     let assignment = result.unwrap();
     assert!(!assignment.mc_assignment.mc_id.is_empty());
-    assert!(!assignment.mh_selection.primary.mh_id.is_empty());
+    assert!(!assignment.mh_selection.handlers.is_empty());
+    assert!(!assignment.mh_selection.handlers[0].mh_id.is_empty());
 
     // Verify mock was called once
     assert_eq!(mock_client.call_count(), 1);
@@ -329,9 +330,9 @@ async fn test_assign_meeting_with_mh_mixed_rejection_then_accept(pool: PgPool) {
     );
 }
 
-/// Test MH selection includes backup when available.
+/// Test MH selection includes multiple handlers when available.
 #[sqlx::test(migrations = "../../migrations")]
-async fn test_mh_selection_includes_backup(pool: PgPool) {
+async fn test_mh_selection_includes_multiple_handlers(pool: PgPool) {
     // Set up MCs and multiple MHs
     setup_mcs(&pool, 2, "us-east-1").await;
     setup_mhs(&pool, 3, "us-east-1").await;
@@ -341,7 +342,7 @@ async fn test_mh_selection_includes_backup(pool: PgPool) {
     let result = McAssignmentService::assign_meeting_with_mh(
         &pool,
         mock_client,
-        "meeting-with-backup",
+        "meeting-with-multiple-mh",
         "us-east-1",
         "gc-test",
     )
@@ -350,26 +351,23 @@ async fn test_mh_selection_includes_backup(pool: PgPool) {
     assert!(result.is_ok());
     let assignment = result.unwrap();
 
-    // Should have primary MH
-    assert!(!assignment.mh_selection.primary.mh_id.is_empty());
-
-    // Should have backup MH (since we have multiple MHs)
+    // Should have multiple MH handlers (since we have multiple MHs)
     assert!(
-        assignment.mh_selection.backup.is_some(),
-        "Should have backup MH when multiple MHs available"
+        assignment.mh_selection.handlers.len() >= 2,
+        "Should have multiple MH handlers when multiple MHs available, got {}",
+        assignment.mh_selection.handlers.len()
     );
 
-    // Primary and backup should be different
-    let backup = assignment.mh_selection.backup.unwrap();
+    // Handlers should be different
     assert_ne!(
-        assignment.mh_selection.primary.mh_id, backup.mh_id,
-        "Primary and backup MH should be different"
+        assignment.mh_selection.handlers[0].mh_id, assignment.mh_selection.handlers[1].mh_id,
+        "MH handlers should be different"
     );
 }
 
-/// Test single MH has no backup.
+/// Test single MH results in one handler.
 #[sqlx::test(migrations = "../../migrations")]
-async fn test_mh_selection_single_mh_no_backup(pool: PgPool) {
+async fn test_mh_selection_single_mh_one_handler(pool: PgPool) {
     // Set up MCs and only 1 MH
     setup_mcs(&pool, 2, "us-east-1").await;
     setup_mhs(&pool, 1, "us-east-1").await;
@@ -388,14 +386,13 @@ async fn test_mh_selection_single_mh_no_backup(pool: PgPool) {
     assert!(result.is_ok());
     let assignment = result.unwrap();
 
-    // Should have primary MH
-    assert!(!assignment.mh_selection.primary.mh_id.is_empty());
-
-    // Should not have backup (only one MH available)
-    assert!(
-        assignment.mh_selection.backup.is_none(),
-        "Should not have backup with single MH"
+    // Should have exactly one MH handler
+    assert_eq!(
+        assignment.mh_selection.handlers.len(),
+        1,
+        "Should have exactly one MH handler with single MH"
     );
+    assert!(!assignment.mh_selection.handlers[0].mh_id.is_empty());
 }
 
 /// Test concurrent assignments to the same meeting return the same result.

@@ -24,6 +24,9 @@
 - CSPRNG + role enforcement → `crates/gc-service/src/handlers/meetings.rs`
 - Atomic org limit CTE → `crates/gc-service/src/repositories/meetings.rs:create_meeting_with_limit_check()`
 - Participant tracking (DB CHECK + partial unique) → `crates/gc-service/src/repositories/participants.rs`
+- MH selection (CSPRNG weighted, active/active) → `crates/gc-service/src/services/mh_selection.rs:MhSelection`
+- MH endpoint validation (registration) → `crates/gc-service/src/grpc/mh_service.rs:validate_endpoint()`
+- GC→MC auth (Bearer token, channel pool) → `crates/gc-service/src/services/mc_client.rs:assign_meeting()`
 
 ## Code Locations — MC (JWT, WebTransport, Actors)
 - MC JWT validation + token_type anti-confusion → `crates/mc-service/src/auth/mod.rs:McJwtValidator`
@@ -64,12 +67,9 @@
 ## Infrastructure Secrets & Network Isolation
 - Imperative secret creation → `setup.sh:create_ac_secrets()`, `create_mc_tls_secret()`, `create_mh_secrets()`, `create_mh_tls_secret()`
 - Input validation (cluster name, DT_PORT_MAP, DT_HOST_GATEWAY_IP) → `infra/kind/scripts/setup.sh` (top), `teardown.sh` (top)
-- ConfigMap advertise-address patching (devloop mode) → `infra/kind/scripts/setup.sh:deploy_mc_service()`, `deploy_mh_service()`
-- Single-service rebuild with allowlist → `infra/kind/scripts/setup.sh:deploy_only_service()`
+- ConfigMap advertise-address patching + single-service rebuild → `infra/kind/scripts/setup.sh:deploy_mc_service()`, `deploy_only_service()`
 - Network policies (per-service ingress/egress) → `infra/services/{ac,gc,mc,mh}-service/network-policy.yaml`; MC↔MH gRPC: MC→MH:50053, MH→MC:50052
 - Kind overlay (no secrets) + supporting infra → `infra/kubernetes/overlays/kind/`, `infra/services/{postgres,redis}/`
 
 ## Health, Probes & Integration Seams
-- MC/MH health + K8s probes → `src/observability/health.rs`, `infra/services/{mc,mh}-service/*-deployment.yaml`
-- Auth chain: AC JWKS → common JwtValidator → GC/MC/MH; gRPC: GC→MC→MH auth interceptors
-- Guards → `scripts/guards/simple/no-secrets-in-logs.sh`, `validate-kustomize.sh` | Join tests → `crates/{mc,gc}-service/tests/`
+- MC/MH health + K8s probes → `src/observability/health.rs`; Auth chain: AC JWKS → common JwtValidator → GC/MC/MH; gRPC auth interceptors

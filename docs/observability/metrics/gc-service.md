@@ -318,12 +318,12 @@ All GC service metrics follow ADR-0011 naming conventions with the `gc_` prefix.
 - **Description**: Total MH selection attempts
 - **Labels**:
   - `status`: Selection outcome (success, error)
-  - `has_backup`: Whether backup MH was selected (true, false)
+  - `has_multiple`: Whether multiple MH peers were selected (true, false)
 - **Cardinality**: Low (4 combinations)
 - **Usage**: Track MH selection patterns
 - **Example**:
   ```promql
-  sum(rate(gc_mh_selections_total{has_backup="true"}[5m])) /
+  sum(rate(gc_mh_selections_total{has_multiple="true"}[5m])) /
   sum(rate(gc_mh_selections_total[5m]))
   ```
 

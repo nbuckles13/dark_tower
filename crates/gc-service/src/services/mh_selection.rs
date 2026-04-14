@@ -18,12 +18,14 @@ use std::time::Instant;
 use tracing::instrument;
 
 /// Result of MH selection for a meeting.
+///
+/// Contains one or more MH peers selected by load/AZ.
+/// All handlers are active/active -- there is no primary/backup distinction.
 #[derive(Debug, Clone)]
 pub struct MhSelection {
-    /// Selected primary MH.
-    pub primary: MhAssignmentInfo,
-    /// Optional backup MH (if available).
-    pub backup: Option<MhAssignmentInfo>,
+    /// Selected MH handlers (active/active peers).
+    /// Non-empty; at least one MH is always selected.
+    pub handlers: Vec<MhAssignmentInfo>,
 }
 
 /// MH assignment information.
@@ -43,8 +45,9 @@ pub struct MhSelectionService;
 impl MhSelectionService {
     /// Select MHs for a meeting in a region.
     ///
-    /// Selects a primary MH and optionally a backup MH using weighted random
-    /// selection based on load ratio.
+    /// Selects up to 2 MH peers using weighted random selection based on load
+    /// ratio. All selected handlers are active/active -- there is no
+    /// primary/backup distinction.
     ///
     /// # Arguments
     ///
@@ -53,7 +56,7 @@ impl MhSelectionService {
     ///
     /// # Returns
     ///
-    /// Returns `MhSelection` with primary and optional backup MH.
+    /// Returns `MhSelection` with one or more MH handlers.
     ///
     /// # Errors
     ///
@@ -88,61 +91,58 @@ impl MhSelectionService {
             "Found candidate MHs for selection"
         );
 
-        // Select primary MH using weighted random
-        let primary = weighted_random_select(&candidates).ok_or_else(|| {
+        let mut handlers = Vec::new();
+
+        // Select first MH using weighted random
+        let first = weighted_random_select(&candidates).ok_or_else(|| {
             GcError::ServiceUnavailable("No media handlers available in this region".to_string())
         })?;
 
-        let primary_info = MhAssignmentInfo {
-            mh_id: primary.handler_id.clone(),
-            webtransport_endpoint: primary.webtransport_endpoint.clone(),
-            grpc_endpoint: primary.grpc_endpoint.clone(),
-        };
+        handlers.push(MhAssignmentInfo {
+            mh_id: first.handler_id.clone(),
+            webtransport_endpoint: first.webtransport_endpoint.clone(),
+            grpc_endpoint: first.grpc_endpoint.clone(),
+        });
 
         tracing::debug!(
             target: "gc.service.mh_selection",
-            primary_mh = %primary.handler_id,
-            load_ratio = primary.load_ratio,
-            "Selected primary MH"
+            mh_id = %first.handler_id,
+            load_ratio = first.load_ratio,
+            mh_index = 0,
+            "Selected MH"
         );
 
-        // Try to select backup MH (different from primary)
-        let backup = if candidates.len() > 1 {
+        // Try to select a second MH peer (different from first)
+        if candidates.len() > 1 {
             let remaining: Vec<_> = candidates
                 .iter()
-                .filter(|c| c.handler_id != primary.handler_id)
+                .filter(|c| c.handler_id != first.handler_id)
                 .collect();
 
             if !remaining.is_empty() {
                 // Convert to owned for weighted_random_select
                 let remaining_owned: Vec<MhCandidate> = remaining.into_iter().cloned().collect();
-                weighted_random_select(&remaining_owned).map(|backup| {
+                if let Some(second) = weighted_random_select(&remaining_owned) {
                     tracing::debug!(
                         target: "gc.service.mh_selection",
-                        backup_mh = %backup.handler_id,
-                        load_ratio = backup.load_ratio,
-                        "Selected backup MH"
+                        mh_id = %second.handler_id,
+                        load_ratio = second.load_ratio,
+                        mh_index = 1,
+                        "Selected MH"
                     );
-                    MhAssignmentInfo {
-                        mh_id: backup.handler_id.clone(),
-                        webtransport_endpoint: backup.webtransport_endpoint.clone(),
-                        grpc_endpoint: backup.grpc_endpoint.clone(),
-                    }
-                })
-            } else {
-                None
+                    handlers.push(MhAssignmentInfo {
+                        mh_id: second.handler_id.clone(),
+                        webtransport_endpoint: second.webtransport_endpoint.clone(),
+                        grpc_endpoint: second.grpc_endpoint.clone(),
+                    });
+                }
             }
-        } else {
-            None
-        };
+        }
 
-        let has_backup = backup.is_some();
-        metrics::record_mh_selection("success", has_backup, start.elapsed());
+        let has_multiple = handlers.len() > 1;
+        metrics::record_mh_selection("success", has_multiple, start.elapsed());
 
-        Ok(MhSelection {
-            primary: primary_info,
-            backup,
-        })
+        Ok(MhSelection { handlers })
     }
 }
 
@@ -296,21 +296,23 @@ mod tests {
     #[test]
     fn test_mh_selection_fields() {
         let selection = MhSelection {
-            primary: MhAssignmentInfo {
-                mh_id: "mh-primary".to_string(),
-                webtransport_endpoint: "https://primary:443".to_string(),
-                grpc_endpoint: "https://primary:50051".to_string(),
-            },
-            backup: Some(MhAssignmentInfo {
-                mh_id: "mh-backup".to_string(),
-                webtransport_endpoint: "https://backup:443".to_string(),
-                grpc_endpoint: "https://backup:50051".to_string(),
-            }),
+            handlers: vec![
+                MhAssignmentInfo {
+                    mh_id: "mh-1".to_string(),
+                    webtransport_endpoint: "https://mh1:443".to_string(),
+                    grpc_endpoint: "https://mh1:50051".to_string(),
+                },
+                MhAssignmentInfo {
+                    mh_id: "mh-2".to_string(),
+                    webtransport_endpoint: "https://mh2:443".to_string(),
+                    grpc_endpoint: "https://mh2:50051".to_string(),
+                },
+            ],
         };
 
-        assert_eq!(selection.primary.mh_id, "mh-primary");
-        assert!(selection.backup.is_some());
-        assert_eq!(selection.backup.as_ref().unwrap().mh_id, "mh-backup");
+        assert_eq!(selection.handlers.len(), 2);
+        assert_eq!(selection.handlers[0].mh_id, "mh-1");
+        assert_eq!(selection.handlers[1].mh_id, "mh-2");
     }
 
     #[test]
