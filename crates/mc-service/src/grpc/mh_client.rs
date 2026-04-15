@@ -20,6 +20,7 @@ use common::secret::ExposeSecret;
 use common::token_manager::TokenReceiver;
 use proto_gen::internal::media_handler_service_client::MediaHandlerServiceClient;
 use proto_gen::internal::RegisterMeetingRequest;
+use std::pin::Pin;
 use std::time::{Duration, Instant};
 use tonic::transport::Endpoint;
 use tonic::Request;
@@ -30,6 +31,22 @@ const MH_RPC_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Default connect timeout for MH.
 const MH_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Trait for MC->MH meeting registration.
+///
+/// Abstraction over the gRPC call used to notify MH instances about
+/// new meeting assignments. Production code uses `MhClient`;
+/// tests can inject a mock to verify call arguments and simulate failures.
+pub trait MhRegistrationClient: Send + Sync {
+    /// Register a meeting with an MH instance.
+    fn register_meeting<'a>(
+        &'a self,
+        mh_grpc_endpoint: &'a str,
+        meeting_id: &'a str,
+        mc_id: &'a str,
+        mc_grpc_endpoint: &'a str,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), McError>> + Send + 'a>>;
+}
 
 /// MH client for RegisterMeeting RPCs.
 ///
@@ -168,6 +185,18 @@ impl MhClient {
                 })?,
         );
         Ok(grpc_request)
+    }
+}
+
+impl MhRegistrationClient for MhClient {
+    fn register_meeting<'a>(
+        &'a self,
+        mh_grpc_endpoint: &'a str,
+        meeting_id: &'a str,
+        mc_id: &'a str,
+        mc_grpc_endpoint: &'a str,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), McError>> + Send + 'a>> {
+        Box::pin(self.register_meeting(mh_grpc_endpoint, meeting_id, mc_id, mc_grpc_endpoint))
     }
 }
 

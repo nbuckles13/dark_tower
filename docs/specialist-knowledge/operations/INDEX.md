@@ -17,8 +17,10 @@
 - Devloop wrapper → `infra/devloop/devloop.sh`, container image → `infra/devloop/Dockerfile`
 - Cluster networking debate → `docs/debates/2026-04-09-devloop-cluster-networking/debate.md`; sidecar (superseded) → `docs/debates/2026-04-05-devloop-cluster-sidecar.md`
 - Helper commands (setup, deploy, rebuild, teardown, status) → `crates/devloop-helper/src/commands.rs`; protocol → `crates/devloop-helper/src/protocol.rs`
-- Port-map.env generation → `crates/devloop-helper/src/commands.rs:write_port_map_shell()`; DT_HOST_GATEWAY_IP → `cmd_setup()`, `cmd_deploy()`
-- Port registry → `~/.cache/devloop/port-registry.json`; per-devloop state → `/tmp/devloop-{slug}/` (PID, socket, auth token, ports.json)
+- Port-map.env generation → `crates/devloop-helper/src/commands.rs:write_port_map_shell()`
+- DT_HOST_GATEWAY_IP propagation → `crates/devloop-helper/src/commands.rs:cmd_setup()`, `cmd_deploy()`
+- Port registry → `~/.cache/devloop/port-registry.json` (global allocation state)
+- Per-devloop runtime state → `/tmp/devloop-{slug}/` (PID, socket, auth token, ports.json, setup.pid, eager-setup.log)
 - Container-side client → `infra/devloop/dev-cluster` (setup, rebuild, deploy, teardown, status)
 - Health check + eager setup → `infra/devloop/devloop.sh` (Infrastructure health check section)
 - Env-test URL config → `crates/env-tests/src/cluster.rs:ClusterPorts::from_env()`; Layer 8 → `.claude/skills/devloop/SKILL.md`
@@ -42,29 +44,26 @@
 - Participant tracking + meetings → `crates/gc-service/src/repositories/participants.rs`, `meetings.rs`
 
 ## Auth & JWT
-- gRPC auth scopes (`service.write.{target}` convention, two-layer auth, deployment order) → ADR-0003; Debate → `docs/debates/2026-04-16-grpc-auth-scopes/debate.md`
-- Scope alignment (three sources must match): `setup.sh:seed_test_data()` seeds, `models/mod.rs:default_scopes()`, auth interceptor `REQUIRED_SCOPE` constants
-- Scope contract tests (regression prevention) → `crates/ac-service/src/models/mod.rs` (test_scope_contract_* tests)
-- Common JWKS + JWT + ServiceClaims → `crates/common/src/jwt.rs`; GC↔AC token types → `meeting_token.rs`
-- AC rate limits → `crates/ac-service/src/config.rs:parse_rate_limit_i64()`
-- Auth layers (all two-layer per ADR-0003) → MC `McAuthLayer`, MH `MhAuthLayer`, GC `GrpcAuthLayer`; dead `McAuthInterceptor`/`MhAuthInterceptor`/`GrpcAuthInterceptor` removed
+- Common JWKS + JWT → `crates/common/src/jwt.rs`
+- Shared GC↔AC token types → `crates/common/src/meeting_token.rs`
+- AC rate limits → `crates/ac-service/src/config.rs:parse_rate_limit_i64()`; Service auth → ADR-0003
 
 ## Observability
 - Kustomize + Grafana → `infra/kubernetes/observability/`, `infra/grafana/dashboards/`; Alerts → `docs/observability/alerts.md`
 - Per-service metrics → `crates/gc-service/src/observability/metrics.rs`, `crates/mc-service/src/observability/metrics.rs`, `crates/mh-service/src/observability/metrics.rs`; Prometheus → `infra/docker/prometheus/prometheus.yml`
-- Layer 2 caller_type_rejected metric → MC `mc_caller_type_rejected_total`, MH `mh_caller_type_rejected_total`, GC `gc_caller_type_rejected_total` (`{grpc_service, expected_type, actual_type}`); Grafana panels in `mc-overview.json`, `mh-overview.json`, `gc-overview.json`
-- JWT failure_reason label → `mc_jwt_validations_total{failure_reason}`, `mh_jwt_validations_total{failure_reason}`, `gc_jwt_validations_total{failure_reason}`; classifier → `classify_jwt_error()` in each service's auth layer
 
 ## MH Service
 - MH startup + config + health → `crates/mh-service/src/main.rs`, `config.rs`, `observability/health.rs`
-- MH gRPC (service, GC client, MC client) → `crates/mh-service/src/grpc/mh_service.rs`, `gc_client.rs`, `mc_client.rs`; two-layer auth → `auth_interceptor.rs:MhAuthLayer` (claims injected into extensions)
-- MH→MC notifications (fire-and-forget) → `connection.rs:spawn_notify_connected()`; tests → `tests/mc_client_integration.rs`
+- MH gRPC (service, GC client, MC client, JWKS auth) → `crates/mh-service/src/grpc/mh_service.rs`, `gc_client.rs`, `mc_client.rs`, `auth_interceptor.rs`
+- MH→MC notifications (fire-and-forget) → `crates/mh-service/src/webtransport/connection.rs:spawn_notify_connected()`; tests → `tests/mc_client_integration.rs`
 - MH WebTransport + session mgmt → `crates/mh-service/src/webtransport/server.rs`, `connection.rs`, `session/mod.rs`
 
 ## MC Service
 - MC startup + gRPC server wiring → `crates/mc-service/src/main.rs`; config → `crates/mc-service/src/config.rs`
 - MC WebTransport → `crates/mc-service/src/webtransport/server.rs`, `connection.rs`
-- MC gRPC clients → `gc_client.rs`, `mh_client.rs`; MC gRPC service (GC→MC) → `mc_service.rs`; MediaCoordinationService (MH→MC :50052) → `media_coordination.rs`; two-layer auth → `McAuthLayer`
+- MC GC client → `crates/mc-service/src/grpc/gc_client.rs`; MH client (MhRegistrationClient trait) → `crates/mc-service/src/grpc/mh_client.rs`
+- Async RegisterMeeting trigger (first-participant, retry+backoff, cancel-aware) → `crates/mc-service/src/webtransport/connection.rs:register_meeting_with_handlers()`
+- MC gRPC services (GC→MC assignments, MH→MC MediaCoordination) → `crates/mc-service/src/grpc/mc_service.rs`, `media_coordination.rs`; JWKS auth → `auth_interceptor.rs:McAuthLayer`
 - MhConnectionRegistry (cleanup wired in controller.rs `remove_meeting()`) → `crates/mc-service/src/mh_connection_registry.rs`
 - Redis (fenced writes, MhAssignmentData, MhAssignmentStore trait) → `crates/mc-service/src/redis/client.rs`
 - Actors → `crates/mc-service/src/actors/controller.rs`, `meeting.rs`, `participant.rs`
@@ -72,4 +71,5 @@
 
 ## GC Service + Tests
 - GC routes + handlers → `crates/gc-service/src/routes/mod.rs`, `handlers/meetings.rs`
-- Join tests → MC `crates/mc-service/tests/join_tests.rs`, GC `crates/gc-service/tests/meeting_tests.rs`; Env-tests → `crates/env-tests/`
+- MC join tests → `crates/mc-service/tests/join_tests.rs`; TestKeypair → `crates/mc-test-utils/src/jwt_test.rs`
+- GC join tests → `crates/gc-service/tests/meeting_tests.rs`; Env-tests → `crates/env-tests/`

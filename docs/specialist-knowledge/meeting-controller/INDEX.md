@@ -3,30 +3,29 @@
 ## Architecture & Design
 - MC architecture, actor model, session binding, capacity → ADR-0023
 - User auth, meeting access, join flow → ADR-0020
-- gRPC auth scopes, two-layer auth (JWKS + service_type routing) → ADR-0003
 - Observability pattern (metrics crate facade) → ADR-0011
 
 ## Code Locations
 - Service entry point → `crates/mc-service/src/main.rs`
 - Config (SecretString, env loading, ac_jwks_url, TLS paths, advertise addresses) → `crates/mc-service/src/config.rs`
 - Error types (McError hierarchy, From<JwtError>) → `crates/mc-service/src/errors.rs`
-- Auth: McJwtValidator (thin wrapper, target: `mc.auth`) → `crates/mc-service/src/auth/mod.rs`
-- Auth: validate_meeting_token (token_type guard) → `crates/mc-service/src/auth/mod.rs:validate_meeting_token()`
-- Auth: validate_guest_token (field enforcement) → `crates/mc-service/src/auth/mod.rs:validate_guest_token()`
+- Auth: McJwtValidator, validate_meeting_token, validate_guest_token → `crates/mc-service/src/auth/mod.rs`
 - Actor: controller (root, capacity) → `crates/mc-service/src/actors/controller.rs`
 - Actor: meeting (participants, grace period) → `crates/mc-service/src/actors/meeting.rs`
 - Actor: messages (inter-actor types, JoinConnection, JoinResult) → `crates/mc-service/src/actors/messages.rs`
 - Actor: participant (per-participant, disconnect notify) → `crates/mc-service/src/actors/participant.rs`
 - WebTransport: server (accept loop, TLS, capacity) → `crates/mc-service/src/webtransport/server.rs`
 - WebTransport: connection (join flow, bridge loop, MediaConnectionFailed R-20) → `crates/mc-service/src/webtransport/connection.rs`
+- WebTransport: async RegisterMeeting trigger (R-12, first participant) → `crates/mc-service/src/webtransport/connection.rs:register_meeting_with_handlers()`
 - WebTransport: handler (encode_participant_update) → `crates/mc-service/src/webtransport/handler.rs`
 - Actor: session binding (HMAC, HKDF) → `crates/mc-service/src/actors/session.rs`
 - Actor: metrics (dual system) → `crates/mc-service/src/actors/metrics.rs`
 - gRPC: GC client (registration, heartbeats, advertise address usage) → `crates/mc-service/src/grpc/gc_client.rs`
 - gRPC: MC service (AssignMeetingWithMh) → `crates/mc-service/src/grpc/mc_service.rs`
 - gRPC: MH client (RegisterMeeting, per-call Channel) → `crates/mc-service/src/grpc/mh_client.rs`
-- gRPC: auth layer (two-layer: JWKS+scope L1, service_type routing L2, claims injection, ADR-0003) → `crates/mc-service/src/grpc/auth_interceptor.rs:McAuthLayer`
-- ADR-0003 scope data: `default_scopes()` → `crates/ac-service/src/models/mod.rs:ServiceType`; seed SQL → `infra/kind/scripts/setup.sh`; contract tests → `test_scope_contract_*`
+- gRPC: MhRegistrationClient trait (testable MH registration) → `crates/mc-service/src/grpc/mh_client.rs:MhRegistrationClient`
+- gRPC: auth interceptor (Bearer validation) → `crates/mc-service/src/grpc/auth_interceptor.rs`
+- gRPC: auth layer (async JWKS + scope check, R-22) → `crates/mc-service/src/grpc/auth_interceptor.rs:McAuthLayer`
 - gRPC: media coordination (MH notifications, R-15) → `crates/mc-service/src/grpc/media_coordination.rs`
 - MH connection registry (participant→MH state, R-18) → `crates/mc-service/src/mh_connection_registry.rs`
 - Redis: fenced client (Lua scripts) → `crates/mc-service/src/redis/client.rs`
@@ -38,7 +37,6 @@
 - Join flow metrics (R-13): record_webtransport_connection, record_jwt_validation, record_session_join → `crates/mc-service/src/observability/metrics.rs`
 - MH communication metrics: record_register_meeting → `crates/mc-service/src/observability/metrics.rs`
 - MH coordination metrics (R-28): record_mh_notification, record_media_connection_failed → `crates/mc-service/src/observability/metrics.rs`
-- Layer 2 auth metric: record_caller_type_rejected (mc_caller_type_rejected_total) → `crates/mc-service/src/observability/metrics.rs`
 - MC metrics catalog → `docs/observability/metrics/mc-service.md`
 - System info (sysinfo) → `crates/mc-service/src/system_info.rs`
 
@@ -65,8 +63,9 @@
 - Env-tests MC-GC integration → `crates/env-tests/tests/22_mc_gc_integration.rs`
 
 ## Advertise Address Config
-- `MC_GRPC_ADVERTISE_ADDRESS` / `MC_WEBTRANSPORT_ADVERTISE_ADDRESS` → `crates/mc-service/src/config.rs`
-- Used in GC registration → `crates/mc-service/src/grpc/gc_client.rs`; K8s: `$(POD_IP)` → `deployment.yaml`
+- Config fields: `grpc_advertise_address`, `webtransport_advertise_address` → `crates/mc-service/src/config.rs`
+- Used in GC registration and MH RegisterMeeting → `crates/mc-service/src/grpc/gc_client.rs`, `connection.rs`
+- K8s: derived from downward API `$(POD_IP)` → `infra/services/mc-service/deployment.yaml`
 
 ## Infrastructure
 - K8s deployment (incl. POD_IP downward API, advertise addresses) → `infra/services/mc-service/deployment.yaml`

@@ -640,7 +640,7 @@ Phase 6 (after dashboards):
 | 5 | MH: RegisterMeeting handler + SessionManager | `docs/devloop-outputs/2026-04-14-mh-register-meeting/` | `e6b02b1` | Completed |
 | 6 | MH: MC notification client | `docs/devloop-outputs/2026-04-15-mh-mc-client-notifications/` | `001ede8` | Completed |
 | 7 | MC: MediaCoordinationService + MhConnectionRegistry + MediaConnectionFailed handler | `docs/devloop-outputs/2026-04-14-mc-media-coordination-service/` | `938f4cb` | Completed |
-| 8 | MC: async RegisterMeeting trigger | | | Pending |
+| 8 | MC: async RegisterMeeting trigger | `docs/devloop-outputs/2026-04-15-mc-async-register-meeting/` | `a45f746` | Completed |
 | 9 | Infra: network policies + MH AC_JWKS_URL | docs/devloop-outputs/2026-04-13-mh-mc-network-policy/ | 93aa29b | Completed |
 | 10 | MH: observability metrics | | | Pending |
 | 11 | MC: MH coordination metrics | | | Pending |

@@ -14,6 +14,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -23,6 +24,7 @@ use common::secret::SecretBox;
 use mc_service::actors::{ActorMetrics, ControllerMetrics, MeetingControllerActorHandle};
 use mc_service::auth::McJwtValidator;
 use mc_service::errors::McError;
+use mc_service::grpc::MhRegistrationClient;
 use mc_service::mh_connection_registry::MhConnectionRegistry;
 use mc_service::redis::{MhAssignmentData, MhAssignmentStore, MhEndpointInfo};
 use mc_service::webtransport::connection;
@@ -76,6 +78,57 @@ impl MhAssignmentStore for MockMhAssignmentStore {
     }
 }
 
+/// Recorded call to MockMhRegistrationClient::register_meeting().
+#[derive(Debug, Clone)]
+struct RegisterMeetingCall {
+    mh_grpc_endpoint: String,
+    meeting_id: String,
+    mc_id: String,
+    mc_grpc_endpoint: String,
+}
+
+/// In-memory mock for MhRegistrationClient — records calls for verification.
+struct MockMhRegistrationClient {
+    calls: std::sync::Mutex<Vec<RegisterMeetingCall>>,
+    /// If set, register_meeting() returns this result.
+    result: Result<(), McError>,
+}
+
+impl MockMhRegistrationClient {
+    fn new() -> Self {
+        Self {
+            calls: std::sync::Mutex::new(Vec::new()),
+            result: Ok(()),
+        }
+    }
+
+    fn calls(&self) -> Vec<RegisterMeetingCall> {
+        self.calls.lock().unwrap().clone()
+    }
+}
+
+impl MhRegistrationClient for MockMhRegistrationClient {
+    fn register_meeting<'a>(
+        &'a self,
+        mh_grpc_endpoint: &'a str,
+        meeting_id: &'a str,
+        mc_id: &'a str,
+        mc_grpc_endpoint: &'a str,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), McError>> + Send + 'a>> {
+        self.calls.lock().unwrap().push(RegisterMeetingCall {
+            mh_grpc_endpoint: mh_grpc_endpoint.to_string(),
+            meeting_id: meeting_id.to_string(),
+            mc_id: mc_id.to_string(),
+            mc_grpc_endpoint: mc_grpc_endpoint.to_string(),
+        });
+        let result = match &self.result {
+            Ok(()) => Ok(()),
+            Err(e) => Err(McError::Grpc(e.to_string())),
+        };
+        Box::pin(async move { result })
+    }
+}
+
 /// A test WebTransport server with all dependencies wired up.
 struct TestServer {
     /// The bound port of the WebTransport endpoint.
@@ -84,6 +137,8 @@ struct TestServer {
     controller_handle: Arc<MeetingControllerActorHandle>,
     /// In-memory MH assignment store (no Redis).
     mh_store: Arc<MockMhAssignmentStore>,
+    /// Mock MH registration client for verifying RegisterMeeting calls.
+    mh_reg_client: Arc<MockMhRegistrationClient>,
     /// JWT validator backed by wiremock JWKS (kept alive for accept loop).
     _jwt_validator: Arc<McJwtValidator>,
     /// Cancellation token for shutting down the accept loop.
@@ -117,6 +172,7 @@ impl TestServer {
         ));
 
         let mh_store = Arc::new(MockMhAssignmentStore::new());
+        let mh_reg_client = Arc::new(MockMhRegistrationClient::new());
 
         let cancel_token = CancellationToken::new();
 
@@ -136,15 +192,17 @@ impl TestServer {
         let ctrl = Arc::clone(&controller_handle);
         let jwt = Arc::clone(&jwt_validator);
         let store = Arc::clone(&mh_store);
+        let reg = Arc::clone(&mh_reg_client);
         let ct = cancel_token.clone();
         tokio::spawn(async move {
-            Self::accept_loop(endpoint, ctrl, jwt, store, ct).await;
+            Self::accept_loop(endpoint, ctrl, jwt, store, reg, ct).await;
         });
 
         Self {
             port,
             controller_handle,
             mh_store,
+            mh_reg_client,
             _jwt_validator: jwt_validator,
             cancel_token,
             _mock_server: mock_server,
@@ -158,6 +216,7 @@ impl TestServer {
         controller_handle: Arc<MeetingControllerActorHandle>,
         jwt_validator: Arc<McJwtValidator>,
         mh_store: Arc<MockMhAssignmentStore>,
+        mh_reg_client: Arc<MockMhRegistrationClient>,
         cancel_token: CancellationToken,
     ) {
         loop {
@@ -167,9 +226,19 @@ impl TestServer {
                     let ctrl = Arc::clone(&controller_handle);
                     let jwt = Arc::clone(&jwt_validator);
                     let store = Arc::clone(&mh_store) as Arc<dyn MhAssignmentStore>;
+                    let reg = Arc::clone(&mh_reg_client) as Arc<dyn MhRegistrationClient>;
                     let ct = cancel_token.child_token();
                     tokio::spawn(async move {
-                        let _ = connection::handle_connection(incoming, ctrl, jwt, store, ct).await;
+                        let _ = connection::handle_connection(
+                            incoming,
+                            ctrl,
+                            jwt,
+                            store,
+                            reg,
+                            "mc-test".to_string(),
+                            "http://mc-test:50052".to_string(),
+                            ct,
+                        ).await;
                     });
                 }
             }
@@ -869,4 +938,95 @@ async fn test_join_participant_name_too_long_returns_error() {
 
     let (code, _message) = extract_error(&response);
     assert_eq!(code, signaling::ErrorCode::InvalidRequest as i32);
+}
+
+// ============================================================================
+// T12: First Participant Triggers RegisterMeeting
+// ============================================================================
+
+#[tokio::test]
+async fn test_first_participant_triggers_register_meeting() {
+    let server = TestServer::start().await;
+    server.create_meeting("meeting-reg").await;
+
+    let claims = make_meeting_claims("meeting-reg");
+    let token = server.sign_token(&claims);
+
+    let response = join_and_read_response(&server.url(), "meeting-reg", &token, "Alice").await;
+
+    // Verify join succeeded
+    assert!(
+        matches!(
+            &response.message,
+            Some(server_message::Message::JoinResponse(_))
+        ),
+        "Expected JoinResponse"
+    );
+
+    // Give the spawned RegisterMeeting task time to execute
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let calls = server.mh_reg_client.calls();
+    assert_eq!(
+        calls.len(),
+        1,
+        "First participant should trigger exactly 1 RegisterMeeting call (1 MH handler)"
+    );
+    assert_eq!(calls[0].meeting_id, "meeting-reg");
+    assert_eq!(calls[0].mc_id, "mc-test");
+    assert_eq!(calls[0].mc_grpc_endpoint, "http://mc-test:50052");
+    assert_eq!(calls[0].mh_grpc_endpoint, "http://mh-test-1:50053");
+}
+
+// ============================================================================
+// T13: Second Participant Does NOT Trigger RegisterMeeting
+// ============================================================================
+
+#[tokio::test]
+async fn test_second_participant_does_not_trigger_register_meeting() {
+    let server = TestServer::start().await;
+    server.create_meeting("meeting-noreg").await;
+
+    // First participant joins
+    let claims1 = make_meeting_claims("meeting-noreg");
+    let token1 = server.sign_token(&claims1);
+    let response1 = join_and_read_response(&server.url(), "meeting-noreg", &token1, "Alice").await;
+    assert!(
+        matches!(
+            &response1.message,
+            Some(server_message::Message::JoinResponse(_))
+        ),
+        "Expected JoinResponse for first client"
+    );
+
+    // Give spawned task time to execute
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let calls_after_first = server.mh_reg_client.calls().len();
+    assert_eq!(
+        calls_after_first, 1,
+        "First participant should trigger RegisterMeeting"
+    );
+
+    // Second participant joins
+    let mut claims2 = make_meeting_claims("meeting-noreg");
+    claims2.sub = "user-002".to_string();
+    let token2 = server.sign_token(&claims2);
+    let response2 = join_and_read_response(&server.url(), "meeting-noreg", &token2, "Bob").await;
+    assert!(
+        matches!(
+            &response2.message,
+            Some(server_message::Message::JoinResponse(_))
+        ),
+        "Expected JoinResponse for second client"
+    );
+
+    // Give time for any potential (unwanted) spawned task
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let calls_after_second = server.mh_reg_client.calls().len();
+    assert_eq!(
+        calls_after_second, 1,
+        "Second participant should NOT trigger additional RegisterMeeting"
+    );
 }

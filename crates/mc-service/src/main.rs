@@ -48,7 +48,10 @@ use mc_service::actors::{ActorMetrics, ControllerMetrics, MeetingControllerActor
 use mc_service::auth::McJwtValidator;
 use mc_service::config::Config;
 use mc_service::errors::McError;
-use mc_service::grpc::{GcClient, McAssignmentService, McAuthLayer, McMediaCoordinationService};
+use mc_service::grpc::{
+    GcClient, McAssignmentService, McAuthLayer, McMediaCoordinationService, MhClient,
+    MhRegistrationClient,
+};
 use mc_service::mh_connection_registry::MhConnectionRegistry;
 use mc_service::observability::{health_router, HealthState};
 use mc_service::redis::FencedRedisClient;
@@ -355,6 +358,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Meeting Controller Phase 6c: GC integration complete");
 
+    // Create MH registration client for async RegisterMeeting RPCs (R-12)
+    let mh_client: Arc<dyn MhRegistrationClient> = Arc::new(MhClient::new(token_rx.clone()));
+
     // Start WebTransport server (R-5: HTTP/3 over QUIC with TLS 1.3 on port 4433)
     let wt_server = WebTransportServer::new(
         config.webtransport_bind_address.clone(),
@@ -363,6 +369,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::clone(&controller_handle),
         jwt_validator,
         Arc::clone(&redis_client) as Arc<dyn mc_service::redis::MhAssignmentStore>,
+        mh_client,
+        config.mc_id.clone(),
+        config.grpc_advertise_address.clone(),
         config.max_participants as usize,
         shutdown_token.child_token(),
     );

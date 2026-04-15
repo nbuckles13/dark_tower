@@ -11,6 +11,7 @@
 
 use crate::actors::MeetingControllerActorHandle;
 use crate::auth::McJwtValidator;
+use crate::grpc::MhRegistrationClient;
 use crate::observability::metrics;
 use crate::redis::MhAssignmentStore;
 
@@ -37,6 +38,12 @@ pub struct WebTransportServer {
     jwt_validator: Arc<McJwtValidator>,
     /// Redis client for reading MH assignment data during join.
     redis_client: Arc<dyn MhAssignmentStore>,
+    /// MH registration client for async RegisterMeeting RPCs.
+    mh_client: Arc<dyn MhRegistrationClient>,
+    /// This MC's identifier.
+    mc_id: String,
+    /// This MC's gRPC advertise address (for MH->MC callbacks).
+    mc_grpc_endpoint: String,
     /// Maximum concurrent connections (bounds resource exhaustion).
     max_connections: usize,
     /// Active connection count.
@@ -59,6 +66,9 @@ impl WebTransportServer {
         controller_handle: Arc<MeetingControllerActorHandle>,
         jwt_validator: Arc<McJwtValidator>,
         redis_client: Arc<dyn MhAssignmentStore>,
+        mh_client: Arc<dyn MhRegistrationClient>,
+        mc_id: String,
+        mc_grpc_endpoint: String,
         max_connections: usize,
         cancel_token: CancellationToken,
     ) -> Self {
@@ -69,6 +79,9 @@ impl WebTransportServer {
             controller_handle,
             jwt_validator,
             redis_client,
+            mh_client,
+            mc_id,
+            mc_grpc_endpoint,
             max_connections,
             active_connections: Arc::new(AtomicUsize::new(0)),
             cancel_token,
@@ -172,6 +185,9 @@ impl WebTransportServer {
                     let controller_handle = Arc::clone(&self.controller_handle);
                     let jwt_validator = Arc::clone(&self.jwt_validator);
                     let redis_client = Arc::clone(&self.redis_client);
+                    let mh_client = Arc::clone(&self.mh_client);
+                    let mc_id = self.mc_id.clone();
+                    let mc_grpc_endpoint = self.mc_grpc_endpoint.clone();
                     let connection_token = self.cancel_token.child_token();
 
                     tokio::spawn(async move {
@@ -180,6 +196,9 @@ impl WebTransportServer {
                             controller_handle,
                             jwt_validator,
                             redis_client,
+                            mh_client,
+                            mc_id,
+                            mc_grpc_endpoint,
                             connection_token,
                         )
                         .await;
