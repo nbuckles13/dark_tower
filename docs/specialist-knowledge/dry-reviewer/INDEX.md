@@ -5,70 +5,71 @@
 - Fix-or-defer review model -> ADR-0024 (`docs/decisions/adr-0024-agent-teams-workflow.md`)
 
 ## JWT Validation (Common + Thin Wrappers)
-- Common JWT code -> `crates/common/src/jwt.rs` | Token types -> `crates/common/src/meeting_token.rs`
-- GC thin wrapper -> `crates/gc-service/src/auth/jwt.rs` | MC -> `crates/mc-service/src/auth/mod.rs`
-- MH JWKS config -> `infra/services/mh-service/configmap.yaml:AC_JWKS_URL`
+- Common JWT code (all shared logic) -> `crates/common/src/jwt.rs`
+- Internal token request types (GC->AC contract) -> `crates/common/src/meeting_token.rs`
+- GC thin wrapper -> `crates/gc-service/src/auth/jwt.rs` (ServiceClaims, UserClaims)
+- MC thin wrapper -> `crates/mc-service/src/auth/mod.rs` (MeetingTokenClaims, GuestTokenClaims)
+- MH JWKS config -> `infra/services/mh-service/configmap.yaml:AC_JWKS_URL` (shared configmap, mirrors MC pattern in `mc-service-config`)
 
 ## Per-Service Observability (Metrics & Dashboards)
 - AC/GC/MC/MH metrics -> `crates/*/src/observability/metrics.rs` (per-service, not duplication)
-- Alert rules -> `infra/docker/prometheus/rules/{mc,gc}-alerts.yaml` | Dashboards -> `infra/grafana/dashboards/` | ADR-0029
+- Alert rules -> `infra/docker/prometheus/rules/{mc,gc}-alerts.yaml`; dashboards -> ADR-0029, `infra/grafana/dashboards/`
 
 ## Integration Test Coverage
-- MC join flow (11 tests) -> `crates/mc-service/tests/join_tests.rs`
+- MC join flow (13 tests, incl T12/T13 RegisterMeeting) -> `crates/mc-service/tests/join_tests.rs`
 - GC join/guest/settings -> `crates/gc-service/tests/meeting_tests.rs`
 - MH GC integration -> `crates/mh-service/tests/gc_integration.rs`
-- MH MC notification integration -> `crates/mh-service/tests/mc_client_integration.rs`
 - Shared fixtures -> `crates/mc-test-utils/src/jwt_test.rs`, `crates/gc-test-utils/src/server_harness.rs`
 
 ## Per-Service Config Parsing
-- AC/GC/MC/MH config -> `crates/*/src/config.rs:Config::from_vars()` (per-service, not duplication)
-- Advertise addresses (MC + MH) -> per-instance ConfigMaps; devloop patches via `setup.sh` DT_HOST_GATEWAY_IP guard
-- StatefulSet ordinal parsing -> `crates/common/src/config.rs:parse_statefulset_ordinal()` (shared)
+- AC/GC/MC/MH config -> `crates/*/src/config.rs:Config::from_vars()` (per-service); ordinal parsing -> `crates/common/src/config.rs:parse_statefulset_ordinal()`
 - Extraction candidate: `generate_instance_id(prefix)` -> 4-line pattern in GC + MC + MH config
 
 ## gRPC Auth (Cross-Service)
-- GC auth -> `crates/gc-service/src/grpc/auth_layer.rs:GrpcAuthLayer` (JWKS + scope `service.write.gc` + Layer 2 service_type routing, ADR-0003); `GrpcAuthInterceptor` removed
-- MC auth -> `crates/mc-service/src/grpc/auth_interceptor.rs:McAuthLayer` (JWKS + scope + Layer 2 service_type routing, ADR-0003); `McAuthInterceptor` removed
-- MH auth -> `crates/mh-service/src/grpc/auth_interceptor.rs:MhAuthLayer` (JWKS + scope + Layer 2 service_type routing, ADR-0003); `MhAuthInterceptor` removed
+- MC auth layer (async JWKS, R-22) -> `crates/mc-service/src/grpc/auth_interceptor.rs:McAuthLayer` (applied in main.rs)
+- MC auth interceptor (legacy structural) -> same file `:McAuthInterceptor` (dead in production)
+- MH auth layer (async JWKS) -> `crates/mh-service/src/grpc/auth_interceptor.rs:MhAuthLayer`
+- MH auth interceptor (legacy structural) -> same file `:MhAuthInterceptor` (dead in production)
 - Shared constant -> `common::jwt::MAX_JWT_SIZE_BYTES`
-- GC/MC/MH auth layers now structurally identical 5-step chain (structural, JWKS, scope, service_type routing, claims injection); all three have `classify_jwt_error()` + `failure_reason` metrics. Extraction tracked in `docs/TODO.md` line 28; blocker is `Claims` vs `ServiceClaims` unification (line 15).
-- Layer 2 metrics -> `gc_caller_type_rejected_total` | `mc_caller_type_rejected_total` | `mh_caller_type_rejected_total` (same labels: `grpc_service, expected_type, actual_type`)
+- McAuthLayer/MhAuthLayer are near-identical tower Layer/Service patterns (extraction candidate in TODO.md)
 
-## Scope Alignment (ADR-0003)
-- Scope convention: `service.write.{target}` for gRPC; `internal:meeting-token` for AC HTTP
-- AC `default_scopes()` -> `crates/ac-service/src/models/mod.rs:ServiceType::default_scopes` (authoritative)
-- Seed SQL -> `infra/kind/scripts/setup.sh:seed_test_data` (must match `default_scopes()`)
-- Scope contract tests -> `crates/ac-service/src/models/mod.rs` (5 tests: GC->MC, MH->MC, MC->MH, MC->GC, MH->GC)
-
-## MC gRPC Services (GC→MC + MH→MC)
+## MC gRPC Services (GC→MC + MH→MC + MC→MH)
 - MC assignment service (GC→MC) -> `crates/mc-service/src/grpc/mc_service.rs:McAssignmentService`
 - MC media coordination (MH→MC, R-15) -> `crates/mc-service/src/grpc/media_coordination.rs:McMediaCoordinationService`
 - MH connection registry -> `crates/mc-service/src/mh_connection_registry.rs:MhConnectionRegistry`
 - MAX_ID_LENGTH constant -> `mh_connection_registry.rs` (single source, imported by media_coordination.rs)
+- MhRegistrationClient trait (testability seam) -> `crates/mc-service/src/grpc/mh_client.rs:MhRegistrationClient`
+- Async RegisterMeeting trigger (R-12) -> `crates/mc-service/src/webtransport/connection.rs:register_meeting_with_handlers()`
 
 ## gRPC Clients (Cross-Service)
 - MC GcClient -> `crates/mc-service/src/grpc/gc_client.rs:GcClient` (bounded retries, fast/comprehensive heartbeats)
 - MC MhClient -> `crates/mc-service/src/grpc/mh_client.rs:MhClient` (per-call channels, no retries)
 - MH GcClient -> `crates/mh-service/src/grpc/gc_client.rs:GcClient` (unbounded retries, load reports)
-- MH McClient -> `crates/mh-service/src/grpc/mc_client.rs:McClient` (per-call channels, 3-attempt retry, best-effort)
 - Shared patterns: channel creation, `add_auth`, backoff constants (acceptable structural similarity)
-- Extraction candidate: `add_auth` (~10 lines identical, 4 call sites: MC GcClient, MC MhClient, MH GcClient, MH McClient) -> extract crate-local in each crate's `grpc/mod.rs`; `common` when third crate needs it
+- Extraction candidate: `add_auth` (~10 lines identical, 3 call sites) -> see TODO.md
 - MH gRPC stub service -> `crates/mh-service/src/grpc/mh_service.rs:MhMediaService`
 
-## Redis, Health & Infrastructure
-- Redis: MhAssignmentStore trait + FencedRedisClient -> `crates/mc-service/src/redis/client.rs` (testability seam for join flow)
-- Health: MC/MH `health_router()` structurally identical (duplication) | GC -> `routes/mod.rs:64-65`
-- K8s: `infra/services/{ac,gc,mc,mh}-service/`; Dockerfiles -> `infra/docker/`; Kind -> `infra/kind/`
+## Redis Abstractions (MC)
+- MhAssignmentStore trait -> `crates/mc-service/src/redis/client.rs:MhAssignmentStore` (testability seam for join flow)
+- FencedRedisClient -> `crates/mc-service/src/redis/client.rs:FencedRedisClient` (fenced writes, implements MhAssignmentStore)
+
+## Health Endpoints (Cross-Service Consistency)
+- MC health -> `crates/mc-service/src/observability/health.rs:health_router()` | MH -> `crates/mh-service/src/observability/health.rs` (duplicated, see TODO.md)
+- GC health -> `crates/gc-service/src/routes/mod.rs:64-65`
+
+## Per-Service Infrastructure (K8s, Docker, Kind)
+- Kustomize bases -> `infra/services/{ac,gc,mc,mh}-service/kustomization.yaml`
+- MC/MH per-pod Services + ConfigMaps -> `infra/services/{mc,mh}-service/` (port: `base + ordinal*2`)
+- Network policies -> `infra/services/{ac,gc,mc,mh}-service/network-policy.yaml`
+- Dockerfiles -> `infra/docker/{ac,gc,mc,mh}-service/Dockerfile`; Kind -> `infra/kind/`
+- setup/teardown (ADR-0030) -> `infra/kind/scripts/{setup,teardown}.sh`; devloop -> `infra/devloop/devloop.sh`
 
 ## False Positive Boundaries
 - Per-service error mapping (GcError vs McError vs MhError) -> required, not duplication
-- MC GcClient vs MH GcClient -> different RPCs, retry strategies, heartbeat models (reviewed 2026-04-01)
-- MH McClient vs MC MhClient -> channel-per-call is justified (different endpoints per meeting); McClient adds retry + auth short-circuit
+- MC GcClient vs MH GcClient -> different RPCs, retry strategies, heartbeat models
 - AC rate limiting (DB-backed lockout) vs GC rate limiting (middleware RPM) -> different mechanisms
-- common::jwt::{ParticipantType,MeetingRole} vs common::meeting_token -> JWT enums intentionally narrower
-- env-tests GuestTokenRequest vs common::meeting_token::GuestTokenRequest -> different types
+- common::jwt enums vs common::meeting_token -> JWT enums intentionally narrower
 
 ## Tech Debt & Extractions
 - Active duplication tech debt -> `docs/TODO.md` (Cross-Service Duplication section)
-- Common crate (extraction target) -> `crates/common/src/` (jwt, config, meeting_token, secret, token_manager)
-- Test fixtures -> `crates/mc-test-utils/src/jwt_test.rs`, `crates/gc-test-utils/`
+- Common crate + test fixtures -> `crates/common/src/`, `crates/mc-test-utils/`, `crates/gc-test-utils/`

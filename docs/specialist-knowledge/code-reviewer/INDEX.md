@@ -3,11 +3,12 @@
 ## Architecture & Design
 - Actor handle/task separation → ADR-0001 (Section: Pattern)
 - No-panic policy, `#[expect]` over `#[allow]` → ADR-0002
-- Service auth: two-layer gRPC auth, scope convention `service.write.{target}` → ADR-0003 (Component 6)
+- Error handling, service-layer wrapping → ADR-0003
 - Host-side cluster helper → ADR-0030
 - Observability naming, label cardinality, SLO targets → ADR-0011
 - Dashboard metric presentation (counters vs rates, $__rate_interval) → ADR-0029
-- Guard pipeline → ADR-0015; DRY cross-service duplication → ADR-0019
+- Guard pipeline methodology → ADR-0015
+- DRY cross-service duplication → ADR-0019
 - User auth, three-tier token architecture → ADR-0020
 - Infrastructure architecture, K8s manifests → ADR-0012; Local dev environment → ADR-0013
 - Agent teams validation pipeline → ADR-0024
@@ -18,37 +19,36 @@
 - Crypto (EdDSA, AES-256-GCM, bcrypt) → `crates/ac-service/src/crypto/mod.rs:sign_jwt()`
 - Error type → `crates/ac-service/src/errors.rs:AcError`
 - Handlers/routes → `handlers/auth_handler.rs:handle_service_token()`, `routes/mod.rs:build_routes()`
-- Scope alignment (ADR-0003): `models/mod.rs:ServiceType::default_scopes()`, scope contract tests `test_scope_contract_*`; seed SQL → `infra/kind/scripts/setup.sh:seed_test_data()`
 - Metrics → `crates/ac-service/src/observability/metrics.rs:init_metrics_recorder()`
 - Repository + service layers → `repositories/signing_keys.rs`, `services/key_management_service.rs`
 - K8s wiring → `infra/services/ac-service/configmap.yaml`, `statefulset.yaml`
 
 ## Code Locations — GC Service
 - Error type, `From<JwtError>` → `crates/gc-service/src/errors.rs:GcError`
-- Auth: JWT/JWKS + HTTP middleware → `auth/jwt.rs` (`validate()`=`GcError`, `validate_raw()`=raw `JwtError` for metric classification), `jwks.rs`, `middleware/auth.rs:require_user_auth()`; two-layer gRPC auth (JWKS + scope `service.write.gc` + Layer 2 `service_type` routing for `GlobalControllerService`→`meeting-controller`, `MediaHandlerRegistryService`→`media-handler`, claims injection, ADR-0003) → `grpc/auth_layer.rs:GrpcAuthLayer`; `classify_jwt_error()` maps `JwtError` → bounded `failure_reason`; legacy `GrpcAuthInterceptor` + `PendingTokenValidation` + `ValidatedClaims` removed
+- Auth (JWT/JWKS, middleware) → `auth/jwt.rs`, `jwks.rs`, `middleware/auth.rs:require_user_auth()`
 - Meeting handlers → `handlers/meetings.rs:create_meeting()`, `join_meeting()`, `get_guest_token()`, `JoinMeetingResponse::new()`
 - Repositories → `repositories/meetings.rs` (atomic CTE), `participants.rs`
 - AC/MC clients → `services/ac_client.rs:AcClient`, `mc_client.rs:McClientTrait`
-- Metrics (includes `gc_jwt_validations_total`, `gc_caller_type_rejected_total`)/dashboard/alerts → `observability/metrics.rs`, `docs/observability/metrics/gc-service.md`, `infra/grafana/dashboards/gc-overview.json`
+- Metrics/dashboard/alerts → `observability/metrics.rs`, `docs/observability/metrics/gc-service.md`, `infra/grafana/dashboards/gc-overview.json`
 
 ## Code Locations — MC Service
 - Error type (McError, bounded labels, From<JwtError>, MhAssignmentMissing) → `crates/mc-service/src/errors.rs`
-- Auth: JWT validator + token type enforcement → `crates/mc-service/src/auth/mod.rs:McJwtValidator`; two-layer auth (JWKS + scope `service.write.mc` + service_type routing, ADR-0003) → `grpc/auth_interceptor.rs:McAuthLayer`; claims injected into `http::Request` extensions
-- MH gRPC client (Channel-per-call, RegisterMeeting RPC) → `crates/mc-service/src/grpc/mh_client.rs:MhClient`
+- Auth: JWT validator + token type enforcement → `crates/mc-service/src/auth/mod.rs:McJwtValidator`; interceptor → `grpc/auth_interceptor.rs:McAuthInterceptor`; auth layer (async JWKS, no scope — deferred to handlers) → `grpc/auth_interceptor.rs:McAuthLayer`
+- MH gRPC client (Channel-per-call, RegisterMeeting RPC) → `grpc/mh_client.rs:MhClient`; trait → `mh_client.rs:MhRegistrationClient`
 - MediaCoordinationService (MH→MC notifications, R-15) → `grpc/media_coordination.rs:McMediaCoordinationService`
 - MH connection registry (participant→MH tracking, RwLock) → `mh_connection_registry.rs:MhConnectionRegistry`
 - Config (ac_jwks_url, advertise addresses, ordinal parsing) → `crates/mc-service/src/config.rs:Config`, `parse_statefulset_ordinal()`
 - Startup wiring (JwksClient, McJwtValidator, McAuthLayer, MediaCoordinationService, registry) → `crates/mc-service/src/main.rs`
 - Redis (MhAssignmentData, MhAssignmentStore trait, FencedRedisClient) → `crates/mc-service/src/redis/client.rs`
-- WebTransport: server (accept loop, redis injection) → `crates/mc-service/src/webtransport/server.rs:WebTransportServer::accept_loop()`; join flow → `webtransport/connection.rs:handle_connection()`, `build_join_response()`; post-join (MediaConnectionFailed R-20) → `connection.rs:handle_client_message()`
-- MC metrics (join, WebTransport, JWT, register_meeting, MH notifications, media failures, caller_type_rejected, init) → `crates/mc-service/src/observability/metrics.rs`; catalog → `docs/observability/metrics/mc-service.md`
+- WebTransport: server (accept loop, redis+mh_client injection) → `webtransport/server.rs:WebTransportServer::accept_loop()`; join flow → `connection.rs:handle_connection()`, `build_join_response()`; async RegisterMeeting trigger (first participant, retry+backoff) → `connection.rs:register_meeting_with_handlers()`; post-join (MediaConnectionFailed R-20) → `connection.rs:handle_client_message()`
+- MC metrics (join, WebTransport, JWT, register_meeting, MH notifications, media failures, init) → `crates/mc-service/src/observability/metrics.rs`; catalog → `docs/observability/metrics/mc-service.md`
 - Dashboard + alerts → `infra/grafana/dashboards/mc-overview.json`, `infra/docker/prometheus/rules/mc-alerts.yaml`
 - Health probes + K8s (8081, per-pod NodePort) → `observability/health.rs:health_router()`, `infra/services/mc-service/`
 
 ## Code Locations — MH Service
 - Config (ac_jwks_url, max_connections, register_meeting_timeout) → `config.rs:Config`
 - Error type (thiserror, bounded labels) → `errors.rs:MhError`
-- Auth: JWT validator → `auth/mod.rs:MhJwtValidator`; two-layer auth (JWKS + scope `service.write.mh` + Layer 2 `service_type` routing for `MediaHandlerService`→`meeting-controller`, claims injection, ADR-0003) → `grpc/auth_interceptor.rs:MhAuthLayer`; `classify_jwt_error()` maps `JwtError` → bounded `failure_reason` label; legacy `MhAuthInterceptor` removed
+- Auth: JWT validator → `auth/mod.rs:MhJwtValidator`; interceptor → `grpc/auth_interceptor.rs:MhAuthInterceptor`; auth layer (async JWKS, scope `service.write.mh`) → `grpc/auth_interceptor.rs:MhAuthLayer`
 - GC client (RegisterMH, SendLoadReport) → `grpc/gc_client.rs:GcClient`
 - MC client (MH→MC: NotifyParticipantConnected/Disconnected, per-call channel, retry) → `grpc/mc_client.rs:McClient`
 - MC client integration tests → `tests/mc_client_integration.rs`
@@ -56,7 +56,7 @@
 - Session manager (registered meetings, pending connections, Notify) → `session/mod.rs:SessionManager`
 - WebTransport: server (TLS, capacity, McClient) → `webtransport/server.rs:WebTransportServer`; connection (JWT, provisional accept, MC notifications) → `webtransport/connection.rs:handle_connection()`, `spawn_notify_connected()`
 - Startup wiring (JWKS, SessionManager, WebTransport, MhAuthLayer, McClient) → `main.rs`
-- Metrics (JWT 3-arg with `failure_reason`, `mh_caller_type_rejected_total`, WebTransport, handshake, connections, MC notifications) → `observability/metrics.rs`; catalog → `docs/observability/metrics/mh-service.md`
+- Metrics (JWT, WebTransport, handshake, connections, MC notifications) → `observability/metrics.rs:record_mc_notification()`; catalog → `docs/observability/metrics/mh-service.md`
 - Health probes (port 8083) → `observability/health.rs`; K8s → `infra/services/mh-service/`
 - Dockerfile → `infra/docker/mh-service/Dockerfile`; NetworkPolicy → `infra/services/mh-service/network-policy.yaml`
 

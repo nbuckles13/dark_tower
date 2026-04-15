@@ -10,8 +10,9 @@ use crate::actors::messages::JoinResult;
 use crate::actors::MeetingControllerActorHandle;
 use crate::auth::McJwtValidator;
 use crate::errors::McError;
+use crate::grpc::MhRegistrationClient;
 use crate::observability::metrics;
-use crate::redis::MhAssignmentStore;
+use crate::redis::{MhAssignmentData, MhAssignmentStore};
 
 use bytes::{BufMut, BytesMut};
 use common::jwt::MeetingRole;
@@ -21,10 +22,10 @@ use proto_gen::signaling::{
     MediaServerInfo, Participant, ServerMessage,
 };
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, instrument, warn};
+use tracing::{debug, error, info, instrument, warn, Instrument};
 use wtransport::endpoint::IncomingSession;
 use wtransport::stream::{RecvStream, SendStream};
 
@@ -37,17 +38,30 @@ const MAX_PARTICIPANT_NAME_LEN: usize = 256;
 /// Channel buffer for outbound messages from ParticipantActor to WebTransport stream.
 const OUTBOUND_CHANNEL_BUFFER: usize = 100;
 
+/// Maximum number of attempts for RegisterMeeting RPC per MH.
+const MAX_REGISTER_ATTEMPTS: u32 = 3;
+
+/// Backoff delays between RegisterMeeting retry attempts.
+const REGISTER_BACKOFF_DELAYS: [Duration; 2] = [Duration::from_secs(1), Duration::from_secs(2)];
+
 /// Handle an incoming WebTransport connection.
 ///
 /// This is the thin entry point: accept session, accept stream, read JoinRequest,
 /// validate JWT, fire JoinConnection to controller, then hand off to the
 /// connection run loop which owns the streams until disconnect.
 #[instrument(skip_all, name = "mc.webtransport.connection", fields(connection_id = tracing::field::Empty))]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Connection handler wiring; all params are distinct dependencies"
+)]
 pub async fn handle_connection(
     incoming: IncomingSession,
     controller_handle: Arc<MeetingControllerActorHandle>,
     jwt_validator: Arc<McJwtValidator>,
     redis_client: Arc<dyn MhAssignmentStore>,
+    mh_client: Arc<dyn MhRegistrationClient>,
+    mc_id: String,
+    mc_grpc_endpoint: String,
     cancel_token: CancellationToken,
 ) -> Result<(), McError> {
     // Step 1: Accept the WebTransport session
@@ -336,7 +350,7 @@ pub async fn handle_connection(
     );
 
     // Step 8: Build and send JoinResponse (reads MH assignment data from Redis)
-    let join_response =
+    let (join_response, mh_data) =
         match build_join_response(&join_result, redis_client.as_ref(), &meeting_id).await {
             Ok(resp) => resp,
             Err(e) => {
@@ -382,7 +396,49 @@ pub async fn handle_connection(
         "JoinResponse sent"
     );
 
-    // Step 9: Run bridge loop — forward ParticipantActor updates to client
+    // Step 9: [ASYNC, first participant only] Fire RegisterMeeting to each MH (R-12)
+    let is_first_participant = join_result.participants.is_empty();
+    if is_first_participant {
+        debug!(
+            target: "mc.webtransport.connection",
+            connection_id = %connection_id,
+            meeting_id = %meeting_id,
+            "First participant joined — spawning async RegisterMeeting"
+        );
+        let reg_mh_client = Arc::clone(&mh_client);
+        let reg_meeting_id = meeting_id.clone();
+        let reg_mc_id = mc_id.clone();
+        let reg_mc_grpc_endpoint = mc_grpc_endpoint.clone();
+        let reg_cancel_token = cancel_token.child_token();
+        let span = tracing::info_span!(
+            target: "mc.register_meeting.trigger",
+            "register_meeting_trigger",
+            meeting_id = %meeting_id,
+        );
+        tokio::spawn(
+            async move {
+                register_meeting_with_handlers(
+                    reg_mh_client.as_ref(),
+                    &mh_data,
+                    &reg_meeting_id,
+                    &reg_mc_id,
+                    &reg_mc_grpc_endpoint,
+                    &reg_cancel_token,
+                )
+                .await;
+            }
+            .instrument(span),
+        );
+    } else {
+        debug!(
+            target: "mc.webtransport.connection",
+            connection_id = %connection_id,
+            meeting_id = %meeting_id,
+            "Not first participant — skipping RegisterMeeting"
+        );
+    }
+
+    // Step 10: Run bridge loop — forward ParticipantActor updates to client
     // outbound_tx was passed through the join flow and is now owned by ParticipantActor.
     // outbound_rx receives encoded protobuf bytes written by ParticipantActor.
     let bridge_result = run_bridge_loop(
@@ -619,13 +675,15 @@ async fn send_error(
 /// Build a protobuf `JoinResponse` from the actor's `JoinResult`.
 ///
 /// Reads MH assignment data from Redis to populate `media_servers`.
+/// Returns the `MhAssignmentData` alongside the response so it can be
+/// passed to the async `RegisterMeeting` task without re-reading Redis.
 /// Fails the join if MH assignment data is unavailable — a meeting
 /// without media handlers is not useful (R-6).
 async fn build_join_response(
     result: &JoinResult,
     redis_client: &dyn MhAssignmentStore,
     meeting_id: &str,
-) -> Result<JoinResponse, McError> {
+) -> Result<(JoinResponse, MhAssignmentData), McError> {
     let existing_participants = result
         .participants
         .iter()
@@ -659,15 +717,109 @@ async fn build_join_response(
         })
         .collect();
 
-    Ok(JoinResponse {
-        participant_id: result.participant_id.clone(),
-        user_id: 0,
-        existing_participants,
-        media_servers,
-        encryption_keys: None,
-        correlation_id: result.correlation_id.clone(),
-        binding_token: result.binding_token.clone(),
-    })
+    Ok((
+        JoinResponse {
+            participant_id: result.participant_id.clone(),
+            user_id: 0,
+            existing_participants,
+            media_servers,
+            encryption_keys: None,
+            correlation_id: result.correlation_id.clone(),
+            binding_token: result.binding_token.clone(),
+        },
+        mh_data,
+    ))
+}
+
+/// Fire `RegisterMeeting` RPCs to each assigned MH (R-12).
+///
+/// Called as a spawned task after the first participant joins. Iterates over
+/// all MH handlers in the assignment data, calling `register_meeting()` on
+/// each that has a gRPC endpoint. Retries with exponential backoff on failure.
+///
+/// This function handles all errors internally (log + continue) since it runs
+/// as a fire-and-forget spawned task with no caller to propagate errors to.
+async fn register_meeting_with_handlers(
+    mh_client: &dyn MhRegistrationClient,
+    mh_data: &MhAssignmentData,
+    meeting_id: &str,
+    mc_id: &str,
+    mc_grpc_endpoint: &str,
+    cancel_token: &CancellationToken,
+) {
+    for handler in &mh_data.handlers {
+        let grpc_endpoint = match &handler.grpc_endpoint {
+            Some(ep) => ep,
+            None => {
+                debug!(
+                    target: "mc.register_meeting.trigger",
+                    mh_id = %handler.mh_id,
+                    "MH has no gRPC endpoint, skipping RegisterMeeting"
+                );
+                continue;
+            }
+        };
+
+        let mut last_error = None;
+        for attempt in 1..=MAX_REGISTER_ATTEMPTS {
+            if cancel_token.is_cancelled() {
+                info!(
+                    target: "mc.register_meeting.trigger",
+                    "RegisterMeeting cancelled during shutdown"
+                );
+                return;
+            }
+            match mh_client
+                .register_meeting(grpc_endpoint, meeting_id, mc_id, mc_grpc_endpoint)
+                .await
+            {
+                Ok(()) => {
+                    debug!(
+                        target: "mc.register_meeting.trigger",
+                        mh_grpc_endpoint = %grpc_endpoint,
+                        "RegisterMeeting succeeded"
+                    );
+                    last_error = None;
+                    break;
+                }
+                Err(e) => {
+                    warn!(
+                        target: "mc.register_meeting.trigger",
+                        attempt = attempt,
+                        max_attempts = MAX_REGISTER_ATTEMPTS,
+                        mh_grpc_endpoint = %grpc_endpoint,
+                        error = %e,
+                        "RegisterMeeting attempt failed"
+                    );
+                    last_error = Some(e);
+
+                    // Backoff before next attempt (unless this was the last attempt)
+                    if let Some(&delay) = REGISTER_BACKOFF_DELAYS.get(attempt as usize - 1) {
+                        tokio::select! {
+                            () = cancel_token.cancelled() => {
+                                info!(
+                                    target: "mc.register_meeting.trigger",
+                                    "RegisterMeeting cancelled during shutdown"
+                                );
+                                return;
+                            }
+                            () = tokio::time::sleep(delay) => {}
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(e) = last_error {
+            error!(
+                target: "mc.register_meeting.trigger",
+                mh_grpc_endpoint = %grpc_endpoint,
+                total_attempts = MAX_REGISTER_ATTEMPTS,
+                error = %e,
+                "RegisterMeeting retries exhausted"
+            );
+        }
+    }
 }
 
 // Note: build_join_response is async and requires a Redis client.
@@ -738,5 +890,155 @@ mod tests {
         let data = msg.encode_to_vec();
         // Should not panic -- exercises the None branch
         handle_client_message(&data, "test-conn-5");
+    }
+
+    // ========================================================================
+    // register_meeting_with_handlers unit tests
+    // ========================================================================
+
+    use crate::redis::MhEndpointInfo;
+    use std::collections::VecDeque;
+    use std::pin::Pin;
+    use std::sync::Mutex;
+
+    /// Mock MhRegistrationClient that returns results from a queue.
+    /// When the queue is empty, returns Ok(()).
+    struct MockRegClient {
+        results: Mutex<VecDeque<Result<(), McError>>>,
+        call_count: Mutex<u32>,
+    }
+
+    impl MockRegClient {
+        fn new(results: Vec<Result<(), McError>>) -> Self {
+            Self {
+                results: Mutex::new(VecDeque::from(results)),
+                call_count: Mutex::new(0),
+            }
+        }
+
+        fn call_count(&self) -> u32 {
+            *self.call_count.lock().unwrap()
+        }
+    }
+
+    impl MhRegistrationClient for MockRegClient {
+        fn register_meeting<'a>(
+            &'a self,
+            _mh_grpc_endpoint: &'a str,
+            _meeting_id: &'a str,
+            _mc_id: &'a str,
+            _mc_grpc_endpoint: &'a str,
+        ) -> Pin<Box<dyn std::future::Future<Output = Result<(), McError>> + Send + 'a>> {
+            *self.call_count.lock().unwrap() += 1;
+            let result = self.results.lock().unwrap().pop_front().unwrap_or(Ok(()));
+            Box::pin(async move { result })
+        }
+    }
+
+    fn make_mh_data(handlers: Vec<MhEndpointInfo>) -> MhAssignmentData {
+        MhAssignmentData {
+            handlers,
+            assigned_at: "2024-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_register_retry_succeeds_on_second_attempt() {
+        let client = MockRegClient::new(vec![Err(McError::Grpc("transient".to_string())), Ok(())]);
+        let mh_data = make_mh_data(vec![MhEndpointInfo {
+            mh_id: "mh-1".to_string(),
+            webtransport_endpoint: "wt://mh-1:4433".to_string(),
+            grpc_endpoint: Some("http://mh-1:50053".to_string()),
+        }]);
+        let cancel = CancellationToken::new();
+
+        register_meeting_with_handlers(&client, &mh_data, "m1", "mc1", "http://mc:50052", &cancel)
+            .await;
+
+        assert_eq!(client.call_count(), 2, "Should succeed on 2nd attempt");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_register_all_retries_exhausted() {
+        let client = MockRegClient::new(vec![
+            Err(McError::Grpc("fail-1".to_string())),
+            Err(McError::Grpc("fail-2".to_string())),
+            Err(McError::Grpc("fail-3".to_string())),
+        ]);
+        let mh_data = make_mh_data(vec![MhEndpointInfo {
+            mh_id: "mh-1".to_string(),
+            webtransport_endpoint: "wt://mh-1:4433".to_string(),
+            grpc_endpoint: Some("http://mh-1:50053".to_string()),
+        }]);
+        let cancel = CancellationToken::new();
+
+        register_meeting_with_handlers(&client, &mh_data, "m1", "mc1", "http://mc:50052", &cancel)
+            .await;
+
+        assert_eq!(
+            client.call_count(),
+            MAX_REGISTER_ATTEMPTS,
+            "Should attempt exactly MAX_REGISTER_ATTEMPTS times"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_register_multiple_handlers_partial_failure() {
+        // Handler 1 succeeds immediately, handler 2 fails all retries
+        let client = MockRegClient::new(vec![
+            Ok(()),                                   // handler 1, attempt 1
+            Err(McError::Grpc("fail-1".to_string())), // handler 2, attempt 1
+            Err(McError::Grpc("fail-2".to_string())), // handler 2, attempt 2
+            Err(McError::Grpc("fail-3".to_string())), // handler 2, attempt 3
+        ]);
+        let mh_data = make_mh_data(vec![
+            MhEndpointInfo {
+                mh_id: "mh-1".to_string(),
+                webtransport_endpoint: "wt://mh-1:4433".to_string(),
+                grpc_endpoint: Some("http://mh-1:50053".to_string()),
+            },
+            MhEndpointInfo {
+                mh_id: "mh-2".to_string(),
+                webtransport_endpoint: "wt://mh-2:4433".to_string(),
+                grpc_endpoint: Some("http://mh-2:50053".to_string()),
+            },
+        ]);
+        let cancel = CancellationToken::new();
+
+        register_meeting_with_handlers(&client, &mh_data, "m1", "mc1", "http://mc:50052", &cancel)
+            .await;
+
+        assert_eq!(
+            client.call_count(),
+            4,
+            "1 call for handler 1 (success) + 3 calls for handler 2 (exhausted)"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_register_skips_handler_without_grpc_endpoint() {
+        let client = MockRegClient::new(vec![Ok(())]);
+        let mh_data = make_mh_data(vec![
+            MhEndpointInfo {
+                mh_id: "mh-no-grpc".to_string(),
+                webtransport_endpoint: "wt://mh-1:4433".to_string(),
+                grpc_endpoint: None,
+            },
+            MhEndpointInfo {
+                mh_id: "mh-with-grpc".to_string(),
+                webtransport_endpoint: "wt://mh-2:4433".to_string(),
+                grpc_endpoint: Some("http://mh-2:50053".to_string()),
+            },
+        ]);
+        let cancel = CancellationToken::new();
+
+        register_meeting_with_handlers(&client, &mh_data, "m1", "mc1", "http://mc:50052", &cancel)
+            .await;
+
+        assert_eq!(
+            client.call_count(),
+            1,
+            "Should only call register_meeting for handler with gRPC endpoint"
+        );
     }
 }
