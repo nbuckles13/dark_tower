@@ -22,6 +22,8 @@ use common::jwt::JwksClient;
 use common::secret::SecretBox;
 use mc_service::actors::{ActorMetrics, ControllerMetrics, MeetingControllerActorHandle};
 use mc_service::auth::McJwtValidator;
+use mc_service::errors::McError;
+use mc_service::redis::{MhAssignmentData, MhAssignmentStore, MhEndpointInfo};
 use mc_service::webtransport::connection;
 use mc_test_utils::jwt_test::{
     make_expired_meeting_claims, make_meeting_claims, mount_jwks_mock, TestKeypair,
@@ -39,12 +41,48 @@ use wtransport::{ClientConfig, Endpoint, Identity, ServerConfig};
 // Test Infrastructure
 // ============================================================================
 
+/// In-memory mock for MhAssignmentStore — no Redis needed.
+struct MockMhAssignmentStore {
+    data: std::sync::Mutex<std::collections::HashMap<String, MhAssignmentData>>,
+}
+
+impl MockMhAssignmentStore {
+    fn new() -> Self {
+        Self {
+            data: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    fn insert(&self, meeting_id: &str, data: MhAssignmentData) {
+        self.data
+            .lock()
+            .unwrap()
+            .insert(meeting_id.to_string(), data);
+    }
+}
+
+impl MhAssignmentStore for MockMhAssignmentStore {
+    fn get_mh_assignment<'a>(
+        &'a self,
+        meeting_id: &'a str,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<Option<MhAssignmentData>, McError>> + Send + 'a,
+        >,
+    > {
+        let result = self.data.lock().unwrap().get(meeting_id).cloned();
+        Box::pin(async move { Ok(result) })
+    }
+}
+
 /// A test WebTransport server with all dependencies wired up.
 struct TestServer {
     /// The bound port of the WebTransport endpoint.
     port: u16,
     /// Controller handle for creating meetings, etc.
     controller_handle: Arc<MeetingControllerActorHandle>,
+    /// In-memory MH assignment store (no Redis).
+    mh_store: Arc<MockMhAssignmentStore>,
     /// JWT validator backed by wiremock JWKS (kept alive for accept loop).
     _jwt_validator: Arc<McJwtValidator>,
     /// Cancellation token for shutting down the accept loop.
@@ -76,6 +114,8 @@ impl TestServer {
             master_secret,
         ));
 
+        let mh_store = Arc::new(MockMhAssignmentStore::new());
+
         let cancel_token = CancellationToken::new();
 
         // Build WebTransport server with self-signed cert
@@ -93,14 +133,16 @@ impl TestServer {
         // Spawn accept loop
         let ctrl = Arc::clone(&controller_handle);
         let jwt = Arc::clone(&jwt_validator);
+        let store = Arc::clone(&mh_store);
         let ct = cancel_token.clone();
         tokio::spawn(async move {
-            Self::accept_loop(endpoint, ctrl, jwt, ct).await;
+            Self::accept_loop(endpoint, ctrl, jwt, store, ct).await;
         });
 
         Self {
             port,
             controller_handle,
+            mh_store,
             _jwt_validator: jwt_validator,
             cancel_token,
             _mock_server: mock_server,
@@ -113,6 +155,7 @@ impl TestServer {
         endpoint: Endpoint<Server>,
         controller_handle: Arc<MeetingControllerActorHandle>,
         jwt_validator: Arc<McJwtValidator>,
+        mh_store: Arc<MockMhAssignmentStore>,
         cancel_token: CancellationToken,
     ) {
         loop {
@@ -121,17 +164,31 @@ impl TestServer {
                 incoming = endpoint.accept() => {
                     let ctrl = Arc::clone(&controller_handle);
                     let jwt = Arc::clone(&jwt_validator);
+                    let store = Arc::clone(&mh_store) as Arc<dyn MhAssignmentStore>;
                     let ct = cancel_token.child_token();
                     tokio::spawn(async move {
-                        let _ = connection::handle_connection(incoming, ctrl, jwt, ct).await;
+                        let _ = connection::handle_connection(incoming, ctrl, jwt, store, ct).await;
                     });
                 }
             }
         }
     }
 
-    /// Create a meeting on the controller.
+    /// Create a meeting on the controller and seed MH assignment data.
     async fn create_meeting(&self, meeting_id: &str) {
+        // Seed MH assignment data so join flow can populate media_servers
+        self.mh_store.insert(
+            meeting_id,
+            MhAssignmentData {
+                handlers: vec![MhEndpointInfo {
+                    mh_id: "mh-test-1".to_string(),
+                    webtransport_endpoint: "wt://mh-test-1:4433".to_string(),
+                    grpc_endpoint: Some("http://mh-test-1:50053".to_string()),
+                }],
+                assigned_at: "2024-01-01T00:00:00Z".to_string(),
+            },
+        );
+
         self.controller_handle
             .create_meeting(meeting_id.to_string())
             .await
@@ -278,6 +335,14 @@ async fn test_join_success_returns_join_response() {
                 !join.binding_token.is_empty(),
                 "binding_token should be non-empty"
             );
+            assert!(
+                !join.media_servers.is_empty(),
+                "media_servers should be populated"
+            );
+            assert_eq!(
+                join.media_servers[0].media_handler_url, "wt://mh-test-1:4433",
+                "media_servers[0] should match first MH endpoint"
+            );
         }
         other => panic!("Expected JoinResponse, got {other:?}"),
     }
@@ -385,6 +450,32 @@ async fn test_join_meeting_not_found_returns_not_found() {
 
     let (code, _message) = extract_error(&response);
     assert_eq!(code, signaling::ErrorCode::NotFound as i32);
+}
+
+// ============================================================================
+// T5b: Meeting Exists But MH Assignment Missing
+// ============================================================================
+
+#[tokio::test]
+async fn test_join_missing_mh_assignment_returns_internal_error() {
+    let server = TestServer::start().await;
+    // Create meeting via controller but DON'T seed MH data in mh_store
+    server
+        .controller_handle
+        .create_meeting("meeting-no-mh".to_string())
+        .await
+        .expect("create meeting");
+
+    let claims = make_meeting_claims("meeting-no-mh");
+    let token = server.sign_token(&claims);
+
+    let response = join_and_read_response(&server.url(), "meeting-no-mh", &token, "NoMedia").await;
+
+    let (code, _message) = extract_error(&response);
+    assert_eq!(
+        code, 6,
+        "MhAssignmentMissing should map to INTERNAL_ERROR (6)"
+    );
 }
 
 // ============================================================================
