@@ -12,7 +12,7 @@
 - AC metrics -> `crates/ac-service/src/observability/metrics.rs:init_metrics_recorder()`, gauge init `services/key_management_service.rs:init_key_metrics()`, HTTP middleware `middleware/http_metrics.rs`, rate limit config `config.rs`
 - GC metrics -> `crates/gc-service/src/observability/metrics.rs`, HTTP middleware `middleware/http_metrics.rs:normalize_endpoint()`, join wiring `handlers/meetings.rs:join_meeting()`, DB metrics `repositories/`; gap: `get_guest_token()` uninstrumented
 - MC metrics -> `crates/mc-service/src/observability/metrics.rs`; recording sites: `webtransport/connection.rs:handle_connection()`, `server.rs:accept_loop()`, `grpc/mh_client.rs:register_meeting()`, `grpc/media_coordination.rs` (mc_mh_notifications_received_total, mc_media_connection_failures_total); bounded labels `errors.rs:error_type_label()`
-- MH metrics (registration, heartbeat, token refresh, gRPC, WebTransport, JWT) -> `crates/mh-service/src/observability/metrics.rs`; recording sites: `webtransport/server.rs:accept_loop()`, `webtransport/connection.rs:handle_connection()`, `grpc/auth_interceptor.rs:MhAuthService`
+- MH metrics (registration, heartbeat, token refresh, gRPC, WebTransport, JWT, MC notifications) -> `crates/mh-service/src/observability/metrics.rs`; recording sites: `webtransport/server.rs:accept_loop()`, `webtransport/connection.rs:handle_connection()`, `grpc/auth_interceptor.rs:MhAuthService`, `grpc/mc_client.rs:send_with_retry()`
 
 ## Auth & JWT Tracing
 - Common JWT (JwksClient, JwtValidator, verify_token, PII-redacted Debug) -> `crates/common/src/jwt.rs`
@@ -27,9 +27,10 @@
 ## MH WebTransport Tracing
 - Server/connection (targets: `mh.webtransport`, `.connection`) -> `crates/mh-service/src/webtransport/server.rs`, `connection.rs`
 
-## gRPC Client Tracing (MC -> GC, MC -> MH)
+## gRPC Client Tracing (MC -> GC, MC -> MH, MH -> MC)
 - GcClient tracing (registration, heartbeat, re-registration) -> `crates/mc-service/src/grpc/gc_client.rs` (target: `mc.grpc.gc_client`)
 - MhClient tracing (RegisterMeeting RPC) -> `crates/mc-service/src/grpc/mh_client.rs` (target: `mc.grpc.mh_client`)
+- McClient tracing (NotifyParticipantConnected/Disconnected) -> `crates/mh-service/src/grpc/mc_client.rs` (target: `mh.grpc.mc_client`)
 
 ## Health
 - MC health state -> `crates/mc-service/src/observability/health.rs:health_router()`
@@ -68,10 +69,7 @@
 - Dashboard-to-kustomize coverage (R-20, bidirectional) -> `scripts/guards/simple/validate-kustomize.sh`
 - Instrument skip_all enforcement -> `scripts/guards/simple/instrument-skip-all.sh`
 
-## Env-Test Observability, Cluster Config & Runbooks
+## Env-Test Observability, Runbooks & Test Coverage
 - MC/MH K8s health probes + metrics scrape -> `infra/services/{mc,mh}-service/deployment.yaml`
-- Per-service deployment + incident response -> `docs/runbooks/` (two per service)
-- GC scenarios 8-9 + join failure triage -> `docs/runbooks/gc-incident-response.md`, `docs/observability/alerts.md`
-
-## Test Coverage & Integration Seams
-- GC/MC/MH metrics tests -> `crates/gc-service/src/observability/metrics.rs`, `crates/mc-service/src/observability/metrics.rs`, `crates/mh-service/src/observability/metrics.rs`
+- Runbooks + alerts -> `docs/runbooks/`, `docs/observability/alerts.md`
+- Metrics tests -> `crates/gc-service/src/observability/metrics.rs`, `crates/mc-service/src/observability/metrics.rs`, `crates/mh-service/src/observability/metrics.rs`

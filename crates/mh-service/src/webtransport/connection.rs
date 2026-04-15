@@ -6,12 +6,14 @@
 //! 3. Read meeting JWT from first length-prefixed message
 //! 4. Validate JWT via `MhJwtValidator`
 //! 5. Check meeting registration status:
-//!    - Registered: add connection, hold open
+//!    - Registered: add connection, notify MC, hold open
 //!    - Not registered: provisional accept with configurable timeout
 //! 6. Monitor for disconnect or cancellation
+//! 7. On disconnect: notify MC, clean up session
 
 use crate::auth::MhJwtValidator;
 use crate::errors::MhError;
+use crate::grpc::McClient;
 use crate::observability::metrics;
 use crate::session::{ConnectionEntry, PendingConnection, SessionManagerHandle};
 
@@ -28,7 +30,11 @@ const MAX_MESSAGE_SIZE: usize = 64 * 1024;
 /// Handle an incoming WebTransport connection.
 ///
 /// This is the entry point for each client connection: accept session,
-/// read JWT, validate, check registration, then hold the connection open.
+/// read JWT, validate, check registration, notify MC, then hold the
+/// connection open. On disconnect, notifies MC and cleans up.
+///
+/// MC notifications are best-effort (fire-and-forget via `tokio::spawn`).
+/// Notification failure does NOT affect the client connection.
 ///
 /// # Errors
 ///
@@ -37,12 +43,14 @@ const MAX_MESSAGE_SIZE: usize = 64 * 1024;
 #[tracing::instrument(skip_all, name = "mh.webtransport.connection", fields(connection_id = tracing::field::Empty))]
 #[expect(
     clippy::too_many_lines,
-    reason = "Connection lifecycle is sequential; splitting would fragment the accept-validate-register-hold flow"
+    reason = "Connection lifecycle is sequential; splitting would fragment the accept-validate-register-notify-hold flow"
 )]
 pub async fn handle_connection(
     incoming: IncomingSession,
     jwt_validator: Arc<MhJwtValidator>,
     session_manager: SessionManagerHandle,
+    mc_client: Arc<McClient>,
+    handler_id: String,
     register_meeting_timeout: Duration,
     cancel_token: CancellationToken,
 ) -> Result<(), MhError> {
@@ -129,7 +137,7 @@ pub async fn handle_connection(
     // Record handshake duration (session accept through JWT validation)
     metrics::record_webtransport_handshake_duration(handshake_start.elapsed());
 
-    // Step 5: Check meeting registration status
+    // Step 5: Check meeting registration status and notify MC
     if session_manager.is_meeting_registered(meeting_id).await {
         // Meeting already registered — add as active connection
         session_manager
@@ -150,6 +158,16 @@ pub async fn handle_connection(
             participant_id = %participant_id,
             "Connection established for registered meeting"
         );
+
+        // Notify MC (best-effort, fire-and-forget)
+        spawn_notify_connected(
+            &mc_client,
+            &session_manager,
+            meeting_id,
+            participant_id,
+            &handler_id,
+        )
+        .await;
     } else {
         // Meeting not yet registered — provisional accept with timeout
         debug!(
@@ -179,6 +197,16 @@ pub async fn handle_connection(
                     meeting_id = %meeting_id,
                     "Pending connection promoted after RegisterMeeting"
                 );
+
+                // Notify MC about the now-promoted connection (best-effort)
+                spawn_notify_connected(
+                    &mc_client,
+                    &session_manager,
+                    meeting_id,
+                    participant_id,
+                    &handler_id,
+                )
+                .await;
             }
             () = tokio::time::sleep(register_meeting_timeout) => {
                 // Timeout expired — disconnect client
@@ -191,6 +219,7 @@ pub async fn handle_connection(
                 session_manager
                     .remove_pending_connection(meeting_id, &connection_id)
                     .await;
+                // No MC disconnect notification — connection was never established with MC
                 return Err(MhError::MeetingNotRegistered(
                     meeting_id.clone(),
                 ));
@@ -212,6 +241,9 @@ pub async fn handle_connection(
     // Step 6: Hold connection open — monitor for disconnect or cancellation
     // The connection stays open for future media frame forwarding (separate story).
     // For now, we monitor the recv stream for closure and the cancellation token.
+    //
+    // Track the disconnect reason for MC notification
+    let disconnect_reason;
     let mut probe_buf = [0u8; 1];
     loop {
         tokio::select! {
@@ -221,17 +253,30 @@ pub async fn handle_connection(
                     connection_id = %connection_id,
                     "Connection cancelled during shutdown"
                 );
+                // Server-initiated shutdown — not a client close or error
+                disconnect_reason = proto_gen::internal::DisconnectReason::Unspecified;
                 break;
             }
             result = recv_stream.read(&mut probe_buf) => {
                 match result {
-                    Ok(None) | Err(_) => {
+                    Ok(None) => {
                         info!(
                             target: "mh.webtransport.connection",
                             connection_id = %connection_id,
                             meeting_id = %meeting_id,
                             "Client disconnected"
                         );
+                        disconnect_reason = proto_gen::internal::DisconnectReason::ClientClosed;
+                        break;
+                    }
+                    Err(_) => {
+                        info!(
+                            target: "mh.webtransport.connection",
+                            connection_id = %connection_id,
+                            meeting_id = %meeting_id,
+                            "Client disconnected with error"
+                        );
+                        disconnect_reason = proto_gen::internal::DisconnectReason::Error;
                         break;
                     }
                     Ok(Some(_)) => {
@@ -242,10 +287,38 @@ pub async fn handle_connection(
         }
     }
 
-    // Step 7: Cleanup — remove connection from session manager
+    // Step 7: Cleanup — remove connection from session manager and notify MC
     session_manager
         .remove_connection(meeting_id, &connection_id)
         .await;
+
+    // Notify MC of disconnection (best-effort, fire-and-forget)
+    if let Some(mc_endpoint) = session_manager.get_mc_endpoint(meeting_id).await {
+        let mc_client = Arc::clone(&mc_client);
+        let meeting_id = meeting_id.clone();
+        let participant_id = participant_id.clone();
+        let handler_id = handler_id.clone();
+        let reason = disconnect_reason as i32;
+        tokio::spawn(async move {
+            if let Err(e) = mc_client
+                .notify_participant_disconnected(
+                    &mc_endpoint,
+                    &meeting_id,
+                    &participant_id,
+                    &handler_id,
+                    reason,
+                )
+                .await
+            {
+                warn!(
+                    target: "mh.webtransport.connection",
+                    error = %e,
+                    meeting_id = %meeting_id,
+                    "Failed to notify MC of participant disconnection"
+                );
+            }
+        });
+    }
 
     info!(
         target: "mh.webtransport.connection",
@@ -256,6 +329,50 @@ pub async fn handle_connection(
     );
 
     Ok(())
+}
+
+/// Spawn a best-effort `NotifyParticipantConnected` notification to MC.
+///
+/// Looks up the MC endpoint from `SessionManager`. If found, spawns the
+/// notification as a fire-and-forget task. If the MC endpoint is not found
+/// (should not happen for registered meetings), logs a warning and skips.
+async fn spawn_notify_connected(
+    mc_client: &Arc<McClient>,
+    session_manager: &SessionManagerHandle,
+    meeting_id: &str,
+    participant_id: &str,
+    handler_id: &str,
+) {
+    if let Some(mc_endpoint) = session_manager.get_mc_endpoint(meeting_id).await {
+        let mc_client = Arc::clone(mc_client);
+        let meeting_id = meeting_id.to_string();
+        let participant_id = participant_id.to_string();
+        let handler_id = handler_id.to_string();
+        tokio::spawn(async move {
+            if let Err(e) = mc_client
+                .notify_participant_connected(
+                    &mc_endpoint,
+                    &meeting_id,
+                    &participant_id,
+                    &handler_id,
+                )
+                .await
+            {
+                warn!(
+                    target: "mh.webtransport.connection",
+                    error = %e,
+                    meeting_id = %meeting_id,
+                    "Failed to notify MC of participant connection"
+                );
+            }
+        });
+    } else {
+        warn!(
+            target: "mh.webtransport.connection",
+            meeting_id = %meeting_id,
+            "Cannot notify MC: no MC endpoint found for meeting"
+        );
+    }
 }
 
 /// Read a length-prefixed message from a `RecvStream`.

@@ -10,6 +10,7 @@
 //! 2. Child tokens propagate cancellation to active connection handlers
 
 use crate::auth::MhJwtValidator;
+use crate::grpc::McClient;
 use crate::observability::metrics;
 use crate::session::SessionManagerHandle;
 
@@ -35,6 +36,10 @@ pub struct WebTransportServer {
     jwt_validator: Arc<MhJwtValidator>,
     /// Session manager handle for meeting registration and connection tracking.
     session_manager: SessionManagerHandle,
+    /// MC notification client for MH→MC participant notifications.
+    mc_client: Arc<McClient>,
+    /// This MH instance's handler ID.
+    handler_id: String,
     /// `RegisterMeeting` timeout duration.
     register_meeting_timeout: Duration,
     /// Maximum concurrent connections (bounds resource exhaustion).
@@ -58,6 +63,8 @@ impl WebTransportServer {
         tls_key_path: String,
         jwt_validator: Arc<MhJwtValidator>,
         session_manager: SessionManagerHandle,
+        mc_client: Arc<McClient>,
+        handler_id: String,
         register_meeting_timeout: Duration,
         max_connections: usize,
         cancel_token: CancellationToken,
@@ -68,6 +75,8 @@ impl WebTransportServer {
             tls_key_path,
             jwt_validator,
             session_manager,
+            mc_client,
+            handler_id,
             register_meeting_timeout,
             max_connections,
             active_connections: Arc::new(AtomicUsize::new(0)),
@@ -171,6 +180,8 @@ impl WebTransportServer {
                     let active_connections = Arc::clone(&self.active_connections);
                     let jwt_validator = Arc::clone(&self.jwt_validator);
                     let session_manager = self.session_manager.clone();
+                    let mc_client = Arc::clone(&self.mc_client);
+                    let handler_id = self.handler_id.clone();
                     let register_meeting_timeout = self.register_meeting_timeout;
                     let connection_token = self.cancel_token.child_token();
 
@@ -179,6 +190,8 @@ impl WebTransportServer {
                             incoming_session,
                             jwt_validator,
                             session_manager,
+                            mc_client,
+                            handler_id,
                             register_meeting_timeout,
                             connection_token,
                         )

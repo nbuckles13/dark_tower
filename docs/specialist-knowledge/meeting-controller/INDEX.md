@@ -63,12 +63,8 @@
 - Env-tests MC-GC integration → `crates/env-tests/tests/22_mc_gc_integration.rs`
 
 ## Advertise Address Config
-- `MC_GRPC_ADVERTISE_ADDRESS` / `MC_WEBTRANSPORT_ADVERTISE_ADDRESS` — required env vars for GC registration endpoints
-- Config fields: `grpc_advertise_address`, `webtransport_advertise_address` → `crates/mc-service/src/config.rs`
-- Used in `register()` and `attempt_reregistration()` → `crates/mc-service/src/grpc/gc_client.rs`
-- Values must include scheme (`http://` or `https://`) — GC validates via `validate_endpoint()`
-- K8s: derived from downward API `status.podIP` via `$(POD_IP)` substitution → `infra/services/mc-service/deployment.yaml`
-- Replaces the old `replace("0.0.0.0", "localhost")` hack in gc_client.rs
+- `MC_GRPC_ADVERTISE_ADDRESS` / `MC_WEBTRANSPORT_ADVERTISE_ADDRESS` → `crates/mc-service/src/config.rs`
+- Used in GC registration → `crates/mc-service/src/grpc/gc_client.rs`; K8s: `$(POD_IP)` → `deployment.yaml`
 
 ## Infrastructure
 - K8s deployment (incl. POD_IP downward API, advertise addresses) → `infra/services/mc-service/deployment.yaml`

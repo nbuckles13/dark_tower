@@ -144,6 +144,26 @@ sum(rate(mh_jwt_validations_total[5m]))
 
 ---
 
+## MC Notification Metrics
+
+### `mh_mc_notifications_total`
+- **Type**: Counter
+- **Description**: Total MH→MC notification delivery attempts by event type and outcome
+- **Labels**:
+  - `event`: Notification event type (`connected`, `disconnected`)
+  - `status`: Delivery outcome (`success`, `error`)
+- **Cardinality**: Low (2 events x 2 statuses = 4 series)
+- **Usage**: Monitor MH→MC notification delivery health, detect MC connectivity issues
+- **Dashboard**: MH Overview - MC Notification Delivery
+
+**PromQL example** - notification failure rate:
+```promql
+sum(rate(mh_mc_notifications_total{status="error"}[5m])) /
+sum(rate(mh_mc_notifications_total[5m]))
+```
+
+---
+
 ## Incoming gRPC Metrics
 
 ### `mh_grpc_requests_total`

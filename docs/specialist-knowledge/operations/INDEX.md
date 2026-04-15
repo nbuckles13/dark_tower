@@ -54,7 +54,8 @@
 
 ## MH Service
 - MH startup + config + health → `crates/mh-service/src/main.rs`, `config.rs`, `observability/health.rs`
-- MH gRPC (service, GC client, JWKS auth) → `crates/mh-service/src/grpc/mh_service.rs`, `gc_client.rs`, `auth_interceptor.rs`
+- MH gRPC (service, GC client, MC client, JWKS auth) → `crates/mh-service/src/grpc/mh_service.rs`, `gc_client.rs`, `mc_client.rs`, `auth_interceptor.rs`
+- MH→MC notifications (fire-and-forget) → `crates/mh-service/src/webtransport/connection.rs:spawn_notify_connected()`; tests → `tests/mc_client_integration.rs`
 - MH WebTransport + session mgmt → `crates/mh-service/src/webtransport/server.rs`, `connection.rs`, `session/mod.rs`
 
 ## MC Service
@@ -68,9 +69,7 @@
 - Actors → `crates/mc-service/src/actors/controller.rs`, `meeting.rs`, `participant.rs`
 - MCMediaConnectionAllFailed alert → `infra/docker/prometheus/rules/mc-alerts.yaml`
 
-## GC Service
-- GC routes + handlers → `crates/gc-service/src/routes/mod.rs`, `crates/gc-service/src/handlers/meetings.rs`
-
-## Tests
+## GC Service + Tests
+- GC routes + handlers → `crates/gc-service/src/routes/mod.rs`, `handlers/meetings.rs`
 - MC join tests → `crates/mc-service/tests/join_tests.rs`; TestKeypair → `crates/mc-test-utils/src/jwt_test.rs`
 - GC join tests → `crates/gc-service/tests/meeting_tests.rs`; Env-tests → `crates/env-tests/`

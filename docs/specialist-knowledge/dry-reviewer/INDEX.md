@@ -5,22 +5,19 @@
 - Fix-or-defer review model -> ADR-0024 (`docs/decisions/adr-0024-agent-teams-workflow.md`)
 
 ## JWT Validation (Common + Thin Wrappers)
-- Common JWT code (all shared logic) -> `crates/common/src/jwt.rs`
-- Internal token request types (GC->AC contract) -> `crates/common/src/meeting_token.rs`
-- GC thin wrapper -> `crates/gc-service/src/auth/jwt.rs` (ServiceClaims, UserClaims)
-- MC thin wrapper -> `crates/mc-service/src/auth/mod.rs` (MeetingTokenClaims, GuestTokenClaims)
-- MH JWKS config -> `infra/services/mh-service/configmap.yaml:AC_JWKS_URL` (shared configmap, mirrors MC pattern in `mc-service-config`)
+- Common JWT code -> `crates/common/src/jwt.rs` | Token types -> `crates/common/src/meeting_token.rs`
+- GC thin wrapper -> `crates/gc-service/src/auth/jwt.rs` | MC -> `crates/mc-service/src/auth/mod.rs`
+- MH JWKS config -> `infra/services/mh-service/configmap.yaml:AC_JWKS_URL`
 
 ## Per-Service Observability (Metrics & Dashboards)
 - AC/GC/MC/MH metrics -> `crates/*/src/observability/metrics.rs` (per-service, not duplication)
-- MC/GC join alert rules -> `infra/docker/prometheus/rules/{mc,gc}-alerts.yaml`
-- Dashboard metric presentation -> ADR-0029
-- Grafana dashboards + configMapGenerator -> `infra/grafana/dashboards/`, `infra/kubernetes/observability/grafana/`
+- Alert rules -> `infra/docker/prometheus/rules/{mc,gc}-alerts.yaml` | Dashboards -> `infra/grafana/dashboards/` | ADR-0029
 
 ## Integration Test Coverage
 - MC join flow (11 tests) -> `crates/mc-service/tests/join_tests.rs`
 - GC join/guest/settings -> `crates/gc-service/tests/meeting_tests.rs`
 - MH GC integration -> `crates/mh-service/tests/gc_integration.rs`
+- MH MC notification integration -> `crates/mh-service/tests/mc_client_integration.rs`
 - Shared fixtures -> `crates/mc-test-utils/src/jwt_test.rs`, `crates/gc-test-utils/src/server_harness.rs`
 
 ## Per-Service Config Parsing
@@ -30,10 +27,8 @@
 - Extraction candidate: `generate_instance_id(prefix)` -> 4-line pattern in GC + MC + MH config
 
 ## gRPC Auth (Cross-Service)
-- MC auth layer (async JWKS, R-22) -> `crates/mc-service/src/grpc/auth_interceptor.rs:McAuthLayer` (applied in main.rs)
-- MC auth interceptor (legacy structural) -> same file `:McAuthInterceptor` (dead in production)
-- MH auth layer (async JWKS) -> `crates/mh-service/src/grpc/auth_interceptor.rs:MhAuthLayer`
-- MH auth interceptor (legacy structural) -> same file `:MhAuthInterceptor` (dead in production)
+- MC auth -> `crates/mc-service/src/grpc/auth_interceptor.rs:McAuthLayer` (JWKS, R-22) + `:McAuthInterceptor` (legacy, dead)
+- MH auth -> `crates/mh-service/src/grpc/auth_interceptor.rs:MhAuthLayer` (JWKS) + `:MhAuthInterceptor` (legacy, dead)
 - Shared constant -> `common::jwt::MAX_JWT_SIZE_BYTES`
 - McAuthLayer/MhAuthLayer are near-identical tower Layer/Service patterns (extraction candidate in TODO.md)
 
@@ -47,8 +42,9 @@
 - MC GcClient -> `crates/mc-service/src/grpc/gc_client.rs:GcClient` (bounded retries, fast/comprehensive heartbeats)
 - MC MhClient -> `crates/mc-service/src/grpc/mh_client.rs:MhClient` (per-call channels, no retries)
 - MH GcClient -> `crates/mh-service/src/grpc/gc_client.rs:GcClient` (unbounded retries, load reports)
+- MH McClient -> `crates/mh-service/src/grpc/mc_client.rs:McClient` (per-call channels, 3-attempt retry, best-effort)
 - Shared patterns: channel creation, `add_auth`, backoff constants (acceptable structural similarity)
-- Extraction candidate: `add_auth` (~10 lines identical, 3 call sites: MC GcClient, MC MhClient, MH GcClient) -> extract crate-local in MC first; `common` when third crate needs it
+- Extraction candidate: `add_auth` (~10 lines identical, 4 call sites: MC GcClient, MC MhClient, MH GcClient, MH McClient) -> extract crate-local in each crate's `grpc/mod.rs`; `common` when third crate needs it
 - MH gRPC stub service -> `crates/mh-service/src/grpc/mh_service.rs:MhMediaService`
 
 ## Redis Abstractions (MC)
@@ -61,16 +57,14 @@
 - GC health routes -> `crates/gc-service/src/routes/mod.rs:64-65`
 
 ## Per-Service Infrastructure (K8s, Docker, Kind)
-- Kustomize bases -> `infra/services/{ac,gc,mc,mh}-service/kustomization.yaml`; AC/MC/MH StatefulSet, GC Deployment
-- MC/MH per-pod Services + per-instance ConfigMaps -> `infra/services/{mc,mh}-service/` (port formula: `base + ordinal*2`)
-- Network policies -> `infra/services/{ac,gc,mc,mh}-service/network-policy.yaml`; MH->MC egress + MC<-MH ingress on TCP 50052
-- Dockerfiles -> `infra/docker/{ac,gc,mc,mh}-service/Dockerfile` (cargo-chef multi-stage); Kind -> `infra/kind/`; overlays -> `infra/kubernetes/overlays/kind/`
-- setup/teardown (ADR-0030) -> `infra/kind/scripts/{setup,teardown}.sh`; devloop -> `infra/devloop/devloop.sh`
-- Helper commands -> `crates/devloop-helper/src/commands.rs`; TLS -> `scripts/generate-dev-certs.sh`
+- Kustomize bases -> `infra/services/{ac,gc,mc,mh}-service/kustomization.yaml`; MC/MH per-pod Services + ConfigMaps
+- Network policies -> `infra/services/{ac,gc,mc,mh}-service/network-policy.yaml`; MH↔MC on TCP 50052
+- Dockerfiles -> `infra/docker/{ac,gc,mc,mh}-service/Dockerfile`; Kind -> `infra/kind/`; setup/teardown -> `infra/kind/scripts/`
 
 ## False Positive Boundaries
 - Per-service error mapping (GcError vs McError vs MhError) -> required, not duplication
 - MC GcClient vs MH GcClient -> different RPCs, retry strategies, heartbeat models (reviewed 2026-04-01)
+- MH McClient vs MC MhClient -> channel-per-call is justified (different endpoints per meeting); McClient adds retry + auth short-circuit
 - AC rate limiting (DB-backed lockout) vs GC rate limiting (middleware RPM) -> different mechanisms
 - common::jwt::{ParticipantType,MeetingRole} vs common::meeting_token -> JWT enums intentionally narrower
 - env-tests GuestTokenRequest vs common::meeting_token::GuestTokenRequest -> different types

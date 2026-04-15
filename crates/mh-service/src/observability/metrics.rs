@@ -171,6 +171,20 @@ pub fn set_active_connections(count: f64) {
     gauge!("mh_active_connections").set(count);
 }
 
+/// Record an MC notification delivery attempt (R-16/R-17).
+///
+/// Metric: `mh_mc_notifications_total`
+/// Labels: `event` (connected | disconnected), `status` (success | error)
+/// Cardinality: 4 (2 events x 2 statuses)
+pub fn record_mc_notification(event: &str, status: &str) {
+    counter!(
+        "mh_mc_notifications_total",
+        "event" => event.to_string(),
+        "status" => status.to_string()
+    )
+    .increment(1);
+}
+
 /// Record a JWT validation attempt (R-27).
 ///
 /// Metric: `mh_jwt_validations_total`
@@ -285,6 +299,15 @@ mod tests {
         record_jwt_validation("failure", "meeting");
         record_jwt_validation("success", "service");
         record_jwt_validation("failure", "service");
+    }
+
+    #[test]
+    fn test_record_mc_notification() {
+        // All 4 combinations: 2 events x 2 statuses
+        record_mc_notification("connected", "success");
+        record_mc_notification("connected", "error");
+        record_mc_notification("disconnected", "success");
+        record_mc_notification("disconnected", "error");
     }
 
     #[test]

@@ -50,11 +50,13 @@
 - Error type (thiserror, bounded labels) → `errors.rs:MhError`
 - Auth: JWT validator → `auth/mod.rs:MhJwtValidator`; interceptor → `grpc/auth_interceptor.rs:MhAuthInterceptor`; auth layer (async JWKS, scope `service.write.mh`) → `grpc/auth_interceptor.rs:MhAuthLayer`
 - GC client (RegisterMH, SendLoadReport) → `grpc/gc_client.rs:GcClient`
+- MC client (MH→MC: NotifyParticipantConnected/Disconnected, per-call channel, retry) → `grpc/mc_client.rs:McClient`
+- MC client integration tests → `tests/mc_client_integration.rs`
 - gRPC stub service (MC→MH: RegisterMeeting) → `grpc/mh_service.rs:MhMediaService`
 - Session manager (registered meetings, pending connections, Notify) → `session/mod.rs:SessionManager`
-- WebTransport: server (TLS, capacity) → `webtransport/server.rs:WebTransportServer`; connection (JWT, provisional accept) → `webtransport/connection.rs`
-- Startup wiring (JWKS, SessionManager, WebTransport, MhAuthLayer) → `main.rs`
-- Metrics (JWT, WebTransport, handshake, connections) → `observability/metrics.rs`; catalog → `docs/observability/metrics/mh-service.md`
+- WebTransport: server (TLS, capacity, McClient) → `webtransport/server.rs:WebTransportServer`; connection (JWT, provisional accept, MC notifications) → `webtransport/connection.rs:handle_connection()`, `spawn_notify_connected()`
+- Startup wiring (JWKS, SessionManager, WebTransport, MhAuthLayer, McClient) → `main.rs`
+- Metrics (JWT, WebTransport, handshake, connections, MC notifications) → `observability/metrics.rs:record_mc_notification()`; catalog → `docs/observability/metrics/mh-service.md`
 - Health probes (port 8083) → `observability/health.rs`; K8s → `infra/services/mh-service/`
 - Dockerfile → `infra/docker/mh-service/Dockerfile`; NetworkPolicy → `infra/services/mh-service/network-policy.yaml`
 
@@ -69,6 +71,5 @@
 - MC+MH TLS cert generation → `scripts/generate-dev-certs.sh`
 - Env-tests cluster module → `crates/env-tests/src/cluster.rs`
 - Kind cluster (ADR-0030): `kind-config.yaml.tmpl`, `setup.sh` (`deploy_only_service()`, `DT_HOST_GATEWAY_IP`), `{mc,mh}-{0,1}-configmap.yaml`
-- Devloop helper → `crates/devloop-helper/src/commands.rs` (`cmd_setup()`, `cmd_status()`, `cmd_deploy()`), `ports.rs`; client → `infra/devloop/dev-cluster`; Layer 8 → `SKILL.md`
-- Service bases + Kind overlay → `infra/services/*/kustomization.yaml`, `infra/kubernetes/overlays/kind/`
+- Devloop helper → `crates/devloop-helper/src/commands.rs`; client → `infra/devloop/dev-cluster`; Service bases → `infra/services/*/kustomization.yaml`
 - Guards: runner → `scripts/guards/run-guards.sh`; Kustomize (R-15–R-20) → `validate-kustomize.sh`; App metrics → `validate-application-metrics.sh`

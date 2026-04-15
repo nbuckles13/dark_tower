@@ -46,6 +46,10 @@
 - Session manager actor tests (handle API, registration, connections, pending promotion, notify via oneshot) -> `crates/mh-service/src/session/mod.rs:tests`
 - WebTransport server + connection handler -> `crates/mh-service/src/webtransport/server.rs`, `connection.rs`
 - Health + metrics tests -> `crates/mh-service/src/observability/health.rs:tests`, `metrics.rs:tests`
+- McClient tests (construction, auth, retry constants, endpoint errors) -> `crates/mh-service/src/grpc/mc_client.rs:tests`
+- MC notification integration tests (mock MediaCoordinationService, retry, auth short-circuit) -> `crates/mh-service/tests/mc_client_integration.rs`
+- WebTransport notification wiring (connect, disconnect, fire-and-forget) -> `crates/mh-service/src/webtransport/connection.rs:spawn_notify_connected()`
+- MC notification metrics -> `crates/mh-service/src/observability/metrics.rs:record_mc_notification()`
 - GC integration tests (registration, load reports, NOT_FOUND) -> `crates/mh-service/tests/gc_integration.rs`
 
 ## Code Locations: Environment Tests
@@ -61,17 +65,11 @@
 - Observability validation (EXPECTED_SERVICES constant) → `crates/env-tests/tests/30_observability.rs`
 
 ## Code Locations: Cluster Setup & Helper (ADR-0030)
-- Setup script (arg parsing, TTY detection, cluster name validation) → `infra/kind/scripts/setup.sh`
-- Single-service rebuild+redeploy → `infra/kind/scripts/setup.sh:deploy_only_service()`
-- Image loading (podman/docker) → `infra/kind/scripts/setup.sh:load_image_to_kind()`
-- Env vars + ConfigMap patching (DT_CLUSTER_NAME, DT_PORT_MAP, advertise addresses) → `infra/kind/scripts/setup.sh`
-- Teardown with cluster name support → `infra/kind/scripts/teardown.sh`
-- Kind config template (listenAddress: HOST_GATEWAY_IP per ADR-0030) → `infra/kind/kind-config.yaml.tmpl`
-- Port map + gateway IP → `crates/devloop-helper/src/commands.rs:write_port_map_shell()`, `validate_gateway_ip()`
-- Port map file → `/tmp/devloop-{slug}/ports.json`
-- Task slug validation → `infra/devloop/devloop.sh` (line 66)
+- Setup script (arg parsing, deploy_only_service, load_image_to_kind) → `infra/kind/scripts/setup.sh`
+- Teardown → `infra/kind/scripts/teardown.sh`; Kind config → `infra/kind/kind-config.yaml.tmpl`
+- Port map + gateway IP → `crates/devloop-helper/src/commands.rs`; Port map file → `/tmp/devloop-{slug}/ports.json`
+- Env vars + ConfigMap patching → `infra/kind/scripts/setup.sh`; Wrapper → `infra/devloop/devloop.sh`
 
 ## Code Locations: Common & Infrastructure
-- JWT (claims, JwtError, JwksClient, JwtValidator, round-trip tests) -> `crates/common/src/jwt.rs`
-- Shared meeting token types (GC<->AC contract, serde, defaults) -> `crates/common/src/meeting_token.rs:tests`
-- MC/MH per-pod Services, ConfigMaps, Kind port mappings → `infra/services/{mc,mh}-service/`, `infra/kind/kind-config.yaml`; Dev certs → `scripts/generate-dev-certs.sh`
+- JWT (claims, JwksClient, JwtValidator, round-trip tests) -> `crates/common/src/jwt.rs`; meeting token -> `meeting_token.rs:tests`
+- MC/MH per-pod Services, ConfigMaps, Kind port mappings → `infra/services/{mc,mh}-service/`; Dev certs → `scripts/generate-dev-certs.sh`
