@@ -97,22 +97,31 @@ docker --version
 
 ### System Limits (Linux/WSL2)
 
-Running Kind clusters (especially multiple concurrent clusters for devloop) requires increased inotify limits. The defaults are too low and cause "too many open files" errors in kube-proxy:
+Running Kind clusters (especially multiple concurrent clusters for devloop) requires increased system limits:
 
 ```bash
 # Check current limits
 sysctl fs.inotify.max_user_instances fs.inotify.max_user_watches
+sysctl kernel.keys.maxkeys kernel.keys.maxbytes
 
 # Increase (immediate)
 sudo sysctl fs.inotify.max_user_instances=1024
 sudo sysctl fs.inotify.max_user_watches=1048576
+sudo sysctl kernel.keys.maxkeys=5000
+sudo sysctl kernel.keys.maxbytes=5000000
 
 # Persist across reboots
-echo "fs.inotify.max_user_instances=1024" | sudo tee -a /etc/sysctl.d/99-kind.conf
-echo "fs.inotify.max_user_watches=1048576" | sudo tee -a /etc/sysctl.d/99-kind.conf
+cat <<EOF | sudo tee /etc/sysctl.d/99-kind.conf
+fs.inotify.max_user_instances=1024
+fs.inotify.max_user_watches=1048576
+kernel.keys.maxkeys=5000
+kernel.keys.maxbytes=5000000
+EOF
 ```
 
-> **Symptom without this fix**: kube-proxy CrashLoopBackOff with "too many open files," Calico init fails, all pods stuck in Pending.
+> **inotify**: Without increased limits, kube-proxy CrashLoopBackOff with "too many open files," Calico init fails, all pods stuck in Pending.
+>
+> **kernel keyrings**: Container runtimes (runc) create a session keyring per container for credential isolation. With multiple Kind clusters (~50-80+ containers), the default per-user limit of 200 keys is exhausted. Symptom: pods stuck in ContainerCreating/CrashLoopBackOff with `unable to create session key: disk quota exceeded`.
 
 ### Optional Tools
 
@@ -447,6 +456,20 @@ kubectl logs -n kube-system -l k8s-app=kube-proxy | grep "too many open files"
 
 # Fix: increase inotify limits (see Prerequisites > System Limits above)
 sudo sysctl fs.inotify.max_user_instances=1024
+
+# Existing pods should self-heal after the limit increase
+```
+
+### Pods stuck with "disk quota exceeded" / session keyring errors
+
+This happens when kernel keyring limits are exhausted by many containers:
+
+```bash
+# Check if this is the issue
+kubectl describe pod -n <namespace> <pod> | grep "disk quota exceeded"
+
+# Fix: increase keyring limits (see Prerequisites > System Limits above)
+sudo sysctl kernel.keys.maxkeys=5000 kernel.keys.maxbytes=5000000
 
 # Existing pods should self-heal after the limit increase
 ```
