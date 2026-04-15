@@ -153,6 +153,14 @@ cleanup() {
     # Remove helper runtime directory
     rm -rf "$HELPER_RUNTIME_DIR"
 
+    # Release port reservation
+    rm -rf "$HOME/.cache/devloop/devloop-${TASK_SLUG}"
+    local registry="$HOME/.cache/devloop/port-registry.json"
+    if [ -f "$registry" ] && command -v jq &>/dev/null; then
+        jq --arg slug "$TASK_SLUG" '.entries |= map(select(.slug != $slug))' "$registry" > "${registry}.tmp" \
+            && mv "${registry}.tmp" "$registry"
+    fi
+
     echo "Removing clone: ${CLONE_DIR}"
     rm -rf "$CLONE_DIR"
     echo "Cleaned up."
@@ -564,6 +572,9 @@ fi
 # ─── Phase 2: Attach ────────────────────────────────────────────
 
 echo ""
+# Set terminal title to devloop slug
+printf '\033]0;devloop: %s\007' "$TASK_SLUG"
+
 echo "Dropping into Claude Code..."
 echo "(Ctrl-D or /exit to detach — containers stay running)"
 echo ""
