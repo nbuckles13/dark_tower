@@ -16,12 +16,13 @@
 - Config (SecretString, env loading, TLS paths, advertise addresses) → `crates/mh-service/src/config.rs`
 - Error types (MhError hierarchy) → `crates/mh-service/src/errors.rs`
 - gRPC: GC client (registration, heartbeats, re-registration) → `crates/mh-service/src/grpc/gc_client.rs`
+- gRPC: MC client (NotifyParticipantConnected/Disconnected, retry with backoff) → `crates/mh-service/src/grpc/mc_client.rs`
 - gRPC: MH service (RegisterMeeting via SessionManagerHandle, other RPCs stub) → `crates/mh-service/src/grpc/mh_service.rs`
 - gRPC: auth interceptor (legacy sync, MhAuthLayer/MhAuthService async JWKS) → `crates/mh-service/src/grpc/auth_interceptor.rs`
 - JWT validation (MhJwtValidator, meeting token validation) → `crates/mh-service/src/auth/mod.rs`
 - Session management (SessionManagerActor/SessionManagerHandle, actor pattern ADR-0001) → `crates/mh-service/src/session/mod.rs`
 - WebTransport server (TLS, capacity, accept loop) → `crates/mh-service/src/webtransport/server.rs`
-- WebTransport connection handler (JWT read, provisional accept) → `crates/mh-service/src/webtransport/connection.rs`
+- WebTransport connection handler (JWT read, provisional accept, MC notifications) → `crates/mh-service/src/webtransport/connection.rs`
 - Health + readiness endpoints → `crates/mh-service/src/observability/health.rs`
 - Prometheus metric wrappers → `crates/mh-service/src/observability/metrics.rs`
 - MH metrics catalog → `docs/observability/metrics/mh-service.md`
@@ -36,12 +37,14 @@
 ## Proto Definitions
 - MC-to-MH RPC (Register, RouteMedia, StreamTelemetry) → `proto/internal.proto`
 - MH-to-GC RPC (RegisterMH, SendLoadReport) → `proto/internal.proto`
-- MH assignment messages (MhAssignment, MhRole) → `proto/internal.proto`
+- MH assignment messages (MhAssignment) → `proto/internal.proto`
+- MH→MC coordination (MediaCoordinationService, ParticipantMedia*, DisconnectReason) → `proto/internal.proto`
 - Client signaling (MediaStream, StreamAssignment, layout) → `proto/signaling.proto`
 - Generated Rust code → `crates/proto-gen/build.rs`
 
 ## Integration Seams
 - MH → GC registration/heartbeat → `crates/mh-service/src/grpc/gc_client.rs`
+- MH → MC notifications (connect/disconnect) → `crates/mh-service/src/grpc/mc_client.rs`
 - MC → MH gRPC service → `crates/mh-service/src/grpc/mh_service.rs`
 - MH → AC token management → `crates/common/src/token_manager.rs`
 - MH → AC JWKS (meeting + service token validation) → `crates/common/src/jwt.rs:JwksClient`
@@ -52,6 +55,7 @@
 
 ## Testing
 - GC integration tests (mock server) → `crates/mh-service/tests/gc_integration.rs`
+- MC client integration tests (mock server, retry, auth short-circuit) → `crates/mh-service/tests/mc_client_integration.rs`
 - Config unit tests → `crates/mh-service/src/config.rs`
 - Auth interceptor tests (legacy + MhAuthService async JWKS) → `crates/mh-service/src/grpc/auth_interceptor.rs`
 - JWT validation tests (meeting tokens, JWKS unreachable) → `crates/mh-service/src/auth/mod.rs`
@@ -61,11 +65,8 @@
 - Metrics unit tests → `crates/mh-service/src/observability/metrics.rs`
 
 ## Advertise Address Config
-- `MH_GRPC_ADVERTISE_ADDRESS` / `MH_WEBTRANSPORT_ADVERTISE_ADDRESS` → required env vars in `config.rs`
-- Used directly in GC registration (register + attempt_reregistration) → `gc_client.rs:139-140, 291-292`
-- Must include scheme prefix (`grpc://`, `https://`) — GC validates in `gc-service/src/grpc/mh_service.rs:96-120`
-- K8s: pod IP via downward API (`status.podIP`) → `infra/services/mh-service/deployment.yaml:103-111`
-- Not in configmap — values are pod-specific, constructed from `$(POD_IP)` expansion
+- Env vars and usage in GC registration → `crates/mh-service/src/config.rs`, `gc_client.rs:register()`
+- K8s downward API pod IP → `infra/services/mh-service/deployment.yaml`
 
 ## Infrastructure
 - K8s deployment (ports, probes, env, downward API) → `infra/services/mh-service/deployment.yaml`

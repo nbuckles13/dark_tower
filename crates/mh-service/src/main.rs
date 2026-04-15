@@ -32,7 +32,7 @@ use common::token_manager::{spawn_token_manager, TokenManagerConfig};
 use mh_service::auth::MhJwtValidator;
 use mh_service::config::Config;
 use mh_service::errors::MhError;
-use mh_service::grpc::{GcClient, MhAuthLayer, MhMediaService};
+use mh_service::grpc::{GcClient, McClient, MhAuthLayer, MhMediaService};
 use mh_service::observability::{health_router, HealthState};
 use mh_service::session::SessionManagerHandle;
 use mh_service::webtransport::WebTransportServer;
@@ -156,6 +156,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let session_manager = SessionManagerHandle::new();
     info!("Session manager actor spawned");
 
+    // Create MC notification client for MH→MC participant notifications (R-16/R-17)
+    let mc_client = Arc::new(McClient::new(token_rx.clone()));
+    info!("MC notification client created");
+
     // Start health HTTP server (MUST succeed - fail startup if it doesn't)
     let health_addr: SocketAddr = config.health_bind_address.parse().map_err(|e| {
         error!(error = %e, addr = %config.health_bind_address, "Invalid health bind address");
@@ -234,6 +238,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.tls_key_path.clone(),
         Arc::clone(&jwt_validator),
         session_manager,
+        Arc::clone(&mc_client),
+        config.handler_id.clone(),
         Duration::from_secs(config.register_meeting_timeout_seconds),
         config.max_connections,
         shutdown_token.child_token(),

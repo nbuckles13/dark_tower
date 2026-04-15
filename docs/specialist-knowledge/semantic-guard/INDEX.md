@@ -10,10 +10,12 @@
 - AC → `docs/observability/metrics/ac-service.md` | GC → `docs/observability/metrics/gc-service.md` | MC → `docs/observability/metrics/mc-service.md` | MH → `docs/observability/metrics/mh-service.md`
 
 ## Cross-Service Boundary Files
-- Common JWT (types, JWKS, validator, errors, HasIat) → `crates/common/src/jwt.rs`
-- Token refresh → `crates/common/src/token_manager.rs`
-- GC error types & JwtError mapping → `crates/gc-service/src/errors.rs`
-- MC error types & JwtError mapping → `crates/mc-service/src/errors.rs`
+- Common JWT → `crates/common/src/jwt.rs` | Token refresh → `crates/common/src/token_manager.rs`
+- Error types & JwtError mapping → `crates/gc-service/src/errors.rs`, `crates/mc-service/src/errors.rs`
+- MH→MC McClient (connect/disconnect RPCs, retry, auth) → `crates/mh-service/src/grpc/mc_client.rs`
+- MC notification wiring → `crates/mh-service/src/webtransport/connection.rs:spawn_notify_connected()`
+- MC notification metrics → `crates/mh-service/src/observability/metrics.rs:record_mc_notification()`
+- MC notification integration tests → `crates/mh-service/tests/mc_client_integration.rs`
 
 ## Authentication Seams
 - GC JWT validation → `crates/gc-service/src/auth/jwt.rs` | JWKS → `auth/jwks.rs` | Middleware → `middleware/auth.rs`
@@ -34,10 +36,9 @@
 - Protobuf encoding utilities → `crates/mc-service/src/webtransport/handler.rs:encode_participant_update()`
 
 ## GC MH Selection & Assignment
-- MH selection (active/active peers, weighted random) → `crates/gc-service/src/services/mh_selection.rs:MhSelectionService`
-- MH selection types (MhSelection.handlers, MhAssignmentInfo) → `mh_selection.rs:MhSelection`
+- MH selection (weighted random) → `crates/gc-service/src/services/mh_selection.rs:MhSelectionService` | Types → `MhSelection`
 - MC assignment with MH → `crates/gc-service/src/services/mc_assignment.rs:AssignmentWithMh`
-- MH selection metrics (gc_mh_selection_duration_seconds, gc_mh_selections_total) → `crates/gc-service/src/observability/metrics.rs:record_mh_selection()`
+- MH selection metrics → `crates/gc-service/src/observability/metrics.rs:record_mh_selection()`
 
 ## GC Handlers, Routes & Repositories
 - Create/Join/Guest/Settings handlers → `crates/gc-service/src/handlers/meetings.rs`
@@ -70,6 +71,5 @@
 - MC↔MH gRPC: MC→MH:50053, MH→MC:50052 | GC→MC:50052 | GC egress:50051
 
 ## Kustomize & Kind
-- Kind overlay → `infra/kubernetes/overlays/kind/` | Setup → ADR-0030, `infra/kind/scripts/setup.sh`
-- ConfigMap patching (MC/MH advertise addresses) → `setup.sh:deploy_mc_service()`, `deploy_mh_service()`
-- Devloop-helper → `crates/devloop-helper/src/commands.rs` | Dev-cluster CLI → `infra/devloop/dev-cluster` | Teardown → `teardown.sh`
+- Kind overlay → `infra/kubernetes/overlays/kind/` | Setup → ADR-0030, `infra/kind/scripts/setup.sh` | Teardown → `teardown.sh`
+- ConfigMap patching (MC/MH advertise) → `setup.sh:deploy_mc_service()`, `deploy_mh_service()` | Helper → `crates/devloop-helper/src/commands.rs`

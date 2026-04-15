@@ -35,13 +35,16 @@
 - MH assignment store (Redis, no credentials stored) → `crates/mc-service/src/redis/client.rs:MhAssignmentStore`, `MhAssignmentData`
 - Session binding + join → `crates/mc-service/src/actors/session.rs`, `meeting.rs:handle_join()`
 
-## Code Locations — MH (Auth, OAuth, TLS)
+## Code Locations — MH (Auth, OAuth, TLS, Outbound Clients)
 - gRPC auth layer (JWKS, scope `service.write.mh`) → `crates/mh-service/src/grpc/auth_interceptor.rs:MhAuthLayer`
 - OAuth config (SecretString, Debug redaction) → `crates/mh-service/src/config.rs:Config` | JWKS: `infra/services/mh-service/configmap.yaml`
 - TLS validation + Bearer auth + error sanitization → `config.rs`, `gc_client.rs`, `errors.rs`
+- MH→MC OAuth Bearer auth (TokenReceiver, add_auth, retry with auth short-circuit) → `crates/mh-service/src/grpc/mc_client.rs:McClient`
+- MC notification wiring (fire-and-forget connect/disconnect) → `crates/mh-service/src/webtransport/connection.rs:spawn_notify_connected()`
 
 ## Code Locations — Observability (Security-Relevant)
 - MC/MH metrics (bounded labels, no PII) → `crates/mc-service/src/observability/metrics.rs` (+ mh) | ADR-0029
+- MC notification metrics (event x status, cardinality 4) → `crates/mh-service/src/observability/metrics.rs:record_mc_notification()`
 
 ## TLS & Certificates
 - Dev cert generation (ECDSA P-256 CA, MC + MH certs) → `scripts/generate-dev-certs.sh`
@@ -53,15 +56,12 @@
 - Per-instance NodePort Services (`{mc,mh}-service-{0,1}`) expose only UDP WebTransport | Registration → `gc_client.rs:register()`
 
 ## Devloop Container & Cluster Helper Security
-- Container isolation → ADR-0025; Cluster helper (trust, socket auth, injection safety, networking, prohibitions) → ADR-0030
-- Env-test URL validation (scheme, credential rejection) → `crates/env-tests/src/cluster.rs:parse_host_port()`, `ClusterPorts::from_env()`
-- Helper binary (Rust, Command::new() arg safety) → `crates/devloop-helper/src/commands.rs`
-- Status command (read-only, auth-gated) → `commands.rs:cmd_status()`, `parse_pod_health()`
-- Auth token (CSPRNG, constant-time compare, 0600) → `crates/devloop-helper/src/auth.rs`
-- Gateway IP validation → `commands.rs:validate_gateway_ip()` | Dev-cluster client → `infra/devloop/dev-cluster`
-- Socket auth + file permissions → ADR-0030 (Helper Process); API allowlist → ADR-0030 (Helper API)
-- Kind NodePort listen address (`${HOST_GATEWAY_IP}`) → `infra/kind/kind-config.yaml.tmpl`; Wrapper → `infra/devloop/devloop.sh`
-- Explicit prohibitions (`--network=host`, podman socket mount, `0.0.0.0` binding) → ADR-0030 (Explicit Prohibitions)
+- Container isolation → ADR-0025; Cluster helper (trust, socket auth, networking) → ADR-0030
+- Env-test URL validation → `crates/env-tests/src/cluster.rs:parse_host_port()`, `ClusterPorts::from_env()`
+- Helper binary (arg safety) → `crates/devloop-helper/src/commands.rs`; Auth token → `src/auth.rs`
+- Status (read-only, auth-gated) → `commands.rs:cmd_status()`; Gateway IP → `validate_gateway_ip()`
+- Socket auth + API allowlist + prohibitions → ADR-0030 (Helper Process, Helper API, Explicit Prohibitions)
+- Kind NodePort listen address → `infra/kind/kind-config.yaml.tmpl`; Wrapper → `infra/devloop/devloop.sh`
 
 ## Infrastructure Secrets & Network Isolation
 - Imperative secret creation → `setup.sh:create_ac_secrets()`, `create_mc_tls_secret()`, `create_mh_secrets()`, `create_mh_tls_secret()`
@@ -72,5 +72,4 @@
 - Kind overlay (no secrets) + supporting infra → `infra/kubernetes/overlays/kind/`, `infra/services/{postgres,redis}/`
 
 ## Health, Probes & Integration Seams
-- MC/MH health + K8s probes → `src/observability/health.rs`, `infra/services/{mc,mh}-service/*-deployment.yaml`
-- Auth chain: AC JWKS → common JwtValidator → GC/MC/MH | Guards → `scripts/guards/simple/` | Join tests → `crates/{mc,gc}-service/tests/`
+- MC/MH health + K8s probes → `src/observability/health.rs` | Auth chain: AC JWKS → GC/MC/MH | Guards → `scripts/guards/simple/`
