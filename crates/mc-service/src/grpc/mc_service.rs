@@ -137,42 +137,44 @@ impl McAssignmentService {
 
     /// Store MH assignments for a meeting in Redis.
     ///
-    /// Per ADR-0023 Section 6, stores:
-    /// - Primary MH endpoint
-    /// - Backup MH endpoint (optional)
-    /// - Assignment metadata
+    /// Converts proto `MhAssignment` messages into `MhEndpointInfo` structs
+    /// and stores them as active/active peers.
     async fn store_mh_assignments(
         &self,
         meeting_id: &str,
         mh_assignments: &[MhAssignment],
     ) -> Result<(), McError> {
-        // Build assignment data
-        let primary = mh_assignments.first().ok_or_else(|| {
+        if mh_assignments.is_empty() {
             error!(
                 target: "mc.grpc.mc_service",
                 meeting_id = %meeting_id,
                 "No MH assignments provided"
             );
-            McError::Config("No MH assignments provided".to_string())
-        })?;
+            return Err(McError::Config("No MH assignments provided".to_string()));
+        }
 
-        let backup = mh_assignments.get(1);
+        let handlers: Vec<crate::redis::MhEndpointInfo> = mh_assignments
+            .iter()
+            .map(|a| crate::redis::MhEndpointInfo {
+                mh_id: a.mh_id.clone(),
+                webtransport_endpoint: a.webtransport_endpoint.clone(),
+                grpc_endpoint: if a.grpc_endpoint.is_empty() {
+                    None
+                } else {
+                    Some(a.grpc_endpoint.clone())
+                },
+            })
+            .collect();
 
         // Store in Redis with fencing token
         self.redis_client
-            .store_mh_assignment(
-                meeting_id,
-                &primary.mh_id,
-                &primary.webtransport_endpoint,
-                backup.map(|b| (b.mh_id.as_str(), b.webtransport_endpoint.as_str())),
-            )
+            .store_mh_assignment(meeting_id, &handlers)
             .await?;
 
         debug!(
             target: "mc.grpc.mc_service",
             meeting_id = %meeting_id,
-            primary_mh = %primary.mh_id,
-            backup_mh = backup.map(|b| b.mh_id.as_str()),
+            handler_count = handlers.len(),
             "Stored MH assignments"
         );
 

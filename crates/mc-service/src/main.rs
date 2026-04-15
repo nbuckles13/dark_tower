@@ -340,6 +340,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.tls_key_path.clone(),
         Arc::clone(&controller_handle),
         jwt_validator,
+        Arc::clone(&redis_client) as Arc<dyn mc_service::redis::MhAssignmentStore>,
         config.max_participants as usize,
         shutdown_token.child_token(),
     );

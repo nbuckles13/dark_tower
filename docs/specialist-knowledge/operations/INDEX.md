@@ -16,11 +16,8 @@
 - Kind config template (envsubst, host-gateway listenAddress) → `infra/kind/kind-config.yaml.tmpl`
 - Devloop wrapper → `infra/devloop/devloop.sh`, container image → `infra/devloop/Dockerfile`
 - Cluster networking debate → `docs/debates/2026-04-09-devloop-cluster-networking/debate.md`; sidecar (superseded) → `docs/debates/2026-04-05-devloop-cluster-sidecar.md`
-- Helper commands (setup, deploy, rebuild, teardown, status) → `crates/devloop-helper/src/commands.rs`
-- Helper protocol (command parsing, streaming) → `crates/devloop-helper/src/protocol.rs`
-- Status command (cluster health, pod readiness, setup-in-progress) → `crates/devloop-helper/src/commands.rs:cmd_status()`
-- Pod health parsing → `crates/devloop-helper/src/commands.rs:parse_pod_health()`
-- Port-map.env generation (MC/MH WebTransport ports) → `crates/devloop-helper/src/commands.rs:write_port_map_shell()`
+- Helper commands (setup, deploy, rebuild, teardown, status) → `crates/devloop-helper/src/commands.rs`; protocol → `crates/devloop-helper/src/protocol.rs`
+- Port-map.env generation → `crates/devloop-helper/src/commands.rs:write_port_map_shell()`
 - DT_HOST_GATEWAY_IP propagation → `crates/devloop-helper/src/commands.rs:cmd_setup()`, `cmd_deploy()`
 - Port registry → `~/.cache/devloop/port-registry.json` (global allocation state)
 - Per-devloop runtime state → `/tmp/devloop-{slug}/` (PID, socket, auth token, ports.json, setup.pid, eager-setup.log)
@@ -64,10 +61,13 @@
 - MH SessionManager actor (ADR-0001) → `crates/mh-service/src/session/mod.rs`; `SessionManagerHandle` (mpsc+oneshot, buffer=256) replaces `Arc<SessionManager>`; shutdown: gRPC+WebTransport tasks drop handles → channel closes → actor exits
 - MH WebTransport → `crates/mh-service/src/webtransport/server.rs`, `connection.rs`
 
-## MC WebTransport + Actors
-- MC WebTransport → `crates/mc-service/src/webtransport/server.rs`, `crates/mc-service/src/webtransport/connection.rs`
-- MC startup → `crates/mc-service/src/main.rs`
-- Actors → `crates/mc-service/src/actors/controller.rs`, `crates/mc-service/src/actors/meeting.rs`, `crates/mc-service/src/actors/participant.rs`
+## MC Service
+- MC startup → `crates/mc-service/src/main.rs`; config → `crates/mc-service/src/config.rs`
+- MC WebTransport → `crates/mc-service/src/webtransport/server.rs`, `connection.rs`
+- MC GC client → `crates/mc-service/src/grpc/gc_client.rs`; MH client → `crates/mc-service/src/grpc/mh_client.rs`
+- MC gRPC service (GC→MC assignments) → `crates/mc-service/src/grpc/mc_service.rs`
+- Redis (fenced writes, MhAssignmentData, MhAssignmentStore trait) → `crates/mc-service/src/redis/client.rs`
+- Actors → `crates/mc-service/src/actors/controller.rs`, `meeting.rs`, `participant.rs`
 
 ## GC Service
 - GC routes + handlers → `crates/gc-service/src/routes/mod.rs`, `crates/gc-service/src/handlers/meetings.rs`

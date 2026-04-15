@@ -80,6 +80,14 @@ pub fn init_metrics_recorder() -> Result<PrometheusHandle, String> {
             ],
         )
         .map_err(|e| format!("Failed to set session join buckets: {e}"))?
+        // MH RegisterMeeting RPC buckets - internal service call
+        .set_buckets_for_metric(
+            Matcher::Prefix("mc_register_meeting".to_string()),
+            &[
+                0.001, 0.005, 0.010, 0.025, 0.050, 0.100, 0.250, 0.500, 1.000,
+            ],
+        )
+        .map_err(|e| format!("Failed to set register meeting buckets: {e}"))?
         .install_recorder()
         .map_err(|e| format!("Failed to install Prometheus metrics recorder: {e}"))
 }
@@ -345,6 +353,29 @@ pub fn record_session_join(status: &str, error_type: Option<&str>, duration: Dur
 }
 
 // ============================================================================
+// MH Registration Metrics
+// ============================================================================
+
+/// Record a RegisterMeeting RPC attempt to an MH.
+///
+/// Emits two metrics:
+/// - `mc_register_meeting_total` counter (labels: `status`)
+/// - `mc_register_meeting_duration_seconds` histogram (no labels)
+///
+/// # Arguments
+///
+/// * `status` - "success" or "error"
+/// * `duration` - Duration of the RegisterMeeting RPC call
+pub fn record_register_meeting(status: &str, duration: Duration) {
+    histogram!("mc_register_meeting_duration_seconds").record(duration.as_secs_f64());
+
+    counter!("mc_register_meeting_total",
+        "status" => status.to_string()
+    )
+    .increment(1);
+}
+
+// ============================================================================
 // Error Metrics
 // ============================================================================
 
@@ -490,6 +521,15 @@ mod tests {
     }
 
     #[test]
+    fn test_record_register_meeting() {
+        // Success path
+        record_register_meeting("success", Duration::from_millis(20));
+
+        // Error path
+        record_register_meeting("error", Duration::from_millis(100));
+    }
+
+    #[test]
     fn test_record_error() {
         // MC uses signaling error codes (2-7), not HTTP status codes
         record_error("token_refresh", "http", 6); // INTERNAL_ERROR
@@ -622,6 +662,9 @@ mod tests {
         // Record token refresh metrics
         record_token_refresh("success", None, Duration::from_millis(50));
         record_token_refresh("error", Some("http"), Duration::from_millis(100));
+
+        // Record MH registration metrics
+        record_register_meeting("success", Duration::from_millis(20));
 
         // Record error metrics
         record_error("token_refresh", "http", 500);

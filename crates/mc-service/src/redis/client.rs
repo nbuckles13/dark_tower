@@ -20,7 +20,12 @@
 //! let client = FencedRedisClient::new("redis://localhost:6379").await?;
 //!
 //! // Store MH assignment with fencing
-//! client.store_mh_assignment("meeting-123", "mh-1", "wt://mh-1:4433", None).await?;
+//! let handlers = &[MhEndpointInfo {
+//!     mh_id: "mh-1".to_string(),
+//!     webtransport_endpoint: "wt://mh-1:4433".to_string(),
+//!     grpc_endpoint: Some("http://mh-1:50053".to_string()),
+//! }];
+//! client.store_mh_assignment("meeting-123", handlers).await?;
 //!
 //! // Get current generation
 //! let gen = client.get_generation("meeting-123").await?;
@@ -37,19 +42,42 @@ use std::time::Instant;
 use tokio::sync::RwLock;
 use tracing::{debug, error, instrument, warn};
 
+/// Information about a single MH endpoint (active/active peers).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MhEndpointInfo {
+    /// MH identifier.
+    pub mh_id: String,
+    /// WebTransport endpoint for client media connections.
+    pub webtransport_endpoint: String,
+    /// gRPC endpoint for MC->MH communication (optional).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grpc_endpoint: Option<String>,
+}
+
 /// MH assignment data stored in Redis.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MhAssignmentData {
-    /// Primary MH ID.
-    pub primary_mh_id: String,
-    /// Primary MH WebTransport endpoint.
-    pub primary_endpoint: String,
-    /// Backup MH ID (optional).
-    pub backup_mh_id: Option<String>,
-    /// Backup MH WebTransport endpoint (optional).
-    pub backup_endpoint: Option<String>,
-    /// Assignment timestamp.
-    pub assigned_at: i64,
+    /// Active MH handlers for this meeting.
+    pub handlers: Vec<MhEndpointInfo>,
+    /// Assignment timestamp (ISO 8601).
+    pub assigned_at: String,
+}
+
+/// Trait for reading MH assignment data.
+///
+/// Abstraction over the Redis lookup used during the join flow to populate
+/// `media_servers` in `JoinResponse`. Production code uses `FencedRedisClient`;
+/// tests can inject an in-memory mock.
+pub trait MhAssignmentStore: Send + Sync {
+    /// Read MH assignment data for a meeting.
+    fn get_mh_assignment<'a>(
+        &'a self,
+        meeting_id: &'a str,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<Option<MhAssignmentData>, McError>> + Send + 'a,
+        >,
+    >;
 }
 
 /// Fenced Redis client for Meeting Controller.
@@ -215,31 +243,24 @@ impl FencedRedisClient {
     /// # Arguments
     ///
     /// * `meeting_id` - Meeting identifier
-    /// * `primary_mh_id` - Primary MH identifier
-    /// * `primary_endpoint` - Primary MH WebTransport endpoint
-    /// * `backup` - Optional backup MH (id, endpoint)
+    /// * `handlers` - Slice of MH endpoint info (active/active peers)
     ///
     /// # Errors
     ///
     /// Returns `McError::FencedOut` if another MC has written a higher generation.
     /// Returns `McError::Redis` for connection or serialization errors.
-    #[instrument(skip_all, fields(meeting_id = %meeting_id, primary_mh_id = %primary_mh_id))]
+    #[instrument(skip_all, fields(meeting_id = %meeting_id, handler_count = handlers.len()))]
     pub async fn store_mh_assignment(
         &self,
         meeting_id: &str,
-        primary_mh_id: &str,
-        primary_endpoint: &str,
-        backup: Option<(&str, &str)>,
+        handlers: &[MhEndpointInfo],
     ) -> Result<(), McError> {
         // Get current generation and increment
         let generation = self.increment_generation(meeting_id).await?;
 
         let data = MhAssignmentData {
-            primary_mh_id: primary_mh_id.to_string(),
-            primary_endpoint: primary_endpoint.to_string(),
-            backup_mh_id: backup.map(|(id, _)| id.to_string()),
-            backup_endpoint: backup.map(|(_, ep)| ep.to_string()),
-            assigned_at: chrono::Utc::now().timestamp(),
+            handlers: handlers.to_vec(),
+            assigned_at: chrono::Utc::now().to_rfc3339(),
         };
 
         let json = serde_json::to_string(&data).map_err(|e| {
@@ -557,6 +578,19 @@ impl FencedRedisClient {
     }
 }
 
+impl MhAssignmentStore for FencedRedisClient {
+    fn get_mh_assignment<'a>(
+        &'a self,
+        meeting_id: &'a str,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<Option<MhAssignmentData>, McError>> + Send + 'a,
+        >,
+    > {
+        Box::pin(self.get_mh_assignment(meeting_id))
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -565,77 +599,124 @@ mod tests {
     #[test]
     fn test_mh_assignment_data_serialization() {
         let data = MhAssignmentData {
-            primary_mh_id: "mh-1".to_string(),
-            primary_endpoint: "wt://mh-1:4433".to_string(),
-            backup_mh_id: Some("mh-2".to_string()),
-            backup_endpoint: Some("wt://mh-2:4433".to_string()),
-            assigned_at: 1234567890,
+            handlers: vec![
+                MhEndpointInfo {
+                    mh_id: "mh-1".to_string(),
+                    webtransport_endpoint: "wt://mh-1:4433".to_string(),
+                    grpc_endpoint: Some("http://mh-1:50053".to_string()),
+                },
+                MhEndpointInfo {
+                    mh_id: "mh-2".to_string(),
+                    webtransport_endpoint: "wt://mh-2:4433".to_string(),
+                    grpc_endpoint: Some("http://mh-2:50053".to_string()),
+                },
+            ],
+            assigned_at: "2024-01-23T00:00:00Z".to_string(),
         };
 
         let json = serde_json::to_string(&data).unwrap();
         let parsed: MhAssignmentData = serde_json::from_str(&json).unwrap();
 
-        assert_eq!(parsed.primary_mh_id, "mh-1");
-        assert_eq!(parsed.backup_mh_id, Some("mh-2".to_string()));
+        assert_eq!(parsed.handlers.len(), 2);
+        assert_eq!(parsed.handlers[0].mh_id, "mh-1");
+        assert_eq!(
+            parsed.handlers[0].grpc_endpoint,
+            Some("http://mh-1:50053".to_string())
+        );
+        assert_eq!(parsed.handlers[1].mh_id, "mh-2");
+        assert_eq!(
+            parsed.handlers[1].grpc_endpoint,
+            Some("http://mh-2:50053".to_string())
+        );
     }
 
     #[test]
-    fn test_mh_assignment_data_without_backup() {
+    fn test_mh_assignment_data_single_handler() {
         let data = MhAssignmentData {
-            primary_mh_id: "mh-1".to_string(),
-            primary_endpoint: "wt://mh-1:4433".to_string(),
-            backup_mh_id: None,
-            backup_endpoint: None,
-            assigned_at: 1234567890,
+            handlers: vec![MhEndpointInfo {
+                mh_id: "mh-1".to_string(),
+                webtransport_endpoint: "wt://mh-1:4433".to_string(),
+                grpc_endpoint: Some("http://mh-1:50053".to_string()),
+            }],
+            assigned_at: "2024-01-23T00:00:00Z".to_string(),
         };
 
         let json = serde_json::to_string(&data).unwrap();
         let parsed: MhAssignmentData = serde_json::from_str(&json).unwrap();
 
-        assert_eq!(parsed.primary_mh_id, "mh-1");
-        assert!(parsed.backup_mh_id.is_none());
+        assert_eq!(parsed.handlers.len(), 1);
+        assert_eq!(parsed.handlers[0].mh_id, "mh-1");
     }
 
     #[test]
     fn test_mh_assignment_data_fields() {
-        // Verify all fields are properly serialized
         let data = MhAssignmentData {
-            primary_mh_id: "mh-primary".to_string(),
-            primary_endpoint: "wt://primary:4433".to_string(),
-            backup_mh_id: Some("mh-backup".to_string()),
-            backup_endpoint: Some("wt://backup:4433".to_string()),
-            assigned_at: 1706000000,
+            handlers: vec![
+                MhEndpointInfo {
+                    mh_id: "mh-1".to_string(),
+                    webtransport_endpoint: "wt://mh-1:4433".to_string(),
+                    grpc_endpoint: Some("http://mh-1:50053".to_string()),
+                },
+                MhEndpointInfo {
+                    mh_id: "mh-2".to_string(),
+                    webtransport_endpoint: "wt://mh-2:4433".to_string(),
+                    grpc_endpoint: Some("http://mh-2:50053".to_string()),
+                },
+            ],
+            assigned_at: "2024-01-23T12:00:00Z".to_string(),
         };
 
         let json = serde_json::to_string(&data).unwrap();
 
         // Verify JSON structure
-        assert!(json.contains("\"primary_mh_id\":\"mh-primary\""));
-        assert!(json.contains("\"primary_endpoint\":\"wt://primary:4433\""));
-        assert!(json.contains("\"backup_mh_id\":\"mh-backup\""));
-        assert!(json.contains("\"backup_endpoint\":\"wt://backup:4433\""));
-        assert!(json.contains("\"assigned_at\":1706000000"));
+        assert!(json.contains("\"mh_id\":\"mh-1\""));
+        assert!(json.contains("\"webtransport_endpoint\":\"wt://mh-1:4433\""));
+        assert!(json.contains("\"grpc_endpoint\":\"http://mh-1:50053\""));
+        assert!(json.contains("\"mh_id\":\"mh-2\""));
+        assert!(json.contains("\"webtransport_endpoint\":\"wt://mh-2:4433\""));
+        assert!(json.contains("\"grpc_endpoint\":\"http://mh-2:50053\""));
+        assert!(json.contains("\"assigned_at\":\"2024-01-23T12:00:00Z\""));
     }
 
     #[test]
     fn test_mh_assignment_data_round_trip() {
-        // Test full round-trip serialization
         let original = MhAssignmentData {
-            primary_mh_id: "mh-1".to_string(),
-            primary_endpoint: "wt://mh-1:4433".to_string(),
-            backup_mh_id: Some("mh-2".to_string()),
-            backup_endpoint: Some("wt://mh-2:4433".to_string()),
-            assigned_at: 1234567890,
+            handlers: vec![
+                MhEndpointInfo {
+                    mh_id: "mh-1".to_string(),
+                    webtransport_endpoint: "wt://mh-1:4433".to_string(),
+                    grpc_endpoint: Some("http://mh-1:50053".to_string()),
+                },
+                MhEndpointInfo {
+                    mh_id: "mh-2".to_string(),
+                    webtransport_endpoint: "wt://mh-2:4433".to_string(),
+                    grpc_endpoint: None,
+                },
+            ],
+            assigned_at: "2024-01-23T00:00:00Z".to_string(),
         };
 
         let json = serde_json::to_string(&original).unwrap();
         let restored: MhAssignmentData = serde_json::from_str(&json).unwrap();
 
-        assert_eq!(original.primary_mh_id, restored.primary_mh_id);
-        assert_eq!(original.primary_endpoint, restored.primary_endpoint);
-        assert_eq!(original.backup_mh_id, restored.backup_mh_id);
-        assert_eq!(original.backup_endpoint, restored.backup_endpoint);
+        assert_eq!(original.handlers.len(), restored.handlers.len());
+        for (orig, rest) in original.handlers.iter().zip(restored.handlers.iter()) {
+            assert_eq!(orig.mh_id, rest.mh_id);
+            assert_eq!(orig.webtransport_endpoint, rest.webtransport_endpoint);
+            assert_eq!(orig.grpc_endpoint, rest.grpc_endpoint);
+        }
         assert_eq!(original.assigned_at, restored.assigned_at);
+    }
+
+    #[test]
+    fn test_mh_endpoint_info_grpc_skip_serializing_none() {
+        let info = MhEndpointInfo {
+            mh_id: "mh-1".to_string(),
+            webtransport_endpoint: "wt://mh-1:4433".to_string(),
+            grpc_endpoint: None,
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        assert!(!json.contains("grpc_endpoint"));
     }
 
     #[test]
@@ -646,7 +727,7 @@ mod tests {
         assert!(result.is_err());
 
         // Test missing required fields
-        let incomplete_json = r#"{"primary_mh_id": "mh-1"}"#;
+        let incomplete_json = r#"{"handlers": []}"#;
         let result: Result<MhAssignmentData, _> = serde_json::from_str(incomplete_json);
         assert!(result.is_err());
     }

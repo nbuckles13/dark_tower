@@ -27,13 +27,13 @@
 
 ## Code Locations: MC Service
 - Auth + token validation (meeting, guest, confusion tests) -> `crates/mc-service/src/auth/mod.rs:tests`
-- Config + error tests -> `crates/mc-service/src/config.rs:tests`, `crates/mc-service/src/errors.rs:tests`
+- Config + error tests (incl. MhAssignmentMissing) -> `crates/mc-service/src/config.rs:tests`, `crates/mc-service/src/errors.rs:tests`
 - Actor tests (controller, meeting, participant, session) -> `crates/mc-service/src/actors/controller.rs:tests`, `meeting.rs`, `participant.rs`, `session.rs`
-- WebTransport tests (encoding, connection) -> `crates/mc-service/src/webtransport/handler.rs:tests`, `connection.rs`
-- MC error code mapping (JwtValidation → Unauthorized) → `crates/mc-service/src/webtransport/connection.rs:send_error()`
+- Join flow integration tests (T1-T11, MH assignment, media_servers, bridge) + encoding -> `crates/mc-service/tests/join_tests.rs`, `src/webtransport/handler.rs:tests`
+- MH data (MhAssignmentStore trait, serde, backward compat, MhClient, MockMhAssignmentStore) -> `crates/mc-service/src/redis/client.rs`, `src/grpc/mh_client.rs:tests`, `tests/join_tests.rs`
 - GC integration + heartbeat tests -> `crates/mc-service/tests/gc_integration.rs`, `heartbeat_tasks.rs`
-- Health + metrics -> `crates/mc-service/src/observability/health.rs`, `metrics.rs`
-- Test utils (mock Redis, mock GC) -> `crates/mc-test-utils/src/mock_redis.rs`, `mock_gc.rs`
+- Health + metrics (incl. RegisterMeeting) -> `crates/mc-service/src/observability/health.rs`, `metrics.rs`
+- Test utils (mock Redis, mock GC, mock MH) -> `crates/mc-test-utils/src/mock_redis.rs`, `mock_gc.rs`, `mock_mh.rs`
 
 ## Code Locations: MH Service
 - Config tests (env vars, defaults, TLS, debug redaction, advertise addresses, JWKS URL, timeouts) -> `crates/mh-service/src/config.rs:tests`

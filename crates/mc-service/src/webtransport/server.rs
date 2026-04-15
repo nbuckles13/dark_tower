@@ -12,6 +12,7 @@
 use crate::actors::MeetingControllerActorHandle;
 use crate::auth::McJwtValidator;
 use crate::observability::metrics;
+use crate::redis::MhAssignmentStore;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -34,6 +35,8 @@ pub struct WebTransportServer {
     controller_handle: Arc<MeetingControllerActorHandle>,
     /// JWT validator for meeting tokens.
     jwt_validator: Arc<McJwtValidator>,
+    /// Redis client for reading MH assignment data during join.
+    redis_client: Arc<dyn MhAssignmentStore>,
     /// Maximum concurrent connections (bounds resource exhaustion).
     max_connections: usize,
     /// Active connection count.
@@ -45,12 +48,17 @@ pub struct WebTransportServer {
 impl WebTransportServer {
     /// Create a new WebTransport server.
     #[must_use]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Constructor wiring; a config struct would be over-engineering"
+    )]
     pub fn new(
         bind_address: String,
         tls_cert_path: String,
         tls_key_path: String,
         controller_handle: Arc<MeetingControllerActorHandle>,
         jwt_validator: Arc<McJwtValidator>,
+        redis_client: Arc<dyn MhAssignmentStore>,
         max_connections: usize,
         cancel_token: CancellationToken,
     ) -> Self {
@@ -60,6 +68,7 @@ impl WebTransportServer {
             tls_key_path,
             controller_handle,
             jwt_validator,
+            redis_client,
             max_connections,
             active_connections: Arc::new(AtomicUsize::new(0)),
             cancel_token,
@@ -162,6 +171,7 @@ impl WebTransportServer {
                     let active_connections = Arc::clone(&self.active_connections);
                     let controller_handle = Arc::clone(&self.controller_handle);
                     let jwt_validator = Arc::clone(&self.jwt_validator);
+                    let redis_client = Arc::clone(&self.redis_client);
                     let connection_token = self.cancel_token.child_token();
 
                     tokio::spawn(async move {
@@ -169,6 +179,7 @@ impl WebTransportServer {
                             incoming_session,
                             controller_handle,
                             jwt_validator,
+                            redis_client,
                             connection_token,
                         )
                         .await;

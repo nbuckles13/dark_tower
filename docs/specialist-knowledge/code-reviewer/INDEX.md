@@ -34,18 +34,18 @@
 - Metrics/dashboard/alerts → `observability/metrics.rs`, `docs/observability/metrics/gc-service.md`, `infra/grafana/dashboards/gc-overview.json`
 
 ## Code Locations — MC Service
-- Error type (McError, bounded labels, From<JwtError>) → `crates/mc-service/src/errors.rs`
+- Error type (McError, bounded labels, From<JwtError>, MhAssignmentMissing) → `crates/mc-service/src/errors.rs`
 - JWT validator + token type enforcement → `crates/mc-service/src/auth/mod.rs:McJwtValidator`
 - gRPC auth interceptor (structural) → `crates/mc-service/src/grpc/auth_interceptor.rs:McAuthInterceptor`
+- MH gRPC client (Channel-per-call, RegisterMeeting RPC) → `crates/mc-service/src/grpc/mh_client.rs:MhClient`
 - Config (ac_jwks_url, advertise addresses, ordinal parsing) → `crates/mc-service/src/config.rs:Config`, `parse_statefulset_ordinal()`
 - Startup wiring (JwksClient + McJwtValidator) → `crates/mc-service/src/main.rs:168-189`
-- WebTransport server (accept loop) → `crates/mc-service/src/webtransport/server.rs:WebTransportServer::accept_loop()`
-- Connection handler (join flow) → `crates/mc-service/src/webtransport/connection.rs:handle_connection()`
-- MC metrics (join, WebTransport, JWT, init) → `crates/mc-service/src/observability/metrics.rs`
-- Dashboard + alerts (join panels, Traffic/Security stat rows) → `infra/grafana/dashboards/mc-overview.json`, `infra/docker/prometheus/rules/mc-alerts.yaml`
-- Metrics catalog → `docs/observability/metrics/mc-service.md`
-- Health probes (liveness/readiness) → `crates/mc-service/src/observability/health.rs:health_router()`
-- K8s (probes on 8081, per-pod NodePort) → `infra/services/mc-service/statefulset.yaml`, `service.yaml`, `network-policy.yaml`
+- Redis (MhAssignmentData, MhAssignmentStore trait, FencedRedisClient) → `crates/mc-service/src/redis/client.rs`
+- WebTransport server (accept loop, redis injection) → `crates/mc-service/src/webtransport/server.rs:WebTransportServer::accept_loop()`
+- Connection handler (join flow, build_join_response) → `crates/mc-service/src/webtransport/connection.rs:handle_connection()`, `build_join_response()`
+- MC metrics (join, WebTransport, JWT, register_meeting, init) → `crates/mc-service/src/observability/metrics.rs`
+- Dashboard + alerts + catalog → `infra/grafana/dashboards/mc-overview.json`, `infra/docker/prometheus/rules/mc-alerts.yaml`, `docs/observability/metrics/mc-service.md`
+- Health probes + K8s (8081, per-pod NodePort) → `observability/health.rs:health_router()`, `infra/services/mc-service/{statefulset,service,network-policy}.yaml`
 
 ## Code Locations — MH Service
 - Config (env vars, SecretString, Debug redaction, advertise addresses) → `crates/mh-service/src/config.rs:Config`

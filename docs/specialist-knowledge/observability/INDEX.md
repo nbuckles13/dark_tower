@@ -11,8 +11,8 @@
 - Metric catalogs -> `docs/observability/metrics/ac-service.md`, `docs/observability/metrics/gc-service.md`, `docs/observability/metrics/mc-service.md`, `docs/observability/metrics/mh-service.md`
 - AC metrics -> `crates/ac-service/src/observability/metrics.rs:init_metrics_recorder()`, gauge init `services/key_management_service.rs:init_key_metrics()`, HTTP middleware `middleware/http_metrics.rs`, rate limit config `config.rs`
 - GC metrics -> `crates/gc-service/src/observability/metrics.rs`, HTTP middleware `middleware/http_metrics.rs:normalize_endpoint()`, join wiring `handlers/meetings.rs:join_meeting()`, DB metrics `repositories/`; gap: `get_guest_token()` uninstrumented
-- MC metrics -> `crates/mc-service/src/observability/metrics.rs`; recording sites: `webtransport/connection.rs:handle_connection()`, `server.rs:accept_loop()`; bounded labels `errors.rs:error_type_label()`
-- MH metrics (registration, heartbeat, token refresh, gRPC, WebTransport, JWT) -> `crates/mh-service/src/observability/metrics.rs`; recording sites: `webtransport/server.rs:accept_loop()`, `webtransport/connection.rs:handle_connection()`, `grpc/auth_interceptor.rs:MhAuthService`, `grpc/mh_service.rs:register_meeting()`
+- MC metrics -> `crates/mc-service/src/observability/metrics.rs`; recording sites: `webtransport/connection.rs:handle_connection()`, `server.rs:accept_loop()`, `grpc/mh_client.rs:register_meeting()`; bounded labels `errors.rs:error_type_label()`
+- MH metrics (registration, heartbeat, token refresh, gRPC, WebTransport, JWT) -> `crates/mh-service/src/observability/metrics.rs`; recording sites: `webtransport/server.rs:accept_loop()`, `webtransport/connection.rs:handle_connection()`, `grpc/auth_interceptor.rs:MhAuthService`
 
 ## Auth & JWT Tracing
 - Common JWT (JwksClient, JwtValidator, verify_token, PII-redacted Debug) -> `crates/common/src/jwt.rs`
@@ -23,24 +23,25 @@
 - Server/connection/handler (targets: `mc.webtransport`, `.connection`, `.handler`) -> `crates/mc-service/src/webtransport/server.rs`, `connection.rs`, `handler.rs`
 - ParticipantActor (target: `mc.actor.participant`) -> `crates/mc-service/src/actors/participant.rs:run()`
 
-## MH Tracing
-- WebTransport server/connection (targets: `mh.webtransport`, `.connection`) -> `crates/mh-service/src/webtransport/server.rs`, `connection.rs`
-- SessionManagerActor (target: `mh.session`, debug lifecycle + warn channel-closed) -> `crates/mh-service/src/session/mod.rs`
+## MH WebTransport Tracing
+- Server/connection (targets: `mh.webtransport`, `.connection`) -> `crates/mh-service/src/webtransport/server.rs`, `connection.rs`
 
-## GC Client Tracing (MC + MH)
-- GcClient tracing (registration, heartbeat, re-registration) -> `crates/mc-service/src/grpc/gc_client.rs` (+ mh)
+## gRPC Client Tracing (MC -> GC, MC -> MH)
+- GcClient tracing (registration, heartbeat, re-registration) -> `crates/mc-service/src/grpc/gc_client.rs` (target: `mc.grpc.gc_client`)
+- MhClient tracing (RegisterMeeting RPC) -> `crates/mc-service/src/grpc/mh_client.rs` (target: `mc.grpc.mh_client`)
 
 ## Health
 - MC health state -> `crates/mc-service/src/observability/health.rs:health_router()`
 - MH health state (ready after GC registration) -> `crates/mh-service/src/observability/health.rs:health_router()`
 
 ## Dashboards, Alerts & Infrastructure
-- Grafana dashboards (per-service overview, errors-overview, SLOs) -> `infra/grafana/dashboards/`, provisioning `infra/grafana/provisioning/`
+- Grafana dashboards (per-service overview, errors-overview, SLOs) -> `infra/grafana/dashboards/`, provisioning `infra/grafana/provisioning/`; MC MH Communication row -> `mc-overview.json` (panels: RegisterMeeting RPC Rate, Latency P50/P95/P99)
 - Grafana K8s (configMapGenerator, sidecar, RBAC) -> `infra/kubernetes/observability/grafana/`
 - Alert rules (GC, MC) -> `infra/docker/prometheus/rules/{gc,mc}-alerts.yaml`; docs -> `docs/observability/alerts.md`, `docs/observability/dashboards.md`
 - Prometheus config -> `infra/docker/prometheus/prometheus.yml` (compose), `infra/kubernetes/observability/prometheus-config.yaml` (K8s)
 - Loki + observability kustomization -> `infra/kubernetes/observability/{loki-config,kustomization}.yaml`
 - Kind observability NodePorts (30090/30030/30080) -> `infra/kind/kind-config.yaml`
+- MC/MH K8s health probes + metrics scrape -> `infra/services/{mc,mh}-service/deployment.yaml`
 
 ## Kind Cluster Setup (Observability)
 - Setup (deploy_observability, setup_port_forwards, deploy_only_service, DT_CLUSTER_NAME/DT_PORT_MAP) -> `infra/kind/scripts/setup.sh`
@@ -66,11 +67,9 @@
 - Dashboard-to-kustomize coverage (R-20, bidirectional) -> `scripts/guards/simple/validate-kustomize.sh`
 - Instrument skip_all enforcement -> `scripts/guards/simple/instrument-skip-all.sh`
 
-## Env-Test Observability & Cluster Config
-- MC/MH K8s health probes + metrics scrape -> `infra/services/{mc,mh}-service/deployment.yaml`
-
 ## Runbooks
-- Per-service deployment + incident response -> `docs/runbooks/`; GC scenarios 8-9 + join triage -> `docs/runbooks/gc-incident-response.md`
+- Per-service deployment + incident response -> `docs/runbooks/` (two per service)
+- GC scenarios 8-9 + join failure triage -> `docs/runbooks/gc-incident-response.md`, `docs/observability/alerts.md`
 
 ## Test Coverage & Integration Seams
 - GC/MC/MH metrics tests -> `crates/gc-service/src/observability/metrics.rs`, `crates/mc-service/src/observability/metrics.rs`, `crates/mh-service/src/observability/metrics.rs`

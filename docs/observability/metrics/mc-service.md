@@ -194,6 +194,30 @@ All MC service metrics follow ADR-0011 naming conventions with the `mc_` prefix.
 
 ---
 
+## MH Communication Metrics
+
+### `mc_register_meeting_total`
+- **Type**: Counter
+- **Description**: Total RegisterMeeting RPC attempts by outcome
+- **Labels**:
+  - `status`: RPC outcome (`success`, `error`)
+- **Cardinality**: Low (2 status values)
+- **Usage**: Monitor MC→MH meeting registration reliability, detect MH connectivity issues
+- **Recorded in**: `mh_client.rs` after RegisterMeeting RPC completes
+- **Dashboard**: MC Overview - RegisterMeeting RPC Rate by Status (MH Communication row)
+
+### `mc_register_meeting_duration_seconds`
+- **Type**: Histogram
+- **Description**: RegisterMeeting RPC round-trip latency
+- **Labels**: None
+- **Buckets**: [0.001, 0.005, 0.010, 0.025, 0.050, 0.100, 0.250, 0.500, 1.000]
+- **Cardinality**: 1 (no labels)
+- **Usage**: Monitor MC→MH RPC latency, detect MH performance degradation
+- **Recorded in**: `mh_client.rs` measuring full RPC round-trip
+- **Dashboard**: MC Overview - RegisterMeeting RPC Latency P50/P95/P99 (MH Communication row)
+
+---
+
 ## Prometheus Query Examples
 
 ### Active Meetings
@@ -257,6 +281,19 @@ sum(rate(mc_webtransport_connections_total[5m]))
 sum(rate(mc_session_join_failures_total[5m])) by (error_type)
 ```
 
+### RegisterMeeting RPC Success Rate
+```promql
+sum(rate(mc_register_meeting_total{status="success"}[5m])) /
+sum(rate(mc_register_meeting_total[5m]))
+```
+
+### RegisterMeeting RPC Latency p99
+```promql
+histogram_quantile(0.99,
+  sum(rate(mc_register_meeting_duration_seconds_bucket[5m])) by (le)
+)
+```
+
 ---
 
 ## SLO Definitions
@@ -295,9 +332,9 @@ All MC service metrics follow strict cardinality bounds per ADR-0011:
 | `type` | 2 | `fast`, `comprehensive` |
 | `result` | 2 | `success`, `failure` (JWT validation) |
 | `token_type` | 2 | `meeting`, `guest` (JWT validation) |
-| `error_type` | ~18 | Bounded by `McError` enum variants |
+| `error_type` | ~19 | Bounded by `McError` enum variants |
 
-**Total Estimated Cardinality**: ~75 time series (well within Prometheus limits)
+**Total Estimated Cardinality**: ~79 time series (well within Prometheus limits)
 
 ---
 

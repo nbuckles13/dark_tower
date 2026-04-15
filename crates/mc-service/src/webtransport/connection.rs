@@ -11,13 +11,14 @@ use crate::actors::MeetingControllerActorHandle;
 use crate::auth::McJwtValidator;
 use crate::errors::McError;
 use crate::observability::metrics;
+use crate::redis::MhAssignmentStore;
 
 use bytes::{BufMut, BytesMut};
 use common::jwt::MeetingRole;
 use prost::Message;
 use proto_gen::signaling::{
-    self, client_message, server_message, ClientMessage, ErrorMessage, JoinResponse, Participant,
-    ServerMessage,
+    self, client_message, server_message, ClientMessage, ErrorMessage, JoinResponse,
+    MediaServerInfo, Participant, ServerMessage,
 };
 use std::sync::Arc;
 use std::time::Instant;
@@ -46,6 +47,7 @@ pub async fn handle_connection(
     incoming: IncomingSession,
     controller_handle: Arc<MeetingControllerActorHandle>,
     jwt_validator: Arc<McJwtValidator>,
+    redis_client: Arc<dyn MhAssignmentStore>,
     cancel_token: CancellationToken,
 ) -> Result<(), McError> {
     // Step 1: Accept the WebTransport session
@@ -333,8 +335,28 @@ pub async fn handle_connection(
         "Join succeeded"
     );
 
-    // Step 8: Build and send JoinResponse
-    let join_response = build_join_response(&join_result);
+    // Step 8: Build and send JoinResponse (reads MH assignment data from Redis)
+    let join_response =
+        match build_join_response(&join_result, redis_client.as_ref(), &meeting_id).await {
+            Ok(resp) => resp,
+            Err(e) => {
+                warn!(
+                    target: "mc.webtransport.connection",
+                    connection_id = %connection_id,
+                    meeting_id = %meeting_id,
+                    error = %e,
+                    "Failed to build JoinResponse"
+                );
+                join_result.participant_handle.cancel();
+                let _ = send_error(&mut send_stream, e.error_code(), &e.client_message()).await;
+                metrics::record_session_join(
+                    "failure",
+                    Some(e.error_type_label()),
+                    join_start.elapsed(),
+                );
+                return Err(e);
+            }
+        };
     let server_msg = ServerMessage {
         message: Some(server_message::Message::JoinResponse(join_response)),
     };
@@ -547,7 +569,15 @@ async fn send_error(
 }
 
 /// Build a protobuf `JoinResponse` from the actor's `JoinResult`.
-fn build_join_response(result: &JoinResult) -> JoinResponse {
+///
+/// Reads MH assignment data from Redis to populate `media_servers`.
+/// Fails the join if MH assignment data is unavailable — a meeting
+/// without media handlers is not useful (R-6).
+async fn build_join_response(
+    result: &JoinResult,
+    redis_client: &dyn MhAssignmentStore,
+    meeting_id: &str,
+) -> Result<JoinResponse, McError> {
     let existing_participants = result
         .participants
         .iter()
@@ -559,92 +589,39 @@ fn build_join_response(result: &JoinResult) -> JoinResponse {
         })
         .collect();
 
-    JoinResponse {
+    // Read MH assignment data from Redis (R-6)
+    let mh_data = redis_client
+        .get_mh_assignment(meeting_id)
+        .await?
+        .ok_or_else(|| {
+            warn!(
+                target: "mc.webtransport.connection",
+                meeting_id = %meeting_id,
+                "No MH assignment data in Redis — cannot join without media handlers"
+            );
+            McError::MhAssignmentMissing(meeting_id.to_string())
+        })?;
+
+    // Populate media_servers with WebTransport endpoints from MH assignment data
+    let media_servers: Vec<MediaServerInfo> = mh_data
+        .handlers
+        .iter()
+        .map(|h| MediaServerInfo {
+            media_handler_url: h.webtransport_endpoint.clone(),
+        })
+        .collect();
+
+    Ok(JoinResponse {
         participant_id: result.participant_id.clone(),
         user_id: 0,
         existing_participants,
-        media_servers: Vec::new(),
+        media_servers,
         encryption_keys: None,
         correlation_id: result.correlation_id.clone(),
         binding_token: result.binding_token.clone(),
-    }
+    })
 }
 
-#[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
-mod tests {
-    use super::*;
-    use crate::actors::messages::{ParticipantInfo, ParticipantStatus};
-
-    fn make_participant_info(id: &str, name: &str) -> ParticipantInfo {
-        ParticipantInfo {
-            participant_id: id.to_string(),
-            user_id: "user-1".to_string(),
-            display_name: name.to_string(),
-            audio_self_muted: false,
-            video_self_muted: false,
-            audio_host_muted: false,
-            video_host_muted: false,
-            status: ParticipantStatus::Connected,
-        }
-    }
-
-    fn dummy_participant_handle() -> crate::actors::participant::ParticipantActorHandle {
-        use crate::actors::metrics::ActorMetrics;
-        let cancel_token = tokio_util::sync::CancellationToken::new();
-        let metrics = ActorMetrics::new();
-        let (handle, _task) = crate::actors::participant::ParticipantActor::spawn(
-            "test-conn".to_string(),
-            "test-part".to_string(),
-            "test-meeting".to_string(),
-            cancel_token,
-            metrics,
-        );
-        handle
-    }
-
-    #[test]
-    fn test_build_join_response_basic() {
-        let _rt = tokio::runtime::Runtime::new().unwrap();
-        let _guard = _rt.enter();
-        let result = JoinResult {
-            participant_id: "part-100".to_string(),
-            correlation_id: "corr-abc".to_string(),
-            binding_token: "token-xyz".to_string(),
-            participants: vec![
-                make_participant_info("part-1", "Alice"),
-                make_participant_info("part-2", "Bob"),
-            ],
-            fencing_generation: 1,
-            participant_handle: dummy_participant_handle(),
-        };
-
-        let response = build_join_response(&result);
-        assert_eq!(response.participant_id, "part-100");
-        assert_eq!(response.correlation_id, "corr-abc");
-        assert_eq!(response.binding_token, "token-xyz");
-        assert_eq!(response.existing_participants.len(), 2);
-        assert_eq!(response.existing_participants[0].participant_id, "part-1");
-        assert_eq!(response.existing_participants[0].name, "Alice");
-        assert_eq!(response.existing_participants[1].participant_id, "part-2");
-        assert_eq!(response.existing_participants[1].name, "Bob");
-    }
-
-    #[test]
-    fn test_build_join_response_empty_participants() {
-        let _rt = tokio::runtime::Runtime::new().unwrap();
-        let _guard = _rt.enter();
-        let result = JoinResult {
-            participant_id: "part-solo".to_string(),
-            correlation_id: "corr-1".to_string(),
-            binding_token: "token-1".to_string(),
-            participants: vec![],
-            fencing_generation: 1,
-            participant_handle: dummy_participant_handle(),
-        };
-
-        let response = build_join_response(&result);
-        assert_eq!(response.participant_id, "part-solo");
-        assert!(response.existing_participants.is_empty());
-    }
-}
+// Note: build_join_response is async and requires a Redis client.
+// Integration tests in tests/join_tests.rs cover the full join flow
+// including Redis MH assignment data population and media_servers verification.

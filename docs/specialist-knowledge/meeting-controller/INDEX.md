@@ -23,12 +23,16 @@
 - Actor: metrics (dual system) → `crates/mc-service/src/actors/metrics.rs`
 - gRPC: GC client (registration, heartbeats, advertise address usage) → `crates/mc-service/src/grpc/gc_client.rs`
 - gRPC: MC service (AssignMeetingWithMh) → `crates/mc-service/src/grpc/mc_service.rs`
+- gRPC: MH client (RegisterMeeting, per-call Channel) → `crates/mc-service/src/grpc/mh_client.rs`
 - gRPC: auth interceptor (Bearer validation) → `crates/mc-service/src/grpc/auth_interceptor.rs`
 - Redis: fenced client (Lua scripts) → `crates/mc-service/src/redis/client.rs`
+- Redis: MhAssignmentStore trait (testable Redis abstraction) → `crates/mc-service/src/redis/client.rs:MhAssignmentStore`
+- Redis: MhAssignmentData (MH endpoints in Redis) → `crates/mc-service/src/redis/client.rs:MhAssignmentData`
 - Redis: Lua scripts (atomic fencing) → `crates/mc-service/src/redis/lua_scripts.rs`
 - Health + readiness endpoints → `crates/mc-service/src/observability/health.rs`
 - Prometheus metric wrappers → `crates/mc-service/src/observability/metrics.rs`
 - Join flow metrics (R-13): record_webtransport_connection, record_jwt_validation, record_session_join → `crates/mc-service/src/observability/metrics.rs`
+- MH communication metrics: record_register_meeting → `crates/mc-service/src/observability/metrics.rs`
 - MC metrics catalog → `docs/observability/metrics/mc-service.md`
 - System info (sysinfo) → `crates/mc-service/src/system_info.rs`
 
@@ -42,11 +46,14 @@
 - GC -> MC assignment → `crates/mc-service/src/grpc/mc_service.rs`
 - MC -> AC token management → `crates/common/src/token_manager.rs`
 - MC -> AC JWKS (meeting token validation) → `crates/common/src/jwt.rs:JwksClient`
+- MC -> MH RegisterMeeting RPC → `crates/mc-service/src/grpc/mh_client.rs:register_meeting()`
 - MC -> Redis session/fencing → `crates/mc-service/src/redis/client.rs`
+- MC -> Redis MH assignment read (join flow) → `crates/mc-service/src/redis/client.rs:get_mh_assignment()`
 
 ## Testing
 - GC integration tests (mock server) → `crates/mc-service/tests/gc_integration.rs`
 - Heartbeat task tests → `crates/mc-service/tests/heartbeat_tasks.rs`
+- Join flow integration tests (WebTransport + mock MH store) → `crates/mc-service/tests/join_tests.rs`
 - Test utilities (mock GC/Redis/MH) → `crates/mc-test-utils/src/`
 - Env-tests MC-GC integration → `crates/env-tests/tests/22_mc_gc_integration.rs`
 
