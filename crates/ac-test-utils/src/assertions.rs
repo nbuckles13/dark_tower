@@ -30,7 +30,7 @@ struct JwtClaims {
 /// ```rust,ignore
 /// token
 ///     .assert_valid_jwt()
-///     .assert_has_scope("meeting:create")
+///     .assert_has_scope("valid-scope")
 ///     .assert_signed_by("test-key-2025-01");
 /// ```
 pub trait TokenAssertions {
@@ -185,7 +185,7 @@ mod tests {
         // Note: Signature validation is done separately in crypto tests
         let header = r#"{"alg":"EdDSA","typ":"JWT","kid":"test-key-1"}"#;
         let payload =
-            r#"{"sub":"test-client","exp":9999999999,"iat":1234567890,"scope":"meeting:create"}"#;
+            r#"{"sub":"test-client","exp":9999999999,"iat":1234567890,"scope":"valid-scope"}"#;
 
         let header_b64 = URL_SAFE_NO_PAD.encode(header.as_bytes());
         let payload_b64 = URL_SAFE_NO_PAD.encode(payload.as_bytes());
@@ -207,7 +207,8 @@ mod tests {
     #[test]
     fn test_assert_has_scope() {
         let header = r#"{"alg":"EdDSA","typ":"JWT"}"#;
-        let payload = r#"{"sub":"test","exp":9999999999,"iat":1234567890,"scope":"meeting:create meeting:read"}"#;
+        let payload =
+            r#"{"sub":"test","exp":9999999999,"iat":1234567890,"scope":"scope-a scope-b"}"#;
 
         let token = format!(
             "{}.{}.sig",
@@ -216,16 +217,15 @@ mod tests {
         );
 
         token
-            .assert_has_scope("meeting:create")
-            .assert_has_scope("meeting:read");
+            .assert_has_scope("scope-a")
+            .assert_has_scope("scope-b");
     }
 
     #[test]
     #[should_panic(expected = "does not contain scope")]
     fn test_assert_has_scope_missing() {
         let header = r#"{"alg":"EdDSA","typ":"JWT"}"#;
-        let payload =
-            r#"{"sub":"test","exp":9999999999,"iat":1234567890,"scope":"meeting:create"}"#;
+        let payload = r#"{"sub":"test","exp":9999999999,"iat":1234567890,"scope":"valid-scope"}"#;
 
         let token = format!(
             "{}.{}.sig",

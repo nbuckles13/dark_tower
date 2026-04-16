@@ -251,7 +251,7 @@ mod tests {
     #[sqlx::test(migrations = "../../migrations")]
     async fn test_create_and_get_service_credential(pool: PgPool) -> Result<(), AcError> {
         // Create a service credential
-        let scopes = vec!["meeting:create".to_string(), "meeting:read".to_string()];
+        let scopes = vec!["scope-a".to_string(), "scope-b".to_string()];
         let credential = create_service_credential(
             &pool,
             "gc-test-client-001",
@@ -290,7 +290,7 @@ mod tests {
     #[sqlx::test(migrations = "../../migrations")]
     async fn test_update_scopes(pool: PgPool) -> Result<(), AcError> {
         // Create credential
-        let initial_scopes = vec!["meeting:create".to_string()];
+        let initial_scopes = vec!["scope-a".to_string()];
         let credential = create_service_credential(
             &pool,
             "test-client-update",
@@ -303,9 +303,9 @@ mod tests {
 
         // Update scopes
         let new_scopes = vec![
-            "meeting:create".to_string(),
-            "meeting:update".to_string(),
-            "participant:manage".to_string(),
+            "scope-a".to_string(),
+            "scope-b".to_string(),
+            "scope-c".to_string(),
         ];
         let updated = update_scopes(&pool, credential.credential_id, &new_scopes).await?;
 
@@ -326,7 +326,7 @@ mod tests {
             "hash",
             "media-handler",
             None,
-            &["media:process".to_string()],
+            &["valid-scope".to_string()],
         )
         .await?;
         assert!(credential.is_active);
@@ -353,7 +353,7 @@ mod tests {
             "hash1",
             "global-controller",
             None,
-            &["meeting:create".to_string()],
+            &["valid-scope".to_string()],
         )
         .await?;
 
@@ -363,7 +363,7 @@ mod tests {
             "hash2",
             "global-controller",
             None,
-            &["meeting:create".to_string()],
+            &["valid-scope".to_string()],
         )
         .await?;
 
@@ -373,7 +373,7 @@ mod tests {
             "hash3",
             "meeting-controller",
             None,
-            &["participant:manage".to_string()],
+            &["valid-scope".to_string()],
         )
         .await?;
 
@@ -452,7 +452,7 @@ mod tests {
             "hash1",
             "global-controller",
             Some("us-west-2"),
-            &["meeting:create".to_string()],
+            &["valid-scope".to_string()],
         )
         .await?;
 
@@ -462,7 +462,7 @@ mod tests {
             "hash2",
             "meeting-controller",
             None,
-            &["participant:manage".to_string()],
+            &["valid-scope".to_string()],
         )
         .await?;
 
@@ -472,7 +472,7 @@ mod tests {
             "hash3",
             "media-handler",
             Some("eu-west-1"),
-            &["media:process".to_string()],
+            &["valid-scope".to_string()],
         )
         .await?;
 
@@ -497,7 +497,7 @@ mod tests {
             "hash",
             "global-controller",
             Some("us-west-2"),
-            &["meeting:create".to_string()],
+            &["valid-scope".to_string()],
         )
         .await?;
 
@@ -510,7 +510,7 @@ mod tests {
         assert_eq!(retrieved.client_id, "test-get-by-id");
         assert_eq!(retrieved.service_type, "global-controller");
         assert_eq!(retrieved.region, Some("us-west-2".to_string()));
-        assert_eq!(retrieved.scopes, vec!["meeting:create".to_string()]);
+        assert_eq!(retrieved.scopes, vec!["valid-scope".to_string()]);
 
         Ok(())
     }
@@ -585,7 +585,7 @@ mod tests {
             "hash",
             "media-handler",
             None,
-            &["media:process".to_string()],
+            &["valid-scope".to_string()],
         )
         .await?;
 
@@ -630,7 +630,7 @@ mod tests {
             "original-hash",
             "global-controller",
             None,
-            &["meeting:create".to_string()],
+            &["valid-scope".to_string()],
         )
         .await?;
 

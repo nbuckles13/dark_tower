@@ -153,7 +153,7 @@ async fn test_issue_service_token(pool: sqlx::PgPool) {
         "test-client",
         "test-secret",
         "client_credentials",
-        &["meeting:create"],
+        &["valid-scope"],
         Some("127.0.0.1"),
         Some("test-agent"),
     ).await?;

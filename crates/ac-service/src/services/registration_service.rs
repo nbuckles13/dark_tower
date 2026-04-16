@@ -259,7 +259,7 @@ mod tests {
     async fn test_scopes_array_injection_prevented(pool: PgPool) -> Result<(), AcError> {
         // Create a credential manually with malicious scope strings
         let malicious_scopes = vec![
-            "meeting:create'; DROP TABLE auth_events; --".to_string(),
+            "scope-a'; DROP TABLE auth_events; --".to_string(),
             "admin:all' OR '1'='1".to_string(),
             "valid:scope".to_string(),
         ];

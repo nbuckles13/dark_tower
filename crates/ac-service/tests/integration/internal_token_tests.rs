@@ -308,7 +308,7 @@ async fn test_meeting_token_rejects_insufficient_scope(pool: PgPool) -> Result<(
 
     // Create service token WITHOUT internal:meeting-token scope
     let token = server
-        .create_service_token("test-service", &["meeting:create", "meeting:read"])
+        .create_service_token("test-service", &["scope-a", "scope-b"])
         .await?;
 
     // Act - Request with valid token but wrong scope
@@ -470,7 +470,7 @@ async fn test_meeting_token_multiple_scopes(pool: PgPool) -> Result<(), anyhow::
     let token = server
         .create_service_token(
             "gc-service-multi",
-            &["internal:meeting-token", "meeting:create", "meeting:read"],
+            &["internal:meeting-token", "scope-a", "scope-b"],
         )
         .await?;
 
@@ -586,7 +586,7 @@ async fn test_guest_token_rejects_insufficient_scope(pool: PgPool) -> Result<(),
 
     // Create service token WITHOUT internal:meeting-token scope
     let token = server
-        .create_service_token("test-service", &["meeting:create"])
+        .create_service_token("test-service", &["invalid-scope"])
         .await?;
 
     // Act

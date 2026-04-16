@@ -736,7 +736,7 @@ mod tests {
             &valid_hash,
             "media-handler",
             None,
-            &["media:process".to_string(), "media:forward".to_string()],
+            &["scope-a".to_string(), "scope-b".to_string()],
         )
         .await?;
 
@@ -749,8 +749,8 @@ mod tests {
             valid_secret,
             "client_credentials",
             Some(vec![
-                "media:process".to_string(),
-                "meeting:create".to_string(), // Unauthorized!
+                "scope-a".to_string(),
+                "invalid-scope".to_string(), // Unauthorized!
             ]),
             None,
             None,
@@ -780,9 +780,9 @@ mod tests {
             "global-controller",
             None,
             &[
-                "meeting:create".to_string(),
-                "meeting:read".to_string(),
-                "meeting:list".to_string(),
+                "scope-a".to_string(),
+                "scope-b".to_string(),
+                "scope-c".to_string(),
             ],
         )
         .await?;
@@ -795,7 +795,7 @@ mod tests {
             "multi-scope-client",
             valid_secret,
             "client_credentials",
-            Some(vec!["meeting:read".to_string()]),
+            Some(vec!["scope-b".to_string()]),
             None,
             None,
             DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
@@ -803,7 +803,7 @@ mod tests {
         )
         .await?;
 
-        assert_eq!(result.scope, "meeting:read");
+        assert_eq!(result.scope, "scope-b");
         assert_eq!(result.token_type, "Bearer");
 
         Ok(())
@@ -907,7 +907,7 @@ mod tests {
             &valid_hash,
             "global-controller",
             Some("us-west-2"),
-            &["meeting:create".to_string(), "meeting:read".to_string()],
+            &["scope-a".to_string(), "scope-b".to_string()],
         )
         .await?;
 
@@ -928,8 +928,8 @@ mod tests {
 
         assert_eq!(result.token_type, "Bearer");
         assert_eq!(result.expires_in, TOKEN_EXPIRY_SECONDS);
-        assert!(result.scope.contains("meeting:create"));
-        assert!(result.scope.contains("meeting:read"));
+        assert!(result.scope.contains("scope-a"));
+        assert!(result.scope.contains("scope-b"));
         assert!(!result.access_token.is_empty());
 
         // Verify JWT structure using test utilities
@@ -937,8 +937,8 @@ mod tests {
         result
             .access_token
             .assert_valid_jwt()
-            .assert_has_scope("meeting:create")
-            .assert_has_scope("meeting:read");
+            .assert_has_scope("scope-a")
+            .assert_has_scope("scope-b");
 
         Ok(())
     }
@@ -967,7 +967,7 @@ mod tests {
             &valid_hash,
             "media-handler",
             None,
-            &["media:process".to_string()],
+            &["valid-scope".to_string()],
         )
         .await?;
 
@@ -1052,7 +1052,7 @@ mod tests {
             sub: "test-client".to_string(),
             exp: Utc::now().timestamp() + TOKEN_EXPIRY_SECONDS_I64,
             iat: Utc::now().timestamp(),
-            scope: "meeting:create".to_string(),
+            scope: "valid-scope".to_string(),
             service_type: Some("global-controller".to_string()),
         };
 
@@ -1101,7 +1101,7 @@ mod tests {
             &valid_hash,
             "global-controller",
             None,
-            &["meeting:create".to_string()],
+            &["valid-scope".to_string()],
         )
         .await?;
 
@@ -1164,7 +1164,7 @@ mod tests {
             &valid_hash,
             "global-controller",
             None,
-            &["meeting:create".to_string()],
+            &["valid-scope".to_string()],
         )
         .await?;
 
@@ -1244,7 +1244,7 @@ mod tests {
             &valid_hash,
             "global-controller",
             None,
-            &["meeting:create".to_string()],
+            &["valid-scope".to_string()],
         )
         .await?;
 
@@ -1317,7 +1317,7 @@ mod tests {
             sub: "expired-client".to_string(),
             exp: Utc::now().timestamp() - TOKEN_EXPIRY_SECONDS_I64, // Expired 1 hour ago
             iat: Utc::now().timestamp() - (TOKEN_EXPIRY_SECONDS_I64 * 2), // Issued 2 hours ago
-            scope: "meeting:create".to_string(),
+            scope: "valid-scope".to_string(),
             service_type: Some("global-controller".to_string()),
         };
 
@@ -1384,7 +1384,7 @@ mod tests {
             sub: "future-client".to_string(),
             exp: Utc::now().timestamp() + (TOKEN_EXPIRY_SECONDS_I64 * 2), // Expires in 2 hours
             iat: Utc::now().timestamp() + TOKEN_EXPIRY_SECONDS_I64, // Issued 1 hour from now (way beyond 5 min skew!)
-            scope: "meeting:create".to_string(),
+            scope: "valid-scope".to_string(),
             service_type: Some("global-controller".to_string()),
         };
 
@@ -1443,7 +1443,7 @@ mod tests {
             sub: "clock-skew-client".to_string(),
             exp: Utc::now().timestamp() + TOKEN_EXPIRY_SECONDS_I64, // Expires in 1 hour
             iat: Utc::now().timestamp() + 120, // Issued 2 minutes from now (within tolerance)
-            scope: "meeting:create".to_string(),
+            scope: "valid-scope".to_string(),
             service_type: Some("global-controller".to_string()),
         };
 
@@ -1474,7 +1474,7 @@ mod tests {
 
         let verified_claims = result.unwrap();
         assert_eq!(verified_claims.sub, "clock-skew-client");
-        assert_eq!(verified_claims.scope, "meeting:create");
+        assert_eq!(verified_claims.scope, "valid-scope");
 
         Ok(())
     }
@@ -1502,7 +1502,7 @@ mod tests {
             sub: "boundary-client".to_string(),
             exp: now.timestamp() + TOKEN_EXPIRY_SECONDS_I64,
             iat: now.timestamp() + DEFAULT_JWT_CLOCK_SKEW.as_secs() as i64, // Exactly at 5 min boundary
-            scope: "meeting:create".to_string(),
+            scope: "valid-scope".to_string(),
             service_type: Some("global-controller".to_string()),
         };
 
@@ -1560,7 +1560,7 @@ mod tests {
             sub: "beyond-boundary-client".to_string(),
             exp: now.timestamp() + TOKEN_EXPIRY_SECONDS_I64,
             iat: now.timestamp() + DEFAULT_JWT_CLOCK_SKEW.as_secs() as i64 + 1, // 1 second beyond 5 min
-            scope: "meeting:create".to_string(),
+            scope: "valid-scope".to_string(),
             service_type: Some("global-controller".to_string()),
         };
 
@@ -1649,7 +1649,7 @@ mod tests {
             sub: "typ-test-client".to_string(),
             exp: Utc::now().timestamp() + TOKEN_EXPIRY_SECONDS_I64,
             iat: Utc::now().timestamp(),
-            scope: "meeting:create".to_string(),
+            scope: "valid-scope".to_string(),
             service_type: Some("global-controller".to_string()),
         };
 
@@ -1723,7 +1723,7 @@ mod tests {
         // Verify the verified claims are correct regardless of typ
         let verified_claims = result.unwrap();
         assert_eq!(verified_claims.sub, "typ-test-client");
-        assert_eq!(verified_claims.scope, "meeting:create");
+        assert_eq!(verified_claims.scope, "valid-scope");
 
         Ok(())
     }
@@ -1761,7 +1761,7 @@ mod tests {
             &valid_hash,
             "global-controller",
             None,
-            &["meeting:create".to_string()],
+            &["valid-scope".to_string()],
         )
         .await?;
 
@@ -1945,7 +1945,7 @@ mod tests {
             &valid_hash,
             "media-handler",
             None,
-            &["media:process".to_string()],
+            &["valid-scope".to_string()],
         )
         .await?;
 
@@ -2041,7 +2041,7 @@ mod tests {
             sub: "extra-claims-client".to_string(),
             exp: Utc::now().timestamp() + TOKEN_EXPIRY_SECONDS_I64,
             iat: Utc::now().timestamp(),
-            scope: "meeting:create".to_string(),
+            scope: "valid-scope".to_string(),
             service_type: Some("global-controller".to_string()),
             admin: true,                                // Extra field
             roles: vec!["superuser".to_string()],       // Extra field
@@ -2063,7 +2063,7 @@ mod tests {
 
         // Should successfully parse the standard fields
         assert_eq!(verified.sub, "extra-claims-client");
-        assert_eq!(verified.scope, "meeting:create");
+        assert_eq!(verified.scope, "valid-scope");
         assert_eq!(verified.service_type, Some("global-controller".to_string()));
 
         // Extra fields (admin, roles, custom_field) are silently ignored
@@ -2151,7 +2151,7 @@ mod tests {
             &valid_hash,
             "global-controller",
             None,
-            &["meeting:create".to_string()],
+            &["valid-scope".to_string()],
         )
         .await?;
 
@@ -2273,7 +2273,7 @@ mod tests {
             sub: "oversized-client".to_string(),
             exp: Utc::now().timestamp() + TOKEN_EXPIRY_SECONDS_I64,
             iat: Utc::now().timestamp(),
-            scope: "meeting:create".to_string(),
+            scope: "valid-scope".to_string(),
             service_type: Some("global-controller".to_string()),
             bloat: bloat_data,
         };
@@ -2315,7 +2315,7 @@ mod tests {
             sub: "normal-client".to_string(),
             exp: Utc::now().timestamp() + TOKEN_EXPIRY_SECONDS_I64,
             iat: Utc::now().timestamp(),
-            scope: "meeting:create".to_string(),
+            scope: "valid-scope".to_string(),
             service_type: Some("global-controller".to_string()),
         };
 
@@ -2342,7 +2342,7 @@ mod tests {
 
         let verified = result.unwrap();
         assert_eq!(verified.sub, "normal-client");
-        assert_eq!(verified.scope, "meeting:create");
+        assert_eq!(verified.scope, "valid-scope");
 
         Ok(())
     }
@@ -2393,7 +2393,7 @@ mod tests {
             &valid_hash,
             "global-controller",
             None,
-            &["meeting:create".to_string()],
+            &["valid-scope".to_string()],
         )
         .await?;
 
@@ -2505,7 +2505,7 @@ mod tests {
             &valid_hash,
             "global-controller",
             None,
-            &["meeting:create".to_string()],
+            &["valid-scope".to_string()],
         )
         .await?;
 

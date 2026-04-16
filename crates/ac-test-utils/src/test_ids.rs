@@ -30,8 +30,3 @@ pub const TEST_CLIENT_ID_MH: &str = "mh-test-client";
 
 // Test secrets (for registration)
 pub const TEST_CLIENT_SECRET: &str = "test-secret-do-not-use-in-production";
-
-// Test scopes
-pub const SCOPE_MEETING_CREATE: &str = "meeting:create";
-pub const SCOPE_MEETING_READ: &str = "meeting:read";
-pub const SCOPE_ADMIN_SERVICES: &str = "admin:services";
