@@ -149,12 +149,13 @@ All MC service metrics follow ADR-0011 naming conventions with the `mc_` prefix.
 
 ### `mc_jwt_validations_total`
 - **Type**: Counter
-- **Description**: Total JWT validation attempts by result and token type
+- **Description**: Total JWT validation attempts by result, token type, and failure reason
 - **Labels**:
   - `result`: Validation outcome (`success`, `failure`)
   - `token_type`: Token type (`meeting`, `guest`, `service`)
-- **Cardinality**: Low (2 results x 3 token types = 6 series)
-- **Usage**: Monitor authentication health, detect token validation failures
+  - `failure_reason`: Reason for failure (`none`, `signature_invalid`, `expired`, `missing_token`, `scope_mismatch`, `malformed`)
+- **Cardinality**: Low (bounded, 2 x 3 x 6 = 36 max, but most combos are sparse in practice)
+- **Usage**: Monitor authentication health, detect token validation failures, diagnose failure causes
 - **Recorded in**: `connection.rs` after JWT validation, `grpc/auth_interceptor.rs` for service tokens
 - **Alert**: `MCHighJwtValidationFailures` (warning, failure rate >10% for 5m)
 - **Dashboard**: MC Overview - JWT Validations by Result (Join Flow row)
@@ -310,6 +311,11 @@ sum(rate(mc_jwt_validations_total{result="failure"}[5m])) /
 sum(rate(mc_jwt_validations_total[5m]))
 ```
 
+### JWT Validation Failures by Reason
+```promql
+sum(rate(mc_jwt_validations_total{result="failure"}[5m])) by (failure_reason)
+```
+
 ### Connection Rejection Rate
 ```promql
 sum(rate(mc_webtransport_connections_total{status="rejected"}[5m])) /
@@ -382,6 +388,7 @@ All MC service metrics follow strict cardinality bounds per ADR-0011:
 | `type` | 2 | `fast`, `comprehensive` |
 | `result` | 2 | `success`, `failure` (JWT validation) |
 | `token_type` | 3 | `meeting`, `guest`, `service` (JWT validation) |
+| `failure_reason` | 6 | `none`, `signature_invalid`, `expired`, `missing_token`, `scope_mismatch`, `malformed` (JWT validation) |
 | `error_type` | ~19 | Bounded by `McError` enum variants |
 | `event` | 2 | `connected`, `disconnected` (MH notifications) |
 | `all_failed` | 2 | `true`, `false` (media connection failures) |

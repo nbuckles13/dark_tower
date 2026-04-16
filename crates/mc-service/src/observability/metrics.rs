@@ -304,17 +304,21 @@ pub fn record_webtransport_connection(status: &str) {
 /// Record a JWT validation attempt.
 ///
 /// Metric: `mc_jwt_validations_total`
-/// Labels: `result`, `token_type`
+/// Labels: `result`, `token_type`, `failure_reason`
 ///
 /// Result values: "success", "failure"
-/// Token type values: "meeting", "guest"
-/// Cardinality: 2 x 2 = 4
+/// Token type values: "meeting", "guest", "service"
+/// Failure reason values: "none" (success), "signature_invalid", "expired",
+///   "missing_token", "scope_mismatch", "malformed"
+/// Cardinality: bounded (2 x 3 x 6 = 36 max, but most combos are sparse in practice)
 ///
-/// Recorded in `connection.rs` after JWT validation.
-pub fn record_jwt_validation(result: &str, token_type: &str) {
+/// Recorded in `connection.rs` after JWT validation,
+/// `grpc/auth_interceptor.rs` for service tokens.
+pub fn record_jwt_validation(result: &str, token_type: &str, failure_reason: &str) {
     counter!("mc_jwt_validations_total",
         "result" => result.to_string(),
-        "token_type" => token_type.to_string()
+        "token_type" => token_type.to_string(),
+        "failure_reason" => failure_reason.to_string()
     )
     .increment(1);
 }
@@ -610,11 +614,15 @@ mod tests {
 
     #[test]
     fn test_record_jwt_validation() {
-        // Test all 4 bounded combinations (2 results x 2 token types)
-        record_jwt_validation("success", "meeting");
-        record_jwt_validation("success", "guest");
-        record_jwt_validation("failure", "meeting");
-        record_jwt_validation("failure", "guest");
+        // Test all bounded combinations (2 results x 3 token types x representative reasons)
+        record_jwt_validation("success", "meeting", "none");
+        record_jwt_validation("success", "guest", "none");
+        record_jwt_validation("success", "service", "none");
+        record_jwt_validation("failure", "meeting", "signature_invalid");
+        record_jwt_validation("failure", "guest", "expired");
+        record_jwt_validation("failure", "service", "scope_mismatch");
+        record_jwt_validation("failure", "service", "malformed");
+        record_jwt_validation("failure", "service", "missing_token");
     }
 
     #[test]
@@ -703,10 +711,20 @@ mod tests {
         }
 
         let valid_jwt_results = ["success", "failure"];
-        let valid_token_types = ["meeting", "guest"];
+        let valid_token_types = ["meeting", "guest", "service"];
+        let valid_failure_reasons = [
+            "none",
+            "signature_invalid",
+            "expired",
+            "missing_token",
+            "scope_mismatch",
+            "malformed",
+        ];
         for result in &valid_jwt_results {
             for token_type in &valid_token_types {
-                record_jwt_validation(result, token_type);
+                for reason in &valid_failure_reasons {
+                    record_jwt_validation(result, token_type, reason);
+                }
             }
         }
 
@@ -786,8 +804,8 @@ mod tests {
         // Record join flow metrics (R-13)
         record_webtransport_connection("accepted");
         record_webtransport_connection("rejected");
-        record_jwt_validation("success", "meeting");
-        record_jwt_validation("failure", "meeting");
+        record_jwt_validation("success", "meeting", "none");
+        record_jwt_validation("failure", "meeting", "signature_invalid");
         record_session_join("success", None, Duration::from_millis(200));
         record_session_join("failure", Some("jwt_validation"), Duration::from_millis(5));
 

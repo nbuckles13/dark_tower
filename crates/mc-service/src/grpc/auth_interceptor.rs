@@ -28,7 +28,7 @@
 use crate::auth::CommonJwtValidator;
 use crate::observability::metrics;
 use axum::http;
-use common::jwt::{JwksClient, ServiceClaims, MAX_JWT_SIZE_BYTES};
+use common::jwt::{JwksClient, JwtError, ServiceClaims, MAX_JWT_SIZE_BYTES};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -40,6 +40,17 @@ use tower::{Layer, Service};
 ///
 /// All callers (GC, MH) must present a token with this scope to call MC gRPC.
 const REQUIRED_SCOPE: &str = "service.write.mc";
+
+/// Map a `JwtError` to a bounded `failure_reason` label for the
+/// `mc_jwt_validations_total` metric.
+fn classify_jwt_error(err: &JwtError) -> &'static str {
+    match err {
+        JwtError::TokenTooLarge | JwtError::MalformedToken | JwtError::MissingKid => "malformed",
+        JwtError::InvalidSignature | JwtError::KeyNotFound => "signature_invalid",
+        JwtError::IatTooFarInFuture => "expired",
+        JwtError::ServiceUnavailable(_) => "signature_invalid",
+    }
+}
 
 /// Async authentication layer for MC gRPC service (R-22).
 ///
@@ -174,16 +185,18 @@ where
             // Cryptographic validation via JWKS
             let claims: ServiceClaims = match jwt_validator.validate(token).await {
                 Ok(claims) => {
-                    metrics::record_jwt_validation("success", "service");
+                    metrics::record_jwt_validation("success", "service", "none");
                     claims
                 }
                 Err(e) => {
+                    let reason = classify_jwt_error(&e);
                     tracing::warn!(
                         target: "mc.grpc.auth",
                         error = ?e,
+                        failure_reason = %reason,
                         "Service token validation failed"
                     );
-                    metrics::record_jwt_validation("failure", "service");
+                    metrics::record_jwt_validation("failure", "service", reason);
                     let response = tonic::Status::unauthenticated("Invalid token").into_http();
                     return Ok(response);
                 }
@@ -197,7 +210,7 @@ where
                     required = REQUIRED_SCOPE,
                     "Service token missing required scope"
                 );
-                metrics::record_jwt_validation("failure", "service");
+                metrics::record_jwt_validation("failure", "service", "scope_mismatch");
                 let response = tonic::Status::unauthenticated("Invalid token").into_http();
                 return Ok(response);
             }

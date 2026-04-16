@@ -198,7 +198,7 @@ pub async fn handle_connection(
                 error = %e,
                 "JWT validation failed"
             );
-            metrics::record_jwt_validation("failure", "meeting");
+            metrics::record_jwt_validation("failure", "meeting", "signature_invalid");
             let _ = send_error(
                 &mut send_stream,
                 signaling::ErrorCode::Unauthorized as i32,
@@ -214,7 +214,7 @@ pub async fn handle_connection(
         }
     };
 
-    metrics::record_jwt_validation("success", "meeting");
+    metrics::record_jwt_validation("success", "meeting", "none");
 
     info!(
         target: "mc.webtransport.connection",
