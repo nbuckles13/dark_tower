@@ -11,7 +11,7 @@ use serde_json::json;
 /// ```rust,ignore
 /// let token = TestTokenBuilder::new()
 ///     .for_user("alice")
-///     .with_scope("meeting:create meeting:read")
+///     .with_scope("scope-a scope-b")
 ///     .expires_in(3600)
 ///     .build();
 /// ```
@@ -83,11 +83,11 @@ mod tests {
     fn test_builder_creates_valid_claims() {
         let claims = TestTokenBuilder::new()
             .for_user("alice")
-            .with_scope("meeting:create")
+            .with_scope("valid-scope")
             .build();
 
         assert_eq!(claims["sub"], "alice");
-        assert_eq!(claims["scope"], "meeting:create");
+        assert_eq!(claims["scope"], "valid-scope");
         assert!(claims["exp"].as_i64().unwrap() > 0);
     }
 

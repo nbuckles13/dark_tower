@@ -168,7 +168,7 @@ async fn test_rotate_keys_without_scope_returns_403(pool: PgPool) -> Result<(), 
         &pool,
         &master_key,
         "limited-client",
-        vec!["meeting:create".to_string()], // Wrong scope
+        vec!["invalid-scope".to_string()], // Wrong scope
     )
     .await?;
 

@@ -23,7 +23,9 @@
 
 | Field | Value |
 |-------|-------|
-| Phase | `reflection` |
+| Phase | `complete` |
+| Main commit | `dc26e39` |
+| Hash-stamp commit | `59f6a38` |
 | Implementer | `implementer@gc-auth-scopes` |
 | Implementing Specialist | `global-controller` |
 | Iteration | `1` |

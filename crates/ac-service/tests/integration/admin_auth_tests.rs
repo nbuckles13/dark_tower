@@ -145,7 +145,7 @@ async fn test_admin_endpoint_rejects_insufficient_scope(pool: PgPool) -> Result<
 
     // Create service token WITHOUT admin:services scope
     let token = server
-        .create_service_token("test-service", &["meeting:create", "meeting:read"])
+        .create_service_token("test-service", &["scope-a", "scope-b"])
         .await?;
 
     // Act - Request with valid token but wrong scope
@@ -418,10 +418,7 @@ async fn test_admin_endpoint_accepts_multiple_scopes(pool: PgPool) -> Result<(),
 
     // Create token with multiple scopes including admin:services
     let multi_scope_token = server
-        .create_service_token(
-            "multi-admin",
-            &["admin:services", "meeting:create", "meeting:read"],
-        )
+        .create_service_token("multi-admin", &["admin:services", "scope-a", "scope-b"])
         .await?;
 
     // Act - Request with multi-scope token

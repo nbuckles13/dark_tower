@@ -157,7 +157,7 @@ async fn test_auth_flow_e2e() {
 
     assert_eq!(response.status(), 200);
     let token: TokenResponse = response.json().await?;
-    token.assert_valid_jwt().assert_has_scope("meeting:create");
+    token.assert_valid_jwt().assert_has_scope("service.write.mc");
 }
 ```
 
@@ -184,7 +184,7 @@ pub fn test_signing_key(seed: u64) -> (String, Vec<u8>) {
 ```rust
 let token = TestTokenBuilder::new()
     .for_user("alice")
-    .with_scope("user.read.gc meeting:create")
+    .with_scope("service.write.mc")
     .expires_in(60)
     .signed_by(test_signing_key(1))
     .build();
@@ -229,7 +229,7 @@ pub trait TokenAssertions {
 // Usage:
 token
     .assert_valid_jwt()
-    .assert_has_scope("user.read.gc")
+    .assert_has_scope("service.write.mc")
     .assert_signed_by("test-key-2025-01")
     .assert_expires_in(3600);
 ```
@@ -492,12 +492,12 @@ async fn test_create_service_credential(pool: PgPool) {
 
     // Act
     let credential = service_credentials::create_service_credential(
-        &pool, client_id, &secret_hash, "global-controller", None, &["meeting:create"]
+        &pool, client_id, &secret_hash, "global-controller", None, &["service.write.mc"]
     ).await?;
 
     // Assert
     assert_eq!(credential.client_id, client_id);
-    assert_eq!(credential.scopes, vec!["meeting:create"]);
+    assert_eq!(credential.scopes, vec!["service.write.mc"]);
 }
 ```
 

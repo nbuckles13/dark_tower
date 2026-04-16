@@ -1593,9 +1593,9 @@ mod tests {
         // Update scopes
         let update_payload = UpdateClientRequest {
             scopes: Some(vec![
-                "meeting:create".to_string(),
-                "meeting:update".to_string(),
-                "meeting:delete".to_string(),
+                "scope-a".to_string(),
+                "scope-b".to_string(),
+                "scope-c".to_string(),
             ]),
         };
 
@@ -1609,9 +1609,9 @@ mod tests {
         assert_eq!(
             response.scopes,
             vec![
-                "meeting:create".to_string(),
-                "meeting:update".to_string(),
-                "meeting:delete".to_string(),
+                "scope-a".to_string(),
+                "scope-b".to_string(),
+                "scope-c".to_string(),
             ]
         );
     }
@@ -1728,7 +1728,7 @@ mod tests {
             "hash",
             "global-controller",
             None,
-            &["meeting:create".to_string()],
+            &["valid-scope".to_string()],
         )
         .await
         .unwrap();
@@ -1778,7 +1778,7 @@ mod tests {
             "hash",
             "global-controller",
             None,
-            &["meeting:create".to_string()],
+            &["valid-scope".to_string()],
         )
         .await
         .unwrap();
