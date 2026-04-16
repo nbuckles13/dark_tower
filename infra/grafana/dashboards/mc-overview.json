@@ -236,8 +236,8 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "sum(increase(mc_jwt_validations_total{result=\"failure\"}[$__range]))",
-          "legendFormat": "Failures",
+          "expr": "sum by(failure_reason) (increase(mc_jwt_validations_total{result=\"failure\"}[$__range]))",
+          "legendFormat": "{{failure_reason}}",
           "range": true,
           "refId": "A"
         }
@@ -3612,8 +3612,8 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by(result, token_type) (increase(mc_jwt_validations_total[$__rate_interval]))",
-          "legendFormat": "{{result}} ({{token_type}})",
+          "expr": "sum by(result, token_type, failure_reason) (increase(mc_jwt_validations_total[$__rate_interval]))",
+          "legendFormat": "{{result}} ({{token_type}}) {{failure_reason}}",
           "range": true,
           "refId": "A"
         }
