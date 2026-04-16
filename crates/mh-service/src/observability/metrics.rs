@@ -188,12 +188,40 @@ pub fn record_mc_notification(event: &str, status: &str) {
 /// Record a JWT validation attempt (R-27).
 ///
 /// Metric: `mh_jwt_validations_total`
-/// Labels: `result` (success | failure), `token_type` (meeting | service)
-/// Cardinality: 4 (2 results x 2 token types)
-pub fn record_jwt_validation(result: &str, token_type: &str) {
+/// Labels: `result`, `token_type`, `failure_reason`
+///
+/// Result values: "success", "failure"
+/// Token type values: "meeting", "service"
+/// Failure reason values: `none` (success), `signature_invalid`, `expired`,
+///   `scope_mismatch`, `malformed`, `validation_failed`
+/// Cardinality: bounded (2 x 2 x 6 = 24 max, but most combos are sparse in practice)
+pub fn record_jwt_validation(result: &str, token_type: &str, failure_reason: &str) {
     counter!("mh_jwt_validations_total",
         "result" => result.to_string(),
-        "token_type" => token_type.to_string()
+        "token_type" => token_type.to_string(),
+        "failure_reason" => failure_reason.to_string()
+    )
+    .increment(1);
+}
+
+// ============================================================================
+// gRPC Auth Layer 2 Metrics (ADR-0003)
+// ============================================================================
+
+/// Record a caller `service_type` rejection by Layer 2 routing.
+///
+/// Metric: `mh_caller_type_rejected_total`
+/// Labels: `grpc_service`, `expected_type`, `actual_type`
+///
+/// Cardinality: 1 x 1 x 3 = 3 max (1 gRPC service, 1 expected type, ~3 actual types + "unknown")
+///
+/// ALERT: Any non-zero value indicates a bug or misconfiguration — a service
+/// is presenting a valid token but calling the wrong gRPC endpoint.
+pub fn record_caller_type_rejected(grpc_service: &str, expected_type: &str, actual_type: &str) {
+    counter!("mh_caller_type_rejected_total",
+        "grpc_service" => grpc_service.to_string(),
+        "expected_type" => expected_type.to_string(),
+        "actual_type" => actual_type.to_string()
     )
     .increment(1);
 }
@@ -295,10 +323,24 @@ mod tests {
 
     #[test]
     fn test_record_jwt_validation() {
-        record_jwt_validation("success", "meeting");
-        record_jwt_validation("failure", "meeting");
-        record_jwt_validation("success", "service");
-        record_jwt_validation("failure", "service");
+        record_jwt_validation("success", "meeting", "none");
+        record_jwt_validation("failure", "meeting", "validation_failed");
+        record_jwt_validation("success", "service", "none");
+        record_jwt_validation("failure", "service", "signature_invalid");
+        record_jwt_validation("failure", "service", "expired");
+        record_jwt_validation("failure", "service", "malformed");
+        record_jwt_validation("failure", "service", "scope_mismatch");
+    }
+
+    #[test]
+    fn test_record_caller_type_rejected() {
+        // Test representative label combinations (ADR-0003 Layer 2)
+        record_caller_type_rejected(
+            "MediaHandlerService",
+            "meeting-controller",
+            "global-controller",
+        );
+        record_caller_type_rejected("MediaHandlerService", "meeting-controller", "unknown");
     }
 
     #[test]

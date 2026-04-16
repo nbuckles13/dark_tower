@@ -41,12 +41,12 @@
 ## Code Locations: MH Service
 - Config tests (env vars, defaults, TLS, debug redaction, advertise addresses, JWKS URL, timeouts) -> `crates/mh-service/src/config.rs:tests`
 - Error tests (labels, status codes, client messages, JwtError conversion) -> `crates/mh-service/src/errors.rs:tests`
-- Auth tests (JWKS ServiceClaims + scope + service_type routing, ADR-0003) -> `crates/mh-service/src/grpc/auth_interceptor.rs:tests`
+- Auth tests (JWKS two-layer: scope + service_type routing, classify_jwt_error, claims injection, MhAuthInterceptor removed, ADR-0003) -> `crates/mh-service/src/grpc/auth_interceptor.rs:tests`
 - JWT validation tests (MhJwtValidator, meeting tokens, wiremock JWKS) -> `crates/mh-service/src/auth/mod.rs:tests`
 - gRPC handler tests (RegisterMeeting validation, SessionManagerHandle integration) -> `crates/mh-service/src/grpc/mh_service.rs:tests`
 - Session manager actor tests (handle API, registration, connections, pending promotion, notify via oneshot) -> `crates/mh-service/src/session/mod.rs:tests`
 - WebTransport server + connection handler -> `crates/mh-service/src/webtransport/server.rs`, `connection.rs`
-- Health + metrics tests -> `crates/mh-service/src/observability/health.rs:tests`, `metrics.rs:tests`
+- Health + metrics tests (failure_reason label on jwt_validations_total, mh_caller_type_rejected_total) -> `crates/mh-service/src/observability/health.rs:tests`, `metrics.rs:tests`
 - McClient tests (construction, auth, retry constants, endpoint errors) -> `crates/mh-service/src/grpc/mc_client.rs:tests`
 - MC notification integration tests (mock MediaCoordinationService, retry, auth short-circuit) -> `crates/mh-service/tests/mc_client_integration.rs`
 - WebTransport notification wiring (connect, disconnect, fire-and-forget) -> `crates/mh-service/src/webtransport/connection.rs:spawn_notify_connected()`

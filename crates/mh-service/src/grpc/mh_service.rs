@@ -6,7 +6,7 @@
 //!
 //! # Security
 //!
-//! All incoming requests are validated by `MhAuthInterceptor` before
+//! All incoming requests are validated by `MhAuthLayer` before
 //! reaching these handlers.
 
 use std::time::Instant;

@@ -109,7 +109,7 @@ pub async fn handle_connection(
     // Step 4: Validate meeting JWT
     let claims = match jwt_validator.validate_meeting_token(&token).await {
         Ok(claims) => {
-            metrics::record_jwt_validation("success", "meeting");
+            metrics::record_jwt_validation("success", "meeting", "none");
             claims
         }
         Err(e) => {
@@ -119,7 +119,7 @@ pub async fn handle_connection(
                 error = %e,
                 "JWT validation failed"
             );
-            metrics::record_jwt_validation("failure", "meeting");
+            metrics::record_jwt_validation("failure", "meeting", "validation_failed");
             return Err(e);
         }
     };

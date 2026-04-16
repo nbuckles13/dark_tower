@@ -19,13 +19,15 @@
 - gRPC: GC client (registration, heartbeats, re-registration) → `crates/mh-service/src/grpc/gc_client.rs`
 - gRPC: MC client (NotifyParticipantConnected/Disconnected, retry with backoff) → `crates/mh-service/src/grpc/mc_client.rs`
 - gRPC: MH service (RegisterMeeting via SessionManagerHandle, other RPCs stub) → `crates/mh-service/src/grpc/mh_service.rs`
-- gRPC: auth interceptor (legacy sync, MhAuthLayer/MhAuthService async JWKS) → `crates/mh-service/src/grpc/auth_interceptor.rs`
+- gRPC: auth layer (MhAuthLayer: JWKS + scope + Layer 2 service_type routing + claims injection, ADR-0003) → `crates/mh-service/src/grpc/auth_interceptor.rs`
+- gRPC: classify_jwt_error helper (JwtError → bounded failure_reason label) → `crates/mh-service/src/grpc/auth_interceptor.rs:classify_jwt_error`
 - JWT validation (MhJwtValidator, meeting token validation) → `crates/mh-service/src/auth/mod.rs`
 - Session management (SessionManagerActor/SessionManagerHandle, actor pattern ADR-0001) → `crates/mh-service/src/session/mod.rs`
 - WebTransport server (TLS, capacity, accept loop) → `crates/mh-service/src/webtransport/server.rs`
 - WebTransport connection handler (JWT read, provisional accept, MC notifications) → `crates/mh-service/src/webtransport/connection.rs`
 - Health + readiness endpoints → `crates/mh-service/src/observability/health.rs`
 - Prometheus metric wrappers → `crates/mh-service/src/observability/metrics.rs`
+- Auth metrics: mh_jwt_validations_total (+failure_reason label), mh_caller_type_rejected_total → `metrics.rs`
 - MH metrics catalog → `docs/observability/metrics/mh-service.md`
 
 ## Media Protocol
@@ -58,7 +60,7 @@
 - GC integration tests (mock server) → `crates/mh-service/tests/gc_integration.rs`
 - MC client integration tests (mock server, retry, auth short-circuit) → `crates/mh-service/tests/mc_client_integration.rs`
 - Config unit tests → `crates/mh-service/src/config.rs`
-- Auth interceptor tests (legacy + MhAuthService async JWKS) → `crates/mh-service/src/grpc/auth_interceptor.rs`
+- Auth layer tests (Layer 1 JWKS/scope + Layer 2 service_type routing + claims injection) → `crates/mh-service/src/grpc/auth_interceptor.rs`
 - JWT validation tests (meeting tokens, JWKS unreachable) → `crates/mh-service/src/auth/mod.rs`
 - Session manager tests → `crates/mh-service/src/session/mod.rs`
 - RegisterMeeting handler tests → `crates/mh-service/src/grpc/mh_service.rs`

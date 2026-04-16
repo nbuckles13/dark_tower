@@ -47,24 +47,24 @@
 - Scope contract tests (regression prevention) → `crates/ac-service/src/models/mod.rs` (test_scope_contract_* tests)
 - Common JWKS + JWT + ServiceClaims → `crates/common/src/jwt.rs`; GC↔AC token types → `meeting_token.rs`
 - AC rate limits → `crates/ac-service/src/config.rs:parse_rate_limit_i64()`
-- Auth layers → MC `McAuthLayer` (two-layer: scope + service_type routing), MH `MhAuthLayer`, GC `GrpcAuthLayer`
+- Auth layers (all two-layer per ADR-0003) → MC `McAuthLayer`, MH `MhAuthLayer`, GC `GrpcAuthLayer`; dead `MhAuthInterceptor`/`McAuthInterceptor` removed
 
 ## Observability
 - Kustomize + Grafana → `infra/kubernetes/observability/`, `infra/grafana/dashboards/`; Alerts → `docs/observability/alerts.md`
 - Per-service metrics → `crates/gc-service/src/observability/metrics.rs`, `crates/mc-service/src/observability/metrics.rs`, `crates/mh-service/src/observability/metrics.rs`; Prometheus → `infra/docker/prometheus/prometheus.yml`
-- MC Layer 2 auth metric → `mc_caller_type_rejected_total{grpc_service, expected_type, actual_type}` in `metrics.rs:record_caller_type_rejected()`; Grafana panel → `mc-overview.json`
+- Layer 2 caller_type_rejected metric → MC `mc_caller_type_rejected_total`, MH `mh_caller_type_rejected_total` (`{grpc_service, expected_type, actual_type}`); Grafana panels in `mc-overview.json`, `mh-overview.json`
+- JWT failure_reason label → `mh_jwt_validations_total{failure_reason}`, `mc_jwt_validations_total{failure_reason}`; classifier → `classify_jwt_error()` in each auth_interceptor.rs
 
 ## MH Service
 - MH startup + config + health → `crates/mh-service/src/main.rs`, `config.rs`, `observability/health.rs`
-- MH gRPC (service, GC client, MC client, JWKS auth) → `crates/mh-service/src/grpc/mh_service.rs`, `gc_client.rs`, `mc_client.rs`, `auth_interceptor.rs`
-- MH→MC notifications (fire-and-forget) → `crates/mh-service/src/webtransport/connection.rs:spawn_notify_connected()`; tests → `tests/mc_client_integration.rs`
+- MH gRPC (service, GC client, MC client) → `crates/mh-service/src/grpc/mh_service.rs`, `gc_client.rs`, `mc_client.rs`; two-layer auth → `auth_interceptor.rs:MhAuthLayer` (claims injected into extensions)
+- MH→MC notifications (fire-and-forget) → `connection.rs:spawn_notify_connected()`; tests → `tests/mc_client_integration.rs`
 - MH WebTransport + session mgmt → `crates/mh-service/src/webtransport/server.rs`, `connection.rs`, `session/mod.rs`
 
 ## MC Service
 - MC startup + gRPC server wiring → `crates/mc-service/src/main.rs`; config → `crates/mc-service/src/config.rs`
 - MC WebTransport → `crates/mc-service/src/webtransport/server.rs`, `connection.rs`
-- MC gRPC clients → `gc_client.rs`, `mh_client.rs`; MC gRPC service (GC→MC) → `mc_service.rs`; MediaCoordinationService (MH→MC :50052) → `media_coordination.rs`
-- MC two-layer gRPC auth (Layer 1 scope + Layer 2 service_type routing, ADR-0003) → `auth_interceptor.rs:McAuthLayer`; dead `McAuthInterceptor` removed
+- MC gRPC clients → `gc_client.rs`, `mh_client.rs`; MC gRPC service (GC→MC) → `mc_service.rs`; MediaCoordinationService (MH→MC :50052) → `media_coordination.rs`; two-layer auth → `McAuthLayer`
 - MhConnectionRegistry (cleanup wired in controller.rs `remove_meeting()`) → `crates/mc-service/src/mh_connection_registry.rs`
 - Redis (fenced writes, MhAssignmentData, MhAssignmentStore trait) → `crates/mc-service/src/redis/client.rs`
 - Actors → `crates/mc-service/src/actors/controller.rs`, `meeting.rs`, `participant.rs`
