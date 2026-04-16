@@ -21,7 +21,8 @@
 - Internal token types (GC→AC, `home_org_id` required) → `crates/common/src/meeting_token.rs`
 
 ## Code Locations — GC (Auth & Access Control)
-- JWT validation → `crates/gc-service/src/auth/jwt.rs` | Auth middleware → `src/middleware/auth.rs`
+- JWT validation (`validate()`, `validate_raw()`) → `crates/gc-service/src/auth/jwt.rs` | Auth middleware → `src/middleware/auth.rs`
+- gRPC two-layer auth `GrpcAuthLayer` → `crates/gc-service/src/grpc/auth_layer.rs`: Layer 1 JWKS+scope (`service.write.gc`), Layer 2 service_type allowlist (GlobalControllerService→MC, MediaHandlerRegistryService→MH), `classify_jwt_error()`, `Claims` injected into extensions. Dead `GrpcAuthInterceptor` removed.
 - CSPRNG + role enforcement → `crates/gc-service/src/handlers/meetings.rs`
 - Atomic org limit CTE → `crates/gc-service/src/repositories/meetings.rs:create_meeting_with_limit_check()`
 - Participant tracking (DB CHECK + partial unique) → `crates/gc-service/src/repositories/participants.rs`
@@ -45,8 +46,8 @@
 
 ## Code Locations — Observability (Security-Relevant)
 - MC/MH metrics (bounded labels, no PII) → `crates/mc-service/src/observability/metrics.rs` (+ mh) | ADR-0029
-- Layer 2 rejection metrics: `mc_caller_type_rejected_total` → `mc metrics.rs`; `mh_caller_type_rejected_total` → `mh metrics.rs`; both via `record_caller_type_rejected(grpc_service, expected_type, actual_type)`
-- MH `mh_jwt_validations_total{result, token_type, failure_reason}` (bounded via `classify_jwt_error()`) → `mh metrics.rs`; catalog → `docs/observability/metrics/mh-service.md`; dashboard → `mh-overview.json`
+- Layer 2 rejection metrics (`{gc,mc,mh}_caller_type_rejected_total` via `record_caller_type_rejected`) → each service's `observability/metrics.rs`
+- JWT validation metrics (`{gc,mc,mh}_jwt_validations_total{result, token_type, failure_reason}` bounded via `classify_jwt_error()`) → each service's `grpc/auth_interceptor.rs` or `grpc/auth_layer.rs`; catalogs under `docs/observability/metrics/`
 
 ## TLS & Certificates
 - Dev cert generation (ECDSA P-256 CA, MC + MH certs) → `scripts/generate-dev-certs.sh`
@@ -65,9 +66,8 @@
 
 ## Infrastructure Secrets & Network Isolation
 - Imperative secret creation → `setup.sh:create_ac_secrets()`, `create_mc_tls_secret()`, `create_mh_secrets()`, `create_mh_tls_secret()`
-- Input validation (cluster name, DT_PORT_MAP, DT_HOST_GATEWAY_IP) → `infra/kind/scripts/setup.sh` (top), `teardown.sh` (top)
-- ConfigMap advertise-address patching (devloop mode) → `infra/kind/scripts/setup.sh:deploy_mc_service()`, `deploy_mh_service()`
-- Single-service rebuild with allowlist → `infra/kind/scripts/setup.sh:deploy_only_service()`
+- Input validation (cluster name, DT_PORT_MAP, DT_HOST_GATEWAY_IP) → `infra/kind/scripts/setup.sh`, `teardown.sh`
+- ConfigMap advertise-address patching + single-service rebuild (devloop mode) → `setup.sh:deploy_mc_service()`, `deploy_mh_service()`, `deploy_only_service()`
 - Network policies (per-service ingress/egress) → `infra/services/{ac,gc,mc,mh}-service/network-policy.yaml`; MC↔MH gRPC: MC→MH:50053, MH→MC:50052
 - Kind overlay (no secrets) + supporting infra → `infra/kubernetes/overlays/kind/`, `infra/services/{postgres,redis}/`
 

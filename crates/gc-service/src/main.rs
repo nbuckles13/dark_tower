@@ -29,7 +29,7 @@ mod tasks;
 use auth::{JwksClient, JwtValidator};
 use common::token_manager::{spawn_token_manager, TokenManagerConfig};
 use config::Config;
-use grpc::auth_layer::async_auth::GrpcAuthLayer;
+use grpc::auth_layer::GrpcAuthLayer;
 use grpc::{McService, MhService};
 use proto_gen::internal::global_controller_service_server::GlobalControllerServiceServer;
 use proto_gen::internal::media_handler_registry_service_server::MediaHandlerRegistryServiceServer;

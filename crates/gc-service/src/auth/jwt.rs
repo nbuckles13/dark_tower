@@ -49,6 +49,16 @@ impl JwtValidator {
         Ok(self.inner.validate::<Claims>(token).await?)
     }
 
+    /// Validate a service JWT and return the raw `JwtError` on failure.
+    ///
+    /// Used by the gRPC auth layer (ADR-0003) to classify failures for the
+    /// `gc_jwt_validations_total{failure_reason}` metric. HTTP call sites
+    /// should keep using `validate()` for the `GcError` mapping.
+    #[instrument(skip_all)]
+    pub async fn validate_raw(&self, token: &str) -> Result<Claims, common::jwt::JwtError> {
+        self.inner.validate::<Claims>(token).await
+    }
+
     /// Validate a user JWT and return the user claims.
     ///
     /// Same security checks as `validate()` but deserializes into `UserClaims`

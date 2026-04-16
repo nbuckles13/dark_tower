@@ -1,237 +1,273 @@
-//! gRPC authentication interceptor for JWT validation.
+//! gRPC authentication for GC service.
 //!
-//! Extracts Bearer token from the `authorization` metadata and validates
-//! it using the existing JwtValidator infrastructure.
+//! Provides async JWKS-based two-layer authentication for all incoming gRPC calls:
+//!
+//! - `GrpcAuthLayer`/`GrpcAuthService`: Tower layer applied at the gRPC server level.
+//!   Validates service tokens cryptographically via JWKS, then enforces caller-type
+//!   routing based on `service_type` claim (ADR-0003).
 //!
 //! # Security
 //!
-//! - All gRPC requests require valid JWT authentication
-//! - Tokens are validated using JWKS from Auth Controller
+//! - All gRPC requests require valid Bearer token
+//! - Tokens validated cryptographically via GC's `JwtValidator` (which wraps
+//!   `common::jwt::JwtValidator<Claims>`)
+//! - Layer 1: Scope authorization enforced (`service.write.gc`) (ADR-0003)
+//! - Layer 2: Caller `service_type` must match gRPC service being called
+//! - Validated `Claims` injected into request extensions for downstream use
 //! - Generic error messages prevent information leakage
 //! - Failed authentication returns UNAUTHENTICATED status
+//! - Failed authorization (valid token, wrong caller) returns PERMISSION_DENIED status
+//!
+//! # Validation Chain (`GrpcAuthLayer`)
+//!
+//! 1. Structural fast-path: format, non-empty, size limit (8KB)
+//! 2. Cryptographic: `EdDSA` signature via JWKS
+//! 3. Claims: exp, iat with clock skew tolerance
+//! 4. Authorization: `service.write.gc` scope check
+//! 5. Routing: `service_type` must match target gRPC service (fail closed)
 
+use crate::auth::claims::Claims;
 use crate::auth::JwtValidator;
+use crate::observability::metrics;
+use axum::http;
+use common::jwt::{JwtError, MAX_JWT_SIZE_BYTES};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
-use tonic::{metadata::MetadataValue, service::Interceptor, Request, Status};
-use tracing::instrument;
+use std::task::{Context, Poll};
+use tonic::body::BoxBody;
+use tower::{Layer, Service};
 
-/// Maximum token size in bytes (8KB) per security requirements.
-const MAX_TOKEN_SIZE: usize = 8192;
+/// Required scope for GC service tokens (ADR-0003).
+///
+/// All callers (MC, MH) must present a token with this scope to call GC gRPC.
+const REQUIRED_SCOPE: &str = "service.write.gc";
 
-/// gRPC authentication interceptor.
+/// Map a `JwtError` to a bounded `failure_reason` label for the
+/// `gc_jwt_validations_total` metric.
+fn classify_jwt_error(err: &JwtError) -> &'static str {
+    match err {
+        JwtError::TokenTooLarge | JwtError::MalformedToken | JwtError::MissingKid => "malformed",
+        JwtError::InvalidSignature | JwtError::KeyNotFound | JwtError::ServiceUnavailable(_) => {
+            "signature_invalid"
+        }
+        JwtError::IatTooFarInFuture => "expired",
+    }
+}
+
+/// Async authentication layer for GC gRPC services (ADR-0003).
 ///
-/// Validates JWT tokens from the `authorization` metadata header.
-/// This is a synchronous interceptor - for async validation, we extract
-/// the token here and the service layer can perform additional validation
-/// if needed.
+/// Wraps an inner service and validates service tokens cryptographically
+/// via JWKS before forwarding requests. Applied at the server level to
+/// authenticate both MC→GC (GlobalControllerService) and MH→GC
+/// (MediaHandlerRegistryService) calls.
 ///
-/// Note: This interceptor is provided as an alternative to the async layer.
-/// It stores the token for later validation by the service layer.
+/// Enforces `service.write.gc` scope authorization after JWKS validation.
 #[derive(Clone)]
-#[allow(dead_code)] // Alternative API to async_auth layer
-pub struct GrpcAuthInterceptor {
+pub struct GrpcAuthLayer {
     jwt_validator: Arc<JwtValidator>,
+    require_auth: bool,
 }
 
-#[allow(dead_code)] // Alternative API to async layer
-impl GrpcAuthInterceptor {
-    /// Create a new gRPC auth interceptor.
+impl GrpcAuthLayer {
+    /// Create a new auth layer with JWKS-based validation.
+    #[must_use]
     pub fn new(jwt_validator: Arc<JwtValidator>) -> Self {
-        Self { jwt_validator }
+        Self {
+            jwt_validator,
+            require_auth: true,
+        }
     }
 
-    /// Extract Bearer token from authorization metadata.
-    fn extract_token<'a>(
-        &self,
-        auth_value: &'a MetadataValue<tonic::metadata::Ascii>,
-    ) -> Option<&'a str> {
-        let auth_str = auth_value.to_str().ok()?;
-        auth_str.strip_prefix("Bearer ")
+    /// Create an auth layer with authentication disabled (for testing only).
+    #[must_use]
+    #[cfg(test)]
+    pub fn disabled() -> Self {
+        let jwks_client = Arc::new(
+            common::jwt::JwksClient::new("http://localhost:0/.well-known/jwks.json".to_string())
+                .expect("Failed to create dummy JWKS client"),
+        );
+        Self {
+            jwt_validator: Arc::new(JwtValidator::new(jwks_client, 300)),
+            require_auth: false,
+        }
     }
 }
 
-impl Interceptor for GrpcAuthInterceptor {
-    /// Intercept the request and validate the JWT token.
-    ///
-    /// Note: tonic Interceptor is synchronous, so we cannot perform async
-    /// JWT validation here. Instead, we extract and do basic validation,
-    /// storing the token for later async validation if needed.
-    ///
-    /// For full async validation, consider using a Tower layer instead.
-    #[instrument(skip_all, name = "gc.grpc.auth_interceptor")]
-    fn call(&mut self, request: Request<()>) -> Result<Request<()>, Status> {
-        // Extract authorization metadata
-        let auth_header = request.metadata().get("authorization").ok_or_else(|| {
-            tracing::debug!(target: "gc.grpc.auth", "Missing authorization metadata");
-            Status::unauthenticated("Missing authorization header")
-        })?;
+impl<S> Layer<S> for GrpcAuthLayer {
+    type Service = GrpcAuthService<S>;
 
-        // Extract Bearer token
-        let token = self.extract_token(auth_header).ok_or_else(|| {
-            tracing::debug!(target: "gc.grpc.auth", "Invalid authorization format");
-            Status::unauthenticated("Invalid authorization format")
-        })?;
-
-        // Basic token format validation (not empty, reasonable length)
-        if token.is_empty() {
-            return Err(Status::unauthenticated("Empty token"));
+    fn layer(&self, inner: S) -> Self::Service {
+        GrpcAuthService {
+            inner,
+            jwt_validator: Arc::clone(&self.jwt_validator),
+            require_auth: self.require_auth,
         }
-
-        // Check token size limit (8KB max per security requirements)
-        if token.len() > MAX_TOKEN_SIZE {
-            tracing::debug!(
-                target: "gc.grpc.auth",
-                token_size = token.len(),
-                "Token exceeds size limit"
-            );
-            return Err(Status::unauthenticated("Invalid token"));
-        }
-
-        // Copy token before releasing borrow
-        let token_string = token.to_string();
-
-        // Store the token in request extensions for async validation by the service
-        // The service can then call jwt_validator.validate() asynchronously
-        let mut request = request;
-        request
-            .extensions_mut()
-            .insert(PendingTokenValidation(token_string));
-
-        Ok(request)
     }
 }
 
-/// Marker type for tokens pending async validation.
+/// Async authentication service wrapping an inner gRPC service.
 ///
-/// The interceptor extracts the token synchronously, and the service
-/// layer performs async JWT validation using this stored token.
-#[derive(Clone, Debug)]
-#[allow(dead_code)] // Used with GrpcAuthInterceptor
-pub struct PendingTokenValidation(pub String);
+/// Validates service tokens via JWKS and enforces caller-type routing
+/// before forwarding to the inner service.
+#[derive(Clone)]
+pub struct GrpcAuthService<S> {
+    inner: S,
+    jwt_validator: Arc<JwtValidator>,
+    require_auth: bool,
+}
 
-/// Async gRPC authentication service layer.
-///
-/// This module provides an async-capable authentication layer for gRPC.
-/// Use this instead of the interceptor when you need full async JWT validation.
-pub mod async_auth {
-    use super::*;
-    use crate::auth::Claims;
-    use axum::http;
-    use std::future::Future;
-    use std::pin::Pin;
-    use std::task::{Context, Poll};
-    use tonic::body::BoxBody;
-    use tower::{Layer, Service};
+impl<S> Service<http::Request<BoxBody>> for GrpcAuthService<S>
+where
+    S: Service<http::Request<BoxBody>, Response = http::Response<BoxBody>> + Clone + Send + 'static,
+    S::Future: Send + 'static,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future =
+        Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + 'static>>;
 
-    /// Tower layer for async gRPC authentication.
-    #[derive(Clone)]
-    pub struct GrpcAuthLayer {
-        jwt_validator: Arc<JwtValidator>,
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
     }
 
-    impl GrpcAuthLayer {
-        /// Create a new async auth layer.
-        pub fn new(jwt_validator: Arc<JwtValidator>) -> Self {
-            Self { jwt_validator }
-        }
-    }
+    fn call(&mut self, request: http::Request<BoxBody>) -> Self::Future {
+        // Clone the inner service for use in the async block
+        let mut inner = self.inner.clone();
+        // Swap so self.inner is the ready clone (per tower Service contract)
+        std::mem::swap(&mut self.inner, &mut inner);
 
-    impl<S> Layer<S> for GrpcAuthLayer {
-        type Service = GrpcAuthService<S>;
+        let jwt_validator = Arc::clone(&self.jwt_validator);
+        let require_auth = self.require_auth;
 
-        fn layer(&self, inner: S) -> Self::Service {
-            GrpcAuthService {
-                inner,
-                jwt_validator: self.jwt_validator.clone(),
+        Box::pin(async move {
+            if !require_auth {
+                return inner.call(request).await;
             }
-        }
-    }
 
-    /// Tower service for async gRPC authentication.
-    #[derive(Clone)]
-    pub struct GrpcAuthService<S> {
-        inner: S,
-        jwt_validator: Arc<JwtValidator>,
-    }
+            // Extract authorization header
+            let Some(auth_header) = request.headers().get("authorization") else {
+                tracing::debug!(target: "gc.grpc.auth", "Missing authorization metadata");
+                let response = tonic::Status::unauthenticated("Invalid token").into_http();
+                return Ok(response);
+            };
 
-    impl<S, ReqBody> Service<http::Request<ReqBody>> for GrpcAuthService<S>
-    where
-        S: Service<http::Request<ReqBody>, Response = http::Response<BoxBody>>
-            + Clone
-            + Send
-            + 'static,
-        S::Future: Send + 'static,
-        ReqBody: Send + 'static,
-    {
-        type Response = S::Response;
-        type Error = S::Error;
-        type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+            let Ok(auth_str) = auth_header.to_str() else {
+                tracing::debug!(target: "gc.grpc.auth", "Authorization header not valid ASCII");
+                let response = tonic::Status::unauthenticated("Invalid token").into_http();
+                return Ok(response);
+            };
 
-        fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-            self.inner.poll_ready(cx)
-        }
+            // Extract Bearer token
+            let Some(token) = auth_str.strip_prefix("Bearer ") else {
+                tracing::debug!(target: "gc.grpc.auth", "Invalid authorization format");
+                let response = tonic::Status::unauthenticated("Invalid token").into_http();
+                return Ok(response);
+            };
 
-        fn call(&mut self, req: http::Request<ReqBody>) -> Self::Future {
-            let mut inner = self.inner.clone();
-            let jwt_validator = self.jwt_validator.clone();
+            // Structural fast-path checks
+            if token.is_empty() {
+                tracing::debug!(target: "gc.grpc.auth", "Empty token");
+                let response = tonic::Status::unauthenticated("Invalid token").into_http();
+                return Ok(response);
+            }
 
-            Box::pin(async move {
-                // Extract authorization header
-                let auth_header = match req.headers().get("authorization") {
-                    Some(h) => h,
-                    None => {
-                        tracing::debug!(target: "gc.grpc.auth", "Missing authorization header");
-                        return Ok(unauthenticated_response());
-                    }
-                };
+            if token.len() > MAX_JWT_SIZE_BYTES {
+                tracing::debug!(
+                    target: "gc.grpc.auth",
+                    token_size = token.len(),
+                    "Token exceeds size limit"
+                );
+                let response = tonic::Status::unauthenticated("Invalid token").into_http();
+                return Ok(response);
+            }
 
-                // Parse header value
-                let auth_str = match auth_header.to_str() {
-                    Ok(s) => s,
-                    Err(_) => {
-                        tracing::debug!(target: "gc.grpc.auth", "Invalid authorization header encoding");
-                        return Ok(unauthenticated_response());
-                    }
-                };
+            // Cryptographic validation via JWKS.
+            // GC's JwtValidator wraps common::jwt::JwtValidator<Claims> and returns
+            // GcError. We need the raw JwtError to classify the failure reason for
+            // metrics, so call the inner validator directly. See auth/jwt.rs.
+            let claims: Claims = match jwt_validator.validate_raw(token).await {
+                Ok(claims) => {
+                    metrics::record_jwt_validation("success", "service", "none");
+                    claims
+                }
+                Err(e) => {
+                    let reason = classify_jwt_error(&e);
+                    tracing::warn!(
+                        target: "gc.grpc.auth",
+                        error = ?e,
+                        failure_reason = %reason,
+                        "Service token validation failed"
+                    );
+                    metrics::record_jwt_validation("failure", "service", reason);
+                    let response = tonic::Status::unauthenticated("Invalid token").into_http();
+                    return Ok(response);
+                }
+            };
 
-                // Extract Bearer token
-                let token = match auth_str.strip_prefix("Bearer ") {
-                    Some(t) => t,
-                    None => {
-                        tracing::debug!(target: "gc.grpc.auth", "Invalid authorization format");
-                        return Ok(unauthenticated_response());
-                    }
-                };
+            // Layer 1: Scope authorization check (ADR-0003)
+            if !claims.has_scope(REQUIRED_SCOPE) {
+                tracing::warn!(
+                    target: "gc.grpc.auth",
+                    scope = %claims.scope,
+                    required = REQUIRED_SCOPE,
+                    "Service token missing required scope"
+                );
+                metrics::record_jwt_validation("failure", "service", "scope_mismatch");
+                let response = tonic::Status::unauthenticated("Invalid token").into_http();
+                return Ok(response);
+            }
 
-                // Validate JWT asynchronously
-                let claims = match jwt_validator.validate(token).await {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::debug!(target: "gc.grpc.auth", error = %e, "JWT validation failed");
-                        return Ok(unauthenticated_response());
-                    }
-                };
+            // Layer 2: service_type routing (ADR-0003)
+            // Match the gRPC service path to the expected caller service_type.
+            let grpc_path = request.uri().path();
+            let (grpc_service_label, expected_type) = if grpc_path
+                .starts_with("/dark_tower.internal.GlobalControllerService/")
+            {
+                ("GlobalControllerService", "meeting-controller")
+            } else if grpc_path.starts_with("/dark_tower.internal.MediaHandlerRegistryService/") {
+                ("MediaHandlerRegistryService", "media-handler")
+            } else {
+                // Unknown gRPC service path — fail closed
+                tracing::warn!(
+                    target: "gc.grpc.auth",
+                    path = %grpc_path,
+                    "Unknown gRPC service path, rejecting"
+                );
+                let response = tonic::Status::permission_denied("Access denied").into_http();
+                return Ok(response);
+            };
 
-                // Store validated claims in request extensions
-                let (mut parts, body) = req.into_parts();
-                parts.extensions.insert(ValidatedClaims(claims));
-                let req = http::Request::from_parts(parts, body);
+            let actual_type = claims.service_type.as_deref().unwrap_or("unknown");
+            if actual_type != expected_type {
+                tracing::warn!(
+                    target: "gc.grpc.auth",
+                    grpc_service = %grpc_service_label,
+                    expected = %expected_type,
+                    actual = %actual_type,
+                    "Caller service_type does not match target gRPC service"
+                );
+                metrics::record_caller_type_rejected(
+                    grpc_service_label,
+                    expected_type,
+                    actual_type,
+                );
+                let response = tonic::Status::permission_denied("Access denied").into_http();
+                return Ok(response);
+            }
 
-                // Continue to inner service
-                inner.call(req).await
-            })
-        }
-    }
+            tracing::trace!(
+                target: "gc.grpc.auth",
+                service_type = %actual_type,
+                "Service token validated successfully"
+            );
 
-    /// Wrapper for validated claims in request extensions.
-    #[derive(Clone, Debug)]
-    #[allow(dead_code)] // Will be used by service handlers
-    pub struct ValidatedClaims(pub Claims);
+            // Inject validated claims into request extensions for downstream handlers
+            let mut request = request;
+            request.extensions_mut().insert(claims);
 
-    /// Create an unauthenticated gRPC response.
-    fn unauthenticated_response() -> http::Response<BoxBody> {
-        let status = Status::unauthenticated("Authentication required");
-        status.into_http()
+            inner.call(request).await
+        })
     }
 }
 
@@ -240,294 +276,19 @@ pub mod async_auth {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_pending_token_validation_debug() {
-        let pending = PendingTokenValidation("test-token".to_string());
-        let debug_str = format!("{:?}", pending);
-        // Token value is visible in debug - this is intentional for testing only
-        assert!(debug_str.contains("PendingTokenValidation"));
-    }
-
-    #[test]
-    fn test_max_token_size() {
-        // Verify constant matches security requirements
-        assert_eq!(super::MAX_TOKEN_SIZE, 8192);
-    }
-
-    // =========================================================================
-    // GrpcAuthInterceptor tests
-    // =========================================================================
-
-    fn create_interceptor() -> GrpcAuthInterceptor {
-        // Create a minimal JwtValidator for the interceptor
-        // The interceptor doesn't actually validate JWT - it just extracts and stores
-        let jwks_client = Arc::new(
-            crate::auth::JwksClient::new("http://localhost:8082/.well-known/jwks.json".to_string())
-                .expect("Failed to create JWKS client"),
-        );
-        let jwt_validator = Arc::new(JwtValidator::new(jwks_client, 300));
-        GrpcAuthInterceptor::new(jwt_validator)
-    }
-
-    fn create_request_with_auth(auth_value: &str) -> Request<()> {
-        let mut request = Request::new(());
-        request
-            .metadata_mut()
-            .insert("authorization", auth_value.parse().unwrap());
-        request
-    }
-
-    fn create_request_without_auth() -> Request<()> {
-        Request::new(())
-    }
-
-    #[test]
-    fn test_interceptor_missing_authorization_header() {
-        let mut interceptor = create_interceptor();
-        let request = create_request_without_auth();
-
-        let result = interceptor.call(request);
-
-        assert!(result.is_err());
-        let status = result.unwrap_err();
-        assert_eq!(status.code(), tonic::Code::Unauthenticated);
-        assert!(status.message().contains("Missing authorization header"));
-    }
-
-    #[test]
-    fn test_interceptor_invalid_auth_format_basic() {
-        let mut interceptor = create_interceptor();
-        let request = create_request_with_auth("Basic dXNlcjpwYXNz");
-
-        let result = interceptor.call(request);
-
-        assert!(result.is_err());
-        let status = result.unwrap_err();
-        assert_eq!(status.code(), tonic::Code::Unauthenticated);
-        assert!(status.message().contains("Invalid authorization format"));
-    }
-
-    #[test]
-    fn test_interceptor_invalid_auth_format_no_bearer() {
-        let mut interceptor = create_interceptor();
-        let request = create_request_with_auth("Token abc123");
-
-        let result = interceptor.call(request);
-
-        assert!(result.is_err());
-        let status = result.unwrap_err();
-        assert_eq!(status.code(), tonic::Code::Unauthenticated);
-        assert!(status.message().contains("Invalid authorization format"));
-    }
-
-    #[test]
-    fn test_interceptor_empty_token() {
-        let mut interceptor = create_interceptor();
-        let request = create_request_with_auth("Bearer ");
-
-        let result = interceptor.call(request);
-
-        assert!(result.is_err());
-        let status = result.unwrap_err();
-        assert_eq!(status.code(), tonic::Code::Unauthenticated);
-        assert!(status.message().contains("Empty token"));
-    }
-
-    #[test]
-    fn test_interceptor_oversized_token() {
-        let mut interceptor = create_interceptor();
-        let oversized_token = "a".repeat(8193);
-        let request = create_request_with_auth(&format!("Bearer {}", oversized_token));
-
-        let result = interceptor.call(request);
-
-        assert!(result.is_err());
-        let status = result.unwrap_err();
-        assert_eq!(status.code(), tonic::Code::Unauthenticated);
-        // Generic error message per security requirements
-        assert!(status.message().contains("Invalid token"));
-    }
-
-    #[test]
-    fn test_interceptor_token_at_8192_bytes_accepted() {
-        let mut interceptor = create_interceptor();
-        // Token exactly at the limit should be accepted
-        let token_at_limit = "a".repeat(8192);
-        let request = create_request_with_auth(&format!("Bearer {}", token_at_limit));
-
-        let result = interceptor.call(request);
-
-        // Token passes size check but is stored for later validation
-        assert!(result.is_ok());
-        let request = result.unwrap();
-        let pending = request
-            .extensions()
-            .get::<PendingTokenValidation>()
-            .expect("Should have PendingTokenValidation");
-        assert_eq!(pending.0.len(), 8192);
-    }
-
-    #[test]
-    fn test_interceptor_valid_token_stored() {
-        let mut interceptor = create_interceptor();
-        let request = create_request_with_auth("Bearer valid.jwt.token");
-
-        let result = interceptor.call(request);
-
-        assert!(result.is_ok());
-        let request = result.unwrap();
-        let pending = request
-            .extensions()
-            .get::<PendingTokenValidation>()
-            .expect("Should have PendingTokenValidation");
-        assert_eq!(pending.0, "valid.jwt.token");
-    }
-
-    #[test]
-    fn test_interceptor_bearer_case_sensitive() {
-        let mut interceptor = create_interceptor();
-        // "bearer" lowercase should not work
-        let request = create_request_with_auth("bearer token123");
-
-        let result = interceptor.call(request);
-
-        assert!(result.is_err());
-        let status = result.unwrap_err();
-        assert_eq!(status.code(), tonic::Code::Unauthenticated);
-    }
-
-    #[test]
-    fn test_interceptor_bearer_with_extra_spaces() {
-        let mut interceptor = create_interceptor();
-        // Extra spaces after Bearer should result in token with leading space
-        let request = create_request_with_auth("Bearer  token-with-leading-space");
-
-        let result = interceptor.call(request);
-
-        assert!(result.is_ok());
-        let request = result.unwrap();
-        let pending = request
-            .extensions()
-            .get::<PendingTokenValidation>()
-            .expect("Should have PendingTokenValidation");
-        // Token includes the extra space
-        assert_eq!(pending.0, " token-with-leading-space");
-    }
-
-    #[test]
-    fn test_extract_token_helper() {
-        let interceptor = create_interceptor();
-
-        // Valid Bearer token
-        let meta: MetadataValue<tonic::metadata::Ascii> = "Bearer abc123".parse().unwrap();
-        assert_eq!(interceptor.extract_token(&meta), Some("abc123"));
-
-        // No Bearer prefix
-        let meta: MetadataValue<tonic::metadata::Ascii> = "Token xyz".parse().unwrap();
-        assert_eq!(interceptor.extract_token(&meta), None);
-
-        // Just "Bearer" without token
-        let meta: MetadataValue<tonic::metadata::Ascii> = "Bearer".parse().unwrap();
-        assert_eq!(interceptor.extract_token(&meta), None);
-    }
-
-    // =========================================================================
-    // async_auth module tests
-    // =========================================================================
-
-    #[test]
-    fn test_validated_claims_debug() {
-        use crate::auth::Claims;
-        use async_auth::ValidatedClaims;
-
-        let claims = Claims {
-            sub: "test-subject".to_string(),
-            exp: 1234567890,
-            iat: 1234567800,
-            scope: "read write".to_string(),
-            service_type: Some("global-controller".to_string()),
-        };
-
-        let validated = ValidatedClaims(claims);
-        let debug_str = format!("{:?}", validated);
-        assert!(debug_str.contains("ValidatedClaims"));
-        // sub should be redacted in Claims debug
-        assert!(debug_str.contains("[REDACTED]"));
-    }
-
-    #[test]
-    fn test_grpc_auth_layer_creation() {
-        let jwks_client = Arc::new(
-            crate::auth::JwksClient::new("http://localhost:8082/.well-known/jwks.json".to_string())
-                .expect("Failed to create JWKS client"),
-        );
-        let jwt_validator = Arc::new(JwtValidator::new(jwks_client, 300));
-
-        let _layer = async_auth::GrpcAuthLayer::new(jwt_validator);
-        // Layer creation should succeed
-    }
-}
-
-// =========================================================================
-// GrpcAuthService async integration tests (requires tokio runtime)
-// =========================================================================
-#[cfg(test)]
-mod async_tests {
-    use super::async_auth::*;
-    use super::*;
-    use axum::http::{self, HeaderValue, Request, Response};
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-    use jsonwebtoken::{encode, Algorithm, EncodingKey, Header as JwtHeader};
+    use chrono::Utc;
+    use common::jwt::JwksClient;
+    use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
     use ring::signature::{Ed25519KeyPair, KeyPair};
     use serde::{Deserialize, Serialize};
-    use std::convert::Infallible;
-    use std::future::Future;
-    use std::pin::Pin;
-    use std::task::{Context, Poll};
-    use tonic::body::BoxBody;
-    use tower::{Layer, Service};
+    use tower::ServiceExt;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    /// Mock inner service that returns OK with a marker header indicating it was reached.
-    #[derive(Clone)]
-    struct MockInnerService;
-
-    /// Header to indicate the inner service was reached.
-    const INNER_SERVICE_REACHED: &str = "x-inner-service-reached";
-
-    impl<ReqBody> Service<Request<ReqBody>> for MockInnerService
-    where
-        ReqBody: Send + 'static,
-    {
-        type Response = Response<BoxBody>;
-        type Error = Infallible;
-        type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
-
-        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-            Poll::Ready(Ok(()))
-        }
-
-        fn call(&mut self, _req: Request<ReqBody>) -> Self::Future {
-            Box::pin(async move {
-                let body = BoxBody::default();
-                Ok(Response::builder()
-                    .status(200)
-                    .header(INNER_SERVICE_REACHED, "true")
-                    .body(body)
-                    .expect("Failed to build response"))
-            })
-        }
-    }
-
-    /// Test keypair for signing tokens.
-    struct TestKeypair {
-        kid: String,
-        public_key_bytes: Vec<u8>,
-        private_key_pkcs8: Vec<u8>,
-    }
-
-    /// JWT Claims for test tokens.
+    /// Test-only claims struct whose JSON shape matches GC's `auth::Claims`.
+    /// We don't use `Claims` directly here because it doesn't implement
+    /// `Serialize` for test signing purposes (it is deserialize-only).
     #[derive(Debug, Clone, Serialize, Deserialize)]
     struct TestClaims {
         sub: String,
@@ -538,12 +299,24 @@ mod async_tests {
         service_type: Option<String>,
     }
 
+    struct TestKeypair {
+        kid: String,
+        public_key_bytes: Vec<u8>,
+        private_key_pkcs8: Vec<u8>,
+    }
+
     impl TestKeypair {
         fn new(seed: u8, kid: &str) -> Self {
             let mut seed_bytes = [0u8; 32];
             seed_bytes[0] = seed;
             for (i, byte) in seed_bytes.iter_mut().enumerate().skip(1) {
-                *byte = seed.wrapping_mul(i as u8).wrapping_add(i as u8);
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "Seed bytes are max 32 elements, fits in u8"
+                )]
+                {
+                    *byte = seed.wrapping_mul(i as u8).wrapping_add(i as u8);
+                }
             }
 
             let key_pair = Ed25519KeyPair::from_seed_unchecked(&seed_bytes)
@@ -561,7 +334,7 @@ mod async_tests {
 
         fn sign_token(&self, claims: &TestClaims) -> String {
             let encoding_key = EncodingKey::from_ed_der(&self.private_key_pkcs8);
-            let mut header = JwtHeader::new(Algorithm::EdDSA);
+            let mut header = Header::new(Algorithm::EdDSA);
             header.typ = Some("JWT".to_string());
             header.kid = Some(self.kid.clone());
 
@@ -580,7 +353,6 @@ mod async_tests {
         }
     }
 
-    /// Build PKCS#8 v1 document from Ed25519 seed.
     fn build_pkcs8_from_seed(seed: &[u8; 32]) -> Vec<u8> {
         let mut pkcs8 = Vec::new();
         pkcs8.push(0x30);
@@ -597,8 +369,10 @@ mod async_tests {
         pkcs8
     }
 
-    async fn setup_mock_jwks(keypair: &TestKeypair) -> MockServer {
+    async fn setup_auth_layer() -> (MockServer, TestKeypair, GrpcAuthLayer) {
         let mock_server = MockServer::start().await;
+        let keypair = TestKeypair::new(42, "gc-auth-test-key-01");
+
         let jwks_response = serde_json::json!({
             "keys": [keypair.jwk_json()]
         });
@@ -609,240 +383,450 @@ mod async_tests {
             .mount(&mock_server)
             .await;
 
-        mock_server
-    }
-
-    fn create_auth_service(jwks_url: String) -> GrpcAuthService<MockInnerService> {
+        let jwks_url = format!("{}/.well-known/jwks.json", mock_server.uri());
         let jwks_client =
-            Arc::new(crate::auth::JwksClient::new(jwks_url).expect("Failed to create JWKS client"));
+            Arc::new(JwksClient::new(jwks_url).expect("Failed to create JWKS client"));
         let jwt_validator = Arc::new(JwtValidator::new(jwks_client, 300));
         let layer = GrpcAuthLayer::new(jwt_validator);
-        layer.layer(MockInnerService)
+
+        (mock_server, keypair, layer)
     }
 
-    fn create_http_request_with_auth(auth_value: &str) -> Request<()> {
-        Request::builder()
-            .header("authorization", auth_value)
-            .body(())
-            .expect("Failed to build request")
-    }
+    /// MC→GC gRPC path for `GlobalControllerService`
+    const MC_GRPC_PATH: &str = "/dark_tower.internal.GlobalControllerService/RegisterMC";
 
-    fn create_http_request_without_auth() -> Request<()> {
-        Request::builder()
-            .body(())
-            .expect("Failed to build request")
-    }
+    /// MH→GC gRPC path for `MediaHandlerRegistryService`
+    const MH_GRPC_PATH: &str = "/dark_tower.internal.MediaHandlerRegistryService/RegisterMH";
 
-    /// Helper to check if inner service was reached (valid auth)
-    fn inner_service_reached(response: &Response<BoxBody>) -> bool {
-        response.headers().get(INNER_SERVICE_REACHED).is_some()
-    }
-
-    #[tokio::test]
-    async fn test_async_auth_missing_authorization_header() {
-        let keypair = TestKeypair::new(1, "test-key-01");
-        let mock_server = setup_mock_jwks(&keypair).await;
-
-        let mut service =
-            create_auth_service(format!("{}/.well-known/jwks.json", mock_server.uri()));
-
-        let request = create_http_request_without_auth();
-        let response = service
-            .call(request)
-            .await
-            .expect("Service should not error");
-
-        // Inner service should NOT be reached - request should be rejected
-        assert!(
-            !inner_service_reached(&response),
-            "Inner service should not be reached for unauthenticated request"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_async_auth_invalid_header_encoding() {
-        let keypair = TestKeypair::new(1, "test-key-01");
-        let mock_server = setup_mock_jwks(&keypair).await;
-
-        let mut service =
-            create_auth_service(format!("{}/.well-known/jwks.json", mock_server.uri()));
-
-        // Create request with non-ASCII header value (using raw bytes)
-        let mut request = Request::builder()
-            .body(())
-            .expect("Failed to build request");
-        // Insert header with invalid UTF-8 sequence
-        request.headers_mut().insert(
-            "authorization",
-            HeaderValue::from_bytes(b"Bearer \xff\xfe invalid").unwrap(),
-        );
-
-        let response = service
-            .call(request)
-            .await
-            .expect("Service should not error");
-
-        // Inner service should NOT be reached
-        assert!(
-            !inner_service_reached(&response),
-            "Inner service should not be reached for invalid header encoding"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_async_auth_invalid_bearer_format() {
-        let keypair = TestKeypair::new(1, "test-key-01");
-        let mock_server = setup_mock_jwks(&keypair).await;
-
-        let mut service =
-            create_auth_service(format!("{}/.well-known/jwks.json", mock_server.uri()));
-
-        // Non-Bearer format
-        let request = create_http_request_with_auth("Basic dXNlcjpwYXNz");
-        let response = service
-            .call(request)
-            .await
-            .expect("Service should not error");
-
-        // Inner service should NOT be reached
-        assert!(
-            !inner_service_reached(&response),
-            "Inner service should not be reached for non-Bearer format"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_async_auth_invalid_jwt_token() {
-        let keypair = TestKeypair::new(1, "test-key-01");
-        let mock_server = setup_mock_jwks(&keypair).await;
-
-        let mut service =
-            create_auth_service(format!("{}/.well-known/jwks.json", mock_server.uri()));
-
-        // Malformed JWT
-        let request = create_http_request_with_auth("Bearer not.a.valid.jwt");
-        let response = service
-            .call(request)
-            .await
-            .expect("Service should not error");
-
-        // Inner service should NOT be reached
-        assert!(
-            !inner_service_reached(&response),
-            "Inner service should not be reached for malformed JWT"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_async_auth_expired_jwt_token() {
-        let keypair = TestKeypair::new(1, "test-key-01");
-        let mock_server = setup_mock_jwks(&keypair).await;
-
-        let mut service =
-            create_auth_service(format!("{}/.well-known/jwks.json", mock_server.uri()));
-
-        // Create expired token
-        let now = chrono::Utc::now().timestamp();
-        let claims = TestClaims {
-            sub: "test-client".to_string(),
-            exp: now - 3600, // Expired 1 hour ago
-            iat: now - 7200,
-            scope: "read".to_string(),
-            service_type: None,
-        };
-        let expired_token = keypair.sign_token(&claims);
-
-        let request = create_http_request_with_auth(&format!("Bearer {}", expired_token));
-        let response = service
-            .call(request)
-            .await
-            .expect("Service should not error");
-
-        // Inner service should NOT be reached
-        assert!(
-            !inner_service_reached(&response),
-            "Inner service should not be reached for expired JWT"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_async_auth_valid_jwt_token() {
-        let keypair = TestKeypair::new(1, "test-key-01");
-        let mock_server = setup_mock_jwks(&keypair).await;
-
-        let mut service =
-            create_auth_service(format!("{}/.well-known/jwks.json", mock_server.uri()));
-
-        // Create valid token
-        let now = chrono::Utc::now().timestamp();
-        let claims = TestClaims {
-            sub: "test-client".to_string(),
-            exp: now + 3600, // Expires in 1 hour
-            iat: now,
-            scope: "read write".to_string(),
-            service_type: Some("global-controller".to_string()),
-        };
-        let valid_token = keypair.sign_token(&claims);
-
-        let request = create_http_request_with_auth(&format!("Bearer {}", valid_token));
-        let response = service
-            .call(request)
-            .await
-            .expect("Service should not error");
-
-        // Inner service SHOULD be reached with valid token
-        assert!(
-            inner_service_reached(&response),
-            "Inner service should be reached for valid JWT"
-        );
-        assert_eq!(response.status(), http::StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn test_async_auth_unknown_kid() {
-        let keypair = TestKeypair::new(1, "test-key-01");
-        let different_keypair = TestKeypair::new(2, "different-key");
-        let mock_server = setup_mock_jwks(&different_keypair).await; // JWKS has different key
-
-        let mut service =
-            create_auth_service(format!("{}/.well-known/jwks.json", mock_server.uri()));
-
-        // Token signed with keypair but JWKS only has different_keypair
-        let now = chrono::Utc::now().timestamp();
-        let claims = TestClaims {
-            sub: "test-client".to_string(),
+    fn make_claims(scope: &str, service_type: Option<&str>) -> TestClaims {
+        let now = Utc::now().timestamp();
+        TestClaims {
+            sub: "test-service".to_string(),
             exp: now + 3600,
             iat: now,
-            scope: "read".to_string(),
-            service_type: None,
+            scope: scope.to_string(),
+            service_type: service_type.map(String::from),
+        }
+    }
+
+    /// A no-op inner service that returns an empty OK response.
+    #[derive(Clone)]
+    struct NoopService;
+
+    impl Service<http::Request<BoxBody>> for NoopService {
+        type Response = http::Response<BoxBody>;
+        type Error = Box<dyn std::error::Error + Send + Sync>;
+        type Future =
+            Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + 'static>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _request: http::Request<BoxBody>) -> Self::Future {
+            Box::pin(async { Ok(http::Response::new(BoxBody::default())) })
+        }
+    }
+
+    fn assert_unauthenticated(response: &http::Response<BoxBody>, context: &str) {
+        let status = tonic::Status::from_header_map(response.headers());
+        assert!(
+            status.is_some(),
+            "{context}: expected gRPC status header in response"
+        );
+        assert_eq!(
+            status.unwrap().code(),
+            tonic::Code::Unauthenticated,
+            "{context}: expected UNAUTHENTICATED"
+        );
+    }
+
+    fn assert_permission_denied(response: &http::Response<BoxBody>, context: &str) {
+        let status = tonic::Status::from_header_map(response.headers());
+        assert!(
+            status.is_some(),
+            "{context}: expected gRPC status header in response"
+        );
+        assert_eq!(
+            status.unwrap().code(),
+            tonic::Code::PermissionDenied,
+            "{context}: expected PERMISSION_DENIED"
+        );
+    }
+
+    #[test]
+    fn test_required_scope_constant() {
+        assert_eq!(REQUIRED_SCOPE, "service.write.gc");
+    }
+
+    #[tokio::test]
+    async fn test_auth_layer_rejects_missing_auth_header() {
+        let (_mock_server, _keypair, layer) = setup_auth_layer().await;
+        let mut svc = layer.layer(NoopService);
+
+        let request = http::Request::builder().body(BoxBody::default()).unwrap();
+
+        let response = svc.ready().await.unwrap().call(request).await.unwrap();
+        assert_unauthenticated(&response, "missing auth header");
+    }
+
+    #[tokio::test]
+    async fn test_auth_layer_rejects_invalid_bearer_format() {
+        let (_mock_server, _keypair, layer) = setup_auth_layer().await;
+        let mut svc = layer.layer(NoopService);
+
+        let request = http::Request::builder()
+            .header("authorization", "Basic dXNlcjpwYXNz")
+            .body(BoxBody::default())
+            .unwrap();
+
+        let response = svc.ready().await.unwrap().call(request).await.unwrap();
+        assert_unauthenticated(&response, "invalid Bearer format");
+    }
+
+    #[tokio::test]
+    async fn test_auth_layer_rejects_empty_token() {
+        let (_mock_server, _keypair, layer) = setup_auth_layer().await;
+        let mut svc = layer.layer(NoopService);
+
+        let request = http::Request::builder()
+            .header("authorization", "Bearer ")
+            .body(BoxBody::default())
+            .unwrap();
+
+        let response = svc.ready().await.unwrap().call(request).await.unwrap();
+        assert_unauthenticated(&response, "empty token");
+    }
+
+    #[tokio::test]
+    async fn test_auth_layer_rejects_oversized_token() {
+        let (_mock_server, _keypair, layer) = setup_auth_layer().await;
+        let mut svc = layer.layer(NoopService);
+
+        let oversized = "a".repeat(8193);
+        let request = http::Request::builder()
+            .header("authorization", format!("Bearer {oversized}"))
+            .body(BoxBody::default())
+            .unwrap();
+
+        let response = svc.ready().await.unwrap().call(request).await.unwrap();
+        assert_unauthenticated(&response, "oversized token");
+    }
+
+    #[tokio::test]
+    async fn test_auth_layer_rejects_invalid_signature() {
+        let (_mock_server, _keypair, layer) = setup_auth_layer().await;
+        let mut svc = layer.layer(NoopService);
+
+        // Sign with a different key than what JWKS serves, reusing the same kid
+        // to force signature-mismatch rather than key-not-found.
+        let wrong_keypair = TestKeypair::new(99, "gc-auth-test-key-01");
+        let claims = make_claims("service.write.gc", Some("meeting-controller"));
+        let token = wrong_keypair.sign_token(&claims);
+
+        let request = http::Request::builder()
+            .uri(MC_GRPC_PATH)
+            .header("authorization", format!("Bearer {token}"))
+            .body(BoxBody::default())
+            .unwrap();
+
+        let response = svc.ready().await.unwrap().call(request).await.unwrap();
+        assert_unauthenticated(&response, "invalid signature");
+    }
+
+    #[tokio::test]
+    async fn test_auth_layer_rejects_unknown_kid() {
+        let (_mock_server, _keypair, layer) = setup_auth_layer().await;
+        let mut svc = layer.layer(NoopService);
+
+        // Sign with a keypair whose kid is NOT in the JWKS (KeyNotFound path,
+        // distinct from signature-mismatch with a known kid).
+        let unknown_keypair = TestKeypair::new(77, "some-other-kid");
+        let claims = make_claims("service.write.gc", Some("meeting-controller"));
+        let token = unknown_keypair.sign_token(&claims);
+
+        let request = http::Request::builder()
+            .uri(MC_GRPC_PATH)
+            .header("authorization", format!("Bearer {token}"))
+            .body(BoxBody::default())
+            .unwrap();
+
+        let response = svc.ready().await.unwrap().call(request).await.unwrap();
+        assert_unauthenticated(&response, "unknown kid");
+    }
+
+    #[tokio::test]
+    async fn test_auth_layer_rejects_expired_token() {
+        let (_mock_server, keypair, layer) = setup_auth_layer().await;
+        let mut svc = layer.layer(NoopService);
+
+        let now = Utc::now().timestamp();
+        let claims = TestClaims {
+            sub: "mc-service".to_string(),
+            exp: now - 3600,
+            iat: now - 7200,
+            scope: "service.write.gc".to_string(),
+            service_type: Some("meeting-controller".to_string()),
         };
         let token = keypair.sign_token(&claims);
 
-        let request = create_http_request_with_auth(&format!("Bearer {}", token));
-        let response = service
-            .call(request)
-            .await
-            .expect("Service should not error");
+        let request = http::Request::builder()
+            .uri(MC_GRPC_PATH)
+            .header("authorization", format!("Bearer {token}"))
+            .body(BoxBody::default())
+            .unwrap();
 
-        // Inner service should NOT be reached - unknown kid
+        let response = svc.ready().await.unwrap().call(request).await.unwrap();
+        assert_unauthenticated(&response, "expired token");
+    }
+
+    #[tokio::test]
+    async fn test_auth_layer_rejects_wrong_scope() {
+        // Sending a non-GC scope (service.write.mc) to GC to prove scope-level
+        // rejection fires before Layer 2 routing ever runs.
+        let (_mock_server, keypair, layer) = setup_auth_layer().await;
+        let mut svc = layer.layer(NoopService);
+
+        let claims = make_claims("service.write.mc", Some("meeting-controller"));
+        let token = keypair.sign_token(&claims);
+
+        let request = http::Request::builder()
+            .uri(MC_GRPC_PATH)
+            .header("authorization", format!("Bearer {token}"))
+            .body(BoxBody::default())
+            .unwrap();
+
+        let response = svc.ready().await.unwrap().call(request).await.unwrap();
+        assert_unauthenticated(&response, "wrong scope");
+    }
+
+    #[tokio::test]
+    async fn test_auth_layer_rejects_empty_scope() {
+        let (_mock_server, keypair, layer) = setup_auth_layer().await;
+        let mut svc = layer.layer(NoopService);
+
+        // Empty scope string — catches any accidental short-circuit in has_scope.
+        let claims = make_claims("", Some("meeting-controller"));
+        let token = keypair.sign_token(&claims);
+
+        let request = http::Request::builder()
+            .uri(MC_GRPC_PATH)
+            .header("authorization", format!("Bearer {token}"))
+            .body(BoxBody::default())
+            .unwrap();
+
+        let response = svc.ready().await.unwrap().call(request).await.unwrap();
+        assert_unauthenticated(&response, "empty scope");
+    }
+
+    #[tokio::test]
+    async fn test_auth_layer_rejects_mismatched_scope_tokens() {
+        let (_mock_server, keypair, layer) = setup_auth_layer().await;
+        let mut svc = layer.layer(NoopService);
+
+        // Non-empty scope with tokens, none matching REQUIRED_SCOPE —
+        // pins the split+exact-match contract in has_scope.
+        let claims = make_claims("read write admin", Some("meeting-controller"));
+        let token = keypair.sign_token(&claims);
+
+        let request = http::Request::builder()
+            .uri(MC_GRPC_PATH)
+            .header("authorization", format!("Bearer {token}"))
+            .body(BoxBody::default())
+            .unwrap();
+
+        let response = svc.ready().await.unwrap().call(request).await.unwrap();
+        assert_unauthenticated(&response, "mismatched scope tokens");
+    }
+
+    #[tokio::test]
+    async fn test_auth_layer_accepts_valid_mc_token() {
+        let (_mock_server, keypair, layer) = setup_auth_layer().await;
+        let mut svc = layer.layer(NoopService);
+
+        let claims = make_claims("service.write.gc", Some("meeting-controller"));
+        let token = keypair.sign_token(&claims);
+
+        let request = http::Request::builder()
+            .uri(MC_GRPC_PATH)
+            .header("authorization", format!("Bearer {token}"))
+            .body(BoxBody::default())
+            .unwrap();
+
+        let response = svc.ready().await.unwrap().call(request).await.unwrap();
+        let status = tonic::Status::from_header_map(response.headers());
+
         assert!(
-            !inner_service_reached(&response),
-            "Inner service should not be reached for unknown kid"
+            status.is_none(),
+            "Valid MC token should pass through, got: {status:?}"
         );
     }
 
     #[tokio::test]
-    async fn test_async_auth_poll_ready_delegates() {
-        let keypair = TestKeypair::new(1, "test-key-01");
-        let mock_server = setup_mock_jwks(&keypair).await;
+    async fn test_auth_layer_accepts_valid_mh_token() {
+        let (_mock_server, keypair, layer) = setup_auth_layer().await;
+        let mut svc = layer.layer(NoopService);
 
-        let mut service: GrpcAuthService<MockInnerService> =
-            create_auth_service(format!("{}/.well-known/jwks.json", mock_server.uri()));
+        let claims = make_claims("service.write.gc", Some("media-handler"));
+        let token = keypair.sign_token(&claims);
 
-        // poll_ready should succeed (delegates to inner service)
-        let waker = futures::task::noop_waker();
-        let mut cx = Context::from_waker(&waker);
-        let result = Service::<Request<()>>::poll_ready(&mut service, &mut cx);
-        assert!(matches!(result, Poll::Ready(Ok(()))));
+        let request = http::Request::builder()
+            .uri(MH_GRPC_PATH)
+            .header("authorization", format!("Bearer {token}"))
+            .body(BoxBody::default())
+            .unwrap();
+
+        let response = svc.ready().await.unwrap().call(request).await.unwrap();
+        let status = tonic::Status::from_header_map(response.headers());
+
+        assert!(
+            status.is_none(),
+            "Valid MH token should pass through, got: {status:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_auth_layer_disabled_skips_validation() {
+        let layer = GrpcAuthLayer::disabled();
+        let mut svc = layer.layer(NoopService);
+
+        let request = http::Request::builder().body(BoxBody::default()).unwrap();
+
+        let response = svc.ready().await.unwrap().call(request).await.unwrap();
+        let status = tonic::Status::from_header_map(response.headers());
+
+        assert!(
+            status.is_none(),
+            "Disabled layer should pass through without auth"
+        );
+    }
+
+    // ========================================================================
+    // Layer 2: service_type routing tests (ADR-0003)
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_layer2_rejects_mc_calling_mh_registry_service() {
+        let (_mock_server, keypair, layer) = setup_auth_layer().await;
+        let mut svc = layer.layer(NoopService);
+
+        // MC token trying to call MediaHandlerRegistryService (MH-only)
+        let claims = make_claims("service.write.gc", Some("meeting-controller"));
+        let token = keypair.sign_token(&claims);
+
+        let request = http::Request::builder()
+            .uri(MH_GRPC_PATH)
+            .header("authorization", format!("Bearer {token}"))
+            .body(BoxBody::default())
+            .unwrap();
+
+        let response = svc.ready().await.unwrap().call(request).await.unwrap();
+        assert_permission_denied(&response, "MC calling MediaHandlerRegistryService");
+    }
+
+    #[tokio::test]
+    async fn test_layer2_rejects_mh_calling_global_controller_service() {
+        let (_mock_server, keypair, layer) = setup_auth_layer().await;
+        let mut svc = layer.layer(NoopService);
+
+        // MH token trying to call GlobalControllerService (MC-only)
+        let claims = make_claims("service.write.gc", Some("media-handler"));
+        let token = keypair.sign_token(&claims);
+
+        let request = http::Request::builder()
+            .uri(MC_GRPC_PATH)
+            .header("authorization", format!("Bearer {token}"))
+            .body(BoxBody::default())
+            .unwrap();
+
+        let response = svc.ready().await.unwrap().call(request).await.unwrap();
+        assert_permission_denied(&response, "MH calling GlobalControllerService");
+    }
+
+    #[tokio::test]
+    async fn test_layer2_rejects_no_service_type_fail_closed() {
+        let (_mock_server, keypair, layer) = setup_auth_layer().await;
+        let mut svc = layer.layer(NoopService);
+
+        let claims = make_claims("service.write.gc", None);
+        let token = keypair.sign_token(&claims);
+
+        let request = http::Request::builder()
+            .uri(MC_GRPC_PATH)
+            .header("authorization", format!("Bearer {token}"))
+            .body(BoxBody::default())
+            .unwrap();
+
+        let response = svc.ready().await.unwrap().call(request).await.unwrap();
+        assert_permission_denied(&response, "no service_type (fail closed)");
+    }
+
+    #[tokio::test]
+    async fn test_layer2_rejects_unknown_grpc_path() {
+        let (_mock_server, keypair, layer) = setup_auth_layer().await;
+        let mut svc = layer.layer(NoopService);
+
+        let claims = make_claims("service.write.gc", Some("meeting-controller"));
+        let token = keypair.sign_token(&claims);
+
+        let request = http::Request::builder()
+            .uri("/dark_tower.internal.UnknownService/SomeMethod")
+            .header("authorization", format!("Bearer {token}"))
+            .body(BoxBody::default())
+            .unwrap();
+
+        let response = svc.ready().await.unwrap().call(request).await.unwrap();
+        assert_permission_denied(&response, "unknown gRPC service path");
+    }
+
+    #[tokio::test]
+    async fn test_claims_injected_into_request_extensions() {
+        let (_mock_server, keypair, layer) = setup_auth_layer().await;
+
+        #[derive(Clone)]
+        struct ClaimsCheckService;
+
+        impl Service<http::Request<BoxBody>> for ClaimsCheckService {
+            type Response = http::Response<BoxBody>;
+            type Error = Box<dyn std::error::Error + Send + Sync>;
+            type Future =
+                Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + 'static>>;
+
+            fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn call(&mut self, request: http::Request<BoxBody>) -> Self::Future {
+                let has_claims = request.extensions().get::<Claims>().is_some();
+                Box::pin(async move {
+                    if has_claims {
+                        Ok(http::Response::new(BoxBody::default()))
+                    } else {
+                        let response =
+                            tonic::Status::internal("Claims not found in extensions").into_http();
+                        Ok(response)
+                    }
+                })
+            }
+        }
+
+        let mut svc = layer.layer(ClaimsCheckService);
+
+        let claims = make_claims("service.write.gc", Some("meeting-controller"));
+        let token = keypair.sign_token(&claims);
+
+        let request = http::Request::builder()
+            .uri(MC_GRPC_PATH)
+            .header("authorization", format!("Bearer {token}"))
+            .body(BoxBody::default())
+            .unwrap();
+
+        let response = svc.ready().await.unwrap().call(request).await.unwrap();
+        let status = tonic::Status::from_header_map(response.headers());
+
+        assert!(
+            status.is_none(),
+            "Claims should be injected into request extensions, got: {status:?}"
+        );
     }
 }
