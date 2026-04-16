@@ -170,7 +170,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Initialize JWKS client + JWT validator for meeting token validation (ADR-0020)
     // This validates client meeting/guest tokens presented during WebTransport join.
-    // Separate from gRPC McAuthInterceptor which validates GC->MC service tokens.
+    // Separate from gRPC McAuthLayer which validates service-to-service tokens.
     info!(
         ac_jwks_url = %config.ac_jwks_url,
         "Initializing JWKS client for meeting token validation..."

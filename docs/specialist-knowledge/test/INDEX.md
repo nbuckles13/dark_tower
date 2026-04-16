@@ -35,7 +35,7 @@
 - MH data (MhAssignmentStore trait, serde, backward compat, MhClient, MockMhAssignmentStore) -> `crates/mc-service/src/redis/client.rs`, `src/grpc/mh_client.rs:tests`, `tests/join_tests.rs`
 - MH coordination (registry, MediaCoordinationService) -> `crates/mc-service/src/mh_connection_registry.rs:tests`, `grpc/media_coordination.rs:tests`
 - GC integration + heartbeat tests -> `crates/mc-service/tests/gc_integration.rs`, `heartbeat_tasks.rs`
-- Health + metrics (incl. RegisterMeeting, MH coordination + media connection failure) -> `crates/mc-service/src/observability/health.rs`, `metrics.rs`
+- Health + metrics (incl. RegisterMeeting, MH coordination, media connection failure, Layer 2 mc_caller_type_rejected_total) -> `crates/mc-service/src/observability/health.rs`, `metrics.rs`
 - Test utils (mock Redis, mock GC, mock MH) -> `crates/mc-test-utils/src/mock_redis.rs`, `mock_gc.rs`, `mock_mh.rs`
 
 ## Code Locations: MH Service
@@ -71,5 +71,5 @@
 
 ## Code Locations: Common & Infrastructure
 - JWT (claims, JwksClient, JwtValidator, round-trip tests) -> `crates/common/src/jwt.rs`; meeting token -> `meeting_token.rs:tests`
-- Scope contract tests (ADR-0003 regression prevention) -> `crates/ac-service/src/models/mod.rs:tests`
+- Scope contract tests + ADR-0003 scope alignment -> `crates/ac-service/src/models/mod.rs:test_scope_contract_*`, `default_scopes()`, `infra/kind/scripts/setup.sh:seed_test_data()`
 - MC/MH per-pod Services, ConfigMaps, Kind port mappings → `infra/services/{mc,mh}-service/`; Dev certs → `scripts/generate-dev-certs.sh`

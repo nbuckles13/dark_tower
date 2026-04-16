@@ -1,17 +1,18 @@
 # Security Navigation
 
 ## Architecture & Design
-- Service authentication (OAuth 2.0 Client Credentials) → ADR-0003
-- Inter-service gRPC auth scopes (two-layer: JWKS+scope, service_type allowlist) → ADR-0003
+- Service auth (OAuth 2.0 Client Credentials, two-layer gRPC: JWKS+scope, service_type allowlist) → ADR-0003
 - Token lifetime & refresh → ADR-0007 | Key rotation → ADR-0008
 - User auth & meeting access → ADR-0020
 - No-panic policy → ADR-0002 | Approved algorithms → ADR-0027
 - MC session binding & HKDF key hierarchy → ADR-0023 (Section 1)
 - Client architecture (E2EE, key management, supply chain) → ADR-0028 (Sections 5, 1)
 
-## Code Locations — AC (Token Issuance & Crypto)
+## Code Locations — AC (Token Issuance, Crypto & Scope Alignment)
 - JWT signing/verification, key encryption, bcrypt → `crates/ac-service/src/crypto/mod.rs`
-- Token issuance → `crates/ac-service/src/services/token_service.rs:issue_service_token()`, `issue_user_token()`
+- Token issuance (service_type always set) → `crates/ac-service/src/services/token_service.rs:issue_service_token()`, `issue_user_token()`
+- ADR-0003 scope alignment: `default_scopes()` → `crates/ac-service/src/models/mod.rs:ServiceType`; seed SQL → `infra/kind/scripts/setup.sh:seed_test_data()`
+- Scope contract tests (regression guard) → `crates/ac-service/src/models/mod.rs:test_scope_contract_*`
 - Security config + rate limits → `crates/ac-service/src/config.rs` | K8s: `infra/services/ac-service/`
 
 ## Code Locations — Common (JWT Infrastructure & Shared Token Types)
@@ -27,7 +28,7 @@
 
 ## Code Locations — MC (JWT, WebTransport, Actors, MH Client)
 - MC JWT validation + token_type anti-confusion → `crates/mc-service/src/auth/mod.rs:McJwtValidator`
-- gRPC auth: JWKS `McAuthLayer` (scope `service.write.mc` + service_type routing per ADR-0003) → `crates/mc-service/src/grpc/auth_interceptor.rs`
+- gRPC two-layer auth `McAuthLayer` → `crates/mc-service/src/grpc/auth_interceptor.rs`: Layer 1 JWKS+scope (`service.write.mc`), Layer 2 service_type allowlist (MeetingControllerService→GC, MediaCoordinationService→MH), claims injected into extensions. Dead `McAuthInterceptor` removed.
 - MC→MH OAuth Bearer auth (TokenReceiver, add_auth) → `crates/mc-service/src/grpc/mh_client.rs:MhClient`
 - MediaCoordinationService (MH→MC, input validation) → `crates/mc-service/src/grpc/media_coordination.rs`
 - MH connection registry (bound: 1000/meeting) + UTF-8 safe truncation (`floor_char_boundary`) → `mh_connection_registry.rs`, `webtransport/connection.rs:handle_client_message()`
@@ -44,6 +45,7 @@
 
 ## Code Locations — Observability (Security-Relevant)
 - MC/MH metrics (bounded labels, no PII) → `crates/mc-service/src/observability/metrics.rs` (+ mh) | ADR-0029
+- Layer 2 rejection metric `mc_caller_type_rejected_total{grpc_service, expected_type, actual_type}` → `metrics.rs:record_caller_type_rejected()`; catalog → `docs/observability/metrics/mc-service.md`; dashboard → `infra/grafana/dashboards/mc-overview.json`
 - MC notification metrics (event x status, cardinality 4) → `crates/mh-service/src/observability/metrics.rs:record_mc_notification()`
 
 ## TLS & Certificates
@@ -52,15 +54,13 @@
 - WebTransport UDP ingress + Kind mapping → `infra/services/{mc,mh}-service/network-policy.yaml`, `infra/kind/kind-config.yaml`
 
 ## Advertise Addresses (MC + MH → GC Registration)
-- gRPC: K8s downward API `status.podIP` | WebTransport: per-instance env var from ConfigMap
-- Per-instance NodePort Services (`{mc,mh}-service-{0,1}`) expose only UDP WebTransport | Registration → `gc_client.rs:register()`
+- gRPC: K8s downward API `status.podIP` | WebTransport: per-instance env var from ConfigMap | Per-instance NodePort Services expose only UDP WebTransport | Registration → `gc_client.rs:register()`
 
 ## Devloop Container & Cluster Helper Security
 - Container isolation → ADR-0025; Cluster helper (trust, socket auth, networking) → ADR-0030
 - Env-test URL validation → `crates/env-tests/src/cluster.rs:parse_host_port()`, `ClusterPorts::from_env()`
 - Helper binary (arg safety) → `crates/devloop-helper/src/commands.rs`; Auth token → `src/auth.rs`
-- Status (read-only, auth-gated) → `commands.rs:cmd_status()`; Gateway IP → `validate_gateway_ip()`
-- Socket auth + API allowlist + prohibitions → ADR-0030 (Helper Process, Helper API, Explicit Prohibitions)
+- Status (read-only, auth-gated) → `commands.rs:cmd_status()`; Gateway IP → `validate_gateway_ip()` | Socket auth + API allowlist → ADR-0030
 - Kind NodePort listen address → `infra/kind/kind-config.yaml.tmpl`; Wrapper → `infra/devloop/devloop.sh`
 
 ## Infrastructure Secrets & Network Isolation
@@ -71,5 +71,5 @@
 - Network policies (per-service ingress/egress) → `infra/services/{ac,gc,mc,mh}-service/network-policy.yaml`; MC↔MH gRPC: MC→MH:50053, MH→MC:50052
 - Kind overlay (no secrets) + supporting infra → `infra/kubernetes/overlays/kind/`, `infra/services/{postgres,redis}/`
 
-## Health, Probes & Integration Seams
+## Health, Probes & Seams
 - MC/MH health + K8s probes → `src/observability/health.rs` | Auth chain: AC JWKS → GC/MC/MH | Guards → `scripts/guards/simple/`

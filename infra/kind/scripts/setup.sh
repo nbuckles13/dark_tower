@@ -454,9 +454,9 @@ seed_test_data() {
     ${KUBECTL} exec -n dark-tower postgres-0 -- psql -U darktower -d dark_tower -c "
 INSERT INTO service_credentials (client_id, client_secret_hash, service_type, region, scopes, is_active)
 VALUES
-    ('global-controller', '\$2b\$12\$Gcm3fKCVQzVeCKBkVumWeu9MpAqayxTo08p4aS7xScQTCK8Fi6nBu', 'global-controller', 'us-west-2', ARRAY['meeting:create', 'meeting:read', 'meeting:update', 'internal:meeting-token'], true),
-    ('meeting-controller', '\$2b\$12\$BX5OkdvGLfsj6eTM89qkGe/mPpU2nf2aAXDK7v5sedsndrwUmG6dm', 'meeting-controller', 'us-west-2', ARRAY['media:forward', 'session:manage'], true),
-    ('media-handler', '\$2b\$12\$DpQDslp37I3UFi.IBC24NOCnMWcPKkdiDO96FEACLVoXqVyYEhyZa', 'media-handler', 'us-west-2', ARRAY['media:receive', 'media:send'], true),
+    ('global-controller', '\$2b\$12\$Gcm3fKCVQzVeCKBkVumWeu9MpAqayxTo08p4aS7xScQTCK8Fi6nBu', 'global-controller', 'us-west-2', ARRAY['service.write.mc', 'internal:meeting-token'], true),
+    ('meeting-controller', '\$2b\$12\$BX5OkdvGLfsj6eTM89qkGe/mPpU2nf2aAXDK7v5sedsndrwUmG6dm', 'meeting-controller', 'us-west-2', ARRAY['service.write.mh', 'service.write.gc'], true),
+    ('media-handler', '\$2b\$12\$DpQDslp37I3UFi.IBC24NOCnMWcPKkdiDO96FEACLVoXqVyYEhyZa', 'media-handler', 'us-west-2', ARRAY['service.write.mc', 'service.write.gc'], true),
     ('test-client', '\$2b\$12\$DpBLvWIsdO2j3a8dhx0VwOd8kLdZ4/szjsuZVm.TX.z4fxjlWzOny', 'global-controller', NULL, ARRAY['test:all'], true)
 ON CONFLICT (client_id) DO UPDATE SET
     client_secret_hash = EXCLUDED.client_secret_hash,

@@ -18,8 +18,7 @@
 //!
 //! # Security
 //!
-//! - All incoming gRPC calls pass through [`McAuthLayer`] (JWKS-based cryptographic validation, R-22)
-//! - Legacy [`McAuthInterceptor`] provides structural validation (not currently applied)
+//! - All incoming gRPC calls pass through [`McAuthLayer`] (JWKS-based two-layer validation, ADR-0003)
 
 pub mod auth_interceptor;
 pub mod gc_client;
@@ -27,7 +26,7 @@ pub mod mc_service;
 pub mod media_coordination;
 pub mod mh_client;
 
-pub use auth_interceptor::{McAuthInterceptor, McAuthLayer};
+pub use auth_interceptor::McAuthLayer;
 pub use gc_client::GcClient;
 pub use mc_service::McAssignmentService;
 pub use media_coordination::McMediaCoordinationService;

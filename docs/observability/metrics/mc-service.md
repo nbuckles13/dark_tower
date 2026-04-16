@@ -152,10 +152,10 @@ All MC service metrics follow ADR-0011 naming conventions with the `mc_` prefix.
 - **Description**: Total JWT validation attempts by result and token type
 - **Labels**:
   - `result`: Validation outcome (`success`, `failure`)
-  - `token_type`: Token type (`meeting`, `guest`)
-- **Cardinality**: Low (2 results x 2 token types = 4 series)
+  - `token_type`: Token type (`meeting`, `guest`, `service`)
+- **Cardinality**: Low (2 results x 3 token types = 6 series)
 - **Usage**: Monitor authentication health, detect token validation failures
-- **Recorded in**: `connection.rs` after JWT validation
+- **Recorded in**: `connection.rs` after JWT validation, `grpc/auth_interceptor.rs` for service tokens
 - **Alert**: `MCHighJwtValidationFailures` (warning, failure rate >10% for 5m)
 - **Dashboard**: MC Overview - JWT Validations by Result (Join Flow row)
 
@@ -238,6 +238,23 @@ All MC service metrics follow ADR-0011 naming conventions with the `mc_` prefix.
 - **Recorded in**: `webtransport/connection.rs` on MediaConnectionFailed message
 - **Alert**: `MCMediaConnectionAllFailed` (warning/P2, all_failed=true > 0 for 5m)
 - **Dashboard**: MC Overview - Media Connection Failures (MH Coordination row)
+
+---
+
+## gRPC Auth Layer 2 Metrics (ADR-0003)
+
+### `mc_caller_type_rejected_total`
+- **Type**: Counter
+- **Description**: Total Layer 2 service_type routing rejections (valid token, wrong caller for gRPC service)
+- **Labels**:
+  - `grpc_service`: Target gRPC service name (`MeetingControllerService`, `MediaCoordinationService`)
+  - `expected_type`: Expected service_type for the gRPC service (`global-controller`, `media-handler`)
+  - `actual_type`: Actual service_type from the token (`global-controller`, `media-handler`, `meeting-controller`, `unknown`)
+- **Cardinality**: Low (2 x 3 x 4 = 24 max, bounded by service types)
+- **Alert**: ANY non-zero value indicates a bug or misconfiguration
+- **Usage**: Detect service-to-service routing errors, misconfigured tokens
+- **Recorded in**: `grpc/auth_interceptor.rs` on Layer 2 rejection
+- **Dashboard**: MC Overview - Caller Type Rejections
 
 ---
 
@@ -364,12 +381,15 @@ All MC service metrics follow strict cardinality bounds per ADR-0011:
 | `status` | 2-3 | `success`, `error`/`failure`, `accepted`/`rejected` |
 | `type` | 2 | `fast`, `comprehensive` |
 | `result` | 2 | `success`, `failure` (JWT validation) |
-| `token_type` | 2 | `meeting`, `guest` (JWT validation) |
+| `token_type` | 3 | `meeting`, `guest`, `service` (JWT validation) |
 | `error_type` | ~19 | Bounded by `McError` enum variants |
 | `event` | 2 | `connected`, `disconnected` (MH notifications) |
 | `all_failed` | 2 | `true`, `false` (media connection failures) |
+| `grpc_service` | 2 | `MeetingControllerService`, `MediaCoordinationService` (Layer 2 auth) |
+| `expected_type` | 3 | `global-controller`, `media-handler`, `meeting-controller` (Layer 2 auth) |
+| `actual_type` | 4 | `global-controller`, `media-handler`, `meeting-controller`, `unknown` (Layer 2 auth) |
 
-**Total Estimated Cardinality**: ~79 time series (well within Prometheus limits)
+**Total Estimated Cardinality**: ~105 time series (well within Prometheus limits)
 
 ---
 

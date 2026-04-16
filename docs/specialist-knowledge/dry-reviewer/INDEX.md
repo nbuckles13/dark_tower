@@ -27,10 +27,17 @@
 - Extraction candidate: `generate_instance_id(prefix)` -> 4-line pattern in GC + MC + MH config
 
 ## gRPC Auth (Cross-Service)
-- MC auth -> `crates/mc-service/src/grpc/auth_interceptor.rs:McAuthLayer` (JWKS, R-22) + `:McAuthInterceptor` (legacy, dead)
-- MH auth -> `crates/mh-service/src/grpc/auth_interceptor.rs:MhAuthLayer` (JWKS) + `:MhAuthInterceptor` (legacy, dead)
+- MC auth -> `crates/mc-service/src/grpc/auth_interceptor.rs:McAuthLayer` (JWKS + scope + Layer 2 service_type routing, ADR-0003); `McAuthInterceptor` removed
+- MH auth -> `crates/mh-service/src/grpc/auth_interceptor.rs:MhAuthLayer` (JWKS + scope, Layer 1 only) + `:MhAuthInterceptor` (legacy, dead)
 - Shared constant -> `common::jwt::MAX_JWT_SIZE_BYTES`
-- McAuthLayer/MhAuthLayer are near-identical tower Layer/Service patterns (extraction candidate in TODO.md)
+- McAuthLayer/MhAuthLayer Layer 1 near-identical; MC diverges with Layer 2 routing + claims injection (extraction candidate in TODO.md, trigger: MH/GC get Layer 2)
+- Layer 2 metric -> `mc_caller_type_rejected_total{grpc_service, expected_type, actual_type}` | Dashboard panel -> `infra/grafana/dashboards/mc-overview.json`
+
+## Scope Alignment (ADR-0003)
+- Scope convention: `service.write.{target}` for gRPC; `internal:meeting-token` for AC HTTP
+- AC `default_scopes()` -> `crates/ac-service/src/models/mod.rs:ServiceType::default_scopes` (authoritative)
+- Seed SQL -> `infra/kind/scripts/setup.sh:seed_test_data` (must match `default_scopes()`)
+- Scope contract tests -> `crates/ac-service/src/models/mod.rs` (5 tests: GC->MC, MH->MC, MC->MH, MC->GC, MH->GC)
 
 ## MC gRPC Services (GC→MC + MH→MC)
 - MC assignment service (GC→MC) -> `crates/mc-service/src/grpc/mc_service.rs:McAssignmentService`
@@ -47,19 +54,10 @@
 - Extraction candidate: `add_auth` (~10 lines identical, 4 call sites: MC GcClient, MC MhClient, MH GcClient, MH McClient) -> extract crate-local in each crate's `grpc/mod.rs`; `common` when third crate needs it
 - MH gRPC stub service -> `crates/mh-service/src/grpc/mh_service.rs:MhMediaService`
 
-## Redis Abstractions (MC)
-- MhAssignmentStore trait -> `crates/mc-service/src/redis/client.rs:MhAssignmentStore` (testability seam for join flow)
-- FencedRedisClient -> `crates/mc-service/src/redis/client.rs:FencedRedisClient` (fenced writes, implements MhAssignmentStore)
-
-## Health Endpoints (Cross-Service Consistency)
-- MC health routes -> `crates/mc-service/src/observability/health.rs:health_router()`
-- MH health routes -> `crates/mh-service/src/observability/health.rs:health_router()` (duplicates MC)
-- GC health routes -> `crates/gc-service/src/routes/mod.rs:64-65`
-
-## Per-Service Infrastructure (K8s, Docker, Kind)
-- Kustomize bases -> `infra/services/{ac,gc,mc,mh}-service/kustomization.yaml`; MC/MH per-pod Services + ConfigMaps
-- Network policies -> `infra/services/{ac,gc,mc,mh}-service/network-policy.yaml`; MH↔MC on TCP 50052
-- Dockerfiles -> `infra/docker/{ac,gc,mc,mh}-service/Dockerfile`; Kind -> `infra/kind/`; setup/teardown -> `infra/kind/scripts/`
+## Redis, Health & Infrastructure
+- Redis: MhAssignmentStore trait + FencedRedisClient -> `crates/mc-service/src/redis/client.rs` (testability seam for join flow)
+- Health: MC/MH `health_router()` structurally identical (duplication) | GC -> `routes/mod.rs:64-65`
+- K8s: `infra/services/{ac,gc,mc,mh}-service/`; Dockerfiles -> `infra/docker/`; Kind -> `infra/kind/`
 
 ## False Positive Boundaries
 - Per-service error mapping (GcError vs McError vs MhError) -> required, not duplication

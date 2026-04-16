@@ -1321,7 +1321,7 @@ mod tests {
 
         let response = result.unwrap().0;
         assert_eq!(response.service_type, "media-handler");
-        assert_eq!(response.scopes.len(), 3); // media-handler has 3 default scopes
+        assert_eq!(response.scopes.len(), 2); // media-handler has 2 default scopes (ADR-0003)
     }
 
     /// Test handle_register_service validates service_type case-sensitively

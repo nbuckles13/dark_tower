@@ -25,8 +25,8 @@
 - gRPC: GC client (registration, heartbeats, advertise address usage) → `crates/mc-service/src/grpc/gc_client.rs`
 - gRPC: MC service (AssignMeetingWithMh) → `crates/mc-service/src/grpc/mc_service.rs`
 - gRPC: MH client (RegisterMeeting, per-call Channel) → `crates/mc-service/src/grpc/mh_client.rs`
-- gRPC: auth interceptor (dead code, remove per ADR-0003) → `crates/mc-service/src/grpc/auth_interceptor.rs:McAuthInterceptor`
-- gRPC: auth layer (async JWKS + scope + service_type routing, ADR-0003) → `crates/mc-service/src/grpc/auth_interceptor.rs:McAuthLayer`
+- gRPC: auth layer (two-layer: JWKS+scope L1, service_type routing L2, claims injection, ADR-0003) → `crates/mc-service/src/grpc/auth_interceptor.rs:McAuthLayer`
+- ADR-0003 scope data: `default_scopes()` → `crates/ac-service/src/models/mod.rs:ServiceType`; seed SQL → `infra/kind/scripts/setup.sh`; contract tests → `test_scope_contract_*`
 - gRPC: media coordination (MH notifications, R-15) → `crates/mc-service/src/grpc/media_coordination.rs`
 - MH connection registry (participant→MH state, R-18) → `crates/mc-service/src/mh_connection_registry.rs`
 - Redis: fenced client (Lua scripts) → `crates/mc-service/src/redis/client.rs`
@@ -38,6 +38,7 @@
 - Join flow metrics (R-13): record_webtransport_connection, record_jwt_validation, record_session_join → `crates/mc-service/src/observability/metrics.rs`
 - MH communication metrics: record_register_meeting → `crates/mc-service/src/observability/metrics.rs`
 - MH coordination metrics (R-28): record_mh_notification, record_media_connection_failed → `crates/mc-service/src/observability/metrics.rs`
+- Layer 2 auth metric: record_caller_type_rejected (mc_caller_type_rejected_total) → `crates/mc-service/src/observability/metrics.rs`
 - MC metrics catalog → `docs/observability/metrics/mc-service.md`
 - System info (sysinfo) → `crates/mc-service/src/system_info.rs`
 

@@ -3,12 +3,11 @@
 ## Architecture & Design
 - Actor handle/task separation → ADR-0001 (Section: Pattern)
 - No-panic policy, `#[expect]` over `#[allow]` → ADR-0002
-- Error handling, service-layer wrapping → ADR-0003
+- Service auth: two-layer gRPC auth, scope convention `service.write.{target}` → ADR-0003 (Component 6)
 - Host-side cluster helper → ADR-0030
 - Observability naming, label cardinality, SLO targets → ADR-0011
 - Dashboard metric presentation (counters vs rates, $__rate_interval) → ADR-0029
-- Guard pipeline methodology → ADR-0015
-- DRY cross-service duplication → ADR-0019
+- Guard pipeline → ADR-0015; DRY cross-service duplication → ADR-0019
 - User auth, three-tier token architecture → ADR-0020
 - Infrastructure architecture, K8s manifests → ADR-0012; Local dev environment → ADR-0013
 - Agent teams validation pipeline → ADR-0024
@@ -19,6 +18,7 @@
 - Crypto (EdDSA, AES-256-GCM, bcrypt) → `crates/ac-service/src/crypto/mod.rs:sign_jwt()`
 - Error type → `crates/ac-service/src/errors.rs:AcError`
 - Handlers/routes → `handlers/auth_handler.rs:handle_service_token()`, `routes/mod.rs:build_routes()`
+- Scope alignment (ADR-0003): `models/mod.rs:ServiceType::default_scopes()`, scope contract tests `test_scope_contract_*`; seed SQL → `infra/kind/scripts/setup.sh:seed_test_data()`
 - Metrics → `crates/ac-service/src/observability/metrics.rs:init_metrics_recorder()`
 - Repository + service layers → `repositories/signing_keys.rs`, `services/key_management_service.rs`
 - K8s wiring → `infra/services/ac-service/configmap.yaml`, `statefulset.yaml`
@@ -33,7 +33,7 @@
 
 ## Code Locations — MC Service
 - Error type (McError, bounded labels, From<JwtError>, MhAssignmentMissing) → `crates/mc-service/src/errors.rs`
-- Auth: JWT validator + token type enforcement → `crates/mc-service/src/auth/mod.rs:McJwtValidator`; interceptor → `grpc/auth_interceptor.rs:McAuthInterceptor`; auth layer (async JWKS, no scope — deferred to handlers) → `grpc/auth_interceptor.rs:McAuthLayer`
+- Auth: JWT validator + token type enforcement → `crates/mc-service/src/auth/mod.rs:McJwtValidator`; two-layer auth (JWKS + scope `service.write.mc` + service_type routing, ADR-0003) → `grpc/auth_interceptor.rs:McAuthLayer`; claims injected into `http::Request` extensions
 - MH gRPC client (Channel-per-call, RegisterMeeting RPC) → `crates/mc-service/src/grpc/mh_client.rs:MhClient`
 - MediaCoordinationService (MH→MC notifications, R-15) → `grpc/media_coordination.rs:McMediaCoordinationService`
 - MH connection registry (participant→MH tracking, RwLock) → `mh_connection_registry.rs:MhConnectionRegistry`
@@ -41,7 +41,7 @@
 - Startup wiring (JwksClient, McJwtValidator, McAuthLayer, MediaCoordinationService, registry) → `crates/mc-service/src/main.rs`
 - Redis (MhAssignmentData, MhAssignmentStore trait, FencedRedisClient) → `crates/mc-service/src/redis/client.rs`
 - WebTransport: server (accept loop, redis injection) → `crates/mc-service/src/webtransport/server.rs:WebTransportServer::accept_loop()`; join flow → `webtransport/connection.rs:handle_connection()`, `build_join_response()`; post-join (MediaConnectionFailed R-20) → `connection.rs:handle_client_message()`
-- MC metrics (join, WebTransport, JWT, register_meeting, MH notifications, media failures, init) → `crates/mc-service/src/observability/metrics.rs`; catalog → `docs/observability/metrics/mc-service.md`
+- MC metrics (join, WebTransport, JWT, register_meeting, MH notifications, media failures, caller_type_rejected, init) → `crates/mc-service/src/observability/metrics.rs`; catalog → `docs/observability/metrics/mc-service.md`
 - Dashboard + alerts → `infra/grafana/dashboards/mc-overview.json`, `infra/docker/prometheus/rules/mc-alerts.yaml`
 - Health probes + K8s (8081, per-pod NodePort) → `observability/health.rs:health_router()`, `infra/services/mc-service/`
 

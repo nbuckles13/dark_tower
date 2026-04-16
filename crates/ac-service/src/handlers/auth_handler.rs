@@ -810,7 +810,7 @@ mod tests {
             client_secret: Some(SecretString::from(
                 registration.client_secret.expose_secret().to_string(),
             )),
-            scope: Some("meeting:read meeting:update".to_string()), // Request allowed scopes
+            scope: Some("service.write.mh service.write.gc".to_string()), // Request allowed scopes (ADR-0003)
         };
 
         let addr = "127.0.0.1:8080".parse::<SocketAddr>().unwrap();
