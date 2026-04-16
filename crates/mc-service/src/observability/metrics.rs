@@ -415,6 +415,28 @@ pub fn record_media_connection_failed(all_failed: bool) {
 }
 
 // ============================================================================
+// gRPC Auth Layer 2 Metrics (ADR-0003)
+// ============================================================================
+
+/// Record a caller service_type rejection by Layer 2 routing.
+///
+/// Metric: `mc_caller_type_rejected_total`
+/// Labels: `grpc_service`, `expected_type`, `actual_type`
+///
+/// Cardinality: 2 x 3 x 4 = 24 max (bounded by gRPC services and service types + "unknown")
+///
+/// ALERT: Any non-zero value indicates a bug or misconfiguration — a service
+/// is presenting a valid token but calling the wrong gRPC endpoint.
+pub fn record_caller_type_rejected(grpc_service: &str, expected_type: &str, actual_type: &str) {
+    counter!("mc_caller_type_rejected_total",
+        "grpc_service" => grpc_service.to_string(),
+        "expected_type" => expected_type.to_string(),
+        "actual_type" => actual_type.to_string()
+    )
+    .increment(1);
+}
+
+// ============================================================================
 // Error Metrics
 // ============================================================================
 
@@ -628,6 +650,23 @@ mod tests {
     }
 
     #[test]
+    fn test_record_caller_type_rejected() {
+        // Test representative label combinations (ADR-0003 Layer 2)
+        record_caller_type_rejected(
+            "MeetingControllerService",
+            "global-controller",
+            "media-handler",
+        );
+        record_caller_type_rejected(
+            "MediaCoordinationService",
+            "media-handler",
+            "global-controller",
+        );
+        record_caller_type_rejected("MeetingControllerService", "global-controller", "unknown");
+        record_caller_type_rejected("MediaCoordinationService", "media-handler", "unknown");
+    }
+
+    #[test]
     fn test_record_media_connection_failed() {
         // Test both boolean states
         record_media_connection_failed(true);
@@ -685,6 +724,18 @@ mod tests {
         // Verify media connection failure labels are bounded
         record_media_connection_failed(true);
         record_media_connection_failed(false);
+
+        // Verify caller type rejection labels are bounded (ADR-0003)
+        record_caller_type_rejected(
+            "MeetingControllerService",
+            "global-controller",
+            "media-handler",
+        );
+        record_caller_type_rejected(
+            "MediaCoordinationService",
+            "media-handler",
+            "global-controller",
+        );
     }
 
     // ========================================================================
@@ -745,6 +796,13 @@ mod tests {
         record_mh_notification("disconnected");
         record_media_connection_failed(true);
         record_media_connection_failed(false);
+
+        // Record Layer 2 auth metrics (ADR-0003)
+        record_caller_type_rejected(
+            "MeetingControllerService",
+            "global-controller",
+            "media-handler",
+        );
 
         // Take a snapshot and verify metrics were recorded
         let snapshot = snapshotter.snapshot();

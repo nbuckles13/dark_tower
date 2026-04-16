@@ -1,20 +1,21 @@
 //! gRPC authentication for MC service.
 //!
-//! Provides two authentication mechanisms:
+//! Provides async JWKS-based two-layer authentication for all incoming gRPC calls:
 //!
-//! - `McAuthInterceptor`: Synchronous structural validation for GC→MC requests
-//!   (format, non-empty, size limits). Full JWKS upgrade deferred.
-//! - `McAuthLayer`/`McAuthService`: Async JWKS-based cryptographic validation
-//!   for MH→MC requests (R-22). Uses `tower::Layer`/`tower::Service` to support
-//!   async JWKS cache lookups.
+//! - `McAuthLayer`/`McAuthService`: Tower layer applied at the gRPC server level.
+//!   Validates service tokens cryptographically via JWKS, then enforces caller-type
+//!   routing based on `service_type` claim (ADR-0003).
 //!
 //! # Security
 //!
 //! - All gRPC requests require valid Bearer token
-//! - MH→MC tokens are validated cryptographically via `JwtValidator<ServiceClaims>`
-//! - Scope authorization enforced (`service.write.mc`) (ADR-0003)
+//! - Tokens validated cryptographically via `JwtValidator<ServiceClaims>`
+//! - Layer 1: Scope authorization enforced (`service.write.mc`) (ADR-0003)
+//! - Layer 2: Caller service_type must match gRPC service being called
+//! - Validated `ServiceClaims` injected into request extensions for downstream use
 //! - Generic error messages prevent information leakage
 //! - Failed authentication returns UNAUTHENTICATED status
+//! - Failed authorization (valid token, wrong caller) returns PERMISSION_DENIED status
 //!
 //! # Validation Chain (McAuthLayer)
 //!
@@ -22,6 +23,7 @@
 //! 2. Cryptographic: `EdDSA` signature via JWKS
 //! 3. Claims: exp, iat with clock skew tolerance
 //! 4. Authorization: `service.write.mc` scope check
+//! 5. Routing: `service_type` must match target gRPC service (fail closed)
 
 use crate::auth::CommonJwtValidator;
 use crate::observability::metrics;
@@ -32,106 +34,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use tonic::body::BoxBody;
-use tonic::{service::Interceptor, Request, Status};
 use tower::{Layer, Service};
-use tracing::instrument;
-
-/// gRPC authentication interceptor for MC service.
-///
-/// Validates that incoming requests have proper authorization headers.
-/// This is a synchronous interceptor that performs basic validation.
-#[derive(Clone, Debug)]
-pub struct McAuthInterceptor {
-    /// Whether to require authorization (can be disabled for testing).
-    require_auth: bool,
-}
-
-impl Default for McAuthInterceptor {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl McAuthInterceptor {
-    /// Create a new auth interceptor with authorization required.
-    #[must_use]
-    pub fn new() -> Self {
-        Self { require_auth: true }
-    }
-
-    /// Create an auth interceptor with authorization disabled (for testing only).
-    #[must_use]
-    #[cfg(test)]
-    pub fn disabled() -> Self {
-        Self {
-            require_auth: false,
-        }
-    }
-
-    /// Extract Bearer token from authorization metadata.
-    fn extract_token<'a>(
-        &self,
-        auth_value: &'a tonic::metadata::MetadataValue<tonic::metadata::Ascii>,
-    ) -> Option<&'a str> {
-        let auth_str = auth_value.to_str().ok()?;
-        auth_str.strip_prefix("Bearer ")
-    }
-}
-
-impl Interceptor for McAuthInterceptor {
-    /// Intercept the request and validate authorization.
-    ///
-    /// Validates:
-    /// - Authorization header is present
-    /// - Bearer token format is correct
-    /// - Token is not empty
-    /// - Token size is within limits (8KB)
-    #[instrument(skip_all, name = "mc.grpc.auth_interceptor")]
-    fn call(&mut self, request: Request<()>) -> Result<Request<()>, Status> {
-        // Skip auth if disabled (testing only)
-        if !self.require_auth {
-            return Ok(request);
-        }
-
-        // Extract authorization metadata
-        let auth_header = request.metadata().get("authorization").ok_or_else(|| {
-            tracing::debug!(target: "mc.grpc.auth", "Missing authorization metadata");
-            Status::unauthenticated("Missing authorization header")
-        })?;
-
-        // Extract Bearer token
-        let token = self.extract_token(auth_header).ok_or_else(|| {
-            tracing::debug!(target: "mc.grpc.auth", "Invalid authorization format");
-            Status::unauthenticated("Invalid authorization format")
-        })?;
-
-        // Basic token format validation
-        if token.is_empty() {
-            tracing::debug!(target: "mc.grpc.auth", "Empty token");
-            return Err(Status::unauthenticated("Empty token"));
-        }
-
-        // Check token size limit (8KB max per security requirements)
-        if token.len() > MAX_JWT_SIZE_BYTES {
-            tracing::debug!(
-                target: "mc.grpc.auth",
-                token_size = token.len(),
-                "Token exceeds size limit"
-            );
-            return Err(Status::unauthenticated("Invalid token"));
-        }
-
-        // Token format validated - request can proceed
-        // Full cryptographic validation deferred to Phase 6h (JWKS integration)
-        tracing::trace!(
-            target: "mc.grpc.auth",
-            token_len = token.len(),
-            "Authorization validated"
-        );
-
-        Ok(request)
-    }
-}
 
 /// Required scope for MC service tokens (ADR-0003).
 ///
@@ -194,7 +97,8 @@ impl<S> Layer<S> for McAuthLayer {
 
 /// Async authentication service wrapping an inner gRPC service.
 ///
-/// Validates MH service tokens via JWKS before forwarding to the inner service.
+/// Validates service tokens via JWKS and enforces caller-type routing
+/// before forwarding to the inner service.
 #[derive(Clone)]
 pub struct McAuthService<S> {
     inner: S,
@@ -285,7 +189,7 @@ where
                 }
             };
 
-            // Scope authorization check (ADR-0003)
+            // Layer 1: Scope authorization check (ADR-0003)
             if !claims.has_scope(REQUIRED_SCOPE) {
                 tracing::warn!(
                     target: "mc.grpc.auth",
@@ -298,10 +202,56 @@ where
                 return Ok(response);
             }
 
+            // Layer 2: service_type routing (ADR-0003)
+            // Match the gRPC service path to the expected caller service_type.
+            let grpc_path = request.uri().path();
+            let expected_type =
+                if grpc_path.starts_with("/dark_tower.internal.MeetingControllerService/") {
+                    "global-controller"
+                } else if grpc_path.starts_with("/dark_tower.internal.MediaCoordinationService/") {
+                    "media-handler"
+                } else {
+                    // Unknown gRPC service path — fail closed
+                    tracing::warn!(
+                        target: "mc.grpc.auth",
+                        path = %grpc_path,
+                        "Unknown gRPC service path, rejecting"
+                    );
+                    let response = tonic::Status::permission_denied("Access denied").into_http();
+                    return Ok(response);
+                };
+
+            let actual_type = claims.service_type.as_deref().unwrap_or("unknown");
+            if actual_type != expected_type {
+                tracing::warn!(
+                    target: "mc.grpc.auth",
+                    grpc_service = %grpc_path,
+                    expected = %expected_type,
+                    actual = %actual_type,
+                    "Caller service_type does not match target gRPC service"
+                );
+                metrics::record_caller_type_rejected(
+                    if grpc_path.starts_with("/dark_tower.internal.MeetingControllerService/") {
+                        "MeetingControllerService"
+                    } else {
+                        "MediaCoordinationService"
+                    },
+                    expected_type,
+                    actual_type,
+                );
+                let response = tonic::Status::permission_denied("Access denied").into_http();
+                return Ok(response);
+            }
+
             tracing::trace!(
                 target: "mc.grpc.auth",
+                service_type = %actual_type,
                 "Service token validated successfully"
             );
+
+            // Inject validated claims into request extensions for downstream handlers
+            let mut request = request;
+            request.extensions_mut().insert(claims);
 
             inner.call(request).await
         })
@@ -312,171 +262,6 @@ where
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-
-    fn create_request_with_auth(auth_value: &str) -> Request<()> {
-        let mut request = Request::new(());
-        request
-            .metadata_mut()
-            .insert("authorization", auth_value.parse().unwrap());
-        request
-    }
-
-    fn create_request_without_auth() -> Request<()> {
-        Request::new(())
-    }
-
-    #[test]
-    fn test_interceptor_default_requires_auth() {
-        let interceptor = McAuthInterceptor::default();
-        assert!(interceptor.require_auth);
-    }
-
-    #[test]
-    fn test_interceptor_missing_authorization_header() {
-        let mut interceptor = McAuthInterceptor::new();
-        let request = create_request_without_auth();
-
-        let result = interceptor.call(request);
-
-        assert!(result.is_err());
-        let status = result.unwrap_err();
-        assert_eq!(status.code(), tonic::Code::Unauthenticated);
-        assert!(status.message().contains("Missing authorization header"));
-    }
-
-    #[test]
-    fn test_interceptor_invalid_auth_format_basic() {
-        let mut interceptor = McAuthInterceptor::new();
-        let request = create_request_with_auth("Basic dXNlcjpwYXNz");
-
-        let result = interceptor.call(request);
-
-        assert!(result.is_err());
-        let status = result.unwrap_err();
-        assert_eq!(status.code(), tonic::Code::Unauthenticated);
-        assert!(status.message().contains("Invalid authorization format"));
-    }
-
-    #[test]
-    fn test_interceptor_invalid_auth_format_no_bearer() {
-        let mut interceptor = McAuthInterceptor::new();
-        let request = create_request_with_auth("Token abc123");
-
-        let result = interceptor.call(request);
-
-        assert!(result.is_err());
-        let status = result.unwrap_err();
-        assert_eq!(status.code(), tonic::Code::Unauthenticated);
-        assert!(status.message().contains("Invalid authorization format"));
-    }
-
-    #[test]
-    fn test_interceptor_empty_token() {
-        let mut interceptor = McAuthInterceptor::new();
-        let request = create_request_with_auth("Bearer ");
-
-        let result = interceptor.call(request);
-
-        assert!(result.is_err());
-        let status = result.unwrap_err();
-        assert_eq!(status.code(), tonic::Code::Unauthenticated);
-        assert!(status.message().contains("Empty token"));
-    }
-
-    #[test]
-    fn test_interceptor_oversized_token() {
-        let mut interceptor = McAuthInterceptor::new();
-        let oversized_token = "a".repeat(8193);
-        let request = create_request_with_auth(&format!("Bearer {}", oversized_token));
-
-        let result = interceptor.call(request);
-
-        assert!(result.is_err());
-        let status = result.unwrap_err();
-        assert_eq!(status.code(), tonic::Code::Unauthenticated);
-        // Generic error message per security requirements
-        assert!(status.message().contains("Invalid token"));
-    }
-
-    #[test]
-    fn test_interceptor_token_at_8192_bytes_accepted() {
-        let mut interceptor = McAuthInterceptor::new();
-        // Token exactly at the limit should be accepted
-        let token_at_limit = "a".repeat(8192);
-        let request = create_request_with_auth(&format!("Bearer {}", token_at_limit));
-
-        let result = interceptor.call(request);
-
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_interceptor_valid_token() {
-        let mut interceptor = McAuthInterceptor::new();
-        let request = create_request_with_auth("Bearer valid.jwt.token");
-
-        let result = interceptor.call(request);
-
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_interceptor_bearer_case_sensitive() {
-        let mut interceptor = McAuthInterceptor::new();
-        // "bearer" lowercase should not work
-        let request = create_request_with_auth("bearer token123");
-
-        let result = interceptor.call(request);
-
-        assert!(result.is_err());
-        let status = result.unwrap_err();
-        assert_eq!(status.code(), tonic::Code::Unauthenticated);
-    }
-
-    #[test]
-    fn test_interceptor_disabled_skips_validation() {
-        let mut interceptor = McAuthInterceptor::disabled();
-        let request = create_request_without_auth();
-
-        let result = interceptor.call(request);
-
-        // Should pass even without auth when disabled
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_max_token_size_constant() {
-        // Verify constant matches security requirements
-        assert_eq!(MAX_JWT_SIZE_BYTES, 8192);
-    }
-
-    #[test]
-    fn test_extract_token_helper() {
-        let interceptor = McAuthInterceptor::new();
-
-        // Valid Bearer token
-        let meta: tonic::metadata::MetadataValue<tonic::metadata::Ascii> =
-            "Bearer abc123".parse().unwrap();
-        assert_eq!(interceptor.extract_token(&meta), Some("abc123"));
-
-        // No Bearer prefix
-        let meta: tonic::metadata::MetadataValue<tonic::metadata::Ascii> =
-            "Token xyz".parse().unwrap();
-        assert_eq!(interceptor.extract_token(&meta), None);
-
-        // Just "Bearer" without token
-        let meta: tonic::metadata::MetadataValue<tonic::metadata::Ascii> =
-            "Bearer".parse().unwrap();
-        assert_eq!(interceptor.extract_token(&meta), None);
-    }
-
-    #[test]
-    fn test_interceptor_debug_impl() {
-        let interceptor = McAuthInterceptor::new();
-        let debug_str = format!("{:?}", interceptor);
-        assert!(debug_str.contains("McAuthInterceptor"));
-        assert!(debug_str.contains("require_auth: true"));
-    }
 
     // ========================================================================
     // McAuthLayer / McAuthService async tests (JWKS-based validation)
@@ -582,14 +367,21 @@ mod tests {
         (mock_server, keypair, layer)
     }
 
-    fn make_service_claims(scope: &str) -> ServiceClaims {
+    /// MH→MC gRPC path for MediaCoordinationService
+    const MH_GRPC_PATH: &str =
+        "/dark_tower.internal.MediaCoordinationService/NotifyParticipantConnected";
+
+    /// GC→MC gRPC path for MeetingControllerService
+    const GC_GRPC_PATH: &str = "/dark_tower.internal.MeetingControllerService/AssignMeetingWithMh";
+
+    fn make_service_claims(scope: &str, service_type: Option<&str>) -> ServiceClaims {
         let now = Utc::now().timestamp();
         ServiceClaims::new(
-            "mh-service".to_string(),
+            "test-service".to_string(),
             now + 3600,
             now,
             scope.to_string(),
-            Some("mh".to_string()),
+            service_type.map(String::from),
         )
     }
 
@@ -623,6 +415,20 @@ mod tests {
             status.unwrap().code(),
             tonic::Code::Unauthenticated,
             "{context}: expected UNAUTHENTICATED"
+        );
+    }
+
+    /// Helper to assert a response has gRPC PERMISSION_DENIED status.
+    fn assert_permission_denied(response: &http::Response<BoxBody>, context: &str) {
+        let status = tonic::Status::from_header_map(response.headers());
+        assert!(
+            status.is_some(),
+            "{context}: expected gRPC status header in response"
+        );
+        assert_eq!(
+            status.unwrap().code(),
+            tonic::Code::PermissionDenied,
+            "{context}: expected PERMISSION_DENIED"
         );
     }
 
@@ -687,10 +493,11 @@ mod tests {
 
         // Sign with a different key than what JWKS serves
         let wrong_keypair = TestKeypair::new(99, "wrong-key");
-        let claims = make_service_claims("service.write.mc");
+        let claims = make_service_claims("service.write.mc", Some("media-handler"));
         let token = wrong_keypair.sign_token(&claims);
 
         let request = http::Request::builder()
+            .uri(MH_GRPC_PATH)
             .header("authorization", format!("Bearer {token}"))
             .body(BoxBody::default())
             .unwrap();
@@ -700,14 +507,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_auth_layer_accepts_valid_token() {
+    async fn test_auth_layer_accepts_valid_mh_token() {
         let (_mock_server, keypair, layer) = setup_auth_layer().await;
         let mut svc = layer.layer(NoopService);
 
-        let claims = make_service_claims("service.write.mc");
+        let claims = make_service_claims("service.write.mc", Some("media-handler"));
         let token = keypair.sign_token(&claims);
 
         let request = http::Request::builder()
+            .uri(MH_GRPC_PATH)
             .header("authorization", format!("Bearer {token}"))
             .body(BoxBody::default())
             .unwrap();
@@ -715,10 +523,32 @@ mod tests {
         let response = svc.ready().await.unwrap().call(request).await.unwrap();
         let status = tonic::Status::from_header_map(response.headers());
 
-        // No gRPC error status means the request passed through to inner service
         assert!(
             status.is_none(),
-            "Valid token should pass through, got: {status:?}"
+            "Valid MH token should pass through, got: {status:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_auth_layer_accepts_valid_gc_token() {
+        let (_mock_server, keypair, layer) = setup_auth_layer().await;
+        let mut svc = layer.layer(NoopService);
+
+        let claims = make_service_claims("service.write.mc", Some("global-controller"));
+        let token = keypair.sign_token(&claims);
+
+        let request = http::Request::builder()
+            .uri(GC_GRPC_PATH)
+            .header("authorization", format!("Bearer {token}"))
+            .body(BoxBody::default())
+            .unwrap();
+
+        let response = svc.ready().await.unwrap().call(request).await.unwrap();
+        let status = tonic::Status::from_header_map(response.headers());
+
+        assert!(
+            status.is_none(),
+            "Valid GC token should pass through, got: {status:?}"
         );
     }
 
@@ -728,10 +558,11 @@ mod tests {
         let mut svc = layer.layer(NoopService);
 
         // Token with wrong scope should be rejected (ADR-0003)
-        let claims = make_service_claims("service.write.gc");
+        let claims = make_service_claims("service.write.gc", Some("media-handler"));
         let token = keypair.sign_token(&claims);
 
         let request = http::Request::builder()
+            .uri(MH_GRPC_PATH)
             .header("authorization", format!("Bearer {token}"))
             .body(BoxBody::default())
             .unwrap();
@@ -769,16 +600,150 @@ mod tests {
             now - 3600, // expired 1 hour ago
             now - 7200,
             "service.write.mc".to_string(),
-            Some("mh".to_string()),
+            Some("media-handler".to_string()),
         );
         let token = keypair.sign_token(&claims);
 
         let request = http::Request::builder()
+            .uri(MH_GRPC_PATH)
             .header("authorization", format!("Bearer {token}"))
             .body(BoxBody::default())
             .unwrap();
 
         let response = svc.ready().await.unwrap().call(request).await.unwrap();
         assert_unauthenticated(&response, "expired token");
+    }
+
+    // ========================================================================
+    // Layer 2: service_type routing tests (ADR-0003)
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_layer2_rejects_mh_calling_meeting_controller_service() {
+        let (_mock_server, keypair, layer) = setup_auth_layer().await;
+        let mut svc = layer.layer(NoopService);
+
+        // MH token trying to call MeetingControllerService (should be GC only)
+        let claims = make_service_claims("service.write.mc", Some("media-handler"));
+        let token = keypair.sign_token(&claims);
+
+        let request = http::Request::builder()
+            .uri(GC_GRPC_PATH)
+            .header("authorization", format!("Bearer {token}"))
+            .body(BoxBody::default())
+            .unwrap();
+
+        let response = svc.ready().await.unwrap().call(request).await.unwrap();
+        assert_permission_denied(&response, "MH calling MeetingControllerService");
+    }
+
+    #[tokio::test]
+    async fn test_layer2_rejects_gc_calling_media_coordination_service() {
+        let (_mock_server, keypair, layer) = setup_auth_layer().await;
+        let mut svc = layer.layer(NoopService);
+
+        // GC token trying to call MediaCoordinationService (should be MH only)
+        let claims = make_service_claims("service.write.mc", Some("global-controller"));
+        let token = keypair.sign_token(&claims);
+
+        let request = http::Request::builder()
+            .uri(MH_GRPC_PATH)
+            .header("authorization", format!("Bearer {token}"))
+            .body(BoxBody::default())
+            .unwrap();
+
+        let response = svc.ready().await.unwrap().call(request).await.unwrap();
+        assert_permission_denied(&response, "GC calling MediaCoordinationService");
+    }
+
+    #[tokio::test]
+    async fn test_layer2_rejects_no_service_type_fail_closed() {
+        let (_mock_server, keypair, layer) = setup_auth_layer().await;
+        let mut svc = layer.layer(NoopService);
+
+        // Token with no service_type should be rejected (fail closed)
+        let claims = make_service_claims("service.write.mc", None);
+        let token = keypair.sign_token(&claims);
+
+        let request = http::Request::builder()
+            .uri(MH_GRPC_PATH)
+            .header("authorization", format!("Bearer {token}"))
+            .body(BoxBody::default())
+            .unwrap();
+
+        let response = svc.ready().await.unwrap().call(request).await.unwrap();
+        assert_permission_denied(&response, "no service_type (fail closed)");
+    }
+
+    #[tokio::test]
+    async fn test_layer2_rejects_unknown_grpc_path() {
+        let (_mock_server, keypair, layer) = setup_auth_layer().await;
+        let mut svc = layer.layer(NoopService);
+
+        let claims = make_service_claims("service.write.mc", Some("media-handler"));
+        let token = keypair.sign_token(&claims);
+
+        let request = http::Request::builder()
+            .uri("/dark_tower.internal.UnknownService/SomeMethod")
+            .header("authorization", format!("Bearer {token}"))
+            .body(BoxBody::default())
+            .unwrap();
+
+        let response = svc.ready().await.unwrap().call(request).await.unwrap();
+        assert_permission_denied(&response, "unknown gRPC service path");
+    }
+
+    #[tokio::test]
+    async fn test_claims_injected_into_request_extensions() {
+        let (_mock_server, keypair, layer) = setup_auth_layer().await;
+
+        // Use a custom inner service that checks for claims in extensions
+        #[derive(Clone)]
+        struct ClaimsCheckService;
+
+        impl Service<http::Request<BoxBody>> for ClaimsCheckService {
+            type Response = http::Response<BoxBody>;
+            type Error = Box<dyn std::error::Error + Send + Sync>;
+            type Future =
+                Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + 'static>>;
+
+            fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn call(&mut self, request: http::Request<BoxBody>) -> Self::Future {
+                let has_claims = request.extensions().get::<ServiceClaims>().is_some();
+                Box::pin(async move {
+                    if has_claims {
+                        Ok(http::Response::new(BoxBody::default()))
+                    } else {
+                        // Return an error response to indicate claims were missing
+                        let response =
+                            tonic::Status::internal("Claims not found in extensions").into_http();
+                        Ok(response)
+                    }
+                })
+            }
+        }
+
+        let mut svc = layer.layer(ClaimsCheckService);
+
+        let claims = make_service_claims("service.write.mc", Some("media-handler"));
+        let token = keypair.sign_token(&claims);
+
+        let request = http::Request::builder()
+            .uri(MH_GRPC_PATH)
+            .header("authorization", format!("Bearer {token}"))
+            .body(BoxBody::default())
+            .unwrap();
+
+        let response = svc.ready().await.unwrap().call(request).await.unwrap();
+        let status = tonic::Status::from_header_map(response.headers());
+
+        // No error status means claims were found in extensions
+        assert!(
+            status.is_none(),
+            "Claims should be injected into request extensions, got: {status:?}"
+        );
     }
 }

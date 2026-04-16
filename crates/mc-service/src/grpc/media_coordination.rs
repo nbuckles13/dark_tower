@@ -12,7 +12,7 @@
 //!
 //! # Security
 //!
-//! Authentication is handled by `McAuthLayer` (applied per-service in main.rs).
+//! Authentication is handled by `McAuthLayer` (applied at the server level in main.rs).
 //! This handler only needs to validate request field constraints.
 //! Generic error messages prevent information leakage (ADR-0003).
 

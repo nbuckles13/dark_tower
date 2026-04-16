@@ -12,14 +12,15 @@
 - Metric catalogs -> `docs/observability/metrics/ac-service.md`, `docs/observability/metrics/gc-service.md`, `docs/observability/metrics/mc-service.md`, `docs/observability/metrics/mh-service.md`
 - AC metrics -> `crates/ac-service/src/observability/metrics.rs:init_metrics_recorder()`, gauge init `services/key_management_service.rs:init_key_metrics()`, HTTP middleware `middleware/http_metrics.rs`, rate limit config `config.rs`
 - GC metrics -> `crates/gc-service/src/observability/metrics.rs`, HTTP middleware `middleware/http_metrics.rs:normalize_endpoint()`, join wiring `handlers/meetings.rs:join_meeting()`, DB metrics `repositories/`; gap: `get_guest_token()` uninstrumented
-- MC metrics -> `crates/mc-service/src/observability/metrics.rs`; recording sites: `webtransport/connection.rs:handle_connection()`, `server.rs:accept_loop()`, `grpc/mh_client.rs:register_meeting()`, `grpc/media_coordination.rs` (mc_mh_notifications_received_total, mc_media_connection_failures_total); bounded labels `errors.rs:error_type_label()`
+- MC metrics -> `crates/mc-service/src/observability/metrics.rs`; recording sites: `webtransport/connection.rs:handle_connection()`, `server.rs:accept_loop()`, `grpc/mh_client.rs:register_meeting()`, `grpc/media_coordination.rs` (mc_mh_notifications_received_total, mc_media_connection_failures_total), `grpc/auth_interceptor.rs` (mc_caller_type_rejected_total); bounded labels `errors.rs:error_type_label()`
 - MH metrics (registration, heartbeat, token refresh, gRPC, WebTransport, JWT, MC notifications) -> `crates/mh-service/src/observability/metrics.rs`; recording sites: `webtransport/server.rs:accept_loop()`, `webtransport/connection.rs:handle_connection()`, `grpc/auth_interceptor.rs:MhAuthService`, `grpc/mc_client.rs:send_with_retry()`
 
 ## Auth & JWT Tracing
 - Common JWT (JwksClient, JwtValidator, verify_token, PII-redacted Debug) -> `crates/common/src/jwt.rs`
 - GC/MC/MH auth wrappers -> `crates/gc-service/src/auth/jwt.rs:JwtValidator`, `crates/mc-service/src/auth/mod.rs:McJwtValidator` (target: `mc.auth`), `crates/mh-service/src/auth/mod.rs:MhJwtValidator` (target: `mh.auth`)
-- Two-layer gRPC auth (ADR-0003): Layer 1 JWKS+scope (`jwt_validations_total`), Layer 2 service_type routing (`caller_type_rejected_total{grpc_service, expected_type, actual_type}`)
-- MC gRPC auth (target: `mc.grpc.auth`) -> `crates/mc-service/src/grpc/auth_interceptor.rs`; MH -> `crates/mh-service/src/grpc/auth_interceptor.rs`
+- Two-layer gRPC auth (ADR-0003): Layer 1 JWKS+scope (`jwt_validations_total{result, token_type}` — token_type: meeting/guest/service), Layer 2 service_type routing (`caller_type_rejected_total{grpc_service, expected_type, actual_type}` — any non-zero is a bug)
+- MC gRPC auth (target: `mc.grpc.auth`) -> `crates/mc-service/src/grpc/auth_interceptor.rs:McAuthLayer` (Layer 1+2, claims injection); MH -> `crates/mh-service/src/grpc/auth_interceptor.rs:MhAuthLayer`
+- ADR-0003 scope alignment: `default_scopes()` -> `crates/ac-service/src/models/mod.rs:ServiceType`; seed SQL -> `infra/kind/scripts/setup.sh`; scope contract tests -> `crates/ac-service/src/models/mod.rs:tests::test_scope_contract_*`
 
 ## MC WebTransport Tracing
 - Server/connection/handler (targets: `mc.webtransport`, `.connection`, `.handler`) -> `crates/mc-service/src/webtransport/server.rs`, `connection.rs` (incl. MediaConnectionFailed), `handler.rs`
@@ -39,7 +40,7 @@
 - MH health state (ready after GC registration) -> `crates/mh-service/src/observability/health.rs:health_router()`
 
 ## Dashboards, Alerts & Infrastructure
-- Grafana dashboards (per-service overview, errors-overview, SLOs) -> `infra/grafana/dashboards/`, provisioning `infra/grafana/provisioning/`; MC MH Communication row -> `mc-overview.json` (panels: RegisterMeeting RPC Rate, Latency P50/P95/P99)
+- Grafana dashboards (per-service overview, errors-overview, SLOs) -> `infra/grafana/dashboards/`, provisioning `infra/grafana/provisioning/`; MC MH Communication row -> `mc-overview.json` (panels: RegisterMeeting RPC Rate, Latency P50/P95/P99, Caller Type Rejections)
 - Grafana K8s (configMapGenerator, sidecar, RBAC) -> `infra/kubernetes/observability/grafana/`
 - Alert rules (GC, MC) -> `infra/docker/prometheus/rules/{gc,mc}-alerts.yaml` (incl. MCMediaConnectionAllFailed); docs -> `docs/observability/alerts.md`, `docs/observability/dashboards.md`
 - Prometheus config -> `infra/docker/prometheus/prometheus.yml` (compose), `infra/kubernetes/observability/prometheus-config.yaml` (K8s)

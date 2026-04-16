@@ -186,26 +186,23 @@ pub enum ServiceType {
 }
 
 impl ServiceType {
-    /// Get default scopes for a service type
+    /// Get default scopes for a service type (ADR-0003).
+    ///
+    /// Scopes use the `service.write.{target}` convention to indicate which
+    /// services this service type is authorized to call via gRPC.
     pub fn default_scopes(&self) -> Vec<String> {
         match self {
             ServiceType::GlobalController => vec![
-                "meeting:create".to_string(),
-                "meeting:list".to_string(),
-                "meeting:read".to_string(),
-                "service:register".to_string(),
+                "service.write.mc".to_string(),
                 "internal:meeting-token".to_string(),
             ],
             ServiceType::MeetingController => vec![
-                "meeting:read".to_string(),
-                "meeting:update".to_string(),
-                "participant:manage".to_string(),
-                "media:route".to_string(),
+                "service.write.mh".to_string(),
+                "service.write.gc".to_string(),
             ],
             ServiceType::MediaHandler => vec![
-                "media:process".to_string(),
-                "media:forward".to_string(),
-                "participant:read".to_string(),
+                "service.write.mc".to_string(),
+                "service.write.gc".to_string(),
             ],
         }
     }
@@ -279,17 +276,70 @@ mod tests {
     #[test]
     fn test_service_type_scopes() {
         let gc_scopes = ServiceType::GlobalController.default_scopes();
-        assert!(gc_scopes.contains(&"meeting:create".to_string()));
+        assert!(gc_scopes.contains(&"service.write.mc".to_string()));
         assert!(
             gc_scopes.contains(&"internal:meeting-token".to_string()),
             "GC must have internal:meeting-token scope for POST /api/v1/auth/internal/meeting-token"
         );
 
         let mc_scopes = ServiceType::MeetingController.default_scopes();
-        assert!(mc_scopes.contains(&"participant:manage".to_string()));
+        assert!(mc_scopes.contains(&"service.write.mh".to_string()));
+        assert!(mc_scopes.contains(&"service.write.gc".to_string()));
 
         let mh_scopes = ServiceType::MediaHandler.default_scopes();
-        assert!(mh_scopes.contains(&"media:process".to_string()));
+        assert!(mh_scopes.contains(&"service.write.mc".to_string()));
+        assert!(mh_scopes.contains(&"service.write.gc".to_string()));
+    }
+
+    // ========================================================================
+    // Scope contract tests (ADR-0003)
+    // ========================================================================
+    // These tests verify that each service's default_scopes() includes the
+    // scopes required by target auth layers. Prevents future scope drift.
+
+    #[test]
+    fn test_scope_contract_gc_can_call_mc() {
+        let gc_scopes = ServiceType::GlobalController.default_scopes();
+        assert!(
+            gc_scopes.contains(&"service.write.mc".to_string()),
+            "GC must have service.write.mc to call MC's McAuthLayer"
+        );
+    }
+
+    #[test]
+    fn test_scope_contract_mh_can_call_mc() {
+        let mh_scopes = ServiceType::MediaHandler.default_scopes();
+        assert!(
+            mh_scopes.contains(&"service.write.mc".to_string()),
+            "MH must have service.write.mc to call MC's McAuthLayer"
+        );
+    }
+
+    #[test]
+    fn test_scope_contract_mc_can_call_mh() {
+        let mc_scopes = ServiceType::MeetingController.default_scopes();
+        assert!(
+            mc_scopes.contains(&"service.write.mh".to_string()),
+            "MC must have service.write.mh to call MH's auth layer"
+        );
+    }
+
+    #[test]
+    fn test_scope_contract_mc_can_call_gc() {
+        let mc_scopes = ServiceType::MeetingController.default_scopes();
+        assert!(
+            mc_scopes.contains(&"service.write.gc".to_string()),
+            "MC must have service.write.gc to call GC's auth layer"
+        );
+    }
+
+    #[test]
+    fn test_scope_contract_mh_can_call_gc() {
+        let mh_scopes = ServiceType::MediaHandler.default_scopes();
+        assert!(
+            mh_scopes.contains(&"service.write.gc".to_string()),
+            "MH must have service.write.gc to call GC's auth layer"
+        );
     }
 
     #[test]
