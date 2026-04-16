@@ -25,11 +25,11 @@
 
 ## Code Locations — GC Service
 - Error type, `From<JwtError>` → `crates/gc-service/src/errors.rs:GcError`
-- Auth (JWT/JWKS, middleware) → `auth/jwt.rs`, `jwks.rs`, `middleware/auth.rs:require_user_auth()`
+- Auth: JWT/JWKS + HTTP middleware → `auth/jwt.rs` (`validate()`=`GcError`, `validate_raw()`=raw `JwtError` for metric classification), `jwks.rs`, `middleware/auth.rs:require_user_auth()`; two-layer gRPC auth (JWKS + scope `service.write.gc` + Layer 2 `service_type` routing for `GlobalControllerService`→`meeting-controller`, `MediaHandlerRegistryService`→`media-handler`, claims injection, ADR-0003) → `grpc/auth_layer.rs:GrpcAuthLayer`; `classify_jwt_error()` maps `JwtError` → bounded `failure_reason`; legacy `GrpcAuthInterceptor` + `PendingTokenValidation` + `ValidatedClaims` removed
 - Meeting handlers → `handlers/meetings.rs:create_meeting()`, `join_meeting()`, `get_guest_token()`, `JoinMeetingResponse::new()`
 - Repositories → `repositories/meetings.rs` (atomic CTE), `participants.rs`
 - AC/MC clients → `services/ac_client.rs:AcClient`, `mc_client.rs:McClientTrait`
-- Metrics/dashboard/alerts → `observability/metrics.rs`, `docs/observability/metrics/gc-service.md`, `infra/grafana/dashboards/gc-overview.json`
+- Metrics (includes `gc_jwt_validations_total`, `gc_caller_type_rejected_total`)/dashboard/alerts → `observability/metrics.rs`, `docs/observability/metrics/gc-service.md`, `infra/grafana/dashboards/gc-overview.json`
 
 ## Code Locations — MC Service
 - Error type (McError, bounded labels, From<JwtError>, MhAssignmentMissing) → `crates/mc-service/src/errors.rs`

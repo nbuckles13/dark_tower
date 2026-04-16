@@ -339,6 +339,55 @@ pub fn record_error(operation: &str, error_type: &str, status_code: u16) {
 }
 
 // ============================================================================
+// gRPC Auth Metrics (ADR-0003)
+// ============================================================================
+
+/// Record a service JWT validation outcome at the gRPC auth layer.
+///
+/// Metric: `gc_jwt_validations_total`
+/// Labels: `result`, `token_type`, `failure_reason`
+///
+/// Result values: "success", "failure"
+/// Token type values: "service" (gRPC auth only sees service tokens;
+///   user/guest tokens flow through HTTP middleware and are not recorded here)
+/// Failure reason values: "none" (success), "signature_invalid", "expired",
+///   "missing_token", "scope_mismatch", "malformed"
+///
+/// Cardinality: bounded (2 x 1 x 6 = 12 max, plus headroom if token_type
+/// expands in the future).
+///
+/// Recorded in `grpc/auth_layer.rs` for every validation attempt that
+/// reaches the cryptographic layer (structural rejects are not counted,
+/// matching MC/MH behavior).
+pub fn record_jwt_validation(result: &str, token_type: &str, failure_reason: &str) {
+    counter!("gc_jwt_validations_total",
+        "result" => result.to_string(),
+        "token_type" => token_type.to_string(),
+        "failure_reason" => failure_reason.to_string()
+    )
+    .increment(1);
+}
+
+/// Record a Layer 2 caller-type rejection at the gRPC auth layer (ADR-0003).
+///
+/// Metric: `gc_caller_type_rejected_total`
+/// Labels: `grpc_service`, `expected_type`, `actual_type`
+///
+/// Cardinality: 2 x 2 x 4 = 16 max (bounded by gRPC services and service
+/// types + "unknown").
+///
+/// ALERT: Any non-zero value indicates a bug or misconfiguration — a service
+/// is presenting a valid token but calling the wrong gRPC endpoint.
+pub fn record_caller_type_rejected(grpc_service: &str, expected_type: &str, actual_type: &str) {
+    counter!("gc_caller_type_rejected_total",
+        "grpc_service" => grpc_service.to_string(),
+        "expected_type" => expected_type.to_string(),
+        "actual_type" => actual_type.to_string()
+    )
+    .increment(1);
+}
+
+// ============================================================================
 // gRPC Metrics
 // ============================================================================
 
@@ -702,6 +751,34 @@ mod tests {
         record_error("guest_token", "rate_limit", 429);
         record_error("update_settings", "unauthorized", 401);
         record_error("mc_assignment", "service_unavailable", 503);
+    }
+
+    #[test]
+    fn test_record_jwt_validation() {
+        // Exercise full bounded label domain (ADR-0003).
+        record_jwt_validation("success", "service", "none");
+        record_jwt_validation("failure", "service", "signature_invalid");
+        record_jwt_validation("failure", "service", "expired");
+        record_jwt_validation("failure", "service", "scope_mismatch");
+        record_jwt_validation("failure", "service", "malformed");
+        record_jwt_validation("failure", "service", "missing_token");
+    }
+
+    #[test]
+    fn test_record_caller_type_rejected() {
+        // Representative bounded label combinations (ADR-0003 Layer 2).
+        record_caller_type_rejected(
+            "GlobalControllerService",
+            "meeting-controller",
+            "media-handler",
+        );
+        record_caller_type_rejected(
+            "MediaHandlerRegistryService",
+            "media-handler",
+            "meeting-controller",
+        );
+        record_caller_type_rejected("GlobalControllerService", "meeting-controller", "unknown");
+        record_caller_type_rejected("MediaHandlerRegistryService", "media-handler", "unknown");
     }
 
     #[test]

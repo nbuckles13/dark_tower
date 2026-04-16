@@ -311,6 +311,35 @@ All GC service metrics follow ADR-0011 naming conventions with the `gc_` prefix.
 
 ---
 
+## gRPC Auth Metrics (ADR-0003)
+
+### `gc_jwt_validations_total`
+- **Type**: Counter
+- **Description**: Total JWT validation attempts at the gRPC auth layer by result, token type, and failure reason.
+- **Labels**:
+  - `result`: Validation outcome (`success`, `failure`)
+  - `token_type`: Token type (`service` — GC's gRPC layer only sees service tokens; user/guest tokens flow through HTTP middleware)
+  - `failure_reason`: Reason for failure (`none`, `signature_invalid`, `expired`, `missing_token`, `scope_mismatch`, `malformed`)
+- **Cardinality**: Low (bounded, 2 x 1 x 6 = 12 max with headroom if `token_type` expands)
+- **Usage**: Monitor gRPC auth health, detect service token validation failures, diagnose failure causes.
+- **Recorded in**: `grpc/auth_layer.rs` on every validation that reaches the cryptographic layer. Structural rejects (missing/invalid-format/empty/oversized) return early without incrementing.
+- **Dashboard**: GC Overview - JWT Validations by Result
+
+### `gc_caller_type_rejected_total`
+- **Type**: Counter
+- **Description**: Total Layer 2 `service_type` routing rejections (valid token, wrong caller for the target gRPC service). ADR-0003.
+- **Labels**:
+  - `grpc_service`: Target gRPC service name (`GlobalControllerService`, `MediaHandlerRegistryService`)
+  - `expected_type`: Expected `service_type` for the gRPC service (`meeting-controller`, `media-handler`)
+  - `actual_type`: Actual `service_type` from the token (`meeting-controller`, `media-handler`, `global-controller`, `unknown`)
+- **Cardinality**: Low (2 x 2 x 4 = 16 max, bounded by gRPC services and service types + "unknown")
+- **Alert**: ANY non-zero value indicates a bug or misconfiguration — a service is presenting a valid token but calling the wrong gRPC endpoint.
+- **Usage**: Detect service-to-service routing errors, misconfigured tokens.
+- **Recorded in**: `grpc/auth_layer.rs` on Layer 2 rejection.
+- **Dashboard**: GC Overview - Caller Type Rejections
+
+---
+
 ## MH Selection Metrics
 
 ### `gc_mh_selections_total`

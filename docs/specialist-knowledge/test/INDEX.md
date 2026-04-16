@@ -18,7 +18,7 @@
 - Rate limit config + tests -> `crates/ac-service/src/config.rs:parse_rate_limit_i64()`, `tests::test_rate_limit_*`
 
 ## Code Locations: GC Service
-- Auth tests (HTTP + wiremock JWKS, jwt wrapper) -> `crates/gc-service/tests/auth_tests.rs`, `crates/gc-service/src/auth/jwt.rs:tests`
+- Auth tests (HTTP + wiremock JWKS, jwt wrapper; gRPC two-layer auth layer tests mirror MC/MH, ADR-0003) -> `crates/gc-service/tests/auth_tests.rs`, `crates/gc-service/src/auth/jwt.rs:tests`, `crates/gc-service/src/grpc/auth_layer.rs:tests`
 - Meeting + assignment tests -> `crates/gc-service/tests/meeting_tests.rs`, `meeting_create_tests.rs`, `meeting_assignment_tests.rs`, `mc_assignment_rpc_tests.rs`
 - MH selection unit tests -> `crates/gc-service/src/services/mh_selection.rs:tests`
 - Participant & activation tests -> `crates/gc-service/tests/participant_tests.rs`

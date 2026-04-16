@@ -13,11 +13,13 @@
 - Configuration (env vars, thresholds) -> `crates/gc-service/src/config.rs:Config::from_env()`
 - Error types -> `crates/gc-service/src/errors.rs`
 - JWT validation -> `crates/gc-service/src/auth/jwt.rs:JwtValidator::validate()`
+- JWT validation (raw JwtError for gRPC failure_reason classification) -> `crates/gc-service/src/auth/jwt.rs:JwtValidator::validate_raw()`
 - JWKS caching -> `crates/gc-service/src/auth/jwks.rs:JwksClient::get_key()`
 - Claims extraction -> `crates/gc-service/src/auth/claims.rs`
 - HTTP auth middleware (service token) -> `crates/gc-service/src/middleware/auth.rs:require_auth()`
 - HTTP auth middleware (user token) -> `crates/gc-service/src/middleware/auth.rs:require_user_auth()`
-- gRPC auth layer (Tower, needs scope+service_type per ADR-0003) -> `crates/gc-service/src/grpc/auth_layer.rs:GrpcAuthLayer`
+- gRPC auth layer (Tower, two-layer: scope + service_type routing per ADR-0003) -> `crates/gc-service/src/grpc/auth_layer.rs:GrpcAuthLayer`
+- gRPC failure_reason classifier for auth metrics -> `crates/gc-service/src/grpc/auth_layer.rs:classify_jwt_error()`
 - Meeting handlers (create, join, guest-token, settings) -> `crates/gc-service/src/handlers/meetings.rs`
 - Join/settings (user-auth, status allowlist, metrics) -> `crates/gc-service/src/handlers/meetings.rs:join_meeting()`, `update_meeting_settings()`
 - Join response construction (shared by join + guest-token) -> `crates/gc-service/src/handlers/meetings.rs:JoinMeetingResponse::new()`

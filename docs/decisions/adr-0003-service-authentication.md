@@ -734,10 +734,10 @@ X-RateLimit-Reset: 1234567890
 | Bcrypt Duration Metrics | ❌ Pending | | Wire `ac_bcrypt_duration_seconds` at call sites. Recording function exists in `metrics.rs` (`#[allow(dead_code)]`) but is not called from password hashing code paths. |
 | Audit Log Metrics | ❌ Pending | | Wire `ac_audit_log_failures_total` at call sites. Recording function exists in `metrics.rs` (`#[allow(dead_code)]`) but audit logging is not yet implemented. |
 | Credential Operations Metrics | ✅ Done | | `ac_credential_operations_total` (renamed from `ac_admin_operations_total`) wired at all admin handler call sites via `record_credential_operation()`. |
-| ADR-0003 Scope Alignment | ❌ Pending | | Update `default_scopes()` and `setup.sh` to use `service.write.{target}` scopes per scope mapping table. Remove legacy domain-oriented scopes. |
-| Two-Layer gRPC Auth (MC) | ❌ Pending | | Add Layer 2 `service_type` + URI-path routing to `McAuthLayer`. Inject claims into extensions. Remove dead `McAuthInterceptor`. |
-| Two-Layer gRPC Auth (MH) | ❌ Pending | | Add Layer 2 `service_type` routing to `MhAuthLayer`. Fix metrics gap (scope rejection not counted). Inject claims into extensions. |
-| Two-Layer gRPC Auth (GC) | ❌ Pending | | Add `service.write.gc` scope enforcement + Layer 2 `service_type` routing to `GrpcAuthLayer`. |
+| ADR-0003 Scope Alignment | ✅ Done | `2c2613c` | `default_scopes()` and `setup.sh` use `service.write.{target}` scopes per scope mapping table. Legacy domain-oriented scopes removed. |
+| Two-Layer gRPC Auth (MC) | ✅ Done | `2c2613c` | Layer 2 `service_type` + URI-path routing added to `McAuthLayer`. Claims injected into extensions. Dead `McAuthInterceptor` removed. |
+| Two-Layer gRPC Auth (MH) | ✅ Done | `6b9f41b` | Layer 2 `service_type` routing added to `MhAuthLayer`. Metrics gap fixed (scope rejection counted via `mh_jwt_validations_total{failure_reason="scope_mismatch"}`). Claims injected into extensions. |
+| Two-Layer gRPC Auth (GC) | ✅ Done | _pending_ | `service.write.gc` scope enforcement + Layer 2 `service_type` routing added to `GrpcAuthLayer`. `gc_jwt_validations_total` and `gc_caller_type_rejected_total` metrics added. Dead `GrpcAuthInterceptor` + `PendingTokenValidation` removed. |
 | Scope Contract Tests | ❌ Pending | | Assert each caller's `default_scopes()` contains the target's `REQUIRED_SCOPE`. Regression prevention. |
 | Redis-based Rate Limiting | ❌ Pending | | Multi-instance distributed rate limiting |
 | CAPTCHA Integration | ❌ Pending | | After 3 failed attempts (Layer 4) |

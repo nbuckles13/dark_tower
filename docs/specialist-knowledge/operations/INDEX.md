@@ -47,13 +47,13 @@
 - Scope contract tests (regression prevention) → `crates/ac-service/src/models/mod.rs` (test_scope_contract_* tests)
 - Common JWKS + JWT + ServiceClaims → `crates/common/src/jwt.rs`; GC↔AC token types → `meeting_token.rs`
 - AC rate limits → `crates/ac-service/src/config.rs:parse_rate_limit_i64()`
-- Auth layers (all two-layer per ADR-0003) → MC `McAuthLayer`, MH `MhAuthLayer`, GC `GrpcAuthLayer`; dead `MhAuthInterceptor`/`McAuthInterceptor` removed
+- Auth layers (all two-layer per ADR-0003) → MC `McAuthLayer`, MH `MhAuthLayer`, GC `GrpcAuthLayer`; dead `McAuthInterceptor`/`MhAuthInterceptor`/`GrpcAuthInterceptor` removed
 
 ## Observability
 - Kustomize + Grafana → `infra/kubernetes/observability/`, `infra/grafana/dashboards/`; Alerts → `docs/observability/alerts.md`
 - Per-service metrics → `crates/gc-service/src/observability/metrics.rs`, `crates/mc-service/src/observability/metrics.rs`, `crates/mh-service/src/observability/metrics.rs`; Prometheus → `infra/docker/prometheus/prometheus.yml`
-- Layer 2 caller_type_rejected metric → MC `mc_caller_type_rejected_total`, MH `mh_caller_type_rejected_total` (`{grpc_service, expected_type, actual_type}`); Grafana panels in `mc-overview.json`, `mh-overview.json`
-- JWT failure_reason label → `mh_jwt_validations_total{failure_reason}`, `mc_jwt_validations_total{failure_reason}`; classifier → `classify_jwt_error()` in each auth_interceptor.rs
+- Layer 2 caller_type_rejected metric → MC `mc_caller_type_rejected_total`, MH `mh_caller_type_rejected_total`, GC `gc_caller_type_rejected_total` (`{grpc_service, expected_type, actual_type}`); Grafana panels in `mc-overview.json`, `mh-overview.json`, `gc-overview.json`
+- JWT failure_reason label → `mc_jwt_validations_total{failure_reason}`, `mh_jwt_validations_total{failure_reason}`, `gc_jwt_validations_total{failure_reason}`; classifier → `classify_jwt_error()` in each service's auth layer
 
 ## MH Service
 - MH startup + config + health → `crates/mh-service/src/main.rs`, `config.rs`, `observability/health.rs`

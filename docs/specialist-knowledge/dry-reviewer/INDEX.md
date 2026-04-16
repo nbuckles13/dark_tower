@@ -27,11 +27,12 @@
 - Extraction candidate: `generate_instance_id(prefix)` -> 4-line pattern in GC + MC + MH config
 
 ## gRPC Auth (Cross-Service)
+- GC auth -> `crates/gc-service/src/grpc/auth_layer.rs:GrpcAuthLayer` (JWKS + scope `service.write.gc` + Layer 2 service_type routing, ADR-0003); `GrpcAuthInterceptor` removed
 - MC auth -> `crates/mc-service/src/grpc/auth_interceptor.rs:McAuthLayer` (JWKS + scope + Layer 2 service_type routing, ADR-0003); `McAuthInterceptor` removed
 - MH auth -> `crates/mh-service/src/grpc/auth_interceptor.rs:MhAuthLayer` (JWKS + scope + Layer 2 service_type routing, ADR-0003); `MhAuthInterceptor` removed
 - Shared constant -> `common::jwt::MAX_JWT_SIZE_BYTES`
-- McAuthLayer/MhAuthLayer now structurally identical (5-step chain: structural, JWKS, scope, service_type routing, claims injection). Both have `classify_jwt_error()` + `failure_reason` metrics. Extraction candidate in TODO.md, trigger: third service needing pattern.
-- Layer 2 metrics -> `mc_caller_type_rejected_total` | `mh_caller_type_rejected_total` (same labels: `grpc_service, expected_type, actual_type`)
+- GC/MC/MH auth layers now structurally identical 5-step chain (structural, JWKS, scope, service_type routing, claims injection); all three have `classify_jwt_error()` + `failure_reason` metrics. Extraction tracked in `docs/TODO.md` line 28; blocker is `Claims` vs `ServiceClaims` unification (line 15).
+- Layer 2 metrics -> `gc_caller_type_rejected_total` | `mc_caller_type_rejected_total` | `mh_caller_type_rejected_total` (same labels: `grpc_service, expected_type, actual_type`)
 
 ## Scope Alignment (ADR-0003)
 - Scope convention: `service.write.{target}` for gRPC; `internal:meeting-token` for AC HTTP
