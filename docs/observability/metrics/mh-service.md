@@ -128,18 +128,44 @@ sum(rate(mh_webtransport_connections_total[5m]))
 
 ### `mh_jwt_validations_total`
 - **Type**: Counter
-- **Description**: Total JWT validation attempts by result and token type
+- **Description**: Total JWT validation attempts by result, token type, and failure reason
 - **Labels**:
   - `result`: Validation outcome (`success`, `failure`)
   - `token_type`: Token type (`meeting`, `service`)
-- **Cardinality**: Low (2 results x 2 token types = 4 series)
-- **Usage**: Monitor authentication health, detect token validation failures
+  - `failure_reason`: Reason for failure (`none`, `signature_invalid`, `expired`, `scope_mismatch`, `malformed`, `validation_failed`)
+- **Cardinality**: Low (2 x 2 x 6 = 24 max, sparse in practice)
+- **Usage**: Monitor authentication health, detect token validation failures, diagnose failure causes
 - **Dashboard**: MH Overview - JWT Validations by Result
 
 **PromQL example** - JWT failure rate:
 ```promql
 sum(rate(mh_jwt_validations_total{result="failure"}[5m])) /
 sum(rate(mh_jwt_validations_total[5m]))
+```
+
+**PromQL example** - failures by reason:
+```promql
+sum by(failure_reason) (rate(mh_jwt_validations_total{result="failure"}[5m]))
+```
+
+---
+
+## gRPC Auth Layer 2 Metrics (ADR-0003)
+
+### `mh_caller_type_rejected_total`
+- **Type**: Counter
+- **Description**: Total caller service_type rejections by Layer 2 routing
+- **Labels**:
+  - `grpc_service`: Target gRPC service name (`MediaHandlerService`)
+  - `expected_type`: Expected caller service_type (`meeting-controller`)
+  - `actual_type`: Actual caller service_type (e.g., `global-controller`, `unknown`)
+- **Cardinality**: Low (1 x 1 x 3 = 3 max)
+- **Usage**: Detect misconfigured services calling wrong gRPC endpoints
+- **ALERT**: Any non-zero value indicates a bug or misconfiguration
+
+**PromQL example** - caller type rejection rate:
+```promql
+rate(mh_caller_type_rejected_total[5m])
 ```
 
 ---

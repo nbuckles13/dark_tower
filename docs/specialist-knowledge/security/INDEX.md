@@ -38,15 +38,15 @@
 - Session binding + join → `crates/mc-service/src/actors/session.rs`, `meeting.rs:handle_join()`
 
 ## Code Locations — MH (Auth, OAuth, TLS, Outbound Clients)
-- gRPC auth layer (JWKS, scope `service.write.mh`, service_type routing per ADR-0003) → `crates/mh-service/src/grpc/auth_interceptor.rs:MhAuthLayer` | OAuth config → `config.rs`
+- gRPC two-layer auth `MhAuthLayer` → `crates/mh-service/src/grpc/auth_interceptor.rs`: Layer 1 JWKS+scope (`service.write.mh`), Layer 2 service_type allowlist (MediaHandlerService→MC), `classify_jwt_error()` for bounded failure_reason, claims injected into extensions. Dead `MhAuthInterceptor` removed. OAuth config → `config.rs`
 - TLS validation + Bearer auth + error sanitization → `config.rs`, `gc_client.rs`, `errors.rs`
 - MH→MC OAuth Bearer auth (TokenReceiver, add_auth, retry with auth short-circuit) → `crates/mh-service/src/grpc/mc_client.rs:McClient`
 - MC notification wiring (fire-and-forget connect/disconnect) → `crates/mh-service/src/webtransport/connection.rs:spawn_notify_connected()`
 
 ## Code Locations — Observability (Security-Relevant)
 - MC/MH metrics (bounded labels, no PII) → `crates/mc-service/src/observability/metrics.rs` (+ mh) | ADR-0029
-- Layer 2 rejection metric `mc_caller_type_rejected_total{grpc_service, expected_type, actual_type}` → `metrics.rs:record_caller_type_rejected()`; catalog → `docs/observability/metrics/mc-service.md`; dashboard → `infra/grafana/dashboards/mc-overview.json`
-- MC notification metrics (event x status, cardinality 4) → `crates/mh-service/src/observability/metrics.rs:record_mc_notification()`
+- Layer 2 rejection metrics: `mc_caller_type_rejected_total` → `mc metrics.rs`; `mh_caller_type_rejected_total` → `mh metrics.rs`; both via `record_caller_type_rejected(grpc_service, expected_type, actual_type)`
+- MH `mh_jwt_validations_total{result, token_type, failure_reason}` (bounded via `classify_jwt_error()`) → `mh metrics.rs`; catalog → `docs/observability/metrics/mh-service.md`; dashboard → `mh-overview.json`
 
 ## TLS & Certificates
 - Dev cert generation (ECDSA P-256 CA, MC + MH certs) → `scripts/generate-dev-certs.sh`

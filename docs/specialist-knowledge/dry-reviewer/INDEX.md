@@ -28,10 +28,10 @@
 
 ## gRPC Auth (Cross-Service)
 - MC auth -> `crates/mc-service/src/grpc/auth_interceptor.rs:McAuthLayer` (JWKS + scope + Layer 2 service_type routing, ADR-0003); `McAuthInterceptor` removed
-- MH auth -> `crates/mh-service/src/grpc/auth_interceptor.rs:MhAuthLayer` (JWKS + scope, Layer 1 only) + `:MhAuthInterceptor` (legacy, dead)
+- MH auth -> `crates/mh-service/src/grpc/auth_interceptor.rs:MhAuthLayer` (JWKS + scope + Layer 2 service_type routing, ADR-0003); `MhAuthInterceptor` removed
 - Shared constant -> `common::jwt::MAX_JWT_SIZE_BYTES`
-- McAuthLayer/MhAuthLayer Layer 1 near-identical; MC diverges with Layer 2 routing + claims injection (extraction candidate in TODO.md, trigger: MH/GC get Layer 2)
-- Layer 2 metric -> `mc_caller_type_rejected_total{grpc_service, expected_type, actual_type}` | Dashboard panel -> `infra/grafana/dashboards/mc-overview.json`
+- McAuthLayer/MhAuthLayer now structurally identical (5-step chain: structural, JWKS, scope, service_type routing, claims injection). Both have `classify_jwt_error()` + `failure_reason` metrics. Extraction candidate in TODO.md, trigger: third service needing pattern.
+- Layer 2 metrics -> `mc_caller_type_rejected_total` | `mh_caller_type_rejected_total` (same labels: `grpc_service, expected_type, actual_type`)
 
 ## Scope Alignment (ADR-0003)
 - Scope convention: `service.write.{target}` for gRPC; `internal:meeting-token` for AC HTTP

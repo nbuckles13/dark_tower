@@ -22,11 +22,12 @@
 - MC JWT validation (McJwtValidator) → `crates/mc-service/src/auth/mod.rs` (meeting + guest token methods)
 - MC JWKS config → `crates/mc-service/src/config.rs:ac_jwks_url`
 - MC WebTransport JWT check (pre-actor) → `crates/mc-service/src/webtransport/connection.rs:handle_connection()`
-- MH gRPC auth interceptor → `crates/mh-service/src/grpc/auth_interceptor.rs:MhAuthInterceptor`
+- MH gRPC auth layer → `crates/mh-service/src/grpc/auth_interceptor.rs:MhAuthLayer`
 - MH JWKS config → `infra/services/mh-service/configmap.yaml:AC_JWKS_URL`
 - ADR-0003 scope definitions → `crates/ac-service/src/models/mod.rs:ServiceType::default_scopes()` | Seed SQL → `infra/kind/scripts/setup.sh`
 - ADR-0003 scope contract tests (drift prevention) → `crates/ac-service/src/models/mod.rs` (`test_scope_contract_*`)
 - NOTE: `McAuthInterceptor` was removed (replaced by `McAuthLayer`). Doc-only references remain in devloop-outputs.
+- NOTE: `MhAuthInterceptor` was removed (replaced by `MhAuthLayer`). Doc-only references remain in devloop-outputs.
 
 ## MC Actor Hierarchy
 - Controller → `actors/controller.rs` | Meeting → `actors/meeting.rs` | Participant → `actors/participant.rs`
@@ -71,5 +72,4 @@
 
 ## Kustomize, Kind & Network Policies
 - Kind overlay → `infra/kubernetes/overlays/kind/` | Setup → ADR-0030, `infra/kind/scripts/setup.sh` | Teardown → `teardown.sh`
-- ConfigMap patching (MC/MH advertise) → `setup.sh:deploy_mc_service()`, `deploy_mh_service()` | Helper → `crates/devloop-helper/src/commands.rs`
-- Network policies → `infra/services/{ac,gc,mc,mh}-service/network-policy.yaml` | MC↔MH gRPC: MC→MH:50053, MH→MC:50052
+- ConfigMap patching (MC/MH advertise) → `setup.sh:deploy_mc_service()`, `deploy_mh_service()` | Network policies → `infra/services/{ac,gc,mc,mh}-service/network-policy.yaml`

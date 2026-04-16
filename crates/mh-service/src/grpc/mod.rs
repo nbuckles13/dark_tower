@@ -16,16 +16,16 @@
 //!
 //! # Security
 //!
-//! All incoming gRPC requests from MC must pass through the [`MhAuthInterceptor`]
-//! which validates authorization headers. This provides defense-in-depth beyond
-//! transport-level security.
+//! All incoming gRPC requests from MC must pass through the [`MhAuthLayer`]
+//! which validates authorization headers and enforces caller-type routing
+//! (ADR-0003). This provides defense-in-depth beyond transport-level security.
 
 pub mod auth_interceptor;
 pub mod gc_client;
 pub mod mc_client;
 pub mod mh_service;
 
-pub use auth_interceptor::{MhAuthInterceptor, MhAuthLayer};
+pub use auth_interceptor::MhAuthLayer;
 pub use gc_client::GcClient;
 pub use mc_client::McClient;
 pub use mh_service::MhMediaService;

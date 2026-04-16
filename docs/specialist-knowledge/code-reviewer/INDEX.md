@@ -48,7 +48,7 @@
 ## Code Locations — MH Service
 - Config (ac_jwks_url, max_connections, register_meeting_timeout) → `config.rs:Config`
 - Error type (thiserror, bounded labels) → `errors.rs:MhError`
-- Auth: JWT validator → `auth/mod.rs:MhJwtValidator`; interceptor → `grpc/auth_interceptor.rs:MhAuthInterceptor`; auth layer (async JWKS, scope `service.write.mh`) → `grpc/auth_interceptor.rs:MhAuthLayer`
+- Auth: JWT validator → `auth/mod.rs:MhJwtValidator`; two-layer auth (JWKS + scope `service.write.mh` + Layer 2 `service_type` routing for `MediaHandlerService`→`meeting-controller`, claims injection, ADR-0003) → `grpc/auth_interceptor.rs:MhAuthLayer`; `classify_jwt_error()` maps `JwtError` → bounded `failure_reason` label; legacy `MhAuthInterceptor` removed
 - GC client (RegisterMH, SendLoadReport) → `grpc/gc_client.rs:GcClient`
 - MC client (MH→MC: NotifyParticipantConnected/Disconnected, per-call channel, retry) → `grpc/mc_client.rs:McClient`
 - MC client integration tests → `tests/mc_client_integration.rs`
@@ -56,7 +56,7 @@
 - Session manager (registered meetings, pending connections, Notify) → `session/mod.rs:SessionManager`
 - WebTransport: server (TLS, capacity, McClient) → `webtransport/server.rs:WebTransportServer`; connection (JWT, provisional accept, MC notifications) → `webtransport/connection.rs:handle_connection()`, `spawn_notify_connected()`
 - Startup wiring (JWKS, SessionManager, WebTransport, MhAuthLayer, McClient) → `main.rs`
-- Metrics (JWT, WebTransport, handshake, connections, MC notifications) → `observability/metrics.rs:record_mc_notification()`; catalog → `docs/observability/metrics/mh-service.md`
+- Metrics (JWT 3-arg with `failure_reason`, `mh_caller_type_rejected_total`, WebTransport, handshake, connections, MC notifications) → `observability/metrics.rs`; catalog → `docs/observability/metrics/mh-service.md`
 - Health probes (port 8083) → `observability/health.rs`; K8s → `infra/services/mh-service/`
 - Dockerfile → `infra/docker/mh-service/Dockerfile`; NetworkPolicy → `infra/services/mh-service/network-policy.yaml`
 
