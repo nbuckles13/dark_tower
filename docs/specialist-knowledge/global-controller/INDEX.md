@@ -5,6 +5,7 @@
 - API versioning, URL prefix conventions -> ADR-0004
 - User auth, meeting access, join dependency chain -> ADR-0020
 - Service-to-service auth (OAuth 2.0 client credentials) -> ADR-0003
+- gRPC auth scopes, two-layer auth (JWKS + service_type routing) -> ADR-0003
 
 ## Code Locations
 - Entrypoint (HTTP + gRPC dual-server startup) -> `crates/gc-service/src/main.rs`
@@ -16,7 +17,7 @@
 - Claims extraction -> `crates/gc-service/src/auth/claims.rs`
 - HTTP auth middleware (service token) -> `crates/gc-service/src/middleware/auth.rs:require_auth()`
 - HTTP auth middleware (user token) -> `crates/gc-service/src/middleware/auth.rs:require_user_auth()`
-- gRPC auth layer (Tower) -> `crates/gc-service/src/grpc/auth_layer.rs:GrpcAuthLayer`
+- gRPC auth layer (Tower, needs scope+service_type per ADR-0003) -> `crates/gc-service/src/grpc/auth_layer.rs:GrpcAuthLayer`
 - Meeting handlers (create, join, guest-token, settings) -> `crates/gc-service/src/handlers/meetings.rs`
 - Join/settings (user-auth, status allowlist, metrics) -> `crates/gc-service/src/handlers/meetings.rs:join_meeting()`, `update_meeting_settings()`
 - Join response construction (shared by join + guest-token) -> `crates/gc-service/src/handlers/meetings.rs:JoinMeetingResponse::new()`
@@ -43,7 +44,7 @@
 - GC <-> AC shared types (MeetingTokenRequest, GuestTokenRequest, TokenResponse, ParticipantType, MeetingRole) -> `crates/common/src/meeting_token.rs`
 - home_org_id is always Uuid (not Option) — set to user_org_id for same-org, user_org_id for cross-org -> `handlers/meetings.rs:400`
 - GC <-> MC (gRPC registration + heartbeat) -> `crates/gc-service/src/grpc/mc_service.rs`
-- GC <-> MC (gRPC assignment RPC) -> `crates/gc-service/src/services/mc_client.rs`
+- GC <-> MC (gRPC assignment RPC, requires service.write.mc per ADR-0003) -> `crates/gc-service/src/services/mc_client.rs`
 - GC <-> MH (gRPC registration + load report) -> `crates/gc-service/src/grpc/mh_service.rs`
 - MhAssignmentInfo -> MhAssignment proto mapping -> `crates/gc-service/src/services/mc_client.rs:assign_meeting()`
 - GC <-> Client (HTTP API /api/v1/*) -> `crates/gc-service/src/routes/mod.rs`

@@ -2,6 +2,7 @@
 
 ## Architecture & Design
 - Service-to-service OAuth 2.0 flow -> ADR-0003
+- gRPC auth scopes & two-layer auth model -> ADR-0003 (Component 6)
 - Token lifetime & expiry rules -> ADR-0007
 - Key rotation strategy -> ADR-0008
 - Integration test infrastructure -> ADR-0009
@@ -52,6 +53,12 @@
 - Request types (`MeetingTokenRequest`, `GuestTokenRequest`) are shared via `common::meeting_token`
 - AC re-exports them from `crate::models` so handler imports are unchanged
 - Note: `common::meeting_token::{ParticipantType, MeetingRole}` (3-variant, snake_case) differs from `common::jwt::{ParticipantType, MeetingRole}` (2-variant, lowercase). Wire-compatible but separate Rust types. Unification is a future cleanup item.
+
+## Scope Data (ADR-0003)
+- Default scopes per service type -> `crates/ac-service/src/models/mod.rs:ServiceType::default_scopes()`
+- DB seed scopes -> `infra/kind/scripts/setup.sh:457-459`
+- Token issuance (scopes from DB, service_type claim) -> `crates/ac-service/src/services/token_service.rs:111-148`
+- ServiceClaims (scope + service_type) -> `crates/common/src/jwt.rs:ServiceClaims`
 
 ## Integration Seams
 - Auth middleware (service tokens) -> `crates/ac-service/src/middleware/auth.rs:require_service_auth()`

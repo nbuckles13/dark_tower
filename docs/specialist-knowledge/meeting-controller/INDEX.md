@@ -3,6 +3,7 @@
 ## Architecture & Design
 - MC architecture, actor model, session binding, capacity → ADR-0023
 - User auth, meeting access, join flow → ADR-0020
+- gRPC auth scopes, two-layer auth (JWKS + service_type routing) → ADR-0003
 - Observability pattern (metrics crate facade) → ADR-0011
 
 ## Code Locations
@@ -24,8 +25,8 @@
 - gRPC: GC client (registration, heartbeats, advertise address usage) → `crates/mc-service/src/grpc/gc_client.rs`
 - gRPC: MC service (AssignMeetingWithMh) → `crates/mc-service/src/grpc/mc_service.rs`
 - gRPC: MH client (RegisterMeeting, per-call Channel) → `crates/mc-service/src/grpc/mh_client.rs`
-- gRPC: auth interceptor (Bearer validation) → `crates/mc-service/src/grpc/auth_interceptor.rs`
-- gRPC: auth layer (async JWKS + scope check, R-22) → `crates/mc-service/src/grpc/auth_interceptor.rs:McAuthLayer`
+- gRPC: auth interceptor (dead code, remove per ADR-0003) → `crates/mc-service/src/grpc/auth_interceptor.rs:McAuthInterceptor`
+- gRPC: auth layer (async JWKS + scope + service_type routing, ADR-0003) → `crates/mc-service/src/grpc/auth_interceptor.rs:McAuthLayer`
 - gRPC: media coordination (MH notifications, R-15) → `crates/mc-service/src/grpc/media_coordination.rs`
 - MH connection registry (participant→MH state, R-18) → `crates/mc-service/src/mh_connection_registry.rs`
 - Redis: fenced client (Lua scripts) → `crates/mc-service/src/redis/client.rs`

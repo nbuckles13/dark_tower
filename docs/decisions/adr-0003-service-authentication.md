@@ -73,6 +73,18 @@ Dark Tower is a distributed system with multiple services that need to communica
 - `service.read.gc` - Service can read from GC
 - `service.admin.gc` - Service can perform admin operations
 
+**Scope Mapping** (based on actual inter-service call graph):
+
+| Service | Token Scopes | Calls |
+|---------|-------------|-------|
+| GC | `service.write.mc`, `internal:meeting-token` | GC→MC (AssignMeeting), GC→AC (meeting token issuance) |
+| MC | `service.write.mh`, `service.write.gc` | MC→MH (RegisterMeeting), MC→GC (registration, heartbeats) |
+| MH | `service.write.mc`, `service.write.gc` | MH→MC (notifications), MH→GC (registration, load reports) |
+
+`internal:meeting-token` is an AC-internal HTTP scope for meeting token issuance, not a gRPC service-to-service scope. It does not follow the `service.write.*` pattern.
+
+Scopes are registered per service in AC's `ServiceType::default_scopes()` (`crates/ac-service/src/models/mod.rs`) and seeded in `infra/kind/scripts/setup.sh`. AC issues all registered scopes in the JWT `scope` claim. The caller cannot request scopes beyond what is registered.
+
 ### Component 3: Token Types
 
 **User Tokens**: See [ADR-0020](adr-0020-user-auth-meeting-access.md) for user token format and authorization model.
@@ -180,7 +192,48 @@ Meeting Controller → Media Handler (RouteMedia):
 6. If valid, process request
 ```
 
-### Component 6: Token Validation (Actor-Based)
+### Component 6: Two-Layer gRPC Auth Architecture
+
+Each service's gRPC auth layer implements two checks in sequence within a single async tower Layer:
+
+**Layer 1 — JWKS Authentication + Scope Authorization (server-wide)**:
+- Validate JWT signature via AC JWKS endpoint (EdDSA)
+- Validate token expiry, issued-at, size limits
+- Check `service.write.{target}` scope via `ServiceClaims::has_scope()`
+- Inject validated `ServiceClaims` into `http::Request` extensions
+
+**Layer 2 — Caller Identity Routing (URI-path based, in same layer)**:
+- After Layer 1 passes, extract gRPC service path from request URI
+- Match path against an allowlist of `service_type` → permitted gRPC services
+- Reject tokens with `service_type: None` (fail closed)
+- Allowlist pattern: only explicitly listed `service_type` values are permitted
+
+The `service_type` claim is populated by AC in every service token from the `service_credentials.service_type` DB column (`token_service.rs:148`). It is an identity claim (who the caller is), not an authorization scope (what the caller can do). The caller cannot choose or override it — it is determined by which credential record matches the `client_id`/`client_secret`.
+
+**Caller routing per service:**
+
+MC (port 50052):
+- `/dark_tower.internal.MeetingControllerService/*` → `service_type == "global-controller"`
+- `/dark_tower.internal.MediaCoordinationService/*` → `service_type == "media-handler"`
+
+MH (port 50053):
+- `/dark_tower.internal.MediaHandlerService/*` → `service_type == "meeting-controller"`
+
+GC (port 50051):
+- `/dark_tower.internal.GlobalControllerService/*` → `service_type == "meeting-controller"`
+- `/dark_tower.internal.MediaHandlerRegistryService/*` → `service_type == "media-handler"`
+
+**Observability:**
+- Layer 1 metric: `{service}_jwt_validations_total{result, token_type}` — auth failures (credential/token issues)
+- Layer 2 metric: `{service}_caller_type_rejected_total{grpc_service, expected_type, actual_type}` — routing failures (should be zero in production, any occurrence is a bug)
+
+**Key files:**
+- MC auth layer: `crates/mc-service/src/grpc/auth_interceptor.rs:McAuthLayer`
+- MH auth layer: `crates/mh-service/src/grpc/auth_interceptor.rs:MhAuthLayer`
+- GC auth layer: `crates/gc-service/src/grpc/auth_layer.rs:GrpcAuthLayer`
+- ServiceClaims: `crates/common/src/jwt.rs:ServiceClaims`
+
+### Component 7: Token Validation
 
 **JwksManagerActor** (see ADR-0001):
 - Manages JWKS cache from all federated clusters
@@ -214,7 +267,7 @@ async fn validate_token(
 }
 ```
 
-### Component 7: Service Credentials (Client Credentials Flow)
+### Component 8: Service Credentials (Client Credentials Flow)
 
 **Service Registration** (at deployment):
 ```
@@ -236,7 +289,7 @@ async fn validate_token(
 5. MC refreshes token before expiration
 ```
 
-### Component 8: Key Rotation
+### Component 9: Key Rotation
 
 **Weekly rotation schedule**:
 ```
@@ -681,6 +734,11 @@ X-RateLimit-Reset: 1234567890
 | Bcrypt Duration Metrics | ❌ Pending | | Wire `ac_bcrypt_duration_seconds` at call sites. Recording function exists in `metrics.rs` (`#[allow(dead_code)]`) but is not called from password hashing code paths. |
 | Audit Log Metrics | ❌ Pending | | Wire `ac_audit_log_failures_total` at call sites. Recording function exists in `metrics.rs` (`#[allow(dead_code)]`) but audit logging is not yet implemented. |
 | Credential Operations Metrics | ✅ Done | | `ac_credential_operations_total` (renamed from `ac_admin_operations_total`) wired at all admin handler call sites via `record_credential_operation()`. |
+| ADR-0003 Scope Alignment | ❌ Pending | | Update `default_scopes()` and `setup.sh` to use `service.write.{target}` scopes per scope mapping table. Remove legacy domain-oriented scopes. |
+| Two-Layer gRPC Auth (MC) | ❌ Pending | | Add Layer 2 `service_type` + URI-path routing to `McAuthLayer`. Inject claims into extensions. Remove dead `McAuthInterceptor`. |
+| Two-Layer gRPC Auth (MH) | ❌ Pending | | Add Layer 2 `service_type` routing to `MhAuthLayer`. Fix metrics gap (scope rejection not counted). Inject claims into extensions. |
+| Two-Layer gRPC Auth (GC) | ❌ Pending | | Add `service.write.gc` scope enforcement + Layer 2 `service_type` routing to `GrpcAuthLayer`. |
+| Scope Contract Tests | ❌ Pending | | Assert each caller's `default_scopes()` contains the target's `REQUIRED_SCOPE`. Regression prevention. |
 | Redis-based Rate Limiting | ❌ Pending | | Multi-instance distributed rate limiting |
 | CAPTCHA Integration | ❌ Pending | | After 3 failed attempts (Layer 4) |
 | Failed Login Alerting | ❌ Pending | | Email user, alert ops team (Layer 5) |
@@ -692,6 +750,7 @@ X-RateLimit-Reset: 1234567890
 - JWKS RFC 7517: https://datatracker.ietf.org/doc/html/rfc7517
 - EdDSA (Ed25519): RFC 8032
 - Implementation: See `JwksManagerActor`, `Auth Controller` crate
+- Debate (scope naming + two-layer auth): `docs/debates/2026-04-16-grpc-auth-scopes/debate.md`
 - Related: ADR-0001 (Actor Pattern for JWKS management)
 - Related: ADR-0002 (Error handling in validation code)
 - Architecture: `docs/ARCHITECTURE.md` (Auth Controller section)

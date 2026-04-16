@@ -2,6 +2,7 @@
 
 ## Architecture & Design
 - Service authentication (OAuth 2.0 Client Credentials) → ADR-0003
+- Inter-service gRPC auth scopes (two-layer: JWKS+scope, service_type allowlist) → ADR-0003
 - Token lifetime & refresh → ADR-0007 | Key rotation → ADR-0008
 - User auth & meeting access → ADR-0020
 - No-panic policy → ADR-0002 | Approved algorithms → ADR-0027
@@ -26,7 +27,7 @@
 
 ## Code Locations — MC (JWT, WebTransport, Actors, MH Client)
 - MC JWT validation + token_type anti-confusion → `crates/mc-service/src/auth/mod.rs:McJwtValidator`
-- gRPC auth: structural `McAuthInterceptor` | JWKS `McAuthLayer` (scope `service.write.mc`) → `crates/mc-service/src/grpc/auth_interceptor.rs`
+- gRPC auth: JWKS `McAuthLayer` (scope `service.write.mc` + service_type routing per ADR-0003) → `crates/mc-service/src/grpc/auth_interceptor.rs`
 - MC→MH OAuth Bearer auth (TokenReceiver, add_auth) → `crates/mc-service/src/grpc/mh_client.rs:MhClient`
 - MediaCoordinationService (MH→MC, input validation) → `crates/mc-service/src/grpc/media_coordination.rs`
 - MH connection registry (bound: 1000/meeting) + UTF-8 safe truncation (`floor_char_boundary`) → `mh_connection_registry.rs`, `webtransport/connection.rs:handle_client_message()`
@@ -36,8 +37,7 @@
 - Session binding + join → `crates/mc-service/src/actors/session.rs`, `meeting.rs:handle_join()`
 
 ## Code Locations — MH (Auth, OAuth, TLS, Outbound Clients)
-- gRPC auth layer (JWKS, scope `service.write.mh`) → `crates/mh-service/src/grpc/auth_interceptor.rs:MhAuthLayer`
-- OAuth config (SecretString, Debug redaction) → `crates/mh-service/src/config.rs:Config` | JWKS: `infra/services/mh-service/configmap.yaml`
+- gRPC auth layer (JWKS, scope `service.write.mh`, service_type routing per ADR-0003) → `crates/mh-service/src/grpc/auth_interceptor.rs:MhAuthLayer` | OAuth config → `config.rs`
 - TLS validation + Bearer auth + error sanitization → `config.rs`, `gc_client.rs`, `errors.rs`
 - MH→MC OAuth Bearer auth (TokenReceiver, add_auth, retry with auth short-circuit) → `crates/mh-service/src/grpc/mc_client.rs:McClient`
 - MC notification wiring (fire-and-forget connect/disconnect) → `crates/mh-service/src/webtransport/connection.rs:spawn_notify_connected()`
