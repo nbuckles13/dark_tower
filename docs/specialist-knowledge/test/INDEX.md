@@ -9,6 +9,7 @@
 - Coverage thresholds -> `.codecov.yml`
 - Client architecture (4-tier testing, test-utils, flaky policy) -> ADR-0028
 - Host-side cluster helper (env-test execution, URL config, attempt budgets, cluster networking) -> `docs/decisions/adr-0030-host-side-cluster-helper.md`
+- gRPC auth scopes (scope contract tests, service_type routing tests, regression prevention) -> ADR-0003 (Component 6)
 
 ## Code Locations: AC Service
 - Integration + fault injection tests -> `crates/ac-service/tests/integration/`, `crates/ac-service/tests/fault_injection/`
@@ -26,7 +27,7 @@
 - Test harness -> `crates/gc-test-utils/src/server_harness.rs`
 
 ## Code Locations: MC Service
-- Auth (meeting/guest JWT, McAuthInterceptor, JWKS McAuthLayer+scope) -> `crates/mc-service/src/auth/mod.rs:tests`, `grpc/auth_interceptor.rs:tests`
+- Auth (meeting/guest JWT, JWKS McAuthLayer+scope+service_type routing, ADR-0003) -> `crates/mc-service/src/auth/mod.rs:tests`, `grpc/auth_interceptor.rs:tests`
 - Config + error tests (incl. MhAssignmentMissing) -> `crates/mc-service/src/config.rs:tests`, `crates/mc-service/src/errors.rs:tests`
 - Actor tests (controller, meeting, participant, session) -> `crates/mc-service/src/actors/controller.rs:tests`, `meeting.rs`, `participant.rs`, `session.rs`
 - Join flow integration tests (T1-T11, MH assignment, media_servers, bridge) + encoding -> `crates/mc-service/tests/join_tests.rs`, `src/webtransport/handler.rs:tests`
@@ -40,7 +41,7 @@
 ## Code Locations: MH Service
 - Config tests (env vars, defaults, TLS, debug redaction, advertise addresses, JWKS URL, timeouts) -> `crates/mh-service/src/config.rs:tests`
 - Error tests (labels, status codes, client messages, JwtError conversion) -> `crates/mh-service/src/errors.rs:tests`
-- Auth tests (legacy structural + JWKS ServiceClaims + scope) -> `crates/mh-service/src/grpc/auth_interceptor.rs:tests`
+- Auth tests (JWKS ServiceClaims + scope + service_type routing, ADR-0003) -> `crates/mh-service/src/grpc/auth_interceptor.rs:tests`
 - JWT validation tests (MhJwtValidator, meeting tokens, wiremock JWKS) -> `crates/mh-service/src/auth/mod.rs:tests`
 - gRPC handler tests (RegisterMeeting validation, SessionManagerHandle integration) -> `crates/mh-service/src/grpc/mh_service.rs:tests`
 - Session manager actor tests (handle API, registration, connections, pending promotion, notify via oneshot) -> `crates/mh-service/src/session/mod.rs:tests`
@@ -55,9 +56,7 @@
 ## Code Locations: Environment Tests
 - Cluster bootstrap + fixtures → `crates/env-tests/src/`, flows (20-24) → `crates/env-tests/tests/`
 - Cluster connection + port config (ADR-0030) → `crates/env-tests/src/cluster.rs:ClusterPorts`, `ClusterConnection`, `from_env()`, `parse_host_port()`
-- GC client fixture (join, guest token, mc_assignment) → `crates/env-tests/src/fixtures/gc_client.rs`
-- Auth client fixture → `crates/env-tests/src/fixtures/auth_client.rs`
-- Prometheus client fixture → `crates/env-tests/src/fixtures/metrics.rs`
+- Client fixtures (GC, Auth, Prometheus) → `crates/env-tests/src/fixtures/gc_client.rs`, `auth_client.rs`, `metrics.rs`
 - Join flow tests (AC→GC→MC e2e) → `crates/env-tests/tests/24_join_flow.rs`
 - CanaryPod + NetworkPolicy manifests → `crates/env-tests/src/canary.rs`, `infra/services/{ac,gc,mc,mh}-service/network-policy.yaml`
 - Cluster health + kubectl security checks → `crates/env-tests/tests/00_cluster_health.rs`
@@ -72,4 +71,5 @@
 
 ## Code Locations: Common & Infrastructure
 - JWT (claims, JwksClient, JwtValidator, round-trip tests) -> `crates/common/src/jwt.rs`; meeting token -> `meeting_token.rs:tests`
+- Scope contract tests (ADR-0003 regression prevention) -> `crates/ac-service/src/models/mod.rs:tests`
 - MC/MH per-pod Services, ConfigMaps, Kind port mappings → `infra/services/{mc,mh}-service/`; Dev certs → `scripts/generate-dev-certs.sh`

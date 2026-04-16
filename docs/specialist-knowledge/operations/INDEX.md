@@ -44,9 +44,10 @@
 - Participant tracking + meetings → `crates/gc-service/src/repositories/participants.rs`, `meetings.rs`
 
 ## Auth & JWT
-- Common JWKS + JWT → `crates/common/src/jwt.rs`
-- Shared GC↔AC token types → `crates/common/src/meeting_token.rs`
-- AC rate limits → `crates/ac-service/src/config.rs:parse_rate_limit_i64()`; Service auth → ADR-0003
+- gRPC auth scopes (naming, two-layer auth, deployment order) → ADR-0003; Service auth → ADR-0003
+- Common JWKS + JWT + ServiceClaims → `crates/common/src/jwt.rs`; GC↔AC token types → `meeting_token.rs`
+- AC rate limits → `crates/ac-service/src/config.rs:parse_rate_limit_i64()`
+- Scope seed → `setup.sh:seed_test_data()`; AC defaults → `models/mod.rs:default_scopes()`; Auth layers → MC `McAuthLayer`, MH `MhAuthLayer`, GC `GrpcAuthLayer`
 
 ## Observability
 - Kustomize + Grafana → `infra/kubernetes/observability/`, `infra/grafana/dashboards/`; Alerts → `docs/observability/alerts.md`

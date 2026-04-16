@@ -5,6 +5,7 @@
 - Actor pattern for concurrency (handle/task, message passing, no locks) → ADR-0001
 - MH assignment, selection algorithm, cross-region coordination → ADR-0023 (Section 5)
 - Service authentication (MH→GC OAuth, MC→MH Bearer) → ADR-0003
+- gRPC auth scopes (two-layer: JWKS+scope server-wide, service_type per-path) → ADR-0003
 - Observability pattern (metrics crate facade) → ADR-0011
 - Dashboard metric presentation (counters vs rates) → ADR-0029
 - Fuzz testing for media frames → ADR-0006
@@ -64,12 +65,9 @@
 - Health endpoint tests → `crates/mh-service/src/observability/health.rs`
 - Metrics unit tests → `crates/mh-service/src/observability/metrics.rs`
 
-## Advertise Address Config
-- Env vars and usage in GC registration → `crates/mh-service/src/config.rs`, `gc_client.rs:register()`
-- K8s downward API pod IP → `infra/services/mh-service/deployment.yaml`
-
 ## Infrastructure
-- K8s deployment (ports, probes, env, downward API) → `infra/services/mh-service/deployment.yaml`
+- K8s deployment (ports, probes, env, downward API, advertise addresses) → `infra/services/mh-service/deployment.yaml`
+- Advertise address config + GC registration → `crates/mh-service/src/config.rs`, `gc_client.rs:register()`
 - K8s configmap (bind addresses, region, GC URL) → `infra/services/mh-service/configmap.yaml`
 - Grafana dashboard → `infra/grafana/dashboards/mh-overview.json`
 - Grafana kustomization → `infra/grafana/kustomization.yaml`

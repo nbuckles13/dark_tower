@@ -6,6 +6,7 @@
 - Client architecture (telemetry, metrics, dashboards, synthetic probe) -> ADR-0028
 - Dashboard metric presentation (counters vs rates, increase/rate classification) -> ADR-0029
 - Host-side cluster helper (observability access, port discovery, health gating, listenAddress fix) -> ADR-0030
+- gRPC auth scopes (two-layer auth, caller_type_rejected_total metric, MH metrics gap fix) -> ADR-0003
 
 ## Metrics
 - Metric catalogs -> `docs/observability/metrics/ac-service.md`, `docs/observability/metrics/gc-service.md`, `docs/observability/metrics/mc-service.md`, `docs/observability/metrics/mh-service.md`
@@ -17,7 +18,8 @@
 ## Auth & JWT Tracing
 - Common JWT (JwksClient, JwtValidator, verify_token, PII-redacted Debug) -> `crates/common/src/jwt.rs`
 - GC/MC/MH auth wrappers -> `crates/gc-service/src/auth/jwt.rs:JwtValidator`, `crates/mc-service/src/auth/mod.rs:McJwtValidator` (target: `mc.auth`), `crates/mh-service/src/auth/mod.rs:MhJwtValidator` (target: `mh.auth`)
-- MH gRPC auth (JWKS-based ServiceClaims validation, tower Layer) -> `crates/mh-service/src/grpc/auth_interceptor.rs:MhAuthLayer` (target: `mh.grpc.auth`)
+- Two-layer gRPC auth (ADR-0003): Layer 1 JWKS+scope (`jwt_validations_total`), Layer 2 service_type routing (`caller_type_rejected_total{grpc_service, expected_type, actual_type}`)
+- MC gRPC auth (target: `mc.grpc.auth`) -> `crates/mc-service/src/grpc/auth_interceptor.rs`; MH -> `crates/mh-service/src/grpc/auth_interceptor.rs`
 
 ## MC WebTransport Tracing
 - Server/connection/handler (targets: `mc.webtransport`, `.connection`, `.handler`) -> `crates/mc-service/src/webtransport/server.rs`, `connection.rs` (incl. MediaConnectionFailed), `handler.rs`
@@ -70,6 +72,4 @@
 - Instrument skip_all enforcement -> `scripts/guards/simple/instrument-skip-all.sh`
 
 ## Env-Test Observability, Runbooks & Test Coverage
-- MC/MH K8s health probes + metrics scrape -> `infra/services/{mc,mh}-service/deployment.yaml`
-- Runbooks + alerts -> `docs/runbooks/`, `docs/observability/alerts.md`
-- Metrics tests -> `crates/gc-service/src/observability/metrics.rs`, `crates/mc-service/src/observability/metrics.rs`, `crates/mh-service/src/observability/metrics.rs`
+- Runbooks + alerts -> `docs/runbooks/`, `docs/observability/alerts.md`; Metrics tests -> per-service `observability/metrics.rs`
