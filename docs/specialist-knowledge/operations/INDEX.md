@@ -65,6 +65,7 @@
 - Async RegisterMeeting trigger (first-participant, retry+backoff, cancel-aware) → `crates/mc-service/src/webtransport/connection.rs:register_meeting_with_handlers()`
 - MC gRPC services (GC→MC assignments, MH→MC MediaCoordination) → `crates/mc-service/src/grpc/mc_service.rs`, `media_coordination.rs`; JWKS auth → `auth_interceptor.rs:McAuthLayer`
 - MhConnectionRegistry (cleanup wired in controller.rs `remove_meeting()`) → `crates/mc-service/src/mh_connection_registry.rs`
+- Idempotent MH-retry invariant (disconnect after registry-clear returns Ok, not gRPC error) → `crates/mc-service/src/grpc/media_coordination.rs:test_coordination_flow_connect_disconnect_round_trip()`
 - Redis (fenced writes, MhAssignmentData, MhAssignmentStore trait) → `crates/mc-service/src/redis/client.rs`
 - Actors → `crates/mc-service/src/actors/controller.rs`, `meeting.rs`, `participant.rs`
 - MCMediaConnectionAllFailed alert → `infra/docker/prometheus/rules/mc-alerts.yaml`

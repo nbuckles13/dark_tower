@@ -35,6 +35,7 @@ use prost::Message;
 use proto_gen::signaling::{
     self, client_message, server_message, ClientMessage, JoinRequest, MuteRequest, ServerMessage,
 };
+use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use wiremock::MockServer;
 use wtransport::endpoint::endpoint_side::Server;
@@ -88,10 +89,17 @@ struct RegisterMeetingCall {
 }
 
 /// In-memory mock for MhRegistrationClient — records calls for verification.
+///
+/// Tests use `call_notify` to wait deterministically for async
+/// `register_meeting` tasks to complete, avoiding `tokio::time::sleep`.
+/// Each call records to `calls` first, then calls `notify_one()` — readers
+/// that count notifications are safe to snapshot `calls` immediately after.
 struct MockMhRegistrationClient {
     calls: std::sync::Mutex<Vec<RegisterMeetingCall>>,
     /// If set, register_meeting() returns this result.
     result: Result<(), McError>,
+    /// Notified once per register_meeting() call, after `calls` is updated.
+    call_notify: Arc<Notify>,
 }
 
 impl MockMhRegistrationClient {
@@ -99,11 +107,39 @@ impl MockMhRegistrationClient {
         Self {
             calls: std::sync::Mutex::new(Vec::new()),
             result: Ok(()),
+            call_notify: Arc::new(Notify::new()),
         }
     }
 
     fn calls(&self) -> Vec<RegisterMeetingCall> {
         self.calls.lock().unwrap().clone()
+    }
+
+    /// Wait for `expected` register_meeting() calls to arrive within `timeout`.
+    /// Returns the recorded calls on success, or panics on timeout.
+    async fn wait_for_calls(&self, expected: usize, timeout: Duration) -> Vec<RegisterMeetingCall> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if self.calls.lock().unwrap().len() >= expected {
+                return self.calls();
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                let current = self.calls();
+                panic!(
+                    "Timeout waiting for {} register_meeting() calls; got {} ({:?})",
+                    expected,
+                    current.len(),
+                    current,
+                );
+            }
+            // `Notify` stores at most one permit; with N calls firing faster than
+            // we re-await, late notifications may be coalesced. Correctness relies
+            // on the length re-check at the top of the loop, which observes the
+            // cumulative state. The notify is a wakeup hint that avoids
+            // busy-polling, not a counter.
+            let _ = tokio::time::timeout(remaining, self.call_notify.notified()).await;
+        }
     }
 }
 
@@ -121,6 +157,7 @@ impl MhRegistrationClient for MockMhRegistrationClient {
             mc_id: mc_id.to_string(),
             mc_grpc_endpoint: mc_grpc_endpoint.to_string(),
         });
+        self.call_notify.notify_one();
         let result = match &self.result {
             Ok(()) => Ok(()),
             Err(e) => Err(McError::Grpc(e.to_string())),
@@ -245,17 +282,28 @@ impl TestServer {
         }
     }
 
-    /// Create a meeting on the controller and seed MH assignment data.
+    /// Create a meeting on the controller and seed MH assignment data
+    /// with the default single-handler fixture.
     async fn create_meeting(&self, meeting_id: &str) {
-        // Seed MH assignment data so join flow can populate media_servers
+        let default_handlers = vec![MhEndpointInfo {
+            mh_id: "mh-test-1".to_string(),
+            webtransport_endpoint: "wt://mh-test-1:4433".to_string(),
+            grpc_endpoint: Some("http://mh-test-1:50053".to_string()),
+        }];
+        self.create_meeting_with_handlers(meeting_id, default_handlers)
+            .await;
+    }
+
+    /// Create a meeting on the controller and seed MH assignment data
+    /// with the supplied handler list.
+    ///
+    /// Use this when the test needs multiple MHs or handlers with specific
+    /// endpoint configurations (e.g., missing gRPC endpoint).
+    async fn create_meeting_with_handlers(&self, meeting_id: &str, handlers: Vec<MhEndpointInfo>) {
         self.mh_store.insert(
             meeting_id,
             MhAssignmentData {
-                handlers: vec![MhEndpointInfo {
-                    mh_id: "mh-test-1".to_string(),
-                    webtransport_endpoint: "wt://mh-test-1:4433".to_string(),
-                    grpc_endpoint: Some("http://mh-test-1:50053".to_string()),
-                }],
+                handlers,
                 assigned_at: "2024-01-01T00:00:00Z".to_string(),
             },
         );
@@ -963,10 +1011,11 @@ async fn test_first_participant_triggers_register_meeting() {
         "Expected JoinResponse"
     );
 
-    // Give the spawned RegisterMeeting task time to execute
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    let calls = server.mh_reg_client.calls();
+    // Wait deterministically for the spawned RegisterMeeting task.
+    let calls = server
+        .mh_reg_client
+        .wait_for_calls(1, Duration::from_secs(2))
+        .await;
     assert_eq!(
         calls.len(),
         1,
@@ -999,12 +1048,14 @@ async fn test_second_participant_does_not_trigger_register_meeting() {
         "Expected JoinResponse for first client"
     );
 
-    // Give spawned task time to execute
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    let calls_after_first = server.mh_reg_client.calls().len();
+    // Wait deterministically for the first RegisterMeeting call.
+    let first_participant_calls = server
+        .mh_reg_client
+        .wait_for_calls(1, Duration::from_secs(2))
+        .await;
     assert_eq!(
-        calls_after_first, 1,
+        first_participant_calls.len(),
+        1,
         "First participant should trigger RegisterMeeting"
     );
 
@@ -1021,7 +1072,10 @@ async fn test_second_participant_does_not_trigger_register_meeting() {
         "Expected JoinResponse for second client"
     );
 
-    // Give time for any potential (unwanted) spawned task
+    // Absence-of-event bound: "no RegisterMeeting after second participant"
+    // cannot be awaited on a notifier (no signal for non-occurrence). A bounded
+    // wall-clock sleep is the intent-correct primitive here. Keeping 100ms to
+    // match historical test duration; raise if CI reports flakiness.
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let calls_after_second = server.mh_reg_client.calls().len();
@@ -1029,4 +1083,160 @@ async fn test_second_participant_does_not_trigger_register_meeting() {
         calls_after_second, 1,
         "Second participant should NOT trigger additional RegisterMeeting"
     );
+}
+
+// ============================================================================
+// T14: Multi-MH Assignment — media_servers populated for each, RegisterMeeting
+// fires once per MH
+// ============================================================================
+
+#[tokio::test]
+async fn test_join_multiple_mh_handlers_populates_all() {
+    let server = TestServer::start().await;
+    server
+        .create_meeting_with_handlers(
+            "meeting-multi",
+            vec![
+                MhEndpointInfo {
+                    mh_id: "mh-alpha".to_string(),
+                    webtransport_endpoint: "wt://mh-alpha:4433".to_string(),
+                    grpc_endpoint: Some("http://mh-alpha:50053".to_string()),
+                },
+                MhEndpointInfo {
+                    mh_id: "mh-beta".to_string(),
+                    webtransport_endpoint: "wt://mh-beta:4433".to_string(),
+                    grpc_endpoint: Some("http://mh-beta:50053".to_string()),
+                },
+            ],
+        )
+        .await;
+
+    let claims = make_meeting_claims("meeting-multi");
+    let token = server.sign_token(&claims);
+
+    let response = join_and_read_response(&server.url(), "meeting-multi", &token, "Alice").await;
+
+    // JoinResponse populates media_servers with all MH WebTransport URLs
+    match &response.message {
+        Some(server_message::Message::JoinResponse(join)) => {
+            assert_eq!(
+                join.media_servers.len(),
+                2,
+                "media_servers should include both assigned MHs"
+            );
+            let urls: std::collections::HashSet<String> = join
+                .media_servers
+                .iter()
+                .map(|m| m.media_handler_url.clone())
+                .collect();
+            assert!(
+                urls.contains("wt://mh-alpha:4433"),
+                "missing mh-alpha URL, got {urls:?}"
+            );
+            assert!(
+                urls.contains("wt://mh-beta:4433"),
+                "missing mh-beta URL, got {urls:?}"
+            );
+        }
+        other => panic!("Expected JoinResponse, got {other:?}"),
+    }
+
+    // RegisterMeeting fires exactly once per MH (R-12)
+    let calls = server
+        .mh_reg_client
+        .wait_for_calls(2, Duration::from_secs(2))
+        .await;
+    assert_eq!(
+        calls.len(),
+        2,
+        "First participant in multi-MH meeting should trigger RegisterMeeting per MH"
+    );
+    let grpc_endpoints: std::collections::HashSet<String> =
+        calls.iter().map(|c| c.mh_grpc_endpoint.clone()).collect();
+    assert!(
+        grpc_endpoints.contains("http://mh-alpha:50053"),
+        "missing mh-alpha gRPC endpoint, got {grpc_endpoints:?}"
+    );
+    assert!(
+        grpc_endpoints.contains("http://mh-beta:50053"),
+        "missing mh-beta gRPC endpoint, got {grpc_endpoints:?}"
+    );
+    for c in &calls {
+        assert_eq!(c.meeting_id, "meeting-multi");
+        assert_eq!(c.mc_id, "mc-test");
+        assert_eq!(c.mc_grpc_endpoint, "http://mc-test:50052");
+    }
+}
+
+// ============================================================================
+// T15: Mixed MH Assignment — handlers without grpc_endpoint are skipped for
+// RegisterMeeting but still appear in media_servers
+// ============================================================================
+
+#[tokio::test]
+async fn test_join_mh_without_grpc_endpoint_skips_register() {
+    let server = TestServer::start().await;
+    server
+        .create_meeting_with_handlers(
+            "meeting-mixed",
+            vec![
+                MhEndpointInfo {
+                    mh_id: "mh-with-grpc".to_string(),
+                    webtransport_endpoint: "wt://mh-with-grpc:4433".to_string(),
+                    grpc_endpoint: Some("http://mh-with-grpc:50053".to_string()),
+                },
+                MhEndpointInfo {
+                    mh_id: "mh-no-grpc".to_string(),
+                    webtransport_endpoint: "wt://mh-no-grpc:4433".to_string(),
+                    grpc_endpoint: None,
+                },
+            ],
+        )
+        .await;
+
+    let claims = make_meeting_claims("meeting-mixed");
+    let token = server.sign_token(&claims);
+
+    let response = join_and_read_response(&server.url(), "meeting-mixed", &token, "Alice").await;
+
+    // Both MHs appear in media_servers regardless of gRPC endpoint presence
+    match &response.message {
+        Some(server_message::Message::JoinResponse(join)) => {
+            assert_eq!(
+                join.media_servers.len(),
+                2,
+                "media_servers should include both MHs, gRPC presence is orthogonal"
+            );
+            let urls: std::collections::HashSet<String> = join
+                .media_servers
+                .iter()
+                .map(|m| m.media_handler_url.clone())
+                .collect();
+            assert!(urls.contains("wt://mh-with-grpc:4433"));
+            assert!(urls.contains("wt://mh-no-grpc:4433"));
+        }
+        other => panic!("Expected JoinResponse, got {other:?}"),
+    }
+
+    // RegisterMeeting fires only for the handler with a gRPC endpoint
+    // Wait for the single expected RegisterMeeting call to land, then give
+    // a brief absence-of-event window (below) to catch any phantom second call.
+    let _ = server
+        .mh_reg_client
+        .wait_for_calls(1, Duration::from_secs(2))
+        .await;
+
+    // Absence-of-event bound: "no RegisterMeeting for the None-endpoint handler"
+    // cannot be awaited on a notifier. Brief wall-clock sleep is the intent-correct
+    // primitive; combined with the `grpc_endpoint: None` data shape, phantom
+    // second calls would require a real bug in `register_meeting_with_handlers`.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let final_calls = server.mh_reg_client.calls();
+    assert_eq!(
+        final_calls.len(),
+        1,
+        "Only handler with grpc_endpoint=Some should trigger RegisterMeeting"
+    );
+    assert_eq!(final_calls[0].mh_grpc_endpoint, "http://mh-with-grpc:50053");
 }

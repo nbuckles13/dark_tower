@@ -33,12 +33,8 @@
 - Redis: MhAssignmentData (MH endpoints in Redis) → `crates/mc-service/src/redis/client.rs:MhAssignmentData`
 - Redis: Lua scripts (atomic fencing) → `crates/mc-service/src/redis/lua_scripts.rs`
 - Health + readiness endpoints → `crates/mc-service/src/observability/health.rs`
-- Prometheus metric wrappers → `crates/mc-service/src/observability/metrics.rs`
-- Join flow metrics (R-13): record_webtransport_connection, record_jwt_validation, record_session_join → `crates/mc-service/src/observability/metrics.rs`
-- MH communication metrics: record_register_meeting → `crates/mc-service/src/observability/metrics.rs`
-- MH coordination metrics (R-28): record_mh_notification, record_media_connection_failed → `crates/mc-service/src/observability/metrics.rs`
+- Prometheus metric wrappers (join R-13, MH R-28: record_webtransport_connection, record_jwt_validation, record_session_join, record_register_meeting, record_mh_notification, record_media_connection_failed) → `crates/mc-service/src/observability/metrics.rs`
 - MC metrics catalog → `docs/observability/metrics/mc-service.md`
-- System info (sysinfo) → `crates/mc-service/src/system_info.rs`
 
 ## Protocols
 - Client signaling (join, mute, session recovery) → `proto/signaling.proto`
@@ -56,9 +52,14 @@
 - MC -> Redis MH assignment read (join flow) → `crates/mc-service/src/redis/client.rs:get_mh_assignment()`
 
 ## Testing
-- GC integration tests (mock server) → `crates/mc-service/tests/gc_integration.rs`
-- Heartbeat task tests → `crates/mc-service/tests/heartbeat_tasks.rs`
+- GC integration + heartbeat tests → `crates/mc-service/tests/gc_integration.rs`, `heartbeat_tasks.rs`
 - Join flow integration tests (WebTransport + mock MH store) → `crates/mc-service/tests/join_tests.rs`
+- Multi-MH fan-out test (R-12) → `crates/mc-service/tests/join_tests.rs:test_join_multiple_mh_handlers_populates_all()`
+- Mixed-endpoint RegisterMeeting skip test → `crates/mc-service/tests/join_tests.rs:test_join_mh_without_grpc_endpoint_skips_register()`
+- Coordination round-trip (sibling preservation + idempotent retry) → `crates/mc-service/src/grpc/media_coordination.rs:test_coordination_flow_connect_disconnect_round_trip()`
+- MH assignment fixture (seed Redis + create meeting) → `crates/mc-service/tests/join_tests.rs:TestServer::create_meeting_with_handlers()`
+- Deterministic RegisterMeeting wait (Notify-based) → `crates/mc-service/tests/join_tests.rs:MockMhRegistrationClient::wait_for_calls()`
+- MhConnectionRegistry / MediaCoordinationService unit tests → `crates/mc-service/src/mh_connection_registry.rs:tests`, `crates/mc-service/src/grpc/media_coordination.rs:tests`
 - Test utilities (mock GC/Redis/MH) → `crates/mc-test-utils/src/`
 - Env-tests MC-GC integration → `crates/env-tests/tests/22_mc_gc_integration.rs`
 

@@ -29,7 +29,7 @@
 - gRPC auth: structural `McAuthInterceptor` | JWKS `McAuthLayer` (scope `service.write.mc`) → `crates/mc-service/src/grpc/auth_interceptor.rs`
 - MC→MH OAuth Bearer auth (TokenReceiver, add_auth, MhRegistrationClient trait) → `crates/mc-service/src/grpc/mh_client.rs`
 - Async RegisterMeeting trigger (first-participant, retry+backoff, CancellationToken) → `webtransport/connection.rs:register_meeting_with_handlers()`
-- MediaCoordinationService (MH→MC, input validation) → `crates/mc-service/src/grpc/media_coordination.rs`
+- MediaCoordinationService (MH→MC, input validation; idempotent re-disconnect returns Ok to avoid retry amplification) → `crates/mc-service/src/grpc/media_coordination.rs`
 - MH connection registry (bound: 1000/meeting) + UTF-8 safe truncation → `mh_connection_registry.rs`, `connection.rs:handle_client_message()`
 - WebTransport (connection handler, accept loop, TLS, join flow, JWT gate, capacity) → `crates/mc-service/src/webtransport/`
 - Join fail-closed on missing MH data (generic client error) → `connection.rs:build_join_response()`
