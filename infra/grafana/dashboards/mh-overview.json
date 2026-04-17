@@ -1494,6 +1494,73 @@
       ],
       "title": "Caller Type Rejections (ADR-0003)",
       "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Count of provisional WebTransport connections disconnected because RegisterMeeting did not arrive within the configured timeout (R-26). Non-zero values indicate MC->MH RegisterMeeting latency or client-side sequencing bugs. Task 12 will expand with alerting/thresholds.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 8,
+        "x": 0,
+        "y": 53
+      },
+      "id": 25,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "sum"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "pluginVersion": "10.0.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "increase(mh_register_meeting_timeouts_total[$__rate_interval])",
+          "legendFormat": "RegisterMeeting Timeouts",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "RegisterMeeting Timeouts (R-26)",
+      "type": "stat"
     }
   ],
   "refresh": "10s",

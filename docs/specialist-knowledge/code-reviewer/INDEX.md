@@ -56,7 +56,7 @@
 - Session manager (registered meetings, pending connections, Notify) → `session/mod.rs:SessionManager`
 - WebTransport: server (TLS, capacity, McClient) → `webtransport/server.rs:WebTransportServer`; connection (JWT, provisional accept, MC notifications) → `webtransport/connection.rs:handle_connection()`, `spawn_notify_connected()`
 - Startup wiring (JWKS, SessionManager, WebTransport, MhAuthLayer, McClient) → `main.rs`
-- Metrics (JWT, WebTransport, handshake, connections, MC notifications) → `observability/metrics.rs:record_mc_notification()`; catalog → `docs/observability/metrics/mh-service.md`
+- Metrics (JWT, WebTransport, handshake, connections, MC notifications, RegisterMeeting timeouts) → `observability/metrics.rs:record_mc_notification()`, `:record_register_meeting_timeout()`; catalog → `docs/observability/metrics/mh-service.md`; timeout fire site → `webtransport/connection.rs` (provisional-accept timeout arm, not cancel arm)
 - Health probes (port 8083) → `observability/health.rs`; K8s → `infra/services/mh-service/`
 - Dockerfile → `infra/docker/mh-service/Dockerfile`; NetworkPolicy → `infra/services/mh-service/network-policy.yaml`
 
