@@ -27,7 +27,7 @@
 - WebTransport connection handler (JWT read, provisional accept, MC notifications) → `crates/mh-service/src/webtransport/connection.rs`
 - Health + readiness endpoints → `crates/mh-service/src/observability/health.rs`
 - Prometheus metric recorders (mh_jwt_validations_total, mh_caller_type_rejected_total, mh_register_meeting_timeouts_total, etc.) → `crates/mh-service/src/observability/metrics.rs`
-- RegisterMeeting timeout fire site → `crates/mh-service/src/webtransport/connection.rs:record_register_meeting_timeout`
+- RegisterMeeting timeout fire site (provisional-accept select helper; behavioral tests enforce metric-only-on-timeout invariant) → `crates/mh-service/src/webtransport/connection.rs:await_meeting_registration`
 - MH metrics catalog → `docs/observability/metrics/mh-service.md`
 
 ## Media Protocol

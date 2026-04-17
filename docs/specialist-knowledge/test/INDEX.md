@@ -47,6 +47,7 @@
 - gRPC handler tests (RegisterMeeting validation, SessionManagerHandle integration) -> `crates/mh-service/src/grpc/mh_service.rs:tests`
 - Session manager actor tests (handle API, registration, connections, pending promotion, notify via oneshot) -> `crates/mh-service/src/session/mod.rs:tests`
 - WebTransport server + connection handler -> `crates/mh-service/src/webtransport/server.rs`, `connection.rs`
+- WebTransport provisional-accept select arms (await_meeting_registration timeout/cancel/registered, local DebuggingRecorder per-test) -> `crates/mh-service/src/webtransport/connection.rs:tests`
 - Health + metrics tests -> `crates/mh-service/src/observability/health.rs:tests`, `metrics.rs:tests`
 - McClient tests (construction, auth, retry constants, endpoint errors) -> `crates/mh-service/src/grpc/mc_client.rs:tests`
 - MC notification integration tests (mock MediaCoordinationService, retry, auth short-circuit) -> `crates/mh-service/tests/mc_client_integration.rs`
