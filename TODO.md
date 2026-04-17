@@ -39,6 +39,65 @@ Post-migration of `mc-alerts.yaml` to ADR-0031 strict compliance (devloop 2026-0
 
 Owner: `meeting-controller` specialist. No deadline; non-blocking.
 
+## ADR-0031 label-canonicalization follow-ups
+
+Non-blocking coordinated renames surfaced during the 2026-04-17
+ADR-0031 Prereq #3 devloop (metric-labels guard + taxonomy). Each rename
+requires a **coordinated migration** across four surfaces atomically:
+
+1. `crates/<svc>-service/src/observability/metrics.rs` — rename the label key.
+2. `infra/grafana/dashboards/<svc>-*.json` — update every PromQL `expr` that
+   selects on the old label.
+3. `infra/docker/prometheus/rules/<svc>-alerts.yaml` — update every alert
+   `expr` that selects on the old label.
+4. `infra/docker/alertmanager/*.yaml` routing config if any rule matches on
+   the renamed label.
+
+A staged rename (old + new both emitted for one deploy cycle, queries
+updated, then old removed) avoids a visibility gap but takes two PRs per
+service. Single-atomic-PR is acceptable with a deploy-window announcement.
+Guards will catch missing dashboard/alert updates: `validate-dashboard-panels.sh`
+and `validate-alert-rules.sh` fail on references to removed metrics/labels.
+
+Canonical-name target list lives in
+`docs/observability/label-taxonomy.md` §Shared Label Names (reviewer-only).
+
+### AC `path` / GC `endpoint` → canonical `endpoint`
+
+- Affected metrics: `ac_http_requests_total`, `ac_http_request_duration_seconds`,
+  `gc_http_requests_total`, `gc_http_request_duration_seconds`.
+- Ripple: every HTTP-route panel/alert in `ac-*.json`, `gc-*.json`,
+  `ac-alerts.yaml`, `gc-alerts.yaml`.
+- GC's `status` (categorized `success`/`error`/`timeout`) also drifts from
+  AC's raw `status_code`. Consider aligning on both at once — emit
+  `status_code` (raw) + `status_category` (categorized) from GC, drop the
+  overloaded `status`. AC already emits `status_code`; no AC change needed.
+
+Owners: `auth-controller` + `global-controller` specialists (coordinate).
+No deadline; non-blocking.
+
+### MC bare `type` → `heartbeat_type`
+
+- Affected metrics: `mc_gc_heartbeats_total` (label `type`),
+  `mc_gc_heartbeat_latency_seconds` (label `type`).
+- Ripple: any MC heartbeat panel/alert that selects on `type`. The bare
+  `type` name shadows a very generic identifier and makes cross-service
+  dashboards ambiguous (e.g., grouping by `type` across metrics would mix
+  heartbeat-type with unrelated dimensions).
+
+Owner: `meeting-controller` specialist. No deadline; non-blocking.
+
+### MC + MH `event` / AC `event_type` → canonical `event_type`
+
+- Affected metrics: `mc_mh_notifications_received_total` (`event`),
+  `mh_mc_notifications_total` (`event`), `ac_audit_log_failures_total`
+  (`event_type`).
+- Ripple: MC + MH notification dashboards/alerts; AC audit-log alerts.
+- AC is already canonical — only MC and MH rename.
+
+Owners: `meeting-controller` + `media-handler` specialists (coordinate).
+No deadline; non-blocking.
+
 ## `/devloop` skill: cross-ownership friction on small changes
 
 **Seed a `/debate` — input needed from all specialists before changing the skill.**
