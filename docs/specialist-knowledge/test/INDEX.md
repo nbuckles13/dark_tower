@@ -49,11 +49,13 @@
 - WebTransport server + connection handler -> `crates/mh-service/src/webtransport/server.rs`, `connection.rs`
 - WebTransport provisional-accept select arms (await_meeting_registration timeout/cancel/registered, local DebuggingRecorder per-test) -> `crates/mh-service/src/webtransport/connection.rs:tests`
 - Health + metrics tests -> `crates/mh-service/src/observability/health.rs:tests`, `metrics.rs:tests`
-- McClient tests (construction, auth, retry constants, endpoint errors) -> `crates/mh-service/src/grpc/mc_client.rs:tests`
-- MC notification integration tests (mock MediaCoordinationService, retry, auth short-circuit) -> `crates/mh-service/tests/mc_client_integration.rs`
-- WebTransport notification wiring (connect, disconnect, fire-and-forget) -> `crates/mh-service/src/webtransport/connection.rs:spawn_notify_connected()`
-- MC notification metrics -> `crates/mh-service/src/observability/metrics.rs:record_mc_notification()`
+- McClient tests + MC notification integration (mock MediaCoordinationService, retry, auth short-circuit) -> `crates/mh-service/src/grpc/mc_client.rs:tests`, `tests/mc_client_integration.rs`
+- WebTransport notification wiring + metrics -> `crates/mh-service/src/webtransport/connection.rs:spawn_notify_connected()`, `src/observability/metrics.rs:record_mc_notification()`
 - GC integration tests (registration, load reports, NOT_FOUND) -> `crates/mh-service/tests/gc_integration.rs`
+- Auth layer integration (MhAuthLayer + MhMediaService, JWKS upgrade, alg-none/HS256 confusion) -> `crates/mh-service/tests/auth_layer_integration.rs`
+- RegisterMeeting integration (happy path over wire, InvalidArgument) -> `crates/mh-service/tests/register_meeting_integration.rs`
+- WebTransport integration (JWT accept path, provisional timeout ±survival, MC connect/disconnect notify) -> `crates/mh-service/tests/webtransport_integration.rs`
+- Shared rigs (TestKeypair, JWKS, gRPC, WebTransport+self-signed TLS, MC mock, token minters) -> `crates/mh-service/tests/common/`
 
 ## Code Locations: Environment Tests
 - Cluster bootstrap + fixtures → `crates/env-tests/src/`, flows (20-24) → `crates/env-tests/tests/`

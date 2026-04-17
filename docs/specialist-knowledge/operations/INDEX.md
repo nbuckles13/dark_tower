@@ -57,6 +57,7 @@
 - MH gRPC (service, GC client, MC client, JWKS auth) → `crates/mh-service/src/grpc/mh_service.rs`, `gc_client.rs`, `mc_client.rs`, `auth_interceptor.rs`
 - MH→MC notifications (fire-and-forget) → `crates/mh-service/src/webtransport/connection.rs:spawn_notify_connected()`; tests → `tests/mc_client_integration.rs`
 - MH WebTransport + session mgmt → `crates/mh-service/src/webtransport/server.rs`, `connection.rs`, `session/mod.rs`
+- MH crate integration tests + shared rigs (RAII Drop, `127.0.0.1:0`) → `crates/mh-service/tests/` (`auth_layer_integration.rs`, `register_meeting_integration.rs`, `webtransport_integration.rs`, `common/`)
 
 ## MC Service
 - MC startup + gRPC server wiring → `crates/mc-service/src/main.rs`; config → `crates/mc-service/src/config.rs`

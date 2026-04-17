@@ -49,16 +49,12 @@
 - Config (ac_jwks_url, max_connections, register_meeting_timeout) → `config.rs:Config`
 - Error type (thiserror, bounded labels) → `errors.rs:MhError`
 - Auth: JWT validator → `auth/mod.rs:MhJwtValidator`; interceptor → `grpc/auth_interceptor.rs:MhAuthInterceptor`; auth layer (async JWKS, scope `service.write.mh`) → `grpc/auth_interceptor.rs:MhAuthLayer`
-- GC client (RegisterMH, SendLoadReport) → `grpc/gc_client.rs:GcClient`
-- MC client (MH→MC: NotifyParticipantConnected/Disconnected, per-call channel, retry) → `grpc/mc_client.rs:McClient`
-- MC client integration tests → `tests/mc_client_integration.rs`
-- gRPC stub service (MC→MH: RegisterMeeting) → `grpc/mh_service.rs:MhMediaService`
-- Session manager (registered meetings, pending connections, Notify) → `session/mod.rs:SessionManager`
-- WebTransport: server (TLS, capacity, McClient) → `webtransport/server.rs:WebTransportServer`; connection (JWT, provisional accept, MC notifications) → `webtransport/connection.rs:handle_connection()`, `spawn_notify_connected()`; provisional-accept select helper (Registered/Timeout/Cancelled outcomes, owns cleanup + metric) → `webtransport/connection.rs:await_meeting_registration()`
-- Startup wiring (JWKS, SessionManager, WebTransport, MhAuthLayer, McClient) → `main.rs`
-- Metrics (JWT, WebTransport, handshake, connections, MC notifications, RegisterMeeting timeouts) → `observability/metrics.rs:record_mc_notification()`, `:record_register_meeting_timeout()`; catalog → `docs/observability/metrics/mh-service.md`; timeout fire site → `webtransport/connection.rs:await_meeting_registration()` (timeout arm only, invariant enforced by co-located behavioral tests)
-- Health probes (port 8083) → `observability/health.rs`; K8s → `infra/services/mh-service/`
-- Dockerfile → `infra/docker/mh-service/Dockerfile`; NetworkPolicy → `infra/services/mh-service/network-policy.yaml`
+- GC client → `grpc/gc_client.rs:GcClient`; MC client (MH→MC notify, per-call channel, retry) → `grpc/mc_client.rs:McClient`
+- gRPC stub service (MC→MH: RegisterMeeting) → `grpc/mh_service.rs:MhMediaService`; Session manager → `session/mod.rs:SessionManager`
+- WebTransport: server → `webtransport/server.rs:WebTransportServer`; connection (JWT, provisional, MC notify) → `webtransport/connection.rs:handle_connection()`
+- Startup wiring → `main.rs`; Metrics → `observability/metrics.rs`; catalog → `docs/observability/metrics/mh-service.md`
+- Integration tests → `tests/{gc,mc_client,auth_layer,register_meeting,webtransport}_integration.rs`; shared rigs → `tests/common/{grpc_rig,jwks_rig,mock_mc,wt_rig,wt_client,tokens}.rs`
+- Health + K8s → `observability/health.rs`, `infra/services/mh-service/`, `infra/docker/mh-service/Dockerfile`
 
 ## Code Locations — Common
 - JWT (errors, claims, validator, JWKS, HasIat) → `crates/common/src/jwt.rs`

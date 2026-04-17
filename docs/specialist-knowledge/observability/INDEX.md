@@ -12,7 +12,7 @@
 - AC metrics -> `crates/ac-service/src/observability/metrics.rs:init_metrics_recorder()`, gauge init `services/key_management_service.rs:init_key_metrics()`, HTTP middleware `middleware/http_metrics.rs`, rate limit config `config.rs`
 - GC metrics -> `crates/gc-service/src/observability/metrics.rs`, HTTP middleware `middleware/http_metrics.rs:normalize_endpoint()`, join wiring `handlers/meetings.rs:join_meeting()`, DB metrics `repositories/`; gap: `get_guest_token()` uninstrumented
 - MC metrics -> `crates/mc-service/src/observability/metrics.rs`; recording sites: `webtransport/connection.rs:handle_connection()`, `server.rs:accept_loop()`, `grpc/mh_client.rs:register_meeting()`, `grpc/media_coordination.rs` (mc_mh_notifications_received_total, mc_media_connection_failures_total); bounded labels `errors.rs:error_type_label()`
-- MH metrics (registration, heartbeat, token refresh, gRPC, WebTransport, JWT, RegisterMeeting timeouts R-26) -> `crates/mh-service/src/observability/metrics.rs`; recording sites: `webtransport/server.rs:accept_loop()`, `webtransport/connection.rs:handle_connection()`, `webtransport/connection.rs:await_meeting_registration()` (provisional-accept select helper; `mh_register_meeting_timeouts_total` fires only on timeout arm — enforced by co-located behavioral tests), `grpc/auth_interceptor.rs:MhAuthService`
+- MH metrics -> `crates/mh-service/src/observability/metrics.rs`; recording sites: `webtransport/server.rs:accept_loop()`, `webtransport/connection.rs:handle_connection()`, `grpc/auth_interceptor.rs:MhAuthService`, `grpc/mc_client.rs`
 
 ## Auth & JWT Tracing
 - Common JWT (JwksClient, JwtValidator, verify_token, PII-redacted Debug) -> `crates/common/src/jwt.rs`
@@ -54,14 +54,12 @@
 - Kind config template (listenAddress: ${HOST_GATEWAY_IP}, dynamic observability ports) -> `infra/kind/kind-config.yaml.tmpl`
 - Port map (prometheus, grafana, loki port discovery) -> `/tmp/devloop-{slug}/ports.json`
 - Port-map.env (observability + WebTransport port shell vars) -> `crates/devloop-helper/src/commands.rs:write_port_map_shell()`
-- Status command (cluster health, pod readiness, checked_at) -> `crates/devloop-helper/src/commands.rs:cmd_status()`
-- Pod health parsing (pure function, unit-testable) -> `crates/devloop-helper/src/commands.rs:parse_pod_health()`
+- Status command + pod health parsing -> `crates/devloop-helper/src/commands.rs:cmd_status()`, `parse_pod_health()`
 - Status client display (health summary from result data) -> `infra/devloop/dev-cluster` (status post-command section)
 - Helper audit log (JSONL, all commands including status) -> `crates/devloop-helper/src/logging.rs:AuditLog`
 - Devloop.sh infrastructure health check (re-entry) -> `infra/devloop/devloop.sh` (ADR-0030 Step 6 section)
 - Eager setup background log -> `/tmp/devloop-{slug}/eager-setup.log`
-- Env-tests observability (URL config, validation) -> `crates/env-tests/src/cluster.rs:ClusterPorts::from_env()`, `crates/env-tests/tests/30_observability.rs`
-- Layer 8 env-test integration (validation pipeline) -> `.claude/skills/devloop/SKILL.md` (Layer 8 section)
+- Env-tests observability + Layer 8 validation pipeline -> `crates/env-tests/src/cluster.rs:ClusterPorts::from_env()`, `crates/env-tests/tests/30_observability.rs`, `.claude/skills/devloop/SKILL.md` (Layer 8)
 
 ## Guards
 - Metric-to-dashboard coverage -> `scripts/guards/simple/validate-application-metrics.sh`
@@ -73,4 +71,6 @@
 - GC scenarios 8-9 + join failure triage -> `docs/runbooks/gc-incident-response.md`, `docs/observability/alerts.md`
 
 ## Test Coverage & Integration Seams
-- Per-service metrics tests -> `crates/gc-service/src/observability/metrics.rs`, `crates/mc-service/src/observability/metrics.rs`, `crates/mh-service/src/observability/metrics.rs`; Deferred MC label-value assertion convention -> `docs/TODO.md:78`
+- Per-service metrics tests -> `crates/gc-service/src/observability/metrics.rs`, `crates/mc-service/src/observability/metrics.rs`, `crates/mh-service/src/observability/metrics.rs`
+- MH integration rigs exercising metric-emitting paths (JWT, MC-notify, handshake, caller-type) -> `crates/mh-service/tests/` (auth_layer, register_meeting, webtransport integration; shared rigs under `common/`)
+- Observability coverage gaps / follow-ups -> `docs/specialist-knowledge/observability/TODO.md`
