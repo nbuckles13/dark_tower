@@ -1,4 +1,4 @@
-# Lenient-mode fixture: severity typo 'criitcal'. Must still fail even under lenient mode.
+# Fixture: severity typo 'criitcal'. Must fail (typo not in allowed severity set).
 groups:
   - name: fx-legacy
     rules:

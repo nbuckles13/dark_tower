@@ -673,8 +673,6 @@ required; `impact` recommended) and the `labels.severity` / `service` /
 `component` requirements.
 
 Note: `labels.severity` must be in `{page, warning, info}` per ADR-0031.
-Legacy `critical` label survives on grandfathered files until migration
-(see [TODO.md §ADR-0031 Alert Migration](../../TODO.md)).
 
 ### 3. Threshold Selection
 
@@ -692,7 +690,7 @@ Match `for:` to the `rate()` window where applicable.
 
 See [alert-conventions.md §annotation-hygiene](./alert-conventions.md#annotation-hygiene)
 for the `runbook_url` format rule. Must be repo-relative under
-`docs/runbooks/` (guard-enforced in strict mode). Every runbook should cover:
+`docs/runbooks/` (guard-enforced). Every runbook should cover:
 symptom, impact, diagnosis, mitigation, escalation.
 
 ---

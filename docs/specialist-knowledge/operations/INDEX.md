@@ -8,7 +8,7 @@
 
 ## CI & Guards
 - CI pipeline → `.github/workflows/ci.yml`; runner + common → `scripts/guards/run-guards.sh`, `common.sh`
-- Kustomize → `scripts/guards/simple/validate-kustomize.sh`; app metrics (metric↔dashboard) → `validate-application-metrics.sh`; alert-rules → `validate-alert-rules.sh`, `alert-rules.legacy-allowlist`, conventions → `docs/observability/alert-conventions.md`
+- Kustomize → `scripts/guards/simple/validate-kustomize.sh`; app metrics (metric↔dashboard) → `validate-application-metrics.sh`; alert-rules → `validate-alert-rules.sh`, conventions → `docs/observability/alert-conventions.md`
 - Metric-test coverage guard (`validate-metric-coverage.sh`, single presence check; lead sequences per-service backfill PRs during phasing window; MH ✓ + MC ✓ + AC ✓ + GC ✓ (all four `0 uncovered` after ADR-0032 Step 5, 2026-04-27 — `run-guards.sh` fully GREEN on `feature/mh-quic-mh-tests`, branch ready to merge) → ADR-0032
 
 ## Devloop Cluster Helper
