@@ -190,19 +190,42 @@ sum(rate(mh_mc_notifications_total[5m]))
 
 ---
 
+## RegisterMeeting Metrics
+
+### `mh_register_meeting_timeouts_total`
+- **Type**: Counter
+- **Description**: Count of provisional WebTransport connections disconnected because `RegisterMeeting` did not arrive within the configured timeout (R-26). Fires only from the provisional-accept timeout arm in `webtransport::connection::handle_connection`; shutdown-driven cancellation does not increment this counter.
+- **Labels**: None
+- **Cardinality**: 1
+- **Usage**: Detect MC → MH `RegisterMeeting` latency issues or client-side sequencing bugs (client connected before MC finished assignment). A non-zero value is actionable.
+
+**PromQL example** (per ADR-0029 — low-rate lifecycle counter, prefer `increase`):
+```promql
+# Count panel — how many timeouts in the window? (ADR-0029 Category A)
+increase(mh_register_meeting_timeouts_total[$__rate_interval])
+```
+
+> **R-26 RegisterMeeting receipt signal**: the user story mentions an `mh_register_meeting_total` metric. That signal is served by the transport-level `mh_grpc_requests_total{method="register_meeting"}` counter (see below) — no separate business-level counter was added, since it would duplicate call-site recordings with identical totals.
+
+---
+
 ## Incoming gRPC Metrics
 
 ### `mh_grpc_requests_total`
 - **Type**: Counter
-- **Description**: Total incoming gRPC requests from MC
+- **Description**: Total incoming gRPC requests from MC (all methods). Also serves as R-26's `RegisterMeeting` receipt counter when filtered by `method="register_meeting"`.
 - **Labels**:
-  - `method`: RPC method (`register`, `route_media`, `stream_telemetry`)
+  - `method`: RPC method (`register`, `register_meeting`, `route_media`, `stream_telemetry`)
   - `status`: Outcome (`success`, `error`)
-- **Cardinality**: Low (6 = 3 methods x 2 statuses)
-- **Usage**: Monitor MC→MH traffic volume and error rates
+- **Cardinality**: Low (8 = 4 methods x 2 statuses)
+- **Usage**: Monitor MC→MH traffic volume and error rates across all gRPC methods.
 
-**PromQL example** - error rate by method:
+**PromQL examples** (per ADR-0029):
 ```promql
+# Count panel — how many RegisterMeeting receipts by outcome?
+increase(mh_grpc_requests_total{method="register_meeting"}[$__rate_interval])
+
+# Ratio panel — error rate by method (ratio requires rate/rate)
 rate(mh_grpc_requests_total{status="error"}[5m])
 ```
 

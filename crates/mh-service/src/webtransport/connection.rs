@@ -216,6 +216,7 @@ pub async fn handle_connection(
                     meeting_id = %meeting_id,
                     "RegisterMeeting timeout expired, disconnecting client"
                 );
+                metrics::record_register_meeting_timeout();
                 session_manager
                     .remove_pending_connection(meeting_id, &connection_id)
                     .await;

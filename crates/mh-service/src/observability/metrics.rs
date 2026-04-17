@@ -171,6 +171,26 @@ pub fn set_active_connections(count: f64) {
     gauge!("mh_active_connections").set(count);
 }
 
+/// Record a `RegisterMeeting` provisional-accept timeout (R-26).
+///
+/// Metric: `mh_register_meeting_timeouts_total`
+/// Labels: none
+/// Cardinality: 1
+///
+/// Fires from the provisional-accept timeout arm in
+/// `webtransport::connection::handle_connection` when a WebTransport client
+/// was accepted before MC finished assigning the meeting to this MH, and
+/// `MC::RegisterMeeting` did not arrive within the configured
+/// `register_meeting_timeout`. The connection is then disconnected.
+///
+/// Does NOT fire on shutdown-driven cancellation (separate arm).
+///
+/// A non-zero rate signals MC → MH `RegisterMeeting` latency issues or a
+/// client-side sequencing bug (client connected before MC finished assignment).
+pub fn record_register_meeting_timeout() {
+    counter!("mh_register_meeting_timeouts_total").increment(1);
+}
+
 /// Record an MC notification delivery attempt (R-16/R-17).
 ///
 /// Metric: `mh_mc_notifications_total`
@@ -341,6 +361,12 @@ mod tests {
             "global-controller",
         );
         record_caller_type_rejected("MediaHandlerService", "meeting-controller", "unknown");
+    }
+
+    #[test]
+    fn test_record_register_meeting_timeout() {
+        record_register_meeting_timeout();
+        record_register_meeting_timeout();
     }
 
     #[test]
