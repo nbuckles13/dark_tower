@@ -19,6 +19,7 @@ use crate::session::{ConnectionEntry, PendingConnection, SessionManagerHandle};
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use wtransport::endpoint::IncomingSession;
@@ -26,6 +27,80 @@ use wtransport::stream::RecvStream;
 
 /// Maximum size for a single framed message (64KB).
 const MAX_MESSAGE_SIZE: usize = 64 * 1024;
+
+/// Outcome of awaiting a `RegisterMeeting` notification for a provisional
+/// connection. Drives the caller's dispatch in [`handle_connection`].
+#[derive(Debug)]
+enum RegistrationOutcome {
+    /// `RegisterMeeting` arrived before the timeout; the pending connection
+    /// was promoted by `SessionManager`. Caller should notify MC.
+    Registered,
+    /// The provisional-accept timeout expired before `RegisterMeeting`
+    /// arrived. `mh_register_meeting_timeouts_total` has been recorded and
+    /// the pending connection has been removed. Caller should return
+    /// `MhError::MeetingNotRegistered`.
+    Timeout,
+    /// The cancellation token fired (server shutdown). The pending
+    /// connection has been removed. Caller should return `Ok(())`.
+    Cancelled,
+}
+
+/// Await one of three outcomes for a provisional WebTransport connection:
+/// `RegisterMeeting` arrives, the timeout expires, or the server shuts down.
+///
+/// On `Timeout`, records `mh_register_meeting_timeouts_total` and removes
+/// the pending connection from `SessionManager`. On `Cancelled`, removes
+/// the pending connection. On `Registered`, leaves MC notification to the
+/// caller so MC-client I/O stays out of this helper (keeps the helper
+/// unit-testable with only `SessionManagerHandle` + `CancellationToken`).
+///
+/// The metric fires ONLY on the timeout arm — this is the invariant the
+/// unit tests in this module enforce.
+#[must_use]
+async fn await_meeting_registration(
+    session_manager: &SessionManagerHandle,
+    meeting_id: &str,
+    connection_id: &str,
+    notify: &Notify,
+    register_meeting_timeout: Duration,
+    cancel_token: &CancellationToken,
+) -> RegistrationOutcome {
+    tokio::select! {
+        () = notify.notified() => {
+            info!(
+                target: "mh.webtransport.connection",
+                connection_id = %connection_id,
+                meeting_id = %meeting_id,
+                "Pending connection promoted after RegisterMeeting"
+            );
+            RegistrationOutcome::Registered
+        }
+        () = tokio::time::sleep(register_meeting_timeout) => {
+            warn!(
+                target: "mh.webtransport.connection",
+                connection_id = %connection_id,
+                meeting_id = %meeting_id,
+                "RegisterMeeting timeout expired, disconnecting client"
+            );
+            metrics::record_register_meeting_timeout();
+            session_manager
+                .remove_pending_connection(meeting_id, connection_id)
+                .await;
+            RegistrationOutcome::Timeout
+        }
+        () = cancel_token.cancelled() => {
+            debug!(
+                target: "mh.webtransport.connection",
+                connection_id = %connection_id,
+                "Provisional connection cancelled during shutdown"
+            );
+            session_manager
+                .remove_pending_connection(meeting_id, connection_id)
+                .await;
+            RegistrationOutcome::Cancelled
+        }
+    }
+}
 
 /// Handle an incoming WebTransport connection.
 ///
@@ -188,16 +263,17 @@ pub async fn handle_connection(
         let notify = session_manager.add_pending_connection(pending).await;
 
         // Wait for either: RegisterMeeting notification, timeout, or cancellation
-        tokio::select! {
-            () = notify.notified() => {
-                // RegisterMeeting arrived — connection was promoted by SessionManager
-                info!(
-                    target: "mh.webtransport.connection",
-                    connection_id = %connection_id,
-                    meeting_id = %meeting_id,
-                    "Pending connection promoted after RegisterMeeting"
-                );
-
+        match await_meeting_registration(
+            &session_manager,
+            meeting_id,
+            &connection_id,
+            &notify,
+            register_meeting_timeout,
+            &cancel_token,
+        )
+        .await
+        {
+            RegistrationOutcome::Registered => {
                 // Notify MC about the now-promoted connection (best-effort)
                 spawn_notify_connected(
                     &mc_client,
@@ -208,32 +284,11 @@ pub async fn handle_connection(
                 )
                 .await;
             }
-            () = tokio::time::sleep(register_meeting_timeout) => {
-                // Timeout expired — disconnect client
-                warn!(
-                    target: "mh.webtransport.connection",
-                    connection_id = %connection_id,
-                    meeting_id = %meeting_id,
-                    "RegisterMeeting timeout expired, disconnecting client"
-                );
-                metrics::record_register_meeting_timeout();
-                session_manager
-                    .remove_pending_connection(meeting_id, &connection_id)
-                    .await;
+            RegistrationOutcome::Timeout => {
                 // No MC disconnect notification — connection was never established with MC
-                return Err(MhError::MeetingNotRegistered(
-                    meeting_id.clone(),
-                ));
+                return Err(MhError::MeetingNotRegistered(meeting_id.clone()));
             }
-            () = cancel_token.cancelled() => {
-                debug!(
-                    target: "mh.webtransport.connection",
-                    connection_id = %connection_id,
-                    "Provisional connection cancelled during shutdown"
-                );
-                session_manager
-                    .remove_pending_connection(meeting_id, &connection_id)
-                    .await;
+            RegistrationOutcome::Cancelled => {
                 return Ok(());
             }
         }
@@ -419,4 +474,179 @@ async fn read_framed_message(stream: &mut RecvStream) -> Result<bytes::Bytes, Mh
     })?;
 
     Ok(bytes::Bytes::from(buf))
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    //! Behavioral tests for [`await_meeting_registration`].
+    //!
+    //! Each test isolates metric recording via
+    //! `::metrics::set_default_local_recorder` (RAII thread-local guard).
+    //! `#[tokio::test]` uses the current-thread runtime, so the helper
+    //! runs on the same thread that holds the guard, and recorder calls
+    //! made across `.await` points are captured.
+    //!
+    //! These tests enforce the invariant documented on
+    //! `::metrics::record_register_meeting_timeout`: the counter fires
+    //! ONLY on the timeout arm of `await_meeting_registration`, never on
+    //! the cancellation or registered arms.
+    //!
+    //! The timeout test uses `#[tokio::test(start_paused = true)]` for
+    //! virtual-time control: with a paused clock on a current-thread
+    //! runtime, `tokio::time::sleep` inside the helper's timeout arm is
+    //! resolved by auto-advance when all other arms (notify, cancel) are
+    //! idle, so `.await` on the helper completes in virtual — not real —
+    //! time.
+    use super::*;
+    use crate::session::PendingConnection;
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+    use metrics_util::MetricKind;
+    use std::time::Instant;
+
+    const METRIC_NAME: &str = "mh_register_meeting_timeouts_total";
+    const TEST_TIMEOUT: Duration = Duration::from_secs(15);
+    const LONG_TIMEOUT: Duration = Duration::from_secs(30);
+
+    /// Return the counter value for `mh_register_meeting_timeouts_total`,
+    /// or `None` if the counter was never recorded against this recorder.
+    fn timeout_counter_value(recorder: &DebuggingRecorder) -> Option<u64> {
+        recorder
+            .snapshotter()
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .find_map(|(composite, _unit, _desc, value)| {
+                if composite.kind() == MetricKind::Counter && composite.key().name() == METRIC_NAME
+                {
+                    match value {
+                        DebugValue::Counter(v) => Some(v),
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            })
+    }
+
+    async fn setup_pending(
+        session_manager: &SessionManagerHandle,
+        meeting_id: &str,
+        connection_id: &str,
+    ) -> Arc<Notify> {
+        session_manager
+            .add_pending_connection(PendingConnection {
+                connection_id: connection_id.to_string(),
+                meeting_id: meeting_id.to_string(),
+                participant_id: "user-1".to_string(),
+                connected_at: Instant::now(),
+            })
+            .await
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timeout_arm_records_metric_once() {
+        let recorder = DebuggingRecorder::new();
+        let _guard = ::metrics::set_default_local_recorder(&recorder);
+
+        let session_manager = SessionManagerHandle::new();
+        let meeting_id = "meeting-1";
+        let connection_id = "conn-1";
+        let notify = setup_pending(&session_manager, meeting_id, connection_id).await;
+        let cancel_token = CancellationToken::new();
+
+        // Virtual time: notify and cancel_token stay idle, so tokio's
+        // auto-advance fires the sleep arm; no real wall-clock wait.
+        let outcome = await_meeting_registration(
+            &session_manager,
+            meeting_id,
+            connection_id,
+            &notify,
+            TEST_TIMEOUT,
+            &cancel_token,
+        )
+        .await;
+
+        assert!(
+            matches!(outcome, RegistrationOutcome::Timeout),
+            "expected Timeout, got {outcome:?}"
+        );
+        assert_eq!(
+            timeout_counter_value(&recorder),
+            Some(1),
+            "timeout arm must record the counter exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_arm_does_not_record_metric() {
+        let recorder = DebuggingRecorder::new();
+        let _guard = ::metrics::set_default_local_recorder(&recorder);
+
+        let session_manager = SessionManagerHandle::new();
+        let meeting_id = "meeting-2";
+        let connection_id = "conn-2";
+        let notify = setup_pending(&session_manager, meeting_id, connection_id).await;
+        let cancel_token = CancellationToken::new();
+        // Pre-cancel: the cancelled() future resolves immediately on poll,
+        // so the cancel arm wins the select! before LONG_TIMEOUT elapses.
+        cancel_token.cancel();
+
+        let outcome = await_meeting_registration(
+            &session_manager,
+            meeting_id,
+            connection_id,
+            &notify,
+            LONG_TIMEOUT,
+            &cancel_token,
+        )
+        .await;
+
+        assert!(
+            matches!(outcome, RegistrationOutcome::Cancelled),
+            "expected Cancelled, got {outcome:?}"
+        );
+        assert!(
+            matches!(timeout_counter_value(&recorder), None | Some(0)),
+            "cancel arm must not record the timeout counter, got {:?}",
+            timeout_counter_value(&recorder)
+        );
+    }
+
+    #[tokio::test]
+    async fn registered_arm_does_not_record_metric() {
+        let recorder = DebuggingRecorder::new();
+        let _guard = ::metrics::set_default_local_recorder(&recorder);
+
+        let session_manager = SessionManagerHandle::new();
+        let meeting_id = "meeting-3";
+        let connection_id = "conn-3";
+        let notify = setup_pending(&session_manager, meeting_id, connection_id).await;
+        let cancel_token = CancellationToken::new();
+
+        // Pre-fire the Notify: its permit is held until the first
+        // `.notified()` consumes it, so the notified() future inside
+        // await_meeting_registration completes immediately on poll.
+        notify.notify_one();
+
+        let outcome = await_meeting_registration(
+            &session_manager,
+            meeting_id,
+            connection_id,
+            &notify,
+            LONG_TIMEOUT,
+            &cancel_token,
+        )
+        .await;
+
+        assert!(
+            matches!(outcome, RegistrationOutcome::Registered),
+            "expected Registered, got {outcome:?}"
+        );
+        assert!(
+            matches!(timeout_counter_value(&recorder), None | Some(0)),
+            "registered arm must not record the timeout counter, got {:?}",
+            timeout_counter_value(&recorder)
+        );
+    }
 }

@@ -54,9 +54,9 @@
 - MC client integration tests → `tests/mc_client_integration.rs`
 - gRPC stub service (MC→MH: RegisterMeeting) → `grpc/mh_service.rs:MhMediaService`
 - Session manager (registered meetings, pending connections, Notify) → `session/mod.rs:SessionManager`
-- WebTransport: server (TLS, capacity, McClient) → `webtransport/server.rs:WebTransportServer`; connection (JWT, provisional accept, MC notifications) → `webtransport/connection.rs:handle_connection()`, `spawn_notify_connected()`
+- WebTransport: server (TLS, capacity, McClient) → `webtransport/server.rs:WebTransportServer`; connection (JWT, provisional accept, MC notifications) → `webtransport/connection.rs:handle_connection()`, `spawn_notify_connected()`; provisional-accept select helper (Registered/Timeout/Cancelled outcomes, owns cleanup + metric) → `webtransport/connection.rs:await_meeting_registration()`
 - Startup wiring (JWKS, SessionManager, WebTransport, MhAuthLayer, McClient) → `main.rs`
-- Metrics (JWT, WebTransport, handshake, connections, MC notifications, RegisterMeeting timeouts) → `observability/metrics.rs:record_mc_notification()`, `:record_register_meeting_timeout()`; catalog → `docs/observability/metrics/mh-service.md`; timeout fire site → `webtransport/connection.rs` (provisional-accept timeout arm, not cancel arm)
+- Metrics (JWT, WebTransport, handshake, connections, MC notifications, RegisterMeeting timeouts) → `observability/metrics.rs:record_mc_notification()`, `:record_register_meeting_timeout()`; catalog → `docs/observability/metrics/mh-service.md`; timeout fire site → `webtransport/connection.rs:await_meeting_registration()` (timeout arm only, invariant enforced by co-located behavioral tests)
 - Health probes (port 8083) → `observability/health.rs`; K8s → `infra/services/mh-service/`
 - Dockerfile → `infra/docker/mh-service/Dockerfile`; NetworkPolicy → `infra/services/mh-service/network-policy.yaml`
 

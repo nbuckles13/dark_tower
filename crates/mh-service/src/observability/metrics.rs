@@ -177,13 +177,16 @@ pub fn set_active_connections(count: f64) {
 /// Labels: none
 /// Cardinality: 1
 ///
-/// Fires from the provisional-accept timeout arm in
-/// `webtransport::connection::handle_connection` when a WebTransport client
-/// was accepted before MC finished assigning the meeting to this MH, and
-/// `MC::RegisterMeeting` did not arrive within the configured
-/// `register_meeting_timeout`. The connection is then disconnected.
+/// Fires from the timeout arm of
+/// `webtransport::connection::await_meeting_registration` when a
+/// WebTransport client was accepted before MC finished assigning the
+/// meeting to this MH, and `MC::RegisterMeeting` did not arrive within
+/// the configured `register_meeting_timeout`. The connection is then
+/// disconnected.
 ///
-/// Does NOT fire on shutdown-driven cancellation (separate arm).
+/// Does NOT fire on shutdown-driven cancellation or successful
+/// registration (separate arms). This invariant is enforced by behavioral
+/// tests co-located with the helper.
 ///
 /// A non-zero rate signals MC → MH `RegisterMeeting` latency issues or a
 /// client-side sequencing bug (client connected before MC finished assignment).
@@ -361,12 +364,6 @@ mod tests {
             "global-controller",
         );
         record_caller_type_rejected("MediaHandlerService", "meeting-controller", "unknown");
-    }
-
-    #[test]
-    fn test_record_register_meeting_timeout() {
-        record_register_meeting_timeout();
-        record_register_meeting_timeout();
     }
 
     #[test]
