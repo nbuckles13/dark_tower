@@ -1,0 +1,15 @@
+# Strict-mode fixture: runbook path repo-relative but file does not exist. Must fail.
+groups:
+  - name: fx-page
+    rules:
+      - alert: FxNonexistentRunbook
+        expr: up == 0
+        for: 1m
+        labels:
+          severity: page
+          service: fx-service
+        annotations:
+          summary: "Fx down"
+          description: "Fx is down."
+          impact: "User-visible."
+          runbook_url: "docs/runbooks/definitely-does-not-exist.md#some-anchor"

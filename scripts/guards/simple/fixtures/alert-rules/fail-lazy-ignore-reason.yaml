@@ -1,0 +1,17 @@
+# Strict-mode fixture: guard:ignore reason is too short/vague. Must fail.
+# The lazy reason should be rejected, so the underlying hygiene violation still fires.
+groups:
+  - name: fx-page
+    rules:
+      # guard:ignore(todo)
+      - alert: FxLazyIgnore
+        expr: up == 0
+        for: 1m
+        labels:
+          severity: page
+          service: fx-service
+        annotations:
+          summary: "Fx unreachable"
+          description: "Cannot reach 10.20.30.40 from the Fx pod."
+          impact: "User-visible."
+          runbook_url: "docs/runbooks/gc-incident-response.md#scenario-4-complete-service-outage"

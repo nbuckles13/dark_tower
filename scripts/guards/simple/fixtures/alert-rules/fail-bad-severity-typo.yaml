@@ -1,0 +1,15 @@
+# Lenient-mode fixture: severity typo 'criitcal'. Must still fail even under lenient mode.
+groups:
+  - name: fx-legacy
+    rules:
+      - alert: FxSeverityTypo
+        expr: up == 0
+        for: 1m
+        labels:
+          severity: criitcal
+          service: fx-service
+        annotations:
+          summary: "Fx down"
+          description: "Fx is down."
+          impact: "User-visible."
+          runbook_url: "https://example.com/runbooks/fx.md"

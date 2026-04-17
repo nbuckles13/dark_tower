@@ -1,0 +1,15 @@
+# Strict-mode fixture: severity 'critical' (not in allowed set). Must fail.
+groups:
+  - name: fx-page
+    rules:
+      - alert: FxBadSeverity
+        expr: up == 0
+        for: 1m
+        labels:
+          severity: critical
+          service: fx-service
+        annotations:
+          summary: "Fx down"
+          description: "Fx is down."
+          impact: "User-visible."
+          runbook_url: "docs/runbooks/gc-incident-response.md#scenario-4-complete-service-outage"

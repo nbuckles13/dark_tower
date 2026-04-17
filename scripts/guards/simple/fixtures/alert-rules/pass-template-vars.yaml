@@ -1,0 +1,15 @@
+# Strict-mode fixture: Go templating whitelisted. Must pass.
+groups:
+  - name: fx-page
+    rules:
+      - alert: FxTemplatingOK
+        expr: up{job="fx"} == 0
+        for: 1m
+        labels:
+          severity: page
+          service: fx-service
+        annotations:
+          summary: "Fx pod {{ $labels.pod }} down ({{ $value }})"
+          description: "Pod {{ $labels.pod }} in namespace {{ $labels.namespace }} has been down; last seen value {{ $value | humanizePercentage }}."
+          impact: "User-visible impact on {{ $labels.service }}."
+          runbook_url: "docs/runbooks/gc-incident-response.md#scenario-4-complete-service-outage"

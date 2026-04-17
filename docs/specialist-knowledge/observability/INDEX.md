@@ -7,6 +7,7 @@
 - Dashboard metric presentation (counters vs rates, increase/rate classification) -> ADR-0029
 - Host-side cluster helper (observability access, port discovery, health gating, listenAddress fix) -> ADR-0030
 - Metric testability (component tests + `MetricAssertion` helper + presence guard) -> ADR-0032
+- Service-owned dashboards and alerts (collapsed Phase 4, observability as cross-cutting reviewer) -> ADR-0031
 
 ## Metrics
 - Metric catalogs -> `docs/observability/metrics/ac-service.md`, `docs/observability/metrics/gc-service.md`, `docs/observability/metrics/mc-service.md`, `docs/observability/metrics/mh-service.md`
@@ -40,10 +41,9 @@
 ## Dashboards, Alerts & Infrastructure
 - Grafana dashboards (per-service overview, errors-overview, SLOs) -> `infra/grafana/dashboards/`, provisioning `infra/grafana/provisioning/`; MC MH Communication row -> `mc-overview.json` (panels: RegisterMeeting RPC Rate, Latency P50/P95/P99)
 - Grafana K8s (configMapGenerator, sidecar, RBAC) -> `infra/kubernetes/observability/grafana/`
-- Alert rules (GC, MC) -> `infra/docker/prometheus/rules/{gc,mc}-alerts.yaml` (incl. MCMediaConnectionAllFailed); docs -> `docs/observability/alerts.md`, `docs/observability/dashboards.md`
-- Prometheus config -> `infra/docker/prometheus/prometheus.yml` (compose), `infra/kubernetes/observability/prometheus-config.yaml` (K8s)
+- Alert rules (GC, MC) -> `infra/docker/prometheus/rules/{gc,mc}-alerts.yaml`, template -> `_template-service-alerts.yaml`; conventions -> `docs/observability/alert-conventions.md`; docs -> `docs/observability/alerts.md`, `dashboards.md`
+- Prometheus config -> `infra/docker/prometheus/prometheus.yml` (compose), `infra/kubernetes/observability/prometheus-config.yaml` (K8s); Kind NodePorts (30090/30030/30080) -> `infra/kind/kind-config.yaml`
 - Loki + observability kustomization -> `infra/kubernetes/observability/{loki-config,kustomization}.yaml`
-- Kind observability NodePorts (30090/30030/30080) -> `infra/kind/kind-config.yaml`
 - MC/MH K8s health probes + metrics scrape -> `infra/services/{mc,mh}-service/deployment.yaml`
 
 ## Kind Cluster Setup (Observability)
@@ -64,10 +64,10 @@
 - Instrument skip_all enforcement -> `scripts/guards/simple/instrument-skip-all.sh`
 - Metric-test coverage (src emission vs test reference) -> `scripts/guards/simple/validate-metric-coverage.sh`
 - MetricAssertion test helper (per-thread DebuggingRecorder; histogram-first ordering load-bearing — first `.assert_*()` of any kind drains histograms via `Snapshotter::snapshot()`, counter/gauge re-reads idempotent; `assert_unobserved` symmetric across `CounterQuery`/`GaugeQuery`/`HistogramQuery` with `ensure_no_kind_mismatch` hardening — closes ADR-0032 §F4 gauge-absence gap, histogram form must precede `assert_observation_count*` on same name+labels) -> `crates/common/src/observability/testing.rs`
+- Alert-rules lint + legacy allowlist -> `scripts/guards/simple/validate-alert-rules.sh`, `alert-rules.legacy-allowlist`
 
 ## Env-Test Observability, Cluster Config & Runbooks
-- Per-service deployment + incident response -> `docs/runbooks/` (two per service)
-- GC scenarios 8-9 + join failure triage -> `docs/runbooks/gc-incident-response.md`, `docs/observability/alerts.md`
+- Per-service deployment + incident response -> `docs/runbooks/` (two per service); GC scenarios 8-9 + join failure triage -> `gc-incident-response.md`, `docs/observability/alerts.md`
 
 ## Test Coverage & Integration Seams
 - MH/MC accept-loop component-test pattern (ADR-0032 Steps 2-3 — Step 2 canonical: real `WebTransportServer::bind()`+`accept_loop()` byte-identical to production, rcgen-PEMs-on-disk, no `results_rx`; `#[tokio::test]` current-thread + live-connection hold + histogram-first are load-bearing; `accepted`/`rejected`/`error` via `MetricAssertion` + `SessionManagerHandle` + companion `mh_jwt_validations_total` labels; sibling JWT/MC-notify/handshake/caller-type rigs. Step 3 ports template + adds `MockMhAssignmentStore`/`MockMhRegistrationClient` injection + `MeetingControllerActorHandle` + `mc_webtransport_connections_total`/`mc_jwt_validations_total`/`mc_session_join_failures_total` adjacency. Cat B token-refresh `record_token_refresh_metrics()` extracted in both services) -> `crates/mh-service/tests/common/accept_loop_rig.rs`, `crates/mh-service/tests/webtransport_accept_loop_integration.rs`, `crates/mc-service/tests/common/accept_loop_rig.rs`, `crates/mc-service/tests/webtransport_accept_loop_integration.rs`, `crates/mh-service/src/observability/metrics.rs`, `crates/mc-service/src/observability/metrics.rs`

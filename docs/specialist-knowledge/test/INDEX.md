@@ -4,7 +4,7 @@
 - Integration testing + fuzz testing strategies -> `docs/decisions/adr-0005-integration-testing-strategy.md`, `adr-0006-fuzz-testing-strategy.md`
 - Integration test infrastructure -> `docs/decisions/adr-0009-integration-test-infrastructure.md`
 - Environment integration tests -> `docs/decisions/adr-0014-environment-integration-tests.md`
-- Validation pipeline (guards, coverage) -> `docs/decisions/adr-0024-agent-teams-workflow.md`
+- Validation pipeline (guards, coverage) -> `docs/decisions/adr-0024-agent-teams-workflow.md`, `scripts/guards/run-guards.sh`; alert-rules guard (strict + lenient-legacy modes, `--self-test`, fixtures) -> `scripts/guards/simple/validate-alert-rules.sh`, `scripts/guards/simple/fixtures/alert-rules/`, `scripts/guards/simple/alert-rules.legacy-allowlist`
 - Coverage thresholds -> `.codecov.yml`
 - Client architecture (4-tier testing, test-utils, flaky policy) -> ADR-0028
 - Host-side cluster helper (env-test execution, URL config, attempt budgets, cluster networking) -> `docs/decisions/adr-0030-host-side-cluster-helper.md`

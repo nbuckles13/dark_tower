@@ -1,0 +1,15 @@
+# Both-modes fixture: for: 10s (< 30s floor). Must fail.
+groups:
+  - name: fx-page
+    rules:
+      - alert: FxShortFor
+        expr: up == 0
+        for: 10s
+        labels:
+          severity: page
+          service: fx-service
+        annotations:
+          summary: "Fx down"
+          description: "Fx is down."
+          impact: "User-visible."
+          runbook_url: "docs/runbooks/gc-incident-response.md#scenario-4-complete-service-outage"

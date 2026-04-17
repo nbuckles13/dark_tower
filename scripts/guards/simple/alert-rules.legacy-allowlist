@@ -1,0 +1,48 @@
+# Legacy allowlist — files pre-dating ADR-0031 conventions, running in lenient mode.
+#
+# Guard: scripts/guards/simple/validate-alert-rules.sh
+# Spec:  docs/decisions/adr-0031-service-owned-dashboards-alerts.md
+#
+# Lenient mode RELAXES for listed files:
+#   - runbook_url shape (absolute URLs allowed; file-existence check skipped)
+#   - severity value (extended to {page, warning, info, critical} — typos still fail)
+#
+# Lenient mode STILL ENFORCES for listed files:
+#   - runbook_url annotation present (non-empty)
+#   - severity label present (non-empty)
+#   - for: duration >= 30s
+#   - annotation hygiene (no hostnames/credentials/secrets)
+#
+# ---------------------------------------------------------------------------
+# Migration deadline: 2026-06-30. Tracked in TODO.md#adr-0031-alert-migration.
+# CI surfaces this date in every guard run.
+# ---------------------------------------------------------------------------
+#
+# NON-EXPANSION PROTOCOL
+#
+# The guard pins the expected active-line count in EXPECTED_ALLOWLIST_COUNT.
+# If the active line count (non-comment, non-blank) differs from that number,
+# the guard fails UNLESS the diff contains a line with:
+#
+#     # ALLOWLIST_EXPANSION_APPROVED_BY: <specialist-name>
+#
+# on a committed line (this file, the guard, or any PR-included file).
+#
+# Expansion (adding an entry):
+#   1) Add the filepath below
+#   2) Bump EXPECTED_ALLOWLIST_COUNT in validate-alert-rules.sh
+#   3) Add the approval marker anywhere in the PR
+#
+# Shrinkage (migration complete):
+#   1) Remove the filepath below
+#   2) Decrement EXPECTED_ALLOWLIST_COUNT in validate-alert-rules.sh
+#   The expansion marker is not required on shrinkage; the guard-source edit
+#   is the review gate.
+#
+# FORMAT
+#
+# One exact filepath per line, relative to repo root. No globs. No wildcards.
+# No directory patterns. Lines starting with '#' and blank lines are ignored.
+
+infra/docker/prometheus/rules/gc-alerts.yaml
+infra/docker/prometheus/rules/mc-alerts.yaml

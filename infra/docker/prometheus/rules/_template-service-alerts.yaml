@@ -1,0 +1,101 @@
+# Starter alert-rules template for a service. Copy to `<svc>-alerts.yaml` and
+# customize. See docs/observability/alert-conventions.md for full guidance.
+#
+# NOT LOADED BY PROMETHEUS — the `_` filename prefix excludes this file from
+# Prometheus's alert-rule load glob. Safe to keep in this directory as a
+# reference-only starter.
+#
+# Placeholders: <svc>, <Svc>, <operation>, <component>, <dependency>,
+# <scenario-anchor>. Angle-bracket form to keep them grep-able.
+#
+# This file is excluded from validate-alert-rules.sh via the `_template-*.yaml`
+# glob. After copying and substituting all `<placeholder>` tokens with real
+# values (including runbook paths that exist on disk), the resulting file
+# must pass strict mode.
+
+groups:
+  # -------------------------------------------------------------------------
+  # PAGE — user-visible impact now, or SLO burn in progress.
+  # Routes to on-call pager per docs/observability/alerts.md §routing.
+  # -------------------------------------------------------------------------
+  - name: <svc>-service-page
+    interval: 30s
+    rules:
+      - alert: <Svc>HighErrorRate
+        # Error-rate SLO alert. Fires when error rate > 1% for 5m.
+        expr: |
+          (
+            sum(rate(<svc>_<operation>_errors_total[5m]))
+            /
+            sum(rate(<svc>_<operation>_total[5m]))
+          ) > 0.01
+        # `for:` must be >= 30s. 5m is typical for steady-state SLO-derived alerts.
+        for: 5m
+        labels:
+          # Severity taxonomy: {page, warning, info}. See alert-conventions.md.
+          severity: page
+          service: <svc>-service
+          component: <component>
+        annotations:
+          # `summary` — one line with `{{ $value | ... }}` so oncall sees the number.
+          summary: "<Svc> error rate above SLO ({{ $value | humanizePercentage }})"
+          # `description` — 1-2 sentences. Explain what + why. Reference dashboards.
+          description: "<Svc> <operation> error rate is {{ $value | humanizePercentage }}, exceeding 1% SLO threshold for 5 minutes."
+          # `impact` — what the user sees and SLO consequence.
+          impact: "Requests are failing. SLO budget burning; investigate immediately."
+          # `runbook_url` MUST be repo-relative under docs/runbooks/. Absolute
+          # URLs are rejected by validate-alert-rules.sh (closes exfil-on-click
+          # vector per ADR-0031).
+          runbook_url: "docs/runbooks/<svc>-incident-response.md#<scenario-anchor>"
+
+  # -------------------------------------------------------------------------
+  # WARNING — degraded but contained, or approaching limits.
+  # Routes to Slack (non-paging) per alerts.md §routing.
+  # -------------------------------------------------------------------------
+  - name: <svc>-service-warning
+    interval: 60s
+    rules:
+      - alert: <Svc>HighMemory
+        # Resource pressure. Not a user-visible failure yet, so `warning`.
+        expr: |
+          (
+            container_memory_usage_bytes{pod=~"<svc>-service-.*"}
+            /
+            container_spec_memory_limit_bytes{pod=~"<svc>-service-.*"}
+          ) > 0.85
+        # Steady-state threshold; 10m avoids flapping.
+        for: 10m
+        labels:
+          severity: warning
+          service: <svc>-service
+          component: infrastructure
+        annotations:
+          summary: "<Svc> memory usage high ({{ $value | humanizePercentage }})"
+          description: "<Svc> pod {{ $labels.pod }} memory usage is {{ $value | humanizePercentage }} for 10 minutes."
+          impact: "Risk of OOM kill. Investigate memory usage or scale up before user impact."
+          runbook_url: "docs/runbooks/<svc>-incident-response.md#resource-pressure"
+
+  # -------------------------------------------------------------------------
+  # INFO — awareness/trend. Leading indicator when a page alert covers SLO.
+  # No notification; surfaced in dashboards only.
+  # -------------------------------------------------------------------------
+  - name: <svc>-service-info
+    interval: 60s
+    rules:
+      - alert: <Svc>SlowDependency
+        # Leading indicator for <dependency>. Info severity because the
+        # aggregate <Svc>HighLatency page alert covers the actual SLO.
+        expr: |
+          histogram_quantile(0.95,
+            sum by(le) (rate(<svc>_<dependency>_duration_seconds_bucket[5m]))
+          ) > 1.0
+        for: 5m
+        labels:
+          severity: info
+          service: <svc>-service
+          component: <dependency>
+        annotations:
+          summary: "<Svc> <dependency> p95 latency elevated ({{ $value }}s > 1s)"
+          description: "Latency to <dependency> is {{ $value }}s for 5 minutes. Leading indicator; the aggregate <Svc>HighLatency page alert covers SLO."
+          impact: "No user impact yet. Watch for escalation to the aggregate latency SLO."
+          runbook_url: "docs/runbooks/<svc>-incident-response.md#dependency-latency"

@@ -7,6 +7,7 @@
 - No-panic policy → ADR-0002 | Approved algorithms → ADR-0027
 - MC session binding & HKDF key hierarchy → ADR-0023 (Section 1)
 - Client architecture (E2EE, key management, supply chain) → ADR-0028 (Sections 5, 1)
+- Service-owned dashboards and alerts → ADR-0031 | Alert-rules guard (URL exfil closure + annotation hygiene) → `scripts/guards/simple/validate-alert-rules.sh`
 
 ## Code Locations — AC (Token Issuance & Crypto)
 - JWT signing/verification, key encryption, bcrypt → `crates/ac-service/src/crypto/mod.rs`
@@ -69,7 +70,6 @@
 - Kind NodePort listen address (`${HOST_GATEWAY_IP}`) → `infra/kind/kind-config.yaml.tmpl`; Wrapper → `infra/devloop/devloop.sh`; Dev-cluster client → `infra/devloop/dev-cluster`
 
 ## Infrastructure Secrets & Network Isolation
-- Imperative secret creation → `setup.sh:create_ac_secrets()`, `create_mc_tls_secret()`, `create_mh_secrets()`, `create_mh_tls_secret()`
-- Input validation (cluster name, DT_PORT_MAP, DT_HOST_GATEWAY_IP) → `infra/kind/scripts/setup.sh` (top), `teardown.sh` (top); ConfigMap advertise-address patching → `setup.sh:deploy_mc_service()`, `deploy_mh_service()`; Single-service rebuild allowlist → `setup.sh:deploy_only_service()`
+- Imperative secret creation → `setup.sh:create_ac_secrets()`, `create_mc_tls_secret()`, `create_mh_secrets()`, `create_mh_tls_secret()`; input validation (cluster name, DT_PORT_MAP, DT_HOST_GATEWAY_IP) → `infra/kind/scripts/setup.sh`, `teardown.sh`; ConfigMap advertise-address patching → `setup.sh:deploy_mc_service()`, `deploy_mh_service()`; single-service rebuild allowlist → `setup.sh:deploy_only_service()`
 - Network policies (per-service ingress/egress) → `infra/services/{ac,gc,mc,mh}-service/network-policy.yaml`; MC↔MH gRPC: MC→MH:50053, MH→MC:50052
 - MC/MH K8s health probes → `crates/mc-service/src/observability/health.rs`, `crates/mh-service/src/observability/health.rs`; Join-flow integration tests → `crates/mc-service/tests/`, `crates/gc-service/tests/`

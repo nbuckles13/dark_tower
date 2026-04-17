@@ -1,0 +1,16 @@
+# Strict-mode fixture: `Bearer {{ $labels.token_kind }}` is legitimate templating,
+# not a bearer-token leak. Must pass (template redaction happens before bearer scan).
+groups:
+  - name: fx-page
+    rules:
+      - alert: FxBearerTemplated
+        expr: up == 0
+        for: 1m
+        labels:
+          severity: page
+          service: fx-service
+        annotations:
+          summary: "Fx auth failed"
+          description: "Auth header sent was Bearer {{ $labels.token_kind }}; check whether credential rotation happened."
+          impact: "User-visible auth failures."
+          runbook_url: "docs/runbooks/gc-incident-response.md#scenario-4-complete-service-outage"

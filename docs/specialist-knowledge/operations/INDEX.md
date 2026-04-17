@@ -4,11 +4,11 @@
 - Infra (Kind, zero-trust) → ADR-0012; Local dev → ADR-0013; Env tests → ADR-0014
 - Guard pipeline → ADR-0015; CI gates → ADR-0024; Containerized devloop → ADR-0025
 - Host-side cluster helper → ADR-0030; Dashboard metrics (counters vs rates) → ADR-0029
-- Metric testability (single presence guard, Cat A/B/C rollout, raw `/metrics` evidence, per-service SLO sub-targets) → ADR-0032
+- Metric testability (single presence guard, Cat A/B/C rollout, raw `/metrics` evidence, per-service SLO sub-targets) → ADR-0032; service-owned dashboards/alerts (collapsed Phase 4) → ADR-0031
 
 ## CI & Guards
 - CI pipeline → `.github/workflows/ci.yml`; runner + common → `scripts/guards/run-guards.sh`, `common.sh`
-- Kustomize → `scripts/guards/simple/validate-kustomize.sh`; app metrics (metric↔dashboard) → `validate-application-metrics.sh`
+- Kustomize → `scripts/guards/simple/validate-kustomize.sh`; app metrics (metric↔dashboard) → `validate-application-metrics.sh`; alert-rules → `validate-alert-rules.sh`, `alert-rules.legacy-allowlist`, conventions → `docs/observability/alert-conventions.md`
 - Metric-test coverage guard (`validate-metric-coverage.sh`, single presence check; lead sequences per-service backfill PRs during phasing window; MH ✓ + MC ✓ + AC ✓ + GC ✓ (all four `0 uncovered` after ADR-0032 Step 5, 2026-04-27 — `run-guards.sh` fully GREEN on `feature/mh-quic-mh-tests`, branch ready to merge) → ADR-0032
 
 ## Devloop Cluster Helper
@@ -23,7 +23,7 @@
 - Kind overlay (per-service, observability) → `infra/kubernetes/overlays/kind/`
 - Per-service Kustomize bases + manifests (statefulset/deployment, netpol, PDB) → `infra/services/ac-service/`, `gc-service/`, `mc-service/`, `mh-service/`
 - Dockerfiles → `infra/docker/ac-service/`, `gc-service/`, `mc-service/`, `mh-service/`; PostgreSQL + Redis → `infra/services/postgres/`, `redis/`
-- Dev certs → `scripts/generate-dev-certs.sh`; Alert rules → `infra/docker/prometheus/rules/gc-alerts.yaml`, `mc-alerts.yaml`
+- Dev certs → `scripts/generate-dev-certs.sh`; Alert rules → `infra/docker/prometheus/rules/gc-alerts.yaml`, `mc-alerts.yaml`, template → `_template-service-alerts.yaml`
 - MC/MH per-instance Deployments + ConfigMaps (advertise addresses) → `infra/services/mc-service/mc-{0,1}-configmap.yaml`, `mh-service/mh-{0,1}-configmap.yaml`; devloop patching + DT_HOST_GATEWAY_IP validation → `infra/kind/scripts/setup.sh:deploy_mc_service()`, `deploy_mh_service()`
 - Per-pod UDP NodePorts: `base + ordinal*2` (MC: 4433/4435, MH: 4434/4436); cross-service netpol in `gc-service/network-policy.yaml`, `mc-service/network-policy.yaml`, `mh-service/network-policy.yaml`
 - Downward API: `status.podIP` → `POD_IP`; WebTransport advertise from per-instance ConfigMap

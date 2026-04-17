@@ -13,7 +13,7 @@
 
 ## Per-Service Observability (Metrics & Dashboards)
 - AC/GC/MC/MH metrics -> `crates/*/src/observability/metrics.rs` (per-service, not duplication)
-- Alert rules -> `infra/docker/prometheus/rules/{mc,gc}-alerts.yaml`; dashboards -> ADR-0029, `infra/grafana/dashboards/`
+- Alert rules -> `infra/docker/prometheus/rules/{mc,gc}-alerts.yaml`; guard + conventions -> `scripts/guards/simple/validate-alert-rules.sh`, `docs/observability/alert-conventions.md` (ADR-0031); dashboards -> ADR-0029, `infra/grafana/dashboards/`
 
 ## Integration Test Coverage
 - MC tests (join_tests, actor_metrics, auth_layer, gc, media_coordination, orphan_metrics, redis_metrics, register_meeting, token_refresh, webtransport_accept_loop) -> `crates/mc-service/tests/`; GC join/guest/settings -> `crates/gc-service/tests/meeting_tests.rs`

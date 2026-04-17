@@ -1,0 +1,18 @@
+# Strict-mode fixture: realistic chained templating. Must pass.
+groups:
+  - name: fx-warning
+    rules:
+      - alert: FxRealisticTemplate
+        expr: |
+          histogram_quantile(0.95,
+            sum by(le) (rate(fx_request_duration_seconds_bucket[5m]))
+          ) > 0.500
+        for: 5m
+        labels:
+          severity: warning
+          service: fx-service
+        annotations:
+          summary: "Fx p95 latency {{ $value | humanizeDuration }} > 500ms"
+          description: "Latency for {{ $labels.service }}/{{ $labels.component }} is {{ $value | humanizeDuration }} (threshold {{ 0.5 | humanizeDuration }}); p95 over 5m window."
+          impact: "User-visible slowness across {{ $labels.service }}."
+          runbook_url: "docs/runbooks/gc-incident-response.md#scenario-2-high-latency--slow-responses"

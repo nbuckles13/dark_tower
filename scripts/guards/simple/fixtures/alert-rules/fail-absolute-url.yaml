@@ -1,0 +1,15 @@
+# Strict-mode fixture: absolute URL. Must fail.
+groups:
+  - name: fx-page
+    rules:
+      - alert: FxAbsoluteURL
+        expr: up == 0
+        for: 1m
+        labels:
+          severity: page
+          service: fx-service
+        annotations:
+          summary: "Fx down"
+          description: "Fx is down."
+          impact: "User-visible."
+          runbook_url: "https://example.com/runbooks/fx.md"
