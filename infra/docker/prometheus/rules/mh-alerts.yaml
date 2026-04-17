@@ -1,0 +1,272 @@
+# Prometheus alerting rules for Media Handler
+#
+# Severity levels (per docs/observability/alert-conventions.md):
+# - page: User-visible impact now or SLO burn; pages oncall immediately (PagerDuty)
+# - warning: Degraded but contained, or approaching limits; Slack notify, business hours
+# - info: Awareness/trend/leading indicator; no notification, dashboards only
+#
+# All alerts link to sections in the consolidated incident response runbook:
+# docs/runbooks/mh-incident-response.md
+#
+# Notes on deliberate omissions:
+# - No burn-rate page/warning pair: MH has no error-rate SLO defined in ADR-0011
+#   at authoring time. Cargo-culting a 10x/5x burn-rate pair without an
+#   authoritative SLO target would produce a threshold with no principled
+#   justification. To be added after MH SLO is ratified in ADR-0011.
+# - No RegisterMeeting RPC alert: mh_grpc_requests_total{method="register"} is
+#   the MC->MH inbound path. MC-side failure (unable to place the call, timeout,
+#   etc.) pages MC oncall first. Covered transitively.
+# - No registration-failure-rate alert: registration is a low-volume one-shot
+#   signal (single register + periodic heartbeats). Heartbeats give a continuous,
+#   larger-denominator signal - MHGCHeartbeatFailureRate below is the canonical
+#   MH->GC health alert. MHHighRegistrationLatency still covers registration
+#   slowness separately.
+#
+# Cross-service co-review triggers (per alert-conventions.md §Service-specialist
+# cross-review):
+# - MHGCHeartbeatFailureRate + MHGCHeartbeatLatencyHigh: need global-controller co-review.
+# - MHMCNotificationFailures: needs meeting-controller co-review.
+
+groups:
+  - name: mh-service-page
+    interval: 30s
+    rules:
+      # ====================================================================
+      # PAGE ALERTS - User-visible impact or SLO burn; page oncall immediately
+      # ====================================================================
+
+      - alert: MHDown
+        expr: |
+          up{job="mh-service"} == 0
+        for: 1m
+        labels:
+          severity: page
+          service: mh-service
+          component: infrastructure
+        annotations:
+          summary: "Media Handler service is down"
+          description: "Media Handler has no running pods for 1 minute. All WebTransport media sessions on affected pods are disrupted."
+          impact: "Users in active meetings lose media. New joins have no working media path."
+          runbook_url: "docs/runbooks/mh-incident-response.md#scenario-1-complete-service-outage"
+
+  - name: mh-service-warning
+    interval: 60s
+    rules:
+      # ====================================================================
+      # WARNING ALERTS - Notify but don't page
+      # ====================================================================
+
+      - alert: MHHighJwtValidationFailures
+        expr: |
+          (
+            sum(rate(mh_jwt_validations_total{result="failure"}[5m]))
+            /
+            sum(rate(mh_jwt_validations_total[5m]))
+          ) > 0.10
+          and
+          sum(rate(mh_jwt_validations_total[5m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+          service: mh-service
+          component: webtransport
+        annotations:
+          summary: "MH JWT validation failure rate high ({{ $value | humanizePercentage }})"
+          description: "JWT validation failure rate is {{ $value | humanizePercentage }} for 5 minutes. A failure-rate spike can mean legitimate rejections of invalid tokens (probing, client bugs) OR a system issue (AC JWKS down, key rotation misconfig, clock skew). Break down by failure_reason and token_type to triage."
+          impact: "Subset of users unable to establish media sessions. Check AC service health, JWKS endpoint, and failure_reason label. signature_invalid concentrates suggest key-rotation or tampering; expired concentrates suggest clock-skew."
+          runbook_url: "docs/runbooks/mh-incident-response.md#scenario-2-jwt-validation-failures"
+
+      - alert: MHGCHeartbeatFailureRate
+        expr: |
+          (
+            sum(rate(mh_gc_heartbeats_total{status="error"}[5m]))
+            /
+            sum(rate(mh_gc_heartbeats_total[5m]))
+          ) > 0.5
+          and
+          sum(rate(mh_gc_heartbeats_total[5m])) > 0
+        for: 2m
+        labels:
+          severity: warning
+          service: mh-service
+          component: gc-integration
+        annotations:
+          summary: "MH-GC heartbeat failure rate high ({{ $value | humanizePercentage }})"
+          description: "Media Handler heartbeats (SendLoadReport) to Global Controller failing at {{ $value | humanizePercentage }} for 2 minutes. Heartbeats are continuous (larger denominator than one-shot registration), so sustained >50% failure indicates real connectivity or auth issues, not a flap."
+          impact: "Partial degradation: existing WebTransport sessions unaffected; GC may mark MH unhealthy and stop assigning new meetings. Investigate MH-GC connectivity, NetworkPolicy, and MH service token validity."
+          runbook_url: "docs/runbooks/mh-incident-response.md#scenario-3-gc-heartbeat-failures"
+
+      - alert: MHHighRegistrationLatency
+        expr: |
+          histogram_quantile(0.95,
+            sum by(le) (rate(mh_gc_registration_duration_seconds_bucket[5m]))
+          ) > 1.0
+        for: 5m
+        labels:
+          severity: warning
+          service: mh-service
+          component: gc-integration
+        annotations:
+          summary: "MH GC registration p95 latency high ({{ $value }}s > 1s)"
+          description: "Media Handler registration RPC p95 latency to GC is {{ $value }}s for 5 minutes. Threshold is provisional pending production baseline data - chosen as a user-perceptible slowness marker well below the 5s bucket ceiling. Revisit once steady-state observed baseline is available (expected sub-250ms typical)."
+          impact: "Slower post-restart recovery. GC may temporarily treat MH as unavailable during slow re-registration."
+          runbook_url: "docs/runbooks/mh-incident-response.md#scenario-4-gc-registration-latency"
+
+      - alert: MHHighWebTransportRejections
+        expr: |
+          (
+            sum(rate(mh_webtransport_connections_total{status="rejected"}[5m]))
+            /
+            sum(rate(mh_webtransport_connections_total[5m]))
+          ) > 0.10
+          and
+          sum(rate(mh_webtransport_connections_total[5m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+          service: mh-service
+          component: webtransport
+        annotations:
+          summary: "MH WebTransport rejection rate high ({{ $value | humanizePercentage }})"
+          description: "WebTransport connection rejection rate is {{ $value | humanizePercentage }} for 5 minutes. May indicate capacity exhaustion, TLS issues, or a QUIC listener stall."
+          impact: "Subset of users unable to establish media sessions. Check capacity, TLS cert, and pod health."
+          runbook_url: "docs/runbooks/mh-incident-response.md#scenario-5-webtransport-rejections"
+
+      - alert: MHWebTransportHandshakeSlow
+        expr: |
+          histogram_quantile(0.95,
+            sum by(le) (rate(mh_webtransport_handshake_duration_seconds_bucket[5m]))
+          ) > 1.0
+        for: 5m
+        labels:
+          severity: warning
+          service: mh-service
+          component: webtransport
+        annotations:
+          summary: "MH WebTransport handshake p95 latency high ({{ $value }}s > 1s)"
+          description: "WebTransport handshake p95 latency (session accept through JWT validation) is {{ $value }}s for 5 minutes. Threshold is a user-perceptible slowness marker, well below the 5s histogram bucket ceiling; treat as hard-limit-derived pending SLO ratification. Likely causes: slow JWKS lookups, TLS renegotiation, or pod CPU saturation."
+          impact: "Slow 'time to first frame' for new meeting joiners. Degraded experience."
+          runbook_url: "docs/runbooks/mh-incident-response.md#scenario-6-webtransport-handshake-slow"
+
+      - alert: MHCallerTypeRejected
+        expr: |
+          sum(increase(mh_caller_type_rejected_total[5m])) > 0
+        for: 2m
+        labels:
+          severity: warning
+          service: mh-service
+          component: grpc-auth
+        annotations:
+          summary: "MH Layer-2 caller-type rejection detected"
+          description: "One or more gRPC callers rejected by Layer-2 service-type routing over a 5-minute window, sustained for 2 minutes. MH expects meeting-controller as the only caller. Non-zero indicates a deployment misconfig OR credential misuse. Inspect actual_type label to identify the caller."
+          impact: "Rejected calls are denied cleanly (no request-serving impact), but the signal means a service is misconfigured OR an unauthorized client is probing endpoints. Investigate deployment manifests and recent cert/token changes; escalate to Security Team if actual_type is unexpected."
+          runbook_url: "docs/runbooks/mh-incident-response.md#scenario-7-caller-type-rejected"
+
+      - alert: MHHighMemory
+        expr: |
+          (
+            container_memory_usage_bytes{pod=~"mh-service-.*"}
+            /
+            container_spec_memory_limit_bytes{pod=~"mh-service-.*"}
+          ) > 0.85
+        for: 10m
+        labels:
+          severity: warning
+          service: mh-service
+          component: infrastructure
+        annotations:
+          summary: "MH memory usage high ({{ $value | humanizePercentage }})"
+          description: "Media Handler pod {{ $labels.pod }} memory usage is {{ $value | humanizePercentage }} for 10 minutes."
+          impact: "Risk of OOM kill. Investigate leak or scale before user impact."
+          runbook_url: "docs/runbooks/mh-incident-response.md#scenario-8-resource-pressure"
+
+      - alert: MHHighCPU
+        expr: |
+          rate(container_cpu_usage_seconds_total{pod=~"mh-service-.*"}[5m]) > 0.80
+        for: 5m
+        labels:
+          severity: warning
+          service: mh-service
+          component: infrastructure
+        annotations:
+          summary: "MH CPU usage high ({{ $value | humanizePercentage }})"
+          description: "Media Handler pod {{ $labels.pod }} CPU usage is {{ $value | humanizePercentage }} for 5 minutes."
+          impact: "High CPU may slow WebTransport handshakes and media forwarding. Consider scaling horizontally."
+          runbook_url: "docs/runbooks/mh-incident-response.md#scenario-8-resource-pressure"
+
+      - alert: MHTokenRefreshFailures
+        expr: |
+          (
+            sum(rate(mh_token_refresh_total{status="error"}[5m]))
+            /
+            sum(rate(mh_token_refresh_total[5m]))
+          ) > 0.10
+          and
+          sum(rate(mh_token_refresh_total[5m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+          service: mh-service
+          component: auth
+        annotations:
+          summary: "MH token refresh failure rate high ({{ $value | humanizePercentage }})"
+          description: "Media Handler OAuth token refresh failing at {{ $value | humanizePercentage }} for 5 minutes. MH uses this token for outbound RPCs to GC (registration, heartbeats) and MC (notifications). Break down by error_type for specific cause."
+          impact: "Initially none (MH uses cached token); after token expiry MH loses outbound auth and GC/MC integration degrades. Check AC service health."
+          runbook_url: "docs/runbooks/mh-incident-response.md#scenario-9-token-refresh-failures"
+
+      - alert: MHMCNotificationFailures
+        expr: |
+          (
+            sum(rate(mh_mc_notifications_total{status="error"}[5m]))
+            /
+            sum(rate(mh_mc_notifications_total[5m]))
+          ) > 0.10
+          and
+          sum(rate(mh_mc_notifications_total[5m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+          service: mh-service
+          component: mc-integration
+        annotations:
+          summary: "MH-MC notification delivery failure rate high ({{ $value | humanizePercentage }})"
+          description: "MH to MC connect/disconnect notification delivery failing at {{ $value | humanizePercentage }} for 5 minutes. Fire-and-forget design means failed events are not retried - MC may develop stale participant state."
+          impact: "Stale presence indicators, delayed disconnect detection, participants appearing still-present after leaving. Check MC service health."
+          runbook_url: "docs/runbooks/mh-incident-response.md#scenario-10-mhmc-notification-failures"
+
+      - alert: MHPodRestartingFrequently
+        expr: |
+          rate(kube_pod_container_status_restarts_total{pod=~"mh-service-.*"}[1h]) > 0.016
+        for: 5m
+        labels:
+          severity: warning
+          service: mh-service
+          component: infrastructure
+        annotations:
+          summary: "MH pod {{ $labels.pod }} restarting frequently"
+          description: "Pod {{ $labels.pod }} has restarted {{ $value }} times per hour. May indicate crashes, OOM kills, or liveness probe failures."
+          impact: "Repeated disconnection of WebTransport sessions on this pod. Users on this pod lose media each restart."
+          runbook_url: "docs/runbooks/mh-incident-response.md#scenario-11-pod-restarting-frequently"
+
+  - name: mh-service-info
+    interval: 60s
+    rules:
+      # ====================================================================
+      # INFO ALERTS - Log only, no notification. Leading indicators.
+      # ====================================================================
+
+      - alert: MHGCHeartbeatLatencyHigh
+        expr: |
+          histogram_quantile(0.95,
+            sum by(le) (rate(mh_gc_heartbeat_latency_seconds_bucket[5m]))
+          ) > 0.100
+        for: 5m
+        labels:
+          severity: info
+          service: mh-service
+          component: gc-integration
+        annotations:
+          summary: "MH GC heartbeat p95 latency high ({{ $value }}s > 100ms)"
+          description: "Media Handler heartbeat RPC p95 latency to GC is {{ $value }}s, exceeding the 100ms SLO target for 5 minutes. Info severity - this is a leading indicator for a future SLO-guarding page alert; no aggregate page alert currently defined (see ADR-0011 for SLO framework). Threshold is SLO-derived per the MH metrics catalog."
+          impact: "No immediate user impact. Watch for escalation to heartbeat failures (MHGCHeartbeatFailureRate) or cascading latency."
+          runbook_url: "docs/runbooks/mh-incident-response.md#scenario-12-gc-heartbeat-latency"

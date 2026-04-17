@@ -119,12 +119,40 @@ extract_and_validate_metrics() {
             continue
         fi
 
-        # Extract metrics using grep
+        # Extract metrics using a multi-line-aware Python pass.
         # Looking for: counter!("metric_name", ...)
         #              histogram!("metric_name", ...)
         #              gauge!("metric_name", ...)
+        # Optionally prefixed with `metrics::` (fully-qualified invocations).
+        #
+        # A single-line `grep -oP` fails on multi-line macro invocations such as
+        #
+        #     counter!(
+        #         "mh_mc_notifications_total",
+        #         ...
+        #     )
+        #
+        # because grep processes line-by-line and `\s` does not cross newlines.
+        # Same whole-file + balanced-paren-aware approach is used in
+        # validate-metric-labels.sh; here we only need the leading string
+        # literal (the metric name), so a DOTALL regex is sufficient.
         local metrics
-        metrics=$(grep -oP '(?:counter|histogram|gauge)!\s*\(\s*"([^"]+)"' "$metrics_file" | grep -oP '"[^"]+"' | tr -d '"' | sort -u || true)
+        metrics=$(python3 - "$metrics_file" <<'PYEOF' || true
+import re, sys
+with open(sys.argv[1], encoding="utf-8") as fh:
+    src = fh.read()
+# Optionally leading `metrics::`, then one of the three macros, then `!(`,
+# then arbitrary whitespace (including newlines), then the first `"..."`
+# string literal which is the metric name.
+pattern = re.compile(
+    r'(?:\bmetrics\s*::\s*)?\b(?:counter|histogram|gauge)!\s*\(\s*"([^"\\]*(?:\\.[^"\\]*)*)"',
+    re.DOTALL,
+)
+names = sorted({m.group(1) for m in pattern.finditer(src)})
+for n in names:
+    print(n)
+PYEOF
+)
 
         if [[ -z "$metrics" ]]; then
             echo -e "${YELLOW}⚠️  WARNING: No metrics found in ${dir_name}/src/observability/metrics.rs${NC}"
