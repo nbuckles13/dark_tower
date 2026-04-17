@@ -21,7 +21,7 @@
 
 | Field | Value |
 |-------|-------|
-| Phase | `complete` |
+| Phase | `complete (iteration 2)` |
 | Implementer | `implementer@devloop-adr-0031-alert-rules-guard` |
 | Implementing Specialist | `operations` |
 | Iteration | `1` |
@@ -183,6 +183,38 @@ This devloop contains zero Rust/service code changes. Only runtime artifact is P
 Not available in this sandbox environment (implementer flagged this; CI will catch). Script uses `set -euo pipefail`, quoted expansions, `grep -Fxq --`, `shopt -s nullglob`, quoted python heredoc — low risk.
 
 ---
+
+## Human Review (Iteration 2)
+
+**Feedback**: After the initial commit (`505a2e5`), post-hoc review revealed the allowlist mechanism was over-engineered for the problem. The deferred migration is ~60 lines of mostly-mechanical YAML changes (severity renames + URL rewrites) with 2-3 genuine judgment calls, not a cross-cutting concern requiring a bespoke grandfather protocol. The allowlist produced: ~80 LOC of guard complexity, a count-pin + expansion-marker protocol, legacy WARN emission, per-file lenient fixtures, TODO.md migration entries, and two follow-up devloops to delete it all in 2 months.
+
+**Revised approach** (Iteration 2 scope):
+1. Strip the allowlist mechanism entirely from the guard. Strict-mode only. CI will be RED against `gc-alerts.yaml` and `mc-alerts.yaml` — that is the **intended forcing function** for the next step.
+2. Two follow-up `--light` devloops, one per service owner (`global-controller` for gc-alerts.yaml, `meeting-controller` for mc-alerts.yaml), migrate those files to strict compliance. Each is 15-20 min of work — mostly sed for the URL rewrite plus per-alert severity judgment. CI returns to green after both land.
+
+This matches ADR-0031's ownership model more faithfully: service specialists own their alert files, and they migrate them in their own devloops rather than us building infrastructure to defer around the edit.
+
+**Files to delete/modify in this iteration**:
+- Delete: `scripts/guards/simple/alert-rules.legacy-allowlist`
+- Modify guard: remove `is_allowlisted`, `check_allowlist_integrity`, `EXPECTED_ALLOWLIST_COUNT`, `ALLOWLIST_FILE`, `MIGRATION_DEADLINE`, lenient-mode branches in `validate_runbook_url` and `validate_severity`, `LENIENT_SEVERITIES` constant, the `[LEGACY]` WARN emission, and mode-switching in `validate_file`
+- Delete: `scripts/guards/simple/fixtures/alert-rules/pass-lenient-*.yaml` and `fail-lenient-*.yaml` (5-6 files)
+- Modify: `docs/observability/alert-conventions.md` — remove the "Collapsed legacy callout" at top of §severity-taxonomy; remove mode-coverage table's Lenient column (leave one column: Strict → Enforced) or collapse to a single-mode rule index; remove any "pre-migration" references
+- Modify: `TODO.md` — delete "ADR-0031 Alert Migration" section + "Post-Migration Protocol" section entirely. Keep "ADR-0031 Convention Follow-ups" and the new "/devloop skill: cross-ownership friction" section.
+- Modify: `docs/observability/alerts.md` — remove any legacy-allowlist references introduced by the A2 pointer edit
+
+**Not in scope** (stay with their previous state): ADR itself, debate record, guard core (Python parser, hygiene regexes, path-traversal check, guard:ignore mechanism), strict-mode fixtures (non-lenient), template file, `mc-alerts.yaml:33` for: bump (keep — it's a legitimate defensive change that aligns the rule to the convention).
+
+**Process lesson** (seeded as a TODO debate for specialists, see `TODO.md`): over-application of ownership boundaries produced a disproportionate mechanism. The new default posture should be "err toward the small mechanical edit with owner review," not "design infrastructure to defer the edit."
+
+### Iteration 2 results
+
+- **Scope**: −331 / +56 lines across 13 files. Pure scope-narrowing.
+- **Validation**: L1/L2/L4/L5 PASS; L3 has 1 expected failure (`validate-alert-rules` fails on gc/mc-alerts.yaml by design — the intended forcing function; 15/16 other guards green); L7 Lead-judgment SAFE; L8 skipped (no Rust/service changes).
+- **Self-test**: 20/20 fixtures pass post-prune.
+- **Production scan**: 50 violations correctly surfaced on gc/mc-alerts.yaml with specific file:line + category.
+- **Security verdict**: CLEAR. Orphaned-reference sweep clean; exfil-closure + annotation hygiene + guard:ignore mechanism intact; fixture coverage preserved on every threat class.
+- **Observability verdict**: RESOLVED. 1 fix (stale "strict mode" qualifier in alerts.md:693), 1 nit deferred to Lead closeout (Phase field, now flipped to `complete`). Conventions doc + rule index + TODO.md Convention Follow-ups all verified coherent post-deletion.
+- **Next steps**: two `--light` devloops to migrate gc-alerts.yaml (owner: global-controller) and mc-alerts.yaml (owner: meeting-controller) to strict compliance, returning CI to green.
 
 ## Code Review Results
 

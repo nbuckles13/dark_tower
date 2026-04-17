@@ -64,7 +64,7 @@
 - Instrument skip_all enforcement -> `scripts/guards/simple/instrument-skip-all.sh`
 - Metric-test coverage (src emission vs test reference) -> `scripts/guards/simple/validate-metric-coverage.sh`
 - MetricAssertion test helper (per-thread DebuggingRecorder; histogram-first ordering load-bearing — first `.assert_*()` of any kind drains histograms via `Snapshotter::snapshot()`, counter/gauge re-reads idempotent; `assert_unobserved` symmetric across `CounterQuery`/`GaugeQuery`/`HistogramQuery` with `ensure_no_kind_mismatch` hardening — closes ADR-0032 §F4 gauge-absence gap, histogram form must precede `assert_observation_count*` on same name+labels) -> `crates/common/src/observability/testing.rs`
-- Alert-rules lint + legacy allowlist -> `scripts/guards/simple/validate-alert-rules.sh`, `alert-rules.legacy-allowlist`
+- Alert-rules lint -> `scripts/guards/simple/validate-alert-rules.sh`
 
 ## Env-Test Observability, Cluster Config & Runbooks
 - Per-service deployment + incident response -> `docs/runbooks/` (two per service); GC scenarios 8-9 + join failure triage -> `gc-incident-response.md`, `docs/observability/alerts.md`

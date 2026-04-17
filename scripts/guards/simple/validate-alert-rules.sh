@@ -10,13 +10,6 @@
 #   5. annotation text free of hostnames, credentials, IPs, secrets
 #   6. per-rule `# guard:ignore(<reason>)` exempts rule from check 5 only
 #
-# LEGACY ALLOWLIST
-#
-# Files named in scripts/guards/simple/alert-rules.legacy-allowlist run in
-# lenient mode: checks 2 and 3 are relaxed (absolute URLs allowed; severity
-# value-set extended to include "critical"). Presence/duration/hygiene checks
-# remain enforced. Non-expansion enforced via count-pin + approval marker.
-#
 # TEMPLATE FILES
 #
 # Files matching `_template-*.yaml` are skipped entirely.
@@ -40,70 +33,15 @@ source "$SCRIPT_DIR/../common.sh"
 
 ALERTS_DIR="$REPO_ROOT/infra/docker/prometheus/rules"
 RUNBOOKS_DIR="$REPO_ROOT/docs/runbooks"
-ALLOWLIST_FILE="$SCRIPT_DIR/alert-rules.legacy-allowlist"
 FIXTURES_DIR="$SCRIPT_DIR/fixtures/alert-rules"
-MIGRATION_DEADLINE="2026-06-30"
-
-# Non-expansion pin. Bump when adding a legitimate legacy entry (with an
-# ALLOWLIST_EXPANSION_APPROVED_BY marker in the same PR). Decrement when
-# removing (migration complete).
-readonly EXPECTED_ALLOWLIST_COUNT=2
-
-# -----------------------------------------------------------------------------
-# Mode detection: is a given absolute file path on the legacy allowlist?
-# -----------------------------------------------------------------------------
-is_legacy_file() {
-    local abs_path="$1"
-    local rel_path="${abs_path#"$REPO_ROOT/"}"
-    [[ -f "$ALLOWLIST_FILE" ]] || return 1
-    grep -vE '^\s*(#|$)' "$ALLOWLIST_FILE" | grep -Fxq -- "$rel_path"
-}
-
-# -----------------------------------------------------------------------------
-# Non-expansion check: allowlist active-line count must match the pin, unless
-# an ALLOWLIST_EXPANSION_APPROVED_BY marker appears in the committed tree.
-# -----------------------------------------------------------------------------
-check_allowlist_integrity() {
-    [[ -f "$ALLOWLIST_FILE" ]] || {
-        echo -e "${RED}FAIL: allowlist file missing: $ALLOWLIST_FILE${NC}" >&2
-        return 1
-    }
-
-    local actual_count
-    actual_count=$(grep -cvE '^\s*(#|$)' "$ALLOWLIST_FILE" || true)
-
-    if [[ "$actual_count" -ne "$EXPECTED_ALLOWLIST_COUNT" ]]; then
-        local marker_present=0
-        if git -C "$REPO_ROOT" grep -l '# ALLOWLIST_EXPANSION_APPROVED_BY:' >/dev/null 2>&1; then
-            marker_present=1
-        fi
-
-        if [[ "$actual_count" -gt "$EXPECTED_ALLOWLIST_COUNT" && "$marker_present" -eq 0 ]]; then
-            echo -e "${RED}FAIL: legacy allowlist grew from $EXPECTED_ALLOWLIST_COUNT to $actual_count without approval marker.${NC}" >&2
-            echo "      To add a legacy entry, include in the PR a committed line:" >&2
-            echo "          # ALLOWLIST_EXPANSION_APPROVED_BY: <specialist-name>" >&2
-            echo "      Then bump EXPECTED_ALLOWLIST_COUNT in $0 to $actual_count." >&2
-            return 1
-        fi
-
-        if [[ "$actual_count" -lt "$EXPECTED_ALLOWLIST_COUNT" ]]; then
-            echo -e "${RED}FAIL: legacy allowlist shrunk from $EXPECTED_ALLOWLIST_COUNT to $actual_count.${NC}" >&2
-            echo "      Migration complete? Decrement EXPECTED_ALLOWLIST_COUNT in $0 to $actual_count." >&2
-            return 1
-        fi
-    fi
-
-    return 0
-}
 
 # -----------------------------------------------------------------------------
 # Python validator — one file at a time, emits JSON-lines on stdout.
 # -----------------------------------------------------------------------------
 run_python_validator() {
     local yaml_path="$1"
-    local mode="$2"
 
-    python3 - "$yaml_path" "$mode" "$RUNBOOKS_DIR" "$REPO_ROOT" <<'PYEOF'
+    python3 - "$yaml_path" "$RUNBOOKS_DIR" "$REPO_ROOT" <<'PYEOF'
 import json
 import os
 import re
@@ -116,12 +54,10 @@ except ImportError:
     sys.exit(2)
 
 YAML_PATH = sys.argv[1]
-MODE = sys.argv[2]
-RUNBOOKS_DIR = sys.argv[3]
-REPO_ROOT = sys.argv[4]
+RUNBOOKS_DIR = sys.argv[2]
+REPO_ROOT = sys.argv[3]
 
-STRICT_SEVERITIES = {"page", "warning", "info"}
-LENIENT_SEVERITIES = STRICT_SEVERITIES | {"critical"}
+ALLOWED_SEVERITIES = {"page", "warning", "info"}
 MIN_FOR_SECONDS = 30
 
 # IPv4 addresses allowed as doc/example references, not real targets.
@@ -261,16 +197,12 @@ def approximate_rule_line(raw_lines, alert_name):
     return 0
 
 
-def validate_runbook_url(url, mode, runbooks_dir):
-    """Returns (ok, message). Mode-aware."""
+def validate_runbook_url(url, runbooks_dir):
+    """Returns (ok, message)."""
     if not url or not isinstance(url, str) or not url.strip():
         return False, "annotations.runbook_url is missing or empty"
 
-    if mode == "lenient":
-        # Lenient: accept any non-empty string. No shape or existence check.
-        return True, None
-
-    # Strict: must be repo-relative under docs/runbooks/ AND target must exist
+    # Must be repo-relative under docs/runbooks/ AND target must exist
     # AND the resolved real path must stay within docs/runbooks/ (no traversal).
     if re.match(r"^(https?:|//|file:)", url):
         return False, f"runbook_url must be repo-relative docs/runbooks/... (got: {url})"
@@ -294,12 +226,11 @@ def validate_runbook_url(url, mode, runbooks_dir):
     return True, None
 
 
-def validate_severity(severity, mode):
+def validate_severity(severity):
     if severity is None or severity == "":
         return False, "labels.severity is missing or empty"
-    allowed = LENIENT_SEVERITIES if mode == "lenient" else STRICT_SEVERITIES
-    if severity not in allowed:
-        allowed_str = "{" + ", ".join(sorted(allowed)) + "}"
+    if severity not in ALLOWED_SEVERITIES:
+        allowed_str = "{" + ", ".join(sorted(ALLOWED_SEVERITIES)) + "}"
         return False, f"labels.severity must be in {allowed_str} (got: {severity})"
     return True, None
 
@@ -344,21 +275,21 @@ def main():
             labels = rule.get("labels") or {}
 
             # Check 1-2: runbook_url
-            ok, msg = validate_runbook_url(annotations.get("runbook_url"), MODE, RUNBOOKS_DIR)
+            ok, msg = validate_runbook_url(annotations.get("runbook_url"), RUNBOOKS_DIR)
             if not ok:
                 emit("runbook_url", rel_path, alert_name, rule_line, msg)
 
             # Check 3: severity
-            ok, msg = validate_severity(labels.get("severity"), MODE)
+            ok, msg = validate_severity(labels.get("severity"))
             if not ok:
                 emit("severity", rel_path, alert_name, rule_line, msg)
 
-            # Check 4: for: duration (same in both modes)
+            # Check 4: for: duration
             ok, msg = validate_for(rule.get("for"))
             if not ok:
                 emit("for_duration", rel_path, alert_name, rule_line, msg)
 
-            # Check 5: annotation hygiene (same in both modes; ignore-hatch scoped here)
+            # Check 5: annotation hygiene (ignore-hatch scoped here)
             ignore_reason = rule_is_ignored(rule_line, ignore_lines)
             if ignore_reason is not None:
                 # Log the bypass so reviewers see it even on a passing run.
@@ -391,16 +322,9 @@ PYEOF
 # -----------------------------------------------------------------------------
 validate_file() {
     local yaml_path="$1"
-    local mode="strict"
-
-    if is_legacy_file "$yaml_path"; then
-        mode="lenient"
-        local rel_path="${yaml_path#"$REPO_ROOT/"}"
-        echo -e "${YELLOW}[LEGACY]${NC} $rel_path — lenient mode (strict checks: severity present, runbook_url present, for:>=30s, annotation hygiene). Migration deadline $MIGRATION_DEADLINE. Tracked in TODO.md#adr-0031-alert-migration."
-    fi
 
     local output
-    if ! output=$(run_python_validator "$yaml_path" "$mode" 2>&1); then
+    if ! output=$(run_python_validator "$yaml_path" 2>&1); then
         echo -e "${RED}ERROR:${NC} python validator failed on $yaml_path" >&2
         echo "$output" >&2
         return 2
@@ -447,9 +371,7 @@ for line in sys.stdin:
 }
 
 # -----------------------------------------------------------------------------
-# Self-test: run each fixture under strict or lenient, assert exit code.
-# Fixtures are named pass-*.yaml / fail-*.yaml. Names starting `fail-lenient-`
-# or `pass-lenient-` are treated as legacy. Others use strict mode.
+# Self-test: run each fixture, assert exit code from its name (pass-*/fail-*).
 # -----------------------------------------------------------------------------
 self_test() {
     echo ""
@@ -469,7 +391,6 @@ self_test() {
         local name
         name=$(basename "$fixture")
         local expected_exit
-        local mode="strict"
 
         case "$name" in
             pass-*)  expected_exit=0 ;;
@@ -477,13 +398,9 @@ self_test() {
             *) continue ;;
         esac
 
-        case "$name" in
-            *lenient*|*legacy*) mode="lenient" ;;
-        esac
-
         local output
         local violation_count=0
-        if output=$(run_python_validator "$fixture" "$mode" 2>&1); then
+        if output=$(run_python_validator "$fixture" 2>&1); then
             violation_count=$(echo "$output" | grep -c '"kind"' || true)
         else
             echo -e "${RED}SELF-TEST ERROR:${NC} python validator blew up on $name" >&2
@@ -498,10 +415,10 @@ self_test() {
         fi
 
         if [[ "$actual_exit" -eq "$expected_exit" ]]; then
-            echo -e "  ${GREEN}PASS${NC} $name (mode=$mode, violations=$violation_count)"
+            echo -e "  ${GREEN}PASS${NC} $name (violations=$violation_count)"
             passed=$((passed + 1))
         else
-            echo -e "  ${RED}FAIL${NC} $name (mode=$mode, expected_exit=$expected_exit, got=$actual_exit, violations=$violation_count)"
+            echo -e "  ${RED}FAIL${NC} $name (expected_exit=$expected_exit, got=$actual_exit, violations=$violation_count)"
             echo "$output" | sed 's/^/    /'
             failed=$((failed + 1))
         fi
@@ -530,10 +447,6 @@ main() {
     print_header "Alert-Rules Validation Guard"
     echo "Scanning: $ALERTS_DIR"
     echo ""
-
-    if ! check_allowlist_integrity; then
-        exit 1
-    fi
 
     local yaml_files=()
     shopt -s nullglob

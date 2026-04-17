@@ -15,8 +15,8 @@ observability owns this document and the guard that enforces it.
 
 **Machine enforcement**: `scripts/guards/simple/validate-alert-rules.sh`
 runs on every CI pipeline. Rules in this document are tagged
-`[guard-enforced]` or `[reviewer-only]`. See §mode-coverage for the full
-strict-vs-lenient enforcement matrix.
+`[guard-enforced]` or `[reviewer-only]`; see the rule index at the end
+of this document for the full enforcement matrix.
 
 ---
 
@@ -25,19 +25,13 @@ strict-vs-lenient enforcement matrix.
 Three severity values, each with a distinct routing contract in Alertmanager.
 **Classify according to user impact, not technical scary-ness.**
 
-> **Legacy note**: The calibration anchors below reference alerts in
-> `gc-alerts.yaml` and `mc-alerts.yaml` that currently use `severity: critical`
-> pre-migration. See [TODO.md §ADR-0031 Alert Migration](../../TODO.md)
-> (deadline 2026-06-30). Treat the anchors as taxonomic examples — the labeled
-> severity will align with this taxonomy once migration lands.
-
 ### `page` — **user-visible impact now, or SLO burn** `[guard-enforced value]`
 
 Fires when users are experiencing, or are about to experience, a failure
 of the service's advertised contract. Pages oncall immediately (PagerDuty +
 Slack incident channel).
 
-Anchor examples (post-migration mapping):
+Anchor examples:
 - `GCDown` — whole GC service unreachable; no meetings can be joined or created.
 - `GCHighErrorRate` — 1% error SLO violation; availability target at risk.
 - `GCDatabaseDown` — 50% DB error rate; all GC operations failing.
@@ -50,7 +44,7 @@ Fires when the system is degraded or trending toward trouble, but users are
 not yet seeing a contract failure. Routes to Slack (non-paging). Investigate
 during business hours.
 
-Anchor examples (post-migration mapping):
+Anchor examples:
 - `GCHighMemory` — 85% memory utilization; OOM risk but no user impact yet.
 - `GCDatabaseSlow` — p99 query latency > 50ms; may cascade to SLO but hasn't.
 - `MCCapacityWarning` — 80% of active-meeting cap; scale out before hitting limit.
@@ -224,10 +218,10 @@ recommended.
 ### `runbook_url` format `[guard-enforced]`
 
 Must be repo-relative, starting with `docs/runbooks/`. Must resolve to an
-existing file under strict mode. Absolute URLs (`http://`, `https://`,
-`//`, `file://`) are rejected — this closes an exfil-on-click vector where
-an operator clicking a tampered runbook URL is exited out of the repo into
-an attacker-controlled destination.
+existing file. Absolute URLs (`http://`, `https://`, `//`, `file://`) are
+rejected — this closes an exfil-on-click vector where an operator clicking
+a tampered runbook URL is exited out of the repo into an attacker-controlled
+destination.
 
 The flat layout (`docs/runbooks/<file>.md`) is accepted. If a service
 chooses to organize into a subdirectory (`docs/runbooks/<svc>/<file>.md`),
@@ -269,29 +263,6 @@ Reviewers should scrutinize every new `guard:ignore` during PR review.
 
 ---
 
-## Mode-Coverage Table
-
-The guard runs in **strict mode** by default. Files listed in
-`scripts/guards/simple/alert-rules.legacy-allowlist` run in **lenient mode**
-until migration (deadline 2026-06-30). Both modes enforce the correctness
-and hygiene invariants; lenient mode only relaxes taxonomy/shape.
-
-| Check | Strict mode | Lenient mode |
-|---|---|---|
-| `runbook_url` annotation present | ENFORCED | ENFORCED |
-| `runbook_url` starts with `docs/runbooks/` | ENFORCED | RELAXED (absolute URLs allowed) |
-| `runbook_url` target file exists on disk | ENFORCED | RELAXED |
-| `labels.severity` present | ENFORCED | ENFORCED |
-| `labels.severity` value allowed set | ENFORCED `{page, warning, info}` | RELAXED-TO-SUPERSET `{page, warning, info, critical}` |
-| `for:` duration ≥ 30s | ENFORCED | ENFORCED |
-| Annotation secret/hostname/PII hygiene | ENFORCED | ENFORCED |
-| `# guard:ignore(reason)` exempts from hygiene check only | Available | Available |
-
-Annotation hygiene is enforced in both modes — the exfil and secret-leak
-risks are orthogonal to the severity taxonomy migration.
-
----
-
 ## Alert-Rule PR Checklist `[reviewer-only]`
 
 At plan-approval time (per ADR-0031), the following cross-cutting reviewers
@@ -322,7 +293,7 @@ apply their lens.
 
 - [ ] Hygiene guard pass clean. Any `# guard:ignore` has a good reason.
 - [ ] No labels or annotations expose user-identifiable data.
-- [ ] `runbook_url` is repo-relative (guard enforces this in strict mode).
+- [ ] `runbook_url` is repo-relative (guard enforces this).
 
 ### Test reviewer
 
@@ -345,8 +316,8 @@ alerts on `<svc>_<dep>_*` metrics require `<svc>` specialist (author) +
 | Rule | Enforcement |
 |---|---|
 | `runbook_url` annotation present | `[guard-enforced]` |
-| `runbook_url` repo-relative | `[guard-enforced]` (strict mode only) |
-| `runbook_url` target exists | `[guard-enforced]` (strict mode only) |
+| `runbook_url` repo-relative | `[guard-enforced]` |
+| `runbook_url` target exists | `[guard-enforced]` |
 | `severity` label present | `[guard-enforced]` |
 | `severity` value in allowed set | `[guard-enforced]` |
 | `for:` ≥ 30s | `[guard-enforced]` |
