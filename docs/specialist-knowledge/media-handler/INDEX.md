@@ -38,10 +38,7 @@
 - Fuzz: roundtrip → `crates/media-protocol/fuzz/fuzz_targets/codec_roundtrip.rs`
 
 ## Proto Definitions
-- MC-to-MH RPC (Register, RouteMedia, StreamTelemetry) → `proto/internal.proto`
-- MH-to-GC RPC (RegisterMH, SendLoadReport) → `proto/internal.proto`
-- MH assignment messages (MhAssignment) → `proto/internal.proto`
-- MH→MC coordination (MediaCoordinationService, ParticipantMedia*, DisconnectReason) → `proto/internal.proto`
+- MC↔MH / MH↔GC / MH→MC RPCs + assignment + DisconnectReason → `proto/internal.proto`
 - Client signaling (MediaStream, StreamAssignment, layout) → `proto/signaling.proto`
 - Generated Rust code → `crates/proto-gen/build.rs`
 
@@ -57,15 +54,13 @@
 - MH depends on media-protocol → `crates/media-protocol/src/lib.rs`
 
 ## Testing
-- GC integration tests (mock server) → `crates/mh-service/tests/gc_integration.rs`
-- MC client integration tests (mock server, retry, auth short-circuit) → `crates/mh-service/tests/mc_client_integration.rs`
-- Config unit tests → `crates/mh-service/src/config.rs`
-- Auth layer tests (Layer 1 JWKS/scope + Layer 2 service_type routing + claims injection) → `crates/mh-service/src/grpc/auth_interceptor.rs`
-- JWT validation tests (meeting tokens, JWKS unreachable) → `crates/mh-service/src/auth/mod.rs`
-- Session manager tests → `crates/mh-service/src/session/mod.rs`
-- RegisterMeeting handler tests → `crates/mh-service/src/grpc/mh_service.rs`
-- Health endpoint tests → `crates/mh-service/src/observability/health.rs`
-- Metrics unit tests → `crates/mh-service/src/observability/metrics.rs`
+- Integration: GC mock → `crates/mh-service/tests/gc_integration.rs`
+- Integration: MC client retry + auth short-circuit → `crates/mh-service/tests/mc_client_integration.rs`
+- Integration: MhAuthLayer over real tonic transport (alg:none + HS256 confusion, Layer 2 routing) → `crates/mh-service/tests/auth_layer_integration.rs`
+- Integration: RegisterMeeting over real gRPC (happy path + InvalidArgument) → `crates/mh-service/tests/register_meeting_integration.rs`
+- Integration: WebTransport accept path, provisional timeout kick/survive, MC notify lifecycle → `crates/mh-service/tests/webtransport_integration.rs`
+- Integration rigs (JWKS mock, mock MC, gRPC rig, WT rig, token minters) → `crates/mh-service/tests/common/`
+- Unit tests live alongside source modules listed in Code Locations (config, auth layer, JWT validator, session manager, RegisterMeeting handler, health, metrics)
 
 ## Infrastructure
 - K8s deployment (ports, probes, env, downward API, advertise addresses) → `infra/services/mh-service/deployment.yaml`

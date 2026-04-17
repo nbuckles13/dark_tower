@@ -38,8 +38,10 @@
 
 ## Code Locations — MH (Auth, OAuth, TLS)
 - gRPC auth layer (JWKS, scope `service.write.mh`) → `crates/mh-service/src/grpc/auth_interceptor.rs:MhAuthLayer`
-- OAuth config (SecretString, Debug redaction) → `crates/mh-service/src/config.rs:Config` | JWKS: `infra/services/mh-service/configmap.yaml`
-- TLS validation + Bearer auth + error sanitization → `config.rs`, `gc_client.rs`, `errors.rs`
+- MH JWT validator (`token_type == "meeting"` anti-confusion) → `crates/mh-service/src/auth/mod.rs:MhJwtValidator::validate_meeting_token`
+- WT accept-path JWT gate → `crates/mh-service/src/webtransport/connection.rs:handle_connection()`
+- OAuth config (SecretString) → `crates/mh-service/src/config.rs:Config` | TLS+Bearer → `crates/mh-service/src/grpc/gc_client.rs` | Error sanitization → `crates/mh-service/src/errors.rs` | JWKS: `infra/services/mh-service/configmap.yaml`
+- Integration tests (auth E2E, WT accept-path, RegisterMeeting, rigs) → `crates/mh-service/tests/`
 
 ## Code Locations — Observability (Security-Relevant)
 - MC/MH metrics (bounded labels, no PII) → `crates/mc-service/src/observability/metrics.rs` (+ mh) | ADR-0029
@@ -50,15 +52,13 @@
 - WebTransport UDP ingress + Kind mapping → `infra/services/{mc,mh}-service/network-policy.yaml`, `infra/kind/kind-config.yaml`
 
 ## Advertise Addresses (MC + MH → GC Registration)
-- gRPC: K8s downward API `status.podIP` | WebTransport: per-instance env var from ConfigMap
-- Per-instance NodePort Services (`{mc,mh}-service-{0,1}`) expose only UDP WebTransport | Registration → `gc_client.rs:register()`
+- gRPC: K8s `status.podIP` | WT: per-instance env from ConfigMap | NodePort `{mc,mh}-service-{0,1}` UDP-only | Registration → `gc_client.rs:register()`
 
 ## Devloop Container & Cluster Helper Security
 - Container isolation → ADR-0025; Cluster helper (trust, socket auth, injection safety, networking, prohibitions) → ADR-0030
 - Env-test URL validation (scheme, credential rejection) → `crates/env-tests/src/cluster.rs:parse_host_port()`
 - Helper binary (Rust, Command::new() arg safety) → `crates/devloop-helper/src/commands.rs`
-- Status command (read-only, auth-gated) → `commands.rs:cmd_status()`, `parse_pod_health()`
-- Auth token (CSPRNG, constant-time compare, 0600) → `crates/devloop-helper/src/auth.rs`
+- Status command (read-only, auth-gated) → `commands.rs:cmd_status()`, `parse_pod_health()` | Auth token (CSPRNG, constant-time compare, 0600) → `crates/devloop-helper/src/auth.rs`
 - Gateway IP validation → `commands.rs:validate_gateway_ip()` | Dev-cluster client → `infra/devloop/dev-cluster`
 - Socket auth, file permissions, API allowlist, explicit prohibitions → ADR-0030 (Helper Process, Helper API, Explicit Prohibitions)
 - Kind NodePort listen address (`${HOST_GATEWAY_IP}`) → `infra/kind/kind-config.yaml.tmpl`; Wrapper → `infra/devloop/devloop.sh`
