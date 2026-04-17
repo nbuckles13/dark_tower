@@ -1,0 +1,55 @@
+# Strict-mode fixture: production-shaped rule modeled on GCDown, GCHighErrorRate,
+# and GCHighLatency from gc-alerts.yaml with the ADR-0031-compliant shape
+# (severity: page, relative runbook_url). Verifies guard works on realistic
+# production-sized rules, not just minimal synthetic YAML.
+groups:
+  - name: gc-service-page-shape
+    interval: 30s
+    rules:
+      - alert: GCDownShape
+        expr: |
+          up{job="gc-service"} == 0
+        for: 1m
+        labels:
+          severity: page
+          service: gc-service
+          component: infrastructure
+        annotations:
+          summary: "Global Controller service is down"
+          description: "Global Controller has no running pods for 1 minute. All meeting join requests are failing."
+          impact: "Users cannot join meetings. Complete service outage."
+          runbook_url: "docs/runbooks/gc-incident-response.md#scenario-4-complete-service-outage"
+
+      - alert: GCHighErrorRateShape
+        expr: |
+          (
+            sum(rate(gc_http_requests_total{status_code=~"[45].."}[5m]))
+            /
+            sum(rate(gc_http_requests_total[5m]))
+          ) > 0.01
+        for: 5m
+        labels:
+          severity: page
+          service: gc-service
+          component: http
+        annotations:
+          summary: "GC error rate above SLO ({{ $value | humanizePercentage }})"
+          description: "Global Controller error rate is {{ $value | humanizePercentage }}, exceeding 1% SLO threshold for 5 minutes. This violates the 99.9% availability SLO."
+          impact: "Increased user errors. Error budget burning rapidly."
+          runbook_url: "docs/runbooks/gc-incident-response.md#scenario-5-high-error-rate"
+
+      - alert: GCHighLatencyShape
+        expr: |
+          histogram_quantile(0.95,
+            sum by(le) (rate(gc_http_request_duration_seconds_bucket[5m]))
+          ) > 0.200
+        for: 5m
+        labels:
+          severity: page
+          service: gc-service
+          component: http
+        annotations:
+          summary: "GC p95 latency above SLO ({{ $value }}s > 200ms)"
+          description: "Global Controller p95 HTTP latency is {{ $value }}s, exceeding 200ms SLO for 5 minutes."
+          impact: "Slow user experience during meeting join. SLO violation."
+          runbook_url: "docs/runbooks/gc-incident-response.md#scenario-2-high-latency--slow-responses"

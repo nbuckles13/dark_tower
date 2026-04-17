@@ -9,6 +9,7 @@
 - Observability pattern (metrics crate facade) → ADR-0011
 - Dashboard metric presentation (counters vs rates) → ADR-0029
 - Metric testability (component tests drive real `WebTransportServer::bind() → accept_loop()`; `MetricAssertion` snapshots via shared `DebuggingRecorder`; `wt_rig` `handle_connection`-direct bypass deleted once accept-loop component test lands) → ADR-0032 §Implementation Notes phasing step 2
+- Service-owned dashboards and alerts (collapsed Phase 4) → ADR-0031
 - Fuzz testing for media frames → ADR-0006
 - Client-to-MH QUIC connection user story → `docs/user-stories/2026-04-12-mh-quic-connection.md`
 
@@ -67,5 +68,4 @@
 - K8s deployment (ports, probes, env, downward API, advertise addresses) → `infra/services/mh-service/deployment.yaml`
 - Advertise address config + GC registration → `crates/mh-service/src/config.rs`, `gc_client.rs:register()`
 - K8s configmap (bind addresses, region, GC URL) → `infra/services/mh-service/configmap.yaml`
-- Grafana dashboard → `infra/grafana/dashboards/mh-overview.json`
-- Grafana kustomization → `infra/grafana/kustomization.yaml`
+- Grafana dashboard + kustomization → `infra/grafana/dashboards/mh-overview.json`, `infra/grafana/kustomization.yaml`

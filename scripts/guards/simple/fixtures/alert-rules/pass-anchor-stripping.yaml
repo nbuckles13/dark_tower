@@ -1,0 +1,16 @@
+# Strict-mode fixture: runbook_url has `#<anchor>`, anchor must be stripped
+# before file-existence check. Must pass.
+groups:
+  - name: fx-page
+    rules:
+      - alert: FxAnchorOK
+        expr: up == 0
+        for: 1m
+        labels:
+          severity: page
+          service: fx-service
+        annotations:
+          summary: "Fx anchor-stripping test"
+          description: "URL should resolve to the file despite anchor."
+          impact: "Fixture."
+          runbook_url: "docs/runbooks/gc-incident-response.md#scenario-1-database-connection-failures"

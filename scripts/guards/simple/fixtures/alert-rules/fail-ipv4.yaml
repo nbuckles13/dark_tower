@@ -1,0 +1,15 @@
+# Both-modes fixture: description contains RFC1918 IPv4. Must fail.
+groups:
+  - name: fx-page
+    rules:
+      - alert: FxIPLeaked
+        expr: up == 0
+        for: 1m
+        labels:
+          severity: page
+          service: fx-service
+        annotations:
+          summary: "Fx unreachable"
+          description: "Cannot reach 10.20.30.40 from the Fx pod."
+          impact: "User-visible."
+          runbook_url: "docs/runbooks/gc-incident-response.md#scenario-4-complete-service-outage"

@@ -1,0 +1,20 @@
+# Strict-mode fixture: runbook_url with a multi-dash anchor fragment. Every existing
+# production rule uses anchors; this explicitly exercises the anchor-stripping path
+# to catch false positives where the guard treats `#some-anchor-with-dashes` as
+# part of the filename.
+groups:
+  - name: mh-service-page-shape
+    interval: 30s
+    rules:
+      - alert: MHDashedAnchor
+        expr: up{job="mh-service"} == 0
+        for: 1m
+        labels:
+          severity: page
+          service: mh-service
+          component: infrastructure
+        annotations:
+          summary: "MH service unreachable"
+          description: "Media Handler has no instances registered for 1 minute."
+          impact: "Active media sessions may be disrupted; new sessions cannot be established."
+          runbook_url: "docs/runbooks/gc-incident-response.md#scenario-1-database-connection-failures"

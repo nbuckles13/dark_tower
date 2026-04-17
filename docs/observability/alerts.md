@@ -653,51 +653,47 @@ histogram_quantile(0.95,
 
 ## Alert Configuration Standards
 
-All alerts must follow these standards (per ADR-0011):
+> **Moved.** Alert authoring standards are now maintained in
+> [`docs/observability/alert-conventions.md`](./alert-conventions.md), which
+> is machine-enforced by `scripts/guards/simple/validate-alert-rules.sh` per
+> ADR-0031. The subsections below are thin pointers into the normative doc.
+> `alerts.md` remains the per-service alert catalog.
 
 ### 1. Alert Naming Convention
 
-**Format**: `{SERVICE}{COMPONENT}{CONDITION}`
-
-**Examples**:
-- `GCDown` (Global Controller Down)
-- `GCHighLatency` (Global Controller High Latency)
-- `ACKeyRotationFailed` (Auth Controller Key Rotation Failed)
+**Format**: `{SERVICE}{COMPONENT}{CONDITION}` (e.g., `GCDown`, `GCHighLatency`,
+`ACKeyRotationFailed`). See [alert-conventions.md](./alert-conventions.md) for
+the full naming convention.
 
 ### 2. Required Fields
 
-Every alert must include:
-- ✅ `alert`: Alert name (follows naming convention)
-- ✅ `expr`: PromQL expression (cardinality-safe)
-- ✅ `for`: Duration threshold (prevents flapping)
-- ✅ `labels.severity`: critical, warning, or info
-- ✅ `labels.service`: Service name
-- ✅ `labels.component`: Component affected
-- ✅ `annotations.summary`: One-line description with value
-- ✅ `annotations.description`: Detailed explanation
-- ✅ `annotations.impact`: User/business impact
-- ✅ `annotations.runbook_url`: Link to runbook
+See [alert-conventions.md §annotation-hygiene](./alert-conventions.md#annotation-hygiene)
+for the required-annotation table (`summary`, `description`, `runbook_url`
+required; `impact` recommended) and the `labels.severity` / `service` /
+`component` requirements.
+
+Note: `labels.severity` must be in `{page, warning, info}` per ADR-0031.
+Legacy `critical` label survives on grandfathered files until migration
+(see [TODO.md §ADR-0031 Alert Migration](../../TODO.md)).
 
 ### 3. Threshold Selection
 
-- **Critical**: SLO violations, service outages
-- **Warning**: Approaching limits, non-critical degradation
-- **Info**: Informational, trend tracking
+See [alert-conventions.md §severity-taxonomy](./alert-conventions.md#severity-taxonomy)
+for the page / warning / info calibration anchors with user-impact framing.
 
 ### 4. Duration (`for` clause)
 
-- **Critical**: 1-5 minutes (fast detection)
-- **Warning**: 5-10 minutes (avoid flapping)
-- **Info**: 10-30 minutes (trend detection)
+See [alert-conventions.md §for-conventions](./alert-conventions.md#for-conventions).
+Floor is 30s (guard-enforced). Typical windows: 30s–1m (critical path
+outages), 5m–10m (steady-state thresholds), 1h+ (long-window burn-rate).
+Match `for:` to the `rate()` window where applicable.
 
 ### 5. Runbook Requirement
 
-Every alert MUST link to a runbook with:
-- Symptom description
-- Impact assessment
-- Diagnosis steps (PromQL queries, kubectl commands)
-- Mitigation actions (immediate + long-term)
-- Escalation paths
+See [alert-conventions.md §annotation-hygiene](./alert-conventions.md#annotation-hygiene)
+for the `runbook_url` format rule. Must be repo-relative under
+`docs/runbooks/` (guard-enforced in strict mode). Every runbook should cover:
+symptom, impact, diagnosis, mitigation, escalation.
 
 ---
 

@@ -1,0 +1,44 @@
+# Strict-mode fixture: one rule per severity, all clean. Must pass.
+groups:
+  - name: fx-page
+    interval: 30s
+    rules:
+      - alert: FxPageExample
+        expr: up == 0
+        for: 1m
+        labels:
+          severity: page
+          service: fx-service
+        annotations:
+          summary: "Fx is down"
+          description: "Fx service has no running instance for 1 minute."
+          impact: "Users cannot use the service."
+          runbook_url: "docs/runbooks/gc-incident-response.md#scenario-4-complete-service-outage"
+  - name: fx-warning
+    interval: 60s
+    rules:
+      - alert: FxWarningExample
+        expr: rate(fx_requests_total[5m]) > 100
+        for: 5m
+        labels:
+          severity: warning
+          service: fx-service
+        annotations:
+          summary: "Fx request rate elevated"
+          description: "Fx request rate is {{ $value }} rps for 5 minutes."
+          impact: "Approaching capacity; watch for scale events."
+          runbook_url: "docs/runbooks/gc-incident-response.md#scenario-6-resource-pressure"
+  - name: fx-info
+    interval: 60s
+    rules:
+      - alert: FxInfoExample
+        expr: rate(fx_cache_misses_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: info
+          service: fx-service
+        annotations:
+          summary: "Fx cache misses present"
+          description: "Fx cache miss rate is {{ $value }}."
+          impact: "No user impact; observability signal."
+          runbook_url: "docs/runbooks/gc-incident-response.md#scenario-1-database-connection-failures"

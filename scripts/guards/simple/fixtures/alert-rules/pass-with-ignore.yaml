@@ -1,0 +1,16 @@
+# Strict-mode fixture: hygiene marker present for a secret-looking string. Must pass.
+groups:
+  - name: fx-page
+    rules:
+      # guard:ignore(third-party docs reference, not a secret)
+      - alert: FxDocsReference
+        expr: up == 0
+        for: 1m
+        labels:
+          severity: page
+          service: fx-service
+        annotations:
+          summary: "Fx doc rendering failed"
+          description: "See 10.0.0.1 for the doc server; failure means internal docs are unreachable."
+          impact: "Doc site down."
+          runbook_url: "docs/runbooks/gc-incident-response.md#scenario-4-complete-service-outage"

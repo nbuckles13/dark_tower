@@ -1,0 +1,15 @@
+# Strict-mode fixture: runbook_url uses ../ to escape docs/runbooks/. Must fail.
+groups:
+  - name: fx-page
+    rules:
+      - alert: FxPathTraversal
+        expr: up == 0
+        for: 1m
+        labels:
+          severity: page
+          service: fx-service
+        annotations:
+          summary: "Fx unreachable"
+          description: "Fx is down."
+          impact: "User-visible."
+          runbook_url: "docs/runbooks/../../etc/passwd"

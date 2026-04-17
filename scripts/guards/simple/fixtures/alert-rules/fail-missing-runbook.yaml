@@ -1,0 +1,14 @@
+# Both-modes fixture: no runbook_url annotation. Must fail.
+groups:
+  - name: fx-page
+    rules:
+      - alert: FxNoRunbook
+        expr: up == 0
+        for: 1m
+        labels:
+          severity: page
+          service: fx-service
+        annotations:
+          summary: "Fx down"
+          description: "Fx is down."
+          impact: "User-visible."

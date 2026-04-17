@@ -5,6 +5,7 @@
 - User auth, meeting access, join flow → ADR-0020
 - Observability pattern (metrics crate facade) → ADR-0011
 - Metric testability (component tests, `MetricAssertion`, presence guard, rollout SLO) → ADR-0032
+- Service-owned dashboards and alerts (collapsed Phase 4) → ADR-0031
 
 ## Code Locations
 - Service entry point → `crates/mc-service/src/main.rs`
