@@ -302,6 +302,102 @@ mod tests {
         assert!(conns.is_empty());
     }
 
+    /// Coordination round-trip covering multi-MH and idempotent retry paths.
+    ///
+    /// Delta vs `test_notify_disconnected_success`:
+    /// - Multi-MH per participant (existing test uses single MH per participant)
+    /// - Interleaved disconnect: removing one handler must not affect siblings
+    ///   (exercises the per-handler `retain` path in
+    ///   `MhConnectionRegistry::remove_connection`)
+    /// - Idempotent second-disconnect on a tuple already removed: returns Ok
+    ///   with `acknowledged=true` (rollback-safe invariant for MH retries /
+    ///   late deliveries after meeting teardown — ops concern, R-15 spec)
+    #[tokio::test]
+    async fn test_coordination_flow_connect_disconnect_round_trip() {
+        let registry = Arc::new(MhConnectionRegistry::new());
+        let svc = McMediaCoordinationService::new(Arc::clone(&registry));
+
+        // Participant connects to two MHs (active/active topology).
+        let connect_mh1 = Request::new(ParticipantMediaConnected {
+            meeting_id: "meeting-round-trip".to_string(),
+            participant_id: "part-rt".to_string(),
+            handler_id: "mh-alpha".to_string(),
+        });
+        svc.notify_participant_connected(connect_mh1).await.unwrap();
+
+        let connect_mh2 = Request::new(ParticipantMediaConnected {
+            meeting_id: "meeting-round-trip".to_string(),
+            participant_id: "part-rt".to_string(),
+            handler_id: "mh-beta".to_string(),
+        });
+        svc.notify_participant_connected(connect_mh2).await.unwrap();
+
+        let conns = registry
+            .get_connections("meeting-round-trip", "part-rt")
+            .await;
+        assert_eq!(conns.len(), 2, "both MH connections should be tracked");
+
+        // Disconnect from mh-alpha only: mh-beta must remain intact (sibling preservation).
+        let disconnect_mh1 = Request::new(ParticipantMediaDisconnected {
+            meeting_id: "meeting-round-trip".to_string(),
+            participant_id: "part-rt".to_string(),
+            handler_id: "mh-alpha".to_string(),
+            reason: 1,
+        });
+        let ack1 = svc
+            .notify_participant_disconnected(disconnect_mh1)
+            .await
+            .unwrap();
+        assert!(ack1.into_inner().acknowledged);
+
+        let conns = registry
+            .get_connections("meeting-round-trip", "part-rt")
+            .await;
+        assert_eq!(
+            conns.len(),
+            1,
+            "removing mh-alpha should leave mh-beta tracked"
+        );
+        assert_eq!(conns[0].handler_id, "mh-beta");
+
+        // Disconnect from mh-beta: participant and meeting should be cleaned up.
+        let disconnect_mh2 = Request::new(ParticipantMediaDisconnected {
+            meeting_id: "meeting-round-trip".to_string(),
+            participant_id: "part-rt".to_string(),
+            handler_id: "mh-beta".to_string(),
+            reason: 1,
+        });
+        let ack2 = svc
+            .notify_participant_disconnected(disconnect_mh2)
+            .await
+            .unwrap();
+        assert!(ack2.into_inner().acknowledged);
+
+        assert_eq!(
+            registry.meeting_count().await,
+            0,
+            "meeting should be cleaned up once all connections are dropped"
+        );
+
+        // Idempotent retry: MH may resend disconnect for a tuple the registry
+        // has already cleared. MC must return Ok, not a gRPC error — a gRPC
+        // error would page operators via error-rate alerts.
+        let disconnect_retry = Request::new(ParticipantMediaDisconnected {
+            meeting_id: "meeting-round-trip".to_string(),
+            participant_id: "part-rt".to_string(),
+            handler_id: "mh-beta".to_string(),
+            reason: 1,
+        });
+        let ack_retry = svc
+            .notify_participant_disconnected(disconnect_retry)
+            .await
+            .unwrap();
+        assert!(
+            ack_retry.into_inner().acknowledged,
+            "idempotent re-disconnect must return acknowledged=true"
+        );
+    }
+
     #[tokio::test]
     async fn test_notify_disconnected_unknown_meeting() {
         let svc = create_service();

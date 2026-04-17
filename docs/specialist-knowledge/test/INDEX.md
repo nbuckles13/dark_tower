@@ -29,11 +29,12 @@
 - Auth (meeting/guest JWT, McAuthInterceptor, JWKS McAuthLayer+scope) -> `crates/mc-service/src/auth/mod.rs:tests`, `grpc/auth_interceptor.rs:tests`
 - Config + error tests (incl. MhAssignmentMissing) -> `crates/mc-service/src/config.rs:tests`, `crates/mc-service/src/errors.rs:tests`
 - Actor tests (controller, meeting, participant, session) -> `crates/mc-service/src/actors/controller.rs:tests`, `meeting.rs`, `participant.rs`, `session.rs`
-- Join flow integration tests (T1-T13, MH assignment, media_servers, bridge, RegisterMeeting trigger) -> `crates/mc-service/tests/join_tests.rs`
+- Join flow integration tests (T1-T15, MH assignment, media_servers, bridge, RegisterMeeting trigger, multi-MH, mixed grpc_endpoint) -> `crates/mc-service/tests/join_tests.rs`
 - WebTransport tests (encoding, connection, handle_client_message) -> `crates/mc-service/src/webtransport/connection.rs:tests`
 - RegisterMeeting retry/backoff unit tests -> `crates/mc-service/src/webtransport/connection.rs:tests::test_register_*`
-- MH data (MhAssignmentStore trait, MhRegistrationClient trait, MockMhAssignmentStore, MockMhRegistrationClient) -> `crates/mc-service/src/redis/client.rs`, `src/grpc/mh_client.rs`, `tests/join_tests.rs`
-- MH coordination (registry, MediaCoordinationService) -> `crates/mc-service/src/mh_connection_registry.rs:tests`, `grpc/media_coordination.rs:tests`
+- MH data (MhAssignmentStore trait, MhRegistrationClient trait, MockMhAssignmentStore, MockMhRegistrationClient + `wait_for_calls(expected, timeout)`) -> `crates/mc-service/src/redis/client.rs`, `src/grpc/mh_client.rs`, `tests/join_tests.rs`
+- Join test harness builders (`TestServer::create_meeting`, `create_meeting_with_handlers(id, handlers)`) -> `crates/mc-service/tests/join_tests.rs`
+- MH coordination (registry, MediaCoordinationService, connect/disconnect round-trip + idempotent retry) -> `crates/mc-service/src/mh_connection_registry.rs:tests`, `grpc/media_coordination.rs:tests::test_coordination_flow_connect_disconnect_round_trip`
 - GC integration + heartbeat tests -> `crates/mc-service/tests/gc_integration.rs`, `heartbeat_tasks.rs`
 - Health + metrics (incl. RegisterMeeting, MH coordination + media connection failure) -> `crates/mc-service/src/observability/health.rs`, `metrics.rs`
 - Test utils (mock Redis, mock GC, mock MH) -> `crates/mc-test-utils/src/mock_redis.rs`, `mock_gc.rs`, `mock_mh.rs`

@@ -5,25 +5,24 @@
 - Fix-or-defer review model -> ADR-0024 (`docs/decisions/adr-0024-agent-teams-workflow.md`)
 
 ## JWT Validation (Common + Thin Wrappers)
-- Common JWT code (all shared logic) -> `crates/common/src/jwt.rs`
-- Internal token request types (GC->AC contract) -> `crates/common/src/meeting_token.rs`
+- Common JWT code -> `crates/common/src/jwt.rs`; internal token request types -> `crates/common/src/meeting_token.rs`
 - GC thin wrapper -> `crates/gc-service/src/auth/jwt.rs` (ServiceClaims, UserClaims)
 - MC thin wrapper -> `crates/mc-service/src/auth/mod.rs` (MeetingTokenClaims, GuestTokenClaims)
-- MH JWKS config -> `infra/services/mh-service/configmap.yaml:AC_JWKS_URL` (shared configmap, mirrors MC pattern in `mc-service-config`)
+- MH JWKS config -> `infra/services/mh-service/configmap.yaml:AC_JWKS_URL` (mirrors `mc-service-config`)
 
 ## Per-Service Observability (Metrics & Dashboards)
 - AC/GC/MC/MH metrics -> `crates/*/src/observability/metrics.rs` (per-service, not duplication)
 - Alert rules -> `infra/docker/prometheus/rules/{mc,gc}-alerts.yaml`; dashboards -> ADR-0029, `infra/grafana/dashboards/`
 
 ## Integration Test Coverage
-- MC join flow (13 tests, incl T12/T13 RegisterMeeting) -> `crates/mc-service/tests/join_tests.rs`
+- MC join flow (15 tests, incl T12-T15 RegisterMeeting + multi-MH + mixed-endpoint) -> `crates/mc-service/tests/join_tests.rs`
+- MC join fixture (single + multi-handler) -> `TestServer::create_meeting()` / `TestServer::create_meeting_with_handlers()` in `join_tests.rs`
 - GC join/guest/settings -> `crates/gc-service/tests/meeting_tests.rs`
 - MH GC integration -> `crates/mh-service/tests/gc_integration.rs`
 - Shared fixtures -> `crates/mc-test-utils/src/jwt_test.rs`, `crates/gc-test-utils/src/server_harness.rs`
 
 ## Per-Service Config Parsing
-- AC/GC/MC/MH config -> `crates/*/src/config.rs:Config::from_vars()` (per-service); ordinal parsing -> `crates/common/src/config.rs:parse_statefulset_ordinal()`
-- Extraction candidate: `generate_instance_id(prefix)` -> 4-line pattern in GC + MC + MH config
+- AC/GC/MC/MH config -> `crates/*/src/config.rs:Config::from_vars()`; ordinal parsing -> `crates/common/src/config.rs:parse_statefulset_ordinal()`; `generate_instance_id(prefix)` is an extraction candidate (GC/MC/MH)
 
 ## gRPC Auth (Cross-Service)
 - MC auth layer (async JWKS, R-22) -> `crates/mc-service/src/grpc/auth_interceptor.rs:McAuthLayer` (applied in main.rs)
@@ -39,6 +38,7 @@
 - MH connection registry -> `crates/mc-service/src/mh_connection_registry.rs:MhConnectionRegistry`
 - MAX_ID_LENGTH constant -> `mh_connection_registry.rs` (single source, imported by media_coordination.rs)
 - MhRegistrationClient trait (testability seam) -> `crates/mc-service/src/grpc/mh_client.rs:MhRegistrationClient`
+- MockMhRegistrationClient + `wait_for_calls(expected, timeout)` deterministic notifier -> `crates/mc-service/tests/join_tests.rs` (reuse before adding new async-wait helpers)
 - Async RegisterMeeting trigger (R-12) -> `crates/mc-service/src/webtransport/connection.rs:register_meeting_with_handlers()`
 
 ## gRPC Clients (Cross-Service)

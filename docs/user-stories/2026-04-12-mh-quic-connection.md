@@ -647,7 +647,7 @@ Phase 6 (after dashboards):
 | 12 | MH: WebTransport dashboard + alerts | | | Pending |
 | 13 | MC: MH coordination dashboard + alerts | | | Pending |
 | 14 | MH: integration tests | | | Pending |
-| 15 | MC: join + coordination tests | | | Pending |
+| 15 | MC: join + coordination tests | `docs/devloop-outputs/2026-04-17-mc-join-coordination-tests/` | `12c7628` | Completed |
 | 16 | Env-tests: MH connection E2E | | | Pending |
 | 17 | MH + MC runbooks | | | Pending |
 | 18 | Post-deploy monitoring checklist | | | Pending |
