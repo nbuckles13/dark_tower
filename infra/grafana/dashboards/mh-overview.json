@@ -38,7 +38,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "Total GC registrations in the selected time range.",
       "fieldConfig": {
@@ -86,7 +86,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "sum(increase(mh_gc_registration_total[$__range]))",
@@ -101,7 +101,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "Total GC heartbeats (load reports) in the selected time range.",
       "fieldConfig": {
@@ -149,7 +149,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "sum(increase(mh_gc_heartbeats_total[$__range]))",
@@ -164,7 +164,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "Total token refresh attempts in the selected time range.",
       "fieldConfig": {
@@ -212,7 +212,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "sum(increase(mh_token_refresh_total[$__range]))",
@@ -240,7 +240,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "GC registration count by status (success/error) over time.",
       "fieldConfig": {
@@ -318,7 +318,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "sum by(status) (increase(mh_gc_registration_total[$__rate_interval]))",
@@ -333,7 +333,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "GC registration RPC latency percentiles (p50, p95, p99).",
       "fieldConfig": {
@@ -411,7 +411,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "histogram_quantile(0.50, sum by(le) (rate(mh_gc_registration_duration_seconds_bucket[$__rate_interval])))",
@@ -422,7 +422,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "histogram_quantile(0.95, sum by(le) (rate(mh_gc_registration_duration_seconds_bucket[$__rate_interval])))",
@@ -433,7 +433,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "histogram_quantile(0.99, sum by(le) (rate(mh_gc_registration_duration_seconds_bucket[$__rate_interval])))",
@@ -461,7 +461,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "GC heartbeat (load report) count by status (success/error) over time.",
       "fieldConfig": {
@@ -539,7 +539,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "sum by(status) (increase(mh_gc_heartbeats_total[$__rate_interval]))",
@@ -554,7 +554,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "GC heartbeat RPC latency percentiles (p50, p95, p99).",
       "fieldConfig": {
@@ -632,7 +632,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "histogram_quantile(0.50, sum by(le) (rate(mh_gc_heartbeat_latency_seconds_bucket[$__rate_interval])))",
@@ -643,7 +643,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "histogram_quantile(0.95, sum by(le) (rate(mh_gc_heartbeat_latency_seconds_bucket[$__rate_interval])))",
@@ -654,7 +654,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "histogram_quantile(0.99, sum by(le) (rate(mh_gc_heartbeat_latency_seconds_bucket[$__rate_interval])))",
@@ -682,7 +682,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "Token refresh count by status (success/error) over time.",
       "fieldConfig": {
@@ -760,7 +760,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "sum by(status) (increase(mh_token_refresh_total[$__rate_interval]))",
@@ -775,7 +775,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "Token refresh latency percentiles (p50, p95, p99).",
       "fieldConfig": {
@@ -853,7 +853,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "histogram_quantile(0.50, sum by(le) (rate(mh_token_refresh_duration_seconds_bucket[$__rate_interval])))",
@@ -864,7 +864,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "histogram_quantile(0.95, sum by(le) (rate(mh_token_refresh_duration_seconds_bucket[$__rate_interval])))",
@@ -875,7 +875,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "histogram_quantile(0.99, sum by(le) (rate(mh_token_refresh_duration_seconds_bucket[$__rate_interval])))",
@@ -903,7 +903,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "Current number of active WebTransport connections.",
       "fieldConfig": {
@@ -959,7 +959,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "mh_active_connections",
@@ -974,7 +974,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "Total WebTransport connections in the selected time range.",
       "fieldConfig": {
@@ -1022,7 +1022,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "sum(increase(mh_webtransport_connections_total[$__range]))",
@@ -1037,7 +1037,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "Total JWT validations in the selected time range.",
       "fieldConfig": {
@@ -1085,7 +1085,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "sum(increase(mh_jwt_validations_total[$__range]))",
@@ -1100,7 +1100,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "WebTransport connection count by status (accepted/rejected/error) over time.",
       "fieldConfig": {
@@ -1178,7 +1178,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "sum by(status) (increase(mh_webtransport_connections_total[$__rate_interval]))",
@@ -1193,7 +1193,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "WebTransport handshake latency percentiles (p50, p95, p99). Measures session accept through JWT validation.",
       "fieldConfig": {
@@ -1271,7 +1271,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "histogram_quantile(0.50, sum by(le) (rate(mh_webtransport_handshake_duration_seconds_bucket[$__rate_interval])))",
@@ -1282,7 +1282,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "histogram_quantile(0.95, sum by(le) (rate(mh_webtransport_handshake_duration_seconds_bucket[$__rate_interval])))",
@@ -1293,7 +1293,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "histogram_quantile(0.99, sum by(le) (rate(mh_webtransport_handshake_duration_seconds_bucket[$__rate_interval])))",
@@ -1308,7 +1308,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "JWT validation count by result (success/failure) and token type over time.",
       "fieldConfig": {
@@ -1386,7 +1386,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "sum by(result, token_type, failure_reason) (increase(mh_jwt_validations_total[$__rate_interval]))",
@@ -1401,7 +1401,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "Caller service_type rejections by Layer 2 routing (ADR-0003). Any non-zero value indicates a bug or misconfiguration.",
       "fieldConfig": {
@@ -1483,7 +1483,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "sum by(grpc_service, expected_type, actual_type) (increase(mh_caller_type_rejected_total[$__rate_interval]))",
@@ -1498,7 +1498,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "Count of provisional WebTransport connections disconnected because RegisterMeeting did not arrive within the configured timeout (R-26). Non-zero values indicate MC->MH RegisterMeeting latency or client-side sequencing bugs. Task 12 will expand with alerting/thresholds.",
       "fieldConfig": {
@@ -1550,7 +1550,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "increase(mh_register_meeting_timeouts_total[$__rate_interval])",
@@ -1571,7 +1571,27 @@
     "service-overview"
   ],
   "templating": {
-    "list": []
+    "list": [
+      {
+        "current": {
+          "selected": false,
+          "text": "prometheus",
+          "value": "prometheus"
+        },
+        "hide": 0,
+        "includeAll": false,
+        "label": "Datasource",
+        "multi": false,
+        "name": "datasource",
+        "options": [],
+        "query": "prometheus",
+        "queryValue": "",
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "type": "datasource"
+      }
+    ]
   },
   "time": {
     "from": "now-1h",

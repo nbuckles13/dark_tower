@@ -1,0 +1,20 @@
+{
+  "title": "fail-hardcoded-datasource",
+  "templating": {"list": []},
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "HTTP Requests",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"unit": "reqps"}},
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "sum(rate(ac_http_requests_total[$__rate_interval])) by (status)"
+        }
+      ]
+    }
+  ]
+}

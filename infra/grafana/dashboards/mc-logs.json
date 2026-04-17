@@ -25,7 +25,7 @@
     {
       "datasource": {
         "type": "loki",
-        "uid": "loki"
+        "uid": "$datasource"
       },
       "description": "Log volume over time grouped by log level. Shows overall logging activity and distribution.",
       "fieldConfig": {
@@ -148,7 +148,7 @@
         {
           "datasource": {
             "type": "loki",
-            "uid": "loki"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "sum by(level) (count_over_time({app=\"mc-service\"}[5m]))",
@@ -163,7 +163,7 @@
     {
       "datasource": {
         "type": "loki",
-        "uid": "loki"
+        "uid": "$datasource"
       },
       "description": "Recent logs from MC service. Filter by log level and pod using variables above.",
       "gridPos": {
@@ -187,7 +187,7 @@
         {
           "datasource": {
             "type": "loki",
-            "uid": "loki"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "{app=\"mc-service\", pod=~\"$pod\", level=~\"$level\"}",
@@ -201,7 +201,7 @@
     {
       "datasource": {
         "type": "loki",
-        "uid": "loki"
+        "uid": "$datasource"
       },
       "description": "Error-level logs only. Critical issues requiring immediate attention.",
       "gridPos": {
@@ -225,7 +225,7 @@
         {
           "datasource": {
             "type": "loki",
-            "uid": "loki"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "{app=\"mc-service\", level=\"ERROR\"}",
@@ -239,7 +239,7 @@
     {
       "datasource": {
         "type": "loki",
-        "uid": "loki"
+        "uid": "$datasource"
       },
       "description": "Warning-level logs. Potential issues that should be monitored.",
       "gridPos": {
@@ -263,7 +263,7 @@
         {
           "datasource": {
             "type": "loki",
-            "uid": "loki"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "{app=\"mc-service\", level=\"WARN\"}",
@@ -284,6 +284,25 @@
   ],
   "templating": {
     "list": [
+      {
+        "current": {
+          "selected": false,
+          "text": "loki",
+          "value": "loki"
+        },
+        "hide": 0,
+        "includeAll": false,
+        "label": "Datasource",
+        "multi": false,
+        "name": "datasource",
+        "options": [],
+        "query": "loki",
+        "queryValue": "",
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "type": "datasource"
+      },
       {
         "current": {
           "selected": false,

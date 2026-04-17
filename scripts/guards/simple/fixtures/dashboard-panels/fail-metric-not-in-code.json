@@ -1,0 +1,22 @@
+{
+  "title": "fail-metric-not-in-code",
+  "templating": {
+    "list": [{"name": "datasource", "type": "datasource", "query": "prometheus"}]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Fabricated Metric",
+      "datasource": {"type": "prometheus", "uid": "$datasource"},
+      "fieldConfig": {"defaults": {"unit": "short"}},
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "expr": "sum(rate(ac_nonexistent_metric_total[$__rate_interval]))"
+        }
+      ]
+    }
+  ]
+}

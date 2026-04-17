@@ -1,0 +1,22 @@
+{
+  "title": "fail-rate-hardcoded-window",
+  "templating": {
+    "list": [{"name": "datasource", "type": "datasource", "query": "prometheus"}]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "HTTP Requests",
+      "datasource": {"type": "prometheus", "uid": "$datasource"},
+      "fieldConfig": {"defaults": {"unit": "reqps"}},
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "expr": "sum(rate(ac_http_requests_total[5m])) by (status)"
+        }
+      ]
+    }
+  ]
+}

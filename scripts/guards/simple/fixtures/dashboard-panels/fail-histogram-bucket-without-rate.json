@@ -1,0 +1,23 @@
+{
+  "_comment": "Histogram _bucket must be wrapped in rate(); histogram_quantile(..., _bucket[..]) without rate() is broken.",
+  "title": "fail-histogram-bucket-without-rate",
+  "templating": {
+    "list": [{"name": "datasource", "type": "datasource", "query": "prometheus"}]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Token Latency p95 (wrong)",
+      "datasource": {"type": "prometheus", "uid": "$datasource"},
+      "fieldConfig": {"defaults": {"unit": "s"}},
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "expr": "histogram_quantile(0.95, ac_token_issuance_duration_seconds_bucket)"
+        }
+      ]
+    }
+  ]
+}

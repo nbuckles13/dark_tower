@@ -122,7 +122,10 @@ if ! command -v jq &> /dev/null; then
 else
     # Extract datasource UIDs from panels using jq (proper JSON parsing)
     # This extracts only UIDs from "datasource": {"uid": "..."} contexts,
-    # excluding dashboard UIDs at root level and other non-datasource UIDs
+    # excluding dashboard UIDs at root level and other non-datasource UIDs.
+    # Also skips Grafana template-variable references ($var, ${var}) —
+    # those are resolved at render time, not against the datasources.yaml
+    # config. validate-dashboard-panels.sh handles template-var correctness.
     referenced_uids=$(find "$DASHBOARD_DIR" -name "*.json" -exec jq -r '
         .. |
         objects |
@@ -132,6 +135,7 @@ else
         .uid // empty
     ' {} \; 2>/dev/null | \
         grep -v "^-- Grafana --$" | \
+        grep -v '^\$' | \
         sort -u || true)
 
     if [ -z "$referenced_uids" ]; then

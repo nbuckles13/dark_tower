@@ -1,0 +1,23 @@
+{
+  "_comment": "Gauges represent instantaneous values and must never be wrapped in rate()/increase().",
+  "title": "fail-gauge-misuse",
+  "templating": {
+    "list": [{"name": "datasource", "type": "datasource", "query": "prometheus"}]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Signing Key Age (wrong)",
+      "datasource": {"type": "prometheus", "uid": "$datasource"},
+      "fieldConfig": {"defaults": {"unit": "d"}},
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "expr": "rate(ac_signing_key_age_days[$__rate_interval])"
+        }
+      ]
+    }
+  ]
+}
