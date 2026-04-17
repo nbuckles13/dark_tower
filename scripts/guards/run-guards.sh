@@ -130,8 +130,17 @@ if [[ -d "$SIMPLE_GUARDS_DIR" ]]; then
                     echo -e "${RED}FAILED${NC}: $GUARD_NAME"
                     ((FAILED_GUARDS++)) || true
                     FAILED_GUARD_NAMES+=("$GUARD_NAME")
-                    # Show failure details
-                    echo "$OUTPUT" | grep -E "(VIOLATION|violation)" | head -5
+                    # Show failure details.
+                    #
+                    # `|| true` is load-bearing: under `set -euo pipefail`, if the
+                    # failed guard's output contains NO `VIOLATION` text (e.g.
+                    # validate-application-metrics emits `ERROR` instead), grep
+                    # exits 1, pipefail propagates, and `set -e` aborts the
+                    # for-loop mid-pipeline. The script then stops running the
+                    # remaining guards silently — turning a single failure into
+                    # a CI lie where downstream guard failures go unreported.
+                    # Keep this sentinel in place even if the pattern changes.
+                    { echo "$OUTPUT" | grep -E "(VIOLATION|violation|ERROR|error)" | head -5; } || true
                 fi
             fi
             echo ""
