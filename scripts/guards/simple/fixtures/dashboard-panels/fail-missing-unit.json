@@ -1,0 +1,22 @@
+{
+  "title": "fail-missing-unit",
+  "templating": {
+    "list": [{"name": "datasource", "type": "datasource", "query": "prometheus"}]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "HTTP Requests (no unit)",
+      "datasource": {"type": "prometheus", "uid": "$datasource"},
+      "fieldConfig": {"defaults": {}},
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "expr": "sum(rate(ac_http_requests_total[$__rate_interval]))"
+        }
+      ]
+    }
+  ]
+}

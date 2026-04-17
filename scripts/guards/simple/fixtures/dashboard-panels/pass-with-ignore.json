@@ -1,0 +1,26 @@
+{
+  "_comment": "Valid guard:ignore in description bypasses classification + rate-window checks for that panel only.",
+  "title": "pass-with-ignore",
+  "templating": {
+    "list": [
+      {"name": "datasource", "type": "datasource", "query": "prometheus"}
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Cumulative Event Count",
+      "description": "Deliberate instant-counter read for investigative dashboard — not a rate. # guard:ignore(investigative panel snapshotting cumulative counter)",
+      "datasource": {"type": "prometheus", "uid": "$datasource"},
+      "fieldConfig": {"defaults": {"unit": "short"}},
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "expr": "sum(ac_token_issuance_total)"
+        }
+      ]
+    }
+  ]
+}

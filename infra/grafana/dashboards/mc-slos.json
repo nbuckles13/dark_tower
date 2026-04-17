@@ -25,7 +25,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "GC heartbeat success rate. Green = >99%, Yellow = 95-99%, Red = <95%. Critical for MC-GC integration health.",
       "fieldConfig": {
@@ -81,7 +81,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "100 * (sum(rate(mc_gc_heartbeats_total{job=\"mc-service\", status=\"success\"}[5m])) / sum(rate(mc_gc_heartbeats_total{job=\"mc-service\"}[5m])))",
@@ -96,7 +96,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "Token refresh success rate. Green = >99.9%, Yellow = 99-99.9%, Red = <99%. Critical for AC authentication.",
       "fieldConfig": {
@@ -152,7 +152,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "100 * (sum(rate(mc_token_refresh_total{job=\"mc-service\", status=\"success\"}[5m])) / sum(rate(mc_token_refresh_total{job=\"mc-service\"}[5m])))",
@@ -167,7 +167,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "Current token refresh p99 latency. Monitors AC token acquisition performance against 5s threshold.",
       "fieldConfig": {
@@ -221,7 +221,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "histogram_quantile(0.99, sum by(le) (rate(mc_token_refresh_duration_seconds_bucket{job=\"mc-service\"}[5m])))",
@@ -242,7 +242,27 @@
     "slo"
   ],
   "templating": {
-    "list": []
+    "list": [
+      {
+        "current": {
+          "selected": false,
+          "text": "prometheus",
+          "value": "prometheus"
+        },
+        "hide": 0,
+        "includeAll": false,
+        "label": "Datasource",
+        "multi": false,
+        "name": "datasource",
+        "options": [],
+        "query": "prometheus",
+        "queryValue": "",
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "type": "datasource"
+      }
+    ]
   },
   "time": {
     "from": "now-7d",

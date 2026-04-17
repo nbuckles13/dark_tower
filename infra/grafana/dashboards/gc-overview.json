@@ -38,7 +38,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "Total HTTP requests in the selected time range.",
       "fieldConfig": {
@@ -86,7 +86,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "sum(increase(gc_http_requests_total[$__range]))",
@@ -101,7 +101,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "Total MC assignments in the selected time range.",
       "fieldConfig": {
@@ -149,7 +149,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "sum(increase(gc_mc_assignments_total[$__range]))",
@@ -164,7 +164,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "HTTP request rate across all endpoints (requests per second). Tracks overall traffic volume to Global Controller.",
       "fieldConfig": {
@@ -242,7 +242,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "sum by(endpoint) (increase(gc_http_requests_total[$__rate_interval]))",
@@ -257,7 +257,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "HTTP request latency percentiles (p50, p95, p99) with SLO threshold line at 200ms. Violations indicate latency SLO breach.",
       "fieldConfig": {
@@ -369,7 +369,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "histogram_quantile(0.50, sum by(le) (rate(gc_http_request_duration_seconds_bucket[$__rate_interval])))",
@@ -380,7 +380,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "histogram_quantile(0.95, sum by(le) (rate(gc_http_request_duration_seconds_bucket[$__rate_interval])))",
@@ -391,7 +391,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "histogram_quantile(0.99, sum by(le) (rate(gc_http_request_duration_seconds_bucket[$__rate_interval])))",
@@ -402,7 +402,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "vector(0.2)",
@@ -417,7 +417,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "HTTP error rate as percentage of total requests. Green = <0.1%, Yellow = 0.1-1%, Red = >1% (SLO violation).",
       "fieldConfig": {
@@ -473,7 +473,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "100 * sum(rate(gc_http_requests_total{status_code=~\"[45]..\"}[$__rate_interval])) / sum(rate(gc_http_requests_total[$__rate_interval]))",
@@ -488,7 +488,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "Breakdown of HTTP requests by status code category (2xx success, 4xx client error, 5xx server error).",
       "fieldConfig": {
@@ -611,7 +611,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "sum by(status_code) (increase(gc_http_requests_total{status_code=~\"2..\"}[$__rate_interval]))",
@@ -622,7 +622,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "sum by(status_code) (increase(gc_http_requests_total{status_code=~\"4..\"}[$__rate_interval]))",
@@ -633,7 +633,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "sum by(status_code) (increase(gc_http_requests_total{status_code=~\"5..\"}[$__rate_interval]))",
@@ -648,7 +648,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "MC assignment rate (assignments per second). Tracks how frequently meetings are being assigned to Meeting Controllers.",
       "fieldConfig": {
@@ -726,7 +726,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "sum by(status) (increase(gc_mc_assignments_total[$__rate_interval]))",
@@ -741,7 +741,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "MC assignment latency percentiles with SLO threshold at 20ms (ADR-0010). Critical path for meeting join performance.",
       "fieldConfig": {
@@ -853,7 +853,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "histogram_quantile(0.50, sum by(le) (rate(gc_mc_assignment_duration_seconds_bucket[$__rate_interval])))",
@@ -864,7 +864,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "histogram_quantile(0.95, sum by(le) (rate(gc_mc_assignment_duration_seconds_bucket[$__rate_interval])))",
@@ -875,7 +875,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "histogram_quantile(0.99, sum by(le) (rate(gc_mc_assignment_duration_seconds_bucket[$__rate_interval])))",
@@ -886,7 +886,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "vector(0.02)",
@@ -901,7 +901,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "MC assignment success rate as percentage. Green = >99%, Yellow = 95-99%, Red = <95%.",
       "fieldConfig": {
@@ -957,7 +957,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "100 * sum(rate(gc_mc_assignments_total{status=\"success\"}[$__rate_interval])) / sum(rate(gc_mc_assignments_total[$__rate_interval]))",
@@ -972,7 +972,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "Database query rate by operation type. Tracks query volume across different database operations.",
       "fieldConfig": {
@@ -1050,7 +1050,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "sum by(operation) (increase(gc_db_queries_total[$__rate_interval]))",
@@ -1065,7 +1065,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "Database query latency percentiles. Monitors database performance and identifies slow queries.",
       "fieldConfig": {
@@ -1177,7 +1177,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "histogram_quantile(0.50, sum by(le) (rate(gc_db_query_duration_seconds_bucket[$__rate_interval])))",
@@ -1188,7 +1188,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "histogram_quantile(0.95, sum by(le) (rate(gc_db_query_duration_seconds_bucket[$__rate_interval])))",
@@ -1199,7 +1199,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "histogram_quantile(0.99, sum by(le) (rate(gc_db_query_duration_seconds_bucket[$__rate_interval])))",
@@ -1210,7 +1210,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "vector(0.05)",
@@ -1225,7 +1225,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "Service health status. 1 = up, 0 = down. Monitors whether GC pods are running and responding to probes.",
       "fieldConfig": {
@@ -1291,7 +1291,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "up{job=\"gc-service\"}",
@@ -1306,7 +1306,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "Number of running GC pods. Monitors pod availability and scaling.",
       "fieldConfig": {
@@ -1360,7 +1360,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "count(up{job=\"gc-service\"} == 1)",
@@ -1375,7 +1375,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "Memory usage across GC pods. Monitors memory consumption and potential leaks.",
       "fieldConfig": {
@@ -1453,7 +1453,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "container_memory_working_set_bytes{namespace=\"dark-tower\", pod=~\"gc-service.*\"}",
@@ -1468,7 +1468,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "CPU usage across GC pods. Monitors CPU consumption and load patterns.",
       "fieldConfig": {
@@ -1546,7 +1546,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "rate(container_cpu_usage_seconds_total{namespace=\"dark-tower\", pod=~\"gc-service.*\"}[$__rate_interval])",
@@ -1574,7 +1574,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "Token refresh attempts by status (success/error). Tracks AC token lifecycle health.",
       "fieldConfig": {
@@ -1668,7 +1668,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "sum by(status) (increase(gc_token_refresh_total[$__rate_interval]))",
@@ -1683,7 +1683,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "Token refresh latency percentiles (p50, p95, p99).",
       "fieldConfig": {
@@ -1761,7 +1761,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "histogram_quantile(0.50, sum by(le) (rate(gc_token_refresh_duration_seconds_bucket[$__rate_interval])))",
@@ -1772,7 +1772,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "histogram_quantile(0.95, sum by(le) (rate(gc_token_refresh_duration_seconds_bucket[$__rate_interval])))",
@@ -1783,7 +1783,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "histogram_quantile(0.99, sum by(le) (rate(gc_token_refresh_duration_seconds_bucket[$__rate_interval])))",
@@ -1798,7 +1798,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "Token refresh failures by error type. High rate indicates AC connectivity issues.",
       "fieldConfig": {
@@ -1876,7 +1876,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "sum by(error_type) (increase(gc_token_refresh_failures_total[$__rate_interval]))",
@@ -1904,7 +1904,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "Requests to Auth Controller by operation and status.",
       "fieldConfig": {
@@ -1982,7 +1982,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "sum by(operation, status) (increase(gc_ac_requests_total[$__rate_interval]))",
@@ -1997,7 +1997,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "AC client request latency percentiles (p50, p95, p99).",
       "fieldConfig": {
@@ -2075,7 +2075,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "histogram_quantile(0.50, sum by(le) (rate(gc_ac_request_duration_seconds_bucket[$__rate_interval])))",
@@ -2086,7 +2086,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "histogram_quantile(0.95, sum by(le) (rate(gc_ac_request_duration_seconds_bucket[$__rate_interval])))",
@@ -2097,7 +2097,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "histogram_quantile(0.99, sum by(le) (rate(gc_ac_request_duration_seconds_bucket[$__rate_interval])))",
@@ -2125,7 +2125,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "gRPC calls to Meeting Controllers by method and status.",
       "fieldConfig": {
@@ -2203,7 +2203,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "sum by(method, status) (increase(gc_grpc_mc_calls_total[$__rate_interval]))",
@@ -2218,7 +2218,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "gRPC call latency to Meeting Controllers (p50, p95, p99).",
       "fieldConfig": {
@@ -2296,7 +2296,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "histogram_quantile(0.50, sum by(le) (rate(gc_grpc_mc_call_duration_seconds_bucket[$__rate_interval])))",
@@ -2307,7 +2307,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "histogram_quantile(0.95, sum by(le) (rate(gc_grpc_mc_call_duration_seconds_bucket[$__rate_interval])))",
@@ -2318,7 +2318,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "histogram_quantile(0.99, sum by(le) (rate(gc_grpc_mc_call_duration_seconds_bucket[$__rate_interval])))",
@@ -2346,7 +2346,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "Media Handler selection attempts by status and backup availability.",
       "fieldConfig": {
@@ -2424,7 +2424,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "sum by(status) (increase(gc_mh_selections_total[$__rate_interval]))",
@@ -2439,7 +2439,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "MH selection latency percentiles (p50, p95, p99).",
       "fieldConfig": {
@@ -2517,7 +2517,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "histogram_quantile(0.50, sum by(le) (rate(gc_mh_selection_duration_seconds_bucket[$__rate_interval])))",
@@ -2528,7 +2528,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "histogram_quantile(0.95, sum by(le) (rate(gc_mh_selection_duration_seconds_bucket[$__rate_interval])))",
@@ -2539,7 +2539,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "histogram_quantile(0.99, sum by(le) (rate(gc_mh_selection_duration_seconds_bucket[$__rate_interval])))",
@@ -2567,7 +2567,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "Meeting creation attempts by status (success/error). Tracks meeting creation volume and success rate.",
       "fieldConfig": {
@@ -2661,7 +2661,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "sum by(status) (increase(gc_meeting_creation_total[$__rate_interval]))",
@@ -2676,7 +2676,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "Meeting creation latency percentiles (p50, p95, p99).",
       "fieldConfig": {
@@ -2754,7 +2754,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "histogram_quantile(0.50, sum by(le) (rate(gc_meeting_creation_duration_seconds_bucket[$__rate_interval])))",
@@ -2765,7 +2765,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "histogram_quantile(0.95, sum by(le) (rate(gc_meeting_creation_duration_seconds_bucket[$__rate_interval])))",
@@ -2776,7 +2776,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "histogram_quantile(0.99, sum by(le) (rate(gc_meeting_creation_duration_seconds_bucket[$__rate_interval])))",
@@ -2791,7 +2791,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "Meeting creation failures by error type. High rate may indicate org limit exhaustion or DB issues.",
       "fieldConfig": {
@@ -2869,7 +2869,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "sum by(error_type) (increase(gc_meeting_creation_failures_total[$__rate_interval]))",
@@ -2897,7 +2897,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "Meeting join attempts by status (success/error). Tracks meeting join volume and success rate.",
       "fieldConfig": {
@@ -2991,7 +2991,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "sum by(status) (increase(gc_meeting_join_total[$__rate_interval]))",
@@ -3006,7 +3006,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "Meeting join latency percentiles (p50, p95, p99). Includes MC assignment and AC token request time.",
       "fieldConfig": {
@@ -3084,7 +3084,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "histogram_quantile(0.50, sum by(le) (rate(gc_meeting_join_duration_seconds_bucket[$__rate_interval])))",
@@ -3095,7 +3095,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "histogram_quantile(0.95, sum by(le) (rate(gc_meeting_join_duration_seconds_bucket[$__rate_interval])))",
@@ -3106,7 +3106,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "histogram_quantile(0.99, sum by(le) (rate(gc_meeting_join_duration_seconds_bucket[$__rate_interval])))",
@@ -3121,7 +3121,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "Meeting join failures by error type. High rate may indicate MC capacity issues or AC connectivity problems.",
       "fieldConfig": {
@@ -3199,7 +3199,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "sum by(error_type) (increase(gc_meeting_join_failures_total[$__rate_interval]))",
@@ -3214,7 +3214,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "Meeting join success rate as percentage. Green = >99%, Yellow = 95-99%, Red = <95%.",
       "fieldConfig": {
@@ -3270,7 +3270,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "100 * sum(rate(gc_meeting_join_total{status=\"success\"}[$__rate_interval])) / sum(rate(gc_meeting_join_total[$__rate_interval]))",
@@ -3298,7 +3298,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "Number of registered controllers by type and health status.",
       "fieldConfig": {
@@ -3406,7 +3406,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "sum by(controller_type, status) (gc_registered_controllers)",
@@ -3421,7 +3421,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "Error rate by operation and error type. Note: operation labels use subsystem prefixes (e.g., ac_meeting_token, mc_grpc) unlike per-subsystem metrics which use unprefixed names.",
       "fieldConfig": {
@@ -3499,7 +3499,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "sum by(operation, error_type) (increase(gc_errors_total[$__rate_interval]))",
@@ -3527,7 +3527,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "JWT validation rate at the gRPC auth layer, by result, token type, and failure reason. Tracks service-token authentication health.",
       "fieldConfig": {
@@ -3621,7 +3621,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "sum by(result, token_type, failure_reason) (increase(gc_jwt_validations_total[$__rate_interval]))",
@@ -3636,9 +3636,9 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
-      "description": "Rate of Layer 2 caller service_type rejections. Any non-zero value indicates a bug or misconfiguration — a service is presenting a valid token but calling the wrong gRPC endpoint.",
+      "description": "Rate of Layer 2 caller service_type rejections. Any non-zero value indicates a bug or misconfiguration \u2014 a service is presenting a valid token but calling the wrong gRPC endpoint.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -3718,7 +3718,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "sum by(grpc_service, expected_type, actual_type) (increase(gc_caller_type_rejected_total[$__rate_interval]))",
@@ -3739,7 +3739,27 @@
     "service-overview"
   ],
   "templating": {
-    "list": []
+    "list": [
+      {
+        "current": {
+          "selected": false,
+          "text": "prometheus",
+          "value": "prometheus"
+        },
+        "hide": 0,
+        "includeAll": false,
+        "label": "Datasource",
+        "multi": false,
+        "name": "datasource",
+        "options": [],
+        "query": "prometheus",
+        "queryValue": "",
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "type": "datasource"
+      }
+    ]
   },
   "time": {
     "from": "now-1h",

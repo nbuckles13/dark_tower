@@ -1,0 +1,24 @@
+{
+  "_comment": "Panels with type=logs or datasource.type=loki are exempt from unit + metric-type classification.",
+  "title": "pass-logs-panel",
+  "templating": {
+    "list": [
+      {"name": "datasource", "type": "datasource", "query": "loki"}
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "logs",
+      "title": "Recent Logs",
+      "datasource": {"type": "loki", "uid": "$datasource"},
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "loki", "uid": "$datasource"},
+          "expr": "{app=\"ac-service\"}"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,25 @@
+{
+  "_comment": "Filename ending in -slos.json exempts this from the rate-window rule per ADR-0029 Category C.",
+  "title": "pass-slo-dashboard",
+  "templating": {
+    "list": [
+      {"name": "datasource", "type": "datasource", "query": "prometheus"}
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Error Budget Burn 1h",
+      "datasource": {"type": "prometheus", "uid": "$datasource"},
+      "fieldConfig": {"defaults": {"unit": "percentunit"}},
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "expr": "sum(rate(ac_http_requests_total[1h])) / sum(rate(ac_http_requests_total[30d]))"
+        }
+      ]
+    }
+  ]
+}

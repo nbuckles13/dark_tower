@@ -39,7 +39,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "Total tokens issued in the selected time range.",
       "fieldConfig": {
@@ -87,7 +87,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "sum(increase(ac_token_issuance_total{job=\"ac-service\"}[$__range]))",
@@ -102,7 +102,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "Total HTTP requests in the selected time range.",
       "fieldConfig": {
@@ -150,7 +150,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "sum(increase(ac_http_requests_total{job=\"ac-service\"}[$__range]))",
@@ -178,7 +178,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "Total rate limit decisions in the selected time range.",
       "fieldConfig": {
@@ -234,7 +234,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "sum(increase(ac_rate_limit_decisions_total{job=\"ac-service\"}[$__range]))",
@@ -249,7 +249,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "Total token validation failures in the selected time range.",
       "fieldConfig": {
@@ -305,7 +305,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "sum(increase(ac_token_validations_total{job=\"ac-service\", status=\"failure\"}[$__range]))",
@@ -333,7 +333,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "fieldConfig": {
         "defaults": {
@@ -380,7 +380,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "sum(increase(ac_token_issuance_total{job=\"ac-service\"}[$__range])) + sum(increase(ac_jwks_requests_total{job=\"ac-service\"}[$__range]))",
@@ -396,7 +396,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "fieldConfig": {
         "defaults": {
@@ -451,7 +451,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "sum(rate(ac_errors_total{job=\"ac-service\"}[$__rate_interval])) / (sum(rate(ac_token_issuance_total{job=\"ac-service\"}[$__rate_interval])) + sum(rate(ac_jwks_requests_total{job=\"ac-service\"}[$__rate_interval])))",
@@ -466,7 +466,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "fieldConfig": {
         "defaults": {
@@ -521,7 +521,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "histogram_quantile(0.95, sum(rate(ac_token_issuance_duration_seconds_bucket{job=\"ac-service\"}[$__rate_interval])) by (le)) * 1000",
@@ -549,7 +549,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "fieldConfig": {
         "defaults": {
@@ -623,7 +623,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "sum(increase(ac_token_issuance_total{job=\"ac-service\"}[$__rate_interval])) by (grant_type)",
@@ -634,7 +634,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "sum(increase(ac_jwks_requests_total{job=\"ac-service\"}[$__rate_interval])) by (cache_status)",
@@ -649,7 +649,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "fieldConfig": {
         "defaults": {
@@ -754,7 +754,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "sum(increase(ac_token_issuance_total{job=\"ac-service\"}[$__rate_interval])) by (status)",
@@ -782,7 +782,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "fieldConfig": {
         "defaults": {
@@ -886,7 +886,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "histogram_quantile(0.50, sum(rate(ac_token_issuance_duration_seconds_bucket{job=\"ac-service\"}[$__rate_interval])) by (le)) * 1000",
@@ -897,7 +897,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "histogram_quantile(0.95, sum(rate(ac_token_issuance_duration_seconds_bucket{job=\"ac-service\"}[$__rate_interval])) by (le)) * 1000",
@@ -908,7 +908,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "histogram_quantile(0.99, sum(rate(ac_token_issuance_duration_seconds_bucket{job=\"ac-service\"}[$__rate_interval])) by (le)) * 1000",
@@ -919,7 +919,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "vector(100)",
@@ -947,7 +947,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "fieldConfig": {
         "defaults": {
@@ -1021,7 +1021,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "sum(increase(ac_token_issuance_total{job=\"ac-service\"}[$__rate_interval])) by (grant_type)",
@@ -1036,7 +1036,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "fieldConfig": {
         "defaults": {
@@ -1126,7 +1126,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "sum(increase(ac_token_issuance_total{job=\"ac-service\", status=\"success\"}[$__rate_interval]))",
@@ -1137,7 +1137,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "sum(increase(ac_token_issuance_total{job=\"ac-service\", status=\"error\"}[$__rate_interval]))",
@@ -1165,7 +1165,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "All HTTP errors including framework-level errors (415 Unsupported Media Type, 400 Bad Request, 404 Not Found, etc.)",
       "fieldConfig": {
@@ -1271,7 +1271,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "sum(increase(ac_http_requests_total{job=\"ac-service\", status_code=~\"4..\"}[$__rate_interval])) by (status_code, path)",
@@ -1286,7 +1286,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "HTTP 5xx server errors by path",
       "fieldConfig": {
@@ -1377,7 +1377,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "sum(increase(ac_http_requests_total{job=\"ac-service\", status_code=~\"5..\"}[$__rate_interval])) by (status_code, path)",
@@ -1392,7 +1392,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "Total HTTP requests per second by endpoint and status",
       "fieldConfig": {
@@ -1467,7 +1467,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "sum(increase(ac_http_requests_total{job=\"ac-service\"}[$__rate_interval])) by (path, status_code)",
@@ -1495,7 +1495,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "Memory usage across AC pods. Monitors memory consumption and potential leaks.",
       "fieldConfig": {
@@ -1573,7 +1573,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "container_memory_working_set_bytes{namespace=\"dark-tower\", pod=~\"ac-service.*\"}",
@@ -1588,7 +1588,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "CPU usage across AC pods. Monitors CPU consumption and load patterns.",
       "fieldConfig": {
@@ -1666,7 +1666,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "rate(container_cpu_usage_seconds_total{namespace=\"dark-tower\", pod=~\"ac-service.*\"}[$__rate_interval])",
@@ -1681,7 +1681,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "Number of running AC pods. Monitors pod availability and scaling.",
       "fieldConfig": {
@@ -1735,7 +1735,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "count(kube_pod_info{namespace=\"dark-tower\", pod=~\"ac-service.*\"})",
@@ -1763,7 +1763,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "Number of active signing keys in the keystore.",
       "fieldConfig": {
@@ -1815,7 +1815,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "ac_active_signing_keys{job=\"ac-service\"}",
@@ -1830,7 +1830,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "Age of the current signing key in days. Alert when key age exceeds rotation threshold.",
       "fieldConfig": {
@@ -1886,7 +1886,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "ac_signing_key_age_days{job=\"ac-service\"}",
@@ -1901,7 +1901,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "Unix timestamp of the last successful key rotation.",
       "fieldConfig": {
@@ -1949,7 +1949,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "ac_key_rotation_last_success_timestamp{job=\"ac-service\"} * 1000",
@@ -1964,7 +1964,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "Key rotation attempts by status (success/error).",
       "fieldConfig": {
@@ -2039,7 +2039,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "sum by(status) (increase(ac_key_rotation_total{job=\"ac-service\"}[$__rate_interval]))",
@@ -2067,7 +2067,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "Database query rate by operation type and status.",
       "fieldConfig": {
@@ -2145,7 +2145,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "sum by(operation) (increase(ac_db_queries_total{job=\"ac-service\"}[$__rate_interval]))",
@@ -2160,7 +2160,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "Database query latency percentiles (p50, p95, p99).",
       "fieldConfig": {
@@ -2272,7 +2272,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "histogram_quantile(0.50, sum by(le) (rate(ac_db_query_duration_seconds_bucket{job=\"ac-service\"}[$__rate_interval])))",
@@ -2283,7 +2283,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "histogram_quantile(0.95, sum by(le) (rate(ac_db_query_duration_seconds_bucket{job=\"ac-service\"}[$__rate_interval])))",
@@ -2294,7 +2294,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "histogram_quantile(0.99, sum by(le) (rate(ac_db_query_duration_seconds_bucket{job=\"ac-service\"}[$__rate_interval])))",
@@ -2305,7 +2305,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "vector(0.05)",
@@ -2333,7 +2333,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "Bcrypt operation latency (hash/verify).",
       "fieldConfig": {
@@ -2411,7 +2411,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "histogram_quantile(0.50, sum by(le, operation) (rate(ac_bcrypt_duration_seconds_bucket{job=\"ac-service\"}[$__rate_interval])))",
@@ -2422,7 +2422,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "histogram_quantile(0.95, sum by(le, operation) (rate(ac_bcrypt_duration_seconds_bucket{job=\"ac-service\"}[$__rate_interval])))",
@@ -2437,7 +2437,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "Rate limiting decisions (allowed vs rejected). Tracks rate limiter effectiveness.",
       "fieldConfig": {
@@ -2531,7 +2531,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "sum by(action) (increase(ac_rate_limit_decisions_total{job=\"ac-service\"}[$__rate_interval]))",
@@ -2546,7 +2546,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "Audit log write failures. ANY non-zero value is compliance-critical and should trigger investigation.",
       "fieldConfig": {
@@ -2598,10 +2598,10 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
-          "expr": "sum(ac_audit_log_failures_total{job=\"ac-service\"})",
+          "expr": "sum(increase(ac_audit_log_failures_total{job=\"ac-service\"}[$__range]))",
           "legendFormat": "Audit Failures",
           "range": true,
           "refId": "A"
@@ -2613,7 +2613,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "Service credential management operations by type and status.",
       "fieldConfig": {
@@ -2691,7 +2691,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "sum by(operation, status) (increase(ac_credential_operations_total{job=\"ac-service\"}[$__rate_interval]))",
@@ -2719,7 +2719,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "Token validation attempts by status and error category. Partially instrumented (clock_skew errors only).",
       "fieldConfig": {
@@ -2797,7 +2797,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "sum by(status, error_category) (increase(ac_token_validations_total{job=\"ac-service\"}[$__rate_interval]))",
@@ -2812,7 +2812,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "HTTP request latency percentiles (p50, p95, p99) across all endpoints.",
       "fieldConfig": {
@@ -2924,7 +2924,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "histogram_quantile(0.50, sum by(le) (rate(ac_http_request_duration_seconds_bucket{job=\"ac-service\"}[$__rate_interval])))",
@@ -2935,7 +2935,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "histogram_quantile(0.95, sum by(le) (rate(ac_http_request_duration_seconds_bucket{job=\"ac-service\"}[$__rate_interval])))",
@@ -2946,7 +2946,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "histogram_quantile(0.99, sum by(le) (rate(ac_http_request_duration_seconds_bucket{job=\"ac-service\"}[$__rate_interval])))",
@@ -2957,7 +2957,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "vector(0.2)",
@@ -2978,7 +2978,27 @@
     "service-overview"
   ],
   "templating": {
-    "list": []
+    "list": [
+      {
+        "current": {
+          "selected": false,
+          "text": "prometheus",
+          "value": "prometheus"
+        },
+        "hide": 0,
+        "includeAll": false,
+        "label": "Datasource",
+        "multi": false,
+        "name": "datasource",
+        "options": [],
+        "query": "prometheus",
+        "queryValue": "",
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "type": "datasource"
+      }
+    ]
   },
   "time": {
     "from": "now-1h",

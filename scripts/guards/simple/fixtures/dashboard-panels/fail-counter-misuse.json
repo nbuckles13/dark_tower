@@ -1,0 +1,23 @@
+{
+  "_comment": "Counter metrics must be wrapped in rate()/increase() per ADR-0029 Category A.",
+  "title": "fail-counter-misuse",
+  "templating": {
+    "list": [{"name": "datasource", "type": "datasource", "query": "prometheus"}]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Total Requests (bare counter)",
+      "datasource": {"type": "prometheus", "uid": "$datasource"},
+      "fieldConfig": {"defaults": {"unit": "short"}},
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "expr": "sum(ac_http_requests_total)"
+        }
+      ]
+    }
+  ]
+}

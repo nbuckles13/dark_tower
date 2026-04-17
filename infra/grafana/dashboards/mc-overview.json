@@ -38,7 +38,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "Current number of active meetings.",
       "fieldConfig": {
@@ -86,7 +86,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "sum(mc_meetings_active)",
@@ -114,7 +114,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "Total JWT validation failures in the selected time range.",
       "fieldConfig": {
@@ -170,7 +170,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "sum by(failure_reason) (increase(mc_jwt_validations_total{result=\"failure\"}[$__range]))",
@@ -185,7 +185,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "Total session join failures in the selected time range.",
       "fieldConfig": {
@@ -241,7 +241,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "sum(increase(mc_session_join_failures_total[$__range]))",
@@ -256,7 +256,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "Total rejected WebTransport connections in the selected time range.",
       "fieldConfig": {
@@ -312,7 +312,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "sum(increase(mc_webtransport_connections_total{status=\"rejected\"}[$__range]))",
@@ -327,7 +327,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "Number of active meetings currently hosted by this Meeting Controller instance.",
       "fieldConfig": {
@@ -381,7 +381,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "sum(mc_meetings_active)",
@@ -396,7 +396,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "Number of active WebTransport connections to this Meeting Controller.",
       "fieldConfig": {
@@ -450,7 +450,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "sum(mc_connections_active)",
@@ -465,7 +465,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "Service health status. 1 = up, 0 = down. Monitors whether MC pods are running and responding to probes.",
       "fieldConfig": {
@@ -531,7 +531,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "up{job=\"mc-service\"}",
@@ -546,7 +546,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "Total actor panics since service start. Any panic is a critical issue requiring investigation.",
       "fieldConfig": {
@@ -596,10 +596,10 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
-          "expr": "sum(mc_actor_panics_total)",
+          "expr": "sum(increase(mc_actor_panics_total[$__range]))",
           "legendFormat": "Total Panics",
           "range": true,
           "refId": "A"
@@ -611,7 +611,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "Number of running MC pods. Monitors pod availability and scaling.",
       "fieldConfig": {
@@ -665,7 +665,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "count(up{job=\"mc-service\"} == 1)",
@@ -680,7 +680,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "Actor mailbox depth by actor type. High depth indicates backpressure or slow processing. Warning at 100, critical at 500.",
       "fieldConfig": {
@@ -767,7 +767,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "sum by(actor_type) (mc_actor_mailbox_depth)",
@@ -782,7 +782,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "Message drop rate by actor type (messages per second). Any dropped messages indicate capacity issues or backpressure.",
       "fieldConfig": {
@@ -860,7 +860,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "sum by(actor_type) (increase(mc_messages_dropped_total[$__rate_interval]))",
@@ -875,7 +875,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "Actor panic rate by actor type. Any panic is a critical issue. Usually indicates a bug in message handling.",
       "fieldConfig": {
@@ -957,7 +957,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "sum by(actor_type) (increase(mc_actor_panics_total[$__rate_interval]))",
@@ -972,7 +972,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "Active meetings and connections over time. Shows capacity utilization and load patterns.",
       "fieldConfig": {
@@ -1064,7 +1064,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "sum(mc_meetings_active)",
@@ -1075,7 +1075,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "sum(mc_connections_active)",
@@ -1090,7 +1090,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "Memory usage across MC pods. Monitors memory consumption and potential leaks.",
       "fieldConfig": {
@@ -1168,7 +1168,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "container_memory_working_set_bytes{namespace=\"dark-tower\", pod=~\"mc-service.*\"}",
@@ -1183,7 +1183,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "CPU usage across MC pods. Monitors CPU consumption and load patterns.",
       "fieldConfig": {
@@ -1261,7 +1261,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "rate(container_cpu_usage_seconds_total{namespace=\"dark-tower\", pod=~\"mc-service.*\"}[$__rate_interval])",
@@ -1276,7 +1276,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "GC registration and heartbeat status. Shows MC registration with Global Controller health.",
       "fieldConfig": {
@@ -1370,7 +1370,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "sum by(status) (increase(mc_gc_heartbeats_total[$__rate_interval]))",
@@ -1385,7 +1385,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "Token refresh rate by status. Tracks OAuth token refresh success/failure against AC.",
       "fieldConfig": {
@@ -1479,7 +1479,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "sum by(status) (increase(mc_token_refresh_total[$__rate_interval]))",
@@ -1494,7 +1494,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "Token refresh latency percentiles (p50, p95, p99). Monitors AC token acquisition performance.",
       "fieldConfig": {
@@ -1572,7 +1572,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "histogram_quantile(0.50, sum by(le) (rate(mc_token_refresh_duration_seconds_bucket[$__rate_interval])))",
@@ -1583,7 +1583,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "histogram_quantile(0.95, sum by(le) (rate(mc_token_refresh_duration_seconds_bucket[$__rate_interval])))",
@@ -1594,7 +1594,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "histogram_quantile(0.99, sum by(le) (rate(mc_token_refresh_duration_seconds_bucket[$__rate_interval])))",
@@ -1609,7 +1609,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "GC heartbeat latency percentiles by type (fast/comprehensive). SLO target: p99 < 100ms.",
       "fieldConfig": {
@@ -1721,7 +1721,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "histogram_quantile(0.99, sum by(le, type) (rate(mc_gc_heartbeat_latency_seconds_bucket[$__rate_interval])))",
@@ -1732,7 +1732,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "vector(0.1)",
@@ -1747,7 +1747,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "Redis operation latency percentiles by operation type. SLO target: p99 < 10ms.",
       "fieldConfig": {
@@ -1859,7 +1859,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "histogram_quantile(0.99, sum by(le, operation) (rate(mc_redis_latency_seconds_bucket[$__rate_interval])))",
@@ -1870,7 +1870,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "vector(0.01)",
@@ -1898,7 +1898,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "Redis operation latency percentiles (p50, p95, p99). SLO target: p99 < 10ms.",
       "fieldConfig": {
@@ -2010,7 +2010,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "histogram_quantile(0.50, sum by(le) (rate(mc_redis_latency_seconds_bucket[$__rate_interval])))",
@@ -2021,7 +2021,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "histogram_quantile(0.95, sum by(le) (rate(mc_redis_latency_seconds_bucket[$__rate_interval])))",
@@ -2032,7 +2032,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "histogram_quantile(0.99, sum by(le) (rate(mc_redis_latency_seconds_bucket[$__rate_interval])))",
@@ -2043,7 +2043,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "vector(0.01)",
@@ -2071,7 +2071,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "Fenced-out events by reason. Non-zero values indicate split-brain scenarios. Investigate if rate > 0.1/min.",
       "fieldConfig": {
@@ -2153,7 +2153,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "sum by(reason) (increase(mc_fenced_out_total[$__rate_interval]))",
@@ -2168,7 +2168,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "GC heartbeat latency percentiles (p50, p95, p99). SLO target: p99 < 100ms.",
       "fieldConfig": {
@@ -2280,7 +2280,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "histogram_quantile(0.50, sum by(le) (rate(mc_gc_heartbeat_latency_seconds_bucket[$__rate_interval])))",
@@ -2291,7 +2291,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "histogram_quantile(0.95, sum by(le) (rate(mc_gc_heartbeat_latency_seconds_bucket[$__rate_interval])))",
@@ -2302,7 +2302,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "histogram_quantile(0.99, sum by(le) (rate(mc_gc_heartbeat_latency_seconds_bucket[$__rate_interval])))",
@@ -2313,7 +2313,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "vector(0.1)",
@@ -2328,7 +2328,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "Token refresh failure rate by reason (error_type). High rate indicates AC connectivity issues.",
       "fieldConfig": {
@@ -2406,7 +2406,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "sum by(error_type) (increase(mc_token_refresh_failures_total[$__rate_interval]))",
@@ -2434,7 +2434,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "Session join attempts by status (success/failure). Tracks join volume and success rate.",
       "fieldConfig": {
@@ -2528,7 +2528,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "sum by(status) (increase(mc_session_joins_total[$__rate_interval]))",
@@ -2543,7 +2543,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "Session join latency percentiles (p50, p95, p99). Measures time from session accept to JoinResponse sent. Extended to 5s (includes actor processing).",
       "fieldConfig": {
@@ -2621,7 +2621,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "histogram_quantile(0.50, sum by(le) (rate(mc_session_join_duration_seconds_bucket{status=\"success\"}[$__rate_interval])))",
@@ -2632,7 +2632,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "histogram_quantile(0.95, sum by(le) (rate(mc_session_join_duration_seconds_bucket{status=\"success\"}[$__rate_interval])))",
@@ -2643,7 +2643,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "histogram_quantile(0.99, sum by(le) (rate(mc_session_join_duration_seconds_bucket{status=\"success\"}[$__rate_interval])))",
@@ -2658,7 +2658,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "Session join failures by error type. High rate may indicate JWT issues, capacity problems, or internal errors.",
       "fieldConfig": {
@@ -2736,7 +2736,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "sum by(error_type) (increase(mc_session_join_failures_total[$__rate_interval]))",
@@ -2751,7 +2751,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "WebTransport connection rate by status. Tracks accepted connections, capacity rejections, and errors.",
       "fieldConfig": {
@@ -2860,7 +2860,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "sum by(status) (increase(mc_webtransport_connections_total[$__rate_interval]))",
@@ -2875,7 +2875,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "JWT validation rate by result and token type. Tracks authentication health.",
       "fieldConfig": {
@@ -2969,7 +2969,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "sum by(result, token_type, failure_reason) (increase(mc_jwt_validations_total[$__rate_interval]))",
@@ -2997,7 +2997,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "RegisterMeeting RPC attempts by status (success/error). Tracks MC\u2192MH meeting registration volume and reliability.",
       "fieldConfig": {
@@ -3091,7 +3091,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "sum by(status) (rate(mc_register_meeting_total[$__rate_interval]))",
@@ -3106,7 +3106,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "RegisterMeeting RPC latency percentiles (P50/P95/P99). Measures MC\u2192MH round-trip time for meeting registration.",
       "fieldConfig": {
@@ -3207,7 +3207,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "histogram_quantile(0.50, sum by(le) (rate(mc_register_meeting_duration_seconds_bucket[$__rate_interval])))",
@@ -3218,7 +3218,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "histogram_quantile(0.95, sum by(le) (rate(mc_register_meeting_duration_seconds_bucket[$__rate_interval])))",
@@ -3229,7 +3229,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "histogram_quantile(0.99, sum by(le) (rate(mc_register_meeting_duration_seconds_bucket[$__rate_interval])))",
@@ -3244,7 +3244,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "Rate of MH\u2192MC participant connection/disconnection notifications by event type.",
       "fieldConfig": {
@@ -3322,7 +3322,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "sum by(event) (increase(mc_mh_notifications_received_total[$__rate_interval]))",
@@ -3337,7 +3337,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "Rate of client-reported media connection failures, split by whether all handlers failed.",
       "fieldConfig": {
@@ -3419,7 +3419,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "sum by(all_failed) (increase(mc_media_connection_failures_total[$__rate_interval]))",
@@ -3434,7 +3434,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "$datasource"
       },
       "description": "Rate of Layer 2 caller service_type rejections. Any non-zero value indicates a bug or misconfiguration \u2014 a service is presenting a valid token but calling the wrong gRPC endpoint.",
       "fieldConfig": {
@@ -3516,7 +3516,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "$datasource"
           },
           "editorMode": "code",
           "expr": "sum by(grpc_service, expected_type, actual_type) (increase(mc_caller_type_rejected_total[$__rate_interval]))",
@@ -3537,7 +3537,27 @@
     "service-overview"
   ],
   "templating": {
-    "list": []
+    "list": [
+      {
+        "current": {
+          "selected": false,
+          "text": "prometheus",
+          "value": "prometheus"
+        },
+        "hide": 0,
+        "includeAll": false,
+        "label": "Datasource",
+        "multi": false,
+        "name": "datasource",
+        "options": [],
+        "query": "prometheus",
+        "queryValue": "",
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "type": "datasource"
+      }
+    ]
   },
   "time": {
     "from": "now-1h",

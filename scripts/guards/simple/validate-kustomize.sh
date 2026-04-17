@@ -452,8 +452,10 @@ else
     # We extract the basename from the path after '='
     declared_dashboards=$(grep -oE '[^/]+\.json$' "$GRAFANA_KUSTOMIZATION" | sort -u || true)
 
-    # List actual dashboard JSON files
-    actual_dashboards=$(find "$DASHBOARDS_DIR" -maxdepth 1 -name '*.json' -exec basename {} \; | sort)
+    # List actual dashboard JSON files. Skip copy-me template stubs
+    # (`_template-*.json`) — these are starter files for service specialists
+    # and must NOT be shipped into the Grafana ConfigMap.
+    actual_dashboards=$(find "$DASHBOARDS_DIR" -maxdepth 1 -name '*.json' ! -name '_template-*.json' -exec basename {} \; | sort)
 
     # Direction 1: Check all actual dashboards are in configMapGenerator
     while IFS= read -r dashboard; do

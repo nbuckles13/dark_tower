@@ -1,0 +1,417 @@
+{
+  "_comment_filename": "This file is a starter template for new service overview dashboards. Copy to <svc>-overview.json, replace all <svc>_ placeholders with your service prefix (ac/gc/mc/mh), and substitute metric names from your service's metrics.rs. The enumeration loop in scripts/guards/simple/validate-dashboard-panels.sh explicitly allow-lists this one file so that it is scanned by the dashboard-panels guard even though its basename starts with `_template-`.",
+  "_comment_conventions": "Follows docs/observability/dashboard-conventions.md. One example panel per metric type — counter via increase(), gauge via instant, histogram quantile via histogram_quantile(rate(_bucket)), histogram bucket heatmap via rate(_bucket).",
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {"type": "grafana", "uid": "-- Grafana --"},
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "description": "Service overview template. Copy and substitute placeholders before use.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "templating": {
+    "list": [
+      {
+        "_comment": "$datasource — Prometheus datasource template var. REQUIRED. All data panels bind to this so dashboards survive datasource UID changes.",
+        "current": {"selected": false, "text": "prometheus", "value": "prometheus"},
+        "hide": 0,
+        "includeAll": false,
+        "label": "Datasource",
+        "multi": false,
+        "name": "datasource",
+        "options": [],
+        "query": "prometheus",
+        "queryValue": "",
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "type": "datasource"
+      },
+      {
+        "_comment": "$namespace — Kubernetes namespace filter. Include on every dashboard so a single dashboard serves dev/stage/prod without duplication.",
+        "current": {"selected": false, "text": "All", "value": "$__all"},
+        "datasource": {"type": "prometheus", "uid": "$datasource"},
+        "definition": "label_values(up, namespace)",
+        "hide": 0,
+        "includeAll": true,
+        "label": "Namespace",
+        "multi": true,
+        "name": "namespace",
+        "options": [],
+        "query": {"query": "label_values(up, namespace)", "refId": "StandardVariableQuery"},
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 1,
+        "type": "query"
+      }
+    ]
+  },
+  "panels": [
+    {
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 0},
+      "id": 1,
+      "panels": [],
+      "title": "Service Health",
+      "type": "row"
+    },
+    {
+      "_comment": "GAUGE example — service up/down. Gauges are read as an instant value; do NOT wrap in rate().",
+      "datasource": {"type": "prometheus", "uid": "$datasource"},
+      "description": "1 = service reachable, 0 = down. Replace <svc>_up with your service's up metric or use the generic `up{job=...}` series.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "mappings": [
+            {"options": {"0": {"color": "red", "text": "DOWN"}}, "type": "value"},
+            {"options": {"1": {"color": "green", "text": "UP"}}, "type": "value"}
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "red", "value": null},
+              {"color": "green", "value": 1}
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 4, "w": 6, "x": 0, "y": 1},
+      "id": 2,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+        "textMode": "auto"
+      },
+      "pluginVersion": "10.0.0",
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "editorMode": "code",
+          "expr": "min(up{job=\"<svc>-service\", namespace=~\"$namespace\"})",
+          "instant": true,
+          "legendFormat": "Up",
+          "refId": "A"
+        }
+      ],
+      "title": "Service Up",
+      "type": "stat"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 5},
+      "id": 3,
+      "panels": [],
+      "title": "Request Metrics",
+      "type": "row"
+    },
+    {
+      "_comment": "COUNTER (stat, $__range) example — ADR-0029 §Category A. Counters on stat panels use increase($__range), not rate().",
+      "datasource": {"type": "prometheus", "uid": "$datasource"},
+      "description": "Total requests in the selected time range. Counter metrics must ALWAYS be wrapped in increase() or rate(); never read the bare counter value.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "mappings": [],
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]},
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 4, "w": 6, "x": 0, "y": 6},
+      "id": 4,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+        "textMode": "auto"
+      },
+      "pluginVersion": "10.0.0",
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "editorMode": "code",
+          "expr": "sum(increase(<svc>_http_requests_total{namespace=~\"$namespace\"}[$__range]))",
+          "legendFormat": "Requests",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Total Requests",
+      "type": "stat"
+    },
+    {
+      "_comment": "COUNTER (timeseries, $__rate_interval) example — ADR-0029 §Category A. Timeseries panels use increase($__rate_interval).",
+      "datasource": {"type": "prometheus", "uid": "$datasource"},
+      "description": "Requests broken down by HTTP status code over time. $__rate_interval auto-adjusts to scrape interval and dashboard range.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 20,
+            "lineWidth": 1,
+            "showPoints": "never"
+          },
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]},
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 6, "y": 6},
+      "id": 5,
+      "options": {
+        "legend": {"calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "none"}
+      },
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "editorMode": "code",
+          "expr": "sum(increase(<svc>_http_requests_total{namespace=~\"$namespace\"}[$__rate_interval])) by (status)",
+          "legendFormat": "{{status}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Requests by Status Code",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 14},
+      "id": 6,
+      "panels": [],
+      "title": "Error Metrics",
+      "type": "row"
+    },
+    {
+      "_comment": "RATIO (ADR-0029 §Category B) — derived percentage uses rate() on numerator and denominator. Unit is `percentunit` (0..1), NOT `percent` (0..100) — PromQL produces a unit ratio.",
+      "datasource": {"type": "prometheus", "uid": "$datasource"},
+      "description": "Error rate as a fraction of total requests. Both sides use rate($__rate_interval) so the ratio is dimensionless.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "yellow", "value": 0.01},
+              {"color": "red", "value": 0.05}
+            ]
+          },
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 15},
+      "id": 7,
+      "options": {
+        "legend": {"calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "none"}
+      },
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "editorMode": "code",
+          "expr": "sum(rate(<svc>_http_requests_total{namespace=~\"$namespace\", status=~\"5..\"}[$__rate_interval])) / sum(rate(<svc>_http_requests_total{namespace=~\"$namespace\"}[$__rate_interval]))",
+          "legendFormat": "5xx error rate",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "5xx Error Rate",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 23},
+      "id": 8,
+      "panels": [],
+      "title": "Latency",
+      "type": "row"
+    },
+    {
+      "_comment": "HISTOGRAM QUANTILE example — ADR-0029 §Category B. Required shape: histogram_quantile(q, sum(rate(_bucket[$__rate_interval])) by (le)).",
+      "datasource": {"type": "prometheus", "uid": "$datasource"},
+      "description": "Request-latency percentiles derived from histogram buckets.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line", "fillOpacity": 10, "lineWidth": 1, "showPoints": "never"},
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 24},
+      "id": 9,
+      "options": {
+        "legend": {"calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "none"}
+      },
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.50, sum(rate(<svc>_http_request_duration_seconds_bucket{namespace=~\"$namespace\"}[$__rate_interval])) by (le))",
+          "legendFormat": "p50",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum(rate(<svc>_http_request_duration_seconds_bucket{namespace=~\"$namespace\"}[$__rate_interval])) by (le))",
+          "legendFormat": "p95",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, sum(rate(<svc>_http_request_duration_seconds_bucket{namespace=~\"$namespace\"}[$__rate_interval])) by (le))",
+          "legendFormat": "p99",
+          "range": true,
+          "refId": "C"
+        }
+      ],
+      "title": "Request Latency (P50/P95/P99)",
+      "type": "timeseries"
+    },
+    {
+      "_comment": "HISTOGRAM BUCKETS (heatmap) example — ADR-0029 §Category B. Bucket panels use rate(_bucket[$__rate_interval]); heatmap renders the distribution over time.",
+      "datasource": {"type": "prometheus", "uid": "$datasource"},
+      "description": "Histogram-bucket heatmap showing the full latency distribution. Useful for spotting bimodality hidden by quantile plots.",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {"hideFrom": {"tooltip": false, "viz": false, "legend": false}, "scaleDistribution": {"type": "linear"}},
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 24},
+      "id": 10,
+      "options": {
+        "calculate": false,
+        "cellGap": 1,
+        "color": {"exponent": 0.5, "fill": "dark-orange", "mode": "scheme", "reverse": false, "scale": "exponential", "scheme": "Spectral", "steps": 64},
+        "legend": {"show": true},
+        "tooltip": {"show": true, "yHistogram": true},
+        "yAxis": {"axisPlacement": "left", "reverse": false, "unit": "s"}
+      },
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "editorMode": "code",
+          "expr": "sum(rate(<svc>_http_request_duration_seconds_bucket{namespace=~\"$namespace\"}[$__rate_interval])) by (le)",
+          "format": "heatmap",
+          "legendFormat": "{{le}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Request Latency Heatmap",
+      "type": "heatmap"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 32},
+      "id": 11,
+      "panels": [],
+      "title": "Resource Usage",
+      "type": "row"
+    },
+    {
+      "_comment": "GAUGE example (container memory) — instant read, never wrapped in rate(). Use `bytes` unit for byte-quantity gauges.",
+      "datasource": {"type": "prometheus", "uid": "$datasource"},
+      "description": "Working-set memory per pod. This metric is a gauge and must be read as an instant value.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line", "fillOpacity": 10, "lineWidth": 1, "showPoints": "never"},
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 33},
+      "id": 12,
+      "options": {
+        "legend": {"calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "none"}
+      },
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "editorMode": "code",
+          "expr": "container_memory_working_set_bytes{namespace=~\"$namespace\", container=\"<svc>-service\"}",
+          "legendFormat": "{{pod}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Memory Usage",
+      "type": "timeseries"
+    },
+    {
+      "_comment": "CPU UTILIZATION example — ADR-0029 §Category B. container_cpu_usage_seconds_total is a counter; rate() converts to seconds-per-second (dimensionless CPU share).",
+      "datasource": {"type": "prometheus", "uid": "$datasource"},
+      "description": "CPU utilization per pod (fractional CPU cores). Uses rate() because container_cpu_usage_seconds_total is a counter and the derived unit is dimensionless.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line", "fillOpacity": 10, "lineWidth": 1, "showPoints": "never"},
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 33},
+      "id": 13,
+      "options": {
+        "legend": {"calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "none"}
+      },
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "editorMode": "code",
+          "expr": "sum(rate(container_cpu_usage_seconds_total{namespace=~\"$namespace\", container=\"<svc>-service\"}[$__rate_interval])) by (pod)",
+          "legendFormat": "{{pod}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "CPU Usage",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 38,
+  "style": "dark",
+  "tags": ["template", "<svc>-service"],
+  "time": {"from": "now-1h", "to": "now"},
+  "timepicker": {},
+  "timezone": "",
+  "title": "<svc>-service Overview (Template)",
+  "uid": "template-svc-overview",
+  "version": 1,
+  "weekStart": ""
+}
