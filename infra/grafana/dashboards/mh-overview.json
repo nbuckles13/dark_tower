@@ -1580,7 +1580,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "MH error rate grouped by error_type (grpc / not_registered / config / internal / token_acquisition / token_acquisition_timeout). Aggregate leading indicator; cross-reference with specific failure-rate alerts for triage.",
+      "description": "MH error rate grouped by operation (registration / heartbeat / grpc_service) and error_type (grpc / not_registered / config / internal / token_acquisition / token_acquisition_timeout). Operation dimension answers the first triage question \"which operation is broken?\" at a glance. status_code label intentionally dropped from grouping (cross-product noise for an overview).",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1659,8 +1659,8 @@
             "uid": "$datasource"
           },
           "editorMode": "code",
-          "expr": "sum by(error_type) (increase(mh_errors_total[$__rate_interval]))",
-          "legendFormat": "{{error_type}}",
+          "expr": "sum by(operation, error_type) (increase(mh_errors_total[$__rate_interval]))",
+          "legendFormat": "{{operation}} / {{error_type}}",
           "range": true,
           "refId": "A"
         }
@@ -1872,7 +1872,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "OAuth token refresh failures by error_type (http / auth_rejected / invalid_response / acquisition_failed / configuration / channel_closed). Complements 'Token Refresh Count by Status' (id 8) by breaking down the failure population for triage.",
+      "description": "Breakdown of OAuth token refresh failures by error_type (http / auth_rejected / invalid_response / acquisition_failed / configuration / channel_closed). Complements the aggregate Token Refresh Count by Status panel (id 8): id-8 shows pass/fail volume, this panel shows which failure mode dominates for triage. Alert: MHTokenRefreshFailures.",
       "fieldConfig": {
         "defaults": {
           "color": {
