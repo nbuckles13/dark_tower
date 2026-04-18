@@ -1611,7 +1611,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "GC heartbeat latency percentiles by type (fast/comprehensive). SLO target: p99 < 100ms.",
+      "description": "GC heartbeat latency percentiles by heartbeat type (fast/comprehensive). SLO target: p99 < 100ms.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1724,8 +1724,8 @@
             "uid": "$datasource"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum by(le, type) (rate(mc_gc_heartbeat_latency_seconds_bucket[$__rate_interval])))",
-          "legendFormat": "p99 - {{type}}",
+          "expr": "histogram_quantile(0.99, sum by(le, heartbeat_type) (rate(mc_gc_heartbeat_latency_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "p99 - {{heartbeat_type}}",
           "range": true,
           "refId": "A"
         },
@@ -1741,7 +1741,7 @@
           "refId": "B"
         }
       ],
-      "title": "GC Heartbeat Latency (P99 by Type)",
+      "title": "GC Heartbeat Latency (P99 by Heartbeat Type)",
       "type": "timeseries"
     },
     {

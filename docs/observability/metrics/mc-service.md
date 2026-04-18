@@ -69,7 +69,7 @@ All MC service metrics follow ADR-0011 naming conventions with the `mc_` prefix.
 - **Description**: Total GC heartbeat attempts
 - **Labels**:
   - `status`: Heartbeat outcome (`success`, `error`)
-  - `type`: Heartbeat type (`fast`, `comprehensive`)
+  - `heartbeat_type`: Heartbeat type (`fast`, `comprehensive`)
 - **Cardinality**: Low (2 statuses x 2 types = 4 series)
 - **Usage**: Monitor GC registration health, detect connectivity issues
 
@@ -77,7 +77,7 @@ All MC service metrics follow ADR-0011 naming conventions with the `mc_` prefix.
 - **Type**: Histogram
 - **Description**: GC heartbeat round-trip latency
 - **Labels**:
-  - `type`: Heartbeat type (`fast`, `comprehensive`)
+  - `heartbeat_type`: Heartbeat type (`fast`, `comprehensive`)
 - **Buckets**: [0.001, 0.005, 0.010, 0.025, 0.050, 0.100, 0.250, 0.500, 1.000]
 - **SLO Target**: p99 < 100ms
 - **Cardinality**: Low (2 types)
@@ -377,7 +377,7 @@ All MC service metrics follow strict cardinality bounds per ADR-0011:
 | `operation` | ~10 | Bounded by Redis commands |
 | `reason` | 2-3 | `stale_generation`, `concurrent_write` |
 | `status` | 2-3 | `success`, `error`/`failure`, `accepted`/`rejected` |
-| `type` | 2 | `fast`, `comprehensive` |
+| `heartbeat_type` | 2 | `fast`, `comprehensive` |
 | `result` | 2 | `success`, `failure` (JWT validation) |
 | `token_type` | 3 | `meeting`, `guest`, `service` (JWT validation) |
 | `failure_reason` | 6 | `none`, `signature_invalid`, `expired`, `missing_token`, `scope_mismatch`, `malformed` (JWT validation) |

@@ -93,20 +93,20 @@ config land together). New metrics MUST use the canonical form.
 
 ### Current Drift (non-blocking)
 
-As of 2026-04-17, the fleet has three pieces of canonical-label drift. Each
-is tracked in TODO.md; the renames are lower-priority than ADR-0031 prereq
-completion and require coordinated migrations (PromQL queries in dashboards
-and alert rules reference these labels).
+As of 2026-04-17, the fleet has two remaining pieces of canonical-label
+drift. Each is tracked in TODO.md; the renames are lower-priority than
+ADR-0031 prereq completion and require coordinated migrations (PromQL
+queries in dashboards and alert rules reference these labels).
 
 1. **AC `path` + `status_code` ↔ GC `endpoint` + `status` (categorized)** —
    proposed canonical: `endpoint` (semantic path) + `status_code` (raw HTTP
    code). GC's `status` is a categorized string (`success`/`error`/
    `timeout`) derived from `status_code`; both have independent utility but
    the path-ish label name should align across services.
-2. **MC bare `type` (heartbeat type)** — proposed canonical: `heartbeat_type`.
-   The bare `type` shadows a very generic name and makes cross-service
-   dashboards ambiguous.
-3. **MC + MH `event` ↔ AC `event_type`** — proposed canonical: `event_type`.
+2. **MC + MH `event` ↔ AC `event_type`** — proposed canonical: `event_type`.
+
+Resolved: MC bare `type` on heartbeat metrics was renamed to
+`heartbeat_type` (FU#3b).
 
 Each rename has PromQL ripple into dashboards (landed in c10dde2) and
 alert rules (landed in f5f53f8); the owning service specialist drives
