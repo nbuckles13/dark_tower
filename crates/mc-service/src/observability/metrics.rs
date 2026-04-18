@@ -353,16 +353,16 @@ pub fn record_register_meeting(status: &str, duration: Duration) {
 /// Record an MH participant notification received by MC.
 ///
 /// Metric: `mc_mh_notifications_received_total`
-/// Labels: `event`
+/// Labels: `event_type`
 ///
-/// Event values: "connected", "disconnected"
+/// Event type values: "connected", "disconnected"
 /// Cardinality: 2
 ///
 /// Recorded in `media_coordination.rs` when MH notifies MC
 /// of participant connection/disconnection events.
 pub fn record_mh_notification(event_type: &str) {
     counter!("mc_mh_notifications_received_total",
-        "event" => event_type.to_string()
+        "event_type" => event_type.to_string()
     )
     .increment(1);
 }

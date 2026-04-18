@@ -382,7 +382,7 @@ Operation: RegisterMeeting timeout (provisional client kicked)
   Logs: client disconnected due to RegisterMeeting timeout (meeting_id, participant_id)
 
 Operation: MC notification delivery (MH side)
-  Metric: mh_mc_notifications_total{event=connected|disconnected,status=success|failure}
+  Metric: mh_mc_notifications_total{event_type=connected|disconnected,status=success|failure}
   Alert: notification delivery failure rate >5% for 5m (P3)
   Logs: notification sent/failed (meeting_id, participant_id, event)
 ```
@@ -396,7 +396,7 @@ Operation: RegisterMeeting sent (MC side)
   Alert: failure rate >5% for 5m (P3)
 
 Operation: MH notification received (MC side)
-  Metric: mc_mh_notifications_received_total{event=connected|disconnected}
+  Metric: mc_mh_notifications_received_total{event_type=connected|disconnected}
   Dashboard: MC overview — notification rate by event type
   Logs: participant connected/disconnected to MH (meeting_id, participant_id, handler_id)
 

@@ -58,10 +58,11 @@ same underlying principle.
 When a label represents the same concept across services, it SHOULD use the
 same canonical name. This is **reviewer-only** — the guard does NOT flag
 drift aliases. The choice to keep this reviewer-only (rather than machine-
-enforce it) was made deliberately: the current fleet has drift (see §Current
-Drift below), and machine-enforcing now would require a grandfather
-allowlist whose cost exceeds the benefit. Coordinated renames are tracked
-in TODO.md under "ADR-0031 label-canonicalization follow-ups".
+enforce it) was made deliberately: historically the fleet had drift, and
+machine-enforcing would have required a grandfather allowlist whose cost
+exceeded the benefit. All previously-tracked drift was resolved through
+ADR-0031 FU#3a/b/c (2026-04-18); the reviewer-only posture remains in
+case future drift emerges from new services or metric additions.
 
 | Canonical name | Meaning | Bounded values |
 |---|---|---|
@@ -90,27 +91,6 @@ config land together). New metrics MUST use the canonical form.
 | `http_status`, `httpstatus`, `statuscode`, `status_num` | `status_code` |
 | `aws_region`, `gcp_region`, `datacenter` | `region` |
 | `pod_name`, `podname`, `pod_id` | `pod` |
-
-### Current Drift (non-blocking)
-
-As of 2026-04-17, the fleet has two remaining pieces of canonical-label
-drift. Each is tracked in TODO.md; the renames are lower-priority than
-ADR-0031 prereq completion and require coordinated migrations (PromQL
-queries in dashboards and alert rules reference these labels).
-
-1. **AC `path` + `status_code` ↔ GC `endpoint` + `status` (categorized)** —
-   proposed canonical: `endpoint` (semantic path) + `status_code` (raw HTTP
-   code). GC's `status` is a categorized string (`success`/`error`/
-   `timeout`) derived from `status_code`; both have independent utility but
-   the path-ish label name should align across services.
-2. **MC + MH `event` ↔ AC `event_type`** — proposed canonical: `event_type`.
-
-Resolved: MC bare `type` on heartbeat metrics was renamed to
-`heartbeat_type` (FU#3b).
-
-Each rename has PromQL ripple into dashboards (landed in c10dde2) and
-alert rules (landed in f5f53f8); the owning service specialist drives
-the migration. See TODO.md §"ADR-0031 label-canonicalization follow-ups".
 
 ### Adding a new shared label
 

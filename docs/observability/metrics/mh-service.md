@@ -176,9 +176,9 @@ rate(mh_caller_type_rejected_total[5m])
 - **Type**: Counter
 - **Description**: Total MH→MC notification delivery attempts by event type and outcome
 - **Labels**:
-  - `event`: Notification event type (`connected`, `disconnected`)
+  - `event_type`: Notification event type (`connected`, `disconnected`)
   - `status`: Delivery outcome (`success`, `error`)
-- **Cardinality**: Low (2 events x 2 statuses = 4 series)
+- **Cardinality**: Low (2 event types x 2 statuses = 4 series)
 - **Usage**: Monitor MH→MC notification delivery health, detect MC connectivity issues
 - **Dashboard**: MH Overview - MC Notification Delivery
 

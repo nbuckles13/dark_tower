@@ -209,12 +209,12 @@ pub fn record_register_meeting_timeout() {
 /// Record an MC notification delivery attempt (R-16/R-17).
 ///
 /// Metric: `mh_mc_notifications_total`
-/// Labels: `event` (connected | disconnected), `status` (success | error)
-/// Cardinality: 4 (2 events x 2 statuses)
-pub fn record_mc_notification(event: &str, status: &str) {
+/// Labels: `event_type` (connected | disconnected), `status` (success | error)
+/// Cardinality: 4 (2 event types x 2 statuses)
+pub fn record_mc_notification(event_type: &str, status: &str) {
     counter!(
         "mh_mc_notifications_total",
-        "event" => event.to_string(),
+        "event_type" => event_type.to_string(),
         "status" => status.to_string()
     )
     .increment(1);

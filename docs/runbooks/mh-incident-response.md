@@ -585,7 +585,7 @@ kubectl logs -n dark-tower -l app=mh-service --tail=500 | grep -iE "token|refres
    ```
 2. Check breakdown by event:
    ```promql
-   sum by(event, status) (rate(mh_mc_notifications_total[5m]))
+   sum by(event_type, status) (rate(mh_mc_notifications_total[5m]))
    ```
 
 **Root Cause Investigation**:
