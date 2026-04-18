@@ -1,0 +1,16 @@
+# Exemption fixture: for: 30s AND rate(...[2m]) — both paths satisfy. Must pass.
+groups:
+  - name: fx-page
+    interval: 30s
+    rules:
+      - alert: FxErrorRateHigh
+        expr: rate(foo_total[2m]) > 0.01
+        for: 30s
+        labels:
+          severity: page
+          service: fx-service
+        annotations:
+          summary: "Fx error rate high"
+          description: "Fx error rate is {{ $value }} over the last 2m."
+          impact: "Users experiencing elevated errors."
+          runbook_url: "docs/runbooks/gc-incident-response.md#scenario-4-complete-service-outage"

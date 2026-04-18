@@ -1,0 +1,16 @@
+# Exemption fixture: for: 0m but expr uses increase(...[5m]) >= 30s. Must pass.
+groups:
+  - name: fx-page
+    interval: 30s
+    rules:
+      - alert: FxPanicDetected
+        expr: increase(foo_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: page
+          service: fx-service
+        annotations:
+          summary: "Fx panic detected"
+          description: "Fx actor panicked at least once in the last 5m."
+          impact: "User-visible; root cause investigation required."
+          runbook_url: "docs/runbooks/gc-incident-response.md#scenario-4-complete-service-outage"

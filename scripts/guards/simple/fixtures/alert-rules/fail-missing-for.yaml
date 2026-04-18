@@ -1,0 +1,16 @@
+# Missing-for fixture: no for: field at all. Must fail regardless of expr shape.
+# Even a qualifying expr-window does not exempt a rule from having for: present.
+groups:
+  - name: fx-page
+    interval: 30s
+    rules:
+      - alert: FxMissingFor
+        expr: increase(foo_total[5m]) > 0
+        labels:
+          severity: page
+          service: fx-service
+        annotations:
+          summary: "Fx missing for"
+          description: "Fx rule missing for: field."
+          impact: "User-visible."
+          runbook_url: "docs/runbooks/gc-incident-response.md#scenario-4-complete-service-outage"

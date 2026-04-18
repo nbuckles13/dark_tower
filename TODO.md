@@ -8,31 +8,6 @@ boundaries or requires judgment that belongs to a different specialist.
 
 Non-blocking refinements to the conventions + guard, for future devloops.
 
-### `for:` floor should recognize expr-window patterns
-
-The current `for: ≥ 30s` floor in `validate-alert-rules.sh` assumes `for:` is
-the flap-suppression mechanism. A legitimate alternative pattern uses the
-expr window for flap suppression and `for: 0m` for immediate fire-on-match:
-
-```yaml
-- alert: PanicDetected
-  expr: increase(panic_total[5m]) > 0   # 5m window smooths transient noise
-  for: 0m                                # fire as soon as the expr is truthy
-```
-
-Surfaced during this devloop when `mc-alerts.yaml:33` (`MCActorPanic`) hit the
-guard's `for: ≥ 30s` rule despite being a correctly-designed immediate-fire
-alert. Workaround: bumped to `for: 30s` (negligible detection delay since the
-rule window is 5m). Proper fix is a guard enhancement:
-
-- Detect rate/increase/sum_over_time expressions with `[Nm]` windows where
-  N ≥ 30s.
-- When detected, exempt the rule from the `for:` floor.
-- Update alert-conventions.md §`for:` conventions to document the pattern
-  and its exemption.
-
-Owner: `operations` specialist. No deadline; non-blocking.
-
 ### MC heartbeat alert: two warning tiers on the same signal
 
 Post-migration of `mc-alerts.yaml` to ADR-0031 strict compliance (devloop 2026-04-17-mc-alerts-adr0031-migration), `MCGCHeartbeatFailure` (50% failure rate for 2m) and `MCGCHeartbeatWarning` (10% for 5m) both land in `severity: warning`. Two warning tiers for the same signal isn't broken — routing still fires — but it's a mild smell. Post-migration tuning candidate: either consolidate into one warning, or re-examine whether the 50%/2m threshold warrants `page` if the "new assignments fail" impact can be reframed as directly user-visible (e.g., if meetings start failing to assign within a user's retry budget).

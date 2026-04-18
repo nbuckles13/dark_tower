@@ -1,0 +1,16 @@
+# Exemption-denial fixture: rate(...[10s]) window < 30s, for: 0m — both paths fail. Must fail.
+groups:
+  - name: fx-page
+    interval: 30s
+    rules:
+      - alert: FxTooShortWindow
+        expr: rate(foo_total[10s]) > 0.01
+        for: 0m
+        labels:
+          severity: page
+          service: fx-service
+        annotations:
+          summary: "Fx short-window alert"
+          description: "Fx short-window rate is {{ $value }}."
+          impact: "User-visible."
+          runbook_url: "docs/runbooks/gc-incident-response.md#scenario-4-complete-service-outage"
