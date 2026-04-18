@@ -18,6 +18,14 @@ runs on every CI pipeline. Rules in this document are tagged
 `[guard-enforced]` or `[reviewer-only]`; see the rule index at the end
 of this document for the full enforcement matrix.
 
+**Worked exemplar** (recommended reading before authoring your first
+alert file): [`docs/devloop-outputs/2026-04-17-adr-0031-mh-alerts-exemplar/main.md`](../devloop-outputs/2026-04-17-adr-0031-mh-alerts-exemplar/main.md)
+captures the paired authoring of `mh-alerts.yaml` end-to-end — severity-
+taxonomy debates, metric-choice discipline, threshold provenance
+honesty, and the latent bugs the exemplar-first rollout surfaced. Shows
+what the review conversation actually looks like, beyond what this
+document specifies.
+
 ---
 
 ## Severity Taxonomy
