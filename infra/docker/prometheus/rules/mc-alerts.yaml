@@ -79,24 +79,6 @@ groups:
           impact: "Message processing delayed. May escalate if not addressed."
           runbook_url: "docs/runbooks/mc-incident-response.md#scenario-1-high-mailbox-depth"
 
-      - alert: MCGCHeartbeatFailure
-        expr: |
-          (
-            sum(rate(mc_gc_heartbeats_total{status="error"}[5m]))
-            /
-            sum(rate(mc_gc_heartbeats_total[5m]))
-          ) > 0.5
-        for: 2m
-        labels:
-          severity: warning
-          service: mc-service
-          component: gc-integration
-        annotations:
-          summary: "MC-GC heartbeat failures ({{ $value | humanizePercentage }} error rate)"
-          description: "Meeting Controller failing to send heartbeats to Global Controller. Error rate {{ $value | humanizePercentage }} for 2 minutes. Existing sessions continue; new meeting assignments will not route to this MC."
-          impact: "Partial outage: GC may mark MC as unhealthy and stop assigning new meetings. Active sessions unaffected. Investigate MC-GC connectivity before it escalates."
-          runbook_url: "docs/runbooks/mc-incident-response.md#scenario-6-gc-integration-failures"
-
       - alert: MCHighMemory
         expr: |
           (

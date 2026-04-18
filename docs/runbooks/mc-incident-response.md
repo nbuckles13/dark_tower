@@ -569,8 +569,8 @@ histogram_quantile(0.95, sum by(le) (rate(mc_session_join_duration_seconds_bucke
 
 ### Scenario 6: GC Integration Failures
 
-**Alert**: `MCGCHeartbeatFailure`, `MCGCHeartbeatWarning`
-**Severity**: Critical (>50% failures) / Warning (>10% failures)
+**Alert**: `MCGCHeartbeatWarning`
+**Severity**: Warning (>10% heartbeat failure rate for 5m)
 **Runbook Section**: `#scenario-6-gc-integration-failures`
 
 **Symptoms**:

@@ -8,12 +8,6 @@ boundaries or requires judgment that belongs to a different specialist.
 
 Non-blocking refinements to the conventions + guard, for future devloops.
 
-### MC heartbeat alert: two warning tiers on the same signal
-
-Post-migration of `mc-alerts.yaml` to ADR-0031 strict compliance (devloop 2026-04-17-mc-alerts-adr0031-migration), `MCGCHeartbeatFailure` (50% failure rate for 2m) and `MCGCHeartbeatWarning` (10% for 5m) both land in `severity: warning`. Two warning tiers for the same signal isn't broken — routing still fires — but it's a mild smell. Post-migration tuning candidate: either consolidate into one warning, or re-examine whether the 50%/2m threshold warrants `page` if the "new assignments fail" impact can be reframed as directly user-visible (e.g., if meetings start failing to assign within a user's retry budget).
-
-Owner: `meeting-controller` specialist. No deadline; non-blocking.
-
 ## ADR-0031 label-canonicalization follow-ups
 
 Non-blocking coordinated renames surfaced during the 2026-04-17
