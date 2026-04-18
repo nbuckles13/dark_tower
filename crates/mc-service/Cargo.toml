@@ -64,7 +64,7 @@ metrics-util = "0.18"
 # HTTP testing for health endpoint integration tests
 http-body-util = "0.1"
 # Need test-util feature for tokio::time::pause/advance in tests
-tokio = { version = "1.40", features = ["full", "test-util"] }
+tokio = { workspace = true, features = ["test-util"] }
 # For wrapping TcpListener as tonic-compatible stream in integration tests
 tokio-stream = "0.1"
 # Enable test-utils feature for common (e.g., TokenReceiver::from_test_channel)

@@ -55,7 +55,7 @@ criterion = { workspace = true }
 # Stream utilities for mock gRPC server
 tokio-stream = "0.1"
 # Need test-util feature for tokio::time::pause/advance in tests
-tokio = { version = "1.40", features = ["full", "test-util"] }
+tokio = { workspace = true, features = ["test-util"] }
 # Metrics test recorder for integration tests
 metrics-util = "0.18"
 # Enable test-utils feature for common (e.g., TokenReceiver::from_test_channel)
