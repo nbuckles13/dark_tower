@@ -200,7 +200,7 @@ All MC service metrics follow ADR-0011 naming conventions with the `mc_` prefix.
 - **Type**: Counter
 - **Description**: Total MH→MC participant connection/disconnection notifications received
 - **Labels**:
-  - `event`: Notification event type (`connected`, `disconnected`)
+  - `event_type`: Notification event type (`connected`, `disconnected`)
 - **Cardinality**: Low (2 event types)
 - **Usage**: Monitor MH→MC notification volume, detect MH connectivity issues
 - **Recorded in**: `grpc/media_coordination.rs` on notification receipt
@@ -336,7 +336,7 @@ histogram_quantile(0.99,
 
 ### MH Notification Rate by Event
 ```promql
-sum(rate(mc_mh_notifications_received_total[5m])) by (event)
+sum(rate(mc_mh_notifications_received_total[5m])) by (event_type)
 ```
 
 ### Media Connection Failures (All Failed)
@@ -383,7 +383,7 @@ All MC service metrics follow strict cardinality bounds per ADR-0011:
 | `failure_reason` | 6 | `none`, `signature_invalid`, `expired`, `missing_token`, `scope_mismatch`, `malformed` (JWT validation) |
 | `error_type` (join failures) | ~19 | Bounded by `McError` enum variants |
 | `error_type` (token refresh) | 6 | `http`, `auth_rejected`, `invalid_response`, `acquisition_failed`, `configuration`, `channel_closed` |
-| `event` | 2 | `connected`, `disconnected` (MH notifications) |
+| `event_type` | 2 | `connected`, `disconnected` (MH notifications) |
 | `all_failed` | 2 | `true`, `false` (media connection failures) |
 | `grpc_service` | 2 | `MeetingControllerService`, `MediaCoordinationService` (Layer 2 auth) |
 | `expected_type` | 3 | `global-controller`, `media-handler`, `meeting-controller` (Layer 2 auth) |

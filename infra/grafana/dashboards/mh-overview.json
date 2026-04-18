@@ -1858,8 +1858,8 @@
             "uid": "$datasource"
           },
           "editorMode": "code",
-          "expr": "sum by(event, status) (increase(mh_mc_notifications_total[$__rate_interval]))",
-          "legendFormat": "{{event}} / {{status}}",
+          "expr": "sum by(event_type, status) (increase(mh_mc_notifications_total[$__rate_interval]))",
+          "legendFormat": "{{event_type}} / {{status}}",
           "range": true,
           "refId": "A"
         }
