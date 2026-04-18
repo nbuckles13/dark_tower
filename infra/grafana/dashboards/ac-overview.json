@@ -1274,13 +1274,13 @@
             "uid": "$datasource"
           },
           "editorMode": "code",
-          "expr": "sum(increase(ac_http_requests_total{job=\"ac-service\", status_code=~\"4..\"}[$__rate_interval])) by (status_code, path)",
-          "legendFormat": "{{status_code}} - {{path}}",
+          "expr": "sum(increase(ac_http_requests_total{job=\"ac-service\", status_code=~\"4..\"}[$__rate_interval])) by (status_code, endpoint)",
+          "legendFormat": "{{status_code}} - {{endpoint}}",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "Client Errors (4xx) by Path",
+      "title": "Client Errors (4xx) by Endpoint",
       "type": "timeseries"
     },
     {
@@ -1288,7 +1288,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "HTTP 5xx server errors by path",
+      "description": "HTTP 5xx server errors by endpoint",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1380,13 +1380,13 @@
             "uid": "$datasource"
           },
           "editorMode": "code",
-          "expr": "sum(increase(ac_http_requests_total{job=\"ac-service\", status_code=~\"5..\"}[$__rate_interval])) by (status_code, path)",
-          "legendFormat": "{{status_code}} - {{path}}",
+          "expr": "sum(increase(ac_http_requests_total{job=\"ac-service\", status_code=~\"5..\"}[$__rate_interval])) by (status_code, endpoint)",
+          "legendFormat": "{{status_code}} - {{endpoint}}",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "Server Errors (5xx) by Path",
+      "title": "Server Errors (5xx) by Endpoint",
       "type": "timeseries"
     },
     {
@@ -1470,13 +1470,13 @@
             "uid": "$datasource"
           },
           "editorMode": "code",
-          "expr": "sum(increase(ac_http_requests_total{job=\"ac-service\"}[$__rate_interval])) by (path, status_code)",
-          "legendFormat": "{{path}} ({{status_code}})",
+          "expr": "sum(increase(ac_http_requests_total{job=\"ac-service\"}[$__rate_interval])) by (endpoint, status_code)",
+          "legendFormat": "{{endpoint}} ({{status_code}})",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "All HTTP Requests by Path & Status",
+      "title": "All HTTP Requests by Endpoint & Status",
       "type": "timeseries"
     },
     {

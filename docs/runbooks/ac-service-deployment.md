@@ -300,7 +300,7 @@ kill %1
 
 ```promql
 # Error rate (should be near 0%)
-increase(ac_http_requests_total{status=~"5.."}[5m])
+increase(ac_http_requests_total{status_code=~"5.."}[5m])
 
 # p99 latency (should be <350ms per ADR-0011)
 histogram_quantile(0.99, rate(ac_token_issuance_duration_seconds_bucket[5m]))
@@ -1021,7 +1021,7 @@ curl -s http://localhost:8082/metrics | head -50
 # Expected output (Prometheus text format):
 # # HELP ac_http_requests_total Total number of HTTP requests
 # # TYPE ac_http_requests_total counter
-# ac_http_requests_total{method="GET",path="/health",status="200"} 42
+# ac_http_requests_total{method="GET",endpoint="/health",status_code="200"} 42
 # ...
 
 # Kill port-forward
@@ -1054,7 +1054,7 @@ kube_pod_status_ready{namespace="dark-tower",pod=~"ac-service-.*"}
 
 ```promql
 # HTTP 5xx error rate (should be <1%)
-sum(rate(ac_http_requests_total{status=~"5.."}[5m])) by (status)
+sum(rate(ac_http_requests_total{status_code=~"5.."}[5m])) by (status_code)
 / sum(rate(ac_http_requests_total[5m])) * 100
 
 # Database query errors (should be 0)
@@ -1114,7 +1114,7 @@ ac_db_connections_active / ac_db_connections_max * 100
   severity: critical
 
 - alert: ACHighErrorRate
-  expr: rate(ac_http_requests_total{status=~"5.."}[5m]) / rate(ac_http_requests_total[5m]) > 0.05
+  expr: rate(ac_http_requests_total{status_code=~"5.."}[5m]) / rate(ac_http_requests_total[5m]) > 0.05
   for: 5m
   severity: critical
 

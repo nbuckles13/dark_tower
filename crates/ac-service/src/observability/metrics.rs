@@ -242,7 +242,7 @@ pub fn record_credential_operation(operation: &str, status: &str) {
 /// Record HTTP request completion
 ///
 /// Metric: `ac_http_requests_total`, `ac_http_request_duration_seconds`
-/// Labels: `method`, `path`, `status_code`
+/// Labels: `method`, `endpoint`, `status_code`
 ///
 /// This captures ALL HTTP responses including framework-level errors like:
 /// - 415 Unsupported Media Type (wrong Content-Type)
@@ -256,14 +256,14 @@ pub fn record_http_request(method: &str, path: &str, status_code: u16, duration:
 
     histogram!("ac_http_request_duration_seconds",
         "method" => method.to_string(),
-        "path" => normalized_path.clone(),
+        "endpoint" => normalized_path.clone(),
         "status_code" => status_code.to_string()
     )
     .record(duration.as_secs_f64());
 
     counter!("ac_http_requests_total",
         "method" => method.to_string(),
-        "path" => normalized_path,
+        "endpoint" => normalized_path,
         "status_code" => status_code.to_string()
     )
     .increment(1);
