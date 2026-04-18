@@ -183,22 +183,22 @@ pub fn record_message_dropped(actor_type: &str) {
 /// Record GC heartbeat result.
 ///
 /// Metric: `mc_gc_heartbeats_total`
-/// Labels: `status` (success, error), `type` (fast, comprehensive)
+/// Labels: `status` (success, error), `heartbeat_type` (fast, comprehensive)
 ///
 /// Cardinality: 4 (2 statuses x 2 types)
 pub fn record_gc_heartbeat(status: &str, heartbeat_type: &str) {
-    counter!("mc_gc_heartbeats_total", "status" => status.to_string(), "type" => heartbeat_type.to_string())
+    counter!("mc_gc_heartbeats_total", "status" => status.to_string(), "heartbeat_type" => heartbeat_type.to_string())
         .increment(1);
 }
 
 /// Record GC heartbeat latency.
 ///
 /// Metric: `mc_gc_heartbeat_latency_seconds`
-/// Labels: `type` (fast, comprehensive)
+/// Labels: `heartbeat_type` (fast, comprehensive)
 ///
 /// SLO target: p99 < 100ms for heartbeats
 pub fn record_gc_heartbeat_latency(heartbeat_type: &str, duration: Duration) {
-    histogram!("mc_gc_heartbeat_latency_seconds", "type" => heartbeat_type.to_string())
+    histogram!("mc_gc_heartbeat_latency_seconds", "heartbeat_type" => heartbeat_type.to_string())
         .record(duration.as_secs_f64());
 }
 

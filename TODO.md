@@ -35,6 +35,14 @@ Related observations that cluster under this gap:
 
 Owners: observability (conventions owner) + meeting-controller (surfaced the motivating case) + all service specialists at debate time. No deadline.
 
+### Dual catalog: `docs/observability/metrics/mc.md` vs `mc-service.md`
+
+Two parallel MC metric catalogs exist (mc.md ~339 lines, mc-service.md ~408 lines). mc.md is the older/stale form; mc-service.md is the authoritative one per the sibling ac-service.md / gc-service.md / mh-service.md pattern. Keeping both in sync is manual drift risk — surfaced during FU#3b when the `heartbeat_type` rename had to be applied to both independently (and we still missed one row on the first pass).
+
+Cleanup: delete `mc.md`, repoint in-code doc comments referencing it (at least `crates/mc-service/src/observability/metrics.rs:256`), verify no dashboards/alerts link into mc.md anchors.
+
+Owner: observability (catalog owner). No deadline; non-blocking.
+
 ## ADR-0031 label-canonicalization follow-ups
 
 Non-blocking coordinated renames surfaced during the 2026-04-17
@@ -57,17 +65,6 @@ and `validate-alert-rules.sh` fail on references to removed metrics/labels.
 
 Canonical-name target list lives in
 `docs/observability/label-taxonomy.md` §Shared Label Names (reviewer-only).
-
-### MC bare `type` → `heartbeat_type`
-
-- Affected metrics: `mc_gc_heartbeats_total` (label `type`),
-  `mc_gc_heartbeat_latency_seconds` (label `type`).
-- Ripple: any MC heartbeat panel/alert that selects on `type`. The bare
-  `type` name shadows a very generic identifier and makes cross-service
-  dashboards ambiguous (e.g., grouping by `type` across metrics would mix
-  heartbeat-type with unrelated dimensions).
-
-Owner: `meeting-controller` specialist. No deadline; non-blocking.
 
 ### MC + MH `event` / AC `event_type` → canonical `event_type`
 
