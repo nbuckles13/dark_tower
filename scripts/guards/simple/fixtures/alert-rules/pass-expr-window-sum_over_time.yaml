@@ -1,0 +1,16 @@
+# Exemption fixture: for: 0m but expr uses sum_over_time(...[10m]) >= 30s. Must pass.
+groups:
+  - name: fx-page
+    interval: 30s
+    rules:
+      - alert: FxGaugeSpike
+        expr: sum_over_time(foo_gauge[10m]) > 100
+        for: 0m
+        labels:
+          severity: page
+          service: fx-service
+        annotations:
+          summary: "Fx gauge spike"
+          description: "Fx gauge accumulated sum over 10m is {{ $value }}."
+          impact: "Sustained elevated gauge reading."
+          runbook_url: "docs/runbooks/gc-incident-response.md#scenario-4-complete-service-outage"

@@ -59,6 +59,17 @@ REPO_ROOT = sys.argv[3]
 
 ALLOWED_SEVERITIES = {"page", "warning", "info"}
 MIN_FOR_SECONDS = 30
+MIN_EXPR_WINDOW_SECONDS = 30
+
+GUARD_DEBUG = os.environ.get("GUARD_DEBUG") == "1"
+
+# Matches `rate(`, `increase(`, or `sum_over_time(` — the three expr-window
+# flap-suppression functions that can substitute for a ≥30s `for:` window.
+EXPR_WINDOW_FUNC_RE = re.compile(r"\b(rate|increase|sum_over_time)\s*\(")
+# Matches `[<duration>]` range selector (e.g. `[5m]`, `[30s]`). The duration
+# token is constrained to Prometheus duration syntax so random `[foo]` doesn't
+# confuse us.
+RANGE_SELECTOR_RE = re.compile(r"\[\s*((?:\d+[smhdwy])+)\s*\]")
 
 # IPv4 addresses allowed as doc/example references, not real targets.
 IPV4_ALLOWLIST = {
@@ -235,14 +246,63 @@ def validate_severity(severity):
     return True, None
 
 
-def validate_for(for_val):
+def find_qualifying_expr_window(expr):
+    """Scan expr for rate/increase/sum_over_time(...[<window>]) where window >= 30s.
+
+    Walks balanced parens from each function call to find the range selector
+    that belongs to that call (not some unrelated nested `[...]` outside it).
+    Returns the max qualifying window in seconds, or None if no qualifying
+    window is found.
+    """
+    if not isinstance(expr, str) or not expr:
+        return None
+
+    best = None
+    for fn_match in EXPR_WINDOW_FUNC_RE.finditer(expr):
+        open_paren = fn_match.end() - 1
+        depth = 0
+        end = None
+        for i in range(open_paren, len(expr)):
+            c = expr[i]
+            if c == "(":
+                depth += 1
+            elif c == ")":
+                depth -= 1
+                if depth == 0:
+                    end = i
+                    break
+        if end is None:
+            continue
+        body = expr[open_paren + 1:end]
+        for rng in RANGE_SELECTOR_RE.finditer(body):
+            secs = parse_prometheus_duration(rng.group(1))
+            if secs is None or secs < MIN_EXPR_WINDOW_SECONDS:
+                continue
+            if best is None or secs > best:
+                best = secs
+    return best
+
+
+def validate_for(for_val, expr):
     if for_val is None:
         return False, "for: is missing"
     secs = parse_prometheus_duration(str(for_val))
     if secs is None:
         return False, f"for: is not a valid Prometheus duration (got: {for_val})"
     if secs < MIN_FOR_SECONDS:
-        return False, f"for: must be >= {MIN_FOR_SECONDS}s (got: {for_val} = {secs}s)"
+        window_secs = find_qualifying_expr_window(expr)
+        if window_secs is not None:
+            if GUARD_DEBUG:
+                sys.stderr.write(
+                    f"DEBUG: for: {for_val} ({secs}s) below floor, but expr-window "
+                    f"{window_secs}s >= {MIN_EXPR_WINDOW_SECONDS}s grants exemption\n"
+                )
+            return True, None
+        return False, (
+            f"for: must be >= {MIN_FOR_SECONDS}s OR expr must contain a "
+            f"rate/increase/sum_over_time(...[>= {MIN_EXPR_WINDOW_SECONDS}s]) "
+            f"window (got for: {for_val} = {secs}s, no qualifying expr-window)"
+        )
     return True, None
 
 
@@ -284,8 +344,8 @@ def main():
             if not ok:
                 emit("severity", rel_path, alert_name, rule_line, msg)
 
-            # Check 4: for: duration
-            ok, msg = validate_for(rule.get("for"))
+            # Check 4: for: duration (or expr-window exemption)
+            ok, msg = validate_for(rule.get("for"), rule.get("expr"))
             if not ok:
                 emit("for_duration", rel_path, alert_name, rule_line, msg)
 

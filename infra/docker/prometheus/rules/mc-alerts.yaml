@@ -33,7 +33,7 @@ groups:
       - alert: MCActorPanic
         expr: |
           increase(mc_actor_panics_total[5m]) > 0
-        for: 30s
+        for: 0m
         labels:
           severity: page
           service: mc-service

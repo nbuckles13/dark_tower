@@ -133,9 +133,10 @@ The canonical alert-rule shape is:
 
 ### Anti-patterns (avoid these)
 
-- **Single-scrape trigger** — `expr` without `for:` or with `for: 0s`. Fires on
-  every transient spike. Use `for: >= 30s` (guard enforced) or use a rate/increase
-  window in the `expr` that already provides smoothing.
+- **Single-scrape trigger** — `expr` without `for:` or with `for: 0s` AND no
+  expr-window smoothing. Fires on every transient spike. Use `for: >= 30s`
+  (guard-enforced floor) or a rate/increase/sum_over_time window ≥ 30s in
+  the `expr` that already provides smoothing — the guard accepts either.
 - **Threshold exactly at SLO** — when error rate is sometimes at SLO and
   sometimes above, alert pages on noise. Use a burn-rate alert (see next
   section) that accounts for budget consumption, not instantaneous crossings.
@@ -196,8 +197,11 @@ intervene before paging.
 
 ## `for:` Conventions
 
-- **Floor: 30 seconds** `[guard-enforced]`. Rejected: `for: 0s`, `for: 10s`,
-  omitted. Prevents single-scrape flapping alerts.
+- **Floor: 30 seconds OR qualifying expr-window** `[guard-enforced]`. A rule
+  passes the floor check if EITHER `for: >= 30s` OR the `expr` contains a
+  `rate(...[W])`, `increase(...[W])`, or `sum_over_time(...[W])` call where
+  `W >= 30s`. `for:` must still be **present and parseable** (e.g. `for: 0m`
+  is allowed; omitting the field is not).
 - **30s–1m**: outage detection on critical paths. Use for `Up == 0`–style
   alerts where detection speed matters and noise is low.
 - **5m–10m**: steady-state SLO-derived thresholds. Most `warning` alerts
@@ -208,6 +212,62 @@ intervene before paging.
 Match the `for:` window to the `rate()` / `increase()` window in the `expr`
 where applicable. A 5m `rate()` window with `for: 1h` means you need 1h of
 sustained breach — rarely what you want.
+
+### Two flap-suppression mechanisms `[reviewer-only]`
+
+Prometheus alert rules have two independent mechanisms for suppressing
+single-scrape flaps. Either one alone is enough; the guard accepts whichever
+is present, as long as the smoothing window is ≥ 30s.
+
+1. **`for:` window** — the rule stays `pending` until the expression has been
+   truthy for the full `for:` duration. Best for **steady-state threshold
+   alerts** where a brief spike above threshold shouldn't fire (e.g. CPU at
+   80% for a single scrape is noise; 80% sustained for 5m is a signal).
+2. **expr-window** — `rate(...[W])` / `increase(...[W])` / `sum_over_time(...[W])`
+   already smooth across a window `W`. A short or zero `for:` with a
+   ≥ 30s expr-window fires as soon as the smoothed condition is truthy.
+   Best for **immediate-fire-on-first-truthy patterns** like panic
+   detection, where any occurrence in the window is actionable and delaying
+   the page by an extra `for:` cycle costs detection latency without
+   reducing noise.
+   - **`irate` is intentionally excluded**: `irate(...[W])` uses `W` only as a
+     lookback bound to find the last two samples, not as a smoothing window,
+     so `for: 0m + irate(foo[5m])` would still flap on a single-scrape
+     transient. Use `rate` / `increase` / `sum_over_time` for exemption-eligible
+     smoothing.
+
+Prefer expr-window when: the metric is a counter whose *occurrence* is the
+signal (panics, unrecoverable errors, fatal-event counters), and you want
+the page to fire on the first truthy evaluation after the event lands.
+
+Prefer `for:` window when: the metric is a gauge or ratio whose *level* is
+the signal (CPU, memory, error-rate ratio), and brief excursions above
+threshold shouldn't fire.
+
+**Exemplar — MCActorPanic** (`infra/docker/prometheus/rules/mc-alerts.yaml`):
+
+```yaml
+- alert: MCActorPanic
+  expr: increase(mc_actor_panics_total[5m]) > 0
+  for: 0m
+```
+
+The 5m `increase()` window smooths the counter; `for: 0m` fires immediately
+on the first truthy evaluation. The 30s floor is satisfied by the expr
+window, not by `for:`.
+
+### Exemption rule `[guard-enforced]`
+
+The guard accepts a rule if:
+
+1. `for:` is present and parseable as a Prometheus duration, AND
+2. EITHER `for: >= 30s` OR the `expr` contains a
+   `rate|increase|sum_over_time(...[W])` call with `W >= 30s`.
+
+A rate/increase window of `[10s]` does NOT qualify — the typical scrape
+interval is 15–30s, so a 10s window samples too few data points to provide
+meaningful flap suppression. Keep the expr-window ≥ 30s (5m is the common
+choice for panic/error-event alerts).
 
 ---
 
@@ -328,7 +388,7 @@ alerts on `<svc>_<dep>_*` metrics require `<svc>` specialist (author) +
 | `runbook_url` target exists | `[guard-enforced]` |
 | `severity` label present | `[guard-enforced]` |
 | `severity` value in allowed set | `[guard-enforced]` |
-| `for:` ≥ 30s | `[guard-enforced]` |
+| `for:` present AND (`for:` ≥ 30s OR qualifying expr-window ≥ 30s) | `[guard-enforced]` |
 | Annotation text free of secrets/hostnames | `[guard-enforced]` |
 | `# guard:ignore(reason)` escape hatch | `[guard-enforced]` (parsed and honored) |
 | Severity classification taxonomy | `[reviewer-only]` |
