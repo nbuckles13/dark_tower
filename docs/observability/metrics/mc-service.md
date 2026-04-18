@@ -266,6 +266,66 @@ All MC service metrics follow ADR-0011 naming conventions with the `mc_` prefix.
 
 ---
 
+## Token Manager Metrics (ADR-0010 Section 4a)
+
+### `mc_token_refresh_total`
+- **Type**: Counter
+- **Description**: Total token refresh attempts
+- **Labels**:
+  - `status`: Refresh outcome (success, error)
+- **Cardinality**: 2
+- **Usage**: Track token refresh rate and success
+- **Example**:
+  ```promql
+  rate(mc_token_refresh_total{job="mc-service", status="error"}[5m])
+  ```
+
+### `mc_token_refresh_duration_seconds`
+- **Type**: Histogram
+- **Description**: Token refresh operation duration
+- **Labels**: None (aggregated)
+- **Buckets**: [0.010, 0.050, 0.100, 0.250, 0.500, 1.000, 2.500, 5.000]
+- **Cardinality**: 1
+- **Usage**: Monitor token refresh latency
+- **Example**:
+  ```promql
+  histogram_quantile(0.99,
+    sum(rate(mc_token_refresh_duration_seconds_bucket{job="mc-service"}[5m])) by (le)
+  )
+  ```
+
+### `mc_token_refresh_failures_total`
+- **Type**: Counter
+- **Description**: Token refresh failures by error type
+- **Labels**:
+  - `error_type`: Type of failure (http, auth_rejected, invalid_response, acquisition_failed, configuration, channel_closed)
+- **Cardinality**: 6
+- **Alert**: High rate indicates AC connectivity issues
+- **Example**:
+  ```promql
+  sum(rate(mc_token_refresh_failures_total{job="mc-service"}[5m])) by (error_type)
+  ```
+
+---
+
+## Error Metrics
+
+### `mc_errors_total`
+- **Type**: Counter
+- **Description**: Total errors by operation and type
+- **Labels**:
+  - `operation`: Operation that failed (token_refresh, gc_heartbeat, redis_session, meeting_join, session_binding)
+  - `error_type`: Error classification from `McError::error_type_label()` (redis, grpc, not_registered, config, session_binding, meeting_not_found, participant_not_found, meeting_capacity_exceeded, mc_capacity_exceeded, draining, migrating, fenced_out, conflict, jwt_validation, permission_denied, internal, token_acquisition, token_acquisition_timeout)
+  - `status_code`: Signaling error code as string (2, 3, 4, 5, 6, 7)
+- **Cardinality**: Medium (~90 combinations, bounded by operations and error types)
+- **Usage**: Track error rates by type, identify patterns in failures
+- **Example**:
+  ```promql
+  sum(rate(mc_errors_total{job="mc-service"}[5m])) by (operation, error_type)
+  ```
+
+---
+
 ## Prometheus Query Examples
 
 ### Active Meetings

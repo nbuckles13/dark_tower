@@ -35,14 +35,6 @@ Related observations that cluster under this gap:
 
 Owners: observability (conventions owner) + meeting-controller (surfaced the motivating case) + all service specialists at debate time. No deadline.
 
-### Dual catalog: `docs/observability/metrics/mc.md` vs `mc-service.md`
-
-Two parallel MC metric catalogs exist (mc.md ~339 lines, mc-service.md ~408 lines). mc.md is the older/stale form; mc-service.md is the authoritative one per the sibling ac-service.md / gc-service.md / mh-service.md pattern. Keeping both in sync is manual drift risk — surfaced during FU#3b when the `heartbeat_type` rename had to be applied to both independently (and we still missed one row on the first pass).
-
-Cleanup: delete `mc.md`, repoint in-code doc comments referencing it (at least `crates/mc-service/src/observability/metrics.rs:256`), verify no dashboards/alerts link into mc.md anchors.
-
-Owner: observability (catalog owner). No deadline; non-blocking.
-
 ## `/devloop` skill: cross-ownership friction on small changes
 
 **Seed a `/debate` — input needed from all specialists before changing the skill.**
