@@ -10,7 +10,14 @@
 //! Labels are bounded to prevent cardinality explosion:
 //! - `method`: 7 values max (GET, POST, PATCH, DELETE, PUT, HEAD, OPTIONS)
 //! - `endpoint`: ~10 values (parameterized paths)
-//! - `status`: 3 values (success, error, timeout)
+//! - `status_code`: raw HTTP status codes (~15 values in practice: 200, 201,
+//!   400, 401, 403, 404, 429, 500, 503, etc.). Categorization (2xx/4xx/5xx
+//!   vs success/error/timeout) is derivable via PromQL regex like
+//!   `status_code=~"[45].."`, so no separate category label is emitted —
+//!   matches AC's canonical shape (see ADR-0031 §Canonical Labels).
+//! - `status`: 5 values (success, error, timeout, rejected, accepted) on
+//!   non-HTTP metrics where callers pass semantic outcome strings (e.g.,
+//!   `gc_mc_assignments_total`, `gc_db_queries_total`).
 //! - `operation`: bounded by code (select_mc, insert_assignment, etc.)
 //! - `error_type`: bounded by error variants
 //!
@@ -118,7 +125,7 @@ pub fn init_metrics_recorder() -> Result<PrometheusHandle, String> {
 /// Record HTTP request completion
 ///
 /// Metric: `gc_http_requests_total`, `gc_http_request_duration_seconds`
-/// Labels: `method`, `endpoint`, `status`
+/// Labels: `method`, `endpoint`, `status_code` (raw HTTP code)
 ///
 /// This captures ALL HTTP responses including framework-level errors like:
 /// - 415 Unsupported Media Type (wrong Content-Type)
@@ -126,18 +133,20 @@ pub fn init_metrics_recorder() -> Result<PrometheusHandle, String> {
 /// - 404 Not Found
 /// - 405 Method Not Allowed
 ///
+/// Categorization (2xx/4xx/5xx, success/timeout) is derivable at query time
+/// via PromQL regex on `status_code` (e.g., `status_code=~"[45].."`). This
+/// matches AC's canonical shape — see ADR-0031 and the canonical-label
+/// reconciliation tracked in TODO.md (originally FU#3a).
+///
 /// SLO target: p95 < 200ms
 pub fn record_http_request(method: &str, endpoint: &str, status_code: u16, duration: Duration) {
     // Normalize endpoint to prevent cardinality explosion
     let normalized_endpoint = normalize_endpoint(endpoint);
 
-    // Determine status category for simplified querying
-    let status = categorize_status_code(status_code);
-
     histogram!("gc_http_request_duration_seconds",
         "method" => method.to_string(),
         "endpoint" => normalized_endpoint.clone(),
-        "status" => status.to_string()
+        "status_code" => status_code.to_string()
     )
     .record(duration.as_secs_f64());
 
@@ -147,15 +156,6 @@ pub fn record_http_request(method: &str, endpoint: &str, status_code: u16, durat
         "status_code" => status_code.to_string()
     )
     .increment(1);
-}
-
-/// Categorize HTTP status code into success/error/timeout
-fn categorize_status_code(status_code: u16) -> &'static str {
-    match status_code {
-        200..=299 => "success",
-        408 | 504 => "timeout",
-        _ => "error",
-    }
 }
 
 /// Normalize endpoint path to prevent label cardinality explosion
@@ -631,32 +631,7 @@ mod tests {
     // not metric emission, so they don't need MetricAssertion.
 
     #[test]
-    fn categorize_status_code_success() {
-        assert_eq!(categorize_status_code(200), "success");
-        assert_eq!(categorize_status_code(201), "success");
-        assert_eq!(categorize_status_code(204), "success");
-        assert_eq!(categorize_status_code(299), "success");
-    }
-
-    #[test]
-    fn categorize_status_code_timeout() {
-        assert_eq!(categorize_status_code(408), "timeout");
-        assert_eq!(categorize_status_code(504), "timeout");
-    }
-
-    #[test]
-    fn categorize_status_code_error() {
-        assert_eq!(categorize_status_code(400), "error");
-        assert_eq!(categorize_status_code(401), "error");
-        assert_eq!(categorize_status_code(403), "error");
-        assert_eq!(categorize_status_code(404), "error");
-        assert_eq!(categorize_status_code(429), "error");
-        assert_eq!(categorize_status_code(500), "error");
-        assert_eq!(categorize_status_code(503), "error");
-    }
-
-    #[test]
-    fn normalize_endpoint_known_paths() {
+    fn test_normalize_endpoint_known_paths() {
         assert_eq!(normalize_endpoint("/"), "/");
         assert_eq!(normalize_endpoint("/health"), "/health");
         assert_eq!(normalize_endpoint("/metrics"), "/metrics");

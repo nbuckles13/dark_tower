@@ -16,12 +16,25 @@ All GC service metrics follow ADR-0011 naming conventions with the `gc_` prefix.
 - **Labels**:
   - `method`: HTTP method (GET, POST, PATCH, DELETE, etc.)
   - `endpoint`: Normalized endpoint path (e.g., `/api/v1/meetings/{code}`)
-  - `status_code`: HTTP response status code (200, 400, 401, 403, 404, 500, etc.)
-- **Cardinality**: ~210 (7 methods x 10 endpoints x 3 status categories)
-- **Usage**: Track request rate and error distribution by endpoint
+  - `status_code`: HTTP response status code — raw code as a string
+    (`"200"`, `"400"`, `"401"`, `"403"`, `"404"`, `"500"`, etc.)
+- **Cardinality**: nominal worst-case ~1,050 combinations (7 methods × 10 endpoints
+  × ~15 realistic status codes) notionally nudges the ADR-0011 §62-63 1,000/metric
+  ceiling, but observed series stay well under 300 because no single
+  (method, endpoint) pair surfaces more than ~3 codes in practice (e.g., `POST
+  /api/v1/meetings` emits roughly 200/400/401/500, not 15 codes). The catalog
+  ceiling holds in practice; revisit if a new endpoint surfaces >5 distinct codes.
+- **Usage**: Track request rate and error distribution by endpoint. Derive
+  category breakdowns via PromQL regex on `status_code` (e.g., `"2.."` for
+  success, `"[45].."` for errors, `"5.."` for server errors). No separate
+  category label is emitted — aligns with AC's canonical shape per ADR-0031.
 - **Example**:
   ```promql
+  # Total request rate
   rate(gc_http_requests_total{job="gc-service-local"}[5m])
+
+  # Server-error rate (5xx)
+  sum(rate(gc_http_requests_total{status_code=~"5.."}[5m]))
   ```
 
 ### `gc_http_request_duration_seconds`
@@ -30,11 +43,18 @@ All GC service metrics follow ADR-0011 naming conventions with the `gc_` prefix.
 - **Labels**:
   - `method`: HTTP method
   - `endpoint`: Normalized endpoint path
-  - `status`: Status category (success, error, timeout)
+  - `status_code`: HTTP response status code — raw code as a string
+    (matches `gc_http_requests_total`)
 - **Buckets**: [0.005, 0.010, 0.025, 0.050, 0.100, 0.150, 0.200, 0.300, 0.500, 1.000, 2.000]
 - **SLO Target**: p95 < 200ms (per ADR-0010)
-- **Cardinality**: ~210 (7 methods x 10 endpoints x 3 statuses)
-- **Usage**: Monitor request latency, calculate percentiles for SLO tracking
+- **Cardinality**: same worst-case framing as `gc_http_requests_total` — nominal
+  ~1,050 label combinations nudges the 1,000/metric ceiling, observed stays well
+  under 300 in practice. Note: `_bucket` time series ≈ 12× the label cardinality
+  per the metrics library's histogram expansion, so the bucket surface is a
+  separate (larger) concern tracked by `validate-histogram-buckets.sh`.
+- **Usage**: Monitor request latency, calculate percentiles for SLO tracking.
+  Filter by `status_code=~"2.."` to exclude error paths from latency SLOs if
+  desired.
 - **Example**:
   ```promql
   histogram_quantile(0.95,
@@ -531,13 +551,13 @@ All GC service metrics follow strict cardinality bounds per ADR-0011:
 |-------|-------|--------|
 | `method` | 7 max | GET, POST, PATCH, DELETE, PUT, HEAD, OPTIONS |
 | `endpoint` | ~10 | /health, /metrics, /api/v1/me, /api/v1/meetings/{code}, etc. |
-| `status` | 3 | success, error, timeout |
-| `status_code` | ~15 | 200, 201, 400, 401, 403, 404, 429, 500, 503, etc. |
+| `status_code` | ~15 realistic | 200, 201, 400, 401, 403, 404, 429, 500, 503, etc. (HTTP metrics only) |
+| `status` | 5 | success, error, timeout, rejected, accepted (non-HTTP outcome metrics: mc_assignments, db_queries, token_refresh, ac_requests, grpc_mc_calls, mh_selections, meeting_creation, meeting_join) |
 | `operation` | ~18 | select_mc, atomic_assign, update_heartbeat, ac_meeting_token, ac_guest_token, mc_grpc, etc. |
 | `rejection_reason` | 5 | at_capacity, draining, unhealthy, rpc_failed, none |
 | `error_type` | ~10 | not_found, forbidden, unauthorized, rate_limit, service_unavailable, internal, etc. |
 
-**Total Estimated Cardinality**: ~410 time series (well within Prometheus limits)
+**Total Estimated Cardinality**: HTTP metrics ~1,050 worst-case (realistically a few hundred), plus ~200 non-HTTP series — well within Prometheus limits.
 
 ---
 

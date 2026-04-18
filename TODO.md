@@ -58,28 +58,6 @@ and `validate-alert-rules.sh` fail on references to removed metrics/labels.
 Canonical-name target list lives in
 `docs/observability/label-taxonomy.md` §Shared Label Names (reviewer-only).
 
-### GC `status` → `status_code` + `status_category` split
-
-- Affected metrics: `gc_http_requests_total`, `gc_http_request_duration_seconds`
-  (and any other GC metric currently emitting the overloaded `status` label).
-- Ripple: every HTTP-route panel/alert in `gc-*.json` and `gc-alerts.yaml`
-  that selects on `status`, plus any alertmanager routing config matching on
-  the label.
-- Schema change (not a rename): GC today emits a categorized
-  `status` (`success`/`error`/`timeout`), which drifts from AC's raw
-  `status_code` and conflates two dimensions. Split into `status_code` (raw
-  HTTP code, matching AC's canonical name) + `status_category` (categorized
-  bucket) so queries can aggregate either way. AC already emits `status_code`
-  and has no categorized variant; no AC change needed.
-- Because this is a schema change rather than a pure rename, existing
-  dashboards/alerts won't just need find-and-replace — categorized queries
-  need to switch to `status_category`, code-based queries to `status_code`.
-  Deferred to its own devloop so the migration can be sequenced carefully
-  (coordinated-migration discipline: metrics + dashboards + alerts +
-  alertmanager routing land atomically, or behind a staged dual-emit).
-
-Owner: `global-controller` specialist. No deadline; non-blocking.
-
 ### MC bare `type` → `heartbeat_type`
 
 - Affected metrics: `mc_gc_heartbeats_total` (label `type`),
