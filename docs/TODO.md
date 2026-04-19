@@ -177,14 +177,14 @@
 
 ## From ADR-0024 §6 Amendment (2026-04-18)
 
-- [ ] **Plan-template extension + scope-drift guard + classification-sanity guard + Gate 1 reviewer-checklist update**: extend `docs/devloop-outputs/_template/main.md` with a `## Cross-Boundary Classification` section (already done as part of the amendment commit); author `validate-cross-boundary-scope.sh` (Layer A: diff vs. plan file list) and `validate-cross-boundary-classification.sh` (Layer B: GSA-not-Mechanical + Owner-field-filled + Trailer-required-rows-produce-trailers); build ownership manifest mapping GSA paths to required specialists; add Gate 1 checklist item to `.claude/skills/devloop/review-protocol.md`. See ADR-0024 §6.8 item 1. Owners: operations + test + security + code-reviewer. Medium devloop.
-- [ ] **Commit-time trailer consistency check**: pre-commit hook (or CI job) verifying plan rows marked "Trailer: Yes" produce matching `Approved-Cross-Boundary:` trailers on the devloop's commits. Can fold into item 1 or run as small follow-up. See ADR-0024 §6.8 item 2. Owner: operations.
-- [ ] **GSA three-way sync guard**: ~15 LOC script diffing the GSA enumerated list across `docs/decisions/adr-0024-agent-teams-workflow.md` §6.4, `.claude/skills/devloop/SKILL.md` §Cross-Boundary Edits, and `.claude/skills/devloop/review-protocol.md` Step 0. Prevents drift when GSA extends via micro-debate. See ADR-0024 §6.8 item 3. Owner: dry-reviewer.
-- [ ] **DRY reviewer retrospective audit on Ownership Lens verdict field**. See ADR-0024 §6.8 item 4. Owner: dry-reviewer.
+- [ ] **Plan-template ⟶ Layer A + Layer B guards + Gate 1 invocation + Gate 1 reviewer-checklist**: template extension already shipped. Author `validate-cross-boundary-scope.sh` (Layer A: diff vs. plan file list, runs at Gate 2) and `validate-cross-boundary-classification.sh` (Layer B: GSA-not-Mechanical + Owner-field-filled, runs at Gate 1 primarily and Gate 2 as safety net); build ownership manifest mapping GSA paths to required specialists; add Gate 1 invocation step to SKILL.md Step 5 (already drafted in amendment); add Gate 1 checklist item to `.claude/skills/devloop/review-protocol.md`. See ADR-0024 §6.8 item 1. Owners: operations + test + security + code-reviewer. Medium devloop.
+- [ ] **GSA three-way sync guard**: ~15 LOC script diffing the GSA enumerated list across `docs/decisions/adr-0024-agent-teams-workflow.md` §6.4, `.claude/skills/devloop/SKILL.md` §Cross-Boundary Edits, and `.claude/skills/devloop/review-protocol.md` Step 0. Prevents drift when GSA extends via micro-debate. See ADR-0024 §6.8 item 2. Owner: dry-reviewer.
+- [ ] **DRY reviewer retrospective audit on Ownership Lens verdict field**. See ADR-0024 §6.8 item 3. Owner: dry-reviewer.
 
 **Reshaped or dropped from earlier drafts** (for history):
 
 - ~~`validate-cross-boundary-approval.sh` at Gate 2~~ — reshaped into Layer A + Layer B guards above. Original framing was flawed (no commits at Gate 2).
+- ~~Commit-time trailer consistency check~~ — dropped. Owner confirmation is now satisfied by Gate 1 review + Gate 3 Ownership Lens verdict. Trailers remain available as an optional audit convention (ADR-0024 §6.7) but are not enforced.
 - ~~APPROVED-CROSS-BOUNDARY classification-failure fixture suite~~ — dropped. Simplified Layer B guard's narrow rules are reviewer-verifiable during authoring; no separate fixture suite needed.
 - ~~Scope/claim/session-field rename guard~~ — deferred indefinitely. Compiler + reviewers cover most cases; residual risk (non-Rust string renames) is narrow.
 

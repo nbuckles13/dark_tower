@@ -102,14 +102,14 @@ Use ADR-0019 Pattern A/B/C vocabulary for duplication/rename patterns; Pattern B
 | Category | Owner involvement | Mechanism |
 |----------|-------------------|-----------|
 | Mechanical | Review-only | Owner sees the change at the standard reviewer gate. No separate approval — **proceed with review**. |
-| Minor-judgment | Hunk-ACK required | Owner-specialist must explicitly ACK the specific cross-boundary hunk via a commit trailer (below). PR-level review insufficient. |
+| Minor-judgment | Owner confirmation required | Owner-specialist must be a reviewer on the devloop and must confirm the cross-boundary hunk at Gate 1 and at Gate 3 (via Ownership Lens verdict). Not satisfied by generic PR approval. Optional `Approved-Cross-Boundary:` trailer (below) available as an audit breadcrumb. |
 | Domain-judgment | Owner-implements | Route to a separate devloop with owner as implementer, or use `--paired-with=<owner>` to keep the owner in the loop during the current devloop. |
 
 **Default-posture flip**: For Mechanical cross-boundary edits the default is "proceed with review," NOT "defer to owner." The older implicit "owner-implements" rule holds only for Domain-judgment and Guarded Shared Areas. **This flip does NOT apply inside Guarded Shared Areas — Mechanical classification is disallowed there.**
 
 ### Guarded Shared Areas (§6.4)
 
-Certain surfaces override the category classification: even a sed-clean edit routes to the owner-specialist. **Mechanical is disallowed inside GSA; Minor-judgment requires owner hunk-ACK.**
+Certain surfaces override the category classification: even a sed-clean edit routes to the owner-specialist. **Mechanical is disallowed inside GSA; Minor-judgment requires owner confirmation at Gate 1 and Gate 3 (§6.3).**
 
 **Criterion** (names the test, not just the list): wire-format runtime coupling, OR auth-routing policy, OR detection/forensics contract, OR schema evolution. Paths matching the criterion are Guarded whether or not enumerated below.
 
@@ -124,23 +124,27 @@ Certain surfaces override the category classification: even a sed-clean edit rou
 - `db/migrations/**` — schema evolution
 - ADR-0027-approved crypto primitives (wherever referenced) — path-independent; guards a concept, not a directory. New call sites of enumerated primitives inherit Guarded status regardless of the containing file.
 
-**Intersection rule**: edits spanning two GSA (e.g., auth-routing fields in `proto/internal.proto` crossing wire-format × auth-routing-policy) require all affected owners co-sign: `Approved-Cross-Boundary: protocol`, `Approved-Cross-Boundary: auth-controller`, `Approved-Cross-Boundary: security` (ADR-0003 §5.7).
+**Intersection rule**: edits spanning two GSA (e.g., auth-routing fields in `proto/internal.proto` crossing wire-format × auth-routing-policy) require all affected owners present as reviewers and all confirming at Gate 1 / Gate 3. Canonical case: changes to `ServiceType` enum, scope enums, or identity fields in `proto/internal.proto` need protocol + auth-controller + security (ADR-0003 §5.7).
 
-**`crates/common/**` outside the Guarded subset** is not owned by a single specialist. Edits require DRY reviewer + code-reviewer approval; affected-specialist involvement is review-only unless call-site semantics change (escalates to Minor-judgment hunk-approval).
+**`crates/common/**` outside the Guarded subset** is not owned by a single specialist. Edits require DRY reviewer + code-reviewer approval; affected-specialist involvement is review-only unless call-site semantics change (escalates to Minor-judgment, §6.3).
 
 Extending the enumerated list requires a **micro-debate** (~3 specialists: affected owner + security + one cross-cutting), not a new ADR. Counter-intuitive property: the rule is *stricter* inside GSA, not looser.
 
-### `Approved-Cross-Boundary:` Commit Trailer (§6.7)
+### Optional `Approved-Cross-Boundary:` Commit Trailer (§6.7)
 
-Hunk-ACK is recorded as a git commit trailer:
+Owner confirmation is satisfied by Gate 1 review + Gate 3 Ownership Lens verdict (§6.3). For cases where a durable audit breadcrumb matters (e.g., auth-critical edits that will be referenced during post-incident review), an owner may optionally record confirmation as a commit trailer:
 
 ```
 Approved-Cross-Boundary: <specialist-name> <reason ≥ 10 chars>
 ```
 
-RFC-5322 style, parseable by `git interpret-trailers`. Multiple trailers allowed on a single commit (one per approving specialist). Reason-clauses should name the authority (e.g., "label-taxonomy rename matches ADR-0011 canonical"), not just the what.
+RFC-5322 style, parseable by `git interpret-trailers`. Multiple trailers per commit allowed. Not mechanically enforced — use when durability of the audit record matters.
 
-**Enforcement**: Gate 2 validation will include two narrow mechanical guards — a **scope-drift check** (diff vs. plan file list) and a **classification-sanity check** (GSA paths cannot be Mechanical; Owner field must be filled for GSA paths; Trailer-required rows must produce matching trailers). **Trailer consistency** itself is verified at **commit time** (pre-commit hook or CI), not Gate 2 — commits don't exist at Gate 2. **Pending implementation** — tracked as ADR-0024 §6.8 items #1 and #2. Until the guards land, the Lead manually examines any cross-boundary rows in the plan's Classification table against ADR §6.3 and §6.4 rules at Gate 1 (plan approval) and Gate 3 (via Ownership Lens verdict).
+**Enforcement**: two narrow mechanical guards (no semantic judgment):
+- **Layer B classification-sanity** (runs at Gate 1 via Lead invocation; also at Gate 2 via `run-guards.sh` as safety net): GSA paths cannot be Mechanical; GSA paths must have the Owner field filled per the ownership manifest.
+- **Layer A scope-drift** (runs at Gate 2 via `run-guards.sh`; needs the diff): flags files in the diff that weren't listed in the plan, or plan entries that weren't touched.
+
+**Pending implementation** — tracked as ADR-0024 §6.8 item #1. Until the guards land, the Lead manually examines the plan's Classification table against ADR §6.3 and §6.4 rules at Gate 1 and Gate 3.
 
 ## Workflow Overview
 
@@ -342,7 +346,15 @@ Options:
 Which would you prefer?
 ```
 
-When all confirmed, update main.md: Phase = implementation
+When all confirmed, before issuing "Plan approved" run the classification-sanity guard:
+
+```bash
+./scripts/guards/simple/validate-cross-boundary-classification.sh docs/devloop-outputs/YYYY-MM-DD-{slug}/main.md
+```
+
+If it fails (GSA path marked Mechanical, or GSA path missing Owner field), send findings to @implementer and return to planning. Do NOT issue "Plan approved."
+
+When the guard passes, update main.md: Phase = implementation, and send "Plan approved" to @implementer.
 
 ### Step 6: Gate 2 - Validation
 
