@@ -87,7 +87,7 @@ For small, contained changes (typically 10-30 lines):
 
 ## Cross-Boundary Edits
 
-When an implementer's plan touches files owned by another specialist, **the implementer self-classifies** each such edit in the devloop brief using the scheme below. Reviewers may **upgrade** a classification at Gate 1 or Gate 2 (downgrade disallowed); challenges auto-route to ESCALATE. Route per the Owner Involvement table (§6.3). See the ADR for rationale; this section covers operational triggers.
+When authoring the plan for a devloop, the implementer lists **every** planned file change in `main.md` (plan template) with a per-file classification — **Mine** (in-domain, the trivial label for most rows), or for cross-boundary rows one of **Not mine, Mechanical** / **Not mine, Minor-judgment** / **Not mine, Domain-judgment**. Reviewers may **upgrade** a classification at Gate 1 or during Gate 3 review (downgrade disallowed); challenges auto-route to ESCALATE. Route per the Owner Involvement table (§6.3). See ADR-0024 §6 for rationale; this section covers operational triggers.
 
 ### Three-Category Classification (§6.2)
 
@@ -140,7 +140,7 @@ Approved-Cross-Boundary: <specialist-name> <reason ≥ 10 chars>
 
 RFC-5322 style, parseable by `git interpret-trailers`. Multiple trailers allowed on a single commit (one per approving specialist). Reason-clauses should name the authority (e.g., "label-taxonomy rename matches ADR-0011 canonical"), not just the what.
 
-**Enforcement**: Gate 2 validation will include `validate-cross-boundary-approval.sh` (scans commit trailers to enforce §6.3 hunk-ACK requirements). **Pending implementation** — tracked as ADR-0024 §6.8 follow-up #1 (operations + test + security). Until the guard lands, trailer presence is a manual verification step at Gate 3 via the Ownership-lens verdict field (see review-protocol.md).
+**Enforcement**: Gate 2 validation will include two narrow mechanical guards — a **scope-drift check** (diff vs. plan file list) and a **classification-sanity check** (GSA paths cannot be Mechanical; Owner field must be filled for GSA paths; Trailer-required rows must produce matching trailers). **Trailer consistency** itself is verified at **commit time** (pre-commit hook or CI), not Gate 2 — commits don't exist at Gate 2. **Pending implementation** — tracked as ADR-0024 §6.8 items #1 and #2. Until the guards land, the Lead manually examines any cross-boundary rows in the plan's Classification table against ADR §6.3 and §6.4 rules at Gate 1 (plan approval) and Gate 3 (via Ownership Lens verdict).
 
 ## Workflow Overview
 
