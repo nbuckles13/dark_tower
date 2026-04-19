@@ -2,7 +2,7 @@
 
 ## Architecture & Design
 - Infra (Kind, zero-trust) → ADR-0012; Local dev → ADR-0013; Env tests → ADR-0014
-- Guard pipeline → ADR-0015; CI gates → ADR-0024; Containerized devloop → ADR-0025
+- Guard pipeline → ADR-0015; CI gates / Agent-Teams workflow / Cross-Boundary Ownership Model → ADR-0024 §6; Containerized devloop → ADR-0025
 - Host-side cluster helper → ADR-0030; Dashboard metrics (counters vs rates) → ADR-0029
 - Metric testability (single presence guard, Cat A/B/C rollout, raw `/metrics` evidence, per-service SLO sub-targets) → ADR-0032; service-owned dashboards/alerts (collapsed Phase 4) → ADR-0031
 

@@ -8,6 +8,7 @@
 - Guard pipeline methodology → ADR-0015; Agent teams validation pipeline → ADR-0024
 - User auth, three-tier token architecture → ADR-0020
 - Infrastructure architecture, K8s manifests → ADR-0012; Local dev → ADR-0013; Host-side cluster helper → ADR-0030
+- Cross-boundary ownership (classification, Guarded Shared Areas, `Approved-Cross-Boundary:` trailer) → ADR-0024 §6, `.claude/skills/devloop/SKILL.md` §Cross-Boundary Edits, `.claude/skills/devloop/review-protocol.md` §sed-Test Worked Example
 - Metric testability: component tests + `MetricAssertion` helper + presence guard; per-failure-class table as review heuristic → ADR-0032; disposition rule for "wrapper-only" metrics — "Phase-N marker present (annotated `#[allow(dead_code)] // Will be used in Phase N ...`, project-wide convention with 9+ hits across `crates/ac-service/src/`, established by `docs/PROJECT_STATUS.md`)" → defer disposition + WRAPPER-CAT-C invocation in `tests/` with framing comment + TODO.md entry; "no marker, zero production callers" → inline-remove (MC iter-2 precedent at `docs/devloop-outputs/2026-04-25-adr-0032-step-3-mc-metric-test-backfill/main.md:200,233,249`); WRAPPER-CAT-C framing comment shape → mirrors MC `media_connection_failed` and AC `record_token_validation` at `crates/ac-service/src/observability/metrics.rs:427-436` (references production sites, lists forward-looking reservations, points at production-path test file, ends with `docs/TODO.md` pointer)
 
 ## Code Locations — AC Service

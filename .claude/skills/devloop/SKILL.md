@@ -9,13 +9,7 @@ A unified implementation workflow where autonomous teammates drive the process. 
 
 ## When to Use
 
-Use `/devloop` for:
-- Any implementation task
-- Bug fixes
-- Refactoring
-- Feature additions
-
-For design decisions needing consensus first, use `/debate` to create an ADR, then use this for implementation.
+Any implementation work: bug fixes, refactors, new features. For design decisions needing consensus first, use `/debate` to create an ADR, then use this for implementation.
 
 **All specialist implementation work MUST go through `/devloop`**. Never manually spawn a specialist via the Task tool — use `/devloop` (full) or `/devloop --light` to ensure consistent identity and navigation context.
 
@@ -25,6 +19,7 @@ For design decisions needing consensus first, use `/debate` to create an ADR, th
 /devloop "task description"                                        # new, full, auto-detect specialist
 /devloop "task description" --specialist={name}                    # new, full, explicit specialist
 /devloop "task description" --light                                # new, light (3 teammates)
+/devloop "task description" --paired-with=<specialist>             # overlay: co-implementer collaborator
 /devloop "feedback" --continue=YYYY-MM-DD-slug                     # reopen completed loop, full
 /devloop "feedback" --continue=YYYY-MM-DD-slug --light             # reopen completed loop, light
 ```
@@ -32,23 +27,27 @@ For design decisions needing consensus first, use `/debate` to create an ADR, th
 - **task description**: What to implement (required)
 - **--specialist**: Implementing specialist (optional, auto-detected from task)
 - **--light**: Lightweight mode — 3 teammates, skip planning gate and reflection (see Lightweight Mode)
+- **--paired-with=\<specialist\>**: Overlay flag — the named specialist actively collaborates during implementation and is an explicit reviewer at Gate 2. Composes with `--light`/full; does not replace routing. Recommended for first-of-N exemplar rollouts (N=1); for N≥4 affected services, use one paired exemplar + remaining-services-as-mechanical-sweep. **Does not exempt Guarded Shared Areas from owner-implements routing** (see §Cross-Boundary Edits below and ADR-0024 §6.5).
 - **--continue**: Reopen a completed devloop to address human review feedback (see Continue Mode)
 
 ## Team Composition
 
 ### Full Mode (default)
 
-Every devloop spawns **7 teammates** (Lead + Implementer + 6 reviewers):
+Every devloop spawns **7 teammates** (Lead + Implementer + 6 reviewers). `name` is the SendMessage recipient; `subagent_type` loads identity from `.claude/agents/{name}.md`.
 
-| Role | Specialist | Purpose |
-|------|------------|---------|
-| Implementer | Specified or auto-detected | Does the work |
-| Security Reviewer | security | Vulnerabilities, crypto, auth |
-| Test Reviewer | test | Coverage, test quality, regression |
-| Observability Reviewer | observability | Metrics, logging, tracing, PII, SLOs |
-| Code Quality Reviewer | code-reviewer | Rust idioms, ADR compliance |
-| DRY Reviewer | dry-reviewer | Cross-service duplication (see DRY exception in review protocol) |
-| Operations Reviewer | operations | Deployment safety, rollback, runbooks |
+| Role | `name` | `subagent_type` | Purpose |
+|------|--------|-----------------|---------|
+| Implementer | `implementer` | `{specialist}` | Does the work |
+| Security Reviewer | `security` | `security` | Vulnerabilities, crypto, auth |
+| Test Reviewer | `test` | `test` | Coverage, test quality, regression |
+| Observability Reviewer | `observability` | `observability` | Metrics, logging, tracing, PII, SLOs |
+| Code Quality Reviewer | `code-reviewer` | `code-reviewer` | Rust idioms, ADR compliance |
+| DRY Reviewer | `dry-reviewer` | `dry-reviewer` | Cross-service duplication (see DRY exception in review protocol) |
+| Operations Reviewer | `operations` | `operations` | Deployment safety, rollback, runbooks |
+| Paired Specialist (if `--paired-with=<specialist>`) | `paired-<specialist>` | `{specialist}` | Active collaborator during implementation + Gate 2 reviewer. When `<specialist>` is already a mandatory reviewer (security/test/observability/operations), the paired teammate replaces that slot with the same identity and an expanded role. |
+
+The Lead (orchestrator) is automatically named `team-lead` in the team config.
 
 **Review model**: All findings default to "fix it." Implementer may defer with justification. See review protocol for details.
 
@@ -86,47 +85,72 @@ For small, contained changes (typically 10-30 lines):
 **Escalation**: Any reviewer can request upgrade to full devloop.
 **Ambiguity rule**: When in doubt, use full mode.
 
+## Cross-Boundary Edits
+
+When an implementer's plan touches files owned by another specialist, **the implementer self-classifies** each such edit in the devloop brief using the scheme below. Reviewers may **upgrade** a classification at Gate 1 or Gate 2 (downgrade disallowed); challenges auto-route to ESCALATE. Route per the Owner Involvement table (§6.3). See the ADR for rationale; this section covers operational triggers.
+
+### Three-Category Classification (§6.2)
+
+- **Mechanical** — Value-neutral *and* structure-preserving (the `sed`-test applies: deterministic find-and-replace that does not change the encoded concept). Requires full guard pipeline coverage for the change-pattern: **Mechanical iff guards catch every partial version** (see `./scripts/guards/run-guards.sh`). Concept substitution (renaming a metric label while changing its semantic meaning) is NOT Mechanical.
+- **Minor-judgment** — Small defensive adjustments where a reasonable reader could argue either way but impact is bounded. Examples: widening a numeric threshold, adding a missing structured-log field. **Alert rule changes** (severity, routing labels, `for:` duration) are Minor-judgment when the edit couples to runbook prose (`docs/runbooks/*.md`) or the alert conventions doc (`docs/observability/alert-conventions.md`) — hunk-ACK by operations is required because the runbook narrative must stay coherent with the fired-state semantics.
+- **Domain-judgment** — Changes requiring the owner's domain knowledge (threshold tuning, behavior changes, API semantics, new instrumentation affecting SLO shape).
+
+Use ADR-0019 Pattern A/B/C vocabulary for duplication/rename patterns; Pattern B coordinated renames require a **named convention author** (e.g., observability for metric taxonomy) — absent one, Pattern B collapses to owner-implements.
+
+### Owner Involvement (§6.3)
+
+| Category | Owner involvement | Mechanism |
+|----------|-------------------|-----------|
+| Mechanical | Review-only | Owner sees the change at the standard reviewer gate. No separate approval — **proceed with review**. |
+| Minor-judgment | Hunk-ACK required | Owner-specialist must explicitly ACK the specific cross-boundary hunk via a commit trailer (below). PR-level review insufficient. |
+| Domain-judgment | Owner-implements | Route to a separate devloop with owner as implementer, or use `--paired-with=<owner>` to keep the owner in the loop during the current devloop. |
+
+**Default-posture flip**: For Mechanical cross-boundary edits the default is "proceed with review," NOT "defer to owner." The older implicit "owner-implements" rule holds only for Domain-judgment and Guarded Shared Areas. **This flip does NOT apply inside Guarded Shared Areas — Mechanical classification is disallowed there.**
+
+### Guarded Shared Areas (§6.4)
+
+Certain surfaces override the category classification: even a sed-clean edit routes to the owner-specialist. **Mechanical is disallowed inside GSA; Minor-judgment requires owner hunk-ACK.**
+
+**Criterion** (names the test, not just the list): wire-format runtime coupling, OR auth-routing policy, OR detection/forensics contract, OR schema evolution. Paths matching the criterion are Guarded whether or not enumerated below.
+
+<!-- Mirror of ADR-0024 §6.4 enumerated list. Update all three locations together when extending via micro-debate. -->
+
+- `proto/**`, `proto-gen/**`, `build.rs` — wire format
+- `crates/media-protocol/**` — SFU protocol semantics (protocol + MH co-sign)
+- `crates/common/src/jwt.rs`, `meeting_token.rs`, `token_manager.rs`, `secret.rs` — auth/crypto primitives
+- `crates/common/src/webtransport/**` — wire-runtime coupling
+- `crates/ac-service/src/jwks/**`, `src/token/**`, `src/crypto/**` — crypto primitives
+- `crates/ac-service/src/audit/**` — detection/forensics contract
+- `db/migrations/**` — schema evolution
+- ADR-0027-approved crypto primitives (wherever referenced) — path-independent; guards a concept, not a directory. New call sites of enumerated primitives inherit Guarded status regardless of the containing file.
+
+**Intersection rule**: edits spanning two GSA (e.g., auth-routing fields in `proto/internal.proto` crossing wire-format × auth-routing-policy) require all affected owners co-sign: `Approved-Cross-Boundary: protocol`, `Approved-Cross-Boundary: auth-controller`, `Approved-Cross-Boundary: security` (ADR-0003 §5.7).
+
+**`crates/common/**` outside the Guarded subset** is not owned by a single specialist. Edits require DRY reviewer + code-reviewer approval; affected-specialist involvement is review-only unless call-site semantics change (escalates to Minor-judgment hunk-approval).
+
+Extending the enumerated list requires a **micro-debate** (~3 specialists: affected owner + security + one cross-cutting), not a new ADR. Counter-intuitive property: the rule is *stricter* inside GSA, not looser.
+
+### `Approved-Cross-Boundary:` Commit Trailer (§6.7)
+
+Hunk-ACK is recorded as a git commit trailer:
+
+```
+Approved-Cross-Boundary: <specialist-name> <reason ≥ 10 chars>
+```
+
+RFC-5322 style, parseable by `git interpret-trailers`. Multiple trailers allowed on a single commit (one per approving specialist). Reason-clauses should name the authority (e.g., "label-taxonomy rename matches ADR-0011 canonical"), not just the what.
+
+**Enforcement**: Gate 2 validation will include `validate-cross-boundary-approval.sh` (scans commit trailers to enforce §6.3 hunk-ACK requirements). **Pending implementation** — tracked as ADR-0024 §6.8 follow-up #1 (operations + test + security). Until the guard lands, trailer presence is a manual verification step at Gate 3 via the Ownership-lens verdict field (see review-protocol.md).
+
 ## Workflow Overview
 
 ```
-Lead (minimal involvement)
-│
-├── SETUP
-│   ├── Create output directory
-│   ├── Record git state: `git rev-parse HEAD` in main.md
-│   ├── Spawn teammates via subagent_type (identity auto-loaded)
-│   └── Send task to implementer
-│
-├── PLANNING (Implementer + Reviewers collaborate) [SKIPPED in --light]
-│   ├── Implementer drafts approach
-│   ├── Reviewers provide input directly
-│   └── All reviewers confirm → GATE 1
-│
-├── GATE 1: PLAN APPROVAL (Lead) [SKIPPED in --light]
-│   └── Check all reviewers confirmed (see Plan Confirmation Checklist in review protocol)
-│
-├── IMPLEMENTATION (Implementer drives)
-│   ├── Implementer does the work
-│   └── Ready → request validation
-│
-├── GATE 2: VALIDATION (Lead)
-│   └── Run validation pipeline (see below)
-│
-├── REVIEW (Reviewers + Implementer collaborate)
-│   ├── Reviewers examine code, send findings to implementer
-│   ├── Implementer fixes findings or defers with justification
-│   ├── Reviewers accept deferrals or escalate to Lead
-│   └── Send verdicts to Lead (CLEAR / RESOLVED / ESCALATED)
-│
-├── GATE 3: FINAL APPROVAL (Lead)
-│   └── Check all verdicts CLEAR or RESOLVED; resolve any ESCALATED
-│
-├── REFLECTION (All teammates) [SKIPPED in --light]
-│   └── Each captures learnings in knowledge files
-│
-└── COMPLETE
-    └── Lead writes summary, invites human review feedback
+SETUP → PLANNING [skipped --light] → GATE 1 [skipped --light] →
+IMPLEMENTATION → GATE 2 (VALIDATION) → REVIEW → GATE 3 (FINAL APPROVAL) →
+REFLECTION [skipped --light] → COMPLETE
 ```
+
+Lead has minimal involvement — acts only at the three gates. Teammates drive Planning, Implementation, and Review directly. See Instructions below for each step.
 
 ## Instructions
 
@@ -187,19 +211,7 @@ For security-critical implementations, the implementer should maintain a "Securi
 
 **Rule 4**: Give the implementer the big-picture task. Let them decide how to break it down — don't micro-manage subtask decomposition.
 
-**Naming convention**: Use the `name` parameter in the Task tool to set each teammate's SendMessage recipient name. These names MUST match the `@` references used in teammate prompts:
-
-| Role | `name` | `subagent_type` |
-|------|--------|-----------------|
-| Implementer | `implementer` | `{specialist-name}` (e.g., `global-controller`) |
-| Security Reviewer | `security` | `security` |
-| Test Reviewer | `test` | `test` |
-| Observability Reviewer | `observability` | `observability` |
-| Code Quality Reviewer | `code-reviewer` | `code-reviewer` |
-| DRY Reviewer | `dry-reviewer` | `dry-reviewer` |
-| Operations Reviewer | `operations` | `operations` |
-
-The Lead (orchestrator) is automatically named `team-lead` in the team config.
+Use `name`/`subagent_type` per the Teammate Roster table in §Team Composition. `name` MUST match the `@` references used in teammate prompts.
 
 **For Implementer**, spawn with `name: "implementer"`, `subagent_type: "{specialist-name}"` and this prompt:
 
@@ -218,7 +230,7 @@ You are implementing a feature for Dark Tower.
 
 ## Your Workflow
 
-1. PLANNING: Draft your approach, use SendMessage to share your plan with reviewers for input
+1. PLANNING: Draft your approach, use SendMessage to share your plan with reviewers for input. If your plan includes cross-boundary edits (files owned by another specialist), self-classify each per §Cross-Boundary Edits (Mechanical / Minor-judgment / Domain-judgment) in the plan.
 2. **WAIT for @team-lead to send you "Plan approved" before implementing.** Individual reviewer confirmations are not sufficient — @team-lead is the gatekeeper.
 3. IMPLEMENTATION: Do the work, use SendMessage to ask reviewers if questions arise
 4. When done, use SendMessage to tell @team-lead: "Ready for validation"
@@ -295,12 +307,7 @@ Update main.md: Phase = planning (full) or implementation (light)
 
 ### Gate Management: Idle ≠ Done
 
-**CRITICAL**: Teammates go idle after every turn — this is normal. An idle notification does NOT mean the teammate has finished their task. Teammates may go idle because:
-- They sent a message and are waiting for a response
-- The user sent them a message, they responded, and their turn ended
-- They are waiting for input from another teammate
-
-**Only treat a task as complete when the teammate explicitly signals completion** (e.g., implementer sends "Ready for validation", reviewer sends their verdict). Never advance the workflow based solely on an idle notification.
+**CRITICAL**: Teammates go idle after every turn — this does NOT mean the teammate has finished their task (they may be waiting for a response, or their turn ended after replying). Only treat a task as complete when the teammate explicitly signals completion (e.g., implementer sends "Ready for validation", reviewer sends their verdict). Never advance the workflow based solely on an idle notification.
 
 ### Step 5: Gate 1 - Plan Approval [FULL MODE ONLY]
 
@@ -370,37 +377,13 @@ Wait for the agent's verdict message. If UNSAFE, treat as a validation failure (
 
 After layers 1-7 pass, run integration tests against the live Kind cluster. Layer 8 always runs — intentionally broader than ADR-0030's trigger-path list, because business logic changes can break integration tests too.
 
-1. **Check cluster readiness**: Run `dev-cluster status`. If `cluster_exists` is false or `pods_healthy` is false:
-   - If `setup_in_progress` is true, poll `dev-cluster status` every 30 seconds for up to 8 minutes (first-run setup cost, does NOT count toward attempts).
-   - If still not ready after timeout, or if `setup_in_progress` is false, run `dev-cluster setup` directly (blocks until complete, does NOT count toward attempts).
-   - If setup fails, escalate to user as infrastructure failure.
+1. **Cluster readiness**: Run `dev-cluster status`. If not ready, run `dev-cluster setup` (polls `setup_in_progress` first). Setup does NOT consume attempts; escalate on setup failure as infra.
+2. **Infra change detection**: If `git diff --name-only ${START_COMMIT}..HEAD -- infra/kind/` shows changes, `dev-cluster teardown` then `setup` (cluster skeleton stale). Does NOT consume attempts; log triggering files.
+3. **Rebuild services**: `dev-cluster rebuild-all`. Report wall-clock time.
+4. **Run env-tests**: Read `/tmp/devloop/ports.json` to construct `ENV_TEST_{AC,GC,PROMETHEUS,GRAFANA,LOKI}_URL` from `.container_urls.*`. Run `timeout 600 cargo test -p env-tests --features all 2>&1 | tee /tmp/devloop/env-test-output.log`. On failure, forward full output + log path to implementer.
+5. **Classify exit**: Exit 0 = pass. Non-zero: if stderr matches infra patterns (`connection refused|timed out|connection reset|broken pipe`), **infrastructure failure** (retry once, do NOT consume attempt, then escalate). Otherwise **test failure** (consume attempt).
 
-2. **Infra change detection**: Run `git diff --name-only ${START_COMMIT}..HEAD -- infra/kind/`. If any files changed:
-   - Log which files triggered the rebuild (e.g., `"Layer 8: infra/kind changes detected: infra/kind/kind-config.yaml.tmpl, infra/kind/scripts/setup.sh"`).
-   - Run `dev-cluster teardown` then `dev-cluster setup` (cluster skeleton may be stale). This does NOT count toward attempts.
-
-3. **Rebuild all services**: Run `dev-cluster rebuild-all`. Report wall-clock time (e.g., `"Layer 8: rebuild-all completed in 142s"`).
-
-4. **Run env-tests**: Read `/tmp/devloop/ports.json` and construct environment variables:
-   ```bash
-   ENV_TEST_AC_URL=$(jq -r '.container_urls.ac' /tmp/devloop/ports.json)
-   ENV_TEST_GC_URL=$(jq -r '.container_urls.gc' /tmp/devloop/ports.json)
-   ENV_TEST_PROMETHEUS_URL=$(jq -r '.container_urls.prometheus // empty' /tmp/devloop/ports.json)
-   ENV_TEST_GRAFANA_URL=$(jq -r '.container_urls.grafana // empty' /tmp/devloop/ports.json)
-   ENV_TEST_LOKI_URL=$(jq -r '.container_urls.loki // empty' /tmp/devloop/ports.json)
-   ```
-   Run with 10-minute timeout, capturing full output for post-mortem debugging:
-   ```bash
-   timeout 600 cargo test -p env-tests --features all 2>&1 | tee /tmp/devloop/env-test-output.log
-   ```
-   On failure, forward full output to implementer. The log file at `/tmp/devloop/env-test-output.log` persists across retries for debugging — include its path in failure reports.
-   Report wall-clock time (e.g., `"Layer 8: env-tests completed in 87s"`).
-
-5. **Classify exit code**:
-   - Exit 0 = pass.
-   - Exit non-zero: check stderr for infrastructure patterns (`"connection refused"`, `"timed out"`, `"connection reset"`, `"broken pipe"`). If found, classify as **infrastructure failure** (do NOT consume attempt — retry once, then escalate). If stderr contains assertion failures or test logic errors, classify as **test failure** (consume Layer 8 attempt).
-
-**Layer 8 attempt budget**: 2 attempts (separate from the 3 attempts for layers 1-7). Infrastructure failures (helper socket errors, Kind crash, connection timeouts) do NOT consume attempts — retry once, then escalate. First-run cluster setup (~7 min) does NOT count toward attempts.
+**Layer 8 attempt budget**: 2 attempts (separate from layers 1-7's 3). Infrastructure failures do not consume attempts. First-run cluster setup (~7 min) does not count toward attempts.
 
 **ARTIFACT-SPECIFIC** (mandatory when detected file types are in the changeset):
 
@@ -521,7 +504,7 @@ Update main.md:
 - Phase = complete
 - Duration
 - Final summary
-- Tech debt section (all accepted deferrals with justifications, plus DRY extraction opportunities)
+- Tech debt section (all accepted deferrals with justifications, plus DRY extraction opportunities, plus any spun-out findings with target devloop slug or "to be scheduled" per review-protocol.md)
 
 If this task is part of a user story, update the Devloop Tracking table
 in the user story file: set Status to Completed, fill in the Devloop
@@ -605,23 +588,7 @@ You are continuing work on a previous devloop implementation.
 
 Address the feedback above. The previous implementation is already in the codebase.
 
-## Your Workflow
-
-1. PLANNING: Draft your approach, use SendMessage to share your plan with reviewers for input
-2. **WAIT for @team-lead to send you "Plan approved" before implementing.** Individual reviewer confirmations are not sufficient — @team-lead is the gatekeeper.
-3. IMPLEMENTATION: Do the work, use SendMessage to ask reviewers if questions arise
-4. When done, use SendMessage to tell @team-lead: "Ready for validation"
-5. REVIEW: Respond to reviewer findings — fix each one or defer with justification (see review protocol for valid/invalid justifications)
-6. REFLECTION: Document learnings when complete
-
-## Communication
-
-All teammate communication MUST use the SendMessage tool. Plain text output is not visible to other teammates.
-
-- Use SendMessage to message reviewers directly with your plan and questions
-- Use SendMessage to tell @team-lead for phase transitions ("Ready for validation", etc.)
-- Use SendMessage to discuss review findings with reviewers directly
-- **Do NOT start implementing until @team-lead sends you "Plan approved"**
+Follow the standard Implementer workflow + communication rules (see Step 3 Implementer prompt above).
 ```
 
 ## Limits
