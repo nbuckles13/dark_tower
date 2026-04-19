@@ -6,7 +6,7 @@ Accepted
 
 ## Date
 
-2026-02-10
+2026-02-10 (amended 2026-04-18 — added §6 Cross-Boundary Ownership Model)
 
 ## Context
 
@@ -344,6 +344,110 @@ If a devloop is interrupted, restart from the beginning with `/devloop`. The `ma
 
 Update CLAUDE.md to explicitly state: **All 4 cross-cutting specialists (Security, Test, Observability, Operations) are mandatory in both devloops and debates.** This closes the policy inconsistency.
 
+### 6. Cross-Boundary Ownership Model
+
+*Added by the 2026-04-18 amendment debate (see Debate Reference).*
+
+#### 6.1 Motivation
+
+The implicit "file owner implements" rule produces correct outcomes when changes require domain judgment but disproportionate ceremony when changes are mechanical, minor defensive adjustments, or naturally span services via convention. The 2026-04 ADR-0031 rollout surfaced multiple instances where cross-boundary friction generated elaborate workarounds (~80 LOC of allowlist infrastructure, Lead-level adjudication thrash, multiple devloops where one would do) that were disproportionate to the underlying work.
+
+This section codifies a three-category classification × tiered owner-involvement model, carves out genuinely high-risk shared surfaces (Guarded Shared Areas), and backs the mechanism with guard infrastructure rather than process ceremony.
+
+#### 6.2 Three-Category Classification
+
+Every cross-boundary edit self-classifies as one of:
+
+**Mechanical** — Value-neutral *and* structure-preserving changes where the `sed`-test applies: the edit is expressible as a deterministic find-and-replace that does not change the concept encoded in the code. Examples: identifier renames that track an approved taxonomy change, path/URL rewrites tracking a deployment move, comment fixes, format conformance.
+
+Mechanical classification requires that the **full guard pipeline covers the change-pattern**. If no guard exists for the file-type × change-pattern combination, the default classification is Minor-judgment. This creates a forcing function for guard expansion: the payoff for adding a guard is that the relaxed rule extends to that area ("mechanical iff guards catch every partial version").
+
+Edits that pass the guard pipeline but change the **concept encoded in a string** (e.g., renaming a metric label without updating its semantic meaning in the taxonomy) are NOT mechanical.
+
+**Minor-judgment** — Small defensive adjustments where a reasonable reader could argue either way but impact is bounded: bumping a `for:` duration to match convention, widening a threshold by a small margin, adding a missing structured-log field.
+
+**Domain-judgment** — Changes requiring the owner's domain knowledge: threshold tuning, behavior changes, API semantics, new instrumentation that affects SLO shape.
+
+**Classification timing.** The implementer self-classifies in the devloop brief. Reviewers may **upgrade** a classification during review; downgrade is disallowed. Classification challenges auto-route to ESCALATE. This monotonic-upgrade rule prevents owner-specialists from being pressured down to review-only when their judgment says owner-implements.
+
+#### 6.3 Owner Involvement by Category
+
+| Category | Owner involvement | Mechanism |
+|----------|-------------------|-----------|
+| Mechanical | Review-only | Owner sees the change at the standard reviewer gate. No separate approval. |
+| Minor-judgment | Hunk-ACK required | Owner-specialist must explicitly ACK the specific cross-boundary hunk via a commit trailer (§6.7). PR-level review is insufficient. |
+| Domain-judgment | Owner-implements | Route to a separate devloop with owner as implementer, or use the **Paired flag** (§6.5) to keep the owner in the loop during the current devloop. |
+
+#### 6.4 Guarded Shared Areas
+
+Certain surfaces override the category classification: even a "mechanical-looking" edit routes to the owner-specialist. **Mechanical classification is disallowed inside Guarded Shared Areas; Minor-judgment requires owner hunk-ACK.**
+
+**Criterion** (names the test, not just the list): wire-format runtime coupling, OR auth-routing policy, OR detection/forensics contract, OR schema evolution. Modules matching the criterion are Guarded whether or not they appear in the enumerated list below.
+
+**Enumerated Guarded Shared Areas** (current snapshot):
+
+- `proto/**`, `proto-gen/**`, `build.rs` — wire format
+- `crates/media-protocol/**` — SFU protocol semantics (protocol + MH co-sign)
+- `crates/common/src/jwt.rs`, `meeting_token.rs`, `token_manager.rs`, `secret.rs` — auth/crypto primitives
+- `crates/common/src/webtransport/**` — wire-runtime coupling
+- `crates/ac-service/src/jwks/**`, `src/token/**`, `src/crypto/**` — crypto primitives
+- `crates/ac-service/src/audit/**` — detection/forensics contract
+- `db/migrations/**` — schema evolution
+- ADR-0027-approved crypto primitives (wherever referenced)
+
+**Intersection rule.** When an edit spans two Guarded Shared Areas (e.g., auth-routing fields in `proto/internal.proto` span both wire-format *and* auth-routing-policy), all affected owners co-sign via trailer. Canonical case: `ServiceType` enum, scope enums, and identity fields in `proto/internal.proto` require `Approved-Cross-Boundary: protocol`, `Approved-Cross-Boundary: auth-controller`, and `Approved-Cross-Boundary: security` per ADR-0003 §5.7.
+
+Extending this list requires a **micro-debate** (~3 specialists: the affected owner + security + one cross-cutting), not a new ADR.
+
+**Counter-intuitive property**: the rule is *stricter* inside Guarded Shared Areas, not looser. The category rule relaxes cross-boundary friction in low-risk areas; the Guarded carve-out prevents that relaxation from reaching high-risk surfaces.
+
+**`crates/common/**` outside the Guarded subset** is not owned by a single specialist. Edits require DRY reviewer + code-reviewer approval; affected-specialist involvement is review-only unless call-site semantics change (escalates to Minor-judgment hunk-approval).
+
+#### 6.5 Paired Flag
+
+`/devloop --paired-with=<specialist>` overlays any devloop routing tier (full / light / owner-implements). The paired specialist actively collaborates during implementation and is an explicit reviewer at Gate 2.
+
+- Paired is **a flag, not a mode** — it composes with routing, does not replace it.
+- Recommended for **first-of-N exemplar rollouts (N=1)**. For N≥4 affected services, use one paired exemplar + remaining-services-as-mechanical-sweep (the MH ADR-0031 rollout precedent).
+- Paired does not exempt Guarded Shared Areas edits from owner-implements routing.
+
+#### 6.6 Classification Workflow
+
+1. Implementer proposes classification in the devloop brief (tentative).
+2. Reviewers examine classification at Gate 1 (plan approval).
+3. Any reviewer may upgrade a classification; challenges auto-route to ESCALATE.
+4. **Pattern B** convention-driven coordinated renames require a **named convention author** (e.g., observability for metric taxonomy, operations for alert conventions). Absent a named convention author, Pattern B collapses to owner-implements.
+5. Gate 2 validation includes the `validate-cross-boundary-approval.sh` guard (see §6.8), which scans commit trailers to enforce §6.3 hunk-ACK requirements.
+6. The code-reviewer verdict at Gate 3 includes an explicit **Ownership lens** field recording the classification, owner-specialists involved, and any trailer-backed approvals observed.
+
+#### 6.7 APPROVED-CROSS-BOUNDARY Commit Trailer
+
+Hunk-ACK is recorded as a git commit trailer, not an in-thread string:
+
+```
+Approved-Cross-Boundary: <specialist-name> <reason ≥ 10 chars>
+```
+
+- RFC-5322 style, parseable by `git interpret-trailers`.
+- Matches the ADR-hash-stamping precedent already used elsewhere in the repo.
+- Durable across devloop restarts and thread archival — threads are ephemeral, trailers are permanent record.
+- Multiple trailers allowed on a single commit (one per approving specialist).
+
+#### 6.8 Follow-Up Work
+
+Named spin-outs from this amendment (not blocking adoption):
+
+1. **`scripts/guards/simple/validate-cross-boundary-approval.sh`** — scans commit trailers at Gate 2. Owners: operations + test + security. ~20 LOC estimate.
+2. **APPROVED-CROSS-BOUNDARY classification-failure fixture suite** — negative tests proving the carve-out works (e.g., "hypothetical mechanical rename in `jwt.rs` fails the Mechanical classification check"). Owner: test, with AC + security consult.
+3. **Scope/claim/session-field rename guard** — when guards catch partial renames automatically, parts of the Guarded Shared Areas list may be relaxed via micro-debate. Owners: security + operations + test.
+4. **DRY reviewer retrospective audit on Ownership-lens verdict field**. Owner: dry-reviewer.
+
+#### 6.9 Cross-References
+
+- **ADR-0019 (DRY Reviewer)**: Pattern A/B/C framework. Amendment required: add clause "`proto/**` edits are never classified as Mechanical for DRY purposes; route via ADR-0024 §6."
+- **ADR-0031 (Service-Owned Dashboards and Alerts)**: motivating case; the 2026-04-17 rollout friction drove this amendment.
+- **`.claude/skills/devloop/SKILL.md`** and **`.claude/skills/devloop/review-protocol.md`**: operational surfaces implementing §6. See Implementation Items §17-30.
+
 ## Consequences
 
 ### Positive
@@ -392,6 +496,25 @@ Update CLAUDE.md to explicitly state: **All 4 cross-cutting specialists (Securit
 15. ~~Add restore pre-flight verification~~ — Removed; restart-from-beginning model adopted instead
 16. Add per-crate benchmark layer for performance-critical services (future)
 
+### 2026-04-18 Amendment: Cross-Boundary Ownership Model (§6)
+
+17. Update `.claude/skills/devloop/SKILL.md` — add §Cross-Boundary Edits summarizing §6.2–6.5, Paired flag argument, Guarded Shared Areas enumeration, default-posture flip ("proceed-with-review" for Mechanical, not "defer-to-owner")
+18. Update `.claude/skills/devloop/review-protocol.md` — Step 0 Guarded Shared Areas scoping, spin-out as third fix-or-defer path, Ownership-lens verdict field, sed-test worked example
+19. Update `docs/decisions/adr-0019-dry-reviewer.md` — cross-ref §6, Pattern B note, proto-never-mechanical clause
+20. Update `.claude/agents/security.md` — cross-boundary posture; Gate 1 block rules for Guarded Shared Areas
+21. Update `.claude/agents/auth-controller.md` — cross-boundary posture; auth-adjacent co-sign on proto edits
+22. Update `.claude/agents/observability.md` — cross-boundary posture; literal-convention-citation requirement
+23. Update `.claude/agents/meeting-controller.md` — cross-boundary posture
+24. Update `.claude/agents/global-controller.md` — cross-boundary posture
+25. Update `.claude/agents/media-handler.md` — cross-boundary posture
+26. Update `.claude/agents/code-reviewer.md` — Ownership-lens review gate; classification-gaming language
+27. Update `.claude/agents/protocol.md` — cross-boundary posture; wire-visibility co-sign rule
+28. Update `.claude/agents/test.md` — classification-failure fixture commitment
+29. Update `.claude/agents/dry-reviewer.md` — Pattern A/B/C framework; common/ non-ownership clarification
+30. Update all specialist `docs/specialist-knowledge/*/INDEX.md` — pointer to ADR-0024 §6
+31. Follow-up devloop: `scripts/guards/simple/validate-cross-boundary-approval.sh` (operations + test + security)
+32. Follow-up devloop: APPROVED-CROSS-BOUNDARY classification-failure fixture suite (test + AC + security)
+
 ## Participants
 
 | Specialist | Final Position | Satisfaction |
@@ -414,7 +537,27 @@ Update CLAUDE.md to explicitly state: **All 4 cross-cutting specialists (Securit
 
 ## Debate Reference
 
-See: `docs/debates/2026-02-10-agent-teams-workflow-review/debate.md`
+Original ADR: `docs/debates/2026-02-10-agent-teams-workflow-review/debate.md`
+
+§6 amendment: `docs/debates/2026-04-18-devloop-cross-ownership-friction/debate.md`
+
+### §6 Amendment Participants (2026-04-18)
+
+| Specialist | Final Satisfaction | Position summary |
+|-----------|--------------------|------------------|
+| Protocol | 94 | Wire-visibility carve-out + proto-gen/build.rs explicit; amend-over-new-ADR |
+| Global-Controller | 94 | Paired-as-flag reframe, authz-enforcement surface sensitivity |
+| Meeting-Controller | 93 | Value-neutrality clause, classification monotonicity, webtransport carve-out |
+| Security | 92 | Conditional asks landed: audit path in GSA + commit-trailer relocation |
+| Test | 92 | Guard-coverage conditional, hunk-ACK, classification-failure fixture suite |
+| Observability | 92 | Mechanical-iff-guards-catch-every-partial-version formulation, Paired as flag |
+| Operations | 92 | Co-owns §6; commit-trailer guard; db/migrations GSA; concept-substitution exclusion |
+| Auth-Controller | 92 | Catch-all for future auth/crypto files in common/ |
+| Media-Handler | 92 | Extending GSA requires micro-debate (not new ADR); rule stricter inside GSA |
+| Code-Reviewer | 92 | Co-owns §6; review-protocol.md ownership; sed-test backbone |
+| DRY-Reviewer | 90 | Pattern A/B/C + expanded common/ list (token_manager.rs + secret.rs); common/ non-ownership clarification |
+
+Consensus: Round 2, all 11 participants ≥ 90.
 
 ## Supersedes
 
