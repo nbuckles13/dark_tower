@@ -2,7 +2,7 @@
 
 ## Architecture & Design
 - Observability framework (metrics, tracing, dashboards, alerts, SLOs) -> ADR-0011
-- Validation pipeline (guards including metric guards) -> ADR-0024
+- Validation pipeline (guards including metric guards) -> ADR-0024; cross-boundary ownership model (Mechanical/Minor-judgment/Domain-judgment, Pattern B convention author, concept-substitution exclusion) -> ADR-0024 §6
 - Client architecture (telemetry, metrics, dashboards, synthetic probe) -> ADR-0028
 - Dashboard metric presentation (counters vs rates, increase/rate classification) -> ADR-0029
 - Host-side cluster helper (observability access, port discovery, health gating, listenAddress fix) -> ADR-0030

@@ -5,6 +5,8 @@
 - Integration test infrastructure -> `docs/decisions/adr-0009-integration-test-infrastructure.md`
 - Environment integration tests -> `docs/decisions/adr-0014-environment-integration-tests.md`
 - Validation pipeline (guards, coverage) -> `docs/decisions/adr-0024-agent-teams-workflow.md`, `scripts/guards/run-guards.sh`; alert-rules guard (`--self-test`, fixtures) -> `scripts/guards/simple/validate-alert-rules.sh`, `scripts/guards/simple/fixtures/alert-rules/`
+- Cross-Boundary Ownership Model (Mechanical/Minor/Domain classification + GSA override; classification-failure fixture suite obligation §6.8 #2) -> ADR-0024 §6
+- sed-test worked example (three anchors: FU#3a-status Mechanical, FU#3c Minor-judgment co-sign, `jwt.rs` GSA negative) -> `.claude/skills/devloop/review-protocol.md` §sed-Test Worked Example
 - Coverage thresholds -> `.codecov.yml`
 - Client architecture (4-tier testing, test-utils, flaky policy) -> ADR-0028
 - Host-side cluster helper (env-test execution, URL config, attempt budgets, cluster networking) -> `docs/decisions/adr-0030-host-side-cluster-helper.md`
@@ -35,8 +37,7 @@
 - Auth-layer integration (5-`failure_reason` JWT cluster + `caller_type_rejected`, real wiremock JWKS) -> `crates/mc-service/tests/auth_layer_integration.rs`
 - Media coordination + register-meeting + token-refresh integration (`mh_notifications`, stub MH gRPC, Cat B `record_token_refresh_metrics` per-`error_category` matrix in `crates/mc-service/src/observability/metrics.rs:tests`) -> `crates/mc-service/tests/media_coordination_integration.rs`, `register_meeting_integration.rs`, `token_refresh_integration.rs`
 - Per-failure-class wrapper covers (actor metrics, redis ops, orphans) -> `crates/mc-service/tests/actor_metrics_integration.rs`, `redis_metrics_integration.rs`, `orphan_metrics_integration.rs`
-- Shared rigs + scaffolding (`AcceptLoopRig`, `TestStackHandles`, `build_test_stack`, `seed_meeting_with_mh`, `MockMhAssignmentStore`, `MockMhRegistrationClient`) -> `crates/mc-service/tests/common/`
-- Health + metrics + cross-service test utils (mock Redis/GC/MH) -> `crates/mc-service/src/observability/health.rs`, `metrics.rs`, `crates/mc-test-utils/src/`
+- Shared rigs + scaffolding (`AcceptLoopRig`, `TestStackHandles`, `build_test_stack`, `seed_meeting_with_mh`, `MockMhAssignmentStore`, `MockMhRegistrationClient`) -> `crates/mc-service/tests/common/`; health + metrics + cross-service test utils (mock Redis/GC/MH) -> `crates/mc-service/src/observability/{health,metrics}.rs`, `crates/mc-test-utils/src/`
 
 ## Code Locations: MH Service
 - Config tests (env vars, defaults, TLS, debug redaction, advertise addresses, JWKS URL, timeouts) -> `crates/mh-service/src/config.rs:tests`
@@ -65,8 +66,7 @@
 - Observability validation (Loki, metrics) → `crates/env-tests/tests/30_observability.rs`, `src/cluster.rs:is_loki_available()`
 
 ## Code Locations: Cluster Setup & Helper (ADR-0030)
-- Setup script (arg parsing, deploy_only_service, load_image_to_kind) → `infra/kind/scripts/setup.sh`
-- Teardown → `infra/kind/scripts/teardown.sh`; Kind config → `infra/kind/kind-config.yaml.tmpl`
+- Setup/teardown (arg parsing, deploy_only_service, load_image_to_kind; Kind config) → `infra/kind/scripts/setup.sh`, `teardown.sh`, `infra/kind/kind-config.yaml.tmpl`
 - Port map + gateway IP → `crates/devloop-helper/src/commands.rs`; Port map file → `/tmp/devloop-{slug}/ports.json`
 - Env vars + ConfigMap patching → `infra/kind/scripts/setup.sh`; Wrapper → `infra/devloop/devloop.sh`
 

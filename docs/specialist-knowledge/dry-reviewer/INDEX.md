@@ -3,6 +3,9 @@
 ## Architecture & Design
 - Blocking vs tech-debt classification -> ADR-0019 (`docs/decisions/adr-0019-dry-reviewer.md`)
 - Fix-or-defer review model -> ADR-0024 (`docs/decisions/adr-0024-agent-teams-workflow.md`)
+- Cross-Boundary Ownership Model (three-tier classification, GSA, Paired flag) -> ADR-0024 §6
+- GSA enumeration triplet (source of truth + mirrors, 3-way sync guard scope) -> `docs/decisions/adr-0024-agent-teams-workflow.md:389`, `.claude/skills/devloop/SKILL.md:115`, `.claude/skills/devloop/review-protocol.md:14`
+- Spin-out as third fix-or-defer path + Ownership-lens verdict field -> `.claude/skills/devloop/review-protocol.md:68-94`, `:113-119`
 
 ## JWT Validation (Common + Thin Wrappers)
 - Common JWT code (all shared logic) -> `crates/common/src/jwt.rs`
@@ -67,9 +70,4 @@
 
 ## Abstraction Lessons (DRY judgment calls)
 - **Abstract the fixed mechanic, not speculative axes (AC Step 4 iter-2→iter-3, GC Step 5)**: speculative helpers pre-baking varying axes get abandoned (`sign_service_token_iat_offset` 3-of-5 axes); the fix is helpers parameterized only on the truly-fixed mechanic (`sign_service_token(pool, master_key, &Claims)`, `TestKeypair` + free-fn attack helpers). When removing dead helpers, verify the duplication is gone, not just moved inline. Mechanical extraction (incl. receiver-style → free-fn) ≠ renaming/re-shaping types.
-- **Per-crate `tests/common/` 3-crate sibling (Steps 3-5)**: AC + MC + GC each own a `tests/common/` with `AppState`/`Config` builders, DB seeding, JWT fixtures; topology divergence keeps them per-service. Cross-crate fixtures (harnesses, crypto, token builders) belong in `*-test-utils`. Workspace-level promotion to `crates/test-utils-common` triggers on 4th caller. `docs/TODO.md` tracks.
-- **Rejected abstraction reference: cross-service `record_token_refresh_metrics` (ADR-0032 Cat B)**: 3-line per-service dispatcher with prefix-only delta — abstraction adds complexity. Per-service parallel siblings at `{mh,mc,gc}-service/src/observability/metrics.rs`. Canonical "below the threshold" reference for future N-line-with-prefix candidates.
-
-## Tech Debt & Extractions
-- Active duplication tech debt -> `docs/TODO.md` (Cross-Service Duplication section)
-- Common crate + test fixtures -> `crates/common/src/`, `crates/mc-test-utils/`, `crates/gc-test-utils/`, `crates/ac-test-utils/`
+- **Per-crate `tests/common/` 3-crate sibling (Steps 3-5)**: AC + MC + GC each own a `tests/common/` with `AppState`/`Config` builders, DB seeding, JWT fixtures; topology divergence keeps them per-service. Cross-crate fixtures (harnesses, crypto, token builders) belong in `*-test-utils`. Workspace-level promotion to `crates/test-utils-common` triggers on 4th caller. Active duplication tech debt -> `docs/TODO.md` (Cross-Service Duplication section). Common crate + test fixtures -> `crates/common/src/`, `crates/mc-test-utils/`, `crates/gc-test-utils/`, `crates/ac-test-utils/`.

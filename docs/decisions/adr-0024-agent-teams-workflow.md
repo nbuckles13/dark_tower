@@ -386,6 +386,8 @@ Certain surfaces override the category classification: even a "mechanical-lookin
 
 **Enumerated Guarded Shared Areas** (current snapshot):
 
+<!-- Source of truth for GSA enumeration. Mirrored in .claude/skills/devloop/SKILL.md and .claude/skills/devloop/review-protocol.md — update all three when extending via micro-debate. -->
+
 - `proto/**`, `proto-gen/**`, `build.rs` — wire format
 - `crates/media-protocol/**` — SFU protocol semantics (protocol + MH co-sign)
 - `crates/common/src/jwt.rs`, `meeting_token.rs`, `token_manager.rs`, `secret.rs` — auth/crypto primitives
