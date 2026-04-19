@@ -69,15 +69,15 @@
 <!-- List EVERY planned file change. For each, classify per ADR-0024 §6.2:
      - Mine — in the implementing specialist's domain (trivial, the common case)
      - Not mine, Mechanical — cross-boundary, sed-test clean, guard-pipeline covered
-     - Not mine, Minor-judgment — cross-boundary, bounded impact, needs owner hunk-ACK trailer
+     - Not mine, Minor-judgment — cross-boundary, bounded impact; owner must review & confirm at Gate 1 + Gate 3
      - Not mine, Domain-judgment — needs owner-implements or --paired-with=<owner>
 
-     For Guarded Shared Area paths (ADR-0024 §6.4), Mechanical is disallowed.
-     Fill Owner (if not mine) + Trailer? for cross-boundary rows. -->
+     For Guarded Shared Area paths (ADR-0024 §6.4), Mechanical is disallowed; Owner must be filled.
+     Fill Owner (if not mine) for cross-boundary rows. -->
 
-| Path | Classification | Owner (if not mine) | Trailer? |
-|------|----------------|---------------------|----------|
-| {path} | Mine \| Not mine, Mechanical \| Not mine, Minor-judgment \| Not mine, Domain-judgment | {specialist or —} | Yes \| — |
+| Path | Classification | Owner (if not mine) |
+|------|----------------|---------------------|
+| {path} | Mine \| Not mine, Mechanical \| Not mine, Minor-judgment \| Not mine, Domain-judgment | {specialist or —} |
 
 ---
 

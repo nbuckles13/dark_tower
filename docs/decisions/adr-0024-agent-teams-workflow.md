@@ -375,12 +375,12 @@ Edits that pass the guard pipeline but change the **concept encoded in a string*
 | Category | Owner involvement | Mechanism |
 |----------|-------------------|-----------|
 | Mechanical | Review-only | Owner sees the change at the standard reviewer gate. No separate approval. |
-| Minor-judgment | Hunk-ACK required | Owner-specialist must explicitly ACK the specific cross-boundary hunk via a commit trailer (§6.7). PR-level review is insufficient. |
+| Minor-judgment | Owner confirmation required | Owner-specialist must be a reviewer on the devloop and must confirm the cross-boundary hunk at Gate 1 (plan review) and Gate 3 (via Ownership Lens verdict). Not satisfied by generic PR approval. An optional `Approved-Cross-Boundary:` commit trailer (§6.7) may be used as a durable audit breadcrumb but is not mechanically enforced. |
 | Domain-judgment | Owner-implements | Route to a separate devloop with owner as implementer, or use the **Paired flag** (§6.5) to keep the owner in the loop during the current devloop. |
 
 #### 6.4 Guarded Shared Areas
 
-Certain surfaces override the category classification: even a "mechanical-looking" edit routes to the owner-specialist. **Mechanical classification is disallowed inside Guarded Shared Areas; Minor-judgment requires owner hunk-ACK.**
+Certain surfaces override the category classification: even a "mechanical-looking" edit routes to the owner-specialist. **Mechanical classification is disallowed inside Guarded Shared Areas; Minor-judgment requires owner confirmation at Gate 1 and Gate 3 (§6.3).**
 
 **Criterion** (names the test, not just the list): wire-format runtime coupling, OR auth-routing policy, OR detection/forensics contract, OR schema evolution. Modules matching the criterion are Guarded whether or not they appear in the enumerated list below.
 
@@ -397,13 +397,13 @@ Certain surfaces override the category classification: even a "mechanical-lookin
 - `db/migrations/**` — schema evolution
 - ADR-0027-approved crypto primitives (wherever referenced)
 
-**Intersection rule.** When an edit spans two Guarded Shared Areas (e.g., auth-routing fields in `proto/internal.proto` span both wire-format *and* auth-routing-policy), all affected owners co-sign via trailer. Canonical case: `ServiceType` enum, scope enums, and identity fields in `proto/internal.proto` require `Approved-Cross-Boundary: protocol`, `Approved-Cross-Boundary: auth-controller`, and `Approved-Cross-Boundary: security` per ADR-0003 §5.7.
+**Intersection rule.** When an edit spans two Guarded Shared Areas (e.g., auth-routing fields in `proto/internal.proto` span both wire-format *and* auth-routing-policy), all affected owners must be reviewers on the devloop and must confirm the edit at Gate 1. Canonical case: `ServiceType` enum, scope enums, and identity fields in `proto/internal.proto` require protocol + auth-controller + security all present and all approving per ADR-0003 §5.7.
 
 Extending this list requires a **micro-debate** (~3 specialists: the affected owner + security + one cross-cutting), not a new ADR.
 
 **Counter-intuitive property**: the rule is *stricter* inside Guarded Shared Areas, not looser. The category rule relaxes cross-boundary friction in low-risk areas; the Guarded carve-out prevents that relaxation from reaching high-risk surfaces.
 
-**`crates/common/**` outside the Guarded subset** is not owned by a single specialist. Edits require DRY reviewer + code-reviewer approval; affected-specialist involvement is review-only unless call-site semantics change (escalates to Minor-judgment hunk-approval).
+**`crates/common/**` outside the Guarded subset** is not owned by a single specialist. Edits require DRY reviewer + code-reviewer approval; affected-specialist involvement is review-only unless call-site semantics change (escalates to Minor-judgment, §6.3).
 
 #### 6.5 Paired Flag
 
@@ -419,17 +419,16 @@ Extending this list requires a **micro-debate** (~3 specialists: the affected ow
 2. Reviewers examine the classification table at Gate 1 (plan approval). Primary review question: are cross-boundary rows classified correctly, and does any row need upgrade?
 3. Any reviewer may upgrade a classification; challenges auto-route to ESCALATE.
 4. **Pattern B** convention-driven coordinated renames require a **named convention author** (e.g., observability for metric taxonomy, operations for alert conventions). Absent a named convention author, Pattern B collapses to owner-implements.
-5. Gate 2 validation includes two mechanical consistency guards (no semantic judgment):
-   - **Scope-drift guard (Layer A)**: compares the current diff against the plan's file list. Unplanned changes or listed-but-untouched files are flagged for Lead adjudication per §6.3/§6.4 rules.
-   - **Classification-sanity guard (Layer B)**: enforces narrow rules a shell script can safely check — (a) Guarded Shared Area paths cannot be classified Mechanical; (b) plan rows for GSA paths must have an Owner field matching the ownership manifest; (c) plan rows marked "Trailer: Yes" must list a specialist that appears as an `Approved-Cross-Boundary:` trailer at commit time.
-6. Trailer consistency is verified at **commit time** (pre-commit hook and/or CI), not Gate 2 — commits don't exist at Gate 2. The Layer B rule (c) above is the commit-time check.
-7. The code-reviewer verdict at Gate 3 includes an explicit **Ownership Lens** field recording classifications, owner-specialists involved, and any trailer-backed approvals observed.
+5. Two mechanical consistency guards back the workflow (no semantic judgment in the scripts):
+   - **Classification-sanity guard (Layer B)** — checks the plan's classification table only. Enforces narrow rules: (a) GSA paths cannot be classified Mechanical; (b) plan rows for GSA paths must have the Owner field filled per the ownership manifest. Runs at **Gate 1** (Lead invokes before issuing "Plan approved"); also runs at Gate 2 via `run-guards.sh` as a safety net for iteration-introduced classification errors.
+   - **Scope-drift guard (Layer A)** — compares the working-tree diff against the plan's file list. Runs at **Gate 2** (needs the diff). Unplanned changes or listed-but-untouched files are flagged for Lead adjudication per §6.3/§6.4 rules.
+6. The code-reviewer verdict at Gate 3 includes an explicit **Ownership Lens** field recording classifications, owner-specialists involved, and confirmation that Minor-judgment and Domain-judgment routes were honored.
 
-**Design rationale.** Classification is the human work (semantic — is this really Mechanical?). Guards are mechanical consistency checks (does the diff match the plan? is the Owner field filled? does the commit trailer exist?). This keeps scripts narrow (no ownership-judgment heuristics, no category-classification heuristics) and puts the meaningful decision at Gate 1 where a plan change is cheap, not at commit time where changes are expensive.
+**Design rationale.** Classification is the human work (semantic — is this really Mechanical?). Guards are mechanical consistency checks (does the diff match the plan? is the Owner field filled?). This keeps scripts narrow (no ownership-judgment heuristics, no category-classification heuristics) and puts the meaningful decision at Gate 1 where a plan change is cheap. The owner-confirmation mechanism is collapsed into the Gate 1 / Gate 3 review flow rather than a separate commit-time trailer-enforcement pass — trailers remain available as an optional audit convention (§6.7) but are not mechanically required.
 
-#### 6.7 APPROVED-CROSS-BOUNDARY Commit Trailer
+#### 6.7 Optional `Approved-Cross-Boundary:` Commit Trailer
 
-Hunk-ACK is recorded as a git commit trailer, not an in-thread string:
+An owner specialist who wants to leave a durable audit breadcrumb after confirming a Minor-judgment cross-boundary edit may record their confirmation as a git commit trailer:
 
 ```
 Approved-Cross-Boundary: <specialist-name> <reason ≥ 10 chars>
@@ -437,9 +436,10 @@ Approved-Cross-Boundary: <specialist-name> <reason ≥ 10 chars>
 
 - RFC-5322 style, parseable by `git interpret-trailers`.
 - Matches the ADR-hash-stamping precedent already used elsewhere in the repo.
-- Durable across devloop restarts and thread archival — threads are ephemeral, trailers are permanent record.
+- Survives thread archival — useful for later "who approved this hunk?" questions (e.g., during post-incident review of an auth-critical change).
 - Multiple trailers allowed on a single commit (one per approving specialist).
-- **Enforcement point**: commit time (pre-commit hook or CI), not Gate 2 — commits don't exist at Gate 2. See §6.6 step 6 and §6.8 item #2.
+
+**Not mechanically enforced.** Owner confirmation is satisfied by Gate 1 plan approval and Gate 3 Ownership Lens verdict (§6.3). Trailers are a convention, not a requirement — use them when durability of the audit record matters.
 
 #### 6.8 Follow-Up Work
 
@@ -447,14 +447,14 @@ Named spin-outs from this amendment (not blocking adoption).
 
 **Active:**
 
-1. **Plan-template extension + scope-drift guard (Layer A) + classification-sanity guard (Layer B) + Gate 1 reviewer-checklist update.** Extend `docs/devloop-outputs/_template/main.md` with a `## Cross-Boundary Classification` section; author the two guards; build an ownership manifest mapping GSA paths to required specialists; add Gate 1 reviewer-checklist item to `.claude/skills/devloop/review-protocol.md`. Owners: operations + test + security + code-reviewer. Estimated: one medium devloop.
-2. **Commit-time trailer consistency check.** Pre-commit hook (or CI job) verifying plan rows marked "Trailer: Yes" produce matching `Approved-Cross-Boundary:` trailers on the devloop's commits. Can fold into #1 or run as a small follow-up. Owner: operations.
-3. **GSA three-way sync guard** (~15 LOC). Diffs the GSA enumerated list across `docs/decisions/adr-0024-agent-teams-workflow.md` §6.4, `.claude/skills/devloop/SKILL.md` §Cross-Boundary Edits, and `.claude/skills/devloop/review-protocol.md` Step 0. Prevents drift when GSA extends via micro-debate. Owner: dry-reviewer.
-4. **DRY reviewer retrospective audit on Ownership Lens verdict field.** Owner: dry-reviewer.
+1. **Plan-template extension + Layer A scope-drift guard + Layer B classification-sanity guard + Gate 1 reviewer-checklist + Lead Gate 1 invocation of Layer B.** Plan-template extension is already shipped. Author the two guards (one script, two modes); build an ownership manifest mapping GSA paths to required specialists; add Gate 1 reviewer-checklist item to `.claude/skills/devloop/review-protocol.md`; add the Lead's Gate 1 invocation step to `.claude/skills/devloop/SKILL.md` Step 5. Owners: operations + test + security + code-reviewer. Estimated: one medium devloop.
+2. **GSA three-way sync guard** (~15 LOC). Diffs the GSA enumerated list across `docs/decisions/adr-0024-agent-teams-workflow.md` §6.4, `.claude/skills/devloop/SKILL.md` §Cross-Boundary Edits, and `.claude/skills/devloop/review-protocol.md` Step 0. Prevents drift when GSA extends via micro-debate. Owner: dry-reviewer.
+3. **DRY reviewer retrospective audit on Ownership Lens verdict field.** Owner: dry-reviewer.
 
 **Reshaped or dropped from earlier drafts (for the record):**
 
-- ~~`validate-cross-boundary-approval.sh` at Gate 2~~ — reshaped. The "Gate 2 scans commit trailers" framing was flawed (no commits exist at Gate 2). The scope-drift + classification-sanity guards in item #1 (plus commit-time trailer check in item #2) replace it.
+- ~~`validate-cross-boundary-approval.sh` at Gate 2~~ — reshaped. The "Gate 2 scans commit trailers" framing was flawed (no commits exist at Gate 2). Layer A + Layer B guards above replace it.
+- ~~Commit-time trailer consistency check~~ — dropped. Owner confirmation is now satisfied by Gate 1 review + Gate 3 Ownership Lens verdict, not by a machine-checked trailer. Trailers remain an optional audit convention (§6.7) but are not enforced. Dropping removes late-feedback ceremony that had near-zero incremental catch rate given Gate 1 + Gate 3 coverage.
 - ~~APPROVED-CROSS-BOUNDARY classification-failure fixture suite~~ — dropped. The simplified Layer B guard's narrow rules are reviewer-verifiable during authoring; no separate fixture suite needed.
 - ~~Scope/claim/session-field rename guard~~ — deferred indefinitely. Compiler catches most partial renames in Rust; reviewers catch string-level renames for auth-critical paths at Gate 1. Residual risk (string renames across non-Rust files the compiler can't see) is narrow; revisit if observed in practice.
 
