@@ -8,6 +8,7 @@
 - Integration test infrastructure -> ADR-0009
 - User auth & meeting access claims -> ADR-0020
 - Observability framework -> ADR-0011
+- Metric testability (AC: Tier A + Tier B; no Tier C) -> ADR-0032
 
 ## Code Locations
 - Config loading & validation -> `crates/ac-service/src/config.rs:Config::from_vars()`
@@ -50,9 +51,8 @@
 ## Internal Token Endpoints (ADR-0020)
 - Meeting token handler -> `crates/ac-service/src/handlers/internal_tokens.rs:handle_meeting_token()`
 - Guest token handler -> `crates/ac-service/src/handlers/internal_tokens.rs:handle_guest_token()`
-- Request types (`MeetingTokenRequest`, `GuestTokenRequest`) are shared via `common::meeting_token`
-- AC re-exports them from `crate::models` so handler imports are unchanged
-- Note: `common::meeting_token::{ParticipantType, MeetingRole}` (3-variant, snake_case) differs from `common::jwt::{ParticipantType, MeetingRole}` (2-variant, lowercase). Wire-compatible but separate Rust types. Unification is a future cleanup item.
+- Request types (`MeetingTokenRequest`, `GuestTokenRequest`) shared via `common::meeting_token`; AC re-exports from `crate::models`
+- Note: `common::meeting_token::{ParticipantType, MeetingRole}` (3-variant, snake_case) vs `common::jwt::{ParticipantType, MeetingRole}` (2-variant, lowercase) — wire-compatible, separate Rust types; unification pending.
 
 ## Scope Data (ADR-0003)
 - Default scopes per service type -> `crates/ac-service/src/models/mod.rs:ServiceType::default_scopes()`

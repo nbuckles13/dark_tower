@@ -6,6 +6,7 @@
 - Client architecture (telemetry, metrics, dashboards, synthetic probe) -> ADR-0028
 - Dashboard metric presentation (counters vs rates, increase/rate classification) -> ADR-0029
 - Host-side cluster helper (observability access, port discovery, health gating, listenAddress fix) -> ADR-0030
+- Metric testability (extraction, MetricAssertion utility, TestHooks bounded scope, coverage ratchet, failure-class table) -> ADR-0032
 
 ## Metrics
 - Metric catalogs -> `docs/observability/metrics/ac-service.md`, `docs/observability/metrics/gc-service.md`, `docs/observability/metrics/mc-service.md`, `docs/observability/metrics/mh-service.md`
@@ -52,19 +53,16 @@
 
 ## Devloop Cluster Helper (Observability)
 - Kind config template (listenAddress: ${HOST_GATEWAY_IP}, dynamic observability ports) -> `infra/kind/kind-config.yaml.tmpl`
-- Port map (prometheus, grafana, loki port discovery) -> `/tmp/devloop-{slug}/ports.json`
-- Port-map.env (observability + WebTransport port shell vars) -> `crates/devloop-helper/src/commands.rs:write_port_map_shell()`
-- Status command + pod health parsing -> `crates/devloop-helper/src/commands.rs:cmd_status()`, `parse_pod_health()`
-- Status client display (health summary from result data) -> `infra/devloop/dev-cluster` (status post-command section)
-- Helper audit log (JSONL, all commands including status) -> `crates/devloop-helper/src/logging.rs:AuditLog`
-- Devloop.sh infrastructure health check (re-entry) -> `infra/devloop/devloop.sh` (ADR-0030 Step 6 section)
-- Eager setup background log -> `/tmp/devloop-{slug}/eager-setup.log`
+- Port map + port-map.env (observability + WebTransport ports) -> `/tmp/devloop-{slug}/ports.json`, `crates/devloop-helper/src/commands.rs:write_port_map_shell()`
+- Status command, pod health parsing, client display -> `crates/devloop-helper/src/commands.rs:cmd_status()`, `parse_pod_health()`, `infra/devloop/dev-cluster`
+- Helper audit log + devloop.sh infrastructure health check (ADR-0030 Step 6) -> `crates/devloop-helper/src/logging.rs:AuditLog`, `infra/devloop/devloop.sh`
 - Env-tests observability + Layer 8 validation pipeline -> `crates/env-tests/src/cluster.rs:ClusterPorts::from_env()`, `crates/env-tests/tests/30_observability.rs`, `.claude/skills/devloop/SKILL.md` (Layer 8)
 
 ## Guards
 - Metric-to-dashboard coverage -> `scripts/guards/simple/validate-application-metrics.sh`
 - Dashboard-to-kustomize coverage (R-20, bidirectional) -> `scripts/guards/simple/validate-kustomize.sh`
 - Instrument skip_all enforcement -> `scripts/guards/simple/instrument-skip-all.sh`
+- Metric-test coverage ratchet, MetricAssertion utility, TestHooks bounded scope, 4-guard enforcement stack (G1-G4), failure-class table -> ADR-0032
 
 ## Env-Test Observability, Cluster Config & Runbooks
 - Per-service deployment + incident response -> `docs/runbooks/` (two per service)
