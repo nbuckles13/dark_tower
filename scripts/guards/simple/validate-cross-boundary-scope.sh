@@ -185,17 +185,28 @@ check_main_md() {
     local violations=0
 
     # Plan paths: parse the classification table, keep path column only.
-    # Exclude main.md itself from both sides — the plan may or may not list
-    # it, but either way self-referential drift is not useful signal.
+    #
+    # Auto-exclusions (applied symmetrically to both plan_paths and diff_paths):
+    # - main.md itself — self-referential drift is not useful signal.
+    # - `docs/specialist-knowledge/**/INDEX.md` — reflection-phase artifacts,
+    #   authored by each specialist themselves during Step 8 reflection, after
+    #   Gate 2 has already run. Listing them in every plan would be ceremony
+    #   for an expected, owner-authored pattern. If a devloop lists them
+    #   explicitly anyway (e.g., implementer plans an INDEX update as part of
+    #   implementation), the exclusion is harmless — plan and diff both omit
+    #   them in Layer A's calculation.
+    local exclude_re
+    exclude_re="^(${rel_path}|docs/specialist-knowledge/[^/]+/INDEX\\.md)\$"
+
     local rows plan_paths
     rows=$(parse_cross_boundary_table "$main_md")
     plan_paths=$(echo "$rows" \
         | awk -F'|' 'NF>=1 && $1!="" { print $1 }' \
-        | grep -v "^${rel_path}$" \
+        | grep -Ev "$exclude_re" \
         | sort -u)
 
     local diff_paths
-    diff_paths=$(echo "$all_diff" | grep -v "^${rel_path}$" | sort -u || true)
+    diff_paths=$(echo "$all_diff" | grep -Ev "$exclude_re" | sort -u || true)
 
     # Inbound drift: in diff, not in plan.
     local inbound
