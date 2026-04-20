@@ -1,0 +1,44 @@
+# Cross-Boundary Ownership Manifest (ADR-0024 §6.4)
+#
+# Mirror of ADR-0024 §6.4 enumerated list. Update all four locations together
+# (ADR-0024 §6.4, .claude/skills/devloop/SKILL.md §Cross-Boundary Edits,
+#  .claude/skills/devloop/review-protocol.md Step 0, this file)
+# when extending via micro-debate.
+#
+# NOTE: ADR-0024 §6.8 item #2 defines a three-way sync guard covering
+# ADR §6.4, SKILL.md, and review-protocol.md. This manifest is the fourth
+# synced location — when that guard is authored (dry-reviewer owner),
+# extend it to cover this file as well.
+#
+# Keys are glob patterns; values list specialists who are valid Owner values.
+# When a path matches multiple keys, union the specialist lists.
+#
+# INCOMPLETE BY DESIGN: ADR-0024 §6.4 also names
+# "ADR-0027-approved crypto primitives (wherever referenced)" as a GSA.
+# That rule is path-independent and CANNOT be enumerated here — call-site
+# usages become GSA wherever they appear. Reviewers must apply the §6.4
+# criterion manually at Gate 1 / Gate 3 (see .claude/skills/devloop/
+# review-protocol.md Step 0). This manifest captures only the
+# path-enumerable subset.
+#
+# When the Layer B guard reports "Owner ∈ manifest list" as passing, that
+# is NOT a certification that all required owners co-signed — all-three
+# intersection enforcement (e.g., proto/internal.proto needing protocol +
+# auth-controller + security) remains Gate 1 human-review territory per
+# §6.6 design rationale.
+
+"proto/**": [protocol]
+"proto-gen/**": [protocol]
+"build.rs": [protocol]
+"proto/internal.proto": [protocol, auth-controller, security]
+"crates/media-protocol/**": [protocol, media-handler]
+"crates/common/src/jwt.rs": [auth-controller, security]
+"crates/common/src/meeting_token.rs": [auth-controller, security]
+"crates/common/src/token_manager.rs": [auth-controller, security]
+"crates/common/src/secret.rs": [auth-controller, security]
+"crates/common/src/webtransport/**": [meeting-controller, protocol]
+"crates/ac-service/src/jwks/**": [auth-controller, security]
+"crates/ac-service/src/token/**": [auth-controller]
+"crates/ac-service/src/crypto/**": [auth-controller, security]
+"crates/ac-service/src/audit/**": [security]
+"db/migrations/**": [database]

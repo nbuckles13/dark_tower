@@ -11,7 +11,12 @@ Before reviewing code, scope your work:
 4. Flag security-sensitive file patterns: `auth/`, `crypto/`, `middleware/`, key management files
 5. **Flag any diff path matching ADR-0024 §6.4 Guarded Shared Areas**. GSA paths and any path matching the criterion (wire-format runtime coupling OR auth-routing policy OR detection/forensics contract OR schema evolution) are **priority-high scope items** — they require owner-specialist co-sign regardless of how clean the edit looks.
 
-<!-- Mirror of ADR-0024 §6.4 enumerated list. Update all three locations together when extending via micro-debate. -->
+> At Gate 1 you also verify the plan's `## Cross-Boundary Classification` table — see the Cross-Boundary Classification review item in `## Plan Confirmation Checklist (Gate 1)` below.
+
+<!-- Mirror of ADR-0024 §6.4 enumerated list. Update all four locations together
+     (ADR-0024 §6.4, .claude/skills/devloop/SKILL.md §Cross-Boundary Edits,
+      this file, scripts/guards/simple/cross-boundary-ownership.yaml)
+     when extending via micro-debate. -->
 
 Guarded Shared Areas (current snapshot):
 
@@ -42,6 +47,8 @@ When the implementer shares their plan, verify before confirming:
 3. No domain-specific concerns that would require redesign
 4. For Security reviewer: threat model implications considered
 5. All technical questions you raised with the implementer are resolved — no pending concerns
+6. **Cross-Boundary Classification review**: verify the plan's `## Cross-Boundary Classification` table. For every row with classification other than `Mine`, check the classification against the change-pattern and impact, and confirm the Owner field is correct. Ensure there is a row for every file the plan touches — not only cross-boundary rows. If uncertain, challenge via **upgrade** (Mechanical → Minor-judgment → Domain-judgment) — downgrade is disallowed per ADR-0024 §6.2 and auto-routes to ESCALATE. See ADR-0024 §6.3 (owner-involvement) and §6.4 (Guarded Shared Areas).
+   - The Layer B classification-sanity guard (`scripts/guards/simple/validate-cross-boundary-classification.sh`) enforces two narrow mechanical rules ahead of Lead's "Plan approved": (a) GSA paths cannot be `Mechanical`; (b) GSA paths with a non-`Mine` classification must have an Owner in the ownership manifest. **Human judgment on is-this-really-Mechanical, is-the-sed-test-clean, and is-the-intersection-rule-honored stays with you at Gate 1** — the guard does not substitute for review.
 
 Only use SendMessage to tell @team-lead "Plan confirmed" after checking all applicable items. **Do NOT confirm if you have unresolved questions or outstanding discussions with the implementer.**
 
