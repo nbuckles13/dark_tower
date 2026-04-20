@@ -387,8 +387,9 @@ Certain surfaces override the category classification: even a "mechanical-lookin
 **Enumerated Guarded Shared Areas** (current snapshot):
 
 <!-- Source of truth for GSA enumeration. Mirrored in .claude/skills/devloop/SKILL.md,
-     .claude/skills/devloop/review-protocol.md, and scripts/guards/simple/cross-boundary-ownership.yaml —
-     update all four when extending via micro-debate. -->
+     .claude/skills/devloop/review-protocol.md, scripts/guards/simple/cross-boundary-ownership.yaml,
+     and the CANON array in scripts/guards/simple/validate-gsa-sync.sh —
+     update all five when extending via micro-debate. -->
 
 - `proto/**`, `proto-gen/**`, `build.rs` — wire format
 - `crates/media-protocol/**` — SFU protocol semantics (protocol + MH co-sign)

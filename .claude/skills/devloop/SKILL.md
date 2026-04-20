@@ -113,9 +113,10 @@ Certain surfaces override the category classification: even a sed-clean edit rou
 
 **Criterion** (names the test, not just the list): wire-format runtime coupling, OR auth-routing policy, OR detection/forensics contract, OR schema evolution. Paths matching the criterion are Guarded whether or not enumerated below.
 
-<!-- Mirror of ADR-0024 §6.4 enumerated list. Update all four locations together
+<!-- Mirror of ADR-0024 §6.4 enumerated list. Update all five locations together
      (ADR-0024 §6.4, this file, .claude/skills/devloop/review-protocol.md Step 0,
-      scripts/guards/simple/cross-boundary-ownership.yaml)
+      scripts/guards/simple/cross-boundary-ownership.yaml,
+      and the CANON array in scripts/guards/simple/validate-gsa-sync.sh)
      when extending via micro-debate. -->
 
 - `proto/**`, `proto-gen/**`, `build.rs` — wire format
