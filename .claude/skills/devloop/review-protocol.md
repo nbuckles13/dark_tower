@@ -13,9 +13,10 @@ Before reviewing code, scope your work:
 
 > At Gate 1 you also verify the plan's `## Cross-Boundary Classification` table — see the Cross-Boundary Classification review item in `## Plan Confirmation Checklist (Gate 1)` below.
 
-<!-- Mirror of ADR-0024 §6.4 enumerated list. Update all four locations together
+<!-- Mirror of ADR-0024 §6.4 enumerated list. Update all five locations together
      (ADR-0024 §6.4, .claude/skills/devloop/SKILL.md §Cross-Boundary Edits,
-      this file, scripts/guards/simple/cross-boundary-ownership.yaml)
+      this file, scripts/guards/simple/cross-boundary-ownership.yaml,
+      and the CANON array in scripts/guards/simple/validate-gsa-sync.sh)
      when extending via micro-debate. -->
 
 Guarded Shared Areas (current snapshot):

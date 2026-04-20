@@ -1,14 +1,14 @@
 # Cross-Boundary Ownership Manifest (ADR-0024 §6.4)
 #
-# Mirror of ADR-0024 §6.4 enumerated list. Update all four locations together
+# Mirror of ADR-0024 §6.4 enumerated list. Update all five locations together
 # (ADR-0024 §6.4, .claude/skills/devloop/SKILL.md §Cross-Boundary Edits,
-#  .claude/skills/devloop/review-protocol.md Step 0, this file)
+#  .claude/skills/devloop/review-protocol.md Step 0, this file,
+#  and the CANON array in scripts/guards/simple/validate-gsa-sync.sh)
 # when extending via micro-debate.
 #
-# NOTE: ADR-0024 §6.8 item #2 defines a three-way sync guard covering
-# ADR §6.4, SKILL.md, and review-protocol.md. This manifest is the fourth
-# synced location — when that guard is authored (dry-reviewer owner),
-# extend it to cover this file as well.
+# The five-way sync is enforced by scripts/guards/simple/validate-gsa-sync.sh
+# (ADR-0024 §6.8 item #2). That guard holds the canonical fully-expanded
+# path list and cross-checks every mirror against it on each run.
 #
 # Keys are glob patterns; values list specialists who are valid Owner values.
 # When a path matches multiple keys, union the specialist lists.
