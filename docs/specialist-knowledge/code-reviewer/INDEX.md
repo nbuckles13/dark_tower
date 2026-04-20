@@ -12,6 +12,7 @@
 - User auth, three-tier token architecture → ADR-0020
 - Infrastructure architecture, K8s manifests → ADR-0012; Local dev environment → ADR-0013
 - Agent teams validation pipeline → ADR-0024
+- Metric testability: extraction + `MetricAssertion` + `TestHooks`; per-failure-class table; `#[must_use]` compile-time enforcement → ADR-0032
 
 ## Code Locations — AC Service
 - Clippy deny list → `Cargo.toml:34-42`

@@ -9,6 +9,7 @@
 - Coverage thresholds -> `.codecov.yml`
 - Client architecture (4-tier testing, test-utils, flaky policy) -> ADR-0028
 - Host-side cluster helper (env-test execution, URL config, attempt budgets, cluster networking) -> `docs/decisions/adr-0030-host-side-cluster-helper.md`
+- Metric testability (extract + `MetricAssertion` + bounded `TestHooks` + ratchet guards) -> `docs/decisions/adr-0032-metric-testability.md`
 
 ## Code Locations: AC Service
 - Integration + fault injection tests -> `crates/ac-service/tests/integration/`, `crates/ac-service/tests/fault_injection/`
@@ -29,12 +30,11 @@
 - Auth (meeting/guest JWT, McAuthInterceptor, JWKS McAuthLayer+scope) -> `crates/mc-service/src/auth/mod.rs:tests`, `grpc/auth_interceptor.rs:tests`
 - Config + error tests (incl. MhAssignmentMissing) -> `crates/mc-service/src/config.rs:tests`, `crates/mc-service/src/errors.rs:tests`
 - Actor tests (controller, meeting, participant, session) -> `crates/mc-service/src/actors/controller.rs:tests`, `meeting.rs`, `participant.rs`, `session.rs`
-- Join flow integration tests (T1-T15, MH assignment, media_servers, bridge, RegisterMeeting trigger, multi-MH, mixed grpc_endpoint) -> `crates/mc-service/tests/join_tests.rs`
+- Join flow integration tests (T1-T13, MH assignment, media_servers, bridge, RegisterMeeting trigger) -> `crates/mc-service/tests/join_tests.rs`
 - WebTransport tests (encoding, connection, handle_client_message) -> `crates/mc-service/src/webtransport/connection.rs:tests`
 - RegisterMeeting retry/backoff unit tests -> `crates/mc-service/src/webtransport/connection.rs:tests::test_register_*`
-- MH data (MhAssignmentStore trait, MhRegistrationClient trait, MockMhAssignmentStore, MockMhRegistrationClient + `wait_for_calls(expected, timeout)`) -> `crates/mc-service/src/redis/client.rs`, `src/grpc/mh_client.rs`, `tests/join_tests.rs`
-- Join test harness builders (`TestServer::create_meeting`, `create_meeting_with_handlers(id, handlers)`) -> `crates/mc-service/tests/join_tests.rs`
-- MH coordination (registry, MediaCoordinationService, connect/disconnect round-trip + idempotent retry) -> `crates/mc-service/src/mh_connection_registry.rs:tests`, `grpc/media_coordination.rs:tests::test_coordination_flow_connect_disconnect_round_trip`
+- MH data (MhAssignmentStore trait, MhRegistrationClient trait, MockMhAssignmentStore, MockMhRegistrationClient) -> `crates/mc-service/src/redis/client.rs`, `src/grpc/mh_client.rs`, `tests/join_tests.rs`
+- MH coordination (registry, MediaCoordinationService) -> `crates/mc-service/src/mh_connection_registry.rs:tests`, `grpc/media_coordination.rs:tests`
 - GC integration + heartbeat tests -> `crates/mc-service/tests/gc_integration.rs`, `heartbeat_tasks.rs`
 - Health + metrics (incl. RegisterMeeting, MH coordination + media connection failure) -> `crates/mc-service/src/observability/health.rs`, `metrics.rs`
 - Test utils (mock Redis, mock GC, mock MH) -> `crates/mc-test-utils/src/mock_redis.rs`, `mock_gc.rs`, `mock_mh.rs`
@@ -47,10 +47,8 @@
 - gRPC handler tests (RegisterMeeting validation, SessionManagerHandle integration) -> `crates/mh-service/src/grpc/mh_service.rs:tests`
 - Session manager actor tests (handle API, registration, connections, pending promotion, notify via oneshot) -> `crates/mh-service/src/session/mod.rs:tests`
 - WebTransport server + connection handler -> `crates/mh-service/src/webtransport/server.rs`, `connection.rs`
-- WebTransport provisional-accept select arms (await_meeting_registration timeout/cancel/registered, local DebuggingRecorder per-test) -> `crates/mh-service/src/webtransport/connection.rs:tests`
-- Health + metrics tests -> `crates/mh-service/src/observability/health.rs:tests`, `metrics.rs:tests`
+- Health + metrics tests (incl. `record_mc_notification`, WT notify wiring via `spawn_notify_connected()`) -> `crates/mh-service/src/observability/`, `src/webtransport/connection.rs:spawn_notify_connected()`
 - McClient tests + MC notification integration (mock MediaCoordinationService, retry, auth short-circuit) -> `crates/mh-service/src/grpc/mc_client.rs:tests`, `tests/mc_client_integration.rs`
-- WebTransport notification wiring + metrics -> `crates/mh-service/src/webtransport/connection.rs:spawn_notify_connected()`, `src/observability/metrics.rs:record_mc_notification()`
 - GC integration tests (registration, load reports, NOT_FOUND) -> `crates/mh-service/tests/gc_integration.rs`
 - Auth layer integration (MhAuthLayer + MhMediaService, JWKS upgrade, alg-none/HS256 confusion) -> `crates/mh-service/tests/auth_layer_integration.rs`
 - RegisterMeeting integration (happy path over wire, InvalidArgument) -> `crates/mh-service/tests/register_meeting_integration.rs`

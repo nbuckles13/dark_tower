@@ -8,6 +8,9 @@
 - gRPC auth scopes (two-layer: JWKS+scope server-wide, service_type per-path) → ADR-0003
 - Observability pattern (metrics crate facade) → ADR-0011
 - Dashboard metric presentation (counters vs rates) → ADR-0029
+- Metric testability pattern (Tier A extract / Tier B MetricAssertion / Tier C TestHooks / Tier D recorder-snapshot) → ADR-0032
+- TestHooks struct + ConnectionOutcome shape for WT accept_loop result channel → ADR-0032 §Tier C
+- Spawn-cleanup ordering rule (send-on-channel is final statement after gauge/counter updates) → ADR-0032 §Tier C
 - Fuzz testing for media frames → ADR-0006
 - Client-to-MH QUIC connection user story → `docs/user-stories/2026-04-12-mh-quic-connection.md`
 
