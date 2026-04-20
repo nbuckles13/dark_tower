@@ -4,7 +4,7 @@
 - Blocking vs tech-debt classification -> ADR-0019 (`docs/decisions/adr-0019-dry-reviewer.md`)
 - Fix-or-defer review model -> ADR-0024 (`docs/decisions/adr-0024-agent-teams-workflow.md`)
 - Cross-Boundary Ownership Model (three-tier classification, GSA, Paired flag) -> ADR-0024 §6
-- GSA enumeration triplet (source of truth + mirrors, 3-way sync guard scope) -> `docs/decisions/adr-0024-agent-teams-workflow.md:389`, `.claude/skills/devloop/SKILL.md:115`, `.claude/skills/devloop/review-protocol.md:14`
+- GSA quartet + cross-boundary guards -> ADR-0024 §6.4; mirrors `.claude/skills/devloop/SKILL.md:116`, `.claude/skills/devloop/review-protocol.md:16`, `scripts/guards/simple/cross-boundary-ownership.yaml` (manifest; anchor-of-truth grep on "Mirror of ADR-0024 §6.4" / "Source of truth for GSA enumeration"); guards `scripts/guards/simple/validate-cross-boundary-scope.sh` + `scripts/guards/simple/validate-cross-boundary-classification.sh` share `scripts/guards/common.sh:parse_cross_boundary_table` (Pattern C precedent)
 - Spin-out as third fix-or-defer path + Ownership-lens verdict field -> `.claude/skills/devloop/review-protocol.md:68-94`, `:113-119`
 
 ## JWT Validation (Common + Thin Wrappers)

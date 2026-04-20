@@ -8,7 +8,7 @@
 - MC session binding & HKDF key hierarchy → ADR-0023 (Section 1)
 - Client architecture (E2EE, key management, supply chain) → ADR-0028 (Sections 5, 1)
 - Service-owned dashboards and alerts → ADR-0031 | Alert-rules guard (URL exfil closure + annotation hygiene) → `scripts/guards/simple/validate-alert-rules.sh`
-- Cross-boundary ownership (GSA, `Approved-Cross-Boundary:` trailer, intersection rule) → ADR-0024 §6 | GSA mirror in skills → `.claude/skills/devloop/SKILL.md` §Cross-Boundary Edits, `.claude/skills/devloop/review-protocol.md` Step 0
+- Cross-boundary ownership (GSA, `Approved-Cross-Boundary:` trailer, intersection rule) → ADR-0024 §6 | GSA mirror in skills → `.claude/skills/devloop/SKILL.md` §Cross-Boundary Edits, `.claude/skills/devloop/review-protocol.md` Step 0 | GSA path → specialist manifest (auth-critical path additions go here) + Layer B classification-sanity guard → `scripts/guards/simple/cross-boundary-ownership.yaml`, `validate-cross-boundary-classification.sh`
 
 ## Code Locations — AC (Token Issuance & Crypto)
 - JWT signing/verification, key encryption, bcrypt → `crates/ac-service/src/crypto/mod.rs`

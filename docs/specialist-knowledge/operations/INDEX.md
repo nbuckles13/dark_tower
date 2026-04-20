@@ -7,15 +7,15 @@
 - Metric testability (single presence guard, Cat A/B/C rollout, raw `/metrics` evidence, per-service SLO sub-targets) → ADR-0032; service-owned dashboards/alerts (collapsed Phase 4) → ADR-0031
 
 ## CI & Guards
-- CI pipeline → `.github/workflows/ci.yml`; runner + common → `scripts/guards/run-guards.sh`, `common.sh`
+- CI pipeline → `.github/workflows/ci.yml`; runner + common → `scripts/guards/run-guards.sh`, `common.sh` (shared helpers incl. `parse_cross_boundary_table()` for ADR-0024 §6 plan parsing)
 - Kustomize → `scripts/guards/simple/validate-kustomize.sh`; app metrics (metric↔dashboard) → `validate-application-metrics.sh`; alert-rules → `validate-alert-rules.sh`, conventions → `docs/observability/alert-conventions.md`
-- Metric-test coverage guard (`validate-metric-coverage.sh`, single presence check; lead sequences per-service backfill PRs during phasing window; MH ✓ + MC ✓ + AC ✓ + GC ✓ (all four `0 uncovered` after ADR-0032 Step 5, 2026-04-27 — `run-guards.sh` fully GREEN on `feature/mh-quic-mh-tests`, branch ready to merge) → ADR-0032
+- Cross-boundary guards (Layer A scope-drift, Layer B classification-sanity; ADR-0024 §6) → `scripts/guards/simple/validate-cross-boundary-scope.sh`, `validate-cross-boundary-classification.sh`, `cross-boundary-ownership.yaml`
+- Metric-test coverage guard (`validate-metric-coverage.sh`, single presence check; lead sequences per-service backfill PRs during phasing window; MH ✓ + MC ✓ + AC ✓ + GC ✓ (all four `0 uncovered` after ADR-0032 Step 5, 2026-04-27) → ADR-0032
 
 ## Devloop Cluster Helper
 - Kind config template (envsubst, host-gateway listenAddress) → `infra/kind/kind-config.yaml.tmpl`
 - Devloop wrapper → `infra/devloop/devloop.sh` (health check + eager setup), Dockerfile → `infra/devloop/Dockerfile`; container-side client → `infra/devloop/dev-cluster`
-- Helper commands (setup, deploy, rebuild, teardown, status; `write_port_map_shell()`, DT_HOST_GATEWAY_IP propagation in `cmd_setup`/`cmd_deploy`) → `crates/devloop-helper/src/commands.rs`; protocol → `crates/devloop-helper/src/protocol.rs`
-- Port registry → `~/.cache/devloop/port-registry.json`; per-devloop runtime state → `/tmp/devloop-{slug}/` (PID, socket, auth token, ports.json, setup.pid, eager-setup.log)
+- Helper commands (setup, deploy, rebuild, teardown, status; `write_port_map_shell()`, DT_HOST_GATEWAY_IP propagation in `cmd_setup`/`cmd_deploy`) → `crates/devloop-helper/src/commands.rs`; protocol → `crates/devloop-helper/src/protocol.rs`; port registry → `~/.cache/devloop/port-registry.json`; per-devloop runtime state → `/tmp/devloop-{slug}/` (PID, socket, auth token, ports.json, setup.pid, eager-setup.log)
 - Env-test URL config → `crates/env-tests/src/cluster.rs:ClusterPorts::from_env()`; Layer 8 → `.claude/skills/devloop/SKILL.md`
 
 ## Deployment & K8s

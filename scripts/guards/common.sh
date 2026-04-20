@@ -345,3 +345,91 @@ declare -A CANONICAL_SERVICES=(
     [mc]="mc-service:mc-service"
     [mh]="mh-service:mh-service"
 )
+
+# =============================================================================
+# Cross-Boundary Classification Table Parser (ADR-0024 §6)
+# =============================================================================
+
+# Parse the ## Cross-Boundary Classification table from a devloop main.md file.
+#
+# Output: one line per data row, format "path|classification|owner".
+# Backticks are stripped from path; all cells are trimmed of surrounding
+# whitespace. Skipped rows:
+#   - the header row (Path | Classification | Owner (if not mine))
+#   - the separator row (|---|---|---|)
+#   - template placeholder rows (path cell matches {path}, TBD, or contains
+#     "during planning")
+#
+# Consumed by:
+#   - validate-cross-boundary-classification.sh (Layer B): per-row rule check
+#   - validate-cross-boundary-scope.sh            (Layer A): plan-set builder
+#
+# Empty output is valid (no data rows yet, or table absent entirely).
+parse_cross_boundary_table() {
+    local main_md="$1"
+
+    [[ -f "$main_md" ]] || return 0
+
+    awk '
+        BEGIN { in_section = 0; in_table = 0 }
+
+        # Enter the section when we hit the heading.
+        /^## Cross-Boundary Classification[[:space:]]*$/ {
+            in_section = 1
+            in_table = 0
+            next
+        }
+
+        # Leave the section at the next same-level heading.
+        /^## / && in_section && !/^## Cross-Boundary Classification/ {
+            in_section = 0
+            in_table = 0
+            next
+        }
+
+        !in_section { next }
+
+        # Separator row: |---|---|---| (with optional spaces/colons).
+        /^[[:space:]]*\|[[:space:]]*:?-+:?[[:space:]]*(\|[[:space:]]*:?-+:?[[:space:]]*)+\|?[[:space:]]*$/ {
+            in_table = 1
+            next
+        }
+
+        # Candidate data row: starts with |, at least two more pipes.
+        /^[[:space:]]*\|/ {
+            if (!in_table) {
+                # Header row precedes the separator; skip until we see the separator.
+                next
+            }
+
+            # Split on | ; strip leading/trailing empty fields from outer pipes.
+            # A well-formed row has leading/trailing empty cells plus 3 data cells = 5.
+            # Tolerate missing trailing pipe: 4 cells (lead-empty + 3 data).
+            n = split($0, cells, /\|/)
+            if (n < 4) next
+            path           = cells[2]
+            classification = cells[3]
+            owner          = cells[4]
+
+            # Trim whitespace from each cell.
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", path)
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", classification)
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", owner)
+
+            # Skip the header row (reached here only if separator is absent
+            # or malformed).  Recognize by literal "Path" in first cell.
+            if (path == "Path") next
+
+            # Skip template placeholder rows.
+            if (path == "{path}") next
+            if (path == "TBD") next
+            if (path ~ /during planning/) next
+            if (path == "") next
+
+            # Strip backticks from path.
+            gsub(/`/, "", path)
+
+            printf "%s|%s|%s\n", path, classification, owner
+        }
+    ' "$main_md"
+}

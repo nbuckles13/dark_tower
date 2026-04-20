@@ -5,7 +5,7 @@
 - Integration test infrastructure -> `docs/decisions/adr-0009-integration-test-infrastructure.md`
 - Environment integration tests -> `docs/decisions/adr-0014-environment-integration-tests.md`
 - Validation pipeline (guards, coverage) -> `docs/decisions/adr-0024-agent-teams-workflow.md`, `scripts/guards/run-guards.sh`; alert-rules guard (`--self-test`, fixtures) -> `scripts/guards/simple/validate-alert-rules.sh`, `scripts/guards/simple/fixtures/alert-rules/`
-- Cross-Boundary Ownership Model (Mechanical/Minor/Domain classification + GSA override; classification-failure fixture suite obligation §6.8 #2) -> ADR-0024 §6
+- Cross-Boundary Ownership Model (Mechanical/Minor/Domain classification + GSA override; §6.8 #1 guards = no-fixture policy with PASS/FAIL logged in Implementation Summary → `scripts/guards/simple/validate-cross-boundary-*.sh`; §6.8 #2 classification-failure fixture suite obligation) -> ADR-0024 §6
 - sed-test worked example (three anchors: FU#3a-status Mechanical, FU#3c Minor-judgment co-sign, `jwt.rs` GSA negative) -> `.claude/skills/devloop/review-protocol.md` §sed-Test Worked Example
 - Coverage thresholds -> `.codecov.yml`
 - Client architecture (4-tier testing, test-utils, flaky policy) -> ADR-0028
