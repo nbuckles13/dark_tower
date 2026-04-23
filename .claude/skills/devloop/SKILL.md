@@ -26,7 +26,7 @@ Any implementation work: bug fixes, refactors, new features. For design decision
 
 - **task description**: What to implement (required)
 - **--specialist**: Implementing specialist (optional, auto-detected from task)
-- **--light**: Lightweight mode — 3 teammates, skip planning gate and reflection (see Lightweight Mode)
+- **--light**: Lightweight mode — 3 teammates, skip planning gate (see Lightweight Mode)
 - **--paired-with=\<specialist\>**: Overlay flag — the named specialist actively collaborates during implementation and is an explicit reviewer at Gate 2. Composes with `--light`/full; does not replace routing. Recommended for first-of-N exemplar rollouts (N=1); for N≥4 affected services, use one paired exemplar + remaining-services-as-mechanical-sweep. **Does not exempt Guarded Shared Areas from owner-implements routing** (see §Cross-Boundary Edits below and ADR-0024 §6.5).
 - **--continue**: Reopen a completed devloop to address human review feedback (see Continue Mode)
 
@@ -70,7 +70,7 @@ For small, contained changes (typically 10-30 lines):
 - Operations — for deployment/config changes
 - DRY — for shared code changes
 
-**Skips**: Gate 1 (plan approval), reflection phase
+**Skips**: Gate 1 (plan approval)
 **Keeps**: Full validation pipeline (Gate 2), review verdicts
 
 **Not eligible** (must use full mode):
@@ -155,10 +155,12 @@ RFC-5322 style, parseable by `git interpret-trailers`. Multiple trailers per com
 ```
 SETUP → PLANNING [skipped --light] → GATE 1 [skipped --light] →
 IMPLEMENTATION → GATE 2 (VALIDATION) → REVIEW → GATE 3 (FINAL APPROVAL) →
-REFLECTION [skipped --light] → COMPLETE
+COMMIT → COMPLETE
 ```
 
 Lead has minimal involvement — acts only at the three gates. Teammates drive Planning, Implementation, and Review directly. See Instructions below for each step.
+
+**Story-scope reflection**: per-devloop reflection has moved to the story level. Each user story runs a single reflection pass at story-close time (`/close-story`), where specialists update their `INDEX.md` based on architectural shifts across the story's devloops. The Gate 2 INDEX guard (`validate-knowledge-index.sh`, invoked via `run-guards.sh`) remains the per-devloop safety net for INDEX consistency.
 
 ## Instructions
 
@@ -211,7 +213,7 @@ For security-critical implementations, the implementer should maintain a "Securi
 
 ### Step 3: Spawn Teammates
 
-**Defensive cleanup**: Before creating a new team, check for and clean up any stale team from a previous devloop. If a team already exists, send shutdown requests to all teammates and call `TeamDelete`. This handles cases where a previous devloop was interrupted before Step 8.9.
+**Defensive cleanup**: Before creating a new team, check for and clean up any stale team from a previous devloop. If a team already exists, send shutdown requests to all teammates and call `TeamDelete`. This handles cases where a previous devloop was interrupted before Step 8.5 (Cleanup Team).
 
 **IMPORTANT**: All teammates are spawned using the `subagent_type` parameter in the Task tool, which auto-loads their identity from `.claude/agents/{name}.md`. Do NOT manually read or inject specialist identity files — the agent system handles this.
 
@@ -243,7 +245,6 @@ You are implementing a feature for Dark Tower.
 3. IMPLEMENTATION: Do the work, use SendMessage to ask reviewers if questions arise
 4. When done, use SendMessage to tell @team-lead: "Ready for validation"
 5. REVIEW: Respond to reviewer findings — fix each one or defer with justification (see review protocol for valid/invalid justifications)
-6. REFLECTION: Document learnings when complete
 
 ## Communication
 
@@ -276,7 +277,6 @@ You are a reviewer in a Dark Tower devloop.
 4. REVIEW: Examine the code, send findings to @implementer. Each finding defaults to "fix it."
 5. TRIAGE: If implementer defers a finding with justification, accept or escalate per review protocol.
 6. Use SendMessage to tell @team-lead your verdict: "CLEAR", "RESOLVED", or "ESCALATED: {reason}"
-7. REFLECTION: Document learnings when complete
 
 ## Communication
 
@@ -448,47 +448,13 @@ Track verdicts in main.md:
 - If routed back: return to implementation phase, max 3 review→implementation iterations
 
 **If all CLEAR or RESOLVED**:
-- Update main.md: Phase = reflection (full) or complete (light)
+- Update main.md: Phase = complete
 - Document accepted deferrals as tech debt in main.md (with implementer's justification)
-- Full mode: proceed to reflection (Step 8)
-- Light mode: Skip to Step 9.
+- Proceed to Step 8 (Commit).
 
-### Step 8: Reflection [FULL MODE ONLY]
+### Step 8: Commit
 
-Send the reflection instructions to each teammate individually (unicast, not broadcast):
-
-```
-Reflection: update your INDEX.md at `docs/specialist-knowledge/{your-name}/INDEX.md`.
-
-INDEX.md is a navigation map — pointers to code and ADRs ONLY.
-
-Format: "Topic → `path/to/file.rs:function_name()`" or "Topic → ADR-NNNN"
-
-- Add pointers for new code locations, new ADRs, new integration seams
-- Update pointers for moved/renamed code
-- Remove pointers for deleted code
-
-DO NOT add implementation facts, gotchas, patterns, design decisions,
-review checklists, task status, or date-stamped sections. If something
-feels important but isn't a pointer, put it as a code comment, an ADR,
-or a TODO.md entry instead.
-
-DRY reviewer: duplication findings go in `docs/TODO.md`, not INDEX.
-
-Organize by architectural concept (not by feature or date). Max 75 lines.
-```
-
-Allow 15 minutes for updates.
-
-After reflection, re-run the INDEX guard to catch any issues introduced:
-```bash
-./scripts/guards/simple/validate-knowledge-index.sh
-```
-If it fails, fix the INDEX files before proceeding.
-
-### Step 8.5: Commit
-
-After reflection (full mode) or after review (light mode), stage and commit:
+After review, stage and commit:
 
 1. `git add -A`
 2. Commit with message:
@@ -500,11 +466,11 @@ After reflection (full mode) or after review (light mode), stage and commit:
    Mode: {full|light}
    Verdicts: Security {verdict}, Test {verdict}, ...
 
-   Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+   Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
    ```
 3. If nothing to commit, skip silently
 
-### Step 8.9: Cleanup Team
+### Step 8.5: Cleanup Team
 
 Shut down all teammates and delete the team before completing:
 
@@ -523,9 +489,10 @@ Update main.md:
 - Tech debt section (all accepted deferrals with justifications, plus DRY extraction opportunities, plus any spun-out findings with target devloop slug or "to be scheduled" per review-protocol.md)
 
 If this task is part of a user story, update the Devloop Tracking table
-in the user story file: set Status to Completed, fill in the Devloop
-Output path and commit hash. Include this in the Step 8.5 commit (or
-amend it).
+in the user story file: set Status to Completed and fill in the Devloop
+Output path. Include this update in the Step 8 commit.
+
+Story-scope INDEX updates happen at story-close time, not here — see `/close-story` Phase 2.
 
 Report to user:
 ```
@@ -618,7 +585,6 @@ Follow the standard Implementer workflow + communication rules (see Step 3 Imple
 | Infra failures (L8) | Retry once | Escalate (don't consume attempts) |
 | First-run setup (L8) | ~7 min | Does not count toward attempts |
 | Review→Impl loop | 3 iterations | Escalate |
-| Reflection | 15 min | Proceed without |
 | Human review rounds | 3 per devloop | Escalate ("is this task well-scoped?") |
 
 ## Recovery

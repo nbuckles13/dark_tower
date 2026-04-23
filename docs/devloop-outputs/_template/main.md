@@ -25,7 +25,7 @@
 
 | Field | Value |
 |-------|-------|
-| Phase | `{setup|planning|implementation|review|reflection|complete}` |
+| Phase | `{setup|planning|implementation|review|complete}` |
 | Implementer | `{agent_id or pending}` |
 | Implementing Specialist | `{specialist-name}` |
 | Iteration | `{1-5}` |
@@ -39,8 +39,8 @@
 <!-- LEAD REMINDER:
      - Update this table at EVERY phase transition
      - Capture teammate IDs AS SOON as you spawn them
-     - When phase is review and all reviewers approve, advance to reflection
-     - Only mark complete after ALL reflections are done
+     - When phase is review and all reviewers approve, advance to complete and proceed to Step 8 (Commit)
+     - Only mark complete after Gate 3 approval
      - Use /devloop-status to check state
      - If interrupted, restart the devloop; main.md records start commit for rollback
 -->
@@ -260,12 +260,6 @@ If this devloop needs to be reverted:
 4. Hard reset (clean revert): `git reset --hard {start_commit}`
 5. For schema changes: rollback requires a forward migration — `git reset` alone is insufficient if migrations were applied
 6. For infrastructure changes: may require `skaffold delete` or `kubectl delete -f` if manifests were applied
-
----
-
-## Reflection
-
-TBD
 
 ---
 
