@@ -314,6 +314,23 @@ Update the story file with all sections populated:
 - Clarification questions (answered or pending)
 - Implementation plan (ordered devloop task table)
 
+### Step 10.5: Create Devloop Task List
+
+The lead creates a task for each devloop in the implementation plan, plus a final `/close-story` task that is blocked by all of them. This makes the story's task list self-sequencing: the close-story task becomes available only after every devloop completes.
+
+1. **For each devloop task** in the Implementation Plan table (in order), call `TaskCreate`:
+   - **subject**: `Run /devloop "{task description}" --specialist={specialist-name}`
+   - **description**: Task #N from `docs/user-stories/YYYY-MM-DD-{story-slug}.md`, plus the task's "Covers" field (code, tests, migration, etc.)
+   - Record the returned task ID.
+2. **Set up dependencies**: For each task with entries in the plan's Dependencies column, call `TaskUpdate` with `addBlockedBy: [ids-of-dependency-tasks]` (per the TaskUpdate tool schema; `TaskCreate` has no `blockedBy` parameter — dependencies must be added in a follow-up `TaskUpdate`).
+3. **Create the /close-story task**: Call `TaskCreate` with:
+   - **subject**: `Run /close-story {short-slug}` — `{short-slug}` is the post-date tail of the story filename (e.g. for `docs/user-stories/2026-04-20-billing-portal.md`, use `billing-portal`). The `/close-story` skill glob-matches the filename, so both short and full forms work.
+   - **description**: `Close user story "{story-title}" — verify completeness, run story-scope reflection, commit, push, create/update PR. See .claude/skills/close-story/SKILL.md.`
+4. **Block close-story on all devloops**: Call `TaskUpdate` on the close-story task with `addBlockedBy: [all-devloop-task-ids]`.
+5. **Write task IDs back into the story file**: Update the `Devloop Tracking` table in the story file to add a new `Task ID` column containing each devloop task's ID. Also add a `**Close-Story Task ID**: <id>` line under the story header. This makes the task-to-plan mapping durable across sessions — `/close-story` reads these IDs to enumerate story tasks via `TaskGet` rather than relying on subject-substring matching across the whole task list.
+
+This sequencing ensures the close-story task cannot start until every devloop completes — it is the forcing function for story-scope reflection and PR creation.
+
 ### Step 11: Report and Review
 
 Report to user, then **wait for confirmation** before shutting down. The team stays alive so the user can request adjustments without a full `--continue` respawn.
@@ -349,10 +366,20 @@ Please review the story file. You can request adjustments now, or confirm to fin
 
 Story file: docs/user-stories/YYYY-MM-DD-{slug}.md
 
+Task list: {N} devloop tasks + 1 close-story task ({close-story-task-id}, blocked by all devloops above)
+
 Next step — run devloops in order:
   /devloop "{task 1 description}" --specialist={name}
   /devloop "{task 2 description}" --specialist={name}
   ...
+
+After the final devloop completes, run:
+  /close-story {short-slug}
+
+(post-date tail — e.g. `billing-portal` for `docs/user-stories/2026-04-20-billing-portal.md`. Full `YYYY-MM-DD-` form also accepted.)
+
+The close-story task is the forcing function for story-scope reflection and PR creation — it
+remains blocked until every devloop task is marked completed.
 ```
 
 ## Continue Mode (`--continue`)
