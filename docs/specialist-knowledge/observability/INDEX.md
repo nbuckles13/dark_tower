@@ -6,7 +6,7 @@
 - Client architecture (telemetry, metrics, dashboards, synthetic probe) -> ADR-0028
 - Dashboard metric presentation (counters vs rates, increase/rate classification) -> ADR-0029
 - Host-side cluster helper (observability access, port discovery, health gating, listenAddress fix) -> ADR-0030
-- Metric testability (extraction, MetricAssertion utility, TestHooks bounded scope, coverage ratchet, failure-class table) -> ADR-0032
+- Metric testability (component tests + `MetricAssertion` helper + presence guard) -> ADR-0032
 
 ## Metrics
 - Metric catalogs -> `docs/observability/metrics/ac-service.md`, `docs/observability/metrics/gc-service.md`, `docs/observability/metrics/mc-service.md`, `docs/observability/metrics/mh-service.md`
@@ -62,7 +62,8 @@
 - Metric-to-dashboard coverage -> `scripts/guards/simple/validate-application-metrics.sh`
 - Dashboard-to-kustomize coverage (R-20, bidirectional) -> `scripts/guards/simple/validate-kustomize.sh`
 - Instrument skip_all enforcement -> `scripts/guards/simple/instrument-skip-all.sh`
-- Metric-test coverage ratchet, MetricAssertion utility, TestHooks bounded scope, 4-guard enforcement stack (G1-G4), failure-class table -> ADR-0032
+- Metric-test coverage (src emission vs test reference) -> `scripts/guards/simple/validate-metric-coverage.sh`
+- MetricAssertion test helper (per-thread DebuggingRecorder, snapshot/counter/gauge/histogram asserts) -> `crates/common/src/observability/testing.rs`
 
 ## Env-Test Observability, Cluster Config & Runbooks
 - Per-service deployment + incident response -> `docs/runbooks/` (two per service)

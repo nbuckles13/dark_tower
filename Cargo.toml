@@ -98,6 +98,7 @@ base64 = "0.22"
 
 # Testing
 criterion = "0.5"
+metrics-util = "0.18"
 
 [profile.release]
 opt-level = 3

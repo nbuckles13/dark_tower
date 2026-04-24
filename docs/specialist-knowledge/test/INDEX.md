@@ -9,7 +9,7 @@
 - Coverage thresholds -> `.codecov.yml`
 - Client architecture (4-tier testing, test-utils, flaky policy) -> ADR-0028
 - Host-side cluster helper (env-test execution, URL config, attempt budgets, cluster networking) -> `docs/decisions/adr-0030-host-side-cluster-helper.md`
-- Metric testability (extract + `MetricAssertion` + bounded `TestHooks` + ratchet guards) -> `docs/decisions/adr-0032-metric-testability.md`
+- Metric testability (component tests + `MetricAssertion` + presence guard) -> `docs/decisions/adr-0032-metric-testability.md`
 
 ## Code Locations: AC Service
 - Integration + fault injection tests -> `crates/ac-service/tests/integration/`, `crates/ac-service/tests/fault_injection/`
@@ -71,5 +71,5 @@
 - Env vars + ConfigMap patching → `infra/kind/scripts/setup.sh`; Wrapper → `infra/devloop/devloop.sh`
 
 ## Code Locations: Common & Infrastructure
-- JWT (claims, JwksClient, JwtValidator, round-trip tests) -> `crates/common/src/jwt.rs`; meeting token -> `meeting_token.rs:tests`
+- JWT (claims, JwksClient, JwtValidator, round-trip tests) -> `crates/common/src/jwt.rs`; meeting token -> `meeting_token.rs:tests`; `MetricAssertion` (ADR-0032 Step 2+ entry) -> `observability/testing.rs`
 - MC/MH per-pod Services, ConfigMaps, Kind port mappings → `infra/services/{mc,mh}-service/`; Dev certs → `scripts/generate-dev-certs.sh`

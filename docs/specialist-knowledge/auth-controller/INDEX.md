@@ -8,7 +8,7 @@
 - Integration test infrastructure -> ADR-0009
 - User auth & meeting access claims -> ADR-0020
 - Observability framework -> ADR-0011
-- Metric testability (AC: Tier A + Tier B; no Tier C) -> ADR-0032
+- Metric testability (AC backfill is Cat C test-only; no accept-loop-style work) -> ADR-0032
 
 ## Code Locations
 - Config loading & validation -> `crates/ac-service/src/config.rs:Config::from_vars()`
