@@ -42,6 +42,18 @@
 //! session manager, the provisional timer, and the MC client together, and
 //! that the real `accept_loop` emits the correct metric labels on each
 //! per-connection outcome.
+//!
+//! # Tokio flavor pinning — do not "simplify"
+//!
+//! Every `MetricAssertion`-using test below is pinned to
+//! `#[tokio::test(flavor = "current_thread")]`. This is LOAD-BEARING:
+//! `MetricAssertion` binds a per-thread recorder, and the accept_loop
+//! emits its status counter + handshake histogram from inside a
+//! `tokio::spawn` task. Under `flavor = "multi_thread"` those tasks can
+//! land on a worker thread, the per-thread recorder sees nothing, and
+//! `assert_delta(N)` silently passes as 0. See
+//! `common/src/observability/testing.rs:60-72`. The `mc_notify_*` test
+//! (mock_mc channels, no `MetricAssertion`) is intentionally left unpinned.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -147,7 +159,7 @@ async fn wait_for_active_count(
 // JWT enforcement on the accept path
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn valid_meeting_jwt_connection_accepted_and_tracked() {
     let mc_client = make_mc_client();
     let suite = WtSuite::start(Duration::from_secs(30), mc_client).await;
@@ -193,7 +205,7 @@ async fn valid_meeting_jwt_connection_accepted_and_tracked() {
         .assert_delta(1);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn missing_jwt_stream_closed_before_write_rejects_connection() {
     // The client opens the bi-stream and closes it without sending any bytes.
     // The server's `read_framed_message` fails and the handler returns an
@@ -235,7 +247,7 @@ async fn missing_jwt_stream_closed_before_write_rejects_connection() {
         .assert_delta(0);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn expired_meeting_jwt_rejected_on_wt_accept_path() {
     let mc_client = make_mc_client();
     let suite = WtSuite::start(Duration::from_secs(30), mc_client).await;
@@ -265,7 +277,7 @@ async fn expired_meeting_jwt_rejected_on_wt_accept_path() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn oversized_jwt_rejected_on_wt_accept_path() {
     // JWT payload fits under the 64KB framing cap but exceeds
     // `MAX_JWT_SIZE_BYTES` (8KB) enforced by `MhJwtValidator`. Confirms the
@@ -292,7 +304,7 @@ async fn oversized_jwt_rejected_on_wt_accept_path() {
         .assert_delta(1);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn wrong_token_type_guest_rejected_on_wt_accept_path() {
     // SECURITY INVARIANT: the WT accept path must call `validate_meeting_token`
     // (which enforces `token_type == "meeting"`), NOT `inner.validate` or any
@@ -362,7 +374,7 @@ async fn wrong_token_type_guest_rejected_on_wt_accept_path() {
 // Provisional-timeout enforcement
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn provisional_connection_kicked_after_register_meeting_timeout() {
     // Provisional timeout = 1s. Asserts end-to-end wiring AND the original
     // lower-bound guarantee ("timer does not fire BEFORE ~900ms"):

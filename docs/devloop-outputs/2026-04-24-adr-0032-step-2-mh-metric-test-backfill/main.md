@@ -23,10 +23,10 @@
 
 | Field | Value |
 |-------|-------|
-| Phase | `complete` |
-| Implementer | `implementer@adr-0032-step-2` |
+| Phase | `complete` (iteration 2 — light continue) |
+| Implementer | `implementer@adr-0032-step-2-iter2` |
 | Implementing Specialist | `media-handler` |
-| Iteration | 1 |
+| Iteration | 2 |
 | Security | `security@adr-0032-step-2` |
 | Test | `test@adr-0032-step-2` |
 | Observability | `observability@adr-0032-step-2` |
@@ -182,3 +182,47 @@ Sister metric check: `mh_gc_heartbeats_total` at `gc_client.rs:251-266` has no `
 - **Guard-regex single-line deficiency**: 4 MH multi-line counter!() emissions (`mh_errors_total`, `mh_grpc_requests_total`, `mh_mc_notifications_total`, `mh_token_refresh_failures_total`) are invisible to the guard entirely. Separate small devloop to extend `validate-metric-coverage.sh`.
 - **Cat B extraction as template**: Step 3 MC backfill should mirror `record_token_refresh_metrics` structurally in `crates/mc-service/src/observability/metrics.rs`. @dry-reviewer flagged the 3-service closure-body duplication as a post-Step-4 extraction candidate.
 - **`write_self_signed_pems` extraction candidate**: if Step 3 MC backfill adopts the real-accept-loop component-test pattern (rather than MC's current in-memory `Identity::self_signed` path), the helper moves to `common` or a new shared test-utils crate. @dry-reviewer flagged this during their plan review as a no-action observation for this devloop, logged for Step 3 implementer.
+
+---
+
+## Human Review (Iteration 2) — Tokio flavor explicit
+
+**Date**: 2026-04-24
+**Mode**: `--continue --light`
+**Start Commit**: `79d0c06`
+
+**Feedback from human review of Step 2 reflection**: "Can we change `#[tokio::test]` to something that makes it explicitly do what we want instead of relying on defaults and file comments?"
+
+Reflection analysis confirmed: the implicit `current_thread` default is a silent-failure trap (analogous to the `#[expect]` unfulfilled-expectation case). Yes — change `#[tokio::test]` → `#[tokio::test(flavor = "current_thread")]` on the 4 tests where `MetricAssertion` is used with `tokio::spawn`. Keep the file-header comment, rewritten to explain **why** the flavor is pinned (since the attribute now covers the **what**).
+
+**Scope**: test-only, mechanical.
+- `crates/mh-service/tests/webtransport_accept_loop_integration.rs` — 3 test attributes + header comment rewrite
+- `crates/mh-service/tests/webtransport_integration.rs` — 1 test attribute (`provisional_connection_kicked_after_register_meeting_timeout`, the Pattern-B two-fixed-point timing test)
+
+**Exit criterion**: `cargo test -p mh-service` still 148/148; grep confirms all 4 target attributes carry explicit flavor; guard unchanged (mh-service: 0 uncovered).
+
+**Light-mode team**: implementer (media-handler) + security (structural) + test (context reviewer, natural fit for test-harness change).
+
+### Iteration 2 Review Verdicts
+
+| Reviewer | Verdict | Findings | Fixed | Deferred | Notes |
+|----------|---------|----------|-------|----------|-------|
+| Security | CLEAR | 0 | 0 | 0 | No production code touched; all security-bearing test assertions preserved (wrong_token_type, oversized_jwt, expired_jwt, missing_jwt, capacity-limit, invalid-JWT-reject); no secret/token material in comments; zero Cargo.toml changes. |
+| Test | CLEAR | 0 | 0 | 0 | 9-pin inventory verified (3 accept-loop + 6 webtransport_integration MetricAssertion-using); 2 correctly unpinned (mc_notify mpsc + active_connection_count-only). File-header comments carry the "load-bearing, do not simplify" semantics + explicit mc_notify exemption callout. Zero test-logic changes. 148/148 pass. |
+
+### Iteration 2 Scope Extension
+
+Mid-Gate-2, semantic-guard (Layer 7) flagged a consistency issue: 5 other `MetricAssertion`-using tests in `webtransport_integration.rs` had the same silent-zero vulnerability as the originally-scoped Pattern-B test but were unpinned. Team-lead extended scope: pin all 6 MetricAssertion tests in the file, promote per-test rationale to a file-header comment that also calls out the 2 intentionally-unpinned non-MetricAssertion tests. Final state: 9 pinned total (3 + 6), 2 intentionally unpinned.
+
+### Iteration 2 Gate 2 Validation
+
+| Layer | Verdict | Notes |
+|-------|---------|-------|
+| 1 (cargo check) | PASS | |
+| 2 (cargo fmt) | PASS | |
+| 3 (guards) | EXPECTED-FAIL on validate-metric-coverage | 15/16 pass; mh-service still 0 uncovered (unchanged by this iteration); 67 cross-service interim state. |
+| 4 (workspace test, focused mh) | PASS | 148/148 mh-service; re-run confirmed after scope extension. |
+| 5 (clippy) | PASS | Re-run confirmed after scope extension. |
+| 6 (audit) | PASS | 7 pre-existing advisories unchanged (no dep changes). |
+| 7 (semantic-guard) | SAFE | Flagged the scope-narrowness that drove the extension; post-extension verdict unchanged. |
+| 8 (env-tests) | SKIPPED | Test-only, no service runtime behavior change. Same justification as Iteration 1 + Step 1. |
