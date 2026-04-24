@@ -22,3 +22,9 @@ pub mod token_manager;
 
 /// Shared types for internal meeting/guest token requests (GC <-> AC)
 pub mod meeting_token;
+
+/// Observability utilities shared across services.
+///
+/// The `observability::testing` submodule is only compiled when `cfg(test)`
+/// is active or the `test-utils` feature is enabled.
+pub mod observability;

@@ -11,8 +11,11 @@ workspace = true
 
 [features]
 default = []
-# Enable test utilities (e.g., TokenReceiver::from_test_channel)
-test-utils = []
+# Enable test utilities (e.g., TokenReceiver::from_test_channel,
+# MetricAssertion at `observability::testing`). The test-utils feature
+# is NOT default-enabled so production builds of consumer services do
+# not pull in test-only dependencies (metrics facade, metrics-util).
+test-utils = ["dep:metrics", "dep:metrics-util"]
 
 [dependencies]
 # Workspace dependencies
@@ -35,9 +38,18 @@ jsonwebtoken = { workspace = true }
 # HTTP client for token management
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
+# Test-only deps, gated behind the `test-utils` feature.
+# Used exclusively by `observability::testing::MetricAssertion`.
+metrics = { version = "0.24", optional = true }
+metrics-util = { workspace = true, optional = true }
+
 [dev-dependencies]
 criterion = { workspace = true }
 serde_json = { workspace = true }
 wiremock = "0.6"
 ring = { workspace = true }
 jsonwebtoken = { workspace = true }
+# For MetricAssertion's own in-file unit tests (module is cfg(test)-visible
+# without needing the test-utils feature to be enabled for `cargo test -p common`).
+metrics = "0.24"
+metrics-util = { workspace = true }

@@ -61,7 +61,7 @@
 - Metrics catalog (creation + join) -> `docs/observability/metrics/gc-service.md`
 
 ### Metric testability (ADR-0032)
-- Uncovered sites (~21/186): `main.rs:127` token-refresh closure (Cat B); `handlers/meetings.rs` error branches (validation direct-call / pg-error-code real-DB+fault / non-DB repo-trait); `mh_selection.rs` deeply-nested; `grpc/auth_layer.rs:250` wrapper-only. No Tier C (GC spawns at `main.rs:180/199/207` are lifecycle, not fire-and-forget). SLO: 11% → <6% by 2026-07 → <3% by 2026-10
+- Uncovered sites (~21/186): `main.rs:127` token-refresh closure (Cat B extraction); `handlers/meetings.rs` error branches (validation direct-call / pg-error-code real-DB+fault / non-DB repo-trait); `mh_selection.rs` deeply-nested; `grpc/auth_layer.rs:250` wrapper-only. GC spawns at `main.rs:180/199/207` are lifecycle, not fire-and-forget (no accept-loop-style backfill needed). SLO: 11% → <6% by 2026-07 → <3% by 2026-10
 
 ### Join endpoint test coverage (R-18)
 - Auth: 401 no token, 401 expired, 401 service token, 401 wrong key/alg/tampered

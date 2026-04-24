@@ -4,7 +4,7 @@
 - MC architecture, actor model, session binding, capacity → ADR-0023
 - User auth, meeting access, join flow → ADR-0020
 - Observability pattern (metrics crate facade) → ADR-0011
-- Metric testability (extraction, `MetricAssertion`, `TestHooks`, rollout SLO) → ADR-0032
+- Metric testability (component tests, `MetricAssertion`, presence guard, rollout SLO) → ADR-0032
 
 ## Code Locations
 - Service entry point → `crates/mc-service/src/main.rs`
@@ -15,7 +15,7 @@
 - Actor: meeting (participants, grace period) → `crates/mc-service/src/actors/meeting.rs`
 - Actor: messages (inter-actor types, JoinConnection, JoinResult) → `crates/mc-service/src/actors/messages.rs`
 - Actor: participant (per-participant, disconnect notify) → `crates/mc-service/src/actors/participant.rs`
-- WebTransport: server (accept loop, TLS, capacity, metric sites rejected:178/accepted:183/error:209 — ADR-0032 Tier C pending) → `crates/mc-service/src/webtransport/server.rs`
+- WebTransport: server (accept loop, TLS, capacity, metric sites rejected:178/accepted:183/error:209 — ADR-0032 accept-loop component-test backfill pending) → `crates/mc-service/src/webtransport/server.rs`
 - WebTransport: connection (join flow, bridge loop, MediaConnectionFailed R-20) → `crates/mc-service/src/webtransport/connection.rs`
 - WebTransport: async RegisterMeeting trigger (R-12, first participant) → `crates/mc-service/src/webtransport/connection.rs:register_meeting_with_handlers()`
 - WebTransport: handler (encode_participant_update) → `crates/mc-service/src/webtransport/handler.rs`
@@ -59,7 +59,7 @@
 ## Testing
 - GC integration tests (mock server) → `crates/mc-service/tests/gc_integration.rs`
 - Heartbeat task tests → `crates/mc-service/tests/heartbeat_tasks.rs`
-- Join flow integration tests (WebTransport + mock MH store; `TestServer::accept_loop` fork at :213-246 — ADR-0032 Tier C pending deletion) → `crates/mc-service/tests/join_tests.rs`
+- Join flow integration tests (WebTransport + mock MH store; `TestServer::accept_loop` fork at :213-246 — deleted once accept-loop component test lands, ADR-0032 phasing step 3) → `crates/mc-service/tests/join_tests.rs`
 - Test utilities (mock GC/Redis/MH) → `crates/mc-test-utils/src/`
 - Env-tests MC-GC integration → `crates/env-tests/tests/22_mc_gc_integration.rs`
 

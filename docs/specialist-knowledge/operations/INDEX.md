@@ -4,12 +4,12 @@
 - Infra (Kind, zero-trust) → ADR-0012; Local dev → ADR-0013; Env tests → ADR-0014
 - Guard pipeline → ADR-0015; CI gates → ADR-0024; Containerized devloop → ADR-0025
 - Host-side cluster helper → ADR-0030; Dashboard metrics (counters vs rates) → ADR-0029
-- Metric testability (ratchet, Cat A/B/C rollout, raw `/metrics` evidence, per-service SLO sub-targets, TestHooks MUST for ops-critical signals) → ADR-0032
+- Metric testability (single presence guard, Cat A/B/C rollout, raw `/metrics` evidence, per-service SLO sub-targets) → ADR-0032
 
 ## CI & Guards
 - CI pipeline → `.github/workflows/ci.yml`; runner + common → `scripts/guards/run-guards.sh`, `common.sh`
 - Kustomize → `scripts/guards/simple/validate-kustomize.sh`; app metrics (metric↔dashboard) → `validate-application-metrics.sh`
-- Metric coverage ratchet (G1, planned): baseline keyed on `(file:line, metric, label_tuple)`, monotonic shrink, status JSON + stall policy (4wk → ticket, 2 windows → escalate) → ADR-0032
+- Metric-test coverage guard (`validate-metric-coverage.sh`, single presence check; lead sequences per-service backfill PRs during phasing window) → ADR-0032
 
 ## Devloop Cluster Helper
 - Kind config template (envsubst, host-gateway listenAddress) → `infra/kind/kind-config.yaml.tmpl`

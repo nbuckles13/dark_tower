@@ -9,20 +9,21 @@
 | | Count | % |
 |---|---|---|
 | Total recording sites (AC+GC+MC+MH) | 778 | 100% |
-| Covered (unit + integration) | ~520 | 67% |
+| Covered (unit + integration) | ~521 | 67% |
 | Wrapper-only (wrapper unit-tested, call site not exercised end-to-end) | ~40 | 5% |
-| Uncovered (no test reaches the code path) | ~218 | 28% |
+| Uncovered (no test reaches the code path) | ~217 | 28% |
 
 The MH `accept_loop` gap is **not an outlier** — it is a representative case of a structural pattern present in every service.
 
 ## Per-service breakdown
 
 ### AC (Auth Controller) — 189 sites
-- ~130 covered, ~18 wrapper-only, ~41 uncovered
+- ~131 covered, ~18 wrapper-only, ~40 uncovered
 - Concentrations:
   - `services/key_management_service.rs`, `services/registration_service.rs`, `handlers/admin_handler.rs` — error branches in admin/key rotation
-  - `main.rs:114-117` — token refresh callback (closure inside `TokenManager::on_refresh`)
   - `record_audit_log_failure` (19 call sites) wrapper-only — wrapper tested, no test exercises the failure paths that call it
+
+> **Correction 2026-04-20**: Earlier draft of this section listed AC `main.rs:114-117` as a Pattern #2 token-refresh callback. Verified against source: those lines are `key_management_service::init_key_metrics(&db_pool)`, NOT a `TokenManager::on_refresh` closure. AC `main.rs` has no `with_on_refresh` call — AC has no Pattern #2 sites. AC uncovered count adjusted by -1 (~41 → ~40). ADR-0032 §Per-service SLO sub-targets unchanged; 1-site delta is within SLO noise.
 
 ### GC (Global Controller) — 186 sites
 - ~140 covered, ~25 wrapper-only, ~21 uncovered
@@ -49,7 +50,7 @@ The MH `accept_loop` gap is **not an outlier** — it is a representative case o
 
 1. **Accept loops are systematically uncovered (MH + MC).** Same root cause in both services: production `accept_loop` spawns connection handlers as fire-and-forget tasks and drops `Result`. Tests need the `MhError`/`McError` variants, so they bypass the loop entirely (`WtRig` for MH, `join_tests.rs` for MC). The accept-loop metrics (rejected/accepted/error counters, active-connections gauge) are unreachable.
 
-2. **Token manager refresh callbacks are untested (AC, GC, MC).** Each `main.rs` registers a closure with `TokenManager::on_refresh` that records refresh-success/failure metrics. No test drives a full token refresh cycle, so the callback's metric calls never fire in CI.
+2. **Token manager refresh callbacks are untested (GC, MC, MH).** Each `main.rs` registers a closure with `TokenManager::with_on_refresh` that records refresh-success/failure metrics. No test drives a full token refresh cycle, so the callback's metric calls never fire in CI. Pattern #2 services (verified 2026-04-17 against source): GC (`crates/gc-service/src/main.rs:124`), MC (`crates/mc-service/src/main.rs:147`), MH (`crates/mh-service/src/main.rs:114`). AC has no `with_on_refresh` call.
 
 3. **Repository error branches have wrapper-only coverage (GC).** DB query metrics record on both success and error. Happy paths hit by integration tests; error cases need DB state corruption or mock failures and aren't exercised.
 
