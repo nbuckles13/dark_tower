@@ -1,9 +1,11 @@
-// current_thread flavor is load-bearing: `MetricAssertion` is per-thread,
-// and the handshake histogram + gauge write + status counter emit inside
-// a `tokio::spawn` task. Under current_thread those tasks run on the test
-// thread so the per-thread recorder captures them; under
-// `flavor = "multi_thread"` the tasks could run on a worker thread and the
-// emissions would be invisible. See common/src/observability/testing.rs:60-72.
+// Every `#[tokio::test]` in this file is pinned to `flavor = "current_thread"`
+// and that pinning is LOAD-BEARING — do not "simplify" it away. `MetricAssertion`
+// binds a per-thread recorder at snapshot time; the handshake histogram, gauge
+// write, and accept-path status counter all emit from inside a `tokio::spawn`
+// task. On `current_thread` those tasks share the test thread so the recorder
+// captures them; on `flavor = "multi_thread"` they land on worker threads and
+// the assertions silently observe zero (and `assert_delta(1)` passes as 0
+// without error). See common/src/observability/testing.rs:60-72.
 //
 //! Component tests for the real `WebTransportServer::accept_loop`.
 //!
@@ -103,7 +105,7 @@ async fn wait_for_active_count(
 // Accept-path status labels: `accepted` | `rejected` | `error`
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn accept_loop_emits_accepted_status_and_handshake_observation_on_happy_path() {
     // Valid JWT + pre-registered meeting → handler completes the handshake,
     // promotes the connection, and holds it open. Observations:
@@ -152,7 +154,7 @@ async fn accept_loop_emits_accepted_status_and_handshake_observation_on_happy_pa
         .assert_value_in_range(1.0..=2.0);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn accept_loop_emits_rejected_status_when_at_capacity() {
     // `max_connections = 1`. Open conn #1 (valid JWT, pre-registered meeting)
     // and hold it live. Open conn #2 — accept_loop sees `active_connections
@@ -202,7 +204,7 @@ async fn accept_loop_emits_rejected_status_when_at_capacity() {
         .assert_delta(1);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn accept_loop_emits_error_status_when_handler_returns_err() {
     // Valid handshake to the WT layer but invalid JWT — handler reaches step
     // 4 and returns `Err(MhError::JwtValidation(_))`. accept_loop emits
