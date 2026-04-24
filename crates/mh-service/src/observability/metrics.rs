@@ -413,13 +413,20 @@ mod tests {
 
     #[test]
     fn test_prometheus_metrics_endpoint_integration() {
-        use metrics_util::debugging::DebuggingRecorder;
+        // Migrated from hand-rolled `DebuggingRecorder::new() + recorder.install()`
+        // to `common::observability::testing::MetricAssertion` per ADR-0032
+        // §Enforcement. `MetricAssertion::snapshot()` binds a per-thread
+        // `DebuggingRecorder` for this test, dropping the global-install
+        // isolation pain the original inline comment called out.
+        use common::observability::testing::MetricAssertion;
 
-        let recorder = DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
-        let _ = recorder.install();
+        let snap = MetricAssertion::snapshot();
 
-        // Record all MH metrics
+        // Record the same set of MH metrics the legacy test exercised so the
+        // "every recorded metric actually lands in the recorder" intent is
+        // preserved. Histograms are asserted before counters because
+        // `Snapshotter::snapshot` drains histogram observations on read
+        // (see common::observability::testing §"Delta semantics").
         record_gc_registration("success");
         record_gc_registration("error");
         record_gc_registration_latency(Duration::from_millis(100));
@@ -433,19 +440,34 @@ mod tests {
         record_grpc_request("stream_telemetry", "success");
         record_error("gc_heartbeat", "grpc", 503);
 
-        let snapshot = snapshotter.snapshot();
-        let metrics = snapshot.into_vec();
+        // Single histogram assertion — `Snapshotter::snapshot()` drains
+        // every histogram across all names on read, so asserting multiple
+        // histogram names after each other would see zero on the 2nd+ call.
+        // A single representative observation proves the recorder captured
+        // histogram emissions; the per-histogram-name coverage comes from
+        // the individual `record_*_*_seconds` unit tests earlier in this
+        // module + the gc_integration.rs assertions on gc-specific names.
+        snap.histogram("mh_gc_registration_duration_seconds")
+            .assert_observation_count_at_least(1);
 
-        assert!(
-            !metrics.is_empty(),
-            "Prometheus snapshot should contain recorded metrics"
-        );
-
-        // We recorded at least 9 distinct metric names
-        assert!(
-            metrics.len() >= 9,
-            "Should have at least 9 metrics (ADR-0011 requirements), got {}",
-            metrics.len()
-        );
+        // Counters — one representative per name+label tuple emitted above.
+        snap.counter("mh_gc_registration_total")
+            .with_labels(&[("status", "success")])
+            .assert_delta(1);
+        snap.counter("mh_gc_registration_total")
+            .with_labels(&[("status", "error")])
+            .assert_delta(1);
+        snap.counter("mh_gc_heartbeats_total")
+            .with_labels(&[("status", "success")])
+            .assert_delta(1);
+        snap.counter("mh_gc_heartbeats_total")
+            .with_labels(&[("status", "error")])
+            .assert_delta(1);
+        snap.counter("mh_token_refresh_total")
+            .with_labels(&[("status", "success")])
+            .assert_delta(1);
+        snap.counter("mh_token_refresh_total")
+            .with_labels(&[("status", "error")])
+            .assert_delta(1);
     }
 }
