@@ -2,7 +2,7 @@
 //!
 //! Uses `with_no_cert_validation()` on the client to accept the test rig's
 //! self-signed server cert. This is a client-only relaxation; the server TLS
-//! code path is the production one (see `wt_rig::WtRig`).
+//! code path is the production one (see `accept_loop_rig::AcceptLoopRig`).
 
 use wtransport::{ClientConfig, Endpoint};
 
