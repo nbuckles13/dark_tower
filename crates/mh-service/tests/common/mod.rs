@@ -25,14 +25,19 @@
 
 // Test-helper modules are consumed selectively by each integration test
 // binary, so some items are unused from any individual binary's perspective.
-#![allow(dead_code, clippy::too_many_arguments)]
+#![allow(
+    dead_code,
+    clippy::too_many_arguments,
+    clippy::unwrap_used,
+    clippy::expect_used
+)]
 
+pub mod accept_loop_rig;
 pub mod grpc_rig;
 pub mod jwks_rig;
 pub mod mock_mc;
 pub mod tokens;
 pub mod wt_client;
-pub mod wt_rig;
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
