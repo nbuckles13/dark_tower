@@ -34,27 +34,19 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use common::observability::testing::MetricAssertion;
-use common::secret::SecretString;
-use common::token_manager::TokenReceiver;
 use mh_service::auth::MhJwtValidator;
 use mh_service::grpc::McClient;
 use mh_service::session::{MeetingRegistration, SessionManagerHandle};
-use tokio::sync::watch;
 
 use test_common::accept_loop_rig::AcceptLoopRig;
 use test_common::jwks_rig::JwksRig;
+use test_common::test_token_receiver;
 use test_common::tokens::{mint_expired_meeting_token, mint_meeting_token};
 use test_common::wt_client::{connect_and_open_bi, write_framed};
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-fn test_token_receiver() -> TokenReceiver {
-    let (tx, rx) = watch::channel(SecretString::from("test-service-token"));
-    std::mem::forget(tx);
-    TokenReceiver::from_test_channel(rx)
-}
 
 fn make_mc_client() -> Arc<McClient> {
     Arc::new(McClient::new(test_token_receiver()))

@@ -8,21 +8,11 @@
 #[path = "common/mod.rs"]
 mod test_common;
 
-use common::secret::SecretString;
-use common::token_manager::TokenReceiver;
 use mh_service::errors::MhError;
 use mh_service::grpc::McClient;
-use tokio::sync::watch;
 
 use test_common::mock_mc::{start_mock_mc_server, MockBehavior, MockMcServer};
-
-/// Create a mock `TokenReceiver` for testing.
-fn mock_token_receiver() -> TokenReceiver {
-    let (tx, rx) = watch::channel(SecretString::from("test-service-token"));
-    // Keep sender alive by leaking it (test only).
-    std::mem::forget(tx);
-    TokenReceiver::from_test_channel(rx)
-}
+use test_common::test_token_receiver;
 
 // ============================================================================
 // Tests
@@ -33,7 +23,7 @@ async fn test_notify_connected_success() {
     let mc = start_mock_mc_server(MockMcServer::new(MockBehavior::Accept)).await;
 
     let mc_url = format!("http://{}", mc.addr);
-    let client = McClient::new(mock_token_receiver());
+    let client = McClient::new(test_token_receiver());
 
     let result = client
         .notify_participant_connected(&mc_url, "meeting-1", "user-1", "mh-1")
@@ -47,7 +37,7 @@ async fn test_notify_disconnected_success() {
     let mc = start_mock_mc_server(MockMcServer::new(MockBehavior::Accept)).await;
 
     let mc_url = format!("http://{}", mc.addr);
-    let client = McClient::new(mock_token_receiver());
+    let client = McClient::new(test_token_receiver());
 
     let result = client
         .notify_participant_disconnected(&mc_url, "meeting-1", "user-1", "mh-1", 1)
@@ -65,7 +55,7 @@ async fn test_retry_succeeds_after_transient_failure() {
     .await;
 
     let mc_url = format!("http://{}", mc.addr);
-    let client = McClient::new(mock_token_receiver());
+    let client = McClient::new(test_token_receiver());
 
     let result = client
         .notify_participant_connected(&mc_url, "meeting-1", "user-1", "mh-1")
@@ -83,7 +73,7 @@ async fn test_retry_exhaustion_after_max_attempts() {
     .await;
 
     let mc_url = format!("http://{}", mc.addr);
-    let client = McClient::new(mock_token_receiver());
+    let client = McClient::new(test_token_receiver());
 
     let result = client
         .notify_participant_connected(&mc_url, "meeting-1", "user-1", "mh-1")
@@ -100,7 +90,7 @@ async fn test_unauthenticated_error_skips_retry() {
     let mc = start_mock_mc_server(MockMcServer::new(MockBehavior::Unauthenticated)).await;
 
     let mc_url = format!("http://{}", mc.addr);
-    let client = McClient::new(mock_token_receiver());
+    let client = McClient::new(test_token_receiver());
 
     let result = client
         .notify_participant_connected(&mc_url, "meeting-1", "user-1", "mh-1")
@@ -118,7 +108,7 @@ async fn test_permission_denied_skips_retry() {
     let mc = start_mock_mc_server(MockMcServer::new(MockBehavior::PermissionDenied)).await;
 
     let mc_url = format!("http://{}", mc.addr);
-    let client = McClient::new(mock_token_receiver());
+    let client = McClient::new(test_token_receiver());
 
     let result = client
         .notify_participant_disconnected(&mc_url, "meeting-1", "user-1", "mh-1", 1)
