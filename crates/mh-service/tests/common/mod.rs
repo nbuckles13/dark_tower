@@ -40,11 +40,28 @@ pub mod tokens;
 pub mod wt_client;
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use common::secret::SecretString;
+use common::token_manager::TokenReceiver;
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use ring::signature::{Ed25519KeyPair, KeyPair};
 use serde::Serialize;
+use tokio::sync::watch;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+
+/// Build a leak-once `TokenReceiver` seeded with a dummy service token.
+///
+/// The `watch::Sender` is leaked (`std::mem::forget`) for process lifetime —
+/// tests never need token rotation, so keeping the sender live via leak is
+/// simpler than threading a cancel handle through every suite. Consolidated
+/// here so `webtransport_integration.rs`,
+/// `webtransport_accept_loop_integration.rs`, and `mc_client_integration.rs`
+/// share one definition (ADR-0019: per @dry-reviewer Finding #1, Step 2).
+pub fn test_token_receiver() -> TokenReceiver {
+    let (tx, rx) = watch::channel(SecretString::from("test-service-token"));
+    std::mem::forget(tx);
+    TokenReceiver::from_test_channel(rx)
+}
 
 /// Deterministic Ed25519 keypair for signing JWTs and publishing JWKs.
 ///

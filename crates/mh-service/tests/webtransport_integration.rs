@@ -43,17 +43,16 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use common::observability::testing::MetricAssertion;
-use common::secret::SecretString;
-use common::token_manager::TokenReceiver;
 use mh_service::auth::MhJwtValidator;
 use mh_service::grpc::McClient;
 use mh_service::session::SessionManagerHandle;
 use proto_gen::internal::DisconnectReason;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::mpsc;
 
 use test_common::accept_loop_rig::AcceptLoopRig;
 use test_common::jwks_rig::JwksRig;
 use test_common::mock_mc::{start_mock_mc_server, MockBehavior, MockMcServer};
+use test_common::test_token_receiver;
 use test_common::tokens::{
     mint_expired_meeting_token, mint_meeting_token, mint_wrong_token_type_token,
 };
@@ -62,13 +61,6 @@ use test_common::wt_client::{connect_and_open_bi, write_framed};
 // ---------------------------------------------------------------------------
 // Rig builder
 // ---------------------------------------------------------------------------
-
-fn test_token_receiver() -> TokenReceiver {
-    let (tx, rx) = watch::channel(SecretString::from("test-service-token"));
-    // Keep the sender alive for the process lifetime (test only).
-    std::mem::forget(tx);
-    TokenReceiver::from_test_channel(rx)
-}
 
 struct WtSuite {
     jwks: JwksRig,
