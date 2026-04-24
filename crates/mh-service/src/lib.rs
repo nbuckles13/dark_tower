@@ -30,4 +30,5 @@ pub mod errors;
 pub mod grpc;
 pub mod observability;
 pub mod session;
+pub mod token_refresh_metrics;
 pub mod webtransport;
