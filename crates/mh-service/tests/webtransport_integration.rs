@@ -54,7 +54,9 @@ use tokio::sync::{mpsc, watch};
 use test_common::accept_loop_rig::AcceptLoopRig;
 use test_common::jwks_rig::JwksRig;
 use test_common::mock_mc::{start_mock_mc_server, MockBehavior, MockMcServer};
-use test_common::tokens::{mint_expired_meeting_token, mint_meeting_token};
+use test_common::tokens::{
+    mint_expired_meeting_token, mint_meeting_token, mint_wrong_token_type_token,
+};
 use test_common::wt_client::{connect_and_open_bi, write_framed};
 
 // ---------------------------------------------------------------------------
@@ -289,19 +291,71 @@ async fn oversized_jwt_rejected_on_wt_accept_path() {
         .assert_delta(1);
 }
 
-// Note: the former `wrong_token_type_guest_rejected_on_wt_accept_path` test
-// is retired under ADR-0032. The refactor-guard it protected
-// (`validate_meeting_token` rejects `token_type != "meeting"`) is covered at
-// unit tier by `crates/mh-service/src/auth/mod.rs::tests` —
-// `test_validate_meeting_token_rejects_wrong_token_type` and
-// `test_validate_meeting_token_rejects_guest_token` both exercise the
-// in-validator `token_type` check directly. `MhJwtValidator::inner` is a
-// private field (auth/mod.rs:32), so `connection.rs` can only reach the
-// validator via `validate_meeting_token`; the public-API surface is
-// structurally guarded by the unit-tier matrix. The accept-path wiring —
-// that `validate_meeting_token` is actually invoked on the WT accept path —
-// is covered by the `expired` / `oversized` tests above via
-// `mh_jwt_validations_total{result=failure, token_type=meeting, failure_reason=validation_failed}`.
+#[tokio::test]
+async fn wrong_token_type_guest_rejected_on_wt_accept_path() {
+    // SECURITY INVARIANT: the WT accept path must call `validate_meeting_token`
+    // (which enforces `token_type == "meeting"`), NOT `inner.validate` or any
+    // hypothetical permissive variant. A correctly-signed guest-typed token
+    // must NOT admit the bearer — not at validation, not at session
+    // registration.
+    //
+    // Authoritative unit-tier guard on `validate_meeting_token`'s contract:
+    // `crates/mh-service/src/auth/mod.rs::tests::test_validate_meeting_token_rejects_guest_token`.
+    // This component-tier test adds the DISTINGUISHING signal: if a future
+    // refactor edits `connection.rs:110` to call a permissive method (or
+    // makes `MhJwtValidator::inner` crate-visible and calls it directly), the
+    // guest token would promote to the session manager and
+    // `active_connection_count` would transition from 0 to 1. Neither the
+    // metric-label assertion (labels at `connection.rs:112,122` are
+    // string-literal and don't depend on which validator method was called)
+    // nor the unit-tier matrix catch that class of call-site refactor. The
+    // session-manager state assertion below does.
+    let mc_client = make_mc_client();
+    let suite = WtSuite::start(Duration::from_secs(30), mc_client).await;
+
+    // Pre-register the meeting so that IF validation were bypassed, the
+    // handler would proceed straight to `add_connection` (state transition
+    // 0 → 1), not `add_pending_connection`. Makes the negative signal
+    // unambiguous.
+    suite
+        .session_manager
+        .register_meeting(
+            "meeting-wt-guest".to_string(),
+            mh_service::session::MeetingRegistration {
+                mc_id: "mc-wt-guest".to_string(),
+                mc_grpc_endpoint: "http://localhost:1".to_string(),
+                registered_at: Instant::now(),
+            },
+        )
+        .await;
+
+    let snap = MetricAssertion::snapshot();
+    let token = mint_wrong_token_type_token(&suite.jwks.keypair, "meeting-wt-guest");
+    let (_conn, _send, _recv) = connect_and_send_jwt(&suite.wt.url, &token).await;
+
+    // Give the handler time to run through validation and the accept_loop
+    // to observe the spawned task's Err exit.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    snap.counter("mh_jwt_validations_total")
+        .with_labels(&[
+            ("result", "failure"),
+            ("token_type", "meeting"),
+            ("failure_reason", "validation_failed"),
+        ])
+        .assert_delta(1);
+    snap.counter("mh_webtransport_connections_total")
+        .with_labels(&[("status", "error")])
+        .assert_delta(1);
+
+    // Distinguishing signal — if this transitions to 1, the token-type
+    // check was bypassed at the call site.
+    assert_eq!(
+        suite.session_manager.active_connection_count().await,
+        0,
+        "guest token reached session manager — validate_meeting_token was bypassed or a permissive variant was called",
+    );
+}
 
 // ---------------------------------------------------------------------------
 // Provisional-timeout enforcement
