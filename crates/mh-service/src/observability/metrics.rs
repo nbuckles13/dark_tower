@@ -424,17 +424,22 @@ mod tests {
 
     #[test]
     fn test_prometheus_metrics_endpoint_integration() {
-        // This is an ADR-0011 plumbing test (verifies every `record_*` wrapper
-        // actually emits to the installed recorder), NOT an ADR-0032 coverage
-        // assertion. Calling the `record_*` fns directly in the test body is
-        // the test's POINT — it's exercising the `counter!`/`histogram!`
-        // macro wrapping plumbing, not the upstream production call sites
-        // (those are covered by the ADR-0032 per-caller component tests in
-        // `tests/gc_integration.rs`, `tests/webtransport_integration.rs`, etc.).
+        // NOT an ADR-0032 coverage assertion — this test pre-dates ADR-0032
+        // and lives in `src/` (outside the guard's `tests/**/*.rs` scan), so
+        // the `record_*` calls here are NOT the "test-side reference to a
+        // production emission path" the guard is designed to catch. This is
+        // an ADR-0011 plumbing test: it exercises every `record_*` wrapper
+        // to verify the `counter!`/`histogram!` macro + recorder + exporter
+        // wiring captures emissions (the guard's coverage-fidelity
+        // requirement is separately met by the per-caller component tests in
+        // `crates/mh-service/tests/*.rs` — `gc_integration.rs`,
+        // `webtransport_integration.rs`, `webtransport_accept_loop_integration.rs`,
+        // etc.). Future readers: do NOT propagate "test-body `record_*`" to
+        // `crates/mh-service/tests/`; that DOES dodge the guard.
         //
         // Migrated from hand-rolled `DebuggingRecorder::new() + recorder.install()`
-        // to `common::observability::testing::MetricAssertion` as a ride-along
-        // DRY cleanup (removes one of two hand-rolled-install sites tracked in
+        // to `common::observability::testing::MetricAssertion` purely as DRY
+        // cleanup (removes one of two hand-rolled-install sites tracked in
         // `docs/TODO.md`). `MetricAssertion::snapshot()` binds a per-thread
         // `DebuggingRecorder` for this test, dropping the global-install
         // isolation pain the original inline comment called out.

@@ -28,9 +28,14 @@
 //!   at 0 catches call-site refactors that would bypass validation (e.g.,
 //!   a future permissive-method swap at `connection.rs:110`). See the test's
 //!   own body comment for the full invariant.
-//! - `session/mod.rs::tests` covers `SessionManagerHandle` state transitions,
-//!   including the provisional-timer lower-bound behaviour — the component
-//!   tier here only asserts end-to-end wiring and upper-bound enforcement.
+//! - `session/mod.rs::tests` covers `SessionManagerHandle` state transitions
+//!   (pending → active promotion, removal, active counts). The provisional
+//!   timer itself lives in `connection.rs` via `tokio::time::sleep(...)`
+//!   and is asserted at component tier only. The component test
+//!   `provisional_connection_kicked_after_register_meeting_timeout` below
+//!   covers both bounds via the two-fixed-point pattern: lower-bound
+//!   (counter still 0 at 800ms, timer did not fire early) and upper-bound
+//!   (counter reaches 1 within 3000ms, timer did fire in bounded time).
 //! - `mc_client_integration.rs` covers `McClient` retry semantics.
 //!
 //! This file proves the *accept path* actually wires the validator, the
