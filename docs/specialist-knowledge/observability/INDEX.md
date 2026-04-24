@@ -63,7 +63,7 @@
 - Dashboard-to-kustomize coverage (R-20, bidirectional) -> `scripts/guards/simple/validate-kustomize.sh`
 - Instrument skip_all enforcement -> `scripts/guards/simple/instrument-skip-all.sh`
 - Metric-test coverage (src emission vs test reference) -> `scripts/guards/simple/validate-metric-coverage.sh`
-- MetricAssertion test helper (per-thread DebuggingRecorder, snapshot/counter/gauge/histogram asserts) -> `crates/common/src/observability/testing.rs`
+- MetricAssertion test helper (per-thread DebuggingRecorder; drain-order rule — first `.assert_*()` of any kind drains histograms globally via internal `Snapshotter::snapshot()`, so histogram assertions MUST come first in a mixed-kind snapshot; counter/gauge re-reads stay idempotent — see §"Delta semantics") -> `crates/common/src/observability/testing.rs`
 
 ## Env-Test Observability, Cluster Config & Runbooks
 - Per-service deployment + incident response -> `docs/runbooks/` (two per service)
@@ -72,4 +72,5 @@
 ## Test Coverage & Integration Seams
 - Per-service metrics tests -> `crates/gc-service/src/observability/metrics.rs`, `crates/mc-service/src/observability/metrics.rs`, `crates/mh-service/src/observability/metrics.rs`
 - MH integration rigs exercising metric-emitting paths (JWT, MC-notify, handshake, caller-type) -> `crates/mh-service/tests/` (auth_layer, register_meeting, webtransport integration; shared rigs under `common/`)
-- Observability coverage gaps / follow-ups -> `docs/specialist-knowledge/observability/TODO.md`
+- MH accept-loop component-test pattern (ADR-0032 Step 2 canonical template — real `WebTransportServer::bind()`+`accept_loop()` byte-identical to production, rcgen-PEMs-on-disk, no `results_rx`; `#[tokio::test]` current-thread flavor + live-connection hold + histogram-first are load-bearing; `accepted`/`rejected`/`error` via `MetricAssertion` + `SessionManagerHandle` + companion `mh_jwt_validations_total` labels) -> `crates/mh-service/tests/common/accept_loop_rig.rs`, `crates/mh-service/tests/webtransport_accept_loop_integration.rs`; Cat B token-refresh extraction -> `crates/mh-service/src/observability/metrics.rs:record_token_refresh_metrics()`
+- Observability coverage gaps / follow-ups -> `docs/TODO.md` §Observability Debt

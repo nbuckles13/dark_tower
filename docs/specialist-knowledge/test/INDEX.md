@@ -1,15 +1,14 @@
 # Test Navigation
 
 ## Architecture & Design
-- Integration testing strategy -> `docs/decisions/adr-0005-integration-testing-strategy.md`
-- Fuzz testing -> `docs/decisions/adr-0006-fuzz-testing-strategy.md`
+- Integration testing + fuzz testing strategies -> `docs/decisions/adr-0005-integration-testing-strategy.md`, `adr-0006-fuzz-testing-strategy.md`
 - Integration test infrastructure -> `docs/decisions/adr-0009-integration-test-infrastructure.md`
 - Environment integration tests -> `docs/decisions/adr-0014-environment-integration-tests.md`
 - Validation pipeline (guards, coverage) -> `docs/decisions/adr-0024-agent-teams-workflow.md`
 - Coverage thresholds -> `.codecov.yml`
 - Client architecture (4-tier testing, test-utils, flaky policy) -> ADR-0028
 - Host-side cluster helper (env-test execution, URL config, attempt budgets, cluster networking) -> `docs/decisions/adr-0030-host-side-cluster-helper.md`
-- Metric testability (component tests + `MetricAssertion` + presence guard) -> `docs/decisions/adr-0032-metric-testability.md`
+- Metric testability + `MetricAssertion` patterns (per-thread recorder, counter-idempotent-on-repeat-read, histogram-drain-on-read, two-fixed-point timing with ONE snapshot, partial-label `assert_delta(0)` subset-match, current_thread flavor load-bearing for `tokio::spawn`) -> `docs/decisions/adr-0032-metric-testability.md`, `crates/common/src/observability/testing.rs:60-138`
 
 ## Code Locations: AC Service
 - Integration + fault injection tests -> `crates/ac-service/tests/integration/`, `crates/ac-service/tests/fault_injection/`
@@ -52,8 +51,9 @@
 - GC integration tests (registration, load reports, NOT_FOUND) -> `crates/mh-service/tests/gc_integration.rs`
 - Auth layer integration (MhAuthLayer + MhMediaService, JWKS upgrade, alg-none/HS256 confusion) -> `crates/mh-service/tests/auth_layer_integration.rs`
 - RegisterMeeting integration (happy path over wire, InvalidArgument) -> `crates/mh-service/tests/register_meeting_integration.rs`
-- WebTransport integration (JWT accept path, provisional timeout ±survival, MC connect/disconnect notify) -> `crates/mh-service/tests/webtransport_integration.rs`
-- Shared rigs (TestKeypair, JWKS, gRPC, WebTransport+self-signed TLS, MC mock, token minters) -> `crates/mh-service/tests/common/`
+- WebTransport integration (JWT accept path, provisional timeout ±survival with two-fixed-point counter idempotence pattern, MC connect/disconnect notify, wrong-token-type session-state distinguishing signal) -> `crates/mh-service/tests/webtransport_integration.rs`
+- Accept-loop component tests (real `bind()+accept_loop()`, `accepted|rejected|error` status labels, `mh_active_connections` gauge, handshake histogram) + token-refresh integration (ADR-0032 Cat B guard-satisfaction; per-`error_category` matrix under `src/observability/metrics.rs:tests`) -> `crates/mh-service/tests/webtransport_accept_loop_integration.rs`, `token_refresh_integration.rs`
+- Shared rigs (TestKeypair, JWKS, gRPC, WebTransport+self-signed TLS via `rcgen` tempdir PEMs, MC mock, token minters, accept_loop_rig) -> `crates/mh-service/tests/common/`
 
 ## Code Locations: Environment Tests
 - Cluster bootstrap + fixtures → `crates/env-tests/src/`, flows (20-24) → `crates/env-tests/tests/`
@@ -71,5 +71,5 @@
 - Env vars + ConfigMap patching → `infra/kind/scripts/setup.sh`; Wrapper → `infra/devloop/devloop.sh`
 
 ## Code Locations: Common & Infrastructure
-- JWT (claims, JwksClient, JwtValidator, round-trip tests) -> `crates/common/src/jwt.rs`; meeting token -> `meeting_token.rs:tests`; `MetricAssertion` (ADR-0032 Step 2+ entry) -> `observability/testing.rs`
+- JWT (claims, JwksClient, JwtValidator, round-trip tests) -> `crates/common/src/jwt.rs`; meeting token -> `meeting_token.rs:tests`
 - MC/MH per-pod Services, ConfigMaps, Kind port mappings → `infra/services/{mc,mh}-service/`; Dev certs → `scripts/generate-dev-certs.sh`
