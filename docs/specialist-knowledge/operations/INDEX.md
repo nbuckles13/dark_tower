@@ -9,7 +9,7 @@
 ## CI & Guards
 - CI pipeline → `.github/workflows/ci.yml`; runner + common → `scripts/guards/run-guards.sh`, `common.sh`
 - Kustomize → `scripts/guards/simple/validate-kustomize.sh`; app metrics (metric↔dashboard) → `validate-application-metrics.sh`
-- Metric-test coverage guard (`validate-metric-coverage.sh`, single presence check; lead sequences per-service backfill PRs during phasing window) → ADR-0032
+- Metric-test coverage guard (`validate-metric-coverage.sh`, single presence check; lead sequences per-service backfill PRs during phasing window; Step 2 MH backfill complete: `mh-service: 0 uncovered`; Steps 3-5 drain AC/GC/MC — `run-guards.sh` stays red on `feature/mh-quic-mh-tests` until then) → ADR-0032
 
 ## Devloop Cluster Helper
 - Kind config template (envsubst, host-gateway listenAddress) → `infra/kind/kind-config.yaml.tmpl`
@@ -56,7 +56,8 @@
 - MH gRPC (service, GC client, MC client, JWKS auth) → `crates/mh-service/src/grpc/mh_service.rs`, `gc_client.rs`, `mc_client.rs`, `auth_interceptor.rs`
 - MH→MC notifications (fire-and-forget) → `crates/mh-service/src/webtransport/connection.rs:spawn_notify_connected()`; tests → `tests/mc_client_integration.rs`
 - MH WebTransport + session mgmt → `crates/mh-service/src/webtransport/server.rs`, `connection.rs`, `session/mod.rs`
-- MH crate integration tests + shared rigs (RAII Drop, `127.0.0.1:0`) → `crates/mh-service/tests/` (`auth_layer_integration.rs`, `register_meeting_integration.rs`, `webtransport_integration.rs`, `common/`)
+- MH crate integration tests + shared rigs (RAII Drop, `127.0.0.1:0`) → `crates/mh-service/tests/` (`auth_layer_integration.rs`, `register_meeting_integration.rs`, `webtransport_integration.rs`, `webtransport_accept_loop_integration.rs`, `token_refresh_integration.rs`, `common/`); accept-loop component rig (real `WebTransportServer::bind()`, runtime `rcgen`-generated PEMs to `tempfile::TempDir`) → `tests/common/accept_loop_rig.rs`
+- MH token-refresh metric extraction (ADR-0032 Cat B, stateless, byte-identical emission) → `crates/mh-service/src/observability/metrics.rs:record_token_refresh_metrics()`
 
 ## MC Service
 - MC startup + gRPC server wiring → `crates/mc-service/src/main.rs`; config → `crates/mc-service/src/config.rs`

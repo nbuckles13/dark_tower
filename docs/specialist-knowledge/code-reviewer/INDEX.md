@@ -54,7 +54,10 @@
 - gRPC stub service (MC→MH: RegisterMeeting) → `grpc/mh_service.rs:MhMediaService`; Session manager → `session/mod.rs:SessionManager`
 - WebTransport: server → `webtransport/server.rs:WebTransportServer`; connection (JWT, provisional, MC notify) → `webtransport/connection.rs:handle_connection()`
 - Startup wiring → `main.rs`; Metrics → `observability/metrics.rs`; catalog → `docs/observability/metrics/mh-service.md`
-- Integration tests → `tests/{gc,mc_client,auth_layer,register_meeting,webtransport}_integration.rs`; shared rigs → `tests/common/{grpc_rig,jwks_rig,mock_mc,wt_rig,wt_client,tokens}.rs`
+- Integration tests → `tests/{gc,mc_client,auth_layer,register_meeting,webtransport,webtransport_accept_loop,token_refresh}_integration.rs`; shared rigs → `tests/common/{grpc_rig,jwks_rig,mock_mc,accept_loop_rig,wt_client,tokens}.rs`
+- Cat B metric extraction (stateless pure fn next to sibling `record_*` wrappers) → `observability/metrics.rs:record_token_refresh_metrics()`; matrix test harness (success + every `error_category` variant) at same file `mod tests`
+- Accept-loop component rig (real `WebTransportServer::bind()+accept_loop()`, runtime `rcgen` PEMs → `tempfile::TempDir`, byte-identical to `main.rs:258-260`) → `tests/common/accept_loop_rig.rs:AcceptLoopRig`; `current_thread` runtime is load-bearing for `MetricAssertion` + `tokio::spawn` capture (see file-header comment)
+- Dual-signal invariant test pattern (metric-label + session-manager state catches call-site refactor) → `tests/webtransport_integration.rs:wrong_token_type_guest_rejected_on_wt_accept_path` and its inline comment
 - Health + K8s → `observability/health.rs`, `infra/services/mh-service/`, `infra/docker/mh-service/Dockerfile`
 
 ## Code Locations — Common
