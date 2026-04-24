@@ -23,6 +23,7 @@ mod test_common;
 use std::time::Duration;
 
 use common::jwt::ServiceClaims;
+use common::observability::testing::MetricAssertion;
 use mh_service::session::SessionManagerHandle;
 use proto_gen::internal::media_handler_service_client::MediaHandlerServiceClient;
 use proto_gen::internal::RegisterMeetingRequest;
@@ -110,6 +111,7 @@ async fn valid_mc_token_over_grpc_succeeds_and_reaches_handler() {
 
     let token = mint_valid_mc_token(&rig.jwks.keypair);
 
+    let snap = MetricAssertion::snapshot();
     let response = client
         .register_meeting(req_with_bearer(Some(&token)))
         .await
@@ -135,6 +137,14 @@ async fn valid_mc_token_over_grpc_succeeds_and_reaches_handler() {
             .as_deref(),
         Some("http://mc-auth-test:50052"),
     );
+
+    snap.counter("mh_jwt_validations_total")
+        .with_labels(&[
+            ("result", "success"),
+            ("token_type", "service"),
+            ("failure_reason", "none"),
+        ])
+        .assert_delta(1);
 }
 
 #[tokio::test]
@@ -162,12 +172,21 @@ async fn signature_invalid_via_wrong_key_returns_unauthenticated() {
     let wrong_keypair = TestKeypair::new(99, "attacker-key");
     let token = mint_valid_mc_token(&wrong_keypair);
 
+    let snap = MetricAssertion::snapshot();
     let err = client
         .register_meeting(req_with_bearer(Some(&token)))
         .await
         .expect_err("token signed by unknown key must be rejected");
 
     assert_eq!(err.code(), Code::Unauthenticated);
+
+    snap.counter("mh_jwt_validations_total")
+        .with_labels(&[
+            ("result", "failure"),
+            ("token_type", "service"),
+            ("failure_reason", "signature_invalid"),
+        ])
+        .assert_delta(1);
 }
 
 #[tokio::test]
@@ -192,6 +211,7 @@ async fn wrong_service_type_returns_permission_denied() {
 
     let token = mint_wrong_service_type_token(&rig.jwks.keypair, "global-controller");
 
+    let snap = MetricAssertion::snapshot();
     let err = client
         .register_meeting(req_with_bearer(Some(&token)))
         .await
@@ -202,6 +222,22 @@ async fn wrong_service_type_returns_permission_denied() {
         Code::PermissionDenied,
         "wrong service_type must map to PERMISSION_DENIED (ADR-0003 Layer 2)"
     );
+
+    // JWT is cryptographically valid; the Layer 2 routing check rejects it.
+    snap.counter("mh_jwt_validations_total")
+        .with_labels(&[
+            ("result", "success"),
+            ("token_type", "service"),
+            ("failure_reason", "none"),
+        ])
+        .assert_delta(1);
+    snap.counter("mh_caller_type_rejected_total")
+        .with_labels(&[
+            ("grpc_service", "MediaHandlerService"),
+            ("expected_type", "meeting-controller"),
+            ("actual_type", "global-controller"),
+        ])
+        .assert_delta(1);
 }
 
 #[tokio::test]

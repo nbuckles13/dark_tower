@@ -13,6 +13,7 @@ use mh_service::config::Config;
 use mh_service::errors::MhError;
 use mh_service::grpc::GcClient;
 
+use common::observability::testing::MetricAssertion;
 use common::secret::SecretString;
 use common::token_manager::TokenReceiver;
 use proto_gen::internal::media_handler_registry_service_server::{
@@ -230,9 +231,17 @@ async fn test_gc_client_registration_success() {
 
     assert!(!gc_client.is_registered());
 
+    let snap = MetricAssertion::snapshot();
     gc_client.register().await.unwrap();
 
     assert!(gc_client.is_registered());
+
+    // Histogram first — `Snapshotter::snapshot` drains histograms on read.
+    snap.histogram("mh_gc_registration_duration_seconds")
+        .assert_observation_count_at_least(1);
+    snap.counter("mh_gc_registration_total")
+        .with_labels(&[("status", "success")])
+        .assert_delta(1);
 
     cancel_token.cancel();
 }
@@ -248,9 +257,21 @@ async fn test_gc_client_registration_rejected() {
 
     let gc_client = GcClient::new(gc_url, token_rx, config).await.unwrap();
 
+    let snap = MetricAssertion::snapshot();
     let result = gc_client.register().await;
     assert!(result.is_err());
     assert!(!gc_client.is_registered());
+
+    // Note: `gc_client::register` currently emits `status=success` even when
+    // the RPC succeeds but `response.accepted=false` (see `gc_client.rs:149`
+    // vs the `accepted` branch at `:152`). The `status=error` branch only
+    // fires on an RPC-transport failure. This test exercises the "GC rejects
+    // registration" path, so `status=success` is what reaches the counter.
+    snap.histogram("mh_gc_registration_duration_seconds")
+        .assert_observation_count_at_least(1);
+    snap.counter("mh_gc_registration_total")
+        .with_labels(&[("status", "success")])
+        .assert_delta(1);
 
     cancel_token.cancel();
 }
@@ -304,7 +325,14 @@ async fn test_gc_client_load_report_success() {
 
     gc_client.register().await.unwrap();
 
+    let snap = MetricAssertion::snapshot();
     gc_client.send_load_report().await.unwrap();
+
+    snap.histogram("mh_gc_heartbeat_latency_seconds")
+        .assert_observation_count_at_least(1);
+    snap.counter("mh_gc_heartbeats_total")
+        .with_labels(&[("status", "success")])
+        .assert_delta(1);
 
     let request = load_report_rx.recv().await.unwrap();
     assert_eq!(request.handler_id, config.handler_id);
@@ -351,6 +379,7 @@ async fn test_gc_client_load_report_not_found_clears_registration() {
     assert!(gc_client.is_registered());
 
     // Load report should get NOT_FOUND and return NotRegistered
+    let snap = MetricAssertion::snapshot();
     let result = gc_client.send_load_report().await;
     assert!(result.is_err());
     let err = result.unwrap_err();
@@ -358,6 +387,12 @@ async fn test_gc_client_load_report_not_found_clears_registration() {
         matches!(err, MhError::NotRegistered),
         "Expected NotRegistered, got: {err:?}"
     );
+
+    snap.histogram("mh_gc_heartbeat_latency_seconds")
+        .assert_observation_count_at_least(1);
+    snap.counter("mh_gc_heartbeats_total")
+        .with_labels(&[("status", "error")])
+        .assert_delta(1);
 
     // is_registered should be cleared
     assert!(!gc_client.is_registered());
