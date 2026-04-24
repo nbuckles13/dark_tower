@@ -309,20 +309,20 @@ async fn oversized_jwt_rejected_on_wt_accept_path() {
 
 #[tokio::test]
 async fn provisional_connection_kicked_after_register_meeting_timeout() {
-    // Provisional timeout = 1s. Asserts end-to-end wiring: the provisional
-    // timer in `handle_connection` → handler exit → accept_loop emits
-    // `mh_webtransport_connections_total{status=error}`.
+    // Provisional timeout = 1s. Asserts end-to-end wiring AND the original
+    // lower-bound guarantee ("timer does not fire BEFORE ~900ms"):
     //
-    // The original test's lower-bound guarantee ("timer does not fire BEFORE
-    // 900ms") is NOT asserted here — it would require polling the per-thread
-    // recorder, which breaks under MetricAssertion's per-snapshot fresh-recorder
-    // model (see common::observability::testing §"Invariants — nested
-    // snapshots"). Lower-bound regression coverage for the provisional timer
-    // state machine lives in `crates/mh-service/src/webtransport/connection.rs`
-    // at the call-site (`tokio::time::sleep(register_meeting_timeout)` is
-    // tokio's own guarantee; no MH code to break).
+    //   1. At 800ms (production timer = 1000ms, 200ms safety margin), the
+    //      counter is still 0 — the handler hasn't exited yet.
+    //   2. At ~3000ms (2200ms after the lower-bound check), the timer has
+    //      fired, handler has returned Err, and accept_loop emitted
+    //      `mh_webtransport_connections_total{status=error}` → counter = 1.
     //
-    // Component tier = end-to-end wiring + upper-bound bound.
+    // Both reads hit the SAME `MetricAssertion` snapshot — counters are
+    // idempotent under repeat reads per common::observability::testing
+    // §"Delta semantics". Do NOT take a fresh snapshot between the two
+    // reads; per-snapshot recorder binding is fresh, so a new snapshot
+    // would see counter=0 regardless of the production emission.
     let mc_client = make_mc_client();
     let suite = WtSuite::start(Duration::from_secs(1), mc_client).await;
 
@@ -330,9 +330,19 @@ async fn provisional_connection_kicked_after_register_meeting_timeout() {
     let token = mint_meeting_token(&suite.jwks.keypair, "meeting-wt-timeout", "user-timeout");
     let (_conn, _send, _recv) = connect_and_send_jwt(&suite.wt.url, &token).await;
 
-    // Generous headroom past the 1s provisional timeout for CI jitter.
-    tokio::time::sleep(Duration::from_millis(2500)).await;
+    // Lower-bound check: 200ms before the 1s production timer would fire,
+    // the error counter must still be 0. This guards against a refactor
+    // that accidentally drops the provisional window entirely.
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    snap.counter("mh_webtransport_connections_total")
+        .with_labels(&[("status", "error")])
+        .assert_delta(0);
 
+    // Upper-bound check: 2200ms later (3000ms total wall-clock from
+    // snapshot, well past the 1s production timer), the counter MUST have
+    // incremented. 2000ms+ headroom covers any reasonable scheduling delay
+    // under CI load.
+    tokio::time::sleep(Duration::from_millis(2200)).await;
     snap.counter("mh_webtransport_connections_total")
         .with_labels(&[("status", "error")])
         .assert_delta(1);
