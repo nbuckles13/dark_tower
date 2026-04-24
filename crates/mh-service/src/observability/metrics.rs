@@ -262,7 +262,6 @@ pub fn record_caller_type_rejected(grpc_service: &str, expected_type: &str, actu
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 

@@ -21,9 +21,13 @@
 //! - `auth/mod.rs::tests` covers the `MhJwtValidator` rejection matrix
 //!   (expired / wrong-key / malformed / oversized / token-type confusion)
 //!   against the validator directly. That unit matrix is the authoritative
-//!   refactor guard for `validate_meeting_token` semantics; the former
-//!   integration test `wrong_token_type_guest_rejected_on_wt_accept_path`
-//!   is retired as redundant with the unit-tier matrix under ADR-0032.
+//!   refactor guard for `validate_meeting_token`'s contract.
+//!   `wrong_token_type_guest_rejected_on_wt_accept_path` is retained at
+//!   component tier because it adds a distinguishing signal the unit tier
+//!   cannot provide: `session_manager.active_connection_count()` remaining
+//!   at 0 catches call-site refactors that would bypass validation (e.g.,
+//!   a future permissive-method swap at `connection.rs:110`). See the test's
+//!   own body comment for the full invariant.
 //! - `session/mod.rs::tests` covers `SessionManagerHandle` state transitions,
 //!   including the provisional-timer lower-bound behaviour — the component
 //!   tier here only asserts end-to-end wiring and upper-bound enforcement.
