@@ -112,7 +112,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         MhError::TokenAcquisition(format!("TokenManager config error: {e}"))
     })?
     .with_on_refresh(Arc::new(|event| {
-        mh_service::token_refresh_metrics::record_token_refresh_metrics(&event);
+        mh_service::observability::metrics::record_token_refresh_metrics(&event);
     }));
 
     let (token_task_handle, token_rx) =

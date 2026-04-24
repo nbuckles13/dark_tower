@@ -116,6 +116,18 @@ pub fn record_token_refresh(status: &str, error_type: Option<&str>, duration: Du
     }
 }
 
+/// Record metrics for a token-refresh attempt (ADR-0032 Category B extraction).
+///
+/// Callable from `main.rs`'s `TokenManager::with_on_refresh` closure and from
+/// unit/integration tests. Maps `TokenRefreshEvent.success: bool` to the
+/// bounded `status` label and forwards `error_category` + `duration` into
+/// `record_token_refresh`. Production emission is byte-identical to the prior
+/// inline closure body at `main.rs:114-122`.
+pub fn record_token_refresh_metrics(event: &common::token_manager::TokenRefreshEvent) {
+    let status = if event.success { "success" } else { "error" };
+    record_token_refresh(status, event.error_category, event.duration);
+}
+
 /// Record an incoming gRPC request from MC.
 ///
 /// Metric: `mh_grpc_requests_total`
@@ -468,6 +480,90 @@ mod tests {
             .assert_delta(1);
         snap.counter("mh_token_refresh_total")
             .with_labels(&[("status", "error")])
+            .assert_delta(1);
+    }
+
+    // =======================================================================
+    // record_token_refresh_metrics (ADR-0032 Category B)
+    // =======================================================================
+    //
+    // These tests cover the `TokenRefreshEvent -> metrics` mapping lifted out
+    // of `main.rs` per ADR-0032 Step 2. Each test takes its own per-thread
+    // `MetricAssertion::snapshot()`; histograms are asserted first because
+    // `Snapshotter::snapshot()` drains histogram observations on read.
+
+    #[test]
+    fn record_token_refresh_metrics_success_event_emits_counter_and_histogram() {
+        use common::observability::testing::MetricAssertion;
+        use common::token_manager::TokenRefreshEvent;
+
+        let snap = MetricAssertion::snapshot();
+        record_token_refresh_metrics(&TokenRefreshEvent {
+            success: true,
+            duration: Duration::from_millis(42),
+            error_category: None,
+        });
+
+        snap.histogram("mh_token_refresh_duration_seconds")
+            .assert_observation_count_at_least(1);
+        snap.counter("mh_token_refresh_total")
+            .with_labels(&[("status", "success")])
+            .assert_delta(1);
+    }
+
+    // Each failure branch exercises a distinct `error_category` value. The
+    // categories are bounded `&'static str`s produced by
+    // `common::token_manager::error_category`; enumerating them here guards
+    // the mapping against silent regression.
+
+    #[test]
+    fn record_token_refresh_metrics_error_http() {
+        assert_token_refresh_failure_emits("http");
+    }
+
+    #[test]
+    fn record_token_refresh_metrics_error_auth_rejected() {
+        assert_token_refresh_failure_emits("auth_rejected");
+    }
+
+    #[test]
+    fn record_token_refresh_metrics_error_invalid_response() {
+        assert_token_refresh_failure_emits("invalid_response");
+    }
+
+    #[test]
+    fn record_token_refresh_metrics_error_acquisition_failed() {
+        assert_token_refresh_failure_emits("acquisition_failed");
+    }
+
+    #[test]
+    fn record_token_refresh_metrics_error_configuration() {
+        assert_token_refresh_failure_emits("configuration");
+    }
+
+    #[test]
+    fn record_token_refresh_metrics_error_channel_closed() {
+        assert_token_refresh_failure_emits("channel_closed");
+    }
+
+    fn assert_token_refresh_failure_emits(category: &'static str) {
+        use common::observability::testing::MetricAssertion;
+        use common::token_manager::TokenRefreshEvent;
+
+        let snap = MetricAssertion::snapshot();
+        record_token_refresh_metrics(&TokenRefreshEvent {
+            success: false,
+            duration: Duration::from_millis(10),
+            error_category: Some(category),
+        });
+
+        snap.histogram("mh_token_refresh_duration_seconds")
+            .assert_observation_count_at_least(1);
+        snap.counter("mh_token_refresh_total")
+            .with_labels(&[("status", "error")])
+            .assert_delta(1);
+        snap.counter("mh_token_refresh_failures_total")
+            .with_labels(&[("error_type", category)])
             .assert_delta(1);
     }
 }
