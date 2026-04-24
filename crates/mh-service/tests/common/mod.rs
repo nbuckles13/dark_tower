@@ -5,7 +5,11 @@
 //! - [`TestKeypair`] / [`mount_jwks_mock`] — Ed25519 keypair + wiremock JWKS
 //! - [`mock_mc`] — MC gRPC mock (MediaCoordinationService) with channel capture
 //! - [`grpc_rig`] — Real `MhAuthLayer` + `MhMediaService` on `127.0.0.1:0`
-//! - [`wt_rig`] — Real `WebTransportServer` with self-signed TLS
+//! - [`accept_loop_rig`] — Real `WebTransportServer::bind() → accept_loop()`
+//!   with runtime-generated self-signed TLS PEMs (via `rcgen` to a
+//!   `tempfile::TempDir`); drives the production accept-loop byte-identically
+//!   to `main.rs:258-260` for ADR-0032 component-tier tests. Replaces the
+//!   former `wt_rig.rs` bypass (which called `handle_connection` directly).
 //! - [`tokens`] — MC service-token and meeting-token minting helpers
 //! - [`wt_client`] — Thin WebTransport client wrapper
 //!
