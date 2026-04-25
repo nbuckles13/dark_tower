@@ -74,6 +74,13 @@ wiremock = "0.6"
 jsonwebtoken = { workspace = true }
 # WebTransport client for join integration tests (dangerous-configuration for self-signed certs)
 wtransport = { workspace = true, features = ["dangerous-configuration"] }
+# Self-signed cert generation for accept-loop component-test rig (ADR-0032 Step 3).
+# Required because `wtransport::Identity::self_signed` returns an opaque Identity with no
+# stable PEM-serialization API, but `WebTransportServer::bind()` reads PEMs from disk via
+# `Identity::load_pemfiles`. The on-disk round-trip exercises the production code path.
+rcgen = "0.13"
+# Tempdir for the runtime-generated PEM files; cleaned up on rig drop.
+tempfile = "3"
 
 [lib]
 name = "mc_service"

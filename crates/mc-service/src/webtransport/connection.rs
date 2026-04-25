@@ -833,6 +833,15 @@ mod tests {
 
     #[test]
     fn test_handle_media_connection_failed() {
+        // Drives the real `decode → match → record_media_connection_failed`
+        // path with `all_handlers_failed=false` and asserts the metric
+        // delta per ADR-0032 Step 3 §F1 review feedback. This is the
+        // production-path assertion for `mc_media_connection_failures_total`
+        // — `tests/media_coordination_integration.rs` only covers the
+        // wrapper plumbing.
+        use common::observability::testing::MetricAssertion;
+        let snap = MetricAssertion::snapshot();
+
         let msg = ClientMessage {
             message: Some(client_message::Message::MediaConnectionFailed(
                 signaling::MediaConnectionFailed {
@@ -843,12 +852,23 @@ mod tests {
             )),
         };
         let data = msg.encode_to_vec();
-        // Should not panic
         handle_client_message(&data, "test-conn-1");
+
+        snap.counter("mc_media_connection_failures_total")
+            .with_labels(&[("all_failed", "false")])
+            .assert_delta(1);
+        // Adjacency: a refactor that flips the boolean→label mapping must
+        // fail this assertion.
+        snap.counter("mc_media_connection_failures_total")
+            .with_labels(&[("all_failed", "true")])
+            .assert_delta(0);
     }
 
     #[test]
     fn test_handle_media_connection_failed_all_handlers() {
+        use common::observability::testing::MetricAssertion;
+        let snap = MetricAssertion::snapshot();
+
         let msg = ClientMessage {
             message: Some(client_message::Message::MediaConnectionFailed(
                 signaling::MediaConnectionFailed {
@@ -860,6 +880,13 @@ mod tests {
         };
         let data = msg.encode_to_vec();
         handle_client_message(&data, "test-conn-2");
+
+        snap.counter("mc_media_connection_failures_total")
+            .with_labels(&[("all_failed", "true")])
+            .assert_delta(1);
+        snap.counter("mc_media_connection_failures_total")
+            .with_labels(&[("all_failed", "false")])
+            .assert_delta(0);
     }
 
     #[test]
