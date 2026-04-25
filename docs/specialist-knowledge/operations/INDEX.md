@@ -9,7 +9,7 @@
 ## CI & Guards
 - CI pipeline → `.github/workflows/ci.yml`; runner + common → `scripts/guards/run-guards.sh`, `common.sh`
 - Kustomize → `scripts/guards/simple/validate-kustomize.sh`; app metrics (metric↔dashboard) → `validate-application-metrics.sh`
-- Metric-test coverage guard (`validate-metric-coverage.sh`, single presence check; lead sequences per-service backfill PRs during phasing window; Step 2 MH backfill complete: `mh-service: 0 uncovered`; Steps 3-5 drain AC/GC/MC — `run-guards.sh` stays red on `feature/mh-quic-mh-tests` until then) → ADR-0032
+- Metric-test coverage guard (`validate-metric-coverage.sh`, single presence check; lead sequences per-service backfill PRs during phasing window; MH ✓ + MC ✓ (`mh-service`/`mc-service: 0 uncovered`); Steps 4-5 drain AC/GC — `run-guards.sh` stays red on `feature/mh-quic-mh-tests` until then) → ADR-0032
 
 ## Devloop Cluster Helper
 - Kind config template (envsubst, host-gateway listenAddress) → `infra/kind/kind-config.yaml.tmpl`
@@ -69,7 +69,7 @@
 - Idempotent MH-retry invariant (disconnect after registry-clear returns Ok, not gRPC error) → `crates/mc-service/src/grpc/media_coordination.rs:test_coordination_flow_connect_disconnect_round_trip()`
 - Redis (fenced writes, MhAssignmentData, MhAssignmentStore trait) → `crates/mc-service/src/redis/client.rs`
 - Actors → `crates/mc-service/src/actors/controller.rs`, `meeting.rs`, `participant.rs`
-- MCMediaConnectionAllFailed alert → `infra/docker/prometheus/rules/mc-alerts.yaml`
+- MCMediaConnectionAllFailed alert → `infra/docker/prometheus/rules/mc-alerts.yaml`; MC token-refresh metric extraction (ADR-0032 Cat B, byte-identical emission) → `crates/mc-service/src/observability/metrics.rs:record_token_refresh_metrics()`; accept-loop component rig + integration tests → `crates/mc-service/tests/common/accept_loop_rig.rs`, `crates/mc-service/tests/`
 
 ## GC Service + Tests
 - GC routes + handlers → `crates/gc-service/src/routes/mod.rs`, `handlers/meetings.rs`

@@ -42,8 +42,8 @@
 - Startup wiring (JwksClient, McJwtValidator, McAuthLayer, MediaCoordinationService, registry) → `crates/mc-service/src/main.rs`
 - Redis (MhAssignmentData, MhAssignmentStore trait, FencedRedisClient) → `crates/mc-service/src/redis/client.rs`
 - WebTransport: server (accept loop, redis+mh_client injection) → `webtransport/server.rs:WebTransportServer::accept_loop()`; join flow → `connection.rs:handle_connection()`, `build_join_response()`; async RegisterMeeting trigger (first participant, retry+backoff) → `connection.rs:register_meeting_with_handlers()`; post-join (MediaConnectionFailed R-20) → `connection.rs:handle_client_message()`
-- MC metrics (join, WebTransport, JWT, register_meeting, MH notifications, media failures, init) → `crates/mc-service/src/observability/metrics.rs`; catalog → `docs/observability/metrics/mc-service.md`
-- Dashboard + alerts → `infra/grafana/dashboards/mc-overview.json`, `infra/docker/prometheus/rules/mc-alerts.yaml`
+- MC metrics (join, WebTransport, JWT, register_meeting, MH notifications, media failures, init) → `crates/mc-service/src/observability/metrics.rs`; catalog → `docs/observability/metrics/mc-service.md`; dashboard + alerts → `infra/grafana/dashboards/mc-overview.json`, `infra/docker/prometheus/rules/mc-alerts.yaml`
+- Integration tests + accept-loop rig (real `bind()+accept_loop()`, `rcgen`+`tempfile` PEMs, byte-identical to `main.rs:376-388`, `current_thread` flavor load-bearing for `MetricAssertion`+`tokio::spawn` capture) → `tests/{actor_metrics,auth_layer,gc,heartbeat_tasks,join,media_coordination,orphan_metrics,redis_metrics,register_meeting,token_refresh,webtransport_accept_loop}*.rs`, `tests/common/{mod,accept_loop_rig}.rs`; Cat B token-refresh extraction + matrix harness → `observability/metrics.rs:record_token_refresh_metrics()`
 - Health probes + K8s (8081, per-pod NodePort) → `observability/health.rs:health_router()`, `infra/services/mc-service/`
 
 ## Code Locations — MH Service

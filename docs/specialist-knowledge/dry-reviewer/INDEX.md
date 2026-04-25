@@ -16,9 +16,11 @@
 - Alert rules -> `infra/docker/prometheus/rules/{mc,gc}-alerts.yaml`; dashboards -> ADR-0029, `infra/grafana/dashboards/`
 
 ## Integration Test Coverage
-- MC join flow -> `crates/mc-service/tests/join_tests.rs`; GC join/guest/settings -> `crates/gc-service/tests/meeting_tests.rs`
+- MC tests (join_tests, actor_metrics, auth_layer, gc, media_coordination, orphan_metrics, redis_metrics, register_meeting, token_refresh, webtransport_accept_loop) -> `crates/mc-service/tests/`; GC join/guest/settings -> `crates/gc-service/tests/meeting_tests.rs`
+- MC shared scaffolding (MockMhAssignmentStore, MockMhRegistrationClient, TestStackHandles, build_test_stack, seed_meeting_with_mh) -> `crates/mc-service/tests/common/mod.rs`
+- MC accept-loop rig (`bind() → accept_loop()` + `write_self_signed_pems`) -> `crates/mc-service/tests/common/accept_loop_rig.rs:AcceptLoopRig` (near-clone of MH's; extraction candidate per ADR-0032 §Step 6 + TODO.md)
 - MH tests (gc_integration, mc_client_integration, auth_layer_integration, register_meeting_integration, webtransport_integration) -> `crates/mh-service/tests/`
-- MH shared test rigs (TestKeypair, mock_mc, jwks_rig, grpc_rig, wt_rig, wt_client, tokens) -> `crates/mh-service/tests/common/`
+- MH shared rigs (TestKeypair, mock_mc, jwks_rig, grpc_rig, accept_loop_rig, wt_client, tokens) -> `crates/mh-service/tests/common/`
 - Shared fixtures (cross-service) -> `crates/mc-test-utils/src/jwt_test.rs`, `crates/gc-test-utils/src/server_harness.rs`
 
 ## Per-Service Config Parsing
@@ -26,10 +28,8 @@
 - Extraction candidate: `generate_instance_id(prefix)` -> 4-line pattern in GC + MC + MH config
 
 ## gRPC Auth (Cross-Service)
-- MC auth layer (async JWKS, R-22) -> `crates/mc-service/src/grpc/auth_interceptor.rs:McAuthLayer` (applied in main.rs)
-- MC auth interceptor (legacy structural) -> same file `:McAuthInterceptor` (dead in production)
-- MH auth layer (async JWKS) -> `crates/mh-service/src/grpc/auth_interceptor.rs:MhAuthLayer`
-- MH auth interceptor (legacy structural) -> same file `:MhAuthInterceptor` (dead in production)
+- MC auth layer (async JWKS, R-22) -> `crates/mc-service/src/grpc/auth_interceptor.rs:McAuthLayer` (applied in main.rs); legacy `:McAuthInterceptor` in same file is dead in production
+- MH auth layer (async JWKS) -> `crates/mh-service/src/grpc/auth_interceptor.rs:MhAuthLayer`; legacy `:MhAuthInterceptor` in same file is dead in production
 - Shared constant -> `common::jwt::MAX_JWT_SIZE_BYTES`
 - McAuthLayer/MhAuthLayer are near-identical tower Layer/Service patterns (extraction candidate in TODO.md)
 

@@ -29,14 +29,14 @@
 - Auth (meeting/guest JWT, McAuthInterceptor, JWKS McAuthLayer+scope) -> `crates/mc-service/src/auth/mod.rs:tests`, `grpc/auth_interceptor.rs:tests`
 - Config + error tests (incl. MhAssignmentMissing) -> `crates/mc-service/src/config.rs:tests`, `crates/mc-service/src/errors.rs:tests`
 - Actor tests (controller, meeting, participant, session) -> `crates/mc-service/src/actors/controller.rs:tests`, `meeting.rs`, `participant.rs`, `session.rs`
-- Join flow integration tests (T1-T13, MH assignment, media_servers, bridge, RegisterMeeting trigger) -> `crates/mc-service/tests/join_tests.rs`
-- WebTransport tests (encoding, connection, handle_client_message) -> `crates/mc-service/src/webtransport/connection.rs:tests`
-- RegisterMeeting retry/backoff unit tests -> `crates/mc-service/src/webtransport/connection.rs:tests::test_register_*`
-- MH data (MhAssignmentStore trait, MhRegistrationClient trait, MockMhAssignmentStore, MockMhRegistrationClient) -> `crates/mc-service/src/redis/client.rs`, `src/grpc/mh_client.rs`, `tests/join_tests.rs`
-- MH coordination (registry, MediaCoordinationService) -> `crates/mc-service/src/mh_connection_registry.rs:tests`, `grpc/media_coordination.rs:tests`
-- GC integration + heartbeat tests -> `crates/mc-service/tests/gc_integration.rs`, `heartbeat_tasks.rs`
-- Health + metrics (incl. RegisterMeeting, MH coordination + media connection failure) -> `crates/mc-service/src/observability/health.rs`, `metrics.rs`
-- Test utils (mock Redis, mock GC, mock MH) -> `crates/mc-test-utils/src/mock_redis.rs`, `mock_gc.rs`, `mock_mh.rs`
+- Join flow + WebTransport tests (T1-T13 MH assignment + media_servers + bridge + RegisterMeeting trigger + retry/backoff `tests::test_register_*` + `handle_client_message` w/ MetricAssertion for `mc_media_connection_failures_total`) -> `crates/mc-service/tests/join_tests.rs`, `src/webtransport/connection.rs:tests`
+- MH coordination + GC heartbeat (per-(status,type) matrix w/ injected fault) -> `crates/mc-service/src/mh_connection_registry.rs:tests`, `grpc/media_coordination.rs:tests`, `tests/gc_integration.rs`, `heartbeat_tasks.rs`
+- Accept-loop component tests (real `bind()+accept_loop()`, `accepted|rejected|error` status, 4 reachable `session_join_failures` `error_type` via real injected faults) -> `crates/mc-service/tests/webtransport_accept_loop_integration.rs`
+- Auth-layer integration (5-`failure_reason` JWT cluster + `caller_type_rejected`, real wiremock JWKS) -> `crates/mc-service/tests/auth_layer_integration.rs`
+- Media coordination + register-meeting + token-refresh integration (`mh_notifications`, stub MH gRPC, Cat B `record_token_refresh_metrics` per-`error_category` matrix in `crates/mc-service/src/observability/metrics.rs:tests`) -> `crates/mc-service/tests/media_coordination_integration.rs`, `register_meeting_integration.rs`, `token_refresh_integration.rs`
+- Per-failure-class wrapper covers (actor metrics, redis ops, orphans) -> `crates/mc-service/tests/actor_metrics_integration.rs`, `redis_metrics_integration.rs`, `orphan_metrics_integration.rs`
+- Shared rigs + scaffolding (`AcceptLoopRig`, `TestStackHandles`, `build_test_stack`, `seed_meeting_with_mh`, `MockMhAssignmentStore`, `MockMhRegistrationClient`) -> `crates/mc-service/tests/common/`
+- Health + metrics + cross-service test utils (mock Redis/GC/MH) -> `crates/mc-service/src/observability/health.rs`, `metrics.rs`, `crates/mc-test-utils/src/`
 
 ## Code Locations: MH Service
 - Config tests (env vars, defaults, TLS, debug redaction, advertise addresses, JWKS URL, timeouts) -> `crates/mh-service/src/config.rs:tests`

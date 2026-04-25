@@ -281,6 +281,18 @@ pub fn record_token_refresh(status: &str, error_type: Option<&str>, duration: Du
     }
 }
 
+/// Record metrics for a token-refresh attempt (ADR-0032 Category B extraction).
+///
+/// Callable from `main.rs`'s `TokenManager::with_on_refresh` closure and from
+/// unit/integration tests. Maps `TokenRefreshEvent.success: bool` to the
+/// bounded `status` label and forwards `error_category` + `duration` into
+/// `record_token_refresh`. Production emission is byte-identical to the prior
+/// inline closure body at `main.rs:147-155`.
+pub fn record_token_refresh_metrics(event: &common::token_manager::TokenRefreshEvent) {
+    let status = if event.success { "success" } else { "error" };
+    record_token_refresh(status, event.error_category, event.duration);
+}
+
 // ============================================================================
 // Join Flow Metrics (R-13)
 // ============================================================================
@@ -464,11 +476,26 @@ pub fn record_error(operation: &str, error_type: &str, status_code: u16) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use common::observability::testing::MetricAssertion;
+    use common::token_manager::TokenRefreshEvent;
 
-    // Note: These tests execute the metric recording functions to ensure code coverage.
-    // The metrics crate will record to a global no-op recorder if none is installed,
-    // which is sufficient for coverage testing. We don't need to verify the actual
-    // metric values - that would require installing a test recorder from metrics-util.
+    // Note: The legacy `test_*` functions below execute the metric recording
+    // functions without a recorder — the metrics crate records to a global
+    // no-op recorder when none is installed, which is sufficient for coverage
+    // testing. They are retained because they exercise constant-folded code
+    // paths the per-failure-class tests don't reach (e.g.,
+    // `test_cardinality_bounds`).
+    //
+    // The newer per-failure-class tests in this module use
+    // `MetricAssertion::snapshot()` which binds a per-thread `DebuggingRecorder`
+    // for the duration of the snapshot — see `common::observability::testing`
+    // module docs for the isolation model. These tests live in
+    // `#[test]` (not `#[tokio::test]`) blocks: the recorders bind to the test
+    // thread and all wrapper calls happen synchronously on it, so no
+    // `flavor = "current_thread"` discipline is needed for the metrics-module
+    // tests specifically. Tests that drive metric emission through `tokio::spawn`
+    // paths live in `crates/mc-service/tests/` and DO need the explicit pinning
+    // (see those file headers).
     //
     // Per ADR-0002: These tests do not panic on missing recorder.
 
@@ -757,97 +784,287 @@ mod tests {
     }
 
     // ========================================================================
-    // Integration test for Prometheus metrics endpoint
-    // ========================================================================
+    // ADR-0032 Category B: pure-fn extraction matrix for `record_token_refresh_metrics`
     //
-    // This test verifies that all required ADR-0023 Section 11 metrics are
-    // exposed in Prometheus text format via the metrics-exporter-prometheus.
+    // The `with_on_refresh` closure at `main.rs:147-155` now calls
+    // `record_token_refresh_metrics(&event)` instead of inlining the
+    // `success bool → status &str` mapping. This matrix covers the success path
+    // plus every `error_category` variant emitted by `common::token_manager`
+    // (`http`, `auth_rejected`, `invalid_response`, `acquisition_failed`,
+    // `configuration`, `channel_closed`).
+    //
+    // Histogram-first ordering (drain-on-read) and per-failure-class
+    // `assert_delta(0)` adjacency on sibling `error_type` labels per ADR-0032.
+    // ========================================================================
+
+    fn make_event(success: bool, error_category: Option<&'static str>) -> TokenRefreshEvent {
+        TokenRefreshEvent {
+            success,
+            duration: Duration::from_millis(42),
+            error_category,
+        }
+    }
 
     #[test]
-    fn test_prometheus_metrics_endpoint_integration() {
-        use metrics_util::debugging::DebuggingRecorder;
+    fn record_token_refresh_metrics_success_emits_success_status_no_failure_counter() {
+        let snap = MetricAssertion::snapshot();
+        record_token_refresh_metrics(&make_event(true, None));
 
-        // Install a debugging recorder to capture metrics
-        let recorder = DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
+        // Histogram first (drain-on-read).
+        snap.histogram("mc_token_refresh_duration_seconds")
+            .assert_observation_count_at_least(1);
+        snap.counter("mc_token_refresh_total")
+            .with_labels(&[("status", "success")])
+            .assert_delta(1);
+        snap.counter("mc_token_refresh_total")
+            .with_labels(&[("status", "error")])
+            .assert_delta(0);
+        // No failure counter on success path — adjacency check across all
+        // bounded error_type labels.
+        for sibling in &[
+            "http",
+            "auth_rejected",
+            "invalid_response",
+            "acquisition_failed",
+            "configuration",
+            "channel_closed",
+        ] {
+            snap.counter("mc_token_refresh_failures_total")
+                .with_labels(&[("error_type", *sibling)])
+                .assert_delta(0);
+        }
+    }
 
-        // Install the recorder - this will replace any existing global recorder
-        // Note: This test must run in isolation (not parallel with other metrics tests)
-        // because metrics recorders are global state.
-        let _ = recorder.install();
+    #[test]
+    fn record_token_refresh_metrics_failure_matrix_per_error_category() {
+        // One snapshot per error_category — each must isolate cleanly.
+        for category in &[
+            "http",
+            "auth_rejected",
+            "invalid_response",
+            "acquisition_failed",
+            "configuration",
+            "channel_closed",
+        ] {
+            let snap = MetricAssertion::snapshot();
+            record_token_refresh_metrics(&make_event(false, Some(category)));
 
-        // Record all 7 ADR-0023 required metrics
-        set_connections_active(42);
-        set_meetings_active(10);
-        record_message_latency("join_request", Duration::from_millis(25));
-        set_actor_mailbox_depth("meeting", 15);
-        record_redis_latency("get", Duration::from_micros(500));
-        record_fenced_out("stale_generation");
-        record_recovery_duration(Duration::from_millis(100));
+            // Histogram first.
+            snap.histogram("mc_token_refresh_duration_seconds")
+                .assert_observation_count_at_least(1);
 
-        // Also record additional operational metrics
-        record_actor_panic("meeting");
-        record_message_dropped("connection");
-        record_gc_heartbeat("success", "fast");
-        record_gc_heartbeat_latency("fast", Duration::from_millis(10));
+            snap.counter("mc_token_refresh_total")
+                .with_labels(&[("status", "error")])
+                .assert_delta(1);
+            snap.counter("mc_token_refresh_total")
+                .with_labels(&[("status", "success")])
+                .assert_delta(0);
 
-        // Record token refresh metrics
-        record_token_refresh("success", None, Duration::from_millis(50));
-        record_token_refresh("error", Some("http"), Duration::from_millis(100));
+            // Named error_type counter delta=1, every sibling delta=0
+            // (label-swap-bug catcher per ADR-0032 §Pattern #3).
+            snap.counter("mc_token_refresh_failures_total")
+                .with_labels(&[("error_type", *category)])
+                .assert_delta(1);
+            for sibling in &[
+                "http",
+                "auth_rejected",
+                "invalid_response",
+                "acquisition_failed",
+                "configuration",
+                "channel_closed",
+            ] {
+                if sibling == category {
+                    continue;
+                }
+                snap.counter("mc_token_refresh_failures_total")
+                    .with_labels(&[("error_type", *sibling)])
+                    .assert_delta(0);
+            }
+        }
+    }
 
-        // Record MH registration metrics
-        record_register_meeting("success", Duration::from_millis(20));
+    // ========================================================================
+    // Per-cluster MetricAssertion tests — replaces the pre-ADR-0032 hand-rolled
+    // `DebuggingRecorder::install()` block (which only proved the snapshot was
+    // non-empty). These exercise the same wrappers but with per-failure-class
+    // delta assertions, mirroring the MH Step 2 migration in
+    // `crates/mh-service/src/observability/metrics.rs`.
+    //
+    // NOTE: These are wrapper-invocation tests (Cat C name-coverage tier).
+    // The PRODUCTION-PATH coverage for these metrics lives in:
+    //   - tests/webtransport_accept_loop_integration.rs (accept_loop, jwt, session_join)
+    //   - tests/auth_layer_integration.rs (service-token jwt, caller_type_rejected)
+    //   - tests/media_coordination_integration.rs (mh_notifications)
+    //   - tests/register_meeting_integration.rs (register_meeting + duration)
+    //   - tests/gc_integration.rs (gc_heartbeats + latency)
+    //   - tests/actor_metrics_integration.rs (mailbox_depth, panics, dropped, gauges)
+    //   - tests/redis_metrics_integration.rs (redis_latency, fenced_out)
+    //   - tests/orphan_metrics_integration.rs (message_latency, recovery_duration, errors)
+    // The block here is the in-file mirror that exercises the metrics.rs
+    // wrappers themselves end-to-end through MetricAssertion.
+    // ========================================================================
 
-        // Record error metrics
-        record_error("token_refresh", "http", 500);
+    #[test]
+    fn metrics_module_emits_join_flow_cluster() {
+        let snap = MetricAssertion::snapshot();
 
-        // Record join flow metrics (R-13)
-        record_webtransport_connection("accepted");
-        record_webtransport_connection("rejected");
-        record_jwt_validation("success", "meeting", "none");
-        record_jwt_validation("failure", "meeting", "signature_invalid");
+        // Histogram first.
         record_session_join("success", None, Duration::from_millis(200));
         record_session_join("failure", Some("jwt_validation"), Duration::from_millis(5));
+        snap.histogram("mc_session_join_duration_seconds")
+            .with_labels(&[("status", "success")])
+            .assert_observation_count_at_least(1);
 
-        // Record MH coordination metrics (R-28)
+        record_webtransport_connection("accepted");
+        record_webtransport_connection("rejected");
+        record_webtransport_connection("error");
+        snap.counter("mc_webtransport_connections_total")
+            .with_labels(&[("status", "accepted")])
+            .assert_delta(1);
+        snap.counter("mc_webtransport_connections_total")
+            .with_labels(&[("status", "rejected")])
+            .assert_delta(1);
+        snap.counter("mc_webtransport_connections_total")
+            .with_labels(&[("status", "error")])
+            .assert_delta(1);
+
+        record_jwt_validation("success", "meeting", "none");
+        record_jwt_validation("failure", "meeting", "signature_invalid");
+        snap.counter("mc_jwt_validations_total")
+            .with_labels(&[("token_type", "meeting"), ("result", "success")])
+            .assert_delta(1);
+        snap.counter("mc_jwt_validations_total")
+            .with_labels(&[
+                ("token_type", "meeting"),
+                ("result", "failure"),
+                ("failure_reason", "signature_invalid"),
+            ])
+            .assert_delta(1);
+
+        snap.counter("mc_session_joins_total")
+            .with_labels(&[("status", "success")])
+            .assert_delta(1);
+        snap.counter("mc_session_joins_total")
+            .with_labels(&[("status", "failure")])
+            .assert_delta(1);
+        snap.counter("mc_session_join_failures_total")
+            .with_labels(&[("error_type", "jwt_validation")])
+            .assert_delta(1);
+    }
+
+    #[test]
+    fn metrics_module_emits_actor_system_cluster() {
+        let snap = MetricAssertion::snapshot();
+
+        set_meetings_active(7);
+        set_connections_active(13);
+        set_actor_mailbox_depth("meeting", 42);
+        record_actor_panic("controller");
+        record_message_dropped("participant");
+
+        snap.gauge("mc_meetings_active").assert_value(7.0);
+        snap.gauge("mc_connections_active").assert_value(13.0);
+        snap.gauge("mc_actor_mailbox_depth")
+            .with_labels(&[("actor_type", "meeting")])
+            .assert_value(42.0);
+        snap.counter("mc_actor_panics_total")
+            .with_labels(&[("actor_type", "controller")])
+            .assert_delta(1);
+        snap.counter("mc_messages_dropped_total")
+            .with_labels(&[("actor_type", "participant")])
+            .assert_delta(1);
+    }
+
+    #[test]
+    fn metrics_module_emits_gc_heartbeat_cluster() {
+        let snap = MetricAssertion::snapshot();
+
+        // Histogram first.
+        record_gc_heartbeat_latency("fast", Duration::from_millis(10));
+        record_gc_heartbeat_latency("comprehensive", Duration::from_millis(40));
+        snap.histogram("mc_gc_heartbeat_latency_seconds")
+            .with_labels(&[("type", "fast")])
+            .assert_observation_count_at_least(1);
+
+        record_gc_heartbeat("success", "fast");
+        record_gc_heartbeat("error", "comprehensive");
+        snap.counter("mc_gc_heartbeats_total")
+            .with_labels(&[("status", "success"), ("type", "fast")])
+            .assert_delta(1);
+        snap.counter("mc_gc_heartbeats_total")
+            .with_labels(&[("status", "error"), ("type", "comprehensive")])
+            .assert_delta(1);
+    }
+
+    #[test]
+    fn metrics_module_emits_mh_coordination_cluster() {
+        let snap = MetricAssertion::snapshot();
+
         record_mh_notification("connected");
         record_mh_notification("disconnected");
         record_media_connection_failed(true);
         record_media_connection_failed(false);
 
-        // Record Layer 2 auth metrics (ADR-0003)
+        snap.counter("mc_mh_notifications_received_total")
+            .with_labels(&[("event", "connected")])
+            .assert_delta(1);
+        snap.counter("mc_mh_notifications_received_total")
+            .with_labels(&[("event", "disconnected")])
+            .assert_delta(1);
+        snap.counter("mc_media_connection_failures_total")
+            .with_labels(&[("all_failed", "true")])
+            .assert_delta(1);
+        snap.counter("mc_media_connection_failures_total")
+            .with_labels(&[("all_failed", "false")])
+            .assert_delta(1);
+    }
+
+    #[test]
+    fn metrics_module_emits_register_meeting_cluster() {
+        let snap = MetricAssertion::snapshot();
+
+        record_register_meeting("success", Duration::from_millis(20));
+        record_register_meeting("error", Duration::from_millis(150));
+
+        snap.histogram("mc_register_meeting_duration_seconds")
+            .assert_observation_count_at_least(2);
+        snap.counter("mc_register_meeting_total")
+            .with_labels(&[("status", "success")])
+            .assert_delta(1);
+        snap.counter("mc_register_meeting_total")
+            .with_labels(&[("status", "error")])
+            .assert_delta(1);
+    }
+
+    #[test]
+    fn metrics_module_emits_caller_type_rejected_cluster() {
+        let snap = MetricAssertion::snapshot();
+
         record_caller_type_rejected(
             "MeetingControllerService",
             "global-controller",
             "media-handler",
         );
-
-        // Take a snapshot and verify metrics were recorded
-        let snapshot = snapshotter.snapshot();
-
-        // Convert to vec to check contents
-        let metrics = snapshot.into_vec();
-
-        // The snapshot contains all metrics recorded during the test.
-        // We verify the snapshot is not empty, indicating metrics were recorded.
-        // Detailed metric name verification would require parsing the snapshot,
-        // which is beyond the scope of this integration test.
-        //
-        // The key verification is that:
-        // 1. The recorder was installed successfully
-        // 2. All metric recording functions executed without error
-        // 3. The snapshot contains recorded data
-        assert!(
-            !metrics.is_empty(),
-            "Prometheus snapshot should contain recorded metrics"
+        record_caller_type_rejected(
+            "MediaCoordinationService",
+            "media-handler",
+            "global-controller",
         );
 
-        // Verify we have multiple metrics recorded
-        assert!(
-            metrics.len() >= 7,
-            "Should have at least 7 metrics (ADR-0023 requirements), got {}",
-            metrics.len()
-        );
+        snap.counter("mc_caller_type_rejected_total")
+            .with_labels(&[
+                ("grpc_service", "MeetingControllerService"),
+                ("expected_type", "global-controller"),
+                ("actual_type", "media-handler"),
+            ])
+            .assert_delta(1);
+        snap.counter("mc_caller_type_rejected_total")
+            .with_labels(&[
+                ("grpc_service", "MediaCoordinationService"),
+                ("expected_type", "media-handler"),
+                ("actual_type", "global-controller"),
+            ])
+            .assert_delta(1);
     }
 
     #[test]

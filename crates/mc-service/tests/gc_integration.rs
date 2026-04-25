@@ -704,3 +704,154 @@ async fn test_attempt_reregistration_after_not_found() {
 
     cancel_token.cancel();
 }
+
+// ============================================================================
+// ADR-0032 Step 3 §Cluster F: per-failure-class fidelity for
+// `mc_gc_heartbeats_total` and `mc_gc_heartbeat_latency_seconds`.
+//
+// Each `#[tokio::test(flavor = "current_thread")]` below is pinned EXPLICITLY
+// — `MetricAssertion` binds a per-thread recorder, and the `GcClient`
+// heartbeat future runs on the test's task. On `current_thread` that's the
+// test thread and emissions are captured. See
+// `crates/common/src/observability/testing.rs:60-72`.
+//
+// Histogram-first ordering (drain-on-read) and `assert_delta(0)` adjacency
+// across all four (status, type) combos per ADR-0032 §Pattern #3.
+// ============================================================================
+
+#[tokio::test(flavor = "current_thread")]
+async fn gc_fast_heartbeat_success_records_status_success_type_fast() {
+    use ::common::observability::testing::MetricAssertion;
+
+    let mock_gc = MockGcServer::accepting();
+    let (addr, cancel_token) = start_mock_gc_server(mock_gc).await;
+    let gc_url = format!("http://{}", addr);
+    let config = test_config(&gc_url);
+    let token_rx = mock_token_receiver();
+    let gc_client = GcClient::new(gc_url, token_rx, config).await.unwrap();
+    gc_client.register().await.unwrap();
+
+    let snap = MetricAssertion::snapshot();
+    gc_client
+        .fast_heartbeat(1, 1, HealthStatus::Healthy)
+        .await
+        .unwrap();
+
+    // Histogram first.
+    snap.histogram("mc_gc_heartbeat_latency_seconds")
+        .with_labels(&[("type", "fast")])
+        .assert_observation_count_at_least(1);
+    snap.counter("mc_gc_heartbeats_total")
+        .with_labels(&[("status", "success"), ("type", "fast")])
+        .assert_delta(1);
+    // Adjacency on the other 3 combos.
+    snap.counter("mc_gc_heartbeats_total")
+        .with_labels(&[("status", "error"), ("type", "fast")])
+        .assert_delta(0);
+    snap.counter("mc_gc_heartbeats_total")
+        .with_labels(&[("status", "success"), ("type", "comprehensive")])
+        .assert_delta(0);
+    snap.counter("mc_gc_heartbeats_total")
+        .with_labels(&[("status", "error"), ("type", "comprehensive")])
+        .assert_delta(0);
+
+    cancel_token.cancel();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn gc_comprehensive_heartbeat_success_records_status_success_type_comprehensive() {
+    use ::common::observability::testing::MetricAssertion;
+
+    let mock_gc = MockGcServer::accepting();
+    let (addr, cancel_token) = start_mock_gc_server(mock_gc).await;
+    let gc_url = format!("http://{}", addr);
+    let config = test_config(&gc_url);
+    let token_rx = mock_token_receiver();
+    let gc_client = GcClient::new(gc_url, token_rx, config).await.unwrap();
+    gc_client.register().await.unwrap();
+
+    let snap = MetricAssertion::snapshot();
+    gc_client
+        .comprehensive_heartbeat(1, 1, HealthStatus::Healthy, 10.0, 20.0)
+        .await
+        .unwrap();
+
+    snap.histogram("mc_gc_heartbeat_latency_seconds")
+        .with_labels(&[("type", "comprehensive")])
+        .assert_observation_count_at_least(1);
+    snap.counter("mc_gc_heartbeats_total")
+        .with_labels(&[("status", "success"), ("type", "comprehensive")])
+        .assert_delta(1);
+    snap.counter("mc_gc_heartbeats_total")
+        .with_labels(&[("status", "success"), ("type", "fast")])
+        .assert_delta(0);
+    snap.counter("mc_gc_heartbeats_total")
+        .with_labels(&[("status", "error"), ("type", "comprehensive")])
+        .assert_delta(0);
+
+    cancel_token.cancel();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn gc_fast_heartbeat_error_records_status_error_type_fast() {
+    use ::common::observability::testing::MetricAssertion;
+
+    // Cancel the server BEFORE the heartbeat → transport failure → error path
+    // at `gc_client.rs:376` fires `record_gc_heartbeat("error", "fast")`.
+    let mock_gc = MockGcServer::accepting();
+    let (addr, cancel_token) = start_mock_gc_server(mock_gc).await;
+    let gc_url = format!("http://{}", addr);
+    let config = test_config(&gc_url);
+    let token_rx = mock_token_receiver();
+    let gc_client = GcClient::new(gc_url, token_rx, config).await.unwrap();
+    gc_client.register().await.unwrap();
+
+    cancel_token.cancel();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let snap = MetricAssertion::snapshot();
+    let result = gc_client.fast_heartbeat(1, 1, HealthStatus::Healthy).await;
+    assert!(result.is_err(), "expected Err after server cancel");
+
+    snap.histogram("mc_gc_heartbeat_latency_seconds")
+        .with_labels(&[("type", "fast")])
+        .assert_observation_count_at_least(1);
+    snap.counter("mc_gc_heartbeats_total")
+        .with_labels(&[("status", "error"), ("type", "fast")])
+        .assert_delta(1);
+    snap.counter("mc_gc_heartbeats_total")
+        .with_labels(&[("status", "success"), ("type", "fast")])
+        .assert_delta(0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn gc_comprehensive_heartbeat_error_records_status_error_type_comprehensive() {
+    use ::common::observability::testing::MetricAssertion;
+
+    let mock_gc = MockGcServer::accepting();
+    let (addr, cancel_token) = start_mock_gc_server(mock_gc).await;
+    let gc_url = format!("http://{}", addr);
+    let config = test_config(&gc_url);
+    let token_rx = mock_token_receiver();
+    let gc_client = GcClient::new(gc_url, token_rx, config).await.unwrap();
+    gc_client.register().await.unwrap();
+
+    cancel_token.cancel();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let snap = MetricAssertion::snapshot();
+    let result = gc_client
+        .comprehensive_heartbeat(1, 1, HealthStatus::Healthy, 10.0, 20.0)
+        .await;
+    assert!(result.is_err(), "expected Err after server cancel");
+
+    snap.histogram("mc_gc_heartbeat_latency_seconds")
+        .with_labels(&[("type", "comprehensive")])
+        .assert_observation_count_at_least(1);
+    snap.counter("mc_gc_heartbeats_total")
+        .with_labels(&[("status", "error"), ("type", "comprehensive")])
+        .assert_delta(1);
+    snap.counter("mc_gc_heartbeats_total")
+        .with_labels(&[("status", "error"), ("type", "fast")])
+        .assert_delta(0);
+}

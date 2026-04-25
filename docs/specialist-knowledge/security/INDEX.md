@@ -34,7 +34,7 @@
 - WebTransport (connection handler, accept loop, TLS, join flow, JWT gate, capacity) → `crates/mc-service/src/webtransport/`
 - Join fail-closed on missing MH data (generic client error) → `connection.rs:build_join_response()`
 - MH assignment store (Redis, no credentials stored) → `crates/mc-service/src/redis/client.rs:MhAssignmentStore`
-- Session binding + join → `crates/mc-service/src/actors/session.rs`, `meeting.rs:handle_join()`
+- Session binding + join → `crates/mc-service/src/actors/session.rs`, `meeting.rs:handle_join()`; Integration tests (auth-layer JWT failure modes, WT accept-path, mocks) → `crates/mc-service/tests/`
 
 ## Code Locations — MH (Auth, OAuth, TLS)
 - gRPC auth layer (JWKS, scope `service.write.mh`) → `crates/mh-service/src/grpc/auth_interceptor.rs:MhAuthLayer`
@@ -48,8 +48,8 @@
 
 ## TLS & Certificates
 - Dev cert generation (ECDSA P-256 CA, MC + MH certs) → `scripts/generate-dev-certs.sh`
-- MC/MH TLS volume mounts (defaultMode 0400) → `infra/services/{mc,mh}-service/{mc,mh}-{0,1}-deployment.yaml`
-- WebTransport UDP ingress + Kind mapping → `infra/services/{mc,mh}-service/network-policy.yaml`, `infra/kind/kind-config.yaml`
+- MC/MH TLS volume mounts (defaultMode 0400) → `infra/services/{mc,mh}-service/{mc,mh}-{0,1}-deployment.yaml`; WebTransport UDP ingress → `infra/services/{mc,mh}-service/network-policy.yaml`, `infra/kind/kind-config.yaml`
+- Test-time self-signed PEM rigs (rcgen, SAN `localhost`/`127.0.0.1`, TempDir) → `crates/mh-service/tests/common/accept_loop_rig.rs`, `crates/mc-service/tests/common/accept_loop_rig.rs`
 
 ## Advertise Addresses (MC + MH → GC Registration)
 - gRPC: K8s `status.podIP` | WT: per-instance env from ConfigMap | NodePort `{mc,mh}-service-{0,1}` UDP-only | Registration → `gc_client.rs:register()`

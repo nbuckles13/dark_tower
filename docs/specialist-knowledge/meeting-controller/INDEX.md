@@ -11,33 +11,23 @@
 - Config (SecretString, env loading, ac_jwks_url, TLS paths, advertise addresses) → `crates/mc-service/src/config.rs`
 - Error types (McError hierarchy, From<JwtError>) → `crates/mc-service/src/errors.rs`
 - Auth: McJwtValidator, validate_meeting_token, validate_guest_token → `crates/mc-service/src/auth/mod.rs`
-- Actor: controller (root, capacity) → `crates/mc-service/src/actors/controller.rs`
-- Actor: meeting (participants, grace period) → `crates/mc-service/src/actors/meeting.rs`
-- Actor: messages (inter-actor types, JoinConnection, JoinResult) → `crates/mc-service/src/actors/messages.rs`
-- Actor: participant (per-participant, disconnect notify) → `crates/mc-service/src/actors/participant.rs`
-- WebTransport: server (accept loop, TLS, capacity, metric sites rejected:178/accepted:183/error:209 — ADR-0032 accept-loop component-test backfill pending) → `crates/mc-service/src/webtransport/server.rs`
+- Actor: controller / meeting / participant / messages → `crates/mc-service/src/actors/`
+- WebTransport: server (accept loop, TLS, capacity, metric sites rejected:178/accepted:183/error:209) → `crates/mc-service/src/webtransport/server.rs`
 - WebTransport: connection (join flow, bridge loop, MediaConnectionFailed R-20) → `crates/mc-service/src/webtransport/connection.rs`
 - WebTransport: async RegisterMeeting trigger (R-12, first participant) → `crates/mc-service/src/webtransport/connection.rs:register_meeting_with_handlers()`
 - WebTransport: handler (encode_participant_update) → `crates/mc-service/src/webtransport/handler.rs`
 - Actor: session binding (HMAC, HKDF) → `crates/mc-service/src/actors/session.rs`
 - Actor: metrics (dual system) → `crates/mc-service/src/actors/metrics.rs`
-- gRPC: GC client (registration, heartbeats, advertise address usage) → `crates/mc-service/src/grpc/gc_client.rs`
+- gRPC: GC client (registration, heartbeats, advertise) → `crates/mc-service/src/grpc/gc_client.rs`
 - gRPC: MC service (AssignMeetingWithMh) → `crates/mc-service/src/grpc/mc_service.rs`
-- gRPC: MH client (RegisterMeeting, per-call Channel) → `crates/mc-service/src/grpc/mh_client.rs`
-- gRPC: MhRegistrationClient trait (testable MH registration) → `crates/mc-service/src/grpc/mh_client.rs:MhRegistrationClient`
-- gRPC: auth interceptor (Bearer validation) → `crates/mc-service/src/grpc/auth_interceptor.rs`
-- gRPC: auth layer (async JWKS + scope check, R-22) → `crates/mc-service/src/grpc/auth_interceptor.rs:McAuthLayer`
+- gRPC: MH client + MhRegistrationClient trait (RegisterMeeting, per-call Channel) → `crates/mc-service/src/grpc/mh_client.rs`
+- gRPC: auth interceptor + McAuthLayer (async JWKS + scope check, R-22) → `crates/mc-service/src/grpc/auth_interceptor.rs`
 - gRPC: media coordination (MH notifications, R-15) → `crates/mc-service/src/grpc/media_coordination.rs`
 - MH connection registry (participant→MH state, R-18) → `crates/mc-service/src/mh_connection_registry.rs`
-- Redis: fenced client (Lua scripts) → `crates/mc-service/src/redis/client.rs`
-- Redis: MhAssignmentStore trait (testable Redis abstraction) → `crates/mc-service/src/redis/client.rs:MhAssignmentStore`
-- Redis: MhAssignmentData (MH endpoints in Redis) → `crates/mc-service/src/redis/client.rs:MhAssignmentData`
+- Redis: fenced client + MhAssignmentStore trait + MhAssignmentData → `crates/mc-service/src/redis/client.rs`
 - Redis: Lua scripts (atomic fencing) → `crates/mc-service/src/redis/lua_scripts.rs`
 - Health + readiness endpoints → `crates/mc-service/src/observability/health.rs`
-- Prometheus metric wrappers → `crates/mc-service/src/observability/metrics.rs`
-- Join flow metrics (R-13): record_webtransport_connection, record_jwt_validation, record_session_join → `crates/mc-service/src/observability/metrics.rs`
-- MH communication metrics: record_register_meeting → `crates/mc-service/src/observability/metrics.rs`
-- MH coordination metrics (R-28): record_mh_notification, record_media_connection_failed → `crates/mc-service/src/observability/metrics.rs`
+- Prometheus metric wrappers (record_webtransport_connection, record_jwt_validation, record_session_join, record_register_meeting, record_mh_notification, record_media_connection_failed, record_token_refresh_metrics) → `crates/mc-service/src/observability/metrics.rs`
 - MC metrics catalog → `docs/observability/metrics/mc-service.md`
 - System info (sysinfo) → `crates/mc-service/src/system_info.rs`
 
@@ -57,19 +47,28 @@
 - MC -> Redis MH assignment read (join flow) → `crates/mc-service/src/redis/client.rs:get_mh_assignment()`
 
 ## Testing
-- GC integration tests (mock server) → `crates/mc-service/tests/gc_integration.rs`
+- Shared bring-up (TestStackHandles, build_test_stack, seed_meeting_with_mh) + mock MH stores → `crates/mc-service/tests/common/mod.rs`
+- Accept-loop component rig (real bind + accept_loop; divergences from MH in file header) → `crates/mc-service/tests/common/accept_loop_rig.rs`
+- Join flow tests (TestServer wraps AcceptLoopRig) → `crates/mc-service/tests/join_tests.rs`
+- Accept-loop status + per-failure-class drilldown → `crates/mc-service/tests/webtransport_accept_loop_integration.rs`
+- gRPC auth-layer per-failure-reason → `crates/mc-service/tests/auth_layer_integration.rs`
+- Media coordination notifications → `crates/mc-service/tests/media_coordination_integration.rs`
+- RegisterMeeting metrics (stub MH gRPC) → `crates/mc-service/tests/register_meeting_integration.rs`
+- ActorMetrics / MailboxMonitor metrics → `crates/mc-service/tests/actor_metrics_integration.rs`
+- Redis-class wrapper coverage → `crates/mc-service/tests/redis_metrics_integration.rs`
+- Orphan-metric wrappers (no production callers) → `crates/mc-service/tests/orphan_metrics_integration.rs`
+- Token-refresh integration (Cat B) → `crates/mc-service/tests/token_refresh_integration.rs`
+- GC integration + heartbeat metrics → `crates/mc-service/tests/gc_integration.rs`
 - Heartbeat task tests → `crates/mc-service/tests/heartbeat_tasks.rs`
-- Join flow integration tests (WebTransport + mock MH store; `TestServer::accept_loop` fork at :213-246 — deleted once accept-loop component test lands, ADR-0032 phasing step 3) → `crates/mc-service/tests/join_tests.rs`
-- Test utilities (mock GC/Redis/MH) → `crates/mc-test-utils/src/`
+- Per-cluster MetricAssertion tests + Cat B matrix → `crates/mc-service/src/observability/metrics.rs`
+- Test utilities (mock GC/Redis/MH, jwt_test) → `crates/mc-test-utils/src/`
 - Env-tests MC-GC integration → `crates/env-tests/tests/22_mc_gc_integration.rs`
 
 ## Advertise Address Config
-- Config fields: `grpc_advertise_address`, `webtransport_advertise_address` → `crates/mc-service/src/config.rs`
-- Used in GC registration and MH RegisterMeeting → `crates/mc-service/src/grpc/gc_client.rs`, `connection.rs`
-- K8s: derived from downward API `$(POD_IP)` → `infra/services/mc-service/deployment.yaml`
+- Config fields `grpc_advertise_address` / `webtransport_advertise_address`; consumed by GC registration + MH RegisterMeeting → `crates/mc-service/src/config.rs`, `crates/mc-service/src/grpc/gc_client.rs`, `crates/mc-service/src/webtransport/connection.rs`
 
 ## Infrastructure
-- K8s deployment (incl. POD_IP downward API, advertise addresses) → `infra/services/mc-service/deployment.yaml`
-- Network policy → `infra/services/mc-service/network-policy.yaml`
+- K8s deployment (POD_IP downward API, advertise addresses) → `infra/services/mc-service/deployment.yaml`
+- K8s network policy → `infra/services/mc-service/network-policy.yaml`
 - Grafana dashboard → `infra/grafana/dashboards/mc-overview.json`
 - Prometheus alert rules → `infra/docker/prometheus/rules/mc-alerts.yaml`
