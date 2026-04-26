@@ -822,15 +822,13 @@ T=30s+    If capacity drops < 90%:
 
 **Metrics** (`mc_{subsystem}_{metric}_{unit}`):
 
-| Metric | Type | Purpose |
-|--------|------|---------|
-| `mc_connections_active` | Gauge | Current connections |
-| `mc_meetings_active` | Gauge | Current meetings |
-| `mc_message_latency_seconds` | Histogram | Processing latency |
-| `mc_actor_mailbox_depth{actor_type}` | Gauge | Backpressure indicator |
-| `mc_redis_latency_seconds` | Histogram | Cache performance |
-| `mc_fenced_out_total{reason}` | Counter | Split-brain events |
-| `mc_recovery_duration_seconds` | Histogram | Session recovery time |
+MC emits the following metric categories:
+
+- **Gauges** for active resources (connections, meetings, mailbox depth)
+- **Histograms** for latency-critical paths (Redis operations, session join, GC heartbeat)
+- **Counters** for outcome and failure events (session/meeting lifecycle outcomes, JWT validations, fence events, actor panics, message drops, MC↔MH coordination, token refreshes, caller-type rejections)
+
+See `docs/observability/metrics/mc-service.md` for the authoritative catalog of current metric names and labels.
 
 **W3C Trace Context Propagation**:
 

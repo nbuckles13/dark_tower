@@ -119,28 +119,20 @@ kill %1
 # In Prometheus:
 sum by(actor_type) (mc_actor_mailbox_depth)
 
-# 3. Check message processing rate vs incoming rate
-# Processing rate:
-sum by(actor_type) (rate(mc_message_latency_seconds_count[5m]))
-# If processing rate is lower than mailbox growth, actor is overwhelmed
-
-# 4. Check for slow message processing
-histogram_quantile(0.99, sum by(le, actor_type) (rate(mc_message_latency_seconds_bucket[5m])))
-
-# 5. Check active meetings and connections
+# 3. Check active meetings and connections
 curl http://localhost:8080/metrics | grep -E "mc_meetings_active|mc_connections_active"
 
-# 6. Check pod resource usage
+# 4. Check pod resource usage
 kubectl top pods -n dark-tower -l app=mc-service
 
-# 7. Check for message drops
+# 5. Check for message drops
 curl http://localhost:8080/metrics | grep mc_messages_dropped_total
 ```
 
 **Common Root Causes**:
 
 1. **Slow Message Processing**: Message handler taking too long
-   - Check: p99 processing latency by actor type
+   - Check: mailbox depth growth by actor type, Redis p99 latency, session join p95
    - Fix: Investigate specific actor logic, optimize, or scale
 
 2. **Message Storm**: Burst of messages from clients
@@ -307,8 +299,8 @@ kubectl port-forward -n dark-tower deployment/mc-service 8080:8080 &
 curl http://localhost:8080/metrics | grep -E "mc_meetings_active|mc_connections_active"
 kill %1
 
-# 2. Check message processing activity
-curl http://localhost:8080/metrics | grep mc_message_latency_seconds
+# 2. Check session join activity and outcomes
+curl http://localhost:8080/metrics | grep -E "mc_session_joins_total|mc_session_join_duration_seconds"
 
 # 3. Look for meeting-related errors in logs
 kubectl logs -n dark-tower -l app=mc-service --tail=500 | grep -i "meeting\|session\|lifecycle"
@@ -478,27 +470,26 @@ kubectl logs -n dark-tower -l app=mc-service --tail=50
 
 ### Scenario 5: High Latency
 
-**Alert**: `MCHighLatency`
-**Severity**: Critical
+**Alert**: `MCHighJoinLatency` (info: session-join p95 >2s for 5m), Redis SLO breach
+**Severity**: Info / Warning (depending on SLI breached)
 **Runbook Section**: `#scenario-5-high-latency`
 
 **Symptoms**:
-- Alert: p95 message processing latency >500ms
-- Meeting participants experiencing delays
-- Sluggish real-time communication
+- Session join p95 exceeding 2s SLO
+- Redis p99 exceeding 10ms SLO
+- Meeting participants experiencing slow joins
 - Possible timeout errors in clients
 
 **Diagnosis**:
 
 ```bash
-# 1. Check current latency metrics
+# 1. Check session join and Redis latency metrics
 kubectl port-forward -n dark-tower deployment/mc-service 8080:8080 &
-curl http://localhost:8080/metrics | grep mc_message_latency_seconds
+curl http://localhost:8080/metrics | grep -E "mc_session_join_duration_seconds|mc_redis_latency_seconds"
 kill %1
 
-# 2. Check latency by actor type
-# In Prometheus:
-histogram_quantile(0.95, sum by(actor_type, le) (rate(mc_message_latency_seconds_bucket[5m])))
+# 2. Session join p95 by status (Prometheus)
+histogram_quantile(0.95, sum by(status, le) (rate(mc_session_join_duration_seconds_bucket[5m])))
 
 # 3. Check mailbox depth (backpressure causes latency)
 sum by(actor_type) (mc_actor_mailbox_depth)
@@ -565,8 +556,8 @@ kubectl delete pod <POD_NAME> -n dark-tower
 # WARNING: Active meetings affected
 
 # Verify recovery
-histogram_quantile(0.95, sum by(le) (rate(mc_message_latency_seconds_bucket[5m])))
-# Should return value < 0.500
+histogram_quantile(0.95, sum by(le) (rate(mc_session_join_duration_seconds_bucket{status="success"}[5m])))
+# Should return value < 2.000
 ```
 
 **Escalation**:
@@ -1190,8 +1181,11 @@ curl http://localhost:8080/metrics | grep mc_meetings
 # Connection metrics
 curl http://localhost:8080/metrics | grep mc_connections
 
-# Message latency metrics
-curl http://localhost:8080/metrics | grep mc_message_latency
+# Session join metrics (rate, duration, failures)
+curl http://localhost:8080/metrics | grep mc_session_join
+
+# Redis op latency
+curl http://localhost:8080/metrics | grep mc_redis_latency
 
 # GC integration metrics
 curl http://localhost:8080/metrics | grep mc_gc

@@ -21,16 +21,7 @@ All `_total` counter metrics representing discrete events use `increase()` for b
 **Timeseries panels**: `increase(metric[$__rate_interval])`
 **Stat panels**: `increase(metric[$__range])`
 
-Applies to:
-- HTTP request counts by status code (`gc_http_requests_total`, `ac_http_requests_total`)
-- Meeting creation/join counts (`gc_meeting_creation_total`, `gc_meeting_join_total`)
-- MC assignment counts (`gc_mc_assignments_total`)
-- Token issuance counts (`ac_token_issuance_total`)
-- Error counts (`ac_errors_total`, `gc_errors_total`, `mc_errors_total`)
-- Security event counts (`ac_rate_limit_decisions_total`, `ac_token_validations_total`, `mc_jwt_validations_total`, `mc_webtransport_connections_total{status="rejected"}`, `mc_session_join_failures_total`, `mc_fenced_out_total`)
-- Message/actor counts (`mc_messages_dropped_total`, `mc_actor_panics_total`)
-- Credential/key operations (`ac_credential_operations_total`, `ac_key_rotation_total`)
-- DB query counts (`ac_db_queries_total`, `gc_db_queries_total`)
+Applies to per-service `*_total` counters: HTTP requests, meeting lifecycle events, MC assignments, token issuance, security events (JWT validations, rate-limit decisions, connection rejections), session-join outcomes, MC↔MH coordination events, fence events, actor panics, credential operations, DB queries. See `docs/observability/metrics/{ac,gc,mc,mh}-service.md` for the current set. *Example: `ac_token_issuance_total`.*
 
 **Y-axis labels** must reflect counts: "requests", "errors", "events" — not "req/s".
 
@@ -41,26 +32,26 @@ Metrics requiring per-second normalization or ratio math use `rate()` with `$__r
 Applies to:
 - **Error percentages**: `rate(errors[w]) / rate(total[w])` — ratio requires rate/rate
 - **Histogram quantiles**: `histogram_quantile(0.95, rate(bucket[w]))` — PromQL requires rate()
-- **Latency distributions**: histogram bucket panels
+- **Latency distributions**: histogram bucket panels (e.g., `mc_session_join_duration_seconds_bucket`, `mc_redis_latency_seconds_bucket`)
 - **CPU utilization**: `rate(container_cpu_usage_seconds_total[w])` — must be rate for fraction
 - **Any ratio panel**: numerator and denominator both use rate()
 
 ### Category C: SLO Dashboards → `rate()` with Explicit Windows
 
-SLO dashboards (`ac-slos.json`, `gc-slos.json`, `mc-slos.json`) keep their current hardcoded windows (30d, 7d, 28d, 1h, 6h) to maintain exact parity with alert rule expressions. SLO burn-rate math is a special case where the window is part of the definition.
+SLO dashboards (`ac-slos.json`, `gc-slos.json`, `mc-slos.json`) keep their current hardcoded windows (30d, 7d, 28d, 1h, 6h) to maintain exact parity with alert rule expressions. SLO burn-rate math is a special case where the window is part of the definition. See per-service catalogs for the metrics underlying each SLO.
 
 ### New Stat Panels
 
-Add `increase(metric[$__range])` stat panels to each overview dashboard:
+Add `increase(metric[$__range])` stat panels to each overview dashboard. Choose service-appropriate `*_total` counters from `docs/observability/metrics/{ac,gc,mc,mh}-service.md`:
 
 **Traffic Summary row** (top of each dashboard, not collapsed):
-- AC: `ac_token_issuance_total`, `ac_http_requests_total`
-- GC: `gc_http_requests_total`, `gc_mc_assignments_total`
-- MC: `mc_message_latency_seconds_count` (messages processed proxy), `mc_meetings_active` (gauge — no change needed)
+- AC: token issuance, HTTP requests. *Example: `ac_token_issuance_total`.*
+- GC: HTTP requests, MC assignments. *Example: `gc_http_requests_total`.*
+- MC: session joins, active meetings (gauge — no change needed). *Example: `mc_session_joins_total`.*
 
 **Security Events row** (on dashboards with security-relevant metrics):
-- AC: `ac_rate_limit_decisions_total`, `ac_token_validations_total{status="failure"}`
-- MC: `mc_jwt_validations_total{result="failure"}`, `mc_session_join_failures_total`, `mc_webtransport_connections_total{status="rejected"}`
+- AC: rate-limit decisions, token-validation failures
+- MC: JWT-validation failures, session-join failures, WebTransport connection rejections, caller-type rejections
 
 ### Alert Rules
 
