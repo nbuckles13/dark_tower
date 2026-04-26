@@ -51,16 +51,6 @@ All MC service metrics follow ADR-0011 naming conventions with the `mc_` prefix.
 
 ## Message Processing Metrics
 
-### `mc_message_latency_seconds`
-- **Type**: Histogram
-- **Description**: Signaling message processing latency
-- **Labels**:
-  - `message_type`: Protobuf message type (e.g., `join_request`, `leave_request`, `layout_update`)
-- **Buckets**: [0.001, 0.005, 0.010, 0.025, 0.050, 0.100, 0.250, 0.500, 1.000]
-- **SLO Target**: p99 < 100ms for signaling messages
-- **Cardinality**: Low (~20 message types)
-- **Usage**: Monitor message processing latency, identify slow message types
-
 ### `mc_messages_dropped_total`
 - **Type**: Counter
 - **Description**: Messages dropped due to backpressure
@@ -118,19 +108,6 @@ All MC service metrics follow ADR-0011 naming conventions with the `mc_` prefix.
   - `reason`: Fencing reason (`stale_generation`, `concurrent_write`)
 - **Cardinality**: Low (2-3 reasons)
 - **Usage**: Detect split-brain scenarios. Should be rare in normal operation. Investigate if rate > 0.1/min.
-
----
-
-## Recovery Metrics
-
-### `mc_recovery_duration_seconds`
-- **Type**: Histogram
-- **Description**: Session recovery duration after reconnection with binding token
-- **Labels**: None
-- **Buckets**: [0.005, 0.010, 0.025, 0.050, 0.100, 0.250, 0.500, 1.000, 2.500, 5.000, 10.000]
-- **SLO Target**: p99 < 500ms
-- **Cardinality**: 1 (no labels)
-- **Usage**: Monitor session recovery performance. Includes Redis state fetch, session rehydration, and actor re-creation.
 
 ---
 
@@ -266,19 +243,6 @@ All MC service metrics follow ADR-0011 naming conventions with the `mc_` prefix.
 sum(mc_meetings_active)
 ```
 
-### Message Processing Latency p99
-```promql
-histogram_quantile(0.99,
-  sum(rate(mc_message_latency_seconds_bucket[5m])) by (le)
-)
-```
-
-### Message Drop Rate
-```promql
-100 * sum(rate(mc_messages_dropped_total[5m])) /
-(sum(rate(mc_messages_dropped_total[5m])) + sum(rate(mc_message_latency_seconds_count[5m])))
-```
-
 ### Redis p99 Latency
 ```promql
 histogram_quantile(0.99,
@@ -354,23 +318,11 @@ sum(rate(mc_media_connection_failures_total{all_failed="true"}[5m]))
 
 ## SLO Definitions
 
-### Message Processing Latency
-- **SLI**: p99 message processing duration
-- **Threshold**: < 100ms
-- **Window**: 30 days
-- **Objective**: 99% of messages under threshold
-
 ### Redis Latency
 - **SLI**: p99 Redis operation duration
 - **Threshold**: < 10ms
 - **Window**: 30 days
 - **Objective**: 99.9% of operations under threshold
-
-### Session Recovery
-- **SLI**: p99 session recovery duration
-- **Threshold**: < 500ms
-- **Window**: 30 days
-- **Objective**: 99% of recoveries under threshold
 
 ---
 
@@ -381,7 +333,6 @@ All MC service metrics follow strict cardinality bounds per ADR-0011:
 | Label | Bound | Values |
 |-------|-------|--------|
 | `actor_type` | 3 | `controller`, `meeting`, `connection` |
-| `message_type` | ~20 | Bounded by protobuf message types |
 | `operation` | ~10 | Bounded by Redis commands |
 | `reason` | 2-3 | `stale_generation`, `concurrent_write` |
 | `status` | 2-3 | `success`, `error`/`failure`, `accepted`/`rejected` |

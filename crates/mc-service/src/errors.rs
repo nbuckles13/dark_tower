@@ -145,12 +145,14 @@ impl McError {
         }
     }
 
-    /// Returns the signaling error code as a u16 (for metrics recording).
+    /// Returns the signaling error code as a u16 (for future metric label use).
     ///
-    /// Maps signaling `ErrorCode` values to u16 for the `status_code` label
-    /// in `mc_errors_total`. MC uses signaling codes (not HTTP status codes)
-    /// since it communicates via WebTransport, not HTTP.
-    #[allow(dead_code)] // Used in Phase 6b+
+    /// Reserved for a future global MC error counter; the consumer (`mc_errors_total`)
+    /// was removed 2026-04-26 per ADR-0032 Step 3 follow-up. Cross-service
+    /// error-metric strategy is open — see `docs/TODO.md §Observability Debt`.
+    /// MC uses signaling codes (not HTTP status codes) since it communicates
+    /// via WebTransport, not HTTP.
+    #[allow(dead_code)] // Reserved; see doc-comment above.
     #[allow(clippy::cast_sign_loss)] // error_code() returns well-known positive values 2-7
     pub fn status_code(&self) -> u16 {
         self.error_code() as u16

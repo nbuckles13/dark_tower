@@ -228,6 +228,46 @@ A small follow-up landed during reflection: brace-expansion path notation (`{a,b
 
 ---
 
+## Human Review (Iteration 2) — 2026-04-26
+
+**Feedback**: "We should not have metrics that are not used; if nothing else we can't test them, so the every-metric-must-be-tested guard will either complain or we have a pointless test." Disposition for the 3 MC observability orphans logged in §Tech Debt: REMOVE all three (`record_message_latency`, `record_recovery_duration`, `record_error`).
+
+**Mode**: `--continue --light`
+
+**Iter 2 Loop Metadata**:
+- Iter 2 start commit: `8e813a2a6716127592d1f3bb678aefb3812b6465`
+- Iter 2 team: `adr-0032-step-3-iter2-orphans`
+- Iter 2 reviewers: Security + Observability (light mode 3-team: implementer + 2 reviewers)
+
+**Iter 2 Verdicts**:
+- Security: CLEAR
+- Observability: RESOLVED (1 finding, 1 fixed — F1 stale `mc_errors_total` doc-comment on `McError::status_code()` rewritten to reference the 2026-04-26 removal and the open cross-service error-metric strategy TODO entry; method kept with tightened `#[allow(dead_code)]` justification)
+
+**Iter 2 Implementation Summary**:
+- Source: removed wrappers `record_message_latency`, `record_recovery_duration`, `record_error` + their `histogram!`/`counter!` macro emissions + bucket configs (`Matcher::Prefix("mc_message")`, `Matcher::Prefix("mc_recovery")`) + 3 in-module `test_record_*` tests; renumbered remaining smoke-test calls 1→5 from 1→8.
+- `crates/mc-service/src/observability/mod.rs`: removed 3 `pub use` re-exports + 3 rows from the metric-summary doc-comment table.
+- `crates/mc-service/tests/orphan_metrics_integration.rs`: deleted entirely.
+- `crates/mc-service/src/errors.rs`: F1 fix — `McError::status_code()` doc-comment rewritten (no longer claims `mc_errors_total` callsite); `#[allow(dead_code)]` justification updated.
+- Dashboards: 6 panels removed from `mc-overview.json`; 7 of 10 panels removed from `mc-slos.json` (the broken-since-emission-was-removed half); MC target trimmed in `errors-overview.json`; "SLO Violations" panel removed from `errors-overview.json`.
+- Alerts: 3 alerts removed from `mc-alerts.yaml` (`MCHighLatency`, `MCHighMessageDropRate`, `MCMeetingStale`).
+- Catalog: 3 metric entries + 2 PromQL example blocks + 2 SLO definitions + `message_type` cardinality row removed from `docs/observability/metrics/mc-service.md`.
+- INDEX: removed orphan-metric tests pointer from `docs/specialist-knowledge/meeting-controller/INDEX.md`.
+- TODO: closed "MC observability orphans — wire production callers or remove" with `[x]` + resolution note pointing at iter-2 main.md; opened "MC orphan-metric removal: clean up runbook + ADR-0023/0029 historical refs" as a follow-up scope (4 doc files, mechanical edits, owner: observability); pre-existing "Cross-service error-metric strategy is incoherent — rationalize" remains OPEN as designed.
+
+**Iter 2 Validation Results**:
+| Layer | Verdict | Notes |
+|-------|---------|-------|
+| 1 cargo check | PASS | |
+| 2 cargo fmt | PASS | |
+| 3 simple guards | EXPECTED-FAIL | 15/16 PASS; `validate-metric-coverage` red because AC: 17, GC: 25 remain uncovered (Steps 4-5 scope); `mc-service: 0` ✓ |
+| 4 cargo test -p mc-service | PASS | 312 pass / 0 fail / 2 ignored (was 320 pre-iter-2; net -8 from removed orphan tests) |
+| 5 clippy -D warnings | PASS | |
+| 6 cargo audit | PASS | 7 vulnerabilities pre-existing (verified vs baseline) |
+| 7 semantic-guard | SAFE | Zero leftover call sites, zero dashboard/alert dangling refs, logically pure deletion |
+| 8 env-tests | SKIPPED | Test-only + delete-only scope; matches Step 2/3 precedent |
+
+---
+
 ## Issues Encountered & Resolutions
 
 ### Issue 1: Brace-expansion path notation rejected by INDEX guard

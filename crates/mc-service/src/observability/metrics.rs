@@ -10,7 +10,6 @@
 //! Labels are bounded to prevent cardinality explosion (ADR-0011):
 //! - `actor_type`: 3 values max (controller, meeting, participant)
 //! - `operation`: bounded by Redis commands (~10 values)
-//! - `message_type`: bounded by protobuf types (~20 values)
 //! - `reason`: bounded fencing reasons (2-3 values)
 //!
 //! Maximum 1,000 unique label combinations per metric.
@@ -25,8 +24,6 @@ use std::time::Duration;
 /// ADR-0011: Must be called before any metrics are recorded.
 /// Configures histogram buckets aligned with SLO targets:
 /// - GC heartbeat p95 < 100ms
-/// - Message latency p99 < 100ms
-/// - Recovery duration p99 < 500ms
 /// - Redis latency p99 < 10ms
 ///
 /// # Errors
@@ -42,22 +39,6 @@ pub fn init_metrics_recorder() -> Result<PrometheusHandle, String> {
             ],
         )
         .map_err(|e| format!("Failed to set GC heartbeat buckets: {e}"))?
-        // Message latency buckets - internal service call
-        .set_buckets_for_metric(
-            Matcher::Prefix("mc_message".to_string()),
-            &[
-                0.001, 0.005, 0.010, 0.025, 0.050, 0.100, 0.250, 0.500, 1.000,
-            ],
-        )
-        .map_err(|e| format!("Failed to set message latency buckets: {e}"))?
-        // Recovery duration buckets - longer operations, HTTP-style
-        .set_buckets_for_metric(
-            Matcher::Prefix("mc_recovery".to_string()),
-            &[
-                0.005, 0.010, 0.025, 0.050, 0.100, 0.250, 0.500, 1.000, 2.500, 5.000, 10.000,
-            ],
-        )
-        .map_err(|e| format!("Failed to set recovery duration buckets: {e}"))?
         // Redis latency buckets - internal service call (like DB queries)
         .set_buckets_for_metric(
             Matcher::Prefix("mc_redis".to_string()),
@@ -143,19 +124,6 @@ pub fn set_actor_mailbox_depth(actor_type: &str, depth: usize) {
 // Latency Metrics (Histograms)
 // ============================================================================
 
-/// Record signaling message processing latency.
-///
-/// Metric: `mc_message_latency_seconds`
-/// Labels: `message_type`
-///
-/// Cardinality: ~20 (bounded by protobuf message types)
-///
-/// SLO target: p99 < 100ms for signaling messages
-pub fn record_message_latency(message_type: &str, duration: Duration) {
-    histogram!("mc_message_latency_seconds", "message_type" => message_type.to_string())
-        .record(duration.as_secs_f64());
-}
-
 /// Record Redis operation latency.
 ///
 /// Metric: `mc_redis_latency_seconds`
@@ -168,19 +136,6 @@ pub fn record_message_latency(message_type: &str, duration: Duration) {
 pub fn record_redis_latency(operation: &str, duration: Duration) {
     histogram!("mc_redis_latency_seconds", "operation" => operation.to_string())
         .record(duration.as_secs_f64());
-}
-
-/// Record session recovery duration.
-///
-/// Metric: `mc_recovery_duration_seconds`
-/// Labels: none
-///
-/// Tracks time to recover a session after reconnection with binding token.
-/// Includes Redis state fetch, session rehydration, and actor re-creation.
-///
-/// SLO target: p99 < 500ms for session recovery
-pub fn record_recovery_duration(duration: Duration) {
-    histogram!("mc_recovery_duration_seconds").record(duration.as_secs_f64());
 }
 
 // ============================================================================
@@ -452,27 +407,6 @@ pub fn record_caller_type_rejected(grpc_service: &str, expected_type: &str, actu
     .increment(1);
 }
 
-// ============================================================================
-// Error Metrics
-// ============================================================================
-
-/// Record error by category.
-///
-/// Metric: `mc_errors_total`
-/// Labels: `operation`, `error_type`, `status_code`
-///
-/// The `operation` label uses a subsystem prefix to disambiguate across
-/// the global error counter (e.g., `"token_refresh"`, `"gc_heartbeat"`,
-/// `"redis_session"`).
-pub fn record_error(operation: &str, error_type: &str, status_code: u16) {
-    counter!("mc_errors_total",
-        "operation" => operation.to_string(),
-        "error_type" => error_type.to_string(),
-        "status_code" => status_code.to_string()
-    )
-    .increment(1);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -528,15 +462,6 @@ mod tests {
     }
 
     #[test]
-    fn test_record_message_latency() {
-        // Test with various message types and durations
-        record_message_latency("join_request", Duration::from_millis(10));
-        record_message_latency("leave_request", Duration::from_millis(5));
-        record_message_latency("layout_update", Duration::from_millis(50));
-        record_message_latency("media_control", Duration::from_millis(2));
-    }
-
-    #[test]
     fn test_record_redis_latency() {
         // Test with various Redis operations
         record_redis_latency("get", Duration::from_micros(500));
@@ -545,15 +470,6 @@ mod tests {
         record_redis_latency("incr", Duration::from_micros(400));
         record_redis_latency("hset", Duration::from_millis(1));
         record_redis_latency("eval", Duration::from_millis(2));
-    }
-
-    #[test]
-    fn test_record_recovery_duration() {
-        // Test with various recovery times
-        record_recovery_duration(Duration::from_millis(50));
-        record_recovery_duration(Duration::from_millis(100));
-        record_recovery_duration(Duration::from_millis(500));
-        record_recovery_duration(Duration::from_secs(1));
     }
 
     #[test]
@@ -619,16 +535,6 @@ mod tests {
 
         // Error path
         record_register_meeting("error", Duration::from_millis(100));
-    }
-
-    #[test]
-    fn test_record_error() {
-        // MC uses signaling error codes (2-7), not HTTP status codes
-        record_error("token_refresh", "http", 6); // INTERNAL_ERROR
-        record_error("gc_heartbeat", "grpc", 6); // INTERNAL_ERROR
-        record_error("redis_session", "redis", 6); // INTERNAL_ERROR
-        record_error("meeting_join", "capacity_exceeded", 7); // CAPACITY_EXCEEDED
-        record_error("session_binding", "session_binding", 2); // UNAUTHORIZED
     }
 
     #[test]
@@ -899,7 +805,6 @@ mod tests {
     //   - tests/gc_integration.rs (gc_heartbeats + latency)
     //   - tests/actor_metrics_integration.rs (mailbox_depth, panics, dropped, gauges)
     //   - tests/redis_metrics_integration.rs (redis_latency, fenced_out)
-    //   - tests/orphan_metrics_integration.rs (message_latency, recovery_duration, errors)
     // The block here is the in-file mirror that exercises the metrics.rs
     // wrappers themselves end-to-end through MetricAssertion.
     // ========================================================================
@@ -1080,20 +985,14 @@ mod tests {
         // 2. mc_meetings_active (gauge)
         set_meetings_active(0);
 
-        // 3. mc_message_latency_seconds (histogram with message_type label)
-        record_message_latency("test_type", Duration::from_millis(1));
-
-        // 4. mc_actor_mailbox_depth (gauge with actor_type label)
+        // 3. mc_actor_mailbox_depth (gauge with actor_type label)
         set_actor_mailbox_depth("controller", 0);
 
-        // 5. mc_redis_latency_seconds (histogram with operation label)
+        // 4. mc_redis_latency_seconds (histogram with operation label)
         record_redis_latency("test_op", Duration::from_millis(1));
 
-        // 6. mc_fenced_out_total (counter with reason label)
+        // 5. mc_fenced_out_total (counter with reason label)
         record_fenced_out("test_reason");
-
-        // 7. mc_recovery_duration_seconds (histogram)
-        record_recovery_duration(Duration::from_millis(1));
 
         // If we get here without panicking, all metric functions are callable
     }
