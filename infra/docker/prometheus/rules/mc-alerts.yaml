@@ -58,40 +58,6 @@ groups:
           impact: "Message processing severely delayed. Active meetings experiencing significant lag or failures."
           runbook_url: "https://github.com/yourorg/dark_tower/blob/main/docs/runbooks/mc-incident-response.md#scenario-1-high-mailbox-depth"
 
-      - alert: MCHighLatency
-        expr: |
-          histogram_quantile(0.95,
-            sum by(le) (rate(mc_message_latency_seconds_bucket[5m]))
-          ) > 0.500
-        for: 5m
-        labels:
-          severity: critical
-          service: mc-service
-          component: message-processing
-        annotations:
-          summary: "MC p95 message processing latency above SLO ({{ $value }}s > 500ms)"
-          description: "Meeting Controller p95 message processing latency is {{ $value }}s, exceeding 500ms SLO for 5 minutes."
-          impact: "Slow meeting experience. Participants experiencing noticeable delays."
-          runbook_url: "https://github.com/yourorg/dark_tower/blob/main/docs/runbooks/mc-incident-response.md#scenario-5-high-latency"
-
-      - alert: MCHighMessageDropRate
-        expr: |
-          (
-            sum(rate(mc_messages_dropped_total[5m]))
-            /
-            (sum(rate(mc_messages_dropped_total[5m])) + sum(rate(mc_message_latency_seconds_count[5m])))
-          ) > 0.01
-        for: 5m
-        labels:
-          severity: critical
-          service: mc-service
-          component: message-processing
-        annotations:
-          summary: "MC message drop rate above SLO ({{ $value | humanizePercentage }})"
-          description: "Meeting Controller is dropping {{ $value | humanizePercentage }} of messages, exceeding 1% SLO threshold for 5 minutes."
-          impact: "Messages being lost. Active meetings affected - participants may miss updates."
-          runbook_url: "https://github.com/yourorg/dark_tower/blob/main/docs/runbooks/mc-incident-response.md#scenario-1-high-mailbox-depth"
-
       - alert: MCGCHeartbeatFailure
         expr: |
           (
@@ -175,21 +141,6 @@ groups:
           summary: "MC has active meetings but no connections"
           description: "Meeting Controller has {{ $value }} active meetings but no WebTransport connections for 5 minutes."
           impact: "Meetings may be orphaned. Investigate connection issues."
-          runbook_url: "https://github.com/yourorg/dark_tower/blob/main/docs/runbooks/mc-incident-response.md#scenario-3-meeting-lifecycle-issues"
-
-      - alert: MCMeetingStale
-        expr: |
-          sum(mc_meetings_active) > 0 and
-          sum(rate(mc_message_latency_seconds_count[10m])) == 0
-        for: 10m
-        labels:
-          severity: warning
-          service: mc-service
-          component: meeting-lifecycle
-        annotations:
-          summary: "MC has meetings but no message processing"
-          description: "Meeting Controller has active meetings but no messages processed in 10 minutes."
-          impact: "Meetings may be stuck. Investigate meeting state."
           runbook_url: "https://github.com/yourorg/dark_tower/blob/main/docs/runbooks/mc-incident-response.md#scenario-3-meeting-lifecycle-issues"
 
       - alert: MCGCHeartbeatWarning

@@ -162,17 +162,6 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "100 * (sum by(job) (rate(mc_messages_dropped_total{job=\"mc-service\"}[$__rate_interval])) / (sum by(job) (rate(mc_messages_dropped_total{job=\"mc-service\"}[$__rate_interval])) + sum by(job) (rate(mc_message_latency_seconds_count{job=\"mc-service\"}[$__rate_interval]))))",
-          "legendFormat": "mc-service",
-          "range": true,
-          "refId": "C"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "editorMode": "code",
           "expr": "vector(1)",
           "legendFormat": "SLO (1%)",
           "range": true,
@@ -181,82 +170,6 @@
       ],
       "title": "Error Rate by Service",
       "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "description": "Services currently exceeding 1% error rate SLO. Green = all services within SLO, Red = violations detected.",
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "thresholds"
-          },
-          "mappings": [
-            {
-              "options": {
-                "0": {
-                  "color": "green",
-                  "index": 0,
-                  "text": "All within SLO"
-                }
-              },
-              "type": "value"
-            }
-          ],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              },
-              {
-                "color": "red",
-                "value": 1
-              }
-            ]
-          },
-          "unit": "none"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 8,
-        "x": 16,
-        "y": 0
-      },
-      "id": 2,
-      "options": {
-        "orientation": "auto",
-        "reduceOptions": {
-          "values": false,
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": ""
-        },
-        "showThresholdLabels": false,
-        "showThresholdMarkers": true
-      },
-      "pluginVersion": "9.5.3",
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "editorMode": "code",
-          "expr": "count((100 * (sum by(job) (rate(ac_errors_total{job=\"ac-service\"}[$__rate_interval])) / (sum by(job) (rate(ac_token_issuance_total{job=\"ac-service\"}[$__rate_interval])) + sum by(job) (rate(ac_jwks_requests_total{job=\"ac-service\"}[$__rate_interval])))) > 1) or (100 * (sum by(job) (rate(gc_http_requests_total{job=\"gc-service\", status_code=~\"[45]..\"}[$__rate_interval])) / sum by(job) (rate(gc_http_requests_total{job=\"gc-service\"}[$__rate_interval]))) > 1) or (100 * (sum by(job) (rate(mc_messages_dropped_total{job=\"mc-service\"}[$__rate_interval])) / (sum by(job) (rate(mc_messages_dropped_total{job=\"mc-service\"}[$__rate_interval])) + sum by(job) (rate(mc_message_latency_seconds_count{job=\"mc-service\"}[$__rate_interval])))) > 1)) or vector(0)",
-          "legendFormat": "Services Violating SLO",
-          "range": true,
-          "refId": "A"
-        }
-      ],
-      "title": "SLO Violations (Count)",
-      "type": "stat"
     },
     {
       "datasource": {

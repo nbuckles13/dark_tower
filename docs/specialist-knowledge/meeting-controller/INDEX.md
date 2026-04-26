@@ -56,7 +56,6 @@
 - RegisterMeeting metrics (stub MH gRPC) → `crates/mc-service/tests/register_meeting_integration.rs`
 - ActorMetrics / MailboxMonitor metrics → `crates/mc-service/tests/actor_metrics_integration.rs`
 - Redis-class wrapper coverage → `crates/mc-service/tests/redis_metrics_integration.rs`
-- Orphan-metric wrappers (no production callers) → `crates/mc-service/tests/orphan_metrics_integration.rs`
 - Token-refresh integration (Cat B) → `crates/mc-service/tests/token_refresh_integration.rs`
 - GC integration + heartbeat metrics → `crates/mc-service/tests/gc_integration.rs`
 - Heartbeat task tests → `crates/mc-service/tests/heartbeat_tasks.rs`
