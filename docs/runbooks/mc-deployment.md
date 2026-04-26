@@ -301,7 +301,8 @@ kill %1
 - `mc_meetings_active` - Active meeting count
 - `mc_connections_active` - Active WebTransport connections
 - `mc_actor_mailbox_depth` - Actor mailbox depth (should be low)
-- `mc_message_latency_seconds` - Message latency (p95 <500ms SLO)
+- `mc_session_join_duration_seconds` - Session join latency (p95 SLO)
+- `mc_redis_latency_seconds` - Redis op latency (p99 <10ms SLO)
 
 ### 9. Post-Deployment Checklist
 
@@ -312,7 +313,7 @@ kill %1
 - [ ] GC heartbeat succeeding
 - [ ] GC has MC marked as 'active'
 - [ ] Actor mailbox depths low (<50)
-- [ ] Message processing latency within SLO (<500ms p95)
+- [ ] Session join duration within SLO (p95 < 2s)
 - [ ] No actor panics in metrics
 
 ---
@@ -336,7 +337,8 @@ kill %1
    - GC heartbeat failures
 
 3. **Severe performance degradation**
-   - p95 message latency >1s (2x SLO)
+   - p95 session join duration >4s (2x SLO)
+   - Redis p99 latency >50ms (5x SLO)
    - Mailbox depth critical (>500)
    - Memory usage >90%
 
@@ -801,15 +803,18 @@ sum by(actor_type) (mc_actor_mailbox_depth)
 # Actor panics (should be 0)
 sum(increase(mc_actor_panics_total[5m]))
 
-# Message drop rate (should be near 0%)
-sum(rate(mc_messages_dropped_total[5m])) / (sum(rate(mc_messages_dropped_total[5m])) + sum(rate(mc_message_latency_seconds_count[5m])))
+# Messages dropped per second (should be near 0)
+sum by(actor_type) (rate(mc_messages_dropped_total[5m]))
 ```
 
 **Latency:**
 
 ```promql
-# p95 message processing latency (SLO: <500ms)
-histogram_quantile(0.95, sum by(le) (rate(mc_message_latency_seconds_bucket[5m])))
+# p95 session join duration, success only (SLO: <2s)
+histogram_quantile(0.95, sum by(le) (rate(mc_session_join_duration_seconds_bucket{status="success"}[5m])))
+
+# p99 Redis op latency (SLO: <10ms)
+histogram_quantile(0.99, sum by(le) (rate(mc_redis_latency_seconds_bucket[5m])))
 ```
 
 **Capacity:**
@@ -832,8 +837,8 @@ sum(rate(mc_gc_heartbeats_total{status="success"}[5m])) / sum(rate(mc_gc_heartbe
 ### Grafana Dashboards
 
 **Recommended dashboards:**
-- **MC Overview** - Active meetings, connections, mailbox depth, panics
-- **MC SLOs** - Message latency, drop rate, error budget
+- **MC Overview** - Active meetings, connections, mailbox depth, panics, join flow
+- **MC SLOs** - Session join duration, Redis latency, drop rate, error budget
 
 See `infra/grafana/dashboards/mc-overview.json`.
 

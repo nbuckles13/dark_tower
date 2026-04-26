@@ -208,7 +208,7 @@ pub fn record_gc_heartbeat_latency(heartbeat_type: &str, duration: Duration) {
 
 /// Record token refresh attempt.
 ///
-/// Emits three metrics per the metrics catalog (`docs/observability/metrics/mc.md`):
+/// Emits three metrics per the metrics catalog (`docs/observability/metrics/mc-service.md`):
 /// - `mc_token_refresh_total` counter (labels: `status`)
 /// - `mc_token_refresh_duration_seconds` histogram (no labels)
 /// - `mc_token_refresh_failures_total` counter (labels: `error_type`, on failure only)

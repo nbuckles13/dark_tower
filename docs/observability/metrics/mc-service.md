@@ -219,6 +219,36 @@ All MC service metrics follow ADR-0011 naming conventions with the `mc_` prefix.
 
 ---
 
+## Token Manager Metrics (ADR-0010 Section 4a)
+
+### `mc_token_refresh_total`
+- **Type**: Counter
+- **Description**: Total token refresh attempts
+- **Labels**:
+  - `status`: Refresh outcome (`success`, `error`)
+- **Cardinality**: Low (2)
+- **Usage**: Track token refresh rate and success
+- **Recorded in**: `token_manager.rs` after refresh attempt completes
+
+### `mc_token_refresh_duration_seconds`
+- **Type**: Histogram
+- **Description**: Token refresh operation duration
+- **Labels**: None
+- **Buckets**: [0.010, 0.050, 0.100, 0.250, 0.500, 1.000, 2.500, 5.000]
+- **Cardinality**: 1
+- **Usage**: Monitor token refresh latency
+
+### `mc_token_refresh_failures_total`
+- **Type**: Counter
+- **Description**: Token refresh failures by error type
+- **Labels**:
+  - `error_type`: Failure type (`http`, `auth_rejected`, `invalid_response`, `acquisition_failed`, `configuration`, `channel_closed`)
+- **Cardinality**: Low (6)
+- **Alert**: High rate indicates AC connectivity issues
+- **Recorded in**: `token_manager.rs` on refresh failure only
+
+---
+
 ## gRPC Auth Layer 2 Metrics (ADR-0003)
 
 ### `mc_caller_type_rejected_total`
@@ -314,6 +344,11 @@ sum(rate(mc_mh_notifications_received_total[5m])) by (event)
 sum(rate(mc_media_connection_failures_total{all_failed="true"}[5m]))
 ```
 
+### Token Refresh Failures by Reason
+```promql
+sum(rate(mc_token_refresh_failures_total[5m])) by (error_type)
+```
+
 ---
 
 ## SLO Definitions
@@ -323,6 +358,12 @@ sum(rate(mc_media_connection_failures_total{all_failed="true"}[5m]))
 - **Threshold**: < 10ms
 - **Window**: 30 days
 - **Objective**: 99.9% of operations under threshold
+
+### Token Refresh Latency
+- **SLI**: p99 token refresh duration
+- **Threshold**: < 5s
+- **Window**: 30 days
+- **Objective**: 99.9% of refreshes under threshold
 
 ---
 
@@ -340,7 +381,8 @@ All MC service metrics follow strict cardinality bounds per ADR-0011:
 | `result` | 2 | `success`, `failure` (JWT validation) |
 | `token_type` | 3 | `meeting`, `guest`, `service` (JWT validation) |
 | `failure_reason` | 6 | `none`, `signature_invalid`, `expired`, `missing_token`, `scope_mismatch`, `malformed` (JWT validation) |
-| `error_type` | ~19 | Bounded by `McError` enum variants |
+| `error_type` (join failures) | ~19 | Bounded by `McError` enum variants |
+| `error_type` (token refresh) | 6 | `http`, `auth_rejected`, `invalid_response`, `acquisition_failed`, `configuration`, `channel_closed` |
 | `event` | 2 | `connected`, `disconnected` (MH notifications) |
 | `all_failed` | 2 | `true`, `false` (media connection failures) |
 | `grpc_service` | 2 | `MeetingControllerService`, `MediaCoordinationService` (Layer 2 auth) |

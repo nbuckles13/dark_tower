@@ -268,6 +268,88 @@ A small follow-up landed during reflection: brace-expansion path notation (`{a,b
 
 ---
 
+## Human Review (Iteration 3) — 2026-04-26
+
+**Feedback**: "We were tracking status in the ADRs and have now pivoted to tracking status via user stories instead." Plus: ADR-0023's 7-row metric table and ADR-0029's exhaustive metric-name lists are maintenance traps. Disposition: amend in place — replace ADR-0023 §11 with a category-level statement + catalog pointer; replace ADR-0029's exhaustive lists with catalog pointers + 1-2 illustrative examples per category.
+
+**Mode**: `--continue --light`
+
+**Iter 3 Loop Metadata**:
+- Iter 3 start commit: `ea89907440b15b186530880d7b3d3a1ae7a6b73c`
+- Iter 3 team: `adr-0032-step-3-iter3-docs`
+- Iter 3 reviewers: Security + Observability (light mode 3-team: implementer + 2 reviewers)
+
+**Iter 3 Verdicts**:
+- Security: CLEAR (0 findings) — verified runbook substitutions preserve security signals; no PII/credentials in PromQL; ADR amendments retain security invariants (JWT validations, fence events, caller-type rejections, session-join failures, etc.)
+- Observability: CLEAR (1 non-blocking advisory) — A1 minor wording suggestion on ADR-0023 §11 counter bullet ("for failure events" undersells the outcome/lifecycle counters listed); catalog pointer is authoritative so non-blocking. Implementer may address as a one-word fix or leave.
+
+**Iter 3 Implementation Summary**:
+- `docs/runbooks/mc-deployment.md`: replaced dead `mc_message_latency_seconds` references with live equivalents (`mc_session_join_duration_seconds`, `mc_redis_latency_seconds`, scoped failure counters) across §8 metrics list, §9 post-deploy checklist, §Rollback degradation criteria, §Monitoring drop-rate / latency PromQL blocks, §Grafana dashboard hints.
+- `docs/runbooks/mc-incident-response.md`: §Scenario 1 dropped 2 dead diagnosis steps and renumbered; §Scenario 4 step 2 swapped curl-grep target; §Scenario 5 (High Latency) re-anchored on `MCHighJoinLatency` (info, p95 >2s) + Redis SLO with current PromQL; §Diagnostic Toolkit metrics-grep updated.
+- `docs/decisions/adr-0023-meeting-controller-architecture.md` §11: replaced 7-row metric table with category-level statement (gauges / histograms / counters with examples) + pointer to `docs/observability/metrics/mc-service.md`. §Phase 6h NOT touched per scope.
+- `docs/decisions/adr-0029-dashboard-metric-presentation.md`: Categories A/B/C and "New Stat Panels" replaced exhaustive lists with rule + pointer + 1 illustrative example each. Dropped dead `mc_message_latency_seconds_count` MC Traffic Summary bullet, replaced with `mc_session_joins_total`.
+- `docs/observability/metrics/mc.md`: DELETED. Token-refresh trio (`mc_token_refresh_total`, `mc_token_refresh_duration_seconds`, `mc_token_refresh_failures_total`) merged into `mc-service.md` (new section + PromQL example + SLO entry + cardinality row). Code-side doc-comment at `crates/mc-service/src/observability/metrics.rs:211` updated from `mc.md` → `mc-service.md`.
+- TODO closure: §Observability Debt "MC orphan-metric removal: clean up runbook + ADR historical refs" marked `[x]` with one-line resolution.
+
+**Iter 3 Validation Results**:
+| Layer | Verdict | Notes |
+|-------|---------|-------|
+| 1 cargo check | PASS | |
+| 2 cargo fmt | PASS | |
+| 3 simple guards | EXPECTED-FAIL | 15/16 PASS; `validate-metric-coverage` red (AC: 17, GC: 25 remain — Steps 4-5 scope) |
+| 4 cargo test -p mc-service | PASS | 312 pass / 0 fail / 2 ignored (unchanged from iter 2 — doc-only diff) |
+| 5 clippy -D warnings | PASS | |
+| 6 cargo audit | PASS | 7 pre-existing vulnerabilities |
+| 7 semantic-guard | SAFE | `mc.md` migration verified, doc-comment fix path-only, ADR amendments structurally complete |
+| 8 env-tests | SKIPPED | Doc-only changes |
+
+**Iter 3 Implementation Summary**:
+
+Doc-only cleanup of the 5 files surfaced in iter 2. No source/dashboard/alert touch beyond a one-line doc-comment path fix in `metrics.rs`.
+
+1. **`docs/runbooks/mc-deployment.md`**:
+   - §8 "Check key metrics" — replaced `mc_message_latency_seconds` bullet with `mc_session_join_duration_seconds` + `mc_redis_latency_seconds`.
+   - §9 Post-Deployment Checklist — replaced "Message processing latency within SLO (<500ms p95)" with "Session join duration within SLO (p95 < 2s)".
+   - §Rollback "Severe performance degradation" — replaced "p95 message latency >1s (2x SLO)" with "p95 session join duration >4s (2x SLO)" + "Redis p99 latency >50ms (5x SLO)".
+   - §Monitoring "Message drop rate" — replaced rate(mc_messages_dropped_total)/(...+ mc_message_latency_seconds_count) ratio with simpler `sum by(actor_type) (rate(mc_messages_dropped_total[5m]))` (dropped denominator since the message-rate proxy no longer exists).
+   - §Latency block — replaced p95 message-processing query with session-join p95 (status="success") and Redis p99 queries.
+   - §Grafana Dashboards descriptions — updated "MC Overview" and "MC SLOs" hints to current panel surface.
+
+2. **`docs/runbooks/mc-incident-response.md`**:
+   - §Scenario 1 Diagnosis — removed steps 3 ("Check message processing rate vs incoming rate") and 4 ("Check for slow message processing") which depended on `mc_message_latency_seconds_count`/`_bucket`. Renumbered remaining steps. Updated "Slow Message Processing" root-cause check to use mailbox depth + Redis p99 + session join p95 instead of "p99 processing latency by actor type".
+   - §Scenario 4 (Meetings Stuck) Diagnosis step 2 — replaced `grep mc_message_latency_seconds` with `grep -E "mc_session_joins_total|mc_session_join_duration_seconds"`.
+   - §Scenario 5 (High Latency) — re-anchored on the live alert (`MCHighJoinLatency` info, p95 >2s) and Redis SLO. Replaced 3 PromQL queries (curl-grep, p95 by actor_type, recovery verification) with current `mc_session_join_duration_seconds` and `mc_redis_latency_seconds` equivalents. Symptoms list rewritten around session-join latency.
+   - §Diagnostic Toolkit metrics-grep block — replaced "Message latency metrics" bullet with "Session join metrics" + "Redis op latency" greps.
+
+3. **`docs/decisions/adr-0023-meeting-controller-architecture.md`** §11:
+   - Replaced 7-row metric table with the category-level statement (gauges / histograms / counters with examples) and a pointer to `docs/observability/metrics/mc-service.md`.
+   - §Phase 6h NOT touched (per task instructions; covered by §Documentation Hygiene "Remove status/tracking from all ADRs" TODO).
+
+4. **`docs/decisions/adr-0029-dashboard-metric-presentation.md`**:
+   - Category A: replaced 9-bullet exhaustive metric-name list with a categorical description + catalog pointer + one illustrative example (`ac_token_issuance_total`).
+   - Category B: kept derived/normalized rule, swapped the dead `mc_message_latency_seconds`-implicit example for `mc_session_join_duration_seconds_bucket` and `mc_redis_latency_seconds_bucket` as live histogram examples.
+   - Category C: appended catalog pointer.
+   - "New Stat Panels" — Traffic Summary row: replaced AC/GC/MC bullets with categorical descriptions + one illustrative example each. Dropped the `mc_message_latency_seconds_count` (messages-processed proxy) bullet; replaced with `mc_session_joins_total`. Security Events row reframed categorically.
+
+5. **`docs/observability/metrics/mc.md`** — disposition: **DELETED**. Survey: mc.md was a stale parallel of mc-service.md (mc-service.md has all gauges/heartbeats/redis/fencing PLUS the join-flow / MH coordination / caller-type metrics added in Step 3; mc.md was missing those). The only unique-and-still-live content was the 3 token-manager metrics (`mc_token_refresh_total`, `mc_token_refresh_duration_seconds`, `mc_token_refresh_failures_total`). Merged that section + a token-refresh PromQL example + the Token Refresh Latency SLO + a `error_type` (token refresh) cardinality row into mc-service.md before deleting mc.md. Updated the lone code-side reference (`crates/mc-service/src/observability/metrics.rs:211` doc-comment) from `metrics/mc.md` → `metrics/mc-service.md`.
+
+**TODO updates**:
+- §Observability Debt "MC orphan-metric removal" entry: marked `[x]`, body replaced with one-line resolution per task spec.
+
+**Files modified (iter 3)**:
+- `docs/runbooks/mc-deployment.md`
+- `docs/runbooks/mc-incident-response.md`
+- `docs/decisions/adr-0023-meeting-controller-architecture.md` (§11 only; §Phase 6h untouched)
+- `docs/decisions/adr-0029-dashboard-metric-presentation.md`
+- `docs/observability/metrics/mc-service.md` (token-refresh trio + SLO + cardinality row added)
+- `docs/observability/metrics/mc.md` (deleted)
+- `crates/mc-service/src/observability/metrics.rs` (doc-comment path fix only — no behavior change)
+- `docs/TODO.md` (close orphan-metric entry)
+
+**Verification**: `grep -r "message_latency\|recovery_duration\|mc_errors_total" docs/runbooks/ docs/decisions/adr-0023-meeting-controller-architecture.md docs/decisions/adr-0029-dashboard-metric-presentation.md docs/observability/metrics/` returns no matches except ADR-0023 §Phase 6h (out of scope, tracked separately). Devloop output history files retained as historical record.
+
+---
+
 ## Issues Encountered & Resolutions
 
 ### Issue 1: Brace-expansion path notation rejected by INDEX guard
