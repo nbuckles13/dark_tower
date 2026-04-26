@@ -281,7 +281,7 @@ A small follow-up landed during reflection: brace-expansion path notation (`{a,b
 
 **Iter 3 Verdicts**:
 - Security: CLEAR (0 findings) — verified runbook substitutions preserve security signals; no PII/credentials in PromQL; ADR amendments retain security invariants (JWT validations, fence events, caller-type rejections, session-join failures, etc.)
-- Observability: CLEAR (1 non-blocking advisory) — A1 minor wording suggestion on ADR-0023 §11 counter bullet ("for failure events" undersells the outcome/lifecycle counters listed); catalog pointer is authoritative so non-blocking. Implementer may address as a one-word fix or leave.
+- Observability: RESOLVED (1 advisory, 1 fixed) — A1 minor wording suggestion on ADR-0023 §11 counter bullet ("for failure events" undersells the outcome/lifecycle counters listed); catalog pointer is authoritative so non-blocking. Implementer applied: bullet reworded to "for outcome and failure events (session/meeting lifecycle outcomes, JWT validations, fence events, actor panics, message drops, MC↔MH coordination, token refreshes, caller-type rejections)" at adr-0023:829.
 
 **Iter 3 Implementation Summary**:
 - `docs/runbooks/mc-deployment.md`: replaced dead `mc_message_latency_seconds` references with live equivalents (`mc_session_join_duration_seconds`, `mc_redis_latency_seconds`, scoped failure counters) across §8 metrics list, §9 post-deploy checklist, §Rollback degradation criteria, §Monitoring drop-rate / latency PromQL blocks, §Grafana dashboard hints.
