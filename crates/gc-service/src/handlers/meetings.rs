@@ -347,13 +347,13 @@ pub async fn join_meeting(
         .await
         .inspect_err(|_| {
             let duration = start.elapsed();
-            metrics::record_meeting_join("error", Some("not_found"), duration);
+            metrics::record_meeting_join("user", "error", Some("not_found"), duration);
         })?;
 
     // Check meeting status (allowlist: only active/scheduled meetings can be joined)
     if meeting.status != "active" && meeting.status != "scheduled" {
         let duration = start.elapsed();
-        metrics::record_meeting_join("error", Some("bad_status"), duration);
+        metrics::record_meeting_join("user", "error", Some("bad_status"), duration);
         return Err(GcError::NotFound(
             "Meeting not found or has ended".to_string(),
         ));
@@ -362,12 +362,12 @@ pub async fn join_meeting(
     // Parse user ID and org ID from user claims
     let user_id = parse_user_id(&user_claims.sub).inspect_err(|_| {
         let duration = start.elapsed();
-        metrics::record_meeting_join("error", Some("unauthorized"), duration);
+        metrics::record_meeting_join("user", "error", Some("unauthorized"), duration);
     })?;
     let user_org_id = Uuid::parse_str(&user_claims.org_id).map_err(|e| {
         tracing::debug!(target: "gc.handlers.meetings", error = %e, "Failed to parse org_id from user token");
         let duration = start.elapsed();
-        metrics::record_meeting_join("error", Some("unauthorized"), duration);
+        metrics::record_meeting_join("user", "error", Some("unauthorized"), duration);
         GcError::InvalidToken("Invalid organization identifier in token".to_string())
     })?;
 
@@ -377,7 +377,7 @@ pub async fn join_meeting(
 
     if !is_same_org && !meeting.allow_external_participants {
         let duration = start.elapsed();
-        metrics::record_meeting_join("error", Some("forbidden"), duration);
+        metrics::record_meeting_join("user", "error", Some("forbidden"), duration);
         warn!(
             target: "gc.handlers.meetings",
             user_id = %user_id,
@@ -413,13 +413,13 @@ pub async fn join_meeting(
     .await
     .inspect_err(|_| {
         let duration = start.elapsed();
-        metrics::record_meeting_join("error", Some("mc_assignment"), duration);
+        metrics::record_meeting_join("user", "error", Some("mc_assignment"), duration);
     })?;
 
     // Create AC client and request meeting token
     let ac_client = create_ac_client(&state).inspect_err(|_| {
         let duration = start.elapsed();
-        metrics::record_meeting_join("error", Some("internal"), duration);
+        metrics::record_meeting_join("user", "error", Some("internal"), duration);
     })?;
     let token_request = MeetingTokenRequest {
         subject_user_id: user_id,
@@ -440,12 +440,12 @@ pub async fn join_meeting(
         .await
         .inspect_err(|_| {
             let duration = start.elapsed();
-            metrics::record_meeting_join("error", Some("ac_request"), duration);
+            metrics::record_meeting_join("user", "error", Some("ac_request"), duration);
         })?;
 
     // Record success metrics
     let duration = start.elapsed();
-    metrics::record_meeting_join("success", None, duration);
+    metrics::record_meeting_join("user", "success", None, duration);
 
     let mh_ids: Vec<&str> = assignment_with_mh
         .mh_selection
@@ -509,24 +509,52 @@ pub async fn join_meeting(
         status = tracing::field::Empty,
     )
 )]
+// `get_guest_token` parity with `join_meeting` (per @observability + @code-reviewer
+// Step 5 review). Both handlers emit `gc_meeting_join_*` discriminated by
+// `participant=user|guest`. Branch parity:
+//   - Shared error_types (same source operation, both paths): not_found,
+//     bad_status, mc_assignment, internal, ac_request.
+//   - `forbidden`: user-only at source. user emits on cross-org denial
+//     (`!is_same_org && !allow_external_participants`). The guest-path
+//     analogous gate (`!meeting.allow_guests`) routes to `guests_disabled`,
+//     a distinct label value — not to `forbidden`. A `forbidden` spike on
+//     the dashboard is therefore user-only by construction.
+//   - Guest-only error_types: bad_request (body validation; user has no body),
+//     guests_disabled (`!meeting.allow_guests`).
+//   - User-only error_type: unauthorized (sub/org_id parse from JWT; guest
+//     path is public).
+// `internal` on guest path covers TWO sources: `generate_guest_id` RNG failure
+// and `create_ac_client` construction failure. Both are genuinely operational
+// `internal` per @observability, so the label name does not subdivide.
 pub async fn get_guest_token(
     State(state): State<Arc<AppState>>,
     Path(code): Path<String>,
     Json(request): Json<GuestJoinRequest>,
 ) -> Result<Json<JoinMeetingResponse>, GcError> {
+    let start = Instant::now();
+
     // Validate request
-    request
-        .validate()
-        .map_err(|e| GcError::BadRequest(e.to_string()))?;
+    request.validate().map_err(|e| {
+        let duration = start.elapsed();
+        metrics::record_meeting_join("guest", "error", Some("bad_request"), duration);
+        GcError::BadRequest(e.to_string())
+    })?;
 
     // TODO: Validate captcha token (integration with captcha service)
     // For now, we just check that it's not empty (validation handles this)
 
     // Look up meeting by code
-    let meeting = find_meeting_by_code(&state.pool, &code).await?;
+    let meeting = find_meeting_by_code(&state.pool, &code)
+        .await
+        .inspect_err(|_| {
+            let duration = start.elapsed();
+            metrics::record_meeting_join("guest", "error", Some("not_found"), duration);
+        })?;
 
     // Check meeting status (allowlist: only active/scheduled meetings can be joined)
     if meeting.status != "active" && meeting.status != "scheduled" {
+        let duration = start.elapsed();
+        metrics::record_meeting_join("guest", "error", Some("bad_status"), duration);
         return Err(GcError::NotFound(
             "Meeting not found or has ended".to_string(),
         ));
@@ -534,6 +562,8 @@ pub async fn get_guest_token(
 
     // Check if guests are allowed
     if !meeting.allow_guests {
+        let duration = start.elapsed();
+        metrics::record_meeting_join("guest", "error", Some("guests_disabled"), duration);
         warn!(
             target: "gc.handlers.meetings",
             meeting_id = %meeting.meeting_id,
@@ -544,8 +574,19 @@ pub async fn get_guest_token(
         ));
     }
 
-    // Generate guest ID using CSPRNG
-    let guest_id = generate_guest_id()?;
+    // Generate guest ID using CSPRNG.
+    //
+    // COVERAGE GAP: generate_guest_id() is wired through inspect_err to emit
+    // `internal`, but `getrandom` returns EAGAIN only at pre-init boot
+    // conditions (entropy pool not yet seeded), which is outside application
+    // control and not reachable in test. The wrapper test in
+    // `tests/meeting_join_metrics_integration.rs` proves label wiring only;
+    // the production emission path is not exercised. See docs/TODO.md
+    // §Observability Debt for fault-injection harness disposition.
+    let guest_id = generate_guest_id().inspect_err(|_| {
+        let duration = start.elapsed();
+        metrics::record_meeting_join("guest", "error", Some("internal"), duration);
+    })?;
 
     // Assign meeting to MC with MH selection (ADR-0010 Section 4a)
     let assignment_with_mh = McAssignmentService::assign_meeting_with_mh(
@@ -555,10 +596,25 @@ pub async fn get_guest_token(
         &state.config.region,
         &state.config.gc_id,
     )
-    .await?;
+    .await
+    .inspect_err(|_| {
+        let duration = start.elapsed();
+        metrics::record_meeting_join("guest", "error", Some("mc_assignment"), duration);
+    })?;
 
-    // Create AC client and request guest token
-    let ac_client = create_ac_client(&state)?;
+    // Create AC client and request guest token.
+    //
+    // COVERAGE GAP: create_ac_client() is wired through inspect_err to emit
+    // `internal`, but AcClient construction is a synchronous URL parse with
+    // no failure modes reachable in test (the URL is validated at config
+    // load). The wrapper test in `tests/meeting_join_metrics_integration.rs`
+    // proves label wiring only; the production emission path is not
+    // exercised. See docs/TODO.md §Observability Debt for fault-injection
+    // harness disposition.
+    let ac_client = create_ac_client(&state).inspect_err(|_| {
+        let duration = start.elapsed();
+        metrics::record_meeting_join("guest", "error", Some("internal"), duration);
+    })?;
     let token_request = GuestTokenRequest {
         guest_id,
         display_name: request.display_name.trim().to_string(),
@@ -568,7 +624,17 @@ pub async fn get_guest_token(
         ttl_seconds: DEFAULT_TOKEN_TTL_SECONDS,
     };
 
-    let token_response = ac_client.request_guest_token(&token_request).await?;
+    let token_response = ac_client
+        .request_guest_token(&token_request)
+        .await
+        .inspect_err(|_| {
+            let duration = start.elapsed();
+            metrics::record_meeting_join("guest", "error", Some("ac_request"), duration);
+        })?;
+
+    // Record success metrics
+    let duration = start.elapsed();
+    metrics::record_meeting_join("guest", "success", None, duration);
 
     let mh_ids: Vec<&str> = assignment_with_mh
         .mh_selection

@@ -9,7 +9,7 @@
 ## CI & Guards
 - CI pipeline → `.github/workflows/ci.yml`; runner + common → `scripts/guards/run-guards.sh`, `common.sh`
 - Kustomize → `scripts/guards/simple/validate-kustomize.sh`; app metrics (metric↔dashboard) → `validate-application-metrics.sh`
-- Metric-test coverage guard (`validate-metric-coverage.sh`, single presence check; lead sequences per-service backfill PRs during phasing window; MH ✓ + MC ✓ (`mh-service`/`mc-service: 0 uncovered`); Steps 4-5 drain AC/GC — `run-guards.sh` stays red on `feature/mh-quic-mh-tests` until then) → ADR-0032
+- Metric-test coverage guard (`validate-metric-coverage.sh`, single presence check; lead sequences per-service backfill PRs during phasing window; MH ✓ + MC ✓ + AC ✓ + GC ✓ (all four `0 uncovered` after ADR-0032 Step 5, 2026-04-27 — `run-guards.sh` fully GREEN on `feature/mh-quic-mh-tests`, branch ready to merge) → ADR-0032
 
 ## Devloop Cluster Helper
 - Kind config template (envsubst, host-gateway listenAddress) → `infra/kind/kind-config.yaml.tmpl`
@@ -32,6 +32,8 @@
 ## Runbooks & Database
 - Per-service incident/deployment → `docs/runbooks/` (ac, gc, mc)
 - Participant tracking + meetings → `crates/gc-service/src/repositories/participants.rs`, `meetings.rs`
+- **Heuristic — additive runbook annotation > full Scenario rewrite** when a code change reuses an existing metric family / endpoint surface and introduces no new failure modes. Add a `# Note:` block + one disambiguation PromQL query inline with the affected scenario; reserve full new Scenario sections for changes that introduce novel diagnostic flow or new root causes. Applied in ADR-0032 Step 5 for `get_guest_token` reusing `gc_meeting_join_*` (3am-operator value at trivial cost; `docs/runbooks/gc-incident-response.md` Scenario 5 lines 562-571).
+- **Heuristic — runbook footnote for new label values** when a code change adds new label values to existing metrics. A new label value first-appears as a panel time series with no historical baseline; pre-emptive "expected first-emission, not an incident" annotation short-circuits operator investigation. Cost: ~3 lines. Applied for `participant=guest` + `error_type=guests_disabled`/`bad_request` in Step 5.
 
 ## Auth & JWT
 - Common JWKS + JWT → `crates/common/src/jwt.rs`
@@ -42,6 +44,8 @@
 - Kustomize + Grafana → `infra/kubernetes/observability/`, `infra/grafana/dashboards/`; Alerts → `docs/observability/alerts.md`
 - Per-service metrics → `crates/ac-service/src/observability/metrics.rs`, `crates/gc-service/src/observability/metrics.rs`, `crates/mc-service/src/observability/metrics.rs`, `crates/mh-service/src/observability/metrics.rs`; Prometheus → `infra/docker/prometheus/prometheus.yml`
 - Shared `MetricAssertion` testing helper (per-thread `DebuggingRecorder`, `!Send` snapshots, drain-on-read histograms) → `crates/common/src/observability/testing.rs`; `assert_unobserved` (additive across all 3 query types — counter hard-form, gauge gap-fill, histogram observation-count equivalence + kind-mismatch hardening) added in ADR-0032 Step 4, no breaking changes to MH/MC callers
+- **Alert-impact verification approach for new metric labels** — when adding a new label to an existing metric family, audit alert PromQL safety in three steps before approving: (1) grep `without(...)` patterns in `infra/docker/prometheus/rules/*.yaml` — any `without` clause keeps the new label and may split series unintentionally; (2) confirm histogram alerts use `sum by(le) (...)` (drops new label automatically — preserves `histogram_quantile` math); (3) confirm counter ratio alerts use bare `sum(rate(...))` with no `by(...)` clause (aggregates over new label automatically — preserves threshold at steady state because numerator+denominator both gain traffic). Applied in Step 5 for `participant` label addition to `gc_meeting_join_*`; zero alert rule changes required. Same protocol for dashboard panel queries in `infra/grafana/dashboards/*.json`.
+- **Cat A canary acceptance criteria template** (per ADR-0032 §Rollout, applied in Step 5 for `get_guest_token` instrumentation) — when production code adds new metric emissions on a previously-uninstrumented handler reusing an existing metric family, three `/metrics` evidence checks suffice: (a) `curl localhost:8080/metrics | grep '^<metric>{'` shows non-zero counts on at least 2 distinct label values reachable via the new path; (b) `curl localhost:8080/metrics | grep '^<histogram>_count'` increments after a successful request through the new path; (c) `curl localhost:8080/metrics | grep '^<family>_' | wc -l` confirms cardinality bounded under ADR-0011 cap-10. Pair with explicit "alert thresholds unchanged" reasoning: ratio alerts preserve threshold at steady state (numerator+denominator both gain traffic); percentile alerts surface real divergence at info severity (right venue for unexpected-but-not-broken behavior). No `*-alerts.yaml` modifications when the family is reused. Template archived in `docs/devloop-outputs/2026-04-27-adr-0032-step-5-gc-metric-test-backfill/main.md` §Cat A canary acceptance criteria.
 
 ## AC Service
 - AC K8s manifests → `infra/services/ac-service/configmap.yaml`, `statefulset.yaml`, `service.yaml`, `service-monitor.yaml`, `network-policy.yaml`, `pdb.yaml`, `kustomization.yaml`

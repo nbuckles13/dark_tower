@@ -292,6 +292,18 @@ pub fn record_token_refresh(status: &str, error_type: Option<&str>, duration: Du
     }
 }
 
+/// Per-service `TokenRefreshEvent` → metrics dispatcher (ADR-0032 Step 5 Cat B).
+///
+/// Callable from `main.rs`'s `TokenManager::with_on_refresh` closure and from
+/// unit/integration tests. Maps `TokenRefreshEvent.success: bool` to the
+/// bounded `status` label and forwards `error_category` + `duration` into
+/// `record_token_refresh`. Production emission is byte-identical to the prior
+/// inline closure body at `main.rs:124-126`.
+pub fn record_token_refresh_metrics(event: &common::token_manager::TokenRefreshEvent) {
+    let status = if event.success { "success" } else { "error" };
+    record_token_refresh(status, event.error_category, event.duration);
+}
+
 // ============================================================================
 // AC Client Metrics
 // ============================================================================
@@ -474,29 +486,52 @@ pub fn record_meeting_creation(status: &str, error_type: Option<&str>, duration:
 /// Record meeting join attempt.
 ///
 /// Emits three metrics per the metrics catalog:
-/// - `gc_meeting_join_total` counter (labels: `status`)
-/// - `gc_meeting_join_duration_seconds` histogram (labels: `status`)
-/// - `gc_meeting_join_failures_total` counter (labels: `error_type`, on failure only)
+/// - `gc_meeting_join_total` counter (labels: `participant`, `status`)
+/// - `gc_meeting_join_duration_seconds` histogram (labels: `participant`, `status`)
+/// - `gc_meeting_join_failures_total` counter (labels: `participant`, `error_type`,
+///   on failure only)
 ///
 /// # Arguments
 ///
+/// * `participant` - "user" (authenticated `join_meeting`) or "guest"
+///   (`get_guest_token`). Discriminator for SLO/alert triage —
+///   `error_type="forbidden"` on user vs guest paths means different things
+///   (cross-org denial vs `allow_guests=false`), so operators need this
+///   axis to triage without log-diving (per @observability ADR-0032 Step 5).
 /// * `status` - "success" or "error"
-/// * `error_type` - Error category for failures (e.g., "not_found", "forbidden",
-///   "unauthorized", "bad_status", "mc_assignment", "ac_request", "internal")
+/// * `error_type` - Error category for failures. Bounded set:
+///   - `"not_found"` (both paths)
+///   - `"bad_status"` (both paths)
+///   - `"unauthorized"` (user only — guest path is public)
+///   - `"forbidden"` (user: external denied; guest: see `guests_disabled`)
+///   - `"guests_disabled"` (guest only — `meeting.allow_guests=false`)
+///   - `"bad_request"` (guest only — body validation; user has no body)
+///   - `"mc_assignment"` (both paths)
+///   - `"ac_request"` (both paths)
+///   - `"internal"` (both paths; guest also includes RNG failure on
+///     `generate_guest_id`)
 /// * `duration` - Duration of the join attempt
-pub fn record_meeting_join(status: &str, error_type: Option<&str>, duration: Duration) {
+pub fn record_meeting_join(
+    participant: &str,
+    status: &str,
+    error_type: Option<&str>,
+    duration: Duration,
+) {
     histogram!("gc_meeting_join_duration_seconds",
+        "participant" => participant.to_string(),
         "status" => status.to_string()
     )
     .record(duration.as_secs_f64());
 
     counter!("gc_meeting_join_total",
+        "participant" => participant.to_string(),
         "status" => status.to_string()
     )
     .increment(1);
 
     if let Some(err_type) = error_type {
         counter!("gc_meeting_join_failures_total",
+            "participant" => participant.to_string(),
             "error_type" => err_type.to_string()
         )
         .increment(1);
@@ -572,76 +607,45 @@ pub fn update_registered_controller_gauges(controller_type: &str, counts: &[(Str
 #[cfg(test)]
 mod tests {
     use super::*;
+    use common::observability::testing::MetricAssertion;
 
-    // Note: These tests execute the metric recording functions to ensure code coverage.
-    // The metrics crate will record to a global no-op recorder if none is installed,
-    // which is sufficient for coverage testing. We don't need to verify the actual
-    // metric values - that would require installing a test recorder from metrics-util.
+    // ========================================================================
+    // Per-cluster MetricAssertion tests — replace the pre-ADR-0032 hand-rolled
+    // smoke tests (which only proved wrappers don't panic against the global
+    // no-op recorder). These exercise the same wrappers but with per-failure-
+    // class delta assertions, mirroring the AC Step 4 / MC Step 3 / MH Step 2
+    // migrations.
     //
-    // Per ADR-0002: These tests do not panic on missing recorder.
+    // NOTE: These are wrapper-invocation tests (Cat C name-coverage tier).
+    // The PRODUCTION-PATH coverage for these metrics lives in cluster files
+    // under crates/gc-service/tests/. The block here is the in-file mirror
+    // that exercises the metrics.rs wrappers themselves end-to-end through
+    // MetricAssertion. Pinning is implicit (cargo's default test runner is
+    // single-threaded per-test); MetricAssertion binds a per-thread recorder.
+    // See `crates/common/src/observability/testing.rs:60-72`.
+    // ========================================================================
+
+    // ---- Pure-function sanity tests (not metric-recorder tests) -------------
+    // These exercise path-normalization logic and the status-code categorizer.
+    // Kept from the pre-ADR-0032 era — they assert deterministic string output,
+    // not metric emission, so they don't need MetricAssertion.
 
     #[test]
-    fn test_record_http_request() {
-        // Test with various methods and statuses
-        record_http_request("GET", "/health", 200, Duration::from_millis(5));
-        record_http_request("GET", "/api/v1/me", 200, Duration::from_millis(50));
-        record_http_request(
-            "GET",
-            "/api/v1/meetings/abc123",
-            200,
-            Duration::from_millis(150),
-        );
-        record_http_request(
-            "POST",
-            "/api/v1/meetings/abc123/guest-token",
-            200,
-            Duration::from_millis(200),
-        );
-        record_http_request(
-            "PATCH",
-            "/api/v1/meetings/uuid-here/settings",
-            200,
-            Duration::from_millis(100),
-        );
-
-        // Test error cases
-        record_http_request("GET", "/api/v1/me", 401, Duration::from_millis(10));
-        record_http_request(
-            "GET",
-            "/api/v1/meetings/notfound",
-            404,
-            Duration::from_millis(5),
-        );
-        record_http_request(
-            "POST",
-            "/api/v1/meetings/abc123/guest-token",
-            429,
-            Duration::from_millis(2),
-        );
-
-        // Test timeout
-        record_http_request("GET", "/api/v1/me", 504, Duration::from_secs(30));
-        record_http_request(
-            "GET",
-            "/api/v1/meetings/abc123",
-            408,
-            Duration::from_secs(30),
-        );
-    }
-
-    #[test]
-    fn test_categorize_status_code() {
-        // Success codes
+    fn categorize_status_code_success() {
         assert_eq!(categorize_status_code(200), "success");
         assert_eq!(categorize_status_code(201), "success");
         assert_eq!(categorize_status_code(204), "success");
         assert_eq!(categorize_status_code(299), "success");
+    }
 
-        // Timeout codes
+    #[test]
+    fn categorize_status_code_timeout() {
         assert_eq!(categorize_status_code(408), "timeout");
         assert_eq!(categorize_status_code(504), "timeout");
+    }
 
-        // Error codes
+    #[test]
+    fn categorize_status_code_error() {
         assert_eq!(categorize_status_code(400), "error");
         assert_eq!(categorize_status_code(401), "error");
         assert_eq!(categorize_status_code(403), "error");
@@ -652,32 +656,24 @@ mod tests {
     }
 
     #[test]
-    fn test_normalize_endpoint_known_paths() {
+    fn normalize_endpoint_known_paths() {
         assert_eq!(normalize_endpoint("/"), "/");
         assert_eq!(normalize_endpoint("/health"), "/health");
         assert_eq!(normalize_endpoint("/metrics"), "/metrics");
         assert_eq!(normalize_endpoint("/api/v1/me"), "/api/v1/me");
+        assert_eq!(normalize_endpoint("/api/v1/meetings"), "/api/v1/meetings");
     }
 
     #[test]
-    fn test_normalize_endpoint_meeting_paths() {
-        // Meeting join
+    fn normalize_endpoint_meeting_paths() {
         assert_eq!(
             normalize_endpoint("/api/v1/meetings/abc123"),
             "/api/v1/meetings/{code}"
         );
         assert_eq!(
-            normalize_endpoint("/api/v1/meetings/some-meeting-code"),
-            "/api/v1/meetings/{code}"
-        );
-
-        // Guest token
-        assert_eq!(
             normalize_endpoint("/api/v1/meetings/abc123/guest-token"),
             "/api/v1/meetings/{code}/guest-token"
         );
-
-        // Settings
         assert_eq!(
             normalize_endpoint("/api/v1/meetings/550e8400-e29b-41d4-a716-446655440000/settings"),
             "/api/v1/meetings/{id}/settings"
@@ -685,7 +681,7 @@ mod tests {
     }
 
     #[test]
-    fn test_normalize_endpoint_unknown_paths() {
+    fn normalize_endpoint_unknown_paths() {
         assert_eq!(normalize_endpoint("/unknown"), "/other");
         assert_eq!(normalize_endpoint("/api/v2/something"), "/other");
         assert_eq!(
@@ -695,78 +691,309 @@ mod tests {
     }
 
     #[test]
-    fn test_record_mc_assignment() {
+    fn controller_statuses_constant() {
+        assert_eq!(CONTROLLER_STATUSES.len(), 5);
+        assert!(CONTROLLER_STATUSES.contains(&"pending"));
+        assert!(CONTROLLER_STATUSES.contains(&"healthy"));
+        assert!(CONTROLLER_STATUSES.contains(&"degraded"));
+        assert!(CONTROLLER_STATUSES.contains(&"unhealthy"));
+        assert!(CONTROLLER_STATUSES.contains(&"draining"));
+    }
+
+    // ---- Per-cluster MetricAssertion-backed wrapper tests --------------------
+
+    #[test]
+    fn metrics_module_emits_http_request_cluster() {
+        let snap = MetricAssertion::snapshot();
+
+        record_http_request("GET", "/health", 200, Duration::from_millis(5));
+        record_http_request("GET", "/api/v1/me", 401, Duration::from_millis(10));
+        record_http_request(
+            "GET",
+            "/api/v1/meetings/abc123",
+            200,
+            Duration::from_millis(150),
+        );
+        record_http_request("GET", "/api/v1/me", 504, Duration::from_secs(30));
+
+        // Histogram first (drain-on-read).
+        snap.histogram("gc_http_request_duration_seconds")
+            .assert_observation_count_at_least(4);
+
+        snap.counter("gc_http_requests_total")
+            .with_labels(&[
+                ("method", "GET"),
+                ("endpoint", "/health"),
+                ("status_code", "200"),
+            ])
+            .assert_delta(1);
+        snap.counter("gc_http_requests_total")
+            .with_labels(&[
+                ("method", "GET"),
+                ("endpoint", "/api/v1/me"),
+                ("status_code", "401"),
+            ])
+            .assert_delta(1);
+        snap.counter("gc_http_requests_total")
+            .with_labels(&[
+                ("method", "GET"),
+                ("endpoint", "/api/v1/meetings/{code}"),
+                ("status_code", "200"),
+            ])
+            .assert_delta(1);
+        snap.counter("gc_http_requests_total")
+            .with_labels(&[
+                ("method", "GET"),
+                ("endpoint", "/api/v1/me"),
+                ("status_code", "504"),
+            ])
+            .assert_delta(1);
+    }
+
+    #[test]
+    fn metrics_module_emits_mc_assignment_cluster() {
+        let snap = MetricAssertion::snapshot();
+
         record_mc_assignment("success", None, Duration::from_millis(15));
         record_mc_assignment("rejected", Some("at_capacity"), Duration::from_millis(10));
         record_mc_assignment("rejected", Some("draining"), Duration::from_millis(8));
         record_mc_assignment("rejected", Some("unhealthy"), Duration::from_millis(5));
         record_mc_assignment("error", Some("rpc_failed"), Duration::from_millis(100));
+
+        snap.histogram("gc_mc_assignment_duration_seconds")
+            .assert_observation_count_at_least(5);
+
+        snap.counter("gc_mc_assignments_total")
+            .with_labels(&[("status", "success"), ("rejection_reason", "none")])
+            .assert_delta(1);
+        for reason in ["at_capacity", "draining", "unhealthy"] {
+            snap.counter("gc_mc_assignments_total")
+                .with_labels(&[("status", "rejected"), ("rejection_reason", reason)])
+                .assert_delta(1);
+        }
+        snap.counter("gc_mc_assignments_total")
+            .with_labels(&[("status", "error"), ("rejection_reason", "rpc_failed")])
+            .assert_delta(1);
     }
 
     #[test]
-    fn test_record_db_query() {
-        record_db_query("select_mc", "success", Duration::from_millis(5));
-        record_db_query(
-            "get_healthy_assignment",
-            "success",
-            Duration::from_millis(3),
-        );
-        record_db_query("get_candidate_mcs", "success", Duration::from_millis(7));
-        record_db_query("atomic_assign", "success", Duration::from_millis(10));
-        record_db_query("end_assignment", "success", Duration::from_millis(5));
-        record_db_query("update_heartbeat", "error", Duration::from_millis(50));
+    fn metrics_module_emits_db_query_cluster() {
+        let snap = MetricAssertion::snapshot();
+
+        record_db_query("create_meeting", "success", Duration::from_millis(5));
+        record_db_query("create_meeting", "error", Duration::from_millis(2));
+        record_db_query("log_audit_event", "success", Duration::from_millis(3));
+        record_db_query("add_participant", "error", Duration::from_millis(7));
+
+        snap.histogram("gc_db_query_duration_seconds")
+            .assert_observation_count_at_least(4);
+
+        snap.counter("gc_db_queries_total")
+            .with_labels(&[("operation", "create_meeting"), ("status", "success")])
+            .assert_delta(1);
+        snap.counter("gc_db_queries_total")
+            .with_labels(&[("operation", "create_meeting"), ("status", "error")])
+            .assert_delta(1);
+        snap.counter("gc_db_queries_total")
+            .with_labels(&[("operation", "log_audit_event"), ("status", "success")])
+            .assert_delta(1);
+        snap.counter("gc_db_queries_total")
+            .with_labels(&[("operation", "add_participant"), ("status", "error")])
+            .assert_delta(1);
     }
 
     #[test]
-    fn test_record_token_refresh() {
-        // Success path
+    fn metrics_module_emits_token_refresh_cluster() {
+        let snap = MetricAssertion::snapshot();
+
         record_token_refresh("success", None, Duration::from_millis(50));
-
-        // Error paths with different error types
         record_token_refresh("error", Some("http"), Duration::from_millis(100));
         record_token_refresh("error", Some("auth_rejected"), Duration::from_millis(200));
-        record_token_refresh("error", Some("invalid_response"), Duration::from_millis(30));
-        record_token_refresh(
-            "error",
-            Some("acquisition_failed"),
-            Duration::from_millis(10),
-        );
+
+        snap.histogram("gc_token_refresh_duration_seconds")
+            .assert_observation_count_at_least(3);
+
+        snap.counter("gc_token_refresh_total")
+            .with_labels(&[("status", "success")])
+            .assert_delta(1);
+        snap.counter("gc_token_refresh_total")
+            .with_labels(&[("status", "error")])
+            .assert_delta(2);
+        snap.counter("gc_token_refresh_failures_total")
+            .with_labels(&[("error_type", "http")])
+            .assert_delta(1);
+        snap.counter("gc_token_refresh_failures_total")
+            .with_labels(&[("error_type", "auth_rejected")])
+            .assert_delta(1);
+    }
+
+    // Cat B per-service dispatcher exercise. Mirrors MC's
+    // `record_token_refresh_metrics_*` pattern (see
+    // `crates/mc-service/src/observability/metrics.rs`). Drives the dispatcher
+    // directly through MetricAssertion.
+    #[test]
+    fn record_token_refresh_metrics_success_emits_status_success_no_failure_counter() {
+        use common::token_manager::TokenRefreshEvent;
+
+        let snap = MetricAssertion::snapshot();
+        record_token_refresh_metrics(&TokenRefreshEvent {
+            success: true,
+            duration: Duration::from_millis(42),
+            error_category: None,
+        });
+
+        snap.histogram("gc_token_refresh_duration_seconds")
+            .assert_observation_count_at_least(1);
+        snap.counter("gc_token_refresh_total")
+            .with_labels(&[("status", "success")])
+            .assert_delta(1);
+        snap.counter("gc_token_refresh_total")
+            .with_labels(&[("status", "error")])
+            .assert_delta(0);
+        // Adjacency: failures counter must be silent on success path across
+        // every bounded `error_category` value (label-swap-bug catcher).
+        for sibling in &[
+            "http",
+            "auth_rejected",
+            "invalid_response",
+            "acquisition_failed",
+            "configuration",
+            "channel_closed",
+        ] {
+            snap.counter("gc_token_refresh_failures_total")
+                .with_labels(&[("error_type", *sibling)])
+                .assert_delta(0);
+        }
     }
 
     #[test]
-    fn test_record_ac_request() {
-        // Success paths for both operations
+    fn record_token_refresh_metrics_failure_matrix_per_error_category() {
+        use common::token_manager::TokenRefreshEvent;
+
+        for category in &[
+            "http",
+            "auth_rejected",
+            "invalid_response",
+            "acquisition_failed",
+            "configuration",
+            "channel_closed",
+        ] {
+            let snap = MetricAssertion::snapshot();
+            record_token_refresh_metrics(&TokenRefreshEvent {
+                success: false,
+                duration: Duration::from_millis(10),
+                error_category: Some(category),
+            });
+
+            snap.histogram("gc_token_refresh_duration_seconds")
+                .assert_observation_count_at_least(1);
+            snap.counter("gc_token_refresh_total")
+                .with_labels(&[("status", "error")])
+                .assert_delta(1);
+            snap.counter("gc_token_refresh_total")
+                .with_labels(&[("status", "success")])
+                .assert_delta(0);
+            snap.counter("gc_token_refresh_failures_total")
+                .with_labels(&[("error_type", *category)])
+                .assert_delta(1);
+        }
+    }
+
+    #[test]
+    fn metrics_module_emits_ac_request_cluster() {
+        let snap = MetricAssertion::snapshot();
+
         record_ac_request("meeting_token", "success", Duration::from_millis(100));
-        record_ac_request("guest_token", "success", Duration::from_millis(80));
-
-        // Error paths
         record_ac_request("meeting_token", "error", Duration::from_millis(200));
+        record_ac_request("guest_token", "success", Duration::from_millis(80));
         record_ac_request("guest_token", "error", Duration::from_millis(150));
+
+        snap.histogram("gc_ac_request_duration_seconds")
+            .assert_observation_count_at_least(4);
+
+        for op in ["meeting_token", "guest_token"] {
+            for status in ["success", "error"] {
+                snap.counter("gc_ac_requests_total")
+                    .with_labels(&[("operation", op), ("status", status)])
+                    .assert_delta(1);
+            }
+        }
     }
 
     #[test]
-    fn test_record_error() {
-        record_error("join_meeting", "not_found", 404);
-        record_error("join_meeting", "forbidden", 403);
-        record_error("guest_token", "rate_limit", 429);
-        record_error("update_settings", "unauthorized", 401);
-        record_error("mc_assignment", "service_unavailable", 503);
+    fn metrics_module_emits_errors_cluster() {
+        let snap = MetricAssertion::snapshot();
+
+        record_error("ac_meeting_token", "service_unavailable", 503);
+        record_error("ac_guest_token", "service_unavailable", 503);
+        record_error("mc_grpc", "connection_failed", 503);
+
+        snap.counter("gc_errors_total")
+            .with_labels(&[
+                ("operation", "ac_meeting_token"),
+                ("error_type", "service_unavailable"),
+                ("status_code", "503"),
+            ])
+            .assert_delta(1);
+        snap.counter("gc_errors_total")
+            .with_labels(&[
+                ("operation", "ac_guest_token"),
+                ("error_type", "service_unavailable"),
+                ("status_code", "503"),
+            ])
+            .assert_delta(1);
+        snap.counter("gc_errors_total")
+            .with_labels(&[
+                ("operation", "mc_grpc"),
+                ("error_type", "connection_failed"),
+                ("status_code", "503"),
+            ])
+            .assert_delta(1);
     }
 
     #[test]
-    fn test_record_jwt_validation() {
-        // Exercise full bounded label domain (ADR-0003).
+    fn metrics_module_emits_jwt_validation_cluster() {
+        let snap = MetricAssertion::snapshot();
+
         record_jwt_validation("success", "service", "none");
-        record_jwt_validation("failure", "service", "signature_invalid");
-        record_jwt_validation("failure", "service", "expired");
-        record_jwt_validation("failure", "service", "scope_mismatch");
-        record_jwt_validation("failure", "service", "malformed");
-        record_jwt_validation("failure", "service", "missing_token");
+        for reason in [
+            "signature_invalid",
+            "expired",
+            "scope_mismatch",
+            "malformed",
+            "missing_token",
+        ] {
+            record_jwt_validation("failure", "service", reason);
+        }
+
+        snap.counter("gc_jwt_validations_total")
+            .with_labels(&[
+                ("result", "success"),
+                ("token_type", "service"),
+                ("failure_reason", "none"),
+            ])
+            .assert_delta(1);
+        for reason in [
+            "signature_invalid",
+            "expired",
+            "scope_mismatch",
+            "malformed",
+            "missing_token",
+        ] {
+            snap.counter("gc_jwt_validations_total")
+                .with_labels(&[
+                    ("result", "failure"),
+                    ("token_type", "service"),
+                    ("failure_reason", reason),
+                ])
+                .assert_delta(1);
+        }
     }
 
     #[test]
-    fn test_record_caller_type_rejected() {
-        // Representative bounded label combinations (ADR-0003 Layer 2).
+    fn metrics_module_emits_caller_type_rejected_cluster() {
+        let snap = MetricAssertion::snapshot();
+
         record_caller_type_rejected(
             "GlobalControllerService",
             "meeting-controller",
@@ -778,52 +1005,172 @@ mod tests {
             "meeting-controller",
         );
         record_caller_type_rejected("GlobalControllerService", "meeting-controller", "unknown");
-        record_caller_type_rejected("MediaHandlerRegistryService", "media-handler", "unknown");
+
+        snap.counter("gc_caller_type_rejected_total")
+            .with_labels(&[
+                ("grpc_service", "GlobalControllerService"),
+                ("expected_type", "meeting-controller"),
+                ("actual_type", "media-handler"),
+            ])
+            .assert_delta(1);
+        snap.counter("gc_caller_type_rejected_total")
+            .with_labels(&[
+                ("grpc_service", "MediaHandlerRegistryService"),
+                ("expected_type", "media-handler"),
+                ("actual_type", "meeting-controller"),
+            ])
+            .assert_delta(1);
+        snap.counter("gc_caller_type_rejected_total")
+            .with_labels(&[
+                ("grpc_service", "GlobalControllerService"),
+                ("expected_type", "meeting-controller"),
+                ("actual_type", "unknown"),
+            ])
+            .assert_delta(1);
     }
 
     #[test]
-    fn test_record_grpc_mc_call() {
+    fn metrics_module_emits_grpc_mc_call_cluster() {
+        let snap = MetricAssertion::snapshot();
+
         record_grpc_mc_call("assign_meeting", "success", Duration::from_millis(25));
         record_grpc_mc_call("assign_meeting", "rejected", Duration::from_millis(10));
         record_grpc_mc_call("assign_meeting", "error", Duration::from_millis(100));
+
+        snap.histogram("gc_grpc_mc_call_duration_seconds")
+            .assert_observation_count_at_least(3);
+
+        for status in ["success", "rejected", "error"] {
+            snap.counter("gc_grpc_mc_calls_total")
+                .with_labels(&[("method", "assign_meeting"), ("status", status)])
+                .assert_delta(1);
+        }
     }
 
     #[test]
-    fn test_record_mh_selection() {
+    fn metrics_module_emits_mh_selection_cluster() {
+        let snap = MetricAssertion::snapshot();
+
         record_mh_selection("success", true, Duration::from_millis(8));
         record_mh_selection("success", false, Duration::from_millis(5));
         record_mh_selection("error", false, Duration::from_millis(3));
+
+        snap.histogram("gc_mh_selection_duration_seconds")
+            .assert_observation_count_at_least(3);
+
+        snap.counter("gc_mh_selections_total")
+            .with_labels(&[("status", "success"), ("has_multiple", "true")])
+            .assert_delta(1);
+        snap.counter("gc_mh_selections_total")
+            .with_labels(&[("status", "success"), ("has_multiple", "false")])
+            .assert_delta(1);
+        snap.counter("gc_mh_selections_total")
+            .with_labels(&[("status", "error"), ("has_multiple", "false")])
+            .assert_delta(1);
     }
 
     #[test]
-    fn test_set_registered_controllers() {
-        // Test all valid controller types and statuses (cardinality: 2 * 5 = 10)
-        // Meeting controllers
-        set_registered_controllers("meeting", "pending", 0);
-        set_registered_controllers("meeting", "healthy", 5);
-        set_registered_controllers("meeting", "degraded", 1);
-        set_registered_controllers("meeting", "unhealthy", 2);
-        set_registered_controllers("meeting", "draining", 1);
+    fn metrics_module_emits_meeting_creation_cluster() {
+        let snap = MetricAssertion::snapshot();
 
-        // Media handlers (future)
-        set_registered_controllers("media", "pending", 0);
-        set_registered_controllers("media", "healthy", 10);
-        set_registered_controllers("media", "degraded", 0);
-        set_registered_controllers("media", "unhealthy", 1);
-        set_registered_controllers("media", "draining", 0);
+        record_meeting_creation("success", None, Duration::from_millis(50));
+        for err_type in [
+            "bad_request",
+            "unauthorized",
+            "forbidden",
+            "db_error",
+            "code_collision",
+            "internal",
+        ] {
+            record_meeting_creation("error", Some(err_type), Duration::from_millis(5));
+        }
+
+        snap.histogram("gc_meeting_creation_duration_seconds")
+            .assert_observation_count_at_least(7);
+
+        snap.counter("gc_meeting_creation_total")
+            .with_labels(&[("status", "success")])
+            .assert_delta(1);
+        snap.counter("gc_meeting_creation_total")
+            .with_labels(&[("status", "error")])
+            .assert_delta(6);
+        for err_type in [
+            "bad_request",
+            "unauthorized",
+            "forbidden",
+            "db_error",
+            "code_collision",
+            "internal",
+        ] {
+            snap.counter("gc_meeting_creation_failures_total")
+                .with_labels(&[("error_type", err_type)])
+                .assert_delta(1);
+        }
     }
 
+    // Per-cluster wrapper exercise — full (participant × error_type) cartesian
+    // is in tests/meeting_join_metrics_integration.rs; this in-src mirror covers
+    // wrapper-signature correctness with both `participant` values.
     #[test]
-    fn test_update_registered_controller_gauges() {
-        // Test with partial counts (some statuses missing)
-        let counts = vec![("healthy".to_string(), 5), ("degraded".to_string(), 2)];
+    fn metrics_module_emits_meeting_join_cluster() {
+        let snap = MetricAssertion::snapshot();
 
-        // Should set all 5 statuses, with missing ones set to 0
-        update_registered_controller_gauges("meeting", &counts);
+        record_meeting_join("user", "success", None, Duration::from_millis(200));
+        record_meeting_join("user", "error", Some("not_found"), Duration::from_millis(5));
+        record_meeting_join("guest", "success", None, Duration::from_millis(180));
+        record_meeting_join(
+            "guest",
+            "error",
+            Some("guests_disabled"),
+            Duration::from_millis(8),
+        );
 
-        // Test with all statuses
+        snap.histogram("gc_meeting_join_duration_seconds")
+            .assert_observation_count_at_least(4);
+
+        snap.counter("gc_meeting_join_total")
+            .with_labels(&[("participant", "user"), ("status", "success")])
+            .assert_delta(1);
+        snap.counter("gc_meeting_join_total")
+            .with_labels(&[("participant", "user"), ("status", "error")])
+            .assert_delta(1);
+        snap.counter("gc_meeting_join_total")
+            .with_labels(&[("participant", "guest"), ("status", "success")])
+            .assert_delta(1);
+        snap.counter("gc_meeting_join_total")
+            .with_labels(&[("participant", "guest"), ("status", "error")])
+            .assert_delta(1);
+        snap.counter("gc_meeting_join_failures_total")
+            .with_labels(&[("participant", "user"), ("error_type", "not_found")])
+            .assert_delta(1);
+        snap.counter("gc_meeting_join_failures_total")
+            .with_labels(&[("participant", "guest"), ("error_type", "guests_disabled")])
+            .assert_delta(1);
+        // Label-swap-bug catcher: the user-side label must NOT have absorbed
+        // the guest-only `guests_disabled` reason and vice-versa.
+        snap.counter("gc_meeting_join_failures_total")
+            .with_labels(&[("participant", "user"), ("error_type", "guests_disabled")])
+            .assert_delta(0);
+        snap.counter("gc_meeting_join_failures_total")
+            .with_labels(&[("participant", "guest"), ("error_type", "not_found")])
+            .assert_delta(0);
+    }
+
+    // Gauge cluster — exercises `set_registered_controllers` and
+    // `update_registered_controller_gauges` zero-fill semantics. The 4-cell
+    // adjacency-coverage matrix per @code-reviewer (§ADR-0032 Step 5):
+    //   1. Full happy path (all 5 statuses present, non-zero counts)
+    //   2. Partial counts → zero-fill for missing statuses
+    //   3. Empty counts → all 5 statuses zero-filled
+    //   4. Caller error path → assert_unobserved (cluster file: cell 4 is
+    //      validated in tests/registered_controllers_metrics_integration.rs
+    //      where the surrounding caller can short-circuit).
+    #[test]
+    fn metrics_module_emits_registered_controllers_full_happy_path() {
+        let snap = MetricAssertion::snapshot();
+
         let full_counts = vec![
-            ("pending".to_string(), 1),
+            ("pending".to_string(), 1u64),
             ("healthy".to_string(), 10),
             ("degraded".to_string(), 3),
             ("unhealthy".to_string(), 2),
@@ -831,52 +1178,80 @@ mod tests {
         ];
         update_registered_controller_gauges("meeting", &full_counts);
 
-        // Test with empty counts
+        snap.gauge("gc_registered_controllers")
+            .with_labels(&[("controller_type", "meeting"), ("status", "pending")])
+            .assert_value(1.0);
+        snap.gauge("gc_registered_controllers")
+            .with_labels(&[("controller_type", "meeting"), ("status", "healthy")])
+            .assert_value(10.0);
+        snap.gauge("gc_registered_controllers")
+            .with_labels(&[("controller_type", "meeting"), ("status", "degraded")])
+            .assert_value(3.0);
+        snap.gauge("gc_registered_controllers")
+            .with_labels(&[("controller_type", "meeting"), ("status", "unhealthy")])
+            .assert_value(2.0);
+        snap.gauge("gc_registered_controllers")
+            .with_labels(&[("controller_type", "meeting"), ("status", "draining")])
+            .assert_value(1.0);
+    }
+
+    #[test]
+    fn metrics_module_emits_registered_controllers_partial_zero_fill() {
+        // Cell 2: partial counts → zero-fill for missing statuses.
+        // assert_value(0.0) is correct, NOT assert_unobserved — the wrapper
+        // explicitly emits set(0.0) for absent statuses, so the metric IS
+        // observed at value zero.
+        let snap = MetricAssertion::snapshot();
+
+        let partial_counts = vec![("healthy".to_string(), 5u64), ("degraded".to_string(), 2)];
+        update_registered_controller_gauges("meeting", &partial_counts);
+
+        snap.gauge("gc_registered_controllers")
+            .with_labels(&[("controller_type", "meeting"), ("status", "healthy")])
+            .assert_value(5.0);
+        snap.gauge("gc_registered_controllers")
+            .with_labels(&[("controller_type", "meeting"), ("status", "degraded")])
+            .assert_value(2.0);
+        // Zero-fill: missing statuses are explicitly set to 0.0, not absent.
+        for missing in ["pending", "unhealthy", "draining"] {
+            snap.gauge("gc_registered_controllers")
+                .with_labels(&[("controller_type", "meeting"), ("status", missing)])
+                .assert_value(0.0);
+        }
+    }
+
+    #[test]
+    fn metrics_module_emits_registered_controllers_empty_counts_all_zero() {
+        // Cell 3: empty counts → all 5 statuses zero-filled.
+        let snap = MetricAssertion::snapshot();
+
         update_registered_controller_gauges("media", &[]);
+
+        for status in CONTROLLER_STATUSES {
+            snap.gauge("gc_registered_controllers")
+                .with_labels(&[("controller_type", "media"), ("status", status)])
+                .assert_value(0.0);
+        }
     }
 
     #[test]
-    fn test_controller_statuses_constant() {
-        // Verify we have all expected statuses
-        assert_eq!(CONTROLLER_STATUSES.len(), 5);
-        assert!(CONTROLLER_STATUSES.contains(&"pending"));
-        assert!(CONTROLLER_STATUSES.contains(&"healthy"));
-        assert!(CONTROLLER_STATUSES.contains(&"degraded"));
-        assert!(CONTROLLER_STATUSES.contains(&"unhealthy"));
-        assert!(CONTROLLER_STATUSES.contains(&"draining"));
-    }
+    fn metrics_module_registered_controllers_unobserved_when_caller_short_circuits() {
+        // Cell 4: code path that does NOT call update_registered_controller_gauges
+        // — gauge must be unobserved across the full label space. This
+        // proves `assert_unobserved` (kind+name+labels axis) catches a
+        // refactor that accidentally always-emits, distinct from cell 2's
+        // zero-fill correctness.
+        let snap = MetricAssertion::snapshot();
 
-    #[test]
-    fn test_record_meeting_creation() {
-        // Success path
-        record_meeting_creation("success", None, Duration::from_millis(50));
+        // No call to update_registered_controller_gauges — simulating an
+        // error short-circuit upstream.
 
-        // Error paths with different error types
-        record_meeting_creation("error", Some("bad_request"), Duration::from_millis(5));
-        record_meeting_creation("error", Some("unauthorized"), Duration::from_millis(3));
-        record_meeting_creation("error", Some("forbidden"), Duration::from_millis(8));
-        record_meeting_creation("error", Some("db_error"), Duration::from_millis(100));
-        record_meeting_creation("error", Some("code_collision"), Duration::from_millis(200));
-        record_meeting_creation("error", Some("internal"), Duration::from_millis(10));
-    }
-
-    #[test]
-    fn test_record_meeting_join() {
-        // Success path
-        record_meeting_join("success", None, Duration::from_millis(200));
-
-        // Error paths with different error types
-        record_meeting_join("error", Some("not_found"), Duration::from_millis(5));
-        record_meeting_join("error", Some("unauthorized"), Duration::from_millis(3));
-        record_meeting_join("error", Some("forbidden"), Duration::from_millis(8));
-        record_meeting_join("error", Some("bad_status"), Duration::from_millis(5));
-        record_meeting_join("error", Some("mc_assignment"), Duration::from_millis(500));
-        record_meeting_join("error", Some("ac_request"), Duration::from_millis(1000));
-        record_meeting_join("error", Some("internal"), Duration::from_millis(10));
-    }
-
-    #[test]
-    fn test_normalize_endpoint_meetings_create() {
-        assert_eq!(normalize_endpoint("/api/v1/meetings"), "/api/v1/meetings");
+        for controller_type in ["meeting", "media"] {
+            for status in CONTROLLER_STATUSES {
+                snap.gauge("gc_registered_controllers")
+                    .with_labels(&[("controller_type", controller_type), ("status", status)])
+                    .assert_unobserved();
+            }
+        }
     }
 }

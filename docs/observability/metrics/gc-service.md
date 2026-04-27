@@ -200,28 +200,41 @@ All GC service metrics follow ADR-0011 naming conventions with the `gc_` prefix.
 
 ## Meeting Join Metrics
 
+> **Note**: The `gc_meeting_join_*` family is **shared between two handlers** —
+> `join_meeting` (authenticated user, `participant=user`) and `get_guest_token`
+> (public guest, `participant=guest`). The `participant` label discriminates so
+> operators can triage user-vs-guest failures without log-diving (added per
+> ADR-0032 Step 5, 2026-04-27). Do NOT introduce a parallel `gc_guest_token_*`
+> family — both paths produce a join token + MC assignment with the same
+> outcome shape; the `participant` axis is the canonical discriminator.
+
 ### `gc_meeting_join_total`
 - **Type**: Counter
-- **Description**: Total meeting join attempts
+- **Description**: Total meeting join attempts (both `join_meeting` and `get_guest_token` handlers)
 - **Labels**:
+  - `participant`: `user` (authenticated) or `guest` (public). ADR-0032 Step 5.
   - `status`: Join outcome (success, error)
-- **Cardinality**: Low (2 statuses)
-- **Usage**: Track meeting join rate and success
+- **Cardinality**: Low (2 participants × 2 statuses = 4)
+- **Usage**: Track meeting join rate and success per participant type
 - **Dashboard**: "Meeting Join Rate by Status" and "Meeting Join Success Rate (%)" panels in `gc-overview.json`
 - **Alerts**: `GCHighJoinFailureRate` (warning, >5% failure rate for 5m)
 - **Example**:
   ```promql
   rate(gc_meeting_join_total{status="error"}[5m])
+  # User-only success rate
+  sum(rate(gc_meeting_join_total{participant="user", status="success"}[5m])) /
+  sum(rate(gc_meeting_join_total{participant="user"}[5m]))
   ```
 
 ### `gc_meeting_join_duration_seconds`
 - **Type**: Histogram
 - **Description**: Meeting join operation duration (end-to-end handler time including MC assignment and AC token request)
 - **Labels**:
+  - `participant`: `user` (authenticated) or `guest` (public). ADR-0032 Step 5.
   - `status`: Join outcome (success, error)
 - **Buckets**: [0.010, 0.025, 0.050, 0.100, 0.200, 0.500, 1.000, 2.000, 5.000]
-- **Cardinality**: Low (2 statuses)
-- **Usage**: Monitor meeting join latency, identify slow MC assignment or AC token paths
+- **Cardinality**: Low (2 participants × 2 statuses = 4)
+- **Usage**: Monitor meeting join latency, identify slow MC assignment or AC token paths; compare guest vs user latency
 - **Dashboard**: "Meeting Join Latency (P50/P95/P99)" panel in `gc-overview.json`
 - **Alerts**: `GCHighJoinLatency` (info, p95 >2s for 5m)
 - **Example**:
@@ -233,16 +246,26 @@ All GC service metrics follow ADR-0011 naming conventions with the `gc_` prefix.
 
 ### `gc_meeting_join_failures_total`
 - **Type**: Counter
-- **Description**: Meeting join failures by error type
+- **Description**: Meeting join failures by error type and participant type
 - **Labels**:
-  - `error_type`: Type of failure (not_found, forbidden, unauthorized, bad_status, mc_assignment, ac_request, internal)
-- **Cardinality**: Low (7 error types)
-- **Alert**: High rate may indicate MC capacity issues or AC connectivity problems
-- **Usage**: Diagnose meeting join failures
+  - `participant`: `user` or `guest`. ADR-0032 Step 5.
+  - `error_type`: Type of failure (bounded set):
+    - `not_found` — meeting doesn't exist (both)
+    - `bad_status` — meeting cancelled/ended (both)
+    - `forbidden` — cross-org denied (`user` only) or `allow_guests=false` is reported as `guests_disabled` (`guest` only — distinct value)
+    - `unauthorized` — JWT parse fails (`user` only — guest path is public)
+    - `guests_disabled` — `meeting.allow_guests=false` (`guest` only). ADR-0032 Step 5.
+    - `bad_request` — body validation fails (`guest` only — user path has no body)
+    - `mc_assignment` — MC assignment service failed (both)
+    - `ac_request` — AC token request failed (both)
+    - `internal` — RNG/AC client construction failure (both)
+- **Cardinality**: Low (~2 participants × ~9 error types ≈ 18 series; bounded under ADR-0011 cap-10-per-label)
+- **Alert**: High rate may indicate MC capacity issues or AC connectivity problems; `participant=guest, error_type=guests_disabled` spikes mean meeting hosts are receiving guest-join attempts on guest-disabled meetings
+- **Usage**: Diagnose meeting join failures, distinguishing user vs guest paths for triage
 - **Dashboard**: "Meeting Join Failures by Type" panel in `gc-overview.json`
 - **Example**:
   ```promql
-  sum(rate(gc_meeting_join_failures_total[5m])) by (error_type)
+  sum(rate(gc_meeting_join_failures_total[5m])) by (participant, error_type)
   ```
 
 ---
@@ -333,6 +356,7 @@ All GC service metrics follow ADR-0011 naming conventions with the `gc_` prefix.
   - `expected_type`: Expected `service_type` for the gRPC service (`meeting-controller`, `media-handler`)
   - `actual_type`: Actual `service_type` from the token (`meeting-controller`, `media-handler`, `global-controller`, `unknown`)
 - **Cardinality**: Low (2 x 2 x 4 = 16 max, bounded by gRPC services and service types + "unknown")
+- **Cardinality note**: The label values listed are the expected/legitimate set. The emission site at `grpc/auth_layer.rs:241` does not currently allowlist-clamp the `claims.service_type` value before recording, so a forged or off-spec JWT presenting an arbitrary string would inject that value as a label. Tracked in `docs/TODO.md` for clamping fix (ADR-0032 Step 5 finding F1); bound in production is enforced by JWKS auth (only legitimately-issued tokens reach this site, and AC issues only the 4 enumerated values).
 - **Alert**: ANY non-zero value indicates a bug or misconfiguration — a service is presenting a valid token but calling the wrong gRPC endpoint.
 - **Usage**: Detect service-to-service routing errors, misconfigured tokens.
 - **Recorded in**: `grpc/auth_layer.rs` on Layer 2 rejection.

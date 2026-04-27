@@ -559,8 +559,23 @@ sum(rate(gc_http_requests_total{status_code=~"[45].."}[5m])) / sum(rate(gc_http_
 # Error breakdown by status code
 sum by(status_code) (increase(gc_http_requests_total{status_code=~"[45].."}[5m]))
 
-# Error breakdown by endpoint
+# Error breakdown by endpoint (now includes guest-token path)
 sum by(endpoint, status_code) (increase(gc_http_requests_total{status_code=~"[45].."}[5m]))
+# Note: /api/v1/meetings/{code}/guest-token contributes to gc_meeting_join_*
+# time series alongside /api/v1/meetings/{code} (since ADR-0032 Step 5,
+# 2026-04-27). To distinguish authenticated-vs-guest failures: filter by
+# `participant=user|guest` on gc_meeting_join_failures_total, or by `endpoint`
+# on gc_http_requests_total, then cross-reference error_type counts.
+#
+# Note: `error_type=guests_disabled` and `error_type=bad_request` are new label
+# values introduced in ADR-0032 Step 5 (2026-04-27). Expect them to first appear
+# on error_type-breakdown panels when guest-flow traffic hits production. A new
+# time series with no historical baseline does NOT indicate an incident on its
+# own — cross-reference with catalog (`docs/observability/metrics/gc-service.md`)
+# for the bounded set.
+
+# Error breakdown by participant (user-vs-guest triage)
+sum by(participant, error_type) (increase(gc_meeting_join_failures_total[5m]))
 
 # 2. Check error types in metrics
 curl http://localhost:8080/metrics | grep gc_errors_total

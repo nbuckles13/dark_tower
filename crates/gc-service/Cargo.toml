@@ -75,3 +75,6 @@ metrics-exporter-prometheus = "0.16"
 # JWT/base64 used in test code (auth_layer async_tests)
 jsonwebtoken = { workspace = true }
 base64 = "0.22"
+# Enable common's test-utils feature for MetricAssertion in tests/
+# (mirrors AC's pattern — ADR-0032 Step 5).
+common = { path = "../common", features = ["test-utils"] }
