@@ -5,6 +5,10 @@
 // Test code is allowed to use expect/unwrap for assertions
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "common/mod.rs"]
+mod test_common;
+use test_common::jwt_fixtures::{TestKeypair, TestServiceClaims};
+
 use anyhow::Result;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chrono::Utc;
@@ -31,9 +35,6 @@ fn get_test_metrics_handle() -> metrics_exporter_prometheus::PrometheusHandle {
         })
         .clone()
 }
-use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
-use ring::signature::{Ed25519KeyPair, KeyPair};
-use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -42,95 +43,6 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
-
-/// JWT Claims for test tokens.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct TestClaims {
-    sub: String,
-    exp: i64,
-    iat: i64,
-    scope: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    service_type: Option<String>,
-}
-
-/// Test keypair for signing tokens.
-struct TestKeypair {
-    kid: String,
-    public_key_bytes: Vec<u8>,
-    private_key_pkcs8: Vec<u8>,
-}
-
-impl TestKeypair {
-    fn new(seed: u8, kid: &str) -> Self {
-        // Create deterministic seed
-        let mut seed_bytes = [0u8; 32];
-        seed_bytes[0] = seed;
-        for (i, byte) in seed_bytes.iter_mut().enumerate().skip(1) {
-            *byte = seed.wrapping_mul(i as u8).wrapping_add(i as u8);
-        }
-
-        let key_pair = Ed25519KeyPair::from_seed_unchecked(&seed_bytes)
-            .expect("Failed to create test keypair");
-
-        let public_key_bytes = key_pair.public_key().as_ref().to_vec();
-        let private_key_pkcs8 = build_pkcs8_from_seed(&seed_bytes);
-
-        Self {
-            kid: kid.to_string(),
-            public_key_bytes,
-            private_key_pkcs8,
-        }
-    }
-
-    fn sign_token(&self, claims: &TestClaims) -> String {
-        let encoding_key = EncodingKey::from_ed_der(&self.private_key_pkcs8);
-        let mut header = Header::new(Algorithm::EdDSA);
-        header.typ = Some("JWT".to_string());
-        header.kid = Some(self.kid.clone());
-
-        encode(&header, claims, &encoding_key).expect("Failed to sign token")
-    }
-
-    fn jwk_json(&self) -> serde_json::Value {
-        serde_json::json!({
-            "kty": "OKP",
-            "kid": self.kid,
-            "crv": "Ed25519",
-            "x": URL_SAFE_NO_PAD.encode(&self.public_key_bytes),
-            "alg": "EdDSA",
-            "use": "sig"
-        })
-    }
-}
-
-/// Build PKCS#8 v1 document from Ed25519 seed.
-fn build_pkcs8_from_seed(seed: &[u8; 32]) -> Vec<u8> {
-    let mut pkcs8 = Vec::new();
-
-    // Outer SEQUENCE tag
-    pkcs8.push(0x30);
-    pkcs8.push(0x2e); // Length: 46 bytes
-
-    // Version: INTEGER 0
-    pkcs8.extend_from_slice(&[0x02, 0x01, 0x00]);
-
-    // Algorithm Identifier: SEQUENCE
-    pkcs8.push(0x30);
-    pkcs8.push(0x05); // Length: 5 bytes
-                      // OID for Ed25519: 1.3.101.112
-    pkcs8.extend_from_slice(&[0x06, 0x03, 0x2b, 0x65, 0x70]);
-
-    // Private Key: OCTET STRING
-    pkcs8.push(0x04);
-    pkcs8.push(0x22); // Length: 34 bytes
-                      // Inner OCTET STRING with seed
-    pkcs8.push(0x04);
-    pkcs8.push(0x20); // Length: 32 bytes
-    pkcs8.extend_from_slice(seed);
-
-    pkcs8
-}
 
 /// Test server with mocked JWKS endpoint.
 struct TestAuthServer {
@@ -225,38 +137,38 @@ impl TestAuthServer {
 
     fn create_valid_token(&self) -> String {
         let now = Utc::now().timestamp();
-        let claims = TestClaims {
+        let claims = TestServiceClaims {
             sub: "test-client".to_string(),
             exp: now + 3600, // 1 hour
             iat: now,
             scope: "read write".to_string(),
             service_type: Some("global-controller".to_string()),
         };
-        self.keypair.sign_token(&claims)
+        self.keypair.sign_service_token(&claims)
     }
 
     fn create_expired_token(&self) -> String {
         let now = Utc::now().timestamp();
-        let claims = TestClaims {
+        let claims = TestServiceClaims {
             sub: "test-client".to_string(),
             exp: now - 3600, // Expired 1 hour ago
             iat: now - 7200, // Issued 2 hours ago
             scope: "read write".to_string(),
             service_type: None,
         };
-        self.keypair.sign_token(&claims)
+        self.keypair.sign_service_token(&claims)
     }
 
     fn create_future_iat_token(&self) -> String {
         let now = Utc::now().timestamp();
-        let claims = TestClaims {
+        let claims = TestServiceClaims {
             sub: "test-client".to_string(),
             exp: now + 7200, // Expires in 2 hours
             iat: now + 3600, // Issued 1 hour from now (invalid)
             scope: "read write".to_string(),
             service_type: None,
         };
-        self.keypair.sign_token(&claims)
+        self.keypair.sign_service_token(&claims)
     }
 
     async fn setup_missing_key(&self) {
@@ -502,14 +414,14 @@ async fn test_token_exactly_at_8kb_limit_accepted(pool: PgPool) -> Result<()> {
 
     // We'll iteratively adjust padding to hit exactly 8192 bytes
     // Start with a base token and measure, then pad the scope field
-    let base_claims = TestClaims {
+    let base_claims = TestServiceClaims {
         sub: "test-client".to_string(),
         exp: now + 3600,
         iat: now,
         scope: "read write".to_string(),
         service_type: Some("global-controller".to_string()),
     };
-    let base_token = server.keypair.sign_token(&base_claims);
+    let base_token = server.keypair.sign_service_token(&base_claims);
     let base_len = base_token.len();
 
     // Calculate padding needed to reach exactly 8192 bytes
@@ -519,14 +431,14 @@ async fn test_token_exactly_at_8kb_limit_accepted(pool: PgPool) -> Result<()> {
     // Base64 encoding ratio is 4:3, so we need approximately needed * 3/4 chars
     let padding_chars = (needed * 3) / 4 + 10; // Add buffer for adjustment
 
-    let padded_claims = TestClaims {
+    let padded_claims = TestServiceClaims {
         sub: "test-client".to_string(),
         exp: now + 3600,
         iat: now,
         scope: format!("read write {}", "x".repeat(padding_chars)),
         service_type: Some("global-controller".to_string()),
     };
-    let padded_token = server.keypair.sign_token(&padded_claims);
+    let padded_token = server.keypair.sign_service_token(&padded_claims);
 
     // Verify we got a token near 8192 bytes
     // Due to base64 encoding, exact 8192 is hard to hit, so we test that:
@@ -553,14 +465,14 @@ async fn test_token_exactly_at_8kb_limit_accepted(pool: PgPool) -> Result<()> {
     } else {
         // Token exceeded 8192, reduce padding and try again
         let smaller_padding = padding_chars.saturating_sub(50);
-        let smaller_claims = TestClaims {
+        let smaller_claims = TestServiceClaims {
             sub: "test-client".to_string(),
             exp: now + 3600,
             iat: now,
             scope: format!("read write {}", "x".repeat(smaller_padding)),
             service_type: Some("global-controller".to_string()),
         };
-        let smaller_token = server.keypair.sign_token(&smaller_claims);
+        let smaller_token = server.keypair.sign_service_token(&smaller_claims);
 
         assert!(
             smaller_token.len() <= 8192,

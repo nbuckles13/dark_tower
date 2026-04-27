@@ -16,6 +16,10 @@
 // Test code is allowed to use expect/unwrap for assertions
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "common/mod.rs"]
+mod test_common;
+use test_common::jwt_fixtures::{TestKeypair, TestServiceClaims, TestUserClaims};
+
 use anyhow::Result;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chrono::Utc;
@@ -44,8 +48,6 @@ fn get_test_metrics_handle() -> metrics_exporter_prometheus::PrometheusHandle {
         .clone()
 }
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
-use ring::signature::{Ed25519KeyPair, KeyPair};
-use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -56,162 +58,12 @@ use uuid::Uuid;
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-// ============================================================================
-// Test Helpers
-// ============================================================================
-
-/// JWT Claims for service test tokens (used by /api/v1/me).
-#[allow(dead_code)]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct TestClaims {
-    sub: String,
-    exp: i64,
-    iat: i64,
-    scope: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    service_type: Option<String>,
-}
-
-/// JWT Claims for user test tokens (used by join/settings/create endpoints).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct TestUserClaims {
-    sub: String,
-    org_id: String,
-    email: String,
-    roles: Vec<String>,
-    iat: i64,
-    exp: i64,
-    jti: String,
-}
-
-/// Test keypair for signing tokens.
-struct TestKeypair {
-    kid: String,
-    public_key_bytes: Vec<u8>,
-    private_key_pkcs8: Vec<u8>,
-}
-
-#[allow(dead_code)]
-impl TestKeypair {
-    fn new(seed: u8, kid: &str) -> Self {
-        // Create deterministic seed
-        let mut seed_bytes = [0u8; 32];
-        seed_bytes[0] = seed;
-        for (i, byte) in seed_bytes.iter_mut().enumerate().skip(1) {
-            *byte = seed.wrapping_mul(i as u8).wrapping_add(i as u8);
-        }
-
-        let key_pair = Ed25519KeyPair::from_seed_unchecked(&seed_bytes)
-            .expect("Failed to create test keypair");
-
-        let public_key_bytes = key_pair.public_key().as_ref().to_vec();
-        let private_key_pkcs8 = build_pkcs8_from_seed(&seed_bytes);
-
-        Self {
-            kid: kid.to_string(),
-            public_key_bytes,
-            private_key_pkcs8,
-        }
-    }
-
-    fn sign_token(&self, claims: &TestClaims) -> String {
-        let encoding_key = EncodingKey::from_ed_der(&self.private_key_pkcs8);
-        let mut header = Header::new(Algorithm::EdDSA);
-        header.typ = Some("JWT".to_string());
-        header.kid = Some(self.kid.clone());
-
-        encode(&header, claims, &encoding_key).expect("Failed to sign token")
-    }
-
-    fn sign_user_token(&self, claims: &TestUserClaims) -> String {
-        let encoding_key = EncodingKey::from_ed_der(&self.private_key_pkcs8);
-        let mut header = Header::new(Algorithm::EdDSA);
-        header.typ = Some("JWT".to_string());
-        header.kid = Some(self.kid.clone());
-
-        encode(&header, claims, &encoding_key).expect("Failed to sign user token")
-    }
-
-    /// Create a token with HS256 algorithm (wrong algorithm attack).
-    fn create_hs256_token(&self, claims: &TestClaims) -> String {
-        // Create a fake HS256 token - this uses the public key as the HMAC secret
-        // which is a known attack vector (algorithm confusion)
-        let encoding_key = EncodingKey::from_secret(&self.public_key_bytes);
-        let mut header = Header::new(Algorithm::HS256);
-        header.typ = Some("JWT".to_string());
-        header.kid = Some(self.kid.clone());
-
-        encode(&header, claims, &encoding_key).expect("Failed to sign HS256 token")
-    }
-
-    /// Create a token signed with a different (unknown) key.
-    fn create_token_with_wrong_key(&self, claims: &TestClaims) -> String {
-        // Create a different keypair (different seed)
-        let wrong_keypair = TestKeypair::new(99, &self.kid); // Same kid, different key
-        wrong_keypair.sign_token(claims)
-    }
-
-    /// Create a tampered token (modify payload after signing).
-    fn create_tampered_token(&self, claims: &TestClaims) -> String {
-        // First, sign the token normally
-        let valid_token = self.sign_token(claims);
-
-        // Parse the token parts
-        let parts: Vec<&str> = valid_token.split('.').collect();
-        let header = parts.first().expect("JWT missing header");
-        let signature = parts.get(2).expect("JWT missing signature");
-
-        // Create modified claims
-        let mut modified_claims = claims.clone();
-        modified_claims.scope = "admin superuser".to_string(); // Escalate privileges
-
-        // Encode the modified payload
-        let modified_payload =
-            URL_SAFE_NO_PAD.encode(serde_json::to_string(&modified_claims).unwrap().as_bytes());
-
-        // Reassemble with original signature (which won't match the modified payload)
-        format!("{}.{}.{}", header, modified_payload, signature)
-    }
-
-    fn jwk_json(&self) -> serde_json::Value {
-        serde_json::json!({
-            "kty": "OKP",
-            "kid": self.kid,
-            "crv": "Ed25519",
-            "x": URL_SAFE_NO_PAD.encode(&self.public_key_bytes),
-            "alg": "EdDSA",
-            "use": "sig"
-        })
-    }
-}
-
-/// Build PKCS#8 v1 document from Ed25519 seed.
-fn build_pkcs8_from_seed(seed: &[u8; 32]) -> Vec<u8> {
-    let mut pkcs8 = Vec::new();
-
-    // Outer SEQUENCE tag
-    pkcs8.push(0x30);
-    pkcs8.push(0x2e); // Length: 46 bytes
-
-    // Version: INTEGER 0
-    pkcs8.extend_from_slice(&[0x02, 0x01, 0x00]);
-
-    // Algorithm Identifier: SEQUENCE
-    pkcs8.push(0x30);
-    pkcs8.push(0x05); // Length: 5 bytes
-                      // OID for Ed25519: 1.3.101.112
-    pkcs8.extend_from_slice(&[0x06, 0x03, 0x2b, 0x65, 0x70]);
-
-    // Private Key: OCTET STRING
-    pkcs8.push(0x04);
-    pkcs8.push(0x22); // Length: 34 bytes
-                      // Inner OCTET STRING with seed
-    pkcs8.push(0x04);
-    pkcs8.push(0x20); // Length: 32 bytes
-    pkcs8.extend_from_slice(seed);
-
-    pkcs8
-}
+// `TestKeypair` / `TestServiceClaims` / `TestUserClaims` / `build_pkcs8_from_seed`
+// are imported from `tests/common/jwt_fixtures.rs` per @team-lead Path Y
+// completion authorization (2026-04-27). User-facing attack-vector helpers
+// (`create_hs256_token_for_user`, `create_token_with_wrong_key`,
+// `create_tampered_token`) live as methods on `TestMeetingServer` below —
+// they operate on `TestUserClaims` shapes specific to this file.
 
 /// Test server with mocked JWKS and AC internal endpoints.
 struct TestMeetingServer {
@@ -488,14 +340,14 @@ impl TestMeetingServer {
     /// The user auth middleware should reject it with 401.
     fn create_service_token(&self) -> String {
         let now = Utc::now().timestamp();
-        let claims = TestClaims {
+        let claims = TestServiceClaims {
             sub: "gc-service".to_string(),
             exp: now + 3600,
             iat: now,
             scope: "read write".to_string(),
             service_type: Some("global-controller".to_string()),
         };
-        self.keypair.sign_token(&claims)
+        self.keypair.sign_service_token(&claims)
     }
 
     /// Create a tampered user token (payload modified after signing).

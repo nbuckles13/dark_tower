@@ -122,9 +122,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .map_err(|e| format!("Token manager config error: {}", e))?
     .with_on_refresh(Arc::new(|event| {
-        let status = if event.success { "success" } else { "error" };
-        let error_type = event.error_category;
-        observability::metrics::record_token_refresh(status, error_type, event.duration);
+        observability::metrics::record_token_refresh_metrics(&event);
     }));
 
     info!("Starting token manager...");
