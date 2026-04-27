@@ -53,22 +53,23 @@
 ## Tests
 - Meeting creation tests -> `crates/gc-service/tests/meeting_create_tests.rs`
 - Meeting join/guest/settings tests -> `crates/gc-service/tests/meeting_tests.rs`
-- MC assignment + MH selection integration tests -> `crates/gc-service/tests/mc_assignment_rpc_tests.rs`
-- Meeting assignment service tests -> `crates/gc-service/tests/meeting_assignment_tests.rs`
+- MC/MH assignment tests -> `crates/gc-service/tests/mc_assignment_rpc_tests.rs`, `crates/gc-service/tests/meeting_assignment_tests.rs`
 - Auth integration tests -> `crates/gc-service/tests/auth_tests.rs`
-- Test harness -> `crates/gc-test-utils/src/server_harness.rs`
-- Test token helpers -> `crates/gc-service/tests/meeting_tests.rs:TestUserClaims`
+- Test harness -> `crates/gc-test-utils/src/server_harness.rs`; per-crate JWT fixtures -> `crates/gc-service/tests/common/jwt_fixtures.rs`
 - Metrics catalog (creation + join) -> `docs/observability/metrics/gc-service.md`
 
 ### Metric testability (ADR-0032)
 - Uncovered sites (~21/186): `main.rs:127` token-refresh closure (Cat B extraction); `handlers/meetings.rs` error branches (validation direct-call / pg-error-code real-DB+fault / non-DB repo-trait); `mh_selection.rs` deeply-nested; `grpc/auth_layer.rs:250` wrapper-only. GC spawns at `main.rs:180/199/207` are lifecycle, not fire-and-forget (no accept-loop-style backfill needed). SLO: 11% → <6% by 2026-07 → <3% by 2026-10
+- ADR-0032 Step 5 closeout (2026-04-27, commit `48f1250`): all 25 uncovered GC metrics drained → `validate-metric-coverage.sh` GREEN. Per-cluster `MetricAssertion`-backed integration tests at `crates/gc-service/tests/*_metrics_integration.rs` (13 cluster files); in-src `#[cfg(test)] mod tests` at `crates/gc-service/src/observability/metrics.rs`. Cat B extraction: `record_token_refresh_metrics` parallel sibling pattern (1:1 with MH/MC). Fixture consolidation: `tests/common/jwt_fixtures.rs` consumed by all 3 pre-existing GC integration test files + 13 new cluster files.
+
+### Step 5 Patterns Worth Carrying Forward
+- 4-cell gauge adjacency matrix (happy / partial+zero-fill / empty / short-circuit) -> `tests/registered_controllers_metrics_integration.rs`
+- Shared metric family + discriminator label (vs `*_user_*`/`*_guest_*` fork) -> `handlers/meetings.rs:512-526`, `tests/meeting_join_metrics_integration.rs:132-145`
+- Orphan-recording-site (all tests wrapper-Cat-C when fn has zero prod callers) -> `tests/db_metrics_integration.rs`, `src/repositories/mod.rs:21`
+- Catalog aspirational-vs-enforced for unbounded-source labels -> `docs/observability/metrics/gc-service.md:351-365`, `auth_layer.rs:241`
+- Per-crate `tests/common/{mod.rs,jwt_fixtures.rs}` fixture consolidation (attack helpers stay file-local) -> `crates/gc-service/tests/common/jwt_fixtures.rs`
 
 ### Join endpoint test coverage (R-18)
-- Auth: 401 no token, 401 expired, 401 service token, 401 wrong key/alg/tampered
-- Access: 403 cross-org denied, 200 cross-org allowed (allow_external=true)
-- Status: 404 cancelled, 404 ended, 200 scheduled, 200 active
-- Failure: 503 AC unavailable, 503 no MC available, 404 meeting not found
-- Success: token + MC assignment (mc_id, grpc_endpoint, webtransport_endpoint)
-- AC failure variant: `TestMeetingServer::spawn_with_ac_failure()` (500 on meeting-token)
-- Regression: same-org join home_org_id invariant -> `meeting_tests.rs:test_same_org_join_sends_home_org_id_equal_to_user_org_id`
-- Shared type unit tests (15 tests) -> `crates/common/src/meeting_token.rs` (#[cfg(test)])
+- Auth (401×4) / access (403, 200 cross-org) / status (404×2, 200×2) / failure (503×2, 404) / success / AC-failure variant -> `crates/gc-service/tests/meeting_tests.rs`
+- AC-failure server: `TestMeetingServer::spawn_with_ac_failure()`; same-org home_org_id regression: `test_same_org_join_sends_home_org_id_equal_to_user_org_id`
+- Shared type unit tests (15) -> `crates/common/src/meeting_token.rs` (#[cfg(test)])
