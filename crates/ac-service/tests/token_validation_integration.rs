@@ -22,13 +22,12 @@
 //! is bounded by production emission. See `docs/TODO.md` §Observability
 //! Debt for the orphan disposition tracker.
 //!
-//! # `clock_skew` cardinality drift (NEW FINDING during Step 4 plan stage)
+//! # `clock_skew` is a first-class `error_category` value
 //!
-//! Catalog `docs/observability/metrics/ac-service.md:39` declares
-//! `error_category ∈ {authentication, authorization, cryptographic, internal, none}`.
-//! Production emits a 5th value `clock_skew`. This file asserts on the
-//! production ground truth (`clock_skew`); disposition pending team-lead
-//! decision (see TODO entry).
+//! Resolved 2026-04-27 (ADR-0032 Step 4 iter-4): `clock_skew` is a documented
+//! 6th value in `docs/observability/metrics/ac-service.md` and a first-class
+//! `ErrorCategory::ClockSkew` variant in `crates/ac-service/src/observability/mod.rs`.
+//! ADR-0011's per-label value cap was raised from 5 to 10 in the same amendment.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 

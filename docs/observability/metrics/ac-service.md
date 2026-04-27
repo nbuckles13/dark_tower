@@ -36,10 +36,10 @@ All AC service metrics follow ADR-0011 naming conventions with the `ac_` prefix.
 - **Description**: Total number of token validation attempts
 - **Labels**:
   - `status`: Validation result (`success`, `error`)
-  - `error_category`: Category of validation error (`authentication`, `authorization`, `cryptographic`, `internal`, `none`)
-- **Cardinality**: Low (2 statuses × 5 categories = 10 series)
+  - `error_category`: Category of validation error (`authentication`, `authorization`, `cryptographic`, `internal`, `clock_skew`, `none`)
+- **Cardinality**: Low (2 statuses × 6 categories = 12 series)
 - **Status**: Defined but not currently used (future)
-- **Usage**: Track validation rate and error types
+- **Usage**: Track validation rate and error types. `clock_skew` is the only category currently emitted from production (via `crypto::verify_jwt` / `verify_user_jwt` iat-skew branches); the others are forward-looking reservations bounded by the `ErrorCategory` enum in `crates/ac-service/src/observability/mod.rs`.
 
 ---
 
@@ -285,7 +285,7 @@ All AC service metrics follow strict cardinality bounds per ADR-0011:
 |-------|-------|--------|
 | `grant_type` | 4 max | `client_credentials`, `authorization_code`, `refresh_token`, `password` |
 | `status` | 2 | `success`, `error` |
-| `error_category` | 4 | `authentication`, `authorization`, `cryptographic`, `internal` |
+| `error_category` | 6 | `authentication`, `authorization`, `cryptographic`, `internal`, `clock_skew`, `none` |
 | `operation` | Bounded by code | `select`, `insert`, `update`, `delete`, etc. |
 | `table` | Bounded by schema | ~7 tables (`service_credentials`, `signing_keys`, `auth_events`, `users`, `user_roles`, `organizations`, etc.) |
 | `cache_status` | 3 | `hit`, `miss`, `bypass` |

@@ -61,9 +61,12 @@ This ADR establishes **requirements and patterns**. Living documentation is main
 
 **Cardinality Limits** (REQUIRED):
 - Maximum unique label combinations per metric: 1,000
+- Maximum unique values per individual label key: 10 (raised from 5; see Amendment 2026-04-27)
 - Maximum label value length: 64 characters
 - Total cardinality budget: 5,000,000 time series
 - Use indexed values (e.g., `mc_index: 1-20`) instead of UUIDs for high-cardinality identifiers
+
+> **Amendment 2026-04-27** (ADR-0032 Step 4): The per-label-key value cap was raised from 5 to 10 to preserve operational distinction between failure modes (e.g., `clock_skew` vs the broader `cryptographic` category on `ac_token_validations_total{error_category}`) when bounded enumeration is otherwise warranted. Collapsing such variants into a parent category loses signal that drives different alerts and runbooks (clock-drift NTP issues vs. signature/key issues). The numeric bound remains a backstop, not the primary discipline; the architectural follow-up to reframe cardinality discipline as **typed-label-source** (label values must come from a Rust enum, named const, or bounded normalization function — not free-form strings) is tracked in `docs/TODO.md` §Observability Debt and will land as its own ADR amendment when the typed-labels migration user story is scheduled.
 
 #### Infrastructure-Provided Metrics
 

@@ -69,10 +69,10 @@ pub fn hash_for_correlation(value: &str, secret: &[u8]) -> String {
 
 /// Error categories for metrics labels (bounded cardinality)
 ///
-/// Maps internal error types to 4 categories per debate consensus.
-///
-/// NOTE: This enum is defined per ADR-0011 for service-layer instrumentation
-/// which will be added in Phase 4 (Documentation & Testing).
+/// Maps internal error types to bounded categories per ADR-0011.
+/// The per-label value cap was raised to 10 in the 2026-04-27 amendment
+/// to preserve operational distinction between failure modes (e.g., `ClockSkew`
+/// vs the broader `Cryptographic` category) when alerting/runbooks differ.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorCategory {
@@ -84,6 +84,15 @@ pub enum ErrorCategory {
     Cryptographic,
     /// Internal errors (database, system)
     Internal,
+    /// JWT iat-validation skew rejection (NTP / clock-drift signal).
+    ///
+    /// Emitted via `record_token_validation` from `crypto::verify_jwt` and
+    /// `crypto::verify_user_jwt` iat-skew branches; not produced by
+    /// `From<&AcError>` because that error path returns `AcError::InvalidToken`
+    /// (a `Cryptographic` variant) without distinguishing iat-skew at the
+    /// error type. Kept first-class here so dashboards and alerts can split
+    /// clock-drift signal from signature/key failures.
+    ClockSkew,
 }
 
 impl ErrorCategory {
@@ -94,6 +103,7 @@ impl ErrorCategory {
             ErrorCategory::Authorization => "authorization",
             ErrorCategory::Cryptographic => "cryptographic",
             ErrorCategory::Internal => "internal",
+            ErrorCategory::ClockSkew => "clock_skew",
         }
     }
 }
@@ -212,6 +222,7 @@ mod tests {
         assert_eq!(ErrorCategory::Authorization.as_str(), "authorization");
         assert_eq!(ErrorCategory::Cryptographic.as_str(), "cryptographic");
         assert_eq!(ErrorCategory::Internal.as_str(), "internal");
+        assert_eq!(ErrorCategory::ClockSkew.as_str(), "clock_skew");
     }
 
     #[test]
