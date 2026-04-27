@@ -636,14 +636,14 @@ Phase 6 (after dashboards):
 | 1 | Proto: MhAssignment grpc_endpoint, remove MhRole, remove connection_token, RegisterMeeting, MediaCoordinationService, MediaConnectionFailed | `docs/devloop-outputs/2026-04-13-mh-quic-proto/` | `703f2ca` | Completed |
 | 2 | GC: propagate grpc_endpoint, remove role assignment | `docs/devloop-outputs/2026-04-14-gc-propagate-grpc-endpoint/` | `27ea1b3` | Completed |
 | 3 | MH: JWT validation + WebTransport server + connection handler + auth interceptor upgrade | `docs/devloop-outputs/2026-04-13-mh-quic-webtransport/main.md` | `e95e315` | Completed |
-| 4 | MC: Redis gRPC endpoints + media_servers + MhClient | | | Pending |
+| 4 | MC: Redis gRPC endpoints + media_servers + MhClient | `docs/devloop-outputs/2026-04-14-mc-mh-grpc-client/` | `442ac92` | Completed |
 | 5 | MH: RegisterMeeting handler + SessionManager | `docs/devloop-outputs/2026-04-14-mh-register-meeting/` | `e6b02b1` | Completed |
 | 6 | MH: MC notification client | `docs/devloop-outputs/2026-04-15-mh-mc-client-notifications/` | `001ede8` | Completed |
 | 7 | MC: MediaCoordinationService + MhConnectionRegistry + MediaConnectionFailed handler | `docs/devloop-outputs/2026-04-14-mc-media-coordination-service/` | `938f4cb` | Completed |
 | 8 | MC: async RegisterMeeting trigger | `docs/devloop-outputs/2026-04-15-mc-async-register-meeting/` | `a45f746` | Completed |
 | 9 | Infra: network policies + MH AC_JWKS_URL | docs/devloop-outputs/2026-04-13-mh-mc-network-policy/ | 93aa29b | Completed |
 | 10 | MH: observability metrics | | | Pending |
-| 11 | MC: MH coordination metrics | | | Pending |
+| 11 | MC: MH coordination metrics | (absorbed by tasks 4, 7) | `442ac92`, `f03f788` | Completed |
 | 12 | MH: WebTransport dashboard + alerts | | | Pending |
 | 13 | MC: MH coordination dashboard + alerts | | | Pending |
 | 14 | MH: integration tests | | | Pending |
