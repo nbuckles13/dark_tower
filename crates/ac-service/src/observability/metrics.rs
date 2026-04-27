@@ -367,76 +367,126 @@ fn is_uuid(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use common::observability::testing::MetricAssertion;
 
-    // Note: These tests execute the metric recording functions to ensure code coverage.
-    // The metrics crate will record to a global no-op recorder if none is installed,
-    // which is sufficient for coverage testing. We don't need to verify the actual
-    // metric values - that would require installing a test recorder from metrics-util.
+    // ========================================================================
+    // Per-cluster MetricAssertion tests — replace the pre-ADR-0032 hand-rolled
+    // smoke tests (which only proved wrappers don't panic against the global
+    // no-op recorder). These exercise the same wrappers but with per-failure-
+    // class delta assertions, mirroring the MC Step 3 / MH Step 2 migrations.
     //
-    // Per ADR-0002: These tests do not panic on missing recorder.
+    // NOTE: These are wrapper-invocation tests (Cat C name-coverage tier).
+    // The PRODUCTION-PATH coverage for these metrics lives in:
+    //   - tests/token_issuance_service_integration.rs (client_credentials)
+    //   - tests/token_issuance_user_integration.rs (password, registration)
+    //   - tests/internal_token_metrics_integration.rs (internal_meeting/guest)
+    //   - tests/token_validation_integration.rs (verify_jwt clock_skew)
+    //   - tests/key_rotation_metrics_integration.rs (key rotation + gauges)
+    //   - tests/db_metrics_integration.rs (db_query success/error cells)
+    //   - tests/bcrypt_metrics_integration.rs (hash/verify with cost-12)
+    //   - tests/jwks_metrics_integration.rs (cache_status=miss)
+    //   - tests/audit_log_failures_integration.rs (NOT VALID CHECK seam)
+    //   - tests/rate_limit_metrics_integration.rs (3 gates × allowed/rejected)
+    //   - tests/credential_ops_metrics_integration.rs (12-cell adjacency)
+    //   - tests/errors_metric_integration.rs (real handler-error paths)
+    //   - tests/http_metrics_integration.rs (200/404/405/500 via tower)
+    // The block here is the in-file mirror that exercises the metrics.rs
+    // wrappers themselves end-to-end through MetricAssertion.
+    // Pinning is implicit (cargo's default test runner is single-threaded
+    // per-test); MetricAssertion binds a per-thread recorder. See
+    // `crates/common/src/observability/testing.rs:60-72`.
+    // ========================================================================
 
     #[test]
-    fn test_record_token_issuance() {
-        // Test with various grant types and statuses
+    fn metrics_module_emits_token_issuance_cluster() {
+        let snap = MetricAssertion::snapshot();
+
         record_token_issuance("client_credentials", "success", Duration::from_millis(250));
         record_token_issuance("client_credentials", "error", Duration::from_millis(100));
         record_token_issuance("authorization_code", "success", Duration::from_millis(300));
         record_token_issuance("refresh_token", "error", Duration::from_millis(50));
+
+        // Histogram first (drain-on-read — single take_entries() per snapshot).
+        snap.histogram("ac_token_issuance_duration_seconds")
+            .assert_observation_count_at_least(4);
+
+        snap.counter("ac_token_issuance_total")
+            .with_labels(&[("grant_type", "client_credentials"), ("status", "success")])
+            .assert_delta(1);
+        snap.counter("ac_token_issuance_total")
+            .with_labels(&[("grant_type", "client_credentials"), ("status", "error")])
+            .assert_delta(1);
+        snap.counter("ac_token_issuance_total")
+            .with_labels(&[("grant_type", "authorization_code"), ("status", "success")])
+            .assert_delta(1);
+        snap.counter("ac_token_issuance_total")
+            .with_labels(&[("grant_type", "refresh_token"), ("status", "error")])
+            .assert_delta(1);
     }
 
+    // WRAPPER-CAT-C: production callers planned for Phase 4 token-validation
+    // endpoint. Today the wrapper has only TWO real call sites — both
+    // `("error", Some("clock_skew"))` from `crypto/mod.rs:284` (`verify_jwt`)
+    // and `:439` (`verify_user_jwt`). The 4 other label combos exercised here
+    // (success, error+authentication, error+authorization, error+cryptographic,
+    // error+internal) are forward-looking reservations from `ADR-0011`. The
+    // production-path coverage for `clock_skew` lives in
+    // `tests/token_validation_integration.rs`. Mirrors MC's
+    // `media_connection_failed` carve-out pattern. See `docs/TODO.md`
+    // §Observability Debt for the orphan disposition tracker.
     #[test]
-    fn test_record_token_validation() {
-        // Test with and without error category
+    fn metrics_module_emits_token_validation_cluster() {
+        let snap = MetricAssertion::snapshot();
+
         record_token_validation("success", None);
         record_token_validation("error", Some("authentication"));
         record_token_validation("error", Some("authorization"));
         record_token_validation("error", Some("cryptographic"));
         record_token_validation("error", Some("internal"));
+
+        snap.counter("ac_token_validations_total")
+            .with_labels(&[("status", "success"), ("error_category", "none")])
+            .assert_delta(1);
+        snap.counter("ac_token_validations_total")
+            .with_labels(&[("status", "error"), ("error_category", "authentication")])
+            .assert_delta(1);
+        snap.counter("ac_token_validations_total")
+            .with_labels(&[("status", "error"), ("error_category", "authorization")])
+            .assert_delta(1);
+        snap.counter("ac_token_validations_total")
+            .with_labels(&[("status", "error"), ("error_category", "cryptographic")])
+            .assert_delta(1);
+        snap.counter("ac_token_validations_total")
+            .with_labels(&[("status", "error"), ("error_category", "internal")])
+            .assert_delta(1);
     }
 
     #[test]
-    fn test_record_key_rotation() {
-        // Test with success and error statuses
+    fn metrics_module_emits_key_management_cluster() {
+        let snap = MetricAssertion::snapshot();
+
         record_key_rotation("success");
         record_key_rotation("error");
-    }
-
-    #[test]
-    fn test_set_signing_key_age_days() {
-        // Test with various age values
-        set_signing_key_age_days(0.0);
         set_signing_key_age_days(15.5);
-        set_signing_key_age_days(30.0);
-        set_signing_key_age_days(90.0);
-    }
-
-    #[test]
-    fn test_set_active_signing_keys() {
-        // Test with various key counts
-        set_active_signing_keys(0);
-        set_active_signing_keys(1);
         set_active_signing_keys(2);
-        set_active_signing_keys(5);
-    }
-
-    #[test]
-    fn test_set_key_rotation_last_success() {
-        // Test with various timestamps (Unix epoch seconds)
-        set_key_rotation_last_success(0.0);
-        set_key_rotation_last_success(1234567890.0);
         set_key_rotation_last_success(1700000000.0);
+
+        snap.counter("ac_key_rotation_total")
+            .with_labels(&[("status", "success")])
+            .assert_delta(1);
+        snap.counter("ac_key_rotation_total")
+            .with_labels(&[("status", "error")])
+            .assert_delta(1);
+        snap.gauge("ac_signing_key_age_days").assert_value(15.5);
+        snap.gauge("ac_active_signing_keys").assert_value(2.0);
+        snap.gauge("ac_key_rotation_last_success_timestamp")
+            .assert_value(1700000000.0);
     }
 
     #[test]
-    fn test_record_rate_limit_decision() {
-        // Test with allowed and rejected actions
-        record_rate_limit_decision("allowed");
-        record_rate_limit_decision("rejected");
-    }
+    fn metrics_module_emits_db_query_cluster() {
+        let snap = MetricAssertion::snapshot();
 
-    #[test]
-    fn test_record_db_query() {
-        // Test with various operations, tables, and statuses
         record_db_query(
             "select",
             "service_credentials",
@@ -457,45 +507,170 @@ mod tests {
         );
         record_db_query("delete", "signing_keys", "error", Duration::from_millis(3));
         record_db_query("select", "jwks_cache", "success", Duration::from_millis(2));
+
+        // Histogram first (drain-on-read — single take_entries() per snapshot).
+        snap.histogram("ac_db_query_duration_seconds")
+            .assert_observation_count_at_least(5);
+
+        snap.counter("ac_db_queries_total")
+            .with_labels(&[
+                ("operation", "select"),
+                ("table", "service_credentials"),
+                ("status", "success"),
+            ])
+            .assert_delta(1);
+        snap.counter("ac_db_queries_total")
+            .with_labels(&[
+                ("operation", "insert"),
+                ("table", "service_credentials"),
+                ("status", "success"),
+            ])
+            .assert_delta(1);
+        snap.counter("ac_db_queries_total")
+            .with_labels(&[
+                ("operation", "delete"),
+                ("table", "signing_keys"),
+                ("status", "error"),
+            ])
+            .assert_delta(1);
     }
 
     #[test]
-    fn test_record_bcrypt_duration() {
-        // Test with hash and verify operations
+    fn metrics_module_emits_bcrypt_cluster() {
+        let snap = MetricAssertion::snapshot();
+
         record_bcrypt_duration("hash", Duration::from_millis(150));
         record_bcrypt_duration("verify", Duration::from_millis(120));
         record_bcrypt_duration("hash", Duration::from_millis(200));
+
+        // Drain-on-read: single take_entries() covers all 3 observations
+        // across both label combos.
+        snap.histogram("ac_bcrypt_duration_seconds")
+            .assert_observation_count_at_least(3);
     }
 
     #[test]
-    fn test_record_jwks_request() {
-        // Test with various cache statuses
+    fn metrics_module_emits_jwks_cluster() {
+        let snap = MetricAssertion::snapshot();
+
         record_jwks_request("hit");
         record_jwks_request("miss");
         record_jwks_request("bypass");
+
+        snap.counter("ac_jwks_requests_total")
+            .with_labels(&[("cache_status", "hit")])
+            .assert_delta(1);
+        snap.counter("ac_jwks_requests_total")
+            .with_labels(&[("cache_status", "miss")])
+            .assert_delta(1);
+        snap.counter("ac_jwks_requests_total")
+            .with_labels(&[("cache_status", "bypass")])
+            .assert_delta(1);
     }
 
     #[test]
-    fn test_record_audit_log_failure() {
-        // Test with various event types and reasons
+    fn metrics_module_emits_audit_failures_cluster() {
+        let snap = MetricAssertion::snapshot();
+
         record_audit_log_failure("token_issued", "db_write_failed");
         record_audit_log_failure("key_rotation", "encryption_failed");
         record_audit_log_failure("authentication", "log_overflow");
+
+        snap.counter("ac_audit_log_failures_total")
+            .with_labels(&[
+                ("event_type", "token_issued"),
+                ("reason", "db_write_failed"),
+            ])
+            .assert_delta(1);
+        snap.counter("ac_audit_log_failures_total")
+            .with_labels(&[
+                ("event_type", "key_rotation"),
+                ("reason", "encryption_failed"),
+            ])
+            .assert_delta(1);
+        snap.counter("ac_audit_log_failures_total")
+            .with_labels(&[("event_type", "authentication"), ("reason", "log_overflow")])
+            .assert_delta(1);
     }
 
     #[test]
-    fn test_record_error() {
-        // Test with various operations, categories, and status codes
+    fn metrics_module_emits_rate_limit_cluster() {
+        let snap = MetricAssertion::snapshot();
+
+        record_rate_limit_decision("allowed");
+        record_rate_limit_decision("rejected");
+
+        snap.counter("ac_rate_limit_decisions_total")
+            .with_labels(&[("action", "allowed")])
+            .assert_delta(1);
+        snap.counter("ac_rate_limit_decisions_total")
+            .with_labels(&[("action", "rejected")])
+            .assert_delta(1);
+    }
+
+    #[test]
+    fn metrics_module_emits_credential_ops_cluster() {
+        let snap = MetricAssertion::snapshot();
+
+        record_credential_operation("list", "success");
+        record_credential_operation("get", "success");
+        record_credential_operation("create", "success");
+        record_credential_operation("update", "success");
+        record_credential_operation("delete", "success");
+        record_credential_operation("rotate_secret", "success");
+        record_credential_operation("create", "error");
+        record_credential_operation("update", "error");
+        record_credential_operation("delete", "error");
+
+        for op in ["list", "get", "create", "update", "delete", "rotate_secret"] {
+            snap.counter("ac_credential_operations_total")
+                .with_labels(&[("operation", op), ("status", "success")])
+                .assert_delta(1);
+        }
+        for op in ["create", "update", "delete"] {
+            snap.counter("ac_credential_operations_total")
+                .with_labels(&[("operation", op), ("status", "error")])
+                .assert_delta(1);
+        }
+    }
+
+    #[test]
+    fn metrics_module_emits_errors_cluster() {
+        let snap = MetricAssertion::snapshot();
+
         record_error("token_issuance", "authentication", 401);
         record_error("token_issuance", "authorization", 403);
         record_error("key_rotation", "cryptographic", 500);
         record_error("db_query", "internal", 500);
         record_error("rate_limit", "authorization", 429);
+
+        snap.counter("ac_errors_total")
+            .with_labels(&[
+                ("operation", "token_issuance"),
+                ("error_category", "authentication"),
+                ("status_code", "401"),
+            ])
+            .assert_delta(1);
+        snap.counter("ac_errors_total")
+            .with_labels(&[
+                ("operation", "key_rotation"),
+                ("error_category", "cryptographic"),
+                ("status_code", "500"),
+            ])
+            .assert_delta(1);
+        snap.counter("ac_errors_total")
+            .with_labels(&[
+                ("operation", "rate_limit"),
+                ("error_category", "authorization"),
+                ("status_code", "429"),
+            ])
+            .assert_delta(1);
     }
 
     #[test]
-    fn test_record_http_request() {
-        // Test successful requests
+    fn metrics_module_emits_http_request_cluster() {
+        let snap = MetricAssertion::snapshot();
+
         record_http_request(
             "GET",
             "/.well-known/jwks.json",
@@ -508,19 +683,11 @@ mod tests {
             200,
             Duration::from_millis(250),
         );
-
-        // Test client errors (including framework-level errors)
         record_http_request(
             "POST",
             "/api/v1/auth/service/token",
             400,
             Duration::from_millis(5),
-        );
-        record_http_request(
-            "POST",
-            "/api/v1/auth/service/token",
-            415,
-            Duration::from_millis(2),
         );
         record_http_request("GET", "/not-found", 404, Duration::from_millis(1));
         record_http_request(
@@ -529,15 +696,58 @@ mod tests {
             405,
             Duration::from_millis(1),
         );
-
-        // Test server errors
         record_http_request(
             "POST",
             "/api/v1/auth/service/token",
             500,
             Duration::from_millis(100),
         );
+
+        // Histogram first (drain-on-read).
+        snap.histogram("ac_http_request_duration_seconds")
+            .with_labels(&[
+                ("method", "POST"),
+                ("path", "/api/v1/auth/service/token"),
+                ("status_code", "200"),
+            ])
+            .assert_observation_count_at_least(1);
+
+        // /not-found normalizes to /other (cardinality bound).
+        snap.counter("ac_http_requests_total")
+            .with_labels(&[
+                ("method", "GET"),
+                ("path", "/.well-known/jwks.json"),
+                ("status_code", "200"),
+            ])
+            .assert_delta(1);
+        snap.counter("ac_http_requests_total")
+            .with_labels(&[
+                ("method", "GET"),
+                ("path", "/other"),
+                ("status_code", "404"),
+            ])
+            .assert_delta(1);
+        snap.counter("ac_http_requests_total")
+            .with_labels(&[
+                ("method", "DELETE"),
+                ("path", "/api/v1/auth/service/token"),
+                ("status_code", "405"),
+            ])
+            .assert_delta(1);
+        snap.counter("ac_http_requests_total")
+            .with_labels(&[
+                ("method", "POST"),
+                ("path", "/api/v1/auth/service/token"),
+                ("status_code", "500"),
+            ])
+            .assert_delta(1);
     }
+
+    // ========================================================================
+    // Path-normalization unit tests — preserved as-is. These exercise the
+    // `normalize_path`/`is_uuid`/`normalize_dynamic_path` logic, NOT metric
+    // emission. They predate ADR-0032 and remain the right shape.
+    // ========================================================================
 
     #[test]
     fn test_normalize_path_known_paths() {
@@ -675,21 +885,5 @@ mod tests {
             normalize_dynamic_path("/api/v2/users/550e8400-e29b-41d4-a716-446655440000"),
             "/other"
         );
-    }
-
-    #[test]
-    fn test_record_credential_operation() {
-        // Test with various operations and statuses
-        record_credential_operation("list", "success");
-        record_credential_operation("get", "success");
-        record_credential_operation("create", "success");
-        record_credential_operation("update", "success");
-        record_credential_operation("delete", "success");
-        record_credential_operation("rotate_secret", "success");
-
-        // Error cases
-        record_credential_operation("create", "error");
-        record_credential_operation("update", "error");
-        record_credential_operation("delete", "error");
     }
 }

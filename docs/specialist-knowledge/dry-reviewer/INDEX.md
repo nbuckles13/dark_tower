@@ -21,33 +21,27 @@
 - MC accept-loop rig (`bind() → accept_loop()` + `write_self_signed_pems`) -> `crates/mc-service/tests/common/accept_loop_rig.rs:AcceptLoopRig` (near-clone of MH's; extraction candidate per ADR-0032 §Step 6 + TODO.md)
 - MH tests (gc_integration, mc_client_integration, auth_layer_integration, register_meeting_integration, webtransport_integration) -> `crates/mh-service/tests/`
 - MH shared rigs (TestKeypair, mock_mc, jwks_rig, grpc_rig, accept_loop_rig, wt_client, tokens) -> `crates/mh-service/tests/common/`
-- Shared fixtures (cross-service) -> `crates/mc-test-utils/src/jwt_test.rs`, `crates/gc-test-utils/src/server_harness.rs`
+- AC tests (Step 4 metric backfill, 13 cluster files: http, bcrypt, token_validation, rate_limit, key_rotation, jwks, credential_ops, errors, token_issuance_service, token_issuance_user, internal_token, audit_log_failures, db) -> `crates/ac-service/tests/*_integration.rs`
+- AC in-crate scaffolding (`make_app_state`, `seed_signing_key`, `seed_service_credential`) -> `crates/ac-service/tests/common/test_state.rs`; JWT signing helpers (`sign_service_token`, `sign_user_token`) -> `crates/ac-service/tests/common/jwt_fixtures.rs`. Uses MIN_BCRYPT_COST except `tests/bcrypt_metrics_integration.rs` (DEFAULT for histogram fidelity). TODO.md.
+- Shared fixtures (cross-service) -> `crates/mc-test-utils/src/jwt_test.rs`, `crates/gc-test-utils/src/server_harness.rs`, `crates/ac-test-utils/src/` (crypto_fixtures, server_harness, token_builders); MetricAssertion -> `crates/common/src/observability/testing.rs`
 
 ## Per-Service Config Parsing
 - AC/GC/MC/MH config -> `crates/*/src/config.rs:Config::from_vars()` (per-service); ordinal parsing -> `crates/common/src/config.rs:parse_statefulset_ordinal()`
 - Extraction candidate: `generate_instance_id(prefix)` -> 4-line pattern in GC + MC + MH config
 
 ## gRPC Auth (Cross-Service)
-- MC auth layer (async JWKS, R-22) -> `crates/mc-service/src/grpc/auth_interceptor.rs:McAuthLayer` (applied in main.rs); legacy `:McAuthInterceptor` in same file is dead in production
-- MH auth layer (async JWKS) -> `crates/mh-service/src/grpc/auth_interceptor.rs:MhAuthLayer`; legacy `:MhAuthInterceptor` in same file is dead in production
-- Shared constant -> `common::jwt::MAX_JWT_SIZE_BYTES`
-- McAuthLayer/MhAuthLayer are near-identical tower Layer/Service patterns (extraction candidate in TODO.md)
+- MC/MH auth layers (async JWKS, R-22; legacy `*AuthInterceptor` in same files is dead in production) -> `crates/mc-service/src/grpc/auth_interceptor.rs:McAuthLayer`, `crates/mh-service/src/grpc/auth_interceptor.rs:MhAuthLayer`
+- McAuthLayer/MhAuthLayer near-identical tower Layer/Service (extraction candidate in TODO.md); shared constant `common::jwt::MAX_JWT_SIZE_BYTES`
 
 ## MC gRPC Services (GC→MC + MH→MC + MC→MH)
-- MC assignment service (GC→MC) -> `crates/mc-service/src/grpc/mc_service.rs:McAssignmentService`
-- MC media coordination (MH→MC, R-15) -> `crates/mc-service/src/grpc/media_coordination.rs:McMediaCoordinationService`
-- MH connection registry -> `crates/mc-service/src/mh_connection_registry.rs:MhConnectionRegistry`
-- MAX_ID_LENGTH constant -> `mh_connection_registry.rs` (single source, imported by media_coordination.rs)
-- MhRegistrationClient trait (testability seam) -> `crates/mc-service/src/grpc/mh_client.rs:MhRegistrationClient`
-- Async RegisterMeeting trigger (R-12) -> `crates/mc-service/src/webtransport/connection.rs:register_meeting_with_handlers()`
+- MC assignment (GC→MC) -> `crates/mc-service/src/grpc/mc_service.rs:McAssignmentService`; media coordination (MH→MC, R-15) -> `:grpc/media_coordination.rs:McMediaCoordinationService`
+- MH connection registry (single MAX_ID_LENGTH source) -> `crates/mc-service/src/mh_connection_registry.rs:MhConnectionRegistry`
+- MhRegistrationClient trait + async RegisterMeeting trigger (R-12) -> `crates/mc-service/src/grpc/mh_client.rs`, `:webtransport/connection.rs:register_meeting_with_handlers()`
 
 ## gRPC Clients (Cross-Service)
-- MC GcClient -> `crates/mc-service/src/grpc/gc_client.rs:GcClient` (bounded retries, fast/comprehensive heartbeats)
-- MC MhClient -> `crates/mc-service/src/grpc/mh_client.rs:MhClient` (per-call channels, no retries)
-- MH GcClient -> `crates/mh-service/src/grpc/gc_client.rs:GcClient` (unbounded retries, load reports)
-- Shared patterns: channel creation, `add_auth`, backoff constants (acceptable structural similarity)
-- Extraction candidate: `add_auth` (~10 lines identical, 3 call sites) -> see TODO.md
-- MH gRPC stub service -> `crates/mh-service/src/grpc/mh_service.rs:MhMediaService`
+- MC GcClient (bounded retries, fast/comprehensive heartbeats) -> `crates/mc-service/src/grpc/gc_client.rs`; MC MhClient (per-call channels, no retries) -> `crates/mc-service/src/grpc/mh_client.rs`
+- MH GcClient (unbounded retries, load reports) -> `crates/mh-service/src/grpc/gc_client.rs`
+- Shared patterns: channel creation, `add_auth` (~10 lines, 3 call sites — extraction candidate per TODO.md), backoff constants
 
 ## Redis Abstractions (MC)
 - MhAssignmentStore trait -> `crates/mc-service/src/redis/client.rs:MhAssignmentStore` (testability seam for join flow)
@@ -69,7 +63,12 @@
 - MC GcClient vs MH GcClient -> different RPCs, retry strategies, heartbeat models
 - AC rate limiting (DB-backed lockout) vs GC rate limiting (middleware RPM) -> different mechanisms
 - common::jwt enums vs common::meeting_token -> JWT enums intentionally narrower
+- AC test-side `Claims { ... }` literal repetition (5 axes of variation) -> false-positive on the literal itself; surrounding decrypt-and-sign boilerplate IS extracted to `tests/common/jwt_fixtures.rs` (`sign_service_token`, `sign_user_token`; 6 call sites). TODO.md tracks the literal-only repetition.
+
+## Abstraction Lessons (DRY judgment calls)
+- **Speculative→tightened helper iteration (Step 4 iter-2→iter-3)**: iter-1's `sign_service_token_iat_offset(..., sub, scope, iat_offset)` was speculative — pre-baked 3 of 5 axes that varied across callers, so no call site adopted it. iter-2 deleted the dead helpers but left the underlying decrypt-and-sign boilerplate inline. iter-3 re-introduced `sign_service_token(pool, master_key, &Claims)` / `sign_user_token(...)` parameterized only on the truly-fixed mechanic (key fetch + decrypt + sign), leaving claims content to callers. 6 call sites adopted. Lesson: when removing dead helpers, verify whether the duplication itself is gone or just moved inline; abstract the fixed mechanic, not speculative axes.
+- **In-crate `tests/common/test_state.rs` vs `*-test-utils` (Steps 3-4)**: per-service `AppState`/`Config` builders + DB seeding belong in-crate; cross-crate fixtures (harnesses, crypto, token builders) belong in `*-test-utils`. Consolidate only when a 3rd in-crate caller appears AND shapes converge.
 
 ## Tech Debt & Extractions
 - Active duplication tech debt -> `docs/TODO.md` (Cross-Service Duplication section)
-- Common crate + test fixtures -> `crates/common/src/`, `crates/mc-test-utils/`, `crates/gc-test-utils/`
+- Common crate + test fixtures -> `crates/common/src/`, `crates/mc-test-utils/`, `crates/gc-test-utils/`, `crates/ac-test-utils/`
