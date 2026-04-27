@@ -13,15 +13,9 @@
 
 ## Devloop Cluster Helper
 - Kind config template (envsubst, host-gateway listenAddress) → `infra/kind/kind-config.yaml.tmpl`
-- Devloop wrapper → `infra/devloop/devloop.sh`, container image → `infra/devloop/Dockerfile`
-- Cluster networking debate → `docs/debates/2026-04-09-devloop-cluster-networking/debate.md`; sidecar (superseded) → `docs/debates/2026-04-05-devloop-cluster-sidecar.md`
-- Helper commands (setup, deploy, rebuild, teardown, status) → `crates/devloop-helper/src/commands.rs`; protocol → `crates/devloop-helper/src/protocol.rs`
-- Port-map.env generation → `crates/devloop-helper/src/commands.rs:write_port_map_shell()`
-- DT_HOST_GATEWAY_IP propagation → `crates/devloop-helper/src/commands.rs:cmd_setup()`, `cmd_deploy()`
-- Port registry → `~/.cache/devloop/port-registry.json` (global allocation state)
-- Per-devloop runtime state → `/tmp/devloop-{slug}/` (PID, socket, auth token, ports.json, setup.pid, eager-setup.log)
-- Container-side client → `infra/devloop/dev-cluster` (setup, rebuild, deploy, teardown, status)
-- Health check + eager setup → `infra/devloop/devloop.sh` (Infrastructure health check section)
+- Devloop wrapper → `infra/devloop/devloop.sh` (health check + eager setup), Dockerfile → `infra/devloop/Dockerfile`; container-side client → `infra/devloop/dev-cluster`
+- Helper commands (setup, deploy, rebuild, teardown, status; `write_port_map_shell()`, DT_HOST_GATEWAY_IP propagation in `cmd_setup`/`cmd_deploy`) → `crates/devloop-helper/src/commands.rs`; protocol → `crates/devloop-helper/src/protocol.rs`
+- Port registry → `~/.cache/devloop/port-registry.json`; per-devloop runtime state → `/tmp/devloop-{slug}/` (PID, socket, auth token, ports.json, setup.pid, eager-setup.log)
 - Env-test URL config → `crates/env-tests/src/cluster.rs:ClusterPorts::from_env()`; Layer 8 → `.claude/skills/devloop/SKILL.md`
 
 ## Deployment & K8s
@@ -30,10 +24,7 @@
 - Per-service Kustomize bases + manifests (statefulset/deployment, netpol, PDB) → `infra/services/ac-service/`, `gc-service/`, `mc-service/`, `mh-service/`
 - Dockerfiles → `infra/docker/ac-service/`, `gc-service/`, `mc-service/`, `mh-service/`; PostgreSQL + Redis → `infra/services/postgres/`, `redis/`
 - Dev certs → `scripts/generate-dev-certs.sh`; Alert rules → `infra/docker/prometheus/rules/gc-alerts.yaml`, `mc-alerts.yaml`
-- MC/MH: per-instance Deployments, per-pod NodePort Services, TLS secrets (imperative via setup.sh)
-- MC/MH per-instance ConfigMaps (advertise addresses) → `infra/services/mc-service/mc-{0,1}-configmap.yaml`, `mh-service/mh-{0,1}-configmap.yaml`
-- Devloop ConfigMap patching (advertise addresses) → `infra/kind/scripts/setup.sh:deploy_mc_service()`, `deploy_mh_service()` (gated on `DT_HOST_GATEWAY_IP`)
-- DT_HOST_GATEWAY_IP validation → `infra/kind/scripts/setup.sh` (after DT_PORT_MAP sourcing)
+- MC/MH per-instance Deployments + ConfigMaps (advertise addresses) → `infra/services/mc-service/mc-{0,1}-configmap.yaml`, `mh-service/mh-{0,1}-configmap.yaml`; devloop patching + DT_HOST_GATEWAY_IP validation → `infra/kind/scripts/setup.sh:deploy_mc_service()`, `deploy_mh_service()`
 - Per-pod UDP NodePorts: `base + ordinal*2` (MC: 4433/4435, MH: 4434/4436); cross-service netpol in `gc-service/network-policy.yaml`, `mc-service/network-policy.yaml`, `mh-service/network-policy.yaml`
 - Downward API: `status.podIP` → `POD_IP`; WebTransport advertise from per-instance ConfigMap
 - Port map: AC=8082, GC=8080/50051, MC=8081/50052/4433, MH=8083/50053/4434; scaling requires per-pod Services + Kind port mappings
@@ -49,7 +40,16 @@
 
 ## Observability
 - Kustomize + Grafana → `infra/kubernetes/observability/`, `infra/grafana/dashboards/`; Alerts → `docs/observability/alerts.md`
-- Per-service metrics → `crates/gc-service/src/observability/metrics.rs`, `crates/mc-service/src/observability/metrics.rs`, `crates/mh-service/src/observability/metrics.rs`; Prometheus → `infra/docker/prometheus/prometheus.yml`
+- Per-service metrics → `crates/ac-service/src/observability/metrics.rs`, `crates/gc-service/src/observability/metrics.rs`, `crates/mc-service/src/observability/metrics.rs`, `crates/mh-service/src/observability/metrics.rs`; Prometheus → `infra/docker/prometheus/prometheus.yml`
+- Shared `MetricAssertion` testing helper (per-thread `DebuggingRecorder`, `!Send` snapshots, drain-on-read histograms) → `crates/common/src/observability/testing.rs`; `assert_unobserved` (additive across all 3 query types — counter hard-form, gauge gap-fill, histogram observation-count equivalence + kind-mismatch hardening) added in ADR-0032 Step 4, no breaking changes to MH/MC callers
+
+## AC Service
+- AC K8s manifests → `infra/services/ac-service/configmap.yaml`, `statefulset.yaml`, `service.yaml`, `service-monitor.yaml`, `network-policy.yaml`, `pdb.yaml`, `kustomization.yaml`
+- AC runbooks → `docs/runbooks/ac-service-deployment.md`, `docs/runbooks/ac-service-incident-response.md`
+- AC metric catalog → `docs/observability/metrics/ac-service.md` (1:1 with `metrics.rs` emissions; runbook PromQL/curl examples reference metric names by string — production wrapper signatures must stay byte-identical to keep runbooks valid)
+- AC metric-test backfill (ADR-0032 Step 4, Pure Cat C, 17 metrics drained to 0; `#[cfg(test)] mod tests` block migrated from no-recorder smoke tests to per-cluster `MetricAssertion`-backed; production `record_*`/`set_*` wrappers untouched) → `crates/ac-service/src/observability/metrics.rs`, `crates/ac-service/tests/` (13 cluster files: `audit_log_failures_integration.rs`, `bcrypt_metrics_integration.rs`, `credential_ops_metrics_integration.rs`, `db_metrics_integration.rs`, `errors_metric_integration.rs`, `http_metrics_integration.rs`, `internal_token_metrics_integration.rs`, `jwks_metrics_integration.rs`, `key_rotation_metrics_integration.rs`, `rate_limit_metrics_integration.rs`, `token_issuance_service_integration.rs`, `token_issuance_user_integration.rs`, `token_validation_integration.rs`); test fixtures → `crates/ac-service/tests/common/test_state.rs`
+- AC bcrypt cost-12 (`DEFAULT_BCRYPT_COST`) load-bearing for `ac_bcrypt_duration_seconds` histogram-bucket fidelity; `MIN_BCRYPT_COST` (10) for incidental scaffolding only → `crates/ac-service/tests/bcrypt_metrics_integration.rs:12-22`, `crates/ac-service/tests/common/test_state.rs`
+- Test-build dev-dependency feature-flag pattern (`common = { path = "../common", features = ["test-utils"] }` in `[dev-dependencies]`, confined to test-build, no production-dep-tree impact) → `crates/ac-service/Cargo.toml`, `crates/mc-service/Cargo.toml`, `crates/mh-service/Cargo.toml`
 
 ## MH Service
 - MH startup + config + health → `crates/mh-service/src/main.rs`, `config.rs`, `observability/health.rs`

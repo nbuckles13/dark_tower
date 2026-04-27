@@ -55,6 +55,11 @@ common = { path = "../common" }
 ac-test-utils = { path = "../ac-test-utils" }
 anyhow = "1.0"
 
+# Enable common's test-utils feature for MetricAssertion in tests/.
+# Per ADR-0032 Step 4: per-failure-class metric tests live in tests/ and
+# require the thread-local DebuggingRecorder shipped behind this feature.
+common = { path = "../common", features = ["test-utils"] }
+
 # Test framework
 tokio = { workspace = true, features = ["test-util"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

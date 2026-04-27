@@ -45,6 +45,13 @@
 
 ## Code Locations — Observability (Security-Relevant)
 - MC/MH metrics (bounded labels, no PII) → `crates/mc-service/src/observability/metrics.rs` (+ mh) | ADR-0029
+- AC audit-log failure real-drive pattern: `ALTER TABLE auth_events ADD CONSTRAINT ... CHECK (...) NOT VALID` (`break_auth_events_inserts`, preserves pre-INSERT SELECTs) and `DROP TABLE auth_events CASCADE` (`break_auth_events_table`, for fns with no auth_events SELECT) → `crates/ac-service/tests/audit_log_failures_integration.rs`; covers all 10 production `record_audit_log_failure` sites including `key_rotated`/`key_expired`/`scopes_updated`/`service_deactivated` (high-stakes lifecycle/privilege/revocation events)
+- AC rate-limit 6-cell (gate × outcome) hard-rule pattern; snapshot-immediately-before-decision avoids cumulative-delta entanglement; registration `allowed` honestly accounts for chained auto-login emission (`assert_delta(2)`) → `crates/ac-service/tests/rate_limit_metrics_integration.rs`
+- AC JWT clock-skew dual-assertion pattern (verification rejection AND metric delta AND sibling-`error_category` adjacency) for `verify_jwt` and `verify_user_jwt` → `crates/ac-service/tests/token_validation_integration.rs`
+- AC key-rotation gauges from real production paths only (`initialize_signing_key`, `handle_rotate_keys`); failure-path `assert_unobserved` adjacency on the 3 signing-key gauges → `crates/ac-service/tests/key_rotation_metrics_integration.rs`
+- AC per-`ErrorCategory` real-handler drives (Authentication / Authorization / Cryptographic / Internal) with real Ed25519 signing for auth-token rejection cells → `crates/ac-service/tests/errors_metric_integration.rs`
+- Failure-path metric adjacency API (`assert_unobserved` symmetric across counter/gauge/histogram, `ensure_no_kind_mismatch` hardening, histogram drain-on-read caveat) → `crates/common/src/observability/testing.rs`
+- AC observability orphans surfaced during ADR-0032 Step 4 — `clock_skew` cardinality drift vs catalog, `record_token_validation` Phase-4 reservation, `ac_jwks_requests_total{cache_status}` `hit`/`bypass` reservations → `docs/TODO.md` §Observability Debt
 
 ## TLS & Certificates
 - Dev cert generation (ECDSA P-256 CA, MC + MH certs) → `scripts/generate-dev-certs.sh`
@@ -55,21 +62,13 @@
 - gRPC: K8s `status.podIP` | WT: per-instance env from ConfigMap | NodePort `{mc,mh}-service-{0,1}` UDP-only | Registration → `gc_client.rs:register()`
 
 ## Devloop Container & Cluster Helper Security
-- Container isolation → ADR-0025; Cluster helper (trust, socket auth, injection safety, networking, prohibitions) → ADR-0030
+- Container isolation → ADR-0025; Cluster helper (trust, socket auth, injection safety, API allowlist, file perms, explicit prohibitions) → ADR-0030
+- Helper binary (Command::new() arg safety, status read-only auth-gated, gateway IP validation) → `crates/devloop-helper/src/commands.rs`; Auth token (CSPRNG, constant-time compare, 0600) → `crates/devloop-helper/src/auth.rs`
 - Env-test URL validation (scheme, credential rejection) → `crates/env-tests/src/cluster.rs:parse_host_port()`
-- Helper binary (Rust, Command::new() arg safety) → `crates/devloop-helper/src/commands.rs`
-- Status command (read-only, auth-gated) → `commands.rs:cmd_status()`, `parse_pod_health()` | Auth token (CSPRNG, constant-time compare, 0600) → `crates/devloop-helper/src/auth.rs`
-- Gateway IP validation → `commands.rs:validate_gateway_ip()` | Dev-cluster client → `infra/devloop/dev-cluster`
-- Socket auth, file permissions, API allowlist, explicit prohibitions → ADR-0030 (Helper Process, Helper API, Explicit Prohibitions)
-- Kind NodePort listen address (`${HOST_GATEWAY_IP}`) → `infra/kind/kind-config.yaml.tmpl`; Wrapper → `infra/devloop/devloop.sh`
+- Kind NodePort listen address (`${HOST_GATEWAY_IP}`) → `infra/kind/kind-config.yaml.tmpl`; Wrapper → `infra/devloop/devloop.sh`; Dev-cluster client → `infra/devloop/dev-cluster`
 
 ## Infrastructure Secrets & Network Isolation
 - Imperative secret creation → `setup.sh:create_ac_secrets()`, `create_mc_tls_secret()`, `create_mh_secrets()`, `create_mh_tls_secret()`
-- Input validation (cluster name, DT_PORT_MAP, DT_HOST_GATEWAY_IP) → `infra/kind/scripts/setup.sh` (top), `teardown.sh` (top)
-- ConfigMap advertise-address patching → `infra/kind/scripts/setup.sh:deploy_mc_service()`, `deploy_mh_service()`
-- Single-service rebuild with allowlist → `infra/kind/scripts/setup.sh:deploy_only_service()`
+- Input validation (cluster name, DT_PORT_MAP, DT_HOST_GATEWAY_IP) → `infra/kind/scripts/setup.sh` (top), `teardown.sh` (top); ConfigMap advertise-address patching → `setup.sh:deploy_mc_service()`, `deploy_mh_service()`; Single-service rebuild allowlist → `setup.sh:deploy_only_service()`
 - Network policies (per-service ingress/egress) → `infra/services/{ac,gc,mc,mh}-service/network-policy.yaml`; MC↔MH gRPC: MC→MH:50053, MH→MC:50052
-- Kind overlay (no secrets) + supporting infra → `infra/kubernetes/overlays/kind/`, `infra/services/{postgres,redis}/`
-
-## Health, Probes & Integration Seams
-- MC/MH health + K8s probes → `crates/mc-service/src/observability/health.rs`, `crates/mh-service/src/observability/health.rs`; Auth chain → `crates/common/src/jwt.rs` | Join tests → `crates/mc-service/tests/`, `crates/gc-service/tests/`
+- MC/MH K8s health probes → `crates/mc-service/src/observability/health.rs`, `crates/mh-service/src/observability/health.rs`; Join-flow integration tests → `crates/mc-service/tests/`, `crates/gc-service/tests/`

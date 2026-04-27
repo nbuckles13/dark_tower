@@ -122,6 +122,52 @@
 //! take a new `MetricAssertion::snapshot()` if you need to check a
 //! subsequent window.
 //!
+//! # Unobserved semantics
+//!
+//! All three query types ([`CounterQuery`] / [`GaugeQuery`] /
+//! [`HistogramQuery`]) ship an `assert_unobserved` method. The unifying
+//! invariant across kinds is **kind-mismatch hardening** via
+//! `ensure_no_kind_mismatch`: if the same metric `name` was recorded under a
+//! DIFFERENT kind in this snapshot, `assert_unobserved` panics with a
+//! redirect message (e.g. `"metric 'foo' was recorded as histogram, not
+//! counter — use .histogram(\"foo\") instead"`). This catches the
+//! load-bearing label-swap-bug class where a refactor accidentally re-emits
+//! a metric under the wrong kind; the soft form
+//! (`assert_delta(0)` / `assert_value(0.0)` / `assert_observation_count(0)`)
+//! does NOT trip on kind-mismatch and would silently pass.
+//!
+//! Symmetry table — soft form (zero-value axis) vs hard form (kind+name+labels axis):
+//!
+//! | Kind      | Soft form              | Hard form           | Soft catches              | Hard catches                          |
+//! |-----------|------------------------|---------------------|---------------------------|---------------------------------------|
+//! | Counter   | `assert_delta(0)`      | `assert_unobserved` | wrong N>0 increment       | wrong call site (any) + wrong kind    |
+//! | Gauge     | (no soft form¹)        | `assert_unobserved` | —                         | wrong call site + wrong kind          |
+//! | Histogram | `assert_observation_count(0)` | `assert_unobserved` | wrong N>0 observations | wrong call site + wrong kind          |
+//!
+//! ¹ Gauge has no native "set-to-zero is indistinguishable from never-set"
+//! idiom because gauges are inherently state-bearing — `set(0.0)` is an
+//! explicit observation, not a "never touched" signal. This is why gauge
+//! needed `assert_unobserved` first (ADR-0032 §F4 motivating use case).
+//!
+//! Per-kind asymmetry beyond the kind-mismatch invariant:
+//!
+//! - **Counter**: `assert_unobserved` is the hard form ("counter never
+//!   registered"); `assert_delta(0)` is the soft form ("counter never
+//!   accrued"). Both pass when the counter is genuinely absent; they diverge
+//!   only on kind-mismatch detection.
+//! - **Gauge**: `assert_unobserved` fills an actual gap in the API —
+//!   `assert_value(0.0)` panics with "not observed" when the gauge has
+//!   never been emitted, so there was no way to express "this gauge correctly
+//!   received zero emissions" before. ADR-0032 §F4 motivating use case.
+//! - **Histogram**: `assert_unobserved` is functionally equivalent to
+//!   `assert_observation_count(0)` on the observation-count axis but adds
+//!   kind-mismatch detection. Subject to the drain-on-read constraint above —
+//!   a `histogram.assert_observation_count*` call earlier in the test
+//!   silently empties the buffer, so `histogram.assert_unobserved` after
+//!   that point falsely passes. Either call `assert_unobserved` BEFORE any
+//!   `assert_observation_count*` on the same name+labels in this snapshot,
+//!   or take a fresh `MetricAssertion::snapshot()` between assertions.
+//!
 //! # Security
 //!
 //! Do not record real tokens, PII, or other secrets into the recorder, even
@@ -362,6 +408,36 @@ impl CounterQuery<'_> {
             "counter '{name}' with labels {labels:?}: expected delta {expected}, got {actual}"
         );
     }
+
+    /// Assert the counter was never registered for this (name, label-filter)
+    /// tuple in this snapshot window.
+    ///
+    /// `assert_delta(0)` is the soft form ("counter never accrued" — passes
+    /// whether the counter is absent OR present-with-value-zero).
+    /// `assert_unobserved` is the hard form ("counter never registered" —
+    /// passes only when absent from the snapshot entirely).
+    ///
+    /// Use the soft form for "this label combo accumulated zero increments"
+    /// under partial-label adjacency. Use the hard form for "this code path
+    /// did not touch this metric at all" — the load-bearing per-failure-class
+    /// adjacency case for code paths that should be silent on a metric (see
+    /// ADR-0032).
+    ///
+    /// Surfaces kind mismatches loudly: if the metric was recorded as a
+    /// gauge or histogram under the same name, panics with a redirect to the
+    /// correct query type.
+    pub fn assert_unobserved(self) {
+        let Self {
+            snapshot,
+            name,
+            labels,
+        } = self;
+        let entries = snapshot.take_entries();
+        ensure_no_kind_mismatch(&entries, name, MetricKind::Counter);
+        if let Some(val) = counter_value(&entries, name, &labels) {
+            panic!("counter '{name}' with labels {labels:?}: expected unobserved, got value {val}");
+        }
+    }
 }
 
 fn counter_value(
@@ -429,6 +505,31 @@ impl GaugeQuery<'_> {
             None => panic!("gauge '{name}' with labels {labels:?}: not observed"),
         }
     }
+
+    /// Assert the gauge was never set for this (name, label-filter) tuple
+    /// in this snapshot window.
+    ///
+    /// Fills the gap that `assert_value` / `assert_value_in_range` cannot
+    /// express: those panic with "not observed" when the gauge is absent,
+    /// which is the *opposite* of what failure-path adjacency tests need.
+    /// Use `assert_unobserved` to prove a code path did NOT touch a gauge
+    /// that other code paths set — the load-bearing per-failure-class
+    /// adjacency case for gauges (ADR-0032).
+    ///
+    /// Surfaces kind mismatches loudly: if the metric was recorded as a
+    /// counter or histogram under the same name, panics with a redirect.
+    pub fn assert_unobserved(self) {
+        let Self {
+            snapshot,
+            name,
+            labels,
+        } = self;
+        let entries = snapshot.take_entries();
+        ensure_no_kind_mismatch(&entries, name, MetricKind::Gauge);
+        if let Some(val) = gauge_value(&entries, name, &labels) {
+            panic!("gauge '{name}' with labels {labels:?}: expected unobserved, got value {val}");
+        }
+    }
 }
 
 fn gauge_value(
@@ -494,6 +595,45 @@ impl HistogramQuery<'_> {
         assert!(
             count >= expected,
             "histogram '{name}' with labels {labels:?}: expected at least {expected} observations, got {count}"
+        );
+    }
+
+    /// Assert the histogram was never recorded for this (name, label-filter)
+    /// tuple in this snapshot window.
+    ///
+    /// `assert_observation_count(0)` is the soft form (passes whether the
+    /// histogram is absent OR present-with-zero-observations).
+    /// `assert_unobserved` is the hard form (passes only when absent from
+    /// the snapshot entirely).
+    ///
+    /// Use the soft form for "this label combo accumulated zero observations"
+    /// under partial-label adjacency. Use the hard form for "this code path
+    /// did not touch this metric at all" — the load-bearing per-failure-class
+    /// adjacency case (ADR-0032).
+    ///
+    /// **Drain-on-read caveat (load-bearing):** each `assert_observation_count*`
+    /// call drains the histogram entries; a subsequent `assert_unobserved` on
+    /// the same name+labels would falsely pass. Either: (a) call
+    /// `assert_unobserved` BEFORE any `assert_observation_count*` on the same
+    /// histogram name+labels in this snapshot, or (b) take a fresh
+    /// [`MetricAssertion::snapshot`] between assertions. The `CounterQuery` and
+    /// `GaugeQuery` `assert_unobserved` methods are not affected because
+    /// counter/gauge values are idempotent on re-read.
+    ///
+    /// Surfaces kind mismatches loudly: if the metric was recorded as a
+    /// counter or gauge under the same name, panics with a redirect.
+    pub fn assert_unobserved(self) {
+        let Self {
+            snapshot,
+            name,
+            labels,
+        } = self;
+        let entries = snapshot.take_entries();
+        ensure_no_kind_mismatch(&entries, name, MetricKind::Histogram);
+        let count = histogram_count(&entries, name, &labels);
+        assert!(
+            count == 0,
+            "histogram '{name}' with labels {labels:?}: expected unobserved, got {count} observations"
         );
     }
 }
@@ -673,5 +813,182 @@ mod tests {
 
         t1.join().unwrap();
         t2.join().unwrap();
+    }
+
+    // -------------------------------------------------------------------------
+    // assert_unobserved — counter / gauge / histogram (ADR-0032 Step 4)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn counter_assert_unobserved_passes_when_never_set() {
+        let snap = MetricAssertion::snapshot();
+        snap.counter("testing_counter_unobserved_never")
+            .assert_unobserved();
+    }
+
+    #[test]
+    #[should_panic(expected = "expected unobserved, got value 5")]
+    fn counter_assert_unobserved_panics_when_set() {
+        let snap = MetricAssertion::snapshot();
+        counter!("testing_counter_unobserved_set").increment(5);
+        snap.counter("testing_counter_unobserved_set")
+            .assert_unobserved();
+    }
+
+    #[test]
+    fn counter_assert_unobserved_with_label_filter_ignores_other_labels() {
+        let snap = MetricAssertion::snapshot();
+        counter!("testing_counter_unobserved_labels", "tenant" => "a").increment(1);
+        // Filter targets a label that was never set — must pass even though
+        // the metric was emitted under different labels.
+        snap.counter("testing_counter_unobserved_labels")
+            .with_labels(&[("tenant", "b")])
+            .assert_unobserved();
+    }
+
+    #[test]
+    fn counter_assert_unobserved_passes_when_other_label_set() {
+        let snap = MetricAssertion::snapshot();
+        counter!("testing_counter_unobserved_other_label", "tenant" => "a").increment(7);
+        snap.counter("testing_counter_unobserved_other_label")
+            .with_labels(&[("tenant", "b")])
+            .assert_unobserved();
+    }
+
+    #[test]
+    fn gauge_assert_unobserved_passes_when_never_set() {
+        let snap = MetricAssertion::snapshot();
+        snap.gauge("testing_gauge_unobserved_never")
+            .assert_unobserved();
+    }
+
+    #[test]
+    #[should_panic(expected = "expected unobserved, got value 42")]
+    fn gauge_assert_unobserved_panics_when_set() {
+        let snap = MetricAssertion::snapshot();
+        gauge!("testing_gauge_unobserved_set").set(42.0);
+        snap.gauge("testing_gauge_unobserved_set")
+            .assert_unobserved();
+    }
+
+    #[test]
+    fn gauge_assert_unobserved_with_label_filter_ignores_other_labels() {
+        let snap = MetricAssertion::snapshot();
+        gauge!("testing_gauge_unobserved_labels", "tenant" => "a").set(1.0);
+        snap.gauge("testing_gauge_unobserved_labels")
+            .with_labels(&[("tenant", "b")])
+            .assert_unobserved();
+    }
+
+    #[test]
+    fn gauge_assert_unobserved_passes_when_other_label_set() {
+        let snap = MetricAssertion::snapshot();
+        gauge!("testing_gauge_unobserved_other_label", "tenant" => "a").set(99.0);
+        snap.gauge("testing_gauge_unobserved_other_label")
+            .with_labels(&[("tenant", "b")])
+            .assert_unobserved();
+    }
+
+    #[test]
+    fn histogram_assert_unobserved_passes_when_never_recorded() {
+        let snap = MetricAssertion::snapshot();
+        snap.histogram("testing_histogram_unobserved_never")
+            .assert_unobserved();
+    }
+
+    #[test]
+    #[should_panic(expected = "expected unobserved, got 1 observations")]
+    fn histogram_assert_unobserved_panics_when_recorded() {
+        let snap = MetricAssertion::snapshot();
+        histogram!("testing_histogram_unobserved_set").record(1.0);
+        snap.histogram("testing_histogram_unobserved_set")
+            .assert_unobserved();
+    }
+
+    #[test]
+    fn histogram_assert_unobserved_with_label_filter_ignores_other_labels() {
+        let snap = MetricAssertion::snapshot();
+        histogram!("testing_histogram_unobserved_labels", "tenant" => "a").record(1.0);
+        snap.histogram("testing_histogram_unobserved_labels")
+            .with_labels(&[("tenant", "b")])
+            .assert_unobserved();
+    }
+
+    // Widened to also exercise drain-on-read interaction across labels:
+    // draining label-A's observations must not falsely make label-B "appear"
+    // observed (label scope is independent from drain).
+    #[test]
+    fn histogram_assert_unobserved_passes_when_other_label_set() {
+        let snap = MetricAssertion::snapshot();
+        histogram!("testing_histogram_unobserved_other_label", "tenant" => "a").record(1.0);
+        snap.histogram("testing_histogram_unobserved_other_label")
+            .with_labels(&[("tenant", "a")])
+            .assert_observation_count(1);
+        snap.histogram("testing_histogram_unobserved_other_label")
+            .with_labels(&[("tenant", "b")])
+            .assert_unobserved();
+    }
+
+    // PROOF OF TRAP: documents why histogram-first ordering matters for
+    // assert_unobserved. After assert_observation_count(1) drains the
+    // histogram, the entries are gone — assert_unobserved on the same
+    // (name, labels) tuple FALSELY PASSES even though the histogram WAS
+    // observed. This is intentional (lighter alternative to a runtime
+    // tracking flag); the module doc-comment §"Unobserved semantics" and
+    // §"Histograms DRAIN on snapshot" document the constraint and the
+    // developer is expected to take a fresh MetricAssertion::snapshot()
+    // between assertions. This test is non-panicking: it PASSES,
+    // demonstrating the trap exists. A future refactor that makes
+    // `assert_observation_count` idempotent would silently break this test
+    // and surface the contract change at build time — that's the
+    // executable-doc value of keeping this in code rather than doc-only.
+    #[test]
+    fn histogram_assert_unobserved_after_assert_observation_count_falsely_passes() {
+        let snap = MetricAssertion::snapshot();
+        histogram!("testing_histogram_drain_trap").record(1.0);
+        snap.histogram("testing_histogram_drain_trap")
+            .assert_observation_count(1);
+        // PROOF OF TRAP: drain-on-read makes a subsequent assert_unobserved
+        // see an empty buffer, so this PASSES even though the histogram WAS
+        // observed. See module §"Unobserved semantics" for the contract.
+        snap.histogram("testing_histogram_drain_trap")
+            .assert_unobserved();
+    }
+
+    // Kind-mismatch hardening on the negative-assertion path. Parallel to the
+    // existing `mismatched_metric_kind_*_panics_clearly` tests at lines
+    // 720-733 which prove `ensure_no_kind_mismatch` works for `assert_delta`/
+    // `assert_value`. These three prove the same hardening applies for
+    // `assert_unobserved` — the load-bearing distinction over
+    // `assert_delta(0)` / `assert_observation_count(0)` per @test reviewer.
+    // Without these, a `counter!("foo")` accidentally emitted under a metric
+    // catalogued as a histogram would silently pass `histogram("foo").
+    // assert_observation_count(0)` and the regression would ship.
+
+    #[test]
+    #[should_panic(expected = "was recorded as histogram, not counter")]
+    fn counter_assert_unobserved_panics_when_recorded_as_histogram() {
+        let snap = MetricAssertion::snapshot();
+        histogram!("testing_unobs_kind_mismatch_hist").record(1.0);
+        snap.counter("testing_unobs_kind_mismatch_hist")
+            .assert_unobserved();
+    }
+
+    #[test]
+    #[should_panic(expected = "was recorded as counter, not gauge")]
+    fn gauge_assert_unobserved_panics_when_recorded_as_counter() {
+        let snap = MetricAssertion::snapshot();
+        counter!("testing_unobs_kind_mismatch_counter").increment(1);
+        snap.gauge("testing_unobs_kind_mismatch_counter")
+            .assert_unobserved();
+    }
+
+    #[test]
+    #[should_panic(expected = "was recorded as counter, not histogram")]
+    fn histogram_assert_unobserved_panics_when_recorded_as_counter() {
+        let snap = MetricAssertion::snapshot();
+        counter!("testing_unobs_kind_mismatch_for_hist").increment(1);
+        snap.histogram("testing_unobs_kind_mismatch_for_hist")
+            .assert_unobserved();
     }
 }

@@ -2,26 +2,26 @@
 
 ## Architecture & Design
 - Actor handle/task separation → ADR-0001 (Section: Pattern)
-- No-panic policy, `#[expect]` over `#[allow]` → ADR-0002
-- Error handling, service-layer wrapping → ADR-0003
-- Host-side cluster helper → ADR-0030
-- Observability naming, label cardinality, SLO targets → ADR-0011
-- Dashboard metric presentation (counters vs rates, $__rate_interval) → ADR-0029
-- Guard pipeline methodology → ADR-0015
-- DRY cross-service duplication → ADR-0019
+- No-panic policy, `#[expect]` over `#[allow]` → ADR-0002; AC Step 4 + MC Step 3 + MH iter-2 metric-test files use `#![allow(clippy::unwrap_used, clippy::expect_used)]` (tech-debt drift originated in MC Step 3 and was matched by AC Step 4 for consistency); cross-step batched-cleanup TODO tracks the migration to `#![expect(..., reason = "...")]` → `docs/TODO.md` §Observability Debt
+- Error handling, service-layer wrapping → ADR-0003; DRY cross-service duplication → ADR-0019
+- Observability naming, label cardinality, SLO targets → ADR-0011; Dashboard presentation (counters vs rates, $__rate_interval) → ADR-0029
+- Guard pipeline methodology → ADR-0015; Agent teams validation pipeline → ADR-0024
 - User auth, three-tier token architecture → ADR-0020
-- Infrastructure architecture, K8s manifests → ADR-0012; Local dev environment → ADR-0013
-- Agent teams validation pipeline → ADR-0024
-- Metric testability: component tests + `MetricAssertion` helper + presence guard; per-failure-class table as review heuristic → ADR-0032
+- Infrastructure architecture, K8s manifests → ADR-0012; Local dev → ADR-0013; Host-side cluster helper → ADR-0030
+- Metric testability: component tests + `MetricAssertion` helper + presence guard; per-failure-class table as review heuristic → ADR-0032; disposition rule for "wrapper-only" metrics — "Phase-N marker present (annotated `#[allow(dead_code)] // Will be used in Phase N ...`, project-wide convention with 9+ hits across `crates/ac-service/src/`, established by `docs/PROJECT_STATUS.md`)" → defer disposition + WRAPPER-CAT-C invocation in `tests/` with framing comment + TODO.md entry; "no marker, zero production callers" → inline-remove (MC iter-2 precedent at `docs/devloop-outputs/2026-04-25-adr-0032-step-3-mc-metric-test-backfill/main.md:200,233,249`); WRAPPER-CAT-C framing comment shape → mirrors MC `media_connection_failed` and AC `record_token_validation` at `crates/ac-service/src/observability/metrics.rs:427-436` (references production sites, lists forward-looking reservations, points at production-path test file, ends with `docs/TODO.md` pointer)
 
 ## Code Locations — AC Service
 - Clippy deny list → `Cargo.toml:34-42`
 - Config (rate limits, defense-in-depth) → `crates/ac-service/src/config.rs:from_vars()`, constants at `:32-61`
-- Crypto (EdDSA, AES-256-GCM, bcrypt) → `crates/ac-service/src/crypto/mod.rs:sign_jwt()`
-- Error type → `crates/ac-service/src/errors.rs:AcError`
+- Crypto (EdDSA, AES-256-GCM, bcrypt) → `crates/ac-service/src/crypto/mod.rs:sign_jwt()`; token-validation `clock_skew` emission sites → `crypto/mod.rs:284,439`
+- Error type → `crates/ac-service/src/errors.rs:AcError`; `ErrorCategory` enum + `From<&AcError>` (4 bounded categories) → `crates/ac-service/src/observability/mod.rs:78-115`
 - Handlers/routes → `handlers/auth_handler.rs:handle_service_token()`, `routes/mod.rs:build_routes()`
-- Metrics → `crates/ac-service/src/observability/metrics.rs:init_metrics_recorder()`
+- Metrics → `crates/ac-service/src/observability/metrics.rs:init_metrics_recorder()`; per-cluster in-src `MetricAssertion`-backed tests (replaces 14 legacy no-op smoke tests) at `:#[cfg(test)] mod tests`; WRAPPER-CAT-C framing comment for `record_token_validation` (Phase-N reservation) → `crates/ac-service/src/observability/metrics.rs:427-436`
 - Repository + service layers → `repositories/signing_keys.rs`, `services/key_management_service.rs`
+- Integration tests (ADR-0032 Step 4, 13 cluster files, all `#[sqlx::test]` implicit current_thread runtime + per-cluster file-header load-bearing pin comment) → `crates/ac-service/tests/audit_log_failures_integration.rs`, `bcrypt_metrics_integration.rs`, `credential_ops_metrics_integration.rs`, `db_metrics_integration.rs`, `errors_metric_integration.rs`, `http_metrics_integration.rs`, `internal_token_metrics_integration.rs`, `jwks_metrics_integration.rs`, `key_rotation_metrics_integration.rs`, `rate_limit_metrics_integration.rs`, `token_issuance_service_integration.rs`, `token_issuance_user_integration.rs`, `token_validation_integration.rs`; shared test fixtures → `crates/ac-service/tests/common/test_state.rs` (`make_app_state`, `seed_signing_key`, `seed_service_credential`)
+- Audit-log fault-injection seam (`ALTER TABLE auth_events ADD CONSTRAINT block_inserts CHECK (...) NOT VALID` — surgical: preserves pre-INSERT SELECT path at `services/token_service.rs:54-59`; companion `DROP TABLE auth_events CASCADE` for fns that don't pre-query) → `crates/ac-service/tests/audit_log_failures_integration.rs:66-88`; partial-label adjacency helper `assert_only_event_type` → `:90-106`
+- 12-cell adjacency-matrix factor pattern (factor `assert_only_cell(snap, op, status, expected_delta)` once, invoke uniformly across all 11 tests in the (operation × status) matrix; label-swap-bug catcher per ADR-0032 §Pattern #3) → `crates/ac-service/tests/credential_ops_metrics_integration.rs`
+- Per-`ErrorCategory` variant production-driven coverage (4 tests, one per variant; `Internal` carve-out via `NotFound` + transitive From-impl unit test at `observability/mod.rs::tests::test_error_category_database_variant`; `ALL_CATEGORIES` constant drives `assert_delta(0)` adjacency on the 3 non-target siblings) → `crates/ac-service/tests/errors_metric_integration.rs`
 - K8s wiring → `infra/services/ac-service/configmap.yaml`, `statefulset.yaml`
 
 ## Code Locations — GC Service
@@ -61,10 +61,8 @@
 - Health + K8s → `observability/health.rs`, `infra/services/mh-service/`, `infra/docker/mh-service/Dockerfile`
 
 ## Code Locations — Common
-- JWT (errors, claims, validator, JWKS, HasIat) → `crates/common/src/jwt.rs`
-- SecretString/SecretBox → `crates/common/src/secret.rs`
-- TokenManager → `crates/common/src/token_manager.rs:spawn_token_manager()`
-- Meeting token shared types (GC↔AC contract, ADR-0020) → `crates/common/src/meeting_token.rs`
+- JWT (errors, claims, validator, JWKS, HasIat) → `crates/common/src/jwt.rs`; SecretString/SecretBox → `secret.rs`; TokenManager → `token_manager.rs:spawn_token_manager()`; Meeting token shared types (GC↔AC contract, ADR-0020) → `meeting_token.rs`
+- `MetricAssertion` (ADR-0032; thread-local `DebuggingRecorder` per snapshot, `!Send`) → `crates/common/src/observability/testing.rs`; `assert_unobserved` on all three query types (counter hard-vs-soft form, gauge gap-fill for §F4, histogram with drain-on-read caveat — call BEFORE any `assert_observation_count*` on same name+labels) at `:CounterQuery::assert_unobserved`, `GaugeQuery::assert_unobserved`, `HistogramQuery::assert_unobserved`; kind-mismatch hardening (`ensure_no_kind_mismatch`) covers negative-assertion path; histogram drain-on-read proof-of-trap test → `:histogram_assert_unobserved_after_assert_observation_count_falsely_passes`; gated behind `common` `test-utils` feature (consumer Cargo.toml needs `common = { path = "../common", features = ["test-utils"] }` in `[dev-dependencies]`)
 
 ## Infrastructure & Guards
 - Standard health endpoints (`/health`, `/ready`) → ADR-0012 (Section: Standard Operational Endpoints)
