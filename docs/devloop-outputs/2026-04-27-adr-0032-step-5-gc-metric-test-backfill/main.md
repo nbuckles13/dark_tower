@@ -22,8 +22,9 @@
 
 | Field | Value |
 |-------|-------|
-| Phase | `reflection` |
-| Implementer | `gate-3-passed` |
+| Phase | `complete` |
+| Implementer | `closed` |
+| End Commit | `6062630` (reflection trims) on top of `48f1250` (Step 5 main) |
 | Implementing Specialist | `global-controller` |
 | Iteration | `1` |
 | Security | `CLEAR` |
