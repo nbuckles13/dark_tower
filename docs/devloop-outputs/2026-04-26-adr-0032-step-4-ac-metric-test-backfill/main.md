@@ -253,3 +253,35 @@ Step 4 closed all 17 uncovered AC metrics to 0 via per-failure-class component t
 - **Component tests must drive real handlers, not server harnesses, when the assertion recorder is per-thread**: the `flavor = "current_thread"` + `#[sqlx::test]` + direct-handler-call combination is the only configuration where the `MetricAssertion` recorder reliably captures emissions from production code paths.
 - **Plan-stage commitment fidelity is the load-bearing discipline**: "X of Y completed" footnotes are NOT acceptable as deferrals — they are blockers for Ready-for-validation. Either land the full Y or explicitly re-scope before declaring readiness. This rule survived two reviewer iterations and will carry into future ADR-0032 phases.
 - **INDEX.md has a 75-line cap and a strict pointer-validation regex**: `:Type::nested` doesn't strip cleanly (the regex's second-character class is `[A-Za-z_]`, not `:`). Use top-level `:Type` or `:function()` references; consolidate verbose code-location entries into one-line groups when the cap binds.
+
+---
+
+## Human Review (Iteration 4)
+
+**Date**: 2026-04-27
+**Mode**: `--continue --light` (3 teammates: implementer + security + observability)
+**Continuation start commit**: `0b7714793933ede7818fc22be6f70f66a06ae749`
+
+### Feedback / Task
+
+User disposition on the deferred `clock_skew` cardinality drift (option (ii) — preserve as 5th value). Plus an architectural extension: amend ADR-0011's per-label cardinality bound (raise the cap to 10 values per label).
+
+### Scope
+
+1. **Amend ADR-0011** — raise per-label cardinality cap to 10 values. Captures rationale: the previous bound was conservative; operational distinction between failure modes (e.g., clock_skew vs cryptographic) is worth preserving when bounded.
+2. **Promote `clock_skew` to first-class category** in AC's `error_category` label set:
+   - Add `ClockSkew` variant to `ErrorCategory` enum at `crates/ac-service/src/observability/mod.rs:78-99`.
+   - Update `From<&AcError>` impl convention (no `AcError` variant currently maps to `ClockSkew`; the metric is emitted directly via `record_token_validation` from `crypto/mod.rs:284,439` — document the mapping convention).
+   - Update catalog at `docs/observability/metrics/ac-service.md:39` to include `clock_skew` as 6th value.
+3. **Component test cleanup**: `crates/ac-service/tests/token_validation_integration.rs` — remove the catalog-drift comment if present.
+4. **TODO.md** — close the corresponding entry (currently `**AC ac_token_validations_total{error_category} cardinality drift vs catalog**`).
+5. **Production code at `crypto/mod.rs:284,439`** already emits `clock_skew` correctly — likely zero changes there.
+
+### Verdict
+
+| Reviewer | Verdict | Notes |
+|---|---|---|
+| security | **CLEAR** | Crypto untouched; `From<&AcError>` impl preserved (no AcError variant routes to `ClockSkew`); dual-assertion test pattern preserved; ADR-0011 cap-10 has no rate-limit blast radius. |
+| observability | **CLEAR** | Catalog/cardinality table internally consistent (6 values); ADR-0011 amendment is workspace-wide not service-specific carve-out; no metric-coverage regressions; TODO entry closure includes date + iteration; `ErrorCategory::ClockSkew` variant doc-comment placement (on the variant itself rather than `From` impl) is more discoverable than spec'd. |
+
+Both verdicts CLEAR. No iter-2 needed. Production code byte-identical (`crypto/mod.rs:284,439` unchanged).
