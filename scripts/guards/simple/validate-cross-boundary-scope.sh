@@ -11,7 +11,9 @@
 #   - If working tree has pending changes (staged, unstaged, or untracked):
 #     diff = working tree vs HEAD
 #   - Otherwise (clean tree):
-#     diff = HEAD vs HEAD^ (most recent commit only)
+#     diff = effective_head^ vs effective_head, where effective_head is HEAD^2
+#     when HEAD is a merge commit (CI synthetic merge / local main-merge),
+#     else HEAD itself. See `resolve_scope` for rationale.
 #
 # The active main.md is whichever `docs/devloop-outputs/*/main.md` is added or
 # modified in that scoped diff. By convention every devloop step touches its
@@ -39,10 +41,21 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 source "$SCRIPT_DIR/../common.sh"
 
 # -----------------------------------------------------------------------------
-# Resolve the diff scope. Echoes one of:
-#   pending  — working tree has uncommitted/staged/untracked changes
-#   head-1   — clean tree, compare HEAD vs HEAD^
-# Exits 0 silently when there is no scope to check (initial commit, no git).
+# Resolve the effective HEAD for diffing. Returns either:
+#   - "pending" if working tree has uncommitted/staged/untracked changes
+#   - "commit:<sha>" — diff that commit against its first parent
+# Exits 0 silently when there is no scope to check (initial commit, no parent).
+#
+# Merge-commit handling:
+#   GitHub Actions' default checkout for `pull_request` events is the synthetic
+#   `refs/pull/N/merge` ref, where HEAD is a merge of base + PR. Then HEAD^ is
+#   the BASE branch (origin/main), and `git diff HEAD^ HEAD` would surface the
+#   entire cumulative PR — which is exactly what this rescoped guard was
+#   written to avoid. When HEAD is a merge commit (has 2 parents), use the
+#   second parent (HEAD^2) as the effective head: in the CI synthetic-merge
+#   case that's the PR's actual tip, and in a local "merge main into feature"
+#   case it's the merged-in branch's tip (which won't contain main.md files,
+#   so the guard correctly stays inert).
 # -----------------------------------------------------------------------------
 resolve_scope() {
     if ! git -C "$REPO_ROOT" rev-parse --is-inside-work-tree &>/dev/null; then
@@ -55,12 +68,21 @@ resolve_scope() {
         return 0
     fi
 
-    if git -C "$REPO_ROOT" rev-parse --verify --quiet HEAD^ >/dev/null 2>&1; then
-        echo "head-1"
+    local effective_head
+    if git -C "$REPO_ROOT" rev-parse --verify --quiet HEAD^2 >/dev/null 2>&1; then
+        # HEAD is a merge commit (CI synthetic merge ref or local merge).
+        effective_head=$(git -C "$REPO_ROOT" rev-parse HEAD^2)
+    else
+        effective_head=$(git -C "$REPO_ROOT" rev-parse HEAD)
+    fi
+
+    if git -C "$REPO_ROOT" rev-parse --verify --quiet "${effective_head}^" >/dev/null 2>&1; then
+        echo "commit:${effective_head}"
         return 0
     fi
 
-    # Initial commit or detached HEAD with no parent — nothing to scope.
+    # No parent reachable (shallow clone too narrow, initial commit, etc.) —
+    # nothing to scope.
     exit 0
 }
 
@@ -77,8 +99,9 @@ get_diff_paths() {
                 git -C "$REPO_ROOT" ls-files --others --exclude-standard 2>/dev/null || true
             } | sort -u
             ;;
-        head-1)
-            git -C "$REPO_ROOT" diff HEAD^ HEAD --name-only 2>/dev/null | sort -u || true
+        commit:*)
+            local head_ref="${scope#commit:}"
+            git -C "$REPO_ROOT" diff "${head_ref}^" "${head_ref}" --name-only 2>/dev/null | sort -u || true
             ;;
     esac
 }
