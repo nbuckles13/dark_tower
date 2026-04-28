@@ -888,16 +888,16 @@ mod tests {
         record_gc_heartbeat_latency("fast", Duration::from_millis(10));
         record_gc_heartbeat_latency("comprehensive", Duration::from_millis(40));
         snap.histogram("mc_gc_heartbeat_latency_seconds")
-            .with_labels(&[("type", "fast")])
+            .with_labels(&[("heartbeat_type", "fast")])
             .assert_observation_count_at_least(1);
 
         record_gc_heartbeat("success", "fast");
         record_gc_heartbeat("error", "comprehensive");
         snap.counter("mc_gc_heartbeats_total")
-            .with_labels(&[("status", "success"), ("type", "fast")])
+            .with_labels(&[("status", "success"), ("heartbeat_type", "fast")])
             .assert_delta(1);
         snap.counter("mc_gc_heartbeats_total")
-            .with_labels(&[("status", "error"), ("type", "comprehensive")])
+            .with_labels(&[("status", "error"), ("heartbeat_type", "comprehensive")])
             .assert_delta(1);
     }
 
@@ -911,10 +911,10 @@ mod tests {
         record_media_connection_failed(false);
 
         snap.counter("mc_mh_notifications_received_total")
-            .with_labels(&[("event", "connected")])
+            .with_labels(&[("event_type", "connected")])
             .assert_delta(1);
         snap.counter("mc_mh_notifications_received_total")
-            .with_labels(&[("event", "disconnected")])
+            .with_labels(&[("event_type", "disconnected")])
             .assert_delta(1);
         snap.counter("mc_media_connection_failures_total")
             .with_labels(&[("all_failed", "true")])

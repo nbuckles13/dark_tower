@@ -55,11 +55,11 @@ async fn notify_participant_connected_records_event_connected() {
     svc.notify_participant_connected(req).await.unwrap();
 
     snap.counter("mc_mh_notifications_received_total")
-        .with_labels(&[("event", "connected")])
+        .with_labels(&[("event_type", "connected")])
         .assert_delta(1);
     // Adjacency catches a future event-label swap.
     snap.counter("mc_mh_notifications_received_total")
-        .with_labels(&[("event", "disconnected")])
+        .with_labels(&[("event_type", "disconnected")])
         .assert_delta(0);
 }
 
@@ -77,9 +77,9 @@ async fn notify_participant_disconnected_records_event_disconnected() {
     svc.notify_participant_disconnected(req).await.unwrap();
 
     snap.counter("mc_mh_notifications_received_total")
-        .with_labels(&[("event", "disconnected")])
+        .with_labels(&[("event_type", "disconnected")])
         .assert_delta(1);
     snap.counter("mc_mh_notifications_received_total")
-        .with_labels(&[("event", "connected")])
+        .with_labels(&[("event_type", "connected")])
         .assert_delta(0);
 }

@@ -72,4 +72,4 @@
 
 ## Infrastructure Secrets & Network Isolation
 - Imperative secret creation → `setup.sh:create_{ac,mc_tls,mh,mh_tls}_secret()`; input validation (cluster name, DT_PORT_MAP, DT_HOST_GATEWAY_IP) → `infra/kind/scripts/setup.sh`, `teardown.sh`; ConfigMap advertise-address patching → `setup.sh:deploy_{mc,mh}_service()`; single-service rebuild allowlist → `setup.sh:deploy_only_service()`
-- Network policies (per-service ingress/egress) → `infra/services/{ac,gc,mc,mh}-service/network-policy.yaml`; MC↔MH gRPC: MC→MH:50053, MH→MC:50052; MC/MH K8s health probes → `crates/{mc,mh}-service/src/observability/health.rs`; Join-flow integration tests → `crates/{mc,gc}-service/tests/`
+- Network policies (per-service ingress/egress) → `infra/services/{ac,gc,mc,mh}-service/network-policy.yaml`; MC↔MH gRPC: MC→MH:50053, MH→MC:50052; MC/MH K8s health probes → `crates/mc-service/src/observability/health.rs`, `crates/mh-service/src/observability/health.rs`; Join-flow integration tests → `crates/mc-service/tests/`, `crates/gc-service/tests/`
