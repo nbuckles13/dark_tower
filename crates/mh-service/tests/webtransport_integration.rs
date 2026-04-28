@@ -413,6 +413,8 @@ async fn provisional_connection_kicked_after_register_meeting_timeout() {
     snap.counter("mh_webtransport_connections_total")
         .with_labels(&[("status", "error")])
         .assert_delta(1);
+    snap.counter("mh_register_meeting_timeouts_total")
+        .assert_delta(1);
     assert_eq!(
         suite.session_manager.active_connection_count().await,
         0,
