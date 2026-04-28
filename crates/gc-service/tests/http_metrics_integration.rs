@@ -63,7 +63,7 @@ async fn http_request_200_static_path_emits_counter_and_histogram() {
         .with_labels(&[
             ("method", "GET"),
             ("endpoint", "/health"),
-            ("status", "success"),
+            ("status_code", "200"),
         ])
         .assert_observation_count(1);
 
@@ -131,7 +131,7 @@ async fn http_request_500_emits_status_error_category() {
         .with_labels(&[
             ("method", "GET"),
             ("endpoint", "/other"),
-            ("status", "error"),
+            ("status_code", "500"),
         ])
         .assert_observation_count(1);
 
@@ -213,7 +213,7 @@ async fn http_request_emits_only_one_observation_per_request() {
         .with_labels(&[
             ("method", "GET"),
             ("endpoint", "/health"),
-            ("status", "success"),
+            ("status_code", "200"),
         ])
         .assert_observation_count(1);
 }
@@ -244,7 +244,7 @@ async fn http_request_504_emits_timeout_status_category() {
         .with_labels(&[
             ("method", "GET"),
             ("endpoint", "/other"),
-            ("status", "timeout"),
+            ("status_code", "504"),
         ])
         .assert_observation_count(1);
 
