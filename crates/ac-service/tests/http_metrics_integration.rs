@@ -60,7 +60,7 @@ async fn http_request_200_emits_counter_and_histogram() {
     snap.histogram("ac_http_request_duration_seconds")
         .with_labels(&[
             ("method", "GET"),
-            ("path", "/health"),
+            ("endpoint", "/health"),
             ("status_code", "200"),
         ])
         .assert_observation_count(1);
@@ -68,7 +68,7 @@ async fn http_request_200_emits_counter_and_histogram() {
     snap.counter("ac_http_requests_total")
         .with_labels(&[
             ("method", "GET"),
-            ("path", "/health"),
+            ("endpoint", "/health"),
             ("status_code", "200"),
         ])
         .assert_delta(1);
@@ -78,7 +78,7 @@ async fn http_request_200_emits_counter_and_histogram() {
         snap.counter("ac_http_requests_total")
             .with_labels(&[
                 ("method", "GET"),
-                ("path", "/health"),
+                ("endpoint", "/health"),
                 ("status_code", sibling_status),
             ])
             .assert_delta(0);
@@ -100,7 +100,7 @@ async fn http_request_500_emits_counter_with_status_500() {
     snap.histogram("ac_http_request_duration_seconds")
         .with_labels(&[
             ("method", "GET"),
-            ("path", "/other"),
+            ("endpoint", "/other"),
             ("status_code", "500"),
         ])
         .assert_observation_count(1);
@@ -108,7 +108,7 @@ async fn http_request_500_emits_counter_with_status_500() {
     snap.counter("ac_http_requests_total")
         .with_labels(&[
             ("method", "GET"),
-            ("path", "/other"),
+            ("endpoint", "/other"),
             ("status_code", "500"),
         ])
         .assert_delta(1);
@@ -118,7 +118,7 @@ async fn http_request_500_emits_counter_with_status_500() {
     snap.counter("ac_http_requests_total")
         .with_labels(&[
             ("method", "GET"),
-            ("path", "/other"),
+            ("endpoint", "/other"),
             ("status_code", "200"),
         ])
         .assert_delta(0);
@@ -139,7 +139,7 @@ async fn http_request_404_for_unknown_route_emits_status_404() {
     snap.histogram("ac_http_request_duration_seconds")
         .with_labels(&[
             ("method", "GET"),
-            ("path", "/other"),
+            ("endpoint", "/other"),
             ("status_code", "404"),
         ])
         .assert_observation_count(1);
@@ -147,7 +147,7 @@ async fn http_request_404_for_unknown_route_emits_status_404() {
     snap.counter("ac_http_requests_total")
         .with_labels(&[
             ("method", "GET"),
-            ("path", "/other"),
+            ("endpoint", "/other"),
             ("status_code", "404"),
         ])
         .assert_delta(1);
@@ -171,7 +171,7 @@ async fn http_request_405_for_wrong_method_emits_status_405() {
     snap.counter("ac_http_requests_total")
         .with_labels(&[
             ("method", "POST"),
-            ("path", "/health"),
+            ("endpoint", "/health"),
             ("status_code", "405"),
         ])
         .assert_delta(1);
@@ -193,7 +193,7 @@ async fn http_request_emits_only_one_observation_per_request() {
     snap.histogram("ac_http_request_duration_seconds")
         .with_labels(&[
             ("method", "GET"),
-            ("path", "/health"),
+            ("endpoint", "/health"),
             ("status_code", "200"),
         ])
         .assert_observation_count(1);
