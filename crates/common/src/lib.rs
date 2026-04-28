@@ -1,6 +1,11 @@
 //! Common utilities and types shared across Dark Tower components.
 
 #![warn(clippy::pedantic)]
+// We standardize on seconds for Duration construction (most timeouts are
+// not multiples of 60; config field naming uses seconds; RFC TTL/JWT exp
+// conventions use seconds). Opting out of this pedantic sublint avoids
+// splitting durations into two unit families on arbitrary divisibility.
+#![allow(clippy::duration_suboptimal_units)]
 
 /// Module for common error types
 pub mod error;

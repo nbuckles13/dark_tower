@@ -171,4 +171,6 @@
 
 ## Code Quality
 
+- [ ] **Consolidate `clippy::pedantic` to workspace lints**: 6 crates declare `#![warn(clippy::pedantic)]` at the crate root (`crates/common/src/lib.rs`, `crates/media-protocol/src/lib.rs`, `crates/mh-service/src/lib.rs`, `crates/proto-gen/src/lib.rs`, `crates/mc-service/src/main.rs`, `crates/mh-service/src/main.rs`); the other production crates (`ac-service`, `gc-service`, `mc-service` lib) do not. Move `pedantic = "warn"` to `[workspace.lints.clippy]` in the root `Cargo.toml` and remove the per-crate declarations. This will surface a backlog of pedantic lints in `ac-service` and `gc-service` that need to be cleaned up. Why follow up: (a) eliminates the manifest-vs-attribute precedence confusion that bit `duration_suboptimal_units` (2026-04-27 — workspace `allow` was overridden by crate-level `#![warn(clippy::pedantic)]`); (b) makes lint policy a single source of truth; (c) extends pedantic enforcement to crates that don't currently get it. Cost: cleanup of however many pedantic lints are currently latent in `ac-service` + `gc-service`.
+
 - [ ] **dead_code lint cleanup**: Review `#[allow(dead_code)]` attributes across `crates/ac-service/src/` once more code paths are exercised by binaries

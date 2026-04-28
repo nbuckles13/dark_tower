@@ -6,7 +6,7 @@
 # Build:  podman build -t darktower-dev:latest infra/devloop/
 # Rebuild weekly or when toolchain/dependencies change.
 
-FROM docker.io/library/rust:1.91-slim-bookworm
+FROM docker.io/library/rust:1.95-slim-bookworm
 
 # System packages required for building (ring, bcrypt, protobuf), guards (jq, bc,
 # python3-yaml for validate-infrastructure-metrics), and database tools
