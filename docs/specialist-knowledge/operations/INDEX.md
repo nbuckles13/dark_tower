@@ -73,5 +73,4 @@
 
 ## GC Service + Tests
 - GC routes + handlers → `crates/gc-service/src/routes/mod.rs`, `handlers/meetings.rs`
-- MC join tests → `crates/mc-service/tests/join_tests.rs`; TestKeypair → `crates/mc-test-utils/src/jwt_test.rs`
-- GC join tests → `crates/gc-service/tests/meeting_tests.rs`; Env-tests → `crates/env-tests/`
+- MC/GC join tests → `crates/mc-service/tests/join_tests.rs`, `crates/gc-service/tests/meeting_tests.rs`; TestKeypair → `crates/mc-test-utils/src/jwt_test.rs`; Env-tests → `crates/env-tests/`
