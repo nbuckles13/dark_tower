@@ -739,20 +739,20 @@ async fn gc_fast_heartbeat_success_records_status_success_type_fast() {
 
     // Histogram first.
     snap.histogram("mc_gc_heartbeat_latency_seconds")
-        .with_labels(&[("type", "fast")])
+        .with_labels(&[("heartbeat_type", "fast")])
         .assert_observation_count_at_least(1);
     snap.counter("mc_gc_heartbeats_total")
-        .with_labels(&[("status", "success"), ("type", "fast")])
+        .with_labels(&[("status", "success"), ("heartbeat_type", "fast")])
         .assert_delta(1);
     // Adjacency on the other 3 combos.
     snap.counter("mc_gc_heartbeats_total")
-        .with_labels(&[("status", "error"), ("type", "fast")])
+        .with_labels(&[("status", "error"), ("heartbeat_type", "fast")])
         .assert_delta(0);
     snap.counter("mc_gc_heartbeats_total")
-        .with_labels(&[("status", "success"), ("type", "comprehensive")])
+        .with_labels(&[("status", "success"), ("heartbeat_type", "comprehensive")])
         .assert_delta(0);
     snap.counter("mc_gc_heartbeats_total")
-        .with_labels(&[("status", "error"), ("type", "comprehensive")])
+        .with_labels(&[("status", "error"), ("heartbeat_type", "comprehensive")])
         .assert_delta(0);
 
     cancel_token.cancel();
@@ -777,16 +777,16 @@ async fn gc_comprehensive_heartbeat_success_records_status_success_type_comprehe
         .unwrap();
 
     snap.histogram("mc_gc_heartbeat_latency_seconds")
-        .with_labels(&[("type", "comprehensive")])
+        .with_labels(&[("heartbeat_type", "comprehensive")])
         .assert_observation_count_at_least(1);
     snap.counter("mc_gc_heartbeats_total")
-        .with_labels(&[("status", "success"), ("type", "comprehensive")])
+        .with_labels(&[("status", "success"), ("heartbeat_type", "comprehensive")])
         .assert_delta(1);
     snap.counter("mc_gc_heartbeats_total")
-        .with_labels(&[("status", "success"), ("type", "fast")])
+        .with_labels(&[("status", "success"), ("heartbeat_type", "fast")])
         .assert_delta(0);
     snap.counter("mc_gc_heartbeats_total")
-        .with_labels(&[("status", "error"), ("type", "comprehensive")])
+        .with_labels(&[("status", "error"), ("heartbeat_type", "comprehensive")])
         .assert_delta(0);
 
     cancel_token.cancel();
@@ -814,13 +814,13 @@ async fn gc_fast_heartbeat_error_records_status_error_type_fast() {
     assert!(result.is_err(), "expected Err after server cancel");
 
     snap.histogram("mc_gc_heartbeat_latency_seconds")
-        .with_labels(&[("type", "fast")])
+        .with_labels(&[("heartbeat_type", "fast")])
         .assert_observation_count_at_least(1);
     snap.counter("mc_gc_heartbeats_total")
-        .with_labels(&[("status", "error"), ("type", "fast")])
+        .with_labels(&[("status", "error"), ("heartbeat_type", "fast")])
         .assert_delta(1);
     snap.counter("mc_gc_heartbeats_total")
-        .with_labels(&[("status", "success"), ("type", "fast")])
+        .with_labels(&[("status", "success"), ("heartbeat_type", "fast")])
         .assert_delta(0);
 }
 
@@ -846,12 +846,12 @@ async fn gc_comprehensive_heartbeat_error_records_status_error_type_comprehensiv
     assert!(result.is_err(), "expected Err after server cancel");
 
     snap.histogram("mc_gc_heartbeat_latency_seconds")
-        .with_labels(&[("type", "comprehensive")])
+        .with_labels(&[("heartbeat_type", "comprehensive")])
         .assert_observation_count_at_least(1);
     snap.counter("mc_gc_heartbeats_total")
-        .with_labels(&[("status", "error"), ("type", "comprehensive")])
+        .with_labels(&[("status", "error"), ("heartbeat_type", "comprehensive")])
         .assert_delta(1);
     snap.counter("mc_gc_heartbeats_total")
-        .with_labels(&[("status", "error"), ("type", "fast")])
+        .with_labels(&[("status", "error"), ("heartbeat_type", "fast")])
         .assert_delta(0);
 }

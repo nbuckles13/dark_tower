@@ -37,7 +37,7 @@
 - Auth-layer integration (5-`failure_reason` JWT cluster + `caller_type_rejected`, real wiremock JWKS) -> `crates/mc-service/tests/auth_layer_integration.rs`
 - Media coordination + register-meeting + token-refresh integration (`mh_notifications`, stub MH gRPC, Cat B `record_token_refresh_metrics` per-`error_category` matrix in `crates/mc-service/src/observability/metrics.rs:tests`) -> `crates/mc-service/tests/media_coordination_integration.rs`, `register_meeting_integration.rs`, `token_refresh_integration.rs`
 - Per-failure-class wrapper covers (actor metrics, redis ops, orphans) -> `crates/mc-service/tests/actor_metrics_integration.rs`, `redis_metrics_integration.rs`, `orphan_metrics_integration.rs`
-- Shared rigs + scaffolding (`AcceptLoopRig`, `TestStackHandles`, `build_test_stack`, `seed_meeting_with_mh`, `MockMhAssignmentStore`, `MockMhRegistrationClient`) -> `crates/mc-service/tests/common/`; health + metrics + cross-service test utils (mock Redis/GC/MH) -> `crates/mc-service/src/observability/{health,metrics}.rs`, `crates/mc-test-utils/src/`
+- Shared rigs + scaffolding (`AcceptLoopRig`, `TestStackHandles`, `build_test_stack`, `seed_meeting_with_mh`, `MockMhAssignmentStore`, `MockMhRegistrationClient`) -> `crates/mc-service/tests/common/`; health + metrics + cross-service test utils (mock Redis/GC/MH) -> `crates/mc-service/src/observability/health.rs`, `crates/mc-service/src/observability/metrics.rs`, `crates/mc-test-utils/src/`
 
 ## Code Locations: MH Service
 - Config tests (env vars, defaults, TLS, debug redaction, advertise addresses, JWKS URL, timeouts) -> `crates/mh-service/src/config.rs:tests`

@@ -707,7 +707,7 @@ mod tests {
         snap.histogram("ac_http_request_duration_seconds")
             .with_labels(&[
                 ("method", "POST"),
-                ("path", "/api/v1/auth/service/token"),
+                ("endpoint", "/api/v1/auth/service/token"),
                 ("status_code", "200"),
             ])
             .assert_observation_count_at_least(1);
@@ -716,28 +716,28 @@ mod tests {
         snap.counter("ac_http_requests_total")
             .with_labels(&[
                 ("method", "GET"),
-                ("path", "/.well-known/jwks.json"),
+                ("endpoint", "/.well-known/jwks.json"),
                 ("status_code", "200"),
             ])
             .assert_delta(1);
         snap.counter("ac_http_requests_total")
             .with_labels(&[
                 ("method", "GET"),
-                ("path", "/other"),
+                ("endpoint", "/other"),
                 ("status_code", "404"),
             ])
             .assert_delta(1);
         snap.counter("ac_http_requests_total")
             .with_labels(&[
                 ("method", "DELETE"),
-                ("path", "/api/v1/auth/service/token"),
+                ("endpoint", "/api/v1/auth/service/token"),
                 ("status_code", "405"),
             ])
             .assert_delta(1);
         snap.counter("ac_http_requests_total")
             .with_labels(&[
                 ("method", "POST"),
-                ("path", "/api/v1/auth/service/token"),
+                ("endpoint", "/api/v1/auth/service/token"),
                 ("status_code", "500"),
             ])
             .assert_delta(1);
