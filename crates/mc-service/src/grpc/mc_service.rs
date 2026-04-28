@@ -150,7 +150,24 @@ impl McAssignmentService {
                 meeting_id = %meeting_id,
                 "No MH assignments provided"
             );
-            return Err(McError::Config("No MH assignments provided".to_string()));
+            return Err(McError::InvalidArgument(
+                "No MH assignments provided".to_string(),
+            ));
+        }
+
+        for a in mh_assignments {
+            if a.grpc_endpoint.is_empty() {
+                error!(
+                    target: "mc.grpc.mc_service",
+                    meeting_id = %meeting_id,
+                    mh_id = %a.mh_id,
+                    "MH assignment has empty grpc_endpoint (GC contract violation)"
+                );
+                return Err(McError::InvalidArgument(format!(
+                    "MH assignment for {} has empty grpc_endpoint",
+                    a.mh_id
+                )));
+            }
         }
 
         let handlers: Vec<crate::redis::MhEndpointInfo> = mh_assignments
@@ -158,11 +175,7 @@ impl McAssignmentService {
             .map(|a| crate::redis::MhEndpointInfo {
                 mh_id: a.mh_id.clone(),
                 webtransport_endpoint: a.webtransport_endpoint.clone(),
-                grpc_endpoint: if a.grpc_endpoint.is_empty() {
-                    None
-                } else {
-                    Some(a.grpc_endpoint.clone())
-                },
+                grpc_endpoint: a.grpc_endpoint.clone(),
             })
             .collect();
 
