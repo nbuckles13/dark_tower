@@ -23,7 +23,7 @@
 //! let handlers = &[MhEndpointInfo {
 //!     mh_id: "mh-1".to_string(),
 //!     webtransport_endpoint: "wt://mh-1:4433".to_string(),
-//!     grpc_endpoint: Some("http://mh-1:50053".to_string()),
+//!     grpc_endpoint: "http://mh-1:50053".to_string(),
 //! }];
 //! client.store_mh_assignment("meeting-123", handlers).await?;
 //!
@@ -49,9 +49,8 @@ pub struct MhEndpointInfo {
     pub mh_id: String,
     /// WebTransport endpoint for client media connections.
     pub webtransport_endpoint: String,
-    /// gRPC endpoint for MC->MH communication (optional).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub grpc_endpoint: Option<String>,
+    /// gRPC endpoint for MC->MH communication.
+    pub grpc_endpoint: String,
 }
 
 /// MH assignment data stored in Redis.
@@ -603,12 +602,12 @@ mod tests {
                 MhEndpointInfo {
                     mh_id: "mh-1".to_string(),
                     webtransport_endpoint: "wt://mh-1:4433".to_string(),
-                    grpc_endpoint: Some("http://mh-1:50053".to_string()),
+                    grpc_endpoint: "http://mh-1:50053".to_string(),
                 },
                 MhEndpointInfo {
                     mh_id: "mh-2".to_string(),
                     webtransport_endpoint: "wt://mh-2:4433".to_string(),
-                    grpc_endpoint: Some("http://mh-2:50053".to_string()),
+                    grpc_endpoint: "http://mh-2:50053".to_string(),
                 },
             ],
             assigned_at: "2024-01-23T00:00:00Z".to_string(),
@@ -619,15 +618,9 @@ mod tests {
 
         assert_eq!(parsed.handlers.len(), 2);
         assert_eq!(parsed.handlers[0].mh_id, "mh-1");
-        assert_eq!(
-            parsed.handlers[0].grpc_endpoint,
-            Some("http://mh-1:50053".to_string())
-        );
+        assert_eq!(parsed.handlers[0].grpc_endpoint, "http://mh-1:50053");
         assert_eq!(parsed.handlers[1].mh_id, "mh-2");
-        assert_eq!(
-            parsed.handlers[1].grpc_endpoint,
-            Some("http://mh-2:50053".to_string())
-        );
+        assert_eq!(parsed.handlers[1].grpc_endpoint, "http://mh-2:50053");
     }
 
     #[test]
@@ -636,7 +629,7 @@ mod tests {
             handlers: vec![MhEndpointInfo {
                 mh_id: "mh-1".to_string(),
                 webtransport_endpoint: "wt://mh-1:4433".to_string(),
-                grpc_endpoint: Some("http://mh-1:50053".to_string()),
+                grpc_endpoint: "http://mh-1:50053".to_string(),
             }],
             assigned_at: "2024-01-23T00:00:00Z".to_string(),
         };
@@ -655,12 +648,12 @@ mod tests {
                 MhEndpointInfo {
                     mh_id: "mh-1".to_string(),
                     webtransport_endpoint: "wt://mh-1:4433".to_string(),
-                    grpc_endpoint: Some("http://mh-1:50053".to_string()),
+                    grpc_endpoint: "http://mh-1:50053".to_string(),
                 },
                 MhEndpointInfo {
                     mh_id: "mh-2".to_string(),
                     webtransport_endpoint: "wt://mh-2:4433".to_string(),
-                    grpc_endpoint: Some("http://mh-2:50053".to_string()),
+                    grpc_endpoint: "http://mh-2:50053".to_string(),
                 },
             ],
             assigned_at: "2024-01-23T12:00:00Z".to_string(),
@@ -685,12 +678,12 @@ mod tests {
                 MhEndpointInfo {
                     mh_id: "mh-1".to_string(),
                     webtransport_endpoint: "wt://mh-1:4433".to_string(),
-                    grpc_endpoint: Some("http://mh-1:50053".to_string()),
+                    grpc_endpoint: "http://mh-1:50053".to_string(),
                 },
                 MhEndpointInfo {
                     mh_id: "mh-2".to_string(),
                     webtransport_endpoint: "wt://mh-2:4433".to_string(),
-                    grpc_endpoint: None,
+                    grpc_endpoint: "http://mh-2:50053".to_string(),
                 },
             ],
             assigned_at: "2024-01-23T00:00:00Z".to_string(),
@@ -706,17 +699,6 @@ mod tests {
             assert_eq!(orig.grpc_endpoint, rest.grpc_endpoint);
         }
         assert_eq!(original.assigned_at, restored.assigned_at);
-    }
-
-    #[test]
-    fn test_mh_endpoint_info_grpc_skip_serializing_none() {
-        let info = MhEndpointInfo {
-            mh_id: "mh-1".to_string(),
-            webtransport_endpoint: "wt://mh-1:4433".to_string(),
-            grpc_endpoint: None,
-        };
-        let json = serde_json::to_string(&info).unwrap();
-        assert!(!json.contains("grpc_endpoint"));
     }
 
     #[test]

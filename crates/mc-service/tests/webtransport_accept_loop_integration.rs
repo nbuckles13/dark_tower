@@ -286,7 +286,7 @@ async fn accept_loop_records_session_join_failure_meeting_not_found() {
             handlers: vec![MhEndpointInfo {
                 mh_id: "mh-test-1".to_string(),
                 webtransport_endpoint: "wt://mh-test-1:4433".to_string(),
-                grpc_endpoint: Some("http://mh-test-1:50053".to_string()),
+                grpc_endpoint: "http://mh-test-1:50053".to_string(),
             }],
             assigned_at: "2026-04-25T00:00:00Z".to_string(),
         },

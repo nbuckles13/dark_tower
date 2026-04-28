@@ -12,11 +12,13 @@
 //!   tests (ADR-0032 Step 3 §Deliverable 3).
 
 #![allow(dead_code)]
+#![allow(clippy::panic, clippy::expect_used, clippy::unwrap_used)]
 
 pub mod accept_loop_rig;
 
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use ::common::jwt::JwksClient;
 use ::common::secret::SecretBox;
@@ -27,6 +29,7 @@ use mc_service::grpc::MhRegistrationClient;
 use mc_service::mh_connection_registry::MhConnectionRegistry;
 use mc_service::redis::{MhAssignmentData, MhAssignmentStore, MhEndpointInfo};
 use mc_test_utils::jwt_test::{mount_jwks_mock, TestKeypair};
+use tokio::sync::Notify;
 use wiremock::MockServer;
 
 // =============================================================================
@@ -93,6 +96,9 @@ pub struct MockMhRegistrationClient {
     calls: Mutex<Vec<RegisterMeetingCall>>,
     /// If set, `register_meeting()` returns this result.
     result: Result<(), McError>,
+    /// Notified once per `register_meeting()` call, after `calls` is updated.
+    /// Lets tests await deterministic fan-out without polling sleeps.
+    call_notify: Arc<Notify>,
 }
 
 impl MockMhRegistrationClient {
@@ -100,6 +106,7 @@ impl MockMhRegistrationClient {
         Self {
             calls: Mutex::new(Vec::new()),
             result: Ok(()),
+            call_notify: Arc::new(Notify::new()),
         }
     }
 
@@ -107,6 +114,7 @@ impl MockMhRegistrationClient {
         Self {
             calls: Mutex::new(Vec::new()),
             result: Err(err),
+            call_notify: Arc::new(Notify::new()),
         }
     }
 
@@ -115,6 +123,36 @@ impl MockMhRegistrationClient {
             .lock()
             .expect("MockMhRegistrationClient mutex poisoned")
             .clone()
+    }
+
+    /// Wait for at least `expected` calls to land within `timeout`.
+    /// Returns the recorded calls on success; panics on timeout.
+    ///
+    /// `Notify` stores at most one permit, so under fast fan-out late
+    /// notifications can coalesce. Correctness relies on the length re-check
+    /// at the top of the loop, which observes the cumulative state.
+    pub async fn wait_for_calls(
+        &self,
+        expected: usize,
+        timeout: Duration,
+    ) -> Vec<RegisterMeetingCall> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if self.calls().len() >= expected {
+                return self.calls();
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                let current = self.calls();
+                panic!(
+                    "Timeout waiting for {} register_meeting() calls; got {} ({:?})",
+                    expected,
+                    current.len(),
+                    current,
+                );
+            }
+            let _ = tokio::time::timeout(remaining, self.call_notify.notified()).await;
+        }
     }
 }
 
@@ -141,6 +179,7 @@ impl MhRegistrationClient for MockMhRegistrationClient {
                 mc_id: mc_id.to_string(),
                 mc_grpc_endpoint: mc_grpc_endpoint.to_string(),
             });
+        self.call_notify.notify_one();
         let result = match &self.result {
             Ok(()) => Ok(()),
             Err(e) => Err(McError::Grpc(e.to_string())),
@@ -208,18 +247,34 @@ pub async fn build_test_stack(keypair_label: &str) -> TestStackHandles {
     }
 }
 
-/// Seed an MH assignment for `meeting_id` and create the meeting on the
-/// controller actor. Used by tests that need both the MC controller and an
-/// MH assignment in place before issuing a JoinRequest.
-pub async fn seed_meeting_with_mh(handles: &TestStackHandles, meeting_id: &str) {
+/// Build a default `MhEndpointInfo` for an MH with the given id.
+///
+/// Endpoints follow the convention `wt://{mh_id}:4433` /
+/// `http://{mh_id}:50053`. Tests that need a different shape can construct
+/// `MhEndpointInfo` directly.
+pub fn mh_handler(mh_id: &str) -> MhEndpointInfo {
+    MhEndpointInfo {
+        mh_id: mh_id.to_string(),
+        webtransport_endpoint: format!("wt://{mh_id}:4433"),
+        grpc_endpoint: format!("http://{mh_id}:50053"),
+    }
+}
+
+/// Seed an MH assignment for `meeting_id` with the supplied handlers and
+/// create the meeting on the controller actor.
+///
+/// Used by tests that need both the MC controller and an MH assignment in
+/// place before issuing a JoinRequest. For single-handler scenarios prefer
+/// the [`seed_meeting_with_mh`] convenience wrapper.
+pub async fn seed_meeting_with_handlers(
+    handles: &TestStackHandles,
+    meeting_id: &str,
+    handlers: Vec<MhEndpointInfo>,
+) {
     handles.mh_store.insert(
         meeting_id,
         MhAssignmentData {
-            handlers: vec![MhEndpointInfo {
-                mh_id: "mh-test-1".to_string(),
-                webtransport_endpoint: "wt://mh-test-1:4433".to_string(),
-                grpc_endpoint: Some("http://mh-test-1:50053".to_string()),
-            }],
+            handlers,
             assigned_at: "2026-04-25T00:00:00Z".to_string(),
         },
     );
@@ -228,4 +283,12 @@ pub async fn seed_meeting_with_mh(handles: &TestStackHandles, meeting_id: &str) 
         .create_meeting(meeting_id.to_string())
         .await
         .expect("create_meeting");
+}
+
+/// Seed an MH assignment for `meeting_id` with a single default handler
+/// (`mh-test-1`) and create the meeting on the controller actor.
+///
+/// Thin wrapper over [`seed_meeting_with_handlers`] for the common case.
+pub async fn seed_meeting_with_mh(handles: &TestStackHandles, meeting_id: &str) {
+    seed_meeting_with_handlers(handles, meeting_id, vec![mh_handler("mh-test-1")]).await;
 }

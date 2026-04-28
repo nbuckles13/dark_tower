@@ -36,8 +36,12 @@ use proto_gen::signaling::{
 };
 use wtransport::{ClientConfig, Endpoint};
 
+use mc_service::redis::MhEndpointInfo;
 use test_common::accept_loop_rig::AcceptLoopRig;
-use test_common::{build_test_stack, seed_meeting_with_mh, TestStackHandles};
+use test_common::{
+    build_test_stack, mh_handler, seed_meeting_with_handlers, seed_meeting_with_mh,
+    TestStackHandles,
+};
 
 // ============================================================================
 // Test Infrastructure
@@ -80,9 +84,16 @@ impl TestServer {
         &self.rig.controller_handle
     }
 
-    /// Create a meeting on the controller and seed MH assignment data.
+    /// Create a meeting on the controller and seed MH assignment data with
+    /// the default single-handler fixture.
     async fn create_meeting(&self, meeting_id: &str) {
         seed_meeting_with_mh(&self.stack, meeting_id).await;
+    }
+
+    /// Create a meeting on the controller and seed MH assignment data with
+    /// the supplied handler list (for multi-MH scenarios).
+    async fn create_meeting_with_handlers(&self, meeting_id: &str, handlers: Vec<MhEndpointInfo>) {
+        seed_meeting_with_handlers(&self.stack, meeting_id, handlers).await;
     }
 
     /// Sign a JWT for the given claims.
@@ -853,4 +864,65 @@ async fn test_second_participant_does_not_trigger_register_meeting() {
         calls_after_second, 1,
         "Second participant should NOT trigger additional RegisterMeeting"
     );
+}
+
+// ============================================================================
+// Multi-MH: media_servers fan-out + RegisterMeeting per handler (R-6, R-12)
+// ============================================================================
+
+#[tokio::test]
+async fn test_join_multiple_mh_handlers_populates_all() {
+    let server = TestServer::start().await;
+    server
+        .create_meeting_with_handlers(
+            "meeting-multi",
+            vec![mh_handler("mh-alpha"), mh_handler("mh-beta")],
+        )
+        .await;
+
+    let claims = make_meeting_claims("meeting-multi");
+    let token = server.sign_token(&claims);
+
+    let response = join_and_read_response(&server.url(), "meeting-multi", &token, "Alice").await;
+
+    // JoinResponse populates media_servers with all MH WebTransport URLs (R-6).
+    match &response.message {
+        Some(server_message::Message::JoinResponse(join)) => {
+            assert_eq!(
+                join.media_servers.len(),
+                2,
+                "media_servers should include both assigned MHs"
+            );
+            let urls: std::collections::HashSet<String> = join
+                .media_servers
+                .iter()
+                .map(|m| m.media_handler_url.clone())
+                .collect();
+            assert!(
+                urls.contains("wt://mh-alpha:4433"),
+                "missing mh-alpha URL, got {urls:?}"
+            );
+            assert!(
+                urls.contains("wt://mh-beta:4433"),
+                "missing mh-beta URL, got {urls:?}"
+            );
+        }
+        other => panic!("Expected JoinResponse, got {other:?}"),
+    }
+
+    // RegisterMeeting fires once per MH (R-12).
+    let calls = server
+        .stack
+        .mh_reg_client
+        .wait_for_calls(2, Duration::from_secs(2))
+        .await;
+    assert_eq!(
+        calls.len(),
+        2,
+        "First participant in multi-MH meeting should trigger RegisterMeeting per MH"
+    );
+    let grpc_endpoints: std::collections::HashSet<String> =
+        calls.iter().map(|c| c.mh_grpc_endpoint.clone()).collect();
+    assert!(grpc_endpoints.contains("http://mh-alpha:50053"));
+    assert!(grpc_endpoints.contains("http://mh-beta:50053"));
 }

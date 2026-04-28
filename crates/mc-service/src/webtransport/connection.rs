@@ -735,7 +735,7 @@ async fn build_join_response(
 ///
 /// Called as a spawned task after the first participant joins. Iterates over
 /// all MH handlers in the assignment data, calling `register_meeting()` on
-/// each that has a gRPC endpoint. Retries with exponential backoff on failure.
+/// each. Retries with exponential backoff on failure.
 ///
 /// This function handles all errors internally (log + continue) since it runs
 /// as a fire-and-forget spawned task with no caller to propagate errors to.
@@ -748,17 +748,7 @@ async fn register_meeting_with_handlers(
     cancel_token: &CancellationToken,
 ) {
     for handler in &mh_data.handlers {
-        let grpc_endpoint = match &handler.grpc_endpoint {
-            Some(ep) => ep,
-            None => {
-                debug!(
-                    target: "mc.register_meeting.trigger",
-                    mh_id = %handler.mh_id,
-                    "MH has no gRPC endpoint, skipping RegisterMeeting"
-                );
-                continue;
-            }
-        };
+        let grpc_endpoint = &handler.grpc_endpoint;
 
         let mut last_error = None;
         for attempt in 1..=MAX_REGISTER_ATTEMPTS {
@@ -975,7 +965,7 @@ mod tests {
         let mh_data = make_mh_data(vec![MhEndpointInfo {
             mh_id: "mh-1".to_string(),
             webtransport_endpoint: "wt://mh-1:4433".to_string(),
-            grpc_endpoint: Some("http://mh-1:50053".to_string()),
+            grpc_endpoint: "http://mh-1:50053".to_string(),
         }]);
         let cancel = CancellationToken::new();
 
@@ -995,7 +985,7 @@ mod tests {
         let mh_data = make_mh_data(vec![MhEndpointInfo {
             mh_id: "mh-1".to_string(),
             webtransport_endpoint: "wt://mh-1:4433".to_string(),
-            grpc_endpoint: Some("http://mh-1:50053".to_string()),
+            grpc_endpoint: "http://mh-1:50053".to_string(),
         }]);
         let cancel = CancellationToken::new();
 
@@ -1022,12 +1012,12 @@ mod tests {
             MhEndpointInfo {
                 mh_id: "mh-1".to_string(),
                 webtransport_endpoint: "wt://mh-1:4433".to_string(),
-                grpc_endpoint: Some("http://mh-1:50053".to_string()),
+                grpc_endpoint: "http://mh-1:50053".to_string(),
             },
             MhEndpointInfo {
                 mh_id: "mh-2".to_string(),
                 webtransport_endpoint: "wt://mh-2:4433".to_string(),
-                grpc_endpoint: Some("http://mh-2:50053".to_string()),
+                grpc_endpoint: "http://mh-2:50053".to_string(),
             },
         ]);
         let cancel = CancellationToken::new();
@@ -1039,33 +1029,6 @@ mod tests {
             client.call_count(),
             4,
             "1 call for handler 1 (success) + 3 calls for handler 2 (exhausted)"
-        );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn test_register_skips_handler_without_grpc_endpoint() {
-        let client = MockRegClient::new(vec![Ok(())]);
-        let mh_data = make_mh_data(vec![
-            MhEndpointInfo {
-                mh_id: "mh-no-grpc".to_string(),
-                webtransport_endpoint: "wt://mh-1:4433".to_string(),
-                grpc_endpoint: None,
-            },
-            MhEndpointInfo {
-                mh_id: "mh-with-grpc".to_string(),
-                webtransport_endpoint: "wt://mh-2:4433".to_string(),
-                grpc_endpoint: Some("http://mh-2:50053".to_string()),
-            },
-        ]);
-        let cancel = CancellationToken::new();
-
-        register_meeting_with_handlers(&client, &mh_data, "m1", "mc1", "http://mc:50052", &cancel)
-            .await;
-
-        assert_eq!(
-            client.call_count(),
-            1,
-            "Should only call register_meeting for handler with gRPC endpoint"
         );
     }
 }

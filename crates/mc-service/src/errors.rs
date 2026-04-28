@@ -32,6 +32,13 @@ pub enum McError {
     #[error("Configuration error: {0}")]
     Config(String),
 
+    /// Caller sent a malformed gRPC request (proto-level contract violation).
+    /// E.g., `AssignMeetingWithMh` with empty `mh_assignments` or empty
+    /// `grpc_endpoint`. Distinct from `Config` (MC's own configuration) and
+    /// `Internal` (unexpected MC failures).
+    #[error("Invalid argument: {0}")]
+    InvalidArgument(String),
+
     /// Session binding token validation failed.
     #[error("Session binding error: {0}")]
     SessionBinding(SessionBindingError),
@@ -126,6 +133,7 @@ impl McError {
             McError::Redis(_)
             | McError::Grpc(_)
             | McError::Config(_)
+            | McError::InvalidArgument(_)
             | McError::Internal(_)
             | McError::FencedOut(_)
             | McError::NotRegistered
@@ -169,6 +177,7 @@ impl McError {
             McError::Grpc(_) => "grpc",
             McError::NotRegistered => "not_registered",
             McError::Config(_) => "config",
+            McError::InvalidArgument(_) => "invalid_argument",
             McError::SessionBinding(_) => "session_binding",
             McError::MeetingNotFound(_) => "meeting_not_found",
             McError::ParticipantNotFound(_) => "participant_not_found",
@@ -194,6 +203,7 @@ impl McError {
             McError::Redis(_)
             | McError::Grpc(_)
             | McError::Config(_)
+            | McError::InvalidArgument(_)
             | McError::Internal(_)
             | McError::NotRegistered
             | McError::MhAssignmentMissing(_)
@@ -245,6 +255,10 @@ mod tests {
             6
         );
         assert_eq!(McError::Config("bad config".to_string()).error_code(), 6);
+        assert_eq!(
+            McError::InvalidArgument("empty grpc_endpoint".to_string()).error_code(),
+            6
+        );
         assert_eq!(McError::Internal("test".to_string()).error_code(), 6);
         assert_eq!(McError::FencedOut("stale".to_string()).error_code(), 6);
         assert_eq!(McError::NotRegistered.error_code(), 6);
@@ -360,6 +374,10 @@ mod tests {
         assert_eq!(McError::Redis("test".to_string()).status_code(), 6);
         assert_eq!(McError::Grpc("test".to_string()).status_code(), 6);
         assert_eq!(McError::Config("test".to_string()).status_code(), 6);
+        assert_eq!(
+            McError::InvalidArgument("test".to_string()).status_code(),
+            6
+        );
         assert_eq!(McError::Internal("test".to_string()).status_code(), 6);
         assert_eq!(McError::FencedOut("test".to_string()).status_code(), 6);
         assert_eq!(McError::NotRegistered.status_code(), 6);
@@ -417,7 +435,7 @@ mod tests {
 
     #[test]
     fn test_error_type_label_exhaustive() {
-        // Verify all 19 McError variants map to bounded &'static str labels
+        // Verify all 20 McError variants map to bounded &'static str labels
         assert_eq!(
             McError::Redis("test".to_string()).error_type_label(),
             "redis"
@@ -427,6 +445,10 @@ mod tests {
         assert_eq!(
             McError::Config("test".to_string()).error_type_label(),
             "config"
+        );
+        assert_eq!(
+            McError::InvalidArgument("test".to_string()).error_type_label(),
+            "invalid_argument"
         );
         assert_eq!(
             McError::SessionBinding(SessionBindingError::TokenExpired).error_type_label(),
