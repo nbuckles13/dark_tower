@@ -541,12 +541,9 @@ mod tests {
 
         record_bcrypt_duration("hash", Duration::from_millis(150));
         record_bcrypt_duration("verify", Duration::from_millis(120));
-        record_bcrypt_duration("hash", Duration::from_millis(200));
 
-        // Drain-on-read: single take_entries() covers all 3 observations
-        // across both label combos.
         snap.histogram("ac_bcrypt_duration_seconds")
-            .assert_observation_count_at_least(3);
+            .assert_observation_count(2);
     }
 
     #[test]

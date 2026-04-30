@@ -28,13 +28,12 @@
 //!
 //! # Isolation model
 //!
-//! [`MetricAssertion::snapshot`] instantiates a fresh
-//! [`metrics_util::debugging::DebuggingRecorder`] and binds it to the current
-//! thread via [`metrics::set_default_local_recorder`]. The returned
-//! [`MetricSnapshot`] owns the resulting `LocalRecorderGuard` and a
-//! `Snapshotter` attached to that recorder. When the snapshot drops, the
-//! guard releases the thread-local binding (restoring whatever recorder was
-//! previously in scope).
+//! [`MetricAssertion::snapshot`] instantiates a fresh in-process test recorder
+//! and binds it to the current thread via [`metrics::set_default_local_recorder`].
+//! The returned [`MetricSnapshot`] owns the resulting `LocalRecorderGuard` and
+//! a reference to the recorder. When the snapshot drops, the guard releases
+//! the thread-local binding (restoring whatever recorder was previously in
+//! scope).
 //!
 //! Every `#[test]` function gets a private recorder. Cargo runs tests on
 //! separate threads by default, so two tests asserting on the same
@@ -49,6 +48,17 @@
 //! This trade avoids a self-referential struct with a manual
 //! `Box::from_raw` drop, which would require `unsafe` and careful
 //! drop-order auditing for a purely test-side helper.
+//!
+//! The recorder is a hand-rolled string-keyed `HashMap` per metric kind —
+//! deliberately not the upstream `metrics-util` `DebuggingRecorder`. The
+//! upstream recorder shards storage by `available_parallelism().next_power_of_two()`
+//! and surfaced an environment-dependent dedup loss in CI under PR #54
+//! (different shard counts on the GitHub Actions runner versus local
+//! WSL2). Rolling our own keeps the dedup logic on a single canonical
+//! `name{k=v,...}` string with sorted labels — no shards, no fixed-key
+//! AHash, no unsafe — so test outcomes are deterministic across
+//! environments. Production code still flows through `metrics-rs` →
+//! `metrics-exporter-prometheus`; this only owns the test path.
 //!
 //! # Parallel tests
 //!
@@ -85,19 +95,19 @@
 //!
 //! - Emissions during the overlap route to the **inner** recorder (the
 //!   most recently bound one), not the outer.
-//! - The **outer** snapshot's `Snapshotter` records nothing for the
-//!   overlap window, so its post-assert values under-report by the amount
-//!   emitted during the overlap.
+//! - The **outer** snapshot's reader records nothing for the overlap
+//!   window, so its post-assert values under-report by the amount emitted
+//!   during the overlap.
 //!
 //! Take one snapshot per test (or per discrete check) and let it drop
 //! before taking another.
 //!
 //! # Delta semantics
 //!
-//! `assert_delta(N)` reads the counter value from a fresh snapshot of the
-//! per-test `Snapshotter` and compares it to `N`. Because the recorder is
-//! brand-new when the snapshot is taken, its pre-state is empty, so the
-//! observed post-value *is* the delta:
+//! `assert_delta(N)` reads the counter value from the per-test recorder
+//! and compares it to `N`. Because the recorder is brand-new when the
+//! snapshot is taken, its pre-state is empty, so the observed post-value
+//! *is* the delta:
 //!
 //! - **Counter absent from post-snapshot** → delta 0 (never emitted).
 //!   `assert_delta(0)` passes; any other expectation panics.
@@ -106,16 +116,16 @@
 //! There is no "present-pre / absent-post" invariant to police — the pre
 //! state is always empty by construction, so the case cannot arise.
 //!
-//! **Counters and gauges are idempotent under repeat reads.**
-//! `Snapshotter::snapshot()` re-reads the underlying atomic value each
-//! time, so `snap.counter(n).assert_delta(N)` and
-//! `snap.gauge(n).assert_value(V)` can be called repeatedly on the same
-//! snapshot and will see the same result until new emissions land.
+//! **Counters and gauges are idempotent under repeat reads.** A snapshot
+//! re-reads the underlying atomic value each time, so
+//! `snap.counter(n).assert_delta(N)` and `snap.gauge(n).assert_value(V)`
+//! can be called repeatedly on the same snapshot and will see the same
+//! result until new emissions land.
 //!
-//! **Histograms DRAIN on snapshot.** `DebuggingRecorder` stores histogram
-//! observations in a buffer that is drained every time `Snapshotter::snapshot()`
-//! runs. Every `assert_observation_count*` call takes a fresh snapshot, so
-//! two successive `assert_observation_count*` calls on the same histogram
+//! **Histograms DRAIN on snapshot.** The recorder stores histogram
+//! observations in a buffer that is drained every time a snapshot is read.
+//! Every `assert_observation_count*` call takes a fresh snapshot, so two
+//! successive `assert_observation_count*` calls on the same histogram
 //! name+labels within one test will see the emitted observations on the
 //! first call and zero on the second. Assert each histogram name+labels
 //! combination at most once per snapshot; emit more observations and/or
@@ -195,16 +205,225 @@
     reason = "test-only assertion helper; intentional panics on mismatch are the contract"
 )]
 
-use metrics::LocalRecorderGuard;
-use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
-use metrics_util::{CompositeKey, MetricKind};
+use metrics::{
+    Counter, CounterFn, Gauge, GaugeFn, Histogram, HistogramFn, Key, KeyName, LocalRecorderGuard,
+    Metadata, Recorder, SharedString, Unit,
+};
+use std::collections::HashMap;
 use std::ops::RangeInclusive;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+
+// =============================================================================
+// In-process test recorder.
+// =============================================================================
+//
+// One `Mutex<HashMap>` per metric kind, keyed by a canonical `name{k=v,...}`
+// string with sorted labels. `register_*` does get-or-insert and clones an
+// `Arc` of the underlying storage into the returned handle, so two
+// registrations for the same logical key share one atomic / one observation
+// buffer. See module §"Isolation model" for why we don't use upstream
+// `DebuggingRecorder`.
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum MetricKind {
+    Counter,
+    Gauge,
+    Histogram,
+}
+
+struct CounterEntry {
+    name: String,
+    labels: Vec<(String, String)>,
+    value: Arc<AtomicU64>,
+}
+
+struct GaugeEntry {
+    name: String,
+    labels: Vec<(String, String)>,
+    // Stores `f64::to_bits` — atomic load/store/CAS over the bit pattern.
+    bits: Arc<AtomicU64>,
+}
+
+struct HistogramEntry {
+    name: String,
+    labels: Vec<(String, String)>,
+    observations: Arc<Mutex<Vec<f64>>>,
+}
+
+struct TestRecorder {
+    counters: Mutex<HashMap<String, CounterEntry>>,
+    gauges: Mutex<HashMap<String, GaugeEntry>>,
+    histograms: Mutex<HashMap<String, HistogramEntry>>,
+}
+
+impl TestRecorder {
+    fn new() -> Self {
+        Self {
+            counters: Mutex::new(HashMap::new()),
+            gauges: Mutex::new(HashMap::new()),
+            histograms: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+/// Build the canonical `name{k=v,...}` string for a `Key`. Labels are sorted
+/// so two calls with the same content produce identical reprs regardless of
+/// the order labels were emitted.
+fn canonicalize_key(key: &Key) -> (String, Vec<(String, String)>) {
+    let mut labels: Vec<(String, String)> = key
+        .labels()
+        .map(|l| (l.key().to_string(), l.value().to_string()))
+        .collect();
+    labels.sort();
+    let labels_str = labels
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    (format!("{}{{{}}}", key.name(), labels_str), labels)
+}
+
+impl Recorder for TestRecorder {
+    fn describe_counter(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {}
+    fn describe_gauge(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {}
+    fn describe_histogram(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {}
+
+    fn register_counter(&self, key: &Key, _metadata: &Metadata<'_>) -> Counter {
+        let (repr, labels) = canonicalize_key(key);
+        let mut map = self
+            .counters
+            .lock()
+            .expect("test recorder counters poisoned");
+        let entry = map.entry(repr).or_insert_with(|| CounterEntry {
+            name: key.name().to_string(),
+            labels,
+            value: Arc::new(AtomicU64::new(0)),
+        });
+        Counter::from_arc(Arc::new(TestCounter {
+            value: entry.value.clone(),
+        }))
+    }
+
+    fn register_gauge(&self, key: &Key, _metadata: &Metadata<'_>) -> Gauge {
+        let (repr, labels) = canonicalize_key(key);
+        let mut map = self.gauges.lock().expect("test recorder gauges poisoned");
+        let entry = map.entry(repr).or_insert_with(|| GaugeEntry {
+            name: key.name().to_string(),
+            labels,
+            bits: Arc::new(AtomicU64::new(0)),
+        });
+        Gauge::from_arc(Arc::new(TestGauge {
+            bits: entry.bits.clone(),
+        }))
+    }
+
+    fn register_histogram(&self, key: &Key, _metadata: &Metadata<'_>) -> Histogram {
+        let (repr, labels) = canonicalize_key(key);
+        let mut map = self
+            .histograms
+            .lock()
+            .expect("test recorder histograms poisoned");
+        let entry = map.entry(repr).or_insert_with(|| HistogramEntry {
+            name: key.name().to_string(),
+            labels,
+            observations: Arc::new(Mutex::new(Vec::new())),
+        });
+        Histogram::from_arc(Arc::new(TestHistogram {
+            observations: entry.observations.clone(),
+        }))
+    }
+}
+
+struct TestCounter {
+    value: Arc<AtomicU64>,
+}
+
+impl CounterFn for TestCounter {
+    fn increment(&self, value: u64) {
+        self.value.fetch_add(value, Ordering::SeqCst);
+    }
+    fn absolute(&self, value: u64) {
+        self.value.store(value, Ordering::SeqCst);
+    }
+}
+
+struct TestGauge {
+    bits: Arc<AtomicU64>,
+}
+
+impl GaugeFn for TestGauge {
+    fn increment(&self, value: f64) {
+        let mut cur = self.bits.load(Ordering::SeqCst);
+        loop {
+            let new = (f64::from_bits(cur) + value).to_bits();
+            match self
+                .bits
+                .compare_exchange_weak(cur, new, Ordering::SeqCst, Ordering::SeqCst)
+            {
+                Ok(_) => return,
+                Err(observed) => cur = observed,
+            }
+        }
+    }
+    fn decrement(&self, value: f64) {
+        let mut cur = self.bits.load(Ordering::SeqCst);
+        loop {
+            let new = (f64::from_bits(cur) - value).to_bits();
+            match self
+                .bits
+                .compare_exchange_weak(cur, new, Ordering::SeqCst, Ordering::SeqCst)
+            {
+                Ok(_) => return,
+                Err(observed) => cur = observed,
+            }
+        }
+    }
+    fn set(&self, value: f64) {
+        self.bits.store(value.to_bits(), Ordering::SeqCst);
+    }
+}
+
+struct TestHistogram {
+    observations: Arc<Mutex<Vec<f64>>>,
+}
+
+impl HistogramFn for TestHistogram {
+    fn record(&self, value: f64) {
+        self.observations
+            .lock()
+            .expect("test recorder histogram observations poisoned")
+            .push(value);
+    }
+}
+
+// =============================================================================
+// Snapshot entries.
+// =============================================================================
+
+#[derive(Debug)]
+enum EntryValue {
+    Counter(u64),
+    Gauge(f64),
+    Histogram(Vec<f64>),
+}
+
+#[derive(Debug)]
+struct EntryKey {
+    kind: MetricKind,
+    name: String,
+    labels: Vec<(String, String)>,
+}
+
+// =============================================================================
+// Public API
+// =============================================================================
 
 /// Namespace for constructing [`MetricSnapshot`] instances.
 pub struct MetricAssertion;
 
 impl MetricAssertion {
-    /// Bind a fresh `DebuggingRecorder` to the current thread and return a
+    /// Bind a fresh test recorder to the current thread and return a
     /// [`MetricSnapshot`] that captures every metric emission on this thread
     /// until the snapshot is dropped.
     ///
@@ -213,26 +432,18 @@ impl MetricAssertion {
     /// [`MetricSnapshot::histogram`] read from this thread's per-snapshot
     /// recorder, not any process-global one.
     pub fn snapshot() -> MetricSnapshot {
-        // Leak the recorder so `LocalRecorderGuard<'static>` can hold a
-        // stable reference for the life of the snapshot. The allocation is
-        // bounded by the number of `snapshot()` calls per test process
-        // (kilobytes over a full CI run) and is reclaimed by the OS at
-        // process exit. See module docs §"Isolation model" for the
-        // rationale behind preferring the leak over a self-referential
-        // struct with `unsafe { Box::from_raw }` in `Drop`.
-        let recorder: &'static DebuggingRecorder = Box::leak(Box::new(DebuggingRecorder::new()));
-        let snapshotter = recorder.snapshotter();
+        let recorder: &'static TestRecorder = Box::leak(Box::new(TestRecorder::new()));
         let guard = metrics::set_default_local_recorder(recorder);
         MetricSnapshot {
             _guard: guard,
-            snapshotter,
+            recorder,
         }
     }
 }
 
 /// A per-thread captured recorder binding. While this value is alive, all
-/// metric emissions on the current thread route through the owned
-/// `DebuggingRecorder`; on drop, the thread-local binding is released.
+/// metric emissions on the current thread route through the owned test
+/// recorder; on drop, the thread-local binding is released.
 ///
 /// **Not `Send`.** `LocalRecorderGuard` is `!Send`, so `MetricSnapshot` is
 /// `!Send` by derivation. Hold it in the test function's stack frame and
@@ -243,7 +454,7 @@ pub struct MetricSnapshot {
     // of clearing the thread-local recorder slot. The underscore silences
     // the dead-code lint.
     _guard: LocalRecorderGuard<'static>,
-    snapshotter: Snapshotter,
+    recorder: &'static TestRecorder,
 }
 
 impl MetricSnapshot {
@@ -274,17 +485,100 @@ impl MetricSnapshot {
         }
     }
 
-    /// Flatten a fresh snapshot from the per-test `Snapshotter` into an owned
-    /// `Vec` of (key, value) pairs. Called by each assertion just before it
-    /// checks its expectation.
-    fn take_entries(&self) -> Vec<(CompositeKey, DebugValue)> {
-        self.snapshotter
-            .snapshot()
-            .into_vec()
-            .into_iter()
-            .map(|(ck, _unit, _desc, value)| (ck, value))
-            .collect()
+    /// Read every entry from the per-test recorder. Counters and gauges are
+    /// loaded non-destructively; histograms are drained (see module doc
+    /// §"Histograms DRAIN on snapshot").
+    fn take_entries(&self) -> Vec<(EntryKey, EntryValue)> {
+        let mut out = Vec::new();
+
+        {
+            let map = self
+                .recorder
+                .counters
+                .lock()
+                .expect("test recorder counters poisoned");
+            for entry in map.values() {
+                let v = entry.value.load(Ordering::SeqCst);
+                out.push((
+                    EntryKey {
+                        kind: MetricKind::Counter,
+                        name: entry.name.clone(),
+                        labels: entry.labels.clone(),
+                    },
+                    EntryValue::Counter(v),
+                ));
+            }
+        }
+
+        {
+            let map = self
+                .recorder
+                .gauges
+                .lock()
+                .expect("test recorder gauges poisoned");
+            for entry in map.values() {
+                let v = f64::from_bits(entry.bits.load(Ordering::SeqCst));
+                out.push((
+                    EntryKey {
+                        kind: MetricKind::Gauge,
+                        name: entry.name.clone(),
+                        labels: entry.labels.clone(),
+                    },
+                    EntryValue::Gauge(v),
+                ));
+            }
+        }
+
+        {
+            let map = self
+                .recorder
+                .histograms
+                .lock()
+                .expect("test recorder histograms poisoned");
+            for entry in map.values() {
+                let mut obs = entry
+                    .observations
+                    .lock()
+                    .expect("test recorder histogram observations poisoned");
+                let drained: Vec<f64> = obs.drain(..).collect();
+                out.push((
+                    EntryKey {
+                        kind: MetricKind::Histogram,
+                        name: entry.name.clone(),
+                        labels: entry.labels.clone(),
+                    },
+                    EntryValue::Histogram(drained),
+                ));
+            }
+        }
+
+        out
     }
+}
+
+/// Print all entries with `name` to stderr — used by assertion methods on
+/// failure to give richer diagnostic context than the bare `expected/got`.
+fn dump_failure_context(
+    entries: &[(EntryKey, EntryValue)],
+    name: &str,
+    filter_labels: &[LabelFilter],
+) {
+    eprintln!("=== metric assertion failure on '{name}' (filter: {filter_labels:?}) ===");
+    let mut matched = 0usize;
+    for (ek, value) in entries {
+        if ek.name == name {
+            eprintln!(
+                "  {:?} {} labels={:?} = {:?}",
+                ek.kind, ek.name, ek.labels, value
+            );
+            matched += 1;
+        }
+    }
+    eprintln!(
+        "=== ({} entries with this name; {} entries total in snapshot) ===",
+        matched,
+        entries.len()
+    );
 }
 
 // =============================================================================
@@ -306,25 +600,24 @@ impl LabelFilter {
     }
 }
 
-/// Does `key`'s labels contain every (k, v) in `filter` (subset match)?
-fn labels_match(key: &metrics::Key, filter: &[LabelFilter]) -> bool {
+/// Does `entry_labels` contain every (k, v) in `filter` (subset match)?
+fn labels_match(entry_labels: &[(String, String)], filter: &[LabelFilter]) -> bool {
     filter.iter().all(|lf| {
-        key.labels()
-            .any(|label| label.key() == lf.key && label.value() == lf.value)
+        entry_labels
+            .iter()
+            .any(|(k, v)| k == &lf.key && v == &lf.value)
     })
 }
 
 fn find_of_kind<'a>(
-    entries: &'a [(CompositeKey, DebugValue)],
+    entries: &'a [(EntryKey, EntryValue)],
     kind: MetricKind,
     name: &str,
     filter: &[LabelFilter],
-) -> Option<&'a DebugValue> {
+) -> Option<&'a EntryValue> {
     entries
         .iter()
-        .find(|(ck, _)| {
-            ck.kind() == kind && ck.key().name() == name && labels_match(ck.key(), filter)
-        })
+        .find(|(ek, _)| ek.kind == kind && ek.name == name && labels_match(&ek.labels, filter))
         .map(|(_, v)| v)
 }
 
@@ -341,20 +634,20 @@ fn kind_name(kind: MetricKind) -> &'static str {
 /// observed. Prefers an actionable "metric X is a histogram, not a counter"
 /// diagnostic over a silent "value 0" failure.
 fn ensure_no_kind_mismatch(
-    entries: &[(CompositeKey, DebugValue)],
+    entries: &[(EntryKey, EntryValue)],
     name: &str,
     expected_kind: MetricKind,
 ) {
     let expected_present = entries
         .iter()
-        .any(|(ck, _)| ck.key().name() == name && ck.kind() == expected_kind);
+        .any(|(ek, _)| ek.name == name && ek.kind == expected_kind);
     if expected_present {
         return;
     }
     let wrong_kind = entries
         .iter()
-        .find(|(ck, _)| ck.key().name() == name && ck.kind() != expected_kind)
-        .map(|(ck, _)| ck.kind());
+        .find(|(ek, _)| ek.name == name && ek.kind != expected_kind)
+        .map(|(ek, _)| ek.kind);
     if let Some(actual) = wrong_kind {
         panic!(
             "metric '{name}' was recorded as {}, not {} — use .{}(\"{name}\") instead",
@@ -403,6 +696,9 @@ impl CounterQuery<'_> {
         ensure_no_kind_mismatch(&entries, name, MetricKind::Counter);
 
         let actual = counter_value(&entries, name, &labels).unwrap_or(0);
+        if actual != expected {
+            dump_failure_context(&entries, name, &labels);
+        }
         assert_eq!(
             actual, expected,
             "counter '{name}' with labels {labels:?}: expected delta {expected}, got {actual}"
@@ -441,12 +737,12 @@ impl CounterQuery<'_> {
 }
 
 fn counter_value(
-    entries: &[(CompositeKey, DebugValue)],
+    entries: &[(EntryKey, EntryValue)],
     name: &str,
     filter: &[LabelFilter],
 ) -> Option<u64> {
     match find_of_kind(entries, MetricKind::Counter, name, filter)? {
-        DebugValue::Counter(n) => Some(*n),
+        EntryValue::Counter(n) => Some(*n),
         _ => None,
     }
 }
@@ -533,12 +829,12 @@ impl GaugeQuery<'_> {
 }
 
 fn gauge_value(
-    entries: &[(CompositeKey, DebugValue)],
+    entries: &[(EntryKey, EntryValue)],
     name: &str,
     filter: &[LabelFilter],
 ) -> Option<f64> {
     match find_of_kind(entries, MetricKind::Gauge, name, filter)? {
-        DebugValue::Gauge(ord) => Some((*ord).into_inner()),
+        EntryValue::Gauge(v) => Some(*v),
         _ => None,
     }
 }
@@ -573,6 +869,9 @@ impl HistogramQuery<'_> {
         let entries = snapshot.take_entries();
         ensure_no_kind_mismatch(&entries, name, MetricKind::Histogram);
         let count = histogram_count(&entries, name, &labels);
+        if count != expected {
+            dump_failure_context(&entries, name, &labels);
+        }
         assert_eq!(
             count, expected,
             "histogram '{name}' with labels {labels:?}: expected {expected} observations, got {count}"
@@ -592,6 +891,9 @@ impl HistogramQuery<'_> {
         let entries = snapshot.take_entries();
         ensure_no_kind_mismatch(&entries, name, MetricKind::Histogram);
         let count = histogram_count(&entries, name, &labels);
+        if count < expected {
+            dump_failure_context(&entries, name, &labels);
+        }
         assert!(
             count >= expected,
             "histogram '{name}' with labels {labels:?}: expected at least {expected} observations, got {count}"
@@ -639,19 +941,17 @@ impl HistogramQuery<'_> {
 }
 
 fn histogram_count(
-    entries: &[(CompositeKey, DebugValue)],
+    entries: &[(EntryKey, EntryValue)],
     name: &str,
     filter: &[LabelFilter],
 ) -> usize {
     entries
         .iter()
-        .filter(|(ck, _)| {
-            ck.kind() == MetricKind::Histogram
-                && ck.key().name() == name
-                && labels_match(ck.key(), filter)
+        .filter(|(ek, _)| {
+            ek.kind == MetricKind::Histogram && ek.name == name && labels_match(&ek.labels, filter)
         })
         .map(|(_, v)| match v {
-            DebugValue::Histogram(obs) => obs.len(),
+            EntryValue::Histogram(obs) => obs.len(),
             _ => 0,
         })
         .sum()
@@ -667,7 +967,7 @@ mod tests {
     use metrics::{counter, gauge, histogram};
 
     // Each test takes its own MetricSnapshot, which binds a fresh
-    // DebuggingRecorder to this thread for the snapshot's lifetime. Cargo
+    // TestRecorder to this thread for the snapshot's lifetime. Cargo
     // runs #[test] fns on separate threads, so tests are parallel-safe
     // without #[serial] attributes and without name-uniqueness helpers.
 
@@ -815,6 +1115,21 @@ mod tests {
         t2.join().unwrap();
     }
 
+    // Two `register_counter` calls for the same key (e.g., two `counter!()`
+    // macro invocations) must dedupe to a single underlying atomic, so two
+    // `.increment(1)` calls accumulate to 2. This is the exact failure mode
+    // that motivated rolling our own recorder under PR #54: upstream
+    // `metrics-util 0.18` `DebuggingRecorder` lost one increment in CI.
+    #[test]
+    fn same_key_registered_twice_accumulates_increments() {
+        let snap = MetricAssertion::snapshot();
+        counter!("testing_counter_repeat_register", "action" => "go").increment(1);
+        counter!("testing_counter_repeat_register", "action" => "go").increment(1);
+        snap.counter("testing_counter_repeat_register")
+            .with_labels(&[("action", "go")])
+            .assert_delta(2);
+    }
+
     // -------------------------------------------------------------------------
     // assert_unobserved — counter / gauge / histogram (ADR-0032 Step 4)
     // -------------------------------------------------------------------------
@@ -956,13 +1271,13 @@ mod tests {
     }
 
     // Kind-mismatch hardening on the negative-assertion path. Parallel to the
-    // existing `mismatched_metric_kind_*_panics_clearly` tests at lines
-    // 720-733 which prove `ensure_no_kind_mismatch` works for `assert_delta`/
-    // `assert_value`. These three prove the same hardening applies for
-    // `assert_unobserved` — the load-bearing distinction over
-    // `assert_delta(0)` / `assert_observation_count(0)` per @test reviewer.
-    // Without these, a `counter!("foo")` accidentally emitted under a metric
-    // catalogued as a histogram would silently pass `histogram("foo").
+    // existing `mismatched_metric_kind_*_panics_clearly` tests which prove
+    // `ensure_no_kind_mismatch` works for `assert_delta` / `assert_value`.
+    // These three prove the same hardening applies for `assert_unobserved` —
+    // the load-bearing distinction over `assert_delta(0)` /
+    // `assert_observation_count(0)` per @test reviewer. Without these, a
+    // `counter!("foo")` accidentally emitted under a metric catalogued as a
+    // histogram would silently pass `histogram("foo").
     // assert_observation_count(0)` and the regression would ship.
 
     #[test]
