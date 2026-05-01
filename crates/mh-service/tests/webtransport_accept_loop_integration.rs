@@ -44,7 +44,7 @@ use test_common::accept_loop_rig::AcceptLoopRig;
 use test_common::jwks_rig::JwksRig;
 use test_common::test_token_receiver;
 use test_common::tokens::{mint_expired_meeting_token, mint_meeting_token};
-use test_common::wt_client::{connect_and_open_bi, write_framed};
+use test_common::wt_client::{connect_and_open_bi, write_mh_connect};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -80,9 +80,9 @@ async fn connect_and_send_jwt(
     wtransport::stream::RecvStream,
 ) {
     let (conn, mut send, recv) = connect_and_open_bi(wt_url).await;
-    write_framed(&mut send, token.as_bytes())
+    write_mh_connect(&mut send, token)
         .await
-        .expect("failed to write JWT frame");
+        .expect("failed to write MhClientMessage frame");
     (conn, send, recv)
 }
 

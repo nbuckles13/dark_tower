@@ -4,6 +4,8 @@
 //! self-signed server cert. This is a client-only relaxation; the server TLS
 //! code path is the production one (see `accept_loop_rig::AcceptLoopRig`).
 
+use prost::Message;
+use proto_gen::signaling::{mh_client_message, MhClientMessage, MhConnectRequest};
 use wtransport::{ClientConfig, Endpoint};
 
 /// Build a fresh wtransport client configured to trust self-signed certs.
@@ -47,4 +49,24 @@ pub async fn write_framed(
     frame.extend_from_slice(&len.to_be_bytes());
     frame.extend_from_slice(payload);
     send.write_all(&frame).await
+}
+
+/// Encode `MhClientMessage{ConnectRequest{join_token: jwt}}` and frame-write it.
+///
+/// This is the production wire format on MH's bidi accept path. Use this
+/// helper for positive-path tests; use [`write_framed`] directly for negative
+/// tests that need raw bytes (malformed envelopes, oversized payloads).
+pub async fn write_mh_connect(
+    send: &mut wtransport::stream::SendStream,
+    jwt: &str,
+) -> Result<(), wtransport::error::StreamWriteError> {
+    let envelope = MhClientMessage {
+        message: Some(mh_client_message::Message::ConnectRequest(
+            MhConnectRequest {
+                join_token: jwt.to_string(),
+            },
+        )),
+    };
+    let encoded = envelope.encode_to_vec();
+    write_framed(send, &encoded).await
 }

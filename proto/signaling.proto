@@ -299,6 +299,18 @@ message ClientMessage {
   }
 }
 
+// MH client→server connect envelope; first framed message on a new bidi stream.
+message MhConnectRequest {
+  string join_token = 1;  // Meeting JWT; same semantics as JoinRequest.join_token.
+}
+
+// Wrapper envelope for client→MH messages (parallel to ClientMessage for MC).
+message MhClientMessage {
+  oneof message {
+    MhConnectRequest connect_request = 1;
+  }
+}
+
 // Server to client message wrapper
 message ServerMessage {
   oneof message {
