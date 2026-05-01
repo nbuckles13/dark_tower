@@ -3,7 +3,7 @@
 **Service**: Media Handler (mh-service)
 **Owner**: SRE Team / Media Handler Service Owner
 **On-Call Rotation**: PagerDuty - Dark Tower MH Team
-**Last Updated**: 2026-04-17
+**Last Updated**: 2026-05-01
 
 ---
 
@@ -24,6 +24,8 @@
    - [Scenario 10: MH→MC Notification Failures](#scenario-10-mhmc-notification-failures)
    - [Scenario 11: Pod Restarting Frequently](#scenario-11-pod-restarting-frequently)
    - [Scenario 12: GC Heartbeat Latency](#scenario-12-gc-heartbeat-latency)
+   - [Scenario 13: RegisterMeeting Timeout — Clients Kicked](#scenario-13-registermeeting-timeout--clients-kicked)
+   - [Scenario 14: WebTransport Server Startup Failure](#scenario-14-webtransport-server-startup-failure)
 4. [Diagnostic Commands](#diagnostic-commands)
 5. [Recovery Procedures](#recovery-procedures)
 6. [Postmortem Template](#postmortem-template)
@@ -47,6 +49,8 @@ Incident severity follows the alert-severity taxonomy defined in
 - Any `warning` persisting > 2 hours with active user impact -> Upgrade to P1 + page
 - Any caller-type rejection spike with concurrent JWT failure spike -> Security Team notification, treat as P1
 - Multiple MH pods down (full regional MH outage) -> P1 with Infrastructure Team escalation
+- `rate(mh_register_meeting_timeouts_total[5m]) > 0.1` sustained for > 10m WITH concurrent JWT-validation failure spike (`rate(mh_jwt_validations_total{result="failure"}[5m])` non-trivial) -> Security investigation per Scenario 13 + Scenario 2
+- WebTransport server bind/listen failures fleet-wide (Scenario 14) -> P1 with Infrastructure Team escalation immediately
 
 ---
 
@@ -614,7 +618,7 @@ kubectl logs -n dark-tower -l app=mh-service --tail=200 | grep -iE "token|auth"
 - If MC is unhealthy: restore MC first (MC Team)
 - Once MC is healthy, fire-and-forget design means MH will naturally stop failing on new events; existing state drift resolves as participants reconnect or are garbage-collected by MC
 
-**Related Alerts**: `MHTokenRefreshFailures`, MC-side alerts (`MCHighMailboxDepthWarning`, `MCDown`).
+**Related Alerts**: `MHTokenRefreshFailures`, MC-side alerts (`MCHighMailboxDepthWarning`, `MCDown`); see also [MC Scenario 13: Unexpected MH Notifications](mc-incident-response.md#scenario-13-unexpected-mh-notifications) for the receiver-side view of the same RPC pair (notifications that did reach MC but reference unknown state).
 
 ---
 
@@ -654,6 +658,7 @@ kubectl rollout history deployment/mh-service -n dark-tower
 2. **OOMKilled** — increase memory limits, investigate leak
 3. **Panic on startup** — recent deploy introduced bug; rollback
 4. **Missing dependency at init** — e.g., can't reach GC or AC at startup
+5. **WebTransport server bind/listen/TLS-load failure** — pod never reaches Ready because the QUIC listener cannot start. Distinguishing signature: previous-pod logs show `webtransport::server::bind()` failing (TLS identity, bind address, UDP port). See [Scenario 14: WebTransport Server Startup Failure](#scenario-14-webtransport-server-startup-failure).
 
 **Recovery**:
 
@@ -666,7 +671,7 @@ kubectl patch deployment/mh-service -n dark-tower -p \
   '{"spec":{"template":{"spec":{"containers":[{"name":"mh-service","resources":{"limits":{"memory":"2Gi"}}}]}}}}'
 ```
 
-**Related Alerts**: `MHHighMemory`, `MHDown` (if all pods restart simultaneously).
+**Related Alerts**: `MHHighMemory`, `MHDown` (if all pods restart simultaneously); see [Scenario 14: WebTransport Server Startup Failure](#scenario-14-webtransport-server-startup-failure) for the bind/listen/TLS-load variant of this signal.
 
 ---
 
@@ -705,6 +710,188 @@ histogram_quantile(0.95, rate(gc_rpc_duration_seconds_bucket{method="SendLoadRep
 **Recovery**: Usually self-heals. Escalate only if sustained or escalating.
 
 **Related Alerts**: `MHGCHeartbeatFailureRate`, `MHHighRegistrationLatency`.
+
+---
+
+### Scenario 13: RegisterMeeting Timeout — Clients Kicked
+
+**Alert**: No alert today; surfaces in `mh_register_meeting_timeouts_total` and oncall reports of clients being disconnected shortly after WebTransport handshake.
+**Severity**: warning
+
+**Symptoms**:
+- `rate(mh_register_meeting_timeouts_total[5m])` non-zero — provisional WebTransport connections being kicked because `MC::RegisterMeeting` did not arrive within `MH_REGISTER_MEETING_TIMEOUT_SECONDS` (default 15s).
+- Receipt-side correlate: `mh_grpc_requests_total{method="register_meeting"}` rate dropping vs baseline, or its `status="error"` slice rising — this is the "MH-side success rate" view (see `docs/observability/metrics/mh-service.md` §RegisterMeeting Metrics; the dashboard panel is **MH Overview → "RegisterMeeting Receipts by Status"**).
+- MH logs at `warn` level: `"RegisterMeeting timeout expired, disconnecting client"` (target `mh.webtransport.connection`).
+- Clients disconnect ~15s after JWT validation succeeds; client-side retry against the same MH likely fails the same way until coordination is restored.
+- `mh_active_connections` gauge does NOT count provisional connections, so a sustained timeout rate may not move the active-conn dashboard panel.
+
+> **Note**: `mh_register_meeting_timeouts_total` starts at zero in production and is incremented only on a real provisional-kick. A non-zero `rate(...[5m])` is the actionable signal — the existence of the time series is not (mirrors the GC Sc 5 first-emission pattern).
+
+**Impact**: Subset of users unable to establish media sessions on this MH despite a valid JWT. **Active media sessions on this MH are unaffected** — they were promoted before the timeout. Severity is warning because (a) MH correctly enforces the timeout (this is the documented contract), (b) clients can usually fall back to other assigned MHs (active/active topology), and (c) the timeout is the security boundary that bounds stolen-JWT-against-unregistered-meeting exposure to ≤ `register_meeting_timeout_seconds`. **Do NOT treat raising this timeout as a mitigation** — see Recovery.
+
+> **Rollback awareness**: During a deliberate rollback of MH to a pre-RegisterMeeting build, **`mh_register_meeting_timeouts_total` stays flat at zero on the rolled-back pods** (old MH never knew about RegisterMeeting and so never sets up the provisional-accept window) — but clients connecting to those pods will report failures via [MC Scenario 11](mc-incident-response.md#scenario-11-media-connection-failures) because MC's `RegisterMeeting` retries are exhausting silently. If the metric is flat zero on some pods but the user impact is real, check `kubectl rollout history deployment/mh-service -n dark-tower` for an in-progress rollback before treating as an incident. See also [MC Scenario 12](mc-incident-response.md#scenario-12-registermeeting-coordination-failures) for the MC-side rollback-aware triage.
+
+**Immediate Response**:
+
+1. Confirm the timeout rate is non-trivial vs background noise:
+   ```promql
+   sum(rate(mh_register_meeting_timeouts_total[5m]))
+   /
+   clamp_min(sum(rate(mh_register_meeting_timeouts_total[1h])), 0.001)
+   ```
+   A 5m rate that is several multiples of the 1h baseline indicates an active incident rather than a steady-state low-rate sequencing race.
+2. Cross-check MC: this is the upstream symptom of MC failing to send `RegisterMeeting`. See [MC runbook Scenario 12: RegisterMeeting Coordination Failures](mc-incident-response.md#scenario-12-registermeeting-coordination-failures).
+3. Check MH→MC and MC→MH network reachability — if MC is healthy but cannot reach MH on the gRPC port, RegisterMeeting will never arrive at MH.
+
+**Root Cause Investigation**:
+
+```bash
+# Confirm provisional-kick rate from raw /metrics (counter increase since pod start)
+kubectl port-forward -n dark-tower deployment/mh-service 8080:8080 &
+curl -s http://localhost:8080/metrics | grep mh_register_meeting_timeouts_total
+# Cross-check receipt-side: how many RegisterMeeting RPCs is MH actually receiving?
+curl -s http://localhost:8080/metrics | grep 'mh_grpc_requests_total.*register_meeting'
+kill %1
+
+# Receipt-side rate by outcome (MC→MH RPC success/error from the MH receiver's view)
+sum by(status) (rate(mh_grpc_requests_total{method="register_meeting"}[5m]))
+
+# MH logs for the timeout warning (no JWT body — log line carries connection_id + meeting_id only)
+kubectl logs -n dark-tower -l app=mh-service --tail=500 \
+  | grep -i "RegisterMeeting timeout"
+
+# Configured timeout for this pod (don't run `kubectl exec ... -- env` — leaks service token)
+kubectl describe pod -n dark-tower -l app=mh-service \
+  | grep MH_REGISTER_MEETING_TIMEOUT_SECONDS
+
+# MC→MH gRPC reachability (run from MC pod, since MC is the originator of RegisterMeeting)
+kubectl exec -it deployment/mc-service -n dark-tower -- \
+  grpcurl -plaintext mh-service.dark-tower.svc.cluster.local:50051 list
+```
+
+**Common Root Causes**:
+
+1. **MC failing to send RegisterMeeting** — most common. MC RegisterMeeting trigger is exhausting retries (3 attempts, 1s/2s backoffs). See [MC Sc 12](mc-incident-response.md#scenario-12-registermeeting-coordination-failures).
+2. **MC→MH NetworkPolicy / firewall** — MC reaches MH for some endpoints but not the gRPC port. Infrastructure Team.
+3. **MC overloaded** — first-participant trigger is queued behind other work; the 1+2s retry budget elapses before the 15s MH-side window. See [MC Sc 1: High Mailbox Depth](mc-incident-response.md#scenario-1-high-mailbox-depth).
+4. **MC restarted mid-flight** — new MC instance re-runs registration; existing provisional connections were kicked before the restarted MC could re-send. Self-healing on client retry.
+5. **Client sequencing bug** — client connecting to an MH for a meeting GC has not yet assigned. `mh_active_connections` near zero with sustained timeout rate is the signal. Escalate to Client Team.
+
+**Recovery**:
+
+```bash
+# Restoration is on the MC side — MH itself is healthy by design when this fires.
+# 1. Triage MC RegisterMeeting health (MC runbook Sc 12).
+# 2. Once MC is delivering RegisterMeeting again, no MH action is needed:
+#    new client connections will be promoted normally; affected users
+#    re-establish via active/active fallback to other assigned MHs.
+# 3. Monitor for resolution
+kubectl port-forward -n dark-tower deployment/mh-service 8080:8080 &
+watch -n 15 'curl -s http://localhost:8080/metrics | grep mh_register_meeting_timeouts_total'
+kill %1
+```
+
+Expected recovery time: bounded by MC-side fix (see MC Sc 12). Once MC starts delivering RegisterMeeting again, the MH-side timeout rate drops to zero within the next provisional-accept window (~15s); affected clients reconnect on their own retry timer (typically 1-5s), so end-to-end user recovery is 30-60s after MC is restored.
+
+**Rollback nuance**: If you are mid-deploy and considering rolling MH back to a pre-RegisterMeeting build to mitigate, **clients are NOT stranded**. Old MH does not understand `RegisterMeeting`, so MC will exhaust retries and log them — but JWT validation still works at the old MH and clients connect normally. The active/active topology means clients fall back to remaining MHs even if one is on the old build. Coordinate with MC team before rollback so they can suppress retry-storm noise.
+
+**Do NOT raise `MH_REGISTER_MEETING_TIMEOUT_SECONDS` as a mitigation.** The 15s default is the authorization boundary that bounds stolen-JWT-against-unregistered-meeting exposure. Sustained timeouts are a coordination problem; widening the window only increases the security blast radius. If you find yourself wanting to tune this, escalate to Security Team for review — do not patch.
+
+**Related Alerts**: MC-side `MCMediaConnectionAllFailed` (clients reporting all MHs failed when this is fleet-wide), `MCHighMailboxDepthWarning` / `MCHighMailboxDepthCritical` (upstream cause if MC trigger is queued).
+
+**Dashboards**: MH Overview → "RegisterMeeting Timeouts (R-26)" (this scenario's headline metric); MH Overview → "RegisterMeeting Receipts by Status" (receipt-side correlate); MC Overview → "RegisterMeeting RPC Rate by Status" + "RegisterMeeting RPC Latency (P50/P95/P99)" (sender-side correlate).
+
+---
+
+### Scenario 14: WebTransport Server Startup Failure
+
+**Alert**: `MHDown` (firing because pod cannot become Ready) and/or `MHPodRestartingFrequently`. Distinct from runtime per-connection rejections (Scenario 5) — pod cannot bind the QUIC listener at boot, so no client traffic is accepted at all.
+**Severity**: page
+
+**Symptoms**:
+- Pod in `CrashLoopBackOff` with the previous-pod logs showing one of:
+  - `"Invalid WebTransport bind address"` — emitted from `webtransport::server::bind()` when `MH_WEBTRANSPORT_BIND_ADDRESS` does not parse as a `SocketAddr`.
+  - `"Failed to load TLS certificate"` — emitted when the cert/key Secret is missing, unreadable, or malformed; the underlying error appears in the structured `error` field on the same log line.
+  - `"Failed to create WebTransport endpoint"` — emitted when the QUIC endpoint cannot bind. The OS-level cause (`Address already in use`, permission denied, UDP unavailable) is in the `error` field of this log line, not in the top-level message.
+- Readiness probe never succeeds; new pods do not register with GC.
+- `mh_webtransport_connections_total` stays flat at zero (no traffic ever reaches the pod).
+- `kubectl get pods` shows `0/1 Ready` for the affected pod.
+
+**Impact**: Affected MH pod accepts no client traffic. If the failure is fleet-wide (deploy regression, bad config), this is a full MH outage — escalates to `MHDown` and meeting joins lose their media path.
+
+**Immediate Response**:
+
+1. Confirm scope — single pod vs all pods:
+   ```bash
+   kubectl get pods -n dark-tower -l app=mh-service
+   ```
+2. Capture previous-pod logs before they're rotated by the next restart:
+   ```bash
+   kubectl logs -n dark-tower <pod> --previous --tail=300 \
+     | grep -iE "bind|listen|tls|quic|certificate|webtransport"
+   ```
+3. If fleet-wide and recent deploy is the trigger, prepare rollback (see Recovery).
+4. Notify MC team — meeting assignments to this MH need to be redirected (GC will mark unhealthy on registration timeout, but explicit notification shortens MTTR).
+
+**Root Cause Investigation**:
+
+```bash
+# Pod events for bind / cert / scheduling errors
+kubectl describe pod <pod> -n dark-tower | tail -50
+
+# Configured bind address (default 0.0.0.0:4434) — inspect via describe, NOT `exec env`
+kubectl describe pod -n dark-tower -l app=mh-service \
+  | grep -E "MH_WEBTRANSPORT_BIND_ADDRESS|webtransport"
+
+# TLS secret exists and is mountable
+kubectl get secret -n dark-tower mh-service-tls -o yaml \
+  | grep -E "tls.crt|tls.key" | head -4
+
+# Certificate validity (run only when TLS load is the suspected cause; do not paste bodies)
+kubectl exec -it deployment/mh-service -n dark-tower -- \
+  openssl x509 -in /certs/tls.crt -noout -dates -subject 2>/dev/null \
+  || echo "Pod not running — inspect cert via secret directly"
+
+# Service definition exposes UDP/4434
+kubectl get svc -n dark-tower mh-service -o yaml | grep -A3 "port:"
+
+# NetworkPolicy / cloud firewall allows UDP ingress on 4434
+kubectl describe networkpolicy mh-service -n dark-tower
+```
+
+**Common Root Causes**:
+
+1. **TLS identity load failure** — cert-manager Secret missing, malformed, or unreadable. Logs show `"Failed to load TLS certificate"` from `webtransport::server::bind()` with the underlying cause in the `error` field.
+2. **Bind address misconfigured** — `MH_WEBTRANSPORT_BIND_ADDRESS` not parseable as `SocketAddr`. Logs show `"Invalid WebTransport bind address"`.
+3. **UDP port already in use** — host networking conflict or another container holding `:4434`. Logs show `"Failed to create WebTransport endpoint"` with `error` field containing `"Address already in use"`.
+4. **Insufficient capabilities** — pod cannot bind UDP socket (e.g., privileged-port restriction, seccomp denial). Logs show permission errors.
+5. **Bad deploy** — recent rollout changed the image, config, or volume mounts and broke the bind path. `kubectl rollout history` shows a recent revision.
+
+**Recovery**:
+
+```bash
+# Option A: Rollback (recent bad deploy)
+kubectl rollout history deployment/mh-service -n dark-tower
+kubectl rollout undo deployment/mh-service -n dark-tower
+kubectl rollout status deployment/mh-service -n dark-tower
+
+# Option B: Recreate TLS secret (cert-manager Issuer flap, malformed renewal)
+kubectl delete secret mh-service-tls -n dark-tower
+# cert-manager re-issues; pods will restart and pick up the new secret.
+kubectl rollout restart deployment/mh-service -n dark-tower
+
+# Option C: Fix bind address (config/ConfigMap regression)
+kubectl edit configmap mh-service -n dark-tower
+# Then:
+kubectl rollout restart deployment/mh-service -n dark-tower
+
+# Option D: Single-pod port collision (rare; reschedule the pod)
+kubectl delete pod <pod> -n dark-tower
+```
+
+Expected recovery time: 1-3 minutes for rollback; cert-manager re-issuance can take 1-2 minutes longer for the new Secret. UDP-port-collision reschedule is 30-60s. Bind-address ConfigMap fix + rolling restart is 2-3 minutes.
+
+**Related Alerts**: `MHDown`, `MHPodRestartingFrequently`, `MHHighRegistrationLatency` (downstream — registration cannot complete until WebTransport server is up and pod is Ready).
 
 ---
 
