@@ -650,7 +650,7 @@ Phase 6 (after dashboards):
 | 15 | MC: join + coordination tests | `docs/devloop-outputs/2026-04-17-mc-join-coordination-tests/` | `12c7628` | Completed |
 | 16 | Env-tests: MH connection E2E | | | Pending |
 | 17 | MH + MC runbooks | | | Pending |
-| 18 | Post-deploy monitoring checklist | | | Pending |
+| 18 | Post-deploy monitoring checklist | `docs/devloop-outputs/2026-05-01-mh-quic-post-deploy-checklist/` | (this commit) | Completed |
 
 ---
 
