@@ -66,6 +66,18 @@ Host
 
 **Invariant**: The helper binary is built from and launched via `$REPO_ROOT/target/release/devloop-helper`. Claude's modifications inside the dev container (at `$CLONE_DIR/work`) cannot alter the helper binary — it is compiled from the source repo on the host.
 
+**Build-context trichotomy**: Three distinct path-roots, each protecting a different concern:
+
+| Layer | Path | Purpose |
+|---|---|---|
+| Helper *binary source* | `REPO_ROOT` | Security: container cannot tamper. Used by `build_helper()` (`cargo build --manifest-path $REPO_ROOT/Cargo.toml`). |
+| Helper *runtime project-root* | `CLONE_DIR` | Function: service builds, kind-config, setup.sh must reflect the devloop's branch state. Passed as `--project-root` arg to the helper at launch; consumed as `ctx.project_root` in `cmd_setup` / `cmd_rebuild` / `cmd_deploy`. |
+| Pod runtime | container fs | Sandboxed; no host access. |
+
+The runtime project-root determines where `podman build` looks for source, where `setup.sh` reads manifests from, and where the kind-config template is read from. Setting it to `REPO_ROOT` (the original implementation, fixed 2026-05-01) caused service rebuilds to silently produce stale images: `/work` inside the dev container is mounted from `CLONE_DIR`, so edits made by Claude landed there — but `podman build` ran against `REPO_ROOT` and saw whatever was last committed to the user's main checkout. Builds full-cache-hit and looked successful in <3s; the rebuilt image was byte-identical to whatever was last built. The fix is `--project-root "$CLONE_DIR"` in `devloop.sh`'s helper launch, with the clone-creation step hoisted to run before `launch_helper` so `CLONE_DIR` always exists when the helper starts.
+
+The trichotomy is the load-bearing safety property: pointing the helper's *runtime* commands at a container-writable path is *correct* because that's what the user is editing; pinning the helper *binary* to a container-immutable path is what blocks the otherwise-obvious tamper attack (edit `crates/devloop-helper/src/`, exit, re-run, persistent host-side compromise).
+
 **Lifecycle**:
 - `devloop.sh` builds the helper (`cargo build --release -p devloop-helper`) on first use, caches the binary
 - Launched as a background process with PID file at `/tmp/devloop-{slug}/helper.pid`
