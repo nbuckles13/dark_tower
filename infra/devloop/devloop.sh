@@ -228,8 +228,16 @@ launch_helper() {
         echo "Stale helper PID file found, will relaunch..."
     fi
 
-    # Launch helper binary as a background process
-    local helper_args=("$TASK_SLUG" --project-root "$REPO_ROOT")
+    # Launch helper binary as a background process.
+    #
+    # --project-root points at CLONE_DIR (NOT REPO_ROOT) so service rebuilds,
+    # setup.sh, and kind-config generation reflect the devloop's branch state
+    # — `/work` inside the dev container is mounted from CLONE_DIR, so this
+    # is what edits land in. The helper *binary* is still compiled from
+    # REPO_ROOT (see build_helper above) — that pin is what protects the
+    # binary from container tampering. See ADR-0030 §"Build-context
+    # trichotomy" for the full security model.
+    local helper_args=("$TASK_SLUG" --project-root "$CLONE_DIR")
     if [ -n "${HOST_GATEWAY_IP:-}" ]; then
         helper_args+=(--host-gateway-ip "$HOST_GATEWAY_IP")
     fi
@@ -335,6 +343,40 @@ is_container_running() {
     podman ps --format "{{.Names}}" 2>/dev/null | grep -q "^${1}$"
 }
 
+# Ensure the per-devloop git clone exists at $CLONE_DIR.
+#
+# Must run BEFORE launch_helper because the helper's --project-root points
+# at $CLONE_DIR (so service rebuilds and setup.sh see the devloop's branch
+# state, not the user's main checkout). Idempotent: no-ops if the clone
+# already exists.
+ensure_clone() {
+    if [ -d "$CLONE_DIR" ]; then
+        echo "Clone already exists: ${CLONE_DIR}"
+        return 0
+    fi
+
+    # Ensure the branch exists locally before cloning.
+    # If it only exists on the remote (e.g., PR iteration), fetch it first.
+    if ! git show-ref --verify --quiet "refs/heads/${BRANCH_NAME}"; then
+        if git ls-remote --exit-code --heads "$GITHUB_REMOTE" "$BRANCH_NAME" &>/dev/null; then
+            echo "Fetching remote branch: ${BRANCH_NAME}"
+            git fetch "$GITHUB_REMOTE" "${BRANCH_NAME}:${BRANCH_NAME}"
+        fi
+    fi
+
+    echo "Creating local clone: ${CLONE_DIR}"
+    if git show-ref --verify --quiet "refs/heads/${BRANCH_NAME}"; then
+        # Branch exists — clone with it
+        git clone --local --branch "$BRANCH_NAME" "$REPO_ROOT" "$CLONE_DIR"
+    else
+        # Fresh start — clone base branch, create the feature branch
+        git clone --local --branch "$BASE_BRANCH" "$REPO_ROOT" "$CLONE_DIR"
+        git -C "$CLONE_DIR" checkout -b "$BRANCH_NAME"
+    fi
+    # Point origin at GitHub (not the local repo)
+    git -C "$CLONE_DIR" remote set-url origin "$GITHUB_REMOTE"
+}
+
 # ─── Validate Prerequisites ─────────────────────────────────────
 
 if ! command -v podman &>/dev/null; then
@@ -372,6 +414,11 @@ if $REBUILD_IMAGE || ! podman image exists "$IMAGE"; then
 fi
 
 # ─── Helper setup (ADR-0030/0031) ─────────────────────────────
+
+# Ensure the devloop's git clone exists BEFORE launching the helper.
+# The helper's --project-root points at CLONE_DIR, so the clone has to
+# exist when the helper starts (see ADR-0030 §"Build-context trichotomy").
+ensure_clone
 
 # Build and launch the host-side cluster helper if kind is available.
 # Without kind, devloop.sh works exactly as before (compile/test only, no cluster).
@@ -425,35 +472,9 @@ if $RECREATE; then
 fi
 
 if ! is_container_running "$DEV_CONTAINER"; then
-    echo "=== Setting up clone and containers for: ${TASK_SLUG} ==="
+    echo "=== Setting up containers for: ${TASK_SLUG} ==="
 
-    # Create local clone if it doesn't exist.
-    # Uses --local for hardlinked objects (fast, space-efficient).
-    # The clone is fully self-contained — no external .git references.
-    if [ ! -d "$CLONE_DIR" ]; then
-        # Ensure the branch exists locally before cloning.
-        # If it only exists on the remote (e.g., PR iteration), fetch it first.
-        if ! git show-ref --verify --quiet "refs/heads/${BRANCH_NAME}"; then
-            if git ls-remote --exit-code --heads "$GITHUB_REMOTE" "$BRANCH_NAME" &>/dev/null; then
-                echo "Fetching remote branch: ${BRANCH_NAME}"
-                git fetch "$GITHUB_REMOTE" "${BRANCH_NAME}:${BRANCH_NAME}"
-            fi
-        fi
-
-        echo "Creating local clone: ${CLONE_DIR}"
-        if git show-ref --verify --quiet "refs/heads/${BRANCH_NAME}"; then
-            # Branch exists — clone with it
-            git clone --local --branch "$BRANCH_NAME" "$REPO_ROOT" "$CLONE_DIR"
-        else
-            # Fresh start — clone base branch, create the feature branch
-            git clone --local --branch "$BASE_BRANCH" "$REPO_ROOT" "$CLONE_DIR"
-            git -C "$CLONE_DIR" checkout -b "$BRANCH_NAME"
-        fi
-        # Point origin at GitHub (not the local repo)
-        git -C "$CLONE_DIR" remote set-url origin "$GITHUB_REMOTE"
-    else
-        echo "Clone already exists: ${CLONE_DIR}"
-    fi
+    # Clone is ensured earlier (before the helper launch) — see ensure_clone().
 
     # Clean up any stopped containers from a previous run
     podman rm -f "$DEV_CONTAINER" 2>/dev/null || true

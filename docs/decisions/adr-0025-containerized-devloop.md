@@ -51,6 +51,8 @@ Each task gets its own `git clone --local` (hardlinked objects, self-contained `
 - Clean separation between parallel tasks
 - No cross-directory `.git` references (unlike worktrees, which reference the main repo's `.git` directory and break inside containers)
 
+**Service image builds run from the clone, not the main checkout.** When the devloop helper rebuilds service images via `podman build` (or runs `setup.sh` for `cmd_setup`/`cmd_deploy`), it uses `CLONE_DIR` as the build context. This means edits made inside the dev container — which sees the clone as `/work` — flow into image rebuilds without committing or pushing first. See ADR-0030 §"Build-context trichotomy" for the security model that lets the helper's *runtime* commands point at a container-writable path while keeping the helper *binary* itself uncompromisable.
+
 ### 3. Credential Separation
 
 | Credential | Location | Exposed to Claude? |
