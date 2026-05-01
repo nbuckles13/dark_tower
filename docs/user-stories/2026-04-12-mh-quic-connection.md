@@ -648,7 +648,7 @@ Phase 6 (after dashboards):
 | 13 | MC: MH coordination dashboard + alerts | (PR #54: ADR-0031 alerts; MCMediaConnectionAllFailed) | covered across PR #54 | Completed |
 | 14 | MH: integration tests | `docs/devloop-outputs/2026-04-17-mh-integration-tests/` | `ea11db3` | Completed |
 | 15 | MC: join + coordination tests | `docs/devloop-outputs/2026-04-17-mc-join-coordination-tests/` | `12c7628` | Completed |
-| 16 | Env-tests: MH connection E2E | | | Pending |
+| 16 | Env-tests: MH connection E2E | `docs/devloop-outputs/2026-04-30-mh-quic-env-tests/` | (this commit) | Completed |
 | 17 | MH + MC runbooks | `docs/devloop-outputs/2026-05-01-mh-quic-runbooks/` | `605687c` | Completed |
 | 18 | Post-deploy monitoring checklist | `docs/devloop-outputs/2026-05-01-mh-quic-post-deploy-checklist/` | `cef394a` | Completed |
 

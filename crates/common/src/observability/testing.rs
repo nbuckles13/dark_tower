@@ -1,3 +1,8 @@
+// Test-utility module behind the `test-utils` feature. Mutex `.expect()` on
+// poisoned-lock is the appropriate fail-fast for a test recorder; doc prose
+// references "AHash" the crate by name without backticks.
+#![allow(clippy::expect_used, clippy::doc_markdown)]
+
 //! `MetricAssertion`: point-in-time metric-value assertions for component tests.
 //!
 //! This helper backs ADR-0032 §Tier B — a shared utility that lets component
