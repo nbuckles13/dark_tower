@@ -77,7 +77,7 @@ use test_common::test_token_receiver;
 use test_common::tokens::{
     mint_expired_meeting_token, mint_meeting_token, mint_wrong_token_type_token,
 };
-use test_common::wt_client::{connect_and_open_bi, write_framed};
+use test_common::wt_client::{connect_and_open_bi, write_framed, write_mh_connect};
 
 // ---------------------------------------------------------------------------
 // Rig builder
@@ -119,9 +119,9 @@ fn make_mc_client() -> Arc<McClient> {
     Arc::new(McClient::new(test_token_receiver()))
 }
 
-/// Open a WT bi-stream and write the supplied token as a length-prefixed
-/// frame. Returns the live connection + streams so the caller can control
-/// its own disconnect.
+/// Open a WT bi-stream and write the supplied token wrapped in the typed
+/// `MhClientMessage{ConnectRequest{join_token}}` envelope. Returns the live
+/// connection + streams so the caller can control its own disconnect.
 async fn connect_and_send_jwt(
     wt_url: &str,
     token: &str,
@@ -131,9 +131,9 @@ async fn connect_and_send_jwt(
     wtransport::stream::RecvStream,
 ) {
     let (conn, mut send, recv) = connect_and_open_bi(wt_url).await;
-    write_framed(&mut send, token.as_bytes())
+    write_mh_connect(&mut send, token)
         .await
-        .expect("failed to write JWT frame");
+        .expect("failed to write MhClientMessage frame");
     (conn, send, recv)
 }
 
@@ -234,6 +234,75 @@ async fn missing_jwt_stream_closed_before_write_rejects_connection() {
     // polling the MetricAssertion itself because the API is panic-only and
     // per-snapshot recorder binding breaks under repeated-snapshot patterns
     // (see common::observability::testing §"Invariants — nested snapshots").
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    snap.counter("mh_webtransport_connections_total")
+        .with_labels(&[("status", "error")])
+        .assert_delta(1);
+    snap.counter("mh_jwt_validations_total")
+        .with_labels(&[("result", "failure")])
+        .assert_delta(0);
+    snap.counter("mh_jwt_validations_total")
+        .with_labels(&[("result", "success")])
+        .assert_delta(0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn malformed_envelope_bytes_rejected_on_wt_accept_path() {
+    // The client sends a framed payload of garbage bytes that fails
+    // `MhClientMessage::decode`. Locks in the metric-shape contract for
+    // pre-validation decode failure: the accept_loop emits
+    // `mh_webtransport_connections_total{status=error}`, and `mh_jwt_validations_total`
+    // does NOT fire — no JWT was extracted, validation never ran. A future
+    // refactor that folds decode failure into the validation metric path will
+    // fail this test loudly.
+    let mc_client = make_mc_client();
+    let suite = WtSuite::start(Duration::from_secs(30), mc_client).await;
+
+    let snap = MetricAssertion::snapshot();
+    let (_conn, mut send, _recv) = connect_and_open_bi(&suite.wt.url).await;
+    write_framed(&mut send, &[0xFF, 0xFF, 0xFF, 0xFF, 0xFF])
+        .await
+        .expect("failed to write garbage frame");
+
+    // Bounded wait so the spawned handler observes the bytes, decode fails,
+    // returns Err, and accept_loop emits the error counter on spawn exit.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    snap.counter("mh_webtransport_connections_total")
+        .with_labels(&[("status", "error")])
+        .assert_delta(1);
+    snap.counter("mh_jwt_validations_total")
+        .with_labels(&[("result", "failure")])
+        .assert_delta(0);
+    snap.counter("mh_jwt_validations_total")
+        .with_labels(&[("result", "success")])
+        .assert_delta(0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn empty_envelope_oneof_rejected_on_wt_accept_path() {
+    // The client sends a well-formed `MhClientMessage` with `message: None`
+    // (no oneof variant set). Decode succeeds, but the handler's match arm on
+    // the `connect_request` variant fails. Same observable as the malformed
+    // bytes case: accept_loop emits `status=error`, no JWT-validations counter
+    // increment. Distinguishes "decode succeeded but no variant" from "decode
+    // failed" — both must close, neither emits validation counters.
+    use prost::Message;
+    use proto_gen::signaling::MhClientMessage;
+
+    let mc_client = make_mc_client();
+    let suite = WtSuite::start(Duration::from_secs(30), mc_client).await;
+
+    let snap = MetricAssertion::snapshot();
+    let envelope = MhClientMessage { message: None };
+    let encoded = envelope.encode_to_vec();
+
+    let (_conn, mut send, _recv) = connect_and_open_bi(&suite.wt.url).await;
+    write_framed(&mut send, &encoded)
+        .await
+        .expect("failed to write empty-oneof envelope");
+
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     snap.counter("mh_webtransport_connections_total")

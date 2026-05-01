@@ -17,6 +17,8 @@ use crate::grpc::McClient;
 use crate::observability::metrics;
 use crate::session::{ConnectionEntry, PendingConnection, SessionManagerHandle};
 
+use prost::Message;
+use proto_gen::signaling::{mh_client_message, MhClientMessage};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
@@ -170,16 +172,35 @@ pub async fn handle_connection(
         MhError::WebTransportError(format!("BiStream accept failed: {e}"))
     })?;
 
-    // Step 3: Read length-prefixed JWT from first message
-    let jwt_bytes = read_framed_message(&mut recv_stream).await?;
-    let token = String::from_utf8(jwt_bytes.to_vec()).map_err(|_| {
+    // Step 3: Read length-prefixed `MhClientMessage` (typed connect envelope)
+    let envelope_bytes = read_framed_message(&mut recv_stream).await?;
+    let envelope = MhClientMessage::decode(envelope_bytes.as_ref()).map_err(|e| {
         warn!(
             target: "mh.webtransport.connection",
             connection_id = %connection_id,
-            "JWT is not valid UTF-8"
+            error = %e,
+            "Failed to decode MhClientMessage envelope"
         );
-        MhError::JwtValidation("The access token is invalid or expired".to_string())
+        MhError::WebTransportError("Invalid connect message".to_string())
     })?;
+
+    // Decode failure, empty oneof, and unknown variant all collapse to a single
+    // generic client-facing error: in all three the JWT was never extracted, so
+    // validation never ran — splitting labels here would be a distinction without
+    // a difference for the accept_loop's status=error observable.
+    let token = match envelope.message {
+        Some(mh_client_message::Message::ConnectRequest(req)) => req.join_token,
+        None => {
+            warn!(
+                target: "mh.webtransport.connection",
+                connection_id = %connection_id,
+                "MhClientMessage carries no oneof variant"
+            );
+            return Err(MhError::WebTransportError(
+                "Invalid connect message".to_string(),
+            ));
+        }
+    };
 
     // Step 4: Validate meeting JWT
     let claims = match jwt_validator.validate_meeting_token(&token).await {

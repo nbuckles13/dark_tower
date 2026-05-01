@@ -41,9 +41,11 @@
 //!
 //! # Wire format
 //!
-//! MH expects the FIRST framed message on a bidi stream to be the **raw JWT
-//! bytes** (UTF-8), 4-byte big-endian length prefix. NOT a protobuf message.
-//! Source of truth: `crates/mh-service/src/webtransport/connection.rs:174-182`.
+//! MH expects the FIRST framed message on a bidi stream to be a typed
+//! `MhClientMessage{ConnectRequest{join_token: <JWT>}}` protobuf envelope,
+//! 4-byte big-endian length prefix + encoded bytes. Mirrors MC's
+//! `ClientMessage{JoinRequest{...}}` discipline. Source of truth:
+//! `crates/mh-service/src/webtransport/connection.rs` Step 3 region.
 
 #![cfg(feature = "flows")]
 
@@ -52,6 +54,7 @@ use env_tests::cluster::ClusterConnection;
 use env_tests::fixtures::auth_client::UserRegistrationRequest;
 use env_tests::fixtures::gc_client::{CreateMeetingRequest, GcClient, JoinMeetingResponse};
 use env_tests::fixtures::{AuthClient, PrometheusClient};
+use prost::Message;
 use std::time::Duration;
 use tokio::sync::OnceCell;
 
@@ -146,15 +149,30 @@ async fn connect_wt(url: &str) -> wtransport::Connection {
         .unwrap_or_else(|e| panic!("connect to WebTransport at {url} failed: {e}"))
 }
 
-/// Encode raw bytes as a length-prefixed frame (4-byte BE length + payload).
+/// Encode `jwt` as the typed `MhClientMessage{ConnectRequest{join_token}}`
+/// envelope and frame it (4-byte BE length + encoded payload).
 ///
-/// MH's wire format on the first message of the bidi stream — the payload is
-/// the raw JWT bytes (UTF-8), NOT a protobuf message.
-fn encode_jwt_frame(jwt: &[u8]) -> Vec<u8> {
-    let len = u32::try_from(jwt.len()).expect("JWT length must fit in u32");
-    let mut frame = BytesMut::with_capacity(4 + jwt.len());
+/// MH's wire format on the first message of the bidi stream is a typed
+/// protobuf envelope, mirroring MC's `ClientMessage{JoinRequest{...}}`.
+/// For negative tests that need to send malformed bytes (e.g., the oversized
+/// payload tests below), the bytes are wrapped in the same envelope and the
+/// validator/decoder observes the failure mode that's intended.
+fn encode_jwt_frame(jwt: &str) -> Vec<u8> {
+    use proto_gen::signaling::{mh_client_message, MhClientMessage, MhConnectRequest};
+
+    let envelope = MhClientMessage {
+        message: Some(mh_client_message::Message::ConnectRequest(
+            MhConnectRequest {
+                join_token: jwt.to_string(),
+            },
+        )),
+    };
+    let encoded = envelope.encode_to_vec();
+
+    let len = u32::try_from(encoded.len()).expect("encoded envelope length must fit in u32");
+    let mut frame = BytesMut::with_capacity(4 + encoded.len());
     frame.put_u32(len);
-    frame.put_slice(jwt);
+    frame.put_slice(&encoded);
     frame.to_vec()
 }
 
@@ -174,7 +192,7 @@ fn encode_jwt_frame(jwt: &[u8]) -> Vec<u8> {
 /// session causes the recv to error/finish, which is observable here.
 async fn send_jwt_on_bi_stream(
     conn: &wtransport::Connection,
-    jwt: &[u8],
+    jwt: &str,
 ) -> (
     wtransport::stream::SendStream,
     wtransport::stream::RecvStream,
@@ -219,7 +237,7 @@ fn jwt_preview(jwt: &[u8]) -> String {
 /// pass even if MH started accepting bad JWTs. Only `conn.closed()`
 /// distinguishes rejection (session terminated by MH) from acceptance
 /// (session held open for media frames).
-async fn assert_mh_rejects(mh_url: &str, jwt: &[u8]) {
+async fn assert_mh_rejects(mh_url: &str, jwt: &str) {
     let conn = connect_wt(mh_url).await;
     let (_send, _recv) = send_jwt_on_bi_stream(&conn, jwt).await;
 
@@ -229,7 +247,7 @@ async fn assert_mh_rejects(mh_url: &str, jwt: &[u8]) {
         close_outcome.is_ok(),
         "MH did not close the WebTransport session within 5s — JWT was \
          not rejected (jwt prefix: {})",
-        jwt_preview(jwt),
+        jwt_preview(jwt.as_bytes()),
     );
 }
 
@@ -516,7 +534,7 @@ async fn test_mh_accepts_valid_meeting_jwt() {
     .await;
 
     let conn = connect_wt(&mh_url).await;
-    let (_send, _recv) = send_jwt_on_bi_stream(&conn, jwt.as_bytes()).await;
+    let (_send, _recv) = send_jwt_on_bi_stream(&conn, &jwt).await;
 
     // Held-open invariant: `conn.closed()` resolves with the close reason
     // only after the WebTransport session terminates. If the session is
@@ -561,7 +579,7 @@ async fn test_mh_rejects_forged_jwt() {
         eyJzdWIiOiJhdHRhY2tlciIsIm1lZXRpbmdfaWQiOiJmYWtlIiwiZXhwIjo5OTk5OTk5OTk5fQ.\
         invalid_signature_that_will_not_verify";
 
-    assert_mh_rejects(&mh_url, forged.as_bytes()).await;
+    assert_mh_rejects(&mh_url, forged).await;
 }
 
 /// Test: MH rejects an oversized JWT (> `MAX_JWT_SIZE_BYTES` = 8192 in
@@ -590,7 +608,7 @@ async fn test_mh_rejects_oversized_jwt() {
 
     // Benign filler — explicitly NOT shaped like a real JWT (no dots, no
     // base64 header) so we don't normalize logging realistic-looking tokens.
-    let oversized = vec![b'A'; 9000];
+    let oversized = "A".repeat(9000);
     assert_mh_rejects(&mh_url, &oversized).await;
 }
 
@@ -636,7 +654,7 @@ async fn test_mh_connect_increments_mc_notification_metric_connected() {
     .await;
 
     let conn = connect_wt(&mh_url).await;
-    let (_send, _recv) = send_jwt_on_bi_stream(&conn, jwt.as_bytes()).await;
+    let (_send, _recv) = send_jwt_on_bi_stream(&conn, &jwt).await;
 
     // The connect notification fires from MH best-effort fire-and-forget after
     // JWT validation. The chain is MH spawn-task → gRPC to MC → MC counter →
@@ -681,7 +699,7 @@ async fn test_mh_disconnect_increments_mc_notification_metric_disconnected() {
     .await;
 
     let conn = connect_wt(&mh_url).await;
-    let (mut send, _recv) = send_jwt_on_bi_stream(&conn, jwt.as_bytes()).await;
+    let (mut send, _recv) = send_jwt_on_bi_stream(&conn, &jwt).await;
 
     // Clean close: finish the send stream (produces Ok(None) on the server's
     // recv) and drop the connection. Matches the `ClientClosed` branch in
