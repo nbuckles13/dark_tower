@@ -3,7 +3,7 @@
 **Service**: Meeting Controller (mc-service)
 **Owner**: SRE Team
 **On-Call Rotation**: PagerDuty - Dark Tower MC Team
-**Last Updated**: 2026-03-27
+**Last Updated**: 2026-05-01
 
 ---
 
@@ -22,6 +22,9 @@
    - [Scenario 8: Join Failures](#scenario-8-join-failures)
    - [Scenario 9: WebTransport Rejections](#scenario-9-webtransport-rejections)
    - [Scenario 10: JWT Validation Failures](#scenario-10-jwt-validation-failures)
+   - [Scenario 11: Media Connection Failures](#scenario-11-media-connection-failures)
+   - [Scenario 12: RegisterMeeting Coordination Failures](#scenario-12-registermeeting-coordination-failures)
+   - [Scenario 13: Unexpected MH Notifications](#scenario-13-unexpected-mh-notifications)
 4. [Diagnostic Commands](#diagnostic-commands)
 5. [Recovery Procedures](#recovery-procedures)
 6. [Postmortem Template](#postmortem-template)
@@ -48,6 +51,9 @@ Automatically upgrade severity if:
 - P3 affects multiple meetings -> Upgrade to P2
 - Any actor panic detected -> Upgrade to P1
 - Any security breach suspected -> Upgrade to P1 + notify Security Team immediately
+- `rate(mc_register_meeting_total{status="error"}[5m]) / rate(mc_register_meeting_total[5m]) > 0.10` sustained for > 15m -> Upgrade to P2 (new meetings losing media) per Scenario 12
+- `rate(mc_media_connection_failures_total{all_failed="true"}[5m]) > 0` sustained for > 15m -> Upgrade to P1 (active participants have no media) per Scenario 11
+- Steady-rate `mc_mh_notifications_received_total` from a single MH service identity referencing meeting_ids absent from `mc_meetings_active` -> Treat as authenticated-MH-misbehavior; notify Security Team immediately per Scenario 13
 
 ---
 
@@ -1146,6 +1152,329 @@ kill %1
 
 ---
 
+### Scenario 11: Media Connection Failures
+
+**Alert**: `MCMediaConnectionAllFailed`
+**Severity**: warning
+**Runbook Section**: `#scenario-11-media-connection-failures`
+
+**Symptoms**:
+- `mc_media_connection_failures_total{all_failed="true"}` incrementing — clients are reporting via the `MediaConnectionFailed` signaling message that **every** assigned MH failed for them.
+- `mc_media_connection_failures_total{all_failed="false"}` may also be elevated; this is per-MH failure noise without an immediate user impact (clients fall back to remaining MHs).
+- Affected participants have signaling (MC) connectivity but no working media path.
+
+**Impact**: Affected participants cannot send or receive media. Signaling connectivity is intact (the report itself arrived via MC WebTransport), so users see other participants in the roster but no audio/video. **MC takes no automatic remediation action** for these reports per R-20 — the metric is observability-only; reallocation is deferred to a future story.
+
+**Treat the `error_reason` and `media_handler_url` fields in the signaling message as untrusted client input.** They reflect what the browser observed and are not authenticated as truthful (the message is authenticated as "from this session", but field content is self-reported). Always corroborate against MH-side metrics and logs before concluding a specific MH is at fault.
+
+> **Note**: `mc_media_connection_failures_total` starts at zero in production. The `all_failed="true"` label value first appears the first time a client reports total failure; a brand-new time series with no historical baseline is not itself an incident — `rate(...{all_failed="true"}[5m])` is the actionable signal (mirrors the GC Sc 5 first-emission pattern).
+
+**Diagnosis**:
+
+```bash
+# 1. Confirm scope: how many distinct clients reported all-failed in the window?
+kubectl port-forward -n dark-tower deployment/mc-service 8080:8080 &
+curl http://localhost:8080/metrics | grep mc_media_connection_failures_total
+kill %1
+
+# 2. Rate of all-failed reports vs partial failures (delta-over-window framing)
+sum(rate(mc_media_connection_failures_total{all_failed="true"}[5m]))
+sum(rate(mc_media_connection_failures_total{all_failed="false"}[5m]))
+
+# 3. Compare against active meeting count — a single all-failed report against
+#    a 100-participant meeting is very different from 10 reports against a 2p meeting
+sum(mc_meetings_active)
+sum(mc_connections_active)
+
+# 4. CORROBORATE before trusting the client-reported reason.
+#    Cross-check MH-side handshake health (do not trust MediaConnectionFailed.error_reason alone):
+sum by(status) (rate(mh_webtransport_connections_total[5m]))
+histogram_quantile(0.95,
+  sum by(le) (rate(mh_webtransport_handshake_duration_seconds_bucket[5m]))
+)
+
+# 5. Check MH JWT validation health — JWT failures at MH look like "media not working" to clients
+sum by(failure_reason) (rate(mh_jwt_validations_total{result="failure"}[5m]))
+
+# 6. MC logs for the WebTransport connection handler (target mc.webtransport.connection)
+kubectl logs -n dark-tower -l app=mc-service --tail=500 \
+  | grep -iE "MediaConnectionFailed|all_handlers_failed"
+
+# 7. MH pod health (per-pod failures correlate with this report)
+kubectl get pods -n dark-tower -l app=mh-service
+```
+
+**Common Root Causes**:
+
+Client reports a failure; the underlying cause is almost always upstream of MC. Triage by corroborating evidence.
+
+> **Strong-signal short-circuit**: if the all-failed reports correlate with elevated `mh_register_meeting_timeouts_total` (MH Sc 13) AND/OR elevated `mc_register_meeting_total{status="error"}` (MC Sc 12) in the same window, treat the RegisterMeeting coordination break as the upstream root cause. Clients connect to MH, get JWT-validated, and are then provisional-kicked because the meeting was never registered — this surfaces to clients as "all MHs failed." Fix the coordination, the all-failed reports stop. Skip to root cause #3 below.
+
+1. **MH WebTransport rejections fleet-wide** — clients connect to MH, get rejected during handshake. Check `mh_webtransport_connections_total{status="rejected"}` rate. See [MH Sc 5: WebTransport Rejections](mh-incident-response.md#scenario-5-webtransport-rejections).
+2. **MH JWT validation failures** — clients have valid JWTs at MC but MH rejects them (JWKS skew, key rotation). See [MH Sc 2: JWT Validation Failures](mh-incident-response.md#scenario-2-jwt-validation-failures).
+3. **MH RegisterMeeting timeouts** — clients arriving at MH before MC has registered the meeting; MH provisional-kicks them. See [MH Sc 13: RegisterMeeting Timeout](mh-incident-response.md#scenario-13-registermeeting-timeout--clients-kicked) and [MC Sc 12](#scenario-12-registermeeting-coordination-failures).
+4. **MH down or unreachable** — full MH outage or NetworkPolicy regression between client and MH. Check MH pod health and UDP/4434 reachability per MH Sc 1.
+5. **TLS / certificate issues at MH** — clients fail QUIC handshake. **Do not conclude this from `error_reason="tls"` alone** — verify with `openssl x509` against the actual MH cert and with MH-side handshake metrics.
+6. **Network path / cloud firewall** — UDP egress from client → MH blocked. Diffuse pattern across many `media_handler_url` values from many clients points here.
+7. **Capacity exhaustion at MH** — `mh_active_connections` at cap, new clients rejected. See MH Sc 5 + Sc 8.
+
+**Remediation**:
+
+```bash
+# Step 1: Identify the dominant upstream cause from the corroborating MH metrics in
+#         Diagnosis steps 4–6. The MC-side runbook does not "fix" this scenario directly —
+#         remediation is on the MH path the clients are reporting against.
+
+# Step 2: If MH WebTransport rejections / capacity:
+#   See MH Sc 5 — scale MH or rotate TLS as appropriate.
+
+# Step 3: If MH RegisterMeeting timeouts (clients kicked before media establishes):
+#   See MC Sc 12 below — fix MC→MH RegisterMeeting delivery.
+
+# Step 4: If MH down:
+#   See MH Sc 1 — restore MH service.
+
+# Step 5: Monitor for resolution. The metric is a leading indicator of user impact;
+#         all_failed=true rate dropping to zero across a 5-minute window is the
+#         recovery signal.
+kubectl port-forward -n dark-tower deployment/mc-service 8080:8080 &
+watch -n 30 'curl -s http://localhost:8080/metrics | grep mc_media_connection_failures_total'
+kill %1
+```
+
+Expected recovery time: bounded by upstream MH/network fix; once the underlying MH/network issue is resolved, in-flight `MediaConnectionFailed` reports stop within 30-60s and the rate decays to baseline over the next 5m window. New clients establish media within their normal connect timeout (~5s).
+
+**Escalation**:
+- If MH path is healthy by every MH-side metric and the all-failed rate persists, escalate to Infrastructure Team — likely a network path issue between clients and MH that MH itself cannot observe.
+- If `all_failed="true"` rate stays elevated for >15 minutes, upgrade to P1 — affected participants have no usable media.
+- If client reports point at TLS/cert issues but MH-side cert is verifiably valid, escalate to Client Team (possible client trust-store misconfiguration).
+
+**Dashboards**: MC Overview → "Media Connection Failures" panel (if present); MH Overview → WebTransport handshake status panel + JWT validation panel for corroborating evidence.
+
+---
+
+### Scenario 12: RegisterMeeting Coordination Failures
+
+**Alert**: No alert today; surfaces in `mc_register_meeting_total{status="error"}` rate, `mc_register_meeting_duration_seconds` p95, and `RegisterMeeting retries exhausted` error logs at target `mc.register_meeting.trigger`. May also co-fire MH-side [Scenario 13: RegisterMeeting Timeout — Clients Kicked](mh-incident-response.md#scenario-13-registermeeting-timeout--clients-kicked).
+**Severity**: warning
+**Runbook Section**: `#scenario-12-registermeeting-coordination-failures`
+
+<!-- TODO: alert MCRegisterMeetingFailureRate — no alert rule exists today; this scenario is metric-driven triage. When observability adds a rule, link it here and remove this TODO. -->
+
+> **Note**: `mc_register_meeting_total{status="error"}` and `mc_register_meeting_duration_seconds` start at zero in production and only emit on the first first-participant join. A brand-new series is not itself an incident; `rate(...{status="error"}[5m]) > 0` against a non-trivial total rate is the actionable signal.
+
+**Symptoms**:
+- `mc_register_meeting_total{status="error"}` non-zero or rising vs baseline. MC retries each MH up to 3 attempts with 1s/2s backoffs (see `register_meeting_with_handlers` in `crates/mc-service/src/webtransport/connection.rs`); a steady error rate means retries are being exhausted.
+- `mc_register_meeting_duration_seconds` p95 climbing — RegisterMeeting RPCs are succeeding but slowly, eating into the MH-side 15s timeout budget.
+- MC error log: `"RegisterMeeting retries exhausted"` (target `mc.register_meeting.trigger`) with `mh_grpc_endpoint` and the underlying error.
+- Concurrent MH-side `mh_register_meeting_timeouts_total` rising — same incident from the receiver's vantage.
+- New meetings fail to ever produce media; clients connect to MH, get JWT-validated, then disconnected ~15s later. From a user perspective: "I joined the meeting but media never came up."
+
+**Impact**: New meetings on this MC do not get registered with their assigned MHs, so first-participant clients are kicked by the MH provisional-accept timeout. **Existing already-registered meetings are unaffected** — RegisterMeeting fires only on first-participant join (R-12). Subset of new meetings affected; severity is warning because clients still have signaling to MC and the active/active topology means a single MH coordination failure does not block the meeting if other assigned MHs registered successfully.
+
+> **Rollback awareness**: During a deliberate rollback to a pre-RegisterMeeting MH version, MC will see exactly these symptoms — old MH does not implement the RPC, so MC retries then exhausts. **This is expected during the rollback window**; clients still establish via the JWT path. Confirm by checking `kubectl rollout history deployment/mh-service -n dark-tower` for an in-progress rollback before treating as an incident. Coordinate with the deployer.
+
+**Diagnosis**:
+
+```bash
+# 1. RegisterMeeting outcome rate by status
+sum by(status) (rate(mc_register_meeting_total[5m]))
+
+# 2. Latency p95 (delta-over-window; uses the MC SLO histogram shape)
+histogram_quantile(0.95,
+  sum by(le) (rate(mc_register_meeting_duration_seconds_bucket[5m]))
+)
+
+# 3. Error rate vs 1h baseline (distinguish incident from background sequencing race)
+sum(rate(mc_register_meeting_total{status="error"}[5m]))
+/
+clamp_min(sum(rate(mc_register_meeting_total[1h])), 0.001)
+
+# 4. MC error logs — error message, mh_grpc_endpoint, and total_attempts are logged
+kubectl logs -n dark-tower -l app=mc-service --tail=500 \
+  | grep -iE "RegisterMeeting retries exhausted|RegisterMeeting attempt failed"
+
+# 5. MH-side correlate (timeouts on the receiving MH)
+sum(rate(mh_register_meeting_timeouts_total[5m]))
+
+# 6. MC→MH gRPC reachability for the failing endpoint(s) from a fresh shell
+kubectl exec -it deployment/mc-service -n dark-tower -- \
+  grpcurl -plaintext mh-service.dark-tower.svc.cluster.local:50051 list
+
+# 7. Check if MC mailbox depth is queueing the trigger task (CPU/backpressure cause)
+sum by(actor_type) (mc_actor_mailbox_depth)
+
+# 8. NetworkPolicy mc → mh
+kubectl describe networkpolicy mc-service -n dark-tower
+```
+
+**Common Root Causes**:
+
+1. **MH down or unreachable** — gRPC connect fails to all MHs in the assignment. Check MH pod health (`kubectl get pods -l app=mh-service`). See [MH Sc 1: Complete Service Outage](mh-incident-response.md#scenario-1-complete-service-outage).
+2. **NetworkPolicy regression** — MC egress to MH gRPC port blocked. Infrastructure Team. Recently-deployed network policy is the most common trigger; check `kubectl rollout history`.
+3. **MH JWKS unable to validate MC's service token** — MC presents a token that MH rejects at Layer 1 auth. Cross-check `mh_jwt_validations_total{token_type="service",result="failure"}`. See [MH Sc 2: JWT Validation Failures](mh-incident-response.md#scenario-2-jwt-validation-failures).
+4. **MH overloaded** — RPC succeeds but slowly; p95 climbs into the timeout budget. Scale MH.
+5. **MC overloaded / mailbox backpressure** — first-participant trigger task is queued behind other work; the 1+2s retry budget elapses before the network path even matters. See [Scenario 1: High Mailbox Depth](#scenario-1-high-mailbox-depth).
+6. **Stale Redis MH assignment data** — assignment points at MH endpoints that no longer exist (drained / scaled-down). MC will exhaust retries against ghost endpoints. Check `MhAssignmentStore` freshness vs current MH pod IPs.
+
+**Remediation**:
+
+```bash
+# Step 1: Confirm the dominant root cause from the metric breakdown above.
+
+# Step 2: If MH down — restore MH (MH Sc 1).
+# Step 3: If NetworkPolicy regression — Infrastructure Team. To verify before rollback:
+kubectl get networkpolicy -n dark-tower -o yaml | grep -A5 mh
+kubectl rollout undo deployment/mc-service -n dark-tower
+# (Or revert the NetworkPolicy change — coordinate with Infrastructure.)
+
+# Step 4: If MH JWKS rejection — escalate AC Team (see MH Sc 2 + MC Sc 10);
+#          MC service token may need rotation if auth_rejected dominates.
+
+# Step 5: If MC mailbox backpressure — scale MC horizontally
+kubectl scale deployment/mc-service -n dark-tower --replicas=5
+
+# Step 6: If stale Redis MH assignment data — escalate to MC Team to investigate
+#         MhAssignmentStore TTL / refresh logic. Affected meetings will recover
+#         on next first-participant join after the assignment is refreshed.
+
+# Verify recovery
+sum by(status) (rate(mc_register_meeting_total[5m]))
+# status="success" should dominate; status="error" rate should drop to baseline.
+```
+
+Expected recovery time: 30-60s for horizontal MC scale; 1-2 minutes for NetworkPolicy revert; 2-3 minutes for AC service-token rotation + MC restart. Stale Redis assignment data: bounded by Redis TTL refresh (consult MhAssignmentStore config) — affected meetings recover on next first-participant-join after refresh.
+
+**Rollback nuance**: `RegisterMeeting` is a new RPC. If MH is rolled back to a pre-RegisterMeeting build, MC will keep sending the RPC, exhaust retries, and log `"RegisterMeeting retries exhausted"` for each affected meeting. **Clients are NOT stranded by this** — they still establish WebTransport sessions to the rolled-back MH via JWT, and the active/active topology covers any meeting where some assigned MHs are on the new build. If you must roll MH back during a coordinated incident, expect sustained `mc_register_meeting_total{status="error"}` for the duration of the rollback window; suppress alerts for that period rather than blocking the rollback.
+
+**Alert candidate** (breadcrumb for future observability work; out of scope here): a candidate threshold for an `MCRegisterMeetingFailureRate` alert would be `(sum(rate(mc_register_meeting_total{status="error"}[5m])) / sum(rate(mc_register_meeting_total[5m]))) > 0.10 and sum(rate(mc_register_meeting_total[5m])) > 0` for 5m at `severity: warning`, with `runbook_url` pointing at this scenario. This mirrors the shape of `MCHighJoinFailureRate`. See `<!-- TODO: alert ... -->` comment near the top of this scenario.
+
+**Do NOT recommend tuning `MH_REGISTER_MEETING_TIMEOUT_SECONDS` (default 15s) as a mitigation.** That timeout is the security boundary that bounds stolen-JWT-against-unregistered-meeting exposure on the MH side. Sustained timeouts mean the coordination path is broken — fix the path, do not widen the window. If you believe the timeout itself is wrong, escalate to Security Team for review.
+
+**Escalation**:
+- If error rate >10% for >15 minutes, upgrade to P2 — new meetings are losing media.
+- If MH is healthy by every MH-side metric but MC still cannot reach it, escalate to Infrastructure Team.
+- If retries-exhausted logs span many distinct `mh_grpc_endpoint` values in a short window, this is fleet-wide MH coordination failure — page MH Team and consider whether GC has stale capacity records.
+
+**Related Alerts**: MH-side `mh_register_meeting_timeouts_total` (downstream effect on receiving MH), `MCHighMailboxDepthWarning` (upstream cause when trigger task is queued), `MCMediaConnectionAllFailed` (downstream user-visible effect when first-participant clients are kicked from every assigned MH).
+
+**Dashboards**: MC Overview → "RegisterMeeting RPC Rate by Status" + "RegisterMeeting RPC Latency (P50/P95/P99)" (the headline panels for this scenario, both in the MH Coordination row); MH Overview → "RegisterMeeting Receipts by Status" + "RegisterMeeting Timeouts (R-26)" (receiver-side correlates).
+
+---
+
+### Scenario 13: Unexpected MH Notifications
+
+**Alert**: No alert today; diagnostic-only signal in `mc_mh_notifications_received_total` and warn-level log `"Connection registry limit reached for meeting"` at target `mc.grpc.media_coordination` (the gRPC handler emits this when the registry's `add_connection` returns `false`). The registry-internal log `"Meeting connection limit reached, rejecting new connection"` at target `mc.mh_registry` is the lower-level companion emitted from the same code path.
+**Severity**: info (operational drift) / page (if security branch — see Common Root Causes)
+
+> **Note on metric asymmetry**: MC has **no failure metric for inbound MH notifications by design** — `mc_mh_notifications_received_total` only carries an `event_type` label, no `status`. Failures originate and are counted on the MH sender side as `mh_mc_notifications_total{status="error"}`; see [MH Scenario 10: MH→MC Notification Failures](mh-incident-response.md#scenario-10-mhmc-notification-failures). This scenario is the complement: notifications that *successfully reached MC* but reference state MC does not expect.
+>
+> `mc_mh_notifications_received_total` starts at zero in production and emits on the first MH notification; a brand-new series is not itself an incident. The actionable signal is rate-relative-to-expected (see Diagnosis step 2) and the warn-log on registry-cap hits.
+
+**Symptoms**:
+- `mc_mh_notifications_received_total{event_type}` rate higher than expected for the active-meeting count.
+- MC `debug` logs: `"Connection was not in registry (may have already been removed)"` (target `mc.grpc.media_coordination`) — disconnect notifications arriving for connections MC does not have a record of. Routine occurrence in small numbers; sustained volume is the signal.
+- MC `warn` logs: `"Connection registry limit reached for meeting"` — `MAX_CONNECTIONS_PER_MEETING` (1000) cap hit, new connect notifications silently dropped. This is unusual for normal meeting load and warrants investigation.
+- gRPC access logs: notifications arriving with `meeting_id` values that do not appear in `mc_meetings_active` for this MC.
+
+**Impact**: Operationally, drift between MC's MhConnectionRegistry and reality. Currently the registry is observability-only (read by future media routing per R-18); a small amount of drift is tolerated by design. **The signal matters for two reasons**:
+1. **Operational drift branch** — diffuse pattern across many `meeting_id` values from many MH source identities suggests GC↔MC↔MH routing has lost coherence (e.g., meeting reassigned but stale MH still notifying). Self-heals as participants reconnect.
+2. **Authenticated-misbehavior branch** — steady-rate stream of unknown-meeting notifications from a single MH service identity suggests a compromised or misconfigured MH that has passed Layer 1 (JWKS) and Layer 2 (caller-type) auth but is sending notifications it should not be. Treat as a potential security incident.
+
+**Diagnosis**:
+
+```bash
+# 1. Volume of notifications received
+sum by(event_type) (rate(mc_mh_notifications_received_total[5m]))
+
+# 2. Compare against expected: 1 connect notification per (participant × MH)
+#    on first connect, 1 disconnect on departure. Active-conn baseline:
+sum(mc_connections_active)
+
+# 3. Stale-disconnect rate (debug-level log; tail with care)
+kubectl logs -n dark-tower -l app=mc-service --tail=2000 \
+  | grep -c "Connection was not in registry" \
+  || true
+
+# 4. Registry-cap hits (warn-level)
+kubectl logs -n dark-tower -l app=mc-service --tail=2000 \
+  | grep -i "Connection registry limit reached"
+
+# 5. SHAPE the signal — diffuse vs concentrated:
+#    Pull MH source identity from gRPC handler logs (target mc.grpc.media_coordination).
+#    The auth interceptor logs the calling service identity at debug level on each request.
+#    `mc_mh_notifications_received_total` itself currently has only `event_type` —
+#    there is no `source_id` label, so attribution must come from logs / traces.
+kubectl logs -n dark-tower -l app=mc-service --tail=2000 \
+  | grep -iE "media_coordination.*meeting_id"
+# Look for: are notifications arriving for the same meeting_id repeatedly from one MH,
+# or scattered across many meetings + many MHs?
+
+# 6. Cross-check with GC's view of meeting assignments (operational-drift hypothesis)
+kubectl exec -it deployment/gc-service -n dark-tower -- \
+  psql $DATABASE_URL -c \
+  "SELECT meeting_id, mc_id, status FROM meetings WHERE updated_at > NOW() - INTERVAL '1 hour' ORDER BY updated_at DESC LIMIT 50;"
+```
+
+**Common Root Causes**:
+
+Triage by signal shape from Diagnosis step 5:
+
+1. **Diffuse, many-MH, many-meeting → Operational drift.**
+   - GC reassigned meetings but old MH continued to notify briefly.
+   - MC was restarted and lost its in-memory registry; in-flight disconnects from MHs arrive for meetings the new MC instance never registered.
+   - MhConnectionRegistry cleanup race in `controller.rs::remove_meeting()`.
+   - Self-heals; no immediate action. Investigate MhConnectionRegistry behavior for tracking debt.
+
+2. **Concentrated, single-MH source identity, many unknown meetings → Authenticated-MH misbehavior.**
+   - Compromised MH credentials being used by an attacker who passed Layer 1+2 auth and is probing or fuzzing the MediaCoordinationService.
+   - Misconfigured MH instance running with the wrong meeting-routing config and broadcasting notifications to the wrong MC.
+   - **Treat as a security incident**: preserve logs (gRPC access log + handler log + the auth interceptor's caller-identity emission), snapshot `mc_mh_notifications_received_total`, do **NOT** restart MC, escalate to Security Team. Do not remediate operationally until Security has triaged.
+
+3. **Registry cap hit (`MAX_CONNECTIONS_PER_MEETING=1000` reached).**
+   - Legitimate giant-meeting scenario or a runaway MH spamming the same `meeting_id`.
+   - If the meeting's `mc_connections_active` corroborates ~1000 participants, this is a capacity-planning signal — discuss with MC Team.
+   - If `mc_connections_active` is small but the registry is full for the meeting, treat as the authenticated-misbehavior branch (#2 above).
+
+**Remediation**:
+
+```bash
+# Operational-drift branch (root cause #1):
+# No action — monitor. Drift resolves as participants reconnect or meetings end.
+
+# Authenticated-misbehavior branch (root cause #2):
+# 1. PRESERVE logs first — capture before any restart.
+kubectl logs -n dark-tower -l app=mc-service --tail=5000 \
+  > /tmp/mc-incident-$(date -u +%Y%m%dT%H%M%SZ).log
+# 2. Snapshot the metric for forensic baseline.
+kubectl port-forward -n dark-tower deployment/mc-service 8080:8080 &
+curl -s http://localhost:8080/metrics | grep mc_mh_notifications_received_total \
+  > /tmp/mc-metrics-$(date -u +%Y%m%dT%H%M%SZ).txt
+kill %1
+# 3. Do NOT restart MC. Do NOT rotate the MH service token (yet) — Security needs evidence.
+# 4. Escalate to Security Team via #security-incidents.
+
+# Capacity-cap branch (root cause #3):
+# Confirm legitimate giant meeting via mc_connections_active for the affected meeting_id.
+# If legitimate, file capacity-planning ticket; do not remediate at runtime.
+# If not legitimate, treat as the authenticated-misbehavior branch above.
+```
+
+Expected recovery time: branch-dependent. Operational drift self-heals over the next 5-15m as participants reconnect or meetings end (no runtime action). Authenticated-misbehavior branch: bounded by Security investigation timeline (do not auto-recover). Capacity-cap branch on a legitimate giant meeting: persists until the meeting ends or capacity-planning lifts the cap; not a runtime fix.
+
+**What this scenario tells you**: this is a diagnostic-appendix scenario, not an alerting one. Use it when you are ALREADY investigating a different signal (e.g. an MC actor panic, a security review of MH→MC RPCs, or an operational sweep) and you notice elevated `mc_mh_notifications_received_total` rate or `"Connection registry limit reached"` warn-logs that don't fit the surrounding incident. The scenario routes you to the right triage branch without re-deriving "what is `MhConnectionRegistry` and why does it have a registry-cap." If you found this scenario via an alert, the alert is wrong — file an issue.
+
+**Escalation**:
+- Authenticated-misbehavior branch: Security Team immediately. Do not restart, do not rotate tokens until Security has captured evidence.
+- Operational-drift branch: no escalation; track for trend.
+- Registry-cap hit on a small meeting: MC Team for investigation.
+
+**Related Alerts**: `MCActorPanic` (if a MeetingActor crashed and lost registry state), MH-side `MHCallerTypeRejected` (Layer 2 caller-type rejections — would indicate misbehaving services that did NOT clear Layer 2; this scenario is the complementary branch where Layer 2 was passed); MH-side [Scenario 10: MH→MC Notification Failures](mh-incident-response.md#scenario-10-mhmc-notification-failures) (the *sender-side* view of the same RPC pair).
+
+**Dashboards**: MC Overview → MH-coordination row notification panels (if present); rely on log-based triage (target `mc.grpc.media_coordination`) for source-identity attribution since the metric has no `source_id` label today.
+
+---
+
 ## Diagnostic Commands
 
 ### Quick Health Check
@@ -1399,6 +1728,7 @@ All times in UTC.
 - Quarterly comprehensive review
 
 **Version History**:
+- 2026-05-01: Add Scenarios 11-13 (MediaConnectionFailed reports, RegisterMeeting coordination failures, unexpected MH notifications) — covers MC↔MH coordination failure modes for the client→MH QUIC connection story. New scenarios use ADR-0031 canonical lowercase severity vocabulary (`page` / `warning` / `info`) deliberately; existing Sc 1-10 retain inherited Title Case (`Warning` / `Critical` / `Info`) — do NOT normalize one to the other without an ADR follow-up.
 - 2026-03-27: Add Scenarios 8-10 (join failures, WebTransport rejections, JWT validation failures); fix 7 stale metric references
 - 2026-02-09: Initial version
 
