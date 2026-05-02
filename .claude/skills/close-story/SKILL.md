@@ -11,7 +11,7 @@ Moves reflection from per-devloop (cheap, repetitive) to per-story (once, with c
 
 ## When to Use
 
-After the final devloop in a user story completes. `/user-story` creates a `/close-story` task blocked by all devloop tasks; when those unblock it, run this skill.
+After every row in the story's `Devloop Tracking` table is marked `Completed`.
 
 Do NOT use mid-story (Phase 1 refuses), for standalone devloops (Gate 2 INDEX guard suffices), or to recover a stuck devloop (use `/devloop --continue=...` first).
 
@@ -34,7 +34,7 @@ Do NOT use mid-story (Phase 1 refuses), for standalone devloops (Gate 2 INDEX gu
 ## Workflow
 
 ```
-VERIFY → REFLECTION → DRY RETRO → FINALIZE (commit/push) → PR → COMPLETE
+VERIFY → TEAM CREATE → REFLECTION → DRY RETRO → TEAM DELETE → FINALIZE (commit/push) → PR → COMPLETE
 ```
 
 ## Phase 1: Verify
@@ -57,28 +57,36 @@ matches = glob("docs/user-stories/*{slug}.md")     # suffix match; exact form al
 - 1 match → proceed with that path.
 - ≥2 matches → escalate to the user (SendMessage): list the matched filenames, ask the user to pick one (they reply with the full `YYYY-MM-DD-slug` or an index).
 
-**Enumerate the story's tasks from the story file** (not from `TaskList`): read the `**Close-Story Task ID**:` header line and the `Task ID` column of the `Devloop Tracking` table. These are written by `/user-story` Step 10.5. For each ID, call `TaskGet`.
+**Read the Devloop Tracking table** from the story file. The table is the source of truth for what's been done — each row is one devloop, with a `Status` column.
 
-Fallback (story predates `/user-story` Step 10.5, so IDs are absent): prompt the user for task IDs rather than guessing via `TaskList` subject-substring matching — that would silently include unrelated tasks or miss renames.
-
-**Completeness check**: every story-task ID other than the close-story task itself MUST have `status == completed`. Phase 1 advances to Phase 2 iff this returns zero non-completed IDs; otherwise escalate:
+**Completeness check**: every row's `Status` MUST be `Completed`. Phase 1 advances to Phase 2 iff there are zero non-completed rows; otherwise escalate:
 
 ```
 **Story close blocked — incomplete tasks**
 
 Story: {story-title}   Slug: {story-slug}
 
-Incomplete tasks:
-- #{id} [{status}] "{subject}" (owner: {owner or unassigned})
+Incomplete rows in Devloop Tracking table:
+- #{N}: "{task description}" — Status: {status}
 
 Resolve these before closing. If a devloop is stuck: /devloop --continue=<slug>.
 ```
 
+**Apply the slug regex** (`^[a-z0-9-]+$`) to every devloop slug parsed from the table's `Devloop Output` column before constructing `docs/devloop-outputs/{devloop-slug}/main.md` paths — the table is hand-edited, so treat it as input-boundary.
+
 ## Phase 2: Story-scope Reflection
 
-**Identify participating specialists**: from each `docs/devloop-outputs/{devloop-slug}/main.md`, collect the implementing specialist (`**Specialist**:` header) plus any reviewer whose Code Review Results verdict was `RESOLVED` or `ESCALATED`. CLEAR reviewers skip reflection. Deduplicate.
+**Identify participating specialists**: from each `docs/devloop-outputs/{devloop-slug}/main.md`, collect the implementing specialist (`**Specialist**:` header) plus any reviewer whose Code Review Results verdict was `RESOLVED` or `ESCALATED`. CLEAR reviewers skip reflection. Deduplicate. Always include `dry-reviewer` (Phase 2.5 retrospective runs in the same team).
 
-**Spawn each** via Task tool (`name` and `subagent_type` both set to the specialist name). Include `docs/specialist-knowledge/{name}/INDEX.md` under a `## Navigation` header.
+**Create the team**. Custom subagent types from `.claude/agents/{name}.md` are spawnable inside a team context (mirrors `/devloop` Step 3):
+
+```
+TeamCreate(team_name: "story-close-{slug}", description: "Story-scope reflection for {story-title}")
+```
+
+Defensive cleanup: if a team named `story-close-{slug}` already exists from a prior aborted close, send `{type: "shutdown_request"}` to each member via SendMessage, then call `TeamDelete` before re-creating.
+
+**Spawn each specialist** via the Agent tool with `team_name: "story-close-{slug}"`, `name: "{specialist-name}"`, `subagent_type: "{specialist-name}"`. The agent system auto-loads identity from `.claude/agents/{name}.md`. Include `docs/specialist-knowledge/{name}/INDEX.md` under a `## Navigation` header in the prompt.
 
 **Send this prompt** (unicast via SendMessage, verbatim):
 
@@ -120,7 +128,7 @@ If it fails, forward to the offending specialist, ask for a fix, re-run. Phase 2
 
 ## Phase 2.5: DRY Ownership Lens Retrospective
 
-Spawn **dry-reviewer only**. Send this prompt verbatim:
+Send this prompt to `dry-reviewer` (already in the team from Phase 2) via SendMessage:
 
 ```
 You are running the Ownership Lens retrospective for user story {story-slug}.
@@ -155,11 +163,18 @@ When done, reply "Retrospective complete".
 
 **Timeout**: 15 min; proceed, note "retrospective skipped (timeout)" if missed.
 
+## Phase 2.6: Team Teardown
+
+After all reflections + the retrospective have completed (or timed out):
+
+1. Send `{type: "shutdown_request"}` to every team member via SendMessage.
+2. Call `TeamDelete`.
+
+Mirrors `/devloop` Step 8.5. Prevents stale team context from leaking into subsequent close-story or devloop runs.
+
 ## Phase 3: Finalize
 
-1. `TaskUpdate(taskId=<close-story-task-id>, status="completed")`.
-
-2. Stage — **narrow scope only**:
+1. Stage — **narrow scope only**:
    ```bash
    git add docs/specialist-knowledge/ docs/devloop-outputs/
    ```
@@ -167,7 +182,7 @@ When done, reply "Retrospective complete".
 
    **Unexpected-modification check**: run `git status --short` before committing. If modified files sit outside `docs/specialist-knowledge/` and `docs/devloop-outputs/`, escalate to the user — a specialist may have touched unrelated files, or ambient work belongs elsewhere.
 
-3. Commit (heredoc avoids shell-expansion of anything read from files; trailer order matches /devloop Step 8):
+2. Commit (heredoc avoids shell-expansion of anything read from files; trailer order matches /devloop Step 8):
 
    ```bash
    git commit -m "$(cat <<'EOF'
@@ -184,7 +199,7 @@ When done, reply "Retrospective complete".
 
    If nothing to commit (reflection produced no INDEX changes), skip silently and note "no commit (no changes)" in the report.
 
-4. `git push`. The harness permission model prompts the user. No in-skill confirmation UI, no dry-run preview, no retry-on-deny — deny is terminal. No `--force`, no `--no-verify`.
+3. `git push`. The harness permission model prompts the user. No in-skill confirmation UI, no dry-run preview, no retry-on-deny — deny is terminal. No `--force`, no `--no-verify`.
 
 ## Phase 4: Pull Request
 
@@ -289,6 +304,7 @@ Conditional output: print the retrospective line only if the file exists (substi
 | Phase 2 | 20 min per specialist | Proceed without; note in report |
 | Phase 2 INDEX guard | 3 retries | Fail close — do not commit |
 | Phase 2.5 | 15 min | Proceed without; note in report |
+| Phase 2.6 (team teardown) | — | Always runs after Phase 2 + 2.5, even if either timed out |
 | Phase 3 (commit/push), Phase 4 (PR) | — | Harness permission prompts; deny is terminal |
 
 ## Files
@@ -297,4 +313,4 @@ Conditional output: print the retrospective line only if the file exists (substi
 - Devloop outputs: `docs/devloop-outputs/{devloop-slug}/main.md`
 - Story-close output: `docs/devloop-outputs/{story-slug}-story-close/ownership-lens-retrospective.md`
 - Specialist INDEX: `docs/specialist-knowledge/{name}/INDEX.md`
-- Upstream: `.claude/skills/devloop/SKILL.md` (reflection removed), `.claude/skills/user-story/SKILL.md` Step 10.5 (creates this task blocked by devloops)
+- Upstream: `.claude/skills/devloop/SKILL.md` (reflection removed), `.claude/skills/user-story/SKILL.md` (decomposes the story into the Devloop Tracking table this skill reads)
