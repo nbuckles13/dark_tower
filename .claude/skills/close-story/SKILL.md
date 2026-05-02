@@ -174,15 +174,16 @@ Mirrors `/devloop` Step 8.5. Prevents stale team context from leaking into subse
 
 ## Phase 3: Finalize
 
-1. Stage — **narrow scope only**:
+1. Update the story file: set `**Status**:` to `Complete`. This is the only metadata recorded on close.
+
+2. Stage — **narrow scope only**:
    ```bash
-   git add docs/specialist-knowledge/ docs/devloop-outputs/
+   git add docs/specialist-knowledge/ docs/devloop-outputs/ docs/user-stories/
    ```
-   Never `git add -A`. The Phase 5 story-file update lands post-commit.
 
-   **Unexpected-modification check**: run `git status --short` before committing. If modified files sit outside `docs/specialist-knowledge/` and `docs/devloop-outputs/`, escalate to the user — a specialist may have touched unrelated files, or ambient work belongs elsewhere.
+   **Unexpected-modification check**: run `git status --short` before committing. If modified files sit outside `docs/specialist-knowledge/`, `docs/devloop-outputs/`, and `docs/user-stories/`, escalate to the user — a specialist may have touched unrelated files, or ambient work belongs elsewhere.
 
-2. Commit (heredoc avoids shell-expansion of anything read from files; trailer order matches /devloop Step 8):
+3. Commit (heredoc avoids shell-expansion of anything read from files; trailer order matches /devloop Step 8):
 
    ```bash
    git commit -m "$(cat <<'EOF'
@@ -199,7 +200,7 @@ Mirrors `/devloop` Step 8.5. Prevents stale team context from leaking into subse
 
    If nothing to commit (reflection produced no INDEX changes), skip silently and note "no commit (no changes)" in the report.
 
-3. `git push`. The harness permission model prompts the user. No in-skill confirmation UI, no dry-run preview, no retry-on-deny — deny is terminal. No `--force`, no `--no-verify`.
+4. `git push`. The harness permission model prompts the user. No in-skill confirmation UI, no dry-run preview, no retry-on-deny — deny is terminal. No `--force`, no `--no-verify`.
 
 ## Phase 4: Pull Request
 
@@ -279,8 +280,6 @@ fi
 Harness permission prompts fire on `gh pr create/edit`; deny is terminal per Phase 3's rule.
 
 ## Phase 5: Complete
-
-Update the story file: set `**Status**:` to `Complete`; append the PR URL as a new `**PR**: <url>` line under the header.
 
 **Report**:
 

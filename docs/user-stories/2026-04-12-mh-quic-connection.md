@@ -1,7 +1,7 @@
 # User Story: Client-to-MH QUIC Connection
 
 **Date**: 2026-04-12
-**Status**: Ready for Review
+**Status**: Complete
 **Participants**: auth-controller, global-controller, meeting-controller, media-handler, database, protocol, infrastructure, security, test, observability, operations
 **Predecessor**: [Meeting Join Flow](2026-03-21-meeting-join.md)
 

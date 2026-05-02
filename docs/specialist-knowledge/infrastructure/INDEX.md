@@ -10,10 +10,9 @@
 
 ## Code Locations
 - Service Dockerfiles -> `infra/docker/{ac,gc,mc,mh}-service/Dockerfile`
+- Service runbooks (per-service `<service>-deployment.md` + `<service>-incident-response.md`) -> `docs/runbooks/`
 - PostgreSQL init -> `infra/docker/postgres/init.sql`
-- Prometheus config (Docker) -> `infra/docker/prometheus/prometheus.yml`
-- Prometheus alert rules -> `infra/docker/prometheus/rules/{gc,mc}-alerts.yaml`
-- Prometheus config (K8s) -> `infra/kubernetes/observability/prometheus-config.yaml`
+- Prometheus config + alert rules -> `infra/docker/prometheus/{prometheus.yml,rules/{gc,mc}-alerts.yaml}`, `infra/kubernetes/observability/prometheus-config.yaml`
 - K8s service manifests (Kustomize bases) -> `infra/services/{ac,gc,mc,mh}-service/kustomization.yaml`
 - AC StatefulSet -> `infra/services/ac-service/statefulset.yaml`
 - GC Deployment -> `infra/services/gc-service/deployment.yaml`
