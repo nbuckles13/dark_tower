@@ -283,26 +283,26 @@ Task 1 also starts immediately; task 7 waits for task 1
 
 ## Devloop Tracking
 
-| # | Task | Devloop Output | Commit | Status |
-|---|------|---------------|--------|--------|
-| 1 | Add MeetingTokenClaims/GuestTokenClaims to common | docs/devloop-outputs/2026-03-21-meeting-claims | 3a22a51 | Completed |
-| 2 | Implement ParticipantsRepository + migration | docs/devloop-outputs/2026-03-21-participants-repo | 3c58e10 | Completed |
-| 3 | Implement meeting activation + audit logging | docs/devloop-outputs/2026-03-21-meeting-activation | 15e7b15 | Completed |
-| 4 | Fix GC join auth + add join metrics | docs/devloop-outputs/2026-03-23-gc-join-auth-metrics | 47bfb59 | Completed |
-| 5 | Infra: TLS certs + MC Secret + Kind UDP | docs/devloop-outputs/2026-03-23-infra-tls-udp | a09ce18 | Completed |
-| 6 | Infra: Enable MC health probes | docs/devloop-outputs/2026-03-26-mc-health-probes | a90e09c | Completed |
-| 7 | Extract JWKS client + JWT validation to common | docs/devloop-outputs/2026-03-26-jwks-extraction | 375be71 | Completed |
-| 8 | Convert GC auth to common JWKS/JWT | docs/devloop-outputs/2026-03-26-jwks-extraction | aa99fee | Completed (in task 7) |
-| 9 | MC JWT validation on common code | docs/devloop-outputs/2027-03-27-mc-jwt-validation | b3a4c8d | Completed |
-| 10 | MC WebTransport server + join flow handler | docs/devloop-outputs/2026-03-27-mc-webtransport | dcee11c | Completed |
-| 11 | MC join flow observability metrics | docs/devloop-outputs/2026-03-27-mc-join-metrics | 7213b17 | Completed |
-| 12 | GC join dashboard + alerts + catalog | docs/devloop-outputs/2026-03-27-gc-join-dashboard | b111e1e | Completed |
-| 13 | MC join dashboard + alerts + catalog | docs/devloop-outputs/2026-03-28-mc-join-dashboard | b1a3328 | Completed |
-| 14 | GC join integration tests | docs/devloop-outputs/2026-03-29-gc-join-tests | a0dfdc5 | Completed |
-| 15 | MC join integration tests | docs/devloop-outputs/2026-03-29-mc-join-tests | fd14948 | Completed |
-| 16 | Join flow env-tests | docs/devloop-outputs/2026-03-30-join-env-tests | 00711e8 | Completed |
-| 17 | MC runbook scenarios 8-10 | docs/devloop-outputs/2026-03-30-mc-runbook-scenarios | 5d2990b | Completed |
-| 18 | Post-deploy checklist + smoke test | docs/devloop-outputs/2026-03-30-post-deploy-checklist | d2af2b6 | Completed |
+| # | Task | Devloop Output | Status |
+|---|------|---------------|--------|
+| 1 | Add MeetingTokenClaims/GuestTokenClaims to common | docs/devloop-outputs/2026-03-21-meeting-claims | Completed |
+| 2 | Implement ParticipantsRepository + migration | docs/devloop-outputs/2026-03-21-participants-repo | Completed |
+| 3 | Implement meeting activation + audit logging | docs/devloop-outputs/2026-03-21-meeting-activation | Completed |
+| 4 | Fix GC join auth + add join metrics | docs/devloop-outputs/2026-03-23-gc-join-auth-metrics | Completed |
+| 5 | Infra: TLS certs + MC Secret + Kind UDP | docs/devloop-outputs/2026-03-23-infra-tls-udp | Completed |
+| 6 | Infra: Enable MC health probes | docs/devloop-outputs/2026-03-26-mc-health-probes | Completed |
+| 7 | Extract JWKS client + JWT validation to common | docs/devloop-outputs/2026-03-26-jwks-extraction | Completed |
+| 8 | Convert GC auth to common JWKS/JWT | docs/devloop-outputs/2026-03-26-jwks-extraction | Completed (in task 7) |
+| 9 | MC JWT validation on common code | docs/devloop-outputs/2027-03-27-mc-jwt-validation | Completed |
+| 10 | MC WebTransport server + join flow handler | docs/devloop-outputs/2026-03-27-mc-webtransport | Completed |
+| 11 | MC join flow observability metrics | docs/devloop-outputs/2026-03-27-mc-join-metrics | Completed |
+| 12 | GC join dashboard + alerts + catalog | docs/devloop-outputs/2026-03-27-gc-join-dashboard | Completed |
+| 13 | MC join dashboard + alerts + catalog | docs/devloop-outputs/2026-03-28-mc-join-dashboard | Completed |
+| 14 | GC join integration tests | docs/devloop-outputs/2026-03-29-gc-join-tests | Completed |
+| 15 | MC join integration tests | docs/devloop-outputs/2026-03-29-mc-join-tests | Completed |
+| 16 | Join flow env-tests | docs/devloop-outputs/2026-03-30-join-env-tests | Completed |
+| 17 | MC runbook scenarios 8-10 | docs/devloop-outputs/2026-03-30-mc-runbook-scenarios | Completed |
+| 18 | Post-deploy checklist + smoke test | docs/devloop-outputs/2026-03-30-post-deploy-checklist | Completed |
 
 ---
 

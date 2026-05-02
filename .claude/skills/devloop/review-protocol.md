@@ -80,7 +80,7 @@ Use SendMessage to tell @team-lead your final verdict:
 The implementer will either:
 1. **Fix it** — the expected default
 2. **Defer with justification** — explain why the fix is too expensive for this PR
-3. **Spin-out** — route the finding to a separate devloop owned by a different specialist when the ADR-0024 §6.3 owner-involvement tier mandates it (Domain-judgment in a non-owner's devloop, or a Guarded Shared Area edit lacking the required owner trailer). Implementer elects; reviewer accepts or escalates using the same triage model as deferrals. When spun out to an owner-implemented devloop, the current devloop's commit does not require the missing owner's trailer — the spun-out devloop is the forcing function. Record the target slug in Tech Debt.
+3. **Spin-out** — route the finding to a separate devloop owned by a different specialist when the ADR-0024 §6.3 owner-involvement tier mandates it (Domain-judgment in a non-owner's devloop, or a Guarded Shared Area edit lacking the required owner trailer). Implementer elects; reviewer accepts or escalates using the same triage model as deferrals. When spun out to an owner-implemented devloop, the current devloop's commit does not require the missing owner's trailer — the spun-out devloop is the forcing function. Record the target slug in `docs/TODO.md`.
 
 ### Valid deferral justifications
 - Requires changing files outside the PR's changeset
@@ -97,7 +97,7 @@ The implementer will either:
 - **Accept**: The justification is legitimate — the fix genuinely can't be done in this PR without disproportionate cost or risk, or the ADR-0024 §6.3 owner tier requires a different specialist. Mark as "accepted deferral" or "accepted spin-out" in your verdict.
 - **Escalate**: The justification is not convincing — you believe the fix should happen in this PR. Send your verdict as ESCALATED and explain why to @team-lead.
 
-**Spin-out tracking**: When a finding is spun out, the reviewer records it in the current devloop's Tech Debt section with a pointer to the new devloop slug (or "to be scheduled"). If the spun-out devloop does not land within the next scheduled devloop for the owning specialist, the finding is surfaced in the current devloop's follow-up report and re-raisable in future devloops touching the same area. Spin-out is not a silent handoff — tracking is the reviewer's responsibility at verdict time.
+**Spin-out tracking**: When a finding is spun out, the reviewer records it in `docs/TODO.md` under the appropriate section (Cross-Service Duplication, Observability Debt, Code Quality, etc.) with a pointer to the new devloop slug (or "to be scheduled"). If the spun-out devloop does not land within the next scheduled devloop for the owning specialist, the finding is surfaced in the current devloop's follow-up report and re-raisable in future devloops touching the same area. Spin-out is not a silent handoff — tracking is the reviewer's responsibility at verdict time.
 
 **When in doubt, lean toward "fix it."** The bar for deferral and spin-out should be high.
 
@@ -105,7 +105,7 @@ The implementer will either:
 
 The DRY reviewer operates on a hybrid model:
 - **True duplication** (code exists in `common` or another service and was reimplemented): Send to @implementer as a finding, enters the fix-or-defer flow.
-- **Extraction opportunities** (similar patterns across services that could be shared but aren't yet): Document directly as tech debt observations in your verdict. These do NOT enter the fix-or-defer flow because they typically require cross-service coordination beyond the current PR's scope.
+- **Extraction opportunities** (similar patterns across services that could be shared but aren't yet): Append to `docs/TODO.md` under Cross-Service Duplication and reference the entry in your verdict. These do NOT enter the fix-or-defer flow because they typically require cross-service coordination beyond the current PR's scope.
 
 ## Verdict Format
 
@@ -139,9 +139,8 @@ The DRY reviewer operates on a hybrid model:
 ### Escalation reason (if escalated)
 [Which finding, why the deferral/spin-out justification is insufficient]
 
-### Tech Debt
-[Accepted deferrals and spin-outs that need follow-up tracking — include spin-out target slug or "to be scheduled"]
-[DRY reviewer: extraction opportunities observed]
+### Tech Debt References
+[Pointers to `docs/TODO.md` entries appended for any accepted deferrals, spin-outs, or DRY extraction opportunities — one bullet per entry, citing the section heading the entry was added under so the reader can locate it.]
 ```
 
 ### Classification Monotonicity (Ownership Lens)

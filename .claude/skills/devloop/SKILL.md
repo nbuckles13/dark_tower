@@ -486,7 +486,14 @@ Update main.md:
 - Phase = complete
 - Duration
 - Final summary
-- Tech debt section (all accepted deferrals with justifications, plus DRY extraction opportunities, plus any spun-out findings with target devloop slug or "to be scheduled" per review-protocol.md)
+
+Append any accepted deferrals, DRY extraction opportunities, and
+spun-out findings to `docs/TODO.md` under the appropriate section
+(Cross-Service Duplication, Observability Debt, Code Quality, etc.).
+This is the durable home for forward-looking work that future readers
+can find. Scope decisions that are devloop-local context (e.g., "we did
+not do X because that is task Y's scope") belong in main.md's existing
+scope/classification sections.
 
 If this task is part of a user story, update the Devloop Tracking table
 in the user story file: set Status to Completed and fill in the Devloop
