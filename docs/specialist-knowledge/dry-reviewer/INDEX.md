@@ -15,18 +15,19 @@
 - MH JWKS config -> `infra/services/mh-service/configmap.yaml:AC_JWKS_URL` (shared configmap, mirrors MC pattern in `mc-service-config`)
 
 ## Per-Service Observability (Metrics & Dashboards)
-- AC/GC/MC/MH metrics -> `crates/*/src/observability/metrics.rs` (per-service, not duplication)
-- Alert rules -> `infra/docker/prometheus/rules/{mc,gc}-alerts.yaml`; guard + conventions -> `scripts/guards/simple/validate-alert-rules.sh`, `docs/observability/alert-conventions.md` (ADR-0031); dashboards -> ADR-0029, `infra/grafana/dashboards/`
+- AC/GC/MC/MH metrics -> `crates/*/src/observability/metrics.rs` (per-service, not duplication); paired MC↔MH notification counters (`mc_mh_notifications_received_total` ↔ `mh_mc_notifications_total`) — different sender/receiver perspectives, not duplication
+- Alert rules -> `infra/docker/prometheus/rules/{mc,gc,mh}-alerts.yaml`; guard + conventions -> `scripts/guards/simple/validate-alert-rules.sh`, `docs/observability/alert-conventions.md` (ADR-0031); dashboards -> ADR-0029, `infra/grafana/dashboards/`
+- Runbooks (per-service incident-response + deployment) -> `docs/runbooks/`; canonical post-deploy checklist owned in `docs/runbooks/mh-deployment.md`, MC addendum cross-pointers to it (DRY: thresholds owned in one place)
 
 ## Integration Test Coverage
-- MC tests (join_tests, actor_metrics, auth_layer, gc, media_coordination, orphan_metrics, redis_metrics, register_meeting, token_refresh, webtransport_accept_loop) -> `crates/mc-service/tests/`; GC join/guest/settings -> `crates/gc-service/tests/meeting_tests.rs`
-- MC shared scaffolding (MockMhAssignmentStore, MockMhRegistrationClient, TestStackHandles, build_test_stack, seed_meeting_with_mh) -> `crates/mc-service/tests/common/mod.rs`
+- MC tests (join_tests T1-T15, actor_metrics, auth_layer, gc, media_coordination, orphan_metrics, redis_metrics, register_meeting, token_refresh, webtransport_accept_loop) -> `crates/mc-service/tests/`; idempotent MH-retry invariant -> `crates/mc-service/src/grpc/media_coordination.rs:tests::test_coordination_flow_connect_disconnect_round_trip`; GC -> `crates/gc-service/tests/meeting_tests.rs`
+- MC shared scaffolding (MockMhAssignmentStore, MockMhRegistrationClient + `wait_for_calls`, TestStackHandles, build_test_stack, seed_meeting_with_mh, create_meeting_with_handlers) -> `crates/mc-service/tests/common/mod.rs`, `crates/mc-service/tests/join_tests.rs`
 - MC accept-loop rig (`bind() → accept_loop()` + `write_self_signed_pems`) -> `crates/mc-service/tests/common/accept_loop_rig.rs:AcceptLoopRig` (near-clone of MH's; extraction candidate per ADR-0032 §Step 6 + TODO.md)
-- MH tests (gc_integration, mc_client_integration, auth_layer_integration, register_meeting_integration, webtransport_integration) -> `crates/mh-service/tests/`
+- MH tests (gc_integration, mc_client_integration, auth_layer_integration, register_meeting_integration, webtransport_integration, webtransport_accept_loop_integration, token_refresh_integration) -> `crates/mh-service/tests/`
 - MH shared rigs (TestKeypair, mock_mc, jwks_rig, grpc_rig, accept_loop_rig, wt_client, tokens) -> `crates/mh-service/tests/common/`
-- AC tests (Step 4 metric backfill, 13 cluster files: http, bcrypt, token_validation, rate_limit, key_rotation, jwks, credential_ops, errors, token_issuance_service, token_issuance_user, internal_token, audit_log_failures, db) -> `crates/ac-service/tests/*_integration.rs`
-- AC + GC in-crate scaffolding -> `crates/ac-service/tests/common/test_state.rs` (`make_app_state`, `seed_signing_key`, `seed_service_credential`), `crates/ac-service/tests/common/jwt_fixtures.rs` (`sign_service_token`, `sign_user_token`; MIN_BCRYPT_COST except `bcrypt_metrics_integration.rs`); `crates/gc-service/tests/common/jwt_fixtures.rs` (`TestKeypair`, `TestUserClaims`, `TestServiceClaims`; Step 5 full 3-of-3 migration; attack helpers as free fns over `&TestKeypair`). TODO.md.
-- Shared fixtures (cross-service) -> `crates/mc-test-utils/src/jwt_test.rs`, `crates/gc-test-utils/src/server_harness.rs`, `crates/ac-test-utils/src/` (crypto_fixtures, server_harness, token_builders); MetricAssertion -> `crates/common/src/observability/testing.rs`
+- env-tests (cluster integration) -> `crates/env-tests/tests/`; MH QUIC E2E (R-33) -> `crates/env-tests/tests/26_mh_quic.rs`; join flow -> `:24_join_flow.rs`
+- AC tests (13 cluster files) -> `crates/ac-service/tests/*_integration.rs`; in-crate scaffolding -> `crates/ac-service/tests/common/`; GC scaffolding -> `crates/gc-service/tests/common/jwt_fixtures.rs`
+- Shared fixtures (cross-service) -> `crates/{ac,gc,mc}-test-utils/src/`; MetricAssertion -> `crates/common/src/observability/testing.rs`
 
 ## Per-Service Config Parsing
 - AC/GC/MC/MH config -> `crates/*/src/config.rs:Config::from_vars()` (per-service); ordinal parsing -> `crates/common/src/config.rs:parse_statefulset_ordinal()`
@@ -37,14 +38,19 @@
 - McAuthLayer/MhAuthLayer near-identical tower Layer/Service (extraction candidate in TODO.md); shared constant `common::jwt::MAX_JWT_SIZE_BYTES`
 
 ## MC gRPC Services (GC→MC + MH→MC + MC→MH)
-- MC assignment (GC→MC) -> `crates/mc-service/src/grpc/mc_service.rs:McAssignmentService`; media coordination (MH→MC, R-15) -> `:grpc/media_coordination.rs:McMediaCoordinationService`
+- MC assignment (GC→MC) -> `crates/mc-service/src/grpc/mc_service.rs:McAssignmentService`; media coordination (MH→MC, R-15) -> `crates/mc-service/src/grpc/media_coordination.rs:McMediaCoordinationService`
 - MH connection registry (single MAX_ID_LENGTH source) -> `crates/mc-service/src/mh_connection_registry.rs:MhConnectionRegistry`
-- MhRegistrationClient trait + async RegisterMeeting trigger (R-12) -> `crates/mc-service/src/grpc/mh_client.rs`, `:webtransport/connection.rs:register_meeting_with_handlers()`
+- MhRegistrationClient trait + async RegisterMeeting trigger (R-12) -> `crates/mc-service/src/grpc/mh_client.rs`, `crates/mc-service/src/webtransport/connection.rs:register_meeting_with_handlers()`
+
+## MH Service (R-12..R-36)
+- MH WebTransport stack (server, accept loop, connection handler) -> `crates/mh-service/src/webtransport/`; provisional-accept select extracted -> `:connection.rs:await_meeting_registration()`
+- MH JWT validator + SessionManager + gRPC clients -> `crates/mh-service/src/auth/mod.rs:MhJwtValidator`, `crates/mh-service/src/session/mod.rs:SessionManager`, `crates/mh-service/src/grpc/`
+- MH selection (Vec<MhAssignmentInfo> with grpc_endpoint) -> `crates/gc-service/src/services/mh_selection.rs:MhSelection`
 
 ## gRPC Clients (Cross-Service)
 - MC GcClient (bounded retries, fast/comprehensive heartbeats) -> `crates/mc-service/src/grpc/gc_client.rs`; MC MhClient (per-call channels, no retries) -> `crates/mc-service/src/grpc/mh_client.rs`
-- MH GcClient (unbounded retries, load reports) -> `crates/mh-service/src/grpc/gc_client.rs`
-- Shared patterns: channel creation, `add_auth` (~10 lines, 3 call sites — extraction candidate per TODO.md), backoff constants
+- MH GcClient (unbounded retries, load reports) -> `crates/mh-service/src/grpc/gc_client.rs`; MH McClient (channel-per-call, exp backoff, auth-error short-circuit) -> `crates/mh-service/src/grpc/mc_client.rs`
+- Shared `add_auth` (~10 lines, 4 call sites — extraction candidate per TODO.md)
 
 ## Redis Abstractions (MC)
 - MhAssignmentStore trait -> `crates/mc-service/src/redis/client.rs:MhAssignmentStore` (testability seam for join flow)
@@ -62,12 +68,8 @@
 - setup/teardown (ADR-0030) -> `infra/kind/scripts/{setup,teardown}.sh`; devloop -> `infra/devloop/devloop.sh`
 
 ## False Positive Boundaries
-- Per-service error mapping (GcError vs McError vs MhError) -> required, not duplication
-- MC GcClient vs MH GcClient -> different RPCs, retry strategies, heartbeat models
-- AC rate limiting (DB-backed lockout) vs GC rate limiting (middleware RPM) -> different mechanisms
-- common::jwt enums vs common::meeting_token -> JWT enums intentionally narrower
-- AC test-side `Claims { ... }` literal repetition (5 axes of variation) -> false-positive on the literal itself; surrounding decrypt-and-sign boilerplate IS extracted to `tests/common/jwt_fixtures.rs` (`sign_service_token`, `sign_user_token`; 6 call sites). TODO.md tracks the literal-only repetition.
+- Per-service error mapping (GcError/McError/MhError); MC vs MH GcClient (different RPCs/retry); AC vs GC rate limiting (different mechanisms); `common::jwt` vs `common::meeting_token` (JWT enums narrower)
+- AC test-side `Claims { ... }` literal repetition -> false-positive on the literal; surrounding decrypt-and-sign IS extracted to `crates/ac-service/tests/common/jwt_fixtures.rs`. TODO.md tracks the literal-only repetition.
 
-## Abstraction Lessons (DRY judgment calls)
-- **Abstract the fixed mechanic, not speculative axes (AC Step 4 iter-2→iter-3, GC Step 5)**: speculative helpers pre-baking varying axes get abandoned (`sign_service_token_iat_offset` 3-of-5 axes); the fix is helpers parameterized only on the truly-fixed mechanic (`sign_service_token(pool, master_key, &Claims)`, `TestKeypair` + free-fn attack helpers). When removing dead helpers, verify the duplication is gone, not just moved inline. Mechanical extraction (incl. receiver-style → free-fn) ≠ renaming/re-shaping types.
-- **Per-crate `tests/common/` 3-crate sibling (Steps 3-5)**: AC + MC + GC each own a `tests/common/` with `AppState`/`Config` builders, DB seeding, JWT fixtures; topology divergence keeps them per-service. Cross-crate fixtures (harnesses, crypto, token builders) belong in `*-test-utils`. Workspace-level promotion to `crates/test-utils-common` triggers on 4th caller. Active duplication tech debt -> `docs/TODO.md` (Cross-Service Duplication section). Common crate + test fixtures -> `crates/common/src/`, `crates/mc-test-utils/`, `crates/gc-test-utils/`, `crates/ac-test-utils/`.
+## Tech Debt / Common Crates
+- Active cross-service duplication -> `docs/TODO.md`; common crate + per-service test-utils -> `crates/common/src/`, `crates/{ac,gc,mc}-test-utils/`

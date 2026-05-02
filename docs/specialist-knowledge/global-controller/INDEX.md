@@ -26,8 +26,8 @@
 - MC gRPC service (register, heartbeat) -> `crates/gc-service/src/grpc/mc_service.rs:McService`
 - MH gRPC service (register, load report) -> `crates/gc-service/src/grpc/mh_service.rs:MhService`
 - MC assignment + load balancing -> `crates/gc-service/src/services/mc_assignment.rs:McAssignmentService`
-- MH selection (active/active peers by load/AZ; types: MhSelection, MhAssignmentInfo) -> `crates/gc-service/src/services/mh_selection.rs:MhSelectionService`
-- MC gRPC client (assign_meeting RPC) -> `crates/gc-service/src/services/mc_client.rs:McClientTrait`
+- MH selection (active/active `handlers: Vec<MhAssignmentInfo>`, no primary/backup; `grpc_endpoint` propagated DB→info→proto) -> `crates/gc-service/src/services/mh_selection.rs:MhSelectionService`
+- MC gRPC client (`assign_meeting` RPC carrying per-handler `webtransport_endpoint` + `grpc_endpoint`) -> `crates/gc-service/src/services/mc_client.rs:McClientTrait`
 - AC HTTP client (meeting/guest tokens) -> `crates/gc-service/src/services/ac_client.rs:AcClient`
 - MC/MH repositories (register, heartbeat, staleness) -> `crates/gc-service/src/repositories/` (`meeting_controllers.rs`, `media_handlers.rs`)
 - Meetings repository (create with limit check, audit log) -> `crates/gc-service/src/repositories/meetings.rs:MeetingsRepository`
@@ -45,7 +45,7 @@
 - GC <-> MC (gRPC registration + heartbeat) -> `crates/gc-service/src/grpc/mc_service.rs`
 - GC <-> MC (gRPC assignment RPC, requires service.write.mc per ADR-0003) -> `crates/gc-service/src/services/mc_client.rs`
 - GC <-> MH (gRPC registration + load report) -> `crates/gc-service/src/grpc/mh_service.rs`
-- MhAssignmentInfo -> MhAssignment proto mapping -> `crates/gc-service/src/services/mc_client.rs:assign_meeting()`
+- MhAssignmentInfo -> MhAssignment proto mapping (mh_id, webtransport_endpoint, grpc_endpoint; `MhRole` removed, field 3 reserved) -> `crates/gc-service/src/services/mc_client.rs:assign_meeting()`
 - GC <-> Client (HTTP API /api/v1/*) -> `crates/gc-service/src/routes/mod.rs`
 - UserClaims (user JWT claims type) -> `crates/common/src/jwt.rs:UserClaims`
 - env-tests GC client fixture -> `crates/env-tests/src/fixtures/gc_client.rs`

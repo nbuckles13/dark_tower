@@ -29,6 +29,7 @@
 - Error type, `From<JwtError>` → `crates/gc-service/src/errors.rs:GcError`
 - Auth (JWT/JWKS, middleware) → `auth/jwt.rs`, `jwks.rs`, `middleware/auth.rs:require_user_auth()`
 - Meeting handlers (`participant=user|guest` parity-note + COVERAGE GAP blocks at `:512-528, 577-585, 605-613`) → `handlers/meetings.rs:create_meeting()`, `join_meeting()`, `get_guest_token()`, `JoinMeetingResponse::new()`; repositories → `repositories/meetings.rs`, `participants.rs`; AC/MC clients → `services/ac_client.rs:AcClient`, `mc_client.rs:McClientTrait`
+- MH selection (flat `handlers: Vec<MhAssignmentInfo>` with `grpc_endpoint`; up to 2 peer MHs by load/AZ) → `services/mh_selection.rs:MhSelection`, `MhSelectionService::select()`
 - Metrics + tests → `observability/metrics.rs` (Cat B byte-1:1 w/ MH/MC at `:295-305`), `docs/observability/metrics/gc-service.md`, `infra/grafana/dashboards/gc-overview.json`; Step 5 13 cluster files (4-cell gauge adjacency at `registered_controllers_metrics_integration.rs`, wiring-only annotation at `meeting_join_metrics_integration.rs:132-146`, JWT fixtures via `#[path = "common/mod.rs"]` from 3 in-place tests at `tests/common/jwt_fixtures.rs`) → `crates/gc-service/tests/*_metrics_integration.rs`
 
 ## Code Locations — MC Service
@@ -51,7 +52,7 @@
 - Auth: JWT validator → `auth/mod.rs:MhJwtValidator`; interceptor → `grpc/auth_interceptor.rs:MhAuthInterceptor`; auth layer (async JWKS, scope `service.write.mh`) → `grpc/auth_interceptor.rs:MhAuthLayer`
 - GC client → `grpc/gc_client.rs:GcClient`; MC client (MH→MC notify, per-call channel, retry) → `grpc/mc_client.rs:McClient`
 - gRPC stub service (MC→MH: RegisterMeeting) → `grpc/mh_service.rs:MhMediaService`; Session manager → `session/mod.rs:SessionManager`
-- WebTransport: server → `webtransport/server.rs:WebTransportServer`; connection (JWT, provisional, MC notify) → `webtransport/connection.rs:handle_connection()`
+- WebTransport: server → `webtransport/server.rs:WebTransportServer`; connection (JWT, provisional, MC notify) → `webtransport/connection.rs:handle_connection()`; provisional-accept select extracted to `await_meeting_registration()` returning `RegistrationOutcome { Registered, Timeout, Cancelled }` (timeout-arm-only metric fire — see behavioral tests at `:#[cfg(test)] mod tests`)
 - Startup wiring → `main.rs`; Metrics → `observability/metrics.rs`; catalog → `docs/observability/metrics/mh-service.md`
 - Integration tests → `tests/{gc,mc_client,auth_layer,register_meeting,webtransport,webtransport_accept_loop,token_refresh}_integration.rs`; shared rigs → `tests/common/{grpc_rig,jwks_rig,mock_mc,accept_loop_rig,wt_client,tokens}.rs`
 - Cat B metric extraction (stateless pure fn next to sibling `record_*` wrappers) → `observability/metrics.rs:record_token_refresh_metrics()`; matrix test harness (success + every `error_category` variant) at same file `mod tests`
@@ -65,6 +66,7 @@
 
 ## Infrastructure & Guards
 - Standard health endpoints (`/health`, `/ready`) → ADR-0012 (Section: Standard Operational Endpoints)
+- MH QUIC story runbooks (R-33 env-tests, R-34 incident scenarios, R-36 post-deploy) → `crates/env-tests/tests/26_mh_quic.rs`; `docs/runbooks/mh-incident-response.md` (Sc 13/14), `docs/runbooks/mc-incident-response.md` (Sc 11/12/13), `docs/runbooks/mh-deployment.md` Post-Deploy Monitoring Checklist
 - MC+MH TLS cert generation → `scripts/generate-dev-certs.sh`
 - Env-tests cluster module → `crates/env-tests/src/cluster.rs`
 - Kind cluster (ADR-0030): `kind-config.yaml.tmpl`, `setup.sh` (`deploy_only_service()`, `DT_HOST_GATEWAY_IP`), `{mc,mh}-{0,1}-configmap.yaml`

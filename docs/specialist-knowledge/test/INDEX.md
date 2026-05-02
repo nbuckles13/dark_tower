@@ -30,14 +30,14 @@
 ## Code Locations: MC Service
 - Auth (meeting/guest JWT, McAuthInterceptor, JWKS McAuthLayer+scope) -> `crates/mc-service/src/auth/mod.rs:tests`, `grpc/auth_interceptor.rs:tests`
 - Config + error tests (incl. MhAssignmentMissing) -> `crates/mc-service/src/config.rs:tests`, `crates/mc-service/src/errors.rs:tests`
-- Actor tests (controller, meeting, participant, session) -> `crates/mc-service/src/actors/controller.rs:tests`, `meeting.rs`, `participant.rs`, `session.rs`
-- Join flow + WebTransport tests (T1-T13 MH assignment + media_servers + bridge + RegisterMeeting trigger + retry/backoff `tests::test_register_*` + `handle_client_message` w/ MetricAssertion for `mc_media_connection_failures_total`) -> `crates/mc-service/tests/join_tests.rs`, `src/webtransport/connection.rs:tests`
-- MH coordination + GC heartbeat (per-(status,type) matrix w/ injected fault) -> `crates/mc-service/src/mh_connection_registry.rs:tests`, `grpc/media_coordination.rs:tests`, `tests/gc_integration.rs`, `heartbeat_tasks.rs`
+- Actor tests (controller, meeting, participant, session; `MhConnectionRegistry::remove_meeting` lifecycle wired in `controller.rs`) -> `crates/mc-service/src/actors/controller.rs:tests`, `meeting.rs`, `participant.rs`, `session.rs`
+- Join flow + WebTransport tests (T1-T15 MH assignment + media_servers + bridge + RegisterMeeting trigger T12/T13 + multi-MH T14 + grpc_endpoint=None skip T15 + retry/backoff `tests::test_register_*` + `handle_client_message` w/ MetricAssertion for `mc_media_connection_failures_total`) -> `crates/mc-service/tests/join_tests.rs`, `src/webtransport/connection.rs:tests`
+- MH coordination + GC heartbeat (per-(status,type) matrix w/ injected fault; idempotent-disconnect round-trip) -> `crates/mc-service/src/mh_connection_registry.rs:tests`, `grpc/media_coordination.rs:tests`, `tests/gc_integration.rs`, `heartbeat_tasks.rs`
 - Accept-loop component tests (real `bind()+accept_loop()`, `accepted|rejected|error` status, 4 reachable `session_join_failures` `error_type` via real injected faults) -> `crates/mc-service/tests/webtransport_accept_loop_integration.rs`
 - Auth-layer integration (5-`failure_reason` JWT cluster + `caller_type_rejected`, real wiremock JWKS) -> `crates/mc-service/tests/auth_layer_integration.rs`
 - Media coordination + register-meeting + token-refresh integration (`mh_notifications`, stub MH gRPC, Cat B `record_token_refresh_metrics` per-`error_category` matrix in `crates/mc-service/src/observability/metrics.rs:tests`) -> `crates/mc-service/tests/media_coordination_integration.rs`, `register_meeting_integration.rs`, `token_refresh_integration.rs`
 - Per-failure-class wrapper covers (actor metrics, redis ops, orphans) -> `crates/mc-service/tests/actor_metrics_integration.rs`, `redis_metrics_integration.rs`, `orphan_metrics_integration.rs`
-- Shared rigs + scaffolding (`AcceptLoopRig`, `TestStackHandles`, `build_test_stack`, `seed_meeting_with_mh`, `MockMhAssignmentStore`, `MockMhRegistrationClient`) -> `crates/mc-service/tests/common/`; health + metrics + cross-service test utils (mock Redis/GC/MH) -> `crates/mc-service/src/observability/health.rs`, `crates/mc-service/src/observability/metrics.rs`, `crates/mc-test-utils/src/`
+- Shared rigs + scaffolding (`AcceptLoopRig`, `TestStackHandles`, `build_test_stack`, `seed_meeting_with_mh`, `MockMhAssignmentStore` trait, `MockMhRegistrationClient` w/ `Arc<Notify>`-based `wait_for_calls()` deterministic sync) -> `crates/mc-service/tests/common/`, `crates/mc-service/tests/join_tests.rs`; health + metrics + cross-service test utils (mock Redis/GC/MH) -> `crates/mc-service/src/observability/health.rs`, `crates/mc-service/src/observability/metrics.rs`, `crates/mc-test-utils/src/`
 
 ## Code Locations: MH Service
 - Config tests (env vars, defaults, TLS, debug redaction, advertise addresses, JWKS URL, timeouts) -> `crates/mh-service/src/config.rs:tests`
@@ -47,8 +47,7 @@
 - gRPC handler tests (RegisterMeeting validation, SessionManagerHandle integration) -> `crates/mh-service/src/grpc/mh_service.rs:tests`
 - Session manager actor tests (handle API, registration, connections, pending promotion, notify via oneshot) -> `crates/mh-service/src/session/mod.rs:tests`
 - WebTransport server + connection handler -> `crates/mh-service/src/webtransport/server.rs`, `connection.rs`
-- Health + metrics tests (incl. `record_mc_notification`, WT notify wiring via `spawn_notify_connected()`) -> `crates/mh-service/src/observability/`, `src/webtransport/connection.rs:spawn_notify_connected()`
-- McClient tests + MC notification integration (mock MediaCoordinationService, retry, auth short-circuit) -> `crates/mh-service/src/grpc/mc_client.rs:tests`, `tests/mc_client_integration.rs`
+- Health + metrics tests + McClient (`record_mc_notification`, `spawn_notify_connected()` WT notify wiring; mock MediaCoordinationService, retry, auth short-circuit) -> `crates/mh-service/src/observability/`, `src/webtransport/connection.rs:spawn_notify_connected()`, `src/grpc/mc_client.rs:tests`, `tests/mc_client_integration.rs`
 - GC integration tests (registration, load reports, NOT_FOUND) -> `crates/mh-service/tests/gc_integration.rs`
 - Auth layer integration (MhAuthLayer + MhMediaService, JWKS upgrade, alg-none/HS256 confusion) -> `crates/mh-service/tests/auth_layer_integration.rs`
 - RegisterMeeting integration (happy path over wire, InvalidArgument) -> `crates/mh-service/tests/register_meeting_integration.rs`
@@ -57,10 +56,11 @@
 - Shared rigs (TestKeypair, JWKS, gRPC, WebTransport+self-signed TLS via `rcgen` tempdir PEMs, MC mock, token minters, accept_loop_rig) -> `crates/mh-service/tests/common/`
 
 ## Code Locations: Environment Tests
-- Cluster bootstrap + fixtures → `crates/env-tests/src/`, flows (20-24) → `crates/env-tests/tests/`
+- Cluster bootstrap + fixtures → `crates/env-tests/src/`, flows (20-26) → `crates/env-tests/tests/`
 - Cluster connection + port config (ADR-0030) → `crates/env-tests/src/cluster.rs`
 - Client fixtures (GC, Auth, Prometheus) → `crates/env-tests/src/fixtures/`
 - Join flow tests (AC→GC→MC e2e) → `crates/env-tests/tests/24_join_flow.rs`
+- MH QUIC e2e tests (R-33: media_servers populated, MH accepts/rejects framed JWT via `conn.closed()` symmetric inverse, MH→MC connect/disconnect counter delta with `#[serial(mh_notifications)]` + custom 60s/90s budgets, R-33#6 `#[ignore]`d stub citing component-tier coverage) → `crates/env-tests/tests/26_mh_quic.rs`
 - CanaryPod + NetworkPolicy manifests → `crates/env-tests/src/canary.rs`, `infra/services/{ac,gc,mc,mh}-service/network-policy.yaml`
 - Cluster health + kubectl security checks → `crates/env-tests/tests/00_cluster_health.rs`
 - Observability validation (Loki, metrics) → `crates/env-tests/tests/30_observability.rs`, `src/cluster.rs:is_loki_available()`
