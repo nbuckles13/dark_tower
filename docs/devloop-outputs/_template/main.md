@@ -210,8 +210,8 @@ TBD
 **True duplication findings** (entered fix-or-defer flow):
 {List findings sent to implementer, or "None"}
 
-**Extraction opportunities** (tech debt observations):
-{List opportunities documented below, or "None"}
+**Extraction opportunities** (appended to `docs/TODO.md`):
+{One bullet per `docs/TODO.md` entry added, citing the section heading the entry was added under, or "None"}
 
 ### Operations Reviewer
 **Verdict**: CLEAR / RESOLVED / ESCALATED
@@ -221,33 +221,17 @@ TBD
 
 ---
 
-## Tech Debt
+## Tech Debt References
 
-<!-- Document all accepted deferrals and DRY extraction opportunities here. -->
+<!-- Tech debt observed during this devloop is appended to `docs/TODO.md`
+     under the appropriate section (Cross-Service Duplication, Observability
+     Debt, Code Quality, etc.). Cite the entries below so future readers of
+     this devloop can locate them. main.md does not duplicate the entries. -->
 
-### Deferred Findings
+- {Section heading in docs/TODO.md} — {short hook quoting the first line of the entry}
 
-| Finding | Reviewer | Location | Deferral Justification | Follow-up Task |
-|---------|----------|----------|------------------------|----------------|
-| {description} | {reviewer} | `file.rs:line` | {implementer's justification for deferral} | {task ref} |
-
-{Or "No deferred findings" if all findings were fixed}
-
-### Cross-Service Duplication (from DRY Reviewer)
-
-| Pattern | New Location | Existing Location | Follow-up Task |
-|---------|--------------|-------------------|----------------|
-| {pattern name} | `crates/X/src/file.rs:line` | `crates/Y/src/file.rs:line` | {Extraction task} |
-
-{Or "No cross-service duplication detected" if DRY review found nothing}
-
-### Temporary Code (from Code Reviewer)
-
-| Item | Location | Reason | Follow-up Task |
-|------|----------|--------|----------------|
-| {endpoint/function} | `path/to/file.rs:line` | {Why it's temporary} | {Remove when X} |
-
-{Or "No temporary code detected" if Code Reviewer found nothing}
+{Or "No tech debt observed during this devloop" if reviewers and implementer
+recorded nothing.}
 
 ---
 

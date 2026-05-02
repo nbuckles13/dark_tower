@@ -109,11 +109,17 @@ get_diff_paths() {
 # -----------------------------------------------------------------------------
 # Find the active devloop's main.md from the scoped diff. Looks for main.md
 # files under docs/devloop-outputs/ that appear in the diff (added or modified).
+# Excludes scaffolding directories (`_template`, `_*`) — those are template
+# files, not active devloops, and contain placeholder values that would
+# always trip the scope check.
 # Echoes one path per line; empty if none found.
 # -----------------------------------------------------------------------------
 find_active_main_md() {
     local diff_paths="$1"
-    echo "$diff_paths" | grep -E '^docs/devloop-outputs/[^/]+/main\.md$' || true
+    echo "$diff_paths" \
+        | grep -E '^docs/devloop-outputs/[^/]+/main\.md$' \
+        | grep -Ev '^docs/devloop-outputs/_' \
+        || true
 }
 
 # -----------------------------------------------------------------------------
