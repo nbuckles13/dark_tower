@@ -18,7 +18,11 @@
 #
 set -euo pipefail
 
-CERT_DIR="infra/docker/certs"
+# Resolve repo root from the script's own location so this script works
+# regardless of caller's CWD (setup.sh, manual host invocation, etc.).
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+CERT_DIR="$REPO_ROOT/infra/docker/certs"
 CA_KEY="${CERT_DIR}/ca.key"
 CA_CERT="${CERT_DIR}/ca.crt"
 DAYS_CA=3650    # 10 years for dev CA
