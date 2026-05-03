@@ -373,6 +373,8 @@ pub async fn handle_connection(
         };
     let server_msg = ServerMessage {
         message: Some(server_message::Message::JoinResponse(join_response)),
+        trace_parent: String::new(),
+        trace_state: String::new(),
     };
 
     if let Err(e) = write_framed_message(&mut send_stream, &server_msg).await {
@@ -537,7 +539,8 @@ async fn run_bridge_loop(
 /// Handle a post-join client message in the bridge loop.
 ///
 /// Currently handles:
-/// - `MediaConnectionFailed` (R-20): Log warning + record metric. No reallocation.
+/// - `MediaConnectionUpdate` (browser-client-join Task #2 stub): no-op
+///   debug log; per-MH state recording deferred to Task #6.
 /// - All other messages: Ignored (logged at debug level).
 fn handle_client_message(data: &[u8], connection_id: &str) {
     let Ok(client_message) = ClientMessage::decode(data) else {
@@ -550,21 +553,22 @@ fn handle_client_message(data: &[u8], connection_id: &str) {
     };
 
     match client_message.message {
-        Some(client_message::Message::MediaConnectionFailed(msg)) => {
-            // Truncate client-controlled fields before logging to prevent log injection.
-            // Use floor_char_boundary to avoid panicking on multi-byte UTF-8 boundaries.
-            let truncated_url =
-                &msg.media_handler_url[..msg.media_handler_url.floor_char_boundary(256)];
-            let truncated_reason = &msg.error_reason[..msg.error_reason.floor_char_boundary(256)];
-            warn!(
+        Some(client_message::Message::MediaConnectionUpdate(msg)) => {
+            debug!(
                 target: "mc.webtransport.connection",
                 connection_id = %connection_id,
-                media_handler_url = %truncated_url,
-                error_reason = %truncated_reason,
-                all_handlers_failed = msg.all_handlers_failed,
-                "Client reported media connection failure (R-20: no reallocation)"
+                statuses_count = msg.statuses.len(),
+                "MediaConnectionUpdate received (Task #6 stub: per-MH state recording deferred)"
             );
-            metrics::record_media_connection_failed(msg.all_handlers_failed);
+            // TODO(browser-client-join task #6, owner: meeting-controller):
+            //   Record per-MH state on participant actor + emit
+            //   `mc_participant_mh_status_total{state}` metric. SECURITY: when
+            //   reintroducing logging of `mh_url` / `failure_reason` /
+            //   `failure_code`, apply `floor_char_boundary(256)` truncation on
+            //   each (matches the discipline previously used for
+            //   `MediaConnectionFailed.media_handler_url` / `error_reason` at
+            //   this site) — these are client-controlled strings and must not
+            //   be logged unbounded.
         }
         Some(_) => {
             debug!(
@@ -665,6 +669,8 @@ async fn send_error(
             message: message.to_string(),
             details: Default::default(),
         })),
+        trace_parent: String::new(),
+        trace_state: String::new(),
     };
     let result = write_framed_message(stream, &server_msg).await;
     // Finish the stream to flush buffered data before the caller drops it
@@ -821,63 +827,12 @@ async fn register_meeting_with_handlers(
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_handle_media_connection_failed() {
-        // Drives the real `decode → match → record_media_connection_failed`
-        // path with `all_handlers_failed=false` and asserts the metric
-        // delta per ADR-0032 Step 3 §F1 review feedback. This is the
-        // production-path assertion for `mc_media_connection_failures_total`
-        // — `tests/media_coordination_integration.rs` only covers the
-        // wrapper plumbing.
-        use common::observability::testing::MetricAssertion;
-        let snap = MetricAssertion::snapshot();
-
-        let msg = ClientMessage {
-            message: Some(client_message::Message::MediaConnectionFailed(
-                signaling::MediaConnectionFailed {
-                    media_handler_url: "https://mh-1.example.com".to_string(),
-                    error_reason: "timeout".to_string(),
-                    all_handlers_failed: false,
-                },
-            )),
-        };
-        let data = msg.encode_to_vec();
-        handle_client_message(&data, "test-conn-1");
-
-        snap.counter("mc_media_connection_failures_total")
-            .with_labels(&[("all_failed", "false")])
-            .assert_delta(1);
-        // Adjacency: a refactor that flips the boolean→label mapping must
-        // fail this assertion.
-        snap.counter("mc_media_connection_failures_total")
-            .with_labels(&[("all_failed", "true")])
-            .assert_delta(0);
-    }
-
-    #[test]
-    fn test_handle_media_connection_failed_all_handlers() {
-        use common::observability::testing::MetricAssertion;
-        let snap = MetricAssertion::snapshot();
-
-        let msg = ClientMessage {
-            message: Some(client_message::Message::MediaConnectionFailed(
-                signaling::MediaConnectionFailed {
-                    media_handler_url: "https://mh-2.example.com".to_string(),
-                    error_reason: "connection_refused".to_string(),
-                    all_handlers_failed: true,
-                },
-            )),
-        };
-        let data = msg.encode_to_vec();
-        handle_client_message(&data, "test-conn-2");
-
-        snap.counter("mc_media_connection_failures_total")
-            .with_labels(&[("all_failed", "true")])
-            .assert_delta(1);
-        snap.counter("mc_media_connection_failures_total")
-            .with_labels(&[("all_failed", "false")])
-            .assert_delta(0);
-    }
+    // Tests for `handle_client_message` against the new
+    // `MediaConnectionUpdate` variant are deferred to browser-client-join
+    // Task #6 (meeting-controller), which writes them against the new
+    // `mc_participant_mh_status_total{state}` metric and the real per-MH
+    // state-recording handler. Task #2 leaves the handler as a `tracing::debug!`
+    // stub (no semantic behavior worth asserting in isolation).
 
     #[test]
     fn test_handle_client_message_unhandled_type() {
@@ -888,6 +843,8 @@ mod tests {
                     video_muted: false,
                 },
             )),
+            trace_parent: String::new(),
+            trace_state: String::new(),
         };
         let data = msg.encode_to_vec();
         // Should not panic -- exercises the Some(_) branch
@@ -903,7 +860,11 @@ mod tests {
 
     #[test]
     fn test_handle_client_message_empty_message() {
-        let msg = ClientMessage { message: None };
+        let msg = ClientMessage {
+            message: None,
+            trace_parent: String::new(),
+            trace_state: String::new(),
+        };
         let data = msg.encode_to_vec();
         // Should not panic -- exercises the None branch
         handle_client_message(&data, "test-conn-5");

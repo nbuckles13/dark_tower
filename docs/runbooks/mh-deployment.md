@@ -41,7 +41,7 @@ Pre-deployment checks: GC reachable, MC reachable, JWKS endpoint reachable, MH W
 
 ## Post-Deploy Monitoring Checklist: MH WebTransport + MC↔MH Coordination
 
-Use this checklist after any deployment that touches MH WebTransport server code (handshake, JWT validation, `await_meeting_registration` timeout) or MC↔MH coordination wiring (`RegisterMeeting`, MH→MC notifications, `MediaConnectionFailed` reporting). For routine deployments that do not touch these paths, the general MH monitoring section is sufficient.
+Use this checklist after any deployment that touches MH WebTransport server code (handshake, JWT validation, `await_meeting_registration` timeout) or MC↔MH coordination wiring (`RegisterMeeting`, MH→MC notifications). For routine deployments that do not touch these paths, the general MH monitoring section is sufficient.
 
 This checklist implements the post-deploy verification required by user story `docs/user-stories/2026-04-12-mh-quic-connection.md` §operations (R-36). Required windows: 30-min, 2-hour, 4-hour, 24-hour.
 
@@ -86,9 +86,6 @@ sum(rate(mh_mc_notifications_total[5m]))
 # Active connections across all MH pods (target: >0 once traffic flows)
 sum(mh_active_connections)
 
-# Client-reported all-MH-failed events in the bake window (target: 0)
-sum(increase(mc_media_connection_failures_total{all_failed="true"}[30m]))
-
 # Is traffic flowing? (sanity check; mirrors join-flow precedent's rate spot-check)
 sum(increase(mh_webtransport_connections_total{status="accepted"}[5m]))
 ```
@@ -99,16 +96,13 @@ sum(increase(mh_webtransport_connections_total{status="accepted"}[5m]))
 - [ ] `mc_register_meeting_total{status="success"}` rate / total >95% (MC RegisterMeeting RPC SLO; emitter labels are `success|error`, see `crates/mc-service/src/observability/metrics.rs:340`)
 - [ ] `mh_mc_notifications_total{status="success"}` rate / total >95% (MH→MC delivery SLO)
 - [ ] `sum(mh_active_connections) > 0` once test traffic is flowing (proof clients are connecting)
-- [ ] `mc_media_connection_failures_total{all_failed="true"}` increase over 30m = 0 (any non-zero is a P1 — clients are losing all MH paths)
 - [ ] No new MH alerts firing: `MHHighJwtValidationFailures`, `MHHighWebTransportRejections`, `MHWebTransportHandshakeSlow`
-- [ ] No new MC alerts firing: `MCMediaConnectionAllFailed`
 
 ### 2-hour check
 
 - [ ] WebTransport handshake success rate trend stable (no downward drift toward 95%)
 - [ ] JWT validation success rate trend stable (no downward drift toward 99%)
 - [ ] `mh_register_meeting_timeouts_total` increase over the last 2 hours = 0
-- [ ] `mc_media_connection_failures_total{all_failed="true"}` increase over 2h = 0
 - [ ] No mh-service or mc-service pod restarts since deploy completed (`kubectl get pods -n dark-tower -l app=mh-service` — `RESTARTS` column should match pre-deploy baseline)
 - [ ] Logs show no repeated error patterns related to WebTransport, JWT, or RegisterMeeting (cross-reference `mh-incident-response.md` Scenarios 2, 5, 10 if anything looks off)
 
@@ -127,7 +121,6 @@ sum(rate(mh_jwt_validations_total[5m]))
 
 # Cumulative-zero counters use the per-window increase
 sum(increase(mh_register_meeting_timeouts_total[2h]))
-sum(increase(mc_media_connection_failures_total{all_failed="true"}[2h]))
 ```
 
 ### 4-hour check
@@ -154,7 +147,6 @@ This is the long-tail window where slow leaks show up — JWKS cache eviction in
 ```promql
 # Cumulative coordination-failure counts since deploy (target: 0)
 sum(increase(mh_register_meeting_timeouts_total[24h]))
-sum(increase(mc_media_connection_failures_total{all_failed="true"}[24h]))
 
 # 24-hour averaged success rates — should still match 30-min readings
 sum(rate(mh_webtransport_connections_total{status="accepted"}[24h]))
@@ -180,7 +172,6 @@ histogram_quantile(0.95,
 ```
 
 - [ ] `mh_register_meeting_timeouts_total` increase over 24h = 0
-- [ ] `mc_media_connection_failures_total{all_failed="true"}` increase over 24h = 0
 - [ ] 24-hour averaged WebTransport handshake success rate still >95%
 - [ ] 24-hour averaged JWT validation success rate still >99% (catches slow JWKS-cache or token-rotation regressions that don't show up at 30-min)
 - [ ] No upward trend in WebTransport rejection rate over the past 24h

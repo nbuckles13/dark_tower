@@ -32,7 +32,7 @@
 
 ## Runbooks & Database
 - Per-service incident/deployment → `docs/runbooks/` (ac, gc, mc, mh); update heuristics — additive `# Note:` + disambiguation PromQL for metric-family reuse, first-emission "is this an incident?" footnotes → `gc-incident-response.md` Scenario 5 (ADR-0032 Step 5)
-- MH/MC QUIC-story scenarios (MH Sc 13/14 RegisterMeeting-timeout + WT-startup; MC Sc 11/12/13 MediaConnectionFailed + RegisterMeeting coordination + unexpected-notifications two-branch op-vs-security split) → `docs/runbooks/mh-incident-response.md`, `mc-incident-response.md`
+- MH/MC QUIC-story scenarios (MH Sc 13/14 RegisterMeeting-timeout + WT-startup; MC Sc 12/13 RegisterMeeting coordination + unexpected-notifications two-branch op-vs-security split) → `docs/runbooks/mh-incident-response.md`, `mc-incident-response.md`
 - MH post-deploy checklist (30m/2h/4h/24h + R-36 rollback; `or vector(0)` denominator-guard antipattern — use `and sum(rate(...)) > 0` for rollback ratios) → `docs/runbooks/mh-deployment.md`; MC↔MH addendum (cross-pointers + `mc_mh_notifications_received_total`) → `docs/runbooks/mc-deployment.md`
 - Participant tracking + meetings → `crates/gc-service/src/repositories/participants.rs`, `meetings.rs`
 
@@ -67,7 +67,7 @@
 - MC gRPC services (GC→MC assignments, MH→MC MediaCoordination) → `crates/mc-service/src/grpc/mc_service.rs`, `media_coordination.rs`; JWKS auth → `crates/mc-service/src/grpc/auth_interceptor.rs:McAuthLayer`
 - MhConnectionRegistry (cleanup wired in `actors/controller.rs:remove_meeting()`) → `crates/mc-service/src/mh_connection_registry.rs`; idempotent MH-retry invariant (disconnect after registry-clear returns Ok) → `crates/mc-service/src/grpc/media_coordination.rs:test_coordination_flow_connect_disconnect_round_trip()`
 - Redis (fenced writes, MhAssignmentData, MhAssignmentStore trait) → `crates/mc-service/src/redis/client.rs`; actors → `crates/mc-service/src/actors/controller.rs`, `meeting.rs`, `participant.rs`
-- MCMediaConnectionAllFailed alert → `infra/docker/prometheus/rules/mc-alerts.yaml`; MC token-refresh metric (ADR-0032 Cat B) → `crates/mc-service/src/observability/metrics.rs:record_token_refresh_metrics()`; accept-loop rig → `crates/mc-service/tests/common/accept_loop_rig.rs`
+- MC token-refresh metric (ADR-0032 Cat B) → `crates/mc-service/src/observability/metrics.rs:record_token_refresh_metrics()`; accept-loop rig → `crates/mc-service/tests/common/accept_loop_rig.rs`
 
 ## GC Service + Tests
 - GC routes + handlers → `crates/gc-service/src/routes/mod.rs`, `handlers/meetings.rs`

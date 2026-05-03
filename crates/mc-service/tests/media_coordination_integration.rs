@@ -7,21 +7,6 @@
 //! Component tests for `McMediaCoordinationService` driving real
 //! `mc_mh_notifications_received_total` emissions per ADR-0032 Step 3
 //! §Cluster D.
-//!
-//! # `mc_media_connection_failures_total` lives in `connection.rs::tests`
-//!
-//! That metric is recorded inside the module-private `handle_client_message`
-//! at `crates/mc-service/src/webtransport/connection.rs:567` — only
-//! reachable from inside the crate. The production-path assertion lives in
-//! `connection.rs::tests::test_handle_media_connection_failed` and
-//! `test_handle_media_connection_failed_all_handlers`, which encode real
-//! `MediaConnectionFailed` protobuf bytes and feed them through the actual
-//! decode→match→record fn under `MetricAssertion::snapshot()` (added in
-//! ADR-0032 Step 3 to address @test review F1 — the production-path metric
-//! coverage gap).
-//!
-//! The guard's `tests/**/*.rs` fixed-string scan is satisfied by the
-//! reference: `mc_media_connection_failures_total`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 

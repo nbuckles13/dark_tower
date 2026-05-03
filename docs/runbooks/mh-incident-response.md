@@ -729,7 +729,7 @@ histogram_quantile(0.95, rate(gc_rpc_duration_seconds_bucket{method="SendLoadRep
 
 **Impact**: Subset of users unable to establish media sessions on this MH despite a valid JWT. **Active media sessions on this MH are unaffected** — they were promoted before the timeout. Severity is warning because (a) MH correctly enforces the timeout (this is the documented contract), (b) clients can usually fall back to other assigned MHs (active/active topology), and (c) the timeout is the security boundary that bounds stolen-JWT-against-unregistered-meeting exposure to ≤ `register_meeting_timeout_seconds`. **Do NOT treat raising this timeout as a mitigation** — see Recovery.
 
-> **Rollback awareness**: During a deliberate rollback of MH to a pre-RegisterMeeting build, **`mh_register_meeting_timeouts_total` stays flat at zero on the rolled-back pods** (old MH never knew about RegisterMeeting and so never sets up the provisional-accept window) — but clients connecting to those pods will report failures via [MC Scenario 11](mc-incident-response.md#scenario-11-media-connection-failures) because MC's `RegisterMeeting` retries are exhausting silently. If the metric is flat zero on some pods but the user impact is real, check `kubectl rollout history deployment/mh-service -n dark-tower` for an in-progress rollback before treating as an incident. See also [MC Scenario 12](mc-incident-response.md#scenario-12-registermeeting-coordination-failures) for the MC-side rollback-aware triage.
+> **Rollback awareness**: During a deliberate rollback of MH to a pre-RegisterMeeting build, **`mh_register_meeting_timeouts_total` stays flat at zero on the rolled-back pods** (old MH never knew about RegisterMeeting and so never sets up the provisional-accept window) — but client-side coordination breaks silently because MC's `RegisterMeeting` retries are exhausting. If the metric is flat zero on some pods but the user impact is real, check `kubectl rollout history deployment/mh-service -n dark-tower` for an in-progress rollback before treating as an incident. See [MC Scenario 12](mc-incident-response.md#scenario-12-registermeeting-coordination-failures) for the MC-side rollback-aware triage.
 
 **Immediate Response**:
 
@@ -797,7 +797,7 @@ Expected recovery time: bounded by MC-side fix (see MC Sc 12). Once MC starts de
 
 **Do NOT raise `MH_REGISTER_MEETING_TIMEOUT_SECONDS` as a mitigation.** The 15s default is the authorization boundary that bounds stolen-JWT-against-unregistered-meeting exposure. Sustained timeouts are a coordination problem; widening the window only increases the security blast radius. If you find yourself wanting to tune this, escalate to Security Team for review — do not patch.
 
-**Related Alerts**: MC-side `MCMediaConnectionAllFailed` (clients reporting all MHs failed when this is fleet-wide), `MCHighMailboxDepthWarning` / `MCHighMailboxDepthCritical` (upstream cause if MC trigger is queued).
+**Related Alerts**: MC-side `MCHighMailboxDepthWarning` / `MCHighMailboxDepthCritical` (upstream cause if MC trigger is queued).
 
 **Dashboards**: MH Overview → "RegisterMeeting Timeouts (R-26)" (this scenario's headline metric); MH Overview → "RegisterMeeting Receipts by Status" (receipt-side correlate); MC Overview → "RegisterMeeting RPC Rate by Status" + "RegisterMeeting RPC Latency (P50/P95/P99)" (sender-side correlate).
 

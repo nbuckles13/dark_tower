@@ -107,6 +107,8 @@ async fn open_bi_send_join(
         .expect("bi stream ready");
 
     let msg = ClientMessage {
+        trace_parent: String::new(),
+        trace_state: String::new(),
         message: Some(client_message::Message::JoinRequest(JoinRequest {
             meeting_id: meeting_id.to_string(),
             join_token: token.to_string(),
@@ -404,6 +406,8 @@ async fn accept_loop_records_session_join_failure_internal_for_wrong_first_messa
         .expect("bi stream ready");
 
     let mute_msg = ClientMessage {
+        trace_parent: String::new(),
+        trace_state: String::new(),
         message: Some(client_message::Message::MuteRequest(MuteRequest {
             audio_muted: true,
             video_muted: false,

@@ -41,7 +41,7 @@
 
 ## Proto Definitions
 - MC↔MH / MH↔GC / MH→MC RPCs + assignment + DisconnectReason → `proto/internal.proto`
-- Client signaling (MediaStream, StreamAssignment, MediaConnectionFailed, layout) → `proto/signaling.proto`
+- Client signaling (MediaStream, StreamAssignment, MediaConnectionUpdate, layout) → `proto/signaling.proto`
 - Generated Rust code → `crates/proto-gen/build.rs`
 
 ## Integration Seams

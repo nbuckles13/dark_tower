@@ -912,7 +912,7 @@ kubectl rollout undo deployment/mc-service -n dark-tower
 
 ### Post-Deploy Monitoring Checklist: MC↔MH Coordination (RegisterMeeting + Notifications)
 
-Use this checklist after any deployment that touches the MC↔MH coordination path: `RegisterMeeting` RPC client (`crates/mc-service/src/grpc/mh_client.rs`), `MhConnectionRegistry`, MH→MC notification handling, or `MediaConnectionFailed` reporting. This is the MC-side companion to the MH-side post-deploy checklist; the canonical full checklist (with all four windows — 30-min, 2-hour, 4-hour, 24-hour — and rollback criteria) lives at:
+Use this checklist after any deployment that touches the MC↔MH coordination path: `RegisterMeeting` RPC client (`crates/mc-service/src/grpc/mh_client.rs`), `MhConnectionRegistry`, or MH→MC notification handling. This is the MC-side companion to the MH-side post-deploy checklist; the canonical full checklist (with all four windows — 30-min, 2-hour, 4-hour, 24-hour — and rollback criteria) lives at:
 
 - `docs/runbooks/mh-deployment.md` §"Post-Deploy Monitoring Checklist: MH WebTransport + MC↔MH Coordination"
 
@@ -921,7 +921,6 @@ Open that section first if you are deploying mh-service or both services togethe
 **Quick MC-side gates** — for the canonical PromQL, see `docs/runbooks/mh-deployment.md` §"Post-Deploy Monitoring Checklist: MH WebTransport + MC↔MH Coordination" → "30-minute check". Do not duplicate the queries here; thresholds and emitter-label conventions are owned in one place to avoid silent divergence:
 
 - `mc_register_meeting_total{status="success"}` rate / total > 95% (canonical query in MH runbook). Emitter-label note: `status="success|error"` (NOT `failure`); see `crates/mc-service/src/observability/metrics.rs:340` and call sites at `crates/mc-service/src/grpc/mh_client.rs:136,144,157`.
-- `mc_media_connection_failures_total{all_failed="true"}` increase over 30m = 0 (canonical query in MH runbook). Any non-zero is a P1 — clients are losing all MH paths.
 
 **MC-only signal** (no MH-side equivalent — counts events arriving at MC, regardless of which MH originated them):
 
@@ -935,8 +934,6 @@ sum by(event_type) (rate(mc_mh_notifications_received_total[5m]))
 
 - [ ] `mc_register_meeting_total{status="success"}` rate / total >95% (run the canonical query)
 - [ ] `mc_mh_notifications_received_total` rate non-zero (events arriving means MH is reaching MC)
-- [ ] `mc_media_connection_failures_total{all_failed="true"}` increase over 30m = 0 (run the canonical query)
-- [ ] No new `MCMediaConnectionAllFailed` alerts firing (`infra/docker/prometheus/rules/mc-alerts.yaml`)
 - [ ] No mc-service pod restarts since deploy completed
 - [ ] Cross-check the MH-side checklist (link above) for the full set of MH-side checks (handshake, JWT, timeout, MH→MC delivery success rate, active connections)
 

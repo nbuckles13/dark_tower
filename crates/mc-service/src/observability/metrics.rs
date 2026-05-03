@@ -367,24 +367,6 @@ pub fn record_mh_notification(event_type: &str) {
     .increment(1);
 }
 
-/// Record a client-reported media connection failure.
-///
-/// Metric: `mc_media_connection_failures_total`
-/// Labels: `all_failed`
-///
-/// All-failed values: "true", "false"
-/// Cardinality: 2
-///
-/// Recorded in the WebTransport bridge loop when a client sends
-/// a `MediaConnectionFailed` signaling message. Per R-20, no
-/// reallocation action is taken; the metric is for observability only.
-pub fn record_media_connection_failed(all_failed: bool) {
-    counter!("mc_media_connection_failures_total",
-        "all_failed" => if all_failed { "true" } else { "false" }.to_string()
-    )
-    .increment(1);
-}
-
 // ============================================================================
 // gRPC Auth Layer 2 Metrics (ADR-0003)
 // ============================================================================
@@ -608,13 +590,6 @@ mod tests {
     }
 
     #[test]
-    fn test_record_media_connection_failed() {
-        // Test both boolean states
-        record_media_connection_failed(true);
-        record_media_connection_failed(false);
-    }
-
-    #[test]
     fn test_cardinality_bounds() {
         // Verify actor_type labels are bounded
         let valid_actor_types = ["controller", "meeting", "participant"];
@@ -671,10 +646,6 @@ mod tests {
         for event in &valid_mh_events {
             record_mh_notification(event);
         }
-
-        // Verify media connection failure labels are bounded
-        record_media_connection_failed(true);
-        record_media_connection_failed(false);
 
         // Verify caller type rejection labels are bounded (ADR-0003)
         record_caller_type_rejected(
@@ -907,20 +878,12 @@ mod tests {
 
         record_mh_notification("connected");
         record_mh_notification("disconnected");
-        record_media_connection_failed(true);
-        record_media_connection_failed(false);
 
         snap.counter("mc_mh_notifications_received_total")
             .with_labels(&[("event_type", "connected")])
             .assert_delta(1);
         snap.counter("mc_mh_notifications_received_total")
             .with_labels(&[("event_type", "disconnected")])
-            .assert_delta(1);
-        snap.counter("mc_media_connection_failures_total")
-            .with_labels(&[("all_failed", "true")])
-            .assert_delta(1);
-        snap.counter("mc_media_connection_failures_total")
-            .with_labels(&[("all_failed", "false")])
             .assert_delta(1);
     }
 

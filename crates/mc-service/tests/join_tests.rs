@@ -186,6 +186,8 @@ async fn join_and_read_response(
         .expect("bi stream ready");
 
     let client_msg = ClientMessage {
+        trace_parent: String::new(),
+        trace_state: String::new(),
         message: Some(client_message::Message::JoinRequest(JoinRequest {
             meeting_id: meeting_id.to_string(),
             join_token: join_token.to_string(),
@@ -442,6 +444,8 @@ async fn test_join_wrong_first_message_returns_invalid_request() {
 
     // Send a MuteRequest instead of JoinRequest
     let client_msg = ClientMessage {
+        trace_parent: String::new(),
+        trace_state: String::new(),
         message: Some(client_message::Message::MuteRequest(MuteRequest {
             audio_muted: true,
             video_muted: false,
@@ -672,6 +676,8 @@ async fn test_participant_joined_notification_via_bridge() {
         .expect("bi stream 1 ready");
 
     let client_msg1 = ClientMessage {
+        trace_parent: String::new(),
+        trace_state: String::new(),
         message: Some(client_message::Message::JoinRequest(JoinRequest {
             meeting_id: "meeting-bridge".to_string(),
             join_token: token1,
@@ -712,6 +718,8 @@ async fn test_participant_joined_notification_via_bridge() {
         .expect("bi stream 2 ready");
 
     let client_msg2 = ClientMessage {
+        trace_parent: String::new(),
+        trace_state: String::new(),
         message: Some(client_message::Message::JoinRequest(JoinRequest {
             meeting_id: "meeting-bridge".to_string(),
             join_token: token2,
