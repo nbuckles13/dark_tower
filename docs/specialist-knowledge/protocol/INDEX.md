@@ -47,8 +47,8 @@
 
 ## Signaling Messages (signaling.proto)
 - MediaServerInfo (in JoinResponse.media_servers) → `proto/signaling.proto`
-- MediaConnectionFailed (client→MC) → `proto/signaling.proto`
-- MediaConnectionFailed handler → `crates/mc-service/src/webtransport/connection.rs`
+- MediaConnectionUpdate (client→MC; per-MH ConnectionState statuses, browser-client-join R-60) → `proto/signaling.proto`
+- MediaConnectionUpdate handler (Task #2 stub; Task #6 reseats with mc_participant_mh_status_total{state}) → `crates/mc-service/src/webtransport/connection.rs`
 
 ## Integration Seams
 - Proto-gen consumed by services (re-exports prost::Message, tonic) → `crates/proto-gen/src/lib.rs`

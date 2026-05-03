@@ -14,7 +14,7 @@
 - Auth: McJwtValidator, validate_meeting_token, validate_guest_token → `crates/mc-service/src/auth/mod.rs`
 - Actors: controller, meeting, participant, messages, session (HMAC/HKDF), metrics → `crates/mc-service/src/actors/`
 - WebTransport: server (accept loop, TLS, capacity) → `crates/mc-service/src/webtransport/server.rs`
-- WebTransport: connection (join flow, bridge loop, MediaConnectionFailed handler R-20) → `crates/mc-service/src/webtransport/connection.rs`
+- WebTransport: connection (join flow, bridge loop, MediaConnectionUpdate handler — Task #2 stub pending Task #6 per-MH state recording) → `crates/mc-service/src/webtransport/connection.rs`
 - WebTransport: async RegisterMeeting trigger (R-12, first participant) → `crates/mc-service/src/webtransport/connection.rs:register_meeting_with_handlers()`
 - WebTransport: handler (encode_participant_update) → `crates/mc-service/src/webtransport/handler.rs`
 - gRPC: GC client (registration, heartbeats, advertise) → `crates/mc-service/src/grpc/gc_client.rs`
@@ -26,11 +26,11 @@
 - Redis: fenced client + MhAssignmentStore trait + MhAssignmentData (handlers Vec) → `crates/mc-service/src/redis/client.rs`
 - Redis: Lua scripts (atomic fencing) → `crates/mc-service/src/redis/lua_scripts.rs`
 - Health/readiness, system info → `crates/mc-service/src/observability/health.rs`, `crates/mc-service/src/system_info.rs`
-- Prometheus metric wrappers (record_register_meeting, record_mh_notification, record_media_connection_failed, record_webtransport_connection, record_jwt_validation, record_session_join, record_token_refresh_metrics) → `crates/mc-service/src/observability/metrics.rs`
+- Prometheus metric wrappers (record_register_meeting, record_mh_notification, record_webtransport_connection, record_jwt_validation, record_session_join, record_token_refresh_metrics) → `crates/mc-service/src/observability/metrics.rs`
 - MC metrics catalog → `docs/observability/metrics/mc-service.md`
 
 ## Protocols
-- Client signaling (join, mute, session recovery, MediaConnectionFailed) → `proto/signaling.proto`
+- Client signaling (join, mute, session recovery, MediaConnectionUpdate) → `proto/signaling.proto`
 - Internal service RPCs (RegisterMc, AssignMeeting, MediaCoordinationService, RegisterMeeting) → `proto/internal.proto`
 
 ## Integration Seams
@@ -69,6 +69,6 @@
 - K8s deployment (POD_IP downward API, advertise addresses) → `infra/services/mc-service/deployment.yaml`
 - K8s network policy (MH ingress on 50052) → `infra/services/mc-service/network-policy.yaml`
 - Grafana dashboard → `infra/grafana/dashboards/mc-overview.json`
-- Prometheus alert rules (incl. MCMediaConnectionAllFailed) → `infra/docker/prometheus/rules/mc-alerts.yaml`
-- Incident runbook (Sc 11 MediaConnectionFailed, Sc 12 RegisterMeeting, Sc 13 unexpected MH notifications) → `docs/runbooks/mc-incident-response.md`
+- Prometheus alert rules → `infra/docker/prometheus/rules/mc-alerts.yaml`
+- Incident runbook (Sc 12 RegisterMeeting, Sc 13 unexpected MH notifications) → `docs/runbooks/mc-incident-response.md`
 - Deployment runbook (post-deploy MC↔MH coordination addendum) → `docs/runbooks/mc-deployment.md`

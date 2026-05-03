@@ -69,6 +69,9 @@ message ControllerCapacity {
 }
 
 // Health status of a controller
+// TODO(post-story): rename to HEALTH_STATUS_PENDING/HEALTHY/DEGRADED/UNHEALTHY/DRAINING per buf STANDARD ENUM_VALUE_PREFIX (wire-breaking; tracked in docs/TODO.md). Includes ENUM_ZERO_VALUE_SUFFIX (PENDING vs HEALTH_STATUS_UNSPECIFIED).
+// buf:lint:ignore ENUM_VALUE_PREFIX
+// buf:lint:ignore ENUM_ZERO_VALUE_SUFFIX
 enum HealthStatus {
   PENDING = 0;    // Just registered, not yet verified
   HEALTHY = 1;

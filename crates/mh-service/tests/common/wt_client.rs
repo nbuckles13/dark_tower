@@ -66,6 +66,8 @@ pub async fn write_mh_connect(
                 join_token: jwt.to_string(),
             },
         )),
+        trace_parent: String::new(),
+        trace_state: String::new(),
     };
     let encoded = envelope.encode_to_vec();
     write_framed(send, &encoded).await

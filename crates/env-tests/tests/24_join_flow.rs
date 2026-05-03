@@ -167,6 +167,8 @@ async fn send_join_and_read_response(
             correlation_id: String::new(),
             binding_token: String::new(),
         })),
+        trace_parent: String::new(),
+        trace_state: String::new(),
     };
 
     let frame = encode_framed(&client_msg);
@@ -679,6 +681,8 @@ async fn test_second_participant_receives_join_notification() {
             correlation_id: String::new(),
             binding_token: String::new(),
         })),
+        trace_parent: String::new(),
+        trace_state: String::new(),
     };
     send1
         .write_all(&encode_framed(&join_msg1))

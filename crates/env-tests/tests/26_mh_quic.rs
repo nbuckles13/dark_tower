@@ -166,6 +166,8 @@ fn encode_jwt_frame(jwt: &str) -> Vec<u8> {
                 join_token: jwt.to_string(),
             },
         )),
+        trace_parent: String::new(),
+        trace_state: String::new(),
     };
     let encoded = envelope.encode_to_vec();
 
@@ -432,6 +434,8 @@ async fn mc_join(
             correlation_id: String::new(),
             binding_token: String::new(),
         })),
+        trace_parent: String::new(),
+        trace_state: String::new(),
     };
     let encoded = join_msg.encode_to_vec();
     let mut frame = MsgBuf::with_capacity(4 + encoded.len());

@@ -2,6 +2,8 @@ syntax = "proto3";
 
 package dark_tower.signaling;
 
+import "google/protobuf/timestamp.proto";
+
 // Participant capabilities during join
 message ParticipantCapabilities {
   repeated string video_codecs = 1;  // e.g., ["VP9", "AV1", "H264"]
@@ -38,6 +40,9 @@ message MediaServerInfo {
 }
 
 // Stream type enumeration
+// TODO(post-story): rename to STREAM_TYPE_AUDIO/CAMERA/SCREEN per buf STANDARD ENUM_VALUE_PREFIX (wire-breaking; tracked in docs/TODO.md).
+// buf:lint:ignore ENUM_VALUE_PREFIX
+// buf:lint:ignore ENUM_ZERO_VALUE_SUFFIX
 enum StreamType {
   AUDIO = 0;
   VIDEO_CAMERA = 1;
@@ -99,6 +104,9 @@ message JoinResponse {
 }
 
 // Reason for participant leaving
+// TODO(post-story): rename to LEAVE_REASON_VOLUNTARY/KICKED/CONNECTION_LOST/MEETING_ENDED/TIMEOUT per buf STANDARD ENUM_VALUE_PREFIX (wire-breaking; tracked in docs/TODO.md).
+// buf:lint:ignore ENUM_VALUE_PREFIX
+// buf:lint:ignore ENUM_ZERO_VALUE_SUFFIX
 enum LeaveReason {
   VOLUNTARY = 0;
   KICKED = 1;
@@ -189,12 +197,18 @@ message StreamPublished {
 // ============================================================================
 
 // Layout type enumeration
+// TODO(post-story): rename to LAYOUT_TYPE_GRID per buf STANDARD ENUM_VALUE_PREFIX (wire-breaking; tracked in docs/TODO.md).
+// buf:lint:ignore ENUM_VALUE_PREFIX
+// buf:lint:ignore ENUM_ZERO_VALUE_SUFFIX
 enum LayoutType {
   GRID = 0;
   // Future: STACK = 1, PRESENTATION = 2, etc.
 }
 
 // Media type for stream assignments
+// TODO(post-story): rename to MEDIA_TYPE_AUDIO/VIDEO_CAMERA/VIDEO_SCREEN per buf STANDARD ENUM_VALUE_PREFIX (wire-breaking; tracked in docs/TODO.md).
+// buf:lint:ignore ENUM_VALUE_PREFIX
+// buf:lint:ignore ENUM_ZERO_VALUE_SUFFIX
 enum MediaType {
   MEDIA_AUDIO = 0;
   MEDIA_VIDEO_CAMERA = 1;
@@ -255,6 +269,9 @@ message StreamQualityUpdate {
 }
 
 // Error codes
+// TODO(post-story): rename to ERROR_CODE_UNKNOWN/INVALID_REQUEST/... per buf STANDARD ENUM_VALUE_PREFIX (wire-breaking; tracked in docs/TODO.md).
+// buf:lint:ignore ENUM_VALUE_PREFIX
+// buf:lint:ignore ENUM_ZERO_VALUE_SUFFIX
 enum ErrorCode {
   UNKNOWN = 0;
   INVALID_REQUEST = 1;
@@ -274,11 +291,44 @@ message ErrorMessage {
   map<string, string> details = 3;
 }
 
-// Client report of media connection failure
-message MediaConnectionFailed {
-  string media_handler_url = 1;
-  string error_reason = 2;
-  bool all_handlers_failed = 3;
+// Per-MH connection-state classification reported by clients in
+// MediaConnectionUpdate. Catalog-style enum-value prefix per ADR-0011
+// + internal.proto convention (DisconnectReason, RejectionReason).
+enum ConnectionState {
+  CONNECTION_STATE_UNSPECIFIED  = 0;
+  CONNECTION_STATE_CONNECTED    = 1;
+  CONNECTION_STATE_FAILED       = 2;
+  CONNECTION_STATE_DISCONNECTED = 3;
+}
+
+// Per-MH connection status reported by the client.
+message MhConnectionStatus {
+  // URL of the media handler this status pertains to.
+  // SECURITY: client-controlled. Consumers MUST truncate before logging
+  // (current MC handler bound: 256 bytes via floor_char_boundary).
+  // SDK SHOULD cap at <= 256 bytes when populating.
+  string mh_url = 1;
+
+  ConnectionState state = 2;
+
+  // Optional human-readable failure reason. Empty when state != FAILED.
+  // SECURITY: client-controlled, untrusted. Same 256-byte truncation
+  // discipline as `mh_url`; never log unbounded.
+  optional string failure_reason = 3;
+
+  // Optional structured failure code (SDK-defined enum-as-string,
+  // e.g. "QUIC_TIMEOUT", "TLS_HANDSHAKE_FAIL"). Empty when state != FAILED.
+  // SECURITY: client-controlled; same truncation discipline.
+  optional string failure_code = 4;
+
+  google.protobuf.Timestamp observed_at = 5;
+}
+
+// Client report of per-MH media connection state (replaces predecessor
+// MediaConnectionFailed; richer per-handler shape supports the SDK's
+// connectAll() resolver in browser-client-join story Task #14).
+message MediaConnectionUpdate {
+  repeated MhConnectionStatus statuses = 1;
 }
 
 // Client to server message wrapper
@@ -295,8 +345,23 @@ message ClientMessage {
     HostMuteRequest host_mute_request = 8;
     UnmuteRequest unmute_request = 9;
     UnmuteResponse unmute_response = 10;
-    MediaConnectionFailed media_connection_failed = 11;
+    // browser-client-join R-60: replaces MediaConnectionFailed; tag 11
+    // reused (one-time wire break — no on-wire clients exist outside
+    // this codebase per Clarification Question 9).
+    MediaConnectionUpdate media_connection_update = 11;
   }
+
+  // W3C Trace Context traceparent header value (RFC: ~55 chars,
+  // e.g. "00-<trace-id>-<span-id>-<flags>"). Empty if client did not
+  // propagate a trace. Parser is `TraceContextPropagator`; downstream
+  // extraction tasks (R-57 MC, R-58-MH, SDK) own validation and rejection
+  // of malformed values — do not rely on the proto layer for validation.
+  string trace_parent = 20;
+
+  // W3C Trace Context tracestate header value (vendor-specific kv pairs;
+  // spec allows up to ~512 bytes / 32 entries). Same parser + validation
+  // boundary as `trace_parent`.
+  string trace_state = 21;
 }
 
 // MH client→server connect envelope; first framed message on a new bidi stream.
@@ -309,6 +374,13 @@ message MhClientMessage {
   oneof message {
     MhConnectRequest connect_request = 1;
   }
+
+  // W3C Trace Context (see ClientMessage::trace_parent for format,
+  // parser, and validation boundary). Same envelope-level placement
+  // pattern — available across all current and future MhClientMessage
+  // variants without per-variant changes.
+  string trace_parent = 20;
+  string trace_state = 21;
 }
 
 // Server to client message wrapper
@@ -327,4 +399,11 @@ message ServerMessage {
     UnmuteResponse unmute_response = 10; // Participant receives host's response
     RedirectToMc redirect_to_mc = 11;    // MC migration redirect
   }
+
+  // W3C Trace Context (see ClientMessage::trace_parent for format,
+  // parser, and validation boundary). MC populates these on outbound
+  // ServerMessage via the global propagator (R-57) so client-side
+  // observability sees a continuous trace across the bidi stream.
+  string trace_parent = 20;
+  string trace_state = 21;
 }

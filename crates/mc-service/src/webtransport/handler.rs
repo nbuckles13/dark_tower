@@ -26,6 +26,8 @@ pub fn encode_participant_update(update: &ParticipantStateUpdate) -> Option<Serv
                         participant: Some(participant),
                     },
                 )),
+                trace_parent: String::new(),
+                trace_state: String::new(),
             })
         }
         ParticipantStateUpdate::Left {
@@ -43,6 +45,8 @@ pub fn encode_participant_update(update: &ParticipantStateUpdate) -> Option<Serv
                     participant_id: participant_id.clone(),
                     reason: proto_reason as i32,
                 })),
+                trace_parent: String::new(),
+                trace_state: String::new(),
             })
         }
         ParticipantStateUpdate::MuteChanged { participant_id, .. } => {

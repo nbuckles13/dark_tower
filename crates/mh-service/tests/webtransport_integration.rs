@@ -295,7 +295,11 @@ async fn empty_envelope_oneof_rejected_on_wt_accept_path() {
     let suite = WtSuite::start(Duration::from_secs(30), mc_client).await;
 
     let snap = MetricAssertion::snapshot();
-    let envelope = MhClientMessage { message: None };
+    let envelope = MhClientMessage {
+        message: None,
+        trace_parent: String::new(),
+        trace_state: String::new(),
+    };
     let encoded = envelope.encode_to_vec();
 
     let (_conn, mut send, _recv) = connect_and_open_bi(&suite.wt.url).await;

@@ -206,17 +206,6 @@ All MC service metrics follow ADR-0011 naming conventions with the `mc_` prefix.
 - **Recorded in**: `grpc/media_coordination.rs` on notification receipt
 - **Dashboard**: MC Overview - MH Notifications by Event (MH Coordination row)
 
-### `mc_media_connection_failures_total`
-- **Type**: Counter
-- **Description**: Total client-reported media connection failures
-- **Labels**:
-  - `all_failed`: Whether all MH candidates failed (`true`, `false`)
-- **Cardinality**: Low (2 values)
-- **Usage**: Monitor media connection health. `all_failed=true` means client has no working MH connection.
-- **Recorded in**: `webtransport/connection.rs` on MediaConnectionFailed message
-- **Alert**: `MCMediaConnectionAllFailed` (warning/P2, all_failed=true > 0 for 5m)
-- **Dashboard**: MC Overview - Media Connection Failures (MH Coordination row)
-
 ---
 
 ## Token Manager Metrics (ADR-0010 Section 4a)
@@ -399,11 +388,6 @@ histogram_quantile(0.99,
 sum(rate(mc_mh_notifications_received_total[5m])) by (event_type)
 ```
 
-### Media Connection Failures (All Failed)
-```promql
-sum(rate(mc_media_connection_failures_total{all_failed="true"}[5m]))
-```
-
 ### Token Refresh Failures by Reason
 ```promql
 sum(rate(mc_token_refresh_failures_total[5m])) by (error_type)
@@ -444,7 +428,6 @@ All MC service metrics follow strict cardinality bounds per ADR-0011:
 | `error_type` (join failures) | ~19 | Bounded by `McError` enum variants |
 | `error_type` (token refresh) | 6 | `http`, `auth_rejected`, `invalid_response`, `acquisition_failed`, `configuration`, `channel_closed` |
 | `event_type` | 2 | `connected`, `disconnected` (MH notifications) |
-| `all_failed` | 2 | `true`, `false` (media connection failures) |
 | `grpc_service` | 2 | `MeetingControllerService`, `MediaCoordinationService` (Layer 2 auth) |
 | `expected_type` | 3 | `global-controller`, `media-handler`, `meeting-controller` (Layer 2 auth) |
 | `actual_type` | 4 | `global-controller`, `media-handler`, `meeting-controller`, `unknown` (Layer 2 auth) |
