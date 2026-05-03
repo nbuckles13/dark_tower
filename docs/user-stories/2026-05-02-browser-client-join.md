@@ -1,0 +1,690 @@
+# User Story: Browser Client — Account Creation and Meeting Join
+
+**Date**: 2026-05-02
+**Status**: Ready for Review
+**Participants**: client, auth-controller, global-controller, meeting-controller, media-handler, database, protocol, infrastructure, security, test, observability, operations
+**Predecessors**: [Meeting Join Flow](2026-03-21-meeting-join.md), [Client-to-MH QUIC Connection](2026-04-12-mh-quic-connection.md)
+**ADR**: [ADR-0028 Client Architecture](../decisions/adr-0028-client-architecture.md)
+
+## Story
+
+As a **user**, I want **to create a user account and join a meeting via a browser-based client** so that **I can establish a signaling WebTransport connection to MC and active/active media WebTransport connections to all assigned MH instances — exercising the full happy-path flow end-to-end**.
+
+**Scope** (per ADR-0028, minimal first-ship):
+- Account creation against AC (`POST /api/v1/auth/register`) + token acquisition + login (`POST /api/v1/auth/user/token`)
+- Meeting join via GC (`GET /api/v1/meetings/:code` HTTP API)
+- WebTransport signaling to MC: JoinRequest/JoinResponse + ParticipantJoined/ParticipantLeft (no mute/layout/etc.)
+- Active/active WebTransport media handshake to all assigned MH instances (auth handshake only — no frame I/O)
+- Thin Svelte demo page wired to the SDK to drive the flow manually
+- E2E env-test (Playwright + Chromium against host-side Kind) exercising the full happy path
+- New packages: `packages/sdk-core/`, `packages/sdk-svelte/`, `packages/web-app/`, `packages/test-utils/`
+- New client telemetry proxy on GC: `POST /api/v1/telemetry`
+
+**Out of scope** (deferred to follow-up stories):
+- Production UX polish (full styling, error UX, loading states beyond minimal)
+- Reconnection logic (binding-token-based recovery)
+- Media frame routing/forwarding (data plane: WebCodecs encode → SFrame → datagram → decode)
+- E2EE: SFrame, MLS WASM
+- Layout subscriptions / `StreamAssignments`
+- Settings UI, device selection
+- Synthetic probe CronJob, full client metrics catalog (only a stub this story), client dashboards JSON
+- Production CDN serving, COOP/COEP/CSP/Permissions-Policy headers, NetworkPolicy productionization
+- npm `--provenance` publish flow + 2FA + SRI hashes
+- AC sign-up hardening (HIBP, CAPTCHA, email verification, rate limiting) — explicitly deferred to a separate story by user decision
+- Running the existing env-tests (or new client E2E) in GitHub Actions CI — deferred to a future infra story (cluster bring-up in CI is a broader effort outside this story's scope)
+
+## Requirements
+
+### Server-side: global-controller
+
+- [ ] **R-1**: GC adds `tower_http::cors::CorsLayer` to the Axum router. Allowed origins are env-driven (config addition: `cors_allowed_origins: Vec<String>`) — explicit allowlist, never `*`. Allowed methods: `GET, POST, PATCH, OPTIONS`. Allowed headers: `authorization, content-type, traceparent, tracestate`. `allow_credentials: false`. Preflight (`OPTIONS`) succeeds without auth. Applies to all `/api/v1/*` routes including `guest-token`. (from: global-controller, security)
+
+- [ ] **R-2**: GC adds `POST /api/v1/telemetry` proxy endpoint. Behind `require_user_auth` (validates user JWT). Accepts OTLP/HTTP-encoded payload (proto preferred; observability owns final encoding decision in design). Strips/drops attributes outside an allowlist for PII filtering. Per-user rate limit (config: `telemetry_proxy_rate_limit_per_minute`, default 60). Rejects payloads above `telemetry_proxy_max_bytes` (default 256 KiB). Forwards to in-cluster OTel collector (config: `otel_collector_endpoint`). Returns `202 Accepted` on success, `401`/`413`/`429`/`502` per the obvious failure modes. (from: global-controller, security, observability)
+
+- [ ] **R-3**: GC `Config` adds `cors_allowed_origins: Vec<String>`, `otel_collector_endpoint: String`, `telemetry_proxy_max_bytes: usize`, `telemetry_proxy_rate_limit_per_minute: u32`, all surfaced in env templates / Kustomize values. (from: global-controller, operations)
+
+### Server-side: meeting-controller
+
+- [ ] **R-4**: **Superseded by R-57** — MC trace-context propagation now uses the OTel SDK propagator registered in R-54 (full bidirectional, including outbound injection on `ServerMessage`). Retained here for traceability of the original requirement. See R-57 for the implementation design. (from: observability, meeting-controller)
+
+### Protocol
+
+- [ ] **R-5**: Add `string trace_parent = 20;` and `string trace_state = 21;` to `ClientMessage` and `ServerMessage` in `proto/signaling.proto`. W3C Trace Context format. Optional/empty when no active trace. Field tags 20/21 are unused today (verified). Wire-compatible additive change. **Same fields also added to `MhClientMessage` envelope per R-58** (rebase target: `MhClientMessage` exists on latest main as the wrapping envelope around `MhConnectRequest`, mirroring the `ClientMessage` `oneof` pattern — adding trace fields at envelope level makes them available for all future MH client message variants). (from: protocol, observability)
+
+- [ ] **R-6**: TypeScript proto codegen pipeline: `@bufbuild/protobuf-es` produces TS types into `packages/sdk-core/src/proto/` from `proto/signaling.proto`. Codegen runs as an Nx task that other client packages depend on. Wire compatibility with Rust `prost` is trusted (both implement the protobuf wire spec; no cross-language hex-fixture verification this story — see Clarification Question 9). (from: protocol, client)
+
+- [ ] **R-7**: `buf lint` and `buf breaking` (against `main`) gate `proto/signaling.proto` in CI. Buf config and ruleset committed at the repo root. (from: protocol, infrastructure)
+
+### Client: monorepo bootstrap
+
+- [ ] **R-8**: Bootstrap pnpm + Nx polyglot workspace at the repo root: `package.json`, `pnpm-workspace.yaml`, `nx.json`, `.nvmrc` (Node 22), `.gitignore` updates (`node_modules/`, `.nx/`, `dist/`). Empty `packages/` directory created. The Cargo `crates/` workspace is unaffected. Owner: **infrastructure**. (from: client, infrastructure)
+
+- [ ] **R-9**: Shared `tsconfig.base.json` with TS strict mode (`strict`, `noUncheckedIndexedAccess`, `exactOptionalPropertyTypes`); each package extends it. ESLint + Prettier + svelte-check wired into a root `pnpm lint` task. (from: client)
+
+- [ ] **R-10**: Library packages (`sdk-core`, `sdk-svelte`, `test-utils`) build via Vite library mode → ESM primary + CJS fallback + `.d.ts` types, declared under the `@darktower/` npm scope (publish config only — no actual npm publish this story). (from: client)
+
+### Client: sdk-core HTTP API
+
+- [ ] **R-11**: `AuthApiClient` exposes `register({email, password, displayName})` (TS API) → `POST /api/v1/auth/register` with **camelCase wire JSON** `{"email", "password", "displayName"}` matching AC's post-R-53 contract (AC structs gain `#[serde(rename_all = "camelCase")]` per R-53). `login({email, password})` → `POST /api/v1/auth/user/token`. Response shapes are camelCase on the wire (`userId`, `displayName`, `accessToken`, `tokenType`, `expiresIn`); SDK consumes them directly — no transform layer. Both target the **subdomain-qualified AC origin** (e.g., `https://demo.localhost:8443` in dev) — strict per ADR-0020. Subdomain validated client-side against `[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?` before URL interpolation (subdomain-injection prevention per security R-2 review). Uses standard `fetch`. Token-source pattern (accepts a token-fetching function). Errors map to typed `AuthError` subtypes for 400/401/403/409/429. (from: client, auth-controller, security)
+
+- [ ] **R-12**: `MeetingApiClient.joinMeeting(code, {userToken})` → `GET /api/v1/meetings/:code` with `Authorization: Bearer <userToken>`, returns the existing `JoinMeetingResponse` shape (meeting token + MC `webtransport_endpoint` + `grpc_endpoint`). Also `MeetingApiClient.createMeeting({title, scheduledStart?, ...}, {userToken})` → `POST /api/v1/meetings` with `Authorization: Bearer <userToken>`, returns the created meeting (including the generated meeting `code`). Errors map to typed SDK errors for 400/401/403/404/409. The demo's create-meeting view (R-29) uses this method so a manual user can drive the full flow end-to-end (sign-up → create → join) from a single browser session. (from: client, global-controller)
+
+### Client: sdk-core WebTransport abstraction
+
+- [ ] **R-13**: `IWebTransport` interface in `sdk-core` defines: connect(url, options), bidirectional stream open/close, datagram send/receive, ready/closed promises, event hooks (open, close, error). All WebTransport usage in `sdk-core` goes through this interface. (from: client)
+
+- [ ] **R-14**: `BrowserWebTransport` real implementation wrapping the browser `WebTransport` API. Supports `serverCertificateHashes` for dev (self-signed certs) gated behind a build-time flag `__DEV_TRUST_FINGERPRINT__` that is `false` in prod bundles and tree-shaken out. Production builds use standard CA-validated TLS. Dev fingerprint passed via env/config — never hardcoded or committed. (from: client, security)
+
+- [ ] **R-15**: `MockWebTransport` test double in `packages/test-utils/`. Control points: `simulateReady()`, `simulateClose(code, reason)`, `simulateError(err)`, `simulateIncomingDatagram(bytes)`, `simulateBidiStream(send, recv)`, `simulateServerMessage(msg)`. Implements `IWebTransport`. All `sdk-core` unit tests run against this. (from: client, test)
+
+### Client: sdk-core signaling
+
+- [ ] **R-16**: `SignalingClient` opens a WebTransport connection to MC's `webtransport_endpoint`, sends `JoinRequest` (carrying meeting JWT + participant capabilities + empty `correlation_id`/`binding_token` for first-time join) on the first bidirectional stream, applies **4-byte big-endian length-prefix framing** on protobuf `ClientMessage` / `ServerMessage` envelopes (per ADR-0028 §3 and MC's existing `read_framed_message` / `write_raw_framed`). Max frame ≤ 64 KiB matches MC's `MAX_MESSAGE_SIZE`. (from: client, meeting-controller, protocol)
+
+- [ ] **R-17**: `SignalingClient` parses `JoinResponse`, exposes typed `onJoined` event with `participant_id`, `user_id` (u64 via BigInt), `existing_participants` roster, `media_servers` (MH WebTransport URLs). Stores `correlation_id` and `binding_token` for future reconnection (storage only — reconnection logic is out of scope). Parses subsequent `ServerMessage` variants and emits typed events for `ParticipantJoined`, `ParticipantLeft`. Other variants are decoded but logged at debug only (no handlers required this story). (from: client, meeting-controller)
+
+- [ ] **R-18**: `SignalingClient` surfaces `ErrorMessage` from MC as a typed `SignalingError` event with the proto `ErrorCode` mapped to an SDK error code; auth-related errors close the connection with a typed reason. Frame parser enforces the max-frame size and handles partial reads buffered across stream chunks. (from: client)
+
+- [ ] **R-19**: `SignalingClient` populates `trace_parent` (W3C `traceparent`) and `trace_state` on every outgoing `ClientMessage` using the OTel JS SDK W3C propagator, with a single root span `dt_client.join` per `MeetingSession.join` call. The same propagator helper is used to populate `trace_parent`/`trace_state` on outbound `MhClientMessage` envelopes (R-58) so that browser → MC and browser → MH propagation share one injection path. (from: observability, client)
+
+### Client: sdk-core media transport (handshake only)
+
+- [ ] **R-20**: `MediaTransport` opens a WebTransport connection to **each** MH URL from `JoinResponse.media_servers` in parallel (active/active per predecessor R-9), authenticates with the meeting JWT (per predecessor R-7 / R-8 of mh-quic-connection — sent as the first length-prefixed bidi-stream message). Successful handshake fires per-MH `onConnected(url)`; failure raises typed `MediaConnectionError` with the failing URL. **No frame I/O. No SFrame. No WebCodecs. No datagram send/receive.** (from: client, media-handler)
+
+- [ ] **R-21**: `MediaTransport.connectAll()` returns a Promise that resolves when at least one MH connection is established and rejects only if all fail. Per-MH state observable. Once `connectAll()` settles (success, partial, or full failure), the SDK sends ONE `MediaConnectionUpdate` `ClientMessage` (per R-60) listing the per-MH state for every URL in `media_servers` (state ∈ `STATE_CONNECTED` / `STATE_FAILED`, plus optional `failure_reason` / `failure_code` when failed). MC tracks per-(participant, mh_url) state for use by future media-routing logic. The coarse legacy `MediaConnectionFailed` proto variant + handler is removed (predecessor is recent — clean replacement, no deprecation cycle). (from: client, meeting-controller, protocol)
+
+### Client: sdk-core room facade + observability hooks
+
+- [ ] **R-22**: A `MeetingSession` class composes `AuthApiClient` + `MeetingApiClient` + `SignalingClient` + `MediaTransport`, exposing `join({orgSubdomain, meetingCode, credentials})` that drives the happy path: auth → meeting token → MC signaling → MH active/active handshake. Emits high-level events (`onJoined`, `onParticipantJoined`, `onParticipantLeft`, `onMediaConnected`, `onError`) and a `disconnect()` method that tears down all transports cleanly. Public SDK entry point for the demo. (Renamed from `Room` per user feedback to align with backend "meeting" terminology.) (from: client)
+
+- [ ] **R-23**: Tokens (user JWT, meeting JWT) held in memory only — never `localStorage` / `sessionStorage` / `IndexedDB` / cookies. Tokens MUST NOT appear in URLs, query strings, console logs, or telemetry payloads. SDK error objects redact token fields. Explicit cleanup on `MeetingSession.disconnect()` / logout: clear all token references; overwrite buffers where the runtime allows. (from: security, client)
+
+- [ ] **R-24**: `MetricsSink` abstraction in `packages/sdk-core/src/telemetry/`. Two implementations: `OtelMetricsSink` (production — wraps OTel JS SDK Meter, exports via OTLP-HTTP to GC `/api/v1/telemetry` per R-2 with `keepalive`) and `InMemoryMetricsSink` (in `packages/test-utils/`). A naming-guard at the sink boundary rejects metric names that don't match `dt_client_*` (warn in prod, throw in dev/test). (from: observability, client)
+
+- [ ] **R-25**: SDK records minimum `dt_client_*` business metrics for the join flow:
+   - `dt_client_join_attempts_total{status, failure_stage}` counter (status ∈ {success, failure}; failure_stage ∈ {none, signup, gc_create_token, gc_join, mc_signaling_connect, mc_join_response, mh_connect, internal})
+   - `dt_client_time_to_signaling_ready_ms` histogram (wall-clock from `MeetingSession.join` to MC `JoinResponse` received)
+   - `dt_client_time_to_first_mh_connected_ms` histogram
+   - `dt_client_signaling_connection_total{status, close_reason}` counter
+   - `dt_client_mh_connection_total{status, mh_index_bucket}` counter (mh_index_bucket ∈ {0, 1, 2+})
+
+   All metrics carry implicit labels `client_version`, `meeting_id_hash` (SHA-256-truncated, NOT raw meeting id), `org_id`. Never label by user_id, email, IP, raw meeting id. (from: observability)
+
+- [ ] **R-26**: Structured **client-side** logs for the join flow with bounded `event` enum (`join.started`, `join.signup_complete`, `join.gc_token_received`, `join.signaling_ready`, `join.mh_connected`, `join.failed`, `join.completed`). Required fields: `meeting_id_hash`, `client_version`, `trace_id`, `event`, `duration_ms`, `failure_stage`. EXCLUDE: email, password, raw meeting id, JWTs, MLS keys, user-agent above DEBUG. **Scope clarification**: R-26 governs *structured logs* (browser console / GC `/api/v1/telemetry` log signals only). The server-side `auth_events` audit table on AC continues to record email + IP + user-agent for sign-up/login attempts per ADR-0020 — that is a database audit trail, NOT a structured-log channel, and is unchanged. (from: observability, security, auth-controller)
+
+- [ ] **R-27**: Client metrics catalog stub at `docs/observability/metrics/client.md` — documents the metrics from R-25 and the `dt_client_*` naming convention. Explicitly marked "Story 1 stub — full catalog deferred." (from: observability)
+
+### Client: sdk-svelte adapter
+
+- [ ] **R-28**: `sdk-svelte` exports Svelte 5 rune stores wrapping `MeetingSession` events: `$meetingState`, `$participants`, `$mediaConnections`, `$lastError`. Stores update reactively from SDK events and clean up on component unmount. **No video components yet** (deferred). (from: client)
+
+### Client: web-app demo
+
+- [ ] **R-29**: Minimal Svelte demo with **four views**: (1) sign-up (email / password / displayName / orgSubdomain), (2) sign-in (email / password / orgSubdomain), (3) **create-meeting** (title + optional scheduledStart, calls `MeetingApiClient.createMeeting` per R-12, displays the returned meeting code for the user to copy/share), (4) meeting-join (prompts for a meeting code and triggers `MeetingSession.join`; shows existing participants and live `ParticipantJoined`/`ParticipantLeft` events). The four-view structure lets a manual user drive the full flow end-to-end (sign-up → create → copy code → join in a second tab/context). **No video rendering, layouts, settings, or controls.** (from: client)
+
+- [ ] **R-30**: `pnpm dev` launches Vite dev server with proxy config pointing to local AC / GC at the host-side NodePort URLs (R-32). Documented `serverCertificateHashes` cert fingerprint flow consistent with R-31. README in `packages/web-app/` documents the local-Kind workflow end-to-end. **The user must be able to bring up the demo on their host browser (Chrome) for manual testing.** (from: client, infrastructure, operations)
+
+### Security
+
+- [ ] **R-31**: Bounded input validation on every new endpoint (display name ≤ 64 chars, email ≤ 254 chars per RFC 5321, password ≤ 128 chars). Deny unknown fields (`#[serde(deny_unknown_fields)]`). Server-side regex validation of meeting code (12 base62) before any DB lookup. (from: security)
+
+- [ ] **R-32**: Browser-side cryptography: all randomness via `crypto.getRandomValues()` (no `Math.random()` for security values). Any `CryptoKey` created by this story uses `extractable: false` where the operation permits — establishes the pattern ADR-0028 §5 mandates for future SFrame/MLS work. (from: security)
+
+- [ ] **R-33**: TS-adapted client guards in `ci-client.yml`: `no-secrets-in-code` (scans for hardcoded JWTs, API keys, fingerprints, signing keys in `.ts` / `.svelte`) and `no-test-removal` (warns on removed `*.test.ts` / `*.spec.ts`). (from: security, test, client)
+
+- [ ] **R-34**: Supply chain controls in `ci-client.yml`: `pnpm audit` runs and fails build on high/critical advisories; `pnpm-lock.yaml` committed and `--frozen-lockfile` enforced; Dependabot (or Renovate) enabled for `packages/**`. (from: security, infrastructure)
+
+### Infrastructure
+
+- [ ] **R-35**: Devloop image (`infra/devloop/Dockerfile`) updated: enable pnpm via `corepack enable` (Node 22 already present); install Playwright system deps for Chromium (libnss3, libatk-bridge2.0-0, libdrm2, libxkbcommon0, libxcomposite1, libxdamage1, libxfixes3, libxrandr2, libgbm1, libpango-1.0-0, libcairo2, libasound2, fonts); pre-cache the Chromium browser via `npx playwright install chromium`; pin Playwright version. Image-size delta documented. (from: infrastructure, operations, client)
+
+- [ ] **R-36**: `scripts/generate-dev-certs.sh` extended to compute SHA-256 of the leaf cert (DER form) for `mc-webtransport.crt` and `mh-webtransport.crt` and write to a stable file (e.g., `infra/docker/certs/fingerprints.json`) consumable by Vite config and Playwright global-setup via `MC_CERT_SHA256` / `MH_CERT_SHA256` env vars. Idempotent. Cert validity window ≤ 14 days, ECDSA P-256 (per Chrome `serverCertificateHashes` requirements). (from: infrastructure, test, security)
+
+- [ ] **R-37**: Kind exposure for AC + GC HTTP — NodePort services + `extraPortMappings` (TCP) entries to `infra/kind/kind-config.yaml` so a host-side Chromium (Playwright or manual) can reach AC sign-up and GC join endpoints. Stable host ports (e.g., AC 8443, GC 8444) documented. **`extraPortMappings.listenAddress` MUST be `127.0.0.1`** (loopback only) so a developer's laptop on a hostile network does not expose AC/GC dev instances to the LAN — explicit security requirement. **Dev/E2E only — production exposure is out of scope.** (from: infrastructure, security)
+
+- [ ] **R-38**: Kind setup script seeds at least one `organizations` row (`subdomain = 'demo'`) so the browser sign-up flow has a default org to register against. Idempotent (`ON CONFLICT DO NOTHING`). Lives in `infra/kind/scripts/setup.sh` or a sibling SQL file. **No DB schema change.** (from: infrastructure, database, auth-controller)
+
+### Test infrastructure
+
+- [ ] **R-39**: `packages/test-utils/` package shipped with: `MockWebTransport.ts` (R-15), `TestTokenBuilder.ts` + `TestTokenSigner.ts` (ephemeral Ed25519, mints user/meeting JWTs with the same claim shape AC/GC produce — for unit tests only; E2E uses real tokens), `deterministic-ids.ts` (seeded UUIDv4), `InMemoryMetricsSink.ts` and `MockOTLPExporter.ts` (assertion stubs). (from: test, client, observability)
+
+- [ ] **R-40**: Browser E2E harness in `packages/web-app/e2e/`: Playwright config (Chromium-only project, `retries=0` per ADR-0028 flaky policy, single context for this story). Helpers: `bootstrapMeeting(adminToken)` (creates a meeting via real GC), `joinAsUser(page, meetingCode)` (drives demo page UI), `waitForJoined(page)`. Reuses port-forward / NodePort pattern from `crates/env-tests/src/cluster.rs` (ADR-0030) so local-dev and devloop-container topologies match. Trace artifact upload on failure. (from: test, client)
+
+### Tests (this story)
+
+- [ ] **R-41**: Unit tests (Vitest, Node) — ~25-35 tests covering: SDK `MeetingSession` state machine (idle → fetching-token → connecting-mc → joining → joined → disconnecting), signaling proto round-trip (`ClientMessage`/`ServerMessage` encode/decode via protobuf-es — using runtime-built protobuf objects, no committed hex fixtures), token-source pattern, error-hierarchy boundaries (`AuthError` / `NetworkError` / `MediaConnectionError`), `MediaTransport.connectAll()` happy/partial/all-fail + `MediaConnectionUpdate` send shape. Coverage ≥ 90% for `sdk-core`. Uses `MockWebTransport`. (from: test, client)
+
+- [ ] **R-42**: Unit tests (Vitest, Node) — ~10-15 tests for the HTTP API client, MSW for `fetch`. Covers AC sign-up + login (200/401/429), GC meeting-join (200/401/403/404). Asserts request shape (headers, JSON bodies, subdomain origin) matches what AC/GC actually accept. (from: test, client)
+
+- [ ] **R-43**: Component tests (Vitest 4.0 Browser Mode, Chromium) — ~10-20 tests covering Svelte component rendering with mocked `MeetingSession`, Svelte rune stores reacting to SDK events, demo views render correct state on sign-up/sign-in/create-meeting/join. Real WebTransport / WebCodecs not exercised (deferred to integration tier in a future story). Runs in CI on GitHub-hosted Linux runners with Playwright-installed Chromium (no live cluster required). (from: test, client)
+
+- [ ] **R-44**: Primary browser E2E env-test scenario — `e2e/join-happy-path.spec.ts`. Playwright launches Chromium with fake media flags; navigates to demo page served by Vite (`packages/web-app/`); drives sign-up → login → meeting create (via direct GC call with the user token, not through the demo UI) → meeting join. Asserts: (a) MC `JoinResponse` received with correct `participant_id` (via SDK event hook or DOM signal), (b) at least one MH WebTransport handshake succeeds for every URL in `media_servers`, (c) opening a second browser context joining the same meeting fires `ParticipantJoined` in the first context. Uses R-36 cert fingerprint. Requires live host-side Kind (AC + GC + MC + MH). (from: test, client)
+
+- [ ] **R-45**: Secondary browser E2E scenarios — `auth-rejection.spec.ts` (unauthenticated meeting-join surfaces typed `AuthError`), `meeting-not-found.spec.ts` (404 surfaces typed error in demo UI), `mc-token-rejection.spec.ts` (SDK obtains real meeting token but is sent to MC with garbage `meeting_id` → MC returns `Unauthorized` → SDK surfaces typed error). (from: test)
+
+- [ ] **R-46**: Existing Rust env-test `crates/env-tests/tests/24_join_flow.rs` is unchanged. Browser E2E adds the layer the Rust test cannot reach: real Chromium, real `WebTransport` API, real demo-page DOM. Division of responsibilities documented in `packages/web-app/e2e/README.md`. (from: test)
+
+### CI + validation pipeline
+
+- [ ] **R-47**: New `.github/workflows/ci-client.yml` triggered on changes to `packages/**`, `proto/**`, `pnpm-lock.yaml`, `nx.json`, and the workflow file itself. Mirrors backend `ci.yml` shape (lint + unit + per-service integration tests). Jobs (in order):
+   - `lint`: `pnpm install --frozen-lockfile`, `pnpm lint` (eslint + prettier + svelte-check), `buf lint`, `buf breaking` (against main), client guards (R-33), `pnpm audit` (R-34).
+   - `unit`: `pnpm test:unit` (Vitest --run, Node), coverage gate ≥ 90% via `@vitest/coverage-v8`.
+   - `component` (the in-CI "integration test" tier for client, analogous to per-service integration tests in backend `ci.yml` — runs in Linux runners against `MockWebTransport` + MSW, no live cluster required): `pnpm test:component` (Vitest --run --browser chromium).
+   - **No browser E2E in CI for this story** — the live-cluster E2E is the client analogue of `crates/env-tests/`, which is not in CI today; see R-48. The existing Rust `ci.yml` is not modified. (from: test, infrastructure, operations)
+
+- [ ] **R-48**: Browser E2E (R-44, R-45) is the client analogue of the existing Rust `crates/env-tests/` suite — runs against a live Kind cluster, not in GitHub Actions. Runnable from inside the devloop container via `pnpm test:e2e` against the host-side Kind cluster (per ADR-0030's host-side cluster helper model). Also runnable directly on the host so a developer can drive Chrome manually for debugging. The devloop validation pipeline (per ADR-0024) runs client unit + component tests in early layers (matching backend integration-test placement) and runs the browser E2E in **Layer 8 alongside the Rust env-tests**, both targeting the same live Kind cluster. The devloop SKILL.md is updated so `/devloop` automatically validates client work end-to-end. (from: test, infrastructure, operations)
+
+### Operations
+
+- [ ] **R-49**: New dev runbook `docs/runbooks/client-dev-local.md` — step-by-step "run the demo locally end-to-end" (bring up Kind via `infra/devloop/dev-cluster`, generate certs + fingerprints, set env vars, `pnpm install`, `pnpm dev`, open Chrome, perform sign-up + join). "Things that go wrong" section covers: (1) devloop image stale (no pnpm/Playwright), (2) cert fingerprint mismatch (browser refuses WebTransport), (3) Vite dev server fails to start. Explicit non-goal banner: "This is the dev-loop runbook. Production deployment, CSP/COEP/COOP, CDN serving, and synthetic probes are tracked separately under ADR-0028 §10." (from: operations)
+
+- [ ] **R-50**: GC `gc-deployment.md` smoke-test entries added: (a) CORS preflight (`curl -X OPTIONS` from expected origin returns 204 with correct ACAO headers), (b) telemetry proxy responds 202 on a small valid payload, 401 unauthenticated, 413 oversize, 429 rate-limited. Alert catalog (`docs/observability/alerts.md`) updated for the new `gc_telemetry_*` alerts (R-51). (from: operations, observability)
+
+### Observability (server-side proxy + dashboards)
+
+- [ ] **R-51**: GC telemetry-proxy metrics + alerts:
+   - `gc_telemetry_ingest_total{status, payload_kind}` counter (`status ∈ {success, rejected_auth, rejected_size, rejected_rate, rejected_pii, error}`; `payload_kind ∈ {metric, trace, log}`)
+   - `gc_telemetry_ingest_duration_seconds{status}` histogram (p99 SLO < 200ms)
+   - `gc_telemetry_payload_bytes{payload_kind}` histogram
+   - `gc_telemetry_rate_limited_total{reason}` counter (`reason ∈ {per_user, per_org, global}`)
+   - Alert (warn): rejection rate > 10% for 10m → suggests broken client
+   - Alert (page): `absent_over_time(gc_telemetry_ingest_total[15m])` once non-zero baseline established → telemetry pipeline broken
+   - Dashboard: new "Telemetry Ingest" row added to existing `gc-overview.json` (no new dashboard file)
+
+   (from: observability, operations)
+
+- [ ] **R-52**: GC CORS preflight metric: `gc_cors_preflight_total{origin_class, status}` — `origin_class ∈ {allowed, denied}` (bucketed, NOT raw origin); `status ∈ {200, 403}`. Logs at `warn` for denied preflight with `{origin_class, requested_method, requested_headers}`. No dedicated alert; covered by `gc_http_requests_total{status="403"}`. (from: observability)
+
+### MediaConnection redesign (replaces `MediaConnectionFailed`)
+
+- [ ] **R-60**: Replace `MediaConnectionFailed { all_handlers_failed }` (proto + MC handler from predecessor `mh-quic-connection`) with a richer per-MH update message:
+   - **Proto**: in `proto/signaling.proto`, remove the `media_connection_failed = N` `oneof` variant on `ClientMessage`, add `MediaConnectionUpdate` message + corresponding `oneof` variant (`media_connection_update = N`). Shape: `MediaConnectionUpdate { repeated MhConnectionStatus statuses; }` and `MhConnectionStatus { string mh_url = 1; ConnectionState state = 2; optional string failure_reason = 3; optional string failure_code = 4; google.protobuf.Timestamp observed_at = 5; }` with `enum ConnectionState { UNSPECIFIED = 0; CONNECTED = 1; FAILED = 2; DISCONNECTED = 3; }`. Field tag for `media_connection_update` may reuse the freed slot from `media_connection_failed` (since that variant is being removed in the same change — no on-the-wire compat clients exist).
+   - **MC handler**: replace the `MediaConnectionFailed` arm in `crates/mc-service/src/webtransport/connection.rs:handle_client_message()` (or wherever the existing dispatch lives) with a `MediaConnectionUpdate` arm that records the per-MH state on the participant actor (`crates/mc-service/src/actors/participant.rs`). State stored as `HashMap<String, MhConnectionStatus>` keyed by `mh_url`; existing failure-path metric (counter previously incremented on all-fail) gets a new label dimension or is replaced by `mc_participant_mh_status_total{state}` — observability adjudicates final shape during T-MC review.
+   - **SDK**: SDK builds the `MediaConnectionUpdate` once `connectAll()` settles, listing every MH URL in `media_servers` with terminal state. (Future story: SDK sends subsequent updates on liveness flips. Out of scope here.)
+   - **Tests**: MC handler unit + integration tests cover all-CONNECTED / partial / all-FAILED; SDK unit tests cover the same three scenarios.
+   (from: protocol, meeting-controller, client, observability)
+
+### Wire format alignment (camelCase migration)
+
+- [ ] **R-53**: AC + GC public HTTP API request/response structs migrate to **camelCase wire JSON** via `#[serde(rename_all = "camelCase")]`. Affected AC types in `crates/ac-service/src/handlers/auth_handler.rs` (`UserRegistrationRequest`, `UserTokenRequest`, response shapes for register / token / introspect / logout) and any sibling DTOs that flow over public HTTP. Affected GC types in `crates/gc-service/src/handlers/meetings.rs` and other public handler modules (`JoinMeetingResponse`, `CreateMeetingRequest`, `CreateMeetingResponse`, error response envelopes if applicable). Existing Rust env-tests in `crates/env-tests/` and runbook smoke `curl` examples in `docs/runbooks/ac-service-deployment.md` + `gc-deployment.md` updated to camelCase keys. **Rationale**: automatic via serde derive, well-tested upstream, vs. a hand-built shim layer the SDK would maintain — chosen by user decision (see Clarification Question 6). No external clients exist today; rebase migration is mechanical. (from: auth-controller, global-controller, test, operations)
+
+### Backend OpenTelemetry rollout
+
+- [ ] **R-54**: Common OTel init helper at `crates/common/src/observability/otel.rs`: `init_otel(service_name: &str, service_version: &str, env: &str, OtelConfig) -> Result<OtelGuard, OtelInitError>`. The guard is RAII — `Drop` flushes spans on shutdown. Builds an OTLP-gRPC exporter pointed at `OtelConfig::endpoint`; registers `TraceContextPropagator` (W3C `traceparent` + `tracestate`) globally; configures `parent_based(traceidratio(otel_sample_rate))` sampler; sets resource attributes `service.name`, `service.version`, `service.namespace=darktower`, `deployment.environment`. Bridges via `tracing-opentelemetry::OpenTelemetryLayer` so existing `#[instrument]` spans across all four services flow into OTLP without per-call-site changes.
+   - **Failure model**: **fail-hard at init, fail-soft at runtime.** If `otel_enabled = true` and the exporter cannot be built or the initial connection-test fails, `init_otel` returns `Err` and the service's `main()` propagates that to a non-zero exit. K8s reports the pod `Unready`/`CrashLoopBackoff` and existing pod-health alerting surfaces it — no new init-outcome metric or dedicated alert needed. If `otel_enabled = false`, `init_otel` is a no-op success (returns a no-op guard). At runtime, OTLP export failures drop spans silently (default exporter behavior) but increment `dt_otel_export_failures_total{service, reason}` (counter, see R-59 alert) so runtime degradation is visible without taking the data plane down.
+   - **Trade-off**: a botched collector upgrade during business hours can put all four services into restart loops simultaneously. Mitigation is deployment discipline (collector upgrades in a separate change window, not bundled with service deploys) — a runbook entry, not a code change.
+   - New common dep: `tracing-opentelemetry` (workspace `opentelemetry` + `opentelemetry-otlp` already present). Unit tests verify: propagator round-trip, sampler decision under parent context, resource attribute shape, **init returns `Err` on unreachable collector when `otel_enabled = true`**, init returns no-op guard when `otel_enabled = false`. (from: observability)
+
+- [ ] **R-55**: Per-service OTel wiring: AC, GC, MC, MH each call `init_otel(...)` from R-54 in their `main.rs` startup before the runtime boots. Per-service `Config` adds `otel_enabled: bool` (default `false`), `otel_endpoint: String`, `otel_sample_rate: f64` (default `1.0` in dev, configurable down for prod). All four service Kustomize ConfigMaps surface the new env vars. The `OtelGuard` is held in `main` and drops on shutdown to flush. (from: observability, auth-controller, global-controller, meeting-controller, media-handler)
+
+- [ ] **R-56**: gRPC trace propagation interceptor at `crates/common/src/observability/otel_grpc.rs`: a Tonic tower layer (or interceptor) that **injects** the active W3C context into outbound request metadata (`traceparent`/`tracestate` headers) and **extracts** it on inbound, attaching it to the current OTel context for the duration of the handler. Reuses the global propagator from R-54. Wired at every gRPC client/server boundary: GC↔AC (`AcAuthClient`), MC↔GC (MC's `GcRegistrationClient` + GC's MC-facing server if any), MC↔MH (`MhRegistrationClient` + MH's `MediaCoordinationService`), MH↔GC (`GcRegistrationClient` from MH side). Unit + integration tests verify round-trip propagation across all four channel directions. (from: observability)
+
+- [ ] **R-57**: MC trace propagation (replaces R-4 design). MC uses the global `TraceContextPropagator` registered in R-54 to extract W3C context from `ClientMessage.trace_parent`/`trace_state` (R-5 fields) and create OTel-backed child spans on existing `mc.webtransport.connection` / `mc.actor.participant` instrumentation. Outbound `ServerMessage` ALSO populates `trace_parent`/`trace_state` via the propagator so that future bidirectional client-side observability works. The hand-parse + `tracing::field::Empty` approach from prior R-4 is removed in favor of the SDK helper. (from: observability, meeting-controller)
+
+- [ ] **R-58**: Add `string trace_parent = 20;` and `string trace_state = 21;` to `MhClientMessage` envelope in `proto/signaling.proto` (mirrors R-5 for `ClientMessage`/`ServerMessage`). MH reads them via the same `TraceContextPropagator`-based pattern as MC R-57, creates child spans on existing `mh.webtransport.connection` instrumentation. Field tags 20/21 verified unallocated on `MhClientMessage` (envelope currently allocates only `oneof message = 1`). Wire-additive, proto3 default-empty. Browser SDK populates the fields on outbound `MhClientMessage` via the same `tracePropagation.injectIntoClientMessage` helper used for MC signaling (R-19) — completing the client→MC and client→MH propagation paths through one shared helper. (from: protocol, observability, media-handler, client)
+
+- [ ] **R-59**: Dev Kind cluster gets an OTel collector deployment at `infra/services/otel-collector/`: standard `otel/opentelemetry-collector-contrib` image, `otel-collector-configmap.yaml` with OTLP-gRPC receiver (`:4317`) for in-cluster service traces and OTLP-HTTP receiver (`:4318`) targeted by GC `/api/v1/telemetry` proxy (R-2). Dev exporters: `logging` (debug) + `debug` verbosity. NO production-class exporters this story (Tempo / Honeycomb / etc. deferred). New `otel-collector` Service. AC/GC/MC/MH `otel_endpoint` Kustomize values point to `http://otel-collector.default.svc.cluster.local:4317`. NetworkPolicy permits cluster ingress from the four service pods (gRPC) + from GC for the HTTP path. **Runtime export-failure alert**: `infra/docker/prometheus/rules/otel-alerts.yaml` (new file, scoped to OTel-pipeline alerts shared across services) adds `OTelExportFailureRate` (warn severity, `rate(dt_otel_export_failures_total[5m]) > 0 for 10m`) — fires per service when runtime exports degrade. No init-failure alert needed: pod `Unready` on init failure is covered by existing K8s pod-health alerting (see R-54 fail-hard-at-init design). (from: infrastructure, observability, operations)
+
+---
+
+## Architecture Validation
+
+**Result**: PASS (12/12 specialists confirmed; test reported FAIL semantically but explicitly recommended "no debates — implementation gaps that this story closes," which the planning protocol treats as PASS-in-spirit since no `/debate` is required first)
+
+**Opt-outs (justified, no implementation work)**:
+- **database**: No new tables, columns, or migrations. Reuses existing AC user/org schema and GC meeting/participant schema. Dev-only seed (R-38) is owned by infrastructure.
+
+**Un-opt-outs (specialists who joined for the OTel + camelCase scope additions)**:
+- **auth-controller**: now owns R-53 (AC HTTP API camelCase migration, paired with global-controller) and R-55 partial (AC `main.rs` OTel wiring + Config). AC sign-up/login endpoint shapes themselves are unchanged — only the wire-format derive flips and OTel init is added. Subdomain caveat still locked by R-38.
+- **meeting-controller**: now owns R-57 (MC OTel SDK propagation, replaces R-4 design) and R-55 partial (MC `main.rs` OTel wiring + Config). Existing WebTransport pipeline unchanged.
+- **media-handler**: now owns R-58 reads (MH consumes `MhClientMessage` envelope trace fields) and R-55 partial (MH `main.rs` OTel wiring + Config) and R-56 partial (MH↔GC + MH↔MC gRPC interceptor). Predecessor mh-quic-connection story still in force; no client-MH wire change beyond the additive trace fields.
+
+**FAIL reports**: None requiring `/debate`. Test specialist's gap list (G1-G7) is implementation work this story performs.
+
+---
+
+## Design
+
+### client
+
+Greenfield browser SDK + Svelte adapter + minimal demo, organized into a strictly sequential 5-task chain (each layer consumes the layer below; no useful intra-client parallelism on a greenfield codebase).
+
+**Package structure** (per ADR-0028 §1, §2):
+- `packages/sdk-core/` (`@darktower/sdk-core`) — pure TypeScript: `transport/{IWebTransport,BrowserWebTransport,framing}`, `api/{AuthApiClient,MeetingApiClient,errors}`, `signaling/SignalingClient`, `media/MediaTransport`, `meeting/MeetingSession`, `telemetry/{MetricsSink,OtelMetricsSink,ConsoleMetricsSink,NoopMetricsSink,nameGuard,meterRegistry,tracePropagation,joinFlowInstrumentation,logger}`, `proto/` (gitignored, generated).
+- `packages/sdk-svelte/` (`@darktower/sdk-svelte`) — Svelte 5 rune stores wrapping `MeetingSession` events.
+- `packages/web-app/` (`@darktower/web-app`) — minimal SPA: sign-up / sign-in / meeting-join views, stable `data-testid` hooks, `window.__darktower_test__` event-bus hook (gated by `__E2E_HOOKS__` Vite-`define`), `vite.config.ts` with proxy + cert-fingerprint loading.
+- `packages/test-utils/` (`@darktower/test-utils`) — owned by **test** specialist: `MockWebTransport`, `TestTokenBuilder` + `TestTokenSigner` (ephemeral Ed25519), `deterministic-ids`, `InMemoryMetricsSink`, `MockOTLPExporter`.
+
+**Key design points**:
+- `IWebTransport` interface is the only WebTransport surface; `BrowserWebTransport` wraps the browser API with `__DEV_TRUST_FINGERPRINT__` Vite-`define` build-time literal gating the `serverCertificateHashes` dev path (CI bundle-inspection asserts the string is absent from prod builds).
+- 4-byte big-endian length-prefix framing on signaling stream; 64 KiB max frame matches MC's `MAX_MESSAGE_SIZE` and is enforced on inbound too.
+- HTTP API serializes **snake_case** on the wire (`{"display_name", "access_token"}`, etc.) matching AC's `UserRegistrationRequest` / GC's `JoinMeetingResponse` shapes; SDK may expose camelCase ergonomics in its TS API and transform at the boundary.
+- AC origin built from `{orgSubdomain, baseDomain, port}` with subdomain regex-validated against `[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?` (security R-31).
+- Tokens held in module-private fields, never on `this`; `MeetingSession.disconnect()` zeroes refs; SDK error classes implement custom `toJSON()` redacting `token`/`bearer`/`Authorization`.
+- `MediaTransport.connectAll()` opens N parallel WT to MH URLs with meeting JWT framed as first bidi-stream message inside the `MhClientMessage` envelope (`MhConnectRequest { join_token }` — per latest-main rebase target); resolves on ≥1, rejects on all-fail. Once settled, builds a `MediaConnectionUpdate` `ClientMessage` (R-60) listing per-MH terminal state for every URL in `media_servers` and sends it via `SignalingClient`.
+- `MeetingSession` is the single public entry point: `join({orgSubdomain, meetingCode, credentials})` → typed events; `disconnect()` clean teardown. The demo also calls `MeetingApiClient.createMeeting` (R-12, R-29) directly via the auth-controlled HTTP client — no `MeetingSession` involvement for create.
+
+**Five-task sequential chain** (T-Client-1..5 in §Implementation Plan).
+
+### global-controller
+
+Two sequential tasks splitting CORS from telemetry proxy (different domains, parallel reviewer attention).
+
+**R-1 / R-3 (CORS)**: `tower_http::cors::CorsLayer` mounted between `TraceLayer` and auth middlewares — preflight bypasses auth but is observed via a thin middleware that emits `gc_cors_preflight_total{origin_class, status}`. Allowlist via env-driven `cors_allowed_origins: Vec<String>`; explicit `AllowOrigin::list(...)`, never wildcard. `allow_credentials: false`.
+
+**R-2 / R-3 / R-51 (telemetry proxy)**: `POST /api/v1/telemetry/v1/{metrics,traces,logs}` (logs path reserved for future story; this story implements metrics + traces). Behind `require_user_auth`. Pipeline:
+1. Size check (`telemetry_proxy_max_bytes` default 256 KiB) → 413 on overflow
+2. Content-Type must be `application/x-protobuf` → 415 otherwise
+3. Per-JWT-`sub` rate limit via `governor` (`telemetry_proxy_rate_limit_per_minute` default 60) → 429
+4. Decode OTLP/HTTP-proto via `opentelemetry-proto` crate, drop attributes outside the **12-key allowlist** (`client_version`, `service.name`, `service.version`, `meeting_id_hash`, `org_id`, `dt.event`, `dt.duration_ms`, `dt.failure_stage`, `dt.close_reason`, `dt.mh_index_bucket`, `http.status_code`, `error.code`), re-serialize
+5. Forward via `reqwest` to `otel_collector_endpoint` → 502 on collector 4xx/5xx/timeout
+6. 202 Accepted on success
+
+New code: `crates/gc-service/src/handlers/telemetry.rs`, `services/telemetry_filter.rs`, `services/telemetry_forwarder.rs`. New `Config` keys, new `GcError` variants. Metrics: `gc_telemetry_ingest_total{status, payload_kind}` + duration histogram + payload-bytes histogram + rate-limited counter + PII-dropped counter.
+
+### meeting-controller
+
+Single task (R-57, replaces prior R-4 hand-parse design now that the backend OTel SDK rollout is in scope). MC initializes the OTel SDK in `main.rs` via the common helper (R-54/R-55), then:
+- Uses the global `TraceContextPropagator` registered by R-54 to extract W3C context from `ClientMessage.trace_parent`/`trace_state` at the bridge-loop dispatch site in `crates/mc-service/src/webtransport/connection.rs` and attach it to the current OTel context for the handler's lifetime.
+- Existing `#[instrument]` spans on `mc.webtransport.connection` / `mc.actor.participant` automatically become child spans of the propagated parent — no new `tracing::field::Empty` plumbing needed (the `tracing-opentelemetry` bridge from R-54 handles it).
+- **Outbound `ServerMessage`** ALSO populates `trace_parent`/`trace_state` via the same propagator — full bidirectional client↔MC propagation. The hand-parse helper from prior R-4 is removed.
+- gRPC trace propagation on MC's outbound clients (`GcRegistrationClient`, `MhRegistrationClient`) and inbound server (the MH-facing `MediaCoordinationService`) wired via the R-56 Tonic interceptor — uniform with the rest of the backend.
+- New MC dep: `tracing-opentelemetry` via `common`.
+
+### protocol
+
+Two tasks: P-1 proto edit + buf config + wire fixtures (no deps), P-2 codegen pipeline (depends on P-1 + workspace bootstrap).
+
+**R-5 + R-58 diff** to `proto/signaling.proto`: add `string trace_parent = 20;` and `string trace_state = 21;` to ALL THREE envelopes — `ClientMessage`, `ServerMessage`, and `MhClientMessage` — outside their `oneof message`. Field tags 20/21 verified unallocated on all three. Wire-additive, proto3 default-empty for old consumers. Adding to `MhClientMessage` envelope (rather than to specific variants like `MhConnectRequest`) follows the same pattern as `ClientMessage` — makes trace propagation available across all current and future MH client message variants without per-variant changes.
+
+**Buf config** at `proto/buf.yaml` (module rooted in `proto/`, not repo root): `STANDARD` lint + `WIRE_JSON` breaking. `proto/buf.gen.yaml` generates TS via `@bufbuild/protoc-gen-es` with `target=ts`, `import_extension=js`, `json_types=true`; output to `packages/sdk-core/src/proto/*_pb.ts` (gitignored — Nx caches). Includes `internal.proto` codegen (tree-shakes); enforces `buf format` in CI lint.
+
+**No cross-language wire-vector fixtures** this story — `protobuf-es` and `prost` both implement the protobuf wire spec; we trust round-trip compatibility rather than maintain dual-language hex fixtures + a regen tool. Each side writes its own normal unit tests against runtime-built protobuf objects (per user direction, Clarification Question 9).
+
+**R-60 MediaConnectionUpdate diff**: in `proto/signaling.proto`, remove the `media_connection_failed` `oneof` variant on `ClientMessage` and the `MediaConnectionFailed` message. Add `MediaConnectionUpdate { repeated MhConnectionStatus statuses; }` + `MhConnectionStatus { string mh_url = 1; ConnectionState state = 2; optional string failure_reason = 3; optional string failure_code = 4; google.protobuf.Timestamp observed_at = 5; }` + `enum ConnectionState { CONNECTION_STATE_UNSPECIFIED = 0; CONNECTION_STATE_CONNECTED = 1; CONNECTION_STATE_FAILED = 2; CONNECTION_STATE_DISCONNECTED = 3; }`. New `oneof` variant `media_connection_update = N` may reuse the freed slot from `media_connection_failed`. Wire-breaking from predecessor in this story by design; no on-the-wire clients exist outside this codebase.
+
+### infrastructure
+
+Owns workspace bootstrap, devloop image, dev-cluster reachability + cert plumbing, CI workflow scaffold, and validation pipeline integration. Splits into 4 tasks (T-INFRA-1..4) plus a portion of the validation-pipeline task co-owned with test/operations.
+
+**T-INFRA-1 (R-8/R-9/R-10 partial)**: repo-root `package.json` + `pnpm-workspace.yaml: ['packages/*']` + `nx.json` (targetDefaults, namedInputs, affected.defaultBase=main) + `.nvmrc` (Node 22) + `.gitignore` updates + `tsconfig.base.json` skeleton + empty `packages/.gitkeep`. Adds `@bufbuild/buf` and pnpm/Nx tooling to root devDependencies. **Cargo workspace unaffected.**
+
+**T-INFRA-2 (R-35)**: `infra/devloop/Dockerfile` extended with `corepack enable && corepack prepare pnpm@9.x`, Playwright system deps, `npx playwright install --with-deps chromium` to pre-cache browser at `/opt/ms-playwright`, version-pinned. Image-size delta documented (~280 MB Chromium + ~50 MB deps; budget ≤600 MB additional).
+
+**T-INFRA-3 (R-36/R-37/R-38)** — three sub-pieces shipped together because they form one capability ("dev cluster reachable from browser, trusted WebTransport, demo org seeded"):
+- `scripts/generate-dev-certs.sh` extended to compute SHA-256 over leaf-cert DER for `mc-webtransport.crt` and `mh-webtransport.crt`, write `infra/docker/certs/fingerprints.json` (`{"mc": {"sha256_b64": "...", "sha256_hex": "..."}, "mh": {...}, "generated_at": "<iso8601>"}`) + sourceable `fingerprints.env`. WebTransport leaf cert validity reduced to 14 days (Chrome `serverCertificateHashes` requirement); auth/non-WT certs unchanged at 365 days. File gitignored.
+- Kind dev overlays `infra/services/{ac,gc}-service/overlays/dev/service-nodeport.yaml` exposing AC port 8082 → NodePort 30082, GC port 8080 → NodePort 30081 (avoiding 30080 Loki collision); `infra/kind/kind-config.yaml` adds `extraPortMappings` AC `30082→8443/TCP listenAddress=127.0.0.1`, GC `30081→8444/TCP listenAddress=127.0.0.1`. **Loopback-only** per security R-37.
+- `infra/kind/scripts/setup.sh` adds `seed_demo_org()` running `INSERT INTO organizations (subdomain, display_name) VALUES ('demo', 'Demo Organization') ON CONFLICT (subdomain) DO NOTHING;` (idempotent; SQL provided by @database).
+
+**T-INFRA-4 (R-7/R-33/R-34/R-47)**: `.github/workflows/ci-client.yml` with path-triggered `lint` + `unit` + `component` jobs. Lint job runs eslint + prettier + svelte-check, `buf lint` + `buf breaking --against main` + `buf format`, TS client guards (`no-secrets-in-code` + `no-test-removal` adapted to `.ts`/`.svelte`), `pnpm audit --audit-level=high` (per security guidance — high/critical only). Unit job: vitest + 90% coverage gate via `@vitest/coverage-v8`. Component job: vitest browser-mode Chromium with `actions/cache@v4` keyed on Playwright version. `.github/dependabot.yml` for npm + GH Actions ecosystems. **No E2E in CI** — that ships in devloop validation pipeline only.
+
+### test
+
+Three tasks (T-A test-utils, T-B Playwright happy-path, T-C secondary E2E + Layer 8 wiring). Embeds R-41/R-42/R-43 unit + component tests in the source-code tasks per the convention that source + tests ship in the same PR.
+
+**T-A (R-39 + cross-language fixture support)**: ships `packages/test-utils/` with `MockWebTransport` (control points `simulateReady`/`simulateClose`/`simulateError`/`simulateIncomingDatagram`/`simulateBidiStream`/`simulateServerMessage`, plus inspector helpers), `TestTokenBuilder`/`TestTokenSigner` (ephemeral Ed25519 via Web Crypto / `@noble/ed25519`), `deterministic-ids`, `InMemoryMetricsSink` (interface contract co-owned with observability — observability owns the assertion shape, test owns the file location and Vitest harness), `MockOTLPExporter`, `proto-fixtures` loader. Also adds `crates/env-tests/src/bin/generate-proto-fixtures.rs` (Rust regen tool — protocol-paired since it touches `proto/test-vectors/`). ~13 self-tests.
+
+**T-B (R-40 + R-44 + R-46 README)**: `packages/web-app/playwright.config.ts` (Chromium-only, `retries=0`, single context default — happy-path spec opts into a second context for the ParticipantJoined assertion), `e2e/global-setup.ts` reads `MC_CERT_SHA256`/`MH_CERT_SHA256` from env and asserts host-side cluster reachable, fixtures for `bootstrapMeeting(adminToken)` / `joinAsUser(page, meetingCode)` / `waitForJoined(page)`, `e2e/join-happy-path.spec.ts` covers signup → login → create-meeting (via direct GC call with admin token, not through demo UI) → meeting join → assert SDK `joined` state + at least one MH WT handshake per `media_servers[]` URL + multi-context ParticipantJoined within 5s. README documents division of responsibilities vs. Rust env-tests (R-46).
+
+**T-C (R-45 + R-48 SKILL.md edit, paired with operations + infrastructure)**: three negative-path E2Es (`auth-rejection`, `meeting-not-found`, `mc-token-rejection`), edit `.claude/skills/devloop/SKILL.md` Layer 8 description so `pnpm --filter @darktower/web-app test:e2e` runs sequentially after `cargo test -p env-tests --features all` against the same Kind cluster (single attempt budget, shared cluster setup), and extend `scripts/verify-completion.sh` to gate client `pnpm test:unit` + `pnpm test:component` under `LAYER >= standard` and the new client E2E under `LAYER == full`.
+
+**Embedded test work** (rides source-code tasks):
+- R-41 unit tests (~30): split between client tasks T-Client-3 (state machine, framing, signaling proto, error hierarchy) and T-Client-4 (MediaTransport `connectAll` + `MediaConnectionUpdate` send shape + MeetingSession orchestration).
+- R-42 unit tests (~12): rides T-Client-2 (HTTP API client + error hierarchy).
+- R-43 component tests (~14): split between T-Client-5 (sdk-svelte stores + web-app demo views).
+
+Test specialist is the test reviewer on each of those source-code devloops.
+
+### observability
+
+Three tasks (Task A client telemetry, Task B GC server-side artifacts, Task C backend OTel SDK rollout — owned by observability for the common helper + interceptor module; per-service `main.rs` wiring is owned by each service specialist per R-55). Task B's deliverables hand off to global-controller's GC-B PR per observability's preference — minimizes the window where the handler exists without alerts.
+
+**Task A (R-19/R-24/R-25/R-26/R-27)**: ships `packages/sdk-core/src/telemetry/` per the package layout above. Pinned OTel JS SDK packages: `@opentelemetry/{api,sdk-metrics,sdk-trace-web,exporter-metrics-otlp-proto,exporter-trace-otlp-proto,core,instrumentation-fetch,resources,semantic-conventions}`. Single global `MeterProvider` + `WebTracerProvider` initialized once via `MeetingSession.configure({ telemetryEndpoint, env })`. Resource attributes: `service.name=darktower-sdk-core`, `service.version=__SDK_VERSION__`, `service.namespace=darktower`, `deployment.environment=<env>`. `W3CTraceContextPropagator` registered globally so `instrumentation-fetch` auto-injects on AC/GC fetches; `tracePropagation.injectIntoClientMessage(msg)` helper called once in `SignalingClient.send()` for the WebTransport `ClientMessage` path AND once at the MH connect-request build site for the `MhClientMessage` envelope (R-58 SDK side). Bounded-event logger emits to console only this story (OTLP-Logs path deferred — follow-up story).
+
+**Task B (R-51/R-52)**: hands off to GC-B PR. Provides:
+- Two alert YAML stanzas for `gc-alerts.yaml`: `GCTelemetryProxyHighRejectionRate` (warn, >10% rejection rate for 10m) + `GCTelemetryProxySilent` (page, `absent_over_time` gated by 1h-baseline guard so day-1 zero traffic doesn't page).
+- "Telemetry Ingest" row added to `gc-overview.json` with 5 panels (ingest rate by status, p50/p99 ingest duration, payload size p99 by kind, rate-limit rejections by reason, CORS preflight by `origin_class`).
+- New sections in `docs/observability/metrics/gc-service.md` for "Telemetry Proxy Metrics" and "CORS Preflight Metrics".
+
+**Catalog stub** `docs/observability/metrics/client.md` ships in Task A — documents the 5 `dt_client_*` join-flow metrics per R-25 plus the naming convention. Marked "Story 1 stub — full catalog deferred."
+
+**Task C (R-54 + R-56)**: ships the common backend OTel module `crates/common/src/observability/otel.rs` (`init_otel(...)` returning RAII guard, OTLP-gRPC exporter, W3C `TraceContextPropagator` registration, `parent_based(traceidratio)` sampler, resource attrs, `tracing-opentelemetry` bridge) and `crates/common/src/observability/otel_grpc.rs` (Tonic tower interceptor — inject on outbound metadata, extract on inbound, attach to handler context). Adds `tracing-opentelemetry` to the workspace deps (sibling of existing `opentelemetry`/`opentelemetry-otlp`). Per-service `main.rs` wiring (R-55) is each service specialist's responsibility — observability provides the helper API and reviews the wiring at devloop close.
+
+### operations
+
+Two tasks. R-35 devloop image is co-owned with infrastructure (advocate role). Validation-pipeline SKILL.md edit rides T-C (test specialist) per scope-locking.
+
+**O-1 (R-49)**: new `docs/runbooks/client-dev-local.md`. Sections: prerequisites, local stack bring-up (10 numbered steps from `dev-cluster setup` through opening Chrome at `https://demo.localhost:5173`), three "things go wrong" scenarios with detection/diagnosis/resolution (devloop image stale, cert fingerprint mismatch, vite dev server fails), running E2E suite from devloop or host, tearing down. Explicit non-goal banner: "This is the dev-loop runbook. Production deployment, CSP/COEP/COOP headers, CDN serving, and synthetic probes are tracked separately under ADR-0028 §10."
+
+**O-2 (R-50)**: six new smoke-test stanzas in `gc-deployment.md` (CORS preflight allowed/denied; telemetry proxy authed/unauthed/oversize/rate-limit). Smoke uses fixture `infra/smoke/empty-otlp-metrics.bin` (owned by observability — minimal valid OTLP-Metrics protobuf with zero data points). Adds two scenarios to `gc-incident-response.md` ("Telemetry proxy unreachable / rate-limit storm", "CORS misconfig post-deploy"). Updates `docs/observability/alerts.md` with the two new `gc_telemetry_*` alerts catalog entries.
+
+### auth-controller
+
+Two tasks (un-opted-in for camelCase migration + AC OTel wiring).
+
+**Task AC-1 (R-53, paired with global-controller)**: Mechanical-classified cross-boundary edit. Adds `#[serde(rename_all = "camelCase")]` to AC public HTTP API request/response structs in `crates/ac-service/src/handlers/auth_handler.rs` (`UserRegistrationRequest`, `UserTokenRequest`, register / token / introspect / logout response types) and any sibling DTOs flowing over public HTTP. Also adds `#[serde(rename_all = "camelCase")]` to GC public HTTP API structs (`JoinMeetingResponse`, `CreateMeetingRequest`, `CreateMeetingResponse`, etc.) in `crates/gc-service/src/handlers/`. Existing Rust env-tests in `crates/env-tests/` updated to use camelCase wire keys; runbook smoke `curl` examples in `docs/runbooks/ac-service-deployment.md` + `docs/runbooks/gc-service-deployment.md` updated. **Cross-Boundary Trailer**: `Approved-Cross-Boundary: Mechanical (camelCase derive sweep)` cites the user-decision lock. Auth-controller is lead specialist; global-controller is paired reviewer for the GC-side touch.
+
+**Task AC-2 (R-55 partial — AC main wiring)**: AC `main.rs` wires `init_otel(...)` from R-54 with service.name=`auth-controller`, service.version from build metadata. AC `Config` adds `otel_enabled` / `otel_endpoint` / `otel_sample_rate`. Surfaced in `infra/services/ac-service/configmap.yaml`. Holds the `OtelGuard` until shutdown. AC's outbound gRPC clients (if any — currently none, but the future-proofing pattern is established by importing the R-56 interceptor crate). No code change on issue-token or verify-token paths beyond automatic span enrichment via the `tracing-opentelemetry` bridge.
+
+### media-handler
+
+One task (un-opted-in for OTel rollout + R-58 envelope reads).
+
+**Task MH-1 (R-55 partial + R-56 partial + R-58 reads)**: MH `main.rs` wires `init_otel(...)` (service.name=`media-handler`). MH `Config` adds the three OTel env knobs and surfaces them in `infra/services/mh-service/configmap.yaml`. The R-56 Tonic interceptor is wired on MH's outbound `GcRegistrationClient` (MH→GC) and `McNotificationClient` (MH→MC) and on MH's inbound gRPC server (the MC-facing endpoints). For R-58: at the WebTransport accept-path in `crates/mh-service/src/webtransport/connection.rs:handle_connection()`, MH parses the inbound `MhClientMessage` envelope (post-rebase: latest main wraps `MhConnectRequest` in this envelope), extracts `trace_parent`/`trace_state` via the global propagator, and attaches the context to existing `mh.webtransport.connection` instrumentation. Outbound MH responses populate `trace_parent`/`trace_state` symmetrically. Integration tests in `crates/mh-service/tests/` cover propagation round-trip via the existing `accept_loop_rig.rs` harness.
+
+### infrastructure (OTel collector dev deployment)
+
+Adds one task to the infrastructure portfolio: dev OTel collector deployment.
+
+**Task INFRA-OTEL (R-59)**: New `infra/services/otel-collector/` Kustomize base — `deployment.yaml` (image `otel/opentelemetry-collector-contrib:0.x`, resource limits, readiness probe on `:13133`), `configmap.yaml` (OTLP-gRPC receiver `:4317`, OTLP-HTTP receiver `:4318`, `logging` + `debug` exporters in dev — no production exporter wiring this story), `service.yaml` (ClusterIP exposing 4317/4318/13133), `network-policy.yaml` (ingress from AC/GC/MC/MH pods on 4317; ingress from GC pod on 4318 for the `/api/v1/telemetry` proxy forward path; egress none beyond DNS). AC/GC/MC/MH `otel_endpoint` Kustomize values populate `http://otel-collector.default.svc.cluster.local:4317`. GC's `otel_collector_endpoint` (R-2) populates `http://otel-collector.default.svc.cluster.local:4318/v1/{metrics,traces}`. Kind setup script verifies collector readiness before declaring cluster healthy.
+
+### security
+
+Cross-cutting; no standalone task this story. Security requirements ride other tasks per the planning protocol; security re-validates at round-2 review and security-review on close. Round 2 review checklist (10 items): build-flag literal injection for R-14, allowlist (not denylist) PII filter for R-2, JWT-`sub` rate-limit key for R-2 (not IP), localhost-bound NodePorts for R-37, AC `UserRegistrationRequest` `#[serde(deny_unknown_fields)]` (defer to sign-up hardening story since AC opted out for sign-up but is back in for camelCase), GC `code` regex pre-DB-lookup, `no-secrets-in-code` guard ships with positive/negative real-JWT fixtures, **R-54 propagator extracts BOUNDED `traceparent`/`tracestate` strings only — reject `traceparent` on length/format mismatch and cap `tracestate` ≤ 512 bytes per W3C §3.3.1.1 to prevent log/span exfil amplification**, **R-56 interceptor must NEVER include user-bearing tokens in span attributes — only `traceparent`/`tracestate` headers are propagated; gRPC `authorization` metadata stays out of the span**, **R-59 dev collector NetworkPolicy is restrictive — only the four service pods + GC for HTTP path can reach it**.
+
+**Deferred** to a separate hardening story (NOT in scope here): HIBP / breached-password check, CAPTCHA, email verification, per-IP and per-email rate-limiting on `/api/v1/auth/register`, generic timing-equalized 409-vs-success responses, npm `--provenance` publish + 2FA, SRI hashes on CDN-loaded assets, production CSP/COOP/COEP/Permissions-Policy headers, NetworkPolicy productionization, synthetic probe + canary dist-tag.
+
+---
+
+## Cross-Cutting Requirements
+
+### Security Checklist
+1. **Authentication**: User JWT (EdDSA, 1h) at AC and GC; meeting JWT (EdDSA, 15min) at MC and MH. Browser-side: tokens in memory only (R-23).
+2. **Authorization**: Subdomain-based org context at AC; user-scoped meeting access at GC (existing); meeting-scoped JWT at MC/MH (existing). Telemetry proxy (R-2) requires authenticated user JWT.
+3. **Input validation**: Bounded sizes, deny-unknown-fields, server-side meeting-code regex (R-31). CORS allowlist not `*` (R-1).
+4. **Data protection**: No PII in metric labels (`meeting_id_hash`, not raw — R-25). Tokens redacted in SDK errors and logs (R-23, R-26). Build-flag-gated dev fingerprint flow (R-14).
+5. **Error handling**: Typed SDK errors with stable codes, server logs detailed cause behind correlation IDs (R-18).
+6. **Cryptography**: `crypto.getRandomValues()`, `extractable: false` on CryptoKeys (R-32). EdDSA + AES-256-GCM (ADR-0027) wherever crypto is invoked.
+
+### Test Checklist
+1. **Unit tests**: SDK state machine, signaling proto round-trip (runtime-built objects, no committed hex fixtures), HTTP API client (camelCase wire), error hierarchy, MediaTransport + `MediaConnectionUpdate` send shape (R-41, R-42).
+2. **Component tests**: Svelte component rendering across all four demo views, store reactivity (R-43).
+3. **Env-tests**: Browser E2E in `packages/web-app/e2e/` for happy-path + 3 negative-path scenarios (R-44, R-45) running in devloop validation Layer 8 (R-48).
+4. **Test infrastructure**: `packages/test-utils/` (R-39), Playwright harness (R-40), cert fingerprint flow (R-36).
+5. **Backend OTel tests**: common helper round-trip + sampler (task #24); per-service main-wiring smoke + gRPC interceptor inbound/outbound (tasks #25/#26/#6/#27); MC `MediaConnectionUpdate` handler all-CONNECTED / partial / all-FAILED (task #6).
+6. **Wire-format migration tests**: existing Rust env-tests in `crates/env-tests/` updated to camelCase wire keys; unit tests of `UserRegistrationRequest` / `JoinMeetingResponse` etc. confirm `#[serde(rename_all = "camelCase")]` round-trips correctly (task #23).
+
+### Observability Checklist
+1. **Business metrics**: Client `dt_client_*` join-flow metrics (R-25). GC telemetry-proxy + CORS metrics (R-51, R-52). MC per-MH connection state (replaces all-fail metric per R-60).
+2. **Dashboards**: New "Telemetry Ingest" row on existing `gc-overview.json` (R-51). No new dashboard files. Client dashboards explicitly out of scope.
+3. **Structured logs**: Bounded `event` enum on client (R-26). Server-side telemetry proxy + CORS logs (R-51, R-52).
+4. **Alerts**: Two new GC alerts for telemetry proxy (R-51). No client alerts (synthetic probe deferred).
+5. **Backend tracing**: end-to-end W3C-context propagation across all four services (R-54–R-58); browser → MC → MH continuity via `ClientMessage` and `MhClientMessage` envelope trace fields; gRPC propagation via Tonic interceptor across GC↔AC, MC↔GC, MC↔MH, MH↔GC.
+6. **Collector deployment**: dev OTel collector at `infra/services/otel-collector/` (R-59) — debug exporters only this story; production exporter wiring deferred.
+
+### Operations Checklist
+1. **New failure modes**: Devloop image stale, cert fingerprint mismatch, Vite dev server fails (R-49 — dev-time). GC telemetry proxy unreachable, telemetry rate-limit storm (R-51 — production). **OTel collector unreachable at startup**: services fail-hard (R-54) → K8s pod `Unready`/`CrashLoopBackoff` → standard pod-health alerting; collector upgrades MUST land in a separate change window from service deploys (operational discipline noted in `client-dev-local.md` and a new note in `gc-deployment.md`'s OTel section). **OTel runtime export degradation**: spans drop silently, `dt_otel_export_failures_total{service, reason}` increments, `OTelExportFailureRate` (warn) fires after 10m of non-zero rate.
+2. **Rollback**: All changes additive at the schema layer — no DB migrations. CORS, telemetry proxy, and per-service OTel can be feature-flagged off via empty `cors_allowed_origins`, telemetry config toggle, and `otel_enabled=false` respectively. R-60 MediaConnectionUpdate is a wire-breaking change with the predecessor — accepted because no on-wire clients exist yet (committed in same story as the SDK that emits it).
+3. **Monitoring**: GC telemetry ingest rate, latency, payload size; CORS preflight rate; per-MH connection state metric on MC (R-60 replacement).
+4. **Runbook**: New `client-dev-local.md` (dev-loop). Smoke-test additions to `gc-deployment.md` with camelCase curl examples (post-R-53). AC sign-up runbook curl examples migrate to camelCase. No new production client runbook this story.
+
+---
+
+## Assumptions
+
+| # | Assumption | Made By | Reason Not Blocked |
+|---|-----------|---------|-------------------|
+| 1 | AC sign-up (`/api/v1/auth/register`) and login (`/api/v1/auth/user/token`) endpoint shapes match `crates/ac-service/src/handlers/auth_handler.rs` as the implemented contract — wire format flips to camelCase via R-53 in this story | client, auth-controller | Endpoints verified in code; ADR-0020 is silent on exact JSON shape; user explicitly chose camelCase migration |
+| 2 | **Updated by user feedback (Revision 1)**: the demo includes a create-meeting view (R-29 four-view structure + R-12 `createMeeting` SDK method) so a manual user can drive the full flow end-to-end. E2E tests MAY still create meetings via direct GC fixture call for speed (this is a permitted optimization, not a requirement) | client, test | Demo now self-sufficient; E2E fixture path retained as optional optimization |
+| 3 | Trace propagation proto fields (20/21) on `ClientMessage`/`ServerMessage` are wire-safe additive changes — verified field tags currently unallocated | protocol, observability | grep confirmed; proto3 default-empty is safe for old consumers |
+| 4 | OTLP/HTTP wire format is the right encoding for GC `/api/v1/telemetry`; encoding details (proto vs JSON, batch shape) finalized during design | global-controller, observability | Standard OTLP-HTTP is well-established |
+| 5 | `MediaTransport` connection success means WebTransport `ready` resolves + meeting-JWT framed write completes per the predecessor MH design (no application "hello" message) | client, media-handler | Confirmed against `mh-service/src/webtransport/connection.rs` |
+| 6 | The dev `serverCertificateHashes` flow is acceptable for both Playwright runs and host-Chrome manual runs — fingerprints written to a stable file and consumed via env var | infrastructure, test | Matches the existing dev-cert pattern; works in both contexts |
+| 7 | Existing devloop / dev-cluster topology (host-side Kind + container-side devloop per ADR-0030) reaches AC/GC NodePorts unchanged; only new exposure is for browser-on-host reachability | infrastructure | Existing env-tests already use this topology |
+| 8 | Component-tier tests in CI need only Linux runners with Playwright-installed Chromium — no Kind cluster, no GPU, no special hardware | test | ADR-0028 §7 specifies this |
+
+## Clarification Questions
+
+| # | Question | Asked By | Status | Answer |
+|---|---------|----------|--------|--------|
+| 1 | Should GC `/api/v1/telemetry` proxy ship in this story? | team-lead | Answered | **Yes — ship it** (R-2, R-3, R-51, R-52 included) |
+| 2 | Scope for AC sign-up hardening? | team-lead | Answered | **Defer** to a separate hardening story; AC opted out, no hardening tasks this story |
+| 3 | Where should the browser E2E test run for this story? | team-lead | Answered | **Local/devloop only**; runnable from devloop container; runnable via host Chrome for manual testing; in validation suite (Layer 8) per R-48 |
+| 4 | Component-tier tests in CI? | team-lead | Answered | **Ship in CI** (R-43) |
+| 5 | AC subdomain handling for the demo? | team-lead | Answered | **Strict** — keep ADR-0020 subdomain requirement; infra seeds `demo` org (R-38) |
+| 6 | snake_case (AC's actual contract) vs. SDK shim vs. server-side rename? | team-lead | Answered | **Option C: server-side `#[serde(rename_all = "camelCase")]` migration** (R-53, task #23). User reasoning: automatic via serde derive, well-tested upstream, vs. a shim layer the SDK would have to build and maintain. No external clients today; rebase migration is mechanical |
+| 7 | Should backend OTel SDK ship in this story (vs. R-4 hand-parse approach)? | team-lead | Answered | **Yes — full backend OTel rollout** (R-54 helper, R-55 per-service wiring, R-56 gRPC interceptor, R-57 MC SDK propagation, R-59 dev collector). Replaces the previously narrower R-4 inbound-only design |
+| 8 | Client→MH trace propagation feasible without large new transport work? | team-lead, protocol | Answered | **Yes — natural via `MhClientMessage` envelope.** Latest main (rebase target) wraps MH client messages in `MhClientMessage { oneof message { MhConnectRequest connect_request = 1; } }`. R-58 adds `trace_parent`/`trace_state` to that envelope, mirroring R-5 for `ClientMessage`/`ServerMessage`. Same propagator helper, same injection pattern |
+| 9 | Cross-language proto wire-vector hex fixtures? | user | Answered | **Drop them** — protobuf wire spec is implemented identically by `protobuf-es` and `prost`; we trust round-trip rather than maintain dual-language hex fixtures + a regen tool. R-6 updated; tasks #2/#7/#8 simplified accordingly |
+| 10 | `Room` class name? | user | Answered | **Rename to `MeetingSession`** — aligns with backend "meeting" terminology, avoids collision with the GC `Meeting` resource type. Updated R-22, R-28, R-29, design sections, tasks #14/#15 |
+| 11 | `MediaConnectionFailed` shape? | user | Answered | **Replace with `MediaConnectionUpdate`** carrying per-MH state (R-60). SDK sends one update once `connectAll()` settles, listing terminal state per MH URL; MC tracks per-(participant, mh_url) state for future routing. Predecessor's coarse all-fail signal removed (clean replacement, no on-wire clients) |
+| 12 | Demo create-meeting view? | user | Answered | **Add fourth view** to R-29 (sign-up / sign-in / create-meeting / join). New `MeetingApiClient.createMeeting` SDK method (R-12 extended). Manual user flow now self-sufficient; assumption A-2 amended |
+| 13 | OTel init: fail-soft or fail-hard? | user | Answered | **Fail-hard at init, fail-soft at runtime.** Configuration bugs surface immediately; transient collector-not-ready races are handled by K8s restart loop + existing pod-health alerts; runtime degradation tracked via `dt_otel_export_failures_total` + `OTelExportFailureRate` warn alert. Drops the silent-failure hole the prior fail-soft design had. Trade-off: botched collector upgrades cascade across all four services — mitigated by deployment discipline (separate change windows) |
+
+---
+
+## Implementation Plan
+
+### Ordered Task List
+
+| # | Task | Specialist | Deps | Covers |
+|---|------|-----------|------|--------|
+| 1 | Bootstrap pnpm + Nx polyglot workspace at repo root: `package.json` (`packageManager: pnpm@9.x`, `engines.node: 22.x`), `pnpm-workspace.yaml: ['packages/*']`, `nx.json` (targetDefaults, namedInputs, `affected.defaultBase: main`), `.nvmrc`, `tsconfig.base.json` skeleton, `.gitignore` updates, empty `packages/.gitkeep`. Root `pnpm` scripts (`lint`/`test:unit`/`test:component`/`test:e2e`/`build`/`dev`) delegate to Nx. Root devDependencies include `@bufbuild/buf`. Cargo workspace unaffected | infrastructure | — | code, deploy |
+| 2 | Proto (R-5, R-58, R-60): add `string trace_parent = 20;` and `string trace_state = 21;` to ALL THREE envelopes in `proto/signaling.proto` — `ClientMessage`, `ServerMessage`, AND `MhClientMessage` (the latter wraps `MhConnectRequest` on rebase target / latest main; field tags 20/21 verified unallocated on all three). Outside the `oneof message` field on each. **R-60 redesign**: remove the `media_connection_failed` `oneof` variant + `MediaConnectionFailed` message; add `MediaConnectionUpdate { repeated MhConnectionStatus statuses; }` + `MhConnectionStatus { string mh_url; ConnectionState state; optional string failure_reason; optional string failure_code; google.protobuf.Timestamp observed_at; }` + `ConnectionState` enum (UNSPECIFIED/CONNECTED/FAILED/DISCONNECTED); new `oneof` variant `media_connection_update` reuses the freed tag from `media_connection_failed`. Create `proto/buf.yaml` (v2, `STANDARD` lint + `WIRE_JSON` breaking — R-60 explicitly accepts a one-time wire break since no on-wire clients exist; document in commit). Run `buf lint` locally; `buf breaking` will flag R-60 — that's expected and approved per Clarification Question 9 | protocol | — | code, tests |
+| 3 | Update devloop image (`infra/devloop/Dockerfile`): `corepack enable && corepack prepare pnpm@9.x --activate`; install Playwright system deps (libnss3, libatk-bridge2.0-0, libdrm2, libxkbcommon0, libxcomposite1, libxdamage1, libxfixes3, libxrandr2, libgbm1, libpango-1.0-0, libcairo2, libasound2, fonts-liberation, fonts-noto-color-emoji); `ENV PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright`; pre-cache via `npx -y playwright@1.49.0 install --with-deps chromium`. Document image-size delta. Verify `pnpm --version` + `npx playwright --version` + Rust devloop regression smoke | infrastructure | — | deploy |
+| 4 | Dev infra plumbing (3 sub-pieces, single PR): (a) extend `scripts/generate-dev-certs.sh` — WebTransport leaf certs reduced to 14-day validity (Chrome `serverCertificateHashes` requirement), DER SHA-256 fingerprints written to `infra/docker/certs/fingerprints.json` (`{"mc": "<b64>", "mh": "<b64>"}`, std base64) + `fingerprints.env` exports (`MC_CERT_SHA256_B64`/`MH_CERT_SHA256_B64`); both gitignored. (b) add Kind dev Kustomize overlays for AC + GC NodePort (AC `30082`, GC `30081` avoiding 30080 Loki collision); add `infra/kind/kind-config.yaml` `extraPortMappings` AC `30082→8443`, GC `30081→8444`, both with `listenAddress: 127.0.0.1`. (c) extend `infra/kind/scripts/setup.sh` with `seed_demo_org()` invoking `infra/kind/scripts/seeds/demo-org.sql` (`INSERT INTO organizations (subdomain, display_name) VALUES ('demo', 'Demo Organization') ON CONFLICT (subdomain) DO NOTHING;`) | infrastructure | — | deploy |
+| 5 | GC CORS layer + config (R-1, R-3 partial, R-52): add `tower_http::cors::CorsLayer` between `TraceLayer` and auth middlewares in `routes/mod.rs:build_routes()`; allowlist via env-driven `cors_allowed_origins: Vec<String>`; methods GET/POST/PATCH/OPTIONS; headers authorization/content-type/traceparent/tracestate; `allow_credentials: false`; `max_age: 600s`. Add `cors_preflight_observer` middleware emitting `gc_cors_preflight_total{origin_class, status}`. New `Config` field. Integration test in `crates/gc-service/tests/cors_integration.rs` covering allowed/denied origins + preflight bypass-auth. Dev allowlist value: `["http://localhost:5173"]` in dev Kustomize ConfigMap | global-controller | — | code, metrics, tests |
+| 6 | MC OTel SDK init + trace propagation (R-55 partial, R-57) + MediaConnectionUpdate handler (R-60 MC half): MC `main.rs` calls `init_otel(...)` from R-54 with `service.name=meeting-controller`. MC `Config` adds `otel_enabled` / `otel_endpoint` / `otel_sample_rate`. R-56 Tonic interceptor wired on MC's outbound `GcRegistrationClient` + `MhRegistrationClient` and on MC's inbound `MediaCoordinationService` server. The global `TraceContextPropagator` extracts W3C context from `ClientMessage.trace_parent`/`trace_state` at the dispatch site in `crates/mc-service/src/webtransport/connection.rs`; existing `#[instrument]` spans become child spans automatically via `tracing-opentelemetry`. Outbound `ServerMessage` populates `trace_parent`/`trace_state` symmetrically. Replace `MediaConnectionFailed` arm in `handle_client_message()` with `MediaConnectionUpdate` arm — per-(participant, mh_url) state stored on the participant actor (`actors/participant.rs`); update the existing all-fail metric to a per-state shape (`mc_participant_mh_status_total{state}`). Unit + integration tests cover propagation round-trip and all-CONNECTED / partial / all-FAILED scenarios | meeting-controller | 2, 24 | code, tests |
+| 7 | Client proto codegen pipeline (R-6, R-7 CI gates): create `proto/buf.gen.yaml` (v2, plugin `buf.build/bufbuild/es`, `target=ts`, `import_extension=js`, `json_types=true`, output `packages/sdk-core/src/proto/`). Declare Nx task `proto-gen:codegen` with declared outputs at `packages/sdk-core/src/proto/*_pb.ts` (gitignored). `buf format` + `buf lint` enforced. Includes `internal.proto` codegen (tree-shaken by client). **No cross-language hex-fixture wire-vector test** (per user direction — protobuf wire compat trusted) | protocol | 1, 2 | code, tests |
+| 8 | `packages/test-utils/` package (R-39): ship `MockWebTransport` (control points `simulateReady`/`simulateClose`/`simulateError`/`simulateIncomingDatagram`/`simulateBidiStream`/`simulateServerMessage` + inspector helpers), `TestTokenBuilder` + `TestTokenSigner` (ephemeral Ed25519, mints user/meeting JWTs matching AC/GC claim shapes), `deterministic-ids` (seeded UUIDv4), `InMemoryMetricsSink`, `MockOTLPExporter`. ~10-12 self-tests. **No cross-language proto-fixture loader or Rust regen tool** (dropped per user direction — no committed hex fixtures this story). | test | 1 | code, tests |
+| 9 | sdk-core scaffold + transport + framing (R-9, R-10, R-13, R-14, R-16): `packages/sdk-core/` Vite library mode (ESM+CJS+`.d.ts`, `@darktower/` scope publish config). `tsconfig.base.json` `compilerOptions` filled in (strict, noUncheckedIndexedAccess, exactOptionalPropertyTypes). `IWebTransport` interface; `BrowserWebTransport` impl with `__DEV_TRUST_FINGERPRINT__` Vite-`define`-gated `serverCertificateHashes` path; CI bundle-inspection assertion verifies prod build excludes `serverCertificateHashes` string. 4-byte BE length-prefix codec (max 64 KiB, partial-read buffering, oversize rejection). ESLint rule `sonarjs/pseudo-random` (or equivalent) blocks `Math.random` outside dev-tools. Unit tests via `MockWebTransport` (R-41 partial: framing + transport tests ~10) | client | 1, 7, 8 | code, tests |
+| 10 | GC telemetry proxy endpoint (R-2, R-3 remaining, R-51 partial): `POST /api/v1/telemetry/v1/{metrics,traces}` (`/v1/logs` reserved/stub) behind `require_user_auth`. Pipeline: size cap 256 KiB → 413; Content-Type `application/x-protobuf` → 415 otherwise; per-JWT-`sub` `governor` rate limit 60/min → 429; OTLP-proto decode + 12-key allowlist PII filter (`client_version`, `service.name`, `service.version`, `meeting_id_hash`, `org_id`, `dt.event`, `dt.duration_ms`, `dt.failure_stage`, `dt.close_reason`, `dt.mh_index_bucket`, `http.status_code`, `error.code`); re-serialize; forward via `reqwest` to `otel_collector_endpoint` → 502 on collector failure; 202 success. New files: `handlers/telemetry.rs`, `services/telemetry_filter.rs`, `services/telemetry_forwarder.rs`. New Config keys (`otel_collector_endpoint`, `telemetry_proxy_max_bytes`, `telemetry_proxy_rate_limit_per_minute`). New `GcError::PayloadTooLarge` + `GcError::BadGateway`. Metrics: `gc_telemetry_ingest_total{status, payload_kind}` + `gc_telemetry_ingest_duration_seconds{status}` + `gc_telemetry_payload_bytes{payload_kind}` + `gc_telemetry_rate_limited_total{reason}` + `gc_telemetry_pii_attributes_dropped_total{kind}`. Unit + integration tests | global-controller | — | code, metrics, tests |
+| 11 | sdk-core HTTP API + error hierarchy (R-11, R-12, R-23, R-31, R-42): `AuthApiClient.register/login` posts **camelCase wire JSON** (`{email, password, displayName}`) to subdomain-qualified AC origin (post-task #23 `#[serde(rename_all = "camelCase")]` migration); subdomain regex-validated client-side (`[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?`) before URL interpolation. `MeetingApiClient.joinMeeting` GET `/api/v1/meetings/:code` with `Authorization: Bearer`. `MeetingApiClient.createMeeting({title, scheduledStart?})` POST `/api/v1/meetings` with `Authorization: Bearer`, returns the created meeting incl. `code`. Typed `AuthError`/`NetworkError`/`MediaConnectionError`/`SignalingError` hierarchy with `toJSON()` redacting `token`/`bearer`/`Authorization` field/header values. `TokenProvider` token-source pattern. MSW-driven unit tests covering 200/400/401/403/404/409/429 paths (~14 tests, R-42 — bumped slightly to cover createMeeting error matrix) | client | 9, 23 | code, tests |
+| 12 | Client telemetry scaffolding (Obs Task A; R-19, R-24, R-25, R-26, R-27): `MetricsSink` interface in `packages/sdk-core/src/telemetry/`; impls `OtelMetricsSink` (`@opentelemetry/exporter-{metrics,trace}-otlp-proto` to GC `/api/v1/telemetry/v1/{metrics,traces}` with `keepalive: true`), `ConsoleMetricsSink` (dev fallback), `NoopMetricsSink` (default). `nameGuard` rejects names not matching `dt_client_*` (throws in dev/test, warns in prod). Single global `MeterProvider` + `WebTracerProvider` configured via `MeetingSession.configure({ telemetryEndpoint, env })`. Resource attrs: `service.name=darktower-sdk-core`, `service.version=__SDK_VERSION__`, `service.namespace=darktower`, `deployment.environment=<env>`. `W3CTraceContextPropagator` registered globally so `instrumentation-fetch` auto-injects on AC/GC fetches. `tracePropagation.injectIntoClientMessage` helper for both the WebTransport `ClientMessage` path AND the `MhClientMessage` envelope (R-19, R-58 SDK side). Bounded-event logger with required + excluded fields per R-26 (console-only this story). `docs/observability/metrics/client.md` stub catalog | observability | 11 | code, docs, tests |
+| 13 | sdk-core SignalingClient (R-16, R-17, R-18, R-19): WebTransport bidi stream open to MC `webtransport_endpoint`; sends JoinRequest (with empty `correlation_id`/`binding_token`) on first bidi; 4-byte BE length-prefix framing on `ClientMessage`/`ServerMessage` envelopes; populates `trace_parent`/`trace_state` on every outbound via the propagator helper from task #12; parses `JoinResponse` (extracts `participant_id`, `user_id` u64 via BigInt, `existing_participants`, `media_servers`, stores `correlation_id`/`binding_token`); emits typed `onJoined`/`onParticipantJoined`/`onParticipantLeft`/`SignalingError` events; `ErrorMessage` → `SignalingError` with proto `ErrorCode` mapped to SDK error code (auth-class errors close connection); inbound 64 KiB frame cap; partial-read buffering. Unit tests with `MockWebTransport` (R-41 ~15 tests covering state machine, runtime-built `ClientMessage`/`ServerMessage` round-trip via protobuf-es, error mapping) | client | 11, 12 | code, tests |
+| 14 | sdk-core MediaTransport + MeetingSession facade (R-20, R-21, R-22, R-23 cleanup, R-32, R-58 SDK side, R-60 SDK side): `MediaTransport.connectAll(urls, jwt)` opens parallel WT to each MH URL, writes a `MhClientMessage { connect_request: { join_token } }` envelope as first 4-byte-BE-length-prefixed bidi-stream message (post-rebase target wraps the JWT in this envelope), populating `trace_parent`/`trace_state` on the envelope via the same propagator helper as `SignalingClient` (R-58 SDK side); per-MH `onConnected(url)` event; resolves on ≥1 success, rejects on all-fail. **Once settled** (success / partial / all-fail), builds a `MediaConnectionUpdate` `ClientMessage` (R-60) with one `MhConnectionStatus` per URL in `media_servers` (state ∈ `CONNECTED`/`FAILED`, optional `failure_reason`/`failure_code`), and sends it via `SignalingClient`. `MeetingSession.join({orgSubdomain, meetingCode, credentials})` orchestrates auth → meeting token → MC signaling → MH handshake → `MediaConnectionUpdate` send; emits `onJoined`/`onParticipantJoined/Left`/`onMediaConnected`/`onError`; `disconnect()` zeroes token references + cached `Bearer` header strings + tears down all transports cleanly. Unit tests: `connectAll` happy/partial/all-fail; `MediaConnectionUpdate` send shape across all three; `MeetingSession` state machine (idle→fetching-token→connecting-mc→joining→joined→disconnecting); token redaction in errors (R-41 ~15 tests) | client | 13 | code, tests |
+| 15 | sdk-svelte adapter + web-app demo + Vite config + dev README (R-28, R-29, R-30, R-43): `packages/sdk-svelte/` Svelte 5 rune stores (`$meetingState`, `$participants`, `$mediaConnections`, `$lastError`) + `bindMeetingSession(session)` helper with unmount cleanup. `packages/web-app/` minimal SPA with **four views** — sign-up / sign-in / **create-meeting** / meeting-join — with stable `data-testid` hooks (`email`, `password`, `display-name`, `org-subdomain`, `meeting-title`, `scheduled-start`, `create-button`, `created-meeting-code`, `meeting-code`, `join-button`, `participant-list`, `participant-{id}`, `last-error`) + `window.__darktower_test__` event-bus hook gated behind `__E2E_HOOKS__` Vite-`define` (separate flag from `__DEV_TRUST_FINGERPRINT__`). `vite.config.ts` with proxy + `__DEV_TRUST_FINGERPRINT__` + `__E2E_HOOKS__` + `__SDK_VERSION__` defines + cert fingerprint loader from `infra/docker/certs/fingerprints.json`. `packages/web-app/README.md` documents local-Kind workflow including `/etc/hosts` fallback for `demo.localhost` and the manual sign-up → create → copy-code → join flow. Component tests via Vitest 4.0 Browser Mode (R-43 ~16 tests covering rune store reactivity + four-view rendering with mocked `MeetingSession`) | client | 14 | code, tests, docs |
+| 16 | GC observability artifacts (Obs Task B; R-51 dashboard + alerts, R-52 panels): hand-off PR to GC team. `infra/docker/prometheus/rules/gc-alerts.yaml` adds `GCTelemetryProxyHighRejectionRate` (warn, >10% rejection rate for 10m) + `GCTelemetryProxySilent` (page, `absent_over_time(...)[15m]` gated by 1h-baseline guard `min_over_time(...) > 0`). `infra/grafana/dashboards/gc-overview.json` adds "Telemetry Ingest" row with 5 panels (ingest rate by status, p50/p99 ingest duration, payload size p99 by kind, rate-limit rejections by reason, CORS preflight rate by `origin_class`). `docs/observability/metrics/gc-service.md` adds "Telemetry Proxy Metrics" + "CORS Preflight Metrics" sections. `docs/runbooks/gc-incident-response.md` gets two new sections referenced by alert `runbook_url` annotations | observability | 5, 10 | dashboard, alerts, docs |
+| 17 | `ci-client.yml` workflow (R-47, R-7 CI gates, R-33, R-34): new `.github/workflows/ci-client.yml` path-triggered on `packages/**`, `proto/**`, `pnpm-lock.yaml`, `nx.json`, `package.json`, `pnpm-workspace.yaml`, `tsconfig.base.json`, `buf.yaml`, `buf.gen.yaml`, the workflow file. Three parallel jobs with concurrency cancellation. **lint**: `pnpm install --frozen-lockfile` (R-34); `pnpm lint` (eslint + prettier + svelte-check); `pnpm exec buf lint` + `pnpm exec buf breaking --against '.git#branch=main'` + `pnpm exec buf format --diff --exit-code`; client TS guards `no-secrets-in-code` + `no-test-removal` (with positive/negative real-JWT fixture cases); `pnpm audit --audit-level=high` (high/critical only). **unit**: `pnpm test:unit` with `@vitest/coverage-v8` ≥90% gate. **component**: `pnpm test:component` (Vitest browser-mode Chromium with `actions/cache@v4` keyed on Playwright version, no Kind cluster). pnpm + Nx caches keyed on lockfile + nx.json. Codecov upload mirrors backend. `.github/dependabot.yml` for npm + GH Actions weekly | infrastructure | 1, 9 | deploy, tests |
+| 18 | Playwright E2E harness + happy-path spec (R-40, R-44, R-46 README): `packages/web-app/playwright.config.ts` (Chromium-only, `retries=0`, single context default); `packages/web-app/e2e/global-setup.ts` reads `MC_CERT_SHA256_B64`/`MH_CERT_SHA256_B64` from env; fixtures `bootstrapMeeting(adminToken)` (creates meeting via direct GC POST), `joinAsUser(page, meetingCode)`, `waitForJoined(page)`. `packages/web-app/e2e/join-happy-path.spec.ts` opens Chromium with fake media flags, drives demo signup → login → join (meeting created via GC fixture, not UI), asserts SDK reaches `joined` state via `window.__darktower_test__` event hook, asserts at least one MH WT handshake succeeded for every URL in `media_servers`, opens second browser context, joins same meeting, asserts first context fires `ParticipantJoined` within 5s. `e2e/README.md` documents division of responsibilities vs. Rust env-tests (R-46 — existing `crates/env-tests/tests/24_join_flow.rs` unchanged). Happy-path spec also asserts the SDK sends `MediaConnectionUpdate` with `state=CONNECTED` for at least one MH (drives task #6's MC handler end-to-end) | test | 3, 4, 6, 8, 15 | tests, docs |
+| 19 | Secondary E2E specs (R-45) + Devloop validation pipeline integration (R-48): three spec files — `auth-rejection.spec.ts` (unauthenticated meeting-join surfaces typed `AuthError`), `meeting-not-found.spec.ts` (404 surfaces typed error in DOM), `mc-token-rejection.spec.ts` (real meeting token + garbage `meeting_id` → typed `SignalingError`). Edit `.claude/skills/devloop/SKILL.md` Layer 8 description so `pnpm --filter @darktower/web-app test:e2e` runs sequentially after `cargo test -p env-tests --features all` against the same Kind cluster (single attempt budget shared, cluster setup shared, browser E2E only triggered when `packages/**`/`proto/**` changed or backend touches MC/AC/GC contract surface). Extend `scripts/verify-completion.sh` to gate client `pnpm test:unit` + `pnpm test:component` under `LAYER >= standard` and `pnpm test:e2e` under `LAYER == full` (Layer 8). **Cross-boundary**: edits SKILL.md (operations-owned) — pair `--paired-with=operations` | test | 18 | tests, docs |
+| 20 | `client-dev-local.md` runbook (R-49): new `docs/runbooks/client-dev-local.md` with explicit non-goal banner. Sections: prerequisites (devloop image post-R-35 OR host with Node 22 + pnpm + Chromium); local-stack bring-up (10 numbered steps from `dev-cluster setup` through opening Chrome at `http://demo.localhost:8443` and `http://localhost:8444` for AC/GC plus `https://localhost:4433/4434` for MC/MH WT); three "things go wrong" scenarios with detection/diagnosis/resolution (devloop image stale, cert fingerprint mismatch, vite dev server fails); running E2E suite from devloop or host; `/etc/hosts` fallback snippet for `127.0.0.1 demo.localhost`; tearing down. Cross-link to `gc-deployment.md` smoke tests | operations | 3, 4, 15 | docs |
+| 21 | `gc-deployment.md` smoke-test additions + alert catalog + incident scenarios (R-50): six new `curl` smoke stanzas in `gc-deployment.md` §"Run Smoke Tests" (CORS preflight allowed origin → 204 with correct ACAO; CORS preflight disallowed origin → 403 or no-ACAO; telemetry proxy authed → 202; unauthenticated → 401; oversize 257 KiB body → 413; rate-limit 70 sequential calls → mix of 202s and 429s). Smoke uses `infra/smoke/empty-otlp-metrics.bin` fixture (provided by observability — minimal valid OTLP-Metrics protobuf with zero data points). Update `docs/observability/alerts.md` catalog with the two new `gc_telemetry_*` alerts. Add scenarios "Telemetry proxy unreachable / rate-limit storm" + "CORS misconfig post-deploy" to `gc-incident-response.md` with detection/diagnosis/resolution per the per-failure-mode trace-throughs. Smoke `curl` examples that touch AC/GC HTTP API bodies use camelCase wire keys (post-task #23) | operations | 5, 10, 16, 23 | docs |
+| 22 | Devloop validation pipeline finalization (R-48 infra portion, T-INFRA-5): finalize `scripts/verify-completion.sh` Layer 8 hookup landed in task #19 by ensuring devloop image (task #3), Kind reachability (task #4), and CI green (task #17) all align; verify the cross-cutting handoff lands cleanly | infrastructure | 3, 17, 19 | deploy, docs |
+| 23 | camelCase wire-format migration (R-53), Mechanical-classified cross-boundary edit: add `#[serde(rename_all = "camelCase")]` to AC public HTTP API request/response structs (`crates/ac-service/src/handlers/auth_handler.rs` — `UserRegistrationRequest`, `UserTokenRequest`, register/token/introspect/logout response types) and GC public HTTP API structs (`crates/gc-service/src/handlers/` — `JoinMeetingResponse`, `CreateMeetingRequest`, `CreateMeetingResponse`, error envelopes). Update existing Rust env-tests in `crates/env-tests/` and runbook smoke `curl` examples in `docs/runbooks/ac-service-deployment.md` + `docs/runbooks/gc-service-deployment.md` to camelCase wire keys. Commit trailer: `Approved-Cross-Boundary: Mechanical (camelCase derive sweep — user-locked decision)`. Auth-controller is lead specialist; **paired with** global-controller for the GC-side touch | auth-controller | — | code, tests, docs |
+| 24 | Common OTel SDK helper + gRPC interceptor module (R-54, R-56): create `crates/common/src/observability/otel.rs` with `init_otel(service_name, service_version, env, OtelConfig) -> OtelGuard` (RAII, flushes on drop). Builds OTLP-gRPC exporter targeting `OtelConfig::endpoint`, registers `TraceContextPropagator` (W3C) globally, configures `parent_based(traceidratio(otel_sample_rate))` sampler, sets resource attrs (`service.name`, `service.version`, `service.namespace=darktower`, `deployment.environment`). Bridges via `tracing-opentelemetry::OpenTelemetryLayer` so `#[instrument]` spans flow into OTLP. Create `crates/common/src/observability/otel_grpc.rs` with Tonic tower interceptor injecting on outbound metadata + extracting on inbound. Add `tracing-opentelemetry` to workspace deps. Unit tests: propagator round-trip, sampler decision under parent context, resource attribute shape, interceptor inject/extract round-trip | observability | — | code, tests |
+| 25 | AC OTel wiring (R-55 partial, R-56 partial): AC `main.rs` calls `init_otel(...)` from R-54 (`service.name=auth-controller`). AC `Config` adds `otel_enabled` / `otel_endpoint` / `otel_sample_rate`. Surfaced in `infra/services/ac-service/configmap.yaml`. Holds the `OtelGuard` until shutdown. AC has no outbound gRPC clients today; the R-56 interceptor is imported and wired on AC's gRPC server (the GC-facing service auth/token-introspection paths) for inbound trace extraction. Existing `#[instrument]` spans on token-issuance + key-rotation paths automatically enrich via the bridge. Unit + integration tests: shutdown-flush behavior, gRPC inbound propagation | auth-controller | 24 | code, tests |
+| 26 | GC OTel wiring (R-55 partial, R-56 partial): GC `main.rs` calls `init_otel(...)` (`service.name=global-controller`). GC `Config` adds the three OTel knobs; surfaced in `infra/services/gc-service/configmap.yaml`. R-56 interceptor wired on GC's outbound `AcAuthClient` (GC→AC) + any MC client + GC's inbound HTTP layer (HTTP propagator extracts `traceparent` from request headers — separate from gRPC interceptor; reuses the global propagator). The `/api/v1/telemetry` proxy (task #10) already accepts `traceparent`/`tracestate` headers via R-1 CORS allow-list — that path now feeds the same propagator. Integration tests cover: GC→AC trace continuity, HTTP→gRPC bridge, telemetry proxy preserves trace context | global-controller | 24 | code, tests |
+| 27 | MH OTel wiring + MhClientMessage trace-field reads (R-55 partial, R-56 partial, R-58 MH side): MH `main.rs` calls `init_otel(...)` (`service.name=media-handler`). MH `Config` adds three OTel knobs; surfaced in `infra/services/mh-service/configmap.yaml`. R-56 interceptor wired on MH's outbound `GcRegistrationClient` (MH→GC) + `McNotificationClient` (MH→MC) + MH's inbound gRPC server (MC-facing endpoints). At `crates/mh-service/src/webtransport/connection.rs:handle_connection()`, MH parses the `MhClientMessage` envelope (post-rebase target), extracts `trace_parent`/`trace_state` via the global propagator, attaches context to existing `mh.webtransport.connection` instrumentation; existing spans become child spans automatically. Outbound MH responses (if any envelope-level outbound exists post-rebase) populate trace fields symmetrically. Integration tests via existing `crates/mh-service/tests/common/accept_loop_rig.rs` cover propagation round-trip | media-handler | 2, 24 | code, tests |
+| 28 | Dev OTel collector deployment (R-59): new `infra/services/otel-collector/` Kustomize base — `deployment.yaml` (image `otel/opentelemetry-collector-contrib:0.x`, resource limits, readiness on `:13133`), `configmap.yaml` (OTLP-gRPC receiver `:4317` + OTLP-HTTP receiver `:4318` + `logging`/`debug` exporters in dev — NO production exporter wiring this story), `service.yaml` (ClusterIP exposing 4317/4318/13133), `network-policy.yaml` (ingress from AC/GC/MC/MH on 4317; ingress from GC pod on 4318 for the `/api/v1/telemetry` proxy forward; egress restricted). Kustomize values for AC/GC/MC/MH `otel_endpoint` populate `http://otel-collector.default.svc.cluster.local:4317`; GC `otel_collector_endpoint` (R-2) populates `http://otel-collector.default.svc.cluster.local:4318/v1/{metrics,traces}`. `infra/kind/scripts/setup.sh` updated to verify collector readiness BEFORE bringing up AC/GC/MC/MH (load-bearing under R-54's fail-hard-at-init design — services with `otel_enabled=true` will refuse to start if collector is unreachable). New `infra/docker/prometheus/rules/otel-alerts.yaml` adds the `OTelExportFailureRate` warn alert per R-59. Add a "collector upgrade discipline" note to `gc-deployment.md`'s OTel section: collector upgrades MUST be a separate change window from service deploys to avoid cascading restart of all four services | infrastructure | — | deploy, docs |
+
+### Task Dependency Graph
+
+```
+Phase 1 (parallel, no deps): 1, 2, 3, 4, 5, 10, 23, 24, 28
+Phase 2:                      6 (after 2, 24)
+                              7 (after 1, 2)
+                              8 (after 1)
+                              25 (after 24)
+                              26 (after 24)
+                              27 (after 2, 24)
+Phase 3:                      9 (after 1, 7, 8)
+Phase 4:                      11 (after 9, 23)
+Phase 5:                      12 (after 11)
+Phase 6:                      13 (after 11, 12)
+Phase 7:                      14 (after 13)
+Phase 8:                      15 (after 14)
+                              17 (after 1, 9)
+                              16 (after 5, 10)
+Phase 9:                      18 (after 3, 4, 6, 8, 15)
+Phase 10:                     19 (after 18)
+                              20 (after 3, 4, 15)
+                              21 (after 5, 10, 16, 23)
+Phase 11:                     22 (after 3, 17, 19)
+```
+
+### Parallelization Opportunities
+
+- **Phase 1** (massively parallel — 9 tasks): tasks 1, 2, 3, 4, 5, 10, 23, 24, 28 all run in parallel — no mutual dependencies. The OTel/camelCase additions don't extend the critical path; they fill Phase 1 width.
+- **Phase 2** (5-way fork): tasks 6, 7, 8, 25, 26, 27 run in parallel (different specialists, different code).
+- **Phase 8** (3-way fork): tasks 15, 16, 17 run in parallel.
+- **Phase 10** (3-way fork): tasks 19, 20, 21 run in parallel after their respective dependencies clear.
+- **Critical path**: 1 → 7 → 9 → 11 → 12 → 13 → 14 → 15 → 18 → 19. Roughly 9 sequential client/test devloops on the longest path. The new tasks add no new critical-path edges — they all fit into existing wide phases.
+
+### Specialist Task Summary
+
+| Specialist | Tasks | Count |
+|-----------|-------|-------|
+| infrastructure | 1, 3, 4, 17, 22, 28 | 6 |
+| protocol | 2, 7 | 2 |
+| meeting-controller | 6 | 1 |
+| global-controller | 5, 10, 26 | 3 |
+| auth-controller | 23 (paired w/ GC), 25 | 2 |
+| media-handler | 27 | 1 |
+| test | 8, 18, 19 | 3 |
+| client | 9, 11, 13, 14, 15 | 5 |
+| observability | 12, 16, 24 | 3 |
+| operations | 20, 21 | 2 |
+| security | — (cross-cutting; reviews each task at devloop close) | 0 |
+| database | — (opt-out, interface validated; SQL provided to infra) | 0 |
+| **Total** | | **28** |
+
+### Requirements Coverage
+
+| Req | Covered By Tasks |
+|-----|-----------------|
+| R-1  | 5 |
+| R-2  | 10 |
+| R-3  | 5 (CORS), 10 (telemetry) |
+| R-4  | 6 |
+| R-5  | 2 |
+| R-6  | 2 (config), 7 (codegen) |
+| R-7  | 2 (config), 7 (CI gates), 17 (CI invocation) |
+| R-8  | 1 |
+| R-9  | 1 (skeleton), 9 (final) |
+| R-10 | 9, 15 |
+| R-11 | 11 |
+| R-12 | 11 |
+| R-13 | 9 |
+| R-14 | 9 |
+| R-15 | 8 |
+| R-16 | 13 |
+| R-17 | 13 |
+| R-18 | 13 |
+| R-19 | 12, 13 |
+| R-20 | 14 |
+| R-21 | 14 |
+| R-22 | 14 |
+| R-23 | 11 (redaction), 14 (cleanup) |
+| R-24 | 12 |
+| R-25 | 12 |
+| R-26 | 12 |
+| R-27 | 12 |
+| R-28 | 15 |
+| R-29 | 15 |
+| R-30 | 15 |
+| R-31 | 11 (browser side), 5/10 (server side via deny_unknown_fields + bounded sizes) |
+| R-32 | 9 (lint rule), 14 (CryptoKey if any) |
+| R-33 | 17 (CI invocation), 9 (lint config) |
+| R-34 | 17 (CI audit + Dependabot) |
+| R-35 | 3 |
+| R-36 | 4 |
+| R-37 | 4 |
+| R-38 | 4 |
+| R-39 | 8 |
+| R-40 | 18 |
+| R-41 | 9, 13, 14 (embedded with each source-code task) |
+| R-42 | 11 (embedded) |
+| R-43 | 15 (embedded) |
+| R-44 | 18 |
+| R-45 | 19 |
+| R-46 | 18 (README) |
+| R-47 | 17 |
+| R-48 | 19 (SKILL.md + verify-completion.sh L8), 22 (finalize) |
+| R-49 | 20 |
+| R-50 | 21 |
+| R-51 | 10 (metric emissions), 16 (alert YAML + dashboard panels + catalog sections) |
+| R-52 | 5 (metric emission), 16 (panel) |
+| R-53 | 23 |
+| R-54 | 24 |
+| R-55 | 25 (AC), 26 (GC), 6 (MC), 27 (MH) |
+| R-56 | 24 (module), 25 (AC inbound), 26 (GC outbound + HTTP), 6 (MC outbound + inbound), 27 (MH outbound + inbound) |
+| R-57 | 6 |
+| R-58 | 2 (proto), 12 (SDK injection helper), 27 (MH read) |
+| R-59 | 28 |
+| R-60 | 2 (proto), 6 (MC handler), 14 (SDK send) |
+
+### Aspect Coverage
+
+| Aspect | Covered By Tasks | N/A? |
+|--------|-----------------|------|
+| Code | 1, 2, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 23, 24, 25, 26, 27 | |
+| Database | 4 (dev seed only — no schema change) | |
+| Tests | 8, 9, 11, 13, 14, 15, 18, 19, 23 (env-test fixture updates), 24 (helper unit tests), 25/26/27 (per-service integration tests for OTel), 6 (MC integration tests for MediaConnectionUpdate) | |
+| Observability | 12 (client metrics), 5/10 (server metrics), 16 (dashboards + alerts + catalog), 24 (common OTel helper + interceptor), 25/26/6/27 (per-service OTel wiring) | |
+| Deployment | 1, 3, 4, 17, 22, 28 (collector deployment) | |
+| Operations | 20 (dev runbook), 21 (smoke tests + alert catalog + incident scenarios — with camelCase wire keys per R-53), 22 (validation pipeline), 23 (runbook curl examples migrated to camelCase) | |
+| Documentation | 12 (catalog stub), 15 (web-app README), 16 (catalog sections), 18 (E2E README), 19 (SKILL.md), 20 (dev runbook), 21 (deployment + alerts + incident docs), 23 (runbooks migrated to camelCase) | |
+
+---
+
+## Devloop Tracking
+
+Each row below is a `/devloop` invocation. Run them in dependency order (see §Task Dependency Graph). Devloops execute in isolated containers, so this table is the source of truth for sequencing — there is no separate task system to consult. Update Status / Devloop Output / Commit columns as you complete each one.
+
+| # | Devloop Invocation | Specialist | Deps | Devloop Output | Commit | Status |
+|---|--------------------|-----------|------|---------------|--------|--------|
+| 1 | `/devloop "Bootstrap pnpm + Nx polyglot workspace at repo root (R-8/R-9/R-10): package.json, pnpm-workspace.yaml, nx.json, .nvmrc, tsconfig.base.json, .gitignore updates, packages/.gitkeep. Cargo workspace unaffected. See task #1 in docs/user-stories/2026-05-02-browser-client-join.md" --specialist=infrastructure` | infrastructure | — | | | Pending |
+| 2 | `/devloop "Proto: add trace_parent/trace_state to ClientMessage + ServerMessage + MhClientMessage envelopes (R-5, R-58). R-60 redesign: replace MediaConnectionFailed with MediaConnectionUpdate{repeated MhConnectionStatus} + ConnectionState enum. Create proto/buf.yaml. See task #2 in docs/user-stories/2026-05-02-browser-client-join.md" --specialist=protocol` | protocol | — | | | Pending |
+| 3 | `/devloop "Update devloop image (infra/devloop/Dockerfile) per R-35: corepack enable pnpm@9.x; install Playwright system deps; pre-cache Chromium. See task #3 in docs/user-stories/2026-05-02-browser-client-join.md" --specialist=infrastructure` | infrastructure | — | | | Pending |
+| 4 | `/devloop "Dev infra plumbing (R-36/R-37/R-38): cert SHA-256 fingerprints + 14d WebTransport leaf validity; Kind dev overlays for AC/GC NodePort with 127.0.0.1 listenAddress; demo org seed in setup.sh. See task #4 in docs/user-stories/2026-05-02-browser-client-join.md" --specialist=infrastructure` | infrastructure | — | | | Pending |
+| 5 | `/devloop "GC CORS layer + config (R-1, R-3 partial, R-52): tower_http CorsLayer, env-driven cors_allowed_origins, gc_cors_preflight_total metric, integration tests. See task #5 in docs/user-stories/2026-05-02-browser-client-join.md" --specialist=global-controller` | global-controller | — | | | Pending |
+| 6 | `/devloop "MC OTel SDK init + trace propagation (R-55 partial, R-57) + MediaConnectionUpdate handler (R-60 MC half). Replace MediaConnectionFailed arm with MediaConnectionUpdate arm; per-(participant, mh_url) state on participant actor. See task #6 in docs/user-stories/2026-05-02-browser-client-join.md" --specialist=meeting-controller` | meeting-controller | 2, 24 | | | Pending |
+| 7 | `/devloop "Client proto codegen pipeline (R-6, R-7 CI gates): proto/buf.gen.yaml with @bufbuild/protoc-gen-es; Nx codegen task; gitignored TS outputs. No cross-language hex-fixture wire-vector test. See task #7 in docs/user-stories/2026-05-02-browser-client-join.md" --specialist=protocol` | protocol | 1, 2 | | | Pending |
+| 8 | `/devloop "packages/test-utils/ package (R-39): MockWebTransport, TestTokenBuilder/Signer (ephemeral Ed25519), deterministic-ids, InMemoryMetricsSink, MockOTLPExporter. ~10-12 self-tests. No proto-fixtures loader. See task #8 in docs/user-stories/2026-05-02-browser-client-join.md" --specialist=test` | test | 1 | | | Pending |
+| 9 | `/devloop "sdk-core scaffold + transport + framing (R-9, R-10, R-13, R-14, R-16): IWebTransport interface, BrowserWebTransport with __DEV_TRUST_FINGERPRINT__-gated serverCertificateHashes, 4-byte BE length-prefix codec, ~10 framing/transport unit tests. See task #9 in docs/user-stories/2026-05-02-browser-client-join.md" --specialist=client` | client | 1, 7, 8 | | | Pending |
+| 10 | `/devloop "GC telemetry proxy endpoint (R-2, R-3 remaining, R-51 partial): POST /api/v1/telemetry/v1/{metrics,traces} behind require_user_auth, OTLP-proto decode + 12-key allowlist PII filter, governor rate limit, forward to otel_collector_endpoint. See task #10 in docs/user-stories/2026-05-02-browser-client-join.md" --specialist=global-controller` | global-controller | — | | | Pending |
+| 11 | `/devloop "sdk-core HTTP API + error hierarchy (R-11, R-12, R-23, R-31, R-42): AuthApiClient.register/login (camelCase wire post-task #23) + MeetingApiClient.joinMeeting/createMeeting; subdomain regex-validated client-side; typed error hierarchy with toJSON() redaction; ~14 MSW unit tests. See task #11 in docs/user-stories/2026-05-02-browser-client-join.md" --specialist=client` | client | 9, 23 | | | Pending |
+| 12 | `/devloop "Client telemetry scaffolding (Obs Task A; R-19, R-24, R-25, R-26, R-27): MetricsSink interface + OtelMetricsSink/ConsoleMetricsSink/NoopMetricsSink, nameGuard, single global MeterProvider+WebTracerProvider via MeetingSession.configure, W3CTraceContextPropagator, tracePropagation.injectIntoClientMessage helper for both ClientMessage and MhClientMessage envelopes, bounded-event logger, client.md catalog stub. See task #12 in docs/user-stories/2026-05-02-browser-client-join.md" --specialist=observability` | observability | 11 | | | Pending |
+| 13 | `/devloop "sdk-core SignalingClient (R-16, R-17, R-18, R-19): WebTransport bidi to MC, JoinRequest, 4-byte BE framing on ClientMessage/ServerMessage, trace_parent/state injection, JoinResponse parse + typed events, ErrorMessage→SignalingError mapping; ~15 unit tests with MockWebTransport. See task #13 in docs/user-stories/2026-05-02-browser-client-join.md" --specialist=client` | client | 11, 12 | | | Pending |
+| 14 | `/devloop "sdk-core MediaTransport + MeetingSession facade (R-20, R-21, R-22, R-23 cleanup, R-32, R-58 SDK side, R-60 SDK side): connectAll opens parallel WT to MH URLs with MhClientMessage{connect_request} envelope incl. trace_parent/state; once settled, sends MediaConnectionUpdate ClientMessage with per-MH terminal state; MeetingSession.join orchestration + clean disconnect. ~15 unit tests. See task #14 in docs/user-stories/2026-05-02-browser-client-join.md" --specialist=client` | client | 13 | | | Pending |
+| 15 | `/devloop "sdk-svelte adapter + web-app demo + Vite config + dev README (R-28, R-29, R-30, R-43): rune stores ($meetingState, $participants, $mediaConnections, $lastError) + bindMeetingSession; four-view SPA (sign-up / sign-in / create-meeting / meeting-join); vite.config.ts with __DEV_TRUST_FINGERPRINT__ + __E2E_HOOKS__ + __SDK_VERSION__; cert fingerprint loader; ~16 component tests. See task #15 in docs/user-stories/2026-05-02-browser-client-join.md" --specialist=client` | client | 14 | | | Pending |
+| 16 | `/devloop "GC observability artifacts (Obs Task B; R-51 alerts + dashboard, R-52 panels): GCTelemetryProxyHighRejectionRate + GCTelemetryProxySilent alerts in gc-alerts.yaml; Telemetry Ingest dashboard row in gc-overview.json; metrics catalog sections in docs/observability/metrics/gc-service.md; runbook scenario sections in gc-incident-response.md. See task #16 in docs/user-stories/2026-05-02-browser-client-join.md" --specialist=observability` | observability | 5, 10 | | | Pending |
+| 17 | `/devloop "ci-client.yml workflow (R-47, R-7 CI gates, R-33, R-34): path-triggered lint+unit+component jobs; eslint+prettier+svelte-check; buf lint/breaking/format; client TS guards; pnpm audit; @vitest/coverage-v8 ≥90% gate; component browser-mode Chromium; Dependabot config. See task #17 in docs/user-stories/2026-05-02-browser-client-join.md" --specialist=infrastructure` | infrastructure | 1, 9 | | | Pending |
+| 18 | `/devloop "Playwright E2E harness + happy-path spec (R-40, R-44, R-46 README): playwright.config.ts, global-setup.ts, fixtures (bootstrapMeeting/joinAsUser/waitForJoined), join-happy-path.spec.ts asserting JoinResponse + MH handshakes + multi-context ParticipantJoined + MediaConnectionUpdate{state=CONNECTED} send. See task #18 in docs/user-stories/2026-05-02-browser-client-join.md" --specialist=test` | test | 3, 4, 6, 8, 15 | | | Pending |
+| 19 | `/devloop "Secondary E2E specs (R-45) + Devloop validation pipeline integration (R-48): auth-rejection.spec.ts + meeting-not-found.spec.ts + mc-token-rejection.spec.ts; edit .claude/skills/devloop/SKILL.md Layer 8; extend scripts/verify-completion.sh for client unit/component (LAYER>=standard) and E2E (LAYER==full). Cross-boundary: --paired-with=operations. See task #19 in docs/user-stories/2026-05-02-browser-client-join.md" --specialist=test` | test | 18 | | | Pending |
+| 20 | `/devloop "client-dev-local.md runbook (R-49): docs/runbooks/client-dev-local.md with prerequisites, 10-step local-stack bring-up, three failure-mode scenarios, /etc/hosts fallback, teardown. Explicit non-goal banner re production. See task #20 in docs/user-stories/2026-05-02-browser-client-join.md" --specialist=operations` | operations | 3, 4, 15 | | | Pending |
+| 21 | `/devloop "gc-deployment.md smoke-test additions + alert catalog + incident scenarios (R-50): six new curl smoke stanzas (camelCase wire bodies post-R-53); update docs/observability/alerts.md with two new gc_telemetry_* alerts; add Telemetry-proxy + CORS-misconfig scenarios to gc-incident-response.md. See task #21 in docs/user-stories/2026-05-02-browser-client-join.md" --specialist=operations` | operations | 5, 10, 16, 23 | | | Pending |
+| 22 | `/devloop "Devloop validation pipeline finalization (R-48 infra portion): verify devloop image (#3) + Kind reachability (#4) + CI green (#17) all align with Layer 8 hookup landed in #19. See task #22 in docs/user-stories/2026-05-02-browser-client-join.md" --specialist=infrastructure` | infrastructure | 3, 17, 19 | | | Pending |
+| 23 | `/devloop "camelCase wire-format migration (R-53, Mechanical cross-boundary edit, paired w/ global-controller): #[serde(rename_all = \"camelCase\")] on AC public HTTP API structs (auth_handler.rs) and GC public HTTP API structs (handlers/); update env-tests in crates/env-tests/ + runbook curl examples. Commit trailer: Approved-Cross-Boundary: Mechanical (camelCase derive sweep). See task #23 in docs/user-stories/2026-05-02-browser-client-join.md" --specialist=auth-controller --paired-with=global-controller` | auth-controller (paired w/ GC) | — | | | Pending |
+| 24 | `/devloop "Common OTel SDK helper + gRPC interceptor module (R-54, R-56): crates/common/src/observability/otel.rs with init_otel(...)→Result<OtelGuard, OtelInitError> (FAIL-HARD AT INIT, fail-soft at runtime); crates/common/src/observability/otel_grpc.rs Tonic tower interceptor (inject outbound metadata + extract inbound); add tracing-opentelemetry to workspace deps; unit tests incl. init Err on unreachable collector. See task #24 in docs/user-stories/2026-05-02-browser-client-join.md" --specialist=observability` | observability | — | | | Pending |
+| 25 | `/devloop "AC OTel wiring (R-55 partial, R-56 partial): main.rs init_otel, Config (otel_enabled/otel_endpoint/otel_sample_rate), surfaced in ac-service/configmap.yaml, R-56 interceptor on AC's inbound gRPC server. See task #25 in docs/user-stories/2026-05-02-browser-client-join.md" --specialist=auth-controller` | auth-controller | 24 | | | Pending |
+| 26 | `/devloop "GC OTel wiring (R-55 partial, R-56 partial): main.rs init_otel, Config knobs, surfaced in gc-service/configmap.yaml, R-56 interceptor on GC's outbound AcAuthClient + MC client + GC's inbound HTTP layer. Integration tests for GC→AC trace continuity + HTTP→gRPC bridge + telemetry-proxy preserves trace context. See task #26 in docs/user-stories/2026-05-02-browser-client-join.md" --specialist=global-controller` | global-controller | 24 | | | Pending |
+| 27 | `/devloop "MH OTel wiring + MhClientMessage trace-field reads (R-55 partial, R-56 partial, R-58 MH side): main.rs init_otel, Config knobs, surfaced in mh-service/configmap.yaml, R-56 interceptor on MH's outbound GcRegistrationClient + McNotificationClient + inbound MC-facing gRPC server. Parse MhClientMessage envelope, extract trace_parent/state, attach to mh.webtransport.connection spans. See task #27 in docs/user-stories/2026-05-02-browser-client-join.md" --specialist=media-handler` | media-handler | 2, 24 | | | Pending |
+| 28 | `/devloop "Dev OTel collector deployment (R-59): infra/services/otel-collector/ Kustomize base (deployment + configmap + service + network-policy); OTLP-gRPC :4317 + OTLP-HTTP :4318 + logging/debug exporters; Kustomize values for AC/GC/MC/MH otel_endpoint + GC otel_collector_endpoint; setup.sh verifies collector readiness BEFORE AC/GC/MC/MH (load-bearing under fail-hard); new infra/docker/prometheus/rules/otel-alerts.yaml with OTelExportFailureRate warn alert; collector-upgrade-discipline note in gc-deployment.md. See task #28 in docs/user-stories/2026-05-02-browser-client-join.md" --specialist=infrastructure` | infrastructure | — | | | Pending |
+
+After all 28 devloops complete: run `/close-story browser-client-join` to verify completeness, run story-scope reflection, commit the cumulative work, and open the PR.
+
+---
+
+## Revisions
+
+### Revision 1 — 2026-05-02
+
+**Feedback** (multi-part, applied as one revision):
+1. Drop cross-language hex+JSON wire-vector fixtures — protobuf wire compat is trusted, not worth the maintenance.
+2. Rename `Room` → `MeetingSession` to align with backend "meeting" vocabulary.
+3. Replace `MediaConnectionFailed { all_handlers_failed }` with a richer `MediaConnectionUpdate { repeated MhConnectionStatus }` so MC has per-MH state for future routing logic.
+4. Demo needs a create-meeting view (and a `createMeeting` SDK method) — a manual user must be able to drive sign-up → create → join end-to-end without test-harness scaffolding.
+5. Lock in **camelCase wire format via option C** — `#[serde(rename_all = "camelCase")]` on AC + GC HTTP API structs.
+6. Lock in **full backend OTel SDK rollout** — common helper + per-service wiring + gRPC interceptor + dev collector. Add `trace_parent`/`trace_state` to the `MhClientMessage` envelope on latest main so client→MH propagation is natural.
+
+**Changes**:
+- **Requirements added**: R-53 (camelCase migration), R-54 (common OTel helper), R-55 (per-service wiring), R-56 (gRPC interceptor), R-57 (MC SDK propagation, supersedes R-4 design), R-58 (MhClientMessage trace fields), R-59 (dev collector deployment), R-60 (MediaConnectionUpdate redesign).
+- **Requirements amended**: R-4 (now a pointer to R-57); R-5 (extends to `MhClientMessage` envelope per R-58); R-6 (drops hex-fixture clause); R-11 (camelCase wire format); R-12 (adds `createMeeting`); R-19 (adds MH envelope injection); R-21 (sends `MediaConnectionUpdate` instead of `MediaConnectionFailed`); R-22 (`Room` → `MeetingSession`); R-23, R-28, R-29, R-41, R-43, R-25 metric description (renames + four-view demo).
+- **Tasks added**: #23 (camelCase migration), #24 (common OTel module), #25 (AC OTel wiring), #26 (GC OTel wiring), #27 (MH OTel + R-58 reads), #28 (collector deployment).
+- **Tasks amended**: #2 (R-58 + R-60 proto, drop hex fixtures), #6 (rewritten — OTel SDK approach + MediaConnectionUpdate handler), #7 (drop TS hex-fixture test), #8 (drop fixtures loader + Rust regen), #11 (camelCase wire + createMeeting + dep on #23), #13 (drop hex-fixture mention), #14 (`MeetingSession` + MhClientMessage envelope + MediaConnectionUpdate send), #15 (`$meetingState` + four views + bindMeetingSession).
+- **Specialists un-opted-in**: auth-controller (tasks #23, #25), media-handler (task #27), meeting-controller (now owns task #6 redesign explicitly).
+- **Total tasks**: 22 → 28. Critical path unchanged (new tasks fill Phase 1/2 width).
+- **Clarification questions answered**: 6 (camelCase), 7 (OTel rollout), 8 (client→MH propagation), 9 (drop hex fixtures), 10 (`Room` rename), 11 (`MediaConnectionUpdate`), 12 (demo create-meeting view).
+
+### Revision 2 — 2026-05-03
+
+**Feedback**: R-54 fail-soft init was a silent-failure hole. User asked whether fail-hard at startup wasn't simpler. Agreed.
+
+**Changes**:
+- **R-54 amended**: now **fail-hard at init, fail-soft at runtime**. `init_otel(...)` returns `Result<OtelGuard, OtelInitError>` instead of an infallible `OtelGuard`; if `otel_enabled=true` and exporter build / initial connection-test fails, `main()` exits non-zero and K8s pod-health alerting (already in place) surfaces it — no new init-outcome metric or dedicated alert needed. Runtime export failures drop spans + increment `dt_otel_export_failures_total{service, reason}` per R-59.
+- **R-59 amended**: adds new `infra/docker/prometheus/rules/otel-alerts.yaml` with the `OTelExportFailureRate` warn alert (`rate(dt_otel_export_failures_total[5m]) > 0 for 10m`). No init-failure alert (covered by K8s pod-health).
+- **Task #28 amended**: collector readiness check in `infra/kind/scripts/setup.sh` is now load-bearing (services refuse to start without it under fail-hard); adds the new `otel-alerts.yaml` file and a "collector upgrade discipline" note in `gc-deployment.md`.
+- **Operations checklist item #1 amended**: replaces fail-soft language with the fail-hard + runtime-metric design. Notes the trade-off that botched collector upgrades during business hours can cascade into a full data-plane restart loop, with operational mitigation (separate change windows).
+- **Clarification question 13 added**: "Why not fail-hard on OTel init?" — answer: agreed. Configuration bugs surface immediately; transient collector-not-ready races are handled by K8s restart loop + existing pod-health alerts; we lose nothing vs. fail-soft + new init-outcome metric/alert plumbing, and gain "broken telemetry can't go silent".
