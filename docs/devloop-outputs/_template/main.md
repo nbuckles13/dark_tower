@@ -73,11 +73,20 @@
      - Not mine, Domain-judgment — needs owner-implements or --paired-with=<owner>
 
      For Guarded Shared Area paths (ADR-0024 §6.4), Mechanical is disallowed; Owner must be filled.
-     Fill Owner (if not mine) for cross-boundary rows. -->
+     Fill Owner (if not mine) for cross-boundary rows.
+
+     Path column convention: bare backtick-quoted filename only. The
+     `validate-cross-boundary-scope` guard parser at scripts/guards/common.sh
+     strips backticks but nothing else; parenthetical annotations like
+     `path.rs` (new) trip scope-drift-inbound at Gate 2. Per-row file-shape
+     context (new vs modify, scope qualifiers, "skeleton-only", etc.)
+     belongs in § Implementation Summary or § Files Modified, not in this
+     table. The table answers one question per row: whose domain is this,
+     and how stringent is the involvement. -->
 
 | Path | Classification | Owner (if not mine) |
 |------|----------------|---------------------|
-| {path} | Mine \| Not mine, Mechanical \| Not mine, Minor-judgment \| Not mine, Domain-judgment | {specialist or —} |
+| `{path}` | Mine \| Not mine, Mechanical \| Not mine, Minor-judgment \| Not mine, Domain-judgment | {specialist or —} |
 
 ---
 
