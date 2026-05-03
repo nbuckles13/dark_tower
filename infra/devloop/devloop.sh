@@ -577,7 +577,10 @@ if [ -n "$HOST_GATEWAY_IP" ] && command -v kind &>/dev/null; then
     if $NEEDS_SETUP; then
         # Subshell ensures setup.pid is cleaned up when setup finishes,
         # preventing stale PID issues on re-attach (PID recycling).
-        (podman exec "$DEV_CONTAINER" dev-cluster setup \
+        # Use full path to dev-cluster: `podman exec` does NOT run the
+        # container's entrypoint (which prepends /work/infra/devloop to PATH),
+        # so a bare `dev-cluster` invocation fails to resolve.
+        (podman exec "$DEV_CONTAINER" /work/infra/devloop/dev-cluster setup \
             >> "$HELPER_RUNTIME_DIR/eager-setup.log" 2>&1; \
             rm -f "$HELPER_RUNTIME_DIR/setup.pid") &
         EAGER_SETUP_PID=$!
