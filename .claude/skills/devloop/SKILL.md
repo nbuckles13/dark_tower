@@ -379,15 +379,19 @@ When implementer signals "Ready for validation", run the validation pipeline:
 
 **Layer 7 — Semantic Guard Agent**:
 
-After layers 1-6 pass, spawn the semantic-guard agent to analyze the diff:
+After layers 1-6 pass, spawn the semantic-guard agent **as a member of the existing devloop team** (not as a standalone Agent call). Project-local agent definitions in `.claude/agents/*.md` only resolve via the team-spawn path; a bare `Agent({subagent_type: "semantic-guard"})` will fail because the standalone-Agent harness only knows its built-in `subagent_type` set. Mirror the reviewer-spawn shape from Step 3:
 
 ```
-name: "semantic-guard"
-subagent_type: "semantic-guard"
-prompt: "Analyze the current diff for semantic issues. Report your verdict to @team-lead."
+Agent({
+  team_name: "devloop-YYYY-MM-DD-{slug}",
+  name: "semantic-guard",
+  subagent_type: "semantic-guard",
+  run_in_background: true,
+  prompt: "Analyze the current diff for semantic issues. SendMessage your verdict (SAFE or UNSAFE) to @team-lead. If UNSAFE, list the specific findings and recommended fixes."
+})
 ```
 
-Wait for the agent's verdict message. If UNSAFE, treat as a validation failure (send findings to implementer, increment iteration). If SAFE, proceed.
+Semantic-guard joins the team mailbox, so the verdict comes back via SendMessage like any other reviewer's verdict (NOT via the synchronous Agent return value). Wait for the verdict message. If UNSAFE, treat as a validation failure (send findings to implementer, increment iteration). If SAFE, proceed. Semantic-guard is shut down via the same `shutdown_request` flow as the other reviewers in Step 8.5 (Cleanup Team).
 
 **Layer 8 — Env-tests (Integration)**:
 

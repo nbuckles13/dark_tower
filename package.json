@@ -1,0 +1,23 @@
+{
+  "name": "darktower",
+  "version": "0.0.0",
+  "private": true,
+  "packageManager": "pnpm@9.15.0",
+  "engines": {
+    "node": ">=22 <23"
+  },
+  "scripts": {
+    "lint": "nx run-many -t lint",
+    "test:unit": "nx run-many -t test:unit",
+    "test:component": "nx run-many -t test:component",
+    "test:e2e": "nx run-many -t test:e2e",
+    "build": "nx run-many -t build",
+    "dev": "nx run-many -t dev --parallel"
+  },
+  "devDependencies": {
+    "@bufbuild/buf": "1.49.0",
+    "@types/node": "22.10.5",
+    "nx": "20.3.0",
+    "typescript": "5.7.3"
+  }
+}

@@ -46,6 +46,9 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 
+# Nx local cache
+.nx/
+
 # Build outputs
 dist/
 build/
