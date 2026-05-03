@@ -61,6 +61,72 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
     npm install -g @anthropic-ai/claude-code && \
     rm -rf /var/lib/apt/lists/*
 
+# === Browser-client toolchain (R-35) ===
+# Image-size delta budget: <=600 MB additional vs. prior image.
+# Expected: ~280 MB Chromium binary + ~50 MB system deps + small fonts margin.
+# Measure: podman image inspect darktower-dev:latest --format '{{.Size}}' before/after.
+
+# pnpm via Corepack (Node 22 ships corepack; no apt install needed).
+ARG PNPM_VERSION=9.15.0
+RUN corepack enable \
+ && corepack prepare pnpm@${PNPM_VERSION} --activate
+
+# Playwright Chromium system deps.
+# Story (R-35) §139 / §464 verbatim list, in the order given there:
+#   libnss3 libatk-bridge2.0-0 libdrm2 libxkbcommon0 libxcomposite1
+#   libxdamage1 libxfixes3 libxrandr2 libgbm1 libpango-1.0-0 libcairo2
+#   libasound2 fonts-liberation fonts-noto-color-emoji
+# Plus two additions (libatk1.0-0, libcups2) that Playwright's `--with-deps`
+# pulls in for headless Chromium on Debian bookworm but the story list omits
+# (canonical source: playwright/lib/server/registry/dependencies.ts). Without
+# these the build-time Chromium smoke fails with missing-symbol errors.
+# We install the explicit list rather than `playwright install --with-deps` so
+# the apt set is auditable here and installed under our own cache discipline.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libnss3 libatk-bridge2.0-0 libatk1.0-0 libcups2 libdrm2 \
+    libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 \
+    libgbm1 libpango-1.0-0 libcairo2 libasound2 \
+    fonts-liberation fonts-noto-color-emoji \
+ && rm -rf /var/lib/apt/lists/*
+
+# Build-time: Layer below writes Chromium under PLAYWRIGHT_BROWSERS_PATH.
+# Runtime:    PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 stops downstream `pnpm install`
+#             inside the running container from re-downloading Chromium —
+#             it must use the image-baked browser at /opt/ms-playwright.
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright \
+    PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+
+# Pre-cache Chromium. Load-bearing: PLAYWRIGHT_VERSION is the contract version
+# between this image (which bakes Chromium at /opt/ms-playwright) and the
+# packages/web-app `playwright` devDep (story task #18). Bumping here REQUIRES
+# bumping the consumer pin in lockstep — Playwright refuses to launch a Chromium
+# revision that does not match its npm-package's recorded revision.
+# Trust chain: the Chromium browser blob is fetched from Playwright's HTTPS CDN.
+# Integrity is established transitively through the version-pinned `playwright`
+# npm tarball (integrity-checked by npm), which carries the Chromium revision
+# and download manifest. Playwright does not publish per-version sha256 for the
+# browser blob, so equivalent verification to the kubectl block above is not
+# applicable; this is the same trust posture as official mcr.microsoft.com/playwright
+# images, acceptable inside the devloop sandbox per ADR-0025.
+# `chmod -R a+rX` makes the cache world-readable + dir-traversable (least-privilege)
+# so --userns=keep-id mapped users can read it. The cache is intentionally
+# read-only at runtime; mutating the baked browser requires an image rebuild.
+ARG PLAYWRIGHT_VERSION=1.49.0
+RUN npx -y playwright@${PLAYWRIGHT_VERSION} install chromium \
+ && chmod -R a+rX /opt/ms-playwright
+
+# Build-time smoke: catches missing shared libs (e.g., libcups2, libatk1.0-0)
+# that Playwright's install step does NOT detect (extraction != dlopen). Path
+# resolved via `playwright install --dry-run` so future on-disk layout changes
+# don't break this step silently — Playwright treats --dry-run output as a
+# tooling contract.
+RUN BROWSER_DIR="$(npx -y playwright@${PLAYWRIGHT_VERSION} install --dry-run chromium 2>&1 | awk '/Install location:/ {print $3}')" \
+ && test -x "${BROWSER_DIR}/chrome-linux/chrome" \
+ && "${BROWSER_DIR}/chrome-linux/chrome" --version
+
+# Rollback: rebuild from prior commit (no state migration; named volumes are
+# toolchain-agnostic).
+
 # Home directory for the mapped user (--userns=keep-id).
 # Without this, HOME defaults to WORKDIR (/work) and Claude writes
 # state files (.claude/, .claude.json) into the git checkout.
