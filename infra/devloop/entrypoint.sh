@@ -7,10 +7,10 @@ set -euo pipefail
 
 echo "=== Dark Tower dev container starting ==="
 
-# Ensure CARGO_HOME is writable and pre-installed tools remain on PATH.
-# Add clone's infra/devloop to PATH so dev-cluster always matches the source.
+# Ensure CARGO_HOME is writable. PATH (incl. /work/infra/devloop) is set at
+# the image level via Dockerfile ENV — required so `podman exec` sessions also
+# pick it up, since exec doesn't run this entrypoint.
 mkdir -p "${CARGO_HOME:-/tmp/cargo-home}"
-export PATH="/work/infra/devloop:/usr/local/cargo/bin:${PATH}"
 
 # Wait for postgres to be ready.
 # With named networks (ADR-0030), DB is at $DB_HOST:5432 via container DNS.
