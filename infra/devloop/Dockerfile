@@ -167,6 +167,14 @@ ENV HOME=/home/dev
 # tools write directly to CARGO_HOME (e.g., advisory-db/).
 RUN mkdir -p /tmp/cargo-home && chmod 777 /tmp/cargo-home
 
+# Add the in-clone tooling directory to PATH at the image level. `podman exec`
+# does NOT run the entrypoint, so PATH exports inside entrypoint.sh are scoped
+# to that one shell and invisible to exec'd processes (the claude session,
+# `podman exec -it bash`, host-orchestrated `podman exec ... dev-cluster`).
+# Hoisting to image ENV means every container surface sees the same PATH and
+# `dev-cluster <cmd>` works as a bare command everywhere.
+ENV PATH=/work/infra/devloop:/usr/local/cargo/bin:$PATH
+
 # Entrypoint script
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
