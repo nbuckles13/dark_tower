@@ -62,14 +62,39 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
     rm -rf /var/lib/apt/lists/*
 
 # === Browser-client toolchain (R-35) ===
-# Image-size delta budget: <=600 MB additional vs. prior image.
-# Expected: ~280 MB Chromium binary + ~50 MB system deps + small fonts margin.
-# Measure: podman image inspect darktower-dev:latest --format '{{.Size}}' before/after.
+# Measured size delta: ~970 MB additional vs. prior image (2026-05-03 build).
+# Story §139 estimated ~330 MB; the actual delta is ~3x the planning-time
+# estimate because `npx playwright install chromium` pulls THREE blobs, not
+# one: Chromium (~280 MB), Chromium Headless Shell (~280 MB, used in some
+# Playwright headless modes), and ffmpeg (~50 MB), plus apt deps and fonts
+# (~50 MB) and npm cache layers from the smoke step.
+# A future cleanup pass could drop chromium_headless_shell-* and ffmpeg-*
+# from /opt/ms-playwright if size becomes a constraint — see TODO.md.
+# Measure: podman image inspect darktower-dev:latest --format '{{.Size}}'.
 
 # pnpm via Corepack (Node 22 ships corepack; no apt install needed).
-ARG PNPM_VERSION=9.15.0
-RUN corepack enable \
- && corepack prepare pnpm@${PNPM_VERSION} --activate
+# COREPACK_ENABLE_DOWNLOAD_PROMPT=0 is persistent — without it, every first-use
+# of pnpm in a running container prompts interactively to download the tarball.
+# COREPACK_HOME pins the activation state to a system path. Without this,
+# `corepack prepare --activate` writes to $HOME/.cache/node/corepack at build
+# time (HOME=/root) but the runtime HOME is /home/dev (set below) — the
+# activation is then unreachable and pnpm falls back to Corepack's built-in
+# default version. /opt/corepack mirrors the shared-path pattern used for
+# PLAYWRIGHT_BROWSERS_PATH below.
+# `corepack prepare ... --activate` only registers the version; the actual
+# download is lazy. The `pnpm --version` line forces the download into the
+# image so containers ship with pnpm fully resolved.
+# Version contract: PNPM_VERSION here MUST match `packageManager` in the
+# repo-root package.json. Corepack reads packageManager when running pnpm
+# inside /work, and a mismatch causes a runtime download (defeating the bake).
+ENV COREPACK_ENABLE_DOWNLOAD_PROMPT=0 \
+    COREPACK_HOME=/opt/corepack
+ARG PNPM_VERSION=10.33.2
+RUN mkdir -p /opt/corepack \
+ && corepack enable \
+ && corepack prepare pnpm@${PNPM_VERSION} --activate \
+ && pnpm --version \
+ && chmod -R a+rX /opt/corepack
 
 # Playwright Chromium system deps.
 # Story (R-35) §139 / §464 verbatim list, in the order given there:
@@ -120,7 +145,7 @@ RUN npx -y playwright@${PLAYWRIGHT_VERSION} install chromium \
 # resolved via `playwright install --dry-run` so future on-disk layout changes
 # don't break this step silently — Playwright treats --dry-run output as a
 # tooling contract.
-RUN BROWSER_DIR="$(npx -y playwright@${PLAYWRIGHT_VERSION} install --dry-run chromium 2>&1 | awk '/Install location:/ {print $3}')" \
+RUN BROWSER_DIR="$(npx -y playwright@${PLAYWRIGHT_VERSION} install --dry-run chromium 2>&1 | awk '/^browser: chromium / {found=1; next} found && /Install location:/ {print $3; exit}')" \
  && test -x "${BROWSER_DIR}/chrome-linux/chrome" \
  && "${BROWSER_DIR}/chrome-linux/chrome" --version
 
