@@ -1,0 +1,30 @@
+{
+  "$schema": "../../node_modules/nx/schemas/project-schema.json",
+  "name": "test-utils",
+  "projectType": "library",
+  "sourceRoot": "packages/test-utils/src",
+  "targets": {
+    "build": {
+      "executor": "nx:run-commands",
+      "options": {
+        "cwd": "packages/test-utils",
+        "command": "vite build"
+      },
+      "outputs": ["{projectRoot}/dist"]
+    },
+    "test:unit": {
+      "executor": "nx:run-commands",
+      "options": {
+        "cwd": "packages/test-utils",
+        "command": "vitest run"
+      }
+    },
+    "lint": {
+      "executor": "nx:run-commands",
+      "options": {
+        "cwd": "packages/test-utils",
+        "command": "tsc --noEmit"
+      }
+    }
+  }
+}
