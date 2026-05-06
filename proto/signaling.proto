@@ -6,8 +6,8 @@ import "google/protobuf/timestamp.proto";
 
 // Participant capabilities during join
 message ParticipantCapabilities {
-  repeated string video_codecs = 1;  // e.g., ["VP9", "AV1", "H264"]
-  repeated string audio_codecs = 2;  // e.g., ["Opus", "AAC"]
+  repeated string video_codecs = 1; // e.g., ["VP9", "AV1", "H264"]
+  repeated string audio_codecs = 2; // e.g., ["Opus", "AAC"]
   bool supports_simulcast = 3;
   uint32 max_video_streams = 4;
 }
@@ -19,12 +19,12 @@ message ParticipantCapabilities {
 // for session recovery.
 message JoinRequest {
   string meeting_id = 1;
-  string join_token = 2;              // JWT from GC (always required, must be fresh)
+  string join_token = 2; // JWT from GC (always required, must be fresh)
   string participant_name = 3;
   ParticipantCapabilities capabilities = 4;
   // Session recovery fields (ADR-0023)
-  string correlation_id = 5;          // UUIDv7, empty for first join
-  string binding_token = 6;           // HMAC-SHA256 binding token, empty for first join
+  string correlation_id = 5; // UUIDv7, empty for first join
+  string binding_token = 6; // HMAC-SHA256 binding token, empty for first join
 }
 
 // Encryption keys for end-to-end encryption
@@ -36,7 +36,7 @@ message EncryptionKeys {
 // Information about the media server
 message MediaServerInfo {
   string media_handler_url = 1;
-  reserved 2;  // was: connection_token (removed — client uses meeting JWT)
+  reserved 2; // was: connection_token (removed — client uses meeting JWT)
 }
 
 // Stream type enumeration
@@ -69,7 +69,7 @@ message VideoMetadata {
 message StreamMetadata {
   string codec = 1;
   uint32 max_bitrate = 2;
-  VideoMetadata video = 3;  // Only for video streams
+  VideoMetadata video = 3; // Only for video streams
 }
 
 // Media stream information
@@ -94,13 +94,13 @@ message Participant {
 // Client must store correlation_id and binding_token for reconnection.
 message JoinResponse {
   string participant_id = 1;
-  uint64 user_id = 2;  // 8-byte user ID for media frames
+  uint64 user_id = 2; // 8-byte user ID for media frames
   repeated Participant existing_participants = 3;
-  repeated MediaServerInfo media_servers = 4;  // Multiple handlers
+  repeated MediaServerInfo media_servers = 4; // Multiple handlers
   EncryptionKeys encryption_keys = 5;
   // Session recovery fields (ADR-0023)
-  string correlation_id = 6;          // UUIDv7, client stores for reconnection
-  string binding_token = 7;           // Client stores for reconnection (30s TTL)
+  string correlation_id = 6; // UUIDv7, client stores for reconnection
+  string binding_token = 7; // Client stores for reconnection (30s TTL)
 }
 
 // Reason for participant leaving
@@ -112,7 +112,7 @@ enum LeaveReason {
   KICKED = 1;
   CONNECTION_LOST = 2;
   MEETING_ENDED = 3;
-  TIMEOUT = 4;  // ADR-0023: 30s disconnect grace period expired
+  TIMEOUT = 4; // ADR-0023: 30s disconnect grace period expired
 }
 
 // ============================================================================
@@ -128,11 +128,11 @@ message MuteRequest {
 // Notification of participant mute state change
 message ParticipantMuteUpdate {
   string participant_id = 1;
-  bool audio_self_muted = 2;      // Informational: participant muted themselves
-  bool video_self_muted = 3;      // Informational: participant muted themselves
-  bool audio_host_muted = 4;      // Enforced: host muted participant
-  bool video_host_muted = 5;      // Enforced: host muted participant
-  string host_muted_by = 6;       // user_id of host who applied mute (if host-muted)
+  bool audio_self_muted = 2; // Informational: participant muted themselves
+  bool video_self_muted = 3; // Informational: participant muted themselves
+  bool audio_host_muted = 4; // Enforced: host muted participant
+  bool video_host_muted = 5; // Enforced: host muted participant
+  string host_muted_by = 6; // user_id of host who applied mute (if host-muted)
 }
 
 // Host request to mute a participant (enforced by MC + MH)
@@ -140,7 +140,7 @@ message HostMuteRequest {
   string participant_id = 1;
   bool audio_muted = 2;
   bool video_muted = 3;
-  string reason = 4;              // Optional reason shown to participant
+  string reason = 4; // Optional reason shown to participant
 }
 
 // Participant request to unmute after being host-muted
@@ -163,9 +163,9 @@ message UnmuteResponse {
 // Server notification to client to reconnect to a different MC
 // Sent during graceful shutdown, load shedding, or rebalancing
 message RedirectToMc {
-  string new_mc_endpoint = 1;     // WebTransport endpoint of target MC
+  string new_mc_endpoint = 1; // WebTransport endpoint of target MC
   string meeting_id = 2;
-  string reason = 3;              // "migration", "rebalance", "capacity"
+  string reason = 3; // "migration", "rebalance", "capacity"
 }
 
 // Notification of participant joining
@@ -220,11 +220,11 @@ message LayoutConfig {
   // For Grid layout
   uint32 rows = 1;
   uint32 columns = 2;
-  uint32 max_streams = 3;  // rows * columns
+  uint32 max_streams = 3; // rows * columns
 
   // Customization
-  repeated uint64 pinned_users = 4;   // Must appear in layout
-  repeated uint64 excluded_users = 5;  // Must not appear
+  repeated uint64 pinned_users = 4; // Must appear in layout
+  repeated uint64 excluded_users = 5; // Must not appear
   bool prefer_video_over_audio = 6;
   bool include_self = 7;
 }
@@ -233,15 +233,15 @@ message LayoutConfig {
 message SubscribeToLayout {
   LayoutType layout_type = 1;
   LayoutConfig config = 2;
-  repeated uint32 stream_ids = 3;  // Subscriber-chosen IDs for each slot
+  repeated uint32 stream_ids = 3; // Subscriber-chosen IDs for each slot
 }
 
 // Stream assignment for a layout slot
 message StreamAssignment {
-  uint32 stream_id = 1;        // The subscriber's local stream_id
-  uint64 user_id = 2;           // Source participant
-  MediaType media_type = 3;     // camera, screen, audio
-  uint32 slot_index = 4;        // Position in layout (0-based)
+  uint32 stream_id = 1; // The subscriber's local stream_id
+  uint64 user_id = 2; // Source participant
+  MediaType media_type = 3; // camera, screen, audio
+  uint32 slot_index = 4; // Position in layout (0-based)
   string media_handler_url = 5; // Which handler to receive from
 }
 
@@ -252,7 +252,7 @@ message StreamAssignments {
 
 // Request to update current layout configuration
 message UpdateLayout {
-  LayoutConfig new_config = 1;  // New layout configuration
+  LayoutConfig new_config = 1; // New layout configuration
 }
 
 // Request to unsubscribe from current layout
@@ -295,9 +295,9 @@ message ErrorMessage {
 // MediaConnectionUpdate. Catalog-style enum-value prefix per ADR-0011
 // + internal.proto convention (DisconnectReason, RejectionReason).
 enum ConnectionState {
-  CONNECTION_STATE_UNSPECIFIED  = 0;
-  CONNECTION_STATE_CONNECTED    = 1;
-  CONNECTION_STATE_FAILED       = 2;
+  CONNECTION_STATE_UNSPECIFIED = 0;
+  CONNECTION_STATE_CONNECTED = 1;
+  CONNECTION_STATE_FAILED = 2;
   CONNECTION_STATE_DISCONNECTED = 3;
 }
 
@@ -366,7 +366,7 @@ message ClientMessage {
 
 // MH client→server connect envelope; first framed message on a new bidi stream.
 message MhConnectRequest {
-  string join_token = 1;  // Meeting JWT; same semantics as JoinRequest.join_token.
+  string join_token = 1; // Meeting JWT; same semantics as JoinRequest.join_token.
 }
 
 // Wrapper envelope for client→MH messages (parallel to ClientMessage for MC).
@@ -395,9 +395,9 @@ message ServerMessage {
     ErrorMessage error = 7;
     // ADR-0023: Additional server messages
     ParticipantMuteUpdate participant_mute_update = 8;
-    UnmuteRequest unmute_request = 9;    // Host receives participant's request
+    UnmuteRequest unmute_request = 9; // Host receives participant's request
     UnmuteResponse unmute_response = 10; // Participant receives host's response
-    RedirectToMc redirect_to_mc = 11;    // MC migration redirect
+    RedirectToMc redirect_to_mc = 11; // MC migration redirect
   }
 
   // W3C Trace Context (see ClientMessage::trace_parent for format,

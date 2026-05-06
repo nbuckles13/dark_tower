@@ -11,6 +11,7 @@ Cargo.lock
 
 # Generated protobuf code
 crates/proto-gen/src/generated/*.rs
+packages/sdk-core/src/proto/*_pb.ts
 
 # IDE
 .idea/
@@ -48,6 +49,9 @@ yarn-error.log*
 
 # Nx local cache
 .nx/
+
+# pnpm content-addressable store (materialized at project root by pnpm 10.x default behavior in containerized devloop)
+.pnpm-store/
 
 # Build outputs
 dist/

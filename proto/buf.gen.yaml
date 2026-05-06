@@ -1,0 +1,10 @@
+version: v2
+inputs:
+  - directory: .
+plugins:
+  - local: ["pnpm", "--filter=@darktower/proto-gen", "exec", "protoc-gen-es"]
+    out: ../packages/sdk-core/src/proto
+    opt:
+      - target=ts
+      - import_extension=js
+      - json_types=true
