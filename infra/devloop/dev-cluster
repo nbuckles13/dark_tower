@@ -11,6 +11,7 @@
 #   dev-cluster deploy <service>
 #   dev-cluster teardown
 #   dev-cluster status
+#   dev-cluster cancel
 #
 # Services: ac, gc, mc, mh
 #
@@ -36,6 +37,7 @@ if [ $# -lt 1 ]; then
     echo "  deploy <service>                Apply manifests only (no rebuild)" >&2
     echo "  teardown                        Delete Kind cluster and clean up" >&2
     echo "  status                          Check cluster health and readiness" >&2
+    echo "  cancel                          Abort the in-flight write command (no-op if idle)" >&2
     echo "" >&2
     echo "Services: ac, gc, mc, mh" >&2
     exit 1
@@ -81,9 +83,12 @@ case "$1" in
     status)
         CMD="status"
         ;;
+    cancel)
+        CMD="cancel"
+        ;;
     *)
         echo "ERROR: Unknown command '$1'" >&2
-        echo "Valid commands: setup, rebuild, rebuild-all, deploy, teardown, status" >&2
+        echo "Valid commands: setup, rebuild, rebuild-all, deploy, teardown, status, cancel" >&2
         exit 1
         ;;
 esac
@@ -227,6 +232,8 @@ display_cluster_info() {
 EXIT_CODE=1
 GOT_RESULT="false"
 RESULT_DATA=""
+ERROR_DATA=""
+CANCEL_TARGET=""
 
 # socat connects to the unix socket, sends the request, reads streaming NDJSON.
 # -t 600 = 10 minute idle timeout (setup can take ~7 min on first run).
@@ -302,6 +309,28 @@ while IFS= read -r line; do
                 RESULT_DATA=$(echo "$line" | jq -r '.data // empty')
             fi
 
+            # Capture the cancelled-op info for the cancel command summary line.
+            # Source from `data` (the helper's wire response): `data.cancelled`
+            # (bool) and `data.op` / `data.args` on a successful cancel. The
+            # `error` field is only used by the audit log to keep cancel events
+            # greppable; the wire response leaves it empty on success, so reading
+            # CANCEL_TARGET from `error` here would always show no-op.
+            if [ "$CMD" = "cancel" ]; then
+                CANCEL_DATA=$(echo "$line" | jq -r '.data // empty')
+                if [ -n "$CANCEL_DATA" ] && [ "$CANCEL_DATA" != "null" ]; then
+                    CANCELLED=$(echo "$CANCEL_DATA" | jq -r '.cancelled // false')
+                    if [ "$CANCELLED" = "true" ]; then
+                        cancel_op=$(echo "$CANCEL_DATA" | jq -r '.op // empty')
+                        cancel_args=$(echo "$CANCEL_DATA" | jq -r '(.args // []) | join(" ")')
+                        if [ -n "$cancel_args" ]; then
+                            CANCEL_TARGET="${cancel_op} ${cancel_args}"
+                        else
+                            CANCEL_TARGET="${cancel_op}"
+                        fi
+                    fi
+                fi
+            fi
+
             if [ "$result_status" = "ok" ]; then
                 echo "=== ${CMD} completed (exit ${exit_code}, ${duration_s}s) ===" >&2
                 EXIT_CODE=0
@@ -320,10 +349,28 @@ while IFS= read -r line; do
             GOT_RESULT="true"
             error_msg=$(echo "$line" | jq -r '.message')
             error_kind=$(echo "$line" | jq -r '.error_kind // "unknown"')
+            ERROR_DATA=$(echo "$line" | jq -r '.data // empty')
             echo "ERROR: ${error_msg} (${error_kind})" >&2
-            if [ "$error_kind" = "auth_failed" ]; then
-                echo "The auth token may have rotated. Re-run devloop.sh to refresh." >&2
-            fi
+            case "$error_kind" in
+                auth_failed)
+                    echo "The auth token may have rotated. Re-run devloop.sh to refresh." >&2
+                    ;;
+                busy)
+                    # Surface the in-flight op (helper places {op, args} in data)
+                    if [ -n "$ERROR_DATA" ] && [ "$ERROR_DATA" != "null" ]; then
+                        in_flight_op=$(echo "$ERROR_DATA" | jq -r '.op // empty')
+                        in_flight_args=$(echo "$ERROR_DATA" | jq -r '(.args // []) | join(" ")')
+                        if [ -n "$in_flight_op" ]; then
+                            if [ -n "$in_flight_args" ]; then
+                                echo "  In-flight write: ${in_flight_op} ${in_flight_args}" >&2
+                            else
+                                echo "  In-flight write: ${in_flight_op}" >&2
+                            fi
+                        fi
+                    fi
+                    echo "  Run 'dev-cluster cancel' to abort it, then retry." >&2
+                    ;;
+            esac
             EXIT_CODE=1
             ;;
 
@@ -355,10 +402,49 @@ if [ "$CMD" = "setup" ] && [ "$EXIT_CODE" -eq 0 ] && [ -f "$PORTS_FILE" ]; then
     display_cluster_info "$PORTS_FILE"
 fi
 
+# After cancel, surface what was cancelled or that no write was running.
+if [ "$CMD" = "cancel" ] && [ "$EXIT_CODE" -eq 0 ]; then
+    if [ -z "$CANCEL_TARGET" ] || [ "$CANCEL_TARGET" = "none" ]; then
+        echo "No write in flight; nothing to cancel." >&2
+    else
+        echo "Sent cancel to in-flight write: ${CANCEL_TARGET}" >&2
+    fi
+fi
+
 # After successful status, display health summary from result data, then URLs
 if [ "$CMD" = "status" ] && [ "$EXIT_CODE" -eq 0 ]; then
     echo "" >&2
     if [ -n "$RESULT_DATA" ]; then
+        # Helper now always emits busy + in_flight + cancel_pending (CR11).
+        # When a write is in flight, surface it as a banner above the rest of
+        # the health summary so operators see it before the (potentially
+        # stale) cluster state. cancel_pending=true means a cancel was sent
+        # and we're inside the SIGTERM-grace + drain window.
+        busy=$(echo "$RESULT_DATA" | jq -r '.busy // false')
+        cancel_pending=$(echo "$RESULT_DATA" | jq -r '.cancel_pending // false')
+        if [ "$busy" = "true" ]; then
+            in_flight_op=$(echo "$RESULT_DATA" | jq -r '.in_flight.op // empty')
+            in_flight_args=$(echo "$RESULT_DATA" | jq -r '(.in_flight.args // []) | join(" ")')
+            if [ -n "$in_flight_op" ]; then
+                if [ "$cancel_pending" = "true" ]; then
+                    state_tag="[busy, cancelling]"
+                else
+                    state_tag="[busy]"
+                fi
+                if [ -n "$in_flight_args" ]; then
+                    echo "${state_tag} write in flight: ${in_flight_op} ${in_flight_args}" >&2
+                else
+                    echo "${state_tag} write in flight: ${in_flight_op}" >&2
+                fi
+                if [ "$cancel_pending" = "true" ]; then
+                    echo "       Cancel sent; the in-flight write should exit within ~2s (SIGTERM) or ~4s (escalates to SIGKILL of the process group)." >&2
+                else
+                    echo "       Run 'dev-cluster cancel' to abort it." >&2
+                fi
+                echo "" >&2
+            fi
+        fi
+
         cluster_exists=$(echo "$RESULT_DATA" | jq -r '.cluster_exists')
         pods_healthy=$(echo "$RESULT_DATA" | jq -r '.pods_healthy')
         setup_in_progress=$(echo "$RESULT_DATA" | jq -r '.setup_in_progress')

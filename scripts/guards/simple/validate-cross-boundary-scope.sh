@@ -143,8 +143,15 @@ check_main_md() {
     #   explicitly anyway (e.g., implementer plans an INDEX update as part of
     #   implementation), the exclusion is harmless — plan and diff both omit
     #   them in Layer A's calculation.
+    # - `docs/TODO.md` — explicit append target documented by ADR-0019 (DRY
+    #   extraction opportunities) and the review-protocol §"Spin-out tracking" /
+    #   §"Tech Debt References" sections. Any reviewer may write deferrals,
+    #   spin-outs, or extraction opportunities there as part of producing a
+    #   verdict, after Gate 2 has already run. Same shape as INDEX.md: an
+    #   expected, reviewer-authored append target that doesn't need to be
+    #   listed in every plan.
     local exclude_re
-    exclude_re="^(${rel_path}|docs/specialist-knowledge/[^/]+/INDEX\\.md)\$"
+    exclude_re="^(${rel_path}|docs/specialist-knowledge/[^/]+/INDEX\\.md|docs/TODO\\.md)\$"
 
     local rows plan_paths
     rows=$(parse_cross_boundary_table "$main_md")
