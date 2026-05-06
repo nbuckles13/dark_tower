@@ -15,11 +15,12 @@ use crate::protocol::{
 use std::fs;
 use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 /// Hostname that dev containers use to reach the host via podman's gateway.
@@ -30,6 +31,183 @@ const CONTAINER_HOST: &str = "host.containers.internal";
 /// Default host-gateway IP for Kind NodePort listenAddress (ADR-0030).
 /// Used as fallback when `--host-gateway-ip` is not provided.
 const DEFAULT_HOST_GATEWAY_IP: &str = "10.255.255.254";
+
+/// Graceful-shutdown window between SIGTERM and SIGKILL on cancel
+/// (per security S5). The 2 s window is for the cooperative shell/kubectl
+/// tree spawned by writer commands — `setup.sh` running `kubectl wait`,
+/// `kubectl apply`, `kind create cluster`, etc. — all of which respond
+/// promptly to SIGTERM. We do NOT signal the Kind cluster's
+/// containerd/kubelet/etcd: those run inside Kind's container as detached
+/// components managed by the cluster's PID 1, not as descendants of
+/// setup.sh — they were never in our process group. Partial-Kind state
+/// from a cancelled `setup` is recovered by setup.sh's "cluster exists,
+/// reusing" branch on the next setup. Process-wide shutdown stays
+/// SIGKILL-immediate; see the `IMPORTANT:` comment in
+/// `run_command_streaming`.
+pub const CANCEL_GRACEFUL_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Lock a `Mutex` recovering from poison (per ADR-0002 + CR7).
+/// Centralized helper so all callsites are panic-free; single change point
+/// if we ever switch to `parking_lot::Mutex`.
+fn lock_recovered<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Send `sig` to the process group led by `child`. Returns
+/// `Err(HelperError::CommandFailed)` (per ADR-0002 — never silently swallow
+/// the overflow case, even though it is defensive-only) if the child's PID
+/// exceeds `i32` range or equals `i32::MIN` (so its `checked_neg` is
+/// undefined). Caller pattern at all signalling sites is:
+///
+/// ```ignore
+/// if signal_process_group(&child, libc::SIGKILL).is_err() {
+///     // Pathological PID — fall back to single-PID kill of the leader.
+///     // Best effort; any grandchildren leak until next sweep.
+///     let _ = child.kill();
+/// }
+/// ```
+///
+/// SAFETY contract (S3-(a) continuity): the caller MUST be the sole signaller
+/// of `child`, MUST NOT have called `child.wait()` yet, AND MUST own the
+/// child via mutable borrow / move (not via shared `Arc<Mutex<Child>>` etc.) —
+/// the borrow checker is what enforces sole-signaller-ness. All three
+/// invariants hold inside `run_command_streaming` because the writer thread
+/// owns `Child` on its own stack and `wait()` is the very last call. The PID
+/// derives from `child.id()` and never crosses thread boundaries —
+/// `cmd_cancel` only flips an atomic; the writer thread alone signals the
+/// group.
+fn signal_process_group(child: &Child, sig: libc::c_int) -> Result<(), HelperError> {
+    // Guard against pid 0: `libc::kill(0, sig)` means "every process in the
+    // calling process's group" — which would SIGKILL the helper itself.
+    // `Child::id()` shouldn't ever return 0 (Linux PIDs start at 1), but the
+    // FFI surface is sharp enough that a guard is cheap insurance.
+    debug_assert!(
+        child.id() > 0,
+        "child.id() must be >0 (libc::kill(0,...) would target the helper's own group)"
+    );
+    let pid_i32 = i32::try_from(child.id()).map_err(|_| HelperError::CommandFailed {
+        cmd: "kill".to_string(),
+        detail: format!("PID {} exceeds i32 range", child.id()),
+    })?;
+    let neg_pid = pid_i32
+        .checked_neg()
+        .ok_or_else(|| HelperError::CommandFailed {
+            cmd: "kill".to_string(),
+            detail: format!("PID {pid_i32} cannot be negated for pgid signal"),
+        })?;
+    debug_assert!(
+        neg_pid < 0,
+        "checked_neg should yield negative for pgid signal"
+    );
+    // SAFETY: libc::kill is FFI; neg_pid is a valid pgid (negative of leader PID
+    // for a child spawned with `Command::process_group(0)`).
+    unsafe {
+        libc::kill(neg_pid, sig);
+    }
+    Ok(())
+}
+
+/// Per-write cancellation signal. Wraps the helper's process-wide shutdown
+/// flag and a per-write cancel token; either being set cancels the in-flight
+/// child (per CR3).
+#[derive(Clone)]
+pub struct CancelSignal {
+    pub shutdown: Arc<AtomicBool>,
+    pub cancel: Arc<AtomicBool>,
+}
+
+impl CancelSignal {
+    pub fn new(shutdown: Arc<AtomicBool>, cancel: Arc<AtomicBool>) -> Self {
+        Self { shutdown, cancel }
+    }
+
+    /// True if either shutdown OR per-write cancel is set. Available for
+    /// callers that want a single check; `run_command_streaming` checks the
+    /// two flags separately to drive distinct kill paths (SIGTERM-then-SIGKILL
+    /// vs SIGKILL-immediate).
+    #[allow(dead_code)]
+    pub fn is_cancelled(&self) -> bool {
+        self.shutdown.load(Ordering::Relaxed) || self.cancel.load(Ordering::Relaxed)
+    }
+
+    /// True if the per-write cancel token (not process shutdown) is set.
+    /// Used to map command-failed errors to `HelperError::Cancelled`.
+    pub fn cancel_set(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
+    }
+
+    /// Construct from process shutdown only (no per-write token). Used by
+    /// tests; production sites always own a per-write token via
+    /// `run_with_write_slot`.
+    #[allow(dead_code)]
+    pub fn shutdown_only(shutdown: Arc<AtomicBool>) -> Self {
+        Self {
+            shutdown,
+            cancel: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+/// Information about a write command in flight on this helper.
+///
+/// Per Security S3 option (a): NO `child_pid` field. The PID stays on the
+/// writer's stack inside `run_command_streaming`; signals are issued from
+/// there before any `wait()` call, so the kernel cannot recycle the PID.
+pub struct InFlightOp {
+    pub op: String,
+    pub args: Vec<String>,
+    pub started_at: String,
+    pub cancel_token: Arc<AtomicBool>,
+}
+
+/// Shared write-mutex state. The `Mutex` guards the `Option`, NOT the running
+/// command — claiming the slot is `lock → check None → insert`, releasing is
+/// `lock → set None`. The writer holds NEITHER the mutex nor any lock during
+/// the long-running command body, so reads (`status`) and `cancel` always
+/// observe state without contention.
+pub struct WriteState {
+    pub in_flight: Option<InFlightOp>,
+}
+
+impl WriteState {
+    pub fn new() -> Self {
+        Self { in_flight: None }
+    }
+}
+
+impl Default for WriteState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// RAII guard that clears `WriteState.in_flight` on drop. Ensures the slot is
+/// released on ANY exit path (success, error, panic). Cancel never lock-steals
+/// the slot — only the writer (via this guard) clears it.
+struct WriteSlotGuard<'a> {
+    state: &'a Mutex<WriteState>,
+}
+
+impl Drop for WriteSlotGuard<'_> {
+    fn drop(&mut self) {
+        let mut g = lock_recovered(self.state);
+        g.in_flight = None;
+    }
+}
+
+/// Snapshot of the in-flight op for a `status` response (per Security S4
+/// snapshot consistency). Cloned under lock, lock dropped, snapshot returned —
+/// the rest of `cmd_status` proceeds without holding the mutex.
+///
+/// `cancel_pending` is loaded from the in-flight op's `cancel_token` while
+/// the lock is still held, so the snapshot is a single-acquisition consistent
+/// view of (op, args, started_at, cancel_pending).
+pub struct BusyHint {
+    pub op: String,
+    pub args: Vec<String>,
+    pub started_at: String,
+    pub cancel_pending: bool,
+}
 
 /// Runtime context for command execution.
 pub struct Context {
@@ -44,6 +222,23 @@ pub struct Context {
     pub host_gateway_ip: Option<String>,
     /// Shutdown flag — set by signal handler, checked during long-running commands.
     pub shutdown: Arc<AtomicBool>,
+    /// Shared write-mutex state — `None` when idle, `Some(InFlightOp)` when a
+    /// write command is running. Reads/cancel observe; only the writer sets it.
+    pub write_state: Arc<Mutex<WriteState>>,
+}
+
+impl Context {
+    /// Snapshot the in-flight op (or `None` if idle). Lock is held only for
+    /// the duration of the clone; the snapshot is returned by value.
+    pub fn snapshot_busy(&self) -> Option<BusyHint> {
+        let g = lock_recovered(&self.write_state);
+        g.in_flight.as_ref().map(|o| BusyHint {
+            op: o.op.clone(),
+            args: o.args.clone(),
+            started_at: o.started_at.clone(),
+            cancel_pending: o.cancel_token.load(Ordering::Relaxed),
+        })
+    }
 }
 
 /// Detected container runtime.
@@ -116,6 +311,9 @@ pub fn check_prerequisites() -> Result<ContainerRuntime, HelperError> {
 /// Sends a `CommandStarted` message, streams stdout/stderr as `StreamLine` messages,
 /// and returns a `CommandResult` with exit code, duration, and optional data.
 /// The caller is responsible for writing the `CommandResult` to the socket.
+///
+/// Write commands serialize on `ctx.write_state` (per Operations + Security).
+/// Reads (`Status`) and control (`Cancel`) bypass the lock entirely.
 pub fn execute(cmd: &HelperCommand, ctx: &Context, writer: &mut dyn Write) -> CommandResult {
     let start = Instant::now();
     let cmd_name = cmd.name();
@@ -130,13 +328,18 @@ pub fn execute(cmd: &HelperCommand, ctx: &Context, writer: &mut dyn Write) -> Co
         eprintln!("[devloop-helper] failed to send started message: {e}");
     }
 
-    let result = match cmd {
-        HelperCommand::Setup { skip_observability } => cmd_setup(ctx, *skip_observability, writer),
-        HelperCommand::Rebuild(svc) => cmd_rebuild(ctx, *svc, writer).map(|()| None),
-        HelperCommand::RebuildAll => cmd_rebuild_all(ctx, writer).map(|()| None),
-        HelperCommand::Deploy(svc) => cmd_deploy(ctx, *svc, writer).map(|()| None),
-        HelperCommand::Teardown => cmd_teardown(ctx, writer).map(|()| None),
-        HelperCommand::Status => cmd_status(ctx),
+    let result = if cmd.is_write() {
+        run_with_write_slot(cmd, ctx, writer)
+    } else {
+        // Reads + control commands bypass the write mutex.
+        match cmd {
+            HelperCommand::Status => cmd_status(ctx),
+            HelperCommand::Cancel => cmd_cancel(ctx),
+            other => Err(HelperError::InvalidCommand(format!(
+                "non-write command not handled: {}",
+                other.name()
+            ))),
+        }
     };
 
     let duration_ms = start.elapsed().as_millis() as u64;
@@ -147,15 +350,246 @@ pub fn execute(cmd: &HelperCommand, ctx: &Context, writer: &mut dyn Write) -> Co
             exit_code: Some(0),
             duration_ms,
             error: None,
+            error_kind: None,
             data,
         },
-        Err(e) => CommandResult {
-            result: CommandOutcome::Error,
-            exit_code: None,
-            duration_ms,
-            error: Some(e.to_string()),
-            data: None,
-        },
+        Err(e) => {
+            // For Busy errors, also surface the structured op/args via data
+            // so the streaming protocol matches what `Response::err` would
+            // emit on the unary side (per Obs O1 wire-shape consistency).
+            let data = match &e {
+                HelperError::Busy { op, args } => Some(serde_json::json!({
+                    "op": op,
+                    "args": args,
+                })),
+                _ => None,
+            };
+            CommandResult {
+                result: CommandOutcome::Error,
+                exit_code: None,
+                duration_ms,
+                error: Some(e.to_string()),
+                error_kind: Some(e.kind().to_string()),
+                data,
+            }
+        }
+    }
+}
+
+/// Try to claim the write slot, run the command, release the slot via
+/// `WriteSlotGuard` on any exit path. Returns `HelperError::Busy` if another
+/// write is already in flight (per Security S1 + Obs O1 collision-pair).
+/// Returns `HelperError::Cancelled` if the per-write cancel token was set
+/// during execution.
+fn run_with_write_slot(
+    cmd: &HelperCommand,
+    ctx: &Context,
+    writer: &mut dyn Write,
+) -> Result<Option<serde_json::Value>, HelperError> {
+    let cancel_token = Arc::new(AtomicBool::new(false));
+
+    // Try to claim the slot.
+    {
+        let mut g = lock_recovered(&ctx.write_state);
+        if let Some(in_flight) = g.in_flight.as_ref() {
+            return Err(HelperError::Busy {
+                op: in_flight.op.clone(),
+                args: in_flight.args.clone(),
+            });
+        }
+        g.in_flight = Some(InFlightOp {
+            op: cmd.name().to_string(),
+            args: cmd.args_for_log(),
+            started_at: now_rfc3339(),
+            cancel_token: Arc::clone(&cancel_token),
+        });
+    }
+    // RAII: clear the slot on any exit path (success/error/panic).
+    let _guard = WriteSlotGuard {
+        state: &ctx.write_state,
+    };
+
+    let signal = CancelSignal::new(Arc::clone(&ctx.shutdown), Arc::clone(&cancel_token));
+
+    let result = match cmd {
+        HelperCommand::Setup { skip_observability } => {
+            cmd_setup(ctx, *skip_observability, writer, &signal)
+        }
+        HelperCommand::Rebuild(svc) => cmd_rebuild(ctx, *svc, writer, &signal).map(|()| None),
+        HelperCommand::RebuildAll => cmd_rebuild_all(ctx, writer, &signal).map(|()| None),
+        HelperCommand::Deploy(svc) => cmd_deploy(ctx, *svc, writer, &signal).map(|()| None),
+        HelperCommand::Teardown => cmd_teardown(ctx, writer, &signal).map(|()| None),
+        #[cfg(test)]
+        HelperCommand::TestSleep { seconds } => {
+            cmd_test_sleep(ctx, *seconds, writer, &signal).map(|()| None)
+        }
+        #[cfg(test)]
+        HelperCommand::TestSleepIgnoringTerm { seconds } => {
+            cmd_test_sleep_ignoring_term(ctx, *seconds, writer, &signal).map(|()| None)
+        }
+        #[cfg(test)]
+        HelperCommand::TestSleepWithChild { seconds } => {
+            cmd_test_sleep_with_child(ctx, *seconds, writer, &signal).map(|()| None)
+        }
+        #[cfg(test)]
+        HelperCommand::TestSleepWithChildIgnoringTerm { seconds } => {
+            cmd_test_sleep_with_child_ignoring_term(ctx, *seconds, writer, &signal).map(|()| None)
+        }
+        // The match in `execute` above ensures non-write commands never reach here.
+        other => Err(HelperError::InvalidRequest(format!(
+            "internal: write dispatcher reached non-write command {}",
+            other.name()
+        ))),
+    };
+
+    // Map command-failed errors to HelperError::Cancelled when the per-write
+    // cancel token was set during execution. Process-shutdown does NOT remap
+    // (we're going down; the helper's exit path swallows it).
+    result.map_err(|e| {
+        if signal.cancel_set() {
+            // The escalation flag will be set by run_command_streaming when
+            // SIGKILL was needed. Default to false here; the streaming path
+            // sets it via a more direct mechanism if needed (we lose the
+            // signal-vs-escalated distinction across the error boundary in
+            // the rare case where command_failed fires before SIGTERM was
+            // even sent, which is fine — clean cancel string).
+            match &e {
+                HelperError::Cancelled { .. } => e,
+                _ => HelperError::Cancelled { escalated: false },
+            }
+        } else {
+            e
+        }
+    })
+}
+
+/// Test-only: run `sleep N` via run_command_streaming so the concurrency
+/// tests exercise the real cancel-token + child-kill path. Spawn `sleep`
+/// directly (NOT via /bin/sh) so SIGTERM goes to the actual sleeping
+/// process — some shells fork+wait instead of exec, which would mask
+/// signal delivery.
+#[cfg(test)]
+fn cmd_test_sleep(
+    ctx: &Context,
+    seconds: u64,
+    writer: &mut dyn Write,
+    signal: &CancelSignal,
+) -> Result<(), HelperError> {
+    eprintln!("[devloop-helper] test-sleep: sleeping for {seconds}s");
+    let _ = ctx; // unused
+    let mut cmd = Command::new("sleep");
+    cmd.arg(seconds.to_string());
+    run_command_streaming(&mut cmd, "test-sleep", writer, signal)
+}
+
+/// Test-only: shell stub that traps SIGTERM and then sleeps. Forces
+/// `run_command_streaming` to wait `CANCEL_GRACEFUL_TIMEOUT` and escalate
+/// to SIGKILL — exercising the `escalated: true` branch of
+/// `HelperError::Cancelled` (Security S5).
+#[cfg(test)]
+fn cmd_test_sleep_ignoring_term(
+    ctx: &Context,
+    seconds: u64,
+    writer: &mut dyn Write,
+    signal: &CancelSignal,
+) -> Result<(), HelperError> {
+    eprintln!("[devloop-helper] test-sleep-ignoring-term: blocking for up to {seconds}s with TERM trapped");
+    let _ = ctx;
+    // Busy-loop in the shell itself (no `sleep` child) so SIGKILL on the
+    // shell terminates everything that holds the stdout/stderr pipes —
+    // otherwise an orphaned `sleep` keeps the pipes open and the reader
+    // threads never see EOF.
+    let mut cmd = Command::new("/bin/sh");
+    cmd.arg("-c").arg(format!(
+        "trap '' TERM; i=0; max=$(( {seconds} * 1000000 )); \
+         while [ $i -lt $max ]; do i=$(( i + 1 )); done"
+    ));
+    run_command_streaming(&mut cmd, "test-sleep-ignoring-term", writer, signal)
+}
+
+/// Test-only: spawn `bash -c 'sleep N & wait'` so a forked grandchild
+/// inherits stdout/stderr. Without process-group SIGTERM, killing only the
+/// immediate `bash` would leave the orphaned `sleep` holding the pipes
+/// open until natural exit (~N seconds). With `process_group(0)` +
+/// `kill(-pgid, SIGTERM)` the grandchild is reached and cancel completes
+/// promptly. This stub validates the iter-2 process-group cancel path.
+#[cfg(test)]
+fn cmd_test_sleep_with_child(
+    ctx: &Context,
+    seconds: u64,
+    writer: &mut dyn Write,
+    signal: &CancelSignal,
+) -> Result<(), HelperError> {
+    eprintln!("[devloop-helper] test-sleep-with-child: bash forking sleep {seconds}");
+    let _ = ctx;
+    let mut cmd = Command::new("bash");
+    cmd.arg("-c").arg(format!("sleep {seconds} & wait"));
+    run_command_streaming(&mut cmd, "test-sleep-with-child", writer, signal)
+}
+
+/// Test-only: TERM-trapped bash with a backgrounded `sleep` grandchild.
+/// Forces both the SIGKILL escalation branch AND the grandchild reach via
+/// process-group SIGKILL — so a successful cancel proves the SIGKILL path
+/// also signals via pgid (not just the cooperative SIGTERM path).
+#[cfg(test)]
+fn cmd_test_sleep_with_child_ignoring_term(
+    ctx: &Context,
+    seconds: u64,
+    writer: &mut dyn Write,
+    signal: &CancelSignal,
+) -> Result<(), HelperError> {
+    eprintln!("[devloop-helper] test-sleep-with-child-ignoring-term: trapped bash forking sleep {seconds}");
+    let _ = ctx;
+    let mut cmd = Command::new("bash");
+    cmd.arg("-c")
+        .arg(format!("trap '' TERM; sleep {seconds} & wait"));
+    run_command_streaming(
+        &mut cmd,
+        "test-sleep-with-child-ignoring-term",
+        writer,
+        signal,
+    )
+}
+
+/// Cancel: signal the in-flight write to abort. Idempotent — returns no-op
+/// success when no write is running. Auth-gated like every other command
+/// (the parse layer + handle_connection enforce token validation per CR9).
+///
+/// Cancel does NOT lock-steal the write slot — only the writer (via
+/// `WriteSlotGuard::drop`) clears it. Cancel just flips the per-write cancel
+/// token; the writer thread (which alone holds `Child`) does the SIGTERM
+/// inside `run_command_streaming`. This closes Security S3's PID-recycle
+/// TOCTOU because no PID ever crosses thread boundaries.
+fn cmd_cancel(ctx: &Context) -> Result<Option<serde_json::Value>, HelperError> {
+    let snapshot = {
+        let g = lock_recovered(&ctx.write_state);
+        g.in_flight.as_ref().map(|o| {
+            (
+                o.op.clone(),
+                o.args.clone(),
+                o.started_at.clone(),
+                Arc::clone(&o.cancel_token),
+            )
+        })
+    };
+    match snapshot {
+        Some((op, args, started_at, cancel_token)) => {
+            cancel_token.store(true, Ordering::SeqCst);
+            eprintln!("[devloop-helper] cancel: signalled in-flight {op}");
+            Ok(Some(serde_json::json!({
+                "cancelled": true,
+                "op": op,
+                "args": args,
+                "started_at": started_at,
+            })))
+        }
+        None => {
+            eprintln!("[devloop-helper] cancel: no write in flight (no-op)");
+            Ok(Some(serde_json::json!({
+                "cancelled": false,
+                "reason": "no-op",
+            })))
+        }
     }
 }
 
@@ -179,6 +613,7 @@ fn cmd_setup(
     ctx: &Context,
     skip_observability: bool,
     writer: &mut dyn Write,
+    signal: &CancelSignal,
 ) -> Result<Option<serde_json::Value>, HelperError> {
     eprintln!("[devloop-helper] setup: allocating ports...");
     let alloc = ports::allocate_ports(&ctx.slug, &ctx.registry_path)?;
@@ -256,7 +691,7 @@ fn cmd_setup(
                 .env(env_key, env_val),
             "kind create cluster",
             writer,
-            &ctx.shutdown,
+            signal,
         )?;
     }
 
@@ -281,7 +716,7 @@ fn cmd_setup(
         setup_cmd.arg("--skip-observability");
     }
 
-    run_command_streaming(&mut setup_cmd, "setup.sh", writer, &ctx.shutdown)?;
+    run_command_streaming(&mut setup_cmd, "setup.sh", writer, signal)?;
 
     // Generate kubeconfig for container access (ADR-0030/0031).
     // Rewrites the API server URL to use host.containers.internal and the
@@ -529,8 +964,15 @@ fn parse_pod_health(json_str: &str) -> Result<PodHealthSummary, String> {
 }
 
 /// Status: read-only health check — cluster exists, pods healthy, ports.json.
+///
+/// Snapshots `WriteState` at request time (per Security S4) so the busy hint
+/// is consistent: lock held only for the field clones, dropped before the
+/// kubectl call. Status NEVER blocks on the write mutex.
 fn cmd_status(ctx: &Context) -> Result<Option<serde_json::Value>, HelperError> {
     eprintln!("[devloop-helper] status: checking cluster health...");
+
+    // 0. Snapshot busy hint BEFORE any blocking work (lock dropped immediately).
+    let busy = ctx.snapshot_busy();
 
     // 1. Check if Kind cluster exists
     let cluster_exists = match cluster_already_exists(&ctx.cluster_name) {
@@ -590,19 +1032,14 @@ fn cmd_status(ctx: &Context) -> Result<Option<serde_json::Value>, HelperError> {
         None
     };
 
-    // 4. Check if setup is in progress (PID file from eager setup)
-    let setup_in_progress = {
-        let setup_pid_path = ctx.runtime_dir.join("setup.pid");
-        if let Ok(pid_str) = fs::read_to_string(&setup_pid_path) {
-            if let Ok(pid) = pid_str.trim().parse::<u32>() {
-                unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
-            } else {
-                false
-            }
-        } else {
-            false
-        }
-    };
+    // 4. Setup-in-progress is true iff a setup write is currently holding the
+    // mutex. Sourcing from the mutex (instead of the legacy `setup.pid` heuristic
+    // owned by devloop.sh's eager-setup wrapper) means the field reflects what
+    // the helper actually sees in flight — including manual `dev-cluster setup`
+    // invocations that never wrote a setup.pid. The `setup.pid` file still
+    // exists and is still maintained by devloop.sh for its own wrapper-lifecycle
+    // tracking; cmd_status simply doesn't consult it any more.
+    let setup_in_progress = busy.as_ref().is_some_and(|b| b.op == "setup");
 
     // Build response data — construct fully to avoid indexing (clippy::indexing_slicing)
     let pod_summary_val = pod_summary.map(|summary| {
@@ -613,6 +1050,20 @@ fn cmd_status(ctx: &Context) -> Result<Option<serde_json::Value>, HelperError> {
         })
     });
 
+    // Per CR11: busy/in_flight always emitted (no skip_serializing_if), so
+    // newer clients can distinguish "old helper, field absent" from "new
+    // helper, idle" deterministically. `cancel_pending` follows the same
+    // wire-determinism rule and is emitted at the top level (not nested
+    // under in_flight) so the idle case has nowhere awkward for it to live.
+    let in_flight_val = busy.as_ref().map(|b| {
+        serde_json::json!({
+            "op": b.op,
+            "args": b.args,
+            "started_at": b.started_at,
+        })
+    });
+    let cancel_pending = busy.as_ref().is_some_and(|b| b.cancel_pending);
+
     let data = serde_json::json!({
         "cluster_exists": cluster_exists,
         "pods_healthy": pods_healthy,
@@ -621,13 +1072,21 @@ fn cmd_status(ctx: &Context) -> Result<Option<serde_json::Value>, HelperError> {
         "pod_summary": pod_summary_val,
         "pod_error": pod_error,
         "ports": ports,
+        "busy": busy.is_some(),
+        "cancel_pending": cancel_pending,
+        "in_flight": in_flight_val,
     });
 
     Ok(Some(data))
 }
 
 /// Rebuild: build one service image, load into Kind, restart deployment.
-fn cmd_rebuild(ctx: &Context, svc: Service, writer: &mut dyn Write) -> Result<(), HelperError> {
+fn cmd_rebuild(
+    ctx: &Context,
+    svc: Service,
+    writer: &mut dyn Write,
+    signal: &CancelSignal,
+) -> Result<(), HelperError> {
     eprintln!("[devloop-helper] rebuild: building {}...", svc);
 
     // Build image
@@ -641,28 +1100,37 @@ fn cmd_rebuild(ctx: &Context, svc: Service, writer: &mut dyn Write) -> Result<()
             .arg(&ctx.project_root),
         &format!("{} build {}", ctx.container_runtime.as_str(), svc),
         writer,
-        &ctx.shutdown,
+        signal,
     )?;
 
     // Load into Kind
-    load_image_to_kind(ctx, svc.image_tag(), writer)?;
+    load_image_to_kind(ctx, svc.image_tag(), writer, signal)?;
 
     // Restart deployment
-    restart_deployment(ctx, svc, writer)?;
+    restart_deployment(ctx, svc, writer, signal)?;
 
     Ok(())
 }
 
 /// Rebuild all service images.
-fn cmd_rebuild_all(ctx: &Context, writer: &mut dyn Write) -> Result<(), HelperError> {
+fn cmd_rebuild_all(
+    ctx: &Context,
+    writer: &mut dyn Write,
+    signal: &CancelSignal,
+) -> Result<(), HelperError> {
     for svc in &Service::ALL {
-        cmd_rebuild(ctx, *svc, writer)?;
+        cmd_rebuild(ctx, *svc, writer, signal)?;
     }
     Ok(())
 }
 
 /// Deploy: apply manifests only via setup.sh --skip-build --only.
-fn cmd_deploy(ctx: &Context, svc: Service, writer: &mut dyn Write) -> Result<(), HelperError> {
+fn cmd_deploy(
+    ctx: &Context,
+    svc: Service,
+    writer: &mut dyn Write,
+    signal: &CancelSignal,
+) -> Result<(), HelperError> {
     eprintln!("[devloop-helper] deploy: applying manifests for {}...", svc);
 
     let (env_key, env_val) = ctx.container_runtime.kind_provider_env();
@@ -688,14 +1156,18 @@ fn cmd_deploy(ctx: &Context, svc: Service, writer: &mut dyn Write) -> Result<(),
             .env(env_key, env_val),
         &format!("setup.sh --skip-build --only {svc}"),
         writer,
-        &ctx.shutdown,
+        signal,
     )?;
 
     Ok(())
 }
 
 /// Teardown: delete Kind cluster, clean up all state.
-fn cmd_teardown(ctx: &Context, writer: &mut dyn Write) -> Result<(), HelperError> {
+fn cmd_teardown(
+    ctx: &Context,
+    writer: &mut dyn Write,
+    signal: &CancelSignal,
+) -> Result<(), HelperError> {
     eprintln!(
         "[devloop-helper] teardown: deleting cluster '{}'...",
         ctx.cluster_name
@@ -713,13 +1185,10 @@ fn cmd_teardown(ctx: &Context, writer: &mut dyn Write) -> Result<(), HelperError
             .env(env_key, env_val),
         "kind delete cluster",
         writer,
-        &ctx.shutdown,
+        signal,
     );
 
-    if let Err(ref e) = result {
-        eprintln!("[devloop-helper] teardown: kind delete cluster warning: {e}");
-        // Continue with cleanup even if kind delete fails
-    }
+    propagate_teardown_kind_result(result)?;
 
     // Remove from port registry
     if let Err(e) = ports::deallocate_ports(&ctx.slug, &ctx.registry_path) {
@@ -729,11 +1198,28 @@ fn cmd_teardown(ctx: &Context, writer: &mut dyn Write) -> Result<(), HelperError
     Ok(())
 }
 
+/// Decide whether `kind delete cluster`'s outcome should abort teardown or be
+/// swallowed so port-deallocation can proceed. `Cancelled` MUST propagate —
+/// port-deallocation is destructive, and the audit log / outcome must reflect
+/// that the op was cancelled, not completed. Every other error is logged and
+/// swallowed so the user can recover from a partial Kind state.
+fn propagate_teardown_kind_result(result: Result<(), HelperError>) -> Result<(), HelperError> {
+    match result {
+        Err(e @ HelperError::Cancelled { .. }) => Err(e),
+        Err(ref e) => {
+            eprintln!("[devloop-helper] teardown: kind delete cluster warning: {e}");
+            Ok(())
+        }
+        Ok(()) => Ok(()),
+    }
+}
+
 /// Load a container image into the Kind cluster.
 fn load_image_to_kind(
     ctx: &Context,
     image_tag: &str,
     writer: &mut dyn Write,
+    signal: &CancelSignal,
 ) -> Result<(), HelperError> {
     let (env_key, env_val) = ctx.container_runtime.kind_provider_env();
 
@@ -749,7 +1235,7 @@ fn load_image_to_kind(
                     .arg(&tmp_path),
                 &format!("podman save {image_tag}"),
                 writer,
-                &ctx.shutdown,
+                signal,
             )?;
             let result = run_command_streaming(
                 Command::new("kind")
@@ -761,7 +1247,7 @@ fn load_image_to_kind(
                     .env(env_key, env_val),
                 "kind load image-archive",
                 writer,
-                &ctx.shutdown,
+                signal,
             );
             let _ = fs::remove_file(&tmp_path);
             result?;
@@ -777,7 +1263,7 @@ fn load_image_to_kind(
                     .env(env_key, env_val),
                 "kind load docker-image",
                 writer,
-                &ctx.shutdown,
+                signal,
             )?;
         }
     }
@@ -789,6 +1275,7 @@ fn restart_deployment(
     ctx: &Context,
     svc: Service,
     writer: &mut dyn Write,
+    signal: &CancelSignal,
 ) -> Result<(), HelperError> {
     let kubectl_ctx = format!("kind-{}", ctx.cluster_name);
 
@@ -805,7 +1292,7 @@ fn restart_deployment(
                     .arg("dark-tower"),
                 "kubectl rollout restart ac-service",
                 writer,
-                &ctx.shutdown,
+                signal,
             )?;
         }
         Service::Gc => {
@@ -820,7 +1307,7 @@ fn restart_deployment(
                     .arg("dark-tower"),
                 "kubectl rollout restart gc-service",
                 writer,
-                &ctx.shutdown,
+                signal,
             )?;
         }
         Service::Mc => {
@@ -836,7 +1323,7 @@ fn restart_deployment(
                         .arg("dark-tower"),
                     &format!("kubectl rollout restart mc-{i}"),
                     writer,
-                    &ctx.shutdown,
+                    signal,
                 )?;
             }
         }
@@ -853,7 +1340,7 @@ fn restart_deployment(
                         .arg("dark-tower"),
                     &format!("kubectl rollout restart mh-{i}"),
                     writer,
-                    &ctx.shutdown,
+                    signal,
                 )?;
             }
         }
@@ -924,13 +1411,17 @@ fn pipe_reader(
 ///
 /// Uses an mpsc channel: two reader threads send `StreamMsg` values, and this
 /// function (on the calling thread) receives them and writes JSON lines to the
-/// writer. The calling thread checks the `shutdown` flag for SIGTERM.
+/// writer. The calling thread checks the `shutdown` flag for SIGTERM and the
+/// per-write cancel token for `cancel`-driven termination.
 ///
-/// On broken pipe (client disconnect) or SIGTERM: the child is killed via
-/// `Child::kill()` (SIGKILL — immediate, non-catchable). The output is lost
-/// anyway when the client disconnects, and idempotent re-runs handle recovery.
-/// The launcher (devloop.sh) sends SIGTERM first; if the helper doesn't exit
-/// within its timeout, devloop.sh escalates to SIGKILL.
+/// Cancel/shutdown send signals to the child's *process group* (negative-pgid
+/// `libc::kill`) so they reach grandchildren that inherited stdout/stderr —
+/// e.g. `kubectl wait` spawned by `setup.sh`. Without this, an immediate-child
+/// SIGKILL would leave grandchildren holding the pipes open, blocking the
+/// reader threads on `read()` until the orphan exited (~60 s in practice).
+/// The child is spawned with `Command::process_group(0)` so it becomes the
+/// leader of a new group with `pgid == child.id()`; helper's own pgid is
+/// unaffected.
 ///
 /// SAFETY: Child processes must not receive the auth token in their environment.
 /// Only DT_CLUSTER_NAME, DT_PORT_MAP (file path), and KIND_EXPERIMENTAL_PROVIDER
@@ -939,8 +1430,13 @@ fn run_command_streaming(
     cmd: &mut Command,
     description: &str,
     writer: &mut dyn Write,
-    shutdown: &AtomicBool,
+    signal: &CancelSignal,
 ) -> Result<(), HelperError> {
+    // Configure the child to call setpgid(0, 0) post-fork pre-exec, making
+    // it the leader of a new group with pgid == child.id(). Helper's own
+    // pgid is unaffected. We then signal -pgid to reach grandchildren that
+    // inherit our stdout/stderr pipes (kubectl wait, etc.).
+    cmd.process_group(0);
     let mut child = cmd
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -981,6 +1477,14 @@ fn run_command_streaming(
     let mut done_count = 0u8;
     let mut write_failed = false;
     let mut child_killed = false;
+    // Cancellation tracking. When the per-write cancel token (NOT process
+    // shutdown) is set, we send SIGTERM, wait up to CANCEL_GRACEFUL_TIMEOUT,
+    // then escalate to SIGKILL. `cancel_termed` records that we sent SIGTERM
+    // (so we don't re-send), `term_at` records when, `escalated` records
+    // whether SIGKILL was needed.
+    let mut cancel_termed = false;
+    let mut term_at: Option<Instant> = None;
+    let mut escalated = false;
 
     loop {
         match receiver.recv_timeout(Duration::from_millis(50)) {
@@ -989,10 +1493,16 @@ fn run_command_streaming(
                     if let Err(e) = send_json_line(writer, &stream_line) {
                         eprintln!("[devloop-helper] stream write failed: {e}");
                         write_failed = true;
-                        // Kill the child — output is lost, idempotent re-run handles recovery
+                        // Broken-pipe path: the client disconnected. Process-group SIGKILL —
+                        // same mechanic as process-shutdown — to ensure grandchildren don't
+                        // hold pipes open and wedge the reader threads. No graceful-grace
+                        // window (client is gone; no need to be polite); this is strictly
+                        // more aggressive than cancel, not less.
                         if !child_killed {
-                            // SIGKILL (not SIGTERM) — immediate termination
-                            let _ = child.kill();
+                            if let Err(e) = signal_process_group(&child, libc::SIGKILL) {
+                                eprintln!("[devloop-helper] signal_process_group broken-pipe fallback: {e}");
+                                let _ = child.kill();
+                            }
                             child_killed = true;
                         }
                     }
@@ -1012,12 +1522,91 @@ fn run_command_streaming(
             }
         }
 
-        // Kill child on SIGTERM
-        if !child_killed && shutdown.load(Ordering::Relaxed) {
-            // SIGKILL (not SIGTERM) — immediate termination; idempotent re-run handles recovery
-            let _ = child.kill();
-            child_killed = true;
-            // Don't break — let the reader threads drain and send Done
+        // IMPORTANT: cancel/shutdown kill semantics (per CR12 + Security S5).
+        //
+        // 1. WHAT GETS KILLED: the whole process group of the write child —
+        //    `setup.sh` plus its kubectl/kind/shell descendants. We do NOT
+        //    reach the Kind cluster's containerd/kubelet/etcd: those run
+        //    inside Kind's container as detached components managed by the
+        //    cluster's PID 1, not as descendants of setup.sh, and were
+        //    never in our process group. (Iter-1's framing claimed they
+        //    were children of setup.sh — that was wrong; iter-2 corrects
+        //    the model and the 2 s grace window's justification.)
+        //
+        // 2. WHY PROCESS-GROUP, NOT IMMEDIATE-CHILD: grandchildren inherit
+        //    stdout/stderr from the bash/setup.sh leader. Killing only the
+        //    leader leaves orphan grandchildren holding the pipes open;
+        //    `read()` on the reader threads then blocks until the orphans
+        //    exit naturally (~60 s observed in pre-iter-2 dev-cluster
+        //    cancel). pgid-signalling reaches the whole shell tree, the
+        //    pipes close, the reader threads see EOF, and cancel completes
+        //    promptly.
+        //
+        // 3. CANCEL vs SHUTDOWN: same kill mechanic (process-group signal),
+        //    different timing.
+        //    - Cancel-token (per-write, set by `cmd_cancel`): SIGTERM to
+        //      the group, CANCEL_GRACEFUL_TIMEOUT (2 s) grace, then
+        //      escalate to SIGKILL of the group. The 2 s window matches
+        //      the cooperative shell/kubectl tree's typical SIGTERM
+        //      response. Partial-Kind state is recovered via setup.sh's
+        //      "cluster exists, reusing" branch on the next setup.
+        //    - Process-shutdown (helper-wide, set by SIGTERM/SIGINT to
+        //      the helper): SIGKILL of the group immediately. We're going
+        //      down; no time for a 2 s grace window.
+        if !child_killed {
+            if signal.cancel.load(Ordering::Relaxed) && !cancel_termed {
+                // Sole signaller of `child` lives on this stack; PID cannot
+                // be recycled because we have not called wait() (Security
+                // S3-(a)). Signal the process group so kubectl-and-friends
+                // grandchildren are reached.
+                match signal_process_group(&child, libc::SIGTERM) {
+                    Ok(()) => {
+                        cancel_termed = true;
+                        term_at = Some(Instant::now());
+                    }
+                    Err(e) => {
+                        // Pathological PID (>i32::MAX or i32::MIN) — fall back
+                        // to single-PID SIGKILL of the leader. Best effort;
+                        // any grandchildren leak until next sweep.
+                        eprintln!("[devloop-helper] signal_process_group failed, falling back to child.kill(): {e}");
+                        let _ = child.kill();
+                        child_killed = true;
+                        escalated = true;
+                    }
+                }
+            } else if cancel_termed {
+                // Check escalation window.
+                if let Some(t0) = term_at {
+                    if t0.elapsed() >= CANCEL_GRACEFUL_TIMEOUT {
+                        // Child still alive after SIGTERM grace window — escalate.
+                        match child.try_wait() {
+                            Ok(Some(_)) => {
+                                // Child exited cleanly within the window.
+                                child_killed = true;
+                            }
+                            Ok(None) | Err(_) => {
+                                if let Err(e) = signal_process_group(&child, libc::SIGKILL) {
+                                    eprintln!("[devloop-helper] signal_process_group SIGKILL fallback: {e}");
+                                    let _ = child.kill();
+                                }
+                                child_killed = true;
+                                escalated = true;
+                            }
+                        }
+                    } else if let Ok(Some(_)) = child.try_wait() {
+                        // Child exited gracefully before the window expired.
+                        child_killed = true;
+                    }
+                }
+            } else if signal.shutdown.load(Ordering::Relaxed) {
+                // Process shutdown — SIGKILL-immediate (asymmetry, see above).
+                // Signal the group so grandchildren don't outlive the helper.
+                if let Err(e) = signal_process_group(&child, libc::SIGKILL) {
+                    eprintln!("[devloop-helper] signal_process_group shutdown fallback: {e}");
+                    let _ = child.kill();
+                }
+                child_killed = true;
+            }
         }
     }
 
@@ -1044,6 +1633,12 @@ fn run_command_streaming(
             cmd: description.to_string(),
             detail: "stream write failed: client disconnected".to_string(),
         });
+    }
+
+    // If the cancel token fired, return Cancelled (not generic CommandFailed)
+    // so the audit log carries the prefix-`cancelled` invariant.
+    if signal.cancel_set() {
+        return Err(HelperError::Cancelled { escalated });
     }
 
     if !status.success() {
@@ -1083,13 +1678,13 @@ mod tests {
     /// Helper: run a command via run_command_streaming, collecting all output
     /// written to the writer as individual JSON lines.
     fn collect_streaming_output(args: &[&str]) -> (Result<(), HelperError>, Vec<String>) {
-        let shutdown = AtomicBool::new(false);
+        let signal = CancelSignal::shutdown_only(Arc::new(AtomicBool::new(false)));
         let mut output = Vec::new();
         let result = run_command_streaming(
             Command::new(args[0]).args(&args[1..]),
             "test command",
             &mut output,
-            &shutdown,
+            &signal,
         );
         let lines: Vec<String> = output
             .split(|&b| b == b'\n')
@@ -1222,13 +1817,13 @@ mod tests {
 
     #[test]
     fn test_streaming_nonexistent_binary() {
-        let shutdown = AtomicBool::new(false);
+        let signal = CancelSignal::shutdown_only(Arc::new(AtomicBool::new(false)));
         let mut output = Vec::new();
         let result = run_command_streaming(
             &mut Command::new("/nonexistent/binary/that/does/not/exist"),
             "nonexistent",
             &mut output,
-            &shutdown,
+            &signal,
         );
         assert!(result.is_err());
 
@@ -1347,6 +1942,7 @@ mod tests {
             container_runtime: ContainerRuntime::Podman,
             host_gateway_ip: None,
             shutdown: Arc::new(AtomicBool::new(false)),
+            write_state: Arc::new(Mutex::new(WriteState::new())),
         };
 
         let mut output = Vec::new();
@@ -1634,5 +2230,38 @@ current-context: kind-devloop-test
         assert_eq!(summary.ready, 0);
         assert_eq!(summary.not_ready.len(), 1);
         assert_eq!(summary.not_ready[0].phase, "Pending");
+    }
+
+    /// Cancel-during-teardown invariant (semantic-guard fix at
+    /// `cmd_teardown`): `Cancelled` must NOT be swallowed alongside other
+    /// kind-delete errors. Port-deallocation is destructive, so a swallowed
+    /// Cancelled would falsely report `outcome=completed` and proceed to
+    /// release ports.
+    #[test]
+    fn test_cancel_during_teardown_propagates() {
+        // Cancelled (clean) propagates.
+        let err = propagate_teardown_kind_result(Err(HelperError::Cancelled { escalated: false }))
+            .unwrap_err();
+        assert!(matches!(err, HelperError::Cancelled { escalated: false }));
+
+        // Cancelled (escalated) propagates.
+        let err = propagate_teardown_kind_result(Err(HelperError::Cancelled { escalated: true }))
+            .unwrap_err();
+        assert!(matches!(err, HelperError::Cancelled { escalated: true }));
+    }
+
+    /// Sibling invariant: NON-cancel errors are intentionally swallowed so
+    /// teardown can finish port-deallocation. Pin this so a future "always
+    /// propagate" simplification breaks the test instead of port cleanup.
+    #[test]
+    fn test_teardown_swallows_non_cancel_errors() {
+        let result = propagate_teardown_kind_result(Err(HelperError::CommandFailed {
+            cmd: "kind delete cluster".to_string(),
+            detail: "exit code: 1".to_string(),
+        }));
+        assert!(result.is_ok(), "non-cancel error must be swallowed");
+
+        let result = propagate_teardown_kind_result(Ok(()));
+        assert!(result.is_ok());
     }
 }

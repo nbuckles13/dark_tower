@@ -96,6 +96,31 @@ pub enum HelperCommand {
     Teardown,
     /// Read-only health check: cluster exists, pods healthy, ports.json.
     Status,
+    /// Interrupt the in-flight write handler (idempotent: no-op when idle).
+    Cancel,
+    /// Test-only: sleep for N seconds via /bin/sh.
+    /// Variant exists only under `cfg(test)`; there is NO `Request::parse_command`
+    /// arm so the wire surface stays clean. Tests construct it directly.
+    #[cfg(test)]
+    TestSleep { seconds: u64 },
+    /// Test-only: run a /bin/sh stub that traps SIGTERM (`trap "" TERM`) and
+    /// then sleeps. Used by `test_sigkill_escalation_logged` to exercise the
+    /// 2s SIGTERM-grace-then-SIGKILL path in `run_command_streaming`. Same
+    /// `cfg(test)`-only / no-parse-arm posture as `TestSleep`.
+    #[cfg(test)]
+    TestSleepIgnoringTerm { seconds: u64 },
+    /// Test-only: spawn `bash -c 'sleep <N> & wait'` so a forked grandchild
+    /// inherits stdout/stderr — exercising the iter-2 process-group cancel
+    /// path. Without `process_group(0)` + `kill(-pgid, ...)`, killing the
+    /// immediate `bash` would leave `sleep` holding the pipes open.
+    #[cfg(test)]
+    TestSleepWithChild { seconds: u64 },
+    /// Test-only: spawn `bash -c 'trap "" TERM; sleep <N> & wait'`. SIGTERM-
+    /// trapped bash forces the SIGKILL escalation branch AND there's a
+    /// grandchild — covers both the escalation path and the grandchild reach
+    /// via process-group SIGKILL.
+    #[cfg(test)]
+    TestSleepWithChildIgnoringTerm { seconds: u64 },
 }
 
 impl HelperCommand {
@@ -108,6 +133,15 @@ impl HelperCommand {
             Self::Deploy(_) => "deploy",
             Self::Teardown => "teardown",
             Self::Status => "status",
+            Self::Cancel => "cancel",
+            #[cfg(test)]
+            Self::TestSleep { .. } => "test-sleep",
+            #[cfg(test)]
+            Self::TestSleepIgnoringTerm { .. } => "test-sleep-ignoring-term",
+            #[cfg(test)]
+            Self::TestSleepWithChild { .. } => "test-sleep-with-child",
+            #[cfg(test)]
+            Self::TestSleepWithChildIgnoringTerm { .. } => "test-sleep-with-child-ignoring-term",
         }
     }
 
@@ -122,7 +156,36 @@ impl HelperCommand {
                 }
             }
             Self::Rebuild(svc) | Self::Deploy(svc) => vec![svc.to_string()],
-            Self::RebuildAll | Self::Teardown | Self::Status => vec![],
+            Self::RebuildAll | Self::Teardown | Self::Status | Self::Cancel => vec![],
+            #[cfg(test)]
+            Self::TestSleep { seconds } => vec![seconds.to_string()],
+            #[cfg(test)]
+            Self::TestSleepIgnoringTerm { seconds } => vec![seconds.to_string()],
+            #[cfg(test)]
+            Self::TestSleepWithChild { seconds } => vec![seconds.to_string()],
+            #[cfg(test)]
+            Self::TestSleepWithChildIgnoringTerm { seconds } => vec![seconds.to_string()],
+        }
+    }
+
+    /// Classify this command as a write that must serialize on the per-helper
+    /// write mutex. Reads (`Status`) skip the lock entirely; control commands
+    /// (`Cancel`) signal an in-flight write without acquiring the lock.
+    pub fn is_write(&self) -> bool {
+        match self {
+            Self::Setup { .. }
+            | Self::Rebuild(_)
+            | Self::RebuildAll
+            | Self::Deploy(_)
+            | Self::Teardown => true,
+            Self::Status | Self::Cancel => false,
+            // TestSleep is a write so the test stub exercises the real
+            // write-lock + cancel-token + child-kill paths.
+            #[cfg(test)]
+            Self::TestSleep { .. }
+            | Self::TestSleepIgnoringTerm { .. }
+            | Self::TestSleepWithChild { .. }
+            | Self::TestSleepWithChildIgnoringTerm { .. } => true,
         }
     }
 }
@@ -142,6 +205,19 @@ impl fmt::Display for HelperCommand {
             Self::Deploy(svc) => write!(f, "deploy {svc}"),
             Self::Teardown => write!(f, "teardown"),
             Self::Status => write!(f, "status"),
+            Self::Cancel => write!(f, "cancel"),
+            #[cfg(test)]
+            Self::TestSleep { seconds } => write!(f, "test-sleep {seconds}"),
+            #[cfg(test)]
+            Self::TestSleepIgnoringTerm { seconds } => {
+                write!(f, "test-sleep-ignoring-term {seconds}")
+            }
+            #[cfg(test)]
+            Self::TestSleepWithChild { seconds } => write!(f, "test-sleep-with-child {seconds}"),
+            #[cfg(test)]
+            Self::TestSleepWithChildIgnoringTerm { seconds } => {
+                write!(f, "test-sleep-with-child-ignoring-term {seconds}")
+            }
         }
     }
 }
@@ -225,6 +301,19 @@ impl Request {
                 }
                 Ok(HelperCommand::Status)
             }
+            "cancel" => {
+                if self.service.is_some() {
+                    return Err(HelperError::InvalidRequest(
+                        "cancel command does not accept a service argument".to_string(),
+                    ));
+                }
+                if self.skip_observability {
+                    return Err(HelperError::InvalidRequest(
+                        "cancel command does not accept --skip-observability".to_string(),
+                    ));
+                }
+                Ok(HelperCommand::Cancel)
+            }
             other => Err(HelperError::InvalidCommand(other.to_string())),
         }
     }
@@ -238,7 +327,11 @@ pub struct Response {
     /// Machine-readable error kind (only present on failure).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_kind: Option<String>,
-    /// Optional structured data (e.g., port map on setup success).
+    /// Optional structured data. On success: command-specific result (e.g.,
+    /// port map on setup). On failure with `error_kind == "busy"`: a
+    /// `{op, args}` object naming the in-flight write that blocked this
+    /// request. This is intentionally dual-role to keep the wire schema
+    /// additive — older clients ignore unknown JSON keys.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<serde_json::Value>,
 }
@@ -255,11 +348,21 @@ impl Response {
     }
 
     pub fn err(error: &HelperError) -> Self {
+        // For Busy errors, surface the in-flight op/args as structured data so
+        // clients can render `helper busy with <op>` (per Obs O1; uses the
+        // dual-role `data` field documented above).
+        let data = match error {
+            HelperError::Busy { op, args } => Some(serde_json::json!({
+                "op": op,
+                "args": args,
+            })),
+            _ => None,
+        };
         Self {
             success: false,
             message: error.to_string(),
             error_kind: Some(error.kind().to_string()),
-            data: None,
+            data,
         }
     }
 }
@@ -308,6 +411,12 @@ pub struct CommandResult {
     pub duration_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Machine-readable error kind (matches `HelperError::kind()`) on failure.
+    /// Lets the connection handler emit the right audit-log shape (e.g.,
+    /// `rejected_busy` for `kind == "busy"`, `cancelled` outcome for
+    /// `kind == "cancelled"`) without parsing the human-readable error string.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_kind: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<serde_json::Value>,
 }
@@ -519,6 +628,109 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_command_cancel() {
+        let req = Request {
+            token: "abc123".to_string(),
+            command: "cancel".to_string(),
+            service: None,
+            skip_observability: false,
+        };
+        let cmd = req.parse_command().unwrap();
+        assert_eq!(cmd, HelperCommand::Cancel);
+    }
+
+    #[test]
+    fn test_cancel_rejects_service_arg() {
+        let req = Request {
+            token: "abc123".to_string(),
+            command: "cancel".to_string(),
+            service: Some("ac".to_string()),
+            skip_observability: false,
+        };
+        assert!(req.parse_command().is_err());
+    }
+
+    #[test]
+    fn test_cancel_rejects_skip_observability() {
+        let req = Request {
+            token: "abc123".to_string(),
+            command: "cancel".to_string(),
+            service: None,
+            skip_observability: true,
+        };
+        assert!(req.parse_command().is_err());
+    }
+
+    /// Security S6 + CR5 + Test #1 regression: the cfg(test) `TestSleep`,
+    /// `TestSleepIgnoringTerm`, `TestSleepWithChild`, and
+    /// `TestSleepWithChildIgnoringTerm` variants exist in the enum but MUST
+    /// NOT have parse arms. Any client sending the matching `command` strings
+    /// over the socket gets `invalid_command`, even with `cfg(test)` enabled.
+    /// The fall-through arm in `parse_command` already provides the structural
+    /// guarantee; this test pins all four literal names so a future refactor
+    /// that accidentally adds a parse arm is caught explicitly.
+    #[test]
+    fn test_release_does_not_expose_test_commands() {
+        for name in [
+            "test-sleep",
+            "test-sleep-ignoring-term",
+            "test-sleep-with-child",
+            "test-sleep-with-child-ignoring-term",
+        ] {
+            let json = format!(r#"{{"token":"abcdef","command":"{name}"}}"#);
+            let req: Request = serde_json::from_str(&json).unwrap();
+            let err = req.parse_command().unwrap_err();
+            assert_eq!(err.kind(), "invalid_command", "name={name}");
+            assert!(err.to_string().contains(name), "name={name}, got: {err}");
+        }
+    }
+
+    #[test]
+    fn test_is_write_classification() {
+        assert!(HelperCommand::Setup {
+            skip_observability: false
+        }
+        .is_write());
+        assert!(HelperCommand::Setup {
+            skip_observability: true
+        }
+        .is_write());
+        assert!(HelperCommand::Rebuild(Service::Ac).is_write());
+        assert!(HelperCommand::RebuildAll.is_write());
+        assert!(HelperCommand::Deploy(Service::Gc).is_write());
+        assert!(HelperCommand::Teardown.is_write());
+        assert!(!HelperCommand::Status.is_write());
+        assert!(!HelperCommand::Cancel.is_write());
+        // TestSleep variants are classified as writes so the stubs exercise
+        // the real write-lock + cancel paths.
+        assert!(HelperCommand::TestSleep { seconds: 1 }.is_write());
+        assert!(HelperCommand::TestSleepIgnoringTerm { seconds: 1 }.is_write());
+        assert!(HelperCommand::TestSleepWithChild { seconds: 1 }.is_write());
+        assert!(HelperCommand::TestSleepWithChildIgnoringTerm { seconds: 1 }.is_write());
+    }
+
+    #[test]
+    fn test_busy_response_data_carries_op_and_args() {
+        let err = HelperError::Busy {
+            op: "setup".to_string(),
+            args: vec!["--skip-observability".to_string()],
+        };
+        let resp = Response::err(&err);
+        assert!(!resp.success);
+        assert_eq!(resp.error_kind.as_deref(), Some("busy"));
+        let data = resp.data.expect("busy response must include data");
+        assert_eq!(data["op"], "setup");
+        assert_eq!(data["args"][0], "--skip-observability");
+    }
+
+    #[test]
+    fn test_non_busy_response_omits_data() {
+        let err = HelperError::AuthFailed;
+        let resp = Response::err(&err);
+        assert!(resp.data.is_none());
+    }
+
+    #[test]
     fn test_parse_command_unknown() {
         let req = Request {
             token: "abc123".to_string(),
@@ -726,6 +938,7 @@ mod tests {
             exit_code: Some(0),
             duration_ms: 42000,
             error: None,
+            error_kind: None,
             data: None,
         };
         let json = serde_json::to_string(&result).unwrap();
@@ -743,6 +956,7 @@ mod tests {
             exit_code: Some(1),
             duration_ms: 5000,
             error: Some("setup.sh failed".to_string()),
+            error_kind: Some("command_failed".to_string()),
             data: None,
         };
         let json = serde_json::to_string(&result).unwrap();
@@ -759,6 +973,7 @@ mod tests {
             exit_code: Some(0),
             duration_ms: 1000,
             error: None,
+            error_kind: None,
             data: Some(data.clone()),
         };
         let json = serde_json::to_string(&result).unwrap();
@@ -773,6 +988,7 @@ mod tests {
             exit_code: None,
             duration_ms: 100,
             error: Some("killed by signal".to_string()),
+            error_kind: Some("command_failed".to_string()),
             data: None,
         };
         let json = serde_json::to_string(&result).unwrap();

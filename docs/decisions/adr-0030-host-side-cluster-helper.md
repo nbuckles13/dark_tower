@@ -56,7 +56,15 @@ Host
 
 ### Helper Process
 
-**Implementation**: Compiled Rust binary at `crates/devloop-helper/` in the workspace. Dependencies: `serde_json` (port map, protocol), `std::os::unix::net::UnixListener` (blocking socket). No service crate dependencies. No async runtime needed — one-client-at-a-time semantics are sufficient.
+**Implementation**: Compiled Rust binary at `crates/devloop-helper/` in the workspace. Dependencies: `serde_json` (port map, protocol), `std::os::unix::net::UnixListener` (blocking socket). No service crate dependencies. No async runtime needed — the helper is thread-per-connection on `std::sync::Mutex` + `Arc<AtomicBool>`; concurrency is bounded structurally rather than scheduled.
+
+**Concurrency model** (added 2026-05-03 after R-35 surfaced `status` hangs while `setup` was in flight):
+
+- Read-only commands (`status`, `ports`, `version`) ALWAYS run concurrently with whatever else is in flight. They take no shared lock and snapshot the busy state for inclusion in their response.
+- Write commands (`setup`, `deploy`, `rebuild`, `rebuild-all`, `teardown`) acquire a single per-helper write slot. A second write while one is in flight is rejected with a typed `busy` error carrying the in-flight `op` + `args` so the client can render `helper busy with <op>; run dev-cluster cancel to abort it`.
+- `cancel` flips a per-write `Arc<AtomicBool>` cancel token. The in-flight write thread observes the token in `run_command_streaming`, sends `SIGTERM` to its child's *process group* (the child was spawned with `Command::process_group(0)` so it is the leader of a fresh group with `pgid == child.id()`), waits up to 2 s, then escalates to `SIGKILL` of the same group. The process-group signal is what reaches grandchildren — `kubectl wait`, `kubectl apply`, etc., spawned by `setup.sh` — that inherited stdout/stderr; without it, an immediate-child kill would leave grandchildren holding the pipes open and stretch cancel latency to ~60 s. `cancel` is idempotent: when no write is in flight it is a no-op (audit-logged with `outcome="no-op"`).
+- The accept loop is bounded at 32 concurrent client connections; over-cap connections are refused with a typed error and the rejection is rate-limited in the audit log to one entry per second to prevent log spam under burst.
+- The writer thread is the sole signaller of its child: it holds the `Child` on its own stack and signals before any `wait()` so PID-recycle TOCTOU is structurally impossible. `cancel` only sets the atomic; it never holds a PID across threads.
 
 **Role**: The helper is a **build-and-deploy tool only**. It manages cluster lifecycle (create, teardown) and image builds (podman build, kind load). It does NOT run tests, proxy kubectl, or serve logs — the dev container has kubectl + kubeconfig and runs env-tests directly. This keeps tests portable and helper-agnostic.
 
@@ -93,14 +101,37 @@ The trichotomy is the load-bearing safety property: pointing the helper's *runti
 
 The helper handles only operations that require the host's container runtime (podman) and Kind CLI. Everything else (tests, logs, status) is done directly from the dev container via kubectl.
 
-| Command | Description | Why host-only |
-|---------|-------------|---------------|
-| `setup` | Allocate ports, generate kind-config, create cluster, run setup.sh | Requires `kind create cluster`, `podman build` |
-| `rebuild <service>` | Build one service image, load into Kind, restart deployment | Requires `podman build`, `kind load image-archive` |
-| `rebuild-all` | Rebuild all service images | Same |
-| `deploy <service>` | Apply manifests only (no image rebuild) | Uses setup.sh which manages kind-specific operations |
-| `teardown` | Delete Kind cluster, clean up all state | Requires `kind delete cluster` |
-| `status` | Report cluster existence, API reachability, port allocations, readiness flag | Helper-internal state + kubectl connectivity check |
+| Command | Description | Class | Why host-only |
+|---------|-------------|-------|---------------|
+| `setup` | Allocate ports, generate kind-config, create cluster, run setup.sh | write | Requires `kind create cluster`, `podman build` |
+| `rebuild <service>` | Build one service image, load into Kind, restart deployment | write | Requires `podman build`, `kind load image-archive` |
+| `rebuild-all` | Rebuild all service images | write | Same |
+| `deploy <service>` | Apply manifests only (no image rebuild) | write | Uses setup.sh which manages kind-specific operations |
+| `teardown` | Delete Kind cluster, clean up all state | write | Requires `kind delete cluster` |
+| `status` | Report cluster existence, API reachability, port allocations, readiness flag, in-flight write | read | Helper-internal state + kubectl connectivity check |
+| `cancel` | Abort the in-flight write (no-op if idle) | read | Touches only the in-flight write's cancel token |
+
+The `class` column drives the concurrency model described in §"Helper Process". Read-class commands never block on the write slot; write-class commands acquire it and are rejected with `busy` if it is held.
+
+#### 1. Concurrency contract
+
+Read-class commands snapshot helper state and never wait. Their response always carries the current busy flag and (when busy) the in-flight `{op, args}` so a client running concurrently with a `setup` sees that `setup` is in progress. Write-class commands hold the per-helper write slot from the moment `run_with_write_slot` is entered until the writer thread releases it via the `WriteSlotGuard` RAII drop — including on panic, cancel, or natural exit. There is exactly one write slot per helper instance.
+
+#### 2. Busy rejection
+
+A second write while a write is in flight returns `Response::err` with `error_kind="busy"` and a `data` field carrying `{op, args}` for the in-flight write. The client renders the human-readable message and points the operator at `dev-cluster cancel`. The rejected request is not partially executed — the rejection happens before any side effect.
+
+#### 3. Cancel semantics
+
+`cancel` looks up the per-write `Arc<AtomicBool>` cancel token under the write-state mutex, drops the lock, and stores `true` into the atomic. The writer thread checks the token between subprocess polls in `run_command_streaming`; on observing `true` it sends `SIGTERM` to the child's **process group** (the immediate child is spawned as a fresh process-group leader via `Command::process_group(0)`, so the signal reaches the whole shell/kubectl tree without affecting Kind's detached cluster components which run inside the cluster container's PID 1). The writer waits up to 2 s for cooperative shutdown of the kubectl/shell tree, then escalates to `SIGKILL` of the same process group. The 2 s window is sized for the cooperative `kubectl wait`/`kubectl apply`/`kind create cluster` shell tree; containerd/kubelet/etcd never received the signal because they were never descendants of `setup.sh`. The `Cancelled` error variant carries `escalated: bool` so the audit log distinguishes the two outcomes. `cancel` is idempotent and never blocks: when no write is in flight it returns success with `outcome="no-op"`. The cancel hand-off does not race with natural completion because the writer thread is the sole owner of both the `Child` and the `WriteSlotGuard`.
+
+While the cancel is in flight (between the cancel-token store and the writer's `Drop` of `WriteSlotGuard`), `status` returns `cancel_pending: true` in its top-level data. The flag is sourced from the in-flight op's `cancel_token` under the same mutex acquisition that snapshots `busy`/`in_flight`, so the view is consistent. Operators see `[busy, cancelling] write in flight: <op>` in the `dev-cluster status` banner during this window; once the writer releases the slot, the banner is omitted entirely (`busy=false`, `cancel_pending=false`, `in_flight=null`).
+
+Cancelling a write — `setup`, `deploy`, `rebuild`, `rebuild-all`, OR `teardown` — abandons the operation immediately and may leave host-side state (Kind cluster fragments, containerd/etcd processes inside leaked Kind containers, port allocations) requiring manual recovery. Recovery is uniform across both abandonment paths: re-running `dev-cluster setup` reconciles partial Kind state via the "cluster exists, reusing" branch (`cmd_setup` at `commands.rs:237-243`); re-running `dev-cluster teardown` is idempotent against straggling state. If the Kind container itself wedges, `podman/docker rm -f kind-control-plane-<cluster-name>` is the manual recovery. The helper does not pretend cancel partial-restores; the user has chosen to abandon, and the cancel mechanism is symmetric for that reason — there is no per-command cancel policy and no `is_cancellable()` carve-out.
+
+#### 4. Connection cap
+
+The accept loop bounds concurrent client connections at 32 (`MAX_CONCURRENT_CONNECTIONS`). This protects against pathological client-side fan-out (e.g., a script polling `status` in a tight loop while `setup` runs) without affecting normal devloop usage. Over-cap connections are immediately refused; the rejection is logged but rate-limited to one audit entry per second (`REJECT_LOG_DEDUP_SECS`) so a flood of refused connections cannot evict useful audit entries.
 
 **Input validation**: All arguments validated via Rust enums/match. Service names: `ac`, `gc`, `mc`, `mh` (exhaustive enum match). No shell interpolation — all commands use `Command::new().arg()`.
 
@@ -108,7 +139,7 @@ The helper handles only operations that require the host's container runtime (po
 
 **File permissions**: All files in `/tmp/devloop-{slug}/` are chmod 0600 (socket, PID file, auth token, log, ports.json). The directory itself is 0700. This prevents other users on the host from accessing the helper's state.
 
-**Audit logging**: Every request logged to `/tmp/devloop-{slug}/helper.log` with timestamp, command, arguments, duration, exit code.
+**Audit logging**: Every request logged to `/tmp/devloop-{slug}/helper.log` with timestamp, command, arguments, duration, exit code, and an `outcome` classifier (one of `completed`, `cancelled`, `error`, `rejected`, `no-op`) for greppable post-hoc triage. `rejected_busy` events emit the collision pair (rejected op + in-flight op) into the `args` field; `cancel` events carry the cancelled op's identifier in the `error` field.
 
 ### Container-Side Test Execution
 
