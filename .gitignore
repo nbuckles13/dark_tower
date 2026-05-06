@@ -47,6 +47,10 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 
+# pnpm 10.x project-local store cache
+.pnpm-store/
+**/.pnpm-store/
+
 # Nx local cache
 .nx/
 

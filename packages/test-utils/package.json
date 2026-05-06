@@ -1,0 +1,45 @@
+{
+  "name": "@darktower/test-utils",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Dark Tower test doubles, mocks, and assertion stubs (test-only).",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.cjs"
+    },
+    "./test-only/signer": {
+      "types": "./dist/test-only/signer.d.ts",
+      "import": "./dist/test-only/signer.mjs",
+      "require": "./dist/test-only/signer.cjs"
+    }
+  },
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.mjs",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "publishConfig": {
+    "access": "restricted"
+  },
+  "scripts": {
+    "build": "vite build",
+    "test:unit": "vitest run",
+    "test:watch": "vitest",
+    "lint": "tsc --noEmit",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@noble/ed25519": "2.1.0",
+    "@types/node": "22.10.5",
+    "typescript": "5.7.3",
+    "vite": "^6.0.0",
+    "vite-plugin-dts": "^4.3.0",
+    "vitest": "^3.2.0"
+  }
+}
