@@ -1,0 +1,64 @@
+{
+  "name": "proto-gen",
+  "$schema": "../../node_modules/nx/schemas/project-schema.json",
+  "root": "packages/proto-gen",
+  "projectType": "library",
+  "targets": {
+    "codegen": {
+      "executor": "nx:run-commands",
+      "inputs": [
+        "{workspaceRoot}/proto/**/*.proto",
+        "{workspaceRoot}/proto/buf.yaml",
+        "{workspaceRoot}/proto/buf.gen.yaml",
+        "{projectRoot}/package.json"
+      ],
+      "outputs": [
+        "{workspaceRoot}/packages/sdk-core/src/proto/*_pb.ts"
+      ],
+      "options": {
+        "command": "pnpm exec buf generate",
+        "cwd": "proto"
+      },
+      "cache": true
+    },
+    "lint": {
+      "executor": "nx:run-commands",
+      "inputs": [
+        "{workspaceRoot}/proto/**/*.proto",
+        "{workspaceRoot}/proto/buf.yaml"
+      ],
+      "options": {
+        "command": "pnpm exec buf lint",
+        "cwd": "proto"
+      },
+      "cache": true
+    },
+    "format": {
+      "executor": "nx:run-commands",
+      "inputs": [
+        "{workspaceRoot}/proto/**/*.proto"
+      ],
+      "options": {
+        "command": "pnpm exec buf format --diff --exit-code",
+        "cwd": "proto"
+      },
+      "cache": true
+    },
+    "test": {
+      "executor": "nx:run-commands",
+      "dependsOn": ["codegen"],
+      "inputs": [
+        "{workspaceRoot}/proto/**/*.proto",
+        "{workspaceRoot}/proto/buf.yaml",
+        "{workspaceRoot}/proto/buf.gen.yaml",
+        "{projectRoot}/scripts/verify-codegen.sh",
+        "{projectRoot}/package.json"
+      ],
+      "options": {
+        "command": "bash scripts/verify-codegen.sh",
+        "cwd": "packages/proto-gen"
+      },
+      "cache": true
+    }
+  }
+}

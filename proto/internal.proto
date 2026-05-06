@@ -26,28 +26,28 @@ message RoutingOptions {
   bool transcode = 1;
   string target_codec = 2;
   uint32 target_bitrate = 3;
-  bool mix_audio = 4;  // Mix multiple audio streams
+  bool mix_audio = 4; // Mix multiple audio streams
 }
 
 // Cascading destination for multi-handler routing
 message CascadeDestination {
   string media_handler_url = 1;
-  repeated string destination_participant_ids = 2;  // Participants on this handler
+  repeated string destination_participant_ids = 2; // Participants on this handler
 }
 
 // Command to route media between participants (supports multi-handler cascading)
 message RouteMediaCommand {
-  uint64 source_user_id = 1;  // Source participant (8-byte user ID)
-  uint32 source_stream_id = 2;  // Source stream (4-byte subscriber ID)
-  repeated string destination_participant_ids = 3;  // Direct destinations on this handler
-  repeated CascadeDestination cascade_destinations = 4;  // Destinations on other handlers
+  uint64 source_user_id = 1; // Source participant (8-byte user ID)
+  uint32 source_stream_id = 2; // Source stream (4-byte subscriber ID)
+  repeated string destination_participant_ids = 3; // Direct destinations on this handler
+  repeated CascadeDestination cascade_destinations = 4; // Destinations on other handlers
   RoutingOptions options = 5;
 }
 
 // Media telemetry from media handler to meeting controller
 message MediaTelemetry {
-  uint64 user_id = 1;  // Source participant (8-byte user ID)
-  uint32 stream_id = 2;  // Stream identifier (4-byte)
+  uint64 user_id = 1; // Source participant (8-byte user ID)
+  uint32 stream_id = 2; // Stream identifier (4-byte)
   uint64 bytes_sent = 3;
   uint64 bytes_received = 4;
   float packet_loss = 5;
@@ -73,27 +73,27 @@ message ControllerCapacity {
 // buf:lint:ignore ENUM_VALUE_PREFIX
 // buf:lint:ignore ENUM_ZERO_VALUE_SUFFIX
 enum HealthStatus {
-  PENDING = 0;    // Just registered, not yet verified
+  PENDING = 0; // Just registered, not yet verified
   HEALTHY = 1;
   DEGRADED = 2;
   UNHEALTHY = 3;
-  DRAINING = 4;   // Graceful shutdown in progress
+  DRAINING = 4; // Graceful shutdown in progress
 }
 
 // MC registration request with both endpoints per ADR-0010
 message RegisterMCRequest {
-  string id = 1;                      // Unique controller ID
-  string region = 2;                  // Deployment region (e.g., "us-east-1")
-  string grpc_endpoint = 3;           // gRPC endpoint for GC→MC calls
-  string webtransport_endpoint = 4;   // WebTransport endpoint for clients
-  uint32 max_meetings = 5;            // Maximum concurrent meetings
-  uint32 max_participants = 6;        // Maximum total participants
+  string id = 1; // Unique controller ID
+  string region = 2; // Deployment region (e.g., "us-east-1")
+  string grpc_endpoint = 3; // gRPC endpoint for GC→MC calls
+  string webtransport_endpoint = 4; // WebTransport endpoint for clients
+  uint32 max_meetings = 5; // Maximum concurrent meetings
+  uint32 max_participants = 6; // Maximum total participants
 }
 
 message RegisterMCResponse {
   bool accepted = 1;
   string message = 2;
-  uint64 fast_heartbeat_interval_ms = 3;          // 10000ms
+  uint64 fast_heartbeat_interval_ms = 3; // 10000ms
   uint64 comprehensive_heartbeat_interval_ms = 4; // 30000ms
 }
 
@@ -154,8 +154,8 @@ service MeetingControllerService {
 
 // Request to notify GC that a meeting has ended
 message NotifyMeetingEndedRequest {
-  string meeting_id = 1;  // Meeting that ended
-  string region = 2;      // Region where the meeting was hosted
+  string meeting_id = 1; // Meeting that ended
+  string region = 2; // Region where the meeting was hosted
 }
 
 // Response to meeting ended notification
@@ -198,22 +198,22 @@ enum RejectionReason {
 
 // Media handler assignment for a meeting
 message MhAssignment {
-  string mh_id = 1;                   // Media handler ID
-  string webtransport_endpoint = 2;    // WebTransport endpoint for clients
-  reserved 3;                          // was: MhRole role (removed — active/active)
-  string grpc_endpoint = 4;           // MC→MH gRPC endpoint
+  string mh_id = 1; // Media handler ID
+  string webtransport_endpoint = 2; // WebTransport endpoint for clients
+  reserved 3; // was: MhRole role (removed — active/active)
+  string grpc_endpoint = 4; // MC→MH gRPC endpoint
 }
 
 // Request from GC to MC to assign a meeting with MH assignments
 message AssignMeetingWithMhRequest {
-  string meeting_id = 1;               // Meeting being assigned
-  repeated MhAssignment mh_assignments = 2;  // MH assignments for this meeting
-  string requesting_gc_id = 3;         // ID of the GC making the request
+  string meeting_id = 1; // Meeting being assigned
+  repeated MhAssignment mh_assignments = 2; // MH assignments for this meeting
+  string requesting_gc_id = 3; // ID of the GC making the request
 }
 
 // Response from MC to GC for meeting assignment
 message AssignMeetingWithMhResponse {
-  bool accepted = 1;                   // Whether the MC accepted the assignment
+  bool accepted = 1; // Whether the MC accepted the assignment
   RejectionReason rejection_reason = 2; // Reason if not accepted
 }
 
@@ -223,28 +223,28 @@ message AssignMeetingWithMhResponse {
 
 // Request to register a media handler with the global controller
 message RegisterMHRequest {
-  string handler_id = 1;               // Unique handler identifier
-  string region = 2;                   // Deployment region (e.g., "us-east-1")
-  string webtransport_endpoint = 3;    // WebTransport endpoint for client connections
-  string grpc_endpoint = 4;            // gRPC endpoint for MC→MH communication
-  uint32 max_streams = 5;              // Maximum concurrent streams
+  string handler_id = 1; // Unique handler identifier
+  string region = 2; // Deployment region (e.g., "us-east-1")
+  string webtransport_endpoint = 3; // WebTransport endpoint for client connections
+  string grpc_endpoint = 4; // gRPC endpoint for MC→MH communication
+  uint32 max_streams = 5; // Maximum concurrent streams
 }
 
 // Response to MH registration
 message RegisterMHResponse {
   bool accepted = 1;
   string message = 2;
-  uint64 load_report_interval_ms = 3;  // How often to send load reports (e.g., 10000ms)
+  uint64 load_report_interval_ms = 3; // How often to send load reports (e.g., 10000ms)
 }
 
 // Load report from MH to GC (heartbeat with capacity info)
 message MHLoadReportRequest {
-  string handler_id = 1;               // Handler sending the report
-  uint32 current_streams = 2;          // Current number of active streams
-  HealthStatus health = 3;             // Current health status
-  float cpu_usage_percent = 4;         // CPU usage (0-100)
-  float memory_usage_percent = 5;      // Memory usage (0-100)
-  float bandwidth_usage_percent = 6;   // Bandwidth usage (0-100)
+  string handler_id = 1; // Handler sending the report
+  uint32 current_streams = 2; // Current number of active streams
+  HealthStatus health = 3; // Current health status
+  float cpu_usage_percent = 4; // CPU usage (0-100)
+  float memory_usage_percent = 5; // Memory usage (0-100)
+  float bandwidth_usage_percent = 6; // Bandwidth usage (0-100)
 }
 
 // Response to load report
