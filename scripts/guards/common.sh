@@ -462,13 +462,6 @@ path_matches_glob() {
     local path="$1"
     local glob="$2"
 
-    # Auto-expand trailing-/ to /** so 'dir/' matches recursively (plan-author UX).
-    # Loop strips any pathological trailing slashes ('dir//' -> 'dir/**').
-    if [[ "$glob" == */ ]]; then
-        while [[ "$glob" == */ ]]; do glob="${glob%/}"; done
-        glob="$glob/**"
-    fi
-
     # Literal match.
     [[ "$path" == "$glob" ]] && return 0
 
@@ -481,9 +474,17 @@ path_matches_glob() {
         return 1
     fi
 
-    # Fall back to bash extglob matching.
+    # Fall back to bash extglob matching. Save extglob state so the caller's
+    # setting is preserved across the call (this helper is sourced via common.sh
+    # and called from many guards; cross-script visibility was the motivating bug).
+    local _prev_extglob
+    shopt -q extglob && _prev_extglob=on || _prev_extglob=off
     shopt -s extglob
+
+    local _result=1
     # shellcheck disable=SC2053
-    [[ "$path" == $glob ]] && return 0
-    return 1
+    [[ "$path" == $glob ]] && _result=0
+
+    [[ "$_prev_extglob" == "off" ]] && shopt -u extglob
+    return $_result
 }
