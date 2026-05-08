@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# cargo-shim — records its argv to $CARGO_SHIM_ARGV_LOG and exits 0.
+# Used by behavior-equivalence.test.sh to verify dispatcher arg-passthrough
+# without depending on a real cargo invocation.
+set -euo pipefail
+IFS=$'\n\t'
+
+if [[ -z "${CARGO_SHIM_ARGV_LOG:-}" ]]; then
+  echo "cargo-shim: CARGO_SHIM_ARGV_LOG must be set" >&2
+  exit 2
+fi
+
+# Record argv (one arg per line for diffability).
+{
+  printf 'cargo'
+  for arg in "$@"; do
+    printf ' %s' "$arg"
+  done
+  printf '\n'
+} >> "$CARGO_SHIM_ARGV_LOG"
+
+exit 0
