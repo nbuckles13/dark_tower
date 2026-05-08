@@ -75,14 +75,22 @@
      For Guarded Shared Area paths (ADR-0024 §6.4), Mechanical is disallowed; Owner must be filled.
      Fill Owner (if not mine) for cross-boundary rows.
 
-     Path column convention: bare backtick-quoted filename only. The
-     `validate-cross-boundary-scope` guard parser at scripts/guards/common.sh
-     strips backticks but nothing else; parenthetical annotations like
-     `path.rs` (new) trip scope-drift-inbound at Gate 2. Per-row file-shape
-     context (new vs modify, scope qualifiers, "skeleton-only", etc.)
-     belongs in § Implementation Summary or § Files Modified, not in this
-     table. The table answers one question per row: whose domain is this,
-     and how stringent is the involvement. -->
+     Path column convention: backtick-quoted paths. Globs (`*`, `?`, `[]`,
+     trailing `/`, `/**`) and parenthetical annotations like `foo.rs` (regen)
+     are tolerated by the `validate-cross-boundary-scope` parser at
+     scripts/guards/common.sh, and are recommended where they clarify intent
+     — use `dir/**` (or `dir/`, which the parser canonicalizes to
+     `dir/**`) to scope a whole tree, `*.svelte` for a filename glob,
+     and `(regen)` / `(cleanup)` /
+     `(skeleton-only)` suffixes for per-row context. Prefer the simplest
+     form that is accurate: if a literal path conveys the same information,
+     use that; reach for a glob when enumerating every file would be noise,
+     and reach for a parenthetical when the row's nature (regen, cleanup,
+     new-vs-modify) materially changes how a reviewer reads it. Longer-form
+     file-shape context (rationale, scope qualifiers, "why this shape") still
+     belongs in § Implementation Summary or § Files Modified — the table
+     answers one question per row: whose domain is this, and how stringent
+     is the involvement. -->
 
 | Path | Classification | Owner (if not mine) |
 |------|----------------|---------------------|

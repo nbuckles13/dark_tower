@@ -430,6 +430,13 @@ parse_cross_boundary_table() {
             gsub(/`/, "", path)
             # Strip one trailing parenthetical annotation (e.g., "foo.ts (regen)" -> "foo.ts").
             sub(/[[:space:]]*\([^)]*\)[[:space:]]*$/, "", path)
+            # Canonicalize trailing-/ to /** so consumers see one form (plan-author UX).
+            # Loop-style trim handles pathological "dir//" cleanly. Idempotent for
+            # paths already ending in "/**" (predicate false; no double-expansion).
+            if (path ~ /\/$/) {
+                sub(/\/+$/, "", path)
+                path = path "/**"
+            }
 
             printf "%s|%s|%s\n", path, classification, owner
         }
@@ -454,6 +461,13 @@ parse_cross_boundary_table() {
 path_matches_glob() {
     local path="$1"
     local glob="$2"
+
+    # Auto-expand trailing-/ to /** so 'dir/' matches recursively (plan-author UX).
+    # Loop strips any pathological trailing slashes ('dir//' -> 'dir/**').
+    if [[ "$glob" == */ ]]; then
+        while [[ "$glob" == */ ]]; do glob="${glob%/}"; done
+        glob="$glob/**"
+    fi
 
     # Literal match.
     [[ "$path" == "$glob" ]] && return 0
