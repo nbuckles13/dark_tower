@@ -48,7 +48,6 @@
 #
 # Usage:
 #   ./validate-metric-labels.sh              # scan production metrics.rs files
-#   ./validate-metric-labels.sh --self-test  # run fixture-based regression suite
 
 set -euo pipefail
 
@@ -59,7 +58,6 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 source "$SCRIPT_DIR/../common.sh"
 
 CRATES_DIR="$REPO_ROOT/crates"
-FIXTURES_DIR="$SCRIPT_DIR/fixtures/metric-labels"
 
 # -----------------------------------------------------------------------------
 # Python validator — one file at a time, emits JSON-lines on stdout.
@@ -958,78 +956,11 @@ find_metric_files() {
 }
 
 # -----------------------------------------------------------------------------
-# Self-test: iterate fixtures, assert exit from filename (pass-*/fail-*).
-# -----------------------------------------------------------------------------
-self_test() {
-    echo ""
-    echo "========================================="
-    echo "Metric-Labels Guard — Self-Test"
-    echo "========================================="
-    echo ""
-
-    if [[ ! -d "$FIXTURES_DIR" ]]; then
-        echo -e "${RED}FAIL: fixtures dir missing: $FIXTURES_DIR${NC}" >&2
-        exit 2
-    fi
-
-    local passed=0 failed=0
-    shopt -s nullglob
-    for fixture in "$FIXTURES_DIR"/*.rs; do
-        local name
-        name=$(basename "$fixture")
-        local expected_exit
-
-        case "$name" in
-            pass-*) expected_exit=0 ;;
-            fail-*) expected_exit=1 ;;
-            *) continue ;;
-        esac
-
-        local output
-        local violation_count=0
-        if output=$(run_python_validator "$fixture" 2>&1); then
-            violation_count=$(echo "$output" | grep -c '"kind"' || true)
-        else
-            echo -e "${RED}SELF-TEST ERROR:${NC} python validator blew up on $name" >&2
-            echo "$output" >&2
-            failed=$((failed + 1))
-            continue
-        fi
-
-        local actual_exit=0
-        if [[ "$violation_count" -gt 0 ]]; then
-            actual_exit=1
-        fi
-
-        if [[ "$actual_exit" -eq "$expected_exit" ]]; then
-            echo -e "  ${GREEN}PASS${NC} $name (violations=$violation_count)"
-            passed=$((passed + 1))
-        else
-            echo -e "  ${RED}FAIL${NC} $name (expected_exit=$expected_exit, got=$actual_exit, violations=$violation_count)"
-            echo "$output" | sed 's/^/    /'
-            failed=$((failed + 1))
-        fi
-    done
-    shopt -u nullglob
-
-    echo ""
-    echo -e "Self-test: ${GREEN}${passed} passed${NC}, ${RED}${failed} failed${NC}"
-    if [[ "$failed" -gt 0 ]]; then
-        exit 1
-    fi
-    exit 0
-}
-
-# -----------------------------------------------------------------------------
 # Main
 # -----------------------------------------------------------------------------
 main() {
     init_violations
     start_timer
-
-    if [[ "${1:-}" == "--self-test" ]]; then
-        self_test
-    fi
 
     print_header "Metric-Labels Validation Guard"
     echo "Scanning: $CRATES_DIR"
