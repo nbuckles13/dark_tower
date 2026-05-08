@@ -517,65 +517,92 @@ Cross-cutting; no standalone task this story. Security requirements ride other t
 | 26 | GC OTel wiring (R-55 partial, R-56 partial): GC `main.rs` calls `init_otel(...)` (`service.name=global-controller`). GC `Config` adds the three OTel knobs; surfaced in `infra/services/gc-service/configmap.yaml`. R-56 interceptor wired on GC's outbound `AcAuthClient` (GC→AC) + any MC client + GC's inbound HTTP layer (HTTP propagator extracts `traceparent` from request headers — separate from gRPC interceptor; reuses the global propagator). The `/api/v1/telemetry` proxy (task #10) already accepts `traceparent`/`tracestate` headers via R-1 CORS allow-list — that path now feeds the same propagator. Integration tests cover: GC→AC trace continuity, HTTP→gRPC bridge, telemetry proxy preserves trace context | global-controller | 24, 31 | code, tests |
 | 27 | MH OTel wiring + MhClientMessage trace-field reads (R-55 partial, R-56 partial, R-58 MH side): MH `main.rs` calls `init_otel(...)` (`service.name=media-handler`). MH `Config` adds three OTel knobs; surfaced in `infra/services/mh-service/configmap.yaml`. R-56 interceptor wired on MH's outbound `GcRegistrationClient` (MH→GC) + `McNotificationClient` (MH→MC) + MH's inbound gRPC server (MC-facing endpoints). At `crates/mh-service/src/webtransport/connection.rs:handle_connection()`, MH parses the `MhClientMessage` envelope (post-rebase target), extracts `trace_parent`/`trace_state` via the global propagator, attaches context to existing `mh.webtransport.connection` instrumentation; existing spans become child spans automatically. Outbound MH responses (if any envelope-level outbound exists post-rebase) populate trace fields symmetrically. Integration tests via existing `crates/mh-service/tests/common/accept_loop_rig.rs` cover propagation round-trip | media-handler | 2, 24, 31 | code, tests |
 | 28 | Dev OTel collector deployment (R-59): new `infra/services/otel-collector/` Kustomize base — `deployment.yaml` (image `otel/opentelemetry-collector-contrib:0.x`, resource limits, readiness on `:13133`), `configmap.yaml` (OTLP-gRPC receiver `:4317` + OTLP-HTTP receiver `:4318` + `logging`/`debug` exporters in dev — NO production exporter wiring this story), `service.yaml` (ClusterIP exposing 4317/4318/13133), `network-policy.yaml` (ingress from AC/GC/MC/MH on 4317; ingress from GC pod on 4318 for the `/api/v1/telemetry` proxy forward; egress restricted). Kustomize values for AC/GC/MC/MH `otel_endpoint` populate `http://otel-collector.default.svc.cluster.local:4317`; GC `otel_collector_endpoint` (R-2) populates `http://otel-collector.default.svc.cluster.local:4318/v1/{metrics,traces}`. `infra/kind/scripts/setup.sh` updated to verify collector readiness BEFORE bringing up AC/GC/MC/MH (load-bearing under R-54's fail-hard-at-init design — services with `otel_enabled=true` will refuse to start if collector is unreachable). New `infra/docker/prometheus/rules/otel-alerts.yaml` adds the `OTelExportFailureRate` warn alert per R-59. Add a "collector upgrade discipline" note to `gc-deployment.md`'s OTel section: collector upgrades MUST be a separate change window from service deploys to avoid cascading restart of all four services | infrastructure | — | deploy, docs |
-| 29 | Proto conventions doc + protocol agent-prompt update (R-61 part 1): create `docs/protocol/CONVENTIONS.md` documenting our buf STANDARD adoption, file-layout rule (`proto/<package_path>/<file>.proto`), package version-suffix rule (`vN`), bare RPC naming rule (Q14), distinct-response-types rule (Q15), and pointer to `proto/buf.yaml` as the enforcement mechanism. Update `.claude/agents/protocol.md` "Your Principles" section with a "Lint conventions" bullet referencing the doc + the operational rule "always run `buf lint` and `buf format --diff --exit-code` after editing protos". Update `docs/specialist-knowledge/protocol/INDEX.md` with a pointer to the new conventions doc. Lands BEFORE #30/#31 so the doc is the spec, not retroactive rationalization. `--light` mode (no plan gate, 3 teammates) | protocol | 2 | docs |
-| 30 | Proto file-layout cleanup (R-61 part 2, MINIMAL findings): move `proto/internal.proto` → `proto/dark_tower/internal/internal.proto` and `proto/signaling.proto` → `proto/dark_tower/signaling/signaling.proto`. Update `crates/proto-gen/build.rs` include paths. Update `proto/buf.gen.yaml` `out` path resolution if needed (relative paths shift). Run `cargo check --workspace` to confirm Rust codegen still produces; run `nx run proto-gen:codegen` + `:test` + `:format` to confirm TS pipeline still produces. `nx run proto-gen:lint` should drop from 21 findings to 17 (the 4 MINIMAL-tier findings resolve). **Wire-format unchanged.** Single-file `crates/proto-gen/build.rs` cross-boundary touch is sed-clean Mechanical (path string update). No co-sign required. ~30-line diff | protocol | 2, 7, 29 | code, tests |
-| 31 | Proto STANDARD-lint rename sweep (R-61 part 3, wire-breaking): apply the rename map in §protocol — package suffix `dark_tower.{internal,signaling}` → `…v1`; bare-name RPC request/response types per Clarification Q14 (13 type renames); split `HeartbeatResponse` per Clarification Q15. Update every Rust consumer: `crates/{ac,gc,mc,mh}-service`, `crates/proto-gen`, `crates/env-tests`, `crates/{ac,gc,mc}-test-utils`. Run `cargo check --workspace` + `cargo test --workspace` + full guard pipeline. `nx run proto-gen:lint` should exit 0 (zero findings). **ADR-0024 §6.4 intersection rule applies** on `internal.proto` (semantic auth-routing-policy edit): `--paired-with=auth-controller` plus `security` + every affected service specialist as reviewers. Wire-breaking — accepted per same-story precedent (R-60); no on-the-wire clients exist outside this codebase. Hundreds of lines across the workspace; expect 2–3 days. Optional pre-step: `/debate` if reviewers contest the rename map | protocol | 2, 7, 30 | code, tests, docs |
+| 29 | Proto conventions doc + protocol agent-prompt update + temporary buf.yaml ignore scaffolding (R-61 part 1): create `docs/protocol/CONVENTIONS.md` documenting our buf STANDARD adoption, file-layout rule (`proto/<package_path>/<file>.proto`), package version-suffix rule (`vN`), bare RPC naming rule (Q14), distinct-response-types rule (Q15), and pointer to `proto/buf.yaml` as the enforcement mechanism. Update `.claude/agents/protocol.md` "Your Principles" section with a "Lint conventions" bullet referencing the doc + the operational rule "always run `buf lint` and `buf format --diff --exit-code` after editing protos". Update `docs/specialist-knowledge/protocol/INDEX.md` with a pointer to the new conventions doc. **Adds temporary `lint.ignore` entries to `proto/buf.yaml` for `proto/internal.proto` and `proto/signaling.proto`** so the always-run `buf lint` gate (per R-62 / Track 3 Wave 2) passes during the cleanup window. The ignores get progressively drained by #30 (path update) and removed entirely by #31. `buf.yaml` comment ties the ignore block to R-61 cleanup so it doesn't get forgotten. Lands BEFORE #30/#31 so the doc is the spec, not retroactive rationalization. `--light` mode (no plan gate, 3 teammates) | protocol | 2, 35 | docs |
+| 30 | Proto file-layout cleanup (R-61 part 2, MINIMAL findings): move `proto/internal.proto` → `proto/dark_tower/internal/internal.proto` and `proto/signaling.proto` → `proto/dark_tower/signaling/signaling.proto`. Update `crates/proto-gen/build.rs` include paths. Update `proto/buf.gen.yaml` `out` path resolution if needed (relative paths shift). **Update `proto/buf.yaml` `lint.ignore` paths** to match the new file locations (no findings drained by the move itself; just keep the ignore in effect against the moved files). Run `cargo check --workspace` to confirm Rust codegen still produces; run `nx run proto-gen:codegen` + `:test` + `:format` to confirm TS pipeline still produces. `nx run proto-gen:lint` should drop from 21 findings to 17 (the 4 MINIMAL-tier findings resolve naturally — but they're inside the ignored files so `buf lint` reports clean either way; remove the 4 corresponding `except` entries if any were used vs path-level ignore). **Wire-format unchanged.** Single-file `crates/proto-gen/build.rs` cross-boundary touch is sed-clean Mechanical (path string update). No co-sign required. ~30-line diff | protocol | 2, 7, 29 | code, tests |
+| 31 | Proto STANDARD-lint rename sweep (R-61 part 3, wire-breaking): apply the rename map in §protocol — package suffix `dark_tower.{internal,signaling}` → `…v1`; bare-name RPC request/response types per Clarification Q14 (13 type renames); split `HeartbeatResponse` per Clarification Q15. Update every Rust consumer: `crates/{ac,gc,mc,mh}-service`, `crates/proto-gen`, `crates/env-tests`, `crates/{ac,gc,mc}-test-utils`. Run `cargo check --workspace` + `cargo test --workspace` + full guard pipeline. **Removes the temporary `lint.ignore` block from `proto/buf.yaml` entirely as the final step.** The devloop's normal Layer 5 validation (`buf lint` workspace-wide, always-run via Track 3 Wave 2) gates that no findings remain — if any do, the devloop cannot close. So the close-out check is implicit in normal validation; no separate baseline pass needed. **ADR-0024 §6.4 intersection rule applies** on `internal.proto` (semantic auth-routing-policy edit): `--paired-with=auth-controller` plus `security` + every affected service specialist as reviewers. Wire-breaking — accepted per same-story precedent (R-60); no on-the-wire clients exist outside this codebase. Hundreds of lines across the workspace; expect 2–3 days. Optional pre-step: `/debate` if reviewers contest the rename map | protocol | 2, 7, 30 | code, tests, docs |
+| 32 | Pipeline scaffolding + classifier + base-ref helper (R-62, ADR-0033 Wave 1 #1): land `scripts/layerN.sh` (1-7) skeletons (`set -euo pipefail`, STATUS-aggregation = worst-child, streaming child STATUS lines verbatim, `LAYER=N START=<ts> END=<ts> RESULT=<enum>` to stderr). Land `scripts/layer-all.sh` orchestrator with `tee /tmp/devloop/layer-N.log` per-layer redirection + final summary table + 90s p95 wall-clock budget enforcement. Land `scripts/lang/_{common,dispatch,changed_helpers,get_base_ref}.sh` shared helpers + `_get_base_ref.test.sh` self-test matrix (local-clean, local-dirty, local-with-untracked, CI-PR, CI-push, first-commit) + `_test_changed_predicates.sh` meta-test. Land `scripts/lang/rust/{changed.sh, changed.test.sh}`. Land per-verb dispatchers (`scripts/{audit,lint,test,fmt,build}.sh`) using `_dispatch.sh::for_each_lang_with_verb` (loud-on-missing-verb via `STATUS=SKIPPED-NO-VERB`). Refactor `scripts/test.sh` body into `lang/rust/test.sh` (root becomes thin shim preserving muscle memory). Refactor `scripts/verify-completion.sh` to call `scripts/layer-all.sh`. **Behavior-equivalence test required**: same exit code on same Rust-only diff before/after. Cross-boundary: `--paired-with=operations` (SKILL.md hooks). | infrastructure | — | code, tests |
+| 33 | `pnpm audit` always-run + ts language directory bootstrap (R-62, ADR-0033 Wave 1 #2): create `scripts/lang/ts/` directory with `changed.sh` + `changed.test.sh`. Wire `pnpm audit --audit-level=high` into `scripts/lang/ts/audit.sh` (always-run via classifying principle — supply-chain advisories surface independent of diff). Update `.github/workflows/ci.yml` to call `scripts/layer-all.sh` end-to-end (closes router-drift between local devloop and CI). Closes the minimatch-class incident permanently. Cross-boundary: `--paired-with=security` (audit-level threshold owned by security per ADR-0033 §11). | infrastructure | 32 | code, deploy |
+| 34 | Layer A scope-drift parser fix (R-62, ADR-0033 Wave 1 #3): fix the cross-boundary scope-drift guard parser at `scripts/guards/simple/validate-cross-boundary-scope.sh` to handle `.ts/.tsx/.svelte/.proto` path syntax. Currently strict-literal matching tripped 2 of 3 Gate 2 attempts on the test-utils devloop. Add fixture test under `scripts/guards/simple/fixtures/scope-drift/` exercising both Rust and TS path patterns. Independent of the dispatcher refactor. | infrastructure | — | code, tests |
+| 35 | Proto wrappers + Layer 1 stage-1 ordering (R-62, ADR-0033 Wave 2 #4): land `scripts/lang/proto/{changed.sh, changed.test.sh, compile.sh, format.sh, lint.sh, breaking.sh}`. No `test.sh` or `audit.sh` — verb discovery handles absence via `STATUS=SKIPPED-NO-VERB`. Wire proto invocation as the first stage of `scripts/layer1.sh` (proto-first ordering encoded in shell, not SKILL.md prose). Wire `buf breaking --against $(scripts/lang/_get_base_ref.sh)` into `scripts/audit.sh` always-run via `lang/proto/breaking.sh`. **Lands BEFORE Track 2 #29 starts** (which depends on this). Cross-boundary: `--paired-with=infrastructure`. | protocol | 32 | code, tests |
+| 36 | TS wrappers (R-62, ADR-0033 Wave 2 #5): land `scripts/lang/ts/{compile,fmt,lint,test}.sh` invoking Nx natively (`nx affected -t <target> --base=$(scripts/lang/_get_base_ref.sh)`). `lang/ts/audit.sh` already landed in #33; this fills in compile/fmt/lint/test. Each wrapper translates Nx output into the dispatcher's uniform `STATUS=` schema. `lang/ts/e2e.sh` deferred until task #15 (web-app + Playwright) lands. | infrastructure | 33 | code, tests |
+| 37 | TS guards under `scripts/guards/simple/ts/` (R-62, ADR-0033 Wave 2 #6): six TS-specific guards — `no-secrets-in-ts.sh` (security), `no-pii-in-logs-ts.sh` (observability), `no-test-removal-ts.sh` (test), `name-guard-dt-client.sh` (client; R-26 — `dt_client_*` metric naming), `bundle-content-r14.sh` (client; R-14 — assert prod build excludes `serverCertificateHashes` test-only paths; implementer leans toward Vitest contract test over guard-style, reconsider in this devloop), `exports-map-closed.sh` (security; package.json `exports` is closed-world, blocks accidental re-export of test-only modules). Each guard self-classifies via path glob; `run-guards.sh` discovery is unchanged. Cross-boundary: `--paired-with=security`, `--paired-with=observability`, `--paired-with=test`. | client | 32, 33 | code, tests |
+| 38 | SKILL.md Step 6 rewrite + auto-detection patterns + Layer N/A template + Layer 8→7 renumber (R-62, ADR-0033 Wave 3 #7): replace SKILL.md Step 6 layer table with "run `scripts/layer-all.sh`" + Always-Run / Skip-If-Untouched matrix per ADR-0033 §3. Add `client|svelte|sdk|tsx?` and `proto|buf` to auto-detection patterns. Rewrite Layer N/A justification template (drops Rust-shaped reasoning). **Renumber Layer 8 → Layer 7 across `SKILL.md`, `ADR-0030`, `ADR-0033`, `docs/debates/2026-05-06-polyglot-validation-pipeline-strategy/debate.md`, and 4 specialist-knowledge `INDEX.md` files.** Devloop output history files left as-is (historical record). Estimated ~20 active edits. | operations | 35, 36, 37 | docs |
+| 39 | `docs/runbooks/devloop-validation.md` runbook (R-62, ADR-0033 Wave 3 #8): authoritative runbook for pipeline failures. Layer-by-layer failure-mode → wrapper-script mapping. Exit-code reference (0/1/2 + `STATUS=` enum parsing). `_get_base_ref.sh` troubleshooting playbook (the stderr `BASE_REF=...` line is the runbook anchor). Per-language wrapper triage (`STATUS=SKIPPED-NO-VERB` interpretation, `_changed_helpers.sh` debugging, `_test_changed_predicates.sh` drift detection). Cross-link from `SKILL.md` Step 6 + each `layerN.sh` header comment. | operations | 38 | docs |
+| 40 | Semantic-guard relocation from layer pipeline to reviewer panel (R-62, ADR-0033 Wave 3 #9): remove semantic-guard agent invocation from `scripts/layer7.sh` (which then becomes pure shell — env-tests only). Add `semantic-guard` as a 7th reviewer slot in the Gate 2 reviewer panel composition (alongside security, code-reviewer, dry-reviewer, observability, operations, test). Coexist with code-reviewer (option a per ADR-0033 §8 — distinct lenses: semantic-guard targets specific anti-patterns, code-reviewer is general). Add deduplication step to panel aggregator so identical findings from semantic-guard + code-reviewer don't both surface. Layer-script model becomes pure shell. | operations | 38 | code, docs |
+| 41 | Intentional wire-break override mechanism (R-62, ADR-0033 Wave 3 #10): decide between per-line `# buf:breaking:ignore` comments vs annotated `proto/buf-breaking-allowlist.md` ratchet list. Land **after** ≥2 real wire-breaking PRs as case studies (Track 2 #31 is one such case; second case TBD post-#31). Mechanism must satisfy ADR-0033 §13: "intentional wire-breaks must be acknowledged explicitly in-tree, never via CI bypass flags or environment overrides." Cross-boundary: `--paired-with=operations`. | protocol | 31, 35 | code, docs |
 
 ### Task Dependency Graph
 
+Tasks land in three sequenced **tracks** (per Revision 4 sequencing decision):
+
+- **Track 3 — Polyglot pipeline foundation** (R-62, ADR-0033): tasks 32-41. Lands first, fully, before Track 2.
+- **Track 2 — Proto STANDARD-lint cleanup** (R-61): tasks 29-31. Lands after Track 3 (so `buf lint` is wired in and the temporary `buf.yaml` ignore scaffolding has somewhere to apply).
+- **Track 1 — Browser-client-join story remainder**: tasks 1-28. Phase 1 tasks (1, 2, 3) already done; the rest pause until Tracks 3+2 complete.
+
 ```
-Phase 1 (parallel, no deps): 1, 2, 3, 4, 5, 10, 23, 24, 28
-Phase 2:                      7 (after 1, 2)
-                              8 (after 1)
-                              29 (after 2)
-Phase 3:                      9 (after 1, 7, 8)
-                              30 (after 2, 7, 29)
-Phase 4:                      31 (after 2, 7, 30)
-                              11 (after 9, 23)
-Phase 5:                      6 (after 2, 24, 31)
-                              25 (after 24, 31)
-                              26 (after 24, 31)
-                              27 (after 2, 24, 31)
-                              12 (after 11)
-Phase 6:                      13 (after 11, 12, 31)
-Phase 7:                      14 (after 13, 31)
-Phase 8:                      15 (after 14)
-                              17 (after 1, 9, 31)
-                              16 (after 5, 10)
-Phase 9:                      18 (after 3, 4, 6, 8, 15)
-Phase 10:                     19 (after 18)
-                              20 (after 3, 4, 15)
-                              21 (after 5, 10, 16, 23)
-Phase 11:                     22 (after 3, 17, 19)
+Track 3 — Wave 1 (parallel, no story-track deps): 32, 33 (after 32), 34
+Track 3 — Wave 2 (after Wave 1):                  35 (after 32), 36 (after 33), 37 (after 32, 33)
+Track 3 — Wave 3 (after Wave 2):                  38 (after 35, 36, 37)
+                                                   39 (after 38)
+                                                   40 (after 38)
+
+Track 2 (after Track 3 Wave 2 lands):              29 (after 2, 35)
+                                                   30 (after 2, 7, 29)
+                                                   31 (after 2, 7, 30)
+                                                   41 (after 31, 35) — deferred Wave 3 task, needs case studies
+
+Track 1 (resumes after Tracks 3+2 done):
+  Phase 1 (parallel, no deps):  4, 5, 10, 23, 24, 28
+  Phase 2:                      7 (after 1, 2)
+                                8 (after 1)
+  Phase 3:                      9 (after 1, 7, 8)
+  Phase 4:                      11 (after 9, 23)
+  Phase 5:                      6 (after 2, 24, 31)
+                                25 (after 24, 31)
+                                26 (after 24, 31)
+                                27 (after 2, 24, 31)
+                                12 (after 11)
+  Phase 6:                      13 (after 11, 12, 31)
+  Phase 7:                      14 (after 13, 31)
+  Phase 8:                      15 (after 14)
+                                17 (after 1, 9, 31)
+                                16 (after 5, 10)
+  Phase 9:                      18 (after 3, 4, 6, 8, 15)
+  Phase 10:                     19 (after 18)
+                                20 (after 3, 4, 15)
+                                21 (after 5, 10, 16, 23)
+  Phase 11:                     22 (after 3, 17, 19)
 ```
 
 ### Parallelization Opportunities
 
-- **Phase 1** (massively parallel — 9 tasks): tasks 1, 2, 3, 4, 5, 10, 23, 24, 28 all run in parallel — no mutual dependencies. The OTel/camelCase additions don't extend the critical path; they fill Phase 1 width.
-- **Phase 2** (3-way fork): tasks 7, 8, 29 run in parallel (different specialists, different code; 29 is `--light` docs work and can land early).
-- **Phase 5** (5-way fork): tasks 6, 25, 26, 27, 12 run in parallel after #31's rename sweep clears.
-- **Phase 8** (3-way fork): tasks 15, 16, 17 run in parallel.
-- **Phase 10** (3-way fork): tasks 19, 20, 21 run in parallel after their respective dependencies clear.
-- **R-61 cleanup tasks (29, 30, 31)**: ship spec-first sequencing — 29 (conventions doc + agent-prompt) lands before 30 (file-layout) and 31 (rename sweep) so the doc is the canonical spec, not retroactive rationalization. 31 blocks every direct proto-type consumer (#6, #13, #14, #17, #25, #26, #27) to minimize rebase pain across in-flight work.
-- **Critical path**: 1 → 7 → 9 → 11 → 12 → 13 → 14 → 15 → 18 → 19 (9 edges). The R-61 cleanup chain (7 → 30 → 31 → consumers) has equal length to the client chain through #13, so it does not extend the critical path — they share the path-length budget.
+- **Track 3 Wave 1** (3-way parallel start): 32 is the dispatcher refactor (largest); 33 chains after 32 because TS lang dir is created there; 34 (scope-drift parser fix) is fully independent and can run in parallel with 32.
+- **Track 3 Wave 2** (3-way parallel): 35, 36, 37 run in parallel after Wave 1 (different specialists: protocol, infrastructure, client).
+- **Track 3 Wave 3** (initial then 2-way): 38 (SKILL.md rewrite + renumber) lands first; then 39 (runbook) and 40 (semantic-guard relocation) run in parallel. 41 (override mechanism) is deferred until Track 2 #31 ships as a case study.
+- **Track 2** (sequential): 29 → 30 → 31 in order; spec-first sequencing preserved per R-61 design.
+- **Track 1 — Phase 1** (massively parallel — 6 remaining tasks): 4, 5, 10, 23, 24, 28 run in parallel after Track 2.
+- **Track 1 — Phase 5** (5-way fork): 6, 25, 26, 27, 12 run in parallel after #31 clears.
+- **Track 1 — Phase 8** (3-way fork): 15, 16, 17.
+- **Track 1 — Phase 10** (3-way fork): 19, 20, 21.
+- **Critical path**: 32 → 35 → 29 → 30 → 31 → 6/13/etc → 14 → 15 → 18 → 19 (~10 edges along the longest chain). Track 3 adds ~3 edges to the critical path vs. the original story.
 
 ### Specialist Task Summary
 
 | Specialist | Tasks | Count |
 |-----------|-------|-------|
-| infrastructure | 1, 3, 4, 17, 22, 28 | 6 |
-| protocol | 2, 7, 29, 30, 31 | 5 |
+| infrastructure | 1, 3, 4, 17, 22, 28, 32, 33, 34, 36 | 10 |
+| protocol | 2, 7, 29, 30, 31, 35, 41 | 7 |
 | meeting-controller | 6 | 1 |
 | global-controller | 5, 10, 26 | 3 |
 | auth-controller | 23 (paired w/ GC), 25 | 2 |
 | media-handler | 27 | 1 |
 | test | 8, 18, 19 | 3 |
-| client | 9, 11, 13, 14, 15 | 5 |
+| client | 9, 11, 13, 14, 15, 37 | 6 |
 | observability | 12, 16, 24 | 3 |
-| operations | 20, 21 | 2 |
-| security | — (cross-cutting; reviews each task at devloop close) | 0 |
+| operations | 20, 21, 38, 39, 40 | 5 |
+| security | — (cross-cutting; reviews each task at devloop close; paired on #33, #37) | 0 |
 | database | — (opt-out, interface validated; SQL provided to infra) | 0 |
-| **Total** | | **31** |
+| **Total** | | **41** |
 
 ### Requirements Coverage
 
@@ -641,19 +668,20 @@ Phase 11:                     22 (after 3, 17, 19)
 | R-58 | 2 (proto), 12 (SDK injection helper), 27 (MH read) |
 | R-59 | 28 |
 | R-60 | 2 (proto), 6 (MC handler), 14 (SDK send) |
-| R-61 | 29 (conventions doc + agent-prompt, lands first as spec), 30 (file-layout, MINIMAL findings), 31 (STANDARD rename sweep, wire-breaking) |
+| R-61 | 29 (conventions doc + agent-prompt + temporary buf.yaml ignore scaffolding, lands first as spec), 30 (file-layout, MINIMAL findings), 31 (STANDARD rename sweep, wire-breaking + ignore removal) |
+| R-62 | 32 (pipeline scaffolding + classifier + base-ref helper), 33 (pnpm audit always-run + ts dir), 34 (Layer A scope-drift parser fix), 35 (proto wrappers + Layer 1 ordering), 36 (TS wrappers via Nx), 37 (TS guards under simple/ts/), 38 (SKILL.md rewrite + Layer 8→7 renumber), 39 (devloop-validation runbook), 40 (semantic-guard relocation to reviewer panel), 41 (intentional wire-break override mechanism, deferred) |
 
 ### Aspect Coverage
 
 | Aspect | Covered By Tasks | N/A? |
 |--------|-----------------|------|
-| Code | 1, 2, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 23, 24, 25, 26, 27, 30, 31 | |
+| Code | 1, 2, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 23, 24, 25, 26, 27, 30, 31, 32, 33, 34, 35, 36, 37, 40, 41 | |
 | Database | 4 (dev seed only — no schema change) | |
-| Tests | 8, 9, 11, 13, 14, 15, 18, 19, 23 (env-test fixture updates), 24 (helper unit tests), 25/26/27 (per-service integration tests for OTel), 6 (MC integration tests for MediaConnectionUpdate), 30 (workspace cargo check + TS codegen smoke), 31 (workspace cargo test post-rename) | |
+| Tests | 8, 9, 11, 13, 14, 15, 18, 19, 23 (env-test fixture updates), 24 (helper unit tests), 25/26/27 (per-service integration tests for OTel), 6 (MC integration tests for MediaConnectionUpdate), 30 (workspace cargo check + TS codegen smoke), 31 (workspace cargo test post-rename), 32 (`_get_base_ref.test.sh` + `_test_changed_predicates.sh` + behavior-equivalence test), 33 (`lang/ts/changed.test.sh`), 34 (scope-drift parser fixture test), 35 (`lang/proto/changed.test.sh`), 37 (TS guard fixture tests) | |
 | Observability | 12 (client metrics), 5/10 (server metrics), 16 (dashboards + alerts + catalog), 24 (common OTel helper + interceptor), 25/26/6/27 (per-service OTel wiring) | |
-| Deployment | 1, 3, 4, 17, 22, 28 (collector deployment) | |
-| Operations | 20 (dev runbook), 21 (smoke tests + alert catalog + incident scenarios — with camelCase wire keys per R-53), 22 (validation pipeline), 23 (runbook curl examples migrated to camelCase) | |
-| Documentation | 12 (catalog stub), 15 (web-app README), 16 (catalog sections), 18 (E2E README), 19 (SKILL.md), 20 (dev runbook), 21 (deployment + alerts + incident docs), 23 (runbooks migrated to camelCase), 29 (proto CONVENTIONS.md + protocol agent-prompt + INDEX), 31 (rename map + ADR-level proto-package-rename rationale if `/debate` is invoked) | |
+| Deployment | 1, 3, 4, 17, 22, 28 (collector deployment), 33 (CI workflow update) | |
+| Operations | 20 (dev runbook), 21 (smoke tests + alert catalog + incident scenarios — with camelCase wire keys per R-53), 22 (validation pipeline), 23 (runbook curl examples migrated to camelCase), 38 (SKILL.md rewrite + Layer renumber), 39 (devloop-validation runbook), 40 (reviewer panel composition + dedup) | |
+| Documentation | 12 (catalog stub), 15 (web-app README), 16 (catalog sections), 18 (E2E README), 19 (SKILL.md), 20 (dev runbook), 21 (deployment + alerts + incident docs), 23 (runbooks migrated to camelCase), 29 (proto CONVENTIONS.md + protocol agent-prompt + INDEX), 31 (rename map + ADR-level proto-package-rename rationale if `/debate` is invoked), 38 (SKILL.md Step 6 rewrite + Layer 8→7 renumber across docs), 39 (devloop-validation.md runbook), 40 (reviewer panel docs), 41 (override mechanism docs) | |
 
 ---
 
@@ -691,11 +719,21 @@ Each row below is a `/devloop` invocation. Run them in dependency order (see §T
 | 26 | `/devloop "GC OTel wiring (R-55 partial, R-56 partial): main.rs init_otel, Config knobs, surfaced in gc-service/configmap.yaml, R-56 interceptor on GC's outbound AcAuthClient + MC client + GC's inbound HTTP layer. Integration tests for GC→AC trace continuity + HTTP→gRPC bridge + telemetry-proxy preserves trace context. See task #26 in docs/user-stories/2026-05-02-browser-client-join.md" --specialist=global-controller` | global-controller | 24, 31 | | Pending |
 | 27 | `/devloop "MH OTel wiring + MhClientMessage trace-field reads (R-55 partial, R-56 partial, R-58 MH side): main.rs init_otel, Config knobs, surfaced in mh-service/configmap.yaml, R-56 interceptor on MH's outbound GcRegistrationClient + McNotificationClient + inbound MC-facing gRPC server. Parse MhClientMessage envelope, extract trace_parent/state, attach to mh.webtransport.connection spans. See task #27 in docs/user-stories/2026-05-02-browser-client-join.md" --specialist=media-handler` | media-handler | 2, 24, 31 | | Pending |
 | 28 | `/devloop "Dev OTel collector deployment (R-59): infra/services/otel-collector/ Kustomize base (deployment + configmap + service + network-policy); OTLP-gRPC :4317 + OTLP-HTTP :4318 + logging/debug exporters; Kustomize values for AC/GC/MC/MH otel_endpoint + GC otel_collector_endpoint; setup.sh verifies collector readiness BEFORE AC/GC/MC/MH (load-bearing under fail-hard); new infra/docker/prometheus/rules/otel-alerts.yaml with OTelExportFailureRate warn alert; collector-upgrade-discipline note in gc-deployment.md. See task #28 in docs/user-stories/2026-05-02-browser-client-join.md" --specialist=infrastructure` | infrastructure | — | | Pending |
-| 29 | `/devloop "Proto conventions doc + protocol agent-prompt update (R-61 part 1): docs/protocol/CONVENTIONS.md captures buf STANDARD adoption + local choices (bare RPC names, distinct response types, file-layout, vN package suffix); .claude/agents/protocol.md gains lint-conventions bullet + run-buf-after-edit ground rule; protocol INDEX.md points at the new doc. Lands BEFORE #30/#31 so the doc is the spec. See task #29 in docs/user-stories/2026-05-02-browser-client-join.md" --specialist=protocol --light` | protocol | 2 | | Pending |
-| 30 | `/devloop "Proto file-layout cleanup (R-61 part 2): move proto/internal.proto + proto/signaling.proto into proto/dark_tower/{internal,signaling}/ directories; update crates/proto-gen/build.rs include paths; verify TS codegen + Rust workspace still build; resolves 4 MINIMAL-tier buf lint findings; wire-format unchanged. See task #30 in docs/user-stories/2026-05-02-browser-client-join.md" --specialist=protocol` | protocol | 2, 7, 29 | | Pending |
-| 31 | `/devloop "Proto STANDARD-lint rename sweep (R-61 part 3): apply rename map per user-story protocol section — package suffix v1, bare-name RPC types (13 renames), split HeartbeatResponse into FastHeartbeatResponse + ComprehensiveHeartbeatResponse. Wire-breaking on internal.proto. Update every Rust consumer of proto-gen. ADR-0024 §6.4 intersection rule applies. See task #31 in docs/user-stories/2026-05-02-browser-client-join.md" --specialist=protocol --paired-with=auth-controller` | protocol | 2, 7, 30 | | Pending |
+| 29 | `/devloop "Proto conventions doc + protocol agent-prompt update + temporary buf.yaml ignore scaffolding (R-61 part 1): docs/protocol/CONVENTIONS.md captures buf STANDARD adoption + local choices; .claude/agents/protocol.md gains lint-conventions bullet; protocol INDEX.md updated; proto/buf.yaml gains temporary lint.ignore entries for proto/internal.proto + proto/signaling.proto so always-run buf lint (per Track 3 Wave 2) passes during cleanup window — drained by #30/#31. See task #29 in docs/user-stories/2026-05-02-browser-client-join.md" --specialist=protocol --light` | protocol | 2, 35 | | Pending |
+| 30 | `/devloop "Proto file-layout cleanup (R-61 part 2): move proto/internal.proto + proto/signaling.proto into proto/dark_tower/{internal,signaling}/ directories; update crates/proto-gen/build.rs include paths + proto/buf.yaml lint.ignore paths; verify TS codegen + Rust workspace still build; resolves 4 MINIMAL-tier buf lint findings; wire-format unchanged. See task #30 in docs/user-stories/2026-05-02-browser-client-join.md" --specialist=protocol` | protocol | 2, 7, 29 | | Pending |
+| 31 | `/devloop "Proto STANDARD-lint rename sweep (R-61 part 3): apply rename map per user-story protocol section — package suffix v1, bare-name RPC types (13 renames), split HeartbeatResponse. Wire-breaking on internal.proto. Update every Rust consumer of proto-gen. Removes the temporary proto/buf.yaml lint.ignore block as final step (Layer 5 buf lint always-run gates that no findings remain). ADR-0024 §6.4 intersection rule applies. See task #31 in docs/user-stories/2026-05-02-browser-client-join.md" --specialist=protocol --paired-with=auth-controller` | protocol | 2, 7, 30 | | Pending |
+| 32 | `/devloop "Pipeline scaffolding + classifier + base-ref helper (R-62, ADR-0033 Wave 1 #1): scripts/layerN.sh skeletons (1-7) with set -euo pipefail + STATUS aggregation + LAYER stderr line; scripts/layer-all.sh orchestrator with tee /tmp/devloop/layer-N.log + summary table + 90s p95 budget; scripts/lang/_{common,dispatch,changed_helpers,get_base_ref}.sh + self-test matrix; scripts/lang/rust/{changed.sh, changed.test.sh}; per-verb dispatchers; refactor scripts/test.sh body into lang/rust/test.sh; refactor scripts/verify-completion.sh; behavior-equivalence test required. See task #32 in docs/user-stories/2026-05-02-browser-client-join.md" --specialist=infrastructure --paired-with=operations` | infrastructure | — | | Pending |
+| 33 | `/devloop "pnpm audit always-run + ts language directory (R-62, ADR-0033 Wave 1 #2): scripts/lang/ts/{changed.sh, changed.test.sh, audit.sh}; pnpm audit --audit-level=high always-run; .github/workflows/ci.yml calls scripts/layer-all.sh end-to-end. Closes minimatch-class incident. See task #33 in docs/user-stories/2026-05-02-browser-client-join.md" --specialist=infrastructure --paired-with=security` | infrastructure | 32 | | Pending |
+| 34 | `/devloop "Layer A scope-drift parser fix (R-62, ADR-0033 Wave 1 #3): scripts/guards/simple/validate-cross-boundary-scope.sh handles .ts/.tsx/.svelte/.proto path syntax; fixture test under scripts/guards/simple/fixtures/scope-drift/. Closes 2-of-3 Gate 2 attempts trip from test-utils devloop. See task #34 in docs/user-stories/2026-05-02-browser-client-join.md" --specialist=infrastructure` | infrastructure | — | | Pending |
+| 35 | `/devloop "Proto wrappers + Layer 1 stage-1 ordering (R-62, ADR-0033 Wave 2 #4): scripts/lang/proto/{changed.sh, changed.test.sh, compile.sh, format.sh, lint.sh, breaking.sh}; proto-first ordering in scripts/layer1.sh; buf breaking always-run via scripts/audit.sh. Lands BEFORE Track 2 #29 starts. See task #35 in docs/user-stories/2026-05-02-browser-client-join.md" --specialist=protocol --paired-with=infrastructure` | protocol | 32 | | Pending |
+| 36 | `/devloop "TS wrappers (R-62, ADR-0033 Wave 2 #5): scripts/lang/ts/{compile,fmt,lint,test}.sh wrapping nx affected -t <target> --base=<resolved>; uniform STATUS= schema translation. Note: lang/ts/audit.sh already landed in #33. See task #36 in docs/user-stories/2026-05-02-browser-client-join.md" --specialist=infrastructure` | infrastructure | 33 | | Pending |
+| 37 | `/devloop "TS guards under scripts/guards/simple/ts/ (R-62, ADR-0033 Wave 2 #6): six guards — no-secrets-in-ts, no-pii-in-logs-ts, no-test-removal-ts, name-guard-dt-client (R-26), bundle-content-r14 (R-14, may resolve as Vitest contract test), exports-map-closed. See task #37 in docs/user-stories/2026-05-02-browser-client-join.md" --specialist=client --paired-with=security` | client | 32, 33 | | Pending |
+| 38 | `/devloop "SKILL.md Step 6 rewrite + auto-detection patterns + Layer N/A template + Layer 8→7 renumber (R-62, ADR-0033 Wave 3 #7): collapse Step 6 to 'run scripts/layer-all.sh' + Always-Run/Skip-If-Untouched matrix; add client/svelte/sdk/tsx?/proto/buf to auto-detect; renumber Layer 8 → Layer 7 across SKILL.md, ADR-0030, ADR-0033, debate doc, and 4 specialist-knowledge INDEX.md files (~20 active edits). See task #38 in docs/user-stories/2026-05-02-browser-client-join.md" --specialist=operations` | operations | 35, 36, 37 | | Pending |
+| 39 | `/devloop "docs/runbooks/devloop-validation.md (R-62, ADR-0033 Wave 3 #8): authoritative pipeline-failure runbook — layer-by-layer failure-mode → wrapper-script mapping; STATUS= enum reference; _get_base_ref.sh troubleshooting; cross-link from SKILL.md and each layerN.sh header. See task #39 in docs/user-stories/2026-05-02-browser-client-join.md" --specialist=operations` | operations | 38 | | Pending |
+| 40 | `/devloop "Semantic-guard relocation from layer pipeline to reviewer panel (R-62, ADR-0033 Wave 3 #9): remove semantic-guard from scripts/layer7.sh (becomes pure shell, env-tests only); add semantic-guard as 7th reviewer slot at Gate 2; coexist with code-reviewer (option a — distinct lenses); add deduplication step to panel aggregator. See task #40 in docs/user-stories/2026-05-02-browser-client-join.md" --specialist=operations` | operations | 38 | | Pending |
+| 41 | `/devloop "Intentional wire-break override mechanism (R-62, ADR-0033 Wave 3 #10): decide between per-line # buf:breaking:ignore comments vs annotated proto/buf-breaking-allowlist.md ratchet; lands AFTER ≥2 real wire-breaking PRs as case studies (#31 is one such). Must satisfy ADR-0033 §13: in-tree explicit acknowledgement only, no CI bypass flags. See task #41 in docs/user-stories/2026-05-02-browser-client-join.md" --specialist=protocol --paired-with=operations` | protocol | 31, 35 | | Pending |
 
-After all 31 devloops complete: run `/close-story browser-client-join` to verify completeness, run story-scope reflection, commit the cumulative work, and open the PR.
+After all 41 devloops complete: run `/close-story browser-client-join` to verify completeness, run story-scope reflection, commit the cumulative work, and open the PR.
 
 ---
 
@@ -743,3 +781,20 @@ After all 31 devloops complete: run `/close-story browser-client-join` to verify
 - **Specialist task counts**: protocol 2 → 5. Total 28 → 31.
 - **Critical path**: unchanged. The R-61 cleanup chain (`7 → 30 → 31 → consumers`) shares the path-length budget with the client chain (`7 → 9 → 11 → 12 → 13`); both are 4 edges from #7 to #13.
 - **Clarification questions answered**: 14 (bare RPC names), 15 (rename `HeartbeatResponse`).
+
+### Revision 4 — 2026-05-07
+
+**Feedback**: Task #8 (test-utils package) surfaced extensive Rust-only-ness in the validation pipeline (Layers 1-8) and `scripts/guards/` tree — implementer + Lead had to invent ad-hoc TS equivalents and mark cargo-only layers N/A. `pnpm audit` not in the pipeline meant 3 high-severity transitive ReDoS vulns in `nx@20.3.0`'s minimatch were latent for weeks. A 3-round multi-agent `/debate` (security/test/observability/operations/infrastructure/client/protocol) produced ADR-0033: Polyglot Validation Pipeline Strategy, accepted 2026-05-07. The user redirected the implementation work into this story since (a) it was surfaced here, (b) Track 2's R-61 cleanup tasks (#29/#30/#31) need `buf lint` always-run wired into the pipeline before they can self-validate cleanly, (c) Track 1's remaining client tasks (#9, #11, #13–#15) benefit from the polyglot pipeline being in place.
+
+**Track sequencing decision**: Track 3 (polyglot pipeline) lands fully BEFORE Track 2 (proto cleanup) BEFORE Track 1 remainder. Rationale: automation > discipline. Wiring `buf lint` always-run before the proto cleanup means every Track 2 devloop runs the gate; the temporary `buf.yaml` `lint.ignore` scaffolding (added in #29, drained by #30/#31) keeps Track 2 closing cleanly during the cleanup window. Pipeline structurally enforces zero findings at #31's close-out — no separate baseline pass needed.
+
+**Changes**:
+- **Requirements added**: R-62 (Polyglot validation pipeline per ADR-0033).
+- **Tasks added**: #32 (pipeline scaffolding + classifier + base-ref helper); #33 (pnpm audit always-run + ts language directory bootstrap); #34 (Layer A scope-drift parser fix); #35 (proto wrappers + Layer 1 stage-1 ordering); #36 (TS wrappers via Nx); #37 (TS guards under `simple/ts/`); #38 (SKILL.md Step 6 rewrite + Layer 8→7 renumber); #39 (`docs/runbooks/devloop-validation.md`); #40 (semantic-guard relocation from layer pipeline to reviewer panel); #41 (intentional wire-break override mechanism — deferred until ≥2 case studies).
+- **Tasks amended**: #29 adds temporary `buf.yaml` `lint.ignore` scaffolding deliverable + dep on #35 (Track 3 Wave 2 must land first); #30 adds `lint.ignore` path-update deliverable; #31 adds `lint.ignore` removal deliverable + notes pipeline-validates-it-automatically.
+- **Specialist task counts**: infrastructure 6 → 10; protocol 5 → 7; client 5 → 6; operations 2 → 5. Total 31 → 41.
+- **Critical path**: extended by ~3 edges (Track 3 Wave 1 → Wave 2 → Wave 3). Track 1 client work pauses until Tracks 3+2 complete.
+- **Track 1 dep additions**: existing `, 31` deps on tasks #6/#13/#14/#17/#25/#26/#27 already encoded in Revision 3 — preserved.
+- **Layer 8 → Layer 7 renumbering**: documented in #38, applied across `SKILL.md`, `ADR-0030`, `ADR-0033`, debate doc, and 4 specialist-knowledge `INDEX.md` files.
+
+**Reference**: `docs/decisions/adr-0033-polyglot-validation-pipeline.md` + `docs/debates/2026-05-06-polyglot-validation-pipeline-strategy/debate.md`.
