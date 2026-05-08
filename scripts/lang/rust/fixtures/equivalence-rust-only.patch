@@ -1,0 +1,6 @@
+--- a/scripts/lang/rust/fixtures/equivalence-fixture.txt
++++ b/scripts/lang/rust/fixtures/equivalence-fixture.txt
+@@ -0,0 +1,3 @@
++# Behavior-equivalence test fixture marker.
++# Ensures the test path is reproducible across runs.
++# Touching only crates/-related state would still classify as Rust per changed.sh.
