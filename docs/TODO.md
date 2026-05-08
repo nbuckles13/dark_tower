@@ -54,6 +54,8 @@
 
 - [ ] **Layer-runner loop duplicated between `scripts/layer-all.sh` and `scripts/verify-completion.sh` (Wave 1 #1, ADR-0033)**: `scripts/layer-all.sh:32-51` and `scripts/verify-completion.sh:102-113` both implement the per-layer-invoke + tee + `parse_status_line` loop (~12 lines each). The `--layer full` path in verify-completion already delegates to layer-all (verify-completion.sh:89-92), so duplication is bounded to the quick/standard branch. Wave-2-or-later refactor: add `--layers <list>` option to layer-all.sh and have verify-completion.sh invoke it for the quick/standard subsets too. Both files are correct as-is; this is a structural deduplication to land before a third caller emerges. Surfaced during ADR-0033 Wave 1 #1 DRY review (2026-05-08).
 
+- [ ] **`lang/<X>/changed.test.sh` locality-self-test harness duplicated (Wave 1 #2, ADR-0033)**: `scripts/lang/rust/changed.test.sh` and `scripts/lang/ts/changed.test.sh` (added Wave 1 #2) share a verbatim ~30-line harness body — `assert_rc()`, `run_with_cache()` (mktemp + `env -i` cache injection + `printf` rc), `PASS`/`FAIL`/`FAILURES` accounting, and the trailing per-failure dump + summary printer. Only the per-language predicate-cases differ (the lines calling `assert_rc` with paths). Same N-instance parallel-anchor pattern as the `lang/<X>/audit.sh` security-comment block (ADR-0033 §11 convention). Likely target: `scripts/lang/_changed_test_harness.sh` exposing `assert_rc` + `run_with_cache`, plus a tiny driver that takes the language name for the summary banner. Defer until Wave 2 #5 (TS test wrappers) or a third lang's `changed.test.sh` lands — current 2-instance shape is below the threshold where extraction reduces complexity, and the parallel anchor is already easy to read. Surfaced during ADR-0033 Wave 1 #2 DRY review (2026-05-08).
+
 - [ ] **`tests/common/test_state.rs` per-service test scaffolding (AC + MC + GC, three-crate sibling)**: `crates/ac-service/tests/common/test_state.rs` (AC, ADR-0032 Step 4 — `make_app_state`, `seed_signing_key`, `seed_service_credential`, `TEST_CLIENT_SECRET`), `crates/mc-service/tests/common/mod.rs` (MC, ADR-0032 Step 3 — equivalent per-service AppState/Config builders + DB seeding helpers), and `crates/gc-service/tests/common/jwt_fixtures.rs` (GC, ADR-0032 Step 5 — JWT signing fixtures: `TestKeypair`/`TestUserClaims`/`TestServiceClaims`/`build_pkcs8_from_seed`) all house in-crate test scaffolding. Three-crate sibling pattern matches the per-service Cat B precedent (`record_token_refresh_metrics`). Likely consolidation target if a fourth caller emerges: extend the per-service `*-test-utils` crate if the helpers stay service-private (most likely — each service has a distinct `AppState`/JWKS topology), or promote to a workspace-level `crates/test-utils-common` if a test-helper genuinely needs cross-service share. Evaluate when 4th caller emerges. Surfaced during ADR-0032 Step 4 @dry-reviewer Finding 2; GC sibling added in Step 5.
 
 - [ ] **GC dashboard panel for `gc_meeting_join_*` `participant` axis (ADR-0032 Step 5)**: The `participant=user|guest` label was added to the `gc_meeting_join_total` / `gc_meeting_join_duration_seconds` / `gc_meeting_join_failures_total` family in Step 5. Existing panels in `infra/grafana/dashboards/gc-overview.json` (`sum by(status)`, `sum by(error_type)`, success-rate ratio) work unchanged because Prometheus aggregates over the new label by default. A dedicated `by(participant)` panel would let operators triage user-vs-guest failure spikes at a glance — e.g. a `gc_meeting_join_failures_total{participant="guest", error_type="guests_disabled"}` rate panel signals meetings hosting unintended guest-join attempts. Estimated ~30 LoC to `gc-overview.json` (one new panel section). Deferred from Step 5 per @team-lead authorization (ADR-0032 Step 5 plan-stage scope decision).
@@ -251,6 +253,67 @@
 ## Dependency Vulnerabilities (cargo audit)
 
 - [ ] **Re-surface from ADR-0033 Wave 1 #1 (2026-05-08)**: the new `scripts/lang/rust/audit.sh` always-run wrapper at Layer 6 hard-blocks on the same 6 advisories. Pipeline behaviour is per ADR-0033 §3 design (always-run audit gate); the work to upgrade the `wtransport` chain remains owned by security under §11. ADR-0033 §12 14-day MTTR tripwire applies on a per-advisory basis. No new advisories introduced; lockfile last touched in `d918343`.
+
+- [ ] **Spin-out framing — 2-devloop A/B/C cluster split (ADR-0033 Wave 1 #2 deferral, 2026-05-08)**: surfaced again at Gate 2 of devloop `2026-05-08-pnpm-audit-ts-lang` (R-62 / task #33), which formally **deferred** the failure under review-protocol.md §Fix-or-Defer (deferral rationale: fix touches `Cargo.toml`/`Cargo.lock` + `crates/{mc,mh}-service/` + `crates/env-tests/` + the `crates/common/src/webtransport/**` GSA — outside that devloop's scope; requires cross-service co-signed work per ADR-0024 §6.4). Until both Devloop I + Devloop II land, every PR's CI run will Layer 6 RED on the cargo-audit half — accepted per ADR-0033 §10 explicit acceptance of always-run-failure visibility over silent bypass. Security ACKed the deferral on this devloop 2026-05-08 (relayed via team-lead). The 9 lockfile rows (6 errors + 3 unmaintained warnings) cluster along three axes:
+  - **Cluster A** (5 of 9 rows): RUSTSEC-2026-0037 (quinn-proto DoS), RUSTSEC-2025-0009 (ring AES panic), RUSTSEC-2025-0010 (ring unmaintained), and both RUSTSEC-2025-0134 entries (rustls-pemfile 1.0.4 + 2.2.0 unmaintained). Closed by Devloop II.
+  - **Cluster B** (3 of 9 rows): RUSTSEC-2026-0099, RUSTSEC-2026-0104, RUSTSEC-2026-0098 (all rustls-webpki). Closed by Devloop I.
+  - **Cluster C** (1 of 9 rows): RUSTSEC-2023-0071 (rsa via sqlx-mysql). Closed by Devloop I.
+
+  Document context: `docs/devloop-outputs/2026-05-08-pnpm-audit-ts-lang/main.md` § Devloop Verification Steps Layer 6 — "Deferral" + "Spin-out plan — 2 devloops, A/B/C cluster split".
+
+- [ ] **Devloop I — Cluster B + Cluster C (small, fast, ~3-4h)** (depends on `2026-05-08-pnpm-audit-ts-lang` landing first). Specialist: `infrastructure --paired-with=security`. Closes 4 of 9 rows. Two scope items:
+
+  - **Cluster B**: `cargo update -p rustls-webpki@0.103.10` (closes RUSTSEC-2026-0098, -0099, -0104). **Security pre-condition for Gate 3 sign-off**: implementer must surface resolved `rustls` / `rustls-webpki` / `quinn` version pins in `Cargo.lock` for security review before merge — "surgical" depends on the bump not unintentionally pulling the rustls 0.22+ chain widening. If chain widening occurs, scope re-evaluates against Cluster A (this becomes part of Devloop II rather than landing alone).
+
+  - **Cluster C**: rsa@0.9.10 ignore in audit config with rationale (closes RUSTSEC-2023-0071). **Policy text of record** per ADR-0033 §11 (security-owned threshold + ignore-list) — verbatim TOML block authored by @security 2026-05-08, to land in `audit-config.toml` exactly as written:
+
+    ```toml
+    [[ignore]]
+    id = "RUSTSEC-2023-0071"
+    # Crate: rsa 0.9.10 (Marvin Attack — timing side-channel on RSA decryption)
+    #
+    # Exposure analysis (security, 2026-05-08):
+    #   - Pulled in transitively by sqlx-macros-core's compile-time query-
+    #     validation scaffolding, NOT by any runtime driver we select.
+    #   - Workspace sqlx config (Cargo.toml): features = ["runtime-tokio",
+    #     "postgres", "uuid", "chrono", "migrate"]. No "mysql" feature; no
+    #     runtime code path constructs an rsa::* primitive.
+    #   - cargo tree -p rsa --invert (verified 2026-05-08) confirms only
+    #     build-time consumers; no shipped binary links rsa runtime.
+    #   - Marvin Attack requires attacker-observable RSA decrypt timing on a
+    #     server we operate. We don't operate one — we don't ship rsa code.
+    #
+    # Upstream status:
+    #   - No fix available in rsa 0.9.x. Constant-time RSA primitives in Rust
+    #     remain an unsolved upstream problem (see rust-lang/rsa#19, et al.);
+    #     waiting for an rsa fix is waiting indefinitely.
+    #
+    # Sunset:
+    #   - Re-evaluate by 2026-08-08 (90-day default per ADR-0033 §11 audit-
+    #     config policy). Re-evaluation MUST re-verify the build-time-only
+    #     claim above against the then-current Cargo.lock — if any runtime
+    #     driver in our deps starts pulling rsa::*, this entry FAILS-CLOSED:
+    #     remove the ignore, fix, OR re-justify with new exposure analysis.
+    #   - Permanence note: this entry is expected to be the longest-lived in
+    #     audit-config.toml because no upstream fix is on the horizon. That
+    #     does NOT make it unconditional — the build-time-only invariant is
+    #     the load-bearing claim, and that invariant must be re-checked at
+    #     each sunset.
+    ```
+
+    Operational substance preserved alongside the TOML block:
+
+    - **Verification command of record**: `cargo tree -p rsa --invert` is the command for re-verifying the build-time-only invariant at each sunset/tripwire fire.
+    - **90-day sunset** (re-evaluate by **2026-08-08**): heavy active re-justification — re-run `cargo tree -p rsa --invert`, confirm runtime tree is still empty, re-affirm in-tree that the rationale still holds.
+    - **Fail-closed condition** (also encoded in the TOML rationale): if any runtime driver starts pulling `rsa::*`, the ignore expires immediately — no extension, no grace period.
+    - **ADR-0033 §12 14-day MTTR tripwire continues to apply** per security's explicit decision; no special-casing. **Tripwire vs sunset** distinction: tripwire = light periodic re-verification of "still build-time-only, still no fix" (cargo tree + advisory-db check); sunset = heavy active re-justification (full rationale review). Both fire, both add value, they do not conflict.
+    - Cluster C is **expected to be the longest-lived entry** in `audit-config.toml`. The TOML rationale block anchors that expectation so the 2026-08-08 re-justification reads as routine active maintenance, not process failure.
+
+- [ ] **Devloop II — Cluster A (separate, multi-day)** (depends on `2026-05-08-pnpm-audit-ts-lang` landing first; can run parallel with Devloop I but does not depend on it). Workspace `wtransport = "0.1"` → `"0.7"` major-version bump; updates `Identity::self_signed`, `Identity::load_pemfiles`, accept-loop signatures, dangerous-configuration cert pinning across `crates/mc-service/`, `crates/mh-service/`, `crates/env-tests/`, and `crates/common/src/webtransport/**` (Guarded Shared Area per ADR-0024 §6.4). Specialist: `infrastructure --paired-with=meeting-controller --paired-with=media-handler --paired-with=security`; add `--paired-with=protocol` if the framed-envelope handshake is touched. Closes 5 of 9 rows: RUSTSEC-2026-0037, -2025-0009, -2025-0010, and both RUSTSEC-2025-0134 entries.
+
+  **Security has approved starting with `/debate` first** (relayed via team-lead 2026-05-08): cert-verification + WT handshake = §11 / ADR-0023 territory; security will be active in the debate. The dry-run survey ("here's what changes; how do we want to sequence?") prevents a stuck implementer once the Cargo.toml bump fans out into Identity API churn.
+
+  Recommended `/debate` framing: "wtransport 0.1 → 0.7 — what's the API surface delta, what tests need rewriting, do we need a transitional shim, can mc-service and mh-service migrate independently or do they need to ship together?"
 
 - [ ] **Resolve 6 pre-existing `cargo audit` findings** (surfaced 2026-05-03 during browser-client-join Task #2 Layer 6). All transitive — none introduced by Task #2 (no `Cargo.lock` change). Two upstream sources:
   - **`wtransport 0.1.14` tree** — pulls in vulnerable `quinn-proto 0.10.6` (RUSTSEC-2026-0037, high, DoS — fix: upgrade to ≥0.11.14), `ring 0.16.20` (RUSTSEC-2025-0009 — fix: ≥0.17.12), `rustls-webpki 0.101.7` (RUSTSEC-2026-0099 — fix: ≥0.103.12), and `rustls-pemfile` 1.0.4 / 2.2.0 unmaintained warnings (RUSTSEC-2025-0134). The `wtransport` crate has not yet released a version that picks up the fixed transitives. Track upstream; revisit when wtransport 0.2.x lands.

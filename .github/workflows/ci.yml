@@ -55,26 +55,27 @@ jobs:
         with:
           shared-key: "ci-cache"
 
-      - name: Check formatting
-        run: cargo fmt --all -- --check
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
 
-      - name: Run simple guards
-        run: ./scripts/guards/run-guards.sh --verbose
-        env:
-          GUARD_DIFF_BASE: ${{ github.event.pull_request.base.sha }}
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.2
+          run_install: false
 
-      - name: Run Clippy
-        run: cargo clippy --workspace -- -D warnings
-
-      - name: Run tests
+      # Single end-to-end pipeline call — same router as local devloop's
+      # scripts/verify-completion.sh --layer full (ADR-0033 §4). Local repro
+      # of an audit failure: `./scripts/layer6.sh`.
+      - name: Run polyglot validation pipeline
         env:
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/dark_tower_test
           AC_MASTER_KEY: AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=
           AC_BIND_ADDRESS: 127.0.0.1:8082
-        run: cargo test --workspace --verbose
-
-      - name: Build binaries
-        run: cargo build --workspace
+          GUARD_DIFF_BASE: ${{ github.event.pull_request.base.sha }}
+        run: ./scripts/layer-all.sh
 
   coverage:
     name: Code Coverage
