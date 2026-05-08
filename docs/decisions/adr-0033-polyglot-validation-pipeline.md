@@ -355,7 +355,7 @@ Flake-rate breaches in Layer 7 trigger quarantine of the offending test (`.skip`
 | 1 | Refactor `scripts/test.sh` body into `lang/rust/test.sh`; preserve root shim | ❌ Pending | TBD | Behavior-equivalence test required |
 | 1 | Refactor `scripts/verify-completion.sh` to call `scripts/layer-all.sh` | ❌ Pending | TBD | |
 | 1 | `pnpm audit` always-run wired into Layer 6 | ❌ Pending | TBD | Closes minimatch class |
-| 1 | Layer A scope-drift parser fix (handle `.ts/.tsx/.svelte/.proto`) | ❌ Pending | TBD | Closes Gate 2 trip from test-utils |
+| 1 | Layer A scope-drift parser fix (handle `.ts/.tsx/.svelte/.proto`) | ✅ Done | 2026-05-08 | Closes Gate 2 trip from test-utils. Fixture-tested in dev (ad-hoc per `docs/TODO.md:250-252` cleanup policy — not committed); Layer 3 dogfood pass on this devloop's plan. `docs/devloop-outputs/2026-05-08-layer-a-scope-drift-parser-fix/` |
 | 2 | `scripts/lang/proto/{compile,format,lint,breaking}.sh` | ❌ Pending | TBD | Lands BEFORE R-61 task #31 |
 | 2 | `scripts/lang/ts/{compile,fmt,lint,test,audit,e2e}.sh` (Nx-wrapping) | ❌ Pending | TBD | |
 | 2 | TS guards under `scripts/guards/simple/ts/` (6 guards) | ❌ Pending | TBD | client + security paired |

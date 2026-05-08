@@ -163,6 +163,31 @@ check_main_md() {
     local diff_paths
     diff_paths=$(echo "$all_diff" | grep -Ev "$exclude_re" | sort -u || true)
 
+    # Expand plan globs against diff paths so the comm-based set arithmetic stays
+    # purely literal: a glob that matches >=1 diff path is replaced by those paths;
+    # a glob matching zero paths stays literal so it surfaces as planned-untouched.
+    local expanded_plan="" plan_entry diff_entry matched
+    while IFS= read -r plan_entry; do
+        [[ -z "$plan_entry" ]] && continue
+        if [[ "$plan_entry" == *[*?[]* ]]; then
+            matched=""
+            while IFS= read -r diff_entry; do
+                [[ -z "$diff_entry" ]] && continue
+                if path_matches_glob "$diff_entry" "$plan_entry"; then
+                    matched+="${diff_entry}"$'\n'
+                fi
+            done <<< "$diff_paths"
+            if [[ -n "$matched" ]]; then
+                expanded_plan+="$matched"
+            else
+                expanded_plan+="${plan_entry}"$'\n'
+            fi
+        else
+            expanded_plan+="${plan_entry}"$'\n'
+        fi
+    done <<< "$plan_paths"
+    plan_paths=$(echo -n "$expanded_plan" | sort -u)
+
     # Inbound drift: in diff, not in plan.
     local inbound
     inbound=$(comm -23 <(echo "$diff_paths") <(echo "$plan_paths") || true)

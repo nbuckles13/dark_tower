@@ -428,8 +428,48 @@ parse_cross_boundary_table() {
 
             # Strip backticks from path.
             gsub(/`/, "", path)
+            # Strip one trailing parenthetical annotation (e.g., "foo.ts (regen)" -> "foo.ts").
+            sub(/[[:space:]]*\([^)]*\)[[:space:]]*$/, "", path)
 
             printf "%s|%s|%s\n", path, classification, owner
         }
     ' "$main_md"
+}
+
+# =============================================================================
+# Path Matching
+# =============================================================================
+
+# Glob match: does $path match $glob per manifest semantics?
+# Supports trailing /** for any depth, literal paths, and simple globs.
+#
+# Used by:
+#   - validate-cross-boundary-classification.sh (Layer B): GSA detection per
+#     manifest globs (specialists_for_path / path_is_gsa).
+#   - validate-cross-boundary-scope.sh            (Layer A): plan-glob expansion
+#     against diff paths.
+#
+# Single source of truth for path-vs-glob matching across the cross-boundary
+# guard family — any future fix here propagates to both consumers.
+path_matches_glob() {
+    local path="$1"
+    local glob="$2"
+
+    # Literal match.
+    [[ "$path" == "$glob" ]] && return 0
+
+    # Trailing /** — match $prefix/ followed by anything.
+    if [[ "$glob" == *"/**" ]]; then
+        local prefix="${glob%/**}"
+        [[ "$path" == "$prefix"/* ]] && return 0
+        # Also match the prefix itself as a file (rare but possible).
+        [[ "$path" == "$prefix" ]] && return 0
+        return 1
+    fi
+
+    # Fall back to bash extglob matching.
+    shopt -s extglob
+    # shellcheck disable=SC2053
+    [[ "$path" == $glob ]] && return 0
+    return 1
 }
