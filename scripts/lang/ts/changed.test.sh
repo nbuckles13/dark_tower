@@ -1,10 +1,16 @@
 #!/usr/bin/env bash
 # changed.test.sh — locality self-test for lang/ts/changed.sh.
 #
+# TODO(wave-3): migrate to scripts/lang/_test_helpers.sh — see
+# scripts/lang/proto/changed.test.sh for consumer shape. The PASS/FAIL/
+# assert_rc/run_with_cache scaffolding below duplicates _test_helpers.sh
+# (dry-reviewer D1 staged adoption — Wave 2 #4 lands helper + 3rd consumer;
+# rust+ts migrate in a future coordinated devloop).
+#
 # Mirrors the rust self-test layout — small representative path set fired
 # against the predicate via injected DEVLOOP_TMP cache. Catches local-only
 # regressions; full cross-language drift detection lives in
-# _test_changed_predicates.sh (Wave 1 only asserts rust there; ts column TBD).
+# _test_changed_predicates.sh.
 set -euo pipefail
 IFS=$'\n\t'
 
