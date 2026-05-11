@@ -90,7 +90,7 @@ scripts/
       changed.sh
       changed.test.sh
       compile.sh                # buf build
-      format.sh                 # buf format --diff --exit-code
+      fmt.sh                    # buf format --diff --exit-code
       lint.sh                   # buf lint
       breaking.sh               # buf breaking (always-run)
       # Note: no test.sh or audit.sh — proto has no test verb; breaking.sh covers audit
@@ -392,7 +392,7 @@ Flake-rate breaches in Layer 7 trigger quarantine of the offending test (`.skip`
 ### Wave 2 Spin-Out Devloops (parallel after Wave 1)
 
 4. **Buf wrappers + Layer 1 stage-1 ordering** — `protocol` (paired with `infrastructure`)
-   - `scripts/lang/proto/{changed.sh, compile.sh, format.sh, lint.sh, breaking.sh}` (no `test.sh` or `audit.sh` — verb discovery handles absence)
+   - `scripts/lang/proto/{changed.sh, compile.sh, fmt.sh, lint.sh, breaking.sh}` (no `test.sh` or `audit.sh` — verb discovery handles absence)
    - Wire proto invocation as first stage of `scripts/layer1.sh`
    - Wire `buf breaking` into `scripts/audit.sh` always-run (via `lang/proto/breaking.sh` invoked unconditionally)
    - **Lands BEFORE R-61 task #31 starts.**
