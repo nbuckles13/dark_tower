@@ -1,0 +1,12 @@
+# Merge strategies for tracking/log files where parallel branches commonly
+# append independent entries. `merge=union` concatenates both sides at conflict
+# points instead of marking them as conflicts. Safe when both sides only ADD
+# (never modify the same row), which is the convention for these files:
+#
+# - user story Devloop Tracking tables: each devloop marks its own row Complete
+# - docs/TODO.md: each devloop appends its own tech-debt entries
+#
+# See: `infra/devloop/absorb-devloop.sh` for the automation that benefits from
+# these markers.
+docs/user-stories/*.md   merge=union
+docs/TODO.md             merge=union
