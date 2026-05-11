@@ -126,7 +126,7 @@ impl WebTransportServer {
 
         let config = ServerConfig::builder()
             .with_bind_address(bind_addr)
-            .with_identity(&identity)
+            .with_identity(identity)
             .build();
 
         let endpoint = Endpoint::server(config).map_err(|e| {
