@@ -83,6 +83,11 @@ main() {
       base="origin/${GITHUB_BASE_REF}"
       source="ci-pr"
       mode="three-dot"
+      # TODO: emit `git merge-base origin/$GITHUB_BASE_REF HEAD` SHA on stdout
+      # instead of tip-SHA so downstream consumers (e.g. `nx affected --base=$SHA`)
+      # get three-dot-equivalent semantics. Tracked in /work/TODO.md under
+      # "_get_base_ref.sh CI-PR tip-SHA vs merge-base-SHA". Surfaced by #36
+      # (TS wrappers). Changed-files cache (line 121) already uses three-dot.
     else
       # CI on push: HEAD~1, with HEAD fallback for first-commit edge case.
       if git rev-parse --verify HEAD~1 >/dev/null 2>&1; then
