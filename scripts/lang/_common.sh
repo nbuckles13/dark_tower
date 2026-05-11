@@ -112,20 +112,31 @@ parse_status_line() {
 
 # Aggregate multiple STATUS values; print the worst per precedence.
 #
-# Precedence (code-reviewer locked): FAIL > N/A > SKIPPED-NO-DIFF > SKIPPED-NO-VERB > OK
-# Reasoning: SKIPPED-NO-VERB is a §6 success-exit; loud visibility is via the child
-# STATUS line surviving the stream-verbatim contract, not via aggregated promotion.
-# N/A is a deliberate documented gap (e.g. layer 7 wave2-pending); SKIPPED-NO-DIFF
-# is "world state didn't change for this lang"; SKIPPED-NO-VERB is "polyglot reality
-# during ramp-up". A Wave 1 run with only lang/rust/ + Rust OK aggregates to OK, not
-# SKIPPED-NO-VERB — so the success path stays clean.
-# UNKNOWN ranks above FAIL (means dispatcher bug → exit 2).
+# Precedence (code-reviewer locked, re-confirmed Wave 2 #4 per ADR-0033):
+#   FAIL > N/A > OK > SKIPPED-NO-DIFF > SKIPPED-NO-VERB
+# Reasoning: if any child did real work and passed, the layer passed; otherwise
+# the SKIPPED-* state is informative. The Wave 1 ladder (OK at the bottom) was
+# correct only for the single-lang case — once a 2nd lang registered with a
+# verb wrapper, a clean rust-only edit would aggregate to SKIPPED-NO-DIFF (or
+# SKIPPED-NO-VERB for missing verbs), corrupting the "loud success" signal.
+# Wave 2 #4 re-ranks OK above the SKIPPED-* class to honor the documented
+# invariant in all multi-lang cases. N/A remains a deliberate documented gap
+# (e.g. layer 7 wave2-pending) that propagates above OK because it signals
+# "this verb is not yet wired" — distinct from "ran cleanly". UNKNOWN ranks
+# above FAIL (means dispatcher bug → exit 2).
+#
+# Exit-code mapping (status_to_exit_code): unaffected by the re-rank — OK and
+# both SKIPPED-* all still map to 0 (§6 success-exit class).
 #
 # Args: $@=zero-or-more STATUS enum values
 # Outputs: stdout=worst status (OK if no args)
 # Returns: 0
 aggregate_worst_status() {
-  local s worst="OK"
+  if [[ $# -eq 0 ]]; then
+    printf 'OK\n'
+    return 0
+  fi
+  local s worst="$1"; shift
   for s in "$@"; do
     if [[ "$(__status_rank "$s")" -gt "$(__status_rank "$worst")" ]]; then
       worst="$s"
@@ -137,9 +148,9 @@ aggregate_worst_status() {
 # Internal: numeric rank for precedence comparison.
 __status_rank() {
   case "$1" in
-    OK)               printf '0\n' ;;
-    SKIPPED-NO-VERB)  printf '1\n' ;;
-    SKIPPED-NO-DIFF)  printf '2\n' ;;
+    SKIPPED-NO-VERB)  printf '0\n' ;;
+    SKIPPED-NO-DIFF)  printf '1\n' ;;
+    OK)               printf '2\n' ;;
     N/A)              printf '3\n' ;;
     FAIL)             printf '4\n' ;;
     UNKNOWN)          printf '5\n' ;;

@@ -2,7 +2,9 @@
 # _common.test.sh — STATUS aggregation precedence test (test §D).
 #
 # Encodes the canonical precedence as a spec test that fails if anyone reorders.
-# Precedence (code-reviewer locked): FAIL > N/A > SKIPPED-NO-DIFF > SKIPPED-NO-VERB > OK
+# Precedence (code-reviewer locked, re-confirmed Wave 2 #4 α):
+#   FAIL > N/A > OK > SKIPPED-NO-DIFF > SKIPPED-NO-VERB
+# Rationale: see _common.sh comment block above aggregate_worst_status.
 set -euo pipefail
 IFS=$'\n\t'
 
@@ -31,13 +33,13 @@ assert_aggregate "OK" "OK" "OK"
 assert_aggregate "OK" "OK"
 assert_aggregate "OK"  # zero args → OK
 
-# Single-step elevations.
-assert_aggregate "SKIPPED-NO-VERB" "OK" "SKIPPED-NO-VERB"
-assert_aggregate "SKIPPED-NO-DIFF" "OK" "SKIPPED-NO-DIFF"
-assert_aggregate "N/A"             "OK" "N/A"
-assert_aggregate "FAIL"            "OK" "FAIL"
+# Single-step elevations (under α: OK ranks above SKIPPED-*; N/A and FAIL still beat OK).
+assert_aggregate "OK"              "OK" "SKIPPED-NO-VERB"   # α: OK now wins over SKIPPED-NO-VERB
+assert_aggregate "OK"              "OK" "SKIPPED-NO-DIFF"   # α: OK now wins over SKIPPED-NO-DIFF
+assert_aggregate "N/A"             "OK" "N/A"               # N/A beats OK (deliberate documented gap)
+assert_aggregate "FAIL"            "OK" "FAIL"              # FAIL beats OK
 
-# Cross-precedence (code-reviewer locked).
+# Cross-precedence (code-reviewer locked, re-confirmed α).
 assert_aggregate "SKIPPED-NO-DIFF" "SKIPPED-NO-VERB" "SKIPPED-NO-DIFF"   # NO-DIFF beats NO-VERB
 assert_aggregate "N/A"             "SKIPPED-NO-DIFF" "N/A"               # N/A beats NO-DIFF
 assert_aggregate "N/A"             "N/A" "SKIPPED-NO-VERB"               # N/A beats NO-VERB
@@ -49,11 +51,11 @@ assert_aggregate "FAIL"            "OK" "OK" "FAIL" "OK"
 assert_aggregate "N/A"             "OK" "SKIPPED-NO-DIFF" "N/A" "SKIPPED-NO-VERB"
 assert_aggregate "OK"              "OK" "OK" "OK"
 
-# Wave 1 success path: rust=OK + absent ts/proto → SKIPPED-NO-VERB.
-# Per locked precedence, this aggregates to SKIPPED-NO-VERB at the dispatcher
-# level, then OK at the layer if the Rust child stream survives. The aggregate
-# here just tests the comparator: { OK, SKIPPED-NO-VERB } → SKIPPED-NO-VERB.
-assert_aggregate "SKIPPED-NO-VERB" "OK" "SKIPPED-NO-VERB"
+# Wave 2 #4 multi-lang success path (α invariant): rust=OK + ts=SKIPPED-NO-VERB
+# (no compile.sh yet) + proto=SKIPPED-NO-DIFF (untouched) aggregates to OK.
+# This is the regression case the α re-rank exists to fix — without α, the
+# layer would report SKIPPED-NO-DIFF on a clean rust-only edit.
+assert_aggregate "OK" "OK" "SKIPPED-NO-VERB" "SKIPPED-NO-DIFF"
 
 # emit_status formatting.
 out=$(emit_status OK "test-passed")

@@ -29,6 +29,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     socat \
     && rm -rf /var/lib/apt/lists/*
 
+# buf binary for proto pipeline (ADR-0033 §1 — lang/proto/ wrappers invoke `buf`).
+# Pinned + sha256-verified per security supply-chain stance; smoke-test at the end
+# of the RUN fails the image build on a bad download/checksum instead of waiting
+# for first wrapper invocation. Placed before the rust toolchain so layer-cache
+# invalidation on a buf version bump does not nuke the heavy rustup/cargo layers.
+ARG BUF_VERSION=1.50.0
+ARG BUF_SHA256=154ea883ce098eac4fa106ff9ee4e4964bb97f809dd8ec9c34a432b466ce1494
+RUN curl -fsSL "https://github.com/bufbuild/buf/releases/download/v${BUF_VERSION}/buf-Linux-x86_64" \
+      -o /usr/local/bin/buf \
+ && echo "${BUF_SHA256}  /usr/local/bin/buf" | sha256sum -c - \
+ && chmod +x /usr/local/bin/buf \
+ && buf --version
+
 # Nightly toolchain (required by guards/strip-test-code.sh)
 RUN rustup toolchain install nightly --profile minimal
 

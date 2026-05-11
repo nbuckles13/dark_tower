@@ -32,6 +32,10 @@ source "${__here}/_common.sh"
 # Special-cases:
 #   - DEVLOOP_DISPATCH_ALWAYS_RUN=1 in env → skip changed.sh short-circuit
 #     (used by audit dispatcher; ADR-0033 §3 always-run).
+#   - DEVLOOP_DISPATCH_INCLUDE_LANGS=<lang> → keep only the named lang.
+#   - DEVLOOP_DISPATCH_EXCLUDE_LANGS=<lang> → drop the named lang.
+#     (Wave 2 #4: single-lang exact match; multi-lang/comma-split deferred
+#     per YAGNI. layer1.sh uses INCLUDE for stage 1 and EXCLUDE for stage 2.)
 #   - DEVLOOP_LANG_ROOT env override → for hermetic _dispatch.test.sh (test §E).
 #
 # Outputs:
@@ -43,6 +47,8 @@ for_each_lang_with_verb() {
   local verb="$1"; shift
   local lang_root="${DEVLOOP_LANG_ROOT:-${__here}}"
   local always_run="${DEVLOOP_DISPATCH_ALWAYS_RUN:-0}"
+  local include="${DEVLOOP_DISPATCH_INCLUDE_LANGS:-}"
+  local exclude="${DEVLOOP_DISPATCH_EXCLUDE_LANGS:-}"
 
   local -a langs=()
   local d name
@@ -57,6 +63,40 @@ for_each_lang_with_verb() {
 
   if [[ ${#langs[@]} -eq 0 ]]; then
     emit_status N/A "no-languages-registered"
+    return 0
+  fi
+
+  # Apply INCLUDE/EXCLUDE filter BEFORE the lint-at-startup pass: a
+  # filtered-out lang is invisible to the dispatcher (no changed.sh
+  # requirement, no execution, no cache-write side-effects). This means the
+  # filter is a true "skip this lang entirely" — useful for layer scripts
+  # that need to invoke different lang subsets in different stages (e.g.,
+  # layer1.sh stages proto separately from rust+ts via INCLUDE then EXCLUDE).
+  #
+  # Single-lang exact match for Wave 2 — multi-lang/comma-split deliberately
+  # deferred per YAGNI (CLAUDE.md "don't design for hypothetical future
+  # requirements"); if a future layer needs multi-lang filter, format
+  # extension is trivial.
+  if [[ -n "$include" ]]; then
+    local -a kept=()
+    for name in "${langs[@]}"; do
+      [[ "$name" == "$include" ]] && kept+=("$name")
+    done
+    langs=("${kept[@]}")
+  elif [[ -n "$exclude" ]]; then
+    local -a kept=()
+    for name in "${langs[@]}"; do
+      [[ "$name" == "$exclude" ]] || kept+=("$name")
+    done
+    langs=("${kept[@]}")
+  fi
+
+  if [[ ${#langs[@]} -eq 0 ]]; then
+    # Operator-error case (e.g. INCLUDE=nonexistent or EXCLUDE matched all).
+    # Loud signal — langs *exist*, they were explicitly muted (closer to
+    # SKIPPED-NO-VERB than N/A's "verb doesn't apply to anything").
+    echo "# dispatcher: INCLUDE='${include}' EXCLUDE='${exclude}' cleared lang set" >&2
+    emit_status SKIPPED-NO-VERB "all-langs-filtered"
     return 0
   fi
 

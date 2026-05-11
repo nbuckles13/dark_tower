@@ -64,8 +64,10 @@ __assert_predicate() {
 # -----------------------------------------------------------------------------
 # Fixtures (test §2)
 #
-# For Wave 1, only the `rust` column is asserted. The fixture file is structured
-# so Wave 2 can add ts/proto columns without rewriting it.
+# Wave 1 asserted only the `rust` column. Wave 2 #4 adds the `proto` column
+# (this devloop). The `ts` column is added by Wave 2 #5 when ts verb wrappers
+# land. Each lang's predicate is asserted independently — drift between
+# predicates is detectable in CI.
 # -----------------------------------------------------------------------------
 
 # Wave 1 — Rust predicate fixtures.
@@ -106,6 +108,22 @@ __assert_predicate rust "infra/y.yaml" 1 "infra outside any lang"
 # negative case: validation pipeline itself is not in any lang's footprint
 __assert_predicate rust "scripts/test.sh" 1 "negative case: classifier doesn't classify our own infra as Rust"
 __assert_predicate rust "scripts/lang/rust/test.sh" 1 "negative case: Rust-the-language footprint vs Rust-related-files distinction"
+
+# Wave 2 #4 — Proto predicate fixtures.
+
+# happy-path proto files (touched)
+__assert_predicate proto "proto/foo.proto"        0 "happy-path proto src under proto/"
+__assert_predicate proto "proto/internal.proto"   0 "real file — catches predicate-pattern-regression"
+__assert_predicate proto "proto/signaling.proto"  0 "real file — same"
+__assert_predicate proto "proto/buf.yaml"         0 "proto buf config — lives under proto/, covered by prefix arm"
+__assert_predicate proto "proto/buf.gen.yaml"     0 "proto buf codegen config — same"
+
+# negative cases: other langs / outside-tree paths must NOT match
+__assert_predicate proto "crates/foo/src/lib.rs"  1 "Rust happy path → proto untouched"
+__assert_predicate proto "packages/foo/src/index.ts" 1 "TS happy path → proto untouched"
+__assert_predicate proto "docs/x.md"              1 "docs outside any lang"
+__assert_predicate proto "scripts/test.sh"        1 "negative case: classifier doesn't classify our own infra as proto"
+__assert_predicate proto "scripts/lang/proto/changed.sh" 1 "negative case: proto-the-tool footprint vs proto-related-files distinction"
 
 # -----------------------------------------------------------------------------
 # Summary

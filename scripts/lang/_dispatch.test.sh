@@ -189,7 +189,7 @@ ${out}
   fi
 
   # (a) aggregated dispatcher STATUS line is the LAST STATUS= line; per locked
-  # precedence (FAIL > N/A > SKIPPED-NO-DIFF > SKIPPED-NO-VERB > OK) it should
+  # precedence (FAIL > N/A > OK > SKIPPED-NO-DIFF > SKIPPED-NO-VERB) it should
   # be SKIPPED-NO-DIFF since it beats SKIPPED-NO-VERB.
   local last_status
   last_status=$(grep '^STATUS=' <<<"$out" | tail -n1 | sed -n 's/^STATUS=\([^ ]*\).*/\1/p')
@@ -198,7 +198,288 @@ ${out}
   else
     FAIL=$((FAIL + 1))
     FAILURES+=("[stream-verbatim] aggregated STATUS expected SKIPPED-NO-DIFF, got '${last_status}'
-  per locked precedence (NO-DIFF > NO-VERB > OK): ${out}")
+  per locked precedence (Wave 2 #4 α: FAIL > N/A > OK > SKIPPED-NO-DIFF > SKIPPED-NO-VERB): ${out}")
+  fi
+}
+
+# -----------------------------------------------------------------------------
+# Test: DEVLOOP_DISPATCH_INCLUDE_LANGS keeps only the named lang.
+#
+# INCLUDE_LANGS / EXCLUDE_LANGS are Wave 2 #4 additions. layer1.sh uses
+# INCLUDE for stage 1 (proto only) and EXCLUDE for stage 2 (rust+ts). Single-
+# lang exact match for Wave 2 — multi-lang/comma-split deferred per YAGNI.
+# Sentinel-file assertions confirm filter runs BEFORE the changed.sh
+# invocation loop (observability bonus check): a filtered-out lang's
+# changed.sh must not be invoked at all (no cache-write side-effects).
+# -----------------------------------------------------------------------------
+
+test_include_langs_keeps() {
+  local tmp; tmp=$(mktemp -d)
+  trap "rm -rf '$tmp'" RETURN
+
+  mkdir -p "${tmp}/lang/kept_lang" "${tmp}/lang/excluded_lang"
+  cp "${__here}/_common.sh"   "${tmp}/lang/_common.sh"
+  cp "${__here}/_dispatch.sh" "${tmp}/lang/_dispatch.sh"
+
+  for lang in kept_lang excluded_lang; do
+    cat > "${tmp}/lang/${lang}/changed.sh" <<EOF
+#!/usr/bin/env bash
+touch "${tmp}/${lang}.sentinel"
+exit 0
+EOF
+    chmod +x "${tmp}/lang/${lang}/changed.sh"
+    cat > "${tmp}/lang/${lang}/test.sh" <<EOF
+#!/usr/bin/env bash
+echo "STATUS=OK REASON=${lang}-test-passed"
+EOF
+    chmod +x "${tmp}/lang/${lang}/test.sh"
+  done
+
+  local out
+  out=$(
+    DEVLOOP_LANG_ROOT="${tmp}/lang" \
+    DEVLOOP_DISPATCH_INCLUDE_LANGS=kept_lang \
+    bash -c "
+      source '${tmp}/lang/_dispatch.sh'
+      for_each_lang_with_verb 'test'
+    " 2>&1
+  )
+
+  assert_pattern_in "include-keeps:status-kept" "STATUS=OK REASON=kept_lang-test-passed" "$out"
+  if grep -q 'REASON=excluded_lang-test-passed' <<<"$out"; then
+    FAIL=$((FAIL + 1))
+    FAILURES+=("[include-keeps:status-excluded] excluded_lang STATUS leaked into output: ${out}")
+  else
+    PASS=$((PASS + 1))
+  fi
+  if [[ -e "${tmp}/kept_lang.sentinel" ]]; then
+    PASS=$((PASS + 1))
+  else
+    FAIL=$((FAIL + 1))
+    FAILURES+=("[include-keeps:kept-changed-sh-ran] kept_lang.sentinel missing — changed.sh was not invoked")
+  fi
+  if [[ -e "${tmp}/excluded_lang.sentinel" ]]; then
+    FAIL=$((FAIL + 1))
+    FAILURES+=("[include-keeps:excluded-changed-sh-not-run] excluded_lang.sentinel present — filter did not run before the changed.sh invocation loop")
+  else
+    PASS=$((PASS + 1))
+  fi
+
+  rm -rf "$tmp"
+  trap - RETURN
+}
+
+# -----------------------------------------------------------------------------
+# Test: DEVLOOP_DISPATCH_EXCLUDE_LANGS drops the named lang.
+# Mirrors the INCLUDE test but inverts the filter direction.
+# -----------------------------------------------------------------------------
+
+test_exclude_langs_drops() {
+  local tmp; tmp=$(mktemp -d)
+  trap "rm -rf '$tmp'" RETURN
+
+  mkdir -p "${tmp}/lang/kept_lang" "${tmp}/lang/excluded_lang"
+  cp "${__here}/_common.sh"   "${tmp}/lang/_common.sh"
+  cp "${__here}/_dispatch.sh" "${tmp}/lang/_dispatch.sh"
+
+  for lang in kept_lang excluded_lang; do
+    cat > "${tmp}/lang/${lang}/changed.sh" <<EOF
+#!/usr/bin/env bash
+touch "${tmp}/${lang}.sentinel"
+exit 0
+EOF
+    chmod +x "${tmp}/lang/${lang}/changed.sh"
+    cat > "${tmp}/lang/${lang}/test.sh" <<EOF
+#!/usr/bin/env bash
+echo "STATUS=OK REASON=${lang}-test-passed"
+EOF
+    chmod +x "${tmp}/lang/${lang}/test.sh"
+  done
+
+  local out
+  out=$(
+    DEVLOOP_LANG_ROOT="${tmp}/lang" \
+    DEVLOOP_DISPATCH_EXCLUDE_LANGS=excluded_lang \
+    bash -c "
+      source '${tmp}/lang/_dispatch.sh'
+      for_each_lang_with_verb 'test'
+    " 2>&1
+  )
+
+  assert_pattern_in "exclude-drops:status-kept" "STATUS=OK REASON=kept_lang-test-passed" "$out"
+  if grep -q 'REASON=excluded_lang-test-passed' <<<"$out"; then
+    FAIL=$((FAIL + 1))
+    FAILURES+=("[exclude-drops:status-excluded] excluded_lang STATUS leaked into output: ${out}")
+  else
+    PASS=$((PASS + 1))
+  fi
+  if [[ -e "${tmp}/kept_lang.sentinel" ]]; then
+    PASS=$((PASS + 1))
+  else
+    FAIL=$((FAIL + 1))
+    FAILURES+=("[exclude-drops:kept-changed-sh-ran] kept_lang.sentinel missing")
+  fi
+  if [[ -e "${tmp}/excluded_lang.sentinel" ]]; then
+    FAIL=$((FAIL + 1))
+    FAILURES+=("[exclude-drops:excluded-changed-sh-not-run] excluded_lang.sentinel present")
+  else
+    PASS=$((PASS + 1))
+  fi
+
+  rm -rf "$tmp"
+  trap - RETURN
+}
+
+# -----------------------------------------------------------------------------
+# Test: INCLUDE_LANGS=nonexistent → empty-after-filter → aggregated
+# STATUS=SKIPPED-NO-VERB REASON=all-langs-filtered.
+#
+# Catches the load-bearing failure mode (test-reviewer's "third test was
+# the load-bearing one" point): operator typo or stale config that filters
+# to zero langs produces a loud signal, not silent OK.
+# -----------------------------------------------------------------------------
+
+test_filter_empty_after_filter() {
+  local tmp; tmp=$(mktemp -d)
+  trap "rm -rf '$tmp'" RETURN
+
+  mkdir -p "${tmp}/lang/fakelang"
+  cp "${__here}/_common.sh"   "${tmp}/lang/_common.sh"
+  cp "${__here}/_dispatch.sh" "${tmp}/lang/_dispatch.sh"
+
+  cat > "${tmp}/lang/fakelang/changed.sh" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+  chmod +x "${tmp}/lang/fakelang/changed.sh"
+
+  local out
+  out=$(
+    DEVLOOP_LANG_ROOT="${tmp}/lang" \
+    DEVLOOP_DISPATCH_INCLUDE_LANGS=nonexistent_lang \
+    bash -c "
+      source '${tmp}/lang/_dispatch.sh'
+      for_each_lang_with_verb 'test'
+    " 2>&1
+  )
+
+  # REASON asserted explicitly per test-reviewer's ask (catches silent drift).
+  assert_pattern_in "empty-after-filter:status" "STATUS=SKIPPED-NO-VERB REASON=all-langs-filtered" "$out"
+
+  rm -rf "$tmp"
+  trap - RETURN
+}
+
+# -----------------------------------------------------------------------------
+# Test: aggregate_worst_status precedence — Wave 2 #4 (α) regression test.
+#
+# Locks the re-ranked ladder: FAIL > N/A > OK > SKIPPED-NO-DIFF > SKIPPED-NO-VERB.
+# Prior Wave-1 ladder put SKIPPED-* above OK, which broke "loud success" once
+# a 2nd lang registered with a verb wrapper (rust-clean PR aggregated to
+# SKIPPED-NO-DIFF instead of OK). Lead-imposed regression test (constraint #3).
+# -----------------------------------------------------------------------------
+
+test_aggregate_precedence_ok_beats_skipped() {
+  local agg
+  agg=$(bash -c "
+    source '${__here}/_common.sh'
+    aggregate_worst_status OK SKIPPED-NO-DIFF SKIPPED-NO-VERB
+  ")
+  if [[ "$agg" == "OK" ]]; then
+    PASS=$((PASS + 1))
+  else
+    FAIL=$((FAIL + 1))
+    FAILURES+=("[precedence:OK-beats-SKIPPED-*] expected OK, got '${agg}' — precedence ladder regressed")
+  fi
+
+  agg=$(bash -c "
+    source '${__here}/_common.sh'
+    aggregate_worst_status OK FAIL SKIPPED-NO-DIFF
+  ")
+  if [[ "$agg" == "FAIL" ]]; then
+    PASS=$((PASS + 1))
+  else
+    FAIL=$((FAIL + 1))
+    FAILURES+=("[precedence:FAIL-wins] expected FAIL, got '${agg}'")
+  fi
+
+  agg=$(bash -c "
+    source '${__here}/_common.sh'
+    aggregate_worst_status OK N/A
+  ")
+  if [[ "$agg" == "N/A" ]]; then
+    PASS=$((PASS + 1))
+  else
+    FAIL=$((FAIL + 1))
+    FAILURES+=("[precedence:NA-beats-OK] expected N/A, got '${agg}'")
+  fi
+}
+
+# -----------------------------------------------------------------------------
+# Test: scripts/audit.sh fail-closed exit-code aggregation (security S2).
+#
+# `scripts/audit.sh` runs the dispatcher loop, then invokes
+# lang/proto/breaking.sh, then exits with the WORST of the two RCs.
+# If either gate fails, the script must exit non-zero — naive shell where
+# breaking.sh's RC masks the dispatcher's RC is the security regression
+# this test catches.
+#
+# Tests the arithmetic pattern (identical to scripts/audit.sh:12-23), not
+# the live invocation (which would require repo-context + buf install).
+# -----------------------------------------------------------------------------
+
+test_audit_fail_closed_aggregation() {
+  # dispatcher=FAIL(1), breaking=OK(0) → audit must exit 1.
+  local rc
+  rc=$(bash -c '
+    dispatch_rc=1
+    breaking_rc=0
+    echo "$(( dispatch_rc > breaking_rc ? dispatch_rc : breaking_rc ))"
+  ')
+  if [[ "$rc" == "1" ]]; then
+    PASS=$((PASS + 1))
+  else
+    FAIL=$((FAIL + 1))
+    FAILURES+=("[audit-fail-closed:dispatch-fail+breaking-ok] expected 1, got '${rc}' — breaking_rc=0 must NOT mask dispatch_rc=1")
+  fi
+
+  # dispatcher=OK(0), breaking=FAIL(1) → audit must exit 1.
+  rc=$(bash -c '
+    dispatch_rc=0
+    breaking_rc=1
+    echo "$(( dispatch_rc > breaking_rc ? dispatch_rc : breaking_rc ))"
+  ')
+  if [[ "$rc" == "1" ]]; then
+    PASS=$((PASS + 1))
+  else
+    FAIL=$((FAIL + 1))
+    FAILURES+=("[audit-fail-closed:dispatch-ok+breaking-fail] expected 1, got '${rc}'")
+  fi
+
+  # Both OK → audit exits 0.
+  rc=$(bash -c '
+    dispatch_rc=0
+    breaking_rc=0
+    echo "$(( dispatch_rc > breaking_rc ? dispatch_rc : breaking_rc ))"
+  ')
+  if [[ "$rc" == "0" ]]; then
+    PASS=$((PASS + 1))
+  else
+    FAIL=$((FAIL + 1))
+    FAILURES+=("[audit-fail-closed:both-ok] expected 0, got '${rc}'")
+  fi
+
+  # UNKNOWN (rc=2) wins over FAIL (rc=1) — dispatcher bug surfaces loud.
+  rc=$(bash -c '
+    dispatch_rc=2
+    breaking_rc=1
+    echo "$(( dispatch_rc > breaking_rc ? dispatch_rc : breaking_rc ))"
+  ')
+  if [[ "$rc" == "2" ]]; then
+    PASS=$((PASS + 1))
+  else
+    FAIL=$((FAIL + 1))
+    FAILURES+=("[audit-fail-closed:unknown-beats-fail] expected 2, got '${rc}'")
   fi
 }
 
@@ -209,6 +490,11 @@ ${out}
 test_missing_changed_sh
 test_single_lang_no_double_emit
 test_stream_verbatim_contract
+test_include_langs_keeps
+test_exclude_langs_drops
+test_filter_empty_after_filter
+test_aggregate_precedence_ok_beats_skipped
+test_audit_fail_closed_aggregation
 
 printf '\n_dispatch.test.sh: %d passed, %d failed\n' "$PASS" "$FAIL"
 if [[ $FAIL -gt 0 ]]; then

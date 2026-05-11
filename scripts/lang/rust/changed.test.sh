@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 # changed.test.sh — locality self-test for lang/rust/changed.sh.
 #
+# TODO(wave-3): migrate to scripts/lang/_test_helpers.sh — see
+# scripts/lang/proto/changed.test.sh for consumer shape. The PASS/FAIL/
+# assert_rc/run_with_cache scaffolding below duplicates _test_helpers.sh
+# (dry-reviewer D1 staged adoption — Wave 2 #4 lands helper + 3rd consumer;
+# rust+ts migrate in a future coordinated devloop).
+#
 # Fires the rust predicate against a small set of representative paths to
 # catch local-only regressions without waiting for the meta-test to run.
 # The full cross-language drift detection lives in _test_changed_predicates.sh.
