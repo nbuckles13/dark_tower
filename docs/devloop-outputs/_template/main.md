@@ -238,17 +238,24 @@ TBD
 
 ---
 
-## Tech Debt References
+## Tech Debt Pointers
 
-<!-- Tech debt observed during this devloop is appended to `docs/TODO.md`
-     under the appropriate section (Cross-Service Duplication, Observability
-     Debt, Code Quality, etc.). Cite the entries below so future readers of
-     this devloop can locate them. main.md does not duplicate the entries. -->
+**Tech debt entries themselves live in `docs/TODO.md`. This section holds only pointers to those entries.** Do not create a `TODO.md` at the repo root or anywhere else — there is exactly one `docs/TODO.md` for the whole project. Do not inline the debt body here — multi-line entries belong in `docs/TODO.md`, not in this section.
 
-- {Section heading in docs/TODO.md} — {short hook quoting the first line of the entry}
+Each pointer is exactly one bullet of the form `- \`docs/TODO.md\` §SECTION-NAME — one-line hook (≤80 chars)`. If you wrote more than one line per entry, you're writing it in the wrong file — move the body to `docs/TODO.md` and leave only the pointer here.
 
-{Or "No tech debt observed during this devloop" if reviewers and implementer
-recorded nothing.}
+Examples:
+
+```
+- `docs/TODO.md` §Observability Debt — orphan recording-site audit follow-up
+- `docs/TODO.md` §Cross-Service Duplication (DRY) — extract record_token_refresh_metrics
+```
+
+or:
+
+```
+- (none surfaced in this devloop)
+```
 
 ---
 
