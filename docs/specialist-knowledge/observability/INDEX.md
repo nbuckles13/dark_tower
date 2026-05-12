@@ -56,7 +56,7 @@
 - Port map + port-map.env (observability + WebTransport ports) -> `/tmp/devloop-{slug}/ports.json`, `crates/devloop-helper/src/commands.rs:write_port_map_shell()`
 - Status command, pod health parsing, client display -> `crates/devloop-helper/src/commands.rs:cmd_status()`, `parse_pod_health()`, `infra/devloop/dev-cluster`
 - Helper audit log + devloop.sh infrastructure health check (ADR-0030 Step 6) -> `crates/devloop-helper/src/logging.rs:AuditLog`, `infra/devloop/devloop.sh`
-- Env-tests observability + Layer 8 validation pipeline -> `crates/env-tests/src/cluster.rs:ClusterPorts::from_env()`, `crates/env-tests/tests/30_observability.rs`, `.claude/skills/devloop/SKILL.md` (Layer 8)
+- Env-tests observability + Layer 7 validation pipeline -> `crates/env-tests/src/cluster.rs:ClusterPorts::from_env()`, `crates/env-tests/tests/30_observability.rs`, `.claude/skills/devloop/SKILL.md` (Layer 7)
 
 ## Guards
 - Metric-to-dashboard coverage -> `scripts/guards/simple/validate-application-metrics.sh`

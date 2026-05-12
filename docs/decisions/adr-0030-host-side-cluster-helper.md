@@ -376,9 +376,9 @@ cargo test -p env-tests
 
 When run manually on the host, the same tests work with `localhost` URLs (or no env vars, using defaults). The env-test code has no dependency on the helper — it just needs the correct URLs and kubectl access.
 
-### Devloop Skill Integration (Layer 8)
+### Devloop Skill Integration (Layer 7)
 
-The purpose of integrating Kind and env-tests into the devloop is to **catch integration boundary regressions that unit tests cannot detect**. Bugs like the `home_org_id` fix (commit `146234d`) pass all unit tests but break at the cross-service boundary — wrong token claims, mismatched gRPC contracts, deployment config errors, secret leaks, NetworkPolicy violations. Layer 8 catches these before the human reviews the code.
+The purpose of integrating Kind and env-tests into the devloop is to **catch integration boundary regressions that unit tests cannot detect**. Bugs like the `home_org_id` fix (commit `146234d`) pass all unit tests but break at the cross-service boundary — wrong token claims, mismatched gRPC contracts, deployment config errors, secret leaks, NetworkPolicy violations. Layer 7 catches these before the human reviews the code.
 
 **Triggers**: handlers/, grpc/, routes/, common/, env-tests/, proto/, infra/kind/, infra/kubernetes/, infra/docker/, config.rs, migrations/
 
@@ -439,7 +439,7 @@ The helper should check these limits at startup and warn if too low for multi-cl
 | 3 | Kind config template (`kind-config.yaml.tmpl`) with per-instance MC/MH ports | — |
 | 4 | Compiled Rust helper binary (`crates/devloop-helper/`) | Steps 0-3 |
 | 5 | `devloop.sh` changes (launch helper, bind-mount socket + kubeconfig, port map, kubectl in image) | Step 4 |
-| 6 | Devloop skill Layer 8 integration | Step 5 |
+| 6 | Devloop skill Layer 7 integration | Step 5 |
 
 Step 0 is verified (see below). Steps 1-3 are independent. Steps 4-6 are sequential.
 

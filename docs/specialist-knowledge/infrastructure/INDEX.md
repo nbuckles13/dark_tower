@@ -38,7 +38,7 @@
 - Skaffold dev workflow -> `infra/skaffold.yaml`
 - Containerized devloop (health check, eager setup, attach) -> `infra/devloop/devloop.sh`
 - dev-cluster client CLI (status display, setup/status output) -> `infra/devloop/dev-cluster`
-- Devloop Layer 8 (env-tests in validation pipeline) -> `.claude/skills/devloop/SKILL.md`
+- Devloop Layer 7 (env-tests in validation pipeline) -> `.claude/skills/devloop/SKILL.md`
 - Docker Compose (local tests) -> `docker-compose.test.yml`
 - Dev TLS cert generation (CA + MC + MH certs) -> `scripts/generate-dev-certs.sh`
 - CI pipeline -> `.github/workflows/ci.yml`

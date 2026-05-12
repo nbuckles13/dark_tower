@@ -16,7 +16,7 @@
 - Kind config template (envsubst, host-gateway listenAddress) → `infra/kind/kind-config.yaml.tmpl`
 - Devloop wrapper → `infra/devloop/devloop.sh` (health check + eager setup), Dockerfile → `infra/devloop/Dockerfile`; container-side client → `infra/devloop/dev-cluster`
 - Helper commands (setup/deploy/rebuild/teardown/status; `write_port_map_shell()`, DT_HOST_GATEWAY_IP propagation) → `crates/devloop-helper/src/commands.rs`, `protocol.rs`; port registry → `~/.cache/devloop/port-registry.json`; per-devloop state → `/tmp/devloop-{slug}/`
-- Env-test URL config → `crates/env-tests/src/cluster.rs:ClusterPorts::from_env()`; Layer 8 → `.claude/skills/devloop/SKILL.md`
+- Env-test URL config → `crates/env-tests/src/cluster.rs:ClusterPorts::from_env()`; Layer 7 → `.claude/skills/devloop/SKILL.md`
 
 ## Deployment & K8s
 - Kind cluster: `infra/kind/kind-config.yaml`, `infra/kind/scripts/setup.sh` (ADR-0030: `load_image_to_kind()`, `deploy_only_service()`, --yes/--only/--skip-build), `infra/kind/scripts/teardown.sh`

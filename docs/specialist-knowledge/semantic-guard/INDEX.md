@@ -4,7 +4,7 @@
 - Guard methodology & principles → ADR-0015 (`docs/decisions/adr-0015-principles-guards-methodology.md`)
 - Agent Teams validation pipeline → ADR-0024 (`docs/decisions/adr-0024-agent-teams-workflow.md`)
 - Semantic check definitions → `scripts/guards/semantic/checks.md` | Utils → `scripts/guards/common.sh`
-- Validation Layer 8 (env-tests integration) → `.claude/skills/devloop/SKILL.md` ("Layer 8" section)
+- Validation Layer 7 (env-tests integration) → `.claude/skills/devloop/SKILL.md` ("Layer 7" section)
 
 ## Metrics Catalogs (Label Validation)
 - AC → `docs/observability/metrics/ac-service.md` | GC → `docs/observability/metrics/gc-service.md` | MC → `docs/observability/metrics/mc-service.md` | MH → `docs/observability/metrics/mh-service.md`
