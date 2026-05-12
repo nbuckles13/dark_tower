@@ -509,7 +509,7 @@ See: `docs/debates/2026-05-06-polyglot-validation-pipeline-strategy/debate.md`
 - ADR-0024 (Agent Teams workflow + cross-boundary classification)
 - ADR-0025 (Containerized devloop)
 - ADR-0028 (Client architecture, especially §5 supply chain and §7 testing tiers)
-- ADR-0030 (Host-side cluster helper, Layer 8 contract — note: Layer numbering will renumber to Layer 7 in Wave 3)
+- ADR-0030 (Host-side cluster helper, Layer 7 contract — renumbered from Layer 8 in Wave 3 per ADR-0033)
 - ADR-0032 (Metric testability)
 - `.claude/skills/devloop/SKILL.md` (current pipeline definition; rewrite in Wave 3 #7)
 - `docs/devloop-outputs/2026-05-06-test-utils-package/main.md` (the pain inventory that prompted this debate)

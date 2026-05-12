@@ -179,12 +179,13 @@ Extract:
 | `media\|video\|audio\|stream\|sfu\|simulcast\|bandwidth\|codec\|datagram` | media-handler |
 | `api\|endpoint\|route\|http\|gateway\|http3\|webtransport\|tenant\|geographic` | global-controller |
 | `database\|migration\|schema\|sql\|index\|query\|sqlx\|postgres\|redis` | database |
-| `proto\|protobuf\|contract\|wire\|signaling\|message.format\|grpc` | protocol |
+| `proto\|protobuf\|buf\|contract\|wire\|signaling\|message.format\|grpc` | protocol |
 | `test\|coverage\|fuzz` | test |
 | `metric\|trace\|log\|observability` | observability |
 | `deploy\|k8s\|infra\|terraform\|docker\|kubernetes\|helm\|ci\|cd\|pipeline\|github.actions` | infrastructure |
+| `client\|svelte\|sdk\|tsx?` | client |
 
-**Disambiguation**: When a task matches multiple specialist patterns, the more specific match takes precedence. If ambiguity remains, Lead prompts the user to choose. Example: "fix meeting assignment load balancing" matches both `meeting` (MC) and `assignment` (GC) — Lead asks user.
+**Disambiguation**: When a task matches multiple specialist patterns, the more specific match takes precedence. If ambiguity remains, Lead prompts the user to choose. Example: "fix meeting assignment load balancing" matches both `meeting` (MC) and `assignment` (GC) — Lead asks user. Example: "fix media SDK bandwidth heuristic" matches both `sdk` (client) and `media` (MH) — Lead asks user.
 
 **If `--continue` is specified**: See Continue Mode section below. Skip to that workflow.
 
@@ -364,22 +365,57 @@ When the guard passes, update main.md: Phase = implementation, and send "Plan ap
 
 When implementer signals "Ready for validation", run the validation pipeline:
 
-**ENFORCED** (run in order, stop on first failure):
+**ENFORCED** — single command runs all seven layers in order, stops on first failure:
 
-| Layer | Command | What It Catches |
-|-------|---------|-----------------|
-| 1. Compile | `cargo check --workspace` | Type errors, sqlx compile-time failures |
-| 2. Format | `cargo fmt --all` | Auto-fix style violations |
-| 3. Guards | `./scripts/guards/run-guards.sh` | Credential leaks, PII, instrument-skip-all, test-coverage, api-version-check |
-| 4. Tests | `./scripts/test.sh --workspace` | Regressions; ensures DB setup + migrations; report P0 security test count |
-| 5. Clippy | `cargo clippy --workspace -- -D warnings` | Lint warnings |
-| 6. Audit | `cargo audit` | Known dependency vulnerabilities |
-| 7. Semantic | Spawn `semantic-guard` agent (see below) | AI-powered diff analysis: credential leaks, actor blocking, error context |
-| 8. Env-tests | `dev-cluster rebuild-all` + `cargo test -p env-tests --features all` | Integration test failures against live Kind cluster |
+```bash
+./scripts/layer-all.sh
+```
 
-**Layer 7 — Semantic Guard Agent**:
+Each `scripts/layerN.sh` is independently callable for targeted debugging (e.g., `scripts/layer4.sh` to re-run only Layer 4 on a failing diff). See ADR-0033 §4 for the wrapper contract (`STATUS=` lines, `LAYER=N START=… END=… RESULT=…` stderr summary, worst-child STATUS aggregation, 90s p95 wall-clock budget for the always-run subset).
 
-After layers 1-6 pass, spawn the semantic-guard agent **as a member of the existing devloop team** (not as a standalone Agent call). Project-local agent definitions in `.claude/agents/*.md` only resolve via the team-spawn path; a bare `Agent({subagent_type: "semantic-guard"})` will fail because the standalone-Agent harness only knows its built-in `subagent_type` set. Mirror the reviewer-spawn shape from Step 3:
+**Always-Run vs Skip-If-Untouched matrix** (operational subset of ADR-0033 §3; see the ADR for the classifying principle, worked examples like `buf breaking`, and the "when in doubt, always-run" default):
+
+| Layer | Verb     | Always-run                                  | Skip-if-untouched per `lang/<X>/changed.sh` |
+|-------|----------|---------------------------------------------|----------------------------------------------|
+| 1     | Compile  | —                                           | rust, ts, proto                              |
+| 2     | Format   | —                                           | rust, ts, proto                              |
+| 3     | Guards   | ALL guards (each self-classifies)           | —                                            |
+| 4     | Test     | —                                           | rust, ts (proto has no `test.sh`)            |
+| 5     | Lint     | —                                           | rust, ts, proto                              |
+| 6     | Audit    | `cargo audit`, `pnpm audit`, `buf breaking` | —                                            |
+| 7     | Env-tests| dev-cluster + Rust env-tests + Playwright `@smoke` | —                                     |
+
+**Layer N/A justification template**:
+
+A wrapper script under `scripts/lang/<X>/` may report `STATUS=N/A`, `SKIPPED-NO-DIFF`, or `SKIPPED-NO-VERB` per the wrapper contract in ADR-0033 §6. `scripts/layer-all.sh` records the status + `REASON=…` in its summary table; the implementer does **not** owe Gate 2 a separate explanation in those cases — the wrapper's own `REASON=…` is the justification.
+
+The only case requiring implementer action is an unexpected `STATUS=N/A` outside the documented skip cases — that indicates a wrapper bug. Escalate to operations rather than defer.
+
+**ARTIFACT-SPECIFIC** (mandatory when detected file types are in the changeset):
+
+| Artifact | Verification | Trigger |
+|----------|-------------|---------|
+| `.proto` files | Proto compilation, freshness check (regenerate + diff `proto-gen/`), backward compat | `git diff --name-only` includes `proto/` |
+| `migrations/` | Sequential numbering, `.sqlx/` offline data freshness, reversibility documented | `git diff --name-only` includes `migrations/` |
+| K8s manifests | `kubeconform` schema validation | `git diff --name-only` includes `infra/kubernetes/` |
+| Dockerfiles | `hadolint` lint | `git diff --name-only` includes `Dockerfile` |
+| Shell scripts | `shellcheck` lint | `git diff --name-only` includes `*.sh` |
+
+**Layer 7 — Env-tests (Integration)**:
+
+Layer 7 is the seventh shell-layer in `scripts/layer-all.sh`, executed automatically after layers 1-6. The protocol below describes the work `scripts/layer7.sh` performs against the live Kind cluster. Layer 7 always runs — intentionally broader than ADR-0030's trigger-path list, because business logic changes can break integration tests too.
+
+1. **Cluster readiness**: Run `dev-cluster status`. If not ready, run `dev-cluster setup` (polls `setup_in_progress` first). Setup does NOT consume attempts; escalate on setup failure as infra.
+2. **Infra change detection**: If `git diff --name-only ${START_COMMIT}..HEAD -- infra/kind/` shows changes, `dev-cluster teardown` then `setup` (cluster skeleton stale). Does NOT consume attempts; log triggering files.
+3. **Rebuild services**: `dev-cluster rebuild-all`. Report wall-clock time.
+4. **Run env-tests**: Read `/tmp/devloop/ports.json` to construct `ENV_TEST_{AC,GC,PROMETHEUS,GRAFANA,LOKI}_URL` from `.container_urls.*`. Run `timeout 600 cargo test -p env-tests --features all 2>&1 | tee /tmp/devloop/env-test-output.log`. On failure, forward full output + log path to implementer.
+5. **Classify exit**: Exit 0 = pass. Non-zero: if stderr matches infra patterns (`connection refused|timed out|connection reset|broken pipe`), **infrastructure failure** (retry once, do NOT consume attempt, then escalate). Otherwise **test failure** (consume attempt).
+
+**Layer 7 attempt budget**: 2 attempts (separate from layers 1-6's 3). Infrastructure failures do not consume attempts. First-run cluster setup (~7 min) does not count toward attempts.
+
+**Semantic Guard Agent** (interim placement; relocates to reviewer panel in ADR-0033 Wave 3 #9):
+
+After `scripts/layer-all.sh` passes (all seven layers), spawn the semantic-guard agent **as a member of the existing devloop team** (not as a standalone Agent call). Project-local agent definitions in `.claude/agents/*.md` only resolve via the team-spawn path; a bare `Agent({subagent_type: "semantic-guard"})` will fail because the standalone-Agent harness only knows its built-in `subagent_type` set. Mirror the reviewer-spawn shape from Step 3:
 
 ```
 Agent({
@@ -393,40 +429,18 @@ Agent({
 
 Semantic-guard joins the team mailbox, so the verdict comes back via SendMessage like any other reviewer's verdict (NOT via the synchronous Agent return value). Wait for the verdict message. If UNSAFE, treat as a validation failure (send findings to implementer, increment iteration). If SAFE, proceed. Semantic-guard is shut down via the same `shutdown_request` flow as the other reviewers in Step 8.5 (Cleanup Team).
 
-**Layer 8 — Env-tests (Integration)**:
-
-After layers 1-7 pass, run integration tests against the live Kind cluster. Layer 8 always runs — intentionally broader than ADR-0030's trigger-path list, because business logic changes can break integration tests too.
-
-1. **Cluster readiness**: Run `dev-cluster status`. If not ready, run `dev-cluster setup` (polls `setup_in_progress` first). Setup does NOT consume attempts; escalate on setup failure as infra.
-2. **Infra change detection**: If `git diff --name-only ${START_COMMIT}..HEAD -- infra/kind/` shows changes, `dev-cluster teardown` then `setup` (cluster skeleton stale). Does NOT consume attempts; log triggering files.
-3. **Rebuild services**: `dev-cluster rebuild-all`. Report wall-clock time.
-4. **Run env-tests**: Read `/tmp/devloop/ports.json` to construct `ENV_TEST_{AC,GC,PROMETHEUS,GRAFANA,LOKI}_URL` from `.container_urls.*`. Run `timeout 600 cargo test -p env-tests --features all 2>&1 | tee /tmp/devloop/env-test-output.log`. On failure, forward full output + log path to implementer.
-5. **Classify exit**: Exit 0 = pass. Non-zero: if stderr matches infra patterns (`connection refused|timed out|connection reset|broken pipe`), **infrastructure failure** (retry once, do NOT consume attempt, then escalate). Otherwise **test failure** (consume attempt).
-
-**Layer 8 attempt budget**: 2 attempts (separate from layers 1-7's 3). Infrastructure failures do not consume attempts. First-run cluster setup (~7 min) does not count toward attempts.
-
-**ARTIFACT-SPECIFIC** (mandatory when detected file types are in the changeset):
-
-| Artifact | Verification | Trigger |
-|----------|-------------|---------|
-| `.proto` files | Proto compilation, freshness check (regenerate + diff `proto-gen/`), backward compat | `git diff --name-only` includes `proto/` |
-| `migrations/` | Sequential numbering, `.sqlx/` offline data freshness, reversibility documented | `git diff --name-only` includes `migrations/` |
-| K8s manifests | `kubeconform` schema validation | `git diff --name-only` includes `infra/kubernetes/` |
-| Dockerfiles | `hadolint` lint | `git diff --name-only` includes `Dockerfile` |
-| Shell scripts | `shellcheck` lint | `git diff --name-only` includes `*.sh` |
-
 **If pass**:
 - Update main.md: Phase = review
 - Message each reviewer individually (unicast, not broadcast): "Start Review. Validation passed — please examine the changes and send your verdict."
 
-**If fail (layers 1-7)**:
+**If fail (layers 1-6)**:
 - Send failure details to implementer
 - Increment iteration count
 - Max 3 attempts before escalation
 
-**If fail (layer 8)**:
+**If fail (layer 7)**:
 - Send full env-test output (stdout + stderr) to implementer
-- Increment Layer 8 iteration count (separate from layers 1-7)
+- Increment Layer 7 iteration count (separate from layers 1-6)
 - Max 2 attempts before escalation
 - Infrastructure failures do not consume attempts (retry once, then escalate)
 
