@@ -102,10 +102,16 @@ echo -e "${BOLD}Simple Guards${NC}"
 echo "============="
 echo ""
 
-# Find all simple guards
+# Iterate simple/**/*.sh recursively (per ADR-0033 §1.5). Prune fixtures/ —
+# no committed fixtures per docs/TODO.md:341 (2026-05-08 guard-self-test-
+# cleanup policy); pruning structurally enforces the policy at the runner
+# level so a future accidental fixture addition does not auto-execute.
 SIMPLE_GUARDS_DIR="$SCRIPT_DIR/simple"
 if [[ -d "$SIMPLE_GUARDS_DIR" ]]; then
-    for guard in "$SIMPLE_GUARDS_DIR"/*.sh; do
+    mapfile -d '' -t guards < <(
+        find "$SIMPLE_GUARDS_DIR" -name "*.sh" -type f -not -path '*/fixtures/*' -print0 | sort -z
+    )
+    for guard in "${guards[@]}"; do
         if [[ -x "$guard" ]]; then
             GUARD_NAME=$(basename "$guard" .sh)
             ((TOTAL_GUARDS++)) || true
