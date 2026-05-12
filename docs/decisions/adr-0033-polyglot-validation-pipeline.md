@@ -96,7 +96,7 @@ scripts/
       # Note: no test.sh or audit.sh — proto has no test verb; breaking.sh covers audit
 
   guards/
-    run-guards.sh               # KEEP — universal, runs all simple/*.sh (per-guard self-classification preserved)
+    run-guards.sh               # KEEP — universal, runs all simple/**/*.sh recursively, fixtures pruned (per-guard self-classification preserved)
     common.sh
     simple/
       rust/                     # MOVED — existing Rust guards
