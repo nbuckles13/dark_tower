@@ -198,7 +198,9 @@ find_main_md_files() {
     fi
 
     local base
-    # Prefer explicit $GUARD_DIFF_BASE from common.sh, else merge-base with main.
+    # get_diff_base forwards to _get_base_ref.sh which returns a SHA in CI and
+    # local-mergebase modes, and falls back to "HEAD" only in local-no-mergebase
+    # mode (no origin/main reachable). This fallback handles that edge case.
     base=$(get_diff_base)
     if [[ "$base" == "HEAD" ]]; then
         # Local run; try merge-base with main for devloop-branch semantics.

@@ -78,7 +78,6 @@ jobs:
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/dark_tower_test
           AC_MASTER_KEY: AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=
           AC_BIND_ADDRESS: 127.0.0.1:8082
-          GUARD_DIFF_BASE: ${{ github.event.pull_request.base.sha }}
         run: ./scripts/layer-all.sh
 
   coverage:
@@ -104,6 +103,9 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        # fetch-depth omitted: coverage job runs cargo-llvm-cov over the full
+        # working tree; no diff-aware tooling is invoked here. The pipeline
+        # job above requires fetch-depth: 0 — keep that surface tight.
 
       - name: Install system dependencies
         run: |

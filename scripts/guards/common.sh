@@ -23,12 +23,13 @@ NC='\033[0m' # No Color
 # Changed File Detection
 # =============================================================================
 
-# Determine the git ref to diff against.
-#   - CI (PRs):  GUARD_DIFF_BASE is set to the PR base SHA by the workflow
-#   - Local:     falls back to HEAD (working-tree changes since last commit)
-# Guards and helper functions below use this instead of hardcoding HEAD.
+# Thin forwarder to the canonical resolver (ADR-0033 §7 SSOT).
+# No logic here — all CI/local detection, merge-base resolution, ref validation,
+# and SHA shaping live in _get_base_ref.sh. See task #42 §Decisions for the
+# rationale (forwarder vs env-preference chain).
 get_diff_base() {
-    echo "${GUARD_DIFF_BASE:-HEAD}"
+    # Forwarder to scripts/lang/_get_base_ref.sh — ADR-0033 §7 canonical resolver.
+    "$(dirname "${BASH_SOURCE[0]}")/../lang/_get_base_ref.sh"
 }
 
 # Get files modified compared to diff base (tracked files only)

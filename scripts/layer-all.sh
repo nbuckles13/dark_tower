@@ -21,6 +21,28 @@ __here="$(cd "$(dirname "$0")" && pwd)"
 source "${__here}/lang/_common.sh"
 init_devloop_tmp
 
+# Precondition: base ref must be pack-resident (ci.yml fetch-depth: 0 — task #42).
+# Dispatch per mode mirrors _get_base_ref.sh's resolution branches.
+if [[ -n "${GITHUB_ACTIONS:-}" && "${GITHUB_EVENT_NAME:-}" == "pull_request" ]]; then
+  # CI-PR: $GITHUB_BASE_REF is the actual base branch (main OR develop).
+  __precondition_ref="origin/${GITHUB_BASE_REF}"
+elif [[ -z "${GITHUB_ACTIONS:-}" ]]; then
+  # Local: resolver uses origin/main.
+  __precondition_ref="origin/main"
+else
+  # CI-push: resolver uses HEAD~1 (local by definition, no remote pack lookup).
+  __precondition_ref=""
+fi
+if [[ -n "$__precondition_ref" ]] && ! git merge-base "${__precondition_ref}" HEAD >/dev/null 2>&1; then
+  # merge-base reachability check — catches both ref-missing (empty/wrong clone)
+  # AND merge-base-outside-depth-window (production-likely depth-N shallow case)
+  # with the same fetch-depth: 0 remediation.
+  printf 'PRECONDITION_FAILURE: merge-base(%s, HEAD) unreachable — CI clone too shallow.\n\n' "$__precondition_ref" >&2
+  printf 'Fix: set actions/checkout fetch-depth: 0 in .github/workflows/ci.yml\n' >&2
+  printf 'See docs/runbooks/devloop-validation.md (lands in task #39).\n' >&2
+  exit 2
+fi
+
 # Cleanup prior run's logs (paired-operations §4).
 rm -f "${DEVLOOP_TMP}"/layer-*.log "${DEVLOOP_TMP}"/layer-*.stderr.log "${DEVLOOP_TMP}"/changed-files.layer-*
 
