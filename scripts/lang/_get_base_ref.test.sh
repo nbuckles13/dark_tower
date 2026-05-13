@@ -176,6 +176,7 @@ test_local_no_mergebase() {
 }
 
 # 5. ci-pr: PR event, local file:// remote stands in for origin.
+#    Post task #42: BASE_REF resolves to merge-base(origin/main, HEAD), DIFF_MODE=two-dot.
 test_ci_pr() {
   local tmp; tmp=$(mktemp_register)
   __push_cwd "$tmp"
@@ -185,6 +186,8 @@ test_ci_pr() {
   git add a.txt
   git commit -q -m "feat: a"
   git push --quiet origin feat
+  local expected_sha
+  expected_sha=$(git merge-base origin/main HEAD)
   out=$(run_isolated \
           GITHUB_ACTIONS=1 \
           GITHUB_EVENT_NAME=pull_request \
@@ -192,11 +195,86 @@ test_ci_pr() {
           2>&1 >/dev/null)
   assert_base_ref_line_well_formed "ci-pr" "$out"
   assert_base_source "ci-pr" "ci-pr" "$out"
-  if grep -q "DIFF_MODE=three-dot" <<<"$out"; then
+  if grep -q "DIFF_MODE=two-dot" <<<"$out"; then
     PASS=$((PASS + 1))
   else
     FAIL=$((FAIL + 1))
-    FAILURES+=("[ci-pr] expected DIFF_MODE=three-dot, stderr: $out")
+    FAILURES+=("[ci-pr] expected DIFF_MODE=two-dot, stderr: $out")
+  fi
+  if grep -q "BASE_REF=${expected_sha} " <<<"$out"; then
+    PASS=$((PASS + 1))
+  else
+    FAIL=$((FAIL + 1))
+    FAILURES+=("[ci-pr] expected BASE_REF=${expected_sha} (merge-base), stderr: $out")
+  fi
+  __pop_cwd
+}
+
+# 5b. ci-pr-merge-base-vs-tip: assert that BASE_REF is the MERGE-BASE, not the
+#     base-branch tip. Constructs M2 (unrelated progress on origin/main after
+#     PR branch was cut) and asserts BASE_REF != origin/main tip SHA.
+test_ci_pr_merge_base_vs_tip() {
+  local tmp; tmp=$(mktemp_register)
+  __push_cwd "$tmp"
+  init_repo_with_origin "$tmp"
+  # init_repo_with_origin leaves HEAD on the initial commit (the merge-base anchor).
+  local merge_base_sha
+  merge_base_sha=$(git rev-parse HEAD)
+  # Create feat branch with one PR commit (P1).
+  git checkout -q -b feat
+  echo "p1" > p1.txt
+  git add p1.txt
+  git commit -q -m "feat: p1"
+  # Advance origin/main with an unrelated commit (M2) via a worktree on main.
+  # Use a detached branch from the merge-base to simulate main advancing.
+  git checkout -q -b main_advance "$merge_base_sha"
+  echo "m2" > m2.txt
+  git add m2.txt
+  git commit -q -m "main: m2 unrelated"
+  git push --quiet origin "main_advance:main" --force
+  local main_tip_sha
+  main_tip_sha=$(git rev-parse HEAD)
+  # Refresh origin/main and switch back to feat (HEAD = PR tip).
+  git fetch --quiet origin
+  git checkout -q feat
+  out=$(run_isolated \
+          GITHUB_ACTIONS=1 \
+          GITHUB_EVENT_NAME=pull_request \
+          GITHUB_BASE_REF=main \
+          2>&1 >/dev/null)
+  if grep -q "BASE_REF=${merge_base_sha} " <<<"$out"; then
+    PASS=$((PASS + 1))
+  else
+    FAIL=$((FAIL + 1))
+    FAILURES+=("[ci-pr-merge-base-vs-tip] expected BASE_REF=${merge_base_sha} (merge-base), stderr: $out")
+  fi
+  if grep -q "BASE_REF=${main_tip_sha} " <<<"$out"; then
+    FAIL=$((FAIL + 1))
+    FAILURES+=("[ci-pr-merge-base-vs-tip] BASE_REF resolved to main tip ${main_tip_sha}; should be merge-base")
+  else
+    PASS=$((PASS + 1))
+  fi
+  __pop_cwd
+}
+
+# 5c. local-mergebase-regression: local-mode BASE_REF equals merge-base. Pre-#42
+#     behavior preserved; this assertion guards against future regressions.
+test_local_clean_merge_base_regression() {
+  local tmp; tmp=$(mktemp_register)
+  __push_cwd "$tmp"
+  init_repo_with_origin "$tmp"
+  git checkout -q -b feat
+  echo "x" > a.txt
+  git add a.txt
+  git commit -q -m "feat: a"
+  local expected_sha
+  expected_sha=$(git merge-base origin/main HEAD)
+  out=$(run_isolated 2>&1 >/dev/null)
+  if grep -q "BASE_REF=${expected_sha} " <<<"$out"; then
+    PASS=$((PASS + 1))
+  else
+    FAIL=$((FAIL + 1))
+    FAILURES+=("[local-mergebase-regression] expected BASE_REF=${expected_sha}, stderr: $out")
   fi
   __pop_cwd
 }
@@ -285,6 +363,8 @@ test_local_dirty
 test_local_with_untracked
 test_local_no_mergebase
 test_ci_pr
+test_ci_pr_merge_base_vs_tip
+test_local_clean_merge_base_regression
 test_ci_push
 test_ci_push_first_commit
 test_ci_pr_base_ref_unreachable

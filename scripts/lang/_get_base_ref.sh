@@ -72,23 +72,15 @@ main() {
   if [[ -n "${GITHUB_ACTIONS:-}" ]]; then
     # CI mode
     if [[ "${GITHUB_EVENT_NAME:-}" == "pull_request" ]]; then
-      # CI on PR: 3-dot diff vs origin/$GITHUB_BASE_REF
+      # CI on PR: resolve to merge-base of origin/$GITHUB_BASE_REF and HEAD.
+      # Base ref is pack-resident: ci.yml fetch-depth: 0 is the precondition.
       __validate_ref_name "${GITHUB_BASE_REF:?GITHUB_BASE_REF required for pull_request event}"
-      # Defensive fetch — sparse-checkouts and worktrees may not have base ref locally.
-      # Suppress fetch stderr (could include token-bearing URLs per security O5).
-      if ! git fetch --no-tags origin "$GITHUB_BASE_REF" 2>/dev/null; then
-        echo "ERROR: PR base ref unreachable: GITHUB_BASE_REF=${GITHUB_BASE_REF}" >&2
+      if ! base=$(git merge-base "origin/${GITHUB_BASE_REF}" HEAD 2>/dev/null); then
+        echo "ERROR: could not compute merge-base for GITHUB_BASE_REF=${GITHUB_BASE_REF}" >&2
         exit 2
       fi
-      base="origin/${GITHUB_BASE_REF}"
       source="ci-pr"
-      mode="three-dot"
-      # TODO: emit `git merge-base origin/$GITHUB_BASE_REF HEAD` SHA on stdout
-      # instead of tip-SHA so downstream consumers (e.g. `nx affected --base=$SHA`)
-      # get three-dot-equivalent semantics. Tracked in docs/TODO.md under
-      # "## Polyglot Pipeline Follow-ups (ADR-0033 Wave 1 #1)" — entry
-      # "_get_base_ref.sh CI-PR tip-SHA vs merge-base-SHA divergence". Surfaced
-      # by #36 (TS wrappers). Changed-files cache (line 121) already uses three-dot.
+      mode="two-dot"
     else
       # CI on push: HEAD~1, with HEAD fallback for first-commit edge case.
       if git rev-parse --verify HEAD~1 >/dev/null 2>&1; then
@@ -123,18 +115,15 @@ main() {
     exit 2
   fi
 
-  # Compute changed-files list.
-  if [[ "$mode" == "three-dot" ]]; then
-    git diff --name-only "${base}...HEAD" > "$cache_file"
-  else
-    {
-      git diff --name-only "$base"
-      # Local mode: union in untracked files.
-      if [[ -z "${GITHUB_ACTIONS:-}" ]]; then
-        git ls-files --others --exclude-standard
-      fi
-    } | sort -u > "$cache_file"
-  fi
+  # Compute changed-files list. All modes are two-dot (CI-PR uses merge-base SHA,
+  # which collapses three-dot to two-dot — see task #42 §Decisions).
+  {
+    git diff --name-only "$base"
+    # Local mode: union in untracked files.
+    if [[ -z "${GITHUB_ACTIONS:-}" ]]; then
+      git ls-files --others --exclude-standard
+    fi
+  } | sort -u > "$cache_file"
 
   local files_changed
   files_changed=$(wc -l < "$cache_file" | tr -d '[:space:]')
