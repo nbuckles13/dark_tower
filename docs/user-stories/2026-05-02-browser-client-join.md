@@ -530,12 +530,13 @@ Cross-cutting; no standalone task this story. Security requirements ride other t
 | 39 | `docs/runbooks/devloop-validation.md` runbook (R-62, ADR-0033 Wave 3 #8): authoritative runbook for pipeline failures. Layer-by-layer failure-mode → wrapper-script mapping. Exit-code reference (0/1/2 + `STATUS=` enum parsing). `_get_base_ref.sh` troubleshooting playbook (the stderr `BASE_REF=...` line is the runbook anchor). Per-language wrapper triage (`STATUS=SKIPPED-NO-VERB` interpretation, `_changed_helpers.sh` debugging, `_test_changed_predicates.sh` drift detection). Cross-link from `SKILL.md` Step 6 + each `layerN.sh` header comment. | operations | 38 | docs |
 | 40 | Semantic-guard relocation from layer pipeline to reviewer panel (R-62, ADR-0033 Wave 3 #9): remove semantic-guard agent invocation from `scripts/layer7.sh` (which then becomes pure shell — env-tests only). Add `semantic-guard` as a 7th reviewer slot in the Gate 2 reviewer panel composition (alongside security, code-reviewer, dry-reviewer, observability, operations, test). Coexist with code-reviewer (option a per ADR-0033 §8 — distinct lenses: semantic-guard targets specific anti-patterns, code-reviewer is general). Add deduplication step to panel aggregator so identical findings from semantic-guard + code-reviewer don't both surface. Layer-script model becomes pure shell. | operations | 38 | code, docs |
 | 41 | Intentional wire-break override mechanism (R-62, ADR-0033 Wave 3 #10): decide between per-line `# buf:breaking:ignore` comments vs annotated `proto/buf-breaking-allowlist.md` ratchet list. Land **after** ≥2 real wire-breaking PRs as case studies (Track 2 #31 is one such case; second case TBD post-#31). Mechanism must satisfy ADR-0033 §13: "intentional wire-breaks must be acknowledged explicitly in-tree, never via CI bypass flags or environment overrides." Cross-boundary: `--paired-with=operations`. | protocol | 31, 35 | code, docs |
+| 42 | Devloop container pnpm-store + entrypoint pnpm install (R-62, ADR-0033 Wave 2 follow-up): add `pnpm-store` named volume + `-e npm_config_store_dir=/tmp/pnpm-store` to `infra/devloop/devloop.sh` (mirrors existing `cargo-registry` / `cargo-git` cache pattern). Add conditional `pnpm install --frozen-lockfile` to `infra/devloop/entrypoint.sh` (runs when `/work/pnpm-lock.yaml` exists and `/work/node_modules/.bin/nx` is missing). Without this, the TS wrappers landed in #36 (`scripts/lang/ts/{compile,fmt,lint,test}.sh`) silently no-op inside devloops because `nx` is a workspace devDep and `node_modules/.bin/nx` is never materialized — TS-touching devloops pass `scripts/layer-all.sh` without ever exercising lint/typecheck/test. First devloop on a host populates the volume; subsequent devloops hardlink-only. Verify: fresh devloop has `nx --version` after entrypoint; `scripts/lang/ts/lint.sh` succeeds. | infrastructure | — | code |
 
 ### Task Dependency Graph
 
 Tasks land in three sequenced **tracks** (per Revision 4 sequencing decision):
 
-- **Track 3 — Polyglot pipeline foundation** (R-62, ADR-0033): tasks 32-41. Lands first, fully, before Track 2.
+- **Track 3 — Polyglot pipeline foundation** (R-62, ADR-0033): tasks 32-42. Lands first, fully, before Track 2.
 - **Track 2 — Proto STANDARD-lint cleanup** (R-61): tasks 29-31. Lands after Track 3 (so `buf lint` is wired in and the temporary `buf.yaml` ignore scaffolding has somewhere to apply).
 - **Track 1 — Browser-client-join story remainder**: tasks 1-28. Phase 1 tasks (1, 2, 3) already done; the rest pause until Tracks 3+2 complete.
 
@@ -579,6 +580,7 @@ Track 1 (resumes after Tracks 3+2 done):
 - **Track 3 Wave 1** (3-way parallel start): 32 is the dispatcher refactor (largest); 33 chains after 32 because TS lang dir is created there; 34 (scope-drift parser fix) is fully independent and can run in parallel with 32.
 - **Track 3 Wave 2** (3-way parallel): 35, 36, 37 run in parallel after Wave 1 (different specialists: protocol, infrastructure, client).
 - **Track 3 Wave 3** (initial then 2-way): 38 (SKILL.md rewrite + renumber) lands first; then 39 (runbook) and 40 (semantic-guard relocation) run in parallel. 41 (override mechanism) is deferred until Track 2 #31 ships as a case study.
+- **Track 3 Wave 2 follow-up**: 42 (devloop container pnpm-store + entrypoint pnpm install) — independent of Wave 3 sequencing; can run in parallel with any in-flight task. Cleanly pairs with 39 (different specialist, no file overlap).
 - **Track 2** (sequential): 29 → 30 → 31 in order; spec-first sequencing preserved per R-61 design.
 - **Track 1 — Phase 1** (massively parallel — 6 remaining tasks): 4, 5, 10, 23, 24, 28 run in parallel after Track 2.
 - **Track 1 — Phase 5** (5-way fork): 6, 25, 26, 27, 12 run in parallel after #31 clears.
@@ -590,7 +592,7 @@ Track 1 (resumes after Tracks 3+2 done):
 
 | Specialist | Tasks | Count |
 |-----------|-------|-------|
-| infrastructure | 1, 3, 4, 17, 22, 28, 32, 33, 34, 36 | 10 |
+| infrastructure | 1, 3, 4, 17, 22, 28, 32, 33, 34, 36, 42 | 11 |
 | protocol | 2, 7, 29, 30, 31, 35, 41 | 7 |
 | meeting-controller | 6 | 1 |
 | global-controller | 5, 10, 26 | 3 |
@@ -602,7 +604,7 @@ Track 1 (resumes after Tracks 3+2 done):
 | operations | 20, 21, 38, 39, 40 | 5 |
 | security | — (cross-cutting; reviews each task at devloop close; paired on #33, #37) | 0 |
 | database | — (opt-out, interface validated; SQL provided to infra) | 0 |
-| **Total** | | **41** |
+| **Total** | | **42** |
 
 ### Requirements Coverage
 
@@ -726,16 +728,15 @@ Each row below is a `/devloop` invocation. Run them in dependency order (see §T
 | 33 | `/devloop "pnpm audit always-run + ts language directory (R-62, ADR-0033 Wave 1 #2): scripts/lang/ts/{changed.sh, changed.test.sh, audit.sh}; pnpm audit --audit-level=high always-run; .github/workflows/ci.yml calls scripts/layer-all.sh end-to-end. Closes minimatch-class incident. See task #33 in docs/user-stories/2026-05-02-browser-client-join.md" --specialist=infrastructure --paired-with=security` | infrastructure | 32 | `docs/devloop-outputs/2026-05-08-pnpm-audit-ts-lang/main.md` | Completed |
 | 34 | `/devloop "Layer A scope-drift parser fix (R-62, ADR-0033 Wave 1 #3): scripts/guards/simple/validate-cross-boundary-scope.sh handles .ts/.tsx/.svelte/.proto path syntax; fixture test under scripts/guards/simple/fixtures/scope-drift/. Closes 2-of-3 Gate 2 attempts trip from test-utils devloop. See task #34 in docs/user-stories/2026-05-02-browser-client-join.md" --specialist=infrastructure` | infrastructure | — | `docs/devloop-outputs/2026-05-08-layer-a-scope-drift-parser-fix/` | Completed |
 | 35 | `/devloop "Proto wrappers + Layer 1 stage-1 ordering (R-62, ADR-0033 Wave 2 #4): scripts/lang/proto/{changed.sh, changed.test.sh, compile.sh, format.sh, lint.sh, breaking.sh}; proto-first ordering in scripts/layer1.sh; buf breaking always-run via scripts/audit.sh. Lands BEFORE Track 2 #29 starts. See task #35 in docs/user-stories/2026-05-02-browser-client-join.md" --specialist=protocol --paired-with=infrastructure` | protocol | 32 | `docs/devloop-outputs/2026-05-11-proto-wrappers-layer1-ordering/main.md` | Completed |
-| 36 | `/devloop "TS wrappers (R-62, ADR-0033 Wave 2 #5): scripts/lang/ts/{compile,fmt,lint,test}.sh wrapping nx affected -t <target> --base=<resolved>; uniform STATUS= schema translation. Note: lang/ts/audit.sh already landed in #33. See task #36 in docs/user-stories/2026-05-02-browser-client-join.md" --specialist=infrastructure` | infrastructure | 33 | | Pending |
-| 35 | `/devloop "Proto wrappers + Layer 1 stage-1 ordering (R-62, ADR-0033 Wave 2 #4): scripts/lang/proto/{changed.sh, changed.test.sh, compile.sh, format.sh, lint.sh, breaking.sh}; proto-first ordering in scripts/layer1.sh; buf breaking always-run via scripts/audit.sh. Lands BEFORE Track 2 #29 starts. See task #35 in docs/user-stories/2026-05-02-browser-client-join.md" --specialist=protocol --paired-with=infrastructure` | protocol | 32 | | Pending |
 | 36 | `/devloop "TS wrappers (R-62, ADR-0033 Wave 2 #5): scripts/lang/ts/{compile,fmt,lint,test}.sh wrapping nx affected -t <target> --base=<resolved>; uniform STATUS= schema translation. Note: lang/ts/audit.sh already landed in #33. See task #36 in docs/user-stories/2026-05-02-browser-client-join.md" --specialist=infrastructure` | infrastructure | 33 | `docs/devloop-outputs/2026-05-11-ts-wrappers-task36/main.md` | Completed |
 | 37 | `/devloop "TS guards under scripts/guards/simple/ts/ (R-62, ADR-0033 Wave 2 #6): six guards — no-secrets-in-ts, no-pii-in-logs-ts, no-test-removal-ts, name-guard-dt-client (R-26), bundle-content-r14 (R-14, may resolve as Vitest contract test), exports-map-closed. See task #37 in docs/user-stories/2026-05-02-browser-client-join.md" --specialist=client --paired-with=security` | client | 32, 33 | `docs/devloop-outputs/2026-05-12-ts-guards-task37/main.md` | Completed |
 | 38 | `/devloop "SKILL.md Step 6 rewrite + auto-detection patterns + Layer N/A template + Layer 8→7 renumber (R-62, ADR-0033 Wave 3 #7): collapse Step 6 to 'run scripts/layer-all.sh' + Always-Run/Skip-If-Untouched matrix; add client/svelte/sdk/tsx?/proto/buf to auto-detect; renumber Layer 8 → Layer 7 across SKILL.md, ADR-0030, ADR-0033, debate doc, and 4 specialist-knowledge INDEX.md files (~20 active edits). See task #38 in docs/user-stories/2026-05-02-browser-client-join.md" --specialist=operations` | operations | 35, 36, 37 | | Pending |
 | 39 | `/devloop "docs/runbooks/devloop-validation.md (R-62, ADR-0033 Wave 3 #8): authoritative pipeline-failure runbook — layer-by-layer failure-mode → wrapper-script mapping; STATUS= enum reference; _get_base_ref.sh troubleshooting; cross-link from SKILL.md and each layerN.sh header. See task #39 in docs/user-stories/2026-05-02-browser-client-join.md" --specialist=operations` | operations | 38 | | Pending |
 | 40 | `/devloop "Semantic-guard relocation from layer pipeline to reviewer panel (R-62, ADR-0033 Wave 3 #9): remove semantic-guard from scripts/layer7.sh (becomes pure shell, env-tests only); add semantic-guard as 7th reviewer slot at Gate 2; coexist with code-reviewer (option a — distinct lenses); add deduplication step to panel aggregator. See task #40 in docs/user-stories/2026-05-02-browser-client-join.md" --specialist=operations` | operations | 38 | | Pending |
 | 41 | `/devloop "Intentional wire-break override mechanism (R-62, ADR-0033 Wave 3 #10): decide between per-line # buf:breaking:ignore comments vs annotated proto/buf-breaking-allowlist.md ratchet; lands AFTER ≥2 real wire-breaking PRs as case studies (#31 is one such). Must satisfy ADR-0033 §13: in-tree explicit acknowledgement only, no CI bypass flags. See task #41 in docs/user-stories/2026-05-02-browser-client-join.md" --specialist=protocol --paired-with=operations` | protocol | 31, 35 | | Pending |
+| 42 | `/devloop "Devloop container pnpm-store + entrypoint pnpm install (R-62, ADR-0033 Wave 2 follow-up): add pnpm-store named volume + -e npm_config_store_dir=/tmp/pnpm-store in infra/devloop/devloop.sh (mirrors existing cargo-registry/cargo-git cache pattern); conditional pnpm install --frozen-lockfile in infra/devloop/entrypoint.sh when /work/pnpm-lock.yaml exists and /work/node_modules/.bin/nx is missing. Fixes silent no-op of TS wrappers from #36 in devloops (nx is a workspace devDep, never materialized without pnpm install). See task #42 in docs/user-stories/2026-05-02-browser-client-join.md" --specialist=infrastructure` | infrastructure | — | | Pending |
 
-After all 41 devloops complete: run `/close-story browser-client-join` to verify completeness, run story-scope reflection, commit the cumulative work, and open the PR.
+After all 42 devloops complete: run `/close-story browser-client-join` to verify completeness, run story-scope reflection, commit the cumulative work, and open the PR.
 
 ---
 
@@ -800,3 +801,13 @@ After all 41 devloops complete: run `/close-story browser-client-join` to verify
 - **Layer 8 → Layer 7 renumbering**: documented in #38, applied across `SKILL.md`, `ADR-0030`, `ADR-0033`, debate doc, and 4 specialist-knowledge `INDEX.md` files.
 
 **Reference**: `docs/decisions/adr-0033-polyglot-validation-pipeline.md` + `docs/debates/2026-05-06-polyglot-validation-pipeline-strategy/debate.md`.
+
+### Revision 5 — 2026-05-13
+
+**Feedback**: Devloop containers ship pnpm (via Corepack baked into the image) but never run `pnpm install` — not at image-build time (workspace isn't baked in; intentional) and not at entrypoint. Consequence: `/work/node_modules/.bin/nx` is missing, and the TS wrappers landed in #36 (`scripts/lang/ts/{compile,fmt,lint,test}.sh`) — which all invoke `pnpm exec nx affected -t <target>` — silently no-op. TS-touching devloops therefore pass `scripts/layer-all.sh` without ever running TS lint, typecheck, or test. Surfaced while debriefing the #38 devloop. Fix mirrors the existing cargo cache-volume pattern at `infra/devloop/devloop.sh:520-522` (`cargo-registry` / `cargo-git` named volumes + `CARGO_HOME` env): add a `pnpm-store` named volume + `npm_config_store_dir` env, plus a conditional `pnpm install --frozen-lockfile` in `entrypoint.sh`. Cache split is consistent across toolchains — shared download cache (named volume), per-worktree materialization (`node_modules` / `target/`). First devloop on a host populates the volume; every subsequent devloop hardlinks from the warm store (~2–5s vs. 30–60s cold).
+
+**Changes**:
+- **Tasks added**: #42 (devloop container pnpm-store + entrypoint pnpm install — infrastructure).
+- **Specialist task counts**: infrastructure 10 → 11. Total 41 → 42.
+- **Critical path**: unchanged (#42 is not on the critical path; it parallelizes with Wave 3).
+- **Sequencing**: #42 is independent of Wave 3 ordering and can run alongside any in-flight task. The recommended pairing is #42 (infrastructure) ‖ #39 (operations, runbook) — different specialists, no file overlap, stays within the 2-parallel devloop budget. #40 (semantic-guard relocation) follows after #38 in the usual Wave 3 order.
