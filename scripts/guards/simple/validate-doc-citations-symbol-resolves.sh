@@ -48,27 +48,14 @@ LIB_DIR   = sys.argv[2]
 sys.path.insert(0, LIB_DIR)
 
 from doc_cite_extract import (  # noqa: E402
-    extract_cites, is_in_scope_doc,
+    extract_cites, walk_in_scope_docs,
     resolve_cited_path, resolve_basename_match, symbol_resolves_in_file,
     supported_resolution_extensions,
 )
 
 SUPPORTED = set(supported_resolution_extensions())
 
-docs = []
-for sub in ("docs/runbooks", ".claude/skills"):
-    abs_sub = os.path.join(REPO_ROOT, sub)
-    if not os.path.isdir(abs_sub):
-        continue
-    for dirpath, _dirnames, filenames in os.walk(abs_sub):
-        for fn in filenames:
-            if not fn.endswith(".md"):
-                continue
-            abs_path = os.path.join(dirpath, fn)
-            rel = os.path.relpath(abs_path, REPO_ROOT)
-            if is_in_scope_doc(rel):
-                docs.append((rel, abs_path))
-docs.sort()
+docs = walk_in_scope_docs(REPO_ROOT)
 
 violations = 0
 cites_seen = 0

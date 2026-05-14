@@ -39,23 +39,9 @@ REPO_ROOT = sys.argv[1]
 LIB_DIR   = sys.argv[2]
 sys.path.insert(0, LIB_DIR)
 
-from doc_cite_extract import extract_cites, is_in_scope_doc  # noqa: E402
+from doc_cite_extract import extract_cites, walk_in_scope_docs  # noqa: E402
 
-# Walk the in-scope doc trees identically to common.sh::doc_citation_in_scope_files.
-docs = []
-for sub in ("docs/runbooks", ".claude/skills"):
-    abs_sub = os.path.join(REPO_ROOT, sub)
-    if not os.path.isdir(abs_sub):
-        continue
-    for dirpath, _dirnames, filenames in os.walk(abs_sub):
-        for fn in filenames:
-            if not fn.endswith(".md"):
-                continue
-            abs_path = os.path.join(dirpath, fn)
-            rel = os.path.relpath(abs_path, REPO_ROOT)
-            if is_in_scope_doc(rel):
-                docs.append((rel, abs_path))
-docs.sort()
+docs = walk_in_scope_docs(REPO_ROOT)
 
 violations = 0
 for rel, abs_path in docs:
