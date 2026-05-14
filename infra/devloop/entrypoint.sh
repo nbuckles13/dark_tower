@@ -59,6 +59,20 @@ fi
 # The Dockerfile provides a base version; this keeps it current without rebuilds.
 npm update -g @anthropic-ai/claude-code >/dev/null 2>&1 &
 
+# Materialize TS workspace deps if pnpm-lock is present and nx isn't yet installed.
+# Foreground (blocks readiness) is intentional: silent no-op of TS wrappers when
+# nx is missing is exactly the failure mode this closes — fail loudly here so it
+# is visible before the devloop touches TS scripts. Placed last so the
+# "Container ready" signal honestly reflects pnpm install completion.
+if command -v pnpm &>/dev/null && [ -f /work/pnpm-lock.yaml ] && [ ! -x /work/node_modules/.bin/nx ]; then
+    echo "Running pnpm install (first run on this host populates the pnpm-store cache, ~30-60s; subsequent devloops are 2-5s)..."
+    pnpm install --frozen-lockfile --dir /work || {
+        echo "ERROR: pnpm install failed — TS pipeline wrappers will not work in this devloop."
+        echo "       To debug: podman run --rm -it --entrypoint bash darktower-dev:latest"
+        exit 1
+    }
+fi
+
 echo "=== Container ready. Attach with: podman exec -it <name> claude --dangerously-skip-permissions ==="
 
 # If a command was passed (e.g., `podman run ... bash -c '...'`), run it.
