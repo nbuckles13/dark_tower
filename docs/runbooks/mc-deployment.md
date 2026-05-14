@@ -920,7 +920,7 @@ Open that section first if you are deploying mh-service or both services togethe
 
 **Quick MC-side gates** — for the canonical PromQL, see `docs/runbooks/mh-deployment.md` §"Post-Deploy Monitoring Checklist: MH WebTransport + MC↔MH Coordination" → "30-minute check". Do not duplicate the queries here; thresholds and emitter-label conventions are owned in one place to avoid silent divergence:
 
-- `mc_register_meeting_total{status="success"}` rate / total > 95% (canonical query in MH runbook). Emitter-label note: `status="success|error"` (NOT `failure`); see `crates/mc-service/src/observability/metrics.rs:340` and call sites at `crates/mc-service/src/grpc/mh_client.rs:136,144,157`.
+- `mc_register_meeting_total{status="success"}` rate / total > 95% (canonical query in MH runbook). Emitter-label note: `status="success|error"` (NOT `failure`); see `crates/mc-service/src/observability/metrics.rs::record_register_meeting` and call sites in `crates/mc-service/src/grpc/mh_client.rs::register_meeting` — the inherent `impl MhClient` method (NOT the `MhRegister` trait declaration nor its trait-impl; the three success/error/timeout call sites all live in the inherent impl body).
 
 **MC-only signal** (no MH-side equivalent — counts events arriving at MC, regardless of which MH originated them):
 

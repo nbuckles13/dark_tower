@@ -45,6 +45,10 @@ import os
 import re
 import sys
 
+# Shared lazy-reason kernel (DRY concern 2 — see scripts/guards/lib/doc_cite_extract.py).
+sys.path.insert(0, os.path.join(sys.argv[3], "scripts/guards/lib"))
+from doc_cite_extract import is_lazy_reason  # noqa: E402
+
 try:
     import yaml
 except ImportError:
@@ -123,14 +127,12 @@ def parse_prometheus_duration(s):
     return total
 
 
-LAZY_REASON_RE = re.compile(r"^(test|tmp|todo|fix ?me|wip)\b", re.IGNORECASE)
-
-
 def load_ignore_lines(path):
     """Return {lineno: reason} for each `# guard:ignore(<reason>)` in the file.
 
-    A lazy reason (too short, or matching test/tmp/todo/fixme/wip) is rejected —
-    the ignore is treated as absent so the hygiene check still fires.
+    Lazy-reason rejection delegates to scripts/guards/lib/doc_cite_extract.py::is_lazy_reason
+    (shared kernel — three call sites: this guard + the two new doc-citation guards).
+    The marker regex and JSON-emit diagnostic remain alert-rules-specific.
     """
     ignored = {}
     marker = re.compile(r"#\s*guard:ignore\(\s*([^)]+?)\s*\)")
@@ -141,7 +143,7 @@ def load_ignore_lines(path):
                 if not m:
                     continue
                 reason = m.group(1).strip()
-                if len(reason) < 10 or LAZY_REASON_RE.match(reason):
+                if is_lazy_reason(reason):
                     # Emit a diagnostic so the reviewer sees it, but don't honor the ignore.
                     print(json.dumps({
                         "file": os.path.relpath(path),

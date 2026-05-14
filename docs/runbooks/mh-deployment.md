@@ -93,7 +93,7 @@ sum(increase(mh_webtransport_connections_total{status="accepted"}[5m]))
 - [ ] `mh_webtransport_connections_total{status="accepted"}` rate / total >95% (handshake success SLO from R-36)
 - [ ] `mh_jwt_validations_total{result="success"}` rate / total >99% (JWT success SLO from R-36)
 - [ ] `mh_register_meeting_timeouts_total` increase over 30m = 0 (healthy MC→MH coordination)
-- [ ] `mc_register_meeting_total{status="success"}` rate / total >95% (MC RegisterMeeting RPC SLO; emitter labels are `success|error`, see `crates/mc-service/src/observability/metrics.rs:340`)
+- [ ] `mc_register_meeting_total{status="success"}` rate / total >95% (MC RegisterMeeting RPC SLO; emitter labels are `success|error`, see `crates/mc-service/src/observability/metrics.rs::record_register_meeting`)
 - [ ] `mh_mc_notifications_total{status="success"}` rate / total >95% (MH→MC delivery SLO)
 - [ ] `sum(mh_active_connections) > 0` once test traffic is flowing (proof clients are connecting)
 - [ ] No new MH alerts firing: `MHHighJwtValidationFailures`, `MHHighWebTransportRejections`, `MHWebTransportHandshakeSlow`
@@ -127,8 +127,8 @@ sum(increase(mh_register_meeting_timeouts_total[2h]))
 
 ```promql
 # WebTransport handshake P95 latency (track against handshake SLO trend).
-# Uses `[5m]` to match the existing MHWebTransportHandshakeSlow alert at
-# infra/docker/prometheus/rules/mh-alerts.yaml:135-149.
+# Uses `[5m]` to match the existing alert defined at
+# infra/docker/prometheus/rules/mh-alerts.yaml § "MHWebTransportHandshakeSlow".
 histogram_quantile(0.95,
   sum by(le) (rate(mh_webtransport_handshake_duration_seconds_bucket[5m]))
 )
@@ -178,13 +178,13 @@ histogram_quantile(0.95,
 - [ ] No new `MHHighJwtValidationFailures` flapping pattern across the day-long window
 - [ ] `mh_active_connections` follows expected diurnal/load pattern (no clamping at 0, no unexplained spikes)
 - [ ] *Additional (beyond R-36)*: WebTransport handshake P95 trailing-1h trend is flat (slow-leak detection — JWKS or connection-pool drift)
-- [ ] *Additional (beyond R-36)*: `mc_register_meeting_duration_seconds` P95 trailing-1h trend is flat (leading indicator for the timeout counter; see `mc-service/src/observability/metrics.rs:341`)
+- [ ] *Additional (beyond R-36)*: `mc_register_meeting_duration_seconds` P95 trailing-1h trend is flat (leading indicator for the timeout counter; see `crates/mc-service/src/observability/metrics.rs::record_register_meeting`)
 
 ### Rollback criteria
 
 Trigger an immediate rollback if any of the following hold (verbatim from user story §operations):
 
-- `mh_webtransport_connections_total` non-accepted ratio > 10% sustained for 10 minutes. The `and sum(rate(...)) > 0` guard prevents phantom rollbacks when there is no traffic (without it, a single rejected connection during low-traffic periods would compute `A / 0 = +Inf > 0.10` and fire). Mirrors the pattern at `infra/docker/prometheus/rules/mh-alerts.yaml:115-123` (`MHHighWebTransportRejections`).
+- `mh_webtransport_connections_total` non-accepted ratio > 10% sustained for 10 minutes. The `and sum(rate(...)) > 0` guard prevents phantom rollbacks when there is no traffic (without it, a single rejected connection during low-traffic periods would compute `A / 0 = +Inf > 0.10` and fire). Mirrors the pattern at `infra/docker/prometheus/rules/mh-alerts.yaml § "MHHighWebTransportRejections"`.
 
   ```promql
   (

@@ -30,7 +30,7 @@ You ran `./scripts/layer-all.sh` and it exited non-zero. Find the failing layer 
 
 If the pipeline exited with `PRECONDITION_FAILURE:` at startup (before any layer ran), jump to §4 (two-token convention).
 
-If you don't see a `LAYER_SUMMARY_BEGIN` block at all, the orchestrator aborted mid-flight; check the last entry in `${DEVLOOP_TMP:-/tmp/devloop}/layer-*.stderr.log` for a `LAYER=<n> … RESULT=…` line — the EXIT trap (`_common.sh:225` `__layer_lifecycle_end`) guarantees this stderr line emits even under `set -e` abort.
+If you don't see a `LAYER_SUMMARY_BEGIN` block at all, the orchestrator aborted mid-flight; check the last entry in `${DEVLOOP_TMP:-/tmp/devloop}/layer-*.stderr.log` for a `LAYER=<n> … RESULT=…` line — the EXIT trap installed by `_common.sh::__layer_lifecycle_end` guarantees this stderr line emits even under `set -e` abort.
 
 ---
 
@@ -79,13 +79,13 @@ The enum values are exactly:
 
 ### Worst-child STATUS aggregation
 
-Each layer collects every child `STATUS=` line that came across stdout (`_common.sh:208` `tee_collect_statuses`), then aggregates with `aggregate_worst_status` using the rank:
+Each layer collects every child `STATUS=` line that came across stdout via `_common.sh::tee_collect_statuses`, then aggregates with `_common.sh::aggregate_worst_status` using the rank:
 
 ```
 SKIPPED-NO-VERB (0)  <  SKIPPED-NO-DIFF (1)  <  OK (2)  <  N/A (3)  <  FAIL (4)  <  UNKNOWN (5)
 ```
 
-The intuition (locked in ADR-0033 §1 by `_common.sh:113-126`): *"if any child did real work and passed, the layer passed; otherwise the SKIPPED-\* state is informative. N/A propagates above OK because it signals 'this verb is not yet wired' — distinct from 'ran cleanly'. UNKNOWN ranks above FAIL — surface dispatcher bugs loud, not silent."*
+The intuition (locked in ADR-0033 §1 by the comment block above `_common.sh::aggregate_worst_status`): *"if any child did real work and passed, the layer passed; otherwise the SKIPPED-\* state is informative. N/A propagates above OK because it signals 'this verb is not yet wired' — distinct from 'ran cleanly'. UNKNOWN ranks above FAIL — surface dispatcher bugs loud, not silent."*
 
 **Worked example — Layer 1 stage-2 (multi-lang)**:
 
@@ -100,7 +100,7 @@ STATUS=FAIL REASON=buf-build-failed         (proto, stage 1)
 
 ### `LAYER=…` stderr summary line
 
-Every layer emits (via the EXIT trap installed by `layer_lifecycle_begin`, `_common.sh:200`):
+Every layer emits (via the EXIT trap installed by `_common.sh::layer_lifecycle_begin`):
 
 ```
 LAYER=<n> START=<unix-ts> END=<unix-ts> DURATION=<s> RESULT=<enum> REASON=<reason>
@@ -131,15 +131,15 @@ Emitted only by `scripts/lang/_get_base_ref.sh`. Indicates the resolver could no
 
 | Line | Emission | Cause |
 |------|----------|-------|
-| `_get_base_ref.sh:36` | `ERROR: ref name contains unexpected characters: <ref>` | `__validate_ref_name` — env-injection defense-in-depth (ADR-0033 §7 security) |
-| `_get_base_ref.sh:79` | `ERROR: could not compute merge-base for GITHUB_BASE_REF=<ref>` | CI-PR `git merge-base` failed (ref unreachable / corrupt pack / shallow clone) |
-| `_get_base_ref.sh:114` | `ERROR: could not resolve base ref to sha: <ref>` | ref resolved but commit unreachable in the local pack |
+| `_get_base_ref.sh::__validate_ref_name` | `ERROR: ref name contains unexpected characters: <ref>` | env-injection defense-in-depth (ADR-0033 §7 security) |
+| `_get_base_ref.sh::main` — the `ERROR: could not compute merge-base` emission (CI-PR branch) | `ERROR: could not compute merge-base for GITHUB_BASE_REF=<ref>` | CI-PR `git merge-base` failed (ref unreachable / corrupt pack / shallow clone) |
+| `_get_base_ref.sh::main` — the `ERROR: could not resolve base ref to sha` emission | `ERROR: could not resolve base ref to sha: <ref>` | ref resolved but commit unreachable in the local pack |
 
 All three sites `exit 2` after emitting.
 
 ### `PRECONDITION_FAILURE:` — Pre-layer guardrail emissions
 
-Emitted only by `scripts/layer-all.sh:40-43`. Indicates a precondition for the layer pipeline is not met:
+Emitted only by `scripts/layer-all.sh` — the `PRECONDITION_FAILURE:` emission near the top of the script (no enclosing function). Indicates a precondition for the layer pipeline is not met:
 
 ```
 PRECONDITION_FAILURE: merge-base(<ref>, HEAD) unreachable — CI clone too shallow.
@@ -171,7 +171,7 @@ Future precondition checks added to `layer-all.sh` (disk-space, env-var presence
 
 ### The runbook anchor: `BASE_REF=…` stderr line
 
-Every invocation of `_get_base_ref.sh` emits exactly one stderr line of the form (ADR-0033 §7 normative requirement, emitted by `__emit_base_ref_line` at `_get_base_ref.sh:51`):
+Every invocation of `_get_base_ref.sh` emits exactly one stderr line of the form (ADR-0033 §7 normative requirement, emitted by `_get_base_ref.sh::__emit_base_ref_line`):
 
 ```
 BASE_REF=<40-char-sha> BASE_SOURCE=<source> DIFF_MODE=<mode> FILES_CHANGED=<count>
@@ -214,7 +214,7 @@ Post-task-#42, `BASE_REF` in CI-PR mode is **`merge-base(origin/$GITHUB_BASE_REF
 
 ### Diagnosing predicate-vs-resolver disagreement
 
-The resolver writes `${DEVLOOP_TMP}/changed-files.layer-<n>` (`_get_base_ref.sh:120-126`); per-language `lang/<X>/changed.sh` predicates read it via `_changed_helpers.sh::__changed_files` (which lazy-invokes the resolver if the cache is missing).
+The resolver writes `${DEVLOOP_TMP}/changed-files.layer-<n>` — the cache-write block in `_get_base_ref.sh::main`; per-language `lang/<X>/changed.sh` predicates read it via `_changed_helpers.sh::__changed_files` (which lazy-invokes the resolver if the cache is missing).
 
 To inspect what a layer actually saw:
 
@@ -310,7 +310,7 @@ Two `run_and_emit` invocations:
 | (no REASON; runtime missing) | `lang/rust/test.sh:detect_runtime` | `Neither podman nor docker found. Please install one.` — install a container runtime. Wrapper aborts before reaching `run_and_emit`, so the STATUS line never emits; the layer aggregates `UNKNOWN`. |
 | (db-bringup failure) | `lang/rust/test.sh:wait_for_db` | `Database did not become ready within ${MAX_WAIT_SECONDS}s` — container started but pg never accepted connections. Check the test container logs. |
 | `nx-test-failed` | `lang/ts/test.sh` (`nx affected -t test:unit test:component`) | A TS unit/component test failed. Run the offending project's test target locally. |
-| `proto-test-sh-missing-or-not-executable` | `_dispatch.sh:149` | Expected — proto has no `test.sh` per ADR-0033 §1. SKIPPED-NO-VERB ranks below OK, so a co-running OK lang dominates. |
+| `proto-test-sh-missing-or-not-executable` | `_dispatch.sh::for_each_lang_with_verb` | Expected — proto has no `test.sh` per ADR-0033 §1. SKIPPED-NO-VERB ranks below OK, so a co-running OK lang dominates. |
 
 ### 6.5 Layer 5 — Lint (`scripts/layer5.sh`)
 
@@ -331,18 +331,18 @@ Two `run_and_emit` invocations:
 1. `_dispatch.sh::for_each_lang_with_verb "audit"` with `DEVLOOP_DISPATCH_ALWAYS_RUN=1` → `lang/rust/audit.sh` (`cargo audit`) + `lang/ts/audit.sh` (`pnpm audit --audit-level=high`). Proto has no `audit.sh` — dispatcher emits `STATUS=SKIPPED-NO-VERB REASON=proto-audit-sh-missing-or-not-executable` (expected).
 2. `lang/proto/breaking.sh` invoked unconditionally separately (`buf breaking proto --against ".git#ref=<sha>,subdir=proto"`). Proto's audit-class gate is `breaking.sh`, not `audit.sh` (ADR-0033 §1 + §10:397).
 
-The orchestrator returns the **worst of `(dispatch_rc, breaking_rc)`** — `set -e` short-circuit would mask the second invocation and silently break the always-run guarantee; the explicit RC capture in `scripts/audit.sh:13-23` preserves both gates.
+The orchestrator returns the **worst of `(dispatch_rc, breaking_rc)`** — `set -e` short-circuit would mask the second invocation and silently break the always-run guarantee; the explicit RC capture block in `scripts/audit.sh` (no enclosing function; flat script) preserves both gates.
 
 **Always-run**: yes. Vulnerability advisories and wire-break detection both depend on external state that can change without a diff in the toolchain's footprint (ADR-0033 §3 classifying principle). Layer 6 is the second of the two layers (with Layer 3) inside the **90s p95 always-run wall-clock budget (ADR-0033 §4)** — `cargo audit` + `pnpm audit` + `buf breaking` collectively count toward that budget.
 
 | REASON token | Wrapper | Cause / Fix |
 |--------------|---------|-------------|
-| `cargo-audit-failed` | `lang/rust/audit.sh` (`cargo audit`) | RUSTSEC advisory. **Triage decision**: fix-the-dep (preferred) vs ignore-via-config (security-owned). The audit-config file (`.cargo/audit.toml` when one is added) is the documented location for `[advisories.ignore]` entries; the policy is security-owned (ADR-0033 §11). Operators MUST NOT silence advisories ad-hoc via CLI flags — the wrapper deliberately blocks `--ignore=…` pass-through (security finding 1 at `lang/rust/audit.sh:6-12`). For a transitive-dep advisory we don't own, escalate to security. |
+| `cargo-audit-failed` | `lang/rust/audit.sh` (`cargo audit`) | RUSTSEC advisory. **Triage decision**: fix-the-dep (preferred) vs ignore-via-config (security-owned). The audit-config file (`.cargo/audit.toml` when one is added) is the documented location for `[advisories.ignore]` entries; the policy is security-owned (ADR-0033 §11). Operators MUST NOT silence advisories ad-hoc via CLI flags — the wrapper deliberately blocks `--ignore=…` pass-through (see the `IMPORTANT (security finding 1)` comment block at the top of `lang/rust/audit.sh`). For a transitive-dep advisory we don't own, escalate to security. |
 | `pnpm-audit-failed` | `lang/ts/audit.sh` (`pnpm audit --audit-level=high`) | High-severity npm advisory. Same triage discipline — threshold and ignore-list edits are security-owned (ADR-0033 §11). Wrapper blocks `--audit-level=critical` and `--ignore=…` pass-through. |
 | `buf-breaking-failed` | `lang/proto/breaking.sh` (`buf breaking … --against .git#ref=<base-sha>,subdir=proto`) | Wire-breaking change against the resolved base ref. For intentional wire-breaks, the override mechanism is deferred to ADR-0033 Wave 3 #10 (task #41) — no CLI bypass exists, by design. |
-| `base-ref-unresolved` | `lang/proto/breaking.sh:48` | `_get_base_ref.sh` exited non-zero before reaching `buf breaking`. The wrapper distinguishes this from `buf-breaking-failed` so operators don't chase a wire-break issue when the actual problem is a degraded git state. Jump to §5. |
+| `base-ref-unresolved` | `lang/proto/breaking.sh` — the `base-ref-unresolved` emission (no enclosing function; flat script) | `_get_base_ref.sh` exited non-zero before reaching `buf breaking`. The wrapper distinguishes this from `buf-breaking-failed` so operators don't chase a wire-break issue when the actual problem is a degraded git state. Jump to §5. |
 | `buf-binary-missing` | `lang/proto/breaking.sh` | See §6.1. |
-| `proto-audit-sh-missing-or-not-executable` | `_dispatch.sh:149` | Expected — proto has no `audit.sh`; `breaking.sh` is the proto audit-class gate, wired separately in `scripts/audit.sh`. |
+| `proto-audit-sh-missing-or-not-executable` | `_dispatch.sh::for_each_lang_with_verb` | Expected — proto has no `audit.sh`; `breaking.sh` is the proto audit-class gate, wired separately in `scripts/audit.sh`. |
 
 **Audit-config ownership reminder**: audit-config changes (`.cargo/audit.toml`, audit-level thresholds, advisory exemptions) are **security-owned** per ADR-0033 §11. Operators should not modify allowlists or suppression flags as part of failure triage — escalate to security.
 
@@ -372,7 +372,7 @@ Currently emits `STATUS=N/A REASON=wave2-pending` — the env-tests wiring is de
 
 | REASON token | Wrapper | Cause / Fix |
 |--------------|---------|-------------|
-| `wave2-pending` | `scripts/layer7.sh:7` (`emit_status N/A "wave2-pending"`) | Expected — Layer 7 body not yet implemented. Aggregates to N/A above OK so the layer signals "this verb is not yet wired" distinct from "ran cleanly". |
+| `wave2-pending` | `scripts/layer7.sh` — the `emit_status N/A "wave2-pending"` line (no enclosing function; flat script) | Expected — Layer 7 body not yet implemented. Aggregates to N/A above OK so the layer signals "this verb is not yet wired" distinct from "ran cleanly". |
 
 When Layer 7 lands, its failure modes will document here. ADR-0030 (host-side cluster helper, renumbered from Layer 8) is the canonical contract.
 
@@ -382,7 +382,7 @@ When Layer 7 lands, its failure modes will document here. ADR-0030 (host-side cl
 
 ### `STATUS=SKIPPED-NO-VERB` — interpreting the verb-discovery skip
 
-`_dispatch.sh:148-150` emits this when `lang/<X>/<verb>.sh` is missing or not executable. Two valid reasons:
+`_dispatch.sh::for_each_lang_with_verb` emits this — the `SKIPPED-NO-VERB` branch inside that function — when `lang/<X>/<verb>.sh` is missing or not executable. Two valid reasons:
 
 1. **Intentional gap** (most common): proto has no `test.sh` (Layer 4) or `audit.sh` (Layer 6) per ADR-0033 §1. The `STATUS=SKIPPED-NO-VERB REASON=<lang>-<verb>-sh-missing-or-not-executable` line is **informative, not a failure** — it ranks below OK so a co-running OK lang dominates.
 2. **Recently-deleted or chmod-stripped wrapper**: verify against ADR-0033 §1 directory listing. If the wrapper should exist, restore it and `chmod +x`.
@@ -391,7 +391,7 @@ Operators triaging Layer 4 / 6 see `proto-test-sh-missing-…` / `proto-audit-sh
 
 ### `STATUS=SKIPPED-NO-DIFF` — diagnosing predicate output
 
-`_dispatch.sh:124-128` emits this when `lang/<X>/changed.sh` returned exit code 1 (lang untouched). Three-step triage:
+`_dispatch.sh::for_each_lang_with_verb` emits this — the `SKIPPED-NO-DIFF` branch inside that function — when `lang/<X>/changed.sh` returned exit code 1 (lang untouched). Three-step triage:
 
 1. **Read the `BASE_REF=` line** in the same layer's stderr log. Was the diff what you expected?
 2. **Inspect the cache**: `cat "${DEVLOOP_TMP:-/tmp/devloop}/changed-files.layer-<n>"`. Is the file you cared about listed?
@@ -417,11 +417,11 @@ When a predicate misfires:
 1. Inspect the predicate source (`scripts/lang/<X>/changed.sh`) — most are 3-5 lines.
 2. Inspect `_changed_helpers.sh` to confirm helper semantics.
 3. Re-run the predicate manually with `DEVLOOP_LAYER=manual` (see above). Same hermetic shape, real cache.
-4. If the predicate reads the wrong cache, `DEVLOOP_LAYER` is not exported — a layer-script bug (the layer-skeleton ought to export `DEVLOOP_LAYER` via `layer_lifecycle_begin` at `_common.sh:199`).
+4. If the predicate reads the wrong cache, `DEVLOOP_LAYER` is not exported — a layer-script bug (the layer-skeleton ought to export `DEVLOOP_LAYER` via `_common.sh::layer_lifecycle_begin`).
 
 ### `_test_changed_predicates.sh` drift detection
 
-Runs every devloop in Layer 3 alongside the simple guards. Hermetic — `mktemp` cache, `env -i` invocation. Failure mode (`_test_changed_predicates.sh:56-61`):
+Runs every devloop in Layer 3 alongside the simple guards. Hermetic — `mktemp` cache, `env -i` invocation. Failure mode (`_test_changed_predicates.sh::__assert_predicate`):
 
 ```
 [<lang>] path=<fixture-row> expected_rc=<0|1> actual_rc=<0|1>
@@ -487,8 +487,21 @@ Grep-driven entry point. Match the symptom, jump to the section.
 
 ---
 
-## 10. Changelog
+## 10. Cite Convention
+
+Cites in this runbook (and other long-lived docs under `docs/runbooks/**` and `.claude/skills/**`) follow a durable shape, enforced by `scripts/guards/simple/validate-doc-citations-no-line-numbers.sh` (Guard A) and `validate-doc-citations-symbol-resolves.sh` (Guard C):
+
+- **Code anchor**: `<file>::<symbol>` — preferred form. Guard C verifies the symbol exists in the file via per-language regex (rs/sh/toml/yaml/md/proto).
+- **Section reference**: `<file> § "<header>"` for cites into markdown/YAML where the anchor is a section/alert name rather than a callable symbol.
+- **Prose fallback**: `<file>::<symbol> — <near-clause>` when a function contains multiple distinct cite-worthy blocks (comments, error emissions, code branches). For flat scripts with no top-level function, use `<file> — <near-clause> (no enclosing function; flat script)`. Examples in this runbook: the `ERROR: …` emission cites in §4, the `RC capture block in scripts/audit.sh` cite in §6.6.
+
+Bare `:<NN>` line cites are forbidden — they drift the moment a file grows by one line. Guard A enforces. If a cite truly requires a line number (e.g., the cited LOC is the entire constant), annotate the line with `<!-- guard:ignore(<reason ≥10 chars, not test/tmp/todo/fixme/wip>) -->`.
+
+---
+
+## 11. Changelog
 
 | Date | Author | Changes |
 |------|--------|---------|
 | 2026-05-14 | operations (task #39) | Initial creation. Documents `scripts/layer-all.sh` + Layers 1-7 + shared helpers as of commit `0130ce8`. Closes ADR-0033 Wave 3 #8. |
+| 2026-05-14 | operations (doc-citation guards devloop) | Sweep: converted ~21 bare-line cites to function-name anchors. Added §10 "Cite Convention" documenting the form Guards A+C enforce. |

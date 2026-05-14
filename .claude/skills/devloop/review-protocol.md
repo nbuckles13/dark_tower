@@ -59,7 +59,7 @@ All teammate communication MUST use the SendMessage tool. Plain text output is n
 
 ### Asking Questions
 Use SendMessage to ask @implementer directly:
-> "Question about `auth.rs:45`: Why did you choose X over Y?"
+> "Question about `auth.rs:<line>`: Why did you choose X over Y?"
 
 ### Flagging Cross-Domain Issues
 Use SendMessage to message the relevant reviewer:
@@ -204,7 +204,7 @@ Three anchors for the Ownership Lens. Apply in order: sed-test first, then check
 - **Pattern**: `\bevent\b` → `event_type`, restricted to label keys on `mc_mh_notifications_received_total` + `mh_mc_notifications_total` and PromQL `sum by(event)` / `{{event}}` legend positions.
 - **Convention author**: observability (owns the metric-label taxonomy per ADR-0011) — Pattern B per ADR-0019.
 - **Guard coverage**: metric-labels + metric-name guards enforce every partial state.
-- **Cross-boundary hunks**: `crates/mh-service/src/observability/metrics.rs:182` and `infra/grafana/dashboards/mh-overview.json:1794-1795` — MC implementer touching MH surfaces.
+- **Cross-boundary hunks**: `crates/mh-service/src/observability/metrics.rs::set_active_connections` and the corresponding MH label panel in `infra/grafana/dashboards/mh-overview.json` — MC implementer touching MH surfaces.
 - **Required trailer** on the commit: `Approved-Cross-Boundary: media-handler label-taxonomy rename matches ADR-0011 canonical`. The reason clause (≥10 chars per ADR-0024 §6.7) names the authority (ADR-0011), not just the what.
 - **Classification**: **Minor-judgment** — cross-service ownership crosses into MH dashboards and alert semantics; MH reviewer hunk-ACK via trailer. The combination of **named convention author** + **full guard coverage** is what legitimizes Pattern B here; absent either, this would collapse to owner-implements per ADR-0019 + ADR-0024 §6.6.
 

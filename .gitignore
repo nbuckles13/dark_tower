@@ -81,3 +81,7 @@ lcov.info
 # OS
 Thumbs.db
 .env.test
+
+# Python (used by guard scripts under scripts/guards/lib/)
+__pycache__/
+*.pyc
