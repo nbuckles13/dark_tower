@@ -218,6 +218,9 @@ Earlier drafts of this plan miscited task #34 as fixture-committing precedent �
    - `fail-symbol-not-found` — `target.rs::missing` produces VIOLATION `symbol-not-found`
    - `fail-path-escape` — `../../etc/passwd::root` produces VIOLATION `path-escape` (file NOT read; security review §2)
    - `pass-unverified-extension` — `target.json::field` is silently allowed (`.json` not in pattern table)
+   - `pass-basename-unambiguous` — basename-only cite (e.g. `_common.sh::aggregate_worst_status`) resolves to the single match across the 4 search roots (here: `scripts/lang/_common.sh`); cite passes.
+   - `fail-basename-ambiguous` — basename-only cite that matches 2+ files (e.g. `metrics.rs::record_foo` with 7 `metrics.rs` files across crates/) produces VIOLATION `file-missing`, forcing the author to disambiguate via full path.
+   - `fail-basename-not-found` — basename-only cite with zero matches across the search roots produces VIOLATION `file-missing`.
 
    **Source-resident test catalog** (security non-blocking observation): the top of `scripts/guards/lib/doc_cite_extract.py` carries a 3-line block comment listing the validated failure modes Guard C exercises (file-missing, path-escape, symbol-not-found, lazy-reason rejection, single-segment-only). Future maintainers re-deriving the test cases need only read that comment, not spelunk this devloop's output. Matches the "what was exercised" trail security asked for without committing fixtures.
 
@@ -371,8 +374,14 @@ Per `docs/TODO.md` §Guard Self-Test Cleanup policy. Throwaway driver + fixtures
 | fail-symbol-not-found | PASS | 1 |
 | fail-path-escape (symlink to `/etc/passwd`) | PASS | 1 |
 | pass-unverified-extension (`.json` skipped silently) | PASS | 0 |
+| **Basename resolution (DRY concern 4 deviation, exercised via manufactured /tmp fixtures, deleted)** | | |
+| pass-basename-unambiguous (single match) | PASS | 0 |
+| fail-basename-ambiguous (≥2 matches → file-missing) | PASS | 1 |
+| fail-basename-not-found (zero matches → file-missing) | PASS | 1 |
 
-**Summary: 32 PASS, 0 FAIL.** Fixtures deleted before commit per policy.
+Case (b) was the previously-unexercised branch — `len(matches) != 1` returns `None` and the caller emits `file-missing`, forcing the doc author to disambiguate. Manufactured fixture: two `collide.sh` files at `/tmp/.../scripts/a/collide.sh` and `/tmp/.../scripts/b/collide.sh`; `resolve_basename_match(root, 'collide.sh')` returns `None`; caller path produces `file-missing` violation. Behavior confirmed.
+
+**Summary: 35 PASS, 0 FAIL.** Fixtures deleted before commit per policy.
 
 ### Gate-2 validation (Layer 3 dogfooding)
 
@@ -411,28 +420,33 @@ TBD — Gate 2 runs `./scripts/layer-all.sh`. The new guards self-apply (Layer 3
 ## Code Review Results
 
 ### Security Specialist
-**Verdict**: TBD
+**Verdict**: CLEAR. Path-escape contract verified (realpath + repo-root-startswith); guard:ignore lazy-reason kernel reused; no shell-injection surface (Python heredoc + sys.argv); no GSA crossings. One non-blocking suggestion: source-resident test catalog comment at top of `doc_cite_extract.py` — applied.
 
 ### Test Specialist
-**Verdict**: TBD
+**Verdict**: RESOLVED. Original Gate-1 concern (fixture-precedent miscite) led to plan revision to no-committed-fixtures policy. Gate-3 finding (matrix missing basename-resolution cases) addressed by the 3 backfill rows + ambiguous-basename manufactured fixture above.
 
 ### Observability Specialist
-**Verdict**: TBD
+**Verdict**: RESOLVED. O1-O4 all resolved (per-guard STATUS leak prevented via simple-guard convention; §5 anchor verification; `mh_client.rs::register_meeting` prose disambiguator; clean PII surface). Two informational TDPs filed: `_BASENAME_SEARCH_ROOTS` layout-coupling + §4 ERROR-only-emitted-by claim pre-existing-inaccurate.
 
 ### Code Quality Reviewer
-**Verdict**: TBD
+**Verdict**: RESOLVED. F1-F5 (Gate 1) addressed during plan iteration; F-Gate3-1 (`resolve_basename_match` docstring extension), F-Gate3-2 (matrix backfill — overlaps with @test), F-Gate3-3 (`mh_client.rs::register_meeting` ambiguity TODO) all folded into the follow-up commit.
 
 ### DRY Reviewer
-**Verdict**: TBD
+**Verdict**: RESOLVED. All 4 Gate-1 concerns addressed (shared internals via `doc_cite_extract.py`; kernel-only `is_lazy_reason` extraction; `print_violation`/`print_ok` output; prose boilerplate). Gate-3 Finding 1 (os.walk duplication) closed in commit `8876653` via `walk_in_scope_docs` extraction. Finding 2 (forward-extension TODO) confirmed present at `docs/TODO.md:251`.
 
 ### Operations Reviewer (peer)
-**Verdict**: TBD
+**Verdict**: RESOLVED. Sweep conversions readable at 3am; Layer 3 budget comfortably met (~40ms per guard); guard:ignore discipline preserved. Two non-blocking nits filed as post-merge TODOs: in-output conversion guidance in failure messages + distinct `ambiguous-basename` REASON token.
 
 ---
 
 ## Tech Debt Pointers
 
-TBD.
+- `docs/TODO.md` §Code Quality — Extend Guards A+C scope to `docs/decisions/**` + `docs/specialist-knowledge/**/INDEX.md` (@dry-reviewer)
+- `docs/TODO.md` §Code Quality — `mh_client.rs::register_meeting` symbol-cite 3-way ambiguity (@code-reviewer F-Gate3-3)
+- `docs/TODO.md` §Code Quality — In-output conversion guidance in Guard A/C failure messages (@operations)
+- `docs/TODO.md` §Code Quality — Distinct `ambiguous-basename` REASON token in Guard C (@operations)
+- `docs/TODO.md` §Observability Debt — `_BASENAME_SEARCH_ROOTS` layout-coupling (@observability)
+- `docs/TODO.md` §Observability Debt — `devloop-validation.md` §4 ERROR-only-emitted claim pre-existing inaccurate (@observability, pre-existing from task #39)
 
 ---
 
