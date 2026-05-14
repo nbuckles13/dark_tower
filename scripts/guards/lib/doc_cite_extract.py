@@ -8,6 +8,12 @@ review and §Correctness validation of the authoring devloop):
     Guard C (symbol-resolves): file-missing, path-escape (../../ outside repo,
         symlink-escape), symbol-not-found per language, single-segment-only
         symbols, top-level-only YAML keys, word-boundary heading match.
+    Basename-fallback (resolve_basename_match): unambiguous single-match resolves
+        transparently; ambiguous multi-match returns None and the caller emits
+        `file-missing`, forcing the doc author to disambiguate via full path;
+        no-match returns None same as above. Walks 4 search roots — `scripts/`,
+        `crates/`, `infra/`, `proto/` — excluding `docs/` and `.claude/` so
+        doc-to-doc cites are forced to full repo-relative paths.
 """
 
 import os
@@ -255,7 +261,13 @@ _BASENAME_SEARCH_ROOTS = ("scripts", "crates", "infra", "proto")
 
 
 def _build_basename_index(repo_root: str) -> dict:
-    """Walk search roots once and build {basename: [abs_paths...]}."""
+    """Walk _BASENAME_SEARCH_ROOTS once; populate {basename: [abs_paths...]}.
+
+    Side effect: callers cache the returned dict in module-level _BASENAME_INDEX
+    (see resolve_basename_match). First call walks 4 trees from repo_root
+    (scripts/, crates/, infra/, proto/); subsequent calls reuse the cached
+    index. Cost ~40ms one-shot on the current repo.
+    """
     index: dict = {}
     for root in _BASENAME_SEARCH_ROOTS:
         abs_root = os.path.join(repo_root, root)
@@ -271,10 +283,22 @@ def resolve_basename_match(repo_root: str, cited_path: str) -> Optional[str]:
     """If cited_path is a basename-only token, find unambiguous match.
 
     Returns the absolute path if exactly one match exists across the search
-    roots; None otherwise (no match OR ambiguous multi-match).
+    roots; None otherwise (no match OR ambiguous multi-match). Multi-match
+    returns None so doc authors must disambiguate via a full repo-relative
+    path rather than getting a silent wrong-file resolution.
+
+    Search roots are `scripts/`, `crates/`, `infra/`, `proto/` — the union
+    of places source-of-truth symbols live (build tooling, services, infra
+    manifests, wire format). `docs/` and `.claude/` are intentionally
+    excluded so doc-to-doc cites are forced to full paths.
 
     A cited path containing `/` is NOT basename-only and returns None;
     callers should treat such cites as full repo-relative paths.
+
+    Side effect: lazily builds module-level `_BASENAME_INDEX` on first
+    call. Subsequent calls reuse the index — if the filesystem changes
+    between calls in a long-lived process, results may stale. Fine for
+    one-shot guard invocations.
     """
     global _BASENAME_INDEX
     if "/" in cited_path:
