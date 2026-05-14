@@ -445,6 +445,23 @@ parse_cross_boundary_table() {
 }
 
 # =============================================================================
+# Doc-citation guard helpers
+# =============================================================================
+
+# Emit the list of in-scope markdown files for the doc-citation guards.
+# Single source of truth for Guards A (no-line-numbers) and C (symbol-resolves);
+# the Python-side scope predicate at scripts/guards/lib/doc_cite_extract.py::is_in_scope_doc
+# mirrors this. Outputs repo-relative paths, one per line.
+doc_citation_in_scope_files() {
+    local repo_root
+    repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+    {
+        [[ -d "$repo_root/docs/runbooks" ]] && find "$repo_root/docs/runbooks" -type f -name '*.md'
+        [[ -d "$repo_root/.claude/skills" ]] && find "$repo_root/.claude/skills" -type f -name '*.md'
+    } | sed "s|^${repo_root}/||" | sort -u
+}
+
+# =============================================================================
 # Path Matching
 # =============================================================================
 
