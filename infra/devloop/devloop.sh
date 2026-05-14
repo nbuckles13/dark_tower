@@ -519,7 +519,9 @@ if ! is_container_running "$DEV_CONTAINER"; then
         -v "$(realpath "$CLONE_DIR"):/work:Z" \
         -v cargo-registry:/tmp/cargo-home/registry \
         -v cargo-git:/tmp/cargo-home/git \
+        -v pnpm-store:/tmp/pnpm-store \
         -e CARGO_HOME=/tmp/cargo-home \
+        -e npm_config_store_dir=/tmp/pnpm-store \
         ${EXTRA_PODMAN_ARGS[@]+"${EXTRA_PODMAN_ARGS[@]}"} \
         -e DATABASE_URL="postgresql://postgres:postgres@${DB_CONTAINER}:5432/dark_tower_test" \
         -e AC_MASTER_KEY="AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=" \
