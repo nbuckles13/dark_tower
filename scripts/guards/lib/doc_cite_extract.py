@@ -304,3 +304,28 @@ def is_in_scope_doc(rel_path: str) -> bool:
         if rel_path == d or rel_path.startswith(d + "/"):
             return True
     return False
+
+
+def walk_in_scope_docs(repo_root: str):
+    """Yield (rel_path, abs_path) for each in-scope markdown doc under repo_root.
+
+    Mechanically derived from IN_SCOPE_DIRS — single source of truth. Both
+    Guards A and C consume this; expanding scope is a one-line edit to
+    IN_SCOPE_DIRS above. The shell helper `common.sh::doc_citation_in_scope_files`
+    is kept for parity but currently has no Bash-side consumer.
+    """
+    seen = []
+    for sub in IN_SCOPE_DIRS:
+        abs_sub = os.path.join(repo_root, sub)
+        if not os.path.isdir(abs_sub):
+            continue
+        for dirpath, _dirnames, filenames in os.walk(abs_sub):
+            for fn in filenames:
+                if not fn.endswith(".md"):
+                    continue
+                abs_path = os.path.join(dirpath, fn)
+                rel = os.path.relpath(abs_path, repo_root)
+                if is_in_scope_doc(rel):
+                    seen.append((rel, abs_path))
+    seen.sort()
+    return seen
