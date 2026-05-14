@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # Layer 2 — Format.
+#
+# Failure triage: docs/runbooks/devloop-validation.md §6.2 (Layer 2 + §4 two-token convention).
 set -euo pipefail
 IFS=$'\n\t'
 source "$(dirname "$0")/lang/_common.sh"

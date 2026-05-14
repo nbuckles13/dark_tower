@@ -10,6 +10,8 @@
 #
 # Stage ordering is encoded in source so a future reader sees stage 1 must
 # precede stage 2: proto-derived artifacts (codegen) feed rust/ts compile.
+#
+# Failure triage: docs/runbooks/devloop-validation.md §6.1 (Layer 1 + §4 two-token convention).
 set -euo pipefail
 IFS=$'\n\t'
 source "$(dirname "$0")/lang/_common.sh"
