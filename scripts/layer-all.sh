@@ -13,6 +13,8 @@
 # Greppable warn tokens (paired-operations §2):
 #   WARN BUDGET_BREACH LAYER=<n> DURATION=<s> BUDGET=<s>
 #   WARN BUDGET_TOTAL_BREACH ALWAYS_RUN_DURATION=<s> BUDGET=90
+#
+# Failure triage: docs/runbooks/devloop-validation.md (all layers + §4 two-token convention).
 
 set -euo pipefail
 IFS=$'\n\t'
@@ -39,7 +41,7 @@ if [[ -n "$__precondition_ref" ]] && ! git merge-base "${__precondition_ref}" HE
   # with the same fetch-depth: 0 remediation.
   printf 'PRECONDITION_FAILURE: merge-base(%s, HEAD) unreachable — CI clone too shallow.\n\n' "$__precondition_ref" >&2
   printf 'Fix: set actions/checkout fetch-depth: 0 in .github/workflows/ci.yml\n' >&2
-  printf 'See docs/runbooks/devloop-validation.md (lands in task #39).\n' >&2
+  printf 'See docs/runbooks/devloop-validation.md.\n' >&2
   exit 2
 fi
 

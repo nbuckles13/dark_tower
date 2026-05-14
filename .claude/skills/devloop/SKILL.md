@@ -373,6 +373,8 @@ When implementer signals "Ready for validation", run the validation pipeline:
 
 Each `scripts/layerN.sh` is independently callable for targeted debugging (e.g., `scripts/layer4.sh` to re-run only Layer 4 on a failing diff). See ADR-0033 §4 for the wrapper contract (`STATUS=` lines, `LAYER=N START=… END=… RESULT=…` stderr summary, worst-child STATUS aggregation, 90s p95 wall-clock budget for the always-run subset).
 
+**Pipeline failures**: see `docs/runbooks/devloop-validation.md` for layer-by-layer failure-mode mapping, exit-code / `STATUS=` enum reference, `_get_base_ref.sh` troubleshooting (the `BASE_REF=…` stderr line is the anchor), and per-language wrapper triage.
+
 **Always-Run vs Skip-If-Untouched matrix** (operational subset of ADR-0033 §3; see the ADR for the classifying principle, worked examples like `buf breaking`, and the "when in doubt, always-run" default):
 
 | Layer | Verb     | Always-run                                  | Skip-if-untouched per `lang/<X>/changed.sh` |

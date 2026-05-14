@@ -4,6 +4,8 @@
 # Wraps existing scripts/guards/run-guards.sh with the STATUS contract.
 # Per ADR-0033 implementation note: also invokes _test_changed_predicates.sh
 # meta-test so predicate drift is detected on every devloop, not just at PR time.
+#
+# Failure triage: docs/runbooks/devloop-validation.md §6.3 (Layer 3 + §4 two-token convention).
 set -euo pipefail
 IFS=$'\n\t'
 __here="$(dirname "$0")"
