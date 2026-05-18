@@ -34,7 +34,10 @@ Any implementation work: bug fixes, refactors, new features. For design decision
 
 ### Full Mode (default)
 
-Every devloop spawns **7 teammates** (Lead + Implementer + 6 reviewers). `name` is the SendMessage recipient; `subagent_type` loads identity from `.claude/agents/{name}.md`.
+<!-- Mirror of ADR-0024 §1 Team Composition / SKILL.md §Team Composition.
+     Update both locations together when changing teammate count or roster. -->
+
+Every devloop spawns **8 teammates** (Lead + Implementer + 7 reviewers). `name` is the SendMessage recipient; `subagent_type` loads identity from `.claude/agents/{name}.md`.
 
 | Role | `name` | `subagent_type` | Purpose |
 |------|--------|-----------------|---------|
@@ -45,6 +48,7 @@ Every devloop spawns **7 teammates** (Lead + Implementer + 6 reviewers). `name` 
 | Code Quality Reviewer | `code-reviewer` | `code-reviewer` | Rust idioms, ADR compliance |
 | DRY Reviewer | `dry-reviewer` | `dry-reviewer` | Cross-service duplication (see DRY exception in review protocol) |
 | Operations Reviewer | `operations` | `operations` | Deployment safety, rollback, runbooks |
+| Semantic Guard Reviewer | `semantic-guard` | `semantic-guard` | Diff-level anti-pattern checks per `scripts/guards/semantic/checks.md` (credential leak, actor blocking, error-context preservation, metrics path completeness). Distinct from code-reviewer's general lens (Rust idioms, ADR compliance, naming, error handling). Applies to non-test production code per `.claude/agents/semantic-guard.md` §Judgment Calibration. |
 | Paired Specialist (if `--paired-with=<specialist>`) | `paired-<specialist>` | `{specialist}` | Active collaborator during implementation + Gate 2 reviewer. When `<specialist>` is already a mandatory reviewer (security/test/observability/operations), the paired teammate replaces that slot with the same identity and an expanded role. |
 
 The Lead (orchestrator) is automatically named `team-lead` in the team config.
@@ -69,6 +73,8 @@ For small, contained changes (typically 10-30 lines):
 - Test — for test changes
 - Operations — for deployment/config changes
 - DRY — for shared code changes
+
+(Semantic Guard is full-mode-only; not eligible as a `--light` context reviewer. The semantic-guard checks are most valuable on multi-file diffs where pattern guards miss issues; for the small contained changes `--light` targets, the panel stays at 3 teammates. If a `--light` change appears to need semantic-guard coverage, escalate to full mode per the escalation rule.)
 
 **Skips**: Gate 1 (plan approval)
 **Keeps**: Full validation pipeline (Gate 2), review verdicts
@@ -307,6 +313,7 @@ Team:
 - Code Quality: @code-reviewer (full mode only)
 - DRY Reviewer: @dry-reviewer (full mode only)
 - Operations: @operations (full mode only)
+- Semantic Guard Reviewer: @semantic-guard (full mode only)
 {list only the teammates actually spawned}
 
 Start by drafting your approach and getting reviewer input.
@@ -328,7 +335,11 @@ Track confirmations in main.md:
 |----------|-------------|
 | Security | confirmed / pending |
 | Test | confirmed / pending |
-| ... | ... |
+| Observability | confirmed / pending |
+| Code Quality | confirmed / pending |
+| DRY | confirmed / pending |
+| Operations | confirmed / pending |
+| Semantic Guard | confirmed / pending |
 ```
 
 **Timeout**: 30 minutes
@@ -415,22 +426,6 @@ Layer 7 is the seventh shell-layer in `scripts/layer-all.sh`, executed automatic
 
 **Layer 7 attempt budget**: 2 attempts (separate from layers 1-6's 3). Infrastructure failures do not consume attempts. First-run cluster setup (~7 min) does not count toward attempts.
 
-**Semantic Guard Agent** (interim placement; relocates to reviewer panel in ADR-0033 Wave 3 #9):
-
-After `scripts/layer-all.sh` passes (all seven layers), spawn the semantic-guard agent **as a member of the existing devloop team** (not as a standalone Agent call). Project-local agent definitions in `.claude/agents/*.md` only resolve via the team-spawn path; a bare `Agent({subagent_type: "semantic-guard"})` will fail because the standalone-Agent harness only knows its built-in `subagent_type` set. Mirror the reviewer-spawn shape from Step 3:
-
-```
-Agent({
-  team_name: "devloop-YYYY-MM-DD-{slug}",
-  name: "semantic-guard",
-  subagent_type: "semantic-guard",
-  run_in_background: true,
-  prompt: "Analyze the current diff for semantic issues. SendMessage your verdict (SAFE or UNSAFE) to @team-lead. If UNSAFE, list the specific findings and recommended fixes."
-})
-```
-
-Semantic-guard joins the team mailbox, so the verdict comes back via SendMessage like any other reviewer's verdict (NOT via the synchronous Agent return value). Wait for the verdict message. If UNSAFE, treat as a validation failure (send findings to implementer, increment iteration). If SAFE, proceed. Semantic-guard is shut down via the same `shutdown_request` flow as the other reviewers in Step 8.5 (Cleanup Team).
-
 **If pass**:
 - Update main.md: Phase = review
 - Message each reviewer individually (unicast, not broadcast): "Start Review. Validation passed — please examine the changes and send your verdict."
@@ -460,6 +455,7 @@ Track verdicts in main.md:
 | Code Quality | CLEAR / RESOLVED / ESCALATED | | | | |
 | DRY | CLEAR / RESOLVED / ESCALATED | | | | |
 | Operations | CLEAR / RESOLVED / ESCALATED | | | | |
+| Semantic Guard | CLEAR / RESOLVED / ESCALATED | | | | |
 ```
 
 **If any ESCALATED**:
@@ -484,7 +480,7 @@ After review, stage and commit:
    Devloop: {YYYY-MM-DD-slug}
    Specialist: {specialist}
    Mode: {full|light}
-   Verdicts: Security {verdict}, Test {verdict}, ...
+   Verdicts: Security {verdict}, Test {verdict}, Observability {verdict}, Code Quality {verdict}, DRY {verdict}, Operations {verdict}, Semantic Guard {verdict}
 
    Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
    ```
@@ -536,6 +532,7 @@ Results:
 - Code Quality: CLEAR/RESOLVED
 - DRY: CLEAR/RESOLVED ({N} tech debt observations)
 - Operations: CLEAR/RESOLVED
+- Semantic Guard: CLEAR/RESOLVED
 
 Files changed:
 {summary}

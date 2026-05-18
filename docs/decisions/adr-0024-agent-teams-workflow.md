@@ -30,9 +30,12 @@ The v3 skills have been retired. `/devloop` and `/debate` are now the sole workf
 
 ### 1. Dev-Loop Workflow
 
-#### Team Composition: 7 Teammates
+#### Team Composition: 8 Teammates
 
-Every devloop spawns **7 teammates** (Lead + Implementer + 6 reviewers):
+<!-- Mirror of ADR-0024 §1 Team Composition / SKILL.md §Team Composition.
+     Update both locations together when changing teammate count or roster. -->
+
+Every devloop spawns **8 teammates** (Lead + Implementer + 7 reviewers):
 
 | Role | Specialist | Purpose | Blocking |
 |------|------------|---------|----------|
@@ -43,8 +46,9 @@ Every devloop spawns **7 teammates** (Lead + Implementer + 6 reviewers):
 | Code Quality Reviewer | code-reviewer | Rust idioms, ADR compliance | MAJOR+ blocks; rest TECH_DEBT |
 | DRY Reviewer | dry-reviewer | Cross-service duplication | BLOCKER only; rest TECH_DEBT (per ADR-0019) |
 | Operations Reviewer | operations | Deployment safety, rollback, runbooks | MAJOR+ blocks; rest TECH_DEBT |
+| Semantic Guard Reviewer | semantic-guard | Diff-pattern anti-patterns per `scripts/guards/semantic/checks.md` (credential-leak, actor-blocking, error-context-preservation, metrics-path-completeness); distinct from code-reviewer's general lens | ESCALATED blocks; rest TECH_DEBT |
 
-**Rationale for 7 teammates**: All four mandatory cross-cutting specialists (Security, Test, Observability, Operations) are now included alongside Code Quality and DRY. This resolves a policy inconsistency where CLAUDE.md listed Observability as mandatory but the devloop excluded it. Each reviewer covers a distinct, non-overlapping domain — no natural combination exists without diluting expertise. Reviewers work in parallel, so the added teammate does not significantly increase wall-clock time.
+**Rationale for 8 teammates**: All four mandatory cross-cutting specialists (Security, Test, Observability, Operations) are included alongside Code Quality, DRY, and Semantic Guard. Semantic Guard was added in ADR-0033 Wave 3 #9 as a peer reviewer (rather than a layer-pipeline step) — its lens is intentionally distinct from code-reviewer's general lens; reviewer-finding overlap with code-reviewer is handled ad-hoc by the Lead at Gate 3, the same way overlap between other reviewer pairs is already handled. Each reviewer covers a distinct, non-overlapping domain — no natural combination exists without diluting expertise. Reviewers work in parallel, so the added teammates do not significantly increase wall-clock time.
 
 **Conditional domain reviewer**: When the task touches database patterns (`migration|schema|sql`) but the implementer is NOT the Database specialist, add Database as a conditional 8th reviewer for that loop. This prevents schema changes landing without database-aware review. The same principle applies to Protocol when API contracts are affected by a non-Protocol implementer.
 
@@ -67,7 +71,7 @@ Lead (minimal involvement)
 ├── SETUP
 │   ├── Create output directory
 │   ├── Record git state: `git rev-parse HEAD` in main.md
-│   ├── Spawn 7 teammates with composed prompts
+│   ├── Spawn 8 teammates with composed prompts
 │   └── Send task to implementer
 │
 ├── PLANNING (Implementer + Reviewers collaborate)
@@ -481,7 +485,7 @@ Named spin-outs from this amendment (not blocking adoption).
 
 ### Negative
 
-1. **Larger review team** — 7 teammates instead of 6 increases resource usage per devloop
+1. **Larger review team** — 8 teammates instead of 7 increases resource usage per devloop
 2. **More complex verification** — Artifact-specific layers add implementation work
 3. **Stricter debate escalation** — Cross-cutting veto may slow consensus on contentious decisions
 

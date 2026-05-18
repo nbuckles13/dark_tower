@@ -275,7 +275,7 @@ Layer 7 in the prior pipeline ran the semantic-guard agent. Spawning agents from
 
 **Overlap with code-reviewer: coexist (option a).** Semantic-guard targets specific patterns (subtle behavioral changes, undocumented contract drift, scope creep beyond stated task); code-reviewer is general (Rust idioms, error handling, ADR compliance, naming). The lenses are distinct and produce visibly different artifacts in practice. Absorbing semantic-guard into code-reviewer's prompt risks dilution of code-reviewer's general focus by a specific checklist; replacement loses the broader review entirely.
 
-**Deduplication step** in the panel summary: if semantic-guard and code-reviewer surface the same finding, the panel aggregator dedupes before presenting to the user. The panel already aggregates verdicts; this is a small extension.
+**Overlapping findings** between semantic-guard and code-reviewer are handled ad-hoc by the Lead in the Gate 3 verdict report, the same way overlap is already handled today between other reviewer pairs (e.g., security ↔ code-reviewer on auth, observability ↔ code-reviewer on metrics) — no formal dedup step is needed.
 
 ### 9. Nx Integration
 
@@ -361,7 +361,7 @@ Flake-rate breaches in Layer 7 trigger quarantine of the offending test (`.skip`
 | 2 | TS guards under `scripts/guards/simple/ts/` (6 guards) | ❌ Pending | TBD | client + security paired |
 | 3 | SKILL.md Step 6 rewrite (collapse to "run `scripts/layer-all.sh`") + auto-detection patterns + N/A template | ❌ Pending | TBD | Renumber Layer 8 → 7 across docs |
 | 3 | `docs/runbooks/devloop-validation.md` | ❌ Pending | TBD | ADR-named deliverable |
-| 3 | Semantic-guard relocated from layer to reviewer panel; deduplication step in aggregator | ❌ Pending | TBD | Coexist with code-reviewer |
+| 3 | Semantic-guard relocated from layer to reviewer panel | ✅ Done | 2026-05-14-semantic-guard-relocation-task40 | Coexist with code-reviewer (option a — distinct lenses); reviewer-finding overlap handled ad-hoc by the Lead at Gate 3, no formal dedup step |
 | 3 | Intentional wire-break override mechanism | ❌ Pending | TBD | After ≥2 real wire-breaking PRs |
 | 3 (opt) | CI dispatch generator | ⏸️ Deferred | — | Only if duplication emerges |
 
@@ -424,8 +424,7 @@ Flake-rate breaches in Layer 7 trigger quarantine of the offending test (`.skip`
 
 9. **Semantic-guard relocation** — `operations` (owns reviewer-panel composition; paired with whoever currently owns semantic-guard agent definition)
    - Move agent invocation from layer pipeline to Gate 2 reviewer panel
-   - Add deduplication step to panel aggregator
-   - Coexist with code-reviewer (option a)
+   - Coexist with code-reviewer (option a); reviewer-finding overlap handled ad-hoc by the Lead at Gate 3
 
 10. **Intentional wire-break override mechanism** — `protocol` (paired with `operations`)
     - Decide between per-line ignore comment vs annotated allowlist
@@ -456,7 +455,7 @@ Flake-rate breaches in Layer 7 trigger quarantine of the offending test (`.skip`
 
 - **`SKILL.md`-prose-driven pipeline definition** (current state — Step 6 enumerates layers in English). **Rejected** in favor of layer-script-driven pipeline: shell is mechanically auditable and testable; SKILL.md becomes "run scripts/layer-all.sh" — drift impossible.
 
-- **Layer 7 spawns `semantic-guard` agent from script.** **Rejected** in favor of relocating semantic-guard to the reviewer panel: keeps layer scripts pure shell with no `claude` CLI runtime dependency; aligns semantic review timing and framework with existing reviewer slots; supports natural deduplication with code-reviewer.
+- **Layer 7 spawns `semantic-guard` agent from script.** **Rejected** in favor of relocating semantic-guard to the reviewer panel: keeps layer scripts pure shell with no `claude` CLI runtime dependency; aligns semantic review timing and framework with existing reviewer slots; overlap with code-reviewer is handled ad-hoc by the Lead at Gate 3.
 
 - **Per-toolchain Always-Run audit only on lockfile touch.** **Rejected**: defeats the purpose — the minimatch incident proved transitive vulns surface independent of lockfile diffs in the current branch (they land via Dependabot or sibling devloops merging to main).
 

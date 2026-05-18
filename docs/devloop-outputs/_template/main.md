@@ -35,6 +35,7 @@
 | Code Quality | `{agent_id or pending}` |
 | DRY | `{agent_id or pending}` |
 | Operations | `{agent_id or pending}` |
+| Semantic Guard | `{agent_id or pending}` |
 
 <!-- LEAD REMINDER:
      - Update this table at EVERY phase transition
@@ -183,15 +184,12 @@ TBD
 **Duration**: ~Xs
 **Output**: {Any warnings}
 
-### Layer 7: Semantic Guards
-**Status**: PASS/MIXED/FAIL
-**Duration**: ~Xs per file
+### Layer 7: Env-tests
+**Status**: PASS/FAIL
+**Duration**: ~Xs
+**Output**: {Wall-clock time for dev-cluster rebuild + env-test run; pass/fail summary; log path}
 
-| File | Verdict | Notes |
-|------|---------|-------|
-| `path/to/file.rs` | SAFE/UNSAFE | {Brief notes} |
-
-{Details on any UNSAFE verdicts - were they valid concerns or false positives?}
+(Semantic-guard relocated to the Gate 2 reviewer panel per ADR-0033 Wave 3 #9. See § Code Review Results → Semantic Guard Reviewer below for its findings.)
 
 ---
 
@@ -235,6 +233,15 @@ TBD
 **Findings**: {count} found, {count} fixed, {count} deferred
 
 {Key findings and resolutions, or "No findings"}
+
+### Semantic Guard Reviewer
+**Verdict**: CLEAR / RESOLVED / ESCALATED
+**Native verdict**: SAFE / UNSAFE (mapped by Lead per `.claude/agents/semantic-guard.md` §Verdict Mapping)
+**Findings**: {count} found, {count} fixed, {count} deferred
+
+{Per-finding `[check-name]: file/path.rs:line - description` block, or "No findings"}
+
+{Note any findings folded with Code Reviewer at Gate 3 §Deduplication, with "(also flagged by code-reviewer)" attribution.}
 
 ---
 
