@@ -8,6 +8,9 @@
 - Host-side cluster helper (observability access, port discovery, health gating, listenAddress fix) -> ADR-0030
 - Metric testability (component tests + `MetricAssertion` helper + presence guard) -> ADR-0032
 - Service-owned dashboards and alerts (collapsed Phase 4, observability as cross-cutting reviewer) -> ADR-0031
+- Guard pipeline as Rust binary (`crates/dt-guard/`, subcommand-per-policy, `--explain` debug surface, no-wholesale-replace contract for (D)-complement) -> ADR-0034; per-guard vendor-coverage matrix (canonical) -> `docs/debates/2026-05-14-python-guard-pipeline-strategy/guard-vendor-coverage-matrix.md`
+- `dt-guard <subcommand> --explain <input>` debug surface (matched span + policy + source location; replaces `python3 -i` REPL workflow) -> ADR-0034 §7
+- Per-policy fixture suite convention (one positive + one negative per named failure mode; mirrors (D)-complement acceptance criteria shape) -> `crates/dt-guard/tests/fixtures/`, ADR-0034 §Implementation Notes
 
 ## Metrics
 - Metric catalogs -> `docs/observability/metrics/ac-service.md`, `docs/observability/metrics/gc-service.md`, `docs/observability/metrics/mc-service.md`, `docs/observability/metrics/mh-service.md`
