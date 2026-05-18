@@ -7,6 +7,7 @@
 - Host-side cluster helper for integration testing -> `docs/decisions/adr-0030-host-side-cluster-helper.md`
 - Client architecture (CDN deployment, Nx build pipeline, synthetic probe sizing) -> ADR-0028
 - Dashboard metric presentation (counters vs rates, $__rate_interval) -> ADR-0029
+- Guard pipeline as Rust binary `dt-guard` (single-crate, subcommand-per-policy) -> `docs/decisions/adr-0034-guard-pipeline-as-rust-binary.md`
 
 ## Code Locations
 - Service Dockerfiles -> `infra/docker/{ac,gc,mc,mh}-service/Dockerfile`
@@ -38,6 +39,9 @@
 - Skaffold dev workflow -> `infra/skaffold.yaml`
 - Containerized devloop (health check, eager setup, attach) -> `infra/devloop/devloop.sh`
 - dev-cluster client CLI (status display, setup/status output) -> `infra/devloop/dev-cluster`
+- Guard policy binary (ADR-0034, lands Wave 1; subcommand-per-policy, clap dispatcher, STATUS line emission per ADR-0033 §6) -> `crates/dt-guard/`
+- Guard shell wrapper shape (~7 LoC invoking `dt-guard <subcommand>` per ADR-0034 §3) -> `scripts/guards/simple/*.sh`
+- Workspace `disallowed_methods` convention (canonical-home `Lazy<Regex>` enforcement per ADR-0034 §6) -> `clippy.toml`
 - Devloop Layer 7 (env-tests in validation pipeline) -> `.claude/skills/devloop/SKILL.md`
 - Docker Compose (local tests) -> `docker-compose.test.yml`
 - Dev TLS cert generation (CA + MC + MH certs) -> `scripts/generate-dev-certs.sh`

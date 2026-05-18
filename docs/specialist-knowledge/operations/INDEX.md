@@ -5,9 +5,13 @@
 - Guard pipeline → ADR-0015; CI gates / Agent-Teams workflow / Cross-Boundary Ownership Model → ADR-0024 §6; Containerized devloop → ADR-0025
 - Host-side cluster helper → ADR-0030; Dashboard metrics (counters vs rates) → ADR-0029
 - Metric testability (single presence guard, Cat A/B/C rollout, raw `/metrics` evidence, per-service SLO sub-targets) → ADR-0032; service-owned dashboards/alerts (collapsed Phase 4) → ADR-0031
+- Guard pipeline as Rust binary `dt-guard` (single `crates/dt-guard/` workspace member; subcommand per policy; `serde_yaml` typed schema + `regex` DFA + `cargo audit` via Layer 6; D-1 promtool-parallel + D-2 grafana-provisioning-dry-run preserved as Wave 4) → ADR-0034
 
 ## CI & Guards
-- CI pipeline → `.github/workflows/ci.yml`; runner + common → `scripts/guards/run-guards.sh`, `common.sh` (shared helpers incl. `parse_cross_boundary_table()` for ADR-0024 §6 plan parsing)
+- CI pipeline → `.github/workflows/ci.yml`; runner + common → `scripts/guards/run-guards.sh`, `common.sh` (shared helpers incl. `parse_cross_boundary_table()` for ADR-0024 §6 plan parsing); per-guard timeout (`GUARD_TIMEOUT_SECS` default 30s, `timeout` wrapper emits `STATUS=FAIL REASON=guard-timeout-<name>` on exit 124 / `STATUS=FAIL REASON=guard-killed-<name>` on exit 137 SIGKILL) → `scripts/guards/run-guards.sh` L122/L132
+- `dt-guard` CLI invocation pattern (3-line shell wrapper invokes `${DT_GUARD:-$REPO_ROOT/target/release/dt-guard} <subcommand> --root "$REPO_ROOT" "$@"`, emits STATUS/REASON per ADR-0033 §6; per-subcommand `--explain <input>` debug surface replaces `python3 -i` REPL workflow) → `crates/dt-guard/src/main.rs`, `crates/dt-guard/README.md`
+- dt-guard triage runbook section (placeholder — to-author at Wave 3, three failure shapes: stale-binary / subcommand-not-found / bona-fide policy-violation) → `docs/runbooks/devloop-validation.md` §6.3.1
+- Debate of record (supersede debate + predecessor debate + per-guard vendor-coverage matrix) → `docs/debates/2026-05-17-guard-toolchain-supersede/debate.md`, `docs/debates/2026-05-14-python-guard-pipeline-strategy/debate.md`, `guard-vendor-coverage-matrix.md`
 - Kustomize → `scripts/guards/simple/validate-kustomize.sh`; app metrics (metric↔dashboard) → `validate-application-metrics.sh`; alert-rules → `validate-alert-rules.sh`, conventions → `docs/observability/alert-conventions.md`
 - Cross-boundary guards (Layer A scope-drift, Layer B classification-sanity; ADR-0024 §6) → `scripts/guards/simple/validate-cross-boundary-scope.sh`, `validate-cross-boundary-classification.sh`, `cross-boundary-ownership.yaml`
 - Metric-test coverage guard (`validate-metric-coverage.sh`, single presence check; lead sequences per-service backfill PRs during phasing window; MH ✓ + MC ✓ + AC ✓ + GC ✓ (all four `0 uncovered` after ADR-0032 Step 5, 2026-04-27) → ADR-0032
