@@ -40,11 +40,13 @@ set -euo pipefail
 REBUILD_IMAGE=false
 REFRESH_CREDS=false
 RECREATE=false
+DESTROY=false
 while [[ "${1:-}" == --* ]]; do
     case "$1" in
         --rebuild) REBUILD_IMAGE=true; shift ;;
         --refresh-creds) REFRESH_CREDS=true; shift ;;
         --recreate) RECREATE=true; shift ;;
+        --destroy) DESTROY=true; shift ;;
         *) echo "Unknown option: $1" >&2; exit 1 ;;
     esac
 done
@@ -63,7 +65,7 @@ if $REBUILD_IMAGE && [ -z "${1:-}" ]; then
     exit 0
 fi
 
-TASK_SLUG="${1:?Usage: devloop.sh [--rebuild] <task-slug> [base-branch]}"
+TASK_SLUG="${1:?Usage: devloop.sh [--rebuild|--refresh-creds|--recreate|--destroy] <task-slug> [base-branch]}"
 # Kind cluster names must be DNS labels (a-z, 0-9, hyphens only).
 if [[ ! "$TASK_SLUG" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]]; then
     echo "ERROR: Invalid task slug: '${TASK_SLUG}'" >&2
@@ -165,6 +167,14 @@ cleanup() {
     rm -rf "$CLONE_DIR"
     echo "Cleaned up."
 }
+
+# --destroy: tear down everything for this slug and exit. Placed after
+# cleanup() definition because bash resolves function calls against the
+# parsed body, not just declared names.
+if $DESTROY; then
+    cleanup
+    exit 0
+fi
 
 # Build the devloop-helper binary (ADR-0030).
 # Always rebuilds — cargo no-ops if source unchanged (~0.1s), and stale
