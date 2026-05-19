@@ -532,14 +532,17 @@ Cross-cutting; no standalone task this story. Security requirements ride other t
 | 41 | Intentional wire-break override mechanism (R-62, ADR-0033 Wave 3 #10): decide between per-line `# buf:breaking:ignore` comments vs annotated `proto/buf-breaking-allowlist.md` ratchet list. Land **after** ≥2 real wire-breaking PRs as case studies (Track 2 #31 is one such case; second case TBD post-#31). Mechanism must satisfy ADR-0033 §13: "intentional wire-breaks must be acknowledged explicitly in-tree, never via CI bypass flags or environment overrides." Cross-boundary: `--paired-with=operations`. | protocol | 31, 35 | code, docs |
 | 42 | Devloop container pnpm-store + entrypoint pnpm install (R-62, ADR-0033 Wave 2 follow-up): add `pnpm-store` named volume + `-e npm_config_store_dir=/tmp/pnpm-store` to `infra/devloop/devloop.sh` (mirrors existing `cargo-registry` / `cargo-git` cache pattern). Add conditional `pnpm install --frozen-lockfile` to `infra/devloop/entrypoint.sh` (runs when `/work/pnpm-lock.yaml` exists and `/work/node_modules/.bin/nx` is missing). Without this, the TS wrappers landed in #36 (`scripts/lang/ts/{compile,fmt,lint,test}.sh`) silently no-op inside devloops because `nx` is a workspace devDep and `node_modules/.bin/nx` is never materialized — TS-touching devloops pass `scripts/layer-all.sh` without ever exercising lint/typecheck/test. First devloop on a host populates the volume; subsequent devloops hardlink-only. Verify: fresh devloop has `nx --version` after entrypoint; `scripts/lang/ts/lint.sh` succeeds. | infrastructure | — | code |
 | 43 | Unify base-ref resolution + remove redundant CI fetch (R-62, ADR-0033 §7 follow-up): four-part coherent refactor surfaced during task #38 review. (1) In `scripts/lang/_get_base_ref.sh` CI-PR branch, resolve `BASE` uniformly to `merge-base(origin/$GITHUB_BASE_REF, HEAD)` per the existing TODO at line 86 — local-mergebase mode already does this; CI-PR mode is the outlier. Keep `DIFF_MODE=two-dot` (correct under uniform merge-base). (2) Delete the in-script `git fetch --no-tags origin "$GITHUB_BASE_REF"` at `_get_base_ref.sh:79` — `actions/checkout@v4` with `fetch-depth: 0` (`ci.yml:38`) makes the base ref pack-resident; the in-script fetch is redundant defense-in-depth. (3) Add precondition guardrail at `scripts/layer-all.sh` entry — `git rev-parse --verify origin/main^{commit}` fast-fail with actionable error so future shallow-checkout regressions don't surface as mystery wrapper failures. (4) Audit `.github/workflows/ci.yml:106` second checkout block — set `fetch-depth: 0` if it runs the pipeline, otherwise document why it's shallow. (5) Retire `scripts/guards/common.sh:get_diff_base()` — bisect the two-helper-family duplication by delegating to (or replacing it with reads of) `$DEVLOOP_BASE_REF`. **Behavior change to characterize**: CI-PR `BASE_SHA` shifts from base-branch tip to merge-base; required behavior-equivalence test on synthetic CI-PR diff (same `lang/*/changed.sh` exit codes + same `buf breaking` verdict before/after). Closes the cold-fetch tech-debt pointer logged in #38. Surfaced during code review of #38; not on original story scope but coherent with R-62 wave 3 cleanup. | infrastructure | 38 | code, deploy, docs |
+| 44 | Wave 1 — Python guards migrate to `crates/dt-guard/` (R-63, ADR-0034 §10 — collapsed to one devloop, deliberate deviation from §10's PR-by-PR plan): land `crates/dt-guard/` scaffold (`Cargo.toml` + `src/main.rs` clap dispatcher + `src/lib.rs` + `src/common/{mod,duration,path_safety,status}.rs`); land all 8 Python-replacement subcommands (`cite-extract`, `alert-rules-policy`, `dashboard-panels`, `metric-labels`, `application-metrics`, `infrastructure-metrics`, `grafana-datasources`, plus `secret_patterns` library used by future Wave 2 work); flip all 8 currently-Python-using shell guards to ≤5-line wrappers (`validate-doc-citations-{no-line-numbers,symbol-resolves}.sh`, `validate-alert-rules.sh`, `validate-dashboard-panels.sh`, `validate-metric-labels.sh`, `validate-application-metrics.sh`, `validate-infrastructure-metrics.sh`, `grafana-datasources.sh`); land 7-case `tests/doc_cite_resolve.rs` security suite + 17-case `tests/cite_extract_parity.rs` Python-vs-Rust parity fixture; delete `scripts/guards/lib/doc_cite_extract.py` + `__init__.py` + `__pycache__/`; remove `python3-yaml` apt from `infra/devloop/Dockerfile` + measure image-size delta; land `scripts/guards/run-guards.sh` per-guard timeout (ADR-0034 §9 strategy-independent hardening — `timeout --kill-after=${GUARD_KILL_AFTER_SECS:-5}s ${GUARD_TIMEOUT_SECS:-30}s`, exit-124 → `STATUS=FAIL REASON=guard-timeout-<name>`); add workspace `clippy.toml` `disallowed_methods` for `regex::Regex::new`; pick maintained `serde_yaml` fork (`serde_yml` or `serde_norway`) per ADR-0034 §Neutral. **Acknowledged trade-off**: this collapses ADR-0034 §10's 8-PR-over-2-3-weeks plan into a single Gate review surface (~1050-1500 LoC new Rust + 8 wrapper flips + 1 module deletion). Reviewability, revertability granularity, and per-subcommand parity-fixture timing all degrade vs. the incremental plan; accepted by user to consolidate Lead overhead. Cross-boundary: `--paired-with=security` (path-containment gate + secret patterns + `serde_yaml` fork audit) + `--paired-with=observability` (alert-rules/dashboard/metrics policy semantics) + `--paired-with=test` (parity + security fixtures + run-guards timeout). | infrastructure | — | code, tests, docs |
+| 45 | Wave 2 — remaining bash guards migrate to `dt-guard` subcommands (R-63, ADR-0034 §Decision "every shell guard becomes a wrapper" — collapsed to one devloop, same trade-off as #44): land subcommands for ~25 currently-pure-bash guards across four thematic groups — (a) **TS guards** (6): `no-secrets-in-ts`, `no-pii-in-logs-ts`, `no-test-removal-ts`, `name-guard-dt-client`, `no-dev-trust-path-in-prod-bundle`, `exports-map-closed`; (b) **secret/PII shell guards** (4): `no-hardcoded-secrets`, `no-pii-in-logs`, `no-secrets-in-logs`, `instrument-skip-all`; (c) **test-discipline guards** (6): `test-coverage`, `test-registration`, `test-rigidity`, `validate-cross-boundary-classification`, `validate-cross-boundary-scope`, `validate-gsa-sync`; (d) **structure/metadata guards** (7): `api-version-check`, `validate-env-config`, `validate-kustomize`, `validate-knowledge-index`, `validate-metric-coverage`, `validate-histogram-buckets`, `validate-todo-tracking`. Each becomes a `dt-guard <subcommand>` invocation in a ≤5-line shell wrapper. Reuse `dt_guard::common::secret_patterns` HYGIENE_PATTERNS set established in #44 for cross-stack consolidation. After this lands, **no shell guard contains substantive policy logic** — the carve-out machinery ADR-0034 §Decision argues against has no surface to police. **Same acknowledged trade-off as #44** — single-devloop scope means ~25 subcommand additions + 25 wrapper flips in one Gate pass; ~2500-3500 LoC by ADR-0034 §Negative LoC ratio. Cross-boundary: `--paired-with=client` (TS guards) + `--paired-with=security` (secret/PII) + `--paired-with=test` (test-discipline) + `--paired-with=operations` (cross-boundary classification gates Lead's GSA workflow). | infrastructure | 44 | code, tests, docs |
 
 ### Task Dependency Graph
 
-Tasks land in three sequenced **tracks** (per Revision 4 sequencing decision):
+Tasks land in four sequenced **tracks** (per Revisions 4 + 7 sequencing decisions):
 
-- **Track 3 — Polyglot pipeline foundation** (R-62, ADR-0033): tasks 32-43. Lands first, fully, before Track 2.
-- **Track 2 — Proto STANDARD-lint cleanup** (R-61): tasks 29-31. Lands after Track 3 (so `buf lint` is wired in and the temporary `buf.yaml` ignore scaffolding has somewhere to apply).
-- **Track 1 — Browser-client-join story remainder**: tasks 1-28. Phase 1 tasks (1, 2, 3) already done; the rest pause until Tracks 3+2 complete.
+- **Track 3 — Polyglot pipeline foundation** (R-62, ADR-0033): tasks 32-43. Lands first, fully, before Track 4.
+- **Track 4 — Guard pipeline as Rust binary** (R-63, ADR-0034): tasks 44, 45. Lands after Track 3 (uses ADR-0033's lang wrappers + audit gates) and before Track 2 (so new client guards surfaced during Track 1 are written as `dt-guard` subcommands rather than rewritten later).
+- **Track 2 — Proto STANDARD-lint cleanup** (R-61): tasks 29-31. Lands after Track 4 (Track 2's proto rename sweep doesn't depend on dt-guard, but interleaving the two would split focus).
+- **Track 1 — Browser-client-join story remainder**: tasks 1-28. Phase 1 tasks (1, 2, 3) already done; the rest pause until Tracks 3+4+2 complete.
 
 ```
 Track 3 — Wave 1 (parallel, no story-track deps): 32, 33 (after 32), 34
@@ -548,13 +551,17 @@ Track 3 — Wave 3 (after Wave 2):                  38 (after 35, 36, 37)
                                                    39 (after 38)
                                                    40 (after 38)
                                                    42 (after 38) — surfaced during #38 review; base-ref unification
+                                                   43 (after 38) — surfaced during #38 review; base-ref unification
 
-Track 2 (after Track 3 Wave 2 lands):              29 (after 2, 35)
+Track 4 (after Track 3 fully closed):              44 (after 38, 40 — Wave 1: Python guards → dt-guard)
+                                                   45 (after 44 — Wave 2: bash guards → dt-guard)
+
+Track 2 (after Track 4 lands):                     29 (after 2, 35)
                                                    30 (after 2, 7, 29)
                                                    31 (after 2, 7, 30)
                                                    41 (after 31, 35) — deferred Wave 3 task, needs case studies
 
-Track 1 (resumes after Tracks 3+2 done):
+Track 1 (resumes after Tracks 3+4+2 done):
   Phase 1 (parallel, no deps):  4, 5, 10, 23, 24, 28
   Phase 2:                      7 (after 1, 2)
                                 8 (after 1)
@@ -583,18 +590,19 @@ Track 1 (resumes after Tracks 3+2 done):
 - **Track 3 Wave 2** (3-way parallel): 35, 36, 37 run in parallel after Wave 1 (different specialists: protocol, infrastructure, client).
 - **Track 3 Wave 3** (initial then 2-way): 38 (SKILL.md rewrite + renumber) lands first; then 39 (runbook) and 40 (semantic-guard relocation) run in parallel. 41 (override mechanism) is deferred until Track 2 #31 ships as a case study.
 - **Track 3 Wave 2 follow-up**: 42 (devloop container pnpm-store + entrypoint pnpm install) and 43 (base-ref unification + redundant-fetch cleanup) — both independent of Wave 3 sequencing; both ran in parallel with Wave 3 in practice. Surfaced separately during #38 review; 43 was originally inserted as a second #42 and renumbered post-absorption.
+- **Track 4** (strictly sequential): 44 → 45. Each is a deliberately collapsed single-devloop Wave per Revision 7; no parallelism within Track 4.
 - **Track 2** (sequential): 29 → 30 → 31 in order; spec-first sequencing preserved per R-61 design.
 - **Track 1 — Phase 1** (massively parallel — 6 remaining tasks): 4, 5, 10, 23, 24, 28 run in parallel after Track 2.
 - **Track 1 — Phase 5** (5-way fork): 6, 25, 26, 27, 12 run in parallel after #31 clears.
 - **Track 1 — Phase 8** (3-way fork): 15, 16, 17.
 - **Track 1 — Phase 10** (3-way fork): 19, 20, 21.
-- **Critical path**: 32 → 35 → 29 → 30 → 31 → 6/13/etc → 14 → 15 → 18 → 19 (~10 edges along the longest chain). Track 3 adds ~3 edges to the critical path vs. the original story.
+- **Critical path**: 32 → 35 → 38 → 40 → 44 → 45 → 29 → 30 → 31 → 6/13/etc → 14 → 15 → 18 → 19 (~13 edges along the longest chain). Track 3 added ~3 edges; Track 4 adds ~2 more (Wave 1 → Wave 2).
 
 ### Specialist Task Summary
 
 | Specialist | Tasks | Count |
 |-----------|-------|-------|
-| infrastructure | 1, 3, 4, 17, 22, 28, 32, 33, 34, 36, 42, 43 | 12 |
+| infrastructure | 1, 3, 4, 17, 22, 28, 32, 33, 34, 36, 42, 43, 44, 45 | 14 |
 | protocol | 2, 7, 29, 30, 31, 35, 41 | 7 |
 | meeting-controller | 6 | 1 |
 | global-controller | 5, 10, 26 | 3 |
@@ -606,7 +614,7 @@ Track 1 (resumes after Tracks 3+2 done):
 | operations | 20, 21, 38, 39, 40 | 5 |
 | security | — (cross-cutting; reviews each task at devloop close; paired on #33, #37) | 0 |
 | database | — (opt-out, interface validated; SQL provided to infra) | 0 |
-| **Total** | | **43** |
+| **Total** | | **45** |
 
 ### Requirements Coverage
 
@@ -673,7 +681,8 @@ Track 1 (resumes after Tracks 3+2 done):
 | R-59 | 28 |
 | R-60 | 2 (proto), 6 (MC handler), 14 (SDK send) |
 | R-61 | 29 (conventions doc + agent-prompt + temporary buf.yaml ignore scaffolding, lands first as spec), 30 (file-layout, MINIMAL findings), 31 (STANDARD rename sweep, wire-breaking + ignore removal) |
-| R-62 | 32 (pipeline scaffolding + classifier + base-ref helper), 33 (pnpm audit always-run + ts dir), 34 (Layer A scope-drift parser fix), 35 (proto wrappers + Layer 1 ordering), 36 (TS wrappers via Nx), 37 (TS guards under simple/ts/), 38 (SKILL.md rewrite + Layer 8→7 renumber), 39 (devloop-validation runbook), 40 (semantic-guard relocation to reviewer panel), 41 (intentional wire-break override mechanism, deferred), 42 (base-ref unification + redundant CI fetch removal — surfaced during #38 review) |
+| R-62 | 32 (pipeline scaffolding + classifier + base-ref helper), 33 (pnpm audit always-run + ts dir), 34 (Layer A scope-drift parser fix), 35 (proto wrappers + Layer 1 ordering), 36 (TS wrappers via Nx), 37 (TS guards under simple/ts/), 38 (SKILL.md rewrite + Layer 8→7 renumber), 39 (devloop-validation runbook), 40 (semantic-guard relocation to reviewer panel), 41 (intentional wire-break override mechanism, deferred), 42 (devloop container pnpm-store + entrypoint pnpm install), 43 (base-ref unification + redundant CI fetch removal — surfaced during #38 review) |
+| R-63 | 44 (Wave 1 — Python guards → dt-guard crate; one-devloop collapse per Revision 7), 45 (Wave 2 — remaining bash guards → dt-guard subcommands; one-devloop collapse per Revision 7) |
 
 ### Aspect Coverage
 
@@ -738,8 +747,10 @@ Each row below is a `/devloop` invocation. Run them in dependency order (see §T
 | 41 | `/devloop "Intentional wire-break override mechanism (R-62, ADR-0033 Wave 3 #10): decide between per-line # buf:breaking:ignore comments vs annotated proto/buf-breaking-allowlist.md ratchet; lands AFTER ≥2 real wire-breaking PRs as case studies (#31 is one such). Must satisfy ADR-0033 §13: in-tree explicit acknowledgement only, no CI bypass flags. See task #41 in docs/user-stories/2026-05-02-browser-client-join.md" --specialist=protocol --paired-with=operations` | protocol | 31, 35 | | Pending |
 | 42 | `/devloop "Devloop container pnpm-store + entrypoint pnpm install (R-62, ADR-0033 Wave 2 follow-up): add pnpm-store named volume + -e npm_config_store_dir=/tmp/pnpm-store in infra/devloop/devloop.sh (mirrors existing cargo-registry/cargo-git cache pattern); conditional pnpm install --frozen-lockfile in infra/devloop/entrypoint.sh when /work/pnpm-lock.yaml exists and /work/node_modules/.bin/nx is missing. Fixes silent no-op of TS wrappers from #36 in devloops (nx is a workspace devDep, never materialized without pnpm install). See task #42 in docs/user-stories/2026-05-02-browser-client-join.md" --specialist=infrastructure` | infrastructure | — | `docs/devloop-outputs/2026-05-14-devloop-pnpm-store-entrypoint/main.md` | Completed |
 | 43 | `/devloop "Unify base-ref resolution + remove redundant CI fetch (R-62, ADR-0033 §7 follow-up; surfaced during task #38 code review): coherent refactor — (1) resolve BASE to merge-base uniformly in scripts/lang/_get_base_ref.sh CI-PR branch (line 83 → git merge-base origin/$GITHUB_BASE_REF HEAD per existing TODO at line 86); keep DIFF_MODE=two-dot. (2) Delete in-script git fetch at _get_base_ref.sh:79 — ci.yml:38 fetch-depth: 0 makes it redundant. (3) Add precondition guardrail at scripts/layer-all.sh entry (git rev-parse --verify origin/main^{commit} fast-fail). (4) Audit ci.yml:106 second checkout block; set fetch-depth: 0 if pipeline-running, document otherwise. (5) Retire scripts/guards/common.sh:get_diff_base() — delegate to or replace with reads of $DEVLOOP_BASE_REF. Behavior-equivalence test required (synthetic CI-PR diff: same lang/*/changed.sh exit codes + same buf breaking verdict before/after). Closes #38 cold-fetch tech-debt pointer. See task #43 in docs/user-stories/2026-05-02-browser-client-join.md" --specialist=infrastructure --paired-with=operations` | infrastructure | 38 | `docs/devloop-outputs/2026-05-13-base-ref-unification-task42/main.md` | Completed |
+| 44 | `/devloop "Wave 1 — Python guards migrate to crates/dt-guard/ (R-63, ADR-0034; collapsed single-devloop per user-story Revision 7, deliberate deviation from ADR-0034 §10's PR-by-PR plan): land crates/dt-guard scaffold + all 8 Python-replacement subcommands (cite-extract, alert-rules-policy, dashboard-panels, metric-labels, application-metrics, infrastructure-metrics, grafana-datasources, plus secret_patterns lib for Wave 2 reuse); flip 8 currently-Python-using shell guards to ≤5-line wrappers; 7-case path_safety security suite + 17-case Python-vs-Rust parity fixture; delete scripts/guards/lib/doc_cite_extract.py; remove python3-yaml apt + measure image-size delta; land run-guards.sh per-guard timeout (strategy-independent §9 hardening); workspace clippy.toml disallowed_methods for Regex::new; maintained serde_yaml fork pick. See task #44 in docs/user-stories/2026-05-02-browser-client-join.md" --specialist=infrastructure --paired-with=security --paired-with=observability --paired-with=test` | infrastructure | 38, 40 | | Pending |
+| 45 | `/devloop "Wave 2 — remaining bash guards migrate to dt-guard subcommands (R-63, ADR-0034 §Decision; collapsed single-devloop per user-story Revision 7, same trade-off as #44): land subcommands for ~25 pure-bash guards in four thematic groups — TS guards (6), secret/PII shell guards (4), test-discipline guards (6), structure/metadata guards (7). Each becomes a dt-guard <subcommand> invocation in a ≤5-line shell wrapper. Reuse dt_guard::common::secret_patterns established in #44. After this lands, no shell guard contains substantive policy logic. See task #45 in docs/user-stories/2026-05-02-browser-client-join.md" --specialist=infrastructure --paired-with=client --paired-with=security --paired-with=test --paired-with=operations` | infrastructure | 44 | | Pending |
 
-After all 43 devloops complete: run `/close-story browser-client-join` to verify completeness, run story-scope reflection, commit the cumulative work, and open the PR.
+After all 45 devloops complete: run `/close-story browser-client-join` to verify completeness, run story-scope reflection, commit the cumulative work, and open the PR.
 
 ---
 
@@ -824,3 +835,25 @@ After all 43 devloops complete: run `/close-story browser-client-join` to verify
 - **Specialist task counts**: infrastructure 11 → 12. Total 42 → 43.
 - **Critical path**: unchanged (#43 is also off the critical path; it ran in parallel with Wave 3 in practice).
 - **Sequencing note**: #43 was completed before this revision was written; the renumber is a labelling cleanup, not a re-plan.
+
+### Revision 7 — 2026-05-18
+
+**Feedback**: Wave 2 of Track 3 (TS guards, task #37) surfaced six pure-bash TS-specific guards under `scripts/guards/simple/ts/`. Task #39's runbook follow-up surfaced that six observability/metrics guards in `scripts/guards/simple/` had been written using inline Python heredocs (multi-month convention the user had not been aware of) and that task #39 itself added the first committed `.py` module at `scripts/guards/lib/doc_cite_extract.py`. A 2026-05-14 debate proposed a system-only-stdlib Python posture + 5 meta-guards + 5 tripwires; user reflection rejected that outcome as structurally incoherent (5 meta-guards policing 1 lib module, `Approved-Stdlib-Exception` trailer being the escape hatch, Python version pin making every Debian point-release an ADR amendment, tripwire-to-future-uv deferring real plumbing). A 2026-05-17 supersede debate constrained specialists to pick one toolchain; **β (Rust binary `dt-guard`)** won unanimous β=84.3 satisfaction (all 7 specialists WOULD_ACCEPT=yes; all cross-cutting specialists ≥70 satisfaction floor per ADR-0024 §5.7). Outcome: **ADR-0034 (Accepted 2026-05-18)** — every shell guard becomes a 3-5 line wrapper invoking `dt-guard <subcommand>`; Python exits the pipeline entirely.
+
+**Why fold into this story rather than spin out**: as Track 1 client work proceeds (#9, #11, #13, #14, #15), new client-related guards will likely be surfaced. Per ADR-0034's "every shell guard becomes a wrapper" scope, **every new guard written in bash would be rewritten as a `dt-guard` subcommand later** — full 2x-write cost. Landing dt-guard before Track 1 resumes avoids that by making "new guard" mean "new `dt-guard` subcommand" from day one. The Python module from #39 also represents *active* negative inventory (cost grows with every doc-citation devloop that has to decide deprecated-vs-canonical) which dissolves the moment Wave 1 deletes it.
+
+**Sequencing decision**: Track 4 lands **after Track 3 fully closes** (uses ADR-0033's lang wrappers + audit gates as the validation surface) and **before Track 2 starts** (so Track 2's proto cleanup work doesn't interleave with the dt-guard migration's broad-touch scope). Critical path extends by ~2 edges (Wave 1 → Wave 2).
+
+**Acknowledged deliberate deviation from ADR-0034 §10's incremental plan**: ADR-0034 specifies 8 PRs over 2-3 weeks for the Python-guard migration, "guard-by-guard, not big-bang." This revision **collapses each Wave to one devloop** (#44 covers all 8 Python-using guards; #45 covers all ~25 bash guards), accepted by user to consolidate Lead overhead. Trade-offs:
+- **Review surface degrades**: ~1050-1500 LoC + 8 wrapper flips arrive at Gate 2 simultaneously for #44; ~2500-3500 LoC + 25 wrapper flips for #45. Security, observability, test, dry-reviewer absorb the entire crate at once vs. ADR's incremental review per subcommand. The `cite-extract` logic is security-sensitive (path containment + symlink escape); this trade-off is the largest single cost.
+- **Revertability granularity degrades**: a regression in subcommand 5 means reverting the entire wave commit-range rather than just that subcommand's PR.
+- **Parity-fixture timing degrades**: 17-case Python-vs-Rust fixture passes-or-fails opaquely at end-of-wave rather than per subcommand.
+
+**Changes**:
+- **Requirements added**: R-63 (Guard pipeline as Rust binary per ADR-0034).
+- **Tasks added**: #44 (Wave 1 — Python guards → `crates/dt-guard/`; one devloop), #45 (Wave 2 — remaining bash guards → `dt-guard` subcommands; one devloop).
+- **Specialist task counts**: infrastructure 12 → 14. Total 43 → 45.
+- **Critical path**: extended by ~2 edges (#44 → #45). New path length ~13 edges.
+- **Track sequencing**: introduces Track 4 between Track 3 (closes after #40 ✅) and Track 2 (proto cleanup, deferred behind dt-guard).
+
+**Reference**: `docs/decisions/adr-0034-guard-pipeline-as-rust-binary.md` + `docs/debates/2026-05-14-python-guard-pipeline-strategy/` (predecessor, reframed) + `docs/debates/2026-05-17-guard-toolchain-supersede/` (winning debate).
