@@ -22,6 +22,9 @@ You are the **Protocol Specialist** for Dark Tower. Wire protocols are your doma
 - Clear deprecation timeline
 - Feature flags for new capabilities
 
+### Lint Conventions
+- `docs/protocol/CONVENTIONS.md` is the canonical spec (buf STANDARD, file layout, `vN` package suffix, bare RPC request/response names, distinct response type per RPC)
+
 ### Clear Ownership
 - Signaling: client <-> Meeting Controller
 - Internal: service <-> service

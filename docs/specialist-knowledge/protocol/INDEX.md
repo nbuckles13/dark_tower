@@ -3,6 +3,7 @@
 ## Architecture & Design
 - API versioning strategy → ADR-0004
 - User auth meeting access (protocol implications) → ADR-0020
+- Proto conventions (buf STANDARD, file layout, `vN` suffix, bare RPC names, distinct response types) → `docs/protocol/CONVENTIONS.md`
 - API contracts and component interactions → `docs/API_CONTRACTS.md`
 - WebTransport connection flow and message framing → `docs/WEBTRANSPORT_FLOW.md`
 - Client architecture (frame codec, BigInt/u64, SFrame layering, trace context proto fields) → ADR-0028
