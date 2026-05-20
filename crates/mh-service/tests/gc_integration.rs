@@ -20,7 +20,7 @@ use proto_gen::internal::media_handler_registry_service_server::{
     MediaHandlerRegistryService, MediaHandlerRegistryServiceServer,
 };
 use proto_gen::internal::{
-    MhLoadReportRequest, MhLoadReportResponse, RegisterMhRequest, RegisterMhResponse,
+    RegisterMhRequest, RegisterMhResponse, SendLoadReportRequest, SendLoadReportResponse,
 };
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
@@ -49,7 +49,7 @@ struct MockGcServer {
     registration_count: AtomicU32,
     load_report_count: AtomicU32,
     registration_tx: Option<mpsc::Sender<RegisterMhRequest>>,
-    load_report_tx: Option<mpsc::Sender<MhLoadReportRequest>>,
+    load_report_tx: Option<mpsc::Sender<SendLoadReportRequest>>,
 }
 
 impl MockGcServer {
@@ -87,7 +87,7 @@ impl MockGcServer {
         self
     }
 
-    fn with_load_report_channel(mut self, tx: mpsc::Sender<MhLoadReportRequest>) -> Self {
+    fn with_load_report_channel(mut self, tx: mpsc::Sender<SendLoadReportRequest>) -> Self {
         self.load_report_tx = Some(tx);
         self
     }
@@ -129,8 +129,8 @@ impl MediaHandlerRegistryService for MockGcServer {
 
     async fn send_load_report(
         &self,
-        request: Request<MhLoadReportRequest>,
-    ) -> Result<Response<MhLoadReportResponse>, Status> {
+        request: Request<SendLoadReportRequest>,
+    ) -> Result<Response<SendLoadReportResponse>, Status> {
         let inner = request.into_inner();
         self.load_report_count.fetch_add(1, Ordering::SeqCst);
 
@@ -141,7 +141,7 @@ impl MediaHandlerRegistryService for MockGcServer {
         match self.behavior {
             MockBehavior::NotFound => Err(Status::not_found("MH not registered with GC")),
             MockBehavior::Accept | MockBehavior::Reject => {
-                Ok(Response::new(MhLoadReportResponse {
+                Ok(Response::new(SendLoadReportResponse {
                     acknowledged: true,
                     timestamp: 1_700_000_000,
                 }))

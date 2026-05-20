@@ -23,14 +23,14 @@
 #
 # When the Layer B guard reports "Owner ∈ manifest list" as passing, that
 # is NOT a certification that all required owners co-signed — all-three
-# intersection enforcement (e.g., proto/dark_tower/internal/internal.proto
+# intersection enforcement (e.g., proto/dark_tower/internal/v1/internal.proto
 # needing protocol + auth-controller + security) remains Gate 1 human-review
 # territory per §6.6 design rationale.
 
 "proto/**": [protocol]
 "proto-gen/**": [protocol]
 "build.rs": [protocol]
-"proto/dark_tower/internal/internal.proto": [protocol, auth-controller, security]
+"proto/dark_tower/internal/v1/internal.proto": [protocol, auth-controller, security]
 "crates/media-protocol/**": [protocol, media-handler]
 "crates/common/src/jwt.rs": [auth-controller, security]
 "crates/common/src/meeting_token.rs": [auth-controller, security]

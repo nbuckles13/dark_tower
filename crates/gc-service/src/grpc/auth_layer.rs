@@ -222,10 +222,11 @@ where
             // Match the gRPC service path to the expected caller service_type.
             let grpc_path = request.uri().path();
             let (grpc_service_label, expected_type) = if grpc_path
-                .starts_with("/dark_tower.internal.GlobalControllerService/")
+                .starts_with("/dark_tower.internal.v1.GlobalControllerService/")
             {
                 ("GlobalControllerService", "meeting-controller")
-            } else if grpc_path.starts_with("/dark_tower.internal.MediaHandlerRegistryService/") {
+            } else if grpc_path.starts_with("/dark_tower.internal.v1.MediaHandlerRegistryService/")
+            {
                 ("MediaHandlerRegistryService", "media-handler")
             } else {
                 // Unknown gRPC service path — fail closed
@@ -393,10 +394,10 @@ mod tests {
     }
 
     /// MC→GC gRPC path for `GlobalControllerService`
-    const MC_GRPC_PATH: &str = "/dark_tower.internal.GlobalControllerService/RegisterMC";
+    const MC_GRPC_PATH: &str = "/dark_tower.internal.v1.GlobalControllerService/RegisterMC";
 
     /// MH→GC gRPC path for `MediaHandlerRegistryService`
-    const MH_GRPC_PATH: &str = "/dark_tower.internal.MediaHandlerRegistryService/RegisterMH";
+    const MH_GRPC_PATH: &str = "/dark_tower.internal.v1.MediaHandlerRegistryService/RegisterMH";
 
     fn make_claims(scope: &str, service_type: Option<&str>) -> TestClaims {
         let now = Utc::now().timestamp();
@@ -770,7 +771,7 @@ mod tests {
         let token = keypair.sign_token(&claims);
 
         let request = http::Request::builder()
-            .uri("/dark_tower.internal.UnknownService/SomeMethod")
+            .uri("/dark_tower.internal.v1.UnknownService/SomeMethod")
             .header("authorization", format!("Bearer {token}"))
             .body(BoxBody::default())
             .unwrap();

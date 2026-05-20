@@ -17,7 +17,7 @@
 - Protobuf-es generated types → `packages/sdk-core/src/proto/`
 
 ## Protocol Integration
-- Signaling proto (client-server) → `proto/dark_tower/signaling/signaling.proto`
+- Signaling proto (client-server) → `proto/dark_tower/signaling/v1/signaling.proto`
 - 42-byte binary frame format → `crates/media-protocol/src/frame.rs`
 - Cross-language test vectors → `proto/test-vectors/`
 - Protobuf-es codegen → `@bufbuild/protobuf-es` (wire compatible with Rust prost)

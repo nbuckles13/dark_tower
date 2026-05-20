@@ -1,6 +1,6 @@
 syntax = "proto3";
 
-package dark_tower.signaling;
+package dark_tower.signaling.v1;
 
 import "google/protobuf/timestamp.proto";
 

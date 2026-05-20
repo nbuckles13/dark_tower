@@ -14,8 +14,9 @@ use crate::routes::AppState;
 use crate::services::McAssignmentService;
 use proto_gen::internal::global_controller_service_server::GlobalControllerService;
 use proto_gen::internal::{
-    ComprehensiveHeartbeatRequest, FastHeartbeatRequest, HeartbeatResponse,
-    NotifyMeetingEndedRequest, NotifyMeetingEndedResponse, RegisterMcRequest, RegisterMcResponse,
+    ComprehensiveHeartbeatRequest, ComprehensiveHeartbeatResponse, FastHeartbeatRequest,
+    FastHeartbeatResponse, NotifyMeetingEndedRequest, NotifyMeetingEndedResponse,
+    RegisterMcRequest, RegisterMcResponse,
 };
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
@@ -269,7 +270,7 @@ impl GlobalControllerService for McService {
     async fn fast_heartbeat(
         &self,
         request: Request<FastHeartbeatRequest>,
-    ) -> Result<Response<HeartbeatResponse>, Status> {
+    ) -> Result<Response<FastHeartbeatResponse>, Status> {
         let req = request.into_inner();
 
         // Validate controller ID
@@ -310,7 +311,7 @@ impl GlobalControllerService for McService {
 
         let timestamp = chrono::Utc::now().timestamp() as u64;
 
-        Ok(Response::new(HeartbeatResponse {
+        Ok(Response::new(FastHeartbeatResponse {
             acknowledged: true,
             timestamp,
         }))
@@ -324,7 +325,7 @@ impl GlobalControllerService for McService {
     async fn comprehensive_heartbeat(
         &self,
         request: Request<ComprehensiveHeartbeatRequest>,
-    ) -> Result<Response<HeartbeatResponse>, Status> {
+    ) -> Result<Response<ComprehensiveHeartbeatResponse>, Status> {
         let req = request.into_inner();
 
         // Validate controller ID
@@ -377,7 +378,7 @@ impl GlobalControllerService for McService {
 
         let timestamp = chrono::Utc::now().timestamp() as u64;
 
-        Ok(Response::new(HeartbeatResponse {
+        Ok(Response::new(ComprehensiveHeartbeatResponse {
             acknowledged: true,
             timestamp,
         }))

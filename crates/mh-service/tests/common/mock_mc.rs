@@ -15,8 +15,8 @@ use proto_gen::internal::media_coordination_service_server::{
     MediaCoordinationService, MediaCoordinationServiceServer,
 };
 use proto_gen::internal::{
-    ParticipantMediaConnected, ParticipantMediaConnectedResponse, ParticipantMediaDisconnected,
-    ParticipantMediaDisconnectedResponse,
+    NotifyParticipantConnectedRequest, NotifyParticipantConnectedResponse,
+    NotifyParticipantDisconnectedRequest, NotifyParticipantDisconnectedResponse,
 };
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -42,8 +42,8 @@ pub struct MockMcServer {
     behavior: MockBehavior,
     connected_count: AtomicU32,
     disconnected_count: AtomicU32,
-    connected_tx: Option<mpsc::Sender<ParticipantMediaConnected>>,
-    disconnected_tx: Option<mpsc::Sender<ParticipantMediaDisconnected>>,
+    connected_tx: Option<mpsc::Sender<NotifyParticipantConnectedRequest>>,
+    disconnected_tx: Option<mpsc::Sender<NotifyParticipantDisconnectedRequest>>,
 }
 
 impl MockMcServer {
@@ -57,12 +57,18 @@ impl MockMcServer {
         }
     }
 
-    pub fn with_connected_tx(mut self, tx: mpsc::Sender<ParticipantMediaConnected>) -> Self {
+    pub fn with_connected_tx(
+        mut self,
+        tx: mpsc::Sender<NotifyParticipantConnectedRequest>,
+    ) -> Self {
         self.connected_tx = Some(tx);
         self
     }
 
-    pub fn with_disconnected_tx(mut self, tx: mpsc::Sender<ParticipantMediaDisconnected>) -> Self {
+    pub fn with_disconnected_tx(
+        mut self,
+        tx: mpsc::Sender<NotifyParticipantDisconnectedRequest>,
+    ) -> Self {
         self.disconnected_tx = Some(tx);
         self
     }
@@ -93,8 +99,8 @@ impl MockMcServer {
 impl MediaCoordinationService for MockMcServer {
     async fn notify_participant_connected(
         &self,
-        request: Request<ParticipantMediaConnected>,
-    ) -> Result<Response<ParticipantMediaConnectedResponse>, Status> {
+        request: Request<NotifyParticipantConnectedRequest>,
+    ) -> Result<Response<NotifyParticipantConnectedResponse>, Status> {
         self.connected_count.fetch_add(1, Ordering::SeqCst);
         let inner = request.into_inner();
 
@@ -106,15 +112,15 @@ impl MediaCoordinationService for MockMcServer {
             return Err(status);
         }
 
-        Ok(Response::new(ParticipantMediaConnectedResponse {
+        Ok(Response::new(NotifyParticipantConnectedResponse {
             acknowledged: true,
         }))
     }
 
     async fn notify_participant_disconnected(
         &self,
-        request: Request<ParticipantMediaDisconnected>,
-    ) -> Result<Response<ParticipantMediaDisconnectedResponse>, Status> {
+        request: Request<NotifyParticipantDisconnectedRequest>,
+    ) -> Result<Response<NotifyParticipantDisconnectedResponse>, Status> {
         self.disconnected_count.fetch_add(1, Ordering::SeqCst);
         let inner = request.into_inner();
 
@@ -126,7 +132,7 @@ impl MediaCoordinationService for MockMcServer {
             return Err(status);
         }
 
-        Ok(Response::new(ParticipantMediaDisconnectedResponse {
+        Ok(Response::new(NotifyParticipantDisconnectedResponse {
             acknowledged: true,
         }))
     }
