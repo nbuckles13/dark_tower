@@ -30,7 +30,7 @@
 - ParticipantActor (target: `mc.actor.participant`) -> `crates/mc-service/src/actors/participant.rs:run()`
 
 ## MH WebTransport Tracing
-- Server/connection (targets: `mh.webtransport`, `.connection`) -> `crates/mh-service/src/webtransport/server.rs`, `connection.rs`
+- Server/connection (targets: `mh.webtransport`, `.connection`) -> `crates/mh-service/src/webtransport/server.rs`, `crates/mh-service/src/webtransport/connection.rs`
 
 ## gRPC Client Tracing (MC -> GC, MC -> MH)
 - GcClient tracing (registration, heartbeat, re-registration) -> `crates/mc-service/src/grpc/gc_client.rs` (target: `mc.grpc.gc_client`)
@@ -38,8 +38,7 @@
 - RegisterMeeting trigger tracing (async spawned task, retry lifecycle) -> `crates/mc-service/src/webtransport/connection.rs:register_meeting_with_handlers()` (target: `mc.register_meeting.trigger`)
 
 ## Health
-- MC health state -> `crates/mc-service/src/observability/health.rs:health_router()`
-- MH health state (ready after GC registration) -> `crates/mh-service/src/observability/health.rs:health_router()`
+- MC -> `crates/mc-service/src/observability/health.rs:health_router()`; MH (ready after GC registration) -> `crates/mh-service/src/observability/health.rs:health_router()`
 
 ## Dashboards, Alerts & Infrastructure
 - Grafana dashboards (per-service overview, errors-overview, SLOs) -> `infra/grafana/dashboards/`, provisioning `infra/grafana/provisioning/`; MC MH Communication row -> `mc-overview.json` (panels: RegisterMeeting RPC Rate, Latency P50/P95/P99)
@@ -50,9 +49,7 @@
 - MC/MH K8s health probes + metrics scrape -> `infra/services/{mc,mh}-service/deployment.yaml`
 
 ## Kind Cluster Setup (Observability)
-- Setup (deploy_observability, setup_port_forwards, deploy_only_service, DT_CLUSTER_NAME/DT_PORT_MAP) -> `infra/kind/scripts/setup.sh`
-- Devloop ConfigMap patching (MC/MH advertise addresses, DT_HOST_GATEWAY_IP guard) -> `infra/kind/scripts/setup.sh:deploy_mc_service()`, `deploy_mh_service()`
-- Teardown (parameterized cluster name, scoped pkill) -> `infra/kind/scripts/teardown.sh`
+- Setup (deploy_observability, setup_port_forwards, deploy_only_service, DT_CLUSTER_NAME/DT_PORT_MAP, devloop ConfigMap patching for MC/MH advertise addresses + DT_HOST_GATEWAY_IP guard at `:deploy_{mc,mh}_service()`) -> `infra/kind/scripts/setup.sh`; teardown (parameterized cluster name, scoped pkill) -> `infra/kind/scripts/teardown.sh`
 
 ## Devloop Cluster Helper (Observability)
 - Kind config template (listenAddress: ${HOST_GATEWAY_IP}, dynamic observability ports) -> `infra/kind/kind-config.yaml.tmpl`

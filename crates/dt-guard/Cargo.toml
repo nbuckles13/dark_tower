@@ -1,0 +1,39 @@
+[package]
+name = "dt-guard"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# ADR-0034: Guard pipeline as Rust binary (`dt-guard`).
+# Single-crate workspace member exposing one subcommand per guard policy.
+# Shell wrappers at scripts/guards/simple/*.sh invoke `dt-guard <subcommand>`.
+# Workspace lints (no-panic) are enforced; static-regex `.expect()` sites carry
+# line-scoped `#[allow(clippy::disallowed_methods, clippy::expect_used)]`
+# per the canonical-home convention in ADR-0034 §6.
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "dt-guard"
+path = "src/main.rs"
+
+[lib]
+name = "dt_guard"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+once_cell = "1"
+regex = "1"
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_norway = "0.9.42"
+walkdir = "2"
+
+[dev-dependencies]
+assert_cmd = "2"
+tempfile = "3"

@@ -2114,6 +2114,10 @@ current-context: kind-devloop-test
         }
 
         // Verify every non-comment, non-empty line matches setup.sh validation regex
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test-only static-literal Regex; pattern compiles or test panics — outside dt-guard canonical-home discipline since this is a one-off test assertion, not a guard kernel. ADR-0034 §6 + ADR-0002"
+        )]
         let re = regex::Regex::new(r"^[A-Z_][A-Z0-9_]*=[0-9]+$").unwrap();
         for line in contents.lines() {
             if line.is_empty() || line.starts_with('#') {

@@ -67,9 +67,8 @@
 - Observability validation (Loki, metrics) → `crates/env-tests/tests/30_observability.rs`, `src/cluster.rs:is_loki_available()`
 
 ## Code Locations: Cluster Setup & Helper (ADR-0030)
-- Setup/teardown (arg parsing, deploy_only_service, load_image_to_kind; Kind config) → `infra/kind/scripts/setup.sh`, `teardown.sh`, `infra/kind/kind-config.yaml.tmpl`
-- Port map + gateway IP → `crates/devloop-helper/src/commands.rs`; Port map file → `/tmp/devloop-{slug}/ports.json`
-- Env vars + ConfigMap patching → `infra/kind/scripts/setup.sh`; Wrapper → `infra/devloop/devloop.sh`
+- Setup/teardown (arg parsing, deploy_only_service, load_image_to_kind; Kind config; env vars + ConfigMap patching) → `infra/kind/scripts/setup.sh`, `teardown.sh`, `infra/kind/kind-config.yaml.tmpl`; wrapper → `infra/devloop/devloop.sh`
+- Port map + gateway IP → `crates/devloop-helper/src/commands.rs`; port map file → `/tmp/devloop-{slug}/ports.json`
 
 ## Code Locations: Common & Infrastructure
 - JWT (claims, JwksClient, JwtValidator, round-trip tests) -> `crates/common/src/jwt.rs`; meeting token -> `meeting_token.rs:tests`
