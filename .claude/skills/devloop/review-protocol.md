@@ -82,20 +82,29 @@ The implementer will either:
 2. **Defer with justification** — explain why the fix is too expensive for this PR
 3. **Spin-out** — route the finding to a separate devloop owned by a different specialist when the ADR-0024 §6.3 owner-involvement tier mandates it (Domain-judgment in a non-owner's devloop, or a Guarded Shared Area edit lacking the required owner trailer). Implementer elects; reviewer accepts or escalates using the same triage model as deferrals. When spun out to an owner-implemented devloop, the current devloop's commit does not require the missing owner's trailer — the spun-out devloop is the forcing function. Record the target slug in `docs/TODO.md`.
 
-### Valid deferral justifications
-- Requires changing files outside the PR's changeset
+### Burden of proof for any deferral
+
+**Deferral requires demonstrating that fix-now-cost (LoC + test surface + risk) > fix-later-cost + tracking-overhead.** The list below names patterns where this math *sometimes* holds — verify it actually holds for THIS finding. The list is not a license to defer; each pattern is a starting point for justification, not a justification itself.
+
+The cost-of-fix-later side of the inequality includes: (a) the same fix later costs the same LoC, (b) someone has to find the tech-debt entry, (c) someone has to re-establish context, (d) the code lives in a broken state until then. Tracking overhead is real and recurring.
+
+**Anti-pattern check** — these justifications are almost never valid for small fixes:
+- "It's a one-line change but it's outside the PR's intended scope" → fix it; sunk-cost framing
+- "It's minor" / "it's low priority" / "it's not important" → severity is not deferral justification
+- "It works as-is" → if it's a finding, something is wrong; deferral isn't acceptance
+- "We can do it later" → not a justification; explain WHY now is harder than later
+
+### Patterns where the cost math sometimes favors deferral
+- Requires changing files outside the PR's changeset **and** the change is non-trivial (>~10 LoC or touches test surface)
 - Requires a design decision or architectural change that warrants its own planning
 - Introduces significant regression risk requiring its own test cycle
 - Needs cross-service coordination (e.g., common crate change affecting multiple consumers)
 
-### Invalid deferral justifications
-- "It's minor" / "it's low priority" / "it's not important"
-- "It works as-is" (if it's a finding, there's something to improve)
-- "We can do it later" (without explaining WHY it can't be done now)
+**Suspicious deferral check** — if the finding is (a) a fix under ~5 LoC, (b) inside the PR's existing file changeset, and (c) has no design ambiguity, then deferral is almost certainly the wrong call. Sunk-cost framing makes one-line fixes feel like "going backward" at Gate 2, but the cognitive frame is the bias — fix it.
 
 ### Your response to a deferral or spin-out
-- **Accept**: The justification is legitimate — the fix genuinely can't be done in this PR without disproportionate cost or risk, or the ADR-0024 §6.3 owner tier requires a different specialist. Mark as "accepted deferral" or "accepted spin-out" in your verdict.
-- **Escalate**: The justification is not convincing — you believe the fix should happen in this PR. Send your verdict as ESCALATED and explain why to @team-lead.
+- **Accept**: The justification meets the burden-of-proof above — the cost math actually favors deferral for THIS finding. Mark as "accepted deferral" or "accepted spin-out" in your verdict. Note that even one accepted deferral makes your verdict RESOLVED-DEFERRED, not RESOLVED-FIXED.
+- **Escalate**: The justification doesn't meet the burden of proof, or the suspicious-deferral check flagged it. Send your verdict as ESCALATED and explain why to @team-lead. Lean toward escalation when in doubt — Gate 3 can always override an ESCALATE down to acceptance, but a missed deferral can't be unwound.
 
 **Spin-out tracking**: When a finding is spun out, the reviewer records it in `docs/TODO.md` under the appropriate section (Cross-Service Duplication, Observability Debt, Code Quality, etc.) with a pointer to the new devloop slug (or "to be scheduled"). If the spun-out devloop does not land within the next scheduled devloop for the owning specialist, the finding is surfaced in the current devloop's follow-up report and re-raisable in future devloops touching the same area. Spin-out is not a silent handoff — tracking is the reviewer's responsibility at verdict time.
 
@@ -134,13 +143,17 @@ The DRY reviewer operates on a hybrid model:
   - **Justification**: [if deferred/spun-out — implementer's justification, and for spin-outs the target devloop slug or "to be scheduled"]
 
 ### Verdict
-**CLEAR** (no findings) or **RESOLVED** (all findings fixed or acceptably deferred/spun-out) or **ESCALATED** (unresolved disagreement on a deferral or spin-out)
+**CLEAR** (no findings), **RESOLVED-FIXED** (every finding was fixed in this PR — zero deferred, zero spun-out), **RESOLVED-DEFERRED** (at least one finding was deferred or spun-out, regardless of how many others were fixed), or **ESCALATED** (unresolved disagreement on a deferral or spin-out).
+
+The verdict is **RESOLVED-DEFERRED** if *any* finding remains in the diff after this PR — even one. A review with 9 fixes and 1 deferral is RESOLVED-DEFERRED, not RESOLVED-FIXED. This is deliberate: a single bullet under §Accepted Deferrals is a cost shift to future work, and the verdict should surface that cost without it being averaged away by the fixes.
+
+**Why the distinction matters**: a single "RESOLVED" verdict that covers both "fully fixed" and "partly deferred" lets deferral hide inside resolution. Splitting the verdict makes the deferral state visible at Gate 2 instead of weeks later in a tech-debt audit, and shifts the cognitive frame from "did we close the loop" to "did we leave anything in the diff." The latter framing is harder to satisfy with paperwork.
 
 ### Escalation reason (if escalated)
 [Which finding, why the deferral/spin-out justification is insufficient]
 
-### Tech Debt References
-[Pointers to `docs/TODO.md` entries appended for any accepted deferrals, spin-outs, or DRY extraction opportunities — one bullet per entry, citing the section heading the entry was added under so the reader can locate it.]
+### Accepted Deferrals
+[Pointers to `docs/TODO.md` entries appended for any accepted deferrals, spin-outs, or DRY extraction opportunities — one bullet per entry, citing the section heading the entry was added under so the reader can locate it. If this section is non-empty, your verdict above is RESOLVED-DEFERRED.]
 ```
 
 ### Classification Monotonicity (Ownership Lens)
@@ -167,14 +180,15 @@ Guards without justification are flagged as findings.
 
 ## Iteration
 
-If implementer fixes your findings:
+If implementer fixes ALL your findings (zero remaining in diff):
 1. Re-review the specific changes
-2. Update your verdict
-3. Use SendMessage to tell @team-lead: "Updated verdict: RESOLVED"
+2. Update your verdict to RESOLVED-FIXED
+3. Use SendMessage to tell @team-lead: "Updated verdict: RESOLVED-FIXED"
 
-If implementer defers with justification you accept:
-1. Mark finding as "Deferred (accepted)" in your verdict
-2. Use SendMessage to tell @team-lead: "Verdict: RESOLVED — {N} findings fixed, {M} acceptably deferred"
+If implementer defers (or spins out) one or more findings with justification you accept:
+1. Mark each deferred finding as "Deferred (accepted)" or "Spun-out (accepted)" in your verdict
+2. Update your verdict to RESOLVED-DEFERRED (even if other findings were fixed)
+3. Use SendMessage to tell @team-lead: "Verdict: RESOLVED-DEFERRED — {N} findings fixed, {M} acceptably deferred"
 
 ## Time Budget
 
