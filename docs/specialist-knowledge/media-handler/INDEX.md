@@ -40,8 +40,8 @@
 - Fuzz: roundtrip → `crates/media-protocol/fuzz/fuzz_targets/codec_roundtrip.rs`
 
 ## Proto Definitions
-- MC↔MH / MH↔GC / MH→MC RPCs + assignment + DisconnectReason → `proto/internal.proto`
-- Client signaling (MediaStream, StreamAssignment, MediaConnectionUpdate, layout) → `proto/signaling.proto`
+- MC↔MH / MH↔GC / MH→MC RPCs + assignment + DisconnectReason → `proto/dark_tower/internal/internal.proto`
+- Client signaling (MediaStream, StreamAssignment, MediaConnectionUpdate, layout) → `proto/dark_tower/signaling/signaling.proto`
 - Generated Rust code → `crates/proto-gen/build.rs`
 
 ## Integration Seams

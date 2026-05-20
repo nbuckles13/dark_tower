@@ -9,8 +9,8 @@
 - Client architecture (frame codec, BigInt/u64, SFrame layering, trace context proto fields) → ADR-0028
 
 ## Proto Definitions
-- Signaling proto (client-server) → `proto/signaling.proto`
-- Internal proto (service-to-service) → `proto/internal.proto`
+- Signaling proto (client-server) → `proto/dark_tower/signaling/signaling.proto`
+- Internal proto (service-to-service) → `proto/dark_tower/internal/internal.proto`
 - Proto codegen build script → `crates/proto-gen/build.rs`
 - Proto re-exports and module wiring → `crates/proto-gen/src/lib.rs`
 
@@ -23,12 +23,12 @@
 - Codec roundtrip fuzzer → `crates/media-protocol/fuzz/fuzz_targets/codec_roundtrip.rs`
 
 ## gRPC Services (internal.proto)
-- MediaHandlerService (MC→MH): Register, RegisterMeeting, RouteMedia, StreamTelemetry → `proto/internal.proto`
-- MediaCoordinationService (MH→MC): NotifyParticipantConnected, NotifyParticipantDisconnected → `proto/internal.proto`
-- MeetingControllerService (GC→MC): AssignMeetingWithMh → `proto/internal.proto`
-- GlobalControllerService (MC→GC): RegisterMC, FastHeartbeat, ComprehensiveHeartbeat → `proto/internal.proto`
-- MediaHandlerRegistryService (MH→GC): RegisterMH, SendLoadReport → `proto/internal.proto`
-- DisconnectReason enum (bounded for metrics) → `proto/internal.proto`
+- MediaHandlerService (MC→MH): Register, RegisterMeeting, RouteMedia, StreamTelemetry → `proto/dark_tower/internal/internal.proto`
+- MediaCoordinationService (MH→MC): NotifyParticipantConnected, NotifyParticipantDisconnected → `proto/dark_tower/internal/internal.proto`
+- MeetingControllerService (GC→MC): AssignMeetingWithMh → `proto/dark_tower/internal/internal.proto`
+- GlobalControllerService (MC→GC): RegisterMC, FastHeartbeat, ComprehensiveHeartbeat → `proto/dark_tower/internal/internal.proto`
+- MediaHandlerRegistryService (MH→GC): RegisterMH, SendLoadReport → `proto/dark_tower/internal/internal.proto`
+- DisconnectReason enum (bounded for metrics) → `proto/dark_tower/internal/internal.proto`
 
 ## gRPC Service Implementations
 - MH MediaHandlerService impl → `crates/mh-service/src/grpc/mh_service.rs`
@@ -47,8 +47,8 @@
 - MC service-token auth layer → `crates/mc-service/src/grpc/auth_interceptor.rs`
 
 ## Signaling Messages (signaling.proto)
-- MediaServerInfo (in JoinResponse.media_servers) → `proto/signaling.proto`
-- MediaConnectionUpdate (client→MC; per-MH ConnectionState statuses, browser-client-join R-60) → `proto/signaling.proto`
+- MediaServerInfo (in JoinResponse.media_servers) → `proto/dark_tower/signaling/signaling.proto`
+- MediaConnectionUpdate (client→MC; per-MH ConnectionState statuses, browser-client-join R-60) → `proto/dark_tower/signaling/signaling.proto`
 - MediaConnectionUpdate handler (Task #2 stub; Task #6 reseats with mc_participant_mh_status_total{state}) → `crates/mc-service/src/webtransport/connection.rs`
 
 ## Integration Seams

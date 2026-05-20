@@ -13,13 +13,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tonic_build::configure()
         .out_dir("src/generated")
         .compile_protos(
-            &["../../proto/signaling.proto", "../../proto/internal.proto"],
+            &[
+                "../../proto/dark_tower/signaling/signaling.proto",
+                "../../proto/dark_tower/internal/internal.proto",
+            ],
             &["../../proto/"],
         )?;
 
     // Tell Cargo to rerun if proto files change
-    println!("cargo:rerun-if-changed=../../proto/signaling.proto");
-    println!("cargo:rerun-if-changed=../../proto/internal.proto");
+    println!("cargo:rerun-if-changed=../../proto/dark_tower/signaling/signaling.proto");
+    println!("cargo:rerun-if-changed=../../proto/dark_tower/internal/internal.proto");
 
     Ok(())
 }

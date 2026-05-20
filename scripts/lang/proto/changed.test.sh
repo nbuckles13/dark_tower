@@ -12,9 +12,10 @@ __here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../_test_helpers.sh
 source "${__here}/../_test_helpers.sh"
 
-# Touched cases (exit 0). Mix of real files in the repo (catches
-# predicate-pattern-regression) plus a synthetic happy-path that survives
-# internal/signaling renames.
+# Touched cases (exit 0). Path strings matched via `diff_touches_path "proto/"`
+# — prefix-only, file existence is not checked. Inputs are deliberately a
+# mix of synthetic paths and real config files; both exercise the same
+# prefix pattern any regression would break.
 assert_rc "proto/foo.proto"        0 "$(run_with_cache "proto/foo.proto")"
 assert_rc "proto/internal.proto"   0 "$(run_with_cache "proto/internal.proto")"
 assert_rc "proto/signaling.proto"  0 "$(run_with_cache "proto/signaling.proto")"
