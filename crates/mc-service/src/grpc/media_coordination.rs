@@ -20,8 +20,8 @@ use crate::mh_connection_registry::{MhConnectionRegistry, MAX_ID_LENGTH};
 use crate::observability::metrics;
 use proto_gen::internal::media_coordination_service_server::MediaCoordinationService;
 use proto_gen::internal::{
-    ParticipantMediaConnected, ParticipantMediaConnectedResponse, ParticipantMediaDisconnected,
-    ParticipantMediaDisconnectedResponse,
+    NotifyParticipantConnectedRequest, NotifyParticipantConnectedResponse,
+    NotifyParticipantDisconnectedRequest, NotifyParticipantDisconnectedResponse,
 };
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
@@ -73,8 +73,8 @@ impl MediaCoordinationService for McMediaCoordinationService {
     #[instrument(skip_all, name = "mc.grpc.media_coordination.connected")]
     async fn notify_participant_connected(
         &self,
-        request: Request<ParticipantMediaConnected>,
-    ) -> Result<Response<ParticipantMediaConnectedResponse>, Status> {
+        request: Request<NotifyParticipantConnectedRequest>,
+    ) -> Result<Response<NotifyParticipantConnectedResponse>, Status> {
         let inner = request.into_inner();
 
         // Validate all required fields
@@ -113,7 +113,7 @@ impl MediaCoordinationService for McMediaCoordinationService {
             "Participant connected to MH"
         );
 
-        Ok(Response::new(ParticipantMediaConnectedResponse {
+        Ok(Response::new(NotifyParticipantConnectedResponse {
             acknowledged: true,
         }))
     }
@@ -122,8 +122,8 @@ impl MediaCoordinationService for McMediaCoordinationService {
     #[instrument(skip_all, name = "mc.grpc.media_coordination.disconnected")]
     async fn notify_participant_disconnected(
         &self,
-        request: Request<ParticipantMediaDisconnected>,
-    ) -> Result<Response<ParticipantMediaDisconnectedResponse>, Status> {
+        request: Request<NotifyParticipantDisconnectedRequest>,
+    ) -> Result<Response<NotifyParticipantDisconnectedResponse>, Status> {
         let inner = request.into_inner();
 
         // Validate all required fields
@@ -165,7 +165,7 @@ impl MediaCoordinationService for McMediaCoordinationService {
             "Participant disconnected from MH"
         );
 
-        Ok(Response::new(ParticipantMediaDisconnectedResponse {
+        Ok(Response::new(NotifyParticipantDisconnectedResponse {
             acknowledged: true,
         }))
     }
@@ -184,7 +184,7 @@ mod tests {
     async fn test_notify_connected_success() {
         let svc = create_service();
 
-        let request = Request::new(ParticipantMediaConnected {
+        let request = Request::new(NotifyParticipantConnectedRequest {
             meeting_id: "meeting-1".to_string(),
             participant_id: "part-1".to_string(),
             handler_id: "mh-1".to_string(),
@@ -200,7 +200,7 @@ mod tests {
         let registry = Arc::new(MhConnectionRegistry::new());
         let svc = McMediaCoordinationService::new(Arc::clone(&registry));
 
-        let request = Request::new(ParticipantMediaConnected {
+        let request = Request::new(NotifyParticipantConnectedRequest {
             meeting_id: "meeting-1".to_string(),
             participant_id: "part-1".to_string(),
             handler_id: "mh-1".to_string(),
@@ -217,7 +217,7 @@ mod tests {
     async fn test_notify_connected_empty_meeting_id() {
         let svc = create_service();
 
-        let request = Request::new(ParticipantMediaConnected {
+        let request = Request::new(NotifyParticipantConnectedRequest {
             meeting_id: String::new(),
             participant_id: "part-1".to_string(),
             handler_id: "mh-1".to_string(),
@@ -232,7 +232,7 @@ mod tests {
     async fn test_notify_connected_empty_participant_id() {
         let svc = create_service();
 
-        let request = Request::new(ParticipantMediaConnected {
+        let request = Request::new(NotifyParticipantConnectedRequest {
             meeting_id: "meeting-1".to_string(),
             participant_id: String::new(),
             handler_id: "mh-1".to_string(),
@@ -247,7 +247,7 @@ mod tests {
     async fn test_notify_connected_empty_handler_id() {
         let svc = create_service();
 
-        let request = Request::new(ParticipantMediaConnected {
+        let request = Request::new(NotifyParticipantConnectedRequest {
             meeting_id: "meeting-1".to_string(),
             participant_id: "part-1".to_string(),
             handler_id: String::new(),
@@ -262,7 +262,7 @@ mod tests {
     async fn test_notify_connected_oversized_id() {
         let svc = create_service();
 
-        let request = Request::new(ParticipantMediaConnected {
+        let request = Request::new(NotifyParticipantConnectedRequest {
             meeting_id: "a".repeat(257),
             participant_id: "part-1".to_string(),
             handler_id: "mh-1".to_string(),
@@ -279,7 +279,7 @@ mod tests {
         let svc = McMediaCoordinationService::new(Arc::clone(&registry));
 
         // First connect
-        let connect_req = Request::new(ParticipantMediaConnected {
+        let connect_req = Request::new(NotifyParticipantConnectedRequest {
             meeting_id: "meeting-1".to_string(),
             participant_id: "part-1".to_string(),
             handler_id: "mh-1".to_string(),
@@ -287,7 +287,7 @@ mod tests {
         svc.notify_participant_connected(connect_req).await.unwrap();
 
         // Then disconnect
-        let disconnect_req = Request::new(ParticipantMediaDisconnected {
+        let disconnect_req = Request::new(NotifyParticipantDisconnectedRequest {
             meeting_id: "meeting-1".to_string(),
             participant_id: "part-1".to_string(),
             handler_id: "mh-1".to_string(),
@@ -318,14 +318,14 @@ mod tests {
         let svc = McMediaCoordinationService::new(Arc::clone(&registry));
 
         // Participant connects to two MHs (active/active topology).
-        let connect_mh1 = Request::new(ParticipantMediaConnected {
+        let connect_mh1 = Request::new(NotifyParticipantConnectedRequest {
             meeting_id: "meeting-round-trip".to_string(),
             participant_id: "part-rt".to_string(),
             handler_id: "mh-alpha".to_string(),
         });
         svc.notify_participant_connected(connect_mh1).await.unwrap();
 
-        let connect_mh2 = Request::new(ParticipantMediaConnected {
+        let connect_mh2 = Request::new(NotifyParticipantConnectedRequest {
             meeting_id: "meeting-round-trip".to_string(),
             participant_id: "part-rt".to_string(),
             handler_id: "mh-beta".to_string(),
@@ -338,7 +338,7 @@ mod tests {
         assert_eq!(conns.len(), 2, "both MH connections should be tracked");
 
         // Disconnect from mh-alpha only: mh-beta must remain intact (sibling preservation).
-        let disconnect_mh1 = Request::new(ParticipantMediaDisconnected {
+        let disconnect_mh1 = Request::new(NotifyParticipantDisconnectedRequest {
             meeting_id: "meeting-round-trip".to_string(),
             participant_id: "part-rt".to_string(),
             handler_id: "mh-alpha".to_string(),
@@ -361,7 +361,7 @@ mod tests {
         assert_eq!(conns[0].handler_id, "mh-beta");
 
         // Disconnect from mh-beta: participant and meeting should be cleaned up.
-        let disconnect_mh2 = Request::new(ParticipantMediaDisconnected {
+        let disconnect_mh2 = Request::new(NotifyParticipantDisconnectedRequest {
             meeting_id: "meeting-round-trip".to_string(),
             participant_id: "part-rt".to_string(),
             handler_id: "mh-beta".to_string(),
@@ -382,7 +382,7 @@ mod tests {
         // Idempotent retry: MH may resend disconnect for a tuple the registry
         // has already cleared. MC must return Ok, not a gRPC error — a gRPC
         // error would page operators via error-rate alerts.
-        let disconnect_retry = Request::new(ParticipantMediaDisconnected {
+        let disconnect_retry = Request::new(NotifyParticipantDisconnectedRequest {
             meeting_id: "meeting-round-trip".to_string(),
             participant_id: "part-rt".to_string(),
             handler_id: "mh-beta".to_string(),
@@ -402,7 +402,7 @@ mod tests {
     async fn test_notify_disconnected_unknown_meeting() {
         let svc = create_service();
 
-        let request = Request::new(ParticipantMediaDisconnected {
+        let request = Request::new(NotifyParticipantDisconnectedRequest {
             meeting_id: "unknown-meeting".to_string(),
             participant_id: "part-1".to_string(),
             handler_id: "mh-1".to_string(),
@@ -419,7 +419,7 @@ mod tests {
     async fn test_notify_disconnected_empty_fields() {
         let svc = create_service();
 
-        let request = Request::new(ParticipantMediaDisconnected {
+        let request = Request::new(NotifyParticipantDisconnectedRequest {
             meeting_id: String::new(),
             participant_id: "part-1".to_string(),
             handler_id: "mh-1".to_string(),

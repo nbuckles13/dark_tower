@@ -23,7 +23,9 @@ use crate::observability::metrics;
 use common::secret::ExposeSecret;
 use common::token_manager::TokenReceiver;
 use proto_gen::internal::media_coordination_service_client::MediaCoordinationServiceClient;
-use proto_gen::internal::{ParticipantMediaConnected, ParticipantMediaDisconnected};
+use proto_gen::internal::{
+    NotifyParticipantConnectedRequest, NotifyParticipantDisconnectedRequest,
+};
 use std::time::Duration;
 use tonic::transport::Endpoint;
 use tonic::Request;
@@ -86,7 +88,7 @@ impl McClient {
         participant_id: &str,
         handler_id: &str,
     ) -> Result<(), MhError> {
-        let request = ParticipantMediaConnected {
+        let request = NotifyParticipantConnectedRequest {
             meeting_id: meeting_id.to_string(),
             participant_id: participant_id.to_string(),
             handler_id: handler_id.to_string(),
@@ -131,7 +133,7 @@ impl McClient {
         handler_id: &str,
         reason: i32,
     ) -> Result<(), MhError> {
-        let request = ParticipantMediaDisconnected {
+        let request = NotifyParticipantDisconnectedRequest {
             meeting_id: meeting_id.to_string(),
             participant_id: participant_id.to_string(),
             handler_id: handler_id.to_string(),

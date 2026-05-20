@@ -53,8 +53,8 @@ use tower::{Layer, Service, ServiceExt};
 use wiremock::MockServer;
 
 const MH_GRPC_PATH: &str =
-    "/dark_tower.internal.MediaCoordinationService/NotifyParticipantConnected";
-const GC_GRPC_PATH: &str = "/dark_tower.internal.MeetingControllerService/AssignMeetingWithMh";
+    "/dark_tower.internal.v1.MediaCoordinationService/NotifyParticipantConnected";
+const GC_GRPC_PATH: &str = "/dark_tower.internal.v1.MeetingControllerService/AssignMeetingWithMh";
 const REQUIRED_SCOPE: &str = "service.write.mc";
 const WRONG_SCOPE: &str = "service.write.gc";
 

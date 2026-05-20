@@ -1,22 +1,22 @@
 syntax = "proto3";
 
-package dark_tower.internal;
+package dark_tower.internal.v1;
 
-import "dark_tower/signaling/signaling.proto";
+import "dark_tower/signaling/v1/signaling.proto";
 
 // ============================================================================
 // Meeting Controller <-> Media Handler
 // ============================================================================
 
 // Request to register a participant with the media handler
-message RegisterParticipant {
+message RegisterRequest {
   string participant_id = 1;
   string meeting_id = 2;
-  repeated dark_tower.signaling.MediaStream streams = 3;
+  repeated dark_tower.signaling.v1.MediaStream streams = 3;
 }
 
 // Response to participant registration
-message RegisterParticipantResponse {
+message RegisterResponse {
   string connection_token = 1;
   string media_handler_url = 2;
 }
@@ -36,7 +36,7 @@ message CascadeDestination {
 }
 
 // Command to route media between participants (supports multi-handler cascading)
-message RouteMediaCommand {
+message RouteMediaRequest {
   uint64 source_user_id = 1; // Source participant (8-byte user ID)
   uint32 source_stream_id = 2; // Source stream (4-byte subscriber ID)
   repeated string destination_participant_ids = 3; // Direct destinations on this handler
@@ -45,7 +45,7 @@ message RouteMediaCommand {
 }
 
 // Media telemetry from media handler to meeting controller
-message MediaTelemetry {
+message StreamTelemetryRequest {
   uint64 user_id = 1; // Source participant (8-byte user ID)
   uint32 stream_id = 2; // Stream identifier (4-byte)
   uint64 bytes_sent = 3;
@@ -119,10 +119,10 @@ message ComprehensiveHeartbeatRequest {
 
 // Media handler service (Meeting Controller -> Media Handler)
 service MediaHandlerService {
-  rpc Register(RegisterParticipant) returns (RegisterParticipantResponse);
+  rpc Register(RegisterRequest) returns (RegisterResponse);
   rpc RegisterMeeting(RegisterMeetingRequest) returns (RegisterMeetingResponse);
-  rpc RouteMedia(RouteMediaCommand) returns (RouteMediaResponse);
-  rpc StreamTelemetry(stream MediaTelemetry) returns (TelemetryAck);
+  rpc RouteMedia(RouteMediaRequest) returns (RouteMediaResponse);
+  rpc StreamTelemetry(stream StreamTelemetryRequest) returns (StreamTelemetryResponse);
 }
 
 // Request to register a meeting with a media handler (MC→MH)
@@ -142,7 +142,7 @@ message RouteMediaResponse {
   string error_message = 2;
 }
 
-message TelemetryAck {
+message StreamTelemetryResponse {
   bool received = 1;
 }
 
@@ -166,8 +166,8 @@ message NotifyMeetingEndedResponse {
 // MC→GC service (MCs call this to register and heartbeat)
 service GlobalControllerService {
   rpc RegisterMC(RegisterMCRequest) returns (RegisterMCResponse);
-  rpc FastHeartbeat(FastHeartbeatRequest) returns (HeartbeatResponse);
-  rpc ComprehensiveHeartbeat(ComprehensiveHeartbeatRequest) returns (HeartbeatResponse);
+  rpc FastHeartbeat(FastHeartbeatRequest) returns (FastHeartbeatResponse);
+  rpc ComprehensiveHeartbeat(ComprehensiveHeartbeatRequest) returns (ComprehensiveHeartbeatResponse);
   rpc NotifyMeetingEnded(NotifyMeetingEndedRequest) returns (NotifyMeetingEndedResponse);
 }
 
@@ -176,10 +176,15 @@ service MediaHandlerRegistryService {
   // Register a new media handler with the global controller
   rpc RegisterMH(RegisterMHRequest) returns (RegisterMHResponse);
   // Send a load report (heartbeat with capacity/health info)
-  rpc SendLoadReport(MHLoadReportRequest) returns (MHLoadReportResponse);
+  rpc SendLoadReport(SendLoadReportRequest) returns (SendLoadReportResponse);
 }
 
-message HeartbeatResponse {
+message FastHeartbeatResponse {
+  bool acknowledged = 1;
+  uint64 timestamp = 2;
+}
+
+message ComprehensiveHeartbeatResponse {
   bool acknowledged = 1;
   uint64 timestamp = 2;
 }
@@ -238,7 +243,7 @@ message RegisterMHResponse {
 }
 
 // Load report from MH to GC (heartbeat with capacity info)
-message MHLoadReportRequest {
+message SendLoadReportRequest {
   string handler_id = 1; // Handler sending the report
   uint32 current_streams = 2; // Current number of active streams
   HealthStatus health = 3; // Current health status
@@ -248,7 +253,7 @@ message MHLoadReportRequest {
 }
 
 // Response to load report
-message MHLoadReportResponse {
+message SendLoadReportResponse {
   bool acknowledged = 1;
   uint64 timestamp = 2;
 }
@@ -267,24 +272,24 @@ enum DisconnectReason {
 
 // MH→MC coordination service for participant media connection lifecycle
 service MediaCoordinationService {
-  rpc NotifyParticipantConnected(ParticipantMediaConnected) returns (ParticipantMediaConnectedResponse);
-  rpc NotifyParticipantDisconnected(ParticipantMediaDisconnected) returns (ParticipantMediaDisconnectedResponse);
+  rpc NotifyParticipantConnected(NotifyParticipantConnectedRequest) returns (NotifyParticipantConnectedResponse);
+  rpc NotifyParticipantDisconnected(NotifyParticipantDisconnectedRequest) returns (NotifyParticipantDisconnectedResponse);
 }
 
 // Notification that a participant has connected to a media handler
-message ParticipantMediaConnected {
+message NotifyParticipantConnectedRequest {
   string meeting_id = 1;
   string participant_id = 2;
   string handler_id = 3;
 }
 
 // Response to participant connected notification
-message ParticipantMediaConnectedResponse {
+message NotifyParticipantConnectedResponse {
   bool acknowledged = 1;
 }
 
 // Notification that a participant has disconnected from a media handler
-message ParticipantMediaDisconnected {
+message NotifyParticipantDisconnectedRequest {
   string meeting_id = 1;
   string participant_id = 2;
   string handler_id = 3;
@@ -292,6 +297,6 @@ message ParticipantMediaDisconnected {
 }
 
 // Response to participant disconnected notification
-message ParticipantMediaDisconnectedResponse {
+message NotifyParticipantDisconnectedResponse {
   bool acknowledged = 1;
 }

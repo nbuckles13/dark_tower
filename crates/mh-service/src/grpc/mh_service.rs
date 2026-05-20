@@ -15,8 +15,8 @@ use crate::observability::metrics;
 use crate::session::{MeetingRegistration, SessionManagerHandle};
 use proto_gen::internal::media_handler_service_server::MediaHandlerService;
 use proto_gen::internal::{
-    MediaTelemetry, RegisterMeetingRequest, RegisterMeetingResponse, RegisterParticipant,
-    RegisterParticipantResponse, RouteMediaCommand, RouteMediaResponse, TelemetryAck,
+    RegisterMeetingRequest, RegisterMeetingResponse, RegisterRequest, RegisterResponse,
+    RouteMediaRequest, RouteMediaResponse, StreamTelemetryRequest, StreamTelemetryResponse,
 };
 use tonic::{Request, Response, Status, Streaming};
 use tracing::instrument;
@@ -65,8 +65,8 @@ impl MediaHandlerService for MhMediaService {
     #[instrument(skip_all)]
     async fn register(
         &self,
-        request: Request<RegisterParticipant>,
-    ) -> Result<Response<RegisterParticipantResponse>, Status> {
+        request: Request<RegisterRequest>,
+    ) -> Result<Response<RegisterResponse>, Status> {
         let req = request.into_inner();
 
         // Basic validation
@@ -87,7 +87,7 @@ impl MediaHandlerService for MhMediaService {
 
         metrics::record_grpc_request("register", "success");
 
-        let stub_response = RegisterParticipantResponse {
+        let stub_response = RegisterResponse {
             connection_token: stub_placeholder(),
             media_handler_url: "stub://localhost".to_string(),
         };
@@ -191,7 +191,7 @@ impl MediaHandlerService for MhMediaService {
     #[instrument(skip_all)]
     async fn route_media(
         &self,
-        request: Request<RouteMediaCommand>,
+        request: Request<RouteMediaRequest>,
     ) -> Result<Response<RouteMediaResponse>, Status> {
         let req = request.into_inner();
 
@@ -216,8 +216,8 @@ impl MediaHandlerService for MhMediaService {
     #[instrument(skip_all)]
     async fn stream_telemetry(
         &self,
-        request: Request<Streaming<MediaTelemetry>>,
-    ) -> Result<Response<TelemetryAck>, Status> {
+        request: Request<Streaming<StreamTelemetryRequest>>,
+    ) -> Result<Response<StreamTelemetryResponse>, Status> {
         let mut stream = request.into_inner();
 
         // Consume the stream (log first message, drain rest)
@@ -254,7 +254,7 @@ impl MediaHandlerService for MhMediaService {
 
         metrics::record_grpc_request("stream_telemetry", "success");
 
-        Ok(Response::new(TelemetryAck { received: true }))
+        Ok(Response::new(StreamTelemetryResponse { received: true }))
     }
 }
 
@@ -262,8 +262,8 @@ impl MediaHandlerService for MhMediaService {
 ///
 /// Wraps `stream.message()` to work with `while let Some` pattern.
 async fn stream_next(
-    stream: &mut Streaming<MediaTelemetry>,
-) -> Option<Result<MediaTelemetry, Status>> {
+    stream: &mut Streaming<StreamTelemetryRequest>,
+) -> Option<Result<StreamTelemetryRequest, Status>> {
     match stream.message().await {
         Ok(Some(msg)) => Some(Ok(msg)),
         Ok(None) => None,

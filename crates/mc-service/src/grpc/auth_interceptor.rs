@@ -218,21 +218,22 @@ where
             // Layer 2: service_type routing (ADR-0003)
             // Match the gRPC service path to the expected caller service_type.
             let grpc_path = request.uri().path();
-            let expected_type =
-                if grpc_path.starts_with("/dark_tower.internal.MeetingControllerService/") {
-                    "global-controller"
-                } else if grpc_path.starts_with("/dark_tower.internal.MediaCoordinationService/") {
-                    "media-handler"
-                } else {
-                    // Unknown gRPC service path — fail closed
-                    tracing::warn!(
-                        target: "mc.grpc.auth",
-                        path = %grpc_path,
-                        "Unknown gRPC service path, rejecting"
-                    );
-                    let response = tonic::Status::permission_denied("Access denied").into_http();
-                    return Ok(response);
-                };
+            let expected_type = if grpc_path
+                .starts_with("/dark_tower.internal.v1.MeetingControllerService/")
+            {
+                "global-controller"
+            } else if grpc_path.starts_with("/dark_tower.internal.v1.MediaCoordinationService/") {
+                "media-handler"
+            } else {
+                // Unknown gRPC service path — fail closed
+                tracing::warn!(
+                    target: "mc.grpc.auth",
+                    path = %grpc_path,
+                    "Unknown gRPC service path, rejecting"
+                );
+                let response = tonic::Status::permission_denied("Access denied").into_http();
+                return Ok(response);
+            };
 
             let actual_type = claims.service_type.as_deref().unwrap_or("unknown");
             if actual_type != expected_type {
@@ -244,7 +245,7 @@ where
                     "Caller service_type does not match target gRPC service"
                 );
                 metrics::record_caller_type_rejected(
-                    if grpc_path.starts_with("/dark_tower.internal.MeetingControllerService/") {
+                    if grpc_path.starts_with("/dark_tower.internal.v1.MeetingControllerService/") {
                         "MeetingControllerService"
                     } else {
                         "MediaCoordinationService"
@@ -382,10 +383,11 @@ mod tests {
 
     /// MH→MC gRPC path for MediaCoordinationService
     const MH_GRPC_PATH: &str =
-        "/dark_tower.internal.MediaCoordinationService/NotifyParticipantConnected";
+        "/dark_tower.internal.v1.MediaCoordinationService/NotifyParticipantConnected";
 
     /// GC→MC gRPC path for MeetingControllerService
-    const GC_GRPC_PATH: &str = "/dark_tower.internal.MeetingControllerService/AssignMeetingWithMh";
+    const GC_GRPC_PATH: &str =
+        "/dark_tower.internal.v1.MeetingControllerService/AssignMeetingWithMh";
 
     fn make_service_claims(scope: &str, service_type: Option<&str>) -> ServiceClaims {
         let now = Utc::now().timestamp();
@@ -697,7 +699,7 @@ mod tests {
         let token = keypair.sign_token(&claims);
 
         let request = http::Request::builder()
-            .uri("/dark_tower.internal.UnknownService/SomeMethod")
+            .uri("/dark_tower.internal.v1.UnknownService/SomeMethod")
             .header("authorization", format!("Bearer {token}"))
             .body(BoxBody::default())
             .unwrap();

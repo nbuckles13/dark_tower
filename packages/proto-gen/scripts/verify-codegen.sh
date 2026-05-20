@@ -49,7 +49,9 @@ assert_generated() {
   echo "verify-codegen: OK — ${file} (contains ${symbol})"
 }
 
-assert_generated "dark_tower/signaling/signaling_pb.ts" "JoinRequest"
-assert_generated "dark_tower/internal/internal_pb.ts" "RegisterParticipant"
+assert_generated "dark_tower/signaling/v1/signaling_pb.ts" "JoinRequest"
+assert_generated "dark_tower/internal/v1/internal_pb.ts" "RegisterRequest"
+assert_generated "dark_tower/internal/v1/internal_pb.ts" "FastHeartbeatResponse"
+assert_generated "dark_tower/internal/v1/internal_pb.ts" "ComprehensiveHeartbeatResponse"
 
 echo "verify-codegen: all checks passed"

@@ -12,8 +12,8 @@
 use crate::repositories::{HealthStatus, MediaHandlersRepository};
 use chrono::Utc;
 use proto_gen::internal::{
-    media_handler_registry_service_server::MediaHandlerRegistryService, MhLoadReportRequest,
-    MhLoadReportResponse, RegisterMhRequest, RegisterMhResponse,
+    media_handler_registry_service_server::MediaHandlerRegistryService, RegisterMhRequest,
+    RegisterMhResponse, SendLoadReportRequest, SendLoadReportResponse,
 };
 use sqlx::PgPool;
 use std::sync::Arc;
@@ -191,8 +191,8 @@ impl MediaHandlerRegistryService for MhService {
     #[instrument(skip_all, fields(handler_id = %request.get_ref().handler_id))]
     async fn send_load_report(
         &self,
-        request: Request<MhLoadReportRequest>,
-    ) -> Result<Response<MhLoadReportResponse>, Status> {
+        request: Request<SendLoadReportRequest>,
+    ) -> Result<Response<SendLoadReportResponse>, Status> {
         let req = request.into_inner();
 
         // Validate handler_id with format checks
@@ -248,7 +248,7 @@ impl MediaHandlerRegistryService for MhService {
         // Use current timestamp from chrono (consistent with rest of codebase)
         let timestamp = Utc::now().timestamp() as u64;
 
-        Ok(Response::new(MhLoadReportResponse {
+        Ok(Response::new(SendLoadReportResponse {
             acknowledged: true,
             timestamp,
         }))
@@ -473,7 +473,7 @@ mod integration_tests {
         .unwrap();
 
         // Send load report
-        let request = Request::new(MhLoadReportRequest {
+        let request = Request::new(SendLoadReportRequest {
             handler_id: "load-report-mh".to_string(),
             current_streams: 50,
             health: 1, // Healthy
@@ -502,7 +502,7 @@ mod integration_tests {
     async fn test_send_load_report_unknown_handler(pool: PgPool) {
         let service = MhService::new(Arc::new(pool));
 
-        let request = Request::new(MhLoadReportRequest {
+        let request = Request::new(SendLoadReportRequest {
             handler_id: "unknown-handler".to_string(),
             current_streams: 50,
             health: 1,
@@ -520,7 +520,7 @@ mod integration_tests {
     async fn test_send_load_report_empty_handler_id(pool: PgPool) {
         let service = MhService::new(Arc::new(pool));
 
-        let request = Request::new(MhLoadReportRequest {
+        let request = Request::new(SendLoadReportRequest {
             handler_id: "".to_string(),
             current_streams: 50,
             health: 1,

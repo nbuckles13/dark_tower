@@ -16,7 +16,9 @@ use ::common::observability::testing::MetricAssertion;
 use mc_service::grpc::McMediaCoordinationService;
 use mc_service::mh_connection_registry::MhConnectionRegistry;
 use proto_gen::internal::media_coordination_service_server::MediaCoordinationService;
-use proto_gen::internal::{ParticipantMediaConnected, ParticipantMediaDisconnected};
+use proto_gen::internal::{
+    NotifyParticipantConnectedRequest, NotifyParticipantDisconnectedRequest,
+};
 use tonic::Request;
 
 fn make_service() -> McMediaCoordinationService {
@@ -30,7 +32,7 @@ fn make_service() -> McMediaCoordinationService {
 #[tokio::test(flavor = "current_thread")]
 async fn notify_participant_connected_records_event_connected() {
     let svc = make_service();
-    let req = Request::new(ParticipantMediaConnected {
+    let req = Request::new(NotifyParticipantConnectedRequest {
         meeting_id: "meeting-1".to_string(),
         participant_id: "part-1".to_string(),
         handler_id: "mh-1".to_string(),
@@ -51,7 +53,7 @@ async fn notify_participant_connected_records_event_connected() {
 #[tokio::test(flavor = "current_thread")]
 async fn notify_participant_disconnected_records_event_disconnected() {
     let svc = make_service();
-    let req = Request::new(ParticipantMediaDisconnected {
+    let req = Request::new(NotifyParticipantDisconnectedRequest {
         meeting_id: "meeting-1".to_string(),
         participant_id: "part-1".to_string(),
         handler_id: "mh-1".to_string(),

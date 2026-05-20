@@ -28,8 +28,8 @@ use proto_gen::internal::media_handler_service_server::{
     MediaHandlerService, MediaHandlerServiceServer,
 };
 use proto_gen::internal::{
-    MediaTelemetry, RegisterMeetingRequest, RegisterMeetingResponse, RegisterParticipant,
-    RegisterParticipantResponse, RouteMediaCommand, RouteMediaResponse, TelemetryAck,
+    RegisterMeetingRequest, RegisterMeetingResponse, RegisterRequest, RegisterResponse,
+    RouteMediaRequest, RouteMediaResponse, StreamTelemetryRequest, StreamTelemetryResponse,
 };
 use tokio::net::TcpListener;
 use tokio::sync::watch;
@@ -48,8 +48,8 @@ struct StubMediaHandler {
 impl MediaHandlerService for StubMediaHandler {
     async fn register(
         &self,
-        _request: Request<RegisterParticipant>,
-    ) -> Result<Response<RegisterParticipantResponse>, Status> {
+        _request: Request<RegisterRequest>,
+    ) -> Result<Response<RegisterResponse>, Status> {
         Err(Status::unimplemented("stub"))
     }
 
@@ -64,15 +64,15 @@ impl MediaHandlerService for StubMediaHandler {
 
     async fn route_media(
         &self,
-        _request: Request<RouteMediaCommand>,
+        _request: Request<RouteMediaRequest>,
     ) -> Result<Response<RouteMediaResponse>, Status> {
         Err(Status::unimplemented("stub"))
     }
 
     async fn stream_telemetry(
         &self,
-        _request: Request<Streaming<MediaTelemetry>>,
-    ) -> Result<Response<TelemetryAck>, Status> {
+        _request: Request<Streaming<StreamTelemetryRequest>>,
+    ) -> Result<Response<StreamTelemetryResponse>, Status> {
         Err(Status::unimplemented("stub"))
     }
 }

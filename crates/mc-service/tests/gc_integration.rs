@@ -22,8 +22,9 @@ use proto_gen::internal::global_controller_service_server::{
     GlobalControllerService, GlobalControllerServiceServer,
 };
 use proto_gen::internal::{
-    ComprehensiveHeartbeatRequest, FastHeartbeatRequest, HealthStatus, HeartbeatResponse,
-    NotifyMeetingEndedRequest, NotifyMeetingEndedResponse, RegisterMcRequest, RegisterMcResponse,
+    ComprehensiveHeartbeatRequest, ComprehensiveHeartbeatResponse, FastHeartbeatRequest,
+    FastHeartbeatResponse, HealthStatus, NotifyMeetingEndedRequest, NotifyMeetingEndedResponse,
+    RegisterMcRequest, RegisterMcResponse,
 };
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
@@ -158,7 +159,7 @@ impl GlobalControllerService for MockGcServer {
     async fn fast_heartbeat(
         &self,
         request: Request<FastHeartbeatRequest>,
-    ) -> Result<Response<HeartbeatResponse>, Status> {
+    ) -> Result<Response<FastHeartbeatResponse>, Status> {
         let inner = request.into_inner();
         let count = self.fast_heartbeat_count.fetch_add(1, Ordering::SeqCst);
 
@@ -176,23 +177,25 @@ impl GlobalControllerService for MockGcServer {
                 if count == 0 {
                     Err(Status::not_found("MC not registered with GC"))
                 } else {
-                    Ok(Response::new(HeartbeatResponse {
+                    Ok(Response::new(FastHeartbeatResponse {
                         acknowledged: true,
                         timestamp: chrono::Utc::now().timestamp() as u64,
                     }))
                 }
             }
-            MockBehavior::Accept | MockBehavior::Reject => Ok(Response::new(HeartbeatResponse {
-                acknowledged: true,
-                timestamp: chrono::Utc::now().timestamp() as u64,
-            })),
+            MockBehavior::Accept | MockBehavior::Reject => {
+                Ok(Response::new(FastHeartbeatResponse {
+                    acknowledged: true,
+                    timestamp: chrono::Utc::now().timestamp() as u64,
+                }))
+            }
         }
     }
 
     async fn comprehensive_heartbeat(
         &self,
         request: Request<ComprehensiveHeartbeatRequest>,
-    ) -> Result<Response<HeartbeatResponse>, Status> {
+    ) -> Result<Response<ComprehensiveHeartbeatResponse>, Status> {
         let inner = request.into_inner();
         let count = self
             .comprehensive_heartbeat_count
@@ -212,16 +215,18 @@ impl GlobalControllerService for MockGcServer {
                 if count == 0 {
                     Err(Status::not_found("MC not registered with GC"))
                 } else {
-                    Ok(Response::new(HeartbeatResponse {
+                    Ok(Response::new(ComprehensiveHeartbeatResponse {
                         acknowledged: true,
                         timestamp: chrono::Utc::now().timestamp() as u64,
                     }))
                 }
             }
-            MockBehavior::Accept | MockBehavior::Reject => Ok(Response::new(HeartbeatResponse {
-                acknowledged: true,
-                timestamp: chrono::Utc::now().timestamp() as u64,
-            })),
+            MockBehavior::Accept | MockBehavior::Reject => {
+                Ok(Response::new(ComprehensiveHeartbeatResponse {
+                    acknowledged: true,
+                    timestamp: chrono::Utc::now().timestamp() as u64,
+                }))
+            }
         }
     }
 

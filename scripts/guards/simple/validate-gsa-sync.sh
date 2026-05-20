@@ -18,7 +18,7 @@
 # Scope boundary: the enumeration section in each markdown mirror runs from
 # the anchor comment through the first contiguous `- ` bullet list; the
 # YAML enumeration is every `"path":` key line. Intersection-rule sub-paths
-# (e.g. `proto/dark_tower/internal/internal.proto`) are YAML-only by design
+# (e.g. `proto/dark_tower/internal/v1/internal.proto`) are YAML-only by design
 # — so YAML count is allowed to exceed canon, but markdown counts must
 # equal canon.
 #
@@ -55,13 +55,13 @@ CANON=(
 
 # YAML-only intersection-rule sub-paths. Sub-paths of a CANON entry that
 # get their own YAML key because they require a broader owner union
-# (e.g., proto/dark_tower/internal/internal.proto needs protocol +
+# (e.g., proto/dark_tower/internal/v1/internal.proto needs protocol +
 # auth-controller + security per ADR-0003 §5.7). Extending this list is a
 # micro-debate trigger — the explicit allowlist keeps the "YAML may have
 # more paths than canon" exception bounded so typo'd stray keys are still
 # caught.
 INTERSECTION_SUBPATHS=(
-    "proto/dark_tower/internal/internal.proto"
+    "proto/dark_tower/internal/v1/internal.proto"
 )
 
 ADR="$REPO_ROOT/docs/decisions/adr-0024-agent-teams-workflow.md"

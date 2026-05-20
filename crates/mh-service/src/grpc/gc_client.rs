@@ -20,7 +20,7 @@ use crate::observability::metrics;
 use common::secret::ExposeSecret;
 use common::token_manager::TokenReceiver;
 use proto_gen::internal::media_handler_registry_service_client::MediaHandlerRegistryServiceClient;
-use proto_gen::internal::{MhLoadReportRequest, RegisterMhRequest};
+use proto_gen::internal::{RegisterMhRequest, SendLoadReportRequest};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tonic::transport::{Channel, Endpoint};
@@ -231,7 +231,7 @@ impl GcClient {
             return Ok(());
         }
 
-        let request = MhLoadReportRequest {
+        let request = SendLoadReportRequest {
             handler_id: self.config.handler_id.clone(),
             current_streams: 0, // Stub: no active streams
             health: 1,          // HEALTHY

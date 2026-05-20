@@ -21,10 +21,10 @@ pub use tonic;
 // Generated protobuf modules
 pub mod signaling {
     //! Client-server signaling messages
-    include!("generated/dark_tower.signaling.rs");
+    include!("generated/dark_tower.signaling.v1.rs");
 }
 
 pub mod internal {
     //! Internal service-to-service messages with gRPC service traits
-    include!("generated/dark_tower.internal.rs");
+    include!("generated/dark_tower.internal.v1.rs");
 }

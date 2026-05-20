@@ -30,8 +30,8 @@
 - MC metrics catalog → `docs/observability/metrics/mc-service.md`
 
 ## Protocols
-- Client signaling (join, mute, session recovery, MediaConnectionUpdate) → `proto/dark_tower/signaling/signaling.proto`
-- Internal service RPCs (RegisterMc, AssignMeeting, MediaCoordinationService, RegisterMeeting) → `proto/dark_tower/internal/internal.proto`
+- Client signaling (join, mute, session recovery, MediaConnectionUpdate) → `proto/dark_tower/signaling/v1/signaling.proto`
+- Internal service RPCs (RegisterMc, AssignMeeting, MediaCoordinationService, RegisterMeeting) → `proto/dark_tower/internal/v1/internal.proto`
 
 ## Integration Seams
 - Client -> MC WebTransport (join, signaling) → `crates/mc-service/src/webtransport/server.rs`
