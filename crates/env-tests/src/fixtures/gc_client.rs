@@ -14,11 +14,19 @@ use uuid::Uuid;
 const MAX_ERROR_BODY_LEN: usize = 256;
 
 /// Regex pattern for JWT tokens (header.payload.signature).
+#[expect(
+    clippy::disallowed_methods,
+    reason = "test fixture LazyLock<Regex>; static pattern compiles or load-time panic. Per ADR-0034 §6 + ADR-0002 §expect-over-allow — same canonical-home discipline as crates/dt-guard/."
+)]
 static JWT_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]*)?").unwrap()
 });
 
 /// Regex pattern for Bearer tokens in text.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "test fixture LazyLock<Regex>; static pattern compiles or load-time panic. Per ADR-0034 §6 + ADR-0002 §expect-over-allow — same canonical-home discipline as crates/dt-guard/."
+)]
 static BEARER_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)bearer\s+[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]*)?").unwrap()
 });

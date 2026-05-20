@@ -62,9 +62,6 @@
 - MC/MH TLS volume mounts (defaultMode 0400) → `infra/services/{mc,mh}-service/{mc,mh}-{0,1}-deployment.yaml`; WebTransport UDP ingress → `infra/services/{mc,mh}-service/network-policy.yaml`, `infra/kind/kind-config.yaml`
 - Test-time self-signed PEM rigs (rcgen, SAN `localhost`/`127.0.0.1`, TempDir) → `crates/mh-service/tests/common/accept_loop_rig.rs`, `crates/mc-service/tests/common/accept_loop_rig.rs`
 
-## Advertise Addresses (MC + MH → GC Registration)
-- gRPC: K8s `status.podIP` | WT: per-instance env from ConfigMap | NodePort `{mc,mh}-service-{0,1}` UDP-only | Registration → `gc_client.rs:register()`
-
 ## Devloop Container & Cluster Helper Security
 - Container isolation → ADR-0025; Cluster helper (trust, socket auth, injection safety, API allowlist, file perms, explicit prohibitions) → ADR-0030
 - Helper binary (Command::new() arg safety, status read-only auth-gated, gateway IP validation) → `crates/devloop-helper/src/commands.rs`; Auth token (CSPRNG, constant-time compare, 0600) → `crates/devloop-helper/src/auth.rs`

@@ -10,3 +10,17 @@
 allow-expect-in-tests = true
 allow-unwrap-in-tests = true
 allow-indexing-slicing-in-tests = true
+
+# Per ADR-0034 §6: structural duplication of regex patterns becomes a
+# compile/clippy error. All `regex::Regex::new` must live inside a
+# `pub(crate) static Lazy<Regex>` initializer at module scope, in the
+# canonical home modules (`crates/dt-guard/src/ignore.rs`,
+# `crates/dt-guard/src/secret_patterns.rs`, `crates/dt-guard/src/metric_macros.rs`,
+# or per-subcommand modules for module-local regexes). The line-scoped
+# `#[expect(clippy::disallowed_methods, clippy::expect_used, reason = "...")]`
+# on each Lazy initializer is the documented escape — re-inlining the same
+# regex shape outside a canonical home defeats §6's "structural duplication
+# impossible by construction." (Per ADR-0002 §expect-over-allow.)
+disallowed-methods = [
+    { path = "regex::Regex::new", reason = "use a pub(crate) static Lazy<Regex> initializer in the canonical-home module; see crates/dt-guard/src/ignore.rs and ADR-0034 §6" }
+]

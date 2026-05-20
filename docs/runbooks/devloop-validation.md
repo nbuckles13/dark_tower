@@ -298,6 +298,24 @@ Two `run_and_emit` invocations:
 | `guards-failed` | `scripts/guards/run-guards.sh` (via `run_and_emit`) | A specific guard tripped. The runner prints `FAILED: <guard-name>` + grep-extracted violation lines (`VIOLATION|violation|ERROR|error`). Jump to that guard's source under `scripts/guards/simple/`. |
 | `predicate-meta-test-failed` | `scripts/lang/_test_changed_predicates.sh` | A `lang/<X>/changed.sh` predicate disagrees with its fixture row. Output prints `[<lang>] path=… expected_rc=… actual_rc=… rationale: …  see: scripts/lang/<lang>/changed.sh`. Fix by correcting the predicate OR amending the fixture (with rationale). See §7 for drift-detection workflow. |
 
+#### 6.3.1 `dt-guard` triage (ADR-0034 §10 Wave 3)
+
+Eight of the simple guards (cite-no-line-numbers / cite-symbol-resolves / alert-rules-policy / dashboard-panels / metric-labels / application-metrics / infrastructure-metrics / grafana-datasources) are ≤5-line shell wrappers around the Rust binary `target/release/dt-guard`. The wrapper resolves the binary path, asserts it is executable, and `exec`s `dt-guard <subcommand> --root "$REPO_ROOT"`. There are three distinct failure shapes:
+
+1. **Stale or missing binary** — `STATUS=FAIL REASON=dt-guard-binary-missing`. The wrapper exits 1 before invoking any subcommand because `target/release/dt-guard` is not present (or not `-x`).
+    - **Diagnostic**: `ls -la target/release/dt-guard`.
+    - **Resolution**: `cargo build --release -p dt-guard` (or re-run `scripts/layer1.sh`, which builds it as part of `compile.sh`). The wrapper produces no `VIOLATION:` lines because the policy kernel never runs.
+
+2. **Subcommand not found** — clap exits non-zero with its own diagnostic on stderr (typically `error: unrecognized subcommand <foo>`). `STATUS=` may surface as `clap-error` or omit entirely depending on which subcommand the wrapper invoked; the canonical signal is the clap-formatted stderr line.
+    - **Diagnostic**: `dt-guard --help` to list registered subcommands.
+    - **Resolution**: typo in the wrapper, or a subcommand-rollout-not-yet-landed across two PRs. Re-build to pick up newly registered subcommands.
+
+3. **Bona-fide policy violation** — `STATUS=FAIL REASON=<policy-token>` after the subcommand runs to completion, paired with one or more `VIOLATION: <path>:<line> — <rule_id> — <message>` lines on stdout.
+    - **Diagnostic**: re-run the subcommand with `--explain` for a single-line `EXPLAIN:` record per finding (span + policy + source location). Example: `target/release/dt-guard alert-rules-policy --root . --explain`.
+    - **Resolution**: fix the input file at the cited path:line, or — if a true false positive — add `# guard:ignore(<reason>)` per the inline guidance in each subcommand's source-doc header. `<reason>` must be ≥10 characters and not match the `LAZY_REASON_RE` vocabulary denylist.
+
+dt-guard also emits `WARN dt-guard auxiliary skip: <path> (<error-kind>)` to stderr when its auxiliary index-scan loops swallow an IO/parse failure (per ADR-0034 §F-SG-2 mitigation). `run-guards.sh` surfaces those WARN lines alongside `VIOLATION` / `ERROR` in non-verbose CI logs — a sudden uptick indicates a corrupted catalog or dashboard file that the policy kernel skipped silently.
+
 ### 6.4 Layer 4 — Test (`scripts/layer4.sh`)
 
 `scripts/test.sh` → `for_each_lang_with_verb "test"` → `lang/rust/test.sh` + `lang/ts/test.sh`. Proto has no `test.sh` — dispatcher emits `STATUS=SKIPPED-NO-VERB REASON=proto-test-sh-missing-or-not-executable` (informative, expected).

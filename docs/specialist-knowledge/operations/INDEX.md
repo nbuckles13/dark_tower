@@ -9,7 +9,7 @@
 
 ## CI & Guards
 - CI pipeline → `.github/workflows/ci.yml`; runner + common → `scripts/guards/run-guards.sh`, `common.sh` (shared helpers incl. `parse_cross_boundary_table()` for ADR-0024 §6 plan parsing); per-guard timeout (`GUARD_TIMEOUT_SECS` default 30s, `timeout` wrapper emits `STATUS=FAIL REASON=guard-timeout-<name>` on exit 124 / `STATUS=FAIL REASON=guard-killed-<name>` on exit 137 SIGKILL) → `scripts/guards/run-guards.sh` L122/L132
-- `dt-guard` CLI invocation pattern (3-line shell wrapper invokes `${DT_GUARD:-$REPO_ROOT/target/release/dt-guard} <subcommand> --root "$REPO_ROOT" "$@"`, emits STATUS/REASON per ADR-0033 §6; per-subcommand `--explain <input>` debug surface replaces `python3 -i` REPL workflow) → `crates/dt-guard/src/main.rs`, `crates/dt-guard/README.md`
+- `dt-guard` CLI invocation pattern (3-line shell wrapper invokes `${DT_GUARD:-$REPO_ROOT/target/release/dt-guard} <subcommand> --root "$REPO_ROOT" "$@"`, emits STATUS/REASON per ADR-0033 §6; per-subcommand `--explain <input>` debug surface replaces `python3 -i` REPL workflow) → `crates/dt-guard/src/main.rs`
 - dt-guard triage runbook section (placeholder — to-author at Wave 3, three failure shapes: stale-binary / subcommand-not-found / bona-fide policy-violation) → `docs/runbooks/devloop-validation.md` §6.3.1
 - Debate of record (supersede debate + predecessor debate + per-guard vendor-coverage matrix) → `docs/debates/2026-05-17-guard-toolchain-supersede/debate.md`, `docs/debates/2026-05-14-python-guard-pipeline-strategy/debate.md`, `guard-vendor-coverage-matrix.md`
 - Kustomize → `scripts/guards/simple/validate-kustomize.sh`; app metrics (metric↔dashboard) → `validate-application-metrics.sh`; alert-rules → `validate-alert-rules.sh`, conventions → `docs/observability/alert-conventions.md`
@@ -41,9 +41,7 @@
 - Participant tracking + meetings → `crates/gc-service/src/repositories/participants.rs`, `meetings.rs`
 
 ## Auth & JWT
-- Common JWKS + JWT → `crates/common/src/jwt.rs`
-- Shared GC↔AC token types → `crates/common/src/meeting_token.rs`
-- AC rate limits → `crates/ac-service/src/config.rs:parse_rate_limit_i64()`; Service auth → ADR-0003
+- Common JWKS + JWT → `crates/common/src/jwt.rs`; shared GC↔AC token types → `crates/common/src/meeting_token.rs`; AC rate limits → `crates/ac-service/src/config.rs:parse_rate_limit_i64()`; Service auth → ADR-0003
 
 ## Observability
 - Kustomize + Grafana → `infra/kubernetes/observability/`, `infra/grafana/dashboards/`; Alerts → `docs/observability/alerts.md`; Prometheus → `infra/docker/prometheus/prometheus.yml`; per-service `crates/ac-service/src/observability/metrics.rs`, `gc-service/`, `mc-service/`, `mh-service/`
@@ -74,5 +72,4 @@
 - MC token-refresh metric (ADR-0032 Cat B) → `crates/mc-service/src/observability/metrics.rs:record_token_refresh_metrics()`; accept-loop rig → `crates/mc-service/tests/common/accept_loop_rig.rs`
 
 ## GC Service + Tests
-- GC routes + handlers → `crates/gc-service/src/routes/mod.rs`, `handlers/meetings.rs`
-- MC/GC join tests → `crates/mc-service/tests/join_tests.rs`, `crates/gc-service/tests/meeting_tests.rs`; TestKeypair → `crates/mc-test-utils/src/jwt_test.rs`; Env-tests → `crates/env-tests/`
+- GC routes + handlers → `crates/gc-service/src/routes/mod.rs`, `handlers/meetings.rs`; MC/GC join tests → `crates/mc-service/tests/join_tests.rs`, `crates/gc-service/tests/meeting_tests.rs`; TestKeypair → `crates/mc-test-utils/src/jwt_test.rs`; Env-tests → `crates/env-tests/`

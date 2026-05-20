@@ -69,8 +69,7 @@
 - Standard health endpoints (`/health`, `/ready`) → ADR-0012 (Section: Standard Operational Endpoints)
 - MH QUIC story runbooks (R-33 env-tests, R-34 incident scenarios, R-36 post-deploy) → `crates/env-tests/tests/26_mh_quic.rs`; `docs/runbooks/mh-incident-response.md` (Sc 13/14), `docs/runbooks/mc-incident-response.md` (Sc 11/12/13), `docs/runbooks/mh-deployment.md` Post-Deploy Monitoring Checklist
 - MC+MH TLS cert generation → `scripts/generate-dev-certs.sh`
-- Env-tests cluster module → `crates/env-tests/src/cluster.rs`
-- Kind cluster (ADR-0030): `kind-config.yaml.tmpl`, `setup.sh` (`deploy_only_service()`, `DT_HOST_GATEWAY_IP`), `{mc,mh}-{0,1}-configmap.yaml`
+- Env-tests cluster module → `crates/env-tests/src/cluster.rs`; Kind cluster (ADR-0030): `kind-config.yaml.tmpl`, `setup.sh` (`deploy_only_service()`, `DT_HOST_GATEWAY_IP`), `{mc,mh}-{0,1}-configmap.yaml`
 - Devloop helper → `crates/devloop-helper/src/commands.rs`; client → `infra/devloop/dev-cluster`; Service bases → `infra/services/*/kustomization.yaml`
 - Guards: runner → `scripts/guards/run-guards.sh`; Kustomize (R-15–R-20) → `validate-kustomize.sh`; App metrics → `validate-application-metrics.sh`; Alert rules (ADR-0031) → `validate-alert-rules.sh`, conventions → `docs/observability/alert-conventions.md`
 - Review heuristics: before drafting Option-1/Option-2 framings on a scope-fidelity finding, `git rev-parse HEAD` + spot-grep against the named file:line — checkout-skew presents identically to silent partial migration but resolves to no-op (GC Step 5 F1(d) precedent). Genuine partial-migration recovery pattern (AC iter-2): bundle gaps with file:line, complete-or-name-the-friction triage, re-load each gap in batched cleanup. Source-of-truth disagreement (handler comment vs catalog) IS the bug. `assert_value(0.0)` (zero-fill) vs `assert_unobserved` (untouched) distinction load-bearing for gauges. Wiring-only cells get per-cell annotation not a const split.

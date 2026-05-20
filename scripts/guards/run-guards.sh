@@ -111,6 +111,71 @@ if [[ -d "$SIMPLE_GUARDS_DIR" ]]; then
     mapfile -d '' -t guards < <(
         find "$SIMPLE_GUARDS_DIR" -name "*.sh" -type f -not -path '*/fixtures/*' -print0 | sort -z
     )
+    # Per-guard timeout per ADR-0034 §9 (strategy-independent hardening).
+    # `GUARD_TIMEOUT_SECS` defaults to 30s, `GUARD_KILL_AFTER_SECS` to 5s.
+    # Exit 124 → STATUS=FAIL REASON=guard-timeout-<name>
+    # Exit 137 → STATUS=FAIL REASON=guard-timeout-kill-<name>
+    # Capture form `local guard_exit=0 || guard_exit=$?` is load-bearing
+    # under `set -euo pipefail` — without the `0` initializer + `||` capture,
+    # a non-zero timeout exit aborts the for-loop before the classifier runs.
+    GUARD_TIMEOUT_SECS="${GUARD_TIMEOUT_SECS:-30}"
+    GUARD_KILL_AFTER_SECS="${GUARD_KILL_AFTER_SECS:-5}"
+
+    # Single classifier per @test F1 fold-in 2026-05-19. Maps the `$1`
+    # exit code from the timeout-wrapped guard invocation into one of
+    # four classes: 0 (PASS), 124 (timeout), 137 (timeout-kill), or
+    # other. Counters / FAILED_GUARD_NAMES are updated as side effects.
+    # `$2` is the captured stdout+stderr for non-verbose callers; empty
+    # for verbose callers (where output already streamed live). On the
+    # generic-failure branch, captured output is greped for VIOLATION /
+    # ERROR / WARN markers and the first 5 hits printed for triage.
+    classify_guard_exit() {
+        local exit_code="$1"
+        local captured="$2"
+        case "$exit_code" in
+            0)
+                echo -e "${GREEN}PASSED${NC}: $GUARD_NAME"
+                ((PASSED_GUARDS++)) || true
+                ;;
+            124)
+                echo "STATUS=FAIL REASON=guard-timeout-${GUARD_NAME}"
+                echo -e "${RED}FAILED${NC}: $GUARD_NAME (timed out after ${GUARD_TIMEOUT_SECS}s)"
+                ((FAILED_GUARDS++)) || true
+                FAILED_GUARD_NAMES+=("$GUARD_NAME")
+                ;;
+            137)
+                echo "STATUS=FAIL REASON=guard-timeout-kill-${GUARD_NAME}"
+                echo -e "${RED}FAILED${NC}: $GUARD_NAME (killed after timeout + ${GUARD_KILL_AFTER_SECS}s grace)"
+                ((FAILED_GUARDS++)) || true
+                FAILED_GUARD_NAMES+=("$GUARD_NAME")
+                ;;
+            *)
+                echo -e "${RED}FAILED${NC}: $GUARD_NAME (exit $exit_code)"
+                ((FAILED_GUARDS++)) || true
+                FAILED_GUARD_NAMES+=("$GUARD_NAME")
+                # Show failure details when caller captured output.
+                #
+                # `|| true` is load-bearing: under `set -euo pipefail`, if the
+                # failed guard's output contains NO `VIOLATION` text (e.g.
+                # validate-application-metrics emits `ERROR` instead), grep
+                # exits 1, pipefail propagates, and `set -e` aborts the
+                # for-loop mid-pipeline. The script then stops running the
+                # remaining guards silently — turning a single failure into
+                # a CI lie where downstream guard failures go unreported.
+                # Keep this sentinel in place even if the pattern changes.
+                #
+                # `WARN` added per @team-lead F-SG-2 fold-in 2026-05-19: dt-guard
+                # subcommands now emit `WARN dt-guard auxiliary skip: <path> (<err>)`
+                # to stderr on IO/parse swallow sites (see common/scan.rs).
+                # Surfacing them here gives oncall coverage-hole visibility in
+                # non-verbose CI logs.
+                if [[ -n "$captured" ]]; then
+                    { echo "$captured" | grep -E "(VIOLATION|violation|ERROR|error|WARN)" | head -5; } || true
+                fi
+                ;;
+        esac
+    }
+
     for guard in "${guards[@]}"; do
         if [[ -x "$guard" ]]; then
             GUARD_NAME=$(basename "$guard" .sh)
@@ -119,35 +184,16 @@ if [[ -d "$SIMPLE_GUARDS_DIR" ]]; then
             echo -e "${BLUE}Running:${NC} $GUARD_NAME"
 
             if $VERBOSE; then
-                if "$guard" "$SEARCH_PATH"; then
-                    echo -e "${GREEN}PASSED${NC}: $GUARD_NAME"
-                    ((PASSED_GUARDS++)) || true
-                else
-                    echo -e "${RED}FAILED${NC}: $GUARD_NAME"
-                    ((FAILED_GUARDS++)) || true
-                    FAILED_GUARD_NAMES+=("$GUARD_NAME")
-                fi
+                guard_exit=0
+                timeout --kill-after="${GUARD_KILL_AFTER_SECS}s" "${GUARD_TIMEOUT_SECS}s" "$guard" "$SEARCH_PATH" || guard_exit=$?
+                classify_guard_exit "$guard_exit" ""
             else
-                # Capture output for non-verbose mode
-                if OUTPUT=$("$guard" "$SEARCH_PATH" 2>&1); then
-                    echo -e "${GREEN}PASSED${NC}: $GUARD_NAME"
-                    ((PASSED_GUARDS++)) || true
-                else
-                    echo -e "${RED}FAILED${NC}: $GUARD_NAME"
-                    ((FAILED_GUARDS++)) || true
-                    FAILED_GUARD_NAMES+=("$GUARD_NAME")
-                    # Show failure details.
-                    #
-                    # `|| true` is load-bearing: under `set -euo pipefail`, if the
-                    # failed guard's output contains NO `VIOLATION` text (e.g.
-                    # validate-application-metrics emits `ERROR` instead), grep
-                    # exits 1, pipefail propagates, and `set -e` aborts the
-                    # for-loop mid-pipeline. The script then stops running the
-                    # remaining guards silently — turning a single failure into
-                    # a CI lie where downstream guard failures go unreported.
-                    # Keep this sentinel in place even if the pattern changes.
-                    { echo "$OUTPUT" | grep -E "(VIOLATION|violation|ERROR|error)" | head -5; } || true
-                fi
+                # Capture output for non-verbose mode.
+                # `OUTPUT=$(...)` swallows exit code into a separate var so we
+                # can still classify timeout vs other failures.
+                guard_exit=0
+                OUTPUT=$(timeout --kill-after="${GUARD_KILL_AFTER_SECS}s" "${GUARD_TIMEOUT_SECS}s" "$guard" "$SEARCH_PATH" 2>&1) || guard_exit=$?
+                classify_guard_exit "$guard_exit" "$OUTPUT"
             fi
             echo ""
         fi

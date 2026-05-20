@@ -15,10 +15,7 @@
 - PostgreSQL init -> `infra/docker/postgres/init.sql`
 - Prometheus config + alert rules -> `infra/docker/prometheus/{prometheus.yml,rules/{gc,mc}-alerts.yaml}`, `infra/kubernetes/observability/prometheus-config.yaml`
 - K8s service manifests (Kustomize bases) -> `infra/services/{ac,gc,mc,mh}-service/kustomization.yaml`
-- AC StatefulSet -> `infra/services/ac-service/statefulset.yaml`
-- GC Deployment -> `infra/services/gc-service/deployment.yaml`
-- MC per-instance Deployments -> `infra/services/mc-service/mc-{0,1}-deployment.yaml`
-- MH per-instance Deployments -> `infra/services/mh-service/mh-{0,1}-deployment.yaml`
+- Service workloads: AC StatefulSet -> `infra/services/ac-service/statefulset.yaml`; GC Deployment -> `infra/services/gc-service/deployment.yaml`; MC/MH per-instance Deployments -> `infra/services/{mc,mh}-service/{mc,mh}-{0,1}-deployment.yaml`
 - MC/MH ConfigMaps (shared + per-instance) -> `infra/services/{mc,mh}-service/configmap.yaml`, `{mc,mh}-{0,1}-configmap.yaml`
 - Network policies (per-service ingress/egress) -> `infra/services/{ac,gc,mc,mh}-service/network-policy.yaml`
 - MC/MH per-instance Services (NodePorts) -> `infra/services/{mc,mh}-service/service.yaml`

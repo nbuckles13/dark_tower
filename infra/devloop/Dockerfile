@@ -8,12 +8,16 @@
 
 FROM docker.io/library/rust:1.95-slim-bookworm
 
-# System packages required for building (ring, bcrypt, protobuf), guards (jq, bc,
-# python3-yaml for validate-infrastructure-metrics), and database tools
-# (postgresql-client for pg_isready used by entrypoint + test.sh).
+# System packages required for building (ring, bcrypt, protobuf), guards (jq, bc),
+# and database tools (postgresql-client for pg_isready used by entrypoint + test.sh).
 # libprotobuf-dev ships the WKTs (e.g., google/protobuf/timestamp.proto) at
 # /usr/include/google/protobuf/, which tonic-build's protoc invocation needs
 # to resolve `import "google/protobuf/timestamp.proto"` in proto/signaling.proto.
+#
+# `python3-yaml` removed per ADR-0034 §10 Wave 3 — the guard pipeline migrated
+# off Python entirely (validate-infrastructure-metrics.sh and 7 other guards
+# now invoke `dt-guard <subcommand>` via shell wrappers; serde_norway does the
+# YAML parsing in `crates/dt-guard/src/infrastructure_metrics.rs`).
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     pkg-config \
@@ -25,7 +29,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     jq \
     bc \
     postgresql-client \
-    python3-yaml \
     socat \
     && rm -rf /var/lib/apt/lists/*
 

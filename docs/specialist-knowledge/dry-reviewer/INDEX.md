@@ -12,7 +12,7 @@
 - **Bash helpers** -> `scripts/guards/common.sh` (Pattern C precedent: `parse_cross_boundary_table` two-consumer extraction; `doc_citation_in_scope_files`, `path_matches_glob`, etc.). Bash-side precedent persists; bash guards continue to share via `source common.sh`.
 - **Rust canonical-home kernels** (ADR-0034 §1 + §6) -> `crates/dt-guard/src/`: `ignore.rs::LAZY_REASON_RE` + `IGNORE_MARKER_RE` (hash + html flavors); `secret_patterns.rs::HYGIENE_PATTERNS` (7-pattern set, consumed by `dt-guard alert-rules-policy` and `dt-guard secret-scan` after `no-hardcoded-secrets.sh` flip per Wave 3); `common/path_safety.rs::resolve_cited_path` (symlink-escape gate, dual-consumer with `dt-guard cite-extract` and `dt-guard alert-rules-policy::validate_runbook_url`); `metric_macros.rs` (counter!/gauge!/histogram! extraction trio).
 - **Structural enforcement** (ADR-0034 §6): each canonical regex/constant lives in **one** `pub static Lazy<Regex>` per module; workspace `clippy.toml disallowed-methods = [{ path = "regex::Regex::new", ... }]` blocks `Regex::new` calls outside canonical module initializers (scoped `#[allow(clippy::disallowed_methods)]` is the documented escape, reviewer-verified). Re-inline becomes a compile-time / clippy error, not a meta-guard target.
-- **Module-naming discipline** (ADR-0034 §Neutral): each `crates/dt-guard/src/<module>.rs` names a single cross-cutting concern; catch-all names (`util`, `helpers`, `common`, `validate`) rejected at code-review. **Sprawl threshold** (ADR-0034 §When-to-Revisit): ≥10 subcommands triggers re-debate on splitting into 2-3 focused binaries; cold-cache Layer-1 `cargo build` budget excess triggers workspace-split (`dt-guard-core` lib + `dt-guard` bin).
+- **Module-naming discipline** (ADR-0034 §Neutral): each module in `crates/dt-guard/src/` names a single cross-cutting concern; catch-all names (`util`, `helpers`, `common`, `validate`) rejected at code-review. **Sprawl threshold** (ADR-0034 §When-to-Revisit): ≥10 subcommands triggers re-debate on splitting into 2-3 focused binaries; cold-cache Layer-1 `cargo build` budget excess triggers workspace-split (`dt-guard-core` lib + `dt-guard` bin).
 - **Cross-stack duplication collapse** (ADR-0034 §6 second paragraph + §10 Wave 3 Day 11): the 7-pattern `HYGIENE_PATTERNS` set previously split across `validate-alert-rules.sh:85-103` Python heredoc ↔ `no-hardcoded-secrets.sh:96,144` bash regex literals collapses to `dt_guard::secret_patterns::HYGIENE_PATTERNS` Rust SoT. `no-hardcoded-secrets.sh` flips to a `dt-guard secret-scan` subcommand in Wave 3 Day 11.
 
 ## JWT Validation (Common + Thin Wrappers)
@@ -38,42 +38,29 @@
 - Shared fixtures (cross-service) -> `crates/{ac,gc,mc}-test-utils/src/`; MetricAssertion -> `crates/common/src/observability/testing.rs`
 
 ## Per-Service Config Parsing
-- AC/GC/MC/MH config -> `crates/*/src/config.rs:Config::from_vars()` (per-service); ordinal parsing -> `crates/common/src/config.rs:parse_statefulset_ordinal()`
-- Extraction candidate: `generate_instance_id(prefix)` -> 4-line pattern in GC + MC + MH config
+- AC/GC/MC/MH config -> `crates/*/src/config.rs:Config::from_vars()` (per-service); ordinal parsing -> `crates/common/src/config.rs:parse_statefulset_ordinal()`; extraction candidate: `generate_instance_id(prefix)` -> 4-line pattern in GC + MC + MH config
 
 ## gRPC Auth (Cross-Service)
-- MC/MH auth layers (async JWKS, R-22; legacy `*AuthInterceptor` in same files is dead in production) -> `crates/mc-service/src/grpc/auth_interceptor.rs:McAuthLayer`, `crates/mh-service/src/grpc/auth_interceptor.rs:MhAuthLayer`
-- McAuthLayer/MhAuthLayer near-identical tower Layer/Service (extraction candidate in TODO.md); shared constant `common::jwt::MAX_JWT_SIZE_BYTES`
+- MC/MH auth layers (async JWKS, R-22; legacy `*AuthInterceptor` in same files dead in production; near-identical tower Layer/Service — extraction candidate in TODO.md; shared `common::jwt::MAX_JWT_SIZE_BYTES`) -> `crates/mc-service/src/grpc/auth_interceptor.rs:McAuthLayer`, `crates/mh-service/src/grpc/auth_interceptor.rs:MhAuthLayer`
 
 ## MC gRPC Services (GC→MC + MH→MC + MC→MH)
-- MC assignment (GC→MC) -> `crates/mc-service/src/grpc/mc_service.rs:McAssignmentService`; media coordination (MH→MC, R-15) -> `crates/mc-service/src/grpc/media_coordination.rs:McMediaCoordinationService`
-- MH connection registry (single MAX_ID_LENGTH source) -> `crates/mc-service/src/mh_connection_registry.rs:MhConnectionRegistry`
-- MhRegistrationClient trait + async RegisterMeeting trigger (R-12) -> `crates/mc-service/src/grpc/mh_client.rs`, `crates/mc-service/src/webtransport/connection.rs:register_meeting_with_handlers()`
+- MC assignment (GC→MC) -> `crates/mc-service/src/grpc/mc_service.rs:McAssignmentService`; media coordination (MH→MC, R-15) -> `crates/mc-service/src/grpc/media_coordination.rs:McMediaCoordinationService`; MH connection registry (single MAX_ID_LENGTH source) -> `crates/mc-service/src/mh_connection_registry.rs:MhConnectionRegistry`; MhRegistrationClient trait + async RegisterMeeting trigger (R-12) -> `crates/mc-service/src/grpc/mh_client.rs`, `crates/mc-service/src/webtransport/connection.rs:register_meeting_with_handlers()`
 
 ## MH Service (R-12..R-36)
-- MH WebTransport stack (server, accept loop, connection handler) -> `crates/mh-service/src/webtransport/`; provisional-accept select extracted -> `:connection.rs:await_meeting_registration()`
-- MH JWT validator + SessionManager + gRPC clients -> `crates/mh-service/src/auth/mod.rs:MhJwtValidator`, `crates/mh-service/src/session/mod.rs:SessionManager`, `crates/mh-service/src/grpc/`
-- MH selection (Vec<MhAssignmentInfo> with grpc_endpoint) -> `crates/gc-service/src/services/mh_selection.rs:MhSelection`
+- MH WebTransport stack (server, accept loop, connection handler; provisional-accept select extracted to `:connection.rs:await_meeting_registration()`) -> `crates/mh-service/src/webtransport/`; MH JWT validator + SessionManager + gRPC clients -> `crates/mh-service/src/auth/mod.rs:MhJwtValidator`, `crates/mh-service/src/session/mod.rs:SessionManager`, `crates/mh-service/src/grpc/`; MH selection (Vec<MhAssignmentInfo> with grpc_endpoint) -> `crates/gc-service/src/services/mh_selection.rs:MhSelection`
 
 ## gRPC Clients (Cross-Service)
-- MC GcClient (bounded retries, fast/comprehensive heartbeats) -> `crates/mc-service/src/grpc/gc_client.rs`; MC MhClient (per-call channels, no retries) -> `crates/mc-service/src/grpc/mh_client.rs`
-- MH GcClient (unbounded retries, load reports) -> `crates/mh-service/src/grpc/gc_client.rs`; MH McClient (channel-per-call, exp backoff, auth-error short-circuit) -> `crates/mh-service/src/grpc/mc_client.rs`
-- Shared `add_auth` (~10 lines, 4 call sites — extraction candidate per TODO.md)
+- MC GcClient (bounded retries, fast/comprehensive heartbeats) -> `crates/mc-service/src/grpc/gc_client.rs`; MC MhClient (per-call channels, no retries) -> `crates/mc-service/src/grpc/mh_client.rs`; MH GcClient (unbounded retries, load reports) -> `crates/mh-service/src/grpc/gc_client.rs`; MH McClient (channel-per-call, exp backoff, auth-error short-circuit) -> `crates/mh-service/src/grpc/mc_client.rs`; shared `add_auth` (~10 lines, 4 call sites — extraction candidate per TODO.md)
 
 ## Redis Abstractions (MC)
-- MhAssignmentStore trait -> `crates/mc-service/src/redis/client.rs:MhAssignmentStore` (testability seam for join flow)
-- FencedRedisClient -> `crates/mc-service/src/redis/client.rs:FencedRedisClient` (fenced writes, implements MhAssignmentStore)
+- MhAssignmentStore trait (testability seam for join flow) + FencedRedisClient (fenced writes, implements MhAssignmentStore) -> `crates/mc-service/src/redis/client.rs`
 
 ## Health Endpoints (Cross-Service Consistency)
-- MC health -> `crates/mc-service/src/observability/health.rs:health_router()` | MH -> `crates/mh-service/src/observability/health.rs` (duplicated, see TODO.md)
-- GC health -> `crates/gc-service/src/routes/mod.rs:64-65`
+- MC -> `crates/mc-service/src/observability/health.rs:health_router()` | MH -> `crates/mh-service/src/observability/health.rs` (duplicated, see TODO.md) | GC -> `crates/gc-service/src/routes/mod.rs:64-65`
 
 ## Per-Service Infrastructure (K8s, Docker, Kind)
-- Kustomize bases -> `infra/services/{ac,gc,mc,mh}-service/kustomization.yaml`
-- MC/MH per-pod Services + ConfigMaps -> `infra/services/{mc,mh}-service/` (port: `base + ordinal*2`)
-- Network policies -> `infra/services/{ac,gc,mc,mh}-service/network-policy.yaml`
-- Dockerfiles -> `infra/docker/{ac,gc,mc,mh}-service/Dockerfile`; Kind -> `infra/kind/`
-- setup/teardown (ADR-0030) -> `infra/kind/scripts/{setup,teardown}.sh`; devloop -> `infra/devloop/devloop.sh`
+- Kustomize bases -> `infra/services/{ac,gc,mc,mh}-service/kustomization.yaml`; MC/MH per-pod Services + ConfigMaps (port: `base + ordinal*2`) -> `infra/services/{mc,mh}-service/`; network policies -> `infra/services/{ac,gc,mc,mh}-service/network-policy.yaml`
+- Dockerfiles -> `infra/docker/{ac,gc,mc,mh}-service/Dockerfile`; Kind setup/teardown (ADR-0030) -> `infra/kind/scripts/{setup,teardown}.sh`; devloop -> `infra/devloop/devloop.sh`
 
 ## False Positive Boundaries
 - Per-service error mapping (GcError/McError/MhError); MC vs MH GcClient (different RPCs/retry); AC vs GC rate limiting (different mechanisms); `common::jwt` vs `common::meeting_token` (JWT enums narrower)
