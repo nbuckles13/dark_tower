@@ -196,31 +196,31 @@ TBD
 ## Code Review Results
 
 ### Security Specialist
-**Verdict**: CLEAR / RESOLVED / ESCALATED
+**Verdict**: CLEAR / RESOLVED-FIXED / RESOLVED-DEFERRED / ESCALATED
 **Findings**: {count} found, {count} fixed, {count} deferred
 
 {Key findings and resolutions, or "No findings"}
 
 ### Test Specialist
-**Verdict**: CLEAR / RESOLVED / ESCALATED
+**Verdict**: CLEAR / RESOLVED-FIXED / RESOLVED-DEFERRED / ESCALATED
 **Findings**: {count} found, {count} fixed, {count} deferred
 
 {Key findings and resolutions, or "No findings"}
 
 ### Observability Specialist
-**Verdict**: CLEAR / RESOLVED / ESCALATED
+**Verdict**: CLEAR / RESOLVED-FIXED / RESOLVED-DEFERRED / ESCALATED
 **Findings**: {count} found, {count} fixed, {count} deferred
 
 {Key findings and resolutions, or "No findings"}
 
 ### Code Quality Reviewer
-**Verdict**: CLEAR / RESOLVED / ESCALATED
+**Verdict**: CLEAR / RESOLVED-FIXED / RESOLVED-DEFERRED / ESCALATED
 **Findings**: {count} found, {count} fixed, {count} deferred
 
 {Key findings and resolutions, or "No findings"}
 
 ### DRY Reviewer
-**Verdict**: CLEAR / RESOLVED / ESCALATED
+**Verdict**: CLEAR / RESOLVED-FIXED / RESOLVED-DEFERRED / ESCALATED
 
 **True duplication findings** (entered fix-or-defer flow):
 {List findings sent to implementer, or "None"}
@@ -229,13 +229,13 @@ TBD
 {One bullet per `docs/TODO.md` entry added, citing the section heading the entry was added under, or "None"}
 
 ### Operations Reviewer
-**Verdict**: CLEAR / RESOLVED / ESCALATED
+**Verdict**: CLEAR / RESOLVED-FIXED / RESOLVED-DEFERRED / ESCALATED
 **Findings**: {count} found, {count} fixed, {count} deferred
 
 {Key findings and resolutions, or "No findings"}
 
 ### Semantic Guard Reviewer
-**Verdict**: CLEAR / RESOLVED / ESCALATED
+**Verdict**: CLEAR / RESOLVED-FIXED / RESOLVED-DEFERRED / ESCALATED
 **Native verdict**: SAFE / UNSAFE (mapped by Lead per `.claude/agents/semantic-guard.md` §Verdict Mapping)
 **Findings**: {count} found, {count} fixed, {count} deferred
 
@@ -245,7 +245,9 @@ TBD
 
 ---
 
-## Tech Debt Pointers
+## Accepted Deferrals
+
+**Each entry here is an issue the devloop chose NOT to fix.** Every bullet is a cost shift: the implementer didn't pay the fix-now cost, so a future reader will pay fix-later cost + tracking overhead. List only what was actually deferred — not "follow-ups" or "future improvements" or "potential extractions." If something was fixed, it doesn't belong here.
 
 **Tech debt entries themselves live in `docs/TODO.md`. This section holds only pointers to those entries.** Do not create a `TODO.md` at the repo root or anywhere else — there is exactly one `docs/TODO.md` for the whole project. Do not inline the debt body here — multi-line entries belong in `docs/TODO.md`, not in this section.
 

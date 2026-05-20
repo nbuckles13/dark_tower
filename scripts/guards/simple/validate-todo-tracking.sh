@@ -2,16 +2,18 @@
 # Validates devloop tech-debt tracking conventions:
 #   (1) docs/TODO.md is the only TODO.md in the tree. Any newly-added TODO.md
 #       at any other path (root, crate, etc.) fails the guard.
-#   (2) Each docs/devloop-outputs/*/main.md's "Tech Debt Pointers" section
-#       contains only one-line pointer bullets, never inlined multi-line debt
-#       bodies. A line is acceptable in the section if it is blank, starts
-#       with `- ` (a bullet), is inside a fenced code block (examples), or
-#       is template-shape prose (Example/Examples/or). Multi-line bodies
-#       are the failure shape.
+#   (2) Each docs/devloop-outputs/*/main.md's "Accepted Deferrals" section
+#       (or older "Tech Debt Pointers" heading — both accepted) contains only
+#       one-line pointer bullets, never inlined multi-line debt bodies. A line
+#       is acceptable in the section if it is blank, starts with `- ` (a
+#       bullet), is inside a fenced code block (examples), or is template-shape
+#       prose (Example/Examples/or). Multi-line bodies are the failure shape.
 #
-# Only the new "Tech Debt Pointers" heading is enforced — the old "Tech Debt
-# References" heading is intentionally NOT matched so historical devloops
-# don't retroactively fail.
+# The original "Tech Debt References" heading (the first iteration) is
+# intentionally NOT matched so historical devloops don't retroactively fail.
+# The "Accepted Deferrals" rename (Revision 8 follow-up) is a wording change
+# that surfaces the cost shift; mechanical rules are identical to the prior
+# "Tech Debt Pointers" enforcement.
 
 set -euo pipefail
 
@@ -56,7 +58,7 @@ if [[ "$ROOT" == "." ]]; then
     done < <(git ls-files --others --exclude-standard '*TODO.md' 2>/dev/null)
 fi
 
-# ─── Rule 2: Tech Debt Pointers sections must be pointer-only ─────────
+# ─── Rule 2: Accepted Deferrals / Tech Debt Pointers sections must be pointer-only ───
 
 for main_md in "$ROOT"/docs/devloop-outputs/*/main.md; do
     [ -f "$main_md" ] || continue
@@ -66,11 +68,11 @@ for main_md in "$ROOT"/docs/devloop-outputs/*/main.md; do
         */_template/main.md) continue ;;
     esac
 
-    # Extract the Tech Debt Pointers section only (new heading). The old
-    # "Tech Debt References" heading is intentionally ignored so historical
-    # devloops don't retroactively fail this guard.
+    # Extract the section under either accepted heading. The original "Tech
+    # Debt References" heading is intentionally ignored so historical devloops
+    # don't retroactively fail.
     section=$(awk '
-        /^## Tech Debt Pointers[[:space:]]*$/ { in_section=1; next }
+        /^## (Accepted Deferrals|Tech Debt Pointers)[[:space:]]*$/ { in_section=1; next }
         in_section && /^## / { in_section=0 }
         in_section { print }
     ' "$main_md")
@@ -84,7 +86,7 @@ for main_md in "$ROOT"/docs/devloop-outputs/*/main.md; do
     line_no=0
     in_fence=0
     body_run=0
-    section_start_line=$(grep -n '^## Tech Debt Pointers' "$main_md" | head -1 | cut -d: -f1)
+    section_start_line=$(grep -nE '^## (Accepted Deferrals|Tech Debt Pointers)' "$main_md" | head -1 | cut -d: -f1)
     section_start_line=${section_start_line:-0}
 
     while IFS= read -r line; do

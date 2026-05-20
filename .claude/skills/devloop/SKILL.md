@@ -53,7 +53,7 @@ Every devloop spawns **8 teammates** (Lead + Implementer + 7 reviewers). `name` 
 
 The Lead (orchestrator) is automatically named `team-lead` in the team config.
 
-**Review model**: All findings default to "fix it." Implementer may defer with justification. See review protocol for details.
+**Review model**: All findings default to "fix it." Deferral requires demonstrating that fix-now-cost > fix-later-cost + tracking-overhead — *for this specific finding*. Verdicts split RESOLVED into RESOLVED-FIXED (everything cleared from the diff) vs RESOLVED-DEFERRED (any finding still in tree); even one accepted deferral forces RESOLVED-DEFERRED for that reviewer. See review protocol for the burden-of-proof, the suspicious-deferral check, and the full taxonomy.
 
 **Conditional domain reviewer**: When the task touches database patterns (`migration|schema|sql`) but the implementer is NOT the Database specialist, add Database as a conditional 8th reviewer. Same for Protocol when API contracts are affected by a non-Protocol implementer.
 
@@ -283,7 +283,7 @@ You are a reviewer in a Dark Tower devloop.
 3. **WAIT for @team-lead to send you "Start Review" before examining code.** Do NOT review code during planning or implementation phases.
 4. REVIEW: Examine the code, send findings to @implementer. Each finding defaults to "fix it."
 5. TRIAGE: If implementer defers a finding with justification, accept or escalate per review protocol.
-6. Use SendMessage to tell @team-lead your verdict: "CLEAR", "RESOLVED", or "ESCALATED: {reason}"
+6. Use SendMessage to tell @team-lead your verdict: "CLEAR", "RESOLVED-FIXED", "RESOLVED-DEFERRED", or "ESCALATED: {reason}". Any accepted deferral or spin-out forces RESOLVED-DEFERRED (not RESOLVED-FIXED), even if other findings were fixed in the same review.
 
 ## Communication
 
@@ -291,7 +291,7 @@ All teammate communication MUST use the SendMessage tool. Plain text output is n
 
 - Use SendMessage to message @implementer directly with feedback
 - Use SendMessage to message other reviewers if you spot issues in their domain
-- Use SendMessage to tell @team-lead for confirmations and verdicts (CLEAR / RESOLVED / ESCALATED)
+- Use SendMessage to tell @team-lead for confirmations and verdicts (CLEAR / RESOLVED-FIXED / RESOLVED-DEFERRED / ESCALATED)
 - **Do NOT start reviewing code until @team-lead sends you "Start Review"**
 ```
 
@@ -449,23 +449,25 @@ Track verdicts in main.md:
 ```
 | Reviewer | Verdict | Findings | Fixed | Deferred | Notes |
 |----------|---------|----------|-------|----------|-------|
-| Security | CLEAR / RESOLVED / ESCALATED | {count} | {count} | {count} | |
-| Test | CLEAR / RESOLVED / ESCALATED | | | | |
-| Observability | CLEAR / RESOLVED / ESCALATED | | | | |
-| Code Quality | CLEAR / RESOLVED / ESCALATED | | | | |
-| DRY | CLEAR / RESOLVED / ESCALATED | | | | |
-| Operations | CLEAR / RESOLVED / ESCALATED | | | | |
-| Semantic Guard | CLEAR / RESOLVED / ESCALATED | | | | |
+| Security | CLEAR / RESOLVED-FIXED / RESOLVED-DEFERRED / ESCALATED | {count} | {count} | {count} | |
+| Test | CLEAR / RESOLVED-FIXED / RESOLVED-DEFERRED / ESCALATED | | | | |
+| Observability | CLEAR / RESOLVED-FIXED / RESOLVED-DEFERRED / ESCALATED | | | | |
+| Code Quality | CLEAR / RESOLVED-FIXED / RESOLVED-DEFERRED / ESCALATED | | | | |
+| DRY | CLEAR / RESOLVED-FIXED / RESOLVED-DEFERRED / ESCALATED | | | | |
+| Operations | CLEAR / RESOLVED-FIXED / RESOLVED-DEFERRED / ESCALATED | | | | |
+| Semantic Guard | CLEAR / RESOLVED-FIXED / RESOLVED-DEFERRED / ESCALATED | | | | |
 ```
+
+A reviewer's verdict is **RESOLVED-DEFERRED** if even one of their findings was deferred or spun-out, regardless of how many others were fixed. RESOLVED-FIXED means zero remaining findings from that reviewer in the diff.
 
 **If any ESCALATED**:
 - Lead reviews the specific finding and the implementer's deferral justification
 - Lead decides: fix it (route back to implementer) or accept the deferral (override)
 - If routed back: return to implementation phase, max 3 review→implementation iterations
 
-**If all CLEAR or RESOLVED**:
+**If all CLEAR / RESOLVED-FIXED / RESOLVED-DEFERRED**:
 - Update main.md: Phase = complete
-- Document accepted deferrals as tech debt in main.md (with implementer's justification)
+- If any reviewer landed on RESOLVED-DEFERRED, surface that explicitly in the summary — at least one accepted deferral exists. Document accepted deferrals in main.md's §Accepted Deferrals section (with implementer's justification).
 - Proceed to Step 8 (Commit).
 
 ### Step 8: Commit
@@ -505,11 +507,14 @@ Update main.md:
 
 Append any accepted deferrals, DRY extraction opportunities, and
 spun-out findings to `docs/TODO.md` under the appropriate section
-(Cross-Service Duplication, Observability Debt, Code Quality, etc.).
-This is the durable home for forward-looking work that future readers
-can find. Scope decisions that are devloop-local context (e.g., "we did
-not do X because that is task Y's scope") belong in main.md's existing
-scope/classification sections.
+(Cross-Service Duplication, Observability Debt, Code Quality, etc.),
+then add a one-line pointer to each under main.md's §Accepted Deferrals.
+The pointer surfaces the cost shift at the devloop level; the body lives
+in `docs/TODO.md` as the durable, decay-tracked home for forward-looking
+work. Scope decisions that are devloop-local context (e.g., "we did not
+do X because that is task Y's scope") belong in main.md's existing
+scope/classification sections — not under §Accepted Deferrals, which is
+reserved for issues that were findings and remain in the diff.
 
 If this task is part of a user story, update the Devloop Tracking table
 in the user story file: set Status to Completed and fill in the Devloop
@@ -526,13 +531,13 @@ Duration: {time}
 Iterations: {count}
 
 Results:
-- Security: CLEAR/RESOLVED ({N} findings, {M} fixed, {K} deferred)
-- Test: CLEAR/RESOLVED
-- Observability: CLEAR/RESOLVED
-- Code Quality: CLEAR/RESOLVED
-- DRY: CLEAR/RESOLVED ({N} tech debt observations)
-- Operations: CLEAR/RESOLVED
-- Semantic Guard: CLEAR/RESOLVED
+- Security: CLEAR / RESOLVED-FIXED / RESOLVED-DEFERRED ({N} findings, {M} fixed, {K} deferred)
+- Test: CLEAR / RESOLVED-FIXED / RESOLVED-DEFERRED
+- Observability: CLEAR / RESOLVED-FIXED / RESOLVED-DEFERRED
+- Code Quality: CLEAR / RESOLVED-FIXED / RESOLVED-DEFERRED
+- DRY: CLEAR / RESOLVED-FIXED / RESOLVED-DEFERRED ({N} tech debt observations)
+- Operations: CLEAR / RESOLVED-FIXED / RESOLVED-DEFERRED
+- Semantic Guard: CLEAR / RESOLVED-FIXED / RESOLVED-DEFERRED
 
 Files changed:
 {summary}
