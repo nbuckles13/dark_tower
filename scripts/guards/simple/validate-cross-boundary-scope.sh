@@ -150,8 +150,19 @@ check_main_md() {
     #   verdict, after Gate 2 has already run. Same shape as INDEX.md: an
     #   expected, reviewer-authored append target that doesn't need to be
     #   listed in every plan.
+    # - `docs/user-stories/*.md` — Devloop Tracking table is updated by every
+    #   devloop at Step 9 (Completed status + Devloop Output path) per SKILL.md.
+    #   Same shape as TODO.md/INDEX.md: expected post-Gate-2 append target.
+    #   NOTE (Wave 2 dt-guard migration, task #45): this exemption is currently
+    #   broad — it exempts the whole file rather than just the Devloop Tracking
+    #   row update. A substantive user-story revision (Requirements, Ordered
+    #   Task List, Revisions) is exactly the kind of judgment edit the table
+    #   should surface, but the bash parser can't cheaply detect "only the
+    #   Devloop Tracking status/output columns changed." The dt-guard Rust
+    #   port should tighten this to row-level detection. See docs/TODO.md
+    #   §Polyglot Pipeline Follow-ups.
     local exclude_re
-    exclude_re="^(${rel_path}|docs/specialist-knowledge/[^/]+/INDEX\\.md|docs/TODO\\.md)\$"
+    exclude_re="^(${rel_path}|docs/specialist-knowledge/[^/]+/INDEX\\.md|docs/TODO\\.md|docs/user-stories/[^/]+\\.md)\$"
 
     local rows plan_paths
     rows=$(parse_cross_boundary_table "$main_md")
