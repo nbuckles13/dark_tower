@@ -24,7 +24,7 @@ use env_tests::fixtures::auth_client::{TokenRequest, UserRegistrationRequest};
 use env_tests::fixtures::gc_client::{CreateMeetingRequest, GcClient, GcClientError};
 use env_tests::fixtures::AuthClient;
 use prost::Message;
-use proto_gen::signaling::{
+use proto_gen::dark_tower::signaling::v1::{
     client_message, server_message, ClientMessage, JoinRequest, ServerMessage,
 };
 use std::time::Duration;
@@ -564,7 +564,7 @@ async fn test_mc_rejects_invalid_meeting_token() {
             // A mismatch is McError::JwtValidation → ErrorCode::Unauthorized (code 2).
             assert_eq!(
                 e.code,
-                proto_gen::signaling::ErrorCode::Unauthorized as i32,
+                proto_gen::dark_tower::signaling::v1::ErrorCode::Unauthorized as i32,
                 "MC should reject wrong meeting ID with Unauthorized, got code: {} message: {}",
                 e.code,
                 e.message
@@ -595,7 +595,7 @@ async fn test_mc_rejects_invalid_meeting_token() {
         Some(server_message::Message::Error(e)) => {
             assert_eq!(
                 e.code,
-                proto_gen::signaling::ErrorCode::Unauthorized as i32,
+                proto_gen::dark_tower::signaling::v1::ErrorCode::Unauthorized as i32,
                 "MC should reject bogus token with Unauthorized, got code: {}",
                 e.code
             );

@@ -18,8 +18,8 @@
 
 use crate::mh_connection_registry::{MhConnectionRegistry, MAX_ID_LENGTH};
 use crate::observability::metrics;
-use proto_gen::internal::media_coordination_service_server::MediaCoordinationService;
-use proto_gen::internal::{
+use proto_gen::dark_tower::internal::v1::media_coordination_service_server::MediaCoordinationService;
+use proto_gen::dark_tower::internal::v1::{
     NotifyParticipantConnectedRequest, NotifyParticipantConnectedResponse,
     NotifyParticipantDisconnectedRequest, NotifyParticipantDisconnectedResponse,
 };

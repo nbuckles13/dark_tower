@@ -158,7 +158,9 @@ async fn connect_wt(url: &str) -> wtransport::Connection {
 /// payload tests below), the bytes are wrapped in the same envelope and the
 /// validator/decoder observes the failure mode that's intended.
 fn encode_jwt_frame(jwt: &str) -> Vec<u8> {
-    use proto_gen::signaling::{mh_client_message, MhClientMessage, MhConnectRequest};
+    use proto_gen::dark_tower::signaling::v1::{
+        mh_client_message, MhClientMessage, MhConnectRequest,
+    };
 
     let envelope = MhClientMessage {
         message: Some(mh_client_message::Message::ConnectRequest(
@@ -410,10 +412,10 @@ async fn mc_join(
     meeting_id: &str,
     meeting_token: &str,
     participant_name: &str,
-) -> proto_gen::signaling::JoinResponse {
+) -> proto_gen::dark_tower::signaling::v1::JoinResponse {
     use bytes::{BufMut, BytesMut as MsgBuf};
     use prost::Message;
-    use proto_gen::signaling::{
+    use proto_gen::dark_tower::signaling::v1::{
         client_message, server_message, ClientMessage, JoinRequest, ServerMessage,
     };
 

@@ -31,7 +31,7 @@ use mc_service::mh_connection_registry::MhConnectionRegistry;
 use mc_service::redis::MhAssignmentStore;
 use mc_test_utils::jwt_test::{make_expired_meeting_claims, make_meeting_claims, TestKeypair};
 use prost::Message;
-use proto_gen::signaling::{
+use proto_gen::dark_tower::signaling::v1::{
     self, client_message, server_message, ClientMessage, JoinRequest, MuteRequest, ServerMessage,
 };
 use wtransport::{ClientConfig, Endpoint};
@@ -292,7 +292,7 @@ async fn test_join_expired_token_returns_unauthorized() {
     let response = join_and_read_response(&server.url(), "meeting-exp", &token, "Expired").await;
 
     let (code, message) = extract_error(&response);
-    assert_eq!(code, signaling::ErrorCode::Unauthorized as i32);
+    assert_eq!(code, v1::ErrorCode::Unauthorized as i32);
     // Security: verify error message is generic, not detailed
     assert!(
         message.contains("Invalid or expired token") || message.contains("invalid"),
@@ -313,7 +313,7 @@ async fn test_join_garbage_token_returns_unauthorized() {
         join_and_read_response(&server.url(), "meeting-garbage", "not-a-valid-jwt", "Bad").await;
 
     let (code, _message) = extract_error(&response);
-    assert_eq!(code, signaling::ErrorCode::Unauthorized as i32);
+    assert_eq!(code, v1::ErrorCode::Unauthorized as i32);
 }
 
 // ============================================================================
@@ -333,7 +333,7 @@ async fn test_join_wrong_meeting_id_returns_unauthorized() {
     let response = join_and_read_response(&server.url(), "meeting-B", &token, "Mismatch").await;
 
     let (code, message) = extract_error(&response);
-    assert_eq!(code, signaling::ErrorCode::Unauthorized as i32);
+    assert_eq!(code, v1::ErrorCode::Unauthorized as i32);
     // Security: generic error, doesn't reveal "meeting_id mismatch"
     assert!(
         !message.contains("mismatch"),
@@ -357,7 +357,7 @@ async fn test_join_meeting_not_found_returns_not_found() {
         join_and_read_response(&server.url(), "meeting-nonexistent", &token, "Lost").await;
 
     let (code, _message) = extract_error(&response);
-    assert_eq!(code, signaling::ErrorCode::NotFound as i32);
+    assert_eq!(code, v1::ErrorCode::NotFound as i32);
 }
 
 // ============================================================================
@@ -460,7 +460,7 @@ async fn test_join_wrong_first_message_returns_invalid_request() {
         .expect("Timeout waiting for error response");
 
     let (code, _message) = extract_error(&response);
-    assert_eq!(code, signaling::ErrorCode::InvalidRequest as i32);
+    assert_eq!(code, v1::ErrorCode::InvalidRequest as i32);
 }
 
 // ============================================================================
@@ -481,7 +481,7 @@ async fn test_join_wrong_signing_key_returns_unauthorized() {
         join_and_read_response(&server.url(), "meeting-wrongkey", &token, "WrongKey").await;
 
     let (code, _message) = extract_error(&response);
-    assert_eq!(code, signaling::ErrorCode::Unauthorized as i32);
+    assert_eq!(code, v1::ErrorCode::Unauthorized as i32);
 }
 
 // ============================================================================
@@ -780,7 +780,7 @@ async fn test_join_participant_name_too_long_returns_error() {
         join_and_read_response(&server.url(), "meeting-longname", &token, &long_name).await;
 
     let (code, _message) = extract_error(&response);
-    assert_eq!(code, signaling::ErrorCode::InvalidRequest as i32);
+    assert_eq!(code, v1::ErrorCode::InvalidRequest as i32);
 }
 
 // ============================================================================

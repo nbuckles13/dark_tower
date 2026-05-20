@@ -24,8 +24,8 @@ use crate::errors::McError;
 use crate::observability::{record_gc_heartbeat, record_gc_heartbeat_latency};
 use common::secret::ExposeSecret;
 use common::token_manager::TokenReceiver;
-use proto_gen::internal::global_controller_service_client::GlobalControllerServiceClient;
-use proto_gen::internal::{
+use proto_gen::dark_tower::internal::v1::global_controller_service_client::GlobalControllerServiceClient;
+use proto_gen::dark_tower::internal::v1::{
     ComprehensiveHeartbeatRequest, ControllerCapacity, FastHeartbeatRequest, HealthStatus,
     RegisterMcRequest,
 };
@@ -295,7 +295,7 @@ impl GcClient {
     async fn try_register(
         &self,
         request: &RegisterMcRequest,
-    ) -> Result<proto_gen::internal::RegisterMcResponse, McError> {
+    ) -> Result<proto_gen::dark_tower::internal::v1::RegisterMcResponse, McError> {
         // Clone the channel (cheap operation) for this request
         let mut client = GlobalControllerServiceClient::new(self.channel.clone());
         let grpc_request = self.add_auth(request.clone())?;

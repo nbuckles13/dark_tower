@@ -17,7 +17,7 @@ use crate::redis::{MhAssignmentData, MhAssignmentStore};
 use bytes::{BufMut, BytesMut};
 use common::jwt::MeetingRole;
 use prost::Message;
-use proto_gen::signaling::{
+use proto_gen::dark_tower::signaling::v1::{
     self, client_message, server_message, ClientMessage, ErrorMessage, JoinResponse,
     MediaServerInfo, Participant, ServerMessage,
 };
@@ -152,7 +152,7 @@ pub async fn handle_connection(
             );
             let _ = send_error(
                 &mut send_stream,
-                signaling::ErrorCode::InvalidRequest as i32,
+                v1::ErrorCode::InvalidRequest as i32,
                 "First message must be JoinRequest",
             )
             .await;
@@ -178,7 +178,7 @@ pub async fn handle_connection(
         );
         let _ = send_error(
             &mut send_stream,
-            signaling::ErrorCode::InvalidRequest as i32,
+            v1::ErrorCode::InvalidRequest as i32,
             "Participant name too long",
         )
         .await;
@@ -215,7 +215,7 @@ pub async fn handle_connection(
             metrics::record_jwt_validation("failure", "meeting", "signature_invalid");
             let _ = send_error(
                 &mut send_stream,
-                signaling::ErrorCode::Unauthorized as i32,
+                v1::ErrorCode::Unauthorized as i32,
                 "Invalid or expired token",
             )
             .await;
@@ -247,7 +247,7 @@ pub async fn handle_connection(
         );
         let _ = send_error(
             &mut send_stream,
-            signaling::ErrorCode::Unauthorized as i32,
+            v1::ErrorCode::Unauthorized as i32,
             "Invalid or expired token",
         )
         .await;
@@ -327,7 +327,7 @@ pub async fn handle_connection(
             );
             let _ = send_error(
                 &mut send_stream,
-                signaling::ErrorCode::InternalError as i32,
+                v1::ErrorCode::InternalError as i32,
                 "Internal error",
             )
             .await;
@@ -837,12 +837,10 @@ mod tests {
     #[test]
     fn test_handle_client_message_unhandled_type() {
         let msg = ClientMessage {
-            message: Some(client_message::Message::MuteRequest(
-                signaling::MuteRequest {
-                    audio_muted: true,
-                    video_muted: false,
-                },
-            )),
+            message: Some(client_message::Message::MuteRequest(v1::MuteRequest {
+                audio_muted: true,
+                video_muted: false,
+            })),
             trace_parent: String::new(),
             trace_state: String::new(),
         };

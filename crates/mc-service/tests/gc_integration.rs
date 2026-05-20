@@ -18,10 +18,10 @@ use mc_service::mh_connection_registry::MhConnectionRegistry;
 
 use common::secret::{SecretBox, SecretString};
 use common::token_manager::TokenReceiver;
-use proto_gen::internal::global_controller_service_server::{
+use proto_gen::dark_tower::internal::v1::global_controller_service_server::{
     GlobalControllerService, GlobalControllerServiceServer,
 };
-use proto_gen::internal::{
+use proto_gen::dark_tower::internal::v1::{
     ComprehensiveHeartbeatRequest, ComprehensiveHeartbeatResponse, FastHeartbeatRequest,
     FastHeartbeatResponse, HealthStatus, NotifyMeetingEndedRequest, NotifyMeetingEndedResponse,
     RegisterMcRequest, RegisterMcResponse,
@@ -408,7 +408,11 @@ async fn test_gc_client_fast_heartbeat() {
 
     // Send a fast heartbeat
     gc_client
-        .fast_heartbeat(5, 50, proto_gen::internal::HealthStatus::Healthy)
+        .fast_heartbeat(
+            5,
+            50,
+            proto_gen::dark_tower::internal::v1::HealthStatus::Healthy,
+        )
         .await
         .unwrap();
 
@@ -442,7 +446,7 @@ async fn test_gc_client_comprehensive_heartbeat() {
         .comprehensive_heartbeat(
             10,
             100,
-            proto_gen::internal::HealthStatus::Healthy,
+            proto_gen::dark_tower::internal::v1::HealthStatus::Healthy,
             45.5,
             60.0,
         )
@@ -476,7 +480,11 @@ async fn test_gc_client_heartbeat_skipped_when_not_registered() {
 
     // These should succeed (skipped, not failed)
     gc_client
-        .fast_heartbeat(5, 50, proto_gen::internal::HealthStatus::Healthy)
+        .fast_heartbeat(
+            5,
+            50,
+            proto_gen::dark_tower::internal::v1::HealthStatus::Healthy,
+        )
         .await
         .unwrap();
 
@@ -484,7 +492,7 @@ async fn test_gc_client_heartbeat_skipped_when_not_registered() {
         .comprehensive_heartbeat(
             10,
             100,
-            proto_gen::internal::HealthStatus::Healthy,
+            proto_gen::dark_tower::internal::v1::HealthStatus::Healthy,
             45.5,
             60.0,
         )

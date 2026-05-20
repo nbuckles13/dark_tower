@@ -24,10 +24,10 @@ use ::common::observability::testing::MetricAssertion;
 use ::common::secret::SecretString;
 use ::common::token_manager::TokenReceiver;
 use mc_service::grpc::MhClient;
-use proto_gen::internal::media_handler_service_server::{
+use proto_gen::dark_tower::internal::v1::media_handler_service_server::{
     MediaHandlerService, MediaHandlerServiceServer,
 };
-use proto_gen::internal::{
+use proto_gen::dark_tower::internal::v1::{
     RegisterMeetingRequest, RegisterMeetingResponse, RegisterRequest, RegisterResponse,
     RouteMediaRequest, RouteMediaResponse, StreamTelemetryRequest, StreamTelemetryResponse,
 };

@@ -16,10 +16,10 @@ use mh_service::grpc::GcClient;
 use common::observability::testing::MetricAssertion;
 use common::secret::SecretString;
 use common::token_manager::TokenReceiver;
-use proto_gen::internal::media_handler_registry_service_server::{
+use proto_gen::dark_tower::internal::v1::media_handler_registry_service_server::{
     MediaHandlerRegistryService, MediaHandlerRegistryServiceServer,
 };
-use proto_gen::internal::{
+use proto_gen::dark_tower::internal::v1::{
     RegisterMhRequest, RegisterMhResponse, SendLoadReportRequest, SendLoadReportResponse,
 };
 use tokio::sync::{mpsc, watch};

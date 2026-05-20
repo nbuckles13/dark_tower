@@ -15,8 +15,10 @@ use crate::observability::metrics;
 use crate::services::mh_selection::MhAssignmentInfo;
 use common::secret::ExposeSecret;
 use common::token_manager::TokenReceiver;
-use proto_gen::internal::meeting_controller_service_client::MeetingControllerServiceClient;
-use proto_gen::internal::{AssignMeetingWithMhRequest, AssignMeetingWithMhResponse, MhAssignment};
+use proto_gen::dark_tower::internal::v1::meeting_controller_service_client::MeetingControllerServiceClient;
+use proto_gen::dark_tower::internal::v1::{
+    AssignMeetingWithMhRequest, AssignMeetingWithMhResponse, MhAssignment,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};

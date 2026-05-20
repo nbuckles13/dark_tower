@@ -11,7 +11,7 @@
 
 use crate::repositories::{HealthStatus, MediaHandlersRepository};
 use chrono::Utc;
-use proto_gen::internal::{
+use proto_gen::dark_tower::internal::v1::{
     media_handler_registry_service_server::MediaHandlerRegistryService, RegisterMhRequest,
     RegisterMhResponse, SendLoadReportRequest, SendLoadReportResponse,
 };

@@ -37,7 +37,7 @@ use mc_service::grpc::MhRegistrationClient;
 use mc_service::redis::{MhAssignmentData, MhAssignmentStore, MhEndpointInfo};
 use mc_test_utils::jwt_test::{make_expired_meeting_claims, make_meeting_claims, TestKeypair};
 use prost::Message;
-use proto_gen::signaling::{client_message, ClientMessage, JoinRequest};
+use proto_gen::dark_tower::signaling::v1::{client_message, ClientMessage, JoinRequest};
 use wtransport::{ClientConfig, Endpoint};
 
 use test_common::accept_loop_rig::AcceptLoopRig;
@@ -386,7 +386,7 @@ async fn accept_loop_records_session_join_failure_jwt_validation() {
 async fn accept_loop_records_session_join_failure_internal_for_wrong_first_message() {
     // First message is a MuteRequest, not a JoinRequest → `connection.rs:160`
     // returns `McError::Internal("Expected JoinRequest as first message")`.
-    use proto_gen::signaling::MuteRequest;
+    use proto_gen::dark_tower::signaling::v1::MuteRequest;
 
     let bundle = start_rig(8).await;
     create_meeting_with_mh(&bundle, "meeting-wrong-first").await;

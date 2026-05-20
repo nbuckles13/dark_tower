@@ -36,7 +36,7 @@ use mh_service::grpc::{GcClient, McClient, MhAuthLayer, MhMediaService};
 use mh_service::observability::{health_router, HealthState};
 use mh_service::session::SessionManagerHandle;
 use mh_service::webtransport::WebTransportServer;
-use proto_gen::internal::media_handler_service_server::MediaHandlerServiceServer;
+use proto_gen::dark_tower::internal::v1::media_handler_service_server::MediaHandlerServiceServer;
 use tokio::signal;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};

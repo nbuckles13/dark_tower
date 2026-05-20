@@ -1,7 +1,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use proto_gen::signaling::ClientMessage;
+use proto_gen::dark_tower::signaling::v1::ClientMessage;
 use proto_gen::Message; // Re-exported from prost
 
 fuzz_target!(|data: &[u8]| {

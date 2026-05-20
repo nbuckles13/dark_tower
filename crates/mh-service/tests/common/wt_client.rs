@@ -5,7 +5,7 @@
 //! code path is the production one (see `accept_loop_rig::AcceptLoopRig`).
 
 use prost::Message;
-use proto_gen::signaling::{mh_client_message, MhClientMessage, MhConnectRequest};
+use proto_gen::dark_tower::signaling::v1::{mh_client_message, MhClientMessage, MhConnectRequest};
 use wtransport::{ClientConfig, Endpoint};
 
 /// Build a fresh wtransport client configured to trust self-signed certs.
