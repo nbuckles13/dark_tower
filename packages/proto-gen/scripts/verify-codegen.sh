@@ -24,7 +24,7 @@ OUT_DIR="${REPO_ROOT}/packages/sdk-core/src/proto"
 # Clean any prior outputs so this run's assertions cannot be satisfied by stale
 # files left behind by a previous (possibly differently-configured) codegen run.
 mkdir -p "${OUT_DIR}"
-find "${OUT_DIR}" -maxdepth 1 -type f \( -name '*_pb.ts' -o -name '*_pb.js' -o -name '*_pb.d.ts' \) -delete
+find "${OUT_DIR}" -type f \( -name '*_pb.ts' -o -name '*_pb.js' -o -name '*_pb.d.ts' \) -delete
 
 cd "${REPO_ROOT}/proto"
 pnpm exec buf generate
@@ -49,7 +49,7 @@ assert_generated() {
   echo "verify-codegen: OK — ${file} (contains ${symbol})"
 }
 
-assert_generated "signaling_pb.ts" "JoinRequest"
-assert_generated "internal_pb.ts" "RegisterParticipant"
+assert_generated "dark_tower/signaling/signaling_pb.ts" "JoinRequest"
+assert_generated "dark_tower/internal/internal_pb.ts" "RegisterParticipant"
 
 echo "verify-codegen: all checks passed"
