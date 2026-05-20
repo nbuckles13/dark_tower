@@ -23,8 +23,8 @@ mod test_common;
 use std::time::Duration;
 
 use mh_service::session::SessionManagerHandle;
-use proto_gen::internal::media_handler_service_client::MediaHandlerServiceClient;
-use proto_gen::internal::RegisterMeetingRequest;
+use proto_gen::dark_tower::internal::v1::media_handler_service_client::MediaHandlerServiceClient;
+use proto_gen::dark_tower::internal::v1::RegisterMeetingRequest;
 use tonic::metadata::MetadataValue;
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Code, Request};

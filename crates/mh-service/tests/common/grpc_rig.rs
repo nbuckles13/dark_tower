@@ -7,7 +7,7 @@ use std::time::Duration;
 use common::jwt::JwksClient;
 use mh_service::grpc::{MhAuthLayer, MhMediaService};
 use mh_service::session::SessionManagerHandle;
-use proto_gen::internal::media_handler_service_server::MediaHandlerServiceServer;
+use proto_gen::dark_tower::internal::v1::media_handler_service_server::MediaHandlerServiceServer;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::Server;

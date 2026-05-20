@@ -25,8 +25,8 @@
 use crate::actors::MeetingControllerActorHandle;
 use crate::errors::McError;
 use crate::redis::FencedRedisClient;
-use proto_gen::internal::meeting_controller_service_server::MeetingControllerService;
-use proto_gen::internal::{
+use proto_gen::dark_tower::internal::v1::meeting_controller_service_server::MeetingControllerService;
+use proto_gen::dark_tower::internal::v1::{
     AssignMeetingWithMhRequest, AssignMeetingWithMhResponse, MhAssignment, RejectionReason,
 };
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};

@@ -657,9 +657,12 @@ mod tests {
         // Decode and verify it's a ParticipantJoined message
         use prost::Message;
         let server_msg =
-            proto_gen::signaling::ServerMessage::decode(received.unwrap().as_ref()).unwrap();
+            proto_gen::dark_tower::signaling::v1::ServerMessage::decode(received.unwrap().as_ref())
+                .unwrap();
         match server_msg.message.unwrap() {
-            proto_gen::signaling::server_message::Message::ParticipantJoined(joined) => {
+            proto_gen::dark_tower::signaling::v1::server_message::Message::ParticipantJoined(
+                joined,
+            ) => {
                 let p = joined.participant.unwrap();
                 assert_eq!(p.participant_id, "part-new");
                 assert_eq!(p.name, "New User");

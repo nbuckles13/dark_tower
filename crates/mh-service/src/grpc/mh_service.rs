@@ -13,8 +13,8 @@ use std::time::Instant;
 
 use crate::observability::metrics;
 use crate::session::{MeetingRegistration, SessionManagerHandle};
-use proto_gen::internal::media_handler_service_server::MediaHandlerService;
-use proto_gen::internal::{
+use proto_gen::dark_tower::internal::v1::media_handler_service_server::MediaHandlerService;
+use proto_gen::dark_tower::internal::v1::{
     RegisterMeetingRequest, RegisterMeetingResponse, RegisterRequest, RegisterResponse,
     RouteMediaRequest, RouteMediaResponse, StreamTelemetryRequest, StreamTelemetryResponse,
 };

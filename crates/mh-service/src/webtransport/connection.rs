@@ -18,7 +18,7 @@ use crate::observability::metrics;
 use crate::session::{ConnectionEntry, PendingConnection, SessionManagerHandle};
 
 use prost::Message;
-use proto_gen::signaling::{mh_client_message, MhClientMessage};
+use proto_gen::dark_tower::signaling::v1::{mh_client_message, MhClientMessage};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
@@ -331,7 +331,7 @@ pub async fn handle_connection(
                     "Connection cancelled during shutdown"
                 );
                 // Server-initiated shutdown — not a client close or error
-                disconnect_reason = proto_gen::internal::DisconnectReason::Unspecified;
+                disconnect_reason = proto_gen::dark_tower::internal::v1::DisconnectReason::Unspecified;
                 break;
             }
             result = recv_stream.read(&mut probe_buf) => {
@@ -343,7 +343,7 @@ pub async fn handle_connection(
                             meeting_id = %meeting_id,
                             "Client disconnected"
                         );
-                        disconnect_reason = proto_gen::internal::DisconnectReason::ClientClosed;
+                        disconnect_reason = proto_gen::dark_tower::internal::v1::DisconnectReason::ClientClosed;
                         break;
                     }
                     Err(_) => {
@@ -353,7 +353,7 @@ pub async fn handle_connection(
                             meeting_id = %meeting_id,
                             "Client disconnected with error"
                         );
-                        disconnect_reason = proto_gen::internal::DisconnectReason::Error;
+                        disconnect_reason = proto_gen::dark_tower::internal::v1::DisconnectReason::Error;
                         break;
                     }
                     Ok(Some(_)) => {

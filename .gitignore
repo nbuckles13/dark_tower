@@ -10,7 +10,6 @@ Cargo.lock
 **/fuzz/artifacts/
 
 # Generated protobuf code
-crates/proto-gen/src/generated/*.rs
 packages/sdk-core/src/proto/**/*_pb.ts
 
 # IDE

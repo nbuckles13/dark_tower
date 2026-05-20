@@ -19,8 +19,8 @@ use crate::errors::MhError;
 use crate::observability::metrics;
 use common::secret::ExposeSecret;
 use common::token_manager::TokenReceiver;
-use proto_gen::internal::media_handler_registry_service_client::MediaHandlerRegistryServiceClient;
-use proto_gen::internal::{RegisterMhRequest, SendLoadReportRequest};
+use proto_gen::dark_tower::internal::v1::media_handler_registry_service_client::MediaHandlerRegistryServiceClient;
+use proto_gen::dark_tower::internal::v1::{RegisterMhRequest, SendLoadReportRequest};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tonic::transport::{Channel, Endpoint};
@@ -201,7 +201,7 @@ impl GcClient {
     async fn try_register(
         &self,
         request: &RegisterMhRequest,
-    ) -> Result<proto_gen::internal::RegisterMhResponse, MhError> {
+    ) -> Result<proto_gen::dark_tower::internal::v1::RegisterMhResponse, MhError> {
         let grpc_request = self.add_auth(request.clone())?;
 
         let mut client = MediaHandlerRegistryServiceClient::new(self.channel.clone());

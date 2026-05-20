@@ -11,10 +11,10 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
-use proto_gen::internal::media_coordination_service_server::{
+use proto_gen::dark_tower::internal::v1::media_coordination_service_server::{
     MediaCoordinationService, MediaCoordinationServiceServer,
 };
-use proto_gen::internal::{
+use proto_gen::dark_tower::internal::v1::{
     NotifyParticipantConnectedRequest, NotifyParticipantConnectedResponse,
     NotifyParticipantDisconnectedRequest, NotifyParticipantDisconnectedResponse,
 };

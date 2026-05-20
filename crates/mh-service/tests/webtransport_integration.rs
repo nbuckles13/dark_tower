@@ -67,7 +67,7 @@ use common::observability::testing::MetricAssertion;
 use mh_service::auth::MhJwtValidator;
 use mh_service::grpc::McClient;
 use mh_service::session::SessionManagerHandle;
-use proto_gen::internal::DisconnectReason;
+use proto_gen::dark_tower::internal::v1::DisconnectReason;
 use tokio::sync::mpsc;
 
 use test_common::accept_loop_rig::AcceptLoopRig;
@@ -289,7 +289,7 @@ async fn empty_envelope_oneof_rejected_on_wt_accept_path() {
     // increment. Distinguishes "decode succeeded but no variant" from "decode
     // failed" — both must close, neither emits validation counters.
     use prost::Message;
-    use proto_gen::signaling::MhClientMessage;
+    use proto_gen::dark_tower::signaling::v1::MhClientMessage;
 
     let mc_client = make_mc_client();
     let suite = WtSuite::start(Duration::from_secs(30), mc_client).await;

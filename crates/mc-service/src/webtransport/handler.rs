@@ -2,7 +2,7 @@
 
 use crate::actors::messages::{LeaveReason, ParticipantStateUpdate};
 
-use proto_gen::signaling::{
+use proto_gen::dark_tower::signaling::v1::{
     self, server_message, Participant, ParticipantJoined, ParticipantLeft, ServerMessage,
 };
 use tracing::debug;
@@ -35,10 +35,10 @@ pub fn encode_participant_update(update: &ParticipantStateUpdate) -> Option<Serv
             reason,
         } => {
             let proto_reason = match reason {
-                LeaveReason::Voluntary => signaling::LeaveReason::Voluntary,
-                LeaveReason::Timeout => signaling::LeaveReason::Timeout,
-                LeaveReason::Removed => signaling::LeaveReason::Kicked,
-                LeaveReason::MeetingEnded => signaling::LeaveReason::MeetingEnded,
+                LeaveReason::Voluntary => v1::LeaveReason::Voluntary,
+                LeaveReason::Timeout => v1::LeaveReason::Timeout,
+                LeaveReason::Removed => v1::LeaveReason::Kicked,
+                LeaveReason::MeetingEnded => v1::LeaveReason::MeetingEnded,
             };
             Some(ServerMessage {
                 message: Some(server_message::Message::ParticipantLeft(ParticipantLeft {
@@ -83,7 +83,7 @@ mod tests {
     use crate::actors::messages::{
         LeaveReason, ParticipantInfo, ParticipantStateUpdate, ParticipantStatus,
     };
-    use proto_gen::signaling::{self, server_message};
+    use proto_gen::dark_tower::signaling::v1::{self, server_message};
 
     fn make_participant_info(id: &str, name: &str) -> ParticipantInfo {
         ParticipantInfo {
@@ -131,7 +131,7 @@ mod tests {
         match msg.message.unwrap() {
             server_message::Message::ParticipantLeft(left) => {
                 assert_eq!(left.participant_id, "part-2");
-                assert_eq!(left.reason, signaling::LeaveReason::Voluntary as i32);
+                assert_eq!(left.reason, v1::LeaveReason::Voluntary as i32);
             }
             other => panic!("Expected ParticipantLeft, got {other:?}"),
         }
@@ -147,7 +147,7 @@ mod tests {
         let msg = encode_participant_update(&update).unwrap();
         match msg.message.unwrap() {
             server_message::Message::ParticipantLeft(left) => {
-                assert_eq!(left.reason, signaling::LeaveReason::Timeout as i32);
+                assert_eq!(left.reason, v1::LeaveReason::Timeout as i32);
             }
             other => panic!("Expected ParticipantLeft, got {other:?}"),
         }
@@ -163,7 +163,7 @@ mod tests {
         let msg = encode_participant_update(&update).unwrap();
         match msg.message.unwrap() {
             server_message::Message::ParticipantLeft(left) => {
-                assert_eq!(left.reason, signaling::LeaveReason::Kicked as i32);
+                assert_eq!(left.reason, v1::LeaveReason::Kicked as i32);
             }
             other => panic!("Expected ParticipantLeft, got {other:?}"),
         }
@@ -179,7 +179,7 @@ mod tests {
         let msg = encode_participant_update(&update).unwrap();
         match msg.message.unwrap() {
             server_message::Message::ParticipantLeft(left) => {
-                assert_eq!(left.reason, signaling::LeaveReason::MeetingEnded as i32);
+                assert_eq!(left.reason, v1::LeaveReason::MeetingEnded as i32);
             }
             other => panic!("Expected ParticipantLeft, got {other:?}"),
         }

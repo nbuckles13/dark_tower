@@ -2,6 +2,11 @@
 //!
 //! This crate contains the compiled Protocol Buffer definitions used for
 //! communication between Dark Tower components.
+//!
+//! Module paths mirror the proto package hierarchy so the schema version is
+//! visible at every consumer use-site: `proto_gen::dark_tower::signaling::v1`,
+//! `proto_gen::dark_tower::internal::v1`. No flat re-export aliases — adding
+//! a future v2 will not silently rename v1 message semantics for any caller.
 
 #![warn(clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
@@ -18,13 +23,17 @@ pub use prost::Message;
 // Re-export tonic for gRPC service traits
 pub use tonic;
 
-// Generated protobuf modules
-pub mod signaling {
-    //! Client-server signaling messages
-    include!("generated/dark_tower.signaling.v1.rs");
-}
+// Generated protobuf modules — paths mirror proto package hierarchy.
+pub mod dark_tower {
+    pub mod signaling {
+        pub mod v1 {
+            include!(concat!(env!("OUT_DIR"), "/dark_tower.signaling.v1.rs"));
+        }
+    }
 
-pub mod internal {
-    //! Internal service-to-service messages with gRPC service traits
-    include!("generated/dark_tower.internal.v1.rs");
+    pub mod internal {
+        pub mod v1 {
+            include!(concat!(env!("OUT_DIR"), "/dark_tower.internal.v1.rs"));
+        }
+    }
 }

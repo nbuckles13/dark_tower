@@ -15,8 +15,8 @@ use std::sync::Arc;
 use ::common::observability::testing::MetricAssertion;
 use mc_service::grpc::McMediaCoordinationService;
 use mc_service::mh_connection_registry::MhConnectionRegistry;
-use proto_gen::internal::media_coordination_service_server::MediaCoordinationService;
-use proto_gen::internal::{
+use proto_gen::dark_tower::internal::v1::media_coordination_service_server::MediaCoordinationService;
+use proto_gen::dark_tower::internal::v1::{
     NotifyParticipantConnectedRequest, NotifyParticipantDisconnectedRequest,
 };
 use tonic::Request;
