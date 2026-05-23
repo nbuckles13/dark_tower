@@ -70,6 +70,12 @@ jobs:
       - name: Install pnpm dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@cargo-audit
+
+      - name: Install buf
+        uses: bufbuild/buf-setup-action@v1
+
       # Single end-to-end pipeline call — same router as local devloop's
       # scripts/verify-completion.sh --layer full (ADR-0033 §4). Local repro
       # of an audit failure: `./scripts/layer6.sh`.
