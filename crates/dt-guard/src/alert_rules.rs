@@ -169,6 +169,7 @@ fn load_ignore_lines(
                         "guard:ignore reason too short or too vague: {reason:?} \
                          (require >=10 chars, not test/tmp/todo/fixme/wip)"
                     ),
+                    secret_pattern: None,
                 });
             } else {
                 out.insert(line_no, reason);
@@ -335,10 +336,44 @@ struct Finding {
     line: usize,
     rule_id: &'static str,
     message: String,
+    /// For `annotation_hygiene` only: the redacted pattern descriptor
+    /// (e.g. `"AWS access key"`, `"bearer token"`). When `Some`, the
+    /// finding is routed through `print_secret_finding` so the matched
+    /// secret bytes are NOT echoed to stdout — per @semantic-guard Wave-2
+    /// Q1 credential-leak fix. `None` for non-secret rules (runbook_url,
+    /// severity, for_duration, lazy_ignore_reason) which continue to use
+    /// `print_finding`.
+    secret_pattern: Option<&'static str>,
 }
 
 impl Finding {
     fn print(&self, explain: bool) {
+        if let Some(pattern) = self.secret_pattern {
+            // Secret-redacted path. Both VIOLATION and EXPLAIN omit the raw
+            // matched bytes; we emit only the pattern descriptor + the alert
+            // name as a safe-to-echo hint.
+            if explain {
+                let policy = format!("alert-rules-policy::{}", self.rule_id);
+                crate::common::explain::print_secret_finding(
+                    &crate::common::explain::SecretFinding {
+                        file: &self.file,
+                        row: self.line,
+                        col: 0,
+                        policy: &policy,
+                        pattern_name: pattern,
+                        extras: &[("alert", &self.alert)],
+                        src_file: file!(),
+                        src_line: line!(),
+                    },
+                );
+            } else {
+                println!(
+                    "VIOLATION: {}:{} [{}] annotation contains suspected {} (redacted)",
+                    self.file, self.line, self.alert, pattern
+                );
+            }
+            return;
+        }
         if explain {
             let policy = format!("alert-rules-policy::{}", self.rule_id);
             crate::common::explain::print_finding(&crate::common::explain::Finding {
@@ -418,6 +453,7 @@ pub fn run(repo_root: &Path, explain: bool) -> Result<()> {
                         line: rule_line,
                         rule_id: RUNBOOK_URL_RULE_ID,
                         message: msg,
+                        secret_pattern: None,
                     });
                 }
 
@@ -429,6 +465,7 @@ pub fn run(repo_root: &Path, explain: bool) -> Result<()> {
                         line: rule_line,
                         rule_id: SEVERITY_RULE_ID,
                         message: msg,
+                        secret_pattern: None,
                     });
                 }
 
@@ -441,6 +478,7 @@ pub fn run(repo_root: &Path, explain: bool) -> Result<()> {
                         line: rule_line,
                         rule_id: FOR_DURATION_RULE_ID,
                         message: msg,
+                        secret_pattern: None,
                     });
                 }
 
@@ -456,15 +494,19 @@ pub fn run(repo_root: &Path, explain: bool) -> Result<()> {
                         else {
                             continue;
                         };
-                        if let Some((kind, hit)) = check_hygiene(&text) {
+                        if let Some((kind, _hit)) = check_hygiene(&text) {
+                            // _hit (raw matched bytes) is intentionally
+                            // discarded — Wave-2 @semantic-guard Q1 credential
+                            // -leak fix. `kind` is the redacted descriptor.
                             all_findings.push(Finding {
                                 file: rel_path.clone(),
                                 alert: alert_name.clone(),
                                 line: rule_line,
                                 rule_id: ANNOTATION_HYGIENE_RULE_ID,
                                 message: format!(
-                                    "annotations.{field} contains suspected {kind}: {hit:?}"
+                                    "annotations.{field} contains suspected {kind} (redacted)"
                                 ),
+                                secret_pattern: Some(kind),
                             });
                         }
                     }

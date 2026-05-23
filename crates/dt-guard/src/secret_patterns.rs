@@ -13,6 +13,29 @@
 //! `secret-scan` is an intra-crate subcommand.
 //!
 //! Ported verbatim from `validate-alert-rules.sh` Python heredoc L85-103.
+//!
+//! ## Applicability slices
+//!
+//! HYGIENE patterns fall into two shape classes:
+//! * **Class V (value-shape)** — unambiguous secret bytes with zero
+//!   legitimate-source-code use (`AKIA...`, `sk-...`, `ghp_...`, `xox...`,
+//!   `eyJ...`). Safe to scan ANY surface (annotations, source code, YAML).
+//! * **Class C (context-shape)** — patterns that fire on legitimate source
+//!   when read out of context (`-prod-` hostnames, `.internal` DNS suffixes,
+//!   PEM markers in comments, Bearer-shaped doc placeholders). Safe ONLY
+//!   in the alert-annotation-text surface where any internal hostname leak
+//!   IS a finding.
+//!
+//! New catalog entries: classify the shape and add to
+//! [`HYGIENE_SOURCE_SCAN_SUBSET`] only if Class V. Per-consumer iterator
+//! helpers (e.g. [`source_scan_patterns`]) preserve the catalog-SoT
+//! discipline (ADR-0034 §6) while keeping source-code consumers
+//! FP-clean. The default for a Class-C pattern is alert-rules ONLY.
+//!
+//! Surfaced 2026-05-22 by @paired-client F-CLIENT-2 + @security co-sign
+//! after in-tree FP survey (Rust source contains internal hostnames in
+//! `gc-service::config`, key-id labels in `ac-service::crypto`, podman
+//! dev-host aliases in `devloop-helper::ports`).
 
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -90,6 +113,46 @@ pub static HYGIENE_PATTERNS: Lazy<Vec<(&'static str, Regex)>> = Lazy::new(|| {
         ),
     ]
 });
+
+/// Subset of [`HYGIENE_PATTERNS`] applicable to source-code scanning.
+///
+/// HYGIENE was authored for alert-rule annotation-text hygiene (Wave-1
+/// `alert_rules` consumer), where any internal hostname / Bearer header /
+/// PEM marker IS a finding. Source-code surfaces (Rust, TS, …)
+/// legitimately contain hostname literals (config defaults), Bearer-shaped
+/// placeholder values in docs, and PEM-format references in comments.
+/// Applying the full catalog FPs.
+///
+/// Source-code consumers (`rust_secrets`, `ts_secrets`) consume this
+/// subset via [`source_scan_patterns`]; alert-rule annotation consumers
+/// continue to use the full [`HYGIENE_PATTERNS`]. Single catalog, two
+/// applicability slices.
+///
+/// **In scope** — Class-V unambiguous value-shape secret bytes:
+/// * `AWS access key`, `OpenAI/Stripe-style key`, `GitHub PAT`,
+///   `Slack token`, `JWT`.
+///
+/// **Out of scope** — Class-C context-dependent shapes that FP on source:
+/// * `bearer token`, `authorization header`, `AWS secret marker`,
+///   `generic secret=value`, `PEM private key`, `internal DNS suffix`,
+///   `prod/stage hostname` (these stay in HYGIENE_PATTERNS for
+///   alert-rule consumers).
+pub const HYGIENE_SOURCE_SCAN_SUBSET: &[&str] = &[
+    "AWS access key",
+    "OpenAI/Stripe-style key",
+    "GitHub PAT",
+    "Slack token",
+    "JWT",
+];
+
+/// Iterator over [`HYGIENE_PATTERNS`] filtered to the source-code
+/// applicability subset. See [`HYGIENE_SOURCE_SCAN_SUBSET`] for the
+/// Class-V/Class-C framing.
+pub fn source_scan_patterns() -> impl Iterator<Item = &'static (&'static str, Regex)> {
+    HYGIENE_PATTERNS
+        .iter()
+        .filter(|(name, _)| HYGIENE_SOURCE_SCAN_SUBSET.contains(name))
+}
 
 /// IPv4 detection regex. Used in conjunction with [`IPV4_ALLOWLIST`] to
 /// flag real-looking IPv4 addresses in annotation text while permitting

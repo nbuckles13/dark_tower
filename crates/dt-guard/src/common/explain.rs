@@ -67,6 +67,79 @@ pub struct Finding<'a> {
     pub src_line: u32,
 }
 
+/// Redacted variant of [`Finding`] for credential-leak-sensitive callers.
+///
+/// **Wave-2 @semantic-guard Q1 blocking-finding helper.** Group (b) callers
+/// (secret/PII scanners) emit findings whose matched bytes ARE the secret
+/// — echoing those to stdout via [`print_finding`] (which carries
+/// `matched="<span>"`) would defeat the credential-leak axis. This helper
+/// emits `pattern=<pattern_name>` instead, where `pattern_name` is a redacted
+/// descriptor (e.g. `"AWS access key"`, `"bearer token"`, `"jwt_literal"`).
+///
+/// **No `matched=` field** — choice is structural. Distinct call site means
+/// reviewers reading group-(b) code see the redaction guarantee at a glance.
+///
+/// Wave-1 non-secret callers (cite-extract, alert-rules `runbook_url` /
+/// `severity` / `for_duration`, dashboard-panels, metric-labels naming,
+/// application/infrastructure-metrics, grafana-datasources) keep using
+/// [`Finding`] / [`print_finding`] — their matched spans are file paths /
+/// metric names / table cells, not secrets.
+///
+/// `pattern_name` source:
+/// * For `HYGIENE_PATTERNS` catalog hits: the tuple key (`"bearer token"`,
+///   `"AWS access key"`, `"JWT"`, `"internal DNS suffix"`, etc.).
+/// * For PII identifier hits: the matched CATEGORY_A/B token (e.g. `"email"`).
+/// * For bespoke checks: a caller-supplied static `&str` rule label
+///   (`"api_key_prefix"`, `"jwt_literal"`, `"conn_string_credentials"`, etc.).
+///
+/// `extras` carries policy-specific HINTS (e.g. `lazy_reason=test`) that are
+/// safe to echo. Caller is responsible for not stuffing secret bytes into
+/// `extras` values — the helper escapes `"`/`\n`/`\r` but does not redact.
+#[derive(Debug, Clone, Copy)]
+pub struct SecretFinding<'a> {
+    pub file: &'a str,
+    pub row: usize,
+    pub col: usize,
+    pub policy: &'a str,
+    pub pattern_name: &'a str,
+    pub extras: &'a [(&'a str, &'a str)],
+    pub src_file: &'a str,
+    pub src_line: u32,
+}
+
+/// Print one redacted `EXPLAIN:` line for a credential-leak-sensitive finding.
+///
+/// Wire format:
+/// ```text
+/// EXPLAIN: <file>:<row>:<col> policy=<policy> pattern=<pattern_name> [<key>=<value>]* src=<src_file>:<src_line>
+/// ```
+///
+/// NO `matched=` field. See [`SecretFinding`] for rationale.
+pub fn print_secret_finding(f: &SecretFinding<'_>) {
+    let row_1 = f.row.max(1);
+    let col_1 = f.col.max(1);
+    let pattern_esc = escape_field_value(f.pattern_name);
+
+    let mut line = String::with_capacity(96 + f.pattern_name.len());
+    let _ = write!(
+        line,
+        "EXPLAIN: {file}:{row_1}:{col_1} policy={policy} pattern={pattern_esc}",
+        file = f.file,
+        policy = f.policy,
+    );
+    for (k, v) in f.extras {
+        let v_esc = escape_field_value(v);
+        let _ = write!(line, " {k}={v_esc}");
+    }
+    let _ = write!(
+        line,
+        " src={src_file}:{src_line}",
+        src_file = f.src_file,
+        src_line = f.src_line
+    );
+    println!("{line}");
+}
+
 /// Print one `EXPLAIN:` line to stdout.
 ///
 /// Wire format (single source of truth):
@@ -195,6 +268,23 @@ mod tests {
         let out = bound_and_escape(&s, MATCHED_SPAN_BOUND);
         assert!(out.ends_with('…'));
         // Should not panic; clamp_char_boundary kept us on a boundary.
+    }
+
+    #[test]
+    fn secret_finding_struct_has_no_matched_field() {
+        // Structural assertion via construction — `SecretFinding` lacks a
+        // `matched` field by design. If a future contributor adds one, this
+        // construction fails to compile and surfaces the regression.
+        let _ = SecretFinding {
+            file: "x.rs",
+            row: 1,
+            col: 1,
+            policy: "rust-no-hardcoded-secrets::api_key",
+            pattern_name: "AWS access key",
+            extras: &[],
+            src_file: "src/rust_secrets.rs",
+            src_line: 42,
+        };
     }
 
     #[test]
