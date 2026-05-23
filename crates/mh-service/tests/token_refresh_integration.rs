@@ -59,4 +59,34 @@ fn failed_refresh_emits_token_refresh_metrics_end_to_end() {
     snap.counter("mh_token_refresh_total")
         .with_labels(&[("status", "error")])
         .assert_delta(1);
+    snap.counter("mh_token_refresh_failures_total")
+        .with_labels(&[("error_type", "http")])
+        .assert_delta(1);
+}
+
+/// Matrix over the bounded `error_category` set defined by
+/// `common::token_manager::error_category` (private mapper at
+/// `crates/common/src/token_manager.rs:155-164`). Mirrors MC's
+/// `token_refresh_integration.rs` precedent so the failure-counter is
+/// component-tier-covered for every category that emits at runtime.
+#[test]
+fn failed_refresh_emits_failure_counter_for_every_error_category() {
+    for error_category in [
+        "http",
+        "auth_rejected",
+        "invalid_response",
+        "acquisition_failed",
+        "configuration",
+        "channel_closed",
+    ] {
+        let snap = MetricAssertion::snapshot();
+        record_token_refresh_metrics(&TokenRefreshEvent {
+            success: false,
+            duration: Duration::from_millis(5),
+            error_category: Some(error_category),
+        });
+        snap.counter("mh_token_refresh_failures_total")
+            .with_labels(&[("error_type", error_category)])
+            .assert_delta(1);
+    }
 }

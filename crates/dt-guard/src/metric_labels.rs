@@ -17,6 +17,7 @@
 use crate::common::path_safety::to_repo_relative;
 use crate::common::scan::warn_skip;
 use crate::common::status::emit_ok;
+use crate::common::test_code_filter::is_scan_exempt;
 use crate::ignore::is_lazy_reason;
 use crate::metric_macros::MacroKind;
 use anyhow::{Context, Result};
@@ -29,77 +30,14 @@ use walkdir::WalkDir;
 const CRATES_SUBDIR: &str = "crates";
 const MAX_LITERAL_VALUE_LENGTH: usize = 64;
 
-// --- PII Category A (secrets, non-bypassable) — Python L96-120 verbatim ---
-const PII_TOKENS_CATEGORY_A: &[&str] = &[
-    "password",
-    "passwd",
-    "api_key",
-    "apikey",
-    "secret",
-    // Bare `token` per Lead ruling 2026-04-17.
-    "token",
-    "bearer_token",
-    "access_token",
-    "refresh_token",
-    "session_token",
-    "id_token",
-    "private_key",
-    "privkey",
-    "signing_key",
-    "jwt",
-    "auth_header",
-    "authorization",
-];
-
-// CATEGORY_A_ALLOWLIST per Python L128-135 — additions require security sign-off.
-const CATEGORY_A_ALLOWLIST: &[&str] = &["token_type"];
-
-// --- PII Category B (user-PII, hashed-suffix exempt) — Python L139-171 ---
-const PII_TOKENS_CATEGORY_B: &[&str] = &[
-    "email",
-    "phone",
-    "phone_number",
-    "display_name",
-    "user_id",
-    "name",
-    "username",
-    "nickname",
-    "handle",
-    "address",
-    "postal_code",
-    "zip",
-    "zipcode",
-    "ip",
-    "ip_addr",
-    "ipv4",
-    "ipv6",
-    "device_id",
-    "user_agent",
-    "fingerprint",
-    "ssn",
-    "dob",
-    "passport",
-    "driver_license",
-    "credit_card",
-    "card_number",
-    "cvv",
-    "latitude",
-    "longitude",
-    "geolocation",
-    "geoip",
-];
-
-const PII_PREFIX_DENYLIST: &[&str] = &["raw_"];
-
-const HASHED_SUFFIXES: &[&str] = &["_hash", "_hashed", "_id_hash", "_sha256", "_digest"];
-
-const LABEL_ALLOWLIST: &[&str] = &[
-    "hostname",
-    "filename",
-    "pathname",
-    "typename",
-    "nameservice",
-];
+// PII / secret-identifier vocabularies are sourced from the canonical home at
+// crate::common::pii_vocabulary (Wave-2 promotion per @security F1 +
+// @observability Q1 + @code-reviewer item 2). Wave-2 widening adds 4 CATEGORY_A
+// + 5 CATEGORY_B tokens; this module's behavior strictly broadens vs. Wave-1.
+use crate::common::pii_vocabulary::{
+    CATEGORY_A_ALLOWLIST, HASHED_SUFFIXES, LABEL_ALLOWLIST, PII_PREFIX_DENYLIST,
+    PII_TOKENS_CATEGORY_A, PII_TOKENS_CATEGORY_B,
+};
 
 pub const LABEL_SECRET_RULE_ID: &str = "label_secret";
 pub const LABEL_PII_RULE_ID: &str = "label_pii";
@@ -811,6 +749,12 @@ fn find_metric_files(repo_root: &Path) -> Vec<PathBuf> {
                 continue;
             }
             if primary_set.contains(path) {
+                continue;
+            }
+            // Guard-internal + test paths are exempt — guards' literal pattern
+            // catalogs and macro-shaped test fixtures self-match otherwise.
+            let rel = to_repo_relative(repo_root, path);
+            if is_scan_exempt(Path::new(&rel)) {
                 continue;
             }
             let src = match std::fs::read_to_string(path) {

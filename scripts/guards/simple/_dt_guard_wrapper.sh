@@ -25,12 +25,21 @@
 #     script's exit code = the dt-guard binary's exit code; no extra shell
 #     frame on the failure path).
 #
-# NOTE on extra positional args: `scripts/guards/run-guards.sh` invokes
-# every guard with `"$SEARCH_PATH"` as `$1`. dt-guard subcommands take
-# `--root` (not a positional), so wrapper-side `"$@"` would forward the
-# search path as a clap-unrecognized positional and trip exit 2. This
-# helper deliberately discards extra wrapper args — the previous inline
-# wrappers had the same behavior (they ignored `$@` entirely).
+# NOTE on extra args (Wave-2 amend per @paired-client F4):
+#
+# `scripts/guards/run-guards.sh` invokes every guard with `"$SEARCH_PATH"` as
+# `$1`. The wrapper SHIFTs the subcommand name off `$@` (line below), so any
+# remaining args that the consumer wrapper supplies are forwarded to the
+# binary AFTER `--root "$REPO_ROOT"`. This supports per-wrapper extra clap
+# flags (e.g. `ts/exports-map-closed.sh` builds `extra_args+=(--strict)`
+# from `STRICT_EXPORTS_MAP=1`).
+#
+# Wave-1 consumer wrappers do not pass extra args — `"$@"` is empty after the
+# shift — so the forwarding is behavior-preserving for them. The `run-guards.sh`
+# positional SEARCH_PATH is still discarded because consumer wrappers do not
+# forward it (they source this helper without `"$@"` themselves; the helper
+# sees only the subcommand-name arg + whatever extras the wrapper explicitly
+# appended).
 #
 # Non-executable on purpose: `scripts/guards/run-guards.sh` gates execution
 # on `[[ -x "$guard" ]]`, so leaving the chmod bit off prevents the runner
@@ -46,11 +55,20 @@ fi
 _dt_guard_subcommand="$1"
 shift
 
-# BASH_SOURCE[1] is the calling wrapper script; we resolve REPO_ROOT relative
-# to that, NOT to this helper. Both helper + wrapper live in the same dir
-# (`scripts/guards/simple/`), so the path math is identical either way.
+# BASH_SOURCE[1] is the calling wrapper script. Resolve REPO_ROOT by walking
+# upward from the wrapper's directory until we find `.git` — this lets the
+# same prelude serve wrappers at `scripts/guards/simple/*.sh` (Wave 1) AND
+# `scripts/guards/simple/ts/*.sh` (Wave 2 group (a)) without baking a
+# fixed-depth `../../..` into the helper.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[1]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+REPO_ROOT="$SCRIPT_DIR"
+while [[ "$REPO_ROOT" != "/" && ! -e "$REPO_ROOT/.git" ]]; do
+    REPO_ROOT="$(dirname "$REPO_ROOT")"
+done
+if [[ ! -e "$REPO_ROOT/.git" ]]; then
+    echo "STATUS=FAIL REASON=dt-guard-wrapper-repo-root-not-found"
+    exit 1
+fi
 DT_GUARD="${DT_GUARD:-$REPO_ROOT/target/release/dt-guard}"
 
 [[ -x "$DT_GUARD" ]] || {
@@ -58,4 +76,4 @@ DT_GUARD="${DT_GUARD:-$REPO_ROOT/target/release/dt-guard}"
     exit 1
 }
 
-exec "$DT_GUARD" "$_dt_guard_subcommand" --root "$REPO_ROOT"
+exec "$DT_GUARD" "$_dt_guard_subcommand" --root "$REPO_ROOT" "$@"

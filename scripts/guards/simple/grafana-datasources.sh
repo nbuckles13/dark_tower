@@ -4,4 +4,4 @@
 # (`grafana cli --dry-run`) is Wave 4 per ADR §8.
 # Full policy logic lives in `crates/dt-guard/src/grafana_datasources.rs`.
 # shellcheck source=./_dt_guard_wrapper.sh
-source "$(dirname "${BASH_SOURCE[0]}")/_dt_guard_wrapper.sh" grafana-datasources "$@"
+source "$(dirname "${BASH_SOURCE[0]}")/_dt_guard_wrapper.sh" grafana-datasources
