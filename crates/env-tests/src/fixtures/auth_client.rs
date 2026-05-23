@@ -221,6 +221,7 @@ fn build_org_host_header(base_url: &str, subdomain: &str) -> String {
 ///
 /// Sent to AC's `POST /api/v1/auth/register` endpoint.
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct UserRegistrationRequest {
     pub email: String,
     pub password: String,
@@ -244,13 +245,22 @@ impl UserRegistrationRequest {
 ///
 /// Returned by AC's `POST /api/v1/auth/register` endpoint.
 /// Contains an auto-login user JWT in `access_token`.
+///
+/// Mirror of `crates/ac-service/src/handlers/auth_handler.rs:UserRegistrationResponse`;
+/// uses the same mixed scheme — camelCase for DT-internal fields, per-field
+/// snake_case overrides on the three OAuth RFC 6749 fields.
 #[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct UserRegistrationResponse {
     pub user_id: Uuid,
     pub email: String,
     pub display_name: String,
+    // OAuth RFC 6749 standard field names — preserved snake_case for client compatibility.
+    #[serde(rename = "access_token")]
     pub access_token: String,
+    #[serde(rename = "token_type")]
     pub token_type: String,
+    #[serde(rename = "expires_in")]
     pub expires_in: u64,
 }
 

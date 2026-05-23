@@ -795,7 +795,7 @@ curl -i http://localhost:8080/ready
 # HTTP/1.1 200 OK
 # Content-Type: application/json
 #
-# {"status":"ready","database":"healthy","jwks":"available"}
+# {"status":"ready","database":"healthy","acJwks":"available"}
 
 # Kill port-forward
 kill %1
@@ -805,7 +805,7 @@ kill %1
 - HTTP 200 status
 - JSON body with `status: "ready"`
 - `database: "healthy"`
-- `jwks: "available"`
+- `acJwks: "available"`
 - Response time: <500ms
 
 ### Test 3: Metrics Endpoint
@@ -856,7 +856,7 @@ curl -i http://localhost:8080/api/v1/me \
 # HTTP/1.1 200 OK
 # Content-Type: application/json
 #
-# {"service_id":"test-client-id","service_type":"...","scopes":[...]}
+# {"sub":"test-client-id","scopes":[...],"serviceType":"..."}
 
 # Kill port-forward
 kill %1
@@ -895,9 +895,9 @@ echo "HTTP Status: $HTTP_CODE"
 echo "Response: $BODY"
 
 # Step 3: Verify response structure
-MEETING_ID=$(echo "$BODY" | jq -r '.meeting_id')
-MC_ID=$(echo "$BODY" | jq -r '.mc_assignment.mc_id')
-MC_URL=$(echo "$BODY" | jq -r '.mc_assignment.mc_url')
+MEETING_ID=$(echo "$BODY" | jq -r '.meetingId')
+MC_ID=$(echo "$BODY" | jq -r '.mcAssignment.mcId')
+MC_URL=$(echo "$BODY" | jq -r '.mcAssignment.mcUrl')
 JOIN_TOKEN=$(echo "$BODY" | jq -r '.token')
 
 echo "Meeting ID: $MEETING_ID"
@@ -929,8 +929,8 @@ kill %1
 
 **Success criteria:**
 - HTTP 200 status for valid meeting code with valid token
-- Response contains `meeting_id` (non-empty UUID)
-- Response contains `mc_assignment` with `mc_id` and `mc_url` (assigned MC is healthy/active)
+- Response contains `meetingId` (non-empty UUID)
+- Response contains `mcAssignment` with `mcId` and `mcUrl` (assigned MC is healthy/active)
 - Response contains `token` (join token for MC WebTransport session)
 - HTTP 404 for invalid meeting code
 - HTTP 401 for missing/invalid token
@@ -948,7 +948,7 @@ kubectl port-forward -n dark-tower deployment/gc-service 8080:8080 &
 # Step 1: Obtain a user JWT via AC register endpoint
 USER_TOKEN=$(curl -s -X POST http://ac-service.dark-tower.svc.cluster.local:8082/api/v1/auth/register \
   -H "Content-Type: application/json" \
-  -d '{"email":"smoke-test@example.com","password":"SmokeTest123!","display_name":"Smoke Test"}' \
+  -d '{"email":"smoke-test@example.com","password":"SmokeTest123!","displayName":"Smoke Test"}' \
   | jq -r '.access_token')
 
 # If user already exists, login instead
@@ -963,7 +963,7 @@ fi
 RESPONSE=$(curl -s -w "\n%{http_code}" -X POST http://localhost:8080/api/v1/meetings \
   -H "Authorization: Bearer $USER_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"display_name":"Smoke Test Meeting"}')
+  -d '{"displayName":"Smoke Test Meeting"}')
 
 HTTP_CODE=$(echo "$RESPONSE" | tail -1)
 BODY=$(echo "$RESPONSE" | sed '$d')
@@ -972,8 +972,8 @@ echo "HTTP Status: $HTTP_CODE"
 echo "Response: $BODY"
 
 # Step 3: Verify response
-MEETING_ID=$(echo "$BODY" | jq -r '.meeting_id')
-MEETING_CODE=$(echo "$BODY" | jq -r '.meeting_code')
+MEETING_ID=$(echo "$BODY" | jq -r '.meetingId')
+MEETING_CODE=$(echo "$BODY" | jq -r '.meetingCode')
 
 echo "Meeting ID: $MEETING_ID"
 echo "Meeting Code: $MEETING_CODE"
@@ -985,11 +985,11 @@ else
   echo "FAIL: Meeting code format invalid: $MEETING_CODE"
 fi
 
-# Step 5: Verify response does NOT leak sensitive fields
-if echo "$BODY" | jq -e '.join_token_secret' > /dev/null 2>&1; then
-  echo "FAIL: Response contains join_token_secret — sensitive data leak"
+# Step 5: Verify response does NOT leak sensitive fields (neither snake_case nor camelCase form)
+if echo "$BODY" | jq -e '.join_token_secret, .joinTokenSecret | select(. != null)' > /dev/null 2>&1; then
+  echo "FAIL: Response contains joinTokenSecret/join_token_secret — sensitive data leak"
 else
-  echo "PASS: Response does not contain join_token_secret"
+  echo "PASS: Response does not contain joinTokenSecret/join_token_secret"
 fi
 
 # Kill port-forward
@@ -998,8 +998,8 @@ kill %1
 
 **Success criteria:**
 - HTTP 201 status
-- Response body contains `meeting_id` (non-empty UUID)
-- Response body contains `meeting_code` (12 alphanumeric characters)
+- Response body contains `meetingId` (non-empty UUID)
+- Response body contains `meetingCode` (12 alphanumeric characters)
 - Response includes secure defaults (e.g., meeting status)
 - Response does NOT contain `join_token_secret` or other sensitive fields
 - Response time: <500ms

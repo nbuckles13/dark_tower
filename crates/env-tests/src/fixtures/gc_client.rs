@@ -66,6 +66,7 @@ pub enum GcClientError {
 
 /// Request body for guest token endpoint.
 #[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GuestTokenRequest {
     /// Display name for the guest.
     pub display_name: String,
@@ -88,6 +89,7 @@ impl std::fmt::Debug for GuestTokenRequest {
 /// Contains the assigned meeting controller's endpoints for the client
 /// to connect to via WebTransport or gRPC fallback.
 #[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct McAssignment {
     /// Assigned meeting controller ID.
     pub mc_id: String,
@@ -113,6 +115,7 @@ impl std::fmt::Debug for McAssignment {
 
 /// Response from meeting join or guest token endpoints.
 #[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct JoinMeetingResponse {
     /// The issued meeting token (JWT).
     pub token: String,
@@ -145,6 +148,7 @@ impl std::fmt::Debug for JoinMeetingResponse {
 
 /// Response from `/api/v1/me` endpoint.
 #[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct MeResponse {
     /// Subject (user or client ID).
     pub sub: String,
@@ -177,6 +181,7 @@ impl std::fmt::Debug for MeResponse {
 
 /// Request body for updating meeting settings.
 #[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct UpdateMeetingSettingsRequest {
     /// Allow anonymous guests to join.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -211,6 +216,7 @@ impl UpdateMeetingSettingsRequest {
 
 /// Response from meeting settings endpoint.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct MeetingResponse {
     /// Meeting UUID.
     pub meeting_id: Uuid,
@@ -242,6 +248,7 @@ pub struct MeetingResponse {
 /// Sent to `POST /api/v1/meetings` by authenticated users.
 /// All fields except `display_name` are optional; GC applies secure defaults.
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CreateMeetingRequest {
     /// Meeting display name (required, 1-255 bytes after trimming).
     pub display_name: String,
@@ -298,6 +305,7 @@ impl CreateMeetingRequest {
 /// Returned by `POST /api/v1/meetings` with status 201 Created.
 /// Excludes `join_token_secret` and other internal fields.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CreateMeetingResponse {
     /// Unique meeting identifier.
     pub meeting_id: Uuid,
@@ -605,8 +613,8 @@ mod tests {
         };
 
         let json = serde_json::to_string(&request).unwrap();
-        assert!(json.contains("\"display_name\":\"Test Guest\""));
-        assert!(json.contains("\"captcha_token\":\"captcha123\""));
+        assert!(json.contains("\"displayName\":\"Test Guest\""));
+        assert!(json.contains("\"captchaToken\":\"captcha123\""));
     }
 
     #[test]
@@ -614,10 +622,10 @@ mod tests {
         let request = UpdateMeetingSettingsRequest::with_allow_guests(true);
 
         let json = serde_json::to_string(&request).unwrap();
-        assert!(json.contains("\"allow_guests\":true"));
+        assert!(json.contains("\"allowGuests\":true"));
         // Other fields should be omitted
-        assert!(!json.contains("allow_external"));
-        assert!(!json.contains("waiting_room"));
+        assert!(!json.contains("allowExternal"));
+        assert!(!json.contains("waitingRoom"));
     }
 
     #[test]
@@ -625,20 +633,20 @@ mod tests {
         let request = UpdateMeetingSettingsRequest::with_waiting_room(false);
 
         let json = serde_json::to_string(&request).unwrap();
-        assert!(json.contains("\"waiting_room_enabled\":false"));
+        assert!(json.contains("\"waitingRoomEnabled\":false"));
     }
 
     #[test]
     fn test_join_meeting_response_deserialization() {
         let json = r#"{
             "token": "eyJ...",
-            "expires_in": 900,
-            "meeting_id": "00000000-0000-0000-0000-000000000001",
-            "meeting_name": "Test Meeting",
-            "mc_assignment": {
-                "mc_id": "mc-001",
-                "webtransport_endpoint": "https://mc.example.com:443",
-                "grpc_endpoint": "https://mc.example.com:50051"
+            "expiresIn": 900,
+            "meetingId": "00000000-0000-0000-0000-000000000001",
+            "meetingName": "Test Meeting",
+            "mcAssignment": {
+                "mcId": "mc-001",
+                "webtransportEndpoint": "https://mc.example.com:443",
+                "grpcEndpoint": "https://mc.example.com:50051"
             }
         }"#;
 
@@ -661,12 +669,12 @@ mod tests {
     fn test_join_meeting_response_deserialization_no_webtransport() {
         let json = r#"{
             "token": "eyJ...",
-            "expires_in": 900,
-            "meeting_id": "00000000-0000-0000-0000-000000000001",
-            "meeting_name": "Test Meeting",
-            "mc_assignment": {
-                "mc_id": "mc-002",
-                "grpc_endpoint": "https://mc.example.com:50051"
+            "expiresIn": 900,
+            "meetingId": "00000000-0000-0000-0000-000000000001",
+            "meetingName": "Test Meeting",
+            "mcAssignment": {
+                "mcId": "mc-002",
+                "grpcEndpoint": "https://mc.example.com:50051"
             }
         }"#;
 
@@ -682,9 +690,9 @@ mod tests {
     #[test]
     fn test_mc_assignment_deserialization() {
         let json = r#"{
-            "mc_id": "mc-test-001",
-            "webtransport_endpoint": "https://mc:443",
-            "grpc_endpoint": "https://mc:50051"
+            "mcId": "mc-test-001",
+            "webtransportEndpoint": "https://mc:443",
+            "grpcEndpoint": "https://mc:50051"
         }"#;
 
         let assignment: McAssignment = serde_json::from_str(json).unwrap();
@@ -701,7 +709,7 @@ mod tests {
         let json = r#"{
             "sub": "user123",
             "scopes": ["read", "write"],
-            "service_type": "global-controller",
+            "serviceType": "global-controller",
             "exp": 1234567890,
             "iat": 1234567800
         }"#;
@@ -728,14 +736,14 @@ mod tests {
     #[test]
     fn test_meeting_response_deserialization() {
         let json = r#"{
-            "meeting_id": "00000000-0000-0000-0000-000000000001",
-            "org_id": "00000000-0000-0000-0000-000000000002",
-            "display_name": "Team Standup",
-            "meeting_code": "abc-def-ghi",
+            "meetingId": "00000000-0000-0000-0000-000000000001",
+            "orgId": "00000000-0000-0000-0000-000000000002",
+            "displayName": "Team Standup",
+            "meetingCode": "abc-def-ghi",
             "status": "scheduled",
-            "allow_guests": true,
-            "allow_external_participants": false,
-            "waiting_room_enabled": true
+            "allowGuests": true,
+            "allowExternalParticipants": false,
+            "waitingRoomEnabled": true
         }"#;
 
         let response: MeetingResponse = serde_json::from_str(json).unwrap();
@@ -932,15 +940,15 @@ mod tests {
         let request = CreateMeetingRequest::new("Team Standup");
 
         let json = serde_json::to_string(&request).unwrap();
-        assert!(json.contains("\"display_name\":\"Team Standup\""));
+        assert!(json.contains("\"displayName\":\"Team Standup\""));
         // Optional fields should be omitted
-        assert!(!json.contains("max_participants"));
-        assert!(!json.contains("enable_e2e_encryption"));
-        assert!(!json.contains("require_auth"));
-        assert!(!json.contains("recording_enabled"));
-        assert!(!json.contains("allow_guests"));
-        assert!(!json.contains("allow_external_participants"));
-        assert!(!json.contains("waiting_room_enabled"));
+        assert!(!json.contains("maxParticipants"));
+        assert!(!json.contains("enableE2eEncryption"));
+        assert!(!json.contains("requireAuth"));
+        assert!(!json.contains("recordingEnabled"));
+        assert!(!json.contains("allowGuests"));
+        assert!(!json.contains("allowExternalParticipants"));
+        assert!(!json.contains("waitingRoomEnabled"));
     }
 
     #[test]
@@ -957,27 +965,27 @@ mod tests {
         };
 
         let json = serde_json::to_string(&request).unwrap();
-        assert!(json.contains("\"display_name\":\"All Hands\""));
-        assert!(json.contains("\"max_participants\":50"));
-        assert!(json.contains("\"enable_e2e_encryption\":true"));
-        assert!(json.contains("\"allow_guests\":false"));
+        assert!(json.contains("\"displayName\":\"All Hands\""));
+        assert!(json.contains("\"maxParticipants\":50"));
+        assert!(json.contains("\"enableE2eEncryption\":true"));
+        assert!(json.contains("\"allowGuests\":false"));
     }
 
     #[test]
     fn test_create_meeting_response_deserialization() {
         let json = r#"{
-            "meeting_id": "00000000-0000-0000-0000-000000000001",
-            "meeting_code": "ABC123def456",
-            "display_name": "Test Meeting",
+            "meetingId": "00000000-0000-0000-0000-000000000001",
+            "meetingCode": "ABC123def456",
+            "displayName": "Test Meeting",
             "status": "scheduled",
-            "max_participants": 100,
-            "enable_e2e_encryption": true,
-            "require_auth": true,
-            "recording_enabled": false,
-            "allow_guests": false,
-            "allow_external_participants": false,
-            "waiting_room_enabled": true,
-            "created_at": "2026-02-28T12:00:00Z"
+            "maxParticipants": 100,
+            "enableE2eEncryption": true,
+            "requireAuth": true,
+            "recordingEnabled": false,
+            "allowGuests": false,
+            "allowExternalParticipants": false,
+            "waitingRoomEnabled": true,
+            "createdAt": "2026-02-28T12:00:00Z"
         }"#;
 
         let response: CreateMeetingResponse = serde_json::from_str(json).unwrap();
@@ -1001,19 +1009,23 @@ mod tests {
     fn test_create_meeting_response_excludes_join_token_secret() {
         // Verify that CreateMeetingResponse does not have a join_token_secret field.
         // The GC service intentionally excludes this from the response.
+        // Note: the substring check is against the Rust struct Debug format,
+        // not the wire JSON. Rust field-name spelling stays snake_case even
+        // after the camelCase wire migration, so the guard string stays
+        // snake_case to match what Debug would render if such a field existed.
         let json = r#"{
-            "meeting_id": "00000000-0000-0000-0000-000000000001",
-            "meeting_code": "ABC123def456",
-            "display_name": "Test",
+            "meetingId": "00000000-0000-0000-0000-000000000001",
+            "meetingCode": "ABC123def456",
+            "displayName": "Test",
             "status": "scheduled",
-            "max_participants": 100,
-            "enable_e2e_encryption": true,
-            "require_auth": true,
-            "recording_enabled": false,
-            "allow_guests": false,
-            "allow_external_participants": false,
-            "waiting_room_enabled": true,
-            "created_at": "2026-02-28T12:00:00Z"
+            "maxParticipants": 100,
+            "enableE2eEncryption": true,
+            "requireAuth": true,
+            "recordingEnabled": false,
+            "allowGuests": false,
+            "allowExternalParticipants": false,
+            "waitingRoomEnabled": true,
+            "createdAt": "2026-02-28T12:00:00Z"
         }"#;
 
         let response: CreateMeetingResponse = serde_json::from_str(json).unwrap();

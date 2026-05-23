@@ -121,7 +121,7 @@ mod tests {
         let json = serde_json::to_string(&ready).unwrap();
         assert!(json.contains("\"status\":\"ready\""));
         assert!(json.contains("\"database\":\"healthy\""));
-        assert!(json.contains("\"ac_jwks\":\"available\""));
+        assert!(json.contains("\"acJwks\":\"available\""));
         // Error field should be omitted (skip_serializing_if)
         assert!(!json.contains("\"error\""));
 

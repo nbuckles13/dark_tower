@@ -61,6 +61,7 @@ struct ErrorResponse {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct ErrorDetail {
     code: String,
     message: String,
@@ -276,8 +277,8 @@ mod tests {
             body_json["error"]["message"],
             "An internal database error occurred"
         );
-        assert!(body_json["error"]["required_scope"].is_null());
-        assert!(body_json["error"]["provided_scopes"].is_null());
+        assert!(body_json["error"]["requiredScope"].is_null());
+        assert!(body_json["error"]["providedScopes"].is_null());
     }
 
     #[tokio::test]
@@ -290,8 +291,8 @@ mod tests {
         let body_json = read_body_json(response.into_body()).await;
         assert_eq!(body_json["error"]["code"], "CRYPTO_ERROR");
         assert_eq!(body_json["error"]["message"], "An internal error occurred");
-        assert!(body_json["error"]["required_scope"].is_null());
-        assert!(body_json["error"]["provided_scopes"].is_null());
+        assert!(body_json["error"]["requiredScope"].is_null());
+        assert!(body_json["error"]["providedScopes"].is_null());
     }
 
     #[tokio::test]
@@ -334,9 +335,9 @@ mod tests {
         let body_json = read_body_json(response.into_body()).await;
         assert_eq!(body_json["error"]["code"], "INSUFFICIENT_SCOPE");
         assert_eq!(body_json["error"]["message"], "Requires scope: admin");
-        assert_eq!(body_json["error"]["required_scope"], "admin");
+        assert_eq!(body_json["error"]["requiredScope"], "admin");
         assert_eq!(
-            body_json["error"]["provided_scopes"],
+            body_json["error"]["providedScopes"],
             serde_json::json!(["read", "write"])
         );
     }

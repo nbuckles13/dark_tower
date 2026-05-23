@@ -12,6 +12,7 @@ use tracing::instrument;
 
 /// Response for `/v1/me` endpoint.
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct MeResponse {
     /// Subject (user or client ID).
     pub sub: String,
@@ -43,7 +44,7 @@ pub struct MeResponse {
 /// {
 ///   "sub": "client_abc123",
 ///   "scopes": ["read", "write"],
-///   "service_type": "global-controller",
+///   "serviceType": "global-controller",
 ///   "exp": 1234567890,
 ///   "iat": 1234567800
 /// }
@@ -90,7 +91,7 @@ mod tests {
 
         assert!(json.contains("\"sub\":\"user123\""));
         assert!(json.contains("\"scopes\":[\"read\",\"write\"]"));
-        assert!(json.contains("\"service_type\":\"global-controller\""));
+        assert!(json.contains("\"serviceType\":\"global-controller\""));
         assert!(json.contains("\"exp\":1234567890"));
         assert!(json.contains("\"iat\":1234567800"));
     }
@@ -108,8 +109,8 @@ mod tests {
         let json = serde_json::to_string(&response).unwrap();
 
         assert!(
-            !json.contains("service_type"),
-            "service_type should be omitted when None"
+            !json.contains("serviceType"),
+            "serviceType should be omitted when None"
         );
     }
 }

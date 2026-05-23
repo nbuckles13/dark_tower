@@ -221,7 +221,7 @@ async fn test_create_meeting_unauthenticated_rejected() {
 
     let gc_client = GcClient::new(&cluster.gc_base_url);
 
-    let body = r#"{"display_name":"Should Not Work"}"#;
+    let body = r#"{"displayName":"Should Not Work"}"#;
 
     let result = gc_client
         .raw_create_meeting(None, body)
@@ -260,7 +260,7 @@ async fn test_create_meeting_rejects_service_token() {
         .expect("Should issue service token");
 
     // Try to create meeting with service token
-    let body = r#"{"display_name":"Service Token Meeting"}"#;
+    let body = r#"{"displayName":"Service Token Meeting"}"#;
     let result = gc_client
         .raw_create_meeting(Some(&token_response.access_token), body)
         .await
@@ -316,16 +316,16 @@ async fn test_create_meeting_invalid_body_rejected() {
         "Missing display_name should return 400"
     );
 
-    // Test 3: Empty display_name (whitespace only)
+    // Test 3: Empty displayName (whitespace only)
     let result = gc_client
-        .raw_create_meeting(Some(&user_token), r#"{"display_name":"   "}"#)
+        .raw_create_meeting(Some(&user_token), r#"{"displayName":"   "}"#)
         .await
         .expect("Network request should succeed");
 
     assert_eq!(
         result.status().as_u16(),
         400,
-        "Whitespace-only display_name should return 400"
+        "Whitespace-only displayName should return 400"
     );
 }
 

@@ -27,6 +27,7 @@ use uuid::Uuid;
 /// Uses email for identification (not username) per ADR-0020.
 /// The password field uses `SecretString` for security.
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct UserTokenRequest {
     pub email: String,
     pub password: SecretString,
@@ -34,6 +35,7 @@ pub struct UserTokenRequest {
 
 /// User registration request (ADR-0020).
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct UserRegistrationRequest {
     pub email: String,
     pub password: SecretString,
@@ -42,12 +44,17 @@ pub struct UserRegistrationRequest {
 
 /// User registration response (ADR-0020).
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct UserRegistrationResponse {
     pub user_id: Uuid,
     pub email: String,
     pub display_name: String,
+    // OAuth RFC 6749 standard field names — preserved snake_case for client compatibility.
+    #[serde(rename = "access_token")]
     pub access_token: String,
+    #[serde(rename = "token_type")]
     pub token_type: String,
+    #[serde(rename = "expires_in")]
     pub expires_in: u64,
 }
 
@@ -631,6 +638,131 @@ mod tests {
         let req: UserTokenRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.email, "testuser@example.com");
         assert_eq!(req.password.expose_secret(), "testpass");
+    }
+
+    /// Test UserRegistrationRequest accepts camelCase wire keys and rejects snake_case
+    /// for the renamed `display_name`/`displayName` field.
+    ///
+    /// Locks the camelCase wire migration (R-53, task #23) and the wire-break
+    /// behaviour: clients MUST send `displayName`; the legacy `display_name`
+    /// form is no longer accepted.
+    #[test]
+    fn test_user_registration_request_deserialization() {
+        // camelCase form succeeds and populates all fields.
+        let camel = r#"{
+            "email": "alice@example.com",
+            "password": "hunter2hunter2",
+            "displayName": "Alice"
+        }"#;
+        let req: UserRegistrationRequest =
+            serde_json::from_str(camel).expect("camelCase form should deserialize");
+        assert_eq!(req.email, "alice@example.com");
+        assert_eq!(req.password.expose_secret(), "hunter2hunter2");
+        assert_eq!(req.display_name, "Alice");
+
+        // snake_case form fails to populate display_name (wire-break check).
+        // With #[serde(rename_all = "camelCase")] the field is named `displayName`
+        // on the wire, so a body with `display_name` deserializes to a struct
+        // missing that field — serde returns an error.
+        let snake = r#"{
+            "email": "alice@example.com",
+            "password": "hunter2hunter2",
+            "display_name": "Alice"
+        }"#;
+        let res: Result<UserRegistrationRequest, _> = serde_json::from_str(snake);
+        assert!(
+            res.is_err(),
+            "snake_case display_name must no longer be accepted at the wire"
+        );
+    }
+
+    /// Test UserRegistrationResponse mixed-scheme serialization (camelCase + OAuth overrides).
+    ///
+    /// Locks the OAuth RFC 6749 disposition documented in
+    /// docs/devloop-outputs/2026-05-23-camelcase-wire-migration/main.md:
+    /// `user_id`/`display_name` flip to camelCase; the three OAuth-standard
+    /// fields (`access_token`, `token_type`, `expires_in`) stay snake_case via
+    /// per-field `#[serde(rename = "...")]` overrides.
+    #[test]
+    fn test_user_registration_response_serialization() {
+        let placeholder_jwt = "FAKE_ACCESS_TOKEN_FOR_TEST".to_string();
+        let response = UserRegistrationResponse {
+            user_id: Uuid::nil(),
+            email: "alice@example.com".to_string(),
+            display_name: "Alice".to_string(),
+            access_token: placeholder_jwt,
+            token_type: "Bearer".to_string(),
+            expires_in: 3600,
+        };
+
+        let json = serde_json::to_string(&response).expect("should serialize");
+
+        // camelCase: DT-internal fields flipped.
+        assert!(json.contains("\"userId\":"), "userId camelCase flip");
+        assert!(
+            json.contains("\"displayName\":\"Alice\""),
+            "displayName camelCase flip"
+        );
+
+        // snake_case OAuth fields preserved via per-field rename overrides.
+        assert!(
+            json.contains("\"access_token\":\"FAKE_ACCESS_TOKEN_FOR_TEST\""),
+            "access_token must remain snake_case (RFC 6749)"
+        );
+        assert!(
+            json.contains("\"token_type\":\"Bearer\""),
+            "token_type must remain snake_case (RFC 6749)"
+        );
+        assert!(
+            json.contains("\"expires_in\":3600"),
+            "expires_in must remain snake_case (RFC 6749)"
+        );
+
+        // Negative: the snake_case forms of the DT-internal fields must be absent
+        // and the camelCase forms of the OAuth fields must be absent.
+        assert!(
+            !json.contains("\"user_id\":"),
+            "user_id snake_case must not appear on the wire"
+        );
+        assert!(
+            !json.contains("\"display_name\":"),
+            "display_name snake_case must not appear on the wire"
+        );
+        assert!(
+            !json.contains("\"accessToken\":"),
+            "accessToken camelCase form must not appear (OAuth preserved)"
+        );
+        assert!(
+            !json.contains("\"tokenType\":"),
+            "tokenType camelCase form must not appear (OAuth preserved)"
+        );
+        assert!(
+            !json.contains("\"expiresIn\":"),
+            "expiresIn camelCase form must not appear (OAuth preserved)"
+        );
+    }
+
+    /// Test ServiceTokenRequest is left unchanged as OAuth-shaped (snake_case wire keys).
+    ///
+    /// Per the OAuth RFC 6749 disposition: this DTO is a pure OAuth 2.0
+    /// client_credentials grant request. snake_case IS the spec; no derive added.
+    #[test]
+    fn test_service_token_request_unchanged_oauth_shape() {
+        let json = r#"{
+            "grant_type": "client_credentials",
+            "client_id": "svc-test",
+            "client_secret": "shh",
+            "scope": "service.write.mh"
+        }"#;
+        let req: ServiceTokenRequest = serde_json::from_str(json)
+            .expect("snake_case OAuth shape must continue to deserialize");
+        assert_eq!(req.grant_type, "client_credentials");
+        assert_eq!(req.client_id.as_deref(), Some("svc-test"));
+        assert_eq!(
+            req.client_secret.as_ref().map(|s| s.expose_secret()),
+            Some("shh")
+        );
+        assert_eq!(req.scope.as_deref(), Some("service.write.mh"));
     }
 
     /// Test UserTokenRequest Debug implementation doesn't leak password
