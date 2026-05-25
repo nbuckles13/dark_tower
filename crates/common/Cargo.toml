@@ -23,11 +23,21 @@ tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 bytes = { workspace = true }
+
+# Tonic for the OTel gRPC interceptor (`observability::otel_grpc`).
+tonic = { workspace = true }
+
+# OpenTelemetry SDK + OTLP-gRPC exporter + tracing bridge for `observability::otel`.
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+opentelemetry-otlp = { workspace = true }
+tracing-opentelemetry = { workspace = true }
 
 # Additional dependencies
 rand = "0.8"
@@ -53,3 +63,7 @@ jsonwebtoken = { workspace = true }
 # without needing the test-utils feature to be enabled for `cargo test -p common`).
 metrics = "0.24"
 metrics-util = { workspace = true }
+# Pull the `testing` feature on `opentelemetry_sdk` for `InMemorySpanExporter`
+# and the `TraceId::from_u128` / `SpanId::from_u64` test-only constructors
+# used by `observability::otel::tests` and `observability::otel_grpc::tests`.
+opentelemetry_sdk = { workspace = true, features = ["rt-tokio", "trace", "testing"] }
