@@ -5,6 +5,11 @@
 # if so, runs `git merge --ff-only`. Otherwise cherry-picks the commits
 # the devloop added on top of its (potentially older) base.
 #
+# Uses `git cherry` (patch-id comparison) to filter the cherry-pick queue,
+# skipping commits whose content is already on the target branch. This is
+# the common case when the clone's base chain was rebased into target under
+# different SHAs (e.g., after a `--rebase` merge of a parent PR).
+#
 # Conflict resolution relies on `.gitattributes` `merge=union` for
 # `docs/user-stories/*.md` and `docs/TODO.md` (the two most common conflict
 # sources). For anything else, the script aborts cleanly and surfaces the
@@ -92,16 +97,38 @@ if [[ "$HEAD_SHA" == "$TIP_SHA" ]]; then
     exit 0
 fi
 
-# Commits to bring in (in chronological order, oldest first)
-mapfile -t COMMITS < <(git log --reverse --format=%H "${MERGE_BASE}..${TMP_REF}")
+# Filter via patch-id: drop commits whose content is already on target.
+# `git cherry <upstream> <head>` walks <upstream>..<head> and prints
+#   `+ <sha>` for commits whose patch-id is NOT on <upstream>
+#   `- <sha>` for commits whose patch-id IS already on <upstream>
+# (newest-first; reverse for chronological cherry-pick order)
+NEW_NEWEST_FIRST=()
+SKIPPED=()
+while IFS=' ' read -r flag sha; do
+    case "$flag" in
+        +) NEW_NEWEST_FIRST+=("$sha") ;;
+        -) SKIPPED+=("$sha") ;;
+    esac
+done < <(git cherry HEAD "$TMP_REF")
+
+COMMITS=()
+for ((i=${#NEW_NEWEST_FIRST[@]}-1; i>=0; i--)); do
+    COMMITS+=("${NEW_NEWEST_FIRST[i]}")
+done
+
 COMMIT_COUNT=${#COMMITS[@]}
+SKIPPED_COUNT=${#SKIPPED[@]}
 
 if [[ "$COMMIT_COUNT" -eq 0 ]]; then
-    say "No new commits to absorb."
+    if [[ "$SKIPPED_COUNT" -gt 0 ]]; then
+        say "All $SKIPPED_COUNT commit(s) from $SOURCE_BRANCH already on $TARGET_BRANCH (patch-id match). Nothing to absorb."
+    else
+        say "No new commits to absorb."
+    fi
     exit 0
 fi
 
-if [[ "$MERGE_BASE" == "$HEAD_SHA" ]]; then
+if [[ "$MERGE_BASE" == "$HEAD_SHA" && "$SKIPPED_COUNT" -eq 0 ]]; then
     STRATEGY="fast-forward"
 else
     STRATEGY="cherry-pick"
@@ -109,8 +136,22 @@ fi
 
 say "Plan: $STRATEGY $COMMIT_COUNT commit(s) into $TARGET_BRANCH"
 echo
-git log --oneline --reverse "${MERGE_BASE}..${TMP_REF}" | sed 's/^/    /'
+for sha in "${COMMITS[@]}"; do
+    git log -1 --oneline "$sha" | sed 's/^/    /'
+done
 echo
+
+if [[ "$SKIPPED_COUNT" -gt 0 ]]; then
+    say "Skipping $SKIPPED_COUNT commit(s) already on $TARGET_BRANCH (patch-id match):"
+    SHOW=5
+    for sha in "${SKIPPED[@]:0:$SHOW}"; do
+        git log -1 --oneline "$sha" | sed 's/^/    - /'
+    done
+    if [[ "$SKIPPED_COUNT" -gt "$SHOW" ]]; then
+        echo "    ... and $((SKIPPED_COUNT - SHOW)) more"
+    fi
+    echo
+fi
 
 if $DRY_RUN; then
     say "Dry run — no changes applied."
