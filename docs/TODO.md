@@ -347,6 +347,55 @@
 - ~~APPROVED-CROSS-BOUNDARY classification-failure fixture suite~~ — dropped. Simplified Layer B guard's narrow rules are reviewer-verifiable during authoring; no separate fixture suite needed.
 - ~~Scope/claim/session-field rename guard~~ — deferred indefinitely. Compiler + reviewers cover most cases; residual risk (non-Rust string renames) is narrow.
 
+## Suppressed Advisories (mirror of audit-suppressions.toml)
+
+Source of truth is `audit-suppressions.toml` (repo root); this is a human-readable mirror
+(task #47). Suppression is ONLY ever added there via a reviewed PR (ADR-0033 §11) — never
+via CLI flags, hand-edited derived files, or Dependabot alert dismissals. See
+`docs/contributor/audit-suppressions.md`.
+
+| id | ecosystem | expires | ticket | summary |
+|----|-----------|---------|--------|---------|
+| RUSTSEC-2023-0071 | rust | 2026-09-01 | this section | rsa 0.9.10 Marvin timing side-channel; build-time-only via sqlx-macros (no mysql feature, no runtime `rsa::*`) — verify with `cargo tree -p rsa --invert`; fail-closed if a runtime consumer ever appears; no upstream fix. Full rationale in the manifest `#`-comment + Cluster C above. |
+
+The always-run `scripts/audit-suppressions-check.sh` (Layer-3 guard) hard-fails any entry past
+`expires`; the weekly `audit-scheduled.yml` scan catches new advisories against unchanged deps.
+
+### Suppression-machinery spin-out TODOs (deferred from task #47)
+
+- [ ] **`*.test.sh` glob-runner (Validation-Pipeline / Code Quality)** — there is NO automatic
+  runner for the shell `*.test.sh` meta-tests; they run ONLY when a layer invokes them explicitly.
+  Currently orphaned (run by hand, not wired into any layer/CI): `scripts/lang/_common.test.sh`,
+  `_dispatch.test.sh`, `_get_base_ref.test.sh`, `_get_base_ref.behavior-equivalence.test.sh`,
+  `_layer_skeleton.test.sh`, `rust/changed.test.sh`, `ts/changed.test.sh` (proto's runs via the
+  Layer-3 predicate meta-test; `rust/behavior-equivalence.test.sh` runs only via `scripts/test.sh`'s
+  doc-path). Task #47 explicitly wired `audit-suppressions-check.test.sh` into `layer3.sh` so it is
+  NOT orphaned, but a general `find -name '*.test.sh'` glob-runner is the proper fix — separate
+  infra scope (must decide hermeticity / budget / STATUS emission for the whole class). The #47
+  layer3 wire-in stays regardless of whether this lands. Owner: infrastructure + test.
+
+- [ ] **Suppression expiry early-warning (EXPIRING_SOON nudge)** — DEFERRED from #47. Optional,
+  non-posture (the hard `expires` FAIL is the enforcement). Best built as a fast-follow once the §F
+  scheduled scan is established, so the nudge rides the scheduled job / a digest rather than per-PR
+  log noise (an EXPIRING_SOON line emitted only on ad-hoc pipeline runs misfires — the suppression
+  owner rarely sees it). If built: a distinct greppable `EXPIRING_SOON=<id>:<days_left>` line, NEVER
+  `STATUS=WARN` (§6 enum has no WARN member; the hard `expires` FAIL stays the only mechanical teeth).
+  Owner: observability + security. **Depends-on:** the §F drift-catcher (`audit-scheduled.yml`,
+  landed in #47).
+
+- [ ] **PATH-1 fail-safe e2e acceptance test (real pnpm tree)** — DEFERRED from #47, accepted by
+  @code-reviewer at Gate 2 (security concurred). The §D.1.2 PATH-1 invariant (malformed
+  `.pnpm-audit-ignore.json` ⇒ ts wrapper applies ZERO suppressions and the scan still RUNS, FAILing
+  on a real advisory rather than erroring-out-before-scanning = denial-of-coverage) is pinned at the
+  FUNCTION level in `scripts/audit-suppressions-check.test.sh` (gate-filter malformed→rc0/zero-ids/WARN
+  + valid + absent cases). The end-to-end variant — inject a known advisory into a real pnpm tree,
+  malform the ignore-file, assert `lang/ts/audit.sh` reaches its scan decision and FAILs on the
+  advisory — needs a real pnpm fixture + a known-advisory package, which is cross-tool fixture
+  infrastructure beyond #47's changeset. Function-level floor is sufficient to prevent silent
+  regression to fail-abort; the e2e adds proof the scan path itself runs under a malformed filter.
+  Owner: infrastructure + test (paired security on the invariant). **Depends-on:** a reusable
+  pnpm-advisory test fixture.
+
 ## Dependency Vulnerabilities (cargo audit)
 
 - [ ] **Re-surface from ADR-0033 Wave 1 #1 (2026-05-08)**: the new `scripts/lang/rust/audit.sh` always-run wrapper at Layer 6 hard-blocks on the same 6 advisories. Pipeline behaviour is per ADR-0033 §3 design (always-run audit gate); the work to upgrade the `wtransport` chain remains owned by security under §11. ADR-0033 §12 14-day MTTR tripwire applies on a per-advisory basis. No new advisories introduced; lockfile last touched in `d918343`.
@@ -401,10 +450,10 @@
     Operational substance preserved alongside the TOML block:
 
     - **Verification command of record**: `cargo tree -p rsa --invert` is the command for re-verifying the build-time-only invariant at each sunset/tripwire fire.
-    - **90-day sunset** (re-evaluate by **2026-08-08**): heavy active re-justification — re-run `cargo tree -p rsa --invert`, confirm runtime tree is still empty, re-affirm in-tree that the rationale still holds.
+    - **90-day sunset** (re-evaluate by **2026-09-01** — re-anchored to the manifest-landing date when task #47 created `audit-suppressions.toml`; the original 2026-08-08 figure was computed from the 2026-05-08 authoring date, before the manifest existed, and is now stale): heavy active re-justification — re-run `cargo tree -p rsa --invert`, confirm runtime tree is still empty, re-affirm in-tree that the rationale still holds. The mechanical teeth are the manifest `expires = "2026-09-01"`, enforced by the always-run `scripts/audit-suppressions-check.sh`.
     - **Fail-closed condition** (also encoded in the TOML rationale): if any runtime driver starts pulling `rsa::*`, the ignore expires immediately — no extension, no grace period.
     - **ADR-0033 §12 14-day MTTR tripwire continues to apply** per security's explicit decision; no special-casing. **Tripwire vs sunset** distinction: tripwire = light periodic re-verification of "still build-time-only, still no fix" (cargo tree + advisory-db check); sunset = heavy active re-justification (full rationale review). Both fire, both add value, they do not conflict.
-    - Cluster C is **expected to be the longest-lived entry** in `audit-config.toml`. The TOML rationale block anchors that expectation so the 2026-08-08 re-justification reads as routine active maintenance, not process failure.
+    - Cluster C is **expected to be the longest-lived entry** in `audit-suppressions.toml`. The rationale block anchors that expectation so the 2026-09-01 re-justification reads as routine active maintenance, not process failure.
 
 - [ ] **Devloop II — Cluster A (separate, multi-day)** (depends on `2026-05-08-pnpm-audit-ts-lang` landing first; can run parallel with Devloop I but does not depend on it). Workspace `wtransport = "0.1"` → `"0.7"` major-version bump; updates `Identity::self_signed`, `Identity::load_pemfiles`, accept-loop signatures, dangerous-configuration cert pinning across `crates/mc-service/`, `crates/mh-service/`, `crates/env-tests/`, and `crates/common/src/webtransport/**` (Guarded Shared Area per ADR-0024 §6.4). Specialist: `infrastructure --paired-with=meeting-controller --paired-with=media-handler --paired-with=security`; add `--paired-with=protocol` if the framed-envelope handshake is touched. Closes 5 of 9 rows: RUSTSEC-2026-0037, -2025-0009, -2025-0010, and both RUSTSEC-2025-0134 entries.
 

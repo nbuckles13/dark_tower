@@ -1,0 +1,10 @@
+# GENERATED from audit-suppressions.toml — DO NOT EDIT.
+# Regenerate: scripts/audit-suppressions-check.sh --fix
+# Suppression is sourced ONLY from the manifest (ADR-0033 §11).
+#
+# Per-id rationale (mirrored from audit-suppressions.toml):
+#   RUSTSEC-2023-0071: rsa 0.9.10 Marvin timing side-channel; build-time-only via sqlx-macros (no mysql feature, no runtime rsa::*) — verify with `cargo tree -p rsa --invert`; fail-closed if a runtime consumer ever appears; no upstream fix. Full rationale in comment above + docs/TODO.md Cluster C.
+#     expires 2026-09-01 — verify build-time-only via `cargo tree -p rsa --invert`; fail-closed if a runtime consumer appears.
+
+[advisories]
+ignore = ["RUSTSEC-2023-0071"]

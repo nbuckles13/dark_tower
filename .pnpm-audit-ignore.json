@@ -1,0 +1,4 @@
+{
+  "_generated": "from audit-suppressions.toml — DO NOT EDIT; run scripts/audit-suppressions-check.sh --fix",
+  "ignore": []
+}

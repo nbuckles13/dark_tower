@@ -287,9 +287,12 @@ The stage-2 dispatch runs unconditionally even on stage-1 fail — observability
 
 ### 6.3 Layer 3 — Guards (always-run; `scripts/layer3.sh`)
 
-Two `run_and_emit` invocations:
-- `scripts/guards/run-guards.sh` — iterates every `scripts/guards/simple/**/*.sh` (excluding `fixtures/`). Each guard self-classifies per-file via path globs. Includes the Layer A scope-drift parser and Layer B classification-sanity guards (ADR-0024 cross-boundary).
+Three `run_and_emit` invocations:
+- `scripts/guards/run-guards.sh` — iterates every `scripts/guards/simple/**/*.sh` (excluding `fixtures/`). Each guard self-classifies per-file via path globs. Includes the Layer A scope-drift parser and Layer B classification-sanity guards (ADR-0024 cross-boundary), AND the always-run **audit-suppressions** guard (`scripts/guards/simple/audit-suppressions.sh` → `scripts/audit-suppressions-check.sh`, read-only) per task #47.
 - `scripts/lang/_test_changed_predicates.sh` — meta-test for each lang's `changed.sh` predicate. Hermetic — synthesizes a cache under `mktemp`, invokes each lang's predicate against fixture rows under `env -i`.
+- `scripts/audit-suppressions-check.test.sh` — self-test for the suppressions-check (drives its FAIL branches with fixtures; wired here because there is no `*.test.sh` auto-runner). Task #47.
+
+Layer 3 also carries a **CI-sentinel-leak runtime assertion** (mirrored in `layer-all.sh`): if `GITHUB_ACTIONS` and `DEVLOOP_TEST` are both set, the layer hard-fails early — see `test-sentinel-set-in-ci` below.
 
 **Always-run**: yes — guards self-classify, predicate meta-test is hermetic. Layer 3 is one of the two layers (with Layer 6) inside the **90s p95 always-run wall-clock budget (ADR-0033 §4)** — a sustained `WARN BUDGET_TOTAL_BREACH` here is the operational signal to investigate.
 
@@ -297,6 +300,23 @@ Two `run_and_emit` invocations:
 |--------------|--------|-------------|
 | `guards-failed` | `scripts/guards/run-guards.sh` (via `run_and_emit`) | A specific guard tripped. The runner prints `FAILED: <guard-name>` + grep-extracted violation lines (`VIOLATION|violation|ERROR|error`). Jump to that guard's source under `scripts/guards/simple/`. |
 | `predicate-meta-test-failed` | `scripts/lang/_test_changed_predicates.sh` | A `lang/<X>/changed.sh` predicate disagrees with its fixture row. Output prints `[<lang>] path=… expected_rc=… actual_rc=… rationale: …  see: scripts/lang/<lang>/changed.sh`. Fix by correcting the predicate OR amending the fixture (with rationale). See §7 for drift-detection workflow. |
+| `suppression-past-due` | `scripts/audit-suppressions-check.sh` (Layer-3 guard) | A suppression in `audit-suppressions.toml` is past its `expires`. **This red is INTENTIONAL** — CI goes red on the expiry day by design, not an outage/flake. Output names each past-due id + its days-past. **Action is NOT bypass:** renew the `expires` after re-verifying the justification (e.g. `cargo tree -p rsa --invert` for RUSTSEC-2023-0071), OR fix the advisory. Renewal procedure: `docs/contributor/audit-suppressions.md`. (Red-on-expiry is the FIRST signal — no warn-ahead window — so renew proactively per the contributor-doc cadence.) |
+| `suppression-drift` | `scripts/audit-suppressions-check.sh` (sync-check) | The generated derived files (`.cargo/audit.toml` / `.pnpm-audit-ignore.json`) drifted from `audit-suppressions.toml` (hand-edited derived file, or a forgotten `--fix`). Fix: `scripts/audit-suppressions-check.sh --fix`, then commit BOTH the manifest and the regenerated derived files. |
+| `suppression-malformed` | `scripts/audit-suppressions-check.sh` (parser) | The manifest (or a derived file) is present but unparseable — missing required field, bad `expires`, duplicate id, etc. The `MALFORMED:` lines name the offending line/field. Fix the manifest; never degrade a malformed entry into "0 suppressions". |
+| `suppression-quality` | `scripts/audit-suppressions-check.sh` (quality-check) | An entry has an empty `reason`/`ticket`, a non-`YYYY-MM-DD` `expires`, or an `ecosystem` outside {rust, js}. Output names the offending id + field. |
+| `suppression-override-without-test-sentinel` | `scripts/audit-suppressions-check.sh` (trust-boundary guard) | A test-injection override env (`DEVLOOP_SUPPRESSIONS_MANIFEST` / `AUDIT_SUPPRESSIONS_NOW` / derived-path overrides) is set but `DEVLOOP_TEST` is not exactly `"1"`. **Tamper / misconfig signal** — a non-test environment set an override that would redirect the check. INVESTIGATE what set the env (CI step, reusable action); do NOT just unset-and-rerun. |
+| `test-sentinel-set-in-ci` | `scripts/layer-all.sh` / `scripts/layer3.sh` (CI-leak assertion) | `DEVLOOP_TEST` is set in a CI job (`GITHUB_ACTIONS=true`). The test sentinel must NEVER be set in CI — it would let the always-run check honor ambient override envs repo-wide. **Pipeline-integrity incident** — find what exported `DEVLOOP_TEST` (workflow step, reusable action) and remove it; do NOT unset-and-rerun blindly. |
+| `dependabot-ignore-present` | `scripts/audit-suppressions-check.sh` (SSOT-integrity check) | `.github/dependabot.yml` has a non-empty `ignore:` block — a shadow suppression surface that fragments the single source of truth. **Dependabot `ignore:` is not a suppression channel** — remove it; if an advisory genuinely needs suppressing, add it to `audit-suppressions.toml` (reviewed PR, ADR-0033 §11). Dependabot is for bump PRs only. |
+
+**Two distinct suppression-drift surfaces — on-call note.** Advisory problems surface in TWO places, and they live in different runbook sections:
+- **Per-PR expiry / hygiene** → Layer-3 `suppression-past-due` / `-drift` / `-malformed` / `-quality` red run (this section). Fires on every devloop + CI run.
+- **Scheduled-scan drift** (a NEW advisory against an UNCHANGED lockfile) → a red `Scheduled Audit` workflow run + an open `audit-drift` GitHub Issue (auto-closes when a later scheduled run is clean). See §6.6 (Layer 6 / scheduled scan). On-call should check the `audit-drift` issue, not just CI, for between-PR drift.
+
+**Suppression renewal exception (security-reviewed wording — ADR-0033 §11 ownership boundary).** The audit-config ownership reminder (§6.6 below) says operators should not modify suppressions during failure triage and should escalate to security. There is ONE sanctioned exception:
+
+> **Exception — suppression renewal on expiry:** when a Layer-3 `suppression-past-due` failure fires, editing `audit-suppressions.toml` to renew the `expires` date (then `scripts/audit-suppressions-check.sh --fix` to regenerate derived files) IS the sanctioned remediation — NOT the prohibited ad-hoc allowlist edit. The prohibition targets SILENT, incident-time suppression of a LIVE advisory via CLI flags or hand-edited derived files. Renewal flows through the tracked manifest, regenerates derived files deterministically, and lands as a reviewed commit. Security ownership (ADR-0033 §11) is preserved: the renewed `reason`/`expires` MUST go through normal PR review — security reviews the renewal justification (e.g. the re-run `cargo tree -p rsa --invert` build-time-only re-verification for RUSTSEC-2023-0071). An operator MUST NOT extend an `expires` date as part of live incident triage to make CI green; that remains prohibited and escalates to security.
+
+Load-bearing distinction: RENEWAL = reviewed manifest commit with re-verified justification (sanctioned); AD-HOC SILENCING = CLI flag / hand-edited derived file / unreviewed expires-bump-to-unblock-CI / Dependabot alert dismissal (prohibited, escalate).
 
 #### 6.3.1 `dt-guard` triage (ADR-0034 §10 Wave 3)
 
@@ -343,7 +363,7 @@ dt-guard also emits `WARN dt-guard auxiliary skip: <path> (<error-kind>)` to std
 | `buf-lint-failed` | `lang/proto/lint.sh` (`buf lint proto`) | Proto STANDARD-lint violation. Inspect output for the file + finding; `proto/buf.yaml` controls policy. |
 | `buf-binary-missing` | `lang/proto/lint.sh` | See §6.1. |
 
-### 6.6 Layer 6 — Audit (always-run; `scripts/layer6.sh`)
+### 6.6 Layer 6 — Audit (dep-change-gated as of task #47; `scripts/layer6.sh`)
 
 `scripts/audit.sh` is an **orchestrator** that combines two gates:
 1. `_dispatch.sh::for_each_lang_with_verb "audit"` with `DEVLOOP_DISPATCH_ALWAYS_RUN=1` → `lang/rust/audit.sh` (`cargo audit`) + `lang/ts/audit.sh` (`pnpm audit --audit-level=high`). Proto has no `audit.sh` — dispatcher emits `STATUS=SKIPPED-NO-VERB REASON=proto-audit-sh-missing-or-not-executable` (expected).
@@ -351,18 +371,20 @@ dt-guard also emits `WARN dt-guard auxiliary skip: <path> (<error-kind>)` to std
 
 The orchestrator returns the **worst of `(dispatch_rc, breaking_rc)`** — `set -e` short-circuit would mask the second invocation and silently break the always-run guarantee; the explicit RC capture block in `scripts/audit.sh` (no enclosing function; flat script) preserves both gates.
 
-**Always-run**: yes. Vulnerability advisories and wire-break detection both depend on external state that can change without a diff in the toolchain's footprint (ADR-0033 §3 classifying principle). Layer 6 is the second of the two layers (with Layer 3) inside the **90s p95 always-run wall-clock budget (ADR-0033 §4)** — `cargo audit` + `pnpm audit` + `buf breaking` collectively count toward that budget.
+**DEP-CHANGE-GATED as of task #47 (ADR-0033 §3 amendment).** `DEVLOOP_DISPATCH_ALWAYS_RUN=1` is RETAINED so the dispatcher still invokes each `audit.sh` wrapper unconditionally — but the wrapper now runs a fail-closed dep-manifest gate internally. When no dependency manifest changed, the wrapper emits `STATUS=SKIPPED-NO-DIFF REASON=no-dep-changes` (expected, non-dominating) instead of scanning. The wrapper runs the scan on any doubt (indeterminate diff). When the scan runs and suppressed advisories are filtered, the wrapper emits a `SUPPRESSED=<ids>` stderr line (the configured suppression set in effect this run). `buf breaking` remains always-run. The always-run audit GUARANTEE moved to the Layer-3 `audit-suppressions-check` guard (§6.3) + the **weekly scheduled full scan** (below).
+
+**Scheduled full scan (the drift-catcher).** `.github/workflows/audit-scheduled.yml` runs weekly, forcing the gate ON (`DEVLOOP_AUDIT_FORCE_RUN=1`, force-run-only — bypasses the GATE, not suppressions) so it scans the full FROZEN lockfile against newly-published advisories — the diff-less vector the per-PR gate intentionally skips. On unsuppressed drift it goes red AND opens-or-updates a single rolling **`audit-drift` GitHub Issue** (auto-closes on a later clean run). On-call: between-PR drift shows up as the `audit-drift` issue + a red `Scheduled Audit` run, NOT a per-PR red — see the two-surfaces note in §6.3.
 
 | REASON token | Wrapper | Cause / Fix |
 |--------------|---------|-------------|
-| `cargo-audit-failed` | `lang/rust/audit.sh` (`cargo audit`) | RUSTSEC advisory. **Triage decision**: fix-the-dep (preferred) vs ignore-via-config (security-owned). The audit-config file (`.cargo/audit.toml` when one is added) is the documented location for `[advisories.ignore]` entries; the policy is security-owned (ADR-0033 §11). Operators MUST NOT silence advisories ad-hoc via CLI flags — the wrapper deliberately blocks `--ignore=…` pass-through (see the `IMPORTANT (security finding 1)` comment block at the top of `lang/rust/audit.sh`). For a transitive-dep advisory we don't own, escalate to security. |
-| `pnpm-audit-failed` | `lang/ts/audit.sh` (`pnpm audit --audit-level=high`) | High-severity npm advisory. Same triage discipline — threshold and ignore-list edits are security-owned (ADR-0033 §11). Wrapper blocks `--audit-level=critical` and `--ignore=…` pass-through. |
+| `cargo-audit-failed` | `lang/rust/audit.sh` (`cargo audit`) | RUSTSEC advisory. **Triage decision**: fix-the-dep (preferred) vs suppress-in-manifest (security-owned). The ONLY sanctioned suppression channel is `audit-suppressions.toml` → generated `.cargo/audit.toml` (cargo-audit reads it natively); add an entry + `scripts/audit-suppressions-check.sh --fix` + reviewed PR per `docs/contributor/audit-suppressions.md`. Operators MUST NOT silence advisories ad-hoc via CLI flags, hand-edited `.cargo/audit.toml`, or Dependabot alert dismissals — the wrapper blocks `--ignore=…` pass-through (see the `IMPORTANT (security finding 1)` comment at the top of `lang/rust/audit.sh`). For a transitive-dep advisory we don't own, escalate to security. |
+| `pnpm-audit-failed` | `lang/ts/audit.sh` (`pnpm audit --audit-level=high` + post-hoc filter) | High-severity npm advisory not in the suppression list. Same triage discipline — suppression goes in `audit-suppressions.toml` → generated `.pnpm-audit-ignore.json` (the wrapper's post-hoc filter reads it), security-owned (ADR-0033 §11). Wrapper blocks `--audit-level=critical` and `--ignore=…` pass-through. A malformed `.pnpm-audit-ignore.json` makes the FILTER apply zero suppressions and proceed (fail-safe + stderr WARN — the scan still reds on real advisories); the Layer-3 check hard-fails the malformed file separately (`suppression-drift`). |
 | `buf-breaking-failed` | `lang/proto/breaking.sh` (`buf breaking … --against .git#ref=<base-sha>,subdir=proto`) | Wire-breaking change against the resolved base ref. For intentional wire-breaks, the override mechanism is deferred to ADR-0033 Wave 3 #10 (task #41) — no CLI bypass exists, by design. |
 | `base-ref-unresolved` | `lang/proto/breaking.sh` — the `base-ref-unresolved` emission (no enclosing function; flat script) | `_get_base_ref.sh` exited non-zero before reaching `buf breaking`. The wrapper distinguishes this from `buf-breaking-failed` so operators don't chase a wire-break issue when the actual problem is a degraded git state. Jump to §5. |
 | `buf-binary-missing` | `lang/proto/breaking.sh` | See §6.1. |
 | `proto-audit-sh-missing-or-not-executable` | `_dispatch.sh::for_each_lang_with_verb` | Expected — proto has no `audit.sh`; `breaking.sh` is the proto audit-class gate, wired separately in `scripts/audit.sh`. |
 
-**Audit-config ownership reminder**: audit-config changes (`.cargo/audit.toml`, audit-level thresholds, advisory exemptions) are **security-owned** per ADR-0033 §11. Operators should not modify allowlists or suppression flags as part of failure triage — escalate to security.
+**Audit-config ownership reminder**: audit-config changes (`audit-suppressions.toml`, the generated `.cargo/audit.toml` / `.pnpm-audit-ignore.json`, audit-level thresholds, advisory exemptions) are **security-owned** per ADR-0033 §11. Operators should not modify allowlists or suppression flags as part of failure triage — escalate to security. **EXCEPTION — suppression renewal on `suppression-past-due`:** editing `audit-suppressions.toml` to renew an `expires` date (then `--fix` + reviewed PR) IS the sanctioned remediation, NOT a prohibited ad-hoc edit — see the full security-reviewed exception note in §6.3. The prohibition targets silent incident-time silencing (CLI flags, hand-edited derived files, Dependabot alert dismissals, or an unreviewed expires-bump just to unblock CI).
 
 **Worked example — twin-rc collection**:
 
@@ -471,7 +493,15 @@ Grep-driven entry point. Match the symptom, jump to the section.
 | Layer 1 fails locally with `nx: command not found` | Local-only failure — CI has corepack/pnpm install in setup. | §6.1 (run `pnpm install`) |
 | Layer 4 fails with `Neither podman nor docker found` | Missing container runtime — `lang/rust/test.sh` bring-up. | §6.4 |
 | Layer 6 fails on every CI run, local clean | Likely CI base-ref shift (post-#42) — check `BASE_SOURCE=ci-pr` `BASE_REF=` is merge-base, not main tip. | §5 (CI-PR scope shift) |
-| Layer 6 `cargo-audit-failed` from a transitive dep | Triage: fix vs ignore-via-config (`.cargo/audit.toml`); audit-config is security-owned (ADR-0033 §11). | §6.6 |
+| Layer 6 `cargo-audit-failed` / `pnpm-audit-failed` from a transitive dep | Triage: fix vs suppress-in-`audit-suppressions.toml` (security-owned, ADR-0033 §11); never CLI flag / hand-edit / Dependabot dismissal. | §6.6 |
+| Layer 3 `suppression-past-due` | A suppression hit its `expires` — INTENTIONAL red. Renew (re-verify + `--fix` + reviewed PR) or fix the advisory. | §6.3 |
+| Layer 3 `suppression-drift` | Derived files (`.cargo/audit.toml` / `.pnpm-audit-ignore.json`) drifted from the manifest — run `scripts/audit-suppressions-check.sh --fix`. | §6.3 |
+| Layer 3 `suppression-malformed` | Manifest/derived file unparseable — fix the offending line named in the `MALFORMED:` output. | §6.3 |
+| Layer 3 `suppression-quality` | Empty reason/ticket, bad `expires`, or bad `ecosystem` in the manifest. | §6.3 |
+| Layer 3 `suppression-override-without-test-sentinel` | A test-injection override env set without `DEVLOOP_TEST=1` — tamper/misconfig; investigate, do NOT unset-and-rerun. | §6.3 |
+| `test-sentinel-set-in-ci` (layer-all / layer3) | `DEVLOOP_TEST` leaked into a CI job — pipeline-integrity incident; find + remove what exported it. | §6.3 |
+| Layer 3 `dependabot-ignore-present` | `.github/dependabot.yml` has a non-empty `ignore:` block — move suppressions to `audit-suppressions.toml`; Dependabot `ignore:` is not a suppression channel. | §6.3 |
+| Open `audit-drift` GitHub Issue / red `Scheduled Audit` run | Between-PR drift: a new advisory against an UNCHANGED lockfile, caught by the weekly scheduled scan. Triage like a Layer-6 advisory; the issue auto-closes when a later scheduled run is clean. | §6.6 |
 | Layer 6 `buf-breaking-failed` on an intentional wire-break | No override exists yet; deferred to ADR-0033 Wave 3 #10 (task #41). | §6.6 |
 | Layer 6 `base-ref-unresolved` | Degraded git state ahead of `buf breaking` — jump to resolver playbook. | §5 |
 | Layer N missing `BASE_REF=` line entirely | Wrapper bug — resolver did not run | escalate |

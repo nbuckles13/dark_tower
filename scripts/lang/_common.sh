@@ -106,6 +106,30 @@ parse_status_line() {
   grep '^STATUS=' "$1" 2>/dev/null | tail -n1 | sed -n 's/^STATUS=\([^ ]*\).*/\1/p'
 }
 
+# CI-SENTINEL-LEAK runtime assertion (task #47, §J/C — security trust boundary).
+# Single source of truth for the check, called from BOTH entry points that can run the
+# always-run path: layer-all.sh (full pipeline) and layer3.sh (standalone). Two call
+# sites are legitimate; the BODY must not be duplicated (a security control that could
+# silently diverge). If the condition ever broadens (another sentinel var, a different
+# CI detector), it changes here once.
+#
+# The audit-suppressions test seam reads override envs ONLY under DEVLOOP_TEST=1; the
+# production path trusts that CI never sets that sentinel. ENFORCE it: if DEVLOOP_TEST
+# leaks into the CI job env, the always-run check would honor ambient overrides
+# repo-wide and silently. Catch it at the pipeline boundary, before any layer runs.
+#
+# Args: (none — reads GITHUB_ACTIONS / DEVLOOP_TEST from env)
+# Outputs: on leak — STATUS line on stdout, CI-SENTINEL-LEAK explanation on stderr
+# Returns: does NOT return on leak (exits 1); returns 0 when no leak.
+assert_no_ci_sentinel_leak() {
+  if [[ -n "${GITHUB_ACTIONS:-}" && -n "${DEVLOOP_TEST:-}" ]]; then
+    printf 'STATUS=FAIL REASON=test-sentinel-set-in-ci\n'
+    printf 'CI-SENTINEL-LEAK: DEVLOOP_TEST is set (=%q) in a CI job. The test sentinel must NEVER be set in CI — it would let the always-run audit-suppressions check honor ambient override envs (manifest/date/derived-path) repo-wide. Find and remove whatever exported DEVLOOP_TEST (workflow step, reusable action); do NOT unset-and-rerun blindly. See docs/runbooks/devloop-validation.md §6.3.\n' "${DEVLOOP_TEST}" >&2
+    exit 1
+  fi
+  return 0
+}
+
 # -----------------------------------------------------------------------------
 # STATUS aggregation (test §D + code-reviewer locked)
 # -----------------------------------------------------------------------------

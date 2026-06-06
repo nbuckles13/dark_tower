@@ -35,6 +35,24 @@ assert_rc() {
   fi
 }
 
+# Increment PASS/FAIL on exact exit-code match (alias of assert_rc with clearer
+# naming for STATUS-emitting tools; same contract). Args: $1=label $2=expected $3=actual.
+assert_exit() { assert_rc "$@"; }
+
+# Increment PASS/FAIL on a substring match; record failure context with the haystack.
+# For asserting a STATUS=/REASON= line or a message fragment in captured output.
+# Args: $1=label  $2=needle (substring)  $3=haystack (captured stdout+stderr)
+# Returns: 0 always
+assert_status() {
+  local label="$1" needle="$2" haystack="$3"
+  if [[ "$haystack" == *"$needle"* ]]; then
+    PASS=$((PASS + 1))
+  else
+    FAIL=$((FAIL + 1))
+    FAILURES+=("[${label}] expected substring '${needle}' not found in output")
+  fi
+}
+
 # Run the calling lang's changed.sh against an injected synthetic
 # changed-files cache; return its exit code on stdout.
 #

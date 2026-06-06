@@ -23,6 +23,12 @@ __here="$(cd "$(dirname "$0")" && pwd)"
 source "${__here}/lang/_common.sh"
 init_devloop_tmp
 
+# CI-SENTINEL-LEAK runtime assertion (task #47, §J/C — security trust boundary).
+# Shared single-locus check in _common.sh; called here (full pipeline) and from
+# layer3.sh (standalone) — two legitimate entry points, one check body. Catches a
+# DEVLOOP_TEST sentinel leak at the pipeline boundary, before any layer runs.
+assert_no_ci_sentinel_leak
+
 # Precondition: base ref must be pack-resident (ci.yml fetch-depth: 0 — task #42).
 # Dispatch per mode mirrors _get_base_ref.sh's resolution branches.
 if [[ -n "${GITHUB_ACTIONS:-}" && "${GITHUB_EVENT_NAME:-}" == "pull_request" ]]; then

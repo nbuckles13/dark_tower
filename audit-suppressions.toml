@@ -1,0 +1,47 @@
+# audit-suppressions.toml — SINGLE SOURCE OF TRUTH for audit advisory suppressions.
+#
+# This is the ONLY sanctioned place to suppress a security advisory (ADR-0033 §11).
+# The derived files below are GENERATED from this manifest — DO NOT hand-edit them:
+#   .cargo/audit.toml          (cargo-audit native ignore list)
+#   .pnpm-audit-ignore.json    (post-hoc filter for `pnpm audit`)
+# Regenerate after editing: `scripts/audit-suppressions-check.sh --fix`, then commit
+# BOTH this manifest and the regenerated derived files.
+#
+# Suppression is NEVER done via ad-hoc CLI flags, hand-edited derived files, or
+# Dependabot / code-scanning alert dismissals — only via an entry here, landed in a
+# reviewed PR. See docs/contributor/audit-suppressions.md.
+#
+# Each entry: id, ecosystem (rust|js), reason (one line), expires (ISO YYYY-MM-DD),
+# ticket. The always-run suppressions-check hard-fails past `expires` (re-suppress
+# with a new date after re-verifying, or fix the advisory). Default duration: 90 days.
+# Policy ownership: security. Machinery: infrastructure.
+
+# RUSTSEC-2023-0071 — rsa 0.9.10 Marvin Attack (timing side-channel on RSA decryption).
+#
+# Exposure analysis (security, 2026-05-08; re-anchored to new manifest 2026-06-06):
+#   - Pulled transitively by sqlx-macros-core compile-time query-validation
+#     scaffolding, NOT by any runtime driver we select.
+#   - Workspace sqlx features = ["runtime-tokio","postgres","uuid","chrono",
+#     "migrate"]. No "mysql" feature; no runtime code path constructs rsa::*.
+#   - INVARIANT (verify command of record): `cargo tree -p rsa --invert`
+#     must show ONLY build-time consumers; no shipped binary links rsa runtime.
+#   - Marvin requires attacker-observable RSA decrypt timing on a server we
+#     operate. We don't ship rsa code, so there is no such surface.
+#
+# Upstream: no fix in rsa 0.9.x; constant-time RSA in Rust is an unsolved
+# upstream problem (rust-lang/rsa#19). Waiting for a fix is waiting indefinitely.
+# Expected to be the longest-lived entry here.
+#
+# FAIL-CLOSED: if `cargo tree -p rsa --invert` ever shows a runtime consumer,
+# this suppression is void immediately — remove it, fix, or re-justify with a
+# new exposure analysis. No grace period.
+#
+# Sunset: 90-day heavy re-justification at `expires` (2026-09-01) — re-run the
+# invert command, confirm the runtime tree is still empty, re-affirm in-tree.
+# ADR-0033 §12 14-day MTTR tripwire continues to apply independently.
+[[suppression]]
+id = "RUSTSEC-2023-0071"
+ecosystem = "rust"
+expires = "2026-09-01"
+ticket = "docs/TODO.md (see the 'Suppressed Advisories' + 'Dependency Vulnerabilities' sections)"
+reason = "rsa 0.9.10 Marvin timing side-channel; build-time-only via sqlx-macros (no mysql feature, no runtime rsa::*) — verify with `cargo tree -p rsa --invert`; fail-closed if a runtime consumer ever appears; no upstream fix. Full rationale in comment above + docs/TODO.md Cluster C."

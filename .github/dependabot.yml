@@ -1,0 +1,39 @@
+# Dependabot — version-update PRs for cargo + npm/pnpm (task #47, Lead "Both" ruling).
+#
+# Dependabot is for BUMP PRs ONLY. Do NOT add an `ignore:` block here to suppress a
+# security advisory, and do NOT dismiss Dependabot/code-scanning alerts in the GitHub
+# UI as a suppression mechanism. The ONLY sanctioned place to suppress an advisory is
+# audit-suppressions.toml, landed in a reviewed PR (ADR-0033 §11). A second suppression
+# surface here would fragment the single source of truth.
+# See docs/contributor/audit-suppressions.md.
+#
+# NOTE: committing this file enables Dependabot VERSION-updates. Dependabot
+# SECURITY-updates (auto-PR on a published advisory) require a repo Settings toggle a
+# maintainer must flip — that cannot be committed. See the contributor doc.
+#
+# (It is DESIRABLE for Dependabot to open a bump PR for a currently-suppressed dep like
+# rsa — that is remediation progress, not a conflict with the suppression.)
+
+version: 2
+updates:
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    groups:
+      cargo-minor-patch:
+        update-types:
+          - "minor"
+          - "patch"
+
+  - package-ecosystem: "npm"   # Dependabot's "npm" ecosystem handles pnpm lockfiles
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    groups:
+      npm-minor-patch:
+        update-types:
+          - "minor"
+          - "patch"
