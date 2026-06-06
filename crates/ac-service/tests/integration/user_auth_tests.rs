@@ -40,7 +40,7 @@ async fn test_register_happy_path(pool: PgPool) -> Result<(), anyhow::Error> {
         .json(&json!({
             "email": "alice@example.com",
             "password": "password123",
-            "display_name": "Alice"
+            "displayName": "Alice"
         }))
         .send()
         .await?;
@@ -54,15 +54,15 @@ async fn test_register_happy_path(pool: PgPool) -> Result<(), anyhow::Error> {
 
     let body: serde_json::Value = response.json().await?;
     assert!(
-        body.get("user_id").is_some(),
-        "Response should include user_id"
+        body.get("userId").is_some(),
+        "Response should include userId"
     );
     assert!(
         body.get("access_token").is_some(),
         "Response should include access_token"
     );
     assert_eq!(body["email"].as_str(), Some("alice@example.com"));
-    assert_eq!(body["display_name"].as_str(), Some("Alice"));
+    assert_eq!(body["displayName"].as_str(), Some("Alice"));
     assert_eq!(body["token_type"].as_str(), Some("Bearer"));
     assert!(body["expires_in"].as_u64().unwrap_or(0) > 0);
 
@@ -86,7 +86,7 @@ async fn test_register_token_has_user_claims(pool: PgPool) -> Result<(), anyhow:
         .json(&json!({
             "email": "bob@example.com",
             "password": "securepass123",
-            "display_name": "Bob"
+            "displayName": "Bob"
         }))
         .send()
         .await?;
@@ -141,7 +141,7 @@ async fn test_register_assigns_default_user_role(pool: PgPool) -> Result<(), any
         .json(&json!({
             "email": "charlie@example.com",
             "password": "password123",
-            "display_name": "Charlie"
+            "displayName": "Charlie"
         }))
         .send()
         .await?;
@@ -184,7 +184,7 @@ async fn test_register_invalid_email(pool: PgPool) -> Result<(), anyhow::Error> 
         .json(&json!({
             "email": "not-an-email",
             "password": "password123",
-            "display_name": "Invalid"
+            "displayName": "Invalid"
         }))
         .send()
         .await?;
@@ -214,7 +214,7 @@ async fn test_register_password_too_short(pool: PgPool) -> Result<(), anyhow::Er
         .json(&json!({
             "email": "short@example.com",
             "password": "1234567",  // 7 chars, need 8
-            "display_name": "Short Pass"
+            "displayName": "Short Pass"
         }))
         .send()
         .await?;
@@ -252,7 +252,7 @@ async fn test_register_empty_display_name(pool: PgPool) -> Result<(), anyhow::Er
         .json(&json!({
             "email": "empty@example.com",
             "password": "password123",
-            "display_name": ""
+            "displayName": ""
         }))
         .send()
         .await?;
@@ -290,7 +290,7 @@ async fn test_register_duplicate_email(pool: PgPool) -> Result<(), anyhow::Error
         .json(&json!({
             "email": "duplicate@example.com",
             "password": "password123",
-            "display_name": "First User"
+            "displayName": "First User"
         }))
         .send()
         .await?;
@@ -309,7 +309,7 @@ async fn test_register_duplicate_email(pool: PgPool) -> Result<(), anyhow::Error
         .json(&json!({
             "email": "duplicate@example.com",
             "password": "differentpass",
-            "display_name": "Second User"
+            "displayName": "Second User"
         }))
         .send()
         .await?;
@@ -348,7 +348,7 @@ async fn test_register_same_email_different_orgs(pool: PgPool) -> Result<(), any
         .json(&json!({
             "email": "shared@example.com",
             "password": "password123",
-            "display_name": "Org 1 User"
+            "displayName": "Org 1 User"
         }))
         .send()
         .await?;
@@ -368,7 +368,7 @@ async fn test_register_same_email_different_orgs(pool: PgPool) -> Result<(), any
         .json(&json!({
             "email": "shared@example.com",
             "password": "password456",
-            "display_name": "Org 2 User"
+            "displayName": "Org 2 User"
         }))
         .send()
         .await?;
@@ -385,8 +385,8 @@ async fn test_register_same_email_different_orgs(pool: PgPool) -> Result<(), any
     // So we just verify body2 has valid data
     let body2: serde_json::Value = response2.json().await?;
     assert!(
-        body2.get("user_id").is_some(),
-        "Second registration should have user_id"
+        body2.get("userId").is_some(),
+        "Second registration should have userId"
     );
 
     Ok(())
@@ -410,7 +410,7 @@ async fn test_register_invalid_subdomain(pool: PgPool) -> Result<(), anyhow::Err
         .json(&json!({
             "email": "test@example.com",
             "password": "password123",
-            "display_name": "Test"
+            "displayName": "Test"
         }))
         .send()
         .await?;
@@ -440,7 +440,7 @@ async fn test_register_unknown_org(pool: PgPool) -> Result<(), anyhow::Error> {
         .json(&json!({
             "email": "test@example.com",
             "password": "password123",
-            "display_name": "Test"
+            "displayName": "Test"
         }))
         .send()
         .await?;
@@ -480,7 +480,7 @@ async fn test_register_rate_limit(pool: PgPool) -> Result<(), anyhow::Error> {
             .json(&json!({
                 "email": format!("user{}@example.com", i),
                 "password": "password123",
-                "display_name": format!("User {}", i)
+                "displayName": format!("User {}", i)
             }))
             .send()
             .await?;

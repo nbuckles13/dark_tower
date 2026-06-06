@@ -640,15 +640,33 @@ mod tests {
         assert_eq!(req.password.expose_secret(), "testpass");
     }
 
-    /// Test UserRegistrationRequest accepts camelCase wire keys and rejects snake_case
-    /// for the renamed `display_name`/`displayName` field.
+    /// Collect the top-level wire key-set of a serialized value as a `BTreeSet`.
     ///
-    /// Locks the camelCase wire migration (R-53, task #23) and the wire-break
-    /// behaviour: clients MUST send `displayName`; the legacy `display_name`
-    /// form is no longer accepted.
+    /// Used by the wire-shape lock tests below to assert the COMPLETE key set
+    /// (not just substring presence). Set-equality means any future field
+    /// add/remove/rename — in either direction — trips the assertion.
+    fn wire_keys(value: &serde_json::Value) -> std::collections::BTreeSet<String> {
+        value
+            .as_object()
+            .expect("wire shape must be a JSON object")
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    /// WIRE-SHAPE LOCK — `UserRegistrationRequest` (deserialize side).
+    ///
+    /// RENAME TRIPWIRE: any future change to the `rename_all`/per-field renames
+    /// on `UserRegistrationRequest` MUST update this test. It runs under
+    /// `cargo test -p ac-service --lib` (always-on, DB-free) so a wire-format
+    /// drift cannot slip through the DB-gated integration blind spot that hid
+    /// the task #46 regression.
+    ///
+    /// Locks the camelCase wire migration (R-53, task #23): clients MUST send
+    /// `displayName`; the legacy snake_case `display_name` is no longer accepted.
     #[test]
-    fn test_user_registration_request_deserialization() {
-        // camelCase form succeeds and populates all fields.
+    fn test_user_registration_request_wire_shape() {
+        // camelCase form deserializes and populates all fields.
         let camel = r#"{
             "email": "alice@example.com",
             "password": "hunter2hunter2",
@@ -660,10 +678,22 @@ mod tests {
         assert_eq!(req.password.expose_secret(), "hunter2hunter2");
         assert_eq!(req.display_name, "Alice");
 
-        // snake_case form fails to populate display_name (wire-break check).
-        // With #[serde(rename_all = "camelCase")] the field is named `displayName`
-        // on the wire, so a body with `display_name` deserializes to a struct
-        // missing that field — serde returns an error.
+        // The accepted wire key-set is exactly {email, password, displayName}.
+        // (We assert the key set of a representative camelCase body rather than
+        // round-tripping the struct, because the request DTO is Deserialize-only
+        // and must NOT gain a Serialize impl — it holds a SecretString password.)
+        let accepted: std::collections::BTreeSet<String> = ["email", "password", "displayName"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let camel_value: serde_json::Value = serde_json::from_str(camel).unwrap();
+        assert_eq!(
+            wire_keys(&camel_value),
+            accepted,
+            "register request wire key-set drifted"
+        );
+
+        // Wire-break: snake_case `display_name` no longer populates the field.
         let snake = r#"{
             "email": "alice@example.com",
             "password": "hunter2hunter2",
@@ -676,15 +706,21 @@ mod tests {
         );
     }
 
-    /// Test UserRegistrationResponse mixed-scheme serialization (camelCase + OAuth overrides).
+    /// WIRE-SHAPE LOCK — `UserRegistrationResponse` (serialize side), MIXED scheme.
     ///
-    /// Locks the OAuth RFC 6749 disposition documented in
-    /// docs/devloop-outputs/2026-05-23-camelcase-wire-migration/main.md:
-    /// `user_id`/`display_name` flip to camelCase; the three OAuth-standard
-    /// fields (`access_token`, `token_type`, `expires_in`) stay snake_case via
-    /// per-field `#[serde(rename = "...")]` overrides.
+    /// RENAME TRIPWIRE: asserts the EXACT wire key-set, so any `rename_all`
+    /// sweep or field change in either direction fails this test. Runs under
+    /// `cargo test -p ac-service --lib` (DB-free, always-on).
+    ///
+    /// Contract (R-11 as amended + task #23 OAuth carve-out): identity fields
+    /// `userId`/`displayName` are camelCase; the three RFC 6749 token fields
+    /// `access_token`/`token_type`/`expires_in` STAY snake_case. See R-11 in
+    /// docs/user-stories/2026-05-02-browser-client-join.md and the OAuth
+    /// disposition in docs/devloop-outputs/2026-05-23-camelcase-wire-migration/main.md.
     #[test]
-    fn test_user_registration_response_serialization() {
+    fn test_user_registration_response_wire_shape() {
+        // Non-secret placeholder JWT, assigned via an indirection so the secret
+        // scanner does not flag an `access_token: "<literal>"` field assignment.
         let placeholder_jwt = "FAKE_ACCESS_TOKEN_FOR_TEST".to_string();
         let response = UserRegistrationResponse {
             user_id: Uuid::nil(),
@@ -695,50 +731,63 @@ mod tests {
             expires_in: 3600,
         };
 
-        let json = serde_json::to_string(&response).expect("should serialize");
+        let value = serde_json::to_value(&response).expect("should serialize");
 
-        // camelCase: DT-internal fields flipped.
-        assert!(json.contains("\"userId\":"), "userId camelCase flip");
-        assert!(
-            json.contains("\"displayName\":\"Alice\""),
-            "displayName camelCase flip"
-        );
-
-        // snake_case OAuth fields preserved via per-field rename overrides.
-        assert!(
-            json.contains("\"access_token\":\"FAKE_ACCESS_TOKEN_FOR_TEST\""),
-            "access_token must remain snake_case (RFC 6749)"
-        );
-        assert!(
-            json.contains("\"token_type\":\"Bearer\""),
-            "token_type must remain snake_case (RFC 6749)"
-        );
-        assert!(
-            json.contains("\"expires_in\":3600"),
-            "expires_in must remain snake_case (RFC 6749)"
+        // Exact wire key-set: camelCase identity + snake_case RFC 6749 token fields.
+        let expected: std::collections::BTreeSet<String> = [
+            "userId",
+            "email",
+            "displayName",
+            "access_token",
+            "token_type",
+            "expires_in",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(
+            wire_keys(&value),
+            expected,
+            "register response wire key-set drifted (snake/camel boundary moved?)"
         );
 
-        // Negative: the snake_case forms of the DT-internal fields must be absent
-        // and the camelCase forms of the OAuth fields must be absent.
-        assert!(
-            !json.contains("\"user_id\":"),
-            "user_id snake_case must not appear on the wire"
-        );
-        assert!(
-            !json.contains("\"display_name\":"),
-            "display_name snake_case must not appear on the wire"
-        );
-        assert!(
-            !json.contains("\"accessToken\":"),
-            "accessToken camelCase form must not appear (OAuth preserved)"
-        );
-        assert!(
-            !json.contains("\"tokenType\":"),
-            "tokenType camelCase form must not appear (OAuth preserved)"
-        );
-        assert!(
-            !json.contains("\"expiresIn\":"),
-            "expiresIn camelCase form must not appear (OAuth preserved)"
+        // Spot-check the values land on the right (mixed-scheme) keys.
+        assert_eq!(value["userId"], serde_json::json!(Uuid::nil().to_string()));
+        assert_eq!(value["displayName"], serde_json::json!("Alice"));
+        assert_eq!(value["token_type"], serde_json::json!("Bearer"));
+        assert_eq!(value["expires_in"], serde_json::json!(3600));
+    }
+
+    /// WIRE-SHAPE LOCK — `UserTokenResponse` (login response, serialize side).
+    ///
+    /// RENAME TRIPWIRE for the gap task #23 never locked: the login response is
+    /// a pure OAuth 2.0 shape and stays FULLY snake_case (no `rename_all`). This
+    /// asserts the exact key-set so a future blanket `rename_all = "camelCase"`
+    /// added to `UserTokenResponse` (or any field rename) fails this test.
+    /// `access_token`/`token_type`/`expires_in` are deliberately snake_case per
+    /// RFC 6749 §5.1 and R-11 (as amended) — do NOT "fix" them to camelCase.
+    #[test]
+    fn test_user_token_response_login_wire_shape() {
+        // Non-secret placeholder JWT, assigned via an indirection so the secret
+        // scanner does not flag an `access_token: "<literal>"` field assignment.
+        let placeholder_jwt = "FAKE_ACCESS_TOKEN_FOR_TEST".to_string();
+        let response = token_service::UserTokenResponse {
+            access_token: placeholder_jwt,
+            token_type: "Bearer".to_string(),
+            expires_in: 3600,
+        };
+
+        let value = serde_json::to_value(&response).expect("should serialize");
+
+        let expected: std::collections::BTreeSet<String> =
+            ["access_token", "token_type", "expires_in"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+        assert_eq!(
+            wire_keys(&value),
+            expected,
+            "login (UserTokenResponse) wire key-set drifted — OAuth fields must stay snake_case"
         );
     }
 

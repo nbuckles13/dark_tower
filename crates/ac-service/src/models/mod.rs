@@ -427,6 +427,47 @@ mod tests {
         assert!(json.contains("\"expires_in\":900"));
     }
 
+    /// WIRE-SHAPE LOCK — service-token `TokenResponse` (serialize side).
+    ///
+    /// RENAME TRIPWIRE: `TokenResponse` is the response of the genuine OAuth 2.0
+    /// token endpoint (`POST /api/v1/auth/service/token`, `client_credentials`).
+    /// Its fields are RFC 6749 §5.1 standard names and MUST stay snake_case —
+    /// this is the one endpoint where §5.1 is normatively load-bearing. A future
+    /// blanket `rename_all = "camelCase"` sweep that reached this struct would
+    /// break OAuth-conformant clients; asserting the exact key-set here makes that
+    /// a deliberate, test-tripping decision rather than a silent regression.
+    /// Do NOT camelCase these fields.
+    #[test]
+    fn test_service_token_response_wire_shape_stays_snake() {
+        // Non-secret placeholder JWT, assigned via an indirection so the secret
+        // scanner does not flag an `access_token: "<literal>"` field assignment.
+        let placeholder_jwt = "FAKE_ACCESS_TOKEN_FOR_TEST".to_string();
+        let response = TokenResponse {
+            access_token: placeholder_jwt,
+            token_type: "Bearer".to_string(),
+            expires_in: 7200,
+            scope: "service.write.mh service.read.gc".to_string(),
+        };
+
+        let value = serde_json::to_value(&response).expect("should serialize");
+        let keys: std::collections::BTreeSet<String> = value
+            .as_object()
+            .expect("wire shape must be a JSON object")
+            .keys()
+            .cloned()
+            .collect();
+
+        let expected: std::collections::BTreeSet<String> =
+            ["access_token", "token_type", "expires_in", "scope"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+        assert_eq!(
+            keys, expected,
+            "service-token TokenResponse wire key-set drifted — OAuth fields must stay snake_case (RFC 6749 §5.1)"
+        );
+    }
+
     #[test]
     fn test_meeting_token_request_full() {
         let json = r#"{
