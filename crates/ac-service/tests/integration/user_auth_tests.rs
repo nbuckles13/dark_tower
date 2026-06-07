@@ -19,7 +19,7 @@ use serde_json::json;
 use sqlx::PgPool;
 
 // ============================================================================
-// Registration Tests (11 tests)
+// Registration Tests (12 tests, incl. wire-shape golden lock)
 // ============================================================================
 
 /// Test that valid registration returns user_id and access_token.
@@ -65,6 +65,124 @@ async fn test_register_happy_path(pool: PgPool) -> Result<(), anyhow::Error> {
     assert_eq!(body["displayName"].as_str(), Some("Alice"));
     assert_eq!(body["token_type"].as_str(), Some("Bearer"));
     assert!(body["expires_in"].as_u64().unwrap_or(0) > 0);
+
+    Ok(())
+}
+
+/// WIRE-SHAPE GOLDEN LOCK at the HTTP-integration level (R-53 / task #23).
+///
+/// Companion to the struct-level locks in `auth_handler.rs` and `models/mod.rs`.
+/// Exists because the R-53 camelCase migration broke the register flow at the
+/// HTTP-INTEGRATION level specifically — task #23's in-clone verification ran
+/// `cargo test -p ac-service --lib` and never exercised this binary, so the
+/// struct-level serde tests passed while these tests sent stale snake_case
+/// keys. This lock asserts the EXACT real-wire round-trip (request accepted +
+/// full response key set) so a future rename sweep that misses an HTTP surface
+/// fails loudly HERE, in the scope that actually broke.
+///
+/// IF THIS FAILS DURING A RENAME SWEEP: confirm the contract (R-11/R-53)
+/// before touching the golden sets — the SDK and every HTTP client depend on
+/// these exact keys. Mixed scheme is deliberate: camelCase DT-internal +
+/// snake_case OAuth (RFC 6749).
+#[sqlx::test(migrations = "../../migrations")]
+async fn test_register_wire_shape_golden_lock(pool: PgPool) -> Result<(), anyhow::Error> {
+    use std::collections::BTreeSet;
+
+    // The COMPLETE, intended set of register-response wire keys. Mixed by
+    // design: camelCase DT-internal + snake_case OAuth. Update ONLY in lockstep
+    // with a deliberate R-53/R-11 contract change (and the struct-level lock).
+    let golden_response_keys: BTreeSet<String> = [
+        "userId",       // camelCase (R-53)
+        "email",        // single-word, scheme-invariant
+        "displayName",  // camelCase (R-53)
+        "access_token", // snake_case (RFC 6749)
+        "token_type",   // snake_case (RFC 6749)
+        "expires_in",   // snake_case (RFC 6749)
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+
+    let server = TestAuthServer::spawn(pool).await?;
+    let _org_id = server.create_test_org("wirelock", "Wire Lock Corp").await?;
+
+    // Request MUST be sent with the exact camelCase wire keys; a snake_case
+    // `display_name` here would 422 (this is the regression this test guards).
+    let response = server
+        .client()
+        .post(format!("{}/api/v1/auth/register", server.url()))
+        .header("Host", server.host_header("wirelock"))
+        .json(&json!({
+            "email": "wirelock@example.com",
+            "password": "password123",
+            "displayName": "Wire Lock",
+        }))
+        .send()
+        .await?;
+
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "golden camelCase request body must be accepted (R-53 wire contract). \
+         A 422 here means the request derive drifted from the camelCase contract — \
+         DO NOT silently re-baseline; confirm the contract and update the SDK (R-11)."
+    );
+
+    let body: serde_json::Value = response.json().await?;
+    let actual_keys: BTreeSet<String> = body
+        .as_object()
+        .expect("register response must be a JSON object")
+        .keys()
+        .cloned()
+        .collect();
+
+    assert_eq!(
+        actual_keys, golden_response_keys,
+        "register response wire-key set drifted from the R-53 golden shape. \
+         If intentional, update this golden set AND the struct-level lock in \
+         auth_handler.rs AND the SDK (R-11). Mixed scheme is deliberate: \
+         camelCase DT-internal + snake_case OAuth (RFC 6749)."
+    );
+
+    // Explicit credential-echo guards. Set-equality above already implies these,
+    // but asserting them explicitly preserves the security intent if anyone
+    // later loosens the equality check to a subset check.
+    for forbidden in [
+        "password",
+        "passwordHash",
+        "password_hash",
+        "secret",
+        "clientSecret",
+        "client_secret",
+    ] {
+        assert!(
+            !actual_keys.contains(forbidden),
+            "register response must not contain credential key `{forbidden}` (no credential echo)"
+        );
+    }
+    assert!(
+        !body.to_string().contains("password123"),
+        "register response must not echo the raw request password value anywhere"
+    );
+
+    // OAuth RFC 6749 invariant ENFORCED at the HTTP boundary: snake_case present,
+    // camelCase forms absent — a future sweep camelCasing them fails here.
+    for snake in ["access_token", "token_type", "expires_in"] {
+        assert!(
+            actual_keys.contains(snake),
+            "OAuth field `{snake}` must remain snake_case on the wire (RFC 6749). \
+             DO NOT silently re-baseline: snake_case is the spec — a sweep that \
+             camelCased it is a regression, not a contract change."
+        );
+    }
+    for camel in ["accessToken", "tokenType", "expiresIn"] {
+        assert!(
+            !actual_keys.contains(camel),
+            "OAuth field camelCase form `{camel}` must be absent (RFC 6749 snake_case is the spec). \
+             DO NOT silently re-baseline: re-add the per-field #[serde(rename)] override \
+             rather than editing this test."
+        );
+    }
 
     Ok(())
 }
