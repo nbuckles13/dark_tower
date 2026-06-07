@@ -4,7 +4,9 @@
 #
 # Per-id rationale (mirrored from audit-suppressions.toml):
 #   RUSTSEC-2023-0071: rsa 0.9.10 Marvin timing side-channel; build-time-only via sqlx-macros (no mysql feature, no runtime rsa::*) — verify with `cargo tree -p rsa --invert`; fail-closed if a runtime consumer ever appears; no upstream fix. Full rationale in comment above + docs/TODO.md Cluster C.
-#     expires 2026-09-01 — verify build-time-only via `cargo tree -p rsa --invert`; fail-closed if a runtime consumer appears.
+#     expires 2026-09-01 — re-verify per the reason line above before renewing; renewal workflow: docs/contributor/audit-suppressions.md.
+#   RUSTSEC-2025-0052: async-std unmaintained WARNING (non-gating; noise-only suppression). Test-build-graph-only via opentelemetry_sdk 0.24 `testing` feature (dev-dep of common) — verify with `cargo tree -i async-std -e normal` (must be empty); fail-closed if a normal-graph consumer appears. Fix = tracked OTel 0.29+ migration (rt-async-std persists through sdk 0.28.0).
+#     expires 2026-09-05 — re-verify per the reason line above before renewing; renewal workflow: docs/contributor/audit-suppressions.md.
 
 [advisories]
-ignore = ["RUSTSEC-2023-0071"]
+ignore = ["RUSTSEC-2023-0071", "RUSTSEC-2025-0052"]

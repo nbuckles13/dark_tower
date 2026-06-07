@@ -60,9 +60,11 @@ unreachable advisories — and even then it expires (below).
 
 New suppressions default to a **90-day** `expires`. The always-run
 `scripts/audit-suppressions-check.sh` (Layer-3 guard, every devloop + CI) hard-fails
-the moment an entry is past `expires` — CI goes red on the expiry day **by design**.
-That is the discipline backstop: a suppression must be periodically re-justified, not
-left to rot.
+any entry **strictly past** `expires`: the entry is valid *through* its `expires`
+date, and CI goes red **the day after** **by design** (e.g. `expires = 2026-09-05`
+is green through 2026-09-05 and fails with `REASON=suppression-past-due` from
+2026-09-06; see `__date_check`). That is the discipline backstop: a suppression
+must be periodically re-justified, not left to rot.
 
 ## Renewal workflow (when a suppression expires, or to renew proactively)
 

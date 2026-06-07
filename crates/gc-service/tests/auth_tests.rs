@@ -254,7 +254,7 @@ async fn test_me_endpoint_with_valid_token(pool: PgPool) -> Result<()> {
     let body: serde_json::Value = response.json().await?;
     assert_eq!(body["sub"], "test-client");
     assert_eq!(body["scopes"], serde_json::json!(["read", "write"]));
-    assert_eq!(body["service_type"], "global-controller");
+    assert_eq!(body["serviceType"], "global-controller");
 
     Ok(())
 }

@@ -406,8 +406,11 @@ __regenerate() {
       ecosystem="$(__field "$rec" 2)"
       [[ "$ecosystem" == "rust" ]] || continue
       id="$(__field "$rec" 1)"
+      # Entry-agnostic expiry line: the entry-specific verify command lives in the
+      # reason line above (task #48 fix — the previous hardcoded rsa-specific text
+      # was wrong for every entry except RUSTSEC-2023-0071 once a second entry landed).
       echo "#   ${id}: $(__field "$rec" 5)"
-      echo "#     expires $(__field "$rec" 3) — verify build-time-only via \`cargo tree -p rsa --invert\`; fail-closed if a runtime consumer appears."
+      echo "#     expires $(__field "$rec" 3) — re-verify per the reason line above before renewing; renewal workflow: docs/contributor/audit-suppressions.md."
     done
     echo ""
     echo "[advisories]"

@@ -45,3 +45,59 @@ ecosystem = "rust"
 expires = "2026-09-01"
 ticket = "docs/TODO.md (see the 'Suppressed Advisories' + 'Dependency Vulnerabilities' sections)"
 reason = "rsa 0.9.10 Marvin timing side-channel; build-time-only via sqlx-macros (no mysql feature, no runtime rsa::*) — verify with `cargo tree -p rsa --invert`; fail-closed if a runtime consumer ever appears; no upstream fix. Full rationale in comment above + docs/TODO.md Cluster C."
+
+# RUSTSEC-2025-0052 — async-std 1.13.2 unmaintained (discontinued 2025-08-24).
+#
+# WARNING-CLASS ADVISORY (unmaintained, not a vulnerability): cargo-audit does NOT
+# deny `unmaintained` warnings, so this entry silences review noise only — the
+# Layer 6 gate was never red on it and does not depend on this entry. Suppressed
+# per the operations pre-authorization recorded 2026-05-25 in docs/TODO.md
+# (Polyglot Pipeline Follow-ups -> async-std entry): "add an ignore-with-
+# justification entry if the warning becomes review-noise before the bump lands."
+# Approved by security at task #48 Gate 1 (2026-06-07): the alarm-fatigue argument
+# wins — an un-actionable warning printed on every dep-change run trains readers
+# to skim past cargo-audit output.
+#
+# ID-SCOPED: this ignores RUSTSEC-2025-0052 only. A future real CVE against
+# async-std gets a different RUSTSEC id and WILL still surface — this is not a
+# blanket ignore of the crate.
+#
+# Exposure analysis (security + infrastructure, 2026-06-07):
+#   - Pulled ONLY via opentelemetry_sdk 0.24.1's `testing` feature
+#     (testing -> rt-async-std -> async-std), enabled by crates/common's
+#     DEV-dependency for InMemorySpanExporter (crates/common/Cargo.toml
+#     [dev-dependencies]).
+#   - INVARIANT (verify command of record): `cargo tree -i async-std -e normal`
+#     must print nothing — async-std must never appear in the normal (non-dev)
+#     dependency graph. Verified empty 2026-06-07 (independently re-run by
+#     security).
+#   - No shipped service binary compiles or links async-std; it exists only in
+#     the test build graph + Cargo.lock.
+#
+# FAIL-CLOSED: if the verify command ever shows a normal-graph consumer, this
+# suppression is void immediately — remove it and fix, or re-justify with a fresh
+# exposure analysis. No grace period (a shipped unmaintained dep is a different
+# risk class).
+#
+# Fix: OTel-stack migration 0.24 -> 0.29+ (registry-verified: opentelemetry_sdk's
+# `testing` feature carries rt-async-std through 0.28.0; the async-std dependency
+# is gone only at 0.29.0+; 0.29-era pairings are opentelemetry/opentelemetry_sdk/
+# opentelemetry-otlp 0.29+ and tracing-opentelemetry 0.30+). Tracked in the ticket
+# entry below (owner: observability + operations, P3). Until that lands there is
+# no in-range fix.
+#
+# RENEWAL PLAYBOOK (expires 2026-09-05, likely BEFORE the P3 OTel migration lands.
+# The entry is valid THROUGH that date; CI goes red with
+# REASON=suppression-past-due starting the day after — 2026-09-06 —
+# strictly-past-due semantics per __date_check, BY DESIGN):
+#   1. Re-run `cargo tree -i async-std -e normal` — must still be empty.
+#      If non-empty: do NOT renew; the fail-closed clause applies.
+#   2. If the OTel 0.29+ migration has landed: DELETE this entry instead.
+#   3. Otherwise: bump `expires` +90 days, re-affirm this analysis in the PR,
+#      regenerate derived files (`scripts/audit-suppressions-check.sh --fix`).
+[[suppression]]
+id = "RUSTSEC-2025-0052"
+ecosystem = "rust"
+expires = "2026-09-05"
+ticket = "docs/TODO.md -> section 'Polyglot Pipeline Follow-ups (ADR-0033 Wave 1 #1)' -> entry: async-std unmaintained warning from opentelemetry_sdk 0.24.1 transitive (RUSTSEC-2025-0052; fix = OTel 0.29+ migration, owner observability+operations)"
+reason = "async-std unmaintained WARNING (non-gating; noise-only suppression). Test-build-graph-only via opentelemetry_sdk 0.24 `testing` feature (dev-dep of common) — verify with `cargo tree -i async-std -e normal` (must be empty); fail-closed if a normal-graph consumer appears. Fix = tracked OTel 0.29+ migration (rt-async-std persists through sdk 0.28.0)."
