@@ -211,7 +211,11 @@ mod tests {
         let body: serde_json::Value = response.json().await?;
         assert_eq!(body["status"], "ready");
         assert_eq!(body["database"], "healthy");
-        assert_eq!(body["ac_jwks"], "available");
+        // `acJwks` is camelCase per `ReadinessResponse` (R-53). The stale `ac_jwks`
+        // read yielded Null, so this value-compare FAILED (this assertion was in the
+        // task-#49 failing surface) — read the camelCase key so the compare is
+        // meaningful and a future snake regression re-trips.
+        assert_eq!(body["acJwks"], "available");
 
         // Error field should be null or absent when ready
         assert!(body.get("error").is_none() || body["error"].is_null());

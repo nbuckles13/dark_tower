@@ -277,7 +277,7 @@ async fn test_create_meeting_happy_path(pool: PgPool) -> Result<()> {
         .post(format!("{}/api/v1/meetings", server.url()))
         .header("Authorization", format!("Bearer {}", token))
         .json(&serde_json::json!({
-            "display_name": "Team Standup"
+            "displayName": "Team Standup"
         }))
         .send()
         .await?;
@@ -285,21 +285,21 @@ async fn test_create_meeting_happy_path(pool: PgPool) -> Result<()> {
     assert_eq!(resp.status(), 201, "Expected 201 Created");
 
     let body: serde_json::Value = resp.json().await?;
-    assert!(body["meeting_id"].is_string(), "Should have meeting_id");
-    assert!(body["meeting_code"].is_string(), "Should have meeting_code");
-    assert_eq!(body["display_name"], "Team Standup");
+    assert!(body["meetingId"].is_string(), "Should have meetingId");
+    assert!(body["meetingCode"].is_string(), "Should have meetingCode");
+    assert_eq!(body["displayName"], "Team Standup");
     assert_eq!(body["status"], "scheduled");
-    assert_eq!(body["max_participants"], 100); // Default
-    assert_eq!(body["enable_e2e_encryption"], true); // Secure default
-    assert_eq!(body["require_auth"], true); // Secure default
-    assert_eq!(body["recording_enabled"], false); // Secure default
-    assert_eq!(body["allow_guests"], false); // Secure default
-    assert_eq!(body["allow_external_participants"], false); // Secure default
-    assert_eq!(body["waiting_room_enabled"], true); // Secure default
-    assert!(body["created_at"].is_string(), "Should have created_at");
+    assert_eq!(body["maxParticipants"], 100); // Default
+    assert_eq!(body["enableE2eEncryption"], true); // Secure default
+    assert_eq!(body["requireAuth"], true); // Secure default
+    assert_eq!(body["recordingEnabled"], false); // Secure default
+    assert_eq!(body["allowGuests"], false); // Secure default
+    assert_eq!(body["allowExternalParticipants"], false); // Secure default
+    assert_eq!(body["waitingRoomEnabled"], true); // Secure default
+    assert!(body["createdAt"].is_string(), "Should have createdAt");
 
     // Meeting code format: 12 base62 chars
-    let code = body["meeting_code"].as_str().unwrap();
+    let code = body["meetingCode"].as_str().unwrap();
     assert_eq!(code.len(), 12);
     for ch in code.chars() {
         assert!(ch.is_ascii_alphanumeric());
@@ -315,7 +315,7 @@ async fn test_create_meeting_missing_auth_token(pool: PgPool) -> Result<()> {
     let client = reqwest::Client::new();
     let resp = client
         .post(format!("{}/api/v1/meetings", server.url()))
-        .json(&serde_json::json!({"display_name": "No Auth"}))
+        .json(&serde_json::json!({"displayName": "No Auth"}))
         .send()
         .await?;
 
@@ -334,7 +334,7 @@ async fn test_create_meeting_expired_token(pool: PgPool) -> Result<()> {
     let resp = client
         .post(format!("{}/api/v1/meetings", server.url()))
         .header("Authorization", format!("Bearer {}", token))
-        .json(&serde_json::json!({"display_name": "Expired"}))
+        .json(&serde_json::json!({"displayName": "Expired"}))
         .send()
         .await?;
 
@@ -351,7 +351,7 @@ async fn test_create_meeting_service_token_rejected(pool: PgPool) -> Result<()> 
     let resp = client
         .post(format!("{}/api/v1/meetings", server.url()))
         .header("Authorization", format!("Bearer {}", token))
-        .json(&serde_json::json!({"display_name": "Wrong Token Type"}))
+        .json(&serde_json::json!({"displayName": "Wrong Token Type"}))
         .send()
         .await?;
 
@@ -372,7 +372,7 @@ async fn test_create_meeting_insufficient_role(pool: PgPool) -> Result<()> {
     let resp = client
         .post(format!("{}/api/v1/meetings", server.url()))
         .header("Authorization", format!("Bearer {}", token))
-        .json(&serde_json::json!({"display_name": "No Permission"}))
+        .json(&serde_json::json!({"displayName": "No Permission"}))
         .send()
         .await?;
 
@@ -411,7 +411,7 @@ async fn test_create_meeting_unknown_field_rejected(pool: PgPool) -> Result<()> 
         .post(format!("{}/api/v1/meetings", server.url()))
         .header("Authorization", format!("Bearer {}", token))
         .json(&serde_json::json!({
-            "display_name": "Test",
+            "displayName": "Test",
             "unknown_field": "should_be_rejected"
         }))
         .send()
@@ -438,7 +438,7 @@ async fn test_create_meeting_org_limit_exceeded(pool: PgPool) -> Result<()> {
     let resp = client
         .post(format!("{}/api/v1/meetings", server.url()))
         .header("Authorization", format!("Bearer {}", token))
-        .json(&serde_json::json!({"display_name": "Over Limit"}))
+        .json(&serde_json::json!({"displayName": "Over Limit"}))
         .send()
         .await?;
 
@@ -461,7 +461,7 @@ async fn test_create_meeting_response_excludes_join_token_secret(pool: PgPool) -
     let resp = client
         .post(format!("{}/api/v1/meetings", server.url()))
         .header("Authorization", format!("Bearer {}", token))
-        .json(&serde_json::json!({"display_name": "Secret Test"}))
+        .json(&serde_json::json!({"displayName": "Secret Test"}))
         .send()
         .await?;
 
@@ -487,17 +487,17 @@ async fn test_create_meeting_db_persistence(pool: PgPool) -> Result<()> {
         .post(format!("{}/api/v1/meetings", server.url()))
         .header("Authorization", format!("Bearer {}", token))
         .json(&serde_json::json!({
-            "display_name": "  Persisted Meeting  ",
-            "max_participants": 25,
-            "enable_e2e_encryption": false,
-            "allow_guests": true
+            "displayName": "  Persisted Meeting  ",
+            "maxParticipants": 25,
+            "enableE2eEncryption": false,
+            "allowGuests": true
         }))
         .send()
         .await?;
 
     assert_eq!(resp.status(), 201);
     let body: serde_json::Value = resp.json().await?;
-    let meeting_id: Uuid = body["meeting_id"].as_str().unwrap().parse().unwrap();
+    let meeting_id: Uuid = body["meetingId"].as_str().unwrap().parse().unwrap();
 
     // Verify DB row
     let row = sqlx::query_as::<_, (String, String, i32, bool, bool, String, Uuid, Uuid)>(
@@ -534,13 +534,13 @@ async fn test_create_meeting_audit_log_created(pool: PgPool) -> Result<()> {
     let resp = client
         .post(format!("{}/api/v1/meetings", server.url()))
         .header("Authorization", format!("Bearer {}", token))
-        .json(&serde_json::json!({"display_name": "Audit Test"}))
+        .json(&serde_json::json!({"displayName": "Audit Test"}))
         .send()
         .await?;
 
     assert_eq!(resp.status(), 201);
     let body: serde_json::Value = resp.json().await?;
-    let meeting_id: Uuid = body["meeting_id"].as_str().unwrap().parse().unwrap();
+    let meeting_id: Uuid = body["meetingId"].as_str().unwrap().parse().unwrap();
 
     // Verify audit log entry
     let audit_count: (i64,) = sqlx::query_as(
@@ -568,13 +568,13 @@ async fn test_create_meeting_max_participants_too_low(pool: PgPool) -> Result<()
 
     let client = reqwest::Client::new();
 
-    // max_participants = 1 should fail
+    // maxParticipants = 1 should fail
     let resp = client
         .post(format!("{}/api/v1/meetings", server.url()))
         .header("Authorization", format!("Bearer {}", token))
         .json(&serde_json::json!({
-            "display_name": "Too Few",
-            "max_participants": 1
+            "displayName": "Too Few",
+            "maxParticipants": 1
         }))
         .send()
         .await?;
@@ -595,14 +595,14 @@ async fn test_create_meeting_with_custom_settings(pool: PgPool) -> Result<()> {
         .post(format!("{}/api/v1/meetings", server.url()))
         .header("Authorization", format!("Bearer {}", token))
         .json(&serde_json::json!({
-            "display_name": "Custom Settings",
-            "max_participants": 50,
-            "enable_e2e_encryption": false,
-            "require_auth": false,
-            "recording_enabled": true,
-            "allow_guests": true,
-            "allow_external_participants": true,
-            "waiting_room_enabled": false
+            "displayName": "Custom Settings",
+            "maxParticipants": 50,
+            "enableE2eEncryption": false,
+            "requireAuth": false,
+            "recordingEnabled": true,
+            "allowGuests": true,
+            "allowExternalParticipants": true,
+            "waitingRoomEnabled": false
         }))
         .send()
         .await?;
@@ -610,14 +610,135 @@ async fn test_create_meeting_with_custom_settings(pool: PgPool) -> Result<()> {
     assert_eq!(resp.status(), 201);
 
     let body: serde_json::Value = resp.json().await?;
-    assert_eq!(body["display_name"], "Custom Settings");
-    assert_eq!(body["max_participants"], 50);
-    assert_eq!(body["enable_e2e_encryption"], false);
-    assert_eq!(body["require_auth"], false);
-    assert_eq!(body["recording_enabled"], true);
-    assert_eq!(body["allow_guests"], true);
-    assert_eq!(body["allow_external_participants"], true);
-    assert_eq!(body["waiting_room_enabled"], false);
+    assert_eq!(body["displayName"], "Custom Settings");
+    assert_eq!(body["maxParticipants"], 50);
+    assert_eq!(body["enableE2eEncryption"], false);
+    assert_eq!(body["requireAuth"], false);
+    assert_eq!(body["recordingEnabled"], true);
+    assert_eq!(body["allowGuests"], true);
+    assert_eq!(body["allowExternalParticipants"], true);
+    assert_eq!(body["waitingRoomEnabled"], false);
 
     Ok(())
+}
+
+/// WIRE-SHAPE GOLDEN LOCK at the HTTP-integration level (R-53 / task #23).
+///
+/// Companion to the struct-level locks in `models/mod.rs`. Exists because the
+/// R-53 camelCase migration broke the meeting flow at the HTTP-INTEGRATION level
+/// specifically — task #23's in-clone verification never ran these DB-gated
+/// `#[sqlx::test]` tests, so the struct-level serde tests passed while these
+/// tests sent stale snake_case keys (the false-CLEAR mechanism the GC mirror of
+/// task #46 fixes). This lock asserts the EXACT real-wire round-trip (camelCase
+/// request accepted with 201 + full response key set) so a future rename sweep
+/// that misses an HTTP surface fails loudly HERE, in the scope that actually
+/// broke. `create` is GC's analogue of AC's `register` lock (`265e56e`): the one
+/// round-trip that must EXCLUDE a credential (`join_token_secret`).
+///
+/// GC has NO OAuth/RFC-6749 endpoints, so the whole key set is camelCase (no
+/// mixed scheme — contrast AC's register lock which keeps OAuth fields snake).
+///
+/// IF THIS FAILS DURING A RENAME SWEEP: the SDK + env-tests fixtures + every HTTP
+/// client depend on these exact camelCase keys (R-53). DO NOT silently
+/// re-baseline — confirm the wire contract and update the golden set AND the
+/// struct-level lock AND the SDK/env-tests fixtures in lockstep. The
+/// all-camelCase, no-mixed-scheme rule is owned by task #51.
+#[sqlx::test(migrations = "../../migrations")]
+async fn test_create_meeting_wire_shape_golden_lock(pool: PgPool) -> Result<()> {
+    use std::collections::BTreeSet;
+
+    // The COMPLETE, intended set of create-meeting-response wire keys — all
+    // camelCase (R-53; GC has no OAuth carve-out). Update ONLY in lockstep with a
+    // deliberate R-53 contract change (and the struct-level lock + task #51).
+    let golden_response_keys: BTreeSet<String> = [
+        "meetingId",                 // camelCase (R-53)
+        "meetingCode",               // camelCase (R-53)
+        "displayName",               // camelCase (R-53)
+        "status",                    // scheme-invariant single word
+        "maxParticipants",           // camelCase (R-53)
+        "enableE2eEncryption",       // camelCase (R-53)
+        "requireAuth",               // camelCase (R-53)
+        "recordingEnabled",          // camelCase (R-53)
+        "allowGuests",               // camelCase (R-53)
+        "allowExternalParticipants", // camelCase (R-53)
+        "waitingRoomEnabled",        // camelCase (R-53)
+        "createdAt",                 // camelCase (R-53)
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+
+    let server = TestCreateMeetingServer::spawn(pool.clone()).await?;
+    let org_id = create_test_org(&pool, "wirelock-org").await;
+    let user_id = create_test_user(&pool, org_id, "user@wirelock.com").await;
+    let token = server.create_user_token(user_id, org_id, vec!["user".to_string()]);
+
+    // Request MUST be sent with the exact camelCase wire keys; a snake_case
+    // `display_name` here would 400 (deny_unknown_fields) — this is the
+    // regression this test guards.
+    let resp = client_post_camel(&server, &token).await?;
+
+    // Assert the request was ACCEPTED (201) BEFORE reading the body. A 400 from
+    // deny_unknown_fields must FAIL the test, not silently pass — this is the
+    // load-bearing anti-mask check.
+    assert_eq!(
+        resp.status(),
+        201,
+        "golden camelCase request body must be accepted with 201 Created (R-53 wire contract). \
+         A 400 here means the request derive drifted from the camelCase contract — \
+         DO NOT silently re-baseline; confirm the contract and update the SDK (R-53, task #51)."
+    );
+
+    let body: serde_json::Value = resp.json().await?;
+    let actual_keys: BTreeSet<String> = body
+        .as_object()
+        .expect("create-meeting response must be a JSON object")
+        .keys()
+        .cloned()
+        .collect();
+
+    assert_eq!(
+        actual_keys, golden_response_keys,
+        "create-meeting response wire-key set drifted from the R-53 camelCase golden shape. \
+         If intentional, update this golden set AND the struct-level lock in models/mod.rs \
+         AND the SDK/env-tests fixtures (R-53). GC is all-camelCase, no mixed scheme."
+    );
+
+    // No serialized key may contain `_` — catches a PARTIAL rename leaving one
+    // field snake_case (set-equality above already implies this, but asserting it
+    // explicitly preserves the all-camelCase intent if anyone loosens the check).
+    for key in &actual_keys {
+        assert!(
+            !key.contains('_'),
+            "create-meeting response key `{key}` contains `_` — a snake_case field survived. \
+             GC wire shape is ALL camelCase (R-53)."
+        );
+    }
+
+    // Credential-non-leak guard at HTTP scope: the join secret must not appear in
+    // EITHER scheme (mirrors the model-layer check at models/mod.rs).
+    for forbidden in ["join_token_secret", "joinTokenSecret"] {
+        assert!(
+            !actual_keys.contains(forbidden),
+            "create-meeting response must not contain credential key `{forbidden}` (no secret echo)"
+        );
+    }
+
+    Ok(())
+}
+
+/// Helper for the golden-lock test: POST a meeting with the exact camelCase wire
+/// body. Kept inline-simple (single call site) to mirror AC's 265e56e structure
+/// without accreting a shared body builder.
+async fn client_post_camel(
+    server: &TestCreateMeetingServer,
+    token: &str,
+) -> Result<reqwest::Response> {
+    let client = reqwest::Client::new();
+    Ok(client
+        .post(format!("{}/api/v1/meetings", server.url()))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&serde_json::json!({ "displayName": "Wire Lock" }))
+        .send()
+        .await?)
 }

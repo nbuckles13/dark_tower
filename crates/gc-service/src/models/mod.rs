@@ -949,4 +949,290 @@ mod tests {
         assert!(!json.contains("joinTokenSecret"));
         assert!(!json.contains("should_not_appear_in_response"));
     }
+
+    // ========================================================================
+    // WIRE-SHAPE LOCKS (R-53 / task #23; GC mirror of AC task #46 `f5fc4b4`)
+    //
+    // RENAME TRIPWIRE. GC's wire structs are `#[serde(rename_all = "camelCase")]`
+    // (task #23, commit `92d963b`). Unlike AC, GC has NO OAuth/RFC-6749 endpoints,
+    // so there is NO snake_case carve-out — EVERY GC wire response is camelCase
+    // (including `JoinMeetingResponse.expires_in` -> `expiresIn`; GC's join /
+    // guest-token are NOT RFC 6749 token endpoints). These tests serialize a real
+    // instance and pin the EXACT key-set via two independent checks per struct:
+    //   (a) full `BTreeSet` key-set EQUALITY  — catches an added / removed / renamed key;
+    //   (b) "no serialized key contains `_`"  — catches a PARTIAL rename sweep that
+    //       leaves a single field snake_case while the rest go camel.
+    // They complement (do not duplicate) the substring serialization tests above,
+    // which spot-check individual keys + VALUES but do NOT assert closed-set
+    // equality and so would miss an added/removed key or a sibling snake-revert.
+    //
+    // IF ONE FAILS DURING A RENAME SWEEP: the SDK + env-tests fixtures + every HTTP
+    // client depend on these exact camelCase keys (R-53). DO NOT silently re-baseline
+    // — confirm the wire contract and update the lock + SDK + env-tests fixtures in
+    // lockstep. The all-camelCase, no-mixed-scheme rule is owned by task #51.
+    // ========================================================================
+
+    /// Collect the top-level serialized JSON object key-set of `value`.
+    fn wire_key_set(value: &serde_json::Value) -> std::collections::BTreeSet<String> {
+        value
+            .as_object()
+            .expect("wire shape must be a JSON object")
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    /// Assert no top-level serialized key contains `_` (i.e. all-camelCase,
+    /// no surviving snake_case field after a rename sweep).
+    fn assert_no_snake_keys(value: &serde_json::Value, ctx: &str) {
+        for key in value
+            .as_object()
+            .expect("wire shape must be a JSON object")
+            .keys()
+        {
+            assert!(
+                !key.contains('_'),
+                "{ctx} wire key `{key}` contains `_` — a snake_case field survived. \
+                 GC wire shape is ALL camelCase (R-53, no OAuth carve-out). \
+                 DO NOT silently re-baseline; re-camelCase the field (rule owned by task #51)."
+            );
+        }
+    }
+
+    #[test]
+    fn test_create_meeting_response_wire_shape_stays_camel() {
+        let response = CreateMeetingResponse {
+            meeting_id: Uuid::nil(),
+            meeting_code: "ABC123def456".to_string(),
+            display_name: "Lock".to_string(),
+            status: "scheduled".to_string(),
+            max_participants: 100,
+            enable_e2e_encryption: true,
+            require_auth: true,
+            recording_enabled: false,
+            allow_guests: false,
+            allow_external_participants: false,
+            waiting_room_enabled: true,
+            created_at: Utc::now(),
+        };
+        let value = serde_json::to_value(&response).expect("should serialize");
+        let expected: std::collections::BTreeSet<String> = [
+            "meetingId",                 // camelCase (R-53)
+            "meetingCode",               // camelCase (R-53)
+            "displayName",               // camelCase (R-53)
+            "status",                    // scheme-invariant single word
+            "maxParticipants",           // camelCase (R-53)
+            "enableE2eEncryption",       // camelCase (R-53)
+            "requireAuth",               // camelCase (R-53)
+            "recordingEnabled",          // camelCase (R-53)
+            "allowGuests",               // camelCase (R-53)
+            "allowExternalParticipants", // camelCase (R-53)
+            "waitingRoomEnabled",        // camelCase (R-53)
+            "createdAt",                 // camelCase (R-53)
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(
+            wire_key_set(&value),
+            expected,
+            "CreateMeetingResponse wire key-set drifted from the R-53 camelCase shape"
+        );
+        assert_no_snake_keys(&value, "CreateMeetingResponse");
+        // Credential-non-leak invariant (both forms), preserved at struct scope.
+        let json = serde_json::to_string(&response).expect("should serialize");
+        assert!(!json.contains("join_token_secret"));
+        assert!(!json.contains("joinTokenSecret"));
+    }
+
+    #[test]
+    fn test_meeting_response_wire_shape_stays_camel() {
+        let response = MeetingResponse {
+            meeting_id: Uuid::nil(),
+            display_name: "Lock".to_string(),
+            meeting_code: "ABC123def456".to_string(),
+            status: "scheduled".to_string(),
+            allow_guests: true,
+            allow_external_participants: false,
+            waiting_room_enabled: true,
+            updated_at: Utc::now(),
+        };
+        let value = serde_json::to_value(&response).expect("should serialize");
+        let expected: std::collections::BTreeSet<String> = [
+            "meetingId",                 // camelCase (R-53)
+            "displayName",               // camelCase (R-53)
+            "meetingCode",               // camelCase (R-53)
+            "status",                    // scheme-invariant single word
+            "allowGuests",               // camelCase (R-53)
+            "allowExternalParticipants", // camelCase (R-53)
+            "waitingRoomEnabled",        // camelCase (R-53)
+            "updatedAt",                 // camelCase (R-53)
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(
+            wire_key_set(&value),
+            expected,
+            "MeetingResponse (settings PATCH) wire key-set drifted from the R-53 camelCase shape"
+        );
+        assert_no_snake_keys(&value, "MeetingResponse");
+    }
+
+    #[test]
+    fn test_join_meeting_response_wire_shape_stays_camel() {
+        let response = JoinMeetingResponse {
+            token: "eyJ.test.sig".to_string(),
+            expires_in: 900,
+            meeting_id: Uuid::nil(),
+            meeting_name: "Lock".to_string(),
+            mc_assignment: McAssignmentInfo {
+                mc_id: "mc-001".to_string(),
+                webtransport_endpoint: Some("https://mc:443".to_string()),
+                grpc_endpoint: "https://mc:50051".to_string(),
+            },
+        };
+        let value = serde_json::to_value(&response).expect("should serialize");
+        let expected: std::collections::BTreeSet<String> = [
+            "token",        // scheme-invariant single word
+            "expiresIn",    // camelCase (R-53) — NOT RFC 6749; GC join is not an OAuth endpoint
+            "meetingId",    // camelCase (R-53)
+            "meetingName",  // camelCase (R-53)
+            "mcAssignment", // camelCase (R-53)
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(
+            wire_key_set(&value),
+            expected,
+            "JoinMeetingResponse wire key-set drifted from the R-53 camelCase shape — \
+             expiresIn is camelCase (GC has NO OAuth carve-out; rule owned by task #51)"
+        );
+        assert_no_snake_keys(&value, "JoinMeetingResponse");
+    }
+
+    #[test]
+    fn test_mc_assignment_info_wire_shape_stays_camel() {
+        // `webtransport_endpoint` is `skip_serializing_if = "Option::is_none"`, so the
+        // `webtransportEndpoint` key is ABSENT when None. Populate it `Some(..)` here
+        // to lock the FULL key-set (all 3) — a rename sweep can hit McAssignmentInfo
+        // independently of JoinMeetingResponse.
+        let assignment = McAssignmentInfo {
+            mc_id: "mc-001".to_string(),
+            webtransport_endpoint: Some("https://mc:443".to_string()),
+            grpc_endpoint: "https://mc:50051".to_string(),
+        };
+        let value = serde_json::to_value(&assignment).expect("should serialize");
+        let expected: std::collections::BTreeSet<String> = [
+            "mcId",                 // camelCase (R-53)
+            "webtransportEndpoint", // camelCase (R-53); present here because Some(..)
+            "grpcEndpoint",         // camelCase (R-53)
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(
+            wire_key_set(&value),
+            expected,
+            "McAssignmentInfo wire key-set drifted from the R-53 camelCase shape"
+        );
+        assert_no_snake_keys(&value, "McAssignmentInfo");
+    }
+
+    #[test]
+    fn test_readiness_response_wire_shape_stays_camel() {
+        let response = ReadinessResponse {
+            status: "ready",
+            database: Some("healthy"),
+            ac_jwks: Some("available"),
+            error: None,
+        };
+        let value = serde_json::to_value(&response).expect("should serialize");
+        // `error` is `skip_serializing_if = Option::is_none` -> absent here (None).
+        let expected: std::collections::BTreeSet<String> = [
+            "status",   // scheme-invariant single word
+            "database", // scheme-invariant single word
+            "acJwks",   // camelCase (R-53) — NOT `ac_jwks`
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(
+            wire_key_set(&value),
+            expected,
+            "ReadinessResponse wire key-set drifted — `acJwks` must stay camelCase (R-53)"
+        );
+        assert_no_snake_keys(&value, "ReadinessResponse");
+    }
+
+    /// Request-struct deserialize locks: the camelCase wire body MUST deserialize,
+    /// and the snake_case body MUST be rejected (`deny_unknown_fields` makes a
+    /// snake key "unknown"). This pins the request side of the R-53 contract.
+    #[test]
+    fn test_create_meeting_request_wire_shape_is_camel() {
+        // camelCase body accepted.
+        let camel = r#"{"displayName":"X","maxParticipants":10,"enableE2eEncryption":false}"#;
+        serde_json::from_str::<CreateMeetingRequest>(camel)
+            .expect("camelCase CreateMeetingRequest body must deserialize (R-53)");
+        // snake_case body rejected (deny_unknown_fields: snake keys are "unknown").
+        let snake = r#"{"display_name":"X","max_participants":10}"#;
+        assert!(
+            serde_json::from_str::<CreateMeetingRequest>(snake).is_err(),
+            "snake_case CreateMeetingRequest body must be REJECTED (R-53 camelCase contract)"
+        );
+    }
+
+    #[test]
+    fn test_guest_join_request_wire_shape_is_camel() {
+        let camel = r#"{"displayName":"John Doe","captchaToken":"abc123"}"#;
+        serde_json::from_str::<GuestJoinRequest>(camel)
+            .expect("camelCase GuestJoinRequest body must deserialize (R-53)");
+        let snake = r#"{"display_name":"John Doe","captcha_token":"abc123"}"#;
+        assert!(
+            serde_json::from_str::<GuestJoinRequest>(snake).is_err(),
+            "snake_case GuestJoinRequest body must be REJECTED (R-53 camelCase contract)"
+        );
+    }
+
+    #[test]
+    fn test_update_meeting_settings_request_wire_shape_is_camel() {
+        let camel =
+            r#"{"allowGuests":true,"allowExternalParticipants":false,"waitingRoomEnabled":true}"#;
+        serde_json::from_str::<UpdateMeetingSettingsRequest>(camel)
+            .expect("camelCase UpdateMeetingSettingsRequest body must deserialize (R-53)");
+        let snake = r#"{"allow_guests":true}"#;
+        assert!(
+            serde_json::from_str::<UpdateMeetingSettingsRequest>(snake).is_err(),
+            "snake_case UpdateMeetingSettingsRequest body must be REJECTED (R-53 camelCase contract)"
+        );
+    }
+
+    /// `HealthResponse` has NO `rename_all`; its fields (`status`/`region`/`database`)
+    /// are scheme-invariant SINGLE WORDS, so the all-camelCase invariant trivially
+    /// holds — this is NOT a snake_case carve-out. It is DEAD CODE (`/health` returns
+    /// plain text "OK" per ADR-0012) -> struct-only lock, no HTTP-integration lock.
+    /// Kept for uniformity with the other response locks; its only forward value is
+    /// catching a future MULTI-WORD field addition that would need camelCasing.
+    /// (The `rename_all="snake_case"` at models/mod.rs:13 is on the `MeetingStatus`
+    /// ENUM, NOT this struct — a different type.)
+    #[test]
+    fn test_health_response_wire_shape_has_no_snake_keys() {
+        let response = HealthResponse {
+            status: "healthy".to_string(),
+            region: "us-east-1".to_string(),
+            database: Some("healthy".to_string()),
+        };
+        let value = serde_json::to_value(&response).expect("should serialize");
+        let expected: std::collections::BTreeSet<String> = ["status", "region", "database"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            wire_key_set(&value),
+            expected,
+            "HealthResponse wire key-set drifted (dead-code struct; single-word fields)"
+        );
+        assert_no_snake_keys(&value, "HealthResponse");
+    }
 }

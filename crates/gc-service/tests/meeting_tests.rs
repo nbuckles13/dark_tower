@@ -584,17 +584,17 @@ async fn test_join_meeting_authenticated_success(pool: PgPool) -> Result<()> {
 
     let body: serde_json::Value = response.json().await?;
     assert!(body["token"].is_string(), "Should return a meeting token");
-    assert!(body["expires_in"].is_number(), "Should return expires_in");
-    assert!(body["meeting_id"].is_string(), "Should return meeting_id");
-    assert_eq!(body["meeting_name"], "Test Meeting");
+    assert_eq!(body["expiresIn"], 900, "Should return expiresIn (mock TTL)");
+    assert!(body["meetingId"].is_string(), "Should return meetingId");
+    assert_eq!(body["meetingName"], "Test Meeting");
     // Verify MC assignment is present
     assert!(
-        body["mc_assignment"]["mc_id"].is_string(),
-        "Should return mc_assignment with mc_id"
+        body["mcAssignment"]["mcId"].is_string(),
+        "Should return mcAssignment with mcId"
     );
     assert!(
-        body["mc_assignment"]["grpc_endpoint"].is_string(),
-        "Should return mc_assignment with grpc_endpoint"
+        body["mcAssignment"]["grpcEndpoint"].is_string(),
+        "Should return mcAssignment with grpcEndpoint"
     );
 
     Ok(())
@@ -980,8 +980,8 @@ async fn test_guest_token_success(pool: PgPool) -> Result<()> {
             server.url()
         ))
         .json(&serde_json::json!({
-            "display_name": "John Guest",
-            "captcha_token": "valid-captcha-token"
+            "displayName": "John Guest",
+            "captchaToken": "valid-captcha-token"
         }))
         .send()
         .await?;
@@ -990,7 +990,7 @@ async fn test_guest_token_success(pool: PgPool) -> Result<()> {
 
     let body: serde_json::Value = response.json().await?;
     assert!(body["token"].is_string(), "Should return guest token");
-    assert!(body["expires_in"].is_number(), "Should return expires_in");
+    assert_eq!(body["expiresIn"], 900, "Should return expiresIn (mock TTL)");
 
     Ok(())
 }
@@ -1007,8 +1007,8 @@ async fn test_guest_token_meeting_not_found(pool: PgPool) -> Result<()> {
             server.url()
         ))
         .json(&serde_json::json!({
-            "display_name": "John Guest",
-            "captcha_token": "valid-captcha-token"
+            "displayName": "John Guest",
+            "captchaToken": "valid-captcha-token"
         }))
         .send()
         .await?;
@@ -1048,8 +1048,8 @@ async fn test_guest_token_guests_not_allowed(pool: PgPool) -> Result<()> {
             server.url()
         ))
         .json(&serde_json::json!({
-            "display_name": "John Guest",
-            "captcha_token": "valid-captcha-token"
+            "displayName": "John Guest",
+            "captchaToken": "valid-captcha-token"
         }))
         .send()
         .await?;
@@ -1093,8 +1093,8 @@ async fn test_guest_token_empty_display_name(pool: PgPool) -> Result<()> {
             server.url()
         ))
         .json(&serde_json::json!({
-            "display_name": "",
-            "captcha_token": "valid-captcha-token"
+            "displayName": "",
+            "captchaToken": "valid-captcha-token"
         }))
         .send()
         .await?;
@@ -1138,8 +1138,8 @@ async fn test_guest_token_whitespace_display_name(pool: PgPool) -> Result<()> {
             server.url()
         ))
         .json(&serde_json::json!({
-            "display_name": "   ",
-            "captcha_token": "valid-captcha-token"
+            "displayName": "   ",
+            "captchaToken": "valid-captcha-token"
         }))
         .send()
         .await?;
@@ -1180,8 +1180,8 @@ async fn test_guest_token_short_display_name(pool: PgPool) -> Result<()> {
             server.url()
         ))
         .json(&serde_json::json!({
-            "display_name": "J",
-            "captcha_token": "valid-captcha-token"
+            "displayName": "J",
+            "captchaToken": "valid-captcha-token"
         }))
         .send()
         .await?;
@@ -1222,8 +1222,8 @@ async fn test_guest_token_empty_captcha(pool: PgPool) -> Result<()> {
             server.url()
         ))
         .json(&serde_json::json!({
-            "display_name": "John Guest",
-            "captcha_token": ""
+            "displayName": "John Guest",
+            "captchaToken": ""
         }))
         .send()
         .await?;
@@ -1263,8 +1263,8 @@ async fn test_guest_token_cancelled_meeting(pool: PgPool) -> Result<()> {
             server.url()
         ))
         .json(&serde_json::json!({
-            "display_name": "John Guest",
-            "captcha_token": "valid-captcha-token"
+            "displayName": "John Guest",
+            "captchaToken": "valid-captcha-token"
         }))
         .send()
         .await?;
@@ -1312,7 +1312,7 @@ async fn test_update_settings_allow_guests(pool: PgPool) -> Result<()> {
         ))
         .header("Authorization", format!("Bearer {}", token))
         .json(&serde_json::json!({
-            "allow_guests": true
+            "allowGuests": true
         }))
         .send()
         .await?;
@@ -1320,7 +1320,7 @@ async fn test_update_settings_allow_guests(pool: PgPool) -> Result<()> {
     assert_eq!(response.status(), 200, "Host should update settings");
 
     let body: serde_json::Value = response.json().await?;
-    assert_eq!(body["allow_guests"], true, "allow_guests should be updated");
+    assert_eq!(body["allowGuests"], true, "allow_guests should be updated");
 
     Ok(())
 }
@@ -1355,7 +1355,7 @@ async fn test_update_settings_allow_external(pool: PgPool) -> Result<()> {
         ))
         .header("Authorization", format!("Bearer {}", token))
         .json(&serde_json::json!({
-            "allow_external_participants": true
+            "allowExternalParticipants": true
         }))
         .send()
         .await?;
@@ -1364,7 +1364,7 @@ async fn test_update_settings_allow_external(pool: PgPool) -> Result<()> {
 
     let body: serde_json::Value = response.json().await?;
     assert_eq!(
-        body["allow_external_participants"], true,
+        body["allowExternalParticipants"], true,
         "allow_external_participants should be updated"
     );
 
@@ -1401,7 +1401,7 @@ async fn test_update_settings_waiting_room(pool: PgPool) -> Result<()> {
         ))
         .header("Authorization", format!("Bearer {}", token))
         .json(&serde_json::json!({
-            "waiting_room_enabled": false
+            "waitingRoomEnabled": false
         }))
         .send()
         .await?;
@@ -1410,7 +1410,7 @@ async fn test_update_settings_waiting_room(pool: PgPool) -> Result<()> {
 
     let body: serde_json::Value = response.json().await?;
     assert_eq!(
-        body["waiting_room_enabled"], false,
+        body["waitingRoomEnabled"], false,
         "waiting_room_enabled should be updated"
     );
 
@@ -1450,7 +1450,7 @@ async fn test_update_settings_non_host_forbidden(pool: PgPool) -> Result<()> {
         ))
         .header("Authorization", format!("Bearer {}", token))
         .json(&serde_json::json!({
-            "allow_guests": true
+            "allowGuests": true
         }))
         .send()
         .await?;
@@ -1483,7 +1483,7 @@ async fn test_update_settings_meeting_not_found(pool: PgPool) -> Result<()> {
         ))
         .header("Authorization", format!("Bearer {}", token))
         .json(&serde_json::json!({
-            "allow_guests": true
+            "allowGuests": true
         }))
         .send()
         .await?;
@@ -1574,7 +1574,7 @@ async fn test_update_settings_partial_update(pool: PgPool) -> Result<()> {
         ))
         .header("Authorization", format!("Bearer {}", token))
         .json(&serde_json::json!({
-            "allow_guests": true
+            "allowGuests": true
         }))
         .send()
         .await?;
@@ -1583,14 +1583,14 @@ async fn test_update_settings_partial_update(pool: PgPool) -> Result<()> {
 
     let body: serde_json::Value = response.json().await?;
     // Updated field
-    assert_eq!(body["allow_guests"], true);
+    assert_eq!(body["allowGuests"], true);
     // Unchanged fields
     assert_eq!(
-        body["allow_external_participants"], false,
+        body["allowExternalParticipants"], false,
         "Unchanged field should remain false"
     );
     assert_eq!(
-        body["waiting_room_enabled"], true,
+        body["waitingRoomEnabled"], true,
         "Unchanged field should remain true"
     );
 
@@ -1628,9 +1628,9 @@ async fn test_update_settings_multiple_fields(pool: PgPool) -> Result<()> {
         ))
         .header("Authorization", format!("Bearer {}", token))
         .json(&serde_json::json!({
-            "allow_guests": true,
-            "allow_external_participants": true,
-            "waiting_room_enabled": false
+            "allowGuests": true,
+            "allowExternalParticipants": true,
+            "waitingRoomEnabled": false
         }))
         .send()
         .await?;
@@ -1642,9 +1642,9 @@ async fn test_update_settings_multiple_fields(pool: PgPool) -> Result<()> {
     );
 
     let body: serde_json::Value = response.json().await?;
-    assert_eq!(body["allow_guests"], true);
-    assert_eq!(body["allow_external_participants"], true);
-    assert_eq!(body["waiting_room_enabled"], false);
+    assert_eq!(body["allowGuests"], true);
+    assert_eq!(body["allowExternalParticipants"], true);
+    assert_eq!(body["waitingRoomEnabled"], false);
 
     Ok(())
 }
@@ -1677,7 +1677,7 @@ async fn test_update_settings_requires_auth(pool: PgPool) -> Result<()> {
             meeting_id
         ))
         .json(&serde_json::json!({
-            "allow_guests": true
+            "allowGuests": true
         }))
         .send()
         .await?;
@@ -1846,8 +1846,8 @@ async fn test_guest_token_max_display_name_boundary(pool: PgPool) -> Result<()> 
             server.url()
         ))
         .json(&serde_json::json!({
-            "display_name": long_name,
-            "captcha_token": "valid-captcha-token"
+            "displayName": long_name,
+            "captchaToken": "valid-captcha-token"
         }))
         .send()
         .await?;
@@ -1908,8 +1908,8 @@ async fn test_concurrent_guest_requests_succeed(pool: PgPool) -> Result<()> {
             client
                 .post(&url)
                 .json(&serde_json::json!({
-                    "display_name": display_name,
-                    "captcha_token": "valid-captcha-token"
+                    "displayName": display_name,
+                    "captchaToken": "valid-captcha-token"
                 }))
                 .send()
                 .await
@@ -1932,9 +1932,9 @@ async fn test_concurrent_guest_requests_succeed(pool: PgPool) -> Result<()> {
             let body: serde_json::Value = response.json().await?;
             // Verify response structure is valid
             assert!(body["token"].is_string(), "Response should contain token");
-            assert!(
-                body["expires_in"].is_number(),
-                "Response should contain expires_in"
+            assert_eq!(
+                body["expiresIn"], 900,
+                "Response should contain expiresIn (mock TTL)"
             );
         }
     }
@@ -2179,21 +2179,21 @@ async fn test_join_meeting_active_status_success(pool: PgPool) -> Result<()> {
 
     let body: serde_json::Value = response.json().await?;
     assert!(body["token"].is_string(), "Should return a meeting token");
-    assert!(body["expires_in"].is_number(), "Should return expires_in");
-    assert!(body["meeting_id"].is_string(), "Should return meeting_id");
-    assert_eq!(body["meeting_name"], "Test Meeting");
-    // Verify MC assignment fields including webtransport_endpoint
+    assert_eq!(body["expiresIn"], 900, "Should return expiresIn (mock TTL)");
+    assert!(body["meetingId"].is_string(), "Should return meetingId");
+    assert_eq!(body["meetingName"], "Test Meeting");
+    // Verify MC assignment fields including webtransportEndpoint
     assert!(
-        body["mc_assignment"]["mc_id"].is_string(),
-        "Should return mc_assignment with mc_id"
+        body["mcAssignment"]["mcId"].is_string(),
+        "Should return mcAssignment with mcId"
     );
     assert!(
-        body["mc_assignment"]["grpc_endpoint"].is_string(),
-        "Should return mc_assignment with grpc_endpoint"
+        body["mcAssignment"]["grpcEndpoint"].is_string(),
+        "Should return mcAssignment with grpcEndpoint"
     );
     assert!(
-        body["mc_assignment"]["webtransport_endpoint"].is_string(),
-        "Should return mc_assignment with webtransport_endpoint"
+        body["mcAssignment"]["webtransportEndpoint"].is_string(),
+        "Should return mcAssignment with webtransportEndpoint"
     );
 
     Ok(())
