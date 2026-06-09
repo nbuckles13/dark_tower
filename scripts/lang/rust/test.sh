@@ -12,6 +12,11 @@
 set -euo pipefail
 IFS=$'\n\t'
 source "$(dirname "${BASH_SOURCE[0]}")/../_common.sh"
+# task #50: the helpers below (detect_runtime/wait_for_db/run_migrations_if_needed)
+# can `exit 1` BEFORE main reaches run_and_emit — the canonical silent-skip-at-pipeline-
+# edge case. The EXIT trap emits STATUS=FAIL REASON=wrapper-aborted-early-exit-<rc> so
+# the dispatcher sees a loud FAIL instead of an empty pipe (which aggregated to UNKNOWN).
+install_wrapper_exit_trap
 
 # Configuration (preserved from original scripts/test.sh)
 CONTAINER_NAME="dark-tower-postgres-test"

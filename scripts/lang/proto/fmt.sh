@@ -10,6 +10,7 @@
 set -euo pipefail
 IFS=$'\n\t'
 source "$(dirname "${BASH_SOURCE[0]}")/../_common.sh"
+install_wrapper_exit_trap  # task #50: emit STATUS=FAIL if we abort before emitting
 
 if ! command -v buf >/dev/null 2>&1; then
   emit_status FAIL "buf-binary-missing"

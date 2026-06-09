@@ -226,9 +226,9 @@ Every per-language wrapper (`lang/<X>/<verb>.sh`) honors a uniform exit-and-outp
 
 | Exit code | Meaning |
 |-----------|---------|
-| 0         | OK / SKIPPED-NO-DIFF / SKIPPED-NO-VERB / N/A-with-reason (success) |
+| 0         | OK / SKIPPED-NO-DIFF / SKIPPED-NO-VERB (intentional gap or all-langs-filtered) / N/A-with-reason (success) |
 | 1         | FAIL (the work ran and detected a problem) |
-| 2         | Wrapper / dispatcher bug (unexpected error; investigate the script itself) |
+| 2         | Wrapper / dispatcher bug (unexpected error; investigate the script itself) — incl. SKIPPED-NO-VERB for an *unexpected* missing/non-executable verb wrapper (see 2026-06-08 amendment) |
 
 Final stdout line: `STATUS=<OK|FAIL|SKIPPED-NO-DIFF|SKIPPED-NO-VERB|N/A> REASON=<short string, no spaces in value>`. Dispatchers parse this for aggregation; CI summary jobs reuse the same parser.
 
@@ -247,6 +247,26 @@ for_each_lang_with_verb "test" || exit 1
 4. If the verb script is missing or not executable, emits `STATUS=SKIPPED-NO-VERB REASON=<lang>/<verb>.sh missing-or-not-executable` — never silently continues
 
 This means proto's lack of `test.sh` produces a visible `SKIPPED-NO-VERB` entry in the layer log, not silent absence.
+
+**Amendment (2026-06-08, task #50):** the `SKIPPED-NO-VERB` exit code is now
+REASON-dependent. An *intentional* gap — `<lang>:<verb>` on the documented allowlist
+(`proto:test`, `proto:audit`), REASON `<lang>-<verb>-sh-missing-or-not-executable` — and
+the `all-langs-filtered` operator-intent case remain in the **exit-0 success class**
+(table row 0 above). An *unexpected* missing-or-non-executable verb wrapper (one that
+should exist — deleted, `chmod`-stripped, or a new lang dir added without the verb),
+REASON `<lang>-<verb>-UNEXPECTED-verb-missing-or-not-executable`, is a WIRING fault and
+maps to **exit 2** — the existing "wrapper/dispatcher bug; investigate the script itself"
+class (table row 2 above), alongside `UNKNOWN`. This closes the silent-skip-at-pipeline-
+edge regression: a missing verb wrapper can no longer be rationalized as a deliberate
+skip. Separately, the per-language verb wrappers now install an EXIT trap that emits
+`STATUS=FAIL REASON=wrapper-aborted-early-exit-<rc>` if the wrapper aborts BEFORE emitting
+a STATUS line (e.g. `set -e` abort in DB bring-up), so a pre-emit crash surfaces as FAIL
+(exit 1) rather than an empty pipe the aggregator reads as `UNKNOWN`. The intentional-gap
+allowlist lives in `_dispatch.sh` (`__intentional_missing_verbs`); its
+`DEVLOOP_INTENTIONAL_MISSING_VERBS` override is honored ONLY under `DEVLOOP_TEST=1`
+(production reads the hardcoded constant). See
+`docs/devloop-outputs/2026-06-08-silent-skip-class-fix-task50/` and
+`docs/runbooks/devloop-validation.md` §3/§6.4/§7/§8.
 
 ### 7. Diff Base Resolution
 

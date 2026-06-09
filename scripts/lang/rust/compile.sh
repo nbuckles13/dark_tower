@@ -9,5 +9,6 @@
 set -euo pipefail
 IFS=$'\n\t'
 source "$(dirname "${BASH_SOURCE[0]}")/../_common.sh"
+install_wrapper_exit_trap  # task #50: emit STATUS=FAIL if we abort before emitting
 run_and_emit "cargo-build" cargo build --workspace --quiet "$@"
 run_and_emit "cargo-build-dt-guard" cargo build --release -p dt-guard --quiet "$@"

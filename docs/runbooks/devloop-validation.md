@@ -53,9 +53,17 @@ If you don't see a `LAYER_SUMMARY_BEGIN` block at all, the orchestrator aborted 
 
 | Exit | Meaning | Maps to STATUS |
 |------|---------|----------------|
-| **0** | PASS or SKIPPED (success-exit class) | `OK | SKIPPED-NO-DIFF | SKIPPED-NO-VERB | N/A` |
+| **0** | PASS or SKIPPED (success-exit class) | `OK | SKIPPED-NO-DIFF | N/A | SKIPPED-NO-VERB`† |
 | **1** | FAIL — work ran and detected a problem | `FAIL` |
-| **2** | PRECONDITION_FAILURE — wrapper/orchestrator bug, dispatcher misconfig, OR pre-layer guardrail tripped (e.g. shallow CI clone) | aggregator treats as `UNKNOWN` |
+| **2** | Wrapper/dispatcher/orchestrator bug — investigate the script itself (dispatcher misconfig; a verb wrapper that should exist is missing/non-executable; OR a pre-layer guardrail tripped, e.g. shallow CI clone) | `UNKNOWN`; `SKIPPED-NO-VERB`† with an `*-UNEXPECTED-verb-missing-or-not-executable` REASON |
+
+† **`SKIPPED-NO-VERB` exit code is REASON-dependent (task #50, 2026-06-08).** It maps to
+**exit 0** for an *intentional* gap (`<lang>-<verb>-sh-missing-or-not-executable`, e.g.
+proto's deliberately-absent `test.sh`/`audit.sh`) or for `all-langs-filtered`; it maps to
+**exit 2** (the wiring-fault class, alongside `UNKNOWN`) when the REASON carries the
+`UNEXPECTED` marker (`<lang>-<verb>-UNEXPECTED-verb-missing-or-not-executable`) — a verb
+wrapper that should exist is missing or not executable. See §7 for the
+intentional-vs-unexpected split, and ADR-0033 §6 (2026-06-08 amendment) for the contract.
 
 ### `STATUS=` enum (ADR-0033 §6)
 
@@ -72,10 +80,15 @@ The enum values are exactly:
 | `OK` | Work ran cleanly | `cargo-check-passed`, `buf-build-passed`, `guards-passed` |
 | `FAIL` | Work ran and detected a problem | `cargo-clippy-failed`, `buf-breaking-failed`, `predicate-meta-test-failed` |
 | `SKIPPED-NO-DIFF` | `lang/<X>/changed.sh` returned 1 (lang untouched) | `<lang>-no-diff` |
-| `SKIPPED-NO-VERB` | `lang/<X>/<verb>.sh` missing-or-not-executable; the dispatcher records the gap rather than silently skipping | `proto-test-sh-missing-or-not-executable`, `proto-audit-sh-missing-or-not-executable` |
+| `SKIPPED-NO-VERB` (intentional gap → **exit 0**) | `lang/<X>/<verb>.sh` is a documented intentional gap; the dispatcher records it rather than silently skipping | `proto-test-sh-missing-or-not-executable`, `proto-audit-sh-missing-or-not-executable` |
+| `SKIPPED-NO-VERB` (UNEXPECTED → **exit 2**) | a verb wrapper that SHOULD exist is missing/non-executable (deleted, `chmod`-stripped, or a new lang dir missing a verb) — a wiring fault, not a benign skip | `rust-test-UNEXPECTED-verb-missing-or-not-executable`, `ts-audit-UNEXPECTED-verb-missing-or-not-executable` |
 | `N/A` | Documented gap (e.g. `layer7.sh` `wave2-pending`) | `wave2-pending`, `no-languages-registered`, `<verb>-aggregate-na` |
 
-`UNKNOWN` is **not** a wrapper-emitted enum — it appears in the aggregator when a child wrapper crashes before emitting `STATUS=`, or when stdout streaming breaks. `UNKNOWN` ranks above `FAIL` in the precedence ladder because it signals a dispatcher/wrapper bug, not a real-work failure.
+The two `SKIPPED-NO-VERB` rows above share the `missing-or-not-executable` suffix but are
+distinguished by the `UNEXPECTED` infix: grep `missing-or-not-executable` to catch BOTH
+flavors, grep `UNEXPECTED` to isolate only the bug case (task #50).
+
+`UNKNOWN` is **not** a wrapper-emitted enum — it appears in the aggregator when a child wrapper crashes before emitting `STATUS=` AND its EXIT trap did not fire (e.g. killed `-9`), or when stdout streaming breaks. Since task #50 the 14 verb wrappers self-emit `STATUS=FAIL REASON=wrapper-aborted-early-exit-<rc>` via an EXIT trap when they abort before emitting, so a true `UNKNOWN` is now genuinely exceptional. `UNKNOWN` ranks above `FAIL` in the precedence ladder because it signals a dispatcher/wrapper bug, not a real-work failure; it maps to exit 2.
 
 ### Worst-child STATUS aggregation
 
@@ -107,6 +120,16 @@ LAYER=<n> START=<unix-ts> END=<unix-ts> DURATION=<s> RESULT=<enum> REASON=<reaso
 ```
 
 This is the **layer-level anchor** for greppable triage in `${DEVLOOP_TMP:-/tmp/devloop}/layer-<n>.stderr.log`. EXIT-trap emission is guaranteed even under `set -e` abort or signal-kill — a runbook reader who hits "the orchestrator died mid-layer" still sees the partial layer state in stderr.
+
+**REASON field — stderr carries the cause, stdout carries the summary (task #50).** The
+`REASON=` on THIS stderr `LAYER=` line is the **worst-child attributable cause** — e.g.
+`<lang>-<verb>-UNEXPECTED-verb-missing-or-not-executable`, `wrapper-aborted-early-exit-<rc>`,
+`buf-build-failed` — NOT the generic `layer<n>-summary`. The matching **stdout** `STATUS=`
+summary line keeps `REASON=layer<n>-summary` (a stable machine-parseable token that
+`layer-all.sh` / `verify-completion.sh` read for the enum only). So a non-zero layer names
+WHY on stderr for the on-call, while stdout stays a stable summary for parsers. If you
+grepped `REASON=layer<n>-summary` on stderr before task #50 and now see a specific cause,
+that's the intended improvement, not format drift or a parser bug.
 
 ### Per-layer & total budget warnings (`layer-all.sh`)
 
@@ -264,13 +287,19 @@ Both stages route through the dispatcher (`scripts/build.sh` → `_dispatch.sh::
 **Worked example — proto fail + rust untouched + ts untouched**:
 
 ```
-STATUS=FAIL REASON=buf-build-failed             (proto, stage 1)
+STATUS=FAIL REASON=buf-build-failed             (proto, stage 1; per-child stdout)
 STATUS=SKIPPED-NO-DIFF REASON=rust-no-diff      (stage 2, rust untouched)
 STATUS=SKIPPED-NO-DIFF REASON=ts-no-diff        (stage 2, ts untouched)
-→ Layer 1 RESULT=FAIL REASON=layer1-summary   (worst-child wins)
+STATUS=FAIL REASON=layer1-summary               (aggregated stdout summary line)
+LAYER=1 ... RESULT=FAIL REASON=buf-build-failed (stderr anchor; worst-child cause)
 ```
 
-The stage-2 dispatch runs unconditionally even on stage-1 fail — observability O2 (one run reveals the full picture; don't force a second invocation).
+Two distinct final lines (task #50): the **stdout** `STATUS=` summary keeps the generic
+`REASON=layer<n>-summary` (downstream parsers read it for the enum only); the **stderr**
+`LAYER=…RESULT=…REASON=` anchor now carries the WORST-CHILD reason (`buf-build-failed`
+here), not `layer<n>-summary` — so a non-zero layer names its real cause for 3am triage
+(observability P2). The stage-2 dispatch runs unconditionally even on stage-1 fail —
+observability O2 (one run reveals the full picture; don't force a second invocation).
 
 ### 6.2 Layer 2 — Format (`scripts/layer2.sh`)
 
@@ -345,8 +374,8 @@ dt-guard also emits `WARN dt-guard auxiliary skip: <path> (<error-kind>)` to std
 | REASON token | Wrapper | Cause / Fix |
 |--------------|---------|-------------|
 | `cargo-test-failed` | `lang/rust/test.sh` (`cargo test "$@"`) | A test failed. The wrapper brings up the test postgres container (podman / docker), applies pending sqlx migrations, then runs `cargo test`. Failure output is the cargo test stderr — fix the test. |
-| (no REASON; runtime missing) | `lang/rust/test.sh:detect_runtime` | `Neither podman nor docker found. Please install one.` — install a container runtime. Wrapper aborts before reaching `run_and_emit`, so the STATUS line never emits; the layer aggregates `UNKNOWN`. |
-| (db-bringup failure) | `lang/rust/test.sh:wait_for_db` | `Database did not become ready within ${MAX_WAIT_SECONDS}s` — container started but pg never accepted connections. Check the test container logs. |
+| `wrapper-aborted-early-exit-<rc>` (runtime missing) | `lang/rust/test.sh:detect_runtime` | `Neither podman nor docker found. Please install one.` — install a container runtime. The wrapper aborts before reaching `run_and_emit`; since task #50 its EXIT trap emits `STATUS=FAIL REASON=wrapper-aborted-early-exit-<rc>` so the layer aggregates **FAIL** (not the old silent `UNKNOWN`). `<rc>` is the abort code. |
+| `wrapper-aborted-early-exit-<rc>` (db-bringup failure) | `lang/rust/test.sh:wait_for_db` / `run_migrations_if_needed` | `Database did not become ready within ${MAX_WAIT_SECONDS}s` (or a migration failure) — container started but pg never accepted connections. Same EXIT-trap path: STATUS=FAIL emitted before exit. Check the test container logs. |
 | `nx-test-failed` | `lang/ts/test.sh` (`nx affected -t test:unit test:component`) | A TS unit/component test failed. Run the offending project's test target locally. |
 | `proto-test-sh-missing-or-not-executable` | `_dispatch.sh::for_each_lang_with_verb` | Expected — proto has no `test.sh` per ADR-0033 §1. SKIPPED-NO-VERB ranks below OK, so a co-running OK lang dominates. |
 
@@ -383,6 +412,26 @@ The orchestrator returns the **worst of `(dispatch_rc, breaking_rc)`** — `set 
 | `base-ref-unresolved` | `lang/proto/breaking.sh` — the `base-ref-unresolved` emission (no enclosing function; flat script) | `_get_base_ref.sh` exited non-zero before reaching `buf breaking`. The wrapper distinguishes this from `buf-breaking-failed` so operators don't chase a wire-break issue when the actual problem is a degraded git state. Jump to §5. |
 | `buf-binary-missing` | `lang/proto/breaking.sh` | See §6.1. |
 | `proto-audit-sh-missing-or-not-executable` | `_dispatch.sh::for_each_lang_with_verb` | Expected — proto has no `audit.sh`; `breaking.sh` is the proto audit-class gate, wired separately in `scripts/audit.sh`. |
+| `audit-gate-wrapper-missing-<lang>` | `scripts/audit.sh` (post-dispatch SECURITY guard, task #50) | A `<lang>/audit.sh` that SHOULD exist is missing/non-executable (deleted, `chmod`-stripped, or a new lang dir added without it) — so that lang's dependency-vuln scan silently did NOT run. Without this guard the failure would be MASKED by a sibling lang's passing audit (the rank-0 `SKIPPED-NO-VERB` is dominated by the sibling's `OK`), fail-OPENing a security gate. The guard scans the dispatch output for the `-UNEXPECTED-verb-missing-or-not-executable` marker and emits `STATUS=FAIL` so the layer reds. **Fix**: restore `<lang>/audit.sh` + `chmod +x`, or (if the gap is genuinely intended) add `<lang>:audit` to `__intentional_missing_verbs` in `_dispatch.sh`. Distinct from proto's intentional `-sh-missing-` gap, which never trips the guard. |
+
+**Exit code for `audit-gate-wrapper-missing-<lang>` — FAIL / exit 1 on both paths (task #50).**
+The guard emits `STATUS=FAIL`, so the IN-PIPELINE path (`layer6.sh` keys the layer exit on the
+STATUS stream) aggregates to a layer FAIL → exit 1; the STANDALONE `./scripts/audit.sh` path folds
+its own rc to 1 to match. `FAIL` ("a security gate that should have run did not execute") is the
+honest enum. We deliberately do NOT emit `STATUS=UNKNOWN` to push the layer to exit 2 — UNKNOWN is
+reserved for "no status emitted / child crashed before STATUS" (§3), and a synthetic UNKNOWN with a
+precise REASON would corrupt that meaning. Both paths agree at exit 1; non-zero is fail-closed and
+`layer-all.sh` folds any non-zero → `final_exit=1`.
+
+The one asymmetry that DOES remain is audit-vs-general: an UNEXPECTED missing wrapper for the
+**audit** verb reds as `STATUS=FAIL REASON=audit-gate-wrapper-missing-<lang>` (exit 1) — because
+`scripts/audit.sh` emits an explicit `STATUS=FAIL` to close the security fail-open — whereas a
+general (non-audit) UNEXPECTED verb-missing surfaces as `STATUS=SKIPPED-NO-VERB` with a
+`*-UNEXPECTED-verb-missing-or-not-executable` REASON (exit 2 when it's the aggregate winner; see §7),
+and its cross-lang-masking tail stays in the deferred residual (docs/TODO.md). So: audit gate missing
+→ always reds (FAIL/1, masking closed); general verb missing → reds as SKIPPED-NO-VERB/2 only when it
+wins the aggregate. The audit path is hardened beyond the general path precisely because it guards a
+security control.
 
 **Audit-config ownership reminder**: audit-config changes (`audit-suppressions.toml`, the generated `.cargo/audit.toml` / `.pnpm-audit-ignore.json`, audit-level thresholds, advisory exemptions) are **security-owned** per ADR-0033 §11. Operators should not modify allowlists or suppression flags as part of failure triage — escalate to security. **EXCEPTION — suppression renewal on `suppression-past-due`:** editing `audit-suppressions.toml` to renew an `expires` date (then `--fix` + reviewed PR) IS the sanctioned remediation, NOT a prohibited ad-hoc edit — see the full security-reviewed exception note in §6.3. The prohibition targets silent incident-time silencing (CLI flags, hand-edited derived files, Dependabot alert dismissals, or an unreviewed expires-bump just to unblock CI).
 
@@ -403,8 +452,14 @@ STATUS=FAIL REASON=buf-breaking-failed    (proto/breaking.sh)
 # scripts/audit.sh exit:
 → exit max(0, 1) = 1
 → Layer 6 collects both STATUS lines; aggregate_worst_status OK FAIL = FAIL
-→ Layer 6 RESULT=FAIL REASON=layer6-summary
+→ Layer 6 stdout:  STATUS=FAIL REASON=layer6-summary        (generic summary; enum-only)
+→ Layer 6 stderr:  LAYER=6 ... RESULT=FAIL REASON=buf-breaking-failed  (worst-child cause, task #50)
 ```
+
+The proto `SKIPPED-NO-VERB REASON=proto-audit-sh-missing-or-not-executable` line is the
+INTENTIONAL gap (proto has no `audit.sh`; `breaking.sh` is its audit gate) — exit 0, it
+does not red the layer; the FAIL here is `breaking.sh`. As in §6.1, the stderr `LAYER=`
+anchor names the worst-child cause (`buf-breaking-failed`), not `layer6-summary`.
 
 ### 6.7 Layer 7 — Env-tests (`scripts/layer7.sh`)
 
@@ -422,12 +477,11 @@ When Layer 7 lands, its failure modes will document here. ADR-0030 (host-side cl
 
 ### `STATUS=SKIPPED-NO-VERB` — interpreting the verb-discovery skip
 
-`_dispatch.sh::for_each_lang_with_verb` emits this — the `SKIPPED-NO-VERB` branch inside that function — when `lang/<X>/<verb>.sh` is missing or not executable. Two valid reasons:
+`_dispatch.sh::for_each_lang_with_verb` emits this — the `SKIPPED-NO-VERB` branch inside that function — when `lang/<X>/<verb>.sh` is missing or not executable. Since task #50 (2026-06-08) the REASON token splits this into **three** distinct states, and the exit code now depends on which (see §3 table + ADR-0033 §6 amendment):
 
-1. **Intentional gap** (most common): proto has no `test.sh` (Layer 4) or `audit.sh` (Layer 6) per ADR-0033 §1. The `STATUS=SKIPPED-NO-VERB REASON=<lang>-<verb>-sh-missing-or-not-executable` line is **informative, not a failure** — it ranks below OK so a co-running OK lang dominates.
-2. **Recently-deleted or chmod-stripped wrapper**: verify against ADR-0033 §1 directory listing. If the wrapper should exist, restore it and `chmod +x`.
-
-Operators triaging Layer 4 / 6 see `proto-test-sh-missing-…` / `proto-audit-sh-missing-…` and may worry these indicate a regression. They don't — proto's verb set is deliberately incomplete; `breaking.sh` covers proto's audit-class concerns.
+1. **Intentional gap → exit 0** (most common): the `<lang>:<verb>` is on the documented allowlist (`proto:test`, `proto:audit` — proto has no `test.sh`/`audit.sh` per ADR-0033 §1; `breaking.sh` is proto's audit gate). REASON = `<lang>-<verb>-sh-missing-or-not-executable`. **Informative, not a failure** — ranks below OK so a co-running OK lang dominates, and `status_to_exit_code` maps it to 0. Triaging Layer 4 / 6 you'll see `proto-test-sh-missing-…` / `proto-audit-sh-missing-…` — these are expected, not a regression.
+2. **Unexpected verb-missing → exit 2** (a bug, NOT self-justifying): a verb wrapper that SHOULD exist is missing or not executable (deleted, `chmod`-stripped, or a new lang dir added without the verb). REASON = `<lang>-<verb>-UNEXPECTED-verb-missing-or-not-executable` (the UPPERCASE `UNEXPECTED` infix shouts in logs). The layer **reds** (exit 2, the wiring-fault class with UNKNOWN). **Action**: restore the wrapper and `chmod +x` it — do NOT rationalize this as a deliberate skip. If the gap is genuinely intentional, add `<lang>:<verb>` to the allowlist (`__intentional_missing_verbs` in `_dispatch.sh`; the `DEVLOOP_INTENTIONAL_MISSING_VERBS` env override is test-only, gated behind `DEVLOOP_TEST=1`).
+3. **All langs filtered → exit 0**: `DEVLOOP_DISPATCH_INCLUDE_LANGS` / `EXCLUDE_LANGS` cleared the whole set (operator intent). REASON = `all-langs-filtered`.
 
 ### `STATUS=SKIPPED-NO-DIFF` — diagnosing predicate output
 
@@ -484,8 +538,11 @@ Grep-driven entry point. Match the symptom, jump to the section.
 | `RESULT=FAIL` on a layer; first hit | Read the per-layer subsection | §6 |
 | `PRECONDITION_FAILURE:` at startup | CI shallow clone (or other layer-all precondition) | §4 + §5 |
 | `ERROR:` in a layer stderr log | `_get_base_ref.sh` resolver failure | §4 + §5 |
-| `STATUS=SKIPPED-NO-VERB REASON=proto-test-sh-…` | Expected — proto has no test.sh | §7 |
-| `STATUS=SKIPPED-NO-VERB REASON=proto-audit-sh-…` | Expected — proto has no audit.sh; breaking.sh is the gate | §6.6 + §7 |
+| `STATUS=SKIPPED-NO-VERB REASON=proto-test-sh-…` | Expected — proto has no test.sh (intentional gap, exit 0) | §7 |
+| `STATUS=SKIPPED-NO-VERB REASON=proto-audit-sh-…` | Expected — proto has no audit.sh; breaking.sh is the gate (intentional gap, exit 0) | §6.6 + §7 |
+| `REASON=…-UNEXPECTED-verb-missing-or-not-executable` | A verb wrapper that should exist is missing/`chmod`-stripped — now **reds the layer (exit 2)**, was silently exit 0 pre-task-#50. Restore the wrapper + `chmod +x`. | §7 |
+| `REASON=wrapper-aborted-early-exit-<rc>` | A verb wrapper crashed BEFORE emitting STATUS (e.g. `set -e` abort, `exit 1` in a helper); previously surfaced as a silent `UNKNOWN`. The EXIT trap now emits FAIL with the abort code `<rc>`. | §6.4 + §7 |
+| `REASON=audit-gate-wrapper-missing-<lang>` | A `<lang>/audit.sh` (dependency-vuln scan) is missing/non-executable and would otherwise be MASKED by a sibling lang's passing audit — a fail-OPEN on a SECURITY gate. The `scripts/audit.sh` guard emits STATUS=FAIL so the layer reds (exit 1, both in-pipeline and standalone). Restore the wrapper or allowlist `<lang>:audit`. | §6.6 |
 | `STATUS=N/A REASON=wave2-pending` | Expected — Layer 7 placeholder | §6.7 |
 | `predicate-meta-test-failed` | Lang predicate vs fixture drift | §6.3 + §7 |
 | `predicate-meta-test-failed` after adding a new lang | Missing fixture row in `_test_changed_predicates.sh` | §7 |
@@ -517,8 +574,10 @@ Grep-driven entry point. Match the symptom, jump to the section.
 
 | Escalation target | Trigger |
 |-------------------|---------|
-| operations | A layer reports `RESULT=UNKNOWN` (dispatcher / wrapper bug — child crashed before STATUS line). |
+| operations | A layer reports `RESULT=UNKNOWN` (dispatcher / wrapper bug — child crashed before STATUS line AND its EXIT trap did not fire, e.g. killed `-9`). Since task #50 this is rarer: the 14 verb wrappers self-emit `STATUS=FAIL REASON=wrapper-aborted-early-exit-<rc>` via an EXIT trap when they abort before emitting, so a pre-emit crash now surfaces as `FAIL`, not `UNKNOWN`. A genuine `UNKNOWN` therefore points at a non-trap path. |
+| operations | A layer reports `RESULT=SKIPPED-NO-VERB` with an `*-UNEXPECTED-verb-missing-or-not-executable` REASON (exit 2 — task #50). A verb wrapper that should exist is missing/non-executable (deleted, `chmod`-stripped, or a new lang dir missing a verb). Restore + `chmod +x` it, or add `<lang>:<verb>` to the `__intentional_missing_verbs` allowlist if the gap is genuinely intended. |
 | operations | `BASE_REF=` line missing from a layer's stderr log (resolver did not run; layer-skeleton regression). |
+| operations **AND** security | Layer 6 reports `REASON=audit-gate-wrapper-missing-<lang>` (task #50 SECURITY guard). A dependency-vuln scan wrapper is missing/non-executable — a fail-OPEN on a security gate that the guard caught. Operations: restore `<lang>/audit.sh` + `chmod +x` (or allowlist `<lang>:audit` if the gap is intended). Security: confirm whether the lang's dep-audit coverage lapsed in any prior green run and whether a manual scan is warranted. |
 | infrastructure | A `scripts/lang/_*.sh` helper or `scripts/lang/<X>/<verb>.sh` wrapper itself is broken (not just reporting a real failure). |
 | security | An audit advisory needs an `[advisories.ignore]` entry — policy is security-owned (ADR-0033 §11). |
 | security | An advisory's mean-time-to-resolution exceeds **14 days** — tripwire (ADR-0033 §12). |

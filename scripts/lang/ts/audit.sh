@@ -28,6 +28,7 @@
 set -euo pipefail
 IFS=$'\n\t'
 source "$(dirname "${BASH_SOURCE[0]}")/../_audit_gate.sh"
+install_wrapper_exit_trap  # task #50: emit STATUS=FAIL if we abort before emitting
 
 gate_rc=0
 audit_gate audit_dep_changed_ts || gate_rc=$?

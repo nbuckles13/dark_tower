@@ -31,6 +31,7 @@
 set -euo pipefail
 IFS=$'\n\t'
 source "$(dirname "${BASH_SOURCE[0]}")/../_common.sh"
+install_wrapper_exit_trap  # task #50: BASE_SHA=$(...) can set -e abort before run_and_emit
 
 if ! command -v buf >/dev/null 2>&1; then
   emit_status FAIL "buf-binary-missing"

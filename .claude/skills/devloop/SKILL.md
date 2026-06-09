@@ -400,9 +400,9 @@ Each `scripts/layerN.sh` is independently callable for targeted debugging (e.g.,
 
 **Layer N/A justification template**:
 
-A wrapper script under `scripts/lang/<X>/` may report `STATUS=N/A`, `SKIPPED-NO-DIFF`, or `SKIPPED-NO-VERB` per the wrapper contract in ADR-0033 §6. `scripts/layer-all.sh` records the status + `REASON=…` in its summary table; the implementer does **not** owe Gate 2 a separate explanation in those cases — the wrapper's own `REASON=…` is the justification.
+A wrapper script under `scripts/lang/<X>/` may report `STATUS=N/A`, `SKIPPED-NO-DIFF`, or an **intentional-gap** `SKIPPED-NO-VERB` (REASON `<lang>-<verb>-sh-missing-or-not-executable`, e.g. proto's deliberately-absent `test.sh`/`audit.sh`) per the wrapper contract in ADR-0033 §6. `scripts/layer-all.sh` records the status + `REASON=…` in its summary table; the implementer does **not** owe Gate 2 a separate explanation in *those* cases — the wrapper's own `REASON=…` is the justification. This self-justifying set does NOT include an *unexpected* `SKIPPED-NO-VERB` (REASON `<lang>-<verb>-UNEXPECTED-verb-missing-or-not-executable`): per task #50 that reds the layer (exit 2) and IS a Gate 2 failure the implementer must act on — restore the missing/​non-executable wrapper, do not rationalize it as a deliberate skip.
 
-The only case requiring implementer action is an unexpected `STATUS=N/A` outside the documented skip cases — that indicates a wrapper bug. Escalate to operations rather than defer.
+The cases requiring implementer action are an unexpected `STATUS=N/A` outside the documented skip cases, OR an unexpected `SKIPPED-NO-VERB` (`*-UNEXPECTED-verb-missing-or-not-executable`) — both indicate a wrapper/wiring bug. Escalate to operations rather than defer.
 
 **ARTIFACT-SPECIFIC** (mandatory when detected file types are in the changeset):
 
