@@ -52,5 +52,35 @@ if [ -n "$DEVLOOP_ERRORS" ]; then
     exit 1
 fi
 
+# Gate-2 authority gate (task #51). For a devloop-completion commit (a staged
+# main.md at Phase=complete WITH validated files staged), require a fresh,
+# tree-matching, PASSing pipeline verdict produced by scripts/layer-all.sh — so a
+# pipeline run cannot be asserted in lieu of actually running (skip-vector C).
+#
+# All logic lives in the shared library function gate2_validate_commit (single
+# source with the producer, so the binding can't diverge). It is FAIL-CLOSED: any
+# error, or an absent/FAIL/stale/slug-mismatched verdict for a triggering commit,
+# blocks here; for non-devloop commits it no-ops.
+#
+# LOCAL-ONLY / ADVISORY: this hook is anti-drift, NOT a security boundary —
+# `git commit --no-verify` bypasses it entirely, and an agent with filesystem
+# write can hand-author a PASS verdict. CI's independent from-scratch re-run of
+# layer-all.sh is the only non-bypassable enforcement point
+# (see docs/runbooks/devloop-validation.md).
+echo "  ➜ Checking Gate-2 validation verdict (devloop commits)..."
+__gate2_repo_root="$(git rev-parse --show-toplevel)"
+__gate2_lib="${__gate2_repo_root}/scripts/lang/_gate2_binding.sh"
+if [ ! -f "$__gate2_lib" ]; then
+    # The library is itself a tracked, validated file; its absence means a broken
+    # checkout. Fail closed rather than silently skipping the authority gate.
+    echo ""
+    echo "❌ Gate-2: shared library missing at $__gate2_lib"
+    echo "   Cannot evaluate the validation verdict. Restore the file, or use 'git commit --no-verify' if intentional."
+    exit 1
+fi
+# shellcheck source=../scripts/lang/_gate2_binding.sh
+source "$__gate2_lib"
+gate2_validate_commit || exit 1
+
 echo "✅ All pre-commit checks passed!"
 exit 0

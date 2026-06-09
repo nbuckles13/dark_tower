@@ -79,6 +79,14 @@ jobs:
       # Single end-to-end pipeline call — same router as local devloop's
       # scripts/verify-completion.sh --layer full (ADR-0033 §4). Local repro
       # of an audit failure: `./scripts/layer6.sh`.
+      #
+      # Gate-2 forgery backstop (task #51): this runs layer-all.sh FROM SCRATCH
+      # and deliberately does NOT read the local /tmp/devloop/gate2-verdict
+      # artifact. The verdict is an anti-drift convenience for the local
+      # pre-commit hook (which an agent could forge or bypass with --no-verify);
+      # CI's independent re-run is the only non-bypassable enforcement. Do NOT
+      # "optimize" by trusting the committed/uploaded verdict — that would
+      # reintroduce the authority skip-vector. See docs/runbooks/devloop-validation.md.
       - name: Run polyglot validation pipeline
         env:
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/dark_tower_test

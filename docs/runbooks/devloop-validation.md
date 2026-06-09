@@ -565,6 +565,83 @@ Grep-driven entry point. Match the symptom, jump to the section.
 | Every pipeline emits dozens of `BASE_REF=` lines | Known cost concern (task #42 Tech Debt Pointer #2); cache + suppression-sentinel mitigation tracked, not yet implemented. | §5 (Known cost concern) |
 | `WARN BUDGET_BREACH LAYER=<n>` | A single layer exceeded its budget (default 20s) | §3 |
 | `WARN BUDGET_TOTAL_BREACH` | Always-run subset (layers 3 + 6) exceeded 90s p95 — ADR-0033 §4 budget. | §3 |
+| `❌ Gate-2: no validation verdict found` (at commit) | Devloop-completion commit but no verdict — pipeline never run this session. Run `./scripts/layer-all.sh`. | §8.5 |
+| `❌ Gate-2: verdict is FAIL` (at commit) | The recorded pipeline run did not pass — fix the failing layer(s) and re-run. | §8.5 |
+| `❌ Gate-2: ... signature mismatch` + `modified after validation: <path>` | A validated file changed after the run — re-stage + re-run. | §8.5 |
+| `❌ Gate-2: ... staged but not in verdict: <path>` | A new validated file was staged the verdict never saw — re-run. | §8.5 |
+| `❌ Gate-2: ... validated but not staged: <path>` | A validated (often untracked/transient, e.g. a dirtied lockfile) file is in the verdict but not staged — re-run, or `--no-verify` if intentional. | §8.5 |
+| `❌ Gate-2: verdict is for a different devloop` | Stale verdict from another devloop in the same `/tmp` session — re-run for THIS one. | §8.5 |
+| `❌ Gate-2: shared library missing` | Broken checkout (`scripts/lang/_gate2_binding.sh` absent) — restore it, or `--no-verify` if intentional. | §8.5 |
+
+---
+
+## 8.5 Gate-2 Authority Verdict (commit-time enforcement)
+
+The pre-commit hook (`.githooks/pre-commit`, wired via `core.hooksPath`) enforces a
+**Gate-2 authority verdict** for devloop-completion commits. This closes skip-vector
+**C**: a Lead (or agent) asserting a pipeline pass *in lieu of* actually running it.
+The producer is `scripts/layer-all.sh`, which emits `/tmp/devloop/gate2-verdict` as
+its final step via an `EXIT` trap (`scripts/lang/_gate2_binding.sh::emit_gate2_verdict`);
+the validator is `scripts/lang/_gate2_binding.sh::gate2_validate_commit`. Design:
+`docs/devloop-outputs/2026-06-09-gate2-authority-verdict-gate/main.md`.
+
+### Threat model — READ THIS before trusting the hook
+
+The local hook is **anti-drift / anti-laziness, NOT anti-forgery, and NOT a security
+boundary.** Two facts make that explicit:
+
+1. **Bypassable.** `git commit --no-verify` skips the hook entirely. It is also the
+   intended escape hatch (see Rollback below) — so a developer who knows the verdict
+   is wrong/transient can still commit deliberately.
+2. **Forgeable.** An agent (or human) with filesystem write can hand-author a
+   well-formed `gate2-verdict` whose signature matches the staged tree. The verdict is
+   a flat text file in `/tmp`; nothing cryptographically binds it to a *real* run.
+
+The only **non-bypassable** enforcement is **CI**: `.github/workflows/ci.yml` re-runs
+`./scripts/layer-all.sh` from scratch on every push/PR and **never reads** the `/tmp`
+artifact. That independent re-run is the forgery defense — which is also why the
+artifact is ephemeral in `/tmp` and is never committed. Treat the local hook as a fast
+"did you actually run it / has the tree drifted since" check, and CI as the source of
+truth.
+
+### When the hook requires a verdict (trigger)
+
+Both must hold (`gate2_validate_commit`):
+1. a **staged** `docs/devloop-outputs/<slug>/main.md` is at **Phase=complete**, AND
+2. the **staged changeset minus exclusions** contains ≥1 file.
+
+Exclusions (mirror `crates/dt-guard/src/cross_boundary_scope.rs::is_symmetric_exclusion`,
+plus a tree-wide `docs/devloop-outputs/**` widening): `docs/devloop-outputs/**`,
+`docs/TODO.md`, `docs/specialist-knowledge/*/INDEX.md`, `docs/user-stories/*.md`. A
+main.md-only edit (validated set empty) therefore no-ops; a non-devloop commit no-ops.
+The hook is **FAIL-CLOSED**: any error evaluating the trigger or verdict blocks.
+
+### Failure shapes (all block the commit)
+
+| Hook message | Meaning | Fix |
+|--------------|---------|-----|
+| `no validation verdict found` | No verdict file — pipeline never ran this session. | `./scripts/layer-all.sh`, then commit. |
+| `verdict is FAIL` | The run did not pass (`GATE2=FAIL`, emitted even on early-exit via the trap). | Fix the failing layer(s) (§6), re-run. |
+| `signature mismatch` → `modified after validation: <path>` | A validated file changed after the run. | Re-stage + re-run. |
+| `signature mismatch` → `staged but not in verdict: <path>` | A new validated file was staged the verdict never bound. | Re-run so the new file is bound. |
+| `signature mismatch` → `validated but not staged: <path>` | A path the verdict bound is not in the staged commit. Common benign cause: a layer transiently **dirtied a lockfile** (`Cargo.lock`/`pnpm-lock.yaml`) the producer saw in the worktree but you never staged. | If the lockfile change is real, `git add` it and re-run. If transient/unwanted, revert it and re-run — or `git commit --no-verify` if you are sure the staged tree is correct. (Lockfiles are deliberately NOT excluded: a *real* committed lockfile change must stay bound.) |
+| `verdict is for a different devloop` | Stale verdict (`SLUG=` mismatch) from another devloop in the same `/tmp` session. | Re-run for the devloop you are committing. |
+| `shared library missing` | `scripts/lang/_gate2_binding.sh` absent — broken checkout. | Restore the file, or `--no-verify` if intentional. |
+
+### Rollback / escape hatch
+
+If a hook bug ever **wedges** a legitimate commit, `git commit --no-verify` bypasses it.
+That is the documented escape hatch while diagnosing — but remember CI still re-runs the
+full pipeline, so a genuinely failing tree will be caught there regardless.
+
+### Isolation self-test
+
+`scripts/guards/simple/selftest-gate2-verdict.sh` drives the producer + validator against
+synthetic staged trees in throwaway temp git repos, covering the verification matrix
+(a–f) plus slug-mismatch and extra-staged-file drift. It runs in Layer 3 (guards) every
+devloop and in CI, and emits the ADR-0033 `STATUS=` contract line. Run it standalone to
+reproduce a hook-logic regression without touching your real index:
+`./scripts/guards/simple/selftest-gate2-verdict.sh`.
 
 ---
 
@@ -612,3 +689,4 @@ Bare `:<NN>` line cites are forbidden — they drift the moment a file grows by 
 |------|--------|---------|
 | 2026-05-14 | operations (task #39) | Initial creation. Documents `scripts/layer-all.sh` + Layers 1-7 + shared helpers as of commit `0130ce8`. Closes ADR-0033 Wave 3 #8. |
 | 2026-05-14 | operations (doc-citation guards devloop) | Sweep: converted ~21 bare-line cites to function-name anchors. Added §10 "Cite Convention" documenting the form Guards A+C enforce. |
+| 2026-06-09 | infrastructure (task #51) | Added §8.5 "Gate-2 Authority Verdict" — commit-time verdict enforcement (skip-vector C), threat model (local = anti-drift/bypassable, CI = forgery backstop), trigger + failure shapes + `--no-verify` escape hatch + isolation self-test. Added catalogue rows for the `❌ Gate-2:` messages. |

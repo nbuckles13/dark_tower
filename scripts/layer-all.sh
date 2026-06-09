@@ -21,7 +21,37 @@ IFS=$'\n\t'
 
 __here="$(cd "$(dirname "$0")" && pwd)"
 source "${__here}/lang/_common.sh"
+# Gate-2 authority gate (task #51): shared producer/hook library. Provides
+# emit_gate2_verdict + the binding/exclusion/signature/slug primitives. Self-
+# contained (no _common.sh dependency); sourced here for the producer side.
+source "${__here}/lang/_gate2_binding.sh"
 init_devloop_tmp
+
+# Per-layer result/duration accumulators — declared BEFORE the EXIT trap installs
+# so emit_gate2_verdict's namerefs always bind to existing (possibly-empty) arrays,
+# even on an early exit that fires before the layer loop populates them.
+declare -a layer_status layer_dur
+final_exit=0
+
+# Gate-2 producer: emit the tree-bound verdict as the pipeline's FINAL step via an
+# EXIT trap (task #51; design main.md §Design point 1). Installing it HERE — before
+# the sentinel/precondition checks below — guarantees a verdict file even when those
+# early-exit (GATE2=FAIL + LAYER_ALL_EXIT=<rc>), so a MISSING file means exclusively
+# "layer-all.sh was never invoked" (the authority skip-vector the hook catches).
+#
+# Capture the real exit code FIRST so a git/sha256 error inside the emitter cannot
+# mutate it; restore the default trap and re-exit with the captured code. Emit
+# failures are logged but never change the pipeline's verdict exit.
+__gate2_emit_trap() {
+  local __rc=$?
+  trap - EXIT
+  if ! emit_gate2_verdict "$__rc" layer_status layer_dur 2>>"${DEVLOOP_TMP}/gate2-emit.stderr.log"; then
+    printf 'WARN gate2: verdict emit failed (see %s/gate2-emit.stderr.log); exit code preserved as %s\n' \
+      "${DEVLOOP_TMP}" "$__rc" >&2
+  fi
+  exit "$__rc"
+}
+trap '__gate2_emit_trap' EXIT
 
 # CI-SENTINEL-LEAK runtime assertion (task #47, §J/C — security trust boundary).
 # Shared single-locus check in _common.sh; called here (full pipeline) and from
@@ -54,10 +84,10 @@ fi
 # Cleanup prior run's logs (paired-operations §4).
 rm -f "${DEVLOOP_TMP}"/layer-*.log "${DEVLOOP_TMP}"/layer-*.stderr.log "${DEVLOOP_TMP}"/changed-files.layer-*
 
-declare -a layer_status layer_dur
+# layer_status / layer_dur / final_exit are declared at the top (before the EXIT
+# trap install) so the verdict emitter's namerefs always bind.
 budget_secs_per_layer="${DEVLOOP_LAYER_BUDGET_SECS:-20}"
 total_budget_secs=90  # ADR-0033 §4: 90s p95 wall-clock for the always-run set (layers 3 + 6)
-final_exit=0
 
 for n in 1 2 3 4 5 6 7; do
   start=$(date +%s)
