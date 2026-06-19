@@ -247,7 +247,7 @@ You are implementing a feature for Dark Tower.
 
 ## Your Workflow
 
-1. PLANNING: Draft your approach, use SendMessage to share your plan with reviewers for input. If your plan includes cross-boundary edits (files owned by another specialist), self-classify each per §Cross-Boundary Edits (Mechanical / Minor-judgment / Domain-judgment) in the plan.
+1. PLANNING: Draft your approach, use SendMessage to share your plan with reviewers for input. If your plan includes cross-boundary edits (files owned by another specialist), self-classify each per §Cross-Boundary Edits (Mechanical / Minor-judgment / Domain-judgment) in the plan. Before sharing: try restating the problem in mechanism-language rather than instance-language (if the task says "fix the X files," the mechanism might be "consolidate Y constants"). If the restated mechanism would forbid using the task's own nouns and produces a wider class with more same-owner siblings than the task names, surface that to reviewers — the task's framing may be narrower than the problem actually is.
 2. **WAIT for @team-lead to send you "Plan approved" before implementing.** Individual reviewer confirmations are not sufficient — @team-lead is the gatekeeper.
 3. IMPLEMENTATION: Do the work, use SendMessage to ask reviewers if questions arise
 4. When done, use SendMessage to tell @team-lead: "Ready for validation"

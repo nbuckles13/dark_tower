@@ -93,6 +93,7 @@ The cost-of-fix-later side of the inequality includes: (a) the same fix later co
 - "It's minor" / "it's low priority" / "it's not important" → severity is not deferral justification
 - "It works as-is" → if it's a finding, something is wrong; deferral isn't acceptance
 - "We can do it later" → not a justification; explain WHY now is harder than later
+- "The task didn't ask for the other instances" → if the finding is one of N same-owner same-mechanism siblings, "out of stated scope" is the framing-lock bug, not a valid deferral reason. Either fix the class (preferred), or file a same-owner follow-up task with the specific siblings named — never leave it as "out of scope." Cross-owner siblings are the exception and route through ADR-0024 §6.3.
 
 ### Patterns where the cost math sometimes favors deferral
 - Requires changing files outside the PR's changeset **and** the change is non-trivial (>~10 LoC or touches test surface)
