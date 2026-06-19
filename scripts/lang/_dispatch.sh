@@ -2,7 +2,8 @@
 # _dispatch.sh — per-verb dispatcher (ADR-0033 §6).
 #
 # Provides for_each_lang_with_verb: iterates scripts/lang/<X>/, runs each language's
-# changed.sh, then invokes the requested verb script (or emits SKIPPED-NO-VERB).
+# changed.sh, then invokes the requested verb script (or emits FAIL-MISSING-VERB if a
+# verb wrapper that should exist is missing/non-executable).
 #
 # STATUS line emission rule (paired-operations Q3):
 #   - 1 lang touched, 1 STATUS streamed → final stdout = that single STATUS;
@@ -22,50 +23,14 @@ __here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=_common.sh
 source "${__here}/_common.sh"
 
-# Intentional verb-missing allowlist (task #50). proto deliberately has no test.sh
-# (Layer 4) nor audit.sh (Layer 6 — breaking.sh is its audit gate), per ADR-0033 §1.
-# Those gaps are EXPECTED and must keep exiting 0; every OTHER missing/non-executable
-# verb wrapper is a WIRING fault and must exit 2 (UNEXPECTED).
-#
-# Production reads a HARDCODED constant. The DEVLOOP_INTENTIONAL_MISSING_VERBS override
-# is honored ONLY under the test sentinel DEVLOOP_TEST=1 (security BLOCKING item 1) —
-# mirroring _audit_gate.sh:__audit_pnpm_ignore_path. An unconditional env surface would
-# let any caller downgrade a genuinely-missing security gate from exit-2 back to exit-0,
-# re-opening the exact silent-skip class this task closes. Reusing DEVLOOP_TEST keeps
-# the seam under the existing assert_no_ci_sentinel_leak trust boundary (_common.sh) —
-# no parallel sentinel, no new uncovered CI hole (security item 2).
-#
-# Format: space-separated `lang:verb` tokens.
-# Args: (none — reads env)
-# Outputs: stdout=space-separated lang:verb allowlist
-# Returns: 0
-__intentional_missing_verbs() {
-  if [[ "${DEVLOOP_TEST:-}" == "1" && -n "${DEVLOOP_INTENTIONAL_MISSING_VERBS:-}" ]]; then
-    printf '%s\n' "$DEVLOOP_INTENTIONAL_MISSING_VERBS"
-  else
-    printf '%s\n' "proto:test proto:audit"   # production constant — literal, not env-derived
-  fi
-}
-
-# Is this lang:verb an INTENTIONAL (documented, exit-0) verb gap?
-# Authoritative source-side check (test-reviewer): keys off ALLOWLIST MEMBERSHIP, not
-# reason-string shape — so the dispatcher's exit decision can never be fooled by a
-# reason token's spelling. (The layer edge, which lacks lang:verb context, keys off the
-# UNEXPECTED reason marker via __is_intentional_gap_reason instead.)
-# Args: $1=lang  $2=verb
-# Returns: 0 (true) if lang:verb is in the allowlist; 1 (false) otherwise
-__is_intentional_gap() {
-  local want="$1:$2" tok
-  # Split the allowlist on whitespace explicitly: _common.sh sets IFS=$'\n\t' (no
-  # space), so a bare `for tok in $(…)` or `read -ra` under the inherited IFS would
-  # NOT split the space-separated list. Set a space IFS for the read only.
-  local -a allow
-  IFS=$' \t\n' read -r -a allow <<<"$(__intentional_missing_verbs)"
-  for tok in "${allow[@]}"; do
-    [[ "$tok" == "$want" ]] && return 0
-  done
-  return 1
-}
+# Intentional verb gaps are registered as PLACEHOLDER verb scripts (task #52,
+# filesystem-as-source-of-truth): a lang that deliberately has no real <verb>.sh ships a
+# one-line wrapper emitting `STATUS=N/A REASON=not-applicable-to-this-lang` (see
+# scripts/lang/proto/{test,audit}.sh). With placeholders present, a verb script that is
+# genuinely MISSING/non-executable is ALWAYS a wiring fault — the dispatcher emits
+# FAIL-MISSING-VERB unconditionally (no allowlist, no allowlist↔filesystem drift). This
+# replaces #50's lang:verb intentional-gap allowlist (and its test-only env seam);
+# readers of scripts/lang/<X>/ now see an intentional gap at the filesystem level.
 
 # Iterate language directories under DEVLOOP_LANG_ROOT (default: scripts/lang/),
 # run each language's changed.sh, and dispatch the requested verb.
@@ -205,19 +170,14 @@ for_each_lang_with_verb() {
       # we want the full picture per ADR philosophy.
       _ignored_rc=$rc  # avoid unused-var lint
     else
-      # Verb script missing-or-not-executable. Reason is keyed off ALLOWLIST
-      # MEMBERSHIP (task #50): an intentional gap (proto:test/proto:audit) keeps the
-      # historical `-sh-missing-or-not-executable` token and exits 0; everything else
-      # is a WIRING fault → the loud UNEXPECTED token, which status_to_exit_code maps
-      # to exit 2. The UNEXPECTED suffix is the shared DEVLOOP_UNEXPECTED_VERB_SUFFIX
-      # constant in _common.sh — SAME literal the layer's __is_intentional_gap_reason
-      # matches on (single source of truth; test-reviewer item 4).
-      lang_status="SKIPPED-NO-VERB"
-      if __is_intentional_gap "$name" "$verb"; then
-        lang_reason="${name}-${verb}-sh-missing-or-not-executable"
-      else
-        lang_reason="${name}-${verb}${DEVLOOP_UNEXPECTED_VERB_SUFFIX}"
-      fi
+      # Verb script genuinely missing-or-not-executable → always a WIRING fault
+      # (task #52). Intentional gaps register as placeholder <verb>.sh scripts that
+      # emit N/A (taking the `-x` branch above), so reaching HERE means a wrapper that
+      # should exist is missing/chmod-stripped — FAIL-MISSING-VERB (rank 5), which
+      # status_to_exit_code maps to exit 2 (§6 wiring-fault class). No allowlist: the
+      # enum carries the semantics, so a sibling lang's OK can never mask this.
+      lang_status="FAIL-MISSING-VERB"
+      lang_reason="${name}-${verb}-verb-missing-or-not-executable"
       emit_status "$lang_status" "$lang_reason"
       child_statuses+=("$lang_status")
       child_reasons+=("$lang_reason")
@@ -229,30 +189,30 @@ for_each_lang_with_verb() {
   if [[ $lang_count -gt 1 ]]; then
     local agg worst_reason i pairs
     agg=$(aggregate_worst_status "${child_statuses[@]}")
-    # Worst-exit-driving reason among children sharing the winning enum (task #50):
-    # so a SKIPPED-NO-VERB aggregate whose winning reason is UNEXPECTED returns exit 2
-    # instead of flattening to status_to_exit_code SKIPPED-NO-VERB=0 (the :162 hole).
+    # Pick a representative reason among children sharing the winning enum, for the
+    # emitted line (so a FAIL-MISSING-VERB aggregate names the offending lang/verb, not
+    # a flattened token). With FAIL-MISSING-VERB ranked above OK (task #52), a missing
+    # verb wins the aggregate over a sibling's clean run — masking closed at the ladder,
+    # no reason→exit coupling needed.
     pairs=()
     for ((i = 0; i < ${#child_statuses[@]}; i++)); do
       pairs+=("${child_statuses[i]}" "${child_reasons[i]:-}")
     done
     worst_reason=$(worst_reason_for_status "$agg" "${pairs[@]}")
     case "$agg" in
-      OK)               emit_status OK              "${verb}-all-langs-ok" ;;
-      SKIPPED-NO-DIFF)  emit_status SKIPPED-NO-DIFF "all-langs-untouched" ;;
-      # Emit the worst child's REASON (which carries the UNEXPECTED marker when a
-      # verb-missing wiring fault drove the aggregate) rather than flattening it away —
-      # so the exit code AND the emitted line agree on why.
-      SKIPPED-NO-VERB)  emit_status SKIPPED-NO-VERB "$worst_reason" ;;
-      N/A)              emit_status N/A             "${verb}-aggregate-na" ;;
-      FAIL)             emit_status FAIL            "${verb}-some-lang-failed" ;;
-      *)                emit_status FAIL            "${verb}-aggregate-unknown" ;;
+      OK)                 emit_status OK                "${verb}-all-langs-ok" ;;
+      SKIPPED-NO-DIFF)    emit_status SKIPPED-NO-DIFF   "all-langs-untouched" ;;
+      SKIPPED-NO-VERB)    emit_status SKIPPED-NO-VERB   "$worst_reason" ;;
+      N/A)                emit_status N/A               "${verb}-aggregate-na" ;;
+      FAIL)               emit_status FAIL              "${verb}-some-lang-failed" ;;
+      # Emit the offending lang/verb REASON so the loud exit names why.
+      FAIL-MISSING-VERB)  emit_status FAIL-MISSING-VERB "$worst_reason" ;;
+      *)                  emit_status FAIL              "${verb}-aggregate-unknown" ;;
     esac
-    return "$(status_to_exit_code "$agg" "$worst_reason")"
+    return "$(status_to_exit_code "$agg")"
   fi
 
-  # Single-lang path: derive return code from the one child (status + reason), so a
-  # single touched lang with an UNEXPECTED verb-missing returns exit 2 (the headline
-  # criterion-(b) case).
-  return "$(status_to_exit_code "${child_statuses[0]:-UNKNOWN}" "${child_reasons[0]:-}")"
+  # Single-lang path: derive return code from the one child's enum, so a single touched
+  # lang with a missing verb returns exit 2 (FAIL-MISSING-VERB → §6 wiring-fault class).
+  return "$(status_to_exit_code "${child_statuses[0]:-UNKNOWN}")"
 }

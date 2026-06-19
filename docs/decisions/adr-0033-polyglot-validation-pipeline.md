@@ -226,11 +226,11 @@ Every per-language wrapper (`lang/<X>/<verb>.sh`) honors a uniform exit-and-outp
 
 | Exit code | Meaning |
 |-----------|---------|
-| 0         | OK / SKIPPED-NO-DIFF / SKIPPED-NO-VERB (intentional gap or all-langs-filtered) / N/A-with-reason (success) |
+| 0         | OK / SKIPPED-NO-DIFF / SKIPPED-NO-VERB (all-langs-filtered, operator intent) / N/A-with-reason (success; incl. intentional-gap placeholders) |
 | 1         | FAIL (the work ran and detected a problem) |
-| 2         | Wrapper / dispatcher bug (unexpected error; investigate the script itself) — incl. SKIPPED-NO-VERB for an *unexpected* missing/non-executable verb wrapper (see 2026-06-08 amendment) |
+| 2         | Wrapper / dispatcher bug (unexpected error; investigate the script itself) — incl. `FAIL-MISSING-VERB` for a verb wrapper that should exist but is missing/non-executable, and `UNKNOWN` (see 2026-06-19 amendment) |
 
-Final stdout line: `STATUS=<OK|FAIL|SKIPPED-NO-DIFF|SKIPPED-NO-VERB|N/A> REASON=<short string, no spaces in value>`. Dispatchers parse this for aggregation; CI summary jobs reuse the same parser.
+Final stdout line: `STATUS=<OK|FAIL|FAIL-MISSING-VERB|SKIPPED-NO-DIFF|SKIPPED-NO-VERB|N/A> REASON=<short string, no spaces in value>`. Dispatchers parse this for aggregation; CI summary jobs reuse the same parser.
 
 **Verb discovery via file existence.** Per-verb dispatchers (`scripts/{audit,lint,test,fmt,build}.sh`) iterate `scripts/lang/*/`:
 
@@ -244,29 +244,45 @@ for_each_lang_with_verb "test" || exit 1
 1. Iterates `lang/*/` directories (excluding underscore-prefixed)
 2. For each language, lints that `changed.sh` exists (fails loud if not)
 3. If the requested verb script exists and is executable, invokes it (with skip-if-untouched short-circuit via `changed.sh`)
-4. If the verb script is missing or not executable, emits `STATUS=SKIPPED-NO-VERB REASON=<lang>/<verb>.sh missing-or-not-executable` — never silently continues
+4. If the verb script is missing or not executable, emits `STATUS=FAIL-MISSING-VERB REASON=<lang>-<verb>-verb-missing-or-not-executable` (exit 2) — never silently continues. A lang that *intentionally* has no real `<verb>.sh` ships a one-line placeholder wrapper emitting `STATUS=N/A` instead (see the placeholder convention below), so reaching this branch always means a wiring fault.
 
-This means proto's lack of `test.sh` produces a visible `SKIPPED-NO-VERB` entry in the layer log, not silent absence.
+This means a deleted/`chmod`-stripped wrapper produces a loud `FAIL-MISSING-VERB` entry that reds the layer (it outranks a sibling lang's OK — see §STATUS aggregation), while proto's deliberate lack of a real `test.sh`/`audit.sh` shows up as a benign `N/A` from its placeholder, not silent absence.
 
-**Amendment (2026-06-08, task #50):** the `SKIPPED-NO-VERB` exit code is now
-REASON-dependent. An *intentional* gap — `<lang>:<verb>` on the documented allowlist
-(`proto:test`, `proto:audit`), REASON `<lang>-<verb>-sh-missing-or-not-executable` — and
-the `all-langs-filtered` operator-intent case remain in the **exit-0 success class**
-(table row 0 above). An *unexpected* missing-or-non-executable verb wrapper (one that
-should exist — deleted, `chmod`-stripped, or a new lang dir added without the verb),
-REASON `<lang>-<verb>-UNEXPECTED-verb-missing-or-not-executable`, is a WIRING fault and
-maps to **exit 2** — the existing "wrapper/dispatcher bug; investigate the script itself"
-class (table row 2 above), alongside `UNKNOWN`. This closes the silent-skip-at-pipeline-
-edge regression: a missing verb wrapper can no longer be rationalized as a deliberate
-skip. Separately, the per-language verb wrappers now install an EXIT trap that emits
-`STATUS=FAIL REASON=wrapper-aborted-early-exit-<rc>` if the wrapper aborts BEFORE emitting
-a STATUS line (e.g. `set -e` abort in DB bring-up), so a pre-emit crash surfaces as FAIL
-(exit 1) rather than an empty pipe the aggregator reads as `UNKNOWN`. The intentional-gap
-allowlist lives in `_dispatch.sh` (`__intentional_missing_verbs`); its
-`DEVLOOP_INTENTIONAL_MISSING_VERBS` override is honored ONLY under `DEVLOOP_TEST=1`
-(production reads the hardcoded constant). See
-`docs/devloop-outputs/2026-06-08-silent-skip-class-fix-task50/` and
-`docs/runbooks/devloop-validation.md` §3/§6.4/§7/§8.
+**Amendment (2026-06-19, task #52 — supersedes the 2026-06-08/task-#50 mechanism):** a
+verb wrapper that should exist but is missing/non-executable is its own STATUS enum,
+**`FAIL-MISSING-VERB`**, ranked in the aggregation ladder ABOVE `OK` and `FAIL` (below
+`UNKNOWN`) and mapped to **exit 2** — the existing "wrapper/dispatcher bug; investigate
+the script itself" wiring-fault class (table row 2 above), alongside `UNKNOWN`. Because
+it outranks `OK`, a missing wrapper can no longer be masked by a sibling lang's clean run
+(the cross-lang-masking residual #50 left open and patched only for the audit slice). The
+exit code is now a **pure function of the aggregate enum** — no REASON is consulted (#50's
+reason→exit coupling is retired; the enum carries the semantics directly).
+
+**Registering an intentional gap — the placeholder convention (canonical).** A language
+that deliberately has no real `<verb>.sh` ships a one-line placeholder wrapper:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
+source "$(dirname "${BASH_SOURCE[0]}")/../_common.sh"
+emit_status N/A not-applicable-to-this-lang
+```
+
+The dispatcher then sees an executable wrapper emitting `N/A` (exit 0) — a benign,
+self-documenting gap visible at the filesystem level (`ls scripts/lang/<X>/`). This
+replaces #50's `__intentional_missing_verbs` allowlist and its `DEVLOOP_TEST`-gated env
+seam (both removed — no allowlist↔filesystem drift). `proto/test.sh` and `proto/audit.sh`
+are the worked examples (`buf` contract checks / `breaking.sh` are proto's real gates).
+`SKIPPED-NO-VERB` now has a single producer: the `all-langs-filtered` operator-intent
+case (exit 0).
+
+Separately (unchanged from #50), the per-language verb wrappers install an EXIT trap that
+emits `STATUS=FAIL REASON=wrapper-aborted-early-exit-<rc>` if the wrapper aborts BEFORE
+emitting a STATUS line (e.g. `set -e` abort in DB bring-up), so a pre-emit crash surfaces
+as FAIL (exit 1) rather than an empty pipe the aggregator reads as `UNKNOWN`. See
+`docs/devloop-outputs/2026-06-19-polyglot-ladder-cleanup/` and
+`docs/runbooks/devloop-validation.md` §3/§6/§7/§8.
 
 ### 7. Diff Base Resolution
 

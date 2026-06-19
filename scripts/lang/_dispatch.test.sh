@@ -120,23 +120,23 @@ EOF
 }
 
 # -----------------------------------------------------------------------------
-# Test: stream-verbatim contract (test-reviewer ask post-Gate-1)
+# Test: stream-verbatim contract + cross-lang-masking CLOSED (task #52).
 #
-# With the precedence reorder (NO-DIFF beats NO-VERB), the layer's aggregated
-# STATUS will MASK a NO-VERB child by promoting NO-DIFF. The structural-error
-# signal must remain visible somewhere — that "somewhere" is the per-child
-# STATUS line surviving in the layer's stdout VERBATIM.
+# Pairs touched_no_verb (a verb wrapper that should exist is missing → FAIL-MISSING-VERB,
+# rank 5) with untouched (SKIPPED-NO-DIFF, rank 1). This is the fixture that #50
+# documented as the masking RESIDUAL (back then the no-verb child was SKIPPED-NO-VERB
+# rank 0, dominated by the sibling → dispatcher exited 0). With FAIL-MISSING-VERB ranked
+# above OK/NO-DIFF, the residual is CLOSED: the wiring fault wins the aggregate and the
+# dispatcher exits 2 — no sibling status can mask it.
 #
-# This test enforces: when one child emits NO-DIFF and another emits NO-VERB,
-#   (a) the dispatcher's aggregated STATUS line is NO-DIFF (per precedence),
-#   (b) the per-child NO-VERB STATUS line is present VERBATIM in the dispatcher's
-#       stdout — not silenced, not aggregated-away.
-#
-# If a future refactor accidentally drops verbatim streaming (e.g. swallows
-# child stdout, only emits aggregated), this test catches it loud.
+# This test enforces:
+#   (a) the dispatcher's aggregated STATUS line is FAIL-MISSING-VERB (per the new rank),
+#       and the dispatcher exits 2,
+#   (b) BOTH per-child STATUS lines survive VERBATIM in stdout — not silenced, not
+#       aggregated-away (the loud-on-missing-verb streaming invariant).
 # -----------------------------------------------------------------------------
 
-test_stream_verbatim_contract() {
+test_stream_verbatim_masking_closed() {
   local tmp; tmp=$(mktemp -d)
   trap "rm -rf '$tmp'" RETURN
 
@@ -144,46 +144,38 @@ test_stream_verbatim_contract() {
   cp "${__here}/_common.sh" "${tmp}/lang/_common.sh"
   cp "${__here}/_dispatch.sh" "${tmp}/lang/_dispatch.sh"
 
-  # NOTE (task #50 cross-lang-masking residual — do NOT "fix" this expecting a red):
-  # this fixture pairs touched_no_verb (UNEXPECTED verb-missing, enum SKIPPED-NO-VERB)
-  # with untouched (SKIPPED-NO-DIFF, rank 1). The aggregate winner is SKIPPED-NO-DIFF,
-  # so the UNEXPECTED child's enum != the winner and it is EXCLUDED from the worst-reason
-  # pick → the dispatcher exits 0. That is the documented masking residual (a sibling
-  # non-bug status masks a single unexpected verb-missing); the headline criterion-(b)
-  # red is the SINGLE-lang case (test_unexpected_verb_missing_single_lang below). This
-  # test only asserts STATUS lines (not the exit code), so it stays green by design.
-  #
-  # touched_no_verb: changed.sh says "touched", but no test.sh exists.
-  # Dispatcher should emit STATUS=SKIPPED-NO-VERB for this lang.
+  # touched_no_verb: changed.sh says "touched", but no test.sh exists → FAIL-MISSING-VERB.
   cat > "${tmp}/lang/touched_no_verb/changed.sh" <<'EOF'
 #!/usr/bin/env bash
 exit 0
 EOF
   chmod +x "${tmp}/lang/touched_no_verb/changed.sh"
-  # No test.sh — dispatcher must emit SKIPPED-NO-VERB for this lang.
+  # No test.sh — dispatcher must emit FAIL-MISSING-VERB for this lang.
 
-  # untouched: changed.sh says "untouched" (exit 1).
-  # Dispatcher should emit STATUS=SKIPPED-NO-DIFF for this lang.
+  # untouched: changed.sh says "untouched" (exit 1) → SKIPPED-NO-DIFF.
   cat > "${tmp}/lang/untouched/changed.sh" <<'EOF'
 #!/usr/bin/env bash
 exit 1
 EOF
   chmod +x "${tmp}/lang/untouched/changed.sh"
 
-  local out
+  local out rc
   out=$(
+    set +e
     DEVLOOP_LANG_ROOT="${tmp}/lang" bash -c "
       source '${tmp}/lang/_dispatch.sh'
       for_each_lang_with_verb 'test'
     " 2>&1
+    echo "__rc=$?"
   )
+  rc=$(grep -oE '__rc=[0-9]+' <<<"$out" | tail -n1 | cut -d= -f2)
 
-  # (b) per-child NO-VERB line MUST be in the verbatim stream.
-  if grep -q '^STATUS=SKIPPED-NO-VERB.*touched_no_verb' <<<"$out"; then
+  # (b) per-child FAIL-MISSING-VERB line MUST be in the verbatim stream.
+  if grep -q '^STATUS=FAIL-MISSING-VERB.*touched_no_verb' <<<"$out"; then
     PASS=$((PASS + 1))
   else
     FAIL=$((FAIL + 1))
-    FAILURES+=("[stream-verbatim] per-child SKIPPED-NO-VERB for touched_no_verb missing from stdout
+    FAILURES+=("[stream-verbatim] per-child FAIL-MISSING-VERB for touched_no_verb missing from stdout
   output:
 ${out}
   → ADR-0033 §6 'loud-on-missing-verb' invariant relies on verbatim streaming")
@@ -197,18 +189,20 @@ ${out}
     FAILURES+=("[stream-verbatim] per-child SKIPPED-NO-DIFF for untouched missing from stdout: ${out}")
   fi
 
-  # (a) aggregated dispatcher STATUS line is the LAST STATUS= line; per locked
-  # precedence (FAIL > N/A > OK > SKIPPED-NO-DIFF > SKIPPED-NO-VERB) it should
-  # be SKIPPED-NO-DIFF since it beats SKIPPED-NO-VERB.
+  # (a) aggregated dispatcher STATUS line is the LAST STATUS= line; FAIL-MISSING-VERB
+  # (rank 5) wins over SKIPPED-NO-DIFF (rank 1) — masking closed.
   local last_status
   last_status=$(grep '^STATUS=' <<<"$out" | tail -n1 | sed -n 's/^STATUS=\([^ ]*\).*/\1/p')
-  if [[ "$last_status" == "SKIPPED-NO-DIFF" ]]; then
+  if [[ "$last_status" == "FAIL-MISSING-VERB" ]]; then
     PASS=$((PASS + 1))
   else
     FAIL=$((FAIL + 1))
-    FAILURES+=("[stream-verbatim] aggregated STATUS expected SKIPPED-NO-DIFF, got '${last_status}'
-  per locked precedence (Wave 2 #4 α: FAIL > N/A > OK > SKIPPED-NO-DIFF > SKIPPED-NO-VERB): ${out}")
+    FAILURES+=("[stream-verbatim] aggregated STATUS expected FAIL-MISSING-VERB (rank 5 beats NO-DIFF), got '${last_status}': ${out}")
   fi
+  # And the dispatcher exits 2 — the wiring fault is no longer masked by the sibling.
+  assert_nonzero_exit "stream-verbatim:rc" "$rc"
+  if [[ "$rc" == "2" ]]; then PASS=$((PASS + 1)); else
+    FAIL=$((FAIL + 1)); FAILURES+=("[stream-verbatim:rc] expected 2 (masking closed), got '${rc}': ${out}"); fi
 }
 
 # -----------------------------------------------------------------------------
@@ -377,9 +371,9 @@ EOF
 
   # REASON asserted explicitly per test-reviewer's ask (catches silent drift).
   assert_pattern_in "empty-after-filter:status" "STATUS=SKIPPED-NO-VERB REASON=all-langs-filtered" "$out"
-  # Criterion (c): all-langs-filtered is OPERATOR INTENT — must stay exit 0 even though
-  # it shares the SKIPPED-NO-VERB enum with the now-exit-2 UNEXPECTED case (task #50).
-  # Assert the rc explicitly so the reason-aware exit path can't silently flip it.
+  # all-langs-filtered is OPERATOR INTENT — must stay exit 0. SKIPPED-NO-VERB now has this
+  # as its ONLY producer (a genuinely-missing verb is FAIL-MISSING-VERB, exit 2 — task #52);
+  # assert the rc explicitly so a future change can't silently flip operator-intent to fail.
   if [[ "$rc" == "0" ]]; then
     PASS=$((PASS + 1))
   else
@@ -392,12 +386,14 @@ EOF
 }
 
 # -----------------------------------------------------------------------------
-# Test: aggregate_worst_status precedence — Wave 2 #4 (α) regression test.
+# Test: aggregate_worst_status precedence — OK-beats-SKIPPED regression test.
 #
-# Locks the re-ranked ladder: FAIL > N/A > OK > SKIPPED-NO-DIFF > SKIPPED-NO-VERB.
-# Prior Wave-1 ladder put SKIPPED-* above OK, which broke "loud success" once
-# a 2nd lang registered with a verb wrapper (rust-clean PR aggregated to
-# SKIPPED-NO-DIFF instead of OK). Lead-imposed regression test (constraint #3).
+# Locks the lower portion of the current ladder (full ladder, task #52:
+# UNKNOWN > FAIL-MISSING-VERB > FAIL > N/A > OK > SKIPPED-NO-DIFF > SKIPPED-NO-VERB).
+# This test pins the OK > SKIPPED-* relationship specifically: a Wave-1 ladder put
+# SKIPPED-* above OK, which broke "loud success" once a 2nd lang registered with a
+# verb wrapper (rust-clean PR aggregated to SKIPPED-NO-DIFF instead of OK). The upper
+# rungs (FAIL-MISSING-VERB, UNKNOWN) are locked in _common.test.sh.
 # -----------------------------------------------------------------------------
 
 test_aggregate_precedence_ok_beats_skipped() {
@@ -447,10 +443,10 @@ test_aggregate_precedence_ok_beats_skipped() {
 #
 # Tests the arithmetic pattern (the `exit "$(( dispatch_rc > breaking_rc ? dispatch_rc
 # : breaking_rc ))"` worst-rc fold at the tail of scripts/audit.sh), not the live
-# invocation (which would require repo-context + buf install). NOTE: the audit-gate
-# SECURITY guard added in task #50 sits BETWEEN the dispatch capture and this fold and is
-# covered separately by test_audit_security_guard_reds_layer (which extracts that block
-# live); this test stays focused on the breaking-rc-must-not-mask-dispatch-rc invariant.
+# invocation (which would require repo-context + buf install). The end-to-end audit
+# fail-closed path — a missing <lang>/audit.sh reds the layer at exit 2 — is covered by
+# test_audit_missing_wrapper_reds_layer (drives the real scripts/audit.sh through a layer6
+# lifecycle); this test stays focused on the breaking-rc-must-not-mask-dispatch-rc invariant.
 # -----------------------------------------------------------------------------
 
 test_audit_fail_closed_aggregation() {
@@ -494,7 +490,8 @@ test_audit_fail_closed_aggregation() {
     FAILURES+=("[audit-fail-closed:both-ok] expected 0, got '${rc}'")
   fi
 
-  # UNKNOWN (rc=2) wins over FAIL (rc=1) — dispatcher bug surfaces loud.
+  # dispatch_rc=2 (FAIL-MISSING-VERB or UNKNOWN — a wiring fault) wins over breaking=FAIL(1):
+  # a missing audit wrapper must not be masked by breaking.sh's lower rc. Surfaces loud.
   rc=$(bash -c '
     dispatch_rc=2
     breaking_rc=1
@@ -504,133 +501,126 @@ test_audit_fail_closed_aggregation() {
     PASS=$((PASS + 1))
   else
     FAIL=$((FAIL + 1))
-    FAILURES+=("[audit-fail-closed:unknown-beats-fail] expected 2, got '${rc}'")
+    FAILURES+=("[audit-fail-closed:wiring-fault-beats-fail] expected 2, got '${rc}'")
   fi
 }
 
 # -----------------------------------------------------------------------------
-# Test: scripts/audit.sh SECURITY fail-closed (security finding, Lead ruling, task #50).
+# Test: audit gate fails closed on a missing audit wrapper (criterion f, task #52).
 #
-# The cross-lang-masking residual would fail-OPEN an audit (security) gate: a deleted
-# rust/audit.sh (UNEXPECTED) masked by ts/audit.sh OK → aggregate OK → the dep-vuln scan
-# silently never ran. scripts/audit.sh closes the AUDIT slice WITHOUT touching the ladder:
-# it scans the captured dispatch output for the UNEXPECTED marker and EMITS a STATUS=FAIL
-# line (so the layer's tee_collect_statuses aggregates FAIL → layer exits 1) AND folds
-# non-zero into its own rc (standalone path).
-#
-# CRITICAL coverage (Lead): the bare-rc fix alone is insufficient — layer6.sh keys the
-# LAYER exit on the STATUS stream, not on audit.sh's rc. So this test drives the real
-# scan-and-emit block (extracted live from scripts/audit.sh so it can't drift) through a
-# LAYER lifecycle and asserts the LAYER exits non-zero, plus the proto-intentional-gap
-# control stays exit 0.
+# A deleted/chmod-stripped rust|ts audit.sh masked by a sibling's OK would fail-OPEN an
+# audit (security) gate — the dep-vuln scan silently never runs while the layer stays
+# green. #50 patched the AUDIT slice with a post-processor in scripts/audit.sh; task #52
+# closes it GENERALLY at the ladder: the missing wrapper → FAIL-MISSING-VERB (rank 5)
+# beats the sibling's OK → the layer reds at exit 2. These tests drive the REAL audit
+# dispatch through a real layer6 lifecycle and assert the layer reds with the
+# FAIL-MISSING-VERB token, plus a placeholder-gap control that stays exit 0.
 # -----------------------------------------------------------------------------
 
-# Run the SECURITY scan-and-emit block from the REAL scripts/audit.sh over a synthetic
-# dispatch-output file, inside a real layer lifecycle. Echoes the emitted STATUS lines +
-# a trailing __rc= (the LAYER exit code). $1 = newline-separated dispatch STATUS stream.
-__run_audit_guard_through_layer() {
-  local dispatch_stream="$1"
-  local audit_sh="${__here}/../../scripts/audit.sh"
+# Successor to #50's test_audit_security_guard_reds_layer (task #52). #50's audit-slice
+# post-processor (grep the dispatch output, emit a synthetic STATUS=FAIL) is RETIRED —
+# the ladder now closes the masking natively. This drives the REAL audit dispatch (the
+# always-run `for_each_lang_with_verb "audit"` that scripts/audit.sh invokes — its
+# breaking.sh tail needs buf, so it's covered by the fold-arithmetic test, not run here)
+# through a real layer6 lifecycle against a synthetic lang root, and asserts the LAYER
+# reds at exit 2 with the FAIL-MISSING-VERB token in the stream (the GENERAL mechanism,
+# not an audit-specific patch).
+#
+# Echoes the layer's combined output + a trailing __rc= (the LAYER exit code).
+# $1 = lang_root (synthetic tree).
+__run_audit_dispatch_through_layer6() {
+  local lang_root="$1"
   local common="${__here}/_common.sh"
-  # Extract the production scan-and-emit block (between the PIPESTATUS capture and the
-  # breaking_rc line) so the test exercises the SHIPPED logic, not a copy.
-  local block
-  block=$(awk '/^dispatch_rc=\$\{PIPESTATUS\[0\]\}$/{f=1;next} /^breaking_rc=0$/{f=0} f' "$audit_sh")
   local tmp; tmp=$(mktemp -d)
-  printf '%s\n' "$dispatch_stream" > "${tmp}/audit_out"
-  local driver="${tmp}/drv.sh"
+  local layer="${tmp}/layer6.sh"
   {
     printf '#!/usr/bin/env bash\nset -uo pipefail\nIFS=$'"'"'\\n\\t'"'"'\n'
     printf 'source %q\n' "$common"
+    printf 'source %q\n' "${lang_root}/_dispatch.sh"
     printf 'layer_lifecycle_begin 6\n'
-    # Sub-shell mirrors layer6: audit-side emits (dispatch stream replay + guard emits)
-    # piped through tee_collect_statuses so the layer aggregates the full stream.
-    printf '{\n'
-    printf '  cat %q\n' "${tmp}/audit_out"
-    printf '  __audit_out=%q\n' "${tmp}/audit_out"
-    printf '  dispatch_rc=0\n'
-    printf '%s\n' "$block"
-    printf '} 2>&1 | tee_collect_statuses\n'
-  } > "$driver"
+    # Mirror layer6.sh: the audit dispatch (always-run) piped through tee_collect_statuses
+    # at top-level command position (lastpipe) so the layer aggregates the full stream.
+    printf 'DEVLOOP_LANG_ROOT=%q DEVLOOP_DISPATCH_ALWAYS_RUN=1 for_each_lang_with_verb "audit" 2>&1 | tee_collect_statuses\n' "$lang_root"
+  } > "$layer"
   local out rc=0
-  out=$(bash "$driver" 2>/dev/null) || rc=$?
+  out=$(bash "$layer" 2>&1) || rc=$?
   rm -rf "$tmp"
   printf '%s\n__rc=%s\n' "$out" "$rc"
 }
 
-# Run the SAME live scan-and-emit block STANDALONE (no layer) over a synthetic dispatch
-# output, returning the folded dispatch_rc — to prove the standalone path agrees with the
-# layer path on the exit code (Lead requirement #2).
-__run_audit_guard_standalone_rc() {
-  local dispatch_stream="$1"
-  local audit_sh="${__here}/../../scripts/audit.sh"
-  local common="${__here}/_common.sh"
-  local block
-  block=$(awk '/^dispatch_rc=\$\{PIPESTATUS\[0\]\}$/{f=1;next} /^breaking_rc=0$/{f=0} f' "$audit_sh")
+test_audit_missing_wrapper_reds_layer() {
   local tmp; tmp=$(mktemp -d)
-  printf '%s\n' "$dispatch_stream" > "${tmp}/audit_out"
-  local driver="${tmp}/drv.sh"
-  {
-    printf '#!/usr/bin/env bash\nset -uo pipefail\nIFS=$'"'"'\\n\\t'"'"'\n'
-    printf 'source %q\n' "$common"
-    printf '__audit_out=%q\n' "${tmp}/audit_out"
-    printf 'dispatch_rc=0\n'
-    printf '%s\n' "$block"
-    printf 'exit "$dispatch_rc"\n'
-  } > "$driver"
-  local rc=0
-  bash "$driver" >/dev/null 2>&1 || rc=$?
-  rm -rf "$tmp"
-  printf '%s\n' "$rc"
-}
+  trap "rm -rf '$tmp'" RETURN
+  cp "${__here}/_common.sh"   "${tmp}/_common.sh"
+  cp "${__here}/_dispatch.sh" "${tmp}/_dispatch.sh"
 
-test_audit_security_guard_reds_layer() {
-  local r out rc std_rc
-  local masked='STATUS=SKIPPED-NO-VERB REASON=rust-audit-UNEXPECTED-verb-missing-or-not-executable
-STATUS=OK REASON=ts-audit-passed
-STATUS=OK REASON=audit-all-langs-ok'
-  # Masking case: UNEXPECTED rust-audit + OK ts → LAYER must exit == 1 (FAIL aggregate,
-  # Lead-ruled exit code for this guard) AND a STATUS=FAIL audit-gate-wrapper-missing-rust
-  # line must be emitted so tee_collect_statuses reds the layer.
-  r=$(__run_audit_guard_through_layer "$masked")
+  # Masking case (criterion f): `present` lang has a working audit.sh (OK); `gone` lang
+  # is missing its audit.sh (the deleted/chmod-stripped dep-vuln gate). Under always-run,
+  # `gone` → FAIL-MISSING-VERB (rank 5) beats present's OK → LAYER reds at exit 2. Dual
+  # assert (rc AND token): FAIL-MISSING-VERB→2 and UNKNOWN→2 collide on the bare code, so
+  # the token proves the layer redded for the RIGHT cause.
+  mkdir -p "${tmp}/present" "${tmp}/gone"
+  printf '#!/usr/bin/env bash\nexit 0\n' > "${tmp}/present/changed.sh"
+  chmod +x "${tmp}/present/changed.sh"
+  printf '#!/usr/bin/env bash\necho "STATUS=OK REASON=present-audit-passed"\n' > "${tmp}/present/audit.sh"
+  chmod +x "${tmp}/present/audit.sh"
+  printf '#!/usr/bin/env bash\nexit 0\n' > "${tmp}/gone/changed.sh"
+  chmod +x "${tmp}/gone/changed.sh"   # no audit.sh — the missing gate
+
+  local r out rc
+  r=$(__run_audit_dispatch_through_layer6 "$tmp")
   rc=$(grep -oE '__rc=[0-9]+' <<<"$r" | tail -n1 | cut -d= -f2)
   out=$(sed '/^__rc=[0-9]*$/d' <<<"$r")
-  if [[ "$rc" == "1" ]]; then PASS=$((PASS + 1)); else
-    FAIL=$((FAIL + 1)); FAILURES+=("[audit-guard:layer-reds] LAYER must exit 1 on masked UNEXPECTED audit, got '${rc}': ${out}"); fi
-  assert_pattern_in "audit-guard:emits-fail" "STATUS=FAIL REASON=audit-gate-wrapper-missing-rust" "$out"
+  if [[ "$rc" == "2" ]]; then PASS=$((PASS + 1)); else
+    FAIL=$((FAIL + 1)); FAILURES+=("[audit-missing:layer-reds] LAYER must exit 2 on a missing audit wrapper masked by a sibling OK, got '${rc}': ${out}"); fi
+  assert_pattern_in "audit-missing:result-token" "RESULT=FAIL-MISSING-VERB" "$out"
+  assert_pattern_in "audit-missing:child-token"  "STATUS=FAIL-MISSING-VERB REASON=gone-audit-verb-missing-or-not-executable" "$out"
 
-  # Both paths agree at exit 1 (Lead ruling, confirmed 2026-06-09 — FAIL/1 on both, NOT a
-  # standalone=2/layer=1 divergence). The emitted STATUS=FAIL reds the LAYER at 1; the
-  # STANDALONE path folds dispatch_rc=1 to match. Lock the standalone code so it can't
-  # drift back to 2 (or up to a synthetic UNKNOWN/2).
-  std_rc=$(__run_audit_guard_standalone_rc "$masked")
-  if [[ "$std_rc" == "1" ]]; then PASS=$((PASS + 1)); else
-    FAIL=$((FAIL + 1)); FAILURES+=("[audit-guard:standalone-rc] standalone audit.sh must exit 1 (FAIL, agrees with layer), got '${std_rc}'"); fi
+  rm -rf "$tmp"; trap - RETURN
+}
 
-  # Control: clean all-OK + proto INTENTIONAL gap (proto-audit-sh-missing-, NOT UNEXPECTED)
-  # → LAYER stays exit 0, NO audit-gate-wrapper-missing emitted.
-  r=$(__run_audit_guard_through_layer \
-    'STATUS=OK REASON=cargo-audit-passed
-STATUS=OK REASON=pnpm-audit-passed
-STATUS=SKIPPED-NO-VERB REASON=proto-audit-sh-missing-or-not-executable
-STATUS=OK REASON=audit-all-langs-ok')
+# Control: a proto-style INTENTIONAL gap registered via a placeholder audit.sh (emits
+# N/A) co-running with a real OK audit → LAYER stays exit 0, aggregate is N/A (the
+# placeholder's N/A rank 3 beats OK rank 2), NO FAIL-MISSING-VERB anywhere. Proves the
+# placeholder convention keeps intentional gaps green under always-run audit.
+test_audit_placeholder_gap_stays_0() {
+  local tmp; tmp=$(mktemp -d)
+  trap "rm -rf '$tmp'" RETURN
+  cp "${__here}/_common.sh"   "${tmp}/_common.sh"
+  cp "${__here}/_dispatch.sh" "${tmp}/_dispatch.sh"
+
+  mkdir -p "${tmp}/present" "${tmp}/protolike"
+  printf '#!/usr/bin/env bash\nexit 0\n' > "${tmp}/present/changed.sh"
+  chmod +x "${tmp}/present/changed.sh"
+  printf '#!/usr/bin/env bash\necho "STATUS=OK REASON=present-audit-passed"\n' > "${tmp}/present/audit.sh"
+  chmod +x "${tmp}/present/audit.sh"
+  printf '#!/usr/bin/env bash\nexit 0\n' > "${tmp}/protolike/changed.sh"
+  chmod +x "${tmp}/protolike/changed.sh"
+  # Placeholder audit.sh emitting N/A — the canonical intentional-gap registration.
+  printf '#!/usr/bin/env bash\necho "STATUS=N/A REASON=not-applicable-to-this-lang"\n' > "${tmp}/protolike/audit.sh"
+  chmod +x "${tmp}/protolike/audit.sh"
+
+  local r out rc
+  r=$(__run_audit_dispatch_through_layer6 "$tmp")
   rc=$(grep -oE '__rc=[0-9]+' <<<"$r" | tail -n1 | cut -d= -f2)
   out=$(sed '/^__rc=[0-9]*$/d' <<<"$r")
   if [[ "$rc" == "0" ]]; then PASS=$((PASS + 1)); else
-    FAIL=$((FAIL + 1)); FAILURES+=("[audit-guard:intentional-gap-stays-0] proto:audit intentional gap must not red the layer, got rc=${rc}: ${out}"); fi
-  if grep -q 'audit-gate-wrapper-missing' <<<"$out"; then
-    FAIL=$((FAIL + 1)); FAILURES+=("[audit-guard:no-spurious-fail] intentional gap must NOT emit audit-gate-wrapper-missing: ${out}")
+    FAIL=$((FAIL + 1)); FAILURES+=("[audit-placeholder:stays-0] intentional placeholder gap must not red the layer, got rc=${rc}: ${out}"); fi
+  if grep -q 'FAIL-MISSING-VERB' <<<"$out"; then
+    FAIL=$((FAIL + 1)); FAILURES+=("[audit-placeholder:no-missing-verb] placeholder gap must NOT emit FAIL-MISSING-VERB: ${out}")
   else
     PASS=$((PASS + 1))
   fi
+
+  rm -rf "$tmp"; trap - RETURN
 }
 
 # -----------------------------------------------------------------------------
-# Task #50 — reason-keyed verb-missing exit codes.
+# Task #52 — FAIL-MISSING-VERB: missing-verb exit codes + parametric masking-closed.
 #
 # Run the dispatcher against a synthetic lang tree and capture BOTH the combined
-# output and the exit code, so we assert the exact code (== 2 for UNEXPECTED, == 0
-# for intentional) not just "non-zero".
+# output and the exit code, so we assert the exact code (== 2 for a missing verb,
+# == 0 for an intentional placeholder gap) not just "non-zero".
 # -----------------------------------------------------------------------------
 
 # Run for_each_lang_with_verb against $1=lang_root with extra env in $2 (string of
@@ -647,9 +637,9 @@ run_dispatch() {
   "
 }
 
-# Headline criterion-(b): a SINGLE touched lang, no verb, NOT allowlisted → the
-# single-lang return path maps SKIPPED-NO-VERB + UNEXPECTED → exit 2.
-test_unexpected_verb_missing_single_lang() {
+# Headline criterion-(b): a SINGLE touched lang, no verb script → the single-lang return
+# path maps FAIL-MISSING-VERB → exit 2.
+test_missing_verb_single_lang() {
   local tmp; tmp=$(mktemp -d)
   trap "rm -rf '$tmp'" RETURN
   mkdir -p "${tmp}/lang/fakeland"
@@ -663,16 +653,16 @@ test_unexpected_verb_missing_single_lang() {
   rc=$(grep -oE '__rc=[0-9]+' <<<"$out" | tail -n1 | cut -d= -f2)
 
   if [[ "$rc" == "2" ]]; then PASS=$((PASS + 1)); else
-    FAIL=$((FAIL + 1)); FAILURES+=("[unexpected-single:rc] expected 2, got '${rc}': ${out}"); fi
-  assert_pattern_in "unexpected-single:reason" \
-    "STATUS=SKIPPED-NO-VERB REASON=fakeland-test-UNEXPECTED-verb-missing-or-not-executable" "$out"
+    FAIL=$((FAIL + 1)); FAILURES+=("[missing-single:rc] expected 2, got '${rc}': ${out}"); fi
+  assert_pattern_in "missing-single:reason" \
+    "STATUS=FAIL-MISSING-VERB REASON=fakeland-test-verb-missing-or-not-executable" "$out"
 
   rm -rf "$tmp"; trap - RETURN
 }
 
-# All-langs-missing (2 langs, both touched, both missing verb, neither allowlisted) →
-# aggregate winner is the UNEXPECTED reason → exit 2.
-test_unexpected_verb_missing_all_langs() {
+# All-langs-missing (2 langs, both touched, both missing verb) → aggregate winner is
+# FAIL-MISSING-VERB → exit 2.
+test_missing_verb_all_langs() {
   local tmp; tmp=$(mktemp -d)
   trap "rm -rf '$tmp'" RETURN
   mkdir -p "${tmp}/lang/alpha" "${tmp}/lang/beta"
@@ -688,14 +678,15 @@ test_unexpected_verb_missing_all_langs() {
   rc=$(grep -oE '__rc=[0-9]+' <<<"$out" | tail -n1 | cut -d= -f2)
 
   if [[ "$rc" == "2" ]]; then PASS=$((PASS + 1)); else
-    FAIL=$((FAIL + 1)); FAILURES+=("[unexpected-all:rc] expected 2, got '${rc}': ${out}"); fi
+    FAIL=$((FAIL + 1)); FAILURES+=("[missing-all:rc] expected 2, got '${rc}': ${out}"); fi
+  assert_pattern_in "missing-all:agg" "STATUS=FAIL-MISSING-VERB" "$out"
 
   rm -rf "$tmp"; trap - RETURN
 }
 
-# Intentional gap via the DEVLOOP_TEST-gated seam → exit 0, historical -sh-missing- token,
-# and the token must NOT carry the UNEXPECTED anchor (matcher-shape guard).
-test_intentional_gap_verb_missing_zero() {
+# Intentional gap via a PLACEHOLDER <verb>.sh emitting N/A → exit 0, no FAIL-MISSING-VERB.
+# This is the canonical task-#52 intentional-gap registration (replaces the #50 allowlist).
+test_placeholder_gap_verb_zero() {
   local tmp; tmp=$(mktemp -d)
   trap "rm -rf '$tmp'" RETURN
   mkdir -p "${tmp}/lang/fakeland"
@@ -703,17 +694,20 @@ test_intentional_gap_verb_missing_zero() {
   cp "${__here}/_dispatch.sh" "${tmp}/lang/_dispatch.sh"
   printf '#!/usr/bin/env bash\nexit 0\n' > "${tmp}/lang/fakeland/changed.sh"
   chmod +x "${tmp}/lang/fakeland/changed.sh"
+  # Placeholder verb wrapper — the intentional-gap registration.
+  printf '#!/usr/bin/env bash\necho "STATUS=N/A REASON=not-applicable-to-this-lang"\n' > "${tmp}/lang/fakeland/test.sh"
+  chmod +x "${tmp}/lang/fakeland/test.sh"
 
   local out rc
-  out=$(run_dispatch "${tmp}/lang" "DEVLOOP_TEST=1 DEVLOOP_INTENTIONAL_MISSING_VERBS=fakeland:test" "test")
+  out=$(run_dispatch "${tmp}/lang" "" "test")
   rc=$(grep -oE '__rc=[0-9]+' <<<"$out" | tail -n1 | cut -d= -f2)
 
   if [[ "$rc" == "0" ]]; then PASS=$((PASS + 1)); else
-    FAIL=$((FAIL + 1)); FAILURES+=("[intentional-gap:rc] expected 0, got '${rc}': ${out}"); fi
-  assert_pattern_in "intentional-gap:reason" \
-    "STATUS=SKIPPED-NO-VERB REASON=fakeland-test-sh-missing-or-not-executable" "$out"
-  if grep -q 'UNEXPECTED' <<<"$out"; then
-    FAIL=$((FAIL + 1)); FAILURES+=("[intentional-gap:no-unexpected] intentional token must not carry UNEXPECTED anchor: ${out}")
+    FAIL=$((FAIL + 1)); FAILURES+=("[placeholder-gap:rc] expected 0, got '${rc}': ${out}"); fi
+  assert_pattern_in "placeholder-gap:reason" \
+    "STATUS=N/A REASON=not-applicable-to-this-lang" "$out"
+  if grep -q 'FAIL-MISSING-VERB' <<<"$out"; then
+    FAIL=$((FAIL + 1)); FAILURES+=("[placeholder-gap:no-missing-verb] placeholder must NOT emit FAIL-MISSING-VERB: ${out}")
   else
     PASS=$((PASS + 1))
   fi
@@ -721,115 +715,51 @@ test_intentional_gap_verb_missing_zero() {
   rm -rf "$tmp"; trap - RETURN
 }
 
-# Security gate: the seam is IGNORED without DEVLOOP_TEST=1 → still exit 2 (an
-# unconditional env surface would re-open the silent-skip class).
-test_intentional_seam_ignored_without_test_sentinel() {
-  local tmp; tmp=$(mktemp -d)
-  trap "rm -rf '$tmp'" RETURN
-  mkdir -p "${tmp}/lang/fakeland"
-  cp "${__here}/_common.sh"   "${tmp}/lang/_common.sh"
-  cp "${__here}/_dispatch.sh" "${tmp}/lang/_dispatch.sh"
-  printf '#!/usr/bin/env bash\nexit 0\n' > "${tmp}/lang/fakeland/changed.sh"
-  chmod +x "${tmp}/lang/fakeland/changed.sh"
-
-  local out rc
-  out=$(run_dispatch "${tmp}/lang" "DEVLOOP_INTENTIONAL_MISSING_VERBS=fakeland:test" "test")
-  rc=$(grep -oE '__rc=[0-9]+' <<<"$out" | tail -n1 | cut -d= -f2)
-
-  if [[ "$rc" == "2" ]]; then PASS=$((PASS + 1)); else
-    FAIL=$((FAIL + 1)); FAILURES+=("[seam-gated:rc] expected 2 (seam ignored without DEVLOOP_TEST), got '${rc}': ${out}"); fi
-
-  rm -rf "$tmp"; trap - RETURN
-}
-
-# MULTI-ENTRY allowlist split (test-reviewer finding): the allowlist is space-separated
-# and __is_intentional_gap splits it with an explicit space-IFS `read -ra` (because
-# _common.sh sets IFS=$'\n\t', so a bare split would NOT word-split on spaces). This
-# test proves entry 2+ matches, not just the first — two touched langs both missing the
-# verb, both in a 2-entry allowlist → BOTH get the intentional `-sh-missing-` token and
-# the aggregate exits 0. (Regression guard for the IFS-split bug found during impl.)
-test_intentional_gap_multi_entry_allowlist() {
-  local tmp; tmp=$(mktemp -d)
-  trap "rm -rf '$tmp'" RETURN
-  mkdir -p "${tmp}/lang/alpha" "${tmp}/lang/beta"
-  cp "${__here}/_common.sh"   "${tmp}/lang/_common.sh"
-  cp "${__here}/_dispatch.sh" "${tmp}/lang/_dispatch.sh"
-  for l in alpha beta; do
-    printf '#!/usr/bin/env bash\nexit 0\n' > "${tmp}/lang/${l}/changed.sh"
-    chmod +x "${tmp}/lang/${l}/changed.sh"  # touched, no test.sh
-  done
-
-  local out rc
-  out=$(run_dispatch "${tmp}/lang" "DEVLOOP_TEST=1 DEVLOOP_INTENTIONAL_MISSING_VERBS='alpha:test beta:test'" "test")
-  rc=$(grep -oE '__rc=[0-9]+' <<<"$out" | tail -n1 | cut -d= -f2)
-
-  # BOTH langs must get the intentional token (proving entry-2 `beta:test` split worked).
-  assert_pattern_in "multi-allow:alpha" "STATUS=SKIPPED-NO-VERB REASON=alpha-test-sh-missing-or-not-executable" "$out"
-  assert_pattern_in "multi-allow:beta"  "STATUS=SKIPPED-NO-VERB REASON=beta-test-sh-missing-or-not-executable" "$out"
-  if grep -q 'UNEXPECTED' <<<"$out"; then
-    FAIL=$((FAIL + 1)); FAILURES+=("[multi-allow:no-unexpected] no lang should be UNEXPECTED when both are allowlisted: ${out}")
-  else
-    PASS=$((PASS + 1))
-  fi
-  if [[ "$rc" == "0" ]]; then PASS=$((PASS + 1)); else
-    FAIL=$((FAIL + 1)); FAILURES+=("[multi-allow:rc] expected 0 (both intentional), got '${rc}': ${out}"); fi
-
-  rm -rf "$tmp"; trap - RETURN
-}
-
-# Direct __is_intentional_gap unit test against the PRODUCTION 2-entry constant
-# `proto:test proto:audit` (test-reviewer: prove the SECOND token — different verb — is
-# found, exercising the real prod shape, not just a same-verb pair). This is the most
-# targeted guard for the IFS word-split: under a broken split the whole
-# "proto:test proto:audit" string lands in allow[0] and matches NEITHER, so BOTH asserts
-# below fail loud — the exact mutation the reviewer ran. Uses the production default (no
-# DEVLOOP_TEST override), so it also pins the hardcoded constant.
-test_is_intentional_gap_prod_constant_both_entries() {
+# PARAMETRIC cross-lang-masking CLOSED across EVERY verb (criterion a). For each of
+# compile/fmt/lint/test/audit: an `ok` lang with a working <verb>.sh (emits OK) co-running
+# with a `missing` lang that lacks <verb>.sh → aggregate FAIL-MISSING-VERB (rank 5 beats
+# OK rank 2) → exit 2. The `audit` row runs under DEVLOOP_DISPATCH_ALWAYS_RUN=1 — the only
+# mode scripts/audit.sh invokes the dispatcher in (the security-critical (f) path). Dual
+# assert per verb (aggregate token AND rc): FAIL-MISSING-VERB→2 and UNKNOWN→2 collide on
+# the bare code, so the token proves it redded for the RIGHT cause.
+test_parametric_masking_closed_all_verbs() {
   local tmp; tmp=$(mktemp -d)
   trap "rm -rf '$tmp'" RETURN
   cp "${__here}/_common.sh"   "${tmp}/_common.sh"
   cp "${__here}/_dispatch.sh" "${tmp}/_dispatch.sh"
-  # FIRST entry (proto:test) must resolve intentional.
-  if bash -c "source '${tmp}/_dispatch.sh'; __is_intentional_gap proto test"; then
-    PASS=$((PASS + 1)); else
-    FAIL=$((FAIL + 1)); FAILURES+=("[is-gap-prod:proto-test] proto:test (entry 1) must be intentional"); fi
-  # SECOND entry (proto:audit — different verb) must ALSO resolve intentional. This is the
-  # load-bearing word-split assertion: a broken split fails HERE.
-  if bash -c "source '${tmp}/_dispatch.sh'; __is_intentional_gap proto audit"; then
-    PASS=$((PASS + 1)); else
-    FAIL=$((FAIL + 1)); FAILURES+=("[is-gap-prod:proto-audit] proto:audit (entry 2, different verb) must be intentional — broken IFS word-split would fail this"); fi
-  # A non-allowlisted lang:verb must NOT be intentional (control).
-  if bash -c "source '${tmp}/_dispatch.sh'; __is_intentional_gap rust audit"; then
-    FAIL=$((FAIL + 1)); FAILURES+=("[is-gap-prod:rust-audit] rust:audit must NOT be intentional (not in the prod allowlist)")
-  else
-    PASS=$((PASS + 1))
-  fi
-  rm -rf "$tmp"; trap - RETURN
-}
 
-# MIXED: one lang in the 2-entry allowlist, one NOT → the allowlisted lang exits-0
-# intentional, the other is UNEXPECTED → aggregate exit 2. Proves membership is
-# per-entry, not "any entry present disables the check".
-test_intentional_gap_multi_entry_mixed() {
-  local tmp; tmp=$(mktemp -d)
-  trap "rm -rf '$tmp'" RETURN
-  mkdir -p "${tmp}/lang/alpha" "${tmp}/lang/gamma"
-  cp "${__here}/_common.sh"   "${tmp}/lang/_common.sh"
-  cp "${__here}/_dispatch.sh" "${tmp}/lang/_dispatch.sh"
-  for l in alpha gamma; do
-    printf '#!/usr/bin/env bash\nexit 0\n' > "${tmp}/lang/${l}/changed.sh"
-    chmod +x "${tmp}/lang/${l}/changed.sh"
+  # ok lang: touched changed.sh + a working wrapper for EVERY verb (emits OK).
+  # missing lang: touched changed.sh, but NO verb wrappers at all → every verb FAIL-MISSING-VERB.
+  mkdir -p "${tmp}/ok" "${tmp}/missing"
+  printf '#!/usr/bin/env bash\nexit 0\n' > "${tmp}/ok/changed.sh";      chmod +x "${tmp}/ok/changed.sh"
+  printf '#!/usr/bin/env bash\nexit 0\n' > "${tmp}/missing/changed.sh"; chmod +x "${tmp}/missing/changed.sh"
+  local verb
+  for verb in compile fmt lint test audit; do
+    printf '#!/usr/bin/env bash\necho "STATUS=OK REASON=ok-%s-passed"\n' "$verb" > "${tmp}/ok/${verb}.sh"
+    chmod +x "${tmp}/ok/${verb}.sh"
   done
 
-  local out rc
-  # allowlist covers alpha:test + beta:test (beta absent); gamma is NOT listed.
-  out=$(run_dispatch "${tmp}/lang" "DEVLOOP_TEST=1 DEVLOOP_INTENTIONAL_MISSING_VERBS='alpha:test beta:test'" "test")
-  rc=$(grep -oE '__rc=[0-9]+' <<<"$out" | tail -n1 | cut -d= -f2)
+  local env_pairs out rc
+  for verb in compile fmt lint test audit; do
+    # The audit verb runs always-run (scripts/audit.sh's mode); the rest run the default
+    # changed.sh-gated path (both langs are touched, so both participate either way).
+    env_pairs=""
+    [[ "$verb" == "audit" ]] && env_pairs="DEVLOOP_DISPATCH_ALWAYS_RUN=1"
+    out=$(run_dispatch "${tmp}" "${env_pairs}" "${verb}")
+    rc=$(grep -oE '__rc=[0-9]+' <<<"$out" | tail -n1 | cut -d= -f2)
 
-  assert_pattern_in "mixed:alpha-intentional" "STATUS=SKIPPED-NO-VERB REASON=alpha-test-sh-missing-or-not-executable" "$out"
-  assert_pattern_in "mixed:gamma-unexpected"  "STATUS=SKIPPED-NO-VERB REASON=gamma-test-UNEXPECTED-verb-missing-or-not-executable" "$out"
-  if [[ "$rc" == "2" ]]; then PASS=$((PASS + 1)); else
-    FAIL=$((FAIL + 1)); FAILURES+=("[mixed:rc] expected 2 (gamma UNEXPECTED wins), got '${rc}': ${out}"); fi
+    # aggregate token (the LAST STATUS= line) must be FAIL-MISSING-VERB.
+    local last_status
+    last_status=$(grep '^STATUS=' <<<"$out" | tail -n1 | sed -n 's/^STATUS=\([^ ]*\).*/\1/p')
+    if [[ "$last_status" == "FAIL-MISSING-VERB" ]]; then PASS=$((PASS + 1)); else
+      FAIL=$((FAIL + 1)); FAILURES+=("[parametric:${verb}:agg] aggregate expected FAIL-MISSING-VERB, got '${last_status}': ${out}"); fi
+    # per-child token names the offending lang/verb.
+    assert_pattern_in "parametric:${verb}:child" \
+      "STATUS=FAIL-MISSING-VERB REASON=missing-${verb}-verb-missing-or-not-executable" "$out"
+    # exit 2.
+    if [[ "$rc" == "2" ]]; then PASS=$((PASS + 1)); else
+      FAIL=$((FAIL + 1)); FAILURES+=("[parametric:${verb}:rc] expected 2, got '${rc}': ${out}"); fi
+  done
 
   rm -rf "$tmp"; trap - RETURN
 }
@@ -840,20 +770,18 @@ test_intentional_gap_multi_entry_mixed() {
 
 test_missing_changed_sh
 test_single_lang_no_double_emit
-test_stream_verbatim_contract
+test_stream_verbatim_masking_closed
 test_include_langs_keeps
 test_exclude_langs_drops
 test_filter_empty_after_filter
 test_aggregate_precedence_ok_beats_skipped
 test_audit_fail_closed_aggregation
-test_unexpected_verb_missing_single_lang
-test_unexpected_verb_missing_all_langs
-test_intentional_gap_verb_missing_zero
-test_intentional_seam_ignored_without_test_sentinel
-test_intentional_gap_multi_entry_allowlist
-test_is_intentional_gap_prod_constant_both_entries
-test_intentional_gap_multi_entry_mixed
-test_audit_security_guard_reds_layer
+test_audit_missing_wrapper_reds_layer
+test_audit_placeholder_gap_stays_0
+test_missing_verb_single_lang
+test_missing_verb_all_langs
+test_placeholder_gap_verb_zero
+test_parametric_masking_closed_all_verbs
 
 printf '\n_dispatch.test.sh: %d passed, %d failed\n' "$PASS" "$FAIL"
 if [[ $FAIL -gt 0 ]]; then

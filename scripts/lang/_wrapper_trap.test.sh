@@ -160,31 +160,36 @@ run_synth_layer() {
   printf '%s\n__rc=%s\n' "$out" "$rc"
 }
 
-# (b-e2e) unexpected verb-missing as the winning child → LAYER exits == 2.
-test_layer_unexpected_verb_missing_exits_2() {
-  local r; r=$(run_synth_layer 'STATUS=SKIPPED-NO-VERB REASON=rust-test-UNEXPECTED-verb-missing-or-not-executable')
+# (b-e2e) FAIL-MISSING-VERB as the winning child → LAYER exits == 2, AND the stderr
+# RESULT/REASON name the cause. Dual-assert (rc AND token): FAIL-MISSING-VERB→2 and
+# UNKNOWN→2 collide on the bare code, so the token proves it redded for the RIGHT cause.
+test_layer_missing_verb_exits_2() {
+  local r; r=$(run_synth_layer 'STATUS=FAIL-MISSING-VERB REASON=rust-test-verb-missing-or-not-executable')
   local rc; rc=$(rc_of "$r")
   local out; out=$(body_of "$r")
-  assert_eq       "layer-unexpected:rc"     "2" "$rc"
-  assert_contains "layer-unexpected:reason" "RESULT=SKIPPED-NO-VERB REASON=rust-test-UNEXPECTED-verb-missing-or-not-executable" "$out"
+  assert_eq       "layer-missing-verb:rc"     "2" "$rc"
+  assert_contains "layer-missing-verb:reason" "RESULT=FAIL-MISSING-VERB REASON=rust-test-verb-missing-or-not-executable" "$out"
 }
 
-# (b-neg-e2e) intentional-gap reason as winning child → LAYER exits == 0, aggregate intact.
+# (b-neg-e2e) intentional-gap placeholder (N/A) as winning child → LAYER exits == 0.
 test_layer_intentional_gap_exits_0() {
-  local r; r=$(run_synth_layer 'STATUS=SKIPPED-NO-VERB REASON=proto-test-sh-missing-or-not-executable')
+  local r; r=$(run_synth_layer 'STATUS=N/A REASON=not-applicable-to-this-lang')
   local rc; rc=$(rc_of "$r")
   assert_eq "layer-intentional:rc" "0" "$(rc_of "$r")"
 }
 
-# (b-tiebreak-e2e) intentional-gap SKIPPED-NO-VERB co-running with an UNEXPECTED
-# verb-missing (same enum, different reasons) → worst-exit-driving reason wins → == 2.
-test_layer_tiebreak_unexpected_wins() {
-  local r; r=$(run_synth_layer 'STATUS=SKIPPED-NO-VERB REASON=proto-test-sh-missing-or-not-executable
-STATUS=SKIPPED-NO-VERB REASON=rust-test-UNEXPECTED-verb-missing-or-not-executable')
+# (b-masking-closed-e2e) a FAIL-MISSING-VERB child co-running with an OK sibling → the
+# layer exits == 2: the wiring fault (rank 5) beats the sibling's OK (rank 2), so masking
+# is closed AT THE LAYER EDGE (task #52 — the case #50's reason-tiebreak could not catch
+# because OK was the aggregate winner). Dual-assert rc AND the FAIL-MISSING-VERB token.
+test_layer_missing_verb_beats_sibling_ok() {
+  local r; r=$(run_synth_layer 'STATUS=OK REASON=ts-audit-passed
+STATUS=FAIL-MISSING-VERB REASON=rust-audit-verb-missing-or-not-executable')
   local rc; rc=$(rc_of "$r")
   local out; out=$(body_of "$r")
-  assert_eq       "layer-tiebreak:rc"     "2" "$rc"
-  assert_contains "layer-tiebreak:reason" "REASON=rust-test-UNEXPECTED-verb-missing-or-not-executable" "$out"
+  assert_eq       "layer-masking-closed:rc"     "2" "$rc"
+  assert_contains "layer-masking-closed:result" "RESULT=FAIL-MISSING-VERB" "$out"
+  assert_contains "layer-masking-closed:reason" "REASON=rust-audit-verb-missing-or-not-executable" "$out"
 }
 
 # (e-e2e) a child emitting NO STATUS line → __LAYER_STATUSES gets UNKNOWN → exit == 2
@@ -219,32 +224,6 @@ test_layer_ok_exits_0() {
   assert_eq "layer-ok:rc" "0" "$(rc_of "$r")"
 }
 
-# SHARED-CONTRACT (test-reviewer item 4): the dispatcher DERIVES the unexpected reason
-# token and the layer/`__is_intentional_gap_reason` MATCHES it — two independent touch
-# points on the same literal. This test pins both sides to the single
-# DEVLOOP_UNEXPECTED_VERB_SUFFIX constant end-to-end: it sources _common.sh, builds the
-# token exactly as _dispatch.sh does (`<lang>-<verb>${DEVLOOP_UNEXPECTED_VERB_SUFFIX}`),
-# feeds THAT string to the matcher + the exit classifier, and asserts bug-classification
-# (exit 2). If a future rename desyncs producer and matcher, this fails loud.
-test_unexpected_suffix_single_source_of_truth() {
-  local r; r=$(run_snippet '
-# Producer side (mirrors _dispatch.sh derivation) using the shared constant:
-reason="rust-test${DEVLOOP_UNEXPECTED_VERB_SUFFIX}"
-echo "DERIVED=$reason"
-# Matcher side (layer edge) must classify it as NOT-intentional (the bug case):
-if __is_intentional_gap_reason "$reason"; then echo "MATCH=intentional-WRONG"; else echo "MATCH=unexpected-ok"; fi
-# Exit classifier must map it to 2:
-echo "CODE=$(status_to_exit_code SKIPPED-NO-VERB "$reason")"
-# And the constant must carry the literal UNEXPECTED segment (cosmetics + grep contract):
-case "$DEVLOOP_UNEXPECTED_VERB_SUFFIX" in *UNEXPECTED*) echo "LITERAL=ok" ;; *) echo "LITERAL-missing" ;; esac
-')
-  local out; out=$(body_of "$r")
-  assert_contains "sssot:derived"  "DERIVED=rust-test-UNEXPECTED-verb-missing-or-not-executable" "$out"
-  assert_contains "sssot:match"    "MATCH=unexpected-ok" "$out"
-  assert_contains "sssot:code"     "CODE=2" "$out"
-  assert_contains "sssot:literal"  "LITERAL=ok" "$out"
-}
-
 # =============================================================================
 # Run all
 # =============================================================================
@@ -253,13 +232,12 @@ test_trap_fires_on_explicit_early_exit
 test_trap_fires_on_set_e_abort
 test_trap_silent_on_normal_ok
 test_trap_silent_on_explicit_fail
-test_layer_unexpected_verb_missing_exits_2
+test_layer_missing_verb_exits_2
 test_layer_intentional_gap_exits_0
-test_layer_tiebreak_unexpected_wins
+test_layer_missing_verb_beats_sibling_ok
 test_layer_no_status_child_is_unknown_exit_2
 test_layer_trapped_crash_is_fail_exit_1
 test_layer_ok_exits_0
-test_unexpected_suffix_single_source_of_truth
 
 printf '\n_wrapper_trap.test.sh: %d passed, %d failed\n' "$PASS" "$FAIL"
 if [[ $FAIL -gt 0 ]]; then

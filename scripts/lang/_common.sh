@@ -146,16 +146,6 @@ run_and_emit() {
   fi
 }
 
-# Single source of truth for the UNEXPECTED-verb-missing REASON suffix (task #50,
-# test-reviewer item 4). The two-layer classifier has two independent touch points for
-# this literal:
-#   - `_dispatch.sh` DERIVES the reason: "${name}-${verb}${DEVLOOP_UNEXPECTED_VERB_SUFFIX}"
-#   - `_common.sh::__is_intentional_gap_reason` MATCHES on it (layer edge, no lang:verb context)
-# Routing both through this one constant means a rename can't silently desync the
-# producer and the matcher. The `_wrapper_trap.test.sh` shared-contract test also pins
-# both sides to this same value end-to-end.
-readonly DEVLOOP_UNEXPECTED_VERB_SUFFIX='-UNEXPECTED-verb-missing-or-not-executable'
-
 # Parse the LAST STATUS= line from a log file; print just the enum value.
 # Single source of truth for STATUS= line shape — used by layer-all.sh,
 # verify-completion.sh, and (in Wave 2) CI YAML's grep.
@@ -176,23 +166,6 @@ parse_status_line() {
 # Returns: 0
 parse_status_reason() {
   grep '^STATUS=' "$1" 2>/dev/null | tail -n1 | sed -n 's/^STATUS=[^ ]* REASON=\([^ ]*\).*/\1/p'
-}
-
-# Is this REASON token an INTENTIONAL (exit-0) SKIPPED-NO-VERB gap, vs an UNEXPECTED
-# (exit-2 wiring-fault) verb-missing? Single shared predicate (dry-reviewer item 3),
-# consumed by status_to_exit_code and the tests.
-#
-# Matching key (test-reviewer): the intentional token (`-sh-missing-or-not-executable`)
-# and the unexpected token (`-UNEXPECTED-verb-missing-or-not-executable`) share the
-# suffix `missing-or-not-executable`, so we anchor on the marker UNIQUE to the
-# unexpected path — the literal `UNEXPECTED` segment — NEVER the shared suffix. A reason
-# WITHOUT the UNEXPECTED marker is intentional (or any other non-bug reason).
-# Args: $1=reason token
-# Returns: 0 (true) if intentional/non-bug; 1 (false) if it carries the UNEXPECTED marker
-# The matcher anchors on the shared DEVLOOP_UNEXPECTED_VERB_SUFFIX constant (single
-# source of truth with the dispatcher's reason-derivation — test-reviewer item 4).
-__is_intentional_gap_reason() {
-  [[ "$1" != *"${DEVLOOP_UNEXPECTED_VERB_SUFFIX}" ]]
 }
 
 # CI-SENTINEL-LEAK runtime assertion (task #47, §J/C — security trust boundary).
@@ -225,21 +198,24 @@ assert_no_ci_sentinel_leak() {
 
 # Aggregate multiple STATUS values; print the worst per precedence.
 #
-# Precedence (code-reviewer locked, re-confirmed Wave 2 #4 per ADR-0033):
-#   FAIL > N/A > OK > SKIPPED-NO-DIFF > SKIPPED-NO-VERB
+# Precedence (task #52 — FAIL-MISSING-VERB inserted at rank 5):
+#   UNKNOWN > FAIL-MISSING-VERB > FAIL > N/A > OK > SKIPPED-NO-DIFF > SKIPPED-NO-VERB
 # Reasoning: if any child did real work and passed, the layer passed; otherwise
-# the SKIPPED-* state is informative. The Wave 1 ladder (OK at the bottom) was
-# correct only for the single-lang case — once a 2nd lang registered with a
-# verb wrapper, a clean rust-only edit would aggregate to SKIPPED-NO-DIFF (or
-# SKIPPED-NO-VERB for missing verbs), corrupting the "loud success" signal.
-# Wave 2 #4 re-ranks OK above the SKIPPED-* class to honor the documented
-# invariant in all multi-lang cases. N/A remains a deliberate documented gap
-# (e.g. layer 7 wave2-pending) that propagates above OK because it signals
-# "this verb is not yet wired" — distinct from "ran cleanly". UNKNOWN ranks
-# above FAIL (means dispatcher bug → exit 2).
+# the SKIPPED-* state is informative. N/A is a deliberate documented gap (a verb
+# that does not apply to a lang — e.g. proto's placeholder test/audit wrappers, or
+# layer 7 wave2-pending) and propagates above OK because it signals "not wired here"
+# — distinct from "ran cleanly". FAIL means "this lang did real work and found a
+# problem". FAIL-MISSING-VERB (task #52) means "a verb wrapper that should exist is
+# missing/non-executable" — a WIRING fault — and ranks ABOVE FAIL: "we don't know if
+# this lang has problems because the gate never ran" is strictly more uncertain than
+# "this lang has problems and we found them", so a wiring fault must not be masked by a
+# sibling lang's OK/FAIL. UNKNOWN (dispatcher bug — no STATUS emitted) stays on top.
+# Ranking FAIL-MISSING-VERB above OK is what closes the cross-lang-masking residual: a
+# missing verb can no longer be hidden by a sibling's clean run (task #52, replaces the
+# #50 reason-tiebreak + the audit-slice post-processor).
 #
-# Exit-code mapping (status_to_exit_code): unaffected by the re-rank — OK and
-# both SKIPPED-* all still map to 0 (§6 success-exit class).
+# Exit-code mapping (status_to_exit_code): OK / SKIPPED-* / N/A → 0; FAIL → 1;
+# FAIL-MISSING-VERB / UNKNOWN → 2 (the §6 wiring-fault "investigate the script" class).
 #
 # Args: $@=zero-or-more STATUS enum values
 # Outputs: stdout=worst status (OK if no args)
@@ -261,80 +237,69 @@ aggregate_worst_status() {
 # Internal: numeric rank for precedence comparison.
 __status_rank() {
   case "$1" in
-    SKIPPED-NO-VERB)  printf '0\n' ;;
-    SKIPPED-NO-DIFF)  printf '1\n' ;;
-    OK)               printf '2\n' ;;
-    N/A)              printf '3\n' ;;
-    FAIL)             printf '4\n' ;;
-    UNKNOWN)          printf '5\n' ;;
-    *)                printf '5\n' ;;  # unknown enum → treat as bug
+    SKIPPED-NO-VERB)    printf '0\n' ;;
+    SKIPPED-NO-DIFF)    printf '1\n' ;;
+    OK)                 printf '2\n' ;;
+    N/A)                printf '3\n' ;;
+    FAIL)               printf '4\n' ;;
+    FAIL-MISSING-VERB)  printf '5\n' ;;  # wiring fault — outranks FAIL (task #52)
+    UNKNOWN)            printf '6\n' ;;
+    *)                  printf '6\n' ;;  # unknown enum → treat as bug
   esac
 }
 
-# Map a (STATUS enum, REASON) pair to its ADR-0033 §6 exit code (dry-reviewer F1).
+# Map a STATUS enum to its ADR-0033 §6 exit code (dry-reviewer F1).
 # Single source of truth for status→exit-code mapping; replaces the duplicated
 # case-statements that used to live in __layer_lifecycle_end and the dispatcher.
 #
-# Task #50: the exit code for SKIPPED-NO-VERB is now REASON-dependent. An UNEXPECTED
-# verb-missing (a wrapper that should exist but is missing/non-executable) is a
-# WIRING fault and maps to exit 2 — the ADR-0033 §6 "wrapper/dispatcher bug —
-# investigate the script itself" class, alongside UNKNOWN. SKIPPED-NO-VERB for an
-# intentional gap (proto test/audit) or all-langs-filtered stays in the exit-0
-# success class. The UNEXPECTED arm is EXPLICIT (Lead ruling), not the `*)→2`
-# catch-all, so the intent is legible and a future reason-token rename can't silently
-# fall through to 2.
+# Pure f(enum) (task #52, Lead ruling): the exit code is a function of the aggregate
+# enum ALONE — no REASON is consulted. The #50 reason→exit coupling existed only to
+# recover an exit code the rank-collided SKIPPED-NO-VERB enum could not express; with
+# FAIL-MISSING-VERB as its own ranked enum (rank 5), the enum carries the semantics
+# directly and the 2nd `reason` arg is retired. FAIL-MISSING-VERB and UNKNOWN are an
+# EXPLICIT exit-2 arm (not the `*)` catch-all) so the wiring-fault intent is legible.
 #
-# Args: $1=STATUS enum value  $2=REASON token (optional; only consulted for SKIPPED-NO-VERB)
+# Args: $1=STATUS enum value
 # Outputs: stdout=exit code (0/1/2)
 # Returns: 0 always (the exit code is on stdout)
 status_to_exit_code() {
-  local status="$1" reason="${2:-}"
+  local status="$1"
   case "$status" in
-    SKIPPED-NO-VERB)
-      if __is_intentional_gap_reason "$reason"; then
-        printf '0\n'                       # intentional gap / all-langs-filtered → success class
-      else
-        printf '2\n'                       # UNEXPECTED verb-missing → wiring-fault class (task #50)
-      fi
-      ;;
-    OK|SKIPPED-NO-DIFF|N/A) printf '0\n' ;;
-    FAIL)                    printf '1\n' ;;
-    *)                       printf '2\n' ;;  # UNKNOWN / dispatcher bug
+    OK|SKIPPED-NO-DIFF|SKIPPED-NO-VERB|N/A) printf '0\n' ;;
+    FAIL)                                    printf '1\n' ;;
+    FAIL-MISSING-VERB|UNKNOWN)               printf '2\n' ;;  # §6 wiring-fault class
+    *)                                       printf '2\n' ;;  # unrecognized → dispatcher bug
   esac
 }
 
-# Among children sharing the WINNING enum, pick the reason whose status_to_exit_code
-# is HIGHEST — so when a layer/dispatch aggregates to SKIPPED-NO-VERB but one
-# contributing child carried an UNEXPECTED-verb-missing reason (exit 2) while another
-# carried an intentional-gap reason (exit 0), the UNEXPECTED reason wins and the layer
-# reds (task #50 tie-break; observability/operations). Single SPOT helper consumed by
-# __layer_lifecycle_end and the dispatcher (dry-reviewer item 3).
+# Among children sharing the WINNING enum, pick a representative real reason — so the
+# stderr LAYER= / dispatcher-emit REASON field names an actual lang/verb cause rather
+# than a generic "<status>-aggregate" token (observability's 3am anchor, P2). This is
+# the FIRST child reason whose enum == the winner.
 #
-# Non-empty fallback (semantic-guard check 2): if NO child reason matches the winning
-# enum (shouldn't happen with 1:1 arrays, but guard the edge), emit a generic
-# "<status>-aggregate" reason so the caller never feeds an empty 2nd arg to
-# status_to_exit_code.
+# Task #52: this no longer drives the exit code — status_to_exit_code is now pure
+# f(enum), and all children sharing the winning enum map to the same exit code, so
+# there is nothing to "tie-break" on. The helper survives purely for the human-readable
+# stderr cause; it does NOT call status_to_exit_code (zero reason→exit coupling remains).
+#
+# Non-empty fallback (semantic-guard): if NO child reason matches the winning enum
+# (shouldn't happen with 1:1 arrays, but guard the edge), emit a generic
+# "<status>-aggregate" reason so the LAYER= line is never blank.
 #
 # Args: $1=winning enum; then alternating enum/reason pairs ($2=enum $3=reason ...)
-# Outputs: stdout=worst-exit-driving reason among children whose enum==$1
+# Outputs: stdout=a representative reason among children whose enum==$1
 # Returns: 0
 worst_reason_for_status() {
   local winner="$1"; shift
-  local best_reason="" best_code=-1 e r code
+  local e r
   while [[ $# -ge 2 ]]; do
     e="$1"; r="$2"; shift 2
-    [[ "$e" == "$winner" ]] || continue
-    code=$(status_to_exit_code "$e" "$r")
-    if [[ "$code" -gt "$best_code" ]]; then
-      best_code="$code"
-      best_reason="$r"
+    if [[ "$e" == "$winner" && -n "$r" ]]; then
+      printf '%s\n' "$r"
+      return 0
     fi
   done
-  if [[ -z "$best_reason" ]]; then
-    printf '%s-aggregate\n' "$(printf '%s' "$winner" | tr '[:upper:]' '[:lower:]')"
-  else
-    printf '%s\n' "$best_reason"
-  fi
+  printf '%s-aggregate\n' "$(printf '%s' "$winner" | tr '[:upper:]' '[:lower:]')"
 }
 
 # -----------------------------------------------------------------------------
@@ -355,11 +320,12 @@ layer_lifecycle_begin() {
   __LAYER_NUM="$1"
   __LAYER_START=$(date +%s)
   __LAYER_STATUSES=()
-  # Parallel to __LAYER_STATUSES, index-aligned (task #50): __LAYER_REASONS[i] is the
-  # REASON of the child whose enum is __LAYER_STATUSES[i]. Lets __layer_lifecycle_end
-  # drive the exit code off the worst child's REASON (UNEXPECTED verb-missing → exit 2)
-  # without overloading __LAYER_STATUSES (which stays bare enums — locked tests +
-  # lastpipe contract preserved; observability P1).
+  # Parallel to __LAYER_STATUSES, index-aligned: __LAYER_REASONS[i] is the REASON of the
+  # child whose enum is __LAYER_STATUSES[i]. Lets __layer_lifecycle_end surface the real
+  # worst-child REASON on the stderr LAYER= line (observability P2) without overloading
+  # __LAYER_STATUSES (which stays bare enums — locked tests + lastpipe contract preserved,
+  # observability P1). Task #52: the exit code is pure f(enum), so this REASON drives only
+  # the human-readable stderr cause, never the exit code.
   __LAYER_REASONS=()
   __LAYER_RESULT="UNKNOWN"
   # Export DEVLOOP_LAYER for child processes (dry-reviewer F3).
@@ -410,11 +376,10 @@ __layer_lifecycle_end() {
   else
     result=$(aggregate_worst_status "${__LAYER_STATUSES[@]}")
     # Build the (enum reason enum reason …) pair list from the index-aligned arrays,
-    # then pick the worst-exit-driving reason among children whose enum == result
-    # (task #50). This drives BOTH the exit code (so an UNEXPECTED verb-missing reds
-    # the layer even when it shares the SKIPPED-NO-VERB enum with an intentional gap)
-    # and the stderr LAYER= REASON (so the loud exit points at the real cause —
-    # observability P2 — distinguishing the two exit-2 classes: UNKNOWN vs verb-missing).
+    # then pick a representative reason among children whose enum == result. This drives
+    # the stderr LAYER= REASON only (so the loud exit points at the real cause —
+    # observability P2 — distinguishing FAIL-MISSING-VERB from UNKNOWN, both exit 2). The
+    # exit code itself is pure f(result) below (task #52 — the enum carries the semantics).
     pairs=()
     for ((i = 0; i < ${#__LAYER_STATUSES[@]}; i++)); do
       pairs+=("${__LAYER_STATUSES[i]}" "${__LAYER_REASONS[i]:-}")
@@ -432,11 +397,10 @@ __layer_lifecycle_end() {
   printf 'LAYER=%s START=%s END=%s DURATION=%s RESULT=%s REASON=%s\n' \
     "$__LAYER_NUM" "$__LAYER_START" "$end" "$duration" "$result" "$worst_reason" >&2
 
-  # Exit code via status_to_exit_code(result, worst_reason) — single source of truth
-  # (dry-reviewer F1). OK/SKIPPED-NO-DIFF/N/A → 0; FAIL → 1; UNKNOWN → 2;
-  # SKIPPED-NO-VERB → 0 for intentional/all-langs-filtered, 2 for UNEXPECTED verb-missing
-  # (task #50 — surface a wiring fault loud, not silent).
-  rc=$(status_to_exit_code "$result" "$worst_reason")
+  # Exit code via status_to_exit_code(result) — single source of truth (dry-reviewer F1),
+  # pure f(enum) (task #52). OK/SKIPPED-*/N/A → 0; FAIL → 1; FAIL-MISSING-VERB/UNKNOWN → 2.
+  # worst_reason drives only the human-readable stderr REASON above, never the exit code.
+  rc=$(status_to_exit_code "$result")
   trap - EXIT
   exit "$rc"
 }
