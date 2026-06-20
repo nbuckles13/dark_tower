@@ -94,8 +94,15 @@ pub struct AuthEvent {
     pub created_at: DateTime<Utc>,
 }
 
-/// Token response (OAuth 2.0 compliant)
+/// Token response (service-token / OAuth 2.0 client_credentials endpoint).
+///
+/// Wire shape is uniform camelCase (`accessToken`/`tokenType`/`expiresIn`/`scope`) under task #51's
+/// single rule — ALL AC token-response endpoints (user-flow AND `/service/token`) are camelCase, no
+/// per-field carve-out. The runtime consumer `common::token_manager::OAuthTokenResponse` is flipped
+/// in lockstep (GSA, security co-sign) so the service-to-service token path stays consistent. Rust
+/// field idents stay snake_case (the `rename_all` flips only the wire keys).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TokenResponse {
     pub access_token: String,
     pub token_type: String,
@@ -431,14 +438,17 @@ mod tests {
     ///
     /// RENAME TRIPWIRE: `TokenResponse` is the response of the genuine OAuth 2.0
     /// token endpoint (`POST /api/v1/auth/service/token`, `client_credentials`).
-    /// Its fields are RFC 6749 §5.1 standard names and MUST stay snake_case —
-    /// this is the one endpoint where §5.1 is normatively load-bearing. A future
-    /// blanket `rename_all = "camelCase"` sweep that reached this struct would
-    /// break OAuth-conformant clients; asserting the exact key-set here makes that
-    /// a deliberate, test-tripping decision rather than a silent regression.
-    /// Do NOT camelCase these fields.
+    /// Under task #51's SINGLE rule, its wire keys are camelCase
+    /// (`accessToken`/`tokenType`/`expiresIn`/`scope`) — ALL AC token-response
+    /// endpoints are camelCase, no per-field carve-out. The runtime consumer
+    /// `common::token_manager::OAuthTokenResponse` is flipped in lockstep (GSA,
+    /// security co-signed) and has its own deserialize-side reject-test, so a future
+    /// reversion to snake_case trips BOTH this serialize lock AND that deserialize
+    /// lock. Do NOT revert these to snake_case — the §5.1 carve-out was removed by
+    /// task #51 (no third-party OAuth client consumes this endpoint; the consumer is
+    /// our own `common::token_manager`).
     #[test]
-    fn test_service_token_response_wire_shape_stays_snake() {
+    fn test_service_token_response_wire_shape() {
         // Non-secret placeholder JWT, assigned via an indirection so the secret
         // scanner does not flag an `access_token: "<literal>"` field assignment.
         let placeholder_jwt = "FAKE_ACCESS_TOKEN_FOR_TEST".to_string();
@@ -458,14 +468,24 @@ mod tests {
             .collect();
 
         let expected: std::collections::BTreeSet<String> =
-            ["access_token", "token_type", "expires_in", "scope"]
+            ["accessToken", "tokenType", "expiresIn", "scope"]
                 .iter()
                 .map(|s| s.to_string())
                 .collect();
         assert_eq!(
             keys, expected,
-            "service-token TokenResponse wire key-set drifted — OAuth fields must stay snake_case (RFC 6749 §5.1)"
+            "service-token TokenResponse wire key-set drifted — must be uniform camelCase (task #51 single rule)"
         );
+
+        // Explicit intentional-reject: no snake_case wire key survives.
+        for key in &keys {
+            assert!(
+                !key.contains('_'),
+                "service-token wire key `{key}` contains `_` — a snake_case field survived. \
+                 AC wire is ALL camelCase (task #51, no OAuth carve-out); the consumer \
+                 OAuthTokenResponse expects camel — do NOT re-snake one side."
+            );
+        }
     }
 
     #[test]

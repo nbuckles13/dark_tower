@@ -58,46 +58,51 @@ async fn test_register_happy_path(pool: PgPool) -> Result<(), anyhow::Error> {
         "Response should include userId"
     );
     assert!(
-        body.get("access_token").is_some(),
-        "Response should include access_token"
+        body.get("accessToken").is_some(),
+        "Response should include accessToken"
     );
     assert_eq!(body["email"].as_str(), Some("alice@example.com"));
     assert_eq!(body["displayName"].as_str(), Some("Alice"));
-    assert_eq!(body["token_type"].as_str(), Some("Bearer"));
-    assert!(body["expires_in"].as_u64().unwrap_or(0) > 0);
+    assert_eq!(body["tokenType"].as_str(), Some("Bearer"));
+    assert!(body["expiresIn"].as_u64().unwrap_or(0) > 0);
 
     Ok(())
 }
 
-/// WIRE-SHAPE GOLDEN LOCK at the HTTP-integration level (R-53 / task #23).
+/// WIRE-SHAPE GOLDEN LOCK at the HTTP-integration level (R-53 / task #23 / task #51).
 ///
-/// Companion to the struct-level locks in `auth_handler.rs` and `models/mod.rs`.
-/// Exists because the R-53 camelCase migration broke the register flow at the
-/// HTTP-INTEGRATION level specifically — task #23's in-clone verification ran
-/// `cargo test -p ac-service --lib` and never exercised this binary, so the
-/// struct-level serde tests passed while these tests sent stale snake_case
-/// keys. This lock asserts the EXACT real-wire round-trip (request accepted +
-/// full response key set) so a future rename sweep that misses an HTTP surface
-/// fails loudly HERE, in the scope that actually broke.
+/// Companion to the struct-level locks in `auth_handler.rs`. Exists because the
+/// R-53 camelCase migration broke the register flow at the HTTP-INTEGRATION level
+/// specifically — task #23's in-clone verification ran `cargo test -p ac-service
+/// --lib` and never exercised this binary, so the struct-level serde tests passed
+/// while these tests sent stale snake_case keys. This lock asserts the EXACT
+/// real-wire round-trip (request accepted + full response key set) so a future
+/// rename sweep that misses an HTTP surface fails loudly HERE, in the scope that
+/// actually broke.
 ///
-/// IF THIS FAILS DURING A RENAME SWEEP: confirm the contract (R-11/R-53)
-/// before touching the golden sets — the SDK and every HTTP client depend on
-/// these exact keys. Mixed scheme is deliberate: camelCase DT-internal +
-/// snake_case OAuth (RFC 6749).
+/// CONTRACT (R-11/R-53 as amended by task #51): the register response wire shape is
+/// UNIFORM camelCase — task #51 removed the former per-field OAuth snake_case carve-out
+/// on this user-flow endpoint. There is NO mixed scheme and NO carve-out.
+///
+/// IF THIS FAILS DURING A RENAME SWEEP: confirm the contract (R-11/R-53) before
+/// touching the golden set — the SDK and every HTTP client depend on these exact
+/// camelCase keys. (Task #51 applied a SINGLE rule: ALL AC token-response wire fields
+/// are camelCase across every endpoint, including the genuine OAuth `/service/token`
+/// client_credentials response — no per-field snake_case carve-out remains.)
 #[sqlx::test(migrations = "../../migrations")]
 async fn test_register_wire_shape_golden_lock(pool: PgPool) -> Result<(), anyhow::Error> {
     use std::collections::BTreeSet;
 
-    // The COMPLETE, intended set of register-response wire keys. Mixed by
-    // design: camelCase DT-internal + snake_case OAuth. Update ONLY in lockstep
-    // with a deliberate R-53/R-11 contract change (and the struct-level lock).
+    // The COMPLETE, intended set of register-response wire keys. Uniform camelCase
+    // (task #51 single rule, no OAuth carve-out). Update ONLY in lockstep with a
+    // deliberate R-53/R-11 contract change (and the struct-level lock).
     let golden_response_keys: BTreeSet<String> = [
-        "userId",       // camelCase (R-53)
-        "email",        // single-word, scheme-invariant
-        "displayName",  // camelCase (R-53)
-        "access_token", // snake_case (RFC 6749)
-        "token_type",   // snake_case (RFC 6749)
-        "expires_in",   // snake_case (RFC 6749)
+        "userId",      // camelCase (R-53)
+        "email",       // single-word, scheme-invariant
+        "displayName", // camelCase (R-53)
+        "accessToken", // camelCase (task #51 — was snake_case access_token)
+        "tokenType",   // camelCase (task #51 — was snake_case token_type)
+        "expiresIn",   // camelCase (task #51 — was snake_case expires_in)
     ]
     .iter()
     .map(|s| s.to_string())
@@ -138,10 +143,10 @@ async fn test_register_wire_shape_golden_lock(pool: PgPool) -> Result<(), anyhow
 
     assert_eq!(
         actual_keys, golden_response_keys,
-        "register response wire-key set drifted from the R-53 golden shape. \
+        "register response wire-key set drifted from the golden shape. \
          If intentional, update this golden set AND the struct-level lock in \
-         auth_handler.rs AND the SDK (R-11). Mixed scheme is deliberate: \
-         camelCase DT-internal + snake_case OAuth (RFC 6749)."
+         auth_handler.rs AND the SDK (R-11). The shape is UNIFORM camelCase \
+         (task #51 single rule — no OAuth snake_case carve-out)."
     );
 
     // Explicit credential-echo guards. Set-equality above already implies these,
@@ -165,22 +170,22 @@ async fn test_register_wire_shape_golden_lock(pool: PgPool) -> Result<(), anyhow
         "register response must not echo the raw request password value anywhere"
     );
 
-    // OAuth RFC 6749 invariant ENFORCED at the HTTP boundary: snake_case present,
-    // camelCase forms absent — a future sweep camelCasing them fails here.
-    for snake in ["access_token", "token_type", "expires_in"] {
-        assert!(
-            actual_keys.contains(snake),
-            "OAuth field `{snake}` must remain snake_case on the wire (RFC 6749). \
-             DO NOT silently re-baseline: snake_case is the spec — a sweep that \
-             camelCased it is a regression, not a contract change."
-        );
-    }
+    // Single-rule invariant ENFORCED at the HTTP boundary (task #51): camelCase
+    // present, snake_case forms ABSENT — the exact inverse of the pre-#51 carve-out.
+    // A future reintroduction of the snake_case OAuth carve-out fails here.
     for camel in ["accessToken", "tokenType", "expiresIn"] {
         assert!(
-            !actual_keys.contains(camel),
-            "OAuth field camelCase form `{camel}` must be absent (RFC 6749 snake_case is the spec). \
-             DO NOT silently re-baseline: re-add the per-field #[serde(rename)] override \
-             rather than editing this test."
+            actual_keys.contains(camel),
+            "user-flow token field `{camel}` must be camelCase on the wire (task #51 single rule). \
+             DO NOT silently re-baseline: the per-field OAuth snake_case carve-out was removed."
+        );
+    }
+    for snake in ["access_token", "token_type", "expires_in"] {
+        assert!(
+            !actual_keys.contains(snake),
+            "snake_case form `{snake}` must be ABSENT on the user-flow wire (task #51 single rule). \
+             DO NOT silently re-baseline: do NOT re-add the per-field #[serde(rename)] OAuth carve-out — \
+             that reintroduces the mixed scheme task #51 removed."
         );
     }
 
@@ -211,9 +216,9 @@ async fn test_register_token_has_user_claims(pool: PgPool) -> Result<(), anyhow:
 
     assert_eq!(response.status(), StatusCode::OK);
     let body: serde_json::Value = response.json().await?;
-    let token = body["access_token"]
+    let token = body["accessToken"]
         .as_str()
-        .expect("Should have access_token");
+        .expect("Should have accessToken");
 
     // Decode JWT payload (second part)
     let parts: Vec<&str> = token.split('.').collect();
@@ -266,9 +271,9 @@ async fn test_register_assigns_default_user_role(pool: PgPool) -> Result<(), any
 
     assert_eq!(response.status(), StatusCode::OK);
     let body: serde_json::Value = response.json().await?;
-    let token = body["access_token"]
+    let token = body["accessToken"]
         .as_str()
-        .expect("Should have access_token");
+        .expect("Should have accessToken");
 
     // Decode JWT payload
     let parts: Vec<&str> = token.split('.').collect();
@@ -652,11 +657,11 @@ async fn test_login_happy_path(pool: PgPool) -> Result<(), anyhow::Error> {
 
     let body: serde_json::Value = response.json().await?;
     assert!(
-        body.get("access_token").is_some(),
-        "Response should include access_token"
+        body.get("accessToken").is_some(),
+        "Response should include accessToken"
     );
-    assert_eq!(body["token_type"].as_str(), Some("Bearer"));
-    assert!(body["expires_in"].as_u64().unwrap_or(0) > 0);
+    assert_eq!(body["tokenType"].as_str(), Some("Bearer"));
+    assert!(body["expiresIn"].as_u64().unwrap_or(0) > 0);
 
     Ok(())
 }
@@ -687,9 +692,9 @@ async fn test_login_token_has_user_claims(pool: PgPool) -> Result<(), anyhow::Er
 
     assert_eq!(response.status(), StatusCode::OK);
     let body: serde_json::Value = response.json().await?;
-    let token = body["access_token"]
+    let token = body["accessToken"]
         .as_str()
-        .expect("Should have access_token");
+        .expect("Should have accessToken");
 
     // Decode JWT payload
     let parts: Vec<&str> = token.split('.').collect();
@@ -1014,9 +1019,9 @@ async fn test_org_extraction_valid_subdomain(pool: PgPool) -> Result<(), anyhow:
 
     // Verify org_id in token matches
     let body: serde_json::Value = response.json().await?;
-    let token = body["access_token"]
+    let token = body["accessToken"]
         .as_str()
-        .expect("Should have access_token");
+        .expect("Should have accessToken");
     let parts: Vec<&str> = token.split('.').collect();
     let payload_bytes =
         base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, parts[1])?;

@@ -43,18 +43,18 @@ pub struct UserRegistrationRequest {
 }
 
 /// User registration response (ADR-0020).
+///
+/// Wire shape is uniform camelCase (`userId`/`displayName`/`accessToken`/`tokenType`/`expiresIn`)
+/// — task #51 removed the former per-field OAuth snake_case carve-out on this user-flow endpoint.
+/// Rust field idents stay snake_case (the `rename_all` flips only the wire keys).
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UserRegistrationResponse {
     pub user_id: Uuid,
     pub email: String,
     pub display_name: String,
-    // OAuth RFC 6749 standard field names — preserved snake_case for client compatibility.
-    #[serde(rename = "access_token")]
     pub access_token: String,
-    #[serde(rename = "token_type")]
     pub token_type: String,
-    #[serde(rename = "expires_in")]
     pub expires_in: u64,
 }
 
@@ -654,6 +654,29 @@ mod tests {
             .collect()
     }
 
+    /// Assert no top-level serialized key contains `_` (i.e. all-camelCase, no
+    /// surviving snake_case wire field after the task #51 single-rule reversal).
+    ///
+    /// Set-equality in the lock tests already implies snake-absence, but this
+    /// explicit reject states the INTENT — the snake-rejection is deliberate, not
+    /// incidental — so a future reader sees it's a contract guard. Mirrors the
+    /// GC-side `assert_no_snake_keys` (gc-service/src/models/mod.rs) for AC/GC
+    /// lock consistency.
+    fn assert_no_snake_keys(value: &serde_json::Value, ctx: &str) {
+        for key in value
+            .as_object()
+            .expect("wire shape must be a JSON object")
+            .keys()
+        {
+            assert!(
+                !key.contains('_'),
+                "{ctx} wire key `{key}` contains `_` — a snake_case field survived. \
+                 AC user-flow wire shape is ALL camelCase (R-11/R-53 as amended by task #51, \
+                 no per-field OAuth carve-out). DO NOT silently re-baseline; re-camelCase the field."
+            );
+        }
+    }
+
     /// WIRE-SHAPE LOCK — `UserRegistrationRequest` (deserialize side).
     ///
     /// RENAME TRIPWIRE: any future change to the `rename_all`/per-field renames
@@ -706,17 +729,22 @@ mod tests {
         );
     }
 
-    /// WIRE-SHAPE LOCK — `UserRegistrationResponse` (serialize side), MIXED scheme.
+    /// WIRE-SHAPE LOCK — `UserRegistrationResponse` (serialize side), single-rule camelCase.
     ///
     /// RENAME TRIPWIRE: asserts the EXACT wire key-set, so any `rename_all`
-    /// sweep or field change in either direction fails this test. Runs under
+    /// removal or field change in either direction fails this test. Runs under
     /// `cargo test -p ac-service --lib` (DB-free, always-on).
     ///
-    /// Contract (R-11 as amended + task #23 OAuth carve-out): identity fields
-    /// `userId`/`displayName` are camelCase; the three RFC 6749 token fields
-    /// `access_token`/`token_type`/`expires_in` STAY snake_case. See R-11 in
-    /// docs/user-stories/2026-05-02-browser-client-join.md and the OAuth
-    /// disposition in docs/devloop-outputs/2026-05-23-camelcase-wire-migration/main.md.
+    /// Contract (R-11/R-53 as amended by task #51): ALL wire fields are camelCase —
+    /// `userId`/`email`/`displayName`/`accessToken`/`tokenType`/`expiresIn`. Task #51
+    /// removed the per-field OAuth snake_case carve-out under a SINGLE rule: ALL AC
+    /// token-response wire fields are camelCase across every endpoint, with no per-field
+    /// exception. A future reintroduction of snake_case `access_token`/`token_type`/
+    /// `expires_in` here trips this tripwire — do NOT re-add the carve-out. (The genuine
+    /// OAuth `/service/token` endpoint was ALSO flipped to camelCase by task #51 — see
+    /// `TokenResponse` + `test_service_token_response_wire_shape` in `models/mod.rs` and
+    /// its GSA consumer `common::token_manager::OAuthTokenResponse`.) See R-11 in
+    /// docs/user-stories/2026-05-02-browser-client-join.md.
     #[test]
     fn test_user_registration_response_wire_shape() {
         // Non-secret placeholder JWT, assigned via an indirection so the secret
@@ -733,14 +761,14 @@ mod tests {
 
         let value = serde_json::to_value(&response).expect("should serialize");
 
-        // Exact wire key-set: camelCase identity + snake_case RFC 6749 token fields.
+        // Exact wire key-set: uniform camelCase, no per-field OAuth carve-out.
         let expected: std::collections::BTreeSet<String> = [
             "userId",
             "email",
             "displayName",
-            "access_token",
-            "token_type",
-            "expires_in",
+            "accessToken",
+            "tokenType",
+            "expiresIn",
         ]
         .iter()
         .map(|s| s.to_string())
@@ -748,24 +776,28 @@ mod tests {
         assert_eq!(
             wire_keys(&value),
             expected,
-            "register response wire key-set drifted (snake/camel boundary moved?)"
+            "register response wire key-set drifted — must be uniform camelCase (no OAuth carve-out)"
         );
 
-        // Spot-check the values land on the right (mixed-scheme) keys.
+        // Explicit intentional-reject: no snake_case wire key survives.
+        assert_no_snake_keys(&value, "register response");
+
+        // Spot-check the values land on the camelCase keys.
         assert_eq!(value["userId"], serde_json::json!(Uuid::nil().to_string()));
         assert_eq!(value["displayName"], serde_json::json!("Alice"));
-        assert_eq!(value["token_type"], serde_json::json!("Bearer"));
-        assert_eq!(value["expires_in"], serde_json::json!(3600));
+        assert_eq!(value["tokenType"], serde_json::json!("Bearer"));
+        assert_eq!(value["expiresIn"], serde_json::json!(3600));
     }
 
     /// WIRE-SHAPE LOCK — `UserTokenResponse` (login response, serialize side).
     ///
-    /// RENAME TRIPWIRE for the gap task #23 never locked: the login response is
-    /// a pure OAuth 2.0 shape and stays FULLY snake_case (no `rename_all`). This
-    /// asserts the exact key-set so a future blanket `rename_all = "camelCase"`
-    /// added to `UserTokenResponse` (or any field rename) fails this test.
-    /// `access_token`/`token_type`/`expires_in` are deliberately snake_case per
-    /// RFC 6749 §5.1 and R-11 (as amended) — do NOT "fix" them to camelCase.
+    /// RENAME TRIPWIRE: the login response (`/api/v1/auth/user/token`) is a user-flow
+    /// endpoint and its wire shape is uniform camelCase under task #51's single rule —
+    /// `accessToken`/`tokenType`/`expiresIn`. This asserts the exact key-set so a future
+    /// reversion to snake_case (e.g. dropping the `rename_all`) fails this test. Do NOT
+    /// "fix" these back to snake_case — the per-field OAuth carve-out was removed by task #51's
+    /// SINGLE rule (all AC token-response wire fields camelCase across every endpoint, incl.
+    /// the genuine OAuth `/service/token` client_credentials response — no carve-out remains).
     #[test]
     fn test_user_token_response_login_wire_shape() {
         // Non-secret placeholder JWT, assigned via an indirection so the secret
@@ -780,15 +812,18 @@ mod tests {
         let value = serde_json::to_value(&response).expect("should serialize");
 
         let expected: std::collections::BTreeSet<String> =
-            ["access_token", "token_type", "expires_in"]
+            ["accessToken", "tokenType", "expiresIn"]
                 .iter()
                 .map(|s| s.to_string())
                 .collect();
         assert_eq!(
             wire_keys(&value),
             expected,
-            "login (UserTokenResponse) wire key-set drifted — OAuth fields must stay snake_case"
+            "login (UserTokenResponse) wire key-set drifted — must be uniform camelCase"
         );
+
+        // Explicit intentional-reject: no snake_case wire key survives.
+        assert_no_snake_keys(&value, "login response");
     }
 
     /// Test ServiceTokenRequest is left unchanged as OAuth-shaped (snake_case wire keys).

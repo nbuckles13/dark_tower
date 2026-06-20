@@ -58,8 +58,14 @@ impl TokenRequest {
     }
 }
 
-/// OAuth 2.0 token response.
+/// OAuth 2.0 token response (service-token / client_credentials endpoint).
+///
+/// Mirror of AC's `crates/ac-service/src/models/mod.rs:TokenResponse`. Under task #51's single rule,
+/// the wire is uniform camelCase (`accessToken`/`tokenType`/`expiresIn`/`scope`) — flipped in lockstep
+/// with the server struct AND the production consumer `common::token_manager::OAuthTokenResponse`.
+/// Rust field idents stay snake_case (`rename_all` flips only the wire keys).
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TokenResponse {
     pub access_token: String,
     pub token_type: String,
@@ -244,23 +250,21 @@ impl UserRegistrationRequest {
 /// User registration response.
 ///
 /// Returned by AC's `POST /api/v1/auth/register` endpoint.
-/// Contains an auto-login user JWT in `access_token`.
+/// Contains an auto-login user JWT in `access_token` (Rust ident; wire key is `accessToken`).
 ///
 /// Mirror of `crates/ac-service/src/handlers/auth_handler.rs:UserRegistrationResponse`;
-/// uses the same mixed scheme — camelCase for DT-internal fields, per-field
-/// snake_case overrides on the three OAuth RFC 6749 fields.
+/// uses the SAME uniform camelCase wire shape — task #51 removed the former per-field
+/// OAuth snake_case carve-out on this user-flow endpoint, so all wire keys are camelCase
+/// (`userId`/`email`/`displayName`/`accessToken`/`tokenType`/`expiresIn`). Rust field idents
+/// stay snake_case (the `rename_all` flips only the wire keys).
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UserRegistrationResponse {
     pub user_id: Uuid,
     pub email: String,
     pub display_name: String,
-    // OAuth RFC 6749 standard field names — preserved snake_case for client compatibility.
-    #[serde(rename = "access_token")]
     pub access_token: String,
-    #[serde(rename = "token_type")]
     pub token_type: String,
-    #[serde(rename = "expires_in")]
     pub expires_in: u64,
 }
 
@@ -333,6 +337,55 @@ mod tests {
         assert!(
             debug_output.contains("test@example.com"),
             "Email should be visible"
+        );
+    }
+
+    /// WIRE-SHAPE ROUND-TRIP LOCK — `UserRegistrationResponse` mirror (task #51).
+    ///
+    /// DB-free guard that the env-tests fixture deserializes AC's CURRENT register
+    /// wire shape: uniform camelCase, no per-field OAuth carve-out. The live
+    /// round-trip (via `register_user()`) only runs in the cluster-gated env-tests;
+    /// this asserts the mirror tracks the server shape without a DB — the same
+    /// always-on protection the AC-side struct locks provide. If the AC server flips
+    /// the wire and this mirror lags, the cluster round-trip (matrix c) would fail at
+    /// deserialize; this test trips first, in-clone.
+    #[test]
+    fn test_user_registration_response_camel_wire_round_trip() {
+        // CURRENT camelCase wire (post-task-#51) deserializes and populates all fields.
+        let camel = r#"{
+            "userId": "00000000-0000-0000-0000-000000000000",
+            "email": "alice@example.com",
+            "displayName": "Alice",
+            "accessToken": "FAKE_TOKEN_FOR_TEST",
+            "tokenType": "Bearer",
+            "expiresIn": 3600
+        }"#;
+        let resp: UserRegistrationResponse =
+            serde_json::from_str(camel).expect("camelCase register wire must deserialize");
+        assert_eq!(resp.user_id, Uuid::nil());
+        assert_eq!(resp.email, "alice@example.com");
+        assert_eq!(resp.display_name, "Alice");
+        assert_eq!(resp.token_type, "Bearer");
+        assert_eq!(resp.expires_in, 3600);
+
+        // Wire-break: the legacy mixed snake_case OAuth keys no longer populate the
+        // token fields. With `rename_all = "camelCase"` and no per-field overrides,
+        // `access_token`/`token_type`/`expires_in` are unknown keys; since the struct
+        // does not `deny_unknown_fields`, they're ignored and the required `accessToken`
+        // is then missing → deserialize error. This pins the carve-out's removal.
+        let snake = r#"{
+            "userId": "00000000-0000-0000-0000-000000000000",
+            "email": "alice@example.com",
+            "displayName": "Alice",
+            "access_token": "FAKE_TOKEN_FOR_TEST",
+            "token_type": "Bearer",
+            "expires_in": 3600
+        }"#;
+        let res: Result<UserRegistrationResponse, _> = serde_json::from_str(snake);
+        assert!(
+            res.is_err(),
+            "legacy snake_case OAuth keys must no longer satisfy the register response \
+             (task #51 removed the per-field carve-out; the mirror must track the camel wire)"
         );
     }
 }

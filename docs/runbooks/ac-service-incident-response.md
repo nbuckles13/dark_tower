@@ -216,7 +216,7 @@ curl http://ac-service:9090/metrics | grep ac_key_rotation_last_success_timestam
 export ADMIN_TOKEN=$(curl -X POST http://ac-service:8080/api/v1/auth/service/token \
   -H "Content-Type: application/json" \
   -d '{"client_id":"admin-client","client_secret":"<admin-secret>","grant_type":"client_credentials","scope":"admin:keys"}' \
-  | jq -r '.access_token')
+  | jq -r '.accessToken')
 
 # Trigger rotation
 curl -X POST http://ac-service:8080/internal/rotate-keys \
@@ -417,7 +417,7 @@ kubectl exec -it -n dark-tower deployment/ac-service -- date
 TOKEN=$(curl -X POST http://ac-service:8080/api/v1/auth/service/token \
   -H "Content-Type: application/json" \
   -d '{"client_id":"test-client","client_secret":"test-secret","grant_type":"client_credentials"}' \
-  | jq -r '.access_token')
+  | jq -r '.accessToken')
 
 # Decode token (use jwt.io or jwt-cli)
 echo $TOKEN | jwt decode -
@@ -814,7 +814,7 @@ kubectl exec -it -n dark-tower deployment/ac-service -- sh -c 'psql $DATABASE_UR
 export ADMIN_TOKEN=$(curl -X POST http://ac-service:8080/api/v1/auth/service/token \
   -H "Content-Type: application/json" \
   -d '{"client_id":"admin-client","client_secret":"'"$ADMIN_SECRET"'","grant_type":"client_credentials","scope":"admin:keys"}' \
-  | jq -r '.access_token')
+  | jq -r '.accessToken')
 
 # 4. Trigger emergency rotation
 curl -X POST http://ac-service:8080/internal/rotate-keys \

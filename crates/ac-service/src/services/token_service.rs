@@ -182,8 +182,12 @@ pub async fn issue_service_token(
 
 /// User token response (ADR-0020).
 ///
-/// Contains the JWT access token and its metadata.
+/// Contains the JWT access token and its metadata. Login (`/api/v1/auth/user/token`) is a
+/// user-flow endpoint, so the wire shape is uniform camelCase
+/// (`accessToken`/`tokenType`/`expiresIn`) — task #51 single-rule reversal. Rust field idents
+/// stay snake_case (the `rename_all` flips only the wire keys).
 #[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct UserTokenResponse {
     pub access_token: String,
     pub token_type: String,

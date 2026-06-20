@@ -973,9 +973,9 @@ curl -i -X POST http://localhost:8082/api/v1/auth/service/token \
 # Content-Type: application/json
 #
 # {
-#   "access_token": "eyJhbGc...",
-#   "token_type": "Bearer",
-#   "expires_in": 7200,
+#   "accessToken": "eyJhbGc...",
+#   "tokenType": "Bearer",
+#   "expiresIn": 7200,
 #   "scope": "service.write.mh service.read.gc"
 # }
 
@@ -985,18 +985,18 @@ kill %1
 
 **Success criteria:**
 - HTTP 200 status
-- JSON response with `access_token`, `token_type`, `expires_in`, `scope`
-- `token_type: "Bearer"`
-- `access_token` is valid JWT (3 base64 parts separated by dots)
+- JSON response with `accessToken`, `tokenType`, `expiresIn`, `scope`
+- `tokenType: "Bearer"`
+- `accessToken` is valid JWT (3 base64 parts separated by dots)
 - Response time: <350ms (p99 SLO per ADR-0011)
 
 **Validate token structure:**
 
 ```bash
-# Extract access_token from response
+# Extract accessToken from response
 ACCESS_TOKEN=$(curl -s -X POST http://localhost:8082/api/v1/auth/service/token \
   -u "test-client-id:test-client-secret" \
-  -d "grant_type=client_credentials" | jq -r '.access_token')
+  -d "grant_type=client_credentials" | jq -r '.accessToken')
 
 # Decode JWT header (without verification)
 echo $ACCESS_TOKEN | cut -d. -f1 | base64 -d 2>/dev/null | jq .

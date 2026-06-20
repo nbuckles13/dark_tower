@@ -846,7 +846,7 @@ kubectl port-forward -n dark-tower deployment/gc-service 8080:8080 &
 # Get a service token from AC (requires test credentials)
 TOKEN=$(curl -s -X POST http://ac-service.dark-tower.svc.cluster.local:8082/api/v1/auth/service/token \
   -u "test-client-id:test-client-secret" \
-  -d "grant_type=client_credentials" | jq -r '.access_token')
+  -d "grant_type=client_credentials" | jq -r '.accessToken')
 
 # Test authenticated endpoint
 curl -i http://localhost:8080/api/v1/me \
@@ -881,7 +881,7 @@ kubectl port-forward -n dark-tower deployment/gc-service 8080:8080 &
 USER_TOKEN=$(curl -s -X POST http://ac-service.dark-tower.svc.cluster.local:8082/api/v1/auth/login \
   -H "Content-Type: application/json" \
   -d '{"email":"smoke-test@example.com","password":"SmokeTest123!"}' \
-  | jq -r '.access_token')
+  | jq -r '.accessToken')
 
 # Step 2: Join the meeting
 MEETING_CODE="REPLACE_WITH_VALID_CODE"  # From test 6 output
@@ -949,14 +949,14 @@ kubectl port-forward -n dark-tower deployment/gc-service 8080:8080 &
 USER_TOKEN=$(curl -s -X POST http://ac-service.dark-tower.svc.cluster.local:8082/api/v1/auth/register \
   -H "Content-Type: application/json" \
   -d '{"email":"smoke-test@example.com","password":"SmokeTest123!","displayName":"Smoke Test"}' \
-  | jq -r '.access_token')
+  | jq -r '.accessToken')
 
 # If user already exists, login instead
 if [ -z "$USER_TOKEN" ] || [ "$USER_TOKEN" = "null" ]; then
   USER_TOKEN=$(curl -s -X POST http://ac-service.dark-tower.svc.cluster.local:8082/api/v1/auth/login \
     -H "Content-Type: application/json" \
     -d '{"email":"smoke-test@example.com","password":"SmokeTest123!"}' \
-    | jq -r '.access_token')
+    | jq -r '.accessToken')
 fi
 
 # Step 2: Create a meeting

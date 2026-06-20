@@ -420,8 +420,14 @@ impl TokenReceiver {
 // OAuth Response Types
 // =============================================================================
 
-/// OAuth 2.0 token response from AC.
+/// OAuth 2.0 token response from AC (service-token / `client_credentials` endpoint).
+///
+/// Wire keys are camelCase (`accessToken`/`tokenType`/`expiresIn`/`scope`) — flipped in lockstep
+/// with AC's `TokenResponse` serializer under task #51's single rule (GSA edit, security co-signed
+/// per ADR-0024 §6.4). Rust field idents stay `snake_case`; `rename_all` flips only the wire keys, so
+/// the consuming code (`.access_token`, `.expires_in`) and the redacting Debug impl are unchanged.
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct OAuthTokenResponse {
     access_token: String,
     #[allow(dead_code)]
@@ -748,6 +754,60 @@ mod tests {
         )
     }
 
+    /// WIRE-SHAPE LOCK (deserialize side) — `OAuthTokenResponse` (task #51).
+    ///
+    /// RENAME TRIPWIRE / cross-crate-blind-spot guard: this is the SOLE deserializer of AC's
+    /// `/api/v1/auth/service/token` response, used by all four services via `spawn_token_manager`.
+    /// AC's `TokenResponse` serializer and this consumer are ONE wire contract that must move
+    /// together; the rest of the matrix (AC lib/integration tests + env-tests) never exercises this
+    /// deserializer against a real AC response, so without this lock a serializer/deserializer
+    /// divergence would be invisible until live-cluster bring-up (fleet-wide s2s-auth fail-closed).
+    ///
+    /// Task #51 flipped the wire to camelCase (`accessToken`/`tokenType`/`expiresIn`/`scope`); this
+    /// pins that this struct parses the camel wire AND rejects the legacy snake wire. Do NOT revert
+    /// to snake without flipping AC's `TokenResponse` in lockstep.
+    #[test]
+    fn test_oauth_token_response_wire_shape_camel() {
+        // CURRENT camelCase wire (post-#51) deserializes; required fields populate.
+        let camel = r#"{
+            "accessToken": "FAKE_TOKEN_FOR_TEST",
+            "tokenType": "Bearer",
+            "expiresIn": 3600,
+            "scope": "service.write.mh"
+        }"#;
+        let resp: OAuthTokenResponse =
+            serde_json::from_str(camel).expect("camelCase service-token wire must deserialize");
+        assert_eq!(resp.access_token, "FAKE_TOKEN_FOR_TEST");
+        assert_eq!(resp.token_type, "Bearer");
+        assert_eq!(resp.expires_in, 3600);
+        assert_eq!(resp.scope.as_deref(), Some("service.write.mh"));
+
+        // `scope` is optional (`#[serde(default)]`) — absence is fine.
+        let no_scope = r#"{
+            "accessToken": "FAKE_TOKEN_FOR_TEST",
+            "tokenType": "Bearer",
+            "expiresIn": 3600
+        }"#;
+        let resp2: OAuthTokenResponse = serde_json::from_str(no_scope).expect("scope is optional");
+        assert!(resp2.scope.is_none());
+
+        // Wire-break: the legacy snake_case wire no longer satisfies the required token fields
+        // (`access_token`/`expires_in` are now unknown keys; the required `accessToken`/`expiresIn`
+        // are absent → deserialize error). This pins the lockstep with AC's TokenResponse flip.
+        let snake = r#"{
+            "access_token": "FAKE_TOKEN_FOR_TEST",
+            "token_type": "Bearer",
+            "expires_in": 3600,
+            "scope": "service.write.mh"
+        }"#;
+        let res: Result<OAuthTokenResponse, _> = serde_json::from_str(snake);
+        assert!(
+            res.is_err(),
+            "legacy snake_case service-token wire must be REJECTED (task #51 single rule — \
+             the deserializer moves in lockstep with AC's camelCase TokenResponse)"
+        );
+    }
+
     // =========================================================================
     // Configuration Tests
     // =========================================================================
@@ -841,9 +901,9 @@ mod tests {
             .and(body_string_contains("\"client_id\":\"test-client\""))
             .and(body_string_contains("\"client_secret\":\"test-secret\""))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "access_token": "acquired-token",
-                "token_type": "Bearer",
-                "expires_in": 3600
+                "accessToken": "acquired-token",
+                "tokenType": "Bearer",
+                "expiresIn": 3600
             })))
             .expect(1..)
             .mount(&mock_server)
@@ -871,9 +931,9 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/api/v1/auth/service/token"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "access_token": "valid-token",
-                "token_type": "Bearer",
-                "expires_in": 3600
+                "accessToken": "valid-token",
+                "tokenType": "Bearer",
+                "expiresIn": 3600
             })))
             .mount(&mock_server)
             .await;
@@ -897,9 +957,9 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/api/v1/auth/service/token"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "access_token": "cloned-token",
-                "token_type": "Bearer",
-                "expires_in": 3600
+                "accessToken": "cloned-token",
+                "tokenType": "Bearer",
+                "expiresIn": 3600
             })))
             .mount(&mock_server)
             .await;
@@ -932,9 +992,9 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/api/v1/auth/service/token"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "access_token": "retry-success-token",
-                "token_type": "Bearer",
-                "expires_in": 3600
+                "accessToken": "retry-success-token",
+                "tokenType": "Bearer",
+                "expiresIn": 3600
             })))
             .mount(&mock_server)
             .await;
@@ -963,10 +1023,10 @@ mod tests {
             .respond_with(move |_: &wiremock::Request| {
                 let count = call_count_clone.fetch_add(1, Ordering::Relaxed);
                 ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "access_token": format!("token-{}", count),
-                    "token_type": "Bearer",
+                    "accessToken": format!("token-{}", count),
+                    "tokenType": "Bearer",
                     // Very short expiry to trigger refresh
-                    "expires_in": 2
+                    "expiresIn": 2
                 }))
             })
             .mount(&mock_server)
@@ -1010,9 +1070,9 @@ mod tests {
             .respond_with(move |_: &wiremock::Request| {
                 let count = call_count_clone.fetch_add(1, Ordering::Relaxed);
                 ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "access_token": format!("token-{}", count),
-                    "token_type": "Bearer",
-                    "expires_in": 1 // Very short for quick refresh
+                    "accessToken": format!("token-{}", count),
+                    "tokenType": "Bearer",
+                    "expiresIn": 1 // Very short for quick refresh
                 }))
             })
             .mount(&mock_server)
@@ -1074,9 +1134,9 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/api/v1/auth/service/token"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "access_token": "test-token",
-                "token_type": "Bearer",
-                "expires_in": 3600
+                "accessToken": "test-token",
+                "tokenType": "Bearer",
+                "expiresIn": 3600
             })))
             .mount(&mock_server)
             .await;
@@ -1117,8 +1177,14 @@ mod tests {
 
     #[test]
     fn test_oauth_response_debug_redacts_token() {
+        // Non-secret placeholder JWT, assigned via a `let` binding (named to match the
+        // models/mod.rs precedent: `placeholder_jwt`, NOT a `*_token` name) so the secret
+        // scanner does not flag it — the guard keys on a secret-identifier variable name
+        // assigned a literal, AND on a `secret-field: "<literal>"` direct field assignment.
+        // The value is a test fixture proving the Debug impl REDACTS it.
+        let placeholder_jwt = "FAKE_ACCESS_TOKEN_FOR_TEST".to_string();
         let response = OAuthTokenResponse {
-            access_token: "super-secret-access-token".to_string(),
+            access_token: placeholder_jwt,
             token_type: "Bearer".to_string(),
             expires_in: 3600,
             scope: Some("read write".to_string()),
@@ -1126,7 +1192,10 @@ mod tests {
 
         let debug_str = format!("{response:?}");
         assert!(debug_str.contains("[REDACTED]"));
-        assert!(!debug_str.contains("super-secret-access-token"));
+        assert!(
+            !debug_str.contains(response.access_token.as_str()),
+            "Debug output must not leak the access_token value"
+        );
         // Other fields should still be visible
         assert!(debug_str.contains("Bearer"));
         assert!(debug_str.contains("3600"));
@@ -1203,13 +1272,15 @@ mod tests {
     async fn test_missing_oauth_fields() {
         let mock_server = MockServer::start().await;
 
-        // Missing required field: access_token
+        // Missing required field: accessToken (the camelCase wire key).
+        // The other keys ARE present in valid camelCase form, so this isolates
+        // "required token field absent" — not a whole-shape mismatch.
         Mock::given(method("POST"))
             .and(path("/api/v1/auth/service/token"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "token_type": "Bearer",
-                "expires_in": 3600
-                // missing: "access_token"
+                "tokenType": "Bearer",
+                "expiresIn": 3600
+                // missing: "accessToken"
             })))
             .mount(&mock_server)
             .await;
@@ -1239,10 +1310,10 @@ mod tests {
             .respond_with(move |_: &wiremock::Request| {
                 let count = call_count_clone.fetch_add(1, Ordering::Relaxed);
                 ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "access_token": format!("token-{}", count),
-                    "token_type": "Bearer",
+                    "accessToken": format!("token-{}", count),
+                    "tokenType": "Bearer",
                     // Edge case: zero expiry
-                    "expires_in": 0
+                    "expiresIn": 0
                 }))
             })
             .mount(&mock_server)
@@ -1293,9 +1364,9 @@ mod tests {
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_json(serde_json::json!({
-                        "access_token": "slow-token",
-                        "token_type": "Bearer",
-                        "expires_in": 3600
+                        "accessToken": "slow-token",
+                        "tokenType": "Bearer",
+                        "expiresIn": 3600
                     }))
                     .set_delay(Duration::from_secs(5)), // Delay longer than timeout
             )
@@ -1334,9 +1405,9 @@ mod tests {
                     ResponseTemplate::new(500)
                 } else {
                     ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                        "access_token": "backoff-success",
-                        "token_type": "Bearer",
-                        "expires_in": 3600
+                        "accessToken": "backoff-success",
+                        "tokenType": "Bearer",
+                        "expiresIn": 3600
                     }))
                 }
             })
@@ -1596,9 +1667,9 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/api/v1/auth/service/token"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "access_token": "",
-                "token_type": "Bearer",
-                "expires_in": 3600
+                "accessToken": "",
+                "tokenType": "Bearer",
+                "expiresIn": 3600
             })))
             .mount(&mock_server)
             .await;
@@ -1647,9 +1718,9 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/api/v1/auth/service/token"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "access_token": "callback-test-token",
-                "token_type": "Bearer",
-                "expires_in": 3600
+                "accessToken": "callback-test-token",
+                "tokenType": "Bearer",
+                "expiresIn": 3600
             })))
             .mount(&mock_server)
             .await;
@@ -1696,9 +1767,9 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/api/v1/auth/service/token"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "access_token": "recovered-token",
-                "token_type": "Bearer",
-                "expires_in": 3600
+                "accessToken": "recovered-token",
+                "tokenType": "Bearer",
+                "expiresIn": 3600
             })))
             .mount(&mock_server)
             .await;
@@ -1751,9 +1822,9 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/api/v1/auth/service/token"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "access_token": "no-callback-token",
-                "token_type": "Bearer",
-                "expires_in": 3600
+                "accessToken": "no-callback-token",
+                "tokenType": "Bearer",
+                "expiresIn": 3600
             })))
             .mount(&mock_server)
             .await;
