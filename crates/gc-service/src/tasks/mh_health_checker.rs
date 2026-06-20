@@ -162,18 +162,42 @@ mod integration_tests {
         let cancel_token = CancellationToken::new();
         let cancel_clone = cancel_token.clone();
 
-        // Spawn health checker with a very short staleness threshold (1 second)
+        // Spawn the real MH health checker (1 second staleness threshold). The
+        // interval's first tick fires immediately, so the loop drives the
+        // mark-stale closure within milliseconds. This exercises the full
+        // loop -> closure -> repository -> DB wiring.
         let pool_clone = pool.clone();
         let handle = tokio::spawn(start_mh_health_checker(pool_clone, 1, cancel_token));
 
-        // Wait for one health check cycle (default interval is 5 seconds, but we can wait a bit more)
-        tokio::time::sleep(Duration::from_secs(6)).await;
+        // Poll for the status flip instead of sleeping a fixed duration. The
+        // generous 10s ceiling only absorbs wall-clock scheduling delay under
+        // parallel test load; locally this resolves in milliseconds. It removes
+        // the race because we assert as soon as the row flips, not after a fixed
+        // window that can be missed under saturation.
+        let polled = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let handler = MediaHandlersRepository::get_handler(&pool, "stale-mh-001")
+                    .await
+                    .expect("Failed to get handler")
+                    .expect("Handler should exist");
+                if handler.health_status == HealthStatus::Unhealthy {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await;
 
-        // Cancel the task
+        // Cancel the task and await teardown.
         cancel_clone.cancel();
         let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
 
-        // Verify the handler is now marked as unhealthy
+        assert!(
+            polled.is_ok(),
+            "Stale handler should be marked unhealthy by the health checker loop within 10s"
+        );
+
+        // Confirm the final state.
         let handler = MediaHandlersRepository::get_handler(&pool, "stale-mh-001")
             .await
             .expect("Failed to get handler")
@@ -214,19 +238,12 @@ mod integration_tests {
         .await
         .expect("Failed to update heartbeat");
 
-        let cancel_token = CancellationToken::new();
-        let cancel_clone = cancel_token.clone();
-
-        // Spawn health checker with a long staleness threshold (60 seconds)
-        let pool_clone = pool.clone();
-        let handle = tokio::spawn(start_mh_health_checker(pool_clone, 60, cancel_token));
-
-        // Wait for one health check cycle
-        tokio::time::sleep(Duration::from_secs(6)).await;
-
-        // Cancel the task
-        cancel_clone.cancel();
-        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        // Drive the staleness check synchronously with a long threshold (60s); the
+        // freshly-heartbeated handler is not stale, so nothing should be marked.
+        let marked = MediaHandlersRepository::mark_stale_handlers_unhealthy(&pool, 60)
+            .await
+            .expect("mark_stale_handlers_unhealthy should succeed");
+        assert_eq!(marked, 0, "No healthy handler should be marked");
 
         // Verify the handler is still healthy
         let handler = MediaHandlersRepository::get_handler(&pool, "healthy-mh-001")
@@ -265,19 +282,13 @@ mod integration_tests {
         .await
         .expect("Failed to set draining status");
 
-        let cancel_token = CancellationToken::new();
-        let cancel_clone = cancel_token.clone();
-
-        // Spawn health checker with short staleness threshold
-        let pool_clone = pool.clone();
-        let handle = tokio::spawn(start_mh_health_checker(pool_clone, 1, cancel_token));
-
-        // Wait for one health check cycle
-        tokio::time::sleep(Duration::from_secs(6)).await;
-
-        // Cancel the task
-        cancel_clone.cancel();
-        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        // Drive the staleness check synchronously with a short threshold (1s). The
+        // handler is stale but draining, so the predicate excludes it and nothing
+        // should be marked.
+        let marked = MediaHandlersRepository::mark_stale_handlers_unhealthy(&pool, 1)
+            .await
+            .expect("mark_stale_handlers_unhealthy should succeed");
+        assert_eq!(marked, 0, "Draining handler should not be marked");
 
         // Verify the handler is still draining (not marked unhealthy)
         let handler = MediaHandlersRepository::get_handler(&pool, "draining-mh-001")
