@@ -101,3 +101,43 @@ ecosystem = "rust"
 expires = "2026-09-05"
 ticket = "docs/TODO.md -> section 'Polyglot Pipeline Follow-ups (ADR-0033 Wave 1 #1)' -> entry: async-std unmaintained warning from opentelemetry_sdk 0.24.1 transitive (RUSTSEC-2025-0052; fix = OTel 0.29+ migration, owner observability+operations)"
 reason = "async-std unmaintained WARNING (non-gating; noise-only suppression). Test-build-graph-only via opentelemetry_sdk 0.24 `testing` feature (dev-dep of common) — verify with `cargo tree -i async-std -e normal` (must be empty); fail-closed if a normal-graph consumer appears. Fix = tracked OTel 0.29+ migration (rt-async-std persists through sdk 0.28.0)."
+
+# GHSA-h67p-54hq-rp68 — js-yaml <=4.1.1 quadratic-complexity DoS via merge keys.
+#
+# Exposure analysis (infrastructure + security, 2026-06-20, task #54):
+#   - Installed: js-yaml@3.14.2 (3.x series), via .>nx>@yarnpkg/parsers>js-yaml.
+#   - @yarnpkg/parsers@3.0.2 declares "js-yaml": "^3.10.0" — constrains to 3.x only.
+#   - No patched 3.x release exists: advisory specifies vulnerable_versions <=4.1.1,
+#     patched_versions >=4.2.0. The fix exists ONLY in the 4.x series; there is no
+#     js-yaml@3.x patch. pnpm audit flags 3.14.2 numerically (3.14.2 <= 4.1.1).
+#   - Forcing a pnpm override "js-yaml>=4.2.0" would jump v3 -> v4 into a package
+#     whose upstream requires ^3.10.0 — a breaking major-version injection into nx
+#     tooling. Evaluated and rejected (task #54 Gate 1; js-yaml@3.x breakage risk
+#     confirmed by Lead independently).
+#   - Dev/build-tooling ONLY: nx project-graph parsing, not production runtime.
+#     Not browser-bundled; not reachable via user-controlled input.
+#
+# INVARIANT (verify command of record): `pnpm why js-yaml` must show ONLY
+# the .>nx>@yarnpkg/parsers (^3.10.0) and .>nx>@zkochan/js-yaml paths —
+# NO production consumer, NO path outside nx tooling.
+# FAIL-CLOSED: if `pnpm why js-yaml` ever shows a production consumer, this
+# suppression is void immediately — remove it and fix, or re-justify.
+#
+# Fix: nx upstream must bump @yarnpkg/parsers to a release that declares
+# "js-yaml": "^4.x". Resolves naturally when that lands; no action needed
+# here except monitoring the nx@20.3.0 -> nx@21+ migration path.
+#
+# RENEWAL PLAYBOOK (expires 2026-09-18):
+#   1. Run `pnpm why js-yaml` — must still show only the @yarnpkg/parsers
+#      (3.x) / @zkochan/js-yaml path. If a production consumer appears: do
+#      NOT renew; fail-closed clause applies.
+#   2. Check nx changelog: if @yarnpkg/parsers was bumped to a js-yaml@^4.x
+#      dep, override may now work safely — evaluate, fix, DELETE this entry.
+#   3. Otherwise: bump `expires` +90 days, re-affirm this analysis in the PR,
+#      regenerate derived files (`scripts/audit-suppressions-check.sh --fix`).
+[[suppression]]
+id = "GHSA-h67p-54hq-rp68"
+ecosystem = "js"
+expires = "2026-09-18"
+ticket = "docs/TODO.md -> section 'Suppressed Advisories' -> row GHSA-h67p-54hq-rp68"
+reason = "js-yaml <=4.1.1 merge-key quadratic DoS; installed js-yaml@3.14.2 pinned by @yarnpkg/parsers@3.0.2 (^3.10.0) — no patched 3.x release exists (fix only in 4.2.0); forcing >=4.2.0 override is a breaking v3->v4 jump into nx tooling. Dev/build-tooling only, below the high/critical gate. Resolves naturally when nx bumps @yarnpkg/parsers to a js-yaml@^4.x consumer."
