@@ -50,6 +50,15 @@ pub enum GcError {
     #[error("Service unavailable: {0}")]
     ServiceUnavailable(String),
 
+    #[error("Payload too large: {0}")]
+    PayloadTooLarge(String),
+
+    #[error("Unsupported media type: {0}")]
+    UnsupportedMediaType(String),
+
+    #[error("Bad gateway: {0}")]
+    BadGateway(String),
+
     #[error("Internal server error: {0}")]
     Internal(String),
 }
@@ -66,6 +75,9 @@ impl GcError {
             GcError::Forbidden(_) => 403,
             GcError::BadRequest(_) => 400,
             GcError::ServiceUnavailable(_) => 503,
+            GcError::PayloadTooLarge(_) => 413,
+            GcError::UnsupportedMediaType(_) => 415,
+            GcError::BadGateway(_) => 502,
         }
     }
 
@@ -82,6 +94,9 @@ impl GcError {
             GcError::Forbidden(_) => "forbidden",
             GcError::BadRequest(_) => "bad_request",
             GcError::ServiceUnavailable(_) => "service_unavailable",
+            GcError::PayloadTooLarge(_) => "payload_too_large",
+            GcError::UnsupportedMediaType(_) => "unsupported_media_type",
+            GcError::BadGateway(_) => "bad_gateway",
             GcError::Internal(_) => "internal",
         }
     }
@@ -129,6 +144,27 @@ impl IntoResponse for GcError {
                     StatusCode::SERVICE_UNAVAILABLE,
                     "SERVICE_UNAVAILABLE",
                     "Service temporarily unavailable".to_string(),
+                )
+            }
+            GcError::PayloadTooLarge(reason) => (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "PAYLOAD_TOO_LARGE",
+                reason.clone(),
+            ),
+            GcError::UnsupportedMediaType(reason) => (
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "UNSUPPORTED_MEDIA_TYPE",
+                reason.clone(),
+            ),
+            GcError::BadGateway(reason) => {
+                // Log actual reason server-side (e.g. collector status/URL), return
+                // generic message to client. Mirrors ServiceUnavailable: never echo
+                // upstream collector details to the caller.
+                tracing::warn!(target: "gc.telemetry", reason = %reason, "Telemetry collector unreachable");
+                (
+                    StatusCode::BAD_GATEWAY,
+                    "BAD_GATEWAY",
+                    "Telemetry collector is unavailable".to_string(),
                 )
             }
             GcError::Internal(reason) => {
@@ -263,6 +299,15 @@ mod tests {
             GcError::ServiceUnavailable("test".to_string()).status_code(),
             503
         );
+        assert_eq!(
+            GcError::PayloadTooLarge("test".to_string()).status_code(),
+            413
+        );
+        assert_eq!(
+            GcError::UnsupportedMediaType("test".to_string()).status_code(),
+            415
+        );
+        assert_eq!(GcError::BadGateway("test".to_string()).status_code(), 502);
         assert_eq!(GcError::Internal("test".to_string()).status_code(), 500);
     }
 
@@ -290,6 +335,18 @@ mod tests {
         assert_eq!(
             GcError::ServiceUnavailable("t".into()).error_type_label(),
             "service_unavailable"
+        );
+        assert_eq!(
+            GcError::PayloadTooLarge("t".into()).error_type_label(),
+            "payload_too_large"
+        );
+        assert_eq!(
+            GcError::UnsupportedMediaType("t".into()).error_type_label(),
+            "unsupported_media_type"
+        );
+        assert_eq!(
+            GcError::BadGateway("t".into()).error_type_label(),
+            "bad_gateway"
         );
         assert_eq!(GcError::Internal("t".into()).error_type_label(), "internal");
     }
@@ -412,5 +469,58 @@ mod tests {
         let body_json = read_body_json(response.into_body()).await;
         assert_eq!(body_json["error"]["code"], "INTERNAL_ERROR");
         assert_eq!(body_json["error"]["message"], "An internal error occurred");
+    }
+
+    #[tokio::test]
+    async fn test_into_response_payload_too_large() {
+        let error = GcError::PayloadTooLarge("Payload exceeds 256 KiB limit".to_string());
+        let response = error.into_response();
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        let body_json = read_body_json(response.into_body()).await;
+        assert_eq!(body_json["error"]["code"], "PAYLOAD_TOO_LARGE");
+        assert_eq!(
+            body_json["error"]["message"],
+            "Payload exceeds 256 KiB limit"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_into_response_unsupported_media_type() {
+        let error = GcError::UnsupportedMediaType(
+            "Content-Type must be application/x-protobuf".to_string(),
+        );
+        let response = error.into_response();
+
+        assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+
+        let body_json = read_body_json(response.into_body()).await;
+        assert_eq!(body_json["error"]["code"], "UNSUPPORTED_MEDIA_TYPE");
+        assert_eq!(
+            body_json["error"]["message"],
+            "Content-Type must be application/x-protobuf"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_into_response_bad_gateway() {
+        // Collector detail logged server-side; generic message returned to client.
+        let error = GcError::BadGateway("collector returned 503".to_string());
+        let response = error.into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+
+        let body_json = read_body_json(response.into_body()).await;
+        assert_eq!(body_json["error"]["code"], "BAD_GATEWAY");
+        // Generic message — collector detail not echoed.
+        assert_eq!(
+            body_json["error"]["message"],
+            "Telemetry collector is unavailable"
+        );
+        assert!(!body_json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("503"));
     }
 }

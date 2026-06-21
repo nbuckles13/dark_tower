@@ -4,10 +4,11 @@
 
 use crate::auth::{JwksClient, JwtValidator};
 use crate::config::Config;
-use crate::handlers;
+use crate::handlers::{self, TelemetryState};
 use crate::middleware::{http_metrics_middleware, require_auth, require_user_auth, AuthState};
 use crate::services::mc_client::McClientTrait;
 use axum::{
+    extract::DefaultBodyLimit,
     middleware,
     routing::{get, patch, post},
     Router,
@@ -33,6 +34,9 @@ pub struct AppState {
 
     /// Token receiver for dynamically refreshed OAuth tokens from TokenManager.
     pub token_receiver: TokenReceiver,
+
+    /// Telemetry proxy state (per-user rate limiter + collector forwarder).
+    pub telemetry: TelemetryState,
 }
 
 /// Build the application routes.
@@ -95,6 +99,40 @@ pub fn build_routes(
         ))
         .with_state(state.clone());
 
+    // Telemetry proxy routes (R-2). User-authenticated. Two-tier real-bytes size
+    // cap (Option 1, security-reviewed): the HANDLER's explicit `body.len() >
+    // max_bytes` check is the load-bearing user-facing 413 at the EXACT configured
+    // limit (and emits `rejected_size`); this `DefaultBodyLimit` layer is a higher
+    // hard-ceiling (`2× max_bytes`) DoS backstop that rejects a pathological body
+    // before unbounded buffering. Both are real-bytes checks; neither trusts
+    // Content-Length.
+    //
+    // SECURITY INVARIANT (do not break): this layer is ABOVE the decode cap, so
+    // the handler's exact-`max_bytes` check is the sole PRE-DECODE oversize gate
+    // for bodies in (max_bytes, 2×max_bytes]. Do NOT raise this ceiling further,
+    // and do NOT remove the handler check, without re-adding a pre-decode
+    // body-length gate at `max_bytes` — otherwise prost::decode runs on oversize
+    // bytes. See `handlers::telemetry::ingest` step 1.
+    //
+    // The path carries two `v1` segments: the outer `/api/v1` is GC's API
+    // version (ADR-0004); the inner `/v1/metrics`|`/v1/traces` is the FIXED
+    // OTLP/HTTP spec path (vendored, not our versioning) — compliant, not a
+    // double-version smell. `/v1/logs` is intentionally NOT routed this story.
+    let telemetry_routes = Router::new()
+        .route(
+            "/api/v1/telemetry/v1/metrics",
+            post(handlers::ingest_metrics),
+        )
+        .route("/api/v1/telemetry/v1/traces", post(handlers::ingest_traces))
+        .layer(DefaultBodyLimit::max(handlers::body_limit_ceiling(
+            state.config.telemetry_proxy_max_bytes,
+        )))
+        .route_layer(middleware::from_fn_with_state(
+            auth_state.clone(),
+            require_user_auth,
+        ))
+        .with_state(state.telemetry.clone());
+
     // Service-authenticated routes (require service JWT with Claims)
     let protected_routes = Router::new()
         // Current user endpoint
@@ -113,6 +151,7 @@ pub fn build_routes(
     Ok(public_routes
         .merge(metrics_routes)
         .merge(user_auth_routes)
+        .merge(telemetry_routes)
         .merge(protected_routes)
         .layer(TraceLayer::new_for_http())
         .layer(TimeoutLayer::new(Duration::from_secs(30)))

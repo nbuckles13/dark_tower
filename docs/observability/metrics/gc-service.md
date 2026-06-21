@@ -454,6 +454,131 @@ All GC service metrics follow ADR-0011 naming conventions with the `gc_` prefix.
 
 ---
 
+## Telemetry Proxy Metrics (R-2 / R-51)
+
+Metrics for the client telemetry proxy `POST /api/v1/telemetry/v1/{metrics,traces}`
+(a sanitizing OTLP reverse-proxy with a deny-by-default attribute allowlist).
+
+> **Declared-vs-emitted (ADR-0032 Step 5 honesty)** — some bounded label values
+> are declared this story but never emitted yet, so alert authors do not write a
+> PromQL selector against a value that can never appear:
+> - `gc_telemetry_ingest_total{status="rejected_pii"}` — **declared, unemitted**.
+>   The proxy DROPS disallowed attributes and still forwards (a 202 `success`);
+>   dropped attributes are counted on `gc_telemetry_pii_attributes_dropped_total`.
+>   `rejected_pii` is reserved for a future "reject-if-PII-present" mode.
+> - `gc_telemetry_ingest_total{status="rejected_auth"}` — **declared, unemitted**.
+>   401 unauthenticated requests are rejected by the `require_user_auth` route
+>   layer BEFORE the handler runs, so the `IngestGuard` is never constructed and
+>   this value never increments. 401s are observable on `gc_http_requests_total`
+>   `{status_code="401"}` and `gc_jwt_validations_total`, NOT here. (A runbook /
+>   smoke test asserting a 401 — e.g. R-50/O-2 — must read `gc_http_*`, not this.)
+> - `gc_telemetry_ingest_total{payload_kind="log"}` — **declared, unemitted**.
+>   The `/v1/logs` route is not implemented this story (reserved); only `metric`
+>   and `trace` are emitted.
+> - `gc_telemetry_rate_limited_total{reason="per_org"|"global"}` — **reserved,
+>   unwired**. Only `per_user` is wired this story.
+>
+> The metric NAME + label spelling is a contract consumed by task #16's alerts
+> (`gc_telemetry_ingest_total` rejection-rate warn + absent-over-time page) — do
+> not rename without updating those alerts.
+>
+> **Two emitted-but-incomplete statuses needing a `gc_http` UNION in #16's
+> alerts** (the counter is honest, not complete, where pre-handler layers reject):
+> - `rejected_size` — covers `(max_bytes, 2×max_bytes]` only; union with
+>   `gc_http_requests_total{...,status_code="413"}` for gross overage (see the
+>   `status` label note below).
+> - `rejected_auth` is declared-unemitted (above), so its size-class analogue —
+>   401 visibility — is `gc_http_requests_total{...,status_code="401"}` ∪
+>   `gc_jwt_validations_total`.
+
+### `gc_telemetry_ingest_total`
+- **Type**: Counter
+- **Description**: Telemetry proxy ingest attempts, one per request that REACHES
+  the handler, recorded on every handler-internal exit via a record-on-drop
+  guard. Two request outcomes are rejected at a LAYER before the handler and are
+  NOT counted here (see honesty block): 401 (auth) and the DoS-backstop 413 (a
+  body above the `2× max_bytes` `DefaultBodyLimit` ceiling).
+- **Labels**:
+  - `status`: Outcome — `success`, `rejected_size`, `rejected_rate`,
+    `rejected_auth` (declared/unemitted — 401 rejected upstream, see honesty
+    block), `rejected_pii` (declared/unemitted), `error`.
+    `rejected_size` is emitted for oversize bodies in the
+    `(max_bytes, 2×max_bytes]` band ONLY — these reach the in-handler size check.
+    It is NOT complete for the size class: a body ABOVE the `2×` ceiling (gross
+    overage — the primary DoS/abuse case) is rejected by the `DefaultBodyLimit`
+    layer PRE-handler and appears ONLY on
+    `gc_http_requests_total{status_code="413"}`, never here. **Alert authors
+    (task #16): the size-rejection class is the UNION**
+    `gc_telemetry_ingest_total{status="rejected_size"}` ∪
+    `gc_http_requests_total{endpoint=~".*/telemetry/.*",status_code="413"}` —
+    do not key a size-rejection rate/absent alert on the telemetry counter alone
+    (it has a documented blind spot above the ceiling). This is the intended
+    trade-off of @security's two-tier cap (bounded handler buffering); the counter
+    is honest about exactly what it covers, not complete.
+    `error` AGGREGATES four distinct failures: content-type-415 + decode-400
+    (client fault) and collector-502 + disabled-503 (server fault). It does NOT
+    distinguish them — split client-vs-server via the paired
+    `gc_http_requests_total{status_code}` series (`415|400` vs `502|503`) for
+    triage. (Distinct error sub-statuses are a task #16 label-taxonomy decision.)
+  - `payload_kind`: `metric`, `trace`, `log` (declared/unemitted). Derived from
+    the route, never from payload content (always a bounded literal).
+- **Cardinality**: Low (6 × 3 = 18 max).
+- **Example**:
+  ```promql
+  sum(rate(gc_telemetry_ingest_total{status=~"rejected_.*|error"}[5m]))
+    / sum(rate(gc_telemetry_ingest_total[5m]))
+  ```
+
+### `gc_telemetry_ingest_duration_seconds`
+- **Type**: Histogram
+- **Description**: HANDLER-scoped duration — measured by the `IngestGuard` from
+  handler entry to exit, for every request that REACHES the handler (same set as
+  `gc_telemetry_ingest_total`). It is uniform across all emitted statuses (the
+  guard times the same span concept for each). It does NOT include the
+  pre-handler layer time (auth, body-buffer-up-to-ceiling) for the layer-rejected
+  401/>2×-413 paths — those aren't counted here at all. So the p99 is
+  handler-processing latency, not full-request latency. SLO: p99 < 200ms.
+- **Labels**: `status` (same value set as `gc_telemetry_ingest_total`).
+- **Buckets**: `[0.005, 0.010, 0.025, 0.050, 0.100, 0.150, 0.200, 0.300, 0.500, 1.0]`
+  (seconds; `gc_telemetry_ingest` prefix matcher).
+- **Cardinality**: Low.
+
+### `gc_telemetry_payload_bytes`
+- **Type**: Histogram
+- **Description**: Size in bytes of accepted telemetry payloads.
+- **Labels**: `payload_kind` (`metric`, `trace`).
+- **Buckets**: `[1024, 4096, 16384, 65536, 131072, 262144]` (**bytes** — distinct
+  `gc_telemetry_payload` prefix matcher so the histogram does NOT inherit the
+  seconds-scale default buckets).
+- **Cardinality**: Low.
+
+### `gc_telemetry_rate_limited_total`
+- **Type**: Counter
+- **Description**: Telemetry proxy rate-limit rejections.
+- **Labels**: `reason` — `per_user` (wired); `per_org`, `global` (reserved/unwired).
+- **Cardinality**: Low (3 max).
+
+### `gc_telemetry_pii_attributes_dropped_total`
+- **Type**: Counter
+- **Description**: Attributes stripped by the allowlist filter, by structural
+  nesting level. Labeled by LEVEL, never by the dropped key/value (which would be
+  unbounded and would re-leak the stripped PII). Counts BOTH non-allowlisted keys
+  AND allowlisted keys whose value is non-scalar (`ArrayValue`/`KvlistValue`/
+  `BytesValue`) — the latter is the value-smuggling defense (deny-by-default on
+  value shape, not just key).
+- **Labels**: `kind` — `resource`, `scope`, `datapoint` (incl. exemplar
+  `filtered_attributes`), `span`, `span_event`, `span_link`.
+- **Cardinality**: Low (6 max).
+- **Example**:
+  ```promql
+  sum(rate(gc_telemetry_pii_attributes_dropped_total[5m])) by (kind)
+  ```
+
+> Dashboards + alerts for these metrics are added by task #16 (observability
+> hand-off); this section documents the metric contract only.
+
+---
+
 ## Prometheus Query Examples
 
 ### Request Rate (Total)

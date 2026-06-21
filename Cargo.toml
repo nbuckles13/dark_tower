@@ -78,6 +78,15 @@ opentelemetry = "0.24"
 opentelemetry_sdk = { version = "0.24", features = ["rt-tokio", "trace"] }
 opentelemetry-otlp = { version = "0.17", features = ["grpc-tonic", "trace"] }
 tracing-opentelemetry = "0.25"
+# OTLP protobuf message types for the GC telemetry proxy (R-2). Message types
+# only (no gRPC transport) — GC re-encodes with prost and forwards over reqwest.
+# 0.7 matches the opentelemetry = 0.24 line and resolves with prost 0.13.
+opentelemetry-proto = { version = "0.7", features = ["gen-tonic-messages", "metrics", "trace"] }
+
+# Rate limiting
+# In-process GCRA keyed rate limiter for the GC telemetry proxy (R-2,
+# per-JWT-`sub`). `dashmap` feature backs the keyed state store.
+governor = { version = "0.10", features = ["std", "dashmap"] }
 
 # Error handling
 anyhow = "1.0"

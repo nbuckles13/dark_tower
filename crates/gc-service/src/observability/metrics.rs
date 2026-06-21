@@ -114,6 +114,24 @@ pub fn init_metrics_recorder() -> Result<PrometheusHandle, String> {
             ],
         )
         .map_err(|e| format!("Failed to set meeting join buckets: {e}"))?
+        // Telemetry ingest DURATION buckets (seconds) aligned with the 200ms p99 SLO.
+        // Prefix "gc_telemetry_ingest" matches gc_telemetry_ingest_duration_seconds and
+        // does NOT overlap the "gc_telemetry_payload" prefix below.
+        .set_buckets_for_metric(
+            Matcher::Prefix("gc_telemetry_ingest".to_string()),
+            &[
+                0.005, 0.010, 0.025, 0.050, 0.100, 0.150, 0.200, 0.300, 0.500, 1.000,
+            ],
+        )
+        .map_err(|e| format!("Failed to set telemetry ingest buckets: {e}"))?
+        // Telemetry payload-size buckets (BYTES, not seconds). MUST be a distinct matcher:
+        // without it gc_telemetry_payload_bytes inherits the default seconds-scale buckets
+        // and the 1 KiB–256 KiB range collapses into the overflow bucket (p99 unobservable).
+        .set_buckets_for_metric(
+            Matcher::Prefix("gc_telemetry_payload".to_string()),
+            &[1024.0, 4096.0, 16384.0, 65536.0, 131072.0, 262144.0],
+        )
+        .map_err(|e| format!("Failed to set telemetry payload buckets: {e}"))?
         .install_recorder()
         .map_err(|e| format!("Failed to install Prometheus recorder: {e}"))
 }
@@ -536,6 +554,114 @@ pub fn record_meeting_join(
         )
         .increment(1);
     }
+}
+
+// ============================================================================
+// Telemetry Proxy Metrics (R-2 / R-51 partial)
+// ============================================================================
+
+/// Record a completed telemetry-proxy ingest attempt (one per request that
+/// REACHES the handler) plus its duration.
+///
+/// Metrics:
+/// - `gc_telemetry_ingest_total{status, payload_kind}` counter
+/// - `gc_telemetry_ingest_duration_seconds{status}` histogram (p99 SLO < 200ms).
+///   HANDLER-scoped: timed from handler entry to exit, uniform across all emitted
+///   statuses. Does NOT include pre-handler layer time (auth / body-buffer) for
+///   the layer-rejected 401/>2×-413 paths (those aren't counted here at all), so
+///   p99 is handler-processing latency, not full-request latency.
+///
+/// Emitted from the handler's record-on-drop guard so every HANDLER-INTERNAL
+/// exit path (202/413/415/429/400/502/503) records exactly once and no future
+/// edit can add a handler exit that forgets to emit.
+///
+/// LAYER-LEVEL exceptions (rejected BEFORE the handler runs, so NOT counted here
+/// — observed on `gc_http_requests_total{status_code}` instead):
+/// - 401 (unauthenticated): rejected by the `require_user_auth` route layer.
+/// - the DoS-backstop 413: a body ABOVE the `2× max_bytes` `DefaultBodyLimit`
+///   ceiling is rejected by the tower layer. The USER-FACING 413 (a body in
+///   `(max_bytes, 2×max_bytes]`, i.e. over the configured limit but under the
+///   ceiling) DOES reach the in-handler size check and IS counted here as
+///   `rejected_size` — that is the path a normal oversize client hits.
+///
+/// # Arguments
+///
+/// * `status` - bounded outcome. Declared set:
+///   `success` | `rejected_auth` | `rejected_size` | `rejected_rate` |
+///   `rejected_pii` | `error`. Two values are DECLARED-but-unemitted this story:
+///   `rejected_pii` (drops-forward-as-success design; see the dropped-attrs
+///   counter) and `rejected_auth` (401s are rejected by the `require_user_auth`
+///   route layer BEFORE this guard is constructed, so they never reach here —
+///   they are counted on `gc_http_requests_total{status_code="401"}` instead).
+///   `error` aggregates 415/400/502/503; the HTTP status code discriminates.
+/// * `payload_kind` - `metric` | `trace` | `log`. Derived from the ROUTE, not
+///   payload content, so it is always a bounded literal even on pre-decode
+///   rejects. `log` is declared but unemitted this story (route omitted).
+/// * `duration` - wall-clock from handler entry to exit.
+pub fn record_telemetry_ingest(status: &str, payload_kind: &str, duration: Duration) {
+    histogram!("gc_telemetry_ingest_duration_seconds",
+        "status" => status.to_string()
+    )
+    .record(duration.as_secs_f64());
+
+    counter!("gc_telemetry_ingest_total",
+        "status" => status.to_string(),
+        "payload_kind" => payload_kind.to_string()
+    )
+    .increment(1);
+}
+
+/// Record the size in bytes of an accepted telemetry payload.
+///
+/// Metric: `gc_telemetry_payload_bytes{payload_kind}` histogram (BYTES — see the
+/// distinct bucket matcher in `init_metrics_recorder`).
+///
+/// # Arguments
+///
+/// * `payload_kind` - `metric` | `trace` | `log` (bounded literal from route).
+/// * `bytes` - size of the received body.
+pub fn record_telemetry_payload_bytes(payload_kind: &str, bytes: usize) {
+    histogram!("gc_telemetry_payload_bytes",
+        "payload_kind" => payload_kind.to_string()
+    )
+    .record(bytes as f64);
+}
+
+/// Record a telemetry-proxy rate-limit rejection.
+///
+/// Metric: `gc_telemetry_rate_limited_total{reason}` counter.
+///
+/// # Arguments
+///
+/// * `reason` - `per_user` | `per_org` | `global`. Only `per_user` is wired this
+///   story; the other two are reserved (bounded label space for future limits).
+pub fn record_telemetry_rate_limited(reason: &str) {
+    counter!("gc_telemetry_rate_limited_total",
+        "reason" => reason.to_string()
+    )
+    .increment(1);
+}
+
+/// Record PII attributes dropped by the allowlist filter, by nesting level.
+///
+/// Metric: `gc_telemetry_pii_attributes_dropped_total{kind}` counter.
+///
+/// `kind` is the structural LEVEL the drop occurred at, NEVER the dropped key or
+/// value (which would be unbounded and would re-leak the PII being stripped).
+///
+/// # Arguments
+///
+/// * `kind` - `resource` | `scope` | `datapoint` | `span` | `span_event` |
+///   `span_link` (exemplar `filtered_attributes` fold into `datapoint`).
+/// * `count` - number of attributes dropped at that level (no-op if 0).
+pub fn record_telemetry_pii_dropped(kind: &str, count: u64) {
+    if count == 0 {
+        return;
+    }
+    counter!("gc_telemetry_pii_attributes_dropped_total",
+        "kind" => kind.to_string()
+    )
+    .increment(count);
 }
 
 // ============================================================================
@@ -1228,5 +1354,117 @@ mod tests {
                     .assert_unobserved();
             }
         }
+    }
+
+    // ---- Telemetry proxy metric cluster (R-2 / R-51) -------------------------
+
+    #[test]
+    fn metrics_module_emits_telemetry_ingest_cluster() {
+        let snap = MetricAssertion::snapshot();
+
+        record_telemetry_ingest("success", "metric", Duration::from_millis(20));
+        record_telemetry_ingest("success", "trace", Duration::from_millis(30));
+        record_telemetry_ingest("rejected_size", "metric", Duration::from_micros(50));
+        record_telemetry_ingest("rejected_rate", "trace", Duration::from_micros(40));
+        record_telemetry_ingest("error", "metric", Duration::from_millis(5));
+
+        snap.histogram("gc_telemetry_ingest_duration_seconds")
+            .assert_observation_count_at_least(5);
+
+        snap.counter("gc_telemetry_ingest_total")
+            .with_labels(&[("status", "success"), ("payload_kind", "metric")])
+            .assert_delta(1);
+        snap.counter("gc_telemetry_ingest_total")
+            .with_labels(&[("status", "success"), ("payload_kind", "trace")])
+            .assert_delta(1);
+        snap.counter("gc_telemetry_ingest_total")
+            .with_labels(&[("status", "rejected_size"), ("payload_kind", "metric")])
+            .assert_delta(1);
+        snap.counter("gc_telemetry_ingest_total")
+            .with_labels(&[("status", "rejected_rate"), ("payload_kind", "trace")])
+            .assert_delta(1);
+        snap.counter("gc_telemetry_ingest_total")
+            .with_labels(&[("status", "error"), ("payload_kind", "metric")])
+            .assert_delta(1);
+    }
+
+    #[test]
+    fn metrics_module_emits_telemetry_payload_bytes() {
+        // Histograms drain on snapshot read, so assert the total observation
+        // count in a SINGLE read (the per-label bucket landing is verified in
+        // tests/telemetry_metrics_integration.rs against the real Prometheus
+        // render, where the F1 distinct-bucket-matcher is observable).
+        let snap = MetricAssertion::snapshot();
+
+        record_telemetry_payload_bytes("metric", 50 * 1024);
+        record_telemetry_payload_bytes("trace", 1024);
+
+        snap.histogram("gc_telemetry_payload_bytes")
+            .assert_observation_count_at_least(2);
+    }
+
+    #[test]
+    fn metrics_module_emits_telemetry_rate_limited() {
+        let snap = MetricAssertion::snapshot();
+
+        record_telemetry_rate_limited("per_user");
+
+        snap.counter("gc_telemetry_rate_limited_total")
+            .with_labels(&[("reason", "per_user")])
+            .assert_delta(1);
+        // per_org / global are reserved/unwired this story.
+        snap.counter("gc_telemetry_rate_limited_total")
+            .with_labels(&[("reason", "per_org")])
+            .assert_delta(0);
+        snap.counter("gc_telemetry_rate_limited_total")
+            .with_labels(&[("reason", "global")])
+            .assert_delta(0);
+    }
+
+    #[test]
+    fn metrics_module_emits_telemetry_pii_dropped_per_kind() {
+        let snap = MetricAssertion::snapshot();
+
+        // One drop per kind — adjacency: each kind's counter moves independently.
+        for (i, kind) in [
+            "resource",
+            "scope",
+            "datapoint",
+            "span",
+            "span_event",
+            "span_link",
+        ]
+        .iter()
+        .enumerate()
+        {
+            record_telemetry_pii_dropped(kind, (i + 1) as u64);
+        }
+
+        for (i, kind) in [
+            "resource",
+            "scope",
+            "datapoint",
+            "span",
+            "span_event",
+            "span_link",
+        ]
+        .iter()
+        .enumerate()
+        {
+            snap.counter("gc_telemetry_pii_attributes_dropped_total")
+                .with_labels(&[("kind", *kind)])
+                .assert_delta((i + 1) as u64);
+        }
+    }
+
+    #[test]
+    fn metrics_module_telemetry_pii_dropped_zero_is_noop() {
+        let snap = MetricAssertion::snapshot();
+
+        record_telemetry_pii_dropped("resource", 0);
+
+        snap.counter("gc_telemetry_pii_attributes_dropped_total")
+            .with_labels(&[("kind", "resource")])
+            .assert_unobserved();
     }
 }

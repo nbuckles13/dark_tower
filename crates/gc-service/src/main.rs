@@ -138,12 +138,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mc_client: Arc<dyn services::McClientTrait> =
         Arc::new(services::McClient::new(token_rx.clone()));
 
+    // Build telemetry proxy state (per-user rate limiter + collector forwarder)
+    // before `config` is moved into AppState.
+    let telemetry = handlers::TelemetryState::from_config(
+        config.otel_collector_endpoint.clone(),
+        config.telemetry_proxy_max_bytes,
+        config.telemetry_proxy_rate_limit_per_minute,
+    )
+    .map_err(|e| {
+        error!("Failed to build telemetry proxy state: {}", e);
+        e
+    })?;
+
+    // Periodically reclaim idle rate-limiter cells (bounds keyspace memory).
+    let _telemetry_eviction_handle = handlers::spawn_rate_limiter_eviction(
+        telemetry.clone(),
+        std::time::Duration::from_secs(60),
+    );
+
     // Create application state
     let state = Arc::new(AppState {
         pool: db_pool.clone(),
         config,
         mc_client,
         token_receiver: token_rx,
+        telemetry,
     });
 
     // Create JWT validator for gRPC auth

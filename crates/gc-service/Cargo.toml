@@ -49,6 +49,14 @@ hex = { workspace = true }
 metrics = "0.24"
 metrics-exporter-prometheus = "0.16"
 
+# Telemetry proxy (R-2): OTLP protobuf message types + per-user rate limiter.
+# opentelemetry-proto supplies the OTLP message structs; prost decodes/re-encodes
+# the filtered payload; governor is the per-`sub` keyed rate limiter.
+opentelemetry-proto = { workspace = true }
+governor = { workspace = true }
+prost = { workspace = true }
+bytes = { workspace = true }
+
 # Local dependencies
 common = { path = "../common" }
 proto-gen = { path = "../proto-gen" }

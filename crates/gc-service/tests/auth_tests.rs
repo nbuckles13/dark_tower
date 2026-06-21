@@ -94,11 +94,18 @@ impl TestAuthServer {
 
         // Create application state with MockMcClient
         let mock_mc_client = Arc::new(MockMcClient::accepting());
+        let telemetry = gc_service::handlers::TelemetryState::from_config(
+            config.otel_collector_endpoint.clone(),
+            config.telemetry_proxy_max_bytes,
+            config.telemetry_proxy_rate_limit_per_minute,
+        )
+        .map_err(|e| anyhow::anyhow!("Failed to build telemetry state: {}", e))?;
         let state = Arc::new(AppState {
             pool: pool.clone(),
             config: config.clone(),
             mc_client: mock_mc_client,
             token_receiver,
+            telemetry,
         });
 
         // Build routes with metrics handle

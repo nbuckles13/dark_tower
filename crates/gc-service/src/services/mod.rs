@@ -14,6 +14,8 @@ pub mod ac_client;
 pub mod mc_assignment;
 pub mod mc_client;
 pub mod mh_selection;
+pub mod telemetry_filter;
+pub mod telemetry_forwarder;
 
 pub use mc_assignment::McAssignmentService;
 // MC client types exposed for external use

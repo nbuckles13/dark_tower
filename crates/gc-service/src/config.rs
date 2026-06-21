@@ -22,6 +22,24 @@ pub const DEFAULT_MC_STALENESS_THRESHOLD_SECONDS: u64 = 30;
 /// Default GC instance ID prefix.
 pub const DEFAULT_GC_ID_PREFIX: &str = "gc";
 
+/// Default in-cluster OTel collector endpoint for the telemetry proxy (R-2).
+///
+/// This is the **bare base** (scheme + host + port, no path, no trailing slash).
+/// The telemetry forwarder appends the per-signal suffix `/v1/metrics` or
+/// `/v1/traces` itself, so this value must NOT include a `/v1/...` path.
+/// (Contract with R-59/INFRA-OTEL: the env var holds the bare base; GC owns the
+/// suffix. Distinct from R-55's `otel_endpoint`, which is the gRPC `:4317`
+/// endpoint for GC's own span export — this is the HTTP `:4318` endpoint the
+/// `/api/v1/telemetry` proxy forwards to.)
+pub const DEFAULT_OTEL_COLLECTOR_ENDPOINT: &str =
+    "http://otel-collector.default.svc.cluster.local:4318";
+
+/// Default maximum telemetry proxy payload size in bytes (256 KiB).
+pub const DEFAULT_TELEMETRY_PROXY_MAX_BYTES: usize = 256 * 1024;
+
+/// Default per-user telemetry proxy rate limit (requests per minute).
+pub const DEFAULT_TELEMETRY_PROXY_RATE_LIMIT_PER_MINUTE: u32 = 60;
+
 /// Global Controller configuration.
 ///
 /// Loaded from environment variables with sensible defaults.
@@ -65,6 +83,22 @@ pub struct Config {
 
     /// OAuth client secret for GC to authenticate with AC (SecretString prevents logging).
     pub gc_client_secret: SecretString,
+
+    /// In-cluster OTel collector endpoint for the telemetry proxy (R-2).
+    ///
+    /// **Bare base** (scheme + host + port, no path, no trailing slash). The
+    /// forwarder appends `/v1/metrics` or `/v1/traces` per signal. An empty
+    /// string disables the proxy (the route returns 503 rather than forwarding).
+    /// See [`DEFAULT_OTEL_COLLECTOR_ENDPOINT`].
+    pub otel_collector_endpoint: String,
+
+    /// Maximum accepted telemetry proxy payload size in bytes (default 256 KiB).
+    /// Enforced on real body bytes (oversize → 413).
+    pub telemetry_proxy_max_bytes: usize,
+
+    /// Per-user (JWT `sub`) telemetry proxy rate limit, requests per minute
+    /// (default 60). Exceeding it → 429.
+    pub telemetry_proxy_rate_limit_per_minute: u32,
 }
 
 /// Custom Debug implementation that redacts sensitive fields.
@@ -86,6 +120,12 @@ impl fmt::Debug for Config {
             .field("gc_id", &self.gc_id)
             .field("gc_client_id", &self.gc_client_id)
             .field("gc_client_secret", &"[REDACTED]")
+            .field("otel_collector_endpoint", &self.otel_collector_endpoint)
+            .field("telemetry_proxy_max_bytes", &self.telemetry_proxy_max_bytes)
+            .field(
+                "telemetry_proxy_rate_limit_per_minute",
+                &self.telemetry_proxy_rate_limit_per_minute,
+            )
             .finish()
     }
 }
@@ -103,6 +143,12 @@ pub enum ConfigError {
 
     #[error("Invalid MC staleness threshold configuration: {0}")]
     InvalidMcStalenessThreshold(String),
+
+    #[error("Invalid telemetry proxy max bytes configuration: {0}")]
+    InvalidTelemetryProxyMaxBytes(String),
+
+    #[error("Invalid telemetry proxy rate limit configuration: {0}")]
+    InvalidTelemetryProxyRateLimit(String),
 }
 
 impl Config {
@@ -235,6 +281,59 @@ impl Config {
             .ok_or_else(|| ConfigError::MissingEnvVar("GC_CLIENT_SECRET".to_string()))?
             .clone();
 
+        // Telemetry proxy: in-cluster OTel collector endpoint (R-2).
+        // Bare base — forwarder appends the per-signal suffix. Empty string is
+        // permitted and disables the proxy (route returns 503).
+        let otel_collector_endpoint = vars
+            .get("OTEL_COLLECTOR_ENDPOINT")
+            .cloned()
+            .unwrap_or_else(|| DEFAULT_OTEL_COLLECTOR_ENDPOINT.to_string());
+
+        // Telemetry proxy max payload size with validation (must be > 0).
+        let telemetry_proxy_max_bytes =
+            if let Some(value_str) = vars.get("TELEMETRY_PROXY_MAX_BYTES") {
+                let value: usize = value_str.parse().map_err(|e| {
+                    ConfigError::InvalidTelemetryProxyMaxBytes(format!(
+                        "TELEMETRY_PROXY_MAX_BYTES must be a valid positive integer, got '{}': {}",
+                        value_str, e
+                    ))
+                })?;
+
+                if value == 0 {
+                    return Err(ConfigError::InvalidTelemetryProxyMaxBytes(
+                        "TELEMETRY_PROXY_MAX_BYTES must be greater than 0".to_string(),
+                    ));
+                }
+
+                value
+            } else {
+                DEFAULT_TELEMETRY_PROXY_MAX_BYTES
+            };
+
+        // Telemetry proxy per-user rate limit with validation (must be > 0:
+        // governor's Quota is built from a NonZeroU32, and a zero quota would
+        // deny all telemetry).
+        let telemetry_proxy_rate_limit_per_minute = if let Some(value_str) =
+            vars.get("TELEMETRY_PROXY_RATE_LIMIT_PER_MINUTE")
+        {
+            let value: u32 = value_str.parse().map_err(|e| {
+                    ConfigError::InvalidTelemetryProxyRateLimit(format!(
+                        "TELEMETRY_PROXY_RATE_LIMIT_PER_MINUTE must be a valid positive integer, got '{}': {}",
+                        value_str, e
+                    ))
+                })?;
+
+            if value == 0 {
+                return Err(ConfigError::InvalidTelemetryProxyRateLimit(
+                    "TELEMETRY_PROXY_RATE_LIMIT_PER_MINUTE must be greater than 0".to_string(),
+                ));
+            }
+
+            value
+        } else {
+            DEFAULT_TELEMETRY_PROXY_RATE_LIMIT_PER_MINUTE
+        };
+
         Ok(Config {
             database_url,
             bind_address,
@@ -248,6 +347,9 @@ impl Config {
             gc_id,
             gc_client_id,
             gc_client_secret: SecretString::from(gc_client_secret),
+            otel_collector_endpoint,
+            telemetry_proxy_max_bytes,
+            telemetry_proxy_rate_limit_per_minute,
         })
     }
 }
@@ -298,6 +400,108 @@ mod tests {
         // OAuth client credentials should be loaded
         assert_eq!(config.gc_client_id, "test-gc-client");
         assert_eq!(config.gc_client_secret.expose_secret(), "test-gc-secret");
+        // Telemetry proxy defaults
+        assert_eq!(
+            config.otel_collector_endpoint,
+            DEFAULT_OTEL_COLLECTOR_ENDPOINT
+        );
+        assert_eq!(
+            config.telemetry_proxy_max_bytes,
+            DEFAULT_TELEMETRY_PROXY_MAX_BYTES
+        );
+        assert_eq!(config.telemetry_proxy_max_bytes, 262144);
+        assert_eq!(
+            config.telemetry_proxy_rate_limit_per_minute,
+            DEFAULT_TELEMETRY_PROXY_RATE_LIMIT_PER_MINUTE
+        );
+        assert_eq!(config.telemetry_proxy_rate_limit_per_minute, 60);
+    }
+
+    #[test]
+    fn test_telemetry_proxy_custom_values() {
+        let mut vars = base_vars();
+        vars.insert(
+            "OTEL_COLLECTOR_ENDPOINT".to_string(),
+            "http://collector.internal:4318".to_string(),
+        );
+        vars.insert(
+            "TELEMETRY_PROXY_MAX_BYTES".to_string(),
+            "524288".to_string(),
+        );
+        vars.insert(
+            "TELEMETRY_PROXY_RATE_LIMIT_PER_MINUTE".to_string(),
+            "120".to_string(),
+        );
+
+        let config = Config::from_vars(&vars).expect("Config should load successfully");
+        assert_eq!(
+            config.otel_collector_endpoint,
+            "http://collector.internal:4318"
+        );
+        assert_eq!(config.telemetry_proxy_max_bytes, 524288);
+        assert_eq!(config.telemetry_proxy_rate_limit_per_minute, 120);
+    }
+
+    #[test]
+    fn test_telemetry_proxy_empty_endpoint_allowed() {
+        // Empty endpoint disables the proxy (route returns 503); it must NOT
+        // make the key required or fail config load.
+        let mut vars = base_vars();
+        vars.insert("OTEL_COLLECTOR_ENDPOINT".to_string(), String::new());
+
+        let config = Config::from_vars(&vars).expect("Empty endpoint should be allowed");
+        assert_eq!(config.otel_collector_endpoint, "");
+    }
+
+    #[test]
+    fn test_telemetry_proxy_max_bytes_rejects_zero() {
+        let mut vars = base_vars();
+        vars.insert("TELEMETRY_PROXY_MAX_BYTES".to_string(), "0".to_string());
+
+        let result = Config::from_vars(&vars);
+        assert!(
+            matches!(result, Err(ConfigError::InvalidTelemetryProxyMaxBytes(msg)) if msg.contains("must be greater than 0"))
+        );
+    }
+
+    #[test]
+    fn test_telemetry_proxy_max_bytes_rejects_non_numeric() {
+        let mut vars = base_vars();
+        vars.insert("TELEMETRY_PROXY_MAX_BYTES".to_string(), "lots".to_string());
+
+        let result = Config::from_vars(&vars);
+        assert!(
+            matches!(result, Err(ConfigError::InvalidTelemetryProxyMaxBytes(msg)) if msg.contains("must be a valid positive integer"))
+        );
+    }
+
+    #[test]
+    fn test_telemetry_proxy_rate_limit_rejects_zero() {
+        // A zero quota would break governor's NonZeroU32 and deny all telemetry.
+        let mut vars = base_vars();
+        vars.insert(
+            "TELEMETRY_PROXY_RATE_LIMIT_PER_MINUTE".to_string(),
+            "0".to_string(),
+        );
+
+        let result = Config::from_vars(&vars);
+        assert!(
+            matches!(result, Err(ConfigError::InvalidTelemetryProxyRateLimit(msg)) if msg.contains("must be greater than 0"))
+        );
+    }
+
+    #[test]
+    fn test_telemetry_proxy_rate_limit_rejects_non_numeric() {
+        let mut vars = base_vars();
+        vars.insert(
+            "TELEMETRY_PROXY_RATE_LIMIT_PER_MINUTE".to_string(),
+            "sixty".to_string(),
+        );
+
+        let result = Config::from_vars(&vars);
+        assert!(
+            matches!(result, Err(ConfigError::InvalidTelemetryProxyRateLimit(msg)) if msg.contains("must be a valid positive integer"))
+        );
     }
 
     #[test]
