@@ -504,6 +504,20 @@ if ! is_container_running "$DEV_CONTAINER"; then
         -e POSTGRES_DB=dark_tower_test \
         docker.io/library/postgres:16-bookworm
 
+    # Capture the DB container's IP on this network — used below as a static
+    # /etc/hosts binding in the dev container. Bypasses aardvark-dns for the
+    # most-frequent cross-container lookup: sqlx-tokio resolves DNS on every
+    # connect (no caching), so under Gate-2 parallel `#[sqlx::test]` load the
+    # lookups saturate aardvark-dns and produce intermittent EAI_AGAIN failures
+    # (surfaced 2026-06-20 during task #55 Gate 2). The dev container's own
+    # name is in /etc/hosts via Podman default, but sidecar hostnames are not.
+    DB_IP=$(podman inspect "$DB_CONTAINER" \
+        --format "{{(index .NetworkSettings.Networks \"$NETWORK_NAME\").IPAddress}}")
+    if [ -z "$DB_IP" ]; then
+        echo "ERROR: Could not determine IP for $DB_CONTAINER on $NETWORK_NAME" >&2
+        exit 1
+    fi
+
     # Mount user-level Claude config files if they exist (read-only, to fixed paths
     # that entrypoint.sh will copy to the correct $HOME inside the container)
     if [ -f "${HOME}/.claude/settings.json" ]; then
@@ -522,10 +536,14 @@ if ! is_container_running "$DEV_CONTAINER"; then
     # Start dev container on the named network (ADR-0030).
     # Uses container DNS to reach postgres via container name.
     # host.containers.internal routes to host-gateway-bound Kind NodePorts.
+    # --add-host pins the DB sidecar to its IP in /etc/hosts (files-first per
+    # nsswitch.conf), bypassing aardvark-dns for sqlx-tokio's per-connect
+    # lookups under Gate-2 parallel-test load — see DB_IP capture above.
     echo "Starting dev container..."
     podman run -d --name "$DEV_CONTAINER" \
         --userns=keep-id \
         --network "$NETWORK_NAME" \
+        --add-host "${DB_CONTAINER}:${DB_IP}" \
         -v "$(realpath "$CLONE_DIR"):/work:Z" \
         -v cargo-registry:/tmp/cargo-home/registry \
         -v cargo-git:/tmp/cargo-home/git \
