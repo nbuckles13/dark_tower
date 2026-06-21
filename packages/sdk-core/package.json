@@ -1,0 +1,41 @@
+{
+  "name": "@darktower/sdk-core",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Dark Tower browser SDK core: WebTransport transport abstraction and length-prefix wire framing.",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.mjs",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "publishConfig": {
+    "access": "restricted"
+  },
+  "scripts": {
+    "build": "vite build",
+    "test:unit": "vitest run",
+    "test:component": "vitest run --config vitest.component.config.ts",
+    "test:watch": "vitest",
+    "lint": "tsc --noEmit",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@darktower/test-utils": "workspace:*",
+    "@types/node": "22.10.5",
+    "typescript": "5.7.3",
+    "vite": "^6.4.3",
+    "vite-plugin-dts": "^4.3.0",
+    "vitest": "^4.1.8"
+  }
+}

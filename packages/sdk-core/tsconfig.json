@@ -1,0 +1,20 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "dist",
+    "types": ["node"],
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "moduleResolution": "Bundler",
+    "noEmit": true,
+    "baseUrl": ".",
+    "paths": {
+      // TEST-ONLY type resolution: point the test-utils dependency at its TS
+      // source so `tsc --noEmit` (lint) resolves `MockWebTransport`'s types
+      // without a built `dist/`. The production build uses tsconfig.build.json,
+      // which EXCLUDES tests and emits no edge to test-utils (R-13 Pattern A).
+      "@darktower/test-utils": ["../test-utils/src/index.ts"]
+    }
+  },
+  "include": ["src/**/*", "tests/**/*", "vite.config.ts", "vitest.config.ts", "vitest.component.config.ts"],
+  "exclude": ["dist", "node_modules"]
+}
