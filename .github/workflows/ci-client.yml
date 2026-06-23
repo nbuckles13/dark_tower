@@ -1,0 +1,239 @@
+name: CI Client
+
+# Standalone client CI workflow (R-47) — mirrors ci.yml shape for the pnpm/Nx
+# polyglot client workspace. Does NOT call scripts/layer-all.sh; every step
+# is explicit per R-47.
+#
+# Jobs:
+#   lint      — frozen-lockfile install, ESLint+Prettier+svelte-check, buf
+#               lint/breaking/format, TS guards (R-33), pnpm audit (R-34).
+#               Requires dt-guard binary → Rust stable build in this job.
+#   unit      — vitest run --coverage; sdk-core ≥90% gate enforced by vitest
+#               thresholds (R-41); Codecov upload.
+#   component — Chromium provisioned forward-compat (R-43 browser-mode tests
+#               arrive with task #15); today's test:component is node-based.
+#
+# Base-ref for TS guards (T2): dt-guard ts-no-test-removal calls
+# scripts/lang/_get_base_ref.sh which in PR mode resolves to
+# git merge-base origin/$GITHUB_BASE_REF HEAD; push mode uses HEAD~1.
+# fetch-depth: 0 on the lint job provides the full history both modes need.
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - 'packages/**'
+      - 'proto/**'
+      - 'pnpm-lock.yaml'
+      - 'nx.json'
+      - 'package.json'
+      - 'pnpm-workspace.yaml'
+      - 'tsconfig.base.json'
+      - 'proto/buf.yaml'
+      - 'proto/buf.gen.yaml'
+      - '.github/workflows/ci-client.yml'
+
+# Least-privilege GITHUB_TOKEN — read-only for all jobs.
+# Codecov upload uses CODECOV_TOKEN secret (same pattern as ci.yml), so
+# id-token: write is not required.
+permissions:
+  contents: read
+
+# Cancel in-flight runs on the same branch when a new push arrives.
+concurrency:
+  group: ci-client-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          # fetch-depth: 0 required for two reasons:
+          # 1. buf breaking --against '.git#branch=main' needs full history.
+          # 2. dt-guard ts-no-test-removal calls _get_base_ref.sh which
+          #    resolves git merge-base origin/$GITHUB_BASE_REF HEAD (PR mode)
+          #    or HEAD~1 (push mode) — both need reachable history.
+          fetch-depth: 0
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q protobuf-compiler
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Isolated cache key: only caches dt-guard, not the full workspace
+          # build used by ci.yml. Keeps cache sizes predictable.
+          shared-key: "ci-client-dt-guard"
+
+      - name: Build dt-guard binary
+        # Guards scripts/guards/simple/ts/*.sh delegate to this binary
+        # (ADR-0034). The wrapper _dt_guard_wrapper.sh exits 1 with
+        # STATUS=FAIL REASON=dt-guard-binary-missing if the binary is absent
+        # or non-executable — no separate existence check needed (S2).
+        run: cargo build --release -p dt-guard --quiet
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.2
+          run_install: false
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'pnpm'
+
+      - name: Install buf
+        uses: bufbuild/buf-setup-action@v1
+
+      - name: Install pnpm dependencies
+        # --frozen-lockfile enforces the committed lockfile (R-34).
+        run: pnpm install --frozen-lockfile
+
+      - name: Lint (ESLint + Prettier + svelte-check)
+        # pnpm lint = nx run-many -t lint (tsc + eslint + prettier per package)
+        #           + svelte-check --workspace packages/ --threshold error
+        # svelte-check exits 0 with 0 files when no .svelte files exist
+        # (no-op-safe until task #15 lands sdk-svelte/web-app).
+        run: pnpm lint
+
+      - name: buf lint
+        run: pnpm exec buf lint
+        working-directory: proto
+
+      - name: buf breaking (against main)
+        run: pnpm exec buf breaking --against '.git#branch=main'
+        working-directory: proto
+
+      - name: buf format check
+        run: pnpm exec buf format --diff --exit-code
+        working-directory: proto
+
+      - name: Guard — no-secrets-in-code (R-33)
+        # Scans changed .ts/.tsx/.svelte files for hardcoded JWTs, API keys,
+        # connection strings, auth header literals. Delegates to dt-guard
+        # ts-no-secrets subcommand. Wrapper hard-fails if binary missing (S2).
+        run: bash scripts/guards/simple/ts/no-secrets-in-ts.sh
+
+      - name: Guard — no-test-removal (R-33)
+        # Diffs against base ref (PR: merge-base origin/$GITHUB_BASE_REF HEAD;
+        # push: HEAD~1) via _get_base_ref.sh. Flags deleted test files that
+        # have no same-basename or same-package replacement in the added set.
+        run: bash scripts/guards/simple/ts/no-test-removal-ts.sh
+
+      - name: Audit — pnpm supply chain (R-34)
+        # Uses the suppression-aware wrapper (scripts/lang/ts/audit.sh) which
+        # reads .pnpm-audit-ignore.json for sanctioned suppressions (ADR-0033
+        # §11). Exits non-zero on any unsuppressed high/critical advisory
+        # (deny-by-default, S1). DEVLOOP_AUDIT_FORCE_RUN=1 bypasses the
+        # no-dep-change skip gate — CI always runs a fresh scan.
+        # Current state (2026-06-23): existing pnpm.overrides entry
+        # minimatch@>=9.0.0 <9.0.7 already resolves the 3 HIGH minimatch
+        # ReDoS advisories; audit exits 0 with only 1 moderate remaining.
+        env:
+          DEVLOOP_AUDIT_FORCE_RUN: "1"
+        run: bash scripts/lang/ts/audit.sh
+
+  unit:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.2
+          run_install: false
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'pnpm'
+
+      - name: Install pnpm dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run unit tests with coverage
+        # vitest run --coverage collects v8 coverage and enforces the
+        # thresholds block in packages/sdk-core/vitest.config.ts (≥90% on
+        # statements/branches/functions/lines). Exits non-zero if any metric
+        # is below threshold (T1). Coverage numbers verified 2026-06-23:
+        # stmts 100%, branches 95.83%, funcs 100%, lines 100%.
+        run: pnpm test:unit
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          # flags: client-unit separates this report from the Rust lcov
+          # report uploaded by ci.yml's coverage job.
+          flags: client-unit
+          fail_ci_if_error: true
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+  component:
+    name: Component Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.2
+          run_install: false
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'pnpm'
+
+      - name: Install pnpm dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Restore Playwright browser cache
+        id: playwright-cache
+        uses: actions/cache@v4
+        with:
+          # Key on pnpm-lock.yaml — lockfile is the authoritative Playwright
+          # version pin (O1). Package.json can change without bumping the
+          # browser binary; pnpm-lock.yaml cannot.
+          key: playwright-chromium-${{ hashFiles('pnpm-lock.yaml') }}
+          path: ~/.cache/ms-playwright
+
+      - name: Install Playwright Chromium
+        # Installs Chromium + system deps (libnss3, libatk-bridge2.0-0, etc.).
+        # Forward-compat: task #15 (sdk-svelte/web-app) adds browser-mode
+        # vitest component tests (R-43) — Chromium is already present.
+        # Today's test:component (sdk-core) runs in node env and does not
+        # exercise the browser binary, so this step is a no-op for current tests.
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
+        run: npx playwright install --with-deps chromium
+
+      - name: Run component tests
+        run: pnpm test:component

@@ -142,11 +142,7 @@ export class FrameDecoder {
         break;
       }
 
-      const view = new DataView(
-        this.#buffer.buffer,
-        this.#buffer.byteOffset,
-        LENGTH_PREFIX_BYTES,
-      );
+      const view = new DataView(this.#buffer.buffer, this.#buffer.byteOffset, LENGTH_PREFIX_BYTES);
       const msgLen = view.getUint32(0, /* littleEndian */ false);
 
       // SECURITY: validate the declared length BEFORE buffering/awaiting the

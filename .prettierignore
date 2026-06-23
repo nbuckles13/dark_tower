@@ -1,0 +1,18 @@
+# Build artifacts and generated code — never reformat these.
+node_modules/
+dist/
+coverage/
+.nx/
+
+# Proto-generated TypeScript (buf codegen output).
+packages/sdk-core/src/proto/
+
+# pnpm lockfile — managed by pnpm, not hand-formatted.
+pnpm-lock.yaml
+
+# Rust sources are handled by rustfmt, not prettier.
+crates/
+target/
+
+# Infra / Kubernetes manifests — separate formatting conventions.
+infra/

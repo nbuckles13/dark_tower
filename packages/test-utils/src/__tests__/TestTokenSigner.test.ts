@@ -17,7 +17,9 @@ describe('TestTokenSigner', () => {
     const jwt = await signer.sign({ sub: 'u1', iat: 0, exp: 9999, jti: 'j1' });
     const parts = jwt.split('.');
     expect(parts).toHaveLength(3);
-    const headerJson = JSON.parse(Buffer.from(parts[0]!.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8'));
+    const headerJson = JSON.parse(
+      Buffer.from(parts[0]!.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8'),
+    );
     expect(headerJson).toMatchObject({ alg: 'EdDSA', typ: 'JWT', kid: signer.kid });
 
     // Verify the signature using the same path that produced it. Web Crypto

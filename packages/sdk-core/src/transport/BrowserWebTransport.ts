@@ -109,10 +109,7 @@ function resolveWebTransportCtor(): BrowserWebTransportCtor {
  * header. Awaiting `transport.ready` after this resolves observes the open
  * hook.
  */
-export function connect(
-  url: string,
-  options?: WebTransportConnectOptions,
-): BrowserWebTransport {
+export function connect(url: string, options?: WebTransportConnectOptions): BrowserWebTransport {
   const Ctor = resolveWebTransportCtor();
 
   if (__DEV_TRUST_FINGERPRINT__) {

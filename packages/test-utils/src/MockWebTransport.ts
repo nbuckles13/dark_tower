@@ -36,7 +36,10 @@ interface CapturedBidiStream {
  */
 export class MockWebTransport implements IWebTransport {
   readonly #readyResolvers: { resolve: () => void; reject: (e: Error) => void };
-  readonly #closedResolvers: { resolve: (info: WebTransportCloseInfo) => void; reject: (e: Error) => void };
+  readonly #closedResolvers: {
+    resolve: (info: WebTransportCloseInfo) => void;
+    reject: (e: Error) => void;
+  };
 
   readonly ready: Promise<void>;
   readonly closed: Promise<WebTransportCloseInfo>;

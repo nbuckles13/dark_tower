@@ -198,6 +198,7 @@ function base64UrlEncode(bytes: Uint8Array): string {
   for (let i = 0; i < bytes.byteLength; i++) {
     binary += String.fromCharCode(bytes[i] ?? 0);
   }
-  const b64 = typeof btoa === 'function' ? btoa(binary) : Buffer.from(binary, 'binary').toString('base64');
+  const b64 =
+    typeof btoa === 'function' ? btoa(binary) : Buffer.from(binary, 'binary').toString('base64');
   return b64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }

@@ -23,10 +23,7 @@ export type {
   WebTransportCloseInfo,
 } from './transport/IWebTransport.js';
 
-export type {
-  DevCertificateHash,
-  WebTransportConnectOptions,
-} from './transport/types.js';
+export type { DevCertificateHash, WebTransportConnectOptions } from './transport/types.js';
 
 export { BrowserWebTransport, connect } from './transport/BrowserWebTransport.js';
 

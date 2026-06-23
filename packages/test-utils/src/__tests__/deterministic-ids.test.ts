@@ -19,8 +19,6 @@ describe('deterministic-ids', () => {
     const next = createSeededUuid(rng);
     const id = next();
     // Format: 8-4-4-4-12 lowercase hex.
-    expect(id).toMatch(
-      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
-    );
+    expect(id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
   });
 });

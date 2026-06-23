@@ -32,6 +32,18 @@ export default defineConfig({
       reporter: ['text', 'json', 'html'],
       include: ['src/**/*.ts'],
       exclude: ['src/**/__tests__/**', 'src/**/*.test.ts', 'src/**/*.d.ts'],
+      // ≥90% gate (R-41 / R-47). Enforced here so `vitest run --coverage`
+      // exits non-zero if any metric drops below threshold — CI does not
+      // need a separate check step. src/index.ts barrel is included in
+      // coverage (re-export lines score as covered); actual numbers
+      // verified 2026-06-23: stmts 100%, branches 95.83%, funcs 100%,
+      // lines 100%.
+      thresholds: {
+        statements: 90,
+        branches: 90,
+        functions: 90,
+        lines: 90,
+      },
     },
   },
 });

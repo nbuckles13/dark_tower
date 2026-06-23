@@ -23,7 +23,7 @@
       "executor": "nx:run-commands",
       "options": {
         "cwd": "packages/test-utils",
-        "command": "tsc --noEmit"
+        "command": "tsc --noEmit && eslint src/ && prettier --check \"src/**/*.ts\""
       }
     }
   }

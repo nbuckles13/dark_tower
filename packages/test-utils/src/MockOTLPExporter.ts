@@ -26,9 +26,7 @@ export interface OTLPExportPayload {
 }
 
 /** Result of an export(); mirrors the production exporter contract. */
-export type OTLPExportResult =
-  | { code: 'success' }
-  | { code: 'failure'; error: Error };
+export type OTLPExportResult = { code: 'success' } | { code: 'failure'; error: Error };
 
 /**
  * Failure-injection response specs. Tests set the next response (or a sticky

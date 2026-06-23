@@ -20,12 +20,7 @@ export type {
 
 export type { MetricLabels, MetricsSink } from './contracts/MetricsSink.js';
 
-export type {
-  MeetingClaims,
-  MeetingRole,
-  ParticipantType,
-  UserClaims,
-} from './token-claims.js';
+export type { MeetingClaims, MeetingRole, ParticipantType, UserClaims } from './token-claims.js';
 
 export {
   InMemoryMetricsSink,
@@ -49,8 +44,4 @@ export {
   type UserClaimsOverrides,
 } from './TestTokenBuilder.js';
 
-export {
-  createIdFactory,
-  createSeededRng,
-  createSeededUuid,
-} from './deterministic-ids.js';
+export { createIdFactory, createSeededRng, createSeededUuid } from './deterministic-ids.js';

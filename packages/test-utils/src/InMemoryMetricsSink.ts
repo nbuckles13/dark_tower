@@ -120,7 +120,9 @@ export class InMemoryMetricsSink implements MetricsSink {
    */
   getHistogramObservations(name: string, labels: MetricLabels): readonly number[] {
     return this.#recorded
-      .filter((r) => r.kind === 'histogram' && r.name === name && labelsMatchSubset(labels, r.labels))
+      .filter(
+        (r) => r.kind === 'histogram' && r.name === name && labelsMatchSubset(labels, r.labels),
+      )
       .map((r) => r.value);
   }
 

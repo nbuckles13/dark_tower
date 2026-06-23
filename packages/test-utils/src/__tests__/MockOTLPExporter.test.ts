@@ -6,14 +6,22 @@ describe('MockOTLPExporter', () => {
     const exp = new MockOTLPExporter();
 
     // Default response is success.
-    const okResult = await exp.export({ kind: 'metrics', capturedAt: 1, body: { fixture: 'metrics' } });
+    const okResult = await exp.export({
+      kind: 'metrics',
+      capturedAt: 1,
+      body: { fixture: 'metrics' },
+    });
     expect(okResult).toEqual({ code: 'success' });
     expect(exp.getMetricPayloads()).toHaveLength(1);
     expect(exp.getTracePayloads()).toHaveLength(0);
 
     // Single-shot 429 with retryAfterMs.
     exp.simulateNextResponse({ status: 429, retryAfterMs: 200 });
-    const rateLimited = await exp.export({ kind: 'traces', capturedAt: 2, body: { fixture: 'traces' } });
+    const rateLimited = await exp.export({
+      kind: 'traces',
+      capturedAt: 2,
+      body: { fixture: 'traces' },
+    });
     expect(rateLimited.code).toBe('failure');
     if (rateLimited.code === 'failure') {
       expect(rateLimited.error.message).toMatch(/429/);

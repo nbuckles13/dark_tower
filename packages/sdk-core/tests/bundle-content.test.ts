@@ -74,9 +74,7 @@ describe('R-14: production bundle excludes the dev-trust path', () => {
   });
 
   it('contains none of the dev-trust tokens in the executable bundle (.mjs/.cjs)', () => {
-    const executableFiles = listFiles(DIST).filter(
-      (f) => f.endsWith('.mjs') || f.endsWith('.cjs'),
-    );
+    const executableFiles = listFiles(DIST).filter((f) => f.endsWith('.mjs') || f.endsWith('.cjs'));
     expect(executableFiles.length, 'expected at least one executable artifact').toBeGreaterThan(0);
     expect(scanForTokens(executableFiles)).toEqual([]);
   });

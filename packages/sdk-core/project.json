@@ -16,7 +16,7 @@
       "executor": "nx:run-commands",
       "options": {
         "cwd": "packages/sdk-core",
-        "command": "vitest run"
+        "command": "vitest run --coverage"
       }
     },
     "test:component": {
@@ -30,7 +30,7 @@
       "executor": "nx:run-commands",
       "options": {
         "cwd": "packages/sdk-core",
-        "command": "tsc --noEmit"
+        "command": "tsc --noEmit && eslint src/ && prettier --check \"src/**/*.ts\""
       }
     }
   }

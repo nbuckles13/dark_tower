@@ -30,7 +30,7 @@
     "build": "vite build",
     "test:unit": "vitest run",
     "test:watch": "vitest",
-    "lint": "tsc --noEmit",
+    "lint": "tsc --noEmit && eslint src/ && prettier --check \"src/**/*.ts\"",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {},
