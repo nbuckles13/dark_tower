@@ -68,6 +68,12 @@ pub(crate) const PII_TOKENS_CATEGORY_A: &[&str] = &[
     "cred",
     "bearer",
     "auth_code",
+    // camelCase counterpart of `access_token` (task #11). The word-boundary +
+    // exact-match consumers (`\b(alternation)\b`) do NOT match camelCase
+    // `accessToken` via the existing `token` / `access_token` entries, so this is a
+    // genuine non-redundant secret identifier — needed for `ts_pii` detection of
+    // the camelCase wire field the browser SDK introduces. @security 2026-06-23.
+    "accessToken",
 ];
 
 /// Identifier names that contain a CATEGORY_A substring but are NOT secrets.
@@ -151,7 +157,7 @@ mod tests {
 
     #[test]
     fn category_a_includes_wave2_additions() {
-        for tok in &["pwd", "cred", "bearer", "auth_code"] {
+        for tok in &["pwd", "cred", "bearer", "auth_code", "accessToken"] {
             assert!(
                 PII_TOKENS_CATEGORY_A.contains(tok),
                 "expected CATEGORY_A to contain {tok}"

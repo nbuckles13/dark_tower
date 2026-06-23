@@ -33,6 +33,8 @@
   "devDependencies": {
     "@darktower/test-utils": "workspace:*",
     "@types/node": "22.10.5",
+    "@vitest/coverage-v8": "4.1.8",
+    "msw": "2.7.0",
     "typescript": "5.7.3",
     "vite": "^6.4.3",
     "vite-plugin-dts": "^4.3.0",

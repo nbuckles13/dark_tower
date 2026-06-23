@@ -28,3 +28,51 @@ export type { DevCertificateHash, WebTransportConnectOptions } from './transport
 export { BrowserWebTransport, connect } from './transport/BrowserWebTransport.js';
 
 export { TransportError, TransportErrorCode } from './transport/errors.js';
+
+// --- HTTP API (R-11, R-12) ---
+
+export { AuthApiClient } from './http/AuthApiClient.js';
+export type { AuthApiClientOptions } from './http/AuthApiClient.js';
+
+export { MeetingApiClient } from './http/MeetingApiClient.js';
+export type { MeetingApiClientOptions } from './http/MeetingApiClient.js';
+
+export type {
+  AuthTokenResponse,
+  CreateMeetingInput,
+  CreateMeetingResponse,
+  FetchLike,
+  JoinMeetingResponse,
+  LoginInput,
+  McAssignment,
+  RegisterInput,
+  RegisterResponse,
+  UserTokenCredentials,
+} from './http/types.js';
+
+// --- Typed error hierarchy (R-23) ---
+
+export { SdkError, SdkErrorCode } from './errors/SdkError.js';
+export type { RedactedSdkError } from './errors/SdkError.js';
+
+export {
+  AuthError,
+  AuthBadRequestError,
+  AuthConflictError,
+  AuthForbiddenError,
+  AuthRateLimitError,
+  AuthUnauthorizedError,
+} from './errors/AuthError.js';
+
+export {
+  MeetingBadRequestError,
+  MeetingConflictError,
+  MeetingError,
+  MeetingForbiddenError,
+  MeetingNotFoundError,
+  MeetingUnauthorizedError,
+} from './errors/MeetingError.js';
+
+export { NetworkError, NetworkErrorReason } from './errors/NetworkError.js';
+
+export { ValidationError } from './errors/ValidationError.js';
