@@ -422,12 +422,7 @@ Artifact-specific: no `.proto`/migration/k8s/Dockerfile in diff → none trigger
 
 ## Accepted Deferrals
 
-- (none surfaced in this devloop)
-
-All findings were fixed in-diff: Observability F1 (pii-safe annotation), Test F1+F2
-(coverage provider + branch tests), Security F1 (pii-safe annotation), Code Quality
-F1 (domain-neutral `ValidationError`) + F3 (email-throw annotations). Zero deferred,
-zero spun-out. Code Quality F2 was a doc-only stale-cell reconciliation (not a diff finding).
+- (none surfaced in this devloop) — all findings fixed in-diff; zero deferred, zero spun-out. Per-finding detail is in the verdict sections above.
 
 ---
 
