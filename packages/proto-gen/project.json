@@ -13,7 +13,7 @@
         "{projectRoot}/package.json"
       ],
       "outputs": [
-        "{workspaceRoot}/packages/sdk-core/src/proto/*_pb.ts"
+        "{workspaceRoot}/packages/sdk-core/src/proto/**/*_pb.ts"
       ],
       "options": {
         "command": "pnpm exec buf generate",

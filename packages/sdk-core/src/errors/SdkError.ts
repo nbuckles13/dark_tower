@@ -31,6 +31,8 @@ export const SdkErrorCode = {
   Auth: 'AUTH',
   /** GC (global-controller) meeting HTTP failure mapped from the error envelope. */
   Meeting: 'MEETING',
+  /** MC (meeting-controller) WebTransport signaling failure (proto `ErrorMessage`, framing, or transport close). */
+  Signaling: 'SIGNALING',
   /** Client-side bounded-input / subdomain / meeting-code validation failure (pre-network). */
   Validation: 'VALIDATION',
   /** `fetch` rejected (DNS/TLS/offline) or the response body was not a usable envelope. */

@@ -1,0 +1,6 @@
+# Proto-generated TypeScript (buf codegen output) — never reformat.
+# The package `lint` target runs `prettier --check` from this directory, so the
+# root .prettierignore (resolved relative to CWD) does not apply here; this local
+# copy keeps the generated `src/proto/**` out of the prettier gate. Mirrors the
+# eslint flat-config ignore for the same path.
+src/proto/

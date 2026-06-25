@@ -35,7 +35,11 @@ export default defineConfig({
       provider: 'v8',
       reporter: ['text', 'json', 'html'],
       include: ['src/**/*.ts'],
-      exclude: ['src/**/__tests__/**', 'src/**/*.test.ts', 'src/**/*.d.ts'],
+      // `src/proto/**` is GENERATED protobuf-es code (gitignored, produced by
+      // `proto-gen:codegen`) — not hand-written, so it is excluded from the
+      // coverage gate (task #13). It is exercised indirectly by the signaling
+      // tests but should not score against the ≥90% threshold.
+      exclude: ['src/**/__tests__/**', 'src/**/*.test.ts', 'src/**/*.d.ts', 'src/proto/**'],
       // ≥90% gate (R-41 / R-47). Enforced here so `vitest run --coverage`
       // exits non-zero if any metric drops below threshold — CI does not
       // need a separate check step. src/index.ts barrel is included in

@@ -81,6 +81,9 @@ export { NetworkError, NetworkErrorReason } from './errors/NetworkError.js';
 
 export { ValidationError } from './errors/ValidationError.js';
 
+export { SignalingError, SignalingErrorCode } from './errors/SignalingError.js';
+export type { RedactedSignalingError, SignalingErrorOptions } from './errors/SignalingError.js';
+
 // --- Telemetry scaffolding (R-19, R-24, R-25, R-26) ---
 
 export type { MetricLabels, MetricsSink } from './telemetry/MetricsSink.js';
@@ -108,3 +111,23 @@ export { JoinEvent, logJoinEvent } from './telemetry/logger.js';
 export type { JoinLogRecord } from './telemetry/logger.js';
 
 export { CloseReason, normalizeCloseReason } from './telemetry/closeReason.js';
+
+// --- Signaling (R-16, R-17, R-18, R-19) ---
+
+export { SignalingClient } from './signaling/SignalingClient.js';
+export type {
+  SignalingClientOptions,
+  SignalingEventMap,
+  SignalingLogger,
+  WebTransportConnectFn,
+} from './signaling/SignalingClient.js';
+
+export { ParticipantLeaveReason } from './signaling/events.js';
+export type {
+  JoinedEvent,
+  ParticipantJoinedEvent,
+  ParticipantLeftEvent,
+  RosterParticipant,
+  SignalingCapabilities,
+  SignalingJoinParams,
+} from './signaling/events.js';

@@ -3,9 +3,11 @@
   "name": "sdk-core",
   "projectType": "library",
   "sourceRoot": "packages/sdk-core/src",
+  "implicitDependencies": ["proto-gen"],
   "targets": {
     "build": {
       "executor": "nx:run-commands",
+      "dependsOn": [{ "projects": ["proto-gen"], "target": "codegen" }],
       "options": {
         "cwd": "packages/sdk-core",
         "command": "vite build"
@@ -14,6 +16,7 @@
     },
     "test:unit": {
       "executor": "nx:run-commands",
+      "dependsOn": [{ "projects": ["proto-gen"], "target": "codegen" }],
       "options": {
         "cwd": "packages/sdk-core",
         "command": "vitest run --coverage"
@@ -21,6 +24,7 @@
     },
     "test:component": {
       "executor": "nx:run-commands",
+      "dependsOn": [{ "projects": ["proto-gen"], "target": "codegen" }],
       "options": {
         "cwd": "packages/sdk-core",
         "command": "vitest run --config vitest.component.config.ts"
@@ -28,6 +32,7 @@
     },
     "lint": {
       "executor": "nx:run-commands",
+      "dependsOn": [{ "projects": ["proto-gen"], "target": "codegen" }],
       "options": {
         "cwd": "packages/sdk-core",
         "command": "tsc --noEmit && eslint src/ && prettier --check \"src/**/*.ts\""
