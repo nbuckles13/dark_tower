@@ -157,6 +157,16 @@ No Guarded Shared Area paths touched (`proto/**` untouched — trace fields 20/2
 
 **None.** All 12 findings raised across the 7 reviewers were fixed in-diff (zero deferred, zero spun-out). Verdicts: Security CLEAR, Test RESOLVED-FIXED, Observability RESOLVED-FIXED, Code Quality RESOLVED-FIXED, DRY RESOLVED-FIXED, Operations CLEAR, Semantic Guard CLEAR.
 
+---
+
+## Post-Completion Notes (non-deferrals)
+
+<!-- Relocated out of §Accepted Deferrals (which is genuinely "None" for this
+     devloop) so the always-run validate-todo-tracking guard sees a
+     pointer-only/None deferrals section. Content below is unchanged — these are
+     forward-looking notes and pre-existing-defect observations, NOT deferred
+     findings left in this devloop's diff. Standalone doc-hygiene fix; see commit. -->
+
 ### Forward-looking follow-ups (NOT deferrals — in `docs/TODO.md`)
 These are future-task dependencies authored as planned scope, not findings left in the diff:
 - **Guard call-site checking** (#13/#14): extend `name-guard-dt-client` to also check `sink.counter('dt_client_*')` literal CALL SITES once emission lands — the `dt-metric-name-dynamic` marker covers generic-sink internals only, not a license to skip literal-call-site checking.
