@@ -13,3 +13,10 @@ data:
   AC_RATE_LIMIT_MAX_ATTEMPTS: "100"
   AC_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES: "1"
   AC_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS: "100"
+  # OTLP-gRPC endpoint for the in-cluster OTel collector (R-59).
+  # AC's OTel init is presence-gated on OTLP_ENDPOINT (config.rs:237,
+  # Option<String>); the http:// scheme is required (parsed via
+  # tonic Endpoint::from_shared — a bare host:port fails at init).
+  # NOTE: inert on this branch — no service main.rs calls init_otel yet
+  # (that wiring is R-55). Becomes live when R-55 lands.
+  OTLP_ENDPOINT: "http://otel-collector.dark-tower:4317"

@@ -1,0 +1,36 @@
+# Prometheus alerting rules for the OTel pipeline (shared across services).
+#
+# Severity levels (per docs/observability/alert-conventions.md):
+# - page: User-visible impact now or SLO burn; pages oncall immediately
+# - warning: Degraded but contained, or approaching limits; Slack notify
+# - info: Awareness/trend/leading indicator; no notification, dashboards only
+#
+# Scope: OTel-pipeline alerts that are not specific to one service. The single
+# alert here fires per-service when runtime OTLP export degrades.
+#
+# DORMANT until the emitter lands: `dt_otel_export_failures_total` is NOT yet
+# emitted by any code on this branch — R-54 defers the counter to the service
+# OTel exporter init wiring (R-55). Until then this rule cannot fire. See
+# docs/runbooks/gc-deployment.md#otel-collector-upgrade-discipline.
+
+groups:
+  - name: otel-pipeline-warning
+    interval: 60s
+    rules:
+      - alert: OTelExportFailureRate
+        # Runtime OTLP export degradation. R-54 is fail-soft at runtime: export
+        # failures drop spans silently but increment this counter. Per-service
+        # via by(service) so each degrading service fires its own alert; the
+        # `reason` label is preserved on the series for drill-down but is not
+        # aggregated on (aggregating by reason would fan one incident into many).
+        expr: |
+          sum by (service) (rate(dt_otel_export_failures_total[5m])) > 0
+        for: 10m
+        labels:
+          severity: warning
+          component: observability
+        annotations:
+          summary: "OTel export failures on {{ $labels.service }} ({{ $value }}/s)"
+          description: "Service {{ $labels.service }} is failing to export spans/metrics to the in-cluster OTel collector at {{ $value }}/s for 10 minutes. Runtime degradation: telemetry is dropping but the data plane is unaffected."
+          impact: "Loss of trace/metric visibility for the affected service. No user-facing impact; observability gap only."
+          runbook_url: "docs/runbooks/gc-deployment.md#otel-collector-upgrade-discipline"

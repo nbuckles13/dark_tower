@@ -6,5 +6,6 @@ resources:
   - gc-service/
   - mc-service/
   - mh-service/
+  - otel-collector/
   - postgres/
   - redis/

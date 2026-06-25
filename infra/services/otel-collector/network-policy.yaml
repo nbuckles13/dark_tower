@@ -1,0 +1,84 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: otel-collector
+  namespace: dark-tower
+  labels:
+    app: otel-collector
+    component: observability
+spec:
+  podSelector:
+    matchLabels:
+      app: otel-collector
+      component: observability
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  # OTLP-gRPC (:4317): only the four service pods may send traces (R-55 init_otel).
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: dark-tower
+      podSelector:
+        matchLabels:
+          app: ac-service
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: dark-tower
+      podSelector:
+        matchLabels:
+          app: gc-service
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: dark-tower
+      podSelector:
+        matchLabels:
+          app: mc-service
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: dark-tower
+      podSelector:
+        matchLabels:
+          app: mh-service
+    ports:
+    - protocol: TCP
+      port: 4317
+  # OTLP-HTTP (:4318): only GC may reach it — the /api/v1/telemetry proxy forward
+  # path (R-2). No other service uses the HTTP receiver.
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: dark-tower
+      podSelector:
+        matchLabels:
+          app: gc-service
+    ports:
+    - protocol: TCP
+      port: 4318
+  # health (:13133): namespace-scoped. Kubelet probe traffic originates from the
+  # node (not a pod), so a podSelector rule would never match it and would
+  # crashloop the probes (per security). 13133 exposes only liveness/readiness
+  # status, no telemetry payload — ns-scope is an acceptable exposure on Kind.
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: dark-tower
+    ports:
+    - protocol: TCP
+      port: 13133
+  egress:
+  # DNS only — dev exporters are debug/logging (no network sink). UDP + TCP 53
+  # (TCP for large/truncated responses).
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: kube-system
+      podSelector:
+        matchLabels:
+          k8s-app: kube-dns
+    ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 53

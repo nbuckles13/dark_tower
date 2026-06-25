@@ -50,6 +50,7 @@ infra/
 5. [Common Deployment Issues](#common-deployment-issues)
 6. [Smoke Tests](#smoke-tests)
 7. [Monitoring and Verification](#monitoring-and-verification)
+8. [OTel Collector Upgrade Discipline](#otel-collector-upgrade-discipline)
 
 ---
 
@@ -1210,6 +1211,85 @@ kubectl logs -n dark-tower -l app=gc-service --since=1h | grep -i "database.*err
 # MC assignment failures
 kubectl logs -n dark-tower -l app=gc-service --since=1h | grep -i "mc_assignment.*error"
 ```
+
+---
+
+## OTel Collector Upgrade Discipline
+
+The dev OTel collector (`infra/services/otel-collector/`) is the in-cluster sink
+for AC/GC/MC/MH OTLP-gRPC traces and the GC `/api/v1/telemetry` OTLP-HTTP proxy
+path (R-2). This section is the upgrade discipline for it and the triage home for
+the `OTelExportFailureRate` alert.
+
+### Current vs. future blast radius (read this first)
+
+**On this branch the collector is enabled-but-inert.** No service `main.rs` calls
+`init_otel` yet (that per-service wiring is R-55), so the cluster-setup readiness
+gate blocks only on the collector's *own* readiness, and a collector
+outage/upgrade has **no service impact** today.
+
+**The fleet-wide-CrashLoop hazard described below becomes ACTIVE only once
+per-service `init_otel` wiring (R-55) lands.** Do not over-read the hazard on the
+current branch.
+
+### Causal chain (once R-55 is live)
+
+R-54 OTel init is **fail-hard at init**: if `init_otel` cannot reach the collector
+at startup, the service exits non-zero. So a botched collector image/config
+upgrade makes AC, GC, MC, and MH all fail init *simultaneously* → fleet-wide
+`CrashLoopBackoff`. A bad collector change is therefore a fleet-wide outage
+trigger, not a localized observability issue.
+
+### Mitigation: upgrade in a separate change window
+
+- Upgrade the collector in a **separate change window** from any service deploy.
+  Never bundle a collector image/config bump with an AC/GC/MC/MH rollout.
+- Verify the collector is `Ready` **independently** (its readiness gate / the
+  cluster-health env-test) *before* and *without* rolling any service.
+- Pre-upgrade checklist (one line): confirm the collector is `Ready` after the
+  change, and confirm **no service deploy is scheduled in the same window**.
+
+### Triage: which failure mode am I looking at?
+
+The key triage step is distinguishing the two modes:
+
+- **Runtime degradation** — the `OTelExportFailureRate` warning alert fires.
+  Spans/metrics are dropping, but the **data plane is UP** and users are
+  unaffected. This is fail-soft: the export pipeline is degraded, the services
+  are healthy.
+- **Init-time collector failure** — fleet-wide pod `Unready` / `CrashLoopBackoff`
+  across AC/GC/MC/MH. The **services are DOWN**. This is the fail-hard path: the
+  collector is unreachable at service init.
+
+  > **The `OTelExportFailureRate` alert is dormant until `dt_otel_export_failures_total`
+  > is emitted by the service OTel exporter init (R-55); until then it cannot fire.**
+  > If you somehow see it before R-55 lands, it is a configuration artifact, not a
+  > real signal — do not chase a non-firing alert.
+
+### Rollback
+
+Revert the collector image tag (and/or config) to the last known-good value and
+re-apply the otel-collector overlay. Because the collector is a single Deployment,
+rollback is a tag revert + `kubectl apply -k` of the overlay.
+
+### Break-glass / escape hatch
+
+If a collector problem is blocking a service deploy that cannot wait for a
+separate window, disable per-service OTel init so the service can boot without the
+collector:
+
+- **Today (branch-accurate):** OTel-for-AC is presence-gated — remove/blank AC's
+  `OTLP_ENDPOINT` ConfigMap value and restart AC. There is no boolean flag this
+  story; enablement is by presence of the endpoint.
+- **Once R-55 lands:** the canonical break-glass is the `otel_enabled=false`
+  per-service no-op path (R-54's no-op guard) — set it and redeploy.
+
+### Escalation / ownership
+
+The collector is owned by **infrastructure**. A fleet-wide `CrashLoop` caused by a
+collector change is a **deployment-discipline incident** (a bundled/botched
+upgrade), not a service bug — route it accordingly and restore the collector
+before investigating individual services.
 
 ---
 

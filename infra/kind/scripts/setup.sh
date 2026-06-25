@@ -407,6 +407,24 @@ deploy_observability() {
     log_info "Observability stack deployed successfully."
 }
 
+# Deploy the dev OTel collector (R-59)
+#
+# Ordered AFTER deploy_observability/deploy_redis and BEFORE the AC/GC/MC/MH
+# services. The readiness gate is load-bearing once R-55 wires init_otel: under
+# R-54 fail-hard-at-init, a service started before the collector is Ready would
+# fail init and CrashLoopBackoff. On THIS branch the gate only blocks on the
+# collector's own readiness (no service calls init_otel yet) — see the
+# collector-upgrade-discipline section in docs/runbooks/gc-deployment.md.
+deploy_otel_collector() {
+    log_step "Deploying OTel collector..."
+
+    ${KUBECTL} apply -k "${PROJECT_ROOT}/infra/kubernetes/overlays/kind/services/otel-collector/"
+
+    log_info "Waiting for OTel collector to be ready..."
+    ${KUBECTL} wait --for=condition=Ready pod -l app=otel-collector -n dark-tower --timeout=120s
+    log_info "OTel collector deployed successfully."
+}
+
 # Run database migrations
 run_migrations() {
     log_step "Running database migrations..."
@@ -848,6 +866,9 @@ deploy_only_service() {
             create_mh_tls_secret
             deploy_mh_service
             ;;
+        otel)
+            deploy_otel_collector
+            ;;
         *)
             log_error "Unknown service '${svc}'"
             exit 1
@@ -878,6 +899,7 @@ main() {
     deploy_postgres
     deploy_redis
     deploy_observability
+    deploy_otel_collector
     run_migrations
     seed_test_data
     create_ac_secrets

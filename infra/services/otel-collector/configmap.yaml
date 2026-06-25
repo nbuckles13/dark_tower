@@ -1,0 +1,60 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: otel-collector-config
+  namespace: dark-tower
+  labels:
+    app: otel-collector
+    component: observability
+data:
+  # OpenTelemetry Collector configuration for local Kind development (R-59).
+  #
+  # Dev sink only: receives OTLP-gRPC traces from AC/GC/MC/MH (R-55) and the
+  # OTLP-HTTP payloads forwarded by GC's /api/v1/telemetry proxy (R-2), and
+  # writes them to the collector log via the debug exporter. NO production
+  # exporters (Tempo / Honeycomb / etc.) this story — those are deferred.
+  config.yaml: |
+    receivers:
+      otlp:
+        protocols:
+          # OTLP-gRPC for in-cluster service traces (AC/GC/MC/MH via R-55 init_otel).
+          grpc:
+            endpoint: 0.0.0.0:4317
+          # OTLP-HTTP for the GC /api/v1/telemetry proxy forward path (R-2).
+          http:
+            endpoint: 0.0.0.0:4318
+
+    exporters:
+      # `debug` is the dev sink — writes received span/metric counts + names to
+      # the collector log. (R-59 item 1 also names `logging`, but `logging` was
+      # deprecated upstream at collector v0.86.0 and REMOVED at v0.111.0 in favor
+      # of `debug`; even on the pinned 0.103.1 — where it still loads with a
+      # deprecation warning — referencing it adds log noise AND becomes a startup
+      # CrashLoop the moment the image is bumped past 0.111.0. It is a redundant
+      # alias of `debug`, not a second sink, so `debug` alone is the correct,
+      # forward-safe dev config. @test/@code-reviewer/@team-lead Gate-3.)
+      #
+      # verbosity is `normal`, NOT `detailed`: `detailed` dumps every span
+      # attribute value to the pod log, so once R-55 makes services emit, any
+      # PII/secret on a span would land in the collector log in cleartext — and
+      # `test_secrets_not_in_logs` only scans ac-service logs, not the collector
+      # pod, so that leak path would be unguarded. `normal` removes the leak path
+      # while still giving span names/counts for dev debugging (@security Gate-3).
+      debug:
+        verbosity: normal
+
+    extensions:
+      # Liveness/readiness surface on :13133 — the K8s probes hit this, and the
+      # NetworkPolicy/Service expose only this port for health (no telemetry).
+      health_check:
+        endpoint: 0.0.0.0:13133
+
+    service:
+      extensions: [health_check]
+      pipelines:
+        traces:
+          receivers: [otlp]
+          exporters: [debug]
+        metrics:
+          receivers: [otlp]
+          exporters: [debug]

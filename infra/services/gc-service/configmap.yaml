@@ -16,3 +16,10 @@ data:
   # AC service discovery via Kubernetes DNS
   AC_JWKS_URL: "http://ac-service.dark-tower:8082/.well-known/jwks.json"
   AC_INTERNAL_URL: "http://ac-service.dark-tower:8082"
+  # In-cluster OTel collector endpoint for the /api/v1/telemetry proxy (R-2/R-59).
+  # BARE BASE (scheme + host + port, NO /v1/... path): the telemetry forwarder
+  # appends /v1/metrics or /v1/traces itself (telemetry_forwarder.rs:3-5,33-37).
+  # A value WITH /v1/... would double-append (/v1/metrics/v1/metrics) → 404.
+  # Overrides the compiled-in DEFAULT_OTEL_COLLECTOR_ENDPOINT (config.rs:34-35),
+  # whose wrong `default` namespace is tracked for fix in docs/TODO.md (R-55/GC).
+  OTEL_COLLECTOR_ENDPOINT: "http://otel-collector.dark-tower:4318"

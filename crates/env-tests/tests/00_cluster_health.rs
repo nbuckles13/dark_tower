@@ -152,3 +152,53 @@ async fn test_secrets_not_in_logs() {
         bearer_count
     );
 }
+
+/// The dev OTel collector (R-59) must be Ready. This asserts the cluster-setup
+/// readiness gate is correct: the `app=otel-collector` selector here MUST match
+/// (1) the Deployment pod-template label and (2) the `kubectl wait` selector in
+/// `deploy_otel_collector()` (infra/kind/scripts/setup.sh). The three-way match
+/// is the invariant — if any one is typo'd/renamed, this test fails rather than
+/// the gate silently passing on zero pods and the breakage surfacing later as
+/// CrashLooping services once R-55 makes the four services depend on the
+/// collector.
+///
+/// `kubectl wait` on a selector matching ZERO pods returns "no matching
+/// resources found" immediately (regardless of `--timeout`), so a stale/typo'd
+/// selector is still caught here, not vacuously passed. The `--timeout=10s` only
+/// governs how long an EXISTING matched pod is given to reach Ready — a small
+/// tolerance matching this suite's other health checks (cluster.rs uses 5-10s
+/// probe timeouts), so a brief readiness blip when smoke tests start doesn't
+/// false-fail even though setup.sh has already Ready-gated the collector.
+///
+/// Namespace is `dark-tower` (where the collector actually runs) — NOT `default`.
+#[tokio::test]
+async fn test_otel_collector_ready() {
+    let output = Command::new("kubectl")
+        .args([
+            "wait",
+            "--for=condition=Ready",
+            "pod",
+            "-l",
+            "app=otel-collector",
+            "-n",
+            "dark-tower",
+            "--timeout=10s",
+        ])
+        .output();
+
+    let output = output.unwrap_or_else(|e| {
+        panic!(
+            "kubectl not available - cannot verify OTel collector readiness. \
+             env-tests require kubectl to be installed and configured: {}",
+            e
+        )
+    });
+
+    assert!(
+        output.status.success(),
+        "OTel collector pod (-l app=otel-collector -n dark-tower) is not Ready - \
+         the deploy_otel_collector readiness gate may be misconfigured (selector/namespace \
+         mismatch) or the collector failed to start: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

@@ -66,6 +66,13 @@ spec:
             configMapKeyRef:
               name: gc-service-config
               key: AC_INTERNAL_URL
+        # In-cluster OTel collector base for the /api/v1/telemetry proxy (R-2/R-59).
+        # The forwarder appends /v1/metrics or /v1/traces (telemetry_forwarder.rs).
+        - name: OTEL_COLLECTOR_ENDPOINT
+          valueFrom:
+            configMapKeyRef:
+              name: gc-service-config
+              key: OTEL_COLLECTOR_ENDPOINT
         - name: DATABASE_URL
           valueFrom:
             secretKeyRef:

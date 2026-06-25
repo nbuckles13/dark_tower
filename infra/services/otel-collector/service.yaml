@@ -1,0 +1,27 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: otel-collector
+  namespace: dark-tower
+  labels:
+    app: otel-collector
+    component: observability
+spec:
+  type: ClusterIP
+  selector:
+    app: otel-collector
+    component: observability
+  ports:
+  - name: otlp-grpc
+    protocol: TCP
+    port: 4317
+    targetPort: 4317
+  - name: otlp-http
+    protocol: TCP
+    port: 4318
+    targetPort: 4318
+  - name: health
+    protocol: TCP
+    port: 13133
+    targetPort: 13133
+  sessionAffinity: None
