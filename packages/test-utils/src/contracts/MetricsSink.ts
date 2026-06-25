@@ -1,26 +1,37 @@
 // File: packages/test-utils/src/contracts/MetricsSink.ts
 //
-// MetricsSink contract — co-owned with the observability specialist per
-// user-story §Design line 256 (named convention author per ADR-0024 §6.5
-// Pattern B). When sdk-core (task #12, R-24) lands, it will declare its
-// canonical version in `packages/sdk-core/src/telemetry/MetricsSink.ts`.
-// All four sinks (`OtelMetricsSink`, `InMemoryMetricsSink`, `ConsoleMetricsSink`,
-// `NoopMetricsSink`) MUST conform to the same shape. The canonical-home
-// decision is tracked in docs/TODO.md as a Gate 3 follow-up.
+// PATTERN A parallel structural copy of the `MetricsSink` + `MetricLabels`
+// contract whose CANONICAL home is
+// `packages/sdk-core/src/telemetry/MetricsSink.ts` (task #12, R-24;
+// observability is the named convention author per ADR-0024 §6.5 Pattern B).
+//
+// WHY A COPY AND NOT A RE-EXPORT: a `export type ... from '@darktower/sdk-core'`
+// re-export adds a test-utils → sdk-core package edge. Because sdk-core already
+// devDepends test-utils (test doubles), that edge makes the Nx build task graph
+// CIRCULAR (`sdk-core:build → test-utils:build → sdk-core:build`), which Nx
+// rejects outright. So the contract is duplicated here as a parallel structural
+// declaration (the same Pattern A the repo uses for `IWebTransport`).
+//
+// ANTI-DRIFT: a compile-time conformance test in sdk-core
+// (`src/telemetry/__tests__/contractParity.test.ts`) asserts the two `MetricsSink`
+// interfaces (and the two `MetricLabels` types) are mutually assignable, so a
+// SHAPE change to one copy without the other fails `tsc`. KEEP THE INTERFACE +
+// TYPE SIGNATURES SHAPE-IDENTICAL to the canonical sdk-core declaration; the
+// `contractParity.test.ts` mutual-assignability check is the enforcement. NOTE:
+// it enforces SHAPE, not bytes — the doc-comments here are intentionally trimmed
+// vs the canonical copy and may differ; a comment-only edit is NOT machine-caught.
+//
+// The `dt_client_*` naming guard does NOT live in this interface — it is a
+// boundary concern of the production sinks. Passive test recorders
+// (`InMemoryMetricsSink`) accept any name so they can exercise guard-wrapping
+// behavior on non-compliant names.
 
 /**
  * String-typed labels at the boundary (mirrors the Rust
- * `metrics::{counter,histogram,gauge}!` macro shape). Cardinality
- * discipline (ADR-0011: ≤10 unique values per key, ≤64 char value length,
- * ≤1000 unique combos per metric) is the **caller's** responsibility — the
- * sink does not pre-mangle/normalize labels.
- *
- * Wire reality: labels are always strings on the OTLP / Prometheus wire.
- * Production sinks (`OtelMetricsSink`, etc.) accept this same string shape
- * and pass through to the OTel Meter. If a future ergonomic wrapper
- * accepts numeric label values, that wrapper MUST stringify before
- * reaching this interface, and the stringified values still count toward
- * the ADR-0011 cardinality budget.
+ * `metrics::{counter,histogram,gauge}!` macro shape). Cardinality discipline
+ * (ADR-0011: ≤10 unique values per key, ≤64 char value length, ≤1000 unique
+ * combos per metric) is the **caller's** responsibility — the sink does not
+ * pre-mangle/normalize labels.
  */
 export type MetricLabels = Readonly<Record<string, string>>;
 
@@ -33,10 +44,6 @@ export type MetricLabels = Readonly<Record<string, string>>;
  *   - `labels` is required (pass `{}` for no labels).
  *   - `value` is optional for `counter` (defaults to 1).
  *   - `value` is required for `histogram` and `gauge`.
- *
- * The R-24 `dt_client_*` naming guard does NOT live in this interface.
- * Production sinks enforce it; passive test recorders accept any name so
- * tests can verify guard-wrapping behavior on non-compliant names.
  */
 export interface MetricsSink {
   /**

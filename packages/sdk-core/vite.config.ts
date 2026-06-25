@@ -1,6 +1,13 @@
 import { defineConfig } from 'vite';
 import dts from 'vite-plugin-dts';
 import { resolve } from 'node:path';
+import { createRequire } from 'node:module';
+
+// Build-time SDK version (task #12, R-24/R-26): read from package.json so the
+// OTel resource `service.version` + the `client_version` log/metric field track
+// the published version with no hand-maintained duplicate.
+const pkgVersion: string = (createRequire(import.meta.url)('./package.json') as { version: string })
+  .version;
 
 // R-14: `__DEV_TRUST_FINGERPRINT__` is a build-time literal. In production
 // builds it is substituted with `false`, so the dev-only
@@ -12,6 +19,7 @@ import { resolve } from 'node:path';
 export default defineConfig(({ mode }) => ({
   define: {
     __DEV_TRUST_FINGERPRINT__: JSON.stringify(mode !== 'production'),
+    __SDK_VERSION__: JSON.stringify(pkgVersion),
   },
   build: {
     lib: {
@@ -25,7 +33,15 @@ export default defineConfig(({ mode }) => ({
       },
     },
     rollupOptions: {
-      external: [],
+      // Task #12 (Gate-1, approved): the `@opentelemetry/*` packages are
+      // EXTERNALIZED, not bundled. The browser SDK ships bare
+      // `import '@opentelemetry/...'` and the bundling consumer (web-app)
+      // resolves them as runtime deps. This (a) keeps sdk-core's `dist` small,
+      // (b) guarantees ZERO OTel transitive string literals land in `dist`, so
+      // the R-14 dist-wide forbidden-token scan in `tests/bundle-content.test.ts`
+      // is unaffected, and (c) lets the unit tier mock OTel via the
+      // constructor-injected `Meter` rather than running the real SDK.
+      external: [/^@opentelemetry\//],
       output: {
         // R-14: do NOT embed original source text in production sourcemaps.
         // The dev-trust runtime object key + source comments would otherwise

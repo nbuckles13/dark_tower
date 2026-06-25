@@ -26,9 +26,7 @@ export function resolveAcOrigin(template: string, subdomain: string): string {
   validateSubdomain(subdomain);
   if (!template.includes(SUBDOMAIN_PLACEHOLDER)) {
     // Misconfiguration, not user input — surface clearly.
-    throw new Error(
-      `AC origin template must contain the ${SUBDOMAIN_PLACEHOLDER} placeholder`,
-    );
+    throw new Error(`AC origin template must contain the ${SUBDOMAIN_PLACEHOLDER} placeholder`);
   }
   return template.split(SUBDOMAIN_PLACEHOLDER).join(subdomain);
 }

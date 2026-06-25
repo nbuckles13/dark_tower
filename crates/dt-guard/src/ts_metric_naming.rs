@@ -1,14 +1,19 @@
 //! `ts-name-guard-dt-client` subcommand — port of
 //! `scripts/guards/simple/ts/name-guard-dt-client.sh`.
 //!
-//! R-26 client metric-name convention (per @observability):
+//! R-26 client metric-name convention (per @observability) — the COMPILED,
+//! authoritative form (see `R26_NAME_RE` below):
 //! ```text
-//! ^dt_client_[a-z][a-z0-9_]{0,53}$
+//! ^dt_client_[a-z]([a-z0-9_]{0,52}[a-z0-9])?$
 //! ```
 //! Literal prefix `dt_client_`; lowercase-letter start (no leading digit/
-//! underscore); snake_case body; max total length 64 (Prometheus/OTel
-//! default; per @observability S4 this is a HARD FAIL — the `{0,53}` regex
-//! itself encodes the cap, matching `metric_labels.rs:MAX_LITERAL_VALUE_LENGTH`).
+//! underscore); snake_case body; NO trailing underscore; max total length 64
+//! (Prometheus/OTel default; per @observability S4 this is a HARD FAIL — the
+//! regex itself encodes the cap, matching
+//! `metric_labels.rs:MAX_LITERAL_VALUE_LENGTH`). NOTE: an older `{0,53}`
+//! shorthand appears in some docs; it is NOT equivalent — `{0,53}` would accept
+//! a trailing underscore (`dt_client_foo_`), which the compiled form REJECTS
+//! (see `r26_rejects_trailing_underscore`). The compiled form is authoritative.
 //!
 //! Scope: **POSITIVE include-list** — `packages/(sdk-core|web-app)/src/**`.
 //! Other packages are out-of-scope by definition (not by exemption). Per
@@ -57,8 +62,14 @@ static METER_OPENER_RE: Lazy<Regex> = Lazy::new(|| {
     .expect("static pattern compiles")
 });
 
-/// R-26 metric-name regex. Per @observability S4: `{0,53}` upper bound is a
-/// HARD FAIL — encodes the 64-char cap (10 + 53 + 1 = 64).
+/// R-26 metric-name regex (the COMPILED, authoritative form). Per @observability
+/// S4 the length cap is a HARD FAIL the regex itself encodes: the `dt_client_`
+/// prefix (10 chars) plus a `[a-z]` head, up to a `{0,52}` body, and a non-`_`
+/// `[a-z0-9]` tail caps the total at 64 chars, and the required non-underscore
+/// tail FORBIDS a trailing `_`. (An older `{0,53}` shorthand in some docs is NOT
+/// equivalent: it would accept a trailing underscore, which this compiled form
+/// rejects. See `r26_rejects_trailing_underscore` and the cross-language lock
+/// `r26_pattern_is_locked_to_the_sdk_runtime_guard`.)
 #[expect(
     clippy::disallowed_methods,
     clippy::expect_used,
@@ -67,6 +78,74 @@ static METER_OPENER_RE: Lazy<Regex> = Lazy::new(|| {
 static R26_NAME_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"^dt_client_[a-z]([a-z0-9_]{0,52}[a-z0-9])?$").expect("static pattern compiles")
 });
+
+// ---------------------------------------------------------------------------
+// `// dt-metric-name-dynamic:` escape hatch (task #12, R-24).
+//
+// ISOLATED ADDITION: the canonical generic `MetricsSink`
+// (`packages/sdk-core/src/telemetry/OtelMetricsSink.ts`) forwards a VARIABLE
+// metric name to `meter.createX(name)` because it is the one legitimate
+// dynamic caller — and it validates the name at runtime via
+// `assertClientMetricName(name, mode)` (the SAME `dt_client_*` regex this guard
+// enforces statically) on the line above each call. Without an escape hatch the
+// byte-walker reports that variable as a `None` (non-literal) name and hard-
+// fails. This marker lets that ONE runtime-validated case opt out.
+//
+// SAFETY INVARIANT (load-bearing): the marker rescues ONLY the dynamic /
+// non-literal case. A LITERAL name that fails `R26_NAME_RE` (e.g.
+// `createCounter("mc_join_total")`) STILL hard-fails even with the marker
+// present — so the guard's real job (catch bad literals at call sites) is
+// untouched. See `scan_file` + tests.
+//
+// Reuses the shared reason-quality bar (`crate::ignore::is_lazy_reason`,
+// ≥10 chars + not test/tmp/todo/fixme/wip) — NOT a forked bar — and the
+// `pii-safe` "on or above the call's opener line" placement convention, so
+// there is one mental model across escape hatches. This block is deliberately
+// self-contained so the guard-mechanism change can be spun out to an
+// infra-owned follow-up if Gate-3 asks, leaving the annotated sink lines.
+#[expect(
+    clippy::disallowed_methods,
+    clippy::expect_used,
+    reason = "module-local canonical-home static-regex initializer; pattern compiles at load-time or binary fails — ADR-0034 §6 + ADR-0002 §expect-over-allow"
+)]
+static DYNAMIC_NAME_MARKER_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"//\s*dt-metric-name-dynamic\s*:\s*(.+?)\s*$").expect("static pattern compiles")
+});
+
+/// Parse `// dt-metric-name-dynamic: <reason>` markers from `src`. Returns the
+/// 1-based line numbers carrying a marker with a NON-lazy reason (lazy reasons
+/// are ignored, so they do not grant an exemption — mirrors the `pii-safe`
+/// marker's reason-quality gate). A bare or too-vague marker grants nothing.
+fn load_dynamic_name_marker_lines(src: &str) -> std::collections::HashSet<usize> {
+    let mut lines = std::collections::HashSet::new();
+    for (idx, line) in src.lines().enumerate() {
+        let Some(caps) = DYNAMIC_NAME_MARKER_RE.captures(line) else {
+            continue;
+        };
+        let Some(reason) = caps.get(1) else {
+            continue;
+        };
+        // Reuse the shared bar — a lazy/short reason does NOT grant exemption.
+        if crate::ignore::is_lazy_reason(reason.as_str().trim()) {
+            continue;
+        }
+        lines.insert(idx + 1);
+    }
+    lines
+}
+
+/// True if the dynamic-name call whose opener is on `start_lineno` carries a
+/// valid marker ON that line or the line directly ABOVE (the `pii-safe`
+/// "on or above" convention).
+fn dynamic_name_exempt(
+    marker_lines: &std::collections::HashSet<usize>,
+    start_lineno: usize,
+) -> bool {
+    if marker_lines.contains(&start_lineno) {
+        return true;
+    }
+    start_lineno > 1 && marker_lines.contains(&(start_lineno - 1))
+}
 
 fn is_in_scope(path: &Path) -> bool {
     let Some(s) = path.to_str() else {
@@ -217,22 +296,40 @@ fn count_newlines_until(src: &str, pos: usize) -> usize {
         .count()
 }
 
+/// Pure per-call violation decision (filesystem-free, so it is directly
+/// unit-testable). Returns `Some(surfaced_name)` if the call is a violation, or
+/// `None` if it is compliant OR a marker-exempted dynamic name.
+///
+/// SAFETY INVARIANT (load-bearing — see the marker block above): the
+/// `// dt-metric-name-dynamic:` exemption applies ONLY when the call's name is
+/// non-literal (`call.name == None`). A LITERAL name that fails `R26_NAME_RE`
+/// is reported as a violation even with a valid marker present.
+fn call_violation(
+    call: &MeterCall,
+    marker_lines: &std::collections::HashSet<usize>,
+) -> Option<String> {
+    let name_for_check = call.name.as_deref().unwrap_or("");
+    if R26_NAME_RE.is_match(name_for_check) {
+        return None; // compliant literal
+    }
+    if call.name.is_none() && dynamic_name_exempt(marker_lines, call.start_line) {
+        return None; // runtime-validated dynamic name, opted out via marker
+    }
+    Some(match &call.name {
+        Some(n) => n.clone(),
+        None => "<non-literal or interpolated metric name>".to_string(),
+    })
+}
+
 fn scan_file(repo_root: &Path, path: &Path) -> Result<Vec<Hit>> {
     let abs = repo_root.join(path);
     let content =
         std::fs::read_to_string(&abs).with_context(|| format!("reading {}", abs.display()))?;
     let mut hits: Vec<Hit> = Vec::new();
+    let marker_lines = load_dynamic_name_marker_lines(&content);
 
     for call in find_meter_calls(&content) {
-        let name_for_check = call.name.as_deref().unwrap_or("");
-        if !R26_NAME_RE.is_match(name_for_check) {
-            // For interpolated/non-static names, surface a marker token so the
-            // operator sees WHY R-26 rejected the call (rather than a bare
-            // empty-string violation).
-            let surfaced_name = match &call.name {
-                Some(n) => n.clone(),
-                None => "<non-literal or interpolated metric name>".to_string(),
-            };
+        if let Some(surfaced_name) = call_violation(&call, &marker_lines) {
             hits.push(Hit {
                 file: path.to_path_buf(),
                 line: call.start_line,
@@ -299,9 +396,15 @@ pub fn run(repo_root: &Path, explain: bool) -> Result<()> {
                 src_line: line!(),
             });
         } else {
+            // Reference `R26_NAME_RE.as_str()` directly so the operator-facing
+            // message can NEVER drift from the compiled rule (was a hardcoded
+            // `{0,53}` form that diverged from the authoritative `{0,52}…[a-z0-9]`).
             println!(
-                "VIOLATION: {}:{} metric name {:?} does not match ^dt_client_[a-z][a-z0-9_]{{0,53}}$",
-                file_disp, hit.line, hit.name
+                "VIOLATION: {}:{} metric name {:?} does not match {}",
+                file_disp,
+                hit.line,
+                hit.name,
+                R26_NAME_RE.as_str()
             );
         }
     }
@@ -358,6 +461,26 @@ mod tests {
     #[test]
     fn r26_rejects_uppercase() {
         assert!(!R26_NAME_RE.is_match("dt_client_BadName"));
+    }
+
+    #[test]
+    fn r26_pattern_is_locked_to_the_sdk_runtime_guard() {
+        // CROSS-LANGUAGE LOCKSTEP (task #12, observability F2): the SDK's runtime
+        // `nameGuard` (packages/sdk-core/src/telemetry/nameGuard.ts) pins THIS
+        // exact pattern string, and `nameGuard.test.ts` asserts the SDK side
+        // equals this literal. Asserting the Rust `R26_NAME_RE` source equals the
+        // SAME literal here closes the loop: a Rust-side edit to the regex now
+        // trips a RUST test (previously only the SDK-vs-its-own-literal was
+        // checked, so a Rust-only edit could silently reopen the drift). If this
+        // pattern legitimately changes, update BOTH this literal AND
+        // nameGuard.ts's `DT_CLIENT_NAME_RE` + its test in the same commit.
+        const SDK_PINNED_PATTERN: &str = r"^dt_client_[a-z]([a-z0-9_]{0,52}[a-z0-9])?$";
+        assert_eq!(
+            R26_NAME_RE.as_str(),
+            SDK_PINNED_PATTERN,
+            "Rust R26_NAME_RE drifted from the SDK nameGuard's pinned pattern; \
+             update both sides + nameGuard.test.ts in the same commit"
+        );
     }
 
     #[test]
@@ -569,5 +692,96 @@ meter.createGauge(\"dt_client_c\");";
         assert!(!is_in_scope(Path::new(
             "packages/sdk-core/src/__tests__/foo.ts"
         )));
+    }
+
+    // --- `// dt-metric-name-dynamic:` escape hatch (task #12, R-24) ---
+    //
+    // The decision is exercised through the pure `call_violation` so these are
+    // filesystem-free. `marker_lines` is computed from the same source the
+    // calls come from, matching `scan_file`.
+
+    const VALID_REASON: &str =
+        "// dt-metric-name-dynamic: runtime-validated by assertClientMetricName on the line above";
+
+    fn violations(src: &str) -> Vec<String> {
+        let marker_lines = load_dynamic_name_marker_lines(src);
+        find_meter_calls(src)
+            .iter()
+            .filter_map(|c| call_violation(c, &marker_lines))
+            .collect()
+    }
+
+    #[test]
+    fn dynamic_name_with_valid_marker_is_exempt() {
+        // (a) dynamic name + valid annotation on the call's opener line → clean.
+        let src = format!("const c = meter.createCounter(name); {VALID_REASON}");
+        assert!(violations(&src).is_empty());
+    }
+
+    #[test]
+    fn dynamic_name_with_marker_on_line_above_is_exempt() {
+        // "on or above" convention: marker on the preceding line also exempts.
+        let src = format!("{VALID_REASON}\nconst c = meter.createCounter(name);");
+        assert!(violations(&src).is_empty());
+    }
+
+    #[test]
+    fn dynamic_name_without_marker_still_hard_fails() {
+        // (b) dynamic name + NO annotation → still a violation.
+        let src = "const c = meter.createCounter(name);";
+        let v = violations(src);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0], "<non-literal or interpolated metric name>");
+    }
+
+    #[test]
+    fn bad_literal_with_marker_present_still_hard_fails() {
+        // (c) THE load-bearing invariant: a marker NEVER rescues a bad LITERAL.
+        // The exemption is dynamic-name-only.
+        let src = format!(r#"const c = meter.createCounter("mc_join_total"); {VALID_REASON}"#);
+        let v = violations(&src);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0], "mc_join_total");
+    }
+
+    #[test]
+    fn interpolated_literal_with_marker_present_still_hard_fails() {
+        // Interpolated template literals are non-static names. They DO get the
+        // dynamic exemption when marked (same `None`-name class as a variable).
+        // Without a marker they hard-fail; this asserts the marker path for the
+        // interpolated shape mirrors the variable shape.
+        let unmarked = r#"const c = meter.createCounter(`dt_client_${suffix}`);"#;
+        assert_eq!(violations(unmarked).len(), 1);
+        let marked =
+            format!(r#"const c = meter.createCounter(`dt_client_${{suffix}}`); {VALID_REASON}"#);
+        assert!(violations(&marked).is_empty());
+    }
+
+    #[test]
+    fn dynamic_name_with_lazy_reason_marker_still_fails() {
+        // (d) a lazy/short reason does NOT grant the exemption (reuses the
+        // shared `is_lazy_reason` bar — ≥10 chars, not test/tmp/todo/fixme/wip).
+        let src = "const c = meter.createCounter(name); // dt-metric-name-dynamic: wip";
+        let v = violations(src);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0], "<non-literal or interpolated metric name>");
+    }
+
+    #[test]
+    fn marker_does_not_leak_to_an_unrelated_distant_call() {
+        // A marked dynamic call, then a blank line, then an UNMARKED dynamic
+        // call: the blank line means the second call's "on or above" window
+        // (its own line + the line directly above = blank) does NOT see the
+        // marker, so only the first is exempt. (The "on or above" window is
+        // deliberately one line, matching the `pii-safe` convention — a marker
+        // does not reach a call two lines down.)
+        let src = format!(
+            "const a = meter.createCounter(name); {VALID_REASON}\n\
+             \n\
+             const b = meter.createHistogram(other);"
+        );
+        let v = violations(&src);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0], "<non-literal or interpolated metric name>");
     }
 }

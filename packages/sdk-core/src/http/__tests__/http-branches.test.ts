@@ -24,9 +24,7 @@ describe('safeFetch: fetch rejection -> NetworkError(FETCH_FAILED)', () => {
     const rejectingFetch: FetchLike = () => Promise.reject(new Error('SECRET-dns-detail'));
     const client = new MeetingApiClient({ gcBaseUrl: GC_BASE, fetchImpl: rejectingFetch });
 
-    const err = await client
-      .joinMeeting(VALID_CODE, { userToken: 'tok' })
-      .catch((e: unknown) => e);
+    const err = await client.joinMeeting(VALID_CODE, { userToken: 'tok' }).catch((e: unknown) => e);
 
     expect(err).toBeInstanceOf(NetworkError);
     expect((err as NetworkError).reason).toBe(NetworkErrorReason.FetchFailed);
@@ -71,9 +69,7 @@ describe('handleResponse: malformed / empty success bodies', () => {
       gcBaseUrl: GC_BASE,
       fetchImpl: () => Promise.resolve(new Response('<<garbage>>', { status: 404 })),
     });
-    const err = await client
-      .joinMeeting(VALID_CODE, { userToken: 'tok' })
-      .catch((e: unknown) => e);
+    const err = await client.joinMeeting(VALID_CODE, { userToken: 'tok' }).catch((e: unknown) => e);
     // 404 -> MeetingNotFoundError even though the body wasn't parseable.
     expect((err as { status?: number }).status).toBe(404);
     expect((err as { name: string }).name).toBe('MeetingNotFoundError');

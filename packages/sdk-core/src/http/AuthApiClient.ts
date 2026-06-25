@@ -10,11 +10,7 @@
 // logs them, stores them, or places them on an error.
 
 import { AuthError } from '../errors/AuthError.js';
-import {
-  validateDisplayName,
-  validateEmail,
-  validatePassword,
-} from '../validation/limits.js';
+import { validateDisplayName, validateEmail, validatePassword } from '../validation/limits.js';
 import { resolveAcOrigin } from './origin.js';
 import { handleResponse, safeFetch } from './parse.js';
 import type {

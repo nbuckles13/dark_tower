@@ -9,11 +9,7 @@
 //     branches and are required for the >=90% target.
 
 import { describe, expect, it } from 'vitest';
-import {
-  AuthBadRequestError,
-  AuthConflictError,
-  AuthError,
-} from '../AuthError.js';
+import { AuthBadRequestError, AuthConflictError, AuthError } from '../AuthError.js';
 import { MeetingNotFoundError } from '../MeetingError.js';
 import { NetworkError, NetworkErrorReason } from '../NetworkError.js';
 

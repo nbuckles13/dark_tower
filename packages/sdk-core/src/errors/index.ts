@@ -5,11 +5,7 @@
 // convenience surface for `src/http/` and tests. Public re-exports are curated in
 // `src/index.ts`.
 
-export {
-  SdkError,
-  SdkErrorCode,
-  readServerErrorEnvelope,
-} from './SdkError.js';
+export { SdkError, SdkErrorCode, readServerErrorEnvelope } from './SdkError.js';
 export type { RedactedSdkError, SdkErrorOptions, ServerErrorEnvelope } from './SdkError.js';
 
 export {

@@ -11,6 +11,10 @@ export default defineConfig({
     // Unit tests exercise the dev branch; mirror the non-prod Vite define so
     // `__DEV_TRUST_FINGERPRINT__` resolves under Vitest's transform.
     __DEV_TRUST_FINGERPRINT__: JSON.stringify(true),
+    // Mirror the build-time SDK version literal (task #12) so `telemetryConfig`
+    // / `logger` resolve `__SDK_VERSION__` under Vitest. A fixed test value
+    // keeps assertions stable across version bumps.
+    __SDK_VERSION__: JSON.stringify('0.0.0-test'),
   },
   resolve: {
     alias: {

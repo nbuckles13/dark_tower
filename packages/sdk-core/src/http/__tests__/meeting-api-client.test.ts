@@ -95,9 +95,9 @@ describe('MeetingApiClient.joinMeeting', () => {
   });
 
   it('rejects a malformed meeting code before any network call (R-31)', async () => {
-    await expect(
-      client().joinMeeting('short', { userToken: 't' }),
-    ).rejects.toBeInstanceOf(ValidationError);
+    await expect(client().joinMeeting('short', { userToken: 't' })).rejects.toBeInstanceOf(
+      ValidationError,
+    );
   });
 });
 

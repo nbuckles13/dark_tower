@@ -6,16 +6,8 @@
 // the tolerant `readServerErrorEnvelope` paths, and the no-cause NetworkError).
 
 import { describe, expect, it } from 'vitest';
-import {
-  AuthError,
-  AuthBadRequestError,
-  AuthForbiddenError,
-} from '../AuthError.js';
-import {
-  MeetingError,
-  MeetingBadRequestError,
-  MeetingConflictError,
-} from '../MeetingError.js';
+import { AuthError, AuthBadRequestError, AuthForbiddenError } from '../AuthError.js';
+import { MeetingError, MeetingBadRequestError, MeetingConflictError } from '../MeetingError.js';
 import { NetworkError, NetworkErrorReason } from '../NetworkError.js';
 import { ValidationError } from '../ValidationError.js';
 import { readServerErrorEnvelope } from '../SdkError.js';

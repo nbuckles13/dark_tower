@@ -6,8 +6,12 @@
 // wire framing (R-16). The full SignalingClient (proto encode/decode, join
 // flow) is a later task and intentionally absent here.
 //
-// No metric / trace / log emissions originate from this package yet
-// (observability sinks land in task #12).
+// Telemetry SCAFFOLDING (task #12, R-19/R-24/R-25/R-26) lands here: the
+// `MetricsSink` contract + sinks, the `dt_client_*` name guard, the single
+// global `configureTelemetry`, the W3C trace-injection helper, and the
+// bounded-event join logger. The actual emission sites (metric increments,
+// `dt_client.join` span creation, wire-level trace injection) land in LATER
+// tasks (#13+) — task #12 only provides the surfaces those tasks consume.
 
 export {
   encodeFrame,
@@ -76,3 +80,31 @@ export {
 export { NetworkError, NetworkErrorReason } from './errors/NetworkError.js';
 
 export { ValidationError } from './errors/ValidationError.js';
+
+// --- Telemetry scaffolding (R-19, R-24, R-25, R-26) ---
+
+export type { MetricLabels, MetricsSink } from './telemetry/MetricsSink.js';
+
+export { assertClientMetricName } from './telemetry/nameGuard.js';
+export type { GuardMode } from './telemetry/nameGuard.js';
+
+export { NoopMetricsSink } from './telemetry/NoopMetricsSink.js';
+export { ConsoleMetricsSink } from './telemetry/ConsoleMetricsSink.js';
+export { OtelMetricsSink } from './telemetry/OtelMetricsSink.js';
+
+export {
+  configureTelemetry,
+  getMeter,
+  getTracer,
+  getMetricsSink,
+  resetTelemetryForTest,
+} from './telemetry/telemetryConfig.js';
+export type { TelemetryConfig, TelemetryEnv } from './telemetry/telemetryConfig.js';
+
+export { injectIntoClientMessage } from './telemetry/tracePropagation.js';
+export type { TraceCarrier } from './telemetry/tracePropagation.js';
+
+export { JoinEvent, logJoinEvent } from './telemetry/logger.js';
+export type { JoinLogRecord } from './telemetry/logger.js';
+
+export { CloseReason, normalizeCloseReason } from './telemetry/closeReason.js';

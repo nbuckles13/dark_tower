@@ -76,7 +76,12 @@ describe('AuthApiClient.register', () => {
     );
 
     const err = await client()
-      .register({ subdomain: 'demo', email: 'a@b.co', password: 'pw-long-enough', displayName: 'A' })
+      .register({
+        subdomain: 'demo',
+        email: 'a@b.co',
+        password: 'pw-long-enough',
+        displayName: 'A',
+      })
       .catch((e: unknown) => e);
 
     expect(err).toBeInstanceOf(AuthRateLimitError);

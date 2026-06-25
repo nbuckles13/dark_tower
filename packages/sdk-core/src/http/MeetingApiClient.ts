@@ -53,10 +53,7 @@ export class MeetingApiClient {
    * @throws {MeetingError} on a mapped GC failure (401/403/404/...); the meeting code
    *   is validated client-side first ({@link ValidationError} on a bad code).
    */
-  async joinMeeting(
-    code: string,
-    credentials: UserTokenCredentials,
-  ): Promise<JoinMeetingResponse> {
+  async joinMeeting(code: string, credentials: UserTokenCredentials): Promise<JoinMeetingResponse> {
     validateMeetingCode(code);
     const url = `${this.#gcBaseUrl}${MEETINGS_PATH}/${encodeURIComponent(code)}`;
     const response = await safeFetch(this.#fetchImpl, url, {
