@@ -50,6 +50,7 @@ Use `/user-story` when:
 - `global-controller` — HTTP/3 API, meeting management, geographic routing
 - `meeting-controller` — WebTransport signaling, sessions
 - `media-handler` — Media routing, quality adaptation
+- `client` — Browser SDK, Svelte web app, media pipeline (peer to backend services in driving system behavior; uses the same planning protocol)
 
 **Domain specialists**:
 - `database` — Schema, migrations, query patterns
@@ -81,7 +82,7 @@ Create `docs/user-stories/YYYY-MM-DD-{story-slug}.md` using the template from `d
 
 ### Step 3: Spawn Planning Team
 
-Spawn all 11 specialists as teammates using `subagent_type` (identity auto-loaded from `.claude/agents/{name}.md`). Each specialist uses their own name for both `name` and `subagent_type`. The Lead is automatically named `team-lead`.
+Spawn all 12 specialists as teammates using `subagent_type` (identity auto-loaded from `.claude/agents/{name}.md`). Each specialist uses their own name for both `name` and `subagent_type`. The Lead is automatically named `team-lead`.
 
 **INDEX injection**: Before spawning each specialist, read `docs/specialist-knowledge/{name}/INDEX.md` and include its contents in the specialist's prompt under a `## Navigation` header. This gives each specialist a navigation map to relevant code and ADRs.
 
@@ -89,7 +90,7 @@ Spawn all 11 specialists as teammates using `subagent_type` (identity auto-loade
 
 | Specialist type | Protocol file |
 |---|---|
-| Service + domain (auth-controller, global-controller, meeting-controller, media-handler, database, protocol, infrastructure) | `planning-protocol.md` |
+| Service + domain (auth-controller, global-controller, meeting-controller, media-handler, client, database, protocol, infrastructure) | `planning-protocol.md` |
 | Security | `planning-protocol-security.md` |
 | Test | `planning-protocol-test.md` |
 | Cross-cutting (observability, operations) | `planning-protocol-cross-cutting.md` |
