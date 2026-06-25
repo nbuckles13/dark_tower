@@ -5,6 +5,13 @@ resources:
   - ../../../../../services/ac-service
   - nodeport.yaml
 
+# R-55: enable OTel in the Kind dev cluster (collector deployed by R-59 + the
+# AC->collector egress rule present in the base NetworkPolicy). The prod base
+# keeps OTEL_ENABLED="false"; this strategic-merge patch flips it to "true" for
+# dev so the AC OTel exemplar is validated end-to-end.
+patches:
+  - path: configmap-otel-patch.yaml
+
 labels:
   - pairs:
       environment: kind

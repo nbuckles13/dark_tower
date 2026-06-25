@@ -1278,11 +1278,14 @@ If a collector problem is blocking a service deploy that cannot wait for a
 separate window, disable per-service OTel init so the service can boot without the
 collector:
 
-- **Today (branch-accurate):** OTel-for-AC is presence-gated — remove/blank AC's
-  `OTLP_ENDPOINT` ConfigMap value and restart AC. There is no boolean flag this
-  story; enablement is by presence of the endpoint.
-- **Once R-55 lands:** the canonical break-glass is the `otel_enabled=false`
-  per-service no-op path (R-54's no-op guard) — set it and redeploy.
+- **AC (R-55 landed, task #25):** OTel init is gated by the explicit `OTEL_ENABLED` flag.
+  Break-glass = set `OTEL_ENABLED=false` in AC's ConfigMap (or drop the Kind overlay's
+  `OTEL_ENABLED=true` patch) and restart AC; it boots with the OTel layer off and no collector
+  dependency. Blanking `OTLP_ENDPOINT` is no longer the lever — presence-gating was replaced by
+  the boolean.
+- **GC / MC / MH:** these do not yet call `init_otel` (per-service R-55 is #26 / #6 / #27), so
+  there is no collector-coupled startup to break-glass for them today. Each adopts the same
+  `OTEL_ENABLED=false` no-op lever when its R-55 wiring lands.
 
 ### Escalation / ownership
 

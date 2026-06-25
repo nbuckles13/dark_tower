@@ -56,18 +56,23 @@
 //! ).await?;
 //!
 //! tracing_subscriber::registry()
+//!     // Compose `otel.layer` FIRST, directly onto the bare `registry()`.
+//!     // Its concrete type is `OpenTelemetryLayer<Registry, Tracer>`, i.e.
+//!     // `Layer<Registry>` only — so it must attach to a plain `Registry`,
+//!     // not to a `Layered<…>` produced by a prior `.with(...)`. Applied
+//!     // after another layer, the `S = Registry` bound fails to typecheck.
+//!     .with(otel.layer)
 //!     .with(tracing_subscriber::EnvFilter::try_from_default_env()
 //!         .unwrap_or_else(|_| "info".into()))
 //!     .with(tracing_subscriber::fmt::layer().json())
-//!     .with(otel.layer)
 //!     .init();
 //!
 //! // hold `otel.guard` in `main()` until shutdown.
 //! let _otel_guard = otel.guard;
 //! ```
 //!
-//! The caller MUST compose `otel.layer` into its own `Registry`; this helper
-//! never calls `.init()` on the subscriber.
+//! The caller MUST compose `otel.layer` into its own `Registry` (layer-first,
+//! per the note above); this helper never calls `.init()` on the subscriber.
 
 #![deny(
     clippy::unwrap_used,

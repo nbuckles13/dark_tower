@@ -69,14 +69,30 @@ spec:
             configMapKeyRef:
               name: ac-service-config
               key: AC_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS
-        # OTLP-gRPC endpoint for the in-cluster OTel collector (R-59). Read by
-        # AC's OTel init (config.rs:237, presence-gated). Inert on this branch
-        # (no main.rs calls init_otel yet — that wiring is R-55).
+        # OpenTelemetry (R-55). Wired into AC's main.rs via init_otel; gated by
+        # OTEL_ENABLED. This workload uses per-key configMapKeyRef (NOT envFrom),
+        # so every ConfigMap key must be referenced here or it is an orphan
+        # (validate-env-config dt-guard).
+        - name: OTEL_ENABLED
+          valueFrom:
+            configMapKeyRef:
+              name: ac-service-config
+              key: OTEL_ENABLED
         - name: OTLP_ENDPOINT
           valueFrom:
             configMapKeyRef:
               name: ac-service-config
               key: OTLP_ENDPOINT
+        - name: OTEL_SAMPLE_RATE
+          valueFrom:
+            configMapKeyRef:
+              name: ac-service-config
+              key: OTEL_SAMPLE_RATE
+        - name: DEPLOYMENT_ENVIRONMENT
+          valueFrom:
+            configMapKeyRef:
+              name: ac-service-config
+              key: DEPLOYMENT_ENVIRONMENT
         - name: RUST_LOG
           value: "info,ac_service=debug"
         resources:

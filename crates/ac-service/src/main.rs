@@ -22,9 +22,44 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize tracing with JSON structured logging
-    // JSON format enables robust parsing in Promtail without brittle regex
+    // Load configuration BEFORE the tracing subscriber: the R-55 OTel layer
+    // needs the endpoint/sample-rate from config, and the subscriber can only
+    // be `.init()`'d once. A config-load failure here propagates as a non-zero
+    // exit (Debug to stderr) — nothing is lost because no spans/logs have been
+    // emitted yet, and ConfigError carries no secret material.
+    let config = Config::from_env()?;
+
+    // R-55: initialize the OpenTelemetry SDK only when explicitly enabled
+    // (OTEL_ENABLED=true). `init_otel` is async, eagerly probes the collector,
+    // and fails hard at init on an unreachable/misconfigured endpoint
+    // (Clarification Q13) so the pod fails K8s readiness instead of silently
+    // dropping spans. When OTel is disabled, `otel_config()` returns `None`,
+    // `init_otel` is never called (no probe), and no OTel layer is composed.
+    let otel = match config.otel_config() {
+        Some(otel_cfg) => Some(
+            common::observability::otel::init_otel(
+                "auth-controller",
+                env!("CARGO_PKG_VERSION"),
+                &config.environment,
+                otel_cfg,
+            )
+            .await?,
+        ),
+        None => None,
+    };
+    // Split into the composable layer and the RAII guard. `_otel_guard` is held
+    // to the end of `main` so pending spans flush on shutdown via Drop; it is a
+    // NAMED binding (not bare `_`) so it is not dropped immediately.
+    let (otel_layer, _otel_guard) = match otel {
+        Some(init) => (Some(init.layer), Some(init.guard)),
+        None => (None, None),
+    };
+
+    // Initialize tracing with JSON structured logging. The OTel layer (if any)
+    // composes onto the bare registry first; the default-off path adds zero
+    // layers. JSON format enables robust parsing in Promtail without brittle regex.
     tracing_subscriber::registry()
+        .with(otel_layer)
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "ac_service=debug,tower_http=debug".into()),
@@ -41,12 +76,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         e
     })?;
     info!("Prometheus metrics recorder initialized");
-
-    // Load configuration
-    let config = Config::from_env().map_err(|e| {
-        error!("Failed to load configuration: {}", e);
-        e
-    })?;
 
     // Log whether clock skew was explicitly configured or using default
     let is_default_clock_skew =

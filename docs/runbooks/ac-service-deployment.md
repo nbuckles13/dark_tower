@@ -468,13 +468,18 @@ psql $DATABASE_URL
 | `DATABASE_URL` | **Yes** | PostgreSQL connection string with TLS | None | `postgresql://ac_user:password@postgres.dark-tower.svc.cluster.local:5432/dark_tower?sslmode=verify-full` |
 | `AC_MASTER_KEY` | **Yes** | Base64-encoded 32-byte AES-256-GCM master key for signing key encryption | None | `base64(random_32_bytes)` |
 | `BIND_ADDRESS` | No | TCP bind address for HTTP server | `0.0.0.0:8082` | `0.0.0.0:8082` |
-| `OTLP_ENDPOINT` | No | OpenTelemetry collector endpoint (future observability) | None | `http://otel-collector:4317` |
+| `OTEL_ENABLED` | No | Master switch for OpenTelemetry tracing. When `true`, AC initializes the OTLP exporter at startup and **fails readiness if the collector is unreachable** (fail-hard at init, R-55). Default-off keeps AC bootable without a collector. | `false` | `true` (Kind/dev) |
+| `OTLP_ENDPOINT` | When `OTEL_ENABLED=true` | OTLP-gRPC collector endpoint. **Must** include the `http://` scheme (parsed via tonic `Endpoint`; a bare `host:port` fails at init). Consumed only when `OTEL_ENABLED=true`. | `""` | `http://otel-collector.dark-tower:4317` |
+| `OTEL_SAMPLE_RATE` | No | Trace sampling ratio in `[0.0, 1.0]`. Parsed at config load; the range is enforced by `init_otel` at startup when enabled (fail-hard). | `1.0` | `0.1` |
+| `DEPLOYMENT_ENVIRONMENT` | No | Value of the `deployment.environment` OTel resource attribute on emitted spans. | `development` | `production` |
 | `CLUSTER_NAME` | No | Cluster identifier for key ID generation | `us` | `us`, `eu`, `ap` |
 | `RUST_LOG` | No | Logging level | `info` | `info,ac_service=debug` |
 | `AC_RATE_LIMIT_WINDOW_MINUTES` | No | Login rate limit sliding window (minutes). Range: 1-60 | `15` | `1` (dev/test) |
 | `AC_RATE_LIMIT_MAX_ATTEMPTS` | No | Login rate limit max failed attempts before lockout. Range: 1-100 | `5` | `100` (dev/test) |
 | `AC_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES` | No | Registration rate limit sliding window (minutes). Range: 1-1440 | `60` | `1` (dev/test) |
 | `AC_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS` | No | Registration rate limit max attempts per IP per window. Range: 1-100 | `5` | `100` (dev/test) |
+
+> **Enabling OpenTelemetry — fail-hard contract (R-55).** `OTEL_ENABLED=true` makes AC initialize the OTLP exporter during startup and **probe the collector eagerly**; if the collector is unreachable, AC fails its readiness probe and serves no traffic. This is deliberate (fail-hard-at-init). Before enabling in any environment confirm: (1) the OTel collector is deployed and Ready; (2) `OTLP_ENDPOINT` carries the `http://` scheme and resolves; (3) AC's NetworkPolicy permits egress to the collector on TCP 4317 (`infra/services/ac-service/network-policy.yaml`). Kind/dev enables this via the overlay patch against the R-59 collector. **Keep `OTEL_ENABLED=false` in production** until the collector has an availability SLO — otherwise a collector outage takes AC, and therefore all service-to-service auth, down.
 
 ### Kubernetes Secrets
 

@@ -13,10 +13,22 @@ data:
   AC_RATE_LIMIT_MAX_ATTEMPTS: "100"
   AC_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES: "1"
   AC_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS: "100"
-  # OTLP-gRPC endpoint for the in-cluster OTel collector (R-59).
-  # AC's OTel init is presence-gated on OTLP_ENDPOINT (config.rs:237,
-  # Option<String>); the http:// scheme is required (parsed via
-  # tonic Endpoint::from_shared — a bare host:port fails at init).
-  # NOTE: inert on this branch — no service main.rs calls init_otel yet
-  # (that wiring is R-55). Becomes live when R-55 lands.
+  # ---- OpenTelemetry (R-55) ----
+  # AC's OTel SDK is wired into main.rs via init_otel (R-55), gated by an
+  # explicit boolean OTEL_ENABLED (NOT presence of OTLP_ENDPOINT). This is the
+  # prod base (AC_CLUSTER_NAME: dark-tower-prod above), so OTEL_ENABLED defaults
+  # to "false" here; the Kind overlay patches it to "true" for dev. Enabling
+  # requires OTEL_ENABLED=true PLUS the AC->collector egress NetworkPolicy rule
+  # (now present) PLUS a reachable collector — init_otel probes eagerly and
+  # FAILS HARD at startup if the collector is unreachable (pod fails readiness).
+  OTEL_ENABLED: "false"
+  # OTLP-gRPC endpoint for the in-cluster OTel collector (R-59). The http://
+  # scheme is required (parsed via tonic Endpoint::from_shared — a bare
+  # host:port fails at init). Only consumed when OTEL_ENABLED=true.
   OTLP_ENDPOINT: "http://otel-collector.dark-tower:4317"
+  # Head-sampling ratio in [0.0, 1.0]; init_otel is the authoritative validator.
+  OTEL_SAMPLE_RATE: "1.0"
+  # deployment.environment resource attribute (ADR-0011). NOTE: this prod base
+  # hardcodes "development"; prod OTel graduation MUST overlay-patch this so prod
+  # telemetry is not mistagged (tracked in docs/TODO.md).
+  DEPLOYMENT_ENVIRONMENT: "development"

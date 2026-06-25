@@ -71,7 +71,10 @@ impl TestAuthServer {
             bind_address: "127.0.0.1:0".to_string(),
             master_key: SecretBox::new(Box::new(master_key.clone())),
             hash_secret: SecretBox::new(Box::new(master_key.clone())), // Use same as master_key for tests
-            otlp_endpoint: None,
+            otel_enabled: false,
+            otel_endpoint: String::new(),
+            otel_sample_rate: ac_service::config::DEFAULT_OTEL_SAMPLE_RATE,
+            environment: ac_service::config::DEFAULT_DEPLOYMENT_ENVIRONMENT.to_string(),
             jwt_clock_skew_seconds: ac_service::config::DEFAULT_JWT_CLOCK_SKEW.as_secs() as i64,
             bcrypt_cost: DEFAULT_BCRYPT_COST,
             rate_limit_window_minutes: ac_service::config::DEFAULT_RATE_LIMIT_WINDOW_MINUTES,

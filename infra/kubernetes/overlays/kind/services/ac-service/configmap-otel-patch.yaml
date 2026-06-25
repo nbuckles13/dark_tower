@@ -1,0 +1,12 @@
+# R-55 dev-enable patch (strategic merge): the prod base configmap ships
+# OTEL_ENABLED="false"; this Kind-overlay patch flips it to "true" so AC's OTel
+# SDK is enabled end-to-end in the dev cluster (collector deployed by R-59 + the
+# AC->collector egress rule in the base NetworkPolicy). Only this one key is
+# patched; every other base configmap value is inherited unchanged.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ac-service-config
+  namespace: dark-tower
+data:
+  OTEL_ENABLED: "true"

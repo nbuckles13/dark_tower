@@ -79,3 +79,15 @@ spec:
     ports:
     - protocol: UDP
       port: 53
+  # Allow egress to the OTel collector for OTLP-gRPC trace export (R-55 init_otel).
+  # Default-deny egress otherwise drops this; with init_otel's fail-hard probe a
+  # blocked path would CrashLoop AC when OTEL_ENABLED=true. Selector mirrors the
+  # collector's ingress-from-AC rule (same namespace: dark-tower).
+  - to:
+    - podSelector:
+        matchLabels:
+          app: otel-collector
+          component: observability
+    ports:
+    - protocol: TCP
+      port: 4317
