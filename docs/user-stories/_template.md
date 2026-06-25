@@ -59,10 +59,13 @@ As a **{persona}**, I want **{goal}** so that **{benefit}**.
 
 ### Test
 
-- **E2E Scenarios**:
-  - {Scenario 1}: {steps, validates which requirement}
-  - {Scenario 2}: {steps, validates which requirement}
-- **Integration Tests**: {key integration points to test}
+For each new endpoint, RPC, cross-service flow, or client-driven SDK behavior, list env-test scenarios. Driver is per-scenario detail (Rust HTTP/RPC, headless browser, etc.); all env-tests run against the live Kind cluster in the same Layer 7 slot. See ADR-0028 §7 (amended 2026-06-25) for the unified Env-Test tier framing.
+
+- **Env-Tests** (live-cluster verification, any driver — owned by implementing specialist, paired with test):
+  - {Scenario 1}: driver={Rust|Browser}, owned by {specialist}, validates R-{N}
+  - {Scenario 2}: ...
+- **Integration Tests** (per-service, handler/repo level — NOT against live cluster; against test postgres sidecar or similar in-process fakes):
+  - {Key integration points}
 
 ### Deployment
 

@@ -1,6 +1,6 @@
 # Planning Protocol — Service & Domain Specialists
 
-For: auth-controller, global-controller, meeting-controller, media-handler, database, protocol, infrastructure
+For: auth-controller, global-controller, meeting-controller, media-handler, client, database, protocol, infrastructure
 
 ## Workflow
 
@@ -49,6 +49,16 @@ Verify compatibility against **actual code** (struct definitions, schema, messag
 @team-lead — INTERFACE CHECK for R-{N}: {Confirmed correct | Incorrect — {what's wrong}}
 ```
 
+## Env-Test Responsibility
+
+If your task introduces **cluster-observable behavior** — a new HTTP endpoint, new RPC, new observability emission, new cross-service flow, or new client-driven SDK behavior — env-test additions are IN-SCOPE of your task, NOT deferred to a separate test-specialist task. Use `--paired-with=test` so the test specialist reviews patterns and fixture discipline.
+
+Env-tests verify the deployed system against the live Kind cluster. Rust-driven env-tests live in `crates/env-tests/`; browser-driven env-tests live in `packages/<app>/e2e/`. Both are the same tier (Layer 7 of `scripts/layer-all.sh`); driver is per-scenario implementation detail. See ADR-0028 §7 (amended 2026-06-25).
+
+Standalone test-specialist tasks remain appropriate for env-test **infrastructure** — harnesses, fixtures, framework setup, cross-cutting suites spanning multiple specialists — but NOT for per-endpoint env-tests.
+
+When listing a task's `Covers:` field below, distinguish env-tests explicitly: `Covers: code, env-tests` (not just `tests`) when your task adds env-tests; the explicit token makes the env-test discipline visible at planning review.
+
 ## Design Contribution
 
 ```
@@ -66,7 +76,7 @@ Verify compatibility against **actual code** (struct definitions, schema, messag
 Task: "{description — clear enough to use as a /devloop prompt}"
   Specialist: {your-name}
   Dependencies: {task numbers or "none"}
-  Covers: {code | migration | tests | deploy | etc.}
+  Covers: {code | migration | unit-tests | integration-tests | env-tests | deploy | etc.}
   Design context: {key decisions}
 
 Aim for 1-3 tasks. Each task stays within your domain. A good task is one a devloop can implement and reviewers can hold in their head.

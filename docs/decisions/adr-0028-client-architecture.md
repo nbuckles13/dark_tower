@@ -166,6 +166,18 @@ Key design decisions:
 
 ### 7. Testing Strategy
 
+#### Amendment (2026-06-25): System-level Env-Test tier unification
+
+The tier model below describes the *client-internal* test pyramid. Subsequent project evolution adds a system-level framing not addressed in the original ADR:
+
+- The **Integration** and **E2E** tiers below are project **env-tests** — live-cluster verification against the same host-side Kind cluster as `crates/env-tests/` (the Rust env-test suite). Browser-driven (Vitest Browser Mode + Playwright) and Rust-driven (`crates/env-tests/`) are *different drivers of the same Env-Test tier*, not separate tiers. Both run in Layer 7 of `scripts/layer-all.sh`.
+- The "Docker services" framing for the Integration tier is superseded by Kind via the host-side cluster helper (ADR-0030). See user-story requirement R-48 in `browser-client-join` for the explicit framing of browser E2E as the client analogue of `crates/env-tests/`.
+- **Ownership.** The specialist introducing cluster-observable behavior — HTTP endpoint, RPC, observability emission, cross-service flow, or client-driven SDK behavior — adds the env-test in their own task scope, paired with the test specialist for pattern review and fixture discipline. Standalone test-specialist tasks remain appropriate for env-test infrastructure (harnesses, fixtures, framework setup, cross-cutting suites) but NOT for per-feature env-tests. This closes a gap surfaced 2026-06-25: ~6 weeks of backend additions shipped without env-test coverage because the responsibility was assumed to land in a separate (never-scheduled) test-specialist task.
+
+The tier-internal mechanics below (Vitest tooling, coverage policy, fixtures, flaky discipline, cross-language test vectors) remain valid for the client-side driver of the Env-Test tier.
+
+---
+
 #### Tier Model
 
 | Tier | Environment | Scope | Speed | When |

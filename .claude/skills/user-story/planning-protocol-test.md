@@ -74,16 +74,20 @@ For any gaps, propose the infrastructure work as a story requirement. Do NOT col
 
 ## Proposing Tasks
 
-Propose devloop tasks for substantial standalone test work only. Unit and integration tests for a new endpoint belong in the service specialist's task, not a separate one.
+**Per-feature env-tests are NOT standalone test-specialist tasks.** A new GC HTTP endpoint adds its Rust env-tests in global-controller's task; a new client SDK flow adds its browser env-tests in client's task. Both kinds ship alongside the code they verify, run against the same live Kind cluster, and land in the same Layer 7 slot. Pair with `--paired-with=test` for pattern review. See ADR-0028 §7 (amended 2026-06-25) for the unified Env-Test tier framing and the ownership rule.
 
-Standalone test tasks are appropriate for:
-- Env-test scenarios (separate infrastructure, separate specialist)
-- New test harness/fixture infrastructure
-- Cross-service integration test suites
+This closes the failure mode where env-tests get filed as a separate, never-launched test-specialist task — surfaced 2026-06-25 after ~6 weeks of backend additions shipped without env-test coverage.
+
+Unit and integration tests for a new endpoint also belong in the service specialist's task, not a separate one.
+
+Standalone test-specialist tasks ARE appropriate for:
+- **Test infrastructure**: harnesses, fixtures, test-utils packages, Playwright framework setup, custom assertion helpers, `MockWebTransport` and similar test doubles
+- **Cross-cutting test suites** spanning multiple implementing specialists (e.g., a trace-continuity suite touching all four services where no single specialist owns the end-to-end flow)
+- **Test framework extensions or migrations** (e.g., Vitest 3→4 upgrade, Playwright API migration)
 
 ```
 Task: "{description}"
   Specialist: test
   Dependencies: {task numbers or "none"}
-  Covers: {env-tests | test-infrastructure | etc.}
+  Covers: {test-infrastructure | cross-cutting-env-tests | framework-migration | etc.}
 ```
