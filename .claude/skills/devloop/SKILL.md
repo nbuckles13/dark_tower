@@ -416,15 +416,11 @@ The cases requiring implementer action are an unexpected `STATUS=N/A` outside th
 
 **Layer 7 — Env-tests (Integration)**:
 
-Layer 7 is the seventh shell-layer in `scripts/layer-all.sh`, executed automatically after layers 1-6. The protocol below describes the work `scripts/layer7.sh` performs against the live Kind cluster. Layer 7 always runs — intentionally broader than ADR-0030's trigger-path list, because business logic changes can break integration tests too.
+Layer 7 is the seventh shell-layer in `scripts/layer-all.sh`, executed automatically after layers 1-6. It always runs — intentionally broader than ADR-0030's trigger-path list, because business logic changes can break integration tests too. The full mechanism (cluster bring-up, two-phase classifier, the four STATUS lanes) lives in `scripts/layer7.sh`; failure-mode → REASON-token → fix mapping is in `docs/runbooks/devloop-validation.md §6.7`.
 
-1. **Cluster readiness**: Run `dev-cluster status`. If not ready, run `dev-cluster setup` (polls `setup_in_progress` first). Setup does NOT consume attempts; escalate on setup failure as infra.
-2. **Infra change detection**: If `git diff --name-only ${START_COMMIT}..HEAD -- infra/kind/` shows changes, `dev-cluster teardown` then `setup` (cluster skeleton stale). Does NOT consume attempts; log triggering files.
-3. **Rebuild services**: `dev-cluster rebuild-all`. Report wall-clock time.
-4. **Run env-tests**: Read `/tmp/devloop/ports.json` to construct `ENV_TEST_{AC,GC,PROMETHEUS,GRAFANA,LOKI}_URL` from `.container_urls.*`. Run `timeout 600 cargo test -p env-tests --features all 2>&1 | tee /tmp/devloop/env-test-output.log`. On failure, forward full output + log path to implementer.
-5. **Classify exit**: Exit 0 = pass. Non-zero: if stderr matches infra patterns (`connection refused|timed out|connection reset|broken pipe`), **infrastructure failure** (retry once, do NOT consume attempt, then escalate). Otherwise **test failure** (consume attempt).
-
-**Layer 7 attempt budget**: 2 attempts (separate from layers 1-6's 3). Infrastructure failures do not consume attempts. First-run cluster setup (~7 min) does not count toward attempts.
+**Lead policy** (the only bits not encoded in the script):
+- **Attempt budget**: Layer 7 = 2 attempts (separate from layers 1-6's 3). **Test failures** (`STATUS=FAIL`, exit 1) consume an attempt; **infrastructure/precondition failures** (`STATUS=PRECONDITION_FAILURE`, exit 2 — the operator lane) do NOT — retry once, then escalate to operations. First-run cluster setup (~7 min) does not count toward attempts.
+- **No cluster**: in **CI** (`GITHUB_ACTIONS`) Layer 7 self-reports `STATUS=SKIPPED-NO-CLUSTER REASON=no-cluster-ci` (exit 0) — a clean pass that does NOT mean env-tests ran; this is the ONLY skip case. A **local** devloop with no helper (or a dead helper) is `PRECONDITION_FAILURE` (exit 2, operator lane) — loud, never a silent skip — so a local code devloop can never exit-0-skip env-tests.
 
 **If pass**:
 - Update main.md: Phase = review
@@ -609,10 +605,10 @@ Follow the standard Implementer workflow + communication rules (see Step 3 Imple
 |-------|-------|--------|
 | Planning | 30 min / 3 rounds | Escalate |
 | Implementation | No limit | Lead monitors progress |
-| Validation (L1-7) | 3 attempts | Escalate |
-| Validation (L8) | 2 attempts | Escalate |
-| Infra failures (L8) | Retry once | Escalate (don't consume attempts) |
-| First-run setup (L8) | ~7 min | Does not count toward attempts |
+| Validation (L1-6) | 3 attempts | Escalate |
+| Validation (L7 env-tests) | 2 attempts | Escalate |
+| Infra/precondition failures (L7) | Retry once | Escalate (don't consume attempts) |
+| First-run setup (L7) | ~7 min | Does not count toward attempts |
 | Review→Impl loop | 3 iterations | Escalate |
 | Human review rounds | 3 per devloop | Escalate ("is this task well-scoped?") |
 

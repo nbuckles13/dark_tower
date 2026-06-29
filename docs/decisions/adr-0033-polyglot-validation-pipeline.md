@@ -199,7 +199,7 @@ All pipeline orchestration lives in shell scripts. `SKILL.md` Step 6 collapses t
 - Runs `layer1.sh` through `layer7.sh` sequentially
 - Redirects each layer's stdout to `tee /tmp/devloop/layer-N.log` (or per-devloop slug equivalent)
 - Emits a final summary table: layer, status, duration
-- Enforces the **90s p95 wall-clock budget for the always-run set** (Layers 3, 6 + reviewer panel cost is excluded from this budget). Warns when any single layer exceeds its per-layer budget; this is the operational signal that catches budget breach before it becomes a paging incident.
+- Enforces the **90s p95 wall-clock budget for the always-run set** (Layers 3, 6 + reviewer panel cost is excluded from this budget). Warns when any single layer exceeds its per-layer budget; this is the operational signal that catches budget breach before it becomes a paging incident. **Layer 7 (env-tests) runs in a separate ~10–15 min envelope** and is excluded from BOTH the 90s always-run total AND the per-layer warn (its cluster bring-up + suite cost would otherwise false-fire the per-layer `BUDGET_BREACH` token every run); it is gated instead by its own `timeout 600` on the suite and the host helper's setup timeout. In **CI** (`GITHUB_ACTIONS`) Layer 7 cleanly skips (`SKIPPED-NO-CLUSTER REASON=no-cluster-ci`, exit 0) and contributes ~0s; a *local* run with no/dead helper is a loud `PRECONDITION_FAILURE` (exit 2), never a silent skip.
 
 Individual `layerN.sh` remain directly callable for targeted debugging (`scripts/layer4.sh` to re-run only Layer 4's tests on a failing diff).
 
@@ -226,11 +226,11 @@ Every per-language wrapper (`lang/<X>/<verb>.sh`) honors a uniform exit-and-outp
 
 | Exit code | Meaning |
 |-----------|---------|
-| 0         | OK / SKIPPED-NO-DIFF / SKIPPED-NO-VERB (all-langs-filtered, operator intent) / N/A-with-reason (success; incl. intentional-gap placeholders) |
+| 0         | OK / SKIPPED-NO-DIFF / SKIPPED-NO-VERB (all-langs-filtered, operator intent) / `SKIPPED-NO-CLUSTER` (Layer 7 CI no-cluster skip — task #56) / N/A-with-reason (success; incl. intentional-gap placeholders) |
 | 1         | FAIL (the work ran and detected a problem) |
-| 2         | Wrapper / dispatcher bug (unexpected error; investigate the script itself) — incl. `FAIL-MISSING-VERB` for a verb wrapper that should exist but is missing/non-executable, and `UNKNOWN` (see 2026-06-19 amendment) |
+| 2         | Wrapper / dispatcher bug (unexpected error; investigate the script itself) — incl. `FAIL-MISSING-VERB` for a verb wrapper that should exist but is missing/non-executable, `UNKNOWN` (see 2026-06-19 amendment), and `PRECONDITION_FAILURE` (Layer 7 operator lane — environment / cluster bring-up failure; task #56) |
 
-Final stdout line: `STATUS=<OK|FAIL|FAIL-MISSING-VERB|SKIPPED-NO-DIFF|SKIPPED-NO-VERB|N/A> REASON=<short string, no spaces in value>`. Dispatchers parse this for aggregation; CI summary jobs reuse the same parser.
+Final stdout line: `STATUS=<OK|FAIL|FAIL-MISSING-VERB|PRECONDITION_FAILURE|SKIPPED-NO-DIFF|SKIPPED-NO-VERB|SKIPPED-NO-CLUSTER|N/A> REASON=<short string, no spaces in value>`. Dispatchers parse this for aggregation; CI summary jobs reuse the same parser. (Layer-level enums `SKIPPED-NO-CLUSTER` + `PRECONDITION_FAILURE` are emitted by `layerN.sh` scripts, not per-language wrappers — see the 2026-06-26/task-#56 amendment.)
 
 **Verb discovery via file existence.** Per-verb dispatchers (`scripts/{audit,lint,test,fmt,build}.sh`) iterate `scripts/lang/*/`:
 
@@ -257,6 +257,34 @@ it outranks `OK`, a missing wrapper can no longer be masked by a sibling lang's 
 (the cross-lang-masking residual #50 left open and patched only for the audit slice). The
 exit code is now a **pure function of the aggregate enum** — no REASON is consulted (#50's
 reason→exit coupling is retired; the enum carries the semantics directly).
+
+**Amendment (2026-06-26, task #56 — Layer-7 env-tests):** Layer 7 (env-tests against the live
+Kind cluster) introduces TWO first-class STATUS enums emitted by the LAYER script
+(`scripts/layer7.sh`), not a per-language wrapper — but they share the same parser and the same
+global worst-wins aggregation ladder (`_common.sh::__status_rank` / `status_to_exit_code`):
+- **`SKIPPED-NO-CLUSTER`** (exit 0, ranked BELOW `OK`): the CI clean-skip lane — `GITHUB_ACTIONS`
+  set + no devloop helper socket (no Kind cluster, none provisionable). Below `OK` so a sibling's
+  real pass dominates and a green CI run reports `TOTAL_RESULT=OK`. It is deliberately NOT
+  `SKIPPED-NO-DIFF` (env-tests are always-run, so the verb DID apply — a cluster just wasn't
+  present) and NOT `N/A` (which ranks ABOVE `OK` and would wrongly dominate CI's total). REASON
+  `no-cluster-ci`. **Reachable ONLY in CI** — a LOCAL run with no/dead helper is the loud
+  `PRECONDITION_FAILURE` below, never a silent skip (the silent-skip-hole closer).
+- **`PRECONDITION_FAILURE`** (exit 2, ranked ABOVE `FAIL`, BELOW `FAIL-MISSING-VERB`): the OPERATOR
+  lane — a Phase-1 pre-suite step (helper liveness / cluster bring-up / rebuild / health /
+  observability readiness) failed, OR a local run with no/dead helper. Above `FAIL` (an infra
+  precondition dominates a sibling test FAIL) but below `FAIL-MISSING-VERB` (a persistent wiring
+  fault outranks a transient/operational cluster-down). Mapped to **exit 2** — the same
+  "investigate the script/environment" wiring/infra class as `FAIL-MISSING-VERB` + `UNKNOWN`.
+Both are EXPLICIT arms in `__status_rank` + `status_to_exit_code` (NOT the `*)` catch-all, which
+stays a fail-closed backstop: a forgotten/typo'd enum ranks top / exits 2, loud).
+
+**Assurance-boundary note (task #56, @security):** env-tests are enforced ONLY by the local
+cluster-equipped devloop, NOT by CI's non-bypassable re-run backstop — in NORMAL CI (no cluster)
+Layer 7 self-reports `SKIPPED-NO-CLUSTER` and env-tests do not run. This is configuration-dependent,
+not a permanent invariant: because the gate is socket-present-FIRST, a future CI that provisions a
+helper+cluster would run env-tests there. The local live run's raw STATUS binds to Gate 2; do not
+"fix" a CI skip by trusting a hand-asserted local pass (the authority skip-vector the Gate-2
+verdict-binding guards against). See `docs/runbooks/devloop-validation.md` §6.7.
 
 **Registering an intentional gap — the placeholder convention (canonical).** A language
 that deliberately has no real `<verb>.sh` ships a one-line placeholder wrapper:

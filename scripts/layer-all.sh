@@ -89,23 +89,49 @@ rm -f "${DEVLOOP_TMP}"/layer-*.log "${DEVLOOP_TMP}"/layer-*.stderr.log "${DEVLOO
 budget_secs_per_layer="${DEVLOOP_LAYER_BUDGET_SECS:-20}"
 total_budget_secs=90  # ADR-0033 §4: 90s p95 wall-clock for the always-run set (layers 3 + 6)
 
+# Layer-script directory. Production is __here. The LAYER_SCRIPT_DIR override is a hermetic
+# TEST SEAM (orchestrator lane-integrity test, task #56): it points the loop at fake layer
+# scripts so a simulated layer-7 PRECONDITION_FAILURE can be driven end-to-end without a
+# cluster. It is honored ONLY under DEVLOOP_TEST=1 (security): assert_no_ci_sentinel_leak
+# above already hard-fails the pipeline if DEVLOOP_TEST leaks into CI, so this seam can
+# never redirect the production orchestrator in a real CI/devloop run.
+layer_script_dir="${__here}"
+if [[ "${DEVLOOP_TEST:-}" == "1" && -n "${LAYER_SCRIPT_DIR:-}" ]]; then
+  layer_script_dir="$LAYER_SCRIPT_DIR"
+fi
+
 for n in 1 2 3 4 5 6 7; do
   start=$(date +%s)
   # observability O3: atomic stderr append redirect (no process-sub race with stdout tee).
-  if ! "${__here}/layer${n}.sh" \
+  # Capture the LAYER's real exit code (PIPESTATUS[0], NOT tee's). set +e/-e around the
+  # pipeline so a non-zero layer doesn't abort the loop (replaces the old `if ! …` guard).
+  set +e
+  "${layer_script_dir}/layer${n}.sh" \
         2>>"${DEVLOOP_TMP}/layer-${n}.stderr.log" \
-        | tee "${DEVLOOP_TMP}/layer-${n}.log"; then
-    final_exit=1
-  fi
+        | tee "${DEVLOOP_TMP}/layer-${n}.log"
+  rc=${PIPESTATUS[0]}
+  set -e
   end=$(date +%s)
   dur=$((end - start))
+
+  # Accumulate the worst OBSERVED process exit code (the @operations FLOOR, task #56). The
+  # authoritative LAYER_ALL_EXIT below is max(status_to_exit_code(total_result), this floor)
+  # — the real rc is the belt to the enum's suspenders: a STATUS/rc MISMATCH (a layer whose
+  # last STATUS line says OK but whose process exited non-zero) must NEVER demote
+  # LAYER_ALL_EXIT below what the process actually returned. That mismatch is a cousin of
+  # the silent-masking bug this task exists to kill.
+  if (( rc > final_exit )); then final_exit=$rc; fi
 
   # observability O4 + dry-reviewer (C): single source of truth for STATUS parsing.
   status=$(parse_status_line "${DEVLOOP_TMP}/layer-${n}.log")
   layer_status[$n]="${status:-UNKNOWN}"
   layer_dur[$n]=$dur
 
-  if [[ $dur -gt $budget_secs_per_layer ]]; then
+  # Per-layer 20s warn EXCLUDES Layer 7 (task #56 ruling B): env-tests run in a separate
+  # ~10–15 min envelope (ADR-0033 §4), so a Layer-7 BUDGET_BREACH would false-fire every
+  # run and train operators to ignore the token. Layer 7 is also excluded from the 90s
+  # always-run total below (which sums only layers 3 + 6).
+  if [[ $n -ne 7 && $dur -gt $budget_secs_per_layer ]]; then
     echo "WARN BUDGET_BREACH LAYER=${n} DURATION=${dur} BUDGET=${budget_secs_per_layer}" >&2
   fi
 done
@@ -123,6 +149,16 @@ for n in 1 2 3 4 5 6 7; do
   total_dur=$(( total_dur + ${layer_dur[$n]:-0} ))
   total_result=$(aggregate_worst_status "$total_result" "${layer_status[$n]:-UNKNOWN}")
 done
+
+# Authoritative process exit = max(status_to_exit_code(total_result), worst-observed-rc).
+# The enum mapping (dry-reviewer F1 single source) carries the SEMANTICS — so the operator
+# lane (Layer-7 PRECONDITION_FAILURE) reaches LAYER_ALL_EXIT=2 and emit_gate2_verdict
+# derives GATE2 correctly, and the latent FAIL-MISSING-VERB(exit 2)→exit-1 collapse is
+# repaired. The worst-observed-rc FLOOR (@operations) is the belt: a STATUS/rc mismatch
+# (last STATUS line OK but the process exited non-zero) can never demote the pipeline below
+# the real return code. final_exit already holds the worst observed rc from the loop.
+mapped_exit=$(status_to_exit_code "$total_result")
+if (( mapped_exit > final_exit )); then final_exit=$mapped_exit; fi
 
 printf '\n=== LAYER_SUMMARY_BEGIN ===\n'
 for n in 1 2 3 4 5 6 7; do

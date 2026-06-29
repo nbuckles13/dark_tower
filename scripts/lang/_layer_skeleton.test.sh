@@ -28,9 +28,14 @@ FAIL=0
 FAILURES=()
 
 # Collect layer scripts (layer1.sh ... layerN.sh, excluding layer-all.sh).
+# Skip `layerN.test.sh` self-tests: the glob `layer[0-9]*.sh` also matches `layer7.test.sh`
+# (and any future `layerN.test.sh`), but a test file legitimately contains the very tokens
+# this linter forbids in a layer BODY — raw `STATUS=`/`aggregate_worst_status` in assertion
+# strings, a `trap 'rm -rf' EXIT` cleanup, etc. Scanning them would false-fail (task #56).
 shopt -s nullglob
 declare -a LAYERS=()
 for f in "${SCRIPTS_ROOT}"/layer[0-9]*.sh; do
+  [[ "$f" == *.test.sh ]] && continue
   LAYERS+=("$f")
 done
 shopt -u nullglob

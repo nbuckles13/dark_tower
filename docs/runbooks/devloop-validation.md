@@ -83,7 +83,9 @@ The enum values are exactly:
 | `SKIPPED-NO-DIFF` | `lang/<X>/changed.sh` returned 1 (lang untouched) | `<lang>-no-diff` |
 | `SKIPPED-NO-VERB` (→ **exit 0**) | `all-langs-filtered` — an INCLUDE/EXCLUDE filter cleared the lang set (operator intent). The ONLY producer of this enum since task #52. | `all-langs-filtered` |
 | `FAIL-MISSING-VERB` (→ **exit 2**) | a verb wrapper that SHOULD exist is missing/non-executable (deleted, `chmod`-stripped, or a new lang dir missing a verb) — a wiring fault, not a benign skip. Ranks above OK, so it can't be masked. | `rust-test-verb-missing-or-not-executable`, `ts-audit-verb-missing-or-not-executable` |
-| `N/A` | Documented gap: a verb that doesn't apply to a lang (an intentional-gap placeholder, e.g. `proto/test.sh` / `proto/audit.sh`), or `layer7.sh` `wave2-pending` | `not-applicable-to-this-lang`, `wave2-pending`, `no-languages-registered`, `<verb>-aggregate-na` |
+| `N/A` | Documented gap: a verb that doesn't apply to a lang (intentional-gap placeholder, e.g. `proto/test.sh` / `proto/audit.sh`). | `not-applicable-to-this-lang`, `no-languages-registered`, `<verb>-aggregate-na` |
+| `SKIPPED-NO-CLUSTER` (→ **exit 0**) | Layer 7 only, **CI only** (`GITHUB_ACTIONS` set): no Kind cluster, provisioning out of scope. The ONLY clean-skip case; ranks BELOW OK so a green CI run reports `TOTAL_RESULT=OK`. A *local* run with no/dead helper is NOT this lane — it's `PRECONDITION_FAILURE` (exit 2). | `no-cluster-ci` |
+| `PRECONDITION_FAILURE` (→ **exit 2**) | Layer 7 only: the ENVIRONMENT a gate needs was unavailable — a Phase-1 pre-suite step (helper liveness / cluster bring-up / rebuild / health) failed, OR a LOCAL run with no/dead helper. The OPERATOR lane; ranks above `FAIL`, below `FAIL-MISSING-VERB`. Does NOT consume an implementer attempt (task #56). | `local-helper-not-running`, `helper-unreachable`, `cluster-setup-failed`, `cluster-rebuild-failed`, `ports-json-missing`, `cluster-unhealthy` |
 
 To find a missing-wrapper wiring fault, grep `FAIL-MISSING-VERB` (or the
 `verb-missing-or-not-executable` REASON). An intentional gap shows up as `N/A` from a
@@ -163,7 +165,7 @@ All three sites `exit 2` after emitting.
 
 ### `PRECONDITION_FAILURE:` — Pre-layer guardrail emissions
 
-Emitted only by `scripts/layer-all.sh` — the `PRECONDITION_FAILURE:` emission near the top of the script (no enclosing function). Indicates a precondition for the layer pipeline is not met:
+Emitted by `scripts/layer-all.sh` (the pre-loop guardrail near the top of the script) AND, as of task #56, by `scripts/layer7.sh` (its `precondition_fail` helper, on the operator lane — cluster/helper bring-up failures). Both indicate a precondition is not met. The two emitters differ in one way: layer-all.sh's pre-loop check exits 2 with the stderr token ALONE (it aborts before the summary table exists); layer7.sh additionally emits `STATUS=PRECONDITION_FAILURE` on stdout (a first-class enum, §6 ladder) so its summary-table row reads PRECONDITION_FAILURE, not a misleading UNKNOWN. The layer-all guardrail example:
 
 ```
 PRECONDITION_FAILURE: merge-base(<ref>, HEAD) unreachable — CI clone too shallow.
@@ -187,7 +189,7 @@ grep -E '^(ERROR|PRECONDITION_FAILURE):' "${DEVLOOP_TMP:-/tmp/devloop}"/layer-*.
 
 ### Convention extends to future precondition checks
 
-Future precondition checks added to `layer-all.sh` (disk-space, env-var presence, container-runtime availability, etc.) inherit the `PRECONDITION_FAILURE:` token. This runbook is the canonical home for the convention; task #42 §Tech Debt Pointers entry 4 is the source.
+Future precondition checks added to `layer-all.sh` OR to a `layerN.sh` (disk-space, env-var presence, container-runtime availability, cluster bring-up, etc.) inherit the `PRECONDITION_FAILURE:` token. This runbook is the canonical home for the convention; task #42 §Tech Debt Pointers entry 4 is the source, and task #56 (Layer 7) is the first `layerN.sh` emitter — see §6.7 for its REASON tokens.
 
 ---
 
@@ -336,6 +338,7 @@ Layer 3 also carries a **CI-sentinel-leak runtime assertion** (mirrored in `laye
 | `suppression-quality` | `scripts/audit-suppressions-check.sh` (quality-check) | An entry has an empty `reason`/`ticket`, a non-`YYYY-MM-DD` `expires`, or an `ecosystem` outside {rust, js}. Output names the offending id + field. |
 | `suppression-override-without-test-sentinel` | `scripts/audit-suppressions-check.sh` (trust-boundary guard) | A test-injection override env (`DEVLOOP_SUPPRESSIONS_MANIFEST` / `AUDIT_SUPPRESSIONS_NOW` / derived-path overrides) is set but `DEVLOOP_TEST` is not exactly `"1"`. **Tamper / misconfig signal** — a non-test environment set an override that would redirect the check. INVESTIGATE what set the env (CI step, reusable action); do NOT just unset-and-rerun. |
 | `test-sentinel-set-in-ci` | `scripts/layer-all.sh` / `scripts/layer3.sh` (CI-leak assertion) | `DEVLOOP_TEST` is set in a CI job (`GITHUB_ACTIONS=true`). The test sentinel must NEVER be set in CI — it would let the always-run check honor ambient override envs repo-wide. **Pipeline-integrity incident** — find what exported `DEVLOOP_TEST` (workflow step, reusable action) and remove it; do NOT unset-and-rerun blindly. |
+| `layer-script-dir-set-in-ci` | `scripts/lang/_common.sh::assert_no_ci_sentinel_leak` (second sentinel, task #56) | `LAYER_SCRIPT_DIR` is set in a CI job (`GITHUB_ACTIONS=true`). It is a LOCAL-ONLY test seam that substitutes stub layer scripts into `layer-all.sh`'s loop (orchestrator lane-integrity test) — in CI it would let a forged stub dir turn the whole pipeline green and FORGE the Gate-2 verdict. **Pipeline-integrity incident** — nothing legitimate sets it in CI; find + remove what exported it; do NOT unset-and-rerun blindly. Defense-in-depth: independent of `DEVLOOP_TEST`, so it reds even if the first sentinel didn't catch the leak. |
 | `dependabot-ignore-present` | `scripts/audit-suppressions-check.sh` (SSOT-integrity check) | `.github/dependabot.yml` has a non-empty `ignore:` block — a shadow suppression surface that fragments the single source of truth. **Dependabot `ignore:` is not a suppression channel** — remove it; if an advisory genuinely needs suppressing, add it to `audit-suppressions.toml` (reviewed PR, ADR-0033 §11). Dependabot is for bump PRs only. |
 
 **Two distinct suppression-drift surfaces — on-call note.** Advisory problems surface in TWO places, and they live in different runbook sections:
@@ -462,13 +465,30 @@ anchor names the worst-child cause (`buf-breaking-failed`), not `layer6-summary`
 
 ### 6.7 Layer 7 — Env-tests (`scripts/layer7.sh`)
 
-Currently emits `STATUS=N/A REASON=wave2-pending` — the env-tests wiring is deferred to a future task (ADR-0033 §1 / §3 / §14 layer-7 contract). When wired, Layer 7 covers dev-cluster bring-up + Rust env-tests + Playwright `@smoke`.
+**Always-run** (ADR-0033 §3): Layer 7 attempts the `crates/env-tests` suite against the live Kind cluster on every devloop — business-logic changes break integration even with no infra/proto diff. The ONLY suppressor is the absence of a cluster to run against (a clean skip, never a failure). Cluster lifecycle is the host-side helper (`infra/devloop/dev-cluster`, ADR-0030).
 
-| REASON token | Wrapper | Cause / Fix |
-|--------------|---------|-------------|
-| `wave2-pending` | `scripts/layer7.sh` — the `emit_status N/A "wave2-pending"` line (no enclosing function; flat script) | Expected — Layer 7 body not yet implemented. Aggregates to N/A above OK so the layer signals "this verb is not yet wired" distinct from "ran cleanly". |
+**Two-phase classifier (the suite-output log-grep is RETIRED — task #56).** Phase 1 (pre-suite: cluster readiness/setup, `infra/kind/` rebuild, `rebuild-all`, ports.json/URLs, post-rebuild health) is the ONLY infra lane. Phase 2 runs the suite on a confirmed-healthy cluster, and **any** non-zero is a test FAIL — we do NOT grep the suite output for `connection refused` etc. (that would let a real test failure whose output contains an infra phrase escape silently as infra — the reverse of the very masking this layer exists to kill). Load-bearing asymmetry: when uncertain, FAIL/loud, never infra/swallow.
 
-When Layer 7 lands, its failure modes will document here. ADR-0030 (host-side cluster helper, renumbered from Layer 8) is the canonical contract.
+**Four terminal lanes** (the `wave2-pending` N/A stub is gone):
+
+| STATUS / REASON token | Origin (in `scripts/layer7.sh`) | Exit | Lane / Cause / Fix |
+|-----------------------|----------------------------------|------|--------------------|
+| `SKIPPED-NO-CLUSTER` / `no-cluster-ci` | env gate — helper socket ABSENT **and** `GITHUB_ACTIONS` set (CI) | 0 | **Expected on CI ONLY** — GitHub Actions has no Kind cluster and we don't provision one. The ONLY clean-skip case; ranks below OK so a green CI run is `TOTAL_RESULT=OK`. NOT a failure. (Socket-presence is checked FIRST, so a future CI that DID provision a helper would *run*, not skip — forward-compatible. A *local* run with no/dead helper is NOT this lane — it's loud `PRECONDITION_FAILURE`.) The only exit-0 no-cluster skip is CI; a local devloop with no reachable helper is always loud `PRECONDITION_FAILURE`, so env-tests cannot silently skip on a local code devloop. |
+| `OK` / `env-tests-passed` | Phase 2, suite exit 0 | 0 | Suite green. |
+| `FAIL` / `env-tests-failed` | Phase 2, suite non-zero | 1 | **IMPLEMENTER lane.** A test regression on a confirmed-healthy cluster (incl. a 600s `timeout`/rc-124 hang). Read the full suite output at `${DEVLOOP_TMP:-/tmp/devloop}/layer-7-env-test.log`; fix the failing test/code. Consumes a Layer-7 attempt. |
+| `PRECONDITION_FAILURE` / `local-helper-not-running` | env gate — NOT CI and no helper socket (local devloop, helper not started) | 2 | **OPERATOR lane** — a local devloop ALWAYS expects a cluster; a missing helper is loud, NEVER a silent skip (this is the silent-skip hole the task closes). Start the devloop cluster (`devloop.sh`); to run only layers 1-6 invoke the individual `scripts/layerN.sh`. |
+| `PRECONDITION_FAILURE` / `helper-unreachable` | helper-liveness probe — socket PRESENT but `dev-cluster status` connection-refused (helper crashed / stale socket) | 2 | **OPERATOR lane** — a cluster WAS expected but the helper is gone; this is deliberately NOT a clean skip (masking a crashed helper would re-open the silent-skip). Re-run `devloop.sh` on the host to restart the helper; check `/tmp/devloop/helper.log` + `helper-stderr.log`. |
+| `PRECONDITION_FAILURE` / `cluster-setup-failed` | Phase 1a/1b — `dev-cluster status`/`setup` could not bring the cluster to ready | 2 | **OPERATOR lane** — environment problem, NOT a code regression; does NOT consume an implementer attempt. Inspect `/tmp/devloop/helper.log` + `dev-cluster status`; re-run `devloop.sh` on the host if the helper is wedged. |
+| `PRECONDITION_FAILURE` / `cluster-rebuild-failed` | Phase 1b/1c — `dev-cluster teardown`/`setup` (stale `infra/kind/`) or `rebuild-all` failed | 2 | OPERATOR lane. Image build / redeploy failed. Inspect `/tmp/devloop/helper.log`, image build output, pod status. |
+| `PRECONDITION_FAILURE` / `ports-json-missing` | Phase 1d — `/tmp/devloop/ports.json` absent/unreadable | 2 | OPERATOR lane. The helper writes `ports.json` on a successful `setup`; ensure setup completed. |
+| `PRECONDITION_FAILURE` / `cluster-unhealthy` | Phase 1e — pods not ready after `rebuild-all` | 2 | OPERATOR lane. Refusing to run the suite against a sick cluster. `dev-cluster status` names the not-ready pods; check pod logs. |
+| `PRECONDITION_FAILURE` / `observability-prometheus-not-ready` | Phase 1f — Prometheus `/-/ready` != 2xx within budget | 2 | OPERATOR lane. The metrics tests one-shot-query Prometheus, so a cold/down Prometheus would flake them — Phase 1f waits for it (HARD probe) and trips loud if it never readies. Check the prometheus pod + logs. |
+
+**Phase 1f — observability-stack readiness (per-probe; task #56 user-ruling (a)).** After pods-healthy (1e), Layer 7 waits for the observability HTTP endpoints the suite probes — the same `ENV_TEST_*_URL` the suite uses, so no gate-vs-suite drift — with **per-probe disposition** (NOT a blanket suppressor): **Prometheus HARD** (`/-/ready` → `PRECONDITION_FAILURE observability-prometheus-not-ready` if it never readies, since the metrics tests one-shot-query it) and **Loki SOFT** (`/ready` → on budget-expiry a loud greppable `WARN LOKI_NOT_READY_AFTER=<n>s` that pre-attributes the eventual `test_all_services_have_logs_in_loki` failure to the observability stack — "NOT your diff" — then PROCEEDS, honoring the crate's optional-Loki semantics). Grafana is skipped (no suite queries its HTTP API). This closes the cold-start gap: a cold-but-coming Loki becomes a Phase-1 WAIT (→ suite green), not a Phase-2 FAIL. A **genuinely-ABSENT** Loki still surfaces as a loud Phase-2 FAIL (no masking) until the deferred env-tests-crate fix (`docs/TODO.md` §Env-Test Resilience — `is_loki_available` retry / conditional-skip). The HTTP probe is a `DEVLOOP_TEST`-gated seam (`HTTP_PROBE`, fixed `curl` in production), same class as the other layer7 seams.
+
+The `PRECONDITION_FAILURE` enum (exit 2) is the operator lane — it surfaces in the `LAYER_SUMMARY` cell and reaches `LAYER_ALL_EXIT=2` (the per-layer exit code is propagated by `layer-all.sh`, not collapsed to 1). It is a first-class STATUS enum in `_common.sh` (rank between `FAIL` and `FAIL-MISSING-VERB`: an infra precondition dominates a sibling test FAIL, but a missing-wrapper wiring fault outranks it). A stderr `PRECONDITION_FAILURE: <cause>` banner with the fix accompanies every exit-2 lane. Per-step timing rides `LAYER=7 STEP=<name> DURATION=<secs>` stderr lines. ADR-0030 (host-side cluster helper) is the canonical lifecycle contract.
+
+**Backstop scope — env-tests are a LOCAL-host-only gate, NOT part of CI's non-bypassable Gate-2 backstop (security).** CI (`ci.yml` running `layer-all.sh`) has no Kind cluster and no ADR-0030 helper, so Layer 7 self-reports `SKIPPED-NO-CLUSTER` (exit 0) there — env-tests do NOT run in NORMAL CI (which provisions no cluster). (Should a future CI provision a helper+cluster — a deliberate infra change, since the gate is socket-present-FIRST per §C.2 — Layer 7 would run env-tests there, and they would then fall under CI's enforcement. The posture below is therefore configuration-dependent, not a permanent invariant.) Therefore, in the current config, env-test coverage is provided ONLY by the local cluster-equipped devloop; CI's "independent re-run is the only non-bypassable enforcement" (§ci.yml authority note) does NOT cover env-tests. Do not "fix" a CI `SKIPPED-NO-CLUSTER` by trusting the local verdict — that is exactly the authority skip-vector the Gate-2 verdict-binding guards against; the local live run IS the env-test gate, and its raw evidence is what Gate 2 must see.
 
 ---
 
@@ -512,7 +532,7 @@ When `lang/<X>/<verb>.sh` is absent, the outcome is one of three DISTINCT enums 
 
 ### `STATUS=N/A` — documented gap vs. wrapper bug
 
-Documented gaps: `layer7.sh` `wave2-pending`, `_dispatch.sh` `no-languages-registered` (would mean every lang directory got filtered out — possible operator-error with `DEVLOOP_DISPATCH_INCLUDE_LANGS=<nonexistent>`).
+Documented gaps: `_dispatch.sh` `no-languages-registered` (would mean every lang directory got filtered out — possible operator-error with `DEVLOOP_DISPATCH_INCLUDE_LANGS=<nonexistent>`). (Layer 7's "no cluster in CI" state is NOT N/A — it is its own enum `SKIPPED-NO-CLUSTER` (exit 0, CI only); a local no/dead helper is `PRECONDITION_FAILURE` (exit 2). See §6.7.)
 
 Unexpected `N/A` outside the documented placeholders is a wrapper bug — escalate. The enum ranks above OK precisely so an unexpected `N/A` does not silently pass as "ran cleanly".
 
@@ -556,7 +576,8 @@ Grep-driven entry point. Match the symptom, jump to the section.
 | `STATUS=N/A REASON=not-applicable-to-this-lang` (proto, Layer 4/6) | Expected — proto's intentional-gap placeholder `test.sh`/`audit.sh` (exit 0). N/A outranks OK, so the dispatch aggregate may read N/A when proto is touched. | §6.4 + §6.6 + §7 |
 | `STATUS=FAIL-MISSING-VERB REASON=…-verb-missing-or-not-executable` | A verb wrapper that should exist is missing/`chmod`-stripped — **reds the layer (exit 2)**, and (task #52) reds even when a sibling lang passed. Restore the wrapper + `chmod +x`, or register a placeholder `<verb>.sh` emitting `N/A` if the gap is intended. | §7 |
 | `REASON=wrapper-aborted-early-exit-<rc>` | A verb wrapper crashed BEFORE emitting STATUS (e.g. `set -e` abort, `exit 1` in a helper); previously surfaced as a silent `UNKNOWN`. The EXIT trap now emits FAIL with the abort code `<rc>`. | §6.4 + §7 |
-| `STATUS=N/A REASON=wave2-pending` | Expected — Layer 7 placeholder | §6.7 |
+| `STATUS=SKIPPED-NO-CLUSTER REASON=no-cluster-ci` | Expected — CI (`GITHUB_ACTIONS`) has no Kind cluster. Clean skip, exit 0, never reds CI. The ONLY skip case (local runs never skip). | §6.7 |
+| `STATUS=PRECONDITION_FAILURE REASON=local-helper-not-running` / `helper-unreachable` / `cluster-*` / `ports-json-missing` | Layer 7 env-gate / Phase-1 infra failure — **OPERATOR lane (exit 2)**, not a test regression; does not consume an implementer attempt. `local-helper-not-running` = local devloop, no helper (loud, never a silent skip); `helper-unreachable` = socket present but the helper crashed. | §6.7 |
 | `predicate-meta-test-failed` | Lang predicate vs fixture drift | §6.3 + §7 |
 | `predicate-meta-test-failed` after adding a new lang | Missing fixture row in `_test_changed_predicates.sh` | §7 |
 | Layer 1 fails on a docs-only PR | `lang/<X>/changed.sh` over-classification (e.g. `crates/foo/README.md` → rust per ADR-0033 §3 trade-off); cargo check is cheap. | §6.1 |
@@ -570,6 +591,7 @@ Grep-driven entry point. Match the symptom, jump to the section.
 | Layer 3 `suppression-quality` | Empty reason/ticket, bad `expires`, or bad `ecosystem` in the manifest. | §6.3 |
 | Layer 3 `suppression-override-without-test-sentinel` | A test-injection override env set without `DEVLOOP_TEST=1` — tamper/misconfig; investigate, do NOT unset-and-rerun. | §6.3 |
 | `test-sentinel-set-in-ci` (layer-all / layer3) | `DEVLOOP_TEST` leaked into a CI job — pipeline-integrity incident; find + remove what exported it. | §6.3 |
+| `layer-script-dir-set-in-ci` (assert_no_ci_sentinel_leak) | `LAYER_SCRIPT_DIR` (a local-only orchestrator test seam) leaked into CI — could forge the Gate-2 verdict; find + remove what exported it. | §6.3 |
 | Layer 3 `dependabot-ignore-present` | `.github/dependabot.yml` has a non-empty `ignore:` block — move suppressions to `audit-suppressions.toml`; Dependabot `ignore:` is not a suppression channel. | §6.3 |
 | Open `audit-drift` GitHub Issue / red `Scheduled Audit` run | Between-PR drift: a new advisory against an UNCHANGED lockfile, caught by the weekly scheduled scan. Triage like a Layer-6 advisory; the issue auto-closes when a later scheduled run is clean. | §6.6 |
 | Layer 6 `buf-breaking-failed` on an intentional wire-break | No override exists yet; deferred to ADR-0033 Wave 3 #10 (task #41). | §6.6 |

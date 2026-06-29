@@ -55,6 +55,24 @@ assert_aggregate "FAIL-MISSING-VERB" "N/A" "FAIL-MISSING-VERB"                # 
 assert_aggregate "FAIL-MISSING-VERB" "OK" "SKIPPED-NO-DIFF" "FAIL-MISSING-VERB" "FAIL"  # beats a mixed field
 assert_aggregate "UNKNOWN"           "FAIL-MISSING-VERB" "UNKNOWN"            # UNKNOWN still on top
 
+# SKIPPED-NO-CLUSTER (task #56): exit-0 clean skip (Layer 7, no devloop cluster in CI).
+# Ranks BELOW OK so a sibling's real OK dominates and a green CI run reports TOTAL_RESULT=OK.
+assert_aggregate "OK"                 "OK" "SKIPPED-NO-CLUSTER"               # OK dominates → CI TOTAL stays OK
+assert_aggregate "SKIPPED-NO-CLUSTER" "SKIPPED-NO-CLUSTER"                    # lone skip (Layer 7 alone)
+assert_aggregate "SKIPPED-NO-CLUSTER" "SKIPPED-NO-DIFF" "SKIPPED-NO-CLUSTER" # same skip tier, above NO-DIFF
+assert_aggregate "N/A"                "N/A" "SKIPPED-NO-CLUSTER"              # N/A (different tier) still beats a skip
+
+# PRECONDITION_FAILURE (task #56): exit-2 operator/infra lane (Layer 7 Phase-1 gate).
+# Rank 6 (@test/@team-lead): outranks FAIL (an infra precondition dominates a sibling test
+# failure) but BELOW FAIL-MISSING-VERB (a missing-wrapper pipeline-machinery defect is more
+# fundamental than a transient cluster-down) and UNKNOWN.
+assert_aggregate "PRECONDITION_FAILURE" "OK" "PRECONDITION_FAILURE"                  # beats OK
+assert_aggregate "PRECONDITION_FAILURE" "FAIL" "PRECONDITION_FAILURE"                # beats a sibling test FAIL
+assert_aggregate "PRECONDITION_FAILURE" "N/A" "PRECONDITION_FAILURE"                 # beats N/A
+assert_aggregate "FAIL-MISSING-VERB"    "PRECONDITION_FAILURE" "FAIL-MISSING-VERB"   # wiring fault outranks it (@test)
+assert_aggregate "UNKNOWN"              "PRECONDITION_FAILURE" "UNKNOWN"              # UNKNOWN still on top
+assert_aggregate "PRECONDITION_FAILURE" "OK" "SKIPPED-NO-DIFF" "PRECONDITION_FAILURE" "FAIL"  # wins a realistic mixed field
+
 # Multi-arg cases.
 assert_aggregate "FAIL"            "OK" "OK" "FAIL" "OK"
 assert_aggregate "N/A"             "OK" "SKIPPED-NO-DIFF" "N/A" "SKIPPED-NO-VERB"
@@ -154,6 +172,10 @@ assert_exit_code "na"                "0" "N/A"
 assert_exit_code "fail"              "1" "FAIL"
 assert_exit_code "fail-missing-verb" "2" "FAIL-MISSING-VERB"
 assert_exit_code "unknown"           "2" "UNKNOWN"
+# task #56 enums: SKIPPED-NO-CLUSTER joins the exit-0 skip set; PRECONDITION_FAILURE
+# joins the exit-2 "investigate the environment" class.
+assert_exit_code "skipped-no-cluster"   "0" "SKIPPED-NO-CLUSTER"
+assert_exit_code "precondition-failure" "2" "PRECONDITION_FAILURE"
 
 # worst_reason_for_status: returns a representative real reason among children whose
 # enum == winner (for the stderr LAYER= cause), with a non-empty fallback. It no longer
@@ -192,6 +214,32 @@ if [[ "${#__LAYER_STATUSES[@]}" -eq 2 \
 else
   FAIL=$((FAIL + 1))
   FAILURES+=("[layer-reasons] __LAYER_REASONS not collected 1:1 with __LAYER_STATUSES; statuses=(${__LAYER_STATUSES[*]:-}) reasons=(${__LAYER_REASONS[*]:-})")
+fi
+
+# emit_step_duration format pin (task #56; observability-owned contract, @test harness).
+# The per-step timing line is an operator grep anchor (`DURATION=` once → layer + per-step);
+# lock its SHAPE so a future edit can't silently drop LAYER= or rename STEP=/DURATION=. The
+# step name is GENERIC (`foo`) on purpose — the helper is layer-agnostic; coupling its unit
+# test to layer7's real 5-step list would be a layering violation (per-step-name coverage,
+# if wanted, lives in layer7.test.sh). Strict `^...$` forces a conscious test update on any
+# field add/rename. (emit_step_duration writes only stderr, so 2>&1 captures it.)
+__sd_ts=$(layer_now)
+__LAYER_NUM=42   # double-digit deliberately exercises LAYER=[0-9]+ (observability's quantifier ask)
+__sd_out=$(emit_step_duration foo "$__sd_ts" 2>&1)
+__sd_re='^LAYER=42 STEP=foo DURATION=[0-9]+$'
+if [[ "$__sd_out" =~ $__sd_re ]]; then
+  PASS=$((PASS + 1))
+else
+  FAIL=$((FAIL + 1)); FAILURES+=("[step-duration-format] expected 'LAYER=42 STEP=foo DURATION=<secs>', got '${__sd_out}'")
+fi
+# Graceful-degradation fallback: called outside a lifecycle (__LAYER_NUM unset) → LAYER=?
+unset __LAYER_NUM
+__sd_out2=$(emit_step_duration foo "$__sd_ts" 2>&1)
+__sd_re2='^LAYER=[?] STEP=foo DURATION=[0-9]+$'
+if [[ "$__sd_out2" =~ $__sd_re2 ]]; then
+  PASS=$((PASS + 1))
+else
+  FAIL=$((FAIL + 1)); FAILURES+=("[step-duration-fallback] expected 'LAYER=? STEP=foo DURATION=<secs>', got '${__sd_out2}'")
 fi
 
 # Summary.

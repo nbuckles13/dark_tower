@@ -451,6 +451,9 @@ if [ "$CMD" = "status" ] && [ "$EXIT_CODE" -eq 0 ]; then
         checked_at=$(echo "$RESULT_DATA" | jq -r '.checked_at')
 
         echo "=== Cluster Health (${checked_at}) ===" >&2
+        # COUPLED: scripts/layer7.sh's readiness grep (__cluster_ready/__cluster_setup_in_progress)
+        # parses these EXACT three lines (positive-match, fail-closed). Changing the wording here
+        # silently breaks Layer-7 readiness detection — keep in sync (task #56).
         echo "  Cluster exists:     ${cluster_exists}" >&2
         echo "  Pods healthy:       ${pods_healthy}" >&2
         echo "  Setup in progress:  ${setup_in_progress}" >&2
