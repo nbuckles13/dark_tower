@@ -39,7 +39,7 @@
 - Guard policy binary (ADR-0034, lands Wave 1; subcommand-per-policy, clap dispatcher, STATUS line emission per ADR-0033 §6) -> `crates/dt-guard/`
 - Guard shell wrapper shape (~7 LoC invoking `dt-guard <subcommand>` per ADR-0034 §3) -> `scripts/guards/simple/*.sh`
 - Workspace `disallowed_methods` convention (canonical-home `Lazy<Regex>` enforcement per ADR-0034 §6) -> `clippy.toml`
-- Devloop Layer 7 (env-tests in validation pipeline) -> `scripts/layer7.sh` (mechanism: two-phase classifier, four STATUS lanes); failure-mode mapping -> `docs/runbooks/devloop-validation.md §6.7`; Lead attempt-policy -> `.claude/skills/devloop/SKILL.md`
+- Devloop Layer 7 (env-tests in validation pipeline) -> `scripts/layer7.sh` (mechanism: two-phase classifier, four STATUS lanes); failure-mode mapping -> `docs/runbooks/devloop-validation.md` §6.7; Lead attempt-policy -> `.claude/skills/devloop/SKILL.md`
 - Docker Compose (local tests) -> `docker-compose.test.yml`
 - Dev TLS cert generation (CA + MC + MH certs) -> `scripts/generate-dev-certs.sh`
 - CI pipeline -> `.github/workflows/ci.yml`

@@ -311,8 +311,9 @@ Loki note (ruling #7): the dev cluster **does** deploy Loki (`infra/kind/scripts
 
 ## Accepted Deferrals
 
-1. **env-test cold-Loki flake → env-tests/observability owner** (NOT fixed here — out of scope per task: "changing the env-tests crate is out of scope"). `crates/env-tests/tests/30_observability.rs:116` (`test_all_services_have_logs_in_loki`) hard-asserts `is_loki_available()` (`GET /ready`) with NO retry, despite the crate having `src/eventual.rs::assert_eventually`. Surfaced by THIS task's first live Layer-7 run; Layer 7 correctly surfaced it as a loud `STATUS=FAIL` (no masking). Tracked in `docs/TODO.md` §"Env-Test Resilience". Fix = wrap the availability gate in `assert_eventually(LogAggregation, …)` OR conditional-skip when Loki is None. **Cold-start mitigation now landed (deferral #2 / Phase-1f):** layer7.sh waits for Loki `/ready` before the suite, so the COLD-start flake is gone; this crate fix now matters only for a GENUINELY-ABSENT Loki (Phase-1f soft-warns + the suite then FAILs loudly with the pre-attributing WARN — no masking).
-2. **Phase-1e observability-endpoint readiness poll — RESOLVED, NOT deferred (user chose option (a), implemented).** ~~Was pending a/b.~~ The user ruled (a): Phase-1f now polls the observability HTTP `/ready` endpoints (the suite-facing `ENV_TEST_*_URL`) before the suite, bounded by `DEVLOOP_HEALTH_BUDGET`, with **per-probe disposition** (@semantic-guard) — Prometheus HARD (`/-/ready` → `PRECONDITION_FAILURE observability-prometheus-not-ready`), Loki SOFT (`/ready` → loud self-attributing WARN + proceed; @observability), Grafana skipped. So the cold-Loki cold-start becomes a Phase-1 WAIT, not a Phase-2 FAIL. Landed in `layer7.sh` (`__wait_http_ready` + Phase-1f) + the `DEVLOOP_TEST`-gated `HTTP_PROBE` seam (5th seam — @security to re-review the gate) + 7 hermetic test cases in `layer7.test.sh` (41/41). Kept entirely within `layer7.sh` (did NOT touch the env-tests crate). Listed here only to record the a/b outcome; it is no longer an open deferral.
+- `docs/TODO.md` §Env-Test Resilience — cold/absent-Loki retry for `test_all_services_have_logs_in_loki` (env-tests/observability owner)
+- Phase-1e observability-readiness poll — RESOLVED in-loop via `layer7.sh` Phase-1f (not deferred); see §Issues
+
 
 ---
 
