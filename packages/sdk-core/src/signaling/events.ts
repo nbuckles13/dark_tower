@@ -104,3 +104,29 @@ export interface SignalingJoinParams {
   /** Optional advertised capabilities. */
   readonly capabilities?: SignalingCapabilities;
 }
+
+/**
+ * Plain, per-MH connection-outcome report — the boundary INPUT to
+ * {@link SignalingClient.sendMediaConnectionUpdate}. PRODUCED by `MediaTransport`
+ * (media layer) and CONSUMED by `SignalingClient` (signaling layer); sited HERE in
+ * the foundational signaling layer (beside {@link SignalingJoinParams}) so the
+ * dependency edge runs media→signaling, never the inversion (@dry-reviewer #4 /
+ * @code-reviewer D). SignalingClient maps it onto the generated proto
+ * `MhConnectionStatus` internally — no `*_pb` type crosses this boundary.
+ *
+ * `failureReason`/`failureCode` are SDK-AUTHORED bounded classifications (never a
+ * raw transport-error message), present only when `state === 'failed'` (R-23).
+ * `mhUrl`/`failureReason`/`failureCode` are capped ≤256 UTF-8 bytes by SignalingClient.
+ */
+export interface MhConnectionStatusReport {
+  /** The MH URL this status pertains to (server-designated). */
+  readonly mhUrl: string;
+  /** Terminal per-MH outcome. */
+  readonly state: 'connected' | 'failed';
+  /** Bounded SDK failure reason (static string); set only when `state === 'failed'`. */
+  readonly failureReason?: string;
+  /** Bounded SDK failure code (enum-as-string); set only when `state === 'failed'`. */
+  readonly failureCode?: string;
+  /** Epoch ms the outcome was observed (injectable clock for deterministic tests). */
+  readonly observedAtMs: number;
+}

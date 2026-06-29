@@ -19,6 +19,67 @@ export const MAX_EMAIL_LENGTH = 254;
 /** Max password length (R-31). */
 export const MAX_PASSWORD_LENGTH = 128;
 
+// ============================================================================
+// Non-throwing truncators (cap-and-return; NEVER throw).
+// Distinct from the validate-or-throw guards below: these silently bound a
+// server-provided value so a too-long field can't crash a status report
+// (@dry-reviewer / @code-reviewer D1). Keep the two semantics visibly separate.
+// ============================================================================
+
+// ANCHOR (DRY): the MH-status field byte-cap mirrors the MC handler's truncation
+// bound — `MhConnectionStatus.{mh_url,failure_reason,failure_code}` are
+// client-controlled/untrusted, and MC truncates each at 256 BYTES via
+// `floor_char_boundary` before logging (proto/dark_tower/signaling/v1/signaling.proto
+// comment on `mh_url`). The SDK caps them at the SAME 256-byte boundary when
+// populating the outbound `MediaConnectionUpdate`, so nothing unbounded reaches the
+// wire (R-23/R-60). BYTES, not chars — see `capUtf8Bytes`.
+export const MAX_MH_URL_BYTES = 256;
+
+const UTF8_ENCODER = /*@__PURE__*/ new TextEncoder();
+
+/**
+ * Truncate `value` to at most `maxBytes` UTF-8 bytes WITHOUT splitting a multi-byte
+ * codepoint (mirrors Rust `str::floor_char_boundary`). Returns `value` unchanged
+ * when it already fits. Unlike the `validate*` helpers this does NOT throw — a
+ * too-long server-provided value is silently truncated, never a thrown error that
+ * would crash the status report (security/DRY review: truncate, don't reject).
+ *
+ * Counts BYTES (`TextEncoder`), not `.length` — a single emoji is 1 `.length` unit
+ * (or 2 with surrogates) but up to 4 UTF-8 bytes, and MC's bound is byte-based.
+ */
+export function capUtf8Bytes(value: string, maxBytes: number): string {
+  // Fast path: most values are short ASCII well under the cap.
+  if (value.length <= maxBytes && UTF8_ENCODER.encode(value).length <= maxBytes) {
+    return value;
+  }
+  // Walk codepoints (for…of iterates by codepoint, never a lone surrogate),
+  // accumulating UTF-8 byte length; stop BEFORE the cap would be exceeded.
+  let bytes = 0;
+  let out = '';
+  for (const ch of value) {
+    const chBytes = UTF8_ENCODER.encode(ch).length;
+    if (bytes + chBytes > maxBytes) break;
+    bytes += chBytes;
+    out += ch;
+  }
+  return out;
+}
+
+/**
+ * Cap an MH-status string field at {@link MAX_MH_URL_BYTES} (256) UTF-8 bytes on a
+ * codepoint boundary. Applied to `mh_url` / `failure_reason` / `failure_code` when
+ * the SDK builds an outbound `MhConnectionStatus` (R-60 / R-23).
+ */
+export function capMhUrl(value: string): string {
+  return capUtf8Bytes(value, MAX_MH_URL_BYTES);
+}
+
+// ============================================================================
+// Validate-or-throw input guards (R-31): reject over-long / malformed input
+// BEFORE any network call by throwing `ValidationError`. Opposite semantics to
+// the non-throwing truncators above — these REJECT, they do not truncate.
+// ============================================================================
+
 // ANCHOR (DRY): the subdomain rule is the SOURCE-OF-TRUTH mirror of the Rust side.
 // AC identifies orgs by subdomain (ADR-0020); the client-side guard MUST match the
 // server's accepted shape exactly to prevent subdomain-injection at URL-interpolation

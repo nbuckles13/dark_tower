@@ -29,3 +29,9 @@ export {
 export { NetworkError, NetworkErrorReason } from './NetworkError.js';
 
 export { ValidationError } from './ValidationError.js';
+
+export { MediaConnectionError, MediaConnectionErrorCode } from './MediaConnectionError.js';
+export type {
+  MediaConnectionErrorOptions,
+  RedactedMediaConnectionError,
+} from './MediaConnectionError.js';

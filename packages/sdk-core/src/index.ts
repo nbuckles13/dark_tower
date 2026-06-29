@@ -84,6 +84,12 @@ export { ValidationError } from './errors/ValidationError.js';
 export { SignalingError, SignalingErrorCode } from './errors/SignalingError.js';
 export type { RedactedSignalingError, SignalingErrorOptions } from './errors/SignalingError.js';
 
+export { MediaConnectionError, MediaConnectionErrorCode } from './errors/MediaConnectionError.js';
+export type {
+  MediaConnectionErrorOptions,
+  RedactedMediaConnectionError,
+} from './errors/MediaConnectionError.js';
+
 // --- Telemetry scaffolding (R-19, R-24, R-25, R-26) ---
 
 export type { MetricLabels, MetricsSink } from './telemetry/MetricsSink.js';
@@ -125,9 +131,39 @@ export type {
 export { ParticipantLeaveReason } from './signaling/events.js';
 export type {
   JoinedEvent,
+  MhConnectionStatusReport,
   ParticipantJoinedEvent,
   ParticipantLeftEvent,
   RosterParticipant,
   SignalingCapabilities,
   SignalingJoinParams,
 } from './signaling/events.js';
+
+// --- Shared typed event emitter (R-22 base for the media/session emitters) ---
+
+export { TypedEventEmitter } from './events/TypedEventEmitter.js';
+export type { EventListener } from './events/TypedEventEmitter.js';
+
+// --- Media transport (R-20, R-21, R-58, R-60 SDK side) ---
+
+export { MediaTransport } from './media/MediaTransport.js';
+export { DEFAULT_MH_CONNECT_TIMEOUT_MS } from './media/events.js';
+export type {
+  MediaConnectionState,
+  MediaTransportEventMap,
+  MediaTransportOptions,
+  RunInContext,
+} from './media/events.js';
+
+// --- MeetingSession facade (R-22) — the public SDK entry point ---
+
+export { MeetingSession } from './session/MeetingSession.js';
+export { MeetingSessionState } from './session/events.js';
+export type {
+  JoinCredentials,
+  JoinOptions,
+  LoginCredentials,
+  MeetingSessionEventMap,
+  MeetingSessionOptions,
+  RegisterCredentials,
+} from './session/events.js';

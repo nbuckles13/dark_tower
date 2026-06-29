@@ -33,6 +33,8 @@ export const SdkErrorCode = {
   Meeting: 'MEETING',
   /** MC (meeting-controller) WebTransport signaling failure (proto `ErrorMessage`, framing, or transport close). */
   Signaling: 'SIGNALING',
+  /** MH (media-handler) WebTransport connect failure during the active/active media handshake. */
+  Media: 'MEDIA',
   /** Client-side bounded-input / subdomain / meeting-code validation failure (pre-network). */
   Validation: 'VALIDATION',
   /** `fetch` rejected (DNS/TLS/offline) or the response body was not a usable envelope. */

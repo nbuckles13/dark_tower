@@ -30,13 +30,16 @@
 // instance, logged, or placed on any error. Unknown ServerMessage variants log the
 // `message.case` discriminant only — never the decoded payload.
 
-import { create, fromBinary, toBinary } from '@bufbuild/protobuf';
+import { create, fromBinary } from '@bufbuild/protobuf';
+import { timestampFromDate } from '@bufbuild/protobuf/wkt';
 import { context, SpanStatusCode, trace } from '@opentelemetry/api';
 import type { Span } from '@opentelemetry/api';
 
-import { encodeFrame, FrameDecoder, FramingError } from '../framing/length-prefix.js';
-import { injectIntoClientMessage } from '../telemetry/tracePropagation.js';
+import { FrameDecoder, FramingError } from '../framing/length-prefix.js';
+import { sendFramedMessage } from '../framing/sendFramed.js';
+import { TypedEventEmitter } from '../events/TypedEventEmitter.js';
 import { getTracer } from '../telemetry/telemetryConfig.js';
+import { capMhUrl } from '../validation/limits.js';
 import { connect as defaultConnect } from '../transport/BrowserWebTransport.js';
 import type {
   IWebTransport,
@@ -47,8 +50,11 @@ import type { WebTransportConnectOptions } from '../transport/types.js';
 import { SignalingError, SignalingErrorCode } from '../errors/SignalingError.js';
 import {
   ClientMessageSchema,
+  ConnectionState,
   ErrorCode,
   JoinRequestSchema,
+  MediaConnectionUpdateSchema,
+  MhConnectionStatusSchema,
   ParticipantCapabilitiesSchema,
   ServerMessageSchema,
 } from '../proto/dark_tower/signaling/v1/signaling_pb.js';
@@ -62,6 +68,7 @@ import { isAuthClass, mapErrorCode, staticMessageFor } from './errorCodeMap.js';
 import { mapLeaveReason } from './events.js';
 import type {
   JoinedEvent,
+  MhConnectionStatusReport,
   ParticipantJoinedEvent,
   ParticipantLeftEvent,
   SignalingJoinParams,
@@ -126,8 +133,6 @@ export interface SignalingEventMap {
   error: SignalingError;
 }
 
-type Listener<K extends keyof SignalingEventMap> = (payload: SignalingEventMap[K]) => void;
-
 interface Deferred<T> {
   readonly promise: Promise<T>;
   resolve(value: T): void;
@@ -164,14 +169,14 @@ const defaultLogger: SignalingLogger = {
  *   webtransportEndpoint, meetingId, joinToken, participantName,
  * });
  */
-export class SignalingClient {
+export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
   readonly #connectFn: WebTransportConnectFn;
   readonly #logger: SignalingLogger;
   readonly #joinTimeoutMs: number;
-  readonly #listeners = new Map<keyof SignalingEventMap, Set<(payload: never) => void>>();
 
   #transport: IWebTransport | undefined;
   #reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+  #stream: WebTransportBidirectionalStream | undefined;
   #span: Span | undefined;
   #join!: Deferred<JoinedEvent>;
   #joinTimer: ReturnType<typeof setTimeout> | undefined;
@@ -184,6 +189,7 @@ export class SignalingClient {
   #bindingToken: string | undefined;
 
   constructor(options: SignalingClientOptions = {}) {
+    super();
     this.#connectFn = options.connect ?? defaultConnect;
     this.#logger = options.logger ?? defaultLogger;
     this.#joinTimeoutMs = options.joinTimeoutMs ?? DEFAULT_JOIN_TIMEOUT_MS;
@@ -203,27 +209,6 @@ export class SignalingClient {
    */
   get bindingToken(): string | undefined {
     return this.#bindingToken;
-  }
-
-  /**
-   * Register a listener for a typed signaling event. Returns an unsubscribe
-   * function.
-   */
-  on<K extends keyof SignalingEventMap>(type: K, listener: Listener<K>): () => void {
-    let set = this.#listeners.get(type);
-    if (set === undefined) {
-      set = new Set();
-      this.#listeners.set(type, set);
-    }
-    set.add(listener as (payload: never) => void);
-    return () => {
-      this.off(type, listener);
-    };
-  }
-
-  /** Remove a previously-registered listener. */
-  off<K extends keyof SignalingEventMap>(type: K, listener: Listener<K>): void {
-    this.#listeners.get(type)?.delete(listener as (payload: never) => void);
   }
 
   /**
@@ -295,8 +280,10 @@ export class SignalingClient {
     await transport.ready;
     if (this.#terminated) return;
 
-    // R-16: the FIRST bidirectional stream carries the JoinRequest.
+    // R-16: the FIRST bidirectional stream carries the JoinRequest. Stored so
+    // post-join sends (task #14 `sendMediaConnectionUpdate`) reuse the SAME stream.
     const stream = await transport.createBidirectionalStream();
+    this.#stream = stream;
     if (this.#terminated) return;
 
     const caps = params.capabilities;
@@ -331,21 +318,67 @@ export class SignalingClient {
     void this.#runReadLoop(stream);
   }
 
+  /**
+   * Thin private wrapper over the shared {@link sendFramedMessage} pipeline (the
+   * extract-on-second-use: the SAME inject/frame/write core also serves the MH
+   * `MhClientMessage` send in `MediaTransport`). Kept private so `join()` and
+   * `sendMediaConnectionUpdate()` route their `ClientMessage` sends through
+   * SignalingClient's own method; the single `injectIntoClientMessage` call lives
+   * inside the shared leaf. Callers wrap this in `context.with(...)` for trace.
+   */
   async #sendClientMessage(
     stream: WebTransportBidirectionalStream,
     clientMessage: ClientMessage,
   ): Promise<void> {
-    // R-19: single trace-injection call site (no hand-rolled propagation.inject).
-    injectIntoClientMessage(clientMessage);
-    const bytes = toBinary(ClientMessageSchema, clientMessage);
-    const frame = encodeFrame(bytes);
-    const writer = stream.writable.getWriter();
-    try {
-      await writer.write(frame);
-    } finally {
-      // Release immediately — the long-lived connection holds no writable lock.
-      writer.releaseLock();
+    await sendFramedMessage(stream, ClientMessageSchema, clientMessage);
+  }
+
+  /**
+   * Run `fn` SYNCHRONOUSLY inside the active `dt_client.join` span context (R-58).
+   * Lets a caller (e.g. `MediaTransport.connectAll`) inject W3C trace context onto
+   * an outbound MH envelope from the SAME join trace this client owns — WITHOUT
+   * relocating span ownership. The wrap MUST be synchronous around the inject call
+   * (the global StackContextManager does not survive an `await`). No-op (`fn()`
+   * under the current context) when telemetry is unconfigured (`#span` undefined).
+   */
+  runInJoinContext<T>(fn: () => T): T {
+    const span = this.#span;
+    if (span === undefined) return fn();
+    return context.with(trace.setSpan(context.active(), span), fn);
+  }
+
+  /**
+   * Send ONE post-join `MediaConnectionUpdate` over the existing MC stream (R-60/R-21),
+   * reporting per-MH terminal state. Maps the plain {@link MhConnectionStatusReport}s
+   * to proto `MhConnectionStatus` internally (no generated type crosses the public
+   * boundary). `mhUrl`/`failureReason`/`failureCode` are capped ≤256 UTF-8 bytes;
+   * `observedAtMs` → proto `Timestamp`. Trace context is injected on the SAME single
+   * path `join()` uses (inside `context.with(#span)`).
+   *
+   * @throws {SignalingError} `Transport` if called before join settled or after teardown.
+   */
+  async sendMediaConnectionUpdate(reports: readonly MhConnectionStatusReport[]): Promise<void> {
+    const stream = this.#stream;
+    if (stream === undefined || this.#terminated || !this.#joinSettled) {
+      throw new SignalingError(
+        SignalingErrorCode.Transport,
+        'sendMediaConnectionUpdate requires a settled, open join',
+      );
     }
+    const statuses = reports.map((r) =>
+      create(MhConnectionStatusSchema, {
+        mhUrl: capMhUrl(r.mhUrl),
+        state: r.state === 'connected' ? ConnectionState.CONNECTED : ConnectionState.FAILED,
+        ...(r.failureReason !== undefined ? { failureReason: capMhUrl(r.failureReason) } : {}),
+        ...(r.failureCode !== undefined ? { failureCode: capMhUrl(r.failureCode) } : {}),
+        observedAt: timestampFromDate(new Date(r.observedAtMs)),
+      }),
+    );
+    const update = create(MediaConnectionUpdateSchema, { statuses });
+    const clientMessage = create(ClientMessageSchema, {
+      message: { case: 'mediaConnectionUpdate', value: update },
+    });
+    await this.runInJoinContext(() => this.#sendClientMessage(stream, clientMessage));
   }
 
   // ----------------------------------------------------------------------------
@@ -407,14 +440,14 @@ export class SignalingClient {
           correlationId: jr.correlationId,
           bindingToken: jr.bindingToken,
         };
-        this.#emit('joined', event);
+        this.emit('joined', event);
         this.#settleJoinSuccess(event);
         return;
       }
       case 'participantJoined': {
         const participant = message.value.participant;
         if (participant !== undefined) {
-          this.#emit('participantJoined', {
+          this.emit('participantJoined', {
             participant: { participantId: participant.participantId, name: participant.name },
           });
         }
@@ -422,7 +455,7 @@ export class SignalingClient {
       }
       case 'participantLeft': {
         const pl = message.value;
-        this.#emit('participantLeft', {
+        this.emit('participantLeft', {
           participantId: pl.participantId,
           reason: mapLeaveReason(pl.reason),
         });
@@ -466,7 +499,7 @@ export class SignalingClient {
     if (!this.#joinSettled) {
       this.#settleJoinFailure(error);
     } else {
-      this.#emit('error', error);
+      this.emit('error', error);
     }
     if (closeConnection) {
       // R-18: typed close reason. Triggers `transport.closed` → #onTransportClosed
@@ -509,7 +542,7 @@ export class SignalingClient {
       if (this.#started && !this.#joinSettled) {
         this.#settleJoinFailure(error);
       } else if (this.#joinSettled) {
-        this.#emit('error', error);
+        this.emit('error', error);
       }
     } else if (this.#started && !this.#joinSettled) {
       // Graceful teardown before join completed → reject the pending join.
@@ -603,14 +636,5 @@ export class SignalingClient {
         ...(cause !== undefined ? { cause } : {}),
       },
     );
-  }
-
-  #emit<K extends keyof SignalingEventMap>(type: K, payload: SignalingEventMap[K]): void {
-    const set = this.#listeners.get(type);
-    if (set === undefined) return;
-    // Copy so a listener that unsubscribes mid-emit doesn't mutate the iteration.
-    for (const listener of [...set]) {
-      (listener as Listener<K>)(payload);
-    }
   }
 }

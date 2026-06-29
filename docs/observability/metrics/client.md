@@ -49,7 +49,30 @@ prefix (ADR-0028 §9). They are emitted via the OTel JS `Meter` (production
 - **Implicit labels** (R-25): every metric carries `client_version`,
   `meeting_id_hash`, and `org_id`. **Never** label by `user_id`, `email`, `ip`,
   `user_agent`, or the **raw meeting id**. `meeting_id_hash` is a
-  SHA-256-truncated digest, never the raw code (R-23).
+  SHA-256-truncated digest, never the raw code (R-23). The SDK does NOT
+  auto-attach implicit labels at the sink (`OtelMetricsSink` passes
+  caller-supplied labels straight through) — `MeetingSession.join` computes the
+  label set ONCE and threads it into every emission site (the facade, plus
+  `MediaTransport` for `mh_connection_total`).
+- **Client-originated label conventions** (task #14 — the client ORIGINATES
+  these; there is no server-side equivalent to mirror):
+  - `meeting_id_hash` = **full SHA-256 over the `meetingId` UUID** (from
+    `JoinMeetingResponse.meetingId`, NOT the low-entropy 12-char meeting CODE),
+    hex-encoded, **truncated to 16 hex chars (64 bits)**. No salt (the UUID is
+    122-bit). Computed via `crypto.subtle.digest('SHA-256', …)` (R-32: a digest,
+    not randomness). The same digest is reused across all metrics (and the R-26
+    logs, when wired) so logs↔metrics correlate.
+    - **Pre-join-resolution sentinel** (task #14): the digest needs the `meetingId`
+      UUID, which is only known AFTER the GC `joinMeeting` response. A join that
+      fails BEFORE that point (`signup` / `gc_join` / `gc_create_token` stages) is
+      emitted with the sentinel `meeting_id_hash="none"`. So `meeting_id_hash="none"`
+      is the expected, bounded value for early-stage failures — not a bug or a
+      cardinality leak (it is a single fixed series).
+  - `org_id` = the org **subdomain** (PLAIN, not hashed — a public, org-level,
+    low-cardinality, non-PII identifier). NOTE: this is the client-visible
+    subdomain, NOT the server's org UUID; correlating client↔server metrics by
+    org requires the subdomain→uuid mapping. (If a real org UUID ever lands in an
+    API response, swap it — non-blocking follow-up.)
 
 ---
 
@@ -65,6 +88,20 @@ prefix (ADR-0028 §9). They are emitted via the OTel JS `Meter` (production
     `gc_join`, `mc_signaling_connect`, `mc_join_response`, `mh_connect`,
     `internal`
 - **Cardinality**: Low (2 statuses × 8 stages = 16, before implicit labels).
+- **Emission honesty** (task #14 — which stages the browser client actually
+  emits):
+  - `gc_create_token` is **RESERVED, never emitted by this client**. The browser
+    issues a single `joinMeeting` POST; the token-mint and join happen server-side
+    behind it, so the client cannot observe that sub-stage separately. It is kept
+    in the catalog only for parity with the server-side join pipeline.
+  - `mc_signaling_connect` vs `mc_join_response` are **distinct**:
+    `mc_signaling_connect` = the signaling channel never opened / no server response
+    arrived — the LOCAL `SignalingErrorCode`s `Transport`, `Framing`, `Timeout`;
+    `mc_join_response` = the channel opened but the server **rejected** the join via
+    an `ErrorMessage` — every server-authored `SignalingErrorCode` (`Unauthorized`,
+    `Forbidden`, `NotFound`, `Conflict`, `InternalError`, `CapacityExceeded`, …).
+    The client splits on local-vs-server origin, so a server `UNAUTHORIZED`/`NOT_FOUND`
+    is `mc_join_response`, while a connect timeout is `mc_signaling_connect`.
 - **Usage**: client-side join success rate + failure-stage distribution
   (complements the server-side `gc_meeting_join_*` family — the client sees
   stages the server cannot, e.g. `mc_signaling_connect`, `mh_connect`).
@@ -101,6 +138,18 @@ prefix (ADR-0028 §9). They are emitted via the OTel JS `Meter` (production
   to `unknown`.
 - **Cardinality**: Low (2 statuses × 6 close reasons = 12, before implicit
   labels).
+- **Emission + success-sentinel semantics** (task #14): emitted FACADE-DERIVED
+  from `MeetingSession.join` off the `signaling.join()` resolve/reject (no
+  telemetry plumbing into the shipped `SignalingClient`). On **success**,
+  `close_reason` is the sentinel `normal` ("no abnormal close during join") — so
+  the success×{auth_failed,timeout,…} cells are unreachable by design; dashboards
+  should not read them as a gap. On **failure**, `close_reason` is mapped from the
+  bounded `SignalingErrorCode` (`Unauthorized`/`Forbidden`→`auth_failed`,
+  `Timeout`→`timeout`, `InternalError`→`server_error`, else
+  `normalizeCloseReason(closeCode)`) — the join-reject `SignalingError` usually
+  carries no numeric `closeCode`, so the code-based mapping alone would collapse
+  to `unknown`; the `SignalingErrorCode` mapping preserves the real signal on the
+  common failure paths.
 
 ### `dt_client_mh_connection_total`
 - **Type**: Counter
