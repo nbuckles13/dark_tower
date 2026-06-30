@@ -22,7 +22,7 @@
 
 | Field | Value |
 |-------|-------|
-| Phase | `PAUSED — Gate 2 blocked on env-test infra (ops devloop precedes)` |
+| Phase | `complete (GATE2=PASS; committed 303ec5d after the 2026-06-30 infra fixes unblocked Layer 7)` |
 | Implementer | `implementer` (global-controller) |
 | Implementing Specialist | `global-controller` |
 | Iteration | `1` |
