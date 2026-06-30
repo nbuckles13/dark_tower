@@ -74,8 +74,11 @@ lcov.info
 *.tfstate.backup
 .terraform.lock.hcl
 
-# Docker
-.dockerignore
+# NOTE: `.dockerignore` is intentionally NOT ignored — it is a committed build-context
+# control file. The service image builds (cargo-chef, `COPY . .` from the repo root) and
+# the devloop `git clone --local` build context both depend on it being tracked; ignoring
+# it silently restored the 27 GB `target/` to every build context (disk exhaustion). See
+# docs/devloop-outputs/2026-06-30-envtest-infra-reliability/main.md §0.
 
 # OS
 Thumbs.db

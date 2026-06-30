@@ -31,6 +31,11 @@ layer_lifecycle_begin 3
   run_and_emit "audit-suppressions-selftest" "${__here}/audit-suppressions-check.test.sh" || true
   run_and_emit "audit-gate-test" "${__here}/lang/_audit_gate.test.sh" || true
   run_and_emit "layer7-selftest" "${__here}/layer7.test.sh" || true
+  # Disk-guard self-test (envtest-infra-reliability devloop): forces
+  # check_build_disk_space's trip branch so the `REASON=insufficient-disk` operator contract
+  # (§6.7) is covered — Gate-2's rebuild only hits the guard's pass path. No cluster needed
+  # (real df, absurd DEVLOOP_MIN_DISK_GB).
+  run_and_emit "setup-disk-guard-selftest" "${__here}/setup.test.sh" || true
   # Orchestrator lane-integrity (task #56): exercises layer-all's exit-code/summary/budget/
   # bypass-closure behavior end-to-end via the DEVLOOP_TEST-gated LAYER_SCRIPT_DIR stub seam
   # — the layer-all-level seams layer7.test.sh structurally cannot reach. No cluster.

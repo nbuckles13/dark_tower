@@ -1,0 +1,68 @@
+# .dockerignore — shrink the Docker/Podman build context for the service images.
+#
+# The service Dockerfiles (infra/docker/{ac,gc,mc,mh}-service/Dockerfile) are cargo-chef
+# multi-stage builds that `COPY . .` from this repo root (the build CONTEXT is
+# ${PROJECT_ROOT}; see infra/kind/scripts/setup.sh:build_image and the host-side helper's
+# cmd_rebuild in crates/devloop-helper/src/commands.rs). Without this file the context
+# includes the ~27 GB host `target/`, which (×4 services, no GC) exhausts the host
+# container-storage filesystem mid-COPY ("no space left on device"). cargo-chef compiles
+# fresh in the container's own /build/target, so the host build artifacts are NEVER read —
+# excluding them is provably safe and only shrinks the context.
+#
+# Honored by BOTH engines: docker reads `.dockerignore`; podman/buildah read
+# `.containerignore` first, then fall back to `.dockerignore` — so this single file covers
+# both (the runtime is podman-or-docker per the detected KIND_EXPERIMENTAL_PROVIDER). The
+# ignore file is read from the CONTEXT ROOT (= repo root here), not next to the -f Dockerfile.
+#
+# RULE: exclude build-irrelevant trees ONLY. Everything the cargo-chef build reads MUST
+# stay: Cargo.toml, Cargo.lock, crates/** (sources + build.rs), proto/** (proto-gen/build.rs
+# compiles ../../proto/), migrations/** (the runtime stage COPYs /build/migrations), .cargo/,
+# .sqlx/. Patterns below are disjoint from those, so no negation (!) rules are needed.
+
+# --- Rust build artifacts (the 27 GB keystone) ---
+target/
+**/target/
+
+# --- VCS history (never a build input) ---
+.git/
+
+# --- JS/TS toolchain (the Rust services never read these) ---
+node_modules/
+**/node_modules/
+.pnpm-store/
+**/.pnpm-store/
+.nx/
+packages/
+dist/
+build/
+out/
+
+# --- Coverage / profiling outputs ---
+coverage/
+.nyc_output/
+lcov.info
+*.profraw
+*.profdata
+
+# --- Docs, IaC state, editor/OS cruft (not build inputs) ---
+docs/
+.terraform/
+*.tfstate
+*.tfstate.backup
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# --- Logs ---
+*.log
+logs/
+
+# --- Local env / secrets (never ship into the build context) ---
+.env
+.env.*
+
+# --- Sibling worktrees (live outside this context; listed defensively) ---
+worktrees/

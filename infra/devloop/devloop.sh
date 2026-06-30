@@ -152,6 +152,23 @@ cleanup() {
         kind delete cluster --name "devloop-${TASK_SLUG}" 2>/dev/null || true
     fi
 
+    # Reclaim the host build cruft this devloop produced — the service images and build
+    # cache nothing else GCs (the multi-hundred-GB leak that exhausts container storage
+    # over time; see docs/TODO.md §Devloop Container Resource Hygiene item A). CONSERVATIVE,
+    # dangling/unused-ONLY prune — NOT -af: per-slug image tagging is DEFERRED (item B), so
+    # the service images are still the shared `localhost/{ac,gc,mc,mh}-service:latest` tags.
+    # `-af` here would yank a *parallel* slug's :latest images mid-run. Dangling-only is
+    # cross-slug-safe: orphaned layers + unused build cache only, never a tagged image a
+    # concurrent devloop still references. Revisit (-> -af / per-slug filtered prune) once
+    # item B lands per-slug tags. podman-only by design — consistent with every other
+    # container op in this script; a docker-built host (KIND_EXPERIMENTAL_PROVIDER=docker)
+    # wouldn't be reclaimed here, acceptable under the podman-primary assumption.
+    if command -v podman &>/dev/null; then
+        echo "Reclaiming dangling images + unused build cache..."
+        podman image prune -f 2>/dev/null || true
+        podman builder prune -f 2>/dev/null || true
+    fi
+
     # Remove helper runtime directory
     rm -rf "$HELPER_RUNTIME_DIR"
 

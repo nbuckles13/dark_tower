@@ -273,6 +273,54 @@ create_namespaces() {
     log_info "Namespaces created."
 }
 
+# Fail fast BEFORE the first cold image build if the host container-storage filesystem
+# lacks headroom for a 4-service release build — rather than dying mid-COPY with "no space
+# left on device" after several minutes. Run-once (the first build_image call guards them
+# all); naturally skipped under --skip-build (build_image isn't called).
+#
+# $1 = the resolved container runtime (build_image's $CONTAINER_CMD). MUST be passed, NOT
+# re-derived: build_image defaults to `docker` when KIND_EXPERIMENTAL_PROVIDER is unset, so
+# a re-derived `podman` default here would `df` the WRONG runtime's graphroot on an
+# unset-provider host — measuring the wrong filesystem exactly when the guard matters.
+#
+# DEVLOOP_MIN_DISK_GB (default 15) is a fast-fail FLOOR, NOT a success guarantee: a fully
+# cold build cache can exceed it and still pass-then-die, so a pass means "not obviously
+# doomed", not "will succeed".
+#
+# Emits the relayed `PRECONDITION_FAILURE: … REASON=insufficient-disk` banner that surfaces
+# in layer7's Phase-1 cluster-setup/rebuild stderr (${DEVLOOP_TMP}/layer-7.stderr.log; the
+# §4 two-token convention — setup.sh is the third PRECONDITION_FAILURE emitter alongside
+# layer-all.sh + layer7.sh). See docs/runbooks/devloop-validation.md §6.7.
+_DT_DISK_CHECKED=false
+check_build_disk_space() {
+    local cmd="$1"
+    [[ "${_DT_DISK_CHECKED}" == "true" ]] && return 0
+    _DT_DISK_CHECKED=true
+    local min_gb="${DEVLOOP_MIN_DISK_GB:-15}" graphroot avail_gb
+    # ${cmd}'s container-storage root is where build layers land; fall back to the rootless
+    # default, then the rootful default, then PROJECT_ROOT's fs (always resolvable).
+    graphroot="$(${cmd} info --format '{{.Store.GraphRoot}}' 2>/dev/null || true)"
+    [[ -n "${graphroot}" && -d "${graphroot}" ]] || graphroot="${HOME}/.local/share/containers/storage"
+    [[ -d "${graphroot}" ]] || graphroot="/var/lib/containers/storage"
+    [[ -d "${graphroot}" ]] || graphroot="${PROJECT_ROOT}"
+    # `|| true`: this script is `set -euo pipefail`, so a non-zero df under pipefail would
+    # abort on this bare assignment — match the `graphroot=…|| true` line above. The
+    # downstream `[[ -n … ]] && (( … ))` guard is already set-e-safe (if-condition).
+    avail_gb="$(df -Pk "${graphroot}" 2>/dev/null | awk 'NR==2{printf "%d", $4/1024/1024}' || true)"
+    if [[ -z "${avail_gb}" ]]; then
+        # Unmeasurable (df/info failed). Fail OPEN — never false-positive-block a healthy
+        # build — but say so, so the case stays self-attributing rather than silently
+        # regressing to the old buried mid-COPY error. The build's own no-space error backstops.
+        echo "WARN: could not determine free space on ${graphroot}; skipping disk precondition (the build's own 'no space left on device' error remains the backstop)." >&2
+        return 0
+    fi
+    if (( avail_gb < min_gb )); then
+        echo "PRECONDITION_FAILURE: container-storage filesystem (${graphroot}) has ${avail_gb}GB free, below the ${min_gb}GB floor for a 4-service image build — a cold build would die mid-COPY ('no space left on device'). REASON=insufficient-disk" >&2
+        echo "  Fix: reclaim space — 'podman image prune -f && podman builder prune -f' (add -af only if no parallel devloops are running). See docs/runbooks/devloop-validation.md §6.7." >&2
+        exit 2
+    fi
+}
+
 # Build a container image, removing the old image if it was replaced.
 # Usage: build_image <tag> <dockerfile> <context-dir>
 build_image() {
@@ -283,6 +331,9 @@ build_image() {
     else
         CONTAINER_CMD="docker"
     fi
+    # Fast-fail on insufficient host disk before the (multi-minute) cold build. Pass the
+    # resolved runtime so the guard measures the SAME runtime's graphroot (see fn header).
+    check_build_disk_space "$CONTAINER_CMD"
     local OLD_IMAGE_ID
     OLD_IMAGE_ID=$(${CONTAINER_CMD} images -q "$TAG" 2>/dev/null || true)
     ${CONTAINER_CMD} build -t "$TAG" -f "$DOCKERFILE" "$CONTEXT"
@@ -915,4 +966,8 @@ main() {
     print_access_info
 }
 
-main "$@"
+# Run main only when executed, not when sourced (the self-test sources this script to
+# exercise check_build_disk_space directly). Mirrors scripts/layer7.sh's BASH_SOURCE guard.
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi
