@@ -191,7 +191,15 @@ __wait_cluster_ready() {
 # Args: $1=url  $2=budget-seconds (default 300)  Returns: 0 ready / 1 timeout.
 __wait_http_ready() {
   local url="$1" budget="${2:-300}" waited=0
-  until $HTTP_PROBE "$url" >/dev/null 2>&1; do
+  # $HTTP_PROBE is a multi-word command string ("curl -fsS -o /dev/null --max-time 5").
+  # This script runs under IFS=$'\n\t' (no space), so an UNQUOTED $HTTP_PROBE would NOT
+  # word-split into argv — the whole string would be treated as a single command name and
+  # fail with exit 127 (command-not-found) on every probe, manifesting as a phantom
+  # observability-*-not-ready against a perfectly healthy endpoint. Split on space into an
+  # array so the probe runs regardless of the script's IFS (mirrors the DEVLOOP_ENV_TEST_CMD
+  # `IFS=' ' read -r -a` handling in __layer7_main).
+  local -a probe; IFS=' ' read -r -a probe <<<"$HTTP_PROBE"
+  until "${probe[@]}" "$url" >/dev/null 2>&1; do
     if (( waited >= budget )); then
       return 1
     fi

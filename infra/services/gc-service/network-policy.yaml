@@ -85,6 +85,21 @@ spec:
     ports:
     - protocol: TCP
       port: 5432
+  # Allow egress to the OTel Collector (OTLP-HTTP) — the /api/v1/telemetry proxy
+  # forward path (R-2 / task #10). The collector's ingress netpol already admits
+  # gc-service on :4318; this is the symmetric egress allow (zero-trust requires
+  # BOTH). Without it GC's forward is blocked by its own egress policy and the
+  # handler returns 502 (surfaced by 31_gc_telemetry env-tests).
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: dark-tower
+      podSelector:
+        matchLabels:
+          app: otel-collector
+    ports:
+    - protocol: TCP
+      port: 4318
   # Allow DNS resolution
   - to:
     - namespaceSelector:

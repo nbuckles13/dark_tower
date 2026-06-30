@@ -335,6 +335,17 @@ mk_busy_dc "${WORK}/dc-busy-always" 1; : > "$BUSY_CNT"
 rc=$( source "$LAYER7" >/dev/null 2>&1; set +e; DEV_CLUSTER="${WORK}/dc-busy-always" DEVLOOP_SETUP_POLL_BUDGET=0 __dev_cluster_setup >/dev/null 2>&1; echo $? )
 [[ "$rc" -ne 0 ]] && PASS=$((PASS+1)) || { FAIL=$((FAIL+1)); FAILURES+=("[busy-setup-persistent-nonzero] persistent (busy) returned 0"); }
 
+# === Phase-1f probe is IFS-immune (regression for the 2026-06-30 root-cause) ==========
+# layer7.sh runs under `IFS=$'\n\t'` (no space). __wait_http_ready must split the multi-word
+# $HTTP_PROBE ("curl -fsS …") into an ARRAY — an unquoted `$HTTP_PROBE` would NOT word-split
+# under that IFS, so the whole string becomes one command name → exit 127 → a phantom
+# observability-*-not-ready against a perfectly HEALTHY endpoint. (The fake probe used by the
+# flow tests above is single-token, which never exercised this — the gap that hid the bug.)
+# A multi-word probe that returns 0 ONLY if argv-split correctly: `true` ignores its args and
+# exits 0; unsplit, "true --max-time 5" is command-not-found (127). budget=0 ⇒ one probe only.
+rc=$( source "$LAYER7" >/dev/null 2>&1; set +e; HTTP_PROBE="true --max-time 5"; __wait_http_ready "http://endpoint/-/ready" 0 >/dev/null 2>&1; echo $? )
+assert_exit "wait-http-ready-splits-multiword-probe-under-strict-IFS" 0 "$rc"
+
 # NOTE: orchestrator integrity (does PRECONDITION_FAILURE/SKIPPED-NO-CLUSTER survive
 # layer-all.sh's loop → LAYER_ALL_EXIT + summary cell + gate2 verdict + the rc FLOOR) is
 # covered comprehensively by scripts/layer-all.test.sh (@test-owned, also wired into
