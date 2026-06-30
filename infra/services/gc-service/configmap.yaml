@@ -23,3 +23,11 @@ data:
   # Overrides the compiled-in DEFAULT_OTEL_COLLECTOR_ENDPOINT (config.rs:34-35),
   # whose wrong `default` namespace is tracked for fix in docs/TODO.md (R-55/GC).
   OTEL_COLLECTOR_ENDPOINT: "http://otel-collector.dark-tower:4318"
+  # Telemetry proxy size cap + per-user rate limit are intentionally NOT set here,
+  # so GC uses the compiled-in defaults (config.rs): TELEMETRY_PROXY_MAX_BYTES =
+  # 256 KiB, TELEMETRY_PROXY_RATE_LIMIT_PER_MINUTE = 60 (per-pod, in-memory GCRA).
+  # COUPLING (reverse cross-ref): crates/env-tests/tests/31_gc_telemetry.rs depends
+  # on those exact defaults (the 413 oversize case + the 429 rate-limit case). If
+  # you set TELEMETRY_PROXY_MAX_BYTES or TELEMETRY_PROXY_RATE_LIMIT_PER_MINUTE here,
+  # update that env-test's constants in lockstep (mirrors the bidirectional
+  # OTEL_COLLECTOR_ENDPOINT ↔ config.rs cross-ref above).

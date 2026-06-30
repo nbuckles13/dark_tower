@@ -581,6 +581,36 @@ impl GcClient {
         Ok(http_request.send().await?)
     }
 
+    /// Make a raw POST to the telemetry proxy and return the response.
+    ///
+    /// Targets `POST /api/v1/telemetry/v1/{signal_path}` where `signal_path` is
+    /// `"metrics"` or `"traces"` (mirrors the GC handlers `ingest_metrics` /
+    /// `ingest_traces`). Sends the raw protobuf `body`; sets `Authorization:
+    /// Bearer` only when `token` is `Some`, and `Content-Type` only when
+    /// `content_type` is `Some` (passing `None` omits the header — exercises the
+    /// 415 path). Returns the raw response so tests can assert status codes
+    /// (202/401/413/415/429) on every path.
+    pub async fn raw_ingest_telemetry(
+        &self,
+        signal_path: &str,
+        token: Option<&str>,
+        content_type: Option<&str>,
+        body: Vec<u8>,
+    ) -> Result<reqwest::Response, GcClientError> {
+        let url = format!("{}/api/v1/telemetry/v1/{}", self.base_url, signal_path);
+
+        let mut request = self.http_client.post(&url).body(body);
+
+        if let Some(ct) = content_type {
+            request = request.header("Content-Type", ct);
+        }
+        if let Some(t) = token {
+            request = request.header("Authorization", format!("Bearer {}", t));
+        }
+
+        Ok(request.send().await?)
+    }
+
     /// Handle response and parse JSON body.
     async fn handle_response<T: serde::de::DeserializeOwned>(
         &self,
