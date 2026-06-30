@@ -21,7 +21,7 @@
 
 | Field | Value |
 |-------|-------|
-| Phase | `validation (gate 2)` |
+| Phase | `complete (GATE2=PASS; committed cefd279)` |
 | Implementer | `team-lead` (Lead-driven root-cause + fix; user-directed direct fix) |
 
 ---
