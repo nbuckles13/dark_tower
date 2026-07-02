@@ -2950,23 +2950,40 @@ mod tests {
     #[sqlx::test(migrations = "../../migrations")]
     #[cfg_attr(coverage, ignore)]
     async fn test_issue_user_token_timing_attack_prevention(pool: PgPool) -> Result<(), AcError> {
+        // Robust timing methodology (mirrors test_timing_attack_prevention_invalid_client_id):
+        // measure MULTIPLE samples per path and compare the MINIMUM of each. Rationale — CI/host
+        // noise (scheduler contention, GC) only ever makes an operation SLOWER, never faster, so
+        // the fastest sample is the true uncontended time. A single-sample comparison (the old
+        // shape) flakes when one lone bcrypt-cost-12 call (~400ms) is descheduled by >30% under
+        // load, even though the true existing-vs-nonexistent difference is ~0.4-2%. Unique emails
+        // per iteration avoid the 5-attempt/window rate limit (which would early-return and
+        // corrupt timings), and a warmup pass removes the cold-first-call bias.
+        const ITERATIONS: usize = 5;
+
         let master_key = crypto::generate_random_bytes(32)?;
         key_management_service::initialize_signing_key(&pool, &master_key, "test").await?;
 
-        // Create org and user
         let org_id = create_test_org(&pool, "timing-test").await;
         let password = "secure-password-123";
-        let email = "timing@example.com";
-        let _user_id = create_test_user(&pool, org_id, email, password).await;
 
-        // Measure time for existing user with wrong password
-        let start = Instant::now();
+        // Create ITERATIONS + 1 real users (unique emails: index 0 for warmup, 1..=N for samples).
+        for i in 0..=ITERATIONS {
+            let _ = create_test_user(
+                &pool,
+                org_id,
+                &format!("timing-{}@example.com", i),
+                password,
+            )
+            .await;
+        }
+
+        // Warmup both paths once (cold connection-pool/cache/lazy-init costs must not bias sample 1).
         let _ = issue_user_token(
             &pool,
             &master_key,
             &master_key,
             org_id,
-            email,
+            "timing-0@example.com",
             "wrong-password",
             None,
             None,
@@ -2974,16 +2991,12 @@ mod tests {
             DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
         )
         .await;
-        let existing_user_duration = start.elapsed();
-
-        // Measure time for non-existent user
-        let start = Instant::now();
         let _ = issue_user_token(
             &pool,
             &master_key,
             &master_key,
             org_id,
-            "nonexistent@example.com",
+            "nonexistent-0@example.com",
             "some-password",
             None,
             None,
@@ -2991,19 +3004,69 @@ mod tests {
             DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
         )
         .await;
-        let nonexistent_user_duration = start.elapsed();
 
-        // Both should take similar time due to dummy hash verification
-        let time_diff = existing_user_duration.abs_diff(nonexistent_user_duration);
-        let max_time = existing_user_duration.max(nonexistent_user_duration);
+        let mut existing_times = Vec::with_capacity(ITERATIONS);
+        let mut nonexistent_times = Vec::with_capacity(ITERATIONS);
+        for i in 1..=ITERATIONS {
+            // Existing user with wrong password (real bcrypt verify) — unique email per iteration.
+            let start = Instant::now();
+            let _ = issue_user_token(
+                &pool,
+                &master_key,
+                &master_key,
+                org_id,
+                &format!("timing-{}@example.com", i),
+                "wrong-password",
+                None,
+                None,
+                DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
+                DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
+            )
+            .await;
+            existing_times.push(start.elapsed());
+
+            // Non-existent user (dummy hash verify) — unique email per iteration.
+            let start = Instant::now();
+            let _ = issue_user_token(
+                &pool,
+                &master_key,
+                &master_key,
+                org_id,
+                &format!("nonexistent-{}@example.com", i),
+                "some-password",
+                None,
+                None,
+                DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
+                DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
+            )
+            .await;
+            nonexistent_times.push(start.elapsed());
+        }
+
+        // Compare minimums — both should be near-identical due to dummy-hash verification on the
+        // non-existent path (timing-attack prevention).
+        let existing_min = existing_times.iter().min().copied().unwrap();
+        let nonexistent_min = nonexistent_times.iter().min().copied().unwrap();
+        let time_diff = existing_min.abs_diff(nonexistent_min);
+        let max_time = existing_min.max(nonexistent_min);
         let diff_percentage = (time_diff.as_millis() as f64 / max_time.as_millis() as f64) * 100.0;
 
         assert!(
             diff_percentage < MAX_TIMING_VARIANCE_PERCENT,
-            "Timing difference too large: {}ms ({:.1}% of {}ms) - potential timing attack vulnerability",
+            "Timing difference too large: {}ms ({:.1}% of {}ms) - potential timing attack vulnerability.\n  \
+             Existing-user min: {:?}\n  \
+             Non-existent-user min: {:?}\n  \
+             Max allowed variance: {:.1}%\n  \
+             All existing times: {:?}\n  \
+             All non-existent times: {:?}",
             time_diff.as_millis(),
             diff_percentage,
-            max_time.as_millis()
+            max_time.as_millis(),
+            existing_min,
+            nonexistent_min,
+            MAX_TIMING_VARIANCE_PERCENT,
+            existing_times,
+            nonexistent_times
         );
 
         Ok(())
