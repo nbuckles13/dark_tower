@@ -586,13 +586,8 @@ were ratified by test + observability during implementation; see §Gate 2 PAUSED
 ## Accepted Deferrals
 
 - (none remain in this diff)
-
-Scope decisions (NOT deferrals): collector-emission verification for AC/MC/MH (→ tasks #25/#26/#27),
-`/v1/logs` (reserved-not-routed), camelCase wire-key env-test (covered by #46/#49/#51) — all
-explicitly out of scope per the task brief. The env-test-infra blockers this devloop surfaced
-(disk / Phase-1f / 502) were FIXED (not deferred) in the 2026-06-30 devloops; the residual
-per-slug-image-tagging (B) + `cmd_rebuild` disk-guard gap (C-followup) are tracked in `docs/TODO.md`
-§Devloop Container Resource Hygiene.
+- Scope decisions (NOT deferrals, per the task brief): collector-emission verification for AC/MC/MH → tasks #25/#26/#27; `/v1/logs` reserved-not-routed; camelCase wire-key env-test covered by #46/#49/#51.
+- The env-test-infra blockers this devloop surfaced (disk / Phase-1f / 502) were FIXED (not deferred) in the 2026-06-30 devloops; residual per-slug image tags (B) + `cmd_rebuild` disk-guard gap (C-followup) tracked in `docs/TODO.md` §Devloop Container Resource Hygiene.
 
 ---
 
