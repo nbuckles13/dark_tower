@@ -33,6 +33,10 @@ bytes = { workspace = true }
 # Tonic for the OTel gRPC interceptor (`observability::otel_grpc`).
 tonic = { workspace = true }
 
+# HTTP types (HeaderMap/HeaderName/HeaderValue) for the OTel HTTP-transport
+# adapter (`observability::otel_http`, R-56). Framework-agnostic — no axum dep.
+http = { workspace = true }
+
 # OpenTelemetry SDK + OTLP-gRPC exporter + tracing bridge for `observability::otel`.
 opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }

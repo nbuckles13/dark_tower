@@ -73,6 +73,29 @@ spec:
             configMapKeyRef:
               name: gc-service-config
               key: OTEL_COLLECTOR_ENDPOINT
+        # GC's own OTel SDK wiring (R-55, task #26) — distinct from
+        # OTEL_COLLECTOR_ENDPOINT above. Per-key configMapKeyRef (this
+        # Deployment does not use envFrom), so each new key needs its own entry.
+        - name: OTEL_ENABLED
+          valueFrom:
+            configMapKeyRef:
+              name: gc-service-config
+              key: OTEL_ENABLED
+        - name: OTLP_ENDPOINT
+          valueFrom:
+            configMapKeyRef:
+              name: gc-service-config
+              key: OTLP_ENDPOINT
+        - name: OTEL_SAMPLE_RATE
+          valueFrom:
+            configMapKeyRef:
+              name: gc-service-config
+              key: OTEL_SAMPLE_RATE
+        - name: DEPLOYMENT_ENVIRONMENT
+          valueFrom:
+            configMapKeyRef:
+              name: gc-service-config
+              key: DEPLOYMENT_ENVIRONMENT
         - name: DATABASE_URL
           valueFrom:
             secretKeyRef:

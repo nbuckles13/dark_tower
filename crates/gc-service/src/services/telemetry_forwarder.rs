@@ -11,6 +11,7 @@
 //! without a real wall-clock wait).
 
 use crate::errors::GcError;
+use crate::services::trace_headers;
 use reqwest::Client;
 use std::time::Duration;
 use tracing::warn;
@@ -93,6 +94,14 @@ impl TelemetryForwarder {
             .client
             .post(&url)
             .header("Content-Type", "application/x-protobuf")
+            // R-56: inject the active span's W3C trace context so the
+            // "telemetry-proxy preserves trace context" property holds — the
+            // client's traceparent (extracted from the inbound proxy request
+            // at surface (a)) propagates through to the collector. Same
+            // shared helper as `ac_client.rs`'s surface (b); this call site
+            // carries no other sensitive header, so applying it is
+            // mechanical.
+            .headers(trace_headers())
             .body(body)
             .send()
             .await

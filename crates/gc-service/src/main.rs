@@ -51,9 +51,46 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize tracing with JSON structured logging
-    // JSON format enables robust parsing in Promtail without brittle regex
+    // Load configuration BEFORE the tracing subscriber: the R-55 OTel layer
+    // needs the endpoint/sample-rate from config, and the subscriber can only
+    // be `.init()`'d once. A config-load failure here propagates as a non-zero
+    // exit (Debug to stderr) — nothing is lost because no spans/logs have been
+    // emitted yet, and ConfigError carries no secret material. Mirrors AC's
+    // task #25 main.rs ordering.
+    let config = Config::from_env()?;
+
+    // R-55: initialize the OpenTelemetry SDK only when explicitly enabled
+    // (OTEL_ENABLED=true). `init_otel` is async, eagerly probes the collector,
+    // and fails hard at init on an unreachable/misconfigured endpoint so the
+    // pod fails K8s readiness instead of silently dropping spans. When OTel is
+    // disabled, `otel_config()` returns `None`, `init_otel` is never called
+    // (no probe), and no OTel layer is composed.
+    let otel = match config.otel_config() {
+        Some(otel_cfg) => Some(
+            common::observability::otel::init_otel(
+                "global-controller",
+                env!("CARGO_PKG_VERSION"),
+                &config.environment,
+                otel_cfg,
+            )
+            .await?,
+        ),
+        None => None,
+    };
+    // Split into the composable layer and the RAII guard. `_otel_guard` is
+    // held to the end of `main` so pending spans flush on shutdown via Drop;
+    // it is a NAMED binding (not bare `_`) so it is not dropped immediately.
+    let (otel_layer, _otel_guard) = match otel {
+        Some(init) => (Some(init.layer), Some(init.guard)),
+        None => (None, None),
+    };
+
+    // Initialize tracing with JSON structured logging. The OTel layer (if
+    // any) composes onto the bare registry first; the default-off path adds
+    // zero layers. JSON format enables robust parsing in Promtail without
+    // brittle regex.
     tracing_subscriber::registry()
+        .with(otel_layer)
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "gc_service=debug,tower_http=debug".into()),
@@ -70,12 +107,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         e
     })?;
     info!("Prometheus metrics recorder initialized");
-
-    // Load configuration
-    let config = Config::from_env().map_err(|e| {
-        error!("Failed to load configuration: {}", e);
-        e
-    })?;
 
     info!(
         region = %config.region,
@@ -252,11 +283,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         http_app.into_make_service_with_connect_info::<SocketAddr>(),
     );
 
-    // Start gRPC server with auth layer and both MC and MH services
+    // Start gRPC server with auth layer, both MC and MH services, and R-56
+    // inbound trace-context extraction (surface (d)).
+    //
+    // `TraceLayer::new_for_grpc()` is REQUIRED, not optional: without a
+    // span-creating layer on this builder, `otel_grpc::server_interceptor()`
+    // below runs with no active `tracing::Span` to attach a parent to —
+    // `Span::current()` resolves to the disabled/none span and
+    // `.set_parent()` on it is a silent no-op (verified against
+    // `GrpcAuthService::call`, which only emits `debug!`/`warn!` events, and
+    // against this builder, which previously had no span-creating layer at
+    // all). (Gate-1 finding, @observability — 2026-07-03 GC OTel wiring devloop.)
+    //
+    // ORDER MATTERS here, and it's the OPPOSITE convention from
+    // `axum::Router::layer` (see `routes/mod.rs`'s extraction-layer comment):
+    // `tonic::transport::Server::builder().layer(...)` composes via
+    // `tower::ServiceBuilder` semantics, where the FIRST `.layer()` added is
+    // OUTERMOST (runs first). `TraceLayer::new_for_grpc()` must be outermost
+    // — both so its span exists before `grpc_auth_layer`/the per-service
+    // interceptor run inside it, AND because `GrpcAuthService`'s hand-rolled
+    // `Service` impl (`grpc/auth_layer.rs`) requires its wrapped inner
+    // service's response body type to be exactly `tonic`'s `BoxBody` —
+    // `TraceLayer` changes that body type, so it must wrap `GrpcAuthService`
+    // from the outside, not be wrapped by it (confirmed by a body-type
+    // mismatch compile error when the order was reversed).
     let grpc_server = TonicServer::builder()
+        .layer(tower_http::trace::TraceLayer::new_for_grpc())
         .layer(grpc_auth_layer)
-        .add_service(GlobalControllerServiceServer::new(mc_service))
-        .add_service(MediaHandlerRegistryServiceServer::new(mh_service))
+        .add_service(GlobalControllerServiceServer::with_interceptor(
+            mc_service,
+            common::observability::otel_grpc::server_interceptor(),
+        ))
+        .add_service(MediaHandlerRegistryServiceServer::with_interceptor(
+            mh_service,
+            common::observability::otel_grpc::server_interceptor(),
+        ))
         .serve(grpc_addr);
 
     // Run both servers concurrently with graceful shutdown

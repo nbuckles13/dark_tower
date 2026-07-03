@@ -5,7 +5,10 @@
 use crate::auth::{JwksClient, JwtValidator};
 use crate::config::Config;
 use crate::handlers::{self, TelemetryState};
-use crate::middleware::{http_metrics_middleware, require_auth, require_user_auth, AuthState};
+use crate::middleware::{
+    extract_trace_context_middleware, http_metrics_middleware, require_auth, require_user_auth,
+    AuthState,
+};
 use crate::services::mc_client::McClientTrait;
 use axum::{
     extract::DefaultBodyLimit,
@@ -143,16 +146,46 @@ pub fn build_routes(
         ))
         .with_state(state);
 
-    // Merge routes and apply global middleware layers
-    // Layer order (bottom-to-top execution):
-    // 1. TimeoutLayer - Timeout the request (innermost)
-    // 2. TraceLayer - Log request details
-    // 3. http_metrics_middleware - Record ALL responses (outermost)
+    // Merge routes and apply global middleware layers.
+    //
+    // `axum::Router::layer` semantics: the *last*-added `.layer()` call is
+    // *outermost* and runs first on the request path (for
+    // `.layer(one).layer(two).layer(three)`, execution is
+    // `three → two → one → handler`). So in ADDED order below, execution
+    // (bottom-to-top of this list) is:
+    // 1. extract_trace_context_middleware - innermost, runs LAST before the
+    //    handler (see below for why this placement is required)
+    // 2. TraceLayer - creates + enters the request span
+    // 3. TimeoutLayer - times out the request
+    // 4. http_metrics_middleware - outermost, runs FIRST; records ALL
+    //    responses including framework-level errors like 415, 400, 404, 405
+    //
+    // (Corrected 2026-07-03, R-56 GC OTel wiring devloop: this comment
+    // previously had TimeoutLayer/TraceLayer's relative innermost/outer
+    // position backwards — TraceLayer, added first, is more inner than
+    // TimeoutLayer, added second, not the reverse.)
+    //
+    // `extract_trace_context_middleware` is placed as the new FIRST `.layer()`
+    // call — physically ABOVE `TraceLayer::new_for_http()` — so it is MORE
+    // INNER than `TraceLayer` and therefore executes AFTER `TraceLayer` has
+    // created and entered its request span, but BEFORE the handler. At that
+    // point `tracing::Span::current()` resolves to `TraceLayer`'s span, so
+    // the middleware's `.set_parent()` call (via
+    // `common::observability::otel_http::extract_trace_context`) correctly
+    // attaches the extracted W3C parent to it — every span the handler
+    // creates afterward (including the MC client's `#[instrument]` span)
+    // inherits it via the tracing hierarchy. See `middleware/otel.rs`'s
+    // module doc for the full reasoning; @observability + @code-reviewer
+    // confirmed this placement at Gate 1. NOTE: GC's inbound gRPC server
+    // (`main.rs`'s `TonicServer::builder()`) composes layers via the
+    // OPPOSITE convention (`tower::ServiceBuilder`-style, first-added =
+    // outermost) — don't flip this ordering by false analogy to that one.
     Ok(public_routes
         .merge(metrics_routes)
         .merge(user_auth_routes)
         .merge(telemetry_routes)
         .merge(protected_routes)
+        .layer(middleware::from_fn(extract_trace_context_middleware))
         .layer(TraceLayer::new_for_http())
         .layer(TimeoutLayer::new(Duration::from_secs(30)))
         // HTTP metrics layer (outermost) - captures ALL responses including

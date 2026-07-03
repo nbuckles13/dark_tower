@@ -190,8 +190,13 @@ impl McClient {
                 })?,
         );
 
-        // Make the RPC call
-        let mut client = MeetingControllerServiceClient::new(channel);
+        // Make the RPC call. R-56 surface (c): inject the active OTel context
+        // into outbound gRPC metadata via task #24's client interceptor —
+        // direct reuse, no new propagation logic here.
+        let mut client = MeetingControllerServiceClient::with_interceptor(
+            channel,
+            common::observability::otel_grpc::client_interceptor(),
+        );
         let response = client.assign_meeting_with_mh(grpc_request).await;
         let rpc_duration = rpc_start.elapsed();
 

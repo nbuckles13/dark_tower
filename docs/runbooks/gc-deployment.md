@@ -1283,9 +1283,16 @@ collector:
   `OTEL_ENABLED=true` patch) and restart AC; it boots with the OTel layer off and no collector
   dependency. Blanking `OTLP_ENDPOINT` is no longer the lever — presence-gating was replaced by
   the boolean.
-- **GC / MC / MH:** these do not yet call `init_otel` (per-service R-55 is #26 / #6 / #27), so
-  there is no collector-coupled startup to break-glass for them today. Each adopts the same
-  `OTEL_ENABLED=false` no-op lever when its R-55 wiring lands.
+- **GC (R-55 landed, task #26):** OTel init is gated by the explicit `OTEL_ENABLED` flag.
+  Break-glass = set `OTEL_ENABLED=false` in GC's ConfigMap (or drop the Kind overlay's
+  `OTEL_ENABLED=true` patch) and restart GC; it boots with the OTel layer off and no collector
+  dependency. GC is a 2-replica `Deployment` (`maxUnavailable: 0`, PDB `minAvailable: 1`) —
+  unlike AC's StatefulSet, a bad `OTEL_ENABLED=true` rollout does **not** cause an outage: new
+  pods CrashLoop before ever binding their HTTP/gRPC ports, so they never pass readiness and the
+  rollout stalls with the old ReplicaSet still serving all traffic. It also does **not**
+  self-heal — `kubectl rollout status` hangs indefinitely until an operator intervenes
+  (`kubectl rollout undo`, or flip the break-glass lever above).
+- **MC / MH:** still pending (#6 / #27), unchanged.
 
 ### Escalation / ownership
 

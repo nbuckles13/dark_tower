@@ -86,3 +86,19 @@ base64 = "0.22"
 # Enable common's test-utils feature for MetricAssertion in tests/
 # (mirrors AC's pattern — ADR-0032 Step 5).
 common = { path = "../common", features = ["test-utils"] }
+# R-56 trace-continuity integration tests (tests/otel_*.rs) construct
+# SpanContext fixtures and a local TracerProvider/OpenTelemetryLayer directly
+# — transitive via `common` is not enough for `use`, hence direct dev-deps.
+# Not needed in production code (gc-service's non-test deps stay thin; see
+# devloop plan §Cargo.toml).
+opentelemetry = { workspace = true }
+# "testing" pulls in InMemorySpanExporter, used by
+# otel_grpc_inbound_continuity.rs to assert the actual exported span's
+# trace_id (not just that the RPC succeeded) — mirrors common's own dev-dep
+# shape for the same feature.
+opentelemetry_sdk = { workspace = true, features = ["rt-tokio", "trace", "testing"] }
+tracing-opentelemetry = { workspace = true }
+# Real mock Tonic server for otel_http_grpc_bridge.rs / otel_grpc_inbound_continuity.rs
+# (mirrors mh-service/tests/common/mock_mc.rs's TcpListenerStream pattern —
+# bind first to learn the OS-assigned port, then adapt to tonic's incoming stream).
+tokio-stream = "0.1"

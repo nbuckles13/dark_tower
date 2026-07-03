@@ -22,3 +22,4 @@
 #![allow(dead_code, clippy::unwrap_used, clippy::expect_used)]
 
 pub mod jwt_fixtures;
+pub mod otel_support;

@@ -5,6 +5,14 @@ resources:
   - ../../../../../services/gc-service
   - nodeport.yaml
 
+# R-55 (task #26): enable OTel in the Kind dev cluster (collector deployed by
+# R-59 + the GC->collector :4317 egress rule present in the base
+# NetworkPolicy). The prod base keeps OTEL_ENABLED="false"; this
+# strategic-merge patch flips it to "true" for dev. Mirrors AC's task #25
+# overlay pattern.
+patches:
+  - path: configmap-otel-patch.yaml
+
 labels:
   - pairs:
       environment: kind

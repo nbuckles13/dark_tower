@@ -100,6 +100,23 @@ spec:
     ports:
     - protocol: TCP
       port: 4318
+  # Allow egress to the OTel Collector (OTLP-gRPC) — GC's OWN span export via
+  # init_otel (R-55, task #26). Distinct port/purpose from the :4318 HTTP rule
+  # above (telemetry-proxy forward) — do NOT conflate/merge the two. The
+  # collector's ingress netpol already admits gc-service on :4317 (pre-
+  # provisioned fleet-wide for R-55); this is the symmetric egress allow.
+  # init_otel's collector probe is fail-hard at startup, so a missing rule
+  # here CrashLoops GC the moment OTEL_ENABLED=true.
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: dark-tower
+      podSelector:
+        matchLabels:
+          app: otel-collector
+    ports:
+    - protocol: TCP
+      port: 4317
   # Allow DNS resolution
   - to:
     - namespaceSelector:

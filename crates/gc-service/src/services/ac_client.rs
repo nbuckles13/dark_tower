@@ -12,6 +12,7 @@
 
 use crate::errors::GcError;
 use crate::observability::metrics;
+use crate::services::trace_headers;
 use common::secret::ExposeSecret;
 use common::token_manager::TokenReceiver;
 use reqwest::Client;
@@ -96,6 +97,9 @@ impl AcClient {
                 format!("Bearer {}", self.token_receiver.token().expose_secret()),
             )
             .header("Content-Type", "application/json")
+            // R-56 surface (b): inject the active span's W3C trace context.
+            // Merges in (does not replace) the headers set above.
+            .headers(trace_headers())
             .json(request)
             .send()
             .await
@@ -144,6 +148,9 @@ impl AcClient {
                 format!("Bearer {}", self.token_receiver.token().expose_secret()),
             )
             .header("Content-Type", "application/json")
+            // R-56 surface (b): inject the active span's W3C trace context.
+            // Merges in (does not replace) the headers set above.
+            .headers(trace_headers())
             .json(request)
             .send()
             .await

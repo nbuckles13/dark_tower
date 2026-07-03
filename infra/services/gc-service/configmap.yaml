@@ -31,3 +31,27 @@ data:
   # you set TELEMETRY_PROXY_MAX_BYTES or TELEMETRY_PROXY_RATE_LIMIT_PER_MINUTE here,
   # update that env-test's constants in lockstep (mirrors the bidirectional
   # OTEL_COLLECTOR_ENDPOINT ↔ config.rs cross-ref above).
+  # ---- OpenTelemetry (R-55, task #26) ----
+  # GC's OTel SDK is wired into main.rs via init_otel (R-55), gated by an
+  # explicit boolean OTEL_ENABLED (NOT presence of OTLP_ENDPOINT). This is the
+  # prod base, so OTEL_ENABLED defaults to "false" here; the Kind overlay
+  # patches it to "true" for dev. Enabling requires OTEL_ENABLED=true PLUS the
+  # GC->collector egress NetworkPolicy rule on :4317 (now present, distinct
+  # from the existing :4318 telemetry-proxy rule above) PLUS a reachable
+  # collector — init_otel probes eagerly and FAILS HARD at startup if the
+  # collector is unreachable (pod fails readiness; mirrors AC's task #25
+  # exemplar).
+  OTEL_ENABLED: "false"
+  # OTLP-gRPC endpoint for the in-cluster OTel collector (R-59) — GC's OWN
+  # span-export endpoint, distinct from OTEL_COLLECTOR_ENDPOINT above (which
+  # is the :4318 OTLP-HTTP endpoint the /api/v1/telemetry proxy forwards to).
+  # The http:// scheme is required (parsed via tonic Endpoint::from_shared —
+  # a bare host:port fails at init). Only consumed when OTEL_ENABLED=true.
+  OTLP_ENDPOINT: "http://otel-collector.dark-tower:4317"
+  # Head-sampling ratio in [0.0, 1.0]; init_otel is the authoritative validator.
+  OTEL_SAMPLE_RATE: "1.0"
+  # deployment.environment resource attribute (ADR-0011). NOTE: this prod base
+  # hardcodes "development"; prod OTel graduation MUST overlay-patch this so
+  # prod telemetry is not mistagged (same tracked caveat as AC's task #25 —
+  # see docs/TODO.md).
+  DEPLOYMENT_ENVIRONMENT: "development"
