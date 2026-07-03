@@ -45,6 +45,11 @@
     "lint": {
       "inputs": ["default"],
       "cache": true
+    },
+    "typecheck": {
+      "dependsOn": ["^codegen"],
+      "inputs": ["default", "^production"],
+      "cache": true
     }
   }
 }
