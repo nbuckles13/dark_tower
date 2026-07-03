@@ -228,7 +228,8 @@ Implementer deviations (recorded for Gate-3 eyeball): (1) `SdkErrorCode.Media` a
 
 ## Accepted Deferrals
 <!-- One pointer per docs/TODO.md entry. -->
-No in-diff reviewer findings were left unresolved — all Gate-3 findings (Security nit, Test F-T1, Code Quality F1/F2/F3, Operations disconnect, Semantic Guard error-context, Observability F1/F2) were FIXED in this PR. The accepted deferral + spun-out follow-ups (forward-looking, not in-diff findings) tracked in `docs/TODO.md`:
+
+All Gate-3 findings were FIXED in this PR (Security nit, Test F-T1, Code Quality F1/F2/F3, Operations disconnect, Semantic Guard error-context, Observability F1/F2). The pointers below are forward-looking follow-ups tracked in `docs/TODO.md` (not in-diff findings):
 
 - **R-26 bounded join LOGS** (the accepted deferral driving @observability's RESOLVED-DEFERRED verdict; a Gate-1 scope split, not an in-diff finding — see §Scope decisions) → `docs/TODO.md` §Observability Debt. Root cause: whole-join `trace_id` needs the `dt_client.join` root span relocated from SignalingClient to MeetingSession.join (task #13 semantics, own planning).
 - **SignalingClient.#terminate emit-before-teardown hardening** (operations spun-out follow-up; pre-existing — the diff only renamed `#emit`→`emit`) → `docs/TODO.md` §Client Architecture. Symmetric ~2-line try/finally, same shape as the task-#14 MeetingSession.disconnect fix. Owner: client.
