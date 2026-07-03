@@ -101,20 +101,18 @@ fi
 # `git cherry <upstream> <head>` walks <upstream>..<head> and prints
 #   `+ <sha>` for commits whose patch-id is NOT on <upstream>
 #   `- <sha>` for commits whose patch-id IS already on <upstream>
-# (newest-first; reverse for chronological cherry-pick order)
-NEW_NEWEST_FIRST=()
+# Output is OLDEST-first, which is the natural cherry-pick apply order —
+# later commits can depend on file-existence semantics from earlier ones
+# (e.g., a chain that creates main.md in commit N and modifies it in N+1
+# only cherry-picks cleanly when applied in that order).
+COMMITS=()
 SKIPPED=()
 while IFS=' ' read -r flag sha; do
     case "$flag" in
-        +) NEW_NEWEST_FIRST+=("$sha") ;;
+        +) COMMITS+=("$sha") ;;
         -) SKIPPED+=("$sha") ;;
     esac
 done < <(git cherry HEAD "$TMP_REF")
-
-COMMITS=()
-for ((i=${#NEW_NEWEST_FIRST[@]}-1; i>=0; i--)); do
-    COMMITS+=("${NEW_NEWEST_FIRST[i]}")
-done
 
 COMMIT_COUNT=${#COMMITS[@]}
 SKIPPED_COUNT=${#SKIPPED[@]}
