@@ -17,6 +17,7 @@
 use crate::config::Config;
 use crate::errors::MhError;
 use crate::observability::metrics;
+use common::observability::otel_grpc::client_interceptor;
 use common::secret::ExposeSecret;
 use common::token_manager::TokenReceiver;
 use proto_gen::dark_tower::internal::v1::media_handler_registry_service_client::MediaHandlerRegistryServiceClient;
@@ -204,7 +205,11 @@ impl GcClient {
     ) -> Result<proto_gen::dark_tower::internal::v1::RegisterMhResponse, MhError> {
         let grpc_request = self.add_auth(request.clone())?;
 
-        let mut client = MediaHandlerRegistryServiceClient::new(self.channel.clone());
+        // R-56: inject the active OTel context as outbound traceparent/tracestate.
+        let mut client = MediaHandlerRegistryServiceClient::with_interceptor(
+            self.channel.clone(),
+            client_interceptor(),
+        );
 
         let response = client.register_mh(grpc_request).await.map_err(|e| {
             debug!(
@@ -243,7 +248,11 @@ impl GcClient {
         let start = Instant::now();
         let grpc_request = self.add_auth(request)?;
 
-        let mut client = MediaHandlerRegistryServiceClient::new(self.channel.clone());
+        // R-56: inject the active OTel context as outbound traceparent/tracestate.
+        let mut client = MediaHandlerRegistryServiceClient::with_interceptor(
+            self.channel.clone(),
+            client_interceptor(),
+        );
 
         match client.send_load_report(grpc_request).await {
             Ok(response) => {

@@ -24,8 +24,10 @@ pub mod auth_interceptor;
 pub mod gc_client;
 pub mod mc_client;
 pub mod mh_service;
+pub mod span_layer;
 
 pub use auth_interceptor::MhAuthLayer;
 pub use gc_client::GcClient;
 pub use mc_client::McClient;
 pub use mh_service::MhMediaService;
+pub use span_layer::SpanLayer;

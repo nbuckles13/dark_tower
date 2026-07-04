@@ -6,6 +6,9 @@
 //! - Channel capture via `with_connected_tx` / `with_disconnected_tx` — pushes
 //!   received request payloads on an `mpsc::Sender` so integration tests can
 //!   assert on the exact fields MH sent.
+//! - `with_traceparent_tx` — pushes the inbound `traceparent` metadata value
+//!   (if any) seen on each call, in call order, for R-56 outbound-injection
+//!   assertions (`otel_grpc_integration.rs`).
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -44,6 +47,7 @@ pub struct MockMcServer {
     disconnected_count: AtomicU32,
     connected_tx: Option<mpsc::Sender<NotifyParticipantConnectedRequest>>,
     disconnected_tx: Option<mpsc::Sender<NotifyParticipantDisconnectedRequest>>,
+    traceparent_tx: Option<mpsc::Sender<Option<String>>>,
 }
 
 impl MockMcServer {
@@ -54,6 +58,7 @@ impl MockMcServer {
             disconnected_count: AtomicU32::new(0),
             connected_tx: None,
             disconnected_tx: None,
+            traceparent_tx: None,
         }
     }
 
@@ -70,6 +75,13 @@ impl MockMcServer {
         tx: mpsc::Sender<NotifyParticipantDisconnectedRequest>,
     ) -> Self {
         self.disconnected_tx = Some(tx);
+        self
+    }
+
+    /// Capture the inbound `traceparent` metadata value (if any) seen on
+    /// each call, in call order — one send per RPC regardless of outcome.
+    pub fn with_traceparent_tx(mut self, tx: mpsc::Sender<Option<String>>) -> Self {
+        self.traceparent_tx = Some(tx);
         self
     }
 
@@ -95,6 +107,15 @@ impl MockMcServer {
     }
 }
 
+/// Read the `traceparent` metadata value off an inbound request, if present.
+fn extract_traceparent<T>(request: &Request<T>) -> Option<String> {
+    request
+        .metadata()
+        .get("traceparent")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+}
+
 #[tonic::async_trait]
 impl MediaCoordinationService for MockMcServer {
     async fn notify_participant_connected(
@@ -102,10 +123,14 @@ impl MediaCoordinationService for MockMcServer {
         request: Request<NotifyParticipantConnectedRequest>,
     ) -> Result<Response<NotifyParticipantConnectedResponse>, Status> {
         self.connected_count.fetch_add(1, Ordering::SeqCst);
+        let traceparent = extract_traceparent(&request);
         let inner = request.into_inner();
 
         if let Some(tx) = &self.connected_tx {
             let _ = tx.send(inner.clone()).await;
+        }
+        if let Some(tx) = &self.traceparent_tx {
+            let _ = tx.send(traceparent).await;
         }
 
         if let Some(status) = self.should_fail() {
@@ -122,10 +147,14 @@ impl MediaCoordinationService for MockMcServer {
         request: Request<NotifyParticipantDisconnectedRequest>,
     ) -> Result<Response<NotifyParticipantDisconnectedResponse>, Status> {
         self.disconnected_count.fetch_add(1, Ordering::SeqCst);
+        let traceparent = extract_traceparent(&request);
         let inner = request.into_inner();
 
         if let Some(tx) = &self.disconnected_tx {
             let _ = tx.send(inner.clone()).await;
+        }
+        if let Some(tx) = &self.traceparent_tx {
+            let _ = tx.send(traceparent).await;
         }
 
         if let Some(status) = self.should_fail() {

@@ -32,7 +32,7 @@ use common::token_manager::{spawn_token_manager, TokenManagerConfig};
 use mh_service::auth::MhJwtValidator;
 use mh_service::config::Config;
 use mh_service::errors::MhError;
-use mh_service::grpc::{GcClient, McClient, MhAuthLayer, MhMediaService};
+use mh_service::grpc::{GcClient, McClient, MhAuthLayer, MhMediaService, SpanLayer};
 use mh_service::observability::{health_router, HealthState};
 use mh_service::session::SessionManagerHandle;
 use mh_service::webtransport::WebTransportServer;
@@ -47,9 +47,45 @@ const TOKEN_ACQUISITION_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize tracing with JSON structured logging
-    // JSON format enables robust parsing in Promtail without brittle regex
+    // Load configuration BEFORE the tracing subscriber: the R-55 OTel layer
+    // needs the endpoint/sample-rate from config, and the subscriber can only
+    // be `.init()`'d once. A config-load failure here has no subscriber to log
+    // through yet — it propagates as a non-zero exit via the default Debug-to-
+    // stderr dump, same as AC's exemplar; nothing is lost because no spans/logs
+    // have been emitted yet.
+    let config = Config::from_env()?;
+
+    // R-55: initialize the OpenTelemetry SDK only when explicitly enabled
+    // (OTEL_ENABLED=true). `init_otel` is async, eagerly probes the collector,
+    // and fails hard at init on an unreachable/misconfigured endpoint so the
+    // pod fails K8s readiness instead of silently dropping spans. When OTel is
+    // disabled, `otel_config()` returns `None`, `init_otel` is never called (no
+    // probe), and no OTel layer is composed.
+    let otel = match config.otel_config() {
+        Some(otel_cfg) => Some(
+            common::observability::otel::init_otel(
+                "media-handler",
+                env!("CARGO_PKG_VERSION"),
+                &config.environment,
+                otel_cfg,
+            )
+            .await?,
+        ),
+        None => None,
+    };
+    // Split into the composable layer and the RAII guard. `_otel_guard` is held
+    // to the end of `main` so pending spans flush on shutdown via Drop; it is a
+    // NAMED binding (not bare `_`) so it is not dropped immediately.
+    let (otel_layer, _otel_guard) = match otel {
+        Some(init) => (Some(init.layer), Some(init.guard)),
+        None => (None, None),
+    };
+
+    // Initialize tracing with JSON structured logging. The OTel layer (if any)
+    // composes onto the bare registry first; the default-off path adds zero
+    // layers. JSON format enables robust parsing in Promtail without brittle regex.
     tracing_subscriber::registry()
+        .with(otel_layer)
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "mh_service=debug".into()),
@@ -58,12 +94,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     info!("Starting Media Handler");
-
-    // Load configuration
-    let config = Config::from_env().map_err(|e| {
-        error!("Failed to load configuration: {}", e);
-        e
-    })?;
 
     info!(
         region = %config.region,
@@ -206,10 +236,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mh_media_service = MhMediaService::new(session_manager.clone());
     let auth_layer = MhAuthLayer::new(Arc::clone(&jwks_client), 300);
 
+    // R-56: extract inbound W3C trace context (traceparent/tracestate) from
+    // MC's request metadata and attach it as the parent of the handler span.
+    // Independent of `auth_layer` above — that reads `authorization`, this
+    // reads only the two W3C headers (common::observability::otel_grpc).
+    //
+    // `SpanLayer` is REQUIRED for the interceptor's `set_parent` call to have
+    // any effect: it supplies the ambient tracing span the interceptor
+    // attaches to and keeps active through the handler's own `#[instrument]`
+    // span (see `grpc::span_layer` module docs — without it, the extracted
+    // context is silently dropped and every inbound call becomes a fresh
+    // root trace, verified empirically).
     let grpc_shutdown_token = shutdown_token.child_token();
     let grpc_server = tonic::transport::Server::builder()
+        .layer(SpanLayer)
         .layer(auth_layer)
-        .add_service(MediaHandlerServiceServer::new(mh_media_service))
+        .add_service(MediaHandlerServiceServer::with_interceptor(
+            mh_media_service,
+            common::observability::otel_grpc::server_interceptor(),
+        ))
         .serve_with_shutdown(grpc_addr, async move {
             grpc_shutdown_token.cancelled().await;
             info!("gRPC server shutting down");

@@ -27,6 +27,13 @@ bytes = { workspace = true }
 # gRPC for GC communication and MC→MH service
 tonic = { workspace = true }
 
+# OpenTelemetry (R-55/R-56/R-58): connection.rs implements a W3C `Extractor`
+# and calls `OpenTelemetrySpanExt::set_parent` directly, so these are named
+# here (not just consumed opaquely via `common::observability::otel::OtelInit`
+# the way AC's main.rs/config.rs do).
+opentelemetry = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+
 # Tower middleware (for async auth Layer/Service on gRPC requests)
 tower = { workspace = true }
 
@@ -77,3 +84,7 @@ wtransport = { workspace = true, features = ["dangerous-configuration"] }
 rcgen = "0.13"
 # TempDir for scoping PEMs to the test lifetime with automatic cleanup.
 tempfile = "3"
+# In-memory span exporter for OTel wiring tests (R-55/R-56/R-58): lets tests
+# assert on exported SpanData (trace_id, parent_span_id) instead of only on
+# side effects. Mirrors common/Cargo.toml's own dev-dependency override.
+opentelemetry_sdk = { workspace = true, features = ["testing"] }

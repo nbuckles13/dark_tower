@@ -45,6 +45,17 @@ pub const MAX_REGISTER_MEETING_TIMEOUT_SECONDS: u64 = 300;
 /// Default maximum concurrent WebTransport connections.
 pub const DEFAULT_MAX_CONNECTIONS: usize = 10_000;
 
+// =============================================================================
+// OpenTelemetry Configuration Defaults (R-55)
+// =============================================================================
+
+/// Default head-sampling ratio when `OTEL_SAMPLE_RATE` is unset (1.0 = sample all).
+/// The `[0.0, 1.0]` range is owned + enforced by `init_otel` (common), not here —
+/// config parsing is parse-only (single owner for the bound; team-lead FREEZE 2026-06-25).
+pub const DEFAULT_OTEL_SAMPLE_RATE: f64 = 1.0;
+/// Default deployment environment when `DEPLOYMENT_ENVIRONMENT` is unset.
+pub const DEFAULT_DEPLOYMENT_ENVIRONMENT: &str = "development";
+
 /// Media Handler configuration.
 ///
 /// Loaded from environment variables with sensible defaults.
@@ -109,6 +120,22 @@ pub struct Config {
 
     /// Maximum concurrent WebTransport connections (default: 10000).
     pub max_connections: usize,
+
+    /// Whether to initialize the OpenTelemetry SDK (R-55). Default `false`.
+    /// When `true`, `main` calls `init_otel` (eager collector probe, fail-hard
+    /// at init) and composes the tracing-opentelemetry layer; when `false`, no
+    /// `OTel` layer is added and no collector probe occurs. Enablement is this
+    /// explicit boolean, NOT presence of `otel_endpoint`.
+    pub otel_enabled: bool,
+    /// OTLP-gRPC collector endpoint (env `OTLP_ENDPOINT`). Only consumed when
+    /// `otel_enabled` is `true`; must be a parseable `http(s)://host:port` URL.
+    pub otel_endpoint: String,
+    /// Head-sampling ratio in `[0.0, 1.0]` (env `OTEL_SAMPLE_RATE`). `init_otel`
+    /// is the authoritative validator and re-checks this bound at startup.
+    pub otel_sample_rate: f64,
+    /// Deployment environment for the `deployment.environment` `OTel` resource
+    /// attribute (env `DEPLOYMENT_ENVIRONMENT`, ADR-0011). Default `development`.
+    pub environment: String,
 }
 
 /// Custom Debug implementation that redacts sensitive fields.
@@ -138,6 +165,10 @@ impl fmt::Debug for Config {
                 &self.register_meeting_timeout_seconds,
             )
             .field("max_connections", &self.max_connections)
+            .field("otel_enabled", &self.otel_enabled)
+            .field("otel_endpoint", &self.otel_endpoint)
+            .field("otel_sample_rate", &self.otel_sample_rate)
+            .field("environment", &self.environment)
             .finish()
     }
 }
@@ -149,6 +180,9 @@ pub enum ConfigError {
 
     #[error("Invalid configuration value: {0}")]
     InvalidValue(String),
+
+    #[error("Invalid OTel configuration: {0}")]
+    InvalidOtelConfig(String),
 }
 
 impl Config {
@@ -276,6 +310,57 @@ impl Config {
             .and_then(|s| s.parse().ok())
             .unwrap_or(DEFAULT_MAX_CONNECTIONS);
 
+        // R-55: OpenTelemetry SDK configuration.
+        // Enablement is an explicit boolean (OTEL_ENABLED), NOT presence of the
+        // endpoint — so a populated OTLP_ENDPOINT with OTEL_ENABLED unset/false
+        // stays OFF (init_otel is never called and no layer is composed).
+        let otel_enabled = if let Some(value_str) = vars.get("OTEL_ENABLED") {
+            match value_str.trim().to_ascii_lowercase().as_str() {
+                "true" => true,
+                "false" => false,
+                _ => {
+                    return Err(ConfigError::InvalidOtelConfig(format!(
+                        "OTEL_ENABLED must be 'true' or 'false', got '{value_str}'"
+                    )))
+                }
+            }
+        } else {
+            false
+        };
+
+        // Endpoint reuses the existing OTLP_ENDPOINT key (task #28 ruling).
+        let otel_endpoint = vars.get("OTLP_ENDPOINT").cloned().unwrap_or_default();
+
+        // Sample rate: PARSE-ONLY (team-lead FREEZE 2026-06-25, option X). The
+        // `[0.0, 1.0]` bound has a SINGLE owner — `init_otel`
+        // (common/observability/otel.rs) — which re-validates it at startup on
+        // the enabled path (fail-hard at init). We do NOT duplicate the range
+        // check here. Non-numeric still fails fast at load. An out-of-range
+        // value is accepted at config load and only hard-fails at `init_otel`
+        // when `otel_enabled=true` — intended.
+        let otel_sample_rate = if let Some(value_str) = vars.get("OTEL_SAMPLE_RATE") {
+            value_str.parse::<f64>().map_err(|e| {
+                ConfigError::InvalidOtelConfig(format!(
+                    "OTEL_SAMPLE_RATE must be a number, got '{value_str}': {e}"
+                ))
+            })?
+        } else {
+            DEFAULT_OTEL_SAMPLE_RATE
+        };
+
+        let environment = vars
+            .get("DEPLOYMENT_ENVIRONMENT")
+            .cloned()
+            .unwrap_or_else(|| DEFAULT_DEPLOYMENT_ENVIRONMENT.to_string());
+
+        // When OTel is enabled the endpoint is required: fail fast with a clear
+        // message rather than letting init_otel reject an empty/unparseable URL.
+        if otel_enabled && otel_endpoint.trim().is_empty() {
+            return Err(ConfigError::InvalidOtelConfig(
+                "OTEL_ENABLED=true requires a non-empty OTLP_ENDPOINT".to_string(),
+            ));
+        }
+
         // Generate MH instance ID
         let handler_id = vars.get("MH_HANDLER_ID").cloned().unwrap_or_else(|| {
             let hostname = std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".to_string());
@@ -302,12 +387,41 @@ impl Config {
             ac_jwks_url,
             register_meeting_timeout_seconds,
             max_connections,
+            otel_enabled,
+            otel_endpoint,
+            otel_sample_rate,
+            environment,
         })
+    }
+
+    /// Build the [`common::observability::otel::OtelConfig`] for `init_otel`,
+    /// or `None` when `OTel` is disabled. Encodes the R-55 gating: `main` calls
+    /// `init_otel` (and composes the layer) iff this returns `Some` — so the
+    /// default-off path performs no collector probe and adds no `OTel` layer.
+    #[must_use]
+    pub fn otel_config(&self) -> Option<common::observability::otel::OtelConfig> {
+        if self.otel_enabled {
+            Some(common::observability::otel::OtelConfig {
+                endpoint: self.otel_endpoint.clone(),
+                sample_rate: self.otel_sample_rate,
+            })
+        } else {
+            None
+        }
     }
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    // OTel sample-rate assertions compare a parsed f64 against the exact
+    // literal it was parsed from (or the exact DEFAULT_OTEL_SAMPLE_RATE
+    // const) — not a computed/accumulated float where precision loss could
+    // hide a bug, so exact equality is the correct check here.
+    clippy::float_cmp
+)]
 mod tests {
     use super::*;
     use common::secret::ExposeSecret;
@@ -608,5 +722,161 @@ mod tests {
 
         let config = Config::from_vars(&vars).expect("Config should load successfully");
         assert_eq!(config.max_connections, 5000);
+    }
+
+    // ============================================================================
+    // OpenTelemetry Configuration Tests (R-55)
+    // ============================================================================
+
+    /// Helper: `base_vars()` plus any extra `OTel` vars supplied by the caller.
+    fn otel_vars(extra: &[(&str, &str)]) -> HashMap<String, String> {
+        let mut vars = base_vars();
+        for (k, v) in extra {
+            vars.insert((*k).to_string(), (*v).to_string());
+        }
+        vars
+    }
+
+    #[test]
+    fn test_otel_defaults() {
+        // No OTel env vars: disabled, empty endpoint, full sampling, dev environment.
+        let config = Config::from_vars(&otel_vars(&[])).expect("Config should load");
+        assert!(!config.otel_enabled, "OTel disabled by default");
+        assert_eq!(config.otel_endpoint, "");
+        assert_eq!(config.otel_sample_rate, DEFAULT_OTEL_SAMPLE_RATE);
+        assert_eq!(config.otel_sample_rate, 1.0);
+        assert_eq!(config.environment, "development");
+        // Disabled → no OtelConfig produced.
+        assert!(config.otel_config().is_none());
+    }
+
+    #[test]
+    fn test_otel_enabled_true_false() {
+        let enabled = Config::from_vars(&otel_vars(&[
+            ("OTEL_ENABLED", "true"),
+            ("OTLP_ENDPOINT", "http://collector:4317"),
+        ]))
+        .expect("Config should load");
+        assert!(enabled.otel_enabled);
+
+        let disabled = Config::from_vars(&otel_vars(&[("OTEL_ENABLED", "false")]))
+            .expect("Config should load");
+        assert!(!disabled.otel_enabled);
+    }
+
+    #[test]
+    fn test_otel_enabled_case_insensitive() {
+        let config = Config::from_vars(&otel_vars(&[
+            ("OTEL_ENABLED", "TRUE"),
+            ("OTLP_ENDPOINT", "http://collector:4317"),
+        ]))
+        .expect("Config should load");
+        assert!(config.otel_enabled);
+    }
+
+    #[test]
+    fn test_otel_enabled_invalid_value_rejected() {
+        // Non-bool value is an explicit ConfigError, NOT a silent false.
+        let result = Config::from_vars(&otel_vars(&[("OTEL_ENABLED", "yes")]));
+        assert!(
+            matches!(result, Err(ConfigError::InvalidOtelConfig(msg)) if msg.contains("OTEL_ENABLED") && msg.contains("yes")),
+            "invalid OTEL_ENABLED should be a ConfigError carrying the offending value"
+        );
+    }
+
+    #[test]
+    fn test_otel_endpoint_maps_from_otlp_endpoint() {
+        let config = Config::from_vars(&otel_vars(&[(
+            "OTLP_ENDPOINT",
+            "http://otel-collector.dark-tower:4317",
+        )]))
+        .expect("Config should load");
+        assert_eq!(
+            config.otel_endpoint,
+            "http://otel-collector.dark-tower:4317"
+        );
+    }
+
+    #[test]
+    fn test_otel_sample_rate_valid_values_stored() {
+        // Parse-only (team-lead FREEZE X): valid numeric values are parsed and stored verbatim.
+        for v in ["0.0", "0.5", "1.0"] {
+            let config = Config::from_vars(&otel_vars(&[("OTEL_SAMPLE_RATE", v)]))
+                .unwrap_or_else(|_| panic!("{v} should parse"));
+            assert_eq!(
+                config.otel_sample_rate,
+                v.parse::<f64>().expect("test literal")
+            );
+        }
+    }
+
+    #[test]
+    fn test_otel_sample_rate_out_of_range_accepted_at_config_load() {
+        // Parse-only contract (team-lead FREEZE X): config load does NOT range-check;
+        // the [0.0, 1.0] bound has a single owner, init_otel, which re-validates at
+        // startup on the enabled path. Out-of-range values PARSE here and are stored
+        // inert; they hard-fail only at init_otel when otel_enabled=true. This test
+        // locks the intentional deferral (a re-added config-load range check would
+        // break it and signal a duplicated bound).
+        let low = Config::from_vars(&otel_vars(&[("OTEL_SAMPLE_RATE", "-0.1")]))
+            .expect("-0.1 parses at config load (range deferred to init_otel)");
+        assert_eq!(low.otel_sample_rate, -0.1);
+
+        let high = Config::from_vars(&otel_vars(&[("OTEL_SAMPLE_RATE", "1.1")]))
+            .expect("1.1 parses at config load (range deferred to init_otel)");
+        assert_eq!(high.otel_sample_rate, 1.1);
+    }
+
+    #[test]
+    fn test_otel_sample_rate_non_numeric_rejected() {
+        let result = Config::from_vars(&otel_vars(&[("OTEL_SAMPLE_RATE", "half")]));
+        assert!(
+            matches!(result, Err(ConfigError::InvalidOtelConfig(msg)) if msg.contains("OTEL_SAMPLE_RATE") && msg.contains("half")),
+            "non-numeric sample rate should be a ConfigError carrying the offending value"
+        );
+    }
+
+    #[test]
+    fn test_deployment_environment_custom() {
+        let config = Config::from_vars(&otel_vars(&[("DEPLOYMENT_ENVIRONMENT", "staging")]))
+            .expect("Config should load");
+        assert_eq!(config.environment, "staging");
+    }
+
+    #[test]
+    fn test_otel_enabled_requires_endpoint() {
+        // Enabled with no endpoint → fail fast.
+        let result = Config::from_vars(&otel_vars(&[("OTEL_ENABLED", "true")]));
+        assert!(
+            matches!(result, Err(ConfigError::InvalidOtelConfig(msg)) if msg.contains("requires a non-empty OTLP_ENDPOINT")),
+            "enabled + empty endpoint should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_otel_config_some_when_enabled() {
+        let config = Config::from_vars(&otel_vars(&[
+            ("OTEL_ENABLED", "true"),
+            ("OTLP_ENDPOINT", "http://collector:4317"),
+            ("OTEL_SAMPLE_RATE", "0.5"),
+        ]))
+        .expect("Config should load");
+        let otel = config.otel_config().expect("enabled → Some(OtelConfig)");
+        assert_eq!(otel.endpoint, "http://collector:4317");
+        assert_eq!(otel.sample_rate, 0.5);
+    }
+
+    #[test]
+    fn test_otel_config_gating_precedence_endpoint_set_but_disabled() {
+        // Regression guard for the Q2 semantic change: endpoint populated but
+        // OTEL_ENABLED unset → otel_config() is None (NOT presence-gated).
+        let config = Config::from_vars(&otel_vars(&[("OTLP_ENDPOINT", "http://collector:4317")]))
+            .expect("Config should load");
+        assert_eq!(config.otel_endpoint, "http://collector:4317");
+        assert!(!config.otel_enabled);
+        assert!(
+            config.otel_config().is_none(),
+            "endpoint present but disabled must NOT enable OTel (no presence-gating)"
+        );
     }
 }

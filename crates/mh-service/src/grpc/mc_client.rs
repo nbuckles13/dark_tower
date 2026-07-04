@@ -20,6 +20,7 @@
 
 use crate::errors::MhError;
 use crate::observability::metrics;
+use common::observability::otel_grpc::client_interceptor;
 use common::secret::ExposeSecret;
 use common::token_manager::TokenReceiver;
 use proto_gen::dark_tower::internal::v1::media_coordination_service_client::MediaCoordinationServiceClient;
@@ -27,7 +28,8 @@ use proto_gen::dark_tower::internal::v1::{
     NotifyParticipantConnectedRequest, NotifyParticipantDisconnectedRequest,
 };
 use std::time::Duration;
-use tonic::transport::Endpoint;
+use tonic::service::interceptor::InterceptedService;
+use tonic::transport::{Channel, Endpoint};
 use tonic::Request;
 use tracing::{debug, error, instrument, warn};
 
@@ -102,6 +104,7 @@ impl McClient {
                 Box::pin(async move { client.notify_participant_connected(req).await })
             },
             request,
+            client_interceptor(),
         )
         .await
     }
@@ -148,6 +151,7 @@ impl McClient {
                 Box::pin(async move { client.notify_participant_disconnected(req).await })
             },
             request,
+            client_interceptor(),
         )
         .await
     }
@@ -158,19 +162,26 @@ impl McClient {
     /// Does not retry on `UNAUTHENTICATED` or `PERMISSION_DENIED` (security:
     /// retrying won't fix auth issues, and repeated attempts could trigger
     /// rate limiting).
-    async fn send_with_retry<T, R, F>(
+    ///
+    /// `interceptor` (R-56) injects the active `OTel` context into outbound
+    /// metadata; it is `Clone` (stateless — reads `tracing::Span::current()`
+    /// at call time) so each retry attempt gets its own clone rather than
+    /// sharing one across `try_send` calls.
+    async fn send_with_retry<T, R, F, I>(
         &self,
         mc_grpc_endpoint: &str,
         meeting_id: &str,
         event: &str,
         rpc_fn: F,
         request: T,
+        interceptor: I,
     ) -> Result<(), MhError>
     where
         T: Clone + prost::Message,
         R: std::fmt::Debug,
+        I: tonic::service::Interceptor + Clone + Send + Sync + 'static,
         F: Fn(
-            MediaCoordinationServiceClient<tonic::transport::Channel>,
+            MediaCoordinationServiceClient<InterceptedService<Channel, I>>,
             Request<T>,
         ) -> std::pin::Pin<
             Box<dyn std::future::Future<Output = Result<tonic::Response<R>, tonic::Status>> + Send>,
@@ -179,7 +190,10 @@ impl McClient {
         let mut delay = RETRY_BASE_DELAY;
 
         for attempt in 1..=MAX_RETRY_ATTEMPTS {
-            match self.try_send(mc_grpc_endpoint, &request, &rpc_fn).await {
+            match self
+                .try_send(mc_grpc_endpoint, &request, &rpc_fn, interceptor.clone())
+                .await
+            {
                 Ok(()) => {
                     metrics::record_mc_notification(event, "success");
                     return Ok(());
@@ -232,17 +246,19 @@ impl McClient {
     }
 
     /// Attempt a single RPC call to MC.
-    async fn try_send<T, R, F>(
+    async fn try_send<T, R, F, I>(
         &self,
         mc_grpc_endpoint: &str,
         request: &T,
         rpc_fn: &F,
+        interceptor: I,
     ) -> Result<(), MhError>
     where
         T: Clone + prost::Message,
         R: std::fmt::Debug,
+        I: tonic::service::Interceptor + Clone + Send + Sync + 'static,
         F: Fn(
-            MediaCoordinationServiceClient<tonic::transport::Channel>,
+            MediaCoordinationServiceClient<InterceptedService<Channel, I>>,
             Request<T>,
         ) -> std::pin::Pin<
             Box<dyn std::future::Future<Output = Result<tonic::Response<R>, tonic::Status>> + Send>,
@@ -271,7 +287,8 @@ impl McClient {
                 MhError::Grpc(format!("Failed to connect to MC: {e}"))
             })?;
 
-        let client = MediaCoordinationServiceClient::new(channel);
+        // R-56: inject the active OTel context as outbound traceparent/tracestate.
+        let client = MediaCoordinationServiceClient::with_interceptor(channel, interceptor);
 
         let grpc_request = self.add_auth(request.clone())?;
 

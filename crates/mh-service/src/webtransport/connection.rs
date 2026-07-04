@@ -19,11 +19,13 @@ use crate::session::{ConnectionEntry, PendingConnection, SessionManagerHandle};
 
 use prost::Message;
 use proto_gen::dark_tower::signaling::v1::{mh_client_message, MhClientMessage};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 use wtransport::endpoint::IncomingSession;
 use wtransport::stream::RecvStream;
 
@@ -183,6 +185,33 @@ pub async fn handle_connection(
         );
         MhError::WebTransportError("Invalid connect message".to_string())
     })?;
+
+    // R-58: extract inbound W3C trace context from the envelope's two trace
+    // fields and attach it as the parent of this span. Proto3-default empty
+    // strings are skipped, so the map stays empty for connections with no
+    // trace context — `extract()` then returns the input context unchanged
+    // (no-op) and the span keeps today's default no-parent behavior.
+    //
+    // MUST go through the GLOBAL propagator (registered by `init_otel`, not a
+    // fresh `TraceContextPropagator`) so `BoundedTraceContextPropagator`'s W3C
+    // bounds-checking applies to this untrusted, browser-originated input —
+    // same security contract as `otel_grpc::server_interceptor`. Keys are
+    // literal `"traceparent"`/`"tracestate"` (matching
+    // `otel_grpc::PROPAGATED_HEADERS`, not indexed here to avoid an
+    // indexing_slicing deny on a foreign-crate slice) rather than a bespoke
+    // `Extractor` impl — `HashMap<String, String>` already implements
+    // `Extractor` (see `otel_grpc.rs` tests, which use the same shape).
+    let mut trace_carrier: HashMap<String, String> = HashMap::new();
+    if !envelope.trace_parent.is_empty() {
+        trace_carrier.insert("traceparent".to_string(), envelope.trace_parent.clone());
+    }
+    if !envelope.trace_state.is_empty() {
+        trace_carrier.insert("tracestate".to_string(), envelope.trace_state.clone());
+    }
+    let parent_cx = opentelemetry::global::get_text_map_propagator(|propagator| {
+        propagator.extract(&trace_carrier)
+    });
+    tracing::Span::current().set_parent(parent_cx);
 
     // Decode failure, empty oneof, and unknown variant all collapse to a single
     // generic client-facing error: in all three the JWT was never extracted, so

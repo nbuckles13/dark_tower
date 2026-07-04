@@ -28,3 +28,22 @@ data:
   # TLS certificate paths for WebTransport (mounted from mh-service-tls Secret)
   MH_TLS_CERT_PATH: "/etc/mh-tls/tls.crt"
   MH_TLS_KEY_PATH: "/etc/mh-tls/tls.key"
+  # ---- OpenTelemetry (R-55) ----
+  # MH's OTel SDK is wired into main.rs via init_otel (R-55), gated by an
+  # explicit boolean OTEL_ENABLED (NOT presence of OTLP_ENDPOINT). Defaults to
+  # "false" here — unlike AC (task #25), MH has NO MH->otel-collector egress
+  # NetworkPolicy rule yet (see infra/services/mh-service/network-policy.yaml)
+  # and NO Kind-overlay enable-patch. Flipping OTEL_ENABLED=true today would
+  # CrashLoop the pod: init_otel probes the collector eagerly and FAILS HARD
+  # at startup if it is unreachable, and the egress path is currently blocked
+  # by default-deny. Do not flip this on without adding the egress rule +
+  # overlay patch first (tracked in docs/TODO.md § Observability Debt).
+  OTEL_ENABLED: "false"
+  # OTLP-gRPC endpoint for the in-cluster OTel collector. The http:// scheme
+  # is required (parsed via tonic Endpoint::from_shared — a bare host:port
+  # fails at init). Only consumed when OTEL_ENABLED=true.
+  OTLP_ENDPOINT: "http://otel-collector.dark-tower:4317"
+  # Head-sampling ratio in [0.0, 1.0]; init_otel is the authoritative validator.
+  OTEL_SAMPLE_RATE: "1.0"
+  # deployment.environment resource attribute (ADR-0011).
+  DEPLOYMENT_ENVIRONMENT: "development"

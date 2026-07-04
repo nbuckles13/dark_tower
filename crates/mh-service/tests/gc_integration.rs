@@ -5,6 +5,9 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "common/mod.rs"]
+mod test_common;
+
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
@@ -16,16 +19,21 @@ use mh_service::grpc::GcClient;
 use common::observability::testing::MetricAssertion;
 use common::secret::SecretString;
 use common::token_manager::TokenReceiver;
+use opentelemetry::trace::{SpanContext, SpanId, TraceContextExt, TraceFlags, TraceId, TraceState};
+use opentelemetry::Context;
 use proto_gen::dark_tower::internal::v1::media_handler_registry_service_server::{
     MediaHandlerRegistryService, MediaHandlerRegistryServiceServer,
 };
 use proto_gen::dark_tower::internal::v1::{
     RegisterMhRequest, RegisterMhResponse, SendLoadReportRequest, SendLoadReportResponse,
 };
+use test_common::otel_capture::{install_test_propagator, SpanCapture};
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
+use tracing::Instrument;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 // ============================================================================
 // Mock GC Server
@@ -50,6 +58,11 @@ struct MockGcServer {
     load_report_count: AtomicU32,
     registration_tx: Option<mpsc::Sender<RegisterMhRequest>>,
     load_report_tx: Option<mpsc::Sender<SendLoadReportRequest>>,
+    /// Captures the inbound `traceparent` metadata value (if any) seen on
+    /// each call, in call order — one send per RPC regardless of outcome.
+    /// Used by the R-56 outbound-injection assertions in
+    /// `otel_grpc_integration.rs`.
+    traceparent_tx: Option<mpsc::Sender<Option<String>>>,
 }
 
 impl MockGcServer {
@@ -61,6 +74,7 @@ impl MockGcServer {
             load_report_count: AtomicU32::new(0),
             registration_tx: None,
             load_report_tx: None,
+            traceparent_tx: None,
         }
     }
 
@@ -96,6 +110,20 @@ impl MockGcServer {
         self.load_report_interval_ms = interval_ms;
         self
     }
+
+    fn with_traceparent_channel(mut self, tx: mpsc::Sender<Option<String>>) -> Self {
+        self.traceparent_tx = Some(tx);
+        self
+    }
+}
+
+/// Read the `traceparent` metadata value off an inbound request, if present.
+fn extract_traceparent<T>(request: &Request<T>) -> Option<String> {
+    request
+        .metadata()
+        .get("traceparent")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
 }
 
 #[tonic::async_trait]
@@ -104,11 +132,15 @@ impl MediaHandlerRegistryService for MockGcServer {
         &self,
         request: Request<RegisterMhRequest>,
     ) -> Result<Response<RegisterMhResponse>, Status> {
+        let traceparent = extract_traceparent(&request);
         let inner = request.into_inner();
         self.registration_count.fetch_add(1, Ordering::SeqCst);
 
         if let Some(tx) = &self.registration_tx {
             let _ = tx.send(inner.clone()).await;
+        }
+        if let Some(tx) = &self.traceparent_tx {
+            let _ = tx.send(traceparent).await;
         }
 
         match self.behavior {
@@ -131,11 +163,15 @@ impl MediaHandlerRegistryService for MockGcServer {
         &self,
         request: Request<SendLoadReportRequest>,
     ) -> Result<Response<SendLoadReportResponse>, Status> {
+        let traceparent = extract_traceparent(&request);
         let inner = request.into_inner();
         self.load_report_count.fetch_add(1, Ordering::SeqCst);
 
         if let Some(tx) = &self.load_report_tx {
             let _ = tx.send(inner).await;
+        }
+        if let Some(tx) = &self.traceparent_tx {
+            let _ = tx.send(traceparent).await;
         }
 
         match self.behavior {
@@ -173,6 +209,10 @@ fn test_config(gc_url: &str) -> Config {
         ac_jwks_url: "http://localhost:8082/.well-known/jwks.json".to_string(),
         register_meeting_timeout_seconds: 15,
         max_connections: 10_000,
+        otel_enabled: false,
+        otel_endpoint: String::new(),
+        otel_sample_rate: 1.0,
+        environment: "test".to_string(),
     }
 }
 
@@ -396,6 +436,120 @@ async fn test_gc_client_load_report_not_found_clears_registration() {
 
     // is_registered should be cleared
     assert!(!gc_client.is_registered());
+
+    cancel_token.cancel();
+}
+
+// ============================================================================
+// R-56: Outbound trace-context injection tests
+// ============================================================================
+//
+// `GcClient` wraps both `MediaHandlerRegistryServiceClient` construction
+// sites with `common::observability::otel_grpc::client_interceptor()`. These
+// tests exercise the REAL `GcClient` → mock-GC round trip (not the
+// interceptor in isolation, which `otel_grpc.rs`'s own unit tests already
+// cover) and assert the mock actually receives a `traceparent` header whose
+// trace id matches a known ambient span the RPC call is wrapped in.
+
+const KNOWN_TRACE_ID_U128: u128 = 0x4bf9_2f35_77b3_4da6_a3ce_929d_0e0e_4736;
+const KNOWN_SPAN_ID_U64: u64 = 0x00f0_67aa_0ba9_02b7;
+
+/// A remote `Context` with a known, fixed trace/span id — used as the
+/// "caller's" ambient trace context for injection assertions.
+fn known_remote_context() -> Context {
+    Context::new().with_remote_span_context(SpanContext::new(
+        TraceId::from(KNOWN_TRACE_ID_U128),
+        SpanId::from(KNOWN_SPAN_ID_U64),
+        TraceFlags::SAMPLED,
+        true,
+        TraceState::default(),
+    ))
+}
+
+#[tokio::test]
+async fn test_gc_client_register_injects_traceparent_matching_ambient_span() {
+    install_test_propagator();
+    // Needed for `set_parent`/`Span::current().context()` to do anything —
+    // without an installed `OpenTelemetryLayer`, both are no-ops.
+    let _capture = SpanCapture::install();
+
+    let (traceparent_tx, mut traceparent_rx) = mpsc::channel(1);
+    let mock_gc = MockGcServer::accepting().with_traceparent_channel(traceparent_tx);
+    let (addr, cancel_token) = start_mock_gc_server(mock_gc).await;
+
+    let gc_url = format!("http://{addr}");
+    let config = test_config(&gc_url);
+    let token_rx = mock_token_receiver();
+    let gc_client = GcClient::new(gc_url, token_rx, config).await.unwrap();
+
+    let span = tracing::info_span!("test_register_root");
+    span.set_parent(known_remote_context());
+    async {
+        gc_client.register().await.unwrap();
+    }
+    .instrument(span)
+    .await;
+
+    let traceparent = traceparent_rx
+        .recv()
+        .await
+        .expect("mock GC should have received one RegisterMH call");
+    let tp = traceparent.expect("RegisterMH RPC should carry a traceparent header");
+    assert!(
+        tp.starts_with("00-"),
+        "traceparent header missing or malformed: {tp:?}"
+    );
+    let trace_id_hex = tp.get(3..35).unwrap_or_default();
+    assert_eq!(
+        trace_id_hex,
+        format!("{KNOWN_TRACE_ID_U128:032x}"),
+        "injected trace_id should match the ambient span's trace id"
+    );
+
+    cancel_token.cancel();
+}
+
+#[tokio::test]
+async fn test_gc_client_send_load_report_injects_traceparent_matching_ambient_span() {
+    install_test_propagator();
+    let _capture = SpanCapture::install();
+
+    let (traceparent_tx, mut traceparent_rx) = mpsc::channel(2);
+    let mock_gc = MockGcServer::accepting().with_traceparent_channel(traceparent_tx);
+    let (addr, cancel_token) = start_mock_gc_server(mock_gc).await;
+
+    let gc_url = format!("http://{addr}");
+    let config = test_config(&gc_url);
+    let token_rx = mock_token_receiver();
+    let gc_client = GcClient::new(gc_url, token_rx, config).await.unwrap();
+
+    // Register outside any ambient span (its own #[instrument] root span
+    // still injects SOME traceparent — drain and discard it below).
+    gc_client.register().await.unwrap();
+
+    let span = tracing::info_span!("test_load_report_root");
+    span.set_parent(known_remote_context());
+    async {
+        gc_client.send_load_report().await.unwrap();
+    }
+    .instrument(span)
+    .await;
+
+    let _register_traceparent = traceparent_rx
+        .recv()
+        .await
+        .expect("mock GC should have received the RegisterMH call first");
+    let load_report_traceparent = traceparent_rx
+        .recv()
+        .await
+        .expect("mock GC should have received the SendLoadReport call second");
+    let tp = load_report_traceparent.expect("SendLoadReport RPC should carry a traceparent header");
+    let trace_id_hex = tp.get(3..35).unwrap_or_default();
+    assert_eq!(
+        trace_id_hex,
+        format!("{KNOWN_TRACE_ID_U128:032x}"),
+        "injected trace_id should match the ambient span's trace id"
+    );
 
     cancel_token.cancel();
 }

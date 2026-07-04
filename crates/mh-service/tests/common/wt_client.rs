@@ -56,9 +56,26 @@ pub async fn write_framed(
 /// This is the production wire format on MH's bidi accept path. Use this
 /// helper for positive-path tests; use [`write_framed`] directly for negative
 /// tests that need raw bytes (malformed envelopes, oversized payloads).
+///
+/// `trace_parent`/`trace_state` are proto3-default empty strings, matching
+/// today's clients that don't yet populate R-58's trace fields — see
+/// [`write_mh_connect_with_trace`] for the trace-carrying variant.
 pub async fn write_mh_connect(
     send: &mut wtransport::stream::SendStream,
     jwt: &str,
+) -> Result<(), wtransport::error::StreamWriteError> {
+    write_mh_connect_with_trace(send, jwt, "", "").await
+}
+
+/// Like [`write_mh_connect`], but sets the envelope's W3C `trace_parent`/
+/// `trace_state` fields (R-58) to the given values instead of leaving them
+/// proto3-default-empty. Used to exercise the WebTransport trace-context
+/// extraction path in `webtransport/connection.rs::handle_connection`.
+pub async fn write_mh_connect_with_trace(
+    send: &mut wtransport::stream::SendStream,
+    jwt: &str,
+    trace_parent: &str,
+    trace_state: &str,
 ) -> Result<(), wtransport::error::StreamWriteError> {
     let envelope = MhClientMessage {
         message: Some(mh_client_message::Message::ConnectRequest(
@@ -66,8 +83,8 @@ pub async fn write_mh_connect(
                 join_token: jwt.to_string(),
             },
         )),
-        trace_parent: String::new(),
-        trace_state: String::new(),
+        trace_parent: trace_parent.to_string(),
+        trace_state: trace_state.to_string(),
     };
     let encoded = envelope.encode_to_vec();
     write_framed(send, &encoded).await

@@ -12,6 +12,8 @@
 //!   former `wt_rig.rs` bypass (which called `handle_connection` directly).
 //! - [`tokens`] — MC service-token and meeting-token minting helpers
 //! - [`wt_client`] — Thin WebTransport client wrapper
+//! - [`otel_capture`] — In-memory OTel span capture + global-propagator
+//!   installation for R-55/R-56/R-58 trace-propagation assertions
 //!
 //! # Integration value
 //!
@@ -40,6 +42,7 @@ pub mod accept_loop_rig;
 pub mod grpc_rig;
 pub mod jwks_rig;
 pub mod mock_mc;
+pub mod otel_capture;
 pub mod tokens;
 pub mod wt_client;
 
