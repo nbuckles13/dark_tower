@@ -1,0 +1,50 @@
+{
+  "$schema": "../../node_modules/nx/schemas/project-schema.json",
+  "name": "web-app",
+  "projectType": "application",
+  "sourceRoot": "packages/web-app/src",
+  "implicitDependencies": ["sdk-core", "sdk-svelte"],
+  "targets": {
+    "build": {
+      "executor": "nx:run-commands",
+      "dependsOn": ["^build", { "projects": ["proto-gen"], "target": "codegen" }],
+      "options": {
+        "cwd": "packages/web-app",
+        "command": "vite build"
+      },
+      "outputs": ["{projectRoot}/dist"]
+    },
+    "dev": {
+      "executor": "nx:run-commands",
+      "dependsOn": [{ "projects": ["proto-gen"], "target": "codegen" }],
+      "options": {
+        "cwd": "packages/web-app",
+        "command": "vite"
+      }
+    },
+    "test:unit": {
+      "executor": "nx:run-commands",
+      "dependsOn": [{ "projects": ["proto-gen"], "target": "codegen" }],
+      "options": {
+        "cwd": "packages/web-app",
+        "command": "vitest run --config vitest.node.config.ts"
+      }
+    },
+    "test:component": {
+      "executor": "nx:run-commands",
+      "dependsOn": [{ "projects": ["proto-gen"], "target": "codegen" }],
+      "options": {
+        "cwd": "packages/web-app",
+        "command": "vitest run --config vitest.config.ts"
+      }
+    },
+    "lint": {
+      "executor": "nx:run-commands",
+      "dependsOn": [{ "projects": ["proto-gen"], "target": "codegen" }],
+      "options": {
+        "cwd": "packages/web-app",
+        "command": "svelte-check --tsconfig ./tsconfig.json && eslint src/ && prettier --check \"src/**/*.{ts,svelte}\""
+      }
+    }
+  }
+}

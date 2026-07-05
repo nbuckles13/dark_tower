@@ -1,0 +1,20 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "dist",
+    "types": ["node"],
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "moduleResolution": "Bundler",
+    "noEmit": true,
+    "baseUrl": ".",
+    "paths": {
+      // Resolve the sdk-core dependency to its TS source so svelte-check / dts
+      // resolve `@darktower/sdk-core` types without first building sdk-core's
+      // `dist/`. `paths` affects resolution only — emitted `.d.ts` still import
+      // from the bare `@darktower/sdk-core` specifier (the closed public barrel).
+      "@darktower/sdk-core": ["../sdk-core/src/index.ts"]
+    }
+  },
+  "include": ["src/**/*", "src/**/*.svelte", "vite.config.ts", "vitest.config.ts"],
+  "exclude": ["dist", "node_modules"]
+}

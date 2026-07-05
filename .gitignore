@@ -35,6 +35,8 @@ infra/docker/certs/*.key
 infra/docker/certs/*.crt
 infra/docker/certs/*.pem
 infra/docker/certs/*.srl
+# Generated dev WebTransport cert fingerprints (infra R-36) — never commit (R-33).
+infra/docker/certs/fingerprints.json
 
 # Logs
 *.log

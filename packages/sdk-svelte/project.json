@@ -1,0 +1,34 @@
+{
+  "$schema": "../../node_modules/nx/schemas/project-schema.json",
+  "name": "sdk-svelte",
+  "projectType": "library",
+  "sourceRoot": "packages/sdk-svelte/src",
+  "implicitDependencies": ["sdk-core"],
+  "targets": {
+    "build": {
+      "executor": "nx:run-commands",
+      "dependsOn": ["^build", { "projects": ["proto-gen"], "target": "codegen" }],
+      "options": {
+        "cwd": "packages/sdk-svelte",
+        "command": "vite build"
+      },
+      "outputs": ["{projectRoot}/dist"]
+    },
+    "test:component": {
+      "executor": "nx:run-commands",
+      "dependsOn": [{ "projects": ["proto-gen"], "target": "codegen" }],
+      "options": {
+        "cwd": "packages/sdk-svelte",
+        "command": "vitest run --config vitest.config.ts"
+      }
+    },
+    "lint": {
+      "executor": "nx:run-commands",
+      "dependsOn": [{ "projects": ["proto-gen"], "target": "codegen" }],
+      "options": {
+        "cwd": "packages/sdk-svelte",
+        "command": "svelte-check --tsconfig ./tsconfig.json && eslint src/ && prettier --check \"src/**/*.{ts,svelte}\""
+      }
+    }
+  }
+}

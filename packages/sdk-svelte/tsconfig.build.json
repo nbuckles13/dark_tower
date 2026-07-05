@@ -1,0 +1,18 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "noEmit": false,
+    "declaration": true,
+    "declarationMap": true,
+    "emitDeclarationOnly": true,
+    "outDir": "dist",
+    // Override the source alias from tsconfig.json: the dts build resolves
+    // `@darktower/sdk-core` from its BUILT `dist/index.d.ts` (via the workspace
+    // node_modules symlink, guaranteed present by the Nx `^build` dependency) so
+    // sdk-core source is not pulled under this package's `rootDir` (TS6059).
+    "paths": {}
+  },
+  "include": ["src/**/*"],
+  "exclude": ["src/**/__tests__/**", "src/**/*.test.ts", "dist", "node_modules"]
+}

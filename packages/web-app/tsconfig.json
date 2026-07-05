@@ -1,0 +1,27 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "types": ["node", "vite/client"],
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "moduleResolution": "Bundler",
+    "noEmit": true,
+    "baseUrl": ".",
+    "paths": {
+      // Source-resolve the workspace SDK packages for svelte-check / editor so no
+      // prebuilt `dist/` is required (mirrors sdk-core's test-utils alias).
+      "@darktower/sdk-core": ["../sdk-core/src/index.ts"],
+      "@darktower/sdk-svelte": ["../sdk-svelte/src/index.ts"]
+    }
+  },
+  "include": [
+    "src/**/*",
+    "src/**/*.svelte",
+    "tests/**/*",
+    "vite/**/*",
+    "vite-env.d.ts",
+    "vite.config.ts",
+    "vitest.config.ts",
+    "vitest.node.config.ts"
+  ],
+  "exclude": ["dist", "node_modules"]
+}

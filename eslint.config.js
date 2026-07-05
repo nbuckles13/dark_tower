@@ -9,6 +9,8 @@
 
 import js from '@eslint/js';
 import tseslint from 'typescript-eslint';
+import sveltePlugin from 'eslint-plugin-svelte';
+import globals from 'globals';
 
 export default tseslint.config(
   // Base JS recommended rules.
@@ -49,20 +51,19 @@ export default tseslint.config(
     },
   },
 
-  // --- svelte placeholder (task #15) ---
-  // When sdk-svelte / web-app land, uncomment the block below and add:
-  //   pnpm add -w -D eslint-plugin-svelte globals
-  //
-  // import sveltePlugin from 'eslint-plugin-svelte';
-  // import globals from 'globals';
-  // ...sveltePlugin.configs['flat/recommended'],
-  // {
-  //   files: ['packages/**/*.svelte'],
-  //   languageOptions: {
-  //     globals: { ...globals.browser },
-  //     parserOptions: { parser: tseslint.parser },
-  //   },
-  // },
+  // --- svelte (task #15: sdk-svelte / web-app) ---
+  ...sveltePlugin.configs['flat/recommended'],
+  {
+    files: ['packages/**/*.svelte', 'packages/**/*.svelte.ts'],
+    languageOptions: {
+      globals: { ...globals.browser },
+      parserOptions: {
+        parser: tseslint.parser,
+        // Runes-aware TS parsing for <script lang="ts"> + `.svelte.ts`.
+        projectService: false,
+      },
+    },
+  },
 
   {
     // Global ignores: generated code, build artifacts, test outputs.
