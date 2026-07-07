@@ -4,6 +4,14 @@ kind: Kustomization
 resources:
   - ../../../../../services/mc-service
 
+# R-55 (task #6): enable OTel in the Kind dev cluster (collector deployed by
+# R-59 + the MC->collector :4317 egress rule present in the base
+# NetworkPolicy). The prod base keeps OTEL_ENABLED="false"; this
+# strategic-merge patch flips it to "true" for dev. Mirrors GC's task #26
+# overlay pattern.
+patches:
+  - path: configmap-otel-patch.yaml
+
 labels:
   - pairs:
       environment: kind

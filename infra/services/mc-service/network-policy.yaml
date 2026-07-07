@@ -99,6 +99,21 @@ spec:
     ports:
     - protocol: TCP
       port: 8082
+  # Allow egress to the OTel Collector (OTLP-gRPC) — MC's OWN span export via
+  # init_otel (R-55, task #6). init_otel's collector probe is fail-hard at
+  # startup, so a missing rule here CrashLoops MC the moment OTEL_ENABLED=true.
+  # The collector's ingress netpol already admits mc-service on :4317
+  # (pre-provisioned fleet-wide for R-55).
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: dark-tower
+      podSelector:
+        matchLabels:
+          app: otel-collector
+    ports:
+    - protocol: TCP
+      port: 4317
   # Allow DNS resolution
   - to:
     - namespaceSelector:

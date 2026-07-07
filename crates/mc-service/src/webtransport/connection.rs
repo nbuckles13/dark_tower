@@ -7,12 +7,16 @@
 //! 4. Notifies the meeting when the connection drops (via `MeetingActorHandle`)
 
 use crate::actors::messages::JoinResult;
-use crate::actors::MeetingControllerActorHandle;
+use crate::actors::{
+    BoundedMhStatus, MeetingControllerActorHandle, MhState, ParticipantActorHandle,
+};
 use crate::auth::McJwtValidator;
 use crate::errors::McError;
 use crate::grpc::MhRegistrationClient;
 use crate::observability::metrics;
 use crate::redis::{MhAssignmentData, MhAssignmentStore};
+
+use super::trace::{inject_current_context, reparent_current_span};
 
 use bytes::{BufMut, BytesMut};
 use common::jwt::MeetingRole;
@@ -32,6 +36,22 @@ use wtransport::stream::{RecvStream, SendStream};
 /// Maximum size for a single framed message (64KB).
 const MAX_MESSAGE_SIZE: usize = 64 * 1024;
 
+/// Maximum bytes for a client-controlled string before it is stored or logged
+/// (R-60 security). Applied to `mh_url` / `failure_reason` / `failure_code`.
+const MAX_CLIENT_STRING_BYTES: usize = 256;
+
+/// Maximum number of per-MH statuses processed from a SINGLE
+/// `MediaConnectionUpdate` message (R-60 security — input-amplification bound).
+/// The persistent per-participant map is capped separately at
+/// `MAX_MH_STATUSES_PER_PARTICIPANT` (16); this bounds the transient work the
+/// handler does per message. A 64 KiB frame can pack tens of thousands of
+/// minimal statuses, but at most 16 can ever land — so we refuse to map+iterate
+/// an unbounded attacker-sized batch. Set to 4× the map cap so a legitimate
+/// client (which sends ≤ its assigned MH count, ≤ the map cap) is never
+/// affected. Over-limit batches bump
+/// `mc_participant_mh_status_dropped_total{reason="over_limit"}`.
+const MAX_MH_STATUSES_PER_UPDATE: usize = 64;
+
 /// Maximum length for a participant display name (bytes).
 const MAX_PARTICIPANT_NAME_LEN: usize = 256;
 
@@ -43,6 +63,37 @@ const MAX_REGISTER_ATTEMPTS: u32 = 3;
 
 /// Backoff delays between RegisterMeeting retry attempts.
 const REGISTER_BACKOFF_DELAYS: [Duration; 2] = [Duration::from_secs(1), Duration::from_secs(2)];
+
+/// Truncate `s` to at most `max_bytes`, snapping DOWN to a UTF-8 char boundary
+/// so a multi-byte codepoint is never split (R-60 security — bounds
+/// client-controlled strings before store/log).
+///
+/// `str::floor_char_boundary` is still unstable, so this rolls the equivalent.
+/// Bounds BYTES (log/memory blast radius is bytes), never panics.
+fn truncate_utf8(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_string()
+}
+
+/// Map the proto `ConnectionState` (stored as `i32`) to the bounded domain enum
+/// via a TOTAL match with an `Unspecified` catch-all (R-60 allowlist-clamp — an
+/// unknown/malformed wire int can never widen the `mc_participant_mh_status_total`
+/// label domain).
+fn map_connection_state(state: i32) -> MhState {
+    use v1::ConnectionState;
+    match ConnectionState::try_from(state) {
+        Ok(ConnectionState::Connected) => MhState::Connected,
+        Ok(ConnectionState::Failed) => MhState::Failed,
+        Ok(ConnectionState::Disconnected) => MhState::Disconnected,
+        Ok(ConnectionState::Unspecified) | Err(_) => MhState::Unspecified,
+    }
+}
 
 /// Handle an incoming WebTransport connection.
 ///
@@ -140,6 +191,12 @@ pub async fn handle_connection(
         );
         err
     })?;
+
+    // R-57: reparent the `mc.webtransport.connection` span onto the browser's
+    // trace so the whole join flow (and the `mc.actor.participant` spawn) become
+    // children of the client's `dt_client.join` span. Extraction uses the global
+    // bounded propagator; empty proto3-default fields → clean root (no-op).
+    reparent_current_span(&client_message.trace_parent, &client_message.trace_state);
 
     // Step 4: Extract JoinRequest
     let join_request = match client_message.message {
@@ -371,10 +428,13 @@ pub async fn handle_connection(
                 return Err(e);
             }
         };
+    // R-57: symmetric outbound injection — carry the current server-side trace
+    // context back to the client on the JoinResponse (bounded W3C IDs only).
+    let (trace_parent, trace_state) = inject_current_context();
     let server_msg = ServerMessage {
         message: Some(server_message::Message::JoinResponse(join_response)),
-        trace_parent: String::new(),
-        trace_state: String::new(),
+        trace_parent,
+        trace_state,
     };
 
     if let Err(e) = write_framed_message(&mut send_stream, &server_msg).await {
@@ -449,6 +509,7 @@ pub async fn handle_connection(
         &mut outbound_rx,
         &cancel_token,
         &connection_id,
+        &join_result.participant_handle,
     )
     .await;
 
@@ -478,6 +539,7 @@ async fn run_bridge_loop(
     outbound_rx: &mut mpsc::Receiver<bytes::Bytes>,
     cancel_token: &CancellationToken,
     connection_id: &str,
+    participant_handle: &ParticipantActorHandle,
 ) -> Result<(), McError> {
     loop {
         tokio::select! {
@@ -518,7 +580,7 @@ async fn run_bridge_loop(
             result = read_framed_message(recv_stream) => {
                 match result {
                     Ok(data) => {
-                        handle_client_message(&data, connection_id);
+                        handle_client_message(&data, connection_id, participant_handle).await;
                     }
                     Err(_) => {
                         debug!(
@@ -538,11 +600,16 @@ async fn run_bridge_loop(
 
 /// Handle a post-join client message in the bridge loop.
 ///
-/// Currently handles:
-/// - `MediaConnectionUpdate` (browser-client-join Task #2 stub): no-op
-///   debug log; per-MH state recording deferred to Task #6.
+/// Handles:
+/// - `MediaConnectionUpdate` (R-60): records per-MH state on the participant
+///   actor under its own reparented child span (see
+///   [`handle_media_connection_update`]).
 /// - All other messages: Ignored (logged at debug level).
-fn handle_client_message(data: &[u8], connection_id: &str) {
+async fn handle_client_message(
+    data: &[u8],
+    connection_id: &str,
+    participant_handle: &ParticipantActorHandle,
+) {
     let Ok(client_message) = ClientMessage::decode(data) else {
         debug!(
             target: "mc.webtransport.connection",
@@ -552,23 +619,20 @@ fn handle_client_message(data: &[u8], connection_id: &str) {
         return;
     };
 
+    // Read the trace fields off the envelope before the `match` moves `.message`.
+    let trace_parent = client_message.trace_parent;
+    let trace_state = client_message.trace_state;
+
     match client_message.message {
-        Some(client_message::Message::MediaConnectionUpdate(msg)) => {
-            debug!(
-                target: "mc.webtransport.connection",
-                connection_id = %connection_id,
-                statuses_count = msg.statuses.len(),
-                "MediaConnectionUpdate received (Task #6 stub: per-MH state recording deferred)"
-            );
-            // TODO(browser-client-join task #6, owner: meeting-controller):
-            //   Record per-MH state on participant actor + emit
-            //   `mc_participant_mh_status_total{state}` metric. SECURITY: when
-            //   reintroducing logging of `mh_url` / `failure_reason` /
-            //   `failure_code`, apply `floor_char_boundary(256)` truncation on
-            //   each (matches the discipline previously used for
-            //   `MediaConnectionFailed.media_handler_url` / `error_reason` at
-            //   this site) — these are client-controlled strings and must not
-            //   be logged unbounded.
+        Some(client_message::Message::MediaConnectionUpdate(update)) => {
+            handle_media_connection_update(
+                update,
+                &trace_parent,
+                &trace_state,
+                connection_id,
+                participant_handle,
+            )
+            .await;
         }
         Some(_) => {
             debug!(
@@ -584,6 +648,77 @@ fn handle_client_message(data: &[u8], connection_id: &str) {
                 "Received empty client message, ignoring"
             );
         }
+    }
+}
+
+/// Handle a post-join `MediaConnectionUpdate` (R-60), recording per-MH state on
+/// the participant actor.
+///
+/// Runs in its OWN span reparented onto the message's trace context (R-57 —
+/// a fresh CHILD span, NOT a re-parent of the long-lived connection span, whose
+/// single parent is fixed at the JoinRequest). All client-controlled strings
+/// (`mh_url` / `failure_reason` / `failure_code`) are truncated to
+/// `MAX_CLIENT_STRING_BYTES` on a char boundary at this trust boundary before
+/// being handed to the actor, so no untruncated field is ever stored or logged.
+#[instrument(
+    target = "mc.webtransport.connection",
+    name = "mc.media_connection_update",
+    skip_all,
+    fields(connection_id = %connection_id, statuses_count = update.statuses.len())
+)]
+async fn handle_media_connection_update(
+    update: v1::MediaConnectionUpdate,
+    trace_parent: &str,
+    trace_state: &str,
+    connection_id: &str,
+    participant_handle: &ParticipantActorHandle,
+) {
+    // Reparent THIS span onto the client's per-message trace context (empty →
+    // clean root; extraction via the global bounded propagator).
+    reparent_current_span(trace_parent, trace_state);
+
+    // Bound the per-message fan-out BEFORE doing any per-entry work (R-60
+    // security): a hostile client can pack a 64 KiB frame with tens of thousands
+    // of minimal statuses, but at most the map cap can ever land. Refuse to
+    // map+iterate an unbounded attacker-sized batch — `take` the first
+    // `MAX_MH_STATUSES_PER_UPDATE` and record the truncation as an observable
+    // drop (no client strings logged, mirroring the cap-drop discipline).
+    let over_limit = update.statuses.len() > MAX_MH_STATUSES_PER_UPDATE;
+    if over_limit {
+        crate::observability::metrics::record_participant_mh_status_dropped("over_limit");
+    }
+
+    // Map + truncate at the trust boundary: the actor only ever receives bounded
+    // domain values keyed by the truncated `mh_url`.
+    let statuses: Vec<(String, BoundedMhStatus)> = update
+        .statuses
+        .into_iter()
+        .take(MAX_MH_STATUSES_PER_UPDATE)
+        .map(|s| {
+            let key = truncate_utf8(&s.mh_url, MAX_CLIENT_STRING_BYTES);
+            let bounded = BoundedMhStatus {
+                state: map_connection_state(s.state),
+                failure_reason: s
+                    .failure_reason
+                    .map(|r| truncate_utf8(&r, MAX_CLIENT_STRING_BYTES)),
+                failure_code: s
+                    .failure_code
+                    .map(|c| truncate_utf8(&c, MAX_CLIENT_STRING_BYTES)),
+            };
+            (key, bounded)
+        })
+        .collect();
+
+    if let Err(e) = participant_handle.record_mh_statuses(statuses).await {
+        // Actor gone mid-connection (mailbox receiver dropped). Graceful — no
+        // panic; the connection will close on its own. No client-controlled
+        // strings in this log line.
+        debug!(
+            target: "mc.webtransport.connection",
+            connection_id = %connection_id,
+            error = %e,
+            "Failed to deliver MediaConnectionUpdate to participant actor"
+        );
     }
 }
 
@@ -663,14 +798,16 @@ async fn send_error(
     error_code: i32,
     message: &str,
 ) -> Result<(), McError> {
+    // R-57: symmetric outbound injection on the error path too.
+    let (trace_parent, trace_state) = inject_current_context();
     let server_msg = ServerMessage {
         message: Some(server_message::Message::Error(ErrorMessage {
             code: error_code,
             message: message.to_string(),
             details: Default::default(),
         })),
-        trace_parent: String::new(),
-        trace_state: String::new(),
+        trace_parent,
+        trace_state,
     };
     let result = write_framed_message(stream, &server_msg).await;
     // Finish the stream to flush buffered data before the caller drops it
@@ -827,15 +964,28 @@ async fn register_meeting_with_handlers(
 mod tests {
     use super::*;
 
-    // Tests for `handle_client_message` against the new
-    // `MediaConnectionUpdate` variant are deferred to browser-client-join
-    // Task #6 (meeting-controller), which writes them against the new
-    // `mc_participant_mh_status_total{state}` metric and the real per-MH
-    // state-recording handler. Task #2 leaves the handler as a `tracing::debug!`
-    // stub (no semantic behavior worth asserting in isolation).
+    // Full R-60 behavioral coverage (all-CONNECTED / partial / all-FAILED state
+    // recording + metric + truncation + cap) lives in
+    // `tests/media_connection_update_integration.rs`, which drives a real framed
+    // `ClientMessage{MediaConnectionUpdate}` through the decode+dispatch seam.
+    // These in-module tests only assert the non-`MediaConnectionUpdate` branches
+    // don't panic and the char-boundary truncation helper is correct.
 
-    #[test]
-    fn test_handle_client_message_unhandled_type() {
+    /// Spawn a throwaway participant actor for the dispatch-branch tests.
+    fn test_participant_handle() -> (ParticipantActorHandle, tokio::task::JoinHandle<()>) {
+        use crate::actors::{ActorMetrics, ParticipantActor};
+        ParticipantActor::spawn(
+            "test-conn".to_string(),
+            "test-part".to_string(),
+            "test-meeting".to_string(),
+            CancellationToken::new(),
+            ActorMetrics::new(),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_handle_client_message_unhandled_type() {
+        let (handle, _task) = test_participant_handle();
         let msg = ClientMessage {
             message: Some(client_message::Message::MuteRequest(v1::MuteRequest {
                 audio_muted: true,
@@ -846,18 +996,20 @@ mod tests {
         };
         let data = msg.encode_to_vec();
         // Should not panic -- exercises the Some(_) branch
-        handle_client_message(&data, "test-conn-3");
+        handle_client_message(&data, "test-conn-3", &handle).await;
     }
 
-    #[test]
-    fn test_handle_client_message_invalid_data() {
+    #[tokio::test]
+    async fn test_handle_client_message_invalid_data() {
+        let (handle, _task) = test_participant_handle();
         let garbage = vec![0xFF, 0xFE, 0xFD, 0xFC, 0xFB];
         // Should not panic -- exercises the decode error branch
-        handle_client_message(&garbage, "test-conn-4");
+        handle_client_message(&garbage, "test-conn-4", &handle).await;
     }
 
-    #[test]
-    fn test_handle_client_message_empty_message() {
+    #[tokio::test]
+    async fn test_handle_client_message_empty_message() {
+        let (handle, _task) = test_participant_handle();
         let msg = ClientMessage {
             message: None,
             trace_parent: String::new(),
@@ -865,7 +1017,43 @@ mod tests {
         };
         let data = msg.encode_to_vec();
         // Should not panic -- exercises the None branch
-        handle_client_message(&data, "test-conn-5");
+        handle_client_message(&data, "test-conn-5", &handle).await;
+    }
+
+    #[test]
+    fn test_truncate_utf8_short_string_unchanged() {
+        assert_eq!(truncate_utf8("hello", 256), "hello");
+    }
+
+    #[test]
+    fn test_truncate_utf8_bounds_bytes_on_char_boundary() {
+        // A 300-byte ASCII string truncates to exactly 256 bytes.
+        let long = "a".repeat(300);
+        let out = truncate_utf8(&long, MAX_CLIENT_STRING_BYTES);
+        assert_eq!(out.len(), MAX_CLIENT_STRING_BYTES);
+    }
+
+    #[test]
+    fn test_truncate_utf8_never_splits_multibyte_codepoint() {
+        // '€' is 3 bytes. Build a string whose 256th byte lands mid-codepoint,
+        // and assert we floor to a boundary (shorter than 256) without panic.
+        let s = "€".repeat(100); // 300 bytes, boundaries at multiples of 3
+        let out = truncate_utf8(&s, MAX_CLIENT_STRING_BYTES);
+        assert!(out.len() <= MAX_CLIENT_STRING_BYTES);
+        assert!(s.starts_with(&out));
+        // 256 is not a multiple of 3 → floors to 255 (85 full '€').
+        assert_eq!(out.len(), 255);
+    }
+
+    #[test]
+    fn test_map_connection_state_total_with_catch_all() {
+        assert_eq!(map_connection_state(1), MhState::Connected);
+        assert_eq!(map_connection_state(2), MhState::Failed);
+        assert_eq!(map_connection_state(3), MhState::Disconnected);
+        assert_eq!(map_connection_state(0), MhState::Unspecified);
+        // Unknown / malformed wire int → Unspecified (allowlist-clamp).
+        assert_eq!(map_connection_state(999), MhState::Unspecified);
+        assert_eq!(map_connection_state(-1), MhState::Unspecified);
     }
 
     // ========================================================================

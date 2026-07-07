@@ -58,6 +58,26 @@ groups:
           impact: "Message processing severely delayed. Active meetings experiencing significant lag or failures."
           runbook_url: "docs/runbooks/mc-incident-response.md#scenario-1-high-mailbox-depth"
 
+      - alert: MCMediaConnectionAllFailed
+        expr: |
+          (
+            sum(rate(mc_participant_mh_status_total{state="failed"}[5m]))
+            /
+            sum(rate(mc_participant_mh_status_total{state=~"connected|failed"}[5m]))
+          ) > 0.80
+          and
+          sum(rate(mc_participant_mh_status_total{state=~"connected|failed"}[5m])) > 0.1
+        for: 5m
+        labels:
+          severity: page
+          service: mc-service
+          component: media-coordination
+        annotations:
+          summary: "MC client-reported media connections predominantly failing ({{ $value | humanizePercentage }})"
+          description: "Over 80% of client-reported per-MH media connections are in the FAILED state ({{ $value | humanizePercentage }}) for 5 minutes, at meaningful volume. Replaces the pre-R-60 all-fail-counter alert (deleted in Task #2); the new signal is the failed share of mc_participant_mh_status_total{state}. See 'Client-Reported MH Status by State' on MC Overview for the per-state breakdown."
+          impact: "Participants are joining meetings but cannot establish media to their assigned Media Handlers — calls are silently broken (no audio/video) even though signaling and join succeed. User-visible."
+          runbook_url: "docs/runbooks/mc-incident-response.md#scenario-11-media-connection-failures"
+
   - name: mc-service-warning
     interval: 60s
     rules:

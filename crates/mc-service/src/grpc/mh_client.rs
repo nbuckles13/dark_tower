@@ -117,7 +117,11 @@ impl MhClient {
                 McError::Grpc(format!("Failed to connect to MH: {e}"))
             })?;
 
-        let mut client = MediaHandlerServiceClient::new(channel);
+        // R-56: inject the active W3C trace context into outbound MH metadata.
+        let mut client = MediaHandlerServiceClient::with_interceptor(
+            channel,
+            common::observability::otel_grpc::client_interceptor(),
+        );
 
         let request = RegisterMeetingRequest {
             meeting_id: meeting_id.to_string(),

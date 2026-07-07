@@ -719,6 +719,216 @@ async fn test_mh_disconnect_increments_mc_notification_metric_disconnected() {
 }
 
 // ============================================================================
+// Scenario 7 (R-60 MC half): MediaConnectionUpdate → mc_participant_mh_status_total
+// ============================================================================
+
+/// Read the cluster-wide value of `mc_participant_mh_status_total` for a
+/// specific `state` label. `sum(...)` for replica-robustness (mirrors
+/// [`mh_notification_counter`]). Returns 0.0 for an as-yet-unobserved series.
+async fn mc_participant_mh_status_counter(prom: &PrometheusClient, state: &str) -> f64 {
+    let promql = format!(
+        r#"sum(mc_participant_mh_status_total{{state="{}"}})"#,
+        state
+    );
+    let response = match prom.query_promql(&promql).await {
+        Ok(r) => r,
+        Err(_) => return 0.0,
+    };
+    response
+        .data
+        .result
+        .first()
+        .and_then(|r| r.value.as_ref())
+        .and_then(|(_, v)| v.parse::<f64>().ok())
+        .unwrap_or(0.0)
+}
+
+/// Poll until `mc_participant_mh_status_total{state=...}` exceeds `baseline`.
+/// Budget: 60s — the chain is WT frame → MC bridge-loop decode → participant
+/// actor record → counter → Prometheus scrape (15s SLA), same shape as the
+/// notification-counter assertion.
+async fn assert_participant_mh_status_increases_past(
+    prom: &PrometheusClient,
+    state: &str,
+    baseline: f64,
+) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let current = mc_participant_mh_status_counter(prom, state).await;
+        if current > baseline {
+            return;
+        }
+        if std::time::Instant::now() > deadline {
+            panic!(
+                "mc_participant_mh_status_total{{state=\"{state}\"}} did not increase above \
+                 baseline {baseline} within 60s (last observed: {current})"
+            );
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+/// Test: after a client joins MC and sends a
+/// `ClientMessage{MediaConnectionUpdate}` reporting a `CONNECTED` MH, MC
+/// records it on the participant actor and
+/// `mc_participant_mh_status_total{state="connected"}` increments (R-60 MC
+/// half — the post-join client→MC reporting plane).
+///
+/// This is the cluster-tier companion to the component-tier seam coverage in
+/// `crates/mc-service/tests/media_connection_update_integration.rs` (which
+/// asserts the same metric through the real `handle_client_message` decode
+/// path) and the deterministic actor + cap coverage in
+/// `crates/mc-service/src/actors/participant.rs::tests`.
+///
+/// On-call: if this fails, suspect MC's post-join `handle_client_message`
+/// dispatch (`crates/mc-service/src/webtransport/connection.rs`), the
+/// `ParticipantActor::record_mh_statuses` path, or Prometheus scrape of MC.
+#[tokio::test]
+#[serial_test::serial(mc_participant_mh_status)]
+async fn test_mc_media_connection_update_increments_participant_mh_status_metric() {
+    use bytes::{BufMut, BytesMut as MsgBuf};
+    use prost::Message;
+    use proto_gen::dark_tower::signaling::v1::{
+        client_message, server_message, ClientMessage, ConnectionState, JoinRequest,
+        MediaConnectionUpdate, MhConnectionStatus, ServerMessage,
+    };
+
+    let cluster = cluster().await;
+    let prom = PrometheusClient::new(&cluster.prometheus_base_url);
+    let auth_client = AuthClient::new(&cluster.ac_base_url);
+    let (user_token, display_name) = register_test_user(&auth_client, "MC MediaUpdate User").await;
+
+    let baseline = mc_participant_mh_status_counter(&prom, "connected").await;
+
+    // Real GC→MC join, but keep the bidi stream open so we can send a
+    // follow-up MediaConnectionUpdate on it (mc_join drops the connection).
+    let gc_join = gc_create_and_join(
+        cluster,
+        &user_token,
+        "MC MediaConnectionUpdate Metric Meeting",
+    )
+    .await;
+    let mc_url = gc_join
+        .mc_assignment
+        .webtransport_endpoint
+        .clone()
+        .expect("MC assignment must include webtransport_endpoint");
+
+    let conn = connect_wt(&mc_url).await;
+    let (mut send, mut recv) = conn
+        .open_bi()
+        .await
+        .expect("open bi stream to MC")
+        .await
+        .expect("MC bi stream ready");
+
+    let join_msg = ClientMessage {
+        message: Some(client_message::Message::JoinRequest(JoinRequest {
+            meeting_id: gc_join.meeting_id.to_string(),
+            join_token: gc_join.token.clone(),
+            participant_name: display_name.clone(),
+            capabilities: None,
+            correlation_id: String::new(),
+            binding_token: String::new(),
+        })),
+        trace_parent: String::new(),
+        trace_state: String::new(),
+    };
+    let encoded = join_msg.encode_to_vec();
+    let mut frame = MsgBuf::with_capacity(4 + encoded.len());
+    frame.put_u32(encoded.len() as u32);
+    frame.put_slice(&encoded);
+    send.write_all(&frame)
+        .await
+        .expect("send JoinRequest to MC");
+
+    // Read the JoinResponse to learn the assigned MH URL(s).
+    let mut len_buf = [0u8; 4];
+    tokio::time::timeout(Duration::from_secs(10), recv.read_exact(&mut len_buf))
+        .await
+        .expect("MC JoinResponse timed out")
+        .expect("read MC JoinResponse length");
+    let msg_len = u32::from_be_bytes(len_buf) as usize;
+    assert!(
+        msg_len > 0 && msg_len <= 65536,
+        "framed length out of range"
+    );
+    let mut buf = vec![0u8; msg_len];
+    recv.read_exact(&mut buf)
+        .await
+        .expect("read JoinResponse body");
+    let join_response = match ServerMessage::decode(buf.as_slice())
+        .expect("decode ServerMessage")
+        .message
+    {
+        Some(server_message::Message::JoinResponse(j)) => j,
+        _ => panic!("expected JoinResponse from MC"),
+    };
+    let mh_url = join_response
+        .media_servers
+        .first()
+        .map(|m| m.media_handler_url.clone())
+        .filter(|u| !u.is_empty())
+        .expect("JoinResponse must include a non-empty MH URL");
+
+    // Report that MH as CONNECTED via the post-join plane.
+    let update = ClientMessage {
+        message: Some(client_message::Message::MediaConnectionUpdate(
+            MediaConnectionUpdate {
+                statuses: vec![MhConnectionStatus {
+                    mh_url,
+                    state: ConnectionState::Connected as i32,
+                    failure_reason: None,
+                    failure_code: None,
+                    observed_at: None,
+                }],
+            },
+        )),
+        trace_parent: String::new(),
+        trace_state: String::new(),
+    };
+    let encoded = update.encode_to_vec();
+    let mut frame = MsgBuf::with_capacity(4 + encoded.len());
+    frame.put_u32(encoded.len() as u32);
+    frame.put_slice(&encoded);
+    send.write_all(&frame)
+        .await
+        .expect("send MediaConnectionUpdate to MC");
+
+    // Keep the connection alive long enough for MC's bridge loop to read the
+    // frame before we let `conn` drop at end of scope.
+    assert_participant_mh_status_increases_past(&prom, "connected", baseline).await;
+    drop(conn);
+}
+
+// ============================================================================
+// Scenario 8 (R-55/R-56/R-57): end-to-end trace continuity — STUB
+// ============================================================================
+
+/// R-55/R-56/R-57 trace-continuity stub — authoritative coverage is at the
+/// component tier:
+///
+/// - `crates/mc-service/tests/otel_grpc_inbound_continuity.rs` — inbound gRPC
+///   `traceparent` → `server_interceptor` → handler span reparent.
+/// - `crates/mc-service/tests/otel_grpc_outbound_integration.rs` — GcClient +
+///   MhClient `client_interceptor` injects the active span's `traceparent`.
+/// - `crates/mc-service/tests/otel_webtransport_integration.rs` — WebTransport
+///   `ClientMessage.trace_parent` → connection span reparent.
+///
+/// We cannot assert trace continuity from env-tests because the Kind
+/// OTel-collector runs at `verbosity: normal` and does NOT log per-span
+/// trace-ids; forcing `detailed` to grep spans out of collector logs would
+/// break the PII-minimization control (untrusted browser-supplied `tracestate`
+/// would land in collector stdout). Asserting continuity would instead require
+/// a queryable trace backend (Tempo/Jaeger), which is out of scope for R-55.
+/// Tracked in `docs/TODO.md` (trace-backend breadcrumb).
+#[tokio::test]
+#[ignore = "covered at component tier — see crates/mc-service/tests/otel_grpc_inbound_continuity.rs, otel_grpc_outbound_integration.rs, otel_webtransport_integration.rs"]
+async fn test_mc_trace_continuity_end_to_end() {
+    // Intentionally unimplemented. See doc-comment above.
+}
+
+// ============================================================================
 // Scenario 6 (R-33 #6): unregistered-meeting timeout — STUB
 // ============================================================================
 

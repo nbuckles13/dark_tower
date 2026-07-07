@@ -41,6 +41,12 @@ pub const DEFAULT_DISCONNECT_GRACE_PERIOD_SECONDS: u64 = 30;
 /// Default MC instance ID prefix.
 pub const DEFAULT_MC_ID_PREFIX: &str = "mc";
 
+/// Default OTLP sample rate (R-55). 1.0 in dev; tune down for prod.
+pub const DEFAULT_OTEL_SAMPLE_RATE: f64 = 1.0;
+
+/// Default deployment environment (R-55, OTel resource attribute).
+pub const DEFAULT_ENVIRONMENT: &str = "development";
+
 /// Meeting Controller configuration.
 ///
 /// Loaded from environment variables with sensible defaults.
@@ -125,6 +131,23 @@ pub struct Config {
     /// This is the address GC uses to reach this MC pod (e.g., `https://10.244.0.5:4433`).
     /// Required environment variable: `MC_WEBTRANSPORT_ADVERTISE_ADDRESS`.
     pub webtransport_advertise_address: String,
+
+    /// Whether OpenTelemetry SDK export is enabled (R-55).
+    /// Explicit boolean gating (env `OTEL_ENABLED`, default `false`) — NOT
+    /// presence-of-endpoint. When `true`, `otel_endpoint` must be non-empty.
+    pub otel_enabled: bool,
+
+    /// OTLP-gRPC collector endpoint (R-55, env `OTLP_ENDPOINT`, default `""`).
+    /// Consumed by `init_otel` only when `otel_enabled` is `true`.
+    pub otel_endpoint: String,
+
+    /// Trace sample rate in `[0.0, 1.0]` (R-55, env `OTEL_SAMPLE_RATE`, default
+    /// `1.0`). Parsed here; range validation is `init_otel`'s responsibility.
+    pub otel_sample_rate: f64,
+
+    /// Deployment environment resource attribute (R-55, env
+    /// `DEPLOYMENT_ENVIRONMENT`, default `"development"`).
+    pub environment: String,
 }
 
 /// Custom Debug implementation that redacts sensitive fields.
@@ -162,6 +185,10 @@ impl fmt::Debug for Config {
                 "webtransport_advertise_address",
                 &self.webtransport_advertise_address,
             )
+            .field("otel_enabled", &self.otel_enabled)
+            .field("otel_endpoint", &self.otel_endpoint)
+            .field("otel_sample_rate", &self.otel_sample_rate)
+            .field("environment", &self.environment)
             .finish()
     }
 }
@@ -174,6 +201,9 @@ pub enum ConfigError {
 
     #[error("Invalid configuration value: {0}")]
     InvalidValue(String),
+
+    #[error("Invalid OTel configuration: {0}")]
+    InvalidOtelConfig(String),
 }
 
 impl Config {
@@ -323,6 +353,56 @@ impl Config {
             format!("{DEFAULT_MC_ID_PREFIX}-{hostname}-{short_suffix}")
         });
 
+        // OpenTelemetry configuration (R-55). Explicit boolean gating via
+        // OTEL_ENABLED — NOT presence-of-endpoint. Mirrors AC/GC/MH exactly:
+        // case-insensitive + trimmed, and an unrecognized value fails fast at
+        // load (never silently coerces to false — that would leave an operator's
+        // `OTEL_ENABLED=TRUE`/`1`/`yes` on MC silently OFF while ON elsewhere).
+        let otel_enabled = if let Some(value_str) = vars.get("OTEL_ENABLED") {
+            match value_str.trim().to_ascii_lowercase().as_str() {
+                "true" => true,
+                "false" => false,
+                _ => {
+                    return Err(ConfigError::InvalidOtelConfig(format!(
+                        "OTEL_ENABLED must be 'true' or 'false', got '{}'",
+                        value_str
+                    )))
+                }
+            }
+        } else {
+            false
+        };
+
+        let otel_endpoint = vars.get("OTLP_ENDPOINT").cloned().unwrap_or_default();
+
+        // Sample rate: PARSE-ONLY. The `[0.0, 1.0]` bound has a SINGLE owner —
+        // `init_otel` — which re-validates at startup on the enabled path. We do
+        // NOT duplicate the range check here (mirrors AC/GC/MH). Non-numeric
+        // still fails fast at load rather than silently sampling at the default.
+        let otel_sample_rate = if let Some(value_str) = vars.get("OTEL_SAMPLE_RATE") {
+            value_str.parse::<f64>().map_err(|e| {
+                ConfigError::InvalidOtelConfig(format!(
+                    "OTEL_SAMPLE_RATE must be a number, got '{}': {}",
+                    value_str, e
+                ))
+            })?
+        } else {
+            DEFAULT_OTEL_SAMPLE_RATE
+        };
+
+        let environment = vars
+            .get("DEPLOYMENT_ENVIRONMENT")
+            .cloned()
+            .unwrap_or_else(|| DEFAULT_ENVIRONMENT.to_string());
+
+        // Fail-fast: enabling OTel without an endpoint is a config bug — surface
+        // it at startup rather than silently no-op'ing exports.
+        if otel_enabled && otel_endpoint.trim().is_empty() {
+            return Err(ConfigError::InvalidOtelConfig(
+                "OTEL_ENABLED=true requires a non-empty OTLP_ENDPOINT".to_string(),
+            ));
+        }
+
         Ok(Config {
             redis_url,
             webtransport_bind_address,
@@ -346,7 +426,28 @@ impl Config {
             tls_key_path,
             grpc_advertise_address,
             webtransport_advertise_address,
+            otel_enabled,
+            otel_endpoint,
+            otel_sample_rate,
+            environment,
         })
+    }
+
+    /// Build an [`OtelConfig`] iff OTel is enabled (R-55).
+    ///
+    /// Returns `Some` only when `otel_enabled` is `true`; `main.rs` gates the
+    /// `init_otel` call on this so a disabled deployment never touches the SDK.
+    /// Sample-rate range validation is deferred to `init_otel`.
+    #[must_use]
+    pub fn otel_config(&self) -> Option<common::observability::otel::OtelConfig> {
+        if self.otel_enabled {
+            Some(common::observability::otel::OtelConfig {
+                endpoint: self.otel_endpoint.clone(),
+                sample_rate: self.otel_sample_rate,
+            })
+        } else {
+            None
+        }
     }
 }
 
@@ -668,5 +769,162 @@ mod tests {
         assert!(
             matches!(result, Err(ConfigError::MissingEnvVar(v)) if v == "MC_WEBTRANSPORT_ADVERTISE_ADDRESS")
         );
+    }
+
+    // =========================================================================
+    // OpenTelemetry config (R-55) — mirrors AC #25 / GC #26 / MH #27
+    // =========================================================================
+
+    #[test]
+    fn test_otel_defaults_disabled() {
+        let config = Config::from_vars(&base_vars()).expect("Config should load");
+        assert!(!config.otel_enabled);
+        assert_eq!(config.otel_endpoint, "");
+        assert!((config.otel_sample_rate - DEFAULT_OTEL_SAMPLE_RATE).abs() < f64::EPSILON);
+        assert_eq!(config.environment, DEFAULT_ENVIRONMENT);
+    }
+
+    #[test]
+    fn test_otel_enabled_true_with_endpoint() {
+        let mut vars = base_vars();
+        vars.insert("OTEL_ENABLED".to_string(), "true".to_string());
+        vars.insert(
+            "OTLP_ENDPOINT".to_string(),
+            "http://otel-collector.dark-tower:4317".to_string(),
+        );
+        let config = Config::from_vars(&vars).expect("Config should load");
+        assert!(config.otel_enabled);
+        assert_eq!(
+            config.otel_endpoint,
+            "http://otel-collector.dark-tower:4317"
+        );
+    }
+
+    #[test]
+    fn test_otel_enabled_case_insensitive() {
+        // Mirrors AC/GC/MH: parsing is case-insensitive + trimmed, so an
+        // operator's `OTEL_ENABLED=TRUE` enables OTel just like elsewhere.
+        let mut vars = base_vars();
+        vars.insert("OTEL_ENABLED".to_string(), "  TRUE ".to_string());
+        vars.insert(
+            "OTLP_ENDPOINT".to_string(),
+            "http://collector:4317".to_string(),
+        );
+        let config = Config::from_vars(&vars).expect("Config should load");
+        assert!(config.otel_enabled);
+    }
+
+    #[test]
+    fn test_otel_enabled_invalid_value_rejected() {
+        // Mirrors AC/GC/MH: an unrecognized value fails fast at load (carrying
+        // the offending value) rather than silently coercing to false — that
+        // silent coercion would leave MC's tracing OFF for a value that enables
+        // it on the sibling services.
+        for bad in ["1", "yes", "on", "enabled"] {
+            let mut vars = base_vars();
+            vars.insert("OTEL_ENABLED".to_string(), bad.to_string());
+            let result = Config::from_vars(&vars);
+            assert!(
+                matches!(&result, Err(ConfigError::InvalidOtelConfig(msg)) if msg.contains(bad)),
+                "OTEL_ENABLED={bad:?} should be rejected with the offending value, got {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_otel_sample_rate_parsed() {
+        let mut vars = base_vars();
+        vars.insert("OTEL_SAMPLE_RATE".to_string(), "0.25".to_string());
+        let config = Config::from_vars(&vars).expect("Config should load");
+        assert!((config.otel_sample_rate - 0.25).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_otel_sample_rate_non_numeric_rejected() {
+        // Mirrors AC/GC/MH: a non-numeric value fails fast at load rather than
+        // silently sampling at the default (a prod typo → 100% collector flood).
+        // Range validation ([0.0, 1.0]) stays init_otel's job — parse-only here.
+        let mut vars = base_vars();
+        vars.insert("OTEL_SAMPLE_RATE".to_string(), "not-a-number".to_string());
+        let result = Config::from_vars(&vars);
+        assert!(
+            matches!(result, Err(ConfigError::InvalidOtelConfig(msg)) if msg.contains("OTEL_SAMPLE_RATE"))
+        );
+    }
+
+    #[test]
+    fn test_environment_parsed() {
+        let mut vars = base_vars();
+        vars.insert(
+            "DEPLOYMENT_ENVIRONMENT".to_string(),
+            "production".to_string(),
+        );
+        let config = Config::from_vars(&vars).expect("Config should load");
+        assert_eq!(config.environment, "production");
+    }
+
+    #[test]
+    fn test_otel_config_none_when_disabled() {
+        let config = Config::from_vars(&base_vars()).expect("Config should load");
+        assert!(config.otel_config().is_none());
+    }
+
+    #[test]
+    fn test_otel_config_some_when_enabled() {
+        let mut vars = base_vars();
+        vars.insert("OTEL_ENABLED".to_string(), "true".to_string());
+        vars.insert(
+            "OTLP_ENDPOINT".to_string(),
+            "http://collector:4317".to_string(),
+        );
+        vars.insert("OTEL_SAMPLE_RATE".to_string(), "0.5".to_string());
+        let config = Config::from_vars(&vars).expect("Config should load");
+        let otel = config.otel_config().expect("otel_config should be Some");
+        assert_eq!(otel.endpoint, "http://collector:4317");
+        assert!((otel.sample_rate - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_otel_enabled_empty_endpoint_fails_fast() {
+        let mut vars = base_vars();
+        vars.insert("OTEL_ENABLED".to_string(), "true".to_string());
+        // OTLP_ENDPOINT deliberately absent → default "".
+        let result = Config::from_vars(&vars);
+        assert!(
+            matches!(result, Err(ConfigError::InvalidOtelConfig(msg)) if msg.contains("OTLP_ENDPOINT"))
+        );
+    }
+
+    #[test]
+    fn test_otel_enabled_whitespace_endpoint_fails_fast() {
+        let mut vars = base_vars();
+        vars.insert("OTEL_ENABLED".to_string(), "true".to_string());
+        vars.insert("OTLP_ENDPOINT".to_string(), "   ".to_string());
+        let result = Config::from_vars(&vars);
+        assert!(matches!(result, Err(ConfigError::InvalidOtelConfig(_))));
+    }
+
+    #[test]
+    fn test_otel_disabled_empty_endpoint_ok() {
+        // Disabled + empty endpoint is the safe base default — must NOT fail.
+        let config = Config::from_vars(&base_vars()).expect("disabled+empty must load");
+        assert!(!config.otel_enabled);
+        assert!(config.otel_config().is_none());
+    }
+
+    #[test]
+    fn test_debug_includes_otel_non_secret_fields() {
+        let mut vars = base_vars();
+        vars.insert("OTEL_ENABLED".to_string(), "true".to_string());
+        vars.insert(
+            "OTLP_ENDPOINT".to_string(),
+            "http://otel-collector.dark-tower:4317".to_string(),
+        );
+        let config = Config::from_vars(&vars).expect("Config should load");
+        let debug_output = format!("{config:?}");
+        // OTel fields are non-secret and appear in Debug (mirrors AC/GC/MH).
+        assert!(debug_output.contains("otel_enabled"));
+        assert!(debug_output.contains("otel-collector.dark-tower:4317"));
+        assert!(debug_output.contains("environment"));
     }
 }

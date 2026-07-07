@@ -268,6 +268,10 @@ fn test_config(gc_url: &str) -> Config {
         tls_key_path: "/dev/null".to_string(),
         grpc_advertise_address: "http://localhost:50052".to_string(),
         webtransport_advertise_address: "https://localhost:4433".to_string(),
+        otel_enabled: false,
+        otel_endpoint: String::new(),
+        otel_sample_rate: 1.0,
+        environment: "development".to_string(),
     }
 }
 

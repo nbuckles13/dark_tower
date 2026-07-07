@@ -32,6 +32,12 @@ bytes = { workspace = true }
 # gRPC for GC communication
 tonic = { workspace = true }
 
+# OpenTelemetry (R-55/R-56/R-57): connection.rs names OTel types directly
+# (Context/propagator) for WebTransport trace extraction + injection, so these
+# are direct deps, not merely transitive via `common`. Mirrors MH task #27.
+opentelemetry = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+
 # Cryptography for session binding tokens (ADR-0023)
 ring = { workspace = true }
 hex = { workspace = true }
@@ -67,6 +73,8 @@ http-body-util = "0.1"
 tokio = { workspace = true, features = ["test-util"] }
 # For wrapping TcpListener as tonic-compatible stream in integration tests
 tokio-stream = "0.1"
+# InMemorySpanExporter for OTel span-parent assertions in integration tests (R-56/R-57)
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
 # Enable test-utils feature for common (e.g., TokenReceiver::from_test_channel)
 common = { path = "../common", features = ["test-utils"] }
 # JWT validation testing (Ed25519 signing, JWKS mocking)

@@ -88,6 +88,20 @@ sum(mh_active_connections)
 
 # Is traffic flowing? (sanity check; mirrors join-flow precedent's rate spot-check)
 sum(increase(mh_webtransport_connections_total{status="accepted"}[5m]))
+
+# Client-reported media-connection FAILED share (R-60; MC-side metric). Gate: < 0.20.
+# This is the canonical query for both mh-deployment.md and mc-deployment.md — the MC
+# runbook references it rather than duplicating (single home avoids silent divergence).
+# Widen the window to [2h] / [24h] for the longer gate tiers below.
+# NOTE: this is a RATIO, not a `{state="failed"}` increase == 0 check. The deleted
+# mc_media_connection_failures_total{all_failed} was a rare total-failure counter where
+# ==0 was reasonable; mc_participant_mh_status_total{state="failed"} increments on ANY
+# single per-MH client hiccup, so ==0 would false-fail every deploy. clamp_min guards the
+# no-traffic case (0/1 = 0 → passes; no traffic is not a failure). Mirrors the
+# MCMediaConnectionAllFailed page alert, which fires at >0.80 sustained 5m.
+sum(increase(mc_participant_mh_status_total{state="failed"}[30m]))
+/
+clamp_min(sum(increase(mc_participant_mh_status_total{state=~"connected|failed"}[30m])), 1)
 ```
 
 - [ ] `mh_webtransport_connections_total{status="accepted"}` rate / total >95% (handshake success SLO from R-36)
@@ -96,13 +110,16 @@ sum(increase(mh_webtransport_connections_total{status="accepted"}[5m]))
 - [ ] `mc_register_meeting_total{status="success"}` rate / total >95% (MC RegisterMeeting RPC SLO; emitter labels are `success|error`, see `crates/mc-service/src/observability/metrics.rs::record_register_meeting`)
 - [ ] `mh_mc_notifications_total{status="success"}` rate / total >95% (MH→MC delivery SLO)
 - [ ] `sum(mh_active_connections) > 0` once test traffic is flowing (proof clients are connecting)
+- [ ] `mc_participant_mh_status_total` **failed-share < 0.20** over 30m (R-60 client→MH media-plane health; run the canonical ratio query above). A breach means clients are reaching MC signaling but failing the MH media connection — triage per `mc-incident-response.md` §"Scenario 11: Media Connection Failures".
 - [ ] No new MH alerts firing: `MHHighJwtValidationFailures`, `MHHighWebTransportRejections`, `MHWebTransportHandshakeSlow`
+- [ ] No new MC alerts firing: `MCMediaConnectionAllFailed` (pages at >0.80 failed-share for 5m — the media-plane paging line above the 0.20 gate)
 
 ### 2-hour check
 
 - [ ] WebTransport handshake success rate trend stable (no downward drift toward 95%)
 - [ ] JWT validation success rate trend stable (no downward drift toward 99%)
 - [ ] `mh_register_meeting_timeouts_total` increase over the last 2 hours = 0
+- [ ] `mc_participant_mh_status_total` failed-share still < 0.20 over 2h (no upward drift toward the 0.80 `MCMediaConnectionAllFailed` paging line)
 - [ ] No mh-service or mc-service pod restarts since deploy completed (`kubectl get pods -n dark-tower -l app=mh-service` — `RESTARTS` column should match pre-deploy baseline)
 - [ ] Logs show no repeated error patterns related to WebTransport, JWT, or RegisterMeeting (cross-reference `mh-incident-response.md` Scenarios 2, 5, 10 if anything looks off)
 
@@ -121,6 +138,12 @@ sum(rate(mh_jwt_validations_total[5m]))
 
 # Cumulative-zero counters use the per-window increase
 sum(increase(mh_register_meeting_timeouts_total[2h]))
+
+# Client-reported media-connection failed share over 2h (R-60; gate < 0.20).
+# Same shape as the 30-min canonical query, window widened to [2h].
+sum(increase(mc_participant_mh_status_total{state="failed"}[2h]))
+/
+clamp_min(sum(increase(mc_participant_mh_status_total{state=~"connected|failed"}[2h])), 1)
 ```
 
 ### 4-hour check
@@ -148,6 +171,11 @@ This is the long-tail window where slow leaks show up — JWKS cache eviction in
 # Cumulative coordination-failure counts since deploy (target: 0)
 sum(increase(mh_register_meeting_timeouts_total[24h]))
 
+# Client-reported media-connection failed share over 24h (R-60; gate < 0.20).
+sum(increase(mc_participant_mh_status_total{state="failed"}[24h]))
+/
+clamp_min(sum(increase(mc_participant_mh_status_total{state=~"connected|failed"}[24h])), 1)
+
 # 24-hour averaged success rates — should still match 30-min readings
 sum(rate(mh_webtransport_connections_total{status="accepted"}[24h]))
 /
@@ -172,6 +200,7 @@ histogram_quantile(0.95,
 ```
 
 - [ ] `mh_register_meeting_timeouts_total` increase over 24h = 0
+- [ ] `mc_participant_mh_status_total` failed-share still < 0.20 over 24h (catches a slow media-plane regression — MH-edge reachability or TLS drift — that stays under the paging line but degrades a growing share of clients)
 - [ ] 24-hour averaged WebTransport handshake success rate still >95%
 - [ ] 24-hour averaged JWT validation success rate still >99% (catches slow JWKS-cache or token-rotation regressions that don't show up at 30-min)
 - [ ] No upward trend in WebTransport rejection rate over the past 24h

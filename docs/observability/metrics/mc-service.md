@@ -208,6 +208,53 @@ All MC service metrics follow ADR-0011 naming conventions with the `mc_` prefix.
 
 ---
 
+## Participant MH-Status Metrics (R-60)
+
+Post-join client→MC reporting plane: a browser client sends
+`ClientMessage{MediaConnectionUpdate}` reporting its per-MH connection outcomes,
+which MC records on the participant actor.
+
+### `mc_participant_mh_status_total`
+- **Type**: Counter
+- **Description**: Total per-MH connection statuses recorded from client
+  `MediaConnectionUpdate` messages (one increment per status entry recorded)
+- **Labels**:
+  - `state`: Reported MH connection state — `connected`, `failed`,
+    `disconnected`, `unspecified` (the proto enum is total-matched; an unknown
+    wire value clamps to `unspecified`, never panics or drops)
+- **Cardinality**: Low (4 states, bounded by the `MhState` enum)
+- **Usage**: Observe client-perceived MH reachability; a rising `failed` share
+  is an early signal of MH-edge connectivity problems the client sees before MC
+  does
+- **Recorded in**: `actors/participant.rs::handle_record_mh_statuses`, driven
+  from `webtransport/connection.rs` `handle_media_connection_update`
+- **Dashboard**: MC Overview - Client-Reported MH Status by State
+
+### `mc_participant_mh_status_dropped_total`
+- **Type**: Counter
+- **Description**: Total per-MH status drops on the client→MC reporting path,
+  by reason. Two independent security bounds:
+  - `cap`: a per-entry drop when the participant is already tracking the
+    per-participant cap (`MAX_MH_STATUSES_PER_PARTICIPANT = 16`) distinct MH
+    URLs. Updates to already-tracked MH URLs are always allowed and never
+    counted — recorded and cap-dropped are mutually exclusive per entry.
+  - `over_limit`: a per-MESSAGE drop when a single `MediaConnectionUpdate`
+    carries more than `MAX_MH_STATUSES_PER_UPDATE = 64` statuses (input
+    amplification bound); the excess is refused before any per-entry work.
+- **Labels**:
+  - `reason`: Drop reason — `cap` (per-entry, map full) or `over_limit`
+    (per-message, oversized batch)
+- **Cardinality**: Low (2 reasons)
+- **Usage**: Detect a client flooding distinct MH URLs (`cap`) or packing an
+  oversized batch into one frame (`over_limit`) — both abuse/bug signals. No
+  client-supplied strings are logged on either reject path (security control),
+  so this counter is the only signal.
+- **Recorded in**: `actors/participant.rs::handle_record_mh_statuses` (`cap`);
+  `webtransport/connection.rs::handle_media_connection_update` (`over_limit`)
+- **Dashboard**: MC Overview - Dropped Client MH Status (cap)
+
+---
+
 ## Token Manager Metrics (ADR-0010 Section 4a)
 
 ### `mc_token_refresh_total`
@@ -419,7 +466,9 @@ All MC service metrics follow strict cardinality bounds per ADR-0011:
 |-------|-------|--------|
 | `actor_type` | 3 | `controller`, `meeting`, `connection` |
 | `operation` | ~10 | Bounded by Redis commands |
-| `reason` | 2-3 | `stale_generation`, `concurrent_write` |
+| `state` | 4 | `connected`, `failed`, `disconnected`, `unspecified` (participant MH status) |
+| `reason` (fencing) | 2-3 | `stale_generation`, `concurrent_write` |
+| `reason` (mh-status drop) | 2 | `cap` (per-entry, map full), `over_limit` (per-message, oversized batch) |
 | `status` | 2-3 | `success`, `error`/`failure`, `accepted`/`rejected` |
 | `heartbeat_type` | 2 | `fast`, `comprehensive` |
 | `result` | 2 | `success`, `failure` (JWT validation) |
@@ -432,7 +481,7 @@ All MC service metrics follow strict cardinality bounds per ADR-0011:
 | `expected_type` | 3 | `global-controller`, `media-handler`, `meeting-controller` (Layer 2 auth) |
 | `actual_type` | 4 | `global-controller`, `media-handler`, `meeting-controller`, `unknown` (Layer 2 auth) |
 
-**Total Estimated Cardinality**: ~105 time series (well within Prometheus limits)
+**Total Estimated Cardinality**: ~111 time series (well within Prometheus limits) — +4 `state` (participant MH status) and +2 `reason` (mh-status drop: `cap`, `over_limit`) over the prior ~105.
 
 ---
 

@@ -73,9 +73,46 @@ const MIN_SECRET_LENGTH: usize = 32;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize tracing with JSON structured logging
-    // JSON format enables robust parsing in Promtail without brittle regex
+    // Load configuration BEFORE the tracing subscriber: the R-55 OTel layer
+    // needs the endpoint/sample-rate from config, and the subscriber can only be
+    // `.init()`'d once. A config-load failure here has no subscriber to log
+    // through yet — it propagates as a non-zero exit via the default Debug-to-
+    // stderr dump (same as the AC/GC/MH exemplars); nothing is lost because no
+    // spans/logs have been emitted yet.
+    let config = Config::from_env()?;
+
+    // R-55: initialize the OpenTelemetry SDK only when explicitly enabled
+    // (OTEL_ENABLED=true). `init_otel` is async, eagerly probes the collector,
+    // and fails hard at init on an unreachable/misconfigured endpoint so the pod
+    // fails K8s readiness instead of silently dropping spans. When OTel is
+    // disabled, `otel_config()` returns `None`, `init_otel` is never called (no
+    // probe), and no OTel layer is composed.
+    let otel = match config.otel_config() {
+        Some(otel_cfg) => Some(
+            common::observability::otel::init_otel(
+                "meeting-controller",
+                env!("CARGO_PKG_VERSION"),
+                &config.environment,
+                otel_cfg,
+            )
+            .await?,
+        ),
+        None => None,
+    };
+    // Split into the composable layer and the RAII guard. `_otel_guard` is held
+    // to the end of `main` so pending spans flush on shutdown via Drop; it is a
+    // NAMED binding (not bare `_`) so it is not dropped immediately.
+    let (otel_layer, _otel_guard) = match otel {
+        Some(init) => (Some(init.layer), Some(init.guard)),
+        None => (None, None),
+    };
+
+    // Initialize tracing with JSON structured logging. The OTel layer (if any)
+    // composes onto the bare registry first (its type is Layer<Registry> only);
+    // the default-off path adds zero layers. JSON format enables robust parsing
+    // in Promtail without brittle regex.
     tracing_subscriber::registry()
+        .with(otel_layer)
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "mc_service=debug,tower_http=debug".into()),
@@ -84,12 +121,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     info!("Starting Meeting Controller");
-
-    // Load configuration
-    let config = Config::from_env().map_err(|e| {
-        error!("Failed to load configuration: {}", e);
-        e
-    })?;
 
     info!(
         region = %config.region,
@@ -313,9 +344,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let grpc_shutdown_token = shutdown_token.child_token();
     let grpc_server = tonic::transport::Server::builder()
+        // R-56: `TraceLayer::new_for_grpc()` creates the per-request tracing span
+        // that `server_interceptor()`'s `set_parent` attaches the inbound W3C
+        // context to — WITHOUT it, `set_parent` runs before any span exists at
+        // the dispatch point and is a silent no-op (every inbound call becomes a
+        // fresh root; verified by the inbound-continuity integration test).
+        //
+        // It MUST be the FIRST/outermost `.layer()`: `McAuthService`
+        // (grpc/auth_interceptor.rs) is bound to `http::Response<BoxBody>`
+        // exactly, so wrapping it in `TraceLayer` (which changes the body type)
+        // fails to compile (E0271). Auth must wrap `Routes` (→ BoxBody) directly;
+        // TraceLayer wraps auth's output. Identical constraint + ordering to
+        // GC #26 (single builder + BoxBody-bound auth layer). Zero new deps —
+        // tower-http's "trace" feature is already enabled.
+        .layer(tower_http::trace::TraceLayer::new_for_grpc())
         .layer(mc_auth_layer)
-        .add_service(MeetingControllerServiceServer::new(mc_assignment_service))
-        .add_service(MediaCoordinationServiceServer::new(media_coord_service))
+        .add_service(MeetingControllerServiceServer::with_interceptor(
+            mc_assignment_service,
+            common::observability::otel_grpc::server_interceptor(),
+        ))
+        .add_service(MediaCoordinationServiceServer::with_interceptor(
+            media_coord_service,
+            common::observability::otel_grpc::server_interceptor(),
+        ))
         .serve_with_shutdown(grpc_addr, async move {
             grpc_shutdown_token.cancelled().await;
             info!("gRPC server shutting down");

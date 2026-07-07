@@ -22,6 +22,7 @@
    - [Scenario 8: Join Failures](#scenario-8-join-failures)
    - [Scenario 9: WebTransport Rejections](#scenario-9-webtransport-rejections)
    - [Scenario 10: JWT Validation Failures](#scenario-10-jwt-validation-failures)
+   - [Scenario 11: Media Connection Failures](#scenario-11-media-connection-failures)
    - [Scenario 12: RegisterMeeting Coordination Failures](#scenario-12-registermeeting-coordination-failures)
    - [Scenario 13: Unexpected MH Notifications](#scenario-13-unexpected-mh-notifications)
 4. [Diagnostic Commands](#diagnostic-commands)
@@ -1150,6 +1151,121 @@ kill %1
 
 ---
 
+### Scenario 11: Media Connection Failures
+
+**Alert**: `MCMediaConnectionAllFailed`
+**Severity**: page
+**Runbook Section**: `#scenario-11-media-connection-failures`
+
+**Symptoms**:
+- `MCMediaConnectionAllFailed` is firing: **>80% of client-reported per-MH media connections are in the `failed` state over a 5-minute window** at meaningful volume (fleet aggregate). This is a *silent broken call* — the affected clients reached MC signaling successfully (they had to, in order to report the status), but the client→MH **media plane** is not working.
+- The `failed` share of `mc_participant_mh_status_total{state=~"connected|failed"}` is elevated. Clients report per-MH outcomes for their assigned Media Handlers via the `MediaConnectionUpdate` signaling message; a healthy population reports mostly `connected`.
+- Affected participants have signaling (MC) connectivity but no working media path — they appear in the roster but send/receive no audio/video.
+
+**Impact**: Affected participants cannot send or receive media. **MC takes no automatic remediation** — the metric is observability-only (R-60); the connection is between the client and MH, and MC neither brokers nor repairs it. Signaling/join continue to succeed, which is exactly why this fails *silently* on the paths MC's other alerts watch.
+
+**Treat `mh_url`, `failure_reason`, and `failure_code` as untrusted client input.** These are self-reported by the browser over the `MediaConnectionUpdate` message; MC truncates each to `MAX_CLIENT_STRING_BYTES` (256, on a UTF-8 boundary) before store/log, but their *content* is not authenticated as truthful (the message is authenticated as "from this session", the field values are not). Always corroborate against MH-side metrics/logs before concluding a specific MH is at fault.
+
+> **Distinguish genuine failure from abuse/amplification first.** `mc_participant_mh_status_dropped_total{reason}` counts statuses MC refused to record: `reason="over_limit"` (a single `MediaConnectionUpdate` carried more than `MAX_MH_STATUSES_PER_UPDATE`=64 statuses — 4× a legitimate client's assigned-MH count) and `reason="cap"` (a participant tried to exceed `MAX_MH_STATUSES_PER_PARTICIPANT`=16 distinct MH entries). A spike in `dropped_total` alongside the `failed` share points at a **misbehaving/abusive client**, not an MH outage — triage that as a client/security issue, not a media-plane incident.
+
+> **Note**: `mc_participant_mh_status_total` starts at zero in production. The `state="failed"` series first appears the first time any client reports a per-MH failure; a brand-new time series with no historical baseline is not itself an incident — the **failed-share ratio** (below) is the actionable signal, and `MCMediaConnectionAllFailed` only pages at >80% share sustained for 5m at meaningful volume (mirrors the GC Sc 5 first-emission pattern).
+
+> **Limitation — what this alert does NOT catch.** `MCMediaConnectionAllFailed` fires on the **fleet-aggregate** failed share, not per participant (the metric has no participant/`mh_url` label — bounded cardinality + PII). It deliberately does **not** reproduce the deleted per-client `all_failed` boolean. Consequence: an **isolated single-participant total media failure** is diluted in the fleet aggregate and will NOT move the ratio or page — that is now a client-side-telemetry / support-ticket signal, not a server-alerted incident. The high 0.80 threshold is exactly what filters the benign partial-failure noise the old `all_failed=false` label used to carry: a client that loses 1 of 2 MHs and falls back contributes only ~33-50% share, structurally below the paging line. The tradeoff for bounded cardinality is single-user insensitivity — document it here so on-call is not misled into expecting a page for a lone "no media" report.
+
+**Diagnosis**:
+
+```bash
+# 1. Confirm the alert's own condition — failed share over the last 5m (fleet).
+#    This is the query MCMediaConnectionAllFailed pages on (>0.80).
+kubectl port-forward -n dark-tower deployment/mc-0 8081:8081 &
+curl -s http://localhost:8081/metrics | grep mc_participant_mh_status_total
+kill %1
+```
+```promql
+# Failed share — byte-identical to the MCMediaConnectionAllFailed alert expr
+# (infra/docker/prometheus/rules/mc-alerts.yaml). Pages when ratio > 0.80 AND
+# there is meaningful volume. The second line is the volume floor (>0.1/s over
+# connected+failed) that stops a divide-by-near-zero from paging on a trickle —
+# it is why a brand-new low-traffic `failed` series does not page.
+(
+  sum(rate(mc_participant_mh_status_total{state="failed"}[5m]))
+  /
+  sum(rate(mc_participant_mh_status_total{state=~"connected|failed"}[5m]))
+) > 0.80
+and
+sum(rate(mc_participant_mh_status_total{state=~"connected|failed"}[5m])) > 0.1
+
+# 2. Rule out abuse/amplification before chasing MH — is dropped_total spiking?
+sum by(reason) (increase(mc_participant_mh_status_dropped_total[5m]))
+
+# 3. Scope: compare against active meetings/connections — a high share against
+#    a handful of participants is different from a fleet-wide media outage.
+sum(mc_meetings_active)
+sum(mc_connections_active)
+
+# 4. CORROBORATE on the MH side (do NOT trust failure_reason alone).
+#    MH WebTransport handshake health + JWT validation health:
+sum by(status) (rate(mh_webtransport_connections_total[5m]))
+histogram_quantile(0.95, sum by(le) (rate(mh_webtransport_handshake_duration_seconds_bucket[5m])))
+sum by(failure_reason) (rate(mh_jwt_validations_total{result="failure"}[5m]))
+```
+```bash
+# 5. MC logs for the MediaConnectionUpdate handler (target mc.webtransport.connection)
+kubectl logs -n dark-tower -l app=mc-service --tail=500 \
+  | grep -iE "MediaConnectionUpdate|mh_status|over_limit"
+
+# 6. MH pod health (per-pod failures correlate with the client reports)
+kubectl get pods -n dark-tower -l app=mh-service
+```
+
+**Common Root Causes**:
+
+The client reports a media failure; the cause is almost always on the **client→MH media path**, upstream of MC. MC signaling is healthy by definition here (the report arrived). Triage by corroborating evidence.
+
+> **Strong-signal short-circuit**: if the elevated `failed` share correlates with elevated `mh_register_meeting_timeouts_total` (MH Sc 13) AND/OR `mc_register_meeting_total{status="error"}` (MC Sc 12) in the same window, treat the RegisterMeeting coordination break as the upstream root cause — clients reach MH, get JWT-validated, then provisional-kicked because the meeting was never registered, which surfaces to clients as failed media. Fix the coordination and the failed share decays. Skip to root cause #3.
+
+1. **MH WebTransport rejections fleet-wide** — clients reach MH but are rejected during handshake. Check `mh_webtransport_connections_total{status="rejected"}`. See [MH Sc 5: WebTransport Rejections](mh-incident-response.md#scenario-5-webtransport-rejections).
+2. **MH JWT validation failures** — valid JWTs at MC, rejected at MH (JWKS skew, key rotation). See [MH Sc 2: JWT Validation Failures](mh-incident-response.md#scenario-2-jwt-validation-failures).
+3. **MH RegisterMeeting timeouts** — clients arriving before MC registered the meeting; MH provisional-kicks them. See [MH Sc 13](mh-incident-response.md#scenario-13-registermeeting-timeout--clients-kicked) and [MC Sc 12](#scenario-12-registermeeting-coordination-failures).
+4. **MH down or unreachable** — full MH outage or NetworkPolicy regression between client and MH (UDP/4434). Check MH pod health per MH Sc 1.
+5. **TLS / certificate issues at MH** — clients fail the QUIC handshake. **Do not conclude this from `failure_reason="tls"` alone** — verify with `openssl x509` against the actual MH cert and MH-side handshake metrics.
+6. **Network path / cloud firewall** — UDP egress from client → MH blocked. A diffuse pattern across many `mh_url` values from many clients points here.
+7. **Capacity exhaustion at MH** — `mh_active_connections` at cap, new clients rejected. See MH Sc 5 + Sc 8.
+8. **Misbehaving/abusive client** — if `mc_participant_mh_status_dropped_total{reason="over_limit"|"cap"}` is the dominant signal, this is not an MH incident; treat as a client/security issue (self-reported amplification), not a media-plane outage.
+
+**Remediation**:
+
+```bash
+# Step 1: Identify the dominant upstream cause from the corroborating MH metrics
+#   (Diagnosis steps 2-6). The MC-side runbook does not "fix" this scenario —
+#   remediation is on the MH media path the clients are reporting against.
+# Step 2: MH WebTransport rejections / capacity -> MH Sc 5 (scale MH / rotate TLS).
+# Step 3: MH RegisterMeeting timeouts -> MC Sc 12 (fix MC->MH RegisterMeeting delivery).
+# Step 4: MH down -> MH Sc 1 (restore MH service).
+# Step 5: dropped_total-dominated -> client/security path, not MH remediation.
+
+# Step 6: Monitor for resolution — the failed share is a leading indicator of
+#         user impact. Recovery = the ratio decaying back below the paging line
+#         and MCMediaConnectionAllFailed clearing.
+kubectl port-forward -n dark-tower deployment/mc-0 8081:8081 &
+watch -n 30 'curl -s http://localhost:8081/metrics | grep mc_participant_mh_status_total'
+kill %1
+```
+
+Expected recovery time: bounded by the upstream MH/network fix; once resolved, in-flight failure reports stop within 30-60s and the failed share decays to baseline over the next 5m window. New clients establish media within their normal connect timeout (~5s).
+
+**Escalation**:
+- If MH is healthy by every MH-side metric and the failed share persists >80%, escalate to Infrastructure Team — likely a client↔MH network path issue MH itself cannot observe.
+- If `MCMediaConnectionAllFailed` stays firing for >15 minutes, treat as a P1 media outage — affected participants have no usable media.
+- If client reports point at TLS/cert issues but the MH cert is verifiably valid, escalate to Client Team (possible client trust-store misconfiguration).
+- If `mc_participant_mh_status_dropped_total` dominates, escalate to Security Team (client-side amplification / abuse), not Infrastructure.
+
+**Dashboards**: MC Overview → "Client-Reported MH Status by State" panel (the `state` breakdown driving this alert); MH Overview → WebTransport handshake-status panel + JWT-validation panel for corroborating evidence.
+
+**Related Alerts**: MH-side `MHHighWebTransportRejections` / `MHWebTransportHandshakeSlow` / `MHHighJwtValidationFailures` (the MH-path causes this scenario corroborates against); MC-side [Scenario 12: RegisterMeeting Coordination Failures](#scenario-12-registermeeting-coordination-failures) (the common upstream root cause when clients are kicked before media establishes).
+
+---
+
 ### Scenario 12: RegisterMeeting Coordination Failures
 
 **Alert**: No alert today; surfaces in `mc_register_meeting_total{status="error"}` rate, `mc_register_meeting_duration_seconds` p95, and `RegisterMeeting retries exhausted` error logs at target `mc.register_meeting.trigger`. May also co-fire MH-side [Scenario 13: RegisterMeeting Timeout — Clients Kicked](mh-incident-response.md#scenario-13-registermeeting-timeout--clients-kicked).
@@ -1625,6 +1741,7 @@ All times in UTC.
 - Quarterly comprehensive review
 
 **Version History**:
+- 2026-07-07: Reintroduce Sc 11 (Media Connection Failures) in browser-client-join Task #6, rebuilt atop `mc_participant_mh_status_total{state}` + the `MCMediaConnectionAllFailed` page alert (fires at >0.80 failed-share for 5m). Detection/diagnosis rewritten from the old `all_failed` boolean to the failed-share ratio; adds the `mc_participant_mh_status_dropped_total{reason}` abuse-vs-failure triage. Completes the 2026-05-03 reintroduction commitment.
 - 2026-05-03: Remove Sc 11 + `MCMediaConnectionAllFailed` alert + dashboard panel id 45 in browser-client-join Task #2 (proto `MediaConnectionFailed` + `mc_media_connection_failures_total` deleted via R-60 redesign). Task #6 reintroduces all four atop `mc_participant_mh_status_total{state}`. Tracked in `docs/TODO.md`.
 - 2026-05-01: Add Scenarios 11-13 (MediaConnectionFailed reports, RegisterMeeting coordination failures, unexpected MH notifications) — covers MC↔MH coordination failure modes for the client→MH QUIC connection story. New scenarios use ADR-0031 canonical lowercase severity vocabulary (`page` / `warning` / `info`) deliberately; existing Sc 1-10 retain inherited Title Case (`Warning` / `Critical` / `Info`) — do NOT normalize one to the other without an ADR follow-up.
 - 2026-03-27: Add Scenarios 8-10 (join failures, WebTransport rejections, JWT validation failures); fix 7 stale metric references

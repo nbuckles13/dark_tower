@@ -1,6 +1,7 @@
 //! Shared encoding utilities for WebTransport signaling messages.
 
 use crate::actors::messages::{LeaveReason, ParticipantStateUpdate};
+use crate::webtransport::trace::inject_current_context;
 
 use proto_gen::dark_tower::signaling::v1::{
     self, server_message, Participant, ParticipantJoined, ParticipantLeft, ServerMessage,
@@ -20,14 +21,17 @@ pub fn encode_participant_update(update: &ParticipantStateUpdate) -> Option<Serv
                 streams: Vec::new(),
                 joined_at: 0,
             };
+            // R-57: carry the current server-side trace context to the client on
+            // the fan-out broadcast (bounded W3C IDs only).
+            let (trace_parent, trace_state) = inject_current_context();
             Some(ServerMessage {
                 message: Some(server_message::Message::ParticipantJoined(
                     ParticipantJoined {
                         participant: Some(participant),
                     },
                 )),
-                trace_parent: String::new(),
-                trace_state: String::new(),
+                trace_parent,
+                trace_state,
             })
         }
         ParticipantStateUpdate::Left {
@@ -40,13 +44,14 @@ pub fn encode_participant_update(update: &ParticipantStateUpdate) -> Option<Serv
                 LeaveReason::Removed => v1::LeaveReason::Kicked,
                 LeaveReason::MeetingEnded => v1::LeaveReason::MeetingEnded,
             };
+            let (trace_parent, trace_state) = inject_current_context();
             Some(ServerMessage {
                 message: Some(server_message::Message::ParticipantLeft(ParticipantLeft {
                     participant_id: participant_id.clone(),
                     reason: proto_reason as i32,
                 })),
-                trace_parent: String::new(),
-                trace_state: String::new(),
+                trace_parent,
+                trace_state,
             })
         }
         ParticipantStateUpdate::MuteChanged { participant_id, .. } => {

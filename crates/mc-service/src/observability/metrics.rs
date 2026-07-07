@@ -367,6 +367,55 @@ pub fn record_mh_notification(event_type: &str) {
     .increment(1);
 }
 
+/// Record one per-MH connection status reported by a client `MediaConnectionUpdate` (R-60).
+///
+/// Metric: `mc_participant_mh_status_total`
+/// Labels: `state`
+///
+/// State values: "connected", "disconnected", "failed", "unspecified"
+/// Cardinality: 4 (allowlist-clamped — the caller maps the proto `ConnectionState`
+/// via a total match with an `unspecified` catch-all, so a malformed/unknown
+/// wire value can never widen the label domain).
+///
+/// Incremented once per `MhConnectionStatus` entry that is RECORDED on the
+/// participant actor. Mutually exclusive with `record_participant_mh_status_dropped`
+/// (a cap-refused entry does NOT bump this counter). `mh_url` / `failure_reason`
+/// / `failure_code` are client-controlled and are NEVER labels.
+pub fn record_participant_mh_status(state: &str) {
+    counter!("mc_participant_mh_status_total",
+        "state" => state.to_string()
+    )
+    .increment(1);
+}
+
+/// Record a dropped client-reported MH status (R-60 security). Two independent
+/// bounds, one per `reason`:
+/// - `"cap"` — a PER-ENTRY drop: the per-participant map already holds
+///   `MAX_MH_STATUSES_PER_PARTICIPANT` distinct `mh_url`s, so a new key is
+///   refused. Mutually exclusive with `record_participant_mh_status` for that
+///   entry (a cap-refused entry never bumps the recorded counter).
+/// - `"over_limit"` — a PER-MESSAGE drop: a single `MediaConnectionUpdate`
+///   carried more than `MAX_MH_STATUSES_PER_UPDATE` statuses, so the excess is
+///   refused before any per-entry work. Fires ONCE per oversized message,
+///   independently of (and possibly alongside) the recorded/`cap` entries from
+///   the truncated prefix — so it is NOT per-entry mutually exclusive.
+///
+/// Metric: `mc_participant_mh_status_dropped_total`
+/// Labels: `reason`
+///
+/// Reason values: "cap", "over_limit"
+/// Cardinality: 2.
+///
+/// A bounded counter is used instead of a per-entry log to avoid the
+/// log-amplification vector a hostile client could drive by flooding distinct
+/// `mh_url`s or packing an oversized batch.
+pub fn record_participant_mh_status_dropped(reason: &str) {
+    counter!("mc_participant_mh_status_dropped_total",
+        "reason" => reason.to_string()
+    )
+    .increment(1);
+}
+
 // ============================================================================
 // gRPC Auth Layer 2 Metrics (ADR-0003)
 // ============================================================================
@@ -884,6 +933,41 @@ mod tests {
             .assert_delta(1);
         snap.counter("mc_mh_notifications_received_total")
             .with_labels(&[("event_type", "disconnected")])
+            .assert_delta(1);
+    }
+
+    #[test]
+    fn metrics_module_emits_participant_mh_status_cluster() {
+        let snap = MetricAssertion::snapshot();
+
+        // Facade coverage (R-60) — the full match/increment behavior + cap
+        // mutual-exclusivity is exercised end-to-end in
+        // `actors::participant::tests`; this pins the facade → metric-name/label
+        // wiring per ADR-0032 (validate-metric-coverage).
+        record_participant_mh_status("connected");
+        record_participant_mh_status("failed");
+        record_participant_mh_status("disconnected");
+        record_participant_mh_status("unspecified");
+        record_participant_mh_status_dropped("cap");
+        record_participant_mh_status_dropped("over_limit");
+
+        snap.counter("mc_participant_mh_status_total")
+            .with_labels(&[("state", "connected")])
+            .assert_delta(1);
+        snap.counter("mc_participant_mh_status_total")
+            .with_labels(&[("state", "failed")])
+            .assert_delta(1);
+        snap.counter("mc_participant_mh_status_total")
+            .with_labels(&[("state", "disconnected")])
+            .assert_delta(1);
+        snap.counter("mc_participant_mh_status_total")
+            .with_labels(&[("state", "unspecified")])
+            .assert_delta(1);
+        snap.counter("mc_participant_mh_status_dropped_total")
+            .with_labels(&[("reason", "cap")])
+            .assert_delta(1);
+        snap.counter("mc_participant_mh_status_dropped_total")
+            .with_labels(&[("reason", "over_limit")])
             .assert_delta(1);
     }
 

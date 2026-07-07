@@ -297,7 +297,11 @@ impl GcClient {
         request: &RegisterMcRequest,
     ) -> Result<proto_gen::dark_tower::internal::v1::RegisterMcResponse, McError> {
         // Clone the channel (cheap operation) for this request
-        let mut client = GlobalControllerServiceClient::new(self.channel.clone());
+        // R-56: inject the active W3C trace context into outbound GC metadata.
+        let mut client = GlobalControllerServiceClient::with_interceptor(
+            self.channel.clone(),
+            common::observability::otel_grpc::client_interceptor(),
+        );
         let grpc_request = self.add_auth(request.clone())?;
 
         client
@@ -347,7 +351,11 @@ impl GcClient {
         };
 
         // Clone the channel (cheap operation) for this request
-        let mut client = GlobalControllerServiceClient::new(self.channel.clone());
+        // R-56: inject the active W3C trace context into outbound GC metadata.
+        let mut client = GlobalControllerServiceClient::with_interceptor(
+            self.channel.clone(),
+            common::observability::otel_grpc::client_interceptor(),
+        );
         let grpc_request = self.add_auth(request)?;
 
         // Start timer for latency measurement (ADR-0011)
@@ -437,7 +445,11 @@ impl GcClient {
         };
 
         // Clone the channel (cheap operation) for this request
-        let mut client = GlobalControllerServiceClient::new(self.channel.clone());
+        // R-56: inject the active W3C trace context into outbound GC metadata.
+        let mut client = GlobalControllerServiceClient::with_interceptor(
+            self.channel.clone(),
+            common::observability::otel_grpc::client_interceptor(),
+        );
         let grpc_request = self.add_auth(request)?;
 
         // Start timer for latency measurement (ADR-0011)
@@ -692,6 +704,10 @@ mod tests {
             tls_key_path: "/dev/null".to_string(),
             grpc_advertise_address: "http://localhost:50052".to_string(),
             webtransport_advertise_address: "https://localhost:4433".to_string(),
+            otel_enabled: false,
+            otel_endpoint: String::new(),
+            otel_sample_rate: 1.0,
+            environment: "development".to_string(),
         };
 
         let token_rx = mock_token_receiver();
@@ -736,6 +752,10 @@ mod tests {
             tls_key_path: "/dev/null".to_string(),
             grpc_advertise_address: "http://localhost:50052".to_string(),
             webtransport_advertise_address: "https://localhost:4433".to_string(),
+            otel_enabled: false,
+            otel_endpoint: String::new(),
+            otel_sample_rate: 1.0,
+            environment: "development".to_string(),
         };
 
         let token_rx = mock_token_receiver();

@@ -1,0 +1,14 @@
+# R-55 dev-enable patch (strategic merge): the prod base configmap ships
+# OTEL_ENABLED="false"; this Kind-overlay patch flips it to "true" so MC's
+# OTel SDK is enabled end-to-end in the dev cluster (collector deployed by
+# R-59 + the MC->collector :4317 egress rule in the base NetworkPolicy).
+# Mirrors GC's task #26 / AC's task #25 configmap-otel-patch.yaml exactly. Only
+# this one key is patched; every other base configmap value is inherited
+# unchanged.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mc-service-config
+  namespace: dark-tower
+data:
+  OTEL_ENABLED: "true"

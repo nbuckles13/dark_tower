@@ -105,6 +105,30 @@ spec:
             configMapKeyRef:
               name: mc-service-config
               key: MC_TLS_KEY_PATH
+        # MC's own OTel SDK wiring (R-55, task #6). Per-key configMapKeyRef
+        # (this Deployment does not use envFrom), so each new key needs its own
+        # entry — mirrors GC's task #26 deployment.yaml. Keep in lockstep with
+        # mc-1-deployment.yaml.
+        - name: OTEL_ENABLED
+          valueFrom:
+            configMapKeyRef:
+              name: mc-service-config
+              key: OTEL_ENABLED
+        - name: OTLP_ENDPOINT
+          valueFrom:
+            configMapKeyRef:
+              name: mc-service-config
+              key: OTLP_ENDPOINT
+        - name: OTEL_SAMPLE_RATE
+          valueFrom:
+            configMapKeyRef:
+              name: mc-service-config
+              key: OTEL_SAMPLE_RATE
+        - name: DEPLOYMENT_ENVIRONMENT
+          valueFrom:
+            configMapKeyRef:
+              name: mc-service-config
+              key: DEPLOYMENT_ENVIRONMENT
         # Pod IP for gRPC advertise address (downward API)
         - name: POD_IP
           valueFrom:

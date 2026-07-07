@@ -426,6 +426,10 @@ kubectl exec -it deployment/gc-service -n dark-tower -- \
 | `HTTP_BIND_ADDRESS` | No | HTTP/metrics bind address | `0.0.0.0:8080` | `0.0.0.0:8080` |
 | `ACTOR_MAILBOX_SIZE` | No | Default actor mailbox capacity | `1000` | `1000` |
 | `GC_HEARTBEAT_INTERVAL_SECS` | No | Heartbeat interval to GC | `10` | `10` |
+| `OTEL_ENABLED` | No | Enable MC's OTel SDK span export (R-55). Gated by this explicit flag, NOT by presence of `OTLP_ENDPOINT`. | `false` | `true` |
+| `OTLP_ENDPOINT` | No | OTLP-gRPC collector endpoint for MC's own span export. `http://` scheme required. Only consumed when `OTEL_ENABLED=true`. | None | `http://otel-collector.dark-tower:4317` |
+| `OTEL_SAMPLE_RATE` | No | Head-sampling ratio in `[0.0, 1.0]`; `init_otel` validates. | `1.0` | `1.0` |
+| `DEPLOYMENT_ENVIRONMENT` | No | `deployment.environment` resource attribute (ADR-0011). | `development` | `production` |
 | `RUST_LOG` | No | Logging level | `info` | `info,mc_service=debug` |
 
 ### Kubernetes Secrets
@@ -460,6 +464,38 @@ data:
   MC_CAPACITY: "100"
   GC_HEARTBEAT_INTERVAL_SECS: "10"
 ```
+
+### OpenTelemetry (R-55) and Break-glass
+
+MC's OTel SDK is initialized in `main.rs` via `init_otel`, gated by the explicit
+`OTEL_ENABLED` flag (see the four `OTEL_*` / `DEPLOYMENT_ENVIRONMENT` env vars
+above). The prod base ConfigMap (`infra/services/mc-service/configmap.yaml`)
+ships `OTEL_ENABLED="false"`; the Kind overlay
+(`infra/kubernetes/overlays/kind/services/mc-service/configmap-otel-patch.yaml`)
+strategic-merge-patches it to `"true"` for the dev cluster.
+
+**`init_otel` is fail-hard at startup:** with `OTEL_ENABLED=true`, if the
+collector at `OTLP_ENDPOINT` is unreachable the pod fails readiness. Enabling
+therefore requires ALL of: `OTEL_ENABLED=true` **and** the MC→collector `:4317`
+egress NetworkPolicy rule (present in `network-policy.yaml`) **and** a reachable
+collector.
+
+**Break-glass / escape hatch** — if the collector is unavailable and MC must
+boot without OTel:
+
+1. Set `OTEL_ENABLED=false` in the `mc-service-config` ConfigMap (or, in Kind,
+   drop the `configmap-otel-patch.yaml` from the overlay `kustomization.yaml`).
+2. Restart **both** MC replicas — MC runs as two singleton Deployments
+   (`mc-0`, `mc-1`), so restart each:
+   ```bash
+   kubectl rollout restart deployment/mc-0 deployment/mc-1 -n dark-tower
+   kubectl rollout status deployment/mc-0 -n dark-tower
+   kubectl rollout status deployment/mc-1 -n dark-tower
+   ```
+3. MC boots with the OTel layer off and no collector dependency. Unlike a
+   StatefulSet, a bad `OTEL_ENABLED=true` rollout does not cause an outage:
+   the old ReplicaSet pods keep serving until the new ones pass readiness, so
+   `kubectl rollout undo deployment/mc-0` (and `mc-1`) is also a valid revert.
 
 ### Resource Limits
 
@@ -934,6 +970,8 @@ sum by(event_type) (rate(mc_mh_notifications_received_total[5m]))
 
 - [ ] `mc_register_meeting_total{status="success"}` rate / total >95% (run the canonical query)
 - [ ] `mc_mh_notifications_received_total` rate non-zero (events arriving means MH is reaching MC)
+- [ ] `mc_participant_mh_status_total` **failed-share < 0.20** over 30m (R-60; canonical ratio query in MH runbook 30-min check). This is a *ratio*, NOT a `{state="failed"}` increase == 0 check — the counter increments on any single per-MH client hiccup, so a bare `== 0` false-fails every deploy. Any breach → investigate the client→MH media plane per `mc-incident-response.md` §"Scenario 11: Media Connection Failures".
+- [ ] No new `MCMediaConnectionAllFailed` alerts firing (`infra/docker/prometheus/rules/mc-alerts.yaml`)
 - [ ] No mc-service pod restarts since deploy completed
 - [ ] Cross-check the MH-side checklist (link above) for the full set of MH-side checks (handshake, JWT, timeout, MH→MC delivery success rate, active connections)
 

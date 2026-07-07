@@ -8,5 +8,6 @@
 pub mod connection;
 pub mod handler;
 pub mod server;
+pub mod trace;
 
 pub use server::WebTransportServer;

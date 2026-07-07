@@ -15,6 +15,7 @@
 #![allow(clippy::panic, clippy::expect_used, clippy::unwrap_used)]
 
 pub mod accept_loop_rig;
+pub mod otel_capture;
 
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
