@@ -11,8 +11,36 @@ name: dark-tower
 
 nodes:
   - role: control-plane
-    # Expose ports for local access
+    # Expose ports for local access.
+    #
+    # SECURITY (R-37): browser-client-flow ports — AC/GC HTTP and MC/MH
+    # WebTransport — bind listenAddress 127.0.0.1 (loopback only) so a laptop on
+    # a hostile network never exposes dev services to the LAN. The host browser /
+    # Playwright reach all of them at localhost, so loopback carries no functional
+    # loss. The observability ports are deliberately left on the wildcard bind
+    # (see their NOTE below). This is the static manual-dev config; the dynamic
+    # kind-config.yaml.tmpl (ADR-0030 devloop helper) intentionally uses
+    # ${HOST_GATEWAY_IP} for its container topology — do NOT align the two.
     extraPortMappings:
+      # --- Browser-client flow (dev/E2E only; loopback) ---
+      # AC (Auth Controller) sign-up HTTP: hostPort 8443 → nodePort 30082 → AC pod 8082
+      - containerPort: 30082
+        hostPort: 8443
+        listenAddress: "127.0.0.1"
+        protocol: TCP
+      # GC (Global Controller) join HTTP: hostPort 8444 → nodePort 30180 → GC pod 8080
+      # (GC gRPC nodePort 30051 is intentionally NOT mapped here — cluster-internal
+      #  for this story; R-37 is scoped to AC sign-up + GC join HTTP.)
+      - containerPort: 30180
+        hostPort: 8444
+        listenAddress: "127.0.0.1"
+        protocol: TCP
+      # --- Observability ---
+      # NOTE: these three bind the wildcard address (0.0.0.0) ON PURPOSE — viewing
+      # dev dashboards from a second device on the LAN is a legitimate dev pattern,
+      # and they are not part of the browser-client flow (a different risk class,
+      # per @security). Residual risk on a hostile network: LAN exposure of dev
+      # Loki logs / a Grafana foothold — dev-only, out of R-37 scope to change.
       # Prometheus
       - containerPort: 30090
         hostPort: 9090
@@ -28,23 +56,29 @@ nodes:
       # MC/MH WebTransport (QUIC/UDP) — per-instance NodePorts.
       # Each MC/MH instance has its own Deployment + NodePort Service.
       # Changing instance count requires updating these mappings + per-instance manifests.
-      # Note: Kind UDP support is best-effort; use port-forward as fallback
+      # Note: Kind UDP support is best-effort; use port-forward as fallback.
+      # listenAddress 127.0.0.1 (R-37): browser-client-flow ports; the host browser
+      # reaches MC/MH WebTransport at localhost, so loopback is a strict hardening.
       #
       # MC-0: hostPort 4433 → nodePort 30433
       - containerPort: 30433
         hostPort: 4433
+        listenAddress: "127.0.0.1"
         protocol: UDP
       # MC-1: hostPort 4435 → nodePort 30435
       - containerPort: 30435
         hostPort: 4435
+        listenAddress: "127.0.0.1"
         protocol: UDP
       # MH-0: hostPort 4434 → nodePort 30434
       - containerPort: 30434
         hostPort: 4434
+        listenAddress: "127.0.0.1"
         protocol: UDP
       # MH-1: hostPort 4436 → nodePort 30436
       - containerPort: 30436
         hostPort: 4436
+        listenAddress: "127.0.0.1"
         protocol: UDP
 
 # Use containerd as the container runtime

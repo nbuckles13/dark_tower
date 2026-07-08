@@ -202,12 +202,26 @@ check_prerequisites() {
     log_info "All prerequisites satisfied."
 }
 
+# Warn that kind extraPortMappings are fixed at cluster-create time (R-37).
+# Reusing an existing cluster will NOT pick up new or changed host-port mappings
+# (AC 8443, GC 8444, MC/MH WebTransport) until teardown + recreate — otherwise a
+# dev "applies the change and nothing happens". Fired only on the reuse paths.
+warn_port_mapping_cliff() {
+    log_warn "Reusing existing cluster — kind extraPortMappings (AC 8443, GC 8444, MC/MH WebTransport)"
+    log_warn "  are baked in at 'kind create cluster'. If you just pulled new/changed port mappings, they"
+    log_warn "  are NOT active until you recreate the cluster:"
+    log_warn "    ./infra/kind/scripts/teardown.sh && ./infra/kind/scripts/setup.sh"
+    log_warn "  (On recreate, a host-port collision fails loudly with 'port is already allocated' — free"
+    log_warn "   the conflicting loopback port and retry.)"
+}
+
 # Create kind cluster
 create_cluster() {
     if kind get clusters 2>/dev/null | grep -q "^${CLUSTER_NAME}$"; then
         log_warn "Cluster '${CLUSTER_NAME}' already exists."
         if [[ "${AUTO_YES}" == "true" ]]; then
             log_info "Cluster exists, reusing (auto-yes defaults to non-destructive)."
+            warn_port_mapping_cliff
             return 0
         fi
         read -p "Delete and recreate? [y/N] " -n 1 -r
@@ -217,6 +231,7 @@ create_cluster() {
             kind delete cluster --name "${CLUSTER_NAME}"
         else
             log_info "Using existing cluster."
+            warn_port_mapping_cliff
             return 0
         fi
     fi
@@ -558,6 +573,29 @@ ON CONFLICT (subdomain) DO UPDATE SET max_concurrent_meetings = 1000;
     fi
 }
 
+# Seed the 'demo' organization (R-38) — the default org the browser sign-up flow
+# registers against. Idempotent via ON CONFLICT DO NOTHING (unlike seed_test_data's
+# devtest DO UPDATE): once present, the demo org is never clobbered on re-run.
+# The 2-column INSERT is valid — display_name is the only NOT-NULL column without a
+# default beyond subdomain; plan_tier ('free') and max_concurrent_meetings (10) take
+# their schema defaults (the right profile for a user-facing demo org), and is_active
+# defaults true so the row is immediately usable for sign-up. No DB schema change.
+seed_demo_org() {
+    log_step "Seeding demo organization (browser sign-up default)..."
+    # Direct exit-code check in the if-condition: set-e-safe (conditions are exempt),
+    # so the failure branch is actually reachable — unlike a post-hoc `$?` test under
+    # `set -e`, where a failed command aborts before the check.
+    if ${KUBECTL} exec -n dark-tower postgres-0 -- psql -U darktower -d dark_tower -c "
+INSERT INTO organizations (subdomain, display_name)
+VALUES ('demo', 'Demo Organization')
+ON CONFLICT (subdomain) DO NOTHING;
+"; then
+        log_info "Demo organization seeded successfully."
+    else
+        log_error "Failed to seed demo organization."
+    fi
+}
+
 # Create AC service secrets
 create_ac_secrets() {
     log_step "Creating AC service secrets..."
@@ -801,10 +839,12 @@ print_access_info() {
     echo ""
     echo "  AC Service (Auth Controller):"
     echo "    URL: http://localhost:${p_ac}"
+    echo "    Host-side E2E/browser (kind NodePort passthrough, loopback): http://127.0.0.1:8443"
     echo "    Status: Running in-cluster (2 replicas)"
     echo ""
     echo "  GC Service (Global Controller):"
     echo "    HTTP API: http://localhost:${p_gc}"
+    echo "    Host-side E2E/browser (kind NodePort passthrough, loopback): http://127.0.0.1:8444"
     echo "    gRPC: localhost:50051 (cluster-internal)"
     echo "    Status: Running in-cluster (2 replicas)"
     echo ""
@@ -953,6 +993,7 @@ main() {
     deploy_otel_collector
     run_migrations
     seed_test_data
+    seed_demo_org
     create_ac_secrets
     deploy_ac_service
     deploy_gc_service

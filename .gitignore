@@ -36,7 +36,9 @@ infra/docker/certs/*.crt
 infra/docker/certs/*.pem
 infra/docker/certs/*.srl
 # Generated dev WebTransport cert fingerprints (infra R-36) — never commit (R-33).
+# (A bare `.env` glob does NOT match `fingerprints.env`, so list it explicitly.)
 infra/docker/certs/fingerprints.json
+infra/docker/certs/fingerprints.env
 
 # Logs
 *.log
