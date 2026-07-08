@@ -1,0 +1,12 @@
+# R-1/R-3 dev CORS patch (strategic merge, task #5): the prod base configmap
+# ships CORS_ALLOWED_ORIGINS="" (fail-closed); this Kind-overlay patch sets it to
+# the Vite demo origin so the browser SDK can call GC's /api/v1/* API in the dev
+# cluster. Mirrors configmap-otel-patch.yaml exactly. Only this one key is
+# patched; every other base configmap value is inherited unchanged.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gc-service-config
+  namespace: dark-tower
+data:
+  CORS_ALLOWED_ORIGINS: "http://localhost:5173"

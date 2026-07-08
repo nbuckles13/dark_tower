@@ -96,6 +96,14 @@ spec:
             configMapKeyRef:
               name: gc-service-config
               key: DEPLOYMENT_ENVIRONMENT
+        # Browser-SDK CORS allowlist (R-1/R-3, task #5). Per-key configMapKeyRef
+        # (this Deployment does not use envFrom). Base is "" (fail-closed); the
+        # Kind overlay patches the ConfigMap value to the Vite dev origin.
+        - name: CORS_ALLOWED_ORIGINS
+          valueFrom:
+            configMapKeyRef:
+              name: gc-service-config
+              key: CORS_ALLOWED_ORIGINS
         - name: DATABASE_URL
           valueFrom:
             secretKeyRef:

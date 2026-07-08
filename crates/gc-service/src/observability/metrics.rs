@@ -665,6 +665,34 @@ pub fn record_telemetry_pii_dropped(kind: &str, count: u64) {
 }
 
 // ============================================================================
+// CORS Preflight Metrics (R-1 / R-52)
+// ============================================================================
+
+/// Record a CORS preflight outcome observed by `cors_preflight_observer`.
+///
+/// Metric: `gc_cors_preflight_total{origin_class, status}` counter.
+///
+/// Cardinality: strictly 2×2 bounded — `origin_class ∈ {allowed, denied}`
+/// (BUCKETED, never the raw Origin, per R-52) × `status ∈ {200, 403}`. Cross
+/// cells (`allowed`/403, `denied`/200) are unreachable by construction: an
+/// allowed preflight is passed through as 200 and a denied one is rewritten to
+/// 403.
+///
+/// # Arguments
+///
+/// * `origin_class` - `allowed` (CorsLayer emitted `Access-Control-Allow-Origin`)
+///   or `denied` (no ACAO → preflight rewritten to 403).
+/// * `status` - the HTTP status the client observes: `200` (allowed) or `403`
+///   (denied).
+pub fn record_cors_preflight(origin_class: &str, status: u16) {
+    counter!("gc_cors_preflight_total",
+        "origin_class" => origin_class.to_string(),
+        "status" => status.to_string()
+    )
+    .increment(1);
+}
+
+// ============================================================================
 // Registered Controllers Gauge (Fleet Monitoring)
 // ============================================================================
 
@@ -1466,5 +1494,43 @@ mod tests {
         snap.counter("gc_telemetry_pii_attributes_dropped_total")
             .with_labels(&[("kind", "resource")])
             .assert_unobserved();
+    }
+
+    // ---- CORS preflight metric cluster (R-1 / R-52) --------------------------
+
+    #[test]
+    fn metrics_module_emits_cors_preflight_allowed() {
+        // allowed/200 fires ⇒ every other cell in the 2×2 is unobserved
+        // (label-domain exclusivity per @observability Gate-1 (b)).
+        let snap = MetricAssertion::snapshot();
+
+        record_cors_preflight("allowed", 200);
+
+        snap.counter("gc_cors_preflight_total")
+            .with_labels(&[("origin_class", "allowed"), ("status", "200")])
+            .assert_delta(1);
+        // Off-diagonal + cross cells must stay silent.
+        for (origin_class, status) in [("denied", "403"), ("allowed", "403"), ("denied", "200")] {
+            snap.counter("gc_cors_preflight_total")
+                .with_labels(&[("origin_class", origin_class), ("status", status)])
+                .assert_delta(0);
+        }
+    }
+
+    #[test]
+    fn metrics_module_emits_cors_preflight_denied() {
+        // denied/403 fires ⇒ every other cell unobserved.
+        let snap = MetricAssertion::snapshot();
+
+        record_cors_preflight("denied", 403);
+
+        snap.counter("gc_cors_preflight_total")
+            .with_labels(&[("origin_class", "denied"), ("status", "403")])
+            .assert_delta(1);
+        for (origin_class, status) in [("allowed", "200"), ("allowed", "403"), ("denied", "200")] {
+            snap.counter("gc_cors_preflight_total")
+                .with_labels(&[("origin_class", origin_class), ("status", status)])
+                .assert_delta(0);
+        }
     }
 }

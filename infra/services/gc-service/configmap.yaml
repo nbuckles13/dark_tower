@@ -55,3 +55,10 @@ data:
   # prod telemetry is not mistagged (same tracked caveat as AC's task #25 —
   # see docs/TODO.md).
   DEPLOYMENT_ENVIRONMENT: "development"
+  # ---- CORS (R-1/R-3, task #5) ----
+  # Browser-SDK CORS allowlist for GC's /api/v1/* HTTP API. Comma-separated
+  # explicit origins; the router's CorsLayer NEVER uses `*`. This prod base is
+  # EMPTY = fail-closed (no origin allowed, no Access-Control-Allow-Origin ever
+  # emitted); the Kind overlay patches it to "http://localhost:5173" for the
+  # Vite demo. Mirrors the OTEL_ENABLED base-false / overlay-true precedent above.
+  CORS_ALLOWED_ORIGINS: ""

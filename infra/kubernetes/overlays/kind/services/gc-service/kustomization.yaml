@@ -12,6 +12,10 @@ resources:
 # overlay pattern.
 patches:
   - path: configmap-otel-patch.yaml
+  # R-1/R-3 (task #5): enable the browser-SDK CORS allowlist in the Kind dev
+  # cluster. Prod base keeps CORS_ALLOWED_ORIGINS=""; this strategic-merge patch
+  # sets it to the Vite dev origin. Mirrors the OTEL overlay pattern above.
+  - path: configmap-cors-patch.yaml
 
 labels:
   - pairs:

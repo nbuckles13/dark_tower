@@ -6,12 +6,13 @@ use crate::auth::{JwksClient, JwtValidator};
 use crate::config::Config;
 use crate::handlers::{self, TelemetryState};
 use crate::middleware::{
-    extract_trace_context_middleware, http_metrics_middleware, require_auth, require_user_auth,
-    AuthState,
+    cors_preflight_observer, extract_trace_context_middleware, http_metrics_middleware,
+    require_auth, require_user_auth, AuthState,
 };
 use crate::services::mc_client::McClientTrait;
 use axum::{
     extract::DefaultBodyLimit,
+    http::{header, HeaderName, HeaderValue, Method},
     middleware,
     routing::{get, patch, post},
     Router,
@@ -21,7 +22,11 @@ use metrics_exporter_prometheus::PrometheusHandle;
 use sqlx::PgPool;
 use std::sync::Arc;
 use std::time::Duration;
-use tower_http::{timeout::TimeoutLayer, trace::TraceLayer};
+use tower_http::{
+    cors::{AllowOrigin, CorsLayer},
+    timeout::TimeoutLayer,
+    trace::TraceLayer,
+};
 
 /// Application state shared across all handlers.
 #[derive(Clone)]
@@ -40,6 +45,42 @@ pub struct AppState {
 
     /// Telemetry proxy state (per-user rate limiter + collector forwarder).
     pub telemetry: TelemetryState,
+}
+
+/// Build the CORS layer from the configured allowlist (R-1).
+///
+/// Explicit origins ONLY — never `Any`/`*`. Each configured origin is parsed as
+/// a [`HeaderValue`]; an entry that fails to parse is dropped with a `warn`
+/// (never widening the allowlist). An EMPTY allowlist is fail-closed: no origin
+/// is allowed, so no `Access-Control-Allow-Origin` is ever emitted.
+///
+/// Methods `GET, POST, PATCH, OPTIONS`; headers
+/// `authorization, content-type, traceparent, tracestate`;
+/// `allow_credentials(false)`; `max_age` 600s.
+fn build_cors_layer(allowed_origins: &[String]) -> CorsLayer {
+    let mut origins: Vec<HeaderValue> = Vec::with_capacity(allowed_origins.len());
+    for origin in allowed_origins {
+        match origin.parse::<HeaderValue>() {
+            Ok(value) => origins.push(value),
+            Err(e) => tracing::warn!(
+                origin = %origin,
+                error = %e,
+                "dropping unparseable CORS allowed origin"
+            ),
+        }
+    }
+
+    CorsLayer::new()
+        .allow_origin(AllowOrigin::list(origins))
+        .allow_methods([Method::GET, Method::POST, Method::PATCH, Method::OPTIONS])
+        .allow_headers([
+            header::AUTHORIZATION,
+            header::CONTENT_TYPE,
+            HeaderName::from_static("traceparent"),
+            HeaderName::from_static("tracestate"),
+        ])
+        .allow_credentials(false)
+        .max_age(Duration::from_secs(600))
 }
 
 /// Build the application routes.
@@ -67,6 +108,11 @@ pub fn build_routes(
         state.config.jwt_clock_skew_seconds,
     ));
     let auth_state = Arc::new(AuthState { jwt_validator });
+
+    // CORS layer (R-1). Built from the configured allowlist BEFORE `state` is
+    // consumed by `.with_state(state)` below. Applied as a global layer so
+    // preflight short-circuits ahead of route-level auth.
+    let cors_layer = build_cors_layer(&state.config.cors_allowed_origins);
 
     // Public routes (no authentication required)
     let public_routes = Router::new()
@@ -155,10 +201,27 @@ pub fn build_routes(
     // (bottom-to-top of this list) is:
     // 1. extract_trace_context_middleware - innermost, runs LAST before the
     //    handler (see below for why this placement is required)
-    // 2. TraceLayer - creates + enters the request span
-    // 3. TimeoutLayer - times out the request
-    // 4. http_metrics_middleware - outermost, runs FIRST; records ALL
+    // 2. CorsLayer - global CORS (R-1). Because it is a GLOBAL layer on the
+    //    merged router it sits OUTSIDE every route-level auth `.route_layer`,
+    //    so a preflight (`OPTIONS` + `Access-Control-Request-Method`)
+    //    short-circuits here BEFORE auth runs — R-1 "preflight bypasses auth",
+    //    satisfied structurally. Applies to all `/api/v1/*` incl. guest-token.
+    // 3. cors_preflight_observer - one step OUTSIDE CorsLayer so it sees
+    //    CorsLayer's response: records `gc_cors_preflight_total` and rewrites a
+    //    denied preflight (200-no-ACAO) into a real 403 (R-52). See
+    //    `middleware/cors_observer.rs` for the locked security conditions.
+    // 4. TraceLayer - creates + enters the request span
+    // 5. TimeoutLayer - times out the request
+    // 6. http_metrics_middleware - outermost, runs FIRST; records ALL
     //    responses including framework-level errors like 415, 400, 404, 405
+    //    (and the observer's rewritten 403, so a denied preflight also shows on
+    //    `gc_http_requests_total{status_code="403"}`)
+    //
+    // CorsLayer + the observer are added AFTER `extract_trace_context` (so they
+    // are more OUTER than it) but BEFORE `TraceLayer` — `extract_trace_context`
+    // stays the innermost `.layer()` so its span-parenting placement (below) is
+    // preserved. A preflight short-circuits at CorsLayer and never reaches
+    // `extract_trace_context` or the routes.
     //
     // (Corrected 2026-07-03, R-56 GC OTel wiring devloop: this comment
     // previously had TimeoutLayer/TraceLayer's relative innermost/outer
@@ -186,6 +249,11 @@ pub fn build_routes(
         .merge(telemetry_routes)
         .merge(protected_routes)
         .layer(middleware::from_fn(extract_trace_context_middleware))
+        // CORS (R-1) + preflight observer (R-52), added just outside
+        // extract_trace_context and inside TraceLayer. Observer is added AFTER
+        // CorsLayer so it is more OUTER and sees CorsLayer's ACAO decision.
+        .layer(cors_layer)
+        .layer(middleware::from_fn(cors_preflight_observer))
         .layer(TraceLayer::new_for_http())
         .layer(TimeoutLayer::new(Duration::from_secs(30)))
         // HTTP metrics layer (outermost) - captures ALL responses including

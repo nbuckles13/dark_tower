@@ -579,6 +579,37 @@ Metrics for the client telemetry proxy `POST /api/v1/telemetry/v1/{metrics,trace
 
 ---
 
+## CORS Metrics (R-1 / R-52)
+
+### `gc_cors_preflight_total`
+- **Type**: Counter
+- **Description**: CORS preflight (`OPTIONS` + `Access-Control-Request-Method`)
+  outcomes observed by the `cors_preflight_observer` middleware, which sits just
+  outside the router's `CorsLayer`. An allowed origin (CorsLayer emitted
+  `Access-Control-Allow-Origin`) is recorded as `allowed`/`200`; a denied origin
+  (no ACAO) is rewritten to a real `403` and recorded as `denied`/`403`.
+  Non-preflight requests (no `Origin`, or not `OPTIONS`, or missing
+  `Access-Control-Request-Method`) are never recorded.
+- **Labels**:
+  - `origin_class` — `allowed` | `denied`. BUCKETED, never the raw `Origin`
+    (which would be unbounded and could leak caller identity).
+  - `status` — `200` | `403`.
+- **Cardinality**: 2×2 bounded (4 max). Cross cells (`allowed`/`403`,
+  `denied`/`200`) are unreachable by construction.
+- **Denied-preflight log**: emitted at `warn` with STRUCTURED fields
+  `{origin_class, requested_method, requested_headers, requested_origin}` — the
+  raw origin/method/headers live on the log line (structured fields, not
+  interpolated into the message), never as metric labels.
+- **Alerting**: no dedicated alert — a denied preflight also surfaces on
+  `gc_http_requests_total{status_code="403"}` (the observer's rewritten 403 is
+  seen by the outermost `http_metrics` layer).
+- **Example**:
+  ```promql
+  sum(rate(gc_cors_preflight_total[5m])) by (origin_class, status)
+  ```
+
+---
+
 ## Prometheus Query Examples
 
 ### Request Rate (Total)

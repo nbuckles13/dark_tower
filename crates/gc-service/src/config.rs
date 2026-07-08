@@ -137,6 +137,15 @@ pub struct Config {
     /// Deployment environment for the `deployment.environment` OTel resource
     /// attribute (env `DEPLOYMENT_ENVIRONMENT`, ADR-0011). Default `development`.
     pub environment: String,
+
+    /// CORS allowlist for the browser SDK / Vite demo (R-1/R-3). Loaded from
+    /// `CORS_ALLOWED_ORIGINS` (comma-separated). Explicit origins only — the
+    /// router's `CorsLayer` NEVER uses `*`. An EMPTY vec (the default) is
+    /// fail-closed: no origin is allowed, so no `Access-Control-Allow-Origin`
+    /// is ever emitted. Individual entries that fail to parse as a
+    /// `HeaderValue` are dropped (with a warn) at `CorsLayer` build time, never
+    /// widening the allowlist. Not secret — shown in Debug output.
+    pub cors_allowed_origins: Vec<String>,
 }
 
 /// Custom Debug implementation that redacts sensitive fields.
@@ -168,6 +177,7 @@ impl fmt::Debug for Config {
             .field("otel_endpoint", &self.otel_endpoint)
             .field("otel_sample_rate", &self.otel_sample_rate)
             .field("environment", &self.environment)
+            .field("cors_allowed_origins", &self.cors_allowed_origins)
             .finish()
     }
 }
@@ -427,6 +437,21 @@ impl Config {
             .cloned()
             .unwrap_or_else(|| DEFAULT_DEPLOYMENT_ENVIRONMENT.to_string());
 
+        // CORS allowlist (R-1/R-3): comma-separated origins, trimmed, empty
+        // segments dropped. Parse-only (cannot fail — unparseable-as-HeaderValue
+        // is handled with warn+drop at CorsLayer build time). Default empty vec =
+        // fail-closed (never allows any origin, never `*`).
+        let cors_allowed_origins = vars
+            .get("CORS_ALLOWED_ORIGINS")
+            .map(|s| {
+                s.split(',')
+                    .map(str::trim)
+                    .filter(|o| !o.is_empty())
+                    .map(String::from)
+                    .collect()
+            })
+            .unwrap_or_default();
+
         // When OTel is enabled the endpoint is required: fail fast with a clear
         // message rather than letting init_otel reject an empty/unparseable URL.
         if otel_enabled && otel_endpoint.trim().is_empty() {
@@ -455,6 +480,7 @@ impl Config {
             otel_endpoint,
             otel_sample_rate,
             environment,
+            cors_allowed_origins,
         })
     }
 
@@ -996,6 +1022,92 @@ mod tests {
         assert!(
             config.otel_config().is_none(),
             "endpoint present but disabled must NOT enable OTel (no presence-gating)"
+        );
+    }
+
+    // ============================================================================
+    // CORS Configuration Tests (R-1 / R-3)
+    // ============================================================================
+
+    #[test]
+    fn test_cors_allowed_origins_defaults_empty() {
+        // No CORS_ALLOWED_ORIGINS → empty vec (fail-closed).
+        let config = Config::from_vars(&base_vars()).expect("Config should load");
+        assert!(
+            config.cors_allowed_origins.is_empty(),
+            "CORS allowlist must default to empty (fail-closed)"
+        );
+    }
+
+    #[test]
+    fn test_cors_allowed_origins_single() {
+        let mut vars = base_vars();
+        vars.insert(
+            "CORS_ALLOWED_ORIGINS".to_string(),
+            "http://localhost:5173".to_string(),
+        );
+
+        let config = Config::from_vars(&vars).expect("Config should load");
+        assert_eq!(config.cors_allowed_origins, vec!["http://localhost:5173"]);
+    }
+
+    #[test]
+    fn test_cors_allowed_origins_multi_comma_split() {
+        let mut vars = base_vars();
+        vars.insert(
+            "CORS_ALLOWED_ORIGINS".to_string(),
+            "http://localhost:5173,https://app.example.com".to_string(),
+        );
+
+        let config = Config::from_vars(&vars).expect("Config should load");
+        assert_eq!(
+            config.cors_allowed_origins,
+            vec!["http://localhost:5173", "https://app.example.com"]
+        );
+    }
+
+    #[test]
+    fn test_cors_allowed_origins_trims_whitespace() {
+        let mut vars = base_vars();
+        vars.insert(
+            "CORS_ALLOWED_ORIGINS".to_string(),
+            "  http://localhost:5173 , https://app.example.com  ".to_string(),
+        );
+
+        let config = Config::from_vars(&vars).expect("Config should load");
+        assert_eq!(
+            config.cors_allowed_origins,
+            vec!["http://localhost:5173", "https://app.example.com"]
+        );
+    }
+
+    #[test]
+    fn test_cors_allowed_origins_drops_empty_segments() {
+        // Leading/trailing/adjacent commas and an all-whitespace segment must
+        // be dropped, not turned into empty-string origins.
+        let mut vars = base_vars();
+        vars.insert(
+            "CORS_ALLOWED_ORIGINS".to_string(),
+            ",http://localhost:5173,, ,https://app.example.com,".to_string(),
+        );
+
+        let config = Config::from_vars(&vars).expect("Config should load");
+        assert_eq!(
+            config.cors_allowed_origins,
+            vec!["http://localhost:5173", "https://app.example.com"]
+        );
+    }
+
+    #[test]
+    fn test_cors_allowed_origins_empty_string_is_fail_closed() {
+        // CORS_ALLOWED_ORIGINS="" (the prod base ConfigMap value) → empty vec.
+        let mut vars = base_vars();
+        vars.insert("CORS_ALLOWED_ORIGINS".to_string(), String::new());
+
+        let config = Config::from_vars(&vars).expect("Config should load");
+        assert!(
+            config.cors_allowed_origins.is_empty(),
+            "empty CORS_ALLOWED_ORIGINS must be fail-closed (no origins)"
         );
     }
 }
