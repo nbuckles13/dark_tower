@@ -68,7 +68,7 @@ Instead of one AI doing everything, we use **specialist agent teams** - each age
 - **Independent context**: Each teammate has its own context window, so one specialist's work doesn't crowd out another's
 - **Lead stays minimal**: The Lead only spawns the team and intervenes at gates (plan approval, validation, final approval) - minimal context accumulation
 - **Focused prompts**: Each specialist gets only their domain knowledge, relevant principles, and the specific task
-- **Cross-cutting review**: Security, Test, and Operations specialists catch what domain experts miss
+- **Cross-cutting review**: Security, Test, Observability, and Operations specialists catch what domain experts miss
 
 ---
 
@@ -140,17 +140,19 @@ Even with focused specialists and targeted principles, AI will sometimes forget 
 
 **Guards exist because we know AI is fallible.** They're the safety net that catches what slips through.
 
-Before any code is committed, it passes through a **validation pipeline** (see ADR-0024 for full specification):
+Before any code is committed, it passes through a **polyglot validation pipeline** (`scripts/layer-all.sh` → `layer1..7.sh`; see ADR-0033 for the full specification). Each layer runs the relevant per-language checks (Rust and TypeScript):
 
 | Layer | Check | Purpose |
 |-------|-------|---------|
-| 1 | `cargo check` | Basic compilation |
-| 2 | `cargo fmt` | Consistent formatting |
-| 3 | Simple guards | Pattern-based security checks |
-| 4 | Tests | Unit + integration via `scripts/test.sh` |
-| 5 | `cargo clippy` | Linting and best practices |
-| 6 | `cargo audit` | Known dependency vulnerabilities |
-| 7 | Semantic guards | AI-powered diff analysis |
+| 1 | Compile | `cargo check` + TS typecheck/build |
+| 2 | Format | `cargo fmt` + prettier |
+| 3 | Guards | Pattern + policy checks (`dt-guard`, ADR-0034) + semantic-guard self-tests |
+| 4 | Test | Rust unit/integration + TS unit/component (Nx) |
+| 5 | Lint | `cargo clippy` + eslint/svelte-check |
+| 6 | Audit | `cargo audit` + `pnpm audit` + buf-breaking |
+| 7 | Env-tests | Integration tests against the live Kind cluster |
+
+> Semantic guards are **not** a numbered layer — they run as a reviewer agent during the review phase (see below), not in the shell pipeline.
 
 ### Simple Guards (Pattern Matching)
 
@@ -170,7 +172,7 @@ See [`scripts/guards/simple/`](scripts/guards/simple/) for the full set.
 
 For issues that patterns can't catch, a dedicated **semantic-guard agent** analyzes the diff during devloop validation. The agent reads check definitions from [`scripts/guards/semantic/checks.md`](scripts/guards/semantic/checks.md), examines the current diff, and can read full source files for context when needed.
 
-Current checks: credential leaks, actor blocking, error context preservation.
+Current checks: credential leaks, actor blocking, error context preservation, metrics path completeness.
 
 The agent reports SAFE or UNSAFE with specific findings (file, line number, explanation). This catches subtle issues like "this function logs a struct that contains a field that could contain sensitive data."
 
@@ -188,7 +190,7 @@ Putting it all together, here's how a feature gets implemented. The key insight:
 ┌─────────────────────────────────────────────────────────────┐
 │  SETUP (Lead)                                               │
 │     Human: /devloop "implement feature X"               │
-│     Lead: Spawns 7 teammates (1 implementer + 6 reviewers)  │
+│     Lead: Spawns 8 teammates (1 implementer + 7 reviewers)  │
 │     Lead: Composes prompts with specialist identity +        │
 │           dynamic knowledge + task context                   │
 │     Lead: Records git state, goes idle - teammates drive     │
@@ -242,9 +244,13 @@ Putting it all together, here's how a feature gets implemented. The key insight:
 | Implementing Specialist | Domain expert who does the work |
 | Security Reviewer | Vulnerabilities, crypto, zero-trust |
 | Test Reviewer | Coverage, edge cases, quality gates |
+| Observability Reviewer | Metrics, logging, tracing, PII, SLOs |
 | Code Quality Reviewer | Rust idioms, ADR compliance |
 | DRY Reviewer | Cross-service duplication |
 | Operations Reviewer | Deployment safety, runbooks |
+| Semantic Guard Reviewer | Diff-level anti-patterns pattern guards can't catch |
+
+(Plus a conditional Database or Protocol reviewer when the change touches schema/migrations or API contracts and the implementer isn't that specialist.)
 
 **Why autonomous teammates?**
 - **Teammates preserve full context**: They stay alive throughout the entire loop with their complete history
@@ -398,7 +404,7 @@ User: /devloop-validate
 ```
 User: /devloop "implement feature X" --specialist=meeting-controller
     ↓
-Lead: Spawns 7 teammates (1 implementer + 6 reviewers)
+Lead: Spawns 8 teammates (1 implementer + 7 reviewers)
 Lead: Records git state, goes idle
     ↓
 Teammates drive autonomously:
@@ -509,13 +515,16 @@ Using this methodology, Dark Tower has achieved:
 - **Authentication Controller**: Production-ready OAuth 2.0 implementation
 - **Global Controller**: HTTP/3 API gateway with meeting management and MC/MH registration
 - **Meeting Controller**: WebTransport signaling with actor-based session management, Prometheus metrics
-- **83% test coverage** (targeting 95%) with 65+ security tests
+- **Media Handler**: Media forwarding with per-instance addressing and MC/MH coordination
+- **Browser client**: TypeScript SDK (`sdk-core`/`sdk-svelte`) + Svelte web-app driving the full join flow
+- **Distributed tracing**: OpenTelemetry with W3C trace-context propagation browser → MC → MH, verified by env-tests
+- **80% test coverage** (per Codecov; targeting 95%) with 65+ security tests
 - **Zero known security vulnerabilities** in implemented components
-- **Consistent code quality** across 15,000+ lines of Rust
-- **Clear architectural decisions** documented in 23+ ADRs
-- **13 specialist knowledge bases** with accumulated patterns and gotchas
+- **Consistent code quality** across ~130,000 lines of Rust + ~12,000 lines of TypeScript/Svelte
+- **Clear architectural decisions** documented in 34+ ADRs
+- **15 specialist knowledge bases** with accumulated patterns and gotchas
 
-The codebase handles authentication, JWT issuance, key rotation, rate limiting, encryption, meeting lifecycle, session binding, and observability - all generated by AI following this structured methodology.
+The codebase handles authentication, JWT issuance, key rotation, rate limiting, encryption, meeting lifecycle, session binding, media forwarding, the browser join flow, and end-to-end observability - all generated by AI following this structured methodology.
 
 ---
 
