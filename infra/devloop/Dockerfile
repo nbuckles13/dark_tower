@@ -143,9 +143,15 @@ ENV PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright \
 
 # Pre-cache Chromium. Load-bearing: PLAYWRIGHT_VERSION is the contract version
 # between this image (which bakes Chromium at /opt/ms-playwright) and the
-# packages/web-app `playwright` devDep (story task #18). Bumping here REQUIRES
-# bumping the consumer pin in lockstep — Playwright refuses to launch a Chromium
-# revision that does not match its npm-package's recorded revision.
+# `playwright` devDep pinned in packages/sdk-svelte + packages/web-app. The
+# lockfile is authoritative: bumping the package pin REQUIRES bumping this ARG
+# in the SAME commit — Playwright refuses to launch a Chromium revision that
+# does not match its npm-package's recorded revision. The edit here is in-tree
+# and belongs with the package bump; only the image *rebake* is host-side.
+# Drift manifests as a phantom "Executable doesn't exist at
+# .../chromium_headless_shell-<rev>/..." at test-run, NOT at build — which is
+# how a 1.49.0-image / 1.55.1-package skew rode along after commit 16fb5e6
+# bumped the packages but not this ARG.
 # Trust chain: the Chromium browser blob is fetched from Playwright's HTTPS CDN.
 # Integrity is established transitively through the version-pinned `playwright`
 # npm tarball (integrity-checked by npm), which carries the Chromium revision
@@ -156,7 +162,7 @@ ENV PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright \
 # `chmod -R a+rX` makes the cache world-readable + dir-traversable (least-privilege)
 # so --userns=keep-id mapped users can read it. The cache is intentionally
 # read-only at runtime; mutating the baked browser requires an image rebuild.
-ARG PLAYWRIGHT_VERSION=1.49.0
+ARG PLAYWRIGHT_VERSION=1.55.1
 RUN npx -y playwright@${PLAYWRIGHT_VERSION} install chromium \
  && chmod -R a+rX /opt/ms-playwright
 
