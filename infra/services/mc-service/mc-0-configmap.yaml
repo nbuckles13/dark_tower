@@ -10,4 +10,10 @@ metadata:
 data:
   # Per-instance WebTransport advertise address (explicit, no computation needed).
   # This is the address GC tells clients to connect to for this specific MC pod.
-  MC_WEBTRANSPORT_ADVERTISE_ADDRESS: "https://localhost:4433"
+  # IPv4 literal, NOT "localhost": under WSL2 mirrored networking a host browser
+  # resolves "localhost" to IPv6 ::1, but the dev port publisher (podman
+  # rootlessport) binds IPv4 127.0.0.1 only. QUIC/WebTransport to ::1 then gets
+  # no reply (UDP has no TCP-style happy-eyeballs fallback) and the signaling
+  # transport times out. Devloop-container runs override this via setup.sh's
+  # DT_HOST_GATEWAY_IP patch; this default serves the host-browser/host-env-test path.
+  MC_WEBTRANSPORT_ADVERTISE_ADDRESS: "https://127.0.0.1:4433"

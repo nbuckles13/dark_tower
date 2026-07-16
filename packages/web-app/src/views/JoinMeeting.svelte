@@ -28,14 +28,11 @@
   let busy = $state(false);
 
   function credentials(): JoinCredentials {
-    if (auth.mode === 'register') {
-      return {
-        mode: 'register',
-        email: auth.email,
-        password: auth.password,
-        displayName: auth.displayName ?? '',
-      };
-    }
+    // Join-time re-auth is ALWAYS a login: the join view is only reachable after
+    // a successful sign-up or sign-in, so the account already exists. Replaying
+    // `register` here (when the user reached join via sign-up, carrying
+    // auth.mode='register') hits AC's 409 "account already exists" and the join
+    // disconnects. auth.mode is therefore no longer consulted here.
     return {
       mode: 'login',
       email: auth.email,

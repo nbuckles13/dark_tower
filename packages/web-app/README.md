@@ -33,6 +33,22 @@ not a production app.
 
 ## Run the demo locally (end-to-end)
 
+**Fastest path — `scripts/dev-web.sh`.** It preflights the whole setup against
+the repo's own pins (Node vs `.nvmrc`, pnpm vs `packageManager`, `nvm` present,
+AC/GC reachable, cert fingerprints, `demo.localhost`), then runs `pnpm install`,
+generates the protobuf-es client code, and launches the dev server — failing
+loudly with the exact fix command for anything missing:
+
+```bash
+scripts/dev-web.sh            # preflight + install + codegen + launch
+scripts/dev-web.sh --check    # preflight only (no install/launch)
+```
+
+Then open Chrome at `http://demo.localhost:5173`. You still need the cluster up
+(step 1) and the `/etc/hosts` entry (step 4) — the script detects and tells you,
+but can't do the privileged/cluster parts for you. The numbered steps below are
+what the script automates, plus the manual fallback.
+
 Prereqs: Node 22 (`.nvmrc`), pnpm (`corepack enable`), a running host-side Kind
 cluster with AC + GC (+ MC + MH for the join step).
 
@@ -70,12 +86,17 @@ cluster with AC + GC (+ MC + MH for the join step).
    127.0.0.1  demo.localhost
    ```
 
-5. **Install + run:**
+5. **Install + run** (through Nx, so proto codegen runs first):
 
    ```bash
    pnpm install
-   pnpm --filter @darktower/web-app dev     # or: pnpm dev (runs all dev targets)
+   pnpm nx run web-app:dev     # runs proto-gen:codegen (dependsOn) then vite
    ```
+
+   > The protobuf-es client (`packages/sdk-core/src/proto/**/*_pb.ts`) is
+   > gitignored generated code produced by `proto-gen:codegen`, which the `dev`
+   > target `dependsOn` — so the Nx target generates it before starting vite.
+   > (`scripts/dev-web.sh` launches this way for you.)
 
 6. **Open Chrome at `http://demo.localhost:5173`** (the `demo.` prefix is
    required so the AC auth proxy forwards the subdomain in the `Host` header).
