@@ -35,9 +35,13 @@ not a production app.
 
 **Fastest path — `scripts/dev-web.sh`.** It preflights the whole setup against
 the repo's own pins (Node vs `.nvmrc`, pnpm vs `packageManager`, `nvm` present,
-AC/GC reachable, cert fingerprints, `demo.localhost`), then runs `pnpm install`,
-generates the protobuf-es client code, and launches the dev server — failing
-loudly with the exact fix command for anything missing:
+AC/GC reachable, cert fingerprints, MC/MH WebTransport listeners, and
+`demo.localhost`), then runs `pnpm install`, generates the protobuf-es client
+code, and launches the dev server — failing loudly with the exact fix command
+for anything missing. The MC/MH check reads the advertise ports from the service
+configmaps and verifies a listener on the right address family, so it flags the
+WSL2 mirrored-mode IPv4/IPv6 loopback trap (browser dials IPv6 `::1`, podman
+publishes IPv4 only) before you hit it at join time:
 
 ```bash
 scripts/dev-web.sh            # preflight + install + codegen + launch

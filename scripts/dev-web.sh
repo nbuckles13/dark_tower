@@ -13,6 +13,7 @@
 #   - pnpm version matches package.json `packageManager` pin  [HARD FAIL]
 #   - AC (8443) + GC (8444) host ports answer                 [HARD FAIL]
 #   - MC/MH WebTransport cert fingerprints present            [WARN — join only]
+#   - MC/MH WebTransport ports have a right-family listener    [WARN — join only]
 #   - demo.localhost resolves (/etc/hosts)                    [WARN — browser only]
 #
 # HARD FAIL = nothing works without it, so we stop. WARN = only part of the
@@ -151,6 +152,89 @@ else
     warn "fingerprints missing ($FINGERPRINTS_JSON) — sign-up/create work, but WebTransport JOIN will fail."
     echo "      Fix: scripts/generate-dev-certs.sh  (then restart this script — Vite reads them at config time)"
 fi
+
+# ─── MC / MH WebTransport reachability (WARN — only the join step needs these) ──
+# The join step dials MC (signaling) then MH (media) over QUIC/WebTransport at
+# the addresses GC advertises to the browser — read here from the service
+# configmaps, the SSoT for those values. Two failure modes this catches that the
+# AC/GC TCP probes above cannot:
+#   1. Cluster up but the MC/MH WT port has no host listener (nothing published).
+#   2. IPv4/IPv6 loopback mismatch — an advertise host of "localhost" resolves to
+#      IPv6 ::1 under WSL2 mirrored networking, while podman rootlessport binds
+#      IPv4 127.0.0.1 only. QUIC to ::1 gets no reply (UDP has no happy-eyeballs
+#      fallback) so signaling times out. IPv4-literal advertise avoids it.
+WT_CONFIGMAPS=(
+    infra/services/mc-service/mc-0-configmap.yaml
+    infra/services/mc-service/mc-1-configmap.yaml
+    infra/services/mh-service/mh-0-configmap.yaml
+    infra/services/mh-service/mh-1-configmap.yaml
+)
+
+# Snapshot UDP listeners once; note whether "localhost" prefers IPv6 (mirrored).
+if command -v ss >/dev/null 2>&1; then
+    WT_LISTENERS="$(ss -uln 2>/dev/null || true)"
+    WT_HAVE_SS=1
+else
+    WT_LISTENERS=""
+    WT_HAVE_SS=0
+fi
+LOCALHOST_FIRST="$(getent ahosts localhost 2>/dev/null | awk 'NR==1 {print $1}')"
+
+# 0 if a UDP listener for $port exists in family $fam (4|6). rootlessport publishes
+# on 127.0.0.1 (v4) or [::1] (v6); 0.0.0.0/[::]/`*` wildcards count too.
+wt_listener_on() {
+    local port="$1" fam="$2"
+    if [[ "$fam" == 4 ]]; then
+        printf '%s\n' "$WT_LISTENERS" | grep -qE "(127\.0\.0\.1|0\.0\.0\.0):${port}([[:space:]]|\$)"
+    else
+        printf '%s\n' "$WT_LISTENERS" | grep -qE "(\[::1?\]|\*):${port}([[:space:]]|\$)"
+    fi
+}
+
+check_wt_endpoint() {
+    local file="$1" label="$2" url hostport host port
+    url="$(grep -E 'WEBTRANSPORT_ADVERTISE_ADDRESS' "$file" 2>/dev/null | grep -oE 'https://[^"]+' | head -1)"
+    if [[ -z "$url" ]]; then
+        warn "${label}: no advertise address in $file — skipping reachability check"
+        return
+    fi
+    hostport="${url#https://}"; port="${hostport##*:}"; host="${hostport%:*}"
+    if [[ "$WT_HAVE_SS" -eq 0 ]]; then
+        warn "${label} advertises ${host}:${port} — install 'ss' (iproute2) to verify a listener"
+        return
+    fi
+    case "$host" in
+        127.0.0.1|0.0.0.0)                       # IPv4 literal — browser dials IPv4
+            if wt_listener_on "$port" 4; then
+                pass "${label} WebTransport listener on ${host}:${port} (IPv4)"
+            else
+                warn "${label}: nothing listening on ${host}:${port} — join's media step will fail (cluster up? MC/MH published?)"
+            fi ;;
+        ::1|::)                                  # IPv6 literal
+            if wt_listener_on "$port" 6; then
+                pass "${label} WebTransport listener on [${host}]:${port} (IPv6)"
+            else
+                warn "${label}: nothing listening on [${host}]:${port} (IPv6) — join's media step will fail"
+            fi ;;
+        *)                                       # hostname — name resolution picks the family
+            local has4=1 has6=1
+            wt_listener_on "$port" 4 || has4=0
+            wt_listener_on "$port" 6 || has6=0
+            if [[ "$LOCALHOST_FIRST" == ::* && "$has6" -eq 0 && "$has4" -eq 1 ]]; then
+                warn "${label} advertises hostname '${host}:${port}', which resolves to IPv6 (${LOCALHOST_FIRST}) under WSL2 mirrored mode, but only an IPv4 listener exists → QUIC will time out."
+                echo "      Fix: set ${host} → the IPv4 literal 127.0.0.1 in $file (see the comment there), then re-run the cluster setup."
+            elif [[ "$has4" -eq 1 || "$has6" -eq 1 ]]; then
+                pass "${label} WebTransport listener on ${host}:${port}"
+            else
+                warn "${label}: nothing listening on ${host}:${port} — join's media step will fail"
+            fi ;;
+    esac
+}
+
+for cm in "${WT_CONFIGMAPS[@]}"; do
+    label="${cm##*/}"; label="${label%-configmap.yaml}"
+    check_wt_endpoint "$cm" "$label"
+done
 
 # ─── demo.localhost resolution (WARN — server starts regardless) ───
 if getent hosts "$DEMO_HOST" >/dev/null 2>&1 || grep -qE "[[:space:]]${DEMO_HOST}(\$|[[:space:]])" /etc/hosts 2>/dev/null; then
