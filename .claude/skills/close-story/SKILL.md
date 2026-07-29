@@ -78,15 +78,11 @@ Resolve these before closing. If a devloop is stuck: /devloop --continue=<slug>.
 
 **Identify participating specialists**: from each `docs/devloop-outputs/{devloop-slug}/main.md`, collect the implementing specialist (`**Specialist**:` header) plus any reviewer whose Code Review Results verdict was `RESOLVED` or `ESCALATED`. CLEAR reviewers skip reflection. Deduplicate. Always include `dry-reviewer` (Phase 2.5 retrospective runs in the same team).
 
-**Create the team**. Custom subagent types from `.claude/agents/{name}.md` are spawnable inside a team context (mirrors `/devloop` Step 3):
+**Spawn the reflection teammates.** The session has a single implicit team — there is no team to create (the `team_name` argument is deprecated and ignored). Custom subagent types from `.claude/agents/{name}.md` are spawnable directly (mirrors `/devloop` Step 3).
 
-```
-TeamCreate(team_name: "story-close-{slug}", description: "Story-scope reflection for {story-title}")
-```
+Defensive cleanup (best-effort): if this session already ran a close/devloop, shut down survivors first — `TaskList` to find prior teammates (by `owner`) and leftover tasks, send `{type: "shutdown_request"}` via SendMessage + `TaskStop` by name, then `TaskUpdate(status: "deleted")` on stale tasks. Ignore not-found failures.
 
-Defensive cleanup: if a team named `story-close-{slug}` already exists from a prior aborted close, send `{type: "shutdown_request"}` to each member via SendMessage, then call `TeamDelete` before re-creating.
-
-**Spawn each specialist** via the Agent tool with `team_name: "story-close-{slug}"`, `name: "{specialist-name}"`, `subagent_type: "{specialist-name}"`. The agent system auto-loads identity from `.claude/agents/{name}.md`. Include `docs/specialist-knowledge/{name}/INDEX.md` under a `## Navigation` header in the prompt.
+**Spawn each specialist** via the Agent tool with `name: "{specialist-name}"`, `subagent_type: "{specialist-name}"`. The agent system auto-loads identity from `.claude/agents/{name}.md`. Include `docs/specialist-knowledge/{name}/INDEX.md` under a `## Navigation` header in the prompt.
 
 **Send this prompt** (unicast via SendMessage, verbatim):
 
@@ -163,14 +159,14 @@ When done, reply "Retrospective complete".
 
 **Timeout**: 15 min; proceed, note "retrospective skipped (timeout)" if missed.
 
-## Phase 2.6: Team Teardown
+## Phase 2.6: Teammate Teardown
 
 After all reflections + the retrospective have completed (or timed out):
 
-1. Send `{type: "shutdown_request"}` to every team member via SendMessage.
-2. Call `TeamDelete`.
+1. Send `{type: "shutdown_request"}` to every teammate you spawned via SendMessage; `TaskStop` by name any that do not wind down.
+2. Clear the session-global task list: call `TaskList`, then `TaskUpdate(status: "completed" | "deleted")` on remaining items.
 
-Mirrors `/devloop` Step 8.5. Prevents stale team context from leaking into subsequent close-story or devloop runs.
+There is no team object to delete. Mirrors `/devloop` Step 8.5. Prevents stale teammates/tasks from leaking into subsequent close-story or devloop runs in the same session.
 
 ## Phase 3: Finalize
 

@@ -220,7 +220,7 @@ For security-critical implementations, the implementer should maintain a "Securi
 
 ### Step 3: Spawn Teammates
 
-**Defensive cleanup**: Before creating a new team, check for and clean up any stale team from a previous devloop. If a team already exists, send shutdown requests to all teammates and call `TeamDelete`. This handles cases where a previous devloop was interrupted before Step 8.5 (Cleanup Team).
+**Defensive cleanup**: The session has a single implicit team that always exists — there is no team to create or delete. In the standard one-container-per-devloop model each run gets a fresh session, so normally nothing is stale. But if this session already ran a devloop (e.g. an interactive re-run interrupted before Step 8.5), its teammates and shared tasks persist. Before spawning: call `TaskList` (each task's `owner` names a prior teammate — this replaces the old `TeamList`), send each survivor `{type: "shutdown_request"}` via `SendMessage`, and `TaskStop` by name as a fallback; then clear leftover tasks with `TaskUpdate(status: "deleted")`. Best-effort — ignore not-found failures. (Re-spawning a roster name is latest-wins for addressing, but the prior agent lingers until stopped, so still do the shutdown.)
 
 **IMPORTANT**: All teammates are spawned using the `subagent_type` parameter in the Task tool, which auto-loads their identity from `.claude/agents/{name}.md`. Do NOT manually read or inject specialist identity files — the agent system handles this.
 
@@ -484,15 +484,20 @@ After review, stage and commit:
    ```
 3. If nothing to commit, skip silently
 
-### Step 8.5: Cleanup Team
+### Step 8.5: Cleanup Teammates
 
-Shut down all teammates and delete the team before completing:
+The session has a single implicit team; there is no team object to delete. Wind
+down what this run spawned so it can't leak into a later run in the same session:
 
-1. Send shutdown requests to all teammates
-2. Call `TeamDelete` to remove the team and task list
+1. Send `{type: "shutdown_request"}` via `SendMessage` to each teammate you
+   spawned (the roster from §Team Composition). Approving shutdown terminates them.
+2. `TaskStop` by name any teammate that does not wind down.
+3. Clear the shared task list — it is session-global and persists now (no longer
+   torn down with the team): call `TaskList`, then `TaskUpdate(status:
+   "completed" | "deleted")` on every remaining item.
 
-This prevents stale team context from leaking into subsequent devloops
-when chained by story-run.
+This matters most for interactive same-session re-runs; in the
+one-container-per-devloop model the session ends here anyway.
 
 ### Step 9: Complete
 
