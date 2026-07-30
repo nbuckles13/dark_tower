@@ -3,18 +3,21 @@
   // MeetingApiClient.createMeeting and displays the returned meeting code for the
   // user to copy into the join view (in this or a second browser context).
   import type { DemoConfig } from '../lib/config.js';
-  import type { AuthResult } from '../lib/types.js';
+  import type { AuthSession } from '../lib/types.js';
   import { buildMeetingClient } from '../lib/session.js';
-  import { errorText } from '../lib/errorText.js';
+  import { errorText, isSessionRejection } from '../lib/errorText.js';
 
   let {
     config,
     auth,
     onGoJoin,
+    onSessionInvalid,
   }: {
     config: DemoConfig;
-    auth: AuthResult;
+    auth: AuthSession;
     onGoJoin: () => void;
+    /** Raised when the retained token is rejected (401 only) — see `isSessionRejection`. */
+    onSessionInvalid: () => void;
   } = $props();
 
   let title = $state('');
@@ -38,6 +41,11 @@
       code = resp.meetingCode;
     } catch (err) {
       error = errorText(err);
+      // A 401 here proves the retained token is dead, exactly as it does at join. A 403
+      // does NOT — it is an authorization decision (e.g. org meeting limit) on a valid token.
+      // The recovery is credential-scoped, not view-scoped: whichever call discovers
+      // the dead credential drops it (task #58 F-SEC-3).
+      if (isSessionRejection(err)) onSessionInvalid();
     } finally {
       busy = false;
     }

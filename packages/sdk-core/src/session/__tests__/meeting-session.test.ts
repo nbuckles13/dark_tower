@@ -14,6 +14,7 @@ import { MeetingSession } from '../MeetingSession.js';
 import { MeetingSessionState } from '../events.js';
 import type { JoinCredentials, MeetingSessionOptions } from '../events.js';
 import { MediaConnectionError } from '../../errors/MediaConnectionError.js';
+import { MeetingUnauthorizedError } from '../../errors/MeetingError.js';
 import { ConnectionState } from '../../proto/dark_tower/signaling/v1/signaling_pb.js';
 import type { FetchLike } from '../../http/types.js';
 import {
@@ -91,6 +92,40 @@ const LOGIN: JoinCredentials = {
   password: 'hunter2hunter2',
   displayName: 'Ada',
 };
+
+const TOKEN_CREDS: JoinCredentials = {
+  mode: 'token',
+  userToken: 'caller-supplied-user-token',
+  displayName: 'Ada',
+};
+
+const REGISTER: JoinCredentials = {
+  mode: 'register',
+  email: 'ada@demo.test',
+  password: 'hunter2hunter2',
+  displayName: 'Ada',
+};
+
+/**
+ * A `fetch` that RECORDS every request URL, so a negative can be asserted on the
+ * recorded list rather than on per-endpoint booleans.
+ *
+ * Spy rather than MSW deliberately (MSW *is* a dependency and is used at the
+ * HTTP-client tier in `http/__tests__/`). Two reasons: this is the
+ * session-orchestration tier, whose established idiom is an injected `fetchImpl`; and
+ * MSW intercepts and SERVES, so a handler-based test proves what a response looked
+ * like, not that no request happened — a regression that re-added the AC call would
+ * get a well-formed register response and pass.
+ */
+function recordingFetch(): { fetchImpl: FetchLike; urls: string[] } {
+  const urls: string[] = [];
+  const inner = fakeFetch();
+  const fetchImpl = ((input: string | URL, init?: RequestInit) => {
+    urls.push(typeof input === 'string' ? input : input.toString());
+    return inner(input, init);
+  }) as unknown as FetchLike;
+  return { fetchImpl, urls };
+}
 
 function makeSession(
   mocks: Map<string, MockWebTransport>,
@@ -644,5 +679,300 @@ describe('MeetingSession — R-58 end-to-end trace threading', () => {
     expect(mhTraceId).toBe(joinSpanTraceId);
     expect(updateTraceId).toBe(joinSpanTraceId);
     session.disconnect();
+  });
+
+  // ---------------------------------------------------------------------------
+  // Task #58 (e): join with a token makes NO auth call
+  // ---------------------------------------------------------------------------
+
+  it('(e) join with mode:token issues NO request to the AC origin and presents the caller token to GC', async () => {
+    const mocks = new Map<string, MockWebTransport>();
+    const { fetchImpl, urls } = recordingFetch();
+    const session = makeSession(mocks, { fetchImpl });
+
+    const joinP = session.join({
+      orgSubdomain: 'demo',
+      meetingCode: MEETING_CODE,
+      credentials: TOKEN_CREDS,
+    });
+    await driveJoin(mocks, 'all');
+    await joinP;
+
+    // ALLOWLIST, not an enumerated denylist: asserting "no /auth/register and no
+    // /auth/user/token" stays green if a future change routes through some OTHER AC
+    // endpoint (refresh, introspect). Assert nothing hit the AC origin at all, on the
+    // recorded URL list, so an unexpected third endpoint surfaces too.
+    const acOrigin = AC_TEMPLATE.replace('{subdomain}', 'demo');
+    expect(urls.filter((u) => u.startsWith(acOrigin))).toEqual([]);
+
+    // POSITIVE outcome in the same test: without this the negative above is satisfied
+    // by an early throw before `#authenticate` is ever reached.
+    const gcJoins = urls.filter((u) => u.includes('/api/v1/meetings/'));
+    expect(gcJoins).toHaveLength(1);
+    expect(session.state).toBe(MeetingSessionState.Joined);
+  });
+
+  it('(e) CONTROL: the same recording spy DOES capture an AC call on the register path', async () => {
+    // Proves the spy is wired. Without this control, a mis-wired spy makes the
+    // zero-AC-request assertion above green forever.
+    const mocks = new Map<string, MockWebTransport>();
+    const { fetchImpl, urls } = recordingFetch();
+    const session = makeSession(mocks, { fetchImpl });
+
+    const joinP = session.join({
+      orgSubdomain: 'demo',
+      meetingCode: MEETING_CODE,
+      credentials: REGISTER,
+    });
+    await driveJoin(mocks, 'all');
+    await joinP;
+
+    expect(urls.some((u) => u.includes('/api/v1/auth/register'))).toBe(true);
+  });
+
+  it('(e) the token path still populates participantName on the MC JoinRequest', async () => {
+    // `#joinSignaling` reads `options.credentials.displayName` as an UN-NARROWED union
+    // property access. It compiles only because every variant declares `displayName`.
+    // A later variant omitting it, "fixed" by narrowing to silence the compile error,
+    // would ship nameless participants while the zero-AC-request assertion above
+    // stayed green. Pin the behaviour, not just the type (@paired-client F2).
+    const mocks = new Map<string, MockWebTransport>();
+    const session = makeSession(mocks);
+
+    const joinP = session.join({
+      orgSubdomain: 'demo',
+      meetingCode: MEETING_CODE,
+      credentials: TOKEN_CREDS,
+    });
+    await driveJoin(mocks, 'all');
+    await joinP;
+
+    const mcMsgs = decodeClientMessages(mocks.get(MC_ENDPOINT)!.getOutboundBidiWrites(0));
+    const joinReq = mcMsgs.find((m) => m.message.case === 'joinRequest');
+    expect(joinReq).toBeDefined();
+    if (joinReq?.message.case !== 'joinRequest') throw new Error('unreachable');
+    expect(joinReq.message.value.participantName).toBe('Ada');
+  });
+
+  it('(e) a malformed caller token is rejected locally, before any network call', async () => {
+    const mocks = new Map<string, MockWebTransport>();
+    const { fetchImpl, urls } = recordingFetch();
+    const session = makeSession(mocks, { fetchImpl });
+
+    await expect(
+      session.join({
+        orgSubdomain: 'demo',
+        meetingCode: MEETING_CODE,
+        // CRLF injection attempt against the `Authorization: Bearer` header.
+        credentials: { mode: 'token', userToken: 'abc\r\nX-Injected: 1' },
+      }),
+    ).rejects.toThrow();
+    expect(urls).toEqual([]);
+  });
+
+  it('(F3) a GC 401 at join is reported as credential_invalid, not gc_join', async () => {
+    // @observability F3: before the token path the user token handed to joinMeeting was
+    // seconds old and SDK-minted, so a credential rejection there was rare. A
+    // caller-supplied token of arbitrary age makes it a ROUTINE gc_join outcome — which
+    // would otherwise mix "meeting join denied" with "your token is dead" under one
+    // label, two populations with different oncall responses.
+    const sink = new InMemoryMetricsSink();
+    const mocks = new Map<string, MockWebTransport>();
+    const unauthorizedFetch = ((input: string | URL) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (url.includes('/api/v1/meetings/')) {
+        return Promise.resolve(
+          new Response(JSON.stringify({ error: { code: 'unauthorized', message: 'bad token' } }), {
+            status: 401,
+            headers: JSON_HEADERS,
+          }),
+        );
+      }
+      return Promise.resolve(new Response('not found', { status: 404 }));
+    }) as unknown as FetchLike;
+    const session = makeSession(mocks, { metricsSink: sink, fetchImpl: unauthorizedFetch });
+
+    await expect(
+      session.join({
+        orgSubdomain: 'demo',
+        meetingCode: MEETING_CODE,
+        credentials: TOKEN_CREDS,
+      }),
+    ).rejects.toBeInstanceOf(MeetingUnauthorizedError);
+
+    sink.assertCounter(
+      'dt_client_join_attempts_total',
+      { status: 'failure', failure_stage: 'credential_invalid' },
+      1,
+    );
+  });
+
+  it('(F3) a GC 404 at join stays gc_join — the refinement is credential-specific', async () => {
+    // Control for the test above: without it, a gcJoinFailureStage that returned
+    // credential_invalid for EVERY GC failure would pass and the split would be
+    // meaningless.
+    const sink = new InMemoryMetricsSink();
+    const mocks = new Map<string, MockWebTransport>();
+    const notFoundFetch = ((input: string | URL) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (url.includes('/api/v1/meetings/')) {
+        return Promise.resolve(
+          new Response(JSON.stringify({ error: { code: 'not_found', message: 'no meeting' } }), {
+            status: 404,
+            headers: JSON_HEADERS,
+          }),
+        );
+      }
+      return Promise.resolve(new Response('not found', { status: 404 }));
+    }) as unknown as FetchLike;
+    const session = makeSession(mocks, { metricsSink: sink, fetchImpl: notFoundFetch });
+
+    await expect(
+      session.join({
+        orgSubdomain: 'demo',
+        meetingCode: MEETING_CODE,
+        credentials: TOKEN_CREDS,
+      }),
+    ).rejects.toBeTruthy();
+
+    sink.assertCounter(
+      'dt_client_join_attempts_total',
+      { status: 'failure', failure_stage: 'gc_join' },
+      1,
+    );
+  });
+
+  it('(F-O1) a malformed meeting code stays gc_join — NOT credential_invalid', async () => {
+    // `joinMeeting` runs `validateMeetingCode` as its first statement, so a user's typo
+    // throws a ValidationError inside the GC-join try block. Routing that to
+    // `credential_invalid` would page oncall toward auth for a mistyped code.
+    // The 404 control could not catch this: a malformed code never reaches HTTP, so it
+    // is outside that control's sample space (@observability F-O1).
+    const sink = new InMemoryMetricsSink();
+    const mocks = new Map<string, MockWebTransport>();
+    const session = makeSession(mocks, { metricsSink: sink });
+
+    await expect(
+      session.join({
+        orgSubdomain: 'demo',
+        meetingCode: 'BAD!!',
+        credentials: TOKEN_CREDS,
+      }),
+    ).rejects.toBeTruthy();
+
+    sink.assertCounter(
+      'dt_client_join_attempts_total',
+      { status: 'failure', failure_stage: 'gc_join' },
+      1,
+    );
+  });
+
+  it('(C1) a GC 403 stays gc_join — an authorization denial is not a dead credential', async () => {
+    // GC returns 403 for decisions on a VALID, live token: org meeting limit exceeded,
+    // insufficient permissions, external participants not allowed. Its contract is
+    // explicit — 401 = invalid/missing token, 403 = user not allowed to join. Routing
+    // 403 to credential_invalid puts the primary "meeting join denied" status into the
+    // credential bucket, which is the population mixing the refinement exists to
+    // prevent (@paired-client C1).
+    const sink = new InMemoryMetricsSink();
+    const mocks = new Map<string, MockWebTransport>();
+    const forbiddenFetch = ((input: string | URL) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (url.includes('/api/v1/meetings/')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({ error: { code: 'forbidden', message: 'org meeting limit exceeded' } }),
+            { status: 403, headers: JSON_HEADERS },
+          ),
+        );
+      }
+      return Promise.resolve(new Response('not found', { status: 404 }));
+    }) as unknown as FetchLike;
+    const session = makeSession(mocks, { metricsSink: sink, fetchImpl: forbiddenFetch });
+
+    await expect(
+      session.join({
+        orgSubdomain: 'demo',
+        meetingCode: MEETING_CODE,
+        credentials: TOKEN_CREDS,
+      }),
+    ).rejects.toBeTruthy();
+
+    sink.assertCounter(
+      'dt_client_join_attempts_total',
+      { status: 'failure', failure_stage: 'gc_join' },
+      1,
+    );
+  });
+
+  it('an unknown credential mode reports `internal`, not `signup`', async () => {
+    // An unrecognized mode is an SDK-contract violation, not an AC call that failed —
+    // `internal` is the one case where that bucket is genuinely right (@observability).
+    const sink = new InMemoryMetricsSink();
+    const mocks = new Map<string, MockWebTransport>();
+    const session = makeSession(mocks, { metricsSink: sink });
+
+    await expect(
+      session.join({
+        orgSubdomain: 'demo',
+        meetingCode: MEETING_CODE,
+        credentials: {
+          mode: 'sso',
+          email: 'a@b.test',
+          password: 'x',
+        } as unknown as JoinCredentials,
+      }),
+    ).rejects.toThrow();
+
+    sink.assertCounter(
+      'dt_client_join_attempts_total',
+      { status: 'failure', failure_stage: 'internal' },
+      1,
+    );
+  });
+
+  it('the exhaustiveness throw carries the MODE ONLY — never the credential object', async () => {
+    // The branch exists for when the type contract is violated, so it must assume `c` is
+    // a real credentials object. Serializing it would put `password` on Error.message,
+    // which propagates out of join() to an SDK embedder (@security F-SEC-4 + three others).
+    const mocks = new Map<string, MockWebTransport>();
+    const session = makeSession(mocks);
+
+    await expect(
+      session.join({
+        orgSubdomain: 'demo',
+        meetingCode: MEETING_CODE,
+        credentials: {
+          mode: 'sso',
+          email: 'ada@demo.test',
+          password: 'hunter2hunter2',
+        } as unknown as JoinCredentials,
+      }),
+    ).rejects.toThrow(
+      expect.objectContaining({
+        message: expect.not.stringContaining('hunter2hunter2') as unknown as string,
+      }),
+    );
+  });
+
+  it('#authenticate throws on an unknown credential mode rather than silently mis-routing', async () => {
+    // The `never` default is unreachable through the type system — that is the point.
+    // But the runtime guard is what protects a caller who bypasses types (a JS consumer,
+    // a cast, a deserialized value), and an untested `default` is exactly where a future
+    // variant would silently take the wrong branch.
+    const mocks = new Map<string, MockWebTransport>();
+    const session = makeSession(mocks);
+
+    await expect(
+      session.join({
+        orgSubdomain: 'demo',
+        meetingCode: MEETING_CODE,
+        credentials: {
+          mode: 'sso',
+          email: 'a@b.test',
+          password: 'x',
+        } as unknown as JoinCredentials,
+      }),
+    ).rejects.toThrow(/unhandled credential mode/);
   });
 });

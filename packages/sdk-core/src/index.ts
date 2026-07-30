@@ -166,4 +166,5 @@ export type {
   MeetingSessionEventMap,
   MeetingSessionOptions,
   RegisterCredentials,
+  TokenCredentials,
 } from './session/events.js';

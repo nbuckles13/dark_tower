@@ -1,11 +1,11 @@
 <script lang="ts">
   // R-29 view 1: sign-up (email / password / displayName / orgSubdomain).
   import type { DemoConfig } from '../lib/config.js';
-  import type { AuthResult } from '../lib/types.js';
+  import type { AuthSession } from '../lib/types.js';
   import { buildAuthClient } from '../lib/session.js';
   import { errorText } from '../lib/errorText.js';
 
-  let { config, onAuthed }: { config: DemoConfig; onAuthed: (result: AuthResult) => void } =
+  let { config, onAuthed }: { config: DemoConfig; onAuthed: (session: AuthSession) => void } =
     $props();
 
   let email = $state('');
@@ -22,14 +22,13 @@
     try {
       const client = buildAuthClient(config);
       const resp = await client.register({ subdomain, email, password, displayName });
-      onAuthed({
-        subdomain,
-        email,
-        password,
-        displayName,
-        mode: 'register',
-        userToken: resp.accessToken,
-      });
+      // Defense in depth: drop this component's reference to the password the moment
+      // the token exchange succeeds. JS strings are immutable, so this narrows the
+      // window rather than erasing the value — the original survives until GC and may
+      // persist in the DOM input value. The session below carries no credential at all,
+      // which is the actual control; this is belt-and-braces on top of it.
+      password = '';
+      onAuthed({ subdomain, displayName, userToken: resp.accessToken });
     } catch (err) {
       error = errorText(err);
     } finally {

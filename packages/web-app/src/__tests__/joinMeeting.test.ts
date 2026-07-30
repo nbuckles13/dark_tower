@@ -6,7 +6,7 @@ import { expect, test, vi } from 'vitest';
 import { render } from 'vitest-browser-svelte';
 import { SdkError, SdkErrorCode } from '@darktower/sdk-core';
 import type { DemoConfig } from '../lib/config.js';
-import type { AuthResult } from '../lib/types.js';
+import type { AuthSession } from '../lib/types.js';
 import { MockMeetingSession } from './helpers/MockMeetingSession.js';
 
 const holder = vi.hoisted(() => ({ session: undefined as MockMeetingSession | undefined }));
@@ -28,18 +28,15 @@ const config: DemoConfig = {
   devCertHashes: [],
 };
 
-const auth: AuthResult = {
+const auth: AuthSession = {
   subdomain: 'demo',
-  email: 'user@example.com',
-  password: 'correct horse battery',
-  mode: 'login',
   userToken: 'user-token',
 };
 
 test('renders join controls and a live roster from the store', async () => {
   const session = new MockMeetingSession();
   holder.session = session;
-  const screen = render(JoinMeeting, { config, auth });
+  const screen = render(JoinMeeting, { config, auth, onSessionInvalid: () => {} });
 
   await expect.element(screen.getByTestId('meeting-code')).toBeInTheDocument();
   await expect.element(screen.getByTestId('join-button')).toBeInTheDocument();
@@ -56,7 +53,7 @@ test('renders join controls and a live roster from the store', async () => {
 test('surfaces an error via last-error without leaking a non-allowlisted field', async () => {
   const session = new MockMeetingSession();
   holder.session = session;
-  const screen = render(JoinMeeting, { config, auth });
+  const screen = render(JoinMeeting, { config, auth, onSessionInvalid: () => {} });
 
   const err = new SdkError(SdkErrorCode.Signaling, 'join rejected', { status: 401 });
   (err as { token?: string }).token = 'SECRET_TOKEN_123';

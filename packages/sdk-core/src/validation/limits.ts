@@ -18,6 +18,14 @@ export const MAX_DISPLAY_NAME_LENGTH = 64;
 export const MAX_EMAIL_LENGTH = 254;
 /** Max password length (R-31). */
 export const MAX_PASSWORD_LENGTH = 128;
+/**
+ * Max user-token length. Sized for a real JWT (header.payload.signature, base64url,
+ * with claims) — NOT derived from `MAX_PASSWORD_LENGTH`. A bound copied from the
+ * password limit would reject every legitimate token, and because the credential
+ * guard ships without a bypass marker there would be no workaround; it would present
+ * as an inexplicable join failure (@security, task #58).
+ */
+export const MAX_USER_TOKEN_LENGTH = 8192;
 
 // ============================================================================
 // Non-throwing truncators (cap-and-return; NEVER throw).
@@ -34,6 +42,9 @@ export const MAX_PASSWORD_LENGTH = 128;
 // populating the outbound `MediaConnectionUpdate`, so nothing unbounded reaches the
 // wire (R-23/R-60). BYTES, not chars — see `capUtf8Bytes`.
 export const MAX_MH_URL_BYTES = 256;
+
+/** RFC 7235 `token68`. Anchored, module-level literal — never `new RegExp(userInput)`. */
+const USER_TOKEN_REGEX = /^[A-Za-z0-9\-._~+/]+=*$/;
 
 const UTF8_ENCODER = /*@__PURE__*/ new TextEncoder();
 
@@ -163,5 +174,39 @@ export function validateSubdomain(subdomain: string): void {
 export function validateMeetingCode(code: string): void {
   if (!MEETING_CODE_REGEX.test(code)) {
     throw new ValidationError('meetingCode', 'Invalid meeting code');
+  }
+}
+
+/**
+ * Validate a caller-supplied user access token BEFORE it is interpolated into an
+ * `Authorization: Bearer` header.
+ *
+ * **This is NOT token verification.** It is a charset/length guard against header
+ * injection. It does not and must not verify the JWT signature, issuer, audience or
+ * expiry — the browser has no JWKS, and the authentication decision belongs to GC's
+ * `require_user_auth`. Do not skip a server-side check on the assumption that the SDK
+ * validated the token it was handed (@paired-client, task #58).
+ *
+ * The charset is RFC 7235 `token68` (`ALPHA / DIGIT / - . _ ~ + /` with optional
+ * trailing `=`), which contains every legitimate JWT compact serialization —
+ * base64url segments joined by `.` are a strict subset — while excluding CR, LF,
+ * space and every other control character. Header splitting is therefore structurally
+ * impossible rather than filtered.
+ *
+ * The token VALUE is never logged or placed on the thrown error.
+ * @throws {ValidationError} if empty, over-long, or outside `token68`.
+ */
+export function validateUserToken(userToken: string): void {
+  if (userToken.length === 0) {
+    throw new ValidationError('userToken', 'User token is required');
+  }
+  if (userToken.length > MAX_USER_TOKEN_LENGTH) {
+    throw new ValidationError(
+      'userToken',
+      `User token must be at most ${MAX_USER_TOKEN_LENGTH} characters`,
+    );
+  }
+  if (!USER_TOKEN_REGEX.test(userToken)) {
+    throw new ValidationError('userToken', 'User token contains invalid characters');
   }
 }

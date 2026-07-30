@@ -5,7 +5,7 @@
 import { afterEach, expect, test, vi } from 'vitest';
 import { render } from 'vitest-browser-svelte';
 import type { DemoConfig } from '../lib/config.js';
-import type { AuthResult } from '../lib/types.js';
+import type { AuthSession } from '../lib/types.js';
 import CreateMeeting from '../views/CreateMeeting.svelte';
 
 const config: DemoConfig = {
@@ -15,12 +15,9 @@ const config: DemoConfig = {
   devCertHashes: [],
 };
 
-const auth: AuthResult = {
+const auth: AuthSession = {
   subdomain: 'demo',
-  email: 'user@example.com',
-  password: 'correct horse battery',
   displayName: 'Ann',
-  mode: 'login',
   userToken: 'user-token',
 };
 
@@ -51,7 +48,12 @@ test('creates a meeting and shows the returned code', async () => {
   );
   vi.stubGlobal('fetch', fetchMock);
 
-  const screen = render(CreateMeeting, { config, auth, onGoJoin: () => {} });
+  const screen = render(CreateMeeting, {
+    config,
+    auth,
+    onGoJoin: () => {},
+    onSessionInvalid: () => {},
+  });
 
   for (const id of ['meeting-title', 'scheduled-start', 'create-button']) {
     await expect.element(screen.getByTestId(id)).toBeInTheDocument();

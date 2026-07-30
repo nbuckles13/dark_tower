@@ -84,16 +84,42 @@ prefix (ADR-0028 §9). They are emitted via the OTel JS `Meter` (production
   stage a failure occurred at.
 - **Labels**:
   - `status`: `success`, `failure`
-  - `failure_stage`: `none` (on success), `signup`, `gc_create_token`,
-    `gc_join`, `mc_signaling_connect`, `mc_join_response`, `mh_connect`,
-    `internal`
-- **Cardinality**: Low (2 statuses × 8 stages = 16, before implicit labels).
+  - `failure_stage`: `none` (on success), `signup`, `credential_invalid`,
+    `gc_create_token`, `gc_join`, `mc_signaling_connect`, `mc_join_response`,
+    `mh_connect`, `internal`
+- **Cardinality**: Low (2 statuses × 9 stages = 18, before implicit labels).
 - **Emission honesty** (task #14 — which stages the browser client actually
   emits):
   - `gc_create_token` is **RESERVED, never emitted by this client**. The browser
     issues a single `joinMeeting` POST; the token-mint and join happen server-side
     behind it, so the client cannot observe that sub-stage separately. It is kept
     in the catalog only for parity with the server-side join pipeline.
+  - `credential_invalid` (task #58) is where **token-mode credential failures land**:
+    either a caller-supplied `userToken` rejected locally by `validateUserToken`
+    (malformed / control chars), or a **401** from GC's `joinMeeting`. Alert / dashboard
+    authors: this is a **caller-input** failure — deterministic and caller-fixable — so
+    it is deliberately NOT `internal` (the SDK-fault bucket). Treating it as an SDK
+    fault would make `internal` non-actionable.
+    - **Deliberately excluded — do not widen this to match a future code change**: a
+      **403** is an authorization decision on a *valid, live* token (org meeting limit,
+      insufficient permissions, external participants not allowed) and stays on
+      `gc_join`; a **malformed meeting code** fails client-side in `validateMeetingCode`
+      before any HTTP and also stays on `gc_join`. Both were routed here at first and
+      corrected at Gate 3 — putting either in this bucket points oncall at auth for a
+      quota breach or a user's typo.
+  - `signup` is **unreachable on the token path**, which is the path the demo app uses.
+    It covers only an AC `register`/`login` call failing, and `MeetingSession.join` with
+    `{mode:'token'}` makes no AC call at all. A flatlining `signup` panel after task #58
+    is the expected state, not an outage — do not alert on its absence. It remains live
+    for the standalone-join path (`{mode:'login'|'register'}`), which no first-party app
+    currently uses.
+  - **Latency-histogram note**: a token-mode join is structurally faster than the
+    pre-#58 flow — it skips an AC round-trip — so `dt_client_time_to_signaling_ready_ms`
+    and `dt_client_time_to_first_mh_connected_ms` shifted downward once at rollout. No
+    discriminator label was added: the demo moved wholesale to the token path, so there
+    is no mixed population, and the shift is a one-time improvement rather than an
+    ongoing bimodality. Re-evaluate if a first-party caller ever adopts the password
+    path, which WOULD create two populations under one series.
   - `mc_signaling_connect` vs `mc_join_response` are **distinct**:
     `mc_signaling_connect` = the signaling channel never opened / no server response
     arrived — the LOCAL `SignalingErrorCode`s `Transport`, `Framing`, `Timeout`;

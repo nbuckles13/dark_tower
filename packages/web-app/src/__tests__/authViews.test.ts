@@ -5,7 +5,7 @@
 import { afterEach, expect, test, vi } from 'vitest';
 import { render } from 'vitest-browser-svelte';
 import type { DemoConfig } from '../lib/config.js';
-import type { AuthResult } from '../lib/types.js';
+import type { AuthSession } from '../lib/types.js';
 import SignUp from '../views/SignUp.svelte';
 import SignIn from '../views/SignIn.svelte';
 
@@ -34,8 +34,8 @@ test('sign-up renders the required testids and registers on submit', async () =>
       jsonResponse({ accessToken: 'user-token', tokenType: 'Bearer', expiresIn: 3600 }),
     ),
   );
-  let result: AuthResult | undefined;
-  const screen = render(SignUp, { config, onAuthed: (r: AuthResult) => (result = r) });
+  let result: AuthSession | undefined;
+  const screen = render(SignUp, { config, onAuthed: (r: AuthSession) => (result = r) });
 
   for (const id of ['email', 'password', 'display-name', 'org-subdomain']) {
     await expect.element(screen.getByTestId(id)).toBeInTheDocument();
@@ -48,8 +48,17 @@ test('sign-up renders the required testids and registers on submit', async () =>
   await screen.getByTestId('create-account-button').click();
 
   await vi.waitFor(() => expect(result).toBeDefined());
-  expect(result?.mode).toBe('register');
+  // `mode` used to be asserted here. It is gone from the session type (task #58), so
+  // this re-points at fields with live consumers rather than dropping the check —
+  // otherwise B2 would quietly reduce this test to "a token came back", losing the
+  // sign-up -> session propagation assertion exactly when what a session IS changed.
   expect(result?.userToken).toBe('user-token');
+  expect(result?.subdomain).toBe('demo');
+  expect(result?.displayName).toBe('Ann');
+  // The session must carry NO credential. This is the type-level control restated as
+  // a runtime assertion, so a future widening of AuthSession fails here too.
+  expect(result).not.toHaveProperty('password');
+  expect(result).not.toHaveProperty('email');
 });
 
 test('sign-in renders org-subdomain and surfaces a typed error on 401', async () => {

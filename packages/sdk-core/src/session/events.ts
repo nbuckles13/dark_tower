@@ -30,7 +30,35 @@ export const MeetingSessionState = {
 
 export type MeetingSessionState = (typeof MeetingSessionState)[keyof typeof MeetingSessionState];
 
-/** Sign in with an existing account. `displayName` is the optional roster label. */
+/**
+ * Join with a user access token the caller already holds — **the path apps should
+ * use**. No AC round-trip: `join()` presents this token to GC directly.
+ *
+ * Prefer this whenever the app has already authenticated. Re-authenticating at join
+ * time means retaining the password past the token exchange that made it
+ * unnecessary, which is a credential-minimisation defect (and was a real one — it
+ * also made the register-vs-login mismatch possible).
+ *
+ * `displayName` is the roster label; it is optional here because a token-holding app
+ * may not have one (AC's token response carries no identity fields).
+ */
+export interface TokenCredentials {
+  readonly mode: 'token';
+  readonly userToken: string;
+  readonly displayName?: string;
+}
+
+/**
+ * Sign in with an existing account, then join. `displayName` is the optional roster label.
+ *
+ * **Standalone-join only.** Legal solely where the credential is a call-scoped
+ * argument that no caller retains — i.e. reached through `join(options)` and never
+ * stored on a field, in component state, or in a store. Prefer {@link TokenCredentials}
+ * if you have already authenticated. That criterion is enforced mechanically, not by
+ * convention: `dt-guard ts-no-retained-credentials` flags any *retained* type carrying
+ * a credential field, so this interface needs no exemption — it passes on the merits
+ * because a function-parameter annotation is not a retention site.
+ */
 export interface LoginCredentials {
   readonly mode: 'login';
   readonly email: string;
@@ -38,7 +66,11 @@ export interface LoginCredentials {
   readonly displayName?: string;
 }
 
-/** Create a new account, then join. `displayName` is required (becomes the roster label). */
+/**
+ * Create a new account, then join. `displayName` is required (becomes the roster label).
+ *
+ * **Standalone-join only** — same criterion as {@link LoginCredentials}.
+ */
 export interface RegisterCredentials {
   readonly mode: 'register';
   readonly email: string;
@@ -46,8 +78,12 @@ export interface RegisterCredentials {
   readonly displayName: string;
 }
 
-/** Discriminated credential carrier for {@link MeetingSession.join}. Held in memory only (R-23). */
-export type JoinCredentials = LoginCredentials | RegisterCredentials;
+/**
+ * Discriminated credential carrier for {@link MeetingSession.join}. Held in memory
+ * only (R-23), and — for the password-bearing variants — only for the duration of the
+ * `join()` call.
+ */
+export type JoinCredentials = TokenCredentials | LoginCredentials | RegisterCredentials;
 
 /** Parameters for {@link MeetingSession.join}. */
 export interface JoinOptions {

@@ -8,14 +8,28 @@
   // join per mount (MeetingSession is single-use) — re-mount to retry.
   import { onDestroy } from 'svelte';
   import type { DemoConfig } from '../lib/config.js';
-  import type { AuthResult } from '../lib/types.js';
+  import type { AuthSession } from '../lib/types.js';
   import type { JoinCredentials } from '@darktower/sdk-core';
   import { bindMeetingSession } from '@darktower/sdk-svelte';
   import { buildMeetingSession } from '../lib/session.js';
   import { installE2EHooks } from '../lib/e2eBus.js';
-  import { errorText } from '../lib/errorText.js';
+  import { errorText, isSessionRejection } from '../lib/errorText.js';
 
-  let { config, auth }: { config: DemoConfig; auth: AuthResult } = $props();
+  let {
+    config,
+    auth,
+    onSessionInvalid,
+  }: {
+    config: DemoConfig;
+    auth: AuthSession;
+    /**
+     * Raised when GC rejects the retained token (401 — see `isSessionRejection`; a
+     * 403 is an authorization decision on a VALID token and must NOT drop it). The shell drops the dead
+     * session, which restores the sign-in affordance — without this the user is
+     * stranded holding a credential the server has already refused.
+     */
+    onSessionInvalid: () => void;
+  } = $props();
 
   // svelte-ignore state_referenced_locally
   const session = buildMeetingSession(config);
@@ -28,15 +42,16 @@
   let busy = $state(false);
 
   function credentials(): JoinCredentials {
-    // Join-time re-auth is ALWAYS a login: the join view is only reachable after
-    // a successful sign-up or sign-in, so the account already exists. Replaying
-    // `register` here (when the user reached join via sign-up, carrying
-    // auth.mode='register') hits AC's 409 "account already exists" and the join
-    // disconnects. auth.mode is therefore no longer consulted here.
+    // Join presents the token the app already holds. No re-authentication, so no
+    // password is retained or re-transmitted — and with no `mode` to carry, the
+    // register-vs-login mismatch that caused AC's 409 is structurally impossible
+    // rather than avoided by a band-aid.
+    //
+    // Conditional spread, not `displayName: auth.displayName`:
+    // `exactOptionalPropertyTypes` rejects assigning `string | undefined` to `?:`.
     return {
-      mode: 'login',
-      email: auth.email,
-      password: auth.password,
+      mode: 'token',
+      userToken: auth.userToken,
       ...(auth.displayName ? { displayName: auth.displayName } : {}),
     };
   }
@@ -49,6 +64,7 @@
       await session.join({ orgSubdomain: auth.subdomain, meetingCode, credentials: credentials() });
     } catch (err) {
       joinError = errorText(err);
+      if (isSessionRejection(err)) onSessionInvalid();
     } finally {
       busy = false;
     }

@@ -2,6 +2,7 @@
 
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -96,6 +97,8 @@ pub struct JwkKey {
 pub struct AuthClient {
     base_url: String,
     http_client: Client,
+    /// Count of AC requests issued through THIS instance — see [`AuthClient::call_count`].
+    calls: AtomicUsize,
 }
 
 impl AuthClient {
@@ -104,7 +107,26 @@ impl AuthClient {
         Self {
             base_url: base_url.into(),
             http_client: Client::new(),
+            calls: AtomicUsize::new(0),
         }
+    }
+
+    /// Number of AC requests this client instance has issued.
+    ///
+    /// Exists so a test can assert on calls that ACTUALLY happened rather than on a
+    /// value it hopes did not change. Added for story task #58, where the token-only
+    /// join property needs a net that fails under the regression shape it targets:
+    /// a re-auth regression introduces a NEW binding (`let token2 = register(...)`)
+    /// and leaves the original untouched, so any assertion comparing the original
+    /// token to a saved copy of itself passes while the property is gone. Counting
+    /// requests observes the regression; comparing a value to its own clone cannot.
+    ///
+    /// **Residual, stated rather than overclaimed**: this counts calls through this
+    /// INSTANCE. An edit that constructs a second `AuthClient` evades it. That is a
+    /// far less natural regression than adding a call on the client already in hand,
+    /// and it is a real net where there was none.
+    pub fn call_count(&self) -> usize {
+        self.calls.load(Ordering::Relaxed)
     }
 
     /// Issue a token using client credentials.
@@ -112,6 +134,7 @@ impl AuthClient {
         &self,
         request: TokenRequest,
     ) -> Result<TokenResponse, AuthClientError> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
         // AC service token endpoint is at /api/v1/auth/service/token
         let token_url = format!("{}/api/v1/auth/service/token", self.base_url);
 
@@ -138,6 +161,7 @@ impl AuthClient {
 
     /// Fetch the JWKS (JSON Web Key Set) from the service.
     pub async fn fetch_jwks(&self) -> Result<JwksResponse, AuthClientError> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
         // AC service JWKS endpoint is at /.well-known/jwks.json
         let jwks_url = format!("{}/.well-known/jwks.json", self.base_url);
 
@@ -176,6 +200,7 @@ impl AuthClient {
         &self,
         request: &UserRegistrationRequest,
     ) -> Result<UserRegistrationResponse, AuthClientError> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
         let register_url = format!("{}/api/v1/auth/register", self.base_url);
 
         // Extract host and port from base_url for the Host header.

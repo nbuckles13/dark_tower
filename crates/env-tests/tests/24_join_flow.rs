@@ -444,6 +444,40 @@ async fn test_gc_guest_join_rejected_when_disabled() {
 /// 2. MC WebTransport connection succeeds with dev certs
 /// 3. Protobuf JoinRequest is processed correctly
 /// 4. JoinResponse contains participant_id and correlation_id (ADR-0023)
+/// 5. **TOKEN-ONLY JOIN (load-bearing for story task #58)**: ONE `register` call
+///    produces a user token that is then reused, unchanged, for create -> GC join ->
+///    MC WebTransport join. No second AC call anywhere in the flow.
+///
+/// # Why (5) is asserted rather than merely true
+///
+/// Task #58 made the browser SDK present the token the app already holds instead of
+/// re-authenticating at join time. This test is the server-side half of that contract:
+/// it proves GC accepts a plain, previously-issued user token for join.
+///
+/// Before #58 the property held only *incidentally* — the test happened to thread one
+/// token through, and nothing asserted the absence of a second AC call, so a future
+/// edit could have inserted one and left the suite green. An incidental property is
+/// not a contract, so the AC-call count is now pinned explicitly.
+///
+/// # It counts REQUESTS, not token equality — and the difference is the whole point
+///
+/// The first version of this assertion compared `user_token` against a clone of itself
+/// taken at issue time. That cannot fail: `user_token` is not `mut` and is never
+/// reassigned, so the borrow checker guarantees the comparison holds. Worse, it was
+/// blind to the exact regression it claimed to catch — a re-auth introduces a NEW
+/// binding (`let token2 = register_test_user(...)`) and passes THAT to the join, leaving
+/// the original untouched and the assertion green while the property is gone
+/// (@test T1, task #58 Gate 3).
+///
+/// So it asserts on `AuthClient::call_count()` — requests that actually happened.
+/// **Residual**: the counter observes calls through this client INSTANCE, so an edit
+/// constructing a second `AuthClient` would evade it. Less natural than adding a call
+/// to the client already in hand, and a real net where there was none.
+///
+/// The CLIENT half — driving the TypeScript `MeetingSession.join` against a live
+/// cluster — belongs to story task #18 (Playwright harness), which is sequenced after
+/// #58 precisely because #58 defines the flow's contract. Between #58 and #18 the
+/// browser join path has no live-cluster coverage; that gap is recorded in the story.
 #[tokio::test]
 async fn test_mc_webtransport_connect_and_join() {
     let cluster = cluster().await;
@@ -454,6 +488,13 @@ async fn test_mc_webtransport_connect_and_join() {
     // Step 1: Register user, create meeting, join via GC
     let (user_token, display_name) =
         register_test_user(&auth_client, "WebTransport Join User").await;
+
+    // (5) Baseline: exactly one AC request so far — the registration above.
+    assert_eq!(
+        auth_client.call_count(),
+        1,
+        "setup should have issued exactly one AC request (the registration)"
+    );
 
     let create_request = CreateMeetingRequest::new("WebTransport Test Meeting");
     let created = gc_client
@@ -510,6 +551,17 @@ async fn test_mc_webtransport_connect_and_join() {
             panic!("Expected JoinResponse from MC, got {:?}", other);
         }
     }
+
+    // (5) STILL exactly one AC request after create -> GC join -> MC WebTransport join.
+    // Counting requests (not comparing a token to itself) is what makes this fail if a
+    // future edit re-authenticates mid-flow, however it binds the new token.
+    assert_eq!(
+        auth_client.call_count(),
+        1,
+        "token-only join is load-bearing for story task #58: the whole flow must issue \
+         exactly ONE AC request. A second call means the join re-authenticated instead \
+         of reusing the token the caller already held."
+    );
 }
 
 /// Test: MC rejects JoinRequests with invalid credentials.

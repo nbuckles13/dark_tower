@@ -1,11 +1,11 @@
 <script lang="ts">
   // R-29 view 2: sign-in (email / password / orgSubdomain).
   import type { DemoConfig } from '../lib/config.js';
-  import type { AuthResult } from '../lib/types.js';
+  import type { AuthSession } from '../lib/types.js';
   import { buildAuthClient } from '../lib/session.js';
   import { errorText } from '../lib/errorText.js';
 
-  let { config, onAuthed }: { config: DemoConfig; onAuthed: (result: AuthResult) => void } =
+  let { config, onAuthed }: { config: DemoConfig; onAuthed: (session: AuthSession) => void } =
     $props();
 
   let email = $state('');
@@ -21,7 +21,12 @@
     try {
       const client = buildAuthClient(config);
       const resp = await client.login({ subdomain, email, password });
-      onAuthed({ subdomain, email, password, mode: 'login', userToken: resp.accessToken });
+      // Defense in depth — see the note in SignUp.svelte. Narrows the window; the
+      // control is that the session carries no credential.
+      password = '';
+      // No displayName: AC's token response carries no identity fields, so sign-in
+      // users join with an empty roster label. Pre-existing, unchanged by task #58.
+      onAuthed({ subdomain, userToken: resp.accessToken });
     } catch (err) {
       error = errorText(err);
     } finally {
