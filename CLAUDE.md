@@ -47,7 +47,7 @@ Apply to every agent here — host orchestrator, devloop teammates, and speciali
 | `code-reviewer` | Code quality, Rust idioms, ADR compliance |
 | `client` | Browser SDK, Svelte web app, media pipeline |
 | `dry-reviewer` | Cross-service duplication detection |
-| `semantic-guard` | Semantic anti-patterns pattern guards can't catch (credential-leak, actor-blocking, error-context, metrics-path) |
+| `semantic-guard` | Semantic anti-patterns pattern guards can't catch (e.g. credential-leak, client credential-lifetime — authoritative list: `scripts/guards/semantic/checks.md`) |
 | `test` | E2E tests, coverage, quality gates (MANDATORY cross-cutting) |
 | `security` | Threat modeling, cryptography (MANDATORY cross-cutting) |
 | `observability` | Metrics, logging, tracing, SLOs (MANDATORY cross-cutting) |

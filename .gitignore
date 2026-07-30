@@ -91,3 +91,10 @@ Thumbs.db
 # Python (used by guard scripts under scripts/guards/lib/)
 __pycache__/
 *.pyc
+
+# Vitest browser-mode FAILURE artifacts (screenshots + attachments). Written only
+# when a browser test fails, so they are transient debugging output, never source.
+# Ignored rather than deleted-by-hand: otherwise the first red browser test in any
+# devloop leaves untracked binaries that trip cross-boundary scope-drift.
+.vitest-attachments/
+**/__tests__/__screenshots__/

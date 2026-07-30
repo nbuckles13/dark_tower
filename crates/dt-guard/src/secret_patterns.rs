@@ -189,6 +189,45 @@ pub const IPV4_ALLOWLIST: &[&str] = &[
 mod tests {
     use super::*;
 
+    /// Every `HYGIENE_SOURCE_SCAN_SUBSET` name must resolve to a real
+    /// `HYGIENE_PATTERNS` entry.
+    ///
+    /// **Why set-membership rather than a count, and why this is standalone**
+    /// (task #58, found by @dry-reviewer, verified by @paired-infrastructure):
+    /// `source_scan_patterns()` filters by `HYGIENE_SOURCE_SCAN_SUBSET.contains(name)`
+    /// against hand-maintained strings. Rename a pattern in `HYGIENE_PATTERNS` — say
+    /// `"JWT"` to `"JWT literal"` — and `contains()` silently stops matching it. The
+    /// subset shrinks, `ts-no-secrets` Check 2 quietly stops scanning for that class,
+    /// the build stays green, and **nothing anywhere fails**. That is silent
+    /// detection-loss in a shipped guard.
+    ///
+    /// Before this test, only `AWS access key` and `JWT` were incidentally pinned
+    /// (by `hygiene_patterns_match_known_leaks` and `ts_secrets`' Check-2 test);
+    /// `OpenAI/Stripe-style key`, `GitHub PAT` and `Slack token` were held by nothing.
+    ///
+    /// Standalone rather than folded into an existing test so a failure names *this*
+    /// invariant instead of surfacing as a puzzling failure in an unrelated case. If
+    /// it looks tautological, that is the point — do not simplify it back into the bug.
+    #[test]
+    fn source_scan_subset_names_all_resolve() {
+        let catalog: Vec<&str> = HYGIENE_PATTERNS.iter().map(|(name, _)| *name).collect();
+        let unresolved: Vec<&&str> = HYGIENE_SOURCE_SCAN_SUBSET
+            .iter()
+            .filter(|name| !catalog.contains(name))
+            .collect();
+        assert!(
+            unresolved.is_empty(),
+            "HYGIENE_SOURCE_SCAN_SUBSET names with no HYGIENE_PATTERNS entry \
+             (renamed in the catalog? the filter now silently drops them): \
+             {unresolved:?}"
+        );
+        assert_eq!(
+            source_scan_patterns().count(),
+            HYGIENE_SOURCE_SCAN_SUBSET.len(),
+            "source_scan_patterns() yielded fewer patterns than the subset declares"
+        );
+    }
+
     #[test]
     fn template_expr_redacts() {
         let scrubbed = TEMPLATE_EXPR.replace_all("Bearer {{ $labels.x }}", "<<TEMPLATED>>");

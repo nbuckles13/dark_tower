@@ -46,7 +46,7 @@ Every devloop spawns **8 teammates** (Lead + Implementer + 7 reviewers):
 | Code Quality Reviewer | code-reviewer | Rust idioms, ADR compliance | MAJOR+ blocks; rest TECH_DEBT |
 | DRY Reviewer | dry-reviewer | Cross-service duplication | BLOCKER only; rest TECH_DEBT (per ADR-0019) |
 | Operations Reviewer | operations | Deployment safety, rollback, runbooks | MAJOR+ blocks; rest TECH_DEBT |
-| Semantic Guard Reviewer | semantic-guard | Diff-pattern anti-patterns per `scripts/guards/semantic/checks.md` (credential-leak, actor-blocking, error-context-preservation, metrics-path-completeness); distinct from code-reviewer's general lens | ESCALATED blocks; rest TECH_DEBT |
+| Semantic Guard Reviewer | semantic-guard | Diff-pattern anti-patterns per `scripts/guards/semantic/checks.md` (that file is the authoritative list; an ADR should not carry a mutable operational enumeration); distinct from code-reviewer's general lens | ESCALATED blocks; rest TECH_DEBT |
 
 **Rationale for 8 teammates**: All four mandatory cross-cutting specialists (Security, Test, Observability, Operations) are included alongside Code Quality, DRY, and Semantic Guard. Semantic Guard was added in ADR-0033 Wave 3 #9 as a peer reviewer (rather than a layer-pipeline step) — its lens is intentionally distinct from code-reviewer's general lens; reviewer-finding overlap with code-reviewer is handled ad-hoc by the Lead at Gate 3, the same way overlap between other reviewer pairs is already handled. Each reviewer covers a distinct, non-overlapping domain — no natural combination exists without diluting expertise. Reviewers work in parallel, so the added teammates do not significantly increase wall-clock time.
 

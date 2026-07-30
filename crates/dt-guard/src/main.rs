@@ -37,6 +37,7 @@ use dt_guard::ts_dev_trust;
 use dt_guard::ts_exports_map;
 use dt_guard::ts_metric_naming;
 use dt_guard::ts_pii;
+use dt_guard::ts_retained_credentials;
 use dt_guard::ts_secrets;
 use dt_guard::ts_test_removal;
 use std::path::PathBuf;
@@ -138,6 +139,15 @@ enum Command {
     },
     /// TS PII-in-logs scan: log-sink + structured-object + error-message checks.
     TsNoPiiInLogs {
+        /// Repository root for path resolution.
+        #[arg(long)]
+        root: PathBuf,
+        /// Emit single-line `EXPLAIN:` records per finding (ADR §7).
+        #[arg(long)]
+        explain: bool,
+    },
+    /// TS client credential-retention guard (task #58; retention-gated, full-tree).
+    TsNoRetainedCredentials {
         /// Repository root for path resolution.
         #[arg(long)]
         root: PathBuf,
@@ -376,6 +386,9 @@ fn run(cli: Cli) -> Result<()> {
         Command::GrafanaDatasources { root, explain } => grafana_datasources::run(&root, explain),
         Command::TsNoSecrets { root, explain } => ts_secrets::run(&root, explain),
         Command::TsNoPiiInLogs { root, explain } => ts_pii::run(&root, explain),
+        Command::TsNoRetainedCredentials { root, explain } => {
+            ts_retained_credentials::run(&root, explain)
+        }
         Command::TsNoTestRemoval { root, explain } => ts_test_removal::run(&root, explain),
         Command::TsNameGuardDtClient { root, explain } => ts_metric_naming::run(&root, explain),
         Command::TsNoDevTrustPathInProdBundle { root, explain } => {

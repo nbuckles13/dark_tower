@@ -48,7 +48,7 @@ Every devloop spawns **8 teammates** (Lead + Implementer + 7 reviewers). `name` 
 | Code Quality Reviewer | `code-reviewer` | `code-reviewer` | Rust idioms, ADR compliance |
 | DRY Reviewer | `dry-reviewer` | `dry-reviewer` | Cross-service duplication (see DRY exception in review protocol) |
 | Operations Reviewer | `operations` | `operations` | Deployment safety, rollback, runbooks |
-| Semantic Guard Reviewer | `semantic-guard` | `semantic-guard` | Diff-level anti-pattern checks per `scripts/guards/semantic/checks.md` (credential leak, actor blocking, error-context preservation, metrics path completeness). Distinct from code-reviewer's general lens (Rust idioms, ADR compliance, naming, error handling). Applies to non-test production code per `.claude/agents/semantic-guard.md` §Judgment Calibration. |
+| Semantic Guard Reviewer | `semantic-guard` | `semantic-guard` | Diff-level anti-pattern checks per `scripts/guards/semantic/checks.md` (e.g. credential leak, client credential lifetime — authoritative list: `scripts/guards/semantic/checks.md`). Distinct from code-reviewer's general lens (Rust idioms, ADR compliance, naming, error handling). Applies to non-test production code per `.claude/agents/semantic-guard.md` §Judgment Calibration. |
 | Paired Specialist (if `--paired-with=<specialist>`) | `paired-<specialist>` | `{specialist}` | Active collaborator during implementation + Gate 2 reviewer. When `<specialist>` is already a mandatory reviewer (security/test/observability/operations), the paired teammate replaces that slot with the same identity and an expanded role. |
 
 The Lead (orchestrator) is automatically named `team-lead` in the team config.

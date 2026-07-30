@@ -8,11 +8,45 @@
 //! * [`rust_pii`](crate::rust_pii) (Wave 2) — log/tracing macro argument check.
 //! * [`ts_pii`](crate::ts_pii) (Wave 2) — TS log call-site check.
 //!
-//! Plus two secret-identifier consumers:
+//! Plus three secret-identifier consumers:
 //! * [`rust_log_secrets`](crate::rust_log_secrets) (Wave 2) — secret variables in
 //!   `info!/debug!/etc.` macros.
 //! * [`instrument_skip_all`](crate::instrument_skip_all) (Wave 2) — sensitive
 //!   parameters under `#[instrument]` without `skip_all`.
+//! * [`ts_retained_credentials`](crate::ts_retained_credentials) (task #58) — the
+//!   **first TypeScript-side consumer of CATEGORY_A**. Every other CATEGORY_A
+//!   consumer is Rust-side, which is why camelCase reachability had never been
+//!   exercised before (see the `accessToken` note below).
+//!
+//! ## Consumer → category map (verified 2026-07-30, @code-reviewer)
+//!
+//! | Consumer | Reads |
+//! |---|---|
+//! | `rust_log_secrets`, `instrument_skip_all` | CATEGORY_A only |
+//! | `rust_pii`, `ts_pii` | CATEGORY_B only |
+//! | `metric_labels` | **BOTH** (sole dual consumer) |
+//! | `ts_retained_credentials` | CATEGORY_A only (TS-side) |
+//!
+//! This grouping is a *why-they-converge* summary, not an import manifest. Do not
+//! restate a consumer→category claim in an entry comment without checking it against
+//! this table — an inline claim of that shape has already been wrong once (below).
+//!
+//! ## CATEGORY_A is now read by TWO MATCHER FAMILIES — say which, always
+//!
+//! * **Word-boundary** (`\b(alternation)\b`) — `rust_log_secrets`, `instrument_skip_all`,
+//!   `metric_labels`. Cannot see inside camelCase: `\btoken\b` matches neither
+//!   `accessToken` nor `userToken`. Needs an explicit entry per camelCase spelling.
+//! * **Segment-equality** — `ts_retained_credentials` (task #58). Splits identifiers on
+//!   `_` and camelCase boundaries, so one `token` entry covers `userToken`,
+//!   `access_token`, `meetingToken`, … and per-spelling entries are redundant to it.
+//!
+//! **Consequence for anyone editing this catalog**: an entry can be simultaneously
+//! load-bearing for one family and redundant for the other, so **a redundancy claim
+//! that does not name a matcher family is not a claim.** Removing an entry because it
+//! is redundant under segment matching silently weakens the three word-boundary
+//! consumers — the exact mirror of the mistake the `accessToken` note records. State
+//! reachability by matcher SHAPE, not by consumer name, so the reasoning survives the
+//! next consumer being added.
 //!
 //! ## CATEGORY_A — non-bypassable secret identifiers
 //!
@@ -68,13 +102,123 @@ pub(crate) const PII_TOKENS_CATEGORY_A: &[&str] = &[
     "cred",
     "bearer",
     "auth_code",
-    // camelCase counterpart of `access_token` (task #11). The word-boundary +
-    // exact-match consumers (`\b(alternation)\b`) do NOT match camelCase
-    // `accessToken` via the existing `token` / `access_token` entries, so this is a
-    // genuine non-redundant secret identifier — needed for `ts_pii` detection of
-    // the camelCase wire field the browser SDK introduces. @security 2026-06-23.
+    // camelCase counterpart of `access_token` (task #11, @security sign-off
+    // 2026-06-23). Added so camelCase wire fields would be detectable under the
+    // word-boundary consumers (`\b(alternation)\b`), which cannot reach
+    // `accessToken` via `token` / `access_token`.
+    //
+    // CORRECTED 2026-07-30 (task #58 Gate 1, @code-reviewer + @paired-client). The
+    // original comment justified this entry as "needed for `ts_pii` detection of the
+    // camelCase wire field the browser SDK introduces". That was false the day it
+    // landed: `ts_pii` reads CATEGORY_**B** (see the consumer map in the module
+    // doc), so it never saw this entry. CATEGORY_A had no TypeScript consumer at all
+    // until `ts_retained_credentials` (task #58).
+    //
+    // Status now, stated by MATCHER SHAPE rather than by consumer name (see the
+    // two-matcher-families note in the module doc — naming consumers is what made the
+    // original comment rot):
+    //   * word-boundary matchers CANNOT reach `accessToken` via `token` /
+    //     `access_token`, so this entry is LOAD-BEARING for them. It fires against raw
+    //     line text, so it also covers literals, doc comments and
+    //     `#[serde(rename = "accessToken")]`.
+    //   * segment matchers resolve `accessToken` -> [access, token] -> `token` on their
+    //     own, so this entry is REDUNDANT for them.
+    //   * one word-boundary consumer (`metric_labels`) lowercases before matching, so
+    //     it cannot see this OR any other camelCase entry — a consumer defect, and the
+    //     next camelCase addition dies there on arrival too.
+    //
+    // KEEP. "Redundant under segment matching" is not "redundant" — removing it would
+    // be correct for the segment consumer and wrong for all three word-boundary ones,
+    // which is the mirror of the mistake this comment records.
     "accessToken",
 ];
+
+/// Credential-shaped subset of [`PII_TOKENS_CATEGORY_A`] — "is this field name a
+/// secret whose holder should stop holding it?"
+///
+/// A partition, not a second vocabulary: every entry is a CATEGORY_A member, and
+/// [`CREDENTIAL_TOKENS`] ∪ [`SESSION_TOKENS`] ∪ [`NON_CREDENTIAL_TOKENS`] is asserted
+/// **set-equal** to CATEGORY_A by `partition_is_total`. No fallthrough bucket, so a
+/// new CATEGORY_A term fails the build until someone classifies it deliberately.
+/// Set-equality rather than a member count (@dry-reviewer): a count test is invariant
+/// under a *rename*, which is exactly the mutation that makes `contains()` fail
+/// silently.
+///
+/// Co-located with the catalog on purpose: a security reviewer adding a CATEGORY_A
+/// term is confronted with the classification obligation at the point of edit, rather
+/// than leaving a consumer to under-match in silence.
+pub(crate) const CREDENTIAL_TOKENS: &[&str] = &[
+    "password",
+    "passwd",
+    "pwd",
+    "secret",
+    "cred",
+    "api_key",
+    "apikey",
+    "private_key",
+    "privkey",
+    "signing_key",
+];
+
+/// Token-shaped subset of [`PII_TOKENS_CATEGORY_A`] — "does the holder already have a
+/// bearer credential, which is what makes a retained password unnecessary?"
+pub(crate) const SESSION_TOKENS: &[&str] = &[
+    "token",
+    "bearer_token",
+    "access_token",
+    "refresh_token",
+    "session_token",
+    "id_token",
+    "jwt",
+    "bearer",
+    "accessToken",
+    "authorization",
+    "auth_header",
+    "auth_code",
+];
+
+/// CATEGORY_A members that are neither credential- nor token-shaped for the
+/// retained-credential question. Explicit rather than a fallthrough so a *forgotten*
+/// classification is distinguishable from a *deliberate* one.
+///
+/// Empty today — every CATEGORY_A term classifies into one of the other two buckets.
+/// It exists so that the next term which fits neither has a declared home instead of
+/// silently widening one of them, and is consumed by `partition_is_total_over_category_a`.
+// Consumed only by `partition_is_total_over_category_a`, so it is dead in the
+// non-test build. `cfg_attr` rather than a bare `expect` because an unconditional
+// expect is itself unfulfilled under `cfg(test)`.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "deliberately-empty third bucket of a total partition; its existence is what forces a deliberate classification for a future CATEGORY_A term"
+    )
+)]
+pub(crate) const NON_CREDENTIAL_TOKENS: &[&str] = &[];
+
+/// Alternate spellings for a CATEGORY_A term, matched by the **same segment-equality
+/// primitive** as every other term — deliberately NOT prefix matching.
+///
+/// Why this exists (@dry-reviewer): `cred` was catalogued meaning "credential-ish"
+/// while every consumer matched `\b…\b`, which cannot do morphology. The entry
+/// worked; its *intent* did not; and no test could have caught that, because the
+/// intent was not in the code. This converts implicit stem-intent into a declared,
+/// testable enumeration.
+///
+/// Why not an open prefix (`segment.starts_with("cred")`) — the worked example: it
+/// matches `creditCard` -> `[credit, card]`, and `credits`, `credited`,
+/// `creditLimit`. So `BillingInfo { creditCard, accessToken }` would raise a
+/// credential-retention finding whose rule ID misdescribes what it found.
+/// `credit_card` is already in [`PII_TOKENS_CATEGORY_B`], so the collision is with
+/// vocabulary this codebase already recognises. A finite list is auditable; a prefix
+/// rule grows silently with the English language.
+///
+/// Keys MUST be CATEGORY_A members — asserted by
+/// `stem_expansion_keys_are_catalog_members`. Without that test a rename of the key
+/// silently orphans the expansion: `credential`/`credentials` stop being detected and
+/// every existing test still passes.
+pub(crate) const STEM_EXPANSIONS: &[(&str, &[&str])] =
+    &[("cred", &["cred", "creds", "credential", "credentials"])];
 
 /// Identifier names that contain a CATEGORY_A substring but are NOT secrets.
 /// Additions require security co-owner sign-off (mirror of Wave-1 Python
@@ -210,6 +354,80 @@ mod tests {
     fn hashed_suffixes_cover_common_shapes() {
         for suf in &["_hash", "_sha256", "_digest"] {
             assert!(HASHED_SUFFIXES.contains(suf));
+        }
+    }
+
+    /// The partition must be TOTAL over CATEGORY_A — union set-equal, no fallthrough.
+    ///
+    /// Set-equality rather than a member count (@dry-reviewer, task #58): a count test
+    /// is invariant under a rename, which is the mutation that makes `contains()`-style
+    /// subset filtering fail *silently* — the subset shrinks, the guard quietly
+    /// under-detects, and every test still passes. Adding a CATEGORY_A term without
+    /// classifying it fails HERE rather than degrading a downstream guard.
+    #[test]
+    fn partition_is_total_over_category_a() {
+        use std::collections::BTreeSet;
+        let catalog: BTreeSet<&str> = PII_TOKENS_CATEGORY_A.iter().copied().collect();
+        let partition: BTreeSet<&str> = CREDENTIAL_TOKENS
+            .iter()
+            .chain(SESSION_TOKENS)
+            .chain(NON_CREDENTIAL_TOKENS)
+            .copied()
+            .collect();
+
+        let unclassified: Vec<&str> = catalog.difference(&partition).copied().collect();
+        assert!(
+            unclassified.is_empty(),
+            "CATEGORY_A terms with no partition bucket (classify each in \
+             CREDENTIAL_TOKENS / SESSION_TOKENS / NON_CREDENTIAL_TOKENS): {unclassified:?}"
+        );
+
+        let orphaned: Vec<&str> = partition.difference(&catalog).copied().collect();
+        assert!(
+            orphaned.is_empty(),
+            "partition entries that are NOT CATEGORY_A members (renamed or removed \
+             from the catalog?): {orphaned:?}"
+        );
+    }
+
+    /// The three buckets must not overlap — a term classified twice is ambiguous.
+    #[test]
+    fn partition_buckets_are_disjoint() {
+        for cred in CREDENTIAL_TOKENS {
+            assert!(
+                !SESSION_TOKENS.contains(cred),
+                "{cred:?} is in both CREDENTIAL_TOKENS and SESSION_TOKENS"
+            );
+            assert!(
+                !NON_CREDENTIAL_TOKENS.contains(cred),
+                "{cred:?} is in both CREDENTIAL_TOKENS and NON_CREDENTIAL_TOKENS"
+            );
+        }
+        for tok in SESSION_TOKENS {
+            assert!(
+                !NON_CREDENTIAL_TOKENS.contains(tok),
+                "{tok:?} is in both SESSION_TOKENS and NON_CREDENTIAL_TOKENS"
+            );
+        }
+    }
+
+    /// Referential integrity: every STEM_EXPANSIONS key must exist in CATEGORY_A.
+    ///
+    /// Without this, renaming `cred` in the catalog orphans the expansion — the key
+    /// matches nothing, `credential`/`credentials` quietly stop being detected, and
+    /// every other test still passes. Same failure family as the `contains()` subset
+    /// filtering above (task #58 §Lessons Learned, "Mode A").
+    #[test]
+    fn stem_expansion_keys_are_catalog_members() {
+        for (key, expansions) in STEM_EXPANSIONS {
+            assert!(
+                PII_TOKENS_CATEGORY_A.contains(key),
+                "STEM_EXPANSIONS key {key:?} is not a CATEGORY_A member — renamed?"
+            );
+            assert!(
+                expansions.contains(key),
+                "STEM_EXPANSIONS[{key:?}] must include the key itself"
+            );
         }
     }
 
