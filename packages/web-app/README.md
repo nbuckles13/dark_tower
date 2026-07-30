@@ -48,65 +48,31 @@ scripts/dev-web.sh            # preflight + install + codegen + launch
 scripts/dev-web.sh --check    # preflight only (no install/launch)
 ```
 
-Then open Chrome at `http://demo.localhost:5173`. You still need the cluster up
-(step 1) and the `/etc/hosts` entry (step 4) — the script detects and tells you,
-but can't do the privileged/cluster parts for you. The numbered steps below are
-what the script automates, plus the manual fallback.
+Then open Chrome at `http://demo.localhost:5173` and drive: **Sign up** →
+**Create meeting** (copy the code) → **Join** (paste the code). Open a second
+tab/profile at the same URL and join the same code to see `ParticipantJoined` in
+the first tab.
 
-Prereqs: Node 22 (`.nvmrc`), pnpm (`corepack enable`), a running host-side Kind
-cluster with AC + GC (+ MC + MH for the join step).
+You still need the Kind cluster up and (for WSL2-side tooling) the `/etc/hosts`
+entry — the script detects both and tells you, but can't do the
+privileged/cluster parts for you:
 
-1. **Bring up the Kind cluster** (AC, GC, MC, MH) with the host-side helper
-   (per ADR-0030):
+```bash
+./infra/kind/scripts/setup.sh                              # cluster: AC, GC, MC, MH
+echo '127.0.0.1  demo.localhost' | sudo tee -a /etc/hosts  # see the runbook — this is the WSL2-side file
+```
 
-   ```bash
-   infra/devloop/dev-cluster setup
-   ```
+Use `./infra/kind/scripts/setup.sh`, **not** `infra/devloop/dev-cluster setup`.
+The latter is the ADR-0030 in-container helper: it needs the devloop helper
+socket (which only exists inside a running devloop container) and it allocates
+dynamic ports bound to the podman host-gateway IP, so the fixed loopback ports
+this demo assumes would not be there.
 
-   The fuller operational runbook lands in this story as
-   `docs/runbooks/client-dev-local.md` (R-49, task #20 — Pending; not yet on this
-   branch). The demo assumes AC on host port **8443** and GC on host port
-   **8444** (loopback `127.0.0.1`, per R-37).
-
-2. **Seed a `demo` org** so sign-up has an org to register against (subdomain
-   `demo`) — handled by the Kind setup (R-38).
-
-3. **Generate dev certs + fingerprints** so the browser will accept the MC/MH
-   WebTransport certs:
-
-   ```bash
-   scripts/generate-dev-certs.sh      # writes infra/docker/certs/fingerprints.json (R-36)
-   ```
-
-   The fingerprints file is read at **Vite config time** — after regenerating
-   certs you must **restart `pnpm dev`** to pick up new hashes. Certs rotate on a
-   ≤14-day window, so a stale dev server is a common trap (see "Things that go
-   wrong").
-
-4. **Add the `/etc/hosts` entry** so the subdomain-qualified AC origin resolves
-   (AC extracts the org from the `Host` header):
-
-   ```
-   127.0.0.1  demo.localhost
-   ```
-
-5. **Install + run** (through Nx, so proto codegen runs first):
-
-   ```bash
-   pnpm install
-   pnpm nx run web-app:dev     # runs proto-gen:codegen (dependsOn) then vite
-   ```
-
-   > The protobuf-es client (`packages/sdk-core/src/proto/**/*_pb.ts`) is
-   > gitignored generated code produced by `proto-gen:codegen`, which the `dev`
-   > target `dependsOn` — so the Nx target generates it before starting vite.
-   > (`scripts/dev-web.sh` launches this way for you.)
-
-6. **Open Chrome at `http://demo.localhost:5173`** (the `demo.` prefix is
-   required so the AC auth proxy forwards the subdomain in the `Host` header).
-   Then: **Sign up** → **Create meeting** (copy the code) → **Join** (paste the
-   code). Open a second tab/profile at the same URL and join the same code to see
-   `ParticipantJoined` in the first tab.
+> **Full operational runbook: `docs/runbooks/client-dev-local.md`** — the
+> two-machine Windows/WSL2 topology (§0), which of the two Kind clusters you're
+> on (§1), step-by-step bring-up (§3), how to tell a real join from a false one
+> (§4), and ten first-run failure modes (§5). It owns the prose and the
+> diagnosis; this README is the quick start.
 
 ## Configuration
 
@@ -121,20 +87,23 @@ runtime, plain env for the proxy upstreams):
 | `VITE_AC_PROXY_TARGET` | `http://127.0.0.1:8443` | Dev-proxy upstream for `/api/v1/auth/*` (Host preserved) |
 | `VITE_GC_PROXY_TARGET` | `http://127.0.0.1:8444` | Dev-proxy upstream for `/api/v1/meetings` + `/api/v1/telemetry` |
 
+> **Unguarded coupling.** The two proxy-target ports above are `vite.config.ts`'s own hardcoded
+> defaults (its SSoT), but they must equal the `hostPort` values in `infra/kind/kind-config.yaml`.
+> The two constants are independent and **nothing enforces the match** — see `docs/TODO.md`
+> §Port Constant Scattering. A mismatch surfaces as `scripts/dev-web.sh` reporting AC/GC
+> unreachable, whose message says "is the Kind cluster up?" — the wrong diagnosis when the real
+> cause is that a `hostPort` moved and these defaults no longer point at it.
+
 ## Things that go wrong (first-run)
 
-Deep diagnosis lives in `docs/runbooks/client-dev-local.md` (R-49, lands as task
-#20). Quick pointers:
+**Owned by `docs/runbooks/client-dev-local.md` §5** — ten failure modes, each with
+a runnable discriminator, because several share a symptom. Not summarised here:
+a short list would have to pick which traps to omit, and the omitted ones are the
+expensive ones.
 
-1. **`fingerprints.json` missing/stale → WebTransport to MC/MH refused.** The
-   browser rejects the self-signed cert when the pin is absent or out of date.
-   Run `scripts/generate-dev-certs.sh` and **restart `pnpm dev`** (fingerprints
-   are read at Vite config time; certs rotate ≤14 days). HTTP views
-   (sign-up/create) still work without it — only join's media step fails.
-2. **`demo.localhost` doesn't resolve.** Add `127.0.0.1 demo.localhost` to
-   `/etc/hosts` and open the app at `http://demo.localhost:5173`.
-3. **Proxy `ECONNREFUSED` on AC/GC.** The Kind cluster / NodePorts (host
-   8443/8444) aren't up — bring up the cluster first.
+The two highest-frequency starting points: run `scripts/dev-web.sh --check`
+first, and if sign-up and create-meeting work while **only** join fails, you are
+in runbook §5 F1/F7/F8 — the WebTransport path — not a proxy problem.
 
 ## E2E contract (for tasks #18/#19)
 

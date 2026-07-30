@@ -396,7 +396,7 @@ Each `scripts/layerN.sh` is independently callable for targeted debugging (e.g.,
 | 4     | Test     | —                                           | rust, ts (proto has no `test.sh`)            |
 | 5     | Lint     | —                                           | rust, ts, proto                              |
 | 6     | Audit    | `cargo audit`, `pnpm audit`, `buf breaking` | —                                            |
-| 7     | Env-tests| dev-cluster + Rust env-tests + Playwright `@smoke` | —                                     |
+| 7     | Env-tests| dev-cluster + Rust env-tests (Playwright `@smoke`: pending #18/#19) | —                    |
 
 **Layer N/A justification template**:
 
@@ -417,6 +417,8 @@ The cases requiring implementer action are an unexpected `STATUS=N/A` outside th
 **Layer 7 — Env-tests (Integration)**:
 
 Layer 7 is the seventh shell-layer in `scripts/layer-all.sh`, executed automatically after layers 1-6. It always runs — intentionally broader than ADR-0030's trigger-path list, because business logic changes can break integration tests too. The full mechanism (cluster bring-up, two-phase classifier, the four STATUS lanes) lives in `scripts/layer7.sh`; failure-mode → REASON-token → fix mapping is in `docs/runbooks/devloop-validation.md §6.7`.
+
+**Today Layer 7 runs only the Rust env-tests** (`cargo test -p env-tests --features all`). The Playwright `@smoke` tier in the table above is ADR-0033's design target, **not yet built** — no `playwright.config.*`, no `@smoke` tag, and no `lang/ts/e2e.sh` exists. It lands with story tasks #18 (harness) and #19 (pipeline integration).
 
 **Lead policy** (the only bits not encoded in the script):
 - **Attempt budget**: Layer 7 = 2 attempts (separate from layers 1-6's 3). **Test failures** (`STATUS=FAIL`, exit 1) consume an attempt; **infrastructure/precondition failures** (`STATUS=PRECONDITION_FAILURE`, exit 2 — the operator lane) do NOT — retry once, then escalate to operations. First-run cluster setup (~7 min) does not count toward attempts.

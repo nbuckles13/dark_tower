@@ -40,7 +40,7 @@ for arg in "$@"; do
     case "$arg" in
         --check)      CHECK_ONLY=true ;;
         --no-install) DO_INSTALL=false ;;
-        -h|--help)    sed -n '2,33p' "$0"; exit 0 ;;
+        -h|--help)    sed -n '2,29p' "$0"; exit 0 ;;
         *) echo "Unknown arg: $arg (see --help)" >&2; exit 1 ;;
     esac
 done
@@ -139,7 +139,7 @@ check_port() {
        || curl -sS -o /dev/null --max-time 3 "http://127.0.0.1:${port}/" 2>&1 | grep -qv 'Connection refused'; then
         pass "${name} reachable on 127.0.0.1:${port}"
     else
-        fail "${name} not answering on 127.0.0.1:${port} — is the Kind cluster up? (infra/devloop/dev-cluster setup)"
+        fail "${name} not answering on 127.0.0.1:${port} — is the Kind cluster up? (./infra/kind/scripts/setup.sh)"
     fi
 }
 check_port "AC" "$AC_PORT"
@@ -157,12 +157,18 @@ fi
 # The join step dials MC (signaling) then MH (media) over QUIC/WebTransport at
 # the addresses GC advertises to the browser — read here from the service
 # configmaps, the SSoT for those values. Two failure modes this catches that the
-# AC/GC TCP probes above cannot:
-#   1. Cluster up but the MC/MH WT port has no host listener (nothing published).
-#   2. IPv4/IPv6 loopback mismatch — an advertise host of "localhost" resolves to
-#      IPv6 ::1 under WSL2 mirrored networking, while podman rootlessport binds
-#      IPv4 127.0.0.1 only. QUIC to ::1 gets no reply (UDP has no happy-eyeballs
-#      fallback) so signaling times out. IPv4-literal advertise avoids it.
+# AC/GC TCP probes above cannot: nothing published on the MC/MH WT port, and an
+# IPv4/IPv6 loopback family mismatch.
+#
+# The "why" for both — the WSL2 mirrored-networking address-family trap, and why
+# AC/GC keep working while only the join dies — is owned by
+# docs/runbooks/client-dev-local.md (§5 F1). Deliberately a pointer, not a copy:
+# this script is the fast path, the runbook is the source of prose/diagnosis.
+#
+# NOTE: the advertise addresses are read from the committed configmap files on
+# disk, which is correct for the static host topology this script targets. On a
+# devloop cluster the live ConfigMap is patched and the on-disk value is stale,
+# so a green result there does not mean the join will work (runbook §1, F8).
 WT_CONFIGMAPS=(
     infra/services/mc-service/mc-0-configmap.yaml
     infra/services/mc-service/mc-1-configmap.yaml
@@ -236,11 +242,16 @@ for cm in "${WT_CONFIGMAPS[@]}"; do
     check_wt_endpoint "$cm" "$label"
 done
 
-# ─── demo.localhost resolution (WARN — server starts regardless) ───
+# ─── demo.localhost resolution (WARN — WSL2-side tooling only) ───
+# This checks THIS machine's resolver (/etc/hosts + glibc). It is NOT the browser's:
+# a host browser reads its own hosts file, and Chromium resolves *.localhost to
+# loopback natively per RFC 6761 §6.3, so it typically needs no entry at all.
+# What breaks without the entry here is WSL2-side tooling — this preflight, and any
+# local curl/browser hitting ${DEMO_HOST}. See docs/runbooks/client-dev-local.md F6.
 if getent hosts "$DEMO_HOST" >/dev/null 2>&1 || grep -qE "[[:space:]]${DEMO_HOST}(\$|[[:space:]])" /etc/hosts 2>/dev/null; then
     pass "${DEMO_HOST} resolves"
 else
-    warn "${DEMO_HOST} does not resolve — the browser can't reach the app until you add it."
+    warn "${DEMO_HOST} does not resolve here — WSL2-side tooling (curl, this check) can't reach it."
     echo "      Fix: echo '127.0.0.1  ${DEMO_HOST}' | sudo tee -a /etc/hosts"
 fi
 

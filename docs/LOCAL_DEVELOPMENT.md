@@ -161,14 +161,21 @@ psql --version
 ./infra/kind/scripts/setup.sh
 ```
 
-This script deploys **infrastructure only**:
+This script deploys the **full local stack**:
 1. Create kind cluster with Calico CNI
 2. Deploy PostgreSQL and Redis
 3. Deploy observability stack (Prometheus, Grafana, Loki, Promtail)
-4. Run database migrations
-5. Set up port-forwarding
+4. Run database migrations, seed test + demo organizations
+5. Generate dev TLS certs and create the MC/MH TLS secrets
+6. Deploy the AC, GC, MC and MH services
+7. Set up port-forwarding
 
-**Note**: The AC service is NOT deployed by setup.sh. See "Deploy AC Service" below.
+**Note**: the services ARE deployed in-cluster by setup.sh. The "Deploy AC Service" section
+below covers running AC *locally* instead (cargo or Skaffold/Telepresence) for fast iteration —
+that is an alternative to the in-cluster pod, not a required step.
+
+> Running the **browser client** against this cluster has its own runbook:
+> `docs/runbooks/client-dev-local.md` (two-machine Windows/WSL2 topology, first-run failure modes).
 
 **First-time setup takes ~2-3 minutes.** The infrastructure stays up, so you only do this once per session.
 

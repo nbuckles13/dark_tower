@@ -143,6 +143,26 @@ This script deploys **infrastructure only**:
 
 **Note**: The AC service is NOT deployed by setup.sh. Developers run it locally.
 
+> **Amendment (2026-07-30, task #20).** The two statements immediately above are **no longer true
+> of the code** and are preserved only as the record of what was decided in 2025-12. `setup.sh`'s
+> `main()` now also calls `deploy_ac_service`, `deploy_gc_service`, `deploy_mc_service` and
+> `deploy_mh_service`, seeds the `devtest` and `demo` organizations, and generates the dev TLS
+> certs — so it deploys the **full local stack**, and AC *is* deployed in-cluster. Running AC
+> locally (cargo / Telepresence) remains supported, but as an alternative to the in-cluster pod
+> rather than a required step.
+>
+> **This amendment also governs three sections below**, which carry the same superseded
+> assumption and should be read under it: §Service Access, §Development Workflow (which still
+> calls local `cargo run` the "Primary workflow" with in-cluster as the alternative — that
+> ordering is now reversed in practice), and §Observability Matrix.
+>
+> The ADR's actual *decision* — a single-tier kind + podman local environment — is unaffected;
+> only implementation prose drifted underneath it. Current behaviour is documented in
+> `docs/LOCAL_DEVELOPMENT.md` § "Quick Start", and the browser-client path in
+> `docs/runbooks/client-dev-local.md`. Surfaced by @code-reviewer during task #20 review, when
+> correcting the identical wording in `docs/LOCAL_DEVELOPMENT.md` would otherwise have left these
+> two files disagreeing.
+
 ### Service Access
 
 | Service | Access Method | URL/Connection |

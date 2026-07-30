@@ -127,7 +127,7 @@
 
 - [ ] **MC/MH port constants duplicated across 6+ files with no single source of truth**: Host ports (4433, 4434, 4435, 4436), NodePorts (30433, 30434, 30435, 30436), and observability ports (9090/30090, 3000/30030, 3100/30080) are hardcoded independently in `infra/kind/kind-config.yaml`, `infra/services/{mc,mh}-service/service.yaml` (NodePort values), `infra/services/{mc,mh}-service/{mc,mh}-{0,1}-configmap.yaml` (advertise addresses), `infra/services/{mc,mh}-service/configmap.yaml` (bind addresses), `infra/docker/{mc,mh}-service/Dockerfile` (EXPOSE + bind defaults), `infra/kind/scripts/setup.sh` (print output), and `crates/env-tests/src/cluster.rs` (ClusterPorts::default). Changing a port in one file without updating all others causes silent breakage. Consider extracting port assignments to a shared config (e.g., `ports.env` sourced by setup.sh, referenced by Kustomize configMapGenerator). The new `kind-config.yaml.tmpl` (ADR-0030) correctly uses envsubst placeholders for its hostPorts, avoiding this issue for devloop clusters. Low priority — manual workflow only. **Update (R-37, task #4)**: the AC/GC host-side E2E ports are now also scattered — static host ports 8443 (AC) / 8444 (GC) and NodePort containerPorts 30082 (AC) / 30180 (GC) are hardcoded in `infra/kind/kind-config.yaml` (new AC/GC `extraPortMappings`), `infra/kind/kind-config.yaml.tmpl` (30082/30180 under `${HOST_PORT_*}`), `infra/kubernetes/overlays/kind/services/{ac,gc}-service/nodeport.yaml`, `infra/kind/scripts/setup.sh` (`print_access_info`), and the committed client config (`packages/web-app/vite.config.ts` proxy targets `127.0.0.1:8443/8444`). Same single-source-of-truth opportunity as MC/MH above.
 
-- [ ] **Auto rollout-restart on cert-secret recreate (R-49 / task #20 handoff)**: `scripts/generate-dev-certs.sh` now uses 14-day WebTransport leaf validity, so expiry is a routine dev event. On an already-running cluster, `setup.sh` regenerating an expiring leaf + recreating the `mc/mh-service-tls` Secret does NOT restart the pods serving the old leaf (`kubectl apply` is a no-op on unchanged Deployment specs), so the operator must manually `kubectl rollout restart deployment/mc-0 mc-1 mh-0 mh-1 -n dark-tower`. The `generate-dev-certs.sh` expiry hint prints this full manual sequence. Automating the rollout-restart in `setup.sh`'s secret-recreate path was deliberately deferred out of R-36 (it's a behavior change firing on ALL runs, including fresh setup — regression surface). Owner: R-49 dev runbook (task #20). Low priority — dev-loop only.
+- [ ] **Auto rollout-restart on cert-secret recreate in `setup.sh`**: `scripts/generate-dev-certs.sh` uses 14-day WebTransport leaf validity (Chrome's `serverCertificateHashes` cap), so expiry is a routine dev event. On an already-running cluster, `setup.sh` regenerating an expiring leaf + recreating the `mc/mh-service-tls` Secret does NOT restart the pods serving the old leaf (`kubectl apply` is a no-op on unchanged Deployment specs). **The remaining work is the automation only**: add the rollout-restart to `setup.sh`'s secret-recreate path. Deliberately deferred out of R-36 — it's a behavior change firing on ALL runs including fresh setup, so it carries regression surface and needs its own test cycle. The operator-facing manual sequence is **documented** in `docs/runbooks/client-dev-local.md` §5 F7 and printed by `generate-dev-certs.sh`'s expiry hint; do not restate it here. Owner: operations / infrastructure. Low priority — dev-loop only. (Was mis-owned to "R-49 dev runbook (task #20)"; task #20 produced prose and discharged the documentation half only — a runbook cannot deliver a `setup.sh` behavior change. Re-owned 2026-07-29 by task #20.)
 
 ## Env-Test Resilience & Runbook Validation
 
@@ -171,6 +171,7 @@
 
 ## Observability Debt
 
+- [ ] **MC emits no log event on the `MediaConnectionUpdate` success path — `statuses_count` is unreachable from logs at any `RUST_LOG` (browser-client-join Task #20 → MC observability)**: `handle_media_connection_update` (`crates/mc-service/src/webtransport/connection.rs:663-724`) carries `#[instrument(name = "mc.media_connection_update", fields(connection_id, statuses_count = update.statuses.len()))]`, but emits **no event on the success path** — its only log is a `debug!` on the actor-gone error branch (`:715-721`), which is itself invisible under the deployed `RUST_LOG=info,mc_service=debug` because the target `mc.webtransport.connection` does not prefix-match `mc_service`. Since `tracing_subscriber::fmt::layer().json()` (`crates/mc-service/src/main.rs:120`) writes one line per **event** and no `.with_span_events(...)` is configured, the span exists only as context on events that never occur. **Consequence**: `statuses_count` — the per-join media fan-out width, and the single richest completeness datum MC has — cannot be read from logs at any log level. The `mc_participant_mh_status_total{state}` counter (`crates/mc-service/src/actors/participant.rs:478`) is the only available substitute, and it is strictly weaker: it increments *inside* the per-entry loop, so an **empty** fan-out produces no increment at all and is indistinguishable from "the client never sent an update" — precisely the case (GC returns empty `media_servers`, client still reaches `joined`, MC still logs `Join succeeded`) that most needs an observable. **Action**: add an `info!` on the success path of `handle_media_connection_update` carrying `statuses_count` (and `connection_id`), target `mc.webtransport.connection` so it is visible at the deployed `info` global. ~3 LoC; the span field already computes the value. Then update `docs/runbooks/client-dev-local.md` §4.2, which currently documents the counter-delta workaround and explicitly warns readers **not** to reach for the span field — that warning can be removed once the event exists. Owner: observability (with meeting-controller — the edit is in MC's WebTransport connection handler). Surfaced 2026-07-29 during task #20 by @observability: the runbook draft cited a `jq` filter on the span name as "the completeness signal", which returns empty output on a healthy join — a phantom signal in a document that trains readers to treat absence as evidence. Caught at review; the runbook now uses the counter delta.
 - [ ] **R-56 inbound HTTP trace-context extraction for AC (browser-client-join Task #25 → GC #26 landed → AC follow-up)**: AC has no inbound gRPC boundary, so R-56's Tonic server-interceptor has no attach point; task #25 wired only the global W3C propagator (registered for free by `init_otel`). **UPDATE (task #26, 2026-07-03)**: the shared `common` HTTP-transport layer now exists — `crates/common/src/observability/otel_http.rs` (`--paired-with=observability`), framework-agnostic `HeaderInjector`/`HeaderExtractor` over `&http::HeaderMap` + `inject_trace_context`/`extract_trace_context` functions, mirroring `otel_grpc.rs`'s pattern. The producer side is also landed: GC's `ac_client.rs` now injects `traceparent`/`tracestate` on every GC→AC HTTP call (task #26 surface (b)), so AC's inbound requests carry a real header to extract, not a hypothetical one. **Remaining action**: AC itself still needs to wire `otel_http::extract_trace_context` at its own inbound HTTP boundary (axum middleware, same shape as GC's `middleware/otel.rs`) — that consumption is NOT part of task #26's scope (GC-only devloop) and remains open. **Security constraint (@security, unchanged)**: the extraction call reads only `traceparent`/`tracestate` — never `authorization` or any bearer header, and never copies header values into span attributes (enforced structurally by `otel_http.rs`'s write-only `HeaderInjector`/keyed-only `HeaderExtractor`, confirmed by @semantic-guard). Owner: auth-controller (consumption) + observability (layer, already landed). Surfaced 2026-06-25 (task #25); shared-layer blocker resolved 2026-07-03 (task #26).
 - [ ] **AC + GC `DEPLOYMENT_ENVIRONMENT` hardcoded `development` in the prod base configmap (browser-client-join Task #25 / #26 → prod OTel graduation)**: `infra/services/ac-service/configmap.yaml` and `infra/services/gc-service/configmap.yaml` both set `DEPLOYMENT_ENVIRONMENT: "development"` in the prod base; the Kind overlay only flips `OTEL_ENABLED` to `true`. OTel is dev-only + default-off (`OTEL_ENABLED=false` in base) today, so zero runtime impact — but once prod OTel graduates (`OTEL_ENABLED=true` in a prod overlay), prod telemetry would be mistagged `deployment.environment=development` for BOTH services. **Action**: prod OTel graduation MUST overlay-patch `DEPLOYMENT_ENVIRONMENT` (e.g. `production`) for every service that lands this pattern (AC done, GC done as of task #26; MC/MH will add the same footgun when #6/#27 land — carry this caveat forward to those tasks too). Owner: operations. Surfaced 2026-06-25 (task #25) by @operations (Gate-1 point 4); carried forward 2026-07-03 (task #26). **Update 2026-07-05 (task #6)**: MC now also ships `DEPLOYMENT_ENVIRONMENT: "development"` in its prod base (`infra/services/mc-service/configmap.yaml`) with the Kind overlay flipping only `OTEL_ENABLED` — so the same prod-mistag footgun now applies to MC. The prod-overlay `DEPLOYMENT_ENVIRONMENT` patch must cover ac + gc + mc (and mh once #27's base carries it).
 - [ ] **TS metric emission policy — Case A vs Case B (ADR-0033 follow-up)**: ADR-0033 (Polyglot Validation Pipeline) is silent on whether the TypeScript client emits its own application metrics (Case B — browser RUM / OpenTelemetry web SDK to a collector) or is purely a metrics consumer that reports server-side via API (Case A — server emits, no TS-side metric guards needed). The decision drives whether `validate-metric-coverage.sh` and `validate-application-metrics.sh` need to extend to TS file globs, whether `lang/ts/changed.sh` should treat metric-emission sites specially, and whether ADR-0032's presence-guard pattern generalizes to TS. **Action**: needs its own ADR or design discussion before client telemetry tasks (R-19, R-24, R-25, R-26, R-27 in browser-client-join story) land. Surfaced 2026-05-06 by observability in ADR-0033 Round 1.
@@ -304,6 +305,12 @@
 
 ## Developer Experience
 
+- [ ] **[next-up, infrastructure] Fix stale `scripts/dev/iterate.sh` path in setup.sh output.** `infra/kind/scripts/setup.sh:780,905` and `infra/kind/scripts/iterate.sh:8` reference `./scripts/dev/iterate.sh`, which does not exist; the script is at `infra/kind/scripts/iterate.sh` (correct form already documented in `scripts/README.md:26`). `:905` is inside the post-setup access-info block, so a first-time developer's **first instruction is an unresolvable path**. Spun out of task #20 to avoid growing a diff already under verdict. Owner: infrastructure. **Not backlog.**
+
+  Blast radius verified and bounded by @infrastructure, independently re-checked at task #20: **exactly 3 actionable lines across 2 files**, the file confirmed absent at `scripts/dev/` and present at `infra/kind/scripts/`, and the target path is not an inference — `scripts/README.md:26` already documents the correct form. So this is landable without re-deriving anything.
+
+  **One site that must NOT be swept**: `docs/devloop-outputs/2026-01-13-env-tests-security.md:200` also contains the stale path. That is a historical devloop record, not prescriptive prose — under the artifact-kind rule applied throughout task #20, records keep their original text. A naive `grep -rl | xargs sed` would rewrite history; scope the fix to the two live files.
+
 - [ ] **Resumable setup.sh**: Add a `--resume` flag to `infra/kind/scripts/setup.sh` that brings the cluster up to date without destroying it. Skip cluster creation if cluster exists, skip namespace creation if namespaces exist, skip image build+load if image tag unchanged, let `kubectl apply -k` handle idempotent infra updates. Currently any infra change requires a full teardown+rebuild (~5 min), when most steps could be skipped.
 - [x] **Pre-load third-party images into Kind**: Third-party images (postgres, redis, prometheus, grafana, loki, promtail, kube-state-metrics, node-exporter) are pulled from the internet by the Kind node on every cluster creation. Pull to host Docker/Podman cache first, then `kind load` into the cluster. Makes subsequent cluster recreations faster and offline-capable. Location: `infra/kind/scripts/setup.sh:preload_third_party_images()`.
 - [ ] **Skip unchanged service image builds**: `build_image` runs `docker build` for all 4 services on every `setup.sh` invocation, even when source code hasn't changed. The `COPY . .` planner stage uses the entire project root as build context, so changing any file invalidates all services' Docker caches. Two improvements: (a) add `.dockerignore` or narrow build context per service so changing GC doesn't invalidate AC's cache, (b) content-hash the relevant source files (`crates/{service}/`, `crates/common/`, `Cargo.toml`, `Cargo.lock`) and skip `build_image` + `kind load` entirely if the hash matches the previously-built image. Location: `infra/kind/scripts/setup.sh:build_image()`.
@@ -401,6 +408,8 @@ the operations brief. Related: see "Skip unchanged service image builds" under
 - [ ] **dt-guard subcommand-sprawl re-debate trigger** (2026-05-21, surfaced during Wave 2 #45 implementation per @code-reviewer item 5). Wave 2 #45 lands 23 subcommands; combined with Wave 1's 8, total = 31. ADR-0034 §When-to-Revisit names ≥10 as the "consider splitting" heuristic. Re-evaluate splitting `dt-guard` into 2-3 focused binaries (e.g., `dt-cite`, `dt-yaml-policy`) when one of three triggers fires: subcommand count reaches 40, OR `cargo build --release -p dt-guard` cold-cache time exceeds Layer-1 budget, OR `dt-guard --help` becomes unscannable for a contributor. Likely produces a `/debate` + ADR. Owner: code-reviewer + infrastructure. Pointer back: `docs/devloop-outputs/2026-05-20-wave2-bash-guards-dt-guard/main.md` §Decisions worth flagging "Subcommand sprawl" + §Accepted Deferrals.
 
 - [ ] **Python in the guard pipeline — language strategy + toolchain plumbing (debate-worthy)**. Surfaced 2026-05-14 during task #39-followup (`docs/devloop-outputs/2026-05-14-doc-citation-durability-guards/`) Gate-3 close-out when the user asked whether the new `.py` module was a fresh dependency. Audit found six pre-existing simple guards already use inline Python heredocs (`validate-alert-rules.sh`, `validate-infrastructure-metrics.sh`, `validate-dashboard-panels.sh`, `validate-application-metrics.sh`, `validate-metric-labels.sh`, `grafana-datasources.sh`) — multi-month convention, never formalized. Task #39-followup added the first **committed `.py` module** at `scripts/guards/lib/doc_cite_extract.py`, consumed via `sys.path.insert(0, "<repo_root>/scripts/guards/lib")` by three guards. Current gaps: no `requirements.txt` / `pyproject.toml` / version manifest anywhere; no Python interpreter version pin (devloop image relies on Debian-bookworm's system `python3` = 3.11, would drift silently on image bumps); no Python lint or type-check guard (Rust has clippy, TS has eslint, proto has buf lint — Python has nothing); no documented import convention; `__pycache__/` `.gitignore` entry added without a rationale comment. Three plausible end states for the debate to converge on: **(A) Standardize on Python** — formal `scripts/guards/lib/` package + `requirements.txt` + Python lint guard (e.g. ruff) + version pin in a shared shell helper; rewrite simple bash guards where Python would be cleaner. **(B) Standardize on bash** — rewrite the 6 existing heredoc guards in pure bash (or jq/yq for structured data); abandon the committed `.py` module + revert task #39-followup's Python module to bash. **(C) Formalized polyglot** — keep both with a written contract for choosing each (e.g., "structured data parsing → Python; pattern matching → bash") and add the missing Python toolchain plumbing. Suggested `/debate "Python in the guard pipeline — formalize, consolidate, or back away?"` with participants infrastructure (devloop image + scripts/) + operations (guards + runbooks) + security (Python ReDoS / supply chain) + test (guard validation surface) + code-reviewer (style + consistency + ADR compliance) + dry-reviewer (cross-guard duplication patterns). Likely produces an ADR. Out of scope: rewriting individual guard logic; this is about language strategy + toolchain plumbing only. Owner: operations (debate convener); resolution likely ADR-track.
+
+- [ ] **Layer-table row duplicated between `SKILL.md` and ADR-0033 has now intentionally diverged, with nothing recording why** (surfaced 2026-07-29 by @test at task #20 Gate 2). The Always-Run/Skip-If-Untouched Layer 7 row exists verbatim in two places: `.claude/skills/devloop/SKILL.md` (§Always-Run vs Skip-If-Untouched matrix) and `docs/decisions/adr-0033-polyglot-validation-pipeline.md` (§3 canonical layer table). Task #20 marked the SKILL.md copy "Playwright @smoke: pending #18/#19" and left the ADR copy reading "+ Playwright @smoke". **That divergence is correct, not a bug** — the two documents have different genres: SKILL.md is an operational instruction read present-tense by every devloop, so an unbuilt tier must be marked; the ADR is a design record of what was decided, and adding status markers to ADRs runs directly against the tracked decision in §Documentation Hygiene ("Remove status/tracking content from all ADRs — ADRs are now design records only"). The problem is that **the justification is written down nowhere**, so a future reader diffing the two rows sees a mismatch and may "correct" it in either direction — re-introducing the present-tense claim into SKILL.md, or pushing status content into the ADR. Fix options: (a) one inline note on the SKILL.md row stating it deliberately carries build-status the ADR does not, and why; (b) have the SKILL.md row cite the ADR as the design target rather than restating its text, so there is one copy. (b) is the CLAUDE.md single-source-of-truth answer and is the smaller surface. **Do NOT implement the guard shape originally proposed for this** (asserting the SKILL.md row against `scripts/layer7.sh`'s actual command): @test proposed it at Gate 1 and then withdrew it — such a guard would flag every legitimate forward reference as drift, which is exactly the pattern ADR-0033 §3 and the #56 Meta-note say to *mark pending*, not delete. A guard here would have to compare the two doc rows to each other, not either row to the script. Natural pickup is story task #19, which already opens `SKILL.md` `--paired-with=operations`. Owner: test (SKILL.md Layer-7 text) + operations (SKILL.md file). Provenance: task #20 Gate-1 row-7 exchange, @team-lead ruling 2026-07-29.
 
 ## Code Quality
 
@@ -589,6 +598,145 @@ The always-run `scripts/audit-suppressions-check.sh` (Layer-3 guard) hard-fails 
 ## Layer 7 Playwright Lane (ADR-0033 §3 vs `layer7.sh` drift)
 
 - [ ] **ADR-0033 §3 promises a Layer-7 Playwright lane that does not exist** (surfaced 2026-07-30 at task #58 Gate 1 by @test + @operations independently; **pre-existing drift, NOT introduced by #58** — recorded here rather than as a finding against that diff). ADR-0033:152 gives the Layer-7 row as "dev-cluster + Rust env-tests + Playwright `@smoke`", and :87 lists `e2e.sh # nx affected -t test:e2e (Playwright)` in the dispatcher layout. Neither exists: `scripts/layer7.sh:410` runs `cargo test -p env-tests --features all` and nothing else, `scripts/lang/ts/e2e.sh` is absent (ADR-0033:479 says it lands "when task #15 lands"), and `packages/web-app/playwright.config.ts` + `packages/web-app/e2e/` are task #18 deliverables. **Consequence at task #58**: verification item (c) ("`MeetingSession.join` succeeds against the live Kind cluster using ONLY a userToken") had no executable lane, and was re-scoped to #18 by joint @test + @operations ruling — the server half is covered by `crates/env-tests/tests/24_join_flow.rs::test_mc_webtransport_connect_and_join` (now pinned observationally via `AuthClient::call_count()`), the client half moves to #18. Between #58 and #18 the browser join path has **no live-cluster coverage at all**, and #58 is the commit that changed that path's contract. **Requirement on #18**: wiring the lane into `layer7.sh` (or `lang/ts/e2e.sh` + the Layer-7 call site) is part of the task, not a follow-up — specs that no layer invokes read as coverage and provide none, which is the same masked-coverage shape #58 spent its review budget removing. Either wire the lane or correct ADR-0033 §3 so the matrix stops promising it. Owner: test (#18) + operations (pipeline surface).
+## Dependency Vulnerabilities (pnpm audit)
+
+- [ ] **`pnpm audit` HIGH/CRITICAL advisories block Layer 6 branch-wide — 11 advisories, 6 packages** (surfaced 2026-07-29 at task #20 Gate 2). **Act soon** — a live CVSS 9.4; whether the ADR-0033 §12 MTTR tripwire has formally fired is **source-dependent and unresolved**, see below. Suggested spin-out slug `2026-07-30-dep-bump-vitest-brace-expansion`.
+
+  **Pre-existing, NOT introduced by task #20**: that devloop's diff is eight docs/scripts files and touches no `package.json` and not `pnpm-lock.yaml`, so `pnpm audit` returns an identical result with or without it. `cargo audit` passes; only the pnpm half is red. Any devloop running `scripts/layer-all.sh` on this branch sees the same failure until this lands.
+
+  **Owner**: client (owns the `packages/*` pins) + infrastructure co-sign (lockfile + pipeline). Security owns the policy call and re-verifies the two prod-graph commands at that devloop's Gate 2. Task #20 (operations) recorded this entry only; remediation is not operations-owned.
+
+  **Suppression posture — scoped per advisory, not blanket.** `audit-suppressions.toml` is untouched by task #20 and nothing has been added under §Suppressed Advisories.
+  - **GHSA-3jxr-9vmj-r5cp and GHSA-p63j-vcc4-9vmv: NOT suppressed, and must not be.** Both have in-range, semver-compatible fixes (verified per-parent below), so neither can make the "no in-range fix exists" claim that earns a slot in the manifest.
+  - **GHSA-mh99-v99m-4gvg: NOT suppressed either — it decomposes by path, and only two of three are blocked.** Its patched version is `>=5.0.8`, and whether that is in range depends entirely on which parent you are under (@security, 2026-07-30):
+
+    | Path | Parent declares | `5.0.8` in range? | Posture |
+    |---|---|---|---|
+    | `5.0.6` ← `minimatch@10.2.3` (`nx`, `typescript-eslint`, `api-extractor`) | `^5.0.2` | **YES** | **Fix now** — semver-compatible, no policy question |
+    | `1.1.15` ← `minimatch@3.1.5` (`eslint`) | `^1.1.7` | no | blocked in-range |
+    | `2.1.1` ← `minimatch@9.0.9` (`vite-plugin-dts`) | `^2.0.2` | no | blocked in-range |
+
+    **Do not write "GHSA-mh99 has no in-range fix"** — flat, that is false. It is fixable today on the widest consumer set. Suppression is reachable only for the `1.x`/`2.x` paths, only after step 3 below has been attempted and failed, and only **path-scoped** — never ID-wide (see the ID-scoping hazard below).
+
+  ### MTTR tripwire (ADR-0033 §12) — determination is SOURCE-DEPENDENT, not established
+
+  §12 measures from advisory **publication**, not discovery — but **GitHub and OSV disagree on both publication dates by roughly three weeks, in the same direction**, and the two sources give opposite answers:
+
+  | Advisory | GitHub published | OSV published | Age on GitHub | Age on OSV |
+  |---|---|---|---|---|
+  | GHSA-p63j-vcc4-9vmv (`@vitest/browser`, CVSS 9.4) | 2026-07-08 | 2026-07-21 | 22 days — **breached** | 9 days — **not breached** |
+  | GHSA-3jxr-9vmj-r5cp (`brace-expansion`, CVSS 7.7) | 2026-06-29 | 2026-07-20 | 31 days — **breached** | 10 days — **not breached** |
+
+  (Ages as at 2026-07-30.) **On GHSA dates both breach the 14-day threshold; on OSV dates neither does.** This entry deliberately does **not** resolve it by picking a source — @security explicitly declined to rule OSV canonical, and selecting whichever database is in front of you and asserting it is the exact move that produced several corrections during task #20.
+
+  So: "breached", "next-up not schedulable", and "§12's revisit clause has fired" are **true on one source and false on the other**, and are recorded here as unresolved pending a decision on which governs.
+
+  > **The underlying gap, which is the durable finding: ADR-0033 §12 says MTTR is measured from "advisory publication date" and never names a source of record.** That ambiguity is harmless while sources agree and decisive when they differ by three weeks — here it is precisely the difference between a fired tripwire and a comfortable margin. Security owns audit policy under §11 and is raising the ADR amendment separately, alongside the ID-scoping hazard below.
+
+  **Independent of which source governs**: the arithmetic still favours acting soon on a CVSS 9.4. But *"act soon because it is serious"* and *"the tripwire has fired"* are different claims, and only the first is established.
+
+  ### Installed versions
+
+  - `@vitest/browser` **4.1.8** — vulnerable (`>=4.0.0 <4.1.10`), target **4.1.10**. Four *exact* pins: `web-app` and `sdk-svelte` (`@vitest/browser` + `@vitest/browser-playwright`), and `sdk-core` via `@vitest/coverage-v8`.
+  - `brace-expansion` — **three** versions installed, and **all three are vulnerable**:
+
+    | Installed | Affected range (GHSA-3jxr) | Patched | Parent declares | Path |
+    |---|---|---|---|---|
+    | `1.1.15` | `<1.1.16` | `1.1.16` | `minimatch@3.1.5` → `^1.1.7` | `eslint@9.39.4` / `@eslint/config-array` |
+    | `2.1.1` | `>=2.0.0 <2.1.2` | `2.1.2` | `minimatch@9.0.9` → `^2.0.2` | `@vue/language-core@2.2.0` ← `vite-plugin-dts@4.5.4` ← devDeps of `sdk-core`, `sdk-svelte`, `test-utils` |
+    | `5.0.6` | `>=3.0.0 <5.0.7` | `5.0.7` | `minimatch@10.2.3` → `^5.0.2` | `@microsoft/api-extractor@7.58.7` ← `vite-plugin-dts@4.5.4`; also `@typescript-eslint/typescript-estree@8.62.0`; also `nx@20.3.0` |
+
+  > **Do not record `5.0.6` as non-vulnerable.** An early triage pass classified it that way and it is wrong — GHSA-3jxr-9vmj-r5cp's third range `>=3.0.0 <5.0.7` contains it. Independently confirmed against the upstream advisory by @team-lead and @security, and against our own `pnpm audit` output. The `5.x` path also reaches a **different consumer set** (`api-extractor`, `typescript-estree`, `nx`) than the `1.x`/`2.x` paths.
+
+  All three GHSA-3jxr overrides are **semver-compatible** — each patched version satisfies its parent's declared range (verified per-parent in the table above), so none is a major-version injection.
+
+  ### ⚠ The obvious three-override fix does NOT clear Layer 6
+
+  A **second** `brace-expansion` advisory is in play that the first triage pass missed:
+
+  | Advisory | Vulnerable | Patched | Hits |
+  |---|---|---|---|
+  | GHSA-3jxr-9vmj-r5cp | `<1.1.16`; `>=2.0.0 <2.1.2`; `>=3.0.0 <5.0.7` | `1.1.16` / `2.1.2` / `5.0.7` respectively | all three installed versions |
+  | **GHSA-mh99-v99m-4gvg** | **`<=5.0.7`** (flat, spans all majors) | **`>=5.0.8`** | **all three installed versions** |
+
+  Overrides of `1.1.16` / `2.1.2` / `5.0.7` clear GHSA-3jxr on all three paths but leave **GHSA-mh99 red on the `1.x` and `2.x` paths**, whose parents cannot admit `>=5.0.8` in range. The `5.x` path *can* (`^5.0.2`), so a single `5.0.8` override there closes **both** advisories on the widest consumer set at once.
+
+  ### Remediation order (@security ruling, 2026-07-30 — supersedes the earlier "three options")
+
+  1. **Fix the `5.x` path now** — override to `5.0.8`. Satisfies `^5.0.2`, and clears GHSA-mh99 *and* GHSA-3jxr there simultaneously (`>=5.0.7` ⊆ `>=5.0.8`). No policy question.
+  2. **Fix the `1.x`/`2.x` paths for GHSA-3jxr** with the semver-compatible `1.1.16` / `2.1.2`.
+  3. **Then evaluate parent bumps** for the two remaining GHSA-mh99 paths — `vite-plugin-dts` (and through it `@vue/language-core`) and `eslint`/`@eslint/config-array` — to releases whose `minimatch` admits a `5.x` `brace-expansion`. The `2.x` path is the more tractable: `vite-plugin-dts@4.5.4` is ours to bump directly. The `1.x` path runs through eslint's own pin and may genuinely be stuck.
+  4. **Suppression only if step 3 fails, and only path-scoped.** The manifest's admission criterion is "no in-range fix exists," which must be *established* per path by attempting the parent bump — not inferred from override arithmetic.
+
+  > **ID-scoping hazard, if it ever reaches step 4.** GHSA-mh99's range is `<=5.0.7` — flat, spanning all majors. An ID-scoped suppression justified by an exposure analysis of the `1.x`/`2.x` paths would **silently cover the `5.x` path too**, so if a future change ever dropped the `5.x` override the advisory would go quiet under a justification that never examined it. The verify-command-of-record for such an entry must therefore assert the `5.x` path is **fixed**, not merely that the prod graph is empty:
+  >
+  > ```
+  > pnpm why -r brace-expansion            # the 5.x line MUST show >=5.0.8; 1.x/2.x are the suppressed scope
+  > pnpm why -r --prod brace-expansion     # must print nothing
+  > pnpm why -r --prod @bufbuild/protobuf  # CONTROL
+  > ```
+
+  This is also the same "do we use `pnpm overrides` for remediation" convention question already open in the pre-existing `nx@20.3.0 → minimatch@9.0.3` entry (§Inter-Service Protocol Inconsistency, 2026-05-06); **resolve the two together** — same packages, same fork.
+
+  ### The other seven advisories
+
+  All transitive, all HIGH, none mentioned in the original triage. They must be cleared too or Layer 6 stays red:
+
+  | Package | GHSA | Vulnerable | Patched | Path |
+  |---|---|---|---|---|
+  | `axios` | GHSA-gcfj-64vw-6mp9 | `>=1.15.2 <1.18.0` | `>=1.18.0` | `nx > axios` |
+  | `fast-uri` | GHSA-4c8g-83qw-93j6 | `>=3.0.0 <3.1.3` | `>=3.1.3` | `sdk-core > vite-plugin-dts > @microsoft/api-extractor > @microsoft/tsdoc-config > ajv > fast-uri` |
+  | `fast-uri` | GHSA-v2hh-gcrm-f6hx | `>=3.0.0 <=3.1.3` | `>=3.1.4` | same as above |
+  | `js-yaml` | GHSA-52cp-r559-cp3m | `>=3.0.0 <3.15.0` | `>=3.15.0` | `nx > @yarnpkg/parsers > js-yaml` |
+  | `js-yaml` | GHSA-52cp-r559-cp3m | `>=4.0.0 <4.3.0` | `>=4.3.0` | `eslint > @eslint/eslintrc > js-yaml` |
+  | `postcss` | GHSA-r28c-9q8g-f849 | `<=8.5.17` | `>=8.5.18` | `eslint-plugin-svelte > postcss` |
+
+  ### Verify commands of record
+
+  ```
+  pnpm why -r --prod @vitest/browser     # must print nothing
+  pnpm why -r --prod brace-expansion     # must print nothing
+  pnpm why -r --prod @bufbuild/protobuf  # CONTROL: must print sdk-core, proving
+                                         # empty above means ABSENT, not silently failed
+  ```
+
+  The control line is load-bearing. An empty result nobody falsifies is a verification claim that has quietly become decorative. Verified 2026-07-30: both prod-graph checks empty; the control printed `@bufbuild/protobuf@2.12.0 └── @darktower/sdk-core@0.0.0 (dependencies)`.
+
+  **Fail-closed clause**: if either prod-graph command ever prints a consumer, the dev-only exposure argument below is void immediately, with no grace period.
+
+  ### Exposure
+
+  **Production exposure nil** — none of the six packages is in the prod graph or a shipped bundle; they are test runner, linter, build plugins and the Nx CLI. Both SDK packages are `private: true`, so there is no downstream publish/supply-chain surface either. Residual risk is **developer-workstation and CI-runner only**.
+
+  `@vitest/browser`'s CRITICAL is a Browser-Mode file-access permission-gate bypass — a test-runner sandbox escape, not a product vulnerability, and only while browser-mode tests run. **The 9.4 vector is AV:N and needs network access to the Browser Mode API.** Neither `packages/sdk-svelte/vitest.config.ts` nor `packages/web-app/vitest.config.ts` sets `test.api` / `api.host`, and nothing in the repo passes `--host` or `0.0.0.0`, so Browser Mode binds its loopback default. Write this down as **mitigated by configuration, not eliminated**: it is an *inherited* default with no guard behind it, and a loopback-bound API with no authorization is still reachable by any same-host process. **Spin-out scope therefore includes** setting `api: { host: '127.0.0.1' }` explicitly in both browser-mode configs, so the property is asserted rather than inherited.
+
+  `brace-expansion` is nil for a **second, independent** reason worth stating separately because it survives even if the packaging argument changes: the DoS input is a glob **pattern**, and every pattern on these paths originates from our own eslint config, `vite-plugin-dts`/`api-extractor` globbing our own source, or `nx`/`typescript-estree` walking repo-controlled config. Verified across all three consumer sets, including the `5.x` path's (`api-extractor`, `typescript-estree`, `nx`) — **analysed, not inherited by analogy from the `1.x`/`2.x` paths.** And killing the vector someone will inevitably ask about: `brace-expansion` expands the *pattern*, not the candidate, so a hostile filename in the workspace is never expanded as a glob.
+
+  ### Verification must not rely on `pnpm audit` going green
+
+  Assert **installed versions directly** rather than treating a clean audit as proof:
+
+  ```
+  pnpm why -r brace-expansion   # expect only >=1.1.16 / >=2.1.2 / >=5.0.7 (and >=5.0.8 if GHSA-mh99 is in scope)
+  pnpm why -r @vitest/browser   # expect >=4.1.10
+  ```
+
+  A green audit proves what the advisory feed knew at that moment, not what is installed. **Advisory ranges can be widened after publication**, so a package that audited clean last week can be in range today with no dependency change at all. Version assertions do not have that property.
+
+  > **Tombstone — do not re-add the worked example.** Earlier drafts of this entry asserted that GHSA-3jxr's `>=3.0.0` range specifically *"was added on 2026-07-20"*. That is **unverifiable, not merely unverified**: GitHub records only a `last updated` timestamp (which says *something* changed, not what), OSV records `published 2026-07-20 / modified 2026-07-21` with **all three ranges already present** and **no per-range history at all**, and neither database stores when an individual range entered an advisory. So the metadata that would substantiate it does not exist, and OSV showing all three ranges at its publication timestamp is mild evidence *against* it.
+  >
+  > The claim survived two retractions because each time it was re-derived as *support* for a conclusion everyone already agreed with. An unfalsified inference does not sit still — it gets cited, and each citation makes it look better-sourced than it is. The general property above needs no instance and the argument loses nothing without it.
+
+  ### On the "our feed lags upstream" claim — not reproducible, do not propagate
+
+  Two separate triage passes concluded that `pnpm audit` failed to flag `5.0.6` and that our advisory feed is behind upstream. **Re-derived twice from `pnpm audit --audit-level high --json` on 2026-07-30, that is not what our tooling does.** It reports all three GHSA-3jxr ranges, including `>=3.0.0 <5.0.7` against installed `5.0.6`, and it additionally reports GHSA-mh99-v99m-4gvg, which neither manual pass had at all:
+
+  ```
+  GHSA-3jxr-9vmj-r5cp | range=>=3.0.0 <5.0.7 | patched=>=5.0.7 | installed=5.0.6
+  GHSA-mh99-v99m-4gvg | range=<=5.0.7        | patched=>=5.0.8 | installed=5.0.6
+  ```
+
+  So the feed was **ahead** of the human summaries, not behind. The conclusion "`5.0.6` is vulnerable" was right; the stated reason was not. **Do not write that Layer 6 under-reports** — it would tell every future reader that a green audit is untrustworthy for a reason that is not true, and the genuinely good reason to distrust a green audit is the range-widening one above. If a run ever does reproduce the under-reporting, record the command and its output here, because this one does not.
 
 ## Guard Self-Test Cleanup
 
