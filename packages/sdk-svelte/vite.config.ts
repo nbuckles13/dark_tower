@@ -30,7 +30,7 @@ export default defineConfig({
     svelte(),
     dts({
       entryRoot: 'src',
-      outDir: 'dist',
+      outDirs: 'dist',
       tsconfigPath: './tsconfig.build.json',
       include: ['src/**/*'],
       exclude: ['src/**/__tests__/**', 'src/**/*.test.ts'],

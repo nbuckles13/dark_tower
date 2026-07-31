@@ -84,7 +84,7 @@ test('unauthenticated shell renders the Sign-up and Sign-in nav', async () => {
     'fetch',
     vi.fn(async () => jsonResponse({})),
   );
-  const screen = render(App, { config });
+  const screen = await render(App, { config });
 
   await expect.element(screen.getByTestId('nav-signup')).toBeInTheDocument();
   await expect.element(screen.getByTestId('nav-signin')).toBeInTheDocument();
@@ -99,7 +99,7 @@ test('authenticated shell removes the Sign-up and Sign-in nav', async () => {
       jsonResponse({ accessToken: 'user-token', tokenType: 'Bearer', expiresIn: 3600 }),
     ),
   );
-  const screen = render(App, { config });
+  const screen = await render(App, { config });
   await signUp(screen);
 
   await expect.element(screen.getByTestId('nav-signup')).not.toBeInTheDocument();
@@ -121,7 +121,7 @@ test('authenticated shell exposes no credential input anywhere', async () => {
       jsonResponse({ accessToken: 'user-token', tokenType: 'Bearer', expiresIn: 3600 }),
     ),
   );
-  const screen = render(App, { config });
+  const screen = await render(App, { config });
   await signUp(screen);
 
   await expect.element(screen.getByTestId('password')).not.toBeInTheDocument();
@@ -140,7 +140,7 @@ test('authenticated shell exposes no credential input anywhere', async () => {
 test('a 401 at join drops the session and restores the sign-in view', async () => {
   const { fetchImpl, urls } = authThenFail(401);
   vi.stubGlobal('fetch', fetchImpl);
-  const screen = render(App, { config });
+  const screen = await render(App, { config });
   await signUp(screen);
 
   await screen.getByTestId('nav-join').click();
@@ -168,7 +168,7 @@ test('a 401 at join drops the session and restores the sign-in view', async () =
 test('a 401 at create-meeting drops the session and restores the sign-in view', async () => {
   const { fetchImpl, urls } = authThenFail(401);
   vi.stubGlobal('fetch', fetchImpl);
-  const screen = render(App, { config });
+  const screen = await render(App, { config });
   await signUp(screen);
 
   // Sign-up lands on the create view already.
@@ -199,7 +199,7 @@ test('a 401 at create-meeting drops the session and restores the sign-in view', 
 test('a 403 at join PRESERVES the session — an authorization denial is not credential death', async () => {
   const { fetchImpl, urls } = authThenFail(403);
   vi.stubGlobal('fetch', fetchImpl);
-  const screen = render(App, { config });
+  const screen = await render(App, { config });
   await signUp(screen);
 
   await screen.getByTestId('nav-join').click();

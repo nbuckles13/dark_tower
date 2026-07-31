@@ -1,12 +1,14 @@
 {
   "extends": "../../tsconfig.base.json",
   "compilerOptions": {
-    "outDir": "dist",
+    // No `outDir` here: this config is typecheck-only (`noEmit`). Setting it
+    // makes TS 6 infer a `rootDir` of this package dir, which then rejects the
+    // cross-package sources the `paths` aliases below deliberately pull in
+    // (TS6059). The real emit is tsconfig.build.json, which sets both itself.
     "types": ["node"],
     "lib": ["ES2022", "DOM", "DOM.Iterable"],
     "moduleResolution": "Bundler",
     "noEmit": true,
-    "baseUrl": ".",
     "paths": {
       // TEST-ONLY type resolution: point the test-utils dependency at its TS
       // source so `tsc --noEmit` (lint) resolves `MockWebTransport`'s types

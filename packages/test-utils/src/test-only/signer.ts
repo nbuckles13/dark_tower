@@ -22,8 +22,12 @@ if (typeof process !== 'undefined' && process.env?.NODE_ENV === 'production') {
 const TEXT_ENCODER = new TextEncoder();
 
 interface SignerImpl {
+  // `<ArrayBuffer>` rather than a bare `Uint8Array`: WebCrypto's `subtle.sign`
+  // takes a `BufferSource`, and since TS 6 a bare `Uint8Array` widens to
+  // `Uint8Array<ArrayBufferLike>` — which admits `SharedArrayBuffer` and is
+  // therefore not assignable. Every caller here encodes its own buffer.
   /** Sign 64 bytes of EdDSA, returning the raw signature. */
-  sign(messageBytes: Uint8Array): Promise<Uint8Array>;
+  sign(messageBytes: Uint8Array<ArrayBuffer>): Promise<Uint8Array>;
   /** JWK representation of the public key. */
   publicJwk(): Promise<JsonWebKey>;
 }

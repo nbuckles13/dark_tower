@@ -35,7 +35,7 @@ test('sign-up renders the required testids and registers on submit', async () =>
     ),
   );
   let result: AuthSession | undefined;
-  const screen = render(SignUp, { config, onAuthed: (r: AuthSession) => (result = r) });
+  const screen = await render(SignUp, { config, onAuthed: (r: AuthSession) => (result = r) });
 
   for (const id of ['email', 'password', 'display-name', 'org-subdomain']) {
     await expect.element(screen.getByTestId(id)).toBeInTheDocument();
@@ -68,7 +68,7 @@ test('sign-in renders org-subdomain and surfaces a typed error on 401', async ()
       jsonResponse({ error: { code: 'unauthorized', message: 'bad credentials' } }, 401),
     ),
   );
-  const screen = render(SignIn, { config, onAuthed: () => {} });
+  const screen = await render(SignIn, { config, onAuthed: () => {} });
 
   for (const id of ['email', 'password', 'org-subdomain']) {
     await expect.element(screen.getByTestId(id)).toBeInTheDocument();

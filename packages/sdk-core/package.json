@@ -30,23 +30,23 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@bufbuild/protobuf": "2.12.0",
+    "@bufbuild/protobuf": "2.13.0",
     "@opentelemetry/api": "1.9.1",
-    "@opentelemetry/core": "2.8.0",
-    "@opentelemetry/exporter-metrics-otlp-proto": "0.219.0",
-    "@opentelemetry/resources": "2.8.0",
-    "@opentelemetry/sdk-metrics": "2.8.0",
-    "@opentelemetry/sdk-trace-web": "2.8.0",
-    "@opentelemetry/semantic-conventions": "1.41.1"
+    "@opentelemetry/core": "2.10.0",
+    "@opentelemetry/exporter-metrics-otlp-proto": "0.221.0",
+    "@opentelemetry/resources": "2.10.0",
+    "@opentelemetry/sdk-metrics": "2.10.0",
+    "@opentelemetry/sdk-trace-web": "2.10.0",
+    "@opentelemetry/semantic-conventions": "1.43.0"
   },
   "devDependencies": {
     "@darktower/test-utils": "workspace:*",
-    "@types/node": "22.10.5",
-    "@vitest/coverage-v8": "4.1.8",
-    "msw": "2.7.0",
-    "typescript": "5.7.3",
-    "vite": "^6.4.3",
-    "vite-plugin-dts": "^4.3.0",
-    "vitest": "^4.1.8"
+    "@types/node": "22.20.1",
+    "@vitest/coverage-v8": "4.1.10",
+    "msw": "2.15.0",
+    "typescript": "6.0.3",
+    "vite": "^8.2.0",
+    "vite-plugin-dts": "^5.0.3",
+    "vitest": "^4.1.10"
   }
 }

@@ -29,8 +29,12 @@ function toTelemetryEnv(mode: string): TelemetryEnv {
   return 'development';
 }
 
+// The `<ArrayBuffer>` argument is load-bearing: `serverCertificateHashes` wants a
+// `BufferSource`, and since TS 6 a bare `Uint8Array` widens to
+// `Uint8Array<ArrayBufferLike>`, which admits `SharedArrayBuffer` and so is not
+// assignable. Allocating from a length always yields a plain `ArrayBuffer`.
 /** Decode a base64 SHA-256 fingerprint into bytes for `serverCertificateHashes`. */
-function decodeBase64(b64: string): Uint8Array {
+function decodeBase64(b64: string): Uint8Array<ArrayBuffer> {
   const binary = atob(b64);
   const bytes = new Uint8Array(binary.length);
   for (let i = 0; i < binary.length; i++) {

@@ -162,7 +162,7 @@ ENV PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright \
 # `chmod -R a+rX` makes the cache world-readable + dir-traversable (least-privilege)
 # so --userns=keep-id mapped users can read it. The cache is intentionally
 # read-only at runtime; mutating the baked browser requires an image rebuild.
-ARG PLAYWRIGHT_VERSION=1.55.1
+ARG PLAYWRIGHT_VERSION=1.62.1
 RUN npx -y playwright@${PLAYWRIGHT_VERSION} install chromium \
  && chmod -R a+rX /opt/ms-playwright
 

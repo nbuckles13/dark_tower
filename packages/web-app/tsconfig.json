@@ -5,7 +5,6 @@
     "lib": ["ES2022", "DOM", "DOM.Iterable"],
     "moduleResolution": "Bundler",
     "noEmit": true,
-    "baseUrl": ".",
     "paths": {
       // Source-resolve the workspace SDK packages for svelte-check / editor so no
       // prebuilt `dist/` is required (mirrors sdk-core's test-utils alias).

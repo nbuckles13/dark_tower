@@ -12,7 +12,7 @@ import { MockMeetingSession } from './helpers/MockMeetingSession.js';
 
 test('component renders reactive store state and live roster', async () => {
   const session = new MockMeetingSession();
-  const screen = render(BoundHarness, { session });
+  const screen = await render(BoundHarness, { session });
 
   await expect.element(screen.getByTestId('state')).toHaveTextContent(MeetingSessionState.Idle);
 
@@ -33,7 +33,7 @@ test('component renders reactive store state and live roster', async () => {
 test('unmount tears down the subscription — no leak (post-unmount events ignored)', async () => {
   const session = new MockMeetingSession();
   let store: MeetingStore | undefined;
-  const screen = render(BoundHarness, {
+  const screen = await render(BoundHarness, {
     session,
     onStore: (s) => {
       store = s;

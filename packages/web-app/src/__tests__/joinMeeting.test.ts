@@ -36,7 +36,7 @@ const auth: AuthSession = {
 test('renders join controls and a live roster from the store', async () => {
   const session = new MockMeetingSession();
   holder.session = session;
-  const screen = render(JoinMeeting, { config, auth, onSessionInvalid: () => {} });
+  const screen = await render(JoinMeeting, { config, auth, onSessionInvalid: () => {} });
 
   await expect.element(screen.getByTestId('meeting-code')).toBeInTheDocument();
   await expect.element(screen.getByTestId('join-button')).toBeInTheDocument();
@@ -53,7 +53,7 @@ test('renders join controls and a live roster from the store', async () => {
 test('surfaces an error via last-error without leaking a non-allowlisted field', async () => {
   const session = new MockMeetingSession();
   holder.session = session;
-  const screen = render(JoinMeeting, { config, auth, onSessionInvalid: () => {} });
+  const screen = await render(JoinMeeting, { config, auth, onSessionInvalid: () => {} });
 
   const err = new SdkError(SdkErrorCode.Signaling, 'join rejected', { status: 401 });
   (err as { token?: string }).token = 'SECRET_TOKEN_123';

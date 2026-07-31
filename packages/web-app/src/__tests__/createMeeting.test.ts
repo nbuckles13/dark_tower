@@ -48,7 +48,7 @@ test('creates a meeting and shows the returned code', async () => {
   );
   vi.stubGlobal('fetch', fetchMock);
 
-  const screen = render(CreateMeeting, {
+  const screen = await render(CreateMeeting, {
     config,
     auth,
     onGoJoin: () => {},
