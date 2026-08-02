@@ -15,6 +15,7 @@ members = [
     "crates/env-tests",
     "crates/devloop-helper",
     "crates/dt-guard",
+    "crates/dt-story",
 ]
 
 exclude = [

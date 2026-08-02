@@ -920,3 +920,365 @@ After all devloops complete: run `/close-story browser-client-join` to verify co
 - **Re-open condition**: if wire-break frequency picks up materially (>2 per quarter), reconsider mechanism. The decision is reversible; the work has not been done.
 
 **Convention follow-up**: add the `Wire-Break:` commit-trailer pattern to `docs/protocol/CONVENTIONS.md` as part of a small docs-only change (no devloop required — protocol specialist can land directly on this branch when convenient).
+
+---
+
+## Task Metadata (dt-story manifest v1)
+
+```yaml
+# task-metadata (dt-story manifest v1)
+story: browser-client-join
+branch: feature/client-join-meeting-user-story
+tasks:
+- id: 1
+  status: completed
+- id: 2
+  status: completed
+- id: 3
+  status: completed
+- id: 4
+  status: completed
+- id: 5
+  status: completed
+- id: 6
+  status: completed
+- id: 7
+  status: completed
+- id: 8
+  status: completed
+- id: 9
+  status: completed
+- id: 10
+  status: completed
+- id: 11
+  status: completed
+- id: 12
+  status: completed
+- id: 13
+  status: completed
+- id: 14
+  status: completed
+- id: 15
+  status: completed
+- id: 16
+  status: pending
+  specialist: observability
+  env_tests: true
+  deps:
+  - 5
+  - 10
+  prompt: |
+    Ship the GC server-side observability artifacts for the telemetry proxy and
+    CORS layer (browser-client-join story requirements R-51 alerts/dashboard and
+    R-52 panel; Obs Task B). The metrics are ALREADY emitted by earlier tasks:
+    task #5 landed `gc_cors_preflight_total{origin_class, status}` and task #10
+    landed `gc_telemetry_ingest_total{status, payload_kind}` (status in
+    success/rejected_auth/rejected_size/rejected_rate/rejected_pii/error;
+    payload_kind in metric/trace/log), `gc_telemetry_ingest_duration_seconds{status}`
+    (p99 SLO < 200ms), `gc_telemetry_payload_bytes{payload_kind}`,
+    `gc_telemetry_rate_limited_total{reason}` (reason in per_user/per_org/global),
+    and `gc_telemetry_pii_attributes_dropped_total`. This task ships only the
+    alerting/dashboard/docs surface:
+    (1) `infra/docker/prometheus/rules/gc-alerts.yaml` gains two alerts —
+    GCTelemetryProxyHighRejectionRate (warn: rejection rate > 10% of ingest for
+    10m, suggests a broken client) and GCTelemetryProxySilent (page:
+    absent_over_time(gc_telemetry_ingest_total[15m]) gated by a 1h non-zero
+    baseline guard such as min_over_time, so day-1 zero traffic does not page).
+    Each alert carries a runbook_url annotation pointing at the incident sections
+    added in (4).
+    (2) `infra/grafana/dashboards/gc-overview.json` gains a new Telemetry Ingest
+    row with 5 panels: ingest rate by status, p50/p99 ingest duration, payload
+    size p99 by kind, rate-limit rejections by reason, CORS preflight rate by
+    origin_class. Do NOT create a new dashboard file — extend gc-overview.json.
+    (3) `docs/observability/metrics/gc-service.md` gains Telemetry Proxy Metrics
+    and CORS Preflight Metrics catalog sections documenting the metrics above.
+    (4) `docs/runbooks/gc-incident-response.md` gains the two scenario sections
+    the alert runbook_url annotations reference. The dt-guard alert-rules-policy
+    and dashboard-panels checks run in the validation pipeline — keep alert and
+    panel shapes compliant with them.
+- id: 17
+  status: completed
+- id: 18
+  status: pending
+  specialist: test
+  env_tests: true
+  deps:
+  - 3
+  - 4
+  - 6
+  - 8
+  - 15
+  - 58
+  prompt: |
+    Build the Playwright browser E2E harness and happy-path spec for the Dark
+    Tower browser client (story requirements R-40, R-44, R-46). New files under
+    `packages/web-app/`: `playwright.config.ts` (Chromium-only project, retries=0
+    per ADR-0028 flaky policy, single browser context by default),
+    `e2e/global-setup.ts` (reads MC_CERT_SHA256_B64 / MH_CERT_SHA256_B64 env vars
+    sourced from `infra/docker/certs/fingerprints.env` written by
+    `scripts/generate-dev-certs.sh`, and asserts the host-side Kind cluster is
+    reachable), and fixtures `bootstrapMeeting(adminToken)` (creates a meeting via
+    direct GC POST /api/v1/meetings, not through the demo UI),
+    `joinAsUser(page, meetingCode)`, and `waitForJoined(page)`.
+    Main spec `e2e/join-happy-path.spec.ts`: launch Chromium with fake media
+    flags, navigate to the Vite-served demo, drive sign-up -> create -> join.
+    IMPORTANT flow contract (post task #58): `MeetingSession.join` is token-based
+    — it reuses the authenticated session userToken and never re-authenticates.
+    There is no login step in the happy path, and the old JoinMeeting forced-login
+    band-aid (commit 7b69288) was removed by #58 — do not encode it. Assert:
+    (a) MC JoinResponse received with a participant_id, observed via the
+    `window.__darktower_test__` event-bus hook (gated by the __E2E_HOOKS__ Vite
+    define); (b) at least one MH WebTransport handshake succeeds for EVERY URL in
+    media_servers (active/active); (c) a second browser context joining the same
+    meeting fires ParticipantJoined in the first context within 5s; (d) the SDK
+    sends a MediaConnectionUpdate ClientMessage with state=CONNECTED for at least
+    one MH (drives task #6's MC handler end-to-end); (e) the token-only invariant
+    inherited from task #58 item c-iii: no credentials (email/password) appear on
+    any request at join time — join uses only the bearer userToken.
+    Requires a live host-side Kind cluster with AC+GC+MC+MH (NodePorts from task
+    #4: AC 127.0.0.1:8443, GC 127.0.0.1:8444). Reuse the port-forward/NodePort
+    pattern from `crates/env-tests/src/cluster.rs` (ADR-0030). Upload Playwright
+    trace artifacts on failure. Also write `e2e/README.md` documenting the
+    division of responsibilities versus the Rust env-test
+    `crates/env-tests/tests/24_join_flow.rs`, which stays unchanged: the browser
+    E2E adds real Chromium, the real WebTransport API, and real demo-page DOM —
+    the layer the Rust test cannot reach.
+- id: 19
+  status: pending
+  specialist: test
+  env_tests: true
+  deps:
+  - 18
+  prompt: |
+    Add the secondary negative-path browser E2E specs and wire the browser E2E
+    into the devloop validation pipeline (story requirements R-45 and R-48).
+    Three new spec files in `packages/web-app/e2e/`, reusing the harness and
+    fixtures task #18 landed:
+    (1) `auth-rejection.spec.ts` — an unauthenticated meeting-join surfaces a
+    typed AuthError in the demo UI; (2) `meeting-not-found.spec.ts` — a GC 404
+    for an unknown meeting code surfaces a typed error in the DOM;
+    (3) `mc-token-rejection.spec.ts` — the SDK obtains a real meeting token but
+    sends MC a garbage meeting_id, MC returns Unauthorized, and the SDK surfaces
+    a typed SignalingError.
+    Pipeline integration: edit `.claude/skills/devloop/SKILL.md` so the env-test
+    layer runs `pnpm --filter @darktower/web-app test:e2e` sequentially AFTER
+    `cargo test -p env-tests --features all` against the same live Kind cluster
+    (shared cluster setup, shared single-attempt budget). NOTE: the original
+    story text said Layer 8, but ADR-0033 renumbered env-tests to Layer 7, and
+    `scripts/layer7.sh` (filled by task #56) is now the mechanical entry point —
+    integrate there, and only trigger the browser E2E when `packages/**` or
+    `proto/**` changed or the backend diff touches the MC/AC/GC contract surface.
+    Extend `scripts/verify-completion.sh` to gate client `pnpm test:unit` +
+    `pnpm test:component` under LAYER >= standard and the browser E2E under
+    LAYER == full. This is a cross-boundary edit of the operations-owned SKILL.md
+    — run with `--paired-with=operations`. Consult
+    `docs/runbooks/devloop-validation.md` for the layer STATUS= contract; a
+    cluster-side precondition failure must surface as a precondition failure,
+    never as a test FAIL and never as a silent skip.
+- id: 20
+  status: completed
+- id: 21
+  status: pending
+  specialist: operations
+  env_tests: false
+  deps:
+  - 5
+  - 10
+  - 16
+  - 23
+  prompt: |
+    Documentation task (story requirement R-50): add smoke tests, alert-catalog
+    entries, and incident scenarios for the GC CORS layer (task #5) and telemetry
+    proxy (task #10).
+    (1) `docs/runbooks/gc-deployment.md` section Run Smoke Tests gains six new
+    curl stanzas: CORS preflight from an allowed origin (OPTIONS returns 204 with
+    correct Access-Control-Allow-Origin headers); CORS preflight from a
+    disallowed origin (403 or no ACAO header); telemetry proxy authenticated POST
+    -> 202; unauthenticated -> 401; oversize body over 256 KiB -> 413; rate-limit
+    burst of 70 sequential calls -> a mix of 202s then 429s. The telemetry smokes
+    POST the fixture `infra/smoke/empty-otlp-metrics.bin` (a minimal valid
+    OTLP-Metrics protobuf with zero data points, owned by observability — create
+    it here if task #16 has not already) with Content-Type
+    application/x-protobuf to /api/v1/telemetry/v1/metrics.
+    (2) Every curl example body or response-key reference touching AC/GC HTTP
+    APIs uses camelCase wire keys per R-53 and the task #51 single-rule ruling
+    (accessToken, tokenType, expiresIn — no snake_case anywhere, no per-field
+    OAuth carve-out).
+    (3) `docs/observability/alerts.md` catalog gains entries for the two new
+    alerts GCTelemetryProxyHighRejectionRate (warn) and GCTelemetryProxySilent
+    (page) — match the exact names and thresholds task #16 lands in
+    `infra/docker/prometheus/rules/gc-alerts.yaml`.
+    (4) `docs/runbooks/gc-incident-response.md` gains two scenarios with
+    detection/diagnosis/resolution: Telemetry proxy unreachable / rate-limit
+    storm, and CORS misconfig post-deploy.
+    Doc-citation guards (dt-guard cite checks) run in the validation pipeline —
+    cite real symbols and paths, no line-number citations.
+- id: 22
+  status: pending
+  specialist: infrastructure
+  env_tests: true
+  deps:
+  - 3
+  - 17
+  - 19
+  prompt: |
+    Devloop validation pipeline finalization for the browser-client story (R-48
+    infrastructure portion, T-INFRA-5). This is an alignment/verification task,
+    not new feature work: confirm the three legs the client E2E lane stands on
+    all agree, and fix any drift found now (fix, do not defer).
+    (1) The devloop image (task #3, `infra/devloop/Dockerfile`) has pnpm via
+    corepack and a pre-cached Playwright Chromium at /opt/ms-playwright, with
+    versions matching the workspace pins.
+    (2) Kind reachability (task #4): AC/GC NodePorts (127.0.0.1:8443 and
+    127.0.0.1:8444) and the cert-fingerprint flow
+    (`infra/docker/certs/fingerprints.env`) work from where the E2E runs.
+    (3) CI (`.github/workflows/ci-client.yml`, task #17) is green and its
+    lint/unit/component jobs match what `scripts/verify-completion.sh` gates
+    locally.
+    Then verify the Layer 7 hookup task #19 landed actually executes end-to-end:
+    `scripts/layer-all.sh` reaches `scripts/layer7.sh`, which runs
+    `cargo test -p env-tests --features all` followed by
+    `pnpm --filter @darktower/web-app test:e2e` against the same live Kind
+    cluster, with correct STATUS= reporting per
+    `docs/runbooks/devloop-validation.md` (a cluster precondition failure must
+    surface as PRECONDITION_FAILURE, not a test FAIL, and never as a silent
+    skip). NOTE: story text referencing Layer 8 is stale — ADR-0033 renumbered
+    env-tests to Layer 7. Document the verification run and any fixes applied in
+    the devloop output.
+- id: 23
+  status: completed
+- id: 24
+  status: completed
+- id: 25
+  status: completed
+- id: 26
+  status: completed
+- id: 27
+  status: completed
+- id: 28
+  status: completed
+- id: 29
+  status: completed
+- id: 30
+  status: completed
+- id: 31
+  status: completed
+- id: 32
+  status: completed
+- id: 33
+  status: completed
+- id: 34
+  status: completed
+- id: 35
+  status: completed
+- id: 36
+  status: completed
+- id: 37
+  status: completed
+- id: 38
+  status: completed
+- id: 39
+  status: completed
+- id: 40
+  status: completed
+- id: 42
+  status: completed
+- id: 43
+  status: completed
+- id: 44
+  status: completed
+- id: 45
+  status: completed
+- id: 46
+  status: completed
+- id: 47
+  status: completed
+- id: 48
+  status: completed
+- id: 49
+  status: completed
+- id: 50
+  status: completed
+- id: 51
+  status: completed
+- id: 52
+  status: completed
+- id: 53
+  status: completed
+  specialist: operations
+  env_tests: false
+  prompt: |
+    Tracking-table reconciliation task — almost certainly a no-op. Story row #53
+    (a devloop process change to catch Gate-3 narrow-scope rationalization via an
+    ESCALATED-SCOPE verdict mechanism plus a class-vs-instance question) was
+    deliberately NOT implemented: the user judged the structural mechanism's cost
+    above its expected steady-state benefit. Do NOT build the mechanism. The
+    agreed substitute was two low-ceremony nudges, and both were verified present
+    in the repo on 2026-08-01:
+    (1) an anti-pattern bullet in `.claude/skills/devloop/review-protocol.md`
+    (around line 96) rejecting the framing `the task did not ask for the other
+    instances` when a finding is one of N same-owner same-mechanism siblings —
+    fix the class or file a named same-owner follow-up, never leave it as out of
+    scope; (2) a mechanism-language planning hint in
+    `.claude/skills/devloop/SKILL.md` step 1 (around line 250) telling
+    implementers to restate instance-language tasks in mechanism-language and
+    surface wider same-owner classes to reviewers.
+    Verify both nudges are still present and intact; restore them if a later edit
+    dropped them. Otherwise simply record this row as resolved-by-decision in the
+    story's Devloop Tracking table. No other work is in scope.
+- id: 54
+  status: completed
+- id: 55
+  status: completed
+- id: 56
+  status: completed
+- id: 57
+  status: completed
+- id: 58
+  status: completed
+- id: 59
+  status: pending
+  specialist: security
+  env_tests: false
+  deps:
+  - 47
+  prompt: |
+    Narrow the Layer 6 audit dep-change gate to TRUE dependency-manifest changes
+    so ambient advisories stop failing unrelated devloops. Problem: pnpm audit
+    and cargo audit are ambient and time-varying — the only validation layer that
+    flips red with zero code change when a CVE is published overnight against the
+    unchanged lockfile — and the current gate over-triggers:
+    `scripts/lang/_audit_gate.sh` functions audit_dep_changed_ts /
+    audit_dep_changed_rust fall back to diff_touches_path on `packages/` /
+    `crates/`, and diff_touches_path in `scripts/lang/_changed_helpers.sh` is
+    prefix-only (awk index==1, no glob or suffix matching), so a source-only diff
+    such as packages/*/src runs audit and fails on an advisory unrelated to the
+    task. Design intent already exists: task #47 moved ambient coverage to
+    `.github/workflows/audit-scheduled.yml` (weekly cron, force-runs via
+    DEVLOOP_AUDIT_FORCE_RUN=1, files a GitHub issue on drift). This narrowing is
+    safe, not masking: a diff touching no dependency manifest provably cannot
+    change the resolved dependency graph. Scope:
+    (1) Add a suffix/glob predicate (diff_touches_glob or diff_touches_suffix)
+    to `scripts/lang/_changed_helpers.sh`, with self-tests.
+    (2) Rewrite audit_dep_changed_rust / audit_dep_changed_ts in
+    `scripts/lang/_audit_gate.sh` to match ONLY true dep manifests: root
+    Cargo.toml and Cargo.lock plus crates/*/Cargo.toml for rust; root
+    package.json, pnpm-lock.yaml, and pnpm-workspace.yaml plus
+    packages/*/package.json for ts. Drop the prefix over-trigger. PRESERVE
+    unchanged: the fail-closed tri-state (indeterminate or base-ref-resolution
+    failure still RUNS the scan), DEVLOOP_AUDIT_FORCE_RUN semantics, the
+    suppression-filter path, and audit-scheduled.yml as the ambient safety net.
+    (3) Amend ADR-0033 §3, `docs/runbooks/devloop-validation.md` Layer 6, and
+    the _audit_gate.sh header comments to document the narrowed gate and the
+    residual (a dep-changing devloop still gets a full-tree scan and may hit an
+    unrelated ambient advisory; suppression per tasks #47/#48 is the escape
+    hatch).
+    Verification matrix: source-only edits under packages/ and crates/ SKIP
+    audit (STATUS=SKIPPED-NO-DIFF); edits to any true dep manifest RUN it and
+    still FAIL on an unsuppressed high/critical advisory; indeterminate diffs
+    still RUN (fail-closed preserved); audit-scheduled.yml is unchanged; the
+    existing _audit_gate.sh, _changed_helpers.sh, and _dispatch.sh self-test
+    suites stay green. Out of scope: advisory-attribution set-diffs (deferred as
+    over-engineering), suppression-machinery changes, and unblocking whatever
+    specific advisory is currently red. Run paired with infrastructure.
+```

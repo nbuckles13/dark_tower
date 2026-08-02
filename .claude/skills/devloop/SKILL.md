@@ -606,6 +606,26 @@ Address the feedback above. The previous implementation is already in the codeba
 Follow the standard Implementer workflow + communication rules (see Step 3 Implementer prompt above).
 ```
 
+## Headless Mode (run-story)
+
+When the invocation prompt is prefixed with `HEADLESS RUN` (set by `scripts/workflow/run-story.sh`, which also sets `DEVLOOP_HEADLESS=1`), no human is available for the duration of the session. Two rules override every escalate-to-user path in this skill; nothing else changes — gates, reviewer panel, verdicts, and commit rules run exactly as in interactive mode.
+
+1. **Never wait for human input.** Every point where this skill would ask the user a question or present options — planning timeout (Step 5), validation attempts exhausted (Step 6), Gate 3 ESCALATED needing a Lead override the Lead cannot justify alone (Step 7), specialist disambiguation (Step 1; first apply the more-specific-match rule, escalate only if genuinely ambiguous), Layer 7 operator lane / any host-op the container cannot perform — becomes a terminal escalation instead: write the escalation file (below) and end the session. Do not improvise past a limit, relax a gate, or self-approve a risk acceptance to keep going.
+
+2. **The escalation file is the contract.** Write `.devloop-escalation.json` at the repo root:
+
+   ```json
+   {
+     "slug": "YYYY-MM-DD-{task-slug}",
+     "phase": "planning | implementation | validation | review | commit",
+     "reason": "planning-timeout | validation-attempts-exhausted | reviewer-escalated | disambiguation | host-op-needed | precondition-failure | other",
+     "detail": "one paragraph: what happened and what a human should decide",
+     "log_hints": ["paths to the most relevant logs or main.md sections"]
+   }
+   ```
+
+   The runner detects this file, records the escalation via `dt-story`, and stops the story. Do NOT commit partial work unless the gates passed (Step 8 rules unchanged); the runner independently treats "session ended with no new commit" as an escalation, so an aborted devloop needs no cleanup beyond writing this file and updating main.md's Phase.
+
 ## Limits
 
 | Phase | Limit | Action |

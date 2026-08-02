@@ -1,0 +1,34 @@
+# dt-story: state engine for the story runner.
+# Owns all reads/writes of a user story's embedded task manifest so bash
+# never parses YAML. Construction mirrors dt-guard (lib + thin clap binary,
+# workspace lints, workspace dependency versions where available).
+
+[package]
+name = "dt-story"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "dt-story"
+path = "src/main.rs"
+
+[lib]
+name = "dt_story"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_norway = "0.9.42"
+tempfile = "3"
+
+[dev-dependencies]
+assert_cmd = "2"
