@@ -123,8 +123,14 @@ while :; do
     escalate "$id" pipeline-red "$gatelog"
   fi
 
-  "$DT_STORY" complete "$STORY_FILE" "$id" --commit "$(git rev-parse HEAD)"
-  echo "STORY_RUN: COMPLETE task=${id} commit=$(git rev-parse --short HEAD)"
+  devloop_commit="$(git rev-parse HEAD)"
+  "$DT_STORY" complete "$STORY_FILE" "$id" --commit "$devloop_commit"
+  # Commit the manifest bump immediately: leaving it uncommitted fails the
+  # resume-time clean-tree check and would otherwise be swept into the next
+  # task's `git add -A` commit.
+  git add "$STORY_FILE"
+  git commit --quiet -m "chore(story): task #${id} complete (run-story manifest bump)"
+  echo "STORY_RUN: COMPLETE task=${id} devloop_commit=${devloop_commit:0:7}"
 done
 
 # Story-close gate: the full pipeline, layer 7 included, on the final tree.
