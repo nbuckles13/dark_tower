@@ -39,7 +39,11 @@ fi
 # Set up user-level Claude config files if mounted by devloop.sh
 mkdir -p "${HOME}/.claude"
 if [ -f /tmp/claude-user-settings.json ]; then
-    cp /tmp/claude-user-settings.json "${HOME}/.claude/settings.json"
+    # Container-specific env on top of the host settings: unlimited print-mode
+    # background wait — headless devloop Leads idle at gates far longer than
+    # the 10-minute default ceiling while teammates work (run-story runner).
+    jq '.env.CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS = "0"' \
+        /tmp/claude-user-settings.json > "${HOME}/.claude/settings.json"
 fi
 if [ -f /tmp/claude-user-config.json ]; then
     # Patch installMethod to match how Claude is installed in the container (npm),

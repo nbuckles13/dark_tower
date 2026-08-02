@@ -20,7 +20,20 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
 
-STORY_FILE="${1:?usage: run-story.sh <story-file.md>}"
+ARG="${1:?usage: run-story.sh <story-file.md | story-slug>}"
+if [ -f "$ARG" ]; then
+  STORY_FILE="$ARG"
+else
+  # Slug form: suffix match against docs/user-stories/, mirroring /close-story.
+  shopt -s nullglob
+  matches=(docs/user-stories/*"${ARG}".md)
+  shopt -u nullglob
+  case "${#matches[@]}" in
+    0) echo "STORY_RUN: no story file matches '${ARG}'" >&2; exit 2 ;;
+    1) STORY_FILE="${matches[0]}" ;;
+    *) echo "STORY_RUN: ambiguous slug '${ARG}' matches: ${matches[*]}" >&2; exit 2 ;;
+  esac
+fi
 DT_STORY="target/release/dt-story"
 RUN_DIR="${DEVLOOP_TMP:-/tmp/devloop}/story-runner/$(basename "${STORY_FILE%.md}")"
 mkdir -p "$RUN_DIR"
@@ -65,9 +78,14 @@ while :; do
 
   echo "STORY_RUN: START task=${id} specialist=${specialist} log=${tasklog}"
   set +e
+  # stream-json + verbose: default text mode prints only the final result at
+  # session end, leaving the log empty for the whole run. JSONL events make
+  # `tail -f` useful; filter with e.g.
+  #   jq -r 'select(.type=="assistant") | .message.content[]? | .text? // empty'
   DEVLOOP_HEADLESS=1 timeout "$TASK_TIMEOUT" claude -p \
     "$(printf 'HEADLESS RUN (run-story task #%s): follow the devloop skill including its Headless Mode section.\n/devloop "%s" --specialist=%s' \
         "$id" "$(cat "$prompt_file")" "$specialist")" \
+    --output-format stream-json --verbose \
     --dangerously-skip-permissions >"$tasklog" 2>&1
   claude_rc=$?
   set -e
