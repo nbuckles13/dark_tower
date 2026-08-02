@@ -166,14 +166,21 @@ ARG PLAYWRIGHT_VERSION=1.62.1
 RUN npx -y playwright@${PLAYWRIGHT_VERSION} install chromium \
  && chmod -R a+rX /opt/ms-playwright
 
-# Build-time smoke: catches missing shared libs (e.g., libcups2, libatk1.0-0)
-# that Playwright's install step does NOT detect (extraction != dlopen). Path
-# resolved via `playwright install --dry-run` so future on-disk layout changes
-# don't break this step silently — Playwright treats --dry-run output as a
-# tooling contract.
-RUN BROWSER_DIR="$(npx -y playwright@${PLAYWRIGHT_VERSION} install --dry-run chromium 2>&1 | awk '/^browser: chromium / {found=1; next} found && /Install location:/ {print $3; exit}')" \
- && test -x "${BROWSER_DIR}/chrome-linux/chrome" \
- && "${BROWSER_DIR}/chrome-linux/chrome" --version
+# Build-time smoke: catches missing shared libs (e.g., libnspr4, libcups2,
+# libatk1.0-0) that Playwright's install step does NOT detect (extraction !=
+# dlopen). We LOCATE the chrome binary by searching the baked browser root, not
+# by parsing `playwright install --dry-run`: that output is NOT a stable
+# contract. The 1.55 -> 1.62 bump broke BOTH the old dry-run header parse (line
+# changed from `browser: chromium ...` to `Chrome for Testing ... (playwright
+# chromium v<rev>)`) AND the on-disk layout (Chrome-for-Testing moved the binary
+# from chrome-linux/chrome to chrome-linux64/chrome). The glob below matches
+# either layout so a future rename won't silently break the build; `-name chrome`
+# excludes the (also-renamed) headless-shell binary, and an empty result fails
+# loud via `test -n`. Runtime browser resolution is Playwright's own job through
+# the version-pinned package; this step only proves the baked blob can dlopen.
+RUN CHROME="$(find "$PLAYWRIGHT_BROWSERS_PATH" -type f -name chrome -path '*/chrome-linux*/chrome' | head -1)" \
+ && test -n "$CHROME" && test -x "$CHROME" \
+ && "$CHROME" --version
 
 # Rollback: rebuild from prior commit (no state migration; named volumes are
 # toolchain-agnostic).
