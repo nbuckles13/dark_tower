@@ -60,7 +60,7 @@ function authThenFail(status: number): { fetchImpl: ReturnType<typeof vi.fn>; ur
 }
 
 /** Drive the real sign-up form to a real authenticated shell. */
-async function signUp(screen: ReturnType<typeof render>): Promise<void> {
+async function signUp(screen: Awaited<ReturnType<typeof render>>): Promise<void> {
   await screen.getByTestId('email').fill('user@example.com');
   await screen.getByTestId('password').fill('correct horse battery');
   await screen.getByTestId('display-name').fill('Ann');
