@@ -225,6 +225,40 @@ sum(rate(gc_meeting_creation_total[15m] offset 1h)) > 0
 
 ---
 
+#### GCTelemetryProxySilent
+
+**Severity**: Critical
+**Condition**: Zero telemetry ingest events for 15+ minutes, with events in the baseline hour before that (covers both silence shapes: flat counters while the pod is alive, and absent series after a restart)
+**Detection Delay**: ~20 minutes for the flat shape (15m rate window + 5m `for` clause)
+**Auto-Resolve Caveat**: resolves on its own after ~1h15m of continuous silence as the baseline window drains — resolution is not recovery; verify ingest rate is non-zero before closing
+**Impact**: Total loss of client-side observability; possible leading indicator of client-facing breakage (CORS, ingress, auth) the server cannot otherwise see
+**Runbook**: [Scenario 11: Telemetry Ingest Silent](../runbooks/gc-incident-response.md#scenario-11-telemetry-ingest-silent)
+
+**PromQL**:
+```promql
+(
+  sum(rate(gc_telemetry_ingest_total[15m])) == 0
+  and
+  sum(increase(gc_telemetry_ingest_total[1h] offset 15m)) > 0
+)
+or
+(
+  absent_over_time(gc_telemetry_ingest_total[15m])
+  and on()
+  (sum(increase(gc_telemetry_ingest_total[1h] offset 15m)) > 0)
+)
+```
+`for: 5m`
+
+**Response**:
+1. Check user-facing traffic first (`gc_http_requests_total` rate + error rate) — whole-service silence → Scenario 4
+2. Check CORS preflight outcomes (`gc_cors_preflight_total`) for a denied/403 spike
+3. Determine which silence shape fired (run the two branches separately); absent shape → check deploy/restart timeline (rolling restart in a low-traffic environment is a known benign trigger)
+4. Check 401s on `gc_http_requests_total{endpoint="/other"}` + GC logs (auth regression rejects telemetry pre-handler; `gc_jwt_validations_total` is service-token/gRPC-only — corroboration for shared JWKS root causes, never clearance for the HTTP user-token path)
+5. Rule out benign causes: client rollout disabled/sampled-down telemetry; natural traffic trough
+
+---
+
 ### Warning Alerts
 
 #### GCHighMemory
@@ -468,6 +502,34 @@ sum(rate(gc_meeting_join_total[5m])) > 0
 3. If `ac_request` errors present → check AC service health and token refresh
 4. If `not_found` errors dominate → check meeting lookup and database health
 5. Check "Meeting Join Success Rate (%)" gauge for current success rate
+
+---
+
+#### GCTelemetryProxyHighRejectionRate
+
+**Severity**: Warning
+**Condition**: Telemetry ingest rejection rate (`status=~"rejected_.*|error"`) >10% for >10 minutes, gated on non-zero traffic
+**Impact**: Client telemetry being dropped — degraded client-side observability; if `error` dominates with 502/503, the collector forwarding path is failing
+**Runbook**: [Scenario 10: Telemetry Proxy High Rejection Rate](../runbooks/gc-incident-response.md#scenario-10-telemetry-proxy-high-rejection-rate)
+
+**PromQL**:
+```promql
+(
+  sum(rate(gc_telemetry_ingest_total{status=~"rejected_.*|error"}[10m]))
+  /
+  sum(rate(gc_telemetry_ingest_total[10m]))
+) > 0.10
+and
+sum(rate(gc_telemetry_ingest_total[10m])) > 0
+```
+`for: 10m`
+
+**Response**:
+1. Split fault direction on the telemetry counter's own `status` values (`rejected_size`/`rejected_rate` → client fault; `error` → step 2)
+2. Split `error` via paired HTTP status codes — 400/415 client fault vs 502/503 collector fault (caveat: telemetry routes report as `endpoint="/other"` on `gc_http_*`, conflated with other unrecognized paths; confirm via GC logs)
+3. If rate-limited: check `gc_telemetry_rate_limited_total` by reason (client retry loop without backoff?)
+4. If client fault: correlate with web-app/SDK deploy timeline → Client/Web-App Team rollback
+5. If collector fault: check otel-collector health → Infrastructure/SRE
 
 ---
 

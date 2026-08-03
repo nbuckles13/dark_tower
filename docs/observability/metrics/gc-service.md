@@ -470,26 +470,43 @@ Metrics for the client telemetry proxy `POST /api/v1/telemetry/v1/{metrics,trace
 >   401 unauthenticated requests are rejected by the `require_user_auth` route
 >   layer BEFORE the handler runs, so the `IngestGuard` is never constructed and
 >   this value never increments. 401s are observable on `gc_http_requests_total`
->   `{status_code="401"}` and `gc_jwt_validations_total`, NOT here. (A runbook /
->   smoke test asserting a 401 — e.g. R-50/O-2 — must read `gc_http_*`, not this.)
+>   `{status_code="401"}` plus GC logs, NOT here — and NOT on
+>   `gc_jwt_validations_total` either (gRPC service-token path only; see the
+>   union bullet below). (A runbook / smoke test asserting a 401 — e.g.
+>   R-50/O-2 — must read `gc_http_*`, not this.)
 > - `gc_telemetry_ingest_total{payload_kind="log"}` — **declared, unemitted**.
 >   The `/v1/logs` route is not implemented this story (reserved); only `metric`
 >   and `trace` are emitted.
 > - `gc_telemetry_rate_limited_total{reason="per_org"|"global"}` — **reserved,
 >   unwired**. Only `per_user` is wired this story.
 >
-> The metric NAME + label spelling is a contract consumed by task #16's alerts
-> (`gc_telemetry_ingest_total` rejection-rate warn + absent-over-time page) — do
-> not rename without updating those alerts.
+> The metric NAME + label spelling is a contract consumed by the live alerts
+> `GCTelemetryProxyHighRejectionRate` and `GCTelemetryProxySilent`
+> (`infra/docker/prometheus/rules/gc-alerts.yaml`) — do not rename without
+> updating those alerts.
 >
-> **Two emitted-but-incomplete statuses needing a `gc_http` UNION in #16's
-> alerts** (the counter is honest, not complete, where pre-handler layers reject):
+> **Two emitted-but-incomplete statuses whose full picture needs a `gc_http`
+> UNION** (the counter is honest, not complete, where pre-handler layers reject):
 > - `rejected_size` — covers `(max_bytes, 2×max_bytes]` only; union with
->   `gc_http_requests_total{...,status_code="413"}` for gross overage (see the
->   `status` label note below).
+>   `gc_http_requests_total{endpoint="/other",status_code="413"}` for gross
+>   overage (see the `status` label note below and the endpoint caveat).
 > - `rejected_auth` is declared-unemitted (above), so its size-class analogue —
->   401 visibility — is `gc_http_requests_total{...,status_code="401"}` ∪
->   `gc_jwt_validations_total`.
+>   401 visibility — is `gc_http_requests_total{endpoint="/other",status_code="401"}`
+>   (approximate; see endpoint caveat) plus GC logs (authoritative).
+>   `gc_jwt_validations_total` does NOT provide this visibility — it records
+>   the gRPC service-token path only (user/guest HTTP tokens are never recorded
+>   on it); treat it as corroboration for shared JWKS/AC root causes, never as
+>   clearance for the HTTP user-token path telemetry uses.
+>
+> **Endpoint caveat (union selectors)**: `normalize_endpoint()`
+> (`crates/gc-service/src/observability/metrics.rs`) has no arm for
+> `/api/v1/telemetry/v1/{metrics,traces}`, so ALL telemetry requests emit
+> `endpoint="/other"` on `gc_http_*` series — conflated with every other
+> unrecognized path. An endpoint-scoped selector such as
+> `endpoint=~".*/telemetry/.*"` matches NOTHING today. Use
+> `endpoint="/other"` + `status_code` plus GC logs, and treat the split as
+> approximate until the telemetry normalization arm lands (tracked in
+> `docs/TODO.md` §Observability Debt).
 
 ### `gc_telemetry_ingest_total`
 - **Type**: Counter
@@ -507,10 +524,12 @@ Metrics for the client telemetry proxy `POST /api/v1/telemetry/v1/{metrics,trace
     It is NOT complete for the size class: a body ABOVE the `2×` ceiling (gross
     overage — the primary DoS/abuse case) is rejected by the `DefaultBodyLimit`
     layer PRE-handler and appears ONLY on
-    `gc_http_requests_total{status_code="413"}`, never here. **Alert authors
-    (task #16): the size-rejection class is the UNION**
+    `gc_http_requests_total{status_code="413"}`, never here. **Alert authors:
+    the size-rejection class is the UNION**
     `gc_telemetry_ingest_total{status="rejected_size"}` ∪
-    `gc_http_requests_total{endpoint=~".*/telemetry/.*",status_code="413"}` —
+    `gc_http_requests_total{endpoint="/other",status_code="413"}` (see the
+    endpoint caveat in the honesty block — telemetry routes normalize to
+    `/other` today) —
     do not key a size-rejection rate/absent alert on the telemetry counter alone
     (it has a documented blind spot above the ceiling). This is the intended
     trade-off of @security's two-tier cap (bounded handler buffering); the counter
@@ -519,7 +538,12 @@ Metrics for the client telemetry proxy `POST /api/v1/telemetry/v1/{metrics,trace
     (client fault) and collector-502 + disabled-503 (server fault). It does NOT
     distinguish them — split client-vs-server via the paired
     `gc_http_requests_total{status_code}` series (`415|400` vs `502|503`) for
-    triage. (Distinct error sub-statuses are a task #16 label-taxonomy decision.)
+    triage — with the endpoint caveat above (`endpoint="/other"` conflation).
+    (Distinct `error` sub-statuses were considered for the shipped alerts and
+    deliberately NOT split: `GCTelemetryProxyHighRejectionRate` keeps the
+    catalog-canonical `rejected_.*|error` selector — dropping `error` would
+    orphan the collector-down failure mode — and pushes the client-vs-collector
+    split to runbook triage.)
   - `payload_kind`: `metric`, `trace`, `log` (declared/unemitted). Derived from
     the route, never from payload content (always a bounded literal).
 - **Cardinality**: Low (6 × 3 = 18 max).
@@ -574,8 +598,15 @@ Metrics for the client telemetry proxy `POST /api/v1/telemetry/v1/{metrics,trace
   sum(rate(gc_telemetry_pii_attributes_dropped_total[5m])) by (kind)
   ```
 
-> Dashboards + alerts for these metrics are added by task #16 (observability
-> hand-off); this section documents the metric contract only.
+> **Dashboards**: `infra/grafana/dashboards/gc-overview.json`, rows
+> "Telemetry Ingest (R-2 / R-51)" (ingest by status, duration p50/p99, payload
+> size p99 by kind, rate-limit rejections by reason, PII drops by kind) and
+> "CORS Preflight (R-1 / R-52)".
+> **Alerting**: `GCTelemetryProxyHighRejectionRate` (warning) and
+> `GCTelemetryProxySilent` (page) — rules in
+> `infra/docker/prometheus/rules/gc-alerts.yaml`, inventory in
+> `docs/observability/alerts.md`, triage in
+> `docs/runbooks/gc-incident-response.md` Scenarios 10–11.
 
 ---
 

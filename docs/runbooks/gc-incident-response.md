@@ -3,7 +3,7 @@
 **Service**: Global Controller (gc-service)
 **Owner**: SRE Team
 **On-Call Rotation**: PagerDuty - Dark Tower GC Team
-**Last Updated**: 2026-02-28
+**Last Updated**: 2026-08-03
 
 ---
 
@@ -21,6 +21,8 @@
    - [Scenario 7: Token Refresh Failures](#scenario-7-token-refresh-failures)
    - [Scenario 8: Meeting Creation Limit Exhaustion](#scenario-8-meeting-creation-limit-exhaustion)
    - [Scenario 9: Meeting Code Collision](#scenario-9-meeting-code-collision)
+   - [Scenario 10: Telemetry Proxy High Rejection Rate](#scenario-10-telemetry-proxy-high-rejection-rate)
+   - [Scenario 11: Telemetry Ingest Silent](#scenario-11-telemetry-ingest-silent)
 4. [Diagnostic Commands](#diagnostic-commands)
 5. [Recovery Procedures](#recovery-procedures)
 6. [Postmortem Template](#postmortem-template)
@@ -81,6 +83,7 @@ Infrastructure Team / SRE Lead
 | **AC Team** | Token validation failures, JWKS issues, TokenManager problems | #ac-oncall, PagerDuty: AC-Team |
 | **MC Team** | MC assignment failures, MC connectivity issues | #mc-oncall, PagerDuty: MC-Team |
 | **Security Team** | Suspected breach, authentication bypass, audit log failures | #security-incidents (CRITICAL ONLY) |
+| **Client/Web-App Team** | Telemetry silent or rejected after a web-app/SDK rollout, CORS origin misconfiguration, client-side join failures | #client-oncall, PagerDuty: Client-Team |
 | **Product/Business** | Customer impact assessment, external communications | Engineering Manager escalates |
 
 ### External Dependencies
@@ -1086,6 +1089,229 @@ kill %1
 - If CSPRNG failure suspected, escalate to Security Team immediately — persistent entropy failures may indicate a compromised node and affect all cryptographic operations across services on that node
 - If database constraint issues, escalate to Database Team
 - If collisions persist after pod restart, escalate to Engineering Lead and Security Team — may require emergency code length increase and node-level investigation
+
+---
+
+### Scenario 10: Telemetry Proxy High Rejection Rate
+
+**Alert**: `GCTelemetryProxyHighRejectionRate`
+**Severity**: Warning
+**Runbook Section**: `#scenario-10-telemetry-proxy-high-rejection-rate`
+
+**Symptoms**:
+- Rejection rate above 10% of telemetry ingest for 10+ minutes
+- Metrics: `gc_telemetry_ingest_total{status=~"rejected_.*|error"}` elevated relative to total ingest
+- Client telemetry (browser metrics/traces) partially or fully missing from the collector
+- Possible client-side console errors on `POST /api/v1/telemetry/v1/{metrics,traces}` (413/429/400/415/502/503)
+
+**Diagnosis**:
+
+```bash
+# 1. FIRST: split fault direction on the telemetry counter's own status values
+# In Prometheus:
+sum by(status) (rate(gc_telemetry_ingest_total{status=~"rejected_.*|error"}[10m]))
+#   rejected_size / rejected_rate dominating -> CLIENT fault (broken or abusive client) -> continue here
+#   error dominating -> could be client fault (400/415) OR collector fault (502/503) -> step 2
+#   If collector fault confirmed in step 2 -> treat as a server-side error condition;
+#   follow Scenario 5 (High Error Rate) practices for the forwarding path
+
+# 2. Split the aggregated `error` status via paired HTTP status codes.
+# CAVEAT: telemetry routes currently normalize to endpoint="/other" on gc_http_* —
+# this series conflates ALL unrecognized paths, so treat it as approximate and
+# confirm via logs (see docs/TODO.md "Observability Debt" for the normalization fix).
+sum by(status_code) (rate(gc_http_requests_total{endpoint="/other", status_code=~"400|413|415|429|502|503"}[10m]))
+#   400/415 -> client sending malformed OTLP or wrong Content-Type (bad SDK rollout?)
+#   502/503 -> collector unreachable or telemetry disabled -> collector path, step 5
+
+# 3. Confirm via GC logs (authoritative, not conflated)
+kubectl logs -n dark-tower -l app=gc-service --tail=500 | grep -i "telemetry"
+
+# 4. If rejected_rate dominates: check rate-limit rejections by reason
+# In Prometheus:
+sum by(reason) (rate(gc_telemetry_rate_limited_total[10m]))
+# per_user -> one or few users hammering (client retry loop? abuse?) — check logs for user context
+
+# 5. If 502/503: check collector health and GC->collector connectivity
+kubectl get pods -n dark-tower -l app=otel-collector
+kubectl logs -n dark-tower -l app=otel-collector --tail=100
+
+# 6. Check payload sizes if rejected_size dominates (oversize client batches)
+# In Prometheus:
+histogram_quantile(0.99, sum by(payload_kind, le) (rate(gc_telemetry_payload_bytes_bucket[10m])))
+# NOTE: bodies above 2x the configured max are rejected PRE-handler (DoS backstop)
+# and appear only as gc_http 413s (step 2), never on the telemetry counter.
+```
+
+**Common Root Causes**:
+
+1. **Bad client/SDK rollout**: a web-app or SDK deploy started sending oversized batches, malformed OTLP, or wrong Content-Type
+   - Check: correlate rejection onset with web-app/SDK deploy timeline; 400/415 in step 2
+   - Fix: roll back the client release; escalate to Client/Web-App Team
+
+2. **Client retry loop hitting the rate limit**: a client bug retrying failed sends without backoff, tripping `per_user` limits
+   - Check: `gc_telemetry_rate_limited_total{reason="per_user"}` in step 4; GC logs for repeated users
+   - Fix: client-side fix (backoff); consider temporarily raising `telemetry_proxy_rate_limit_per_minute` only if legitimate traffic is being dropped
+
+3. **Collector path failing (502/503)**: OTel collector down, unreachable, or telemetry disabled in config
+   - Check: step 5; `error` status + 502/503 in step 2
+   - Fix: restore collector (see infra runbooks); if intentional (telemetry disabled), silence the alert for the maintenance window
+
+4. **Abusive/oversize sender**: a single origin pushing large payloads (rejected_size) — possible probing
+   - Check: step 6 payload p99 vs the 256 KiB bucket ceiling; GC logs for user context
+   - Fix: rate-limit or block at ingress; escalate to Security Team if abuse suspected
+
+**Remediation**:
+
+```bash
+# Option 1: Roll back a bad client release (Client/Web-App Team executes)
+# Expected recovery time: minutes after rollout completes; rejection rate drops as clients reload
+
+# Option 2: Restore the collector path
+kubectl rollout restart deployment/otel-collector -n dark-tower
+kubectl rollout status deployment/otel-collector -n dark-tower
+# Expected recovery time: 1-2 minutes; error-status rate drops immediately after
+
+# Verify recovery — rejection share should fall back under 10%
+# In Prometheus:
+sum(rate(gc_telemetry_ingest_total{status=~"rejected_.*|error"}[10m]))
+  / sum(rate(gc_telemetry_ingest_total[10m]))
+```
+
+**Escalation**:
+- If rejections correlate with a client release, escalate to Client/Web-App Team for rollback
+- If collector infrastructure is down, escalate to Infrastructure/SRE
+- If abuse suspected (rate-limit or oversize probing from few users), escalate to Security Team
+- If rejection taxonomy looks wrong (e.g., legitimate payloads rejected as oversize), escalate to GC Team
+
+---
+
+### Scenario 11: Telemetry Ingest Silent
+
+**Alert**: `GCTelemetryProxySilent`
+**Severity**: Page
+**Runbook Section**: `#scenario-11-telemetry-ingest-silent`
+
+> **Why this pages**: total loss of client-side observability, and possibly the
+> leading indicator of client-facing breakage (CORS, ingress, auth) that the
+> server cannot otherwise see. Expected detection delay is ~20 minutes for the
+> flat-counter shape (15m rate window + 5m for clause).
+
+> **Auto-resolve is NOT recovery**: after ~1h15m of continuous silence the 1h
+> baseline window drains and the alert resolves on its own while ingest may
+> still be dead. Before closing any incident, verify
+> `sum(rate(gc_telemetry_ingest_total[15m])) > 0`.
+
+**Symptoms**:
+- No `gc_telemetry_ingest_total` events for 15+ minutes despite traffic in the prior hour
+- Telemetry Ingest dashboard row flat or empty
+- Client dashboards fed by the collector stop updating
+
+**Diagnosis**:
+
+```bash
+# 1. FIRST: is this user-impacting? Check user-facing traffic and error rate.
+# In Prometheus:
+sum(rate(gc_http_requests_total[5m]))
+sum(rate(gc_http_requests_total{status_code=~"[45].."}[5m])) / sum(rate(gc_http_requests_total[5m]))
+#   ALL GC traffic near-zero -> whole-service problem -> go to Scenario 4 (Complete Service Outage)
+#   Traffic normal, only telemetry silent -> telemetry-scoped, continue here
+
+# 2. Check CORS preflight outcomes — a CORS misconfiguration blocks browser
+# telemetry (and possibly all browser API calls) before requests reach handlers
+# In Prometheus:
+sum by(origin_class, status) (rate(gc_cors_preflight_total[15m]))
+#   denied/403 spiking -> CORS misconfig or unexpected origin -> check GC config
+#   (denied-preflight warn logs carry the structured requested_origin field)
+
+# 3. Which silence shape fired? Run the two alert branches separately.
+# Flat shape (pod alive, traffic stopped):
+sum(rate(gc_telemetry_ingest_total[15m])) == 0
+# Absent shape (series gone — pod restarted, nothing arrived since):
+absent_over_time(gc_telemetry_ingest_total[15m])
+#   Absent shape -> check the deploy/restart timeline FIRST:
+kubectl get pods -n dark-tower -l app=gc-service -o wide   # look at pod AGE
+#   A rolling restart in a low-traffic environment is a known benign trigger —
+#   the counter registers lazily on the first request after restart.
+
+# 4. Check 401s — an auth regression rejects telemetry at the route layer,
+# BEFORE the handler, so it produces silence on the telemetry counter (the
+# declared rejected_auth status is never emitted; 401s land on gc_http only).
+# Same endpoint="/other" conflation caveat as Scenario 10 step 2.
+sum(rate(gc_http_requests_total{endpoint="/other", status_code="401"}[15m]))
+# GC logs are the AUTHORITATIVE user-token 401 diagnosis (not conflated):
+kubectl logs -n dark-tower -l app=gc-service --tail=500 | grep -i "unauthorized\|401"
+# Corroboration ONLY — the following counter covers the gRPC SERVICE-token path
+# exclusively (user/guest HTTP tokens are never recorded on it), so a failure
+# spike here is meaningful when the root cause is shared (JWKS/AC-side key
+# regression hits both paths), but a healthy series does NOT clear the HTTP
+# user-token path that telemetry uses:
+sum by(result, failure_reason) (rate(gc_jwt_validations_total[15m]))
+
+# 5. Check for a client rollout that disabled or sampled-down telemetry
+# (benign): recent web-app/SDK deploys, telemetry flag/sampling config changes
+
+# 6. Natural traffic trough check (benign): if gc_http traffic is also near-zero
+# AND the error rate is normal, this is likely just no users online — not an
+# incident. NOTE: recurring trough pages are an Alertmanager time-of-day routing
+# concern, not a rule-threshold change (GCMeetingCreationStopped precedent).
+```
+
+**Common Root Causes**:
+
+1. **Whole-service or ingress outage**: GC itself is down or unreachable
+   - Check: step 1
+   - Fix: go to Scenario 4 (Complete Service Outage)
+
+2. **CORS misconfiguration**: allowed-origins list regressed; browsers blocked at preflight. NOTE: the allowlist is fail-closed — an EMPTY `CORS_ALLOWED_ORIGINS` blocks ALL cross-origin browser requests, which is exactly the misconfig shape that produces total telemetry silence
+   - Check: step 2 denied/403 spike; then the knob itself:
+     `kubectl get configmap gc-service -n dark-tower -o yaml | grep CORS`
+     (`CORS_ALLOWED_ORIGINS`, comma-separated explicit origins, never `*` —
+     set in `infra/services/gc-service/configmap.yaml` + env overlays, read by
+     `crates/gc-service/src/config.rs`)
+   - Fix: correct `CORS_ALLOWED_ORIGINS` in the gc-service ConfigMap and restart; expected recovery 2-3 minutes
+
+3. **Auth regression on the telemetry route**: clients getting 401s pre-handler
+   - Check: step 4
+   - Fix: identify the auth change (JWKS, token validation); see Scenario 7 for AC-side token issues
+
+4. **Rolling restart in a low-traffic environment (benign)**: absent-series shape; counter registers lazily on first post-restart request
+   - Check: step 3 pod AGE vs alert firing time
+   - Fix: none needed if the first real telemetry request lands; verify with the recovery query
+
+5. **Client rollout disabled/sampled-down telemetry (benign-ish)**: web-app deploy turned telemetry off or sampling to ~0
+   - Check: step 5 deploy timeline
+   - Fix: confirm intent with Client/Web-App Team; if unintended, roll back the client release
+
+6. **Natural traffic trough (benign)**: nobody online
+   - Check: step 6
+   - Fix: none; close as non-incident after the recovery-verification query is understood
+
+**Remediation**:
+
+```bash
+# Option 1: Fix CORS origin allowlist — edit CORS_ALLOWED_ORIGINS in the
+# gc-service ConfigMap (infra/services/gc-service/configmap.yaml / env overlay;
+# comma-separated explicit origins, never "*"; empty = fail-closed, ALL
+# cross-origin browser requests blocked), then:
+kubectl rollout restart deployment/gc-service -n dark-tower
+kubectl rollout status deployment/gc-service -n dark-tower
+# Expected recovery time: 2-3 minutes + client page reloads
+
+# Option 2: Roll back a client release that broke/disabled telemetry (Client/Web-App Team)
+# Expected recovery time: minutes after rollout; ingest resumes as clients reload
+
+# Option 3: Whole-service outage -> Scenario 4 procedures
+
+# Verify recovery (REQUIRED before closing — the alert can auto-resolve while still broken):
+# In Prometheus:
+sum(rate(gc_telemetry_ingest_total[15m])) > 0
+```
+
+**Escalation**:
+- If whole-service outage, follow Scenario 4 escalation (Engineering Lead after 30 min)
+- If CORS/auth regression from a GC config or code change, escalate to GC Team; auth-side to AC Team
+- If a client release disabled or broke telemetry, escalate to Client/Web-App Team
+- If silence persists with no identified cause, escalate to Observability Team (#observability) — collector-side ingestion may be masking a deeper issue
 
 ---
 

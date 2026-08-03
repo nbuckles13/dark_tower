@@ -132,6 +132,30 @@ groups:
           impact: "Users cannot create meetings. Investigate GC health, routing, and upstream dependencies."
           runbook_url: "docs/runbooks/gc-incident-response.md#scenario-4-complete-service-outage"
 
+      - alert: GCTelemetryProxySilent
+        expr: |
+          (
+            sum(rate(gc_telemetry_ingest_total[15m])) == 0
+            and
+            sum(increase(gc_telemetry_ingest_total[1h] offset 15m)) > 0
+          )
+          or
+          (
+            absent_over_time(gc_telemetry_ingest_total[15m])
+            and on()
+            (sum(increase(gc_telemetry_ingest_total[1h] offset 15m)) > 0)
+          )
+        for: 5m
+        labels:
+          severity: page
+          service: gc-service
+          component: telemetry-proxy
+        annotations:
+          summary: "Telemetry ingest has gone silent despite recent baseline traffic"
+          description: "No telemetry ingest events for 15+ minutes, but events flowed during the baseline hour before that. Covers both silence shapes: flat counters (pod alive, client traffic stopped — client reachability, CORS, or auth breakage) and absent series (pod restarted and no telemetry arrived since; a rolling restart in a low-traffic environment is a known benign trigger — check the deploy timeline first). Expected detection delay is ~20 minutes for the flat shape (15m rate window + 5m for clause). The alert can auto-resolve after ~1h15m of continuous silence as the baseline window drains — resolution is not recovery; verify ingest rate is non-zero before closing."
+          impact: "Total loss of client-side observability. May be the leading indicator of client-facing breakage (CORS, ingress, auth) the server cannot otherwise see. Check user-facing traffic immediately."
+          runbook_url: "docs/runbooks/gc-incident-response.md#scenario-11-telemetry-ingest-silent"
+
   - name: gc-service-warning
     interval: 60s
     rules:
@@ -310,6 +334,26 @@ groups:
           description: "Meeting join failure rate is {{ $value | humanizePercentage }} for 5 minutes. Check 'Meeting Join Failures by Type' dashboard panel to determine root cause. mc_assignment errors → Scenario 3 (MC assignment), ac_request errors → check AC service health (Scenario 7), not_found errors → check meeting lookup and database."
           impact: "Some users unable to join meetings. Investigate error types in dashboard."
           runbook_url: "docs/runbooks/gc-incident-response.md#scenario-3-mc-assignment-failures"
+
+      - alert: GCTelemetryProxyHighRejectionRate
+        expr: |
+          (
+            sum(rate(gc_telemetry_ingest_total{status=~"rejected_.*|error"}[10m]))
+            /
+            sum(rate(gc_telemetry_ingest_total[10m]))
+          ) > 0.10
+          and
+          sum(rate(gc_telemetry_ingest_total[10m])) > 0
+        for: 10m
+        labels:
+          severity: warning
+          service: gc-service
+          component: telemetry-proxy
+        annotations:
+          summary: "Telemetry proxy rejection rate high ({{ $value | humanizePercentage }})"
+          description: "Telemetry ingest rejection rate is {{ $value | humanizePercentage }} for 10 minutes, above the 10% threshold. Triage on the telemetry counter's own status values first: rejected_size / rejected_rate point at a broken or abusive client; error aggregates client-fault decode/content-type failures (HTTP 400/415) and collector-fault forwarding failures (HTTP 502/503) — split via the paired HTTP status codes in the runbook. Note the telemetry endpoint currently reports as endpoint /other on gc_http_requests_total (conflated with other unrecognized paths — see runbook caveat)."
+          impact: "Client telemetry is being dropped — degraded client-side observability. If the error status dominates with 502/503, the collector path is failing and accepted telemetry may not be forwarding either."
+          runbook_url: "docs/runbooks/gc-incident-response.md#scenario-10-telemetry-proxy-high-rejection-rate"
 
   - name: gc-service-info
     interval: 60s
