@@ -961,7 +961,7 @@ tasks:
 - id: 15
   status: completed
 - id: 16
-  status: pending
+  status: completed
   specialist: observability
   env_tests: true
   deps:
@@ -996,6 +996,7 @@ tasks:
     the alert runbook_url annotations reference. The dt-guard alert-rules-policy
     and dashboard-panels checks run in the validation pipeline — keep alert and
     panel shapes compliant with them.
+  commit: f4165aefa902d4d0d27e0b3dd8c4656bebb000ac
 - id: 17
   status: completed
 - id: 18
