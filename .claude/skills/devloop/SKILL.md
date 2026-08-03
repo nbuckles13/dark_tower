@@ -612,7 +612,9 @@ When the invocation prompt is prefixed with `HEADLESS RUN` (set by `scripts/work
 
 1. **Never wait for human input.** Every point where this skill would ask the user a question or present options — planning timeout (Step 5), validation attempts exhausted (Step 6), Gate 3 ESCALATED needing a Lead override the Lead cannot justify alone (Step 7), specialist disambiguation (Step 1; first apply the more-specific-match rule, escalate only if genuinely ambiguous), Layer 7 operator lane / any host-op the container cannot perform — becomes a terminal escalation instead: write the escalation file (below) and end the session. Do not improvise past a limit, relax a gate, or self-approve a risk acceptance to keep going.
 
-2. **The escalation file is the contract.** Write `.devloop-escalation.json` at the repo root:
+2. **A Stop hook enforces completion.** Your turn cannot end until the devloop has committed (Step 8) or written the escalation file — premature stops are blocked mechanically (`scripts/workflow/devloop-stop-hook.sh`). When blocked: check teammate status (TaskList), hold on pending work with a blocking `TaskOutput` call (`block: true` — Monitor does not block), and drive the next gate.
+
+3. **The escalation file is the contract.** Write `.devloop-escalation.json` at the repo root:
 
    ```json
    {

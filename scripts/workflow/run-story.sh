@@ -74,7 +74,8 @@ while :; do
   tasklog="$RUN_DIR/task-${id}.devloop.log"
   gatelog="$RUN_DIR/task-${id}.gate.log"
   head_before="$(git rev-parse HEAD)"
-  rm -f .devloop-escalation.json
+  stop_count_file="$RUN_DIR/task-${id}.stopblocks"
+  rm -f .devloop-escalation.json "$stop_count_file"
 
   echo "STORY_RUN: START task=${id} specialist=${specialist} log=${tasklog}"
   set +e
@@ -82,7 +83,9 @@ while :; do
   # session end, leaving the log empty for the whole run. JSONL events make
   # `tail -f` useful; filter with e.g.
   #   jq -r 'select(.type=="assistant") | .message.content[]? | .text? // empty'
-  DEVLOOP_HEADLESS=1 timeout "$TASK_TIMEOUT" claude -p \
+  DEVLOOP_HEADLESS=1 DEVLOOP_START_HEAD="$head_before" \
+    DEVLOOP_STOP_COUNT_FILE="$stop_count_file" \
+    timeout "$TASK_TIMEOUT" claude -p \
     "$(printf 'HEADLESS RUN (run-story task #%s): follow the devloop skill including its Headless Mode section.\n/devloop "%s" --specialist=%s' \
         "$id" "$(cat "$prompt_file")" "$specialist")" \
     --output-format stream-json --verbose \
