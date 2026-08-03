@@ -40,7 +40,11 @@ mkdir -p "$RUN_DIR"
 
 # Per-devloop wall-clock ceiling. A wedged headless session must not hold the
 # story forever; timeout is an infra escalation, not a task verdict.
+# (Applies per claude invocation — session-limit sleeps don't consume it.)
 TASK_TIMEOUT="${STORY_TASK_TIMEOUT:-14400}"
+
+# Session-limit waits per task before falling through to escalation.
+SESSION_LIMIT_RETRIES="${STORY_SESSION_LIMIT_RETRIES:-2}"
 
 scripts/workflow/preflight-story.sh "$STORY_FILE"
 
@@ -78,20 +82,63 @@ while :; do
   rm -f .devloop-escalation.json "$stop_count_file"
 
   echo "STORY_RUN: START task=${id} specialist=${specialist} log=${tasklog}"
-  set +e
-  # stream-json + verbose: default text mode prints only the final result at
-  # session end, leaving the log empty for the whole run. JSONL events make
-  # `tail -f` useful; filter with e.g.
-  #   jq -r 'select(.type=="assistant") | .message.content[]? | .text? // empty'
-  DEVLOOP_HEADLESS=1 DEVLOOP_START_HEAD="$head_before" \
-    DEVLOOP_STOP_COUNT_FILE="$stop_count_file" \
-    timeout "$TASK_TIMEOUT" claude -p \
-    "$(printf 'HEADLESS RUN (run-story task #%s): follow the devloop skill including its Headless Mode section.\n/devloop "%s" --specialist=%s' \
-        "$id" "$(cat "$prompt_file")" "$specialist")" \
-    --output-format stream-json --verbose \
-    --dangerously-skip-permissions >"$tasklog" 2>&1
-  claude_rc=$?
-  set -e
+  start_marker="$RUN_DIR/task-${id}.start"
+  touch "$start_marker"
+  limit_waits=0
+  continue_slug=""
+  while :; do
+    if [ -n "$continue_slug" ]; then
+      task_prompt="$(printf 'HEADLESS RUN (run-story task #%s, resumed after session-limit wait): follow the devloop skill including its Headless Mode section.\n/devloop "Previous session hit the usage limit mid-task. Resume from main.md state: finish incomplete phases, then gates and commit as normal." --continue=%s' \
+          "$id" "$continue_slug")"
+    else
+      task_prompt="$(printf 'HEADLESS RUN (run-story task #%s): follow the devloop skill including its Headless Mode section.\n/devloop "%s" --specialist=%s' \
+          "$id" "$(cat "$prompt_file")" "$specialist")"
+    fi
+
+    # stream-json + verbose: default text mode prints only the final result at
+    # session end, leaving the log empty for the whole run. JSONL events make
+    # `tail -f` useful; filter with e.g.
+    #   jq -r 'select(.type=="assistant") | .message.content[]? | .text? // empty'
+    set +e
+    DEVLOOP_HEADLESS=1 DEVLOOP_START_HEAD="$head_before" \
+      DEVLOOP_STOP_COUNT_FILE="$stop_count_file" \
+      timeout "$TASK_TIMEOUT" claude -p "$task_prompt" \
+      --output-format stream-json --verbose \
+      --dangerously-skip-permissions >>"$tasklog" 2>&1
+    claude_rc=$?
+    set -e
+
+    # Session-limit lane (infra, not a task failure): the dying session cannot
+    # handle its own 429 — its API is what's refusing. Wait out the window and
+    # resume the same devloop via --continue instead of escalating.
+    if [ "$claude_rc" -ne 0 ] && [ "$limit_waits" -lt "$SESSION_LIMIT_RETRIES" ] \
+        && tail -n 5 "$tasklog" | grep -q 'api_error_status":429\|hit your session limit'; then
+      limit_waits=$((limit_waits + 1))
+      sleep_secs=3600
+      reset_txt="$(tail -n 5 "$tasklog" | grep -o 'resets [0-9]\+:[0-9]\+[ap]m' | tail -n 1 | cut -d' ' -f2)"
+      if [ -n "$reset_txt" ]; then
+        reset_epoch="$(date -u -d "$reset_txt" +%s 2>/dev/null || echo 0)"
+        now_epoch="$(date -u +%s)"
+        if [ "$reset_epoch" -gt 0 ]; then
+          [ "$reset_epoch" -le "$now_epoch" ] && reset_epoch=$((reset_epoch + 86400))
+          sleep_secs=$((reset_epoch - now_epoch + 300))
+        fi
+      fi
+      [ "$sleep_secs" -gt 21600 ] && sleep_secs=21600
+      # Resume target: the devloop output dir this task created.
+      continue_slug="$(find docs/devloop-outputs -mindepth 1 -maxdepth 1 -type d \
+        -newer "$start_marker" -printf '%T@ %f\n' 2>/dev/null | sort -rn | head -n 1 | cut -d' ' -f2-)"
+      if [ -z "$continue_slug" ] || [ ! -f "docs/devloop-outputs/${continue_slug}/main.md" ]; then
+        continue_slug=""   # nothing to resume — clean up and retry fresh
+        git reset --hard -q "$head_before"
+        git clean -fdq
+      fi
+      echo "STORY_RUN: SESSION-LIMIT task=${id} wait=${sleep_secs}s resume=${continue_slug:-fresh} (${limit_waits}/${SESSION_LIMIT_RETRIES})"
+      sleep "$sleep_secs"
+      continue
+    fi
+    break
+  done
 
   # Order matters: an explicit escalation file is the most informative signal;
   # timeout and session-error are infra-lane; no-commit catches a devloop that
@@ -126,14 +173,16 @@ while :; do
     escalate "$id" pipeline-red "$gatelog"
   fi
 
-  devloop_commit="$(git rev-parse HEAD)"
-  "$DT_STORY" complete "$STORY_FILE" "$id" --commit "$devloop_commit"
-  # Commit the manifest bump immediately: leaving it uncommitted fails the
-  # resume-time clean-tree check and would otherwise be swept into the next
-  # task's `git add -A` commit.
+  # Fold the manifest bump into the devloop's own commit. No --commit sha in
+  # the manifest: amending changes the sha, so it can't be recorded inside the
+  # commit it refers to. Fall back to a separate chore commit if the amend is
+  # rejected (e.g. a hook that pins devloop-commit trees).
+  "$DT_STORY" complete "$STORY_FILE" "$id"
   git add "$STORY_FILE"
-  git commit --quiet -m "chore(story): task #${id} complete (run-story manifest bump)"
-  echo "STORY_RUN: COMPLETE task=${id} devloop_commit=${devloop_commit:0:7}"
+  if ! git commit --quiet --amend --no-edit; then
+    git commit --quiet -m "chore(story): task #${id} complete (run-story manifest bump)"
+  fi
+  echo "STORY_RUN: COMPLETE task=${id} commit=$(git rev-parse --short HEAD)"
 done
 
 # Story-close gate: the full pipeline, layer 7 included, on the final tree.

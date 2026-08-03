@@ -645,6 +645,8 @@ When the invocation prompt is prefixed with `HEADLESS RUN` (set by `scripts/work
 
 If a session is interrupted, restart the devloop from the beginning. The main.md file records the start commit for rollback if needed.
 
+Exception — headless infra interruptions (session limit, crash): the run-story runner relaunches the task as `/devloop --continue={slug}` even though the devloop never completed. Treat main.md's Loop State as authoritative: respawn the roster, finish the incomplete phases, then gates and commit as normal.
+
 ## Files
 
 - **Specialist definitions**: `.claude/agents/{name}.md` (auto-loaded via `subagent_type`)
