@@ -79,16 +79,32 @@ while :; do
   gatelog="$RUN_DIR/task-${id}.gate.log"
   head_before="$(git rev-parse HEAD)"
   stop_count_file="$RUN_DIR/task-${id}.stopblocks"
+  slug_file="$RUN_DIR/task-${id}.slug"
+  start_marker="$RUN_DIR/task-${id}.start"
   rm -f .devloop-escalation.json "$stop_count_file"
 
-  echo "STORY_RUN: START task=${id} specialist=${specialist} log=${tasklog}"
-  start_marker="$RUN_DIR/task-${id}.start"
+  # Resume detection: a persisted slug (written on any uncommitted exit) means
+  # this task has an interrupted devloop to continue instead of a fresh start.
+  continue_slug=""
+  if [ -s "$slug_file" ]; then
+    s="$(cat "$slug_file")"
+    [ -f "docs/devloop-outputs/${s}/main.md" ] && continue_slug="$s"
+  fi
+  if [ -z "$continue_slug" ]; then
+    # Fresh starts require a clean tree; resumes tolerate (expect) the
+    # interrupted devloop's uncommitted work.
+    if ! git diff --quiet || ! git diff --cached --quiet; then
+      echo "STORY_RUN: dirty tree and no resumable devloop for task ${id} — clean up, or point ${slug_file} at the interrupted devloop dir" >&2
+      exit 2
+    fi
+  fi
+
+  echo "STORY_RUN: START task=${id} specialist=${specialist} resume=${continue_slug:-no} log=${tasklog}"
   touch "$start_marker"
   limit_waits=0
-  continue_slug=""
   while :; do
     if [ -n "$continue_slug" ]; then
-      task_prompt="$(printf 'HEADLESS RUN (run-story task #%s, resumed after session-limit wait): follow the devloop skill including its Headless Mode section.\n/devloop "Previous session hit the usage limit mid-task. Resume from main.md state: finish incomplete phases, then gates and commit as normal." --continue=%s' \
+      task_prompt="$(printf 'HEADLESS RUN (run-story task #%s, resumed): follow the devloop skill including its Headless Mode section.\n/devloop "This devloop was interrupted before completion. Resume from main.md state: finish incomplete phases, then gates and commit as normal." --continue=%s' \
           "$id" "$continue_slug")"
     else
       task_prompt="$(printf 'HEADLESS RUN (run-story task #%s): follow the devloop skill including its Headless Mode section.\n/devloop "%s" --specialist=%s' \
@@ -125,13 +141,17 @@ while :; do
         fi
       fi
       [ "$sleep_secs" -gt 21600 ] && sleep_secs=21600
-      # Resume target: the devloop output dir this task created.
-      continue_slug="$(find docs/devloop-outputs -mindepth 1 -maxdepth 1 -type d \
-        -newer "$start_marker" -printf '%T@ %f\n' 2>/dev/null | sort -rn | head -n 1 | cut -d' ' -f2-)"
-      if [ -z "$continue_slug" ] || [ ! -f "docs/devloop-outputs/${continue_slug}/main.md" ]; then
-        continue_slug=""   # nothing to resume — clean up and retry fresh
-        git reset --hard -q "$head_before"
-        git clean -fdq
+      if [ -z "$continue_slug" ]; then
+        # Resume target: the devloop output dir this task created.
+        continue_slug="$(find docs/devloop-outputs -mindepth 1 -maxdepth 1 -type d \
+          -newer "$start_marker" -printf '%T@ %f\n' 2>/dev/null | sort -rn | head -n 1 | cut -d' ' -f2-)"
+        if [ -n "$continue_slug" ] && [ -f "docs/devloop-outputs/${continue_slug}/main.md" ]; then
+          echo "$continue_slug" >"$slug_file"
+        else
+          continue_slug=""   # nothing to resume — clean up and retry fresh
+          git reset --hard -q "$head_before"
+          git clean -fdq
+        fi
       fi
       echo "STORY_RUN: SESSION-LIMIT task=${id} wait=${sleep_secs}s resume=${continue_slug:-fresh} (${limit_waits}/${SESSION_LIMIT_RETRIES})"
       sleep "$sleep_secs"
@@ -139,6 +159,15 @@ while :; do
     fi
     break
   done
+
+  # Persist the resume pointer on any uncommitted exit, so a later runner
+  # invocation (after human intervention) resumes via --continue instead of
+  # starting fresh over the partial work. Committed exits don't resume.
+  if [ ! -s "$slug_file" ] && [ "$(git rev-parse HEAD)" = "$head_before" ]; then
+    d="$(find docs/devloop-outputs -mindepth 1 -maxdepth 1 -type d \
+      -newer "$start_marker" -printf '%T@ %f\n' 2>/dev/null | sort -rn | head -n 1 | cut -d' ' -f2-)"
+    [ -n "$d" ] && [ -f "docs/devloop-outputs/${d}/main.md" ] && echo "$d" >"$slug_file"
+  fi
 
   # Order matters: an explicit escalation file is the most informative signal;
   # timeout and session-error are infra-lane; no-commit catches a devloop that
@@ -182,6 +211,7 @@ while :; do
   if ! git commit --quiet --amend --no-edit; then
     git commit --quiet -m "chore(story): task #${id} complete (run-story manifest bump)"
   fi
+  rm -f "$slug_file" "$start_marker" "$stop_count_file"
   echo "STORY_RUN: COMPLETE task=${id} commit=$(git rev-parse --short HEAD)"
 done
 

@@ -7,9 +7,10 @@
 # ~/.claude/settings.json (not shell-visible anyway) and jq/claude are baked
 # into the image. It checks only what is genuinely outside that control:
 #
-#   1. Run state that changes between invocations: manifest validity, clean
-#      working tree (a prior devloop-no-commit escalation leaves a dirty tree
-#      on purpose — human cleans up before resuming), dt-story binary built.
+#   1. Run state that changes between invocations: manifest validity and the
+#      dt-story binary. (Clean-tree checking lives in run-story.sh per task:
+#      fresh starts require it; resumes tolerate the interrupted devloop's
+#      uncommitted work.)
 #   2. The experimental substrate: agent teams inside `claude -p` is
 #      empirically-working but documentation-silent, AND entrypoint.sh
 #      npm-updates the CLI at container start — so the substrate can shift
@@ -33,10 +34,6 @@ command -v jq >/dev/null 2>&1 || fail "jq not found"
 [ -f "$STORY_FILE" ] || fail "story file not found: ${STORY_FILE}"
 
 target/release/dt-story validate "$STORY_FILE" || fail "story manifest invalid"
-
-if ! git diff --quiet || ! git diff --cached --quiet; then
-  fail "working tree not clean"
-fi
 
 # --- Substrate probe, cached per claude version ---
 VERSION="$(claude --version 2>/dev/null | head -n 1 | tr -cs 'A-Za-z0-9.' '-')"
