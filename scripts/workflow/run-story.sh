@@ -140,7 +140,11 @@ while :; do
           sleep_secs=$((reset_epoch - now_epoch + 300))
         fi
       fi
-      [ "$sleep_secs" -gt 21600 ] && sleep_secs=21600
+      # Sanity cap only: the reset time comes from the API's own 429 message,
+      # and daily/weekly quota resets can be many hours out — clamping a
+      # correct long wait just schedules doomed retries (parse failures take
+      # the 1h fallback above and never reach this cap).
+      [ "$sleep_secs" -gt 93600 ] && sleep_secs=93600
       if [ -z "$continue_slug" ]; then
         # Resume target: the devloop output dir this task created.
         continue_slug="$(find docs/devloop-outputs -mindepth 1 -maxdepth 1 -type d \
