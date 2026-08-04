@@ -57,6 +57,21 @@ escalate() {
   exit 1
 }
 
+# Persist the --continue pointer for the current task if its devloop created
+# an output dir and nothing was committed. Uses the per-task vars set in the
+# main loop. Safe to call on any exit path; no-op if already persisted.
+persist_resume_pointer() {
+  [ -s "$slug_file" ] && return 0
+  [ "$(git rev-parse HEAD)" != "$head_before" ] && return 0
+  local d
+  d="$(find docs/devloop-outputs -mindepth 1 -maxdepth 1 -type d \
+    -newer "$start_marker" -printf '%T@ %f\n' 2>/dev/null | sort -rn | head -n 1 | cut -d' ' -f2-)"
+  if [ -n "$d" ] && [ -f "docs/devloop-outputs/${d}/main.md" ]; then
+    echo "$d" >"$slug_file"
+  fi
+  return 0
+}
+
 while :; do
   set +e
   task_json="$("$DT_STORY" next "$STORY_FILE")"
@@ -115,6 +130,7 @@ while :; do
     # session end, leaving the log empty for the whole run. JSONL events make
     # `tail -f` useful; filter with e.g.
     #   jq -r 'select(.type=="assistant") | .message.content[]? | .text? // empty'
+    attempt_off="$(stat -c %s "$tasklog" 2>/dev/null || echo 0)"
     set +e
     DEVLOOP_HEADLESS=1 DEVLOOP_START_HEAD="$head_before" \
       DEVLOOP_STOP_COUNT_FILE="$stop_count_file" \
@@ -124,14 +140,29 @@ while :; do
     claude_rc=$?
     set -e
 
+    # Failure signatures are read from THIS attempt's log slice only — the
+    # task log is append-mode, and a previous attempt's 429 lines in the tail
+    # would misclassify a different failure (observed 2026-08-04: auth-expired
+    # treated as session-limit, runner slept instead of stopping).
+    attempt_tail="$(tail -c +"$((attempt_off + 1))" "$tasklog" | tail -n 5)"
+
+    # Auth-expired lane: pure infra, needs a human (host /login + container
+    # restart to re-copy credentials). No manifest edit — the task stays
+    # pending and the resume pointer survives, so a rerun picks up cleanly.
+    if printf '%s' "$attempt_tail" | grep -q 'authentication_failed\|OAuth session expired'; then
+      persist_resume_pointer
+      echo "STORY_RUN: AUTH-EXPIRED task=${id} — run /login on the host, restart the container (entrypoint re-copies credentials), then rerun to resume" >&2
+      exit 2
+    fi
+
     # Session-limit lane (infra, not a task failure): the dying session cannot
     # handle its own 429 — its API is what's refusing. Wait out the window and
     # resume the same devloop via --continue instead of escalating.
     if [ "$claude_rc" -ne 0 ] && [ "$limit_waits" -lt "$SESSION_LIMIT_RETRIES" ] \
-        && tail -n 5 "$tasklog" | grep -q 'api_error_status":429\|hit your session limit'; then
+        && printf '%s' "$attempt_tail" | grep -q 'api_error_status":429\|hit your session limit'; then
       limit_waits=$((limit_waits + 1))
       sleep_secs=3600
-      reset_txt="$(tail -n 5 "$tasklog" | grep -o 'resets [0-9]\+:[0-9]\+[ap]m' | tail -n 1 | cut -d' ' -f2)"
+      reset_txt="$(printf '%s' "$attempt_tail" | grep -o 'resets [0-9]\+:[0-9]\+[ap]m' | tail -n 1 | cut -d' ' -f2)"
       if [ -n "$reset_txt" ]; then
         reset_epoch="$(date -u -d "$reset_txt" +%s 2>/dev/null || echo 0)"
         now_epoch="$(date -u +%s)"
@@ -167,11 +198,7 @@ while :; do
   # Persist the resume pointer on any uncommitted exit, so a later runner
   # invocation (after human intervention) resumes via --continue instead of
   # starting fresh over the partial work. Committed exits don't resume.
-  if [ ! -s "$slug_file" ] && [ "$(git rev-parse HEAD)" = "$head_before" ]; then
-    d="$(find docs/devloop-outputs -mindepth 1 -maxdepth 1 -type d \
-      -newer "$start_marker" -printf '%T@ %f\n' 2>/dev/null | sort -rn | head -n 1 | cut -d' ' -f2-)"
-    [ -n "$d" ] && [ -f "docs/devloop-outputs/${d}/main.md" ] && echo "$d" >"$slug_file"
-  fi
+  persist_resume_pointer
 
   # Order matters: an explicit escalation file is the most informative signal;
   # timeout and session-error are infra-lane; no-commit catches a devloop that
