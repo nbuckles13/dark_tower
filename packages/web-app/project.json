@@ -38,6 +38,14 @@
         "command": "vitest run --config vitest.config.ts"
       }
     },
+    "test:e2e": {
+      "executor": "nx:run-commands",
+      "dependsOn": [{ "projects": ["proto-gen"], "target": "codegen" }],
+      "options": {
+        "cwd": "packages/web-app",
+        "command": "playwright test"
+      }
+    },
     "lint": {
       "executor": "nx:run-commands",
       "dependsOn": [{ "projects": ["proto-gen"], "target": "codegen" }],

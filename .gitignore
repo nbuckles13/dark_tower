@@ -71,6 +71,11 @@ coverage/
 lcov.info
 *.profraw
 *.profdata
+# Playwright browser-E2E artifacts (task #18) — traces record request bodies
+# incl. synthetic dev-cluster credentials; never committable.
+packages/web-app/test-results/
+packages/web-app/playwright-report/
+packages/web-app/blob-report/
 
 # Terraform
 .terraform/

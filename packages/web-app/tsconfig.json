@@ -16,8 +16,10 @@
     "src/**/*",
     "src/**/*.svelte",
     "tests/**/*",
+    "e2e/**/*",
     "vite/**/*",
     "vite-env.d.ts",
+    "playwright.config.ts",
     "vite.config.ts",
     "vitest.config.ts",
     "vitest.node.config.ts"

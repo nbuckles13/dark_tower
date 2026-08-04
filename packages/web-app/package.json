@@ -10,6 +10,7 @@
     "preview": "vite preview",
     "test:unit": "vitest run --config vitest.node.config.ts",
     "test:component": "vitest run --config vitest.config.ts",
+    "test:e2e": "playwright test",
     "test:watch": "vitest --config vitest.config.ts",
     "lint": "svelte-check --tsconfig ./tsconfig.json && eslint src/ && prettier --check \"src/**/*.{ts,svelte}\"",
     "typecheck": "svelte-check --tsconfig ./tsconfig.json"
