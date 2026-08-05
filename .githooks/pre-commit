@@ -52,6 +52,32 @@ if [ -n "$DEVLOOP_ERRORS" ]; then
     exit 1
 fi
 
+# TODO-tracking format guard at commit time (task #19 incident, 2026-08-05):
+# devloop Step 9 writes main.md §Accepted Deferrals and TODO.md entries AFTER
+# Gate 2 validation ran, so the in-devloop pipeline structurally cannot see
+# them — the commit is the boundary where that content becomes durable, so
+# the format contract is enforced here. (Checks the working tree, not staged
+# content — same semantics as the pipeline's own guard run. Backstop: the
+# run-story independent gate re-runs all guards post-devloop.)
+if git diff --cached --name-only | grep -qE 'docs/devloop-outputs/.*/main\.md$|(^|/)TODO\.md$'; then
+    echo "  ➜ Checking TODO-tracking format (dt-guard todo-tracking)..."
+    __dtg_root="$(git rev-parse --show-toplevel)"
+    __dtg_bin="${__dtg_root}/target/release/dt-guard"
+    if [ ! -x "$__dtg_bin" ]; then
+        echo "     (dt-guard not built — building)"
+        (cd "$__dtg_root" && cargo build --release -q -p dt-guard) || {
+            echo "❌ dt-guard build failed; cannot run todo-tracking guard."
+            exit 1
+        }
+    fi
+    "$__dtg_bin" todo-tracking --root "$__dtg_root" || {
+        echo ""
+        echo "❌ TODO-tracking violation (see above)."
+        echo "   §Accepted Deferrals must be pointer bullets to docs/TODO.md — body text lives in TODO.md."
+        exit 1
+    }
+fi
+
 # Gate-2 authority gate (task #51). For a devloop-completion commit (a staged
 # main.md at Phase=complete WITH validated files staged), require a fresh,
 # tree-matching, PASSing pipeline verdict produced by scripts/layer-all.sh — so a
