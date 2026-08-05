@@ -281,6 +281,10 @@ while :; do
 
   # Gate: fast floor (layers 1-6) every task; layer 7 only when the task is
   # tagged env_tests. Full pipeline incl. layer 7 runs once at story close.
+  gate_layers="1-6"
+  [ "$env_tests" = "true" ] && gate_layers="1-6+7"
+  echo "STORY_RUN: GATE task=${id} layers=${gate_layers} running (log=${gatelog})"
+  gate_start="$(date +%s)"
   gate_rc=0
   for n in 1 2 3 4 5 6; do
     set +e
@@ -295,6 +299,7 @@ while :; do
     gate_rc=$?
     set -e
   fi
+  echo "STORY_RUN: GATE task=${id} layers=${gate_layers} rc=${gate_rc} elapsed=$(( $(date +%s) - gate_start ))s"
   if [ "$gate_rc" -ne 0 ]; then
     tail -n 50 "$gatelog"
     escalate "$id" pipeline-red "$gatelog"
