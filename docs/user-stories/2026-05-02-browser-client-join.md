@@ -1045,7 +1045,7 @@ tasks:
     E2E adds real Chromium, the real WebTransport API, and real demo-page DOM —
     the layer the Rust test cannot reach.
 - id: 19
-  status: pending
+  status: completed
   specialist: test
   env_tests: true
   deps:

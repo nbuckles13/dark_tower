@@ -566,13 +566,11 @@ comment).
 
 ## Accepted Deferrals
 
-None — all seven Gate-3 verdicts are RESOLVED-FIXED; every finding on this diff was
-fixed in this PR. The `docs/TODO.md` entries added during review (§Env-Test Resilience:
-stale-series baseline capture in both Rust and TS counter-delta helpers; `Err(_) => 0.0`
-Prometheus-error masking in `26_mh_quic.rs` helpers; §Code Quality: `verify-completion.sh`
-dead `--verbose`/`[path]` args) track PRE-EXISTING debt outside this PR's hunks, surfaced
-by the Gate-2 flake diagnosis and a reviewer's out-of-diff observation — they are not
-deferrals of findings on this change (see the verdicts in §Code Review Results).
+None — all seven Gate-3 verdicts are RESOLVED-FIXED; every finding on this diff was fixed in this PR. The bullets below are PRE-EXISTING debt surfaced during review (Gate-2 flake diagnosis + one out-of-diff reviewer observation), not deferrals of findings on this change — see §Code Review Results.
+
+- `docs/TODO.md` §Env-Test Resilience — stale-series baseline capture in both Rust and TS counter-delta helpers
+- `docs/TODO.md` §Env-Test Resilience — `Err(_) => 0.0` Prometheus-error masking in `26_mh_quic.rs` helpers
+- `docs/TODO.md` §Code Quality — `verify-completion.sh` dead `--verbose`/`[path]` args
 
 ---
 
