@@ -78,8 +78,9 @@ test.describe('join happy path (R-40/R-44/R-46)', () => {
       const page2 = await context2.newPage();
       await page2.goto('/');
       // Fresh credential->token exchange (sign-IN, not a join-time re-auth);
-      // reuses the run's single registered user to respect AC's 5/hour
-      // registration budget. Participant identity is per-join, not per-user.
+      // reuses this spec's single registered user to respect the suite's
+      // registration budget (rate-limit SSoT + budget math: e2e/README.md
+      // §Budgets). Participant identity is per-join, not per-user.
       await signInViaUi(page2, creds);
 
       const recorder2 = recordRequests(context2); // context 2's OWN join window

@@ -12,6 +12,14 @@
 # `--layer full` IS `scripts/layer-all.sh` (paired-operations Q5): identical layer
 # scripts run, identical exit-code semantics. Layer loop is NOT reimplemented here.
 #
+# Client test coverage rides the SAME delegation (task #19 — no parallel test
+# invocations are added here; the layer scripts are the one encoding):
+#   standard → client unit+component tests via L4's `lang/ts/test.sh`
+#              (`nx affected -t test:unit test:component`, affected-gated per
+#              ADR-0033 §3)
+#   full     → browser E2E (Playwright) via L7's Phase-2 browser lane
+#              (diff-triggered; see scripts/layer7.sh + runbook §6.7)
+#
 # <path> arg is informational/cosmetic; layers run repo-wide.
 
 set -euo pipefail
@@ -36,8 +44,10 @@ Usage: verify-completion.sh [options] [path]
 Options:
   --layer LEVEL    Verification level: quick, standard, full (default: full)
                    quick    → L1 compile, L2 format, L3 guards
-                   standard → quick + L4 test
-                   full     → all layers L1-L7 (= scripts/layer-all.sh)
+                   standard → quick + L4 test (incl. client unit/component via
+                              the L4 ts wrapper, affected-gated)
+                   full     → all layers L1-L7 (= scripts/layer-all.sh; L7 adds
+                              env-tests + the diff-triggered browser E2E)
   --format FORMAT  Output format: text, json (default: text)
   --verbose        Show detailed output
   --help           Show this help message

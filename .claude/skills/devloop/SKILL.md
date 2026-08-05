@@ -396,7 +396,7 @@ Each `scripts/layerN.sh` is independently callable for targeted debugging (e.g.,
 | 4     | Test     | —                                           | rust, ts (proto has no `test.sh`)            |
 | 5     | Lint     | —                                           | rust, ts, proto                              |
 | 6     | Audit    | `cargo audit`, `pnpm audit`, `buf breaking` | —                                            |
-| 7     | Env-tests| dev-cluster + Rust env-tests (Playwright `@smoke`: pending #18/#19) | —                    |
+| 7     | Env-tests| dev-cluster + Rust env-tests (always) + browser E2E (diff-triggered, task #19) | —      |
 
 **Layer N/A justification template**:
 
@@ -418,10 +418,10 @@ The cases requiring implementer action are an unexpected `STATUS=N/A` outside th
 
 Layer 7 is the seventh shell-layer in `scripts/layer-all.sh`, executed automatically after layers 1-6. It always runs — intentionally broader than ADR-0030's trigger-path list, because business logic changes can break integration tests too. The full mechanism (cluster bring-up, two-phase classifier, the four STATUS lanes) lives in `scripts/layer7.sh`; failure-mode → REASON-token → fix mapping is in `docs/runbooks/devloop-validation.md §6.7`.
 
-**Today Layer 7 runs only the Rust env-tests** (`cargo test -p env-tests --features all`). The Playwright `@smoke` tier in the table above is ADR-0033's design target, **not yet built** — no `playwright.config.*`, no `@smoke` tag, and no `lang/ts/e2e.sh` exists. It lands with story tasks #18 (harness) and #19 (pipeline integration).
+**Layer 7 runs two Phase-2 suites sequentially against the same cluster** (task #19, R-48): first the Rust env-tests (`cargo test -p env-tests --features all`, always attempted), then the browser E2E (`pnpm --filter @darktower/web-app test:e2e`, Playwright harness from task #18) — **diff-triggered**, run only when the diff can change behavior a real browser client observes. The mechanism SSoT is `scripts/layer7.sh` (trigger-path array, precondition checks, timeouts — not re-encoded here); failure-mode → REASON-token → fix mapping is runbook §6.7.
 
 **Lead policy** (the only bits not encoded in the script):
-- **Attempt budget**: Layer 7 = 2 attempts (separate from layers 1-6's 3). **Test failures** (`STATUS=FAIL`, exit 1) consume an attempt; **infrastructure/precondition failures** (`STATUS=PRECONDITION_FAILURE`, exit 2 — the operator lane) do NOT — retry once, then escalate to operations. First-run cluster setup (~7 min) does not count toward attempts.
+- **Attempt budget**: Layer 7 = 2 attempts (separate from layers 1-6's 3). **Test failures** (`STATUS=FAIL`, exit 1) consume an attempt; **infrastructure/precondition failures** (`STATUS=PRECONDITION_FAILURE`, exit 2 — the operator lane) do NOT — retry once, then escalate to operations. First-run cluster setup (~7 min) does not count toward attempts. The two Phase-2 suites **share the single Layer-7 attempt**: a browser-suite `FAIL` (`browser-e2e-failed`) consumes it exactly like an env-test FAIL; a browser `PRECONDITION_FAILURE` (`dev-certs-missing` / `playwright-browser-missing`) does not. When env-tests fail first, the browser suite is skipped that attempt (loud `browser-e2e-not-run:` stderr note, no browser STATUS line) and runs on the retry; an untriggered diff reports `STATUS=SKIPPED-NO-DIFF REASON=browser-e2e-no-diff` (ranks below OK).
 - **No cluster**: in **CI** (`GITHUB_ACTIONS`) Layer 7 self-reports `STATUS=SKIPPED-NO-CLUSTER REASON=no-cluster-ci` (exit 0) — a clean pass that does NOT mean env-tests ran; this is the ONLY skip case. A **local** devloop with no helper (or a dead helper) is `PRECONDITION_FAILURE` (exit 2, operator lane) — loud, never a silent skip — so a local code devloop can never exit-0-skip env-tests.
 
 **If pass**:

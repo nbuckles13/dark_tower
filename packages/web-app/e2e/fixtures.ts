@@ -16,11 +16,19 @@
 //     gitignored and must never leave the workstation (see e2e/README.md).
 
 import { expect } from 'playwright/test';
-import type { BrowserContext, Page, Request } from 'playwright/test';
+import type { BrowserContext, Page, Request, Response } from 'playwright/test';
 // Resolved to sdk-core SOURCE via this package's tsconfig `paths` (Playwright
 // honors tsconfig path mapping), keeping GC's R-53 camelCase wire mapping
 // single-sourced instead of re-encoding it in a raw fetch (@dry-reviewer).
-import { MeetingApiClient, type AuthTokenResponse } from '@darktower/sdk-core';
+// SdkErrorCode is the SSoT for the demo's `last-error` code prefixes (errorText
+// renders `${err.code}: ${err.message}`) — expectLastErrorCode types against it
+// so a typo'd prefix is a compile error (@code-reviewer, task #19 Gate 1).
+import {
+  MeetingApiClient,
+  SdkErrorCode,
+  type AuthTokenResponse,
+  type RegisterResponse,
+} from '@darktower/sdk-core';
 import { e2eEnv } from './env.js';
 
 // ============================================================================
@@ -48,8 +56,11 @@ function randomPassword(): string {
 }
 
 /**
- * Fresh throwaway credentials. AC registration is rate-limited to 5/hour — keep
- * the suite at 2 registrations per run (see e2e/README.md budget note).
+ * Fresh throwaway credentials. AC registration is rate-limited — the limit's
+ * SSoT for the Kind cluster this suite targets is
+ * `infra/services/ac-service/configmap.yaml` (`AC_REGISTRATION_RATE_LIMIT_*`,
+ * relaxed to 100/min for dev/test); the suite's per-run registration budget is
+ * tracked in e2e/README.md §Budgets (4/run as of task #19).
  */
 export function randomCredentials(label: string): TestCredentials {
   userCounter += 1;
@@ -58,6 +69,23 @@ export function randomCredentials(label: string): TestCredentials {
     password: randomPassword(),
     displayName: `E2E ${label} ${runId}`,
   };
+}
+
+// ============================================================================
+// Wire paths (module-local single encoding)
+// ============================================================================
+
+// The wire paths this harness observes, each encoded ONCE here (observer-side
+// duplicates of sdk-core's module-private consts — the tracked barrel
+// extraction in docs/TODO.md §Cross-Service Duplication makes each a one-site
+// import swap later; @dry-reviewer, task #19 review). Consumed by BOTH the
+// waitForResponse predicates and the route globs below.
+const REGISTER_PATH = '/api/v1/auth/register';
+const LOGIN_PATH = '/api/v1/auth/user/token';
+
+/** GC's per-meeting join path for `code` (predicates + route globs). */
+function meetingPath(code: string): string {
+  return `/api/v1/meetings/${code}`;
 }
 
 // ============================================================================
@@ -72,19 +100,36 @@ async function fillAuthFields(page: Page, creds: TestCredentials): Promise<void>
 }
 
 /**
+ * Wait for the response whose pathname is exactly `path` while `action` drives
+ * the UI, and return it. THE one encoding of the response-capture idiom
+ * (@dry-reviewer, task #19 review): PATH-only predicate + 15s timeout,
+ * narrowly scoped (the listener ends with the wait). The predicate matching on
+ * path ONLY is load-bearing — callers assert status/body EXACTLY afterwards,
+ * so a wrong-status outcome is a named assertion failure, never an opaque
+ * timeout (@test, task #19 Gate 1).
+ */
+async function captureResponse(
+  page: Page,
+  path: string,
+  action: () => Promise<void>,
+): Promise<Response> {
+  const [response] = await Promise.all([
+    page.waitForResponse((r) => new URL(r.url()).pathname === path, { timeout: 15_000 }),
+    action(),
+  ]);
+  return response;
+}
+
+/**
  * Wait for the auth exchange response on `path` while `action` drives the UI,
- * and return the issued access token. Narrowly scoped: the response predicate
- * matches only the given auth path and the listener ends with the wait.
+ * and return the issued access token.
  */
 async function captureAccessToken(
   page: Page,
   path: string,
   action: () => Promise<void>,
 ): Promise<string> {
-  const [response] = await Promise.all([
-    page.waitForResponse((r) => new URL(r.url()).pathname === path, { timeout: 15_000 }),
-    action(),
-  ]);
+  const response = await captureResponse(page, path, action);
   expect(response.ok(), `auth exchange ${path} failed: HTTP ${response.status()}`).toBe(true);
   // Partial<AuthTokenResponse>: the sdk-core wire type (R-53 camelCase SSoT —
   // covers both /register's RegisterResponse extends AuthTokenResponse and
@@ -104,7 +149,7 @@ export async function signUpViaUi(page: Page, creds: TestCredentials): Promise<s
   await page.getByTestId('nav-signup').click();
   await fillAuthFields(page, creds);
   await page.getByTestId('display-name').fill(creds.displayName);
-  const token = await captureAccessToken(page, '/api/v1/auth/register', () =>
+  const token = await captureAccessToken(page, REGISTER_PATH, () =>
     page.getByTestId('create-account-button').click(),
   );
   await expect(page.getByTestId('meeting-title')).toBeVisible();
@@ -119,7 +164,7 @@ export async function signUpViaUi(page: Page, creds: TestCredentials): Promise<s
 export async function signInViaUi(page: Page, creds: TestCredentials): Promise<string> {
   await page.getByTestId('nav-signin').click();
   await fillAuthFields(page, creds);
-  const token = await captureAccessToken(page, '/api/v1/auth/user/token', () =>
+  const token = await captureAccessToken(page, LOGIN_PATH, () =>
     page.getByTestId('signin-button').click(),
   );
   await expect(page.getByTestId('meeting-title')).toBeVisible();
@@ -155,14 +200,34 @@ export interface JoinedBusEvent {
   readonly mediaServers: readonly string[];
 }
 
+/** Open the join view and fill the meeting code (shared by both join drivers). */
+async function fillJoinForm(page: Page, meetingCode: string): Promise<void> {
+  await page.getByTestId('nav-join').click();
+  await page.getByTestId('meeting-code').fill(meetingCode);
+}
+
 /**
  * Drive the join view: token-based `MeetingSession.join` using the retained
  * session token (post-task-#58 contract — there is NO login step at join time).
  */
 export async function joinAsUser(page: Page, meetingCode: string): Promise<void> {
-  await page.getByTestId('nav-join').click();
-  await page.getByTestId('meeting-code').fill(meetingCode);
+  await fillJoinForm(page, meetingCode);
   await page.getByTestId('join-button').click();
+}
+
+/**
+ * Drive the join view AND capture the HTTP status of GC's join response for
+ * `meetingCode` (task #19 negative paths). The waitForResponse predicate matches
+ * on PATH only — the caller asserts the status EXACTLY afterwards, so a
+ * wrong-status outcome is a named assertion failure, never an opaque timeout
+ * (@test, task #19 Gate 1; same discipline as captureAccessToken above).
+ */
+export async function joinCapturingGcStatus(page: Page, meetingCode: string): Promise<number> {
+  await fillJoinForm(page, meetingCode);
+  const response = await captureResponse(page, meetingPath(meetingCode), () =>
+    page.getByTestId('join-button').click(),
+  );
+  return response.status();
 }
 
 /** Read the replay buffer (empty array when the bus is absent). */
@@ -293,6 +358,158 @@ export async function waitForParticipantJoined(
 }
 
 // ============================================================================
+// Negative-path helpers (task #19, R-45)
+// ============================================================================
+
+/**
+ * A random, WELL-FORMED meeting code that (statistically) matches no meeting.
+ *
+ * FORMAT AUTHORITIES (coupled — @dry-reviewer, task #19 Gate 1): must pass BOTH
+ * the SDK's client-side guard (`packages/sdk-core/src/validation/limits.ts`
+ * `MEETING_CODE_REGEX` = 12 alphanumerics, checked FIRST by `joinMeeting`) and
+ * GC's pre-DB-lookup shape check (`crates/gc-service/src/handlers/meetings.rs`
+ * `MEETING_CODE_LENGTH`), so a rejection is a REAL 404 lookup miss — never a
+ * client-side ValidationError or a GC 400. UUID hex chars are a strict subset
+ * of the allowed alphabet.
+ */
+export function randomMeetingCode(): string {
+  return crypto.randomUUID().replaceAll('-', '').slice(0, 12);
+}
+
+/**
+ * A random, well-formed-but-INVALID JWT-shaped token. Runtime-generated (never
+ * a literal — nothing to leak, nothing for the secrets guards to flag).
+ *
+ * FORMAT AUTHORITY (coupled): three dot-joined segments of UUID hex — a strict
+ * subset of the RFC 7235 token68 charset that
+ * `packages/sdk-core/src/validation/limits.ts:validateUserToken()` enforces, so
+ * the SDK's local header-injection guard passes and the REJECTION decision is
+ * made by the server (GC's `require_user_auth`), which is exactly what the
+ * unauthenticated-join spec must prove.
+ */
+export function garbageToken68(): string {
+  const segment = (): string => crypto.randomUUID().replaceAll('-', '');
+  return `${segment()}.${segment()}.${segment()}`;
+}
+
+/**
+ * Route-FULFILL the AC register exchange with a synthetic `RegisterResponse`
+ * carrying `accessToken` (task #19 auth-rejection Test A). The request never
+ * leaves the browser: AC is never hit, no registration budget is consumed, and
+ * the demo ends up retaining exactly the token we hand it — the ONLY way to put
+ * the UI into its authed shell holding a known-garbage credential (the auth nav
+ * is hidden once a session exists, task #58 B3, so there is no UI path to an
+ * invalid-token state).
+ */
+export async function fulfillAuthRegister(
+  page: Page,
+  creds: TestCredentials,
+  accessToken: string,
+): Promise<void> {
+  const body: RegisterResponse = {
+    accessToken,
+    tokenType: 'Bearer',
+    expiresIn: 3600,
+    userId: crypto.randomUUID(),
+    email: creds.email,
+    displayName: creds.displayName,
+  };
+  await page.route(`**${REGISTER_PATH}`, (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify(body),
+    }),
+  );
+}
+
+/**
+ * Drive the sign-in view EXPECTING the exchange to be rejected; returns the AC
+ * response's HTTP status for the caller to assert EXACTLY (401-exact
+ * discriminates a credential rejection from a 429 rate-limit — @security, task
+ * #19 Gate 1). Counterpart of `signInViaUi`, which asserts success.
+ */
+export async function signInExpectingRejection(
+  page: Page,
+  creds: TestCredentials,
+): Promise<number> {
+  await page.getByTestId('nav-signin').click();
+  await fillAuthFields(page, creds);
+  const response = await captureResponse(page, LOGIN_PATH, () =>
+    page.getByTestId('signin-button').click(),
+  );
+  return response.status();
+}
+
+/**
+ * Intercept GC's join response for `meetingCode` and rewrite ONLY `meetingId`
+ * to a random UUID (task #19 mc-token-rejection): the SDK proceeds holding the
+ * REAL meeting token and the REAL `mcAssignment`, but presents MC a
+ * `meeting_id` that cannot match the token's claim — driving MC's step-6
+ * binding check (`crates/mc-service/src/webtransport/connection.rs`) to its
+ * `Unauthorized` reply. The token passes through the fulfilled body BY VALUE
+ * and is never logged or interpolated anywhere (@semantic-guard item 8).
+ */
+export async function rewriteJoinResponseMeetingId(
+  page: Page,
+  meetingCode: string,
+): Promise<void> {
+  await page.route(`**${meetingPath(meetingCode)}`, async (route) => {
+    const real = await route.fetch();
+    const body = (await real.json()) as Record<string, unknown>;
+    await route.fulfill({
+      response: real,
+      body: JSON.stringify({ ...body, meetingId: crypto.randomUUID() }),
+    });
+  });
+}
+
+/**
+ * Assert NO `joined` bus event exists — a POINT-IN-TIME scan, deliberately not
+ * a wait-for-absence (which would trade flake for coverage). Call ONLY after
+ * the spec's terminal condition is established (error rendered / counter
+ * moved), so "not joined yet" cannot masquerade as "did not join" (@test, task
+ * #19 Gate 1).
+ */
+export async function expectNoJoinedEvent(page: Page, label: string): Promise<void> {
+  const events = await busEvents(page);
+  const joined = events.filter((e) => e['type'] === 'joined');
+  expect(
+    joined,
+    `[${label}] a 'joined' bus event exists — the join SUCCEEDED where this spec requires rejection`,
+  ).toEqual([]);
+}
+
+/**
+ * Wait (bounded) for the demo's `last-error` surface and assert it renders the
+ * TYPED code prefix — `errorText` renders `${err.code}: ${err.message}`, so the
+ * leading `CODE:` pins the SdkError subclass family without depending on the
+ * free-form message text. Returns the full rendered text for optional further
+ * assertion. On absence, the failure names what the bus DID see.
+ */
+export async function expectLastErrorCode(
+  page: Page,
+  code: SdkErrorCode,
+  timeoutMs = 15_000,
+): Promise<string> {
+  const lastError = page.getByTestId('last-error');
+  try {
+    await expect(lastError).toBeVisible({ timeout: timeoutMs });
+  } catch {
+    throw new Error(
+      `no last-error rendered within ${timeoutMs}ms (expected the typed '${code}:' ` +
+        `prefix). ${await busFailureContext(page)}`,
+    );
+  }
+  const text = (await lastError.textContent())?.trim() ?? '';
+  expect(
+    text.startsWith(`${code}:`),
+    `last-error must carry the typed '${code}:' prefix, got: "${text}"`,
+  ).toBe(true);
+  return text;
+}
+
+// ============================================================================
 // Assertion (e): token-only join traffic (task #58 item c-iii)
 // ============================================================================
 
@@ -387,6 +604,10 @@ export function assertTokenOnlyJoinTraffic(
       const scheme = authHeader.split(' ')[0] ?? '<empty>';
       nonBearerAuthHeaders.push(redact(`${record.method} ${record.url} (scheme: ${scheme})`));
     }
+    // DELIBERATELY independent literals (NOT the module consts above): a test
+    // asserting the ABSENCE of auth calls must not derive the forbidden prefix
+    // from the same encoding the drivers use — see docs/TODO.md
+    // §Cross-Service Duplication, #18 entry, nuance (b). Do not "clean up".
     const pathname = new URL(record.url).pathname;
     if (pathname.startsWith('/api/v1/auth/')) {
       authCalls.push(redact(`${record.method} ${record.url}`));

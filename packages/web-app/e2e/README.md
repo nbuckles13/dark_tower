@@ -1,4 +1,4 @@
-# Browser E2E (Playwright) — task #18
+# Browser E2E (Playwright) — tasks #18/#19
 
 Playwright specs that drive the **real product surface**: real Chromium, the real
 WebTransport API (including `serverCertificateHashes` cert pinning), and the real
@@ -47,6 +47,39 @@ only):
   endpoint is hit (the removed forced-login band-aid, commit 7b69288, must never
   come back), and GC requests authenticate via `Authorization: Bearer` only
 
+## What the negative-path specs assert (task #19, R-45)
+
+Each spec pins the **typed** error discriminant (the `CODE:` prefix `errorText`
+renders — never free message text) plus at least one status-exact or
+server-side observation, so a dead cluster / rate-limit 429 / wrong-hop
+rejection cannot false-pass it:
+
+- **`auth-rejection.spec.ts`** (0 registrations) — both credential-rejection
+  hops. Test A: the demo retains a runtime-generated garbage token (the
+  register exchange is route-fulfilled; AC is never hit) and joins → GC responds
+  exactly **401** and the demo drops the session (the session-drop policy fires
+  ONLY on `MeetingUnauthorizedError` — that behavior IS the typed-error
+  assertion). Test B: sign-in with never-registered credentials → AC responds
+  exactly **401** and `last-error` renders the typed `AUTH:` prefix (the literal
+  R-45 "typed AuthError in the demo UI" surface).
+- **`meeting-not-found.spec.ts`** (1 registration) — a real user joins a
+  random well-formed code → GC responds exactly **404**, `last-error` renders
+  the typed `MEETING:` prefix and **stays** rendered (nav-signin must NOT
+  reappear: a 404 is not a credential rejection, discriminating this path from
+  the 401 session drop).
+- **`mc-token-rejection.spec.ts`** (1 registration) — a real token + real
+  `mcAssignment`, but the GC join response's `meetingId` is route-rewritten to
+  garbage: MC's step-6 binding check rejects with the bounded generic
+  `Unauthorized` → `last-error` renders the typed `SIGNALING:` prefix **and**
+  MC's own `mc_session_join_failures_total{error_type="jwt_validation"}` rises
+  above a pre-join baseline (the server-side proof — a dead/unreachable MC also
+  yields `SIGNALING:` in the DOM but structurally cannot increment its own
+  rejection counter).
+
+All three additionally assert that no `joined` bus event exists (a
+point-in-time scan after each spec's terminal condition — never a
+wait-for-absence).
+
 ## Prerequisites (host-side)
 
 1. **Kind cluster with AC+GC+MC+MH _and_ the observability stack**:
@@ -76,9 +109,22 @@ dev mode: a `pnpm preview`/prod server has the `__E2E_HOOKS__` bus
 dead-code-eliminated and every spec fails in `waitForJoined` with a message
 naming this failure mode).
 
-**Manual invocation only for now.** This suite is _not_ wired into
-`scripts/layer-all.sh` Layer 7 — pipeline integration, sharding, and the
-`@smoke` tag are story task #19.
+**Pipeline wiring (task #19, R-48).** `scripts/layer7.sh` runs this suite as
+its second Phase-2 step: sequentially **after** `cargo test -p env-tests
+--features all`, against the same live Kind cluster, under the same
+single-attempt Layer-7 budget (its own 600s wall clock,
+`DEVLOOP_BROWSER_E2E_TIMEOUT`). It is **diff-triggered** — it runs only when
+the diff touches `packages/**`/TS root manifests (via `lang/ts/changed.sh`),
+`proto/`, or a browser-observable backend crate (the
+`__BROWSER_E2E_TRIGGER_PATHS` array in `layer7.sh` is the one encoding); an
+untriggered diff emits an explicit `STATUS=SKIPPED-NO-DIFF
+REASON=browser-e2e-no-diff` child line. If the Rust env-tests fail first, the
+browser suite is not run that attempt (loud `browser-e2e-not-run:` stderr note;
+it runs on the retry). Missing dev certs or a missing Playwright Chromium
+surface as `PRECONDITION_FAILURE` (operator lane) **before** either suite runs
+— never as a cryptic spec timeout. Triage: `docs/runbooks/devloop-validation.md`
+§6.7. The layer exports `E2E_*`/`VITE_*_PROXY_TARGET` from the helper's
+ports.json, so a pipeline run needs none of the manual env knobs below.
 
 ### Environment knobs (defaults = static Kind config)
 
@@ -96,11 +142,20 @@ counterpart). MC/MH endpoints come exclusively from the join response's
 
 ## Budgets and policies
 
-- **AC registration limit: 5/hour.** The suite registers **2 throwaway users per
-  run** — more than 2 consecutive runs within an hour will exhaust the limit and
-  sign-up fails with 429; wait for the window to pass or reseed the cluster.
-  This suite assumes a **single workstation against its own cluster**; it is not
-  designed for concurrent runs sharing one cluster's rate-limit budget.
+- **Registration budget: 4 throwaway users per run** (happy path 2 +
+  meeting-not-found 1 + mc-token-rejection 1; auth-rejection registers 0). The
+  rate-limit **SSoT is the AC config the target cluster actually runs**: the
+  Kind cluster this suite targets ships
+  `infra/services/ac-service/configmap.yaml`
+  (`AC_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS: "100"` per 1-minute window,
+  relaxed for dev/test), so consecutive runs and the Layer-7 retry are safe. A
+  **prod-configured AC** target instead gets the production default of 5 per
+  60-minute window (`crates/ac-service/src/config.rs`
+  `DEFAULT_REGISTRATION_RATE_LIMIT_*`) — there, a second same-hour run exhausts
+  the budget and sign-up fails 429 (the negative specs' 401/404-exact
+  assertions cannot mistake that 429 for a pass). This suite assumes a
+  **single workstation against its own cluster**; it is not designed for
+  concurrent runs sharing one cluster's rate-limit budget.
 - **`retries: 0`** (ADR-0028): a failure is real. Fix it or delete the test —
   never mask with retries.
 - **Timeouts**: 120s/test ceiling; assertion-meaningful waits are tighter (5s
@@ -115,7 +170,11 @@ Failures leave traces/screenshots in `test-results/` (gitignored):
 pnpm exec playwright show-trace test-results/<test-dir>/trace.zip
 ```
 
-**Artifact hygiene**: traces record full request/response traffic — including
-the run's synthetic credentials and bearer tokens for the local dev cluster.
-They are disposable per-run values, but do not promote artifacts to shared
-storage or attach them to issues.
+**Artifact hygiene**: retain-on-failure traces capture full network
+request/response **bodies** and therefore CAN contain live credentials — real
+user and meeting tokens for the cluster the run targeted — **local-only,
+gitignored, treat as sensitive**. They persist across pipeline runs by design
+(they live outside `DEVLOOP_TMP`'s per-run `layer-*.log` cleanup — that is what
+makes them useful for triage). The tokens are disposable per-run values for a
+local dev cluster, but do not promote artifacts to shared storage or attach
+them to issues.
