@@ -46,10 +46,38 @@ TASK_TIMEOUT="${STORY_TASK_TIMEOUT:-14400}"
 # Session-limit waits per task before falling through to escalation.
 SESSION_LIMIT_RETRIES="${STORY_SESSION_LIMIT_RETRIES:-2}"
 
+# Model for devloop sessions (Lead + teammates inherit). Default Opus: the
+# ~200-devloop baseline ran on Opus-class models (comparability), the gate
+# structure catches implementation mistakes regardless, and quota windows —
+# not model capability — are the binding constraint on story throughput.
+# Judgment-heavy work (planning, escalation triage) stays on the strongest
+# model in interactive sessions.
+STORY_MODEL="${STORY_MODEL:-claude-opus-4-8}"
+
 scripts/workflow/preflight-story.sh "$STORY_FILE"
+
+# Best-effort cost telemetry: sum every result event in the task's log (all
+# attempts, including cross-invocation resumes, append to the same file).
+# Telemetry only — never routes control flow; classification uses the canary.
+report_task_cost() {
+  local id="$1" summary
+  summary="$( (grep -h '"type":"result"' "$RUN_DIR/task-${id}.devloop.log" 2>/dev/null || true) \
+    | jq -s --argjson task "$id" 'select(length > 0) | {
+        task: $task, attempts: length,
+        usd: (map(.total_cost_usd // 0) | add * 100 | round / 100),
+        output_tokens: (map(.usage.output_tokens // 0) | add),
+        cache_read_tokens: (map(.usage.cache_read_input_tokens // 0) | add),
+        turns: (map(.num_turns // 0) | add),
+        api_minutes: ((map(.duration_api_ms // 0) | add) / 60000 | round)
+      }' 2>/dev/null)" || true
+  [ -n "$summary" ] || return 0
+  echo "$summary" >>"$RUN_DIR/cost-ledger.jsonl"
+  echo "STORY_RUN: COST $(jq -r '"task=\(.task) attempts=\(.attempts) usd=\(.usd) output_tokens=\(.output_tokens) cache_read_tokens=\(.cache_read_tokens) turns=\(.turns) api_minutes=\(.api_minutes)"' <<<"$summary")"
+}
 
 escalate() {
   local id="$1" reason="$2" log="$3"
+  report_task_cost "$id"
   "$DT_STORY" escalate "$STORY_FILE" "$id" --reason "$reason" --log "$log" \
     --out "$RUN_DIR/escalation.json"
   echo "STORY_RUN: ESCALATED task=${id} reason=${reason} log=${log}" >&2
@@ -163,6 +191,7 @@ while :; do
     DEVLOOP_HEADLESS=1 DEVLOOP_START_HEAD="$head_before" \
       DEVLOOP_STOP_COUNT_FILE="$stop_count_file" \
       timeout "$TASK_TIMEOUT" claude -p "$task_prompt" \
+      --model "$STORY_MODEL" \
       --output-format stream-json --verbose \
       --dangerously-skip-permissions >>"$tasklog" 2>&1
     claude_rc=$?
@@ -282,6 +311,7 @@ while :; do
   fi
   rm -f "$slug_file" "$start_marker" "$stop_count_file"
   echo "STORY_RUN: COMPLETE task=${id} commit=$(git rev-parse --short HEAD)"
+  report_task_cost "$id"
 done
 
 # Story-close gate: the full pipeline, layer 7 included, on the final tree.
@@ -294,6 +324,14 @@ if [ "$rc" -ne 0 ]; then
   tail -n 50 "$closelog"
   echo "STORY_RUN: story-close gate red (log=${closelog})" >&2
   exit "$rc"
+fi
+
+# Story-level cost rollup (last ledger entry per task — later entries for a
+# resumed task are supersets of earlier partials).
+if [ -f "$RUN_DIR/cost-ledger.jsonl" ]; then
+  jq -s -r 'group_by(.task) | map(last)
+    | "STORY_RUN: STORY-COST tasks=\(length) usd=\(map(.usd) | add * 100 | round / 100) output_tokens=\(map(.output_tokens) | add) api_minutes=\(map(.api_minutes) | add)"' \
+    "$RUN_DIR/cost-ledger.jsonl" 2>/dev/null || true
 fi
 
 echo "STORY_RUN: ALL TASKS COMPLETE — story-close gate green. Next step: /close-story"
