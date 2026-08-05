@@ -57,6 +57,35 @@ escalate() {
   exit 1
 }
 
+# Canary probe: a minimal haiku request whose single-object JSON output is
+# classifiable by field access. Consulted only to explain a devloop failure —
+# when the environment is broken (quota, auth, network) the canary fails the
+# same way, and classifying its 2-line output replaces signature-grepping the
+# devloop's stream log (which misclassified two incidents: attempt-boundary
+# contamination 2026-08-04, result line buried by teammate wind-down events
+# 2026-08-05).
+canary_probe() {
+  local out="$1"
+  timeout 120 claude -p "Reply with exactly: ok" --model haiku \
+    --output-format json --dangerously-skip-permissions >"$out" 2>&1
+}
+
+# Classify a canary output file: healthy | session-limit | auth-expired | infra
+canary_classify() {
+  local out="$1" is_err status text
+  is_err="$(jq -r '.is_error // false' "$out" 2>/dev/null)" || { echo infra; return 0; }
+  status="$(jq -r '.api_error_status // empty' "$out" 2>/dev/null)" || true
+  text="$(jq -r '.result // empty' "$out" 2>/dev/null)" || true
+  if [ "$is_err" = "false" ] && [ -n "$text" ]; then echo healthy; return 0; fi
+  if [ "$status" = "429" ] || printf '%s' "$text" | grep -q 'session limit'; then
+    echo session-limit; return 0
+  fi
+  if printf '%s' "$text" | grep -qi 'authenticat\|oauth'; then
+    echo auth-expired; return 0
+  fi
+  echo infra
+}
+
 # Persist the --continue pointer for the current task if its devloop created
 # an output dir and nothing was committed. Uses the per-task vars set in the
 # main loop. Safe to call on any exit path; no-op if already persisted.
@@ -130,7 +159,6 @@ while :; do
     # session end, leaving the log empty for the whole run. JSONL events make
     # `tail -f` useful; filter with e.g.
     #   jq -r 'select(.type=="assistant") | .message.content[]? | .text? // empty'
-    attempt_off="$(stat -c %s "$tasklog" 2>/dev/null || echo 0)"
     set +e
     DEVLOOP_HEADLESS=1 DEVLOOP_START_HEAD="$head_before" \
       DEVLOOP_STOP_COUNT_FILE="$stop_count_file" \
@@ -140,57 +168,67 @@ while :; do
     claude_rc=$?
     set -e
 
-    # Failure signatures are read from THIS attempt's log slice only — the
-    # task log is append-mode, and a previous attempt's 429 lines in the tail
-    # would misclassify a different failure (observed 2026-08-04: auth-expired
-    # treated as session-limit, runner slept instead of stopping).
-    attempt_tail="$(tail -c +"$((attempt_off + 1))" "$tasklog" | tail -n 5)"
-
-    # Auth-expired lane: pure infra, needs a human (host /login + container
-    # restart to re-copy credentials). No manifest edit — the task stays
-    # pending and the resume pointer survives, so a rerun picks up cleanly.
-    if printf '%s' "$attempt_tail" | grep -q 'authentication_failed\|OAuth session expired'; then
-      persist_resume_pointer
-      echo "STORY_RUN: AUTH-EXPIRED task=${id} — run /login on the host, restart the container (entrypoint re-copies credentials), then rerun to resume" >&2
-      exit 2
-    fi
-
-    # Session-limit lane (infra, not a task failure): the dying session cannot
-    # handle its own 429 — its API is what's refusing. Wait out the window and
-    # resume the same devloop via --continue instead of escalating.
-    if [ "$claude_rc" -ne 0 ] && [ "$limit_waits" -lt "$SESSION_LIMIT_RETRIES" ] \
-        && printf '%s' "$attempt_tail" | grep -q 'api_error_status":429\|hit your session limit'; then
-      limit_waits=$((limit_waits + 1))
-      sleep_secs=3600
-      reset_txt="$(printf '%s' "$attempt_tail" | grep -o 'resets [0-9]\+:[0-9]\+[ap]m' | tail -n 1 | cut -d' ' -f2)"
-      if [ -n "$reset_txt" ]; then
-        reset_epoch="$(date -u -d "$reset_txt" +%s 2>/dev/null || echo 0)"
-        now_epoch="$(date -u +%s)"
-        if [ "$reset_epoch" -gt 0 ]; then
-          [ "$reset_epoch" -le "$now_epoch" ] && reset_epoch=$((reset_epoch + 86400))
-          sleep_secs=$((reset_epoch - now_epoch + 300))
-        fi
-      fi
-      # Sanity cap only: the reset time comes from the API's own 429 message,
-      # and daily/weekly quota resets can be many hours out — clamping a
-      # correct long wait just schedules doomed retries (parse failures take
-      # the 1h fallback above and never reach this cap).
-      [ "$sleep_secs" -gt 93600 ] && sleep_secs=93600
-      if [ -z "$continue_slug" ]; then
-        # Resume target: the devloop output dir this task created.
-        continue_slug="$(find docs/devloop-outputs -mindepth 1 -maxdepth 1 -type d \
-          -newer "$start_marker" -printf '%T@ %f\n' 2>/dev/null | sort -rn | head -n 1 | cut -d' ' -f2-)"
-        if [ -n "$continue_slug" ] && [ -f "docs/devloop-outputs/${continue_slug}/main.md" ]; then
-          echo "$continue_slug" >"$slug_file"
-        else
-          continue_slug=""   # nothing to resume — clean up and retry fresh
-          git reset --hard -q "$head_before"
-          git clean -fdq
-        fi
-      fi
-      echo "STORY_RUN: SESSION-LIMIT task=${id} wait=${sleep_secs}s resume=${continue_slug:-fresh} (${limit_waits}/${SESSION_LIMIT_RETRIES})"
-      sleep "$sleep_secs"
-      continue
+    if [ "$claude_rc" -ne 0 ]; then
+      cfile="$RUN_DIR/task-${id}.canary.json"
+      canary_probe "$cfile" || true
+      case "$(canary_classify "$cfile")" in
+        auth-expired)
+          # Pure infra, needs a human (host /login + container restart to
+          # re-copy credentials). No manifest edit — the task stays pending
+          # and the resume pointer survives, so a rerun picks up cleanly.
+          persist_resume_pointer
+          echo "STORY_RUN: AUTH-EXPIRED task=${id} — run /login on the host, restart the container (entrypoint re-copies credentials), then rerun to resume" >&2
+          exit 2
+          ;;
+        infra)
+          persist_resume_pointer
+          echo "STORY_RUN: INFRA task=${id} — API unreachable or canary unclassifiable (${cfile}); manifest untouched, rerun to resume" >&2
+          exit 2
+          ;;
+        session-limit)
+          # Infra, not a task failure: wait out the window, resume the same
+          # devloop via --continue. Retries exhausted falls through to the
+          # generic escalation below.
+          if [ "$limit_waits" -lt "$SESSION_LIMIT_RETRIES" ]; then
+            limit_waits=$((limit_waits + 1))
+            sleep_secs=3600
+            reset_txt="$(jq -r '.result // empty' "$cfile" 2>/dev/null \
+              | grep -o 'resets [0-9]\+:[0-9]\+[ap]m' | cut -d' ' -f2 || true)"
+            if [ -n "$reset_txt" ]; then
+              reset_epoch="$(date -u -d "$reset_txt" +%s 2>/dev/null || echo 0)"
+              now_epoch="$(date -u +%s)"
+              if [ "$reset_epoch" -gt 0 ]; then
+                [ "$reset_epoch" -le "$now_epoch" ] && reset_epoch=$((reset_epoch + 86400))
+                sleep_secs=$((reset_epoch - now_epoch + 300))
+              fi
+            fi
+            # Sanity cap only: the reset time comes from the API's own
+            # message, and daily/weekly resets can be many hours out. A
+            # relaunch into a still-closed window dies on its first request
+            # in seconds, so a wrong sleep costs a retry slot, not dollars.
+            [ "$sleep_secs" -gt 93600 ] && sleep_secs=93600
+            if [ -z "$continue_slug" ]; then
+              # Resume target: the devloop output dir this task created.
+              continue_slug="$(find docs/devloop-outputs -mindepth 1 -maxdepth 1 -type d \
+                -newer "$start_marker" -printf '%T@ %f\n' 2>/dev/null | sort -rn | head -n 1 | cut -d' ' -f2-)"
+              if [ -n "$continue_slug" ] && [ -f "docs/devloop-outputs/${continue_slug}/main.md" ]; then
+                echo "$continue_slug" >"$slug_file"
+              else
+                continue_slug=""   # nothing to resume — clean up and retry fresh
+                git reset --hard -q "$head_before"
+                git clean -fdq
+              fi
+            fi
+            echo "STORY_RUN: SESSION-LIMIT task=${id} wait=${sleep_secs}s resume=${continue_slug:-fresh} (${limit_waits}/${SESSION_LIMIT_RETRIES})"
+            sleep "$sleep_secs"
+            continue
+          fi
+          ;;
+        healthy)
+          # Environment fine — the failure was task/session-specific.
+          # Fall through to the escalation checks below.
+          ;;
+      esac
     fi
     break
   done
