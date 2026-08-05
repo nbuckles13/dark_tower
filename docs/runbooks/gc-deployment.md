@@ -275,6 +275,131 @@ Minimum required smoke tests:
 - [ ] Readiness check returns 200 OK
 - [ ] Metrics endpoint returns Prometheus format
 - [ ] Authenticated endpoint works (with valid token)
+- [ ] CORS preflight from an allowed origin returns 200 + `Access-Control-Allow-Origin` (stanza a)
+- [ ] CORS preflight from a disallowed origin returns 403 with no `Access-Control-Allow-Origin` (stanza b)
+- [ ] Telemetry proxy accepts an authenticated OTLP POST — 202 (stanza c)
+- [ ] Telemetry proxy rejects an unauthenticated POST — 401 (stanza d)
+- [ ] Telemetry proxy rejects an oversize body — 413 (stanza e)
+- [ ] Telemetry proxy rate-limits a per-user burst — 202s then 429s (stanza f)
+
+#### CORS + Telemetry Proxy Smoke Tests (R-1 / R-2)
+
+**Purpose:** Verify the browser-facing CORS allowlist (`crates/gc-service/src/middleware/cors_observer.rs`, `crates/gc-service/src/routes/mod.rs::build_cors_layer`) and the sanitizing OTLP telemetry proxy (`crates/gc-service/src/handlers/telemetry.rs::ingest`) behave correctly after deploy.
+
+**Prerequisites (shared by every stanza below):**
+
+```bash
+# Port-forward to a GC pod
+kubectl port-forward -n dark-tower deployment/gc-service 8080:8080 &
+```
+
+- An allowed origin must be configured in `CORS_ALLOWED_ORIGINS` (this runbook assumes `http://localhost:5173`; confirm with `kubectl get configmap gc-service -n dark-tower -o yaml | grep CORS_ALLOWED_ORIGINS`). The allowlist is fail-closed (empty ⇒ no origin allowed) and never `*`.
+- A user access token is needed for the authenticated telemetry stanzas. Obtain one with the AC-login pattern from Test 5 (camelCase `accessToken` per the API contract):
+
+```bash
+USER_TOKEN=$(curl -s -X POST http://ac-service.dark-tower.svc.cluster.local:8082/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d "{\"email\":\"$SMOKE_EMAIL\",\"password\":\"$SMOKE_PASSWORD\"}" \
+  | jq -r '.accessToken')
+```
+
+- The telemetry stanzas POST the canned fixture `infra/smoke/empty-otlp-metrics.bin` (a valid `ExportMetricsServiceRequest` with zero data points) with `Content-Type: application/x-protobuf`. Stanzas expecting **202** additionally require the in-cluster OTel collector to be reachable (an unreachable collector yields 502; an empty `OTEL_COLLECTOR_ENDPOINT` yields 503).
+
+**(a) CORS preflight from an ALLOWED origin → 200 + ACAO**
+
+```bash
+curl -i -X OPTIONS http://localhost:8080/api/v1/meetings \
+  -H "Origin: http://localhost:5173" \
+  -H "Access-Control-Request-Method: POST" \
+  -H "Access-Control-Request-Headers: authorization,content-type"
+```
+
+Expected:
+
+```
+HTTP/1.1 200 OK
+Access-Control-Allow-Origin: http://localhost:5173
+```
+
+> **NOTE (behavior vs. expectation):** an allowed preflight returns **200 OK, NOT 204**. `tower_http`'s `CorsLayer` short-circuits a genuine preflight with 200, and `cors_preflight_observer` passes that 200 through untouched — see the unit test `allowed_preflight_passes_through_200_with_acao`, which asserts `StatusCode::OK`. The echoed `Access-Control-Allow-Origin` is the exact configured origin, never `*` (the layer is built explicit-origins-only with `allow_credentials(false)`).
+
+**(b) CORS preflight from a DISALLOWED origin → 403, no ACAO**
+
+```bash
+curl -i -X OPTIONS http://localhost:8080/api/v1/meetings \
+  -H "Origin: https://evil.example.com" \
+  -H "Access-Control-Request-Method: POST"
+```
+
+Expected: `HTTP/1.1 403 Forbidden`, with **no** `Access-Control-Allow-Origin` header, no `Access-Control-Allow-Credentials`, and an empty body. `cors_preflight_observer` rewrites the layer's denied 200-no-ACAO into a fresh 403 and records `gc_cors_preflight_total{origin_class="denied",status="403"}` (the denied-preflight warn log carries the structured `requested_origin` field).
+
+**(c) Telemetry proxy — AUTHENTICATED OTLP POST → 202**
+
+```bash
+curl -i -X POST http://localhost:8080/api/v1/telemetry/v1/metrics \
+  -H "Authorization: Bearer $USER_TOKEN" \
+  -H "Content-Type: application/x-protobuf" \
+  --data-binary @infra/smoke/empty-otlp-metrics.bin
+```
+
+Expected: `HTTP/1.1 202 Accepted`. The proxy decodes the OTLP request, applies the deny-by-default PII filter (a no-op for the empty fixture), re-encodes, and forwards to the collector. A 502 means the collector is unreachable (`GcError::BadGateway`); a 503 means the proxy is disabled (empty `OTEL_COLLECTOR_ENDPOINT`).
+
+**(d) Telemetry proxy — UNAUTHENTICATED → 401**
+
+```bash
+curl -i -X POST http://localhost:8080/api/v1/telemetry/v1/metrics \
+  -H "Content-Type: application/x-protobuf" \
+  --data-binary @infra/smoke/empty-otlp-metrics.bin
+```
+
+Expected:
+
+```
+HTTP/1.1 401 Unauthorized
+WWW-Authenticate: Bearer realm="dark-tower-api", error="invalid_token"
+```
+
+The route sits behind `require_user_auth`; a missing Bearer token is rejected before the handler runs.
+
+**(e) Telemetry proxy — OVERSIZE body (> 256 KiB) → 413**
+
+```bash
+# 300000 bytes (~293 KiB): above the 256 KiB user-facing limit, below the 512 KiB
+# (2x) layer ceiling, so it hits the handler's exact-limit gate (status="rejected_size").
+head -c 300000 /dev/zero > /tmp/oversize-otlp.bin
+
+curl -i -X POST http://localhost:8080/api/v1/telemetry/v1/metrics \
+  -H "Authorization: Bearer $USER_TOKEN" \
+  -H "Content-Type: application/x-protobuf" \
+  --data-binary @/tmp/oversize-otlp.bin
+
+rm -f /tmp/oversize-otlp.bin
+```
+
+Expected: `HTTP/1.1 413 Payload Too Large` with body code `PAYLOAD_TOO_LARGE`. The size check (`body.len() > telemetry_proxy_max_bytes`; default `DEFAULT_TELEMETRY_PROXY_MAX_BYTES` = 262144) runs FIRST — before content-type and before OTLP decode — so the oversize body is rejected regardless of content. A body above 512 KiB (2×) is instead rejected by the route `DefaultBodyLimit` layer (still 413, but no `rejected_size` metric).
+
+**(f) Telemetry proxy — per-user RATE-LIMIT burst → 202s then 429s**
+
+```bash
+# Use a token whose `sub` has an unspent budget (a dedicated smoke account is
+# cleanest: the GCRA cell is keyed on JWT `sub`, so re-logging the same user
+# does NOT reset it). Acquire it from a SEPARATE account than $USER_TOKEN:
+BURST_TOKEN=$(curl -s -X POST http://ac-service.dark-tower.svc.cluster.local:8082/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d "{\"email\":\"$SMOKE_BURST_EMAIL\",\"password\":\"$SMOKE_BURST_PASSWORD\"}" \
+  | jq -r '.accessToken')
+
+# Fire 70 rapid sequential POSTs.
+for i in $(seq 1 70); do
+  curl -s -o /dev/null -w "%{http_code}\n" -X POST \
+    http://localhost:8080/api/v1/telemetry/v1/metrics \
+    -H "Authorization: Bearer $BURST_TOKEN" \
+    -H "Content-Type: application/x-protobuf" \
+    --data-binary @infra/smoke/empty-otlp-metrics.bin
+done | sort | uniq -c
+```
+
+Expected: a mix of `202` then `429` — roughly the first ~60 return **202** and the remainder return **429** (`RATE_LIMIT_EXCEEDED`). The per-user limiter is a `governor` GCRA quota of `DEFAULT_TELEMETRY_PROXY_RATE_LIMIT_PER_MINUTE` = 60 requests/minute keyed on JWT `sub`, so burst capacity is 60 and cells replenish at ~1/second — the exact 202/429 split depends on how long the loop takes. The 429 rejection (`status="rejected_rate"`, and `gc_telemetry_rate_limited_total{reason="per_user"}`) fires before OTLP decode/forward.
 
 ### 7. Monitor Metrics
 

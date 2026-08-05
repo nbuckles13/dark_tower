@@ -23,6 +23,8 @@
    - [Scenario 9: Meeting Code Collision](#scenario-9-meeting-code-collision)
    - [Scenario 10: Telemetry Proxy High Rejection Rate](#scenario-10-telemetry-proxy-high-rejection-rate)
    - [Scenario 11: Telemetry Ingest Silent](#scenario-11-telemetry-ingest-silent)
+   - [Scenario 12: CORS Misconfiguration Post-Deploy](#scenario-12-cors-misconfiguration-post-deploy)
+   - [Scenario 13: Telemetry Proxy Unreachable / Rate-Limit Storm](#scenario-13-telemetry-proxy-unreachable--rate-limit-storm)
 4. [Diagnostic Commands](#diagnostic-commands)
 5. [Recovery Procedures](#recovery-procedures)
 6. [Postmortem Template](#postmortem-template)
@@ -1312,6 +1314,158 @@ sum(rate(gc_telemetry_ingest_total[15m])) > 0
 - If CORS/auth regression from a GC config or code change, escalate to GC Team; auth-side to AC Team
 - If a client release disabled or broke telemetry, escalate to Client/Web-App Team
 - If silence persists with no identified cause, escalate to Observability Team (#observability) — collector-side ingestion may be masking a deeper issue
+
+---
+
+### Scenario 12: CORS Misconfiguration Post-Deploy
+
+**Alert**: none dedicated — surfaces via `GCTelemetryProxySilent` (Scenario 11) when browser telemetry stops, or via user reports of blocked browser API calls
+**Severity**: P2 (High) — browser clients broken while server health is normal
+**Runbook Section**: `#scenario-12-cors-misconfiguration-post-deploy`
+**Trigger context**: a gc-service config or image rollout that changed `CORS_ALLOWED_ORIGINS`
+
+**Symptoms**:
+- Spike in `gc_cors_preflight_total{origin_class="denied",status="403"}` immediately after a gc-service rollout
+- Browser console errors on cross-origin `/api/v1/*` calls ("blocked by CORS policy", missing `Access-Control-Allow-Origin`)
+- Frequently arrives first as Scenario 11 (Telemetry Ingest Silent) — browser telemetry POSTs are blocked at preflight before reaching the handler
+- Server-side health (`gc_http_requests_total` overall rate + error rate, `/health`, `/ready`) is normal — the breakage is browser-only
+
+A `denied`/`403` climb while `allowed` drops right after a deploy signals a CORS regression — run the `gc_cors_preflight_total` preflight query from **Scenario 11 step 2** (not restated here, single source).
+
+**Diagnosis**:
+
+```bash
+# 1. Confirm the denial pattern and the requested origins. Denied-preflight warn
+#    logs carry the structured requested_origin field (never string-interpolated).
+kubectl logs -n dark-tower -l app=gc-service --tail=500 | grep -i "CORS preflight denied"
+
+# 2. Inspect the live allowlist knob.
+kubectl get configmap gc-service -n dark-tower -o yaml | grep CORS_ALLOWED_ORIGINS
+#   Empty value            -> fail-closed: ALL cross-origin browser requests blocked
+#   Missing the real origin -> that origin specifically blocked
+#   Value "*"               -> does NOT widen: config keeps "*" verbatim, and "*" parses
+#                              as a valid HeaderValue, so it reaches AllowOrigin::list,
+#                              which PANICS on a wildcard (tower-http 0.5.2) -> gc-service
+#                              crashes at startup (pod CrashLoopBackOff / rollout never
+#                              Ready). Net effect: "*" never widens the allowlist, but via
+#                              a hard startup crash, not a silent ignore.
+
+# 3. Diff against last-good to pinpoint the regression. The ConfigMap + overlay are
+#    the single source; crates/gc-service/src/config.rs parses CORS_ALLOWED_ORIGINS.
+git log -p --oneline -- infra/services/gc-service/configmap.yaml \
+  infra/kubernetes/overlays/*/services/gc-service/ | head -80
+```
+
+For the shared `gc_cors_preflight_total` allowlist query and the fail-closed semantics, cross-reference **Scenario 11 step 2** (do not re-run both paths). This scenario adds only the deploy-time entry point.
+
+**Common Root Causes**:
+
+1. **Allowlist emptied by a bad config merge**: an overlay/ConfigMap change dropped `CORS_ALLOWED_ORIGINS` to empty → fail-closed, every browser origin blocked
+   - Check: step 2 (empty value)
+   - Fix: restore the correct explicit origins
+2. **New client origin not added**: the web-app moved to a new origin (host/port/scheme) never added to the allowlist
+   - Check: step 1 (the blocked origin appears in the warn logs) + step 2
+   - Fix: add that specific origin
+3. **Someone "fixed" it with `*`**: a `*` in `CORS_ALLOWED_ORIGINS` does NOT allow-all — it panics `AllowOrigin::list` at router build (tower-http 0.5.2), so gc-service crashes at startup and the symptom flips from browser-only breakage to gc-service not coming up (CrashLoopBackOff / rollout stuck)
+   - Check: step 2 shows `*` AND the pod is crashlooping / the rollout is stuck (not Ready)
+   - Fix: replace `*` with the explicit origin(s)
+
+**Remediation**:
+
+```bash
+# Add the SPECIFIC missing origin(s) to CORS_ALLOWED_ORIGINS — comma-separated,
+# explicit, NEVER "*" and never allow-all (the layer is fail-closed by design and
+# runs with allow_credentials(false); a "*" entry does NOT allow-all — it panics
+# AllowOrigin::list and crashes gc-service at startup).
+# Edit infra/services/gc-service/configmap.yaml (or the env overlay), then:
+kubectl rollout restart deployment/gc-service -n dark-tower
+kubectl rollout status deployment/gc-service -n dark-tower
+
+# Alternatively, if the regression came from a specific deploy, roll that back:
+kubectl rollout undo deployment/gc-service -n dark-tower
+```
+
+**Verify** with the deploy smoke stanzas (gc-deployment.md §6, "CORS + Telemetry Proxy Smoke Tests"): stanza (a) — the real client origin now returns 200 + `Access-Control-Allow-Origin`; stanza (b) — a disallowed origin still returns 403. Confirm `gc_cors_preflight_total{origin_class="denied"}` falls back to baseline. Expected recovery: 2-3 minutes + client page reloads.
+
+**Escalation**:
+- Regression from a GC config/image change → GC Team; client changed origin without coordination → Client/Web-App Team
+- If total telemetry silence accompanied it, resolving CORS should clear Scenario 11 — re-verify `sum(rate(gc_telemetry_ingest_total[15m])) > 0`
+
+---
+
+### Scenario 13: Telemetry Proxy Unreachable / Rate-Limit Storm
+
+**Alert**: `GCTelemetryProxyHighRejectionRate` (warning); may co-fire with `GCTelemetryProxySilent` (page) if accepted ingest also stops
+**Severity**: P2 (High) — degraded client-side observability
+**Runbook Section**: `#scenario-13-telemetry-proxy-unreachable--rate-limit-storm`
+**Related**: focused companion to **Scenario 10** (Telemetry Proxy High Rejection Rate) and **Scenario 11** (Telemetry Ingest Silent). Use their diagnosis for the rejection-rate taxonomy and the silence shapes; this scenario adds only the two angles they do not fully cover: (i) distinguishing a broken GC→collector network path from a collector-pod outage, and (ii) a burst-shaped per-user rate-limit storm.
+
+> **Do not restate 10/11.** For the `status`-value fault split (`rejected_size` / `rejected_rate` / `error`), the `error`→502/503 collector branch, and the `endpoint="/other"` conflation caveat, follow **Scenario 10 → Diagnosis**. For the silent-ingest branches (flat vs absent series, auth-401 pre-handler), follow **Scenario 11 → Diagnosis**. The alert PromQL/thresholds live in `docs/observability/alerts.md` and `infra/docker/prometheus/rules/gc-alerts.yaml` — not repeated here.
+
+#### 13a. Collector unreachable (502 storm)
+
+**Symptoms**:
+- `GCTelemetryProxyHighRejectionRate` firing with the `error` status dominating (Scenario 10 step 1), paired with 502s on the telemetry path
+- 502 body code `BAD_GATEWAY` ("Telemetry collector is unavailable"); GC logs a `gc.telemetry` warn "Telemetry collector unreachable"
+- If accepted ingest degrades to zero, `GCTelemetryProxySilent` also fires (Scenario 11)
+
+**Diagnosis** (added angle — separate the two 502 causes):
+
+First confirm collector-pod health per **Scenario 10 step 5** (`kubectl get pods` / `logs -l app=otel-collector`) — not restated here. If the pod is healthy but GC still 502s, this scenario's added angle is a broken GC→collector **network path**:
+
+```bash
+# Path check — DNS + reachability + config from a GC pod to the configured endpoint.
+# OTEL_COLLECTOR_ENDPOINT is the BARE base (scheme+host+port, no path); GC appends
+# /v1/metrics|/v1/traces itself (crates/gc-service/src/config.rs).
+kubectl get configmap gc-service -n dark-tower -o yaml | grep OTEL_COLLECTOR_ENDPOINT
+kubectl exec -n dark-tower deployment/gc-service -- \
+  sh -c 'getent hosts otel-collector.dark-tower.svc.cluster.local'
+# Confirm no NetworkPolicy blocks GC egress -> collector
+# (infra/services/gc-service/network-policy.yaml).
+kubectl get networkpolicy -n dark-tower
+
+# Distinguish 502 (unreachable) from 503 (disabled): an EMPTY OTEL_COLLECTOR_ENDPOINT
+# disables the proxy and returns 503, not 502.
+```
+
+- Collector pod healthy but GC still 502s → **network-path** fault (DNS, netpol egress, wrong endpoint) — the angle beyond Scenario 10.
+- Collector pod down/crashlooping → collector outage — hand off per Scenario 10 remediation.
+
+**Remediation**:
+- **Collector outage:** restore it per **Scenario 10 → Remediation Option 2** (`kubectl rollout restart deployment/otel-collector`) — not restated here.
+- **Network-path fault (this scenario's angle):** fix the broken piece — correct `OTEL_COLLECTOR_ENDPOINT` to the bare base, restore the GC egress NetworkPolicy, or fix DNS — then restart GC if config changed:
+
+```bash
+kubectl rollout restart deployment/gc-service -n dark-tower
+```
+
+Verify with deploy smoke stanza (c): an authenticated OTLP POST returns 202 (not 502). Then confirm the error share falls under 10% (Scenario 10 recovery query).
+
+#### 13b. Rate-limit storm (429 burst)
+
+**Symptoms**:
+- `GCTelemetryProxyHighRejectionRate` firing with `rejected_rate` dominating (Scenario 10 step 1)
+- Sharp spike in `gc_telemetry_rate_limited_total{reason="per_user"}`
+- Client console shows repeated 429 (`RATE_LIMIT_EXCEEDED`) on `POST /api/v1/telemetry/v1/{metrics,traces}`
+
+**Diagnosis** (added angle — storm shape):
+
+Run the per-user rate-limit query from **Scenario 10 step 4** (`gc_telemetry_rate_limited_total` by `reason`) — not restated here. Two additive notes for the storm shape:
+
+- **Cardinality:** `reason` is the ONLY label — the `sub` is deliberately NOT a label (bounded cardinality), so the metric shows the storm but not which user. To identify the offending `sub`, correlate with ingress/gateway access logs or the client fleet.
+- **Quota:** the limiter is per-JWT-`sub` GCRA at `TELEMETRY_PROXY_RATE_LIMIT_PER_MINUTE` (default 60/min, burst 60): one hot `sub` ⇒ a client retry loop without backoff; broad across many `sub`s ⇒ a fleet-wide client bug or a genuine surge past the quota.
+
+**Remediation**:
+- Single-sub retry loop → fix the client (backoff/jitter); escalate to Client/Web-App Team. Do NOT raise the limit to paper over a retry bug.
+- Broad, legitimate surge that outgrew the quota → raise `TELEMETRY_PROXY_RATE_LIMIT_PER_MINUTE` in the gc-service ConfigMap (config over hardcoding; must be > 0), then `kubectl rollout restart deployment/gc-service -n dark-tower`.
+- Never disable per-user rate limiting — it is the abuse/DoS guard on the browser-facing telemetry surface.
+
+Verify with deploy smoke stanza (f): a fresh-`sub` 70-burst still shows the intended 202→429 transition (the limiter works), and legitimate single-request traffic returns 202.
+
+**Escalation**:
+- Collector infrastructure down or network-path broken beyond a config fix → Infrastructure/SRE
+- Client retry-loop or fleet-wide client bug → Client/Web-App Team
+- Suspected abuse (a single origin storming the limiter or oversize probing) → Security Team
 
 ---
 
