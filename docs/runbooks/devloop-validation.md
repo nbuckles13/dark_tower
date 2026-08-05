@@ -98,10 +98,10 @@ placeholder wrapper (task #52) — distinct enum, distinct exit code, no infix a
 Each layer collects every child `STATUS=` line that came across stdout via `_common.sh::tee_collect_statuses`, then aggregates with `_common.sh::aggregate_worst_status` using the rank:
 
 ```
-SKIPPED-NO-VERB (0)  <  SKIPPED-NO-DIFF (1)  <  OK (2)  <  N/A (3)  <  FAIL (4)  <  FAIL-MISSING-VERB (5)  <  UNKNOWN (6)
+SKIPPED-NO-VERB (0)  <  SKIPPED-NO-DIFF (1)  <  SKIPPED-NO-CLUSTER (2)  <  OK (3)  <  N/A (4)  <  FAIL (5)  <  PRECONDITION_FAILURE (6)  <  FAIL-MISSING-VERB (7)  <  UNKNOWN (8)
 ```
 
-The intuition (locked in ADR-0033 §1 by the comment block above `_common.sh::aggregate_worst_status`): *"if any child did real work and passed, the layer passed; otherwise the SKIPPED-\* state is informative. N/A propagates above OK because it signals 'this verb doesn't apply here' — distinct from 'ran cleanly'. FAIL-MISSING-VERB ranks above FAIL — 'we don't know if this lang has problems because the gate never ran' (a wiring fault) is more uncertain than 'this lang has problems and we found them', and it must not be masked by a sibling lang's OK (task #52, the cross-lang-masking fix). UNKNOWN ranks above all — surface dispatcher bugs loudest."*
+The intuition (locked in ADR-0033 §1 by the comment block above `_common.sh::aggregate_worst_status`): *"if any child did real work and passed, the layer passed; otherwise the SKIPPED-\* state is informative. N/A propagates above OK because it signals 'this verb doesn't apply here' — distinct from 'ran cleanly'. FAIL-MISSING-VERB ranks above FAIL — 'we don't know if this lang has problems because the gate never ran' (a wiring fault) is more uncertain than 'this lang has problems and we found them', and it must not be masked by a sibling lang's OK (task #52, the cross-lang-masking fix). PRECONDITION_FAILURE (task #56, the operator/infra lane — an unavailable environment the gate needed) ranks between FAIL and FAIL-MISSING-VERB: an infra precondition dominates a sibling test FAIL, but a missing-wrapper wiring fault outranks it. SKIPPED-NO-CLUSTER (task #56) ranks just below OK — a clean exit-0 skip when no devloop cluster exists (CI), so a sibling's real OK still dominates. UNKNOWN ranks above all — surface dispatcher bugs loudest."*
 
 **Worked example — Layer 1 stage-2 (multi-lang)**:
 
@@ -420,7 +420,7 @@ The orchestrator returns the **worst of `(dispatch_rc, breaking_rc)`** — `set 
 | `base-ref-unresolved` | `lang/proto/breaking.sh` — the `base-ref-unresolved` emission (no enclosing function; flat script) | `_get_base_ref.sh` exited non-zero before reaching `buf breaking`. The wrapper distinguishes this from `buf-breaking-failed` so operators don't chase a wire-break issue when the actual problem is a degraded git state. Jump to §5. |
 | `buf-binary-missing` | `lang/proto/breaking.sh` | See §6.1. |
 | `not-applicable-to-this-lang` (proto) | `lang/proto/audit.sh` (intentional-gap placeholder) | Expected — proto has no real `audit.sh`; `breaking.sh` is the proto audit-class gate, wired separately in `scripts/audit.sh`. The placeholder emits `N/A` (exit 0). |
-| `<lang>-audit-verb-missing-or-not-executable` (`FAIL-MISSING-VERB`) | `_dispatch.sh::for_each_lang_with_verb` | A `<lang>/audit.sh` that SHOULD exist is missing/non-executable (deleted, `chmod`-stripped, or a new lang dir added without it) — that lang's dependency-vuln scan did NOT run. The dispatcher emits `FAIL-MISSING-VERB` (rank 5), which beats a sibling lang's passing audit (`OK`, rank 2) in the aggregate → **the layer reds at exit 2** (masking closed by the ladder, task #52 — no separate guard needed). **Fix**: restore `<lang>/audit.sh` + `chmod +x`, or (if the gap is genuinely intended) register an intentional-gap placeholder `<lang>/audit.sh` emitting `N/A`. |
+| `<lang>-audit-verb-missing-or-not-executable` (`FAIL-MISSING-VERB`) | `_dispatch.sh::for_each_lang_with_verb` | A `<lang>/audit.sh` that SHOULD exist is missing/non-executable (deleted, `chmod`-stripped, or a new lang dir added without it) — that lang's dependency-vuln scan did NOT run. The dispatcher emits `FAIL-MISSING-VERB` (rank 7), which beats a sibling lang's passing audit (`OK`, rank 3) in the aggregate → **the layer reds at exit 2** (masking closed by the ladder, task #52 — no separate guard needed). **Fix**: restore `<lang>/audit.sh` + `chmod +x`, or (if the gap is genuinely intended) register an intentional-gap placeholder `<lang>/audit.sh` emitting `N/A`. |
 
 **Exit code for a missing audit wrapper — FAIL-MISSING-VERB / exit 2 (task #52).**
 A missing `<lang>/audit.sh` is `FAIL-MISSING-VERB`, which ranks above `OK` in the aggregation
@@ -446,7 +446,7 @@ There is no longer an audit-vs-general asymmetry: the audit verb and every other
 STATUS=OK REASON=cargo-audit-passed       (rust)
 STATUS=OK REASON=pnpm-audit-passed        (ts)
 STATUS=N/A REASON=not-applicable-to-this-lang  (proto, placeholder audit.sh)
-→ dispatcher aggregates: STATUS=N/A REASON=audit-aggregate-na   (N/A rank 3 > OK rank 2)
+→ dispatcher aggregates: STATUS=N/A REASON=audit-aggregate-na   (N/A rank 4 > OK rank 3)
 → dispatch_rc = 0   (N/A → exit 0)
 
 # breaking stage (separate):

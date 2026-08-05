@@ -144,9 +144,12 @@ jobs:
         # §11). Exits non-zero on any unsuppressed high/critical advisory
         # (deny-by-default, S1). DEVLOOP_AUDIT_FORCE_RUN=1 bypasses the
         # no-dep-change skip gate — CI always runs a fresh scan.
-        # Current state (2026-06-23): existing pnpm.overrides entry
-        # minimatch@>=9.0.0 <9.0.7 already resolves the 3 HIGH minimatch
-        # ReDoS advisories; audit exits 0 with only 1 moderate remaining.
+        # Advisories are held clear by the pnpm.overrides in the root package.json
+        # plus the sanctioned suppressions in .pnpm-audit-ignore.json (generated
+        # from audit-suppressions.toml; ADR-0033 §11). Those two files are the SSoT
+        # — this comment intentionally does NOT restate the override list or a live
+        # advisory count (that snapshot drifted once: a since-removed minimatch
+        # entry); read those files for the current set.
         env:
           DEVLOOP_AUDIT_FORCE_RUN: "1"
         run: bash scripts/lang/ts/audit.sh
