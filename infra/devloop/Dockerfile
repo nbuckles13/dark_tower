@@ -3,8 +3,10 @@
 # Pre-built image with full Rust toolchain and development tools.
 # Used by devloop.sh for isolated Claude Code execution.
 #
-# Build:  podman build -t darktower-dev:latest infra/devloop/
+# Build:  ./infra/devloop/devloop.sh --rebuild   (reads .nvmrc, passes NODE_VERSION)
+#   or:   podman build --build-arg NODE_VERSION="$(cat .nvmrc)" -t darktower-dev:latest infra/devloop/
 # Rebuild weekly or when toolchain/dependencies change.
+# NOTE: NODE_VERSION has no default and the build FAILS without it — see the Node block.
 
 FROM docker.io/library/rust:1.95-slim-bookworm
 
@@ -75,9 +77,27 @@ RUN curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kub
     && chmod +x /usr/local/bin/kubectl \
     && rm -f /tmp/kubectl.sha256
 
-# Node.js 22 + Claude Code CLI
-RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
-    apt-get install -y --no-install-recommends nodejs && \
+# Node.js + Claude Code CLI.
+# Version contract: NODE_VERSION is derived from the repo-root `.nvmrc` — the SINGLE
+# SOURCE for the Node pin across .nvmrc / this Dockerfile / the workspace lockfile
+# engines floor. devloop.sh reads .nvmrc and passes --build-arg NODE_VERSION=<pin> at
+# BOTH of its `podman build` sites. There is deliberately NO ARG default: the build
+# context is infra/devloop/ (SCRIPT_DIR), which cannot COPY the repo-root .nvmrc, so a
+# bare `podman build infra/devloop/` with no --build-arg MUST fail loudly rather than
+# float an unpinned "latest 22.x" and re-introduce the three-way pin drift that caused
+# the 2026-08-05 host dev-env failure (see docs/runbooks/client-dev-local.md F11 and
+# the drift-guard TODO under §Developer Experience).
+#
+# `setup_22.x | bash -` adds NodeSource's GPG-signed apt repo for the 22.x line (same
+# trust posture as the previous floating install — apt verifies package signatures);
+# the exact patch is then pinned via the apt version string `<ver>-1nodesource1`. The
+# `node --version` assertion fails the build if apt resolved a different version than
+# the pin (e.g. NodeSource dropped that patch), so drift can't ride along silently.
+ARG NODE_VERSION
+RUN : "${NODE_VERSION:?NODE_VERSION build-arg is required — derive it from repo-root .nvmrc; build via devloop.sh --rebuild}" && \
+    curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
+    apt-get install -y --no-install-recommends "nodejs=${NODE_VERSION}-1nodesource1" && \
+    test "$(node --version)" = "v${NODE_VERSION}" && \
     npm install -g @anthropic-ai/claude-code && \
     rm -rf /var/lib/apt/lists/*
 

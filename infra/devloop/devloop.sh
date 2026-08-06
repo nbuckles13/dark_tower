@@ -35,6 +35,22 @@
 
 set -euo pipefail
 
+# ─── Node pin (SSoT = repo-root .nvmrc) ─────────────────────────
+# The Dockerfile pins Node via `ARG NODE_VERSION` (no default; fails loud if unset).
+# The build context is infra/devloop/ (SCRIPT_DIR), which cannot COPY the repo-root
+# .nvmrc, so we read .nvmrc here and pass it as --build-arg at BOTH `podman build`
+# sites. This keeps .nvmrc the single source and prevents the .nvmrc/Dockerfile/lockfile
+# pin drift behind the 2026-08-05 host dev-env failure. Fails loud on a missing/empty
+# .nvmrc rather than defaulting to a floating version.
+read_node_version() {
+    local script_dir="$1" nvmrc ver
+    nvmrc="${script_dir}/../../.nvmrc"
+    [[ -r "$nvmrc" ]] || { echo "ERROR: cannot read ${nvmrc} (SSoT for the container Node pin)." >&2; exit 1; }
+    ver="$(tr -d '[:space:]' < "$nvmrc")"
+    [[ -n "$ver" ]] || { echo "ERROR: ${nvmrc} is empty — cannot derive NODE_VERSION." >&2; exit 1; }
+    printf '%s\n' "$ver"
+}
+
 # ─── Configuration ──────────────────────────────────────────────
 
 REBUILD_IMAGE=false
@@ -57,7 +73,8 @@ if $REBUILD_IMAGE && [ -z "${1:-}" ]; then
     IMAGE="darktower-dev:latest"
     echo "Building dev container image..."
     OLD_IMAGE_ID=$(podman images -q "$IMAGE" 2>/dev/null || true)
-    podman build -t "$IMAGE" "$SCRIPT_DIR"
+    NODE_VERSION="$(read_node_version "$SCRIPT_DIR")"
+    podman build --build-arg "NODE_VERSION=${NODE_VERSION}" -t "$IMAGE" "$SCRIPT_DIR"
     if [ -n "$OLD_IMAGE_ID" ] && [ "$OLD_IMAGE_ID" != "$(podman images -q "$IMAGE")" ]; then
         podman rmi "$OLD_IMAGE_ID" 2>/dev/null || true
     fi
@@ -434,7 +451,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if $REBUILD_IMAGE || ! podman image exists "$IMAGE"; then
     echo "Building dev container image..."
     OLD_IMAGE_ID=$(podman images -q "$IMAGE" 2>/dev/null || true)
-    podman build -t "$IMAGE" "$SCRIPT_DIR"
+    NODE_VERSION="$(read_node_version "$SCRIPT_DIR")"
+    podman build --build-arg "NODE_VERSION=${NODE_VERSION}" -t "$IMAGE" "$SCRIPT_DIR"
     if [ -n "$OLD_IMAGE_ID" ] && [ "$OLD_IMAGE_ID" != "$(podman images -q "$IMAGE")" ]; then
         podman rmi "$OLD_IMAGE_ID" 2>/dev/null || true
     fi

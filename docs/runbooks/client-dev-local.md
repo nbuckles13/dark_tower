@@ -2,7 +2,7 @@
 
 **Service(s)**: web-app demo + AC / GC / MC / MH (local Kind)
 **Owner**: operations
-**Last Updated**: 2026-07-29
+**Last Updated**: 2026-08-06
 **Executable companion**: `scripts/dev-web.sh`
 
 > ## ⚠ NON-GOAL BANNER — THIS IS NOT A PRODUCTION PATTERN
@@ -47,7 +47,7 @@
 - [§2 Prerequisites](#2-prerequisites)
 - [§3 Bring-up](#3-bring-up)
 - [§4 Is the join real?](#4-is-the-join-real)
-- [§5 Failure modes (F1–F10)](#5-failure-modes-f1f10)
+- [§5 Failure modes (F1–F11)](#5-failure-modes-f1f11)
 - [§6 Teardown](#6-teardown)
 - [§6.5 Automated checks that exist today](#65-automated-checks-that-exist-today)
 - [§7 Not on this branch](#7-not-on-this-branch)
@@ -558,7 +558,7 @@ notification path, which none of the signals above cover.
 
 ---
 
-## 5. Failure modes (F1–F10)
+## 5. Failure modes (F1–F11)
 
 Each scenario gives a **discriminator** — something you can run to tell it apart from the
 scenarios that share its symptom. F1/F8 and F1/F9 are symptom-identical pairs; without a
@@ -898,6 +898,66 @@ same-origin path.
 
 ---
 
+### F11 — Vite crashes at launch with "cannot find native binding"
+
+**Symptom.** `pnpm install` succeeds, but Vite (via `scripts/dev-web.sh` or
+`pnpm nx run web-app:dev`) then dies at startup naming a missing native binding — e.g.
+`Cannot find module '@rolldown/binding-linux-x64-gnu'` / "cannot find native binding". Nothing
+starts, so sign-up / create / join never enter the picture. On a *fresh* attempt you may instead
+see `pnpm install` itself refuse with `ERR_PNPM_UNSUPPORTED_ENGINE` — the same root cause caught
+earlier (see the sub-cases).
+
+**Discriminator — is this even F11?** The error names an **engines** violation or a **native
+binding** load failure — not a *missing* binary (that is F2) and not a version that otherwise runs
+(F3/F4). `scripts/dev-web.sh --check` prints a **✗ bundler probe** line naming
+`@rolldown/binding-linux-x64-gnu`; that line is the F11 signature. Crucially this is the exact case
+the script's Node check only **WARNs** on ("same major, likely fine") — F11 is where "same major"
+is *not* fine, because the workspace floor is a *minor*, not merely a major. A reader whose Node is
+simply on the wrong `nvm` alias is in F3, not here — confirm the binding/engines wording first.
+
+Once F11 is confirmed, split the two sub-cases — they have different *minimal* fixes:
+
+| Sub-case | Signal | Minimal fix |
+|---|---|---|
+| **(a)** Node is *below* the engines floor | `pnpm install` refused with `ERR_PNPM_UNSUPPORTED_ENGINE` (Wanted = the `engines.node` range, Got = your version) | **Upgrade Node** first, then install |
+| **(b)** Node *satisfies* the floor, but `node_modules` is stale | `node --version` already meets the floor, yet the bundler probe still ✗ | **Reinstall only** — do *not* touch Node |
+
+**Cause.** Vite 8 / rolldown load a native binding at import time. That binding
+(`@rolldown/binding-linux-x64-gnu`) is an **optional** dependency whose own `engines` require Node
+at or above the workspace floor — the floor value lives in the root `package.json` `engines.node`
+and the lockfile and is **not restated here** (§2.4; a second copy would drift). Under a Node
+*below* that floor, pnpm **silently skips** the engines-mismatched optional binding: the install
+still succeeds and the gap only surfaces at Vite launch. `engine-strict=true` in the repo `.npmrc`
+now turns sub-case (a) into a loud `pnpm install` failure. But a `node_modules` tree installed
+*earlier* under a below-floor Node (sub-case b) keeps the gap until it is reinstalled: once pnpm has
+recorded the optional binding as skipped, a plain `pnpm install` over the existing tree may not
+re-evaluate/re-fetch it — **removing `node_modules` is what forces re-resolution** of the
+now-satisfiable optional dep.
+
+**Fix.** The always-safe superset — do this if unsure; it covers both sub-cases:
+
+```bash
+# --- WSL2 ---
+nvm install "$(cat .nvmrc)"     # the pinned Node — satisfies the floor by construction
+rm -rf node_modules             # forces re-resolution of the skipped optional binding
+pnpm install
+```
+
+For sub-case (a) the `nvm install` is the load-bearing step; for sub-case (b) the
+`rm -rf node_modules && pnpm install` pair is — never a *bare* `pnpm install` for (b), for the
+re-resolution reason in **Cause**. The superset is harmless either way; prefer it unless you have a
+reason to minimise. Re-run `scripts/dev-web.sh --check` — the bundler probe should go green.
+
+**Why it recurs.** Whenever the running Node drifts below the workspace floor: a new machine, a
+reset `nvm alias default` (see F3), or a `node_modules` carried across a floor-raising dependency
+bump — the vite 8 / rolldown 1.2.1 bump on 2026-08-05 is what first exposed this. The pins are
+single-sourced (`.nvmrc`, root `package.json` engines) precisely so the fix is "match the repo,"
+not "guess a version"; a tracked drift-guard (`docs/TODO.md`, §Developer Experience) will fail
+validation if `.nvmrc`, the devloop-image Node pin, the lockfile floor, and root `engines.node`
+ever disagree.
+
+---
+
 ## 6. Teardown
 
 ```bash
@@ -938,9 +998,11 @@ cargo test -p env-tests --features all            # everything (~8-10 min)
 > bare `cargo test`, sees green, and concludes the cluster is validated has validated nothing.
 
 `crates/env-tests/tests/24_join_flow.rs` is a real end-to-end join across AC, GC and MC;
-`26_mh_quic.rs` covers the MH QUIC path. This is the same suite the devloop's Layer 7 gate runs
+`26_mh_quic.rs` covers the MH QUIC path. This is the same Rust suite the devloop's Layer 7 gate runs
 (`scripts/layer7.sh`, `--features all`); failure-mode triage lives in
-`docs/runbooks/devloop-validation.md` §6.7. Browser E2E is not part of Layer 7 — see §7.
+`docs/runbooks/devloop-validation.md` §6.7. Layer 7 **also** runs a browser E2E suite (Playwright)
+after the Rust env-tests — diff-triggered and gated on its own preconditions; it is described just
+below.
 
 **Two splits that will confuse you if nobody names them.** Both are §1's mechanism applied one
 layer down:
@@ -964,15 +1026,37 @@ pnpm nx run web-app:test:unit        # Node-tier prod-bundle-content assertion (
 `test:unit` is not a general unit suite — it asserts that dev-only strings are absent from a
 production build, and does not exercise the join path at all.
 
+The **browser E2E suite** (the Playwright harness from story tasks #18/#19) runs through Playwright,
+not Nx, and unlike the two Vitest tiers above it needs the cluster up *and* the dev-cert
+fingerprints present (§3):
+
+```bash
+# --- WSL2 ---
+pnpm --filter @darktower/web-app test:e2e
+```
+
+`packages/web-app/playwright.config.ts` + `packages/web-app/e2e/` (specs, `global-setup.ts`,
+fixtures) own this; its `global-setup.ts` reads the dev-cert fingerprints from
+`infra/docker/certs/fingerprints.json` (the `fingerprints.env` beside it is the shell-sourceable
+form of the same MC/MH pair — one writer, `scripts/generate-dev-certs.sh`). This is the same lane
+`scripts/layer7.sh` runs as a **diff-triggered** step *after* the Rust env-tests and only if they
+pass; it is gated on `fingerprints.json` and a Playwright Chromium being present (missing either is a
+Layer-7 `PRECONDITION_FAILURE`, not a silent skip). `packages/web-app/e2e/README.md` owns the
+specifics.
+
 ---
 
 ## 7. Not on this branch
 
-- **No Playwright / browser-driven E2E suite.** There is no `playwright.config.*` anywhere in
-  `packages/`; `playwright` appears only as the Vitest browser provider. The harness and specs are
-  story tasks #18 and #19, and Playwright is specified to run inside Layer 7 alongside the Rust
-  env-tests (ADR-0033). Until #18 lands, `infra/docker/certs/fingerprints.env` — the sourceable
-  form of the fingerprints — has no consumer.
+- **Browser E2E now EXISTS on this branch** — an explicit correction, because this section
+  previously said it did not. Story tasks #18/#19 landed `packages/web-app/playwright.config.ts` and
+  the `packages/web-app/e2e/` specs + `global-setup.ts`, and `scripts/layer7.sh` runs them as a
+  diff-triggered lane after the Rust env-tests. `infra/docker/certs/fingerprints.json` now has a
+  **second** consumer — the Playwright `global-setup.ts`, alongside the pre-existing Vite config
+  (`packages/web-app/vite/fingerprints.ts`) — while the sourceable `fingerprints.env` remains the
+  shell form with **no code consumer** (the prior §7 note's "fingerprints.env … has no consumer"
+  was, and stays, true for `.env`). See §6.5 for how to run it; kept here as a correction so the
+  prior "no Playwright" note is not trusted.
 - **No media plane.** MH connections perform the auth handshake and nothing more: no SFrame, no
   WebCodecs, no datagrams. See the silence note in §4.3.
 - **No browser-side join logging or client metrics by default** — see §4.0 rung 1.
@@ -1008,3 +1092,4 @@ yourself updating the same fact in two of these files, one of them is wrong.
 | Date | Author | Changes |
 |------|--------|---------|
 | 2026-07-29 | operations (task #20) | Initial creation (R-49). Two-machine topology, two-topology cluster split, bring-up, join-verification ladder, F1–F10, teardown, env-tests section. Deliberately diverges from `TEMPLATE.md` — see the banner. |
+| 2026-08-06 | infrastructure (task #61) | Added **F11** (Vite "cannot find native binding" — engines-skipped optional binding under a below-floor Node) with (a)/(b) sub-case split; updated §5 header + ToC. Reconciled §6.5/§7 with reality: the Playwright browser-E2E lane (tasks #18/#19) now exists and runs diff-triggered in Layer 7 — corrected the stale "no Playwright" §7 note and the §6.5 cross-reference. Cross-boundary edit into this operations-owned runbook, confirmed by operations at Gate 1/Gate 3. |

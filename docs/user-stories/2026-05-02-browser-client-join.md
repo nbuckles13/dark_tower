@@ -1333,10 +1333,9 @@ tasks:
     (no media plane this story), telemetry-emission tests (pending Phase 5
     manual finding), reconnection tests (no reconnection logic this story).
 - id: 61
-  status: pending
+  status: completed
   specialist: infrastructure
   env_tests: false
-  deps: []
   prompt: |
     Toolchain-pin cleanup after the host dev-env failure of 2026-08-05: the
     vite 8 / rolldown 1.2.1 upgrade (commit 511d201) raised the Node engines
@@ -1379,7 +1378,6 @@ tasks:
   status: pending
   specialist: observability
   env_tests: true
-  deps: []
   prompt: |
     Manual testing (2026-08-05) found MH is the only service missing its logs
     and SLO dashboards: infra/grafana/dashboards/ has {ac,gc,mc}-logs.json and
@@ -1399,7 +1397,6 @@ tasks:
   status: pending
   specialist: auth-controller
   env_tests: true
-  deps: []
   prompt: |
     Fix roster display names: manual testing (2026-08-05) shows the meeting
     roster renders generic labels (Participant 1, Participant 2) instead of the
@@ -1425,7 +1422,6 @@ tasks:
   status: pending
   specialist: meeting-controller
   env_tests: true
-  deps: []
   prompt: |
     Reduce or bound roster leave latency: manual testing (2026-08-05) observed
     that after a participant closes their tab, the other participant's roster

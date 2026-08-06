@@ -56,12 +56,81 @@ pass() { echo "  ${GRN}✓${NC} $*"; }
 warn() { echo "  ${YEL}!${NC} $*"; }
 fail() { echo "  ${RED}✗${NC} $*"; HARD_FAIL=1; }
 
+# ─── Bundler load probe (the native-binding silent-skip class) ──
+# Vite 8 / rolldown load a native binding (@rolldown/binding-linux-x64-gnu) at import
+# time. When the running Node is below the workspace engines floor, pnpm SILENTLY skips
+# that engines-mismatched optional binding at install; `pnpm install` succeeds and vite
+# then crashes at LAUNCH with "cannot find native binding". engine-strict now fails a
+# below-floor install loudly (see .npmrc + root package.json engines) — but a
+# node_modules tree installed EARLIER under a below-floor Node keeps the gap until it is
+# reinstalled, and that residual case is exactly what this probe catches.
+#
+# Guarded on node_modules presence: only meaningful when a tree exists (so --check and
+# --no-install catch the stale-tree case). A fresh clone has nothing to probe — skip with
+# a note; the fresh case is caught loudly by engine-strict at `pnpm install`.
+#
+# It does a REAL dynamic import() of rolldown's entry (resolved from vite) — the exact
+# operation that loads the native binding; a resolve-only check would false-pass. Two
+# distinct causes get two remedies (exit 3 = tree unresolvable → reinstall; exit 4 =
+# binding load threw → engine/binding remedy), so the binding-mismatch message is not
+# emitted for a merely-incomplete tree. No version literal — the floor is derived from
+# package.json engines.node (ENGINES_NODE), the in-repo SSoT.
+probe_bundler() {
+    if [[ ! -d node_modules ]]; then
+        warn "bundler load probe skipped — no node_modules yet (fresh clone). 'pnpm install' below is the loud gate; engine-strict fails a below-floor Node install."
+        return
+    fi
+    if ! command -v node >/dev/null 2>&1; then
+        return   # node absence already hard-failed above; nothing to add here
+    fi
+    local probe_js probe_out rc=0
+    # Resolve vite from the web-app package, resolve rolldown from vite, then import it.
+    probe_js='
+import { createRequire } from "node:module";
+import { pathToFileURL } from "node:url";
+const req = createRequire(process.cwd() + "/packages/web-app/");
+let vitePath;
+try { vitePath = req.resolve("vite"); } catch (e) { console.error("resolve vite: " + e.message); process.exit(3); }
+let entry;
+try { entry = createRequire(vitePath).resolve("rolldown"); } catch (e) { console.error("resolve rolldown: " + e.message); process.exit(3); }
+try { await import(pathToFileURL(entry).href); } catch (e) { console.error("load rolldown: " + (e && e.message || String(e))); process.exit(4); }
+'
+    # `|| rc=$?` CAPTURES the exit code for explicit handling below — it is not `|| true`;
+    # a nonzero code flips HARD_FAIL via fail(), so the failure is surfaced, never masked.
+    probe_out="$(node --input-type=module -e "$probe_js" 2>&1)" || rc=$?
+    if [[ "$rc" -eq 0 ]]; then
+        pass "bundler loads (vite + rolldown native binding present)"
+        return
+    fi
+    if [[ "$rc" -eq 3 ]]; then
+        fail "bundler probe: vite/rolldown not resolvable — node_modules looks incomplete."
+        echo "      Detail: ${probe_out}"
+        echo "      Fix (reinstall; Node is not the issue): rm -rf node_modules && pnpm install"
+    else
+        fail "bundler probe: rolldown could not load its native binding (@rolldown/binding-linux-x64-gnu)."
+        echo "      Detail: ${probe_out}"
+        echo "      Cause: node_modules was installed under a Node BELOW the workspace engines floor"
+        echo "             (package.json engines.node = ${ENGINES_NODE:-see package.json}), so pnpm SILENTLY"
+        echo "             skipped the engines-mismatched optional binding."
+        echo "      This SUPERSEDES any 'same major, likely fine' Node note above — same major is not"
+        echo "             sufficient; satisfying the engines floor is."
+        echo "      Fix: ${NVM_LOAD}nvm install \"\$(cat .nvmrc)\" && rm -rf node_modules && pnpm install"
+        echo "      (If 'node --version' already satisfies the floor, the binding was skipped by an earlier"
+        echo "       below-floor install — 'rm -rf node_modules && pnpm install' alone is enough.)"
+    fi
+}
+
 # ─── SSoT: expected versions read from the repo ─────────────────
-EXPECTED_NODE="$(<.nvmrc)"                       # e.g. 22.11.0
+EXPECTED_NODE="$(<.nvmrc)"                       # from .nvmrc (SSoT)
 EXPECTED_NODE_MAJOR="${EXPECTED_NODE%%.*}"       # e.g. 22
 # packageManager pin, e.g. "pnpm@10.33.2" → 10.33.2 (no node needed to parse)
 EXPECTED_PNPM="$(grep -oE '"packageManager"[[:space:]]*:[[:space:]]*"pnpm@[^"]+"' package.json \
     | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+# Root engines.node range — the SSoT Node floor the bundler's native binding needs
+# (e.g. ">=22.13.0 <23"). Used ONLY in the bundler-probe remedy message, never as a
+# version literal compared against here (that would fork the SSoT the drift-guard owns).
+ENGINES_NODE="$(grep -oE '"node"[[:space:]]*:[[:space:]]*"[^"]+"' package.json \
+    | grep -oE '"[^"]+"$' | tr -d '"' | head -1)"
 
 # Ports (Vite proxy defaults / #4 kind-config); env-overridable.
 AC_PORT="${AC_PORT:-8443}"
@@ -129,6 +198,12 @@ else
         pass "pnpm ${PNPM_VER}"
     fi
 fi
+
+# ─── Bundler load probe (AFTER the Node/pnpm version checks) ────
+# Catches the engines-skipped native-binding class the major-only Node check above only
+# WARNs on. node_modules-gated so a fresh clone is not false-failed. See F11 in
+# docs/runbooks/client-dev-local.md.
+probe_bundler
 
 # ─── AC / GC host ports ─────────────────────────────────────────
 check_port() {
