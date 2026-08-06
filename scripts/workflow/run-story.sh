@@ -10,9 +10,12 @@
 # Intended execution context: inside the devloop container set up by
 # devloop.sh (skip-permissions is only safe behind that boundary).
 #
-# Usage: scripts/workflow/run-story.sh docs/user-stories/YYYY-MM-DD-slug.md
+# Usage: scripts/workflow/run-story.sh <story-file.md | story-slug> [--stop-after=N]
 #
-# Exit: 0  all tasks complete, story-close gate green
+#   --stop-after=N  exit 0 after task N completes (skips the story-close gate).
+#                   For staged runs where a human step belongs between tasks.
+#
+# Exit: 0  all tasks complete, story-close gate green (or --stop-after reached)
 #       1  task escalated (escalation.json path printed) or blocked
 #       2  precondition / infra / manifest failure
 set -euo pipefail
@@ -20,7 +23,15 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
 
-ARG="${1:?usage: run-story.sh <story-file.md | story-slug>}"
+ARG="${1:?usage: run-story.sh <story-file.md | story-slug> [--stop-after=N]}"
+STOP_AFTER="${2:-}"
+if [ -n "$STOP_AFTER" ]; then
+  case "$STOP_AFTER" in
+    --stop-after=*) STOP_AFTER="${STOP_AFTER#--stop-after=}" ;;
+    *) echo "STORY_RUN: unknown argument '$STOP_AFTER'" >&2; exit 2 ;;
+  esac
+  [[ "$STOP_AFTER" =~ ^[0-9]+$ ]] || { echo "STORY_RUN: --stop-after needs a task id" >&2; exit 2; }
+fi
 if [ -f "$ARG" ]; then
   STORY_FILE="$ARG"
 else
@@ -317,6 +328,11 @@ while :; do
   rm -f "$slug_file" "$start_marker" "$stop_count_file"
   echo "STORY_RUN: COMPLETE task=${id} commit=$(git rev-parse --short HEAD)"
   report_task_cost "$id"
+
+  if [ -n "$STOP_AFTER" ] && [ "$id" = "$STOP_AFTER" ]; then
+    echo "STORY_RUN: STOPPED after task ${id} (--stop-after) — story-close gate NOT run; rerun without the flag to continue"
+    exit 0
+  fi
 done
 
 # Story-close gate: the full pipeline, layer 7 included, on the final tree.
