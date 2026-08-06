@@ -48,7 +48,9 @@ configMapGenerator:
       labels:
         grafana_dashboard: "1"
     files:
+      - mh-logs.json=dashboards/mh-logs.json
       - mh-overview.json=dashboards/mh-overview.json
+      - mh-slos.json=dashboards/mh-slos.json
   - name: grafana-dashboards-errors
     options:
       labels:

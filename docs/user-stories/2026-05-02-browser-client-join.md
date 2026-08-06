@@ -1375,7 +1375,7 @@ tasks:
     Playwright-pin guard entry; genuinely task-sized, tracked not done here).
     Out of scope: implementing the drift guard itself; rebaking the image.
 - id: 62
-  status: pending
+  status: completed
   specialist: observability
   env_tests: true
   prompt: |
