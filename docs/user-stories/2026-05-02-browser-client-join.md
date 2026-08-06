@@ -1313,7 +1313,12 @@ tasks:
     the first context receives participantLeft for the departed id, assert
     mc_connections_active (or an equivalent MC counter via mcMetrics.ts)
     reflects the departure, then rejoin from a fresh context and assert a NEW
-    participant id and a joined event (clean re-entry).
+    participant id and a joined event (clean re-entry). The rejoin MUST use
+    signInViaUi (not a fresh registration): a signed-in client has no
+    client-side displayName (SignIn.svelte:27), so asserting the rejoined
+    participant's roster name is correct proves the meeting token carries the
+    registered name (task 63's second variant) - the sign-up path alone would
+    stay green if the name were ever band-aided client-side.
     (3) Join-after-error recovery: append to each of the three negative specs
     (auth-rejection, meeting-not-found, mc-token-rejection) a recovery tail -
     after the asserted failure, perform a valid join in the SAME page session
