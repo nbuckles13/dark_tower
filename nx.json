@@ -9,10 +9,7 @@
       "{workspaceRoot}/nx.json",
       "{workspaceRoot}/pnpm-workspace.yaml"
     ],
-    "default": [
-      "{projectRoot}/**/*",
-      "sharedGlobals"
-    ],
+    "default": ["{projectRoot}/**/*", "sharedGlobals"],
     "production": [
       "default",
       "!{projectRoot}/**/*.spec.*",
@@ -51,5 +48,6 @@
       "inputs": ["default", "^production"],
       "cache": true
     }
-  }
+  },
+  "analytics": false
 }
