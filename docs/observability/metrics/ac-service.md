@@ -31,6 +31,19 @@ All AC service metrics follow ADR-0011 naming conventions with the `ac_` prefix.
 - **Cardinality**: Low (4 grant types × 2 statuses = 8 series)
 - **Usage**: Monitor token issuance latency, calculate p50/p95/p99
 
+### `ac_meeting_token_display_name_total`
+- **Type**: Counter
+- **Description**: Outcome of the display-name lookup performed while issuing a USER meeting token (the registered `users.display_name` is stamped into the token so the roster shows real names). Issuance is FAIL-CLOSED: a missing `users` row refuses the token rather than minting a nameless one.
+- **Labels**:
+  - `outcome`: Closed enum, exactly three values:
+    - `resolved` — user row found; `display_name` stamped into the token.
+    - `user_not_found` — no `users` row for the subject; token refused (HTTP 404).
+    - `lookup_error` — the `users` SELECT itself failed (DB error); token refused.
+- **Cardinality**: Low (1 label × 3 fixed values = 3 series)
+- **PII**: None. `outcome` is a fixed enum; no `user_id`/`display_name`/email is ever a label (ADR-0011).
+- **Usage**: Distinguish the fail-closed data-integrity path (`user_not_found`) from a transient DB path (`lookup_error`) and track healthy `resolved` rate. `user_not_found` and `lookup_error` also surface as token-issuance errors via the existing issuance-error SLO.
+- **Related Metric**: `ac_token_issuance_total`
+
 ### `ac_token_validations_total`
 - **Type**: Counter
 - **Description**: Total number of token validation attempts

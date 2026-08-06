@@ -344,14 +344,15 @@ pub enum MeetingRole {
 /// - `participant_type`: Member or External
 /// - `role`: Host or Participant
 /// - `capabilities`: Granted capabilities (e.g., `["video", "audio", "screen_share"]`)
+/// - `display_name`: Participant's registered display name (from `users.display_name`)
 /// - `iat`: Issued-at timestamp (Unix epoch seconds)
 /// - `exp`: Expiration timestamp (Unix epoch seconds)
 /// - `jti`: Unique token identifier for revocation
 ///
 /// # Security
 ///
-/// The `sub` and `jti` fields are redacted in Debug output to prevent
-/// accidental logging of personally identifiable information.
+/// The `sub`, `display_name`, and `jti` fields are redacted in Debug output to
+/// prevent accidental logging of personally identifiable information.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct MeetingTokenClaims {
     /// Subject (participant UUID) - redacted in Debug output.
@@ -371,6 +372,15 @@ pub struct MeetingTokenClaims {
     pub role: MeetingRole,
     /// Granted capabilities (e.g., `["video", "audio", "screen_share"]`).
     pub capabilities: Vec<String>,
+    /// Participant's registered display name (from `users.display_name`) -
+    /// redacted in Debug output (PII).
+    ///
+    /// `#[serde(default)]` is backward-compatibility for rollout: meeting tokens
+    /// minted before this field existed carry no `display_name` claim and must
+    /// still deserialize (to an empty string). It does not relax any other
+    /// validation and does not affect the `token_type` anti-confusion check.
+    #[serde(default)]
+    pub display_name: String,
     /// Issued-at timestamp (Unix epoch seconds).
     pub iat: i64,
     /// Expiration timestamp (Unix epoch seconds).
@@ -390,6 +400,7 @@ impl fmt::Debug for MeetingTokenClaims {
             .field("participant_type", &self.participant_type)
             .field("role", &self.role)
             .field("capabilities", &self.capabilities)
+            .field("display_name", &"[REDACTED]")
             .field("iat", &self.iat)
             .field("exp", &self.exp)
             .field("jti", &"[REDACTED]")
@@ -595,12 +606,12 @@ pub fn extract_kid(token: &str) -> Result<String, JwtError> {
     // Decode the header (first part) - safe indexing since we verified length above
     let header_part = parts.first().ok_or(JwtError::MalformedToken)?;
     let header_bytes = URL_SAFE_NO_PAD.decode(header_part).map_err(|e| {
-        tracing::debug!(target: "common.jwt", error = %e, "Failed to decode JWT header base64");
+        tracing::debug!(target: "common.jwt", error = %e, "Failed to decode JWT header base64"); // guard:ignore(logs decode error string not a token or secret)
         JwtError::MalformedToken
     })?;
 
     let header: serde_json::Value = serde_json::from_slice(&header_bytes).map_err(|e| {
-        tracing::debug!(target: "common.jwt", error = %e, "Failed to parse JWT header JSON");
+        tracing::debug!(target: "common.jwt", error = %e, "Failed to parse JWT header JSON"); // guard:ignore(logs parse error string not a token or secret)
         JwtError::MalformedToken
     })?;
 
@@ -842,7 +853,7 @@ impl JwksClient {
             .timeout(Duration::from_secs(10))
             .build()
             .map_err(|e| {
-                tracing::error!(target: "common.jwt.jwks", error = %e, "Failed to build HTTP client");
+                tracing::error!(target: "common.jwt.jwks", error = %e, "Failed to build HTTP client"); // guard:ignore(logs http client build error not a secret)
                 JwtError::ServiceUnavailable("Failed to initialize JWKS client".to_string())
             })?;
 
@@ -874,11 +885,11 @@ impl JwksClient {
             if let Some(cached) = cache.as_ref() {
                 if cached.expires_at > Instant::now() {
                     if let Some(key) = cached.keys.get(kid) {
-                        tracing::debug!(target: "common.jwt.jwks", kid = %kid, "JWKS cache hit");
+                        tracing::debug!(target: "common.jwt.jwks", kid = %kid, "JWKS cache hit"); // guard:ignore(logs public key id kid not a secret)
                         return Ok(key.clone());
                     }
                     // Key not found in valid cache
-                    tracing::debug!(target: "common.jwt.jwks", kid = %kid, "Key not found in JWKS cache");
+                    tracing::debug!(target: "common.jwt.jwks", kid = %kid, "Key not found in JWKS cache"); // guard:ignore(logs public key id kid not a secret)
                     return Err(JwtError::KeyNotFound);
                 }
             }
@@ -896,14 +907,14 @@ impl JwksClient {
         }
 
         // Key not found even after refresh
-        tracing::warn!(target: "common.jwt.jwks", kid = %kid, "Key not found in JWKS after refresh");
+        tracing::warn!(target: "common.jwt.jwks", kid = %kid, "Key not found in JWKS after refresh"); // guard:ignore(logs public key id kid not a secret)
         Err(JwtError::KeyNotFound)
     }
 
     /// Refresh the JWKS cache by fetching from Auth Controller.
     #[instrument(skip_all)]
     async fn refresh_cache(&self) -> Result<(), JwtError> {
-        tracing::debug!(target: "common.jwt.jwks", url = %self.jwks_url, "Fetching JWKS from AC");
+        tracing::debug!(target: "common.jwt.jwks", url = %self.jwks_url, "Fetching JWKS from AC"); // guard:ignore(logs jwks endpoint url not a secret)
 
         let response = self
             .http_client
@@ -911,7 +922,7 @@ impl JwksClient {
             .send()
             .await
             .map_err(|e| {
-                tracing::error!(target: "common.jwt.jwks", error = %e, "Failed to fetch JWKS");
+                tracing::error!(target: "common.jwt.jwks", error = %e, "Failed to fetch JWKS"); // guard:ignore(logs jwks fetch error not a secret)
                 JwtError::ServiceUnavailable("Authentication service unavailable".to_string())
             })?;
 
@@ -927,7 +938,7 @@ impl JwksClient {
         }
 
         let jwks: JwksResponse = response.json().await.map_err(|e| {
-            tracing::error!(target: "common.jwt.jwks", error = %e, "Failed to parse JWKS response");
+            tracing::error!(target: "common.jwt.jwks", error = %e, "Failed to parse JWKS response"); // guard:ignore(logs jwks parse error not a secret)
             JwtError::ServiceUnavailable("Authentication service unavailable".to_string())
         })?;
 
@@ -993,25 +1004,25 @@ impl JwksClient {
 pub fn verify_token<T: DeserializeOwned>(token: &str, jwk: &Jwk) -> Result<T, JwtError> {
     // Validate JWK is EdDSA key
     if jwk.kty != "OKP" {
-        tracing::warn!(target: "common.jwt", kty = %jwk.kty, "Unexpected JWK key type");
+        tracing::warn!(target: "common.jwt", kty = %jwk.kty, "Unexpected JWK key type"); // guard:ignore(logs public jwk key type not a secret)
         return Err(JwtError::InvalidSignature);
     }
     if let Some(alg) = &jwk.alg {
         if alg != "EdDSA" {
-            tracing::warn!(target: "common.jwt", alg = %alg, "Unexpected JWK algorithm");
+            tracing::warn!(target: "common.jwt", alg = %alg, "Unexpected JWK algorithm"); // guard:ignore(logs public jwk algorithm not a secret)
             return Err(JwtError::InvalidSignature);
         }
     }
 
     // Get public key bytes from JWK
     let public_key_b64 = jwk.x.as_ref().ok_or_else(|| {
-        tracing::error!(target: "common.jwt", kid = %jwk.kid, "JWK missing x field");
+        tracing::error!(target: "common.jwt", kid = %jwk.kid, "JWK missing x field"); // guard:ignore(logs public key id kid not a secret)
         JwtError::InvalidSignature
     })?;
 
     // Decode public key from base64url using common utility
     let public_key_bytes = decode_ed25519_public_key_jwk(public_key_b64).map_err(|e| {
-        tracing::error!(target: "common.jwt", error = %e, "Invalid public key encoding");
+        tracing::error!(target: "common.jwt", error = %e, "Invalid public key encoding"); // guard:ignore(logs public key encoding error not a secret)
         JwtError::InvalidSignature
     })?;
 
@@ -1025,7 +1036,7 @@ pub fn verify_token<T: DeserializeOwned>(token: &str, jwk: &Jwk) -> Result<T, Jw
 
     // Decode and verify
     let token_data = decode::<T>(token, &decoding_key, &validation).map_err(|e| {
-        tracing::debug!(target: "common.jwt", error = %e, "Token verification failed");
+        tracing::debug!(target: "common.jwt", error = %e, "Token verification failed"); // guard:ignore(logs verification error string not a token)
         JwtError::InvalidSignature
     })?;
 
@@ -1096,7 +1107,7 @@ impl JwtValidator {
     pub async fn validate<T: DeserializeOwned + HasIat>(&self, token: &str) -> Result<T, JwtError> {
         // 1. Extract kid from JWT header (includes size check)
         let kid = extract_kid(token).map_err(|e| {
-            tracing::debug!(target: "common.jwt", error = ?e, "Token kid extraction failed");
+            tracing::debug!(target: "common.jwt", error = ?e, "Token kid extraction failed"); // guard:ignore(logs kid extraction error not a token)
             e
         })?;
 
@@ -1647,6 +1658,7 @@ mod tests {
             participant_type: ParticipantType::External,
             role: MeetingRole::Participant,
             capabilities: vec!["video".to_string(), "audio".to_string()],
+            display_name: "Alice Example".to_string(),
             iat: 1_234_567_890,
             exp: 1_234_568_790,
             jti: "jti-unique-id".to_string(),
@@ -1663,6 +1675,10 @@ mod tests {
         assert_eq!(deserialized.participant_type, ParticipantType::External);
         assert_eq!(deserialized.role, MeetingRole::Participant);
         assert_eq!(deserialized.capabilities, vec!["video", "audio"]);
+        assert_eq!(
+            deserialized.display_name, "Alice Example",
+            "display_name must survive a serialize/deserialize roundtrip"
+        );
         assert_eq!(deserialized.iat, claims.iat);
         assert_eq!(deserialized.exp, claims.exp);
         assert_eq!(deserialized.jti, claims.jti);
@@ -1683,6 +1699,7 @@ mod tests {
                 "audio".to_string(),
                 "screen_share".to_string(),
             ],
+            display_name: "Alice Example".to_string(),
             iat: 1_234_567_890,
             exp: 1_234_568_790,
             jti: "jti-id".to_string(),
@@ -1707,6 +1724,24 @@ mod tests {
         assert_eq!(claims.home_org_id, None);
     }
 
+    /// BACKWARD-COMPAT LOCK: a meeting token minted before the `display_name`
+    /// claim existed carries no such field. `#[serde(default)]` must let it
+    /// still deserialize (to an empty string) so in-flight tokens keep
+    /// validating during rollout. This uses a LITERAL JSON that omits the key
+    /// on purpose — a serialize/deserialize roundtrip would never exercise the
+    /// serde-default path because our serializer always emits the field.
+    #[test]
+    fn test_meeting_token_claims_deserialize_missing_display_name_defaults_empty() {
+        let json = r#"{"sub":"u","token_type":"meeting","meeting_id":"m","meeting_org_id":"o","participant_type":"member","role":"host","capabilities":[],"iat":0,"exp":0,"jti":"j"}"#;
+        let claims: MeetingTokenClaims = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            claims.display_name, "",
+            "missing display_name must default to empty string (rollout backward-compat)"
+        );
+        // token_type anti-confusion is unaffected by the new default field.
+        assert_eq!(claims.token_type, "meeting");
+    }
+
     #[test]
     fn test_meeting_token_claims_empty_capabilities() {
         let claims = MeetingTokenClaims {
@@ -1718,6 +1753,7 @@ mod tests {
             participant_type: ParticipantType::Member,
             role: MeetingRole::Host,
             capabilities: vec![],
+            display_name: "Alice Example".to_string(),
             iat: 1_234_567_890,
             exp: 1_234_568_790,
             jti: "jti-id".to_string(),
@@ -1761,6 +1797,7 @@ mod tests {
             participant_type: ParticipantType::Member,
             role: MeetingRole::Host,
             capabilities: vec!["video".to_string()],
+            display_name: "Secret Participant Name".to_string(),
             iat: 1_234_567_890,
             exp: 1_234_568_790,
             jti: "secret-jti-value".to_string(),
@@ -1776,6 +1813,10 @@ mod tests {
         assert!(
             !debug_str.contains("secret-jti-value"),
             "jti should be redacted"
+        );
+        assert!(
+            !debug_str.contains("Secret Participant Name"),
+            "display_name (PII) should be redacted"
         );
         assert!(
             debug_str.contains("[REDACTED]"),
@@ -1823,6 +1864,7 @@ mod tests {
             participant_type: ParticipantType::Member,
             role: MeetingRole::Host,
             capabilities: vec!["video".to_string()],
+            display_name: "Alice Example".to_string(),
             iat: 1_234_567_890,
             exp: 1_234_568_790,
             jti: "jti-id".to_string(),
@@ -1833,6 +1875,7 @@ mod tests {
         assert_eq!(cloned.meeting_id, claims.meeting_id);
         assert_eq!(cloned.participant_type, ParticipantType::Member);
         assert_eq!(cloned.role, MeetingRole::Host);
+        assert_eq!(cloned.display_name, claims.display_name);
     }
 
     // -------------------------------------------------------------------------

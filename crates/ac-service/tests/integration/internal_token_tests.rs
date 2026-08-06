@@ -56,6 +56,28 @@ fn guest_token_request(
     })
 }
 
+/// Seed an organization + user and return `(user_id, display_name)`.
+///
+/// Meeting-token issuance now looks up `users.display_name` and FAILS CLOSED on a
+/// missing row, so any test that expects a successfully issued meeting token must
+/// seed the subject first. Uses unique subdomain/email so it is collision-free.
+async fn seed_meeting_subject(server: &TestAuthServer) -> Result<(Uuid, String), anyhow::Error> {
+    let unique = Uuid::new_v4();
+    let org_id = server
+        .create_test_org(&format!("org-{unique}"), "Test Org")
+        .await?;
+    let display_name = "Alice Example".to_string();
+    let user_id = server
+        .create_test_user(
+            org_id,
+            &format!("user-{unique}@example.com"),
+            "password123",
+            &display_name,
+        )
+        .await?;
+    Ok((user_id, display_name))
+}
+
 // ============================================================================
 // require_service_auth Middleware Tests
 // ============================================================================
@@ -367,6 +389,9 @@ async fn test_meeting_token_success(pool: PgPool) -> Result<(), anyhow::Error> {
         .create_service_token("gc-service", &["internal:meeting-token"])
         .await?;
 
+    // Seed the subject user (issuance looks up users.display_name, fail-closed).
+    let (subject_user_id, expected_name) = seed_meeting_subject(&server).await?;
+
     // Act - Request with valid token and correct scope
     let response = client
         .post(format!(
@@ -375,7 +400,7 @@ async fn test_meeting_token_success(pool: PgPool) -> Result<(), anyhow::Error> {
         ))
         .bearer_auth(&token)
         .json(&meeting_token_request(
-            test_uuid(1),
+            subject_user_id,
             test_uuid(2),
             test_uuid(3),
             test_uuid(4),
@@ -404,9 +429,55 @@ async fn test_meeting_token_success(pool: PgPool) -> Result<(), anyhow::Error> {
     let parts: Vec<&str> = issued_token.split('.').collect();
     assert_eq!(parts.len(), 3, "Issued token should be a valid JWT format");
 
+    // HAPPY PATH: the token must carry the seeded registered display_name.
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    let claims: serde_json::Value = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[1])?)?;
+    assert_eq!(
+        claims["display_name"].as_str(),
+        Some(expected_name.as_str()),
+        "meeting token must carry the registered display_name from users.display_name"
+    );
+
     // Verify expires_in is capped at 900 (requested was 600, should be 600)
     let expires_in = body["expires_in"].as_u64().unwrap();
     assert_eq!(expires_in, 600, "expires_in should match requested TTL");
+
+    Ok(())
+}
+
+/// FAIL-CLOSED: a valid, correctly-scoped request for a subject with NO `users`
+/// row must be refused with 404 (not a nameless token, not a 500).
+#[sqlx::test(migrations = "../../migrations")]
+async fn test_meeting_token_missing_user_fails_closed(pool: PgPool) -> Result<(), anyhow::Error> {
+    let server = TestAuthServer::spawn(pool).await?;
+    let client = reqwest::Client::new();
+
+    let token = server
+        .create_service_token("gc-service", &["internal:meeting-token"])
+        .await?;
+
+    // subject_user_id intentionally NOT seeded -> get_by_id returns None.
+    let response = client
+        .post(format!(
+            "{}/api/v1/auth/internal/meeting-token",
+            server.url()
+        ))
+        .bearer_auth(&token)
+        .json(&meeting_token_request(
+            test_uuid(9999),
+            test_uuid(2),
+            test_uuid(3),
+            test_uuid(4),
+        ))
+        .send()
+        .await?;
+
+    assert_eq!(
+        response.status(),
+        StatusCode::NOT_FOUND,
+        "missing users row must fail closed with 404, not mint a nameless token"
+    );
 
     Ok(())
 }
@@ -426,7 +497,9 @@ async fn test_meeting_token_ttl_capping(pool: PgPool) -> Result<(), anyhow::Erro
         .await?;
 
     // Request with TTL above maximum (1 hour)
-    let mut payload = meeting_token_request(test_uuid(1), test_uuid(2), test_uuid(3), test_uuid(4));
+    let (subject_user_id, _) = seed_meeting_subject(&server).await?;
+    let mut payload =
+        meeting_token_request(subject_user_id, test_uuid(2), test_uuid(3), test_uuid(4));
     payload["ttl_seconds"] = serde_json::json!(3600); // 1 hour
 
     // Act
@@ -474,6 +547,8 @@ async fn test_meeting_token_multiple_scopes(pool: PgPool) -> Result<(), anyhow::
         )
         .await?;
 
+    let (subject_user_id, _) = seed_meeting_subject(&server).await?;
+
     // Act
     let response = client
         .post(format!(
@@ -482,7 +557,7 @@ async fn test_meeting_token_multiple_scopes(pool: PgPool) -> Result<(), anyhow::
         ))
         .bearer_auth(&token)
         .json(&meeting_token_request(
-            test_uuid(1),
+            subject_user_id,
             test_uuid(2),
             test_uuid(3),
             test_uuid(4),
@@ -513,7 +588,9 @@ async fn test_meeting_token_host_role(pool: PgPool) -> Result<(), anyhow::Error>
         .create_service_token("gc-service", &["internal:meeting-token"])
         .await?;
 
-    let mut payload = meeting_token_request(test_uuid(1), test_uuid(2), test_uuid(3), test_uuid(4));
+    let (subject_user_id, _) = seed_meeting_subject(&server).await?;
+    let mut payload =
+        meeting_token_request(subject_user_id, test_uuid(2), test_uuid(3), test_uuid(4));
     payload["role"] = serde_json::json!("host");
     payload["participant_type"] = serde_json::json!("member");
     payload["capabilities"] = serde_json::json!(["video", "audio", "screen_share"]);
@@ -551,7 +628,11 @@ async fn test_meeting_token_external_participant(pool: PgPool) -> Result<(), any
         .create_service_token("gc-service", &["internal:meeting-token"])
         .await?;
 
-    let mut payload = meeting_token_request(test_uuid(1), test_uuid(2), test_uuid(3), test_uuid(4));
+    // External participants are still AC-authenticated users with a local row
+    // today (single-cluster), so seed the subject; fail-closed applies uniformly.
+    let (subject_user_id, _) = seed_meeting_subject(&server).await?;
+    let mut payload =
+        meeting_token_request(subject_user_id, test_uuid(2), test_uuid(3), test_uuid(4));
     payload["participant_type"] = serde_json::json!("external");
 
     // Act
@@ -939,8 +1020,9 @@ async fn test_meeting_token_minimal_request(pool: PgPool) -> Result<(), anyhow::
         .await?;
 
     // Request with only required fields (use defaults for optionals)
+    let (subject_user_id, _) = seed_meeting_subject(&server).await?;
     let payload = serde_json::json!({
-        "subject_user_id": test_uuid(1).to_string(),
+        "subject_user_id": subject_user_id.to_string(),
         "meeting_id": test_uuid(2).to_string(),
         "meeting_org_id": test_uuid(3).to_string(),
         "home_org_id": test_uuid(4).to_string()
@@ -1033,7 +1115,7 @@ async fn test_meeting_token_claims_structure(pool: PgPool) -> Result<(), anyhow:
         .create_service_token("gc-service", &["internal:meeting-token"])
         .await?;
 
-    let subject_user_id = test_uuid(100);
+    let (subject_user_id, expected_name) = seed_meeting_subject(&server).await?;
     let meeting_id = test_uuid(200);
     let meeting_org_id = test_uuid(300);
     let home_org_id = test_uuid(400);
@@ -1090,6 +1172,11 @@ async fn test_meeting_token_claims_structure(pool: PgPool) -> Result<(), anyhow:
         claims["role"].as_str(),
         Some("host"),
         "role should be 'host'"
+    );
+    assert_eq!(
+        claims["display_name"].as_str(),
+        Some(expected_name.as_str()),
+        "display_name claim should be the seeded users.display_name"
     );
     assert!(claims["jti"].is_string(), "jti should be present");
     assert!(claims["iat"].is_number(), "iat should be present");

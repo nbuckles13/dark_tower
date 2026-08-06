@@ -85,6 +85,22 @@ pub fn record_token_issuance(grant_type: &str, status: &str, duration: Duration)
         .increment(1);
 }
 
+/// Record the outcome of the meeting-token display-name lookup.
+///
+/// Metric: `ac_meeting_token_display_name_total`
+/// Labels: `outcome` — CLOSED enum, exactly three values:
+/// - `resolved`      — user row found; display_name stamped into the token.
+/// - `user_not_found`— fail-closed: no `users` row for the subject; token refused.
+/// - `lookup_error`  — the `users` SELECT itself failed (DB error); token refused.
+///
+/// PII discipline (ADR-0011): `outcome` is the ONLY label and is a fixed enum;
+/// no `user_id`, `display_name`, or other per-user value is ever a label.
+/// The `user_not_found` cell distinguishes the fail-closed data-integrity path
+/// from a transient `lookup_error` (DB) path for alerting.
+pub fn record_meeting_display_name_outcome(outcome: &str) {
+    counter!("ac_meeting_token_display_name_total", "outcome" => outcome.to_string()).increment(1);
+}
+
 /// Record token validation result
 ///
 /// Metric: `ac_token_validations_total`

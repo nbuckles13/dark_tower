@@ -125,6 +125,7 @@ pub fn make_meeting_claims(meeting_id: &str) -> MeetingTokenClaims {
         participant_type: ParticipantType::Member,
         role: MeetingRole::Participant,
         capabilities: vec!["video".to_string(), "audio".to_string()],
+        display_name: "Test Participant".to_string(),
         iat: now,
         exp: now + 3600,
         jti: format!("jti-{}", uuid::Uuid::new_v4()),
@@ -143,6 +144,7 @@ pub fn make_expired_meeting_claims(meeting_id: &str) -> MeetingTokenClaims {
         participant_type: ParticipantType::Member,
         role: MeetingRole::Participant,
         capabilities: vec!["video".to_string(), "audio".to_string()],
+        display_name: "Test Participant".to_string(),
         iat: past,
         exp: past + 3600, // expired 1 hour ago
         jti: format!("jti-{}", uuid::Uuid::new_v4()),

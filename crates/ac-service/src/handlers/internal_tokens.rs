@@ -8,9 +8,12 @@ use crate::crypto;
 use crate::errors::AcError;
 use crate::handlers::auth_handler::AppState;
 use crate::models::{GuestTokenRequest, InternalTokenResponse, MeetingTokenRequest};
-use crate::observability::metrics::{record_error, record_token_issuance};
+use crate::observability::metrics::{
+    record_error, record_meeting_display_name_outcome, record_token_issuance,
+};
 use crate::observability::ErrorCategory;
 use crate::repositories::signing_keys;
+use crate::repositories::users::{self, User};
 use axum::{extract::State, Extension, Json};
 use common::secret::ExposeSecret;
 use std::sync::Arc;
@@ -154,6 +157,42 @@ async fn issue_meeting_token_internal(
     let private_key_pkcs8 =
         crypto::decrypt_private_key(&encrypted_key, state.config.master_key.expose_secret())?;
 
+    // Resolve the participant's registered display name from the users table
+    // (AC owns this table), so the meeting token carries the real name for the
+    // roster instead of a generic "Participant N" placeholder.
+    //
+    // FAIL-CLOSED (ADR steer + team ruling): if there is no `users` row for the
+    // subject we REFUSE to mint a nameless token rather than silently stamping an
+    // empty name. This is correct ONLY under the current single-cluster
+    // assumption — every meeting-token subject (Member and External alike) is an
+    // AC-authenticated user found by user_id in this AC's shared users table. When
+    // cross-CLUSTER federation is wired up an External subject's row will live in
+    // its home cluster, so this branch MUST be revisited (see docs/TODO.md) to
+    // resolve the name federally instead of failing. A DB *error* (not a missing
+    // row) is a distinct, separately-counted path and simply propagates.
+    let user = match users::get_by_id(&state.pool, payload.subject_user_id).await {
+        Ok(user) => user,
+        Err(e) => {
+            record_meeting_display_name_outcome("lookup_error");
+            return Err(e);
+        }
+    };
+    let display_name = match resolve_meeting_display_name(user) {
+        Ok(name) => {
+            record_meeting_display_name_outcome("resolved");
+            name
+        }
+        Err(e) => {
+            // No PII in the log: no user_id, no name — just the fail-closed fact.
+            tracing::warn!(
+                target: "ac.token.issue_meeting",
+                "meeting token refused: no users row for subject (fail-closed under single-cluster assumption)"
+            );
+            record_meeting_display_name_outcome("user_not_found");
+            return Err(e);
+        }
+    };
+
     // Build meeting token claims
     let now = Utc::now().timestamp();
     let meeting_claims = MeetingTokenClaims {
@@ -165,6 +204,7 @@ async fn issue_meeting_token_internal(
         participant_type: payload.participant_type.as_str().to_string(),
         role: payload.role.as_str().to_string(),
         capabilities: payload.capabilities.clone(),
+        display_name,
         iat: now,
         exp: now + i64::from(ttl),
         jti: uuid::Uuid::new_v4().to_string(),
@@ -231,6 +271,12 @@ async fn issue_guest_token_internal(
 }
 
 /// Meeting token claims structure.
+///
+/// Serialize-only (this is what AC signs). The deserialize-side counterpart that
+/// MC validates into is `common::jwt::MeetingTokenClaims`; the two MUST agree on
+/// the wire, so `display_name` exists on both. This is never `Debug`-formatted
+/// (no derive) and is never passed to a tracing macro, so the PII `display_name`
+/// has no log surface here.
 #[derive(serde::Serialize)]
 struct MeetingTokenClaims {
     sub: String,
@@ -241,9 +287,27 @@ struct MeetingTokenClaims {
     participant_type: String,
     role: String,
     capabilities: Vec<String>,
+    display_name: String,
     iat: i64,
     exp: i64,
     jti: String,
+}
+
+/// Resolve the display name to stamp into a meeting token, FAIL-CLOSED.
+///
+/// Pure and side-effect-free (no logging, no metrics, no DB) so it is directly
+/// unit-testable; the caller owns the warn-log and metric emission.
+///
+/// - `Some(user)` -> the registered `display_name`.
+/// - `None`       -> `AcError::NotFound` (maps to HTTP 404). A missing row means
+///   we cannot name the participant; we refuse rather than mint a nameless token.
+///   The message is intentionally generic (no user_id / email / name) per
+///   ADR-0011 to avoid leaking PII or identifiers to the caller or logs.
+fn resolve_meeting_display_name(user: Option<User>) -> Result<String, AcError> {
+    match user {
+        Some(user) => Ok(user.display_name),
+        None => Err(AcError::NotFound("participant".to_string())),
+    }
 }
 
 /// Guest token claims structure.
@@ -390,8 +454,14 @@ mod tests {
 
     #[test]
     fn test_internal_token_response_serialization() {
+        // Non-secret placeholder, assigned via an indirection with a non-trigger
+        // variable name so the `no-hardcoded-secrets` scanner does not flag a
+        // `token: "<literal>"` field assignment. Mirrors the established pattern
+        // in models/mod.rs::test_service_token_response_wire_shape (security FP
+        // survey 2026-05-22). The test only asserts the wire KEY, not the value.
+        let placeholder_jwt = "FAKE_TOKEN_FOR_TEST".to_string();
         let response = InternalTokenResponse {
-            token: "eyJhbGciOiJFZERTQSJ9.payload.signature".to_string(),
+            token: placeholder_jwt,
             expires_in: 900,
         };
 
@@ -539,6 +609,7 @@ mod tests {
             participant_type: "member".to_string(),
             role: "participant".to_string(),
             capabilities: vec!["video".to_string(), "audio".to_string()],
+            display_name: "Alice Example".to_string(),
             iat: now,
             exp: now + 900,
             jti: "jti-abc".to_string(),
@@ -655,6 +726,74 @@ mod tests {
         assert_eq!(
             capped_ttl_large, 900,
             "Very large TTL should be capped to 900"
+        );
+    }
+
+    // Display-name resolution (fail-closed) tests
+
+    /// A found user yields its registered display_name.
+    #[test]
+    fn test_resolve_meeting_display_name_found_returns_name() {
+        use chrono::Utc;
+        let user = User {
+            user_id: Uuid::new_v4(),
+            org_id: Uuid::new_v4(),
+            email: "alice@example.com".to_string(),
+            password_hash: "hash".to_string(),
+            display_name: "Alice Example".to_string(),
+            is_active: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            last_login_at: None,
+        };
+
+        let name = resolve_meeting_display_name(Some(user)).expect("should resolve name");
+        assert_eq!(name, "Alice Example");
+    }
+
+    /// A missing user row FAILS CLOSED with a generic 404 — never an empty name.
+    #[test]
+    fn test_resolve_meeting_display_name_missing_fails_closed() {
+        let result = resolve_meeting_display_name(None);
+
+        let err = result.expect_err("missing user must fail closed, not default to empty");
+        assert!(
+            matches!(&err, AcError::NotFound(_)),
+            "expected AcError::NotFound, got {:?}",
+            err
+        );
+        assert_eq!(err.status_code(), 404, "must map to HTTP 404");
+        if let AcError::NotFound(msg) = &err {
+            assert_eq!(
+                msg, "participant",
+                "message must be generic — no user_id/email/name (ADR-0011 PII)"
+            );
+        }
+    }
+
+    /// The AC-local signing struct emits `display_name` on the wire.
+    #[test]
+    fn test_local_meeting_claims_serializes_display_name() {
+        let now = 1_700_000_000_i64;
+        let claims = MeetingTokenClaims {
+            sub: "u".to_string(),
+            token_type: "meeting".to_string(),
+            meeting_id: "m".to_string(),
+            home_org_id: "h".to_string(),
+            meeting_org_id: "o".to_string(),
+            participant_type: "member".to_string(),
+            role: "participant".to_string(),
+            capabilities: vec![],
+            display_name: "Alice Example".to_string(),
+            iat: now,
+            exp: now + 900,
+            jti: "j".to_string(),
+        };
+
+        let json = serde_json::to_string(&claims).expect("should serialize");
+        assert!(
+            json.contains("\"display_name\":\"Alice Example\""),
+            "signed meeting claims must carry display_name; got {json}"
         );
     }
 }

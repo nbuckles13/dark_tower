@@ -1394,7 +1394,7 @@ tasks:
     dashboard-set completeness guard asserting every service has
     overview+logs+slos - the gap that let MH silently drift.
 - id: 63
-  status: pending
+  status: completed
   specialist: auth-controller
   env_tests: true
   prompt: |

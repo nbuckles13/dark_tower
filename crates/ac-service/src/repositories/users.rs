@@ -56,7 +56,6 @@ pub async fn get_by_email(
 }
 
 /// Get user by user_id.
-#[allow(dead_code)] // Library function - will be used in future phases
 pub async fn get_by_id(pool: &PgPool, user_id: Uuid) -> Result<Option<User>, AcError> {
     let start = Instant::now();
     let result = sqlx::query_as::<_, User>(

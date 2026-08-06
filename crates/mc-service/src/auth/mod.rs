@@ -213,6 +213,7 @@ mod tests {
             participant_type: common::jwt::ParticipantType::Member,
             role: common::jwt::MeetingRole::Participant,
             capabilities: vec!["video".to_string(), "audio".to_string()],
+            display_name: "Test Participant".to_string(),
             iat: now,
             exp: now + 3600,
             jti: "jti-001".to_string(),
