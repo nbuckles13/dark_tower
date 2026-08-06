@@ -1289,6 +1289,8 @@ tasks:
   deps:
   - 18
   - 19
+  - 63
+  - 64
   prompt: |
     Close four browser E2E coverage gaps identified during the pre-close manual
     test-plan review (docs/user-stories/2026-05-02-browser-client-join-manual-test-plan.md
@@ -1368,4 +1370,73 @@ tasks:
     the workspace lockfile engines floor agree - same pattern as the existing
     Playwright-pin guard entry; genuinely task-sized, tracked not done here).
     Out of scope: implementing the drift guard itself; rebaking the image.
+- id: 62
+  status: pending
+  specialist: observability
+  env_tests: true
+  deps: []
+  prompt: |
+    Manual testing (2026-08-05) found MH is the only service missing its logs
+    and SLO dashboards: infra/grafana/dashboards/ has {ac,gc,mc}-logs.json and
+    {ac,gc,mc}-slos.json but only mh-overview.json for MH. Create mh-logs.json
+    and mh-slos.json following the established per-service patterns
+    (mc-logs.json and mc-slos.json are the closest references; service-owned
+    dashboards per ADR-0031). Metric and SLO sources: docs/observability/
+    metrics/mh-service.md (e.g. mh_webtransport_handshake_duration_seconds SLO,
+    mh_jwt_validations_total, mh_active_connections) and Loki label app=mh-service
+    for the logs dashboard (level filter + ERROR/WARN panels, matching
+    mc-logs.json structure). Verify the Grafana provisioning path in
+    infra/kind/scripts/setup.sh picks both up and the dashboard-panels guard
+    passes. Also add a docs/TODO.md entry (tracked, not implemented here) for a
+    dashboard-set completeness guard asserting every service has
+    overview+logs+slos - the gap that let MH silently drift.
+- id: 63
+  status: pending
+  specialist: auth-controller
+  env_tests: true
+  deps: []
+  prompt: |
+    Fix roster display names: manual testing (2026-08-05) shows the meeting
+    roster renders generic labels (Participant 1, Participant 2) instead of the
+    display name entered at registration. The downstream plumbing already
+    works: proto Participant.name exists (signaling.proto), MC populates it
+    from the validated meeting-token display_name
+    (crates/mc-service/src/webtransport/handler.rs and connection.rs), and the
+    web-app renders participant.name (JoinMeeting.svelte roster li). So the
+    break is upstream: the USER-type meeting token display_name is not the
+    registered display name. Investigate where AC mints user meeting tokens
+    (the GC meeting_token operation path) and populate display_name from the
+    users table displayName. Note SignIn.svelte:27 documents a related known
+    gap: AC token responses carry no identity fields, so signed-IN (vs
+    signed-up) users have no client-side displayName either - the meeting
+    token is the right carrier for the roster name regardless of client state.
+    GSA notice: crates/common/src/meeting_token.rs is a Guarded Shared Area
+    (auth/crypto) - claim additions/changes are owner-implemented here
+    (auth-controller) with security co-sign at review. Acceptance: two DISTINCT
+    registered users join the same meeting from two browsers and each sees the
+    other's registered display name in the roster (manual verification note in
+    main.md; automated assertion lands in task 60).
+- id: 64
+  status: pending
+  specialist: meeting-controller
+  env_tests: true
+  deps: []
+  prompt: |
+    Reduce or bound roster leave latency: manual testing (2026-08-05) observed
+    that after a participant closes their tab, the other participant's roster
+    takes noticeably long to update (it does eventually, so ParticipantLeft
+    broadcast works). Diagnose the MC disconnect-detection path: does MC react
+    to the WebTransport/QUIC session-closed event promptly, or does it only
+    discover the departure via QUIC max-idle-timeout expiry? Expected outcome:
+    (a) if the transport surfaces a close/closed event, handle it immediately
+    and broadcast ParticipantLeft with the appropriate LeaveReason;
+    (b) for the crash/network-loss case where only the idle timeout can detect
+    departure, make the timeout an explicit config value (config-driven per
+    project conventions, not a library default), choose a defensible value,
+    and document the expected worst-case roster-remove latency in the MC
+    metrics/ops docs. Add or extend an MC metric if disconnect reason is not
+    already observable (check mc_connections_active semantics and the
+    mc_mh_notifications path). Acceptance: tab-close roster removal is fast
+    (target: a few seconds, bounded and documented); task 60's teardown E2E
+    will assert the bound.
 ```
