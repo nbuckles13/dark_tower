@@ -2699,9 +2699,7 @@ label, so the cost-shifts stay visible.
 
 ## Accepted Deferrals
 
-No finding raised against this diff was deferred or spun out. The entries below are DRY
-extraction opportunities (which the review protocol routes here rather than through fix-or-defer)
-plus pre-existing conditions surfaced during review and tracked rather than fixed:
+No finding raised against this diff was deferred or spun out. The entries below are DRY extraction opportunities (which the review protocol routes here rather than through fix-or-defer) plus pre-existing conditions surfaced during review and tracked rather than fixed:
 
 - `docs/TODO.md` §Polyglot Pipeline Follow-ups — `is_ts_build_artifact()` extraction (3rd caller vs documented 4th-caller threshold)
 - `docs/TODO.md` §Polyglot Pipeline Follow-ups — comment/string-aware line lexer duplicated 3×
@@ -2710,7 +2708,7 @@ plus pre-existing conditions surfaced during review and tracked rather than fixe
 - `docs/TODO.md` §Polyglot Pipeline Follow-ups — CATEGORY_A promotion of `credential`/`credentials`/`creds`
 - `docs/TODO.md` §Supply Chain — pre-existing unsuppressed `pnpm audit` reds, P1 with re-check trigger
 - `docs/TODO.md` — Layer 7 Playwright lane (ADR-0033 §3 vs `layer7.sh` drift); made a requirement *on* task #18
-- **Not yet filed**: knowledge-index 75-line cap Goodhart problem (@paired-infrastructure-2) — six of fifteen INDEX files sit at exactly 75, so "merge two lines to make room" is becoming the coping strategy. Owner to file; Lead to file with attribution if not done at story close.
+- `docs/TODO.md` §Documentation Hygiene — knowledge-index 75-line cap Goodhart problem (filed 2026-08-03 by Lead with attribution per this bullet's instruction; owner @paired-infrastructure-2)
 
 ---
 
