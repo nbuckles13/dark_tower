@@ -25,9 +25,9 @@ import type { BrowserContext, Page, Request, Response } from 'playwright/test';
 // so a typo'd prefix is a compile error (@code-reviewer, task #19 Gate 1).
 import {
   MeetingApiClient,
-  SdkErrorCode,
   type AuthTokenResponse,
   type RegisterResponse,
+  type SdkErrorCode,
 } from '@darktower/sdk-core';
 import { e2eEnv } from './env.js';
 
@@ -60,7 +60,8 @@ function randomPassword(): string {
  * SSoT for the Kind cluster this suite targets is
  * `infra/services/ac-service/configmap.yaml` (`AC_REGISTRATION_RATE_LIMIT_*`,
  * relaxed to 100/min for dev/test); the suite's per-run registration budget is
- * tracked in e2e/README.md §Budgets (4/run as of task #19).
+ * tracked in e2e/README.md §Budgets (2/run: the shared user V + one distinct
+ * second party — see {@link SHARED_USER}).
  */
 export function randomCredentials(label: string): TestCredentials {
   userCounter += 1;
@@ -69,6 +70,75 @@ export function randomCredentials(label: string): TestCredentials {
     password: randomPassword(),
     displayName: `E2E ${label} ${runId}`,
   };
+}
+
+/**
+ * The suite's ONE shared valid user — the single-source-of-truth for the
+ * registration budget (see e2e/README.md §Budgets). Registered exactly ONCE per
+ * run and reused everywhere via `signInViaUi` (0 further registrations), so the
+ * whole suite spends 2 registrations: this user + the one genuinely-distinct
+ * second party (`userB`) in the distinct-user two-party test.
+ *
+ * BUDGET ↔ workers=1 COUPLING (do not decouple silently): "registered once per
+ * run" rests on `workers: 1` (playwright.config.ts). A single worker process
+ * means the module-level `sharedRegistration` memo below is a per-RUN singleton.
+ * Raising `workers` would give each worker its OWN module instance → V would be
+ * re-registered per worker, multiplying the budget invisibly. If `workers` ever
+ * changes, this memo must move to a global-setup / setup-project that registers
+ * V once and hands its creds to workers.
+ */
+export const SHARED_USER = randomCredentials('shared');
+
+/** Success-only memo: holds the registration promise ONLY once it has resolved. */
+let sharedRegistration: Promise<void> | undefined;
+
+/**
+ * Register {@link SHARED_USER} exactly once, in an ISOLATED throwaway context.
+ *
+ * The isolation is load-bearing: some specs install a `page.route('**...register…')`
+ * fulfill (auth-rejection's `fulfillAuthRegister`) that would intercept a real
+ * sign-up. Routes are per-context, so registering V in its own fresh context is
+ * immune to whatever the caller's page has mocked.
+ *
+ * Fail-loud, write-once: on failure the memo is RESET (never cached as a
+ * partial/undefined identity) and a single clearly-named diagnostic is thrown —
+ * V is the suite's single valid-user SPOF, so its registration failure must read
+ * at the real cause, not as N cryptic downstream `signInViaUi(V)` timeouts.
+ */
+async function ensureSharedUserRegistered(page: Page): Promise<void> {
+  if (sharedRegistration === undefined) {
+    sharedRegistration = (async (): Promise<void> => {
+      const browser = page.context().browser();
+      if (browser === null) {
+        throw new Error('no Browser handle on the page context (persistent context?)');
+      }
+      const context = await browser.newContext();
+      try {
+        const registrationPage = await context.newPage();
+        await registrationPage.goto('/');
+        await signUpViaUi(registrationPage, SHARED_USER);
+      } finally {
+        await context.close();
+      }
+    })().catch((err: unknown) => {
+      sharedRegistration = undefined; // do not cache a failed registration
+      const detail = err instanceof Error ? err.message : String(err);
+      throw new Error(`shared user V registration failed: ${detail}`);
+    });
+  }
+  return sharedRegistration;
+}
+
+/**
+ * Authenticate `page` as the shared valid user {@link SHARED_USER}, registering
+ * it once per run on first use (see {@link ensureSharedUserRegistered}). Returns
+ * the issued access token (needed Node-side by {@link bootstrapMeeting}). This is
+ * the 0-registration way to get a page into the authed shell holding a real,
+ * valid session.
+ */
+export async function authAsSharedUser(page: Page): Promise<string> {
+  await ensureSharedUserRegistered(page);
+  return signInViaUi(page, SHARED_USER);
 }
 
 // ============================================================================
@@ -357,6 +427,74 @@ export async function waitForParticipantJoined(
   }
 }
 
+/**
+ * Gap (2): wait (bounded) until `page`'s bus sees `participantLeft` for
+ * `participantId` — the SDK received MC's `ParticipantLeft` broadcast for the
+ * departed peer (task-#64 leave contract / R-46 roster propagation, departure
+ * side). Own diagnostic (NOT a bare event-string swap of `waitForParticipantJoined`):
+ * a LEFT that never arrives means a different thing than a JOINED that never
+ * arrives — the peer's teardown did not propagate, or exceeded MC's grace/idle
+ * worst case (see mcMetrics.ts `waitForMcParticipantLeavesAbove` for the config
+ * SSoT). The default budget covers MC's broadcast worst case
+ * (idle_timeout + grace_period + grace-check ≈ 45s, no Prometheus scrape hop) —
+ * the spec drives a clean close so it resolves in ~1 tick in practice.
+ */
+export async function waitForParticipantLeft(
+  page: Page,
+  participantId: string,
+  timeoutMs = 60_000,
+): Promise<void> {
+  try {
+    await page.waitForFunction(
+      (id) =>
+        window.__darktower_test__?.events.some(
+          (e) => e['type'] === 'participantLeft' && e['participantId'] === id,
+        ) ?? false,
+      participantId,
+      { timeout: timeoutMs },
+    );
+  } catch {
+    throw new Error(
+      `no 'participantLeft' bus event for participant ${participantId} within ` +
+        `${timeoutMs}ms (the departed peer's teardown did not propagate, or exceeded ` +
+        `MC's grace/idle worst case). ${await busFailureContext(page)}`,
+    );
+  }
+}
+
+// ============================================================================
+// Roster DOM assertions (gap (4): tie bus truth to the rendered roster)
+// ============================================================================
+
+/**
+ * Assert the live-roster DOM (`JoinMeeting.svelte` `participant-list`) renders a
+ * `<li data-testid="participant-${participantId}">` whose text is EXACTLY
+ * `expectedName`. Ties the bus/JoinResponse truth to what the demo actually
+ * paints. When the joining peer authenticated via `signInViaUi` (no client-side
+ * displayName — `SignIn.svelte`), a correct name here proves the name is carried
+ * by the meeting token, not band-aided client-side.
+ */
+export async function expectRosterShows(
+  page: Page,
+  participantId: string,
+  expectedName: string,
+): Promise<void> {
+  const entry = page.getByTestId(`participant-${participantId}`);
+  await expect(entry, `roster must render participant ${participantId}`).toBeVisible();
+  await expect(
+    entry,
+    `roster entry for ${participantId} must show its (token-carried) display name`,
+  ).toHaveText(expectedName);
+}
+
+/** Assert the roster DOM renders NO entry for `participantId` (post-departure). */
+export async function expectRosterMissing(page: Page, participantId: string): Promise<void> {
+  await expect(
+    page.getByTestId(`participant-${participantId}`),
+    `roster must NOT render departed participant ${participantId}`,
+  ).toHaveCount(0);
+}
+
 // ============================================================================
 // Negative-path helpers (task #19, R-45)
 // ============================================================================
@@ -450,10 +588,7 @@ export async function signInExpectingRejection(
  * `Unauthorized` reply. The token passes through the fulfilled body BY VALUE
  * and is never logged or interpolated anywhere (@semantic-guard item 8).
  */
-export async function rewriteJoinResponseMeetingId(
-  page: Page,
-  meetingCode: string,
-): Promise<void> {
+export async function rewriteJoinResponseMeetingId(page: Page, meetingCode: string): Promise<void> {
   await page.route(`**${meetingPath(meetingCode)}`, async (route) => {
     const real = await route.fetch();
     const body = (await real.json()) as Record<string, unknown>;
@@ -462,6 +597,16 @@ export async function rewriteJoinResponseMeetingId(
       body: JSON.stringify({ ...body, meetingId: crypto.randomUUID() }),
     });
   });
+}
+
+/**
+ * Remove the {@link rewriteJoinResponseMeetingId} interception for `meetingCode`
+ * (gap (3) mc-token-rejection recovery: the recovery join must run WITHOUT the
+ * rewrite active). Same glob the rewrite installs — the real GC response flows
+ * through untouched afterwards.
+ */
+export async function clearJoinResponseRewrite(page: Page, meetingCode: string): Promise<void> {
+  await page.unroute(`**${meetingPath(meetingCode)}`);
 }
 
 /**
@@ -633,4 +778,34 @@ export function assertTokenOnlyJoinTraffic(
       `[${label}] GC request ${redact(request.url)} must authenticate via bearer token`,
     ).toMatch(/^Bearer /);
   }
+}
+
+// ============================================================================
+// Join-after-error recovery (gap (3), R-45 recovery tail)
+// ============================================================================
+
+/**
+ * Recover from a failed/spent join by re-entering the join view and joining
+ * `meetingCode` in the SAME page session (NO reload), asserting success. Returns
+ * the recovery join's `joined` bus projection.
+ *
+ * `MeetingSession` is single-use (`JoinMeeting.svelte`): a spent join view cannot
+ * join again — the view must REMOUNT to build a fresh session. So this navigates
+ * to the create view (which unmounts `JoinMeeting` → `onDestroy` →
+ * `session.disconnect()`) and WAITS for the create view to render before
+ * re-entering join — a GATED remount, not back-to-back clicks that would race the
+ * single-use teardown (fatal under retries=0). It then delegates to
+ * {@link joinAsUser} (which owns nav-join + meeting-code fill — not re-encoded).
+ *
+ * Caller owns the spec-specific preamble (e.g. `clearJoinResponseRewrite`,
+ * `bootstrapMeeting`, or re-authenticating a dropped session) BEFORE calling.
+ */
+export async function recoverByJoining(page: Page, meetingCode: string): Promise<JoinedBusEvent> {
+  await page.getByTestId('nav-create').click();
+  await expect(
+    page.getByTestId('meeting-title'),
+    'recovery: the create view must render (JoinMeeting unmounted) before re-entering join',
+  ).toBeVisible();
+  await joinAsUser(page, meetingCode);
+  return waitForJoined(page);
 }

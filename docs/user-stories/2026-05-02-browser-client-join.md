@@ -1283,7 +1283,7 @@ tasks:
     over-engineering), suppression-machinery changes, and unblocking whatever
     specific advisory is currently red. Run paired with infrastructure.
 - id: 60
-  status: pending
+  status: completed
   specialist: test
   env_tests: true
   deps:

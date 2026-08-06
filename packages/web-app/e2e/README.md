@@ -32,20 +32,44 @@ browser SDK** feeds it. The PromQL lives in exactly one helper per language
 
 `join-happy-path.spec.ts`, observed via the `window.__darktower_test__` replay
 bus (`src/lib/e2eBus.ts`, compile-time gated by `__E2E_HOOKS__` — dev builds
-only):
+only). Four focused tests (each its own fresh 120s budget):
+
+**Test 1 — token-based join with active/active media (a/b/d/e):**
 
 - **(a)** MC `JoinResponse` received with a `participant_id`
 - **(b)** ≥1 successful MH WebTransport handshake for **every** URL in
   `media_servers` (active/active; MH count is cluster topology, not hardcoded)
-- **(c)** a second browser context joining the same meeting fires
-  `ParticipantJoined` in the first context within **5s**
 - **(d)** the SDK's post-join `MediaConnectionUpdate` (state=CONNECTED) reached
   MC's handler — `mc_participant_mh_status_total{state="connected"}` rises above
   a baseline captured immediately before the join
-- **(e)** token-only join (task #58 c-iii): in each context's join window, no
-  request carries the raw email/password **values**, no `/api/v1/auth/*`
-  endpoint is hit (the removed forced-login band-aid, commit 7b69288, must never
-  come back), and GC requests authenticate via `Authorization: Bearer` only
+- **(e)** token-only join (task #58 c-iii): in the join window, no request
+  carries the raw email/password **values**, no `/api/v1/auth/*` endpoint is hit
+  (the removed forced-login band-aid, commit 7b69288, must never come back), and
+  GC requests authenticate via `Authorization: Bearer` only
+
+**Test 2 — distinct-user two-party join + rendered roster (gaps 1 + 4):** a
+second context joins as a GENUINELY DIFFERENT account (`userB`, freshly
+registered — not a second sign-in of the same user). Asserts two distinct
+`participant_id`s AND two distinct `user_id`s; **(c)** the first context sees
+`ParticipantJoined` within **5s**; and the rendered roster DOM
+(`participant-list` / `participant-${id}`) shows BOTH peers with correct display
+names — each context renders its peer (the roster excludes self). The host (V)
+is signed in, so its name in the peer's roster proves the meeting token carries
+the registered name, not a client-side value.
+
+**Test 3 — participant leave, MC counter, and clean rejoin (gap 2):** a second
+participant joins, then departs (the demo's own teardown drives a clean
+`session.disconnect()`, then the context is closed). The first context observes
+the departure three ways — the `participantLeft` bus event, the roster DOM
+removal, and MC's server-side `mc_participant_leaves_total` (all-reasons
+monotonic sum) rising above a pre-departure baseline. Then a FRESH context
+rejoins (via sign-in, no client displayName): a NEW `participant_id`, a fresh
+`joined`, and the roster DOM shows the rejoined peer's TOKEN-CARRIED registered
+name (the sign-up path alone would stay green if the name were band-aided
+client-side — task 63 second variant).
+
+**Test 4 — bootstrap-join:** a meeting created via direct GC `POST` (not the
+demo UI) is joinable from the browser, with the token-only invariant held.
 
 ## What the negative-path specs assert (task #19, R-45)
 
@@ -62,14 +86,14 @@ rejection cannot false-pass it:
   assertion). Test B: sign-in with never-registered credentials → AC responds
   exactly **401** and `last-error` renders the typed `AUTH:` prefix (the literal
   R-45 "typed AuthError in the demo UI" surface).
-- **`meeting-not-found.spec.ts`** (1 registration) — a real user joins a
-  random well-formed code → GC responds exactly **404**, `last-error` renders
-  the typed `MEETING:` prefix and **stays** rendered (nav-signin must NOT
+- **`meeting-not-found.spec.ts`** (0 registrations — reuses V) — a real user
+  joins a random well-formed code → GC responds exactly **404**, `last-error`
+  renders the typed `MEETING:` prefix and **stays** rendered (nav-signin must NOT
   reappear: a 404 is not a credential rejection, discriminating this path from
   the 401 session drop).
-- **`mc-token-rejection.spec.ts`** (1 registration) — a real token + real
-  `mcAssignment`, but the GC join response's `meetingId` is route-rewritten to
-  garbage: MC's step-6 binding check rejects with the bounded generic
+- **`mc-token-rejection.spec.ts`** (0 registrations — reuses V) — a real token +
+  real `mcAssignment`, but the GC join response's `meetingId` is route-rewritten
+  to garbage: MC's step-6 binding check rejects with the bounded generic
   `Unauthorized` → `last-error` renders the typed `SIGNALING:` prefix **and**
   MC's own `mc_session_join_failures_total{error_type="jwt_validation"}` rises
   above a pre-join baseline (the server-side proof — a dead/unreachable MC also
@@ -79,6 +103,14 @@ rejection cannot false-pass it:
 All three additionally assert that no `joined` bus event exists (a
 point-in-time scan after each spec's terminal condition — never a
 wait-for-absence).
+
+**Join-after-error recovery (gap 3):** each negative spec ends with a recovery
+tail — after the asserted failure, a valid join in the SAME page session (no
+reload) succeeds (`joined` observed). Because `MeetingSession` is single-use, the
+recovery remounts the join view (`recoverByJoining`). meeting-not-found and
+mc-token-rejection reuse their retained session (the latter clears the meetingId
+rewrite first); auth-rejection Test A re-authenticates as V after the session
+drop. This proves a failed join is not a dead end.
 
 ## Prerequisites (host-side)
 
@@ -142,25 +174,53 @@ counterpart). MC/MH endpoints come exclusively from the join response's
 
 ## Budgets and policies
 
-- **Registration budget: 4 throwaway users per run** (happy path 2 +
-  meeting-not-found 1 + mc-token-rejection 1; auth-rejection registers 0). The
-  rate-limit **SSoT is the AC config the target cluster actually runs**: the
+- **Registration budget: 2 throwaway users per run.** The suite registers
+  exactly two AC accounts:
+  - **V** — the shared valid user (`fixtures.ts` `SHARED_USER`), registered ONCE
+    per run via `authAsSharedUser` (in an isolated, route-mock-safe throwaway
+    context) and reused by every "needs a valid session" role through
+    `signInViaUi` (0 further registrations): the happy-path host, the
+    bootstrap-join, the leave/rejoin participants, and the negative specs
+    (meeting-not-found, mc-token-rejection, and auth-rejection's recovery tail).
+  - **userB** — the ONE genuinely-distinct second party, registered by the
+    distinct-user two-party test so it can assert two different accounts (distinct
+    `user_id`s), not two sessions of the same user.
+
+  **Why not more:** every recovery tail (gap 3) reuses a live/valid session — the
+  meeting-not-found and mc-token-rejection recoveries reuse their spec's retained
+  token; auth-rejection's recovery reuses V. The leave/rejoin second participant
+  is a second V *session* (participant identity is minted per-join), so it costs 0.
+
+  **workers=1 ↔ register-once coupling (do not decouple silently):** "V once per
+  run" holds only because `workers: 1` gives the whole run a single worker
+  process, so `fixtures.ts`'s `sharedRegistration` memo is a per-run singleton.
+  Raising `workers` would give each worker its own module instance and re-register
+  V per worker — move the memo to a global-setup / setup-project first (see the
+  comment at `SHARED_USER` and in `playwright.config.ts`).
+
+  The rate-limit **SSoT is the AC config the target cluster actually runs**: the
   Kind cluster this suite targets ships
   `infra/services/ac-service/configmap.yaml`
   (`AC_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS: "100"` per 1-minute window,
   relaxed for dev/test), so consecutive runs and the Layer-7 retry are safe. A
   **prod-configured AC** target instead gets the production default of 5 per
   60-minute window (`crates/ac-service/src/config.rs`
-  `DEFAULT_REGISTRATION_RATE_LIMIT_*`) — there, a second same-hour run exhausts
-  the budget and sign-up fails 429 (the negative specs' 401/404-exact
-  assertions cannot mistake that 429 for a pass). This suite assumes a
-  **single workstation against its own cluster**; it is not designed for
-  concurrent runs sharing one cluster's rate-limit budget.
+  `DEFAULT_REGISTRATION_RATE_LIMIT_*`) — at 2/run even the Layer-7 retry
+  (a second in-window run → 4 registrations) stays under that prod default,
+  a margin the previous 4/run budget did not have. A 429 there still cannot
+  false-pass a negative spec (their 401/404-exact assertions reject it). This
+  suite assumes a **single workstation against its own cluster**; it is not
+  designed for concurrent runs sharing one cluster's rate-limit budget.
 - **`retries: 0`** (ADR-0028): a failure is real. Fix it or delete the test —
   never mask with retries.
 - **Timeouts**: 120s/test ceiling; assertion-meaningful waits are tighter (5s
-  roster propagation; 60s Prometheus budget matching the Rust Scenario 7 helper,
-  which includes the 15s scrape SLA).
+  roster propagation; 60s Prometheus budget for the join-side counter matching
+  the Rust Scenario 7 helper; the departure-side leave counter uses a wider ~90s
+  ceiling — a leave's worst case includes MC's disconnect grace path, so the
+  budget is derived from `MC_QUIC_MAX_IDLE_TIMEOUT + MC_DISCONNECT_GRACE_PERIOD +
+  grace-check + scrape SLA`; see `mcMetrics.ts` and
+  `docs/observability/metrics/mc-service.md`. The leave/rejoin spec drives a
+  clean close, so in practice it settles in ~1 scrape interval).
 
 ## Artifacts & triage
 

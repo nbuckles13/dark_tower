@@ -19,11 +19,14 @@
 // behavior that ONLY `MeetingUnauthorizedError` can trigger.
 //
 // Registration budget: ZERO — Test A route-fulfills the register exchange
-// (AC never hit); Test B signs in with never-registered credentials.
+// (AC never hit); Test B signs in with never-registered credentials; Test A's
+// recovery tail reuses the suite's shared valid user V (0 registrations).
 
 import { expect, test } from 'playwright/test';
 import { SdkErrorCode } from '@darktower/sdk-core';
 import {
+  authAsSharedUser,
+  bootstrapMeeting,
   expectLastErrorCode,
   expectNoJoinedEvent,
   fulfillAuthRegister,
@@ -31,6 +34,7 @@ import {
   joinCapturingGcStatus,
   randomCredentials,
   randomMeetingCode,
+  recoverByJoining,
   signInExpectingRejection,
   signUpViaUi,
 } from './fixtures.js';
@@ -81,6 +85,20 @@ test.describe('auth rejection (R-45)', () => {
 
     // Terminal condition established (session dropped) — point-in-time scan.
     await expectNoJoinedEvent(page, 'auth-rejection/unauthenticated-join');
+
+    // Recovery (gap 3): the dropped session is RECOVERABLE — the restored auth nav
+    // is not a dead end. In the SAME page session (no reload) sign in as the shared
+    // valid user V (0 registrations; signInViaUi hits /user/token, not the
+    // route-fulfilled /register), create a real meeting Node-side, and complete a
+    // real join. The garbage-token register route stays installed but is inert
+    // here (it only matches /register).
+    const recoveryToken = await authAsSharedUser(page);
+    const meetingCode = await bootstrapMeeting(recoveryToken, 'E2E auth-rejection recovery');
+    const joined = await recoverByJoining(page, meetingCode);
+    expect(
+      joined.participantId,
+      'recovery: a valid join must succeed after re-authenticating in the same session',
+    ).not.toBe('');
   });
 
   test('AC rejects invalid credentials at sign-in with a typed AuthError in the demo UI', async ({

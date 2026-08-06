@@ -38,6 +38,32 @@ import { e2eEnv } from './env.js';
 
 const CONNECTED_SUM_PROMQL = 'sum(mc_participant_mh_status_total{state="connected"})';
 
+// Task-64 departure counter (browser-E2E gap (2), leave/teardown/rejoin).
+//
+// LABEL ANCHOR (@observability): `mc_participant_leaves_total` is incremented
+// exactly ONCE per `ParticipantLeft` broadcast at MC's single roster-removal
+// choke-point (`crates/mc-service/src/observability/metrics.rs:442`
+// `record_participant_leave`, called from `actors::meeting`
+// `remove_and_broadcast_left`). Its `reason` label is the bounded, enum-derived
+// set `voluntary | timeout | removed | meeting_ended` (`actors/messages.rs`
+// `LeaveReason::label()`, EXHAUSTIVE match — a new variant is a compile error).
+//
+// We sum over ALL reasons (NO label filter) on purpose: a Playwright
+// `context.close()` does not deterministically drive a clean WebTransport
+// CONNECTION_CLOSE, so the reason MC assigns can be `voluntary` (clean close →
+// ClientClosed → immediate) OR `timeout` (ambiguous loss → ConnectionLost →
+// grace expiry). Summing every reason is immune to that classification variance
+// while staying strictly monotonic — so it drops into `pollUntilSumAbove`
+// (`> baseline`) unchanged and inherits the series-churn hint. Per-participant
+// attribution is proven separately by the bus `participantLeft(participantId)`
+// event; this counter is the SERVER-SIDE proof MC actually recorded the leave
+// (a dead/unreachable MC cannot increment its own counter — same false-pass
+// killer as the join-failure helper above). The spec ALSO drives the demo's own
+// teardown (unmount → session.disconnect() → clean voluntary close), so the
+// common path settles in ~1 scrape interval; the wide budget below is grace-path
+// insurance, not the expected latency.
+const LEAVES_SUM_PROMQL = 'sum(mc_participant_leaves_total)';
+
 /**
  * Bounded MC join-failure `error_type` label values this suite asserts on.
  *
@@ -164,10 +190,49 @@ export async function waitForMcConnectedStatusAbove(
   );
 }
 
+/** Current cluster-wide `mc_participant_leaves_total` sum (all reasons — see anchor). */
+export async function mcParticipantLeavesSum(): Promise<number> {
+  return promInstantSum(LEAVES_SUM_PROMQL);
+}
+
+/**
+ * Poll until MC's all-reasons participant-leave counter exceeds `baseline` — the
+ * server-side proof that MC recorded a roster departure (gap (2)). Throws with
+ * the last observed value on timeout.
+ *
+ * BUDGET (config-derived, NOT a fixed rationale — @observability): the ceiling
+ * must cover MC's worst-case roster-remove latency, catalogued in
+ * `docs/observability/metrics/mc-service.md` §"Worst-case roster-remove latency"
+ * as `MC_QUIC_MAX_IDLE_TIMEOUT_SECONDS + MC_DISCONNECT_GRACE_PERIOD_SECONDS +
+ * 5s grace-check` (defaults 10 + 30 + 5 = 45s), PLUS the ~15s Prometheus scrape
+ * SLA this counter is read through ≈ 60s — so the 90s default is that worst case
+ * with margin (and stays under the 120s/test ceiling). This is LARGER than the
+ * join-side 60s helper precisely because a departure's worst case includes the
+ * disconnect grace path. In practice the spec drives a clean close, so this
+ * resolves in ~1 scrape interval; 90s is the grace-path safety net, not the norm.
+ */
+export async function waitForMcParticipantLeavesAbove(
+  baseline: number,
+  options: PollOptions = {},
+): Promise<void> {
+  await pollUntilSumAbove(
+    LEAVES_SUM_PROMQL,
+    baseline,
+    { timeoutMs: 90_000, ...options },
+    (lastObserved, timeoutMs) =>
+      `mc_participant_leaves_total (all reasons) did not rise above baseline ` +
+      `${baseline} within ${timeoutMs}ms (last observed: ${lastObserved}). MC never ` +
+      `recorded the participant departure — either the ParticipantLeft broadcast did ` +
+      `not fire (roster-removal choke-point crates/mc-service/src/actors/meeting.rs ` +
+      `remove_and_broadcast_left) or it exceeded the config-derived worst-case ` +
+      `(idle_timeout + grace_period + grace-check + scrape SLA; see ` +
+      `docs/observability/metrics/mc-service.md). (A below-baseline reading gets the ` +
+      `series-churn hint appended centrally by the poll loop.)`,
+  );
+}
+
 /** Current cluster-wide `mc_session_join_failures_total{error_type=<errorType>}` sum. */
-export async function mcSessionJoinFailureSum(
-  errorType: McJoinFailureErrorType,
-): Promise<number> {
+export async function mcSessionJoinFailureSum(errorType: McJoinFailureErrorType): Promise<number> {
   return promInstantSum(joinFailureSumPromql(errorType));
 }
 

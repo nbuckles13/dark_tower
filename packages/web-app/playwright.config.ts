@@ -20,8 +20,13 @@ export default defineConfig({
   // masked by retry. Do not override per-spec.
   retries: 0,
   // One worker, in-order: a single shared cluster + Vite server backs every
-  // spec, and AC's registration rate limit (5/hour) leaves no headroom for
-  // parallel credential churn. Escalation path is "more shards" (task #19),
+  // spec, AND the suite's registration budget assumes workers=1 — the shared
+  // valid user (fixtures.ts `SHARED_USER`) is registered ONCE per run via a
+  // module-level memo that only a single worker process makes a per-run
+  // singleton; a second worker would get its own memo and re-register. The
+  // registration rate-limit SSoT is the TARGET cluster's AC config (Kind dev:
+  // 100/min per infra/services/ac-service/configmap.yaml; prod default 5/60min)
+  // — see e2e/README.md §Budgets. Escalation path is "more shards" (task #19),
   // not parallel workers against one cluster.
   fullyParallel: false,
   workers: 1,

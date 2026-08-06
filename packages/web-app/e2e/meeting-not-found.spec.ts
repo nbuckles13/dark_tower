@@ -17,19 +17,21 @@
 //       session-drop path (the auth-rejection spec asserts the inverse);
 //   (3) no `joined` bus event (point-in-time scan after the terminal condition).
 //
-// Registration budget: ONE registration (a real user is required — an invalid
-// token would be rejected 401 at the auth middleware BEFORE the lookup, testing
-// the wrong hop). See e2e/README.md §Budgets.
+// Registration budget: ZERO — reuses the suite's shared valid user V via
+// `authAsSharedUser` (a real user is required — an invalid token would be
+// rejected 401 at the auth middleware BEFORE the lookup, testing the wrong hop).
+// See e2e/README.md §Budgets.
 
 import { expect, test } from 'playwright/test';
 import { SdkErrorCode } from '@darktower/sdk-core';
 import {
+  authAsSharedUser,
+  bootstrapMeeting,
   expectLastErrorCode,
   expectNoJoinedEvent,
   joinCapturingGcStatus,
-  randomCredentials,
   randomMeetingCode,
-  signUpViaUi,
+  recoverByJoining,
 } from './fixtures.js';
 
 test.describe('meeting not found (R-45)', () => {
@@ -38,9 +40,8 @@ test.describe('meeting not found (R-45)', () => {
   }) => {
     // Real user, real token: the rejection under test must be the DB lookup
     // miss, not an auth-middleware rejection upstream of it.
-    const creds = randomCredentials('meeting-not-found');
     await page.goto('/');
-    await signUpViaUi(page, creds);
+    const token = await authAsSharedUser(page);
 
     // randomMeetingCode() is well-formed for BOTH format authorities (client
     // validateMeetingCode + GC's pre-DB-lookup shape check — see the fixture's
@@ -68,5 +69,16 @@ test.describe('meeting not found (R-45)', () => {
 
     // Terminal condition established (typed error rendered) — point-in-time scan.
     await expectNoJoinedEvent(page, 'meeting-not-found');
+
+    // Recovery (gap 3): the 404 did NOT drop the session (asserted above), so a
+    // VALID join in the SAME page session (no reload) must succeed. Create a real
+    // meeting Node-side with the still-valid retained token, then remount the join
+    // view and join it.
+    const meetingCode = await bootstrapMeeting(token, 'E2E meeting-not-found recovery');
+    const joined = await recoverByJoining(page, meetingCode);
+    expect(
+      joined.participantId,
+      'recovery: a valid join in the same session must succeed after the 404',
+    ).not.toBe('');
   });
 });

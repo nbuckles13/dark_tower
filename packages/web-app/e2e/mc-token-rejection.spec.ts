@@ -28,19 +28,21 @@
 // inside the route-fulfilled response body, by value — never logged, never
 // interpolated into titles or assertion messages.
 //
-// Registration budget: ONE registration (+1 GC meeting create via
-// bootstrapMeeting). See e2e/README.md §Budgets.
+// Registration budget: ZERO — reuses the suite's shared valid user V via
+// `authAsSharedUser` (+1 GC meeting create via bootstrapMeeting).
+// See e2e/README.md §Budgets.
 
-import { test } from 'playwright/test';
+import { expect, test } from 'playwright/test';
 import { SdkErrorCode } from '@darktower/sdk-core';
 import {
+  authAsSharedUser,
   bootstrapMeeting,
+  clearJoinResponseRewrite,
   expectLastErrorCode,
   expectNoJoinedEvent,
   joinAsUser,
-  randomCredentials,
+  recoverByJoining,
   rewriteJoinResponseMeetingId,
-  signUpViaUi,
 } from './fixtures.js';
 import { mcSessionJoinFailureSum, waitForMcSessionJoinFailureAbove } from './mcMetrics.js';
 
@@ -50,9 +52,8 @@ test.describe('MC token rejection (R-45)', () => {
   }) => {
     // Real user + real meeting (Node-side GC create — not the demo UI): every
     // credential in play is genuine EXCEPT the meeting_id binding we corrupt.
-    const creds = randomCredentials('mc-token-reject');
     await page.goto('/');
-    const token = await signUpViaUi(page, creds);
+    const token = await authAsSharedUser(page);
     const meetingCode = await bootstrapMeeting(token, 'E2E mc-token-rejection meeting');
 
     // Corrupt ONLY the meetingId in the GC join response the SDK will consume.
@@ -80,5 +81,16 @@ test.describe('MC token rejection (R-45)', () => {
     // (3) Terminal condition established (error rendered + counter moved) —
     // point-in-time scan.
     await expectNoJoinedEvent(page, 'mc-token-rejection');
+
+    // Recovery (gap 3): the rejection is transient to the corrupted binding, not
+    // the session. Clear the meetingId rewrite (recovery MUST run WITHOUT it) and
+    // rejoin the SAME real meeting in the SAME page session — MC now sees a
+    // matching binding and admits the join.
+    await clearJoinResponseRewrite(page, meetingCode);
+    const joined = await recoverByJoining(page, meetingCode);
+    expect(
+      joined.participantId,
+      'recovery: a valid join must succeed once the meetingId rewrite is cleared',
+    ).not.toBe('');
   });
 });
