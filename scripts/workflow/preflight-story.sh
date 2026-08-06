@@ -35,6 +35,30 @@ command -v jq >/dev/null 2>&1 || fail "jq not found"
 
 target/release/dt-story validate "$STORY_FILE" || fail "story manifest invalid"
 
+# --- Runner-owned substrate config (idempotent) ---
+# The Stop hook and the unlimited print-mode background wait are RUNNER
+# dependencies, so the runner installs them — settings.json is patched here,
+# in-container, every run. They were previously registered by the container
+# entrypoint, which is baked into the image: the 2026-08-06 task #64 idle-death
+# happened because the in-tree entrypoint edit never made it into a rebaked
+# image, so no container ever had the hook. Preflight ownership removes the
+# image-bake coupling entirely.
+SETTINGS="$HOME/.claude/settings.json"
+HOOK_CMD="$REPO_ROOT/scripts/workflow/devloop-stop-hook.sh"
+[ -x "$HOOK_CMD" ] || fail "stop hook script missing/not executable: ${HOOK_CMD}"
+mkdir -p "$HOME/.claude"
+[ -f "$SETTINGS" ] || echo '{}' >"$SETTINGS"
+jq --arg cmd "$HOOK_CMD" '
+  .env.CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS = "0"
+  | .hooks.Stop = ((.hooks.Stop // [])
+      | if ([.[]?.hooks[]?.command] | index($cmd)) then .
+        else . + [{"hooks": [{"type": "command", "command": $cmd}]}] end)
+' "$SETTINGS" >"$SETTINGS.tmp" && mv "$SETTINGS.tmp" "$SETTINGS"
+jq -e --arg cmd "$HOOK_CMD" \
+  '(.env.CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS == "0") and ([.hooks.Stop[]?.hooks[]?.command] | index($cmd))' \
+  "$SETTINGS" >/dev/null || fail "settings.json substrate patch did not verify"
+echo "PREFLIGHT: substrate config ensured (stop hook + bg-wait ceiling)"
+
 # --- Substrate probe, cached per claude version ---
 VERSION="$(claude --version 2>/dev/null | head -n 1 | tr -cs 'A-Za-z0-9.' '-')"
 RUN_BASE="${DEVLOOP_TMP:-/tmp/devloop}/story-runner"

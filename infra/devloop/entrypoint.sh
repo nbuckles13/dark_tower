@@ -39,14 +39,10 @@ fi
 # Set up user-level Claude config files if mounted by devloop.sh
 mkdir -p "${HOME}/.claude"
 if [ -f /tmp/claude-user-settings.json ]; then
-    # Container-specific config on top of the host settings:
-    # - unlimited print-mode background wait (headless devloop Leads hold on
-    #   teammates far longer than the 10-minute default ceiling)
-    # - Stop hook enforcing the headless devloop completion contract
-    #   (no-op outside run-story sessions; appended, not replacing host hooks)
-    jq '.env.CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS = "0"
-        | .hooks.Stop = ((.hooks.Stop // []) + [{"hooks":[{"type":"command","command":"/work/scripts/workflow/devloop-stop-hook.sh"}]}])' \
-        /tmp/claude-user-settings.json > "${HOME}/.claude/settings.json"
+    # Runner-specific config (Stop hook, bg-wait ceiling) is NOT set here:
+    # entrypoint.sh is baked into the image, so edits sit unbaked in-tree —
+    # run-story preflight owns that patching (in-container, every run).
+    cp /tmp/claude-user-settings.json "${HOME}/.claude/settings.json"
 fi
 if [ -f /tmp/claude-user-config.json ]; then
     # Patch installMethod to match how Claude is installed in the container (npm),
