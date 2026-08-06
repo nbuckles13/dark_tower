@@ -1291,6 +1291,7 @@ tasks:
   - 19
   - 63
   - 64
+  - 65
   prompt: |
     Close four browser E2E coverage gaps identified during the pre-close manual
     test-plan review (docs/user-stories/2026-05-02-browser-client-join-manual-test-plan.md
@@ -1440,4 +1441,39 @@ tasks:
     mc_mh_notifications path). Acceptance: tab-close roster removal is fast
     (target: a few seconds, bounded and documented); task 60's teardown E2E
     will assert the bound.
+- id: 65
+  status: pending
+  specialist: meeting-controller
+  env_tests: true
+  deps:
+  - 64
+  prompt: |
+    Plumb the participant display name through MC's join flow. Task #60's new
+    E2E tests (currently stashed in the clone; they are the acceptance
+    criteria and will run at task #60's retry) caught that task #63 is
+    incomplete end-to-end: AC mints the registered display name into the
+    meeting token (crates/ac-service/src/services/internal_tokens.rs:162-207)
+    and MC has claims.display_name in scope at the connection layer
+    (crates/mc-service/src/webtransport/connection.rs:393), but the join path
+    never passes it - handle_join hardcodes format!("Participant {}", ...)
+    (crates/mc-service/src/actors/meeting.rs:612, the MINOR-003 stopgap), so
+    every roster entry renders as Participant N regardless of the token.
+    Fix: carry display_name from the validated claims through the
+    connection_join message -> ConnectionJoin -> handle_join -> the
+    Participant record broadcast in JoinResponse/ParticipantJoined, keeping a
+    generic label ONLY as a genuine-absence fallback (empty claim). Update MC
+    unit/integration tests that assert the hardcoded label (join_tests
+    reference Test User fixtures; see also 2026-08-06-roster-leave-latency
+    tests for current join-test patterns).
+    Secondary, same plumbing: the #60 devloop observed JoinResponse userId is
+    uniformly "0" across distinct users (bus-visible). Investigate while in
+    the join path: if it is a trivial drop of a real claim, fix it here; if
+    it is design-scoped, add a docs/TODO.md entry with the finding and file
+    pointers instead.
+    Acceptance: task #60's retry (its rejoin and rendered-roster assertions,
+    which sign in as distinct users and assert registered names render) goes
+    green with no test weakening. Context: full diagnosis in
+    docs/devloop-outputs/2026-08-06-browser-e2e-coverage-gaps/main.md
+    (Escalation and Issues sections - note that directory is also stashed;
+    rely on this prompt's file pointers as primary).
 ```
