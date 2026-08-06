@@ -124,12 +124,17 @@ impl MeetingControllerActorHandle {
     ///
     /// The controller looks up the meeting and forwards the join request.
     /// Returns a oneshot receiver that the caller can await for the result.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "actor-handle join signature threads the full join tuple (ids + display_name + host flag + stream); bundling into a JoinConnectionParams struct is a larger cross-message refactor tracked in docs/TODO.md"
+    )]
     pub async fn join_connection(
         &self,
         meeting_id: String,
         connection_id: String,
         user_id: String,
         participant_id: String,
+        display_name: String,
         is_host: bool,
         stream_tx: tokio::sync::mpsc::Sender<bytes::Bytes>,
     ) -> Result<tokio::sync::oneshot::Receiver<Result<JoinResult, McError>>, McError> {
@@ -140,6 +145,7 @@ impl MeetingControllerActorHandle {
                 connection_id,
                 user_id,
                 participant_id,
+                display_name,
                 is_host,
                 stream_tx,
                 respond_to: tx,
@@ -367,6 +373,7 @@ impl MeetingControllerActor {
                 connection_id,
                 user_id,
                 participant_id,
+                display_name,
                 is_host,
                 stream_tx,
                 respond_to,
@@ -380,6 +387,7 @@ impl MeetingControllerActor {
                                     connection_id,
                                     user_id,
                                     participant_id,
+                                    display_name,
                                     is_host,
                                     Some(stream_tx),
                                 )

@@ -471,6 +471,30 @@ pub fn record_participant_disconnect(cause: &str) {
     .increment(1);
 }
 
+/// Record how a joining participant's roster display name was resolved (one per
+/// successful join, at the `handle_join` name sink).
+///
+/// Metric: `mc_join_display_name_resolved_total`
+/// Labels: `outcome`
+///
+/// Outcome values: "present" (the validated meeting-token claim carried a name,
+/// used verbatim) | "fallback" (the claim was empty, so the generic
+/// `Participant N` label was substituted). Cardinality: 2 (bounded — the caller
+/// passes one of two fixed `&'static str` literals; the label is NEVER the name
+/// value itself, which is PII).
+///
+/// Makes the empty-claim degradation OBSERVABLE on the MC consumer side: the
+/// AC-side `ac_meeting_token_display_name_total` only covers token issuance, so
+/// without this a name lost between issuance and roster render (e.g. an old
+/// `#[serde(default)]`-empty token) would degrade silently. A rising `fallback`
+/// rate is the "fail loudly" signal for that gap.
+pub fn record_display_name_resolution(outcome: &str) {
+    counter!("mc_join_display_name_resolved_total",
+        "outcome" => outcome.to_string()
+    )
+    .increment(1);
+}
+
 // ============================================================================
 // gRPC Auth Layer 2 Metrics (ADR-0003)
 // ============================================================================

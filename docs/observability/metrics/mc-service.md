@@ -313,6 +313,25 @@ client-controlled string, `mh_url`, participant-id, or raw close-reason text.
 - **Recorded in**: `actors/meeting.rs::remove_and_broadcast_left` (voluntary/timeout/removed)
   and `actors/meeting.rs::handle_end_meeting` (meeting_ended)
 
+### `mc_join_display_name_resolved_total`
+- **Type**: Counter
+- **Description**: How a joining participant's roster display name was resolved — one per
+  successful join, at the `handle_join` name sink. Complements the AC-side
+  `ac_meeting_token_display_name_total`, which covers only the token ISSUANCE vector: this
+  metric makes the MC CONSUMER side observable, so a name lost between issuance and roster
+  render (e.g. an old `#[serde(default)]`-empty token) does not degrade silently.
+- **Labels**:
+  - `outcome`: `present` (the validated meeting-token claim carried a display name, used
+    verbatim), `fallback` (the claim was empty → the generic `Participant N` label was
+    substituted)
+  - The label is one of two fixed `&'static str` literals; it is NEVER the display-name
+    value itself (display_name is PII and must never become a metric label).
+- **Cardinality**: Low (2 outcomes)
+- **Usage**: A rising `fallback` share is the "fail loudly" signal that registered names are
+  not reaching the roster (a truncation/empty-claim edge, or stale tokens minted before the
+  display-name feature). Under healthy issuance this should be almost entirely `present`.
+- **Recorded in**: `actors/meeting.rs::handle_join`
+
 **Worst-case roster-remove latency (SSoT — derived from config, not a fixed number):**
 - Clean tab-close: ≈ network RTT (sub-second). `Connection::closed()` fires immediately
   and the grace period is skipped.

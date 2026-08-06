@@ -84,6 +84,7 @@ async fn clean_close_removes_immediately_emits_voluntary_and_broadcasts_left_fra
             "conn-b".to_string(),
             "user-b".to_string(),
             "part-b".to_string(),
+            String::new(),
             false,
             Some(b_tx),
         )
@@ -95,6 +96,7 @@ async fn clean_close_removes_immediately_emits_voluntary_and_broadcasts_left_fra
             "conn-a".to_string(),
             "user-a".to_string(),
             "part-a".to_string(),
+            String::new(),
             false,
             None,
         )
@@ -152,6 +154,7 @@ async fn abrupt_loss_keeps_grace_emits_connection_lost_then_timeout_left_after_g
             "conn-b".to_string(),
             "user-b".to_string(),
             "part-b".to_string(),
+            String::new(),
             false,
             Some(b_tx),
         )
@@ -162,6 +165,7 @@ async fn abrupt_loss_keeps_grace_emits_connection_lost_then_timeout_left_after_g
             "conn-a".to_string(),
             "user-a".to_string(),
             "part-a".to_string(),
+            String::new(),
             false,
             None,
         )

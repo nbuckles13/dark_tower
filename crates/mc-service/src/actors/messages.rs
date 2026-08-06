@@ -47,6 +47,10 @@ pub enum ControllerMessage {
         connection_id: String,
         user_id: String,
         participant_id: String,
+        /// Registered display name from the validated meeting-token claim
+        /// (already length-bounded at the connection trust boundary). Empty
+        /// string means the claim carried no name → a generic label is used.
+        display_name: String,
         is_host: bool,
         /// Sender for writing framed protobuf bytes to the WebTransport stream.
         stream_tx: tokio::sync::mpsc::Sender<bytes::Bytes>,
@@ -71,6 +75,10 @@ pub enum MeetingMessage {
         connection_id: String,
         user_id: String,
         participant_id: String,
+        /// Registered display name from the validated meeting-token claim
+        /// (already length-bounded at the connection trust boundary). Empty
+        /// string means the claim carried no name → a generic label is used.
+        display_name: String,
         /// Whether this participant has host privileges.
         is_host: bool,
         /// Sender for writing framed protobuf bytes to the WebTransport stream.

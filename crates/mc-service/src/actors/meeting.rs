@@ -61,12 +61,16 @@ impl MeetingActorHandle {
     /// * `connection_id` - Unique connection identifier
     /// * `user_id` - User ID from JWT
     /// * `participant_id` - Participant ID for this meeting
+    /// * `display_name` - Registered display name from the validated meeting-token
+    ///   claim (already length-bounded at the connection boundary); empty means the
+    ///   claim carried no name and a generic label is applied at the join sink
     /// * `is_host` - Whether this participant has host privileges
     pub async fn connection_join(
         &self,
         connection_id: String,
         user_id: String,
         participant_id: String,
+        display_name: String,
         is_host: bool,
         stream_tx: Option<tokio::sync::mpsc::Sender<bytes::Bytes>>,
     ) -> Result<JoinResult, McError> {
@@ -76,6 +80,7 @@ impl MeetingActorHandle {
                 connection_id,
                 user_id,
                 participant_id,
+                display_name,
                 is_host,
                 stream_tx,
                 respond_to: tx,
@@ -459,12 +464,20 @@ impl MeetingActor {
                 connection_id,
                 user_id,
                 participant_id,
+                display_name,
                 is_host,
                 stream_tx,
                 respond_to,
             } => {
                 let result = self
-                    .handle_join(connection_id, user_id, participant_id, is_host, stream_tx)
+                    .handle_join(
+                        connection_id,
+                        user_id,
+                        participant_id,
+                        display_name,
+                        is_host,
+                        stream_tx,
+                    )
                     .await;
                 let _ = respond_to.send(result);
             }
@@ -550,6 +563,7 @@ impl MeetingActor {
         connection_id: String,
         user_id: String,
         participant_id: String,
+        display_name: String,
         is_host: bool,
         stream_tx: Option<tokio::sync::mpsc::Sender<bytes::Bytes>>,
     ) -> Result<JoinResult, McError> {
@@ -608,8 +622,18 @@ impl MeetingActor {
             },
         );
 
-        // Create participant (MINOR-003: use generic display name, not derived from user_id)
-        let display_name = format!("Participant {}", self.participants.len() + 1);
+        // Prefer the token's display_name; fall back to a generic label only when
+        // the claim is genuinely absent (empty). The claim was already length-bounded
+        // at the connection trust boundary, so it is used verbatim here. Record the
+        // resolution outcome (bounded label, never the name value) so the empty-claim
+        // degradation is observable on the MC consumer side ("fail loudly").
+        let display_name = if display_name.is_empty() {
+            crate::observability::metrics::record_display_name_resolution("fallback");
+            format!("Participant {}", self.participants.len() + 1)
+        } else {
+            crate::observability::metrics::record_display_name_resolution("present");
+            display_name
+        };
         let conn_handle_for_result = conn_handle.clone();
         let participant = Participant {
             participant_id: participant_id.clone(),
@@ -1394,6 +1418,7 @@ mod tests {
                 "conn-1".to_string(),
                 "user-1".to_string(),
                 "part-1".to_string(),
+                String::new(),
                 false, // not host
                 None,
             )
@@ -1428,6 +1453,7 @@ mod tests {
                 "conn-1".to_string(),
                 "user-1".to_string(),
                 "part-1".to_string(),
+                String::new(),
                 false,
                 None,
             )
@@ -1439,6 +1465,7 @@ mod tests {
                 "conn-2".to_string(),
                 "user-1".to_string(),
                 "part-1".to_string(),
+                String::new(),
                 false,
                 None,
             )
@@ -1468,6 +1495,7 @@ mod tests {
                 "conn-1".to_string(),
                 "user-1".to_string(),
                 "part-1".to_string(),
+                String::new(),
                 false,
                 None,
             )
@@ -1479,6 +1507,107 @@ mod tests {
         assert_eq!(state.meeting_id, "meeting-state-test");
         assert_eq!(state.participants.len(), 1);
         assert!(!state.is_shutting_down);
+
+        handle.cancel();
+    }
+
+    /// The registered display_name from the (already-validated, already-bounded)
+    /// token claim must flow through the join path onto the participant's own
+    /// roster entry — keyed by participant, NOT derived from join order/count.
+    /// Distinct names make this discriminating: a position/count-derived label
+    /// (the MINOR-003 stopgap) would fail here.
+    #[tokio::test]
+    async fn test_handle_join_uses_claim_display_name_per_participant() {
+        let metrics = ActorMetrics::new();
+        let controller_metrics = ControllerMetrics::new();
+        let cancel_token = CancellationToken::new();
+
+        let (handle, _task) = MeetingActor::spawn(
+            "meeting-name-test".to_string(),
+            cancel_token.clone(),
+            metrics,
+            controller_metrics,
+            test_secret(),
+        );
+
+        handle
+            .connection_join(
+                "conn-1".to_string(),
+                "user-1".to_string(),
+                "part-1".to_string(),
+                "Alice".to_string(),
+                false,
+                None,
+            )
+            .await
+            .expect("join 1");
+        handle
+            .connection_join(
+                "conn-2".to_string(),
+                "user-2".to_string(),
+                "part-2".to_string(),
+                "Bob".to_string(),
+                false,
+                None,
+            )
+            .await
+            .expect("join 2");
+
+        let state = handle.get_state().await.unwrap();
+        let alice = state
+            .participants
+            .iter()
+            .find(|p| p.participant_id == "part-1")
+            .expect("part-1 present");
+        let bob = state
+            .participants
+            .iter()
+            .find(|p| p.participant_id == "part-2")
+            .expect("part-2 present");
+        assert_eq!(
+            alice.display_name, "Alice",
+            "each participant must render its OWN registered name"
+        );
+        assert_eq!(bob.display_name, "Bob");
+
+        handle.cancel();
+    }
+
+    /// Genuine-absence fallback: an EMPTY claim display_name (the only case the
+    /// generic label is allowed) yields the `Participant N` stopgap. Exact match,
+    /// not `contains`, so the fallback shape is pinned.
+    #[tokio::test]
+    async fn test_handle_join_empty_claim_falls_back_to_generic_label() {
+        let metrics = ActorMetrics::new();
+        let controller_metrics = ControllerMetrics::new();
+        let cancel_token = CancellationToken::new();
+
+        let (handle, _task) = MeetingActor::spawn(
+            "meeting-fallback-test".to_string(),
+            cancel_token.clone(),
+            metrics,
+            controller_metrics,
+            test_secret(),
+        );
+
+        handle
+            .connection_join(
+                "conn-1".to_string(),
+                "user-1".to_string(),
+                "part-1".to_string(),
+                String::new(), // genuine absence → generic fallback
+                false,
+                None,
+            )
+            .await
+            .expect("join");
+
+        let state = handle.get_state().await.unwrap();
+        assert_eq!(state.participants.len(), 1);
+        assert_eq!(
+            state.participants[0].display_name, "Participant 1",
+            "empty claim must fall back to the generic 'Participant N' label"
+        );
 
         handle.cancel();
     }
@@ -1503,6 +1632,7 @@ mod tests {
                 "conn-1".to_string(),
                 "user-1".to_string(),
                 "part-1".to_string(),
+                String::new(),
                 false,
                 None,
             )
@@ -1539,6 +1669,7 @@ mod tests {
                 "conn-1".to_string(),
                 "user-1".to_string(),
                 "part-1".to_string(),
+                String::new(),
                 false,
                 None,
             )
@@ -1595,6 +1726,7 @@ mod tests {
                 "conn-1".to_string(),
                 "user-1".to_string(),
                 "part-1".to_string(),
+                String::new(),
                 false,
                 None,
             )
@@ -1650,6 +1782,7 @@ mod tests {
                 "conn-1".to_string(),
                 "user-1".to_string(),
                 "part-1".to_string(),
+                String::new(),
                 false,
                 None,
             )
@@ -1694,6 +1827,7 @@ mod tests {
                 "conn-1".to_string(),
                 "user-1".to_string(),
                 "part-1".to_string(),
+                String::new(),
                 true, // host
                 None,
             )
@@ -1703,6 +1837,7 @@ mod tests {
                 "conn-2".to_string(),
                 "user-2".to_string(),
                 "part-2".to_string(),
+                String::new(),
                 false, // not host
                 None,
             )
@@ -1747,6 +1882,7 @@ mod tests {
                 "conn-1".to_string(),
                 "user-1".to_string(),
                 "part-1".to_string(),
+                String::new(),
                 false, // not host
                 None,
             )
@@ -1756,6 +1892,7 @@ mod tests {
                 "conn-2".to_string(),
                 "user-2".to_string(),
                 "part-2".to_string(),
+                String::new(),
                 false, // not host
                 None,
             )
@@ -1817,6 +1954,7 @@ mod tests {
                 "conn-1".to_string(),
                 "user-1".to_string(),
                 "part-1".to_string(),
+                String::new(),
                 false,
                 None,
             )
@@ -1901,6 +2039,7 @@ mod tests {
                 "conn-1".to_string(),
                 "user-1".to_string(),
                 "part-1".to_string(),
+                String::new(),
                 false,
                 None,
             )
@@ -1967,6 +2106,7 @@ mod tests {
                 "conn-1".to_string(),
                 "user-1".to_string(),
                 "part-1".to_string(),
+                String::new(),
                 false,
                 None,
             )
@@ -2024,6 +2164,7 @@ mod tests {
                 "conn-1".to_string(),
                 "user-1".to_string(),
                 "part-1".to_string(),
+                String::new(),
                 false,
                 None,
             )

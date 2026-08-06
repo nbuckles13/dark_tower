@@ -394,12 +394,21 @@ pub async fn handle_connection(
     let participant_id = uuid::Uuid::new_v4().to_string();
     let (outbound_tx, mut outbound_rx) = mpsc::channel::<bytes::Bytes>(OUTBOUND_CHANNEL_BUFFER);
 
+    // Length-bound the token's display_name at the trust boundary before it
+    // enters the roster / JoinResponse / ParticipantJoined broadcast. The claim
+    // is only whole-token-size limited (and guest names are self-reported), so
+    // truncate (never reject) with the same UTF-8-safe helper + cap used for the
+    // client-supplied participant_name. An empty claim stays empty so the
+    // handle_join sink applies the generic "Participant N" fallback.
+    let display_name = truncate_utf8(&claims.display_name, MAX_PARTICIPANT_NAME_LEN);
+
     let join_rx = match controller_handle
         .join_connection(
             meeting_id.clone(),
             connection_id.clone(),
             claims.sub.clone(),
             participant_id.clone(),
+            display_name,
             is_host,
             outbound_tx,
         )

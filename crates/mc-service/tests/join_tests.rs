@@ -23,6 +23,7 @@ mod test_common;
 use std::sync::Arc;
 use std::time::Duration;
 
+use ::common::observability::testing::MetricAssertion;
 use ::common::secret::SecretBox;
 use bytes::{BufMut, BytesMut};
 use mc_service::actors::{ActorMetrics, ControllerMetrics, MeetingControllerActorHandle};
@@ -565,6 +566,7 @@ async fn test_actor_level_join_success() {
             "conn-1".to_string(),
             "user-1".to_string(),
             "part-1".to_string(),
+            String::new(),
             false,
             outbound_tx,
         )
@@ -609,6 +611,7 @@ async fn test_actor_level_join_meeting_not_found() {
             "conn-1".to_string(),
             "user-1".to_string(),
             "part-1".to_string(),
+            String::new(),
             false,
             outbound_tx,
         )
@@ -661,6 +664,7 @@ async fn test_actor_level_second_joiner_sees_first_in_roster() {
             "conn-1".to_string(),
             "user-1".to_string(),
             "part-1".to_string(),
+            "Alice".to_string(),
             false,
             tx1,
         )
@@ -675,7 +679,9 @@ async fn test_actor_level_second_joiner_sees_first_in_roster() {
 
     assert!(result1.participants.is_empty());
 
-    // Second participant joins
+    // Second participant joins (distinct name so the roster assertion is
+    // discriminating: it proves the FIRST joiner's own registered name renders,
+    // not a count/position-derived label).
     let (tx2, _rx2) = tokio::sync::mpsc::channel::<bytes::Bytes>(100);
     let join_rx2 = controller
         .join_connection(
@@ -683,6 +689,7 @@ async fn test_actor_level_second_joiner_sees_first_in_roster() {
             "conn-2".to_string(),
             "user-2".to_string(),
             "part-2".to_string(),
+            "Bob".to_string(),
             false,
             tx2,
         )
@@ -701,6 +708,95 @@ async fn test_actor_level_second_joiner_sees_first_in_roster() {
         "Second joiner should see first participant"
     );
     assert_eq!(result2.participants[0].participant_id, "part-1");
+    assert_eq!(
+        result2.participants[0].display_name, "Alice",
+        "Roster must render the first joiner's registered display_name, not a generic label"
+    );
+
+    controller.cancel();
+}
+
+/// The `handle_join` display-name sink emits `mc_join_display_name_resolved_total`
+/// with the correct bounded `outcome` label so the empty-claim degradation is
+/// observable on the MC consumer side ("fail loudly"). Drives the REAL actor path
+/// (not the free fn directly) and uses `(0)` adjacency on the sibling label to
+/// catch a present/fallback label-swap.
+#[tokio::test]
+async fn test_join_records_display_name_resolution_outcome_metric() {
+    let master_secret = SecretBox::new(Box::new(vec![0u8; 32]));
+    let metrics = ActorMetrics::new();
+    let controller_metrics = ControllerMetrics::new();
+    let controller = MeetingControllerActorHandle::new(
+        "mc-actor-dn-metric".to_string(),
+        metrics,
+        controller_metrics,
+        master_secret,
+        Arc::new(MhConnectionRegistry::new()),
+    );
+    controller
+        .create_meeting("meeting-dn-metric".to_string())
+        .await
+        .unwrap();
+
+    // Non-empty claim → outcome="present"
+    let snap_present = MetricAssertion::snapshot();
+    let (tx1, _rx1) = tokio::sync::mpsc::channel::<bytes::Bytes>(100);
+    let join_rx1 = controller
+        .join_connection(
+            "meeting-dn-metric".to_string(),
+            "conn-1".to_string(),
+            "user-1".to_string(),
+            "part-1".to_string(),
+            "Alice".to_string(),
+            false,
+            tx1,
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), join_rx1)
+        .await
+        .expect("Timeout")
+        .expect("Channel dropped")
+        .expect("present join failed");
+
+    snap_present
+        .counter("mc_join_display_name_resolved_total")
+        .with_labels(&[("outcome", "present")])
+        .assert_delta(1);
+    snap_present
+        .counter("mc_join_display_name_resolved_total")
+        .with_labels(&[("outcome", "fallback")])
+        .assert_delta(0);
+
+    // Empty claim → outcome="fallback"
+    let snap_fallback = MetricAssertion::snapshot();
+    let (tx2, _rx2) = tokio::sync::mpsc::channel::<bytes::Bytes>(100);
+    let join_rx2 = controller
+        .join_connection(
+            "meeting-dn-metric".to_string(),
+            "conn-2".to_string(),
+            "user-2".to_string(),
+            "part-2".to_string(),
+            String::new(),
+            false,
+            tx2,
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), join_rx2)
+        .await
+        .expect("Timeout")
+        .expect("Channel dropped")
+        .expect("fallback join failed");
+
+    snap_fallback
+        .counter("mc_join_display_name_resolved_total")
+        .with_labels(&[("outcome", "fallback")])
+        .assert_delta(1);
+    snap_fallback
+        .counter("mc_join_display_name_resolved_total")
+        .with_labels(&[("outcome", "present")])
+        .assert_delta(0);
 
     controller.cancel();
 }
@@ -755,9 +851,15 @@ async fn test_participant_joined_notification_via_bridge() {
         "Expected JoinResponse for first client"
     );
 
-    // Second client connects and joins (need fresh claims with different sub for different user)
+    // Second client connects and joins (need fresh claims with different sub for different user).
+    // Give this user a DISTINCT registered display_name in the token — deliberately
+    // different from both the JoinRequest participant_name ("Bob") and the default
+    // minter name ("Test Participant") — so the broadcast assertion below proves the
+    // roster renders the TOKEN CLAIM's name, not the client-supplied participant_name
+    // and not a generic label.
     let mut claims2 = make_meeting_claims("meeting-bridge");
     claims2.sub = "user-002".to_string();
+    claims2.display_name = "Bob Registered".to_string();
     let token2 = server.sign_token(&claims2);
 
     let conn2 = connect_client(&server.url()).await;
@@ -807,6 +909,13 @@ async fn test_participant_joined_notification_via_bridge() {
         Some(server_message::Message::ParticipantJoined(joined)) => {
             let p = joined.participant.as_ref().unwrap();
             assert!(!p.participant_id.is_empty());
+            // The BROADCAST sink (separate from JoinResponse) must carry the joining
+            // peer's registered display_name from the validated token claim.
+            assert_eq!(
+                p.name, "Bob Registered",
+                "ParticipantJoined broadcast must render the token claim's display_name \
+                 (not the client-supplied participant_name or a generic label)"
+            );
         }
         other => panic!("Expected ParticipantJoined notification, got {other:?}"),
     }

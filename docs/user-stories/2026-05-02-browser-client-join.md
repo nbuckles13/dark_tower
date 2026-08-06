@@ -1442,7 +1442,7 @@ tasks:
     (target: a few seconds, bounded and documented); task 60's teardown E2E
     will assert the bound.
 - id: 65
-  status: pending
+  status: completed
   specialist: meeting-controller
   env_tests: true
   deps:
