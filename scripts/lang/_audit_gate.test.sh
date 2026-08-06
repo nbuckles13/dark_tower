@@ -34,23 +34,66 @@ pred_rc() {
   printf '%s\n' "$rc"
 }
 
-# rust dep-manifest changes -> 0 (run)
+# rust dep-manifest changes -> 0 (run). NARROWED 2026-08-05: matches ONLY true dep
+# manifests (root Cargo.toml/Cargo.lock + crates/*/Cargo.toml), not the old crates/ PREFIX.
 assert_rc "rust: Cargo.lock changed -> run"   0 "$(pred_rc rust 'Cargo.lock')"
 assert_rc "rust: Cargo.toml changed -> run"   0 "$(pred_rc rust 'Cargo.toml')"
 assert_rc "rust: crate Cargo.toml -> run"     0 "$(pred_rc rust 'crates/ac-service/Cargo.toml')"
-assert_rc "rust: crate source -> run (fail-safe over-trigger)" 0 "$(pred_rc rust 'crates/ac-service/src/lib.rs')"
-# rust no dep + no crate source -> 1 (skip)
+# * crosses / — the workspace-EXCLUDED nested fuzz manifest still MATCHES (fail-safe: run
+# the scan against the unchanged root lock). See _changed_helpers.test.sh for the semantics.
+assert_rc "rust: nested/excluded fuzz Cargo.toml -> run (* crosses /)" 0 "$(pred_rc rust 'crates/ac-service/fuzz/Cargo.toml')"
+# NARROWED: a crate-SOURCE-only edit now SKIPS (was "run" as a fail-safe over-trigger; the
+# over-trigger is gone — a source edit cannot move the resolved dep graph).
+assert_rc "rust: crate source only -> skip (narrowed)"   1 "$(pred_rc rust 'crates/ac-service/src/lib.rs')"
+# negative glob: shares crates/ prefix but suffix differs -> skip.
+assert_rc "rust: crates/ suffix-differing sibling (.bak) -> skip" 1 "$(pred_rc rust 'crates/ac-service/Cargo.toml.bak')"
+# rust no dep -> 1 (skip)
 assert_rc "rust: docs only -> skip"           1 "$(pred_rc rust 'docs/x.md')"
 assert_rc "rust: scripts only -> skip"        1 "$(pred_rc rust 'scripts/foo.sh')"
 
-# ts dep-manifest changes -> 0 (run)
+# ts dep-manifest changes -> 0 (run). NARROWED: root package.json/pnpm-lock.yaml/
+# pnpm-workspace.yaml + packages/*/package.json, not the old packages/ PREFIX.
 assert_rc "ts: package.json -> run"           0 "$(pred_rc ts 'package.json')"
 assert_rc "ts: pnpm-lock.yaml -> run"         0 "$(pred_rc ts 'pnpm-lock.yaml')"
 assert_rc "ts: pnpm-workspace.yaml -> run"    0 "$(pred_rc ts 'pnpm-workspace.yaml')"
-assert_rc "ts: packages/**/package.json -> run" 0 "$(pred_rc ts 'packages/proto-gen/package.json')"
-assert_rc "ts: packages source -> run (fail-safe over-trigger)" 0 "$(pred_rc ts 'packages/proto-gen/src/i.ts')"
+assert_rc "ts: packages/*/package.json -> run" 0 "$(pred_rc ts 'packages/proto-gen/package.json')"
+# NARROWED: a package-SOURCE-only edit now SKIPS (was a fail-safe over-trigger).
+assert_rc "ts: packages source only -> skip (narrowed)" 1 "$(pred_rc ts 'packages/proto-gen/src/i.ts')"
 # ts no dep -> 1 (skip)
 assert_rc "ts: docs only -> skip"             1 "$(pred_rc ts 'docs/x.md')"
+
+# -----------------------------------------------------------------------------
+# Part 1b — SSoT-DRIFT GUARD (task narrowing, 2026-08-05). The narrowed predicates couple
+# to the workspace layout: root Cargo.toml [workspace].members/exclude (matched by
+# crates/*/Cargo.toml) and pnpm-workspace.yaml `packages: - 'packages/*'` (matched by
+# packages/*/package.json). A FUTURE workspace member outside crates/* — or a new pnpm
+# workspace glob outside packages/* — would silently open a false-SKIP hole: an edit to
+# that manifest would NOT trigger the audit. This guard fails LOUDLY on that drift.
+#
+# git ls-files is the manifest enumerator (SSoT for "which manifests exist"; no TOML/YAML
+# parse): every tracked Cargo.toml MUST fire audit_dep_changed_rust and every tracked
+# package.json MUST fire audit_dep_changed_ts. Unlike Part 1 (hermetic, injected cache),
+# this section deliberately reads the REAL tracked paths; skips gracefully if git is absent.
+#
+# SAFE-BIAS LIMITATION (@security, non-blocking): this asserts EVERY tracked manifest is
+# audit-covered. A tracked manifest OUTSIDE the cargo/pnpm workspace (e.g. a fixture
+# docs/examples/package.json or a non-member Cargo.toml) is legitimately NOT audited, so
+# this guard would fail LOUDLY on it even though skipping it is correct. That is the safe
+# bias (loud + human-in-loop, never a silent SKIP), and there are ZERO such paths today.
+# If one is ever added, scope the git ls-files enumeration below to the workspace roots
+# (crates/, packages/) OR add a documented exclusion here at that time.
+if git -C "$REPO_ROOT" rev-parse --git-dir >/dev/null 2>&1; then
+  while IFS= read -r m; do
+    [[ -z "$m" ]] && continue
+    assert_rc "drift: tracked manifest '$m' covered by rust audit predicate" 0 "$(pred_rc rust "$m")"
+  done < <(git -C "$REPO_ROOT" ls-files '*Cargo.toml')
+  while IFS= read -r m; do
+    [[ -z "$m" ]] && continue
+    assert_rc "drift: tracked manifest '$m' covered by ts audit predicate" 0 "$(pred_rc ts "$m")"
+  done < <(git -C "$REPO_ROOT" ls-files '*package.json')
+else
+  echo "# audit-gate-test: git unavailable — SSoT-drift guard skipped (non-fatal)" >&2
+fi
 
 # -----------------------------------------------------------------------------
 # Part 2 — audit_gate COMPOSITION (tri-state wrapper): force-run + indeterminate.

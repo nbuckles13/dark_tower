@@ -69,3 +69,40 @@ diff_touches_root_files() {
   done
   return 1
 }
+
+# True if any changed file matches one of the listed shell-GLOB patterns.
+# Args: $@=glob patterns (e.g. "crates/*/Cargo.toml")
+# Returns: 0 if any changed path matches any pattern, 1 if none
+#
+# This is the ONLY glob matcher among the predicates. It uses bash [[ == ]] pattern
+# matching — a GLOB, NOT a regex, and NOT the fixed-string match of diff_touches_path
+# (awk index) or diff_touches_root_files (grep -qxF). The RHS is deliberately UNQUOTED
+# so [[ ]] treats it as a pattern (a quoted RHS would be a literal-string compare). This
+# is the same literal-vs-permissive discipline as security finding 2, made explicit: the
+# other predicates stay fixed-string; only THIS one globs, and the SC2053 waiver marks
+# the intent so a future reader doesn't "harden" the unquoting into a literal compare.
+#
+# IMPORTANT — in bash [[ == ]], `*` matches `/` too (UNLIKE pathname/filename globbing).
+# So "crates/*/Cargo.toml" matches a Cargo.toml at ANY depth under crates/ — e.g.
+# crates/ac-service/Cargo.toml AND the workspace-excluded crates/ac-service/fuzz/Cargo.toml.
+# That is CORRECT and intended: any Cargo.toml anywhere under crates/ is a crate manifest,
+# and matching = the fail-safe "run the scan" direction. The match is full-line anchored
+# (no surrounding wildcards), so a prefix-only share (crates/foo/src/x.rs vs
+# crates/*/Cargo.toml) does NOT match, and a suffix-differing sibling (crates/foo/Cargo.toml.bak)
+# does NOT match.
+#
+# Consumes __changed_files — the SAME base-ref-validated cached diff every other predicate
+# reads. It never runs its own git diff, so it cannot fail-open to an empty set on an
+# enumeration error: a resolver failure surfaces upstream as a loud abort (set -e in
+# __ensure_cache) or, in the audit path, as audit_gate's indeterminate->RUN. It thereby
+# inherits the cache's clean, unquoted, repo-relative lines (no ./ prefix, no wrapping).
+diff_touches_glob() {
+  local line pat
+  while IFS= read -r line; do
+    for pat in "$@"; do
+      # shellcheck disable=SC2053  # intentional glob match: RHS pattern MUST stay unquoted
+      [[ "$line" == $pat ]] && return 0
+    done
+  done < <(__changed_files)
+  return 1
+}

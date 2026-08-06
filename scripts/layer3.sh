@@ -28,6 +28,7 @@ layer_lifecycle_begin 3
 {
   run_and_emit "guards" "${__here}/guards/run-guards.sh" || true
   run_and_emit "predicate-meta-test" "${__here}/lang/_test_changed_predicates.sh" || true
+  run_and_emit "changed-helpers-test" "${__here}/lang/_changed_helpers.test.sh" || true
   run_and_emit "audit-suppressions-selftest" "${__here}/audit-suppressions-check.test.sh" || true
   run_and_emit "audit-gate-test" "${__here}/lang/_audit_gate.test.sh" || true
   run_and_emit "layer7-selftest" "${__here}/layer7.test.sh" || true

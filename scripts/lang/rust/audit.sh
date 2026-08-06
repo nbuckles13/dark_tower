@@ -16,10 +16,11 @@
 # `--db /custom/path`), add an explicit allowlist of safe flags, not blanket pass-through.
 #
 # GATE (fail-closed tri-state, _audit_gate.sh): runs the scan if deps changed OR the
-# diff is indeterminate; emits SKIPPED-NO-DIFF only on a PROVEN no-dep-change. The
-# skip predicate is conservative — a clean SKIPPED-NO-DIFF guarantees no dep manifest
-# moved; a crates/-source-only edit RUNS audit (fail-safe over-trigger), it does not skip.
-# DEVLOOP_AUDIT_FORCE_RUN=1 forces a run (weekly scheduled scan); force-RUN-only.
+# diff is indeterminate; emits SKIPPED-NO-DIFF only on a PROVEN no-dep-change. The gate
+# matches ONLY true dep manifests (root Cargo.toml/Cargo.lock + crates/*/Cargo.toml) —
+# a crates/-SOURCE-only edit now SKIPS (it cannot move the resolved dep graph); an
+# indeterminate diff still RUNS. DEVLOOP_AUDIT_FORCE_RUN=1 forces a run (weekly
+# scheduled scan); force-RUN-only.
 set -euo pipefail
 IFS=$'\n\t'
 source "$(dirname "${BASH_SOURCE[0]}")/../_audit_gate.sh"

@@ -15,10 +15,11 @@
 # reads ONLY the tracked derived file, never CLI/env.
 #
 # GATE (fail-closed tri-state, _audit_gate.sh): runs the scan if deps changed OR the
-# diff is indeterminate; emits SKIPPED-NO-DIFF only on a PROVEN no-dep-change. The
-# skip predicate is conservative — a clean SKIPPED-NO-DIFF guarantees no dep manifest
-# moved; a packages/-source-only edit RUNS audit (fail-safe over-trigger), it does not skip.
-# DEVLOOP_AUDIT_FORCE_RUN=1 forces a run (weekly scheduled scan); force-RUN-only.
+# diff is indeterminate; emits SKIPPED-NO-DIFF only on a PROVEN no-dep-change. The gate
+# matches ONLY true dep manifests (root package.json/pnpm-lock.yaml/pnpm-workspace.yaml +
+# packages/*/package.json) — a packages/-SOURCE-only edit now SKIPS (it cannot move the
+# resolved dep graph); an indeterminate diff still RUNS. DEVLOOP_AUDIT_FORCE_RUN=1 forces
+# a run (weekly scheduled scan); force-RUN-only.
 #
 # FILTER fail-mode (security §D.1.2 PATH-1): if .pnpm-audit-ignore.json is malformed,
 # the filter applies ZERO suppressions and PROCEEDS (every advisory surfaces; the scan

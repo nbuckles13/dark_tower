@@ -8,6 +8,13 @@
 # instead of scanning. The always-run discipline moved to the Layer-3
 # audit-suppressions-check guard + the weekly scheduled full scan (audit-scheduled.yml).
 #
+# NARROWED (2026-08-05): the dep-change predicates match ONLY true dependency manifests
+# (root Cargo.toml/Cargo.lock + crates/*/Cargo.toml; root package.json/pnpm-lock.yaml/
+# pnpm-workspace.yaml + packages/*/package.json). The earlier crates/ / packages/ PREFIX
+# fallback (diff_touches_path) over-triggered on source-only edits and could red on an
+# ambient advisory unrelated to the diff; it is replaced by the anchored diff_touches_glob.
+# Safe, not masking: a diff touching no dep manifest cannot move the resolved dep graph.
+#
 # Gate placement (D-b): the audit dispatch KEEPS DEVLOOP_DISPATCH_ALWAYS_RUN=1 so the
 # dispatcher invokes each wrapper unconditionally; the FAIL-CLOSED tri-state gate lives
 # HERE, inside the wrapper — never via the dispatcher's changed.sh short-circuit (which
@@ -16,7 +23,7 @@
 # Suppression is sourced ONLY from the manifest -> generated derived files, never from
 # CLI flags (preserves the Wave-1 no-CLI-pass-through finding, ADR-0033 §11).
 #
-# Reuses _changed_helpers.sh predicates (diff_touches_root_files / diff_touches_path)
+# Reuses _changed_helpers.sh predicates (diff_touches_root_files / diff_touches_glob)
 # and _common.sh emit_status — no bespoke diff parsing, no reinvented STATUS lines.
 
 set -euo pipefail
@@ -73,26 +80,41 @@ audit_gate() {
   fi
 }
 
-# rust dep-manifest predicate. Over-trigger via diff_touches_path "crates/" is a
-# deliberate FAIL-SAFE choice (@dry-reviewer): _changed_helpers.sh has no glob
-# predicate, so editing any crate source re-runs the audit. That never produces a
-# FALSE skip — a clean SKIPPED-NO-DIFF still guarantees no dep manifest moved.
+# rust dep-manifest predicate — matches ONLY true dependency manifests (task narrowing,
+# 2026-08-05). A prior fail-safe fallback used diff_touches_path "crates/" (a PREFIX
+# match), so ANY crate-source edit re-ran cargo audit and could red on an ambient
+# advisory unrelated to the diff. That over-trigger is GONE: we now match the root
+# manifests plus per-crate manifests via the anchored diff_touches_glob.
 #
-# skip predicate is conservative: a clean SKIPPED-NO-DIFF guarantees no dep manifest
-# moved; a crates/-source-only edit RUNS audit (fail-safe over-trigger), it does not skip.
+# SSoT anchor: the glob is coupled to the crate layout in the root Cargo.toml
+# [workspace] block (members + exclude). `*` in bash [[ == ]] crosses `/`, so
+# crates/*/Cargo.toml matches every member manifest AND the workspace-EXCLUDED
+# crates/*/fuzz/Cargo.toml at two levels — the fail-safe "run" direction. A future
+# member outside crates/* would open a false-SKIP hole: the SSoT-drift guard in
+# _audit_gate.test.sh asserts every git-tracked manifest stays covered.
+#
+# Safe, not masking: a diff touching no dep manifest provably cannot move the resolved
+# dependency graph. Residual: a dep-changing devloop still full-tree scans and may hit
+# an unrelated ambient advisory — suppression (ADR-0033 §11) is the escape hatch; the
+# weekly scheduled scan (audit-scheduled.yml) remains the diff-less-vector net.
 audit_dep_changed_rust() {
-  diff_touches_root_files "Cargo.toml" "Cargo.lock" || diff_touches_path "crates/"
+  diff_touches_root_files "Cargo.toml" "Cargo.lock" \
+    || diff_touches_glob "crates/*/Cargo.toml"
 }
 
-# ts dep-manifest predicate. pnpm-workspace.yaml included (security): editing it
-# changes which packages resolve into the dep graph without touching a package.json.
-# packages/ over-trigger is the same fail-safe choice as rust.
+# ts dep-manifest predicate — matches ONLY true dependency manifests (task narrowing,
+# 2026-08-05). pnpm-workspace.yaml stays in the root set (security): editing it changes
+# which packages resolve into the dep graph without touching a package.json. The prior
+# diff_touches_path "packages/" PREFIX over-trigger (any TS source edit re-ran pnpm
+# audit) is GONE — replaced by the anchored per-package glob.
 #
-# skip predicate is conservative: a clean SKIPPED-NO-DIFF guarantees no dep manifest
-# moved; a packages/-source-only edit RUNS audit (fail-safe over-trigger), it does not skip.
+# SSoT anchor: the glob is coupled to pnpm-workspace.yaml (`packages: - 'packages/*'`).
+# A future workspace glob outside packages/* would open a false-SKIP hole; the
+# SSoT-drift guard in _audit_gate.test.sh asserts every git-tracked package.json stays
+# covered. Same residual + safe-not-masking rationale as rust above.
 audit_dep_changed_ts() {
   diff_touches_root_files "package.json" "pnpm-lock.yaml" "pnpm-workspace.yaml" \
-    || diff_touches_path "packages/"
+    || diff_touches_glob "packages/*/package.json"
 }
 
 # -----------------------------------------------------------------------------
