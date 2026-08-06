@@ -19,26 +19,22 @@ pub struct RunnableTask {
 }
 
 /// Outcome of `next` resolution (exit codes 0 / 3 / 4 respectively).
+/// `reopened` is true when the selected task was escalated and has been
+/// flipped back to pending for retry — the caller must persist that
+/// mutation to the story file before acting on the payload.
 #[derive(Debug)]
 pub enum NextOutcome {
-    Runnable(RunnableTask),
+    Runnable { task: RunnableTask, reopened: bool },
     AllDone,
     Blocked(String),
 }
 
-/// Resolve the next runnable task: the lowest-id pending task whose deps
-/// are ALL completed. Serial execution — no critical-path prioritization.
-pub fn next(manifest: &Manifest) -> Result<NextOutcome> {
-    let mut pending: Vec<&Task> = manifest
-        .tasks
-        .iter()
-        .filter(|t| t.status == Status::Pending)
-        .collect();
-    if pending.is_empty() {
-        return Ok(NextOutcome::AllDone);
-    }
-    pending.sort_by_key(|t| t.id);
-
+/// Resolve the next runnable task: the lowest-id pending OR escalated task
+/// whose deps are ALL completed. Serial execution — no critical-path
+/// prioritization. Escalated tasks are retryable: when one is selected it
+/// is mutated back to pending (escalation cleared) and reported with
+/// `reopened: true` so the caller can persist the transition.
+pub fn next(manifest: &mut Manifest) -> Result<NextOutcome> {
     let completed: HashSet<u32> = manifest
         .tasks
         .iter()
@@ -46,29 +42,58 @@ pub fn next(manifest: &Manifest) -> Result<NextOutcome> {
         .map(|t| t.id)
         .collect();
 
-    for task in &pending {
-        if task.deps.iter().all(|d| completed.contains(d)) {
-            return runnable_payload(task).map(NextOutcome::Runnable);
-        }
-    }
-
-    let first = pending
-        .first()
-        .ok_or_else(|| anyhow!("pending set vanished (internal error)"))?;
-    let waits: Vec<String> = first
-        .deps
+    let mut candidates: Vec<&Task> = manifest
+        .tasks
         .iter()
-        .filter(|d| !completed.contains(d))
-        .map(|d| match manifest.task(*d) {
-            Some(dep) => format!("dep {d} is {}", dep.status),
-            None => format!("dep {d} is missing"),
-        })
+        .filter(|t| matches!(t.status, Status::Pending | Status::Escalated))
         .collect();
-    Ok(NextOutcome::Blocked(format!(
-        "no runnable task: task {} is blocked ({})",
-        first.id,
-        waits.join(", ")
-    )))
+    if candidates.is_empty() {
+        return Ok(NextOutcome::AllDone);
+    }
+    candidates.sort_by_key(|t| t.id);
+
+    let selected = candidates
+        .iter()
+        .find(|t| t.deps.iter().all(|d| completed.contains(d)))
+        .map(|t| t.id);
+
+    let Some(id) = selected else {
+        let first = candidates
+            .first()
+            .ok_or_else(|| anyhow!("candidate set vanished (internal error)"))?;
+        let waits: Vec<String> = first
+            .deps
+            .iter()
+            .filter(|d| !completed.contains(d))
+            .map(|d| match manifest.task(*d) {
+                Some(dep) if dep.status == Status::Escalated => format!(
+                    "dep {d} is escalated and blocks dependents until it is selected and retried"
+                ),
+                Some(dep) => format!("dep {d} is {}", dep.status),
+                None => format!("dep {d} is missing"),
+            })
+            .collect();
+        return Ok(NextOutcome::Blocked(format!(
+            "no runnable task: task {} ({}) is blocked ({})",
+            first.id,
+            first.status,
+            waits.join(", ")
+        )));
+    };
+
+    let task = manifest
+        .task_mut(id)
+        .ok_or_else(|| anyhow!("selected task {id} vanished (internal error)"))?;
+    let reopened = task.status == Status::Escalated;
+    if reopened {
+        task.status = Status::Pending;
+        task.escalation = None;
+    }
+    let payload = runnable_payload(task)?;
+    Ok(NextOutcome::Runnable {
+        task: payload,
+        reopened,
+    })
 }
 
 /// Enforce pending-task field requirements on `next`'s output path.

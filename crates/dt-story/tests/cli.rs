@@ -85,8 +85,29 @@ fn next_blocked_exits_four_with_stderr_diagnosis() {
     );
     let stderr = String::from_utf8(output.stderr).expect("utf-8 stderr");
     assert!(
-        stderr.contains("task 2") && stderr.contains("dep 1 is escalated"),
-        "diagnosis must name the blocked task and dep status, got: {stderr}"
+        stderr.contains("task 1")
+            && stderr.contains(
+                "dep 2 is escalated and blocks dependents until it is selected and retried"
+            ),
+        "diagnosis must name the blocked task and explain the escalated dep, got: {stderr}"
+    );
+}
+
+#[test]
+fn next_escalated_task_with_unmet_deps_still_exits_four() {
+    // blocked.md's task 2 is escalated with an unmet dep — being escalated
+    // must not make it runnable, and the blocked path must not rewrite the
+    // story file.
+    let orig = fs::read_to_string(fixture("blocked.md")).expect("read fixture");
+    dt_story()
+        .arg("next")
+        .arg(fixture("blocked.md"))
+        .assert()
+        .code(4);
+    let after = fs::read_to_string(fixture("blocked.md")).expect("re-read fixture");
+    assert_eq!(
+        after, orig,
+        "blocked next must leave the story file untouched"
     );
 }
 
@@ -231,8 +252,73 @@ fn escalate_round_trip_records_state_and_writes_out_json() {
     assert_eq!(out_json["reason"], "env-tests-failed");
     assert_eq!(out_json["log"], "escalations/task-2.log");
 
-    // Task 3 now waits on an escalated dep — next must report blocked.
-    dt_story().arg("next").arg(&story).assert().code(4);
+    // Escalated tasks are retryable: next reopens task 2 instead of
+    // reporting task 3 as blocked.
+    let assert = dt_story().arg("next").arg(&story).assert();
+    let output = assert.success().get_output().clone();
+    let stdout = String::from_utf8(output.stdout).expect("utf-8 stdout");
+    let json: serde_json::Value = serde_json::from_str(stdout.trim()).expect("stdout JSON");
+    assert_eq!(json["id"], 2);
+}
+
+#[test]
+fn next_reopens_escalated_task_for_retry() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let story = dir.path().join("story.md");
+    let orig = fs::read_to_string(fixture("runnable.md")).expect("read fixture");
+    fs::write(&story, &orig).expect("write story copy");
+
+    dt_story()
+        .arg("escalate")
+        .arg(&story)
+        .arg("2")
+        .arg("--reason")
+        .arg("env-tests-failed")
+        .arg("--log")
+        .arg("escalations/task-2.log")
+        .assert()
+        .success();
+
+    // next must return the SAME task, flip the file back to pending with
+    // the escalation cleared, and announce the reopen on stderr.
+    let assert = dt_story().arg("next").arg(&story).assert();
+    let output = assert.success().get_output().clone();
+    let stdout = String::from_utf8(output.stdout).expect("utf-8 stdout");
+    let json: serde_json::Value = serde_json::from_str(stdout.trim()).expect("stdout JSON");
+    assert_eq!(json["id"], 2);
+    assert_eq!(json["specialist"], "global-controller");
+    let stderr = String::from_utf8(output.stderr).expect("utf-8 stderr");
+    assert!(
+        stderr.contains("dt-story: reopening escalated task 2 for retry"),
+        "reopen must be announced on stderr, got: {stderr}"
+    );
+
+    let mutated = fs::read_to_string(&story).expect("read mutated story");
+    assert_non_manifest_bytes_preserved(&orig, &mutated);
+    let manifest = parse_manifest(&mutated);
+    let task2 = manifest.task(2).expect("task 2");
+    assert_eq!(task2.status, Status::Pending);
+    assert_eq!(
+        task2.escalation, None,
+        "reopen must clear the escalation field"
+    );
+
+    // A second next selects the (now plain pending) task again without a
+    // reopen notice and without rewriting the file.
+    let assert = dt_story().arg("next").arg(&story).assert();
+    let output = assert.success().get_output().clone();
+    let stdout = String::from_utf8(output.stdout).expect("utf-8 stdout");
+    let json: serde_json::Value = serde_json::from_str(stdout.trim()).expect("stdout JSON");
+    assert_eq!(json["id"], 2);
+    assert!(
+        output.stderr.is_empty(),
+        "no reopen happened, so stderr must be silent"
+    );
+    let unchanged = fs::read_to_string(&story).expect("re-read story");
+    assert_eq!(
+        unchanged, mutated,
+        "a non-reopening next must not rewrite the story file"
+    );
 }
 
 // ------------------------------------------------------------ validate --

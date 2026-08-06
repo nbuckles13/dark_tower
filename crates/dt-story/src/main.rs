@@ -1,8 +1,10 @@
 //! dt-story binary entry point: pure clap dispatch + exit-code mapping.
 //!
 //! Exit-code contract (consumed by the story runner's bash wrapper):
-//! * `next`     — 0 runnable (JSON on stdout), 3 no pending tasks left,
-//!   4 pending-but-blocked (diagnosis on stderr), 2 malformed.
+//! * `next`     — 0 runnable (JSON on stdout), 3 no pending/escalated
+//!   tasks left, 4 blocked (diagnosis on stderr), 2 malformed. Escalated
+//!   tasks are retryable: selecting one reopens it (status back to
+//!   pending, escalation cleared, file rewritten) with a stderr notice.
 //! * `complete` / `escalate` — 0 on success, 2 on any error.
 //! * `validate` — 0 valid, 1 with one violation per stderr line.
 
@@ -122,16 +124,26 @@ fn exit_on_error(result: Result<()>) -> ExitCode {
 }
 
 fn cmd_next(story: &Path) -> ExitCode {
-    let doc = match load(story) {
+    let mut doc = match load(story) {
         Ok(doc) => doc,
         Err(e) => {
             eprintln!("dt-story: {e:#}");
             return ExitCode::from(EXIT_MALFORMED);
         }
     };
-    match engine::next(&doc.manifest) {
-        Ok(NextOutcome::Runnable(task)) => match serde_json::to_string(&task) {
+    match engine::next(&mut doc.manifest) {
+        Ok(NextOutcome::Runnable { task, reopened }) => match serde_json::to_string(&task) {
             Ok(json) => {
+                // Persist the escalated→pending reopen before emitting the
+                // payload; only reopens rewrite the file — a plain `next`
+                // stays read-only.
+                if reopened {
+                    if let Err(e) = save(story, &doc) {
+                        eprintln!("dt-story: {e:#}");
+                        return ExitCode::from(EXIT_MALFORMED);
+                    }
+                    eprintln!("dt-story: reopening escalated task {} for retry", task.id);
+                }
                 println!("{json}");
                 ExitCode::SUCCESS
             }
