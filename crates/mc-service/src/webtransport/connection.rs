@@ -6,7 +6,7 @@
 //! 3. Runs the bridge loop forwarding `ParticipantUpdate` messages to the client
 //! 4. Notifies the meeting when the connection drops (via `MeetingActorHandle`)
 
-use crate::actors::messages::JoinResult;
+use crate::actors::messages::{DisconnectCause, JoinResult};
 use crate::actors::{
     BoundedMhStatus, MeetingControllerActorHandle, MhState, ParticipantActorHandle,
 };
@@ -31,7 +31,9 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn, Instrument};
 use wtransport::endpoint::IncomingSession;
+use wtransport::error::ConnectionError;
 use wtransport::stream::{RecvStream, SendStream};
+use wtransport::Connection;
 
 /// Maximum size for a single framed message (64KB).
 const MAX_MESSAGE_SIZE: usize = 64 * 1024;
@@ -58,6 +60,16 @@ const MAX_PARTICIPANT_NAME_LEN: usize = 256;
 /// Channel buffer for outbound messages from ParticipantActor to WebTransport stream.
 const OUTBOUND_CHANNEL_BUFFER: usize = 100;
 
+/// Micro-bound for resolving the authoritative session close reason after the
+/// client's recv stream ends or an outbound write fails.
+///
+/// This is NOT a policy/config knob: on any real session close `Connection::closed()`
+/// is already resolved and this returns in ~0ms. It only bounds the pathological
+/// case where a single stream ends while the QUIC session lingers (does not occur
+/// on a browser tab-close), so the connection handler can't hang. If it elapses,
+/// the cause fails safe to `ConnectionLost` (grace-preserving).
+const CLOSE_CAUSE_RESOLVE_BOUND: Duration = Duration::from_secs(2);
+
 /// Maximum number of attempts for RegisterMeeting RPC per MH.
 const MAX_REGISTER_ATTEMPTS: u32 = 3;
 
@@ -79,6 +91,66 @@ fn truncate_utf8(s: &str, max_bytes: usize) -> String {
         end -= 1;
     }
     s[..end].to_string()
+}
+
+/// Classify a WebTransport `ConnectionError` (from `Connection::closed()`) into
+/// the transport-authenticated [`DisconnectCause`].
+///
+/// Only a clean peer/application close maps to `ClientClosed` (immediate roster
+/// removal — grace skipped). EVERYTHING ELSE, including any future `wtransport`
+/// variant via the catch-all, maps to the grace-preserving `ConnectionLost`, so
+/// a new/unknown variant can never fall into the immediate-remove path
+/// (fail-safe). Classification uses ONLY the error VARIANT — the client-chosen
+/// application error-code / close-reason string inside `ApplicationClosed` is
+/// never inspected, logged, or used as a metric label.
+fn classify_connection_error(error: &ConnectionError) -> DisconnectCause {
+    match error {
+        // Deliberate close by the peer — application-level (WebTransport session
+        // close, e.g. a browser tab close) or QUIC transport-level CONNECTION_CLOSE.
+        ConnectionError::ApplicationClosed(_) | ConnectionError::ConnectionClosed(_) => {
+            DisconnectCause::ClientClosed
+        }
+        // We closed it (shutdown/drain/explicit-leave already handled).
+        ConnectionError::LocallyClosed => DisconnectCause::ServerInitiated,
+        // Idle timeout, QUIC/H3 protocol errors, CID exhaustion, and any future
+        // variant → abrupt/ambiguous loss: keep the ADR-0023 grace period.
+        _ => DisconnectCause::ConnectionLost,
+    }
+}
+
+/// Map a `ConnectionError` to a FIXED, bounded variant discriminant for logging.
+///
+/// This returns a `&'static str` variant name ONLY — it never renders the error's
+/// `Display`, which for `ApplicationClosed` embeds the client-controlled
+/// WebTransport close-reason phrase (`String::from_utf8_lossy`, unescaped). Logging
+/// that would be a log-injection / log-forging vector and would violate the
+/// `classify_connection_error` contract ("the client-chosen close-reason string ...
+/// is never inspected, logged, or used as a metric label"). Forensic-only hint; the
+/// authoritative signal is the bounded [`DisconnectCause`].
+fn connection_error_variant(error: &ConnectionError) -> &'static str {
+    match error {
+        ConnectionError::ApplicationClosed(_) => "application_closed",
+        ConnectionError::ConnectionClosed(_) => "connection_closed",
+        ConnectionError::LocallyClosed => "locally_closed",
+        ConnectionError::TimedOut => "timed_out",
+        ConnectionError::CidsExhausted => "cids_exhausted",
+        // Any other/future variant (QUIC/H3 protocol errors, etc.): a fixed label,
+        // never the client-influenced Display.
+        _ => "other",
+    }
+}
+
+/// Resolve the authoritative disconnect cause after a stream ended / write failed.
+///
+/// `Connection::closed()` yields the session close reason; on any real close it is
+/// already resolved (~0ms). Bounded by [`CLOSE_CAUSE_RESOLVE_BOUND`] so a lingering
+/// half-closed session cannot hang the handler — on timeout, fail safe to
+/// `ConnectionLost` (grace-preserving).
+async fn resolve_close_cause(connection: &Connection) -> DisconnectCause {
+    match tokio::time::timeout(CLOSE_CAUSE_RESOLVE_BOUND, connection.closed()).await {
+        Ok(error) => classify_connection_error(&error),
+        Err(_) => DisconnectCause::ConnectionLost,
+    }
 }
 
 /// Map the proto `ConnectionState` (stored as `i32`) to the bounded domain enum
@@ -503,15 +575,25 @@ pub async fn handle_connection(
     // Step 10: Run bridge loop — forward ParticipantActor updates to client
     // outbound_tx was passed through the join flow and is now owned by ParticipantActor.
     // outbound_rx receives encoded protobuf bytes written by ParticipantActor.
-    let bridge_result = run_bridge_loop(
+    // Returns the transport-authenticated disconnect cause.
+    let disconnect_cause = run_bridge_loop(
         &mut send_stream,
         &mut recv_stream,
         &mut outbound_rx,
         &cancel_token,
+        &connection,
         &connection_id,
         &join_result.participant_handle,
     )
     .await;
+
+    // Record the cause on the ParticipantActor handle BEFORE cancelling, so the
+    // actor's exit notification carries it to the meeting (Release store happens
+    // -before the cancel the actor observes). A clean close → immediate roster
+    // removal; abrupt/ambiguous → grace period preserved.
+    join_result
+        .participant_handle
+        .set_disconnect_cause(disconnect_cause);
 
     // Cancel the ParticipantActor — it will notify the meeting of disconnect on exit
     info!(
@@ -519,28 +601,42 @@ pub async fn handle_connection(
         connection_id = %connection_id,
         meeting_id = %meeting_id,
         participant_id = %join_result.participant_id,
+        cause = %disconnect_cause.label(),
         "Connection closing, cancelling ParticipantActor"
     );
     join_result.participant_handle.cancel();
 
-    bridge_result
+    Ok(())
 }
 
 /// Run the bridge loop: forward outbound messages to the WebTransport stream.
 ///
+/// Returns the transport-authenticated [`DisconnectCause`] describing why the
+/// loop exited, so the caller can drive an immediate roster removal (clean close)
+/// vs. the ADR-0023 grace period (abrupt/ambiguous loss).
+///
 /// Exits when:
-/// - Cancellation token is triggered
-/// - Outbound channel is closed (ParticipantActor stopped)
-/// - WebTransport stream errors
-/// - Client closes their end of the stream
+/// - Cancellation token is triggered → [`DisconnectCause::ServerInitiated`]
+/// - The session closes (`Connection::closed()` fires) → classified from the
+///   `ConnectionError` (clean peer close → `ClientClosed`; idle-timeout/abrupt →
+///   `ConnectionLost`; local close → `ServerInitiated`)
+/// - The client's recv stream ends or an outbound write fails → the authoritative
+///   cause is resolved via [`resolve_close_cause`]
+/// - The outbound channel closes (ParticipantActor stopped) →
+///   [`DisconnectCause::ServerInitiated`]
+///
+/// Each arm cleanly `return`s or `break`s — no busy-loop. A FRESH
+/// `connection.closed()` future is created each iteration (cancellation-safe to
+/// re-poll).
 async fn run_bridge_loop(
     send_stream: &mut SendStream,
     recv_stream: &mut RecvStream,
     outbound_rx: &mut mpsc::Receiver<bytes::Bytes>,
     cancel_token: &CancellationToken,
+    connection: &Connection,
     connection_id: &str,
     participant_handle: &ParticipantActorHandle,
-) -> Result<(), McError> {
+) -> DisconnectCause {
     loop {
         tokio::select! {
             () = cancel_token.cancelled() => {
@@ -549,20 +645,41 @@ async fn run_bridge_loop(
                     connection_id = %connection_id,
                     "Bridge loop cancelled"
                 );
-                break;
+                return DisconnectCause::ServerInitiated;
+            }
+
+            // Session-level close (the authoritative departure signal). A browser
+            // tab close surfaces here as ApplicationClosed/ConnectionClosed; a
+            // crash/network-loss as TimedOut once the configured idle timeout fires.
+            close_error = connection.closed() => {
+                let cause = classify_connection_error(&close_error);
+                // Log the bounded classification + a FIXED variant discriminant only.
+                // Never `%close_error`: its Display embeds the client-controlled
+                // close-reason string (log-injection vector; contract-violating).
+                debug!(
+                    target: "mc.webtransport.connection",
+                    connection_id = %connection_id,
+                    error_variant = %connection_error_variant(&close_error),
+                    cause = %cause.label(),
+                    "WebTransport session closed"
+                );
+                return cause;
             }
 
             msg = outbound_rx.recv() => {
                 match msg {
                     Some(data) => {
                         if let Err(e) = write_raw_framed(send_stream, &data).await {
+                            // Post-join write failure = the peer is going away.
+                            // Resolve the authoritative session close reason rather
+                            // than treating it as a server error.
                             warn!(
                                 target: "mc.webtransport.connection",
                                 connection_id = %connection_id,
                                 error = %e,
-                                "Failed to write outbound message"
+                                "Failed to write outbound message; resolving close cause"
                             );
-                            return Err(e);
+                            return resolve_close_cause(connection).await;
                         }
                     }
                     None => {
@@ -571,7 +688,7 @@ async fn run_bridge_loop(
                             connection_id = %connection_id,
                             "Outbound channel closed, ending bridge loop"
                         );
-                        break;
+                        return DisconnectCause::ServerInitiated;
                     }
                 }
             }
@@ -582,20 +699,23 @@ async fn run_bridge_loop(
                     Ok(data) => {
                         handle_client_message(&data, connection_id, participant_handle).await;
                     }
-                    Err(_) => {
+                    Err(e) => {
+                        // The client's recv stream ended. Resolve the authoritative
+                        // session close reason (bounded) so a clean tab-close is
+                        // classified as ClientClosed. The underlying stream error is
+                        // logged for forensics (variant only; no client strings).
                         debug!(
                             target: "mc.webtransport.connection",
                             connection_id = %connection_id,
-                            "Client stream closed or read error"
+                            error = %e,
+                            "Client stream closed or read error; resolving close cause"
                         );
-                        break;
+                        return resolve_close_cause(connection).await;
                     }
                 }
             }
         }
     }
-
-    Ok(())
 }
 
 /// Handle a post-join client message in the bridge loop.
@@ -1043,6 +1163,36 @@ mod tests {
         assert!(s.starts_with(&out));
         // 256 is not a multiple of 3 → floors to 255 (85 full '€').
         assert_eq!(out.len(), 255);
+    }
+
+    #[test]
+    fn test_classify_connection_error_abrupt_and_local() {
+        // Unit-constructible ConnectionError variants. The clean-close variants
+        // (ApplicationClosed/ConnectionClosed → ClientClosed) wrap private quinn
+        // types that cannot be built in a unit test; that mapping is exercised
+        // end-to-end by the transport integration test
+        // `join_tests::test_clean_close_broadcasts_prompt_participant_left_voluntary`
+        // (real session close → ClientClosed → prompt Left{Voluntary}). Here we
+        // pin the grace-preserving and server-initiated mappings, incl. the catch-all.
+        assert_eq!(
+            classify_connection_error(&ConnectionError::TimedOut),
+            DisconnectCause::ConnectionLost,
+            "idle-timeout must keep grace (ConnectionLost)"
+        );
+        assert_eq!(
+            classify_connection_error(&ConnectionError::LocallyClosed),
+            DisconnectCause::ServerInitiated,
+        );
+        // Catch-all: a non-clean variant must NEVER map to the immediate-remove
+        // ClientClosed path.
+        assert_eq!(
+            classify_connection_error(&ConnectionError::CidsExhausted),
+            DisconnectCause::ConnectionLost,
+        );
+        assert_ne!(
+            classify_connection_error(&ConnectionError::CidsExhausted),
+            DisconnectCause::ClientClosed,
+        );
     }
 
     #[test]

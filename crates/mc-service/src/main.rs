@@ -418,6 +418,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.mc_id.clone(),
         config.grpc_advertise_address.clone(),
         config.max_participants as usize,
+        std::time::Duration::from_secs(config.quic_max_idle_timeout_seconds),
         shutdown_token.child_token(),
     );
 

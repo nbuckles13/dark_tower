@@ -259,6 +259,7 @@ fn test_config(gc_url: &str) -> Config {
         clock_skew_seconds: 5,
         nonce_grace_window_seconds: 5,
         disconnect_grace_period_seconds: 30,
+        quic_max_idle_timeout_seconds: 10,
         binding_token_secret: SecretString::from("dGVzdC1zZWNyZXQ="),
         ac_endpoint: "https://ac.example.com".to_string(),
         client_id: "mc-service".to_string(),

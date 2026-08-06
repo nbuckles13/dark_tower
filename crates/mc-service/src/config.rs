@@ -38,6 +38,21 @@ pub const DEFAULT_NONCE_GRACE_WINDOW_SECONDS: u64 = 5;
 /// Default participant disconnect grace period in seconds (ADR-0023).
 pub const DEFAULT_DISCONNECT_GRACE_PERIOD_SECONDS: u64 = 30;
 
+/// Default QUIC max-idle-timeout in seconds for the WebTransport server.
+///
+/// This is the ONLY detector for a crash / network-loss departure (a clean tab
+/// close is caught immediately by `Connection::closed()`; see
+/// `webtransport::connection`). It is deliberately set to a few seconds:
+/// - fast enough that an abrupt departure is detected promptly, and
+/// - paired with a keep-alive interval (`< idle`) so a healthy-but-quiet
+///   connection is kept alive and is NEVER spuriously idle-timed-out.
+///
+/// The effective timeout is `min(this, peer_idle_timeout)`, so this value
+/// governs versus the browser's larger default. It also bounds the documented
+/// worst-case crash roster-remove latency (`idle_timeout + grace_period +
+/// grace_check_interval`).
+pub const DEFAULT_QUIC_MAX_IDLE_TIMEOUT_SECONDS: u64 = 10;
+
 /// Default MC instance ID prefix.
 pub const DEFAULT_MC_ID_PREFIX: &str = "mc";
 
@@ -93,6 +108,14 @@ pub struct Config {
 
     /// Participant disconnect grace period in seconds (default: 30, per ADR-0023).
     pub disconnect_grace_period_seconds: u64,
+
+    /// QUIC max-idle-timeout in seconds for the WebTransport server (default: 10).
+    ///
+    /// Bounds detection of a crash/network-loss departure. Parsed FAIL-LOUD
+    /// (non-numeric or `0` is rejected at load) — an invalid value must not
+    /// silently fall back to a library default, which would re-introduce the
+    /// unbounded-detection bug. Env var: `MC_QUIC_MAX_IDLE_TIMEOUT_SECONDS`.
+    pub quic_max_idle_timeout_seconds: u64,
 
     /// Master secret for binding token HMAC (base64-encoded).
     /// Rotates on each deployment for defense-in-depth.
@@ -172,6 +195,10 @@ impl fmt::Debug for Config {
             .field(
                 "disconnect_grace_period_seconds",
                 &self.disconnect_grace_period_seconds,
+            )
+            .field(
+                "quic_max_idle_timeout_seconds",
+                &self.quic_max_idle_timeout_seconds,
             )
             .field("binding_token_secret", &"[REDACTED]")
             .field("ac_endpoint", &self.ac_endpoint)
@@ -345,6 +372,31 @@ impl Config {
             .and_then(|s| s.parse().ok())
             .unwrap_or(DEFAULT_DISCONNECT_GRACE_PERIOD_SECONDS);
 
+        // QUIC max-idle-timeout: FAIL-LOUD parse (mirrors the OTEL_SAMPLE_RATE
+        // pattern, NOT the lenient `.parse().ok().unwrap_or(DEFAULT)` used by the
+        // other `_SECONDS` vars). A non-numeric value, or `0` (which maps to an
+        // infinite idle timeout — the wtransport docs warn this can hang
+        // futures, and it re-introduces the unbounded crash-detection bug),
+        // must crash the process at load rather than silently reverting to a
+        // library default.
+        let quic_max_idle_timeout_seconds = if let Some(value_str) =
+            vars.get("MC_QUIC_MAX_IDLE_TIMEOUT_SECONDS")
+        {
+            let parsed = value_str.trim().parse::<u64>().map_err(|e| {
+                ConfigError::InvalidValue(format!(
+                    "MC_QUIC_MAX_IDLE_TIMEOUT_SECONDS must be a positive integer, got '{value_str}': {e}"
+                ))
+            })?;
+            if parsed == 0 {
+                return Err(ConfigError::InvalidValue(
+                    "MC_QUIC_MAX_IDLE_TIMEOUT_SECONDS must be greater than 0 (0 = infinite idle timeout, which leaves crash/network-loss departures undetected)".to_string(),
+                ));
+            }
+            parsed
+        } else {
+            DEFAULT_QUIC_MAX_IDLE_TIMEOUT_SECONDS
+        };
+
         // Generate MC instance ID
         let mc_id = vars.get("MC_ID").cloned().unwrap_or_else(|| {
             let hostname = std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".to_string());
@@ -417,6 +469,7 @@ impl Config {
             clock_skew_seconds,
             nonce_grace_window_seconds,
             disconnect_grace_period_seconds,
+            quic_max_idle_timeout_seconds,
             binding_token_secret,
             ac_endpoint,
             client_id,
@@ -523,6 +576,10 @@ mod tests {
             config.disconnect_grace_period_seconds,
             DEFAULT_DISCONNECT_GRACE_PERIOD_SECONDS
         );
+        assert_eq!(
+            config.quic_max_idle_timeout_seconds,
+            DEFAULT_QUIC_MAX_IDLE_TIMEOUT_SECONDS
+        );
         // MC ID should be auto-generated
         assert!(config.mc_id.starts_with("mc-"));
         assert_eq!(
@@ -561,6 +618,10 @@ mod tests {
             "MC_DISCONNECT_GRACE_PERIOD_SECONDS".to_string(),
             "45".to_string(),
         );
+        vars.insert(
+            "MC_QUIC_MAX_IDLE_TIMEOUT_SECONDS".to_string(),
+            "15".to_string(),
+        );
 
         let config = Config::from_vars(&vars).expect("Config should load successfully");
 
@@ -574,6 +635,65 @@ mod tests {
         assert_eq!(config.binding_token_ttl_seconds, 60);
         assert_eq!(config.clock_skew_seconds, 10);
         assert_eq!(config.disconnect_grace_period_seconds, 45);
+        assert_eq!(config.quic_max_idle_timeout_seconds, 15);
+    }
+
+    // =========================================================================
+    // QUIC max-idle-timeout config — FAIL-LOUD parse (task #64)
+    // =========================================================================
+
+    #[test]
+    fn test_quic_max_idle_timeout_default() {
+        let config = Config::from_vars(&base_vars()).expect("Config should load");
+        assert_eq!(
+            config.quic_max_idle_timeout_seconds,
+            DEFAULT_QUIC_MAX_IDLE_TIMEOUT_SECONDS
+        );
+    }
+
+    #[test]
+    fn test_quic_max_idle_timeout_custom_value() {
+        let mut vars = base_vars();
+        vars.insert(
+            "MC_QUIC_MAX_IDLE_TIMEOUT_SECONDS".to_string(),
+            "7".to_string(),
+        );
+        let config = Config::from_vars(&vars).expect("Config should load");
+        assert_eq!(config.quic_max_idle_timeout_seconds, 7);
+    }
+
+    #[test]
+    fn test_quic_max_idle_timeout_non_numeric_fails_loud() {
+        // A non-numeric value fails fast at load rather than silently reverting
+        // to a library default (which would re-introduce unbounded detection).
+        let mut vars = base_vars();
+        vars.insert(
+            "MC_QUIC_MAX_IDLE_TIMEOUT_SECONDS".to_string(),
+            "not-a-number".to_string(),
+        );
+        let result = Config::from_vars(&vars);
+        assert!(
+            matches!(result, Err(ConfigError::InvalidValue(msg))
+                if msg.contains("MC_QUIC_MAX_IDLE_TIMEOUT_SECONDS") && msg.contains("not-a-number")),
+            "expected fail-loud error naming the var and echoing the bad value"
+        );
+    }
+
+    #[test]
+    fn test_quic_max_idle_timeout_zero_rejected() {
+        // 0 = infinite idle timeout → crash/network-loss departures would never
+        // be detected. Must be rejected, not accepted.
+        let mut vars = base_vars();
+        vars.insert(
+            "MC_QUIC_MAX_IDLE_TIMEOUT_SECONDS".to_string(),
+            "0".to_string(),
+        );
+        let result = Config::from_vars(&vars);
+        assert!(
+            matches!(result, Err(ConfigError::InvalidValue(msg))
+                if msg.contains("MC_QUIC_MAX_IDLE_TIMEOUT_SECONDS") && msg.contains("greater than 0")),
+            "expected zero to be rejected fail-loud"
+        );
     }
 
     #[test]

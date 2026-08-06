@@ -1419,7 +1419,7 @@ tasks:
     other's registered display name in the roster (manual verification note in
     main.md; automated assertion lands in task 60).
 - id: 64
-  status: pending
+  status: completed
   specialist: meeting-controller
   env_tests: true
   prompt: |

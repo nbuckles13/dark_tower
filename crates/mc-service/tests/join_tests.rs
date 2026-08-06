@@ -207,6 +207,57 @@ async fn join_and_read_response(
         .expect("Timeout waiting for server response")
 }
 
+/// Join and return the LIVE connection + streams alongside the response, so the
+/// caller can keep the WebTransport session OPEN.
+///
+/// Unlike [`join_and_read_response`] (which drops the connection at function end
+/// — a clean close that, post-task-#64, removes the participant from the roster
+/// immediately instead of lingering through the ADR-0023 grace period), this
+/// keeps the participant genuinely present for the duration the returned handles
+/// are held. Used by tests that need a first participant to remain in the meeting
+/// while a second one joins.
+async fn join_keep_open(
+    url: &str,
+    meeting_id: &str,
+    join_token: &str,
+    participant_name: &str,
+) -> (
+    wtransport::Connection,
+    wtransport::SendStream,
+    wtransport::RecvStream,
+    ServerMessage,
+) {
+    let conn = connect_client(url).await;
+    let (mut send, mut recv) = conn
+        .open_bi()
+        .await
+        .expect("open bi stream")
+        .await
+        .expect("bi stream ready");
+
+    let client_msg = ClientMessage {
+        trace_parent: String::new(),
+        trace_state: String::new(),
+        message: Some(client_message::Message::JoinRequest(JoinRequest {
+            meeting_id: meeting_id.to_string(),
+            join_token: join_token.to_string(),
+            participant_name: participant_name.to_string(),
+            capabilities: None,
+            correlation_id: String::new(),
+            binding_token: String::new(),
+        })),
+    };
+
+    let frame = encode_framed(&client_msg);
+    send.write_all(&frame).await.expect("write join request");
+
+    let response = tokio::time::timeout(Duration::from_secs(5), read_server_message(&mut recv))
+        .await
+        .expect("Timeout waiting for server response");
+
+    (conn, send, recv, response)
+}
+
 /// Helper to extract error code from a ServerMessage::Error.
 fn extract_error(msg: &ServerMessage) -> (i32, String) {
     match &msg.message {
@@ -762,6 +813,81 @@ async fn test_participant_joined_notification_via_bridge() {
 }
 
 // ============================================================================
+// T10b: Clean transport close → prompt ParticipantLeft{Voluntary} via bridge
+// ============================================================================
+
+/// End-to-end coverage for the task-#64 clean-close classification pipeline that
+/// the meeting-actor component test (`disconnect_latency_integration.rs`) cannot
+/// reach: it injects `DisconnectCause::ClientClosed` directly, bypassing the
+/// transport. THIS test drives a REAL WebTransport session close and asserts the
+/// whole chain — `run_bridge_loop`'s `connection.closed()` arm →
+/// `classify_connection_error` (ApplicationClosed/ConnectionClosed → `ClientClosed`)
+/// → `set_disconnect_cause` Release-store → `handle_disconnect` skip-grace →
+/// `ParticipantLeft{Voluntary}` broadcast — by observing the peer's wire frame.
+///
+/// The bound (well under the 30s ADR-0023 grace) is what proves grace was SKIPPED:
+/// a graceful-path removal could only arrive after ~30s + the 5s grace-check tick.
+#[tokio::test]
+async fn test_clean_close_broadcasts_prompt_participant_left_voluntary() {
+    let server = TestServer::start().await;
+    server.create_meeting("meeting-cleanclose").await;
+
+    // Bob joins FIRST and stays connected — he is the observer whose roster must
+    // update. Holding the returned handles keeps his session genuinely open.
+    let claims_bob = make_meeting_claims("meeting-cleanclose");
+    let token_bob = server.sign_token(&claims_bob);
+    let (_bob_conn, _bob_send, mut bob_recv, _bob_resp) =
+        join_keep_open(&server.url(), "meeting-cleanclose", &token_bob, "Bob").await;
+
+    // Alice joins SECOND on a droppable connection. Different sub → different user.
+    let mut claims_alice = make_meeting_claims("meeting-cleanclose");
+    claims_alice.sub = "user-alice".to_string();
+    let token_alice = server.sign_token(&claims_alice);
+    let (alice_conn, alice_send, alice_recv, alice_resp) =
+        join_keep_open(&server.url(), "meeting-cleanclose", &token_alice, "Alice").await;
+
+    let alice_id = match &alice_resp.message {
+        Some(server_message::Message::JoinResponse(join)) => join.participant_id.clone(),
+        other => panic!("Expected JoinResponse for Alice, got {other:?}"),
+    };
+    assert!(!alice_id.is_empty(), "Alice must have a participant_id");
+
+    // Alice cleanly closes her WebTransport session (browser tab close).
+    drop(alice_send);
+    drop(alice_recv);
+    drop(alice_conn);
+
+    // Bob must receive ParticipantLeft{alice, Voluntary} PROMPTLY. Read past any
+    // interleaved frames (e.g. the ParticipantJoined for Alice) until the Left
+    // arrives or the bounded deadline (10s ≪ 30s grace) elapses — arrival within
+    // the bound is the proof that the grace period was skipped.
+    let deadline = Duration::from_secs(10);
+    let left = tokio::time::timeout(deadline, async {
+        loop {
+            match try_read_server_message(&mut bob_recv).await {
+                Some(msg) => {
+                    if let Some(server_message::Message::ParticipantLeft(left)) = msg.message {
+                        return Some(left);
+                    }
+                    // Ignore ParticipantJoined / other frames; keep reading.
+                }
+                None => return None, // Bob's stream closed unexpectedly.
+            }
+        }
+    })
+    .await
+    .expect("Timeout: prompt ParticipantLeft not received (grace was NOT skipped)")
+    .expect("Bob's stream closed before ParticipantLeft arrived");
+
+    assert_eq!(left.participant_id, alice_id, "Left must name Alice");
+    assert_eq!(
+        left.reason,
+        v1::LeaveReason::Voluntary as i32,
+        "clean transport close must map to LeaveReason::Voluntary"
+    );
+}
+
+// ============================================================================
 // T11: Participant Name Too Long Rejected
 // ============================================================================
 
@@ -830,10 +956,14 @@ async fn test_second_participant_does_not_trigger_register_meeting() {
     let server = TestServer::start().await;
     server.create_meeting("meeting-noreg").await;
 
-    // First participant joins
+    // First participant joins and STAYS connected — otherwise a clean close would
+    // (post-task-#64) remove Alice immediately, and Bob below would look like the
+    // first participant and re-trigger RegisterMeeting. Holding the connection is
+    // what "a meeting that already has a participant" actually means.
     let claims1 = make_meeting_claims("meeting-noreg");
     let token1 = server.sign_token(&claims1);
-    let response1 = join_and_read_response(&server.url(), "meeting-noreg", &token1, "Alice").await;
+    let (_conn1, _send1, _recv1, response1) =
+        join_keep_open(&server.url(), "meeting-noreg", &token1, "Alice").await;
     assert!(
         matches!(
             &response1.message,
@@ -851,7 +981,7 @@ async fn test_second_participant_does_not_trigger_register_meeting() {
         "First participant should trigger RegisterMeeting"
     );
 
-    // Second participant joins
+    // Second participant joins (Alice still connected → Bob is genuinely second)
     let mut claims2 = make_meeting_claims("meeting-noreg");
     claims2.sub = "user-002".to_string();
     let token2 = server.sign_token(&claims2);

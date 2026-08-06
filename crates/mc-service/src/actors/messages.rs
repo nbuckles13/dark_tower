@@ -80,9 +80,14 @@ pub enum MeetingMessage {
     },
 
     /// A connection has disconnected (may reconnect within grace period).
+    ///
+    /// `cause` carries the transport-authenticated close classification so the
+    /// meeting can decide between an immediate roster removal (clean client
+    /// close) and the ADR-0023 grace period (abrupt/ambiguous loss).
     ConnectionDisconnected {
         connection_id: String,
         participant_id: String,
+        cause: DisconnectCause,
     },
 
     /// A connection is attempting to reconnect.
@@ -326,7 +331,7 @@ pub enum ParticipantStateUpdate {
 /// Reason for participant leaving.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LeaveReason {
-    /// Participant chose to leave.
+    /// Participant chose to leave (explicit leave OR clean transport close).
     Voluntary,
     /// Disconnect grace period expired.
     Timeout,
@@ -334,6 +339,97 @@ pub enum LeaveReason {
     Removed,
     /// Meeting ended.
     MeetingEnded,
+}
+
+impl LeaveReason {
+    /// Bounded, low-cardinality metric-label form for
+    /// `mc_participant_leaves_total{reason}` (exactly 4 values).
+    ///
+    /// Exhaustive match with NO wildcard: a future variant is a COMPILE error,
+    /// not a silently-mislabeled metric.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Voluntary => "voluntary",
+            Self::Timeout => "timeout",
+            Self::Removed => "removed",
+            Self::MeetingEnded => "meeting_ended",
+        }
+    }
+}
+
+/// Transport-authenticated classification of why a connection dropped.
+///
+/// Derived by the WebTransport layer from the QUIC/WebTransport session close
+/// signal (`wtransport::Connection::closed()` → `ConnectionError`), NEVER from a
+/// client-controlled payload. Drives the disconnect handling decision:
+///
+/// - [`ClientClosed`](Self::ClientClosed): clean peer/application close (browser
+///   tab close) → the participant is removed from the roster **immediately**
+///   (the ADR-0023 reconnection grace period is skipped — a deliberately closed
+///   session is not coming back).
+/// - [`ConnectionLost`](Self::ConnectionLost): idle-timeout / abrupt loss →
+///   the participant enters the grace period so a genuine transient disconnect
+///   can reconnect (ADR-0023).
+/// - [`ServerInitiated`](Self::ServerInitiated): we closed it (cancel / drain /
+///   explicit-leave already processed) → grace path (a no-op when the
+///   participant was already removed by another handler).
+///
+/// # Fail-safe default
+///
+/// The `u8` round-trip ([`from_u8`](Self::from_u8) / [`as_u8`](Self::as_u8)) used
+/// for the lock-free cause cell decodes any unexpected/uninitialized byte to
+/// [`ConnectionLost`](Self::ConnectionLost) — the grace-preserving direction.
+/// An unknown byte can therefore NEVER be coerced into the immediate-remove
+/// (`ClientClosed`) path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DisconnectCause {
+    /// Clean client/application close — remove immediately (skip grace).
+    ClientClosed,
+    /// Idle-timeout / abrupt loss — keep the ADR-0023 grace period.
+    ConnectionLost,
+    /// Server-initiated close (cancel / drain / already-handled leave).
+    ServerInitiated,
+}
+
+impl DisconnectCause {
+    /// Encode as a `u8` for the lock-free cause cell.
+    #[must_use]
+    pub fn as_u8(self) -> u8 {
+        match self {
+            Self::ClientClosed => 1,
+            Self::ConnectionLost => 2,
+            Self::ServerInitiated => 3,
+        }
+    }
+
+    /// Decode from a `u8`. Any unexpected/uninitialized byte fails safe to
+    /// [`ConnectionLost`](Self::ConnectionLost) (grace-preserving) — an unknown
+    /// value is NEVER decoded as the immediate-remove `ClientClosed`.
+    #[must_use]
+    pub fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::ClientClosed,
+            3 => Self::ServerInitiated,
+            // 2 (ConnectionLost) and every other byte (incl. the 0 the cell is
+            // initialized to) fail safe to the grace-preserving cause.
+            _ => Self::ConnectionLost,
+        }
+    }
+
+    /// Bounded, low-cardinality metric-label form for
+    /// `mc_participant_disconnects_total{cause}` (exactly 3 values).
+    ///
+    /// Exhaustive match with NO wildcard: a future variant is a COMPILE error,
+    /// not a silently-mislabeled metric.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ClientClosed => "client_closed",
+            Self::ConnectionLost => "connection_lost",
+            Self::ServerInitiated => "server_initiated",
+        }
+    }
 }
 
 /// Current state of a meeting (for debugging/health).
@@ -387,6 +483,49 @@ mod tests {
     fn test_leave_reason_equality() {
         assert_eq!(LeaveReason::Voluntary, LeaveReason::Voluntary);
         assert_ne!(LeaveReason::Voluntary, LeaveReason::Timeout);
+    }
+
+    #[test]
+    fn test_leave_reason_labels_bounded() {
+        assert_eq!(LeaveReason::Voluntary.label(), "voluntary");
+        assert_eq!(LeaveReason::Timeout.label(), "timeout");
+        assert_eq!(LeaveReason::Removed.label(), "removed");
+        assert_eq!(LeaveReason::MeetingEnded.label(), "meeting_ended");
+    }
+
+    #[test]
+    fn test_disconnect_cause_labels_bounded() {
+        assert_eq!(DisconnectCause::ClientClosed.label(), "client_closed");
+        assert_eq!(DisconnectCause::ConnectionLost.label(), "connection_lost");
+        assert_eq!(DisconnectCause::ServerInitiated.label(), "server_initiated");
+    }
+
+    #[test]
+    fn test_disconnect_cause_u8_roundtrip() {
+        for cause in [
+            DisconnectCause::ClientClosed,
+            DisconnectCause::ConnectionLost,
+            DisconnectCause::ServerInitiated,
+        ] {
+            assert_eq!(DisconnectCause::from_u8(cause.as_u8()), cause);
+        }
+    }
+
+    #[test]
+    fn test_disconnect_cause_from_u8_fails_safe_to_connection_lost() {
+        // The 0 the atomic cell is initialized to, and every other unexpected
+        // byte, MUST decode to the grace-preserving cause — never ClientClosed
+        // (immediate remove). This is the fail-safe / anti-spoof-eject guard.
+        assert_eq!(DisconnectCause::from_u8(0), DisconnectCause::ConnectionLost);
+        for byte in [4u8, 5, 42, 255] {
+            assert_eq!(
+                DisconnectCause::from_u8(byte),
+                DisconnectCause::ConnectionLost,
+                "byte {byte} must fail safe to ConnectionLost"
+            );
+        }
+        // Explicitly: no byte decodes to ClientClosed except the exact encoding.
+        assert_ne!(DisconnectCause::from_u8(0), DisconnectCause::ClientClosed);
     }
 
     #[test]

@@ -16,8 +16,8 @@
 use crate::errors::McError;
 
 use super::messages::{
-    JoinResult, LeaveReason, MeetingMessage, MeetingState, ParticipantInfo, ParticipantStateUpdate,
-    ParticipantStatus, ReconnectResult, SignalingPayload,
+    DisconnectCause, JoinResult, LeaveReason, MeetingMessage, MeetingState, ParticipantInfo,
+    ParticipantStateUpdate, ParticipantStatus, ReconnectResult, SignalingPayload,
 };
 use super::metrics::{ActorMetrics, ActorType, ControllerMetrics, MailboxMonitor};
 use super::participant::{ParticipantActor, ParticipantActorHandle};
@@ -88,15 +88,22 @@ impl MeetingActorHandle {
     }
 
     /// Notify of a connection disconnect.
+    ///
+    /// `cause` is the transport-authenticated close classification (see
+    /// [`DisconnectCause`]). A [`DisconnectCause::ClientClosed`] removes the
+    /// participant from the roster immediately; the abrupt/ambiguous causes keep
+    /// the ADR-0023 grace period for reconnection.
     pub async fn connection_disconnected(
         &self,
         connection_id: String,
         participant_id: String,
+        cause: DisconnectCause,
     ) -> Result<(), McError> {
         self.sender
             .send(MeetingMessage::ConnectionDisconnected {
                 connection_id,
                 participant_id,
+                cause,
             })
             .await
             .map_err(|e| McError::Internal(format!("channel send failed: {e}")))
@@ -465,8 +472,9 @@ impl MeetingActor {
             MeetingMessage::ConnectionDisconnected {
                 connection_id,
                 participant_id,
+                cause,
             } => {
-                self.handle_disconnect(&connection_id, &participant_id)
+                self.handle_disconnect(&connection_id, &participant_id, cause)
                     .await;
             }
 
@@ -660,44 +668,154 @@ impl MeetingActor {
     }
 
     /// Handle connection disconnect.
-    async fn handle_disconnect(&mut self, connection_id: &str, participant_id: &str) {
+    ///
+    /// `cause` (transport-authenticated; see [`DisconnectCause`]) selects the
+    /// path:
+    /// - [`DisconnectCause::ClientClosed`] — a clean tab-close: remove the
+    ///   participant from the roster IMMEDIATELY and broadcast
+    ///   `ParticipantLeft{Voluntary}` (the ADR-0023 grace period is skipped — a
+    ///   deliberately closed session is not reconnecting).
+    /// - [`DisconnectCause::ConnectionLost`] / [`DisconnectCause::ServerInitiated`]
+    ///   — abrupt/ambiguous: mark the participant `Disconnected` and start the
+    ///   grace period so a genuine transient disconnect can reconnect.
+    ///
+    /// Idempotent under the double-notify path (the `ParticipantActor` self-notify
+    /// plus [`check_connection_health`](Self::check_connection_health)): once the
+    /// participant is removed (`ClientClosed`) or already in grace
+    /// (`ConnectionLost`/`ServerInitiated`), a second call is a no-op. Both arms
+    /// gate `record_participant_disconnect` on a live→dead transition
+    /// (`status != Disconnected`), so the physical drop is counted exactly once
+    /// even when a racing inline `ConnectionLost` marks the participant
+    /// `Disconnected` before the queued `ClientClosed` is processed — the disconnect
+    /// counter is never double-incremented, and the leave counter fires once via the
+    /// single `remove_and_broadcast_left` choke-point.
+    async fn handle_disconnect(
+        &mut self,
+        connection_id: &str,
+        participant_id: &str,
+        cause: DisconnectCause,
+    ) {
         debug!(
             target: "mc.actor.meeting",
             meeting_id = %self.meeting_id,
             participant_id = %participant_id,
             connection_id = %connection_id,
+            cause = %cause.label(),
             "Connection disconnected"
         );
 
-        // Remove connection
+        // Remove connection (once).
         if let Some(conn) = self.connections.remove(connection_id) {
             // Wait briefly for task to complete
             let _ = tokio::time::timeout(Duration::from_millis(100), conn.task_handle).await;
             self.metrics.connection_closed();
         }
 
-        // Mark participant as disconnected (start grace period)
-        if let Some(participant) = self.participants.get_mut(participant_id) {
-            participant.status = ParticipantStatus::Disconnected;
-            participant.disconnected_at = Some(Instant::now());
-            participant.connection = None;
+        // Look up current participant status; if already gone (removed/left),
+        // there is nothing to do — keeps the double-notify path idempotent.
+        let Some(status) = self.participants.get(participant_id).map(|p| p.status) else {
+            return;
+        };
 
-            // Broadcast disconnect to other participants
-            self.broadcast_update(
-                participant_id,
-                ParticipantStateUpdate::Disconnected {
-                    participant_id: participant_id.to_string(),
-                },
-            )
-            .await;
+        match cause {
+            DisconnectCause::ClientClosed => {
+                // Clean close — the user closed the tab. Remove immediately and
+                // broadcast ParticipantLeft{Voluntary}; skip the grace period.
+                //
+                // Count the physical drop ONLY on a live→dead transition, matching
+                // the ConnectionLost arm below. If the participant is already
+                // Disconnected, a racing inline ConnectionLost (from
+                // check_connection_health observing the finished conn task before
+                // this queued ClientClosed is processed) already counted the drop —
+                // re-counting here would double-increment
+                // mc_participant_disconnects_total for one departure and skew the
+                // reconnect-rate identity. We still remove + broadcast Left below
+                // (skip grace); only the counter is gated.
+                if status != ParticipantStatus::Disconnected {
+                    crate::observability::metrics::record_participant_disconnect(cause.label());
+                }
+                info!(
+                    target: "mc.actor.meeting",
+                    meeting_id = %self.meeting_id,
+                    participant_id = %participant_id,
+                    "Clean transport close — removing participant immediately (grace skipped)"
+                );
+                self.remove_and_broadcast_left(participant_id, LeaveReason::Voluntary)
+                    .await;
+            }
+            DisconnectCause::ConnectionLost | DisconnectCause::ServerInitiated => {
+                // Abrupt / ambiguous loss. Start the ADR-0023 grace period so a
+                // genuine transient disconnect can reconnect. Idempotent: if the
+                // participant is already in grace, do nothing (no double count).
+                if status == ParticipantStatus::Disconnected {
+                    return;
+                }
+                crate::observability::metrics::record_participant_disconnect(cause.label());
+                if let Some(participant) = self.participants.get_mut(participant_id) {
+                    participant.status = ParticipantStatus::Disconnected;
+                    participant.disconnected_at = Some(Instant::now());
+                    participant.connection = None;
+                }
 
-            info!(
-                target: "mc.actor.meeting",
-                meeting_id = %self.meeting_id,
-                participant_id = %participant_id,
-                "Participant disconnected, grace period started"
-            );
+                // Broadcast disconnect to other participants (informational; not
+                // serialized to the wire — the roster is only removed on grace
+                // expiry via check_disconnect_timeouts).
+                self.broadcast_update(
+                    participant_id,
+                    ParticipantStateUpdate::Disconnected {
+                        participant_id: participant_id.to_string(),
+                    },
+                )
+                .await;
+
+                info!(
+                    target: "mc.actor.meeting",
+                    meeting_id = %self.meeting_id,
+                    participant_id = %participant_id,
+                    "Participant disconnected, grace period started"
+                );
+            }
         }
+    }
+
+    /// Remove a participant from the roster and broadcast `ParticipantLeft`.
+    ///
+    /// The SINGLE roster-removal choke-point (ADR-0032 metric-path completeness):
+    /// every removal — clean-close, grace-timeout, explicit leave — flows through
+    /// here, so `mc_participant_leaves_total{reason}` is emitted exactly once per
+    /// removal and can never be broadcast-without-metric. Cleans up the
+    /// correlation/binding maps, cancels any live connection, decrements the GC
+    /// participant count, records the metric, then broadcasts.
+    async fn remove_and_broadcast_left(&mut self, participant_id: &str, reason: LeaveReason) {
+        let Some(participant) = self.participants.remove(participant_id) else {
+            return;
+        };
+
+        // Remove correlation and binding mappings (session recovery cleanup).
+        self.correlation_to_participant
+            .remove(&participant.correlation_id);
+        self.stored_bindings.remove(&participant.correlation_id);
+
+        // Cancel the connection if still active.
+        if let Some(conn_handle) = &participant.connection {
+            conn_handle.cancel();
+        }
+
+        // Decrement participant count for GC heartbeat reporting.
+        self.controller_metrics.decrement_participants();
+
+        // Record the leave (bounded reason label) at the single choke-point.
+        crate::observability::metrics::record_participant_leave(reason.label());
+
+        // Broadcast leave to the remaining participants.
+        self.broadcast_update(
+            participant_id,
+            ParticipantStateUpdate::Left {
+                participant_id: participant_id.to_string(),
+                reason,
+            },
+        )
+        .await;
     }
 
     /// Handle reconnection attempt.
@@ -861,34 +979,16 @@ impl MeetingActor {
     /// Handle participant leaving.
     #[instrument(skip_all, fields(meeting_id = %self.meeting_id))]
     async fn handle_leave(&mut self, participant_id: &str) -> Result<(), McError> {
-        if let Some(participant) = self.participants.remove(participant_id) {
+        if self.participants.contains_key(participant_id) {
             debug!(
                 target: "mc.actor.meeting",
                 "Participant leaving"
             );
 
-            // Remove correlation and binding mappings
-            self.correlation_to_participant
-                .remove(&participant.correlation_id);
-            self.stored_bindings.remove(&participant.correlation_id);
-
-            // Close connection if still active
-            if let Some(conn_handle) = &participant.connection {
-                conn_handle.cancel();
-            }
-
-            // Decrement participant count for GC heartbeat reporting
-            self.controller_metrics.decrement_participants();
-
-            // Broadcast leave
-            self.broadcast_update(
-                participant_id,
-                ParticipantStateUpdate::Left {
-                    participant_id: participant_id.to_string(),
-                    reason: LeaveReason::Voluntary,
-                },
-            )
-            .await;
+            // Explicit voluntary leave — remove via the single choke-point
+            // (emits mc_participant_leaves_total{reason="voluntary"}).
+            self.remove_and_broadcast_left(participant_id, LeaveReason::Voluntary)
+                .await;
 
             info!(
                 target: "mc.actor.meeting",
@@ -1068,8 +1168,14 @@ impl MeetingActor {
 
         self.is_shutting_down = true;
 
-        // Notify all participants
+        // Notify all participants. The meeting is being torn down, so the roster
+        // maps are dropped wholesale rather than removed one-by-one; emit the
+        // leave metric per participant so meeting-end departures are counted like
+        // every other removal (ADR-0032 metric-path completeness).
         for participant_id in self.participants.keys().cloned().collect::<Vec<_>>() {
+            crate::observability::metrics::record_participant_leave(
+                LeaveReason::MeetingEnded.label(),
+            );
             self.broadcast_update(
                 &participant_id,
                 ParticipantStateUpdate::Left {
@@ -1114,22 +1220,10 @@ impl MeetingActor {
                 "Disconnect grace period expired, removing participant"
             );
 
-            if let Some(participant) = self.participants.remove(&participant_id) {
-                self.correlation_to_participant
-                    .remove(&participant.correlation_id);
-
-                // Decrement participant count for GC heartbeat reporting
-                self.controller_metrics.decrement_participants();
-
-                self.broadcast_update(
-                    &participant_id,
-                    ParticipantStateUpdate::Left {
-                        participant_id: participant_id.clone(),
-                        reason: LeaveReason::Timeout,
-                    },
-                )
+            // Grace expired — remove via the single choke-point
+            // (emits mc_participant_leaves_total{reason="timeout"}).
+            self.remove_and_broadcast_left(&participant_id, LeaveReason::Timeout)
                 .await;
-            }
         }
     }
 
@@ -1168,9 +1262,17 @@ impl MeetingActor {
                     }
                 }
 
-                // Mark participant as disconnected
-                self.handle_disconnect(&conn_id, &managed.participant_id)
-                    .await;
+                // Mark participant as disconnected. A task that finished/panicked
+                // without a transport-classified clean close is an abrupt loss →
+                // ConnectionLost (grace-preserving). If the ParticipantActor's own
+                // exit notification (which carries the authoritative cause) already
+                // ran, this call is an idempotent no-op.
+                self.handle_disconnect(
+                    &conn_id,
+                    &managed.participant_id,
+                    DisconnectCause::ConnectionLost,
+                )
+                .await;
             }
         }
     }
@@ -1445,7 +1547,11 @@ mod tests {
 
         // Disconnect
         let _ = handle
-            .connection_disconnected("conn-1".to_string(), "part-1".to_string())
+            .connection_disconnected(
+                "conn-1".to_string(),
+                "part-1".to_string(),
+                DisconnectCause::ConnectionLost,
+            )
             .await;
 
         // Reconnect with valid binding token
@@ -1497,7 +1603,11 @@ mod tests {
 
         // Disconnect
         let _ = handle
-            .connection_disconnected("conn-1".to_string(), "part-1".to_string())
+            .connection_disconnected(
+                "conn-1".to_string(),
+                "part-1".to_string(),
+                DisconnectCause::ConnectionLost,
+            )
             .await;
 
         // Reconnect with invalid binding token
@@ -1722,7 +1832,11 @@ mod tests {
 
         // Disconnect the participant
         let _ = handle
-            .connection_disconnected("conn-1".to_string(), "part-1".to_string())
+            .connection_disconnected(
+                "conn-1".to_string(),
+                "part-1".to_string(),
+                DisconnectCause::ConnectionLost,
+            )
             .await;
 
         // Give actor time to process the disconnect message
@@ -1795,7 +1909,11 @@ mod tests {
 
         // Disconnect the participant
         let _ = handle
-            .connection_disconnected("conn-1".to_string(), "part-1".to_string())
+            .connection_disconnected(
+                "conn-1".to_string(),
+                "part-1".to_string(),
+                DisconnectCause::ConnectionLost,
+            )
             .await;
 
         // Give actor time to process
@@ -1818,6 +1936,129 @@ mod tests {
         assert_eq!(reconnect_result.participant_id, "part-1");
 
         // Verify participant is connected again
+        let state = handle.get_state().await.unwrap();
+        assert_eq!(state.participants.len(), 1);
+        assert_eq!(state.participants[0].status, ParticipantStatus::Connected);
+
+        handle.cancel();
+    }
+
+    /// Task #64: a CLEAN transport close (`DisconnectCause::ClientClosed`) removes
+    /// the participant from the roster IMMEDIATELY — the 30s grace period is
+    /// SKIPPED. Uses `start_paused`: the participant is gone without any time
+    /// being advanced past the grace window, which pins "grace skipped".
+    #[tokio::test(start_paused = true)]
+    async fn test_clean_close_skips_grace_removes_immediately() {
+        let metrics = ActorMetrics::new();
+        let controller_metrics = ControllerMetrics::new();
+        let cancel_token = CancellationToken::new();
+
+        let (handle, _task) = MeetingActor::spawn(
+            "meeting-clean-close-test".to_string(),
+            cancel_token.clone(),
+            metrics,
+            controller_metrics,
+            test_secret(),
+        );
+
+        // Join a participant.
+        let _ = handle
+            .connection_join(
+                "conn-1".to_string(),
+                "user-1".to_string(),
+                "part-1".to_string(),
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let state = handle.get_state().await.unwrap();
+        assert_eq!(state.participants.len(), 1);
+
+        // Clean transport close — user closed the tab.
+        let _ = handle
+            .connection_disconnected(
+                "conn-1".to_string(),
+                "part-1".to_string(),
+                DisconnectCause::ClientClosed,
+            )
+            .await;
+
+        // Give the actor time to process the disconnect message. NOTE: we do NOT
+        // advance past the 30s grace window — this small settle is only for
+        // mailbox processing under start_paused.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // Participant is GONE already (grace skipped) — not merely Disconnected.
+        let state = handle.get_state().await.unwrap();
+        assert_eq!(
+            state.participants.len(),
+            0,
+            "clean close must remove the participant immediately, skipping grace"
+        );
+
+        handle.cancel();
+    }
+
+    /// Task #64: an ABRUPT loss (`DisconnectCause::ConnectionLost`) must PRESERVE
+    /// the ADR-0023 grace period — the participant stays visible (Disconnected)
+    /// and a reconnect within grace still succeeds. Guards against the skip-grace
+    /// change regressing session recovery.
+    #[tokio::test(start_paused = true)]
+    async fn test_connection_lost_preserves_grace_and_allows_reconnect() {
+        let metrics = ActorMetrics::new();
+        let controller_metrics = ControllerMetrics::new();
+        let cancel_token = CancellationToken::new();
+
+        let (handle, _task) = MeetingActor::spawn(
+            "meeting-conn-lost-grace-test".to_string(),
+            cancel_token.clone(),
+            metrics,
+            controller_metrics,
+            test_secret(),
+        );
+
+        let join_result = handle
+            .connection_join(
+                "conn-1".to_string(),
+                "user-1".to_string(),
+                "part-1".to_string(),
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Abrupt loss — keep grace.
+        let _ = handle
+            .connection_disconnected(
+                "conn-1".to_string(),
+                "part-1".to_string(),
+                DisconnectCause::ConnectionLost,
+            )
+            .await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // Still present, but Disconnected (grace running) — NOT removed.
+        let state = handle.get_state().await.unwrap();
+        assert_eq!(state.participants.len(), 1);
+        assert_eq!(
+            state.participants[0].status,
+            ParticipantStatus::Disconnected
+        );
+
+        // Reconnect within grace still works (ADR-0023 preserved).
+        tokio::time::advance(Duration::from_secs(10)).await;
+        let reconnect_result = handle
+            .connection_reconnect(
+                "conn-2".to_string(),
+                join_result.correlation_id.clone(),
+                join_result.binding_token.clone(),
+            )
+            .await;
+        assert!(reconnect_result.is_ok());
+
         let state = handle.get_state().await.unwrap();
         assert_eq!(state.participants.len(), 1);
         assert_eq!(state.participants[0].status, ParticipantStatus::Connected);

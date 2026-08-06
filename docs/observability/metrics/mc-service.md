@@ -121,7 +121,15 @@ All MC service metrics follow ADR-0011 naming conventions with the `mc_` prefix.
 - **Cardinality**: Low (3 status values)
 - **Usage**: Monitor connection acceptance rate, capacity rejections, and connection errors
 - **Recorded in**: `server.rs` accept loop
-- **Alert**: `MCHighWebTransportRejections` (warning, rejection rate >10% for 5m)
+- **Scope of `error`**: Connection ESTABLISHMENT errors ONLY — session/stream accept,
+  first-message decode, JWT/join failures (i.e. the connection handler returns an
+  `McError` before or during join). A participant departing MID-SESSION (clean tab-close
+  or abrupt loss) is NOT an `error`; those are observed on
+  `mc_participant_disconnects_total` / `mc_participant_leaves_total` below. (Prior to
+  task #64, post-join transport read/write failures also bumped `status="error"`; that was
+  reclassified as a normal disconnect.)
+- **Alert**: `MCHighWebTransportRejections` (warning, rejection rate >10% for 5m — keys off
+  `status="rejected"`, unaffected by the `error`-scope change)
 - **Dashboard**: MC Overview - WebTransport Connections by Status (Join Flow row)
 
 ### `mc_jwt_validations_total`
@@ -252,6 +260,65 @@ which MC records on the participant actor.
 - **Recorded in**: `actors/participant.rs::handle_record_mh_statuses` (`cap`);
   `webtransport/connection.rs::handle_media_connection_update` (`over_limit`)
 - **Dashboard**: MC Overview - Dropped Client MH Status (cap)
+
+---
+
+## Participant Departure Metrics (task #64 — roster leave latency)
+
+These two counters make the disconnect/leave path observable, and distinguish a
+clean tab-close from a crash/network-loss departure. Both labels are bounded
+`&'static str`s mapped from internal enums via EXHAUSTIVE matches (a new variant is
+a compile error, never an unbounded or mislabeled series); neither is ever a
+client-controlled string, `mh_url`, participant-id, or raw close-reason text.
+
+### `mc_participant_disconnects_total`
+- **Type**: Counter
+- **Description**: Total participant transport disconnects, by transport-authenticated
+  cause, recorded at the moment the departure is detected (before the immediate-vs-grace
+  decision). Derived ONLY from the WebTransport `Connection::closed()` classification.
+- **Labels**:
+  - `cause`: `client_closed` (clean tab/app close → immediate removal, grace skipped),
+    `connection_lost` (idle-timeout/abrupt loss → grace period kept for reconnection),
+    `server_initiated` (local close: shutdown/drain/already-handled leave)
+- **Cardinality**: Low (3 causes)
+- **Usage**: Observe the idle-timeout path directly (otherwise hidden inside
+  `leaves{reason="timeout"}`), verify the configured `MC_QUIC_MAX_IDLE_TIMEOUT_SECONDS`
+  bound is firing, and derive reconnect rate:
+  `disconnects{connection_lost} − leaves{timeout} ≈ reconnected within grace`.
+  A `client_closed` disconnect always pairs with a `leaves{reason="voluntary"}`; a
+  `connection_lost` disconnect resolves LATER as either a reconnect or a
+  `leaves{reason="timeout"}`.
+- **Recorded in**: `actors/meeting.rs::handle_disconnect`
+
+### `mc_participant_leaves_total`
+- **Type**: Counter
+- **Description**: Total participant roster REMOVALS — one per `ParticipantLeft`
+  broadcast — by leave reason. Emitted at the single roster-removal choke-point, so a
+  `Left` broadcast can never occur without a matching increment.
+- **Labels**:
+  - `reason`: `voluntary` (clean transport close OR explicit leave — grace skipped),
+    `timeout` (disconnect grace period expired), `removed` (host-removed),
+    `meeting_ended` (meeting ended)
+  - **Emission honesty (ADR-0032 expected-vs-enforced):** `removed` is RESERVED —
+    the enum variant, the `Kicked` wire-map (`handler.rs`), and the exhaustive label
+    map are in place, but there is NO production emission site yet (no host-remove
+    handler routes through `remove_and_broadcast_left`). Today only `voluntary`,
+    `timeout`, and `meeting_ended` are actually emitted; `removed` will light up when
+    the host-remove path lands.
+- **Cardinality**: Low (4 reasons; `removed` reserved, see above)
+- **Usage**: A clean tab-close shows as `voluntary`; a crash/network-loss that did not
+  reconnect shows as `timeout`. A rising `timeout` share is the primary signal of
+  involuntary departures (network issues / crashes) — see the disconnect-reason runbook
+  section.
+- **Recorded in**: `actors/meeting.rs::remove_and_broadcast_left` (voluntary/timeout/removed)
+  and `actors/meeting.rs::handle_end_meeting` (meeting_ended)
+
+**Worst-case roster-remove latency (SSoT — derived from config, not a fixed number):**
+- Clean tab-close: ≈ network RTT (sub-second). `Connection::closed()` fires immediately
+  and the grace period is skipped.
+- Crash / network-loss: `MC_QUIC_MAX_IDLE_TIMEOUT_SECONDS` + `MC_DISCONNECT_GRACE_PERIOD_SECONDS`
+  + the 5s grace-check interval. With defaults: `10 + 30 + 5 = 45s`. See the MC incident
+  runbook for the operational budget + PromQL.
 
 ---
 
@@ -438,6 +505,25 @@ sum(rate(mc_mh_notifications_received_total[5m])) by (event_type)
 ### Token Refresh Failures by Reason
 ```promql
 sum(rate(mc_token_refresh_failures_total[5m])) by (error_type)
+```
+
+### Involuntary Departure Share (timeout leaves)
+```promql
+sum(rate(mc_participant_leaves_total{reason="timeout"}[5m])) /
+sum(rate(mc_participant_leaves_total[5m]))
+```
+A rising share indicates crashes / network loss (not clean tab-closes). Gate on a
+volume floor before alerting — see the MC incident runbook.
+
+### Disconnect Cause Breakdown
+```promql
+sum(rate(mc_participant_disconnects_total[5m])) by (cause)
+```
+
+### Reconnect Rate (within grace)
+```promql
+sum(rate(mc_participant_disconnects_total{cause="connection_lost"}[5m])) -
+sum(rate(mc_participant_leaves_total{reason="timeout"}[5m]))
 ```
 
 ---

@@ -417,6 +417,61 @@ pub fn record_participant_mh_status_dropped(reason: &str) {
 }
 
 // ============================================================================
+// Participant Departure Metrics (task #64 — roster leave latency)
+// ============================================================================
+
+/// Record a participant roster REMOVAL (one per `ParticipantLeft` broadcast).
+///
+/// Metric: `mc_participant_leaves_total`
+/// Labels: `reason`
+///
+/// Reason values: "voluntary", "timeout", "removed", "meeting_ended"
+/// Cardinality: 4 (bounded — the caller maps the internal `LeaveReason` enum via
+/// an EXHAUSTIVE match, so a new variant is a compile error, never an unbounded
+/// or mislabeled series). The label is a fixed `&'static str`, never a client
+/// string / `mh_url` / participant-id.
+///
+/// Emitted at the single roster-removal choke-point in `actors::meeting`:
+/// - `voluntary` — clean transport close (skip-grace) OR explicit leave
+/// - `timeout` — disconnect grace period expired (abrupt loss that did not reconnect)
+/// - `removed` — host-removed
+/// - `meeting_ended` — meeting ended
+///
+/// Distinguishes a clean tab-close (`voluntary`) from a crash/network-loss that
+/// timed out of grace (`timeout`).
+pub fn record_participant_leave(reason: &str) {
+    counter!("mc_participant_leaves_total",
+        "reason" => reason.to_string()
+    )
+    .increment(1);
+}
+
+/// Record a participant transport DISCONNECT (one per connection drop, at the
+/// moment the departure is detected — before the immediate-vs-grace decision).
+///
+/// Metric: `mc_participant_disconnects_total`
+/// Labels: `cause`
+///
+/// Cause values: "client_closed", "connection_lost", "server_initiated"
+/// Cardinality: 3 (bounded — the caller maps the internal `DisconnectCause` enum
+/// via an EXHAUSTIVE match). The label is a fixed `&'static str`, derived ONLY
+/// from the transport-authenticated `Connection::closed()` classification — never
+/// from a client-controlled close error-code / reason string.
+///
+/// This is a DIFFERENT event from a terminal leave (a `connection_lost` disconnect
+/// may later reconnect within grace instead of producing a `timeout` leave), so it
+/// does not double-count leaves. It makes the idle-timeout path observable (which
+/// is otherwise hidden inside `mc_participant_leaves_total{reason="timeout"}`) and
+/// lets reconnect rate be derived
+/// (`disconnects{connection_lost} − leaves{timeout} ≈ reconnected`).
+pub fn record_participant_disconnect(cause: &str) {
+    counter!("mc_participant_disconnects_total",
+        "cause" => cause.to_string()
+    )
+    .increment(1);
+}
+
+// ============================================================================
 // gRPC Auth Layer 2 Metrics (ADR-0003)
 // ============================================================================
 
@@ -969,6 +1024,73 @@ mod tests {
         snap.counter("mc_participant_mh_status_dropped_total")
             .with_labels(&[("reason", "over_limit")])
             .assert_delta(1);
+    }
+
+    #[test]
+    fn metrics_module_emits_participant_departure_cluster() {
+        let snap = MetricAssertion::snapshot();
+
+        // Leaves — every bounded reason (task #64).
+        record_participant_leave("voluntary");
+        record_participant_leave("timeout");
+        record_participant_leave("removed");
+        record_participant_leave("meeting_ended");
+
+        // Disconnects — every bounded cause.
+        record_participant_disconnect("client_closed");
+        record_participant_disconnect("connection_lost");
+        record_participant_disconnect("server_initiated");
+
+        for reason in ["voluntary", "timeout", "removed", "meeting_ended"] {
+            snap.counter("mc_participant_leaves_total")
+                .with_labels(&[("reason", reason)])
+                .assert_delta(1);
+        }
+        for cause in ["client_closed", "connection_lost", "server_initiated"] {
+            snap.counter("mc_participant_disconnects_total")
+                .with_labels(&[("cause", cause)])
+                .assert_delta(1);
+        }
+    }
+
+    #[test]
+    fn metrics_module_participant_leave_reason_adjacency() {
+        // Label-swap-bug catcher (ADR-0032 §Pattern #3): a single reason bumps
+        // ONLY its own series; every sibling stays at delta 0.
+        for reason in ["voluntary", "timeout", "removed", "meeting_ended"] {
+            let snap = MetricAssertion::snapshot();
+            record_participant_leave(reason);
+            snap.counter("mc_participant_leaves_total")
+                .with_labels(&[("reason", reason)])
+                .assert_delta(1);
+            for sibling in ["voluntary", "timeout", "removed", "meeting_ended"] {
+                if sibling == reason {
+                    continue;
+                }
+                snap.counter("mc_participant_leaves_total")
+                    .with_labels(&[("reason", sibling)])
+                    .assert_delta(0);
+            }
+        }
+    }
+
+    #[test]
+    fn metrics_module_participant_disconnect_cause_adjacency() {
+        for cause in ["client_closed", "connection_lost", "server_initiated"] {
+            let snap = MetricAssertion::snapshot();
+            record_participant_disconnect(cause);
+            snap.counter("mc_participant_disconnects_total")
+                .with_labels(&[("cause", cause)])
+                .assert_delta(1);
+            for sibling in ["client_closed", "connection_lost", "server_initiated"] {
+                if sibling == cause {
+                    continue;
+                }
+                snap.counter("mc_participant_disconnects_total")
+                    .with_labels(&[("cause", sibling)])
+                    .assert_delta(0);
+            }
+        }
     }
 
     #[test]

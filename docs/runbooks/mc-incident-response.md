@@ -25,6 +25,7 @@
    - [Scenario 11: Media Connection Failures](#scenario-11-media-connection-failures)
    - [Scenario 12: RegisterMeeting Coordination Failures](#scenario-12-registermeeting-coordination-failures)
    - [Scenario 13: Unexpected MH Notifications](#scenario-13-unexpected-mh-notifications)
+   - [Scenario 14: Elevated Involuntary Departures / Slow Roster Removal](#scenario-14-elevated-involuntary-departures--slow-roster-removal)
 4. [Diagnostic Commands](#diagnostic-commands)
 5. [Recovery Procedures](#recovery-procedures)
 6. [Postmortem Template](#postmortem-template)
@@ -969,8 +970,15 @@ kubectl top pods -n dark-tower -l app=mc-service
    - Check: MC logs for TLS handshake errors mentioning SNI
    - Fix: Verify DNS resolution and client connection URL
 
-6. **Transport-Level Errors** (`status="error"`): Network interruptions, malformed QUIC packets
-   - Check: `mc_webtransport_connections_total{status="error"}` rate
+6. **Transport-Level Establishment Errors** (`status="error"`): connection-SETUP failures
+   only — malformed QUIC handshake packets, accept/decode failures during session
+   establishment. As of task #64 this label is establishment-scoped: mid-session
+   transport loss (network interruptions after join) NO LONGER lands here — it now
+   surfaces on `mc_participant_disconnects_total{cause="connection_lost"}` (see Scenario 14).
+   - Check: `mc_webtransport_connections_total{status="error"}` rate for establishment errors
+   - For mid-session drops (participants disappearing after joining), do NOT rely on
+     `{status="error"}` — check `mc_participant_disconnects_total{cause="connection_lost"}`
+     per Scenario 14 instead.
    - Fix: Investigate network path; may indicate DDoS or network instability
 
 **Remediation**:
@@ -1485,6 +1493,82 @@ Expected recovery time: branch-dependent. Operational drift self-heals over the 
 **Related Alerts**: `MCActorPanic` (if a MeetingActor crashed and lost registry state), MH-side `MHCallerTypeRejected` (Layer 2 caller-type rejections — would indicate misbehaving services that did NOT clear Layer 2; this scenario is the complementary branch where Layer 2 was passed); MH-side [Scenario 10: MH→MC Notification Failures](mh-incident-response.md#scenario-10-mhmc-notification-failures) (the *sender-side* view of the same RPC pair).
 
 **Dashboards**: MC Overview → MH-coordination row notification panels (if present); rely on log-based triage (target `mc.grpc.media_coordination`) for source-identity attribution since the metric has no `source_id` label today.
+
+---
+
+### Scenario 14: Elevated Involuntary Departures / Slow Roster Removal
+
+**Symptom**: Users report the roster is slow to drop a participant who left, OR
+`mc_participant_leaves_total{reason="timeout"}` is an unusually high share of all leaves.
+
+**Background — expected roster-remove latency (task #64).** The MC removes a participant
+from the roster on one of two paths:
+
+- **Clean tab-close** (WebTransport `Connection::closed()` → `ApplicationClosed`/`ConnectionClosed`):
+  removed IMMEDIATELY, grace skipped → `ParticipantLeft{Voluntary}`. Expected latency ≈
+  network RTT (sub-second).
+- **Crash / network-loss** (only the QUIC idle timeout can detect it): the participant
+  enters the ADR-0023 grace period (for reconnection) and is removed only when grace
+  expires → `ParticipantLeft{Timeout}`.
+
+**Worst-case roster-remove latency is DERIVED from config (single source of truth):**
+
+```
+worst_case_crash_removal =
+    MC_QUIC_MAX_IDLE_TIMEOUT_SECONDS      (idle-timeout detection; default 10s)
+  + MC_DISCONNECT_GRACE_PERIOD_SECONDS    (ADR-0023 reconnection grace; default 30s)
+  + 5s                                    (grace-check tick interval, code constant)
+```
+
+With defaults: **10 + 30 + 5 = 45 seconds**. If either env var is overridden, recompute
+from the pod's actual values (`kubectl exec ... env | grep -E 'MC_QUIC_MAX_IDLE_TIMEOUT_SECONDS|MC_DISCONNECT_GRACE_PERIOD_SECONDS'`).
+`MC_QUIC_MAX_IDLE_TIMEOUT_SECONDS` is operator-overridable (fail-loud: an invalid or `0`
+value crashes the pod at startup rather than silently reverting to a library default);
+the grace period is a code constant today.
+
+Why 10s idle: it is a DETECTION timeout, not an eject timer. A server keep-alive interval
+(idle/3 ≈ 3.3s) keeps a healthy-but-quiet connection alive, so a live participant is never
+spuriously ejected; the 30s grace then absorbs genuine transient blips (reconnection).
+
+**Triage**:
+
+```promql
+# Involuntary-departure share. Gate on a volume floor so a tiny all-crash meeting
+# doesn't read as a 100% incident.
+(
+  sum(rate(mc_participant_leaves_total{reason="timeout"}[5m])) /
+  sum(rate(mc_participant_leaves_total[5m]))
+) > 0.5
+and
+sum(rate(mc_participant_leaves_total[5m])) > 0.1
+```
+
+```promql
+# Disconnect cause breakdown — the oncall discriminator:
+sum(rate(mc_participant_disconnects_total[5m])) by (cause)
+```
+
+- `connection_lost` rising while `leaves{timeout}` stays flat → clients are dropping and
+  RECONNECTING within grace (transient network churn — usually healthy; check client
+  network / LB idle timeouts).
+- `connection_lost` AND `leaves{timeout}` rising together → genuine involuntary departures
+  (crashes / hard network loss). Investigate client stability, pod health, and whether
+  `MC_QUIC_MAX_IDLE_TIMEOUT_SECONDS` is misconfigured too LOW (would eject healthy quiet
+  sessions — cross-check that `keep_alive` < idle in the `"QUIC idle timeout + keep-alive
+  configured"` startup log).
+- `client_closed` dominates → normal (clean tab-closes); no action.
+
+**If roster removal is slower than the derived worst case**: the idle timeout may not be
+taking effect. Confirm the startup log line `QUIC idle timeout + keep-alive configured`
+shows the expected `idle_timeout_secs`; if absent, the pod is running an older image
+without task #64.
+
+**Alert**: No formal alert this iteration — thresholds pending a production baseline (owned
+by Observability/Operations follow-up). Surfaces via the PromQL above and the MC Overview
+departure panels.
+
+**Escalation**: MC Team for a genuine involuntary-departure spike; Operations if a
+misconfigured `MC_QUIC_MAX_IDLE_TIMEOUT_SECONDS` is suspected.
 
 ---
 

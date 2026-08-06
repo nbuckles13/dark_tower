@@ -15,11 +15,12 @@ use crate::errors::McError;
 
 use super::meeting::MeetingActorHandle;
 use super::messages::{
-    BoundedMhStatus, ParticipantMessage, ParticipantStateUpdate, SignalingPayload,
+    BoundedMhStatus, DisconnectCause, ParticipantMessage, ParticipantStateUpdate, SignalingPayload,
 };
 use super::metrics::{ActorMetrics, ActorType, MailboxMonitor};
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -46,6 +47,15 @@ pub struct ParticipantActorHandle {
     cancel_token: CancellationToken,
     connection_id: String,
     participant_id: String,
+    /// Lock-free cell carrying the transport-authenticated disconnect cause from
+    /// the WebTransport bridge loop to the actor's exit notification. The bridge
+    /// loop stores the cause (Release) BEFORE it cancels the actor; the actor's
+    /// run-loop tail loads it (Acquire) and forwards it to the meeting. Shared
+    /// memory, so there is no mailbox-vs-cancel ordering race. Initialized to `0`,
+    /// which [`DisconnectCause::from_u8`] decodes to the grace-preserving
+    /// `ConnectionLost` (fail-safe: a cancel that races ahead of any store can
+    /// never eject a participant without grace).
+    disconnect_cause: Arc<AtomicU8>,
 }
 
 impl ParticipantActorHandle {
@@ -112,6 +122,18 @@ impl ParticipantActorHandle {
             .map_err(|e| McError::Internal(format!("response receive failed: {e}")))
     }
 
+    /// Record the transport-authenticated disconnect cause for this connection.
+    ///
+    /// MUST be called BEFORE [`cancel`](Self::cancel) so the actor's exit
+    /// notification carries the right cause. Stored with `Release`; the actor
+    /// reads it with `Acquire` after observing cancellation. Idempotent (last
+    /// write wins). Only the WebTransport bridge loop calls this, with a cause
+    /// derived from `Connection::closed()` — never from a client payload.
+    pub fn set_disconnect_cause(&self, cause: DisconnectCause) {
+        self.disconnect_cause
+            .store(cause.as_u8(), Ordering::Release);
+    }
+
     /// Cancel the participant actor.
     pub fn cancel(&self) {
         self.cancel_token.cancel();
@@ -152,6 +174,10 @@ pub struct ParticipantActor {
     /// truncated `mh_url`. Bounded to `MAX_MH_STATUSES_PER_PARTICIPANT` distinct
     /// keys; only ever holds truncated, bounded values.
     mh_statuses: HashMap<String, BoundedMhStatus>,
+    /// Shared disconnect-cause cell (see [`ParticipantActorHandle::disconnect_cause`]).
+    /// Read once on exit to tell the meeting whether to skip or keep the grace
+    /// period.
+    disconnect_cause: Arc<AtomicU8>,
 }
 
 impl ParticipantActor {
@@ -239,6 +265,10 @@ impl ParticipantActor {
     ) -> (ParticipantActorHandle, JoinHandle<()>) {
         let (sender, receiver) = mpsc::channel(PARTICIPANT_CHANNEL_BUFFER);
 
+        // Shared cause cell. `0` decodes to the grace-preserving ConnectionLost
+        // (fail-safe default); the bridge loop overwrites it before cancelling.
+        let disconnect_cause = Arc::new(AtomicU8::new(0));
+
         let actor = Self {
             connection_id: connection_id.clone(),
             participant_id: participant_id.clone(),
@@ -251,6 +281,7 @@ impl ParticipantActor {
             stream_tx,
             meeting_handle,
             mh_statuses: HashMap::new(),
+            disconnect_cause: Arc::clone(&disconnect_cause),
         };
 
         let task_handle = tokio::spawn(actor.run());
@@ -260,6 +291,7 @@ impl ParticipantActor {
             cancel_token,
             connection_id,
             participant_id,
+            disconnect_cause,
         };
 
         (handle, task_handle)
@@ -323,16 +355,24 @@ impl ParticipantActor {
             }
         }
 
-        // Notify meeting of disconnect before stopping
+        // Notify meeting of disconnect before stopping, carrying the
+        // transport-authenticated cause set by the bridge loop (defaults to the
+        // grace-preserving ConnectionLost if none was set).
         if let Some(meeting_handle) = &self.meeting_handle {
+            let cause = DisconnectCause::from_u8(self.disconnect_cause.load(Ordering::Acquire));
             debug!(
                 target: "mc.actor.participant",
                 connection_id = %self.connection_id,
                 participant_id = %self.participant_id,
+                cause = %cause.label(),
                 "Notifying meeting of disconnect"
             );
             let _ = meeting_handle
-                .connection_disconnected(self.connection_id.clone(), self.participant_id.clone())
+                .connection_disconnected(
+                    self.connection_id.clone(),
+                    self.participant_id.clone(),
+                    cause,
+                )
                 .await;
         }
 
@@ -529,6 +569,7 @@ mod tests {
             stream_tx: None,
             meeting_handle: None,
             mh_statuses: HashMap::new(),
+            disconnect_cause: Arc::new(AtomicU8::new(0)),
         }
     }
 
