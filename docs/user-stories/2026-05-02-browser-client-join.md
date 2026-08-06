@@ -1282,4 +1282,90 @@ tasks:
     suites stay green. Out of scope: advisory-attribution set-diffs (deferred as
     over-engineering), suppression-machinery changes, and unblocking whatever
     specific advisory is currently red. Run paired with infrastructure.
+- id: 60
+  status: pending
+  specialist: test
+  env_tests: true
+  deps:
+  - 18
+  - 19
+  prompt: |
+    Close four browser E2E coverage gaps identified during the pre-close manual
+    test-plan review (docs/user-stories/2026-05-02-browser-client-join-manual-test-plan.md
+    section Promote-to-E2E verdicts). All work lives in packages/web-app/e2e/
+    plus one small SDK-side bus addition. Follow the existing suite conventions
+    exactly: retries=0 (a flaky test is fixed or deleted per ADR-0028), workers=1,
+    counter assertions via mcMetrics.ts baseline-delta pattern, credentials as
+    per-run throwaways, no cert-bypass flags, respect the 4-registrations-per-run
+    budget across the WHOLE suite after these additions.
+    (1) Distinct-user two-party join: extend the happy-path spec (or add a spec)
+    where the second browser context registers a genuinely DIFFERENT account
+    (not signInViaUi of the same user) and joins the same meeting. Assert both
+    participant ids distinct AND the first context sees a participantJoined for
+    the second user. Budget note: this adds one registration - rebalance other
+    specs to fixture bootstrap if the budget would be exceeded.
+    (2) ParticipantLeft / teardown / rejoin: add a participantLeft event to the
+    dev-only replay bus (packages/web-app/src/lib/e2eBus.ts, gated by
+    __E2E_HOOKS__ like existing events, mirroring the ParticipantLeft signaling
+    message the SDK already receives). Then: close the second context, assert
+    the first context receives participantLeft for the departed id, assert
+    mc_connections_active (or an equivalent MC counter via mcMetrics.ts)
+    reflects the departure, then rejoin from a fresh context and assert a NEW
+    participant id and a joined event (clean re-entry).
+    (3) Join-after-error recovery: append to each of the three negative specs
+    (auth-rejection, meeting-not-found, mc-token-rejection) a recovery tail -
+    after the asserted failure, perform a valid join in the SAME page session
+    without reload and assert joined. For mc-token-rejection, the recovery join
+    must run WITHOUT the route rewrite active.
+    (4) Rendered-roster DOM assertion: in the two-party test, assert the
+    participant roster DOM (via testid) shows both participants with correct
+    display names - tying bus truth to rendered UI. If the demo page lacks a
+    roster testid, add one (data-testid on the existing roster list element;
+    presentation-only change, no logic).
+    Out of scope: guest join (no guest UI this story), media-frame assertions
+    (no media plane this story), telemetry-emission tests (pending Phase 5
+    manual finding), reconnection tests (no reconnection logic this story).
+- id: 61
+  status: pending
+  specialist: infrastructure
+  env_tests: false
+  deps: []
+  prompt: |
+    Toolchain-pin cleanup after the host dev-env failure of 2026-08-05: the
+    vite 8 / rolldown 1.2.1 upgrade (commit 511d201) raised the Node engines
+    floor to >=22.12.0, but .nvmrc still pins 22.11.0. pnpm under 22.11.0
+    SILENTLY skips the engines-mismatched optional native binding
+    (@rolldown/binding-linux-x64-gnu), so pnpm install succeeds and vite then
+    crashes at launch with cannot-find-native-binding. The devloop container
+    was unaffected because its Dockerfile installs unpinned latest Node 22.x -
+    a three-way pin drift (.nvmrc vs Dockerfile vs lockfile engines).
+    (1) Bump .nvmrc to a Node version satisfying the workspace lockfile engines
+    floor (>=22.12.0); prefer parity with what the devloop container actually
+    runs (check node --version in the current image).
+    (2) Add engine-strict=true to the repo .npmrc so an engines-mismatched
+    install FAILS LOUDLY at pnpm install instead of silently skipping optional
+    deps (fail-loudly convention; this converts the whole failure class from
+    runtime crash to actionable install error).
+    (3) Pin the devloop container Node: replace the floating NodeSource
+    setup_22.x install in infra/devloop/Dockerfile with a version derived from
+    .nvmrc (build ARG plumbed by devloop.sh from .nvmrc, or an explicit
+    apt/nodesource version pin with a comment naming .nvmrc as SSoT). In-tree
+    edit only; note the image rebake as the remaining host-side action in the
+    devloop output.
+    (4) dev-web.sh preflight: add a bundler-load probe after the version
+    checks - verify the installed tree can actually load the bundler (e.g.
+    resolve/import rolldown or run vite --version via the workspace) and HARD
+    FAIL with a message naming the engines/pin mismatch and the reinstall
+    remedy. The preflight previously validated node-matches-.nvmrc, which
+    enforced the WRONG pin confidently.
+    (5) docs/runbooks/client-dev-local.md: add failure mode F10 (engines-skipped
+    optional binding: symptom cannot-find-native-binding at vite launch, cause
+    Node below lockfile engines floor, fix nvm install per .nvmrc + rm -rf
+    node_modules + pnpm install). Also fix the section 7 doc drift: it still
+    says no Playwright E2E exists, stale since tasks 18/19 landed the suite.
+    (6) Add a docs/TODO.md entry under Developer Experience for a node-pin
+    drift guard (dt-guard subcommand asserting .nvmrc, the Dockerfile pin, and
+    the workspace lockfile engines floor agree - same pattern as the existing
+    Playwright-pin guard entry; genuinely task-sized, tracked not done here).
+    Out of scope: implementing the drift guard itself; rebaking the image.
 ```
