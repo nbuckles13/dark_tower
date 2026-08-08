@@ -1,7 +1,7 @@
 # User Story: Browser Client — Account Creation and Meeting Join
 
 **Date**: 2026-05-02
-**Status**: Ready for Review
+**Status**: Complete
 **Participants**: client, auth-controller, global-controller, meeting-controller, media-handler, database, protocol, infrastructure, security, test, observability, operations
 **Predecessors**: [Meeting Join Flow](2026-03-21-meeting-join.md), [Client-to-MH QUIC Connection](2026-04-12-mh-quic-connection.md)
 **ADR**: [ADR-0028 Client Architecture](../decisions/adr-0028-client-architecture.md)

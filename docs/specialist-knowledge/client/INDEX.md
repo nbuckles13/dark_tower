@@ -7,25 +7,64 @@
 - Observability standards → ADR-0011
 - Guards methodology → ADR-0015
 - Test strategy → ADR-0005
+- Debate record → `docs/debates/2026-02-28-client-architecture/debate.md`
 
-## Code Locations (Planned)
-- SDK core package → `packages/sdk-core/`
-- Svelte adapter package → `packages/sdk-svelte/`
-- Web application → `packages/web-app/`
-- Shared test utilities → `packages/test-utils/`
-- WASM crates (MLS) → `crates/browser-wasm/`
-- Protobuf-es generated types → `packages/sdk-core/src/proto/`
+## SDK Core (`packages/sdk-core/src/`)
+- Signaling client (proto ServerMessage → events) → `signaling/SignalingClient.ts`
+- Meeting session (event bridge, single-use per join) → `session/MeetingSession.ts`
+- Binary media frame codec → `framing/`
+- WebCodecs encode/decode → `media/`
+- WebTransport connection mgmt → `transport/`
+- HTTP/3 meeting API client → `http/`
+- Error taxonomy (`SdkErrorCode`) → `errors/`
+- Protobuf-es generated types → `proto/dark_tower/`
+
+## Svelte Adapter (`packages/sdk-svelte/src/`)
+- Roster/participant store (seeded from `existingParticipants`, excludes self) → `stores/MeetingStore.svelte.ts`
+- Session-to-store binding → `stores/bindMeetingSession.ts`
+
+## Web Application (`packages/web-app/src/`)
+- Roster DOM (`participant-list` / `participant-${id}` testids) → `views/JoinMeeting.svelte`
+- Auth/meeting views → `views/{SignIn,SignUp,CreateMeeting}.svelte`
+- E2E event bus (whitelist projection of SDK events) → `lib/e2eBus.ts`
+- Session wiring, config, error text → `lib/{session,config,errorText}.ts`
+- Vite proxy + E2E-hook / cert-fingerprint plumbing → `packages/web-app/vite.config.ts`, `packages/web-app/vite/fingerprints.ts`
+
+## Client Telemetry (`packages/sdk-core/src/telemetry/`)
+- OTel metrics sink / noop → `OtelMetricsSink.ts`, `NoopMetricsSink.ts`
+- Trace propagation → `tracePropagation.ts`
+- Close-reason classification → `closeReason.ts`
+- Structured logger + name redaction guard → `logger.ts`, `nameGuard.ts`
+
+## Browser E2E Harness (`packages/web-app/e2e/`)
+- Shared fixtures/helpers (auth, roster asserts, recovery, shared-user memo) → `fixtures.ts`
+- MC metric assertions (baseline-delta, `pollUntilSumAbove`) → `mcMetrics.ts`
+- Specs (happy-path, negative, recovery tails) → `*.spec.ts`
+- Env/global setup → `env.ts`, `global-setup.ts`
+- Budgets & assertion catalog → `packages/web-app/e2e/README.md`
+- Playwright config (retries=0, workers=1) → `packages/web-app/playwright.config.ts`
+- Browser E2E pipeline lane (Layer 7) → `scripts/layer7.sh`
+
+## Client Test Utilities (`packages/test-utils/src/`)
+- Mock transport → `MockWebTransport.ts`
+- Test token builder → `TestTokenBuilder.ts`, `token-claims.ts`
+- Metrics sink contract + in-memory / OTLP mocks → `contracts/MetricsSink.ts`, `InMemoryMetricsSink.ts`, `MockOTLPExporter.ts`
+- Deterministic id generator → `deterministic-ids.ts`
 
 ## Protocol Integration
 - Signaling proto (client-server) → `proto/dark_tower/signaling/v1/signaling.proto`
 - 42-byte binary frame format → `crates/media-protocol/src/frame.rs`
 - Cross-language test vectors → `proto/test-vectors/`
-- Protobuf-es codegen → `@bufbuild/protobuf-es` (wire compatible with Rust prost)
+- Protobuf-es codegen (wire-compatible with Rust prost) → `@bufbuild/protobuf-es`
+- Meeting-token `display_name` claim (roster names) → `crates/common/src/jwt.rs:MeetingTokenClaims`
 
 ## Observability
 - Client alert rules → `client-alerts.yaml`
 - Client dashboards → `client-overview.json`, `client-slo.json`, `client-synthetic.json`
 
-## CI & Deployment
+## Toolchain & Build
+- Node version SSoT (`.nvmrc`; enforced via `.npmrc` engine-strict + `package.json` engines.node) → `.nvmrc`
+- pnpm transitive-security overrides → `package.json:pnpm.overrides`
+- Dev-web preflight (rolldown-binding probe) → `scripts/dev-web.sh`
+- Devloop image Node pin (reads `.nvmrc`) → `infra/devloop/Dockerfile`
 - Client CI workflow → `.github/workflows/ci-client.yml`
-- Debate record → `docs/debates/2026-02-28-client-architecture/debate.md`

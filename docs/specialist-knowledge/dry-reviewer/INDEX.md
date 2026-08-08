@@ -21,6 +21,7 @@
 - GC thin wrapper -> `crates/gc-service/src/auth/jwt.rs` (ServiceClaims, UserClaims)
 - MC thin wrapper -> `crates/mc-service/src/auth/mod.rs` (MeetingTokenClaims, GuestTokenClaims)
 - MH JWKS config -> `infra/services/mh-service/configmap.yaml:AC_JWKS_URL` (shared configmap, mirrors MC pattern in `mc-service-config`)
+- Display-name join carrier (AC resolves -> shared claim -> MC consumes) -> `crates/ac-service/src/handlers/internal_tokens.rs:resolve_meeting_display_name`, `crates/common/src/jwt.rs:MeetingTokenClaims` (`display_name` field, GSA); AC-local serialize-only copy lockstep -> `docs/TODO.md` #53
 
 ## Per-Service Observability (Metrics & Dashboards)
 - AC/GC/MC/MH metrics -> `crates/*/src/observability/metrics.rs` (per-service, not duplication); paired MC↔MH notification counters (`mc_mh_notifications_received_total` ↔ `mh_mc_notifications_total`) — different sender/receiver perspectives, not duplication
@@ -36,6 +37,7 @@
 - env-tests (cluster integration) -> `crates/env-tests/tests/`; MH QUIC E2E (R-33) -> `crates/env-tests/tests/26_mh_quic.rs`; join flow -> `:24_join_flow.rs`
 - AC tests (13 cluster files) -> `crates/ac-service/tests/*_integration.rs`; in-crate scaffolding -> `crates/ac-service/tests/common/`; GC scaffolding -> `crates/gc-service/tests/common/jwt_fixtures.rs`
 - Shared fixtures (cross-service) -> `crates/{ac,gc,mc}-test-utils/src/`; MetricAssertion -> `crates/common/src/observability/testing.rs`
+- Browser E2E harness (Playwright, shared fixtures reused across loops) -> `packages/web-app/e2e/`: topology/config `env.ts:describeEnv`/`loopbackBaseUrl`; auth+join fixtures `fixtures.ts` (`captureResponse`, `authAsSharedUser`, `joinAsUser`/`waitForJoined`, hoisted wire-path consts); single MC-PromQL home `mcMetrics.ts:pollUntilSumAbove`; division-of-responsibility vs `crates/env-tests/tests/` -> `packages/web-app/e2e/README.md` (ADR-0028); sdk-core wire-path barrel extraction candidate -> `docs/TODO.md`
 
 ## Per-Service Config Parsing
 - AC/GC/MC/MH config -> `crates/*/src/config.rs:Config::from_vars()` (per-service); ordinal parsing -> `crates/common/src/config.rs:parse_statefulset_ordinal()`; extraction candidate: `generate_instance_id(prefix)` -> 4-line pattern in GC + MC + MH config

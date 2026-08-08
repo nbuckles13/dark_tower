@@ -9,13 +9,14 @@
 
 ## Code Locations
 - Service entry point → `crates/mc-service/src/main.rs`
-- Config (SecretString, env loading, ac_jwks_url, TLS paths, advertise addresses) → `crates/mc-service/src/config.rs`
+- Config (SecretString, env loading, ac_jwks_url, TLS paths, advertise addresses, quic_max_idle_timeout_seconds) → `crates/mc-service/src/config.rs`
 - Error types (McError hierarchy, From<JwtError>, MhAssignmentMissing) → `crates/mc-service/src/errors.rs`
 - Auth: McJwtValidator, validate_meeting_token, validate_guest_token → `crates/mc-service/src/auth/mod.rs`
 - Actors: controller, meeting, participant, messages, session (HMAC/HKDF), metrics → `crates/mc-service/src/actors/`
-- WebTransport: server (accept loop, TLS, capacity) → `crates/mc-service/src/webtransport/server.rs`
-- WebTransport: connection (join flow, bridge loop, MediaConnectionUpdate handler — Task #2 stub pending Task #6 per-MH state recording) → `crates/mc-service/src/webtransport/connection.rs`
-- WebTransport: async RegisterMeeting trigger (R-12, first participant) → `crates/mc-service/src/webtransport/connection.rs:register_meeting_with_handlers()`
+- Join display-name plumbing: boundary truncate (connection.rs) → `display_name` field on `JoinConnection`/`ConnectionJoin` (messages.rs) → empty-claim fallback sink → `crates/mc-service/src/actors/meeting.rs:handle_join()`
+- Disconnect cause / leave latency: `DisconnectCause` enum → `crates/mc-service/src/actors/messages.rs`; skip-grace on clean close + `remove_and_broadcast_left()` choke-point → `crates/mc-service/src/actors/meeting.rs:handle_disconnect()`; cause-cell (AtomicU8) → `crates/mc-service/src/actors/participant.rs`
+- WebTransport: server (accept loop, TLS, capacity; config-driven max_idle_timeout/keep_alive for crash detection in `bind()`) → `crates/mc-service/src/webtransport/server.rs`
+- WebTransport: connection (join flow, bridge loop, Connection::closed() watch + classify_connection_error, MediaConnectionUpdate handler; async RegisterMeeting trigger R-12 in `register_meeting_with_handlers()`) → `crates/mc-service/src/webtransport/connection.rs`
 - WebTransport: handler (encode_participant_update) → `crates/mc-service/src/webtransport/handler.rs`
 - gRPC: GC client (registration, heartbeats, advertise) → `crates/mc-service/src/grpc/gc_client.rs`
 - gRPC: MC service (AssignMeetingWithMh) → `crates/mc-service/src/grpc/mc_service.rs`
@@ -26,7 +27,7 @@
 - Redis: fenced client + MhAssignmentStore trait + MhAssignmentData (handlers Vec) → `crates/mc-service/src/redis/client.rs`
 - Redis: Lua scripts (atomic fencing) → `crates/mc-service/src/redis/lua_scripts.rs`
 - Health/readiness, system info → `crates/mc-service/src/observability/health.rs`, `crates/mc-service/src/system_info.rs`
-- Prometheus metric wrappers (record_register_meeting, record_mh_notification, record_webtransport_connection, record_jwt_validation, record_session_join, record_token_refresh_metrics) → `crates/mc-service/src/observability/metrics.rs`
+- Prometheus metric wrappers (record_register_meeting, record_mh_notification, record_webtransport_connection, record_jwt_validation, record_session_join, record_token_refresh_metrics, record_participant_leave, record_participant_disconnect, record_display_name_resolution) → `crates/mc-service/src/observability/metrics.rs`
 - MC metrics catalog → `docs/observability/metrics/mc-service.md`
 
 ## Protocols
@@ -50,7 +51,7 @@
 - Join flow tests (TestServer, MockMhRegistrationClient.wait_for_calls, multi-MH and skip-grpc-endpoint cases) → `crates/mc-service/tests/join_tests.rs`
 - Accept-loop status + per-failure-class drilldown → `crates/mc-service/tests/webtransport_accept_loop_integration.rs`
 - gRPC auth-layer per-failure-reason → `crates/mc-service/tests/auth_layer_integration.rs`
-- Media coordination notifications + connect/disconnect round-trip → `crates/mc-service/tests/media_coordination_integration.rs`
+- Media coordination notifications + connect/disconnect round-trip → `crates/mc-service/tests/media_coordination_integration.rs`; leave/disconnect counter deltas + ParticipantLeft wire frames → `crates/mc-service/tests/disconnect_latency_integration.rs`
 - RegisterMeeting metrics (stub MH gRPC) → `crates/mc-service/tests/register_meeting_integration.rs`
 - ActorMetrics / MailboxMonitor metrics → `crates/mc-service/tests/actor_metrics_integration.rs`
 - Redis-class wrapper coverage → `crates/mc-service/tests/redis_metrics_integration.rs`
@@ -70,5 +71,5 @@
 - K8s network policy (MH ingress on 50052) → `infra/services/mc-service/network-policy.yaml`
 - Grafana dashboard → `infra/grafana/dashboards/mc-overview.json`
 - Prometheus alert rules → `infra/docker/prometheus/rules/mc-alerts.yaml`
-- Incident runbook (Sc 12 RegisterMeeting, Sc 13 unexpected MH notifications) → `docs/runbooks/mc-incident-response.md`
+- Incident runbook (Sc 12 RegisterMeeting, Sc 13 unexpected MH notifications, Sc 14 roster-remove latency budget) → `docs/runbooks/mc-incident-response.md`
 - Deployment runbook (post-deploy MC↔MH coordination addendum) → `docs/runbooks/mc-deployment.md`

@@ -29,21 +29,21 @@
 - Kind cluster config (static + dynamic template) -> `infra/kind/kind-config.yaml`, `kind-config.yaml.tmpl`
 - Kind cluster setup script -> `infra/kind/scripts/setup.sh`
 - setup.sh parameterization (DT_CLUSTER_NAME, DT_PORT_MAP, DT_HOST_GATEWAY_IP, --yes, --only, --skip-build) -> ADR-0030
-- setup.sh devloop ConfigMap patching (MC/MH advertise addresses) -> `infra/kind/scripts/setup.sh:deploy_mc_service()`, `deploy_mh_service()`
-- setup.sh helpers -> `load_image_to_kind()`, `deploy_only_service()`
-- Local iteration (Telepresence) -> `infra/kind/scripts/iterate.sh`
-- Cluster teardown -> `infra/kind/scripts/teardown.sh`
-- Skaffold dev workflow -> `infra/skaffold.yaml`
-- Containerized devloop (health check, eager setup, attach) -> `infra/devloop/devloop.sh`
-- dev-cluster client CLI (status display, setup/status output) -> `infra/devloop/dev-cluster`
+- setup.sh helpers -> `deploy_mc_service()`/`deploy_mh_service()` (ConfigMap advertise-addr patching), `load_image_to_kind()`, `deploy_only_service()`
+- Local iteration / teardown / Skaffold -> `infra/kind/scripts/{iterate,teardown}.sh`, `infra/skaffold.yaml`
+- Containerized devloop + dev-cluster CLI -> `infra/devloop/{devloop.sh,dev-cluster}`
 - Guard policy binary + wrapper shape (ADR-0034; subcommand-per-policy, clap dispatcher, STATUS line per ADR-0033 §6; wrappers source the shared prelude per ADR-0034 §3) -> `crates/dt-guard/`, `scripts/guards/simple/*.sh`
 - Client credential-retention guard (retention-gated, segment-matched field vocabulary from `common::pii_vocabulary`, full-tree `packages/**`) -> `crates/dt-guard/src/ts_retained_credentials.rs`, wrapper `scripts/guards/simple/ts/no-retained-credentials.sh`
 - Workspace `disallowed_methods` convention (canonical-home `Lazy<Regex>` enforcement per ADR-0034 §6) -> `clippy.toml`
-- Devloop Layer 7 (env-tests in validation pipeline) -> `scripts/layer7.sh` (mechanism: two-phase classifier, four STATUS lanes); failure-mode mapping -> `docs/runbooks/devloop-validation.md` §6.7; Lead attempt-policy -> `.claude/skills/devloop/SKILL.md`
 - Docker Compose (local tests) -> `docker-compose.test.yml`
 - Dev TLS cert generation (CA + MC + MH certs) -> `scripts/generate-dev-certs.sh`
-- CI pipeline -> `.github/workflows/ci.yml`
-- Fuzz nightly -> `.github/workflows/fuzz-nightly.yml`
+
+## Validation Pipeline & Toolchain (ADR-0033)
+- Layer scripts -> orchestrator `scripts/layer-all.sh`; Layer 7 (env-tests + browser E2E, one live cluster) -> `scripts/layer7.sh`, failure-map `docs/runbooks/devloop-validation.md` §6.7, Lead attempt-policy `.claude/skills/devloop/SKILL.md`
+- Layer 6 audit dep-change gate (manifest-only match) -> `scripts/lang/_audit_gate.sh:audit_dep_changed_{rust,ts}`, glob predicate `scripts/lang/_changed_helpers.sh:diff_touches_glob`; design -> ADR-0033 §3/§11
+- Audit suppressions (pnpm + cargo) -> `.pnpm-audit-ignore.json`, `.cargo/audit.toml`, lib `scripts/lang/_audit_suppressions_lib.sh`, drift check `scripts/audit-suppressions-check.sh`, wrappers `scripts/lang/rust/audit.sh`, `scripts/lang/ts/audit.sh`
+- Node toolchain pin (SSoT `.nvmrc` -> Dockerfile ARG + lockfile engines floor) -> `.nvmrc`, `.npmrc` (engine-strict), root `package.json` engines.node, `infra/devloop/Dockerfile` ARG NODE_VERSION, `infra/devloop/devloop.sh:read_node_version()`
+- CI pipelines -> `.github/workflows/{ci.yml,ci-client.yml}`; scheduled ambient audit -> `audit-scheduled.yml`; fuzz nightly -> `fuzz-nightly.yml`
 
 ## Host-Side Cluster Helper (ADR-0030)
 - Devloop helper binary -> `crates/devloop-helper/src/`

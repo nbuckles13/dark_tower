@@ -31,11 +31,16 @@
 - Internal token response (AC-local) -> `crates/ac-service/src/models/mod.rs:InternalTokenResponse`
 - Error types -> `crates/ac-service/src/errors.rs:AcError`
 - Metrics recording -> `crates/ac-service/src/observability/metrics.rs:record_token_issuance()`
+- Meeting-token display-name outcome metric -> `crates/ac-service/src/observability/metrics.rs:record_meeting_display_name_outcome()`
+- Users repo (display_name lookup at issuance) -> `crates/ac-service/src/repositories/users.rs:get_by_id()`
 - Correlation hashing -> `crates/ac-service/src/observability/mod.rs:hash_for_correlation()`
 
 ## Internal Token Endpoints (ADR-0020)
 - Meeting token handler -> `crates/ac-service/src/handlers/internal_tokens.rs:handle_meeting_token()`
 - Guest token handler -> `crates/ac-service/src/handlers/internal_tokens.rs:handle_guest_token()`
+- Meeting-token display-name resolution (fail-closed, single-cluster) -> `crates/ac-service/src/handlers/internal_tokens.rs:resolve_meeting_display_name()`
+- `MeetingTokenClaims.display_name` claim (PII, Debug-redacted, `#[serde(default)]`) -> `crates/common/src/jwt.rs:MeetingTokenClaims`
+- Fail-closed federation revisit -> `docs/TODO.md` §Roster Display Names
 - Request types (`MeetingTokenRequest`, `GuestTokenRequest`) shared via `common::meeting_token`; AC re-exports from `crate::models`
 - Note: `common::meeting_token::{ParticipantType, MeetingRole}` (3-variant, snake_case) vs `common::jwt::{ParticipantType, MeetingRole}` (2-variant, lowercase) — wire-compatible, separate Rust types; unification pending.
 
