@@ -1477,7 +1477,7 @@ tasks:
     (Escalation and Issues sections - note that directory is also stashed;
     rely on this prompt's file pointers as primary).
 - id: 66
-  status: pending
+  status: completed
   specialist: client
   env_tests: false
   prompt: |-
