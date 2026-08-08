@@ -23,14 +23,19 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
 
+# Timestamped console logging (UTC). All STORY_RUN lines route through these so
+# elapsed time between events is readable in a captured run log.
+slog() { printf '[%s] %s\n' "$(date -u +%H:%M:%S)" "$*"; }
+slogerr() { printf '[%s] %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
+
 ARG="${1:?usage: run-story.sh <story-file.md | story-slug> [--stop-after=N]}"
 STOP_AFTER="${2:-}"
 if [ -n "$STOP_AFTER" ]; then
   case "$STOP_AFTER" in
     --stop-after=*) STOP_AFTER="${STOP_AFTER#--stop-after=}" ;;
-    *) echo "STORY_RUN: unknown argument '$STOP_AFTER'" >&2; exit 2 ;;
+    *) slogerr "STORY_RUN: unknown argument '$STOP_AFTER'"; exit 2 ;;
   esac
-  [[ "$STOP_AFTER" =~ ^[0-9]+$ ]] || { echo "STORY_RUN: --stop-after needs a task id" >&2; exit 2; }
+  [[ "$STOP_AFTER" =~ ^[0-9]+$ ]] || { slogerr "STORY_RUN: --stop-after needs a task id"; exit 2; }
 fi
 if [ -f "$ARG" ]; then
   STORY_FILE="$ARG"
@@ -40,9 +45,9 @@ else
   matches=(docs/user-stories/*"${ARG}".md)
   shopt -u nullglob
   case "${#matches[@]}" in
-    0) echo "STORY_RUN: no story file matches '${ARG}'" >&2; exit 2 ;;
+    0) slogerr "STORY_RUN: no story file matches '${ARG}'"; exit 2 ;;
     1) STORY_FILE="${matches[0]}" ;;
-    *) echo "STORY_RUN: ambiguous slug '${ARG}' matches: ${matches[*]}" >&2; exit 2 ;;
+    *) slogerr "STORY_RUN: ambiguous slug '${ARG}' matches: ${matches[*]}"; exit 2 ;;
   esac
 fi
 DT_STORY="target/release/dt-story"
@@ -83,7 +88,7 @@ report_task_cost() {
       }' 2>/dev/null)" || true
   [ -n "$summary" ] || return 0
   echo "$summary" >>"$RUN_DIR/cost-ledger.jsonl"
-  echo "STORY_RUN: COST $(jq -r '"task=\(.task) attempts=\(.attempts) usd=\(.usd) output_tokens=\(.output_tokens) cache_read_tokens=\(.cache_read_tokens) turns=\(.turns) api_minutes=\(.api_minutes)"' <<<"$summary")"
+  slog "STORY_RUN: COST $(jq -r '"task=\(.task) attempts=\(.attempts) usd=\(.usd) output_tokens=\(.output_tokens) cache_read_tokens=\(.cache_read_tokens) turns=\(.turns) api_minutes=\(.api_minutes)"' <<<"$summary")"
 }
 
 escalate() {
@@ -91,8 +96,8 @@ escalate() {
   report_task_cost "$id"
   "$DT_STORY" escalate "$STORY_FILE" "$id" --reason "$reason" --log "$log" \
     --out "$RUN_DIR/escalation.json"
-  echo "STORY_RUN: ESCALATED task=${id} reason=${reason} log=${log}" >&2
-  echo "STORY_RUN: escalation record: ${RUN_DIR}/escalation.json" >&2
+  slogerr "STORY_RUN: ESCALATED task=${id} reason=${reason} log=${log}"
+  slogerr "STORY_RUN: escalation record: ${RUN_DIR}/escalation.json"
   exit 1
 }
 
@@ -148,8 +153,8 @@ while :; do
   case "$next_rc" in
     0) ;;
     3) break ;;
-    4) echo "STORY_RUN: BLOCKED — pending tasks with unsatisfied deps (see dt-story stderr)" >&2; exit 1 ;;
-    *) echo "STORY_RUN: manifest error (dt-story next rc=${next_rc})" >&2; exit 2 ;;
+    4) slogerr "STORY_RUN: BLOCKED — pending tasks with unsatisfied deps (see dt-story stderr)"; exit 1 ;;
+    *) slogerr "STORY_RUN: manifest error (dt-story next rc=${next_rc})"; exit 2 ;;
   esac
 
   id="$(jq -r .id <<<"$task_json")"
@@ -177,12 +182,12 @@ while :; do
     # Fresh starts require a clean tree; resumes tolerate (expect) the
     # interrupted devloop's uncommitted work.
     if ! git diff --quiet || ! git diff --cached --quiet; then
-      echo "STORY_RUN: dirty tree and no resumable devloop for task ${id} — clean up, or point ${slug_file} at the interrupted devloop dir" >&2
+      slogerr "STORY_RUN: dirty tree and no resumable devloop for task ${id} — clean up, or point ${slug_file} at the interrupted devloop dir"
       exit 2
     fi
   fi
 
-  echo "STORY_RUN: START task=${id} specialist=${specialist} resume=${continue_slug:-no} log=${tasklog}"
+  slog "STORY_RUN: START task=${id} specialist=${specialist} resume=${continue_slug:-no} log=${tasklog}"
   touch "$start_marker"
   limit_waits=0
   while :; do
@@ -217,12 +222,12 @@ while :; do
           # re-copy credentials). No manifest edit — the task stays pending
           # and the resume pointer survives, so a rerun picks up cleanly.
           persist_resume_pointer
-          echo "STORY_RUN: AUTH-EXPIRED task=${id} — run /login on the host, restart the container (entrypoint re-copies credentials), then rerun to resume" >&2
+          slogerr "STORY_RUN: AUTH-EXPIRED task=${id} — run /login on the host, restart the container (entrypoint re-copies credentials), then rerun to resume"
           exit 2
           ;;
         infra)
           persist_resume_pointer
-          echo "STORY_RUN: INFRA task=${id} — API unreachable or canary unclassifiable (${cfile}); manifest untouched, rerun to resume" >&2
+          slogerr "STORY_RUN: INFRA task=${id} — API unreachable or canary unclassifiable (${cfile}); manifest untouched, rerun to resume"
           exit 2
           ;;
         session-limit)
@@ -259,7 +264,7 @@ while :; do
                 git clean -fdq
               fi
             fi
-            echo "STORY_RUN: SESSION-LIMIT task=${id} wait=${sleep_secs}s resume=${continue_slug:-fresh} (${limit_waits}/${SESSION_LIMIT_RETRIES})"
+            slog "STORY_RUN: SESSION-LIMIT task=${id} wait=${sleep_secs}s resume=${continue_slug:-fresh} (${limit_waits}/${SESSION_LIMIT_RETRIES})"
             sleep "$sleep_secs"
             continue
           fi
@@ -294,7 +299,7 @@ while :; do
   # tagged env_tests. Full pipeline incl. layer 7 runs once at story close.
   gate_layers="1-6"
   [ "$env_tests" = "true" ] && gate_layers="1-6+7"
-  echo "STORY_RUN: GATE task=${id} layers=${gate_layers} running (log=${gatelog})"
+  slog "STORY_RUN: GATE task=${id} layers=${gate_layers} running (log=${gatelog})"
   gate_start="$(date +%s)"
   gate_rc=0
   for n in 1 2 3 4 5 6; do
@@ -310,7 +315,7 @@ while :; do
     gate_rc=$?
     set -e
   fi
-  echo "STORY_RUN: GATE task=${id} layers=${gate_layers} rc=${gate_rc} elapsed=$(( $(date +%s) - gate_start ))s"
+  slog "STORY_RUN: GATE task=${id} layers=${gate_layers} rc=${gate_rc} elapsed=$(( $(date +%s) - gate_start ))s"
   if [ "$gate_rc" -ne 0 ]; then
     tail -n 50 "$gatelog"
     escalate "$id" pipeline-red "$gatelog"
@@ -326,24 +331,30 @@ while :; do
     git commit --quiet -m "chore(story): task #${id} complete (run-story manifest bump)"
   fi
   rm -f "$slug_file" "$start_marker" "$stop_count_file"
-  echo "STORY_RUN: COMPLETE task=${id} commit=$(git rev-parse --short HEAD)"
+  slog "STORY_RUN: COMPLETE task=${id} commit=$(git rev-parse --short HEAD)"
   report_task_cost "$id"
 
   if [ -n "$STOP_AFTER" ] && [ "$id" = "$STOP_AFTER" ]; then
-    echo "STORY_RUN: STOPPED after task ${id} (--stop-after) — story-close gate NOT run; rerun without the flag to continue"
+    slog "STORY_RUN: STOPPED after task ${id} (--stop-after) — story-close gate NOT run; rerun without the flag to continue"
     exit 0
   fi
 done
 
 # Story-close gate: the full pipeline, layer 7 included, on the final tree.
+# This runs silently (redirected) for many minutes — layer 7 brings up the
+# cluster — so mark its start/end, mirroring the per-task GATE lines, or a
+# quiet story-close reads as a hang.
 closelog="$RUN_DIR/story-close.gate.log"
+slog "STORY_RUN: STORY-CLOSE GATE running — full layer-all.sh incl. layer 7 (log=${closelog})"
+close_start="$(date +%s)"
 set +e
 ./scripts/layer-all.sh >"$closelog" 2>&1
 rc=$?
 set -e
+slog "STORY_RUN: STORY-CLOSE GATE rc=${rc} elapsed=$(( $(date +%s) - close_start ))s"
 if [ "$rc" -ne 0 ]; then
   tail -n 50 "$closelog"
-  echo "STORY_RUN: story-close gate red (log=${closelog})" >&2
+  slogerr "STORY_RUN: story-close gate red (log=${closelog})"
   exit "$rc"
 fi
 
@@ -355,4 +366,4 @@ if [ -f "$RUN_DIR/cost-ledger.jsonl" ]; then
     "$RUN_DIR/cost-ledger.jsonl" 2>/dev/null || true
 fi
 
-echo "STORY_RUN: ALL TASKS COMPLETE — story-close gate green. Next step: /close-story"
+slog "STORY_RUN: ALL TASKS COMPLETE — story-close gate green. Next step: /close-story"
