@@ -120,18 +120,40 @@ fn runnable_payload(task: &Task) -> Result<RunnableTask> {
 }
 
 /// Mark a pending task completed, recording the commit if given.
-pub fn complete(manifest: &mut Manifest, id: u32, commit: Option<String>) -> Result<()> {
+/// Outcome of `complete`, so callers can distinguish a real transition from an
+/// idempotent no-op (e.g. the runner marking a task the devloop already marked).
+#[derive(Debug, PartialEq, Eq)]
+pub enum CompleteOutcome {
+    /// Task was pending and is now completed.
+    Completed,
+    /// Task was already completed — no change written.
+    AlreadyComplete,
+}
+
+pub fn complete(
+    manifest: &mut Manifest,
+    id: u32,
+    commit: Option<String>,
+) -> Result<CompleteOutcome> {
     let task = manifest
         .task_mut(id)
         .ok_or_else(|| anyhow!("task {id} not found in manifest"))?;
-    if task.status != Status::Pending {
-        bail!("task {id} is {}, not pending; cannot complete", task.status);
+    match task.status {
+        Status::Pending => {
+            task.status = Status::Completed;
+            if commit.is_some() {
+                task.commit = commit;
+            }
+            Ok(CompleteOutcome::Completed)
+        }
+        // Idempotent: the desired end state already holds. This is the normal
+        // case when a headless devloop marks its own task before the runner's
+        // own `dt-story complete` runs (task #60 collision, 2026-08-06).
+        Status::Completed => Ok(CompleteOutcome::AlreadyComplete),
+        Status::Escalated => {
+            bail!("task {id} is escalated, not pending; cannot complete")
+        }
     }
-    task.status = Status::Completed;
-    if commit.is_some() {
-        task.commit = commit;
-    }
-    Ok(())
 }
 
 /// Mark a pending task escalated, recording the escalation log path.

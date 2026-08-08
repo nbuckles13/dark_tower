@@ -14,6 +14,7 @@ branch: feature/client-join-meeting
 tasks:
 - id: 1
   status: completed
+  commit: abc1230
 - id: 2
   status: pending
   specialist: global-controller

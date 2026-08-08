@@ -166,8 +166,29 @@ fn cmd_next(story: &Path) -> ExitCode {
 
 fn cmd_complete(story: &Path, id: u32, commit: Option<String>) -> Result<()> {
     let mut doc = load(story)?;
-    engine::complete(&mut doc.manifest, id, commit)?;
-    save(story, &doc)
+    // Warn (don't fail) if the task is already completed against a different
+    // recorded commit — a genuine conflict worth surfacing, but not one that
+    // should red the runner. Read the existing commit before the mutation.
+    let prior_commit = doc
+        .manifest
+        .tasks
+        .iter()
+        .find(|t| t.id == id)
+        .and_then(|t| t.commit.clone());
+    match engine::complete(&mut doc.manifest, id, commit.clone())? {
+        engine::CompleteOutcome::Completed => save(story, &doc),
+        engine::CompleteOutcome::AlreadyComplete => {
+            if let (Some(new), Some(old)) = (&commit, &prior_commit) {
+                if new != old {
+                    eprintln!(
+                        "dt-story: task {id} already completed at {old}; not overwriting with {new}"
+                    );
+                }
+            }
+            eprintln!("dt-story: task {id} already completed — no change");
+            Ok(())
+        }
+    }
 }
 
 fn cmd_escalate(story: &Path, id: u32, reason: &str, log: &str, out: Option<&Path>) -> Result<()> {

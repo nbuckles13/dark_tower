@@ -199,21 +199,58 @@ fn complete_round_trip_preserves_non_manifest_bytes() {
 }
 
 #[test]
-fn complete_rejects_non_pending_task() {
+fn complete_is_idempotent_on_already_completed_task() {
     let dir = tempfile::tempdir().expect("tempdir");
     let story = dir.path().join("story.md");
     let orig = fs::read_to_string(fixture("runnable.md")).expect("read fixture");
     fs::write(&story, &orig).expect("write story copy");
 
-    // Task 1 is already completed.
-    dt_story()
+    // Task 1 is already completed — completing it again is a success no-op
+    // (task #60 double-writer collision, 2026-08-06), file untouched.
+    let output = dt_story()
         .arg("complete")
         .arg(&story)
         .arg("1")
-        .assert()
-        .code(2);
+        .output()
+        .expect("run");
+    assert!(output.status.success(), "idempotent complete must exit 0");
+    let stderr = String::from_utf8(output.stderr).expect("utf-8 stderr");
+    assert!(
+        stderr.contains("already completed"),
+        "expected already-completed note, got: {stderr}"
+    );
     let untouched = fs::read_to_string(&story).expect("read story");
-    assert_eq!(untouched, orig, "failed complete must not modify the file");
+    assert_eq!(
+        untouched, orig,
+        "idempotent complete must not modify the file"
+    );
+}
+
+#[test]
+fn complete_warns_on_commit_mismatch_but_succeeds() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let story = dir.path().join("story.md");
+    let orig = fs::read_to_string(fixture("runnable.md")).expect("read fixture");
+    fs::write(&story, &orig).expect("write story copy");
+
+    // Task 1 already completed; re-completing with a different commit warns
+    // (genuine conflict) but still exits 0 and leaves the file unchanged.
+    let output = dt_story()
+        .arg("complete")
+        .arg(&story)
+        .arg("1")
+        .arg("--commit")
+        .arg("deadbeefcafe")
+        .output()
+        .expect("run");
+    assert!(output.status.success(), "mismatch complete must exit 0");
+    let stderr = String::from_utf8(output.stderr).expect("utf-8 stderr");
+    assert!(
+        stderr.contains("not overwriting"),
+        "expected commit-mismatch warning, got: {stderr}"
+    );
+    let untouched = fs::read_to_string(&story).expect("read story");
+    assert_eq!(untouched, orig, "mismatch warning must not modify the file");
 }
 
 #[test]
