@@ -358,6 +358,165 @@ fn next_reopens_escalated_task_for_retry() {
     );
 }
 
+// ------------------------------------------------------------ add-task --
+
+#[test]
+fn add_task_appends_runnable_pending_task() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let story = dir.path().join("story.md");
+    let orig = fs::read_to_string(fixture("runnable.md")).expect("read fixture");
+    fs::write(&story, &orig).expect("write story copy");
+
+    let prompt_path = dir.path().join("prompt.txt");
+    let prompt_body = "Fix the audit advisory.\nPrefer a version bump over suppression.\n";
+    fs::write(&prompt_path, prompt_body).expect("write prompt");
+
+    let output = dt_story()
+        .arg("add-task")
+        .arg(&story)
+        .arg("--specialist")
+        .arg("infrastructure")
+        .arg("--prompt-file")
+        .arg(&prompt_path)
+        .arg("--tag")
+        .arg("audit-remediation-rust")
+        .arg("--env-tests")
+        .output()
+        .expect("run");
+    assert!(output.status.success(), "add-task must exit 0 on append");
+    let new_id: u32 = String::from_utf8(output.stdout)
+        .expect("utf-8 stdout")
+        .trim()
+        .parse()
+        .expect("stdout is the new id");
+    // runnable.md has tasks 1,2,3 → fresh id is 4.
+    assert_eq!(new_id, 4);
+
+    let mutated = fs::read_to_string(&story).expect("read mutated story");
+    assert_non_manifest_bytes_preserved(&orig, &mutated);
+    let manifest = parse_manifest(&mutated);
+    let added = manifest.task(new_id).expect("added task");
+    assert_eq!(added.status, Status::Pending);
+    assert_eq!(added.specialist.as_deref(), Some("infrastructure"));
+    assert_eq!(added.env_tests, Some(true));
+    assert_eq!(added.tag.as_deref(), Some("audit-remediation-rust"));
+    // Trailing newline trimmed, internal newline preserved.
+    assert_eq!(
+        added.prompt.as_deref(),
+        Some("Fix the audit advisory.\nPrefer a version bump over suppression.")
+    );
+
+    // The re-serialized multi-line prompt is a YAML block scalar.
+    let new_span = markdown::find_manifest_block(&mutated).expect("mutated block");
+    let new_yaml = markdown::manifest_yaml(&mutated, &new_span).expect("mutated yaml");
+    assert!(
+        new_yaml.contains("prompt: |"),
+        "multiline prompt must re-serialize as a block scalar, got:\n{new_yaml}"
+    );
+}
+
+#[test]
+fn add_task_with_existing_tag_is_idempotent_noop() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let story = dir.path().join("story.md");
+    let orig = fs::read_to_string(fixture("runnable.md")).expect("read fixture");
+    fs::write(&story, &orig).expect("write story copy");
+
+    let prompt_path = dir.path().join("prompt.txt");
+    fs::write(&prompt_path, "Do the thing.\n").expect("write prompt");
+
+    let add = || {
+        dt_story()
+            .arg("add-task")
+            .arg(&story)
+            .arg("--specialist")
+            .arg("client")
+            .arg("--prompt-file")
+            .arg(&prompt_path)
+            .arg("--tag")
+            .arg("dup-tag")
+            .output()
+            .expect("run")
+    };
+
+    // First append: exit 0, new id 4, env_tests defaults to false (flag absent).
+    let first = add();
+    assert!(first.status.success());
+    let first_id: u32 = String::from_utf8(first.stdout)
+        .expect("utf-8")
+        .trim()
+        .parse()
+        .expect("id");
+    assert_eq!(first_id, 4);
+    let after_first = fs::read_to_string(&story).expect("read story");
+    assert_eq!(
+        parse_manifest(&after_first)
+            .task(first_id)
+            .expect("added task")
+            .env_tests,
+        Some(false),
+        "absent --env-tests flag must default to false"
+    );
+
+    // Second append with the same tag: exit 4, prints the existing id, no write.
+    let second = add();
+    assert_eq!(
+        second.status.code(),
+        Some(4),
+        "duplicate tag must exit 4 (EXIT_TAG_EXISTS)"
+    );
+    let echoed_id: u32 = String::from_utf8(second.stdout)
+        .expect("utf-8")
+        .trim()
+        .parse()
+        .expect("existing id");
+    assert_eq!(echoed_id, first_id);
+    let stderr = String::from_utf8(second.stderr).expect("utf-8 stderr");
+    assert!(
+        stderr.contains("already exists"),
+        "duplicate must announce on stderr, got: {stderr}"
+    );
+    let after_second = fs::read_to_string(&story).expect("re-read story");
+    assert_eq!(
+        after_second, after_first,
+        "duplicate-tag add-task must not modify the file"
+    );
+}
+
+#[test]
+fn add_task_missing_prompt_file_exits_two() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let story = dir.path().join("story.md");
+    fs::write(
+        &story,
+        fs::read_to_string(fixture("runnable.md")).expect("read fixture"),
+    )
+    .expect("write story");
+
+    dt_story()
+        .arg("add-task")
+        .arg(&story)
+        .arg("--specialist")
+        .arg("client")
+        .arg("--prompt-file")
+        .arg(dir.path().join("nope.txt"))
+        .arg("--tag")
+        .arg("t")
+        .assert()
+        .code(2);
+}
+
+#[test]
+fn validate_accepts_manifest_with_tagged_task() {
+    let (code, stderr) = run_validate(
+        "story: s\nbranch: b\ntasks:\n- id: 1\n  status: pending\n  specialist: test\n  env_tests: false\n  prompt: p\n  tag: audit-remediation-ts\n",
+    );
+    assert_eq!(
+        code, 0,
+        "tagged pending task must validate, stderr: {stderr}"
+    );
+}
+
 // ------------------------------------------------------------ validate --
 
 fn run_validate(yaml_body: &str) -> (i32, String) {

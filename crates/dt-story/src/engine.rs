@@ -156,6 +156,46 @@ pub fn complete(
     }
 }
 
+/// Outcome of `add_task`: either a new task was appended (with its id) or a
+/// task with the same tag already existed (idempotent no-op, its id returned).
+#[derive(Debug, PartialEq, Eq)]
+pub enum AddOutcome {
+    Added(u32),
+    Exists(u32),
+}
+
+/// Append a pending task, idempotent on `tag`. If a task with the same tag
+/// already exists, return `Exists(id)` without mutating; otherwise append a
+/// pending task with a fresh id (max existing id + 1) and return `Added(id)`.
+pub fn add_task(
+    manifest: &mut Manifest,
+    specialist: String,
+    prompt: String,
+    env_tests: bool,
+    tag: String,
+) -> Result<AddOutcome> {
+    if let Some(existing) = manifest
+        .tasks
+        .iter()
+        .find(|t| t.tag.as_deref() == Some(tag.as_str()))
+    {
+        return Ok(AddOutcome::Exists(existing.id));
+    }
+    let new_id = manifest.tasks.iter().map(|t| t.id).max().unwrap_or(0) + 1;
+    manifest.tasks.push(Task {
+        id: new_id,
+        status: Status::Pending,
+        specialist: Some(specialist),
+        env_tests: Some(env_tests),
+        deps: Vec::new(),
+        prompt: Some(prompt),
+        commit: None,
+        escalation: None,
+        tag: Some(tag),
+    });
+    Ok(AddOutcome::Added(new_id))
+}
+
 /// Mark a pending task escalated, recording the escalation log path.
 pub fn escalate(manifest: &mut Manifest, id: u32, log: &str) -> Result<()> {
     let task = manifest

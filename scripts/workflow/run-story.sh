@@ -130,6 +130,60 @@ canary_classify() {
   echo infra
 }
 
+# Advisory-remediation gate (runs when all tracked tasks are done, before the
+# story-close gate). Ambient advisories accumulate independent of the story's
+# diff, so the first-ever close can go audit-red on unrelated CVEs. Rather than
+# hard-fail (breaking the "come back to done" promise), auto-append a scoped
+# remediation devloop per red language and let the loop run it.
+#
+# Language-agnostic: iterates scripts/lang/*/audit.sh (never hardcodes rust/ts),
+# forces the scan (the normal gate is dep-change-gated), and fails LOUDLY if a
+# language's audit is red but declares no remediation owner.
+
+# Set AUDIT_RED to newline-separated red languages, forcing every scan (the
+# normal per-lang gate is dep-change-gated). Called directly (NOT in $()) so a
+# `return 2` propagates. Per-audit.sh exit contract: 0 = OK/N-A/skipped (clean),
+# 1 = FAIL (advisory), >=2 = precondition/unknown (infra, not a fixable advisory).
+AUDIT_RED=""
+audit_scan() {
+    AUDIT_RED=""
+    local sh lang rc
+    for sh in scripts/lang/*/audit.sh; do
+        [ -f "$sh" ] || continue
+        lang="$(basename "$(dirname "$sh")")"
+        set +e
+        DEVLOOP_AUDIT_FORCE_RUN=1 "$sh" >"$RUN_DIR/audit-${lang}.log" 2>&1
+        rc=$?
+        set -e
+        if [ "$rc" -eq 1 ]; then
+            AUDIT_RED+="${lang}"$'\n'
+        elif [ "$rc" -ge 2 ]; then
+            slogerr "STORY_RUN: audit for ${lang} exited ${rc} (precondition/unknown, not an advisory) — see $RUN_DIR/audit-${lang}.log"
+            return 2
+        fi
+    done
+    return 0
+}
+
+# Echo a language's declared remediation owner (audit-remediation.md line-1
+# `# owner: <specialist>`), or return 2 (loud) if the file/header is missing —
+# the "audit red for a language we don't understand" fail-loud case. Call via
+# `owner="$(audit_owner_for X)" || exit 2` so the return propagates.
+audit_owner_for() {
+    local lang="$1" file owner
+    file="scripts/lang/${lang}/audit-remediation.md"
+    if [ ! -f "$file" ]; then
+        slogerr "STORY_RUN: audit red for '${lang}' but ${file} is missing — declare its remediation owner + prompt, or fix the advisory by hand"
+        return 2
+    fi
+    owner="$(sed -n '1s/^# owner: *//p' "$file")"
+    if [ -z "$owner" ]; then
+        slogerr "STORY_RUN: ${file} line 1 must be '# owner: <specialist>' — got: $(head -n1 "$file")"
+        return 2
+    fi
+    printf '%s' "$owner"
+}
+
 # Persist the --continue pointer for the current task if its devloop created
 # an output dir and nothing was committed. Uses the per-task vars set in the
 # main loop. Safe to call on any exit path; no-op if already persisted.
@@ -152,7 +206,34 @@ while :; do
   set -e
   case "$next_rc" in
     0) ;;
-    3) break ;;
+    3) # All tracked tasks done — advisory-remediation gate before story close.
+       audit_scan || exit 2
+       if [ -z "$AUDIT_RED" ]; then
+         break   # every language's forced audit is clean → proceed to close gate
+       fi
+       # Handle one red language per iteration; the loop re-audits after each
+       # remediation devloop, so multiple red languages resolve serially.
+       red_lang="$(printf '%s' "$AUDIT_RED" | head -n1)"
+       red_owner="$(audit_owner_for "$red_lang")" || exit 2
+       set +e
+       add_id="$("$DT_STORY" add-task "$STORY_FILE" \
+         --specialist "$red_owner" \
+         --prompt-file <(tail -n +2 "scripts/lang/${red_lang}/audit-remediation.md") \
+         --tag "audit-remediation-${red_lang}")"
+       add_rc=$?
+       set -e
+       case "$add_rc" in
+         0) slog "STORY_RUN: AUDIT-REMEDIATION ${red_lang} red → appended task #${add_id} (owner ${red_owner})"
+            continue ;;   # loop picks up the appended remediation task
+         4) # A remediation task for this language already exists but the audit
+            # is still red — the auto-fix didn't resolve it. Human judgment
+            # needed (patch unavailable, or a governed suppression decision).
+            slogerr "STORY_RUN: AUDIT-REMEDIATION ${red_lang} still red after remediation task #${add_id} — fix the advisory or add a governed suppression (docs/contributor/audit-suppressions.md), then rerun"
+            slogerr "STORY_RUN: audit log: $RUN_DIR/audit-${red_lang}.log"
+            exit 1 ;;
+         *) slogerr "STORY_RUN: dt-story add-task failed rc=${add_rc}"; exit 2 ;;
+       esac
+       ;;
     4) slogerr "STORY_RUN: BLOCKED — pending tasks with unsatisfied deps (see dt-story stderr)"; exit 1 ;;
     *) slogerr "STORY_RUN: manifest error (dt-story next rc=${next_rc})"; exit 2 ;;
   esac
@@ -333,6 +414,16 @@ while :; do
   rm -f "$slug_file" "$start_marker" "$stop_count_file"
   slog "STORY_RUN: COMPLETE task=${id} commit=$(git rev-parse --short HEAD)"
   report_task_cost "$id"
+
+  # Suppression-visibility monitor: if this task's commit ADDED audit-suppression
+  # entries, surface it — a cleared advisory via suppression (vs a real fix) is a
+  # governed but deliberate choice that should be loud, not buried in a diff.
+  if git show HEAD --format= --name-only 2>/dev/null | grep -q '^audit-suppressions\.toml$'; then
+    added="$(git show HEAD -- audit-suppressions.toml 2>/dev/null | grep -cE '^\+[[:space:]]*id[[:space:]]*=' || true)"
+    if [ "${added:-0}" -gt 0 ]; then
+      slog "STORY_RUN: NOTE task=${id} added ${added} audit suppression(s) — verify security-reviewed with exposure analysis + expiry"
+    fi
+  fi
 
   if [ -n "$STOP_AFTER" ] && [ "$id" = "$STOP_AFTER" ]; then
     slog "STORY_RUN: STOPPED after task ${id} (--stop-after) — story-close gate NOT run; rerun without the flag to continue"

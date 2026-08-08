@@ -6,6 +6,9 @@
 //!   tasks are retryable: selecting one reopens it (status back to
 //!   pending, escalation cleared, file rewritten) with a stderr notice.
 //! * `complete` / `escalate` — 0 on success, 2 on any error.
+//! * `add-task` — 0 appended (new id on stdout), 4 a task with the same
+//!   tag already exists (existing id on stdout, notice on stderr), 2 on
+//!   file-read / parse / write error.
 //! * `validate` — 0 valid, 1 with one violation per stderr line.
 
 use anyhow::{Context, Result};
@@ -20,6 +23,8 @@ use std::process::ExitCode;
 const EXIT_MALFORMED: u8 = 2;
 const EXIT_ALL_DONE: u8 = 3;
 const EXIT_BLOCKED: u8 = 4;
+/// `add-task`: a task with the requested tag already exists (idempotent).
+const EXIT_TAG_EXISTS: u8 = 4;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -65,6 +70,23 @@ enum Command {
         #[arg(long)]
         out: Option<PathBuf>,
     },
+    /// Append a pending task, idempotent on --tag. Prints the task id.
+    AddTask {
+        /// Path to the user story markdown file.
+        story: PathBuf,
+        /// Implementing specialist for the new task.
+        #[arg(long)]
+        specialist: String,
+        /// File whose contents become the task's devloop prompt.
+        #[arg(long)]
+        prompt_file: PathBuf,
+        /// Idempotency key: a second add-task with this tag is a no-op.
+        #[arg(long)]
+        tag: String,
+        /// Mark the task as requiring env-tests (default false).
+        #[arg(long)]
+        env_tests: bool,
+    },
     /// Check the story's manifest; print violations to stderr.
     Validate {
         /// Path to the user story markdown file.
@@ -108,6 +130,13 @@ fn main() -> ExitCode {
             log,
             out,
         } => exit_on_error(cmd_escalate(&story, id, &reason, &log, out.as_deref())),
+        Command::AddTask {
+            story,
+            specialist,
+            prompt_file,
+            tag,
+            env_tests,
+        } => cmd_add_task(&story, &specialist, &prompt_file, &tag, env_tests),
         Command::Validate { story } => cmd_validate(&story),
     }
 }
@@ -217,6 +246,52 @@ fn cmd_escalate(story: &Path, id: u32, reason: &str, log: &str, out: Option<&Pat
             .with_context(|| format!("failed to write {}", out_path.display()))?;
     }
     Ok(())
+}
+
+fn cmd_add_task(
+    story: &Path,
+    specialist: &str,
+    prompt_file: &Path,
+    tag: &str,
+    env_tests: bool,
+) -> ExitCode {
+    // Read the prompt first: a bad --prompt-file is a caller error (exit 2),
+    // distinct from a manifest/write error, but both map to EXIT_MALFORMED.
+    let result = (|| -> Result<engine::AddOutcome> {
+        let prompt = fs::read_to_string(prompt_file)
+            .with_context(|| format!("failed to read prompt file {}", prompt_file.display()))?;
+        // Trim only trailing whitespace; internal newlines are load-bearing
+        // (multi-line devloop prompt round-tripping as a YAML block scalar).
+        let prompt = prompt.trim_end().to_string();
+        let mut doc = load(story)?;
+        let outcome = engine::add_task(
+            &mut doc.manifest,
+            specialist.to_string(),
+            prompt,
+            env_tests,
+            tag.to_string(),
+        )?;
+        if let engine::AddOutcome::Added(_) = outcome {
+            save(story, &doc)?;
+        }
+        Ok(outcome)
+    })();
+
+    match result {
+        Ok(engine::AddOutcome::Added(id)) => {
+            println!("{id}");
+            ExitCode::SUCCESS
+        }
+        Ok(engine::AddOutcome::Exists(id)) => {
+            println!("{id}");
+            eprintln!("dt-story: task with tag '{tag}' already exists (id {id})");
+            ExitCode::from(EXIT_TAG_EXISTS)
+        }
+        Err(e) => {
+            eprintln!("dt-story: {e:#}");
+            ExitCode::from(EXIT_MALFORMED)
+        }
+    }
 }
 
 fn cmd_validate(story: &Path) -> ExitCode {

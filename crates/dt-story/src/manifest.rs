@@ -52,6 +52,11 @@ pub struct Task {
     pub commit: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub escalation: Option<String>,
+    /// Idempotency key for programmatically-added tasks (e.g. audit
+    /// remediation): `add-task` refuses to append a second task with the
+    /// same tag. Absent on hand-authored tasks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tag: Option<String>,
 }
 
 /// The embedded task manifest (v1).
