@@ -223,7 +223,12 @@ while :; do
        add_rc=$?
        set -e
        case "$add_rc" in
-         0) slog "STORY_RUN: AUDIT-REMEDIATION ${red_lang} red → appended task #${add_id} (owner ${red_owner})"
+         0) # Commit the manifest append before continuing — otherwise the
+            # appended task's fresh-start clean-tree check trips on the
+            # runner's own story-file write.
+            git add "$STORY_FILE"
+            git commit --quiet -m "chore(story): append audit-remediation task #${add_id} (${red_lang} advisory)"
+            slog "STORY_RUN: AUDIT-REMEDIATION ${red_lang} red → appended task #${add_id} (owner ${red_owner})"
             continue ;;   # loop picks up the appended remediation task
          4) # A remediation task for this language already exists but the audit
             # is still red — the auto-fix didn't resolve it. Human judgment
