@@ -188,11 +188,11 @@ There is no team object to delete. Mirrors `/devloop` Step 8.5. Prevents stale t
    Story: docs/user-stories/<story-slug>.md
    Devloops: <comma-separated list of devloop slugs>
    Tasks-closed: <count>
-
-   Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
    EOF
    )"
    ```
+
+   (The standard `Co-Authored-By` trailer is added per the harness commit convention — do not hard-code it here; a hard-coded version has gone stale before.)
 
    If nothing to commit (reflection produced no INDEX changes), skip silently and note "no commit (no changes)" in the report.
 

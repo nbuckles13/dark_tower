@@ -481,9 +481,8 @@ After review, stage and commit:
    Specialist: {specialist}
    Mode: {full|light}
    Verdicts: Security {verdict}, Test {verdict}, Observability {verdict}, Code Quality {verdict}, DRY {verdict}, Operations {verdict}, Semantic Guard {verdict}
-
-   Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
    ```
+   (The standard `Co-Authored-By` trailer is added per the harness commit convention — do not hard-code it here; a hard-coded version has gone stale before.)
 3. If nothing to commit, skip silently
 
 ### Step 8.5: Cleanup Teammates
