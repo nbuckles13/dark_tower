@@ -308,7 +308,7 @@ while :; do
           # re-copy credentials). No manifest edit — the task stays pending
           # and the resume pointer survives, so a rerun picks up cleanly.
           persist_resume_pointer
-          slogerr "STORY_RUN: AUTH-EXPIRED task=${id} — run /login on the host, restart the container (entrypoint re-copies credentials), then rerun to resume"
+          slogerr "STORY_RUN: AUTH-EXPIRED task=${id} — on the host run: /login (if needed) then ./infra/devloop/devloop.sh --refresh-creds <devloop-slug>, then rerun to resume (<devloop-slug> is the container's slug, not the story slug)"
           exit 2
           ;;
         infra)
