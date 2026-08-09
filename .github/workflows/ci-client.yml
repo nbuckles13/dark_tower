@@ -119,8 +119,11 @@ jobs:
         working-directory: proto
 
       - name: buf breaking (against main)
-        run: pnpm exec buf breaking --against '.git#branch=main'
-        working-directory: proto
+        # Run from repo ROOT so `.git` resolves (it is one level above proto/);
+        # positional `proto` + `subdir=proto` matches the working local invocation
+        # in scripts/lang/proto/breaking.sh. Running under working-directory: proto
+        # mis-resolved `.git` → `<workspace>/proto.git`.
+        run: pnpm exec buf breaking proto --against '.git#branch=main,subdir=proto'
 
       - name: buf format check
         run: pnpm exec buf format --diff --exit-code
@@ -231,12 +234,13 @@ jobs:
 
       - name: Install Playwright Chromium
         # Installs Chromium + system deps (libnss3, libatk-bridge2.0-0, etc.).
-        # Forward-compat: task #15 (sdk-svelte/web-app) adds browser-mode
-        # vitest component tests (R-43) — Chromium is already present.
-        # Today's test:component (sdk-core) runs in node env and does not
-        # exercise the browser binary, so this step is a no-op for current tests.
+        # web-app + sdk-svelte run vitest browser-mode component tests (R-15/R-43)
+        # that need Chromium. `playwright` is a package-level dep (web-app,
+        # sdk-svelte), NOT hoisted to the root .bin under pnpm — so resolve it via
+        # the workspace package; `npx playwright` at repo root fails
+        # "playwright: not found".
         if: steps.playwright-cache.outputs.cache-hit != 'true'
-        run: npx playwright install --with-deps chromium
+        run: pnpm --filter @darktower/web-app exec playwright install --with-deps chromium
 
       - name: Run component tests
         run: pnpm test:component
