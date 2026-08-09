@@ -76,6 +76,15 @@ jobs:
       - name: Install buf
         uses: bufbuild/buf-setup-action@v1
 
+      - name: Install Playwright Chromium
+        # INTERIM PATCH (see TODO: run CI in the devloop image). Layer 4
+        # (scripts/lang/ts/test.sh → nx test:component) runs vitest browser-mode
+        # tests that need Chromium — the devloop image bakes it in; CI must
+        # provision it too or Layer 4 fails "Executable doesn't exist …
+        # chromium_headless_shell". `playwright` is a package-level dep, so resolve
+        # via the workspace package (not `npx` at root).
+        run: pnpm --filter @darktower/web-app exec playwright install --with-deps chromium
+
       # Single end-to-end pipeline call — same router as local devloop's
       # scripts/verify-completion.sh --layer full (ADR-0033 §4). Local repro
       # of an audit failure: `./scripts/layer6.sh`.

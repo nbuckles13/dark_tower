@@ -118,12 +118,15 @@ jobs:
         run: pnpm exec buf lint
         working-directory: proto
 
-      - name: buf breaking (against main)
-        # Run from repo ROOT so `.git` resolves (it is one level above proto/);
-        # positional `proto` + `subdir=proto` matches the working local invocation
-        # in scripts/lang/proto/breaking.sh. Running under working-directory: proto
-        # mis-resolved `.git` → `<workspace>/proto.git`.
-        run: pnpm exec buf breaking proto --against '.git#branch=main,subdir=proto'
+      - name: buf breaking (against PR base)
+        # INTERIM PATCH (see TODO: run CI in the devloop image). Resolve the base
+        # ref the way the pipeline's scripts/lang/proto/breaking.sh does — a PR
+        # checkout has no local `main` branch, only origin/<base>, so `#branch=main`
+        # fails "couldn't find remote ref main". Run from repo ROOT so `.git`
+        # resolves; positional `proto` + `subdir=proto` match the pipeline invocation.
+        run: |
+          BASE_SHA=$(git merge-base "origin/${GITHUB_BASE_REF:-main}" HEAD)
+          pnpm exec buf breaking proto --against ".git#ref=${BASE_SHA},subdir=proto"
 
       - name: buf format check
         run: pnpm exec buf format --diff --exit-code
