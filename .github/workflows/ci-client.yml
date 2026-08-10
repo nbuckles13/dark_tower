@@ -227,7 +227,7 @@ jobs:
 
       - name: Restore Playwright browser cache
         id: playwright-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           # Key on pnpm-lock.yaml — lockfile is the authoritative Playwright
           # version pin (O1). Package.json can change without bumping the
