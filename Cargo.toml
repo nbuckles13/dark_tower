@@ -50,7 +50,7 @@ tokio = { version = "1.40", features = ["full"] }
 tokio-util = "0.7"
 
 # Web frameworks
-axum = "0.7"
+axum = "0.8"
 tower = "0.5"
 tower-http = "0.5"
 # HTTP types (HeaderMap/HeaderName/HeaderValue) shared by axum/reqwest/tonic.
