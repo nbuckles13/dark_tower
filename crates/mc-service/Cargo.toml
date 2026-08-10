@@ -66,7 +66,7 @@ media-protocol = { path = "../media-protocol" }
 criterion = { workspace = true }
 mc-test-utils = { path = "../mc-test-utils" }
 # Metrics testing
-metrics-util = "0.18"
+metrics-util = "0.20"
 # HTTP testing for health endpoint integration tests
 http-body-util = "0.1"
 # Need test-util feature for tokio::time::pause/advance in tests

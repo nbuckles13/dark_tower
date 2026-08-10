@@ -64,7 +64,7 @@ tokio-stream = "0.1"
 # Need test-util feature for tokio::time::pause/advance in tests
 tokio = { workspace = true, features = ["test-util"] }
 # Metrics test recorder for integration tests
-metrics-util = "0.18"
+metrics-util = "0.20"
 # Enable test-utils feature for common (e.g., TokenReceiver::from_test_channel)
 common = { path = "../common", features = ["test-utils"] }
 # JWT validation testing (Ed25519 signing, JWKS mocking)
