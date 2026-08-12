@@ -675,9 +675,25 @@ if [ -f "${HOME}/.claude/.credentials.json" ]; then
     podman cp "${HOME}/.claude/.credentials.json" "${DEV_CONTAINER}:/home/dev/.claude/.credentials.json"
 fi
 
-# Update Claude Code to latest before each attach
-echo "Updating Claude Code..."
-podman exec --user=0 "$DEV_CONTAINER" npm install -g @anthropic-ai/claude-code --loglevel=warn
+# Update Claude Code to latest before each attach — UNLESS a story run owns this
+# container. run-story's preflight probes the experimental teams-in-print-mode
+# substrate ONCE per invocation and binds to that CLI version; updating underneath
+# a live run puts every later task on an unprobed version (run-story asserts the
+# version per task and will halt the story if this happens).
+#
+# The update is skipped, NOT the attach: the credential refresh above is the
+# documented AUTH-EXPIRED recovery (run-story.sh prints `devloop.sh --refresh-creds`),
+# and blocking the attach would break that recovery in exactly the situation it is
+# needed — while a story is in flight (security, 2026-08-10). Announced, never silent.
+INFLIGHT_MARKER="${HELPER_RUNTIME_DIR}/story-runner/.run-in-flight"
+if [ -f "$INFLIGHT_MARKER" ] && [ "${FORCE_CLI_UPDATE:-}" != "1" ]; then
+    echo "Story run in flight ($(cat "$INFLIGHT_MARKER" 2>/dev/null || echo 'unknown')) —"
+    echo "  SKIPPING the Claude Code update so the run's substrate stays as probed."
+    echo "  Update after the run, or re-attach with FORCE_CLI_UPDATE=1 to override."
+else
+    echo "Updating Claude Code..."
+    podman exec --user=0 "$DEV_CONTAINER" npm install -g @anthropic-ai/claude-code --loglevel=warn
+fi
 
 podman exec -it "$DEV_CONTAINER" claude --dangerously-skip-permissions --remote-control "$TASK_SLUG" || true
 

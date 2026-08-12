@@ -1,8 +1,8 @@
 # Security Navigation
 
 ## Architecture & Design
-- Service auth (OAuth 2.0 Client Credentials) → ADR-0003 | Token lifetime & refresh → ADR-0007 | Key rotation → ADR-0008
-- User auth & meeting access → ADR-0020 | PII / generic-error discipline → ADR-0011 | No-panic policy → ADR-0002 | Approved algorithms → ADR-0027
+- Service auth (OAuth 2.0 Client Credentials) → ADR-0003 | Token lifetime & refresh → ADR-0007 | Key rotation → ADR-0008 | User auth & meeting access → ADR-0020
+- PII / generic-error discipline → ADR-0011 | No-panic policy → ADR-0002 | Approved algorithms → ADR-0027 | Unattended story runner (pass/fail authority, container boundary, suppression gate) → ADR-0035
 - MC session binding & HKDF key hierarchy → ADR-0023 (Section 1)
 - Client architecture (E2EE, key management, supply chain) → ADR-0028 (Sections 5, 1)
 - Service-owned dashboards and alerts → ADR-0031 | Alert-rules guard (URL exfil + annotation hygiene) → `scripts/guards/simple/validate-alert-rules.sh`
@@ -22,8 +22,7 @@
 - Security config + rate limits (registration SSoT `DEFAULT_REGISTRATION_RATE_LIMIT_*`) → `crates/ac-service/src/config.rs` | K8s: `infra/services/ac-service/`
 
 ## Code Locations — Common (JWT Infrastructure & Shared Token Types)
-- JWT claims (PII-redacted Debug: `display_name`/`sub`/`jti` → `[REDACTED]`), JWKS client, validator (EdDSA, size limit, kid, iat) → `crates/common/src/jwt.rs`
-- Token manager (secure constructor) → `crates/common/src/token_manager.rs:new_secure()` | Internal/meeting token types (`home_org_id` required, `display_name` carrier) → `crates/common/src/meeting_token.rs`
+- JWT claims (PII-redacted Debug: `display_name`/`sub`/`jti` → `[REDACTED]`), JWKS client, validator (EdDSA, size limit, kid, iat) → `crates/common/src/jwt.rs` | Token manager (secure constructor) → `crates/common/src/token_manager.rs:new_secure()` | Internal/meeting token types (`home_org_id` required, `display_name` carrier) → `crates/common/src/meeting_token.rs`
 
 ## Code Locations — GC (Auth, Access Control, CORS, Telemetry)
 - JWT validation → `crates/gc-service/src/auth/jwt.rs` | Auth middleware → `src/middleware/auth.rs`
@@ -33,13 +32,11 @@
 
 ## Code Locations — MC (JWT, WebTransport, Actors, MH Client)
 - MC JWT validation + token_type anti-confusion → `crates/mc-service/src/auth/mod.rs:McJwtValidator`
-- gRPC auth: structural `McAuthInterceptor` | JWKS `McAuthLayer` (scope `service.write.mc`) → `crates/mc-service/src/grpc/auth_interceptor.rs`
-- MC→MH OAuth Bearer auth (TokenReceiver, add_auth, MhRegistrationClient trait) → `crates/mc-service/src/grpc/mh_client.rs`
+- gRPC auth: structural `McAuthInterceptor` | JWKS `McAuthLayer` (scope `service.write.mc`) → `crates/mc-service/src/grpc/auth_interceptor.rs` | MC→MH OAuth Bearer (TokenReceiver, add_auth) → `crates/mc-service/src/grpc/mh_client.rs`
 - Async RegisterMeeting trigger (first-participant, retry+backoff, CancellationToken) → `webtransport/connection.rs:register_meeting_with_handlers()`
 - MediaCoordinationService (MH→MC, input validation; idempotent re-disconnect) → `crates/mc-service/src/grpc/media_coordination.rs`
 - MH connection registry (bound 1000/meeting) + UTF-8 safe truncation → `mh_connection_registry.rs`, `connection.rs:handle_client_message()`
-- WebTransport (connection handler, accept loop, TLS, join flow, JWT gate, capacity) → `crates/mc-service/src/webtransport/`
-- Join trust boundary: display-name `truncate_utf8` cap (`MAX_PARTICIPANT_NAME_LEN`), client `participant_name` length-check, fail-closed on missing MH data → `crates/mc-service/src/webtransport/connection.rs`; empty-claim `Participant N` fallback → `crates/mc-service/src/actors/meeting.rs:handle_join()`
+- WebTransport (connection handler, accept loop, TLS, join flow, JWT gate, capacity) → `crates/mc-service/src/webtransport/`; join trust boundary — display-name `truncate_utf8` cap (`MAX_PARTICIPANT_NAME_LEN`), client `participant_name` length-check, fail-closed on missing MH data → `connection.rs`; empty-claim `Participant N` fallback → `crates/mc-service/src/actors/meeting.rs:handle_join()`
 - Disconnect: transport-authenticated close (not client-forgeable), raw close-reason NOT logged (`&'static str` `error_variant`) → `crates/mc-service/src/webtransport/connection.rs:run_bridge_loop`
 - MH assignment store (Redis, no credentials stored) → `crates/mc-service/src/redis/client.rs:MhAssignmentStore` | session binding → `crates/mc-service/src/actors/session.rs`, `meeting.rs:handle_join()`; integration tests (auth JWT failure modes, WT accept-path) → `crates/mc-service/tests/`
 
@@ -64,8 +61,11 @@
 - Dev cert generation + fingerprint SSoT (single writer) → `scripts/generate-dev-certs.sh`; consumers → `packages/web-app/vite/fingerprints.ts`, `scripts/layer7.sh` (14-day `serverCertificateHashes` expiry cap); Playwright hash-pin (no cert-bypass flags) → `packages/web-app/playwright.config.ts`
 - MC/MH TLS volume mounts (defaultMode 0400) → `infra/services/{mc,mh}-service/{mc,mh}-{0,1}-deployment.yaml`; WebTransport UDP ingress → `infra/services/{mc,mh}-service/network-policy.yaml`, `infra/kind/kind-config.yaml`; test-time self-signed PEM rigs (rcgen, SAN `localhost`/`127.0.0.1`) → `crates/mh-service/tests/common/accept_loop_rig.rs`
 
-## Devloop Container & Cluster Helper Security
+## Devloop Container, Story Runner & Cluster Helper
 - Container isolation → ADR-0025; Cluster helper (trust, socket auth, injection safety, API allowlist, file perms) → ADR-0030
+- Runner container-boundary gate (hard-fail on `/run/.containerenv` ∪ `/.dockerenv`, `STORY_RUNNER_ALLOW_HOST` hatch) + substrate probe → `scripts/workflow/preflight-story.sh`
+- Gate-2 verdict threat model (anti-drift, NOT anti-forgery) → `scripts/lang/_gate2_binding.sh` file header; unkeyed changeset digest → `gate2_signature()`; hook validator → `gate2_validate_commit()`; self-test → `scripts/guards/simple/selftest-gate2-verdict.sh`
+- Headless completion enforcement → `scripts/workflow/devloop-stop-hook.sh`; failure classification + audit-suppression gate → `scripts/workflow/run-story.sh:canary_classify()`
 - Helper binary (arg safety, status read-only auth-gated, gateway IP validation) → `crates/devloop-helper/src/commands.rs`; Auth token (CSPRNG, constant-time compare, 0600) → `crates/devloop-helper/src/auth.rs`
 - Env-test URL validation (scheme, credential rejection) → `crates/env-tests/src/cluster.rs:parse_host_port()`
 - Kind NodePort listen address (`${HOST_GATEWAY_IP}`) → `infra/kind/kind-config.yaml.tmpl`; Wrapper → `infra/devloop/devloop.sh`; Dev-cluster client → `infra/devloop/dev-cluster`

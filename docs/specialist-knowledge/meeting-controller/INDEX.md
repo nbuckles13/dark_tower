@@ -67,7 +67,7 @@
 - Config fields `grpc_advertise_address` / `webtransport_advertise_address`; consumed by GC registration + MH RegisterMeeting → `crates/mc-service/src/config.rs`, `crates/mc-service/src/grpc/gc_client.rs`, `crates/mc-service/src/webtransport/connection.rs`
 
 ## Infrastructure
-- K8s deployment (POD_IP downward API, advertise addresses) → `infra/services/mc-service/deployment.yaml`
+- K8s deployment (POD_IP downward API, advertise addresses) → `infra/services/mc-service/mc-0-deployment.yaml`, `infra/services/mc-service/mc-1-deployment.yaml`
 - K8s network policy (MH ingress on 50052) → `infra/services/mc-service/network-policy.yaml`
 - Grafana dashboard → `infra/grafana/dashboards/mc-overview.json`
 - Prometheus alert rules → `infra/docker/prometheus/rules/mc-alerts.yaml`
