@@ -66,11 +66,43 @@ SESSION_LIMIT_RETRIES="${STORY_SESSION_LIMIT_RETRIES:-2}"
 # ~200-devloop baseline ran on Opus-class models (comparability), the gate
 # structure catches implementation mistakes regardless, and quota windows —
 # not model capability — are the binding constraint on story throughput.
-# Judgment-heavy work (planning, escalation triage) stays on the strongest
-# model in interactive sessions.
-STORY_MODEL="${STORY_MODEL:-claude-opus-4-8}"
+#
+# The default is the ALIAS `opus`, never a generation-pinned id. A pinned id
+# rots in two directions the runner cannot detect: it silently executes a
+# weaker model than intended across a whole unattended story, or it hard-fails
+# every task once the id is retired. Same form as the canary's `--model haiku`
+# below. Per-seat tiering (ADR-0035 §F) is a separate decision and needs a
+# per-teammate override in the devloop skill, not a change to this default.
+STORY_MODEL="${STORY_MODEL:-opus}"
 
 scripts/workflow/preflight-story.sh "$STORY_FILE"
+
+# Runner-scoped, per-invocation (security 2026-08-10): the unlimited print-mode
+# background wait is a RUNNER dependency, not an operator preference, so it is
+# exported here rather than living in global config. Preflight still writes it to
+# settings.json in-container (ephemeral $HOME); on the host-hatch path this export
+# is the only carrier, which is why it must not be conditional.
+export CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0
+
+# Substrate version binding. preflight probes ONCE per invocation, but the CLI can
+# move underneath a run: infra/devloop/devloop.sh updates it on every attach,
+# against the RUNNING container (the attach path is also the credential-recovery
+# path, so it cannot simply be blocked — see devloop.sh). The probe validates a
+# version; detecting that the validated version CHANGED is just `claude --version`,
+# so assert it per task and fail loud at the boundary rather than silently running
+# tasks on unprobed code.
+cli_version() { claude --version 2>/dev/null | head -n 1; }
+STORY_CLI_VERSION="$(cli_version)"
+slog "STORY_RUN: substrate bound to claude ${STORY_CLI_VERSION:-unknown}"
+
+# In-flight marker: lets a host-side attach see that a run owns this container and
+# skip its CLI update. Removed on every exit path, including escalation.
+RUN_BASE="${DEVLOOP_TMP:-/tmp/devloop}/story-runner"
+INFLIGHT="$RUN_BASE/.run-in-flight"
+mkdir -p "$RUN_BASE"
+printf 'story=%s pid=%s started=%s\n' \
+  "$(basename "${STORY_FILE%.md}")" "$$" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$INFLIGHT"
+trap 'rm -f "$INFLIGHT"' EXIT
 
 # Best-effort cost telemetry: sum every result event in the task's log (all
 # attempts, including cross-invocation resumes, append to the same file).
@@ -78,7 +110,7 @@ scripts/workflow/preflight-story.sh "$STORY_FILE"
 report_task_cost() {
   local id="$1" summary
   summary="$( (grep -h '"type":"result"' "$RUN_DIR/task-${id}.devloop.log" 2>/dev/null || true) \
-    | jq -s --argjson task "$id" 'select(length > 0) | {
+    | jq -s -c --argjson task "$id" 'select(length > 0) | {
         task: $task, attempts: length,
         usd: (map(.total_cost_usd // 0) | add * 100 | round / 100),
         output_tokens: (map(.usage.output_tokens // 0) | add),
@@ -92,13 +124,49 @@ report_task_cost() {
 }
 
 escalate() {
-  local id="$1" reason="$2" log="$3"
+  local id="$1" reason="$2" log="$3" rec
   report_task_cost "$id"
+  # Per-task, per-attempt record. A single shared escalation.json was overwritten
+  # by each later escalation: Run #1 escalated tasks 61/64/66 (ledger attempts=2)
+  # but only ONE runner record survived, so the escalation history — the evidence
+  # you most want, since an escalated task never commits and therefore leaves
+  # nothing in docs/devloop-outputs — was destroyed by the next escalation.
+  # escalation.json is kept as a stable "latest" pointer (documented at :19).
+  rec="$RUN_DIR/task-${id}.runner-escalation.$(date -u +%Y%m%dT%H%M%SZ).json"
   "$DT_STORY" escalate "$STORY_FILE" "$id" --reason "$reason" --log "$log" \
-    --out "$RUN_DIR/escalation.json"
+    --out "$rec"
+  cp -f "$rec" "$RUN_DIR/escalation.json"
   slogerr "STORY_RUN: ESCALATED task=${id} reason=${reason} log=${log}"
-  slogerr "STORY_RUN: escalation record: ${RUN_DIR}/escalation.json"
+  slogerr "STORY_RUN: escalation record: ${rec} (latest also at ${RUN_DIR}/escalation.json)"
   exit 1
+}
+
+# Durable incident record for the lanes that deliberately DO NOT touch the
+# manifest (auth-expired, infra, and any future ceiling lane). escalate() is not
+# usable there — it marks the task escalated, and "manifest untouched" is the
+# whole contract of those lanes — so they previously exited leaving nothing but a
+# console line. Run #1's auth-expired tasks (61, 66) left no record at all, and
+# their canary was overwritten by the next attempt because the canary path is
+# fixed per task. This writes a per-attempt record and preserves the canary that
+# drove the classification. Never reads or writes the manifest.
+record_infra_incident() {
+  local id="$1" lane="$2" detail="$3" ts rec canary
+  ts="$(date -u +%Y%m%dT%H%M%SZ)"
+  rec="$RUN_DIR/task-${id}.infra-incident.${ts}.json"
+  canary="$RUN_DIR/task-${id}.canary.${ts}.json"
+  if [ -f "$RUN_DIR/task-${id}.canary.json" ]; then
+    cp -f "$RUN_DIR/task-${id}.canary.json" "$canary"
+  else
+    canary=""
+  fi
+  jq -n --argjson task "$id" --arg lane "$lane" --arg detail "$detail" \
+        --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg canary "$canary" \
+        --arg cli "$STORY_CLI_VERSION" \
+    '{task:$task, lane:$lane, at:$at, detail:$detail, cli:$cli,
+      canary:(if $canary == "" then null else $canary end)}' \
+    >"$rec" 2>/dev/null || true
+  slogerr "STORY_RUN: incident record: ${rec}"
+  return 0
 }
 
 # Canary probe: a minimal haiku request whose single-object JSON output is
@@ -273,6 +341,18 @@ while :; do
     fi
   fi
 
+  # Per-task substrate assertion (see cli_version above). A version change mid-run
+  # means the remaining tasks would execute on a substrate the probe never
+  # validated — infra lane, not a task verdict: manifest untouched, rerun
+  # re-probes the new version in preflight and resumes.
+  # (No resume pointer to persist here: no devloop has run this iteration, and an
+  # existing pointer from an earlier attempt is already on disk.)
+  now_version="$(cli_version)"
+  if [ "$now_version" != "$STORY_CLI_VERSION" ]; then
+    slogerr "STORY_RUN: SUBSTRATE-CHANGED task=${id} — claude moved from '${STORY_CLI_VERSION}' to '${now_version}' mid-run (an attach updates the CLI in the running container). The new version is UNPROBED; manifest untouched, rerun to re-probe and resume."
+    exit 2
+  fi
+
   slog "STORY_RUN: START task=${id} specialist=${specialist} resume=${continue_slug:-no} log=${tasklog}"
   touch "$start_marker"
   limit_waits=0
@@ -304,15 +384,19 @@ while :; do
       canary_probe "$cfile" || true
       case "$(canary_classify "$cfile")" in
         auth-expired)
-          # Pure infra, needs a human (host /login + container restart to
-          # re-copy credentials). No manifest edit — the task stays pending
+          # Pure infra, needs a human (host /login if the refresh token itself
+          # expired, then devloop.sh --refresh-creds, which copies fresh creds
+          # into the RUNNING container — no restart, so RUN_DIR state survives).
+          # No manifest edit — the task stays pending
           # and the resume pointer survives, so a rerun picks up cleanly.
           persist_resume_pointer
+          record_infra_incident "$id" auth-expired "OAuth credentials rejected; recovery is devloop.sh --refresh-creds on the host"
           slogerr "STORY_RUN: AUTH-EXPIRED task=${id} — on the host run: /login (if needed) then ./infra/devloop/devloop.sh --refresh-creds <devloop-slug>, then rerun to resume (<devloop-slug> is the container's slug, not the story slug)"
           exit 2
           ;;
         infra)
           persist_resume_pointer
+          record_infra_incident "$id" infra "API unreachable or canary unclassifiable"
           slogerr "STORY_RUN: INFRA task=${id} — API unreachable or canary unclassifiable (${cfile}); manifest untouched, rerun to resume"
           exit 2
           ;;

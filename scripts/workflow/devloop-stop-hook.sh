@@ -5,8 +5,10 @@
 # messages nor background-task completion start a new turn), so premature
 # stops are blocked here mechanically instead of by skill convention.
 #
-# Registered container-side by infra/devloop/entrypoint.sh; no-op everywhere
-# else (gated on run-story's env). Exit 0 with no output = allow the stop.
+# Registered in-container by scripts/workflow/preflight-story.sh on every run
+# (NOT by the image entrypoint — an unbaked entrypoint edit caused the 2026-08-06
+# task #64 idle-death); no-op everywhere else (gated on run-story's env).
+# Exit 0 with no output = allow the stop.
 set -uo pipefail
 
 if [ "${DEVLOOP_HEADLESS:-}" != "1" ] || [ -z "${DEVLOOP_START_HEAD:-}" ]; then

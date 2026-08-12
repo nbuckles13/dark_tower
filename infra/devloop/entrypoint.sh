@@ -58,9 +58,23 @@ if [ -d /work/.githooks ]; then
     git -C /work config core.hooksPath /work/.githooks
 fi
 
-# Update Claude Code to latest in the background (non-blocking).
-# The Dockerfile provides a base version; this keeps it current without rebuilds.
-npm update -g @anthropic-ai/claude-code >/dev/null 2>&1 &
+# Update Claude Code to latest. The Dockerfile provides a base version; this
+# keeps it current without rebuilds.
+#
+# FOREGROUND AND UNMASKED, deliberately (same reasoning as the pnpm block below).
+# This was previously backgrounded with output discarded, which broke two things:
+#   1. It raced the readiness signal, so run-story's preflight could sample
+#      `claude --version` BEFORE the update landed. The story then ran on an
+#      UNPROBED version, and the probe marker preflight wrote
+#      (.substrate-probe-ok-<version>) named the OLD version — so every later
+#      story read a stale marker and skipped the probe too. Silently.
+#   2. `>/dev/null 2>&1` masked a failed or partial update entirely.
+# A version the substrate probe never validated is exactly the risk the probe
+# exists to eliminate, so the version must be settled before readiness.
+# Non-fatal: an offline host should still get a usable container, but loudly.
+echo "Updating Claude Code (blocks readiness so the version is settled before preflight samples it)..."
+npm update -g @anthropic-ai/claude-code \
+    || echo "WARNING: claude-code update failed — container will run the image's baked version. The run-story substrate probe binds whatever 'claude --version' reports, so this is safe but may be stale." >&2
 
 # Materialize TS workspace deps if pnpm-lock is present and nx isn't yet installed.
 # Foreground (blocks readiness) is intentional: silent no-op of TS wrappers when

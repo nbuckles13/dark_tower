@@ -286,9 +286,54 @@ feels important but isn't a pointer, put it as a code comment, an ADR,
 or a TODO.md entry instead.
 
 Organize by architectural concept (not by feature or date). Max 75 lines.
+
+MANDATORY before you report done — the pointers you write are gated by
+layer 3. Run the same wrapper layer 3 runs:
+
+    ./scripts/guards/simple/validate-knowledge-index.sh
+
+It must print STATUS=OK. Use the wrapper, NOT `target/release/dt-guard`
+directly — the wrapper resolves the binary, honours a DT_GUARD override, and
+reports `STATUS=FAIL REASON=dt-guard-binary-missing` instead of a bash
+file-not-found when the build is absent (a debug-only container is common,
+and a bash error reads as a broken environment rather than "build it").
+
+Use FULL LITERAL PATHS: the guard resolves each backticked path on disk and
+does NOT expand `{a,b}` brace lists or `<placeholder>` segments, so
+`crates/{mc,mh}-service/src/config.rs` and `docs/x/<slug>/main.md` are read
+as filenames that do not exist and FAIL. Write both paths out, or point at
+the directory. The 75-line cap actively tempts you toward that shorthand —
+resist it, or trim elsewhere.
+
+The guard is REPO-WIDE and your teammates are editing their INDEX files in
+parallel, so a mid-flight run may show THEIR in-progress violations. READ THE
+SUMMARY LINE FIRST: `STATUS=OK` means everything is clean, including yours —
+you are done. Only if it says FAIL do you need to attribute violations:
+
+    ./scripts/guards/simple/validate-knowledge-index.sh 2>&1 | grep "<your-name>/INDEX.md"
+
+A clean run prints ONLY the summary line and no per-file lines, so that grep
+is EXPECTED to be empty and exit 1 when all is well. Do not read that as a
+failure.
+
+Verify each path resolves BEFORE you write it, not only after. The guard's
+scope predicate covers only `docs/`, `crates/`, `proto/`, `scripts/`, so an
+`infra/` or root-level pointer passes whether or not it is real — that blind
+spot was already concealing a stale pointer, found only because someone
+checked before editing rather than after.
+
+Do NOT hand-roll your own path checker instead of running the guard. Three
+specialists tried during one debate and all three passed themselves: a bash
+`[ -e "$p" ]` loop expands braces (the guard doesn't), and hand-written
+filters skipped the brace tokens before reporting "0 unresolved". Each check
+established a real property that was not the property the guard enforces.
+Never satisfy this guard by DELETING a pointer — that is backwards from what
+the index is for.
 ```
 
 Allow 15 minutes for updates.
+
+**Why this check is in the instruction** (2026-08-10, ADR-0035 debate): six specialists ran reflection in parallel with no gate between authoring and committing, and collectively turned layer 3 red with 13 stale-pointer violations — every one of them brace/placeholder shorthand adopted to fit the line cap. The guard already existed and was green beforehand; nothing ran it until commit time. Running it at authoring time is the same "feedback where the judgment happens" argument this project applies elsewhere.
 
 ### Step 9: Complete
 
