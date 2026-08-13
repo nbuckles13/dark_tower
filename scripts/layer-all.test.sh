@@ -81,19 +81,11 @@ run_la() {
   LA_RC=$?
 }
 
-# --- Local assertion helpers (build on _test_helpers.sh PASS/FAIL/FAILURES) ---
-assert_absent() { # $1=label $2=needle $3=haystack — PASS iff needle NOT present
-  if [[ "$3" != *"$2"* ]]; then PASS=$((PASS+1)); else
-    FAIL=$((FAIL+1)); FAILURES+=("[$1] unexpected substring '$2' WAS present"); fi
-}
-assert_no_marker() { # $1=label — PASS iff no stub-ran marker exists in LA_DT
-  if ! ls "${LA_DT}"/ran.layer* >/dev/null 2>&1; then PASS=$((PASS+1)); else
-    FAIL=$((FAIL+1)); FAILURES+=("[$1] a stub layer RAN (ran.layer* present) but should not have"); fi
-}
-assert_marker() { # $1=label — PASS iff at least one stub-ran marker exists in LA_DT
-  if ls "${LA_DT}"/ran.layer* >/dev/null 2>&1; then PASS=$((PASS+1)); else
-    FAIL=$((FAIL+1)); FAILURES+=("[$1] no stub layer ran (ran.layer* absent) but the seam should have run them"); fi
-}
+# assert_absent / assert_marker / assert_no_marker are PROMOTED into
+# lang/_test_helpers.sh (sourced above) — they were local closures over LA_DT and
+# a hardcoded `ran.layer*` glob, which a second consumer could not reuse without
+# them silently always passing. They now take <label> <dir> <glob>; pass "$LA_DT"
+# and 'ran.layer*' explicitly at each call site below.
 
 # =============================================================================
 # (a) PRECONDITION_FAILURE at Layer 7 → LAYER_ALL_EXIT=2 + summary RESULT cell.
@@ -156,7 +148,7 @@ run_la "$d" DEVLOOP_TEST=1 LAYER_SCRIPT_DIR="$d"
 out="$(cat "$LA_OUT")"
 assert_exit   "f-all-ok-exit0"  0 "$LA_RC"
 assert_status "f-all-ok-total"  "TOTAL_RESULT=OK" "$out"
-assert_marker "f-all-ok-stubs-ran"
+assert_marker "f-all-ok-stubs-ran" "$LA_DT" 'ran.layer*'
 
 # =============================================================================
 # (g) WORST-WINS across layers: a FAIL (exit 1) at Layer 4 AND a PRECONDITION (exit 2) at
@@ -182,7 +174,7 @@ out="$(cat "$LA_OUT")"
 assert_exit       "7a-rejected-nonzero"   1 "$LA_RC"
 assert_status     "7a-exact-token"        "REASON=layer-script-dir-set-in-ci" "$out"
 assert_absent     "7a-no-spurious-green"  "TOTAL_RESULT=OK" "$out"
-assert_no_marker  "7a-no-stub-ran"
+assert_no_marker  "7a-no-stub-ran" "$LA_DT" 'ran.layer*'
 
 # 7b — GITHUB_ACTIONS=1 + DEVLOOP_TEST=1 + LAYER_SCRIPT_DIR: BOTH sentinel clauses match,
 # but `test-sentinel-set-in-ci` is the earlier `if` and short-circuits. Assert LOOSELY
@@ -195,7 +187,7 @@ assert_exit "7b-rejected-nonzero" 1 "$LA_RC"
 if [[ "$out" == *"REASON=test-sentinel-set-in-ci"* || "$out" == *"REASON=layer-script-dir-set-in-ci"* ]]; then
   PASS=$((PASS+1)); else
   FAIL=$((FAIL+1)); FAILURES+=("[7b-a-sentinel-token] neither sentinel token present in output"); fi
-assert_no_marker "7b-no-stub-ran"
+assert_no_marker "7b-no-stub-ran" "$LA_DT" 'ran.layer*'
 
 # 7c — POSITIVE no-over-fire (security refinement C): GITHUB_ACTIONS UNSET + DEVLOOP_TEST=1
 # + LAYER_SCRIPT_DIR → the seam is HONORED (stubs run), NO sentinel rejection. A control
@@ -206,6 +198,43 @@ run_la "$d" DEVLOOP_TEST=1 LAYER_SCRIPT_DIR="$d"
 out="$(cat "$LA_OUT")"
 assert_exit   "7c-honored-exit0"        0 "$LA_RC"
 assert_absent "7c-no-sentinel-rejection" "REASON=layer-script-dir-set-in-ci" "$out"
-assert_marker "7c-seam-honored-stubs-ran"
+assert_marker "7c-seam-honored-stubs-ran" "$LA_DT" 'ran.layer*'
+
+# =============================================================================
+# (h) INPUT-SIDE SEAM: a shared helper's stdout must not inject a verdict vote.
+# =============================================================================
+# This file exists to pin the STATUS parse -> aggregate -> final_exit seam. This
+# is that same seam from the INPUT side: `tee_collect_statuses` anchors
+# `^STATUS=` at LINE START on stdout, and every match becomes a vote in the
+# enclosing layer's verdict. All 10 consumers of lang/_test_helpers.sh run under
+# `run_and_emit` inside a layer script, and a FAILURES[] entry routinely
+# contains the text `STATUS=...` — any assertion about a status line quotes one.
+# `report_results`' leading prefixes are the ONLY thing keeping that text
+# mid-line and therefore uncollectable. Nothing asserted it until now: the
+# property would have stopped holding with nothing going red.
+#
+# THE FIXTURE MUST START WITH `STATUS=` AT CHARACTER ZERO. Every FAILURES+=
+# producer in _test_helpers.sh begins its entry with `[${label}]`, so an entry
+# copying that shape stays mid-line whether or not the prefix exists — measured:
+# with a `[case] …` entry the negative half passes with the prefix AND without
+# it, so the case certifies a property it cannot see. Only a line-start
+# `STATUS=` distinguishes them.
+#
+# Both halves are required. The negative alone is vacuous — it also passes if
+# `report_results` stops printing FAILURES entries at all, which would destroy
+# the diagnostics the prefix exists to carry while reporting the property holds.
+#
+# This case was itself the fifth sighting of the class it exists to serve, and
+# of the CORRECT form of the question: "what else produces this same
+# observation?" The observation "no line-start STATUS=" was produced by the
+# prefix working AND by a fixture that could never trigger it. The narrower
+# question ("does this pass if the thing never runs?") clears it — as it clears
+# OPS-1, where the mechanism ran and the file was created.
+__rr_out="$(
+  PASS=0 FAIL=1 FAILURES=("STATUS=FAIL REASON=rr-selftest-needle — injected at line start")
+  report_results "rr-selftest" 2>&1 || true
+)"
+assert_absent "h-report-results-no-collectable-status" "$(printf '\nSTATUS=')" "$(printf '\n%s' "$__rr_out")"
+assert_status "h-report-results-still-prints-failures" "rr-selftest-needle" "$__rr_out"
 
 report_results "scripts/layer-all.test.sh"

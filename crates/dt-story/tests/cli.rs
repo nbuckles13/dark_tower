@@ -594,3 +594,189 @@ fn validate_rejects_pending_task_missing_prompt() {
         "got: {stderr}"
     );
 }
+
+// ---------------------------------------------------------- list-tasks --
+//
+// `list-tasks` is a read-only projection consumed by `run-story.sh`'s
+// `--stop-after` validation and probed by `preflight-story.sh`. Its contract
+// (see the module doc in `src/main.rs`): exit 0 with a single-line JSON array
+// on stdout, exit 2 with EMPTY stdout on any error, no other exit code, and
+// never a write to the story file.
+
+/// Write `yaml_body` as a story file in a fresh tempdir; return both.
+fn story_in_tempdir(yaml_body: &str) -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let story = dir.path().join("story.md");
+    fs::write(&story, story_md(yaml_body)).expect("write story");
+    (dir, story)
+}
+
+/// Task ids deliberately out of ascending order, all three statuses present,
+/// and every non-projected field populated — `specialist`, `env_tests`,
+/// `prompt`, `commit`, `escalation`. Any of those appearing in the output is
+/// a widening of the projection.
+const MIXED_MANIFEST: &str = "story: s\nbranch: b\ntasks:\n\
+- id: 3\n  status: pending\n  specialist: protocol\n  env_tests: false\n  deps:\n  - 1\n  prompt: |\n    third\n\
+- id: 1\n  status: completed\n  commit: abc1234\n\
+- id: 2\n  status: escalated\n  specialist: test\n  env_tests: true\n  deps:\n  - 1\n  prompt: |\n    second\n  escalation: /tmp/devloop/story-runner/s/task-2.log\n";
+
+#[test]
+fn list_tasks_projects_exactly_three_keys_in_manifest_order() {
+    let (_dir, story) = story_in_tempdir(MIXED_MANIFEST);
+
+    let assert = dt_story().arg("list-tasks").arg(&story).assert();
+    let output = assert.success().get_output().clone();
+    let stdout = String::from_utf8(output.stdout).expect("utf-8 stdout");
+
+    assert_eq!(
+        stdout.trim_end().lines().count(),
+        1,
+        "output must be a single compact line, got:\n{stdout}"
+    );
+
+    let json: serde_json::Value = serde_json::from_str(stdout.trim()).expect("stdout JSON");
+    let array = json.as_array().expect("top level must be a JSON array");
+    assert_eq!(array.len(), 3);
+
+    // Closed-world key assertion. Asserting each expected field individually
+    // is open-world: it passes unchanged when a key is ADDED, which is the
+    // one thing this test exists to catch (e.g. someone swapping the
+    // projection for a serialization of `manifest::Task`, which would drag in
+    // `prompt`, `commit` and `escalation`).
+    for element in array {
+        let obj = element.as_object().expect("element must be a JSON object");
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["deps", "id", "status"],
+            "projection key set must be exactly {{id, status, deps}}, got: {element}"
+        );
+    }
+
+    // Manifest order, NOT sorted by id — re-sorting would be dt-story forming
+    // a second opinion about the file's own task order.
+    let ids: Vec<i64> = array
+        .iter()
+        .map(|e| e["id"].as_i64().expect("id must be a number"))
+        .collect();
+    assert_eq!(
+        ids,
+        vec![3, 1, 2],
+        "tasks must be emitted in manifest order"
+    );
+
+    // Pins the lowercase status token set the runner's jq matches on.
+    let statuses: Vec<&str> = array
+        .iter()
+        .map(|e| e["status"].as_str().expect("status must be a string"))
+        .collect();
+    assert_eq!(statuses, vec!["pending", "completed", "escalated"]);
+
+    // `deps` is total: always present, `[]` rather than absent, so consumers
+    // never need `// []`.
+    assert_eq!(array[0]["deps"], serde_json::json!([1]));
+    assert_eq!(
+        array[1]["deps"],
+        serde_json::json!([]),
+        "a task with no deps must emit an empty array, not omit the key"
+    );
+}
+
+/// The escalated task is the lowest-id candidate with satisfied deps and no
+/// pending task ahead of it, so `engine::next` is GUARANTEED to select it and
+/// flip it back to pending — i.e. `next` writes the file for this input.
+/// Without that guarantee the read-only assertion below would pass against a
+/// `list-tasks` that simply delegated to `next`.
+const REOPEN_MANIFEST: &str = "story: s\nbranch: b\ntasks:\n\
+- id: 1\n  status: escalated\n  specialist: test\n  env_tests: false\n  prompt: |\n    only task\n  escalation: /tmp/devloop/story-runner/s/task-1.log\n\
+- id: 2\n  status: pending\n  specialist: test\n  env_tests: false\n  deps:\n  - 1\n  prompt: |\n    blocked on 1\n";
+
+#[test]
+fn list_tasks_never_writes_the_story_file() {
+    let (_dir, story) = story_in_tempdir(REOPEN_MANIFEST);
+    let orig = fs::read_to_string(&story).expect("read story");
+
+    // Precondition: prove the trap can spring. `next` on an identical fixture
+    // MUST mutate it — otherwise this fixture cannot distinguish a read-only
+    // `list-tasks` from one that delegates to `engine::next`, and the
+    // assertion below would be vacuous. Selection order lives in
+    // `engine::next` and could change; this fails loudly if it does.
+    let (_probe_dir, probe_story) = story_in_tempdir(REOPEN_MANIFEST);
+    dt_story().arg("next").arg(&probe_story).assert().success();
+    let after_next = fs::read_to_string(&probe_story).expect("read probe story");
+    assert_ne!(
+        orig, after_next,
+        "fixture precondition broken: `next` must reopen the escalated task \
+         and rewrite the file, or the read-only assertion proves nothing"
+    );
+
+    dt_story().arg("list-tasks").arg(&story).assert().success();
+
+    // Whole-file equality, not `assert_non_manifest_bytes_preserved` — the
+    // latter ignores the manifest block, which is exactly the region a
+    // delegating implementation would rewrite.
+    let after = fs::read_to_string(&story).expect("re-read story");
+    assert_eq!(
+        orig, after,
+        "list-tasks must leave the story file byte-identical"
+    );
+}
+
+/// The one input where "exit 0 implies non-empty stdout" is closest to
+/// failing. `preflight-story.sh`'s `[ -n "$out" ]` check treats rc-0-with-
+/// empty-stdout as a contract violation, so an empty manifest MUST still
+/// emit the two bytes `[]` rather than nothing. Nothing in
+/// `engine::validate_manifest` rejects an empty task list, so this is a
+/// reachable input, not a hypothetical one — and if the projection ever
+/// became "emit nothing when there is nothing", that check would silently
+/// start passing an unfounded state.
+#[test]
+fn list_tasks_empty_manifest_emits_empty_array_not_empty_stdout() {
+    let (_dir, story) = story_in_tempdir("story: s\nbranch: b\ntasks: []\n");
+
+    let assert = dt_story().arg("list-tasks").arg(&story).assert();
+    let output = assert.success().get_output().clone();
+    let stdout = String::from_utf8(output.stdout).expect("utf-8 stdout");
+
+    assert!(
+        !stdout.trim().is_empty(),
+        "exit 0 must never carry empty stdout — preflight reads that as a \
+         contract violation"
+    );
+    assert_eq!(stdout.trim(), "[]");
+    let json: serde_json::Value = serde_json::from_str(stdout.trim()).expect("stdout JSON");
+    assert_eq!(
+        json.as_array().expect("top level must be an array").len(),
+        0
+    );
+}
+
+#[test]
+fn list_tasks_malformed_exits_two_with_empty_stdout() {
+    let assert = dt_story()
+        .arg("list-tasks")
+        .arg(fixture("malformed.md"))
+        .assert();
+    let output = assert.code(2).get_output().clone();
+    assert!(
+        output.stdout.is_empty(),
+        "exit 2 must print nothing on stdout — a consumer's jq must never \
+         see partial output, and preflight reads rc-0-with-empty-stdout as a \
+         contract violation"
+    );
+    assert!(!output.stderr.is_empty(), "exit 2 must diagnose on stderr");
+}
+
+#[test]
+fn list_tasks_missing_file_exits_two_with_empty_stdout() {
+    let assert = dt_story()
+        .arg("list-tasks")
+        .arg(fixture("does-not-exist.md"))
+        .assert();
+    let output = assert.code(2).get_output().clone();
+    assert!(
+        output.stdout.is_empty(),
+        "exit 2 must print nothing on stdout"
+    );
+}

@@ -360,7 +360,8 @@ Most of the simple guards — the eight listed here (cite-no-line-numbers / cite
 
 1. **Stale or missing binary** — `STATUS=FAIL REASON=dt-guard-binary-missing`. The wrapper exits 1 before invoking any subcommand because `target/release/dt-guard` is not present (or not `-x`).
     - **Diagnostic**: `ls -la target/release/dt-guard`.
-    - **Resolution**: `cargo build --release -p dt-guard` (or re-run `scripts/layer1.sh`, which builds it as part of `compile.sh`). The wrapper produces no `VIOLATION:` lines because the policy kernel never runs.
+    - **Resolution**: `cargo build --release -p dt-guard -p dt-story`. The wrapper produces no `VIOLATION:` lines because the policy kernel never runs.
+    - **Do NOT rely on re-running `scripts/layer1.sh` here** (this file said to, until 2026-08-13). Layer 1 builds both binaries inside the *skip-gated* rust compile verb, which does not run when the diff touches no `crates/` or root `Cargo.*`/`rust-toolchain.toml` path — i.e. it is skipped in precisely the situation that produces this failure. Re-running Layer 1 works only when your diff already touches Rust, which is the case that never had the problem. See §8's two guard-binary rows for the producer/consumer skew, and `docs/TODO.md` §Polyglot Pipeline Follow-ups for the structural fix.
 
 2. **Subcommand not found** — clap exits non-zero with its own diagnostic on stderr (typically `error: unrecognized subcommand <foo>`). `STATUS=` may surface as `clap-error` or omit entirely depending on which subcommand the wrapper invoked; the canonical signal is the clap-formatted stderr line.
     - **Diagnostic**: `dt-guard --help` to list registered subcommands.
@@ -611,6 +612,9 @@ Grep-driven entry point. Match the symptom, jump to the section.
 | Layer 3 `suppression-override-without-test-sentinel` | A test-injection override env set without `DEVLOOP_TEST=1` — tamper/misconfig; investigate, do NOT unset-and-rerun. | §6.3 |
 | `test-sentinel-set-in-ci` (layer-all / layer3) | `DEVLOOP_TEST` leaked into a CI job — pipeline-integrity incident; find + remove what exported it. | §6.3 |
 | `layer-script-dir-set-in-ci` (assert_no_ci_sentinel_leak) | `LAYER_SCRIPT_DIR` (a local-only orchestrator test seam) leaked into CI — could forge the Gate-2 verdict; find + remove what exported it. | §6.3 |
+| Layer 3 `STATUS=FAIL REASON=dt-guard-binary-missing` (any `guards/simple/**` wrapper) | `target/release/dt-guard` absent. **Producer/consumer skew, not a code defect**: the binary is built by `lang/rust/compile.sh's cargo build step` inside the *skip-gated* compile verb (`lang/rust/changed.sh` triggers only on `crates/` + root `Cargo.*`/`rust-toolchain.toml`), but ~15 Layer-3 guards consume it *always-run*. So a diff touching only `packages/**` or docs skips the build and reds Layer 3. Fix: `cargo build --release -p dt-guard -p dt-story`. **Note the lane**: the wrapper exits **1** (implementer), so under `run-story.sh` this wiring fault is recorded against the task — see the caveat below the table. | §6.3 |
+| Layer 3 `dt-story not built but manifests exist` (`validate-story-manifest.sh`) | Same skew, same cause, same fix — `target/release/dt-story` is built by the same skip-gated verb and consumed by an always-run guard (and, since the story-runner hardening devloop, by `scripts/workflow/run-story.test.sh`). `scripts/workflow/preflight-story.sh` asserts both binaries at story start, so a `run-story` invocation refuses on the operator lane instead of discovering this at a task's gate. CI is covered by `ci.yml`'s unconditional build step; **a plain local devloop is not**. | §6.3 |
+| Two `STATUS=` lines for one Layer-3 child (e.g. `PRECONDITION_FAILURE REASON=<child-token>` **and** `FAIL REASON=<child>-failed`) | **Expected, not a bug — read the ladder, not the last line.** `run_and_emit` (`lang/_common.sh`) appends its own `STATUS=FAIL <prefix>-failed` whenever a child exits non-zero, *in addition to* any `STATUS=` line the child printed itself. `tee_collect_statuses` collects **both** and `aggregate_worst_status` resolves worst-wins, so a child's `PRECONDITION_FAILURE` (rank 6) beats the appended `FAIL` (rank 5) and the layer's verdict is the operator lane. The child's own REASON token names the real cause; the `-failed` one is just "a child exited non-zero". A child that prints **no** STATUS line of its own has only the appended `FAIL`, which is why a wiring fault from such a child reaches the implementer lane — see the caveat below. | §3 (ladder) + §6.3 |
 | Layer 3 `dependabot-ignore-present` | `.github/dependabot.yml` has a non-empty `ignore:` block — move suppressions to `audit-suppressions.toml`; Dependabot `ignore:` is not a suppression channel. | §6.3 |
 | Open `audit-drift` GitHub Issue / red `Scheduled Audit` run | Between-PR drift: a new advisory against an UNCHANGED lockfile, caught by the weekly scheduled scan. Triage like a Layer-6 advisory; the issue auto-closes when a later scheduled run is clean. | §6.6 |
 | Layer 6 `buf-breaking-failed` on an intentional wire-break | No override exists yet; deferred to ADR-0033 Wave 3 #10 (task #41). | §6.6 |
@@ -626,6 +630,24 @@ Grep-driven entry point. Match the symptom, jump to the section.
 | `❌ Gate-2: ... validated but not staged: <path>` | A validated (often untracked/transient, e.g. a dirtied lockfile) file is in the verdict but not staged — re-run, or `--no-verify` if intentional. | §8.5 |
 | `❌ Gate-2: verdict is for a different devloop` | Stale verdict from another devloop in the same `/tmp` session — re-run for THIS one. | §8.5 |
 | `❌ Gate-2: shared library missing` | Broken checkout (`scripts/lang/_gate2_binding.sh` absent) — restore it, or `--no-verify` if intentional. | §8.5 |
+
+### Caveat: a missing guard binary reaches the implementer lane
+
+The two guard-binary rows above are **correct detection on the wrong lane**, and the lane is not
+fixable at the guard. A missing build artifact is a wiring fault — the operator class by §4's own
+convention — but both emitters `exit 1`, `run_and_emit` (`lang/_common.sh`) collapses any non-zero
+to `STATUS=FAIL`, and `FAIL` maps to exit 1. `scripts/layer3.sh` flattens a guard-level
+`PRECONDITION_FAILURE` the same way, so re-classifying inside a guard would not survive either.
+
+Consequence worth knowing before triaging: `run-story.sh` routes a gate exit 1 to a **task
+escalation** and anything else non-zero to the operator lane, so this failure is recorded against
+whatever task happened to be running. If a story escalates with `pipeline-red` and the gate log
+names either symptom above, the task is not the cause — rebuild the binaries and rerun.
+
+Tracked in `docs/TODO.md` under *Polyglot Pipeline Follow-ups*: the structural fix is to move
+guard-binary production out of the skip-gated compile verb onto an always-run path, which collapses
+the three current build/assert sites (`lang/rust/compile.sh`, `ci.yml`, `preflight-story.sh`) back
+to one, plus a `run_and_emit` enum that can carry `PRECONDITION_FAILURE`.
 
 ---
 
