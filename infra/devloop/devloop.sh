@@ -82,14 +82,33 @@ if $REBUILD_IMAGE && [ -z "${1:-}" ]; then
     exit 0
 fi
 
-TASK_SLUG="${1:?Usage: devloop.sh [--rebuild|--refresh-creds|--recreate|--destroy] <task-slug> [base-branch]}"
+TASK_SLUG="${1:?Usage: devloop.sh [--rebuild|--refresh-creds|--recreate|--destroy] <task-slug> [base-branch] [-- <command...>]}"
+shift
 # Kind cluster names must be DNS labels (a-z, 0-9, hyphens only).
 if [[ ! "$TASK_SLUG" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]]; then
     echo "ERROR: Invalid task slug: '${TASK_SLUG}'" >&2
     echo "  Must be lowercase alphanumeric with hyphens (e.g., 'my-task-42')" >&2
     exit 1
 fi
-BASE_BRANCH="${2:-$(git rev-parse --abbrev-ref HEAD)}"
+
+# Optional base-branch, then an optional `-- <command...>`: everything after the
+# separator runs in the container instead of the interactive claude attach. Kept
+# deliberately general — devloop.sh sets up an environment, and encoding any
+# particular tool's flags here would be a second copy of that tool's interface,
+# drifting from the one it describes. Unattended story runs are just:
+#   devloop.sh <slug> -- scripts/workflow/run-story.sh <story> --stop-after=1
+if [[ -n "${1:-}" && "$1" != "--" ]]; then
+    BASE_BRANCH="$1"
+    shift
+else
+    BASE_BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+fi
+EXEC_CMD=()
+if [[ "${1:-}" == "--" ]]; then
+    shift
+    EXEC_CMD=("$@")
+    [ ${#EXEC_CMD[@]} -gt 0 ] || { echo "ERROR: -- given with no command to run" >&2; exit 1; }
+fi
 
 # Resolve paths relative to the repo root
 REPO_ROOT="$(git rev-parse --show-toplevel)"
@@ -664,9 +683,11 @@ echo ""
 # Set terminal title to devloop slug
 printf '\033]0;devloop: %s\007' "$TASK_SLUG"
 
-echo "Dropping into Claude Code..."
-echo "(Ctrl-D or /exit to detach — containers stay running)"
-echo ""
+if [ ${#EXEC_CMD[@]} -eq 0 ]; then
+    echo "Dropping into Claude Code..."
+    echo "(Ctrl-D or /exit to detach — containers stay running)"
+    echo ""
+fi
 
 # Refresh OAuth credentials before each attach (host sessions may have rotated
 # the refresh token since the container started, invalidating the container's copy).
@@ -693,6 +714,46 @@ if [ -f "$INFLIGHT_MARKER" ] && [ "${FORCE_CLI_UPDATE:-}" != "1" ]; then
 else
     echo "Updating Claude Code..."
     podman exec --user=0 "$DEV_CONTAINER" npm install -g @anthropic-ai/claude-code --loglevel=warn
+fi
+
+if [ ${#EXEC_CMD[@]} -gt 0 ]; then
+    # DEVLOOP_SLUG is exported because a process inside the container cannot see
+    # the container's own name, and at least one — run-story's AUTH-EXPIRED lane —
+    # has to tell the operator to run `devloop.sh --refresh-creds <slug>` on the
+    # host. A recovery instruction is only actionable with the real value in it.
+    echo "Running in ${DEV_CONTAINER}: ${EXEC_CMD[*]}"
+    podman exec -it -e "DEVLOOP_SLUG=${TASK_SLUG}" -w /work "$DEV_CONTAINER" "${EXEC_CMD[@]}"
+    EXEC_RC=$?
+
+    # Report and exit HERE rather than falling through to Phase 3, which ends in
+    # `read -p "Choice: "` — that would block a finished unattended run on a
+    # keypress nobody is present to give, holding the terminal and the container
+    # indefinitely. This form exists to be left alone, so it reports and leaves.
+    #
+    # Exiting with the command's own code also preserves a distinction Phase 3
+    # would erase. For run-story that is: 0 all tasks complete, 1 implementer-class
+    # stop, 2 operator-class. A story that ended in escalation must not exit like
+    # one that finished.
+    echo ""
+    echo "=== exited rc=${EXEC_RC} ==="
+    EXEC_COMMITS=$(git -C "$CLONE_DIR" log --oneline "${BASE_BRANCH}..HEAD" 2>/dev/null || true)
+    if [ -n "$EXEC_COMMITS" ]; then
+        echo "Commits on ${BRANCH_NAME}:"
+        echo "$EXEC_COMMITS"
+    else
+        echo "No new commits on ${BRANCH_NAME}."
+    fi
+    # Left running deliberately: teardown deletes the clone (and with it any
+    # unpushed commits) and the run evidence under the helper runtime dir, and for
+    # run-story specifically, rerunning is the documented recovery for several
+    # lanes. Named explicitly because more is left up than "containers" suggests —
+    # the Kind cluster behind the helper is the expensive part, and under-reporting
+    # it is how it ends up running overnight after a run that finished.
+    echo ""
+    echo "Still running: ${DEV_CONTAINER}, ${DB_CONTAINER}, and the dev-cluster helper (Kind)."
+    echo "  Re-enter:  $0 ${TASK_SLUG}"
+    echo "  Tear down: $0 --destroy ${TASK_SLUG}   (deletes the clone — push first)"
+    exit "$EXEC_RC"
 fi
 
 podman exec -it "$DEV_CONTAINER" claude --dangerously-skip-permissions --remote-control "$TASK_SLUG" || true

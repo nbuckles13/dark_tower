@@ -391,7 +391,7 @@ while :; do
           # and the resume pointer survives, so a rerun picks up cleanly.
           persist_resume_pointer
           record_infra_incident "$id" auth-expired "OAuth credentials rejected; recovery is devloop.sh --refresh-creds on the host"
-          slogerr "STORY_RUN: AUTH-EXPIRED task=${id} — on the host run: /login (if needed) then ./infra/devloop/devloop.sh --refresh-creds <devloop-slug>, then rerun to resume (<devloop-slug> is the container's slug, not the story slug)"
+          slogerr "STORY_RUN: AUTH-EXPIRED task=${id} — on the host run: /login (if needed) then ./infra/devloop/devloop.sh --refresh-creds ${DEVLOOP_SLUG:-<devloop-slug>}, then rerun to resume (that slug is the container's, not the story's; devloop.sh --run-story exports it as DEVLOOP_SLUG)"
           exit 2
           ;;
         infra)
