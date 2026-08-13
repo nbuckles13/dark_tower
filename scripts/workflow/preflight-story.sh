@@ -63,23 +63,52 @@ fi
 
 command -v claude >/dev/null 2>&1 || fail "claude CLI not found"
 command -v jq >/dev/null 2>&1 || fail "jq not found"
-# dt-story is built by Layer 1 (`scripts/lang/rust/compile.sh:18`), but preflight
-# runs before the first task's pipeline does — so on a freshly created container
-# the binary the next line needs does not exist yet, and every new container hits
-# this. Build it rather than failing: the runner cannot proceed without it, and
-# refusing to run the one command we would have told the operator to run is a
-# papercut, not a safety property.
+# Guard binaries. ONE check naming ONE command, deliberately: the old line named
+# only `-p dt-story`, which steers operators into the built-the-wrong-subset
+# state, and a second half-command beside it would move that trap one line over
+# rather than close it. dt-guard matters here because ~15 always-run Layer-3
+# wrappers consume it and exit 1 when it is missing — which reaches the runner's
+# gate as rc 1 and, under the R-4 split, is blamed on the implementer.
 #
-# Deliberately not sourced from compile.sh: that pulls in `_common.sh`, which
-# mutates global shell state at source time (`set +m`, `shopt -s lastpipe`).
-if [ ! -x target/release/dt-story ]; then
-  echo "PREFLIGHT: building dt-story (Layer 1 has not run in this container yet)..."
-  cargo build --release -p dt-story --quiet || fail "dt-story build failed"
-fi
-[ -x target/release/dt-story ] || fail "dt-story not built (cargo build --release -p dt-story)"
+# This NEWLY REFUSES a run that succeeds today: a fresh container whose first
+# task touches crates/ would have had its own Layer 1 build both binaries before
+# Layer 3 consumed them. It is still right — every task's gate depends on
+# dt-guard, and asserting a dependency at start beats discovering it at Layer 3
+# on the wrong lane — so do not "fix" the strictness.
+[ -x target/release/dt-story ] && [ -x target/release/dt-guard ] \
+  || fail "guard binaries not built (cargo build --release -p dt-guard -p dt-story)"
 [ -f "$STORY_FILE" ] || fail "story file not found: ${STORY_FILE}"
 
 target/release/dt-story validate "$STORY_FILE" || fail "story manifest invalid"
+
+# Capability probe: assert the VERBS consumed, not the artifacts hoped for.
+# `[ -x ]` proves existence, not currency — a dt-story predating the `list-tasks`
+# verb passes it and then makes --stop-after refuse every valid id, sending an
+# operator hunting a typo in a flag that was correct. `--version` cannot catch
+# that (it comes from Cargo.toml, which does not move per commit). Same rule the
+# runner already applies to the CLI, whose version it binds and re-asserts per task.
+#
+# Two steps, because neither alone is enough. Step 1 depends on nothing but the
+# binary, so no reordering of this file can break it. Step 2 asserts the OUTPUT
+# SHAPE, and is attributable to a stale binary because `validate` above has
+# already parsed this file with this binary.
+#
+# Three EXPLICIT checks, never a pipeline: `jq -e` returns 0 on EMPTY input
+# (measured: `printf '' | jq -e 'type=="array"'` -> 0), so a piped shape
+# assertion is vacuous against a producer that emits nothing and its apparent
+# safety comes entirely from pipefail catching the producer's rc. `[ -n "$out" ]`
+# is a CONTRACT-VIOLATION check, not padding: the `list-tasks` bullet in crates/dt-story/src/main.rs's module doc guarantees exit 0
+# carries a JSON array on stdout, so rc-0-with-empty-stdout is a state that
+# contract says cannot occur. That guarantee is per-verb, not crate-wide —
+# `validate` and `complete` both legitimately exit 0 with empty stdout.
+target/release/dt-story list-tasks --help >/dev/null 2>&1 \
+  || fail "target/release/dt-story is STALE — it has no 'list-tasks' verb, which --stop-after validation depends on (cargo build --release -p dt-guard -p dt-story)"
+lt_out="$(target/release/dt-story list-tasks "$STORY_FILE")" \
+  || fail "dt-story list-tasks failed on ${STORY_FILE} despite validate passing — investigate before running the story"
+[ -n "$lt_out" ] \
+  || fail "dt-story list-tasks exited 0 with EMPTY stdout, which its contract (see the list-tasks bullet in crates/dt-story/src/main.rs's module doc) says cannot happen — the binary and its declared contract disagree; rebuild and investigate"
+printf '%s' "$lt_out" | jq -e 'type == "array"' >/dev/null 2>&1 \
+  || fail "dt-story list-tasks output is not a JSON array — the runner's --stop-after validation would misread it"
 
 # --- Runner-owned substrate config (idempotent) ---
 # The Stop hook and the unlimited print-mode background wait are RUNNER

@@ -41,4 +41,11 @@ layer_lifecycle_begin 3
   # bypass-closure behavior end-to-end via the DEVLOOP_TEST-gated LAYER_SCRIPT_DIR stub seam
   # — the layer-all-level seams layer7.test.sh structurally cannot reach. No cluster.
   run_and_emit "layer-all-orchestrator-test" "${__here}/layer-all.test.sh" || true
+  # Story-runner self-test (ADR-0035 §12): the runner drives unattended
+  # skip-permissions sessions and reaches `git reset --hard` + `git clean -fdq`
+  # from a classification decision, with zero tests before this file. Hermetic —
+  # real runner, throwaway fixture repo via the DEVLOOP_TEST-gated
+  # STORY_REPO_ROOT/DT_STORY seams; stub claude/sleep/date, real git, real
+  # dt-story. No cluster, no network, no real sessions.
+  run_and_emit "run-story-selftest" "${__here}/workflow/run-story.test.sh" || true
 } | tee_collect_statuses

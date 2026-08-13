@@ -76,6 +76,25 @@ jobs:
       - name: Install buf
         uses: bufbuild/buf-setup-action@v1
 
+      - name: Build guard binaries
+        # Layer 3 guards are ALWAYS-RUN and consume target/release/dt-guard and
+        # dt-story, but those binaries are produced by a SKIP-GATED compile verb
+        # (scripts/lang/rust/changed.sh triggers only on crates/ changes). So a
+        # packages/**-only PR skips the rust compile, the binaries are absent,
+        # and _dt_guard_wrapper.sh / validate-story-manifest.sh exit 1 — a wiring
+        # fault reported on the implementer lane. Mirrors ci-client.yml's
+        # equivalent step.
+        #
+        # SCOPE: this closes the CI half ONLY. The same skip-gate lives in
+        # scripts/lang/_dispatch.sh and runs identically in a local devloop, so a
+        # fresh worktree with a packages/**-only change still reds Layer 3. And
+        # this is a SECOND build site for the same two binaries alongside
+        # scripts/lang/rust/compile.sh. Both are knowingly accepted here rather
+        # than relocating the build outside the dispatcher, which is an ADR-0033
+        # layering decision (layer1.sh calls dispatcher-as-single-enforcement-point
+        # the load-bearing pipeline invariant). Tracked in docs/TODO.md.
+        run: cargo build --release -p dt-guard -p dt-story
+
       - name: Install Playwright Chromium
         # INTERIM PATCH (see TODO: run CI in the devloop image). Layer 4
         # (scripts/lang/ts/test.sh → nx test:component) runs vitest browser-mode
