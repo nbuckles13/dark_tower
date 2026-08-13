@@ -7,7 +7,10 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/../../.."
 
 BIN=target/release/dt-story
-files="$(grep -l '# task-metadata (dt-story manifest v1)' docs/user-stories/*.md 2>/dev/null || true)"
+# Version-agnostic discovery: matching the `v1` suffix here would make a
+# future marker bump silently select zero files and exit 0 — a masked gate.
+# Any version dt-story cannot parse must reach `validate` and fail loudly.
+files="$(grep -l '# task-metadata (dt-story manifest ' docs/user-stories/*.md 2>/dev/null || true)"
 [ -z "$files" ] && exit 0   # no manifests in tree yet — nothing to validate
 
 [ -x "$BIN" ] || { echo "dt-story not built but manifests exist (cargo build --release -p dt-story)"; exit 1; }

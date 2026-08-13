@@ -68,7 +68,16 @@ async fn cluster() -> &'static ClusterConnection {
 ///
 /// Returns (access_token, display_name). Registers the user once via AC;
 /// subsequent calls return the cached token. This keeps GC-level registration
-/// count to 1 instead of 5, staying well within AC's 5/hour rate limit.
+/// count to 1 instead of 5.
+///
+/// The budget is the DEPLOYED limit, not AC's compiled default. The dev cluster
+/// sets `AC_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS: "100"` /
+/// `AC_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES: "1"`
+/// (`infra/services/ac-service/configmap.yaml:14-15`), so the per-IP ceiling here is
+/// 100/minute — not the 5/hour default in `crates/ac-service/src/config.rs:50,57` that
+/// applies only when those keys are absent. The limit is counted in Postgres
+/// (`user_service.rs:80`), so it is the one AC budget that survives a pod rollout;
+/// at 100/minute the whole suite stays far under it.
 async fn shared_user(cluster: &ClusterConnection) -> &'static (String, String) {
     SHARED_USER
         .get_or_init(|| async {

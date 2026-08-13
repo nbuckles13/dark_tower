@@ -36,7 +36,9 @@ Serial also enables cluster reuse across consecutive tasks, which parallel branc
 
 **Revisit only when both hold**: quota is no longer the binding constraint (API-billed execution, or a materially larger window) **AND** a per-task layer-7 cluster-isolation story exists. The second is a capacity question — do not redesign a helper that is not what is in the way.
 
-**Head-of-line blocking is solved without parallelism.** Add opt-in `--keep-going` (default off): on escalation, record it, skip that task and its dependents, continue with dep-satisfied tasks, exit 1 at the end with the queue. Requires `dt-story next --skip-escalated` (filter to `Pending` only — `next` deliberately re-selects `Escalated` tasks and would otherwise loop within one invocation) plus one runner branch; the dependent cascade falls out of the existing deps filter.
+**Head-of-line blocking is deferred, not solved.** An escalation stops the whole story, including tasks unrelated to the failure. `--keep-going` (on escalation: record it, skip that task and its dependents, continue with dep-satisfied tasks, exit 1 at the end with the queue) was specified here and **withdrawn 2026-08-12**, before implementation.
+
+The mechanics are cheap and stay accurate for whenever it returns: `dt-story next --skip-escalated` (filter to `Pending` only — `next` deliberately re-selects `Escalated` tasks and would otherwise loop within one invocation), plus one runner branch; the dependent cascade falls out of the existing deps filter. Two things to know before building it. `next` returns `AllDone` whenever its candidate set is empty, so a skip-set implementation must distinguish *"nothing left"* from *"everything left is skipped"* — otherwise the story-close gate runs on an incomplete story and reports success. And continuing is only ever correct for **implementer**-class escalations: `auth-expired`, `infra` and substrate-change are environment failures where every subsequent task fails identically, so keeping going spends the story's remaining budget producing copies of one error. That classification is §6's, and while the runner still collapses it this feature would have to carry a second copy. Build it after failure classification is trustworthy, not before.
 
 ### 3. Pass/fail authority is the runner's own pipeline run — never the devloop's verdict
 
@@ -60,7 +62,7 @@ A proposal is admissible if and only if it can only ever *increase* the set of t
 Three admissible uses, all adopted:
 
 - **VERDICT-MISMATCH cross-check.** Read `GATE2` + `LAYER` lines before re-running; if the verdict claims PASS and the runner's re-run goes red, emit `STORY_RUN: VERDICT-MISMATCH` as both a `slog` line and a journal event. Payload: `{task, verdict_head, runner_head, claimed, observed_rc, first_red_layer, verdict_layers, runner_layers}`. Trigger requires all of: verdict exists and parses; `verdict.HEAD == head_before`; verdict claims PASS and the re-run went red. **Never gates.** It is the only mechanism that would *detect* a bad verdict rather than merely be immune to one.
-- **Freshness check.** `verdict.HEAD == head_before` (`run-story.sh:254`). `GATE2_VERDICT_FILE` is a single mutable path every task overwrites, so this is a precondition for reading the artifact for any purpose.
+- **Freshness check.** `verdict.HEAD == head_before` — **not built** (this originally cited `run-story.sh:254`, which is unrelated code; the runner reads the verdict nowhere at all today). `GATE2_VERDICT_FILE` is a single mutable path every task overwrites, so this is a precondition for reading the artifact for any purpose, and must land with the first read that is built.
 - **Commit-completeness assertion.** Assert the task commit contains a devloop main.md at `Phase=complete`; today the runner checks only that HEAD moved. **This is an honest-mistake control, not anti-forgery** — it is `--no-verify`-bypassable and slug-conjunct-gated. Do not over-trust it.
 
 **Record the runner's own per-layer results**, not the artifact's. The runner already loops layers with each `rc` in hand and discards all but the first failure.
@@ -173,7 +175,7 @@ The runner already writes a structured per-task cost ledger. Extend it with **`m
 
 **Retention**: derived scalars are promotable to `docs/devloop-outputs/<slug>/`, git-tracked. **Raw stream-json transcripts and canary responses stay ephemeral and gitignored, permanently** — not because they are known to contain credentials (a scan of Run #1's 70 files found none) but because **their contents are uncontrolled**: a devloop that debugs an auth failure or echoes an env var captures it verbatim into 6–11 MB nobody re-reads before attaching it somewhere.
 
-**Per-story budget ceiling**: a loud stop, not a throttle. One counter against the ledger, set at ~2× the planned estimate (a 14-task story at the measured median is ≈$520, so order $1,000), exiting like the INFRA lane so rerunning is the resume gesture. Depends on the ledger being **durable and parseable**, and on `outcome`, or it cannot distinguish a costly success from a costly failure.
+**Per-story budget ceiling — withdrawn 2026-08-12.** The original decision was a loud stop (not a throttle): one counter against the ledger, set at ~2× the planned estimate, exiting like the INFRA lane so rerunning is the resume gesture. It is not being built. Runs continue until rate-limited, which is an existing, self-enforcing bound. The per-task ledger remains and stays durable and parseable, so the data to reconsider this is still being collected — and the `outcome` field remains required regardless, since distinguishing a costly success from a costly failure is worth having on its own.
 
 ### 12. The runner requires a test suite before further change
 
@@ -187,51 +189,23 @@ The runner already writes a structured per-task cost ledger. Extend it with **`m
 - Also in scope: de-prosing the canary lanes; the substrate probe; the §7 gate; journal schema assertions; and a review pass asserting the recovery paths' comments match the messages they print (a test suite cannot catch a wrong comment, and two were found misdirecting operators mid-incident).
 - **Canary fixtures must carry all three `api_error_status` shapes** — present-with-429, present-with-null, absent. Production emits present-with-null; `jq`'s `//` collapses null and missing today, so a fixture omitting the key looks like it covers the real case and would stop covering it the moment anyone hardens that check.
 
-### 13. Acceptance criteria must be machine-assertable or explicitly annotated
+### 13. Acceptance is proven by env-tests, not by per-task acceptance criteria
 
-A prose ban is an instruction followed by a model — exactly what this ADR's lineage replaces with enforcement. Homed in `dt-story validate`, already invoked by preflight on every run.
+**Amended 2026-08-12. The original decision is withdrawn.** It required every task to carry machine-assertable `acceptance` entries (`passes_after:`, `assert:`, `manual:`), validated at planning, completion and story close, with the story's acceptance tests written by an early task and committed **red** under expected-fail annotations so the suite stayed green-runnable. None of that is built, and it should not be.
 
-Each task carries an `acceptance` list whose entries take **one of three forms, never free prose**: `passes_after: <task-id>`, `assert: <test-id>`, or `manual: <reason>`.
+Three findings retired it.
 
-**No test names are invented at planning time.** `passes_after` names a **task**, not a test, and that is the normal planning-time form. It is knowable when planning: *"this task's behavior is proven by the assertion that lands in task N."* Concretely, the story's acceptance tests are written by an early task and committed **red** with expected-fail annotations, so the suite stays green-runnable all story; each red assertion carries the id of the task that will turn it green. `assert: <test-id>` is for a test that **already exists** — an existing E2E that must keep passing — and is the exception at planning time, not the rule.
+1. **The expected-fail mechanism does not exist across the languages this repo uses.** The contract demanded a marker with three properties — green-runnable while red, self-clearing when the behaviour lands, and provably able to fail. Only Rust's `#[should_panic(expected = "…")]` holds all three. **Bash has no such marker at all.** **Playwright's `test.fail()` fails the first property when a test reds by timing out rather than by throwing** — not hypothetical here, where the config allows 120s and the harness's own waits run 30–60s apiece, so a red path crossing two of them exhausts the budget and fails the suite it was supposed to keep green.
 
-**Validation is lifecycle-aware, which is what makes this work**:
+2. **Committing red is harmful in this runner, independent of the marker.** Pass/fail authority is the runner's own pipeline run (§3), and a red env-test reds *every subsequent task's gates*, not only its own. A deliberately-red assertion therefore makes every later task's verdict meaningless for the remainder of the story — the opposite of what §3 exists to guarantee.
 
-| Checked at | Assertion |
-|---|---|
-| **Planning** (`/user-story` writes the manifest) | 1. Every task has ≥1 entry.<br>2. No entry is free prose — *this is the "ban manual verification note" made mechanical*; choosing `manual:` becomes a visible, deliberate act rather than the path of least resistance.<br>3. Every `passes_after:` names a task that exists in the manifest and is not already complete.<br>4. `manual:` has a non-empty reason; validate reports the count so they stay reviewable. |
-| **Task completion** | 5. Every `assert:` on this task resolves to a test that exists in the tree. *(Enforced here, not at planning — at planning the test may legitimately not exist yet.)* |
-| **Story close** | 6. **No `passes_after` is unsatisfied.** `dt-story next` does not reach exit 3 with a dangling promise. |
+3. **The weaker variant does not address the failure it was aimed at.** Naming the proving test at planning time and making it green within its own task was considered and rejected: a task's own test, written by the same agent that wrote the code, does not detect a partially-broken implementation. That is the failure this section existed to catch, and the ceremony bought no detection.
 
-(3)+(6) are the crux: #63's criterion was *"manual verification note in main.md; automated assertion lands in task 60"* — a promise, tracked as an unchecked TODO box, in a task marked complete. Under this guard that is a `passes_after: 60`, task 63 may still complete, and **the story cannot close until 60's assertion is green.**
+**What replaces it: nothing per-task.** Integration correctness is established by `crates/env-tests` and the browser E2E suite at layer 7. They already run on every devloop, already gate every task, and already find the breakage this section was aimed at. A capability spanning several services is proven when those suites pass — not by criteria attached to the individual tasks that built it.
 
-(4)+(5) are the crux: #63's criterion was *"manual verification note in main.md; automated assertion lands in task 60"* — a promise, tracked as an unchecked TODO box, in a task marked complete. Under this guard that is a `passes_after: 60` and the story cannot close until it is green.
+**What this gives up, stated plainly.** The pattern that motivated the original decision — #63's *"manual verification note in main.md; automated assertion lands in task 60"*, a promise tracked as an unchecked box inside a task marked complete — is no longer mechanically prevented. Nothing now stops a task completing on a promise, and nothing blocks story close on an unsatisfied one. That returns to reviewer judgement. The judgement recorded here is that per-task acceptance bookkeeping cost more ceremony than it removed risk, given that env-tests find these failures anyway and the enforcement mechanism was unavailable in two of three languages.
 
-**The flow, and who flips the annotation.** An early task writes the acceptance test and commits it **red** under an expected-fail annotation, so the suite stays green-runnable while the assertion is unsatisfied. The implementing task later makes it pass **and removes the annotation in the same commit**.
-
-**No runner machinery un-marks it, because the annotation must be self-clearing.** An implementer who forgets to remove it reds their own gate immediately, so the flip cannot be silently skipped. That is a stronger guarantee than a runner-side un-mark, and it needs no new code.
-
-**This is a property contract, not one language's annotation** — acceptance tests here are both TypeScript (Playwright) and Rust (`crates/env-tests` at layer 7), so the mechanism must be stated per language. Any expected-fail marker used for `passes_after` must have all three properties:
-
-1. **Green-runnable while red** — the suite passes with the assertion unsatisfied, so the story stays runnable.
-2. **Self-clearing** — the marker *fails* once the behavior lands, forcing the flip.
-3. **Proves the test can fail** — a vacuous assertion is caught the moment it is committed.
-
-| Language | Marker | Notes |
-|---|---|---|
-| TypeScript / Playwright | `test.fail()` | Fails the suite if the test passes. |
-| Rust (unit + `env-tests`) | `#[should_panic(expected = "<distinctive assertion text>")]` | `cargo test` fails with *"test did not panic as expected"* once the behavior lands, and a vacuous test that never panics fails immediately. Matches the existing house convention — every `should_panic` in the tree already carries `expected =`. |
-| Rust — **not** `#[ignore]` | — | **Fails properties 2 and 3**: an ignored test never runs, so it neither clears itself when the feature lands nor demonstrates it can fail. `#[ignore]` is reserved here for `unimplemented!()` stubs, which `dt-guard test-rigidity` already keys on. Do not overload it. |
-
-**Rust-specific caveat**: `should_panic` is satisfied by *any* panic matching the substring, so a setup `unwrap()` on a `None` can masquerade as a correctly-red acceptance test. The `expected =` string must be distinctive to the assertion itself — not a generic message another failure could produce.
-
-**The hazard this creates, and its partial guard.** The implementing task must edit a test file it did not author, which is the classic route to "make it pass by weakening the assertion." `ts-no-test-removal` (TypeScript only — Rust has no equivalent) catches deletion of a test *file* but is **file-deletion-only in v1** — the block-count heuristic is deferred — so weakening an assertion in place is not mechanically caught. Therefore: **a `passes_after` task's licence to touch the test file is limited to removing the named annotation.** Any other change to that file is a review flag, and this is the one place where the panel is load-bearing rather than confirmatory.
-
-**Committing red is itself a test of the test.** A test that does not fail against unimplemented behavior is proven vacuous the moment it is committed — which test-after never reveals, because a vacuous test passes and looks fine. This is the main reason the inversion is worth its cost, and it is a check the previous ordering could not perform at all.
-
-**What must be knowable when the test is authored — and the altitude rule that follows.** Acceptance tests assert **user-observable behavior through stable seams**, not internal shapes: *"a signed-in user joining a meeting sees their registered display name in the roster"* is authorable at planning without knowing how any service plumbs it. If an assertion cannot be written without first knowing an internal API shape, **the assertion is at the wrong altitude** — that is unit/integration territory owned by the implementing task, not story acceptance. And if the user-observable behavior itself is genuinely undecided, acceptance-tests-first is premature: the story needs a design task, and `manual:` with a stated reason is the honest interim.
-
-**Stated limit**: this closes the *bookkeeping* hole, not the *adequacy* hole. It cannot judge whether a test asserts the right thing, and a test that is too **weak** still escapes — the same class as having no test. That remains reviewer judgment.
+**What survives from the original reasoning**, because it was sound and is not specific to the withdrawn mechanism: acceptance is about **user-observable behaviour through stable seams**. If an assertion cannot be written without first knowing an internal API shape, it is at the wrong altitude — that is unit or integration territory owned by the implementing task. And a test that is merely *weak* escapes any bookkeeping scheme, which was a stated limit of the original decision and remains true of this one.
 
 ### 14. Exploratory tooling needs no ADR; promotion to load-bearing does
 
@@ -277,9 +251,9 @@ Build-then-document was correct here: no up-front debate produces the incident t
 **Where the detail lives — the two halves have different sources, deliberately, to avoid duplicating either:**
 
 - **Skill-batch items** (`/user-story`, `/close-story`, `/devloop`, `devloop.sh`) — detail bodies in `docs/TODO.md` §Story Workflow Follow-ups, which predates this ADR. Those entries are annotated with the section and group that decided them; this ADR owns the decision, grouping and ordering, and the TODO entries stay the single source for the bodies.
-- **Runner and gate work** (§2 `--keep-going`, §3 verdict reads, §7 suppression gate, §8 probe hardening, §9 routing and residue maps, §10 tiering, §11 run record, §12 seams and suite, §13 acceptance criteria) — **specified in the numbered sections above; this ADR is the source.** Do not re-file them into `docs/TODO.md`; a second copy would drift from the decision that created it.
+- **Runner and gate work** (§3 verdict reads, §7 suppression gate, §8 probe hardening, §9 routing and residue maps, §10 tiering, §11 run record, §12 seams and suite) — **specified in the numbered sections above; this ADR is the source.** Do not re-file them into `docs/TODO.md`; a second copy would drift from the decision that created it. §2 `--keep-going`, §11's budget ceiling and §13's acceptance criteria were all specified here and subsequently withdrawn; see those sections for why, and do not re-file them as pending work.
 
-**Bootstrap caveat for the first planning pass**: two things that would improve it are themselves in this list — `/user-story` emitting the manifest at planning time, and §13's machine-assertable acceptance criteria. So Group 1 gets planned with hand-written acceptance criteria and should be re-validated once §13 lands. This is the same inert-until-reinvoke logic as the `--stop-after` seam, not an oversight.
+**Bootstrap caveat for the first planning pass**: one thing that would improve it is itself in this list — `/user-story` emitting the manifest at planning time. Group 1 is therefore planned against a hand-written manifest. (This caveat originally also named §13's machine-assertable acceptance criteria; that decision has since been withdrawn, so there is nothing to re-validate against.)
 
 **Group 1 — runner core, strict order.** §12 is a hard predecessor of everything: landing a gate change, tiering, or the suppression gate before it means using the live run as the test.
 
@@ -290,11 +264,12 @@ Build-then-document was correct here: no up-front debate produces the incident t
 5. **§3 · layer-4 `passed=0` detector** (standalone; the re-run cannot cover this class).
 
 **Group 2 — safe anywhere (inert until reinvoked, or affecting only future runs).**
-- **§13 · acceptance-tests-first — immediately after Group 1.** The only follow-on item with direct defect evidence behind it.
 - `/user-story` emits the manifest at planning time; `/close-story` reads the manifest, not the drifted table.
-- `devloop.sh --run-story` mode; exports `DEVLOOP_SLUG`.
+- ~~`devloop.sh --run-story` mode; exports `DEVLOOP_SLUG`.~~ **Done 2026-08-12**, generalised: `devloop.sh <slug> [base] -- <command...>` runs any command in the prepared container instead of the interactive attach, and exports `DEVLOOP_SLUG`. A story-specific flag was built first and replaced — encoding run-story's option set inside `devloop.sh` would have been a second copy of that interface, drifting from the one it describes.
 - **§9 · `review_mode` field**; **§9 · per-role mechanization boundaries** (including rewriting `.claude/agents/code-reviewer.md`, whose first-listed focus is deny-level clippy and therefore cannot produce a review finding).
-- **§2 · `--keep-going`**; **§11 · budget ceiling**; stale `Co-Authored-By` trailers.
+- Stale `Co-Authored-By` trailers.
+
+*(Withdrawn from this group 2026-08-12: §13 acceptance-tests-first, §2 `--keep-going`, §11 budget ceiling.)*
 
 **Group 3 — live-read `/devloop` skill edits (run last; a fresh `claude -p` reads these per task, so a broken edit breaks the rest of the in-flight run).**
 - `/devloop` headless-only.

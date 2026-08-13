@@ -63,6 +63,19 @@ fi
 
 command -v claude >/dev/null 2>&1 || fail "claude CLI not found"
 command -v jq >/dev/null 2>&1 || fail "jq not found"
+# dt-story is built by Layer 1 (`scripts/lang/rust/compile.sh:18`), but preflight
+# runs before the first task's pipeline does — so on a freshly created container
+# the binary the next line needs does not exist yet, and every new container hits
+# this. Build it rather than failing: the runner cannot proceed without it, and
+# refusing to run the one command we would have told the operator to run is a
+# papercut, not a safety property.
+#
+# Deliberately not sourced from compile.sh: that pulls in `_common.sh`, which
+# mutates global shell state at source time (`set +m`, `shopt -s lastpipe`).
+if [ ! -x target/release/dt-story ]; then
+  echo "PREFLIGHT: building dt-story (Layer 1 has not run in this container yet)..."
+  cargo build --release -p dt-story --quiet || fail "dt-story build failed"
+fi
 [ -x target/release/dt-story ] || fail "dt-story not built (cargo build --release -p dt-story)"
 [ -f "$STORY_FILE" ] || fail "story file not found: ${STORY_FILE}"
 
