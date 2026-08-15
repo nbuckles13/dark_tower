@@ -25,8 +25,8 @@
 - Kind overlays -> `infra/kubernetes/overlays/kind/` (services, observability, per-service)
 - Grafana dashboards + provisioning -> `infra/grafana/{dashboards,provisioning}/`
 - Kind cluster config + setup script -> `infra/kind/kind-config.yaml`, `kind-config.yaml.tmpl`, `infra/kind/scripts/setup.sh`
-- setup.sh parameterization (DT_CLUSTER_NAME, DT_PORT_MAP, DT_HOST_GATEWAY_IP, --yes, --only, --skip-build) -> ADR-0030
-- setup.sh helpers -> `deploy_mc_service()`/`deploy_mh_service()` (ConfigMap advertise-addr patching), `load_image_to_kind()`, `deploy_only_service()`
+- setup.sh parameterization (DT_CLUSTER_NAME, DT_PORT_MAP, DT_HOST_GATEWAY_IP, DT_ORG_MAX_CONCURRENT_MEETINGS, --yes, --only, --skip-build, --provision-org) -> ADR-0030
+- setup.sh helpers -> `deploy_mc_service()`/`deploy_mh_service()` (ConfigMap advertise-addr patching), `load_image_to_kind()`, `deploy_only_service()`, `dt_psql()` (in-pod psql SSoT), `provision_run_org()` (per-run org, the one CONTAINER-runnable mode: early-dispatch before `check_prerequisites`, stdin+`--set` never `psql -c`; caller `scripts/layer7.sh` Phase 1h, tests `scripts/setup.test.sh` §B)
 - Local iteration / teardown / Skaffold -> `infra/kind/scripts/{iterate,teardown}.sh`, `infra/skaffold.yaml`
 - Containerized devloop + dev-cluster CLI -> `infra/devloop/{devloop.sh,dev-cluster}`; container start -> `infra/devloop/entrypoint.sh`
 - Guard policy binary + wrapper shape (ADR-0034; subcommand-per-policy, clap dispatcher, STATUS line per ADR-0033 §6; wrappers source the shared prelude per ADR-0034 §3) -> `crates/dt-guard/`, `scripts/guards/simple/*.sh`

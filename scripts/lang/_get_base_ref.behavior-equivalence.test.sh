@@ -349,16 +349,33 @@ test_ci_push_guardrail_skip() {
 }
 
 # Case 7: guard-callsite-coverage — TWO distinct sub-checks, per @test Gate-1 nit:
-#   7a. Syntax check: bash -n across all 29 scripts in guards/simple/**/*.sh
-#       PLUS guards/common.sh. Broader than the 11 strict callsites because
-#       common.sh is sourced by all 29 — a syntax break in common.sh would
-#       break all 29 even though only 11 directly invoke get_diff_base.
+#   7a. Syntax check: bash -n across EVERY *.sh under scripts/ and infra/.
+#       Broader than the 11 strict callsites because common.sh is sourced by
+#       all the simple guards — a syntax break there would break all of them
+#       even though only 11 directly invoke get_diff_base.
+#
+#       WIDENED 2026-08-15 (story R-7 task #3, @operations F4) from
+#       scripts/guards/simple + common.sh to all of scripts/ + infra/. This was
+#       the ONLY bash -n sweep in the repo, and it covered neither layer*.sh,
+#       lang/**, workflow/**, infra/kind/scripts/** nor infra/devloop/**. Those
+#       were parse-checked only INCIDENTALLY, by self-tests that happen to
+#       execute them — which is how a stray `fi` that made scripts/layer7.sh
+#       entirely unparseable was caught during that story. That catch was
+#       luck-adjacent rather than designed: an unparseable layer script exits
+#       from the shell itself with no STATUS line, no REASON and no lane, so
+#       layer-all records UNKNOWN. A parse error is the cheapest possible thing
+#       to detect and among the most expensive to diagnose, so it gets a
+#       first-class sweep rather than incidental coverage.
+#
+#       Deliberately COUNT-FREE: the old comment pinned "29 scripts", a number
+#       nothing enforced and which was already wrong. The check asserts that
+#       every file found parses, not that some quantity of them exists.
 #   7b. Callsite invocation: confirm the 11 get_diff_base-consuming guards
 #       still contain a get_diff_base callsite (drift guard), AND exercise the
 #       forwarder path end-to-end (source common.sh + invoke get_diff_base()
 #       in a real synthetic git repo; assert it matches direct resolver call).
 test_guard_callsite_coverage() {
-  # 7a — syntax check across 29 scripts + common.sh.
+  # 7a — syntax check across every shell script in scripts/ and infra/.
   local syntax_total=0
   local syntax_failures=0
   local syntax_files=""
@@ -369,7 +386,15 @@ test_guard_callsite_coverage() {
       syntax_failures=$((syntax_failures + 1))
       syntax_files+="$f "
     fi
-  done < <(find "${REPO_ROOT}/scripts/guards/simple" -type f -name "*.sh"; printf '%s\n' "${REPO_ROOT}/scripts/guards/common.sh")
+  done < <(find "${REPO_ROOT}/scripts" "${REPO_ROOT}/infra" -type f -name "*.sh")
+
+  # The sweep finding NOTHING would make the pass branch below vacuous, so treat an empty
+  # result as a hard failure rather than as "all clean" — the same anti-vacuity discipline the
+  # subdomain drift guard applies to its own extraction.
+  if [[ $syntax_total -eq 0 ]]; then
+    FAIL=$((FAIL + 1))
+    FAILURES+=("[guard-callsite-coverage 7a] the bash -n sweep matched ZERO files — the find roots have drifted; this check is VACUOUS until repaired")
+  fi
 
   if [[ $syntax_failures -eq 0 ]]; then
     PASS=$((PASS + 1))

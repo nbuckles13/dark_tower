@@ -47,16 +47,27 @@ Planning produced 23 requirements across 8 tasks. That was disproportionate to t
 
 ## Implementation Plan
 
-| # | Task | Specialist | Depends on | Covers |
-|---|------|-----------|------------|--------|
-| 1 | Seams, hermetic test suite, and the five defect fixes in `run-story.sh` | `test` (paired with `infrastructure`) | — | R-1..R-5 |
-| 2 | Disambiguate GC's three meeting-refusal causes | `global-controller` | — | R-6 |
-| 3 | Provision a fresh organization per layer-7 run | `test` (paired with `database`) | 2 | R-7 |
-| 4 | `/user-story` emits the manifest; `/close-story` reads it | `operations` | 1 | R-8 |
+| # | Task | Specialist | Depends on | Covers | Status | Devloop Output |
+|---|------|-----------|------------|--------|--------|----------------|
+| 1 | Seams, hermetic test suite, and the five defect fixes in `run-story.sh` | `test` (paired with `infrastructure`) | — | R-1..R-5 | Completed | `docs/devloop-outputs/2026-08-13-run-story-seams-and-hermetic-tests/` |
+| 2 | Disambiguate GC's three meeting-refusal causes | `global-controller` | — | R-6 | Completed | `docs/devloop-outputs/2026-08-14-gc-meeting-refusal-causes/` |
+| 3 | Provision a fresh organization per layer-7 run | `test` (paired with `database`) | 2 | R-7 | Completed | `docs/devloop-outputs/2026-08-15-layer7-per-run-org/` |
+| 4 | `/user-story` emits the manifest; `/close-story` reads it | `operations` | 1 | R-8 | Pending | — |
 
 **Task 1 notes.** Two `DEVLOOP_TEST`-gated seams — `STORY_REPO_ROOT` and `DT_STORY` — using the existing exact-match sentinel idiom at `audit-suppressions-check.sh:36-60`, including its fail-loud-when-set-without-sentinel half. `DEVLOOP_TMP` already redirects the run dir; no third seam. Fixture is `mktemp -d` + `git init`, with stub layers and the real `dt-story`; `claude`, `sleep` and `date` are PATH-injected under `env -i`; `git` stays real. Wire the test file into `layer3.sh` at creation. Every stub records its invocation and every case asserts the stubs it depends on ran — promote `assert_marker`/`assert_no_marker` out of `layer-all.test.sh:89-95` rather than copying them. Also carries the ADR §6 one-liner: the canary must run with `--allowedTools ""`, keeping `--dangerously-skip-permissions` (dropping it reintroduces a permission-prompt hang that gets misclassified as `infra`).
 
 **Task 3 notes.** Provision in `layer7.sh` Phase 1, which drives the cluster solely through the `dev-cluster` helper's closed verb allowlist (ADR-0030) — no `psql`, no `kubectl`. Set `max_concurrent_meetings` explicitly (1000); do **not** touch `max_participants_per_meeting`, which an env-test asserts equals 100 and which `LEAST()` would silently cap. Subdomains must be lowercase. Provisioning failure must report on the operator lane (`PRECONDITION_FAILURE`, exit 2), never as a suite failure — which is why task 2 precedes it.
+
+  *Premise corrected 2026-08-15 during implementation.* The clause above asserting that Phase 1 has **no `psql`, no `kubectl`**, and the R-7 mechanism built on it (that provisioning must therefore go through a new `dev-cluster` helper verb), rest on a premise verified **FALSE** in the devloop container on 2026-08-15. Four facts, each checked directly:
+
+  1. `command -v psql` → `/usr/bin/psql`; `infra/devloop/Dockerfile:33` installs `postgresql-client`.
+  2. `command -v kubectl` → `/usr/local/bin/kubectl`; `infra/devloop/Dockerfile:69-78` installs it, sha256-verified.
+  3. `infra/devloop/devloop.sh:519-520` exports `KUBECONFIG=/tmp/devloop/kubeconfig` in the same conditional block that bind-mounts the helper runtime dir, so helper-socket-present ⟺ kubeconfig-present — and ADR-0030 §"Container-Side Test Execution" grants the container kubectl plus a cluster-admin kubeconfig as an explicit, risk-accepted decision.
+  4. `infra/devloop/devloop.sh:235-239` `build_helper()` compiles from `$REPO_ROOT/Cargo.toml` — the **host** checkout, never `CLONE_DIR`. A verb added on this branch therefore cannot exist in the helper serving this devloop, and nothing container-side can rebuild or restart it. Since task 3 runs with `env_tests: true`, the helper-verb route was a *certain* Layer-7 operator-lane red rather than a risk to mitigate, which in headless mode terminates the story.
+
+  **Ruling: no helper verb.** `layer7.sh` Phase 1h invokes `infra/kind/scripts/setup.sh --provision-org <sub>` directly, container-side. That satisfies every substantive requirement stated above (Phase 1; `max_concurrent_meetings` explicitly 1000; `max_participants_per_meeting` untouched; lowercase by construction; `PRECONDITION_FAILURE` exit 2 on any failure) and adds no verb at all, so it cannot undo ADR-0030's injection-impossibility property — which the ADR scopes to the socket surface. `crates/devloop-helper/**` and `infra/devloop/**` are untouched. The corollary now recorded in ADR-0030 is the general form: **no devloop can validate a change to `crates/devloop-helper/` within its own run.**
+
+  Corrected in place rather than deleted, for the same reason this file states for its own 2026-08-14 correction: otherwise the original sentence remains citable as evidence that a helper verb was required, and the next reader re-derives the same dead end. *(test, infrastructure)*
 
 **Where a provisioning failure actually surfaces (corrected 2026-08-14, task 2).** It surfaces at **AC token acquisition**, not at GC meeting creation. AC's `org_extraction` middleware resolves the Host subdomain through `organizations::get_by_subdomain`, which filters `WHERE subdomain = $1 AND is_active = true`, and **fails closed** with `AcError::NotFound`. A missing or inactive organization therefore never yields a token, so the request never reaches `POST /api/v1/meetings` at all. Phase 1 must consequently verify provisioning **directly** — org exists, `is_active`, token obtainable — and treat that check failing as the `PRECONDITION_FAILURE`. A detector keyed on a GC meeting-creation status would be permanently dead code. What task 2 does deliver is the removal of a false positive: `403 ORGANIZATION_MEETING_LIMIT_EXCEEDED` now means a genuine cap **and nothing else**, so a cap signal can be trusted rather than treated as possibly-a-provisioning-fault.
 
@@ -169,7 +180,7 @@ tasks:
   env_tests: false
   prompt: Make GC distinguish the three causes of a refused meeting creation. create_meeting_with_limit_check returns an empty result for cap-exhausted, organization-missing and organization-inactive alike, and the handler maps all three to one 403 saying the limit was exceeded. Give each cause a distinct observable outcome so a provisioning failure cannot be mistaken for a full cap. See docs/user-stories/2026-08-11-story-runner-hardening.md R-6.
 - id: 3
-  status: pending
+  status: completed
   specialist: test
   env_tests: true
   deps:

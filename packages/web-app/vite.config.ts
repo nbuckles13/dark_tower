@@ -50,9 +50,18 @@ export default defineConfig(({ mode }) => ({
   plugins: [svelte()],
   server: {
     // AC needs the subdomain in the Host header (ADR-0020 org extraction), so the
-    // auth proxy PRESERVES Host (changeOrigin:false) — serve the app at
-    // http://demo.localhost:5173 so the Host carries `demo`. GC resolves org from
-    // the JWT, so its proxy may rewrite the host.
+    // auth proxy PRESERVES Host (changeOrigin:false) and forwards WHATEVER `*.localhost`
+    // label the page was served on — this proxy is subdomain-AGNOSTIC and needs no change
+    // per organization. GC resolves org from the JWT, so its proxy may rewrite the host.
+    //
+    // `demo` is NOT a load-bearing label here any more (R-7, story task #3). It remains the
+    // interactive `pnpm dev` default, prefilled in SignUp.svelte/SignIn.svelte and seeded by
+    // infra/kind/scripts/setup.sh:seed_demo_org — serve the app at
+    // http://demo.localhost:5173 for that. The browser E2E suite runs against a PER-RUN
+    // organization instead: scripts/layer7.sh Phase 1h provisions one and exports
+    // E2E_ORG_SUBDOMAIN, from which packages/web-app/e2e/env.ts DERIVES the page origin
+    // (`http://${orgSubdomain}.localhost:5173`). Hardcoding `demo` anywhere on that path
+    // re-creates the cross-run meeting-cap exhaustion the per-run org removes.
     proxy: {
       '/api/v1/auth': { target: AC_PROXY_TARGET, changeOrigin: false, secure: false },
       '/api/v1/meetings': { target: GC_PROXY_TARGET, changeOrigin: true, secure: false },
