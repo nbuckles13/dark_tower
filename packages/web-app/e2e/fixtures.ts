@@ -29,13 +29,17 @@ import {
   type RegisterResponse,
   type SdkErrorCode,
 } from '@darktower/sdk-core';
-import { e2eEnv } from './env.js';
+import { e2eEnv, toLoopbackUrl } from './env.js';
 
 // ============================================================================
 // Credentials
 // ============================================================================
 
-/** Per-run throwaway credentials for the seeded `demo` org. */
+/**
+ * Per-run throwaway credentials for the run's organization — `e2eEnv.orgSubdomain`,
+ * the per-run org layer 7 provisions (R-7), NOT the shared seeded `demo` org.
+ * `fillAuthFields` is what binds them to it; see its note.
+ */
 export interface TestCredentials {
   readonly email: string;
   readonly password: string;
@@ -162,7 +166,16 @@ function meetingPath(code: string): string {
 // Auth (UI-driven)
 // ============================================================================
 
-/** Fill the shared auth fields (SignUp and SignIn use the same testids). */
+/**
+ * Fill the shared auth fields (SignUp and SignIn use the same testids).
+ *
+ * The org-subdomain fill is LOAD-BEARING, not boilerplate (@dry-reviewer, task
+ * #3 review): `SignUp.svelte` and `SignIn.svelte` prefill `demo` in their
+ * `$state`, so a spec that skips this fill and rides the prefill signs into the
+ * shared `demo` org — silently un-fixing R-7 for the one suite whose
+ * meeting-cap exhaustion motivated the per-run org, while every gate stays
+ * green. Always fill from `e2eEnv.orgSubdomain`; never rely on the view default.
+ */
 async function fillAuthFields(page: Page, creds: TestCredentials): Promise<void> {
   await page.getByTestId('email').fill(creds.email);
   await page.getByTestId('password').fill(creds.password);
@@ -587,10 +600,39 @@ export async function signInExpectingRejection(
  * binding check (`crates/mc-service/src/webtransport/connection.rs`) to its
  * `Unauthorized` reply. The token passes through the fulfilled body BY VALUE
  * and is never logged or interpolated anywhere (@semantic-guard item 8).
+ *
+ * ---------------------------------------------------------------------------
+ * FAILURE CLASS: Node resolver vs browser resolver for `*.localhost`.
+ * READ THIS BEFORE WRITING ANOTHER `route.fetch()` IN THIS HARNESS.
+ *
+ * `route.fetch()` does NOT run in the browser — it runs in the Playwright NODE
+ * process, and by default replays the intercepted request's URL verbatim. That
+ * URL carries the per-run org subdomain (`http://e2e-<hex>.localhost:5173/...`,
+ * R-7). Chromium resolves any `*.localhost` label internally; Node does not, so
+ * the verbatim replay dies with `getaddrinfo ENOTFOUND e2e-<hex>.localhost`.
+ * Story R-7 task #3 Gate 2 is the worked example: 7 purely browser-side specs
+ * passed and this one — the harness's only Node-side hop onto the page origin —
+ * failed. `toLoopbackUrl` (env.ts owns the ONE hostname swap) is the fix, and
+ * any new Node-side replay of a browser URL needs it too.
+ *
+ * ONLY the URL moves; the intercepted request's own headers ride along
+ * unchanged, so `Authorization: Bearer <user token>` still reaches GC and the
+ * join is still made as the real signed-in user.
+ *
+ * `Host` is deliberately NOT fixed up here, because on THIS path nothing reads
+ * it: `vite.config.ts` proxies `/api/v1/meetings` with `changeOrigin: true`, so
+ * the proxy rewrites Host to the GC target whatever arrives, and GC's
+ * `join_meeting` resolves the org from the JWT's `org_id` claim
+ * (`crates/gc-service/src/handlers/meetings.rs`), never from Host. The contrast
+ * is load-bearing: `/api/v1/auth` is proxied `changeOrigin: false` precisely
+ * because AC's ADR-0020 org extraction DOES read Host, so a Node-side hop onto
+ * an AC path would have to carry the org-subdomain Host explicitly rather than
+ * inheriting one from the rewritten URL.
+ * ---------------------------------------------------------------------------
  */
 export async function rewriteJoinResponseMeetingId(page: Page, meetingCode: string): Promise<void> {
   await page.route(`**${meetingPath(meetingCode)}`, async (route) => {
-    const real = await route.fetch();
+    const real = await route.fetch({ url: toLoopbackUrl(route.request().url()) });
     const body = (await real.json()) as Record<string, unknown>;
     await route.fulfill({
       response: real,

@@ -129,6 +129,18 @@ No `/etc/hosts` entry is needed for the tests themselves — Chromium resolves
 `*.localhost` natively. (The `demo.localhost` hosts entry from the web-app
 README is for manually browsing with other tools.)
 
+**Corollary — the one rule for Node-side hops.** That native resolution is a
+**browser** behavior; **Node does not resolve `*.localhost`**. The per-run org
+subdomain (`e2e-<hex>.localhost`) therefore resolves in Chromium and NOWHERE
+else, and no hosts entry can help — the label is random per run. So any code in
+this harness that fetches a browser URL from the **Node** side — `route.fetch()`,
+`APIRequestContext`, a bare `fetch()` built from `e2eEnv.baseUrl` — must route it
+through `toLoopbackUrl()` in `env.ts`, which owns the one hostname swap.
+Skipping it yields `getaddrinfo ENOTFOUND e2e-<hex>.localhost` at that call, with
+every browser-side spec around it still green. Node-side calls that already
+target a NodePort (`E2E_AC_URL` / `E2E_GC_URL` / `E2E_PROMETHEUS_URL`, all
+loopback by default) are unaffected — the rule applies only to the page origin.
+
 ## Running
 
 ```bash
@@ -156,16 +168,40 @@ it runs on the retry). Missing dev certs or a missing Playwright Chromium
 surface as `PRECONDITION_FAILURE` (operator lane) **before** either suite runs
 — never as a cryptic spec timeout. Triage: `docs/runbooks/devloop-validation.md`
 §6.7. The layer exports `E2E_*`/`VITE_*_PROXY_TARGET` from the helper's
-ports.json, so a pipeline run needs none of the manual env knobs below.
+ports.json, so a pipeline run needs none of the manual env knobs below —
+**except `E2E_ORG_SUBDOMAIN`, which has no default and no fallback** (R-7).
 
 ### Environment knobs (defaults = static Kind config)
 
-| Variable             | Default                      | Purpose                                           |
-| -------------------- | ---------------------------- | ------------------------------------------------- |
-| `E2E_BASE_URL`       | `http://demo.localhost:5173` | Vite-served demo (Host carries the org subdomain) |
-| `E2E_AC_URL`         | `http://127.0.0.1:8443`      | AC NodePort (health probe)                        |
-| `E2E_GC_URL`         | `http://127.0.0.1:8444`      | GC NodePort (health probe + `bootstrapMeeting`)   |
-| `E2E_PROMETHEUS_URL` | `http://127.0.0.1:9090`      | Assertion (d) counter reads                       |
+| Variable              | Default                                        | Purpose                                                     |
+| --------------------- | ---------------------------------------------- | ----------------------------------------------------------- |
+| `E2E_ORG_SUBDOMAIN`   | **required — no default**                      | The per-run organization. `env.ts` throws if unset or blank. |
+| `E2E_BASE_URL`        | `http://${E2E_ORG_SUBDOMAIN}.localhost:5173`   | **Derived.** Vite-served app; the Host carries the org.      |
+| `E2E_AC_URL`          | `http://127.0.0.1:8443`                        | AC NodePort (health probe)                                   |
+| `E2E_GC_URL`          | `http://127.0.0.1:8444`                        | GC NodePort (health probe + `bootstrapMeeting`)              |
+| `E2E_PROMETHEUS_URL`  | `http://127.0.0.1:9090`                        | Assertion (d) counter reads                                  |
+
+**`E2E_ORG_SUBDOMAIN` is required on purpose.** Layer 7 provisions a fresh
+organization per run (`scripts/layer7.sh` Phase 1h) because no production code
+marks a meeting ended, so an org's live-meeting count only climbs toward
+`max_concurrent_meetings` — this suite creates ~7 meetings per run, and a second
+run against a cap of 10 used to fail partway with a 403 the pipeline blamed on
+the diff. A default here would silently restore that: green on the first run of
+the day, 403 later. Running the suite by hand therefore needs an explicit value,
+e.g. `E2E_ORG_SUBDOMAIN=demo pnpm --filter @darktower/web-app test:e2e` against
+a hand-seeded org.
+
+`E2E_BASE_URL` **derives** from `E2E_ORG_SUBDOMAIN` rather than being a second
+knob. Setting both is allowed but cross-checked: `env.ts` throws if the base
+URL's first host label disagrees with the subdomain. That is a correctness
+constraint, not tidiness — `vite.config.ts:52-57` proxies `/api/v1/auth` with
+`changeOrigin: false` so the Host reaches AC for ADR-0020 org extraction, so two
+values that merely *happen* to agree would let sign-up fill one org into the form
+while AC resolved a different one from the Host.
+
+The throw fires at Playwright **config-load** (`playwright.config.ts` imports
+`env.ts`), i.e. before any browser launches — a named error rather than a spec
+timeout.
 
 Defaults trace to `infra/kind/kind-config.yaml` (SSoT), mirrored by
 `vite.config.ts` (dev proxy) and `crates/env-tests/src/cluster.rs` (Rust

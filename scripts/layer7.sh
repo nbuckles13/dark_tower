@@ -78,6 +78,34 @@ if [[ "${DEVLOOP_TEST:-}" == "1" ]]; then
   BROWSER_E2E_FINGERPRINTS="${DEVLOOP_FINGERPRINTS_JSON:-${__repo_root}/infra/docker/certs/fingerprints.json}"
   BROWSER_E2E_CMD_OVERRIDE="${DEVLOOP_BROWSER_E2E_CMD:-}"
   BROWSER_E2E_TRIGGER_OVERRIDE="${DEVLOOP_BROWSER_E2E_TRIGGER:-}"
+  # Phase-1h org provisioning (R-7): the EXECUTED provisioning script. Same trust boundary as
+  # DEVLOOP_DEV_CLUSTER_BIN — pointing it at a stub would fake the per-run organization, so the
+  # suites would silently run against whatever org they last used and the cross-run meeting-cap
+  # exhaustion R-7 removes would come straight back with every gate still green.
+  # DELIBERATELY NOT A SEAM: the generated subdomain itself. An override there would let a
+  # PINNED subdomain reach production, which is cross-run org REUSE — the exact defect — wearing
+  # a config knob. The self-test observes the generated value through the stub instead.
+  SETUP_SH="${DEVLOOP_SETUP_SH:-${__repo_root}/infra/kind/scripts/setup.sh}"
+  # AC org-resolution probe (Phase-1h verification). Command-swap seam, gated exactly like
+  # HTTP_PROBE: it must return an HTTP STATUS CODE on stdout, because the check discriminates
+  # 401 (org resolved, credentials rejected) from 404 (org_extraction failed closed). A
+  # pass/fail probe cannot express that distinction.
+  #
+  # DEVLOOP_ORG_PROBE_TIMEOUT is a PLAIN BUDGET KNOB, not a seam — same class as
+  # DEVLOOP_ORG_PROVISION_TIMEOUT, so it is deliberately NOT DEVLOOP_TEST-gated: it redirects
+  # nothing and executes nothing, it only moves a deadline. It exists because this cap was the
+  # one hardcoded budget on the Phase-1h path while every sibling (DEVLOOP_HEALTH_BUDGET,
+  # DEVLOOP_ORG_PROVISION_TIMEOUT, ENV_TEST_TIMEOUT, BROWSER_E2E_TIMEOUT) is tunable — and it
+  # is the budget MOST likely to bite. The probe's latency is dominated by AC running bcrypt
+  # UNCONDITIONALLY at cost 12 against a dummy hash for non-existent users (a deliberate
+  # timing-attack mitigation: ac-service/src/services/token_service.rs, "Always run bcrypt to
+  # prevent timing attacks"), so the cost is CPU-bound on a possibly-throttled Kind node, NOT
+  # the two indexed lookups. Blowing this budget lands PRECONDITION_FAILURE / ac-unreachable,
+  # which under scripts/workflow/run-story.sh is PIPELINE-PRECONDITION -> exit 2 and HALTS THE
+  # WHOLE STORY for operator intervention. An operator who has diagnosed a slow node needs a
+  # deadline they can move; without the knob the only remedy the runbook could offer was
+  # "re-run".
+  ORG_PROBE="${DEVLOOP_ORG_PROBE:-curl -s -o /dev/null -w %{http_code} --max-time ${DEVLOOP_ORG_PROBE_TIMEOUT:-10}}"
 else
   DEV_CLUSTER="${__repo_root}/infra/devloop/dev-cluster"
   DEVLOOP_HELPER_SOCKET="/tmp/devloop/helper.sock"
@@ -86,6 +114,8 @@ else
   BROWSER_E2E_FINGERPRINTS="${__repo_root}/infra/docker/certs/fingerprints.json"
   BROWSER_E2E_CMD_OVERRIDE=""
   BROWSER_E2E_TRIGGER_OVERRIDE=""
+  SETUP_SH="${__repo_root}/infra/kind/scripts/setup.sh"
+  ORG_PROBE="curl -s -o /dev/null -w %{http_code} --max-time ${DEVLOOP_ORG_PROBE_TIMEOUT:-10}"
 fi
 
 # NOT a DEVLOOP_TEST-gated seam, deliberately: PLAYWRIGHT_BROWSERS_PATH is Playwright's OWN
@@ -318,6 +348,73 @@ __dev_cluster_setup() {
 }
 
 # -----------------------------------------------------------------------------
+# Per-run organization (Phase 1h, R-7)
+# -----------------------------------------------------------------------------
+
+# Generate the per-run organization subdomain: `e2e-<16 lowercase hex>`, 20 chars, no inputs.
+#
+# VALID BY CONSTRUCTION — no sanitizer, no validation, nothing a future input can break. The
+# fixed `e2e-` prefix and a lowercase-hex suffix mean the result cannot begin or end with a
+# hyphen, cannot contain uppercase, and is 20 chars against a 63-char limit. This function
+# therefore carries NO copy of the schema's subdomain CHECK regex (@code-reviewer: generation
+# over validation). migrations/20250118000001_initial_schema.sql:16 is the format SSoT;
+# setup.sh's own check is defense-in-depth at the point the value meets SQL and must NOT be
+# collapsed on DRY grounds (@dry-reviewer, @security) — provenance ("it happens to be locally
+# generated") does not survive future edits; construction does.
+#
+# NO CLUSTER/STORY SLUG IN THE SUBDOMAIN, deliberately (@client). An earlier draft used
+# `e2e-<sanitized-slug>-<hex>`, where the middle was valid by *sanitization* — a function of
+# inputs this script does not control (story slug, task name, branch), and story titles in this
+# repo already contain em-dashes and other non-ASCII. That gap lands on the WRONG LANE: a
+# malformed subdomain is exported, reaches packages/web-app/e2e/env.ts's required-var check, and
+# throws at Playwright CONFIG-LOAD time — so the browser suite exits non-zero and Phase 2 records
+# `FAIL browser-e2e-failed`, exit 1, IMPLEMENTER lane. A provisioning-input defect billed to the
+# diff is the exact misattribution R-7 forbids and R-4 exists to prevent. Human-readable
+# identification lives in the org's `display_name`, which has no DNS-label constraint.
+#
+# RANDOMNESS — `od -An -tx1 -N8 /dev/urandom` reads EXACTLY 8 bytes and exits. The idiomatic
+# `tr -dc 'a-z0-9' </dev/urandom | head -c N` is a landmine under this script's `set -euo
+# pipefail`: head closes the pipe, tr takes SIGPIPE (141), pipefail propagates, and set -e kills
+# layer7.sh with NO STATUS line and NO lane — a bare non-zero exit that never reaches
+# precondition_fail. Same defect class this story's Deferred section records for `find` in
+# run-story.sh (@security). `od` also emits lowercase hex by construction, so there is nothing to
+# normalize between generation and INSERT (@security S12: no `${x,,}`, no trim, no truncate — a
+# value that changed shape after validation would land under a different subdomain than the one
+# exported to the suites, and both suites would then fail at AC token acquisition).
+#
+# 64 bits ⇒ P(collision) over k=1000 orgs accumulated on one cluster ≈ k²/2^65 ≈ 2.7e-14. A
+# collision is loud regardless: the INSERT carries no ON CONFLICT, so it is a unique violation,
+# never a silent reuse of an at-cap org.
+# Args: (none)  Outputs: the subdomain on stdout.
+__generate_org_subdomain() {
+  # LC_ALL=C pins the bracket ranges in the postcondition below to ASCII. Bash applies a
+  # `local LC_ALL=` assignment through setlocale and restores it on unwind, so the scope is
+  # exactly this function. Same control, same reason, as infra/kind/scripts/setup.sh's
+  # `local LC_ALL=C` above `subdomain_re` — under a UTF-8 locale `[0-9a-f]` is
+  # collation-dependent and does not reliably mean ASCII, so the pattern LOOKS structural
+  # without being so. Not exploitable today (the input is `od -tx1` output, ASCII by
+  # construction) — but that is PROVENANCE, and this postcondition exists precisely because
+  # "valid by construction" can silently stop holding. A check that catches provenance
+  # breaking must not itself depend on the environment. (@security)
+  local LC_ALL=C
+  local suffix
+  suffix="$(od -An -tx1 -N8 /dev/urandom | LC_ALL=C tr -d ' \n')"
+  # POSTCONDITION ON THE ENTROPY READ. `set -e` does NOT catch a failed command substitution in
+  # argument position — measured: `printf 'e2e-%s' "$(od -An -tx1 -N8 /nonexistent 2>/dev/null
+  # | tr -d ' \n')"` yields the string `e2e-` with rc 0. That ends in a hyphen, so it fails the
+  # schema CHECK, and "valid by construction" would have silently stopped holding while the
+  # function still reported success. setup.sh's boundary check does catch it — which is that
+  # layered check earning its keep — but it names the wrong problem at 3am ("invalid subdomain
+  # at the SQL boundary" when the fault is "the entropy read failed").
+  # NOT a copy of the schema regex, and deliberately so (@code-reviewer, @dry-reviewer ruled
+  # against that): this asserts `[0-9a-f]{16}` — that the generator produced the entropy it
+  # claims — and says nothing about DNS-label format. Generation-over-validation is preserved;
+  # this is a postcondition on generation itself. (@operations)
+  [[ "$suffix" =~ ^[0-9a-f]{16}$ ]] || return 1
+  printf 'e2e-%s' "$suffix"
+}
+
+# -----------------------------------------------------------------------------
 # Env-test URL wiring (Phase 1d)
 # -----------------------------------------------------------------------------
 
@@ -482,6 +579,250 @@ __layer7_main() {
   fi
   emit_step_duration observability-ready "$t_step"
 
+  # (h) Per-run organization (R-7). No production code ever marks a meeting ended, so an org's
+  #     count of live meetings only CLIMBS toward max_concurrent_meetings: the browser suite
+  #     creates ~7 meetings/run against demo's cap of 10, so a second run against the same
+  #     cluster failed partway with a 403 the pipeline attributed to the code under test.
+  #     Provisioning a FRESH org per run makes run N's verdict independent of runs 1..N-1 for
+  #     everything keyed by org_id. (NOT for anything keyed above it — AC's registration limiter
+  #     counts auth_events by IP, org-independent (user_service.rs:203-229). Not a regression,
+  #     but the same mechanism one level up; see the story's Deferred section.)
+  #
+  #     ORDERING IS LOAD-BEARING: this runs AFTER (e) pods-healthy and (f) observability-HTTP,
+  #     so a failure here can be attributed narrowly — the cluster and the NodePort path are
+  #     already confirmed, which is what lets `ac-unreachable` and `org-provision-unverified` be
+  #     different lanes instead of one ambiguous cell. Do not reorder without re-reading this.
+  #
+  #     OPERATOR LANE THROUGHOUT: every failure below is precondition_fail (exit 2). There is
+  #     deliberately NO fallback to the static devtest/demo orgs — a fallback would report R-7
+  #     fixed while the cluster kept accumulating meetings, i.e. a false green.
+  t_step=$(layer_now)
+  local run_org cluster_name provision_out provision_rc
+  # THE ONE `|| true` IN THIS FILE, AND IT IS LOAD-BEARING — do not delete it to satisfy the
+  # "no `|| true`" rule declared above (@operations F5). Without it, a missing or unreadable
+  # ports.json makes jq exit non-zero and `set -e` kills layer7.sh on THIS line: no STATUS
+  # line, no REASON token, no lane — the same shape as the stray-`fi` parse failure. With it,
+  # the emptiness is caught by the `-z` check two lines down and routed to
+  # org-provision-context-unresolved, which is a named operator lane. The `|| true` converts a
+  # lane-less death into a diagnosed one; it swallows nothing, because the very next statement
+  # inspects the value it produced.
+  cluster_name="$(jq -r '.cluster_name // empty' "$ENV_TEST_PORTS_JSON" 2>/dev/null || true)"
+  if [[ -z "$cluster_name" ]] || ! command -v kubectl >/dev/null 2>&1; then
+    precondition_fail org-provision-context-unresolved \
+      "cannot resolve a kubectl context for the devloop cluster (ports.json '.cluster_name'='${cluster_name:-<empty>}', kubectl $(command -v kubectl >/dev/null 2>&1 && echo present || echo MISSING)) — refusing to provision the per-run organization against an unknown database" \
+      "this is a cluster-addressing problem, NOT a database problem: ensure 'dev-cluster setup' completed and wrote /tmp/devloop/ports.json, and that the container kubeconfig is mounted (re-run devloop.sh on the host)"
+  fi
+  # Folded into org-provision-failed with an explicit cause rather than a sixth token: the
+  # runbook is scoped at five and this cause is too rare to earn a dedicated row (@operations).
+  run_org="$(__generate_org_subdomain)" || precondition_fail org-provision-failed \
+    "could not generate a per-run organization subdomain — the read from /dev/urandom did not yield 16 hex characters, so the generator's postcondition failed (this is an ENTROPY/environment fault, not a SQL or subdomain-format problem)" \
+    "check /dev/urandom is readable in this container and that od/tr are present on PATH"
+  # Emitted BEFORE the call, unconditionally: with no audit log on this route this is the only
+  # record of which org the run used, and printing it first means it precedes every later
+  # failure note in this same stream (incl. env-tests-failed / browser-e2e-failed).
+  printf 'Layer7: provisioning per-run organization subdomain=%s cluster=%s\n' \
+    "$run_org" "$cluster_name" >&2
+  # DELIBERATE, NARROW DEPARTURE from this file's own "no post-hoc $? under set -e" rule, and
+  # signed off as correct (@code-reviewer): `timeout`'s rc 124 must stay distinguishable from
+  # generic non-zero, and the `if ! cmd` form collapses every non-zero into one branch. The
+  # window is exactly one statement wide and the rc is branched three ways (124, then non-zero,
+  # then the fail-closed PROVISIONED_ORG positive match). Do not "fix" this back to `if !`.
+  #
+  # SINGLE ATTEMPT, AND ANY FUTURE RETRY MUST REGENERATE `run_org` FIRST (@database). The INSERT
+  # in provision_run_org() carries NO `ON CONFLICT`, deliberately — a duplicate subdomain must be
+  # a detectable collision, not a silently reused at-cap org. So a retry loop wrapped around this
+  # call that re-sends the SAME subdomain would hit the `organizations_subdomain_key` unique
+  # violation on attempt 2 and surface as `org-provision-failed` — reading as a provisioning
+  # DEFECT when the real fault was whatever made attempt 1 transient. Regenerate per attempt, or
+  # do not retry. (This is the opposite direction from the "never regenerated" note at the export
+  # below, which forbids re-deriving the subdomain AFTER a successful provision.)
+  set +e
+  provision_out="$(DT_CLUSTER_NAME="$cluster_name" \
+    timeout "${DEVLOOP_ORG_PROVISION_TIMEOUT:-120}" "$SETUP_SH" --provision-org "$run_org" 2>&1)"
+  provision_rc=$?
+  set -e
+  # Relay to STDERR: setup.sh's log_* write to STDOUT, and THIS script's stdout is the STATUS=
+  # channel tee_collect_statuses/parse_status_line consume. Mirrors __dev_cluster_setup:311-312.
+  printf '%s\n' "$provision_out" >&2
+  # 124 branched FIRST — a timeout is a distinct operator action from a rejected INSERT.
+  if (( provision_rc == 124 )); then
+    precondition_fail org-provision-timeout \
+      "provisioning the per-run organization did not complete within ${DEVLOOP_ORG_PROVISION_TIMEOUT:-120}s — the cluster passed pods-healthy and observability-HTTP, so a hang here points at the K8s API server or the postgres pod, not at the diff" \
+      "kubectl -n dark-tower get pods; check the postgres-0 pod and its logs; raise DEVLOOP_ORG_PROVISION_TIMEOUT only after ruling out a wedged pod"
+  fi
+  # Positive-match, fail-closed (same discipline as __cluster_ready): absence of the token counts
+  # as failure. setup.sh interleaves log_step/log_info on stdout, so there is no "last line".
+  if (( provision_rc != 0 )) || ! grep -qF "PROVISIONED_ORG " <<<"$provision_out"; then
+    precondition_fail org-provision-failed \
+      "could not provision the per-run organization '${run_org}' — setup.sh --provision-org exited ${provision_rc}$( (( provision_rc == 0 )) && printf ' but emitted no PROVISIONED_ORG line, so the statement never confirmably ran (a success-looking no-op)') — the env-test and browser suites have no organization to run against" \
+      "the relayed setup.sh output above carries the psql diagnostic; verify the postgres pod is up and the migrations ran ('kubectl -n dark-tower exec postgres-0 -c postgres -- psql -U darktower -d dark_tower -c \\\\dt')"
+  fi
+  # TWO TIMERS, NOT ONE (@observability F2). `provision-org` is closed HERE, before verification,
+  # and `org-verify` is opened for the AC probes. Verification waits up to $obs_budget (300s) on
+  # AC /health, so a single timer spanning both would bill a cold AC to PROVISIONING: an operator
+  # reading `STEP=provision-org DURATION=200` goes looking at postgres-0, which is exactly where
+  # the org-provision-timeout row also sends them. That is the timing surface committing the same
+  # attribution error the lane tokens go to real lengths to avoid. The failure lanes already
+  # discriminate the two halves; the timing line now does too, for the same reason.
+  emit_step_duration provision-org "$t_step"
+  t_step=$(layer_now)
+
+  # Verify DIRECTLY (story R-7 / Task-3 notes). A provisioning failure surfaces at AC TOKEN
+  # ACQUISITION, not at GC meeting creation: AC's org_extraction middleware resolves the Host
+  # subdomain via organizations::get_by_subdomain (WHERE subdomain = $1 AND is_active = true) and
+  # FAILS CLOSED with AcError::NotFound, so no token is minted and the request never reaches
+  # POST /api/v1/meetings. A detector keyed on a GC meeting-creation status would be permanently
+  # dead code.
+  #
+  # AC's own health is probed FIRST so "AC is down" and "the org is not there" get DIFFERENT
+  # lanes rather than one ambiguous cell. Built on __wait_http_ready (not a raw curl) so it
+  # inherits the DEVLOOP_TEST-gated $HTTP_PROBE seam — which makes this lane hermetically
+  # testable — and the IFS=$'\n\t' array-splitting handling documented at :284-291, whose absence
+  # would produce exit 127 on every probe and surface as a phantom ac-unreachable against a
+  # perfectly healthy AC.
+  # ABSENT AC URL IS A FAILURE, NOT A SKIP (@operations). This deliberately INVERTS the `-n`
+  # shape used for Prometheus/Loki at 1f: those are genuinely optional (documented auto-skip
+  # semantics, `--skip-observability` is a supported mode), so guarding them on presence is
+  # correct. AC is NOT optional — both suites acquire their tokens through it — so the same
+  # shape here would mean the opposite thing. Reachable, not theoretical: Phase 1d's
+  # __env_test_export_urls returns 0 when ports.json EXISTS but lacks `.container_urls.ac`
+  # (stale file, partial write, helper crashed mid-write), so `ports-json-missing` never trips
+  # and ENV_TEST_AC_URL stays unset. Guarding on presence would then skip verification silently
+  # and run the suites against an unverified org — both fail at AC token acquisition, and the
+  # verdict is FAIL env-tests-failed, exit 1, IMPLEMENTER lane, consuming an attempt. A
+  # provisioning-verification gap billed to the diff is the precise misattribution this task
+  # exists to prevent.
+  if [[ -z "${ENV_TEST_AC_URL:-}" ]]; then
+    precondition_fail ac-unreachable \
+      "ports.json has no '.container_urls.ac', so AC has no address and the per-run organization '${run_org}' cannot be verified — refusing to run the suites against an unverified org" \
+      "re-run 'dev-cluster setup' so the helper rewrites /tmp/devloop/ports.json with a complete container_urls block; inspect it with: jq .container_urls /tmp/devloop/ports.json"
+  fi
+  # Verification runs UNCONDITIONALLY from here — there is no path to Phase 2 that skips it.
+  __wait_http_ready "${ENV_TEST_AC_URL}/health" "$obs_budget" \
+      || precondition_fail ac-unreachable \
+        "AC did not answer ready (${ENV_TEST_AC_URL}/health != 2xx) within ${obs_budget}s — the per-run organization was provisioned, but AC cannot be asked whether it resolves, so a failure here is NOT attributable to provisioning" \
+        "check the ac-service pod ('dev-cluster status'; kubectl -n dark-tower get pods) + its logs"
+  # 401 vs 404 is the whole check. A deliberately NON-EXISTENT email means: org missing or
+  # inactive -> 404 (org_extraction fails closed); org present and active -> user lookup misses
+  # -> 401. Consumes NO rate-limit budget: token_service.rs:222-235 only rate-limits by_user
+  # when the user exists, and the IP-keyed registration counter (user_service.rs:203-229) counts
+  # only success=true events. A registering probe would instead spend from the very budget the
+  # two suites share -- causing the flake it exists to prevent.
+  #
+  # NOT WRAPPED IN AN `if`, deliberately — see the "runs UNCONDITIONALLY" note above. An earlier
+  # revision of this hunk guarded the probe on `[[ -n "$ENV_TEST_AC_URL" ]]`; inverting that to
+  # the fail-closed check at :639 left its closing `fi` behind, which made this whole FILE
+  # unparseable (`bash -n` → "syntax error near unexpected token `fi'"). That is worse than any
+  # lane bug: bash rejects the script before line 1 runs, so layer7 exits 2 from the shell itself
+  # with NO STATUS line, NO REASON token and NO lane — layer-all records UNKNOWN. layer7.test.sh
+  # runs the real script for every flow case, so the suite catches this class immediately; keep
+  # it wired (scripts/layer3.sh) and keep new branches balanced.
+  local -a org_probe; IFS=' ' read -r -a org_probe <<<"$ORG_PROBE"
+  local ac_authority probe_code
+  ac_authority="${ENV_TEST_AC_URL#*://}"
+  probe_code="$("${org_probe[@]}" -X POST \
+    -H "Host: ${run_org}.${ac_authority}" \
+    -H 'Content-Type: application/json' \
+    --data '{"email":"layer7-provision-probe@invalid.test","password":"not-a-real-password"}' \
+    "${ENV_TEST_AC_URL}/api/v1/auth/user/token" 2>/dev/null)" || probe_code="000"
+  # DISCRIMINATE BY WHAT THE CODE ACTUALLY EVIDENCES (@operations F1+F2, @observability F1,
+  # @semantic-guard, @code-reviewer, @security). Each token fires ONLY on the condition it names:
+  #
+  #   401  -> PASS. AC resolved the org and reached credential checking.
+  #   404  -> org-provision-unverified. THE ONLY code that evidences a provisioning fault:
+  #           org_extraction fell through get_by_subdomain's
+  #           `WHERE subdomain = $1 AND is_active = true` and failed closed.
+  #   2xx  -> ac-auth-bypass-signature. AC ANSWERED, and authenticated an account that cannot
+  #           exist. Neither a provisioning fault nor an availability one. Own token (@security
+  #           F4) — see the arm below for why the catch-all is the wrong home for it.
+  #   *    -> ac-unreachable. The shared cause is "AC could not answer the question", which is
+  #           that token's meaning. The observed code goes in the cause line.
+  #
+  # WHY THE CATCH-ALL IS ON ac-unreachable AND NOT ON unverified. An earlier revision had
+  # `!= 401 -> org-provision-unverified`, whose remediation asserts with maximum confidence
+  # "this is a PROVISIONING fault, not a flake — re-running will not change it". That sentence is
+  # FALSE for a transport failure (`000`) and for a 5xx, and it sends the operator to inspect an
+  # `organizations` row that is fine — the exact misattribution R-7 exists to remove, produced by
+  # the check built to prevent it. Defaulting the unknown case to the SPECIFIC diagnosis was the
+  # bug; defaulting it to "AC could not answer" is the honest one.
+  #
+  # NO DEDICATED 429 LANE, deliberately — and this is a CORRECTION, recorded rather than silently
+  # applied. An earlier revision had one, justified by "repeated failed auth is exactly what AC's
+  # 60s sliding-window limiter counts". That is FALSE for this probe, as the comment above already
+  # implies: `issue_user_token`'s limiter is inside `if let Some(ref u) = user`
+  # (token_service.rs:226-246) and returns AcError::TooManyRequests, so a deliberately
+  # NON-EXISTENT email never reaches it. The other 429 sources are off this path entirely —
+  # token_service.rs:61-68 is `issue_service_token` (client_credentials) and returns
+  # AcError::RateLimitExceeded; user_service.rs:86 is registration, IP-keyed. AC has no
+  # rate-limit middleware. So 429 CANNOT occur here today, and a dedicated LANE would have been a
+  # TOKEN that cannot fire — the same dead-code defect this story refused to commit for
+  # `helper-verb-unsupported` / `org-provision-helper-busy`. The catch-all still routes a future
+  # 429 to ac-unreachable, so @security's forward-compatible fail-safe is preserved WITHOUT a
+  # dead token: if AC ever gains an IP or endpoint limiter, it lands on the operator lane
+  # naming the code, never as a phantom provisioning fault.
+  #
+  # PRECISION ON WHAT SURVIVED, because the sentence above used to overclaim (@code-reviewer N4).
+  # What was deleted is the dedicated 429 LANE — its own REASON token, its own runbook row, its
+  # own operator action. What REMAINS is a `429)` arm in the sub-cause `case` below, and that arm
+  # genuinely cannot fire today. It is deliberate and it is NOT the dead-branch class, because it
+  # claims no diagnosis: it selects explanatory TEXT inside a lane (`ac-unreachable`) that has
+  # already been chosen by the catch-all, and the text it selects says exactly "if you are
+  # reading this, AC has GAINED a limiter this probe does not model — update both." A dead LANE
+  # asserts a wrong cause and sends an operator somewhere; a forward-compatible sub-cause string
+  # costs one `case` arm and turns a future silent misfile into a self-describing one. Those are
+  # different things and the earlier wording conflated them — worth correcting in place, since a
+  # comment naming a property the code does not have is the exact failure mode this file is
+  # otherwise careful about.
+  #
+  # The false justification is corrected rather than deleted because it was actively dangerous:
+  # a reader citing it as evidence that this probe spends failed-auth budget would "fix" the
+  # probe by registering a user — spending the IP-KEYED REGISTRATION budget the two suites
+  # genuinely DO share, and causing the very flake the 401 probe was chosen to avoid.
+  if [[ "$probe_code" == "404" ]]; then
+    precondition_fail org-provision-unverified \
+      "AC is healthy and ANSWERED, but will not resolve the organization just provisioned: a token request with Host '${run_org}.${ac_authority}' returned 404. AC's org_extraction fell through organizations::get_by_subdomain's 'WHERE subdomain = \$1 AND is_active = true' — the row is missing or inactive despite provisioning reporting success" \
+      "this is a PROVISIONING fault, not a flake — re-running will not change it. Check the row: kubectl -n dark-tower exec postgres-0 -c postgres -- psql -U darktower -d dark_tower -c \"SELECT subdomain, is_active FROM organizations WHERE subdomain = '${run_org}'\""
+  fi
+  # 2xx BEFORE the catch-all, on its OWN token (@security F4). This is the one non-401 status
+  # that is neither "AC could not answer" nor "the org is missing": AC answered, and the answer
+  # is that it AUTHENTICATED an account that cannot exist. Filing it under ac-unreachable would
+  # repeat, one arm over, the precise defect F1 fixed — that token's cause line closes with "AC
+  # simply could not be asked", which is FALSE here in the most load-bearing way available.
+  # `ac-unreachable` is NOT a neutral bucket: it makes a positive claim about what did not
+  # happen, so an unknown-but-answering code must not default there any more than it may default
+  # to org-provision-unverified. A security signature filed under a name that says "the service
+  # was unreachable" is a misattribution an operator acts on at 3am — and this one is acted on
+  # by re-running, which is the single worst response available.
+  #
+  # NOT the dead-token class this file refuses elsewhere (see the 429 note above): unlike 429,
+  # which is unreachable by inspection, a 2xx here is not provably impossible. It is the
+  # signature of a regression in AC's user-token path, which is exactly a mode worth naming.
+  if [[ "$probe_code" == 2?? ]]; then
+    precondition_fail ac-auth-bypass-signature \
+      "the organization-resolution probe for Host '${run_org}.${ac_authority}' got ${probe_code} — a SUCCESS status for an account that CANNOT EXIST. The probe posts 'layer7-provision-probe@invalid.test', an address nothing registers, so any 2xx means AC accepted credentials for a non-existent user. This is NOT a provisioning fault and NOT an availability problem: AC answered, promptly, with the wrong answer. It is an authentication-bypass signature in AC's user-token path" \
+      "TREAT THIS AS A SECURITY FINDING. Do NOT re-run to see if it clears, and do NOT raise any timeout — neither changes what AC just did, and a second green run would bury it. Note the org-resolution question this probe exists to ask went UNANSWERED, so the per-run organization is also unverified. Capture the full response before anything is redeployed or torn down: curl -i -X POST -H \"Host: ${run_org}.${ac_authority}\" -H 'Content-Type: application/json' --data '{\"email\":\"layer7-provision-probe@invalid.test\",\"password\":\"not-a-real-password\"}' \"${ENV_TEST_AC_URL}/api/v1/auth/user/token\" ; then grab AC's logs (kubectl -n dark-tower logs -l app=ac-service --tail=200) and escalate to the auth-controller and security owners"
+  fi
+  if [[ "$probe_code" != "401" ]]; then
+    # Sub-cause detail only — ONE token, because the operator action is the same in kind ("find
+    # out why AC could not answer"), while the specific hint differs. No 2xx arm here: 2xx is
+    # claimed by its own lane above and can never reach this case.
+    local probe_detail
+    case "$probe_code" in
+      000) probe_detail="got NO HTTP RESPONSE at all (transport failure, or the probe's own ${DEVLOOP_ORG_PROBE_TIMEOUT:-10}s cap elapsed). AC answered /health moments ago, so a cold or CPU-starved AC exceeding the probe budget on its FIRST token request is the likely cause: /health is a trivial handler, whereas this endpoint does two indexed lookups AND — dominating both — an UNCONDITIONAL bcrypt verify at cost 12 against a dummy hash, which AC runs even for a non-existent account to keep the path constant-time. That is CPU-bound, so a throttled or contended node stretches it. Raise DEVLOOP_ORG_PROBE_TIMEOUT (default 10) rather than re-running blind if this recurs" ;;
+      5??) probe_detail="got ${probe_code}: AC answered but failed INTERNALLY. Since org_extraction returns 404 when an organization does not resolve, a 5xx is not evidence about the per-run organization — look at AC's own dependencies (database, JWKS)" ;;
+      429) probe_detail="got 429. NOTE: no AC limiter counts this request today (a non-existent email never reaches the by-user window), so this means AC has GAINED a limiter that layer7.sh's probe does not model — both the probe and this token's guidance need updating" ;;
+      *)   probe_detail="got the unexpected status ${probe_code}, which is neither 401 (org resolved) nor 404 (org not resolved). AC did not answer the question this probe asks" ;;
+    esac
+    precondition_fail ac-unreachable \
+      "the organization-resolution probe for Host '${run_org}.${ac_authority}' ${probe_detail}. This is NOT a provisioning fault — the per-run organization may well be fine; AC simply could not be asked" \
+      "check the ac-service pod ('dev-cluster status'; kubectl -n dark-tower get pods) and its logs ('kubectl -n dark-tower logs -l app=ac-service --tail=100'). Unlike org-provision-unverified, re-running Layer 7 is a reasonable action here"
+  fi
+
+  # ONE generation site, ONE exported value — the subdomain actually provisioned and verified,
+  # never regenerated. The browser half is exported with its E2E_* siblings below (Phase 2).
+  export ENV_TEST_ORG_SUBDOMAIN="$run_org"
+  emit_step_duration org-verify "$t_step"
+
   # (g) Browser-E2E trigger + preconditions (task #19, R-48). Trigger-gated: these checks
   #     run ONLY when the browser suite will actually run — an untriggered diff must not
   #     be able to red on a workstation without Playwright installed. Both checks are
@@ -579,6 +920,11 @@ __layer7_main() {
     # harness (packages/web-app/e2e/env.ts); VITE_* points the dev proxy the browser
     # traffic flows through at the same AC/GC endpoints.
     export E2E_AC_URL="$ENV_TEST_AC_URL" E2E_GC_URL="$ENV_TEST_GC_URL"
+    # The per-run org (Phase 1h), DERIVED from the one generation site — not regenerated.
+    # E2E_BASE_URL is deliberately NOT exported: packages/web-app/e2e/env.ts derives it from
+    # this value and hard-throws if both are set and the host label disagrees, so exporting it
+    # here would trip that check on the first mismatch. One knob, one encoding.
+    export E2E_ORG_SUBDOMAIN="$ENV_TEST_ORG_SUBDOMAIN"
     export VITE_AC_PROXY_TARGET="$ENV_TEST_AC_URL" VITE_GC_PROXY_TARGET="$ENV_TEST_GC_URL"
     if [[ -n "${ENV_TEST_PROMETHEUS_URL:-}" ]]; then
       export E2E_PROMETHEUS_URL="$ENV_TEST_PROMETHEUS_URL"

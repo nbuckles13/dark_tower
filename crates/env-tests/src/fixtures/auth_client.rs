@@ -1,16 +1,53 @@
 //! Authentication client fixture for token issuance and JWKS operations.
 
+use regex::Regex;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{LazyLock, Once};
 use thiserror::Error;
 use uuid::Uuid;
 
 /// Default password for test users (meets AC's 8-char minimum).
 pub const TEST_USER_PASSWORD: &str = "test-env-password-42";
 
-/// Default subdomain for the seeded dev organization.
-const TEST_ORG_SUBDOMAIN: &str = "devtest";
+/// Environment variable carrying the organization this run registers users into.
+///
+/// REQUIRED, with NO fallback and NO default — see [`resolve_org_subdomain`].
+pub const ORG_SUBDOMAIN_VAR: &str = "ENV_TEST_ORG_SUBDOMAIN";
+
+// ANCHOR (DRY): the org-subdomain shape, copied VERBATIM (not paraphrased) from the
+// schema's own CHECK at `migrations/20250118000001_initial_schema.sql:16`, which is the
+// SSoT. The same literal is mirrored at several further sites; the AUTHORITATIVE INVENTORY
+// is the `SITES` table in `scripts/guards/simple/validate-subdomain-regex-sync.sh`, and it
+// is deliberately NOT re-listed here — a hand-copied inventory is itself a mirror, and it
+// drifted exactly that way once (`docs/DATABASE_SCHEMA.md` was added to the guard's table
+// while this list still read "all six"). Byte-identity across every enumerated site is
+// ENFORCED by that guard (CLAUDE.md's "derive one from the other, or add a guard that
+// fails validation on drift"), so this copy is checked rather than trusted.
+//
+// Deliberately the SAME literal rather than a new hand-rolled predicate: AC's own
+// `org_extraction.rs::extract_subdomain` is already a hand-rolled, weaker variant of this
+// rule (it does not bound the length), and a second invented-but-equivalent formulation
+// would be uncheckable against anything.
+const SUBDOMAIN_PATTERN: &str = r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$";
+
+/// Compiled [`SUBDOMAIN_PATTERN`], built once. Same `LazyLock<Regex>` canonical-home shape
+/// this crate already uses for `JWT_PATTERN` / `BEARER_PATTERN` in `gc_client.rs`.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "test fixture LazyLock<Regex>; static pattern compiles or load-time panic. Per ADR-0034 §6 + ADR-0002 §expect-over-allow — same canonical-home discipline as crates/dt-guard/."
+)]
+static SUBDOMAIN_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(SUBDOMAIN_PATTERN).unwrap());
+
+/// The per-run organization subdomain could not be resolved.
+///
+/// A distinct type rather than a variant of [`AuthClientError`] so
+/// [`resolve_org_subdomain`] stays a pure, independently testable function; it converts
+/// into `AuthClientError` at the one call site that needs it.
+#[derive(Debug, Error)]
+#[error("{0}")]
+pub struct OrgSubdomainError(String);
 
 /// Authentication client errors.
 #[derive(Debug, Error)]
@@ -26,6 +63,110 @@ pub enum AuthClientError {
 
     #[error("JSON deserialization failed: {0}")]
     JsonError(#[from] serde_json::Error),
+
+    #[error("{0}")]
+    OrgSubdomainUnresolved(#[from] OrgSubdomainError),
+}
+
+/// Resolve the per-run organization subdomain from an already-read raw value.
+///
+/// PURE by construction — the caller does the `std::env::var`, so the unit tests below
+/// exercise every branch without mutating process-global environment (no `#[serial]`, no
+/// cross-test interference).
+///
+/// # Why there is no default
+///
+/// R-7: no production code ever marks a meeting ended, so an organization's live-meeting
+/// count only CLIMBS toward `max_concurrent_meetings`. A static organization therefore
+/// makes run N's verdict a function of runs 1..N-1 — green on the first run of the day, a
+/// 403 later, attributed to the code under test. `scripts/layer7.sh` Phase 1h provisions a
+/// FRESH organization per run and exports it here.
+///
+/// A `unwrap_or("devtest")` fallback would be that same defect wearing a default: the
+/// suite would go green while the fix sat inert. So unset AND blank both fail loudly.
+/// `devtest` remains reachable only through the EXPLICIT manual invocation named in the
+/// error message below (and seeded by `infra/kind/scripts/setup.sh:seed_test_data`, which
+/// carries the matching half of this cross-reference).
+///
+/// Follows `crates/env-tests/src/cluster.rs::read_env_url`'s conventions — empty string
+/// treated as unset, validation eager rather than at first use — with a subdomain
+/// validator in place of the URL one.
+pub fn resolve_org_subdomain(raw: Option<&str>) -> Result<String, OrgSubdomainError> {
+    // `Some("")` collapses to the unset case exactly as `read_env_url` does: an exported
+    // -but-empty variable is what a failed command substitution in a shell wrapper
+    // produces, and treating it as "present" would push a blank Host label to AC.
+    let value = match raw {
+        None => return Err(OrgSubdomainError(unset_message("unset"))),
+        Some("") => return Err(OrgSubdomainError(unset_message("set but empty"))),
+        Some(v) => v,
+    };
+
+    // Validated as given, NOT trimmed first: silently repairing " foo " into "foo" would
+    // resolve a DIFFERENT organization than the one the operator exported.
+    if !SUBDOMAIN_RE.is_match(value) {
+        return Err(OrgSubdomainError(format!(
+            "{ORG_SUBDOMAIN_VAR}=\"{value}\" is not a valid organization subdomain.\n\
+             Expected a DNS label matching {SUBDOMAIN_PATTERN} (ASCII lowercase letters, \
+             digits and internal hyphens, 1-63 characters) — the same rule the database \
+             enforces as the `subdomain_format` CHECK on `organizations`.\n\
+             AC resolves the organization from the Host header and fails closed on any \
+             other shape, so catching it here turns an unattributable 400/404 mid-suite \
+             into a named failure before the first request."
+        )));
+    }
+
+    Ok(value.to_string())
+}
+
+/// The fail-loud message shared by the unset and blank branches.
+fn unset_message(state: &str) -> String {
+    format!(
+        "{ORG_SUBDOMAIN_VAR} is required but {state}.\n\
+         `scripts/layer7.sh` Phase 1h provisions a fresh organization for every layer-7 \
+         run and exports this variable to the suite; if you are seeing this inside a \
+         devloop, Phase 1h did not run or did not export.\n\
+         For a STANDALONE run, either provision one \
+         (`infra/kind/scripts/setup.sh --provision-org <subdomain>`) and export the \
+         subdomain it reports, or use the seeded development organization explicitly:\n\
+         \n    {ORG_SUBDOMAIN_VAR}=devtest cargo test -p env-tests\n\n\
+         There is deliberately NO default: silently falling back to a static organization \
+         re-creates the cross-run meeting-cap exhaustion (R-7) this variable exists to \
+         remove, with every gate still green."
+    )
+}
+
+/// Read and validate [`ORG_SUBDOMAIN_VAR`] from the process environment.
+///
+/// Thin wrapper over the pure [`resolve_org_subdomain`]. Emits the same
+/// `[env-tests] VAR = … (from env)` provenance line `cluster.rs` emits for each URL, once
+/// per process so a suite of ~4 registrations does not repeat it.
+fn org_subdomain() -> Result<String, OrgSubdomainError> {
+    // NOT `.ok()`, deliberately (@semantic-guard). `.ok()` collapses `VarError::NotUnicode` into
+    // `None`, so a variable that IS set to non-UTF-8 bytes would report "required but unset" and
+    // send the operator hunting a Phase-1h export that demonstrably happened. That is the
+    // wrong-lane diagnostic this entire story exists to remove, so it does not get to survive in
+    // the fixture that reads the story's own variable — near-unreachable or not.
+    // `cluster.rs::read_env_url` uses the `.ok()` shape; this deliberately diverges rather than
+    // matching a precedent whose weakness is the exact class under repair here.
+    let raw = match std::env::var(ORG_SUBDOMAIN_VAR) {
+        Ok(v) => Some(v),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(bytes)) => {
+            return Err(OrgSubdomainError(format!(
+                "{ORG_SUBDOMAIN_VAR} is SET but its value is not valid UTF-8 ({bytes:?}).\n\
+                 This is NOT the same as unset: something did export the variable, so do not go \
+                 looking for a missing `scripts/layer7.sh` Phase-1h export. A generated \
+                 subdomain is ASCII by construction (`e2e-<16 hex>`), so non-UTF-8 bytes here \
+                 mean the value was corrupted in transit or set by hand."
+            )));
+        }
+    };
+    let resolved = resolve_org_subdomain(raw.as_deref())?;
+    static LOGGED: Once = Once::new();
+    LOGGED.call_once(|| {
+        eprintln!("[env-tests] {ORG_SUBDOMAIN_VAR} = {resolved} (from env)");
+    });
+    Ok(resolved)
 }
 
 /// OAuth 2.0 token request.
@@ -190,22 +331,33 @@ impl AuthClient {
 
     /// Register a new user and return the registration response with auto-login token.
     ///
-    /// The registration endpoint requires org context from the `Host` header.
-    /// We use the seeded `devtest` organization subdomain.
+    /// The registration endpoint requires org context from the `Host` header. The
+    /// organization is the PER-RUN one provisioned by `scripts/layer7.sh` Phase 1h and
+    /// read from [`ORG_SUBDOMAIN_VAR`] — never a static `devtest`/`demo` constant, which
+    /// is R-7 (see [`resolve_org_subdomain`]).
     ///
     /// # Arguments
     ///
     /// * `request` - Registration request with email, password, display_name
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthClientError::OrgSubdomainUnresolved`] BEFORE issuing any request when
+    /// [`ORG_SUBDOMAIN_VAR`] is unset, blank or malformed.
     pub async fn register_user(
         &self,
         request: &UserRegistrationRequest,
     ) -> Result<UserRegistrationResponse, AuthClientError> {
+        // Resolved BEFORE the call counter moves and before any network I/O: a missing
+        // organization is a configuration fault, not an AC interaction, and must not be
+        // counted as one by `call_count()`.
+        let subdomain = org_subdomain()?;
         self.calls.fetch_add(1, Ordering::Relaxed);
         let register_url = format!("{}/api/v1/auth/register", self.base_url);
 
         // Extract host and port from base_url for the Host header.
         // AC's org extraction middleware requires subdomain.domain format.
-        let host_header = build_org_host_header(&self.base_url, TEST_ORG_SUBDOMAIN);
+        let host_header = build_org_host_header(&self.base_url, &subdomain);
 
         let response = self
             .http_client
@@ -309,6 +461,122 @@ impl std::fmt::Debug for UserRegistrationResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // === resolve_org_subdomain (R-7) =====================================================
+    //
+    // Every case calls the PURE function with an explicit `Option<&str>`, so none of them
+    // touch process-global environment: no `#[serial]`, no ordering dependence, and no way
+    // for one case to leak a value into another. That is the reason the env read was split
+    // out of the resolver in the first place.
+
+    #[test]
+    fn test_resolve_org_subdomain_accepts_a_valid_generated_subdomain() {
+        // The exact shape scripts/layer7.sh's __generate_org_subdomain emits.
+        let resolved = resolve_org_subdomain(Some("e2e-0123456789abcdef"))
+            .expect("a well-formed per-run subdomain must resolve");
+        assert_eq!(resolved, "e2e-0123456789abcdef");
+    }
+
+    #[test]
+    fn test_resolve_org_subdomain_accepts_the_documented_manual_escape_hatch() {
+        // `ENV_TEST_ORG_SUBDOMAIN=devtest cargo test -p env-tests` is the invocation the
+        // unset-error names; if it did not validate, that message would send an operator
+        // to a command that cannot work.
+        assert_eq!(
+            resolve_org_subdomain(Some("devtest")).expect("devtest must remain valid"),
+            "devtest"
+        );
+    }
+
+    #[test]
+    fn test_resolve_org_subdomain_rejects_unset() {
+        let err = resolve_org_subdomain(None).expect_err("unset must NOT fall back to a default");
+        let msg = err.to_string();
+        // The three things an operator needs, per the no-fallback ruling: the variable, who
+        // normally sets it, and how to run standalone.
+        assert!(
+            msg.contains("ENV_TEST_ORG_SUBDOMAIN"),
+            "error must name the variable: {msg}"
+        );
+        assert!(
+            msg.contains("layer7.sh") && msg.contains("Phase 1h"),
+            "error must name layer7.sh Phase 1h as the normal provider: {msg}"
+        );
+        assert!(
+            msg.contains("ENV_TEST_ORG_SUBDOMAIN=devtest cargo test -p env-tests"),
+            "error must name the manual escape hatch verbatim: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_org_subdomain_rejects_blank() {
+        // `Some("")` must behave exactly like `None` (cluster.rs's read_env_url convention).
+        // A shell exporting the result of a failed command substitution produces this, and
+        // treating it as "present" would send a Host header with an empty first label.
+        let err = resolve_org_subdomain(Some("")).expect_err("an empty value must not be accepted");
+        assert!(
+            err.to_string().contains("ENV_TEST_ORG_SUBDOMAIN"),
+            "blank must produce the named required-variable error, not a regex error"
+        );
+    }
+
+    #[test]
+    fn test_resolve_org_subdomain_rejects_uppercase() {
+        // The single most likely bad value, and the one the schema CHECK rejects at the far
+        // end of the run: AC lowercases nothing, so `Demo` resolves no organization.
+        let err = resolve_org_subdomain(Some("E2E-ABCDEF0123456789"))
+            .expect_err("uppercase must be rejected, NOT silently lowercased");
+        let msg = err.to_string();
+        assert!(msg.contains("not a valid organization subdomain"), "{msg}");
+        // Rejected, never repaired — a normalized value would address a different org than
+        // the one layer7.sh actually provisioned and exported.
+        assert!(
+            !msg.contains("e2e-abcdef0123456789"),
+            "the resolver must not offer a normalized form: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_org_subdomain_rejects_regex_invalid_shapes() {
+        // Boundary conditions of the anchored DNS-label rule, each a distinct way to be
+        // invalid rather than five spellings of one.
+        for bad in [
+            "-leading",         // leading hyphen
+            "trailing-",        // trailing hyphen
+            "has_underscore",   // charset
+            "has space",        // charset
+            "e2e-abc\ndevtest", // embedded newline — the anchors are `^`/`$`, so a
+            // multiline value must NOT pass on its second line
+            "аbc", // Cyrillic U+0430, not ASCII 'a'
+            "0123456789012345678901234567890123456789012345678901234567890123", // 64 chars
+        ] {
+            assert!(
+                resolve_org_subdomain(Some(bad)).is_err(),
+                "{bad:?} must be rejected by the anchored subdomain pattern"
+            );
+        }
+    }
+
+    #[test]
+    fn test_resolve_org_subdomain_accepts_maximum_length_label() {
+        // 63 chars is the schema's VARCHAR(63) ceiling and the pattern's `{0,61}` + 2
+        // anchors. Pinned alongside the 64-char rejection above so the boundary is proven
+        // to be in the right place rather than merely somewhere.
+        let max = "a".repeat(63);
+        assert_eq!(
+            resolve_org_subdomain(Some(&max)).expect("63 chars is the documented maximum"),
+            max
+        );
+    }
+
+    #[test]
+    fn test_subdomain_pattern_matches_the_schema_check_verbatim() {
+        // Byte-identity with the migration's `subdomain_format` CHECK. The cross-file
+        // version of this is enforced by
+        // scripts/guards/simple/validate-subdomain-regex-sync.sh; this in-crate assertion
+        // fails first, in-clone, without needing the guard to run.
+        assert_eq!(SUBDOMAIN_PATTERN, "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$");
+    }
 
     #[test]
     fn test_build_org_host_header_http() {

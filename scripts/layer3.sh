@@ -32,6 +32,16 @@ layer_lifecycle_begin 3
   run_and_emit "audit-suppressions-selftest" "${__here}/audit-suppressions-check.test.sh" || true
   run_and_emit "audit-gate-test" "${__here}/lang/_audit_gate.test.sh" || true
   run_and_emit "layer7-selftest" "${__here}/layer7.test.sh" || true
+  # Org-subdomain drift guard SELF-TEST (story R-7, task #3). The guard itself is
+  # auto-discovered by run-guards.sh above and runs on every devloop — but a PASSING guard
+  # exercises none of its failure branches, and those branches are its entire value: a check
+  # that greps, finds nothing, compares nothing and reports success is the exact bug it was
+  # written to prevent. This drives them (drifted literal, renamed site, a seventh encoding,
+  # a skewed pinned count, and the zero-hit vacuity case) against synthetic trees via the
+  # DEVLOOP_TEST-gated SUBDOMAIN_GUARD_ROOT seam. Deliberately NOT under guards/simple/:
+  # run-guards.sh's `find -name '*.sh'` matches `*.test.sh` too, so it would be auto-run as a
+  # guard as well as here. No cluster.
+  run_and_emit "subdomain-regex-guard-selftest" "${__here}/guards/validate-subdomain-regex-sync.test.sh" || true
   # Disk-guard self-test (envtest-infra-reliability devloop): forces
   # check_build_disk_space's trip branch so the `REASON=insufficient-disk` operator contract
   # (§6.7) is covered — Gate-2's rebuild only hits the guard's pass path. No cluster needed

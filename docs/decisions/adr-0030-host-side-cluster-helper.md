@@ -86,6 +86,8 @@ The runtime project-root determines where `podman build` looks for source, where
 
 The trichotomy is the load-bearing safety property: pointing the helper's *runtime* commands at a container-writable path is *correct* because that's what the user is editing; pinning the helper *binary* to a container-immutable path is what blocks the otherwise-obvious tamper attack (edit `crates/devloop-helper/src/`, exit, re-run, persistent host-side compromise).
 
+**Corollary — no devloop can validate a change to `crates/devloop-helper/` within its own run.** Because the binary is compiled from `REPO_ROOT` and launched before the dev container starts, helper source edited on a devloop branch (which lives in `CLONE_DIR`) is never the code the running helper executes — a socket verb added in-tree returns `invalid_command` until the branch reaches the host checkout, the helper is rebuilt, and it is restarted, none of which is reachable from inside the container. Work whose acceptance depends on new helper behaviour must therefore be sequenced across runs rather than planned as one task, and a design that can reach the same end through a capability the container already holds (kubectl against the dev cluster, per Container-Side Test Execution below) should be preferred on those grounds alone.
+
 **Lifecycle**:
 - `devloop.sh` builds the helper (`cargo build --release -p devloop-helper`) on first use, caches the binary
 - Launched as a background process with PID file at `/tmp/devloop-{slug}/helper.pid`
@@ -351,6 +353,10 @@ PORT_MAP_FILE="${DT_PORT_MAP:-}"
 - Interactive prompts auto-skipped when stdin is not a TTY (`[[ -t 0 ]]`), so automated callers don't need `--yes`
 - `--only <service>`: Rebuild + redeploy single service (~30-60s with cargo-chef cache)
 - `--skip-build`: Apply manifests only (~15-20s)
+- `--provision-org <subdomain>`: Create one fresh `organizations` row and exit, printing `PROVISIONED_ORG org_id=<uuid> subdomain=<sub>`. **The only mode of this script that is CONTAINER-runnable** (story R-7): it dispatches from `main()` before `check_prerequisites`, so it never touches `kind`/`podman`/`docker` — none of which exist in the devloop container — and reaches the cluster solely through `kubectl exec` + the container kubeconfig this ADR already grants under *Container-Side Test Execution*. `DT_CLUSTER_NAME` is **required with no fallback** on this path (the global `dark-tower` default would silently resolve to a manually created workstation cluster and write the row into the wrong database), and the context is asserted to resolve before any write. Invoked by `scripts/layer7.sh` Phase 1h; rejected in combination with `--only`/`--skip-build`.
+- `DT_ORG_MAX_CONCURRENT_MEETINGS` (default 1000): `max_concurrent_meetings` for the orgs the test suites drive — `seed_test_data`'s `devtest` org and `--provision-org`. Deliberately not applied to `seed_demo_org`, which takes the schema default.
+
+The helper does **not** gain a verb for org provisioning, and that is a consequence of the build-context trichotomy corollary above rather than a preference: a new socket verb cannot be exercised by the devloop that adds it. Provisioning therefore goes through this script, which the helper's *runtime* project-root already resolves to `CLONE_DIR`.
 
 ### Env-Test URL Configuration
 
