@@ -157,6 +157,10 @@
 - [ ] **Per-service credential registration Jobs**: Each service (GC, MC, MH) should own its credential registration via a K8s Job in its Kustomize base. The Job calls the AC admin API to register the service's client_id and required scopes. Deploy pipeline ensures AC is ready before downstream services deploy. This way, adding a new scope (e.g., `internal:meeting-token`) is part of the same PR that adds the endpoint requiring it.
 - [ ] **Remove setup.sh seed_test_data**: Once the admin API and registration Jobs exist, remove the raw SQL credential seeding from `infra/kind/scripts/setup.sh` and `infra/docker/postgres/init.sql`.
 
+## Organization Lifecycle
+
+- [ ] **Org deprovisioning is unsupported — deleting an organization fails on a FK violation**: `organizations`' children cascade (`ON DELETE CASCADE`), but the cascade reaches `users` and stops: `auth_events.user_id REFERENCES users(user_id)` has no `ON DELETE` clause (`migrations/20250122000001_auth_controller_tables.sql:59`) and `auth_events` carries no `org_id`, so the delete aborts. Two consequences worth knowing before this is picked up: (1) a retention decision is needed first — audit rows probably should outlive the user, so `ON DELETE SET NULL` rather than cascade; (2) GC maps a missing org to **500** (`MeetingRefusal::OrganizationNotProvisioned`) on the reasoning that `org_id` comes from a signed JWT claim, so an org that does not exist is a provisioning bug rather than a lifecycle state — if deprovisioning ships, revisit that mapping, since a valid token for a deleted org becomes normal and 401/403 fits better. Surfaced 2026-08-15.
+
 ## Client Architecture
 
 - [ ] **Evaluate HTTP/3 for AC**: AC currently serves HTTP/1.1 (TCP-based). For consistency with GC, evaluate adding HTTP/3 support. Low priority — client is protocol-agnostic via `fetch()`. Follow-up to ADR-0003.
