@@ -29,6 +29,18 @@ use std::time::Duration;
 use ::common::observability::testing::MetricAssertion;
 use gc_service::observability::metrics::record_meeting_creation;
 
+/// Every `error_type` value `record_meeting_creation` is called with in
+/// production, per `docs/observability/metrics/gc-service.md`.
+///
+/// NOTE (@observability, story R-6): this array is a **wrapper-level mirror**.
+/// It drives the recording wrapper with string literals, so it proves the
+/// wrapper faithfully records what it is handed and gives each value sibling
+/// `assert_delta(0)` adjacency as a label-swap catcher. It does **not** pin the
+/// vocabulary: nothing here constructs a `MeetingRefusal` or calls
+/// `metric_label()`, so this file would still pass if that mapping drifted.
+/// The mapping is pinned by `metric_label_per_variant` in
+/// `src/repositories/meetings.rs` and end-to-end by the `/metrics` scrape
+/// assertions in `meeting_create_tests.rs`.
 const ALL_ERROR_TYPES: &[&str] = &[
     "bad_request",
     "forbidden",
@@ -36,6 +48,11 @@ const ALL_ERROR_TYPES: &[&str] = &[
     "internal",
     "code_collision",
     "db_error",
+    // Story R-6: the three organization-refusal causes, previously all
+    // reported as "forbidden". `forbidden` now means role denial only.
+    "org_limit",
+    "org_inactive",
+    "org_not_provisioned",
 ];
 
 #[test]

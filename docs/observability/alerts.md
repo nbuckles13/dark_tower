@@ -446,10 +446,43 @@ sum(rate(gc_meeting_creation_total[5m])) > 0
 
 **Response**:
 1. Check "Meeting Creation Failures by Type" dashboard panel for error breakdown
-2. If `forbidden` errors dominate → [Scenario 8: Limit Exhaustion](../runbooks/gc-incident-response.md#scenario-8-meeting-creation-limit-exhaustion)
-3. If `code_collision` errors present → [Scenario 9: Code Collision](../runbooks/gc-incident-response.md#scenario-9-meeting-code-collision) (investigate seriously)
-4. If `db_error` errors dominate → [Scenario 1: Database Connection Failures](../runbooks/gc-incident-response.md#scenario-1-database-connection-failures)
-5. Check database health and query latency
+2. If `org_limit` errors dominate → genuine capacity exhaustion, [Scenario 8: Limit Exhaustion](../runbooks/gc-incident-response.md#scenario-8-meeting-creation-limit-exhaustion)
+3. If `org_inactive` or `org_not_provisioned` errors present → organization-state fault, **not** a full cap. See `GCMeetingCreationOrgStateInvalid` below and [Scenario 8](../runbooks/gc-incident-response.md#scenario-8-meeting-creation-limit-exhaustion)
+4. If `forbidden` errors dominate → role denial (caller lacks a meeting-create role). **Not** a capacity problem — no runbook scenario applies
+5. If `code_collision` errors present → [Scenario 9: Code Collision](../runbooks/gc-incident-response.md#scenario-9-meeting-code-collision) (investigate seriously)
+6. If `db_error` errors dominate → [Scenario 1: Database Connection Failures](../runbooks/gc-incident-response.md#scenario-1-database-connection-failures)
+7. Check database health and query latency
+
+> **`forbidden` changed meaning on 2026-08-14 (story R-6).** It previously covered
+> both role denial and org cap exhaustion; cap exhaustion is now `org_limit`. A
+> `forbidden` spike is no longer evidence of a capacity problem.
+
+---
+
+#### GCMeetingCreationOrgStateInvalid
+
+**Severity**: Warning
+**Condition**: Any meeting creation refused with `error_type` of `org_inactive` or `org_not_provisioned` within the last hour, sustained 15m
+**Impact**: Affected callers cannot create meetings. `org_not_provisioned` returns 500 (and so also counts toward the aggregate HTTP error-rate SLO alerts); `org_inactive` returns 403
+**Runbook**: [Scenario 8: Limit Exhaustion](../runbooks/gc-incident-response.md#scenario-8-meeting-creation-limit-exhaustion)
+
+**PromQL**:
+```promql
+sum(increase(gc_meeting_creation_failures_total{error_type=~"org_inactive|org_not_provisioned"}[1h])) > 0
+```
+`for: 15m`
+
+**Absence semantics — read this before treating a firing as a misconfiguration**:
+- **Steady state is provably zero.** No code path deactivates or deletes an organization, and AC will not mint a token for an inactive org. A valid token naming a missing or inactive org means GC and AC disagree about database state.
+- **No data is healthy**, not a broken exporter or a bad scrape config. This series is expected to be permanently absent in normal operation.
+- **One occurrence is the signal.** `for: 15m` debounces scrape flapping; it does **not** require repeated events. Expected detection delay ~15m.
+- **This rule has no automated exerciser** — the repo has no `promtool test rules` harness — so the fact that it has never fired before is *not* evidence that it works, nor that this firing is spurious.
+
+**Response**:
+1. Confirm which value fired: `sum by(error_type) (increase(gc_meeting_creation_failures_total[1h]))`
+2. Work the cause table in [Scenario 8](../runbooks/gc-incident-response.md#scenario-8-meeting-creation-limit-exhaustion) — triage order is database volume reset, then GC/AC pointed at different databases, then a restore, then out-of-band SQL
+3. Distinguish the two regimes by duration: a one-off org-state change decays to zero within ~1h15m as outstanding tokens expire; anything sustained past that is an ongoing divergence, not a tail
+4. `org_limit` is deliberately **excluded** from this rule — a full cap is capacity behaviour, not a fault
 
 ---
 

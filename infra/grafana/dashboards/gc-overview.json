@@ -2793,7 +2793,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "Meeting creation failures by error type. High rate may indicate org limit exhaustion or DB issues.",
+      "description": "Meeting creation failures by error type. Values are not interchangeable: org_limit is capacity exhaustion; org_inactive and org_not_provisioned are organization-state faults (expected permanently absent — see runbook Scenario 8); forbidden is role denial only; bad_request and unauthorized are client-side; db_error, code_collision and internal are server-side faults.",
       "fieldConfig": {
         "defaults": {
           "color": {

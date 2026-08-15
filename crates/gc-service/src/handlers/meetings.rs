@@ -21,7 +21,9 @@ use crate::models::{
     DEFAULT_MAX_PARTICIPANTS, MIN_PARTICIPANTS,
 };
 use crate::observability::metrics;
-use crate::repositories::{map_row_to_meeting, McAssignment, MeetingsRepository};
+use crate::repositories::{
+    map_row_to_meeting, CreateMeetingOutcome, McAssignment, MeetingRefusal, MeetingsRepository,
+};
 use crate::routes::AppState;
 use crate::services::ac_client::{
     AcClient, GuestTokenRequest, MeetingRole, MeetingTokenRequest, ParticipantType, TokenResponse,
@@ -170,7 +172,7 @@ pub async fn create_meeting(
     })?;
 
     let org_id = Uuid::parse_str(&user_claims.org_id).map_err(|e| {
-        tracing::debug!(target: "gc.handlers.meetings", error = %e, "Failed to parse org_id from token");
+        tracing::debug!(target: "gc.handlers.meetings", error = %e, "Failed to parse org_id claim");
         let duration = start.elapsed();
         metrics::record_meeting_creation("error", Some("unauthorized"), duration);
         GcError::InvalidToken("Invalid organization identifier in token".to_string())
@@ -227,21 +229,50 @@ pub async fn create_meeting(
         )
         .await
         {
-            Ok(Some(row)) => {
-                meeting_row = Some(row);
+            Ok(CreateMeetingOutcome::Created(row)) => {
+                meeting_row = Some(*row);
                 break;
             }
-            Ok(None) => {
-                // Org limit exceeded (R-6)
+            Ok(CreateMeetingOutcome::Refused(refusal)) => {
+                // The organization refused the insert. The three causes are
+                // unrelated and must stay distinguishable on the wire (R-6):
+                // a full cap is routine, the other two mean the organization
+                // row is in a state no application flow produces.
+                //
+                // SAFETY (multi-tenancy): `org_id` below is derived solely from
+                // the caller's own validated token — `CreateMeetingRequest` has
+                // no organization field and rejects unknown fields. Reporting
+                // the distinct causes therefore discloses only the caller's own
+                // organization state, to a principal already holding a
+                // membership token for it. Adding any client-supplied org
+                // selector would turn these three outcomes into a cross-tenant
+                // enumeration oracle.
+                match refusal {
+                    MeetingRefusal::CapacityExhausted => warn!(
+                        target: "gc.handlers.meetings",
+                        org_id = %org_id,
+                        user_id = %user_id,
+                        "Meeting creation refused: organization concurrent-meeting limit reached"
+                    ),
+                    MeetingRefusal::OrganizationInactive => warn!(
+                        target: "gc.handlers.meetings",
+                        org_id = %org_id,
+                        user_id = %user_id,
+                        "Meeting creation refused: organization is not active"
+                    ),
+                    MeetingRefusal::OrganizationNotProvisioned => tracing::error!(
+                        target: "gc.handlers.meetings",
+                        org_id = %org_id,
+                        user_id = %user_id,
+                        "Meeting creation refused: organization referenced by a valid token does not exist"
+                    ),
+                }
+
                 let duration = start.elapsed();
-                metrics::record_meeting_creation("error", Some("forbidden"), duration);
-                return Err(GcError::Forbidden(
-                    "Organization meeting limit exceeded".to_string(),
-                ));
+                metrics::record_meeting_creation("error", Some(refusal.metric_label()), duration);
+                return Err(refusal.into());
             }
-            Err(GcError::Database(ref e))
-                if e.contains("unique constraint") || e.contains("duplicate key") =>
-            {
+            Ok(CreateMeetingOutcome::MeetingCodeTaken) => {
                 // Meeting code collision — retry with new code
                 tracing::debug!(
                     target: "gc.handlers.meetings",
@@ -365,7 +396,7 @@ pub async fn join_meeting(
         metrics::record_meeting_join("user", "error", Some("unauthorized"), duration);
     })?;
     let user_org_id = Uuid::parse_str(&user_claims.org_id).map_err(|e| {
-        tracing::debug!(target: "gc.handlers.meetings", error = %e, "Failed to parse org_id from user token");
+        tracing::debug!(target: "gc.handlers.meetings", error = %e, "Failed to parse user org_id claim");
         let duration = start.elapsed();
         metrics::record_meeting_join("user", "error", Some("unauthorized"), duration);
         GcError::InvalidToken("Invalid organization identifier in token".to_string())
@@ -779,7 +810,7 @@ async fn find_meeting_by_code(pool: &PgPool, code: &str) -> Result<MeetingRow, G
         .await?
         .ok_or_else(|| GcError::NotFound("Meeting not found".to_string()))?;
 
-    Ok(map_row_to_meeting(row))
+    map_row_to_meeting(row)
 }
 
 /// Find a meeting by its ID.
@@ -792,7 +823,7 @@ async fn find_meeting_by_id(pool: &PgPool, meeting_id: Uuid) -> Result<MeetingRo
         .await?
         .ok_or_else(|| GcError::NotFound("Meeting not found".to_string()))?;
 
-    Ok(map_row_to_meeting(row))
+    map_row_to_meeting(row)
 }
 
 /// Update meeting settings in the database.
@@ -842,7 +873,7 @@ async fn update_meeting_settings_in_db(
     .await?
     .ok_or_else(|| GcError::NotFound("Meeting not found".to_string()))?;
 
-    Ok(map_row_to_meeting(row))
+    map_row_to_meeting(row)
 }
 
 // ============================================================================
@@ -855,7 +886,7 @@ async fn update_meeting_settings_in_db(
 fn parse_user_id(sub: &str) -> Result<Uuid, GcError> {
     let uuid_str = sub.strip_prefix("user:").unwrap_or(sub);
     Uuid::parse_str(uuid_str).map_err(|e| {
-        tracing::debug!(target: "gc.handlers.meetings", error = %e, "Failed to parse user ID from token");
+        tracing::debug!(target: "gc.handlers.meetings", error = %e, "Failed to parse user ID claim");
         GcError::InvalidToken("Invalid user identifier in token".to_string())
     })
 }
@@ -931,7 +962,7 @@ fn generate_join_token_secret() -> Result<String, GcError> {
     let mut bytes = [0u8; JOIN_TOKEN_SECRET_BYTES];
 
     rng.fill(&mut bytes).map_err(|e| {
-        tracing::error!(target: "gc.handlers.meetings", error = %e, "Failed to generate random bytes for join token secret");
+        tracing::error!(target: "gc.handlers.meetings", error = %e, "CSPRNG fill failed while generating the join credential");
         GcError::Internal("RNG failure".to_string())
     })?;
 

@@ -52,7 +52,8 @@ use std::time::Duration;
 use ::common::observability::testing::MetricAssertion;
 use gc_service::observability::metrics::record_db_query;
 use gc_service::repositories::{
-    HealthStatus, MediaHandlersRepository, MeetingsRepository, ParticipantsRepository,
+    CreateMeetingOutcome, HealthStatus, MediaHandlersRepository, MeetingsRepository,
+    ParticipantsRepository,
 };
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -446,8 +447,20 @@ async fn db_query_create_meeting_unique_collision_emits_status_error(pool: PgPoo
         None,
     )
     .await;
-    assert!(result.is_err(), "Expected unique-constraint collision");
 
+    // Classification, not just failure. The metric assertion below was green
+    // before the SQLSTATE classifier existed and would stay green if the
+    // classifier were wrong — the statement fails either way. This assertion is
+    // what ties the hardcoded `meetings_org_code_unique` constraint name to the
+    // migration that declares it: rename it there and this reds, rather than
+    // collisions silently degrading into 500s.
+    assert!(
+        matches!(result, Ok(CreateMeetingOutcome::MeetingCodeTaken)),
+        "Expected unique-constraint collision to classify as MeetingCodeTaken, got {result:?}"
+    );
+
+    // The statement still failed, so the DB-layer metric stays "error": a
+    // collision is a failed query the caller retries, not a successful one.
     snap.counter("gc_db_queries_total")
         .with_labels(&[("operation", "create_meeting"), ("status", "error")])
         .assert_delta(1);

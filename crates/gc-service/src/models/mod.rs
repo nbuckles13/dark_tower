@@ -4,6 +4,7 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use uuid::Uuid;
 
 /// Meeting status enumeration.
@@ -130,7 +131,11 @@ pub const MIN_GUEST_DISPLAY_NAME_LENGTH: usize = 2;
 ///
 /// Represents a meeting as stored in the database.
 /// Some fields are unused currently but will be used in future phases.
-#[derive(Debug, Clone)]
+/// `Debug` is hand-rolled below rather than derived — `join_token_secret` is a
+/// 256-bit CSPRNG credential from which join tokens are minted, and a derived
+/// `Debug` puts it one `?row` away from the log stream. Same treatment as
+/// `Config` (`config.rs`) and `UserContext` (`auth/claims.rs`) in this crate.
+#[derive(Clone)]
 #[allow(dead_code)] // Fields used in database queries and future phases
 pub struct MeetingRow {
     /// Unique meeting identifier.
@@ -195,6 +200,57 @@ pub struct MeetingRow {
 
     /// Whether waiting room is enabled.
     pub waiting_room_enabled: bool,
+}
+
+/// Custom Debug implementation that redacts `join_token_secret`.
+///
+/// The secret is a 256-bit CSPRNG credential from which meeting join tokens are
+/// minted; a derived `Debug` would put it one `tracing::debug!(?row, …)` or
+/// `format!("{row:?}")` away from a log stream that ships to a collector.
+/// `no-secrets-in-logs` cannot see this — it is a lexical rule over identifiers
+/// and string literals, and cannot follow a type through a `Debug` impl.
+///
+/// Every other field is passed through: redacting the struct wholesale would
+/// make the type useless for the debugging it exists to serve. That pass-through
+/// is a decision rather than an omission — `join_token_secret` is the only
+/// credential in this struct. `meeting_code` in particular is deliberately in the
+/// clear: it is a public identifier distributed in join URLs, and it does not
+/// admit a join on its own (`require_auth` defaults true, guest access requires
+/// `allow_guests`, and the join path still enforces org and role checks).
+///
+/// A derive has no per-field intent to misread; the moment it is hand-rolled,
+/// every unredacted field silently asserts "considered, and safe" in a form a
+/// reader cannot distinguish from "copied across without thinking". So: a field
+/// added here that *is* secret belongs on the redaction list above.
+impl fmt::Debug for MeetingRow {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MeetingRow")
+            .field("meeting_id", &self.meeting_id)
+            .field("org_id", &self.org_id)
+            .field("created_by_user_id", &self.created_by_user_id)
+            .field("display_name", &self.display_name)
+            .field("meeting_code", &self.meeting_code)
+            .field("join_token_secret", &"[REDACTED]")
+            .field("max_participants", &self.max_participants)
+            .field("enable_e2e_encryption", &self.enable_e2e_encryption)
+            .field("require_auth", &self.require_auth)
+            .field("recording_enabled", &self.recording_enabled)
+            .field("meeting_controller_id", &self.meeting_controller_id)
+            .field("meeting_controller_region", &self.meeting_controller_region)
+            .field("status", &self.status)
+            .field("scheduled_start_time", &self.scheduled_start_time)
+            .field("actual_start_time", &self.actual_start_time)
+            .field("actual_end_time", &self.actual_end_time)
+            .field("created_at", &self.created_at)
+            .field("updated_at", &self.updated_at)
+            .field("allow_guests", &self.allow_guests)
+            .field(
+                "allow_external_participants",
+                &self.allow_external_participants,
+            )
+            .field("waiting_room_enabled", &self.waiting_room_enabled)
+            .finish()
+    }
 }
 
 /// Response for joining a meeting.
@@ -493,6 +549,54 @@ impl From<MeetingRow> for MeetingResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `MeetingRow`'s `Debug` must never render `join_token_secret`.
+    ///
+    /// Without this, the redaction is a comment: re-adding `Debug` to the derive
+    /// list would silently restore the leak, and `no-secrets-in-logs` cannot see
+    /// it (a lexical rule cannot follow a type through a `Debug` impl).
+    #[test]
+    fn meeting_row_debug_redacts_join_token_secret() {
+        let secret = "d34db33fcafebabe0123456789abcdef0123456789abcdef0123456789abcdef";
+        let row = MeetingRow {
+            meeting_id: Uuid::new_v4(),
+            org_id: Uuid::new_v4(),
+            created_by_user_id: Uuid::new_v4(),
+            display_name: "Redaction Probe".to_string(),
+            meeting_code: "REDACT00001A".to_string(),
+            join_token_secret: secret.to_string(),
+            max_participants: 10,
+            enable_e2e_encryption: true,
+            require_auth: true,
+            recording_enabled: false,
+            meeting_controller_id: None,
+            meeting_controller_region: None,
+            status: "scheduled".to_string(),
+            scheduled_start_time: None,
+            actual_start_time: None,
+            actual_end_time: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            allow_guests: false,
+            allow_external_participants: false,
+            waiting_room_enabled: true,
+        };
+
+        let rendered = format!("{row:?}");
+        assert!(
+            !rendered.contains(secret),
+            "Debug output must not contain the join token secret"
+        );
+        assert!(
+            rendered.contains("join_token_secret: \"[REDACTED]\""),
+            "the field must still appear, redacted, so its absence is not mistaken \
+             for the struct lacking one: {rendered}"
+        );
+        // Non-secret fields still render — a wholesale redaction would make the
+        // type useless for the debugging it exists to serve.
+        assert!(rendered.contains("REDACT00001A"));
+        assert!(rendered.contains("Redaction Probe"));
+    }
 
     #[test]
     fn test_meeting_status_as_str() {
