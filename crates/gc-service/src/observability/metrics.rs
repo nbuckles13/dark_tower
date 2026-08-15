@@ -475,8 +475,16 @@ pub fn record_mh_selection(status: &str, has_multiple: bool, duration: Duration)
 /// # Arguments
 ///
 /// * `status` - "success" or "error"
-/// * `error_type` - Error category for failures (e.g., "bad_request", "forbidden",
-///   "db_error", "code_collision", "unauthorized", "internal")
+/// * `error_type` - Error category for failures. Bounded set of 9 values
+///   (ADR-0011 caps `error_type` at ~10, so this is near the budget):
+///   - `"bad_request"`, `"unauthorized"`, `"internal"`, `"db_error"`,
+///     `"code_collision"`
+///   - `"forbidden"` — role denial **only**. Before story R-6 this also carried
+///     organization-cap exhaustion; it no longer does.
+///   - `"org_limit"` / `"org_inactive"` / `"org_not_provisioned"` — the three
+///     organization-refusal causes (story R-6). Pass these via
+///     `MeetingRefusal::metric_label()` rather than retyping the literal; the
+///     mapping is pinned by tests in `src/repositories/meetings.rs`.
 /// * `duration` - Duration of the creation attempt
 pub fn record_meeting_creation(status: &str, error_type: Option<&str>, duration: Duration) {
     histogram!("gc_meeting_creation_duration_seconds",
@@ -1202,35 +1210,37 @@ mod tests {
     fn metrics_module_emits_meeting_creation_cluster() {
         let snap = MetricAssertion::snapshot();
 
-        record_meeting_creation("success", None, Duration::from_millis(50));
-        for err_type in [
+        // Single local list — previously restated twice in this function, which
+        // is how a value gets added to one copy and not the other.
+        // `forbidden` is role denial only; the three `org_*` values are the
+        // organization-refusal causes separated by story R-6.
+        const ERROR_TYPES: &[&str] = &[
             "bad_request",
             "unauthorized",
             "forbidden",
             "db_error",
             "code_collision",
             "internal",
-        ] {
+            "org_limit",
+            "org_inactive",
+            "org_not_provisioned",
+        ];
+
+        record_meeting_creation("success", None, Duration::from_millis(50));
+        for err_type in ERROR_TYPES {
             record_meeting_creation("error", Some(err_type), Duration::from_millis(5));
         }
 
         snap.histogram("gc_meeting_creation_duration_seconds")
-            .assert_observation_count_at_least(7);
+            .assert_observation_count_at_least(ERROR_TYPES.len() + 1);
 
         snap.counter("gc_meeting_creation_total")
             .with_labels(&[("status", "success")])
             .assert_delta(1);
         snap.counter("gc_meeting_creation_total")
             .with_labels(&[("status", "error")])
-            .assert_delta(6);
-        for err_type in [
-            "bad_request",
-            "unauthorized",
-            "forbidden",
-            "db_error",
-            "code_collision",
-            "internal",
-        ] {
+            .assert_delta(ERROR_TYPES.len() as u64);
+        for err_type in ERROR_TYPES {
             snap.counter("gc_meeting_creation_failures_total")
                 .with_labels(&[("error_type", err_type)])
                 .assert_delta(1);

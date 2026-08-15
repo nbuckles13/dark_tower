@@ -558,6 +558,26 @@ Common error codes:
 - `RATE_LIMITED` - Too many requests
 - `INTERNAL_ERROR` - Server error
 
+#### Meeting-creation refusal codes (`POST /api/v1/meetings`)
+
+Creation can be refused for three unrelated reasons. Each has its own code, so a
+client (or an automated runner) can tell a busy organization from a broken one
+without parsing the human-readable `message`:
+
+| Code | Status | Meaning | Caller action |
+|------|--------|---------|---------------|
+| `ORGANIZATION_MEETING_LIMIT_EXCEEDED` | 403 | The organization is at its concurrent-meeting cap | Retry once a meeting ends; a routine capacity refusal |
+| `ORGANIZATION_INACTIVE` | 403 | The organization exists but is deactivated | Do not retry; contact an administrator |
+| `ORGANIZATION_NOT_PROVISIONED` | 500 | A valid token names an organization with no record | Do not retry; server-side state fault, operator action required |
+
+`FORBIDDEN` on this endpoint now means role denial **only** — the caller lacks
+one of `user`, `admin`, `org_admin`. Before this split it also carried cap
+exhaustion.
+
+Note that `INTERNAL_ERROR` remains in use on this endpoint for meeting-code
+collision exhaustion and CSPRNG failure; `ORGANIZATION_NOT_PROVISIONED` is
+deliberately distinct from it so the two cannot be confused.
+
 ### WebTransport/Protobuf Errors
 
 ```protobuf

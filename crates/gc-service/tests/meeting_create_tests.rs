@@ -253,19 +253,131 @@ async fn create_test_user(pool: &PgPool, org_id: Uuid, email: &str) -> Uuid {
     user_id
 }
 
-async fn create_test_meeting_directly(pool: &PgPool, org_id: Uuid, user_id: Uuid, code: &str) {
+/// Insert an organization that exists but is deactivated.
+async fn create_test_org_inactive(pool: &PgPool, subdomain: &str) -> Uuid {
+    let org_id = Uuid::new_v4();
+    sqlx::query(
+        r#"
+        INSERT INTO organizations (org_id, subdomain, display_name, plan_tier, is_active)
+        VALUES ($1, $2, $3, 'pro', false)
+        "#,
+    )
+    .bind(org_id)
+    .bind(subdomain)
+    .bind(format!("Inactive Org {}", subdomain))
+    .execute(pool)
+    .await
+    .expect("Failed to create inactive test organization");
+    org_id
+}
+
+/// Insert an organization with an explicit per-meeting participant cap.
+async fn create_test_org_with_participant_cap(pool: &PgPool, subdomain: &str, cap: i32) -> Uuid {
+    let org_id = Uuid::new_v4();
+    sqlx::query(
+        r#"
+        INSERT INTO organizations (org_id, subdomain, display_name, plan_tier, max_participants_per_meeting, is_active)
+        VALUES ($1, $2, $3, 'pro', $4, true)
+        "#,
+    )
+    .bind(org_id)
+    .bind(subdomain)
+    .bind(format!("Test Org {}", subdomain))
+    .bind(cap)
+    .execute(pool)
+    .await
+    .expect("Failed to create test organization");
+    org_id
+}
+
+/// Insert a meeting directly, in the given lifecycle status.
+///
+/// `status` is a parameter because the creation query counts
+/// `status IN ('scheduled', 'active')` toward the cap, and every fixture in
+/// this file used to hard-code `'scheduled'` — leaving the `'active'` arm
+/// unpinned. That arm carries story R-7's whole premise (live meetings
+/// accumulating toward the cap), so it needs its own coverage.
+async fn create_test_meeting_with_status(
+    pool: &PgPool,
+    org_id: Uuid,
+    user_id: Uuid,
+    code: &str,
+    status: &str,
+) {
     sqlx::query(
         r#"
         INSERT INTO meetings (org_id, created_by_user_id, display_name, meeting_code, join_token_secret, status)
-        VALUES ($1, $2, 'Pre-existing Meeting', $3, 'secret-hex', 'scheduled')
+        VALUES ($1, $2, 'Pre-existing Meeting', $3, 'secret-hex', $4)
         "#,
     )
     .bind(org_id)
     .bind(user_id)
     .bind(code)
+    .bind(status)
     .execute(pool)
     .await
     .expect("Failed to create test meeting");
+}
+
+async fn create_test_meeting_directly(pool: &PgPool, org_id: Uuid, user_id: Uuid, code: &str) {
+    create_test_meeting_with_status(pool, org_id, user_id, code, "scheduled").await;
+}
+
+/// Read the `gc_meeting_creation_failures_total` value for one `error_type`.
+///
+/// Scrapes the server's real `/metrics` endpoint rather than using
+/// `MetricAssertion`: that helper binds a *thread-local* recorder, and the
+/// handler runs on a spawned server task, so an in-process snapshot taken here
+/// would observe nothing and every assertion against it would pass vacuously.
+/// Scraping also asserts against the rendered Prometheus exposition format —
+/// which is what the alert matcher actually reads.
+///
+/// Returns 0 when the series is absent (Prometheus counters are only rendered
+/// once observed).
+///
+/// **Callers compare with `>`, deliberately — do not "tighten" it to
+/// `assert_eq!(after, before + 1.0)`.** `TEST_METRICS_HANDLE` is a process-global
+/// `OnceLock` and tests in this binary run in parallel, so several tests bump
+/// `error_type="org_limit"` concurrently (`..._org_limit_exceeded`,
+/// `..._pairwise_distinct`, `..._org_selector_...` part (b),
+/// `..._active_meetings_count_...`). An exact delta would fail intermittently —
+/// the classic re-run-the-suite flake.
+///
+/// The looseness is safe because this assertion is **corroborating, not
+/// binding**: a sibling's increment can make it pass vacuously, but never fail
+/// falsely, and the `(status, error.code)` assertions beside it are exact and
+/// per-request. Those carry the actual contract; this one catches a
+/// `metric_label()` that has drifted away from the catalog.
+async fn creation_failures_for(server: &TestCreateMeetingServer, error_type: &str) -> f64 {
+    let body = reqwest::get(format!("{}/metrics", server.url()))
+        .await
+        .expect("metrics endpoint unreachable")
+        .text()
+        .await
+        .expect("metrics body not readable");
+
+    let needle = format!("gc_meeting_creation_failures_total{{error_type=\"{error_type}\"}}");
+    body.lines()
+        .find_map(|line| line.strip_prefix(&needle))
+        .and_then(|rest| rest.trim().parse::<f64>().ok())
+        .unwrap_or(0.0)
+}
+
+/// Parsed `{status, code}` of an error response.
+async fn error_status_and_code(resp: reqwest::Response) -> (u16, String) {
+    let status = resp.status().as_u16();
+    let body: serde_json::Value = resp.json().await.expect("error body must be JSON");
+    // `.get()` rather than indexing: this is a helper, not a `#[test]` body, and
+    // `allow-indexing-slicing-in-tests` only reaches the latter.
+    let code = body
+        .get("error")
+        .and_then(|e| e.get("code"))
+        .and_then(|c| c.as_str());
+    assert!(
+        code.is_some(),
+        "error body has no error.code (status {status}): {body}"
+    );
+    (status, code.unwrap_or_default().to_string())
 }
 
 // ============================================================================
@@ -441,6 +553,8 @@ async fn test_create_meeting_org_limit_exceeded(pool: PgPool) -> Result<()> {
 
     let token = server.create_user_token(user_id, org_id, vec!["user".to_string()]);
 
+    let before = creation_failures_for(&server, "org_limit").await;
+
     let client = reqwest::Client::new();
     let resp = client
         .post(format!("{}/api/v1/meetings", server.url()))
@@ -449,10 +563,387 @@ async fn test_create_meeting_org_limit_exceeded(pool: PgPool) -> Result<()> {
         .send()
         .await?;
 
+    let (status, code) = error_status_and_code(resp).await;
+
+    assert_eq!(status, 403, "Should return 403 when org limit exceeded");
+    assert_eq!(
+        code, "ORGANIZATION_MEETING_LIMIT_EXCEEDED",
+        "Cap exhaustion must be distinguishable from role denial (FORBIDDEN) \
+         and from the two organization-state faults"
+    );
+    assert!(
+        creation_failures_for(&server, "org_limit").await > before,
+        "cap exhaustion must emit error_type=\"org_limit\""
+    );
+
+    // Same no-row assertion the other two refusal causes carry. Defends against
+    // the `CASE` arms being reordered so a row is inserted while a refusal is
+    // reported — the guard here (`c.cnt < o.max_concurrent_meetings`) is the one
+    // most likely to be edited later.
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM meetings WHERE org_id = $1")
+        .bind(org_id)
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(count, 2, "refused creation must not insert a meeting");
+    Ok(())
+}
+
+// ============================================================================
+// NOTE ON THE CAP TESTS IN THIS FILE
+//
+// `test_create_meeting_org_limit_exceeded`, `test_active_meetings_count_toward_org_limit`
+// and `test_org_limit_counts_only_own_org_meetings` all drive **sequentially**.
+// They exercise the cap's *value* — which meetings count, whose meetings count,
+// what happens at the boundary — and never its enforcement under concurrency.
+//
+// The cap is not in fact enforced under concurrent statements: `current_count`
+// takes no row locks under READ COMMITTED and no constraint backs the limit, so
+// N concurrent creates against a cap of M can overshoot to M+N-1. Tracked in
+// `docs/TODO.md` (Code Quality), owner database.
+//
+// A green cap suite is not evidence the cap holds under load.
+// ============================================================================
+
+// ============================================================================
+// Story R-6: the three refusal causes are distinguishable
+//
+// NOTE ON REACHABILITY: this harness signs its own tokens against a mocked
+// JWKS, so it can present a valid `UserClaims` for an organization that does
+// not exist or is inactive. Production cannot reach those states through this
+// endpoint — AC's `org_extraction` resolves the org by subdomain filtered on
+// `is_active = true` and fails closed, so no token is ever minted for such an
+// org; they are reachable only inside the ~1h token TTL after the row changes
+// underneath a live credential. Both readings are true at once: the assertions
+// below are real, and a green run is NOT evidence that these branches are
+// routinely reachable in the field.
+// ============================================================================
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn test_create_meeting_org_inactive_returns_organization_inactive(
+    pool: PgPool,
+) -> Result<()> {
+    let server = TestCreateMeetingServer::spawn(pool.clone()).await?;
+    let org_id = create_test_org_inactive(&pool, "inactive-org").await;
+    let user_id = create_test_user(&pool, org_id, "user@inactive.com").await;
+    let token = server.create_user_token(user_id, org_id, vec!["user".to_string()]);
+
+    let before = creation_failures_for(&server, "org_inactive").await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/api/v1/meetings", server.url()))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&serde_json::json!({"displayName": "Inactive Org Meeting"}))
+        .send()
+        .await?;
+
+    let (status, code) = error_status_and_code(resp).await;
+    assert_eq!(status, 403, "A deactivated org is an authorization refusal");
+    assert_eq!(
+        code, "ORGANIZATION_INACTIVE",
+        "A deactivated org must not report as a full cap"
+    );
+    assert!(
+        creation_failures_for(&server, "org_inactive").await > before,
+        "inactive org must emit error_type=\"org_inactive\""
+    );
+
+    // No meeting may exist: the refusal and the INSERT guard are expressed in
+    // two different places in the query, and the dangerous drift is the one
+    // where the row lands anyway.
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM meetings WHERE org_id = $1")
+        .bind(org_id)
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(count, 0, "refused creation must not insert a meeting");
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn test_create_meeting_org_not_provisioned_is_distinct(pool: PgPool) -> Result<()> {
+    let server = TestCreateMeetingServer::spawn(pool.clone()).await?;
+    // No organizations row is inserted: a validly-signed token naming an org
+    // that does not exist. The users FK is never reached, because the INSERT's
+    // source relation yields zero candidate rows.
+    let org_id = Uuid::new_v4();
+    let user_id = Uuid::new_v4();
+    let token = server.create_user_token(user_id, org_id, vec!["user".to_string()]);
+
+    let before = creation_failures_for(&server, "org_not_provisioned").await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/api/v1/meetings", server.url()))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&serde_json::json!({"displayName": "Ghost Org Meeting"}))
+        .send()
+        .await?;
+
+    let status = resp.status().as_u16();
+    let body: serde_json::Value = resp.json().await?;
+    let code = body["error"]["code"].as_str().unwrap();
+    let message = body["error"]["message"].as_str().unwrap();
+
+    assert_eq!(
+        status, 500,
+        "An org row missing under a valid token is a server-side state fault"
+    );
+    assert_eq!(
+        code, "ORGANIZATION_NOT_PROVISIONED",
+        "Must be distinct from INTERNAL_ERROR, which this endpoint already \
+         emits for RNG failure and meeting-code-collision exhaustion"
+    );
+
+    // The organization identifier is a log field, never a body field. This
+    // assertion is the thing that would catch someone later converting the
+    // unit variant into one carrying a helpful detail string.
+    assert_eq!(message, "An internal error occurred");
+    assert!(
+        !message.contains(&org_id.to_string()),
+        "response body must not carry the organization identifier"
+    );
+    assert!(
+        creation_failures_for(&server, "org_not_provisioned").await > before,
+        "missing org must emit error_type=\"org_not_provisioned\""
+    );
+
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM meetings WHERE org_id = $1")
+        .bind(org_id)
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(count, 0, "refused creation must not insert a meeting");
+    Ok(())
+}
+
+/// The tuple task #3 and the story runner branch on.
+///
+/// Before story R-6 all three of these were `(403, "FORBIDDEN")`, so a broken
+/// organization was indistinguishable from a busy one. Any future re-collapse
+/// reds this test rather than silently changing which lane a failure lands in.
+#[sqlx::test(migrations = "../../migrations")]
+async fn test_meeting_refusal_causes_are_pairwise_distinct(pool: PgPool) -> Result<()> {
+    let server = TestCreateMeetingServer::spawn(pool.clone()).await?;
+    let client = reqwest::Client::new();
+
+    let mut observed = Vec::new();
+
+    // 1. Cap exhausted.
+    let full_org = create_test_org_with_limit(&pool, "distinct-full", 1).await;
+    let full_user = create_test_user(&pool, full_org, "user@distinct-full.com").await;
+    create_test_meeting_directly(&pool, full_org, full_user, "DISTINCT001A").await;
+
+    // 2. Organization deactivated.
+    let inactive_org = create_test_org_inactive(&pool, "distinct-inactive").await;
+    let inactive_user = create_test_user(&pool, inactive_org, "user@distinct-inactive.com").await;
+
+    // 3. Organization row absent.
+    let ghost_org = Uuid::new_v4();
+    let ghost_user = Uuid::new_v4();
+
+    for (org_id, user_id, label) in [
+        (full_org, full_user, "cap exhausted"),
+        (inactive_org, inactive_user, "org inactive"),
+        (ghost_org, ghost_user, "org not provisioned"),
+    ] {
+        let token = server.create_user_token(user_id, org_id, vec!["user".to_string()]);
+        let resp = client
+            .post(format!("{}/api/v1/meetings", server.url()))
+            .header("Authorization", format!("Bearer {}", token))
+            .json(&serde_json::json!({"displayName": "Distinctness Probe"}))
+            .send()
+            .await?;
+        let (status, code) = error_status_and_code(resp).await;
+        observed.push((status, code, label));
+    }
+
+    for (i, left) in observed.iter().enumerate() {
+        for right in observed.iter().skip(i + 1) {
+            assert!(
+                (left.0, &left.1) != (right.0, &right.1),
+                "'{}' and '{}' both respond ({}, {}) — the refusal causes have re-collapsed",
+                left.2,
+                right.2,
+                left.0,
+                left.1
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The organization probed is the token's, and only the token's.
+///
+/// The whole safety argument for reporting distinct causes is that `org_id` is
+/// token-derived, so a caller learns only about their own organization. If a
+/// client-supplied selector were ever accepted, these three outcomes would
+/// become a cross-tenant enumeration oracle.
+#[sqlx::test(migrations = "../../migrations")]
+async fn test_org_selector_cannot_be_supplied_by_client(pool: PgPool) -> Result<()> {
+    let server = TestCreateMeetingServer::spawn(pool.clone()).await?;
+
+    // Caller's own org is at its cap.
+    let caller_org = create_test_org_with_limit(&pool, "selector-caller", 1).await;
+    let caller_user = create_test_user(&pool, caller_org, "user@selector-caller.com").await;
+    create_test_meeting_directly(&pool, caller_org, caller_user, "SELECTOR001A").await;
+
+    // A different, perfectly healthy org the caller must not be able to name.
+    let other_org = create_test_org(&pool, "selector-other").await;
+
+    let token = server.create_user_token(caller_user, caller_org, vec!["user".to_string()]);
+    let client = reqwest::Client::new();
+
+    // (a) An explicit org selector in the body is rejected outright.
+    for field in ["orgId", "org_id"] {
+        let resp = client
+            .post(format!("{}/api/v1/meetings", server.url()))
+            .header("Authorization", format!("Bearer {}", token))
+            .json(&serde_json::json!({
+                "displayName": "Selector Probe",
+                field: other_org.to_string(),
+            }))
+            .send()
+            .await?;
+        assert_eq!(
+            resp.status(),
+            400,
+            "body field `{field}` must be rejected as an unknown field"
+        );
+    }
+
+    // (b) With no selector accepted, the outcome follows the token's org even
+    // though another org is healthy and available.
+    let resp = client
+        .post(format!("{}/api/v1/meetings", server.url()))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&serde_json::json!({"displayName": "Selector Probe"}))
+        .send()
+        .await?;
+    let (status, code) = error_status_and_code(resp).await;
+    assert_eq!(status, 403);
+    assert_eq!(
+        code, "ORGANIZATION_MEETING_LIMIT_EXCEEDED",
+        "outcome must follow the token's org, not any other org's state"
+    );
+
+    // The healthy org was never touched.
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM meetings WHERE org_id = $1")
+        .bind(other_org)
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(count, 0);
+    Ok(())
+}
+
+/// The cap counts `'active'` meetings, not only `'scheduled'` ones.
+///
+/// Story R-7's premise is that live meetings accumulate toward the cap. Every
+/// fixture in this file previously created `'scheduled'` rows, so dropping
+/// `'active'` from the query's `status IN (...)` would not have redded anything
+/// here.
+#[sqlx::test(migrations = "../../migrations")]
+async fn test_active_meetings_count_toward_org_limit(pool: PgPool) -> Result<()> {
+    let server = TestCreateMeetingServer::spawn(pool.clone()).await?;
+    let org_id = create_test_org_with_limit(&pool, "active-count-org", 2).await;
+    let user_id = create_test_user(&pool, org_id, "user@active-count.com").await;
+
+    // Both at the cap, both 'active' — not a single 'scheduled' row.
+    create_test_meeting_with_status(&pool, org_id, user_id, "ACTIVE0001AA", "active").await;
+    create_test_meeting_with_status(&pool, org_id, user_id, "ACTIVE0002BB", "active").await;
+
+    let token = server.create_user_token(user_id, org_id, vec!["user".to_string()]);
+    let resp = reqwest::Client::new()
+        .post(format!("{}/api/v1/meetings", server.url()))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&serde_json::json!({"displayName": "Should Be Refused"}))
+        .send()
+        .await?;
+
+    let (status, code) = error_status_and_code(resp).await;
+    assert_eq!(status, 403);
+    assert_eq!(code, "ORGANIZATION_MEETING_LIMIT_EXCEEDED");
+    Ok(())
+}
+
+/// The cap counts only the caller's own organization's meetings.
+///
+/// `current_count`'s `WHERE org_id = $1` moved into the restructured CTE's join
+/// source. That predicate can survive a refactor character-for-character while
+/// the relation it constrains shifts underneath it, and no test in this file
+/// previously had two organizations where one held meetings — so the
+/// regression (cross-tenant count bleed) would have been invisible.
+#[sqlx::test(migrations = "../../migrations")]
+async fn test_org_limit_counts_only_own_org_meetings(pool: PgPool) -> Result<()> {
+    let server = TestCreateMeetingServer::spawn(pool.clone()).await?;
+
+    // Org A: cap 2, zero meetings of its own.
+    let org_a = create_test_org_with_limit(&pool, "tenant-a", 2).await;
+    let user_a = create_test_user(&pool, org_a, "user@tenant-a.com").await;
+
+    // Org B: holds enough meetings to exhaust A's cap if they were counted.
+    let org_b = create_test_org_with_limit(&pool, "tenant-b", 10).await;
+    let user_b = create_test_user(&pool, org_b, "user@tenant-b.com").await;
+    create_test_meeting_directly(&pool, org_b, user_b, "TENANTB0001A").await;
+    create_test_meeting_directly(&pool, org_b, user_b, "TENANTB0002B").await;
+    create_test_meeting_with_status(&pool, org_b, user_b, "TENANTB0003C", "active").await;
+
+    let token = server.create_user_token(user_a, org_a, vec!["user".to_string()]);
+    let resp = reqwest::Client::new()
+        .post(format!("{}/api/v1/meetings", server.url()))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&serde_json::json!({"displayName": "Tenant A Meeting"}))
+        .send()
+        .await?;
+
     assert_eq!(
         resp.status(),
-        403,
-        "Should return 403 when org limit exceeded"
+        201,
+        "another organization's meetings must not count toward this org's cap"
+    );
+    Ok(())
+}
+
+/// `max_participants` is capped at the org's `max_participants_per_meeting`.
+///
+/// The `LEAST($6, o.max_participants_per_meeting)` branch had never executed in
+/// any test: every case requested fewer participants than the schema default of
+/// 100. It is also the branch that would silently uncap if the INSERT's source
+/// relation were ever changed to a LEFT JOIN, because `LEAST($6, NULL)`
+/// returns `$6`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn test_max_participants_capped_at_org_limit(pool: PgPool) -> Result<()> {
+    let server = TestCreateMeetingServer::spawn(pool.clone()).await?;
+    let org_id = create_test_org_with_participant_cap(&pool, "participant-cap-org", 10).await;
+    let user_id = create_test_user(&pool, org_id, "user@participant-cap.com").await;
+    let token = server.create_user_token(user_id, org_id, vec!["user".to_string()]);
+
+    let resp = reqwest::Client::new()
+        .post(format!("{}/api/v1/meetings", server.url()))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&serde_json::json!({
+            "displayName": "Oversized Request",
+            "maxParticipants": 500
+        }))
+        .send()
+        .await?;
+
+    assert_eq!(resp.status(), 201);
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(
+        body["maxParticipants"], 10,
+        "response must reflect the org cap, not the request"
+    );
+
+    // Read back: the stored row is what task #3's env-tests depend on, and a
+    // regression could echo the requested value while storing something else.
+    let stored: i32 = sqlx::query_scalar(
+        "SELECT max_participants FROM meetings WHERE meeting_id = $1::text::uuid",
+    )
+    .bind(body["meetingId"].as_str().unwrap())
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(
+        stored, 10,
+        "stored max_participants must reflect the org cap"
     );
     Ok(())
 }

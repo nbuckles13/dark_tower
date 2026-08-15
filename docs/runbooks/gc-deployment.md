@@ -1229,7 +1229,25 @@ histogram_quantile(0.95,
 - [ ] Meeting creation error rate < 1%
 - [ ] Meeting creation p95 latency < 500ms
 - [ ] No `code_collision` errors in `gc_meeting_creation_failures_total{error_type="code_collision"}`
-- [ ] No unexpected `forbidden` errors in `gc_meeting_creation_failures_total{error_type="forbidden"}`
+- [ ] No unexpected capacity exhaustion in `gc_meeting_creation_failures_total{error_type="org_limit"}`
+- [ ] **Zero** `gc_meeting_creation_failures_total{error_type=~"org_inactive|org_not_provisioned"}` (see note below)
+- [ ] No unexpected role denials in `gc_meeting_creation_failures_total{error_type="forbidden"}`
+
+> **`error_type="forbidden"` changed meaning.** Before the meeting-refusal-cause split it covered
+> both org capacity exhaustion and role denial; it now means **role denial only**. Capacity
+> exhaustion is `org_limit`. A checklist or dashboard query still selecting `forbidden` for
+> capacity will report clean *during a real cap exhaustion*. If you are carrying the old
+> association, re-read the four selectors above.
+>
+> **`org_inactive` and `org_not_provisioned` are expected to be permanently absent** — they are
+> organization-state faults with no legitimate cause in this system. Their appearance is most
+> likely right after a deploy, which makes this checklist the highest-signal place to catch them.
+> If either is non-zero, do **not** treat it as a code regression and do **not** roll back on that
+> basis: check first whether GC and AC are pointed at the same database (`gc-service-secrets` and
+> `ac-service-secrets` each carry an independent `DATABASE_URL`, and nothing enforces that they
+> agree), and whether the database was reset or restored. Alert `GCMeetingCreationOrgStateInvalid`
+> covers the same condition; triage is
+> `gc-incident-response.md#scenario-8-meeting-creation-limit-exhaustion`.
 
 **2-hour check:**
 
@@ -1240,14 +1258,15 @@ histogram_quantile(0.95,
 
 **4-hour check:**
 
-- [ ] No limit exhaustion patterns (no spike in `error_type="forbidden"`)
+- [ ] No limit exhaustion patterns (no spike in `error_type="org_limit"`)
+- [ ] `error_type=~"org_inactive|org_not_provisioned"` still zero
 - [ ] Code collision count = 0 (`gc_meeting_creation_failures_total{error_type="code_collision"}`)
 - [ ] Meeting creation latency trend is stable
 - [ ] Database query latency for meeting operations is within baseline
 
 **24-hour check:**
 
-- [ ] All meeting creation alerts clear (no `GCMeetingCreationStopped`, `GCMeetingCreationFailureRate`, `GCMeetingCreationLatencyHigh`)
+- [ ] All meeting creation alerts clear (no `GCMeetingCreationStopped`, `GCMeetingCreationFailureRate`, `GCMeetingCreationLatencyHigh`, `GCMeetingCreationOrgStateInvalid`)
 - [ ] Daily meeting creation volume matches pre-deployment baseline expectations
 - [ ] No anomalous patterns in error type distribution
 - [ ] Remove any temporary monitoring overrides or escalation holds

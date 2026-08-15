@@ -4,6 +4,7 @@
 //! Error messages returned to clients are intentionally generic to avoid
 //! leaking internal details. Actual errors are logged server-side.
 
+use crate::repositories::MeetingRefusal;
 use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
@@ -24,7 +25,6 @@ use thiserror::Error;
 /// - BadRequest: 400 Bad Request
 /// - ServiceUnavailable: 503 Service Unavailable
 #[derive(Debug, Error)]
-#[allow(dead_code)] // Variants will be used in Phase 2+
 pub enum GcError {
     #[error("Database error: {0}")]
     Database(String),
@@ -35,6 +35,17 @@ pub enum GcError {
     #[error("Not found: {0}")]
     NotFound(String),
 
+    /// A resource conflict (409).
+    // No constructor yet — the only variant of this enum without one. Scoped here
+    // rather than the enum-wide `#[allow(dead_code)]` this replaces, which masked
+    // all fifteen. `#[expect]` is unusable: `main.rs` re-declares these modules
+    // privately, so the lint fires for the bin target but not the lib, where the
+    // enum is `pub` and never dead — an `#[expect]` would be unfulfilled in the
+    // lib build and warn there instead.
+    #[allow(
+        dead_code,
+        reason = "Conflict has no constructor; all other variants are live"
+    )]
     #[error("Conflict: {0}")]
     Conflict(String),
 
@@ -43,6 +54,31 @@ pub enum GcError {
 
     #[error("Forbidden: {0}")]
     Forbidden(String),
+
+    /// The organization is at its concurrent-meeting cap (403).
+    ///
+    /// Unit variant deliberately: `IntoResponse` echoes the payload of
+    /// `String`-carrying variants verbatim to the client, so carrying one here
+    /// would put an org identifier, cap value or live meeting count one careless
+    /// call site away from the wire. The message is fixed.
+    #[error("Organization meeting limit exceeded")]
+    OrgMeetingLimitExceeded,
+
+    /// The organization row exists with `is_active = false` (403).
+    ///
+    /// Unit variant for the same reason as [`GcError::OrgMeetingLimitExceeded`].
+    #[error("Organization is not active")]
+    OrgInactive,
+
+    /// A valid token names an organization with no row (500).
+    ///
+    /// Distinct from [`GcError::Internal`] because this endpoint already emits
+    /// `INTERNAL_ERROR` for RNG failure and meeting-code-collision exhaustion:
+    /// reusing it would leave the cause indistinguishable on the wire, which is
+    /// the defect story R-6 exists to remove. Client-visible message stays
+    /// generic; the organization identifier goes to the log only.
+    #[error("Organization is not provisioned")]
+    OrgNotProvisioned,
 
     #[error("Bad request: {0}")]
     BadRequest(String),
@@ -72,7 +108,8 @@ impl GcError {
             GcError::NotFound(_) => 404,
             GcError::Conflict(_) => 409,
             GcError::RateLimitExceeded => 429,
-            GcError::Forbidden(_) => 403,
+            GcError::Forbidden(_) | GcError::OrgMeetingLimitExceeded | GcError::OrgInactive => 403,
+            GcError::OrgNotProvisioned => 500,
             GcError::BadRequest(_) => 400,
             GcError::ServiceUnavailable(_) => 503,
             GcError::PayloadTooLarge(_) => 413,
@@ -92,6 +129,12 @@ impl GcError {
             GcError::Conflict(_) => "conflict",
             GcError::RateLimitExceeded => "rate_limit",
             GcError::Forbidden(_) => "forbidden",
+            // These three intentionally equal `MeetingRefusal::metric_label()`
+            // so `gc_meeting_creation_failures_total` and the HTTP error metrics
+            // correlate mechanically for whoever is on call.
+            GcError::OrgMeetingLimitExceeded => "org_limit",
+            GcError::OrgInactive => "org_inactive",
+            GcError::OrgNotProvisioned => "org_not_provisioned",
             GcError::BadRequest(_) => "bad_request",
             GcError::ServiceUnavailable(_) => "service_unavailable",
             GcError::PayloadTooLarge(_) => "payload_too_large",
@@ -136,6 +179,26 @@ impl IntoResponse for GcError {
                 "Too many requests. Please try again later.".to_string(),
             ),
             GcError::Forbidden(reason) => (StatusCode::FORBIDDEN, "FORBIDDEN", reason.clone()),
+            GcError::OrgMeetingLimitExceeded => (
+                StatusCode::FORBIDDEN,
+                "ORGANIZATION_MEETING_LIMIT_EXCEEDED",
+                "Organization meeting limit exceeded".to_string(),
+            ),
+            GcError::OrgInactive => (
+                StatusCode::FORBIDDEN,
+                "ORGANIZATION_INACTIVE",
+                "Organization is not active".to_string(),
+            ),
+            // Deliberately does NOT log here. Unlike `Database`/`Internal`, this
+            // is a unit variant carrying no detail to preserve, and the handler
+            // already emits an `error!` with `org_id` and `user_id`. A second
+            // line here would add no context while double-counting the event in
+            // any log-derived error rate.
+            GcError::OrgNotProvisioned => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "ORGANIZATION_NOT_PROVISIONED",
+                "An internal error occurred".to_string(),
+            ),
             GcError::BadRequest(reason) => (StatusCode::BAD_REQUEST, "BAD_REQUEST", reason.clone()),
             GcError::ServiceUnavailable(reason) => {
                 // Log actual reason server-side
@@ -199,6 +262,21 @@ impl IntoResponse for GcError {
         }
 
         response
+    }
+}
+
+/// Map a repository-level refusal cause to its HTTP-level error.
+///
+/// The single place the two taxonomies meet. Exhaustive, so adding a fourth
+/// refusal cause is a compile error here rather than a silently-defaulted
+/// status code.
+impl From<MeetingRefusal> for GcError {
+    fn from(refusal: MeetingRefusal) -> Self {
+        match refusal {
+            MeetingRefusal::OrganizationNotProvisioned => GcError::OrgNotProvisioned,
+            MeetingRefusal::OrganizationInactive => GcError::OrgInactive,
+            MeetingRefusal::CapacityExhausted => GcError::OrgMeetingLimitExceeded,
+        }
     }
 }
 
@@ -284,6 +362,178 @@ mod tests {
     fn test_display_internal() {
         let error = GcError::Internal("test reason".to_string());
         assert_eq!(format!("{}", error), "Internal server error: test reason");
+    }
+
+    /// One representative value per `GcError` variant.
+    ///
+    /// **What the `match` below does and does not enforce.** Adding a variant to
+    /// `GcError` is a compile error here until someone adds an arm — so a new
+    /// variant cannot be introduced without a maintainer visiting this function.
+    /// It does **not** enforce that the variant was also added to `all`: the
+    /// `match` only ever sees values already in the list, so handling the arm
+    /// while forgetting the list leaves the uniqueness test silently covering
+    /// N-1 of N variants. Rust cannot close that gap without a derive
+    /// (`strum` is not in the workspace; `std::mem::variant_count` is nightly),
+    /// so **adding the value to `all` is on the author.**
+    ///
+    /// Stated precisely because an overclaiming comment on *this* test would be
+    /// worse than none — it is the anti-re-collapse guard for the whole change,
+    /// so it is what a future reader trusts instead of checking (@test, T-9
+    /// follow-up). Still stronger than the hand-enumerated house style at the
+    /// `test_status_codes` / `test_error_type_labels` pair below, which can be
+    /// narrowed with no signal at all.
+    fn one_of_each_variant() -> Vec<GcError> {
+        let all = vec![
+            GcError::Database("t".into()),
+            GcError::InvalidToken("t".into()),
+            GcError::NotFound("t".into()),
+            GcError::Conflict("t".into()),
+            GcError::RateLimitExceeded,
+            GcError::Forbidden("t".into()),
+            GcError::OrgMeetingLimitExceeded,
+            GcError::OrgInactive,
+            GcError::OrgNotProvisioned,
+            GcError::BadRequest("t".into()),
+            GcError::ServiceUnavailable("t".into()),
+            GcError::PayloadTooLarge("t".into()),
+            GcError::UnsupportedMediaType("t".into()),
+            GcError::BadGateway("t".into()),
+            GcError::Internal("t".into()),
+        ];
+
+        // Duplicate guard only; see the doc comment above for what this match
+        // does and does not enforce.
+        let mut seen = std::collections::BTreeSet::new();
+        for err in &all {
+            let discriminant = match err {
+                GcError::Database(_) => "Database",
+                GcError::InvalidToken(_) => "InvalidToken",
+                GcError::NotFound(_) => "NotFound",
+                GcError::Conflict(_) => "Conflict",
+                GcError::RateLimitExceeded => "RateLimitExceeded",
+                GcError::Forbidden(_) => "Forbidden",
+                GcError::OrgMeetingLimitExceeded => "OrgMeetingLimitExceeded",
+                GcError::OrgInactive => "OrgInactive",
+                GcError::OrgNotProvisioned => "OrgNotProvisioned",
+                GcError::BadRequest(_) => "BadRequest",
+                GcError::ServiceUnavailable(_) => "ServiceUnavailable",
+                GcError::PayloadTooLarge(_) => "PayloadTooLarge",
+                GcError::UnsupportedMediaType(_) => "UnsupportedMediaType",
+                GcError::BadGateway(_) => "BadGateway",
+                GcError::Internal(_) => "Internal",
+            };
+            assert!(
+                seen.insert(discriminant),
+                "{discriminant} listed twice in one_of_each_variant"
+            );
+        }
+
+        all
+    }
+
+    /// Every `GcError` variant renders a distinct envelope `code`.
+    ///
+    /// This is the anti-re-collapse guard for story R-6: the three refusal
+    /// causes are told apart by (status, code), and `POST /api/v1/meetings`
+    /// already emitted `INTERNAL_ERROR` from two unrelated paths before this
+    /// change. A future variant sharing a code would silently re-merge causes
+    /// that this work separated.
+    #[tokio::test]
+    async fn every_variant_has_a_distinct_error_code() {
+        let mut codes: std::collections::BTreeMap<String, &'static str> =
+            std::collections::BTreeMap::new();
+
+        for err in one_of_each_variant() {
+            let label = err.error_type_label();
+            let response = err.into_response();
+            let body_json = read_body_json(response.into_body()).await;
+            let code = body_json["error"]["code"].as_str().unwrap().to_string();
+
+            let previous = codes.get(&code).copied().unwrap_or_default();
+            assert!(
+                previous.is_empty(),
+                "error code {code} is emitted by both {previous} and {label} — \
+                 two variants sharing a code silently re-merge causes"
+            );
+            codes.insert(code, label);
+        }
+    }
+
+    /// The three refusal causes are pairwise distinct at the (status, code)
+    /// level — the tuple the story runner and task #3 branch on.
+    #[tokio::test]
+    async fn refusal_causes_are_pairwise_distinct() {
+        let mut seen = std::collections::BTreeSet::new();
+
+        for err in [
+            GcError::OrgMeetingLimitExceeded,
+            GcError::OrgInactive,
+            GcError::OrgNotProvisioned,
+        ] {
+            let status = err.status_code();
+            let response = err.into_response();
+            let body_json = read_body_json(response.into_body()).await;
+            let code = body_json["error"]["code"].as_str().unwrap().to_string();
+            assert!(
+                seen.insert((status, code.clone())),
+                "({status}, {code}) is not distinct across the three refusal causes"
+            );
+        }
+        assert_eq!(seen.len(), 3);
+    }
+
+    #[test]
+    fn refusal_maps_to_its_error_variant() {
+        use crate::repositories::meetings::MeetingRefusal;
+
+        // Label agreement between the two taxonomies is load-bearing: the
+        // creation-failure metric and the HTTP error metric must correlate.
+        for (refusal, expected_status) in [
+            (MeetingRefusal::CapacityExhausted, 403),
+            (MeetingRefusal::OrganizationInactive, 403),
+            (MeetingRefusal::OrganizationNotProvisioned, 500),
+        ] {
+            let err: GcError = refusal.into();
+            assert_eq!(err.status_code(), expected_status);
+            assert_eq!(err.error_type_label(), refusal.metric_label());
+        }
+    }
+
+    #[tokio::test]
+    async fn org_not_provisioned_body_carries_no_identifier() {
+        let response = GcError::OrgNotProvisioned.into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let body_json = read_body_json(response.into_body()).await;
+        assert_eq!(body_json["error"]["code"], "ORGANIZATION_NOT_PROVISIONED");
+        // Generic message: the org identifier is a log field, never a body field.
+        assert_eq!(body_json["error"]["message"], "An internal error occurred");
+    }
+
+    #[tokio::test]
+    async fn org_inactive_response_shape() {
+        let response = GcError::OrgInactive.into_response();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let body_json = read_body_json(response.into_body()).await;
+        assert_eq!(body_json["error"]["code"], "ORGANIZATION_INACTIVE");
+        assert_eq!(body_json["error"]["message"], "Organization is not active");
+    }
+
+    #[tokio::test]
+    async fn org_meeting_limit_exceeded_response_shape() {
+        let response = GcError::OrgMeetingLimitExceeded.into_response();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let body_json = read_body_json(response.into_body()).await;
+        assert_eq!(
+            body_json["error"]["code"],
+            "ORGANIZATION_MEETING_LIMIT_EXCEEDED"
+        );
+        assert_eq!(
+            body_json["error"]["message"],
+            "Organization meeting limit exceeded"
+        );
     }
 
     #[test]

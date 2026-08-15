@@ -31,6 +31,7 @@
 - AC HTTP client (meeting/guest tokens) -> `crates/gc-service/src/services/ac_client.rs:AcClient`
 - MC/MH repositories (register, heartbeat, staleness) -> `crates/gc-service/src/repositories/` (`meeting_controllers.rs`, `media_handlers.rs`)
 - Meetings repository (create with limit check, audit log) -> `crates/gc-service/src/repositories/meetings.rs:MeetingsRepository`
+- Meeting-refusal cause taxonomy (`MeetingRefusal`, `CreateMeetingOutcome`, `metric_label()`) -> `crates/gc-service/src/repositories/meetings.rs`; HTTP mapping via `impl From<MeetingRefusal> for GcError` in `errors.rs`
 - Assignment repository (weighted select, atomic assign, row mapper) -> `crates/gc-service/src/repositories/meeting_assignments.rs`
 - Generic health checker loop -> `crates/gc-service/src/tasks/generic_health_checker.rs`
 - Assignment cleanup (soft/hard delete) -> `crates/gc-service/src/tasks/assignment_cleanup.rs`
@@ -59,7 +60,6 @@
 - Metrics catalog (creation + join) -> `docs/observability/metrics/gc-service.md`
 
 ### Metric testability (ADR-0032)
-- Uncovered sites (~21/186): `main.rs:127` token-refresh closure (Cat B extraction); `handlers/meetings.rs` error branches (validation direct-call / pg-error-code real-DB+fault / non-DB repo-trait); `mh_selection.rs` deeply-nested; `grpc/auth_layer.rs:250` wrapper-only. GC spawns at `main.rs:180/199/207` are lifecycle, not fire-and-forget (no accept-loop-style backfill needed). SLO: 11% → <6% by 2026-07 → <3% by 2026-10
 - ADR-0032 Step 5 closeout (2026-04-27, commit `48f1250`): all 25 uncovered GC metrics drained → `validate-metric-coverage.sh` GREEN. Per-cluster `MetricAssertion`-backed integration tests at `crates/gc-service/tests/*_metrics_integration.rs` (13 cluster files); in-src `#[cfg(test)] mod tests` at `crates/gc-service/src/observability/metrics.rs`. Cat B extraction: `record_token_refresh_metrics` parallel sibling pattern (1:1 with MH/MC). Fixture consolidation: `tests/common/jwt_fixtures.rs` consumed by all 3 pre-existing GC integration test files + 13 new cluster files.
 
 ### Step 5 Patterns Worth Carrying Forward

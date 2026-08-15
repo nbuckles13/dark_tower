@@ -295,8 +295,39 @@ groups:
           component: meeting-creation
         annotations:
           summary: "Meeting creation failure rate high ({{ $value | humanizePercentage }})"
-          description: "Meeting creation failure rate is {{ $value | humanizePercentage }} for 5 minutes. This may indicate database issues, org limit exhaustion, or code collision problems."
+          description: "Meeting creation failure rate is {{ $value | humanizePercentage }} for 5 minutes. Break down by `error_type` on the 'Meeting Creation Failures by Type' panel and follow the cause table in the runbook. These values are not interchangeable: capacity exhaustion, organization-state faults and role denial have different causes and different owners."
           impact: "Some users unable to create meetings. Investigate error types in dashboard."
+          runbook_url: "docs/runbooks/gc-incident-response.md#scenario-8-meeting-creation-limit-exhaustion"
+
+      # Organization-state refusals (R-6). Steady state for this series is zero:
+      # no code path deactivates or deletes an organization, and AC will not mint
+      # a token for an inactive org, so a valid token naming a missing/inactive
+      # org means GC and AC disagree about database state.
+      #
+      # Window derivation (SSoT coupling — NOT mechanically guarded):
+      #   `for: 15m` must stay BELOW the maximum lifetime of the condition, which
+      #   is bounded by AC's access-token TTL — `TOKEN_EXPIRY_SECONDS = 3600` at
+      #   `crates/ac-service/src/services/token_service.rs:18` — plus the 1h
+      #   `increase()` window. An earlier draft used `for: 2h`, which EXCEEDS that
+      #   ceiling and was therefore unsatisfiable by construction: it would have
+      #   passed the alert guard and never fired. If the token TTL is ever
+      #   shortened, re-check this clause. Nothing enforces this coupling; see
+      #   `docs/TODO.md` §Observability Debt (alert-rule unit tests).
+      #
+      # This rule has no automated exerciser — the repo has no `promtool test
+      # rules` harness — so its silence is NOT evidence that it works.
+      - alert: GCMeetingCreationOrgStateInvalid
+        expr: |
+          sum(increase(gc_meeting_creation_failures_total{error_type=~"org_inactive|org_not_provisioned"}[1h])) > 0
+        for: 15m
+        labels:
+          severity: warning
+          service: gc-service
+          component: meeting-creation
+        annotations:
+          summary: "GC refused meeting creation for organization-state reasons ({{ $value }} in the last hour)"
+          description: "Meeting creation was refused because the caller's organization is inactive (`org_inactive`) or absent (`org_not_provisioned`), rather than because its meeting cap is full. Steady state for this series is zero — no code path deactivates or deletes an organization — so any occurrence means a valid token references organization state GC cannot see. Check in this order: a database volume reset (the seeded org is re-created with a fresh org_id while pre-reset tokens carry the old one), GC and AC configured against different databases, a restore, then out-of-band SQL. This rule fires on a SINGLE occurrence; the 15m `for` clause debounces scrape flapping and does not require repeated events. Expected detection delay ~15m. An empty series is the normal, healthy state — absence of data here is not a broken exporter."
+          impact: "Affected callers cannot create meetings. `org_not_provisioned` returns 500 and so also counts toward the aggregate HTTP error-rate SLO alerts; `org_inactive` returns 403. A rate that does not decay within roughly an hour indicates an ongoing divergence rather than the tail of expiring tokens."
           runbook_url: "docs/runbooks/gc-incident-response.md#scenario-8-meeting-creation-limit-exhaustion"
 
       - alert: GCMeetingCreationLatencyHigh

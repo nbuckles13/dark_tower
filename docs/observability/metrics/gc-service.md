@@ -207,13 +207,39 @@ All GC service metrics follow ADR-0011 naming conventions with the `gc_` prefix.
 - **Type**: Counter
 - **Description**: Meeting creation failures by error type
 - **Labels**:
-  - `error_type`: Type of failure (bad_request, forbidden, unauthorized, code_collision, db_error, internal)
-- **Cardinality**: Low (6 error types)
-- **Alert**: High rate may indicate org limit exhaustion or DB issues
-- **Usage**: Diagnose meeting creation failures
+  - `error_type`: Type of failure. Nine values:
+    - `bad_request`, `unauthorized`, `internal`, `db_error`, `code_collision`
+    - `forbidden` — **role denial only**. Before story R-6 (2026-08-14) this
+      value also carried organization-cap exhaustion; it no longer does.
+    - `org_limit` — the organization is at `max_concurrent_meetings`. A routine
+      policy refusal (`403 ORGANIZATION_MEETING_LIMIT_EXCEEDED`).
+    - `org_inactive` — the organization row exists with `is_active = false`
+      (`403 ORGANIZATION_INACTIVE`). Expected permanently absent; see below.
+    - `org_not_provisioned` — a valid token names an organization with no row
+      (`500 ORGANIZATION_NOT_PROVISIONED`). Expected permanently absent; see below.
+- **Cardinality**: Low (9 error types — note ADR-0011 bounds `error_type` at ~10,
+  so this metric is near its budget; adding a tenth value warrants a look at
+  whether the axis is still bounded by error *variants* rather than by causes.)
+- **Alert**: `GCMeetingCreationOrgStateInvalid` (org_inactive / org_not_provisioned).
+  A high `org_limit` rate indicates genuine capacity pressure, not a fault, and is
+  deliberately excluded from that rule.
+- **Usage**: Diagnose meeting creation failures. Because these three values are
+  emitted from `MeetingRefusal::metric_label()` (`crates/gc-service/src/repositories/meetings.rs`),
+  a `403` on `POST /api/v1/meetings` can be attributed to a specific cause without
+  log-diving — which is the point of story R-6.
+- **Absence semantics**: `org_inactive` and `org_not_provisioned` are expected to
+  be **permanently absent** in normal operation. No data on those series means
+  healthy, not a broken exporter or a bad scrape config. Neither is reachable
+  through any application flow: AC's `org_extraction` resolves the organization by
+  subdomain filtered on `is_active = true` and fails closed, so no token is minted
+  for a missing or inactive org. They are reachable only inside the token TTL after
+  the row changes underneath a live credential.
 - **Example**:
   ```promql
   sum(rate(gc_meeting_creation_failures_total[5m])) by (error_type)
+  # Organization-state faults only (excludes legitimate capacity refusals)
+  sum(increase(gc_meeting_creation_failures_total{
+    error_type=~"org_inactive|org_not_provisioned"}[1h])) > 0
   ```
 
 ---
@@ -742,7 +768,7 @@ All GC service metrics follow strict cardinality bounds per ADR-0011:
 | `status` | 5 | success, error, timeout, rejected, accepted (non-HTTP outcome metrics: mc_assignments, db_queries, token_refresh, ac_requests, grpc_mc_calls, mh_selections, meeting_creation, meeting_join) |
 | `operation` | ~18 | select_mc, atomic_assign, update_heartbeat, ac_meeting_token, ac_guest_token, mc_grpc, etc. |
 | `rejection_reason` | 5 | at_capacity, draining, unhealthy, rpc_failed, none |
-| `error_type` | ~10 | not_found, forbidden, unauthorized, rate_limit, service_unavailable, internal, etc. |
+| `error_type` | ~10 | not_found, forbidden, unauthorized, rate_limit, service_unavailable, internal, org_limit, org_inactive, org_not_provisioned, etc. `gc_meeting_creation_failures_total` carries 9 of these — near the bound. |
 
 **Total Estimated Cardinality**: HTTP metrics ~1,050 worst-case (realistically a few hundred), plus ~200 non-HTTP series — well within Prometheus limits.
 

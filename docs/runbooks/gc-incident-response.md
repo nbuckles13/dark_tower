@@ -549,6 +549,16 @@ curl http://gc-service.dark-tower.svc.cluster.local:8080/ready
 - Mix of 4xx and 5xx errors
 - Metrics: `gc_http_requests_total{status_code=~"[45].."}` increasing
 
+> **Do not roll back on a `500 ORGANIZATION_NOT_PROVISIONED` spike.** That error is
+> data-caused, not code-caused: a valid token naming an organization row GC cannot
+> see. A rollback cannot fix it and burns a deploy cycle mid-incident. The trap is
+> specific and well-timed — the `org_not_provisioned` series first appears when the
+> 2026-08-14 change deploys, so the deploy-correlation heuristic in Step 2 below
+> will fire with maximum apparent confidence on the one cause it cannot address.
+> Check `gc_meeting_creation_failures_total{error_type="org_not_provisioned"}`
+> first; if it is non-zero, go to
+> [Scenario 8](#scenario-8-meeting-creation-limit-exhaustion) instead.
+
 **Diagnosis**:
 
 ```bash
@@ -634,7 +644,10 @@ sum by(status_code) (increase(gc_http_requests_total{status_code=~"[45].."}[5m])
 # Step 2: For 5xx errors - check for recent deployments
 kubectl rollout history deployment/gc-service -n dark-tower
 
-# If recent deployment correlates with error spike:
+# BEFORE rolling back, rule out ORGANIZATION_NOT_PROVISIONED — see the note below.
+sum(increase(gc_meeting_creation_failures_total{error_type="org_not_provisioned"}[15m]))
+
+# If recent deployment correlates with error spike AND the query above is 0:
 kubectl rollout undo deployment/gc-service -n dark-tower
 
 # Expected recovery time: 2-3 minutes
@@ -872,15 +885,61 @@ curl http://localhost:8080/metrics | grep 'gc_token_refresh_total{status="succes
 
 ### Scenario 8: Meeting Creation Limit Exhaustion
 
-**Alert**: `GCMeetingCreationFailureRate`
+**Alert**: `GCMeetingCreationFailureRate`, `GCMeetingCreationOrgStateInvalid`
 **Severity**: Warning
 **Runbook Section**: `#scenario-8-meeting-creation-limit-exhaustion`
 
+> **Section title retained deliberately.** Since 2026-08-14 this scenario covers
+> three distinct refusal causes, only one of which is limit exhaustion. The
+> heading is unchanged because both alert rules bind their `runbook_url` to the
+> `#scenario-8-meeting-creation-limit-exhaustion` anchor — this is anchor
+> stability, not stale prose.
+
 **Symptoms**:
-- 403 Forbidden responses on `POST /api/v1/meetings`
+- 403 or 500 responses on `POST /api/v1/meetings`
 - Users unable to create new meetings despite valid authentication
-- Metrics: `gc_meeting_creation_failures_total{error_type="forbidden"}` spiking
-- Logs: `meeting creation forbidden: org concurrent meeting limit reached`
+- Metrics: `gc_meeting_creation_failures_total` spiking on one of the three
+  organization-refusal values below
+
+**Which cause fired.** Creation refusals split three ways. Match on the response
+`error.code` or the metric `error_type` — never on the message prose:
+
+| `error_type` | HTTP | `error.code` | Log message (verbatim) |
+|---|---|---|---|
+| `org_limit` | 403 | `ORGANIZATION_MEETING_LIMIT_EXCEEDED` | `Meeting creation refused: organization concurrent-meeting limit reached` |
+| `org_inactive` | 403 | `ORGANIZATION_INACTIVE` | `Meeting creation refused: organization is not active` |
+| `org_not_provisioned` | 500 | `ORGANIZATION_NOT_PROVISIONED` | `Meeting creation refused: organization referenced by a valid token does not exist` |
+
+> **`error_type="forbidden"` did not disappear — it changed meaning.** It now
+> denotes **role denial only** (the caller lacks `user`/`admin`/`org_admin`).
+> Before 2026-08-14 it also carried cap exhaustion, so an oncall carrying the old
+> association will keep producing confident wrong reads: nothing breaks, the
+> selector still matches, and it is simply answering a different question. Cap
+> exhaustion is now `org_limit`.
+
+The "Meeting Creation Failures by Type" panel in `gc-overview.json` groups by
+`error_type` rather than enumerating values, so it shows all four with no edit.
+
+> **`org_inactive` and `org_not_provisioned` are expected to be permanently
+> absent.** No data on those series is healthy — not a broken exporter, not a bad
+> scrape config. Neither state is reachable through any application flow (AC's
+> `org_extraction` resolves the org by subdomain filtered on `is_active = true`
+> and fails closed, so no token is minted for a missing or inactive org). They are
+> reachable only inside the ~1h token TTL after the row changes underneath a
+> credential that was already issued.
+>
+> **`GCMeetingCreationOrgStateInvalid` has no automated exerciser**: it is
+> expected never to fire in production, it is not reliably exercised in
+> development, and this repository has no alert-rule unit-test harness
+> (`validate-alert-rules.sh` checks that rules are *well-formed*, never that they
+> *fire*). **The fact that it has never fired is not evidence that it works.** If
+> it fires, treat the signal as real and follow the cause table below; do not
+> assume a misconfigured rule.
+>
+> All three values are new as of 2026-08-14 on a metric previously documented as
+> carrying six. A series appearing for the first time has no historical baseline,
+> so a first occurrence is not on its own an incident — the same caveat as
+> Scenario 5's new-label note.
 
 **Diagnosis**:
 
@@ -894,7 +953,14 @@ kill %1
 sum by(error_type) (increase(gc_meeting_creation_failures_total[5m]))
 
 # 3. Identify the affected organization(s)
-kubectl logs -n dark-tower -l app=gc-service --tail=200 | grep "meeting creation forbidden"
+#    Every refusal logs a structured `org_id` field — this is where the <ORG_ID>
+#    that steps 4-6 need comes from. Before 2026-08-14 the refusal path emitted
+#    no log at all, so those steps had no way to obtain it.
+kubectl logs -n dark-tower -l app=gc-service --tail=200 | grep "Meeting creation refused"
+
+# 3b. Narrow to one cause (substitute the log message from the table above)
+kubectl logs -n dark-tower -l app=gc-service --tail=200 \
+  | grep "Meeting creation refused: organization is not active"
 
 # 4. Check active and scheduled meeting counts for the org
 kubectl exec -it deployment/gc-service -n dark-tower -- psql $DATABASE_URL -c \
@@ -939,7 +1005,81 @@ kubectl exec -it deployment/gc-service -n dark-tower -- psql $DATABASE_URL -c \
    - Check: Look for a single user creating many 'scheduled' meetings that are never started — query `created_by_user_id` on recent orphaned meetings
    - Fix: Identify the offending user, clean up orphaned meetings, consider per-user meeting creation rate limits; escalate to Security Team if abuse is confirmed
 
+Causes 1-4 above are all `error_type="org_limit"`. The two organization-state
+causes are different problems with different fixes:
+
+5. **`org_inactive`** — the organization row exists with `is_active = false`, and a
+   token issued before the flag flipped is still being used.
+   - Check: `SELECT org_id, subdomain, is_active FROM organizations WHERE org_id = '<ORG_ID>';`
+   - Expect self-clearing within the token TTL (1h), because AC will not mint a
+     replacement token for an inactive org.
+   - Fix: none at the GC layer. If the deactivation was unintended, restore
+     `is_active`; if intended, the errors are correct and will stop on their own.
+
+6. **`org_not_provisioned`** — a validly-signed token names an organization with no
+   row. **This one has a duration discriminator, and it decides your next move.**
+
+   *Bounded regime* (self-clearing, ≤1h): the credential outlives the row. AC
+   cannot mint replacements, so the rate decays to zero within the token TTL.
+   Usually a test-manufactured blip of seconds to minutes — layer-7 exercises these
+   paths and provisions a per-run organization.
+
+   *Unbounded regime* (fires indefinitely): AC's row is healthy and AC keeps
+   minting valid tokens forever, **behaving correctly throughout**. GC is the side
+   that cannot see the row.
+
+   **Discriminator**: still firing beyond ~1h15m (1h TTL + the 15m rate window)
+   means the unbounded regime. In that case, in this order:
+
+   1. **The database was reset or restored.** Highest-likelihood cause and the
+      cheapest to check. `infra/docker/postgres/init.sql` seeds the dev org with
+      no explicit `org_id`, so it takes `DEFAULT gen_random_uuid()` — every volume
+      wipe mints a *new* `org_id` while previously-issued tokens still carry the
+      old one. Zero manual SQL required; the most routine dev action there is.
+      (A restart against a surviving volume is fine: `ON CONFLICT (subdomain) DO
+      NOTHING` preserves the existing row. This is specifically a *reset*.)
+   2. **GC and AC pointed at different databases.** `ac-service` and `gc-service`
+      carry independently-authored `DATABASE_URL` values in separate Secrets, with
+      nothing enforcing agreement. Compare both targets — same host, same database
+      name — before anything else.
+   3. **Restore-from-backup timing**: a restore landing between token issuance and
+      token use.
+   4. **Out-of-band SQL mutation**: real, but no tooling in this repository deletes
+      organizations, so this is the last hypothesis rather than the first.
+
+   Only if all four are clean should you suspect AC's fail-closed filter, and page
+   `@auth-controller` at that point — not before.
+
+   Note on the alert's `for: 15m`: it buys debounce and a settle window, but it
+   does **not** filter single events. `increase(...[1h]) > 0` stays true for an
+   hour after one occurrence, so a fired alert implies *at least* one event, not
+   several. Sizing the incident on the wrong reading is a real failure mode here.
+
 **Remediation**:
+
+> **Check which cause fired before running anything below.** This scenario serves
+> three causes; the commands that follow remediate **only** `org_limit`. Both are
+> `psql` writes issued through `kubectl exec ... psql $DATABASE_URL`, and neither
+> can fix an organization row GC cannot see.
+>
+> - **`org_inactive`** — do **not** run these. Nothing about meetings or caps is
+>   involved. Establish whether the deactivation was intended; if it was not, the
+>   remedy is restoring `is_active` on the organization row. If it was intended,
+>   the errors are correct and stop on their own within the token TTL.
+> - **`org_not_provisioned`** — do **not** run these, **and do not write to any
+>   database until you have confirmed which database `$DATABASE_URL` resolves to.**
+>   The second-ranked cause for this error *is* "GC and AC are pointed at different
+>   databases," so an operator working it is by definition uncertain of the target,
+>   and Option 1 below is an unfiltered `UPDATE meetings`. The remedy lives in
+>   Diagnosis: reconcile the two `DATABASE_URL` values, or address the database
+>   reset/restore. Nothing here.
+>
+> This is the Scenario 5 rollback trap one step further down — the wrong
+> *remediation* rather than the wrong *diagnosis* — and the more expensive of the
+> two, because a rollback is recoverable and an `UPDATE` against the wrong database
+> may not be.
+
+**Remediation for `org_limit` (capacity exhaustion) only:**
 
 ```bash
 # Option 1: Clean up orphaned meetings for the affected org
@@ -971,7 +1111,9 @@ kubectl exec -it deployment/gc-service -n dark-tower -- psql $DATABASE_URL -c \
 kubectl port-forward -n dark-tower deployment/gc-service 8080:8080 &
 curl http://localhost:8080/metrics | grep 'gc_meeting_creation_failures_total'
 kill %1
-# forbidden error_type rate should drop to 0
+# org_limit error_type rate should drop to 0.
+# NOT forbidden — that is role denial and was never going to move here, so
+# watching it confirms recovery whether or not the remediation worked.
 ```
 
 **Escalation**:
@@ -1841,6 +1983,7 @@ All times in UTC. Link to relevant Slack threads, PagerDuty incidents, and dashb
 **Version History**:
 - 2026-02-05: Initial version (consolidated from gc-high-latency.md, gc-mc-assignment-failures.md, gc-database-issues.md)
 - 2026-02-28: Added Scenario 8 (Meeting Creation Limit Exhaustion) and Scenario 9 (Meeting Code Collision)
+- 2026-08-14: Scenario 8 extended to the three meeting-creation refusal causes (story R-6). `error_type="forbidden"` narrowed to role denial; cap exhaustion is now `org_limit`. Added `org_inactive` / `org_not_provisioned` cause tables, the duration discriminator, absence semantics, and a Scenario 5 cross-reference warning against rolling back a data-caused 5xx. Symptoms previously cited a log line (`meeting creation forbidden: org concurrent meeting limit reached`) that existed nowhere in the codebase; the refusal path emitted no log at all until this change. Remediation scoped to `org_limit` with an explicit do-not-run guard for the two organization-state causes — its `psql` writes cannot fix them, and `org_not_provisioned`'s second-ranked cause is a `DATABASE_URL` mismatch, which makes an unfiltered `UPDATE meetings` a write against a possibly-wrong target. Recovery-verification comment repointed from `forbidden` to `org_limit`.
 
 ---
 
