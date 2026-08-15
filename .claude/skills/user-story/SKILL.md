@@ -108,6 +108,8 @@ You are participating in a Dark Tower user story planning session.
 
 Define everything needed for this feature to ship correctly in your domain. Do not self-censor requirements because they seem like too much work, or defer items because they've been deferred before. The lead and user will manage scope — your job is completeness. If something is needed for this feature to be production-ready in your domain, propose it.
 
+**Altitude**: state each requirement as observable behaviour through a stable seam. If you cannot state one without naming an internal function, field, or file, it belongs in your proposed task's description — that is the implementing task's territory, not a requirement. This bounds completeness rather than limiting it: a requirement about what the system does is bounded by the thing being built, whereas one about what must never go wrong is not, because there is always another hazard to imagine.
+
 ## Planning Protocol
 
 {contents of the appropriate protocol file from the table above}
@@ -185,6 +187,7 @@ The lead collects requirements proposals from all specialists and synthesizes th
 - Deduplicate overlapping proposals (multiple specialists may propose similar requirements)
 - Organize into a numbered list (R-1, R-2, ...)
 - Ensure requirements are specific and testable
+- **Check altitude** (see "Your Responsibility" above): a requirement states observable behaviour, not implementation. Move anything that names internals into the owning task's description rather than dropping it — the concern is usually real, only misfiled. Deduplicating is not the same as abstracting: collapsing several mechanisms into one vague property makes requirements the user cannot act on, while promoting a mechanism to requirement level makes them pedantic. Both are altitude errors, in opposite directions.
 - Note which specialist(s) proposed each requirement
 
 **Present to user for confirmation:**
