@@ -376,13 +376,13 @@ When the guard passes, update main.md: Phase = implementation, and send "Plan ap
 
 When implementer signals "Ready for validation", run the validation pipeline:
 
-**ENFORCED** — single command runs all seven layers in order, stops on first failure:
+**Run the full pipeline through this single command** — do not substitute a subset. It runs all seven layers in order, records each layer's `STATUS=`, and aggregates the worst child STATUS into its own verdict:
 
 ```bash
 ./scripts/layer-all.sh
 ```
 
-Each `scripts/layerN.sh` is independently callable for targeted debugging (e.g., `scripts/layer4.sh` to re-run only Layer 4 on a failing diff). See ADR-0033 §4 for the wrapper contract (`STATUS=` lines, `LAYER=N START=… END=… RESULT=…` stderr summary, worst-child STATUS aggregation, 90s p95 wall-clock budget for the always-run subset).
+Each `scripts/layerN.sh` is independently callable for targeted debugging (e.g., `scripts/layer4.sh` to re-run only Layer 4 on a failing diff). See ADR-0033 §4 for the wrapper contract (`STATUS=` lines, `LAYER=N START=… END=… RESULT=…` stderr summary, worst-child STATUS aggregation, 90s p95 wall-clock budget for the always-run subset). **§4 specifies `layer-all.sh` runs the layers "sequentially" and does NOT stop at the first red layer; `scripts/layer-all.sh` implements that explicitly and deliberately** — its per-layer loop wraps each invocation in `set +e`, commented "so a non-zero layer doesn't abort the loop (replaces the old `if ! …` guard)" — a failing layer is recorded and the run continues, so one invocation reports the state of all seven. **Read the `TOTAL_RESULT=` line in the `LAYER_SUMMARY` block for the verdict**, not any single layer, and not a wrapper's exit status.
 
 **Pipeline failures**: see `docs/runbooks/devloop-validation.md` for layer-by-layer failure-mode mapping, exit-code / `STATUS=` enum reference, `_get_base_ref.sh` troubleshooting (the `BASE_REF=…` stderr line is the anchor), and per-language wrapper triage.
 
@@ -518,9 +518,19 @@ do X because that is task Y's scope") belong in main.md's existing
 scope/classification sections — not under §Accepted Deferrals, which is
 reserved for issues that were findings and remain in the diff.
 
-If this task is part of a user story, update the Devloop Tracking table
-in the user story file: set Status to Completed and fill in the Devloop
-Output path. Include this update in the Step 8 commit.
+If this task is part of a user story, record completion in the story's
+`dt-story` manifest — the only home for task status and the devloop-output
+slug (ADR-0035 §4; the §Devloop Tracking table it replaces is retired).
+**Only when `DEVLOOP_HEADLESS` is unset** (an interactive `/devloop`, not a
+`HEADLESS RUN` invocation — this includes a run-story task and any
+audit-remediation devloop the runner appends at story close):
+`target/release/dt-story complete <story-file> <task-id> --slug <this
+devloop's output slug>`, included in the Step 8 commit. Build it first if the
+tree is cold — `cargo build --release -p dt-guard -p dt-story` — otherwise this
+gesture fails with "no such file or directory" and no next step. Under `HEADLESS RUN`
+the runner records completion itself **after its own gates pass**, so doing
+it here would assert a verdict before the pipeline has issued one — which
+ADR-0035 §3 reserves to the runner.
 
 Story-scope INDEX updates happen at story-close time, not here — see `/close-story` Phase 2.
 

@@ -95,13 +95,18 @@ For each new endpoint, RPC, cross-service flow, or client-driven SDK behavior, l
 
 ## Implementation Plan
 
-| # | Task | Specialist | Dependencies | Covers | Status |
-|---|------|-----------|--------------|--------|--------|
-| 1 | {task description} | {specialist} | — | {code, migration, etc.} | Pending |
-| 2 | {task description} | {specialist} | 1 | {code} | Pending |
-| 3 | {task description} | {specialist} | 1, 2 | {code} | Pending |
-| 4 | {task description} | {specialist} | 2, 3 | {deploy, operations} | Pending |
-| 5 | {task description} | {specialist} | 2, 3, 4 | {tests} | Pending |
+Human-readable intent only. **No `Status` column and no `Devloop Output`
+column** — both live in the manifest below and nowhere else (ADR-0035 §4).
+Prose descriptions and machine state have different edit rhythms, and a table
+mixing them drifts on the fast-moving column.
+
+| # | Task | Specialist | Dependencies | Covers |
+|---|------|-----------|--------------|--------|
+| 1 | {task description} | {specialist} | — | {code, migration, etc.} |
+| 2 | {task description} | {specialist} | 1 | {code} |
+| 3 | {task description} | {specialist} | 1, 2 | {code} |
+| 4 | {task description} | {specialist} | 2, 3 | {deploy, operations} |
+| 5 | {task description} | {specialist} | 2, 3, 4 | {tests} |
 
 ### Requirements Coverage
 
@@ -124,14 +129,57 @@ For each new endpoint, RPC, cross-service flow, or client-driven SDK behavior, l
 
 ---
 
-## Devloop Tracking
+## Task Metadata (dt-story manifest v1)
 
-{Updated as devloops complete}
+The **only** home for per-task machine state: status, specialist, `env_tests`,
+deps, prompt, tag, and the devloop-output slug. `run-story` reads and writes
+it; `/close-story` reads status and slug from it. There is no §Devloop
+Tracking table — it was a second home for both facts and it demonstrably
+drifted (ADR-0035 §4).
 
-| # | Task | Devloop Output | PR | Status |
-|---|------|---------------|-----|--------|
-| 1 | {task} | | | Pending |
-| 2 | {task} | | | Pending |
+**Emit this block with `dt-story add-task`, not by hand** — see
+`/user-story` Step 10.4. The write verb refuses to produce a manifest
+containing a markdown fence, which is what keeps a prompt carrying a fenced
+example from silently truncating the block.
+
+<!-- THREE CONSTRAINTS ON EDITING THIS SECTION. This file is discovered by
+     scripts/guards/simple/validate-story-manifest.sh (it greps for the
+     marker line, so the template is validated in CI exactly like a real
+     story), and breaking any of these reds Layer 3 REPO-WIDE, not just here.
+
+     1. Real values, not {placeholders}. `{specialist}` is YAML flow-mapping
+        syntax and deserializes as a map, not a string.
+     2. Exactly ONE marker-bearing block in the file. A second example block
+        fails with "found 2 manifest blocks".
+     3. NO `- id: N` lines anywhere OUTSIDE this block. dt-story treats a
+        manifest-shaped line outside the block as the signature of a
+        silently-truncated manifest and hard-errors. A template is the file
+        most likely to want an illustrative task snippet in prose — put any
+        such example INSIDE the block below. -->
+
+```yaml
+# task-metadata (dt-story manifest v1)
+story: story-slug
+tasks:
+- id: 1
+  status: pending
+  specialist: database
+  env_tests: false
+  prompt: Self-contained devloop prompt. The devloop sees only this text, so
+    it must carry every fact needed to do the work. No fenced code blocks —
+    a fence closes the manifest block early. Inline `backticks` are fine.
+    Record pairing as prose here ("Pair with protocol"), never in the
+    specialist field.
+  tag: story-story-slug-task-1
+- id: 2
+  status: pending
+  specialist: global-controller
+  env_tests: true
+  deps:
+  - 1
+  prompt: Second task. Runs only after task 1 completes.
+  tag: story-story-slug-task-2
+```
 
 ---
 

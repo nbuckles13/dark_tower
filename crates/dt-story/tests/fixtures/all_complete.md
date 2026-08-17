@@ -5,7 +5,6 @@ Every task is a completed stub — `next` must exit 3.
 ```yaml
 # task-metadata (dt-story manifest v1)
 story: fully-done
-branch: feature/fully-done
 tasks:
 - id: 1
   status: completed

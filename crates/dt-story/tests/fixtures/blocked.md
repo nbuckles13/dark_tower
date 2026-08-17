@@ -8,7 +8,6 @@ non-cyclic manifest always has a runnable candidate.)
 ```yaml
 # task-metadata (dt-story manifest v1)
 story: blocked-story
-branch: feature/blocked-story
 tasks:
 - id: 1
   status: pending

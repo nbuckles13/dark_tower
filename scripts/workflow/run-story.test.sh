@@ -285,7 +285,16 @@ __on_exit() {
     #
     # Two known limits, both stated rather than papered over:
     #   * a writer that stops before the re-sample looks stable and is reported
-    #     as a containment failure — over-reporting, the safe direction;
+    #     as a containment failure — over-reporting, the safe direction.
+    #     OBSERVED 2026-08-17, and the trigger is a PLAUSIBLE OPERATOR ACTION,
+    #     not an exotic one: running `cargo fmt` (or any formatter) in the same
+    #     command as this suite rewrites tracked files inside the sampling
+    #     window. IF YOU SEE THIS AFTER RUNNING A FORMATTER, THAT IS THE CAUSE —
+    #     RE-RUN THE SUITE ALONE BEFORE INVESTIGATING. Confirmed empirically
+    #     rather than inferred from this comment: it fired on a real concurrent
+    #     writer and did NOT fire across five subsequent isolated runs. Written
+    #     down because "I saw it once and it went away" is exactly how a REAL
+    #     containment failure gets waved through later;
     #   * a genuine breach WHILE a writer is active is reported as
     #     unattributable — under-reporting, which is why the quiescence
     #     pre-flight above exists to make that combination rare.
@@ -416,10 +425,29 @@ case "$mode" in
       # dir. Measured before this line: a 1-in-8 flake in K1. Timestamps that a
       # case's outcome depends on are SET, never inherited from execution order.
       touch -d 'now + 1 minute' "docs/devloop-outputs/${MKOUT_NAME}"; }
+    # Second CREATED output dir — drives the genuine-ambiguity case. Distinct
+    # from FAKE_DEVLOOP_TOUCH_EXISTING below, which MODIFIES a pre-existing
+    # one: `--diff-filter=A` must treat those two differently, so the stub has
+    # to be able to produce each independently.
+    [ -n "${FAKE_DEVLOOP_MKOUT2:-}" ] && {
+      mkdir -p "docs/devloop-outputs/${FAKE_DEVLOOP_MKOUT2}"
+      printf '# fixture devloop 2\n' > "docs/devloop-outputs/${FAKE_DEVLOOP_MKOUT2}/main.md"; }
+    # Modify a pre-existing, committed, class-valid output dir — the measured
+    # benign shape (a devloop that improves the output template while adding
+    # its own). Must NOT count as a candidate.
+    [ "${FAKE_DEVLOOP_TOUCH_EXISTING:-0}" = "1" ] && \
+      printf 'appended by a later devloop\n' >> "docs/devloop-outputs/2026-01-01-prior-devloop/main.md"
     [ -n "${FAKE_DEVLOOP_ESCALATION:-}" ] && printf '%s\n' "$FAKE_DEVLOOP_ESCALATION" > .devloop-escalation.json
     if [ "${FAKE_DEVLOOP_COMMIT:-1}" = "1" ]; then
       printf 'work %s\n' "$n" >> work.txt
       git add work.txt >/dev/null 2>&1
+      # A real devloop COMMITS its own output dir (Step 8 stages
+      # docs/devloop-outputs/<slug>/main.md), and the runner derives the task
+      # slug from `git diff --diff-filter=A` over that path. A stub that left
+      # the dir uncommitted would make every slug case look like
+      # "no-record-in-range" — i.e. it would test the absence path four times
+      # and the recording path never.
+      git add docs/devloop-outputs >/dev/null 2>&1 || true
       git commit --quiet -m "fixture task work ${n}" >/dev/null 2>&1
     fi
     # Simulate a TRANSIENT git failure at the point the runner reads HEAD back.
@@ -535,7 +563,6 @@ mk_story() {
     printf '```yaml\n'
     printf '# task-metadata (dt-story manifest v1)\n'
     printf 'story: fixture\n'
-    printf 'branch: fixture-branch\n'
     printf 'tasks:\n'
     printf '%s\n' "$tasks"
     printf '```\n'
@@ -1195,7 +1222,137 @@ run_story DEVLOOP_TMP="${REAL_REPO_ROOT}/scripts" -- fixture
 assert_exit   "l8-run-dir-inside-real-repo-exit2" 2 "$RC"
 assert_status "l8-run-dir-inside-real-repo-token" "SEAM-RUN-DIR-INSIDE-REAL-REPO" "$OUTPUT"
 
-# NOT COVERED, with reasons (both accepted at Gate 3):
+# =============================================================================
+# M: slug recording at completion (story task 4, R-8)
+# =============================================================================
+# The runner records which devloop produced each task into the manifest.
+#
+# The closed set has SIX outcomes. FIVE are exercised here by six cases:
+# derived (m1), derived via the benign multi-dir shape (m2), absent (m3),
+# ambiguous (m4), resumed (m5), unsafe-class (m6). The sixth, `git-error`, is
+# NOT covered — see the §NOT COVERED entry below for the measurement behind
+# that. Each case asserts the ABSENCE of the neighbouring causes, so a
+# double-emission anywhere in the set reds — membership alone cannot detect it.
+#
+# Keep this count matching the enumeration. "FIVE outcomes" above six labels is
+# itself the drift that invites the next reader to stop counting, and this
+# header has already been wrong once (it claimed four states exercised while
+# `resumed` had no case at all). A test that only asserted "status flipped" would pass against a
+# runner that recorded nothing, which is the whole failure being fixed.
+
+# M1: happy path — the devloop's output dir is CREATED in the task's commit
+# range, so the slug is derived from the commit range and lands in the
+# manifest. Asserts the VALUE, not merely that a slug exists.
+run_story FAKE_DEVLOOP_MKOUT=1 FAKE_DEVLOOP_MKOUT_NAME=2026-08-17-fixture-devloop -- fixture
+assert_exit   "m1-slug-derived-exit0" 0 "$RC"
+assert_status "m1-slug-derived-logged" "slug=2026-08-17-fixture-devloop src=commit-range" "$OUTPUT"
+assert_marker "m1-slug-derived-devloop-ran" "$MARK" 'ran.claude.devloop'
+assert_absent "m1-slug-derived-no-nosslug" "NO-SLUG" "$OUTPUT"
+m1_manifest="$(cat "${FIX}/docs/user-stories/2026-08-13-fixture.md" 2>/dev/null || true)"
+assert_status "m1-slug-in-manifest" "slug: 2026-08-17-fixture-devloop" "$m1_manifest"
+
+# M2: BENIGN MULTI-DIR — the measured shape (~1% of commits, concentrated in
+# workflow-tooling stories): a devloop that improves the output template
+# MODIFIES a second, pre-existing, class-valid dir in the same commit that
+# ADDS its own. `--diff-filter=A` must ignore the modified one and still
+# record the created one. Reds against a derivation that counts every touched
+# path. Deliberately class-VALID so correctness cannot rest on the slug floor
+# happening to reject the other name.
+prime_existing_output() {
+  mkdir -p "$1/docs/devloop-outputs/2026-01-01-prior-devloop"
+  printf '# prior\n' > "$1/docs/devloop-outputs/2026-01-01-prior-devloop/main.md"
+  git -C "$1" add -A >/dev/null 2>&1
+  git -C "$1" commit --quiet -m "prior devloop output" >/dev/null 2>&1
+}
+FIXTURE_PRERUN=prime_existing_output \
+  run_story FAKE_DEVLOOP_MKOUT=1 FAKE_DEVLOOP_MKOUT_NAME=2026-08-17-new-devloop \
+            FAKE_DEVLOOP_TOUCH_EXISTING=1 -- fixture
+unset FIXTURE_PRERUN
+assert_exit   "m2-benign-multi-exit0" 0 "$RC"
+assert_status "m2-benign-multi-slug" "slug=2026-08-17-new-devloop src=commit-range" "$OUTPUT"
+assert_absent "m2-benign-multi-not-ambiguous" "cause=ambiguous" "$OUTPUT"
+
+# M3: ZERO candidates — no output dir added and no resume pointer. The task
+# must still COMPLETE (its work is committed and its gates are green; erroring
+# here would be a self-inflicted operator-lane red of exactly the class R-4
+# exists to prevent), while saying so loudly and naming the repair.
+run_story -- fixture
+assert_exit   "m3-no-slug-exit0" 0 "$RC"
+assert_status "m3-no-slug-cause" "cause=no-record-in-range" "$OUTPUT"
+assert_status "m3-no-slug-names-repair" "--slug <slug>" "$OUTPUT"
+assert_status "m3-no-slug-still-completes" "ALL TASKS COMPLETE" "$OUTPUT"
+assert_absent "m3-no-slug-not-ambiguous" "cause=ambiguous" "$OUTPUT"
+assert_absent "m3-no-slug-not-unsafe" "cause=unsafe-class" "$OUTPUT"
+
+# M4: AMBIGUOUS — two output dirs CREATED in one commit range. Must omit the
+# slug rather than pick one ("pick the first" is the same deterministic-but-
+# arbitrary selection this derivation replaced mtime sorting to avoid), and
+# must report the COUNT: without it, zero and many are indistinguishable in
+# the log, which is the vacuous-case shape at the message layer.
+run_story FAKE_DEVLOOP_MKOUT=1 FAKE_DEVLOOP_MKOUT_NAME=2026-08-17-devloop-one \
+          FAKE_DEVLOOP_MKOUT2=2026-08-17-devloop-two -- fixture
+assert_exit   "m4-ambiguous-exit0" 0 "$RC"
+assert_status "m4-ambiguous-cause" "cause=ambiguous" "$OUTPUT"
+assert_status "m4-ambiguous-count" "candidates=2" "$OUTPUT"
+assert_status "m4-ambiguous-still-completes" "ALL TASKS COMPLETE" "$OUTPUT"
+assert_absent "m4-ambiguous-not-no-record" "cause=no-record-in-range" "$OUTPUT"
+
+# M5: RESUMED — the fallback arm, and a ROUTINE path rather than an emergency
+# one: @observability measured `added=0` at 16% of commits. A `--continue`
+# resumption ACROSS runner invocations has its main.md already committed by the
+# previous run, so it sits inside $head_before and `--diff-filter=A` yields zero
+# by construction, leaving $continue_slug the sole supplier. Reds if the
+# fallback arm is dropped — which is the property that makes it worth having,
+# since the derived path keeps working and would mask its loss.
+FIXTURE_PRERUN=prime_existing_output SEED_SLUG=2026-01-01-prior-devloop \
+  run_story FAKE_DEVLOOP_MKOUT=0 -- fixture
+unset FIXTURE_PRERUN SEED_SLUG
+assert_exit   "m5-resumed-exit0" 0 "$RC"
+assert_status "m5-resumed-src" "slug=2026-01-01-prior-devloop src=resume-pointer" "$OUTPUT"
+assert_absent "m5-resumed-no-nosslug" "NO-SLUG" "$OUTPUT"
+m5_manifest="$(cat "${FIX}/docs/user-stories/2026-08-13-fixture.md" 2>/dev/null || true)"
+assert_status "m5-resumed-in-manifest" "slug: 2026-01-01-prior-devloop" "$m5_manifest"
+
+# M6: UNSAFE-CLASS, and it is a PARTITION test, not a membership test. The
+# absence assertions are the ones doing the work: an earlier implementation
+# emitted `cause=unsafe-class` and then FELL THROUGH into the count-based arms,
+# adding a second, contradictory `cause=no-record-in-range` whose text was
+# affirmatively false (a main.md WAS added; its name was rejected), and left
+# `src=commit-range` on a `slug=none` record line. Asserting only that
+# `cause=unsafe-class` appears goes GREEN against all three symptoms, because
+# the first line is emitted and nothing checks what follows it.
+#
+# A closed set is only closed if the cases assert the PARTITION. Membership
+# assertions make "closed" a property of the comment rather than of the code.
+run_story FAKE_DEVLOOP_MKOUT=1 FAKE_DEVLOOP_MKOUT_NAME=Bad_Slug_Name -- fixture
+assert_exit      "m6-unsafe-class-exit0" 0 "$RC"
+assert_status    "m6-unsafe-class-cause" "cause=unsafe-class" "$OUTPUT"
+assert_absent    "m6-unsafe-class-single-cause" "cause=no-record-in-range" "$OUTPUT"
+assert_status    "m6-unsafe-class-src-none" "slug=none src=none" "$OUTPUT"
+assert_status    "m6-unsafe-class-completes" "ALL TASKS COMPLETE" "$OUTPUT"
+
+# NOT COVERED, with reasons (all accepted at Gate 3):
+#   cause=git-error (slug derivation) — the branch fires when `git diff` itself
+#     fails while enumerating the task's commit range. NOT fault-injectable in
+#     this harness, measured rather than assumed (@test): `corrupt_git_index`,
+#     the mutator that reaches other otherwise-unreachable git branches, does
+#     NOT reach this one — `git diff A B` is TREE-TO-TREE and never consults
+#     the index, so with a garbage `.git/index` both `rev-parse HEAD` and the
+#     derivation still exit 0. Breaking the object store instead would fail the
+#     surrounding `git add` / `git commit --amend` FIRST, so the case would red
+#     for a different reason than the one it names — worse than no case. Real
+#     `git` is deliberately not stubbed (the containment argument depends on
+#     it). Defensive branch; its value is that it does not fold a git fault
+#     into `no-record-in-range`, whose text would then be affirmatively false.
+#     WHAT WOULD MAKE IT TESTABLE, so this does not become permanent by
+#     default: a seam that makes the derivation's `git` invocation
+#     independently faultable without touching the surrounding real-git
+#     operations — e.g. routing just that call through a `DEVLOOP_TEST`-gated
+#     indirection the suite can point at a failing stub, in the same
+#     exact-match sentinel idiom as STORY_REPO_ROOT/DT_STORY. That is a
+#     runner change, not a test change, which is why it is not done here.
+#     Revisit if a second git-faulting branch appears, since one seam would
+#     then cover both.
 #   STOP-AFTER-NEVER-FIRED — the terminal check sits on the AllDone path, and
 #     every scenario that would leave the flag unfired (a dep escalating, a gate
 #     going red, a lane exit) leaves the loop EARLIER through escalate() or an

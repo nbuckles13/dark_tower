@@ -1,7 +1,7 @@
 //! State transitions (`next`, `complete`, `escalate`, `validate`) and the
 //! atomic write used by mutating subcommands.
 
-use crate::manifest::{Manifest, Status, Task};
+use crate::manifest::{Manifest, Slug, Status, Task};
 use crate::markdown;
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Serialize;
@@ -126,14 +126,31 @@ fn runnable_payload(task: &Task) -> Result<RunnableTask> {
 pub enum CompleteOutcome {
     /// Task was pending and is now completed.
     Completed,
-    /// Task was already completed — no change written.
-    AlreadyComplete,
+    /// Task was already completed. `slug_updated` is true when a
+    /// newly-supplied slug replaced a different (or absent) one, which is the
+    /// ONLY case in which this arm mutates the manifest — the caller must
+    /// persist when it is set. See [`complete`] for why `slug` overwrites
+    /// here and `commit` deliberately does not.
+    AlreadyComplete { slug_updated: bool },
 }
 
+/// Mark a task completed, recording `commit` and/or `slug` if supplied.
+///
+/// The `AlreadyComplete` arm is reached when a headless devloop marked its
+/// own task before the runner's `dt-story complete` ran (double-writer, not
+/// an error — task #60 collision, 2026-08-06).
+///
+/// On that arm `slug` is LAST-WRITER-WINS and IS applied, while `commit` is
+/// first-writer-wins and is NOT. The asymmetry is deliberate; see the field
+/// docs on [`crate::manifest::Task::slug`] for the provenance argument. The
+/// practical consequence is that `complete --slug` REPAIRS a completed task
+/// that is missing its slug, which is what lets the runner's `NO-SLUG`
+/// diagnostic name a recovery gesture that actually works.
 pub fn complete(
     manifest: &mut Manifest,
     id: u32,
     commit: Option<String>,
+    slug: Option<Slug>,
 ) -> Result<CompleteOutcome> {
     let task = manifest
         .task_mut(id)
@@ -144,12 +161,21 @@ pub fn complete(
             if commit.is_some() {
                 task.commit = commit;
             }
+            if slug.is_some() {
+                task.slug = slug;
+            }
             Ok(CompleteOutcome::Completed)
         }
-        // Idempotent: the desired end state already holds. This is the normal
-        // case when a headless devloop marks its own task before the runner's
-        // own `dt-story complete` runs (task #60 collision, 2026-08-06).
-        Status::Completed => Ok(CompleteOutcome::AlreadyComplete),
+        Status::Completed => {
+            let slug_updated = match slug {
+                Some(new) if task.slug.as_ref() != Some(&new) => {
+                    task.slug = Some(new);
+                    true
+                }
+                _ => false,
+            };
+            Ok(CompleteOutcome::AlreadyComplete { slug_updated })
+        }
         Status::Escalated => {
             bail!("task {id} is escalated, not pending; cannot complete")
         }
@@ -164,35 +190,82 @@ pub enum AddOutcome {
     Exists(u32),
 }
 
+/// Fields for [`add_task`], as a struct rather than positional parameters.
+///
+/// NOT for arity: `specialist`, `prompt` and `tag` are three ADJACENT
+/// same-typed (`String`) parameters, so transposing any two compiles cleanly
+/// and produces a task carrying the specialist in its tag field — silent
+/// corruption of the struct this crate makes authoritative. Named fields
+/// make the transposition impossible to write.
+pub struct NewTask {
+    pub specialist: String,
+    pub prompt: String,
+    pub env_tests: bool,
+    pub tag: String,
+    pub deps: Vec<u32>,
+}
+
 /// Append a pending task, idempotent on `tag`. If a task with the same tag
 /// already exists, return `Exists(id)` without mutating; otherwise append a
 /// pending task with a fresh id (max existing id + 1) and return `Added(id)`.
-pub fn add_task(
-    manifest: &mut Manifest,
-    specialist: String,
-    prompt: String,
-    env_tests: bool,
-    tag: String,
-) -> Result<AddOutcome> {
+///
+/// IDEMPOTENT IN THE WEAK SENSE: "will not duplicate", NOT "converges to the
+/// supplied values". The tag check returns BEFORE any field is written, so a
+/// re-run supplying corrected `specialist` / `prompt` / `env_tests` / `deps`
+/// silently discards them. Callers must surface that (`main.rs` does, on the
+/// rc-4 path); the gesture for a changed plan is to reset the manifest to a
+/// skeleton and re-emit, not to re-run `add-task` over a populated one.
+///
+/// CALLERS MUST NOT PREDICT THE ASSIGNED ID. It is `max + 1` over existing
+/// tasks, so it depends on what is already in the file — and the `Exists`
+/// short-circuit means a re-run does not advance the sequence. A caller that
+/// computes dep numbers from its own ordering will, on any re-run or partial
+/// run, produce deps that point at the WRONG TASKS AND STILL VALIDATE. Read
+/// the id back from the returned outcome (both arms carry it) and map your
+/// own numbering onto it.
+///
+/// Dep validation is DELTA-form: an append is refused only if it INTRODUCES
+/// new violations. An absolute check would turn `add-task` into a surprise
+/// gate on unrelated pre-existing state — fatal on the audit-remediation
+/// path, which appends to a live mid-flight story — and would need a special
+/// case for the legitimately-empty skeleton, i.e. a hole drilled in the very
+/// gate that guards it.
+pub fn add_task(manifest: &mut Manifest, new: NewTask) -> Result<AddOutcome> {
     if let Some(existing) = manifest
         .tasks
         .iter()
-        .find(|t| t.tag.as_deref() == Some(tag.as_str()))
+        .find(|t| t.tag.as_deref() == Some(new.tag.as_str()))
     {
         return Ok(AddOutcome::Exists(existing.id));
     }
+    let before = validate_manifest(manifest);
     let new_id = manifest.tasks.iter().map(|t| t.id).max().unwrap_or(0) + 1;
     manifest.tasks.push(Task {
         id: new_id,
         status: Status::Pending,
-        specialist: Some(specialist),
-        env_tests: Some(env_tests),
-        deps: Vec::new(),
-        prompt: Some(prompt),
+        specialist: Some(new.specialist),
+        env_tests: Some(new.env_tests),
+        deps: new.deps,
+        prompt: Some(new.prompt),
         commit: None,
+        slug: None,
         escalation: None,
-        tag: Some(tag),
+        tag: Some(new.tag),
     });
+    let after = validate_manifest(manifest);
+    let introduced: Vec<String> = after
+        .iter()
+        .filter(|v| !before.contains(v))
+        .cloned()
+        .collect();
+    if !introduced.is_empty() {
+        manifest.tasks.pop();
+        bail!(
+            "refusing to append task {new_id}: it would introduce manifest violations that the \
+             runner's own gate would then reject — {}",
+            introduced.join("; ")
+        );
+    }
     Ok(AddOutcome::Added(new_id))
 }
 
@@ -233,6 +306,34 @@ pub fn validate_story(text: &str) -> Vec<String> {
 /// (Status legality and unknown fields are enforced by deserialization.)
 pub fn validate_manifest(manifest: &Manifest) -> Vec<String> {
     let mut violations = Vec::new();
+
+    // MANIFEST-LEVEL, not status-aware — the only such check here, and the
+    // reason this function's description in `manifest.rs` had to change.
+    //
+    // A zero-task manifest is a valid document that ASSERTS THE STORY IS
+    // COMPLETE: `next` finds no pending candidates and exits 3 (AllDone),
+    // which `run-story.sh` reads as "all tracked tasks done" and follows
+    // straight to the story-close gate. So an interrupted `/user-story` —
+    // which writes this skeleton before appending tasks — leaves behind an
+    // artifact that does not look broken, it looks FINISHED.
+    //
+    // There is no valid state this excludes: at planning time the manifest
+    // holds the planned set, and completed tasks remain in the list marked
+    // `completed` rather than being removed.
+    //
+    // It composes with the emission route because `add-task` goes through
+    // `load()` and never calls this function, so the skeleton stays fully
+    // usable by the one tool whose job is to populate it while never passing
+    // the gate that declares a story runnable. Transient by construction,
+    // not by convention. `preflight-story.sh` and the Layer-3 guard both run
+    // `validate`, so a skeleton left on disk stops the runner and reds CI.
+    if manifest.tasks.is_empty() {
+        violations.push(
+            "manifest has no tasks — an empty task list asserts the story is COMPLETE (`next` \
+             exits 3 AllDone). If this is a planning skeleton, finish emitting tasks into it."
+                .to_string(),
+        );
+    }
 
     let mut ids: HashSet<u32> = HashSet::new();
     let mut duplicates = false;

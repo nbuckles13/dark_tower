@@ -216,6 +216,32 @@ if __test_sentinel_active; then __seam_assert_run_dir_isolated; fi
 # against the real manifest. The (2) guard above is the only thing between an
 # inherited env var and that.
 DT_STORY="target/release/dt-story"
+
+# TWO SLUG CLASSES, deliberately different, each named so neither drifts and
+# neither gets "helpfully" unified into the other.
+#
+# SLUG_CLASS_RESUME — the WIDER class. Guards shell command-line
+# interpolation of an EPHEMERAL resume value (`--continue=%s`) read off the
+# filesystem. Its job is "this cannot present as a flag or split the command
+# line", not "this is a well-formed manifest value". Collapsed here from four
+# literal copies.
+#
+# SLUG_CLASS_CANONICAL — the NARROW class, MIRRORING the Rust
+# `manifest::SLUG_PATTERN`, which is the source of truth. Applied only where
+# a slug is about to enter the durable manifest.
+#
+# For WHICH literals are pinned together and why the resume class is excluded,
+# see the SCOPE comment in scripts/guards/simple/validate-slug-class-sync.sh —
+# that guard is the one home for the enumeration. Restating it here would give
+# the coverage list two homes, which is the failure this pair guards against.
+#
+# ANCHOR CONVENTION DIVERGES between these two, deliberately and unavoidably:
+# SLUG_CLASS_CANONICAL EMBEDS `^...$` (it is compared byte-for-byte against the
+# Rust literal, which embeds them), while SLUG_CLASS_RESUME OMITS them and each
+# use site supplies its own (it is interpolated into larger patterns). Check
+# which you are using before adding a third use site.
+readonly SLUG_CLASS_RESUME='[0-9A-Za-z._-]+'
+readonly SLUG_CLASS_CANONICAL='^[a-z0-9]+(-[a-z0-9]+)*$'
 if [ -n "$__seam_dt_story" ]; then DT_STORY="$__seam_dt_story"; fi
 
 # (6) Enter the (possibly redirected) root. Nothing above this line touches the
@@ -832,10 +858,10 @@ newest_devloop_output() {
   # A malformed directory name is not necessarily hostile, but it must never be
   # interpolated, and losing a resume pointer must not be silent.
   local safe unsafe
-  safe="$(printf '%s\n' "$shaped" | grep -E '^[0-9]+(\.[0-9]+)? [0-9A-Za-z._-]+$' || true)"
-  unsafe="$(printf '%s\n' "$shaped" | grep -cvE '^[0-9]+(\.[0-9]+)? [0-9A-Za-z._-]+$' || true)"
+  safe="$(printf '%s\n' "$shaped" | grep -E "^[0-9]+(\.[0-9]+)? ${SLUG_CLASS_RESUME}$" || true)"
+  unsafe="$(printf '%s\n' "$shaped" | grep -cvE "^[0-9]+(\.[0-9]+)? ${SLUG_CLASS_RESUME}$" || true)"
   if [ "${unsafe:-0}" -gt 0 ] && [ -n "$shaped" ]; then
-    slogerr "STORY_RUN: WARN ${unsafe} docs/devloop-outputs entry name(s) are outside [0-9A-Za-z._-] and were excluded from resume selection — they would be interpolated into the devloop's --continue flag. If one of them is this task's interrupted devloop, its resume pointer is being lost; rename the directory. Offending: $(printf '%s\n' "$shaped" | grep -vE '^[0-9]+(\.[0-9]+)? [0-9A-Za-z._-]+$' | head -n 3 | cut -d' ' -f2- | tr '\n' ' ')"
+    slogerr "STORY_RUN: WARN ${unsafe} docs/devloop-outputs entry name(s) are outside ${SLUG_CLASS_RESUME} and were excluded from resume selection — they would be interpolated into the devloop's --continue flag. If one of them is this task's interrupted devloop, its resume pointer is being lost; rename the directory. Offending: $(printf '%s\n' "$shaped" | grep -vE "^[0-9]+(\.[0-9]+)? ${SLUG_CLASS_RESUME}$" | head -n 3 | cut -d' ' -f2- | tr '\n' ' ')"
   fi
   printf '%s\n' "$safe" | sort -rn | head -n 1 | cut -d' ' -f2- || true
 }
@@ -941,8 +967,8 @@ while :; do
     # Third splice site: --continue=%s. Filesystem-derived so lower severity
     # than the prompt, but the same mechanism, and it must not survive the fix
     # to the other two.
-    if ! [[ "$s" =~ ^[0-9A-Za-z._-]+$ ]]; then
-      slogerr "STORY_RUN: INVALID-RESUME-SLUG task=${id} — '${slug_file}' contains '${s}', which is not a plain slug ([0-9A-Za-z._-]+). It is interpolated as a flag value. Remove the file to start this task fresh."
+    if ! [[ "$s" =~ ^${SLUG_CLASS_RESUME}$ ]]; then
+      slogerr "STORY_RUN: INVALID-RESUME-SLUG task=${id} — '${slug_file}' contains '${s}', which is not a plain slug (${SLUG_CLASS_RESUME}). It is interpolated as a flag value. Remove the file to start this task fresh."
       exit 2
     fi
     [ -f "docs/devloop-outputs/${s}/main.md" ] && continue_slug="$s"
@@ -1193,17 +1219,133 @@ while :; do
     exit 2
   fi
 
+  # SLUG RESOLUTION — a CLOSED SET of four outcomes. Every completion emits
+  # exactly one of them, so "none of the four appeared" is itself a detectable
+  # state; a per-outcome record covering only the outcomes we thought of
+  # structurally cannot represent the one we didn't (the same argument this
+  # story's §Deferred makes about a run exiting through no lane).
+  #
+  # Primary derivation is the task's own commit range, NOT a directory mtime.
+  #
+  # `--diff-filter=A` restricts to output dirs CREATED in this range, a tighter
+  # statement of "the attempt that actually committed" than "any devloop path
+  # touched": a devloop that improves the output template modifies
+  # `_template/main.md` in the same commit that adds its own output (~1% of
+  # commits, concentrated in exactly the workflow-tooling stories this runner
+  # drives). MEASURED, not reasoned: against a commit that ADDS
+  # `2026-08-17-new/main.md` and MODIFIES a pre-existing `2026-01-01-prior/`,
+  # the filter yields exactly `2026-08-17-new`, while dropping it yields both
+  # and the task falls to a false `cause=ambiguous`.
+  #
+  # `:(glob)` pins `*` to ONE path segment. MEASURED: git matches pathspecs
+  # with fnmatch WITHOUT FNM_PATHNAME, so a bare
+  # `docs/devloop-outputs/*/main.md` matches `alpha/nested/main.md` as well as
+  # `beta/main.md` — 2 candidates after the `cut` below, i.e. a manufactured
+  # `cause=ambiguous`; `:(glob)` yields only `beta`.
+  #
+  # NOTE THE COLLAPSE THAT HIDES THIS, so a future re-test does not repeat the
+  # mistake that was nearly recorded here: if the nested file sits under a
+  # directory that ALSO has a top-level main.md, `cut -d/ -f3 | sort -u` folds
+  # both to one slug and the two pathspec forms look identical. A fixture must
+  # ISOLATE the nested case or it will confirm the wrong conclusion.
+  #
+  # Fallback is $continue_slug, and it is a ROUTINE path, not an emergency
+  # arm: measured at 16% of commits, a `--continue` resumption ACROSS runner
+  # invocations has its main.md already committed by the previous run, so it
+  # is inside $head_before and `--diff-filter=A` yields zero by construction.
+  # `src=` on the COMPLETE line records which derivation supplied the value,
+  # because the two have different standing and slug= alone cannot say.
+  # Capture git's rc SEPARATELY from the pipeline, the same discipline
+  # newest_devloop_output establishes at length above for `find`: a genuine
+  # enumeration failure must stay distinguishable from "nothing was added",
+  # and a whole-pipeline $( ) under pipefail cannot tell you which stage
+  # failed. Folding a git fault into `no-record-in-range` would print a
+  # message that is affirmatively false.
+  slug_git_err="$RUN_DIR/task-${id}.slug-derive.err"
+  slug_derive_ok=1
+  if ! slug_raw="$(git diff --name-only --diff-filter=A "$head_before" HEAD \
+        -- ':(glob)docs/devloop-outputs/*/main.md' 2>"$slug_git_err")"; then
+    slug_derive_ok=0
+  fi
+  slug_candidates="$(printf '%s\n' "$slug_raw" | grep . | cut -d/ -f3 | sort -u || true)"
+  slug_count="$(printf '%s' "$slug_candidates" | grep -c . || true)"
+
+  # ONE outcome per completion. The arms below are MUTUALLY EXCLUSIVE and
+  # `slug_cause` is set exactly once, so a reader (or a test) classifying by
+  # `cause=` gets a single answer. An earlier version emitted `unsafe-class`
+  # and then fell through into the count-based arms, printing a second,
+  # CONTRADICTORY `cause=no-record-in-range` on the same completion — with
+  # both of its clauses false, since a main.md *was* added and was rejected
+  # for its name. Keep this a partition.
+  task_slug=""; slug_src=""; slug_cause=""; slug_rejected=""
+  if [ "$slug_derive_ok" -ne 1 ]; then
+    slug_cause="git-error"
+  elif [ "${slug_count:-0}" -gt 1 ]; then
+    slug_cause="ambiguous"
+  elif [ "${slug_count:-0}" -eq 1 ]; then
+    task_slug="$slug_candidates"; slug_src="commit-range"
+  elif [ -n "$continue_slug" ]; then
+    task_slug="$continue_slug"; slug_src="resume-pointer"
+  else
+    slug_cause="no-record-in-range"
+  fi
+
+  # Write-time floor on the NARROW class. Pinned against the canonical Rust
+  # class by scripts/guards/simple/validate-slug-class-sync.sh — see that
+  # guard's SCOPE comment for which literals it covers and why the resume
+  # class is deliberately excluded. Applied here so a rejected slug can never
+  # reach `complete` and kill the run under `set -e`: at this point the task's
+  # work is committed and its gates are green, so erroring would be a
+  # self-inflicted operator-lane red of exactly the class R-4 exists to
+  # prevent.
+  if [ -n "$task_slug" ] && ! [[ "$task_slug" =~ $SLUG_CLASS_CANONICAL ]]; then
+    slug_rejected="$task_slug"
+    slug_cause="unsafe-class"
+    task_slug=""; slug_src=""
+  fi
+
   # Fold the manifest bump into the devloop's own commit. No --commit sha in
   # the manifest: amending changes the sha, so it can't be recorded inside the
   # commit it refers to. Fall back to a separate chore commit if the amend is
   # rejected (e.g. a hook that pins devloop-commit trees).
-  "$DT_STORY" complete "$STORY_FILE" "$id"
+  if [ -n "$task_slug" ]; then
+    "$DT_STORY" complete "$STORY_FILE" "$id" --slug "$task_slug"
+  else
+    # Answered, not raised — but never silent, and never more than one cause.
+    # Each arm states what actually held; "many" deliberately OMITS the slug
+    # rather than picking one, since a deterministic-but-arbitrary choice is
+    # what this derivation replaced mtime sorting to avoid.
+    case "$slug_cause" in
+      git-error)
+        slogerr "STORY_RUN: NO-SLUG task=${id} cause=git-error — enumerating this task's commit range for a devloop output failed; the slug could not be derived at all (this is NOT 'no record exists'). git stderr: ${slug_git_err}. Recording completion without a slug. Repair with: ${DT_STORY} complete ${STORY_FILE} ${id} --slug <slug>" ;;
+      ambiguous)
+        slogerr "STORY_RUN: NO-SLUG task=${id} cause=ambiguous candidates=${slug_count} ($(printf '%s' "$slug_candidates" | tr '\n' ' ')) — more than one devloop output was CREATED in this task's commit range, so which one produced it is not decidable here. Recording completion without a slug. Repair with: ${DT_STORY} complete ${STORY_FILE} ${id} --slug <slug>" ;;
+      unsafe-class)
+        slogerr "STORY_RUN: NO-SLUG task=${id} cause=unsafe-class candidate='${slug_rejected}' — outside ${SLUG_CLASS_CANONICAL}, so it would be rejected by dt-story and kill the run at a point where this task's work is already committed. Recording completion without a slug. Repair with: ${DT_STORY} complete ${STORY_FILE} ${id} --slug <slug>" ;;
+      no-record-in-range)
+        slogerr "STORY_RUN: NO-SLUG task=${id} cause=no-record-in-range — no docs/devloop-outputs/*/main.md was ADDED between ${head_before} and HEAD, AND no resume pointer survived. (This does NOT mean the devloop wrote no record: on a resumed task the record exists and was committed by an earlier run.) Recording completion without a slug. Repair with: ${DT_STORY} complete ${STORY_FILE} ${id} --slug <slug>" ;;
+      *)
+        # NO CATCH-ALL INTO A SPECIFIC CLAIM. Every cause gets its own arm;
+        # an unrecognised one makes NO environmental assertion at all. An
+        # earlier shape let `no-record-in-range` be the `*)` fallback, so any
+        # cause the emitter did not know about was reported as "nothing was
+        # added and no resume pointer survived" — a strongly-worded claim
+        # about the environment that had never been established. That is the
+        # same defect as the fall-through this partition was built to fix,
+        # one layer down, and it stops being latent the moment a sixth cause
+        # is added without an arm here (a fifth, `git-error`, was added
+        # mid-review). The classifier being exhaustive is not enough: the
+        # EMITTER has to be faithful too.
+        slogerr "STORY_RUN: NO-SLUG task=${id} cause=unclassified='${slug_cause}' — the slug classifier produced a cause this emitter has no arm for, so no claim is made about why. This is a RUNNER BUG; the completion itself is sound. Repair with: ${DT_STORY} complete ${STORY_FILE} ${id} --slug <slug>" ;;
+    esac
+    "$DT_STORY" complete "$STORY_FILE" "$id"
+  fi
   git add "$STORY_FILE"
   if ! git commit --quiet --amend --no-edit; then
     git commit --quiet -m "chore(story): task #${id} complete (run-story manifest bump)"
   fi
   rm -f "$slug_file" "$start_marker" "$stop_count_file"
-  slog "STORY_RUN: COMPLETE task=${id} commit=$(git rev-parse --short HEAD)"
+  slog "STORY_RUN: COMPLETE task=${id} commit=$(git rev-parse --short HEAD) slug=${task_slug:-none} src=${slug_src:-none} cause=${slug_cause:-none}"
   report_task_cost "$id"
 
   # Suppression-visibility monitor: if this task's commit ADDED audit-suppression
