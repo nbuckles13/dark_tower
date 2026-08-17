@@ -42,6 +42,15 @@ layer_lifecycle_begin 3
   # run-guards.sh's `find -name '*.sh'` matches `*.test.sh` too, so it would be auto-run as a
   # guard as well as here. No cluster.
   run_and_emit "subdomain-regex-guard-selftest" "${__here}/guards/validate-subdomain-regex-sync.test.sh" || true
+  # Slug-class sync self-test (story task #4, R-8): same shape and same reason as the
+  # subdomain guard above. validate-slug-class-sync.sh pins /close-story's read-time slug
+  # regex to the canonical `manifest::SLUG_PATTERN`; in-tree it always passes, so its drift
+  # branch — the only branch with any value — is exercised here against synthetic pairs via
+  # the SLUG_SYNC_RUST_SRC / SLUG_SYNC_SKILL seams. Also covers the vacuity cases (marker
+  # missing, canonical declaration renamed), where a grep-based guard would otherwise compare
+  # nothing and report success. Deliberately NOT under guards/simple/ for the same
+  # find -name '*.sh' reason. No cluster.
+  run_and_emit "slug-class-sync-guard-selftest" "${__here}/guards/validate-slug-class-sync.test.sh" || true
   # Disk-guard self-test (envtest-infra-reliability devloop): forces
   # check_build_disk_space's trip branch so the `REASON=insufficient-disk` operator contract
   # (§6.7) is covered — Gate-2's rebuild only hits the guard's pass path. No cluster needed

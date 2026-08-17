@@ -1,4 +1,12 @@
 # owner: client
+<!-- NO FENCED CODE BLOCKS IN THIS FILE. Everything below line 1 is spliced
+     verbatim into a dt-story manifest prompt by run-story.sh
+     (add-task --prompt-file <(tail -n +2 ...)). A ``` fence inside a
+     manifest block closes it early and SILENTLY truncates the manifest.
+     dt-story now refuses to write such a manifest, so a fence here turns
+     an unattended audit-remediation append into an operator-lane failure
+     — reachable ONLY during a headless run with a red audit, i.e. the
+     worst available discovery conditions. Use inline `backtick spans`. -->
 Clear all outstanding TypeScript/JavaScript dependency advisories so `pnpm audit
 --audit-level=high` (forced, DEVLOOP_AUDIT_FORCE_RUN=1) reports zero unsuppressed
 findings at or above the threshold. This task was auto-appended by the story

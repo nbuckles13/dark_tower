@@ -928,7 +928,6 @@ After all devloops complete: run `/close-story browser-client-join` to verify co
 ```yaml
 # task-metadata (dt-story manifest v1)
 story: browser-client-join
-branch: feature/client-join-meeting-user-story
 tasks:
 - id: 1
   status: completed

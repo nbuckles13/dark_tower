@@ -25,9 +25,55 @@ struct OpenFence {
     is_manifest: Option<bool>,
 }
 
+/// An orphaned task-entry line outside the manifest block is the signature
+/// of a SILENT TRUNCATION: a prompt carrying a markdown fence closed the
+/// block early, so the manifest's tail now sits in the document as prose.
+///
+/// THE REGEX FORM IS LOAD-BEARING. It tolerates LEADING WHITESPACE because
+/// hand-authored manifests indent entries under `tasks:` — `serde_norway`
+/// emits at column 0 only because it is the machine writer, and a
+/// column-0-anchored pattern was MEASURED to find zero matches on a real
+/// truncated fixture. It also requires the line to END after the id, so a
+/// story file merely DISCUSSING `- id: 3 (see above)` in prose is not a
+/// match; without that anchor this hard error would red Layer 3 on ordinary
+/// documentation. Both halves were measured as free (identical match counts
+/// tree-wide) and both are needed. The narrow form looks more correct and is
+/// not: do not "tighten" this back to `^- id:`.
+fn is_orphaned_task_entry(line: &str) -> bool {
+    let rest = line.trim_start();
+    let Some(rest) = rest.strip_prefix('-') else {
+        return false;
+    };
+    // `-` must be followed by at least one space (a YAML sequence dash).
+    if !rest.starts_with(' ') && !rest.starts_with('\t') {
+        return false;
+    }
+    let rest = rest.trim_start();
+    let Some(rest) = rest.strip_prefix("id:") else {
+        return false;
+    };
+    let rest = rest.trim_start();
+    let digits_end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    if digits_end == 0 {
+        return false;
+    }
+    rest[digits_end..].trim().is_empty()
+}
+
 /// Find the single manifest block: a ```` ```yaml ```` fence whose first
 /// content line is the v1 marker comment. Errors if none or more than one
-/// exists, or if the manifest fence is unterminated.
+/// exists, if any fence in the file is unterminated, or if manifest-shaped
+/// content is found outside the located block.
+///
+/// THE TWO INTEGRITY CHECKS LIVE HERE, NOT IN THE CALLERS, because this is
+/// the common ancestor of every verb: `main.rs::load` calls it, and
+/// `engine::validate_story` calls it DIRECTLY — `validate` is the one verb
+/// that does not go through `load`, and it is precisely the verb behind
+/// `validate-story-manifest.sh` (Layer 3 / CI) and `preflight-story.sh`.
+/// A check placed caller-side would therefore be invisible to both gates and
+/// would fire only once the runner was already executing the story.
 pub fn find_manifest_block(text: &str) -> Result<BlockSpan> {
     let mut blocks: Vec<BlockSpan> = Vec::new();
     let mut open: Option<OpenFence> = None;
@@ -62,21 +108,63 @@ pub fn find_manifest_block(text: &str) -> Result<BlockSpan> {
         offset += raw.len();
     }
 
-    if let Some(fence) = open {
-        if fence.is_yaml && fence.is_manifest == Some(true) {
-            bail!("manifest block is not terminated by a closing ``` fence");
-        }
+    // ANY unterminated fence is an error, not only an unterminated MANIFEST
+    // fence. When a prompt's fenced example closes the manifest early, the
+    // manifest's own closing fence then OPENS a new one that never closes —
+    // so this catches that shape. Scoped honestly: it catches it only when
+    // the fence lines remaining after the truncation point leave one open,
+    // which depends on whether the model tagged its fence and how many
+    // fenced blocks follow. It is markdown well-formedness, not a detector
+    // for the truncation class; the orphan scan below is that.
+    //
+    // Known, deliberate consequence: a 4-backtick fence is a hard failure of
+    // the whole file (it satisfies the ``` prefix so it opens a fence, but
+    // can never equal a bare ``` so it never closes). Zero occurrences in
+    // story files; nested fenced examples are unsupported by this parser.
+    if open.is_some() {
+        bail!(
+            "unterminated ``` fence: the file has an odd number of fence lines. If a manifest \
+             prompt contains a fenced code example, it closed the manifest block early and \
+             SILENTLY truncated it. Manifest prompts cannot contain fenced code examples \
+             (nested/4-backtick fences are also unsupported)."
+        );
     }
 
-    match blocks.len() {
+    let span = match blocks.len() {
         1 => blocks
             .pop()
-            .ok_or_else(|| anyhow::anyhow!("manifest block vanished (internal error)")),
+            .ok_or_else(|| anyhow::anyhow!("manifest block vanished (internal error)"))?,
         0 => bail!(
             "no manifest block found (expected one ```yaml fence whose first line is '{MARKER}')"
         ),
         n => bail!("found {n} manifest blocks; exactly one is required"),
+    };
+
+    // ORPHAN SCAN — the read-side detector for silent truncation, and the
+    // one that does not depend on fence parity. A truncation leaves the
+    // manifest's tail in the document as prose, full of task-entry lines.
+    // HARD ERROR, not a warning: `engine::validate_story` turns an Err from
+    // this function into a violation with the right exit code, whereas it
+    // collects violations and has no warning channel at all — a WARN here
+    // would be silently swallowed by the very gate that needs it.
+    let mut offset = 0usize;
+    for raw in text.split_inclusive('\n') {
+        let line_end = offset + raw.len();
+        let outside = line_end <= span.content_start || offset >= span.content_end;
+        if outside && is_orphaned_task_entry(raw) {
+            bail!(
+                "manifest-shaped line outside the manifest block: {:?}. This is the signature of \
+                 a SILENTLY TRUNCATED manifest — a prompt containing a markdown fence closed the \
+                 block early, leaving the remaining tasks in the document as prose. The surviving \
+                 block still parses and still validates, so this check is the only thing that \
+                 sees the loss.",
+                raw.trim()
+            );
+        }
+        offset = line_end;
     }
+
+    Ok(span)
 }
 
 /// Borrow the YAML content (marker line included) of a located block.
@@ -107,7 +195,7 @@ mod tests {
 
     #[test]
     fn finds_single_block_and_round_trips_content() {
-        let text = story("story: s\nbranch: b\ntasks: []\n");
+        let text = story("story: s\ntasks: []\n");
         let span = find_manifest_block(&text).expect("span");
         let yaml = manifest_yaml(&text, &span).expect("yaml");
         assert!(yaml.starts_with(MARKER));
@@ -132,7 +220,7 @@ mod tests {
 
     #[test]
     fn two_blocks_is_an_error() {
-        let one = story("story: s\nbranch: b\ntasks: []\n");
+        let one = story("story: s\ntasks: []\n");
         let text = format!("{one}\n{one}");
         let err = find_manifest_block(&text).expect_err("must fail with two blocks");
         assert!(err.to_string().contains("2 manifest blocks"));

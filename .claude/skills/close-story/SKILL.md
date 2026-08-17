@@ -11,7 +11,7 @@ Moves reflection from per-devloop (cheap, repetitive) to per-story (once, with c
 
 ## When to Use
 
-After every row in the story's `Devloop Tracking` table is marked `Completed`.
+After every task in the story's `dt-story` manifest has `status: completed`.
 
 Do NOT use mid-story (Phase 1 refuses), for standalone devloops (Gate 2 INDEX guard suffices), or to recover a stuck devloop (use `/devloop --continue=...` first).
 
@@ -45,7 +45,7 @@ VERIFY → TEAM CREATE → REFLECTION → DRY RETRO → TEAM DELETE → FINALIZE
 ^[a-z0-9-]+$
 ```
 
-Reject otherwise. This covers the normal `billing-portal` shape *and* a full `2026-04-20-billing-portal` (dashes and digits already allowed). Apply the **same regex** to every devloop-slug value read from the story file's `Devloop Tracking` table before constructing `docs/devloop-outputs/{devloop-slug}/main.md` paths — second injection vector (hand-edited story file).
+Reject otherwise. This covers the normal `billing-portal` shape *and* a full `2026-04-20-billing-portal` (dashes and digits already allowed). Devloop slugs read from the manifest are validated separately, against the canonical class pinned below — see “Slug extraction and validation”.
 
 **Locate the story file** via glob match:
 
@@ -57,22 +57,64 @@ matches = glob("docs/user-stories/*{slug}.md")     # suffix match; exact form al
 - 1 match → proceed with that path.
 - ≥2 matches → escalate to the user (SendMessage): list the matched filenames, ask the user to pick one (they reply with the full `YYYY-MM-DD-slug` or an index).
 
-**Read the Devloop Tracking table** from the story file. The table is the source of truth for what's been done — each row is one devloop, with a `Status` column.
+**Read task state from the `dt-story` manifest** — never from a markdown table. Per ADR-0035 §4 the manifest is the only home for task status and the devloop-output slug.
 
-**Completeness check**: every row's `Status` MUST be `Completed`. Phase 1 advances to Phase 2 iff there are zero non-completed rows; otherwise escalate:
+```bash
+target/release/dt-story list-tasks docs/user-stories/{story-file}.md
+```
+
+**Use `list-tasks`, NOT `next`.** `next` mutates on exactly one path — selecting an escalated task reopens it (status back to `pending`, `escalation` cleared, file rewritten) — and that path is reachable **precisely when the completeness check would fail**. A completeness probe built on `next` is therefore safe only when it passes and destructive when it fails, which is the inverse of what an audit gate must be: it would erase the record that a task was escalated at the exact moment someone is auditing the story, and Phase 3 stages `docs/user-stories/`, so the mutation would ride into a commit. `list-tasks` is read-only.
+
+**Exit-code handling — rc 2 aborts, never degrades.** Per the `list-tasks` contract, rc 2 means "this binary cannot answer" and guarantees empty stdout. Do **not** wrap the call so a failure becomes an empty task list: that converts "cannot answer" into "nothing to do", which passes vacuously. If `list-tasks` exits non-zero, or the story file has no manifest block, abort with the message below — there is deliberately **no table-reading fallback**.
+
+```
+**Story close blocked — manifest unreadable**
+
+Story: {story-title}   Slug: {story-slug}
+
+`dt-story list-tasks` exited {rc}. This skill reads task state only from the
+dt-story manifest. If this story predates the manifest (pre-2026-05), it is
+already closed and re-closing is not supported.
+```
+
+**Completeness check**: every task's `status` MUST be **positively** `completed`.
+
+```bash
+target/release/dt-story list-tasks "$STORY" | jq -e 'length > 0 and all(.[]; .status == "completed")'
+```
+
+Assert `completed` positively — do **not** test for the absence of `pending`. `Status` has **three** variants, so `all(.status != "pending")` silently passes a story with an **escalated** task, which is strictly weaker than the check this replaces. Otherwise escalate:
 
 ```
 **Story close blocked — incomplete tasks**
 
 Story: {story-title}   Slug: {story-slug}
 
-Incomplete rows in Devloop Tracking table:
-- #{N}: "{task description}" — Status: {status}
+Incomplete tasks (from the dt-story manifest):
+- #{id}: status {status}
 
 Resolve these before closing. If a devloop is stuck: /devloop --continue=<slug>.
+An escalated task is retried by rerunning the story runner.
 ```
 
-**Apply the slug regex** (`^[a-z0-9-]+$`) to every devloop slug parsed from the table's `Devloop Output` column before constructing `docs/devloop-outputs/{devloop-slug}/main.md` paths — the table is hand-edited, so treat it as input-boundary.
+**Slug extraction and validation.** Take each completed task's `slug` field from the same `list-tasks` JSON — structured extraction, never a hand-parse of the YAML block. Apply this regex before constructing any `docs/devloop-outputs/{slug}/main.md` path:
+
+<!-- slug-class-sync: ^[a-z0-9]+(-[a-z0-9]+)*$ -->
+
+That literal is pinned to `manifest::SLUG_PATTERN` (the canonical class, enforced in `dt-story`'s deserializer) by `scripts/guards/simple/validate-slug-class-sync.sh`. Re-validating here is deliberate defence in depth: a manifest is a hand-editable markdown block regardless of who wrote it, so it is an input boundary. **Edit the marker line above only to match a canonical-class change** — the guard fails on drift.
+
+**Missing slugs — distinguish history from a recording failure.** The discriminator is: *does **any** completed task in this manifest carry a slug?*
+
+- **No completed task has a slug** → a pre-slug-era story (closed before the runner recorded slugs). **Tolerate**: proceed, and state in the Phase 5 report which devloops could not be enumerated and that the story's own file is the historical record. Do not fail — a story cannot become uncloseable for lacking a field it predates.
+- **Some do, but this task does not** → a live recording failure. **Hard-fail**, naming the task id, the runner's corresponding `STORY_RUN: NO-SLUG task=N cause=...` line, and the repair:
+
+  ```
+  target/release/dt-story complete docs/user-stories/{story}.md {id} --slug {slug}
+  ```
+
+  That gesture works on an already-completed task (slug is last-writer-wins), so it repairs the record in place.
+
+**Revalidate at use.** A slug is a stored reference whose referent can be removed by a later commit while the story file stays byte-identical. Before using one, confirm `docs/devloop-outputs/{slug}/main.md` exists; a missing directory is the hard-fail in Phase 4, not a silently shortened list.
 
 ## Phase 2: Story-scope Reflection
 
@@ -206,7 +248,7 @@ There is no team object to delete. Mirrors `/devloop` Step 8.5. Prevents stale t
 git log --oneline "$(git merge-base HEAD main)..HEAD"
 ```
 
-Categorize each: **story-devloop** (references a `docs/devloop-outputs/{slug}/` path or has a `Devloop:` trailer matching the story's Devloop Tracking table), **story-close** (this skill's own commit), or **adjacent** (anything else).
+Categorize each: **story-devloop** (references a `docs/devloop-outputs/{slug}/` path or has a `Devloop:` trailer matching a slug from the manifest), **story-close** (this skill's own commit), or **adjacent** (anything else).
 
 **PR body synthesis — structured fields only**. For each story-devloop main.md, include ONLY:
 
@@ -221,7 +263,7 @@ Exclude everything else: `.env` dumps, log tails, teammate transcripts, freeform
 **Missing sections — tolerate**:
 - Missing Implementation Summary → omit description beyond Task + verdicts.
 - Missing Tech Debt → skip; if all devloops lack it, render "Remaining follow-ups: None."
-- Missing devloop output dir → hard-fail with the path and the Devloop Tracking row that referenced it.
+- Missing devloop output dir → hard-fail with the path and the manifest task id whose `slug` referenced it. This is the revalidate-at-use check that admits `slug` as a stored reference at all — do not soften it into a silently shorter list.
 - All-sections-missing across N devloops → "{N} devloops contributed no structured data; see individual main.md files" in the affected section.
 
 **PR body shape** (fixed template, heredoc-safe):
@@ -283,11 +325,14 @@ Harness permission prompts fire on `gh pr create/edit`; deny is terminal per Pha
 **Story closed**: {story-title}
 
 Devloops: {count} ({comma-separated slugs})
+Slug coverage: {N}/{M} completed tasks
 PR: {URL}
 TODO additions: {count from Phase 2.5}
 Reflection: {count of specialists who updated INDEX}
 Ownership-lens retrospective: docs/devloop-outputs/{story-slug}-story-close/ownership-lens-retrospective.md
 ```
+
+**`Slug coverage` is ALWAYS printed, never conditional.** The normal case reads `4/4`; a degraded close (the pre-slug-era tolerate path) reads e.g. `0/65` and is visible in the fixed record **by value**. A degraded close must not depend on a model remembering to mention it in prose under budget pressure — same reason the runner emits a `cause=` token rather than a sentence.
 
 Conditional output: print the retrospective line only if the file exists (substitute `skipped (timeout)` or omit). If Phase 3 was a no-op commit, add `Commit: none (no working-tree changes)`. Flag any other skipped phases inline.
 
@@ -308,4 +353,5 @@ Conditional output: print the retrospective line only if the file exists (substi
 - Devloop outputs: `docs/devloop-outputs/{devloop-slug}/main.md`
 - Story-close output: `docs/devloop-outputs/{story-slug}-story-close/ownership-lens-retrospective.md`
 - Specialist INDEX: `docs/specialist-knowledge/{name}/INDEX.md`
-- Upstream: `.claude/skills/devloop/SKILL.md` (reflection removed), `.claude/skills/user-story/SKILL.md` (decomposes the story into the Devloop Tracking table this skill reads)
+- Upstream: `.claude/skills/devloop/SKILL.md` (reflection removed), `.claude/skills/user-story/SKILL.md` (emits the `dt-story` manifest this skill reads)
+- Slug class pinned to `crates/dt-story/src/manifest.rs::SLUG_PATTERN` by `scripts/guards/simple/validate-slug-class-sync.sh`

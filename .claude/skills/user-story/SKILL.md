@@ -316,7 +316,65 @@ Update the story file with all sections populated:
 - Cross-cutting requirements (observability, test, operations)
 - Assumptions made (which specialist, what they assumed, why they didn't block)
 - Clarification questions (answered or pending)
-- Implementation plan (ordered devloop task table)
+- Implementation plan — **prose intent only**. No `Status` column and no `Devloop Output` column: those live in the manifest and nowhere else (ADR-0035 §4). There is no §Devloop Tracking table.
+
+### Step 10.4: Emit the `dt-story` Manifest
+
+`run-story` cannot drive a story without this block. **Emit it through `dt-story`, never by hand-writing YAML** — that is what makes prompt integrity structural rather than a convention.
+
+**First**, copy the `## Task Metadata (dt-story manifest v1)` section from `docs/user-stories/_template.md` and reduce it to a skeleton:
+
+```yaml
+# task-metadata (dt-story manifest v1)
+story: {story-slug}
+tasks: []
+```
+
+**Then append one task at a time**, writing each prompt to a temp file first so no prompt text ever reaches a command line:
+
+```bash
+target/release/dt-story add-task "$STORY" \
+  --specialist <name> \
+  --prompt-file /tmp/task-<n>.prompt \
+  --tag "story-{story-slug}-task-<n>" \
+  --deps 1,2 \
+  --env-tests          # omit the flag entirely when false
+```
+
+**Why through `dt-story` and not hand-written YAML.** `Manifest::to_block_body` refuses to write a manifest containing a markdown fence line. A prompt carrying a fenced code example would otherwise close the manifest block early and truncate it **silently** — the surviving prefix still parses, still validates, and `next` then reports the story complete with tasks missing. Emitting through the write verb makes that refusal cover this skill by construction. Hand-writing the YAML bypasses it entirely.
+
+**Rules for the values:**
+
+- **`--tag` is mandatory and deterministic**: `story-{story-slug}-task-{n}`. This makes emission **idempotent and resumable** — an interrupted Step 10.4 is recovered by simply re-running it, because an existing tag is a no-op rather than a duplicate append.
+- **NEVER predict task ids.** `add-task` assigns `max(existing id) + 1`, so ids depend on what is already in the file, and the `Exists` short-circuit means a re-run does not advance the sequence. **Read the id back from stdout** (printed on both the rc-0 and rc-4 paths) and map your own task numbering onto the returned ids before computing `--deps`. A predicted dep number silently points at the wrong task **and still validates** — the manifest is well-formed and means something else. This is the reason for the read-back; do not "simplify" it back to prediction.
+- **Check the exit code of every call, separately from the captured id.** `id="$(dt-story add-task …)"` succeeds even when the write did not happen.
+
+  | rc | meaning | action |
+  |----|---------|--------|
+  | 0 | appended | record the returned id |
+  | 4 | tag already exists | **success-with-existing-id** — record the id, continue. A naive "non-zero means failed" reading breaks resumption outright, since on a resumed emission *every* already-emitted task returns 4 |
+  | 2 (or any other) | bad prompt file, **fence refusal**, write error | **hard stop**, surface stderr |
+
+  rc 2 is how the fence refusal surfaces. A loop that ignores exit codes converts that guarantee back into nothing.
+- **`specialist` must match `^[a-z][a-z0-9-]*$`** — a single bare agent name. It is the one manifest value the runner still interpolates onto a command line (`run-story.sh` floors it and refuses otherwise). Record pairing as **prose inside the prompt** ("Pair with protocol for the crate change"), never as `test --paired-with=infrastructure` in the `specialist` field.
+- **Prompts must be self-contained** (the devloop sees only the prompt) and **must not contain fenced code blocks**. Inline `` `backtick spans` `` are fine.
+- **`--deps ''` is an error.** Omit the flag for a task with no dependencies.
+
+### Step 10.5: Verify the Emission — BLOCKING
+
+Emitting the manifest is not the same as having emitted it, exactly as setting a redirect is not the same as being redirected (R-1's own principle, applied to this skill). Both checks must pass before the story is reported Ready.
+
+```bash
+target/release/dt-story validate "$STORY"          # 1. schema + semantic check
+target/release/dt-story list-tasks "$STORY" | jq -r '[.[].id] | @csv'   # 2. id-set check
+```
+
+1. **`validate` must exit 0.** It also rejects a zero-task manifest, which catches an emission that never got past the skeleton — that state otherwise *asserts the story is complete* (`next` exits 3 = AllDone).
+2. **The returned id set must EQUAL the planned id set**, and each task's `deps` must match the planned graph. Equality, not subset: extra ids mean a duplicate append, missing ids mean truncation. This is a numeric comparison, independent of markdown fence parity anywhere in the file, and it is the only check standing in front of this skill as a producer.
+
+If either fails, fix the manifest and re-run — do **not** report the story Ready.
+
+**If the plan changes (`--continue`)**: reset the manifest block back to the skeleton and re-emit the whole plan. Do **not** re-run `add-task` over a populated manifest — an existing tag returns rc 4 **without applying** the supplied `--specialist`, `--prompt-file`, `--env-tests` or `--deps`, so a revised prompt would be silently discarded. **Refuse to reset if any task is not `pending`**: the story has already started, and resetting would destroy completed tasks' `status` and `slug`. Escalate — and name the next move rather than stopping at the refusal: the human either edits the affected task's `prompt` in the manifest block directly (leaving completed tasks untouched), or, if the remaining plan has changed structurally, closes this story and plans a new one for the remaining work.
 
 ### Step 11: Report and Review
 

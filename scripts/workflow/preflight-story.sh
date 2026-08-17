@@ -79,7 +79,12 @@ command -v jq >/dev/null 2>&1 || fail "jq not found"
   || fail "guard binaries not built (cargo build --release -p dt-guard -p dt-story)"
 [ -f "$STORY_FILE" ] || fail "story file not found: ${STORY_FILE}"
 
-target/release/dt-story validate "$STORY_FILE" || fail "story manifest invalid"
+# Two causes, named, because the bare "story manifest invalid" sent readers
+# hunting a manifest bug for what was a stale binary — and after the 2026-08-17
+# `branch` removal a STALE BINARY MEETING A BRANCH-LESS MANIFEST is the most
+# likely cause of this message. Mirrors the shape run-story.sh already uses.
+target/release/dt-story validate "$STORY_FILE" \
+  || fail "story manifest invalid (see dt-story's stderr above for the violations). TWO CAUSES, and the error text distinguishes them: (1) the manifest genuinely violates the schema — fix ${STORY_FILE}; or (2) target/release/dt-story is STALE and disagrees with the manifest's schema — rebuild with 'cargo build --release -p dt-guard -p dt-story'. An unknown-field error naming a field the current schema does not have (e.g. 'branch') is always cause 2."
 
 # Capability probe: assert the VERBS consumed, not the artifacts hoped for.
 # `[ -x ]` proves existence, not currency — a dt-story predating the `list-tasks`

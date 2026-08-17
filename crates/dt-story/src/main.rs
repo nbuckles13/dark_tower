@@ -42,10 +42,10 @@
 //!   validating a flag against the manifest needs its own verb rather than
 //!   a `next` call.
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use dt_story::engine::{self, NextOutcome};
-use dt_story::manifest::{Manifest, Status};
+use dt_story::manifest::{Manifest, Slug, Status};
 use dt_story::markdown::{self, BlockSpan};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -75,7 +75,7 @@ enum Command {
         /// Path to the user story markdown file.
         story: PathBuf,
     },
-    /// Mark a pending task completed, optionally recording its commit.
+    /// Mark a pending task completed, optionally recording its commit/slug.
     Complete {
         /// Path to the user story markdown file.
         story: PathBuf,
@@ -84,6 +84,14 @@ enum Command {
         /// Commit sha to record on the task.
         #[arg(long)]
         commit: Option<String>,
+        /// Devloop-output slug of the attempt that completed this task.
+        /// Last-writer-wins: supplying it on an already-completed task
+        /// REPAIRS a missing or stale slug. Validated at the clap boundary
+        /// as well as in the deserializer, because this flag is a second
+        /// producer (a model on a command line) less constrained than the
+        /// runner's own derived value.
+        #[arg(long)]
+        slug: Option<Slug>,
     },
     /// Mark a pending task escalated, recording the escalation log path.
     Escalate {
@@ -112,11 +120,21 @@ enum Command {
         #[arg(long)]
         prompt_file: PathBuf,
         /// Idempotency key: a second add-task with this tag is a no-op.
+        /// WEAK idempotency — the no-op does NOT apply the other flags.
         #[arg(long)]
         tag: String,
         /// Mark the task as requiring env-tests (default false).
         #[arg(long)]
         env_tests: bool,
+        /// Comma-separated dependency task ids, e.g. `--deps 1,2`.
+        /// Omit the flag for no deps; `--deps ''` is an error, because a
+        /// caller with an unset variable emits exactly that and a silently
+        /// dep-free task is a masked failure.
+        /// `Deps` newtype, not `Vec<u32>`: clap's derive reads a bare `Vec<T>`
+        /// as a MULTI-VALUE argument and tries to parse each occurrence as
+        /// `T`, which conflicts with our single-token comma-separated parser.
+        #[arg(long, value_parser = parse_deps)]
+        deps: Option<Deps>,
     },
     /// Check the story's manifest; print violations to stderr.
     Validate {
@@ -140,31 +158,97 @@ enum Command {
 /// merged into "don't emit extra fields" because they fail for unrelated
 /// reasons and would need unrelated fixes:
 ///
-/// 1. **Every field has a named consumer in `scripts/workflow/run-story.sh`;
-///    add one only together with its reader.** `id` and `status` drive
-///    `--stop-after` validation. `deps` drives the deps-aware refusal
-///    ("task 3 exists but is unreachable: dep 2 is pending"), which needs
-///    each *dep's* status — that is why this is the whole array and not a
-///    per-id lookup. Do not "optimise" it into a single-task query.
+/// 1. **Every field has a NAMED consumer, and the consumer is named here;
+///    add a field only together with its reader.** `id` and `status` drive
+///    `run-story.sh`'s `--stop-after` validation. `deps` drives its
+///    deps-aware refusal ("task 3 exists but is unreachable: dep 2 is
+///    pending"), which needs each *dep's* status — that is why this is the
+///    whole array and not a per-id lookup. Do not "optimise" it into a
+///    single-task query. `slug` is read by `/close-story` Phase 1 (mapping
+///    completed tasks to their devloop outputs) and Phase 4 (PR synthesis).
+///    This rule previously said "a named consumer **in
+///    `scripts/workflow/run-story.sh`**"; that stopped being true when
+///    `/close-story` became a consumer, and it is widened here rather than
+///    silently reread — the rule's force is "no field without a reader", not
+///    "the runner is the only reader".
 /// 2. **Never project an uncontrolled value.** `prompt` is arbitrary text;
 ///    keeping it off consumer command lines is the point of the runner's
-///    out-of-band prompt handling.
+///    out-of-band prompt handling. `slug` satisfies this BY CONSTRUCTION
+///    rather than by a producer-side filter: [`Slug`] is a newtype whose
+///    only constructor enforces `SLUG_PATTERN` in the deserializer, so an
+///    unvalidated value cannot exist in a parsed `Task`. That type is a
+///    PRECONDITION for projecting `slug` at all — a devloop-output directory
+///    name is model-produced, exactly the trust level this rule exists for.
 /// 3. **Never project a reference whose referent can be invalidated without
-///    this artifact being rewritten.** `escalation` holds a `$RUN_DIR` path
-///    that vanishes with the container; `commit` holds a sha that the
+///    this artifact being rewritten** — unless it is admitted on the
+///    revalidate-at-use branch, and says so. `escalation` holds a `$RUN_DIR`
+///    path that vanishes with the container; `commit` holds a sha that the
 ///    runner's post-completion `git commit --amend` invalidates by
 ///    construction (`run-story.sh` says so where it declines to set it).
 ///    Different mechanisms, same hazard — and neither argument finds the
 ///    other's instance, so test the property, not the shape: both are
 ///    `Option<String>`, so references are invisible to the type system.
+///
+///    `slug` IS such a reference and is admitted anyway, on the explicit
+///    condition that consumers revalidate. It is not durable-by-nature: it
+///    travels with its referent (the runner writes it in the same commit
+///    that contains `docs/devloop-outputs/<slug>/`, which is git-tracked),
+///    but a later commit deleting or renaming that directory invalidates the
+///    slug while the story file stays byte-identical — the literal test the
+///    `docs/TODO.md` referent-durability entry proposes. So "travels with",
+///    NOT "cannot break". The remedy is the one that entry documents as the
+///    codebase's own positive instance: revalidate at use. `/close-story`
+///    re-checks that `main.md` exists before constructing paths from a slug,
+///    mirroring how `run-story.sh` re-checks `$slug_file` rather than
+///    trusting it on read.
 /// 4. **`deps` is not `skip_serializing_if`.** Consumers get a total shape,
 ///    so `jq` never needs `// []`. Storage-side optionality is a YAML
-///    round-tripping concern and does not belong on the wire.
+///    round-tripping concern and does not belong on the wire. `slug` is
+///    likewise projected as an always-present key (`null` when unset), so a
+///    consumer never has to distinguish absent from empty.
 #[derive(Debug, serde::Serialize)]
 struct TaskSummary<'a> {
     id: u32,
     status: Status,
     deps: &'a [u32],
+    slug: Option<&'a str>,
+}
+
+/// Parse `--deps 1,2,3` into ids. Our own parser rather than clap's
+/// `value_delimiter`: a single quotable token is auditable in an emitted
+/// command line, where repeated flags force bash array-building and a
+/// variable-length command line — first-class concerns after R-2 defect 5 —
+/// and it mirrors the manifest's own YAML sequence.
+///
+/// Every rejection is explicit and none silently normalises: an empty value,
+/// an empty element, a non-numeric element, and DUPLICATES (a repeated dep
+/// is a caller bug; deduping would hide it).
+#[derive(Debug, Clone)]
+struct Deps(Vec<u32>);
+
+fn parse_deps(raw: &str) -> std::result::Result<Deps, String> {
+    if raw.trim().is_empty() {
+        return Err(
+            "--deps was given an empty value. Omit the flag entirely for a task with no \
+             dependencies; an empty value usually means an unset variable in the caller."
+                .to_string(),
+        );
+    }
+    let mut ids = Vec::new();
+    for element in raw.split(',') {
+        let element = element.trim();
+        if element.is_empty() {
+            return Err(format!("--deps '{raw}' has an empty element"));
+        }
+        let id: u32 = element
+            .parse()
+            .map_err(|_| format!("--deps element '{element}' is not a task id"))?;
+        if ids.contains(&id) {
+            return Err(format!("--deps '{raw}' repeats dep {id}"));
+        }
+        ids.push(id);
+    }
+    Ok(Deps(ids))
 }
 
 /// A loaded story file: full text, manifest block span, parsed manifest.
@@ -187,15 +271,60 @@ fn load(path: &Path) -> Result<Doc> {
     })
 }
 
+/// Write the mutated manifest back, then PROVE the file still round-trips.
+///
+/// This is the single chokepoint for every mutating verb (`next`'s reopen,
+/// `complete`, `escalate`, `add-task`), so the post-write check makes ANY
+/// corruption mechanism loud at write time — including ones nobody has
+/// thought of — rather than at `next`-returns-AllDone time, where a
+/// truncated manifest is indistinguishable from a finished story. That
+/// signature (green over work that never ran) is the one ADR-0035 §3 exists
+/// to prevent, which is why this is worth a re-read of the file.
+///
+/// Scope, stated so it is not over-read: it detects corruption INTRODUCED by
+/// this write. It cannot detect corruption INHERITED — a file that was
+/// already truncated when we loaded it round-trips its own truncation
+/// perfectly. `markdown::find_manifest_block`'s orphan scan covers that.
 fn save(path: &Path, doc: &Doc) -> Result<()> {
     let new_text = engine::rewrite_story(&doc.text, &doc.span, &doc.manifest)?;
-    engine::write_atomic(path, &new_text)
+    engine::write_atomic(path, &new_text)?;
+
+    // Compare the RE-SERIALIZED BODY, not the task-id vector. Ids are the
+    // wrong comparand for the loss class this crate defends against: a
+    // truncation inside the LAST task's prompt leaves every `- id: N` line
+    // intact, so an id comparison passes over a mangled file. Body equality
+    // catches that, plus prompt/slug/status changes and mechanisms nobody has
+    // enumerated — which is the only job this check is here to do.
+    // (`Task` derives no `PartialEq`, hence comparing serialized form rather
+    // than the structs.)
+    let expected = doc.manifest.to_block_body()?;
+    let reloaded = load(path).with_context(|| {
+        format!(
+            "WROTE A MANIFEST THAT NO LONGER PARSES ({}). The write has landed on disk; inspect \
+             the file before rerunning.",
+            path.display()
+        )
+    })?;
+    if reloaded.manifest.to_block_body()? != expected {
+        bail!(
+            "manifest did not round-trip: reading {} back yields a different manifest than was \
+             written. The file on disk is corrupt — most likely a prompt containing a markdown \
+             fence truncated the block.",
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 fn main() -> ExitCode {
     match Cli::parse().command {
         Command::Next { story } => cmd_next(&story),
-        Command::Complete { story, id, commit } => exit_on_error(cmd_complete(&story, id, commit)),
+        Command::Complete {
+            story,
+            id,
+            commit,
+            slug,
+        } => exit_on_error(cmd_complete(&story, id, commit, slug)),
         Command::Escalate {
             story,
             id,
@@ -209,7 +338,15 @@ fn main() -> ExitCode {
             prompt_file,
             tag,
             env_tests,
-        } => cmd_add_task(&story, &specialist, &prompt_file, &tag, env_tests),
+            deps,
+        } => cmd_add_task(
+            &story,
+            &specialist,
+            &prompt_file,
+            &tag,
+            env_tests,
+            deps.map(|d| d.0).unwrap_or_default(),
+        ),
         Command::Validate { story } => cmd_validate(&story),
         Command::ListTasks { story } => cmd_list_tasks(&story),
     }
@@ -267,20 +404,18 @@ fn cmd_next(story: &Path) -> ExitCode {
     }
 }
 
-fn cmd_complete(story: &Path, id: u32, commit: Option<String>) -> Result<()> {
+fn cmd_complete(story: &Path, id: u32, commit: Option<String>, slug: Option<Slug>) -> Result<()> {
     let mut doc = load(story)?;
-    // Warn (don't fail) if the task is already completed against a different
-    // recorded commit — a genuine conflict worth surfacing, but not one that
-    // should red the runner. Read the existing commit before the mutation.
-    let prior_commit = doc
-        .manifest
-        .tasks
-        .iter()
-        .find(|t| t.id == id)
-        .and_then(|t| t.commit.clone());
-    match engine::complete(&mut doc.manifest, id, commit.clone())? {
+    // Read prior values before the mutation. `commit` conflicts warn but do
+    // not overwrite; `slug` conflicts warn AND overwrite (last-writer-wins).
+    // Both are loud — same visibility, opposite action, which is what makes
+    // the pair legible rather than looking like an inconsistency.
+    let prior = doc.manifest.tasks.iter().find(|t| t.id == id);
+    let prior_commit = prior.and_then(|t| t.commit.clone());
+    let prior_slug = prior.and_then(|t| t.slug.clone());
+    match engine::complete(&mut doc.manifest, id, commit.clone(), slug.clone())? {
         engine::CompleteOutcome::Completed => save(story, &doc),
-        engine::CompleteOutcome::AlreadyComplete => {
+        engine::CompleteOutcome::AlreadyComplete { slug_updated } => {
             if let (Some(new), Some(old)) = (&commit, &prior_commit) {
                 if new != old {
                     eprintln!(
@@ -288,8 +423,23 @@ fn cmd_complete(story: &Path, id: u32, commit: Option<String>) -> Result<()> {
                     );
                 }
             }
-            eprintln!("dt-story: task {id} already completed — no change");
-            Ok(())
+            if slug_updated {
+                match &prior_slug {
+                    Some(old) => eprintln!(
+                        "dt-story: task {id} already completed; replacing slug {old} with {} \
+                         (last-writer-wins)",
+                        slug.as_ref().map_or("<none>", Slug::as_str)
+                    ),
+                    None => eprintln!(
+                        "dt-story: task {id} already completed; recording missing slug {}",
+                        slug.as_ref().map_or("<none>", Slug::as_str)
+                    ),
+                }
+                save(story, &doc)
+            } else {
+                eprintln!("dt-story: task {id} already completed — no change");
+                Ok(())
+            }
         }
     }
 }
@@ -328,6 +478,7 @@ fn cmd_add_task(
     prompt_file: &Path,
     tag: &str,
     env_tests: bool,
+    deps: Vec<u32>,
 ) -> ExitCode {
     // Read the prompt first: a bad --prompt-file is a caller error (exit 2),
     // distinct from a manifest/write error, but both map to EXIT_MALFORMED.
@@ -340,10 +491,13 @@ fn cmd_add_task(
         let mut doc = load(story)?;
         let outcome = engine::add_task(
             &mut doc.manifest,
-            specialist.to_string(),
-            prompt,
-            env_tests,
-            tag.to_string(),
+            engine::NewTask {
+                specialist: specialist.to_string(),
+                prompt,
+                env_tests,
+                tag: tag.to_string(),
+                deps,
+            },
         )?;
         if let engine::AddOutcome::Added(_) = outcome {
             save(story, &doc)?;
@@ -358,7 +512,17 @@ fn cmd_add_task(
         }
         Ok(engine::AddOutcome::Exists(id)) => {
             println!("{id}");
-            eprintln!("dt-story: task with tag '{tag}' already exists (id {id})");
+            // Name what was NOT done. The tag check returns before any field
+            // is written, so every supplied flag was accepted and discarded;
+            // silently reporting "already exists" reads as convergence and
+            // is not. A caller re-running with a CORRECTED dependency graph
+            // gets no error and no edit.
+            eprintln!(
+                "dt-story: task with tag '{tag}' already exists (id {id}) — NOT UPDATED. The \
+                 supplied --specialist/--prompt-file/--env-tests/--deps were NOT applied; this \
+                 verb appends, it does not update. To change an existing task, edit the manifest \
+                 block directly, or reset it to a skeleton and re-emit the whole plan."
+            );
             ExitCode::from(EXIT_TAG_EXISTS)
         }
         Err(e) => {
@@ -389,6 +553,7 @@ fn cmd_list_tasks(story: &Path) -> ExitCode {
             id: task.id,
             status: task.status,
             deps: &task.deps,
+            slug: task.slug.as_ref().map(dt_story::manifest::Slug::as_str),
         })
         .collect();
     // Serialize fully BEFORE printing anything, so a SERIALIZATION failure

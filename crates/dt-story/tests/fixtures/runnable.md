@@ -10,7 +10,6 @@ survive `complete`/`escalate` byte-for-byte.
 ```yaml
 # task-metadata (dt-story manifest v1)
 story: client-join-meeting
-branch: feature/client-join-meeting
 tasks:
 - id: 1
   status: completed
