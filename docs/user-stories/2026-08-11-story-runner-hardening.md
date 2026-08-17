@@ -1,7 +1,7 @@
 # User Story: Story-Runner Hardening (ADR-0035 follow-on)
 
 **Date**: 2026-08-11
-**Status**: Planning
+**Status**: Complete
 **Participants**: auth-controller, global-controller, meeting-controller, media-handler, client, database, protocol, infrastructure, security, test, observability, operations
 
 ## Story

@@ -17,6 +17,8 @@
 - WebTransport connection mgmt → `transport/`
 - HTTP/3 meeting API client → `http/`
 - Error taxonomy (`SdkErrorCode`) → `errors/`
+- HTTP status → meeting error mapping (cap vs org-inactive 403s) → `errors/MeetingError.ts:fromResponse()`
+- Input validation SSoT (`SUBDOMAIN_REGEX`, length caps, validators) → `validation/limits.ts`
 - Protobuf-es generated types → `proto/dark_tower/`
 
 ## Svelte Adapter (`packages/sdk-svelte/src/`)
@@ -40,10 +42,13 @@
 - Shared fixtures/helpers (auth, roster asserts, recovery, shared-user memo) → `fixtures.ts`
 - MC metric assertions (baseline-delta, `pollUntilSumAbove`) → `mcMetrics.ts`
 - Specs (happy-path, negative, recovery tails) → `*.spec.ts`
-- Env/global setup → `env.ts`, `global-setup.ts`
+- Env contract (required `E2E_ORG_SUBDOMAIN`, derived `E2E_BASE_URL`) → `env.ts`, `global-setup.ts`
 - Budgets & assertion catalog → `packages/web-app/e2e/README.md`
 - Playwright config (retries=0, workers=1) → `packages/web-app/playwright.config.ts`
 - Browser E2E pipeline lane (Layer 7) → `scripts/layer7.sh`
+- Per-run org provisioning (source of `E2E_ORG_SUBDOMAIN`) → `scripts/layer7.sh` Phase 1h, `infra/kind/scripts/setup.sh:provision_run_org()`
+- Node-tier vitest specs (env contract, bundle content) → `packages/web-app/tests/`
+- Subdomain-pattern drift guard (e2e mirror ↔ SDK SSoT) → `scripts/guards/simple/validate-subdomain-regex-sync.sh`
 
 ## Client Test Utilities (`packages/test-utils/src/`)
 - Mock transport → `MockWebTransport.ts`
@@ -55,16 +60,13 @@
 - Signaling proto (client-server) → `proto/dark_tower/signaling/v1/signaling.proto`
 - 42-byte binary frame format → `crates/media-protocol/src/frame.rs`
 - Cross-language test vectors → `proto/test-vectors/`
-- Protobuf-es codegen (wire-compatible with Rust prost) → `@bufbuild/protobuf-es`
 - Meeting-token `display_name` claim (roster names) → `crates/common/src/jwt.rs:MeetingTokenClaims`
 
 ## Observability
-- Client alert rules → `client-alerts.yaml`
-- Client dashboards → `client-overview.json`, `client-slo.json`, `client-synthetic.json`
+- Client alert rules & dashboards → `client-alerts.yaml`, `client-overview.json`, `client-slo.json`, `client-synthetic.json`
 
 ## Toolchain & Build
-- Node version SSoT (`.nvmrc`; enforced via `.npmrc` engine-strict + `package.json` engines.node) → `.nvmrc`
+- Node version SSoT (`.nvmrc`; enforced via `.npmrc` engine-strict, `package.json` engines.node, `infra/devloop/Dockerfile`) → `.nvmrc`
 - pnpm transitive-security overrides → `package.json:pnpm.overrides`
 - Dev-web preflight (rolldown-binding probe) → `scripts/dev-web.sh`
-- Devloop image Node pin (reads `.nvmrc`) → `infra/devloop/Dockerfile`
 - Client CI workflow → `.github/workflows/ci-client.yml`
