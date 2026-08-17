@@ -852,6 +852,24 @@ ON CONFLICT (subdomain) DO NOTHING;
 # Phase 1 would read success and R-7's "operator lane, never a suite failure"
 # would invert exactly backwards. Do not harmonize this with its neighbours.
 #
+# TODO: Replace with AC org provisioning API (see docs/TODO.md) — SAME marker as
+# the seed_test_data() call site below, and for the same reason. This function is
+# a STOPGAP, not the intended design.
+#
+# Writing organizations by SQL from a test fixture inverts the dependency: the
+# suite reaches around the product to arrange state the product should own, so it
+# exercises a path no real client can take, and every consumer of that state
+# (AC's subdomain rules, GC's cap semantics) is duplicated here rather than
+# enforced once by the service. The direction of travel is already tracked for
+# the identical pattern with service credentials — admin API, then registration
+# Jobs, then "Remove setup.sh seed_test_data" — and org provisioning belongs in
+# that sequence rather than beside it. Note the ordering constraint: calling an
+# AC org endpoint needs an admin credential, and credentials are themselves
+# SQL-seeded today, so neither escapes seeding until both admin APIs exist.
+#
+# Do not extend this function's reach. Adding more product state here (users,
+# roles, credentials) widens the workaround and the eventual removal.
+#
 # Args: $1 = subdomain (lowercase, DNS-label shaped)
 # Env:  DT_CLUSTER_NAME (required, no fallback)
 # Stdout: one line `PROVISIONED_ORG org_id=<uuid> subdomain=<sub>`
