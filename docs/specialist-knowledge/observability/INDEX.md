@@ -13,18 +13,19 @@
 - Deterministic story runner (run-story) -> ADR-0035
 - Open observability debt -> `docs/TODO.md` §Observability Debt
 
-## Story Runner Telemetry (ADR-0035)
-Evidence artifacts, not monitored signals — ADR-0032's metric-governance regime does not apply here.
-- Cost ledger emitter, canary classification, gate loop, run-record dir -> `scripts/workflow/run-story.sh:report_task_cost()`, `canary_probe()`, `canary_classify()`, `RUN_DIR`
+## Story Runner Telemetry (ADR-0035; governance boundary ADR-0035 §11)
+- Cost ledger, canary probe/classify, escalation + infra-incident lanes, run-record dir -> `scripts/workflow/run-story.sh:report_task_cost()`, `canary_probe()`, `canary_classify()`, `escalate()`, `record_infra_incident()`, `RUN_DIR`
+- Gate rc lane split (implementer vs operator), git-fault lane, devloop-output enumeration -> `scripts/workflow/run-story.sh:git_error_lane()`, `git_head()`, `tree_dirty()`, `newest_devloop_output()`, `persist_resume_pointer()`
+- Test seams + containment predicate; hermetic suite; shared bash assert helpers -> `scripts/workflow/run-story.sh:__test_sentinel_active()`, `__any_seam_override_present()`, `__seam_assert_run_dir_isolated()`, `scripts/workflow/run-story.test.sh`, `scripts/lang/_test_helpers.sh`
 - Substrate probe + settings registration; devloop completion enforcement -> `scripts/workflow/preflight-story.sh`, `scripts/workflow/devloop-stop-hook.sh`
 - Gate-2 verdict emitter (per-layer `LAYER n STATUS DURATION`; ephemeral-only guard) -> `scripts/lang/_gate2_binding.sh:emit_gate2_verdict()`
-- Task manifest state machine -> `crates/dt-story/src/engine.rs`, `crates/dt-story/src/manifest.rs`, `crates/dt-story/src/markdown.rs`
+- Manifest as sole home for task status + devloop slug (`Slug`, `SLUG_PATTERN`, fence-safe emit) -> `crates/dt-story/src/manifest.rs`, `engine.rs`, `markdown.rs:find_manifest_block()`, `main.rs`; producer/consumer `.claude/skills/user-story/SKILL.md`, `.claude/skills/close-story/SKILL.md`
 - Per-task devloop records (one dir per devloop) -> `docs/devloop-outputs/`, template `docs/devloop-outputs/_template/main.md`
 
 ## Metrics
 - Metric catalogs -> `docs/observability/metrics/ac-service.md`, `docs/observability/metrics/gc-service.md`, `docs/observability/metrics/mc-service.md`, `docs/observability/metrics/mh-service.md`
 - AC -> `crates/ac-service/src/observability/metrics.rs:init_metrics_recorder()`, `record_meeting_display_name_outcome()`; gauge init `services/key_management_service.rs:init_key_metrics()`; HTTP middleware `middleware/http_metrics.rs`; rate-limit config `config.rs`; emission site `handlers/internal_tokens.rs:resolve_meeting_display_name()`
-- GC -> `crates/gc-service/src/observability/metrics.rs`; middleware `middleware/http_metrics.rs:normalize_endpoint()`; join wiring `handlers/meetings.rs:join_meeting()`, `get_guest_token()`; DB `repositories/`; telemetry-proxy + CORS `handlers/telemetry.rs`, `services/telemetry_filter.rs`, `middleware/cors_observer.rs`
+- GC -> `crates/gc-service/src/observability/metrics.rs`; middleware `middleware/http_metrics.rs:normalize_endpoint()`; join wiring `handlers/meetings.rs:join_meeting()`, `get_guest_token()`; DB `repositories/`; telemetry-proxy + CORS `handlers/telemetry.rs`, `services/telemetry_filter.rs`, `middleware/cors_observer.rs`; meeting-refusal cause taxonomy (`error_type` labels, per-cause logs) `repositories/meetings.rs:MeetingRefusal::metric_label()`, `classify_insert_error()`, `errors.rs`, `handlers/meetings.rs:create_meeting()`
 - MC -> `crates/mc-service/src/observability/metrics.rs:record_display_name_resolution()`, `record_participant_leave()`, `record_participant_disconnect()`; bounded labels `errors.rs:error_type_label()`; emission sites `actors/meeting.rs:handle_join()`, `handle_disconnect()`, `grpc/media_coordination.rs`
 - MH -> `crates/mh-service/src/observability/metrics.rs`; emission sites `grpc/auth_interceptor.rs:MhAuthService`, `grpc/mc_client.rs`
 
@@ -53,6 +54,7 @@ Evidence artifacts, not monitored signals — ADR-0032's metric-governance regim
 - Cluster setup / teardown -> `infra/kind/scripts/setup.sh`, `infra/kind/scripts/teardown.sh`
 - Devloop helper (port map, status, audit log) -> `crates/devloop-helper/src/commands.rs:write_port_map_shell()`, `cmd_status()`, `parse_pod_health()`, `crates/devloop-helper/src/logging.rs:AuditLog`, `/tmp/devloop-{slug}/ports.json`, `infra/devloop/dev-cluster`, `infra/devloop/devloop.sh`
 - Env-tests observability -> `crates/env-tests/src/cluster.rs:ClusterPorts::from_env()`, `crates/env-tests/tests/30_observability.rs`; Layer 7 -> `.claude/skills/devloop/SKILL.md`
+- Layer-7 operator lane + per-run org provisioning (`PRECONDITION_FAILURE` reason tokens, AC org probe) -> `scripts/layer7.sh:precondition_fail()`, `__generate_org_subdomain()`, `infra/kind/scripts/setup.sh:provision_run_org()`, `crates/env-tests/src/fixtures/auth_client.rs:resolve_org_subdomain()`, `packages/web-app/e2e/env.ts`, tokens documented in `docs/runbooks/devloop-validation.md`, hermetic pins `scripts/layer7.test.sh`, `scripts/setup.test.sh`, `packages/web-app/tests/e2e-env.test.ts`
 
 ## Guards
 - Metric-to-dashboard coverage -> `scripts/guards/simple/validate-application-metrics.sh`
@@ -62,6 +64,7 @@ Evidence artifacts, not monitored signals — ADR-0032's metric-governance regim
 - Alert-rules lint -> `scripts/guards/simple/validate-alert-rules.sh`
 - PII / secret identifier vocabulary -> `crates/dt-guard/src/common/pii_vocabulary.rs`, `scripts/guards/simple/no-pii-in-logs.sh`, `scripts/guards/simple/ts/no-pii-in-logs-ts.sh`
 - Metric label + naming policies -> `crates/dt-guard/src/metric_labels.rs`, `crates/dt-guard/src/ts_metric_naming.rs`; `MetricAssertion` test helper `crates/common/src/observability/testing.rs`
+- Cross-encoding pattern drift (org subdomain, story slug class) -> `scripts/guards/simple/validate-subdomain-regex-sync.sh`, `scripts/guards/simple/validate-slug-class-sync.sh`
 
 ## Runbooks
 - Per-service deployment + incident response -> `docs/runbooks/` (two per service); GC join-failure triage, telemetry-proxy + CORS scenarios -> `docs/runbooks/gc-incident-response.md`, `docs/runbooks/gc-deployment.md`; OTLP smoke fixture `infra/smoke/empty-otlp-metrics.bin`
@@ -69,4 +72,4 @@ Evidence artifacts, not monitored signals — ADR-0032's metric-governance regim
 ## Test Coverage & Integration Seams
 - MH/MC accept-loop rigs (ADR-0032 Steps 2-3) -> `crates/mh-service/tests/common/accept_loop_rig.rs`, `crates/mh-service/tests/webtransport_accept_loop_integration.rs`, `crates/mc-service/tests/common/accept_loop_rig.rs`, `crates/mc-service/tests/webtransport_accept_loop_integration.rs`
 - AC cluster component tests (ADR-0032 Step 4) -> `crates/ac-service/tests/*_integration.rs`
-- GC cluster component tests (ADR-0032 Step 5) -> `crates/gc-service/tests/*_integration.rs`, `crates/gc-service/src/handlers/meetings.rs`
+- GC cluster component tests (ADR-0032 Step 5) -> `crates/gc-service/tests/*_integration.rs`, `crates/gc-service/src/handlers/meetings.rs`; refusal-cause + metric-label pins `crates/gc-service/tests/meeting_create_tests.rs`, `meeting_creation_metrics_integration.rs`

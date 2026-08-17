@@ -49,7 +49,20 @@
 ## Signaling Messages (signaling.proto)
 - MediaServerInfo (in JoinResponse.media_servers) → `proto/dark_tower/signaling/v1/signaling.proto`
 - MediaConnectionUpdate (client→MC; per-MH ConnectionState statuses, browser-client-join R-60) → `proto/dark_tower/signaling/v1/signaling.proto`
-- MediaConnectionUpdate handler (Task #2 stub; Task #6 reseats with mc_participant_mh_status_total{state}) → `crates/mc-service/src/webtransport/connection.rs`
+- MediaConnectionUpdate handler → `crates/mc-service/src/webtransport/connection.rs`
+
+## HTTP API Error Contracts
+- GC error taxonomy (HTTP status + `error.code` + `error_type` label per variant) → `crates/gc-service/src/errors.rs`
+- Meeting-creation refusal causes (`MeetingRefusal`, `CreateMeetingOutcome`) → `crates/gc-service/src/repositories/meetings.rs`
+
+## Story Manifest Schema (dt-story)
+- Manifest contract, versioning and per-task state → ADR-0035
+- Manifest/Task schema, `deny_unknown_fields`, `v1` marker, canonical `SLUG_PATTERN` → `crates/dt-story/src/manifest.rs`
+- Fence-safe block emission → `crates/dt-story/src/manifest.rs:to_block_body()`
+- Block discovery and orphan-entry detection → `crates/dt-story/src/markdown.rs:find_manifest_block()`
+- CLI surface (`validate`, `next`, `complete --slug`, `add-task --deps`) → `crates/dt-story/src/main.rs`
+- Manifest validity guard → `scripts/guards/simple/validate-story-manifest.sh`
+- Slug-class drift guard → `scripts/guards/simple/validate-slug-class-sync.sh`
 
 ## Integration Seams
 - Proto-gen consumed by services (re-exports prost::Message, tonic) → `crates/proto-gen/src/lib.rs`

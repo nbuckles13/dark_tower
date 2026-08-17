@@ -3,8 +3,7 @@
 ## Architecture & Design
 - Service auth (OAuth 2.0 Client Credentials) → ADR-0003 | Token lifetime & refresh → ADR-0007 | Key rotation → ADR-0008 | User auth & meeting access → ADR-0020
 - PII / generic-error discipline → ADR-0011 | No-panic policy → ADR-0002 | Approved algorithms → ADR-0027 | Unattended story runner (pass/fail authority, container boundary, suppression gate) → ADR-0035
-- MC session binding & HKDF key hierarchy → ADR-0023 (Section 1)
-- Client architecture (E2EE, key management, supply chain) → ADR-0028 (Sections 5, 1)
+- MC session binding & HKDF key hierarchy → ADR-0023 (Section 1) | Client architecture (E2EE, key management, supply chain) → ADR-0028 (Sections 5, 1)
 - Service-owned dashboards and alerts → ADR-0031 | Alert-rules guard (URL exfil + annotation hygiene) → `scripts/guards/simple/validate-alert-rules.sh`
 - Cross-boundary ownership (GSA, `Approved-Cross-Boundary:` trailer, intersection rule) → ADR-0024 §6 | GSA mirror → `.claude/skills/devloop/SKILL.md` §Cross-Boundary Edits, `.claude/skills/devloop/review-protocol.md` Step 0 | GSA manifest + classification guard → `scripts/guards/simple/cross-boundary-ownership.yaml`, `validate-cross-boundary-classification.sh`
 - Guard pipeline as single Rust binary `dt-guard` (ReDoS-safe `regex` crate, typed `serde_yaml` schema, SHA256/digest-pinned vendor binaries) → ADR-0034 | canonical path-containment gate → `crates/dt-guard/src/common/path_safety.rs` | symlink-escape tests → `crates/dt-guard/tests/doc_cite_resolve.rs`
@@ -28,7 +27,7 @@
 - JWT validation → `crates/gc-service/src/auth/jwt.rs` | Auth middleware → `src/middleware/auth.rs`
 - CORS allowlist (fail-closed, never `*` — wildcard panics router build) → `crates/gc-service/src/config.rs:Config.cors_allowed_origins` (env `CORS_ALLOWED_ORIGINS`); layer → `src/routes/mod.rs:build_cors_layer`; preflight deny-rewrite → `src/middleware/cors_observer.rs:cors_preflight_observer`; incident → `docs/runbooks/gc-incident-response.md` Scenario 12
 - Telemetry proxy (user-JWT gate `require_user_auth`; PII drop + size/rate caps) → `crates/gc-service/src/handlers/telemetry.rs`, `src/services/telemetry_filter.rs:filter_metrics`
-- CSPRNG + role enforcement → `crates/gc-service/src/handlers/meetings.rs` | atomic org limit CTE → `crates/gc-service/src/repositories/meetings.rs:create_meeting_with_limit_check()` | participant tracking (DB CHECK + partial unique) → `crates/gc-service/src/repositories/participants.rs`
+- CSPRNG + role enforcement → `crates/gc-service/src/handlers/meetings.rs` | atomic org limit CTE, refusal-cause disambiguation (cap-exhausted / org-inactive / org-not-provisioned), SQLSTATE collision classifier → `crates/gc-service/src/repositories/meetings.rs:create_meeting_with_limit_check()`, `classify_insert_error()` | unit-only error variants so no identifier reaches an echoed body → `crates/gc-service/src/errors.rs` | `join_token_secret` hand-rolled `Debug` redaction → `crates/gc-service/src/models/mod.rs` | participant tracking (DB CHECK + partial unique) → `crates/gc-service/src/repositories/participants.rs`
 
 ## Code Locations — MC (JWT, WebTransport, Actors, MH Client)
 - MC JWT validation + token_type anti-confusion → `crates/mc-service/src/auth/mod.rs:McJwtValidator`
@@ -62,14 +61,15 @@
 - MC/MH TLS volume mounts (defaultMode 0400) → `infra/services/{mc,mh}-service/{mc,mh}-{0,1}-deployment.yaml`; WebTransport UDP ingress → `infra/services/{mc,mh}-service/network-policy.yaml`, `infra/kind/kind-config.yaml`; test-time self-signed PEM rigs (rcgen, SAN `localhost`/`127.0.0.1`) → `crates/mh-service/tests/common/accept_loop_rig.rs`
 
 ## Devloop Container, Story Runner & Cluster Helper
-- Container isolation → ADR-0025; Cluster helper (trust, socket auth, injection safety, API allowlist, file perms) → ADR-0030
-- Runner container-boundary gate (hard-fail on `/run/.containerenv` ∪ `/.dockerenv`, `STORY_RUNNER_ALLOW_HOST` hatch) + substrate probe → `scripts/workflow/preflight-story.sh`
+- Container isolation → ADR-0025 | Cluster helper (trust, socket auth, injection safety, API allowlist, file perms; cannot self-validate within its own devloop run) → ADR-0030 | Helper binary (arg safety, status read-only auth-gated, gateway IP validation) → `crates/devloop-helper/src/commands.rs`; auth token (CSPRNG, constant-time compare, 0600) → `crates/devloop-helper/src/auth.rs`
+- Runner container-boundary gate (hard-fail on `/run/.containerenv` ∪ `/.dockerenv`, `STORY_RUNNER_ALLOW_HOST` hatch) + substrate probe → `scripts/workflow/preflight-story.sh` | test seams (`STORY_REPO_ROOT`/`DT_STORY`: sentinel-gated, rejected under `GITHUB_ACTIONS`, fail-loud when set without sentinel) + destructive-path containment predicate → `scripts/workflow/run-story.sh:__any_seam_override_present()`; hermetic suite → `scripts/workflow/run-story.test.sh`
+- Command-injection surface in the runner — task prompt passed out of band by file path, `specialist`/`continue_slug` character floors (task loop) → `scripts/workflow/run-story.sh` | failure classification (probe stderr on its own fd, structured-first) + audit-suppression gate → `canary_classify()` | headless completion enforcement, fail-closed on git error → `scripts/workflow/devloop-stop-hook.sh`
+- Story manifest as a parsed trust boundary: `Slug` newtype validated in the deserializer + fence-safe emit → `crates/dt-story/src/manifest.rs:to_block_body()` | read-path bail on unterminated fence and orphaned `- id:` lines → `crates/dt-story/src/markdown.rs:find_manifest_block()` | slug class-drift guard → `scripts/guards/simple/validate-slug-class-sync.sh`
 - Gate-2 verdict threat model (anti-drift, NOT anti-forgery) → `scripts/lang/_gate2_binding.sh` file header; unkeyed changeset digest → `gate2_signature()`; hook validator → `gate2_validate_commit()`; self-test → `scripts/guards/simple/selftest-gate2-verdict.sh`
-- Headless completion enforcement → `scripts/workflow/devloop-stop-hook.sh`; failure classification + audit-suppression gate → `scripts/workflow/run-story.sh:canary_classify()`
-- Helper binary (arg safety, status read-only auth-gated, gateway IP validation) → `crates/devloop-helper/src/commands.rs`; Auth token (CSPRNG, constant-time compare, 0600) → `crates/devloop-helper/src/auth.rs`
-- Env-test URL validation (scheme, credential rejection) → `crates/env-tests/src/cluster.rs:parse_host_port()`
+- Env-test URL validation (scheme, credential rejection) → `crates/env-tests/src/cluster.rs:parse_host_port()`; per-run org subdomain (required, no fallback, DNS-label validated) → `crates/env-tests/src/fixtures/auth_client.rs:resolve_org_subdomain()`, browser side → `packages/web-app/e2e/env.ts`
 - Kind NodePort listen address (`${HOST_GATEWAY_IP}`) → `infra/kind/kind-config.yaml.tmpl`; Wrapper → `infra/devloop/devloop.sh`; Dev-cluster client → `infra/devloop/dev-cluster`
 
 ## Infrastructure Secrets & Network Isolation
 - Imperative secret creation → `setup.sh:create_{ac,mc_tls,mh,mh_tls}_secret()`; input validation → `infra/kind/scripts/setup.sh`, `teardown.sh`; ConfigMap advertise-address patching → `setup.sh:deploy_{mc,mh}_service()`; single-service rebuild allowlist → `setup.sh:deploy_only_service()`
+- Per-run tenant isolation for Layer 7 — terminal `--provision-org` mode, single `dt_psql()` connection identity, validated cap interpolated into SQL → `infra/kind/scripts/setup.sh:provision_run_org()`; CSPRNG subdomain + AC org-resolution probe → `scripts/layer7.sh:__generate_org_subdomain()`; credential-containment assertions → `scripts/setup.test.sh`; subdomain-pattern drift guard → `scripts/guards/simple/validate-subdomain-regex-sync.sh`
 - Network policies (per-service ingress/egress) → `infra/services/{ac,gc,mc,mh}-service/network-policy.yaml`; MC↔MH gRPC MC→MH:50053 / MH→MC:50052; health probes → `crates/mc-service/src/observability/health.rs`
