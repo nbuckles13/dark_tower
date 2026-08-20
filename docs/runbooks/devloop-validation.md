@@ -18,7 +18,7 @@ You ran `./scripts/layer-all.sh` and it exited non-zero. Find the failing layer 
    ```
    === LAYER_SUMMARY_BEGIN ===
    LAYER=1 RESULT=OK             DURATION=2
-   LAYER=2 RESULT=SKIPPED-NO-DIFF DURATION=0
+   LAYER=2 RESULT=OK             DURATION=1
    LAYER=3 RESULT=OK             DURATION=4
    LAYER=4 RESULT=FAIL           DURATION=18
    ...
@@ -41,7 +41,7 @@ If you don't see a `LAYER_SUMMARY_BEGIN` block at all, the orchestrator aborted 
 | `./scripts/layer-all.sh` | Full validation (every layer in order). Default for Gate 2. |
 | `./scripts/layerN.sh` | Re-run a single layer (e.g. `./scripts/layer4.sh` to re-run only Layer 4 on a failing diff). Each layer is independently invocable. |
 | `./scripts/{audit,build,fmt,lint,test}.sh` | Per-verb dispatcher (e.g. `scripts/test.sh --workspace`). Iterates `scripts/lang/<X>/<verb>.sh` via `_dispatch.sh::for_each_lang_with_verb`. Preserves muscle-memory: `scripts/test.sh` keeps its original CLI shape. |
-| `bash scripts/lang/<X>/<verb>.sh` | Direct invocation of a single language's wrapper. Bypasses the skip-if-untouched short-circuit and the dispatcher's aggregation logic — useful for isolating "is the wrapper itself broken?" from "is the dispatcher routing correctly?". |
+| `bash scripts/lang/<X>/<verb>.sh` | Direct invocation of a single language's wrapper. Bypasses the dispatcher's aggregation logic — useful for isolating "is the wrapper itself broken?" from "is the dispatcher routing correctly?". |
 
 `scripts/verify-completion.sh` is the historical entry point; post-Wave-1 it calls `scripts/layer-all.sh` for the body (router-drift between local and CI is structurally eliminated).
 
@@ -79,8 +79,8 @@ The enum values are exactly:
 | STATUS | Meaning | Typical REASON examples |
 |--------|---------|-------------------------|
 | `OK` | Work ran cleanly | `cargo-check-passed`, `buf-build-passed`, `guards-passed` |
-| `FAIL` | Work ran and detected a problem | `cargo-clippy-failed`, `buf-breaking-failed`, `predicate-meta-test-failed`, `env-tests-failed`, `browser-e2e-failed` |
-| `SKIPPED-NO-DIFF` | `lang/<X>/changed.sh` returned 1 (lang untouched); the Layer-6 audit dep-gate when no dependency manifest changed (the COMMON case post-narrowing — every source-only PR emits this; see §6.6); also Layer 7's browser-E2E lane when the diff touches none of its trigger surfaces (task #19) | `<lang>-no-diff`, `no-dep-changes`, `browser-e2e-no-diff` |
+| `FAIL` | Work ran and detected a problem | `cargo-clippy-failed`, `buf-breaking-failed`, `env-tests-failed`, `browser-e2e-failed` |
+| `SKIPPED-NO-DIFF` | the Layer-6 audit dep-gate when no dependency manifest changed (the COMMON case — every source-only PR emits this; see §6.6). **This is now the ONLY producer**: the language-level `<lang>-no-diff` short-circuit and Layer-7's `browser-e2e-no-diff` lane were both retired 2026-08-20 (every language, and the browser suite, now always-run). The dispatcher's aggregate `all-langs-skipped` fires only if every audit child reports no-dep-changes. | `no-dep-changes`, `all-langs-skipped` |
 | `SKIPPED-NO-VERB` (→ **exit 0**) | `all-langs-filtered` — an INCLUDE/EXCLUDE filter cleared the lang set (operator intent). The ONLY producer of this enum since task #52. | `all-langs-filtered` |
 | `FAIL-MISSING-VERB` (→ **exit 2**) | a verb wrapper that SHOULD exist is missing/non-executable (deleted, `chmod`-stripped, or a new lang dir missing a verb) — a wiring fault, not a benign skip. Ranks above OK, so it can't be masked. | `rust-test-verb-missing-or-not-executable`, `ts-audit-verb-missing-or-not-executable` |
 | `N/A` | Documented gap: a verb that doesn't apply to a lang (intentional-gap placeholder, e.g. `proto/test.sh` / `proto/audit.sh`). | `not-applicable-to-this-lang`, `no-languages-registered`, `<verb>-aggregate-na` |
@@ -107,9 +107,9 @@ The intuition (locked in ADR-0033 §1 by the comment block above `_common.sh::ag
 
 ```
 STATUS=OK REASON=cargo-check-passed         (rust)
-STATUS=SKIPPED-NO-DIFF REASON=ts-no-diff    (ts)
+STATUS=OK REASON=tsc-passed                 (ts)
 STATUS=FAIL REASON=buf-build-failed         (proto, stage 1)
-→ aggregate_worst_status OK SKIPPED-NO-DIFF FAIL = FAIL
+→ aggregate_worst_status OK OK FAIL = FAIL
 → Layer 1 final STATUS=FAIL REASON=layer1-summary
 → exit code 1 (status_to_exit_code FAIL)
 ```
@@ -140,7 +140,7 @@ Budget targets (ADR-0033 §4): **90-second p95 wall-clock for the always-run sub
 
 ```
 WARN BUDGET_BREACH LAYER=<n> DURATION=<s> BUDGET=<s>           (per-layer; default budget 20s)
-WARN BUDGET_TOTAL_BREACH ALWAYS_RUN_DURATION=<s> BUDGET=90     (always-run subset, layers 3 + 6; ADR-0033 §4 budget)
+WARN BUDGET_TOTAL_BREACH GUARD_AUDIT_DURATION=<s> BUDGET=90    (guard+audit fast tier, layers 3 + 6; ADR-0033 §4 budget)
 ```
 
 `WARN BUDGET_*` is informational only — it does not change exit code. A breach is the signal to revisit budgets (ADR-0033 §4 budget target; §14 flake-rate budget for adjacent context) or investigate a regression.
@@ -240,9 +240,9 @@ This is the **runbook anchor**: every layer log carries one such line, so "what 
 
 Post-task-#42, `BASE_REF` in CI-PR mode is **`merge-base(origin/$GITHUB_BASE_REF, HEAD)`**, NOT base-branch tip. This narrows what every diff-aware guard sees — semantically asks "what did this PR add?" instead of "what is in main + this PR?". Operators or dashboards that previously assumed base-tip semantics will see scope narrowing. ADR-0033 §7 + `docs/devloop-outputs/2026-05-13-base-ref-unification-task42/main.md` §Security explain why this is correctness-preserving.
 
-### Diagnosing predicate-vs-resolver disagreement
+### Diagnosing what a layer's diff-aware gates saw
 
-The resolver writes `${DEVLOOP_TMP}/changed-files.layer-<n>` — the cache-write block in `_get_base_ref.sh::main`; per-language `lang/<X>/changed.sh` predicates read it via `_changed_helpers.sh::__changed_files` (which lazy-invokes the resolver if the cache is missing).
+The resolver writes `${DEVLOOP_TMP}/changed-files.layer-<n>` — the cache-write block in `_get_base_ref.sh::main`. The surviving diff-aware consumers read it via `_changed_helpers.sh::__changed_files` (which lazy-invokes the resolver if the cache is missing): the Layer-6 audit dep-manifest gate (`_audit_gate.sh`'s `diff_touches_glob`) and Layer-7's `infra/kind/` rebuild check. (The per-language `changed.sh` classifiers that used to read this cache were retired 2026-08-20 — ADR-0033 §2/§3.)
 
 To inspect what a layer actually saw:
 
@@ -250,14 +250,11 @@ To inspect what a layer actually saw:
 cat "${DEVLOOP_TMP:-/tmp/devloop}/changed-files.layer-<n>"
 ```
 
-To re-run the resolver and a single predicate hermetically:
+To re-populate the cache hermetically:
 
 ```bash
 DEVLOOP_LAYER=manual bash scripts/lang/_get_base_ref.sh >/dev/null     # populates cache + emits BASE_REF= line
-DEVLOOP_LAYER=manual bash scripts/lang/rust/changed.sh; echo "rc=$?"   # 0 = lang IS affected; 1 = lang is untouched
 ```
-
-(See §7 for the reversed-from-typical-shell exit-code convention on predicates.)
 
 ### Known cost concern (informational)
 
@@ -267,7 +264,7 @@ DEVLOOP_LAYER=manual bash scripts/lang/rust/changed.sh; echo "rc=$?"   # 0 = lan
 
 ## 6. Layer-by-Layer Failure Modes
 
-Each subsection covers one layer: what it runs, its always-run / skip-if-untouched character, common failure modes (each anchored at the emitting wrapper script + the REASON token), and the canonical fix vocabulary.
+Each subsection covers one layer: what it runs (every language, always-run since 2026-08-20), common failure modes (each anchored at the emitting wrapper script + the REASON token), and the canonical fix vocabulary.
 
 ### 6.1 Layer 1 — Compile (`scripts/layer1.sh`)
 
@@ -275,9 +272,9 @@ Two-stage compile (ADR-0033 §5):
 - **Stage 1**: proto-only via `scripts/build.sh` with `DEVLOOP_DISPATCH_INCLUDE_LANGS=proto` → `lang/proto/compile.sh` (`buf build proto`). Runs first so contract failures surface ahead of Rust/TS type-error cascades.
 - **Stage 2**: rust + ts via `DEVLOOP_DISPATCH_EXCLUDE_LANGS=proto` → `lang/rust/compile.sh` (`cargo check --workspace`) + `lang/ts/compile.sh` (`nx affected -t typecheck`).
 
-Both stages route through the dispatcher (`scripts/build.sh` → `_dispatch.sh::for_each_lang_with_verb "compile"`) so changed.sh short-circuit, STATUS aggregation, and missing-verb signalling apply uniformly.
+Both stages route through the dispatcher (`scripts/build.sh` → `_dispatch.sh::for_each_lang_with_verb "compile"`) so always-run dispatch, STATUS aggregation, and missing-verb signalling apply uniformly.
 
-**Skip-if-untouched**: rust, ts, proto (per ADR-0033 §3).
+**Always-run**: rust, ts, proto compile on every run (per ADR-0033 §3 — the skip-if-untouched short-circuit was retired 2026-08-20).
 
 **Common failures**:
 
@@ -289,15 +286,17 @@ Both stages route through the dispatcher (`scripts/build.sh` → `_dispatch.sh::
 | `nx-typecheck-failed` | `lang/ts/compile.sh` | `tsc --noEmit` error reported via `nx affected -t typecheck`. Run `pnpm exec nx affected -t typecheck --base=$(./scripts/lang/_get_base_ref.sh)` locally. |
 | `nx: command not found` | `lang/ts/compile.sh` (also Layer 2 / 4 / 5 TS wrappers) | Local-only failure mode — CI has `corepack` / `pnpm install` in setup. Fix: `pnpm install` from repo root (nx is a project-local dev dep, not a global tool). |
 
-**Worked example — proto fail + rust untouched + ts untouched**:
+**Worked example — proto stage-1 fail; rust + ts still compile (stage 2 always-runs)**:
 
 ```
 STATUS=FAIL REASON=buf-build-failed             (proto, stage 1; per-child stdout)
-STATUS=SKIPPED-NO-DIFF REASON=rust-no-diff      (stage 2, rust untouched)
-STATUS=SKIPPED-NO-DIFF REASON=ts-no-diff        (stage 2, ts untouched)
+STATUS=OK REASON=cargo-check-passed             (stage 2, rust — always-runs)
+STATUS=OK REASON=tsc-passed                     (stage 2, ts — always-runs)
 STATUS=FAIL REASON=layer1-summary               (aggregated stdout summary line)
 LAYER=1 ... RESULT=FAIL REASON=buf-build-failed (stderr anchor; worst-child cause)
 ```
+
+Stage 2 runs unconditionally even when stage 1 fails (proto-derived codegen may be stale, but rust/ts compile is still attempted so one run reports the full picture) — and since 2026-08-20 rust/ts compile always-run regardless of diff, so there is no `SKIPPED-NO-DIFF` case here any more.
 
 Two distinct final lines (task #50): the **stdout** `STATUS=` summary keeps the generic
 `REASON=layer<n>-summary` (downstream parsers read it for the enum only); the **stderr**
@@ -310,7 +309,7 @@ observability O2 (one run reveals the full picture; don't force a second invocat
 
 `scripts/fmt.sh` → `for_each_lang_with_verb "fmt"` → `lang/{rust,ts,proto}/fmt.sh`.
 
-**Skip-if-untouched**: rust, ts, proto.
+**Always-run**: rust, ts, proto — every language, every run (per ADR-0033 §3; the skip-if-untouched short-circuit was retired 2026-08-20).
 
 | REASON token | Wrapper | Cause / Fix |
 |--------------|---------|-------------|
@@ -321,20 +320,19 @@ observability O2 (one run reveals the full picture; don't force a second invocat
 
 ### 6.3 Layer 3 — Guards (always-run; `scripts/layer3.sh`)
 
-Three `run_and_emit` invocations:
+Key `run_and_emit` invocations:
 - `scripts/guards/run-guards.sh` — iterates every `scripts/guards/simple/**/*.sh` (excluding `fixtures/`). Each guard self-classifies per-file via path globs. Includes the Layer A scope-drift parser and Layer B classification-sanity guards (ADR-0024 cross-boundary), AND the always-run **audit-suppressions** guard (`scripts/guards/simple/audit-suppressions.sh` → `scripts/audit-suppressions-check.sh`, read-only) per task #47.
-- `scripts/lang/_test_changed_predicates.sh` — meta-test for each lang's `changed.sh` predicate. Hermetic — synthesizes a cache under `mktemp`, invokes each lang's predicate against fixture rows under `env -i`.
 - `scripts/audit-suppressions-check.test.sh` — self-test for the suppressions-check (drives its FAIL branches with fixtures; wired here because there is no `*.test.sh` auto-runner). Task #47.
+- plus the other wired self-tests (`_changed_helpers.test.sh`, `_audit_gate.test.sh`, `layer7.test.sh`, the subdomain/slug-class/disk guard self-tests, `layer-all.test.sh`, `run-story.test.sh`). (The former `_test_changed_predicates.sh` meta-test was removed 2026-08-20 with the `changed.sh` classifier — §2/§3 amendments.)
 
 Layer 3 also carries a **CI-sentinel-leak runtime assertion** (mirrored in `layer-all.sh`): if `GITHUB_ACTIONS` and `DEVLOOP_TEST` are both set, the layer hard-fails early — see `test-sentinel-set-in-ci` below.
 
-**Always-run**: yes — guards self-classify, predicate meta-test is hermetic. Layer 3 is one of the two layers (with Layer 6) inside the **90s p95 always-run wall-clock budget (ADR-0033 §4)** — a sustained `WARN BUDGET_TOTAL_BREACH` here is the operational signal to investigate.
+**Always-run**: yes — guards self-classify. Layer 3 is one of the two layers (with Layer 6) inside the **90s p95 guard+audit fast-tier wall-clock budget (ADR-0033 §4)** — a sustained `WARN BUDGET_TOTAL_BREACH` here is the operational signal to investigate.
 
 | REASON token | Origin | Cause / Fix |
 |--------------|--------|-------------|
 | `guards-failed` | `scripts/guards/run-guards.sh` (via `run_and_emit`) | A specific guard tripped. The runner prints `FAILED: <guard-name>` + grep-extracted violation lines (`VIOLATION|violation|ERROR|error`). Jump to that guard's source under `scripts/guards/simple/`. |
 | `guards-failed` + `FAILED: no-retained-credentials` | `crates/dt-guard/src/ts_retained_credentials.rs` (task #58) | A **retained** client type carries a credential field. `VIOLATION:` lines name the file/line, the rule id (`ts-no-retained-credentials::auth_state_password_with_token` = credential + session token on the same retained type; `::retained_credential_binding` = credential alone), and the type. **Fix: remove the field, or stop retaining the type.** <br>**There is no in-code bypass** — no `guard:ignore` marker is honored, deliberately: a suppression on a credential-retention guard gets applied by whoever is inconvenienced, at the moment of inconvenience, with no security review. If the **guard itself** is wrong, revert the guard commit — it is a separate commit by design and ordered after the client fix precisely so this works (see §Rollback in the task-#58 devloop output). <br>**This guard is FULL-TREE and always-run, so it can fail your devloop for a violation your diff did not introduce.** That is intended: it is a standing invariant, not a diff lint. Do not go hunting your own change for the cause — read the file:line in the VIOLATION line. <br>**If it TIMES OUT** (`guard-timeout-no-retained-credentials`): suspect a **cyclic type alias** in `packages/**` before suspecting scan volume. The declaration closure is cycle-guarded, but a hang presents as a performance problem and sends triage to the wrong place. Measured runtime is ~9ms over 62 files. <br>**A `WARN` from THIS guard is a coverage gap, not an IO skip.** §6.3.1 describes dt-guard WARN lines as a corrupted catalog/dashboard the kernel skipped; `ts-no-retained-credentials` uses the channel differently — `declaration block exceeded line cap` means fields beyond `MAX_DECL_BLOCK_LINES` were never scanned, so the guard may be under-matching on that declaration while still reporting `STATUS=OK`. A clean run must be a WARN-free run. If one appears, either the cap needs raising or a declaration has grown pathological — do not ignore it because the layer passed. <br>**Maintenance**: the guard's zero-false-positive claim is *measured across the current tree*, NOT true by construction. Re-measure against the real tree whenever the credential/token vocabulary, the retention-idiom set, or the alias closure changes — any of those moves the false-positive surface without this guard's code changing, and the breakage lands on whoever's devloop is next. |
-| `predicate-meta-test-failed` | `scripts/lang/_test_changed_predicates.sh` | A `lang/<X>/changed.sh` predicate disagrees with its fixture row. Output prints `[<lang>] path=… expected_rc=… actual_rc=… rationale: …  see: scripts/lang/<lang>/changed.sh`. Fix by correcting the predicate OR amending the fixture (with rationale). See §7 for drift-detection workflow. |
 | `suppression-past-due` | `scripts/audit-suppressions-check.sh` (Layer-3 guard) | A suppression in `audit-suppressions.toml` is past its `expires`. **This red is INTENTIONAL** — CI goes red on the expiry day by design, not an outage/flake. Output names each past-due id + its days-past. **Action is NOT bypass:** renew the `expires` after re-verifying the justification (e.g. `cargo tree -p rsa --invert` for RUSTSEC-2023-0071), OR fix the advisory. Renewal procedure: `docs/contributor/audit-suppressions.md`. (Red-on-expiry is the FIRST signal — no warn-ahead window — so renew proactively per the contributor-doc cadence.) |
 | `suppression-drift` | `scripts/audit-suppressions-check.sh` (sync-check) | The generated derived files (`.cargo/audit.toml` / `.pnpm-audit-ignore.json`) drifted from `audit-suppressions.toml` (hand-edited derived file, or a forgotten `--fix`). Fix: `scripts/audit-suppressions-check.sh --fix`, then commit BOTH the manifest and the regenerated derived files. |
 | `suppression-malformed` | `scripts/audit-suppressions-check.sh` (parser) | The manifest (or a derived file) is present but unparseable — missing required field, bad `expires`, duplicate id, etc. The `MALFORMED:` lines name the offending line/field. Fix the manifest; never degrade a malformed entry into "0 suppressions". |
@@ -361,7 +359,7 @@ Most of the simple guards — the eight listed here (cite-no-line-numbers / cite
 1. **Stale or missing binary** — `STATUS=FAIL REASON=dt-guard-binary-missing`. The wrapper exits 1 before invoking any subcommand because `target/release/dt-guard` is not present (or not `-x`).
     - **Diagnostic**: `ls -la target/release/dt-guard`.
     - **Resolution**: `cargo build --release -p dt-guard -p dt-story`. The wrapper produces no `VIOLATION:` lines because the policy kernel never runs.
-    - **Do NOT rely on re-running `scripts/layer1.sh` here** (this file said to, until 2026-08-13). Layer 1 builds both binaries inside the *skip-gated* rust compile verb, which does not run when the diff touches no `crates/` or root `Cargo.*`/`rust-toolchain.toml` path — i.e. it is skipped in precisely the situation that produces this failure. Re-running Layer 1 works only when your diff already touches Rust, which is the case that never had the problem. See §8's two guard-binary rows for the producer/consumer skew, and `docs/TODO.md` §Polyglot Pipeline Follow-ups for the structural fix.
+    - **Re-running `scripts/layer1.sh` now rebuilds both binaries** — since 2026-08-20 the rust compile verb is **always-run** (the skip-if-untouched short-circuit was retired, ADR-0033 §3), so `lang/rust/compile.sh`'s `cargo build --release -p dt-guard -p dt-story` steps run on every devloop regardless of what the diff touches. The former producer/consumer skew (compile skip-gated on non-Rust diffs while the guards consume the binary always-run) is **CLOSED** by this change — a plain `packages/**`-only or docs-only devloop now builds both binaries. If the binary is still missing after a full Layer-1 run, that is a genuine build failure (or a fresh checkout that never ran Layer 1), not a skip-skew.
 
 2. **Subcommand not found** — clap exits non-zero with its own diagnostic on stderr (typically `error: unrecognized subcommand <foo>`). `STATUS=` may surface as `clap-error` or omit entirely depending on which subcommand the wrapper invoked; the canonical signal is the clap-formatted stderr line.
     - **Diagnostic**: `dt-guard --help` to list registered subcommands.
@@ -378,7 +376,7 @@ dt-guard also emits `WARN dt-guard auxiliary skip: <path> (<error-kind>)` to std
 
 `scripts/test.sh` → `for_each_lang_with_verb "test"` → `lang/rust/test.sh` + `lang/ts/test.sh`. Proto has no real test phase — its placeholder `lang/proto/test.sh` emits `STATUS=N/A REASON=not-applicable-to-this-lang` (informative, expected) when proto is touched.
 
-**Skip-if-untouched**: rust, ts. Proto is naturally skipped via verb-discovery.
+**Always-run**: rust, ts — every run (per ADR-0033 §3; skip-if-untouched retired 2026-08-20). Proto is N/A via verb-discovery (no `test.sh`).
 
 | REASON token | Wrapper | Cause / Fix |
 |--------------|---------|-------------|
@@ -392,7 +390,7 @@ dt-guard also emits `WARN dt-guard auxiliary skip: <path> (<error-kind>)` to std
 
 `scripts/lint.sh` → `for_each_lang_with_verb "lint"` → `lang/{rust,ts,proto}/lint.sh`.
 
-**Skip-if-untouched**: rust, ts, proto.
+**Always-run**: rust, ts, proto — every language, every run (per ADR-0033 §3; the skip-if-untouched short-circuit was retired 2026-08-20).
 
 | REASON token | Wrapper | Cause / Fix |
 |--------------|---------|-------------|
@@ -409,7 +407,7 @@ dt-guard also emits `WARN dt-guard auxiliary skip: <path> (<error-kind>)` to std
 
 The orchestrator returns the **worst of `(dispatch_rc, breaking_rc)`** — `set -e` short-circuit would mask the second invocation and silently break the always-run guarantee; the explicit RC capture block in `scripts/audit.sh` (no enclosing function; flat script) preserves both gates.
 
-**DEP-CHANGE-GATED as of task #47 (ADR-0033 §3 amendment).** `DEVLOOP_DISPATCH_ALWAYS_RUN=1` is RETAINED so the dispatcher still invokes each `audit.sh` wrapper unconditionally — but the wrapper now runs a fail-closed dep-manifest gate internally. When no dependency manifest changed, the wrapper emits `STATUS=SKIPPED-NO-DIFF REASON=no-dep-changes` (expected, non-dominating) instead of scanning. The wrapper runs the scan on any doubt (indeterminate diff). When the scan runs and suppressed advisories are filtered, the wrapper emits a `SUPPRESSED=<ids>` stderr line (the configured suppression set in effect this run). `buf breaking` remains always-run. The always-run audit GUARANTEE moved to the Layer-3 `audit-suppressions-check` guard (§6.3) + the **weekly scheduled full scan** (below).
+**DEP-CHANGE-GATED as of task #47 (ADR-0033 §3 amendment).** The dispatcher invokes each `audit.sh` wrapper unconditionally — since 2026-08-20 that is simply the dispatcher's default (the `DEVLOOP_DISPATCH_ALWAYS_RUN` opt-in was removed when the per-language changed.sh short-circuit was retired) — but the wrapper then runs a fail-closed dep-manifest gate internally. When no dependency manifest changed, the wrapper emits `STATUS=SKIPPED-NO-DIFF REASON=no-dep-changes` (expected, non-dominating) instead of scanning. The wrapper runs the scan on any doubt (indeterminate diff). When the scan runs and suppressed advisories are filtered, the wrapper emits a `SUPPRESSED=<ids>` stderr line (the configured suppression set in effect this run). `buf breaking` remains always-run. The always-run audit GUARANTEE moved to the Layer-3 `audit-suppressions-check` guard (§6.3) + the **weekly scheduled full scan** (below).
 
 **RUN vs SKIP boundary (narrowed 2026-08-05 — the gate matches ONLY true dep manifests).** On-call reading a `SKIPPED-NO-DIFF REASON=no-dep-changes`: this is EXPECTED whenever the diff touches no dependency manifest — including source-only edits under `crates/**`/`packages/**` (e.g. `crates/*/src/*.rs`, `packages/*/src/*.ts`). Such a source edit provably cannot move the resolved dependency graph, so the ambient scan is skipped. The gate RUNS on: root `Cargo.toml`/`Cargo.lock` or `crates/*/Cargo.toml` (rust); root `package.json`/`pnpm-lock.yaml`/`pnpm-workspace.yaml` or `packages/*/package.json` (ts); ANY indeterminate diff (fail-closed). Prior to this narrowing a source-only edit RAN the scan (a fail-safe over-trigger) and could red on an advisory unrelated to the diff — that over-trigger is intentionally removed. **Residual an operator must know:** a dep-changing devloop still gets a FULL-TREE scan and CAN still red on an ambient advisory unrelated to the specific dep it changed (the scan is whole-lockfile, not attributed to the changed line). Triage that exactly like any Layer-6 advisory — fix-the-dep or suppress in `audit-suppressions.toml` (security-owned, §11); the narrowing does not change the suppression escape hatch. The **weekly scheduled scan** (below) remains the net for the diff-less vector (a new advisory against an UNCHANGED lockfile), which the per-PR gate deliberately skips.
 
@@ -474,7 +472,7 @@ anchor names the worst-child cause (`buf-breaking-failed`), not `layer6-summary`
 
 **Always-run** (ADR-0033 §3): Layer 7 attempts the `crates/env-tests` suite against the live Kind cluster on every devloop — business-logic changes break integration even with no infra/proto diff. The ONLY suppressor is the absence of a cluster to run against (a clean skip, never a failure). Cluster lifecycle is the host-side helper (`infra/devloop/dev-cluster`, ADR-0030).
 
-**Two Phase-2 suites since task #19 (R-48), sequential, same cluster, shared single-attempt budget**: (1) the Rust env-tests (always attempted); (2) the browser E2E (`pnpm --filter @darktower/web-app test:e2e`, the task-#18 Playwright harness) — **diff-triggered**: it runs only when the diff touches `packages/**`/TS root manifests (via `lang/ts/changed.sh`) or a path in the trigger list evaluated by `scripts/layer7.sh::__browser_e2e_triggered` (the `__BROWSER_E2E_TRIGGER_PATHS` array that function iterates: `proto/` + the browser-observable backend crates; fail-toward-RUN, and the array is the ONE encoding — the skip note lists the same array, never a hand-written copy). Trigger semantics: untriggered → explicit `STATUS=SKIPPED-NO-DIFF REASON=browser-e2e-no-diff` child line (ranks below OK — a green Rust suite still aggregates OK); env-tests FAIL first → browser suite NOT run that attempt (greppable stderr `browser-e2e-not-run:` note, deliberately NO browser STATUS line — the layer is already FAIL; the browser suite runs on the retry). Browser-suite preconditions (dev-cert fingerprints, Playwright Chromium) are Phase-1(g) checks — operator lane, surfaced BEFORE either suite so they can never masquerade as spec-timeout FAILs. Each suite has its own wall clock (`DEVLOOP_ENV_TEST_TIMEOUT` / `DEVLOOP_BROWSER_E2E_TIMEOUT`, both default 600s).
+**Two Phase-2 suites since task #19 (R-48), sequential, same cluster, shared single-attempt budget**: (1) the Rust env-tests (always attempted); (2) the browser E2E (`pnpm --filter @darktower/web-app test:e2e`, the task-#18 Playwright harness) — **also always runs** whenever Layer 7 runs (the diff-trigger `__browser_e2e_triggered` / `__BROWSER_E2E_TRIGGER_PATHS` was retired 2026-08-20; gate coverage is independent of change-detection, so there is no longer a "no diff" case for the browser suite and the `browser-e2e-no-diff` lane is gone). One remaining conditional: env-tests FAIL first → browser suite NOT run that attempt (greppable stderr `browser-e2e-not-run:` note, deliberately NO browser STATUS line — the layer is already FAIL; the browser suite runs on the retry). Browser-suite preconditions (dev-cert fingerprints, Playwright Chromium) are Phase-1(g) checks — operator lane, now run UNCONDITIONALLY on every Layer-7 (a backend-only diff on a workstation lacking dev-certs/Chromium reds here — intended), surfaced BEFORE either suite so they can never masquerade as spec-timeout FAILs. Each suite has its own wall clock (`DEVLOOP_ENV_TEST_TIMEOUT` / `DEVLOOP_BROWSER_E2E_TIMEOUT`, both default 600s). **Operational note**: because Layer 7 now runs on every run-story task, a single missing browser precondition stalls the WHOLE story (operator lane), not just a subset — oncall tracing a stalled story should check for one missing cert/binary, not a task-specific fault. **Known-accepted (do not chase)**: on a branch that touches `infra/kind/`, the Phase-1b cluster rebuild (`diff_touches_path "infra/kind/"` → teardown + setup — the one skip decision deliberately kept) now fires on **every** run-story task rather than once, because it reads the whole-branch diff and Layer 7 now runs every task. This is accepted, not a fault to chase (ADR-0035 §3); it costs rebuild time per task on such branches but keeps each task's cluster current.
 
 **Two-phase classifier (the suite-output log-grep is RETIRED — task #56).** Phase 1 (pre-suite: cluster readiness/setup, `infra/kind/` rebuild, `rebuild-all`, ports.json/URLs, post-rebuild health, observability-stack readiness, per-run-organization provisioning + verification) is the ONLY infra lane. Phase 2 runs the suite on a confirmed-healthy cluster, and **any** non-zero is a test FAIL — we do NOT grep the suite output for `connection refused` etc. (that would let a real test failure whose output contains an infra phrase escape silently as infra — the reverse of the very masking this layer exists to kill). Load-bearing asymmetry: when uncertain, FAIL/loud, never infra/swallow.
 
@@ -499,7 +497,6 @@ anchor names the worst-child cause (`buf-breaking-failed`), not `layer6-summary`
 | `PRECONDITION_FAILURE` / `ac-auth-bypass-signature` | Phase 1h — the org-resolution probe returned a **2xx**: AC issued a SUCCESS for an account that cannot exist | 2 | **OPERATOR lane, but this is a SECURITY finding, not an environment one — and it is the one Phase-1h lane where re-running is the wrong action.** The probe POSTs `layer7-provision-probe@invalid.test`, an address nothing ever registers, precisely so that the only correct answers are 401 (org resolved, credentials rejected) and 404 (org not resolved). A 2xx means AC accepted credentials for a non-existent user — an authentication-bypass signature in the user-token path. **Do not re-run** (a second green run buries it) and **do not raise any timeout** (nothing here is a latency problem). Note the org-resolution question also went unanswered, so the per-run organization is unverified as well. **Capture the evidence before anything is redeployed or torn down**: re-issue the probe with `curl -i` (the full invocation is in the emitted `Fix:` line, with the run's own Host header substituted), then `kubectl -n dark-tower logs -l app=ac-service --tail=200`. Escalate to the auth-controller and security owners. **Why this is not folded into `ac-unreachable`:** that token asserts "AC could not be asked", which a prompt 2xx falsifies outright — filing a bypass signature under a name meaning "the service was unreachable" is the same misattribution class R-7 exists to remove, and it would inherit that row's "re-running is reasonable" guidance. **Why it is not dead-lane drift** (cf. the 429 note above): unlike 429, a 2xx here is not unreachable by inspection — it is the signature of a regression in AC's auth path. |
 | `PRECONDITION_FAILURE` / `org-provision-unverified` | Phase 1h — AC healthy and ANSWERED, but the org-resolution probe returned **404** | 2 | **OPERATOR lane, and NOT a flake — re-running will not change it.** 404 is the *only* status that evidences a provisioning fault, which is why this token now fires on it alone: provisioning reported success but AC will not resolve the org. A token request with `Host: <run-org>.<ac-authority>` returns 401 when the org resolves (credentials rejected) and 404 when AC's `org_extraction` falls through `get_by_subdomain`'s `WHERE subdomain = $1 AND is_active = true` — i.e. the row is missing or inactive. Every other non-401 status routes away from this token — 2xx to `ac-auth-bypass-signature`, everything else to `ac-unreachable` — because this row's "re-running will not change it" claim is only true for a genuine resolution answer; asserting it for a transport failure sent operators to inspect a row that was fine. Inspect it directly: `kubectl -n dark-tower exec postgres-0 -c postgres -- psql -U darktower -d dark_tower -c "SELECT subdomain, is_active FROM organizations WHERE subdomain = '<run-org>'"` (the subdomain is on the `Layer7: provisioning per-run organization subdomain=…` line in `${DEVLOOP_TMP:-/tmp/devloop}/layer-7.stderr.log`; the `org_id` is on the relayed `PROVISIONED_ORG` line in the same file). |
 | `OK` / `browser-e2e-passed` | Phase 2 browser lane (task #19), suite exit 0 | 0 | Browser E2E green (only emitted when the diff triggered the lane). |
-| `SKIPPED-NO-DIFF` / `browser-e2e-no-diff` | Phase 2 browser lane — diff touches none of the trigger surfaces | 0 | Expected on backend-only diffs outside the browser-observable crates (and docs-only diffs). The stderr note lists the trigger paths. Ranks below OK — never blocks. |
 | `FAIL` / `browser-e2e-failed` | Phase 2 browser lane, suite non-zero | 1 | **IMPLEMENTER lane.** A browser-spec regression on a confirmed-healthy cluster. Suite output: `${DEVLOOP_TMP:-/tmp/devloop}/layer-7-browser-e2e.log`; Playwright traces/screenshots: `packages/web-app/test-results/` — retained on failure, **outside** `DEVLOOP_TMP`'s per-run cleanup, gitignored, **can contain live tokens** (traces record request/response bodies) — local-only, treat as sensitive. Consumes the shared Layer-7 attempt. |
 | `PRECONDITION_FAILURE` / `dev-certs-missing` | Phase 1g — fingerprints JSON missing `MC_CERT_SHA256`/`MH_CERT_SHA256` | 2 | OPERATOR lane. Without both pinned hashes the browser refuses the MC/MH self-signed certs (`serverCertificateHashes`) and every join spec could only time out. Run `scripts/generate-dev-certs.sh` on the host; restart any running Vite dev server (fingerprints are read at Vite config time). |
 | `PRECONDITION_FAILURE` / `playwright-browser-missing` | Phase 1g — no Chromium under `PLAYWRIGHT_BROWSERS_PATH` (default `/opt/ms-playwright`) | 2 | OPERATOR lane. `pnpm exec playwright install chromium` (the devloop image is expected to bake it — see `infra/devloop/Dockerfile`). |
@@ -551,17 +548,12 @@ When `lang/<X>/<verb>.sh` is absent, the outcome is one of three DISTINCT enums 
    `EXCLUDE_LANGS` cleared the whole set (operator intent). REASON = `all-langs-filtered`. This is
    now the ONLY producer of `SKIPPED-NO-VERB`.
 
-### `STATUS=SKIPPED-NO-DIFF` — diagnosing predicate output
+### `STATUS=SKIPPED-NO-DIFF` — diagnosing the audit dep-gate
 
-`_dispatch.sh::for_each_lang_with_verb` emits this — the `SKIPPED-NO-DIFF` branch inside that function — when `lang/<X>/changed.sh` returned exit code 1 (lang untouched). Three-step triage:
+Since 2026-08-20 the **only** producer of `SKIPPED-NO-DIFF` is the Layer-6 audit dep-manifest gate (`lang/{rust,ts}/audit.sh` → `no-dep-changes`, and the dispatcher's aggregate `all-langs-skipped`). The language-level `<lang>-no-diff` short-circuit was retired with the `changed.sh` classifier (§2/§3 amendments), so a language layer never emits this any more. Two-step triage for a `no-dep-changes`:
 
 1. **Read the `BASE_REF=` line** in the same layer's stderr log. Was the diff what you expected?
-2. **Inspect the cache**: `cat "${DEVLOOP_TMP:-/tmp/devloop}/changed-files.layer-<n>"`. Is the file you cared about listed?
-3. **Re-run the predicate manually** (hermetically):
-   ```bash
-   DEVLOOP_LAYER=manual bash scripts/lang/<X>/changed.sh; echo "rc=$?"
-   ```
-   **Predicate exit-code convention (reversed from typical shell)**: `rc=0` means *"this lang IS affected"* (the diff touches it); `rc=1` means *"this lang is provably untouched"*. This inversion matches the dispatcher's `if ! changed.sh; then SKIPPED-NO-DIFF` semantics but is easy to misread at 3am — explicit callout.
+2. **Inspect the cache**: `cat "${DEVLOOP_TMP:-/tmp/devloop}/changed-files.layer-<n>"`. Is the dependency manifest you cared about (`Cargo.toml`/`Cargo.lock`/`crates/*/Cargo.toml`; `package.json`/`pnpm-lock.yaml`/`pnpm-workspace.yaml`/`packages/*/package.json`) listed? If it is and the gate still skipped, that is a `_audit_gate.sh:diff_touches_glob` bug (§6.6 audit gate). If it isn't, the skip is correct — a diff touching no dependency manifest cannot move the resolved dependency graph.
 
 ### `STATUS=N/A` — documented gap vs. wrapper bug
 
@@ -571,29 +563,14 @@ Unexpected `N/A` outside the documented placeholders is a wrapper bug — escala
 
 ### `_changed_helpers.sh` debugging
 
-Predicates use two helpers (`scripts/lang/_changed_helpers.sh`):
-- **`diff_touches_path <prefix>`** (lines 52-55): awk + fixed-string `index($0, p) == 1`. Matches files whose path *starts with* `<prefix>`. Fixed-string by design — a future `c++` or `c#` lang dir would silently regex-match wrong files under naive `grep "^prefix"`.
-- **`diff_touches_root_files <file…>`** (lines 63-71): `grep -qxF` (fixed-string, exact-line). Matches root-level files exactly by name.
+The surviving diff-aware consumers — the Layer-6 audit dep-manifest gate (`_audit_gate.sh`) and Layer-7's `infra/kind/` rebuild check — compose these helpers (`scripts/lang/_changed_helpers.sh`); its self-test is `_changed_helpers.test.sh` (Layer 3):
+- **`diff_touches_path <prefix>`** (lines 52-55): awk + fixed-string `index($0, p) == 1`. Matches files whose path *starts with* `<prefix>`. Fixed-string by design — a future `c++` or `c#` path would silently regex-match wrong files under naive `grep "^prefix"`.
+- **`diff_touches_glob <glob>`** / **`diff_touches_root_files <file…>`**: anchored glob / `grep -qxF` (fixed-string, exact-line) — the audit dep-manifest gate's predicates.
 
-When a predicate misfires:
-1. Inspect the predicate source (`scripts/lang/<X>/changed.sh`) — most are 3-5 lines.
-2. Inspect `_changed_helpers.sh` to confirm helper semantics.
-3. Re-run the predicate manually with `DEVLOOP_LAYER=manual` (see above). Same hermetic shape, real cache.
-4. If the predicate reads the wrong cache, `DEVLOOP_LAYER` is not exported — a layer-script bug (the layer-skeleton ought to export `DEVLOOP_LAYER` via `_common.sh::layer_lifecycle_begin`).
-
-### `_test_changed_predicates.sh` drift detection
-
-Runs every devloop in Layer 3 alongside the simple guards. Hermetic — `mktemp` cache, `env -i` invocation. Failure mode (`_test_changed_predicates.sh::__assert_predicate`):
-
-```
-[<lang>] path=<fixture-row> expected_rc=<0|1> actual_rc=<0|1>
-  rationale: <fixture rationale>
-  see: scripts/lang/<lang>/changed.sh
-```
-
-Reversed-from-shell exit-code convention (per above): `expected_rc=0` means the fixture asserts the lang IS affected by the path; `expected_rc=1` means the fixture asserts the lang is provably untouched. A mismatch means either (a) the predicate is broken — fix `scripts/lang/<lang>/changed.sh`, or (b) the fixture row is stale — amend the fixture (with rationale). When in doubt, prefer correcting the predicate; the fixture was written down for a reason.
-
-**Adding a new language** triggers a `predicate-meta-test-failed` until the meta-test gains rows for the new lang. The fix is mechanical: add fixture rows under §"Wave N — \<Lang\> predicate fixtures" in `_test_changed_predicates.sh`, mirroring the existing Rust and Proto sections.
+When a consumer misfires:
+1. Inspect the consumer (`_audit_gate.sh` for the audit gate; `layer7.sh` Phase-1b for the infra/kind check).
+2. Inspect `_changed_helpers.sh` to confirm helper semantics; re-populate the cache with `DEVLOOP_LAYER=manual bash scripts/lang/_get_base_ref.sh` and re-check against it.
+3. If the consumer reads the wrong cache, `DEVLOOP_LAYER` is not exported — a layer-script bug (the layer-skeleton ought to export `DEVLOOP_LAYER` via `_common.sh::layer_lifecycle_begin`).
 
 ---
 
@@ -619,10 +596,7 @@ Grep-driven entry point. Match the symptom, jump to the section.
 | `STATUS=FAIL REASON=browser-e2e-failed` | Browser E2E spec regression (implementer lane; consumes the shared Layer-7 attempt). Log: `layer-7-browser-e2e.log`; Playwright traces in `packages/web-app/test-results/` (outside `DEVLOOP_TMP` cleanup, can contain live tokens — local-only). | §6.7 |
 | `browser-e2e-not-run:` (stderr) | Env-tests failed first — the browser suite was deliberately skipped this attempt (shared single-attempt budget), NOT a browser problem. Fix the env-test failures; browser suite runs on the retry. | §6.7 |
 | `STATUS=PRECONDITION_FAILURE REASON=dev-certs-missing` / `playwright-browser-missing` | Layer 7 Phase-1g browser-suite precondition — **OPERATOR lane (exit 2)**. Missing WebTransport cert fingerprints (`scripts/generate-dev-certs.sh`) or missing Playwright Chromium (`pnpm exec playwright install chromium`). | §6.7 |
-| `STATUS=SKIPPED-NO-DIFF REASON=browser-e2e-no-diff` | Expected — the diff touches none of the browser-E2E trigger surfaces (the stderr note lists them). Ranks below OK; never blocks. | §6.7 |
-| `predicate-meta-test-failed` | Lang predicate vs fixture drift | §6.3 + §7 |
-| `predicate-meta-test-failed` after adding a new lang | Missing fixture row in `_test_changed_predicates.sh` | §7 |
-| Layer 1 fails on a docs-only PR | `lang/<X>/changed.sh` over-classification (e.g. `crates/foo/README.md` → rust per ADR-0033 §3 trade-off); cargo check is cheap. | §6.1 |
+| Layer 1 runs `cargo check`/`tsc` on a docs-only PR | Expected since 2026-08-20 — every language layer always-runs (ADR-0033 §3); `cargo check` is cheap. (Formerly framed as `changed.sh` over-classification; there is no longer any per-lang classification.) | §6.1 |
 | Layer 1 fails locally with `nx: command not found` | Local-only failure — CI has corepack/pnpm install in setup. | §6.1 (run `pnpm install`) |
 | Layer 4 fails with `Neither podman nor docker found` | Missing container runtime — `lang/rust/test.sh` bring-up. | §6.4 |
 | Layer 6 fails on every CI run, local clean | Likely CI base-ref shift (post-#42) — check `BASE_SOURCE=ci-pr` `BASE_REF=` is merge-base, not main tip. | §5 (CI-PR scope shift) |
@@ -634,8 +608,8 @@ Grep-driven entry point. Match the symptom, jump to the section.
 | Layer 3 `suppression-override-without-test-sentinel` | A test-injection override env set without `DEVLOOP_TEST=1` — tamper/misconfig; investigate, do NOT unset-and-rerun. | §6.3 |
 | `test-sentinel-set-in-ci` (layer-all / layer3) | `DEVLOOP_TEST` leaked into a CI job — pipeline-integrity incident; find + remove what exported it. | §6.3 |
 | `layer-script-dir-set-in-ci` (assert_no_ci_sentinel_leak) | `LAYER_SCRIPT_DIR` (a local-only orchestrator test seam) leaked into CI — could forge the Gate-2 verdict; find + remove what exported it. | §6.3 |
-| Layer 3 `STATUS=FAIL REASON=dt-guard-binary-missing` (any `guards/simple/**` wrapper) | `target/release/dt-guard` absent. **Producer/consumer skew, not a code defect**: the binary is built by `lang/rust/compile.sh's cargo build step` inside the *skip-gated* compile verb (`lang/rust/changed.sh` triggers only on `crates/` + root `Cargo.*`/`rust-toolchain.toml`), but ~15 Layer-3 guards consume it *always-run*. So a diff touching only `packages/**` or docs skips the build and reds Layer 3. Fix: `cargo build --release -p dt-guard -p dt-story`. **Note the lane**: the wrapper exits **1** (implementer), so under `run-story.sh` this wiring fault is recorded against the task — see the caveat below the table. | §6.3 |
-| Layer 3 `dt-story not built but manifests exist` (`validate-story-manifest.sh`) | Same skew, same cause, same fix — `target/release/dt-story` is built by the same skip-gated verb and consumed by an always-run guard (and, since the story-runner hardening devloop, by `scripts/workflow/run-story.test.sh`). `scripts/workflow/preflight-story.sh` asserts both binaries at story start, so a `run-story` invocation refuses on the operator lane instead of discovering this at a task's gate. CI is covered by `ci.yml`'s unconditional build step; **a plain local devloop is not**. | §6.3 |
+| Layer 3 `STATUS=FAIL REASON=dt-guard-binary-missing` (any `guards/simple/**` wrapper) | `target/release/dt-guard` absent. The former producer/consumer skew (built by `lang/rust/compile.sh` inside a *skip-gated* compile verb, consumed always-run by ~15 guards) is **CLOSED since 2026-08-20**: the compile verb is now always-run (ADR-0033 §3), so both binaries build on every devloop, including `packages/**`-only and docs-only diffs. If this still fires, it is a genuine build failure or a fresh checkout — Fix: `cargo build --release -p dt-guard -p dt-story`, or just re-run Layer 1. **Note the lane**: the wrapper exits **1** (implementer). | §6.3 |
+| Layer 3 `dt-story not built but manifests exist` (`validate-story-manifest.sh`) | Same story — `target/release/dt-story` is built by the same now-always-run compile verb and consumed by an always-run guard (and by `scripts/workflow/run-story.test.sh`). The skip-skew is closed. `scripts/workflow/preflight-story.sh` still asserts both binaries at story start (operator lane) as belt-and-braces. | §6.3 |
 | Two `STATUS=` lines for one Layer-3 child (e.g. `PRECONDITION_FAILURE REASON=<child-token>` **and** `FAIL REASON=<child>-failed`) | **Expected, not a bug — read the ladder, not the last line.** `run_and_emit` (`lang/_common.sh`) appends its own `STATUS=FAIL <prefix>-failed` whenever a child exits non-zero, *in addition to* any `STATUS=` line the child printed itself. `tee_collect_statuses` collects **both** and `aggregate_worst_status` resolves worst-wins, so a child's `PRECONDITION_FAILURE` (rank 6) beats the appended `FAIL` (rank 5) and the layer's verdict is the operator lane. The child's own REASON token names the real cause; the `-failed` one is just "a child exited non-zero". A child that prints **no** STATUS line of its own has only the appended `FAIL`, which is why a wiring fault from such a child reaches the implementer lane — see the caveat below. | §3 (ladder) + §6.3 |
 | Layer 3 `dependabot-ignore-present` | `.github/dependabot.yml` has a non-empty `ignore:` block — move suppressions to `audit-suppressions.toml`; Dependabot `ignore:` is not a suppression channel. | §6.3 |
 | Open `audit-drift` GitHub Issue / red `Scheduled Audit` run | Between-PR drift: a new advisory against an UNCHANGED lockfile, caught by the weekly scheduled scan. Triage like a Layer-6 advisory; the issue auto-closes when a later scheduled run is clean. | §6.6 |
@@ -644,7 +618,7 @@ Grep-driven entry point. Match the symptom, jump to the section.
 | Layer N missing `BASE_REF=` line entirely | Wrapper bug — resolver did not run | escalate |
 | Every pipeline emits dozens of `BASE_REF=` lines | Known cost concern (task #42 Tech Debt Pointer #2); cache + suppression-sentinel mitigation tracked, not yet implemented. | §5 (Known cost concern) |
 | `WARN BUDGET_BREACH LAYER=<n>` | A single layer exceeded its budget (default 20s) | §3 |
-| `WARN BUDGET_TOTAL_BREACH` | Always-run subset (layers 3 + 6) exceeded 90s p95 — ADR-0033 §4 budget. | §3 |
+| `WARN BUDGET_TOTAL_BREACH` | Guard+audit fast tier (layers 3 + 6) exceeded 90s p95 — ADR-0033 §4 budget. | §3 |
 | `❌ Gate-2: no validation verdict found` (at commit) | Devloop-completion commit but no verdict — pipeline never run this session. Run `./scripts/layer-all.sh`. | §8.5 |
 | `❌ Gate-2: verdict is FAIL` (at commit) | The recorded pipeline run did not pass — fix the failing layer(s) and re-run. | §8.5 |
 | `❌ Gate-2: ... signature mismatch` + `modified after validation: <path>` | A validated file changed after the run — re-stage + re-run. | §8.5 |
@@ -666,10 +640,12 @@ escalation** and anything else non-zero to the operator lane, so this failure is
 whatever task happened to be running. If a story escalates with `pipeline-red` and the gate log
 names either symptom above, the task is not the cause — rebuild the binaries and rerun.
 
-Tracked in `docs/TODO.md` under *Polyglot Pipeline Follow-ups*: the structural fix is to move
-guard-binary production out of the skip-gated compile verb onto an always-run path, which collapses
-the three current build/assert sites (`lang/rust/compile.sh`, `ci.yml`, `preflight-story.sh`) back
-to one, plus a `run_and_emit` enum that can carry `PRECONDITION_FAILURE`.
+Largely resolved as of 2026-08-20: the compile verb is now **always-run** (ADR-0033 §3 — the
+skip-if-untouched short-circuit was retired), so guard-binary production already sits on an
+always-run path and the skip-skew that produced these symptoms is gone. What remains as a possible
+`docs/TODO.md` follow-up is only the cosmetic consolidation of the three build/assert sites
+(`lang/rust/compile.sh`, `ci.yml`, `preflight-story.sh`) into one plus a `run_and_emit` enum that
+can carry `PRECONDITION_FAILURE` — no longer a correctness fix.
 
 ---
 
@@ -760,7 +736,7 @@ reproduce a hook-logic regression without touching your real index:
 
 ### Related documentation
 
-- **ADR-0033** (`docs/decisions/adr-0033-polyglot-validation-pipeline.md`) — canonical design spec for the polyglot pipeline. §3 always-run / skip-if-untouched matrix + classifying principle; §4 layer-script contract; §6 wrapper contract + STATUS enum; §7 base-ref resolution.
+- **ADR-0033** (`docs/decisions/adr-0033-polyglot-validation-pipeline.md`) — canonical design spec for the polyglot pipeline. §2/§3 always-run policy + the retired-changed.sh amendments; §4 layer-script contract; §6 wrapper contract + STATUS enum; §7 base-ref resolution.
 - **ADR-0030** (`docs/decisions/adr-0030-*.md`) — host-side cluster helper, Layer 7 contract (renumbered from Layer 8).
 - **`.claude/skills/devloop/SKILL.md`** — devloop workflow. Step 6 (Gate 2 — Validation) is the entry point; pointer back to this runbook lands there.
 - **`docs/devloop-outputs/2026-05-12-skill-step6-rewrite-task38/main.md`** — task #38 (Layer 8→7 renumber + SKILL.md Step 6 rewrite).

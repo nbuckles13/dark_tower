@@ -962,7 +962,6 @@ tasks:
 - id: 16
   status: completed
   specialist: observability
-  env_tests: true
   deps:
   - 5
   - 10
@@ -1001,7 +1000,6 @@ tasks:
 - id: 18
   status: completed
   specialist: test
-  env_tests: true
   deps:
   - 3
   - 4
@@ -1046,7 +1044,6 @@ tasks:
 - id: 19
   status: completed
   specialist: test
-  env_tests: true
   deps:
   - 18
   prompt: |
@@ -1080,7 +1077,6 @@ tasks:
 - id: 21
   status: completed
   specialist: operations
-  env_tests: false
   deps:
   - 5
   - 10
@@ -1116,7 +1112,6 @@ tasks:
 - id: 22
   status: completed
   specialist: infrastructure
-  env_tests: true
   deps:
   - 3
   - 17
@@ -1206,7 +1201,6 @@ tasks:
 - id: 53
   status: completed
   specialist: operations
-  env_tests: false
   prompt: |
     Tracking-table reconciliation task — almost certainly a no-op. Story row #53
     (a devloop process change to catch Gate-3 narrow-scope rationalization via an
@@ -1239,7 +1233,6 @@ tasks:
 - id: 59
   status: completed
   specialist: security
-  env_tests: false
   deps:
   - 47
   prompt: |
@@ -1284,7 +1277,6 @@ tasks:
 - id: 60
   status: completed
   specialist: test
-  env_tests: true
   deps:
   - 18
   - 19
@@ -1335,7 +1327,6 @@ tasks:
 - id: 61
   status: completed
   specialist: infrastructure
-  env_tests: false
   prompt: |
     Toolchain-pin cleanup after the host dev-env failure of 2026-08-05: the
     vite 8 / rolldown 1.2.1 upgrade (commit 511d201) raised the Node engines
@@ -1377,7 +1368,6 @@ tasks:
 - id: 62
   status: completed
   specialist: observability
-  env_tests: true
   prompt: |
     Manual testing (2026-08-05) found MH is the only service missing its logs
     and SLO dashboards: infra/grafana/dashboards/ has {ac,gc,mc}-logs.json and
@@ -1396,7 +1386,6 @@ tasks:
 - id: 63
   status: completed
   specialist: auth-controller
-  env_tests: true
   prompt: |
     Fix roster display names: manual testing (2026-08-05) shows the meeting
     roster renders generic labels (Participant 1, Participant 2) instead of the
@@ -1421,7 +1410,6 @@ tasks:
 - id: 64
   status: completed
   specialist: meeting-controller
-  env_tests: true
   prompt: |
     Reduce or bound roster leave latency: manual testing (2026-08-05) observed
     that after a participant closes their tab, the other participant's roster
@@ -1443,7 +1431,6 @@ tasks:
 - id: 65
   status: completed
   specialist: meeting-controller
-  env_tests: true
   deps:
   - 64
   prompt: |
@@ -1478,7 +1465,6 @@ tasks:
 - id: 66
   status: completed
   specialist: client
-  env_tests: false
   prompt: |-
     Clear all outstanding TypeScript/JavaScript dependency advisories so `pnpm audit
     --audit-level=high` (forced, DEVLOOP_AUDIT_FORCE_RUN=1) reports zero unsuppressed
@@ -1520,7 +1506,7 @@ tasks:
     (zero unsuppressed advisories); `pnpm install` succeeds and `pnpm -w lint` /
     svelte-check still pass (the lint toolchain may be what changed); any suppression
     added is justified, expiring, and security-reviewed; `docs/TODO.md` §Dependency
-    Vulnerabilities (pnpm audit) / §Supply Chain updated. No cluster behavior
-    (env_tests false); Layers 1–6 gate the change.
+    Vulnerabilities (pnpm audit) / §Supply Chain updated. No cluster behavior; the
+    validation pipeline gates the change.
   tag: audit-remediation-ts
 ```

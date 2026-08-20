@@ -15,10 +15,15 @@
 # ambient advisory unrelated to the diff; it is replaced by the anchored diff_touches_glob.
 # Safe, not masking: a diff touching no dep manifest cannot move the resolved dep graph.
 #
-# Gate placement (D-b): the audit dispatch KEEPS DEVLOOP_DISPATCH_ALWAYS_RUN=1 so the
-# dispatcher invokes each wrapper unconditionally; the FAIL-CLOSED tri-state gate lives
-# HERE, inside the wrapper — never via the dispatcher's changed.sh short-circuit (which
-# treats non-zero as "skip" = fail-OPEN, unsafe for a security scan).
+# Gate placement (D-b): the dispatcher is unconditionally always-run (ADR-0033 §3,
+# 2026-08-20), so it invokes each `audit.sh` wrapper for every run; the FAIL-CLOSED
+# tri-state dep-manifest gate lives HERE, inside the wrapper, AFTER it runs — never as a
+# dispatcher-level skip. This placement is deliberate and load-bearing: a language-level
+# skip-if-untouched short-circuit treats a non-zero predicate as "skip", which is
+# fail-OPEN — unsafe for a security scan (an untouched-looking diff would silently never
+# scan). That fail-OPEN hazard is exactly why the whole pipeline retired the language
+# short-circuit in favor of always-run (ADR-0033 §3): running-then-deciding-inside-the-
+# wrapper is fail-CLOSED, skipping-before-running is fail-OPEN.
 #
 # Suppression is sourced ONLY from the manifest -> generated derived files, never from
 # CLI flags (preserves the Wave-1 no-CLI-pass-through finding, ADR-0033 §11).

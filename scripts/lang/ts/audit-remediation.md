@@ -47,5 +47,5 @@ Acceptance: `DEVLOOP_AUDIT_FORCE_RUN=1 scripts/lang/ts/audit.sh` emits STATUS=OK
 (zero unsuppressed advisories); `pnpm install` succeeds and `pnpm -w lint` /
 svelte-check still pass (the lint toolchain may be what changed); any suppression
 added is justified, expiring, and security-reviewed; `docs/TODO.md` §Dependency
-Vulnerabilities (pnpm audit) / §Supply Chain updated. No cluster behavior
-(env_tests false); Layers 1–6 gate the change.
+Vulnerabilities (pnpm audit) / §Supply Chain updated. No cluster behavior; the
+validation pipeline gates the change.

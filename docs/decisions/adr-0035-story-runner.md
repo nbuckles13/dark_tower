@@ -15,7 +15,7 @@ Validated by **Run #1** — the pending tasks of the `browser-client-join` story
 ### Constraints that shape the design
 
 - **Quota, not compute, binds throughput.** Measured: 17.1h of work against 106.4h of inter-task gap — the runner was **14% working, 86% waiting**.
-- **The devloop session dominates per-task cost.** Gate time is 14.2% of an `env_tests` task and 4.4% otherwise; ~1–2% of story wall-clock.
+- **The devloop session dominates per-task cost.** Gate time is ~1–2% of story wall-clock even with every layer running on every task (measured on the story-runner-hardening run: layers 1–6 total ~178s, layer 7 alone ~753s). **Amendment (2026-08-20):** the earlier split — "14.2% of an `env_tests` task and 4.4% otherwise" — is obsolete: layer 7 now runs on **every** task (the `env_tests` tag was removed), so there is no cheap-vs-expensive per-task class. This is affordable precisely because quota, not compute, binds throughput — see the constraint above — and per-run org provisioning (layer7.sh Phase 1h) makes running layer 7 every task safe.
 - **The execution substrate is experimental** — agent teams inside print mode, documentation-silent, with no supported alternative (see §8).
 
 ## Decision
@@ -42,7 +42,9 @@ The mechanics are cheap and stay accurate for whenever it returns: `dt-story nex
 
 ### 3. Pass/fail authority is the runner's own pipeline run — never the devloop's verdict
 
-Fast floor (layers 1–6) per task; layer 7 when the task is `env_tests`-tagged; full `layer-all.sh` at story close.
+Every layer, including layer 7, runs on every task; full `layer-all.sh` at story close.
+
+**Amendment (2026-08-20):** previously the per-task gate ran a fast floor (layers 1–6) always and layer 7 only when the task was `env_tests`-tagged. That tag encoded the opposite of this ADR's own principle — it let a gate be skipped by a per-task classification decision — so it was retired: **layer 7 now runs on every task after 1–6 pass**, and the `env_tests` manifest field was removed entirely (a schema change forced into one commit with all its story files by serde `deny_unknown_fields`). This is affordable because gate time is ~1–2% of story wall-clock and quota, not compute, binds throughput. **Operational consequence (accepted):** a broken layer-7 precondition (dev-certs, Playwright Chromium, cluster health, proto codegen) previously stalled only `env_tests`-tagged tasks; now it stalls **every** task in the story. This is acceptable because the operator lane (`PRECONDITION_FAILURE`, exit 2) routes such failures off the implementer's attempt budget — but the story-wide stall is the deliberate trade. **Also accepted:** on a branch touching `infra/kind`, the layer-7 cluster rebuild (layer7.sh Phase-1b, the one skip decision deliberately kept) now fires on every task rather than once; not engineered around.
 
 **The rule exists because self-reported success has failed before, in two distinct ways** — both cases where a gate said PASS while the work it was gating had not happened:
 
@@ -73,7 +75,7 @@ Three admissible uses, all adopted:
 
 ### 4. Manifest as state SSoT
 
-A `dt-story` task-metadata block in the story markdown: id, status, specialist, `env_tests`, deps, self-contained prompt, tag. Verbs: `next` / `complete` / `escalate` / `validate` / `add-task`.
+A `dt-story` task-metadata block in the story markdown: id, status, specialist, deps, self-contained prompt, tag. Verbs: `next` / `complete` / `escalate` / `validate` / `add-task`. (The `env_tests` field was removed 2026-08-20 when layer 7 became unconditional per §3.)
 
 `complete` is idempotent — the headless devloop marks its own task before the runner does (double-writer, not error). Escalated tasks are retryable: **rerunning the runner is the resume gesture.**
 
@@ -82,7 +84,7 @@ A `dt-story` task-metadata block in the story markdown: id, status, specialist, 
 | Artifact | Holds | Status? |
 |---|---|---|
 | **§Ordered Task List** | human-readable intent: what the task is for, and which requirements it covers | **No** |
-| **§Task Metadata (`dt-story` manifest)** | everything machine-read: id, status, specialist, `env_tests`, deps, prompt, tag, devloop-output slug | **Yes — the only place** |
+| **§Task Metadata (`dt-story` manifest)** | everything machine-read: id, status, specialist, deps, prompt, tag, devloop-output slug | **Yes — the only place** |
 | ~~§Devloop Tracking table~~ | *(deleted)* | — |
 
 **Delete §Devloop Tracking.** Every column it carries is either already in the manifest (invocation, specialist, deps, status) or belongs there (devloop-output link — the runner already records the slug). It is hand-edited, and it demonstrably drifted during Run #1: duplicate rows for tasks 18/19/20 and a conflicting status for 20, found during backfill.
@@ -288,7 +290,7 @@ Build-then-document was correct here: no up-front debate produces the incident t
 - **§10 · per-seat model tiering** — requires per-teammate model overrides in `SKILL.md`, which is why it belongs here rather than Group 2.
 - **Re-run the preflight substrate probe after any Group 3 edit**, since it changes what every subsequent session reads.
 
-**Cross-cutting**: every item phrased as a *skill-file instruction* should be re-examined as a `dt-story validate` check instead — at least the acceptance-criteria ban, the `env_tests`/deps completeness check, and any DAG-degeneration detector qualify. A document claiming a trajectory of moving trust out of instructions should not close by adding three new instructions.
+**Cross-cutting**: every item phrased as a *skill-file instruction* should be re-examined as a `dt-story validate` check instead — at least the acceptance-criteria ban, the deps completeness check, and any DAG-degeneration detector qualify. A document claiming a trajectory of moving trust out of instructions should not close by adding three new instructions.
 
 ## Alternatives Considered
 

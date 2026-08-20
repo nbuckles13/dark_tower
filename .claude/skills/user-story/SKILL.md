@@ -337,8 +337,7 @@ target/release/dt-story add-task "$STORY" \
   --specialist <name> \
   --prompt-file /tmp/task-<n>.prompt \
   --tag "story-{story-slug}-task-<n>" \
-  --deps 1,2 \
-  --env-tests          # omit the flag entirely when false
+  --deps 1,2
 ```
 
 **Why through `dt-story` and not hand-written YAML.** `Manifest::to_block_body` refuses to write a manifest containing a markdown fence line. A prompt carrying a fenced code example would otherwise close the manifest block early and truncate it **silently** — the surviving prefix still parses, still validates, and `next` then reports the story complete with tasks missing. Emitting through the write verb makes that refusal cover this skill by construction. Hand-writing the YAML bypasses it entirely.
@@ -374,7 +373,7 @@ target/release/dt-story list-tasks "$STORY" | jq -r '[.[].id] | @csv'   # 2. id-
 
 If either fails, fix the manifest and re-run — do **not** report the story Ready.
 
-**If the plan changes (`--continue`)**: reset the manifest block back to the skeleton and re-emit the whole plan. Do **not** re-run `add-task` over a populated manifest — an existing tag returns rc 4 **without applying** the supplied `--specialist`, `--prompt-file`, `--env-tests` or `--deps`, so a revised prompt would be silently discarded. **Refuse to reset if any task is not `pending`**: the story has already started, and resetting would destroy completed tasks' `status` and `slug`. Escalate — and name the next move rather than stopping at the refusal: the human either edits the affected task's `prompt` in the manifest block directly (leaving completed tasks untouched), or, if the remaining plan has changed structurally, closes this story and plans a new one for the remaining work.
+**If the plan changes (`--continue`)**: reset the manifest block back to the skeleton and re-emit the whole plan. Do **not** re-run `add-task` over a populated manifest — an existing tag returns rc 4 **without applying** the supplied `--specialist`, `--prompt-file` or `--deps`, so a revised prompt would be silently discarded. **Refuse to reset if any task is not `pending`**: the story has already started, and resetting would destroy completed tasks' `status` and `slug`. Escalate — and name the next move rather than stopping at the refusal: the human either edits the affected task's `prompt` in the manifest block directly (leaving completed tasks untouched), or, if the remaining plan has changed structurally, closes this story and plans a new one for the remaining work.
 
 ### Step 11: Report and Review
 

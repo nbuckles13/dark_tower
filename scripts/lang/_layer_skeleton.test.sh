@@ -75,18 +75,6 @@ for layer in "${LAYERS[@]}"; do
   __assert_no_match "$layer" "trap installation"     '^\s*trap\s'
 done
 
-# Required-invocation check: layer3.sh MUST invoke _test_changed_predicates.sh
-# per ADR-0033 implementation note (test-reviewer Finding 2).
-# A future refactor that moves guard logic out without preserving this call
-# silently weakens predicate-drift detection — catch it here.
-if grep -q '_test_changed_predicates' "${SCRIPTS_ROOT}/layer3.sh"; then
-  PASS=$((PASS + 1))
-else
-  FAIL=$((FAIL + 1))
-  FAILURES+=("[layer3.sh] missing required invocation of _test_changed_predicates.sh
-  → ADR-0033 implementation note: meta-test must run on every devloop, not just at PR time")
-fi
-
 printf '\n_layer_skeleton.test.sh: %d passed, %d failed\n' "$PASS" "$FAIL"
 if [[ $FAIL -gt 0 ]]; then
   printf 'Failures:\n'

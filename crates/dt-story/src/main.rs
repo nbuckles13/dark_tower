@@ -123,9 +123,6 @@ enum Command {
         /// WEAK idempotency — the no-op does NOT apply the other flags.
         #[arg(long)]
         tag: String,
-        /// Mark the task as requiring env-tests (default false).
-        #[arg(long)]
-        env_tests: bool,
         /// Comma-separated dependency task ids, e.g. `--deps 1,2`.
         /// Omit the flag for no deps; `--deps ''` is an error, because a
         /// caller with an unset variable emits exactly that and a silently
@@ -337,14 +334,12 @@ fn main() -> ExitCode {
             specialist,
             prompt_file,
             tag,
-            env_tests,
             deps,
         } => cmd_add_task(
             &story,
             &specialist,
             &prompt_file,
             &tag,
-            env_tests,
             deps.map(|d| d.0).unwrap_or_default(),
         ),
         Command::Validate { story } => cmd_validate(&story),
@@ -477,7 +472,6 @@ fn cmd_add_task(
     specialist: &str,
     prompt_file: &Path,
     tag: &str,
-    env_tests: bool,
     deps: Vec<u32>,
 ) -> ExitCode {
     // Read the prompt first: a bad --prompt-file is a caller error (exit 2),
@@ -494,7 +488,6 @@ fn cmd_add_task(
             engine::NewTask {
                 specialist: specialist.to_string(),
                 prompt,
-                env_tests,
                 tag: tag.to_string(),
                 deps,
             },
@@ -519,7 +512,7 @@ fn cmd_add_task(
             // gets no error and no edit.
             eprintln!(
                 "dt-story: task with tag '{tag}' already exists (id {id}) — NOT UPDATED. The \
-                 supplied --specialist/--prompt-file/--env-tests/--deps were NOT applied; this \
+                 supplied --specialist/--prompt-file/--deps were NOT applied; this \
                  verb appends, it does not update. To change an existing task, edit the manifest \
                  block directly, or reset it to a skeleton and re-emit the whole plan."
             );

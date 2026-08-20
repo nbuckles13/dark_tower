@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
-# _changed_helpers.sh — declarative diff predicates for per-language changed.sh.
+# _changed_helpers.sh — declarative diff predicates (diff_touches_path / _glob /
+# _root_files).
 #
-# Each lang/<X>/changed.sh sources this file and uses these primitives instead
-# of bespoke shell. Keeps every changed.sh to 3-5 lines of intent.
+# The surviving diff-aware consumers source this file and compose these primitives
+# instead of bespoke shell: the Layer-6 audit dep-manifest gate (`_audit_gate.sh`) and
+# Layer-7's `infra/kind/` rebuild check (`layer7.sh` Phase-1b). (The per-language
+# `changed.sh` classifiers that used to be the primary consumers were retired 2026-08-20 —
+# ADR-0033 §2/§3; these predicates are unaffected.)
 #
 # Reads the changed-files cache produced by _get_base_ref.sh. If the cache
 # doesn't exist (direct invocation outside a layer), invokes _get_base_ref.sh

@@ -65,11 +65,11 @@ scripts/
     _changed_helpers.sh         # NEW — sourced helper: declarative diff predicates
     _get_base_ref.sh            # NEW — env-aware base-ref resolver (local vs CI)
     _get_base_ref.test.sh       # NEW — self-test matrix (local-clean, local-dirty, CI-PR, CI-push, first-commit)
-    _test_changed_predicates.sh # NEW — meta-test: each language's changed.sh fires on representative paths
+    # (per-lang changed.sh classifier + its changed.test.sh + _test_changed_predicates.sh
+    #  meta-test were RETIRED 2026-08-20 — see §2 amendment; the pipeline always-runs, so a
+    #  consumerless footprint predicate had no reason to exist)
 
     rust/
-      changed.sh                # exit 0 if rust touched, 1 if not
-      changed.test.sh           # locality self-test for changed.sh
       compile.sh                # cargo check
       fmt.sh                    # cargo fmt
       lint.sh                   # cargo clippy
@@ -77,8 +77,6 @@ scripts/
       audit.sh                  # cargo audit
 
     ts/
-      changed.sh
-      changed.test.sh
       compile.sh                # nx affected -t typecheck
       fmt.sh                    # nx affected -t format
       lint.sh                   # nx affected -t lint
@@ -87,8 +85,6 @@ scripts/
       e2e.sh                    # nx affected -t test:e2e (Playwright)
 
     proto/
-      changed.sh
-      changed.test.sh
       compile.sh                # buf build
       fmt.sh                    # buf format --diff --exit-code
       lint.sh                   # buf lint
@@ -107,64 +103,69 @@ scripts/
 
 ### 2. Classifier — Per-Language Convention
 
-The classifier is decentralized: each `lang/<X>/changed.sh` is the sole authority for its language's footprint. `changed.sh` exits **0 if the diff touches that language, 1 if provably untouched.** No centralized rules table.
+> **RETIRED (2026-08-20).** The per-language `changed.sh` classifier described in this
+> section — its decentralized "sole authority for the language's footprint" role, the
+> `_dispatch.sh` lint-at-startup that required it, the `_test_changed_predicates.sh`
+> meta-test, and each `lang/<X>/changed.test.sh` — **was removed entirely** when §3's
+> skip-if-untouched policy was retired (see the §3 amendment). With the dispatcher
+> always-running every language's verb, the footprint predicate had **no consumer**, so it
+> became consumerless dead code structurally identical to the `env_tests` manifest field
+> removed in the same change; keeping one while deleting the other would have been
+> incoherent. **Footprint detection did NOT disappear** — it lives, and always did, in
+> `scripts/lang/_changed_helpers.sh`'s `diff_touches_path` / `diff_touches_glob` /
+> `diff_touches_root_files` primitives, which the surviving diff-aware consumers use
+> directly: the Layer-6 audit **dep-manifest** gate (`_audit_gate.sh`, §3 task-#47
+> amendment) and Layer-7's `infra/kind/` rebuild check. `_changed_helpers.sh` and its
+> self-test stay. The original decentralized-classifier design is preserved below for the
+> record; it describes a mechanism the tree no longer contains.
 
-Each `changed.sh` is 3–5 lines using shared helpers from `scripts/lang/_changed_helpers.sh` (so each language's predicate is declarative intent, not bespoke shell):
+The classifier was decentralized: each `lang/<X>/changed.sh` was the sole authority for its language's footprint, exiting **0 if the diff touches that language, 1 if provably untouched** — 3–5 lines composing the shared `scripts/lang/_changed_helpers.sh` `diff_touches_*` primitives, with a mandatory-presence lint in `_dispatch.sh` and a `_test_changed_predicates.sh` meta-test guarding cross-language drift. All of that is retired per the note above; the `diff_touches_*` primitives it composed are what survive.
 
-```bash
-# scripts/lang/rust/changed.sh
-#!/usr/bin/env bash
-set -euo pipefail
-source "$(dirname "$0")/../_changed_helpers.sh"
-diff_touches_path "crates/" || diff_touches_root_files "Cargo.toml" "Cargo.lock" "rust-toolchain.toml"
-```
+### 3. Always-Run (formerly Always-Run vs Skip-If-Untouched)
 
-```bash
-# scripts/lang/ts/changed.sh
-#!/usr/bin/env bash
-set -euo pipefail
-source "$(dirname "$0")/../_changed_helpers.sh"
-diff_touches_path "packages/" || diff_touches_root_files \
-  "package.json" "pnpm-lock.yaml" "pnpm-workspace.yaml" "nx.json" "tsconfig.base.json" ".nvmrc"
-```
+> **AMENDMENT (2026-08-20) — skip-if-untouched retired; every layer runs every language
+> every run.** The per-language skip-if-untouched short-circuit (the `changed.sh`
+> classifier and its `_dispatch.sh` consumer) is **removed**. Gate coverage is now
+> independent of change-detection: layers 1/2/4/5 (compile/fmt/test/lint) join 3/6/7 as
+> unconditional always-run. **Why:** the skip machinery treated a non-zero footprint
+> predicate as "skip" — which is **fail-OPEN**, a mode that is actively unsafe for a
+> security scan (an untouched-*looking* diff would silently never run the gate) and, more
+> broadly, trades a silent-skip failure class for savings that don't exist — measured, the
+> whole gate is ~1–2% of story wall-clock and **quota, not compute, is the binding
+> constraint**. Running the verb and letting it decide inside itself is fail-CLOSED;
+> skipping before running is fail-OPEN. The ONE surviving conditional is the Layer-6 audit
+> **dep-manifest** gate (task-#47 amendment below): it is dep-change-gated *inside* the
+> wrapper, AFTER the dispatcher runs it, via `_changed_helpers.sh:diff_touches_glob` — a
+> different mechanism from the retired per-lang `changed.sh`, and it stays. The matrix and
+> principle below are updated to reflect always-run.
 
-```bash
-# scripts/lang/proto/changed.sh
-diff_touches_path "proto/"
-```
+Default: run everything, every language, every run.
 
-**`lang/<X>/changed.sh` is mandatory.** `scripts/lang/_dispatch.sh` lints at startup that every directory under `scripts/lang/` (excluding underscore-prefixed helpers) contains an executable `changed.sh`. Missing predicate fails loud — language is never silently invisible.
+| Layer | Verb     | Runs                                                                            |
+|-------|----------|---------------------------------------------------------------------------------|
+| 1     | Compile  | rust, ts, proto — always                                                        |
+| 2     | Format   | rust, ts, proto — always                                                        |
+| 3     | Guards   | ALL guards (each self-classifies) — always                                      |
+| 4     | Test     | rust, ts — always (proto has no `test.sh` — N/A placeholder)                     |
+| 5     | Lint     | rust, ts, proto — always                                                         |
+| 6     | Audit    | cargo audit, pnpm audit, buf breaking — always dispatched; the cargo/pnpm audit wrappers then apply a dep-manifest gate internally (task-#47 amendment) |
+| 7     | Env-tests| dev-cluster + Rust env-tests + browser E2E — always                             |
 
-**Meta-test (`_test_changed_predicates.sh`)** asserts each language's `changed.sh` fires correctly against a hand-curated fixture set. Drift between predicates (one language stricter than another) is detectable in CI. Each language also ships its own `lang/<X>/changed.test.sh` for predicate self-testing in locality.
+**The classifying principle (retained for future toolchains):**
 
-### 3. Always-Run vs Skip-If-Untouched
+> When in doubt, always-run — and since 2026-08-20 that is the whole rule: a validation step
+> runs on every run. The former skip-if-untouched class (compile/type/lint/format/test that
+> "require source change in the corresponding file family") is retired, because a
+> footprint-based skip is fail-OPEN and the compute saved is negligible against the
+> quota-bound cost. A NEW step only needs the orthogonal decision of whether its wall-clock
+> cost belongs in the 90s guard+audit fast-tier budget (§4) or outside it.
 
-Default: run everything. Skip a language-specific layer only when its `changed.sh` proves the diff is untouched.
+Applied to the former hard cases:
+- `cargo audit`, `pnpm audit` → always dispatched; dep-manifest-gated inside the wrapper (task-#47 amendment)
+- `buf breaking` (vs `main`) → **always-run** (re-running codegen against a drifted `main` can break wire compat without a `proto/**` diff; ~500ms)
+- `buf lint`, `buf format`, `cargo check`, `tsc --noEmit` → **always-run** (formerly skip-if-untouched — the language short-circuit is gone)
 
-| Layer | Verb     | Always-run                              | Skip-if-untouched per `lang/<X>/changed.sh` |
-|-------|----------|-----------------------------------------|---------------------------------------------|
-| 1     | Compile  | —                                       | rust, ts, proto                             |
-| 2     | Format   | —                                       | rust, ts, proto                             |
-| 3     | Guards   | ALL guards (each self-classifies)       | —                                           |
-| 4     | Test     | —                                       | rust, ts (proto has no `test.sh` — naturally skipped) |
-| 5     | Lint     | —                                       | rust, ts, proto                             |
-| 6     | Audit    | cargo audit, pnpm audit, buf breaking   | —                                           |
-| 7     | Env-tests| dev-cluster + Rust env-tests + Playwright `@smoke` | —                                |
-
-**The classifying principle (so future toolchains classify themselves):**
-
-> A step is **always-run** if its failure mode can be triggered by external state change with no diff in the toolchain's footprint (advisory DB updates, contract evolution against `main`, source-of-truth integrity drift). A step is **skip-if-untouched** if its failure mode requires source change in the corresponding file family (compile errors, type errors, lint violations, formatting drift, test regressions).
->
-> When in doubt, always-run.
-
-Applied to the prompted hard cases:
-- `cargo audit`, `pnpm audit` → always-run (vulns publish independently of our diff)
-- `buf breaking` (vs `main`) → **always-run** despite being proto-related (re-running codegen against a drifted `main` can break wire compat without a `proto/**` diff in the current branch; ~500ms)
-- `buf lint`, `buf format` → skip-if-no-proto
-- `cargo check` (no Rust changed) → skip
-- `tsc --noEmit` (no TS changed) → skip
-
-**Files outside any classified directory** (`infra/`, `docs/`, `scripts/`, `.github/`, `.claude/`) do not trigger any skip optimization. They get the always-run set (Layers 3, 6, 7 + reviewer panel) and skip the language-specific layers — exactly the right behavior. No special "neutral" registration required.
+**Files outside any former classified directory** (`infra/`, `docs/`, `scripts/`, `.github/`, `.claude/`) never had a skip optimization and still don't; every diff gets the full pipeline. No special "neutral" registration required.
 
 #### Amendment (task #47, 2026-06-06) — audit scan reclassified to dep-change-gated
 
@@ -177,7 +178,7 @@ Applied to the prompted hard cases:
 
 **Net posture:** the always-run *guarantee* moves from "scan every advisory every run" to "cheap always-run date/sync/quality discipline + weekly scheduled full scan". Per-PR cost drops (no-dep PRs no longer scan; budget-positive). Suppression is sourced exclusively from the tracked `audit-suppressions.toml` → generated derived files (`.cargo/audit.toml`, `.pnpm-audit-ignore.json`), never ad-hoc CLI flags, hand-edited derived files, or Dependabot alert dismissals (preserves the Wave-1 no-CLI-pass-through finding; see §11). Co-signed by operations + security (paired). The §3 always-run matrix row for Layer 6 audit now reads "dep-change-gated (per §47 amendment); always-run guarantee held by the Layer-3 suppressions-check + weekly scheduled scan."
 
-**Follow-up narrowing (2026-08-05) — gate matches ONLY true dependency manifests.** The initial task-#47 predicate fell back to a `crates/` / `packages/` **prefix** match (`diff_touches_path`), a deliberate fail-safe over-trigger chosen because `_changed_helpers.sh` then had no glob/suffix predicate. Consequence: a **source-only** edit under those trees (`crates/*/src`, `packages/*/src`) RAN the ambient `cargo audit` / `pnpm audit` and could go red on an advisory published overnight against an UNCHANGED lockfile — the only layer that flips red with zero dep change. The predicate now matches **only true dependency manifests**: root `Cargo.toml` / `Cargo.lock` **plus** `crates/*/Cargo.toml` (rust); root `package.json` / `pnpm-lock.yaml` / `pnpm-workspace.yaml` **plus** `packages/*/package.json` (ts) — via a new anchored `diff_touches_glob` predicate (bash `[[ == ]]`, where `*` crosses `/`, so any `Cargo.toml` at any depth under `crates/`, including the workspace-excluded `fuzz` manifests, still matches → the fail-safe "run" direction). This is **SAFE, not masking**: a diff touching no dependency manifest provably cannot change the resolved dependency graph. **Preserved unchanged:** the fail-closed tri-state (indeterminate diff OR base-ref-resolution failure still RUNS), `DEVLOOP_AUDIT_FORCE_RUN` force-RUN-only semantics, and the entire suppression path. The per-language `changed.sh` classifiers (Layers 1/2/4/5) keep their `crates/` / `packages/` prefix match — a source edit SHOULD still recompile/test/lint; only the Layer-6 audit gate narrows. **Residual:** a dep-changing devloop still gets a FULL-TREE scan and may still hit an ambient advisory unrelated to its change — suppression (§11) is the escape hatch, and `audit-scheduled.yml` remains the diff-less-vector safety net. A `diff_touches_glob` self-test (`_changed_helpers.test.sh`) plus an SSoT-drift guard (`_audit_gate.test.sh`: every git-tracked manifest must stay covered) are wired into Layer 3.
+**Follow-up narrowing (2026-08-05) — gate matches ONLY true dependency manifests.** The initial task-#47 predicate fell back to a `crates/` / `packages/` **prefix** match (`diff_touches_path`), a deliberate fail-safe over-trigger chosen because `_changed_helpers.sh` then had no glob/suffix predicate. Consequence: a **source-only** edit under those trees (`crates/*/src`, `packages/*/src`) RAN the ambient `cargo audit` / `pnpm audit` and could go red on an advisory published overnight against an UNCHANGED lockfile — the only layer that flips red with zero dep change. The predicate now matches **only true dependency manifests**: root `Cargo.toml` / `Cargo.lock` **plus** `crates/*/Cargo.toml` (rust); root `package.json` / `pnpm-lock.yaml` / `pnpm-workspace.yaml` **plus** `packages/*/package.json` (ts) — via a new anchored `diff_touches_glob` predicate (bash `[[ == ]]`, where `*` crosses `/`, so any `Cargo.toml` at any depth under `crates/`, including the workspace-excluded `fuzz` manifests, still matches → the fail-safe "run" direction). This is **SAFE, not masking**: a diff touching no dependency manifest provably cannot change the resolved dependency graph. **Preserved unchanged:** the fail-closed tri-state (indeterminate diff OR base-ref-resolution failure still RUNS), `DEVLOOP_AUDIT_FORCE_RUN` force-RUN-only semantics, and the entire suppression path. The per-language `changed.sh` classifiers (Layers 1/2/4/5) kept their `crates/` / `packages/` prefix match at the time of this #47 narrowing — a source edit SHOULD still recompile/test/lint; only the Layer-6 audit gate narrowed. (Those per-language classifiers were themselves **retired 2026-08-20** — see the §2/§3 amendments; Layers 1/2/4/5 now always-run every language unconditionally, so only the Layer-6 dep-manifest gate described here remains a conditional.) **Residual:** a dep-changing devloop still gets a FULL-TREE scan and may still hit an ambient advisory unrelated to its change — suppression (§11) is the escape hatch, and `audit-scheduled.yml` remains the diff-less-vector safety net. A `diff_touches_glob` self-test (`_changed_helpers.test.sh`) plus an SSoT-drift guard (`_audit_gate.test.sh`: every git-tracked manifest must stay covered) are wired into Layer 3.
 
 **Dependency disposition (`python3`):** the JS-audit suppression-filter path (parsing `pnpm audit --json` and the generated `.pnpm-audit-ignore.json` in `lang/ts/audit.sh` + `lang/_audit_suppressions_lib.sh`) uses `python3` for JSON parsing. This is a NEW pipeline dependency relative to the §Consequences "zero new tooling dependencies… no yq/jq/Node required for **classification**" claim — but it does NOT contradict that claim: it is scoped to the JS suppression-FILTER path (the pass/fail decision after a scan), not the bash-only changed-file CLASSIFICATION that the claim is about. The bash-only zero-dep classification guarantee is intact. `python3` is present on all CI runners + the devcontainer; a stripped-down container lacking it would degrade only the JS-audit filter path (the TOML/manifest machinery and rust audit are python-free). Accepted trade-off (cheaper + more robust than a hand-rolled bash JSON parser for a security-relevant parse); flagged here so it is explicit, not an unstated contradiction with §Consequences. (A future jq-or-pure-bash rewrite to drop the dep is possible but out of #47 scope.)
 
@@ -201,7 +202,7 @@ All pipeline orchestration lives in shell scripts. `SKILL.md` Step 6 collapses t
 - Runs `layer1.sh` through `layer7.sh` sequentially
 - Redirects each layer's stdout to `tee /tmp/devloop/layer-N.log` (or per-devloop slug equivalent)
 - Emits a final summary table: layer, status, duration
-- Enforces the **90s p95 wall-clock budget for the always-run set** (Layers 3, 6 + reviewer panel cost is excluded from this budget). Warns when any single layer exceeds its per-layer budget; this is the operational signal that catches budget breach before it becomes a paging incident. **Layer 7 (env-tests) runs in a separate ~10–15 min envelope** and is excluded from BOTH the 90s always-run total AND the per-layer warn (its cluster bring-up + suite cost would otherwise false-fire the per-layer `BUDGET_BREACH` token every run); it is gated instead by its own `timeout 600` on the suite and the host helper's setup timeout. In **CI** (`GITHUB_ACTIONS`) Layer 7 cleanly skips (`SKIPPED-NO-CLUSTER REASON=no-cluster-ci`, exit 0) and contributes ~0s; a *local* run with no/dead helper is a loud `PRECONDITION_FAILURE` (exit 2), never a silent skip.
+- Enforces the **90s p95 wall-clock budget for the guard+audit fast tier** (Layers 3 + 6; reviewer panel cost excluded). **Since 2026-08-20 all of Layers 1–6 always-run** (the language skip-if-untouched short-circuit was retired), so this budget is deliberately scoped to the cheap fast floor (3 + 6) — the language layers 1/2/4/5 (compile/fmt/test/lint) carry inherently large/variable cost and are excluded, the same way Layer 7 is (`GUARD_AUDIT_DURATION` in `layer-all.sh`, not "always-run total"). Warns when any single layer exceeds its per-layer budget; this is the operational signal that catches budget breach before it becomes a paging incident. **Layer 7 (env-tests) runs in a separate ~10–15 min envelope** and is excluded from BOTH the 90s fast-tier total AND the per-layer warn (its cluster bring-up + suite cost would otherwise false-fire the per-layer `BUDGET_BREACH` token every run); it is gated instead by its own `timeout 600` on the suite and the host helper's setup timeout. In **CI** (`GITHUB_ACTIONS`) Layer 7 cleanly skips (`SKIPPED-NO-CLUSTER REASON=no-cluster-ci`, exit 0) and contributes ~0s; a *local* run with no/dead helper is a loud `PRECONDITION_FAILURE` (exit 2), never a silent skip.
 
 Individual `layerN.sh` remain directly callable for targeted debugging (`scripts/layer4.sh` to re-run only Layer 4's tests on a failing diff).
 
@@ -214,8 +215,7 @@ A dedicated "Layer 0: Contract" was considered and rejected. The execution-order
 set -euo pipefail
 source "$(dirname "$0")/lang/_common.sh"
 
-# Stage 1: contract (proto consumed by both downstream)
-"$(dirname "$0")/lang/proto/changed.sh" || { /* run if changed */ }
+# Stage 1: contract (proto consumed by both downstream) — always dispatched
 # Stage 2: code (rust + ts can run in any order)
 # ... see scripts/build.sh for the dispatch
 ```
@@ -244,9 +244,9 @@ for_each_lang_with_verb "test" || exit 1
 
 `for_each_lang_with_verb` (defined in `_dispatch.sh`):
 1. Iterates `lang/*/` directories (excluding underscore-prefixed)
-2. For each language, lints that `changed.sh` exists (fails loud if not)
-3. If the requested verb script exists and is executable, invokes it (with skip-if-untouched short-circuit via `changed.sh`)
-4. If the verb script is missing or not executable, emits `STATUS=FAIL-MISSING-VERB REASON=<lang>-<verb>-verb-missing-or-not-executable` (exit 2) — never silently continues. A lang that *intentionally* has no real `<verb>.sh` ships a one-line placeholder wrapper emitting `STATUS=N/A` instead (see the placeholder convention below), so reaching this branch always means a wiring fault.
+2. Invokes the requested verb script for EVERY language, unconditionally (always-run — the
+   skip-if-untouched short-circuit and its `changed.sh` lint were retired 2026-08-20, §3 amendment)
+3. If the verb script is missing or not executable, emits `STATUS=FAIL-MISSING-VERB REASON=<lang>-<verb>-verb-missing-or-not-executable` (exit 2) — never silently continues. A lang that *intentionally* has no real `<verb>.sh` ships a one-line placeholder wrapper emitting `STATUS=N/A` instead (see the placeholder convention below), so reaching this branch always means a wiring fault.
 
 This means a deleted/`chmod`-stripped wrapper produces a loud `FAIL-MISSING-VERB` entry that reds the layer (it outranks a sibling lang's OK — see §STATUS aggregation), while proto's deliberate lack of a real `test.sh`/`audit.sh` shows up as a benign `N/A` from its placeholder, not silent absence.
 
@@ -395,12 +395,12 @@ Flake-rate breaches in Layer 7 trigger quarantine of the offending test (`.skip`
 - **Closes the minimatch class of incident permanently.** `pnpm audit` is always-run; transitive supply-chain drift surfaces every devloop, not weeks later.
 - **Pipeline knowledge is greppable, diffable, testable shell.** `SKILL.md` collapses from per-layer prose to "run `scripts/layer-all.sh`" — drift between documentation and runtime behavior becomes structurally impossible.
 - **Layer scripts are independently debuggable.** When Layer 4 fails, a dev runs `scripts/layer4.sh` directly and reproduces bit-for-bit what the pipeline saw. Bisecting regressions by replaying layers in isolation becomes trivial.
-- **Safe-by-default failure mode.** Default-to-run + skip-only-when-provably-untouched means classifier bugs cause spurious work, never silent skipping.
-- **Polyglot extensibility is structural.** A 4th language adds: `mkdir scripts/lang/go && touch changed.sh test.sh lint.sh build.sh fmt.sh audit.sh && chmod +x *.sh` — zero edits to dispatchers, layer scripts, or `SKILL.md`.
+- **Safe-by-default failure mode.** Always-run (2026-08-20; formerly default-to-run + skip-only-when-provably-untouched) means gate coverage never depends on a change-detection decision — no classifier bug can cause a silent skip, because there is no classifier.
+- **Polyglot extensibility is structural.** A 4th language adds: `mkdir scripts/lang/go && touch test.sh lint.sh build.sh fmt.sh audit.sh && chmod +x *.sh` — zero edits to dispatchers, layer scripts, or `SKILL.md` (and no `changed.sh` — the dispatcher always-runs every verb).
 - **Single source of truth for dispatch logic.** Local and CI run identical layer scripts; "works on my machine" failures collapse.
 - **Surface-root-cause-first ordering.** Proto failures surface as buf errors in `layer1.sh` stage 1, not as Rust E0277 / TS TS2322 cascades downstream.
 - **Cross-language schema-drift gate.** `buf breaking` always-run catches main-rebase wire-breaks that no proto-diff would surface.
-- **Decentralized classifier strengthens single-source-of-truth.** Each language owns its own footprint definition (`lang/<X>/changed.sh` + `changed.test.sh`); no centralized rules table to drift.
+- ~~**Decentralized classifier strengthens single-source-of-truth.**~~ — **RETIRED 2026-08-20**: the per-lang `changed.sh` classifier + `changed.test.sh` were removed (always-run made the footprint predicate consumerless). Footprint detection for the surviving diff-aware consumers lives in `_changed_helpers.sh`'s `diff_touches_*`.
 - **Pure-shell layer model.** Removing semantic-guard from layers eliminates the agent-runtime dependency from the pipeline; layers stay testable, hermetic, and CI-portable.
 - **Existing scripts preserved.** `scripts/test.sh` keeps its name and external contract; existing CI, runbooks, and muscle memory continue to work.
 - **Zero new tooling dependencies.** Bash sourcing throughout — runs in any bash environment including stripped-down CI containers. No `yq`/`jq`/Node required for classification.
@@ -411,9 +411,9 @@ Flake-rate breaches in Layer 7 trigger quarantine of the offending test (`.skip`
 - **Renumbering churn.** Layer 8 → Layer 7 affects `SKILL.md`, `ADR-0030`, this ADR, debate doc, and ≤4 specialist-knowledge `INDEX.md` files (~20 active edits, ~45 min mechanical work). Devloop output history files retain "Layer 8" as historical record.
 - **Audit-fatigue debt is codified, not solved.** Developers will continue to ignore audit findings on transitive vulns they did not introduce. We accept this trade-off; the 14-day MTTR tripwire is the only mitigation.
 - **`buf breaking` will fire on intentional wire-breaks** until override mechanism lands in Wave 3. R-61 task #31 sequences after Wave 2 #4 (proto wrappers) and possibly Wave 3 (override mechanism) for that reason.
-- **Modest CI-minutes increase per PR.** Always-run set adds `pnpm audit` (~5s) and `buf breaking` (~500ms). Within the 90s p95 budget.
-- **Mild over-run on docs-inside-code-dirs.** A docs-only change to `crates/foo/README.md` classifies as rust-touched. Cargo check is cheap; refine the predicate later if it bothers anyone.
-- **Per-language predicate drift risk.** With each `lang/<X>/changed.sh` owned independently, predicates can drift in strictness across languages. Mitigated by `_changed_helpers.sh` (declarative shared primitives) + `_test_changed_predicates.sh` (meta-test).
+- **Modest CI-minutes increase per PR.** The guard+audit fast tier adds `pnpm audit` (~5s) and `buf breaking` (~500ms). Within the 90s p95 budget. (Since 2026-08-20 the language layers 1/2/4/5 also always-run — compile/test/lint/fmt on every run — but their cost sits outside this fast-tier budget, as noted in §4.)
+- **Every language layer runs every run.** Since 2026-08-20 (always-run) `cargo check` / `tsc` / lint / fmt run on every diff, docs-only included. Each is comparatively cheap; the former "over-run on docs-inside-code-dirs" framing is moot now that there is no per-lang classification at all.
+- ~~**Per-language predicate drift risk.**~~ — **RETIRED 2026-08-20**: with the per-lang `changed.sh` predicates removed there is nothing to drift. `_changed_helpers.sh`'s `diff_touches_*` primitives survive with their own self-test (`_changed_helpers.test.sh`).
 
 ### Neutral
 
@@ -543,12 +543,12 @@ Flake-rate breaches in Layer 7 trigger quarantine of the offending test (`.skip`
 Trigger an ADR amendment or successor ADR when any of the following occurs:
 
 - **A 4th language is added to the workspace** (Go, Python, Helm, etc.). Confirm the wrapper count is still manageable and `SKILL.md` doesn't need restructure.
-- **A new universally-applicable validation tool emerges** (license scanning, SAST, etc.). Confirm classification (always-run vs skip-if-untouched) by the principle in §3 and that the always-run budget can absorb it.
-- **CI cost exceeds the 90s p95 wall-clock budget** for the always-run set. Revisit the budget number, the always-run set membership, or both.
+- **A new universally-applicable validation tool emerges** (license scanning, SAST, etc.). Since 2026-08-20 every layer always-runs, so the only classification question is whether its cost belongs in the guard+audit fast-tier budget (like layers 3/6) or outside it (like the language layers and Layer 7) — decide by the principle in §3.
+- **CI cost exceeds the 90s p95 wall-clock budget** for the guard+audit fast tier. Revisit the budget number, the fast-tier membership, or both.
 - **Mean-time-to-resolution for high-severity audit advisories exceeds 14 days.** Trigger audit-triage workflow design (Section 12 tripwire).
 - **Intentional wire-break override mechanism causes friction** (post-R-61 task #31 retrospective).
 - **Layer 7 flake rate exceeds 2% weekly.** Quarantine policy is the immediate response; persistent breach signals deeper restructuring.
-- **Per-language `changed.sh` predicates drift** in detectable strictness asymmetry (caught by `_test_changed_predicates.sh` meta-test, but worth ADR amendment if structural).
+- ~~**Per-language `changed.sh` predicates drift**~~ — **RETIRED 2026-08-20**: the per-lang predicates and their meta-test were removed with the skip-if-untouched policy (§2/§3 amendments); no drift trigger remains.
 
 ## Implementation Notes
 
@@ -556,10 +556,10 @@ Trigger an ADR amendment or successor ADR when any of the following occurs:
 - **Wave 2 must precede R-61 task #31.** The proto rename sweep needs `buf breaking` available locally. Without Wave 2 #4, task #31 cannot self-validate its wire-breaking changes.
 - **Task #17 is re-scoped, not blocked.** The `ci-client.yml` workflow becomes thin: it calls `scripts/layer-all.sh` and surfaces the structured summary output. The `pnpm audit`, `buf lint`, `buf breaking` invocations move from inline-in-workflow to per-language wrappers — same gates, fewer places.
 - **`_get_base_ref.sh` must emit its `BASE_REF=...` line to stderr on every invocation.** The runbook depends on this for "what diff did the validation actually see?" debugging.
-- **`scripts/lang/_dispatch.sh::for_each_lang_with_verb`** must lint at startup that every `lang/<X>/` has an executable `changed.sh`. Loud absence beats silent absence.
-- **`_test_changed_predicates.sh`** must be invoked from `scripts/layer3.sh` (Guards layer) so meta-test runs on every devloop, not just at PR time.
+- ~~**`for_each_lang_with_verb`** must lint at startup that every `lang/<X>/` has an executable `changed.sh`~~ — **RETIRED 2026-08-20** (§2/§3 amendments): `changed.sh` is removed; the dispatcher always-runs every verb.
+- ~~**`_test_changed_predicates.sh`** must be invoked from `scripts/layer3.sh`~~ — **RETIRED 2026-08-20**: the meta-test and its layer3 invocation were removed with the `changed.sh` classifier.
 - **Wave 1 ships `scripts/lang/_get_base_ref.test.sh`** alongside the helper itself. Self-test matrix: local-clean, local-dirty, local-with-untracked, CI-PR, CI-push, first-commit.
-- **Failure messages from any `changed.sh` or dispatch helper** must name the unhandled file path and point at the relevant `lang/<X>/changed.sh` so contributors hit a wall with a clear next step.
+- **Failure messages from any dispatch helper** must name the unhandled file path so contributors hit a wall with a clear next step. (The former `changed.sh` clause is moot — `changed.sh` was retired 2026-08-20.)
 - **Untracked-file inclusion in local mode** is the difference between "your branch validates correctly before commit" and "your validation lies until you stage everything." Don't drop it.
 
 ## Participants

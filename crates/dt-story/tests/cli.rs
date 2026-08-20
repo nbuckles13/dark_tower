@@ -54,7 +54,6 @@ fn next_runnable_prints_json_and_exits_zero() {
     let json: serde_json::Value = serde_json::from_str(stdout.trim()).expect("stdout JSON");
     assert_eq!(json["id"], 2);
     assert_eq!(json["specialist"], "global-controller");
-    assert_eq!(json["env_tests"], true);
     let prompt = json["prompt"].as_str().expect("prompt string");
     assert_eq!(
         prompt, "Implement the join endpoint.\nReturn a meeting token on success.\n",
@@ -380,7 +379,6 @@ fn add_task_appends_runnable_pending_task() {
         .arg(&prompt_path)
         .arg("--tag")
         .arg("audit-remediation-rust")
-        .arg("--env-tests")
         .output()
         .expect("run");
     assert!(output.status.success(), "add-task must exit 0 on append");
@@ -398,7 +396,6 @@ fn add_task_appends_runnable_pending_task() {
     let added = manifest.task(new_id).expect("added task");
     assert_eq!(added.status, Status::Pending);
     assert_eq!(added.specialist.as_deref(), Some("infrastructure"));
-    assert_eq!(added.env_tests, Some(true));
     assert_eq!(added.tag.as_deref(), Some("audit-remediation-rust"));
     // Trailing newline trimmed, internal newline preserved.
     assert_eq!(
@@ -439,7 +436,7 @@ fn add_task_with_existing_tag_is_idempotent_noop() {
             .expect("run")
     };
 
-    // First append: exit 0, new id 4, env_tests defaults to false (flag absent).
+    // First append: exit 0, new id 4.
     let first = add();
     assert!(first.status.success());
     let first_id: u32 = String::from_utf8(first.stdout)
@@ -449,14 +446,6 @@ fn add_task_with_existing_tag_is_idempotent_noop() {
         .expect("id");
     assert_eq!(first_id, 4);
     let after_first = fs::read_to_string(&story).expect("read story");
-    assert_eq!(
-        parse_manifest(&after_first)
-            .task(first_id)
-            .expect("added task")
-            .env_tests,
-        Some(false),
-        "absent --env-tests flag must default to false"
-    );
 
     // Second append with the same tag: exit 4, prints the existing id, no write.
     let second = add();
@@ -509,7 +498,7 @@ fn add_task_missing_prompt_file_exits_two() {
 #[test]
 fn validate_accepts_manifest_with_tagged_task() {
     let (code, stderr) = run_validate(
-        "story: s\ntasks:\n- id: 1\n  status: pending\n  specialist: test\n  env_tests: false\n  prompt: p\n  tag: audit-remediation-ts\n",
+        "story: s\ntasks:\n- id: 1\n  status: pending\n  specialist: test\n  prompt: p\n  tag: audit-remediation-ts\n",
     );
     assert_eq!(
         code, 0,
@@ -554,7 +543,7 @@ fn validate_rejects_unknown_field() {
 #[test]
 fn validate_rejects_dangling_dep() {
     let (code, stderr) = run_validate(
-        "story: s\ntasks:\n- id: 1\n  status: pending\n  specialist: test\n  env_tests: false\n  deps: [9]\n  prompt: p\n",
+        "story: s\ntasks:\n- id: 1\n  status: pending\n  specialist: test\n  deps: [9]\n  prompt: p\n",
     );
     assert_eq!(code, 1);
     assert!(
@@ -567,8 +556,8 @@ fn validate_rejects_dangling_dep() {
 fn validate_rejects_dependency_cycle() {
     let (code, stderr) = run_validate(
         "story: s\ntasks:\n\
-         - id: 1\n  status: pending\n  specialist: test\n  env_tests: false\n  deps: [2]\n  prompt: p\n\
-         - id: 2\n  status: pending\n  specialist: test\n  env_tests: false\n  deps: [1]\n  prompt: p\n",
+         - id: 1\n  status: pending\n  specialist: test\n  deps: [2]\n  prompt: p\n\
+         - id: 2\n  status: pending\n  specialist: test\n  deps: [1]\n  prompt: p\n",
     );
     assert_eq!(code, 1);
     assert!(stderr.contains("cycle"), "got: {stderr}");
@@ -585,9 +574,8 @@ fn validate_rejects_duplicate_id() {
 
 #[test]
 fn validate_rejects_pending_task_missing_prompt() {
-    let (code, stderr) = run_validate(
-        "story: s\ntasks:\n- id: 1\n  status: pending\n  specialist: test\n  env_tests: true\n",
-    );
+    let (code, stderr) =
+        run_validate("story: s\ntasks:\n- id: 1\n  status: pending\n  specialist: test\n");
     assert_eq!(code, 1);
     assert!(
         stderr.contains("pending task 1 has no prompt"),
@@ -612,15 +600,15 @@ fn story_in_tempdir(yaml_body: &str) -> (tempfile::TempDir, PathBuf) {
 }
 
 /// Task ids deliberately out of ascending order, all three statuses present,
-/// and every non-projected field populated — `specialist`, `env_tests`,
-/// `prompt`, `commit`, `escalation`. Any of those appearing in the output is
+/// and every non-projected field populated — `specialist`, `prompt`,
+/// `commit`, `escalation`. Any of those appearing in the output is
 /// a widening of the projection. Task 1 carries a `slug`, which IS projected
 /// (rule 1: its named consumer is `/close-story` Phase 1/4), and tasks 2/3 do
 /// not, so the `null`-not-absent property below is exercised too.
 const MIXED_MANIFEST: &str = "story: s\ntasks:\n\
-- id: 3\n  status: pending\n  specialist: protocol\n  env_tests: false\n  deps:\n  - 1\n  prompt: |\n    third\n\
+- id: 3\n  status: pending\n  specialist: protocol\n  deps:\n  - 1\n  prompt: |\n    third\n\
 - id: 1\n  status: completed\n  commit: abc1234\n  slug: 2026-08-13-some-devloop\n\
-- id: 2\n  status: escalated\n  specialist: test\n  env_tests: true\n  deps:\n  - 1\n  prompt: |\n    second\n  escalation: /tmp/devloop/story-runner/s/task-2.log\n";
+- id: 2\n  status: escalated\n  specialist: test\n  deps:\n  - 1\n  prompt: |\n    second\n  escalation: /tmp/devloop/story-runner/s/task-2.log\n";
 
 #[test]
 fn list_tasks_projects_exactly_four_keys_in_manifest_order() {
@@ -699,14 +687,7 @@ fn list_tasks_projects_exactly_four_keys_in_manifest_order() {
     // The projection must NOT be a serialization of `manifest::Task`: the
     // uncontrolled/non-durable fields stay off the wire (rules 2 and 3).
     for element in array {
-        for banned in [
-            "prompt",
-            "commit",
-            "escalation",
-            "specialist",
-            "env_tests",
-            "tag",
-        ] {
+        for banned in ["prompt", "commit", "escalation", "specialist", "tag"] {
             assert!(
                 element.get(banned).is_none(),
                 "{banned} must not be projected: {element}"
@@ -721,8 +702,8 @@ fn list_tasks_projects_exactly_four_keys_in_manifest_order() {
 /// Without that guarantee the read-only assertion below would pass against a
 /// `list-tasks` that simply delegated to `next`.
 const REOPEN_MANIFEST: &str = "story: s\ntasks:\n\
-- id: 1\n  status: escalated\n  specialist: test\n  env_tests: false\n  prompt: |\n    only task\n  escalation: /tmp/devloop/story-runner/s/task-1.log\n\
-- id: 2\n  status: pending\n  specialist: test\n  env_tests: false\n  deps:\n  - 1\n  prompt: |\n    blocked on 1\n";
+- id: 1\n  status: escalated\n  specialist: test\n  prompt: |\n    only task\n  escalation: /tmp/devloop/story-runner/s/task-1.log\n\
+- id: 2\n  status: pending\n  specialist: test\n  deps:\n  - 1\n  prompt: |\n    blocked on 1\n";
 
 #[test]
 fn list_tasks_never_writes_the_story_file() {
@@ -845,12 +826,34 @@ fn validate_rejects_removed_branch_field() {
     );
 }
 
+/// `env_tests` was a required field whose only consumer — run-story's per-task
+/// layer-7 gate — is gone now that layer 7 runs on every task. Removing it from
+/// the struct makes every manifest still carrying it fail `deny_unknown_fields`.
+///
+/// Exact mirror of `validate_rejects_removed_branch_field`: the edited fixtures
+/// prove the NEW shape parses and say nothing about the OLD one, so the
+/// rejection is asserted directly here — otherwise a reintroduced
+/// `pub env_tests` would slip past the whole suite. Field named in the error so
+/// a stale-binary vs stale-manifest diagnosis stays possible.
+#[test]
+fn validate_rejects_removed_env_tests_field() {
+    let (code, stderr) = run_validate(
+        "story: s\ntasks:\n- id: 1\n  status: pending\n  specialist: test\n  env_tests: true\n  prompt: p\n",
+    );
+    assert_eq!(code, 1, "a manifest still carrying `env_tests` must fail");
+    assert!(
+        stderr.contains("env_tests"),
+        "the violation must name the offending field so a stale-binary vs \
+         stale-manifest diagnosis is possible, got: {stderr}"
+    );
+}
+
 // --- Slug: class enforcement, round-trip, last-writer-wins ----------------
 
 #[test]
 fn slug_round_trips_through_complete() {
     let (dir, story) = story_in_tempdir(
-        "story: s\ntasks:\n- id: 1\n  status: pending\n  specialist: test\n  env_tests: false\n  prompt: p\n",
+        "story: s\ntasks:\n- id: 1\n  status: pending\n  specialist: test\n  prompt: p\n",
     );
     dt_story()
         .args(["complete"])
@@ -894,7 +897,7 @@ fn invalid_slug_fails_the_whole_manifest_to_parse() {
 #[test]
 fn complete_rejects_out_of_class_slug_at_the_cli_boundary() {
     let (_dir, story) = story_in_tempdir(
-        "story: s\ntasks:\n- id: 1\n  status: pending\n  specialist: test\n  env_tests: false\n  prompt: p\n",
+        "story: s\ntasks:\n- id: 1\n  status: pending\n  specialist: test\n  prompt: p\n",
     );
     // Enforced at the clap boundary as well as in the deserializer, because
     // `--slug` is a SECOND producer (a model on a command line), less
@@ -918,7 +921,7 @@ fn complete_rejects_out_of_class_slug_at_the_cli_boundary() {
 #[test]
 fn slug_is_last_writer_wins_on_an_already_completed_task() {
     let (_dir, story) = story_in_tempdir(
-        "story: s\ntasks:\n- id: 1\n  status: pending\n  specialist: test\n  env_tests: false\n  prompt: p\n",
+        "story: s\ntasks:\n- id: 1\n  status: pending\n  specialist: test\n  prompt: p\n",
     );
     for slug in ["2026-08-16-first-attempt", "2026-08-17-second-attempt"] {
         dt_story()
@@ -959,7 +962,7 @@ fn commit_is_not_overwritten_on_an_already_completed_task() {
 #[test]
 fn complete_without_slug_preserves_an_existing_slug() {
     let (_dir, story) = story_in_tempdir(
-        "story: s\ntasks:\n- id: 1\n  status: pending\n  specialist: test\n  env_tests: false\n  prompt: p\n  slug: 2026-08-17-hand-written\n",
+        "story: s\ntasks:\n- id: 1\n  status: pending\n  specialist: test\n  prompt: p\n  slug: 2026-08-17-hand-written\n",
     );
     dt_story()
         .args(["complete"])
@@ -1152,8 +1155,8 @@ fn add_task_existing_tag_discards_supplied_fields_and_says_so() {
 fn story_with_injected_prompt(injected: &str, after: &str) -> String {
     format!(
         "# Title\n\nprose\n\n```yaml\n# task-metadata (dt-story manifest v1)\nstory: s\ntasks:\n\
-         - id: 1\n  status: pending\n  specialist: test\n  env_tests: false\n  prompt: |\n\
-         {injected}\n- id: 2\n  status: pending\n  specialist: test\n  env_tests: false\n  prompt: p\n\
+         - id: 1\n  status: pending\n  specialist: test\n  prompt: |\n\
+         {injected}\n- id: 2\n  status: pending\n  specialist: test\n  prompt: p\n\
          ```\n\n{after}\n"
     )
 }

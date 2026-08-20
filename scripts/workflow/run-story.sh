@@ -944,7 +944,6 @@ while :; do
     slogerr "STORY_RUN: INVALID-SPECIALIST task=${id} — specialist '${specialist}' is not a plain token ([a-z][a-z0-9-]*). It is interpolated as a flag value, so anything else changes what the devloop is told to do."
     exit 2
   fi
-  env_tests="$(jq -r .env_tests <<<"$task_json")"
   prompt_file="$RUN_DIR/task-${id}.prompt"
   jq -r .prompt <<<"$task_json" >"$prompt_file"
 
@@ -1155,10 +1154,13 @@ while :; do
   fi
   [ "$head_after" = "$head_before" ] && escalate "$id" devloop-no-commit "$tasklog"
 
-  # Gate: fast floor (layers 1-6) every task; layer 7 only when the task is
-  # tagged env_tests. Full pipeline incl. layer 7 runs once at story close.
-  gate_layers="1-6"
-  [ "$env_tests" = "true" ] && gate_layers="1-6+7"
+  # Gate: EVERY task runs layers 1-6 then layer 7 (2026-08-20 — layer 7 is now
+  # UNCONDITIONAL, no longer gated on an env_tests tag; that manifest field was
+  # removed). The `1-6+7` label is kept deliberately: layer 7 is a separate
+  # ~10-15min cost envelope (the 90s guard+audit fast-tier budget covers only a
+  # subset of 1-6), so the `+7` preserves that distinction — it no longer signals
+  # conditionality. Full pipeline incl. layer 7 also runs once at story close.
+  gate_layers="1-6+7"
   slog "STORY_RUN: GATE task=${id} layers=${gate_layers} running (log=${gatelog})"
   gate_start="$(date +%s)"
   gate_rc=0
@@ -1170,7 +1172,7 @@ while :; do
     set -e
     if [ "$rc" -ne 0 ]; then gate_rc=$rc; gate_layer=$n; break; fi
   done
-  if [ "$gate_rc" -eq 0 ] && [ "$env_tests" = "true" ]; then
+  if [ "$gate_rc" -eq 0 ]; then
     set +e
     scripts/layer7.sh >>"$gatelog" 2>&1
     gate_rc=$?

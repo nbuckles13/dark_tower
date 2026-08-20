@@ -4,9 +4,8 @@
 # Both stages route through the dispatcher (`build.sh`); INCLUDE_LANGS and
 # EXCLUDE_LANGS select which langs participate per stage. Dispatcher-as-
 # single-enforcement-point is the load-bearing pipeline invariant — every
-# lang-verb call (including stage 1) routes through it so changed.sh
-# short-circuit, STATUS aggregation, and lint-at-startup contract apply
-# uniformly. See Wave 2 #4 plan §8 for rationale.
+# lang-verb call (including stage 1) routes through it so always-run dispatch
+# and STATUS aggregation apply uniformly. See Wave 2 #4 plan §8 for rationale.
 #
 # Stage ordering is encoded in source so a future reader sees stage 1 must
 # precede stage 2: proto-derived artifacts (codegen) feed rust/ts compile.

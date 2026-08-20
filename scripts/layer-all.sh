@@ -8,11 +8,18 @@
 #
 # Budget (ADR-0033 §4 + paired-operations §2):
 #   Per-layer warn threshold: ${DEVLOOP_LAYER_BUDGET_SECS:-20}s (warn-only).
-#   Always-run subset (layers 3 + 6): hard 90s p95.
+#   Guard+audit fast tier (layers 3 + 6): hard 90s p95.
+#
+# NOTE (2026-08-20): since the language short-circuit was retired, ALL of layers 1-6
+# always-run. The 90s p95 budget deliberately covers ONLY the cheap "fast floor" —
+# layers 3 (guards) + 6 (audit) — NOT the language layers 1/2/4/5 (compile/fmt/test/lint),
+# whose cost is inherently large/variable and was never in a p95 latency budget (the same
+# reason layer 7's ~10-15min env-test envelope is excluded). "Always-run" is now the whole
+# pipeline; this budget is scoped to the fast-floor subset by design, not by accident.
 #
 # Greppable warn tokens (paired-operations §2):
 #   WARN BUDGET_BREACH LAYER=<n> DURATION=<s> BUDGET=<s>
-#   WARN BUDGET_TOTAL_BREACH ALWAYS_RUN_DURATION=<s> BUDGET=90
+#   WARN BUDGET_TOTAL_BREACH GUARD_AUDIT_DURATION=<s> BUDGET=90
 #
 # Failure triage: docs/runbooks/devloop-validation.md (all layers + §4 two-token convention).
 
@@ -87,7 +94,7 @@ rm -f "${DEVLOOP_TMP}"/layer-*.log "${DEVLOOP_TMP}"/layer-*.stderr.log "${DEVLOO
 # layer_status / layer_dur / final_exit are declared at the top (before the EXIT
 # trap install) so the verdict emitter's namerefs always bind.
 budget_secs_per_layer="${DEVLOOP_LAYER_BUDGET_SECS:-20}"
-total_budget_secs=90  # ADR-0033 §4: 90s p95 wall-clock for the always-run set (layers 3 + 6)
+total_budget_secs=90  # ADR-0033 §4: 90s p95 wall-clock for the guard+audit fast tier (layers 3 + 6)
 
 # Layer-script directory. Production is __here. The LAYER_SCRIPT_DIR override is a hermetic
 # TEST SEAM (orchestrator lane-integrity test, task #56): it points the loop at fake layer
@@ -130,16 +137,19 @@ for n in 1 2 3 4 5 6 7; do
   # Per-layer 20s warn EXCLUDES Layer 7 (task #56 ruling B): env-tests run in a separate
   # ~10–15 min envelope (ADR-0033 §4), so a Layer-7 BUDGET_BREACH would false-fire every
   # run and train operators to ignore the token. Layer 7 is also excluded from the 90s
-  # always-run total below (which sums only layers 3 + 6).
+  # guard+audit fast-tier total below (which sums only layers 3 + 6).
   if [[ $n -ne 7 && $dur -gt $budget_secs_per_layer ]]; then
     echo "WARN BUDGET_BREACH LAYER=${n} DURATION=${dur} BUDGET=${budget_secs_per_layer}" >&2
   fi
 done
 
-# Always-run subset budget check (layers 3 + 6 per ADR-0033 §4).
-always_run_dur=$(( ${layer_dur[3]:-0} + ${layer_dur[6]:-0} ))
-if [[ $always_run_dur -gt $total_budget_secs ]]; then
-  echo "WARN BUDGET_TOTAL_BREACH ALWAYS_RUN_DURATION=${always_run_dur} BUDGET=${total_budget_secs}" >&2
+# Guard+audit fast-tier budget check (layers 3 + 6 per ADR-0033 §4). Deliberately NOT a
+# sum over all always-run layers: since 2026-08-20 layers 1/2/4/5 also always-run, but
+# their compile/fmt/test/lint cost is inherently large/variable and out of this p95 budget
+# (like layer 7's env-test envelope). This is the cheap fast-floor latency guard only.
+guard_audit_dur=$(( ${layer_dur[3]:-0} + ${layer_dur[6]:-0} ))
+if [[ $guard_audit_dur -gt $total_budget_secs ]]; then
+  echo "WARN BUDGET_TOTAL_BREACH GUARD_AUDIT_DURATION=${guard_audit_dur} BUDGET=${total_budget_secs}" >&2
 fi
 
 # Aggregate total + emit machine-parseable summary block (paired-operations §5).

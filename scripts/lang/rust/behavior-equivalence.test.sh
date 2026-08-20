@@ -65,11 +65,10 @@ run_equivalence() {
       CARGO_SHIM_ARGV_LOG="$old_log" \
       "${SCRIPTS_ROOT}/lang/rust/test.sh" "${test_args[@]}" >/dev/null 2>&1 || old_rc=$?
 
-  # NEW path: invoke scripts/test.sh dispatcher.
-  # Need to also force changed.sh to say "touched" so the dispatcher actually invokes test.sh.
-  # Inject a synthetic cache so rust changed.sh returns 0.
-  local cache_tmp; cache_tmp=$(mktemp -d)
-  printf 'crates/foo/src/lib.rs\n' > "${cache_tmp}/changed-files.layer-shared"
+  # NEW path: invoke scripts/test.sh dispatcher. It always-runs test.sh (ADR-0033 §3 —
+  # there is no changed.sh gate to satisfy), so this path needs no diff/cache setup; a
+  # throwaway DEVLOOP_TMP just isolates any log writes.
+  local tmp_devloop; tmp_devloop=$(mktemp -d)
 
   local new_rc=0
   env -i \
@@ -77,10 +76,10 @@ run_equivalence() {
       HOME="$HOME" \
       DATABASE_URL="postgresql://postgres:postgres@localhost:5433/dark_tower_test" \
       CARGO_SHIM_ARGV_LOG="$new_log" \
-      DEVLOOP_TMP="$cache_tmp" \
+      DEVLOOP_TMP="$tmp_devloop" \
       "${SCRIPTS_ROOT}/test.sh" "${test_args[@]}" >/dev/null 2>&1 || new_rc=$?
 
-  rm -rf "$cache_tmp"
+  rm -rf "$tmp_devloop"
 
   # Assert exit codes match.
   if [[ "$old_rc" == "$new_rc" ]]; then

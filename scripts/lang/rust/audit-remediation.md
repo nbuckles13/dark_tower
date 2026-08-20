@@ -42,5 +42,5 @@ SUPPRESSION IS GOVERNED — it is NOT the easy way out:
 Acceptance: `DEVLOOP_AUDIT_FORCE_RUN=1 scripts/lang/rust/audit.sh` emits STATUS=OK
 (zero unsuppressed advisories); any suppression added is justified, expiring, and
 security-reviewed; `docs/TODO.md` §Dependency Vulnerabilities (cargo audit) /
-§Supply Chain updated to reflect what changed. No cluster behavior (env_tests
-false); Layers 1–6 gate the change.
+§Supply Chain updated to reflect what changed. No cluster behavior; the
+validation pipeline gates the change.

@@ -5,8 +5,7 @@
 # whose FAIL path is never tested can't be trusted to fire (security requirement).
 #
 # Wired into scripts/layer3.sh (there is no *.test.sh auto-runner), so it runs every
-# devloop + CI. Consumes scripts/lang/_test_helpers.sh (canonical shape:
-# scripts/lang/proto/changed.test.sh) + the assert_status/assert_exit helpers.
+# devloop + CI. Consumes scripts/lang/_test_helpers.sh's assert_status/assert_exit helpers.
 #
 # Determinism: "now" is injected via AUDIT_SUPPRESSIONS_NOW; fixtures are written to a
 # temp dir and pointed at via DEVLOOP_SUPPRESSIONS_MANIFEST / DEVLOOP_CARGO_AUDIT_TOML

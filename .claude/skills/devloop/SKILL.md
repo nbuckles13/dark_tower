@@ -386,17 +386,19 @@ Each `scripts/layerN.sh` is independently callable for targeted debugging (e.g.,
 
 **Pipeline failures**: see `docs/runbooks/devloop-validation.md` for layer-by-layer failure-mode mapping, exit-code / `STATUS=` enum reference, `_get_base_ref.sh` troubleshooting (the `BASE_REF=…` stderr line is the anchor), and per-language wrapper triage.
 
-**Always-Run vs Skip-If-Untouched matrix** (operational subset of ADR-0033 §3; see the ADR for the classifying principle, worked examples like `buf breaking`, and the "when in doubt, always-run" default):
+**Always-run matrix** (operational subset of ADR-0033 §3; see the ADR for the classifying principle and the "when in doubt, always-run" default). Since 2026-08-20 **every layer runs every language every run** — the per-language skip-if-untouched short-circuit was retired, so gate coverage no longer depends on change-detection:
 
-| Layer | Verb     | Always-run                                  | Skip-if-untouched per `lang/<X>/changed.sh` |
-|-------|----------|---------------------------------------------|----------------------------------------------|
-| 1     | Compile  | —                                           | rust, ts, proto                              |
-| 2     | Format   | —                                           | rust, ts, proto                              |
-| 3     | Guards   | ALL guards (each self-classifies)           | —                                            |
-| 4     | Test     | —                                           | rust, ts (proto has no `test.sh`)            |
-| 5     | Lint     | —                                           | rust, ts, proto                              |
-| 6     | Audit    | `cargo audit`, `pnpm audit`, `buf breaking` | —                                            |
-| 7     | Env-tests| dev-cluster + Rust env-tests (always) + browser E2E (diff-triggered, task #19) | —      |
+| Layer | Verb     | Runs                                                                 |
+|-------|----------|----------------------------------------------------------------------|
+| 1     | Compile  | rust, ts, proto — always                                             |
+| 2     | Format   | rust, ts, proto — always                                             |
+| 3     | Guards   | ALL guards (each self-classifies) — always                           |
+| 4     | Test     | rust, ts — always (proto has no `test.sh`)                           |
+| 5     | Lint     | rust, ts, proto — always                                             |
+| 6     | Audit    | `cargo audit`, `pnpm audit`, `buf breaking` — always dispatched; each `audit.sh` then applies its OWN dep-manifest gate internally (`SKIPPED-NO-DIFF no-dep-changes` when no dependency manifest changed — a within-wrapper decision, not a dispatcher skip) |
+| 7     | Env-tests| dev-cluster + Rust env-tests + browser E2E — all always                |
+
+The **only** remaining `SKIPPED-NO-DIFF` producer is the Layer-6 audit dep-manifest gate (`no-dep-changes`); the language-level `<lang>-no-diff` and browser `browser-e2e-no-diff` skips are gone.
 
 **Layer N/A justification template**:
 
@@ -418,10 +420,10 @@ The cases requiring implementer action are an unexpected `STATUS=N/A` outside th
 
 Layer 7 is the seventh shell-layer in `scripts/layer-all.sh`, executed automatically after layers 1-6. It always runs — intentionally broader than ADR-0030's trigger-path list, because business logic changes can break integration tests too. The full mechanism (cluster bring-up, two-phase classifier, the four STATUS lanes) lives in `scripts/layer7.sh`; failure-mode → REASON-token → fix mapping is in `docs/runbooks/devloop-validation.md §6.7`.
 
-**Layer 7 runs two Phase-2 suites sequentially against the same cluster** (task #19, R-48): first the Rust env-tests (`cargo test -p env-tests --features all`, always attempted), then the browser E2E (`pnpm --filter @darktower/web-app test:e2e`, Playwright harness from task #18) — **diff-triggered**, run only when the diff can change behavior a real browser client observes. The mechanism SSoT is `scripts/layer7.sh` (trigger-path array, precondition checks, timeouts — not re-encoded here); failure-mode → REASON-token → fix mapping is runbook §6.7.
+**Layer 7 runs two Phase-2 suites sequentially against the same cluster** (task #19, R-48): first the Rust env-tests (`cargo test -p env-tests --features all`, always attempted), then the browser E2E (`pnpm --filter @darktower/web-app test:e2e`, Playwright harness from task #18) — which **also always runs** whenever Layer 7 runs (the diff-trigger was retired 2026-08-20), subject only to its Phase-1g preconditions. The mechanism SSoT is `scripts/layer7.sh` (precondition checks, timeouts — not re-encoded here); failure-mode → REASON-token → fix mapping is runbook §6.7.
 
 **Lead policy** (the only bits not encoded in the script):
-- **Attempt budget**: Layer 7 = 2 attempts (separate from layers 1-6's 3). **Test failures** (`STATUS=FAIL`, exit 1) consume an attempt; **infrastructure/precondition failures** (`STATUS=PRECONDITION_FAILURE`, exit 2 — the operator lane) do NOT — retry once, then escalate to operations. First-run cluster setup (~7 min) does not count toward attempts. The two Phase-2 suites **share the single Layer-7 attempt**: a browser-suite `FAIL` (`browser-e2e-failed`) consumes it exactly like an env-test FAIL; a browser `PRECONDITION_FAILURE` (`dev-certs-missing` / `playwright-browser-missing`) does not. When env-tests fail first, the browser suite is skipped that attempt (loud `browser-e2e-not-run:` stderr note, no browser STATUS line) and runs on the retry; an untriggered diff reports `STATUS=SKIPPED-NO-DIFF REASON=browser-e2e-no-diff` (ranks below OK).
+- **Attempt budget**: Layer 7 = 2 attempts (separate from layers 1-6's 3). **Test failures** (`STATUS=FAIL`, exit 1) consume an attempt; **infrastructure/precondition failures** (`STATUS=PRECONDITION_FAILURE`, exit 2 — the operator lane) do NOT — retry once, then escalate to operations. First-run cluster setup (~7 min) does not count toward attempts. The two Phase-2 suites **share the single Layer-7 attempt**: a browser-suite `FAIL` (`browser-e2e-failed`) consumes it exactly like an env-test FAIL; a browser `PRECONDITION_FAILURE` (`dev-certs-missing` / `playwright-browser-missing`) does not. When env-tests fail first, the browser suite is skipped that attempt (loud `browser-e2e-not-run:` stderr note, no browser STATUS line) and runs on the retry.
 - **No cluster**: in **CI** (`GITHUB_ACTIONS`) Layer 7 self-reports `STATUS=SKIPPED-NO-CLUSTER REASON=no-cluster-ci` (exit 0) — a clean pass that does NOT mean env-tests ran; this is the ONLY skip case. A **local** devloop with no helper (or a dead helper) is `PRECONDITION_FAILURE` (exit 2, operator lane) — loud, never a silent skip — so a local code devloop can never exit-0-skip env-tests.
 
 **If pass**:

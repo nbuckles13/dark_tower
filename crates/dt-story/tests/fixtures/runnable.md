@@ -17,7 +17,6 @@ tasks:
 - id: 2
   status: pending
   specialist: global-controller
-  env_tests: true
   deps:
   - 1
   prompt: |
@@ -26,7 +25,6 @@ tasks:
 - id: 3
   status: pending
   specialist: test
-  env_tests: false
   deps:
   - 2
   prompt: |
