@@ -100,9 +100,8 @@ emit_status() {
 # Call as a one-liner from each per-language VERB wrapper (rust/ts {compile,fmt,lint,
 # test,audit} + proto {compile,fmt,lint,breaking}) right after sourcing _common.sh.
 #
-# Do NOT call from changed.sh predicates (they legitimately `exit 1` to mean "lang
-# untouched" — a trap there would synthesize a false STATUS=FAIL) or from layer
-# scripts (they own the layer_lifecycle_begin EXIT trap; a second trap would clobber it).
+# Do NOT call from layer scripts (they own the layer_lifecycle_begin EXIT trap; a second
+# trap would clobber it).
 #
 # Args: (none)
 # Outputs: (none at install time)

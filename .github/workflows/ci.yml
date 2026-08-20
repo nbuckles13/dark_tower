@@ -77,22 +77,17 @@ jobs:
         uses: bufbuild/buf-setup-action@v1
 
       - name: Build guard binaries
-        # Layer 3 guards are ALWAYS-RUN and consume target/release/dt-guard and
-        # dt-story, but those binaries are produced by a SKIP-GATED compile verb
-        # (scripts/lang/rust/changed.sh triggers only on crates/ changes). So a
-        # packages/**-only PR skips the rust compile, the binaries are absent,
-        # and _dt_guard_wrapper.sh / validate-story-manifest.sh exit 1 — a wiring
-        # fault reported on the implementer lane. Mirrors ci-client.yml's
-        # equivalent step.
-        #
-        # SCOPE: this closes the CI half ONLY. The same skip-gate lives in
-        # scripts/lang/_dispatch.sh and runs identically in a local devloop, so a
-        # fresh worktree with a packages/**-only change still reds Layer 3. And
-        # this is a SECOND build site for the same two binaries alongside
-        # scripts/lang/rust/compile.sh. Both are knowingly accepted here rather
-        # than relocating the build outside the dispatcher, which is an ADR-0033
-        # layering decision (layer1.sh calls dispatcher-as-single-enforcement-point
-        # the load-bearing pipeline invariant). Tracked in docs/TODO.md.
+        # Layer 3 guards are always-run and consume target/release/dt-guard and
+        # dt-story. Those binaries are produced by scripts/lang/rust/compile.sh,
+        # which — since the skip-if-untouched short-circuit was retired 2026-08-20
+        # (ADR-0033 §3) — now ALWAYS runs, on every diff including packages/**-only
+        # and docs-only ones. So the old producer/consumer skew (binaries absent on
+        # a non-Rust diff) can no longer occur; this step is now BELT-AND-BRACES:
+        # compile.sh's verb is `cargo build`/`cargo check` and this explicit release
+        # build guarantees target/release presence for the guards regardless. It is
+        # a second build site for the same two binaries (a knowingly-accepted SSoT
+        # cost, no longer a correctness requirement — see docs/TODO.md §Polyglot).
+        # Mirrors ci-client.yml's equivalent step.
         run: cargo build --release -p dt-guard -p dt-story
 
       - name: Install Playwright Chromium

@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
-# _dispatch.test.sh — dispatcher loud-fail-on-missing-changed.sh test (test §E).
+# _dispatch.test.sh — dispatcher always-run + verb-dispatch + masking tests (test §E).
 #
 # Hermeticity (test §A + post-confirmation refinement): operates on a copy of
 # `_dispatch.sh` and a synthetic lang/ tree in a tempdir. Never mutates the live
 # scripts/lang/ tree — a flaky test can't leave fakeland/ behind.
+#
+# NB (2026-08-20, ADR-0033 §3): the per-lang `changed.sh` classifier was retired, so the
+# synthetic lang trees here register ONLY the verb wrapper being exercised — the dispatcher
+# always-runs it, with no changed.sh present or consulted.
 set -euo pipefail
 IFS=$'\n\t'
 
@@ -34,42 +38,6 @@ assert_nonzero_exit() {
 }
 
 # -----------------------------------------------------------------------------
-# Test: dispatcher fails loud when a lang dir lacks changed.sh
-# -----------------------------------------------------------------------------
-
-test_missing_changed_sh() {
-  local tmp; tmp=$(mktemp -d)
-  trap "rm -rf '$tmp'" RETURN
-
-  # Copy helpers + dispatcher into the tempdir so we never mutate live tree.
-  mkdir -p "${tmp}/lang/fakeland"
-  cp "${__here}/_common.sh" "${tmp}/lang/_common.sh"
-  cp "${__here}/_dispatch.sh" "${tmp}/lang/_dispatch.sh"
-
-  # fakeland/ is intentionally empty — no changed.sh.
-
-  # Invoke the dispatcher with DEVLOOP_LANG_ROOT pointing at our synthetic tree.
-  local rc=0 out
-  out=$(
-    set +e
-    DEVLOOP_LANG_ROOT="${tmp}/lang" bash -c "
-      source '${tmp}/lang/_dispatch.sh'
-      for_each_lang_with_verb 'test'
-    " 2>&1
-    echo "__rc=$?"
-  )
-  rc=$(grep -oE '__rc=[0-9]+' <<<"$out" | tail -n1 | cut -d= -f2)
-  rc="${rc:-0}"
-
-  assert_nonzero_exit "missing-changed-sh" "$rc"
-  assert_pattern_in   "missing-changed-sh" "fakeland/changed.sh" "$out"
-
-  # Cleanup explicit (RETURN trap covers the lazy path).
-  rm -rf "$tmp"
-  trap - RETURN
-}
-
-# -----------------------------------------------------------------------------
 # Test: dispatcher with a working lang emits expected STATUS shape (single-lang)
 # -----------------------------------------------------------------------------
 
@@ -81,14 +49,8 @@ test_single_lang_no_double_emit() {
   cp "${__here}/_common.sh" "${tmp}/lang/_common.sh"
   cp "${__here}/_dispatch.sh" "${tmp}/lang/_dispatch.sh"
 
-  # Synthetic changed.sh that always says "touched".
-  cat > "${tmp}/lang/fakelang/changed.sh" <<'EOF'
-#!/usr/bin/env bash
-exit 0
-EOF
-  chmod +x "${tmp}/lang/fakelang/changed.sh"
-
-  # Synthetic verb that emits its own STATUS.
+  # Synthetic verb that emits its own STATUS (the dispatcher always-runs it — there is no
+  # changed.sh gate any more).
   cat > "${tmp}/lang/fakelang/test.sh" <<'EOF'
 #!/usr/bin/env bash
 echo "STATUS=OK REASON=fakelang-test-passed"
@@ -122,42 +84,37 @@ EOF
 # -----------------------------------------------------------------------------
 # Test: stream-verbatim contract + cross-lang-masking CLOSED (task #52).
 #
-# Pairs touched_no_verb (a verb wrapper that should exist is missing → FAIL-MISSING-VERB,
-# rank 5) with untouched (SKIPPED-NO-DIFF, rank 1). This is the fixture that #50
-# documented as the masking RESIDUAL (back then the no-verb child was SKIPPED-NO-VERB
-# rank 0, dominated by the sibling → dispatcher exited 0). With FAIL-MISSING-VERB ranked
-# above OK/NO-DIFF, the residual is CLOSED: the wiring fault wins the aggregate and the
-# dispatcher exits 2 — no sibling status can mask it.
+# Pairs no_verb_lang (a verb wrapper that should exist is missing → FAIL-MISSING-VERB,
+# rank 5) with ok_lang (a working test.sh → OK, rank 2). Since the dispatcher always-runs
+# every registered lang's verb (no changed.sh gate), ok_lang's verb runs and emits OK, and
+# the masking assertion is that FAIL-MISSING-VERB beats OK in aggregate_worst_status — so
+# the wiring fault wins the aggregate and the dispatcher exits 2, no sibling status can
+# mask it.
 #
 # This test enforces:
-#   (a) the dispatcher's aggregated STATUS line is FAIL-MISSING-VERB (per the new rank),
-#       and the dispatcher exits 2,
+#   (a) the dispatcher's aggregated STATUS line is FAIL-MISSING-VERB, and it exits 2,
 #   (b) BOTH per-child STATUS lines survive VERBATIM in stdout — not silenced, not
-#       aggregated-away (the loud-on-missing-verb streaming invariant).
+#       aggregated-away (the loud-on-missing-verb streaming invariant),
+#   (c) ok_lang RAN its verb (STATUS=OK) — the always-run behavior.
 # -----------------------------------------------------------------------------
 
 test_stream_verbatim_masking_closed() {
   local tmp; tmp=$(mktemp -d)
   trap "rm -rf '$tmp'" RETURN
 
-  mkdir -p "${tmp}/lang/touched_no_verb" "${tmp}/lang/untouched"
+  mkdir -p "${tmp}/lang/no_verb_lang" "${tmp}/lang/ok_lang"
   cp "${__here}/_common.sh" "${tmp}/lang/_common.sh"
   cp "${__here}/_dispatch.sh" "${tmp}/lang/_dispatch.sh"
 
-  # touched_no_verb: changed.sh says "touched", but no test.sh exists → FAIL-MISSING-VERB.
-  cat > "${tmp}/lang/touched_no_verb/changed.sh" <<'EOF'
+  # no_verb_lang: no test.sh → the dispatcher must emit FAIL-MISSING-VERB for this lang.
+
+  # ok_lang: a working verb → the dispatcher always-runs it and it emits OK.
+  cat > "${tmp}/lang/ok_lang/test.sh" <<'EOF'
 #!/usr/bin/env bash
+echo "STATUS=OK REASON=ok-lang-ran"
 exit 0
 EOF
-  chmod +x "${tmp}/lang/touched_no_verb/changed.sh"
-  # No test.sh — dispatcher must emit FAIL-MISSING-VERB for this lang.
-
-  # untouched: changed.sh says "untouched" (exit 1) → SKIPPED-NO-DIFF.
-  cat > "${tmp}/lang/untouched/changed.sh" <<'EOF'
-#!/usr/bin/env bash
-exit 1
-EOF
-  chmod +x "${tmp}/lang/untouched/changed.sh"
+  chmod +x "${tmp}/lang/ok_lang/test.sh"
 
   local out rc
   out=$(
@@ -171,33 +128,33 @@ EOF
   rc=$(grep -oE '__rc=[0-9]+' <<<"$out" | tail -n1 | cut -d= -f2)
 
   # (b) per-child FAIL-MISSING-VERB line MUST be in the verbatim stream.
-  if grep -q '^STATUS=FAIL-MISSING-VERB.*touched_no_verb' <<<"$out"; then
+  if grep -q '^STATUS=FAIL-MISSING-VERB.*no_verb_lang' <<<"$out"; then
     PASS=$((PASS + 1))
   else
     FAIL=$((FAIL + 1))
-    FAILURES+=("[stream-verbatim] per-child FAIL-MISSING-VERB for touched_no_verb missing from stdout
+    FAILURES+=("[stream-verbatim] per-child FAIL-MISSING-VERB for no_verb_lang missing from stdout
   output:
 ${out}
   → ADR-0033 §6 'loud-on-missing-verb' invariant relies on verbatim streaming")
   fi
 
-  # Per-child NO-DIFF line MUST also be in the verbatim stream.
-  if grep -q '^STATUS=SKIPPED-NO-DIFF.*untouched' <<<"$out"; then
+  # (c) ok_lang's verb RAN (always-run) — its child OK line must be in the verbatim stream.
+  if grep -q '^STATUS=OK REASON=ok-lang-ran' <<<"$out"; then
     PASS=$((PASS + 1))
   else
     FAIL=$((FAIL + 1))
-    FAILURES+=("[stream-verbatim] per-child SKIPPED-NO-DIFF for untouched missing from stdout: ${out}")
+    FAILURES+=("[stream-verbatim] ok_lang did NOT run its verb — the dispatcher should always-run every registered lang: ${out}")
   fi
 
   # (a) aggregated dispatcher STATUS line is the LAST STATUS= line; FAIL-MISSING-VERB
-  # (rank 5) wins over SKIPPED-NO-DIFF (rank 1) — masking closed.
+  # (rank 5) wins over OK (rank 2) — masking closed.
   local last_status
   last_status=$(grep '^STATUS=' <<<"$out" | tail -n1 | sed -n 's/^STATUS=\([^ ]*\).*/\1/p')
   if [[ "$last_status" == "FAIL-MISSING-VERB" ]]; then
     PASS=$((PASS + 1))
   else
     FAIL=$((FAIL + 1))
-    FAILURES+=("[stream-verbatim] aggregated STATUS expected FAIL-MISSING-VERB (rank 5 beats NO-DIFF), got '${last_status}': ${out}")
+    FAILURES+=("[stream-verbatim] aggregated STATUS expected FAIL-MISSING-VERB (rank 5 beats OK), got '${last_status}': ${out}")
   fi
   # And the dispatcher exits 2 — the wiring fault is no longer masked by the sibling.
   assert_nonzero_exit "stream-verbatim:rc" "$rc"
@@ -211,9 +168,9 @@ ${out}
 # INCLUDE_LANGS / EXCLUDE_LANGS are Wave 2 #4 additions. layer1.sh uses
 # INCLUDE for stage 1 (proto only) and EXCLUDE for stage 2 (rust+ts). Single-
 # lang exact match for Wave 2 — multi-lang/comma-split deferred per YAGNI.
-# Sentinel-file assertions confirm filter runs BEFORE the changed.sh
-# invocation loop (observability bonus check): a filtered-out lang's
-# changed.sh must not be invoked at all (no cache-write side-effects).
+# Sentinel-file assertions confirm the filter runs BEFORE any per-lang work
+# (observability bonus check): a filtered-out lang's verb must not be invoked
+# at all. The sentinel is touched by the VERB (test.sh).
 # -----------------------------------------------------------------------------
 
 test_include_langs_keeps() {
@@ -225,14 +182,11 @@ test_include_langs_keeps() {
   cp "${__here}/_dispatch.sh" "${tmp}/lang/_dispatch.sh"
 
   for lang in kept_lang excluded_lang; do
-    cat > "${tmp}/lang/${lang}/changed.sh" <<EOF
-#!/usr/bin/env bash
-touch "${tmp}/${lang}.sentinel"
-exit 0
-EOF
-    chmod +x "${tmp}/lang/${lang}/changed.sh"
+    # Sentinel touched by the VERB: its presence proves the verb RAN for the kept lang
+    # and its absence proves the filtered-out lang was dropped BEFORE any per-lang work.
     cat > "${tmp}/lang/${lang}/test.sh" <<EOF
 #!/usr/bin/env bash
+touch "${tmp}/${lang}.sentinel"
 echo "STATUS=OK REASON=${lang}-test-passed"
 EOF
     chmod +x "${tmp}/lang/${lang}/test.sh"
@@ -259,11 +213,11 @@ EOF
     PASS=$((PASS + 1))
   else
     FAIL=$((FAIL + 1))
-    FAILURES+=("[include-keeps:kept-changed-sh-ran] kept_lang.sentinel missing — changed.sh was not invoked")
+    FAILURES+=("[include-keeps:kept-verb-ran] kept_lang.sentinel missing — the kept lang's verb was not invoked")
   fi
   if [[ -e "${tmp}/excluded_lang.sentinel" ]]; then
     FAIL=$((FAIL + 1))
-    FAILURES+=("[include-keeps:excluded-changed-sh-not-run] excluded_lang.sentinel present — filter did not run before the changed.sh invocation loop")
+    FAILURES+=("[include-keeps:excluded-verb-not-run] excluded_lang.sentinel present — filter did not run before the verb dispatch loop")
   else
     PASS=$((PASS + 1))
   fi
@@ -286,14 +240,11 @@ test_exclude_langs_drops() {
   cp "${__here}/_dispatch.sh" "${tmp}/lang/_dispatch.sh"
 
   for lang in kept_lang excluded_lang; do
-    cat > "${tmp}/lang/${lang}/changed.sh" <<EOF
-#!/usr/bin/env bash
-touch "${tmp}/${lang}.sentinel"
-exit 0
-EOF
-    chmod +x "${tmp}/lang/${lang}/changed.sh"
+    # Sentinel touched by the VERB: its presence proves the verb RAN for the kept lang
+    # and its absence proves the filtered-out lang was dropped BEFORE any per-lang work.
     cat > "${tmp}/lang/${lang}/test.sh" <<EOF
 #!/usr/bin/env bash
+touch "${tmp}/${lang}.sentinel"
 echo "STATUS=OK REASON=${lang}-test-passed"
 EOF
     chmod +x "${tmp}/lang/${lang}/test.sh"
@@ -320,11 +271,11 @@ EOF
     PASS=$((PASS + 1))
   else
     FAIL=$((FAIL + 1))
-    FAILURES+=("[exclude-drops:kept-changed-sh-ran] kept_lang.sentinel missing")
+    FAILURES+=("[exclude-drops:kept-verb-ran] kept_lang.sentinel missing")
   fi
   if [[ -e "${tmp}/excluded_lang.sentinel" ]]; then
     FAIL=$((FAIL + 1))
-    FAILURES+=("[exclude-drops:excluded-changed-sh-not-run] excluded_lang.sentinel present")
+    FAILURES+=("[exclude-drops:excluded-verb-not-run] excluded_lang.sentinel present")
   else
     PASS=$((PASS + 1))
   fi
@@ -349,12 +300,8 @@ test_filter_empty_after_filter() {
   mkdir -p "${tmp}/lang/fakelang"
   cp "${__here}/_common.sh"   "${tmp}/lang/_common.sh"
   cp "${__here}/_dispatch.sh" "${tmp}/lang/_dispatch.sh"
-
-  cat > "${tmp}/lang/fakelang/changed.sh" <<'EOF'
-#!/usr/bin/env bash
-exit 0
-EOF
-  chmod +x "${tmp}/lang/fakelang/changed.sh"
+  # fakelang has no wrappers — irrelevant here: INCLUDE=nonexistent clears the lang set
+  # before any dispatch, so the outcome is SKIPPED-NO-VERB all-langs-filtered.
 
   local out rc
   out=$(
@@ -538,9 +485,10 @@ __run_audit_dispatch_through_layer6() {
     printf 'source %q\n' "$common"
     printf 'source %q\n' "${lang_root}/_dispatch.sh"
     printf 'layer_lifecycle_begin 6\n'
-    # Mirror layer6.sh: the audit dispatch (always-run) piped through tee_collect_statuses
-    # at top-level command position (lastpipe) so the layer aggregates the full stream.
-    printf 'DEVLOOP_LANG_ROOT=%q DEVLOOP_DISPATCH_ALWAYS_RUN=1 for_each_lang_with_verb "audit" 2>&1 | tee_collect_statuses\n' "$lang_root"
+    # Mirror layer6.sh: the audit dispatch (dispatcher is unconditionally always-run) piped
+    # through tee_collect_statuses at top-level command position (lastpipe) so the layer
+    # aggregates the full stream.
+    printf 'DEVLOOP_LANG_ROOT=%q for_each_lang_with_verb "audit" 2>&1 | tee_collect_statuses\n' "$lang_root"
   } > "$layer"
   local out rc=0
   out=$(bash "$layer" 2>&1) || rc=$?
@@ -560,12 +508,9 @@ test_audit_missing_wrapper_reds_layer() {
   # assert (rc AND token): FAIL-MISSING-VERB→2 and UNKNOWN→2 collide on the bare code, so
   # the token proves the layer redded for the RIGHT cause.
   mkdir -p "${tmp}/present" "${tmp}/gone"
-  printf '#!/usr/bin/env bash\nexit 0\n' > "${tmp}/present/changed.sh"
-  chmod +x "${tmp}/present/changed.sh"
   printf '#!/usr/bin/env bash\necho "STATUS=OK REASON=present-audit-passed"\n' > "${tmp}/present/audit.sh"
   chmod +x "${tmp}/present/audit.sh"
-  printf '#!/usr/bin/env bash\nexit 0\n' > "${tmp}/gone/changed.sh"
-  chmod +x "${tmp}/gone/changed.sh"   # no audit.sh — the missing gate
+  # gone/ has no audit.sh — the missing (deleted/chmod-stripped) dep-vuln gate.
 
   local r out rc
   r=$(__run_audit_dispatch_through_layer6 "$tmp")
@@ -590,12 +535,8 @@ test_audit_placeholder_gap_stays_0() {
   cp "${__here}/_dispatch.sh" "${tmp}/_dispatch.sh"
 
   mkdir -p "${tmp}/present" "${tmp}/protolike"
-  printf '#!/usr/bin/env bash\nexit 0\n' > "${tmp}/present/changed.sh"
-  chmod +x "${tmp}/present/changed.sh"
   printf '#!/usr/bin/env bash\necho "STATUS=OK REASON=present-audit-passed"\n' > "${tmp}/present/audit.sh"
   chmod +x "${tmp}/present/audit.sh"
-  printf '#!/usr/bin/env bash\nexit 0\n' > "${tmp}/protolike/changed.sh"
-  chmod +x "${tmp}/protolike/changed.sh"
   # Placeholder audit.sh emitting N/A — the canonical intentional-gap registration.
   printf '#!/usr/bin/env bash\necho "STATUS=N/A REASON=not-applicable-to-this-lang"\n' > "${tmp}/protolike/audit.sh"
   chmod +x "${tmp}/protolike/audit.sh"
@@ -645,8 +586,7 @@ test_missing_verb_single_lang() {
   mkdir -p "${tmp}/lang/fakeland"
   cp "${__here}/_common.sh"   "${tmp}/lang/_common.sh"
   cp "${__here}/_dispatch.sh" "${tmp}/lang/_dispatch.sh"
-  printf '#!/usr/bin/env bash\nexit 0\n' > "${tmp}/lang/fakeland/changed.sh"
-  chmod +x "${tmp}/lang/fakeland/changed.sh"  # touched, but no test.sh
+  # fakeland has no test.sh — the dispatcher always-runs the verb and finds it missing.
 
   local out rc
   out=$(run_dispatch "${tmp}/lang" "" "test")
@@ -660,7 +600,7 @@ test_missing_verb_single_lang() {
   rm -rf "$tmp"; trap - RETURN
 }
 
-# All-langs-missing (2 langs, both touched, both missing verb) → aggregate winner is
+# All-langs-missing (2 langs, both missing verb) → aggregate winner is
 # FAIL-MISSING-VERB → exit 2.
 test_missing_verb_all_langs() {
   local tmp; tmp=$(mktemp -d)
@@ -668,10 +608,7 @@ test_missing_verb_all_langs() {
   mkdir -p "${tmp}/lang/alpha" "${tmp}/lang/beta"
   cp "${__here}/_common.sh"   "${tmp}/lang/_common.sh"
   cp "${__here}/_dispatch.sh" "${tmp}/lang/_dispatch.sh"
-  for l in alpha beta; do
-    printf '#!/usr/bin/env bash\nexit 0\n' > "${tmp}/lang/${l}/changed.sh"
-    chmod +x "${tmp}/lang/${l}/changed.sh"
-  done
+  # Neither alpha nor beta ships test.sh → each FAIL-MISSING-VERB.
 
   local out rc
   out=$(run_dispatch "${tmp}/lang" "" "test")
@@ -692,8 +629,6 @@ test_placeholder_gap_verb_zero() {
   mkdir -p "${tmp}/lang/fakeland"
   cp "${__here}/_common.sh"   "${tmp}/lang/_common.sh"
   cp "${__here}/_dispatch.sh" "${tmp}/lang/_dispatch.sh"
-  printf '#!/usr/bin/env bash\nexit 0\n' > "${tmp}/lang/fakeland/changed.sh"
-  chmod +x "${tmp}/lang/fakeland/changed.sh"
   # Placeholder verb wrapper — the intentional-gap registration.
   printf '#!/usr/bin/env bash\necho "STATUS=N/A REASON=not-applicable-to-this-lang"\n' > "${tmp}/lang/fakeland/test.sh"
   chmod +x "${tmp}/lang/fakeland/test.sh"
@@ -718,34 +653,30 @@ test_placeholder_gap_verb_zero() {
 # PARAMETRIC cross-lang-masking CLOSED across EVERY verb (criterion a). For each of
 # compile/fmt/lint/test/audit: an `ok` lang with a working <verb>.sh (emits OK) co-running
 # with a `missing` lang that lacks <verb>.sh → aggregate FAIL-MISSING-VERB (rank 5 beats
-# OK rank 2) → exit 2. The `audit` row runs under DEVLOOP_DISPATCH_ALWAYS_RUN=1 — the only
-# mode scripts/audit.sh invokes the dispatcher in (the security-critical (f) path). Dual
-# assert per verb (aggregate token AND rc): FAIL-MISSING-VERB→2 and UNKNOWN→2 collide on
-# the bare code, so the token proves it redded for the RIGHT cause.
+# OK rank 2) → exit 2. Every verb — including `audit` (the security-critical (f) path) —
+# runs under the dispatcher's unconditional always-run behavior (no env knob). Dual assert
+# per verb (aggregate token AND rc): FAIL-MISSING-VERB→2 and UNKNOWN→2 collide on the bare
+# code, so the token proves it redded for the RIGHT cause.
 test_parametric_masking_closed_all_verbs() {
   local tmp; tmp=$(mktemp -d)
   trap "rm -rf '$tmp'" RETURN
   cp "${__here}/_common.sh"   "${tmp}/_common.sh"
   cp "${__here}/_dispatch.sh" "${tmp}/_dispatch.sh"
 
-  # ok lang: touched changed.sh + a working wrapper for EVERY verb (emits OK).
-  # missing lang: touched changed.sh, but NO verb wrappers at all → every verb FAIL-MISSING-VERB.
+  # ok lang: a working wrapper for EVERY verb (emits OK).
+  # missing lang: NO verb wrappers at all → every verb FAIL-MISSING-VERB.
   mkdir -p "${tmp}/ok" "${tmp}/missing"
-  printf '#!/usr/bin/env bash\nexit 0\n' > "${tmp}/ok/changed.sh";      chmod +x "${tmp}/ok/changed.sh"
-  printf '#!/usr/bin/env bash\nexit 0\n' > "${tmp}/missing/changed.sh"; chmod +x "${tmp}/missing/changed.sh"
   local verb
   for verb in compile fmt lint test audit; do
     printf '#!/usr/bin/env bash\necho "STATUS=OK REASON=ok-%s-passed"\n' "$verb" > "${tmp}/ok/${verb}.sh"
     chmod +x "${tmp}/ok/${verb}.sh"
   done
 
-  local env_pairs out rc
+  local out rc
   for verb in compile fmt lint test audit; do
-    # The audit verb runs always-run (scripts/audit.sh's mode); the rest run the default
-    # changed.sh-gated path (both langs are touched, so both participate either way).
-    env_pairs=""
-    [[ "$verb" == "audit" ]] && env_pairs="DEVLOOP_DISPATCH_ALWAYS_RUN=1"
-    out=$(run_dispatch "${tmp}" "${env_pairs}" "${verb}")
+    # All verbs run always-run (the dispatcher is unconditionally always-run); both langs
+    # participate regardless of changed.sh.
+    out=$(run_dispatch "${tmp}" "" "${verb}")
     rc=$(grep -oE '__rc=[0-9]+' <<<"$out" | tail -n1 | cut -d= -f2)
 
     # aggregate token (the LAST STATUS= line) must be FAIL-MISSING-VERB.
@@ -768,7 +699,6 @@ test_parametric_masking_closed_all_verbs() {
 # Run all
 # -----------------------------------------------------------------------------
 
-test_missing_changed_sh
 test_single_lang_no_double_emit
 test_stream_verbatim_masking_closed
 test_include_langs_keeps

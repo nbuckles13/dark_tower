@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Lint dispatcher: invokes lang/<X>/lint.sh per language with skip-if-untouched.
+# Lint dispatcher: invokes lang/<X>/lint.sh for every language (always-run — the
+# skip-if-untouched short-circuit was retired 2026-08-20, ADR-0033 §3).
 set -euo pipefail
 IFS=$'\n\t'
 source "$(dirname "$0")/lang/_dispatch.sh"

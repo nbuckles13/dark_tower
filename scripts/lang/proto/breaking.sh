@@ -3,7 +3,7 @@
 #
 # Always-run per ADR-0033 §3 + §6 — invoked unconditionally from
 # `scripts/audit.sh` per ADR-0033 §10:397. This wrapper does NOT self-gate via
-# its own changed.sh: the always-run guarantee comes from the caller's
+# any diff check: the always-run guarantee comes from the caller's
 # invocation discipline. If a future cleanup pass adds a skip-if-untouched
 # diff check here, the always-run gate silently breaks. Wrapper is
 # unconditional; caller decides.

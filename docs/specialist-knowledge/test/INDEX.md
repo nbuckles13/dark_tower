@@ -58,7 +58,7 @@
 - Fixtures → `packages/web-app/e2e/fixtures.ts`; Prometheus helpers (one PromQL home) → `packages/web-app/e2e/mcMetrics.ts`
 - Specs + division of responsibility vs Rust env-tests → `packages/web-app/e2e/`, `packages/web-app/e2e/README.md`
 - Test bus + types → `packages/web-app/src/lib/e2eBus.ts`, `vite.config.ts`, `src/globals.d.ts`
-- Layer-7 browser lane trigger → `scripts/layer7.sh:__browser_e2e_triggered`
+- Layer-7 browser lane (always-runs since 2026-08-20; no diff-trigger — gated only by the Phase-1g dev-cert + Playwright Chromium preconditions) → `scripts/layer7.sh`
 
 ## Environment Tests & Cluster (ADR-0030)
 - Bootstrap + fixtures + cluster config → `crates/env-tests/src/`, `src/cluster.rs`, `src/fixtures/`

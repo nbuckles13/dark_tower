@@ -12,7 +12,6 @@ tasks:
 - id: 1
   status: pending
   specialist: meeting-controller
-  env_tests: true
   deps:
   - 2
   prompt: |

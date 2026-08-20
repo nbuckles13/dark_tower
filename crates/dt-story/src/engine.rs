@@ -14,7 +14,6 @@ use std::path::Path;
 pub struct RunnableTask {
     pub id: u32,
     pub specialist: String,
-    pub env_tests: bool,
     pub prompt: String,
 }
 
@@ -103,9 +102,6 @@ fn runnable_payload(task: &Task) -> Result<RunnableTask> {
         .as_deref()
         .filter(|s| !s.trim().is_empty())
         .ok_or_else(|| anyhow!("task {} is pending but has no specialist", task.id))?;
-    let env_tests = task
-        .env_tests
-        .ok_or_else(|| anyhow!("task {} is pending but has no env_tests value", task.id))?;
     let prompt = task
         .prompt
         .as_deref()
@@ -114,7 +110,6 @@ fn runnable_payload(task: &Task) -> Result<RunnableTask> {
     Ok(RunnableTask {
         id: task.id,
         specialist: specialist.to_string(),
-        env_tests,
         prompt: prompt.to_string(),
     })
 }
@@ -200,7 +195,6 @@ pub enum AddOutcome {
 pub struct NewTask {
     pub specialist: String,
     pub prompt: String,
-    pub env_tests: bool,
     pub tag: String,
     pub deps: Vec<u32>,
 }
@@ -211,7 +205,7 @@ pub struct NewTask {
 ///
 /// IDEMPOTENT IN THE WEAK SENSE: "will not duplicate", NOT "converges to the
 /// supplied values". The tag check returns BEFORE any field is written, so a
-/// re-run supplying corrected `specialist` / `prompt` / `env_tests` / `deps`
+/// re-run supplying corrected `specialist` / `prompt` / `deps`
 /// silently discards them. Callers must surface that (`main.rs` does, on the
 /// rc-4 path); the gesture for a changed plan is to reset the manifest to a
 /// skeleton and re-emit, not to re-run `add-task` over a populated one.
@@ -244,7 +238,6 @@ pub fn add_task(manifest: &mut Manifest, new: NewTask) -> Result<AddOutcome> {
         id: new_id,
         status: Status::Pending,
         specialist: Some(new.specialist),
-        env_tests: Some(new.env_tests),
         deps: new.deps,
         prompt: Some(new.prompt),
         commit: None,
@@ -377,9 +370,6 @@ pub fn validate_manifest(manifest: &Manifest) -> Vec<String> {
             .is_none_or(|s| s.trim().is_empty())
         {
             violations.push(format!("pending task {} has no specialist", task.id));
-        }
-        if task.env_tests.is_none() {
-            violations.push(format!("pending task {} has no env_tests value", task.id));
         }
         if task.prompt.as_deref().is_none_or(|s| s.trim().is_empty()) {
             violations.push(format!("pending task {} has no prompt", task.id));

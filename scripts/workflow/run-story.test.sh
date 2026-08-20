@@ -572,7 +572,6 @@ mk_story() {
 DEFAULT_TASKS='- id: 1
   status: pending
   specialist: test
-  env_tests: false
   prompt: fixture task one prompt'
 
 mk_story "$TEMPLATE/docs/user-stories/2026-08-13-fixture.md" "$DEFAULT_TASKS"
@@ -736,6 +735,12 @@ assert_status "d1-baseline-seam-announced" "TEST SEAMS ACTIVE" "$OUTPUT"
 assert_marker "d1-baseline-preflight-ran" "$MARK" 'ran.preflight'
 assert_marker "d1-baseline-devloop-ran"   "$MARK" 'ran.claude.devloop'
 assert_marker "d1-baseline-layers-ran"    "$MARK" 'ran.layer1'
+# Layer 7 now runs on EVERY task, not only env_tests-tagged ones. This plain,
+# untagged task must run layer 7 AND complete when it's green — the positive
+# proof of the every-task policy on the happy path (F4 below proves the same
+# on the operator-rc-split/failure path). Without this marker, the whole point
+# of Part 3 (per-task layer 7) is untested on the completes path.
+assert_marker "d1-baseline-layer7-ran"    "$MARK" 'ran.layer7'
 assert_marker "d1-baseline-close-gate-ran" "$MARK" 'ran.layer-all'
 if [ "$(manifest_status "$FIX" 1)" = "completed" ]; then PASS=$((PASS+1)); else
   FAIL=$((FAIL+1)); FAILURES+=("[d1-baseline-manifest-completed] task 1 status is '$(manifest_status "$FIX" 1)', expected completed"); fi
@@ -757,7 +762,6 @@ assert_no_marker "e2-absent-id-no-devloop" "$MARK" 'ran.claude.devloop'
 mk_story "${TEMPLATE}/docs/user-stories/2026-08-13-fixture.md" '- id: 1
   status: pending
   specialist: test
-  env_tests: false
   prompt: fixture task one prompt
 - id: 2
   status: completed'
@@ -782,12 +786,10 @@ assert_no_marker "e3-unreachable-id-no-devloop" "$MARK" 'ran.claude.devloop'
 mk_story "${TEMPLATE}/docs/user-stories/2026-08-13-fixture.md" '- id: 1
   status: pending
   specialist: test
-  env_tests: false
   prompt: fixture task one prompt
 - id: 2
   status: pending
   specialist: test
-  env_tests: false
   deps: [1]
   prompt: fixture task two prompt'
 git -C "$TEMPLATE" commit --quiet -am "pending-dep fixture" >/dev/null
@@ -879,20 +881,18 @@ run_story FAKE_LAYER3_RC=127 -- fixture
 assert_exit   "f3-rc127-exit2" 2 "$RC"
 assert_status "f3-rc127-token" "PIPELINE-PRECONDITION" "$OUTPUT"
 
-# F4: the split applies to layer 7 as well as 1-6 (env_tests task).
-mk_story "${TEMPLATE}/docs/user-stories/2026-08-13-fixture.md" '- id: 1
-  status: pending
-  specialist: test
-  env_tests: true
-  prompt: fixture task needing env tests'
-git -C "$TEMPLATE" commit --quiet -am "env-tests fixture" >/dev/null
+# F4: the operator/implementer rc-split applies to layer 7 exactly as to layers
+# 1-6, and — post-change — on EVERY task, not only env_tests-tagged ones. That
+# the split reaches layer 7 on an ORDINARY untagged task IS the property, so no
+# special fixture: DEFAULT_TASKS is already loaded (F1-F3 don't swap; E5 restored
+# it). Layers 1-6 pass (default rc 0) so layer 7 is reached; FAKE_LAYER7_RC=2 is
+# operator-class → exit 2 / PIPELINE-PRECONDITION / layer=7. (D1 above proves the
+# green-completes half; this proves the red-splits half.)
 run_story FAKE_LAYER7_RC=2 -- fixture
 assert_exit   "f4-layer7-rc2-exit2" 2 "$RC"
 assert_status "f4-layer7-rc2-token" "PIPELINE-PRECONDITION" "$OUTPUT"
 assert_status "f4-layer7-names-layer" "layer=7" "$OUTPUT"
 assert_marker "f4-layer7-ran" "$MARK" 'ran.layer7'
-mk_story "${TEMPLATE}/docs/user-stories/2026-08-13-fixture.md" "$DEFAULT_TASKS"
-git -C "$TEMPLATE" commit --quiet -am "restore single-task fixture" >/dev/null
 
 # =============================================================================
 # (G) CANARY CLASSIFICATION — R-2 defects 1 & 2, R-3
@@ -1070,7 +1070,6 @@ SPLICE_SENTINEL='SPLICE-CANARY-7f3a'
 mk_story "${TEMPLATE}/docs/user-stories/2026-08-13-fixture.md" '- id: 1
   status: pending
   specialist: test
-  env_tests: false
   prompt: "Fix the \"quoted\" thing SPLICE-CANARY-7f3a and also --paired-with=evil"'
 git -C "$TEMPLATE" commit --quiet -am "splice fixture" >/dev/null
 run_story -- fixture
@@ -1091,7 +1090,6 @@ assert_status "i6-prompt-quotes-preserved" '"quoted"' "$prompt_on_disk"
 mk_story "${TEMPLATE}/docs/user-stories/2026-08-13-fixture.md" '- id: 1
   status: pending
   specialist: "test --paired-with=evil"
-  env_tests: false
   prompt: ordinary prompt'
 git -C "$TEMPLATE" commit --quiet -am "bad specialist fixture" >/dev/null
 run_story -- fixture

@@ -4,10 +4,11 @@
 # TWO Phase-2 suites since task #19 (R-48), run SEQUENTIALLY against the same cluster
 # under the same single-attempt budget:
 #   1. Rust env-tests (`cargo test -p env-tests --features all`) — ALWAYS attempted.
-#   2. Browser E2E (`pnpm --filter @darktower/web-app test:e2e`) — DIFF-TRIGGERED (see
-#      __BROWSER_E2E_TRIGGER_PATHS below), run only AFTER the Rust suite and only when it
-#      passed (an env-test FAIL skips the browser suite with a loud stderr note — fixing
-#      the Rust failures comes first; the browser suite runs on the retry).
+#   2. Browser E2E (`pnpm --filter @darktower/web-app test:e2e`) — runs WHENEVER Layer 7
+#      runs (2026-08-20: the diff-trigger was retired; subject only to its Phase-1g
+#      preconditions), AFTER the Rust suite and only when it passed (an env-test FAIL skips
+#      the browser suite with a loud stderr note — fixing the Rust failures comes first;
+#      the browser suite runs on the retry).
 #
 # ALWAYS-RUN (ADR-0033 §3; user ruling 2026-06-26, task #56): Layer 7 attempts the
 # env-test suite on every devloop regardless of diff surface — business-logic changes
@@ -19,13 +20,13 @@
 # what keeps the 6-week silent-skip from relocating to "helper-not-running".)
 #
 # FOUR terminal lanes, each a STATUS line through the lifecycle (the browser suite adds
-# REASON tokens — browser-e2e-passed / browser-e2e-failed / browser-e2e-no-diff /
-# dev-certs-missing / playwright-browser-missing — but NO new lanes):
+# REASON tokens — browser-e2e-passed / browser-e2e-failed / dev-certs-missing /
+# playwright-browser-missing — but NO new lanes):
 #   SKIPPED-NO-CLUSTER (exit 0) — socket ABSENT + `GITHUB_ACTIONS` set (CI, no cluster, not
 #                                 provisionable). The ONLY clean-skip case; below OK. A
 #                                 PRESENT socket runs even in CI (forward-compatible).
-#   OK                 (exit 0) — every suite that ran was green (a diff-untouched browser
-#                                 suite reports SKIPPED-NO-DIFF, which ranks below OK).
+#   OK                 (exit 0) — every suite that ran was green (both the Rust env-tests
+#                                 and the browser E2E, which now always runs).
 #   FAIL               (exit 1) — IMPLEMENTER lane: a suite returned non-zero on a
 #                                 confirmed-healthy cluster (the diff's problem).
 #   PRECONDITION_FAILURE (exit 2) — OPERATOR lane: a Phase-1 pre-suite step (helper
@@ -71,13 +72,12 @@ if [[ "${DEVLOOP_TEST:-}" == "1" ]]; then
   # the test injects a fake probe keyed on FAKE_{PROM,LOKI}_READY so the obs gate is hermetic).
   HTTP_PROBE="${DEVLOOP_HTTP_PROBE:-curl -fsS -o /dev/null --max-time 5}"
   # Browser-E2E seams (task #19, same trust boundary): the executed suite command
-  # (DEVLOOP_BROWSER_E2E_CMD), the fingerprints-file path the Phase-1g gate reads
-  # (DEVLOOP_FINGERPRINTS_JSON — pointing it elsewhere could fake the cert precondition),
-  # and a force-run/force-skip trigger override (DEVLOOP_BROWSER_E2E_TRIGGER=1|0) so the
-  # self-test pins both Phase-2 browser branches without depending on the repo's live diff.
+  # (DEVLOOP_BROWSER_E2E_CMD) and the fingerprints-file path the Phase-1g gate reads
+  # (DEVLOOP_FINGERPRINTS_JSON — pointing it elsewhere could fake the cert precondition).
+  # (The former DEVLOOP_BROWSER_E2E_TRIGGER force-run/skip seam was retired with the
+  # diff-trigger — the browser suite now always runs, so there is no branch to pin.)
   BROWSER_E2E_FINGERPRINTS="${DEVLOOP_FINGERPRINTS_JSON:-${__repo_root}/infra/docker/certs/fingerprints.json}"
   BROWSER_E2E_CMD_OVERRIDE="${DEVLOOP_BROWSER_E2E_CMD:-}"
-  BROWSER_E2E_TRIGGER_OVERRIDE="${DEVLOOP_BROWSER_E2E_TRIGGER:-}"
   # Phase-1h org provisioning (R-7): the EXECUTED provisioning script. Same trust boundary as
   # DEVLOOP_DEV_CLUSTER_BIN — pointing it at a stub would fake the per-run organization, so the
   # suites would silently run against whatever org they last used and the cross-run meeting-cap
@@ -113,7 +113,6 @@ else
   HTTP_PROBE="curl -fsS -o /dev/null --max-time 5"
   BROWSER_E2E_FINGERPRINTS="${__repo_root}/infra/docker/certs/fingerprints.json"
   BROWSER_E2E_CMD_OVERRIDE=""
-  BROWSER_E2E_TRIGGER_OVERRIDE=""
   SETUP_SH="${__repo_root}/infra/kind/scripts/setup.sh"
   ORG_PROBE="curl -s -o /dev/null -w %{http_code} --max-time ${DEVLOOP_ORG_PROBE_TIMEOUT:-10}"
 fi
@@ -143,57 +142,15 @@ ENV_TEST_TIMEOUT="${DEVLOOP_ENV_TEST_TIMEOUT:-600}"
 BROWSER_E2E_TIMEOUT="${DEVLOOP_BROWSER_E2E_TIMEOUT:-600}"
 
 # -----------------------------------------------------------------------------
-# Browser-E2E trigger (task #19, R-48 — Gate-1 Q4 ruling)
+# Browser-E2E: ALWAYS RUN whenever Layer 7 runs (2026-08-20)
 # -----------------------------------------------------------------------------
-
-# Backend contract surfaces the BROWSER CLIENT observes. Mechanism (fail-toward-RUN): run
-# the browser suite whenever the diff can change behavior a real browser client sees —
-# over-triggering costs minutes, under-triggering silently un-gates the browser tier.
-# Wider than the story text's literal "MC/AC/GC" on purpose (Gate-1 Q4, reviewer-ruled):
-#   crates/ac-service/     — auth exchange the demo drives (sign-up/sign-in wire shapes)
-#   crates/gc-service/     — meeting create/join HTTP contract + error envelopes
-#   crates/mc-service/     — WebTransport signaling contract (JoinResponse/ErrorMessage)
-#   crates/mh-service/     — MH WebTransport handshake the happy-path spec asserts for
-#                            every media_servers URL (assertion (b))
-#   crates/common/         — shared JWT/meeting-token types all four services serve from
-#   crates/media-protocol/ — 42-byte frame format the browser SDK framing mirrors
-# packages/** + the TS root manifests are covered by lang/ts/changed.sh (the TS-diff SSoT
-# — not restated here), and proto/ is the wire contract itself.
-# THE ONE ENCODING: __browser_e2e_triggered() AND the Phase-2 skip note both iterate this
-# array — never restate the list in a hand-written string (@code-reviewer, Gate 1).
-__BROWSER_E2E_TRIGGER_PATHS=(
-  "proto/"
-  "crates/ac-service/"
-  "crates/gc-service/"
-  "crates/mc-service/"
-  "crates/mh-service/"
-  "crates/common/"
-  "crates/media-protocol/"
-)
-
-# True iff the browser E2E suite should run for this diff. Reads the SAME changed-files
-# cache the rest of the layer uses (populated by _get_base_ref.sh in __layer7_main — no
-# second git-diff derivation): first via lang/ts/changed.sh (packages/ + TS root files),
-# then via diff_touches_path over __BROWSER_E2E_TRIGGER_PATHS.
-# Args: (none)  Returns: 0 if triggered, 1 otherwise.
-__browser_e2e_triggered() {
-  # Self-test seam (DEVLOOP_TEST-gated at the top of this file): force-run/force-skip so
-  # the flow tests don't depend on the repo's live diff. Empty = real predicate.
-  if [[ -n "$BROWSER_E2E_TRIGGER_OVERRIDE" ]]; then
-    [[ "$BROWSER_E2E_TRIGGER_OVERRIDE" == "1" ]]
-    return
-  fi
-  if "${__layer7_dir}/lang/ts/changed.sh"; then
-    return 0
-  fi
-  local p
-  for p in "${__BROWSER_E2E_TRIGGER_PATHS[@]}"; do
-    if diff_touches_path "$p"; then
-      return 0
-    fi
-  done
-  return 1
-}
+# The diff-trigger (task #19's __browser_e2e_triggered + __BROWSER_E2E_TRIGGER_PATHS)
+# was RETIRED: gate coverage is now independent of change-detection, so the browser E2E
+# suite runs on every Layer-7 run, exactly like the Rust env-tests. It stays subject to
+# its Phase-1g preconditions (dev-cert fingerprints + Playwright Chromium) and to the
+# sequential-after-Rust / env-red-skips-browser-this-attempt discipline below. There is no
+# longer a "no diff" case for the browser suite, so the SKIPPED-NO-DIFF browser-e2e-no-diff
+# lane is gone.
 
 # -----------------------------------------------------------------------------
 # Cluster-availability gate (the env-awareness the always-run model requires)
@@ -823,35 +780,30 @@ __layer7_main() {
   export ENV_TEST_ORG_SUBDOMAIN="$run_org"
   emit_step_duration org-verify "$t_step"
 
-  # (g) Browser-E2E trigger + preconditions (task #19, R-48). Trigger-gated: these checks
-  #     run ONLY when the browser suite will actually run — an untriggered diff must not
-  #     be able to red on a workstation without Playwright installed. Both checks are
-  #     deterministic pre-suite facts, so a failure is the OPERATOR lane (exit 2) — a
+  # (g) Browser-E2E preconditions (task #19, R-48). ALWAYS run (2026-08-20 — the browser
+  #     suite is no longer diff-triggered, so these run on every Layer-7 run). Both checks
+  #     are deterministic pre-suite facts, so a failure is the OPERATOR lane (exit 2) — a
   #     missing cert/browser can only produce cryptic spec timeouts if allowed through,
   #     which would masquerade as a test FAIL (the exact misattribution the hard
   #     requirement forbids). AC/GC/Prometheus reachability is deliberately NOT re-checked
   #     here: steps (e)/(f) above already confirmed the very endpoints the browser suite's
   #     global-setup probes (same ports.json-derived URLs — see the Phase-2 export).
   t_step=$(layer_now)
-  local browser_e2e=skip
-  if __browser_e2e_triggered; then
-    browser_e2e=run
-    # WebTransport cert fingerprints: without BOTH pinned hashes the browser refuses the
-    # MC/MH self-signed certs (serverCertificateHashes) and every join spec can only time
-    # out at the handshake. Writer: scripts/generate-dev-certs.sh; same canonical keys the
-    # Vite loader (packages/web-app/vite/fingerprints.ts) and the suite's global-setup read.
-    if ! jq -e '(.MC_CERT_SHA256 // "" | length > 0) and (.MH_CERT_SHA256 // "" | length > 0)' \
-        "$BROWSER_E2E_FINGERPRINTS" >/dev/null 2>&1; then
-      precondition_fail dev-certs-missing \
-        "WebTransport dev cert fingerprints missing/incomplete at ${BROWSER_E2E_FINGERPRINTS} (need MC_CERT_SHA256 + MH_CERT_SHA256) — the browser cannot pin the MC/MH certs, so the browser E2E suite would only time out" \
-        "run scripts/generate-dev-certs.sh on the host, then restart the Vite dev server if one is running (fingerprints are read at Vite config time)"
-    fi
-    # Playwright Chromium: same location the runner itself resolves (PLAYWRIGHT_BROWSERS_PATH).
-    if ! compgen -G "${PLAYWRIGHT_BROWSERS_DIR}/chromium*" >/dev/null; then
-      precondition_fail playwright-browser-missing \
-        "no Playwright Chromium installation under ${PLAYWRIGHT_BROWSERS_DIR} — the browser E2E suite cannot launch a browser" \
-        "run 'pnpm exec playwright install chromium' (the devloop image is expected to bake it; see infra/devloop/Dockerfile)"
-    fi
+  # WebTransport cert fingerprints: without BOTH pinned hashes the browser refuses the
+  # MC/MH self-signed certs (serverCertificateHashes) and every join spec can only time
+  # out at the handshake. Writer: scripts/generate-dev-certs.sh; same canonical keys the
+  # Vite loader (packages/web-app/vite/fingerprints.ts) and the suite's global-setup read.
+  if ! jq -e '(.MC_CERT_SHA256 // "" | length > 0) and (.MH_CERT_SHA256 // "" | length > 0)' \
+      "$BROWSER_E2E_FINGERPRINTS" >/dev/null 2>&1; then
+    precondition_fail dev-certs-missing \
+      "WebTransport dev cert fingerprints missing/incomplete at ${BROWSER_E2E_FINGERPRINTS} (need MC_CERT_SHA256 + MH_CERT_SHA256) — the browser cannot pin the MC/MH certs, so the browser E2E suite would only time out" \
+      "run scripts/generate-dev-certs.sh on the host, then restart the Vite dev server if one is running (fingerprints are read at Vite config time)"
+  fi
+  # Playwright Chromium: same location the runner itself resolves (PLAYWRIGHT_BROWSERS_PATH).
+  if ! compgen -G "${PLAYWRIGHT_BROWSERS_DIR}/chromium*" >/dev/null; then
+    precondition_fail playwright-browser-missing \
+      "no Playwright Chromium installation under ${PLAYWRIGHT_BROWSERS_DIR} — the browser E2E suite cannot launch a browser" \
+      "run 'pnpm exec playwright install chromium' (the devloop image is expected to bake it; see infra/devloop/Dockerfile)"
   fi
   emit_step_duration browser-e2e-preconditions "$t_step"
 
@@ -889,17 +841,9 @@ __layer7_main() {
   fi
 
   # --- Browser E2E (task #19, R-48): sequentially AFTER the Rust suite, same cluster ---
-  if [[ "$browser_e2e" == "skip" ]]; then
-    # Explicit, never an invisible if-branch: the child STATUS line records WHY the
-    # browser suite did not run (SKIPPED-NO-DIFF ranks below OK — a green Rust suite
-    # still aggregates to OK). The note iterates the ONE trigger-path encoding (space-
-    # joined in a subshell: this script's IFS=$'\n\t' would make ${arr[*]} newline-join).
-    local trigger_list
-    trigger_list="$(IFS=' '; printf '%s' "${__BROWSER_E2E_TRIGGER_PATHS[*]}")"
-    printf 'Layer7: browser E2E skipped — no diff under its trigger surfaces (packages/** + TS root manifests via lang/ts/changed.sh, plus: %s).\n' \
-      "$trigger_list" >&2
-    emit_status SKIPPED-NO-DIFF browser-e2e-no-diff | tee_collect_statuses
-  elif [[ "$rc" -ne 0 ]]; then
+  # The browser suite ALWAYS runs (2026-08-20 — no longer diff-triggered), subject only to
+  # the env-red-skips-this-attempt discipline below and the Phase-1g preconditions above.
+  if [[ "$rc" -ne 0 ]]; then
     # Shared single-attempt budget (Gate-1 Q1 ruling): with the Rust suite already FAIL,
     # running the browser suite against the same possibly-diff-broken backend adds
     # attribution noise, not signal. Loud + greppable (stable `browser-e2e-not-run:`

@@ -2,8 +2,6 @@
 # Layer 3 — Guards (always-run: no skip-if-untouched).
 #
 # Wraps existing scripts/guards/run-guards.sh with the STATUS contract.
-# Per ADR-0033 implementation note: also invokes _test_changed_predicates.sh
-# meta-test so predicate drift is detected on every devloop, not just at PR time.
 #
 # Failure triage: docs/runbooks/devloop-validation.md §6.3 (Layer 3 + §4 two-token convention).
 set -euo pipefail
@@ -22,12 +20,11 @@ layer_lifecycle_begin 3
 # Use run_and_emit (dry-reviewer F2) instead of inline if/else — single source
 # of truth for STATUS line emission + exit-code mapping.
 # The audit-suppressions guard is auto-discovered by run-guards.sh (simple/*.sh); its
-# SELF-TEST is wired explicitly here (task #47) alongside the predicate meta-test —
-# there is no *.test.sh auto-runner, so an unrun test is untested. This drives the
-# check's FAIL branches (past-due/drift/malformed/sentinel) every devloop + CI.
+# SELF-TEST is wired explicitly here (task #47) — there is no *.test.sh auto-runner, so an
+# unrun test is untested. This drives the check's FAIL branches (past-due/drift/malformed/
+# sentinel) every devloop + CI.
 {
   run_and_emit "guards" "${__here}/guards/run-guards.sh" || true
-  run_and_emit "predicate-meta-test" "${__here}/lang/_test_changed_predicates.sh" || true
   run_and_emit "changed-helpers-test" "${__here}/lang/_changed_helpers.test.sh" || true
   run_and_emit "audit-suppressions-selftest" "${__here}/audit-suppressions-check.test.sh" || true
   run_and_emit "audit-gate-test" "${__here}/lang/_audit_gate.test.sh" || true

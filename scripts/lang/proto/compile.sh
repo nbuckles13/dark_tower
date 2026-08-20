@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Proto compile: buf build (ADR-0033 §5 stage 1 of layer 1).
 #
-# No internal changed.sh short-circuit: the dispatcher handles skip-if-untouched
-# uniformly for both stages of layer1 (INCLUDE for stage 1, EXCLUDE for stage 2).
+# No internal skip short-circuit: since 2026-08-20 the dispatcher always-runs every verb
+# (the per-lang skip-if-untouched classifier was retired, ADR-0033 §3), so this wrapper
+# simply runs whenever its stage is dispatched (INCLUDE for stage 1, EXCLUDE for stage 2).
 # All proto wrappers stay structurally uniform — no special-case shape.
 #
 # No "$@" pass-through to buf — same lockdown as the other buf wrappers

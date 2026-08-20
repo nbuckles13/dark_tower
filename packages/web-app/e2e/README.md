@@ -157,14 +157,11 @@ naming this failure mode).
 its second Phase-2 step: sequentially **after** `cargo test -p env-tests
 --features all`, against the same live Kind cluster, under the same
 single-attempt Layer-7 budget (its own 600s wall clock,
-`DEVLOOP_BROWSER_E2E_TIMEOUT`). It is **diff-triggered** — it runs only when
-the diff touches `packages/**`/TS root manifests (via `lang/ts/changed.sh`),
-`proto/`, or a browser-observable backend crate (the
-`__BROWSER_E2E_TRIGGER_PATHS` array in `layer7.sh` is the one encoding); an
-untriggered diff emits an explicit `STATUS=SKIPPED-NO-DIFF
-REASON=browser-e2e-no-diff` child line. If the Rust env-tests fail first, the
-browser suite is not run that attempt (loud `browser-e2e-not-run:` stderr note;
-it runs on the retry). Missing dev certs or a missing Playwright Chromium
+`DEVLOOP_BROWSER_E2E_TIMEOUT`). It **always runs** whenever Layer 7 runs (the
+diff-trigger was retired 2026-08-20 — gate coverage is independent of
+change-detection, so there is no longer a "no diff" skip for the browser suite).
+If the Rust env-tests fail first, the browser suite is not run that attempt
+(loud `browser-e2e-not-run:` stderr note; it runs on the retry). Missing dev certs or a missing Playwright Chromium
 surface as `PRECONDITION_FAILURE` (operator lane) **before** either suite runs
 — never as a cryptic spec timeout. Triage: `docs/runbooks/devloop-validation.md`
 §6.7. The layer exports `E2E_*`/`VITE_*_PROXY_TARGET` from the helper's

@@ -14,13 +14,12 @@
 #   - Phase-2 green                                   → OK, exit 0
 #   - Phase-2 non-zero                                → FAIL, exit 1 (implementer)
 #   - Phase-2 non-zero whose output CONTAINS infra words → STILL FAIL (the retired-grep proof)
-#   - Browser E2E (task #19): trigger-off → SKIPPED-NO-DIFF child line, layer still OK;
-#     trigger-on both-green → OK with BOTH -passed REASONs; browser suite non-zero → FAIL
-#     browser-e2e-failed (exit 1); fingerprints missing / Chromium missing → the two
-#     Phase-1g PRECONDITION_FAILURE tokens (exit 2, BEFORE any suite runs); env-tests red
-#     + trigger-on → browser suite NOT run (greppable `browser-e2e-not-run:` stderr note,
-#     NO browser STATUS line); plus direct-call cases pinning the REAL
-#     __browser_e2e_triggered() predicate against a hand-written changed-files cache.
+#   - Browser E2E (task #19; always-run since 2026-08-20 — the diff-trigger was retired):
+#     both-green → OK with BOTH -passed REASONs (the browser suite ran with NO trigger, the
+#     always-run proof); browser suite non-zero → FAIL browser-e2e-failed (exit 1);
+#     fingerprints missing / Chromium missing → the two Phase-1g PRECONDITION_FAILURE tokens
+#     (exit 2, BEFORE any suite runs, now unconditional); env-tests red → browser suite NOT
+#     run that attempt (greppable `browser-e2e-not-run:` stderr note, NO browser STATUS line).
 #   - PARSE-PATH INTEGRITY: the operator lane's emitted STATUS survives the SHARED parse/
 #     aggregate helpers layer-all.sh will later run on it (parse_status_line /
 #     aggregate_worst_status / status_to_exit_code) → PRECONDITION_FAILURE, not UNKNOWN/FAIL.
@@ -240,8 +239,7 @@ run_layer7() {
       FAKE_PROBE_CODE="${FAKE_PROBE_CODE:-401}" \
       FAKE_AC_READY="${FAKE_AC_READY:-1}" \
       FAKE_SUITE_RC="${FAKE_SUITE_RC:-0}" \
-      DEVLOOP_BROWSER_E2E_TRIGGER="${BROWSER_TRIGGER:-0}" \
-      DEVLOOP_BROWSER_E2E_CMD="${BROWSER_CMD:-}" \
+      DEVLOOP_BROWSER_E2E_CMD="${BROWSER_CMD:-true}" \
       DEVLOOP_FINGERPRINTS_JSON="${FP_JSON:-$GOOD_FP}" \
       PLAYWRIGHT_BROWSERS_PATH="${PW_DIR:-$GOOD_PW_DIR}" \
       FAKE_PROM_READY="${FAKE_PROM_READY:-1}" \
@@ -258,13 +256,14 @@ run_layer7() {
 }
 
 # Reset per-case FAKE_* / ENVCMD / browser-E2E overrides to defaults.
-# NB: BROWSER_TRIGGER defaults to 0 (force-skip) in run_layer7 — every pre-existing flow
-# case stays hermetic (no dependence on the repo's live diff); browser cases opt in with
-# BROWSER_TRIGGER=1.
+# NB (2026-08-20): the browser suite ALWAYS runs now (the diff-trigger was retired), so
+# there is no BROWSER_TRIGGER knob — every flow case that reaches Phase 2 runs the browser
+# suite (a `true` BROWSER_CMD keeps it hermetically green when a case only cares about the
+# env-test lane; BROWSER_CMD defaults to a green stub via BROWSER_STUB below).
 reset_case() {
   unset FAKE_CLUSTER_EXISTS FAKE_PODS_HEALTHY FAKE_SETUP_IN_PROGRESS FAKE_STATUS_RC \
         FAKE_SETUP_RC FAKE_TEARDOWN_RC FAKE_REBUILD_RC FAKE_PROM_READY FAKE_LOKI_READY \
-        ENVCMD CI_FLAG BROWSER_TRIGGER BROWSER_CMD FP_JSON PW_DIR \
+        ENVCMD CI_FLAG BROWSER_CMD FP_JSON PW_DIR \
         FAKE_PROVISION_RC FAKE_PROVISION_TOKEN FAKE_PROVISION_SLEEP FAKE_PROBE_CODE \
         FAKE_AC_READY FAKE_SUITE_RC PORTS_JSON_OVERRIDE SETUP_SH_OVERRIDE \
         ORG_PROBE_OVERRIDE PROVISION_TIMEOUT
@@ -470,31 +469,25 @@ reset_case
 
 # === Browser E2E lanes (task #19, R-48) ========================================
 
-# (B1) trigger-off → explicit SKIPPED-NO-DIFF child line; layer aggregate stays OK, exit 0.
-#      Pins the "never an invisible if-branch" contract AND the no-ladder-edits claim
-#      (SKIPPED-NO-DIFF must rank below the Rust suite's OK).
+# (B2) ALWAYS-RUN PROOF: no trigger knob exists — the browser suite runs whenever Layer 7
+#      runs. Both suites green → OK with BOTH -passed REASONs, exit 0. The explicit
+#      browser-e2e-passed assertion is the proof the browser suite RAN independent of any
+#      diff (this replaces the old trigger-off SKIPPED-NO-DIFF case, which no longer exists).
 reset_case
-SOCK="$PRESENT_SOCK"; export ENVCMD="true" BROWSER_TRIGGER=0
-run_layer7 "$OUT" "$ERR"
-assert_exit   "browser-skip-exit0"     0 "$RC"
-assert_status "browser-skip-child"     "STATUS=SKIPPED-NO-DIFF REASON=browser-e2e-no-diff" "$(cat "$OUT")"
-assert_status "browser-skip-note"      "browser E2E skipped" "$(cat "$ERR")"
-assert_status "browser-skip-env-ok"    "STATUS=OK REASON=env-tests-passed" "$(cat "$OUT")"
-reset_case
-
-# (B2) trigger-on, both suites green → OK with BOTH -passed REASONs, exit 0.
-reset_case
-SOCK="$PRESENT_SOCK"; export ENVCMD="true" BROWSER_TRIGGER=1 BROWSER_CMD="true"
+SOCK="$PRESENT_SOCK"; export ENVCMD="true" BROWSER_CMD="true"
 run_layer7 "$OUT" "$ERR"
 assert_exit   "browser-ok-exit0"       0 "$RC"
 assert_status "browser-ok-env"         "STATUS=OK REASON=env-tests-passed" "$(cat "$OUT")"
 assert_status "browser-ok-browser"     "STATUS=OK REASON=browser-e2e-passed" "$(cat "$OUT")"
+# And no SKIPPED-NO-DIFF / no-diff lane for the browser suite survives.
+if ! grep -q 'browser-e2e-no-diff' "$OUT"; then PASS=$((PASS+1)); else
+  FAIL=$((FAIL+1)); FAILURES+=("[browser-ok-no-skip-lane] retired browser-e2e-no-diff lane still emitted"); fi
 reset_case
 
-# (B3) trigger-on, browser suite non-zero → FAIL browser-e2e-failed (implementer lane,
-#      exit 1) — the Rust suite's OK must not mask the browser failure.
+# (B3) browser suite non-zero → FAIL browser-e2e-failed (implementer lane, exit 1) — the
+#      Rust suite's OK must not mask the browser failure.
 reset_case
-SOCK="$PRESENT_SOCK"; export ENVCMD="true" BROWSER_TRIGGER=1 BROWSER_CMD="false"
+SOCK="$PRESENT_SOCK"; export ENVCMD="true" BROWSER_CMD="false"
 run_layer7 "$OUT" "$ERR"
 assert_exit   "browser-fail-exit1"     1 "$RC"
 assert_status "browser-fail-env-ok"    "STATUS=OK REASON=env-tests-passed" "$(cat "$OUT")"
@@ -502,11 +495,13 @@ assert_status "browser-fail-status"    "STATUS=FAIL REASON=browser-e2e-failed" "
 assert_status "browser-fail-artifacts" "test-results" "$(cat "$ERR")"
 reset_case
 
-# (B4) trigger-on, fingerprints incomplete → PRECONDITION_FAILURE dev-certs-missing
-#      (exit 2, operator lane) — surfaced in PHASE 1, i.e. BEFORE either suite runs, so a
-#      missing cert can never masquerade as a spec-timeout test FAIL.
+# (B4) fingerprints incomplete → PRECONDITION_FAILURE dev-certs-missing (exit 2, operator
+#      lane) — surfaced in PHASE 1, i.e. BEFORE either suite runs, so a missing cert can
+#      never masquerade as a spec-timeout test FAIL. NOW UNCONDITIONAL: the browser
+#      preconditions run on every Layer-7 (no trigger gate), so a backend-only diff on a
+#      workstation without dev-certs reds here — intended per always-run.
 reset_case
-SOCK="$PRESENT_SOCK"; export ENVCMD="true" BROWSER_TRIGGER=1 BROWSER_CMD="true" FP_JSON="$INCOMPLETE_FP"
+SOCK="$PRESENT_SOCK"; export ENVCMD="true" BROWSER_CMD="true" FP_JSON="$INCOMPLETE_FP"
 run_layer7 "$OUT" "$ERR"
 assert_exit   "certs-missing-exit2"    2 "$RC"
 assert_status "certs-missing-status"   "STATUS=PRECONDITION_FAILURE" "$(cat "$OUT")"
@@ -515,21 +510,22 @@ if ! grep -q 'REASON=env-tests' "$OUT"; then PASS=$((PASS+1)); else
   FAIL=$((FAIL+1)); FAILURES+=("[certs-missing-before-suites] env-test suite ran despite a Phase-1g precondition failure"); fi
 reset_case
 
-# (B5) trigger-on, no chromium under the browsers dir → PRECONDITION_FAILURE
-#      playwright-browser-missing (exit 2, operator lane).
+# (B5) no chromium under the browsers dir → PRECONDITION_FAILURE playwright-browser-missing
+#      (exit 2, operator lane). Also unconditional now.
 reset_case
-SOCK="$PRESENT_SOCK"; export ENVCMD="true" BROWSER_TRIGGER=1 BROWSER_CMD="true" PW_DIR="$EMPTY_PW_DIR"
+SOCK="$PRESENT_SOCK"; export ENVCMD="true" BROWSER_CMD="true" PW_DIR="$EMPTY_PW_DIR"
 run_layer7 "$OUT" "$ERR"
 assert_exit   "pw-missing-exit2"       2 "$RC"
 assert_status "pw-missing-status"      "STATUS=PRECONDITION_FAILURE" "$(cat "$OUT")"
 assert_status "pw-missing-token"       "REASON=playwright-browser-missing" "$(cat "$OUT")"
 reset_case
 
-# (B6) trigger-on + env-tests red → browser suite NOT run: greppable stderr token, NO
+# (B6) env-tests red → browser suite NOT run this attempt: greppable stderr token, NO
 #      browser STATUS line of any kind (Gate-1 Q1 — the layer is already FAIL; a browser
-#      enum would misattribute the cause). Exit stays 1 (implementer lane).
+#      enum would misattribute the cause). Exit stays 1 (implementer lane). This
+#      env-red-skips-browser-this-attempt discipline is preserved under always-run.
 reset_case
-SOCK="$PRESENT_SOCK"; export ENVCMD="false" BROWSER_TRIGGER=1 BROWSER_CMD="true"
+SOCK="$PRESENT_SOCK"; export ENVCMD="false" BROWSER_CMD="true"
 run_layer7 "$OUT" "$ERR"
 assert_exit   "env-red-exit1"          1 "$RC"
 assert_status "env-red-env-fail"       "STATUS=FAIL REASON=env-tests-failed" "$(cat "$OUT")"
@@ -537,25 +533,6 @@ assert_status "env-red-not-run-note"   "browser-e2e-not-run:" "$(cat "$ERR")"
 if ! grep -q 'REASON=browser-e2e' "$OUT"; then PASS=$((PASS+1)); else
   FAIL=$((FAIL+1)); FAILURES+=("[env-red-no-browser-status] browser STATUS line emitted despite env-tests FAIL"); fi
 reset_case
-
-# (B7) REAL trigger predicate (direct call, no flow): __browser_e2e_triggered() against a
-#      hand-written changed-files cache. The flow cases above use the force override for
-#      hermeticity; THIS pins the actual array/ts-changed logic. _changed_helpers reads
-#      ${DEVLOOP_TMP}/changed-files.layer-shared when DEVLOOP_LAYER is unset, and only
-#      populates it when ABSENT — pre-writing it short-circuits any git derivation.
-BTRIG_TMP="${WORK}/btrig-tmp"; mkdir -p "$BTRIG_TMP"
-btrig() {  # $1=cache content (newline-separated changed paths); echoes predicate rc
-  printf '%s\n' "$1" > "${BTRIG_TMP}/changed-files.layer-shared"
-  ( cd "$REPO_ROOT" && env -i PATH="$PATH" HOME="$HOME" DEVLOOP_TEST=1 \
-      DEVLOOP_TMP="$BTRIG_TMP" \
-      bash -c 'source scripts/layer7.sh >/dev/null 2>&1; set +e; __browser_e2e_triggered >/dev/null 2>&1; echo $?' )
-}
-assert_exit "btrig-mc-service-triggers"      0 "$(btrig 'crates/mc-service/src/actors/meeting.rs')"
-assert_exit "btrig-mh-service-triggers"      0 "$(btrig 'crates/mh-service/src/webtransport/server.rs')"
-assert_exit "btrig-proto-triggers"           0 "$(btrig 'proto/dark_tower/signaling/v1/signaling.proto')"
-assert_exit "btrig-packages-triggers-via-ts" 0 "$(btrig 'packages/web-app/src/App.svelte')"
-assert_exit "btrig-docs-only-no-trigger"     1 "$(btrig 'docs/runbooks/devloop-validation.md')"
-assert_exit "btrig-unrelated-crate-no-trigger" 1 "$(btrig 'crates/dt-guard/src/main.rs')"
 
 # === busy-tolerant setup (@operations condition 4) ============================
 # `__dev_cluster_setup` must RETRY a `(busy)` result (another write holds the helper mutex —
@@ -713,7 +690,7 @@ reset_case
 #      exhausts the cap (~7 meetings/run against 10).
 reset_case
 SOCK="$PRESENT_SOCK"
-export ENVCMD="$SUITE_STUB" BROWSER_TRIGGER=1 BROWSER_CMD="$BROWSER_STUB"
+export ENVCMD="$SUITE_STUB" BROWSER_CMD="$BROWSER_STUB"
 run_layer7 "$OUT" "$ERR"
 assert_exit "org-consumption-exit0" 0 "$RC"
 mapfile -t CONSUMED_SUBS < "$PROVISIONED" 2>/dev/null || true

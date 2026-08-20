@@ -184,19 +184,16 @@ tasks:
 - id: 1
   status: completed
   specialist: test
-  env_tests: false
   prompt: Add DEVLOOP_TEST-gated seams STORY_REPO_ROOT and DT_STORY to run-story.sh using the exact-match sentinel idiom from audit-suppressions-check.sh:36-60 including its fail-loud-when-set-without-sentinel half; validate --stop-after against the manifest rather than as a bare integer; build a hermetic test suite at scripts/workflow/run-story.test.sh wired into layer3.sh, with an mktemp fixture repo, PATH-injected claude/sleep/date under env -i, real git, and a containment assertion that the redirected root is its own git top-level and differs from the real one; every stub records its invocation and every case asserts the stubs it depends on ran, promoting assert_marker and assert_no_marker out of layer-all.test.sh:89-95 rather than copying them; fix the five defects in R-2 with a failing test each; and give the canary --allowedTools with an empty value while keeping --dangerously-skip-permissions. See docs/user-stories/2026-08-11-story-runner-hardening.md R-1 to R-5.
   slug: 2026-08-13-run-story-seams-and-hermetic-tests
 - id: 2
   status: completed
   specialist: global-controller
-  env_tests: false
   prompt: Make GC distinguish the three causes of a refused meeting creation. create_meeting_with_limit_check returns an empty result for cap-exhausted, organization-missing and organization-inactive alike, and the handler maps all three to one 403 saying the limit was exceeded. Give each cause a distinct observable outcome so a provisioning failure cannot be mistaken for a full cap. See docs/user-stories/2026-08-11-story-runner-hardening.md R-6.
   slug: 2026-08-14-gc-meeting-refusal-causes
 - id: 3
   status: completed
   specialist: test
-  env_tests: true
   deps:
   - 2
   prompt: Provision a freshly generated organization per layer-7 run so repeated runs against the same dev cluster reach the same verdict. Provision in layer7.sh Phase 1 through the dev-cluster helper verb allowlist only, per ADR-0030 — Phase 1 has neither psql nor kubectl, and adding a SQL verb would undo that ADR's injection-impossibility property. Set max_concurrent_meetings explicitly to 1000; do not touch max_participants_per_meeting, which an env-test asserts equals 100 and which LEAST would silently cap. Subdomains must be lowercase. A provisioning failure must report on the operator lane as PRECONDITION_FAILURE exit 2, never as a suite failure. See docs/user-stories/2026-08-11-story-runner-hardening.md R-7.
@@ -204,7 +201,6 @@ tasks:
 - id: 4
   status: completed
   specialist: operations
-  env_tests: false
   deps:
   - 1
   prompt: Make the dt-story manifest the single home for per-task state across the story workflow. (a) The /user-story skill must emit the manifest block it validates — today it has zero mentions of manifests or dt-story, so every story must be hand-authored before run-story can drive it. (b) Add a slug field to the manifest task entry and retire the Devloop Tracking table. That table holds a Status column plus the devloop-output slug /close-story uses to build docs/devloop-outputs/SLUG/main.md paths, so it is a second home for both facts. The runner already knows the slug — it writes it to RUN_DIR/task-N.slug — but deletes it on success at run-story.sh:1205, so nothing durable records which devloop produced which task. Write it into the manifest at completion time alongside the status flip, and have /close-story read status and slug from there. Attempts are not one-to-one with devloops (task 2 recorded attempts=4; a fresh attempt after an escalation gets a new slug, while a --continue resumption reuses it), so define last-writer-wins, meaning the attempt that actually committed. Storing a slug is consistent with the referent-durability rule task 1 filed in docs/TODO.md because docs/devloop-outputs/ is git-tracked; the manifest escalation field, which holds an ephemeral RUN_DIR path, is that rule's counterexample and is not a precedent to copy. (c) Remove the manifest branch field — declared required in crates/dt-story/src/manifest.rs as a bare String, yet read nowhere in dt-story or either workflow script, so it hardcodes topology into a planning document and lets a manifest assert a branch the run is not on. Manifest and Task carry serde deny_unknown_fields, so removing the field from the struct makes every story file still carrying it fail to parse — the struct change and the file updates must land in the same commit. Besides this file, only docs/user-stories/2026-05-02-browser-client-join.md carries it. (d) /close-story only needs to handle story files that have a manifest; the four older table-only story files are closed and will not be reopened, so do not build a table-reading fallback for them. Prompts written into the manifest must survive the runner interpolating them into a shell command; this task depends on task 1 having fixed that, and must not reintroduce the hazard by emitting unescaped prompt text. Do not change the devloop skill — its Headless Mode section at SKILL.md:608 already covers run-story. Pair with protocol for the crate change. See docs/user-stories/2026-08-11-story-runner-hardening.md R-8.

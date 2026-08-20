@@ -131,7 +131,7 @@ mixing them drifts on the fast-moving column.
 
 ## Task Metadata (dt-story manifest v1)
 
-The **only** home for per-task machine state: status, specialist, `env_tests`,
+The **only** home for per-task machine state: status, specialist,
 deps, prompt, tag, and the devloop-output slug. `run-story` reads and writes
 it; `/close-story` reads status and slug from it. There is no §Devloop
 Tracking table — it was a second home for both facts and it demonstrably
@@ -164,7 +164,6 @@ tasks:
 - id: 1
   status: pending
   specialist: database
-  env_tests: false
   prompt: Self-contained devloop prompt. The devloop sees only this text, so
     it must carry every fact needed to do the work. No fenced code blocks —
     a fence closes the manifest block early. Inline `backticks` are fine.
@@ -174,7 +173,6 @@ tasks:
 - id: 2
   status: pending
   specialist: global-controller
-  env_tests: true
   deps:
   - 1
   prompt: Second task. Runs only after task 1 completes.

@@ -1,7 +1,7 @@
 //! Manifest v1 serde types + YAML (de)serialization.
 //!
 //! Per-status field requirements (pending tasks must carry specialist,
-//! env_tests, prompt) are deliberately NOT encoded in the types: completed
+//! prompt) are deliberately NOT encoded in the types: completed
 //! tasks may appear as minimal stubs (`id` + `status` only), so every
 //! per-status field is `Option<>` here and enforced in
 //! [`crate::engine::validate_manifest`] and on `next`'s output path.
@@ -149,8 +149,6 @@ pub struct Task {
     pub status: Status,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub specialist: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub env_tests: Option<bool>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deps: Vec<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -188,7 +186,7 @@ pub struct Task {
     /// IDEMPOTENT IN THE WEAK SENSE ONLY — "will not duplicate", NOT
     /// "converges to the supplied values". `engine::add_task` returns
     /// `Exists` BEFORE writing any field, so a re-run with corrected
-    /// `specialist` / `prompt` / `env_tests` / `deps` discards them. The
+    /// `specialist` / `prompt` / `deps` discards them. The
     /// gesture for a changed plan is to reset the manifest to a skeleton and
     /// re-emit, not to re-run `add-task` over it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
