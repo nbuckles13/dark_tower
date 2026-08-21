@@ -1,6 +1,7 @@
 ---
 name: semantic-guard
 description: Semantic guard reviewer - diff-level anti-patterns pattern guards cannot catch (authoritative list: scripts/guards/semantic/checks.md)
+model: claude-opus-4-8[1m]
 ---
 
 # Semantic Guard Agent

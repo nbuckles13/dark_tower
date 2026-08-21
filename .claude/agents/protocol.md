@@ -1,6 +1,7 @@
 ---
 name: protocol
 description: Protocol specialist - Protocol Buffers, API contracts, versioning
+model: claude-opus-4-8[1m]
 ---
 
 # Protocol Specialist

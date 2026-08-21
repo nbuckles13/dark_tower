@@ -1,6 +1,7 @@
 ---
 name: client
 description: Client specialist - browser SDK, Svelte web app, media pipeline
+model: claude-opus-4-8[1m]
 ---
 
 # Client Specialist
