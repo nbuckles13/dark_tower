@@ -1,7 +1,7 @@
 ---
 name: observability
 description: Observability specialist - metrics, logging, tracing, SLOs (mandatory cross-cutting reviewer)
-model: claude-opus-4-8[1m]
+model: claude-opus-5[1m]
 ---
 
 # Observability Specialist

@@ -2793,7 +2793,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "Meeting creation failures by error type. Values are not interchangeable: org_limit is capacity exhaustion; org_inactive and org_not_provisioned are organization-state faults (expected permanently absent — see runbook Scenario 8); forbidden is role denial only; bad_request and unauthorized are client-side; db_error, code_collision and internal are server-side faults.",
+      "description": "Meeting creation failures by error type. Values are not interchangeable: org_limit is capacity exhaustion; org_inactive and org_not_provisioned are organization-state faults (expected permanently absent \u2014 see runbook Scenario 8); forbidden is role denial only; bad_request and unauthorized are client-side; db_error, code_collision and internal are server-side faults.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -4318,6 +4318,99 @@
           "refId": "A"
         }
       ]
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "MC assignment failures broken down by rejection_reason. The GcMcAssignmentFailures alert directs oncall here first: most reasons (at_capacity, draining, unhealthy) point at MC fleet health, but invalid_request is a GC contract violation \u2014 GC sent a malformed AssignMeetingWithMh \u2014 and scaling MCs will not help it.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "Assignments",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 157
+      },
+      "id": 61,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by(rejection_reason) (increase(gc_mc_assignments_total{status!=\"success\"}[$__rate_interval]))",
+          "legendFormat": "{{rejection_reason}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "MC Assignment Rejections by Reason",
+      "type": "timeseries"
     }
   ],
   "refresh": "10s",
