@@ -15,6 +15,7 @@
 |-------|-------|
 | Start Commit | `{git rev-parse HEAD at setup}` |
 | Branch | `{current branch}` |
+| Lead Model | `{Lead's model identifier}` |
 
 ---
 

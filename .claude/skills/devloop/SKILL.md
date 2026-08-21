@@ -205,7 +205,7 @@ mkdir -p docs/devloop-outputs/YYYY-MM-DD-{task-slug}
 
 Create `main.md` (see `docs/devloop-outputs/_template/main.md` for the full template). Key fields to populate at setup:
 
-- **Loop Metadata**: Record `git rev-parse HEAD` as Start Commit and current branch
+- **Loop Metadata**: Record `git rev-parse HEAD` as Start Commit, the current branch, and the Lead's own model identifier as Lead Model
 - **Loop State**: All reviewers set to `pending`
 - **Phase**: `setup`
 - **Mode**: `full` or `light`
@@ -230,7 +230,7 @@ For security-critical implementations, the implementer should maintain a "Securi
 
 Use `name`/`subagent_type` per the Teammate Roster table in §Team Composition. `name` MUST match the `@` references used in teammate prompts.
 
-**For Implementer**, spawn with `name: "implementer"`, `subagent_type: "{specialist-name}"` and this prompt:
+**For Implementer**, spawn with `name: "implementer"`, `subagent_type: "{specialist-name}"`, `model: "opus"` and this prompt:
 
 ```
 You are implementing a feature for Dark Tower.
@@ -262,6 +262,8 @@ All teammate communication MUST use the SendMessage tool. Plain text output is n
 - Use SendMessage to discuss review findings with reviewers directly
 - **Do NOT start implementing until @team-lead sends you "Plan approved"**
 ```
+
+**For a paired specialist** (`--paired-with`), spawn with `name: "paired-{specialist}"`, `subagent_type: "{specialist}"`, `model: "opus"`
 
 **For Reviewers**, spawn with `name: "{reviewer-name}"`, `subagent_type: "{reviewer-name}"` and this prompt:
 
