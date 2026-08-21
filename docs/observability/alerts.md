@@ -133,7 +133,7 @@ for: 5m
 **Severity**: Critical
 **Condition**: MC assignment p95 latency >20ms for >5 minutes
 **Impact**: Slow meeting join, critical path degradation
-**Runbook**: [docs/runbooks/gc-mc-assignment-failures.md](../runbooks/gc-mc-assignment-failures.md)
+**Runbook**: [Scenario 3: MC Assignment Failures](../runbooks/gc-incident-response.md#scenario-3-mc-assignment-failures)
 
 **PromQL**:
 ```promql
@@ -312,7 +312,7 @@ for: 5m
 **Severity**: Warning
 **Condition**: MC assignment failure rate >5% for >5 minutes
 **Impact**: Some users unable to join meetings
-**Runbook**: [docs/runbooks/gc-mc-assignment-failures.md](../runbooks/gc-mc-assignment-failures.md)
+**Runbook**: [Scenario 3: MC Assignment Failures](../runbooks/gc-incident-response.md#scenario-3-mc-assignment-failures)
 
 **PromQL**:
 ```promql
@@ -324,11 +324,14 @@ for: 5m
 for: 5m
 ```
 
+<!-- ANCHOR (DRY): the rejection_reason values in step 2 mirror the terminal match in
+     crates/gc-service/src/services/mc_assignment.rs (source of truth). Sibling mirrors:
+     docs/observability/metrics/gc-service.md (:74 + cardinality table) and the
+     gc-incident-response.md legend — edit all in lockstep. -->
 **Response**:
-1. Check MC pod health
-2. Investigate rejection reasons (at_capacity, draining, unhealthy)
-3. Scale MC if capacity issue
-4. Check MC heartbeat in database
+1. **Break down by `rejection_reason` FIRST** (`sum by(rejection_reason) (increase(gc_mc_assignments_total{status!="success"}[5m]))`). Emitted values: `at_capacity`, `draining`, `unhealthy`, `unspecified`, `no_mcs_available`, `invalid_request`.
+2. Check MC pod health and heartbeat in database.
+3. **Scale MC ONLY for a genuine capacity reason** (`at_capacity`, or `no_mcs_available` with an empty/unhealthy pool). Do **NOT** scale for `invalid_request` — that is a GC-side contract violation, not a fleet problem; follow Scenario F (do not scale, escalate to the GC owner).
 
 ---
 

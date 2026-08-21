@@ -4,6 +4,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use ::common::observability::testing::MetricAssertion;
 use gc_service::repositories::{
     HealthStatus, MediaHandlersRepository, MeetingControllersRepository,
 };
@@ -163,6 +164,148 @@ async fn test_assign_meeting_with_mh_fails_after_max_retries(pool: PgPool) {
 
     // Verify mock was called 3 times (max retries)
     assert_eq!(mock_client.call_count(), 3);
+}
+
+/// Test that a GENUINELY malformed request (GC's own MH selection is malformed)
+/// fails fast — GC must NOT walk the pool or burn the retry budget, because every MC
+/// rejects the identical bad request the same way.
+#[sqlx::test(migrations = "../../migrations")]
+async fn test_assign_meeting_with_mh_invalid_request_fails_fast(pool: PgPool) {
+    // A full pool (3 MCs) is available — the point is that GC does NOT try them all.
+    setup_mcs(&pool, 3, "us-east-1").await;
+    // Register a healthy MH with an EMPTY grpc_endpoint. The gRPC registration layer
+    // rejects this, so GC never produces it in normal operation — but corrupt data or
+    // a GC bug could, and that is the only case where GC genuinely sent bad data.
+    MediaHandlersRepository::register_mh(
+        &pool,
+        "mh-bad-1",
+        "us-east-1",
+        "https://mh-bad:443",
+        "", // malformed: empty grpc_endpoint
+        1000,
+    )
+    .await
+    .expect("MH registration should succeed");
+    MediaHandlersRepository::update_load_report(
+        &pool,
+        "mh-bad-1",
+        10,
+        HealthStatus::Healthy,
+        Some(10.0),
+        Some(20.0),
+        Some(15.0),
+    )
+    .await
+    .expect("MH load report should succeed");
+
+    let mock_client = Arc::new(MockMcClient::rejecting(McRejectionReason::InvalidRequest));
+
+    // Capture metrics across the flow. `#[sqlx::test]` runs on a current-thread
+    // runtime, so the per-thread snapshot sees records made during the await.
+    let snap = MetricAssertion::snapshot();
+
+    let result = McAssignmentService::assign_meeting_with_mh(
+        &pool,
+        mock_client.clone(),
+        "meeting-invalid-001",
+        "us-east-1",
+        "gc-test",
+    )
+    .await;
+
+    // GC verified its OWN selection was malformed, so it emits invalid_request on the
+    // error axis and must NOT emit unhealthy.
+    snap.counter("gc_mc_assignments_total")
+        .with_labels(&[("status", "error"), ("rejection_reason", "invalid_request")])
+        .assert_delta(1);
+    snap.counter("gc_mc_assignments_total")
+        .with_labels(&[("status", "rejected"), ("rejection_reason", "unhealthy")])
+        .assert_delta(0);
+    snap.counter("gc_mc_assignments_total")
+        .with_labels(&[("status", "error"), ("rejection_reason", "unhealthy")])
+        .assert_delta(0);
+
+    assert!(
+        result.is_err(),
+        "Assignment should fail on an invalid request"
+    );
+    let err = result.unwrap_err();
+    // Returned as Internal (500), not ServiceUnavailable — a GC contract violation
+    // is a server defect, not transient unavailability.
+    assert_eq!(
+        err.status_code(),
+        500,
+        "invalid_request should map to 500: {err}"
+    );
+    assert!(
+        format!("{err}").contains("invalid"),
+        "Error should describe an invalid request: {err}"
+    );
+
+    // The core guarantee: exactly ONE MC call. The pool was NOT walked and the
+    // retry budget was NOT burned (contrast the AtCapacity test which expects 3).
+    assert_eq!(
+        mock_client.call_count(),
+        1,
+        "fail-fast must stop after the first MC, not walk the pool"
+    );
+
+    // No assignment row was written — fail-fast returns before the DB write.
+    let existing = McAssignmentService::get_assignment(&pool, "meeting-invalid-001", "us-east-1")
+        .await
+        .expect("assignment lookup should succeed");
+    assert!(
+        existing.is_none(),
+        "fail-fast must not persist an assignment row"
+    );
+}
+
+/// Test that an INVALID_REQUEST claim from an MC for a WELL-FORMED request does NOT
+/// remove failover (security S-3). GC has the ground truth locally, so a buggy /
+/// rolled-back MC cannot veto the pool: GC treats the claim as unhealthy and retries.
+#[sqlx::test(migrations = "../../migrations")]
+async fn test_invalid_request_claim_on_wellformed_request_preserves_failover(pool: PgPool) {
+    // Full, healthy pool with VALID MH selection (non-empty grpc_endpoints).
+    setup_mcs(&pool, 3, "us-east-1").await;
+    setup_mhs(&pool, 2, "us-east-1").await;
+
+    // Every MC misreports INVALID_REQUEST even though GC's request is well-formed.
+    let mock_client = Arc::new(MockMcClient::rejecting(McRejectionReason::InvalidRequest));
+
+    let snap = MetricAssertion::snapshot();
+
+    let result = McAssignmentService::assign_meeting_with_mh(
+        &pool,
+        mock_client.clone(),
+        "meeting-wellformed-001",
+        "us-east-1",
+        "gc-test",
+    )
+    .await;
+
+    // GC must walk the whole pool (failover preserved), NOT fail fast on one MC's word.
+    assert_eq!(
+        mock_client.call_count(),
+        3,
+        "a well-formed request must not be vetoed by one MC's INVALID_REQUEST claim"
+    );
+
+    // The outcome is recorded as unhealthy (the MC is misbehaving), NOT invalid_request
+    // (GC verified its own request was fine, so the metric stays trustworthy).
+    snap.counter("gc_mc_assignments_total")
+        .with_labels(&[("status", "rejected"), ("rejection_reason", "unhealthy")])
+        .assert_delta(1);
+    snap.counter("gc_mc_assignments_total")
+        .with_labels(&[("status", "error"), ("rejection_reason", "invalid_request")])
+        .assert_delta(0);
+
+    // And it is a retryable 503, not a 500 — the fleet is the suspect here, not GC.
+    let err = result.expect_err("all MCs rejected, so assignment fails");
+    assert_eq!(
+        err.status_code(),
+        503,
+        "misreported invalid_request should surface as retryable 503: {err}"
+    );
 }
 
 /// Test assignment fails when no MCs available.

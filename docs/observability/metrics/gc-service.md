@@ -71,8 +71,25 @@ All GC service metrics follow ADR-0011 naming conventions with the `gc_` prefix.
 - **Description**: Total MC assignment attempts
 - **Labels**:
   - `status`: Assignment outcome (success, rejected, error)
-  - `rejection_reason`: Reason for rejection (at_capacity, draining, unhealthy, rpc_failed, none)
-- **Cardinality**: Low (~15 combinations)
+  <!-- ANCHOR (DRY): rejection_reason values are enumerated by the terminal match in
+       crates/gc-service/src/services/mc_assignment.rs (the source of truth). Mirrors —
+       edit in lockstep: this list, the Cardinality-Management table below, the
+       gc-incident-response.md legend, and alerts.md GCMCAssignmentFailures response. -->
+  - `rejection_reason`: Reason for rejection — emitted values: `at_capacity`, `draining`,
+    `unhealthy`, `unspecified`, `no_mcs_available`, `invalid_request`, `none` (success path).
+    Also `rpc_failed (declared/unemitted — see note)`.
+    - `invalid_request` — GC sent a malformed `AssignMeetingWithMh` (empty MH selection, or an
+      MH with an empty `grpc_endpoint`). A GC-side contract violation surfaced by MC; recorded with
+      `status="error"` and GC fails fast rather than retrying the pool. It is **not** a controller
+      health problem — do not read it as a sick fleet.
+
+  > **Note**: `rpc_failed` is **declared but not currently emitted**. An all-RPC-failed assignment
+  > exhaustion surfaces as `no_mcs_available` (the `Err` branch at `mc_assignment.rs` sets no
+  > rejection reason), which is **indistinguishable from a genuinely empty pool**. Reconciling
+  > `rpc_failed` — the runbook Scenario D and the two tests (`metrics.rs`,
+  > `mc_assignment_metrics_integration.rs`) — with emission is tracked in `docs/TODO.md`
+  > §Observability Debt (the `declared/unemitted` tag is provisional pending that reconciliation).
+- **Cardinality**: Low (~18 combinations)
 - **Usage**: Track assignment success rate and failure patterns
 - **Example**:
   ```promql
@@ -767,7 +784,8 @@ All GC service metrics follow strict cardinality bounds per ADR-0011:
 | `status_code` | ~15 realistic | 200, 201, 400, 401, 403, 404, 429, 500, 503, etc. (HTTP metrics only) |
 | `status` | 5 | success, error, timeout, rejected, accepted (non-HTTP outcome metrics: mc_assignments, db_queries, token_refresh, ac_requests, grpc_mc_calls, mh_selections, meeting_creation, meeting_join) |
 | `operation` | ~18 | select_mc, atomic_assign, update_heartbeat, ac_meeting_token, ac_guest_token, mc_grpc, etc. |
-| `rejection_reason` | 5 | at_capacity, draining, unhealthy, rpc_failed, none |
+<!-- ANCHOR (DRY): source of truth = terminal match in crates/gc-service/src/services/mc_assignment.rs; mirrors the gc_mc_assignments_total label list above, the gc-incident-response.md legend, and alerts.md GCMCAssignmentFailures response. -->
+| `rejection_reason` | 7 emitted (+1 declared/unemitted) | at_capacity, draining, unhealthy, unspecified, no_mcs_available, invalid_request, none; plus rpc_failed (declared/unemitted — see `gc_mc_assignments_total` note) |
 | `error_type` | ~10 | not_found, forbidden, unauthorized, rate_limit, service_unavailable, internal, org_limit, org_inactive, org_not_provisioned, etc. `gc_meeting_creation_failures_total` carries 9 of these — near the bound. |
 
 **Total Estimated Cardinality**: HTTP metrics ~1,050 worst-case (realistically a few hundred), plus ~200 non-HTTP series — well within Prometheus limits.

@@ -44,6 +44,11 @@ pub enum McRejectionReason {
     Draining,
     /// MC is unhealthy.
     Unhealthy,
+    /// GC sent a malformed assignment request (proto-level contract violation:
+    /// empty `mh_assignments`, or an `MhAssignment` with an empty `grpc_endpoint`).
+    /// A GC-side defect, not a controller problem — retrying the pool cannot help,
+    /// so GC fails fast (see `mc_assignment.rs`) instead of walking candidates.
+    InvalidRequest,
 }
 
 impl From<i32> for McRejectionReason {
@@ -52,6 +57,10 @@ impl From<i32> for McRejectionReason {
             1 => McRejectionReason::AtCapacity,
             2 => McRejectionReason::Draining,
             3 => McRejectionReason::Unhealthy,
+            4 => McRejectionReason::InvalidRequest,
+            // Unknown/future values (incl. a `4` from an MC newer than an
+            // un-upgraded GC) degrade to Unspecified — never mis-parsed, and
+            // `accepted: bool` remains the only gate.
             _ => McRejectionReason::Unspecified,
         }
     }
@@ -457,6 +466,11 @@ mod tests {
         assert_eq!(McRejectionReason::from(1), McRejectionReason::AtCapacity);
         assert_eq!(McRejectionReason::from(2), McRejectionReason::Draining);
         assert_eq!(McRejectionReason::from(3), McRejectionReason::Unhealthy);
+        assert_eq!(
+            McRejectionReason::from(4),
+            McRejectionReason::InvalidRequest
+        );
+        // Unknown/future values fall through to Unspecified (forward-compat).
         assert_eq!(McRejectionReason::from(99), McRejectionReason::Unspecified);
     }
 

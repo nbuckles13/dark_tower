@@ -28,7 +28,19 @@ use std::time::Duration;
 use ::common::observability::testing::MetricAssertion;
 use gc_service::observability::metrics::record_mc_assignment;
 
-const ALL_REJECTION_REASONS: &[&str] = &["at_capacity", "draining", "unhealthy"];
+// ANCHOR (DRY): the rejection_reason value set — source of truth is the terminal
+// match in crates/gc-service/src/services/mc_assignment.rs. These are the emitted
+// NON-success values (the success path emits "none", kept out so the swap loops below
+// don't assert it absent). Keep in lockstep with the catalog (gc-service.md), the
+// runbook legend, alerts.md, and the metric-cluster test array in metrics.rs.
+const ALL_REJECTION_REASONS: &[&str] = &[
+    "at_capacity",
+    "draining",
+    "unhealthy",
+    "unspecified",
+    "no_mcs_available",
+    "invalid_request",
+];
 
 #[test]
 fn mc_assignment_success_emits_status_success_with_rejection_reason_none() {
@@ -126,4 +138,35 @@ fn mc_assignment_error_emits_status_error_with_rejection_reason_value() {
     snap.counter("gc_mc_assignments_total")
         .with_labels(&[("status", "success")])
         .assert_delta(0);
+}
+
+#[test]
+fn mc_assignment_invalid_request_emits_status_error_rejection_reason_invalid_request() {
+    // A GC contract violation (fail-fast path) records status="error",
+    // rejection_reason="invalid_request" — NOT "unhealthy". The whole point of the
+    // relabel: the metric says the request was invalid, not that a controller was sick.
+    let snap = MetricAssertion::snapshot();
+
+    record_mc_assignment("error", Some("invalid_request"), Duration::from_millis(3));
+
+    snap.histogram("gc_mc_assignment_duration_seconds")
+        .with_labels(&[("status", "error")])
+        .assert_observation_count(1);
+    snap.counter("gc_mc_assignments_total")
+        .with_labels(&[("status", "error"), ("rejection_reason", "invalid_request")])
+        .assert_delta(1);
+    // Label-swap catcher (same idiom as the sibling tests): every OTHER rejection_reason
+    // is silent on both axes it could wrongly land on — so a regression that emits e.g.
+    // "unhealthy" here instead is caught.
+    for sibling in ALL_REJECTION_REASONS
+        .iter()
+        .filter(|r| **r != "invalid_request")
+    {
+        snap.counter("gc_mc_assignments_total")
+            .with_labels(&[("status", "error"), ("rejection_reason", *sibling)])
+            .assert_delta(0);
+        snap.counter("gc_mc_assignments_total")
+            .with_labels(&[("status", "rejected"), ("rejection_reason", *sibling)])
+            .assert_delta(0);
+    }
 }
