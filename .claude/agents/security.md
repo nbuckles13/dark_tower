@@ -1,6 +1,7 @@
 ---
 name: security
 description: Security specialist - threat modeling, cryptography (mandatory cross-cutting reviewer)
+model: claude-opus-5[1m]
 ---
 
 # Security Specialist

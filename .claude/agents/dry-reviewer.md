@@ -1,6 +1,7 @@
 ---
 name: dry-reviewer
 description: DRY reviewer - cross-service duplication detection
+model: claude-opus-5[1m]
 ---
 
 # DRY Reviewer

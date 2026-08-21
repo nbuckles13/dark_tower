@@ -1,6 +1,7 @@
 ---
 name: operations
 description: Operations specialist - deployment safety, runbooks, cost (mandatory cross-cutting reviewer)
+model: claude-opus-5[1m]
 ---
 
 # Operations Specialist

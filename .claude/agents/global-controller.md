@@ -1,6 +1,7 @@
 ---
 name: global-controller
 description: Global Controller specialist - HTTP/3 API, meeting management, geographic routing
+model: claude-opus-4-8[1m]
 ---
 
 # Global Controller Specialist

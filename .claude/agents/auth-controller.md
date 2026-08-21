@@ -1,6 +1,7 @@
 ---
 name: auth-controller
 description: Auth Controller specialist - authentication, JWT, JWKS, federation
+model: claude-opus-4-8[1m]
 ---
 
 # Auth Controller Specialist

@@ -1,6 +1,7 @@
 ---
 name: test
 description: Test specialist - E2E tests, coverage, quality gates (mandatory cross-cutting reviewer)
+model: claude-opus-4-8[1m]
 ---
 
 # Test Specialist

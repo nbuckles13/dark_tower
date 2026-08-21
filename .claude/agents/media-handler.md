@@ -1,6 +1,7 @@
 ---
 name: media-handler
 description: Media Handler specialist - media forwarding, quality adaptation
+model: claude-opus-4-8[1m]
 ---
 
 # Media Handler Specialist
