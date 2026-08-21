@@ -57,6 +57,10 @@ REBUILD_IMAGE=false
 REFRESH_CREDS=false
 RECREATE=false
 DESTROY=false
+# Model for the interactive session, which is the Lead when /devloop runs.
+# Teammates take their model from .claude/agents/*.md; the Lead has no agent
+# file, so this is the only place its model can be set.
+DEVLOOP_LEAD_MODEL="${DEVLOOP_LEAD_MODEL:-claude-opus-4-8[1m]}"
 while [[ "${1:-}" == --* ]]; do
     case "$1" in
         --rebuild) REBUILD_IMAGE=true; shift ;;
@@ -756,7 +760,7 @@ if [ ${#EXEC_CMD[@]} -gt 0 ]; then
     exit "$EXEC_RC"
 fi
 
-podman exec -it "$DEV_CONTAINER" claude --dangerously-skip-permissions --remote-control "$TASK_SLUG" || true
+podman exec -it "$DEV_CONTAINER" claude --dangerously-skip-permissions --model "$DEVLOOP_LEAD_MODEL" --remote-control "$TASK_SLUG" || true
 
 # ─── Phase 3: Post-session ──────────────────────────────────────
 
