@@ -896,13 +896,18 @@ mod tests {
         record_mc_assignment("rejected", Some("draining"), Duration::from_millis(8));
         record_mc_assignment("rejected", Some("unhealthy"), Duration::from_millis(5));
         record_mc_assignment("error", Some("rpc_failed"), Duration::from_millis(100));
+        // GC contract violation: status="error", rejection_reason="invalid_request".
+        record_mc_assignment("error", Some("invalid_request"), Duration::from_millis(3));
 
         snap.histogram("gc_mc_assignment_duration_seconds")
-            .assert_observation_count_at_least(5);
+            .assert_observation_count_at_least(6);
 
         snap.counter("gc_mc_assignments_total")
             .with_labels(&[("status", "success"), ("rejection_reason", "none")])
             .assert_delta(1);
+        // ANCHOR (DRY): rejection_reason values — source of truth is the terminal
+        // match in crates/gc-service/src/services/mc_assignment.rs; mirrored in the
+        // catalog, runbook legend, alerts.md, and mc_assignment_metrics_integration.rs.
         for reason in ["at_capacity", "draining", "unhealthy"] {
             snap.counter("gc_mc_assignments_total")
                 .with_labels(&[("status", "rejected"), ("rejection_reason", reason)])
@@ -910,6 +915,9 @@ mod tests {
         }
         snap.counter("gc_mc_assignments_total")
             .with_labels(&[("status", "error"), ("rejection_reason", "rpc_failed")])
+            .assert_delta(1);
+        snap.counter("gc_mc_assignments_total")
+            .with_labels(&[("status", "error"), ("rejection_reason", "invalid_request")])
             .assert_delta(1);
     }
 

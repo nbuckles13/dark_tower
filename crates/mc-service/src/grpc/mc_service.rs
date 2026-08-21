@@ -144,6 +144,17 @@ impl McAssignmentService {
         meeting_id: &str,
         mh_assignments: &[MhAssignment],
     ) -> Result<(), McError> {
+        // ANCHOR (DRY): these two contract checks (empty `mh_assignments`; any empty
+        // `grpc_endpoint`) are the validator-side definition of a malformed
+        // `AssignMeetingWithMhRequest`. GC mirrors them producer-side in
+        // `selection_is_malformed` (crates/gc-service/src/services/mc_assignment.rs).
+        // Adding a condition HERE without updating that predicate does NOT fail loudly:
+        // GC adjudicates INVALID_REQUEST against its own request rather than trusting
+        // this peer, so it will read the rejection as "MC misreporting", relabel to
+        // Unhealthy, and walk the whole pool — every MC rejecting identically. That is
+        // exactly the burn-the-retry-budget / record-a-sick-fleet behaviour
+        // REJECTION_REASON_INVALID_REQUEST was introduced to remove, silently restored
+        // with no test failing. Keep the two condition sets in lockstep.
         if mh_assignments.is_empty() {
             error!(
                 target: "mc.grpc.mc_service",
@@ -195,6 +206,29 @@ impl McAssignmentService {
     }
 }
 
+/// Map a `store_mh_assignments` failure to the rejection reason GC should see.
+///
+/// `McError::InvalidArgument` is a GC-side contract violation (empty
+/// `mh_assignments`, or an `MhAssignment` with an empty `grpc_endpoint`) — every
+/// MC would reject the identical malformed request the same way, so GC should
+/// fail fast; it maps to `InvalidRequest`. Every *other* error that
+/// `store_mh_assignments` can surface (`Redis`/`Internal`/`FencedOut` propagated
+/// from `store_mh_assignment`) is a genuine controller-side problem GC may retry
+/// elsewhere, so it stays `Unhealthy`.
+///
+/// This is a deliberate, explicit variant match — never a blanket map in either
+/// direction. Distinguishing the two here is what stops a Redis outage from being
+/// mislabelled `invalid_request` (masking real infra failure) and stops a bad
+/// request from being mislabelled `unhealthy` (a false sick-fleet signal that
+/// burns GC's retry budget). `McError::InvalidArgument` is constructed only at the
+/// two contract checks in `store_mh_assignments`, so the match is watertight.
+fn rejection_for_store_error(e: &McError) -> RejectionReason {
+    match e {
+        McError::InvalidArgument(_) => RejectionReason::InvalidRequest,
+        _ => RejectionReason::Unhealthy,
+    }
+}
+
 #[tonic::async_trait]
 impl MeetingControllerService for McAssignmentService {
     /// Handle meeting assignment with MH assignments (ADR-0010 Section 4a).
@@ -235,21 +269,41 @@ impl MeetingControllerService for McAssignmentService {
             }));
         }
 
-        // Store MH assignments in Redis
+        // Store MH assignments in Redis. Distinguish a GC contract violation
+        // (InvalidArgument → INVALID_REQUEST, GC fails fast) from a genuine
+        // controller-side storage failure (Redis/etc. → UNHEALTHY, GC may retry
+        // elsewhere). Never blanket-map either direction.
         if let Err(e) = self
             .store_mh_assignments(meeting_id, &inner.mh_assignments)
             .await
         {
-            error!(
-                target: "mc.grpc.mc_service",
-                meeting_id = %meeting_id,
-                error = %e,
-                "Failed to store MH assignments"
-            );
+            let reason = rejection_for_store_error(&e);
+            match reason {
+                RejectionReason::InvalidRequest => {
+                    // The specific contract violation was already logged at error!
+                    // inside store_mh_assignments; record the rejection decision
+                    // without re-implicating MC health.
+                    warn!(
+                        target: "mc.grpc.mc_service",
+                        meeting_id = %meeting_id,
+                        rejection_reason = ?reason,
+                        "Rejecting assignment: GC sent an invalid request"
+                    );
+                }
+                _ => {
+                    error!(
+                        target: "mc.grpc.mc_service",
+                        meeting_id = %meeting_id,
+                        error = %e,
+                        rejection_reason = ?reason,
+                        "Failed to store MH assignments (controller-side error)"
+                    );
+                }
+            }
 
             return Ok(Response::new(AssignMeetingWithMhResponse {
                 accepted: false,
-                rejection_reason: RejectionReason::Unhealthy.into(),
+                rejection_reason: reason.into(),
             }));
         }
 
@@ -307,6 +361,36 @@ mod tests {
         assert_eq!(RejectionReason::AtCapacity as i32, 1);
         assert_eq!(RejectionReason::Draining as i32, 2);
         assert_eq!(RejectionReason::Unhealthy as i32, 3);
+        assert_eq!(RejectionReason::InvalidRequest as i32, 4);
+    }
+
+    #[test]
+    fn test_rejection_for_store_error_invalid_argument_maps_to_invalid_request() {
+        // A GC contract violation must surface as INVALID_REQUEST so GC fails fast.
+        assert_eq!(
+            rejection_for_store_error(&McError::InvalidArgument("empty grpc_endpoint".to_string())),
+            RejectionReason::InvalidRequest
+        );
+    }
+
+    #[test]
+    fn test_rejection_for_store_error_storage_errors_stay_unhealthy() {
+        // Anti-mask: a genuine controller-side storage failure must NOT be reported
+        // as invalid_request. Every non-InvalidArgument error stays UNHEALTHY so GC
+        // may retry elsewhere. FencedOut is the semantically interesting one — a
+        // split-brain fence is transient, so UNHEALTHY (retry) is correct.
+        assert_eq!(
+            rejection_for_store_error(&McError::Redis("connection refused".to_string())),
+            RejectionReason::Unhealthy
+        );
+        assert_eq!(
+            rejection_for_store_error(&McError::Internal("unexpected".to_string())),
+            RejectionReason::Unhealthy
+        );
+        assert_eq!(
+            rejection_for_store_error(&McError::FencedOut("stale generation".to_string())),
+            RejectionReason::Unhealthy
+        );
     }
 
     #[test]

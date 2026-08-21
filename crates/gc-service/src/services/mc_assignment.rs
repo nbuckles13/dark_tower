@@ -23,7 +23,7 @@ use crate::errors::GcError;
 use crate::observability::metrics;
 use crate::repositories::{weighted_random_select, McAssignment, MeetingAssignmentsRepository};
 use crate::services::mc_client::{McAssignmentResult, McClientTrait, McRejectionReason};
-use crate::services::mh_selection::{MhSelection, MhSelectionService};
+use crate::services::mh_selection::{MhAssignmentInfo, MhSelection, MhSelectionService};
 use sqlx::PgPool;
 use std::sync::Arc;
 use std::time::Instant;
@@ -31,6 +31,28 @@ use tracing::instrument;
 
 /// Maximum number of retry attempts for MC rejection per ADR-0010.
 const MAX_MC_ASSIGNMENT_RETRIES: usize = 3;
+
+/// True if GC's own MH selection is malformed — empty, or any handler carrying an
+/// empty `grpc_endpoint`. These are exactly the two conditions MC rejects as
+/// `INVALID_REQUEST`, so GC can verify that claim against its own request instead of
+/// trusting the peer (see the `Rejected` arm of `assign_meeting_with_mh`).
+///
+/// For a correct GC over clean data this is always `false`:
+/// `select_mhs_for_meeting` guarantees a non-empty selection and MH registration
+/// validates `grpc_endpoint` non-empty. So a `true` result is a genuine GC-side /
+/// data-integrity fault — the only case in which failing fast (rather than retrying
+/// the pool) is the right call.
+///
+/// ANCHOR (DRY): these two conditions are the *producer-side mirror* of MC's
+/// validator-side contract check in `store_mh_assignments`
+/// (`crates/mc-service/src/grpc/mc_service.rs` — empty `mh_assignments`, empty
+/// `grpc_endpoint` → `McError::InvalidArgument`). They are the same wire contract
+/// (`AssignMeetingWithMhRequest` validity) on the two sides of the RPC; if MC's
+/// definition of "malformed" changes, this predicate must change in lockstep, or GC
+/// will retry-vs-fail-fast on the wrong criterion.
+fn selection_is_malformed(handlers: &[MhAssignmentInfo]) -> bool {
+    handlers.is_empty() || handlers.iter().any(|h| h.grpc_endpoint.is_empty())
+}
 
 /// Service for MC assignment operations.
 pub struct McAssignmentService;
@@ -256,6 +278,45 @@ impl McAssignmentService {
                     });
                 }
                 Ok(McAssignmentResult::Rejected(reason)) => {
+                    if reason == McRejectionReason::InvalidRequest {
+                        // INVALID_REQUEST is a claim from a remote peer. Only act on it
+                        // if GC's OWN request was actually malformed — never remove
+                        // failover on the MC's word alone. GC has the ground truth in
+                        // local scope (`mh_selection.handlers` is what it just sent), so
+                        // it verifies rather than trusts: a buggy or rolled-back MC that
+                        // returns `4` for a well-formed request must not be able to veto
+                        // assignment for the whole pool.
+                        if selection_is_malformed(&mh_selection.handlers) {
+                            // GC genuinely sent bad data. Every MC rejects the identical
+                            // request the same way, so retrying cannot succeed and would
+                            // only burn the budget and falsely record a "sick fleet".
+                            // Fail fast (adjudicated behaviour) — a GC contract violation.
+                            last_rejection_reason = Some(McRejectionReason::InvalidRequest);
+                            tracing::error!(
+                                target: "gc.service.assignment",
+                                meeting_id = %meeting_id,
+                                mc_id = %mc_id,
+                                attempt = attempt,
+                                "MC rejected a genuinely malformed assignment request (GC contract violation); failing fast without retrying the pool"
+                            );
+                            break;
+                        }
+                        // GC's request was well-formed, so this MC is misreporting.
+                        // Treat it as a controller problem and preserve failover: retry
+                        // the rest of the pool rather than letting one peer veto assignment.
+                        last_rejection_reason = Some(McRejectionReason::Unhealthy);
+                        tracing::error!(
+                            target: "gc.service.assignment",
+                            meeting_id = %meeting_id,
+                            mc_id = %mc_id,
+                            attempt = attempt,
+                            "MC claimed INVALID_REQUEST for a well-formed request; treating as unhealthy and retrying the pool"
+                        );
+                        tried_mcs.push(mc_id);
+                        continue;
+                    }
+
+                    last_rejection_reason = Some(reason);
                     tracing::warn!(
                         target: "gc.service.assignment",
                         meeting_id = %meeting_id,
@@ -265,7 +326,6 @@ impl McAssignmentService {
                         "MC rejected assignment, will retry"
                     );
                     tried_mcs.push(mc_id);
-                    last_rejection_reason = Some(reason);
                     // Continue to next attempt
                 }
                 Err(e) => {
@@ -283,22 +343,68 @@ impl McAssignmentService {
             }
         }
 
-        // All retries exhausted - record rejection/error metrics
+        // Loop ended (retries exhausted, pool drained, or fail-fast break) -
+        // record the outcome metric. Exactly one emit for every failure path,
+        // including the invalid_request fail-fast (which breaks here rather than
+        // emitting inside the loop).
+        //
+        // ANCHOR (DRY): this match is the source of truth for
+        // gc_mc_assignments_total{rejection_reason} label values. Mirrors — edit in
+        // lockstep (prose AND code):
+        //   docs/observability/metrics/gc-service.md (label list :74 + cardinality table)
+        //   docs/observability/alerts.md (GCMCAssignmentFailures response)
+        //   docs/runbooks/gc-incident-response.md (legend)
+        //   infra/docker/prometheus/rules/gc-alerts.yaml (GCMCAssignmentFailures
+        //     description — illustrative triage prose, not a complete enumeration)
+        //   crates/gc-service/tests/mc_assignment_metrics_integration.rs (ALL_REJECTION_REASONS)
+        //   crates/gc-service/src/observability/metrics.rs (metric-cluster test array)
         let (status, rejection_reason) = match last_rejection_reason {
             Some(McRejectionReason::AtCapacity) => ("rejected", Some("at_capacity")),
             Some(McRejectionReason::Draining) => ("rejected", Some("draining")),
             Some(McRejectionReason::Unhealthy) => ("rejected", Some("unhealthy")),
             Some(McRejectionReason::Unspecified) => ("rejected", Some("unspecified")),
+            // GC contract violation surfaced by MC — a GC fault, not a rejection
+            // of a healthy request, so status="error" (groups with no_mcs_available).
+            Some(McRejectionReason::InvalidRequest) => ("error", Some("invalid_request")),
             None => ("error", Some("no_mcs_available")),
         };
         metrics::record_mc_assignment(status, rejection_reason, start.elapsed());
 
+        // Generic, bounded static (log field only — errors.rs discards the payload
+        // and returns a fixed client body; no meeting_id/mh_id/endpoint here).
+        // Exhaustive (no catch-all), mirroring the metric match above so a future
+        // RejectionReason variant compile-fails here too, not just at the metric match.
         let reason_str = match last_rejection_reason {
             Some(McRejectionReason::AtCapacity) => "All meeting controllers are at capacity",
             Some(McRejectionReason::Draining) => "All meeting controllers are draining",
             Some(McRejectionReason::Unhealthy) => "All meeting controllers are unhealthy",
-            _ => "No meeting controllers available",
+            Some(McRejectionReason::InvalidRequest) => {
+                "Meeting assignment request was invalid (GC contract violation)"
+            }
+            // A controller responded with a reason GC doesn't recognize (not "no MCs").
+            Some(McRejectionReason::Unspecified) => {
+                "A meeting controller rejected the assignment for an unrecognized reason"
+            }
+            None => "No meeting controllers available",
         };
+
+        // Fail-fast on a GC contract violation: return an internal (500) error, not
+        // ServiceUnavailable (503). A GC-computed bad request is a server defect, not
+        // transient unavailability; 503 would invite a retry that recomputes the same
+        // bad request. The in-loop error! already logged the cause; the terminal log
+        // here must NOT claim "after N attempts" (only one MC was tried).
+        if matches!(
+            last_rejection_reason,
+            Some(McRejectionReason::InvalidRequest)
+        ) {
+            tracing::error!(
+                target: "gc.service.assignment",
+                meeting_id = %meeting_id,
+                region = %region,
+                "Failed to assign meeting: GC sent an invalid assignment request (contract violation); not retried"
+            );
+            return Err(GcError::Internal(reason_str.to_string()));
+        }
 
         tracing::error!(
             target: "gc.service.assignment",
@@ -315,6 +421,39 @@ impl McAssignmentService {
 
 #[cfg(test)]
 mod tests {
-    // Integration tests are in the tests/ directory
-    // since they require database access via #[sqlx::test]
+    // Loop-level behaviour (fail-fast, failover, metrics) is covered by the
+    // #[sqlx::test] integration tests in tests/mc_assignment_rpc_tests.rs.
+    use super::*;
+
+    fn handler(grpc_endpoint: &str) -> MhAssignmentInfo {
+        MhAssignmentInfo {
+            mh_id: "mh-1".to_string(),
+            webtransport_endpoint: "https://mh:443".to_string(),
+            grpc_endpoint: grpc_endpoint.to_string(),
+        }
+    }
+
+    #[test]
+    fn selection_is_malformed_flags_empty_selection() {
+        assert!(selection_is_malformed(&[]));
+    }
+
+    #[test]
+    fn selection_is_malformed_flags_empty_grpc_endpoint() {
+        assert!(selection_is_malformed(&[handler("")]));
+        // Malformed even if only one of several handlers is bad.
+        assert!(selection_is_malformed(&[
+            handler("grpc://mh-1:50051"),
+            handler(""),
+        ]));
+    }
+
+    #[test]
+    fn selection_is_malformed_accepts_well_formed_selection() {
+        assert!(!selection_is_malformed(&[handler("grpc://mh-1:50051")]));
+        assert!(!selection_is_malformed(&[
+            handler("grpc://mh-1:50051"),
+            handler("grpc://mh-2:50051"),
+        ]));
+    }
 }

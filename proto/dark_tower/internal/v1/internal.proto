@@ -199,6 +199,7 @@ enum RejectionReason {
   REJECTION_REASON_AT_CAPACITY = 1;
   REJECTION_REASON_DRAINING = 2;
   REJECTION_REASON_UNHEALTHY = 3;
+  REJECTION_REASON_INVALID_REQUEST = 4;
 }
 
 // Media handler assignment for a meeting

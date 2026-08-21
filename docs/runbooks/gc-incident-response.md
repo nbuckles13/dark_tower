@@ -356,11 +356,25 @@ kubectl logs -n dark-tower -l app=gc-service --tail=100 | grep "mc_assignment"
 kubectl logs -n dark-tower -l app=mc-service --tail=100 | grep -i "reject\|capacity\|assignment"
 ```
 
-**Common Rejection Reasons** (from ADR-0010):
+<!-- ANCHOR (DRY): rejection_reason values are defined by the terminal match in
+     crates/gc-service/src/services/mc_assignment.rs (source of truth). Mirrors — edit
+     in lockstep: this legend, docs/observability/metrics/gc-service.md (:74 + cardinality
+     table), and docs/observability/alerts.md GCMCAssignmentFailures response. -->
+**Common Rejection Reasons** (`rejection_reason` on `gc_mc_assignments_total`; break these down with step 2 above):
 - `at_capacity`: MC has reached max concurrent sessions
 - `draining`: MC is in graceful shutdown
 - `unhealthy`: MC failed health check
-- `rpc_failed`: gRPC call to MC failed (network/timeout)
+- `invalid_request`: GC sent a malformed `AssignMeetingWithMh` (empty MH selection, or an MH with an
+  empty `grpc_endpoint`). A **GC-side contract violation, not a fleet health problem** — see the
+  invalid_request remediation below; **do NOT scale the MC fleet**.
+- `no_mcs_available`: no MC accepted — pool empty **or** all candidates unreachable; check GC logs to
+  tell which (see Scenario D).
+- `unspecified`: MC returned a reason this GC doesn't recognize; typically a newer MC talking to an
+  older GC — finish the GC rollout.
+- `none`: success path.
+
+> **Note**: `rpc_failed` is **not currently emitted** — an all-RPC-failed exhaustion surfaces as
+> `no_mcs_available` (see Scenario D and `docs/TODO.md` §Observability Debt).
 
 **Remediation**:
 
@@ -393,7 +407,13 @@ kubectl rollout restart deployment/mc-service -n dark-tower
 
 # Expected recovery time: 60 seconds
 
-# Scenario D: gRPC Call Failures (rpc_failed)
+# Scenario D: gRPC Call Failures (all MCs unreachable)
+# NOTE: RPC failures are NOT currently emitted as rejection_reason="rpc_failed".
+# An all-unreachable exhaustion surfaces as no_mcs_available (see TODO
+# §Observability Debt). Confirm this is an unreachability case, not a genuinely
+# empty pool, via GC logs BEFORE running the checks below:
+kubectl logs -n dark-tower -l app=gc-service --tail=200 | grep "MC RPC failed, will retry"
+
 # Check NetworkPolicy allows GC→MC traffic
 kubectl get networkpolicy -n dark-tower -o yaml | grep -A20 "mc-service"
 
@@ -410,6 +430,25 @@ kubectl exec -it -n dark-tower postgres-0 -- psql -c "EXPLAIN ANALYZE SELECT * F
 kubectl exec -it -n dark-tower postgres-0 -- psql -c "CREATE INDEX CONCURRENTLY idx_mc_last_heartbeat ON meeting_controllers (last_heartbeat);"
 
 # Expected recovery time: Immediate after index creation
+
+# Scenario F: Invalid Assignment Request (invalid_request)
+# This is a GC-SIDE CONTRACT VIOLATION, not a fleet problem. GC computed a
+# malformed AssignMeetingWithMh and MC rejected it; GC fails fast (one MC tried,
+# not the whole pool). *** DO NOT scale the MC fleet (do not run Scenario A). ***
+# Scaling MCs fixes nothing — every MC rejects the identical request the same way.
+#
+# Most likely upstream MH selection produced an empty mh_assignments or an
+# assignment with an empty grpc_endpoint; CONFIRM from the GC log line before
+# escalating (do not assume):
+kubectl logs -n dark-tower -l app=gc-service --tail=200 | grep -i "invalid request"
+# Then escalate to the GC owner with that log line — the cause is in GC's request
+# construction (MH selection), upstream of the MC.
+#
+# ONE ROOT CAUSE, NOT TWO: because invalid_request returns HTTP 500, a storm of it
+# trips GCHighErrorRate / error-budget-burn AND GCMCAssignmentFailures at the same
+# time. These are the SAME incident — do not open two investigations.
+#
+# Expected recovery time: after the GC fix ships (code change, not a scale/restart).
 
 # Verify recovery
 sum(rate(gc_mc_assignments_total{status="success"}[5m])) / sum(rate(gc_mc_assignments_total[5m]))

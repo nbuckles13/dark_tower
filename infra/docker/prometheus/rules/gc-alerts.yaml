@@ -195,6 +195,10 @@ groups:
           impact: "High CPU may increase latency. Consider scaling horizontally."
           runbook_url: "docs/runbooks/gc-incident-response.md#scenario-6-resource-pressure"
 
+      # ANCHOR (DRY): the description below names rejection_reason values as triage
+      # examples — source of truth is the terminal match in
+      # crates/gc-service/src/services/mc_assignment.rs (illustrative, not a complete
+      # enumeration; the complete mirrors are the catalog, runbook legend, and alerts.md).
       - alert: GCMCAssignmentFailures
         expr: |
           (
@@ -209,8 +213,8 @@ groups:
           component: mc-assignment
         annotations:
           summary: "MC assignment failure rate high ({{ $value | humanizePercentage }})"
-          description: "MC assignment failures are {{ $value | humanizePercentage }} for 5 minutes. This may indicate MC capacity or connectivity issues."
-          impact: "Some users unable to join meetings. Investigate MC health and capacity."
+          description: "MC assignment failures are {{ $value | humanizePercentage }} for 5 minutes. Break down by `rejection_reason` FIRST (`sum by(rejection_reason) (increase(gc_mc_assignments_total{status!=\"success\"}[5m]))`): at_capacity/unhealthy/no_mcs_available point at MC capacity or connectivity; `invalid_request` is a GC-side contract violation (GC sent a malformed request), NOT a fleet problem — do not scale MCs, follow the runbook's invalid_request branch and escalate to the GC owner."
+          impact: "Some users unable to join meetings. Triage by rejection_reason: MC health/capacity for most reasons, but invalid_request is a GC bug."
           runbook_url: "docs/runbooks/gc-incident-response.md#scenario-3-mc-assignment-failures"
 
       - alert: GCDatabaseSlow
