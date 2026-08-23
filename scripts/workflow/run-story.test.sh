@@ -405,6 +405,13 @@ case "$mode" in
     n=$(( $(cat "${M}/devloop.count" 2>/dev/null || echo 0) + 1 ))
     printf '%s' "$n" > "${M}/devloop.count"
     : >> "${M}/ran.claude.devloop"
+    # F1 PREMISE pin (@security): Model B's coverage of the inner Gate-2 layer-all runs at
+    # run-story.sh:1041 rests on this devloop session actually RECEIVING DEVLOOP_HEADLESS=1
+    # (an inline per-command prefix — the same fragile construct that caused F1 at :1388). If
+    # a refactor hoists/restructures :1041 and drops the prefix, the inner runs silently become
+    # interactive and Model B never engages, with nothing else going red. Pin the premise that
+    # the helper-level (=1,headless)→RUNALL cell structurally cannot see.
+    [ "${DEVLOOP_HEADLESS:-}" = "1" ] && : >> "${M}/devloop.session.headless"
     # Per-attempt rc list, e.g. FAKE_DEVLOOP_RCS="1 0" => fail then succeed.
     rc=0
     if [ -n "${FAKE_DEVLOOP_RCS:-}" ]; then
@@ -551,6 +558,13 @@ done
 cat > "$TEMPLATE/scripts/layer-all.sh" <<'STUB'
 #!/usr/bin/env bash
 : >> "${DEVLOOP_TEST_MARKERS}/ran.layer-all"
+# F1 (fast-fail-guards): the story-close gate is an unattended AUTHORITY run that must run
+# ALL layers — never fail-fast. run-story.sh:1388 forces that with an inline
+# `DEVLOOP_FAIL_FAST=0` prefix (defence-in-depth: robust even if fail_fast_mode's precedence
+# table regresses, and it overrides any ambient DEVLOOP_FAIL_FAST leaked into the runner).
+# Record the effective value so a pin can prove the belt is present (=="0") and cannot be
+# truncated by an ambient =1. ${VAR-x} (not ${VAR:-x}) keeps set-empty distinct from unset.
+printf '%s' "${DEVLOOP_FAIL_FAST-UNSET}" > "${DEVLOOP_TEST_MARKERS}/close-gate.fail_fast"
 exit "${FAKE_LAYER_ALL_RC:-0}"
 STUB
 chmod +x "$TEMPLATE"/scripts/workflow/preflight-story.sh "$TEMPLATE"/scripts/layer*.sh
@@ -742,8 +756,32 @@ assert_marker "d1-baseline-layers-ran"    "$MARK" 'ran.layer1'
 # of Part 3 (per-task layer 7) is untested on the completes path.
 assert_marker "d1-baseline-layer7-ran"    "$MARK" 'ran.layer7'
 assert_marker "d1-baseline-close-gate-ran" "$MARK" 'ran.layer-all'
+# F1 (belt): the story-close gate must be invoked with DEVLOOP_FAIL_FAST=0 — the explicit,
+# table-independent run-all signal. Composed with _common.test.sh's interactive-off-0 cell
+# (=0 → RUNALL), the two together prove the close gate runs COMPLETE; this half proves the
+# belt is physically present at run-story.sh:1388, so a future edit that "simplifies" the
+# call site back to a table-dependent signal reds here.
+if [ "$(cat "$MARK/close-gate.fail_fast" 2>/dev/null)" = "0" ]; then PASS=$((PASS + 1)); else
+  FAIL=$((FAIL + 1)); FAILURES+=("[d1-close-gate-forces-run-all] close gate saw DEVLOOP_FAIL_FAST='$(cat "$MARK/close-gate.fail_fast" 2>/dev/null)', expected '0'"); fi
+# F1 (premise): the inner devloop session received DEVLOOP_HEADLESS=1 — guards Model B's
+# coverage of the :1041 inner Gate-2 runs (see the claude stub's devloop arm).
+assert_marker "d1-devloop-session-headless" "$MARK" 'devloop.session.headless'
 if [ "$(manifest_status "$FIX" 1)" = "completed" ]; then PASS=$((PASS+1)); else
   FAIL=$((FAIL+1)); FAILURES+=("[d1-baseline-manifest-completed] task 1 status is '$(manifest_status "$FIX" 1)', expected completed"); fi
+
+# F1 (companion — the actual threat, @security): an ambient DEVLOOP_FAIL_FAST=1 leaked into the
+# runner (a developer who exports it for fast interactive loops, then runs a story) must NOT
+# truncate the unattended story-close gate. run-story.sh:1388's inline DEVLOOP_FAIL_FAST=0
+# overrides the leaked export, so the close-gate stub still sees "0". RED if that inline belt is
+# dropped — the stub would then see the ambient "1". This passes under BOTH the =0 belt AND
+# Model B (the run is headless), which is the point, not redundancy: it asserts the OUTCOME
+# (close gate runs complete), so it stays meaningful if a future edit changes the call-site
+# signal. Of the three F1 asserts, keep THIS one if ever trimming.
+run_story DEVLOOP_FAIL_FAST=1 -- fixture
+assert_exit   "f1-ambient-story-completes" 0 "$RC"
+assert_marker "f1-ambient-close-gate-ran"  "$MARK" 'ran.layer-all'
+if [ "$(cat "$MARK/close-gate.fail_fast" 2>/dev/null)" = "0" ]; then PASS=$((PASS + 1)); else
+  FAIL=$((FAIL + 1)); FAILURES+=("[f1-ambient-not-truncated] ambient DEVLOOP_FAIL_FAST=1 reached the close gate (saw '$(cat "$MARK/close-gate.fail_fast" 2>/dev/null)', expected '0' — the inline =0 belt is missing)"); fi
 
 # =============================================================================
 # (E) --stop-after  (R-5)

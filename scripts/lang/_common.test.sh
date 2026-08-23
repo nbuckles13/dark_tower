@@ -242,6 +242,70 @@ else
   FAIL=$((FAIL + 1)); FAILURES+=("[step-duration-fallback] expected 'LAYER=? STEP=foo DURATION=<secs>', got '${__sd_out2}'")
 fi
 
+# =============================================================================
+# fail_fast_mode() — DEVLOOP_FAIL_FAST precedence truth table (fast-fail-guards).
+#
+# This is the SINGLE home for the (=1, GITHUB_ACTIONS) → RUNALL cell: layer-all's
+# LAYER_SCRIPT_DIR stub seam rejects GITHUB_ACTIONS (assert_no_ci_sentinel_leak),
+# so that CI-authority arm is structurally UNREACHABLE through layer-all.test.sh.
+# The pure, sourceable helper is what turns it from an untestable disjunct into a
+# real pin — that was the whole argument for extracting it.
+#
+# Model B (validity-first): a bad value is INVALID even under CI/headless; an
+# explicit =1 is REFUSED (run-all) under any unattended lane so an ambient var
+# cannot shrink an authority run's coverage (ADR-0035); interactive honors the knob.
+# assert_ffm runs the helper in a subshell with a clean slate for the 3 inputs;
+# `if (( $# ))` guards `export` so the no-env case doesn't trip set -e.
+# =============================================================================
+assert_ffm() {
+  local label="$1" expected="$2"; shift 2
+  local actual
+  actual=$(
+    unset DEVLOOP_FAIL_FAST GITHUB_ACTIONS DEVLOOP_HEADLESS
+    if (( $# )); then export "$@"; fi
+    fail_fast_mode
+  )
+  if [[ "$actual" == "$expected" ]]; then
+    PASS=$((PASS + 1))
+  else
+    FAIL=$((FAIL + 1))
+    FAILURES+=("[ffm:${label}] env(${*:-none}) → expected '${expected}' got '${actual}'")
+  fi
+}
+
+# --- Interactive (neither GITHUB_ACTIONS nor DEVLOOP_HEADLESS) ---
+assert_ffm "interactive-default"    "FAILFAST interactive-default"
+assert_ffm "interactive-empty"      "FAILFAST interactive-default" DEVLOOP_FAIL_FAST=  # set-but-empty == unset
+assert_ffm "interactive-on-1"       "FAILFAST fail-fast-env"       DEVLOOP_FAIL_FAST=1
+assert_ffm "interactive-on-true"    "FAILFAST fail-fast-env"       DEVLOOP_FAIL_FAST=true
+assert_ffm "interactive-on-TRUE"    "FAILFAST fail-fast-env"       DEVLOOP_FAIL_FAST=TRUE
+assert_ffm "interactive-on-yes"     "FAILFAST fail-fast-env"       DEVLOOP_FAIL_FAST=yes
+assert_ffm "interactive-off-0"      "RUNALL run-all-env"           DEVLOOP_FAIL_FAST=0
+assert_ffm "interactive-off-false"  "RUNALL run-all-env"           DEVLOOP_FAIL_FAST=false
+assert_ffm "interactive-off-no"     "RUNALL run-all-env"           DEVLOOP_FAIL_FAST=no
+
+# --- Bad values → INVALID (validity FIRST, loud EVEN under an authority lane) ---
+assert_ffm "invalid-typo"           "INVALID" DEVLOOP_FAIL_FAST=ture
+assert_ffm "invalid-numeric"        "INVALID" DEVLOOP_FAIL_FAST=2
+assert_ffm "invalid-on-word"        "INVALID" DEVLOOP_FAIL_FAST=on    # 'on' is NOT an accepted boolean form
+assert_ffm "invalid-under-ci"       "INVALID" DEVLOOP_FAIL_FAST=ture GITHUB_ACTIONS=1     # loud even in CI
+assert_ffm "invalid-under-headless" "INVALID" DEVLOOP_FAIL_FAST=xyz  DEVLOOP_HEADLESS=1
+
+# --- Headless story-runner lane ---
+assert_ffm "headless-unset"         "RUNALL headless"                    DEVLOOP_HEADLESS=1
+assert_ffm "headless-off"           "RUNALL headless"                    DEVLOOP_HEADLESS=1 DEVLOOP_FAIL_FAST=0
+assert_ffm "headless-refuses-1"     "RUNALL unattended-override-refused" DEVLOOP_HEADLESS=1 DEVLOOP_FAIL_FAST=1
+assert_ffm "headless-refuses-true"  "RUNALL unattended-override-refused" DEVLOOP_HEADLESS=1 DEVLOOP_FAIL_FAST=true
+
+# --- GITHUB_ACTIONS CI lane (the arm the layer-all seam structurally cannot reach) ---
+assert_ffm "ci-unset"               "RUNALL github-actions"              GITHUB_ACTIONS=1
+assert_ffm "ci-off"                 "RUNALL github-actions"              GITHUB_ACTIONS=1 DEVLOOP_FAIL_FAST=0
+assert_ffm "ci-refuses-1"           "RUNALL unattended-override-refused" GITHUB_ACTIONS=1 DEVLOOP_FAIL_FAST=1
+
+# --- Both unattended signals: GHA carries the label; an explicit =1 still refused ---
+assert_ffm "both-unset-ci-label"    "RUNALL github-actions"              GITHUB_ACTIONS=1 DEVLOOP_HEADLESS=1
+assert_ffm "both-refuses-1"         "RUNALL unattended-override-refused" GITHUB_ACTIONS=1 DEVLOOP_HEADLESS=1 DEVLOOP_FAIL_FAST=1
+
 # Summary.
 printf '\n_common.test.sh: %d passed, %d failed\n' "$PASS" "$FAIL"
 if [[ $FAIL -gt 0 ]]; then

@@ -64,4 +64,13 @@ layer_lifecycle_begin 3
   # STORY_REPO_ROOT/DT_STORY seams; stub claude/sleep/date, real git, real
   # dt-story. No cluster, no network, no real sessions.
   run_and_emit "run-story-selftest" "${__here}/workflow/run-story.test.sh" || true
+  # Guard-runner self-test (fast-fail-guards devloop): pins run-guards.sh's timeout
+  # emission + the violation/timeout counter split + the ladder-mirror exit precedence
+  # (PRECONDITION>0 → exit 2 dominant), all via a PATH-stubbed `timeout` (hermetic, no real
+  # sleep). The exit-precedence mirror in run-guards.sh (it sources guards/common.sh, not
+  # lang/_common.sh, so cannot call status_to_exit_code) has NO other mechanical drift guard;
+  # this test derives the expected exit from status_to_exit_code at test time. Deliberately
+  # NOT under guards/simple/ — run-guards.sh's `find simple -name '*.sh'` would auto-run it as
+  # a guard too. No cluster.
+  run_and_emit "run-guards-selftest" "${__here}/guards/run-guards.test.sh" || true
 } | tee_collect_statuses

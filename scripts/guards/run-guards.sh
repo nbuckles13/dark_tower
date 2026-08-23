@@ -7,8 +7,11 @@
 #
 # Exit codes:
 #   0 - All guards passed
-#   1 - One or more guards failed
-#   2 - Script error
+#   1 - One or more guards found a violation (implementer lane)
+#   2 - A guard hit its timeout (operator lane — PRECONDITION_FAILURE; see
+#       scripts/lang/_common.sh status_to_exit_code / ADR-0033 §6), OR a script/usage error.
+#       A timeout exit DOMINATES a violation exit (ladder-mirror: PRECONDITION_FAILURE > FAIL);
+#       the coexisting violation is still named loudly (STATUS=FAIL guard-violations + MIXED_LANE).
 #
 # Usage:
 #   ./run-guards.sh [options] [path]
@@ -86,11 +89,17 @@ echo ""
 echo "Path: $SEARCH_PATH"
 echo ""
 
-# Track results
+# Track results.
+# FAILED_GUARDS / FAILED_GUARD_NAMES mean "found a VIOLATION" (implementer lane, exit 1).
+# PRECONDITION_GUARDS / PRECONDITION_GUARD_NAMES mean "timed out / SIGKILLed" (operator lane,
+# exit 2) — a machine fact, not a diff defect. Kept as SEPARATE counters so a timeout is never
+# reported as a violation and vice versa (ADR-0033 §6 lane split).
 TOTAL_GUARDS=0
 PASSED_GUARDS=0
 FAILED_GUARDS=0
+PRECONDITION_GUARDS=0
 declare -a FAILED_GUARD_NAMES
+declare -a PRECONDITION_GUARD_NAMES
 
 # Timer
 START_TIME=$(date +%s.%N)
@@ -113,8 +122,11 @@ if [[ -d "$SIMPLE_GUARDS_DIR" ]]; then
     )
     # Per-guard timeout per ADR-0034 §9 (strategy-independent hardening).
     # `GUARD_TIMEOUT_SECS` defaults to 30s, `GUARD_KILL_AFTER_SECS` to 5s.
-    # Exit 124 → STATUS=FAIL REASON=guard-timeout-<name>
-    # Exit 137 → STATUS=FAIL REASON=guard-timeout-kill-<name>
+    # Exit 124 → STATUS=PRECONDITION_FAILURE REASON=guard-timeout-<name>       (operator lane, exit 2)
+    # Exit 137 → STATUS=PRECONDITION_FAILURE REASON=guard-timeout-kill-<name>  (operator lane, exit 2)
+    # A timeout is a machine fact (contention/OOM), NOT a diff defect, so it lands on the
+    # operator lane instead of a code-defect FAIL. REASON tokens are byte-identical to the
+    # pre-2026-08-21 contract; only the STATUS enum moved FAIL → PRECONDITION_FAILURE.
     # Capture form `local guard_exit=0 || guard_exit=$?` is load-bearing
     # under `set -euo pipefail` — without the `0` initializer + `||` capture,
     # a non-zero timeout exit aborts the for-loop before the classifier runs.
@@ -124,7 +136,9 @@ if [[ -d "$SIMPLE_GUARDS_DIR" ]]; then
     # Single classifier per @test F1 fold-in 2026-05-19. Maps the `$1`
     # exit code from the timeout-wrapped guard invocation into one of
     # four classes: 0 (PASS), 124 (timeout), 137 (timeout-kill), or
-    # other. Counters / FAILED_GUARD_NAMES are updated as side effects.
+    # other (violation). 124/137 update PRECONDITION_GUARDS / _NAMES
+    # (operator lane); a violation updates FAILED_GUARDS / _NAMES
+    # (implementer lane) — the two counter sets are never crossed.
     # `$2` is the captured stdout+stderr for non-verbose callers; empty
     # for verbose callers (where output already streamed live). On the
     # generic-failure branch, captured output is greped for VIOLATION /
@@ -138,16 +152,24 @@ if [[ -d "$SIMPLE_GUARDS_DIR" ]]; then
                 ((PASSED_GUARDS++)) || true
                 ;;
             124)
-                echo "STATUS=FAIL REASON=guard-timeout-${GUARD_NAME}"
-                echo -e "${RED}FAILED${NC}: $GUARD_NAME (timed out after ${GUARD_TIMEOUT_SECS}s)"
-                ((FAILED_GUARDS++)) || true
-                FAILED_GUARD_NAMES+=("$GUARD_NAME")
+                # Timeout → operator lane (PRECONDITION_FAILURE, exit 2), NOT a diff defect.
+                echo "STATUS=PRECONDITION_FAILURE REASON=guard-timeout-${GUARD_NAME}"
+                echo -e "${YELLOW}TIMEOUT${NC}: $GUARD_NAME (timed out after ${GUARD_TIMEOUT_SECS}s — operator lane, machine too slow, not a diff defect)"
+                # Line-anchored stderr banner (R-F): makes the runbook §4 one-pass triage grep
+                # `^(ERROR|PRECONDITION_FAILURE):` find a guard timeout. Under layer3 this lands
+                # in ${DEVLOOP_TMP}/layer-3.stderr.log via layer-all's `2>>` redirect.
+                echo "PRECONDITION_FAILURE: guard ${GUARD_NAME} timed out after ${GUARD_TIMEOUT_SECS}s (operator lane; suspect concurrent machine load) REASON=guard-timeout-${GUARD_NAME}" >&2
+                ((PRECONDITION_GUARDS++)) || true
+                PRECONDITION_GUARD_NAMES+=("$GUARD_NAME")
                 ;;
             137)
-                echo "STATUS=FAIL REASON=guard-timeout-kill-${GUARD_NAME}"
-                echo -e "${RED}FAILED${NC}: $GUARD_NAME (killed after timeout + ${GUARD_KILL_AFTER_SECS}s grace)"
-                ((FAILED_GUARDS++)) || true
-                FAILED_GUARD_NAMES+=("$GUARD_NAME")
+                # SIGKILL after the --kill-after grace (or an OOM kill) — also an environment
+                # fact, so it shares the operator lane with 124 (ADR-0034 §9 authorizes both).
+                echo "STATUS=PRECONDITION_FAILURE REASON=guard-timeout-kill-${GUARD_NAME}"
+                echo -e "${YELLOW}TIMEOUT-KILL${NC}: $GUARD_NAME (SIGKILLed after ${GUARD_TIMEOUT_SECS}s timeout + ${GUARD_KILL_AFTER_SECS}s grace — operator lane, not a diff defect)"
+                echo "PRECONDITION_FAILURE: guard ${GUARD_NAME} SIGKILLed after ${GUARD_TIMEOUT_SECS}s timeout + ${GUARD_KILL_AFTER_SECS}s grace (operator lane; suspect concurrent machine load or OOM) REASON=guard-timeout-kill-${GUARD_NAME}" >&2
+                ((PRECONDITION_GUARDS++)) || true
+                PRECONDITION_GUARD_NAMES+=("$GUARD_NAME")
                 ;;
             *)
                 echo -e "${RED}FAILED${NC}: $GUARD_NAME (exit $exit_code)"
@@ -217,16 +239,65 @@ echo "==========================================${NC}"
 echo ""
 echo "Total guards run: $TOTAL_GUARDS"
 echo -e "Passed: ${GREEN}$PASSED_GUARDS${NC}"
-echo -e "Failed: ${RED}$FAILED_GUARDS${NC}"
+echo -e "Failed (violations): ${RED}$FAILED_GUARDS${NC}"
+echo -e "Timed out (operator lane): ${YELLOW}$PRECONDITION_GUARDS${NC}"
 printf "Elapsed time: %.2f seconds\n" "$ELAPSED"
 echo ""
 
+# R-A2 (@security F2): a violating guard's generic-failure arm prints only the human
+# `FAILED: <name>` line and NO `STATUS=` token — so standalone a violation would have no
+# machine-readable trace. Emit one whenever any violation was found, mirroring the `FAIL`
+# line run_and_emit already emits on the layer path. This is what keeps the ladder-mirror
+# operator-lane exit (2, below) from MASKING a real defect when a timeout coexists.
 if [[ $FAILED_GUARDS -gt 0 ]]; then
-    echo -e "${RED}Failed guards:${NC}"
+    echo "STATUS=FAIL REASON=guard-violations"
+    echo -e "${RED}Failed guards (violations — implementer lane):${NC}"
     for failed in "${FAILED_GUARD_NAMES[@]}"; do
         echo "  - $failed"
     done
     echo ""
+fi
+
+if [[ $PRECONDITION_GUARDS -gt 0 ]]; then
+    echo -e "${YELLOW}Timed-out guards (operator lane — machine too slow / OOM, NOT a diff defect):${NC}"
+    for timed_out in "${PRECONDITION_GUARD_NAMES[@]}"; do
+        echo "  - $timed_out"
+    done
+    echo "  Re-run on a quiet machine. See docs/runbooks/devloop-validation.md §6.3."
+    echo ""
+fi
+
+# MIXED_LANE (R-A2): when a timeout AND a violation coexist, name the violation LOUDLY so the
+# ladder-mirror operator-lane exit (2) is never read as "nothing to fix". This line + the
+# guard-violations STATUS trace above are what license exit-2-on-mixed (see the exit block).
+if [[ $PRECONDITION_GUARDS -gt 0 && $FAILED_GUARDS -gt 0 ]]; then
+    mixed_lane_line="MIXED_LANE: precondition=${PRECONDITION_GUARDS} violations=${FAILED_GUARDS} — exit 2 (operator lane); the ${FAILED_GUARDS} violation(s) above are REAL and must be fixed; re-run on a quiet machine for a clean implementer-lane verdict."
+    echo "$mixed_lane_line"
+    # Also to stderr (@observability): under layer3, stdout → layer-3.log but the documented
+    # §4 one-pass triage reads layer-3.stderr.log — where the timeout banner lands. Without this,
+    # an operator grepping stderr sees only "guard timed out, suspect machine load" and could
+    # dismiss with "re-run on a quiet machine", missing the coexisting violation R-A2 exists to
+    # keep legible. Putting the caveat in the SAME channel as the alarm closes that 3am shortcut.
+    echo "$mixed_lane_line" >&2
+    echo ""
+fi
+
+# ANCHOR (DRY): this exit precedence MIRRORS scripts/lang/_common.sh __status_rank +
+# status_to_exit_code (PRECONDITION_FAILURE rank 6 > FAIL rank 5 > OK → exit 2 > 1 > 0).
+# run-guards.sh sources scripts/guards/common.sh, NOT lang/_common.sh, so it cannot call
+# status_to_exit_code directly — this hand-copy is the SAME ONE ladder as the layer
+# aggregation (standalone exit == layer verdict == pipeline lane; no divergence). The mirror,
+# AND the three hand-rolled `STATUS=` emissions in this file (the 124/137 arms + the
+# guard-violations line above, all bypassing lang/_common.sh emit_status), are pinned by
+# scripts/guards/run-guards.test.sh, which derives the expected exit from status_to_exit_code
+# at test time so a ladder change REDS the test instead of silently desyncing. That self-test
+# is the ONLY mechanical drift guard for this hand-copy. A FOURTH hand-rolled `STATUS=`
+# emission is the recorded trigger to revisit routing through emit_status (which would require
+# sourcing lang/_common.sh — rejected on coupling grounds, ADR-0015 §Pre-commit standalone use).
+if [[ $PRECONDITION_GUARDS -gt 0 ]]; then
+    echo "Run with --verbose for detailed output"
+    exit 2
+elif [[ $FAILED_GUARDS -gt 0 ]]; then
     echo "Run with --verbose for detailed output"
     exit 1
 else
