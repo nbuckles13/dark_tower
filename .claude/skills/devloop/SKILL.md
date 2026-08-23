@@ -384,7 +384,7 @@ When implementer signals "Ready for validation", run the validation pipeline:
 ./scripts/layer-all.sh
 ```
 
-Each `scripts/layerN.sh` is independently callable for targeted debugging (e.g., `scripts/layer4.sh` to re-run only Layer 4 on a failing diff). See ADR-0033 §4 for the wrapper contract (`STATUS=` lines, `LAYER=N START=… END=… RESULT=…` stderr summary, worst-child STATUS aggregation, 90s p95 wall-clock budget for the always-run subset). **§4 specifies `layer-all.sh` runs the layers "sequentially" and does NOT stop at the first red layer; `scripts/layer-all.sh` implements that explicitly and deliberately** — its per-layer loop wraps each invocation in `set +e`, commented "so a non-zero layer doesn't abort the loop (replaces the old `if ! …` guard)" — a failing layer is recorded and the run continues, so one invocation reports the state of all seven. **Read the `TOTAL_RESULT=` line in the `LAYER_SUMMARY` block for the verdict**, not any single layer, and not a wrapper's exit status.
+Each `scripts/layerN.sh` is independently callable for targeted debugging (e.g., `scripts/layer4.sh` to re-run only Layer 4 on a failing diff). See ADR-0033 §4 for the wrapper contract (`STATUS=` lines, `LAYER=N START=… END=… RESULT=…` stderr summary, worst-child STATUS aggregation, 90s p95 wall-clock budget for the always-run subset). **Whether `layer-all.sh` runs all seven layers or stops at the first red one is MODE-DEPENDENT — see ADR-0033 §4 (2026-08-21 amendment) and `docs/runbooks/devloop-validation.md` §3 "Fail-fast vs run-all" for the authoritative contract**: unattended callers (CI, the story runner / headless sessions, the story-close gate) run ALL layers (one pass reports everything broken — what the authority verdict relies on); an INTERACTIVE devloop fail-fasts (stops at the first layer exiting non-zero, the rest render `RESULT=NOT-RUN`). A `devloop` running interactively will typically see the pipeline STOP at the first red layer — that is expected, not a truncated run. **Read the `TOTAL_RESULT=` line in the `LAYER_SUMMARY` block for the verdict**, not any single layer, and not a wrapper's exit status; a `NOT-RUN` layer means "not evaluated" (not "clean").
 
 **Pipeline failures**: see `docs/runbooks/devloop-validation.md` for layer-by-layer failure-mode mapping, exit-code / `STATUS=` enum reference, `_get_base_ref.sh` troubleshooting (the `BASE_REF=…` stderr line is the anchor), and per-language wrapper triage.
 
@@ -404,7 +404,7 @@ The **only** remaining `SKIPPED-NO-DIFF` producer is the Layer-6 audit dep-manif
 
 **Layer N/A justification template**:
 
-A wrapper script under `scripts/lang/<X>/` may report `STATUS=N/A` (incl. an **intentional-gap** placeholder wrapper emitting `REASON=not-applicable-to-this-lang`, e.g. proto's deliberately-absent test/audit phases registered as `proto/test.sh` / `proto/audit.sh`), `SKIPPED-NO-DIFF`, or `SKIPPED-NO-VERB` (`all-langs-filtered`, operator intent) per the wrapper contract in ADR-0033 §6. `scripts/layer-all.sh` records the status + `REASON=…` in its summary table; the implementer does **not** owe Gate 2 a separate explanation in *those* cases — the wrapper's own `REASON=…` is the justification. This self-justifying set does NOT include `FAIL-MISSING-VERB` (REASON `<lang>-<verb>-verb-missing-or-not-executable`): per task #52 a verb wrapper that should exist but is missing/non-executable reds the layer (exit 2) and IS a Gate 2 failure the implementer must act on — restore the wrapper (or register an intentional-gap placeholder emitting `N/A`), do not rationalize it as a deliberate skip.
+A wrapper script under `scripts/lang/<X>/` may report `STATUS=N/A` (incl. an **intentional-gap** placeholder wrapper emitting `REASON=not-applicable-to-this-lang`, e.g. proto's deliberately-absent test/audit phases registered as `proto/test.sh` / `proto/audit.sh`), `SKIPPED-NO-DIFF`, or `SKIPPED-NO-VERB` (`all-langs-filtered`, operator intent) per the wrapper contract in ADR-0033 §6. `scripts/layer-all.sh` records the status + `REASON=…` in its summary table; the implementer does **not** owe Gate 2 a separate explanation in *those* cases — the wrapper's own `REASON=…` is the justification. This self-justifying set does NOT include `FAIL-MISSING-VERB` (REASON `<lang>-<verb>-verb-missing-or-not-executable`): per task #52 a verb wrapper that should exist but is missing/non-executable reds the layer (exit 2) and IS a Gate 2 failure the implementer must act on — restore the wrapper (or register an intentional-gap placeholder emitting `N/A`), do not rationalize it as a deliberate skip. It ALSO does NOT include `RESULT=NOT-RUN` (2026-08-21): under interactive fail-fast, layers AFTER the first failing one render `NOT-RUN` in the summary — that means "never evaluated", NOT a clean skip. Do not rationalize a `NOT-RUN` layer at Gate 2 the way a `SKIPPED-NO-DIFF` can be justified; the verdict is the FAILING layer that stopped the run, and the `NOT-RUN` layers are simply unmeasured (re-run with `DEVLOOP_FAIL_FAST=0` to evaluate them all).
 
 The cases requiring implementer action are an unexpected `STATUS=N/A` outside the documented gap/placeholder cases, OR a `FAIL-MISSING-VERB` — both indicate a wrapper/wiring bug. Escalate to operations rather than defer.
 
@@ -420,7 +420,7 @@ The cases requiring implementer action are an unexpected `STATUS=N/A` outside th
 
 **Layer 7 — Env-tests (Integration)**:
 
-Layer 7 is the seventh shell-layer in `scripts/layer-all.sh`, executed automatically after layers 1-6. It always runs — intentionally broader than ADR-0030's trigger-path list, because business logic changes can break integration tests too. The full mechanism (cluster bring-up, two-phase classifier, the four STATUS lanes) lives in `scripts/layer7.sh`; failure-mode → REASON-token → fix mapping is in `docs/runbooks/devloop-validation.md §6.7`.
+Layer 7 is the seventh shell-layer in `scripts/layer-all.sh`, executed automatically after layers 1-6. When it runs, it always runs its full suite — intentionally broader than ADR-0030's trigger-path list, because business logic changes can break integration tests too. **(Fail-fast caveat, 2026-08-21:** in an INTERACTIVE devloop, if any of layers 1-6 fails, `layer-all.sh` stops there and Layer 7 renders `RESULT=NOT-RUN` — it does NOT run. Layer 7 running unconditionally holds for UNATTENDED callers, incl. the story-close authority gate. So an interactive iteration that reds at Layer 3 will not pay Layer 7's cluster bring-up — that is the point of the change. Re-run with `DEVLOOP_FAIL_FAST=0` to force Layer 7.)** The full mechanism (cluster bring-up, two-phase classifier, the four STATUS lanes) lives in `scripts/layer7.sh`; failure-mode → REASON-token → fix mapping is in `docs/runbooks/devloop-validation.md §6.7`.
 
 **Layer 7 runs two Phase-2 suites sequentially against the same cluster** (task #19, R-48): first the Rust env-tests (`cargo test -p env-tests --features all`, always attempted), then the browser E2E (`pnpm --filter @darktower/web-app test:e2e`, Playwright harness from task #18) — which **also always runs** whenever Layer 7 runs (the diff-trigger was retired 2026-08-20), subject only to its Phase-1g preconditions. The mechanism SSoT is `scripts/layer7.sh` (precondition checks, timeouts — not re-encoded here); failure-mode → REASON-token → fix mapping is runbook §6.7.
 
@@ -436,6 +436,18 @@ Layer 7 is the seventh shell-layer in `scripts/layer-all.sh`, executed automatic
 - Send failure details to implementer
 - Increment iteration count
 - Max 3 attempts before escalation
+- **Operator lane — a `PRECONDITION_FAILURE` (exit 2) from ANY layer does NOT consume an attempt**
+  (generalized from L7-only, 2026-08-21). The pipeline maps `PRECONDITION_FAILURE`/`FAIL-MISSING-VERB`/`UNKNOWN`
+  → exit 2 (`_common.sh status_to_exit_code`), and `run-story.sh` already routes any gate exit ≥2 to the
+  operator lane in code — the interactive Gate 2 must mirror that. A `FAIL` (exit 1) still consumes an attempt.
+  The most common Layer-1-6 case is a **Layer-3 guard timeout** (`STATUS=PRECONDITION_FAILURE REASON=guard-timeout[-kill]-<name>`,
+  machine contention/OOM): retry once, don't consume an attempt, then escalate to operations.
+  - **BUT — reproduce-on-retry is the discriminator, don't default to "operator lane":** a guard timeout that
+    times out AGAIN on retry (or on a quiet machine), OR whose runtime jumped vs its normal cost while the diff
+    grew its input set, is **DIFF-CAUSED** — the changeset pushed the guard past its budget and the guard rendered
+    NO verdict, so whatever it would have caught went unreported. Route it to the IMPLEMENTER and CONSUME an
+    attempt (it is not "not my problem"). Only a NON-reproducing timeout is the true operator lane. See
+    `docs/runbooks/devloop-validation.md` §6.3 (`guard-timeout-*` row).
 
 **If fail (layer 7)**:
 - Send full env-test output (stdout + stderr) to implementer
@@ -649,7 +661,7 @@ When the invocation prompt is prefixed with `HEADLESS RUN` (set by `scripts/work
 | Implementation | No limit | Lead monitors progress |
 | Validation (L1-6) | 3 attempts | Escalate |
 | Validation (L7 env-tests) | 2 attempts | Escalate |
-| Infra/precondition failures (L7) | Retry once | Escalate (don't consume attempts) |
+| Infra/precondition failures (`PRECONDITION_FAILURE`/exit 2, ANY layer — incl. L3 guard timeout) | Retry once | Escalate (don't consume attempts) — UNLESS it reproduces/is diff-caused (§6.3), then implementer lane + consume |
 | First-run setup (L7) | ~7 min | Does not count toward attempts |
 | Review→Impl loop | 3 iterations | Escalate |
 | Human review rounds | 3 per devloop | Escalate ("is this task well-scoped?") |

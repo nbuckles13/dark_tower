@@ -574,7 +574,8 @@ fn collect_from_file(path: &Path, content: &str, decls: &mut BTreeMap<String, De
 /// Transitive closure with a **visited set**. TypeScript permits mutually recursive
 /// types (`interface A { next: B }` / `interface B { next: A }`), which are idiomatic
 /// for tree/list shapes; without cycle detection this does not terminate, and a hang
-/// presents as `STATUS=FAIL REASON=guard-timeout-…` on every devloop — a *performance*
+/// presents as `STATUS=PRECONDITION_FAILURE REASON=guard-timeout-…` (operator lane, exit 2,
+/// as of 2026-08-21; the REASON token is unchanged) on every devloop — a *performance*
 /// symptom that sends triage to file counts rather than to a recursive type
 /// (@operations, task #58).
 fn close_over(decls: BTreeMap<String, Decl>) -> DeclIndex {

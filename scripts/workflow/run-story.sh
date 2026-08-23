@@ -1385,7 +1385,15 @@ closelog="$RUN_DIR/story-close.gate.log"
 slog "STORY_RUN: STORY-CLOSE GATE running — full layer-all.sh incl. layer 7 (log=${closelog})"
 close_start="$(date +%s)"
 set +e
-./scripts/layer-all.sh >"$closelog" 2>&1
+# S3: force RUN-ALL on the story-close authority gate. This runs from the runner's OWN shell
+# where DEVLOOP_HEADLESS is unset (line ~1041 sets it only as a per-command prefix on the
+# `claude` invocation), so without a signal layer-all.sh would classify this unattended gate as
+# interactive and FAIL-FAST it — losing the one-pass full report ADR-0035's authority gate needs.
+# DEVLOOP_FAIL_FAST=0 (not DEVLOOP_HEADLESS=1): Model B already refuses an ambient =1 under
+# headless, but an inline =0 is defense-in-depth (independent of the helper's precedence table)
+# AND overrides an ambient DEVLOOP_FAIL_FAST=1 a developer may have exported into the runner's
+# env (a DEVLOOP_HEADLESS=1 prefix would leave that ambient =1 present). See devloop main.md S3.
+DEVLOOP_FAIL_FAST=0 ./scripts/layer-all.sh >"$closelog" 2>&1
 rc=$?
 set -e
 slog "STORY_RUN: STORY-CLOSE GATE rc=${rc} elapsed=$(( $(date +%s) - close_start ))s"

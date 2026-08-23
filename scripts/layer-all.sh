@@ -39,6 +39,17 @@ init_devloop_tmp
 # even on an early exit that fires before the layer loop populates them.
 declare -a layer_status layer_dur
 final_exit=0
+stopped_early=0   # >0 = the layer at which interactive fail-fast stopped the run (0 = ran all)
+
+# NOT_RUN — DISPLAY-ONLY marker for layers that never ran under interactive fail-fast.
+# GUARDRAIL (@security): NOT_RUN must NEVER be added to _common.sh __status_rank or given an
+# arm in status_to_exit_code. It is deliberately kept OUT of aggregation: the aggregation loop
+# `continue`s past it and status_to_exit_code is never called on it, so an un-run layer can
+# neither demote nor inflate TOTAL_RESULT / LAYER_ALL_EXIT. The `*)` fail-closed backstops in
+# __status_rank (rank 8) and status_to_exit_code (exit 2) make an accidental leak LOUD — but a
+# well-meaning `NOT-RUN → 0` arm would silently reopen the fail-fast GATE2=PASS-forgery vector
+# (a stopped-early run exiting 0 over layers that never ran). Do not "complete the enum".
+readonly NOT_RUN="NOT-RUN"
 
 # Gate-2 producer: emit the tree-bound verdict as the pipeline's FINAL step via an
 # EXIT trap (task #51; design main.md §Design point 1). Installing it HERE — before
@@ -107,6 +118,29 @@ if [[ "${DEVLOOP_TEST:-}" == "1" && -n "${LAYER_SCRIPT_DIR:-}" ]]; then
   layer_script_dir="$LAYER_SCRIPT_DIR"
 fi
 
+# Fail-fast vs run-all mode (Change 2). Resolved by the pure _common.sh::fail_fast_mode()
+# predicate (single source of the DEVLOOP_FAIL_FAST precedence). Placed AFTER
+# assert_no_ci_sentinel_leak (above) so no new env is read before the sentinel check.
+# fail_fast_mode always returns 0 and signals INVALID via stdout; `|| true` just keeps a
+# (hypothetical) non-zero return from aborting under set -e without a dead capture var.
+ff_decision="$(fail_fast_mode)" || true
+ff_mode="${ff_decision%% *}"      # first word: FAILFAST | RUNALL | INVALID
+ff_source="${ff_decision#"$ff_mode"}"; ff_source="${ff_source# }"  # remainder = SOURCE label (empty for INVALID)
+case "$ff_mode" in
+  FAILFAST) fail_fast=1 ;;
+  RUNALL)   fail_fast=0 ;;
+  *)  # INVALID (or any unexpected token) — fail-closed, loud, per "fail loudly; never mask".
+    printf 'PRECONDITION_FAILURE: DEVLOOP_FAIL_FAST=%q is not a recognized boolean (use 1/0/true/false/yes/no).\n' "${DEVLOOP_FAIL_FAST:-}" >&2
+    exit 2 ;;
+esac
+# Always announce the mode in force (R-E/N1) — a fact in the log, incl. someone else's pasted
+# log; neither line starts with STATUS=. On an unattended override refusal, also emit the
+# WARN token (matches the WARN BUDGET_* convention so `grep 'WARN '` finds it).
+printf 'PIPELINE_MODE=%s SOURCE=%s\n' "$([[ $fail_fast -eq 1 ]] && printf 'fail-fast' || printf 'run-all')" "$ff_source" >&2
+if [[ "$ff_source" == "unattended-override-refused" ]]; then
+  echo "WARN FAIL_FAST_OVERRIDE_IGNORED REQUESTED=1 MODE=run-all" >&2
+fi
+
 for n in 1 2 3 4 5 6 7; do
   start=$(date +%s)
   # observability O3: atomic stderr append redirect (no process-sub race with stdout tee).
@@ -141,22 +175,66 @@ for n in 1 2 3 4 5 6 7; do
   if [[ $n -ne 7 && $dur -gt $budget_secs_per_layer ]]; then
     echo "WARN BUDGET_BREACH LAYER=${n} DURATION=${dur} BUDGET=${budget_secs_per_layer}" >&2
   fi
+
+  # Change 2 — interactive fail-fast: STOP at the first failing layer. Keyed on the layer's
+  # real process exit code `rc != 0` (@security S1 — NEVER status-based; a status-based stop
+  # could halt on an exit-0 N/A/SKIPPED layer at final_exit==0 and forge GATE2=PASS over
+  # un-run layers). rc catches even a lying `STATUS=OK; exit 1` layer. Placed at the END of
+  # the loop body, AFTER final_exit + layer_status/dur are set, so the failing layer's own rc
+  # and RESULT cell are recorded. Unattended (fail_fast=0) never breaks → byte-identical run-all.
+  if (( fail_fast )) && (( rc != 0 )); then
+    stopped_early=$n
+    break
+  fi
 done
+
+# Mark the layers that never ran under a fail-fast stop as NOT-RUN (DISPLAY-ONLY — see the
+# NOT_RUN decl). Setting them explicitly means the `${…:-UNKNOWN}` reads below never fire for
+# an un-run layer (UNKNOWN would wrongly inflate TOTAL_RESULT → exit 2). Loud greppable stop
+# line so "layers N+1..7 missing" is never ambiguous with a truncated log.
+if (( stopped_early > 0 )); then
+  not_run_list=""
+  for (( n = stopped_early + 1; n <= 7; n++ )); do
+    layer_status[$n]="$NOT_RUN"
+    layer_dur[$n]=0
+    not_run_list="${not_run_list:+${not_run_list},}${n}"
+  done
+  echo "STOPPED_EARLY LAYER=${stopped_early} RESULT=${layer_status[$stopped_early]} NOT_RUN=${not_run_list}" >&2
+  # Defensive (N3): fail-fast only ever breaks on rc!=0, so final_exit>0 by construction here.
+  # A zero here is an orchestrator bug that would let a stopped-early run report success — a
+  # fixed greppable token so it's identifiable in a log and rides the §4 one-pass grep.
+  if (( final_exit == 0 )); then
+    echo "PRECONDITION_FAILURE: stopped early at layer ${stopped_early} but final_exit==0 — orchestrator invariant violated REASON=fail-fast-exit-invariant" >&2
+    exit 2
+  fi
+fi
 
 # Guard+audit fast-tier budget check (layers 3 + 6 per ADR-0033 §4). Deliberately NOT a
 # sum over all always-run layers: since 2026-08-20 layers 1/2/4/5 also always-run, but
 # their compile/fmt/test/lint cost is inherently large/variable and out of this p95 budget
 # (like layer 7's env-test envelope). This is the cheap fast-floor latency guard only.
-guard_audit_dur=$(( ${layer_dur[3]:-0} + ${layer_dur[6]:-0} ))
-if [[ $guard_audit_dur -gt $total_budget_secs ]]; then
-  echo "WARN BUDGET_TOTAL_BREACH GUARD_AUDIT_DURATION=${guard_audit_dur} BUDGET=${total_budget_secs}" >&2
+# Under fail-fast, if layer 3 OR 6 did not run, the sum would be half-measured — a check that
+# silently stops checking (CLAUDE.md "fail loudly; never mask"). Skip it with a loud greppable
+# token (joins the WARN BUDGET_* family) rather than compare against absent data. Keyed off the
+# NOT-RUN status, not layer_dur==0 (a genuinely fast layer 6 can legitimately measure 0s).
+if [[ "${layer_status[3]:-}" != "$NOT_RUN" && "${layer_status[6]:-}" != "$NOT_RUN" ]]; then
+  guard_audit_dur=$(( ${layer_dur[3]:-0} + ${layer_dur[6]:-0} ))
+  if [[ $guard_audit_dur -gt $total_budget_secs ]]; then
+    echo "WARN BUDGET_TOTAL_BREACH GUARD_AUDIT_DURATION=${guard_audit_dur} BUDGET=${total_budget_secs}" >&2
+  fi
+else
+  echo "WARN BUDGET_TOTAL_SKIPPED REASON=layers-not-run LAST_RAN=${stopped_early}" >&2
 fi
 
 # Aggregate total + emit machine-parseable summary block (paired-operations §5).
+# NOT-RUN layers are DISPLAY-ONLY: skipped here so they never vote (not a new aggregation
+# enum). TOTAL_RESULT is therefore the worst of the layers that ACTUALLY ran (through the
+# failing one) = the failing layer's status; final_exit already holds its rc.
 total_dur=0
 total_result="OK"
 for n in 1 2 3 4 5 6 7; do
   total_dur=$(( total_dur + ${layer_dur[$n]:-0} ))
+  [[ "${layer_status[$n]:-UNKNOWN}" == "$NOT_RUN" ]] && continue
   total_result=$(aggregate_worst_status "$total_result" "${layer_status[$n]:-UNKNOWN}")
 done
 

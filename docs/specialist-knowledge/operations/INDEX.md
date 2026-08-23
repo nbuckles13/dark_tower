@@ -27,7 +27,7 @@
 
 ## CI & Guards
 - CI pipeline → `.github/workflows/ci.yml`; guard runner + common → `scripts/guards/run-guards.sh`, `common.sh`; `dt-guard` CLI → `crates/dt-guard/src/main.rs`, ADR-0033 §6
-- Devloop validation runbook (dt-guard triage §6.3.1, STATUS ladder §3, dep-change gate §6.6, browser-E2E §6.7, symptom catalogue §8) → `docs/runbooks/devloop-validation.md`; STATUS rank SSoT → `scripts/guards/common.sh:__status_rank`
+- Devloop validation runbook (dt-guard triage §6.3.1, STATUS ladder §3, dep-change gate §6.6, browser-E2E §6.7, symptom catalogue §8) → `docs/runbooks/devloop-validation.md`; STATUS rank SSoT → `scripts/lang/_common.sh:__status_rank` (+ `status_to_exit_code`); fail-fast/`DEVLOOP_FAIL_FAST` mode → `scripts/lang/_common.sh:fail_fast_mode`; guard timeout → operator lane → `scripts/guards/run-guards.sh:classify_guard_exit`
 - Layer 7 browser-E2E preconditions + Phase-2 lane, per-run org (Phase 1h) → `scripts/layer7.sh:__generate_org_subdomain()`, `precondition_fail()`; Layer 6 audit dep-change gate → `scripts/lang/_audit_gate.sh`, ADR-0033 §3
 - Pipeline self-tests (hermetic convention for E) → `scripts/layer-all.test.sh`, `scripts/layer7.test.sh`, `scripts/setup.test.sh`, `scripts/audit-suppressions-check.test.sh`, `scripts/workflow/run-story.test.sh`, `scripts/guards/validate-slug-class-sync.test.sh`, `scripts/guards/validate-subdomain-regex-sync.test.sh`
 - Shared self-test assertions (`assert_marker`/`assert_no_marker`/`assert_absent`) → `scripts/lang/_test_helpers.sh`

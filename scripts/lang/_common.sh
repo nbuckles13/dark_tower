@@ -321,6 +321,61 @@ status_to_exit_code() {
   esac
 }
 
+# Decide fail-fast vs run-all for scripts/layer-all.sh, from ENV ONLY. PURE + sourceable +
+# tri-state, with NO self-exit (the caller acts on the verdict) — the single source of the
+# DEVLOOP_FAIL_FAST precedence, unit-tested in _common.test.sh incl. the GITHUB_ACTIONS arm
+# the layer-all LAYER_SCRIPT_DIR stub seam structurally cannot reach.
+#
+# Echoes one of: "FAILFAST <source>" | "RUNALL <source>" | "INVALID" (returns 0 always).
+# The CALLER (layer-all.sh) acts: exit 2 loud on INVALID; emit `WARN FAIL_FAST_OVERRIDE_IGNORED`
+# on `unattended-override-refused`.
+#
+# Precedence (top wins) — Model B, validity-first (@security F3 + Lead R-B):
+#   1. bad DEVLOOP_FAIL_FAST value                → INVALID  (a typo is loud EVEN in CI/headless)
+#   2. explicit =1 AND unattended (GHA||HEADLESS) → RUNALL unattended-override-refused
+#      (an AMBIENT =1 must not shrink an authority run's coverage — ADR-0035; the refusal is
+#       LOUD not silent, and cannot forge green since a red run stays red)
+#   3. unattended (GHA||HEADLESS), =0 or unset    → RUNALL <github-actions|headless>
+#   4. interactive: =1 → FAILFAST fail-fast-env; =0 → RUNALL run-all-env; unset → FAILFAST interactive-default
+#
+# DEVLOOP_FAIL_FAST="" (set-but-empty) is treated as UNSET (standard ${:-} idiom).
+#
+# Args: (none — reads DEVLOOP_FAIL_FAST / GITHUB_ACTIONS / DEVLOOP_HEADLESS)
+# Outputs: stdout = "<MODE> [<source>]"
+# Returns: 0 always
+fail_fast_mode() {
+  local knob="${DEVLOOP_FAIL_FAST:-}" explicit=""
+  case "$knob" in
+    1|true|TRUE|yes|YES) explicit=on ;;
+    0|false|FALSE|no|NO) explicit=off ;;
+    "")                  explicit= ;;
+    *)                   printf 'INVALID\n'; return 0 ;;  # validity FIRST — before any env check
+  esac
+
+  # Unattended authority lanes (CI or a headless story-runner session) FORCE run-all.
+  if [[ -n "${GITHUB_ACTIONS:-}" || -n "${DEVLOOP_HEADLESS:-}" ]]; then
+    if [[ "$explicit" == on ]]; then
+      printf 'RUNALL unattended-override-refused\n'   # Model B: an explicit =1 is refused here
+      return 0
+    fi
+    # =0 or unset: agrees with run-all; label by the env that carries the authority.
+    if [[ -n "${GITHUB_ACTIONS:-}" ]]; then
+      printf 'RUNALL github-actions\n'
+    else
+      printf 'RUNALL headless\n'
+    fi
+    return 0
+  fi
+
+  # Interactive: the explicit knob wins; default is fail-fast.
+  case "$explicit" in
+    on)  printf 'FAILFAST fail-fast-env\n' ;;
+    off) printf 'RUNALL run-all-env\n' ;;
+    *)   printf 'FAILFAST interactive-default\n' ;;
+  esac
+  return 0
+}
+
 # Among children sharing the WINNING enum, pick a representative real reason — so the
 # stderr LAYER= / dispatcher-emit REASON field names an actual lang/verb cause rather
 # than a generic "<status>-aggregate" token (observability's 3am anchor, P2). This is

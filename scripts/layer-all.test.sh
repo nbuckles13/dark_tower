@@ -151,14 +151,23 @@ assert_status "f-all-ok-total"  "TOTAL_RESULT=OK" "$out"
 assert_marker "f-all-ok-stubs-ran" "$LA_DT" 'ran.layer*'
 
 # =============================================================================
-# (g) WORST-WINS across layers: a FAIL (exit 1) at Layer 4 AND a PRECONDITION (exit 2) at
-#     Layer 7 → LAYER_ALL_EXIT=2 (2 > 1 > 0), not 1. Proves the max is across all layers.
+# (g) WORST-WINS across layers (RUN-ALL mode): a FAIL (exit 1) at Layer 4 AND a
+#     PRECONDITION (exit 2) at Layer 7 → LAYER_ALL_EXIT=2 (2 > 1 > 0), not 1. This
+#     worst-wins-ACROSS-layers property only holds in RUN-ALL mode: under the new
+#     interactive fail-fast DEFAULT (Change 2) the run stops at L4 (exit 1) and never
+#     reaches L7 — that is case (i) below. Pinned to run-all via the explicit
+#     DEVLOOP_FAIL_FAST=0 override (explicit-override→run-all); DEVLOOP_HEADLESS=1 is the
+#     env-detection equivalent, covered by case (v).
 # =============================================================================
 d="$(new_stubdir)"
 mk_stub "$d" 4 FAIL layer4-test-fail 1
 mk_stub "$d" 7 PRECONDITION_FAILURE cluster-setup-failed 2
-run_la "$d" DEVLOOP_TEST=1 LAYER_SCRIPT_DIR="$d"
-assert_exit "g-worst-wins-exit2" 2 "$LA_RC"
+run_la "$d" DEVLOOP_TEST=1 LAYER_SCRIPT_DIR="$d" DEVLOOP_FAIL_FAST=0
+out="$(cat "$LA_OUT")"; err="$(cat "$LA_ERR")"
+assert_exit   "g-worst-wins-exit2" 2 "$LA_RC"
+assert_status "g-worst-wins-total" "TOTAL_RESULT=PRECONDITION_FAILURE" "$out"
+assert_status "g-run-all-mode"     "PIPELINE_MODE=run-all SOURCE=run-all-env" "$err"
+assert_marker "g-all-layers-ran"   "$LA_DT" 'ran.layer7'   # run-all reached L7 (no early stop)
 
 # =============================================================================
 # BYPASS-CLOSURE (security): the LAYER_SCRIPT_DIR seam must be NON-bypassable in CI. A
@@ -236,5 +245,103 @@ __rr_out="$(
 )"
 assert_absent "h-report-results-no-collectable-status" "$(printf '\nSTATUS=')" "$(printf '\n%s' "$__rr_out")"
 assert_status "h-report-results-still-prints-failures" "rr-selftest-needle" "$__rr_out"
+
+# =============================================================================
+# FAIL-FAST (Change 2) — the interactive DEFAULT. run_la scrubs GITHUB_ACTIONS /
+# DEVLOOP_HEADLESS / DEVLOOP_FAIL_FAST (env -i), so fail_fast_mode() resolves to
+# FAILFAST interactive-default: the cases below set NO mode env and exercise the default.
+# =============================================================================
+
+# (i) FAIL-FAST default: FAIL@L4 (rc 1) + PRECONDITION@L7 — the SAME stub tree as (g), but
+#     interactive ⇒ STOP at L4. The paired contrast with (g): the exit is the FAILING layer's
+#     (1), NOT the max-across-layers (2) — proving L7's PRECONDITION is never even reached.
+#     L5-7 render RESULT=NOT-RUN, their stubs never ran (no markers), and none reads OK (would
+#     forge GATE2=PASS over un-run work) or UNKNOWN (the `${:-UNKNOWN}` default → exit 2, which
+#     would inflate the verdict) — the honesty + no-leak constraints (@security S2).
+d="$(new_stubdir)"
+mk_stub "$d" 4 FAIL layer4-test-fail 1
+mk_stub "$d" 7 PRECONDITION_FAILURE cluster-setup-failed 2
+run_la "$d" DEVLOOP_TEST=1 LAYER_SCRIPT_DIR="$d"
+out="$(cat "$LA_OUT")"; err="$(cat "$LA_ERR")"
+assert_exit      "i-failfast-exit1-not-2" 1 "$LA_RC"          # L4's rc, NOT L7's 2
+assert_status    "i-failfast-total-fail"  "TOTAL_RESULT=FAIL" "$out"
+assert_status    "i-failfast-mode"        "PIPELINE_MODE=fail-fast SOURCE=interactive-default" "$err"
+assert_status    "i-stopped-early-line"   "STOPPED_EARLY LAYER=4 RESULT=FAIL NOT_RUN=5,6,7" "$err"
+assert_status    "i-l7-not-run-cell"      "LAYER=7 RESULT=NOT-RUN" "$out"
+assert_marker    "i-l4-ran"               "$LA_DT" 'ran.layer4'
+assert_no_marker "i-l5-not-run"           "$LA_DT" 'ran.layer5'
+assert_no_marker "i-l7-not-run"           "$LA_DT" 'ran.layer7'
+assert_absent    "i-no-unknown-cell"      "RESULT=UNKNOWN" "$out"
+assert_absent    "i-l7-not-ok"            "LAYER=7 RESULT=OK" "$out"
+# Fail-fast skipped layer 6 → the fast-tier budget cannot be measured; loud skip token.
+assert_status    "i-budget-skipped"       "WARN BUDGET_TOTAL_SKIPPED REASON=layers-not-run LAST_RAN=4" "$err"
+
+# (ii) FAIL-FAST + PRECONDITION@L3 (rc 2): the composed Change-1×Change-2 case — an L3
+#      guard-timeout-style operator-lane precondition STOPS the interactive run at L3, before
+#      L4-7 (incl. L7's cluster bring-up — exactly the 2026-08-14 waste both changes exist to
+#      kill). exit 2, TOTAL=PRECONDITION_FAILURE.
+d="$(new_stubdir)"
+mk_stub "$d" 3 PRECONDITION_FAILURE guard-timeout-validate-kustomize 2
+run_la "$d" DEVLOOP_TEST=1 LAYER_SCRIPT_DIR="$d"
+out="$(cat "$LA_OUT")"; err="$(cat "$LA_ERR")"
+assert_exit      "ii-precondition-exit2" 2 "$LA_RC"
+assert_status    "ii-total-precondition" "TOTAL_RESULT=PRECONDITION_FAILURE" "$out"
+assert_status    "ii-stopped-at-3"       "STOPPED_EARLY LAYER=3 RESULT=PRECONDITION_FAILURE NOT_RUN=4,5,6,7" "$err"
+assert_no_marker "ii-l4-not-run"         "$LA_DT" 'ran.layer4'
+assert_no_marker "ii-l7-not-run"         "$LA_DT" 'ran.layer7'
+
+# (S1) FAIL-CLOSED (@security S1): a layer whose status is an EXIT-0 skip
+#      (N/A / SKIPPED-NO-DIFF / SKIPPED-NO-CLUSTER) must NOT trigger the fail-fast stop — the
+#      run continues and STILL reaches layer 7. This GUARDS AGAINST a future edit that keys the
+#      stop on "status != OK" instead of `rc != 0`: that edit would halt on a benign exit-0
+#      skip and forge a GATE2=PASS over layers that never ran. It reads as a tautology against
+#      today's `rc != 0` stop — the tautology IS the point until someone breaks it; do not
+#      delete it as redundant.
+for skip in "N/A" "SKIPPED-NO-DIFF" "SKIPPED-NO-CLUSTER"; do
+  d="$(new_stubdir)"
+  mk_stub "$d" 3 "$skip" "layer3-${skip}" 0
+  run_la "$d" DEVLOOP_TEST=1 LAYER_SCRIPT_DIR="$d"
+  err="$(cat "$LA_ERR")"
+  assert_exit   "S1-${skip}-exit0"         0 "$LA_RC"
+  assert_marker "S1-${skip}-l7-still-ran"  "$LA_DT" 'ran.layer7'
+  assert_absent "S1-${skip}-no-early-stop" "STOPPED_EARLY" "$err"
+done
+
+# (k) AUTHORITY-LANE REFUSAL (@security R-B, Model B): an unattended run (DEVLOOP_HEADLESS=1)
+#     with an ambient DEVLOOP_FAIL_FAST=1 must NOT fail-fast — the CI/story authority run's
+#     one-pass coverage cannot be truncated by an ambient var. fail_fast_mode() returns
+#     `RUNALL unattended-override-refused`; the run goes run-all (all layers), and the refusal
+#     is LOUD (grep-able), never silent (it cannot forge green — a red run stays red). Same
+#     stub tree as (g)/(i) → exit 2, all ran.
+d="$(new_stubdir)"
+mk_stub "$d" 4 FAIL layer4-test-fail 1
+mk_stub "$d" 7 PRECONDITION_FAILURE cluster-setup-failed 2
+run_la "$d" DEVLOOP_TEST=1 LAYER_SCRIPT_DIR="$d" DEVLOOP_HEADLESS=1 DEVLOOP_FAIL_FAST=1
+err="$(cat "$LA_ERR")"
+assert_exit   "k-refused-runs-all-exit2" 2 "$LA_RC"
+assert_marker "k-refused-l7-ran"         "$LA_DT" 'ran.layer7'
+assert_status "k-refused-mode-line"      "PIPELINE_MODE=run-all SOURCE=unattended-override-refused" "$err"
+assert_status "k-refused-warn"           "WARN FAIL_FAST_OVERRIDE_IGNORED REQUESTED=1 MODE=run-all" "$err"
+
+# (v) ENV-DETECTION run-all: DEVLOOP_HEADLESS=1 (no explicit knob) ⇒ RUNALL headless — the
+#     story-runner path. Same tree as (g); proves unattended detection alone forces run-all.
+d="$(new_stubdir)"
+mk_stub "$d" 4 FAIL layer4-test-fail 1
+mk_stub "$d" 7 PRECONDITION_FAILURE cluster-setup-failed 2
+run_la "$d" DEVLOOP_TEST=1 LAYER_SCRIPT_DIR="$d" DEVLOOP_HEADLESS=1
+err="$(cat "$LA_ERR")"
+assert_exit   "v-headless-runs-all-exit2" 2 "$LA_RC"
+assert_marker "v-headless-l7-ran"         "$LA_DT" 'ran.layer7'
+assert_status "v-headless-mode-line"      "PIPELINE_MODE=run-all SOURCE=headless" "$err"
+
+# (vii) BAD VALUE fail-closed: DEVLOOP_FAIL_FAST=ture → fail_fast_mode()=INVALID → the caller
+#       exits 2 LOUD *before the layer loop* (a typo must never silently pick a mode). No stub
+#       runs. Greppable boolean-error message, distinct from the merge-base PRECONDITION line.
+d="$(new_stubdir)"
+run_la "$d" DEVLOOP_TEST=1 LAYER_SCRIPT_DIR="$d" DEVLOOP_FAIL_FAST=ture
+err="$(cat "$LA_ERR")"
+assert_exit      "vii-invalid-exit2"   2 "$LA_RC"
+assert_status    "vii-invalid-message" "DEVLOOP_FAIL_FAST=ture is not a recognized boolean" "$err"
+assert_no_marker "vii-no-stub-ran"     "$LA_DT" 'ran.layer*'
 
 report_results "scripts/layer-all.test.sh"
