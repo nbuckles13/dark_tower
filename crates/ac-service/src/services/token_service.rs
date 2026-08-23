@@ -1541,12 +1541,19 @@ mod tests {
         Ok(())
     }
 
-    /// P1-SECURITY: Test JWT iat just beyond clock skew boundary is rejected
+    /// P1-SECURITY: Test JWT with a future iat beyond the clock skew boundary is rejected
     ///
-    /// Verifies that tokens with iat just 1 second beyond the 5-minute boundary
-    /// are rejected. This ensures the boundary validation is strict.
+    /// End-to-end WIRING check: a token whose iat is well beyond the 5-minute skew
+    /// window is rejected through the full `sign_jwt` → `verify_jwt` → `validate_iat`
+    /// path. It proves `verify_jwt` actually enforces the skew, NOT the exact
+    /// boundary offset — the razor-strict "+300 ok / +301 rejected" boundary is pinned
+    /// deterministically in `common::jwt::test_validate_iat_at_boundary_exact` via
+    /// `validate_iat_at(iat, skew, now)` with an injected clock. `verify_jwt` exposes no
+    /// `now` seam and reads the real wall clock, so a 1-second margin here flaked under
+    /// load (elapsed test time closed the gap); a comfortable margin keeps this reliable
+    /// without duplicating boundary coverage.
     #[sqlx::test(migrations = "../../migrations")]
-    async fn test_jwt_iat_just_beyond_clock_skew_rejected(pool: PgPool) -> Result<(), AcError> {
+    async fn test_jwt_iat_beyond_clock_skew_rejected(pool: PgPool) -> Result<(), AcError> {
         use chrono::Utc;
 
         let master_key = crypto::generate_random_bytes(32)?;
@@ -1557,13 +1564,14 @@ mod tests {
             .await?
             .expect("No active signing key found");
 
-        // Create a token with iat 1 second beyond the clock skew boundary
-        // Capture `now` once to avoid timing race conditions in CI
+        // Create a token with iat well beyond the clock skew boundary (twice the skew).
+        // A comfortable margin (not +1s) so real elapsed test time cannot close the gap
+        // and flip the verdict — this is a wiring check, not a razor-boundary check.
         let now = Utc::now();
         let claims_beyond_boundary = crypto::Claims {
             sub: "beyond-boundary-client".to_string(),
             exp: now.timestamp() + TOKEN_EXPIRY_SECONDS_I64,
-            iat: now.timestamp() + DEFAULT_JWT_CLOCK_SKEW.as_secs() as i64 + 1, // 1 second beyond 5 min
+            iat: now.timestamp() + DEFAULT_JWT_CLOCK_SKEW.as_secs() as i64 * 2, // well beyond 5 min
             scope: "valid-scope".to_string(),
             service_type: Some("global-controller".to_string()),
         };
@@ -1594,7 +1602,7 @@ mod tests {
 
         assert!(
             matches!(result, Err(AcError::InvalidToken(_))),
-            "JWT with iat 1 second beyond 5 minute boundary should be rejected"
+            "JWT with iat well beyond the 5 minute skew window should be rejected"
         );
 
         Ok(())
