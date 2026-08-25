@@ -5,7 +5,8 @@
 **Date**: 2026-08-23 (revised 2026-08-24)
 
 **Deciders**: media-handler, meeting-controller, protocol, client, security, test, observability,
-operations
+operations. **auth-controller** reviewed §3 and §4 after the debate closed and corrected the
+credential-binding mechanism (§4).
 
 **Debate**: `docs/debates/2026-08-23-media-flow/debate.md`
 
@@ -335,9 +336,11 @@ exactly why §3's signatures are required for attribution — decryption proves 
 
 ### How it works
 
-1. **Before requesting the meeting token**, the client generates its identity signing keypair. AC
-   binds the thumbprint into the meeting token. This ordering is load-bearing; see the next
-   subsection.
+1. **Before requesting the meeting token**, the client generates its identity signing keypair, and
+   AC issues two things over it: a `cnf.jkt` thumbprint claim inside the meeting token, proving the
+   join-time holder controls that key; and a **separate peer-presentable identity attestation** over
+   (participant, thumbprint, meeting), which is what other participants actually verify. The ordering
+   is load-bearing; see the next subsection.
 2. The client joins and MC hands it the group's public state.
 3. The client admits **itself** with an MLS External Commit — no existing member needs to be online.
 4. **MC serialises commits** — one wins per epoch, concurrent commits are rejected as stale — and
@@ -378,6 +381,46 @@ member's credential traces to an AC-issued identity for a real participant.** MC
 for a fabricated member. This is why the join-flow reorder in step 1 exists, and why AC credential
 binding is described here as the price of being end-to-end encrypted at all rather than as an MLS
 detail.
+
+**The credential is not the meeting token, and this distinction is easy to get wrong.** A meeting
+token binds *A's own* thumbprint into *A's own* token — but for B to validate A's credential, B must
+verify **AC's signature over A's identity-to-key binding**, and **B never holds A's token.** Using the
+meeting token as the credential would mean distributing it, which fails three ways at once: it is a
+short-lived **bearer** credential that MC uses to admit you, so handing it to every peer through MC is
+a credential leak; its expiry is far shorter than the membership it must vouch for, so credentials
+churn or go stale; and it carries display-name PII to parties that do not need it.
+
+So AC mints **two distinct artifacts** over the same key:
+
+| Artifact | Audience | Nature | Lifetime |
+|---|---|---|---|
+| `cnf.jkt` claim in the meeting token | MC and MH, at admission | part of a **bearer** credential | the token's, short |
+| **Identity attestation** over (participant, thumbprint, meeting) | every peer, carried in the MLS leaf credential | **non-bearer**, safe to distribute | matched to membership, not to the join token |
+
+Both verify against AC's existing JWKS. The thumbprint is an RFC 7638 JWK thumbprint carried as
+`cnf.jkt`; the client SDK already computes exactly that canonicalisation over the same key shape AC's
+JWKS emits, so the cross-language agreement exists rather than needing to be established.
+
+Binding a thumbprint rather than a raw key is deliberate: it forces the verifier to obtain the actual
+public key from the roster and check that it hashes to the attested value, which is the property
+being sought.
+
+**Identity keys are scoped to a meeting**, not to a participant across meetings. §3's "long-lived"
+means *surviving reconnect within a membership*, not persisting across meetings — a key reused across
+meetings would make a participant linkable by their public key regardless of display name, which
+matters most for the guests who have the least identity assurance to begin with.
+
+**AC does not track key continuity, and should not.** It is stateless here: on token refresh the
+client re-presents the same thumbprint and AC re-stamps it, with no rebinding step and no AC-side
+state. Nothing at AC prevents a client presenting a *different* key at the next refresh. **Continuity
+of membership is MLS's property, not the token's** — this is correct, and it is stated because the
+token must not be mistaken for the thing that guarantees a stable identity across a meeting.
+
+**Guests receive an attested pseudonym, not an attested identity.** Guest tokens stamp a
+client-supplied display name with no lookup, so the attestation proves *"every frame came from the
+same keyholder"* and never *"who that keyholder is."* This is worth having — it stops one guest
+forging another guest's frames — but it must never be described as identity assurance for guests, and
+it leaves the insider bar at "a meeting link" exactly where §3 puts it.
 
 **Where a client-verified binding and MC's roster disagree, the client-verified binding wins.**
 
@@ -483,9 +526,17 @@ between epochs — recovery from a suspected client compromise, or counter exhau
 
 ### Dependency
 
-**auth-controller must sign off before the story is written.** The work is one claim binding a key
-thumbprint into the meeting token, using AC's existing signing path — but it is a commitment to a
-service that did not participate in this debate.
+**auth-controller reviewed this section after the debate closed and corrected it.** The correction is
+above: the meeting token cannot be the peer-verified credential. Two further findings from that
+review are reflected here and in Open Items.
+
+**The work is larger than "one claim on the existing signing path."** That characterisation holds only
+for the AC-internal slice, where stamping an extra field into the claims struct and signing it is
+genuinely trivial. End to end it is a **three-edge contract change**, and the largest piece is not
+AC's: **the client→GC join endpoint takes no request body today**, so there is no channel for the
+client's thumbprint to reach GC at all. That endpoint grows a body, GC passes the field through to AC,
+and the deserialise-side claims type gains it for MC and MH to read. Size the story on that, not on
+the AC slice.
 
 ## 5. What clients send
 
@@ -1133,6 +1184,15 @@ deliberate.
   inside a system that never re-invoked it. Cheapest closure is one chaos case: establish a meeting
   with media flowing, delete the handler pod mid-call, assert media resumes within a bounded window
   **with no client rejoin**. Add the MC-restart equivalent, which currently self-heals *by accident*.
+- **There is no revocation path for a compromised participant signing key.** No token denylist exists
+  anywhere in the tree — `jti` is generated and never checked against anything — and AC's key rotation
+  rotates AC's *own* signing keys, not participant identity keys. Token exposure is bounded to the
+  token TTL, but the participant signing key survives reconnect and every refresh, and there is no
+  mechanism to invalidate it mid-membership. The only lever is to stop re-attesting at the next
+  refresh, which bounds exposure to one refresh interval and does nothing within it. Scoping keys per
+  meeting (§4) bounds the blast radius to a single meeting; it does not close the gap. Recorded as
+  absent by design today rather than deferred, because nothing in the current path provides it and
+  nothing should imply otherwise.
 - **The switch-abandonment bound is unspecified** (§7): how long MH waits for a source that never
   produces a usable frame, and what the slot becomes when it gives up.
 - **The shared-atomic contention benchmark is unresolved.** Named at the outset as the item most
@@ -1175,6 +1235,7 @@ connection-token response field may be dead in the same way a previously removed
 | protocol | 95 | The header, the identifier model, and the complete wire draft |
 | operations | 94 | Six numbered requirements; found the restart blackhole, the transport defaults, and the dead alert selectors |
 | security | 90 | Overturned the attribution claim; the three-way key-distribution analysis with sizing; the telemetry conditions |
+| auth-controller | post-debate review | Found that the meeting token cannot be the peer-verified credential; identified the missing client→GC request body; established that no signing-key revocation path exists |
 
 Security scored 90 conditional on the key-distribution choice landing on a genuinely end-to-end
 option, and 62 had a provider that lets MC decrypt been shipped to a real environment — a decision
