@@ -60,9 +60,9 @@
 - Metric-to-dashboard coverage -> `scripts/guards/simple/validate-application-metrics.sh`
 - Metric-test coverage (src emission vs test reference) -> `scripts/guards/simple/validate-metric-coverage.sh`
 - Dashboard-to-kustomize coverage (bidirectional) -> `scripts/guards/simple/validate-kustomize.sh`
-- Instrument skip_all enforcement -> `scripts/guards/simple/instrument-skip-all.sh`
-- Alert-rules lint -> `scripts/guards/simple/validate-alert-rules.sh`
+- Instrument skip_all enforcement -> `scripts/guards/simple/instrument-skip-all.sh`; alert-rules lint -> `scripts/guards/simple/validate-alert-rules.sh`
 - PII / secret identifier vocabulary -> `crates/dt-guard/src/common/pii_vocabulary.rs`, `scripts/guards/simple/no-pii-in-logs.sh`, `scripts/guards/simple/ts/no-pii-in-logs-ts.sh`
+- **Matcher families — read before adding any vocabulary entry.** Two shapes, and an entry that is load-bearing under one is inert under the other. *Word-boundary* `\b(alternation)\b` (`metric_labels.rs`, `rust_pii.rs`, `rust_log_secrets`, `instrument_skip_all`) cannot see inside compounds: `_` is a word character, so `\btoken\b` matches neither `userToken` nor `user_token`, and `\bkid\b` does not match `sender_kid`. *Segment equality* -> `crates/dt-guard/src/ts_retained_credentials.rs:198` `pub fn segments()` splits on `_`, non-word chars and camelCase, so one entry covers every spelling; tests `segments_splits_camel_and_snake`, `token_limb_matches_camel_and_snake_spellings`. A vocabulary entry on the word-boundary matcher reports clean while the compound spelling ships. Promote `segments()` to `crate::common::` at the third consumer (Pattern B, as `pii_vocabulary` itself was).
 - Metric label + naming policies -> `crates/dt-guard/src/metric_labels.rs`, `crates/dt-guard/src/ts_metric_naming.rs`; `MetricAssertion` test helper `crates/common/src/observability/testing.rs`
 - Cross-encoding pattern drift (org subdomain, story slug class) -> `scripts/guards/simple/validate-subdomain-regex-sync.sh`, `scripts/guards/simple/validate-slug-class-sync.sh`
 
