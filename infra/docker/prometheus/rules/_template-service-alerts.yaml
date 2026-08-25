@@ -59,9 +59,9 @@ groups:
         # Resource pressure. Not a user-visible failure yet, so `warning`.
         expr: |
           (
-            container_memory_usage_bytes{pod=~"<svc>-service-.*"}
+            container_memory_usage_bytes{container="<svc>-service"}
             /
-            container_spec_memory_limit_bytes{pod=~"<svc>-service-.*"}
+            container_spec_memory_limit_bytes{container="<svc>-service"}
           ) > 0.85
         # Steady-state threshold; 10m avoids flapping.
         for: 10m

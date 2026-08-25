@@ -165,9 +165,9 @@ groups:
       - alert: MHHighMemory
         expr: |
           (
-            container_memory_usage_bytes{pod=~"mh-service-.*"}
+            container_memory_usage_bytes{container="mh-service"}
             /
-            container_spec_memory_limit_bytes{pod=~"mh-service-.*"}
+            container_spec_memory_limit_bytes{container="mh-service"}
           ) > 0.85
         for: 10m
         labels:
@@ -182,7 +182,7 @@ groups:
 
       - alert: MHHighCPU
         expr: |
-          rate(container_cpu_usage_seconds_total{pod=~"mh-service-.*"}[5m]) > 0.80
+          rate(container_cpu_usage_seconds_total{container="mh-service"}[5m]) > 0.80
         for: 5m
         labels:
           severity: warning
@@ -236,7 +236,7 @@ groups:
 
       - alert: MHPodRestartingFrequently
         expr: |
-          rate(kube_pod_container_status_restarts_total{pod=~"mh-service-.*"}[1h]) > 0.016
+          rate(kube_pod_container_status_restarts_total{container="mh-service"}[1h]) > 0.016
         for: 5m
         labels:
           severity: warning
