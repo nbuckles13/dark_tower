@@ -166,9 +166,9 @@ groups:
       - alert: GCHighMemory
         expr: |
           (
-            container_memory_usage_bytes{pod=~"gc-service-.*"}
+            container_memory_usage_bytes{container="gc-service"}
             /
-            container_spec_memory_limit_bytes{pod=~"gc-service-.*"}
+            container_spec_memory_limit_bytes{container="gc-service"}
           ) > 0.85
         for: 10m
         labels:
@@ -183,7 +183,7 @@ groups:
 
       - alert: GCHighCPU
         expr: |
-          rate(container_cpu_usage_seconds_total{pod=~"gc-service-.*"}[5m]) > 0.80
+          rate(container_cpu_usage_seconds_total{container="gc-service"}[5m]) > 0.80
         for: 5m
         labels:
           severity: warning
@@ -271,7 +271,7 @@ groups:
 
       - alert: GCPodRestartingFrequently
         expr: |
-          rate(kube_pod_container_status_restarts_total{pod=~"gc-service-.*"}[1h]) > 0.016
+          rate(kube_pod_container_status_restarts_total{container="gc-service"}[1h]) > 0.016
         for: 5m
         labels:
           severity: warning
