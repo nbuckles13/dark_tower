@@ -61,7 +61,7 @@ MH declares its QUIC transport parameters explicitly, validated at startup:
 | Setting | Why it cannot be left implicit |
 |---|---|
 | Maximum concurrent unidirectional streams | Must be **declared**, because a bound has to be declared to be assertable and because the default being adequate is not the same as the default being chosen. Under one-group-per-stream the pressure is mild — five video slots at a one-second keyframe cadence is roughly five opens per second and a similar number concurrent, against quinn's default of 100. The failure mode is a **slow subscriber**, whose unfinished groups accumulate; the application bound below must trip well before the transport ceiling. |
-| Datagram send buffer size | quinn's default is 1 MiB ≈ **140 seconds of queued audio** before the oldest is silently discarded. A realtime path must prefer loss to unbounded latency. Express and document this in **frames of audio**, not bytes. |
+| Datagram send buffer size | quinn's default is 1 MiB ≈ **93 seconds of queued audio** (at the ~225-byte on-wire audio frame of §3 and §4) before the oldest is silently discarded. A realtime path must prefer loss to unbounded latency. Express and document this in **frames of audio**, not bytes. |
 | Keepalive interval | QUIC's connection-level keepalive is what refreshes NAT bindings while no media flows — which happens whenever a participant is muted (§5). Without it a muted participant's path can be reaped by an intermediary and unmute is not instantaneous. |
 
 MH currently builds its server configuration with no transport configuration at all
@@ -1061,7 +1061,7 @@ retaining it:
 - **No per-frame, per-participant, or per-stream-identity dimension** in media-path logs, metric
   labels, or span attributes. Aggregate distributions are safe; **the time-ordered sequence of sizes
   for a single stream is the voice-activity trace.**
-- **Flat prohibition: no meeting identifier on any metric anywhere in this design.** Stated as a rule
+- **Flat prohibition: no meeting identifier on any metric anywhere in this design**, with one closed, enumerated exception: the ADR-0028 join-flow metrics that already carry the client SDK's implicit join label set (`meeting_id_hash`) are grandfathered as a set and are not extended; every metric this design adds, and every future metric on any media-carrying path, is under the bar. Stated as a rule
   rather than a derivable conclusion because four specialists independently had to be corrected on it
   during the debate — a rule re-derived by every author who touches a metric will not survive. It is
   barred twice: unbounded cardinality, and per-meeting aggregation in a **two-person meeting is
@@ -1101,8 +1101,8 @@ transmit-key material on the MC→MH contract and in MC logs — the one place a
 component entitled to hold it.
 
 **Admission control is keyed on egress bandwidth, not connection count.** A stream-count value is
-advertised to GC as capacity and enforced nowhere; the only enforced limit is a connection count two
-orders of magnitude off the real constraint. The capacity figure must be **the same configuration
+advertised to GC as capacity and enforced only at GC placement, never at MH admission; MH's own
+enforced limit is a connection count two orders of magnitude off the real constraint. The capacity figure must be **the same configuration
 value that enforcement reads**, published as a gauge, or the alert threshold and the enforcement
 drift silently.
 
@@ -1246,6 +1246,7 @@ answer to deferring performance work.
   meeting (§4) bounds the blast radius to a single meeting; it does not close the gap. Recorded as
   absent by design today rather than deferred, because nothing in the current path provides it and
   nothing should imply otherwise.
+- **Historical per-meeting debugging has no retention posture.** §11 accepts the in-memory metadata leak and bounds live per-participant resolution to an auto-expiring ring buffer, which serves debugging a meeting while it runs and cannot serve debugging one after it has ended. Operations will need the latter. Retaining per-meeting, per-participant quality data is exactly what §11 forbids, because the time-ordered per-stream record is the voice-activity trace; a decision is needed on the aggregation floor, the store, the retention period, access control, the widened adversary set (storage, backups, time), and the interaction with §4's guest pseudonymity. Recorded as open; it is a §11 amendment and belongs to its own debate.
 - **The switch-abandonment bound is unspecified** (§7): how long MH waits for a source that never
   produces a usable frame, and what the slot becomes when it gives up.
 - **The shared-atomic contention benchmark is unresolved.** Named at the outset as the item most
