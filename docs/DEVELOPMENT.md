@@ -476,6 +476,22 @@ See guard script comments and `docs/specialist-knowledge/security/` for the stan
 
 ## Environment Variables
 
+<!-- ANCHOR (DRY): the required-variable set in the per-service blocks below
+     mirrors crates/<svc>/src/config.rs::Config::from_vars() — specifically its
+     ConfigError::MissingEnvVar(...) set, which is the source of truth for what
+     each service refuses to start without.
+
+     The mirror is one-directional: every MissingEnvVar must appear here, but
+     these blocks also legitimately carry non-required vars (RUST_LOG,
+     OTEL_ENABLED, OTLP_ENDPOINT). This is NOT a set-equality contract — a
+     future guard asserting equality will red on correct docs.
+
+     STATUS 2026-08-28: the mirror is INCOMPLETE and nothing checks it. 19 of
+     23 required vars are absent; the MC and MH blocks are non-functional as
+     written (each exits at startup on its first MissingEnvVar). Tracked in
+     docs/TODO.md § Cross-Service Duplication (DRY). Do not read the blocks
+     below as a working local configuration until that entry is closed. -->
+
 ### Auth Controller
 
 ```bash
@@ -485,6 +501,9 @@ export AC_MASTER_KEY="<generated-base64-key>"  # Generate with: ./scripts/genera
 export RUST_LOG="info,ac_service=debug"
 export BIND_ADDRESS="0.0.0.0:8082"
 export OTLP_ENDPOINT="http://localhost:4317"
+export OTEL_ENABLED="false"  # OTel span export is gated on the explicit boolean OTEL_ENABLED, NOT on OTLP_ENDPOINT being set;
+# leaving this "false" means OTLP_ENDPOINT above has no effect. Enabling needs a reachable collector
+# (init_otel probes eagerly and fails hard at startup).
 ```
 
 **⚠️ CRITICAL**: Never commit `AC_MASTER_KEY` to git. Store in `.env` file (git-ignored).
@@ -575,6 +594,15 @@ export AC_CLIENT_ID="<from-service-registration>"
 export AC_CLIENT_SECRET="<from-service-registration>"
 export AC_URL="http://localhost:8082"
 export OTLP_ENDPOINT="http://localhost:4317"
+export OTEL_ENABLED="false"  # OTel span export is gated on the explicit boolean OTEL_ENABLED, NOT on OTLP_ENDPOINT being set;
+# leaving this "false" means OTLP_ENDPOINT above has no effect. Enabling needs a reachable collector
+# (init_otel probes eagerly and fails hard at startup).
+# GC also reads OTEL_COLLECTOR_ENDPOINT (the :4318 OTLP-HTTP endpoint its /api/v1/telemetry
+# proxy forwards browser spans to). Its compiled-in default points at the in-cluster
+# otel-collector, unresolvable bare-metal, so set it for a local run. Write the BARE base with
+# NO /v1/... suffix -- GC appends the per-signal path itself; a suffixed value double-appends
+# and 502s (see docs/TODO.md OTEL_COLLECTOR_ENDPOINT double-suffix entry).
+export OTEL_COLLECTOR_ENDPOINT="http://localhost:4318"
 ```
 
 ### Meeting Controller
@@ -582,23 +610,31 @@ export OTLP_ENDPOINT="http://localhost:4317"
 ```bash
 export REDIS_URL="redis://:dev_password_change_in_production@localhost:6379"
 export RUST_LOG="info,meeting_controller=debug"
-export BIND_ADDRESS="0.0.0.0:4433"
+# MC reads MC_WEBTRANSPORT_BIND_ADDRESS, not the unprefixed BIND_ADDRESS (which it ignores).
+export MC_WEBTRANSPORT_BIND_ADDRESS="0.0.0.0:4433"
 export AC_CLIENT_ID="<from-service-registration>"
 export AC_CLIENT_SECRET="<from-service-registration>"
 export AC_URL="http://localhost:8082"
 export OTLP_ENDPOINT="http://localhost:4317"
+export OTEL_ENABLED="false"  # OTel span export is gated on the explicit boolean OTEL_ENABLED, NOT on OTLP_ENDPOINT being set;
+# leaving this "false" means OTLP_ENDPOINT above has no effect. Enabling needs a reachable collector
+# (init_otel probes eagerly and fails hard at startup).
 ```
 
 ### Media Handler
 
 ```bash
 export RUST_LOG="info,media_handler=debug"
-export BIND_ADDRESS="0.0.0.0:4434"
-export MAX_STREAMS="10000"
+# MH reads MH_WEBTRANSPORT_BIND_ADDRESS, not the unprefixed BIND_ADDRESS (which it ignores).
+export MH_WEBTRANSPORT_BIND_ADDRESS="0.0.0.0:4434"
+export MH_MAX_STREAMS="100"  # matches the deployed ConfigMap; known-wrong, superseded by the egress-budget chain in story 2
 export AC_CLIENT_ID="<from-service-registration>"
 export AC_CLIENT_SECRET="<from-service-registration>"
 export AC_URL="http://localhost:8082"
 export OTLP_ENDPOINT="http://localhost:4317"
+export OTEL_ENABLED="false"  # OTel span export is gated on the explicit boolean OTEL_ENABLED, NOT on OTLP_ENDPOINT being set;
+# leaving this "false" means OTLP_ENDPOINT above has no effect. Enabling needs a reachable collector
+# (init_otel probes eagerly and fails hard at startup).
 ```
 
 ### Using .env File
@@ -625,14 +661,28 @@ RUST_LOG=info
 
 # Observability
 OTLP_ENDPOINT=http://localhost:4317
+# OTel span export is OFF unless OTEL_ENABLED=true; setting OTLP_ENDPOINT alone does nothing.
+# Enabling requires a reachable collector (init_otel fails hard at startup if it is not).
+OTEL_ENABLED=false
+# GC only: bare base, NO /v1/... suffix (GC appends the per-signal path itself).
+OTEL_COLLECTOR_ENDPOINT=http://localhost:4318
 ```
 
 **⚠️ WARNING**: `.env` is git-ignored and contains secrets. Never commit it.
 
 Load with:
 ```bash
-source .env
+set -a; source .env; set +a
 ```
+
+`set -a` is required, not cosmetic. The template uses bare `KEY=value`, so a plain
+`source .env` creates **shell** variables — child processes (`cargo run`) inherit only
+*exported* ones and would see none of them. The failure is silent and easy to miss:
+assigning to a name that is already exported in your shell preserves that export
+attribute, so `source .env` appears to work for whichever variables your environment
+happened to already carry, and quietly does nothing for the rest. In a clean shell it
+exports nothing at all. `OTEL_ENABLED` is exactly the kind of new variable that will
+not be in anyone's ambient environment.
 
 Or use `.env` file automatically with tools like `direnv` or `cargo-watch`.
 

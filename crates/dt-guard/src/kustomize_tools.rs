@@ -117,6 +117,20 @@ pub struct YamlFinding {
 /// Workload `kind`s subject to R-18 security-context invariants. Matches
 /// bash today (`Deployment` + `StatefulSet`). Does NOT include `DaemonSet`
 /// or `Job` (bash today doesn't check them either; preserving parity).
+///
+/// ANCHOR (DRY): `crates/dt-guard/src/env_config.rs::WORKLOAD_KINDS_WITH_POD_SPEC`
+/// is the *other* answer in this binary to "which kinds carry a pod spec", and
+/// the two deliberately differ on `DaemonSet` — that list covers every kind
+/// that can carry env configuration, this one is pinned to bash parity for
+/// R-18. Neither is the other's SSoT and they must not be folded together
+/// without an owner decision on the parity constraint.
+///
+/// **Known consequence of the divergence**: a `DaemonSet` in a service
+/// directory would have its env wiring checked by `env-config` while R-18
+/// silently skips its `runAsNonRoot` / `allowPrivilegeEscalation` /
+/// `capabilities.drop` invariants and reports green. No service directory
+/// contains one today. Whoever retires the bash-parity constraint should
+/// reconcile the two lists at that point.
 pub const SECURITY_CONTEXT_KINDS: &[&str] = &["Deployment", "StatefulSet"];
 
 /// Workload names that bash today exempts from `readOnlyRootFilesystem: true`
