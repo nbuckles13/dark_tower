@@ -1,8 +1,8 @@
 # ADR-0036: Media Flow Between Participants
 
-**Status**: Proposed.
+**Status**: Accepted.
 
-**Date**: 2026-08-23 (revised 2026-08-24)
+**Date**: 2026-08-23 (revised 2026-08-27)
 
 **Deciders**: media-handler, meeting-controller, protocol, client, security, test, observability,
 operations. **auth-controller** reviewed §3 and §4 after the debate closed and corrected the
@@ -27,6 +27,13 @@ ignores every media signalling message. `JoinResponse.user_id` is hardcoded `0` 
 `encryption_keys` is `None`. There is no `getUserMedia` anywhere, no `crypto/` or `room/` in
 `sdk-core`, no in-meeting view in `web-app`, and `proto/test-vectors/` — mandated by ADR-0028 — does
 not exist.
+
+**A note on the word "stream", which this document uses for three different things.** A **QUIC
+stream** is a transport object — one per group of pictures (§1). A **media stream** is what a
+publisher produces — one encoding of one source, the unit a send directive names (§5). A **slot** is
+a subscriber's receive position, identified by the stream id in the relay region (§2, §6). Where the
+distinction matters the text says which; where it says "per (connection, stream)" it means the
+**media stream**, never the QUIC stream.
 
 **How to read this document.** Sections 1–11 are prescriptive: they state what to build. A *Why*
 subsection appears only where the reasoning constrains implementation — where someone who knew only
@@ -69,7 +76,7 @@ keyframe becomes ~37 fragments with no recovery — about 67% survival at 1% los
 independent-loss arithmetic. Under **bursty** loss the mean is similar but the variance is far worse:
 whole runs of fragments vanish, some keyframes are total losses, and users experience the variance as
 *"sometimes video takes three seconds to appear."* Datagrams-only would have made forward error
-correction a prerequisite of the first story rather than a later choice.
+correction a prerequisite rather than a later choice.
 
 **Why a group and not a frame.** A stream per frame bounds blocking to one frame, which buys almost
 nothing: if a delta frame is lost, the frames behind it depend on it and are undecodable regardless.
@@ -111,18 +118,23 @@ region is what MH rewrites per subscriber and is authenticated by nobody.
 ```
 PUBLISHER REGION — covered by the signature (§3) and the AEAD associated data (§4)
   version                 protocol version
-  flags                   independently-decodable; discardable;
+  flags                   independently-decodable; discardable; key-bearing;
                           all other bits: decode REJECTS if set
   payload length          delimits this frame within its group's stream
-  stream sequence         end-to-end, per (sender, stream, epoch)
+  stream sequence         end-to-end, per (sender, stream, generation)
+  wrapped transmit key    present iff key-bearing is set; fixed size; the sender's
+                          key for this frame's key id, wrapped under the meeting
+                          KEK and bound to the key id (§4)
   extensions              optional, type-length-value, publisher-set (§7)
 
 RELAY REGION — excluded from signature and associated data; MH rewrites per subscriber
   stream id               which of the subscriber's slots this frame fills
   hop sequence            per (connection, stream); counts what the transmitter sent
 
-PAYLOAD                   encrypted frame (key id, authentication tag,
-                          presentation timestamp all inside)
+PAYLOAD                   SFrame object: key id and authentication tag in its own
+                          clear header (the receiver must read the key id to
+                          select a key before decrypting); presentation
+                          timestamp inside the ciphertext
 SIGNATURE                 Ed25519 over publisher region and payload (§3)
 ```
 
@@ -135,9 +147,9 @@ guard and as proof the publisher used the version MC directed, which is what mak
 detectable.
 
 Two consequences. A mid-meeting joiner supporting only a lower version forces either a meeting-wide
-downgrade or exclusion, and that is MC's policy call. And a version change lands on an **epoch
-boundary**, because versions may differ in what the signature and associated data cover — which is
-convenient, since joining already triggers rotation (§4).
+downgrade or exclusion, and that is MC's policy call. And a version change lands on a
+**transmit-key generation boundary**, because versions may differ in what the signature and
+associated data cover — and a sender rotates generations freely (§4), so no coordination is needed.
 
 **Two sequence numbers, because they answer different questions.**
 
@@ -148,18 +160,18 @@ cryptographic rather than conventional.
 
 Being the nonce input is a stronger constraint than ordering alone would impose: **a repeat under one
 key does not merely expose those two frames, it leaks the authentication subkey and permits forgery.**
-The rule is therefore uniqueness per key, and because the key changes each epoch, uniqueness *within*
-an epoch suffices — the epoch boundary **permits** a reset rather than requiring one.
+The rule is therefore uniqueness per key, and because the key changes each generation, uniqueness
+*within* a generation suffices — a generation boundary **permits** a reset rather than requiring one.
 
-**Do not reset it at epoch boundaries; keep counting per (sender, stream).** Epochs change on every
-join and leave, so a resetting counter restarts constantly in a churning meeting and every reset is a
+**Do not reset it at generation boundaries; keep counting per (sender, stream).** Generations
+advance on every video group (§4), so a resetting counter restarts constantly and every reset is a
 discontinuity the receiver must special-case rather than read as loss — which damages the field's
 second job. Continuing to count also removes a class of bug, since resetting at the wrong moment
 relative to the key swap is exactly how a silent nonce repeat happens. At 32 bits and 50 fps,
 exhaustion is years away, and rotate-before-wrap remains a format rule.
 
 It is **counted per (sender, stream)**, not per sender — which requires the key id to identify
-**(sender, stream, epoch)** so that each stream has its own derived key and nonce uniqueness still
+**(sender, stream, generation)** so that each stream has its own key and nonce uniqueness still
 holds (§4). Counting per sender across streams would make the sequence sparse for any single
 subscriber — gaps wherever another stream consumed numbers — and useless for loss detection.
 
@@ -176,9 +188,11 @@ The hop sequence counts **what the transmitter actually sent**, so a deliberatel
 consumes no number and any gap the receiver observes is genuine transport loss. Get that backwards
 and the metric measures selection policy instead of loss.
 
-It is counted **per (connection, stream)** rather than per connection, because the useful question is
-*which slot degraded* — the input to congestion-withheld slot state (§6) — not merely whether the
-link lost packets.
+It is counted **per (connection, media stream)** rather than per connection, because the useful
+question is *which slot degraded* — the input to congestion-withheld slot state (§6) — not merely
+whether the link lost packets. It is emphatically **not** per QUIC stream: a video QUIC stream lasts
+one group of pictures (§1), so a counter scoped to it would reset at every keyframe and detect
+nothing.
 
 It needs no authentication: it rides inside QUIC/TLS, and a transmitter lying about its own send
 count only conceals drops it could already perform.
@@ -205,6 +219,12 @@ retransmits and delivers in order. For datagrams there is no application-visible
 decoded without predecessors; it must not know whether that frame is audio or video (§7). The
 subscriber learns media kind from its own slot declaration, never from the frame. This makes the
 switching rule in §7 uniform and configuration-free.
+
+**The key-bearing flag** announces a fixed-size wrapped transmit key following the stream sequence
+(§4). A flag rather than a length: the field has one size, so presence is the only thing to signal,
+and a variable-size header region is exactly what the "every byte decoded or rejected" rule forbids.
+It sits in the publisher region because it is the publisher's statement about its own key, and
+because a signed field cannot be added, removed, or replayed by the relay.
 
 **The discardable flag** marks non-reference frames the sender believes can be dropped without
 affecting others — real information for congestion response, since video encoders genuinely produce
@@ -269,9 +289,9 @@ Only the media key carries a counter hazard. These look symmetric and are not.
 
 ### Why
 
-Without signatures, attribution rests on symmetric authenticated encryption: every member derives
-every other member's media key — that is precisely how anyone can decrypt anyone — so **possession of
-the key is authorship**, and any participant can encrypt a frame under another's key that every
+Without signatures, attribution rests on symmetric authenticated encryption: every member can unwrap
+every other member's transmit key, and so can MC — that is precisely how anyone can decrypt anyone —
+so **possession of the key is authorship**, and any participant can encrypt a frame under another's key that every
 receiver accepts and labels with the wrong name. Guests carry a client-supplied display name, so the
 insider bar is a meeting link.
 
@@ -281,8 +301,8 @@ Signatures also collapse two other problems:
   identically under any §4 mechanism, so who a frame is attributed to does not depend on how media
   keys are established.
 - **MC can no longer mis-attribute.** MC publishes the roster, so a roster-derived mapping would let
-  a compromised MC rename the speaker — defeating end-to-end encryption while appearing to satisfy
-  it. A forged roster entry does not help when the signature will not verify against a key the client
+  a compromised MC rename the speaker. MC can already read media (§4); without signatures it could
+  also author it as anyone. A forged roster entry does not help when the signature will not verify against a key the client
   validated independently.
 
 ### Cost, stated plainly
@@ -305,238 +325,290 @@ verified together.
 
 ## 4. Encryption and key distribution
 
-Media is encrypted per frame using the SFrame construction, with two deviations from
-`draft-ietf-moq-secure-objects-01`: the relay region is **excluded** from the associated data (MH
-rewrites it), and MoQ group and object identifiers are not used — the synthesized nonce is the key
-id and stream sequence, and nothing else.
+Media is encrypted per frame using the SFrame construction. The nonce is synthesized from the key id
+and the stream sequence (§2) rather than transmitted, and the relay region is **excluded** from the
+associated data because MH rewrites it.
 
-**Media keys are distributed with MLS.** The deciding argument is scale: **meetings of several
-hundred participants are a real target**, and the alternative that avoids MLS does not survive it —
-see *Alternatives evaluated* below.
+**Each sender encrypts under its own transmit keys and carries them, wrapped, inside its own
+frames. MC issues one key-encryption key (KEK) per meeting to every participant it admits.** If MC
+lets a client in, the client gets the KEK; there is no other condition, no group protocol, and no
+key material on the roster.
+
+**This is a trust decision, recorded as the user's.** Under it, **MC — and therefore the operator —
+can read media. MH, the network, and everything at rest cannot.** The debate's security position
+was that a provider under which an operator service can reach media requires explicit risk
+acceptance under ADR-0024 §5.7 rather than majority override; that acceptance is given here. The
+grounds: every mechanism that excludes MC by construction makes membership a coordination problem
+among clients — a global barrier under MLS, N² wrapping under pairwise keys, or a key server whose
+own trust story needs sealed envelopes, org-issued certification, and issuer federation before it
+excludes anyone — and each trades in-meeting quality, reliability, or simplicity for operator
+exclusion. This system's goals are a joiner receiving media within 200 ms of join completion and
+no join ever touching an existing flow. The precise claim is therefore: **media is encrypted between
+clients; MH, transport, and storage cannot read it; MC can.** Nothing may describe this as
+zero-trust or as end-to-end against the operator. Logs and metrics carry a **key-custody** label,
+fixed at `operator` today, in place of any end-to-end boolean.
 
 ### Keys, and who holds what
 
 | Key | Scheme | Lifetime | Held by | Purpose |
 |---|---|---|---|---|
-| Identity **signing** key | Ed25519 | long-lived, survives reconnect | client generates; public half on the roster, thumbprint AC-attested | signs every frame (§3) — proves a frame came from that participant |
-| MLS **node** keys | HPKE | per epoch | client; private halves never leave the device | build the group secret; never touch media directly |
-| **Media** key | AES-GCM, symmetric | per epoch, per sender, per stream | **derived locally by every member**, never transmitted | encrypts frames |
+| Identity **signing** key | Ed25519 | one meeting; survives reconnect, not a fresh join | client; public half on the roster, thumbprint AC-attested | signs every frame (§3) — proves origin |
+| Meeting **KEK** | AES-256, symmetric | one meeting; rotated by MC (below) | **generated at random by MC's per-meeting actor, held only in memory**; every current member | wraps transmit keys |
+| **Transmit** key | AES-256-GCM | per (sender, stream, generation); sender-rotated | sender generates; carried wrapped in the sender's own frames | encrypts frames |
 
-The identity signing key and the media keys answer different questions and are deliberately not one
-key: **the signing key answers who sent a frame; the media key answers who can read one.** Only the
-media key carries a counter hazard, so only it rotates.
+**Every member can unwrap every sender's transmit key.** That is inherent to a shared KEK, and it is
+why §3's signatures are required for attribution: possession of a key is not authorship, and MC is
+now also in the set that could forge a frame without them.
 
-**Media keys are derived, not sent.** Each member derives every sender's key from the epoch secret
-plus that sender's leaf index — so per-sender keys cost **zero bytes on the wire** and need no
-distribution step of their own. The key id encodes **(leaf index, stream, epoch)**, which is what
-makes the per-stream sequence in §2 dense and unique per key.
-
-**Every member can derive every other member's media key.** That is inherent to the scheme and it is
-exactly why §3's signatures are required for attribution — decryption proves nothing about origin.
+**The KEK is never derived and never persisted.** It is random, lives in the meeting actor, and dies
+with the meeting. Compromise must be live: a database, a backup, or a log yields nothing, and no
+master secret exists whose loss reaches backward across meetings. A derived-from-master design lacks
+this property, which is why the KEK is generated rather than computed.
 
 ### How it works
 
-1. **Before requesting the meeting token**, the client generates its identity signing keypair, and
-   AC issues two things over it: a `cnf.jkt` thumbprint claim inside the meeting token, proving the
-   join-time holder controls that key; and a **separate peer-presentable identity attestation** over
-   (participant, thumbprint, meeting), which is what other participants actually verify. The ordering
-   is load-bearing; see the next subsection.
-2. The client joins and MC hands it the group's public state.
-3. The client admits **itself** with an MLS External Commit — no existing member needs to be online.
-4. **MC serialises commits** — one wins per epoch, concurrent commits are rejected as stale — and
-   fans the winner out unchanged. Its per-meeting actor already provides that serialisation point.
-5. Every member processes the commit, updates its ratchet tree, and derives the new epoch secret.
-6. Each member derives its own sender keys and encrypts frames under them.
-7. A receiver derives the sender's key from the same epoch secret and that sender's leaf index.
-8. Any join or leave produces a new commit, a new epoch, and re-derivation.
+1. **Before requesting the meeting token**, the client generates its identity signing keypair; AC
+   attests the thumbprint in the token's `cnf` claim and issues the peer-presentable identity
+   attestation (§3, and *Identity keys must be AC-attested* below).
+2. The client's join request to MC carries the raw signing public key. MC checks it against the
+   token's thumbprint and publishes it on the roster.
+3. **MC returns the current KEK in the join response.** That is the entire key-distribution step for
+   a joiner. It costs nothing beyond the join MC already performed, and it touches no existing
+   member.
+4. The client generates a transmit key per stream, wraps it under the KEK, and **carries the wrapped
+   key in the publisher region of its own frames**, announced by the key-bearing flag (§2; cadence
+   below). A receiver that already holds the
+   key for that key id ignores the field; one that does not unwraps it and caches it.
+5. A sender rotates a transmit key by advancing the generation and carrying the new wrapped key.
+   **Rotation is O(1), involves nobody else, and needs no signalling** — which is why it can be
+   aggressive.
+6. MC rotates the KEK (below) by generating a new one and pushing it to every member over
+   signalling. Senders wrap under the new KEK from then on. Receivers retain the previous KEK for a
+   **bounded** window so frames in flight, and frames from senders that have not yet re-wrapped,
+   still open.
 
-**MC's entire role is to serialise and relay opaque bytes.** It derives nothing.
+**The KEK-source seam.** The client obtains the KEK through a seam, as §10's transport and
+measurement seams; today its one implementation is the join response and the KEK-push
+message. Nothing in the frame format or the wrap depends on where the KEK came from, so a key
+server outside MC — should operator exclusion ever be required — changes the source and nothing
+else. That is what "key delivery is pluggable" means here.
 
-### Why MC cannot read media
+### In-band key carriage
 
-Members occupy the leaves of a ratchet tree. Each node has a keypair, and a member knows the private
-keys of every node from its own leaf to the root; the root secret is what the epoch secret derives
-from. A commit encrypts fresh path secrets to the **public** keys of sibling subtrees, so each member
-decrypts exactly what it is entitled to and derives upward.
+The wrapped transmit key travels in the frame, not on the roster. This is the mechanism the
+previous draft deferred as sender-driven rekeying in the manner of SRTP's Encrypted Key Transport;
+with MC holding the KEK it becomes the simplest correct design rather than an optimisation, and it
+is what removes every remaining round trip from joins, rotations, and speaker changes.
 
-MC observes those ciphertexts and the public keys. **It holds no private key** — no leaf's, no
-interior node's, no root's — and public keys plus ciphertext do not yield the secret.
+**Cadence.** The field costs roughly 50 bytes (32-byte key, 16-byte tag, KEK generation; the wrap
+nonce is derived, not carried).
 
-This is worth contrasting with a scheme that looks similar and is not: distributing per-sender public
-keys and having senders wrap a media key such that the **public** half unwraps it. That provides
-authenticity, not confidentiality — anything a public key can undo, every holder of that public key
-can undo, MC included. Distributing public keys is only safe when they confer the ability to
-*encrypt to* a member and nothing else.
+| Media | Carried on | Why |
+|---|---|---|
+| Video | the first **N** frames of every group, N small and configured (default 3) | a group is a QUIC stream and a switch lands on a group start (§7), so a subscriber's first frame from a new source is key-bearing by construction. Streams are reliable, so N=1 would suffice; N>1 is cheap insurance against a reader that starts one frame late |
+| Audio | **every frame** | audio switching is instantaneous and autonomous at MH (§7), so a receiver's first frame from a newly selected speaker must be decryptable with no wait at all. Every-other-frame would save half the bytes for a 20 ms worst-case hole on every speaker change; every frame is the deterministic rule and the difference is small |
 
-### The condition that makes it sufficient — and it is not cryptographic
+**Cost, stated plainly.** On audio this adds ~50 bytes to the ~174 of §3, so a 20 ms Opus stream
+goes from ~70 kbps to roughly **90 kbps**; five audio slots is about 450 kbps per subscriber, still
+small against video. The cost is bandwidth only — a receiver holding the key does no per-frame
+unwrap. §3's mitigation ladder applies unchanged: 40 ms audio frames halve the signature and the key
+overhead together.
 
-**MLS alone does not stop MC. MLS plus credential validation does.**
+**The field is signed and KEK-bound.** The wrap is AES-256-GCM under the KEK with the nonce derived
+from the key id and the key id as associated data. One transmit key therefore wraps to one
+ciphertext — byte-identical from frame to frame within a generation — and nonce uniqueness under the
+KEK reduces to key-id uniqueness, which generation monotonicity gives (below). It sits in the
+**publisher region** (§2): covered by the signature, so MH can neither attach, strip, nor replay
+it, and announced by a flag bit so the header stays fixed-layout. This forecloses one optimisation —
+MH caching a sender's wrapped key and attaching it for new subscribers — and that is accepted: the
+audio cadence below makes it unnecessary, and a relay that edits headers is the thing §2's split
+exists to prevent.
 
-MC controls membership, because it is the delivery service. The real attack is therefore not breaking
-encryption but **MC forging an Add for a key it controls**, becoming a member, and legitimately
-deriving the group secret.
+**Receivers accept a wrapped key only for the key id of the frame carrying it.** Any member holds
+the KEK and could wrap arbitrary material, but it can only place it in frames it signs — its own —
+and a wrap for another sender's key id in those frames is ignored. Stated so the attack has no
+surface.
 
-What prevents it: every member's leaf carries a **credential**, and **clients validate that every
-member's credential traces to an AC-issued identity for a real participant.** MC has no AC attestation
-for a fabricated member. This is why the join-flow reorder in step 1 exists, and why AC credential
-binding is described here as the price of being end-to-end encrypted at all rather than as an MLS
-detail.
+**Frames that cannot be opened are dropped and counted, by reason.** Two reasons exist and they
+have different remedies, so they are distinct label values on one client-side counter: **no KEK for
+the carried KEK generation** — at join before the KEK arrives, or after a rotation before the push
+lands; and **no roster entry for the sender** — unwrappable but not verifiable, since §3 needs the
+signing key. Both are expected transiently at join and at rotation and are wrong when sustained; the
+sustained case is the signal. Per §11 the counter carries a reason label and no participant or
+meeting dimension.
 
-**The credential is not the meeting token, and this distinction is easy to get wrong.** A meeting
-token binds *A's own* thumbprint into *A's own* token — but for B to validate A's credential, B must
-verify **AC's signature over A's identity-to-key binding**, and **B never holds A's token.** Using the
-meeting token as the credential would mean distributing it, which fails three ways at once: it is a
-short-lived **bearer** credential that MC uses to admit you, so handing it to every peer through MC is
-a credential leak; its expiry is far shorter than the membership it must vouch for, so credentials
-churn or go stale; and it carries display-name PII to parties that do not need it.
+**A non-key-bearing frame for an unknown key id is a protocol violation, not a third reason.** Under
+the cadence above it cannot occur: audio carries the key on every frame, and a video subscriber
+enters a group at its start (§7), whose first frame is the keyframe and is never discardable. The
+only paths to it are defects — a sender omitting the flag, a reader starting mid-stream — so it is
+counted in the decode-reject bucket alongside unknown flag bits, where firing means an invariant
+broke rather than a state the system passes through.
 
-So AC mints **two distinct artifacts** over the same key:
+**A wrap from a frame that fails verification is not cached.** After a missing roster entry lands,
+the receiver waits for the next key-bearing frame — immediate for audio, up to one group for video.
+That is the real cost of the no-roster case, and why the roster update must travel the same
+signalling path as the KEK and land first.
 
-| Artifact | Audience | Nature | Lifetime |
-|---|---|---|---|
-| `cnf.jkt` claim in the meeting token | MC and MH, at admission | part of a **bearer** credential | the token's, short |
-| **Identity attestation** over (participant, thumbprint, meeting) | every peer, carried in the MLS leaf credential | **non-bearer**, safe to distribute | matched to membership, not to the join token |
+### Key identifiers and stop/start
 
-Both verify against AC's existing JWKS. The thumbprint is an RFC 7638 JWK thumbprint carried as
-`cnf.jkt`; the client SDK already computes exactly that canonicalisation over the same key shape AC's
-JWKS emits, so the cross-language agreement exists rather than needing to be established.
+The key id encodes **(sender, stream, generation)**. Generation is **monotonic per sender across its
+membership and never reset**, so a stream number reused after a stop/start lands under a new key id
+and a new key. Stream sequences keep counting per (sender, stream) across stop/start, as §2
+requires. Nothing needs to coordinate which stream numbers are live.
 
-Binding a thumbprint rather than a raw key is deliberate: it forces the verifier to obtain the actual
-public key from the roster and check that it hashes to the attested value, which is the property
-being sought.
-
-**Identity keys are scoped to a meeting**, not to a participant across meetings. §3's "long-lived"
-means *surviving reconnect within a membership*, not persisting across meetings — a key reused across
-meetings would make a participant linkable by their public key regardless of display name, which
-matters most for the guests who have the least identity assurance to begin with.
-
-**AC does not track key continuity, and should not.** It is stateless here: on token refresh the
-client re-presents the same thumbprint and AC re-stamps it, with no rebinding step and no AC-side
-state. Nothing at AC prevents a client presenting a *different* key at the next refresh. **Continuity
-of membership is MLS's property, not the token's** — this is correct, and it is stated because the
-token must not be mistaken for the thing that guarantees a stable identity across a meeting.
-
-**Guests receive an attested pseudonym, not an attested identity.** Guest tokens stamp a
-client-supplied display name with no lookup, so the attestation proves *"every frame came from the
-same keyholder"* and never *"who that keyholder is."* This is worth having — it stops one guest
-forging another guest's frames — but it must never be described as identity assurance for guests, and
-it leaves the insider bar at "a meeting link" exactly where §3 puts it.
-
-**Where a client-verified binding and MC's roster disagree, the client-verified binding wins.**
-
-Skip this validation and the result is worse than no encryption, because it *looks* end-to-end: MLS
-ships, MC adds itself, and the property everyone believes they have is absent with nothing reporting
-it.
-
-MLS does close the adjacent doors on its own. Commits are signed by their committer, so MC cannot
-forge one attributed to a member; and confirmation tags over the transcript mean MC cannot hand
-different members divergent group states without detection.
-
-### What MC can still do
-
-**Deny service** — drop, refuse, or partition delivery. Nothing here prevents that, and nothing
-should pretend to.
-
-**Observe membership** — who is in the group and when it changes. That is metadata, not content, and
-it is the same class of leak §11 already accepts and bounds on the media path.
-
-### Rotation applies to media keys only
-
-The signing key persists across reconnect (§3).
+### Rotation
 
 | Trigger | Rule |
 |---|---|
-| Participant leaves | **Rotate immediately, never debounced.** A departed member can otherwise still derive current keys. |
-| Participant joins | Rotate, so a joiner cannot decrypt media captured before it arrived. MLS gives this free with the Add commit. |
-| Counter exhaustion | Rotate before the stream sequence wraps. |
-| Reconnect without provable counter continuity | Rotate rather than resume — nonce reuse is far worse than an extra epoch. |
-| MH failover or reassignment | **Not a trigger.** MH never held keys; coupling the crypto epoch to transport topology buys nothing. |
+| Participant leaves | **MC rotates the KEK, debounced to at most once per W** measured from the oldest un-rotated leave; departures inside one window coalesce. **A leaver is bounded by W and by nothing else**: holding the KEK, it unwraps every new transmit key as it is carried, so transmit-key rotation does not shorten this window. It receives no media from MH after leaving, so W bounds damage only where ciphertext was captured in transit. **W is configuration**, defaulting to the order of a minute. |
+| Participant joins | **No action on any existing member.** The joiner receives the current KEK and unwraps each sender's key from that sender's next key-bearing frame. **Backward secrecy is bounded by the last KEK rotation, not by join**: a joiner who captured ciphertext before joining holds key-bearing frames, and the KEK it is handed unwraps them. Same caveat as the leave case — it requires ciphertext obtained outside the media path — and closing it would mean rotating the KEK on every join, the O(N) coordination this design exists to avoid. Accepted and stated. |
+| Transmit-key cadence | Senders rotate transmit keys **on every video group and every T for audio**, because rotation is free. What this bounds is a **leaked transmit key** — one group or one T of media — and counter hygiene. It bounds nothing for a KEK holder, joiner or leaver, since every new key is carried under the KEK. |
+| Sender resumes from empty | Rotate the transmit key. For video this coincides with the resume keyframe (§5); for audio it is the same generation bump without one. |
+| Counter exhaustion | Rotate the transmit key before the stream sequence wraps. |
+| Reconnect (same process, transport dropped) | MC re-issues the current KEK; the sender rotates its transmit keys rather than resuming counters. |
+| Fresh join after lost state | **Identity key, token, and generation counter share one lifetime.** Losing any means a fresh join with a fresh identity, which is a new key-id namespace; no continuity is attempted. |
+| MC migration (ADR-0023) | The new owner generates a fresh KEK; clients receive it on re-attach. MC state is in memory and moves with ownership. |
+| MH failover or reassignment | **Not a trigger.** MH never held keys. |
 
-Rotation depends on every client learning promptly when participants join and leave. Roster updates
-already carry that, and are wanted for other reasons.
-
-**Rate-limit epoch changes per participant and evict flappers.** A client in a reconnect loop forcing
-an epoch change per cycle is a cheap denial-of-service against every other client's CPU. That, not
-steady-state joins, is the real hazard.
+**Rate-limit rotation per participant and evict flappers.** A client in a reconnect loop must not be
+able to force a KEK rotation per cycle; the leave debounce covers that, and the per-sender generation
+bump on reconnect is the sender's own cost.
 
 ### Nonce-reuse invariants are structural, not comments
 
 **Encrypt once and fan out the ciphertext.** A client encrypting per destination either reuses the
 counter — catastrophic for AES-GCM, yielding authentication-key recovery rather than mere
-confidentiality loss — or burns two counters per frame. §5's stream model is what makes this hold by
+confidentiality loss — or burns two counters per frame. §5's stream model makes this hold by
 construction.
 
-**Rotate on reconnect rather than resuming counters**, and **rotate before exhaustion.**
+**Never reuse a (key, nonce) pair.** The key id distinguishes generations, so a transmit-key rotation
+permits a sequence reset; §2's rule is to keep counting regardless.
 
-### Key delivery is pluggable
+**Receivers reject replays.** Within a generation a replayed frame carries a valid signature and a
+valid authentication tag — it *was* legitimately produced. The stream sequence makes rejection
+possible and the receiver must use it: a sliding window per (sender, stream, generation), dropping
+duplicates and anything below it.
 
-The delivery seam abstracts **transport as well as algorithm**, so an external key service can be
-added without redesign. The goal is that our servers cannot access decrypted media **by design rather
-than by implementation**, which means such a service sits in a **different trust domain** — separate
-operator, separate credentials, ideally customer-operable.
+### MH stays keyless, and that is a guard, not a convention
 
-Under MLS, MC is already only an ordered relay of opaque bytes, so it holds no material today. What
-must not be baked in is the assumption that MC *is* the delivery path.
+MC now holds the KEK and is one RPC away from handing it to MH. **No key material crosses the MC→MH
+contract**, enforced by the credential-leak semantic guard extended to KEK and transmit-key material
+in internal messages and in logs — not by review. Every property §7 and §11 derive from "MH cannot
+see the media" depends on it.
+
+### What MC can do, stated
+
+- **Read media**, for meetings it owns, while they are live. The accepted cost above.
+- **Deny service** and **observe membership**, as before.
+- A memory dump of a live MC pod yields the KEKs of that pod's live meetings — bounded to those
+  meetings, nothing retroactive.
+
+MC still cannot forge a frame that verifies: §3's signatures are against keys the client validated
+through AC, and MC cannot mint an attestation.
 
 ### Alternatives evaluated
 
-**Pairwise sender-key sealing — ruled out on mechanism, not on a number.** Each sender seals its media
-key to every peer's public key. A rotation costs each sender N−1 seals, so across N senders one
-membership change is N(N−1) seal operations and as many distinct blobs to relay — roughly 250,000
-operations at 500 participants, on *every* join and leave. MLS's ratchet tree makes the same change
-**one commit**, broadcast unchanged, with O(log N) work per member. The gap is not a constant factor.
-Pairwise remains genuinely end-to-end encrypted and is cheaper below roughly fifty participants; it
-simply does not reach the target.
+**MLS — rejected on coordination, and it was the previous decision here (ADR-0028 §5).** MLS fuses
+joins and leaves into a single global epoch change. Its O(log N) rekey is genuinely efficient, but it
+is bought by making one shared group state the unit of consistency, so **every join is a synchronous
+barrier that one slow client can wedge**, and a member who misses a commit is stranded from the
+whole group. At scale it also needs a group creator, committer nomination with timeout
+re-nomination, authorised external senders with a service-level key, and published group state. At
+thousands of participants the observed failure is exactly the one this system's goals forbid: media
+breaks for the slow client or never starts for the joiner.
 
-**Development-only provider — a test double, never shipped to a real environment.** It loses
-confidentiality against us — an MC compromise, memory dump, insider, or subpoena yields plaintext —
-and **MC could author media as any participant**, which is strictly larger than §3's residual gap and
-sits with the operator rather than a participant. If it is ever used outside local development it
-fails closed, reports `e2ee=disabled` in logs and metrics, is never described as end-to-end
-encrypted, and `ARCHITECTURE.md:851-857` plus `adr-0028:134-141` are corrected in the same change.
+**Pairwise sender keys — rejected on cost under this system's send model.** Each sender wraps to
+every receiver. Because every participant sends audio at all times and must be ready to send video
+instantly, every participant is a sender, and a leave costs N² wraps per rotation window — around
+1 MB/s of relay through MC per thousand-person meeting at a one-minute window, a double-digit share
+of media traffic in the several thousands, plus an MC-side transpose with an N²-proportional working
+set. Barrier-free and bounded, but it spends bandwidth and MC capacity on operator exclusion, which
+this deployment does not require.
+
+**A key server outside MC — deferred, with its design recorded.** The shape that works: the
+participant holds an AC-attested X25519 encryption key; MC couriers a request to the key server,
+which seals the KEK to the attested key and signs the envelope under its JWKS; the client verifies
+both, which closes the two courier attacks (key substitution inbound, KEK substitution outbound).
+What it does *not* close without more: the operator's AC can still attest a participant the
+operator controls, so excluding an *active* operator additionally needs org-issued certification of
+the participant's key, per-org trust configuration, and issuer-scoped token validation (`iss`, which
+tokens do not carry today — ADR-0003 Phase 2). A KEK derived from an org master secret was found to
+lack forward secrecy and would need versioned, destroyed masters bounded by backup retention. Each
+piece is sound; together they are a separate design, and none is needed for the goals as stated.
+**Trigger to revisit**: a customer requirement for operator exclusion. The KEK-source seam is
+what keeps that design additive.
+
+**Leave-triggered rotation without debounce** — deferred; W is the knob, and a per-org W is
+configuration, not design.
 
 ### Costs accepted
 
-- A **WASM crate** carrying an MLS implementation, and `wasm32-unknown-unknown` as a new target in
-  the ADR-0033 validation pipeline — a new language target, not merely a new dependency. Bundle size
-  lands on the join critical path and needs a gate.
-- An **ADR-0027 amendment**: MLS requires HPKE, which `ring` does not implement, so this approves a
-  second crypto stack for the end-to-end path. That is a deliberate decision, not paperwork.
-- **Key material transits WASM linear memory** and cannot be marked non-extractable the way a
-  WebCrypto handle can. This is a real weakening relative to the pairwise alternative and is accepted
-  rather than solved; key material is imported inside the wasm-bindgen boundary rather than passing
-  through the JS heap, which is the worse of the two — garbage-collected, never zeroed, reachable by
-  any same-realm script injection.
-- **Frames in flight across an epoch change.** A receiver may hold epoch N+1 while frames encrypted
-  under epoch N are still arriving, so it must retain the previous epoch's keys for a **bounded**
-  window. That slightly weakens the forward-secrecy claim and must be bounded and stated rather than
-  discovered.
+- **Operator access to live media**, as the user's risk decision under ADR-0024 §5.7, stated
+  wherever the property is described and labelled in telemetry.
+- **~50 bytes per audio frame** for in-band key carriage, on top of §3's signature.
+- **Frames in flight across a rotation**: receivers retain the previous KEK and the previous
+  transmit-key generation for a bounded window, which is part of the leave-exposure figure.
+- **Both membership bounds are KEK bounds.** A leaver decrypts forward until the next KEK rotation
+  (≤ W); a joiner with captured ciphertext decrypts backward to the last one. Transmit-key rotation
+  does not tighten either.
+- **W, N, and T have no measurement behind them.** Configuration, with stated defaults.
 
-### Deferred, with a trigger
+### Identity keys must be AC-attested, and clients must check
 
-**In-band sender-driven rekeying**, in the manner of SRTP's Encrypted Key Transport: a sender chooses
-its own media key and transmits it wrapped under a group key, rather than deriving it. This buys
-rotation without an epoch change, at the cost of periodically carrying a wrapped key on the wire —
-roughly 48–64 bytes, which is why such schemes transmit it periodically rather than per packet.
+Everything in §3 rests on a receiver knowing that the identity key it verifies against genuinely
+belongs to the participant it claims. **MC publishes the roster**, so without an independent check
+MC could list a fabricated participant holding a key it controls.
 
-Under MLS's derivation this is unnecessary: per-sender keys cost nothing on the wire and epochs
-already change on every membership event. **Trigger to revisit**: a need for sender-local rotation
-between epochs — recovery from a suspected client compromise, or counter exhaustion, which at a
-32-bit sequence and 50 fps is years away.
+What that would buy is narrow but real: MC can already read media, so a fabricated participant adds
+**injection** — media attributed to someone who does not exist, or, with a forged roster entry, to
+someone who does. The attestation is what makes that impossible even for MC.
 
-### Dependency
+**The check**: every participant's identity key carries an **AC attestation**, and clients validate
+it rather than trusting the roster. Where a client-verified attestation and MC's roster disagree,
+**the attestation wins.**
 
-**auth-controller reviewed this section after the debate closed and corrected it.** The correction is
-above: the meeting token cannot be the peer-verified credential. Two further findings from that
-review are reflected here and in Open Items.
+**AC mints two distinct artifacts** over the same identity key, and they must not be conflated:
 
-**The work is larger than "one claim on the existing signing path."** That characterisation holds only
-for the AC-internal slice, where stamping an extra field into the claims struct and signing it is
-genuinely trivial. End to end it is a **three-edge contract change**, and the largest piece is not
-AC's: **the client→GC join endpoint takes no request body today**, so there is no channel for the
-client's thumbprint to reach GC at all. That endpoint grows a body, GC passes the field through to AC,
-and the deserialise-side claims type gains it for MC and MH to read. Size the story on that, not on
-the AC slice.
+| Artifact | Audience | Nature | Lifetime |
+|---|---|---|---|
+| A thumbprint confirmation claim in the meeting token | MC and MH, at admission | part of a **bearer** credential | the token's, short |
+| An **identity attestation** over (participant, key, meeting) | every peer | **non-bearer**, safe to distribute | matched to participation |
+
+The meeting token cannot serve as the peer-verified credential. A meeting token binds *A's own* key
+into *A's own* token, and **B never holds A's token** — so it could only work by distributing it,
+which would hand every peer a short-lived bearer credential that MC uses to admit you, expire far
+sooner than the participation it vouches for, and carry display-name PII to parties with no need for
+it.
+
+Binding a **thumbprint** rather than a raw key is deliberate: it forces the verifier to obtain the
+actual key from the roster and check that it hashes to the attested value. The RFC 7638
+canonicalisation over the OKP key shape AC's JWKS emits already exists in the tree, but in
+**test-only code, not the SDK**, so a production implementation is required.
+
+**Identity keys are scoped to a meeting**, not to a participant across meetings. A key reused across
+meetings makes a participant linkable by public key regardless of display name, which matters most
+for the guests who have the least identity assurance to begin with. It also bounds what a compromised
+key is worth.
+
+**AC does not track key continuity, and should not.** It is stateless here: on token refresh the
+client re-presents the same thumbprint and AC re-stamps it. Nothing at AC prevents a client
+presenting a different key at the next refresh — **continuity is not the token's property**, and the
+token must not be mistaken for the thing that guarantees a stable identity across a meeting.
+
+**Guests receive an attested pseudonym, not an attested identity.** Guest tokens stamp a
+client-supplied display name with no lookup, so the attestation proves *"every frame came from the
+same keyholder"* and never *"who that keyholder is."* Worth having — it stops one guest forging
+another's frames — but never to be described as identity assurance.
+
+### Contract changes this section forces
+
+The attestation is a **three-edge contract change**, not one claim on an existing signing path: the
+client must deliver its key thumbprint to GC, GC must pass it to AC, and the deserialise-side claims
+type must expose it to MC and MH. The largest piece is not AC's — **the authenticated client→GC
+join endpoint takes no request body today**, so the client's key has no channel to reach GC; the
+guest join path already carries a body, so one edge needs a new shape and the other does not. MC
+gains KEK generation in the meeting actor, the KEK in the join response, the KEK-push message, and
+the debounced leave rotation.
 
 ## 5. What clients send
 
@@ -770,11 +842,11 @@ back.
 ### The mechanism
 
 **MC periodically re-asserts the full meeting registration, now carrying policy.** The registration
-request gains the selector, per-egress-stream behaviours, priority groups, transport mode, and host
-mute — plus a **generation** number, monotonic per (meeting, handler) and derived from the assignment
+request gains the selector, per-egress-stream behaviours, priority groups, transport mode, and server
+mute (§7) — plus a **generation** number, monotonic per (meeting, handler) and derived from the assignment
 computation's *output change*, never free-running.
 
-MC re-fires on three triggers:
+MC re-fires on four triggers:
 
 | Trigger | Character |
 |---|---|
@@ -949,7 +1021,7 @@ with zero syscalls. Absolute numbers are not meaningful on a shared laptop; delt
 
 **Tier 3 — objective**, non-gating, in a real environment.
 
-**Both seams are first-story work.**
+**Both seams are prerequisites, not refinements** (see *Ordering constraints* under Consequences).
 
 - **A transport trait seam in MH**, mirroring the client's transport interface. Hot-path
   per-connection I/O behind the trait; endpoint and accept loop stay concrete. It is quadruply
@@ -1019,8 +1091,14 @@ retaining it:
 
 **Vocabulary additions cannot be cited as the protection.** The guard's matcher is word-boundary
 based and underscore is a word character, so a bare token matches but no realistic prefixed spelling
-does — and the adopted roster field name is exactly such a spelling. A guard reporting clean while
-the offending line ships reads as coverage. The directory-scoped deny catches by *shape*.
+does, and a prefixed spelling of a sensitive token is the realistic form. A guard reporting clean
+while the offending line ships reads as coverage. The directory-scoped deny catches by *shape*.
+
+**Key custody is a label, not a boolean.** Every service reports `key_custody=operator` in logs and
+metrics; no metric, log, or document may carry an end-to-end or zero-trust boolean, because the
+default deployment is neither (§4). The credential-leak semantic guard's scope gains KEK and
+transmit-key material on the MC→MH contract and in MC logs — the one place a key could leave the
+component entitled to hold it.
 
 **Admission control is keyed on egress bandwidth, not connection count.** A stream-count value is
 advertised to GC as capacity and enforced nowhere; the only enforced limit is a connection count two
@@ -1034,6 +1112,13 @@ value admission control reads. A derived value cannot drift; a guard only catche
 introduces it. Startup validation is the fallback where derivation is impossible — as with the
 cadence and provisional-timeout coupling in §8.
 
+**Frames dropped for missing key material are counted on the client, by reason** — no KEK for the
+carried generation, no roster entry for the sender (§4); a frame with no key and no wrap is a
+protocol violation and lands in the decode-reject count instead. MH cannot
+observe any of them, since it never opens a frame. Expected as a transient at join and after a KEK
+rotation; a sustained rate is a join or rotation path that has silently stopped delivering keys, and
+it is the only signal for it.
+
 **Silent failure modes are counted on both ends** — datagram send drop, stream-credit stall, and
 partial-frame discard on MH; the sender-side equivalents in the SDK. **The client-side drop matters
 most: it occurs in the sender and MH structurally cannot observe it.** WebTransport exposes no
@@ -1045,15 +1130,19 @@ also closes the mirror of the oversized transport buffer in §1.
 concurrent-stream and creation-rate limits enforced before per-frame work; a bounded datagram queue
 with drop-oldest; a server-side slot cap.
 
-**MH sheds media sessions on restart.** Shutdown marks not-ready, cancels, and sleeps two seconds
-inside a thirty-five second grace period — there is no drain phase. Recovery is §8's re-assert.
+**MH sheds media sessions on restart, and that is the decision, not merely the current behaviour.**
+Shutdown marks not-ready, cancels, and sleeps two seconds inside a thirty-five second grace period,
+with no drain phase, and v1 keeps it that way: draining media sessions means either holding a pod
+open for the length of a meeting or migrating live sessions, and neither is in scope. Recovery is
+§8's re-assert, and the ≤10 s bound is what makes shedding tolerable. The Open Items entry below is
+about *testing* that recovery, not about adding a drain.
 Resumes must be **jittered on both MC and client sides**, or recovery after a congestion episode, an
 MH restart, or a rollout produces a synchronised keyframe storm — keyframes being an order of
 magnitude larger than delta frames, from every publisher at once, into a link that just proved
 constrained.
 
-**Runbooks and the alerts citing them land in the same story**, since alert validation requires every
-runbook reference to resolve to a file. Eight media scenarios are needed — restart media-dark,
+**Eight media runbook scenarios are required**, and alert validation requires every runbook
+reference to resolve to a file, so none of the alerts below can exist without its runbook. They are — restart media-dark,
 sustained re-assert failure, generation divergence, keyframe storm, stream-credit stall, datagram
 drop, egress exhaustion, and rollout-with-media. The existing fourteen cover no media-flow failure at
 all, because there is no media path yet. Sustained congestion-withholding is the **leading indicator**
@@ -1077,21 +1166,16 @@ notice.** A directory scope over a maintained file list. A compile error over a 
 path-scoped deny over a vocabulary entry. A derived value over a drift guard. A generation derived
 from output change over a tested idempotency convention.
 
-This debate collected six instances across five specialists — five found, one pre-empted — and four
-failed the *applies* half, which is the half nobody tests unprompted:
+The *applies* half is the one nobody tests unprompted. Three instances from this design, each
+mapping to a gate this design adds:
 
 | Instance | Failure |
 |---|---|
-| A sensitive-token vocabulary matching no realistic spelling of its target | alive, never applies |
 | Alert selectors matching no real pod — several alerts had never fired in the product's life | alive, never applied |
-| A reconnect counter for a failure undetectable as configured | applies, never fires |
-| A coverage test referencing a never-emitted metric, passing on absence-of-absence | applies, fires for the wrong reason |
 | A generation gauge fed by the received rather than the applied value | applies, never fires when it should |
 | A per-frame tracing feature guarded by CI rather than by compilation | could be out of scope entirely |
 
-**Forward checklist — every gate this story adds answers both halves explicitly, at plan approval.**
-Six historical instances explain the past and prevent nothing; the same material applied to the gates
-being written now stops the seventh.
+**Forward checklist — every gate this design adds answers both halves explicitly, at plan approval.**
 
 | | Does it fire? | Does it apply? |
 |---|---|---|
@@ -1101,47 +1185,13 @@ being written now stops the seventh.
 structured block reviewed at plan approval by the cross-cutting reviewers. This is a second table in
 that same block.
 
-**A corollary, since two of this debate's three design improvements came from it: when a metric is
-hard to make meaningful, that is evidence about the design, not just about the metric.** The
+**A corollary: when a metric is hard to make meaningful, that is evidence about the design, not just
+about the metric.** The
 objection *"a reconnect counter is meaningless if its failure is undetectable"* was not answered by
 adding keepalive — the control plane changed so the failure mode ceased to exist. The question *"can
 we count a send-side datagram drop?"* was not answered by finding a counter — the SDK took ownership
 of the queue. That is how instrumentation pays for itself rather than taxing, and it is the concrete
 answer to deferring performance work.
-
----
-
-## Implementation guidance
-
-**Pre-story experiments. These gate transport choice and the wire format, and must run before the
-header is frozen in code.**
-
-1. **Fan-out spike**, handler server half and browser client half in one harness through the
-   transport seam, swept at fan-out **with a slow-subscriber arm**. Its job is to **validate
-   one-group-per-stream and establish the application bound**, not to choose the shape — the
-   granularity is decided in §1 by dependency alignment, which is a design argument rather than an
-   empirical one. Running at full speed with fast readers will not find the ceiling; the binding
-   quantity is **concurrent unfinished groups under receiver backpressure**, not raw open rate. Keep
-   a per-frame arm only as a control, to confirm the churn argument holds in practice.
-2. **Capture-resistance selector test**, pure logic, no media: scripted speaker turns with crosstalk
-   and near-threshold flapping; assert correct selection with zero control round trips **and** that a
-   participant declaring maximum salience cannot outrank a higher priority group.
-3. **Contended-counter benchmark**: a shared cached counter versus per-stream sharding at increasing
-   thread counts. Low cardinality means every stream hits the same atomic — a tension inside the
-   telemetry design, named rather than assumed away.
-4. **Insider-forgery regression test**, in the test-vector harness: one participant encrypts under
-   another's key id and asserts the receiver attributes it to the wrong participant. **Under §3's
-   signatures this must now fail** — it is the test that proves the signature layer is load-bearing
-   rather than decorative.
-
-**Sequencing.** Test vectors and the header precede the forward path. The transport seam precedes the
-ingress and egress loops — cheap now, expensive against concrete types. The key-provider seam
-precedes any key work. **The roster field rename and the guard's consumption of the segment matcher
-land in one commit**: the rename is safe only *because* the cardinality rule consumes that matcher,
-and if the rename lands while the guard work slips, it routes around the guard with a name that looks
-deliberate.
-
-**Dependencies**: auth-controller sign-off (§4) before the story is written.
 
 ---
 
@@ -1162,9 +1212,12 @@ deliberate.
 - The accepted metadata leak is real and permanent for a relay that cannot decrypt; padding is out of
   scope.
 - §1 does not isolate audio from video at the congestion-control layer.
-- MLS costs a WASM crate, a new compilation target in the validation pipeline, an ADR-0027 amendment
-  for HPKE, and key material transiting WASM linear memory where a pure-WebCrypto alternative could
-  have kept it in a non-extractable handle (§4).
+- **MC, and therefore the operator, can read live media.** Accepted as the user's risk decision under
+  ADR-0024 §5.7; MH, transport, and storage cannot, and nothing may describe the result as zero-trust
+  or end-to-end against the operator (§4).
+- In-band key carriage adds ~50 bytes to every audio frame (§4).
+- A departed participant retains working keys until the debounced KEK rotation lands. Bounded, stated,
+  and inert against anything but ciphertext obtained outside the media path (§4).
 - Multi-handler send costs N× client uplink and can reduce aggregate goodput on a constrained link.
 
 ### Open items — carried deliberately, not resolved
@@ -1174,7 +1227,7 @@ deliberate.
   default **fails closed, deliberately low**, chosen by the asymmetry of the error: under-estimating
   costs money linearly and visibly, over-estimating saturates the interface, degrades every stream at
   once, and fires the alert at a percentage of a fiction. MH logs the derived subscriber ceiling
-  loudly at startup. Operations owns a measured figure as a dated node-pool sizing follow-up. **The
+  loudly at startup. A measured figure requires a production deployment and does not yet exist. **The
   tell that this is likely rather than pessimistic: it is the failure this debate found, and the fix
   reproduces its precondition.**
 - **No end-to-end test exercises the recovery machinery.** Drain, re-assert, convergence from an
@@ -1204,55 +1257,72 @@ deliberate.
 |---|---|
 | `ARCHITECTURE.md:253,276,283,289,293` | QUIC datagrams throughout → hybrid per §1 |
 | `ARCHITECTURE.md:24` | The join-to-media target is an objective, never a gate |
-| `ARCHITECTURE.md:851-857` | Key distribution per the §4 branch chosen |
+| `ARCHITECTURE.md:851-857` | Key distribution per §4: MC-issued KEK, in-band transmit keys, operator custody stated |
 | ADR-0028, "bidirectional datagrams" | Not a coherent construct; superseded by §1 |
-| ADR-0011, handler jitter objective | **Unmeasurable** — MH forwards and does not buffer; perceived jitter is a client-side jitter-buffer property and jitter-buffer design is out of scope. Struck, with a client-side successor deferred to the resilience story |
+| ADR-0028 §4, 42-byte header and 64-bit user id | Superseded by §2's header and §3's attribution model |
+| ADR-0028 §5, replay counter "per-sender" | Now per (sender, stream) — §2's per-stream sequence and §4's per-stream key derivation |
+| ADR-0028 §5, "AES-256-GCM" | Unchanged — §4 states AES-256-GCM per ADR-0027; AES-128-GCM remains permitted only for SFrame interop |
+| ADR-0028 §5, rotation on manual request and hourly | Superseded by §4's rotation table: senders rotate transmit keys on every video group and every T for audio because rotation is free; MC rotates the KEK on departure, debounced to W |
+| ADR-0028 §5, MLS for key management | **Superseded.** §4 uses an MC-issued meeting KEK with sender transmit keys carried in-band. MLS's efficient rekey is bought by making every join a synchronous global barrier, which is the direct negation of the join goals |
+| ADR-0011, handler jitter objective | **Unmeasurable** — MH forwards and does not buffer; perceived jitter is a client-side jitter-buffer property and jitter-buffer design is out of scope. Struck, with a client-side successor deferred with jitter-buffer design |
 | ADR-0011, handler forwarding latency objective | No defined measurement point; redefined as ingress-read-complete → egress-enqueued |
 | ADR-0012:388-389 | Thresholds already mandated but unimplementable; the bandwidth indicator in §11 makes them real |
-| ADR-0027 | Approve a second crypto stack for the end-to-end path — MLS requires HPKE, which `ring` does not implement |
+| ADR-0027 | **No amendment needed** — AES-256-GCM, HKDF and Ed25519 are all already approved |
 | `docs/observability/slos.md` | Referenced by ADR-0011 and does not exist; created |
 | `docs/PROJECT_STATUS.md` | Badly stale — lists MH as a skeleton and GC/MC as planned; corrected |
+
+### Assumptions that must be validated before the wire format is frozen
+
+The design rests on four claims that are falsifiable and have not been measured. Each has a named
+experiment; the header is not frozen in code until they have run.
+
+1. **Fan-out spike**, handler server half and browser client half in one harness through the
+   transport seam, swept at fan-out **with a slow-subscriber arm**. Its job is to **validate
+   one-group-per-stream and establish the application bound**, not to choose the shape — the
+   granularity is decided in §1 by dependency alignment, which is a design argument rather than an
+   empirical one. Running at full speed with fast readers will not find the ceiling; the binding
+   quantity is **concurrent unfinished groups under receiver backpressure**, not raw open rate. Keep
+   a per-frame arm only as a control, to confirm the churn argument holds in practice.
+2. **Capture-resistance selector test**, pure logic, no media: scripted speaker turns with crosstalk
+   and near-threshold flapping; assert correct selection with zero control round trips **and** that a
+   participant declaring maximum salience cannot outrank a higher priority group.
+3. **Contended-counter benchmark**: a shared cached counter versus per-stream sharding at increasing
+   thread counts. Low cardinality means every stream hits the same atomic — a tension inside the
+   telemetry design, named rather than assumed away.
+4. **Insider-forgery regression test**, in the test-vector harness: one participant encrypts under
+   another's key id, and the test asserts the receiver **rejects the frame** rather than attributing
+   it. It is the test that proves the signature layer is load-bearing rather than decorative.
+
+### Ordering constraints that follow from the design
+
+- **Test vectors and the header precede the forward path.** Vectors are the drift guard between the
+  two codecs (§2); a forward path written against an unfrozen header is written against nothing.
+- **The transport seam precedes the ingress and egress loops.** Cheap against nothing, expensive
+  against concrete types (§10).
+- **The KEK-source seam precedes any key work.** It is what keeps a future key server additive (§4).
+- **Every runbook an alert cites exists when the alert lands**, because alert validation requires
+  every runbook reference to resolve to a file (§11).
 
 ### Explicitly out of scope
 Simulcast and scalable coding; quality adaptation; forward error correction, retransmission, and
 jitter-buffer design; handler-to-handler cascade; recording and transcription; screen share as a
 shipped feature; codec negotiation beyond a v1 default; asymmetric per-edge permissions.
 
-**Flagged for separate audit, not this story**: a participant-level registration RPC and its
+**Flagged for separate audit**: a participant-level registration RPC and its
 connection-token response field may be dead in the same way a previously removed token pattern was.
 
 ---
 
 ## Participants
 
-| Specialist | Final | Contribution |
-|---|---|---|
-| observability | 97 | The zero-allocation invariant, the cardinality budget, and the coverage-demonstrated principle; disproved a guard it had itself advocated |
-| media-handler | 97 | Buffer-sharing fan-out; behaviours-not-types survived contact with the control plane; conceded the control-plane shape when its premises reversed |
-| test | 96 | Three-tier gating, latency observed-never-gated, the control-plane gates, both seams as first-story work |
-| meeting-controller | 96 | The control plane, multi-handler assignment as a clusterless pure function, distinguishable slot states |
-| client | 96 | The frame format, a worker-isolated receive pipeline, three-branch sizing; browser APIs verified rather than asserted |
-| protocol | 95 | The header, the identifier model, and the complete wire draft |
-| operations | 94 | Six numbered requirements; found the restart blackhole, the transport defaults, and the dead alert selectors |
-| security | 90 | Overturned the attribution claim; the three-way key-distribution analysis with sizing; the telemetry conditions |
-| auth-controller | post-debate review | Found that the meeting token cannot be the peer-verified credential; identified the missing client→GC request body; established that no signing-key revocation path exists |
+Decided by media-handler, meeting-controller, protocol, client, security, test, observability, and
+operations, with auth-controller reviewing §4 after the debate closed. Satisfaction scores,
+per-specialist contributions, and the record of positions changed during the debate are in
+`docs/debates/2026-08-23-media-flow/debate.md`, not here.
 
-Security scored 90 conditional on the key-distribution choice landing on a genuinely end-to-end
-option, and 62 had a provider that lets MC decrypt been shipped to a real environment — a decision
-that under ADR-0024 §5.7 would have required explicit user risk acceptance rather than majority
-override. **The user selected MLS**, so the conditional resolves at 90.
-
-**Notable self-corrections**, recorded because they are why this converged rather than being
-negotiated: security withdrew its own rotation-debounce recommendation and reversed its dismissal of
-pairwise sealing, which became its second choice; media-handler retracted a proposal to defer multi-handler
-support, then conceded the control-plane shape; operations withdrew a field, later reinstated it for
-a case it had missed, corrected its own runbook claim, retracted most of its own requirement when the
-design changed beneath it, and corrected its own escalation as a stale read; observability revised
-its attribution mechanism and disproved a guard it had spent two rounds advocating; client conceded
-the timestamp argument and corrected its own cost claim as an overreach; the control-plane shape
-moved four times, each move adding a real constraint. The team lead was wrong three times —
-asserting the attribution property was unforgeable, asserting the codec avoided copying, and
-understating the audio signature overhead by half — and all three are corrected here.
+**Operator access to live media is accepted risk, recorded as the user's under ADR-0024 §5.7 rather
+than a majority override.** Security's position was that any design under which an operator service
+can read media requires that acceptance explicitly; it was given, and §4 records the grounds.
 
 ---
 
@@ -1261,7 +1331,8 @@ understating the audio signature overhead by half — and all three are correcte
 Protocol holds the full text; this is the shape.
 
 **Frame header** — a binary codec in `media-protocol`, not protobuf. Version 2. Layout and the
-publisher/relay boundary per §2. The signature (§3) trails the payload and covers the publisher
+publisher/relay boundary per §2, including the key-bearing flag and the wrapped-transmit-key field it
+announces in the publisher region. The signature (§3) trails the payload and covers the publisher
 region and payload; the payload extent comes from the header's length field (§2), which is what
 delimits frames sharing a group's stream.
 Flags decode rejects any bit beyond those defined. A maximum-payload constant is enforced
@@ -1271,10 +1342,12 @@ pre-allocation in both languages. Decode slices rather than copies.
 single-key encryption message. Add: a receive-capability declaration with per-slot media kind and
 optional pin; a slot-state enum with the seven states of §6; a send directive listing streams to
 produce, each with encoding parameters and a target set carrying transport mode; a stream assignment
-carrying participant identity, media kind, handler address, and slot state; and an opaque
-key-distribution message pair. The roster gains, per participant, an AC-attested identity public key
-— client-validated, never trusted from MC — and the media key identifiers in use, with a bounded
-retention window for overlapping epochs.
+carrying participant identity, media kind, handler address, and slot state; the meeting KEK
+and its generation in the join response; and a KEK-push server message carrying a new KEK and
+generation on rotation. The roster gains, per participant, an AC-attested identity public key —
+client-validated, never trusted from MC. **No key material rides on the roster.** The existing host-mute request message is **renamed to
+server mute** per §5's terminology; it is the same message, and the rename should land with the other
+signalling changes rather than separately.
 
 **Internal contract** — delete the routing RPC and its transcode and mix options, which describe a
 transcoding-mixer relay that cannot exist under end-to-end encryption and is called from nowhere.
@@ -1284,6 +1357,9 @@ and server mute — plus a generation derived from assignment output change. Its
 handler identifier, a process-start epoch, and the **applied** generation. A slot-state notification
 carries §6's states plus §7's switch-completion reports keyed by command identifier, debounced by MH.
 
-**The key carrier is opaque to MC.** The key-distribution message pair carries MLS handshake bytes
-that MC relays without interpreting, which is what keeps MC an ordered relay rather than a
-participant (§4).
+**Transmit keys ride in frames, not in signalling.** The publisher region gains a **key-bearing**
+flag and, when set, a fixed-size wrapped transmit key — AES-256-GCM under the meeting KEK, nonce
+derived from the key id, key id as associated data, carrying the KEK generation — on the first N
+frames of every video group and on every audio frame (§4). It is signed; MH forwards it unchanged.
+**No key material crosses the MC→MH contract**, and the credential-leak guard covers KEK and
+transmit-key material in internal messages and logs.
