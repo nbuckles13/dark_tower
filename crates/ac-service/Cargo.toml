@@ -66,7 +66,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 http-body-util = "0.1"
 
 # Metrics testing
-metrics-util = "0.18"
+metrics-util = "0.20"
 
 # Benchmarking
 criterion = { workspace = true }

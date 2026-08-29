@@ -77,7 +77,7 @@ http-body-util = "0.1"
 wiremock = "0.6"
 futures = "0.3"
 tower = { workspace = true, features = ["util"] }
-metrics-util = "0.18"
+metrics-util = "0.20"
 # Re-export for integration tests (metrics-exporter-prometheus is also in deps)
 metrics-exporter-prometheus = "0.16"
 # JWT/base64 used in test code (auth_layer async_tests)
