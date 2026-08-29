@@ -36,7 +36,7 @@ bcrypt = { workspace = true }
 jsonwebtoken = { workspace = true }
 
 # Additional dependencies for auth controller
-base64 = "0.21"
+base64 = "0.23"
 
 # Metrics (ADR-0011 Observability)
 metrics = "0.24"

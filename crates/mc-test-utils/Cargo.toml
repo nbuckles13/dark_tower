@@ -37,7 +37,7 @@ bytes = { workspace = true }
 
 # Cryptography for test fixtures
 ring = { workspace = true }
-base64 = "0.22"
+base64 = "0.23"
 
 # JWT test utilities (Ed25519 signing, JWKS mocking)
 wiremock = "0.6"
