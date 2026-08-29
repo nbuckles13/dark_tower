@@ -40,8 +40,8 @@ import {
   waitForParticipantLeft,
 } from './fixtures.js';
 import {
-  mcConnectedStatusSum,
-  mcParticipantLeavesSum,
+  mcConnectedStatusByInstance,
+  mcParticipantLeavesByInstance,
   waitForMcConnectedStatusAbove,
   waitForMcParticipantLeavesAbove,
 } from './mcMetrics.js';
@@ -63,7 +63,7 @@ test.describe('join happy path (R-40/R-44/R-46)', () => {
     const recorder = recordRequests(page.context());
     // Assertion (d) baseline: captured immediately before the join action
     // (narrowest false-pass window — @test Gate 1 refinement).
-    const mcStatusBaseline = await mcConnectedStatusSum();
+    const mcStatusBaseline = await mcConnectedStatusByInstance();
 
     // --- Token-based join (NO login step) ---
     await joinAsUser(page, meetingCode);
@@ -168,7 +168,7 @@ test.describe('join happy path (R-40/R-44/R-46)', () => {
       await expectRosterShows(page, departedId, SHARED_USER.displayName);
 
       // Departure baseline captured immediately before the leave gesture.
-      const leavesBaseline = await mcParticipantLeavesSum();
+      const leavesBaseline = await mcParticipantLeavesByInstance();
 
       // Drive the demo's OWN teardown for a DETERMINISTIC clean close: navigating
       // away from the join view unmounts JoinMeeting → onDestroy →
