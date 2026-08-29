@@ -44,7 +44,7 @@ import {
   recoverByJoining,
   rewriteJoinResponseMeetingId,
 } from './fixtures.js';
-import { mcSessionJoinFailureSum, waitForMcSessionJoinFailureAbove } from './mcMetrics.js';
+import { mcSessionJoinFailureByInstance, waitForMcSessionJoinFailureAbove } from './mcMetrics.js';
 
 test.describe('MC token rejection (R-45)', () => {
   test('MC rejects a join whose meeting_id does not match the token claim, surfacing a typed SignalingError', async ({
@@ -62,7 +62,7 @@ test.describe('MC token rejection (R-45)', () => {
     // Counter baseline captured immediately before the join action (narrowest
     // false-pass window; `> baseline` on a monotonic counter is safe under
     // concurrent suites — see mcMetrics.ts header).
-    const baseline = await mcSessionJoinFailureSum('jwt_validation');
+    const baseline = await mcSessionJoinFailureByInstance('jwt_validation');
 
     await joinAsUser(page, meetingCode);
 

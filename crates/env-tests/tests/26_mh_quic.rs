@@ -53,6 +53,9 @@ use bytes::{BufMut, BytesMut};
 use env_tests::cluster::ClusterConnection;
 use env_tests::fixtures::auth_client::UserRegistrationRequest;
 use env_tests::fixtures::gc_client::{CreateMeetingRequest, GcClient, JoinMeetingResponse};
+use env_tests::fixtures::metrics::{
+    format_instance_map, instance_maps_equal, poll_until_any_instance_above, InstanceCounters,
+};
 use env_tests::fixtures::{AuthClient, PrometheusClient};
 use prost::Message;
 use std::time::Duration;
@@ -259,12 +262,31 @@ async fn assert_mh_rejects(mh_url: &str, jwt: &str) {
 // Prometheus delta helpers for tests 4 & 5.
 // ----------------------------------------------------------------------------
 
-/// Wait for the cluster-wide `mc_mh_notifications_received_total{event_type=...}`
-/// counter to stabilize: two consecutive reads (with a Prometheus scrape interval
-/// gap) returning the same value. Closes the cross-test race where leftover
-/// signals from a predecessor test (under the same `#[serial]` group) might
-/// still be in flight to Prometheus when the next test snapshots its baseline.
-/// After this returns, baseline-reads are safe.
+/// The per-instance PromQL for `mc_mh_notifications_received_total` — the ONE
+/// string source shared by the reader, the stabilize loop, and the delta
+/// assert, so those three cannot disagree on the query.
+fn notification_promql(event_type: &str) -> String {
+    format!(
+        r#"sum by (instance) (mc_mh_notifications_received_total{{event_type="{event_type}"}})"#
+    )
+}
+
+/// Wait for the PER-INSTANCE `mc_mh_notifications_received_total{event_type=...}`
+/// snapshot to stabilize: two consecutive reads (a Prometheus scrape interval
+/// apart) returning the SAME per-instance map. Closes the cross-test race where
+/// leftover signals from a predecessor test (under the same `#[serial]` group)
+/// might still be in flight to Prometheus when the next test snapshots its
+/// baseline. After this returns, baseline-reads are safe.
+///
+/// Per-instance treatment IS needed here, not only in the delta assert: the
+/// in-flight-increment race the stabilize guards against is per-pod, and
+/// comparing whole per-instance maps ([`instance_maps_equal`]) is ALSO
+/// churn-robust — if a stale old-pod series expires between the two reads the
+/// maps differ and we retry, and once the expired series is gone from both
+/// reads the maps match. (A cluster-wide scalar would self-heal the same way,
+/// but re-introduces the cross-pod `sum` this fix exists to remove; comparing
+/// maps keeps ONE idiom across the counter-delta helpers.) Fail-loud on a
+/// Prometheus query error is inherited from `instance_counter_map`.
 ///
 /// Budget: up to 90s. The chain that has to settle is MH's fire-and-forget
 /// `tokio::spawn(notify)` → gRPC RPC → MC counter increment → Prometheus scrape
@@ -278,65 +300,65 @@ async fn wait_for_notification_counter_stable(prom: &PrometheusClient, event_typ
         // outstanding scrape lands between v1 and v2.
         tokio::time::sleep(Duration::from_secs(16)).await;
         let v2 = mh_notification_counter(prom, event_type).await;
-        if (v1 - v2).abs() < f64::EPSILON {
+        if instance_maps_equal(&v1, &v2) {
             return;
         }
         if std::time::Instant::now() > deadline {
             panic!(
                 "mc_mh_notifications_received_total{{event_type=\"{event_type}\"}} \
-                 did not stabilize within 90s (last reads: v1={v1}, v2={v2})"
+                 per-instance snapshot did not stabilize within 90s \
+                 (last reads: v1={}, v2={})",
+                format_instance_map(&v1),
+                format_instance_map(&v2),
             );
         }
     }
 }
 
-/// Poll until `mc_mh_notifications_received_total{event_type=...}` exceeds
-/// `baseline`. Budget: 60s — 2x `MetricsScrape` to absorb the MH spawn-task
-/// + gRPC + MC handler + scrape chain under cluster load.
+/// Poll until SOME currently-present instance's
+/// `mc_mh_notifications_received_total{event_type=...}` value exceeds its OWN
+/// `baseline` value. Robust to a pod rollover (a fresh post-rollover pod passes
+/// once its value exceeds zero; an expired old-pod series can't inflate anything
+/// because the comparison never sums across pods). The loop itself is the shared
+/// [`poll_until_any_instance_above`] so this and the participant-status assert
+/// cannot drift in budget/ordering/message-shape. Budget: 60s — 2x
+/// `MetricsScrape` for the MH spawn-task + gRPC + MC handler + scrape chain.
 async fn assert_notification_counter_increases_past(
     prom: &PrometheusClient,
     event_type: &str,
-    baseline: f64,
+    baseline: &InstanceCounters,
 ) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
-    loop {
-        let current = mh_notification_counter(prom, event_type).await;
-        if current > baseline {
-            return;
-        }
-        if std::time::Instant::now() > deadline {
-            panic!(
-                "mc_mh_notifications_received_total{{event_type=\"{event_type}\"}} \
-                 did not increase above baseline {baseline} within 60s \
-                 (last observed: {current})"
-            );
-        }
-        tokio::time::sleep(Duration::from_secs(2)).await;
-    }
+    poll_until_any_instance_above(
+        prom,
+        &notification_promql(event_type),
+        baseline,
+        Duration::from_secs(60),
+        Duration::from_secs(2),
+        |current| {
+            format!(
+                "mc_mh_notifications_received_total{{event_type=\"{event_type}\"}} did not increase \
+                 past baseline on any instance within 60s (baseline: {}, last observed: {})",
+                format_instance_map(baseline),
+                format_instance_map(current),
+            )
+        },
+    )
+    .await;
 }
 
-/// Read the cluster-wide value of `mc_mh_notifications_received_total` for a
-/// specific `event_type` label. Uses `sum(...)` for replica-robustness per
-/// @observability plan-stage guidance.
+/// Read a PER-INSTANCE snapshot of `mc_mh_notifications_received_total` for a
+/// specific `event_type` label, via `sum by (instance)(...)`.
 ///
-/// Returns 0.0 if the counter has not yet been observed (Prometheus returns
-/// no result for an empty series).
-async fn mh_notification_counter(prom: &PrometheusClient, event_type: &str) -> f64 {
-    let promql = format!(
-        r#"sum(mc_mh_notifications_received_total{{event_type="{}"}})"#,
-        event_type
-    );
-    let response = match prom.query_promql(&promql).await {
-        Ok(r) => r,
-        Err(_) => return 0.0,
-    };
-    response
-        .data
-        .result
-        .first()
-        .and_then(|r| r.value.as_ref())
-        .and_then(|(_, v)| v.parse::<f64>().ok())
-        .unwrap_or(0.0)
+/// See [`InstanceCounters`] for why the grouping label is `instance` (pod
+/// IP:port, fresh on every rollover) and the two traps that keep it
+/// load-bearing (the `pod` label lives only in the logs/Loki pipeline; a future
+/// `labelmap` in the metrics scrape config would silently break this). FAILS
+/// LOUDLY on a Prometheus query error (naming the PromQL + error); an empty
+/// result (counter not yet observed) is a legitimate empty map — a per-pod zero
+/// distinct from a failed query (docs/TODO.md §Env-Test Resilience, defect #2).
+async fn mh_notification_counter(prom: &PrometheusClient, event_type: &str) -> InstanceCounters {
+    prom.instance_counter_map(&notification_promql(event_type))
+        .await
 }
 
 // ============================================================================
@@ -646,8 +668,9 @@ async fn test_mh_connect_increments_mc_notification_metric_connected() {
 
     // Cross-test stabilization (mirrors test 5's pattern): wait for any in-flight
     // connect signal from a sibling test under the same `#[serial(mh_notifications)]`
-    // group to finish scraping before we snapshot baseline. Use `sum()` so
-    // multi-replica MC scaling returns a single scalar.
+    // group to finish scraping before we snapshot baseline. Baseline is a
+    // per-instance map (`sum by (instance)`), robust to a mid-assertion pod
+    // rollover — see the helper docs.
     wait_for_notification_counter_stable(&prom, "connected").await;
     let baseline = mh_notification_counter(&prom, "connected").await;
 
@@ -665,7 +688,7 @@ async fn test_mh_connect_increments_mc_notification_metric_connected() {
     // The connect notification fires from MH best-effort fire-and-forget after
     // JWT validation. The chain is MH spawn-task → gRPC to MC → MC counter →
     // Prometheus scrape (15s SLA). 60s budget absorbs cluster-load variance.
-    assert_notification_counter_increases_past(&prom, "connected", baseline).await;
+    assert_notification_counter_increases_past(&prom, "connected", &baseline).await;
 }
 
 /// Test: After a client cleanly disconnects a WebTransport session from MH,
@@ -715,57 +738,61 @@ async fn test_mh_disconnect_increments_mc_notification_metric_disconnected() {
         .expect("client send.finish() should succeed");
     drop(conn);
 
-    assert_notification_counter_increases_past(&prom, "disconnected", baseline).await;
+    assert_notification_counter_increases_past(&prom, "disconnected", &baseline).await;
 }
 
 // ============================================================================
 // Scenario 7 (R-60 MC half): MediaConnectionUpdate → mc_participant_mh_status_total
 // ============================================================================
 
-/// Read the cluster-wide value of `mc_participant_mh_status_total` for a
-/// specific `state` label. `sum(...)` for replica-robustness (mirrors
-/// [`mh_notification_counter`]). Returns 0.0 for an as-yet-unobserved series.
-async fn mc_participant_mh_status_counter(prom: &PrometheusClient, state: &str) -> f64 {
-    let promql = format!(
-        r#"sum(mc_participant_mh_status_total{{state="{}"}})"#,
-        state
-    );
-    let response = match prom.query_promql(&promql).await {
-        Ok(r) => r,
-        Err(_) => return 0.0,
-    };
-    response
-        .data
-        .result
-        .first()
-        .and_then(|r| r.value.as_ref())
-        .and_then(|(_, v)| v.parse::<f64>().ok())
-        .unwrap_or(0.0)
+/// The per-instance PromQL for `mc_participant_mh_status_total` — the ONE string
+/// source shared by the reader and the delta assert.
+fn participant_mh_status_promql(state: &str) -> String {
+    format!(r#"sum by (instance) (mc_participant_mh_status_total{{state="{state}"}})"#)
 }
 
-/// Poll until `mc_participant_mh_status_total{state=...}` exceeds `baseline`.
+/// Read a PER-INSTANCE snapshot of `mc_participant_mh_status_total` for a
+/// specific `state` label, via `sum by (instance)(...)`. Mirrors
+/// [`mh_notification_counter`]; see [`InstanceCounters`] for the `instance`
+/// grouping rationale + the two traps. FAILS LOUDLY on a Prometheus query
+/// error; an empty result (state not yet observed) is a legitimate empty map
+/// (per-pod zero), distinct from a failed query.
+async fn mc_participant_mh_status_counter(
+    prom: &PrometheusClient,
+    state: &str,
+) -> InstanceCounters {
+    prom.instance_counter_map(&participant_mh_status_promql(state))
+        .await
+}
+
+/// Poll until SOME currently-present instance's
+/// `mc_participant_mh_status_total{state=...}` value exceeds its OWN `baseline`
+/// value — robust to a pod rollover, via the shared
+/// [`poll_until_any_instance_above`] (same loop as
+/// [`assert_notification_counter_increases_past`], so the two cannot drift).
 /// Budget: 60s — the chain is WT frame → MC bridge-loop decode → participant
-/// actor record → counter → Prometheus scrape (15s SLA), same shape as the
-/// notification-counter assertion.
+/// actor record → counter → Prometheus scrape (15s SLA).
 async fn assert_participant_mh_status_increases_past(
     prom: &PrometheusClient,
     state: &str,
-    baseline: f64,
+    baseline: &InstanceCounters,
 ) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
-    loop {
-        let current = mc_participant_mh_status_counter(prom, state).await;
-        if current > baseline {
-            return;
-        }
-        if std::time::Instant::now() > deadline {
-            panic!(
-                "mc_participant_mh_status_total{{state=\"{state}\"}} did not increase above \
-                 baseline {baseline} within 60s (last observed: {current})"
-            );
-        }
-        tokio::time::sleep(Duration::from_secs(2)).await;
-    }
+    poll_until_any_instance_above(
+        prom,
+        &participant_mh_status_promql(state),
+        baseline,
+        Duration::from_secs(60),
+        Duration::from_secs(2),
+        |current| {
+            format!(
+                "mc_participant_mh_status_total{{state=\"{state}\"}} did not increase past baseline \
+                 on any instance within 60s (baseline: {}, last observed: {})",
+                format_instance_map(baseline),
+                format_instance_map(current),
+            )
+        },
+    )
+    .await;
 }
 
 /// Test: after a client joins MC and sends a
@@ -897,7 +924,7 @@ async fn test_mc_media_connection_update_increments_participant_mh_status_metric
 
     // Keep the connection alive long enough for MC's bridge loop to read the
     // frame before we let `conn` drop at end of scope.
-    assert_participant_mh_status_increases_past(&prom, "connected", baseline).await;
+    assert_participant_mh_status_increases_past(&prom, "connected", &baseline).await;
     drop(conn);
 }
 
