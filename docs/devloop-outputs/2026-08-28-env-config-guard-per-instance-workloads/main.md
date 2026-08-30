@@ -28,7 +28,7 @@
 | Phase | `complete` |
 | Implementer | `implementer` (infrastructure, opus) |
 | Implementing Specialist | `infrastructure` |
-| Iteration | `1` |
+| Iteration | `2` (iteration 2 = re-validation only, no code change — see §Iteration 2) |
 | Security | `security` |
 | Test | `test` |
 | Observability | `observability` |
@@ -1254,3 +1254,94 @@ gate is real.
 editing cost @test a full 15-reversion mutation sweep against bytes that were stale before they
 finished. The fix is batch-declare-stop. Relatedly: a peer relaying that the Lead authorized
 something is not the Lead authorizing it — confirming directly delayed one edit and was worth it.
+
+---
+
+## Iteration 2 — 2026-08-30, re-validation after a runner-gate escalation
+
+**Why this iteration exists, and what it is NOT.** Iteration 1 completed every phase of this
+skill: Gate 1 confirmed, Gate 2 green on the committed bytes, Gate 3 approved with all seven
+verdicts, and the work committed as `1c77948`. The task nevertheless went back to `pending`,
+because the **story runner's own post-devloop gate** — a separate `layer-all.sh` run the runner
+performs after the devloop returns — came back red:
+
+```
+/tmp/devloop/story-runner/2026-08-27-hear-yourself-through-handler/task-1.runner-escalation.20260828T224105Z.json
+  {"reason":"pipeline-red-layer7"}
+  crates/env-tests/tests/26_mh_quic.rs
+    test_mc_media_connection_update_increments_participant_mh_status_metric ... FAILED
+  STATUS=FAIL REASON=env-tests-failed
+```
+
+That is the *same* `26_mh_quic` counter-baseline flake this devloop had already met at Gate-2
+attempt 3, ruled operator-lane on the reproduce-on-retry discriminator, and filed as occurrence 2
+against `docs/TODO.md` §Env-Test Resilience (see §Gate-2 attempt history above). Its defer trigger
+fired, and the follow-up landed in the very next commit — `3bdfd82`, "Make Layer-7 counter-delta
+assertions robust to pod rollovers; fail loud on Prometheus query errors". So the escalation was
+never about this changeset; it was about the assertion style of a test in another crate, and the
+cause was removed before this iteration began.
+
+**No new implementation, therefore no new review.** The task's substantive files are
+byte-identical to what Gate 3 cleared:
+
+```
+$ git diff --name-only 1c77948..HEAD -- crates/dt-guard/ infra/services/mh-service/ docs/DEVELOPMENT.md
+(empty)
+```
+
+`3bdfd82` did touch `docs/TODO.md` and `docs/runbooks/devloop-validation.md`, but only to add its
+own L7-flake entries; this devloop's Observability-Debt and runbook rows are intact (the four keys
+still appear verbatim at `docs/TODO.md:266`). Re-spawning the seven-reviewer panel over an unchanged
+diff would have produced seven verdicts about bytes already carrying seven verdicts — theatre of
+exactly the kind §"The finding that outranks the task" is about. The Recovery clause of the devloop
+skill directs a relaunched task to "finish the incomplete phases"; none were incomplete. What was
+owed was the gate that had actually failed, re-run.
+
+**Gate 2 — re-run in full, this iteration (`./scripts/layer-all.sh`, unattended run-all).**
+Read from `/tmp/devloop/gate2-verdict`, not from an exit status:
+
+```
+SCHEMA=gate2-verdict/v1
+GATE2=PASS
+LAYER_ALL_EXIT=0
+HEAD=3bdfd82f821e336fe4c89b9d7c67efc3af4e8865
+BASE_REF=0216eab9c0a47b7d69b1e551001790328d131d32
+RUN_AT=2026-08-30T20:13:06Z
+LAYER 1 OK  3
+LAYER 2 OK  1
+LAYER 3 OK  18
+LAYER 4 N/A 182  passed=3425 failed=0 ignored=38 filtered=0
+LAYER 5 OK  2
+LAYER 6 N/A 0
+LAYER 7 OK  242
+```
+
+A grep for `STATUS=(FAIL|PRECONDITION_FAILURE|UNKNOWN|FAIL-MISSING-VERB)` and
+`RESULT=(FAIL|NOT-RUN)` over the run's logs returns **0**. The two `N/A` aggregates are the same
+documented intentional-gap cases as iteration 1 (proto placeholder wrappers; the Layer-6
+dep-manifest gate). Layer 7 ran both Phase-2 suites and both passed — `STATUS=OK
+REASON=env-tests-passed` and `STATUS=OK REASON=browser-e2e-passed` (`/tmp/devloop/layer-7.log:489`,
+`:519`) — including the `26_mh_quic` test whose failure caused the escalation.
+
+**The control itself, re-exercised on the real tree:**
+
+```
+$ ./scripts/guards/simple/validate-env-config.sh
+STATUS=OK REASON=env-config-clean-4-services-6-workloads
+```
+
+Six workloads — `ac` statefulset, `gc` deployment, `mc-0`, `mc-1`, `mh-0`, `mh-1` — against the
+pre-fix `env-config-clean-4-services`, which counted four services while silently skipping two of
+them. The number in the status line is now the number actually checked, which was the point.
+
+**Lead-side note, in the spirit of iteration 1's instrumentation defect.** This iteration's
+`layer-all.sh` invocation was backgrounded with its stdout redirected to a log that came back
+**twelve bytes long** — just the trailing `REAL_EXIT=0` the Lead had appended. The harness reported
+"exit code 0". Taking either signal as the verdict would have declared Gate 2 green on a log
+containing no evidence that any layer ran — the seventh instance of this devloop's own defect, and
+the second to originate with the Lead. The verdict above was instead read from
+`/tmp/devloop/gate2-verdict` and the per-layer logs, whose timestamps (20:05–20:13) and contents
+show the run really happened. An empty log is not a passing log.
+
+**Outcome**: no code change was required or made in iteration 2. This commit records the
+re-validation so the runner's next gate has a moved HEAD and the story can proceed.
