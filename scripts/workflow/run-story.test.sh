@@ -546,13 +546,23 @@ cat > "$TEMPLATE/scripts/workflow/preflight-story.sh" <<'STUB'
 exit "${FAKE_PREFLIGHT_RC:-0}"
 STUB
 
-# Stub layers: per-layer rc injection, each dropping a ran-marker.
+# Stub layers: per-layer rc injection, each dropping a ran-marker. When a layer
+# is red AND FAKE_LAYER_FAIL_STATUS is set, it also emits a
+# `STATUS=FAIL REASON=<value>` line — the layer-script contract's real shape,
+# needed so the escalation gate log carries a REASON tail for --restart to splice
+# into the operator paragraph. This goes to the layer's STDOUT, which the runner
+# redirects into the per-task gate LOG file (never the test's own stdout), so it
+# is not a STATUS vote in this suite's Layer-3 verdict (see coupling #1 above).
 for n in 1 2 3 4 5 6 7; do
   cat > "$TEMPLATE/scripts/layer${n}.sh" <<STUB
 #!/usr/bin/env bash
 : >> "\${DEVLOOP_TEST_MARKERS}/ran.layer${n}"
 printf 'fixture layer${n} output\n'
-exit "\${FAKE_LAYER${n}_RC:-0}"
+__rc="\${FAKE_LAYER${n}_RC:-0}"
+if [ "\$__rc" -ne 0 ] && [ -n "\${FAKE_LAYER_FAIL_STATUS:-}" ]; then
+  printf 'STATUS=FAIL REASON=%s\n' "\${FAKE_LAYER_FAIL_STATUS}"
+fi
+exit "\$__rc"
 STUB
 done
 cat > "$TEMPLATE/scripts/layer-all.sh" <<'STUB'
@@ -610,18 +620,29 @@ run_story() {
     if [ "$seen_sep" -eq 1 ]; then args+=("$a"); else env_kv+=("$a"); fi
   done
 
-  FIX="$(mktemp -d "${WORK}/fix.XXXXXX")"
-  cp -a "${TEMPLATE}/." "${FIX}/"
-  DT="$(mktemp -d "${WORK}/dt.XXXXXX")"
-  MARK="$(mktemp -d "${WORK}/mark.XXXXXX")"
-  # Optional fixture corruption, applied AFTER the copy and BEFORE the runner —
-  # the only window for defects the runner hits before it invokes any stub.
-  if [ -n "${FIXTURE_PRERUN:-}" ]; then "$FIXTURE_PRERUN" "$FIX"; fi
-  # Optional pre-seeded resume pointer, for the branches that read $slug_file
-  # on entry rather than writing it.
-  if [ -n "${SEED_SLUG:-}" ]; then
-    mkdir -p "$(RUN_DIR_OF "$DT")"
-    printf '%s\n' "$SEED_SLUG" > "$(RUN_DIR_OF "$DT")/task-1.slug"
+  if [ -n "${REUSE_FIXTURE:-}" ]; then
+    # SECOND invocation against the SAME fixture + RUN_DIR as the prior run_story
+    # call (its FIX and DT globals persist), which is how the operator-retry flags
+    # are reached: an earlier run escalated a task, leaving its runner-escalation
+    # record + baseline sidecar in DT's RUN_DIR and the escalated manifest in FIX.
+    # A FRESH MARK, so per-run marker assertions (e.g. "no devloop ran on the
+    # --revalidate invocation") are not polluted by the first run's markers. The
+    # first run's EXIT trap already removed .run-in-flight, so no SEAM-RUN-DIR-IN-USE.
+    MARK="$(mktemp -d "${WORK}/mark.XXXXXX")"
+  else
+    FIX="$(mktemp -d "${WORK}/fix.XXXXXX")"
+    cp -a "${TEMPLATE}/." "${FIX}/"
+    DT="$(mktemp -d "${WORK}/dt.XXXXXX")"
+    MARK="$(mktemp -d "${WORK}/mark.XXXXXX")"
+    # Optional fixture corruption, applied AFTER the copy and BEFORE the runner —
+    # the only window for defects the runner hits before it invokes any stub.
+    if [ -n "${FIXTURE_PRERUN:-}" ]; then "$FIXTURE_PRERUN" "$FIX"; fi
+    # Optional pre-seeded resume pointer, for the branches that read $slug_file
+    # on entry rather than writing it.
+    if [ -n "${SEED_SLUG:-}" ]; then
+      mkdir -p "$(RUN_DIR_OF "$DT")"
+      printf '%s\n' "$SEED_SLUG" > "$(RUN_DIR_OF "$DT")/task-1.slug"
+    fi
   fi
   OUT="${MARK}/stdout"; ERR="${MARK}/stderr"
 
@@ -1399,5 +1420,309 @@ assert_status    "m6-unsafe-class-completes" "ALL TASKS COMPLETE" "$OUTPUT"
 #   persist_resume_pointer's git-fault WARN — a documented DELIBERATE exception
 #     to the lane rule (it must not hijack the caller's lane), where the comment
 #     is better evidence than a contrived test. @operations explicitly accepted.
+
+# =============================================================================
+# (N) OPERATOR-INTERVENTION RETRY FLAGS — --revalidate / --restart
+# =============================================================================
+# Both flags act on the escalated task the run REACHES. A run halts at its first
+# escalation; `dt-story next` reopens an escalated task on selection, so the
+# escalated task is the first the loop reaches. The state each flag keys on — a
+# prior runner-escalation record + its baseline sidecar in RUN_DIR — is created
+# by REALLY escalating a task with the runner (REUSE_FIXTURE runs a further
+# invocation against the same FIX + RUN_DIR), so the detection/refusal logic runs
+# against genuine artifacts, not a hand-seeded approximation.
+#
+# The DEFAULT_TASKS single-task fixture is loaded here (M6 did not swap it); N16
+# swaps to a two-task fixture and does not restore it, so it is LAST.
+#
+# HEADINGS use the `# Nn:` form the comment-is-not-a-case self-check greps for
+# (`^# [A-Z][0-9]+b?:`, header lines 46-52) — the earlier `# --- N1:` / `# N0a:`
+# forms were INVISIBLE to that grep, silently defeating the very control that
+# catches a heading with no assertions behind it.
+
+# N1: --revalidate + --restart are mutually exclusive (distinct token, exit 2).
+run_story -- fixture --revalidate --restart 'x'
+assert_exit   "n1-mutual-exclusion-exit2" 2 "$RC"
+assert_status "n1-mutual-exclusion-token" "REVALIDATE-WITH-RESTART" "$OUTPUT"
+
+# N2: --restart with empty text (explicit '' and missing arg) → distinct token.
+run_story -- fixture --restart ''
+assert_exit   "n2-restart-empty-exit2" 2 "$RC"
+assert_status "n2-restart-empty-token" "RESTART-EMPTY-TEXT" "$OUTPUT"
+run_story -- fixture --restart
+assert_exit   "n2-restart-missing-arg-exit2" 2 "$RC"
+assert_status "n2-restart-missing-arg-token" "RESTART-EMPTY-TEXT" "$OUTPUT"
+
+# N3: a code-fence in the restart text is refused BEFORE interpolation (fourth
+# splice site). Backtick fence would break the prompt/manifest contract.
+run_story -- fixture --restart 'here is a fence ``` that breaks things'
+assert_exit   "n3-restart-unsafe-exit2" 2 "$RC"
+assert_status "n3-restart-unsafe-token" "RESTART-UNSAFE-TEXT" "$OUTPUT"
+
+# N4: (S-3) --restart must NOT swallow a following flag as its diagnosis text —
+# that would bypass the mutual-exclusion / --stop-after handling. A flag-shaped
+# next token is refused; the mutual-exclusion check must NOT be silently skipped.
+run_story -- fixture --restart --revalidate
+assert_exit   "n4-restart-eats-flag-exit2" 2 "$RC"
+assert_status "n4-restart-eats-flag-token" "RESTART-FLAG-AS-TEXT" "$OUTPUT"
+run_story -- fixture --restart --stop-after=1
+assert_exit   "n4-restart-eats-stopafter-exit2" 2 "$RC"
+assert_status "n4-restart-eats-stopafter-token" "RESTART-FLAG-AS-TEXT" "$OUTPUT"
+# A diagnosis that genuinely starts with -- goes through the =form (accepted at
+# parse; here it reaches the NO-ESCALATED-TASK lane since the fixture is fresh).
+run_story -- fixture --restart=--weird-but-intended-diagnosis
+assert_status "n4-restart-eq-double-dash-accepted" "NO-ESCALATED-TASK" "$OUTPUT"
+assert_absent "n4-restart-eq-not-flag-as-text" "RESTART-FLAG-AS-TEXT" "$OUTPUT"
+
+# N5: (S-4) --stop-after= with an EMPTY value must still be validated (it used to
+# be silently ignored after the flag-parse refactor), and a repeated flag must be
+# refused rather than silently last-wins.
+run_story -- fixture --stop-after=
+assert_exit   "n5-stop-after-empty-exit2" 2 "$RC"
+assert_status "n5-stop-after-empty-msg" "--stop-after needs a task id" "$OUTPUT"
+run_story -- fixture --stop-after=1 --stop-after=1
+assert_exit   "n5-stop-after-dup-exit2" 2 "$RC"
+assert_status "n5-stop-after-dup-token" "DUPLICATE-FLAG" "$OUTPUT"
+run_story -- fixture --revalidate --revalidate
+assert_exit   "n5-revalidate-dup-exit2" 2 "$RC"
+assert_status "n5-revalidate-dup-token" "DUPLICATE-FLAG" "$OUTPUT"
+
+# N6: either flag on a story whose reached task was NEVER escalated → refuse
+# (NO-ESCALATED-TASK). The fresh single-task fixture has no escalation record.
+run_story -- fixture --revalidate
+assert_exit   "n6-no-escalation-revalidate-exit2" 2 "$RC"
+assert_status "n6-no-escalation-revalidate-token" "NO-ESCALATED-TASK" "$OUTPUT"
+assert_no_marker "n6-no-escalation-no-devloop" "$MARK" 'ran.claude.devloop'
+run_story -- fixture --restart 'diagnose'
+assert_exit   "n6-no-escalation-restart-exit2" 2 "$RC"
+assert_status "n6-no-escalation-restart-token" "NO-ESCALATED-TASK" "$OUTPUT"
+
+# N7: revalidate-green. A committed prior attempt (pipeline-red on layer 3, having
+# committed a devloop output dir) is re-gated; the gate now passes, so the task
+# COMPLETES, the slug is RECOVERED from the prior attempt's commit range, a
+# gate-only ZERO-cost entry is written, and NO devloop session runs.
+run_story FAKE_LAYER3_RC=1 FAKE_DEVLOOP_MKOUT=1 \
+  FAKE_DEVLOOP_MKOUT_NAME=2026-08-17-revalidate-devloop -- fixture
+assert_exit   "n7-setup-escalated-exit1" 1 "$RC"
+if [ "$(manifest_status "$FIX" 1)" = "escalated" ]; then PASS=$((PASS+1)); else
+  FAIL=$((FAIL+1)); FAILURES+=("[n7-setup-escalated] task 1 status is '$(manifest_status "$FIX" 1)', expected escalated"); fi
+REUSE_FIXTURE=1 run_story FAKE_LAYER3_RC=0 -- fixture --revalidate
+unset REUSE_FIXTURE
+assert_exit      "n7-revalidate-green-exit0" 0 "$RC"
+assert_status    "n7-revalidate-announced" "REVALIDATE task=1" "$OUTPUT"
+assert_status    "n7-revalidate-completes" "ALL TASKS COMPLETE" "$OUTPUT"
+assert_status    "n7-revalidate-slug-recovered" "slug=2026-08-17-revalidate-devloop src=commit-range" "$OUTPUT"
+assert_no_marker "n7-revalidate-no-devloop" "$MARK" 'ran.claude.devloop'
+assert_marker    "n7-revalidate-gate-ran" "$MARK" 'ran.layer7'
+if [ "$(manifest_status "$FIX" 1)" = "completed" ]; then PASS=$((PASS+1)); else
+  FAIL=$((FAIL+1)); FAILURES+=("[n7-revalidate-manifest-completed] task 1 status is '$(manifest_status "$FIX" 1)', expected completed"); fi
+n7_manifest="$(cat "${FIX}/docs/user-stories/2026-08-13-fixture.md" 2>/dev/null || true)"
+assert_status "n7-revalidate-slug-in-manifest" "slug: 2026-08-17-revalidate-devloop" "$n7_manifest"
+# F4: the gate-only entry's WHOLE POINT is zero cost (vs re-deriving the prior
+# devloop's cost from its leftover session log). Assert the shape, not just kind.
+n7_zero="$(jq -r 'select(.kind=="revalidate-gate-only") | (.usd==0 and .output_tokens==0 and .turns==0)' "$(RUN_DIR_OF "$DT")/cost-ledger.jsonl" 2>/dev/null || echo PARSE-FAILED)"
+assert_status "n7-revalidate-gate-only-zero-cost" "true" "$n7_zero"
+
+# N8: (F1) --revalidate composed with --stop-after. The revalidate-green + stop
+# branch must fire: complete the task, print STOPPED, and SKIP the story-close
+# gate (no second layer-all run). Mirrors the E-section stop-after assertions.
+run_story FAKE_LAYER3_RC=1 FAKE_DEVLOOP_MKOUT=1 \
+  FAKE_DEVLOOP_MKOUT_NAME=2026-08-17-reval-stop-devloop -- fixture
+assert_exit "n8-setup-escalated-exit1" 1 "$RC"
+REUSE_FIXTURE=1 run_story FAKE_LAYER3_RC=0 -- fixture --revalidate --stop-after=1
+unset REUSE_FIXTURE
+assert_exit      "n8-reval-stop-exit0" 0 "$RC"
+assert_status    "n8-reval-stop-message" "STOPPED after task 1" "$OUTPUT"
+assert_status    "n8-reval-stop-announced" "REVALIDATE task=1" "$OUTPUT"
+assert_marker    "n8-reval-stop-gate-ran" "$MARK" 'ran.layer7'
+assert_no_marker "n8-reval-stop-close-gate-skipped" "$MARK" 'ran.layer-all'
+assert_no_marker "n8-reval-stop-no-devloop" "$MARK" 'ran.claude.devloop'
+if [ "$(manifest_status "$FIX" 1)" = "completed" ]; then PASS=$((PASS+1)); else
+  FAIL=$((FAIL+1)); FAILURES+=("[n8-reval-stop-manifest-completed] task 1 status is '$(manifest_status "$FIX" 1)', expected completed"); fi
+
+# N9: revalidate-red. The gate is STILL red on revalidation, so the task
+# RE-ESCALATES with the fresh gate log (the operator's environmental judgement was
+# wrong).
+run_story FAKE_LAYER3_RC=1 FAKE_DEVLOOP_MKOUT=1 \
+  FAKE_DEVLOOP_MKOUT_NAME=2026-08-17-reval-red-devloop -- fixture
+assert_exit "n9-setup-escalated-exit1" 1 "$RC"
+REUSE_FIXTURE=1 run_story FAKE_LAYER3_RC=1 -- fixture --revalidate
+unset REUSE_FIXTURE
+assert_exit   "n9-revalidate-red-exit1" 1 "$RC"
+assert_status "n9-revalidate-red-escalated" "ESCALATED" "$OUTPUT"
+assert_status "n9-revalidate-red-reason" "reason=revalidate-pipeline-red-layer3" "$OUTPUT"
+assert_marker "n9-revalidate-red-record" "$(RUN_DIR_OF "$DT")" 'task-1.runner-escalation.*.json'
+if [ "$(manifest_status "$FIX" 1)" = "escalated" ]; then PASS=$((PASS+1)); else
+  FAIL=$((FAIL+1)); FAILURES+=("[n9-revalidate-red-manifest-escalated] task 1 status is '$(manifest_status "$FIX" 1)', expected escalated"); fi
+# The re-escalation's record must name the fresh gate log.
+n9_rec="$(ls "$(RUN_DIR_OF "$DT")"/task-1.runner-escalation.*.json 2>/dev/null | sort | tail -n1)"
+assert_status "n9-record-reason" "revalidate-pipeline-red-layer3" "$(jq -r '.reason // "MISSING"' "$n9_rec" 2>/dev/null || echo PARSE-FAILED)"
+n9_gatelog="$(jq -r '.log // "MISSING"' "$n9_rec" 2>/dev/null || echo PARSE-FAILED)"
+assert_status "n9-record-log-is-gatelog" "task-1.gate.log" "$n9_gatelog"
+
+# N10: (F3) DOUBLE revalidate must preserve the ORIGINAL baseline. run-story.sh
+# sets head_before=reval_baseline before re-escalating on revalidate-red
+# precisely so a SECOND --revalidate does not see baseline==HEAD and wrongly hit
+# NO-COMMIT-REFUSED (a --revalidate adds no commit, so cur_head is not a new
+# baseline). Setup → revalidate-red → revalidate-again(green): the second must
+# re-gate and complete, NOT refuse. If the baseline-preservation line regresses,
+# the second revalidate reds here with NO-COMMIT-REFUSED.
+run_story FAKE_LAYER3_RC=1 FAKE_DEVLOOP_MKOUT=1 \
+  FAKE_DEVLOOP_MKOUT_NAME=2026-08-17-double-reval-devloop -- fixture
+assert_exit "n10-setup-escalated-exit1" 1 "$RC"
+REUSE_FIXTURE=1 run_story FAKE_LAYER3_RC=1 -- fixture --revalidate
+unset REUSE_FIXTURE
+assert_exit "n10-first-revalidate-red-exit1" 1 "$RC"
+REUSE_FIXTURE=1 run_story FAKE_LAYER3_RC=0 -- fixture --revalidate
+unset REUSE_FIXTURE
+assert_exit   "n10-second-revalidate-green-exit0" 0 "$RC"
+assert_absent "n10-second-not-no-commit-refused" "NO-COMMIT-REFUSED" "$OUTPUT"
+assert_status "n10-second-completes" "ALL TASKS COMPLETE" "$OUTPUT"
+assert_marker "n10-second-gate-ran" "$MARK" 'ran.layer7'
+if [ "$(manifest_status "$FIX" 1)" = "completed" ]; then PASS=$((PASS+1)); else
+  FAIL=$((FAIL+1)); FAILURES+=("[n10-second-manifest-completed] task 1 status is '$(manifest_status "$FIX" 1)', expected completed"); fi
+
+# N11: restart-injects-paragraph. --restart spawns a FRESH devloop whose prompt
+# FILE carries the operator paragraph: the required text, the prior commit SHA,
+# and the escalation's gate REASON tail. It discards any resume pointer (the fresh
+# devloop must NOT --continue the prior work).
+run_story FAKE_LAYER3_RC=1 FAKE_DEVLOOP_MKOUT=1 \
+  FAKE_DEVLOOP_MKOUT_NAME=2026-08-17-restart-devloop \
+  FAKE_LAYER_FAIL_STATUS=fixture-layer3-red -- fixture
+assert_exit "n11-setup-escalated-exit1" 1 "$RC"
+n11_prior_commit="$(git -C "$FIX" rev-parse HEAD)"
+# Seed a VALID resume pointer (its target dir was committed by the prior attempt)
+# so the discard is meaningful: without the rm, the fresh-start path WOULD resume
+# via --continue.
+printf '2026-08-17-restart-devloop\n' > "$(RUN_DIR_OF "$DT")/task-1.slug"
+REUSE_FIXTURE=1 run_story -- fixture --restart 'RESTART-DIAG-9f3c fix the broken selector'
+unset REUSE_FIXTURE
+assert_exit   "n11-restart-exit0" 0 "$RC"
+assert_status "n11-restart-announced" "RESTART task=1" "$OUTPUT"
+# The prompt FILE the devloop is pointed at must carry all three pieces.
+n11_prompt="$(cat "$(RUN_DIR_OF "$DT")/task-1.prompt" 2>/dev/null || true)"
+assert_status "n11-prompt-has-diagnosis" "RESTART-DIAG-9f3c fix the broken selector" "$n11_prompt"
+assert_status "n11-prompt-has-prior-commit" "$n11_prior_commit" "$n11_prompt"
+assert_status "n11-prompt-has-reason-tail" "fixture-layer3-red" "$n11_prompt"
+# S-2: the machine-generated gate tail is CONTAINED — each line `> `-quoted so an
+# injected REASON reads as quoted evidence, not prompt structure — and the
+# operator diagnosis is the LAST paragraph (authoritative), below the tail.
+assert_status "n11-prompt-gate-tail-quoted" "> STATUS=FAIL REASON=fixture-layer3-red" "$n11_prompt"
+n11_diag_pos="$(printf '%s' "$n11_prompt" | grep -n 'RESTART-DIAG-9f3c' | head -n1 | cut -d: -f1)"
+n11_tail_pos="$(printf '%s' "$n11_prompt" | grep -n 'REASON=fixture-layer3-red' | head -n1 | cut -d: -f1)"
+if [ -n "$n11_diag_pos" ] && [ -n "$n11_tail_pos" ] && [ "$n11_diag_pos" -gt "$n11_tail_pos" ]; then PASS=$((PASS+1)); else
+  FAIL=$((FAIL+1)); FAILURES+=("[n11-diagnosis-is-last] operator diagnosis (line ${n11_diag_pos:-?}) must sit AFTER the machine tail (line ${n11_tail_pos:-?})"); fi
+# Fresh start, not a resume: the spawned devloop must use --specialist and NOT
+# --continue (the seeded resume pointer was discarded).
+n11_devloop_argv="$(grep -- '--output-format stream-json' "${MARK}/claude.argv" 2>/dev/null || true)"
+assert_status "n11-devloop-fresh-specialist" "--specialist=test" "$n11_devloop_argv"
+assert_absent "n11-devloop-not-resumed" "--continue=" "$n11_devloop_argv"
+
+# N12: no-commit-refused. A devloop-no-commit escalation (the devloop exited 0
+# having committed nothing) has nothing to validate or restart from. BOTH flags
+# refuse with the distinct NO-COMMIT-REFUSED token. Separate escalation fixtures
+# per flag so neither invocation's reopen affects the other.
+run_story FAKE_DEVLOOP_COMMIT=0 -- fixture
+assert_exit "n12-setup-nocommit-revalidate-exit1" 1 "$RC"
+assert_status "n12-setup-nocommit-reason" "devloop-no-commit" "$OUTPUT"
+REUSE_FIXTURE=1 run_story -- fixture --revalidate
+unset REUSE_FIXTURE
+assert_exit   "n12-nocommit-revalidate-exit2" 2 "$RC"
+assert_status "n12-nocommit-revalidate-token" "NO-COMMIT-REFUSED" "$OUTPUT"
+assert_no_marker "n12-nocommit-revalidate-no-gate" "$MARK" 'ran.layer7'
+
+run_story FAKE_DEVLOOP_COMMIT=0 -- fixture
+assert_exit "n12-setup-nocommit-restart-exit1" 1 "$RC"
+REUSE_FIXTURE=1 run_story -- fixture --restart 'diagnose the failure'
+unset REUSE_FIXTURE
+assert_exit   "n12-nocommit-restart-exit2" 2 "$RC"
+assert_status "n12-nocommit-restart-token" "NO-COMMIT-REFUSED" "$OUTPUT"
+assert_no_marker "n12-nocommit-restart-no-devloop" "$MARK" 'ran.claude.devloop'
+
+# N13: (S-5) --revalidate refuses a tree dirty beyond the manifest reopen. The
+# gate would validate uncommitted work that completion (which stages only the
+# story file) never records — a green not reproducible from the commit. An
+# untracked file (junk a prior devloop left) is the reachable shape.
+run_story FAKE_LAYER3_RC=1 FAKE_DEVLOOP_MKOUT=1 \
+  FAKE_DEVLOOP_MKOUT_NAME=2026-08-17-dirty-tree-devloop -- fixture
+assert_exit "n13-setup-escalated-exit1" 1 "$RC"
+printf 'uncommitted junk a prior devloop left\n' > "${FIX}/stray-uncommitted.txt"
+REUSE_FIXTURE=1 run_story FAKE_LAYER3_RC=0 -- fixture --revalidate
+unset REUSE_FIXTURE
+assert_exit      "n13-dirty-tree-exit2" 2 "$RC"
+assert_status    "n13-dirty-tree-token" "REVALIDATE-DIRTY-TREE" "$OUTPUT"
+assert_no_marker "n13-dirty-tree-no-gate" "$MARK" 'ran.layer7'
+if [ "$(manifest_status "$FIX" 1)" != "completed" ]; then PASS=$((PASS+1)); else
+  FAIL=$((FAIL+1)); FAILURES+=("[n13-dirty-tree-not-completed] a dirty-tree revalidate marked task 1 COMPLETED (false green)"); fi
+
+# N14: (S-1) fail CLOSED when a commit cannot be positively established. A missing
+# baseline sidecar (an escalation recorded before this feature, or a failed
+# sidecar write) must NOT be read as "committed". Delete it between the two
+# invocations; the flag must refuse with NO-COMMIT-EVIDENCE and run no gate.
+run_story FAKE_LAYER3_RC=1 FAKE_DEVLOOP_MKOUT=1 \
+  FAKE_DEVLOOP_MKOUT_NAME=2026-08-17-no-evidence-devloop -- fixture
+assert_exit "n14-setup-escalated-exit1" 1 "$RC"
+rm -f "$(RUN_DIR_OF "$DT")/task-1.head-before"
+REUSE_FIXTURE=1 run_story FAKE_LAYER3_RC=0 -- fixture --revalidate
+unset REUSE_FIXTURE
+assert_exit      "n14-no-evidence-exit2" 2 "$RC"
+assert_status    "n14-no-evidence-token" "NO-COMMIT-EVIDENCE" "$OUTPUT"
+assert_no_marker "n14-no-evidence-no-gate" "$MARK" 'ran.layer7'
+
+# N15: (S-1) the ROBUST cross-check arm of NO-COMMIT-REFUSED — baseline == HEAD —
+# fires for an uncommitted attempt whose reason is NOT devloop-no-commit, which a
+# reason-only check would miss. A devloop that writes .devloop-escalation.json AND
+# commits nothing escalates as `devloop-escalated` (before the head_after==head_
+# before check), so its persisted baseline equals HEAD. --revalidate must refuse
+# via the baseline==HEAD half, naming the non-no-commit reason.
+run_story FAKE_DEVLOOP_COMMIT=0 FAKE_DEVLOOP_ESCALATION='{"reason":"stub-diagnosed"}' -- fixture
+assert_exit   "n15-setup-escalated-exit1" 1 "$RC"
+assert_status "n15-setup-reason-not-nocommit" "reason=devloop-escalated" "$OUTPUT"
+REUSE_FIXTURE=1 run_story FAKE_LAYER3_RC=0 -- fixture --revalidate
+unset REUSE_FIXTURE
+assert_exit      "n15-baseline-eq-head-exit2" 2 "$RC"
+assert_status    "n15-baseline-eq-head-token" "NO-COMMIT-REFUSED" "$OUTPUT"
+# The refusal names the non-no-commit reason — proving the baseline==HEAD arm
+# fired, not the reason==devloop-no-commit arm.
+assert_status    "n15-baseline-eq-head-reason" "reason=devloop-escalated" "$OUTPUT"
+assert_no_marker "n15-baseline-eq-head-no-gate" "$MARK" 'ran.layer7'
+
+# N16: (F2) the RETRY_APPLIED one-shot guard. Both flags act on the FIRST escalated
+# task the run reaches; SUBSEQUENT tasks run the normal fresh-devloop path. A
+# single-task fixture cannot show this, so use a TWO-task fixture: task 1 is
+# escalated, then --revalidate completes task 1 gate-only (no devloop) and task 2
+# runs a plain devloop. Proof: task 1 is revalidated (no devloop) while task 2
+# DOES spawn one, so exactly ONE devloop session runs across the invocation.
+# (This swaps TEMPLATE and does not restore it — hence LAST in the file.)
+mk_story "${TEMPLATE}/docs/user-stories/2026-08-13-fixture.md" '- id: 1
+  status: pending
+  specialist: test
+  prompt: retry one-shot task one
+- id: 2
+  status: pending
+  specialist: test
+  deps: [1]
+  prompt: retry one-shot task two'
+git -C "$TEMPLATE" commit --quiet -am "two-task retry one-shot fixture" >/dev/null
+run_story FAKE_LAYER3_RC=1 FAKE_DEVLOOP_MKOUT=1 \
+  FAKE_DEVLOOP_MKOUT_NAME=2026-08-17-oneshot-task1-devloop -- fixture
+assert_exit "n16-setup-task1-escalated-exit1" 1 "$RC"
+if [ "$(manifest_status "$FIX" 1)" = "escalated" ] && [ "$(manifest_status "$FIX" 2)" = "pending" ]; then PASS=$((PASS+1)); else
+  FAIL=$((FAIL+1)); FAILURES+=("[n16-setup-state] expected task1 escalated + task2 pending, got '$(manifest_status "$FIX" 1)' + '$(manifest_status "$FIX" 2)'"); fi
+REUSE_FIXTURE=1 run_story FAKE_LAYER3_RC=0 -- fixture --revalidate
+unset REUSE_FIXTURE
+assert_exit   "n16-oneshot-exit0" 0 "$RC"
+assert_status "n16-oneshot-task1-revalidated" "REVALIDATE task=1" "$OUTPUT"
+assert_status "n16-oneshot-task2-normal-start" "START task=2" "$OUTPUT"
+assert_status "n16-oneshot-completes" "ALL TASKS COMPLETE" "$OUTPUT"
+assert_marker "n16-oneshot-task2-devloop-ran" "$MARK" 'ran.claude.devloop'
+# The one-shot property: exactly ONE devloop across the invocation — task 2's.
+# Task 1 (the escalated one) took the gate-only revalidate path and spawned none.
+n16_devloop_count="$(cat "${MARK}/devloop.count" 2>/dev/null || echo MISSING)"
+assert_status "n16-oneshot-exactly-one-devloop" "1" "$n16_devloop_count"
+if [ "$n16_devloop_count" = "1" ]; then PASS=$((PASS+1)); else
+  FAIL=$((FAIL+1)); FAILURES+=("[n16-oneshot-devloop-count-exact] expected exactly 1 devloop (task 2 only), got '${n16_devloop_count}'"); fi
+if [ "$(manifest_status "$FIX" 1)" = "completed" ] && [ "$(manifest_status "$FIX" 2)" = "completed" ]; then PASS=$((PASS+1)); else
+  FAIL=$((FAIL+1)); FAILURES+=("[n16-oneshot-both-completed] expected both tasks completed, got '$(manifest_status "$FIX" 1)' + '$(manifest_status "$FIX" 2)'"); fi
 
 report_results "scripts/workflow/run-story.test.sh"

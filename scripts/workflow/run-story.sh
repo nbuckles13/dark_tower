@@ -10,14 +10,31 @@
 # Intended execution context: inside the devloop container set up by
 # devloop.sh (skip-permissions is only safe behind that boundary).
 #
-# Usage: scripts/workflow/run-story.sh <story-file.md | story-slug> [--stop-after=N]
+# Usage: scripts/workflow/run-story.sh <story-file.md | story-slug> \
+#          [--stop-after=N] [--revalidate | --restart <text>]
 #
 #   --stop-after=N  exit 0 after task N completes (skips the story-close gate).
 #                   For staged runs where a human step belongs between tasks.
 #
+#   --revalidate    operator-intervention retry for the escalated task the run
+#                   reaches: re-run ONLY the authoritative gate against the tree
+#                   as committed by the prior attempt (no devloop is spawned).
+#                   For a failure judged environmental, not diff-caused (e.g. a
+#                   since-fixed flaky Layer-7 test). Green -> complete; red ->
+#                   re-escalate. Composable with --stop-after.
+#   --restart <text>  operator-intervention retry for the escalated task the run
+#                   reaches: spawn a FRESH devloop seeded with <text> (the
+#                   operator's diagnosis), the prior attempt's commit and its
+#                   gate-failure tail, so it starts from the diagnosis and the
+#                   existing commit rather than re-implementing. <text> is
+#                   REQUIRED. Composable with --stop-after.
+#   --revalidate and --restart are MUTUALLY EXCLUSIVE. Both REFUSE if the task
+#   the run reaches has no prior escalation, or if that attempt never committed
+#   (a devloop-no-commit escalation has nothing to validate or restart from).
+#
 # Exit: 0  all tasks complete, story-close gate green (or --stop-after reached)
 #       1  task escalated (escalation.json path printed) or blocked
-#       2  precondition / infra / manifest failure
+#       2  precondition / infra / manifest failure / retry-flag misuse
 set -euo pipefail
 
 # Timestamped console logging (UTC). All STORY_RUN lines route through these so
@@ -257,24 +274,84 @@ if __test_sentinel_active && __any_seam_override_present; then
   slog "STORY_RUN: TEST SEAMS ACTIVE — repo_root=${REPO_ROOT} dt_story=${DT_STORY} run_dir_base=${DEVLOOP_TMP:-<unset>} (NOT a production run)"
 fi
 
-ARG="${1:?usage: run-story.sh <story-file.md | story-slug> [--stop-after=N]}"
-STOP_AFTER="${2:-}"
-if [ -n "$STOP_AFTER" ]; then
-  case "$STOP_AFTER" in
-    --stop-after=*) STOP_AFTER="${STOP_AFTER#--stop-after=}" ;;
-    *) slogerr "STORY_RUN: UNKNOWN-ARGUMENT '$STOP_AFTER'"; exit 2 ;;
+ARG="${1:?usage: run-story.sh <story-file.md | story-slug> [--stop-after=N] [--revalidate | --restart <text>]}"
+shift
+# Flag grammar (order-independent after the story arg). Extra/unknown argv is
+# REFUSED, not silently dropped — a flag that silently does nothing is the same
+# failure class R-5 names. --revalidate / --restart are the operator-intervention
+# retry flags (see the usage header); they slot into the SAME accepted grammar as
+# --stop-after and compose with it.
+STOP_AFTER=""
+SAW_STOP_AFTER=0   # PRESENCE, tracked separately from the value: `--stop-after=`
+                   # strips to empty, and testing `-n` on the STRIPPED value would
+                   # let an empty value skip validation and silently do nothing
+                   # (the R-5 failure class). Validate on presence, not on `-n`.
+REVALIDATE=0
+RESTART=0
+RESTART_TEXT=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --stop-after=*)
+      # A repeated flag silently last-wins, which is the same "flag that does
+      # nothing" class this grammar refuses extra argv for. Refuse the duplicate.
+      [ "$SAW_STOP_AFTER" -eq 0 ] || { slogerr "STORY_RUN: DUPLICATE-FLAG — --stop-after given more than once; a silently-last-wins flag is the R-5 failure class. Pass it once."; exit 2; }
+      SAW_STOP_AFTER=1; STOP_AFTER="${1#--stop-after=}" ;;
+    --revalidate)
+      [ "$REVALIDATE" -eq 0 ] || { slogerr "STORY_RUN: DUPLICATE-FLAG — --revalidate given more than once."; exit 2; }
+      REVALIDATE=1 ;;
+    # --restart takes its diagnosis text as the NEXT argv token (never inline on
+    # this flag's own token beyond the =form), so an empty/missing text is
+    # detectable and refused below rather than silently interpolated. The next
+    # token must NOT look like a flag: consuming a following `--revalidate` /
+    # `--stop-after=` as the diagnosis text would bypass the mutual-exclusion and
+    # stop-after handling (S-3). A diagnosis that genuinely starts with `--` goes
+    # through the =form.
+    --restart)
+      [ "$RESTART" -eq 0 ] || { slogerr "STORY_RUN: DUPLICATE-FLAG — --restart given more than once."; exit 2; }
+      RESTART=1
+      if [ "$#" -ge 2 ] && [ "${2#--}" = "$2" ]; then
+        RESTART_TEXT="$2"; shift
+      elif [ "$#" -ge 2 ]; then
+        slogerr "STORY_RUN: RESTART-FLAG-AS-TEXT — --restart was followed by '$2', which is a flag, not a diagnosis; consuming it as the text would bypass the mutual-exclusion / --stop-after checks. If the diagnosis genuinely starts with '--', pass it as --restart=<text>."
+        exit 2
+      else
+        RESTART_TEXT=""
+      fi ;;
+    --restart=*)
+      [ "$RESTART" -eq 0 ] || { slogerr "STORY_RUN: DUPLICATE-FLAG — --restart given more than once."; exit 2; }
+      RESTART=1; RESTART_TEXT="${1#--restart=}" ;;
+    *) slogerr "STORY_RUN: UNKNOWN-ARGUMENT '$1' — usage: run-story.sh <story-file.md | story-slug> [--stop-after=N] [--revalidate | --restart <text>]"; exit 2 ;;
   esac
+  shift
+done
+if [ "$SAW_STOP_AFTER" -eq 1 ]; then
   [[ "$STOP_AFTER" =~ ^[0-9]+$ ]] || { slogerr "STORY_RUN: --stop-after needs a task id"; exit 2; }
   # Normalize: the comparison at the stop check is a STRING compare, so "01"
   # would pass a numeric lookup here and then never match id "1".
   STOP_AFTER="$((10#$STOP_AFTER))"
 fi
-# Extra argv is REFUSED, not silently dropped — `run-story.sh story
-# --stop-after=1 --foo` ignored --foo, which is the same failure class R-5 names
-# (a flag that silently does nothing).
-if [ "$#" -gt 2 ]; then
-  slogerr "STORY_RUN: UNKNOWN-ARGUMENT — extra arguments after --stop-after: ${*:3}. Usage: run-story.sh <story-file.md | story-slug> [--stop-after=N]"
+# Retry-flag misuse, each a distinct STORY_RUN token + exit 2. These are the
+# up-front (argv-only) refusals; NO-ESCALATED-TASK and NO-COMMIT-REFUSED need the
+# manifest and fire inside the loop.
+if [ "$REVALIDATE" -eq 1 ] && [ "$RESTART" -eq 1 ]; then
+  slogerr "STORY_RUN: REVALIDATE-WITH-RESTART — --revalidate and --restart are mutually exclusive: the first re-runs only the gate, the second spawns a fresh devloop. Pick one."
   exit 2
+fi
+if [ "$RESTART" -eq 1 ]; then
+  if [ -z "$RESTART_TEXT" ]; then
+    slogerr "STORY_RUN: RESTART-EMPTY-TEXT — --restart requires a non-empty diagnosis text (it is spliced into the fresh devloop's prompt so it starts from the diagnosis)."
+    exit 2
+  fi
+  # FOURTH prompt-splice site (alongside the specialist token, the --continue
+  # slug and the prompt file). SAME discipline: validate BEFORE interpolation,
+  # and the value reaches the model ONLY via the on-disk prompt file, never the
+  # claude command line (mirrors the R-2 defect-5 out-of-band fix). A code-fence
+  # line would break the prompt/manifest contract the file is read under, so it
+  # is refused loudly rather than normalised.
+  if printf '%s' "$RESTART_TEXT" | grep -qF '```'; then
+    slogerr "STORY_RUN: RESTART-UNSAFE-TEXT — the --restart text contains a code fence (\`\`\`), which would break the prompt/manifest contract the devloop reads the prompt file under. Remove it; the text is a diagnosis paragraph, not a code block."
+    exit 2
+  fi
 fi
 if [ -f "$ARG" ]; then
   STORY_FILE="$ARG"
@@ -475,8 +552,25 @@ escalate() {
   "$DT_STORY" escalate "$STORY_FILE" "$id" --reason "$reason" --log "$log" \
     --out "$rec"
   cp -f "$rec" "$RUN_DIR/escalation.json"
+  # Persist THIS attempt's baseline (HEAD before the devloop ran) beside the
+  # record. The diagnosed-retry flags read it to (a) recover the prior attempt's
+  # output-doc slug via the SAME --diff-filter=A commit-range derivation the
+  # completion path uses, and (b) confirm the attempt actually COMMITTED
+  # (baseline != HEAD), which — with the reason — is the POSITIVE evidence the
+  # no-commit refusal requires. A missing/empty sidecar is NOT read as
+  # "committed": the retry flags refuse (NO-COMMIT-EVIDENCE) when it is absent,
+  # so a failed `|| true` write fails closed, never open.
+  printf '%s' "${head_before:-}" > "$RUN_DIR/task-${id}.head-before" || true
   slogerr "STORY_RUN: ESCALATED task=${id} reason=${reason} log=${log}"
   slogerr "STORY_RUN: escalation record: ${rec} (latest also at ${RUN_DIR}/escalation.json)"
+  # Diagnosed-retry guidance. A COMMITTED attempt can be retried without
+  # re-implementing; a devloop-no-commit attempt committed nothing, so neither
+  # flag applies to it. Name the two flags here rather than a bare "rerun".
+  if [ "$reason" = "devloop-no-commit" ]; then
+    slogerr "STORY_RUN: recover: this attempt committed nothing to retry from — fix the task and rerun the runner (the diagnosed-retry flags --revalidate/--restart require a committed attempt)."
+  else
+    slogerr "STORY_RUN: recover after diagnosing: rerun with --revalidate (re-run the gate ONLY, for an environmental failure) OR --restart 'what to fix' (fresh devloop from THIS commit). A plain rerun re-implements from scratch."
+  fi
   exit 1
 }
 
@@ -888,6 +982,172 @@ persist_resume_pointer() {
   return 0
 }
 
+# latest_escalation_record <id> — path of the newest runner-escalation record for
+# this task, or empty. escalate() names each record with an embedded UTC
+# timestamp (task-N.runner-escalation.<ts>.json), so a lexical sort orders them
+# by time; the diagnosed-retry flags read the newest one's `reason` to decide
+# whether the task the run reached was escalated at all, and whether its prior
+# attempt committed.
+latest_escalation_record() {
+  local id="$1"
+  # `|| true`: with no matching record `ls` exits non-zero, and under
+  # `set -euo pipefail` that would abort the caller's `esc_rec="$( … )"`
+  # assignment before the NO-ESCALATED-TASK lane can report it. "No record" is a
+  # normal, answered state here (empty stdout), not a failure.
+  ls -1 "$RUN_DIR"/task-"${id}".runner-escalation.*.json 2>/dev/null | sort | tail -n 1 || true
+}
+
+# run_gate <id> — the AUTHORITATIVE per-task gate: layers 1-6 then layer 7,
+# appended to $gatelog. Factored so the normal completion path and --revalidate
+# run the IDENTICAL invocation (ADR-0035 §3 — pass/fail authority is this gate,
+# never the devloop's verdict). Sets the globals gate_rc / gate_layer /
+# gate_layers that the caller's operator-vs-implementer split reads.
+run_gate() {
+  local id="$1" n rc gate_start
+  # EVERY task runs layers 1-6 then layer 7 (2026-08-20 — layer 7 is now
+  # UNCONDITIONAL, no longer gated on an env_tests tag; that manifest field was
+  # removed). The `1-6+7` label is kept deliberately: layer 7 is a separate
+  # ~10-15min cost envelope, so the `+7` preserves that distinction — it no
+  # longer signals conditionality.
+  gate_layers="1-6+7"
+  slog "STORY_RUN: GATE task=${id} layers=${gate_layers} running (log=${gatelog})"
+  gate_start="$(date +%s)"
+  gate_rc=0
+  gate_layer=0
+  for n in 1 2 3 4 5 6; do
+    set +e
+    "scripts/layer${n}.sh" >>"$gatelog" 2>&1
+    rc=$?
+    set -e
+    if [ "$rc" -ne 0 ]; then gate_rc=$rc; gate_layer=$n; break; fi
+  done
+  if [ "$gate_rc" -eq 0 ]; then
+    set +e
+    scripts/layer7.sh >>"$gatelog" 2>&1
+    gate_rc=$?
+    set -e
+    [ "$gate_rc" -ne 0 ] && gate_layer=7
+  fi
+  slog "STORY_RUN: GATE task=${id} layers=${gate_layers} rc=${gate_rc} elapsed=$(( $(date +%s) - gate_start ))s"
+}
+
+# complete_task <id> <baseline-head> [cost_mode] — slug resolution + dt-story
+# complete + manifest bump + cleanup + suppression-visibility note. Factored so
+# the normal completion path and --revalidate share ONE implementation of the
+# closed-set slug derivation and the amend-or-chore commit; the ONLY difference
+# is the commit-range baseline (the devloop's head_before on the normal path, the
+# prior attempt's persisted baseline on --revalidate). cost_mode selects the
+# ledger entry: `devloop` (default) derives cost from the session log via
+# report_task_cost; `gate-only` appends an explicit zero-cost entry (a
+# --revalidate attempt spawned no devloop, so it has no session log to derive
+# from). Reuses continue_slug / slug_file / start_marker / stop_count_file /
+# gatelog as the per-task globals the caller set.
+complete_task() {
+  local id="$1" baseline="$2" cost_mode="${3:-devloop}"
+  local slug_git_err slug_derive_ok slug_raw slug_candidates slug_count
+  local task_slug slug_src slug_cause slug_rejected added
+
+  # SLUG RESOLUTION — a CLOSED SET of outcomes. Every completion emits exactly
+  # one, so "none of them appeared" is itself detectable. Primary derivation is
+  # the task's own commit range, NOT a directory mtime. `--diff-filter=A`
+  # restricts to output dirs CREATED in this range; `:(glob)` pins `*` to one
+  # path segment (git's fnmatch lacks FNM_PATHNAME). Capture git's rc SEPARATELY
+  # from the pipeline so a genuine enumeration failure stays distinguishable from
+  # "nothing was added" — folding a git fault into `no-record-in-range` would
+  # print a message that is affirmatively false. See the story-task-4 comments in
+  # the git history for the measured cases behind each clause.
+  slug_git_err="$RUN_DIR/task-${id}.slug-derive.err"
+  slug_derive_ok=1
+  if ! slug_raw="$(git diff --name-only --diff-filter=A "$baseline" HEAD \
+        -- ':(glob)docs/devloop-outputs/*/main.md' 2>"$slug_git_err")"; then
+    slug_derive_ok=0
+  fi
+  slug_candidates="$(printf '%s\n' "$slug_raw" | grep . | cut -d/ -f3 | sort -u || true)"
+  slug_count="$(printf '%s' "$slug_candidates" | grep -c . || true)"
+
+  # ONE outcome per completion. The arms are MUTUALLY EXCLUSIVE and `slug_cause`
+  # is set exactly once, so a reader (or a test) classifying by `cause=` gets a
+  # single answer. Keep this a partition — see the git-history comment about the
+  # earlier unsafe-class fall-through that emitted a second, contradictory cause.
+  task_slug=""; slug_src=""; slug_cause=""; slug_rejected=""
+  if [ "$slug_derive_ok" -ne 1 ]; then
+    slug_cause="git-error"
+  elif [ "${slug_count:-0}" -gt 1 ]; then
+    slug_cause="ambiguous"
+  elif [ "${slug_count:-0}" -eq 1 ]; then
+    task_slug="$slug_candidates"; slug_src="commit-range"
+  elif [ -n "$continue_slug" ]; then
+    task_slug="$continue_slug"; slug_src="resume-pointer"
+  else
+    slug_cause="no-record-in-range"
+  fi
+
+  # Write-time floor on the NARROW class. Pinned against the canonical Rust class
+  # by scripts/guards/simple/validate-slug-class-sync.sh. Applied here so a
+  # rejected slug can never reach `complete` and kill the run under `set -e`: the
+  # task's work is committed and its gates are green, so erroring would be a
+  # self-inflicted operator-lane red of exactly the class R-4 exists to prevent.
+  if [ -n "$task_slug" ] && ! [[ "$task_slug" =~ $SLUG_CLASS_CANONICAL ]]; then
+    slug_rejected="$task_slug"
+    slug_cause="unsafe-class"
+    task_slug=""; slug_src=""
+  fi
+
+  # Fold the manifest bump into the devloop's own commit. No --commit sha in the
+  # manifest: amending changes the sha. Fall back to a separate chore commit if
+  # the amend is rejected (e.g. a hook that pins devloop-commit trees).
+  if [ -n "$task_slug" ]; then
+    "$DT_STORY" complete "$STORY_FILE" "$id" --slug "$task_slug"
+  else
+    # Answered, not raised — but never silent, and never more than one cause.
+    case "$slug_cause" in
+      git-error)
+        slogerr "STORY_RUN: NO-SLUG task=${id} cause=git-error — enumerating this task's commit range for a devloop output failed; the slug could not be derived at all (this is NOT 'no record exists'). git stderr: ${slug_git_err}. Recording completion without a slug. Repair with: ${DT_STORY} complete ${STORY_FILE} ${id} --slug <slug>" ;;
+      ambiguous)
+        slogerr "STORY_RUN: NO-SLUG task=${id} cause=ambiguous candidates=${slug_count} ($(printf '%s' "$slug_candidates" | tr '\n' ' ')) — more than one devloop output was CREATED in this task's commit range, so which one produced it is not decidable here. Recording completion without a slug. Repair with: ${DT_STORY} complete ${STORY_FILE} ${id} --slug <slug>" ;;
+      unsafe-class)
+        slogerr "STORY_RUN: NO-SLUG task=${id} cause=unsafe-class candidate='${slug_rejected}' — outside ${SLUG_CLASS_CANONICAL}, so it would be rejected by dt-story and kill the run at a point where this task's work is already committed. Recording completion without a slug. Repair with: ${DT_STORY} complete ${STORY_FILE} ${id} --slug <slug>" ;;
+      no-record-in-range)
+        slogerr "STORY_RUN: NO-SLUG task=${id} cause=no-record-in-range — no docs/devloop-outputs/*/main.md was ADDED between ${baseline} and HEAD, AND no resume pointer survived. (This does NOT mean the devloop wrote no record: on a resumed task the record exists and was committed by an earlier run.) Recording completion without a slug. Repair with: ${DT_STORY} complete ${STORY_FILE} ${id} --slug <slug>" ;;
+      *)
+        # NO CATCH-ALL INTO A SPECIFIC CLAIM — an unrecognised cause makes NO
+        # environmental assertion at all (see the git-history comment).
+        slogerr "STORY_RUN: NO-SLUG task=${id} cause=unclassified='${slug_cause}' — the slug classifier produced a cause this emitter has no arm for, so no claim is made about why. This is a RUNNER BUG; the completion itself is sound. Repair with: ${DT_STORY} complete ${STORY_FILE} ${id} --slug <slug>" ;;
+    esac
+    "$DT_STORY" complete "$STORY_FILE" "$id"
+  fi
+  git add "$STORY_FILE"
+  if ! git commit --quiet --amend --no-edit; then
+    git commit --quiet -m "chore(story): task #${id} complete (run-story manifest bump)"
+  fi
+  rm -f "$slug_file" "$start_marker" "$stop_count_file"
+  slog "STORY_RUN: COMPLETE task=${id} commit=$(git rev-parse --short HEAD) slug=${task_slug:-none} src=${slug_src:-none} cause=${slug_cause:-none}"
+
+  # Cost ledger. A gate-only (--revalidate) attempt spawned no devloop, so
+  # report_task_cost would either find nothing or (wrongly) re-derive the PRIOR
+  # devloop's cost from its leftover session log; instead append an explicit
+  # zero-cost entry. Telemetry only — never routes control flow.
+  if [ "$cost_mode" = "gate-only" ]; then
+    jq -n --argjson task "$id" \
+      '{task:$task, attempts:1, usd:0, output_tokens:0, cache_read_tokens:0, turns:0, api_minutes:0, kind:"revalidate-gate-only"}' \
+      >>"$RUN_DIR/cost-ledger.jsonl" || true
+    slog "STORY_RUN: COST task=${id} kind=revalidate-gate-only usd=0 (no devloop session)"
+  else
+    report_task_cost "$id"
+  fi
+
+  # Suppression-visibility monitor: if this task's commit ADDED audit-suppression
+  # entries, surface it — a cleared advisory via suppression (vs a real fix) is a
+  # governed but deliberate choice that should be loud, not buried in a diff.
+  if git show HEAD --format= --name-only 2>/dev/null | grep -q '^audit-suppressions\.toml$'; then
+    added="$(git show HEAD -- audit-suppressions.toml 2>/dev/null | grep -cE '^\+[[:space:]]*id[[:space:]]*=' || true)"
+    if [ "${added:-0}" -gt 0 ]; then
+      slog "STORY_RUN: NOTE task=${id} added ${added} audit suppression(s) — verify security-reviewed with exposure analysis + expiry"
+    fi
+  fi
+}
+
+RETRY_APPLIED=0
 while :; do
   set +e
   task_json="$("$DT_STORY" next "$STORY_FILE")"
@@ -961,6 +1221,152 @@ while :; do
   # Resume detection: a persisted slug (written on any uncommitted exit) means
   # this task has an interrupted devloop to continue instead of a fresh start.
   continue_slug=""
+
+  # --- OPERATOR-INTERVENTION RETRY (--revalidate / --restart) ------------------
+  # A run halts at its FIRST escalation, and `dt-story next` reopens an escalated
+  # task on selection (status back to pending, escalation cleared, file
+  # rewritten) — so the escalated task is exactly the FIRST task this loop
+  # reaches, and by here `next` has already reopened it. Both flags therefore act
+  # on THIS task, once (RETRY_APPLIED gate): after handling it, subsequent tasks
+  # run the normal fresh-devloop path.
+  #
+  # The manifest no longer shows the escalation (next cleared it), but the
+  # runner-escalation record escalate() wrote in a PRIOR run survives in RUN_DIR
+  # and is the evidence both flags key on: no record => the task the run reached
+  # was never escalated (NO-ESCALATED-TASK); reason == devloop-no-commit (or a
+  # persisted baseline equal to HEAD) => the prior attempt committed nothing, so
+  # there is nothing to validate or restart from (NO-COMMIT-REFUSED, masked-
+  # failure protection). This block sits BEFORE the fresh-start clean-tree check
+  # deliberately: next's reopen dirtied the manifest, which that check would
+  # otherwise reject.
+  if { [ "$REVALIDATE" -eq 1 ] || [ "$RESTART" -eq 1 ]; } && [ "$RETRY_APPLIED" -eq 0 ]; then
+    esc_rec="$(latest_escalation_record "$id")"
+    if [ -z "$esc_rec" ]; then
+      slogerr "STORY_RUN: NO-ESCALATED-TASK — the task the run reached (task ${id}) has no prior runner-escalation record in ${RUN_DIR}, so there is nothing for --revalidate/--restart to act on. These flags retry a task an EARLIER run escalated; run the runner without them to make forward progress."
+      exit 2
+    fi
+    esc_reason="$(jq -r '.reason // ""' "$esc_rec" 2>/dev/null || true)"
+    # Establish the prior attempt's baseline (HEAD before its devloop ran) from
+    # the sidecar escalate() persists. cur_head is HEAD at loop entry, which — on
+    # a committed prior attempt that then escalated (e.g. pipeline-red) — is that
+    # attempt's own commit, since escalate() adds no commits of its own.
+    reval_baseline=""
+    bfile="$RUN_DIR/task-${id}.head-before"
+    [ -f "$bfile" ] && reval_baseline="$(cat "$bfile" 2>/dev/null || true)"
+    cur_head="$head_before"
+    # FAIL CLOSED (S-1). The refusal must rest on POSITIVE evidence of a commit,
+    # never on the ABSENCE of a no-commit signal. `devloop-no-commit` is not the
+    # only reason that can name an uncommitted attempt: devloop-escalated and
+    # devloop-session-error escalate BEFORE the head_after==head_before check, so
+    # for those the baseline sidecar is the only evidence — and an absent/empty
+    # sidecar (a record predating this feature, a `|| true` write that failed) or
+    # an unreadable record (esc_reason="") must NOT be read as "committed".
+    # So: (1) require a readable reason AND a persisted baseline at all; then
+    # (2) refuse on devloop-no-commit or baseline==HEAD.
+    if [ -z "$esc_reason" ] || [ -z "$reval_baseline" ]; then
+      slogerr "STORY_RUN: NO-COMMIT-EVIDENCE — cannot establish that task ${id}'s prior attempt committed: reason='${esc_reason:-<unreadable>}', baseline sidecar '${bfile}' is $( [ -s "$bfile" ] && echo present-but-empty || echo absent ). Refusing rather than assuming a commit (masked-failure protection). This can happen for an escalation recorded before this feature existed; fix the task and rerun the runner WITHOUT a retry flag. record: ${esc_rec}"
+      exit 2
+    fi
+    if [ "$esc_reason" = "devloop-no-commit" ] || [ "$reval_baseline" = "$cur_head" ]; then
+      slogerr "STORY_RUN: NO-COMMIT-REFUSED — task ${id}'s prior attempt (reason=${esc_reason}) committed nothing (head_after == head_before), so there is no committed work to validate or restart from. This is masked-failure protection: fix the task and rerun the runner WITHOUT a retry flag. record: ${esc_rec}"
+      exit 2
+    fi
+    # A committed prior attempt is now positively established: a readable reason
+    # that is not devloop-no-commit, and a persisted baseline that differs from
+    # HEAD (i.e. a commit landed in between).
+    RETRY_APPLIED=1
+
+    if [ "$REVALIDATE" -eq 1 ]; then
+      slog "STORY_RUN: REVALIDATE task=${id} — re-running the authoritative gate against the committed prior attempt (reason=${esc_reason}); no devloop is spawned."
+      # ATTEST THE TREE (S-5). --revalidate promises to gate "the tree as
+      # committed by the prior attempt", and complete_task stages only
+      # $STORY_FILE — so any OTHER uncommitted edit (an operator hand-fix, junk a
+      # prior devloop left) would be validated green but never recorded, a green
+      # not reproducible from the commit. Refuse unless the tree is clean apart
+      # from the manifest reopen next() just made. Route a git read failure to the
+      # operator lane, consistent with tree_dirty's rc>1 handling.
+      if ! reval_status="$(git status --porcelain -- . ":(exclude)$STORY_FILE" 2>"$giterr")"; then
+        git_error_lane "$id" "checking the tree is clean before revalidation" "$giterr"
+      fi
+      __drop_if_empty "$giterr"
+      if [ -n "$reval_status" ]; then
+        slogerr "STORY_RUN: REVALIDATE-DIRTY-TREE task=${id} — the work tree has uncommitted changes beyond the manifest reopen, so the gate would validate work this completion (which stages only ${STORY_FILE}) will NOT record — a green not reproducible from the commit. Commit or clean the tree, then rerun. Offending: $(printf '%s' "$reval_status" | head -n 5 | tr '\n' ';')"
+        exit 2
+      fi
+      run_gate "$id"
+      if [ "$gate_rc" -eq 0 ]; then
+        # Green: complete the task, recovering the slug from the PRIOR attempt's
+        # commit range (baseline..HEAD) via the shared completion path; record a
+        # gate-only, zero-cost ledger entry.
+        complete_task "$id" "$reval_baseline" gate-only
+        slog "STORY_RUN: REVALIDATE task=${id} — gate green; task completed (gate-only, zero devloop cost)."
+        if [ -n "$STOP_AFTER" ] && [ "$id" = "$STOP_AFTER" ]; then
+          STOP_AFTER_FIRED=1
+          slog "STORY_RUN: STOPPED after task ${id} (--stop-after) — story-close gate NOT run; rerun without the flag to continue"
+          exit 0
+        fi
+        continue
+      else
+        tail -n 50 "$gatelog"
+        # Red: re-escalate with the fresh gate log. Set head_before to the
+        # ORIGINAL baseline first so escalate()'s re-persisted sidecar keeps
+        # pointing at the real pre-attempt baseline (a --revalidate spawns no
+        # devloop, so cur_head is NOT a new baseline — persisting it would make a
+        # subsequent --revalidate see baseline == HEAD and wrongly refuse).
+        head_before="$reval_baseline"
+        escalate "$id" "revalidate-pipeline-red-layer${gate_layer}" "$gatelog"
+      fi
+    else
+      # --restart: seed a FRESH devloop with the operator diagnosis and the prior
+      # attempt's evidence, then fall through to the normal fresh-start path.
+      slog "STORY_RUN: RESTART task=${id} — spawning a fresh devloop seeded with the operator diagnosis and the prior attempt's commit; discarding any resume pointer."
+      prior_commit="$cur_head"
+      # Prior attempt's output-doc slug (best-effort), via the same commit-range
+      # derivation the completion path uses. Apply the SAME canonical slug floor
+      # every other slug site applies (S-6): it is `cut`-derived and interpolated
+      # into the prompt, so an out-of-class value must not pass unfiltered.
+      prior_slug="$(git diff --name-only --diff-filter=A "$reval_baseline" HEAD \
+          -- ':(glob)docs/devloop-outputs/*/main.md' 2>/dev/null | grep . | head -n1 | cut -d/ -f3 || true)"
+      [[ -n "$prior_slug" && "$prior_slug" =~ $SLUG_CLASS_CANONICAL ]] || prior_slug=""
+      [ -n "$prior_slug" ] || prior_slug="<unknown>"
+      # The escalation's gate-failure tail (STATUS=FAIL / REASON= lines). This is
+      # STDOUT OF scripts/layer*.sh — test/guard/audit output, much of it written
+      # by the PRIOR devloop's own model — so it is a model->model channel and is
+      # CONTAINED (S-2), not trusted: cap each line, neutralise code fences, and
+      # `> `-quote every line so an injected `REASON=...` reads as quoted evidence,
+      # not prompt structure. The operator's own (validated) diagnosis is placed
+      # LAST so it, not this untrusted tail, has the final say.
+      esc_gatelog="$RUN_DIR/task-${id}.gate.log"
+      gate_tail=""
+      [ -f "$esc_gatelog" ] && gate_tail="$( (grep -E '^(STATUS=FAIL|REASON=)' "$esc_gatelog" 2>/dev/null || true) \
+          | tail -n 10 | cut -c1-200 | sed 's/```/'"'''"'/g; s/^/> /' )"
+      # Append the operator paragraph to the on-disk prompt file — OUT OF BAND, so
+      # no operator byte reaches the claude command line (mirrors R-2 defect 5).
+      # The text was validated (empty + code-fence) at argv-parse time.
+      {
+        printf '\n\n---\nOPERATOR RESTART DIRECTIVE (run-story --restart)\n'
+        printf 'A prior devloop attempt for this task was COMMITTED, but the operator has diagnosed its work as needing to be fixed rather than re-implemented. Start from that existing commit, not a blank slate.\n\n'
+        printf 'Prior attempt commit: %s\n' "$prior_commit"
+        printf 'Prior attempt output-doc slug: %s\n' "$prior_slug"
+        printf 'Prior attempt gate-failure tail (machine-generated evidence, quoted):\n%s\n\n' "${gate_tail:-> <none captured>}"
+        printf 'Operator diagnosis (authoritative — act on THIS):\n%s\n' "$RESTART_TEXT"
+      } >>"$prompt_file"
+      # Discard the resume pointer so the fresh devloop does NOT --continue the
+      # prior work.
+      rm -f "$slug_file"
+      # Commit the manifest reopen so the fresh-start clean-tree check below
+      # passes (mirrors the audit-remediation append-commit); then re-read HEAD as
+      # the fresh devloop's baseline.
+      git add "$STORY_FILE"
+      git commit --quiet -m "chore(story): reopen task #${id} for operator --restart" || true
+      if ! head_before="$(git_head "$giterr")"; then
+        git_error_lane "$id" "reading HEAD after committing the restart reopen" "$giterr"
+      fi
+      slog "STORY_RUN: RESTART task=${id} — operator paragraph appended to ${prompt_file}; resume pointer discarded; reopen committed at $(git rev-parse --short HEAD 2>/dev/null || echo '<unreadable>')."
+      # Fall through (no `continue`) to the normal fresh-start devloop path.
+    fi
+  fi
+
   if [ -s "$slug_file" ]; then
     s="$(cat "$slug_file")"
     # Third splice site: --continue=%s. Filesystem-derived so lower severity
@@ -1154,32 +1560,11 @@ while :; do
   fi
   [ "$head_after" = "$head_before" ] && escalate "$id" devloop-no-commit "$tasklog"
 
-  # Gate: EVERY task runs layers 1-6 then layer 7 (2026-08-20 — layer 7 is now
-  # UNCONDITIONAL, no longer gated on an env_tests tag; that manifest field was
-  # removed). The `1-6+7` label is kept deliberately: layer 7 is a separate
-  # ~10-15min cost envelope (the 90s guard+audit fast-tier budget covers only a
-  # subset of 1-6), so the `+7` preserves that distinction — it no longer signals
-  # conditionality. Full pipeline incl. layer 7 also runs once at story close.
-  gate_layers="1-6+7"
-  slog "STORY_RUN: GATE task=${id} layers=${gate_layers} running (log=${gatelog})"
-  gate_start="$(date +%s)"
-  gate_rc=0
-  gate_layer=0
-  for n in 1 2 3 4 5 6; do
-    set +e
-    "scripts/layer${n}.sh" >>"$gatelog" 2>&1
-    rc=$?
-    set -e
-    if [ "$rc" -ne 0 ]; then gate_rc=$rc; gate_layer=$n; break; fi
-  done
-  if [ "$gate_rc" -eq 0 ]; then
-    set +e
-    scripts/layer7.sh >>"$gatelog" 2>&1
-    gate_rc=$?
-    set -e
-    [ "$gate_rc" -ne 0 ] && gate_layer=7
-  fi
-  slog "STORY_RUN: GATE task=${id} layers=${gate_layers} rc=${gate_rc} elapsed=$(( $(date +%s) - gate_start ))s"
+  # Gate: EVERY task runs layers 1-6 then layer 7 (the authoritative pass/fail
+  # run, ADR-0035 §3). Factored into run_gate so --revalidate uses the IDENTICAL
+  # invocation; run_gate sets gate_rc / gate_layer, read by the split below. Full
+  # pipeline incl. layer 7 also runs once at story close.
+  run_gate "$id"
   # OPERATOR vs IMPLEMENTER (R-4). The pipeline already draws and names this
   # line: lang/_common.sh status_to_exit_code maps FAIL -> 1 (implementer) and
   # PRECONDITION_FAILURE | FAIL-MISSING-VERB | UNKNOWN -> 2 (operator), with a
@@ -1221,144 +1606,11 @@ while :; do
     exit 2
   fi
 
-  # SLUG RESOLUTION — a CLOSED SET of four outcomes. Every completion emits
-  # exactly one of them, so "none of the four appeared" is itself a detectable
-  # state; a per-outcome record covering only the outcomes we thought of
-  # structurally cannot represent the one we didn't (the same argument this
-  # story's §Deferred makes about a run exiting through no lane).
-  #
-  # Primary derivation is the task's own commit range, NOT a directory mtime.
-  #
-  # `--diff-filter=A` restricts to output dirs CREATED in this range, a tighter
-  # statement of "the attempt that actually committed" than "any devloop path
-  # touched": a devloop that improves the output template modifies
-  # `_template/main.md` in the same commit that adds its own output (~1% of
-  # commits, concentrated in exactly the workflow-tooling stories this runner
-  # drives). MEASURED, not reasoned: against a commit that ADDS
-  # `2026-08-17-new/main.md` and MODIFIES a pre-existing `2026-01-01-prior/`,
-  # the filter yields exactly `2026-08-17-new`, while dropping it yields both
-  # and the task falls to a false `cause=ambiguous`.
-  #
-  # `:(glob)` pins `*` to ONE path segment. MEASURED: git matches pathspecs
-  # with fnmatch WITHOUT FNM_PATHNAME, so a bare
-  # `docs/devloop-outputs/*/main.md` matches `alpha/nested/main.md` as well as
-  # `beta/main.md` — 2 candidates after the `cut` below, i.e. a manufactured
-  # `cause=ambiguous`; `:(glob)` yields only `beta`.
-  #
-  # NOTE THE COLLAPSE THAT HIDES THIS, so a future re-test does not repeat the
-  # mistake that was nearly recorded here: if the nested file sits under a
-  # directory that ALSO has a top-level main.md, `cut -d/ -f3 | sort -u` folds
-  # both to one slug and the two pathspec forms look identical. A fixture must
-  # ISOLATE the nested case or it will confirm the wrong conclusion.
-  #
-  # Fallback is $continue_slug, and it is a ROUTINE path, not an emergency
-  # arm: measured at 16% of commits, a `--continue` resumption ACROSS runner
-  # invocations has its main.md already committed by the previous run, so it
-  # is inside $head_before and `--diff-filter=A` yields zero by construction.
-  # `src=` on the COMPLETE line records which derivation supplied the value,
-  # because the two have different standing and slug= alone cannot say.
-  # Capture git's rc SEPARATELY from the pipeline, the same discipline
-  # newest_devloop_output establishes at length above for `find`: a genuine
-  # enumeration failure must stay distinguishable from "nothing was added",
-  # and a whole-pipeline $( ) under pipefail cannot tell you which stage
-  # failed. Folding a git fault into `no-record-in-range` would print a
-  # message that is affirmatively false.
-  slug_git_err="$RUN_DIR/task-${id}.slug-derive.err"
-  slug_derive_ok=1
-  if ! slug_raw="$(git diff --name-only --diff-filter=A "$head_before" HEAD \
-        -- ':(glob)docs/devloop-outputs/*/main.md' 2>"$slug_git_err")"; then
-    slug_derive_ok=0
-  fi
-  slug_candidates="$(printf '%s\n' "$slug_raw" | grep . | cut -d/ -f3 | sort -u || true)"
-  slug_count="$(printf '%s' "$slug_candidates" | grep -c . || true)"
-
-  # ONE outcome per completion. The arms below are MUTUALLY EXCLUSIVE and
-  # `slug_cause` is set exactly once, so a reader (or a test) classifying by
-  # `cause=` gets a single answer. An earlier version emitted `unsafe-class`
-  # and then fell through into the count-based arms, printing a second,
-  # CONTRADICTORY `cause=no-record-in-range` on the same completion — with
-  # both of its clauses false, since a main.md *was* added and was rejected
-  # for its name. Keep this a partition.
-  task_slug=""; slug_src=""; slug_cause=""; slug_rejected=""
-  if [ "$slug_derive_ok" -ne 1 ]; then
-    slug_cause="git-error"
-  elif [ "${slug_count:-0}" -gt 1 ]; then
-    slug_cause="ambiguous"
-  elif [ "${slug_count:-0}" -eq 1 ]; then
-    task_slug="$slug_candidates"; slug_src="commit-range"
-  elif [ -n "$continue_slug" ]; then
-    task_slug="$continue_slug"; slug_src="resume-pointer"
-  else
-    slug_cause="no-record-in-range"
-  fi
-
-  # Write-time floor on the NARROW class. Pinned against the canonical Rust
-  # class by scripts/guards/simple/validate-slug-class-sync.sh — see that
-  # guard's SCOPE comment for which literals it covers and why the resume
-  # class is deliberately excluded. Applied here so a rejected slug can never
-  # reach `complete` and kill the run under `set -e`: at this point the task's
-  # work is committed and its gates are green, so erroring would be a
-  # self-inflicted operator-lane red of exactly the class R-4 exists to
-  # prevent.
-  if [ -n "$task_slug" ] && ! [[ "$task_slug" =~ $SLUG_CLASS_CANONICAL ]]; then
-    slug_rejected="$task_slug"
-    slug_cause="unsafe-class"
-    task_slug=""; slug_src=""
-  fi
-
-  # Fold the manifest bump into the devloop's own commit. No --commit sha in
-  # the manifest: amending changes the sha, so it can't be recorded inside the
-  # commit it refers to. Fall back to a separate chore commit if the amend is
-  # rejected (e.g. a hook that pins devloop-commit trees).
-  if [ -n "$task_slug" ]; then
-    "$DT_STORY" complete "$STORY_FILE" "$id" --slug "$task_slug"
-  else
-    # Answered, not raised — but never silent, and never more than one cause.
-    # Each arm states what actually held; "many" deliberately OMITS the slug
-    # rather than picking one, since a deterministic-but-arbitrary choice is
-    # what this derivation replaced mtime sorting to avoid.
-    case "$slug_cause" in
-      git-error)
-        slogerr "STORY_RUN: NO-SLUG task=${id} cause=git-error — enumerating this task's commit range for a devloop output failed; the slug could not be derived at all (this is NOT 'no record exists'). git stderr: ${slug_git_err}. Recording completion without a slug. Repair with: ${DT_STORY} complete ${STORY_FILE} ${id} --slug <slug>" ;;
-      ambiguous)
-        slogerr "STORY_RUN: NO-SLUG task=${id} cause=ambiguous candidates=${slug_count} ($(printf '%s' "$slug_candidates" | tr '\n' ' ')) — more than one devloop output was CREATED in this task's commit range, so which one produced it is not decidable here. Recording completion without a slug. Repair with: ${DT_STORY} complete ${STORY_FILE} ${id} --slug <slug>" ;;
-      unsafe-class)
-        slogerr "STORY_RUN: NO-SLUG task=${id} cause=unsafe-class candidate='${slug_rejected}' — outside ${SLUG_CLASS_CANONICAL}, so it would be rejected by dt-story and kill the run at a point where this task's work is already committed. Recording completion without a slug. Repair with: ${DT_STORY} complete ${STORY_FILE} ${id} --slug <slug>" ;;
-      no-record-in-range)
-        slogerr "STORY_RUN: NO-SLUG task=${id} cause=no-record-in-range — no docs/devloop-outputs/*/main.md was ADDED between ${head_before} and HEAD, AND no resume pointer survived. (This does NOT mean the devloop wrote no record: on a resumed task the record exists and was committed by an earlier run.) Recording completion without a slug. Repair with: ${DT_STORY} complete ${STORY_FILE} ${id} --slug <slug>" ;;
-      *)
-        # NO CATCH-ALL INTO A SPECIFIC CLAIM. Every cause gets its own arm;
-        # an unrecognised one makes NO environmental assertion at all. An
-        # earlier shape let `no-record-in-range` be the `*)` fallback, so any
-        # cause the emitter did not know about was reported as "nothing was
-        # added and no resume pointer survived" — a strongly-worded claim
-        # about the environment that had never been established. That is the
-        # same defect as the fall-through this partition was built to fix,
-        # one layer down, and it stops being latent the moment a sixth cause
-        # is added without an arm here (a fifth, `git-error`, was added
-        # mid-review). The classifier being exhaustive is not enough: the
-        # EMITTER has to be faithful too.
-        slogerr "STORY_RUN: NO-SLUG task=${id} cause=unclassified='${slug_cause}' — the slug classifier produced a cause this emitter has no arm for, so no claim is made about why. This is a RUNNER BUG; the completion itself is sound. Repair with: ${DT_STORY} complete ${STORY_FILE} ${id} --slug <slug>" ;;
-    esac
-    "$DT_STORY" complete "$STORY_FILE" "$id"
-  fi
-  git add "$STORY_FILE"
-  if ! git commit --quiet --amend --no-edit; then
-    git commit --quiet -m "chore(story): task #${id} complete (run-story manifest bump)"
-  fi
-  rm -f "$slug_file" "$start_marker" "$stop_count_file"
-  slog "STORY_RUN: COMPLETE task=${id} commit=$(git rev-parse --short HEAD) slug=${task_slug:-none} src=${slug_src:-none} cause=${slug_cause:-none}"
-  report_task_cost "$id"
-
-  # Suppression-visibility monitor: if this task's commit ADDED audit-suppression
-  # entries, surface it — a cleared advisory via suppression (vs a real fix) is a
-  # governed but deliberate choice that should be loud, not buried in a diff.
-  if git show HEAD --format= --name-only 2>/dev/null | grep -q '^audit-suppressions\.toml$'; then
-    added="$(git show HEAD -- audit-suppressions.toml 2>/dev/null | grep -cE '^\+[[:space:]]*id[[:space:]]*=' || true)"
-    if [ "${added:-0}" -gt 0 ]; then
-      slog "STORY_RUN: NOTE task=${id} added ${added} audit suppression(s) — verify security-reviewed with exposure analysis + expiry"
-    fi
-  fi
+  # Slug resolution + dt-story complete + manifest bump + suppression note,
+  # factored into complete_task (shared with --revalidate). The devloop's own
+  # head_before is the commit-range baseline on this path; cost is derived from
+  # the session log.
+  complete_task "$id" "$head_before"
 
   if [ -n "$STOP_AFTER" ] && [ "$id" = "$STOP_AFTER" ]; then
     STOP_AFTER_FIRED=1
