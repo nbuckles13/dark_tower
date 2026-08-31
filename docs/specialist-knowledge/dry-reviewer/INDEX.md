@@ -67,6 +67,7 @@
 
 ## False Positive Boundaries
 - Per-service error mapping (GcError/McError/MhError); MC vs MH GcClient (different RPCs/retry); AC vs GC rate limiting (different mechanisms); `common::jwt` vs `common::meeting_token` (JWT enums narrower)
+- **Media path (ADR-0036 frame v2, 2026-08-31)** — three boundaries, all deliberate: `crates/media-protocol/src/frame.rs:AEAD_TAG_BYTES` (SFrame-0x0005 media *wire* tag) is NOT `crates/ac-service/src/crypto/mod.rs`'s at-rest storage-envelope `16` (same magnitude, different concept; sharing would couple the media ciphersuite to key storage — boundary recorded at the definition); `MAX_PAYLOAD_BYTES` is NOT MC/MH `MAX_MESSAGE_SIZE` (media payload vs signalling envelope; the latter's 2-Rust-home duplication is tracked in `docs/TODO.md`); and Rust<->TypeScript codec duplication is designed-in per ADR-0036 §2, guarded by the story-task-8 vectors drift guard — grep `ANCHOR (DRY)` in `crates/media-protocol/` for the four pinned constants, full precedence statement at `extensions.rs::EXT_REGISTRY`.
 - AC test-side `Claims { ... }` literal repetition -> false-positive on the literal; surrounding decrypt-and-sign IS extracted to `crates/ac-service/tests/common/jwt_fixtures.rs`
 
 ## Tech Debt / Common Crates

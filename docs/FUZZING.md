@@ -225,15 +225,34 @@ cp fuzz/artifacts/target_name/minimized-abc123 \
 
 ### Seed Corpus
 
-Create initial corpus from existing test data:
+`fuzz/corpus/**` is gitignored, so a seed corpus is **generated**, never committed.
+
+For `media-protocol` the generator is a test, not a script or an example:
 
 ```bash
-# Create corpus directory
-mkdir -p fuzz/corpus/target_name
+# Builds every seed through the v2 encoder, asserts its expected decode
+# outcome, and writes fuzz/corpus/{codec_decode,codec_roundtrip}/
+cargo test -p media-protocol --test corpus_seeds
+```
 
-# Add valid inputs from tests
+Two properties make this the preferred shape, and both are worth copying:
+
+- **Seeds are derived from the codec**, so a seed cannot drift from the format
+  it seeds. Every negative seed is an encoder-produced valid frame mutated at a
+  *named constant offset*, never a hand-written byte array — the invalid cases
+  are unencodable by construction, and hand-writing them would make the test
+  file a second home for the wire layout.
+- **The assertions execute.** An earlier design put the generator in
+  `examples/`, where `cargo clippy --all-targets` compiles `main()` but
+  `cargo test` never runs it: the per-seed assertions would have been
+  lint-clean and never executed a single decode. If you write a corpus
+  generator, put it where the pipeline runs it.
+
+For other crates, add valid inputs from existing tests:
+
+```bash
+mkdir -p fuzz/corpus/target_name
 cp tests/fixtures/valid_frame_1.bin fuzz/corpus/target_name/
-cp tests/fixtures/valid_frame_2.bin fuzz/corpus/target_name/
 ```
 
 ### Merge Corpora

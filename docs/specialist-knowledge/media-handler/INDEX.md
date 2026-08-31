@@ -32,12 +32,15 @@
 - Prometheus metric recorders → `crates/mh-service/src/observability/metrics.rs`
 - MH metrics catalog → `docs/observability/metrics/mh-service.md`
 
-## Media Protocol
-- Frame types (MediaFrame, FrameType, FrameFlags) → `crates/media-protocol/src/frame.rs`
-- Binary codec (encode_frame, decode_frame) → `crates/media-protocol/src/codec.rs`
-- Stream state (MediaStream, StreamConfig) → `crates/media-protocol/src/stream.rs`
-- Fuzz: decode → `crates/media-protocol/fuzz/fuzz_targets/codec_decode.rs`
-- Fuzz: roundtrip → `crates/media-protocol/fuzz/fuzz_targets/codec_roundtrip.rs`
+## Media Protocol (v2 frame codec — ADR-0036 §2)
+- Frame v2 layout, exported size constants, decoded `MediaFrameView` → `crates/media-protocol/src/frame.rs`
+- Forward-path buffer-sizing constants (`MAX_HEADER_BYTES`, `MAX_FRAME_BYTES`, `MAX_PAYLOAD_BYTES`) → `frame.rs` (derived; do not recompute in MH)
+- Sequence-reset asymmetry: `hop_sequence` resettable / `stream_sequence` MUST NEVER reset (AEAD nonce input — reset = GCM auth-key recovery) → `frame.rs` accessors (task 16 `HopSequence` lands here, no reset API)
+- Single layout parser + four entry points (`decode_datagram`, `decode_stream_frame`, `peek_frame_len`, `rewrite_relay_region`); reject reasons via enum-derived `ALL_REJECT_REASONS` → `crates/media-protocol/src/codec.rs`
+- Relay-region rewrite (offset derived per frame via `parse_layout`, NEVER a constant) → `codec.rs:rewrite_relay_region()`
+- Reader-side pre-allocation bound (`MAX_PAYLOAD_BYTES` enforced before buffering) → `codec.rs:peek_frame_len()`
+- Extension TLV registry + salience `0x01` selector input (value `0..=100`) → `crates/media-protocol/src/extensions.rs` (story-5 selector)
+- Fuzz: decode / roundtrip → `crates/media-protocol/fuzz/fuzz_targets/`
 
 ## Proto Definitions
 - MC↔MH / MH↔GC / MH→MC RPCs + assignment + DisconnectReason → `proto/dark_tower/internal/v1/internal.proto`

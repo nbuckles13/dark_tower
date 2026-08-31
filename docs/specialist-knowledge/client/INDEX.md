@@ -12,7 +12,7 @@
 ## SDK Core (`packages/sdk-core/src/`)
 - Signaling client (proto ServerMessage → events) → `signaling/SignalingClient.ts`
 - Meeting session (event bridge, single-use per join) → `session/MeetingSession.ts`
-- Binary media frame codec → `framing/`
+- WebTransport length-prefix stream framing (matches MC wire contract) → `framing/length-prefix.ts`, `framing/sendFramed.ts`
 - WebCodecs encode/decode → `media/`
 - WebTransport connection mgmt → `transport/`
 - HTTP/3 meeting API client → `http/`
@@ -58,7 +58,7 @@
 
 ## Protocol Integration
 - Signaling proto (client-server) → `proto/dark_tower/signaling/v1/signaling.proto`
-- 42-byte binary frame format → `crates/media-protocol/src/frame.rs`
+- Media frame binary format (publisher/relay header split, per-frame Ed25519-signed) → `crates/media-protocol/`
 - Cross-language test vectors → `proto/test-vectors/`
 - Meeting-token `display_name` claim (roster names) → `crates/common/src/jwt.rs:MeetingTokenClaims`
 
