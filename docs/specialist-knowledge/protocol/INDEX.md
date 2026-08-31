@@ -14,13 +14,18 @@
 - Proto codegen build script → `crates/proto-gen/build.rs`
 - Proto re-exports and module wiring → `crates/proto-gen/src/lib.rs`
 
-## Media Protocol Crate
-- Media protocol crate root → `crates/media-protocol/src/lib.rs`
-- Binary frame definitions → `crates/media-protocol/src/frame.rs`
-- Codec encode/decode → `crates/media-protocol/src/codec.rs`
-- Stream handling → `crates/media-protocol/src/stream.rs`
-- Codec decode fuzzer → `crates/media-protocol/fuzz/fuzz_targets/codec_decode.rs`
-- Codec roundtrip fuzzer → `crates/media-protocol/fuzz/fuzz_targets/codec_roundtrip.rs`
+## Media Protocol Crate (frame header v2, ADR-0036 §2 + Appendix)
+- Crate root; no-crypto / no-telemetry scope, lint denies → `crates/media-protocol/src/lib.rs`
+- Wire layout, size constants, flags, zero-copy view, publisher/relay split → `crates/media-protocol/src/frame.rs`
+- TLV extension grammar + registry (type → value length → accepted set) → `crates/media-protocol/src/extensions.rs`
+- Single parser, four entry points, encode, reject-reason vocabulary → `crates/media-protocol/src/codec.rs`
+- Relay-region rewrite (offset derived per frame, never a constant) → `crates/media-protocol/src/codec.rs:rewrite_relay_region()`
+- Reader-side pre-allocation bound → `crates/media-protocol/src/codec.rs:peek_frame_len()`
+- No-skipped-byte proof (every byte and bit mutated) → `crates/media-protocol/tests/byte_coverage.rs`
+- Reject reasons, precedence, producibility, prefix invariant → `crates/media-protocol/tests/reject_reasons.rs`
+- Zero-copy aliasing, canonical roundtrip, relay rewrite, redaction → `crates/media-protocol/tests/frame_properties.rs`
+- Fuzz seed corpus (asserted under `cargo test`) + shared 2x2 fixture matrix → `crates/media-protocol/tests/corpus_seeds.rs`, `crates/media-protocol/tests/common/mod.rs`
+- Codec fuzzers (decode, roundtrip) → `crates/media-protocol/fuzz/fuzz_targets/`
 
 ## gRPC Services (internal.proto)
 - MediaHandlerService (MC→MH): Register, RegisterMeeting, RouteMedia, StreamTelemetry → `proto/dark_tower/internal/v1/internal.proto`

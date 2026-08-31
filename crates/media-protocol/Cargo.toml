@@ -10,15 +10,14 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
-# Workspace dependencies
-tokio = { workspace = true }
-serde = { workspace = true }
+# Deliberately minimal. This crate holds no keys, performs no cryptography, and
+# emits no telemetry (ADR-0036 §4, §7, §11).
+#
+# `tracing` is intentionally ABSENT: without the dependency a log or metric
+# macro in this crate is a compile error rather than a rule someone has to
+# remember. Errors return; the caller counts them by `codec::RejectReason`.
+#
+# `tokio`, `serde`, `common` and the `criterion` dev-dependency were declared
+# for the v1 codec and used by nothing; they are removed rather than carried.
 thiserror = { workspace = true }
 bytes = { workspace = true }
-tracing = { workspace = true }
-
-# Local dependencies
-common = { path = "../common" }
-
-[dev-dependencies]
-criterion = { workspace = true }

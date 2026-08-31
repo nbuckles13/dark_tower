@@ -407,15 +407,25 @@ Before implementing a new feature, answer these questions:
 **Priority**: 🔴 CRITICAL
 
 **Fuzz Targets**:
-- `media_protocol/fuzz/fuzz_targets/codec_decode.rs` - Malformed input
-- `media_protocol/fuzz/fuzz_targets/codec_roundtrip.rs` - Correctness
+- `media_protocol/fuzz/fuzz_targets/codec_decode.rs` - Malformed input; drives all four entry
+  points (`decode_datagram`, `decode_stream_frame`, `peek_frame_len`, `rewrite_relay_region`),
+  because they differ exactly where a bug hides. `peek_frame_len` is the only one that covers the
+  reader-side pre-allocation bound, which ADR-0036 §2 notes a fuzz test of the decode function
+  alone structurally misses.
+- `media_protocol/fuzz/fuzz_targets/codec_roundtrip.rs` - Correctness. Asserts **byte identity**,
+  not field equality: encoding is canonical, so `encode(decode(x)) == x` means decode is injective
+  over the accepted language, which is the no-covert-channel property. Weakening this to a field
+  comparison silently gives that up.
 
-**Seed Corpus**:
-- Valid audio frame
-- Valid video keyframe
-- Valid video delta frame
-- Frames with all flags combinations
-- Edge cases: max payload length, sequence overflow
+**Seed Corpus**: generated and asserted by `cargo test -p media-protocol --test corpus_seeds`
+(the corpus directory is gitignored; the *generator* is the checked-in artifact). Covers the four
+header shapes (key-bearing × extensions-present) at three payload sizes, each undefined flag bit
+individually, `payload_length` at and over the maximum, every extension-grammar rejection, trailing
+bytes, and truncation at **every** byte offset of every shape.
+
+**Known gap**: `Cargo.toml` excludes `crates/media-protocol/fuzz` (and `crates/ac-service/fuzz`)
+from the workspace, so `scripts/layer-all.sh` compiles neither — a fuzz target that does not build
+cannot fail. `cargo-fuzz` is also absent from the devloop container. Tracked in `docs/TODO.md`.
 
 **CI**: Runs for 60s per target on every PR
 

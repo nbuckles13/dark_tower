@@ -532,15 +532,20 @@ Client-side JavaScript for sending media via datagrams:
 // Get datagram writer
 const datagramWriter = transport.datagrams.writable.getWriter();
 
-// Encode media frame (using media-protocol format)
+// Encode media frame (media-protocol v2 header — ADR-0036 §2 + Appendix).
+// The header splits into a publisher region (signed and used as the AEAD
+// associated data) and a relay region the media handler rewrites per
+// subscriber. There is no media-type field: the independently-decodable flag
+// replaces it, because MH must not learn audio from video (§7).
 const encodedFrame = encodeMediaFrame({
-  user_id: myUserId,
-  stream_id: streamId,
-  frame_type: FrameType.VideoKey,
-  timestamp: performance.now() * 1000,  // microseconds
-  sequence: frameSequence++,
-  flags: { end_of_frame: true, discardable: false },
-  payload: encryptedFrameData  // SFrame encrypted
+  flags: { independentlyDecodable: true, discardable: false, keyBearing: true },
+  streamSequence: streamSequence++,   // per (sender, stream); NEVER reset — AEAD nonce input
+  wrappedTransmitKey: wrapped,        // present iff keyBearing (§4)
+  extensions: [],                     // publisher-set TLV (§7); loopback carries none
+  streamId,                           // relay region: subscriber slot
+  hopSequence: hopSequence++,         // relay region: per (connection, media stream)
+  payload: sframeObject,              // opaque SFrame object
+  signature                           // Ed25519 over publisher region then payload (§3)
 });
 
 // Send via datagram
