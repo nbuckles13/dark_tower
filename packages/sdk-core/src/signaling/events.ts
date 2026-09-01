@@ -6,11 +6,15 @@
 // the public `.d.ts` would break consumers on a clean checkout. SignalingClient
 // maps the wire types onto these plain shapes at the dispatch boundary.
 //
-// `userId` is `bigint` (proto `uint64` → protobuf-es `bigint`, R-17). The roster
-// is intentionally minimal for this story (participantId + name); stream metadata
-// is out of scope until layout/subscription lands.
+// `senderId` is `number | undefined` (proto `optional uint32`, ADR-0036 §2).
+// The roster is intentionally minimal for this story (participantId + name);
+// per-slot stream metadata arrives with the receive-capability model (§6).
 
 import { LeaveReason } from '../proto/dark_tower/signaling/v1/signaling_pb.js';
+
+import type { SignalingCodec } from './codecMap.js';
+
+export { SignalingCodec } from './codecMap.js';
 
 /** A participant in the meeting roster (minimal shape for this story). */
 export interface RosterParticipant {
@@ -19,14 +23,28 @@ export interface RosterParticipant {
 }
 
 /**
- * Payload of the `joined` event (proto `JoinResponse`). `userId` is a `bigint`
- * (proto `uint64`). `mediaServers` are the MH WebTransport URLs taken from each
+ * Payload of the `joined` event (proto `JoinResponse`).
+ *
+ * `senderId` is the joiner's per-meeting numeric sender id (ADR-0036 §2): a
+ * `number` carrying 16-bit semantics, valid 1..=65535, and `undefined` when MC
+ * has not assigned one — the state this story ships. **Zero is never valid and
+ * `undefined` MUST NOT be coerced to 0** (no `?? 0`): identical sender ids
+ * collide on the SFrame key id and therefore on the derived AES-GCM wrap nonce
+ * under one meeting KEK. It replaces the pre-ADR-0036 `userId`, which was a
+ * hardcoded-zero `uint64` durable user id; a per-meeting id is deliberate,
+ * because a durable one would make participants linkable across meetings.
+ *
+ * `mediaServers` are the MH WebTransport URLs taken from each
  * `MediaServerInfo.mediaHandlerUrl`. `correlationId`/`bindingToken` are stored for
  * future reconnection (storage only this story).
+ *
+ * Deliberately carries NO key material: the meeting KEK is on the wire
+ * (`JoinResponse.meetingKek`) but is not projected here, because this object's
+ * natural use is `console.log`.
  */
 export interface JoinedEvent {
   readonly participantId: string;
-  readonly userId: bigint;
+  readonly senderId?: number | undefined;
   readonly existingParticipants: readonly RosterParticipant[];
   readonly mediaServers: readonly string[];
   readonly correlationId: string;
@@ -85,10 +103,21 @@ export function mapLeaveReason(reason: LeaveReason): ParticipantLeaveReason {
  * proto3 defaults (empty arrays / false / 0) when omitted.
  */
 export interface SignalingCapabilities {
-  readonly videoCodecs?: readonly string[];
-  readonly audioCodecs?: readonly string[];
-  readonly supportsSimulcast?: boolean;
-  readonly maxVideoStreams?: number;
+  /**
+   * Codecs this client can encode and decode, in the stable public vocabulary
+   * ({@link SignalingCodec}). One list, not a video/audio pair: media kind is
+   * a property of the codec's own identity, so encoding it a second time
+   * positionally would let the two representations disagree.
+   */
+  readonly supportedCodecs?: readonly SignalingCodec[];
+
+  /**
+   * Frame header versions this client can produce and consume (ADR-0036 §2).
+   * An upper bound on what the client can do — never a lower bound on what the
+   * meeting accepts: MC selects from a server-side allowlist with a minimum
+   * floor and rejects a client that declares nothing at or above it.
+   */
+  readonly supportedHeaderVersions?: readonly number[];
 }
 
 /** Parameters for {@link SignalingClient.join}. */

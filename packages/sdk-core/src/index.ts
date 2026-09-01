@@ -129,6 +129,11 @@ export type {
 } from './signaling/SignalingClient.js';
 
 export { ParticipantLeaveReason } from './signaling/events.js';
+// Public vocabulary of `SignalingCapabilities.supportedCodecs`; root-exported to
+// mirror `ParticipantLeaveReason` so an external consumer can name the type
+// (const object carries both value and type). Without it the field ships with a
+// nameless vocabulary.
+export { SignalingCodec } from './signaling/events.js';
 export type {
   JoinedEvent,
   MhConnectionStatusReport,

@@ -6,7 +6,8 @@
 //! - Real-time meeting coordination and participant state management
 //! - Session binding token pattern for secure session recovery (ADR-0023)
 //! - WebTransport connection handling for client signaling
-//! - Layout subscription management (virtualized pub/sub)
+//! - Receive-capability management (ADR-0036 §6: the client declares slots it
+//!   can decode; MC composes the experience and assigns sources to them)
 //! - Media Handler coordination for media routing
 //! - Graceful shutdown with meeting migration
 //!

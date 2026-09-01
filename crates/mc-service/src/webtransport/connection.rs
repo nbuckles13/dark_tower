@@ -964,6 +964,17 @@ async fn build_join_response(
             name: p.display_name.clone(),
             streams: Vec::new(),
             joined_at: 0,
+            // ADR-0036 §4: the roster carries the sender id and the identity
+            // signing public key, and no other key material. Both are
+            // unpopulated until story task 10 lands MC's sender-id allocator
+            // and roster publication of the client's key.
+            //
+            // `sender_id` is `None`, never `Some(0)`: 0 is reserved-invalid,
+            // and N unassigned participants sharing it would collide on one
+            // roster identity and — via key id, derived wrap nonce — on one
+            // AES-GCM nonce.
+            sender_id: None,
+            identity_public_key: Vec::new(),
         })
         .collect();
 
@@ -992,10 +1003,17 @@ async fn build_join_response(
     Ok((
         JoinResponse {
             participant_id: result.participant_id.clone(),
-            user_id: 0,
             existing_participants,
             media_servers,
-            encryption_keys: None,
+            // ADR-0036 §2/§4. Unpopulated this story: MC has no sender-id
+            // allocator and no per-meeting KEK yet — both land in story task
+            // 10. `sender_id: None` is the honest "not yet assigned" state
+            // (see the field's contract in signaling.proto); an empty
+            // `meeting_kek` means not-yet-provisioned, and consumers fail
+            // closed on it rather than wrapping under a short key.
+            sender_id: None,
+            meeting_kek: Vec::new(),
+            kek_generation: 0,
             correlation_id: result.correlation_id.clone(),
             binding_token: result.binding_token.clone(),
         },

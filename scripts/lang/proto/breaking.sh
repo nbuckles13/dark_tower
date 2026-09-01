@@ -59,4 +59,47 @@ else
   fi
 fi
 
+# Surface any in-tree `breaking.ignore` carve-out BEFORE running the gate, using the
+# same `SUPPRESSED=` idiom as scripts/lang/rust/audit.sh and scripts/lang/ts/audit.sh
+# (the other two audit-family gates that can be silenced by a tracked in-tree list).
+#
+# This is the loudness control for the ONE suppression channel the comment block above
+# does not close. That block is about CLI/env bypass — we don't forward "$@", there is
+# no skip env var — and it stays true. But `proto/buf.yaml` can silence this gate via
+# `breaking.ignore`, and buf reports a plain green when it does, so without this line a
+# reader of Layer-6 output sees `STATUS=OK REASON=buf-breaking-passed` with no
+# signal that enforcement is off. Silent green on a disabled gate is the masked failure
+# CLAUDE.md forbids; an in-tree, greppable, per-run `SUPPRESSED=` line is the fix, and
+# it is also the mechanical reminder that a prose TODO cannot be — it fires on every
+# run until the key is deleted.
+#
+# COVERAGE LIMIT: `.github/workflows/ci-client.yml` does NOT route through this wrapper —
+# it hand-rolls `pnpm exec buf breaking` with its own `git merge-base` (self-described
+# there as an INTERIM PATCH pending "run CI in the devloop image"). The buf.yaml carve-out
+# itself DOES apply there (buf reads proto/buf.yaml regardless of caller — verified on the
+# CI-pinned buf 1.72.0), but this SUPPRESSED= line does not, so GitHub CI still shows a
+# bare green. Routing that step through this wrapper is the fix and is NOT a drop-in:
+# ci-client.yml also runs on `push: [main, develop]`, where its hand-roll bases on
+# origin/main while _get_base_ref.sh bases on HEAD~1. Owner: infrastructure.
+#
+# Deliberately a warning, not a failure: intentional wire breaks are legitimate (ADR-0033
+# §13) and this wrapper must not become the thing that blocks one. It makes the carve-out
+# impossible to *not notice*, which is the property that was missing.
+__buf_yaml="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)/proto/buf.yaml"
+if [[ -f "$__buf_yaml" ]]; then
+  # Paths listed under `breaking:` → `ignore:`. Scoped to that block so a future
+  # `lint.ignore` is not misreported as a breaking-gate suppression.
+  __ignored="$(awk '
+    /^breaking:/            { in_breaking = 1; next }
+    /^[^[:space:]#]/        { in_breaking = 0; in_ignore = 0 }
+    in_breaking && /^  ignore:[[:space:]]*$/ { in_ignore = 1; next }
+    in_breaking && /^  [^[:space:]#]/        { in_ignore = 0 }
+    in_ignore && /^    - / { sub(/^    - /, ""); print }
+  ' "$__buf_yaml" | paste -sd, -)"
+  if [[ -n "$__ignored" ]]; then
+    echo "SUPPRESSED=${__ignored}" >&2
+    echo "buf breaking: enforcement is DISABLED for the paths above via proto/buf.yaml 'breaking.ignore'. A green result does NOT mean those files are break-free. See the comment block in proto/buf.yaml for the restore condition." >&2
+  fi
+fi
+
 run_and_emit "buf-breaking" buf breaking proto --against ".git#ref=${BASE_SHA},subdir=proto"

@@ -66,6 +66,8 @@ import type {
 
 import { isAuthClass, mapErrorCode, staticMessageFor } from './errorCodeMap.js';
 import { mapLeaveReason } from './events.js';
+import { toWireCodec } from './codecMap.js';
+import type { Codec } from '../proto/dark_tower/signaling/v1/signaling_pb.js';
 import type {
   JoinedEvent,
   MhConnectionStatusReport,
@@ -288,10 +290,15 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
 
     const caps = params.capabilities;
     const capabilities = create(ParticipantCapabilitiesSchema, {
-      videoCodecs: caps?.videoCodecs ? [...caps.videoCodecs] : [],
-      audioCodecs: caps?.audioCodecs ? [...caps.audioCodecs] : [],
-      supportsSimulcast: caps?.supportsSimulcast ?? false,
-      maxVideoStreams: caps?.maxVideoStreams ?? 0,
+      // Public vocabulary → wire enum through the one oracle in codecMap.ts.
+      // An unmappable value is dropped rather than sent as
+      // `CODEC_UNSPECIFIED`, which is never valid on the wire (ADR-0036 §5).
+      supportedCodecs: (caps?.supportedCodecs ?? [])
+        .map(toWireCodec)
+        .filter((c): c is Codec => c !== undefined),
+      supportedHeaderVersions: caps?.supportedHeaderVersions
+        ? [...caps.supportedHeaderVersions]
+        : [],
     });
     const joinRequest = create(JoinRequestSchema, {
       meetingId: params.meetingId,
@@ -431,7 +438,9 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
         this.#bindingToken = jr.bindingToken;
         const event: JoinedEvent = {
           participantId: jr.participantId,
-          userId: jr.userId,
+          // `optional uint32` → `number | undefined`. Absence is passed
+          // through, never coerced to 0 (ADR-0036 §2: 0 is reserved-invalid).
+          senderId: jr.senderId,
           existingParticipants: jr.existingParticipants.map((p) => ({
             participantId: p.participantId,
             name: p.name,

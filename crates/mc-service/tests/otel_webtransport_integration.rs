@@ -98,6 +98,10 @@ async fn join_with_trace(
             capabilities: None,
             correlation_id: String::new(),
             binding_token: String::new(),
+            // ADR-0036 §4: raw Ed25519 identity signing public key. Empty here —
+            // this test exercises the join path, not attribution, and MC performs
+            // no attestation check this story.
+            identity_public_key: Vec::new(),
         })),
     };
     send.write_all(&encode_framed(&client_msg))

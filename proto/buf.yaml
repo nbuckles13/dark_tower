@@ -7,3 +7,38 @@ lint:
 breaking:
   use:
     - FILE
+  # TEMPORARILY DISABLED FOR ONE FILE (2026-08-31) — RESTORE AFTER ADR-0036 STORY 1
+  # MERGES TO MAIN.
+  #
+  # WHY: the ADR-0036 Appendix mandates an intentional wire break (signalling
+  # contract reshape; 54 FILE-level findings, predicted in-tree and measured
+  # set-identical, accepted by the user at the task-3 escalation of
+  # docs/user-stories/2026-08-27-hear-yourself-through-handler.md).
+  #
+  # SCOPE: buf's `breaking.ignore` takes PATHS (files/dirs relative to the module
+  # root), not package names, so this is scoped to the single file that breaks.
+  # All 54 findings are in signaling.proto; zero are in internal.proto (measured by
+  # running `buf breaking` with no ignore and bucketing findings by file). A blanket
+  # `- dark_tower` would also silence `dark_tower/internal/v1/internal.proto` — and
+  # that is not theoretical: story tasks 4 and 8-10 reshape exactly that MC<->MH
+  # contract while this carve-out is in force, so it stays under full enforcement.
+  #
+  # COST: inside signaling.proto NO break of any kind is caught while this is
+  # present, including unintended ones — reviewers must read that file's diff by
+  # hand. buf has no per-finding acceptance (ADR-0033 §13 Wave-3 mechanism unbuilt),
+  # so one file is the narrowest granularity the tool offers.
+  #
+  # LOUDNESS: scripts/lang/proto/breaking.sh detects this key and emits
+  # `SUPPRESSED=<paths>` on every Layer-6 run (same idiom as
+  # scripts/lang/rust/audit.sh and scripts/lang/ts/audit.sh), so the pipeline never
+  # reports a silent green while it is present. GitHub CI is NOT covered by that
+  # line — ci-client.yml hand-rolls its own `buf breaking` invocation; the carve-out
+  # applies there, the warning does not. See breaking.sh §COVERAGE LIMIT.
+  #
+  # RESTORE: delete the `ignore:` key once the story PR merges to main — the first
+  # post-merge merge-base is post-reshape, so FILE enforcement goes green on its
+  # own. Rebase any in-flight proto-touching branch onto post-merge main first, or
+  # its merge-base is still pre-reshape and it will re-fire all 54. Tracked in
+  # docs/TODO.md ("Restore buf breaking enforcement after ADR-0036 story 1").
+  ignore:
+    - dark_tower/signaling/v1/signaling.proto

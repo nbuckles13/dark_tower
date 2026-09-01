@@ -902,8 +902,8 @@ mod tests {
             display_name: "New User".to_string(),
             audio_self_muted: false,
             video_self_muted: false,
-            audio_host_muted: false,
-            video_host_muted: false,
+            audio_server_muted: false,
+            video_server_muted: false,
             status: super::super::messages::ParticipantStatus::Connected,
         });
         handle.send_update(update).await.unwrap();
@@ -954,8 +954,8 @@ mod tests {
             participant_id: "part-other".to_string(),
             audio_self_muted: true,
             video_self_muted: false,
-            audio_host_muted: false,
-            video_host_muted: false,
+            audio_server_muted: false,
+            video_server_muted: false,
         };
         handle.send_update(update).await.unwrap();
 

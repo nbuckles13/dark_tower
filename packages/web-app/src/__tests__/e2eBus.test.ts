@@ -49,7 +49,7 @@ test('joined projection drops bindingToken and correlationId (whitelist)', () =>
   installE2EHooks(session);
   session.fire('joined', {
     participantId: 'self',
-    userId: 123n,
+    senderId: 123,
     existingParticipants: [{ participantId: 'a', name: 'Ann' }],
     mediaServers: ['https://mh-0:4433'],
     correlationId: 'CORR_SECRET',
@@ -59,7 +59,7 @@ test('joined projection drops bindingToken and correlationId (whitelist)', () =>
   const joined = events().find((e) => e['type'] === 'joined');
   expect(joined).toBeDefined();
   expect(joined?.['participantId']).toBe('self');
-  expect(joined?.['userId']).toBe('123'); // stringified bigint
+  expect(joined?.['senderId']).toBe('123'); // stringified per-meeting sender id
   expect(joined?.['bindingToken']).toBeUndefined();
   expect(joined?.['correlationId']).toBeUndefined();
   expect(JSON.stringify(joined)).not.toContain('BINDING_SECRET');

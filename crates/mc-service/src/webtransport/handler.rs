@@ -20,6 +20,12 @@ pub fn encode_participant_update(update: &ParticipantStateUpdate) -> Option<Serv
                 name: info.display_name.clone(),
                 streams: Vec::new(),
                 joined_at: 0,
+                // ADR-0036 §4: sender id and identity signing key are the only
+                // roster additions, and no other key material rides here.
+                // Unpopulated until story task 10. `None`, never `Some(0)` —
+                // 0 is reserved-invalid for `sender_id`.
+                sender_id: None,
+                identity_public_key: Vec::new(),
             };
             // R-57: carry the current server-side trace context to the client on
             // the fan-out broadcast (bounded W3C IDs only).
@@ -97,8 +103,8 @@ mod tests {
             display_name: name.to_string(),
             audio_self_muted: false,
             video_self_muted: false,
-            audio_host_muted: false,
-            video_host_muted: false,
+            audio_server_muted: false,
+            video_server_muted: false,
             status: ParticipantStatus::Connected,
         }
     }
@@ -196,8 +202,8 @@ mod tests {
             participant_id: "part-1".to_string(),
             audio_self_muted: true,
             video_self_muted: false,
-            audio_host_muted: false,
-            video_host_muted: false,
+            audio_server_muted: false,
+            video_server_muted: false,
         };
         assert!(encode_participant_update(&update).is_none());
     }

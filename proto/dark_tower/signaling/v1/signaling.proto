@@ -4,12 +4,174 @@ package dark_tower.signaling.v1;
 
 import "google/protobuf/timestamp.proto";
 
-// Participant capabilities during join
+// ============================================================================
+// Media vocabulary (ADR-0036)
+// ============================================================================
+
+// What a media stream carries. Replaces the pre-ADR-0036 `StreamType` and
+// `MediaType`, which were duplicate spellings of one concept.
+//
+// This is a client/MC concept only. A media handler is deliberately blind to
+// it (ADR-0036 §7): MH cannot decrypt, so media-type awareness would be
+// knowledge it has no legitimate source for, and a new media kind must cost
+// zero MH changes. The subscriber learns the kind from its own slot
+// declaration, never from a frame.
+enum MediaKind {
+  MEDIA_KIND_UNSPECIFIED = 0;
+  MEDIA_KIND_AUDIO = 1;
+  MEDIA_KIND_VIDEO_CAMERA = 2;
+  MEDIA_KIND_VIDEO_SCREEN = 3;
+}
+
+// Codec vocabulary, defined once for both directions: what a participant
+// declares it can handle (`ParticipantCapabilities.supported_codecs`) and what
+// MC directs it to produce (`EncodingParameters.codec`).
+//
+// A closed enum rather than free-form strings so that "MC directed a codec the
+// participant never declared" is checkable rather than merely wrong. Media
+// kind is NOT encoded positionally by which list a value appears in — it is a
+// property of the codec's own identity, so there is exactly one home for the
+// classification.
+//
+// `CODEC_UNSPECIFIED` is never valid in a send directive. Zero is not a silent
+// Opus, the same fail-closed rule `TransportMode` carries: an unset field must
+// not select a codec by default, or the closed-set property is defeated on
+// every directive that forgets to set it. Enforcement is MC-side (story task
+// 14); the proto cannot check it.
+enum Codec {
+  CODEC_UNSPECIFIED = 0;
+  CODEC_OPUS = 1;
+  CODEC_VP9 = 2;
+  CODEC_AV1 = 3;
+  CODEC_H264 = 4;
+}
+
+// How a media stream is carried on the wire (ADR-0036 §1, §5).
+//
+// Transport mode is not compiled in: it is a per-stream behaviour MC assigns,
+// so moving video to datagrams-plus-FEC later is a configuration change.
+//
+// `TRANSPORT_MODE_UNSPECIFIED` is fail-closed: MC MUST assign a mode, and the
+// zero value is not a convenient "datagram" default. A client receiving
+// UNSPECIFIED on a send target MUST reject the directive rather than guess.
+enum TransportMode {
+  TRANSPORT_MODE_UNSPECIFIED = 0;
+  // One frame per QUIC datagram. Audio today (ADR-0036 §1).
+  TRANSPORT_MODE_DATAGRAM = 1;
+  // One unidirectional QUIC stream per group of pictures: a stream opens at
+  // each independently-decodable frame and is finished or reset when the next
+  // group begins. Video today. The stream's head-of-line blocking scope equals
+  // the decode-dependency scope, which is what fixes the granularity.
+  TRANSPORT_MODE_STREAM_PER_GROUP = 2;
+}
+
+// The state of one of a subscriber's receive slots (ADR-0036 §6).
+//
+// Slot state is explicit on the wire because **absence of frames is not a
+// signal**. "Withheld by congestion", "fewer sources than slots" and "source
+// unreachable" are indistinguishable to a client — all present as no media —
+// and render completely differently. A client that cannot tell them apart
+// shows the same spinner for a bandwidth problem, an under-filled grid, and a
+// participant it can never see.
+//
+// OBSERVABILITY (ADR-0036 §11): a slot is a stream identity. Slot state may be
+// aggregated into a bounded counter; it MUST NOT be joined to a slot id,
+// sender id or meeting id in a metric label or span attribute.
+enum SlotState {
+  SLOT_STATE_UNSPECIFIED = 0;
+  // Steady: a source is assigned and producing.
+  SLOT_STATE_ACTIVE = 1;
+  // Steady: the source is present but has muted itself at capture, so no media
+  // leaves its device (ADR-0036 §5 client mute). The receiver renders a
+  // placeholder from this state, never from a substitute frame.
+  SLOT_STATE_SOURCE_MUTED = 2;
+  // Transient, and the only genuinely MH-observed state.
+  SLOT_STATE_WITHHELD_BY_CONGESTION = 3;
+  // Steady: the meeting has fewer sources than the subscriber requested slots.
+  SLOT_STATE_FEWER_SOURCES_THAN_SLOTS = 4;
+  // Steady: the subscriber requested zero of this kind.
+  SLOT_STATE_ZERO_REQUESTED = 5;
+  // Structurally persistent, unlike the transient states above (ADR-0036 §9).
+  SLOT_STATE_SOURCE_UNREACHABLE = 6;
+  // Transient: a source switch has been commanded and is waiting on the new
+  // source's next independently-decodable frame (ADR-0036 §7). Carries the
+  // requesting command identifier in
+  // `StreamAssignment.switch_command_id` — completion is reported by command
+  // id, never by state description, because "A to B complete" is ambiguous
+  // when a slot has switched to B, reverted to A, and switched to B again.
+  SLOT_STATE_SWITCH_PENDING = 7;
+}
+
+// ============================================================================
+// Capabilities and join
+// ============================================================================
+
+// Participant capabilities during join.
 message ParticipantCapabilities {
-  repeated string video_codecs = 1; // e.g., ["VP9", "AV1", "H264"]
-  repeated string audio_codecs = 2; // e.g., ["Opus", "AAC"]
-  bool supports_simulcast = 3;
-  uint32 max_video_streams = 4;
+  // Pre-ADR-0036 shape, removed in full.
+  //
+  // `video_codecs`/`audio_codecs` were free-form strings whose media-kind
+  // classification was encoded positionally; both collapse into
+  // `supported_codecs`, where the classification lives in the codec's own
+  // identity.
+  //
+  // `supports_simulcast`: simulcast and scalable coding are explicitly out of
+  // scope in ADR-0036.
+  //
+  // `max_video_streams`: superseded by `ReceiveCapability` (ADR-0036 §6). A
+  // scalar maximum and an explicit per-slot list are two representations of
+  // one constraint, and the slot list is strictly more expressive — it carries
+  // media kind and an optional pin per slot, and its length IS the count.
+  // Keeping both would let them disagree.
+  reserved 1 to 4;
+
+  reserved "video_codecs", "audio_codecs", "supports_simulcast", "max_video_streams";
+
+  // Codecs this participant can encode and decode. An upper bound on what the
+  // client can do — never a lower bound on what the meeting accepts.
+  //
+  // Unbounded on this client-to-server wire; the proto does not enforce a cap.
+  // Server-side configuration caps it and MC REJECTS an over-cap declaration,
+  // same as the other two unbounded repeated fields in this message
+  // (`supported_header_versions`, and `ReceiveCapability.slots`). Enforcement
+  // owner: story task 10 (join-path validation).
+  repeated Codec supported_codecs = 5;
+
+  // Frame header versions (ADR-0036 §2) this client can produce and consume.
+  //
+  // The header version is meeting-wide and MC-directed: it sits in the signed
+  // publisher region, so a relay cannot translate between versions, and MC
+  // therefore selects one version for the whole meeting from the participants'
+  // declarations and carries it in the send directive.
+  //
+  // SECURITY — this is a negotiation surface, and header v2 is the version
+  // carrying the signature and the key-bearing flag. MC MUST select from a
+  // server-side allowlist with a configured minimum version floor. A
+  // declaration is an upper bound on what a client can do, never a lower bound
+  // on what the meeting accepts: a client declaring nothing at or above the
+  // floor is REJECTED AT JOIN, never accommodated by lowering the meeting. An
+  // empty list is NOT "accept anything" — fail closed. Otherwise one patched
+  // client declaring only version 1 drags the whole meeting onto a header with
+  // no sender-authentication or key-carriage guarantees.
+  //
+  // The list is unbounded on this wire; the proto does not enforce a cap.
+  // Server-side configuration caps it.
+  //
+  // ENFORCEMENT NOT YET ALLOCATED TO A TASK. The allowlist, the minimum floor
+  // and the below-floor join rejection above are REQUIRED but no current story
+  // task carries them — neither task 14 nor task 10's prompt mentions a version
+  // floor or an allowlist, and this is latent only because PROTOCOL_VERSION is
+  // 2 with no v1 downgrade path. Tracked in `docs/TODO.md` (filed by
+  // operations, Gate 3); a task must own it before a second header version
+  // exists. Do NOT read this obligation as covered.
+  //
+  // ANCHOR (DRY): the cross-language single source of truth for the header
+  // version is `proto/test-vectors/frame-v2.vectors.json` (story task 8);
+  // `crates/media-protocol/src/frame.rs::PROTOCOL_VERSION` is the Rust-side
+  // derivation. Precedence: vectors beat prose, but a vector contradicting a
+  // recorded ruling is a defect to escalate rather than conform to — see
+  // `docs/TODO.md` §Media Path Obligations.
+  repeated uint32 supported_header_versions = 6;
 }
 
 // Request to join a meeting (ADR-0023 Session Binding Token Pattern)
@@ -25,66 +187,124 @@ message JoinRequest {
   // Session recovery fields (ADR-0023)
   string correlation_id = 5; // UUIDv7, empty for first join
   string binding_token = 6; // HMAC-SHA256 binding token, empty for first join
+
+  // The client's raw Ed25519 identity signing public key (ADR-0036 §4 step 2).
+  // Exactly 32 bytes: the raw key, NOT PEM, JWK, base64 or SPKI.
+  //
+  // This story performs NO attestation check. MC does not verify this key
+  // against the meeting token's `cnf` thumbprint, and publishes it on the
+  // roster as received — trust on first use. A frame signature verified
+  // against it therefore proves only that every frame came from the same
+  // keyholder; it never proves WHO that keyholder is, and for a guest it never
+  // proves more than a pseudonym. The client-validated AC attestation that
+  // closes this is story 2.
+  //
+  // The proto does not validate length. MC MUST length-check 32 before
+  // publishing a client-controlled blob to every participant on the roster;
+  // the enforcement lands in story task 10 (MC join path), NOT task 3.
+  // Empty means NO KEY PUBLISHED: consumers MUST fail closed and MUST NOT fall
+  // back to accepting unsigned frames.
+  //
+  // Identity keys are scoped to ONE MEETING, not to a participant across
+  // meetings (ADR-0036 §4): a key reused across meetings makes a participant
+  // linkable by public key regardless of display name, which matters most for
+  // the guests who have the least identity assurance to begin with.
+  //
+  // OBSERVABILITY: public material, so not a do-not-log rule — but a stable
+  // per-participant identifier for the meeting's lifetime. Never a metric
+  // label, never a span attribute, never a per-frame log dimension.
+  bytes identity_public_key = 7;
 }
 
-// Encryption keys for end-to-end encryption
-message EncryptionKeys {
-  bytes public_key = 1;
-  string key_id = 2;
-}
-
-// Information about the media server
+// Information about the media server.
+//
+// Kept as a message rather than collapsed to a bare URL string: this is the
+// join-time handler DESCRIPTOR, and ADR-0036 §9 (handler unreachability) and
+// §10 (transport seam) are expected to add per-handler fields to it. The
+// vestigial `reserved 2` is what makes it look unearned today.
 message MediaServerInfo {
+  // Server-to-client. Same spelling as `SendTarget.media_handler_url` and
+  // `StreamAssignment.media_handler_url` — one name for one concept.
   string media_handler_url = 1;
-  reserved 2; // was: connection_token (removed — client uses meeting JWT)
+
+  // `connection_token` is not reused, so both halves are reserved (CONVENTIONS
+  // §Rule 5): the number keeps a future field off tag 2, the name keeps a
+  // future field from silently re-adopting the old identifier.
+  reserved 2;
+  reserved "connection_token";
 }
 
-// Stream type enumeration
-// TODO(post-story): rename to STREAM_TYPE_AUDIO/CAMERA/SCREEN per buf STANDARD ENUM_VALUE_PREFIX (wire-breaking; tracked in docs/TODO.md).
-// buf:lint:ignore ENUM_VALUE_PREFIX
-// buf:lint:ignore ENUM_ZERO_VALUE_SUFFIX
-enum StreamType {
-  AUDIO = 0;
-  VIDEO_CAMERA = 1;
-  VIDEO_SCREEN = 2;
+// Encoding parameters for one media stream (ADR-0036 §5).
+//
+// The single encoding vocabulary in this file. Replaces the pre-ADR-0036
+// `StreamMetadata`/`VideoMetadata`/`SimulcastLayer` cluster; simulcast and
+// scalable coding are explicitly out of scope in ADR-0036.
+//
+// One shape for audio and video. Audio ignores `width`, `height` and
+// `frame_rate`; the fields are present anyway so a later video story needs no
+// wire change.
+message EncodingParameters {
+  // Server-to-client when carried on a send directive.
+  Codec codec = 1;
+  uint32 max_bitrate_bps = 2;
+  uint32 width = 3;
+  uint32 height = 4;
+  uint32 frame_rate = 5;
 }
 
-// Simulcast layer configuration
-message SimulcastLayer {
-  string layer_id = 1;
-  uint32 width = 2;
-  uint32 height = 3;
-  uint32 max_bitrate = 4;
-}
-
-// Video metadata
-message VideoMetadata {
-  uint32 width = 1;
-  uint32 height = 2;
-  uint32 framerate = 3;
-  repeated SimulcastLayer simulcast_layers = 4;
-}
-
-// Stream metadata
-message StreamMetadata {
-  string codec = 1;
-  uint32 max_bitrate = 2;
-  VideoMetadata video = 3; // Only for video streams
-}
-
-// Media stream information
+// Media stream information.
 message MediaStream {
   string stream_id = 1;
-  StreamType stream_type = 2;
-  StreamMetadata metadata = 3;
+
+  // Pre-ADR-0036: `StreamType stream_type = 2` and `StreamMetadata metadata =
+  // 3`. Both take fresh tags rather than being re-pointed: the media-kind
+  // enum's zero value changes meaning (old `AUDIO = 0`, new
+  // `MEDIA_KIND_UNSPECIFIED = 0`), so an old peer's audio stream would decode
+  // as "unspecified" on a re-pointed tag rather than failing.
+  reserved 2, 3;
+
+  reserved "stream_type", "metadata";
+
+  MediaKind media_kind = 4;
+  EncodingParameters encoding = 5;
 }
 
-// Participant information
+// Participant information — the meeting roster.
+//
+// ADR-0036 §4: NO KEY MATERIAL RIDES ON THE ROSTER. The only key-bearing field
+// is `identity_public_key`, which is a public key. No meeting KEK, no wrapped
+// transmit key, no key id, no thumbprint.
 message Participant {
   string participant_id = 1;
   string name = 2;
   repeated MediaStream streams = 3;
   uint64 joined_at = 4;
+
+  // This participant's numeric sender id. See `JoinResponse.sender_id` for the
+  // full range, allocation and fail-closed rules — stated once there and
+  // referenced here so the key-id layout has one place to change.
+  //
+  // Present on the roster because a receiver resolves an arriving frame's key
+  // id to `sender_id`, `sender_id` to this roster entry, and this entry to
+  // `identity_public_key` for Ed25519 verification (ADR-0036 §2, §3). That
+  // chain is unexpressible with the key alone.
+  optional uint32 sender_id = 5;
+
+  // This participant's raw Ed25519 identity signing public key, as received in
+  // their `JoinRequest`. Exactly 32 bytes.
+  //
+  // NOT attested, NOT verified, NOT trusted — this story performs no
+  // attestation check of any kind. MC publishes what the client sent. A
+  // compromised or malicious MC can therefore publish a key it controls for a
+  // participant that does not exist, and nothing here detects it; the
+  // client-validated AC attestation that closes this is story 2, and when it
+  // lands the attestation wins over the roster on disagreement.
+  //
+  // Empty means no key published: consumers MUST fail closed and MUST NOT fall
+  // back to accepting unsigned frames from this participant. MC enforces the
+  // 32-byte length before publishing to this roster in story task 10 (join
+  // path), NOT task 3 — same owner as the sender_id and meeting_kek checks.
+  bytes identity_public_key = 6;
 }
 
 // Response to join request (ADR-0023 Session Binding Token Pattern)
@@ -94,62 +314,218 @@ message Participant {
 // Client must store correlation_id and binding_token for reconnection.
 message JoinResponse {
   string participant_id = 1;
-  uint64 user_id = 2; // 8-byte user ID for media frames
+
+  // Pre-ADR-0036: `uint64 user_id = 2` (hardcoded 0) and `EncryptionKeys
+  // encryption_keys = 5` (single-key model, superseded by ADR-0036 §4's KEK
+  // model).
+  //
+  // `sender_id` deliberately does NOT re-point tag 2. `uint64` and `uint32`
+  // are both varint, so a repurposed tag 2 is the one change in this reshape
+  // that an old peer would decode successfully with the wrong semantics —
+  // reading a per-meeting sender id as a durable user id. A fresh tag makes it
+  // absent instead of plausible-but-wrong.
+  reserved 2, 5;
+
+  reserved "user_id", "encryption_keys";
+
   repeated Participant existing_participants = 3;
   repeated MediaServerInfo media_servers = 4; // Multiple handlers
-  EncryptionKeys encryption_keys = 5;
   // Session recovery fields (ADR-0023)
   string correlation_id = 6; // UUIDv7, client stores for reconnection
   string binding_token = 7; // Client stores for reconnection (30s TTL)
+
+  // The joiner's numeric sender id for this meeting. THE canonical statement of
+  // this field's rules; the roster and `StreamAssignment` reference it.
+  //
+  // Valid range 1..=65535. **Zero is never valid**, and there is no zero
+  // sentinel: absence is expressed by field presence, not by a magic value.
+  // Absent means MC has not assigned one — the state this story ships, since
+  // the allocator is story task 10.
+  //
+  // A `uint32` on the wire carrying 16-bit semantics: the 64-bit SFrame key id
+  // allots 16 bits to the sender. ANCHOR (DRY): the key-id layout —
+  // `sender_id` (16 bits) | `stream` (8 bits) | `generation` (40 bits) — is
+  // documented at `crates/media-protocol/src/frame.rs::KEY_ID_BYTES`.
+  //
+  // MC is both the allocator and the enforcement point. The proto cannot check
+  // the range and does not. MC MUST enforce it with `NonZeroU16` — NOT a bare
+  // `u16::try_from`, which accepts 0, the one value this contract reserves as
+  // invalid — and MUST fail closed on violation: refuse the join, refuse the
+  // assignment, never truncate or wrap. An out-of-range value does not fail
+  // loudly on its own: it truncates into the key id's 16-bit sender field and
+  // corrupts attribution, surfacing as an Ed25519 verification failure against
+  // the WRONG participant's key.
+  //
+  // Receiver-side, and this holds even under `optional` — explicit presence
+  // says the field was set, not that it was set sensibly, and a peer can send
+  // zero. A consumer MUST NOT use `sender_id = 0` for key-id construction or
+  // roster lookup, MUST NOT substitute 0 for an absent value (no
+  // `unwrap_or(0)`, no `?? 0`), MUST NOT attribute frames to an absent id, and
+  // MUST reject rather than treat either as an anonymous participant. A shared
+  // zero is not a recycled id, it is N concurrently-live colliding ones: since
+  // the key id encodes (sender, stream, generation), the wrap nonce is derived
+  // from the key id and the key id is the associated data, two senders at zero
+  // with the same stream and generation wrap distinct transmit keys under the
+  // same KEK at the same nonce — AES-GCM authentication-key recovery, not
+  // merely a confidentiality loss (ADR-0036 §4).
+  //
+  // Nonce-uniqueness invariants this id participates in: a key id is never
+  // reused under one KEK; generation is monotonic per sender and never reset;
+  // a `sender_id` is never recycled while a KEK is live.
+  //
+  // This is a PER-MEETING id MC allocates. It is NOT derived from, and NOT, a
+  // stable user identity — carrying a durable user id into the media path
+  // would reintroduce exactly the cross-meeting linkability that ADR-0036 §4's
+  // meeting-scoped keys exist to prevent.
+  //
+  // OBSERVABILITY (ADR-0036 §11): never a metric label, never a span
+  // attribute, never a per-frame log dimension. Note the rename away from
+  // `user_id` removes this field's incidental coverage by the dt-guard PII
+  // vocabulary, so this comment carries that weight now.
+  optional uint32 sender_id = 8;
+
+  // The meeting key-encryption key (ADR-0036 §4 step 3). AES-256: exactly 32
+  // bytes. Empty means NOT YET PROVISIONED — the state this story ships, since
+  // MC's KEK generation is story task 10.
+  //
+  // Every participant MC admits receives this KEK; there is no other
+  // condition, no group protocol, and no key material on the roster. Senders
+  // wrap their per-stream transmit keys under it and carry the wrapped key
+  // in their own frames, so a joiner needs no round trip and no existing
+  // member is touched.
+  //
+  // What this does and does not claim, stated in ADR-0036 §4's own words:
+  // media is encrypted between clients; MH, transport and storage cannot read
+  // it; MC can. This is accepted operator custody, recorded as the user's risk
+  // decision. It MUST NOT be described as end-to-end against the operator, or
+  // as zero-trust. Telemetry carries `key_custody=operator` in place of any
+  // end-to-end boolean.
+  //
+  // SECURITY: live key material. Never logged, never a span attribute, never a
+  // metric label, never placed in an error or panic payload, and NEVER crosses
+  // the MC-to-MH contract — MH holds no keys, and that is a guard rather than
+  // a convention. Consumers MUST fail closed: never wrap or unwrap under a KEK
+  // of any length other than 32; an empty or all-zero KEK is never a usable
+  // key. Derived `Debug` is suppressed for this message in
+  // `crates/proto-gen/build.rs`; see the redacting impl in
+  // `crates/proto-gen/src/lib.rs`.
+  bytes meeting_kek = 9;
+
+  // The generation of `meeting_kek`. A `uint32` carrying u16 semantics, to
+  // match the frame's wrapped-key field. ANCHOR (DRY):
+  // `crates/media-protocol/src/frame.rs::KEK_GENERATION_FIELD_BYTES` = 2.
+  // Range-checked to 65535 by MC via `u16::try_from`.
+  //
+  // Deliberately has NO sentinel: 0 is a plausible legal first generation, so
+  // the not-provisioned signal is `meeting_kek` not being exactly 32 bytes.
+  // Do not gate on `kek_generation != 0` — that would give one field two
+  // meanings.
+  //
+  // Note 65535 here and 65535 on `sender_id` are the same magnitude and
+  // DIFFERENT CONCEPTS. Do not share a constant or a validation helper between
+  // them: sender allocation and key rotation are unrelated, and collapsing
+  // them silently loses `sender_id`'s never-recycled-while-a-KEK-is-live
+  // invariant. Same recorded boundary as `AEAD_TAG_BYTES` versus AC's at-rest
+  // storage-envelope tag length.
+  //
+  // OBSERVABILITY: never a metric label, never a span attribute, and never a
+  // per-frame log dimension — this IS a frame-header field
+  // (`crates/media-protocol/src/frame.rs::KEK_GENERATION_FIELD_BYTES`), so
+  // per-frame logging is the most reachable hazard of the three for it. And it
+  // looks safe when it is not — it is monotonic over the meeting's life, so its
+  // label cardinality is unbounded over TIME rather than bounded by its type,
+  // and it advances on the §4 leave debounce, which makes a per-meeting
+  // generation series a membership-change trace, de-anonymising by inspection
+  // in the two-person case. Logging it inside an already-redacted `Debug` is
+  // fine and useful.
+  uint32 kek_generation = 10;
 }
 
-// Reason for participant leaving
-// TODO(post-story): rename to LEAVE_REASON_VOLUNTARY/KICKED/CONNECTION_LOST/MEETING_ENDED/TIMEOUT per buf STANDARD ENUM_VALUE_PREFIX (wire-breaking; tracked in docs/TODO.md).
-// buf:lint:ignore ENUM_VALUE_PREFIX
-// buf:lint:ignore ENUM_ZERO_VALUE_SUFFIX
+// Reason for participant leaving.
+//
+// Value 0 is `LEAVE_REASON_UNSPECIFIED` per buf STANDARD, which displaces the
+// pre-ADR-0036 `VOLUNTARY = 0`. The five real reasons are renumbered to 5..9
+// and 1..4 are RESERVED rather than re-pointed: re-pointing would have an old
+// peer's `2` (`CONNECTION_LOST`) decode as `KICKED`, a plausible-but-wrong
+// read on a forensics-adjacent field. The one unavoidable exception is value
+// 0 itself, which proto3 forces to exist and so cannot be reserved: an old
+// peer's `VOLUNTARY` now reads as `UNSPECIFIED`. That degrades in the safe
+// direction — a real value collapsing to the fail-closed reading, never to a
+// different real value.
 enum LeaveReason {
-  VOLUNTARY = 0;
-  KICKED = 1;
-  CONNECTION_LOST = 2;
-  MEETING_ENDED = 3;
-  TIMEOUT = 4; // ADR-0023: 30s disconnect grace period expired
+  LEAVE_REASON_UNSPECIFIED = 0;
+
+  reserved 1 to 4;
+
+  LEAVE_REASON_VOLUNTARY = 5;
+  LEAVE_REASON_KICKED = 6;
+  LEAVE_REASON_CONNECTION_LOST = 7;
+  LEAVE_REASON_MEETING_ENDED = 8;
+  LEAVE_REASON_TIMEOUT = 9; // ADR-0023: 30s disconnect grace period expired
 }
 
 // ============================================================================
-// ADR-0023: Mute State (Self-mute vs Host-mute)
+// Mute state (ADR-0023, terminology per ADR-0036 §5)
 // ============================================================================
+//
+// Two distinct things are called muting, and the terminology matters because
+// the enforcement point follows from who decided:
+//
+//   Client mute — decided by the participant about themselves, enforced at
+//   capture on the client, protects the user from the server. No media leaves
+//   the device; this must not depend on the server honouring it.
+//
+//   Server mute — decided by meeting policy about someone else, enforced at MH
+//   ingress, protects the meeting from a patched client.
+//
+// "Host mute" is deliberately avoided as a term: it presumes a role model this
+// system has not defined.
 
-// Request to update self-mute status (informational, not enforced by MH)
+// Request to update client-mute status (informational, not enforced by MH).
 message MuteRequest {
   bool audio_muted = 1;
   bool video_muted = 2;
 }
 
-// Notification of participant mute state change
+// Notification of participant mute state change.
 message ParticipantMuteUpdate {
   string participant_id = 1;
   bool audio_self_muted = 2; // Informational: participant muted themselves
   bool video_self_muted = 3; // Informational: participant muted themselves
-  bool audio_host_muted = 4; // Enforced: host muted participant
-  bool video_host_muted = 5; // Enforced: host muted participant
-  string host_muted_by = 6; // user_id of host who applied mute (if host-muted)
+  bool audio_server_muted = 4; // Enforced at MH ingress (ADR-0036 §5, §7)
+  bool video_server_muted = 5; // Enforced at MH ingress (ADR-0036 §5, §7)
+
+  // Participant id of the actor who applied the server mute, if any.
+  //
+  // SECURITY: server-to-client, but relayed identity. Truncate before logging
+  // (256-byte bound, as `MhConnectionStatus.mh_url`); never log unbounded.
+  string server_muted_by = 6;
 }
 
-// Host request to mute a participant (enforced by MC + MH)
-message HostMuteRequest {
+// Server-mute request: mute a participant by meeting policy (ADR-0036 §5).
+// Enforced by MC and MH, unlike `MuteRequest`, which the client enforces at
+// capture. Renamed from the pre-ADR-0036 `HostMuteRequest`; same message, same
+// tag, no behaviour change.
+message ServerMuteRequest {
   string participant_id = 1;
   bool audio_muted = 2;
   bool video_muted = 3;
-  string reason = 4; // Optional reason shown to participant
+
+  // Optional reason shown to the participant.
+  //
+  // SECURITY: client-controlled when sent by a participant with mute
+  // authority, and echoed to another participant. Consumers MUST truncate
+  // before logging (256-byte bound) and MUST NOT render it as trusted markup.
+  string reason = 4;
 }
 
-// Participant request to unmute after being host-muted
+// Participant request to unmute after being server-muted.
 message UnmuteRequest {
   bool request_audio = 1;
   bool request_video = 2;
 }
 
-// Host response to unmute request
+// Response to an unmute request from a participant with mute authority.
 message UnmuteResponse {
   string participant_id = 1;
   bool audio_approved = 2;
@@ -179,11 +555,18 @@ message ParticipantLeft {
   LeaveReason reason = 2;
 }
 
-// Request to publish a new stream
+// Request to publish a new stream.
 message PublishStream {
   string stream_id = 1;
-  StreamType stream_type = 2;
-  StreamMetadata metadata = 3;
+
+  // Pre-ADR-0036 `StreamType stream_type = 2` / `StreamMetadata metadata = 3`;
+  // fresh tags for the same reason as on `MediaStream`.
+  reserved 2, 3;
+
+  reserved "stream_type", "metadata";
+
+  MediaKind media_kind = 4;
+  EncodingParameters encoding = 5;
 }
 
 // Notification of stream being published
@@ -193,72 +576,309 @@ message StreamPublished {
 }
 
 // ============================================================================
-// Virtualized Pub/Sub - Layout-based Subscription
+// Receive capability and slot assignment (ADR-0036 §6)
 // ============================================================================
 
-// Layout type enumeration
-// TODO(post-story): rename to LAYOUT_TYPE_GRID per buf STANDARD ENUM_VALUE_PREFIX (wire-breaking; tracked in docs/TODO.md).
-// buf:lint:ignore ENUM_VALUE_PREFIX
-// buf:lint:ignore ENUM_ZERO_VALUE_SUFFIX
-enum LayoutType {
-  GRID = 0;
-  // Future: STACK = 1, PRESENTATION = 2, etc.
+// One receive slot a subscriber declares it can decode and render.
+//
+// A slot is a statement about what the client can DECODE, not about
+// presentation: which participant lands in which slot is MC's decision, from
+// meeting state the client does not have. The pre-ADR-0036 contract had the
+// client specifying grid geometry, which inverts that.
+message ReceiveSlot {
+  // Subscriber-chosen identifier for this slot, echoed back in
+  // `StreamAssignment.slot_id`.
+  //
+  // SCOPED TO ONE SUBSCRIBER'S CONNECTION — NOT globally unique. A media
+  // handler's routing table MUST be keyed on (subscriber, slot_id), never on
+  // `slot_id` alone, or two subscribers both choosing slot 0 collide.
+  //
+  // Must be unique within one `ReceiveCapability`: MC REJECTS a declaration
+  // containing duplicates, never last-write-wins — a duplicate means "two
+  // sources into one slot".
+  //
+  // A `uint32` on the wire carrying 16-bit semantics: this is the same value
+  // space as the frame's relay-region stream id, which is what lets a receiver
+  // validate an arriving `stream_id` against its own declared slots.
+  // ANCHOR (DRY): `crates/media-protocol/src/frame.rs::STREAM_ID_FIELD_BYTES`
+  // = 2. This is also NOT `SendStream.stream_number`, the 8-bit key-id stream
+  // field — the file's other numeric stream-ish identifier — which lives in the
+  // signed key id, not the relay region (the reciprocal of the disclaimer on
+  // that field). This is NOT `sender_id`'s bound either: that one is an
+  // allocation bound
+  // (key-id derived, never recycled while a KEK is live), this one is a
+  // validation bound (relay-region derived, per-subscriber, freely reusable
+  // across declarations). Do NOT introduce a shared `MAX_16BIT_ID` constant or
+  // a shared `validate_16bit_id()` helper — collapsing them silently loses
+  // `sender_id`'s non-recycling invariant.
+  //
+  // SECURITY: client-controlled input that MC forwards into the relay-region
+  // address space. MC MUST validate the 16-bit range and the server-side slot
+  // cap with `u16::try_from` and REJECT THE WHOLE DECLARATION on violation.
+  // Not a `debug_assert!` — release profiles do not enable debug assertions,
+  // so it would be compiled out in exactly the builds facing untrusted
+  // clients. Not clamp-or-truncate — reject, never silently truncate into the
+  // u16 relay field. Blast radius is bounded to this subscriber's own slots,
+  // which is WHY rejecting suffices and no cross-participant validation is
+  // needed — but that bound depends entirely on the (subscriber, slot_id)
+  // keying above holding in MH. The two conditions are load-bearing for each
+  // other. Enforcement owner: story task 14.
+  //
+  // OBSERVABILITY (ADR-0036 §11): a slot is a stream identity. Never a metric
+  // label, never a span attribute, never a per-frame log dimension. "Slot 3 is
+  // stalling" is a legitimate operational question answered by the bucketed
+  // slot-state gauge plus MC's assignment state at investigation time, not by
+  // a per-slot series.
+  uint32 slot_id = 1;
+
+  // What this slot can decode.
+  MediaKind media_kind = 2;
+
+  // Optional pin: the source this subscriber wants in this slot.
+  //
+  // A per-slot OPTIONAL PARAMETER, never a parallel list — which is what makes
+  // "seven pins into six slots" unrepresentable rather than merely invalid.
+  // Every constraint here is an upper bound, so any subset is a valid
+  // fulfilment and an unsatisfiable request cannot be expressed.
+  //
+  // Zero is not a legal pin target, per `JoinResponse.sender_id`. This is the
+  // one place MC receives an attacker-supplied `sender_id`, so `Some(0)` is
+  // rejected like any other out-of-range pin.
+  optional uint32 pinned_sender_id = 3;
 }
 
-// Media type for stream assignments
-// TODO(post-story): rename to MEDIA_TYPE_AUDIO/VIDEO_CAMERA/VIDEO_SCREEN per buf STANDARD ENUM_VALUE_PREFIX (wire-breaking; tracked in docs/TODO.md).
-// buf:lint:ignore ENUM_VALUE_PREFIX
-// buf:lint:ignore ENUM_ZERO_VALUE_SUFFIX
-enum MediaType {
-  MEDIA_AUDIO = 0;
-  MEDIA_VIDEO_CAMERA = 1;
-  MEDIA_VIDEO_SCREEN = 2;
+// A subscriber's declaration of what it can receive (ADR-0036 §6).
+//
+// The client states what it can decode and render; MC composes the experience
+// and decides who appears where. This is also a security property:
+// resource-amplification-by-request becomes structurally impossible rather
+// than rate-limited.
+message ReceiveCapability {
+  // The declared slots.
+  //
+  // Unbounded on this wire; the proto does not enforce a cap. Slot count is
+  // capped by server-side configuration (ADR-0036 §6), and MC rejects a
+  // declaration exceeding it. Enforcement owner: story task 14.
+  repeated ReceiveSlot slots = 1;
 }
 
-// Layout configuration
-message LayoutConfig {
-  // For Grid layout
-  uint32 rows = 1;
-  uint32 columns = 2;
-  uint32 max_streams = 3; // rows * columns
+// ============================================================================
+// Send directives (ADR-0036 §5)
+// ============================================================================
 
-  // Customization
-  repeated uint64 pinned_users = 4; // Must appear in layout
-  repeated uint64 excluded_users = 5; // Must not appear
-  bool prefer_video_over_audio = 6;
-  bool include_self = 7;
+// One destination for a produced stream.
+message SendTarget {
+  // Server-to-client. Same spelling as `MediaServerInfo.media_handler_url`.
+  string media_handler_url = 1;
+
+  // How to carry this stream to this target.
+  //
+  // The send directive carries transport mode and NOT priority group. Priority
+  // group is an MC-to-MH egress property on the internal registration contract
+  // (ADR-0036 §7): MC assigns each egress stream a priority group explicitly,
+  // and those groups BOUND how far a self-declared salience signal can promote
+  // a participant. A client able to name its own priority group could promote
+  // itself past that bound, which turns "hold the meeting's audio floor" into
+  // a one-line client patch.
+  TransportMode transport_mode = 2;
 }
 
-// Request to subscribe to a layout (replaces individual stream subscription)
-message SubscribeToLayout {
-  LayoutType layout_type = 1;
-  LayoutConfig config = 2;
-  repeated uint32 stream_ids = 3; // Subscriber-chosen IDs for each slot
+// One media stream MC directs a client to produce (ADR-0036 §5).
+//
+// Different encodings are DIFFERENT STREAMS, not one stream with divergent
+// per-target encodings. That is what keeps the encrypt-once invariant true by
+// construction: different encodings mean different plaintext, so there is no
+// single ciphertext to fan out, and modelling it otherwise would require
+// either per-destination encryption (nonce reuse — catastrophic) or two
+// counters per frame. A stream sent to several targets is encoded and
+// encrypted ONCE and transmitted N times.
+message SendStream {
+  // The publisher's stream index.
+  //
+  // A `uint32` on the wire carrying 8-BIT semantics: the 64-bit SFrame key id
+  // allots 8 bits to the stream. ANCHOR (DRY): the layout is documented at
+  // `crates/media-protocol/src/frame.rs::KEY_ID_BYTES`. This is NOT
+  // `ReceiveSlot.slot_id`, which is 16-bit and lives in the relay region.
+  //
+  // MC MUST enforce the range with `u8::try_from` and fail closed; the proto
+  // cannot. Enforcement owner: story task 14.
+  //
+  // OBSERVABILITY (ADR-0036 §11): stream identity. Never a metric label, never
+  // a span attribute, never a per-frame log dimension.
+  uint32 stream_number = 1;
+
+  MediaKind media_kind = 2;
+  EncodingParameters encoding = 3;
+
+  // Where to send it. AN EMPTY TARGET SET MEANS SEND NOTHING — MC turns off
+  // publishers nobody watches. Resuming from empty is a keyframe event, and
+  // the sender rotates its transmit key at that point (ADR-0036 §4).
+  repeated SendTarget targets = 4;
 }
 
-// Stream assignment for a layout slot
+// What MC directs this client to produce, and where (ADR-0036 §5).
+//
+// MC keeps a send directive active while a client reports itself client-muted:
+// the client suppresses locally and MC does not withdraw the instruction,
+// which is what makes unmute instantaneous and keeps "MC has not asked you to
+// send" distinguishable from "you have muted yourself".
+message SendDirective {
+  repeated SendStream streams = 1;
+
+  // The meeting-wide frame header version every stream in this directive must
+  // use (ADR-0036 §2). A `uint32` carrying u8 semantics; the value is 2 today.
+  //
+  // Meeting-wide and MC-directed because the version sits in the SIGNED
+  // publisher region: a relay cannot translate between header versions without
+  // breaking verification, so MC selects one version for the whole meeting
+  // from the participants' declared capabilities and no translation ever
+  // arises. The signed field is also proof the publisher used the version MC
+  // directed, which is what makes a downgrade detectable.
+  //
+  // MC MUST set this BY DERIVATION, never as a literal `2`, and MUST NOT emit
+  // a version below the configured floor even as a policy downgrade.
+  // ANCHOR (DRY): cross-language source of truth is
+  // `proto/test-vectors/frame-v2.vectors.json` (story task 8); the Rust-side
+  // derivation is `crates/media-protocol/src/frame.rs::PROTOCOL_VERSION`. See
+  // `ParticipantCapabilities.supported_header_versions` for the floor rule and
+  // `docs/TODO.md` §Media Path Obligations for the precedence rule between
+  // the two anchors.
+  uint32 header_version = 2;
+}
+
+// ============================================================================
+// Stream assignment (ADR-0036 §2, §3, §6, §7)
+// ============================================================================
+
+// What MC has placed in one of the subscriber's declared slots.
+//
+// ATTRIBUTION CHAIN: a receiver resolves an arriving frame's key id to
+// `sender_id`, `sender_id` to that participant's roster entry, and the roster
+// entry's `identity_public_key` to an Ed25519 verification of the frame.
+// Attribution comes from THE SIGNATURE VERIFYING, never from this assignment
+// or from the roster mapping itself — a compromised MC can mis-map either, and
+// this story's chain is rooted in trust-on-first-use because no attestation
+// check exists yet (story 2 adds it).
 message StreamAssignment {
-  uint32 stream_id = 1; // The subscriber's local stream_id
-  uint64 user_id = 2; // Source participant
-  MediaType media_type = 3; // camera, screen, audio
-  uint32 slot_index = 4; // Position in layout (0-based)
-  string media_handler_url = 5; // Which handler to receive from
+  // Pre-ADR-0036 (the layout-form message that occupied this name): `uint32
+  // stream_id = 1`, `uint64 user_id = 2`, `MediaType media_type = 3`, `uint32
+  // slot_index = 4`, `string media_handler_url = 5`.
+  //
+  // Every one of the six ADR-0036 fields takes a fresh tag; not one of the
+  // five vacated tags is re-pointed. Two of them are the exact hazard the
+  // reserve-the-tag rule exists for — an old peer would decode them
+  // SUCCESSFULLY, with the wrong semantics, rather than failing:
+  //
+  //   tag 2 (`uint64 user_id` -> `optional uint32 sender_id`): both varint, so
+  //   a durable user id would be read as a per-meeting sender id. Byte-for-byte
+  //   the same change `JoinResponse` reserves tag 2 for, on the same field-name
+  //   pair; the two must be reserved the same way or the file contradicts
+  //   itself.
+  //
+  //   tag 3 (`MediaType` -> `MediaKind`): the enum's zero value changes meaning
+  //   (old `AUDIO = 0`, new `MEDIA_KIND_UNSPECIFIED = 0`), so an old peer's
+  //   audio assignment would decode as "unspecified" instead of failing. Same
+  //   reasoning as `MediaStream`/`PublishStream` tags 2 and 3.
+  //
+  // Tags 1, 4 and 5 would have been wire-incompatible repurposes that fail
+  // loud (uint32 -> uint32 with a changed value space; uint32 -> string;
+  // string -> enum). They are reserved anyway: a rule applied to three of five
+  // repurposes in one message is worse than no rule, because a reader cannot
+  // tell the unreserved tags from the ones nobody looked at.
+  reserved 1, 2, 3, 4, 5;
+
+  // `media_handler_url` is deliberately ABSENT from the name reservation: the
+  // ADR-0036 shape reuses that name on a fresh tag, and reserving a name you
+  // then use is a protoc error. Second and last instance of this exception in
+  // the file — see `ServerMessage`'s `reserved 5;` for the first.
+  reserved "stream_id", "user_id", "media_type", "slot_index";
+
+  // Which of the subscriber's declared slots this fills. Echoes the
+  // `ReceiveSlot.slot_id` the subscriber chose; see that field for the full
+  // scoping, range, validation AND observability rules — this is a published
+  // message, so it is the surface a well-meant "assignments per slot" label
+  // would come from.
+  uint32 slot_id = 6;
+
+  // The source participant. See `JoinResponse.sender_id` for the full range,
+  // allocation, fail-closed AND observability rules.
+  //
+  // Absent when no source is assigned — which is the normal case for
+  // `SLOT_STATE_ZERO_REQUESTED`, `SLOT_STATE_FEWER_SOURCES_THAN_SLOTS` and
+  // `SLOT_STATE_SOURCE_UNREACHABLE`. Absent MUST NOT be coerced to 0.
+  optional uint32 sender_id = 7;
+
+  MediaKind media_kind = 8;
+
+  // Which handler to receive this slot's media from. Empty when no source is
+  // assigned. Server-to-client. Same spelling as
+  // `MediaServerInfo.media_handler_url`.
+  string media_handler_url = 9;
+
+  // Why this slot looks the way it does. Explicit because absence of frames is
+  // not a signal (ADR-0036 §6).
+  SlotState slot_state = 10;
+
+  // The MC command that requested a pending source switch. Present if and only
+  // if `slot_state` is `SLOT_STATE_SWITCH_PENDING`.
+  //
+  // Opaque to the client: echo-only, for correlating a pending switch with the
+  // command that requested it. Needed because a state description is ambiguous
+  // — if MC switches a slot to B, reverts to A, then switches to B again, a
+  // report reading "A to B" cannot distinguish the first command from the
+  // third (ADR-0036 §7).
+  //
+  // SSoT: the MC-to-MH internal contract MUST use `uint64` for the same
+  // identifier. A conversion in the middle of the path this identifier exists
+  // to disambiguate is exactly where the disambiguation would be lost.
+  //
+  // OBSERVABILITY (ADR-0036 §11): unbounded cardinality. Never a metric label,
+  // never a span attribute, never a per-frame log dimension.
+  optional uint64 switch_command_id = 11;
 }
 
-// Response with stream assignments for layout
+// The subscriber's current slot assignments.
+//
+// Not subject to the reserve-the-tag rule: `assignments = 1` keeps its name,
+// its tag, its cardinality and its type NAME across the reshape — only the
+// element message's contents changed, and that hazard is reserved for inside
+// `StreamAssignment` above. Reserving tag 1 here would vacate a field that
+// nothing repurposed.
 message StreamAssignments {
   repeated StreamAssignment assignments = 1;
 }
 
-// Request to update current layout configuration
-message UpdateLayout {
-  LayoutConfig new_config = 1; // New layout configuration
+// ============================================================================
+// Key distribution (ADR-0036 §4)
+// ============================================================================
+
+// A new meeting KEK, pushed to every member on rotation (ADR-0036 §4 step 6).
+//
+// Defined additively and UNUSED THIS STORY, so that story 2's rotation is a
+// behaviour change only. MC rotates on participant departure, debounced; the
+// joiner path uses `JoinResponse` instead, which touches no existing member.
+// Receivers retain the previous KEK for a bounded window so frames in flight,
+// and frames from senders that have not yet re-wrapped, still open.
+message MeetingKekUpdate {
+  // The new meeting key-encryption key. AES-256: exactly 32 bytes. See
+  // `JoinResponse.meeting_kek` for the full custody, logging and fail-closed
+  // rules — they apply identically here.
+  //
+  // SECURITY: live key material. Never logged, never a span attribute, never a
+  // metric label, never in an error or panic payload, never across the MC-to-MH
+  // contract. Derived `Debug` is suppressed for this message in
+  // `crates/proto-gen/build.rs`.
+  bytes meeting_kek = 1;
+
+  // The generation of `meeting_kek`. Same u16 semantics and same observability
+  // rules as `JoinResponse.kek_generation` — the two MUST NOT diverge, or
+  // rotation breaks in a way that only shows up as undecryptable frames.
+  uint32 kek_generation = 2;
 }
 
-// Request to unsubscribe from current layout
-message UnsubscribeLayout {
-  // No parameters needed - unsubscribes from current layout
-}
+// ============================================================================
+// Quality, errors, connection state
+// ============================================================================
 
 // Stream quality update (bidirectional)
 message StreamQualityUpdate {
@@ -268,20 +888,21 @@ message StreamQualityUpdate {
   uint32 rtt_ms = 4;
 }
 
-// Error codes
-// TODO(post-story): rename to ERROR_CODE_UNKNOWN/INVALID_REQUEST/... per buf STANDARD ENUM_VALUE_PREFIX (wire-breaking; tracked in docs/TODO.md).
-// buf:lint:ignore ENUM_VALUE_PREFIX
-// buf:lint:ignore ENUM_ZERO_VALUE_SUFFIX
+// Error codes.
+//
+// Value 0 is `ERROR_CODE_UNSPECIFIED` per buf STANDARD, displacing the
+// pre-ADR-0036 `UNKNOWN`. Same number and same meaning, so unlike
+// `LeaveReason` no renumbering is needed and no value is reserved.
 enum ErrorCode {
-  UNKNOWN = 0;
-  INVALID_REQUEST = 1;
-  UNAUTHORIZED = 2;
-  FORBIDDEN = 3;
-  NOT_FOUND = 4;
-  CONFLICT = 5;
-  INTERNAL_ERROR = 6;
-  CAPACITY_EXCEEDED = 7;
-  STREAM_ERROR = 8;
+  ERROR_CODE_UNSPECIFIED = 0;
+  ERROR_CODE_INVALID_REQUEST = 1;
+  ERROR_CODE_UNAUTHORIZED = 2;
+  ERROR_CODE_FORBIDDEN = 3;
+  ERROR_CODE_NOT_FOUND = 4;
+  ERROR_CODE_CONFLICT = 5;
+  ERROR_CODE_INTERNAL_ERROR = 6;
+  ERROR_CODE_CAPACITY_EXCEEDED = 7;
+  ERROR_CODE_STREAM_ERROR = 8;
 }
 
 // Error message
@@ -331,24 +952,34 @@ message MediaConnectionUpdate {
   repeated MhConnectionStatus statuses = 1;
 }
 
+// ============================================================================
+// Envelopes
+// ============================================================================
+
 // Client to server message wrapper
 message ClientMessage {
+  // Pre-ADR-0036 layout-subscription variants. Capability replaces layout
+  // (ADR-0036 §6): geometry was never the server's business.
+  reserved 3, 4, 5;
+
+  reserved "subscribe_to_layout", "update_layout", "unsubscribe_layout";
+
+  // Variant tags stay below 20; tags 20+ are envelope-level (see below).
   oneof message {
     JoinRequest join_request = 1;
     PublishStream publish_stream = 2;
-    SubscribeToLayout subscribe_to_layout = 3;
-    UpdateLayout update_layout = 4;
-    UnsubscribeLayout unsubscribe_layout = 5;
     StreamQualityUpdate stream_quality_update = 6;
-    // ADR-0023: Mute messages
+    // ADR-0023 mute messages, ADR-0036 §5 terminology
     MuteRequest mute_request = 7;
-    HostMuteRequest host_mute_request = 8;
+    ServerMuteRequest server_mute_request = 8;
     UnmuteRequest unmute_request = 9;
     UnmuteResponse unmute_response = 10;
     // browser-client-join R-60: replaces MediaConnectionFailed; tag 11
     // reused (one-time wire break — no on-wire clients exist outside
     // this codebase per Clarification Question 9).
     MediaConnectionUpdate media_connection_update = 11;
+    // ADR-0036 §6: replaces SubscribeToLayout/UpdateLayout/UnsubscribeLayout.
+    ReceiveCapability receive_capability = 12;
   }
 
   // W3C Trace Context traceparent header value (RFC: ~55 chars,
@@ -371,6 +1002,7 @@ message MhConnectRequest {
 
 // Wrapper envelope for client→MH messages (parallel to ClientMessage for MC).
 message MhClientMessage {
+  // Variant tags stay below 20; tags 20+ are envelope-level.
   oneof message {
     MhConnectRequest connect_request = 1;
   }
@@ -385,19 +1017,31 @@ message MhClientMessage {
 
 // Server to client message wrapper
 message ServerMessage {
+  // Was: the layout-form `StreamAssignments`. The NAME is reused by the
+  // ADR-0036 shape on a fresh tag, so only the NUMBER is reserved here —
+  // deliberately no name reservation, since reserving a name and then using it
+  // is a protoc error. One of exactly two places in this file where the name
+  // half of the reserve-the-vacated-tag rule does not apply; the other is
+  // `StreamAssignment`'s `media_handler_url`.
+  reserved 5;
+
+  // Variant tags stay below 20; tags 20+ are envelope-level.
   oneof message {
     JoinResponse join_response = 1;
     ParticipantJoined participant_joined = 2;
     ParticipantLeft participant_left = 3;
     StreamPublished stream_published = 4;
-    StreamAssignments stream_assignments = 5;
     StreamQualityUpdate stream_quality_update = 6;
     ErrorMessage error = 7;
     // ADR-0023: Additional server messages
     ParticipantMuteUpdate participant_mute_update = 8;
-    UnmuteRequest unmute_request = 9; // Host receives participant's request
-    UnmuteResponse unmute_response = 10; // Participant receives host's response
+    UnmuteRequest unmute_request = 9; // Participant's request, relayed
+    UnmuteResponse unmute_response = 10; // Response, relayed to participant
     RedirectToMc redirect_to_mc = 11; // MC migration redirect
+    // ADR-0036 §6 / §5 / §4
+    StreamAssignments stream_assignments = 12;
+    SendDirective send_directive = 13;
+    MeetingKekUpdate meeting_kek_update = 14;
   }
 
   // W3C Trace Context (see ClientMessage::trace_parent for format,
