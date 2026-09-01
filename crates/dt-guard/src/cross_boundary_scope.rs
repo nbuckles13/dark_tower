@@ -67,8 +67,16 @@ pub fn is_user_story_path(path: &str) -> bool {
 /// * `docs/specialist-knowledge/*/INDEX.md` — reflection-phase artifacts.
 /// * `docs/user-stories/*.md` — whole-file exemption per bash (Step-9
 ///   Tracking append target).
+/// * `.devloop-escalation.json` — the devloop skill's own escalation
+///   contract writes this file at repo root, so every headless escalation
+///   would otherwise red this guard by obeying the skill (surfaced at the
+///   ADR-0036 story-1 task-4 escalation, 2026-09-01; tracked in
+///   docs/TODO.md §Guard Precision). It is runner state, never plan scope.
 pub fn is_symmetric_exclusion(rel_main_md: &str, path: &str) -> bool {
     if path == rel_main_md {
+        return true;
+    }
+    if path == ".devloop-escalation.json" {
         return true;
     }
     if path == "docs/TODO.md" {
@@ -337,6 +345,14 @@ mod tests {
         ));
         // Whole-file user-story exemption — verbatim bash behavior.
         assert!(is_symmetric_exclusion(rel, "docs/user-stories/story.md"));
+        // The devloop skill's escalation contract writes this at repo root;
+        // obeying the skill must not red the guard. Root path ONLY — a copy
+        // elsewhere is not runner state.
+        assert!(is_symmetric_exclusion(rel, ".devloop-escalation.json"));
+        assert!(!is_symmetric_exclusion(
+            rel,
+            "docs/.devloop-escalation.json"
+        ));
         assert!(!is_symmetric_exclusion(rel, "crates/foo/src/lib.rs"));
     }
 
