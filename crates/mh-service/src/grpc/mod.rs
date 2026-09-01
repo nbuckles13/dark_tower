@@ -3,7 +3,7 @@
 //! This module provides:
 //! - `gc_client` - Client for MH→GC communication (registration, load reports)
 //! - `mc_client` - Client for MH→MC communication (participant notifications)
-//! - `mh_service` - Server for MC→MH communication (register, route, telemetry) — stub
+//! - `mh_service` - Server for MC→MH communication (meeting registration)
 //! - `auth_interceptor` - Authorization validation for incoming MC requests
 //!
 //! # Architecture
@@ -11,7 +11,7 @@
 //! ```text
 //! MH → GC: RegisterMH, SendLoadReport
 //! MH → MC: NotifyParticipantConnected, NotifyParticipantDisconnected
-//! MC → MH: Register, RouteMedia, StreamTelemetry (requires authorization)
+//! MC → MH: RegisterMeeting (requires authorization)
 //! ```
 //!
 //! # Security

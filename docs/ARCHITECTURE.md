@@ -598,15 +598,14 @@ Not shown: Charlie (excluded), 5 others (no space)
    └─> Meeting Controller validates token (via JWKS)
    └─> Creates participant session in Redis
    └─> Assigns Media Handler
-   └─> Issues connection token for Media Handler
    └─> Returns JoinResponse with:
        - participant_id
        - existing participants
-       - media_handler_url + connection_token
-       - E2E encryption keys
+       - media_handler_url
+       - meeting KEK + generation (ADR-0036 §4)
 
 5. Client → Media Handler (WebTransport)
-   Authenticate with connection_token
+   Authenticate with the meeting JWT (ADR-0020)
    └─> Media Handler validates token
    └─> Media Handler creates session
    └─> Ready to receive/send media

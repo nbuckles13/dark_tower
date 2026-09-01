@@ -54,6 +54,9 @@ fn authed_request(
         meeting_id: meeting_id.to_string(),
         mc_id: mc_id.to_string(),
         mc_grpc_endpoint: mc_grpc_endpoint.to_string(),
+        egress_streams: Vec::new(),
+        selection_rules: None,
+        policy_generation: 0,
     });
     let value: MetadataValue<_> = format!("Bearer {token}")
         .parse()

@@ -5,56 +5,298 @@ package dark_tower.internal.v1;
 import "dark_tower/signaling/v1/signaling.proto";
 
 // ============================================================================
-// Meeting Controller <-> Media Handler
+// Meeting Controller -> Media Handler control plane (ADR-0036 §7, §8)
 // ============================================================================
+//
+// RETIRED 2026-09-01 (ADR-0036 Appendix, "Internal contract"). proto3 has NO
+// `reserved` for message names or RPC method names -- `reserved` covers field
+// numbers/names inside a message and value numbers inside an enum, and nothing
+// else -- so this block IS the tombstone. It matters because a gRPC method name
+// is a wire path component
+// (`/dark_tower.internal.v1.MediaHandlerService/Register`): re-adding any of
+// these names with different semantics would silently re-point a live path,
+// which is the same failure CONVENTIONS.md §5 forbids for field tags. DO NOT
+// RESURRECT THESE NAMES.
+//
+//   rpc Register        -> RegisterRequest, RegisterResponse
+//   rpc RouteMedia      -> RouteMediaRequest, RouteMediaResponse,
+//                          RoutingOptions, CascadeDestination
+//   rpc StreamTelemetry -> StreamTelemetryRequest, StreamTelemetryResponse
+//
+// Why, in one line each. `RouteMedia` described a transcoding/mixing relay,
+// which cannot exist when MH holds no keys (§4) and is type-blind (§7).
+// `Register` issued a second client credential parallel to the meeting JWT that
+// actually authenticates; its client-facing half was already deleted
+// (`signaling.proto` `MediaServerInfo`, `reserved 2`). `StreamTelemetry`
+// carried per-participant `user_id` + per-stream `stream_id` + byte counts +
+// timestamp -- the per-stream time-ordered size sequence §11 names as "the
+// voice-activity trace" -- and §11 replaces it with MH self-monitoring
+// histograms.
+//
+// Per-deletion audit evidence (no production caller for any of the three) is in
+// the commit message and in
+// docs/devloop-outputs/2026-09-01-internal-contract-reshape/main.md §1.
 
-// Request to register a participant with the media handler
-message RegisterRequest {
-  string participant_id = 1;
-  string meeting_id = 2;
-  repeated dark_tower.signaling.v1.MediaStream streams = 3;
+// One subscriber's receive slot, as addressed by the forwarding policy.
+//
+// SSoT: this is a REFERENCE to identifiers defined canonically elsewhere; their
+// rules are deliberately NOT restated here.
+//   - `sender_id` (1..=65535, zero never valid, fail-closed):
+//     `dark_tower.signaling.v1.JoinResponse.sender_id`.
+//   - `slot_id` (16-bit, scoped to ONE subscriber's connection, MH's routing
+//     table MUST be keyed on (subscriber, slot_id) never `slot_id` alone,
+//     reject-never-truncate): `dark_tower.signaling.v1.ReceiveSlot.slot_id`.
+//
+// Do NOT introduce a shared `MAX_16BIT_ID` constant or a shared
+// `validate_16bit_id()` helper collapsing the two: `sender_id` carries a
+// non-recycling allocation bound, `slot_id` a per-subscriber validation bound.
+//
+// *** SENDER IDS ARE MEETING-SCOPED. RESOLVE THEM AGAINST THIS REGISTRATION'S
+// `meeting_id` AND NOTHING ELSE. ***
+//
+// A `sender_id` is a 16-BIT PER-MEETING ORDINAL, not a global handle: the
+// key-id layout is `sender_id`(16) | `stream`(8) | `generation`(40)
+// (ADR-0036 §2), so `sender_id` 5 exists CONCURRENTLY IN EVERY MEETING on a
+// handler. Therefore:
+//   - MH MUST resolve every `sender_id` in an `EgressStream` against the
+//     connections of the registered meeting ONLY.
+//   - MH MUST NOT maintain a global `sender_id` -> connection index.
+//   - A `sender_id` that would resolve only in ANOTHER meeting MUST NOT resolve
+//     at all. This falls out of the scoping rule rather than needing its own
+//     check, which is the point: if you only ever look inside one meeting, you
+//     cannot cross meetings.
+//
+// A global index is not merely imprecise; it is a CROSS-MEETING
+// MEDIA-CROSSING PRIMITIVE, and cross-tenant leakage is the one threat class a
+// keyless relay does not otherwise expose.
+//
+// UNRESOLVED IS NOT THE SAME AS ILLEGAL, AND THE DIFFERENCE IS LOAD-BEARING.
+// An earlier draft of this comment said "MH MUST REJECT the registration if any
+// `sender_id` does not resolve within that meeting". That was WRONG and is
+// corrected here rather than quietly reworded, because the wrong version reads
+// as the safer one:
+//
+//   - MALFORMED -> REJECT THE REGISTRATION. `sender_id` 0, or a value outside
+//     1..=65535. These can never become valid, so accepting them is accepting a
+//     policy that can never be honoured.
+//   - IN-MEETING BUT NOT YET CONNECTED -> HOLD, DO NOT REJECT. ADR-0036 §8 has
+//     the handler "drain and promote pending connections" on registration: a
+//     `sender_id` pending promotion WITHIN THE REGISTERED MEETING is exactly the
+//     case the handler exists to rescue, and a blanket reject would make
+//     registration hostile to the mechanism §8 relies on for restart recovery.
+//     The egress stream stays in the applied policy and forwards nothing until
+//     the source connects; the subscriber's slot reports its §6 state.
+//     (Concretely, and not as the reason: loopback's own subscriber is
+//     provisionally accepted and promoted BY THIS VERY RPC, so at the instant
+//     the registration is processed the referenced connection is mid-promotion.
+//     Rejecting on non-resolution would make the CONTROL PLANE HOSTAGE TO
+//     DATA-PLANE CONNECTION TIMING.)
+//
+//     A PENDING SOURCE DOES NOT HOLD BACK `applied_generation`, AND MUST NOT.
+//     The two are different instruments: `applied_generation` is PER-SNAPSHOT
+//     ("is this policy installed on the forward path?"), the §6 slot state is
+//     PER-EDGE ("is this edge carrying media?"). A snapshot installed for
+//     `policy_generation` N with one source not yet connected IS faithfully
+//     applied, so the echo advances to N; the absent source is reported through
+//     slot state. Gating the echo on source connectivity would peg MC's §8
+//     comparison into permanent divergence-and-re-assert for any legitimately
+//     absent source -- a NEW false-alarm bug, in the very field that exists to
+//     prevent false liveness. The case where the echo must NOT advance is the
+//     snapshot never being installed at all (mailbox full, apply errored), and
+//     that is stated once, at `RegisterMeetingResponse.applied_generation`.
+//
+// Holding rather than rejecting costs nothing in safety, because the SCOPING
+// rule above is what carries the cross-tenant property: an unresolved
+// `sender_id` under meeting-only lookup forwards nothing, whereas the tempting
+// "relax resolution so the registration succeeds" fix is precisely the drift
+// toward a global fallback this comment forbids. The reject is for what can
+// never be valid; the hold is for what is not valid YET.
+//
+// THE PRECONDITION ABOVE IS SCOPED TO THE TIMING CASE ONLY. Do NOT generalise
+// it. The structural rejects in these messages are evaluable from the request
+// alone, need no external state, and stay IMMEDIATE HARD REJECTS: the
+// cross-meeting / structurally-unresolvable half of this very check; duplicate
+// `egress_stream_id`; duplicate `(subscriber.sender_id, subscriber.slot_id)`;
+// the candidate-per-egress and egress-per-meeting count bounds;
+// `transport_mode == TRANSPORT_MODE_UNSPECIFIED`; and heterogeneous transport
+// modes across egress streams. The security-load-bearing rejects are in that
+// list, and "the sender_id rule says defer" must not be read onto them.
+//
+// NO GATE IN THIS STORY CAN CATCH A GLOBAL INDEX. Loopback is one meeting with
+// one participant, so a correctly meeting-scoped index and a global one are
+// OBSERVATIONALLY IDENTICAL across all seven validation layers -- unit,
+// integration, env-test, every guard. This contract is the only artefact that
+// survives into the MH task carrying the requirement, which is why it is a MUST
+// here and not a review note there. The acceptance pin is an executable
+// MULTI-MEETING negative test (a `sender_id` valid in meeting A must be
+// REJECTED in meeting B's request), recorded in docs/TODO.md §Media Path
+// Obligations.
+//
+// This is a NEW obligation created by this reshape, not an existing one:
+// `crates/mh-service/src/session/mod.rs` keys connections
+// `meeting_id -> participant_id -> Vec<ConnectionEntry>` (correctly
+// meeting-scoped), but `EgressStream` references `sender_id`, not
+// `participant_id` -- so the resolution index does not exist yet and its shape
+// is a free choice. Enforcement owner: story task 5, NOT this task.
+//
+// OBSERVABILITY (ADR-0036 §11): both fields are stream identity. NEVER a metric
+// label, NEVER a span attribute, NEVER a per-frame log dimension. That this
+// message is a CONTRACT field rather than a metric label is what makes it
+// legitimate here; carrying it into telemetry is the voice-activity trace §11
+// bars, and this message is the obvious new back door for it now that
+// `StreamTelemetry` is gone.
+message SubscriberSlot {
+  uint32 sender_id = 1;
+  uint32 slot_id = 2;
 }
 
-// Response to participant registration
-message RegisterResponse {
-  string connection_token = 1;
-  string media_handler_url = 2;
+// One source this egress stream may forward, referenced by its key-id pair.
+//
+// DELIBERATELY NOT `dark_tower.signaling.v1.MediaStream`: that type carries
+// `media_kind` and `EncodingParameters`, and ADR-0036 §7 makes MH type-blind --
+// media kind on this contract is knowledge MH has no legitimate source for, and
+// a new media kind must cost zero MH changes. MH is told what a stream DOES
+// (`supersede_on_independent_frame`, `transport_mode`), never what it IS.
+//
+// OBSERVABILITY (ADR-0036 §11): as `SubscriberSlot` -- never a label, never a
+// span attribute, never a per-frame log dimension.
+message CandidateSource {
+  // Publishing participant.
+  //
+  // MEETING-SCOPED. The full MUST -- resolve against this registration's
+  // `meeting_id` only, never a global index, malformed rejects and
+  // not-yet-connected holds -- is stated once at `SubscriberSlot.sender_id` and
+  // applies IDENTICALLY HERE. It is called out rather than left to inference
+  // because this is the reference an implementer reaches for when building the
+  // INGRESS-side lookup, which is the side where a global index is most
+  // tempting.
+  uint32 sender_id = 1;
+
+  // Which of that publisher's streams. A `uint32` on the wire carrying 8-BIT
+  // semantics: the 64-bit SFrame key id allots 8 bits to the stream.
+  //
+  // SSoT: `dark_tower.signaling.v1.SendStream.stream_number`.
+  // ANCHOR (DRY): the layout is documented at
+  // `crates/media-protocol/src/frame.rs::KEY_ID_BYTES`
+  // (`sender_id` 16 | `stream` 8 | `generation` 40).
+  //
+  // This is NOT `SubscriberSlot.slot_id`, which is 16-bit and lives in the
+  // relay region rather than in the signed key id.
+  uint32 stream_number = 2;
 }
 
-// Routing options for media forwarding
-message RoutingOptions {
-  bool transcode = 1;
-  string target_codec = 2;
-  uint32 target_bitrate = 3;
-  bool mix_audio = 4; // Mix multiple audio streams
+// One egress stream: a complete, self-contained forwarding instruction.
+//
+// SELF-CONTAINED BY CONSTRUCTION (ADR-0036 §6, make-conflicts-unrepresentable).
+// Behaviours are NOT a second repeated field keyed by `egress_stream_id`: a
+// behaviour whose id matches no edge, and an edge with no behaviour, are both
+// unrepresentable here. Two parallel lists make that a class of bug; one
+// message makes it a shape that cannot be written.
+//
+// UNIQUENESS, AND MH'S OBLIGATION. Within one `RegisterMeetingRequest`, BOTH
+// `egress_stream_id` AND `(subscriber.sender_id, subscriber.slot_id)` MUST be
+// unique. MH MUST REJECT THE WHOLE REGISTRATION on a duplicate of either --
+// never last-write-wins, never partial application; a duplicate subscriber slot
+// means "two sources into one slot". Same posture as
+// `dark_tower.signaling.v1.ReceiveCapability`. Enforcement owner: story task 5.
+message EgressStream {
+  // MC-allocated, stable identity for this egress stream, unique within one
+  // meeting registration.
+  //
+  // NOT REDUNDANT WITH `subscriber`, even though the two are 1:1 today, and the
+  // reason is stated so the next reader does not delete it as duplicated
+  // identity. `subscriber` is the DATA-PLANE ADDRESS: `slot_id` is client-chosen
+  // and is renumbered whenever the subscriber re-declares its receive
+  // capability. `egress_stream_id` is the POLICY-PLANE IDENTITY that survives
+  // such a renumber, and it is what per-stream state hangs off: §7
+  // pending-switch state, and §11's per-stream (not per-participant) egress
+  // budget in story 2. Because both are present, both carry the uniqueness
+  // obligation above; a reader must not have to guess which one MH keys on.
+  //
+  // OBSERVABILITY (ADR-0036 §11): stream identity -- never a metric label.
+  uint32 egress_stream_id = 1;
+
+  // Who receives this stream, and in which of their slots. MH writes
+  // `subscriber.slot_id` into the frame's relay-region `stream_id` for this
+  // egress. ANCHOR (DRY):
+  // `crates/media-protocol/src/frame.rs::STREAM_ID_FIELD_BYTES` = 2.
+  SubscriberSlot subscriber = 2;
+
+  // Sources eligible to fill this egress stream.
+  //
+  // REPEATED EVEN THOUGH SIZE IS 1 THIS STORY. The loopback assignment yields
+  // exactly one candidate (the subscriber's own audio), but audio selection
+  // among many speakers (§7, story 5) must be ADDITIVE -- it adds candidates and
+  // a ranking rule, not a new message shape.
+  //
+  // BOUND: MH MUST reject a registration whose candidate count exceeds the
+  // configured per-egress bound, and whose `egress_streams` count exceeds the
+  // configured per-meeting bound, BEFORE building any routing table -- the same
+  // posture the existing handler already takes on scalars. Unbounded repeated
+  // fields on a control-plane message are an allocation surface. Enforcement
+  // owner: story task 5, NOT this task.
+  repeated CandidateSource candidate_sources = 3;
+
+  // MC-assigned forwarding priority (ADR-0036 §7). MC owns the numbering.
+  //
+  // ASSIGNED BY MC, NEVER BY A CLIENT, AND THAT IS A SECURITY PROPERTY.
+  // Priority groups BOUND how far a publisher's self-declared salience signal
+  // can promote it. A client able to name its own group could promote itself
+  // past that bound, turning "hold the meeting's audio floor" into a one-line
+  // client patch -- which is exactly why `dark_tower.signaling.v1.SendTarget`
+  // deliberately carries transport mode and NOT priority group. This field is
+  // the reciprocal of that disclaimer.
+  //
+  // MH derives no priority from media type; it has no media type (§7).
+  uint32 priority_group = 4;
+
+  // Whether a superseding frame permits discarding queued frames for this
+  // egress (ADR-0036 §7). A BEHAVIOUR, not a media type: MH is told what the
+  // stream does, never that it is video.
+  //
+  // FALSE for the loopback audio egress stream -- every frame forwards. "Every
+  // audio frame forwards" is a consequence of this flag, not of MH knowing the
+  // stream is audio.
+  //
+  // ANCHOR (DRY):
+  // `crates/media-protocol/src/frame.rs::FLAG_INDEPENDENTLY_DECODABLE` (bit 0,
+  // decoded field `independently_decodable`) is the wire bit MH reads to decide
+  // when this fires. Policy lives here; the bit lives there; they are one
+  // concept in two encodings. This is an UNGUARDED anchor comment -- nothing
+  // fails if the layout moves and this does not -- consistent with the five in
+  // `signaling.proto`; see docs/TODO.md §Media Path Obligations item (d).
+  bool supersede_on_independent_frame = 5;
+
+  // How MH carries this egress stream to its subscriber (ADR-0036 §1, §5).
+  //
+  // The signalling enum, IMPORTED -- not a parallel `internal.v1` copy.
+  // Divergent numbering between a client-facing and a server-facing spelling of
+  // one concept would make MC and MH silently disagree on mode while the §8 echo
+  // check below reads green.
+  //
+  // `TRANSPORT_MODE_UNSPECIFIED` IS A REJECTION, NOT A DEFAULT. MH MUST reject
+  // an egress stream that does not name a mode; it MUST NOT fall back to
+  // datagram. The enum's own definition is fail-closed for the same reason, and
+  // this is the reciprocal of the response echo's "UNSPECIFIED is a mismatch,
+  // not a skip" rule -- one hazard, both directions.
+  dark_tower.signaling.v1.TransportMode transport_mode = 6;
 }
 
-// Cascading destination for multi-handler routing
-message CascadeDestination {
-  string media_handler_url = 1;
-  repeated string destination_participant_ids = 2; // Participants on this handler
-}
-
-// Command to route media between participants (supports multi-handler cascading)
-message RouteMediaRequest {
-  uint64 source_user_id = 1; // Source participant (8-byte user ID)
-  uint32 source_stream_id = 2; // Source stream (4-byte subscriber ID)
-  repeated string destination_participant_ids = 3; // Direct destinations on this handler
-  repeated CascadeDestination cascade_destinations = 4; // Destinations on other handlers
-  RoutingOptions options = 5;
-}
-
-// Media telemetry from media handler to meeting controller
-message StreamTelemetryRequest {
-  uint64 user_id = 1; // Source participant (8-byte user ID)
-  uint32 stream_id = 2; // Stream identifier (4-byte)
-  uint64 bytes_sent = 3;
-  uint64 bytes_received = 4;
-  float packet_loss = 5;
-  uint32 bitrate = 6;
-  uint32 jitter_ms = 7;
-  uint64 timestamp = 8;
-}
+// Meeting-level rules governing selection among an egress stream's candidate
+// sources (ADR-0036 §7).
+//
+// DELIBERATELY EMPTY AT THIS STORY, and deliberately a NAMED MESSAGE rather
+// than `bytes`, `google.protobuf.Any`, or `map<string, string>`. A type-blind
+// blob on the control plane is unvalidatable and defeats §6
+// make-conflicts-unrepresentable; an empty named message is additive and
+// validatable. Presence of the field distinguishes "MC declared no rules" from
+// "MC did not speak about rules".
+//
+// MEETING-LEVEL, NOT PER-EGRESS, ON PURPOSE. Ranking, debounce, churn rate
+// limits and per-subscriber exclusions (§7) are properties of the selection
+// POOL, not of one egress edge. Folding a ranking field into `EgressStream`
+// would make one meeting-wide rule N per-edge copies that can disagree.
+message SelectionRules {}
 
 // ============================================================================
 // Global Controller <-> Meeting Controller
@@ -117,33 +359,283 @@ message ComprehensiveHeartbeatRequest {
 // Service Definitions
 // ============================================================================
 
-// Media handler service (Meeting Controller -> Media Handler)
+// Media handler service (Meeting Controller -> Media Handler).
+//
+// ONE RPC BY DESIGN. Registration IS the control plane (ADR-0036 §8): it gains
+// FIELDS rather than sibling RPCs, which is why this service has exactly one
+// method and is expected to keep exactly one. Three RPCs were retired on
+// 2026-09-01 -- see the tombstone block above `SubscriberSlot`.
+//
+// The MH gRPC `method` metric label is therefore single-valued by design
+// (`register_meeting`); its value set is bounded by this service block, which is
+// its single source of truth (docs/observability/label-taxonomy.md).
 service MediaHandlerService {
-  rpc Register(RegisterRequest) returns (RegisterResponse);
   rpc RegisterMeeting(RegisterMeetingRequest) returns (RegisterMeetingResponse);
-  rpc RouteMedia(RouteMediaRequest) returns (RouteMediaResponse);
-  rpc StreamTelemetry(stream StreamTelemetryRequest) returns (StreamTelemetryResponse);
 }
 
-// Request to register a meeting with a media handler (MC→MH)
+// Request to register a meeting with a media handler (MC->MH).
+//
+// THIS MESSAGE IS THE CONTROL PLANE (ADR-0036 §8). It is a FULL SNAPSHOT, not a
+// delta: MH replaces its policy for this meeting wholesale, which is what makes
+// a re-assert idempotent and what makes restart recovery a re-send rather than
+// a reconciliation.
+//
+// NO KEY MATERIAL CROSSES THIS CONTRACT (ADR-0036 §4, Appendix). No KEK, no
+// transmit key, no key id, no wrapped material, ever. MH is keyless, and that is
+// a structural guard rather than a convention. The `connection_token` this
+// reshape deletes was the only credential this file ever carried; nothing
+// replaces it under another name.
 message RegisterMeetingRequest {
   string meeting_id = 1;
   string mc_id = 2;
   string mc_grpc_endpoint = 3;
+
+  // The complete forwarding policy for this meeting on this handler.
+  //
+  // AN EMPTY SET IS MEANINGFUL AND LEGAL: "this handler forwards nothing for
+  // this meeting". It is a computed output of MC's assignment, never an operator
+  // lever.
+  //
+  // BOUND: see `EgressStream.candidate_sources`. Enforcement owner: story task 5.
+  repeated EgressStream egress_streams = 4;
+
+  SelectionRules selection_rules = 5;
+
+  // Monotonic per (meeting, handler), DERIVED FROM THE ASSIGNMENT COMPUTATION'S
+  // OUTPUT CHANGE, NEVER FREE-RUNNING (ADR-0036 §8). Unchanged policy carries
+  // the SAME number so MH no-ops; that property is what makes the §8
+  // acknowledgement silent in steady state.
+  //
+  // ZERO IS NOT A VALID VALUE. Valid values start at 1. proto3 scalars have no
+  // presence, so an old peer that has never heard of this field is
+  // indistinguishable from a new peer sending 0 -- and on the response side that
+  // would reproduce exactly the partial-blackhole-reporting-healthy bug
+  // `applied_generation` exists to catch, on the ordinary rolling-deploy path.
+  // MH MUST reject a registration carrying `policy_generation` 0.
+  //
+  // *** ORDERING CONSTRAINT -- READ THIS BEFORE IMPLEMENTING THE REJECTION. ***
+  // MH's rejection of `policy_generation` 0 MUST NOT BE ENFORCED UNTIL MC EMITS
+  // `policy_generation` >= 1. Enforcement lands WITH or AFTER the MC change,
+  // NEVER BEFORE IT.
+  //
+  // Why this sentence exists: at the commit that introduced this field, MC's
+  // only caller (`crates/mc-service/src/grpc/mh_client.rs`) sends
+  // `policy_generation` 0 with an empty policy, and MC does not send real values
+  // until story task 6. MH implements its side at story task 5. Enforcing the
+  // rejection at task 5 would therefore reject EVERY registration MC sends for
+  // the whole task-5..task-6 window: no meeting is ever registered, every client
+  // is provisionally accepted and kicked at the registration timeout, and that
+  // is ADR-0036 §8's opening paragraph almost verbatim -- "a permanent media
+  // blackhole for that meeting until it emptied, reached through an ordinary
+  // rolling deploy." Enforcing this MUST out of order REINTRODUCES THE EXACT
+  // FAILURE §8 EXISTS TO ELIMINATE, through the field added to prevent it.
+  //
+  // The obvious workaround -- have MC send `policy_generation` 1 now -- is WRONG
+  // and is recorded here so it is not rediscovered as a fix. §8 has MH no-op on
+  // an unchanged value. An MC shipping `policy_generation` 1 with an EMPTY
+  // policy makes MH apply "1 = no edges"; task 6's first REAL assignment is also
+  // naturally 1 (the value derives from assignment-output change, and that is
+  // the first output), so MH sees a value it has already applied and NO-OPS THE
+  // REAL POLICY. That trades a loud outage for a silent one, which is the worse
+  // trade.
+  //
+  // MH MUST IGNORE A REGISTRATION WHOSE VALUE IS LOWER THAN THE ONE IT HAS
+  // APPLIED -- reordered or retried delivery must not roll policy back.
+  //
+  // NOT A SECURITY TOKEN. Not a nonce, not an anti-replay control, and MUST NOT
+  // be used as one. This channel's authenticity comes from the existing OAuth
+  // Bearer + JWKS `service.write.mh` gate, not from this field.
+  //
+  // THREE DIFFERENT "generation" CONCEPTS EXIST IN THIS TREE; DO NOT COLLAPSE
+  // THEM.
+  //   (a) `dark_tower.signaling.v1.JoinResponse.kek_generation` -- the KEK
+  //       rotation counter.
+  //   (b) MC's Redis FENCING generation (`meeting:{id}:generation`,
+  //       `crates/mc-service/src/redis/`) -- advances on every fenced write,
+  //       including writes that do not change forwarding output. BOTH ENDS OF
+  //       THAT API ARE TRAPS, and the READ path is the likelier collapse:
+  //       `get_generation(meeting_id) -> u64` is what an implementer reaches for
+  //       when they want "the current generation for this meeting". It
+  //       type-checks, compiles, and PASSES EVERY LOOPBACK TEST -- the fencing
+  //       counter is monotonic and non-zero, so even the §8 applied-generation
+  //       echo check goes green. `increment_generation()` is the same trap from
+  //       the write side. Using either BREAKS §8's "unchanged policy carries the
+  //       same number and MH no-ops" property and turns every fenced write into
+  //       a spurious policy re-apply.
+  //   (c) this field.
+  //
+  // THE FIELD IS NAMED `policy_generation`, NOT `generation`, FOR THAT REASON.
+  // ADR-0036 §8 always qualifies the noun -- "derived from the assignment
+  // computation's output change" -- and the qualified name is what makes the
+  // collapse resistible AT THE VALUE-SOURCE SITE IN MC, where this comment is
+  // not in view and `get_generation()` is one autocomplete away. A bare
+  // `generation` field is an invitation addressed to the one place the warning
+  // cannot reach.
+  //
+  // OBSERVABILITY (ADR-0036 §11): NOT LABEL MATERIAL. A generation value is
+  // unbounded and would be a new series per policy change. A mismatch is
+  // expressed as a BOUNDED OUTCOME label, enumerated at
+  // `RegisterMeetingResponse.applied_generation`; the numbers themselves belong
+  // in the log line and in the metric's VALUE, never in a label.
+  uint64 policy_generation = 6;
 }
 
-// Response to meeting registration
+// Response to meeting registration (ADR-0036 §8).
 message RegisterMeetingResponse {
+  // Received and parsed. THAT IS ALL IT MEANS, and it is not evidence of
+  // application: MH's handler hands policy to the session actor over a bounded
+  // mailbox and returns, so the apply is asynchronous relative to this response.
+  // MC MUST NOT treat `accepted == true` as success. Only
+  // `applied_generation == the policy_generation MC sent` is success.
   bool accepted = 1;
-}
 
-message RouteMediaResponse {
-  bool success = 1;
-  string error_message = 2;
-}
+  // The applied counterpart of `RegisterMeetingRequest.policy_generation`: the
+  // generation MH's LIVE FORWARD PATH ACTUALLY REFLECTS -- never the highest
+  // received, never an echo of the request (ADR-0036 §8).
+  //
+  // Named `applied_generation`, not `applied_policy_generation`, and the
+  // asymmetry with the request field is deliberate rather than an oversight. The
+  // `policy_` qualifier exists to stop an MC implementer sourcing the value from
+  // Redis's fencing counter; that hazard is MC-side and request-side only. MH
+  // produces this value from its own applied state and has no fencing counter to
+  // confuse it with, and `applied_` is itself already a qualifier that makes the
+  // wrong source unreachable: there is no "applied" reading of a fencing counter.
+  //
+  // ECHOING ON RECEIPT REPRODUCES THE EXACT BUG THIS FIELD EXISTS TO CATCH:
+  // MC sends 7, MH enqueues and returns success, the mailbox is full or the
+  // apply errors, MC believes MH runs 7 while MH runs 4 -- a partial blackhole
+  // with every liveness signal green. An implementer who writes
+  // `applied_generation: req.policy_generation` has deleted the feature while
+  // leaving the field.
+  //
+  // "REFLECTS" MEANS THE COMPLETE SNAPSHOT FOR THIS GENERATION IS INSTALLED.
+  // Apply is all-edges-or-none: any per-edge failure fails the whole apply and
+  // leaves the PRIOR generation live. A partial install is not a representable
+  // state, so this field is never a partial reflection. Stated rather than left
+  // to inference -- a strict reading of "actually reflects" already excludes a
+  // partial install (a partial reflection is not a reflection of N), but an
+  // inferred invariant is the kind that decays, and the failure it prevents is a
+  // forward path reflecting NEITHER N nor N-1 while the echo claims N. The
+  // concrete future is not someone ignoring the rule: it is someone with a good
+  // reason to change the apply shape -- incremental per-edge application is the
+  // obvious optimisation once meetings are large, and it is a PERFORMANCE change
+  // nobody would think to route past a correctness constraint.
+  //
+  // A pending source does NOT hold this back; see
+  // `SubscriberSlot.sender_id` for why per-edge liveness is the §6 slot state's
+  // job and not this field's.
+  //
+  // ZERO MEANS "NOTHING APPLIED" and is a legal, meaningful value: a handler
+  // that has never successfully applied any policy for this meeting reports 0.
+  // It is therefore ALSO what a pre-reshape MH's absent field decodes to, and
+  // the two readings agree -- in both cases MC's correct action is identical (do
+  // not believe policy is live; re-assert). Valid applied values start at 1,
+  // matching `RegisterMeetingRequest.policy_generation`.
+  //
+  // OBSERVABILITY (ADR-0036 §11): not label material -- see
+  // `RegisterMeetingRequest.policy_generation`. MC feeds its divergence gauge
+  // from THIS value, never from the sent value.
+  //
+  // CANONICAL ENUMERATION of MC's bounded `outcome` label, defined here and
+  // deliberately not restated elsewhere:
+  //
+  //   match | generation_mismatch | no_applied_generation |
+  //   transport_mode_mismatch | handler_id_mismatch
+  //
+  // The set is FIVE, and each value exists because some field on this response
+  // can fail in a way MC must act on. `no_applied_generation` is the
+  // pre-contract-handler case, and its CONSTRUCTIBILITY is the entire reason
+  // zero is reserved above: if 0 were legal the state would have no name and
+  // would silently fold into `match`. `handler_id_mismatch` covers the
+  // `handler_id` comparison below. Every fail-loud path in this response has a
+  // bounded label to land in; a comparison specified with no observable is the
+  // "declared in one place, assumed in another, verified nowhere" precedent §8
+  // itself cites.
+  uint64 applied_generation = 2;
 
-message StreamTelemetryResponse {
-  bool received = 1;
+  // The handler answering this call, as IT identifies itself.
+  //
+  // Spelling: `handler_id`, matching `RegisterMHRequest`,
+  // `SendLoadReportRequest` and the two `NotifyParticipant*` messages. NOT
+  // `mh_id` (the `MhAssignment` spelling) -- one concept should not gain a third
+  // home.
+  //
+  // MH-ASSERTED, NOT MH-PROVEN. It carries no trust beyond the existing
+  // authenticated-service trust on this channel. MC MUST compare it against the
+  // `MhAssignment.mh_id` of the handler it dialed and FAIL LOUD on mismatch --
+  // the same two-ends-must-agree treatment §8 gives transport mode. That catches
+  // a misrouted or misconfigured handler registering as another.
+  //
+  // OBSERVABILITY: acceptable as a metric label -- pod/handler level IS §11's
+  // stated aggregation floor.
+  string handler_id = 3;
+
+  // Unix epoch milliseconds at which THIS MH PROCESS started, so MC can detect a
+  // restart (ADR-0036 §8).
+  //
+  // PER-PROCESS, NOT PER-POD-NAME AND NOT PER-CONFIG. MH MUST sample this ONCE
+  // at process start and return the same value for the process's whole life. A
+  // crash-restart into the same pod identity must change it, or the restart
+  // detector never fires for the case it exists to catch.
+  //
+  // COMPARED FOR INEQUALITY ONLY -- it is a process-incarnation token, not a
+  // clock reading MC does arithmetic on. Wall-clock skew between handlers is
+  // therefore irrelevant.
+  //
+  // ZERO MEANS "NOT REPORTED", NOT "EPOCH ZERO". A pre-reshape MH's absent field
+  // decodes to 0 on EVERY response, and 0 is STABLE, so without this rule it
+  // would read as "same process, never restarted", permanently. MC MUST treat 0
+  // as "restart undetectable" and never as a stable incarnation. A restart
+  // detector pinned to a constant is worse than an absent one, because it is
+  // load-bearing and green.
+  //
+  // The PRODUCER obligation is not testable in one story and is split in
+  // docs/TODO.md §Media Path Obligations: within-process stability is pinned at
+  // story task 5 (two calls in one process return the same value, which kills a
+  // per-call clock read); changes-on-restart is pinned at the handler-restart
+  // story, because distinguishing a correct per-process sample from a
+  // per-pod-name or per-config value requires a SECOND PROCESS INCARNATION
+  // SHARING A POD IDENTITY, which does not exist until then.
+  //
+  // OBSERVABILITY: not label material -- unbounded, one new series per restart.
+  uint64 process_start_epoch_ms = 4;
+
+  // The transport mode MH APPLIED to every egress stream of
+  // `applied_generation` -- ADR-0036 §8's two-ends-must-agree echo. MC compares
+  // it against what it declared and fails loud on mismatch. The cautionary
+  // precedent §8 cites is a capacity value advertised to GC and enforced
+  // nowhere: declared in one place, assumed in another, verified nowhere.
+  //
+  // AN UNSPECIFIED ECHO IS A MISMATCH, NOT A SKIP. This sentence constrains the
+  // READER of this field, in the same register as
+  // `dark_tower.signaling.v1.JoinResponse.sender_id`'s comment, because the
+  // proto cannot enforce it. A pre-reshape MH echoes `TRANSPORT_MODE_UNSPECIFIED`
+  // (proto3 absent enum = zero), and the natural defensive implementation --
+  // `if echoed != UNSPECIFIED { compare }` -- FAILS OPEN against precisely the
+  // peer population this check exists to police. That form survives code review
+  // as defensiveness, and its skip-branch is unreachable in any test written
+  // against a same-version peer, so it is invisible to the test suite
+  // permanently. MC MUST compare `sent != echoed` UNCONDITIONALLY. Acceptance
+  // pin, with its distinguishing input named: a same-version peer echoes
+  // UNSPECIFIED and MC reports MISMATCH (docs/TODO.md §Media Path Obligations).
+  //
+  // SCOPE LIMIT, STATED SO IT CANNOT DEGRADE SILENTLY. This is ONE field echoing
+  // a policy that is PER-EGRESS-STREAM in the request. It is unambiguous only
+  // while a meeting's egress streams are homogeneous in transport mode, which is
+  // true for this story (one audio egress stream, datagram) and stops being true
+  // when video lands (§1: audio on datagrams, video on stream-per-group).
+  //
+  // Therefore: MH MUST REJECT a registration whose egress streams do not all
+  // carry the same transport mode, rather than pick one and echo it. Echoing one
+  // of N would make the check silently meaningless -- the precise failure §8
+  // warns about.
+  //
+  // THIS SCOPE LIMIT EXPIRES WHEN VIDEO LANDS, NAMED SO IT CANNOT BECOME
+  // PERMANENT: a scope limit with no named expiry is how a temporary shape
+  // becomes the shape. At that point the field moves per-egress as a deliberate
+  // contract change, which the reject forces to happen loudly. Enforcement
+  // owner: story task 5. Recorded in docs/TODO.md §Media Path Obligations.
+  dark_tower.signaling.v1.TransportMode transport_mode = 5;
 }
 
 // Meeting controller service (Global Controller -> Meeting Controller)

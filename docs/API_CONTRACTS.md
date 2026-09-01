@@ -507,9 +507,21 @@ message StreamQualityUpdate {
 
 ### 3.1 Connection Establishment
 
-1. Client receives `media_handler_url` and `connection_token` from Meeting Controller
-2. Client establishes WebTransport connection to Media Handler
-3. Client opens bidirectional streams for each media stream
+1. Client receives `media_handler_url` from the Meeting Controller
+2. Client establishes a WebTransport connection to the Media Handler and
+   authenticates with its **meeting JWT** (ADR-0020) — validated by
+   `MhJwtValidator::validate_meeting_token`
+3. Client opens streams for each media stream
+
+> **Superseded 2026-09-01.** This step previously read "receives `media_handler_url`
+> and `connection_token`". There is no `connection_token`: the client authenticates
+> to the Media Handler with the meeting JWT, not a second credential. The
+> client-facing half of that field was removed from `signaling.proto`'s
+> `MediaServerInfo` on 2026-04-13 (`reserved 2; reserved "connection_token";`), and
+> the server-side half — `internal.proto`'s `RegisterResponse.connection_token` —
+> was deleted with the ADR-0036 internal-contract reshape. Corrected in place rather
+> than silently edited, because a reader who trusted the old text would have built
+> the credential.
 
 ### 3.2 Media Protocol
 
@@ -557,57 +569,39 @@ Total header size: 42 bytes
 
 **Transport**: Internal gRPC or WebTransport
 
-### 4.1 Register Participant
+### 4.1 Register Meeting — the MC→MH control plane
 
-**Request**:
-```protobuf
-message RegisterParticipant {
-  string participant_id = 1;
-  string meeting_id = 2;
-  repeated MediaStream streams = 3;
-}
-```
+`MediaHandlerService` has **exactly one RPC**, by design. ADR-0036 §8 makes
+meeting registration the control plane: it gains *fields* rather than sibling
+RPCs. Authoritative shape, with the normative rules on every field:
+`proto/dark_tower/internal/v1/internal.proto`.
 
-**Response**:
-```protobuf
-message RegisterParticipantResponse {
-  string connection_token = 1;
-  string media_handler_url = 2;
-}
-```
+The request carries the meeting identity, MC's callback endpoint, the complete
+forwarding policy as a repeated self-contained `EgressStream` (subscriber slot +
+candidate sources + priority group + supersede-on-independent-frame + transport
+mode), meeting-level `SelectionRules`, and a `policy_generation` derived from MC's
+assignment-output change. The response carries `accepted` (received-and-parsed
+only — **not** evidence of application), the **applied** generation, `handler_id`,
+`process_start_epoch_ms`, and the echoed `transport_mode`.
 
-### 4.2 Route Media
-
-**Command**:
-```protobuf
-message RouteMediaCommand {
-  string source_stream_id = 1;
-  repeated string destination_participant_ids = 2;
-  RoutingOptions options = 3;
-}
-
-message RoutingOptions {
-  bool transcode = 1;
-  string target_codec = 2;
-  uint32 target_bitrate = 3;
-  bool mix_audio = 4;  // Mix multiple audio streams
-}
-```
-
-### 4.3 Telemetry (Media Handler → Meeting Controller)
-
-**Stream**:
-```protobuf
-message MediaTelemetry {
-  string stream_id = 1;
-  uint64 bytes_sent = 2;
-  uint64 bytes_received = 3;
-  float packet_loss = 4;
-  uint32 bitrate = 5;
-  uint32 jitter_ms = 6;
-  uint64 timestamp = 7;
-}
-```
+> **Superseded 2026-09-01 — three RPCs retired.** This section previously
+> specified `RegisterParticipant`/`RegisterParticipantResponse{connection_token}`
+> (§4.1), `RouteMediaCommand` + `RoutingOptions{transcode, target_codec,
+> target_bitrate, mix_audio}` (§4.2), and `MediaTelemetry{..., jitter_ms}` (§4.3).
+> All three are deleted from `internal.proto`, and the text is replaced rather
+> than dropped so a reader who relied on it learns why:
+>
+> - **Route Media** described a transcoding/mixing relay. It cannot exist: the
+>   Media Handler holds no keys (ADR-0036 §4) and is type-blind (§7), so it
+>   cannot decode media to transcode or mix it.
+> - **Register Participant** issued a second client credential parallel to the
+>   meeting JWT that actually authenticates. See the §3.1 note above.
+> - **Telemetry** carried per-participant and per-stream identity with byte
+>   counts and timestamps — the per-stream time-ordered size sequence ADR-0036
+>   §11 names as *the voice-activity trace* — and §11 replaces it with Media
+>   Handler self-monitoring histograms. Its `jitter_ms` measured an ADR-0011
+>   objective the ADR-0036 amendment table strikes as unmeasurable, because the
+>   handler forwards and does not buffer.
 
 ## 5. Global Controller ↔ Meeting Controller
 

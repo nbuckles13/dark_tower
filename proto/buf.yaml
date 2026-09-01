@@ -35,6 +35,16 @@ breaking:
   # line — ci-client.yml hand-rolls its own `buf breaking` invocation; the carve-out
   # applies there, the warning does not. See breaking.sh §COVERAGE LIMIT.
   #
+  # SCOPE EXTENSION (2026-09-01, task-4 escalation, user decision): internal.proto
+  # added — 11 findings (8 MESSAGE_NO_DELETE + 3 RPC_NO_DELETE), predicted
+  # set-identical in-tree, same ADR-0036 Appendix mandate, audit evidence in
+  # docs/devloop-outputs/2026-09-01-internal-contract-reshape/main.md. Tasks 8-10
+  # reshape this same MC<->MH contract; the acceptance covers them too. DO NOT
+  # NARROW THIS LIST DURING THE STORY: both files are under one user-granted
+  # acceptance for the whole ADR-0036 story-1 reshape, and narrowing it re-fires
+  # a human escalation per task for a decision already made. Precision is
+  # restored by DELETING the whole key after merge, not by trimming it now.
+  #
   # RESTORE: delete the `ignore:` key once the story PR merges to main — the first
   # post-merge merge-base is post-reshape, so FILE enforcement goes green on its
   # own. Rebase any in-flight proto-touching branch onto post-merge main first, or
@@ -42,3 +52,4 @@ breaking:
   # docs/TODO.md ("Restore buf breaking enforcement after ADR-0036 story 1").
   ignore:
     - dark_tower/signaling/v1/signaling.proto
+    - dark_tower/internal/v1/internal.proto

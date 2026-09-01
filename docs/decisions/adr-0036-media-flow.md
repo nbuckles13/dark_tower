@@ -1363,4 +1363,27 @@ flag and, when set, a fixed-size wrapped transmit key — AES-256-GCM under the 
 derived from the key id, key id as associated data, carrying the KEK generation — on the first N
 frames of every video group and on every audio frame (§4). It is signed; MH forwards it unchanged.
 **No key material crosses the MC→MH contract**, and the credential-leak guard covers KEK and
-transmit-key material in internal messages and logs.
+transmit-key material **in logs**.
+
+> **Correction (2026-09-01, ADR-0036 internal-contract reshape).** This sentence
+> previously read "...in internal messages and logs." **The "internal messages" half was
+> false and is corrected here rather than quietly deleted, because a reader who trusted it
+> would have believed a `.proto` file was mechanically scanned for key material when it is
+> not — and, worse, would have spent their review attention elsewhere.** Every
+> credential- and PII-detecting module in `dt-guard` is extension-scoped to `.rs` or
+> `.ts`/`.tsx`/`.svelte` (`rust_secrets.rs`, `rust_log_secrets.rs`, `rust_pii.rs`,
+> `instrument_skip_all.rs`, `ts_secrets.rs`, `ts_pii.rs`, `ts_retained_credentials.rs`,
+> `ts_metric_naming.rs`); `.proto` appears in that crate only in citation-resolution,
+> index-scope and GSA-path code, none of which are scanners. The semantic layer is not a
+> fallback either: `scripts/guards/semantic/checks.md` scopes its Credential Leak check to
+> Rust and TypeScript in its own preamble.
+>
+> This is row one of this ADR's own taxonomy below — *a control can be alive and out of
+> scope, or in scope and dead; both read as coverage, which is worse than an absent
+> control, because an absence gets noticed*. Unlike the `buf breaking` carve-out, there is
+> **no loudness leg available** here: there is no scanner to print a warning from, so this
+> corrected text is itself the control. A `.proto` scanner is tracked in `docs/TODO.md`
+> (owner: security for the check definition, `dt-guard`/infrastructure for
+> implementation). Until it exists, the enforcement is that no key-shaped field exists on
+> the MC→MH contract and that reintroducing one is a review failure — reviewer-enforced,
+> not structural, and named as the weaker form it is.
