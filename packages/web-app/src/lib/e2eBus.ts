@@ -11,8 +11,9 @@
 //     bundle-content test asserts `__darktower_test__` is absent from the bundle.
 //   - Every payload is an explicit WHITELIST projection — never a raw event or
 //     Error. `joined` DROPS `bindingToken` (reconnection credential) and
-//     `correlationId`; `userId` is stringified (bigint isn't structured-clone
-//     safe for `page.evaluate` reads anyway). Errors cross via `SdkError.toJSON()`
+//     `correlationId`; `senderId` is stringified, and is `undefined` until MC
+//     assigns one (ADR-0036 §2 — absence is never coerced to 0, since 0 is
+//     reserved-invalid). Errors cross via `SdkError.toJSON()`
 //     (the R-23 non-secret allowlist), never a raw Error / `.cause` / `.stack`.
 
 import type { MeetingSessionEventMap, RosterParticipant, SdkError } from '@darktower/sdk-core';
@@ -84,7 +85,7 @@ export function installE2EHooks(session: SessionEvents): void {
       bus.emit({
         type: 'joined',
         participantId: event.participantId,
-        userId: event.userId.toString(),
+        senderId: event.senderId?.toString(),
         participants: event.existingParticipants.map(roster),
         mediaServers: [...event.mediaServers],
         // NOTE: bindingToken + correlationId are intentionally NOT projected (R-23).

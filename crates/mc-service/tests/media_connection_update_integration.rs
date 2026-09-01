@@ -75,6 +75,10 @@ fn join_frame(meeting_id: &str, join_token: &str) -> Vec<u8> {
             capabilities: None,
             correlation_id: String::new(),
             binding_token: String::new(),
+            // ADR-0036 §4: raw Ed25519 identity signing public key. Empty here —
+            // this test exercises the join path, not attribution, and MC performs
+            // no attestation check this story.
+            identity_public_key: Vec::new(),
         })),
     })
 }

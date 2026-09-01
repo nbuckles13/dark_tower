@@ -26,7 +26,7 @@ test('reacts to each SDK event', () => {
 
   session.fire('joined', {
     participantId: 'self',
-    userId: 7n,
+    senderId: 7,
     existingParticipants: [{ participantId: 'a', name: 'Ann' }],
     mediaServers: [],
     correlationId: 'c',

@@ -195,8 +195,10 @@ impl MeetingActorHandle {
             .map_err(|e| McError::Internal(format!("channel send failed: {e}")))
     }
 
-    /// Host mutes a participant (enforced).
-    pub async fn host_mute(
+    /// Server-mutes a participant by meeting policy (enforced at MH ingress,
+    /// ADR-0036 §5). "Host mute" is avoided as a term: it presumes a role
+    /// model this system has not defined.
+    pub async fn server_mute(
         &self,
         target_participant_id: String,
         muted_by: String,
@@ -205,7 +207,7 @@ impl MeetingActorHandle {
     ) -> Result<(), McError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.sender
-            .send(MeetingMessage::HostMute {
+            .send(MeetingMessage::ServerMute {
                 target_participant_id,
                 muted_by,
                 audio_muted,
@@ -273,10 +275,10 @@ struct Participant {
     audio_self_muted: bool,
     /// Video self-mute (informational).
     video_self_muted: bool,
-    /// Audio host-mute (enforced).
-    audio_host_muted: bool,
-    /// Video host-mute (enforced).
-    video_host_muted: bool,
+    /// Audio server-mute (enforced, ADR-0036 §5).
+    audio_server_muted: bool,
+    /// Video server-mute (enforced, ADR-0036 §5).
+    video_server_muted: bool,
     /// Whether this participant has host privileges.
     is_host: bool,
 }
@@ -289,8 +291,8 @@ impl Participant {
             display_name: self.display_name.clone(),
             audio_self_muted: self.audio_self_muted,
             video_self_muted: self.video_self_muted,
-            audio_host_muted: self.audio_host_muted,
-            video_host_muted: self.video_host_muted,
+            audio_server_muted: self.audio_server_muted,
+            video_server_muted: self.video_server_muted,
             status: self.status,
         }
     }
@@ -532,7 +534,7 @@ impl MeetingActor {
                     .await;
             }
 
-            MeetingMessage::HostMute {
+            MeetingMessage::ServerMute {
                 target_participant_id,
                 muted_by,
                 audio_muted,
@@ -540,7 +542,7 @@ impl MeetingActor {
                 respond_to,
             } => {
                 let result = self
-                    .handle_host_mute(&target_participant_id, &muted_by, audio_muted, video_muted)
+                    .handle_server_mute(&target_participant_id, &muted_by, audio_muted, video_muted)
                     .await;
                 let _ = respond_to.send(result);
             }
@@ -645,8 +647,8 @@ impl MeetingActor {
             disconnected_at: None,
             audio_self_muted: false,
             video_self_muted: false,
-            audio_host_muted: false,
-            video_host_muted: false,
+            audio_server_muted: false,
+            video_server_muted: false,
             is_host,
         };
 
@@ -1103,8 +1105,8 @@ impl MeetingActor {
                 participant_id: participant_id.to_string(),
                 audio_self_muted: participant.audio_self_muted,
                 video_self_muted: participant.video_self_muted,
-                audio_host_muted: participant.audio_host_muted,
-                video_host_muted: participant.video_host_muted,
+                audio_server_muted: participant.audio_server_muted,
+                video_server_muted: participant.video_server_muted,
             })
         } else {
             None
@@ -1116,11 +1118,11 @@ impl MeetingActor {
         }
     }
 
-    /// Handle host mute (enforced).
+    /// Handle a server-mute request (enforced, ADR-0036 §5).
     ///
     /// Only participants with host privileges can mute other participants.
     #[instrument(skip_all, fields(meeting_id = %self.meeting_id))]
-    async fn handle_host_mute(
+    async fn handle_server_mute(
         &mut self,
         target_participant_id: &str,
         muted_by: &str,
@@ -1137,7 +1139,7 @@ impl MeetingActor {
         if !is_host {
             warn!(
                 target: "mc.actor.meeting",
-                "Non-host attempted host mute operation"
+                "Non-host attempted server-mute operation"
             );
             return Err(McError::PermissionDenied(
                 "Only hosts can mute other participants".to_string(),
@@ -1146,22 +1148,22 @@ impl MeetingActor {
 
         // Update mute state and extract values for broadcast
         let update = if let Some(participant) = self.participants.get_mut(target_participant_id) {
-            participant.audio_host_muted = audio_muted;
-            participant.video_host_muted = video_muted;
+            participant.audio_server_muted = audio_muted;
+            participant.video_server_muted = video_muted;
 
             info!(
                 target: "mc.actor.meeting",
                 audio_muted = audio_muted,
                 video_muted = video_muted,
-                "Host mute applied"
+                "Server mute applied"
             );
 
             Some(ParticipantStateUpdate::MuteChanged {
                 participant_id: target_participant_id.to_string(),
                 audio_self_muted: participant.audio_self_muted,
                 video_self_muted: participant.video_self_muted,
-                audio_host_muted: participant.audio_host_muted,
-                video_host_muted: participant.video_host_muted,
+                audio_server_muted: participant.audio_server_muted,
+                video_server_muted: participant.video_server_muted,
             })
         } else {
             None
@@ -1808,13 +1810,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_meeting_actor_host_mute() {
+    async fn test_meeting_actor_server_mute() {
         let metrics = ActorMetrics::new();
         let controller_metrics = ControllerMetrics::new();
         let cancel_token = CancellationToken::new();
 
         let (handle, _task) = MeetingActor::spawn(
-            "meeting-host-mute-test".to_string(),
+            "meeting-server-mute-test".to_string(),
             cancel_token.clone(),
             metrics,
             controller_metrics,
@@ -1843,9 +1845,9 @@ mod tests {
             )
             .await;
 
-        // Host mutes part-2
+        // Host-privileged participant server-mutes part-2
         let result = handle
-            .host_mute("part-2".to_string(), "part-1".to_string(), true, false)
+            .server_mute("part-2".to_string(), "part-1".to_string(), true, false)
             .await;
         assert!(result.is_ok());
 
@@ -1856,20 +1858,20 @@ mod tests {
             .iter()
             .find(|p| p.participant_id == "part-2")
             .unwrap();
-        assert!(participant.audio_host_muted);
-        assert!(!participant.video_host_muted);
+        assert!(participant.audio_server_muted);
+        assert!(!participant.video_server_muted);
 
         handle.cancel();
     }
 
     #[tokio::test]
-    async fn test_meeting_actor_host_mute_denied_for_non_host() {
+    async fn test_meeting_actor_server_mute_denied_for_non_host() {
         let metrics = ActorMetrics::new();
         let controller_metrics = ControllerMetrics::new();
         let cancel_token = CancellationToken::new();
 
         let (handle, _task) = MeetingActor::spawn(
-            "meeting-host-mute-denied".to_string(),
+            "meeting-server-mute-denied".to_string(),
             cancel_token.clone(),
             metrics,
             controller_metrics,
@@ -1900,7 +1902,7 @@ mod tests {
 
         // Non-host tries to mute part-2 - should fail
         let result = handle
-            .host_mute("part-2".to_string(), "part-1".to_string(), true, false)
+            .server_mute("part-2".to_string(), "part-1".to_string(), true, false)
             .await;
         assert!(matches!(result, Err(McError::PermissionDenied(_))));
 

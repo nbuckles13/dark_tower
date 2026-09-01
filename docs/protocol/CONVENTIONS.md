@@ -10,11 +10,54 @@ rules from the start; pre-existing deviations are draining via the R-61 chain.
 `proto/buf.yaml` is the enforcement mechanism. It pins:
 
 - `lint.use: [STANDARD]` — the full buf STANDARD ruleset, no carve-outs.
-- `breaking.use: [WIRE_JSON]` — wire- and JSON-compatible breakage detection.
+- `breaking.use: [FILE]` — symbol-set breakage detection, the strictest
+  category. Chosen over `WIRE_JSON` on 2026-05-20 (`docs/TODO.md`): `WIRE_JSON`
+  covers binary-wire compatibility only, so a package rename via file move —
+  same tags, same types, no wire-encoding change — passed it silently. `FILE`
+  catches `PACKAGE_NO_DELETE`, `FILE_NO_DELETE` and message removal.
 
-There is no `lint.ignore` block. If a finding surfaces, the fix lives in the
-`.proto` source, not in a buf config carve-out (consistent with ADR-0033 §13
-and ADR-0034's "fix the parser, don't relax the check" principle).
+There is no `lint.ignore` block, and as of the ADR-0036 signalling reshape no
+`// buf:lint:ignore` annotations either — `signaling.proto` carried five, all
+now drained. If a **lint** finding surfaces, the fix lives in the `.proto`
+source, not in a buf config carve-out and not in an inline annotation
+(consistent with ADR-0033 §13 and ADR-0034's "fix the parser, don't relax the
+check" principle). This paragraph is about `lint` only — see the breaking-change
+note below, which no longer shares its absolutes.
+
+**Intentional wire breaks.** A devloop that intends a wire break declares the
+expected Layer-6 findings up front — by rule class, in its `main.md` under
+`## Expected Layer-State` and in the commit message. The declaration is the
+artifact: the real log is diffed against it class by class, and any
+*unpredicted* finding is a regression on its merits. In a **headless** run the
+Lead may **not** accept the red itself (that is a self-approved risk acceptance);
+it escalates and a human decides.
+
+> **Correction (2026-08-31, ADR-0036 signalling reshape).** This section
+> previously read "`buf breaking` has no suppression mechanism by design
+> (`scripts/lang/proto/breaking.sh`: no `--exclude-path`, no `--against`
+> override, no env bypass)." **That was false and is corrected here rather than
+> quietly deleted, because a reader who trusted it would misread a green gate.**
+> `breaking.sh`'s lockdown covers **CLI flags and env bypass** — it does not
+> forward `"$@"` and has no skip variable, and that much remains true. It says
+> nothing about **config keys**, and `proto/buf.yaml` can silence the gate
+> entirely via `breaking.ignore`, which takes **paths** (files or directories
+> relative to the module root), not package names.
+>
+> **A carve-out is live right now.** `proto/buf.yaml` carries
+> `breaking.ignore: [dark_tower/signaling/v1/signaling.proto]`, added at the
+> user's direction to carry the ADR-0036 intentional break (54 predicted and
+> measured findings) through Layer 6 and CI. While it is present, **no break of
+> any kind is caught in that file — including an unintended one — and a green
+> Layer 6 is not evidence that file is break-free.** `internal.proto` and every
+> other proto stay fully enforced; do **not** widen the entry to `dark_tower`.
+> `scripts/lang/proto/breaking.sh` prints `SUPPRESSED=<paths>` on every run
+> while the key exists. Restore by deleting the key once the ADR-0036 story
+> merges to main — tracked in `docs/TODO.md` ("Restore buf breaking enforcement
+> after ADR-0036 story 1").
+>
+> **If you are the task-4 (`internal.proto`) implementer**: your break is *not*
+> covered by the entry above and Layer 6 will fire for you. Declare it the same
+> way and expect the same escalation.
 
 ## Rules
 
@@ -64,6 +107,46 @@ and `ComprehensiveHeartbeatResponse`. Task #31 lands this rename.
 Rationale: Clarification Q15 in
 `docs/user-stories/2026-05-02-browser-client-join.md`. The split is cheap now
 and keeps future divergence (extra fields on one side) wire-clean.
+
+### 5. Reserve the vacated tag and name; never repurpose in place
+
+When a field's meaning changes, the old tag number **and** the old field name go
+into `reserved`, and the new field takes a **fresh** tag. A tag is never
+re-pointed at a different concept, even when the wire types differ.
+
+```proto
+// Pre-ADR-0036: `uint64 user_id = 2`.
+//
+// `sender_id` deliberately does NOT re-point tag 2: `uint64` and `uint32` are
+// both varint, so an old peer would decode it SUCCESSFULLY with the wrong
+// semantics.
+reserved 2;
+reserved "user_id";
+
+optional uint32 sender_id = 8;
+```
+
+Rationale: a repurposed tag whose old and new encodings are both decodable by an
+old peer is the one failure mode that does not fail loud — the peer reads a
+plausible wrong value instead of erroring. Reserving converts it into a field
+deletion, which every decoder and `buf breaking` both report. Reserve the
+wire-incompatible repurposes too: a rule applied to some of the repurposes in a
+message is worse than no rule, because a reader cannot tell the unreserved tags
+from the ones nobody looked at.
+
+Applies to **enum values** as well as field tags: a vacated enum number is
+reserved, never re-pointed.
+
+**Two exceptions, and only these two.** Both must be annotated at the site so
+the omission reads as a decision rather than an oversight.
+
+1. *A name reused by the new shape.* If the new field keeps the old field's name
+   on a fresh tag, the name cannot also be reserved — protoc rejects reserving a
+   name that is then used. Reserve the number only, and say why in a comment.
+2. *Enum value 0.* proto3 forces value 0 to exist, so it cannot be reserved.
+   Renaming it to `<ENUM>_UNSPECIFIED` re-points it by necessity. This is safe
+   only in the direction where a real value collapses to the fail-closed
+   reading; check that before relying on it.
 
 ## Why STANDARD, not a custom ruleset
 

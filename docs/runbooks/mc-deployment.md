@@ -104,6 +104,20 @@ Complete ALL items before deploying to production:
 
 ### Coordination
 
+- [ ] **MC and the browser SDK ship together** (wire-lockstep)
+  - The ADR-0036 signalling reshape is a breaking wire change: `ClientMessage`
+    tag 8 changed message type, and stream assignments moved from tag 5 to 12.
+    A split deploy fails in the decodes-successfully-wrong-semantics direction,
+    not with a loud error — so MC and the SDK build (`@darktower/sdk-core`
+    consumers) must be deployed as one coordinated release, not independently.
+  - **MH is NOT in the coupled set for the `signaling.proto` reshape**:
+    `MhClientMessage` is unchanged and no `mh-service` source is in it, so MH
+    deploys independently. **This changes when the `internal.proto` reshape
+    (story task 4) lands** — that is the MC↔MH contract, and MH joins the
+    coupled set then; revisit this line at that point.
+  - Note: `## Rollback Procedure` below covers rolling back the *repo*, not a
+    *deployment* — a deployment rollback must revert MC and the SDK together.
+
 - [ ] **Maintenance window scheduled** (if downtime expected)
   - Dependent services notified (GC, MH)
   - Users notified if user-facing impact

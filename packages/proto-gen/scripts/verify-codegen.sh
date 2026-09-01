@@ -49,9 +49,80 @@ assert_generated() {
   echo "verify-codegen: OK — ${file} (contains ${symbol})"
 }
 
+# Absence half of the oracle. Presence greps alone would stay green through an
+# entire deletion set: the ADR-0036 reshape removes twelve symbols, and a
+# half-done deletion or a rename-back must FAIL this script rather than pass it
+# quietly (@test, Gate 1).
+#
+# Named `assert_not_generated`, deliberately NOT `assert_absent`:
+# `scripts/lang/_test_helpers.sh:60` already defines that name with an
+# incompatible contract (tally + `report_results` vs this script's fail-fast
+# `exit 1`). Two helpers sharing a name would shadow silently if this script
+# ever sourced that file, so it pairs with the local `assert_generated` instead.
+#
+# Matches the EXPORT DECLARATION, not a bare token, so a surviving mention in a
+# doc comment cannot produce a false pass.
+assert_not_generated() {
+  local file="$1"
+  local symbol="$2"
+  local path="${OUT_DIR}/${file}"
+
+  # Fail loudly on a missing file rather than passing open. Without this, a
+  # missing/renamed target makes `grep -qE` return a file-error rc, the `if`
+  # below reads it as "not found", and every absence assert prints a false
+  # "OK — absent". Today only ordering saves it (a presence assert on the same
+  # path runs first); the oracle must not depend on that (@test, Gate 3).
+  if [[ ! -f "${path}" ]]; then
+    echo "verify-codegen: FAIL — cannot check absence, file not produced: ${path}" >&2
+    exit 1
+  fi
+  if grep -qE "^export (type|enum|const) ${symbol}\\b" "${path}"; then
+    echo "verify-codegen: FAIL — deleted symbol '${symbol}' is still generated: ${path}" >&2
+    exit 1
+  fi
+  echo "verify-codegen: OK — ${symbol} absent from ${file}"
+}
+
 assert_generated "dark_tower/signaling/v1/signaling_pb.ts" "JoinRequest"
 assert_generated "dark_tower/internal/v1/internal_pb.ts" "RegisterRequest"
 assert_generated "dark_tower/internal/v1/internal_pb.ts" "FastHeartbeatResponse"
 assert_generated "dark_tower/internal/v1/internal_pb.ts" "ComprehensiveHeartbeatResponse"
+
+# ADR-0036 signalling contract — the media-path shapes must exist.
+for symbol in \
+  ReceiveCapability \
+  ReceiveSlot \
+  SendDirective \
+  SendTarget \
+  StreamAssignment \
+  MeetingKekUpdate \
+  ServerMuteRequest \
+  EncodingParameters; do
+  assert_generated "dark_tower/signaling/v1/signaling_pb.ts" "${symbol}"
+done
+
+for symbol in MediaKind Codec TransportMode SlotState; do
+  assert_generated "dark_tower/signaling/v1/signaling_pb.ts" "${symbol}"
+done
+
+# ADR-0036 signalling contract — the superseded shapes must be GONE.
+# `StreamAssignment` is deliberately absent from this list: the name is reused
+# by the new shape, so an absence assert on it would contradict the presence
+# assert above.
+for symbol in \
+  HostMuteRequest \
+  EncryptionKeys \
+  SubscribeToLayout \
+  UpdateLayout \
+  UnsubscribeLayout \
+  LayoutConfig \
+  LayoutType \
+  StreamType \
+  MediaType \
+  StreamMetadata \
+  VideoMetadata \
+  SimulcastLayer; do
+  assert_not_generated "dark_tower/signaling/v1/signaling_pb.ts" "${symbol}"
+done
 
 echo "verify-codegen: all checks passed"

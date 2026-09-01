@@ -131,15 +131,21 @@ async fn handle_join_request(
     // Allocate media handler
     let media_server = allocate_media_handler(&participant_id).await?;
 
-    // Generate encryption keys for E2E
-    let encryption_keys = generate_encryption_keys(&participant_id)?;
+    // ADR-0036 §4: hand the joiner the meeting KEK. There is no per-participant
+    // key generation and no group protocol — if MC admits you, you get the KEK,
+    // and senders carry their wrapped transmit keys in their own frames.
+    let (meeting_kek, kek_generation) = meeting_actor.current_kek().await?;
 
     // Send response
     let response = JoinResponse {
         participant_id: participant_id.to_string(),
         existing_participants,
         media_server: Some(media_server),
-        encryption_keys: Some(encryption_keys),
+        // `None` until MC's allocator assigns one (range/zero rules: see the
+        // normative `JoinResponse.sender_id` proto comment).
+        sender_id,
+        meeting_kek,
+        kek_generation,
     };
 
     send_proto_message(stream, &response).await?;
@@ -250,28 +256,29 @@ If no heartbeat received for 30 seconds, the participant is marked as disconnect
 - Unreliable delivery (acceptable for real-time media)
 - Automatic flow control at the connection level
 
-Control messages (layout changes, routing updates) use bidirectional streams.
+Control messages (receive-capability declarations, send directives, slot
+assignments) use bidirectional streams.
 
 ```
 Client                                    Media Handler
   │                                              │
   │ Send Datagram: MediaFrame (audio)           │
-  │ [user_id=0x123, stream_id=0x001]            │
+  │ [sender_id=0x123, stream_id=0x001]          │
   │───────────────────────────────────────────>│
   │                                              │
   │ Send Datagram: MediaFrame (video)           │
-  │ [user_id=0x123, stream_id=0x002]            │
+  │ [sender_id=0x123, stream_id=0x002]          │
   │───────────────────────────────────────────>│
   │                                              │
   │                                    Route to  │
   │                                    subscribers│
   │                                              │
   │          Receive Datagram: MediaFrame       │
-  │          [user_id=0x456, stream_id=0x003]   │
+  │          [sender_id=0x456, stream_id=0x003] │
   │<─────────────────────────────────────────────│
   │                                              │
   │          Receive Datagram: MediaFrame       │
-  │          [user_id=0x456, stream_id=0x004]   │
+  │          [sender_id=0x456, stream_id=0x004] │
   │<─────────────────────────────────────────────│
   │                                              │
 ```

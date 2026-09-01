@@ -196,6 +196,10 @@ async fn join_and_read_response(
             capabilities: None,
             correlation_id: String::new(),
             binding_token: String::new(),
+            // ADR-0036 §4: raw Ed25519 identity signing public key. Empty here —
+            // this test exercises the join path, not attribution, and MC performs
+            // no attestation check this story.
+            identity_public_key: Vec::new(),
         })),
     };
 
@@ -246,6 +250,10 @@ async fn join_keep_open(
             capabilities: None,
             correlation_id: String::new(),
             binding_token: String::new(),
+            // ADR-0036 §4: raw Ed25519 identity signing public key. Empty here —
+            // this test exercises the join path, not attribution, and MC performs
+            // no attestation check this story.
+            identity_public_key: Vec::new(),
         })),
     };
 
@@ -832,6 +840,10 @@ async fn test_participant_joined_notification_via_bridge() {
             capabilities: None,
             correlation_id: String::new(),
             binding_token: String::new(),
+            // ADR-0036 §4: raw Ed25519 identity signing public key. Empty here —
+            // this test exercises the join path, not attribution, and MC performs
+            // no attestation check this story.
+            identity_public_key: Vec::new(),
         })),
     };
     send1
@@ -880,6 +892,10 @@ async fn test_participant_joined_notification_via_bridge() {
             capabilities: None,
             correlation_id: String::new(),
             binding_token: String::new(),
+            // ADR-0036 §4: raw Ed25519 identity signing public key. Empty here —
+            // this test exercises the join path, not attribution, and MC performs
+            // no attestation check this story.
+            identity_public_key: Vec::new(),
         })),
     };
     send2

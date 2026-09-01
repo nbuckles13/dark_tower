@@ -18,7 +18,7 @@ import { SignalingErrorCode } from '../errors/SignalingError.js';
  * until mapped.
  */
 const ERROR_CODE_TO_SIGNALING: Record<ErrorCode, SignalingErrorCode> = {
-  [ErrorCode.UNKNOWN]: SignalingErrorCode.Unknown,
+  [ErrorCode.UNSPECIFIED]: SignalingErrorCode.Unknown,
   [ErrorCode.INVALID_REQUEST]: SignalingErrorCode.InvalidRequest,
   [ErrorCode.UNAUTHORIZED]: SignalingErrorCode.Unauthorized,
   [ErrorCode.FORBIDDEN]: SignalingErrorCode.Forbidden,

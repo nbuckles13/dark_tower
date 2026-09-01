@@ -45,17 +45,20 @@ function buildServerMessage(
 
 export interface JoinResponseInit {
   participantId?: string;
-  userId?: bigint;
+  senderId?: number;
   participants?: { participantId: string; name: string }[];
   mediaServers?: string[];
   correlationId?: string;
   bindingToken?: string;
+  // Present so a test can construct the leak scenario: the meeting KEK is on the
+  // wire but must never be projected into `JoinedEvent` (events.ts guarantee).
+  meetingKek?: Uint8Array;
 }
 
 export function buildJoinResponse(init: JoinResponseInit = {}) {
   return create(JoinResponseSchema, {
     participantId: init.participantId ?? 'participant-self',
-    userId: init.userId ?? 0n,
+    senderId: init.senderId,
     existingParticipants: (init.participants ?? []).map((p) =>
       create(ParticipantSchema, { participantId: p.participantId, name: p.name }),
     ),
@@ -64,6 +67,7 @@ export function buildJoinResponse(init: JoinResponseInit = {}) {
     ),
     correlationId: init.correlationId ?? '',
     bindingToken: init.bindingToken ?? '',
+    meetingKek: init.meetingKek ?? new Uint8Array(),
   });
 }
 

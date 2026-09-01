@@ -115,8 +115,10 @@ test.describe('join happy path (R-40/R-44/R-46)', () => {
 
       // Gap (1): the two contexts are DISTINCT participants. (Distinct accounts
       // are proven by the roster DOM below — userB's registered display name vs
-      // V's — NOT by the bus `userId`, which e2eBus projects as 0 for every user;
-      // see main.md §Issues.)
+      // V's — NOT by the bus `senderId`, which is absent for every user until
+      // MC's allocator lands: ADR-0036 §2 makes 0 reserved-invalid, so the
+      // pre-allocator state is `undefined` rather than a shared zero. See
+      // docs/TODO.md §"JoinResponse sender_id".)
       expect(joinedB.participantId, 'second party must get its own participant_id').not.toBe(
         joinedA.participantId,
       );

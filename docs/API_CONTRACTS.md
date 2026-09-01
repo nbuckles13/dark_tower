@@ -145,24 +145,49 @@ message JoinRequest {
   string join_token = 2;
   string participant_name = 3;
   ParticipantCapabilities capabilities = 4;
+  string correlation_id = 5;              // ADR-0023 session recovery
+  string binding_token = 6;               // ADR-0023 session recovery
+  bytes identity_public_key = 7;          // raw Ed25519, 32 bytes (ADR-0036 §4)
 }
 
 message ParticipantCapabilities {
-  repeated string video_codecs = 1;  // e.g., ["VP9", "AV1", "H264"]
-  repeated string audio_codecs = 2;  // e.g., ["Opus", "AAC"]
-  bool supports_simulcast = 3;
-  uint32 max_video_streams = 4;
+  reserved 1 to 4;                        // was: video_codecs, audio_codecs,
+  reserved "video_codecs", "audio_codecs",  //      supports_simulcast,
+           "supports_simulcast", "max_video_streams";
+  repeated Codec supported_codecs = 5;
+  repeated uint32 supported_header_versions = 6;
+}
+
+enum Codec {
+  CODEC_UNSPECIFIED = 0;                  // never valid in a directive
+  CODEC_OPUS = 1;
+  CODEC_VP9 = 2;
+  CODEC_AV1 = 3;
+  CODEC_H264 = 4;
 }
 ```
+
+`video_codecs`/`audio_codecs` collapse into one `supported_codecs` list: media
+kind is a property of the codec's own identity, so encoding it a second time
+positionally lets the two representations disagree (`audio_codecs: [VP9]` was
+well-typed and meaningless). `supports_simulcast` goes because simulcast is out
+of scope in ADR-0036, and `max_video_streams` because `ReceiveCapability`'s
+explicit slot list supersedes it — a scalar maximum and a per-slot list are two
+representations of one constraint, and the list is strictly more expressive.
 
 #### JoinResponse
 ```protobuf
 message JoinResponse {
   string participant_id = 1;
-  uint64 user_id = 2;  // 8-byte user ID for media frames
+  reserved 2, 5;                                // was: user_id, encryption_keys
+  reserved "user_id", "encryption_keys";
   repeated Participant existing_participants = 3;
-  repeated MediaServerInfo media_servers = 4;  // Multiple handlers
-  EncryptionKeys encryption_keys = 5;
+  repeated MediaServerInfo media_servers = 4;   // Multiple handlers
+  string correlation_id = 6;                    // ADR-0023 session recovery
+  string binding_token = 7;                     // ADR-0023 session recovery
+  optional uint32 sender_id = 8;                // 16-bit semantics; 1..=65535
+  bytes meeting_kek = 9;                        // AES-256, exactly 32 bytes
+  uint32 kek_generation = 10;                   // u16 semantics
 }
 
 message Participant {
@@ -170,18 +195,66 @@ message Participant {
   string name = 2;
   repeated MediaStream streams = 3;
   uint64 joined_at = 4;
+  optional uint32 sender_id = 5;
+  bytes identity_public_key = 6;                // raw Ed25519, 32 bytes
 }
 
 message MediaServerInfo {
   string media_handler_url = 1;
-  string connection_token = 2;
-}
-
-message EncryptionKeys {
-  bytes public_key = 1;
-  string key_id = 2;
+  reserved 2;                                   // was: connection_token
 }
 ```
+
+**`sender_id` (ADR-0036 §2).** The joiner's per-meeting numeric sender id, and the
+first half of the attribution chain. A `uint32` on the wire carrying 16-bit
+semantics, because the 64-bit SFrame key id allots 16 bits to the sender
+(`sender_id(16) | stream(8) | generation(40)`).
+
+> The `JoinResponse.sender_id` comment in `proto/dark_tower/signaling/v1/signaling.proto`
+> is normative; the bullets below summarise it. On any disagreement — especially
+> the `NonZeroU16` enforcement clause, which is an unimplemented instruction to
+> story task 10 — the proto wins.
+
+- **Valid range 1..=65535. Zero is never valid**, and there is no zero sentinel:
+  absence is field presence, not a magic value. Absent means MC has not assigned
+  one.
+- MC is allocator **and** enforcement point, using `NonZeroU16` — not a bare
+  `u16::try_from`, which accepts the reserved-invalid zero. Fail closed on
+  violation: refuse the join or the assignment, never truncate or wrap. An
+  out-of-range value does not fail loudly on its own — it truncates into the key
+  id and surfaces as a signature failure against the *wrong* participant's key.
+- Consumers MUST NOT coerce absence to 0. Two senders sharing zero collide on the
+  key id, hence on the derived AEAD wrap nonce under one KEK — AES-GCM
+  authentication-key recovery, not merely a confidentiality loss.
+- Per-meeting and MC-allocated. **Not** a durable user identity: the field it
+  replaces (`user_id`, a hardcoded-zero `uint64`) would have made participants
+  linkable across meetings.
+
+**`meeting_kek` / `kek_generation` (ADR-0036 §4).** Every participant MC admits
+receives the meeting key-encryption key; there is no other condition and no group
+protocol. Senders wrap per-stream transmit keys under it and carry the wrapped key
+in their own frames, so a joiner needs no round trip and no existing member is
+touched. Empty KEK means not-yet-provisioned; consumers fail closed and never wrap
+or unwrap under a key of any length other than 32.
+
+The accurate claim, in ADR-0036 §4's own words: **media is encrypted between
+clients; MH, transport and storage cannot read it; MC can.** This is accepted
+operator custody, recorded as the user's risk decision. It must never be described
+as end-to-end against the operator or as zero-trust; telemetry carries
+`key_custody=operator` in place of any end-to-end boolean. No key material crosses
+the MC→MH contract, and none rides on the roster.
+
+**`identity_public_key` (ADR-0036 §3, §4).** The participant's raw Ed25519 signing
+public key — 32 bytes, not PEM/JWK/base64/SPKI — sent on `JoinRequest` and
+republished on the roster. **This story performs no attestation check**: MC does
+not verify it against the meeting token's `cnf` thumbprint, so it is trust on
+first use. A verified frame signature therefore proves only that every frame came
+from the same keyholder, never *who* that keyholder is, and for a guest never more
+than a pseudonym. The client-validated AC attestation closes this in story 2;
+when it lands, the attestation wins over the roster on disagreement.
+
+Keys are scoped to one meeting, never reused across meetings — a reused key makes
+a participant linkable by public key regardless of display name.
 
 #### ParticipantJoined (Server → Client)
 ```protobuf
@@ -198,10 +271,13 @@ message ParticipantLeft {
 }
 
 enum LeaveReason {
-  VOLUNTARY = 0;
-  KICKED = 1;
-  CONNECTION_LOST = 2;
-  MEETING_ENDED = 3;
+  LEAVE_REASON_UNSPECIFIED = 0;
+  reserved 1 to 4;                    // was: VOLUNTARY..TIMEOUT at 0..4
+  LEAVE_REASON_VOLUNTARY = 5;
+  LEAVE_REASON_KICKED = 6;
+  LEAVE_REASON_CONNECTION_LOST = 7;
+  LEAVE_REASON_MEETING_ENDED = 8;
+  LEAVE_REASON_TIMEOUT = 9;
 }
 ```
 
@@ -209,34 +285,34 @@ enum LeaveReason {
 ```protobuf
 message PublishStream {
   string stream_id = 1;
-  StreamType stream_type = 2;
-  StreamMetadata metadata = 3;
+  reserved 2, 3;                      // was: stream_type, metadata
+  MediaKind media_kind = 4;
+  EncodingParameters encoding = 5;
 }
 
-enum StreamType {
-  AUDIO = 0;
-  VIDEO_CAMERA = 1;
-  VIDEO_SCREEN = 2;
+message MediaStream {
+  string stream_id = 1;
+  reserved 2, 3;
+  MediaKind media_kind = 4;
+  EncodingParameters encoding = 5;
 }
 
-message StreamMetadata {
-  string codec = 1;
-  uint32 max_bitrate = 2;
-  VideoMetadata video = 3;  // Only for video streams
+// Collapses the former duplicate StreamType and MediaType enums.
+enum MediaKind {
+  MEDIA_KIND_UNSPECIFIED = 0;
+  MEDIA_KIND_AUDIO = 1;
+  MEDIA_KIND_VIDEO_CAMERA = 2;
+  MEDIA_KIND_VIDEO_SCREEN = 3;
 }
 
-message VideoMetadata {
-  uint32 width = 1;
-  uint32 height = 2;
-  uint32 framerate = 3;
-  repeated SimulcastLayer simulcast_layers = 4;
-}
-
-message SimulcastLayer {
-  string layer_id = 1;
-  uint32 width = 2;
-  uint32 height = 3;
-  uint32 max_bitrate = 4;
+// The single encoding vocabulary. Replaces StreamMetadata / VideoMetadata /
+// SimulcastLayer; simulcast is out of scope in ADR-0036.
+message EncodingParameters {
+  Codec codec = 1;
+  uint32 max_bitrate_bps = 2;
+  uint32 width = 3;
+  uint32 height = 4;
+  uint32 frame_rate = 5;
 }
 ```
 
@@ -246,64 +322,46 @@ message StreamPublished {
   string participant_id = 1;
   MediaStream stream = 2;
 }
-
-message MediaStream {
-  string stream_id = 1;
-  StreamType stream_type = 2;
-  StreamMetadata metadata = 3;
-}
 ```
 
-#### SubscribeToLayout (Client → Server)
+#### ReceiveCapability (Client → Server)
 
-**Virtualized Subscription**: Client subscribes to a layout, not individual streams.
+**Capability, not layout.** The client declares what it can **decode and render**
+— a list of slots, each with a media kind and an optional pin — and MC composes
+the experience. It does not specify who appears where. The predecessor
+(`SubscribeToLayout` / `UpdateLayout` / `UnsubscribeLayout` / `LayoutConfig` /
+`LayoutType`) had the client specifying grid geometry, which inverts that;
+geometry was never the server's business. This is also a security property:
+resource-amplification-by-request becomes structurally impossible rather than
+rate-limited.
 
 ```protobuf
-message SubscribeToLayout {
-  LayoutType layout_type = 1;
-  LayoutConfig config = 2;
-  repeated uint32 stream_ids = 3;  // Subscriber-chosen IDs for each slot
+message ReceiveCapability {
+  repeated ReceiveSlot slots = 1;     // capped by server-side configuration
 }
 
-enum LayoutType {
-  GRID = 0;
-  // Future: STACK = 1, PRESENTATION = 2, etc.
-}
-
-message LayoutConfig {
-  // For Grid layout
-  uint32 rows = 1;
-  uint32 columns = 2;
-  uint32 max_streams = 3;  // rows * columns
-
-  // Customization
-  repeated uint64 pinned_users = 4;   // Must appear in layout
-  repeated uint64 excluded_users = 5;  // Must not appear
-  bool prefer_video_over_audio = 6;
-  bool include_self = 7;
+message ReceiveSlot {
+  uint32 slot_id = 1;                 // subscriber-chosen, 16-bit semantics
+  MediaKind media_kind = 2;
+  optional uint32 pinned_sender_id = 3;
 }
 ```
 
-**Example**:
-```protobuf
-SubscribeToLayout {
-  layout_type: GRID,
-  config: {
-    rows: 3,
-    columns: 3,
-    max_streams: 9,
-    pinned_users: [0x123456, 0x789ABC],
-    include_self: false
-  },
-  stream_ids: [1, 2, 3, 4, 5, 6, 7, 8, 9]  // One for each grid slot
-}
-```
+**Every constraint is an upper bound**, so any subset is a valid fulfilment and an
+unsatisfiable request cannot be expressed. **Pins are a per-slot optional
+parameter, never a parallel list** — which makes "seven pins into six slots"
+unrepresentable rather than merely invalid.
 
-Meeting Controller responds with `StreamAssignments` indicating which user/stream maps to each slot.
+`slot_id` is **subscriber-chosen and scoped to one subscriber's connection, not
+globally unique**: a media handler's routing table must be keyed on
+`(subscriber, slot_id)`. It must be unique within one declaration — MC rejects
+duplicates rather than last-write-wins — and MC validates the 16-bit range and the
+slot cap, rejecting the whole declaration on violation (not a `debug_assert!`,
+which release profiles compile out; not clamp-or-truncate). It is the same value
+space as the frame's relay-region stream id, which is what lets a receiver
+validate an arriving `stream_id` against its own declared slots.
 
 #### StreamAssignments (Server → Client)
-
-Meeting Controller sends this after processing layout subscription:
 
 ```protobuf
 message StreamAssignments {
@@ -311,52 +369,127 @@ message StreamAssignments {
 }
 
 message StreamAssignment {
-  uint32 stream_id = 1;        // The subscriber's local stream_id
-  uint64 user_id = 2;           // Source participant
-  MediaType media_type = 3;     // camera, screen, audio
-  uint32 slot_index = 4;        // Position in layout (0-based)
-  string media_handler_url = 5; // Which handler to receive from
-}
-
-enum MediaType {
-  AUDIO = 0;
-  VIDEO_CAMERA = 1;
-  VIDEO_SCREEN = 2;
+  uint32 slot_id = 1;
+  optional uint32 sender_id = 2;
+  MediaKind media_kind = 3;
+  string media_handler_url = 4;
+  SlotState slot_state = 5;
+  optional uint64 switch_command_id = 6;   // iff slot_state == SWITCH_PENDING
 }
 ```
 
-**Example Response**:
-```protobuf
-StreamAssignments {
-  assignments: [
-    { stream_id: 1, user_id: 0x123456, media_type: VIDEO_CAMERA, slot_index: 0, media_handler_url: "https://mh1..." },
-    { stream_id: 2, user_id: 0x789ABC, media_type: VIDEO_CAMERA, slot_index: 1, media_handler_url: "https://mh1..." },
-    { stream_id: 3, user_id: 0xDEF012, media_type: VIDEO_SCREEN, slot_index: 2, media_handler_url: "https://mh2..." },
-    // ... up to 9 assignments for 3x3 grid
-  ]
-}
-```
+**Attribution chain**: an arriving frame's key id yields `sender_id`, `sender_id`
+yields the roster entry, and the roster entry's `identity_public_key` verifies the
+frame's Ed25519 signature. Attribution comes from **the signature verifying**,
+never from this assignment or the roster mapping itself — a compromised MC can
+mis-map either.
 
-Client uses this mapping to route received datagrams to correct UI slots.
-
-#### UpdateLayout (Client → Server)
-
-Client can update layout without full resubscription:
+**Slot state is explicit on the wire, because absence of frames is not a signal.**
+*Withheld by congestion*, *fewer sources than slots* and *source unreachable* are
+indistinguishable to a client — all present as no media — and render completely
+differently.
 
 ```protobuf
-message UpdateLayout {
-  LayoutConfig new_config = 1;  // New layout configuration
+enum SlotState {
+  SLOT_STATE_UNSPECIFIED = 0;
+  SLOT_STATE_ACTIVE = 1;                        // steady
+  SLOT_STATE_SOURCE_MUTED = 2;                  // steady: present, far-end muted
+  SLOT_STATE_WITHHELD_BY_CONGESTION = 3;        // transient; the only MH-observed one
+  SLOT_STATE_FEWER_SOURCES_THAN_SLOTS = 4;      // steady
+  SLOT_STATE_ZERO_REQUESTED = 5;                // steady
+  SLOT_STATE_SOURCE_UNREACHABLE = 6;            // structurally persistent
+  SLOT_STATE_SWITCH_PENDING = 7;                // transient; carries command id
 }
 ```
 
-Server responds with updated `StreamAssignments`.
+Switch completion is reported **by command identifier, never by state
+description**: if MC switches a slot to B, reverts to A, then switches to B again,
+a report reading "A→B complete" is ambiguous across the first and third commands.
 
-#### UnsubscribeLayout (Client → Server)
+#### SendDirective (Server → Client)
+
+**MC directs both where a client sends and what it produces** (ADR-0036 §5).
+
 ```protobuf
-message UnsubscribeLayout {
-  // No parameters needed - unsubscribes from current layout
+message SendDirective {
+  repeated SendStream streams = 1;
+  uint32 header_version = 2;          // meeting-wide frame header version (§2)
+}
+
+message SendStream {
+  uint32 stream_number = 1;           // 8-bit semantics (key id's stream field)
+  MediaKind media_kind = 2;
+  EncodingParameters encoding = 3;
+  repeated SendTarget targets = 4;    // empty target set = send nothing
+}
+
+message SendTarget {
+  string media_handler_url = 1;
+  TransportMode transport_mode = 2;   // NOT priority group — see below
+}
+
+enum TransportMode {
+  TRANSPORT_MODE_UNSPECIFIED = 0;     // fail-closed: MC MUST assign
+  TRANSPORT_MODE_DATAGRAM = 1;
+  TRANSPORT_MODE_STREAM_PER_GROUP = 2;
 }
 ```
+
+**Different encodings are different streams**, not one stream with divergent
+per-target encodings. That is what keeps the encrypt-once invariant true by
+construction: different encodings mean different plaintext, so there is no single
+ciphertext to fan out, and modelling it otherwise would force either
+per-destination encryption (nonce reuse) or two counters per frame.
+
+**The directive carries transport mode and NOT priority group.** Priority group is
+an MC→MH egress property on the internal registration contract (ADR-0036 §7), and
+those groups *bound* how far a self-declared salience signal can promote a
+participant. A client able to name its own priority group could promote itself past
+that bound — turning "hold the meeting's audio floor" into a one-line client patch.
+
+**`header_version` is meeting-wide and MC-directed**, because it sits in the signed
+publisher region: a relay cannot translate between header versions without breaking
+verification. MC selects one version for the whole meeting from participants'
+declared `supported_header_versions`, applying a server-side allowlist and a
+minimum floor. A declaration is an upper bound on what a client can do, never a
+lower bound on what the meeting accepts; a client declaring nothing at or above the
+floor is rejected at join rather than the meeting being downgraded, and an empty
+list is not "accept anything". **Enforcement is not yet allocated to a story
+task** (neither task 14 nor task 10 carries the allowlist/floor); it is latent
+while only header version 2 exists and is tracked in `docs/TODO.md`. Do not read
+it as covered.
+
+#### MeetingKekUpdate (Server → Client)
+
+```protobuf
+message MeetingKekUpdate {
+  bytes meeting_kek = 1;              // AES-256, exactly 32 bytes
+  uint32 kek_generation = 2;          // u16 semantics
+}
+```
+
+Pushed to every member when MC rotates the KEK (debounced on participant
+departure). Defined additively and unused as of this contract revision. Receivers
+retain the previous KEK for a bounded window so frames in flight, and frames from
+senders that have not yet re-wrapped, still open.
+
+#### ServerMuteRequest (Client → Server)
+
+Renamed from `HostMuteRequest`; same message, same tag, no behaviour change.
+ADR-0036 §5 avoids *host mute* as a term because it presumes a role model this
+system has not defined. Two distinct things are called muting and the enforcement
+point follows from who decided:
+
+| | Decided by | Enforced at | Protects |
+|---|---|---|---|
+| **Client mute** (`MuteRequest`) | the participant, about themselves | the client, at capture | the user, from the server |
+| **Server mute** (`ServerMuteRequest`) | meeting policy, about someone else | MH, at ingress | the meeting, from a patched client |
+
+Under client mute **no media leaves the device**, enforced client-side and never
+dependent on the server honouring it. MC keeps the send directive active while a
+client reports itself muted, which is what makes unmute instantaneous and keeps
+*"MC has not asked you to send"* distinguishable from *"you have muted yourself"*.
+
 
 #### StreamQualityUpdate (Bidirectional)
 ```protobuf

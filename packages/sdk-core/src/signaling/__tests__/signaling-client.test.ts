@@ -20,7 +20,8 @@ import { MockWebTransport } from '@darktower/test-utils';
 import { SignalingClient } from '../SignalingClient.js';
 import type { SignalingClientOptions } from '../SignalingClient.js';
 import type { SignalingJoinParams } from '../events.js';
-import { ParticipantLeaveReason } from '../events.js';
+import { ParticipantLeaveReason, SignalingCodec } from '../events.js';
+import { Codec } from '../../proto/dark_tower/signaling/v1/signaling_pb.js';
 import { SignalingError, SignalingErrorCode } from '../../errors/SignalingError.js';
 import { MAX_MESSAGE_SIZE } from '../../framing/length-prefix.js';
 import { CloseReason, normalizeCloseReason } from '../../telemetry/closeReason.js';
@@ -112,10 +113,8 @@ describe('SignalingClient — connect + JoinRequest (R-16)', () => {
     const wt = new MockWebTransport();
     const { client, joinPromise } = startJoin(wt, {
       capabilities: {
-        videoCodecs: ['VP9', 'AV1'],
-        audioCodecs: ['Opus'],
-        supportsSimulcast: true,
-        maxVideoStreams: 3,
+        supportedCodecs: [SignalingCodec.Vp9, SignalingCodec.Av1, SignalingCodec.Opus],
+        supportedHeaderVersions: [2],
       },
     });
     wt.simulateReady();
@@ -125,10 +124,10 @@ describe('SignalingClient — connect + JoinRequest (R-16)', () => {
     expect(cm.message.case).toBe('joinRequest');
     if (cm.message.case === 'joinRequest') {
       const caps = cm.message.value.capabilities;
-      expect(caps?.videoCodecs).toEqual(['VP9', 'AV1']);
-      expect(caps?.audioCodecs).toEqual(['Opus']);
-      expect(caps?.supportsSimulcast).toBe(true);
-      expect(caps?.maxVideoStreams).toBe(3);
+      // Public vocabulary is mapped onto the wire enum through codecMap's one
+      // oracle — one list, since media kind is a property of the codec.
+      expect(caps?.supportedCodecs).toEqual([Codec.VP9, Codec.AV1, Codec.OPUS]);
+      expect(caps?.supportedHeaderVersions).toEqual([2]);
     }
 
     client.close();
@@ -153,7 +152,7 @@ describe('SignalingClient — connect + JoinRequest (R-16)', () => {
 });
 
 describe('SignalingClient — JoinResponse + typed events (R-17)', () => {
-  it('emits onJoined with a BigInt userId, roster, and media-server URLs', async () => {
+  it('emits onJoined with a numeric senderId, roster, and media-server URLs', async () => {
     const wt = new MockWebTransport();
     const onJoined = vi.fn();
     const { client, joinPromise } = startJoin(wt);
@@ -165,7 +164,7 @@ describe('SignalingClient — JoinResponse + typed events (R-17)', () => {
       0,
       framedJoinResponse({
         participantId: 'p-self',
-        userId: 123456789012345n,
+        senderId: 4242,
         participants: [
           { participantId: 'p1', name: 'Bob' },
           { participantId: 'p2', name: 'Carol' },
@@ -178,14 +177,33 @@ describe('SignalingClient — JoinResponse + typed events (R-17)', () => {
 
     const joined = (await joinPromise) as Awaited<ReturnType<SignalingClient['join']>>;
     expect(joined.participantId).toBe('p-self');
-    expect(typeof joined.userId).toBe('bigint');
-    expect(joined.userId).toBe(123456789012345n);
+    expect(typeof joined.senderId).toBe('number');
+    expect(joined.senderId).toBe(4242);
     expect(joined.existingParticipants).toEqual([
       { participantId: 'p1', name: 'Bob' },
       { participantId: 'p2', name: 'Carol' },
     ]);
     expect(joined.mediaServers).toEqual(['https://mh1.example', 'https://mh2.example']);
     expect(onJoined).toHaveBeenCalledTimes(1);
+
+    client.close();
+  });
+
+  it('never projects the meeting KEK into the joined event', async () => {
+    // events.ts guarantees JoinedEvent carries no key material. Rust has three
+    // Debug-redaction tests; this is the TS-side enforcement of the same
+    // guarantee, on the surface with no `skip_debug` equivalent. Mirrors the
+    // e2eBus stringify assertion pattern.
+    const wt = new MockWebTransport();
+    const { client, joinPromise } = startJoin(wt);
+    // 32-byte KEK on the wire with a recognizable byte value (0xAB = 171).
+    await reachJoined(wt, { meetingKek: new Uint8Array(32).fill(0xab) });
+    const joined = (await joinPromise) as Awaited<ReturnType<SignalingClient['join']>>;
+
+    expect('meetingKek' in (joined as unknown as Record<string, unknown>)).toBe(false);
+    const serialized = JSON.stringify(joined);
+    expect(serialized).not.toContain('meetingKek');
+    expect(serialized).not.toContain('171');
 
     client.close();
   });
@@ -293,7 +311,7 @@ describe('SignalingClient — JoinResponse + typed events (R-17)', () => {
 
 describe('SignalingClient — ErrorMessage → SignalingError (R-18)', () => {
   const EXPECTED: ReadonlyArray<readonly [ErrorCode, SignalingErrorCode, string]> = [
-    [ErrorCode.UNKNOWN, SignalingErrorCode.Unknown, 'UNKNOWN'],
+    [ErrorCode.UNSPECIFIED, SignalingErrorCode.Unknown, 'UNSPECIFIED'],
     [ErrorCode.INVALID_REQUEST, SignalingErrorCode.InvalidRequest, 'INVALID_REQUEST'],
     [ErrorCode.UNAUTHORIZED, SignalingErrorCode.Unauthorized, 'UNAUTHORIZED'],
     [ErrorCode.FORBIDDEN, SignalingErrorCode.Forbidden, 'FORBIDDEN'],
@@ -506,7 +524,7 @@ describe('SignalingClient — framing edge cases (R-16/R-18)', () => {
     wt.simulateReady();
     await waitFor(() => wt.getOpenedBidiStreams().length > 0);
 
-    const framed = framedJoinResponse({ participantId: 'p-split', userId: 7n });
+    const framed = framedJoinResponse({ participantId: 'p-split', senderId: 7 });
     const split = Math.floor(framed.byteLength / 2);
     wt.simulateServerMessage(0, framed.slice(0, split));
     wt.simulateServerMessage(0, framed.slice(split));

@@ -457,6 +457,10 @@ async fn mc_join(
             capabilities: None,
             correlation_id: String::new(),
             binding_token: String::new(),
+            // ADR-0036 §4: raw Ed25519 identity signing public key. Empty here —
+            // this test exercises the join path, not attribution, and MC performs
+            // no attestation check this story.
+            identity_public_key: Vec::new(),
         })),
         trace_parent: String::new(),
         trace_state: String::new(),
@@ -857,6 +861,10 @@ async fn test_mc_media_connection_update_increments_participant_mh_status_metric
             capabilities: None,
             correlation_id: String::new(),
             binding_token: String::new(),
+            // ADR-0036 §4: raw Ed25519 identity signing public key. Empty here —
+            // this test exercises the join path, not attribution, and MC performs
+            // no attestation check this story.
+            identity_public_key: Vec::new(),
         })),
         trace_parent: String::new(),
         trace_state: String::new(),

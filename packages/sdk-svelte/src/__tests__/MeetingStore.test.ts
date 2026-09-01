@@ -14,7 +14,7 @@ function roster(id: string, name: string): RosterParticipant {
 function joined(existing: readonly RosterParticipant[]): JoinedEvent {
   return {
     participantId: 'self',
-    userId: 42n,
+    senderId: 42,
     existingParticipants: existing,
     mediaServers: [],
     correlationId: 'corr',

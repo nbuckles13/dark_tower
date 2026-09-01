@@ -15,7 +15,7 @@ export class MockMeetingSession extends TypedEventEmitter<MeetingSessionEventMap
     this.joinCalls += 1;
     return {
       participantId: 'self',
-      userId: 1n,
+      senderId: 1,
       existingParticipants: [],
       mediaServers: [],
       correlationId: 'c',

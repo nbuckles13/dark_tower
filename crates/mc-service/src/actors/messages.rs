@@ -133,8 +133,10 @@ pub enum MeetingMessage {
         video_muted: bool,
     },
 
-    /// Host mutes a participant (enforced).
-    HostMute {
+    /// Server-mutes a participant by meeting policy (enforced at MH ingress,
+    /// ADR-0036 §5). "Host mute" is avoided as a term: it presumes a role
+    /// model this system has not defined.
+    ServerMute {
         target_participant_id: String,
         muted_by: String,
         audio_muted: bool,
@@ -293,10 +295,10 @@ pub struct ParticipantInfo {
     pub audio_self_muted: bool,
     /// Whether video is self-muted.
     pub video_self_muted: bool,
-    /// Whether audio is host-muted (enforced).
-    pub audio_host_muted: bool,
-    /// Whether video is host-muted (enforced).
-    pub video_host_muted: bool,
+    /// Whether audio is server-muted (enforced, ADR-0036 §5).
+    pub audio_server_muted: bool,
+    /// Whether video is server-muted (enforced, ADR-0036 §5).
+    pub video_server_muted: bool,
     /// Connection status.
     pub status: ParticipantStatus,
 }
@@ -327,8 +329,8 @@ pub enum ParticipantStateUpdate {
         participant_id: String,
         audio_self_muted: bool,
         video_self_muted: bool,
-        audio_host_muted: bool,
-        video_host_muted: bool,
+        audio_server_muted: bool,
+        video_server_muted: bool,
     },
     /// A participant disconnected (still in grace period).
     Disconnected { participant_id: String },
@@ -556,8 +558,8 @@ mod tests {
             display_name: "Test User".to_string(),
             audio_self_muted: false,
             video_self_muted: true,
-            audio_host_muted: false,
-            video_host_muted: false,
+            audio_server_muted: false,
+            video_server_muted: false,
             status: ParticipantStatus::Connected,
         };
         let cloned = info.clone();
