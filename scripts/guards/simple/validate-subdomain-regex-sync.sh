@@ -26,7 +26,7 @@
 #   1. pins an EXACT literal site count, independent of the table it checks;
 #   2. FAILS LOUDLY if any single enumerated site yields ZERO matches (missing file, renamed
 #      file, edited literal — all indistinguishable from "nothing to check", so all red);
-#   3. pins an EXACT total-occurrence count over a repo-wide sweep, so ADDING AN EIGHTH
+#   3. pins an EXACT total-occurrence count over a tracked-file sweep, so ADDING AN EIGHTH
 #      encoding reds until the table and the counts are deliberately updated. Growth must be
 #      a decision, not an accident.
 #
@@ -112,16 +112,26 @@ readonly EXPECTED_SITE_COUNT=7
 readonly EXPECTED_TOTAL_OCCURRENCES=10
 
 # EXCLUSIONS ARE NARROWED TO THE AUDIT TRAIL, not to docs/ wholesale (@dry-reviewer).
-# `docs/devloop-outputs/**` and `docs/user-stories/**` are dated records that quote the pattern
-# as it stood on a given day; rewriting them when the rule changes would destroy the audit trail
-# the repo keeps on purpose, so they are out. Everything else under docs/ IS scanned — notably
-# `docs/DATABASE_SCHEMA.md`, which opens "This document defines the data models for PostgreSQL"
-# and is therefore a live spec mirror, not a historical record. Excluding all of docs/ was the
-# earlier and lazier cut, and it left the one doc where drift actually matters unenforced.
+# The sweep runs over GIT-TRACKED files only (see step (3) below), so build artifacts,
+# node_modules, target/ and dist/ need NO denylist — they are gitignored, never tracked, and
+# excluded by construction. The only exclusions that remain are TRACKED content that quotes
+# the pattern without being an enforced encoding:
+#   - `docs/devloop-outputs/**` and `docs/user-stories/**` are dated records that quote the
+#     pattern as it stood on a given day; rewriting them when the rule changes would destroy
+#     the audit trail the repo keeps on purpose, so they are out. They ARE tracked and DO carry
+#     the literal (verified: excluding them is exactly what keeps the pinned total at 10).
+#   - this guard's own file, whose `readonly CANONICAL=` line would otherwise self-count.
+# Everything else tracked IS scanned — notably `docs/DATABASE_SCHEMA.md`, which opens "This
+# document defines the data models for PostgreSQL" and is therefore a live spec mirror, not a
+# historical record; it is enumerated above. Excluding all of docs/ was the earlier and lazier
+# cut, and it left the one doc where drift actually matters unenforced.
+#
+# These are git PATHSPECS (`:(exclude)…`), passed after `--` to `git grep`; they are NOT grep
+# `--exclude`/`--exclude-dir` flags. Directory forms end in `/` so they match everything under.
 readonly SWEEP_EXCLUDES=(
-  --exclude-dir=.git --exclude-dir=node_modules --exclude-dir=target
-  --exclude-dir=dist --exclude-dir=devloop-outputs --exclude-dir=user-stories
-  --exclude=validate-subdomain-regex-sync.sh
+  ':(exclude)docs/devloop-outputs/'
+  ':(exclude)docs/user-stories/'
+  ':(exclude)scripts/guards/simple/validate-subdomain-regex-sync.sh'
 )
 
 violations=0
@@ -165,40 +175,82 @@ if [[ "$found_sites" -ne "$EXPECTED_SITE_COUNT" ]]; then
   violation "only ${found_sites} of ${EXPECTED_SITE_COUNT} enumerated sites matched — a partial comparison is NOT evidence of sync"
 fi
 
-# --- (3) Repo-wide sweep: no unenumerated encoding, and no drifted one -------------------
+# --- (3) Tracked-file sweep: no unenumerated encoding, and no drifted one -----------------
 # The table alone cannot see a SEVENTH copy someone adds elsewhere. This sweep can, and it
 # reds until the count and the table are updated together.
-# OPTION ORDER IS LOAD-BEARING, and the reason is the `--` END-OF-OPTIONS TERMINATOR, not any
-# grep dialect. After `--`, EVERY remaining argument is an operand by definition — so
-# `grep -rn -F -- "$PAT" "$ROOT" --exclude-dir=docs` parses the exclusion as a PATH TO SEARCH.
-# GNU grep 3.8 (what actually runs here) and ugrep both behave this way; both also permute
-# options fine when there is no `--`. Measured on a synthetic tree:
-#     grep -rn -F     NEEDLE /tmp/pt --exclude-dir=docs   -> exclusion honored,  rc 0
-#     grep -rn -F --  NEEDLE /tmp/pt --exclude-dir=docs   -> exclusion IGNORED,  rc 2
-#     grep -rn --exclude-dir=docs -F -- NEEDLE /tmp/pt    -> exclusion honored,  rc 0
-# The rule: put every flag BEFORE the `--`, and reserve `--` for when the pattern may begin
-# with `-` (it can here — the canonical pattern starts with `^`, but a future one might not).
-# An earlier revision of this comment blamed ugrep for "not permuting"; that was measured in a
-# Claude Code agent shell where `grep` is a shell FUNCTION shimming ugrep, and is false for the
-# `/usr/bin/grep` every script, layer and CI job actually gets. Corrected in place because this
-# is the site a future scanner author copies from.
-mapfile -t sweep_hits < <(
-  grep -rn --binary-files=without-match "${SWEEP_EXCLUDES[@]}" -F -- "$CANONICAL" "$REPO_ROOT" \
-    2>/dev/null || true
-)
-total="${#sweep_hits[@]}"
+#
+# THE SWEEP IS GIT-TRACKED-ONLY, by construction. `git grep` searches the working-tree content
+# of the files git tracks and NOTHING else — so a gitignored build artifact can never be
+# counted: `packages/sdk-core/coverage/**/limits.ts.html`, `.nx/cache/**` copies of limits.ts,
+# and every future generated reflection of a source site are all untracked and simply absent
+# from the scan. This closes BOTH failure modes of the `grep -rn` filesystem walk with a
+# `--exclude-dir` denylist that this guard shipped with:
+#   - the false POSITIVE — a run after `pnpm/nx test` generated coverage/.nx copies of the
+#     sdk-core SUBDOMAIN_REGEX reds the guard on phantom hits (observed 10 -> 13 under
+#     /usr/bin/grep, which walks the filesystem regardless of .gitignore); and, because the
+#     total is pinned by EXACT EQUALITY,
+#   - the false NEGATIVE a denylist structurally CANNOT close — an untracked artifact adding
+#     +1 masks a deleted tracked pin (-1), nets back to 10, and passes SILENTLY, losing a real
+#     encoding. A denylist is whack-a-mole on the first and blind to the second; tracked-only
+#     is immune to both, and to build-state nondeterminism besides.
+# It NARROWS coverage on purpose, and the trade is right for a merge gate: a new copy is seen
+# once it is STAGED/committed; an UNSTAGED working-tree addition is out of scope by construction
+# (nothing unstaged reaches main, and CI scans committed content). MODIFICATIONS to an
+# already-tracked file are still caught from the working tree with no re-staging — `git grep`
+# reads working-tree content for tracked paths — so a loosened literal in a committed site reds
+# immediately, which is the case that actually matters.
+#
+# Flags: `-e "$CANONICAL"` keeps the leading `^` from being read as an option; `-F` is
+# fixed-string; `-I` skips binary files (the old `--binary-files=without-match`). NO `:/`
+# anchor pathspec: `git grep` then scans from REPO_ROOT downward, and the `:(exclude)…` audit-
+# trail pathspecs are resolved relative to that same REPO_ROOT — anchoring the scan and the
+# carve-out at ONE place. (`:/` would anchor the scan at the enclosing repo's top level while
+# the excludes stayed REPO_ROOT-relative, so a REPO_ROOT below the top level would scan wider
+# than it excludes and the carve-out would evaporate — @security S1.) This matches the old
+# `grep -rn … "$REPO_ROOT"` scoping exactly. `git grep` prints REPO_ROOT-relative paths, so no
+# prefix stripping is needed. It counts matching LINES, one per hit — exactly as the old
+# `grep -rn`/mapfile did, and no enumerated site carries two occurrences on one line, so
+# lines == occurrences here.
+#
+# PRECONDITION (@security S2): REPO_ROOT must be the TOP LEVEL of a git work tree. `git -C`
+# resolves UPWARD, so a REPO_ROOT that is a subdirectory of some repo (or not a repo at all)
+# would otherwise scan the wrong tree, or nothing, and surface as a bare "found zero". Enforce
+# it as code, not prose: require the resolved toplevel to BE REPO_ROOT. This splits "git is
+# broken / wrong root" from "git works and the tree genuinely has zero copies" (the vacuity
+# branch), so a failure names its real cause, and it holds S1's single-anchor property by
+# construction rather than by the fixture comments merely talking around it.
+sweep_hits=()
+total=0
+# The `-ef` is load-bearing — do NOT simplify it to `[[ -n "$__sweep_top" ]]` or a string
+# compare. `rev-parse` SUCCEEDING is not the property we need: for a REPO_ROOT that is a
+# SUBDIRECTORY of a repo it succeeds and returns the ENCLOSING repo's toplevel. Requiring the
+# resolved toplevel to BE REPO_ROOT (same device+inode, symlink-safe) is what rejects that
+# subdirectory case — the S1 hazard — and what keeps self-test case 9 sound even if the test's
+# $WORK ever lands inside a repo (rev-parse would then succeed and `-ef` would still red).
+if ! __sweep_top="$(git -C "$REPO_ROOT" rev-parse --show-toplevel 2>/dev/null)" \
+     || [[ ! "$__sweep_top" -ef "$REPO_ROOT" ]]; then
+  violation "REPO_ROOT='${REPO_ROOT}' is not the top level of a git work tree (git absent, not a repo, or a subdirectory of one) — the tracked-file sweep cannot run, so this guard is VACUOUS until the root is corrected; it is not evidence that the sites are in sync"
+else
+  mapfile -t sweep_hits < <(
+    git -C "$REPO_ROOT" grep -I -n -F -e "$CANONICAL" -- "${SWEEP_EXCLUDES[@]}" \
+      2>/dev/null || true
+  )
+  total="${#sweep_hits[@]}"
 
-if [[ "$total" -eq 0 ]]; then
-  # The extractor finding NOTHING is the guard's own vacuous-pass mode: with zero hits every
-  # comparison below is trivially satisfied. Treat it as a hard failure of the guard itself.
-  violation "the repo-wide sweep found ZERO occurrences of the canonical pattern — the guard's own extraction has broken (wrong REPO_ROOT='${REPO_ROOT}', or grep semantics changed). This guard is VACUOUS until repaired; it is not evidence that the sites are in sync"
-elif [[ "$total" -ne "$EXPECTED_TOTAL_OCCURRENCES" ]]; then
-  violation "found ${total} occurrences of the org-subdomain pattern in scanned source, expected exactly ${EXPECTED_TOTAL_OCCURRENCES}"
-  printf '  every occurrence found:\n'
-  printf '    %s\n' "${sweep_hits[@]#"${REPO_ROOT}/"}"
-  printf '  If you ADDED an encoding: add it to SITES (with its delimiters) and bump BOTH\n'
-  printf '  counts. If you REMOVED one: drop the row and lower the counts. Either way the\n'
-  printf '  edit is deliberate — that is the point of pinning a literal number.\n'
+  if [[ "$total" -eq 0 ]]; then
+    # The extractor finding NOTHING is the guard's own vacuous-pass mode: with zero hits every
+    # comparison below is trivially satisfied. REPO_ROOT is a valid git tree (the precondition
+    # passed), so the pattern is genuinely absent from tracked source — a broken extraction, not
+    # evidence of sync. Treat it as a hard failure of the guard itself.
+    violation "the tracked-file sweep found ZERO occurrences of the canonical pattern — the guard's own extraction has broken (REPO_ROOT='${REPO_ROOT}' is a git work tree, but the pattern is absent from every tracked file). This guard is VACUOUS until repaired; it is not evidence that the sites are in sync"
+  elif [[ "$total" -ne "$EXPECTED_TOTAL_OCCURRENCES" ]]; then
+    violation "found ${total} occurrences of the org-subdomain pattern in scanned source, expected exactly ${EXPECTED_TOTAL_OCCURRENCES}"
+    printf '  every occurrence found:\n'
+    printf '    %s\n' "${sweep_hits[@]}"
+    printf '  If you ADDED an encoding: add it to SITES (with its delimiters) and bump BOTH\n'
+    printf '  counts. If you REMOVED one: drop the row and lower the counts. Either way the\n'
+    printf '  edit is deliberate — that is the point of pinning a literal number.\n'
+  fi
 fi
 
 printf '\n'

@@ -40,9 +40,11 @@ trap 'rm -rf "$WORK"' EXIT
 
 CANON='^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$'
 
-# Build a synthetic tree carrying exactly the ground truth the guard pins: the six enumerated
-# sites in their real delimiter forms, plus the three test occurrences, for a total of ten.
-# Each case then mutates ONE thing, so a failure names one cause.
+# Build a synthetic tree carrying exactly the ground truth the guard pins: the seven enumerated
+# sites in their real delimiter forms, plus the three test occurrences, for a total of ten. The
+# tree is `git init`ed and staged at the end (the guard's sweep is `git grep`, tracked-only).
+# Each case then mutates ONE thing, so a failure names one cause; a case that adds a NEW file
+# re-stages it.
 mk_tree() {  # $1 = root
   local r="$1"
   mkdir -p "$r/migrations" "$r/infra/docker/postgres" "$r/infra/kind/scripts" \
@@ -76,6 +78,21 @@ mk_tree() {  # $1 = root
   mkdir -p "$r/docs"
   printf "    CONSTRAINT subdomain_format CHECK (subdomain ~ '%s')\n" "$CANON" \
     > "$r/docs/DATABASE_SCHEMA.md"
+  # The guard's step-(3) sweep is `git grep` — tracked files only, by construction (this is
+  # the whole point of the tracked-only rewrite: a filesystem walk counted gitignored build
+  # artifacts). So the synthetic fixture must be a git work tree with its content STAGED, or
+  # `git grep` sees nothing and every case reds on the vacuity branch. No commit is needed —
+  # `git grep` (no --cached) searches the working-tree content of tracked (indexed) files — and
+  # no identity is needed, since `git add` requires none. Cases that add a NEW file after this
+  # point must re-stage it (see case 4); modifications to already-tracked files are picked up
+  # from the working tree with no re-add.
+  #
+  # `-Af` — FORCE past any global core.excludesFile (@security S4). Without it, a developer
+  # whose global gitignore matches a fixture path (e.g. `*.md`, so DATABASE_SCHEMA.md) would
+  # leave that file unstaged, dropping the pinned total below 10 and reding every case for a
+  # reason unrelated to what it tests. Force-add makes the fixture hermetic against the host.
+  git init -q "$r"
+  git -C "$r" add -Af
 }
 
 # Run the guard against a tree. Sets global G_OUT / G_RC.
@@ -129,6 +146,10 @@ assert_status "missing-partial-comparison" "of 7 enumerated sites matched" "$G_O
 T="$(new_tree)"
 mkdir -p "$T/crates/gc-service/src"
 printf 'const SUB: &str = r"%s";\n' "$CANON" > "$T/crates/gc-service/src/validate.rs"
+# The sweep is `git grep`, which sees TRACKED files only — an unstaged new encoding would be
+# invisible and this case would pass for the wrong reason. Force-stage it (past any host global
+# gitignore, per mk_tree's -Af note), exactly as a real eighth copy committed into the tree.
+git -C "$T" add -Af
 run_guard "$T"
 assert_rc     "seventh-exit1" 1 "$G_RC"
 assert_status "seventh-count" "found 11 occurrences of the org-subdomain pattern in scanned source, expected exactly 10" "$G_OUT"
@@ -147,7 +168,12 @@ assert_status "removed-count" "found 9 occurrences of the org-subdomain pattern 
 # An empty tree yields zero hits, at which point every comparison in the guard is trivially
 # satisfied. That is the guard's own vacuous-pass mode and it must be a hard failure with a
 # message saying so — "no violations found" and "I could not look" are different answers.
+# It is a git work tree with NOTHING staged: `git grep` over an empty index returns zero hits
+# cleanly, exercising the "found zero, extraction is broken" branch rather than the "not a git
+# repo" one — and a fresh init also shadows any repo the temp dir might sit inside, so the case
+# does not depend on $WORK being outside version control.
 T="$(mktemp -d "${WORK}/empty.XXXXXX")"
+git init -q "$T"
 run_guard "$T"
 assert_rc     "vacuous-exit1"    1 "$G_RC"
 assert_status "vacuous-named"    "the guard's own extraction has broken" "$G_OUT"
@@ -188,5 +214,24 @@ empty="$(mktemp -d "${WORK}/inert.XXXXXX")"
 inert_out="$(env -u DEVLOOP_TEST SUBDOMAIN_GUARD_ROOT="$empty" bash "$GUARD" 2>&1)"; inert_rc=$?
 assert_rc     "seam-inert-exit0"  0 "$inert_rc"
 assert_status "seam-inert-scanned-real-repo" "7 enumerated site(s) in sync" "$inert_out"
+
+# === (9) REPO_ROOT IS NOT A GIT TOP LEVEL → FAIL, naming THAT (not "found zero") =============
+# The sweep is `git grep`, and `git -C` resolves UPWARD, so a REPO_ROOT that is not itself a
+# git top level would scan the wrong tree (a subdirectory of an enclosing repo) or nothing at
+# all — surfacing as a bare "found zero" that names the wrong cause. The guard's precondition
+# (@security S2) must catch this. Proven FAIL-CLOSED: the fixture carries all ten real
+# occurrences ON DISK, then has its `.git` stripped — so a filesystem walk (the old grep -rn)
+# WOULD have found and counted them, but the tracked-only guard must red because git cannot see
+# them, and must say so ("not the top level of a git work tree"), NOT falsely report zero. This
+# is the case that distinguishes "the content is missing" from "I could not look".
+T="$(new_tree)"                 # populated AND git-init'd by mk_tree...
+rm -rf "$T/.git"                # ...then de-repo'd: 10 occurrences on disk, no git to see them
+run_guard "$T"
+assert_rc     "nogit-exit1"        1 "$G_RC"
+assert_status "nogit-named"        "is not the top level of a git work tree" "$G_OUT"
+assert_status "nogit-not-evidence" "it is not evidence that the sites are in sync" "$G_OUT"
+# It must NOT pass, and must NOT masquerade as a genuine in-sync result despite the files being
+# physically present — the whole point of naming the precondition instead of "found zero".
+assert_absent "nogit-not-ok"       "STATUS=OK" "$G_OUT"
 
 report_results "scripts/guards/validate-subdomain-regex-sync.test.sh"
