@@ -58,6 +58,15 @@ path = "src/main.rs"
 
 [dev-dependencies]
 criterion = { workspace = true }
+# Deterministic transport double for the ADR-0036 §10 seam (loss / delay /
+# backpressure). A dev-dependency edge ONLY. While the edge stays here, the
+# compiler forbids production code in mh-service from importing
+# mh_test_utils at all, so substituting the shim requires a visible manifest
+# move out of [dev-dependencies] plus a production `use` — two source edits,
+# not a build-flag flip. Strictly stronger than a cargo feature, where
+# --all-features needs no source edit. It is not impossible; see the crate
+# doc in ../mh-test-utils/src/lib.rs for the control at its true strength.
+mh-test-utils = { path = "../mh-test-utils" }
 # HTTP testing for health endpoint integration tests — tower is now a regular dep
 # Stream utilities for mock gRPC server
 tokio-stream = "0.1"

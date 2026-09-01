@@ -307,9 +307,10 @@ tasks:
   slug: 2026-09-01-internal-contract-reshape
   tag: story-2026-08-27-hear-yourself-through-handler-task-4
 - id: 5
-  status: pending
+  status: completed
   specialist: test
   prompt: 'Introduce a transport trait in mh-service that abstracts per-connection hot-path I/O — send datagram, receive datagram, open/finish unidirectional stream, write to stream — mirroring the client SDK''s IWebTransport interface shape in `packages/sdk-core/src/transport/types.ts`. The QUIC endpoint and the accept loop stay concrete types; only per-connection I/O goes behind the trait. Provide a deterministic test-double implementation of the trait — a loss/delay/backpressure shim — that injects configurable datagram loss, added delay implemented as `tokio::time::sleep` released by `tokio::time::advance` under a `start_paused` test runtime — the workspace''s existing deterministic-time mechanism (see mc-service actors/meeting.rs and mh-service webtransport/connection.rs); do NOT introduce a Clock trait (none exists in the workspace) and the shim takes no clock argument, and two explicit drop-mode knobs that map to two distinct MH counters: `set_datagram_loss` (in-flight loss — datagram accepted but not delivered, for hop-sequence gap detection) and `set_send_capacity(n)` (accept n datagrams then return `WouldBlock(Bytes)` handing the payload back, to trip the bounded egress queue so the egress-overflow counter fires). Payloads are `Bytes` so the refcount gate can assert zero-copy; generics, not dyn. It must drive the forward path with zero syscalls. Add a reachability test proving each drop path (datagram-send-drop, backpressure drop-oldest) is deterministically reachable through the shim, so later metric-coverage tests can trip them on demand. Do not implement the ingress/egress loops themselves — this task delivers the seam and the shim they will be built against. No fenced code in any doc you touch. This is the §10 transport seam of ADR-0036 and its Consequences ordering constraint ("the transport seam precedes the ingress and egress loops — cheap against nothing, expensive against concrete types"). Pair with media-handler, who consumes the trait.'
+  slug: 2026-09-01-mh-transport-seam
   tag: story-2026-08-27-hear-yourself-through-handler-task-5
 - id: 6
   status: pending

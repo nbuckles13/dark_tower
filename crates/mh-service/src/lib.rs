@@ -13,8 +13,13 @@
 //! Registers with GC, and `RegisterMeeting` — the single MC→MH RPC, and the
 //! ADR-0036 §8 control plane — records the meeting and promotes pending
 //! WebTransport connections. It does **not** yet apply forwarding policy, so it
-//! reports `applied_generation: 0` ("nothing applied"); that is story task 5.
+//! reports `applied_generation: 0` ("nothing applied"); that is story task 11.
 //! No media forwarding is performed yet.
+//!
+//! The ADR-0036 §10 per-connection transport seam ([`transport`]) has landed
+//! and is deliberately unconsumed: no production type implements it yet. The
+//! real wtransport implementation and the forward path that runs against it are
+//! story tasks 12 and 16 respectively.
 //!
 //! # Architecture (ADR-0010, ADR-0023)
 //!
@@ -32,4 +37,5 @@ pub mod errors;
 pub mod grpc;
 pub mod observability;
 pub mod session;
+pub mod transport;
 pub mod webtransport;

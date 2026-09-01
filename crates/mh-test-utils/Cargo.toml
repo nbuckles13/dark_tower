@@ -1,0 +1,36 @@
+[package]
+name = "mh-test-utils"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Test utilities for the Dark Tower Media Handler"
+
+# Note: mh-test-utils is a test utility library providing test doubles and
+# fixtures. Test assertion methods intentionally use unwrap/expect/panic to
+# fail tests. Unlike production crates, this crate does NOT inherit workspace
+# lints because test utilities need to use unwrap/expect/panic for assertions.
+#
+# `transport_shim.rs` is the exception and carries a FILE-SCOPED deny of those
+# same lints — see the module header for why the shim specifically is held to
+# the production bar while the rest of the crate is not.
+
+[dependencies]
+# Async runtime — the shim's ingress queue (`tokio::sync::mpsc`), close
+# notification (`tokio::sync::Notify`) and deterministic delay
+# (`tokio::time::sleep_until` under a `start_paused` runtime) all come from
+# here. No `test-util` feature is needed on THIS side: pause/advance is a
+# property of the runtime the CONSUMER builds, not of the shim.
+tokio = { workspace = true }
+
+# Zero-copy payload type on the datagram path. The shim moves `Bytes` rather
+# than copying so a caller can assert allocation identity on the `WouldBlock`
+# hand-back.
+bytes = { workspace = true }
+
+# The seam this crate provides a test double for. This is the ONLY edge
+# between the two crates, and `mh-service` reaches back only through
+# `[dev-dependencies]` — see the crate doc in `src/lib.rs` for the exact
+# strength of that control, which is weaker than "impossible".
+mh-service = { path = "../mh-service" }
