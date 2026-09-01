@@ -60,6 +60,9 @@ fn req_with_bearer(token: Option<&str>) -> Request<RegisterMeetingRequest> {
         meeting_id: "meeting-auth-test".to_string(),
         mc_id: "mc-auth-test".to_string(),
         mc_grpc_endpoint: "http://mc-auth-test:50052".to_string(),
+        egress_streams: Vec::new(),
+        selection_rules: None,
+        policy_generation: 0,
     });
     if let Some(t) = token {
         let value: MetadataValue<_> = format!("Bearer {t}")

@@ -84,9 +84,41 @@ assert_not_generated() {
 }
 
 assert_generated "dark_tower/signaling/v1/signaling_pb.ts" "JoinRequest"
-assert_generated "dark_tower/internal/v1/internal_pb.ts" "RegisterRequest"
 assert_generated "dark_tower/internal/v1/internal_pb.ts" "FastHeartbeatResponse"
 assert_generated "dark_tower/internal/v1/internal_pb.ts" "ComprehensiveHeartbeatResponse"
+
+# ADR-0036 internal contract (2026-09-01 reshape) — the MC→MH control-plane
+# shapes must exist. `RegisterRequest` was previously asserted here; it is one of
+# the eight symbols the reshape deletes and is asserted ABSENT below.
+for symbol in \
+  RegisterMeetingRequest \
+  RegisterMeetingResponse \
+  EgressStream \
+  SubscriberSlot \
+  CandidateSource \
+  SelectionRules; do
+  assert_generated "dark_tower/internal/v1/internal_pb.ts" "${symbol}"
+done
+
+# ADR-0036 internal contract — the retired shapes must be GONE.
+#
+# All eight, not a sample. A presence-only oracle stays green through a
+# half-done deletion or a rename-back, which is the same reasoning that added
+# the signalling absence block below. Note `RegisterResponse` is asserted absent
+# from `internal_pb.ts` ONLY: `packages/sdk-core/src/http/types.ts` defines an
+# unrelated hand-written AC HTTP type of the same name, which is why this
+# assertion is file-scoped and why the deletion audit had to check both.
+for symbol in \
+  RegisterRequest \
+  RegisterResponse \
+  RoutingOptions \
+  CascadeDestination \
+  RouteMediaRequest \
+  RouteMediaResponse \
+  StreamTelemetryRequest \
+  StreamTelemetryResponse; do
+  assert_not_generated "dark_tower/internal/v1/internal_pb.ts" "${symbol}"
+done
 
 # ADR-0036 signalling contract — the media-path shapes must exist.
 for symbol in \

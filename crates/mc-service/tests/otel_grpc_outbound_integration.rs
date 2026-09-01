@@ -35,9 +35,8 @@ use proto_gen::dark_tower::internal::v1::{
     ComprehensiveHeartbeatRequest, ComprehensiveHeartbeatResponse, FastHeartbeatRequest,
     FastHeartbeatResponse, NotifyMeetingEndedRequest, NotifyMeetingEndedResponse,
     RegisterMcRequest, RegisterMcResponse, RegisterMeetingRequest, RegisterMeetingResponse,
-    RegisterRequest, RegisterResponse, RouteMediaRequest, RouteMediaResponse,
-    StreamTelemetryRequest, StreamTelemetryResponse,
 };
+use proto_gen::dark_tower::signaling::v1::TransportMode;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::Server;
@@ -109,29 +108,24 @@ struct MockMh;
 
 #[tonic::async_trait]
 impl MediaHandlerService for MockMh {
-    async fn register(
-        &self,
-        _request: Request<RegisterRequest>,
-    ) -> Result<Response<RegisterResponse>, Status> {
-        Err(Status::unimplemented("not used"))
-    }
     async fn register_meeting(
         &self,
         _request: Request<RegisterMeetingRequest>,
     ) -> Result<Response<RegisterMeetingResponse>, Status> {
-        Ok(Response::new(RegisterMeetingResponse { accepted: true }))
-    }
-    async fn route_media(
-        &self,
-        _request: Request<RouteMediaRequest>,
-    ) -> Result<Response<RouteMediaResponse>, Status> {
-        Err(Status::unimplemented("not used"))
-    }
-    async fn stream_telemetry(
-        &self,
-        _request: Request<tonic::Streaming<StreamTelemetryRequest>>,
-    ) -> Result<Response<StreamTelemetryResponse>, Status> {
-        Err(Status::unimplemented("not used"))
+        Ok(Response::new(RegisterMeetingResponse {
+            accepted: true,
+            // Truthful zeros, deliberately NOT `applied_generation:
+            // req.policy_generation`. That would be inert today (the client
+            // reads only `accepted`) and that is exactly the danger: a
+            // fixture pre-baking the echo-a-received-value lie hands story
+            // task 6 a green success-test validating the precise ADR-0036 §8
+            // anti-pattern its check must catch. Task 6 must make this mock
+            // echo the sent generation DELIBERATELY, when it adds the check.
+            applied_generation: 0,
+            handler_id: String::new(),
+            process_start_epoch_ms: 0,
+            transport_mode: TransportMode::Unspecified as i32,
+        }))
     }
 }
 

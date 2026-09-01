@@ -252,6 +252,9 @@ async fn test_inbound_register_meeting_reparents_handler_span_to_injected_trace(
         meeting_id: "otel-inbound-meeting".to_string(),
         mc_id: "otel-inbound-mc".to_string(),
         mc_grpc_endpoint: "http://mc:50052".to_string(),
+        egress_streams: Vec::new(),
+        selection_rules: None,
+        policy_generation: 0,
     });
     let auth_value: MetadataValue<_> = format!("Bearer {token}")
         .parse()
@@ -317,6 +320,9 @@ async fn test_inbound_register_meeting_no_traceparent_gets_fresh_trace_id() {
         meeting_id: "otel-inbound-meeting-noop".to_string(),
         mc_id: "otel-inbound-mc-noop".to_string(),
         mc_grpc_endpoint: "http://mc:50052".to_string(),
+        egress_streams: Vec::new(),
+        selection_rules: None,
+        policy_generation: 0,
     });
     let auth_value: MetadataValue<_> = format!("Bearer {token}")
         .parse()

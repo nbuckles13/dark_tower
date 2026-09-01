@@ -103,21 +103,54 @@ Scopes are registered per service in AC's `ServiceType::default_scopes()` (`crat
 }
 ```
 
-**Connection Tokens** (issued by Meeting Controller for Media Handler access):
-```json
-{
-  "sub": "participant_id",
-  "meeting_id": "meeting_id",
-  "user_id": "0x123456",  // 8-byte user ID
-  "media_handler_id": "mh-abc123",  // Restrict to specific MH
-  "client_fingerprint": "sha256...",  // Bind to specific client
-  "scopes": ["media.publish", "media.subscribe"],
-  "iss": "mc-instance-xyz",
-  "iat": 1234567890,
-  "exp": null,  // Valid until meeting ends
-  "aud": "dark-tower-mh"
-}
-```
+**Connection Tokens** — **SUPERSEDED 2026-09-01. NOT IMPLEMENTED, AND NOT TO BE
+IMPLEMENTED.** Clients authenticate to the Media Handler with the **meeting JWT**
+(ADR-0020), validated by `MhJwtValidator::validate_meeting_token`. There is no
+second, MH-scoped client credential.
+
+The superseded specification is retained below rather than deleted, because a
+reader who trusted it would have *built* the credential — and this ADR is the
+decision of record that three narrative documents derive from, so a silent edit
+would leave anyone who had already read it with no signal:
+
+> ~~Connection Tokens (issued by Meeting Controller for Media Handler access):~~
+> ```json
+> {
+>   "sub": "participant_id",
+>   "meeting_id": "meeting_id",
+>   "user_id": "0x123456",              // 8-byte user ID
+>   "media_handler_id": "mh-abc123",    // Restrict to specific MH
+>   "client_fingerprint": "sha256...",  // Bind to specific client
+>   "scopes": ["media.publish", "media.subscribe"],
+>   "iss": "mc-instance-xyz",
+>   "iat": 1234567890,
+>   "exp": null,                        // Valid until meeting ends
+>   "aud": "dark-tower-mh"
+> }
+> ```
+
+**Why it is gone.** It was never issued: the only producer was a Media Handler
+stub returning the literal string `"STUB-PLACEHOLDER"`, with no issuer, no
+validator, no signing key and no `media.publish` / `media.subscribe` scope
+anywhere in the tree. Its client-facing carrier was removed from
+`signaling.proto`'s `MediaServerInfo` on 2026-04-13 (`reserved 2; reserved
+"connection_token";`), and its server-side half —
+`internal.proto`'s `RegisterResponse.connection_token` — was deleted with the
+ADR-0036 Appendix internal-contract reshape on 2026-09-01. The direction of
+travel is deliberately toward **one** client authentication path, not two.
+
+> **Amendment note (2026-09-01, ADR-0036 internal-contract reshape).** Three
+> edits above are *amendments*, not re-decisions: Component 3's Connection Tokens
+> are marked superseded; Component 5's example flow and the Component 6 diagram
+> now name `RegisterMeeting` instead of the retired `RouteMedia` RPC, because
+> `MediaHandlerService` has exactly one RPC after the reshape and an example
+> citing a deleted method is unfollowable; and the Consequences entry for
+> connection-token binding is struck. **Nothing about the service→service
+> authentication decision changes** — the mTLS + JWT pair, the
+> `service.write.mh` scope, the JWKS validation and the two-layer architecture
+> are all untouched, and the Media Handler's authorization gate is a
+> service-level gRPC path prefix (`auth_interceptor.rs`), not a per-method
+> allowlist, so retiring three methods does not move it.
 
 ### Component 4: Federation
 
@@ -182,7 +215,7 @@ let jwks_client = reqwest::Client::builder()
 
 **Flow**:
 ```
-Meeting Controller → Media Handler (RouteMedia):
+Meeting Controller → Media Handler (RegisterMeeting):
 1. mTLS handshake (both verify each other's certs)
 2. MC sends gRPC request with service token in metadata:
    metadata["authorization"] = "Bearer <JWT>"
@@ -312,7 +345,11 @@ Week 4: Keys [keyC, keyD]    - sign with keyD, validate both
 - ✅ **Defense in depth**: mTLS + JWT
 - ✅ **Granular permissions**: Scope-based authorization
 - ✅ **Key rotation**: Weekly rotation limits exposure
-- ✅ **Connection token binding**: Prevents token theft
+- ~~✅ **Connection token binding**: Prevents token theft~~ — **superseded
+  2026-09-01**, see Component 3. The connection token was never issued, so this
+  positive consequence was never realised. Client→MH authentication rests on the
+  meeting JWT (ADR-0020); service→service rests on the mTLS + JWT pair above,
+  which is unaffected.
 
 ### Negative
 
@@ -423,7 +460,7 @@ Week 4: Keys [keyC, keyD]    - sign with keyD, validate both
 │Meeting Controller│         │Media Handler │
 └────────┬─────────┘         └──────┬───────┘
          │                          │
-         │ gRPC: RouteMedia         │
+         │ gRPC: RegisterMeeting    │
          │ mTLS + JWT in metadata   │
          │─────────────────────────>│
          │                          │

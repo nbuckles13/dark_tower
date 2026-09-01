@@ -1673,7 +1673,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "Inbound gRPC request volume from MC by method (register / route_media / stream_telemetry) and status. MC->MH RPC health.",
+      "description": "Inbound gRPC request volume from MC by method and status. MC->MH RPC health. The `method` label is single-valued by design: `register_meeting` is the only RPC on MediaHandlerService, because ADR-0036 \u00a78 makes meeting registration the control plane and it gains fields rather than sibling RPCs. The `register`, `route_media` and `stream_telemetry` values this description previously listed were retired with the 2026-09-01 internal.proto reshape and can never appear.",
       "fieldConfig": {
         "defaults": {
           "color": {

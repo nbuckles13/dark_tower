@@ -221,8 +221,9 @@ If no heartbeat received for 30 seconds, the participant is marked as disconnect
 │ Client │                                    │Media Handler │
 └───┬────┘                                    └──────┬───────┘
     │                                                │
-    │ 1. Receive media_handler_url &                │
-    │    connection_token from Meeting Controller   │
+    │ 1. Receive media_handler_url from the         │
+    │    Meeting Controller; authenticate below     │
+    │    with the meeting JWT (ADR-0020)            │
     │                                                │
     │ 2. WebTransport Connect                       │
     │    URL: https://mh.region.dark.com:4434       │

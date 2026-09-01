@@ -123,10 +123,29 @@ impl MhClient {
             common::observability::otel_grpc::client_interceptor(),
         );
 
+        // TODO(story task 6, meeting-controller): compute the meeting's
+        // forwarding assignment and push it here, with `policy_generation`
+        // derived from the assignment computation's OUTPUT CHANGE (ADR-0036 §8)
+        // — never free-running, and never sourced from MC's Redis fencing
+        // counter (`get_generation()` / `increment_generation()`), which advances
+        // on writes that do not change forwarding output. Then compare the
+        // response's `applied_generation` against what was sent and fail loud on
+        // mismatch, feeding the divergence gauge from the APPLIED value.
+        //
+        // TODO(story task 5/6 ordering): `policy_generation` 0 is documented
+        // invalid on the wire, and MH MUST NOT enforce that rejection until this
+        // call sends >= 1. Task 5 (MH) implements the reject; task 6 (MC)
+        // supplies the precondition. Enforced in the other order, every
+        // registration is rejected for the whole window — ADR-0036 §8's
+        // permanent-media-blackhole failure, through the field added to prevent
+        // it. See `RegisterMeetingRequest.policy_generation` in internal.proto.
         let request = RegisterMeetingRequest {
             meeting_id: meeting_id.to_string(),
             mc_id: mc_id.to_string(),
             mc_grpc_endpoint: mc_grpc_endpoint.to_string(),
+            egress_streams: Vec::new(),
+            selection_rules: None,
+            policy_generation: 0,
         };
 
         let grpc_request = self.add_auth(request)?;

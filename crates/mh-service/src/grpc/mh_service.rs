@@ -1,8 +1,16 @@
 //! `MediaHandlerService` gRPC server implementation.
 //!
 //! Implements the MC→MH gRPC service from `internal.proto`.
-//! `register_meeting` is fully integrated with `SessionManagerHandle`;
-//! other handlers remain stubs to unblock end-to-end join flow testing.
+//!
+//! **One RPC by design** (ADR-0036 §8): `RegisterMeeting` *is* the MC→MH control
+//! plane and gains fields rather than sibling RPCs. The `Register`, `RouteMedia`
+//! and `StreamTelemetry` stubs were retired with the 2026-09-01 `internal.proto`
+//! reshape; see the tombstone block in that file.
+//!
+//! `register_meeting` is integrated with `SessionManagerHandle` for registration
+//! and pending-connection promotion. It does **not** yet apply forwarding policy
+//! — that is story task 5, and until it lands this handler reports
+//! `applied_generation: 0` ("nothing applied"), which is the truth.
 //!
 //! # Security
 //!
@@ -14,18 +22,10 @@ use std::time::Instant;
 use crate::observability::metrics;
 use crate::session::{MeetingRegistration, SessionManagerHandle};
 use proto_gen::dark_tower::internal::v1::media_handler_service_server::MediaHandlerService;
-use proto_gen::dark_tower::internal::v1::{
-    RegisterMeetingRequest, RegisterMeetingResponse, RegisterRequest, RegisterResponse,
-    RouteMediaRequest, RouteMediaResponse, StreamTelemetryRequest, StreamTelemetryResponse,
-};
-use tonic::{Request, Response, Status, Streaming};
+use proto_gen::dark_tower::internal::v1::{RegisterMeetingRequest, RegisterMeetingResponse};
+use proto_gen::dark_tower::signaling::v1::TransportMode;
+use tonic::{Request, Response, Status};
 use tracing::instrument;
-
-/// Returns a stub placeholder value for fields that would contain real data
-/// in a production implementation.
-fn stub_placeholder() -> String {
-    String::from("STUB-PLACEHOLDER")
-}
 
 /// Maximum allowed length for `meeting_id` and `mc_id` fields.
 /// Prevents `HashMap` key bloat from malicious or buggy callers.
@@ -37,8 +37,8 @@ const MAX_ENDPOINT_LENGTH: usize = 2048;
 
 /// Media Handler gRPC service.
 ///
-/// Handles MC→MH RPCs. `register_meeting` is fully integrated with
-/// `SessionManagerHandle`; other handlers remain stubs.
+/// Handles the single MC→MH RPC, `register_meeting`, which is integrated with
+/// `SessionManagerHandle` for registration and pending-connection promotion.
 pub struct MhMediaService {
     session_manager: SessionManagerHandle,
 }
@@ -59,41 +59,6 @@ impl Default for MhMediaService {
 
 #[tonic::async_trait]
 impl MediaHandlerService for MhMediaService {
-    /// Register a participant with the media handler (stub).
-    ///
-    /// Returns a stub connection token and media handler URL.
-    #[instrument(skip_all)]
-    async fn register(
-        &self,
-        request: Request<RegisterRequest>,
-    ) -> Result<Response<RegisterResponse>, Status> {
-        let req = request.into_inner();
-
-        // Basic validation
-        if req.participant_id.is_empty() {
-            metrics::record_grpc_request("register", "error");
-            return Err(Status::invalid_argument("participant_id is required"));
-        }
-        if req.meeting_id.is_empty() {
-            metrics::record_grpc_request("register", "error");
-            return Err(Status::invalid_argument("meeting_id is required"));
-        }
-
-        tracing::info!(
-            target: "mh.grpc.service",
-            stream_count = req.streams.len(),
-            "Participant registered (stub)"
-        );
-
-        metrics::record_grpc_request("register", "success");
-
-        let stub_response = RegisterResponse {
-            connection_token: stub_placeholder(),
-            media_handler_url: "stub://localhost".to_string(),
-        };
-        Ok(Response::new(stub_response))
-    }
-
     /// Register a meeting with the media handler.
     ///
     /// Called by MC when a participant is assigned to this MH instance.
@@ -182,92 +147,28 @@ impl MediaHandlerService for MhMediaService {
 
         metrics::record_grpc_request("register_meeting", "success");
 
-        Ok(Response::new(RegisterMeetingResponse { accepted: true }))
-    }
-
-    /// Route media between participants (stub).
-    ///
-    /// Returns success without performing any routing.
-    #[instrument(skip_all)]
-    async fn route_media(
-        &self,
-        request: Request<RouteMediaRequest>,
-    ) -> Result<Response<RouteMediaResponse>, Status> {
-        let req = request.into_inner();
-
-        tracing::info!(
-            target: "mh.grpc.service",
-            destination_count = req.destination_participant_ids.len(),
-            cascade_count = req.cascade_destinations.len(),
-            "RouteMedia received (stub)"
-        );
-
-        metrics::record_grpc_request("route_media", "success");
-
-        Ok(Response::new(RouteMediaResponse {
-            success: true,
-            error_message: String::new(),
+        // ADR-0036 §8: the response reports what MH's LIVE FORWARD PATH
+        // reflects, never what it received.
+        //
+        // TODO(story task 5, media-handler): apply the request's forwarding
+        // policy through a config-apply mailbox and report the generation the
+        // session actor has actually installed, plus this handler's identity and
+        // process-start epoch.
+        //
+        // Until then these values are TRUTHFUL, not placeholders: this handler
+        // applies no policy, so its forward path reflects generation 0; it holds
+        // no handler id to report; it records no process-start instant; and it
+        // has applied no transport mode. `applied_generation: req.policy_generation`
+        // is deliberately NOT written even transitionally — that single line IS
+        // the §8 bug, and a transitional lie here is exactly the kind that
+        // survives into task 5 unnoticed.
+        Ok(Response::new(RegisterMeetingResponse {
+            accepted: true,
+            applied_generation: 0,
+            handler_id: String::new(),
+            process_start_epoch_ms: 0,
+            transport_mode: TransportMode::Unspecified as i32,
         }))
-    }
-
-    /// Receive telemetry stream from MC (stub).
-    ///
-    /// Acknowledges the stream without processing telemetry data.
-    #[instrument(skip_all)]
-    async fn stream_telemetry(
-        &self,
-        request: Request<Streaming<StreamTelemetryRequest>>,
-    ) -> Result<Response<StreamTelemetryResponse>, Status> {
-        let mut stream = request.into_inner();
-
-        // Consume the stream (log first message, drain rest)
-        let mut count: u64 = 0;
-        while let Some(result) = stream_next(&mut stream).await {
-            match result {
-                Ok(_telemetry) => {
-                    if count == 0 {
-                        tracing::info!(
-                            target: "mh.grpc.service",
-                            "StreamTelemetry started (stub)"
-                        );
-                    }
-                    count = count.saturating_add(1);
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        target: "mh.grpc.service",
-                        error = %e,
-                        messages_received = count,
-                        "StreamTelemetry error"
-                    );
-                    metrics::record_grpc_request("stream_telemetry", "error");
-                    return Err(e);
-                }
-            }
-        }
-
-        tracing::info!(
-            target: "mh.grpc.service",
-            messages_received = count,
-            "StreamTelemetry completed (stub)"
-        );
-
-        metrics::record_grpc_request("stream_telemetry", "success");
-
-        Ok(Response::new(StreamTelemetryResponse { received: true }))
-    }
-}
-
-/// Helper to get next item from a streaming request.
-///
-/// Wraps `stream.message()` to work with `while let Some` pattern.
-async fn stream_next(
-    stream: &mut Streaming<StreamTelemetryRequest>,
-) -> Option<Result<StreamTelemetryRequest, Status>> {
-    match stream.message().await {
-        Ok(Some(msg)) => Some(Ok(msg)),
-        Ok(None) => None,
-        Err(e) => Some(Err(e)),
     }
 }
 
@@ -292,6 +193,9 @@ mod tests {
             meeting_id: meeting_id.to_string(),
             mc_id: mc_id.to_string(),
             mc_grpc_endpoint: mc_grpc_endpoint.to_string(),
+            egress_streams: Vec::new(),
+            selection_rules: None,
+            policy_generation: 0,
         })
     }
 
