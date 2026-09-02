@@ -2305,10 +2305,18 @@ commit** so the precedent is greppable rather than buried in a guard change.
 ---
 
 ### Issue 17: OPS-10 — the header under-listed the cannot-run causes, and nothing pinned it
-**Problem**: @operations found that after Issue 15 added two branches, the body had **four**
-`CANNOT VERIFY` causes (no advertise address, `ss` failed, `ss` missing, no resolver) while the
-header enumerated **two** — and the suite stayed 61/61 green through the change. Verified by
-counting both before touching either.
+**Problem**: @operations found that the body had **four** `CANNOT VERIFY` causes (no advertise
+address, `ss` failed, `ss` missing, no resolver) while the header enumerated **two** — and the suite
+stayed 61/61 green through the change. Verified by counting both before touching either.
+
+**Attribution, stated precisely because the record would otherwise mislead.** This is a finding
+against **my Issue-15 change**, which landed *after* @test's section-6 sign-off — not a gap in that
+sign-off. @test verified the properties that existed at review time and verified them correctly:
+the severity tags, the absence of `warn`, and the `--help` sentinel. The header's cause enumeration
+was accurate when they reviewed it. It became a drift surface only when I added the `ss`-failed and
+no-resolver branches to the body afterwards, and I did not extend the assertion to cover the
+property my own change had put in motion. A reviewer cannot pin a coupling that does not exist yet;
+the implementer who creates it owns extending its guard.
 
 **Weighted honestly, as @operations did: the semantics were never wrong.** The contract paragraph
 below states the general rule — *"A check that CANNOT RUN is a hard fail too, not a pass"* — which
@@ -2406,7 +2414,17 @@ with the remedy in its message. Suite 61 → 66.
    `warn`-absence while the extraction range (OPS-9) and the cause enumeration (OPS-10) drifted
    underneath it. When a test extracts a block, ask which properties of that block are *not* being
    asserted — those are where the next drift lands.
-15. **The durable lesson of this devloop: three of the four behavioural findings were a
+15. **A guard that degrades as its subject grows fails exactly when there is more to check.**
+   @team-lead's framing of the SIGPIPE, and the sharpest line to come out of the loop. The
+   `printf | awk '{exit}'` in the self-test was a size-dependent race: it passed all devloop and
+   turned deterministic only once `dev-web.sh` crossed ~31 KB, so the suite was beginning to
+   silently self-disable *as the script it guards got bigger*. Generalised past bash and past this
+   file: **any assertion whose cost scales with the artifact it guards has that failure curve** —
+   it weakens on exactly the inputs that most need checking, and it weakens quietly, because the
+   failure mode is an empty result rather than a wrong one. Worth asking of any new guard: does the
+   work this check does grow with what it checks, and what happens at the size where it stops
+   coping?
+16. **The durable lesson of this devloop: three of the four behavioural findings were a
    defensive-looking conjunct converting failure into silence** — `!derived.is_empty()`, the
    swallowed second parse, and the comment-anchored `sed` range — **and none was caught by my own
    tests.** That is the same shape as the task's subject (a control that is inert while looking like
