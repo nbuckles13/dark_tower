@@ -401,6 +401,11 @@ Most of the simple guards — the eight listed here (cite-no-line-numbers / cite
     - **Resolution**: fix the input file at the cited path:line, or — if a true false positive — add `# guard:ignore(<reason>)` per the inline guidance in each subcommand's source-doc header. `<reason>` must be ≥10 characters and not match the `LAZY_REASON_RE` vocabulary denylist.
     - **`.ts` / `.svelte` guards have NO `#` marker — do not reach for one.** `crates/dt-guard/src/ignore.rs` ships only the `#`-comment and HTML-comment flavors, and neither matches a `//` line comment, so a `#` comment added to a TypeScript file silently does nothing. TS-scoped guards either define a bespoke marker (`ts_metric_naming`'s `// dt-metric-name-dynamic:`) or deliberately have none at all (`ts-no-retained-credentials` — see its §6.3 row for what to do instead).
 
+4. **Vacuity — the guard could not check what it is responsible for.** `STATUS=FAIL REASON=<vacuity-token>` where the token names a *discovery* fault rather than a policy finding (`env-config-no-services-checked`, `release-build-profile-no-dockerfiles-discovered-<n>`, `no-insecure-browser-flags-no-candidate-files-<n>`). **This outranks any policy finding and always names the run**: a walk-based guard that finds nothing and reports OK "reads as coverage", so these guards fail closed instead.
+    - **Diagnostic**: the vacuity line is printed FIRST, before any `VIOLATION:` lines, and is emitted as `ERROR: PRECONDITION [<token>] …`. The `ERROR:` prefix is load-bearing — see the lane note below.
+    - **Resolution — read the token first, because two sub-classes need opposite actions.** *Most* vacuity tokens fire because the guard's **discovery path** broke (a service roster, a directory layout, a manifest it walks), not because an operator edited an input: `release-build-profile-no-dockerfiles-discovered` means the `infra/docker/*/Dockerfile` walk matched nothing, and you cannot cause that by editing a Dockerfile — start at the guard module's discovery code, not the input tree. **But some ARE causable by an ordinary edit**, and for those the environmental advice actively misleads: `release-build-profile-cargo-config-unparseable` (invalid TOML in `.cargo/config.toml`) and `release-build-profile-service-roster-underivable` (glob entries in `[workspace] members`) are both normal things to have just done. Those messages name the offending file and the remedy — follow them. The per-token split is in the §8 catalogue row.
+    - **Lane**: these are *precondition* failures on the operator lane by intent, but they arrive as `STATUS=FAIL` (exit 1, implementer lane). That is not a bug in the guard — a guard subprocess **cannot** self-declare a lane; see the mechanism note below. The token and the `ERROR: PRECONDITION` body are the only channels carrying the lane, which is why they are worded the way they are.
+
 dt-guard also emits `WARN dt-guard auxiliary skip: <path> (<error-kind>)` to stderr when its auxiliary index-scan loops swallow an IO/parse failure (per ADR-0034 §F-SG-2 mitigation). `run-guards.sh` surfaces those WARN lines alongside `VIOLATION` / `ERROR` in non-verbose CI logs — a sudden uptick indicates a corrupted catalog or dashboard file that the policy kernel skipped silently.
 
 ### 6.4 Layer 4 — Test (`scripts/layer4.sh`)
@@ -639,6 +644,11 @@ Grep-driven entry point. Match the symptom, jump to the section.
 | `env-config-configmap-not-found-<n>-of-<m>-findings` | A `configMapKeyRef` names a ConfigMap with no manifest in that service directory. **Runtime-fatal** — kubelet reports `CreateContainerConfigError` and the pod never starts. Usually a typo'd `name:`, or a ConfigMap expected from an overlay (which this guard does not cover — see its module doc and `docs/TODO.md` §Infrastructure Validation in Devloops). | §6.3 |
 | `env-config-key-not-in-configmap-<n>-of-<m>-findings` | The named ConfigMap exists but does not declare the requested key. Same runtime consequence as above. Go to that ConfigMap's `data:` block — note resolution is **name-scoped**, so a key present in a *sibling* ConfigMap does not satisfy the reference. | §6.3 |
 | `env-config-orphan-key-<n>-of-<m>-findings` | A ConfigMap `data:` key that no workload **naming that ConfigMap** references. Not runtime-fatal, but the key is misleading: it looks configurable and changing it does nothing (an operator raising `OTEL_SAMPLE_RATE` mid-incident would see no effect). Fix by referencing it via `configMapKeyRef` in every workload that needs it, or removing it. Per-instance ConfigMaps are handled correctly — a key in `mh-0-config` referenced only by `mh-0-deployment.yaml` is NOT an orphan. | §6.3 |
+| `release-build-profile-{no-dockerfiles-discovered,workspace-manifest-unreadable,cargo-config-unparseable,dockerfile-no-cargo-build-line,service-roster-underivable,service-crate-without-dockerfile,canonical-services-roster-drift}-<n>` | **The guard refused to claim coverage** — it could not check something it is responsible for, which outranks any policy finding and always names the run. Printed FIRST (before any `VIOLATION:`) as `ERROR: PRECONDITION [<token>] …` so it survives the `head -5` re-emission cap. `<n>` is the hit count for the winning class only. **Read the two sub-classes differently — this is the triage decision:** <br>**(i) Environmental — you did NOT cause it by editing an input.** `no-dockerfiles-discovered` (the `infra/docker/*/Dockerfile` walk matched nothing), `workspace-manifest-unreadable` (root `Cargo.toml` absent or unparseable), `dockerfile-no-cargo-build-line` (a service image with no `cargo build`/`cargo chef cook` line), `service-crate-without-dockerfile` and `canonical-services-roster-drift` (the service roster and the image tree disagree). Do **not** go hunting in `infra/docker/` — start at the guard's discovery code. <br>**(ii) Causable by an ordinary edit — go fix the file the message names.** `cargo-config-unparseable` = `.cargo/config.toml` (or `.cargo/config`) is not valid TOML; breaking it is a normal edit, so the environmental advice above would steer you away from exactly what you just did. `service-roster-underivable` = `[workspace] members` uses glob entries (`crates/*`), which cargo supports but which cannot be resolved to a service roster — without this the coverage floor checked nothing and the guard reported OK. Both messages name the file and the remedy. <br>**Lane note**: all seven are precondition failures by intent but arrive as `STATUS=FAIL` (exit 1) — a guard subprocess cannot self-declare a lane (see the caveats below), so the token IS the lane. | §6.3.1 |
+| `dockerfile-build-not-release-<n>` / `release-profile-debug-assertions-enabled-<n>` / `cargo-config-release-profile-debug-assertions-<n>` / `release-inheriting-profile-debug-assertions-<n>` / `rustflags-debug-assertions-<n>` / `cargo-profile-env-debug-assertions-<n>` / `dockerfile-cook-profile-mismatch-<n>` | **A shipped artifact could have `debug_assertions` ON**, which silently disarms every `compile_error!`-based compile-time control (ADR-0036 §11). Real policy violations, implementer lane. The token appears verbatim in the `VIOLATION: [<token>] <file>:<line>` line, so grep the token not the STATUS. Six distinct inputs can flip it: a Dockerfile losing `--release` or selecting a non-release `--profile`; `[profile.release]` or a `[profile.release.package.<crate>]` override in the root `Cargo.toml`; the same in `.cargo/config.toml`; a custom profile with `inherits = "release"` that a Dockerfile selects; `RUSTFLAGS=-C debug-assertions`; or a `CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS` env/ARG — the last of which flips it with every file the guard's name suggests left byte-identical. Fix the cited input; there is no bypass marker. | §6.3.1 |
+| `release-build-profile-violation` / `release-build-profile-violations-<n>` / `insecure-browser-setting` | **Guard wiring fault, not a diff defect — and the finding it carries is real but unclassified.** These are the fallback tokens in `release_build_profile.rs:token_for_rule` / `reason_for` and `no_insecure_browser_flags.rs:token_for`. They are unreachable by construction while every rule id is registered, so seeing one means **a rule was added to the guard without being added to `RULE_ORDER` (or to `token_for`'s match)**. Consequence: the hit is reported but lands outside the precedence ladder, so it cannot be triaged from this table and — for the release guard — cannot be recognised as a precondition class. Fix the registration in the guard, then re-run; do not triage the underlying finding from the fallback token, because its lane is exactly what the missing registration lost. | §6.3.1 |
+| `no-insecure-browser-flags-no-candidate-files-<n>` | Vacuity twin of the row above for the browser-flag guard — the git-tracked walk matched zero candidate files, so the guard verified nothing. Same fail-closed rationale, same "not operator drift" reading. | §6.3.1 |
+| `insecure-browser-cert-validation-flag-<n>` / `insecure-browser-origin-or-websecurity-flag-<n>` / `insecure-browser-config-property-<n>` | A script, config, runbook or test invocation carries a browser/harness setting that disables certificate validation, forces an insecure origin to be treated as trustworthy, or turns off web security. **Standing prohibition (story R-33) — there is no accepted use.** Browser trust here flows exclusively through `serverCertificateHashes` pinning, so any one of these turns the pinning assertion into decoration while every test stays green. The allowlist is literal-path only (never prefix or glob) and each entry carries an inline justification; **do not widen it to clear a finding** — remove the setting instead. If the demo origin is not a secure context the fix is a TLS dev origin, not a flag. | §6.3.1 |
 | Layer 3 `suppression-past-due` | A suppression hit its `expires` — INTENTIONAL red. Renew (re-verify + `--fix` + reviewed PR) or fix the advisory. | §6.3 |
 | Layer 3 `suppression-drift` | Derived files (`.cargo/audit.toml` / `.pnpm-audit-ignore.json`) drifted from the manifest — run `scripts/audit-suppressions-check.sh --fix`. | §6.3 |
 | Layer 3 `suppression-malformed` | Manifest/derived file unparseable — fix the offending line named in the `MALFORMED:` output. | §6.3 |
@@ -681,14 +691,61 @@ fixable at THOSE guards. A missing build artifact is a wiring fault — the oper
 convention — but both emitters `exit 1` and print **no `STATUS=` line of their own**, so the only
 STATUS the layer sees is `run_and_emit`'s appended `STATUS=FAIL <prefix>-failed`, which maps to exit 1.
 
-**This is NOT because layer3 "flattens" a guard-level `PRECONDITION_FAILURE`** — that earlier claim
-was wrong, and 2026-08-21's guard-timeout change disproves it: a guard that PRINTS ITS OWN
-`STATUS=PRECONDITION_FAILURE` line (as run-guards.sh's 124/137 arms now do) IS collected by
-`tee_collect_statuses` and DOES win the aggregation (rank 6 > 5) → the layer reaches the operator
-lane, exit 2. In-guard reclassification survives precisely WHEN the guard emits its own STATUS line.
-The dt-guard-binary-missing wrappers reach the implementer lane only because they emit none; giving
-them a `STATUS=PRECONDITION_FAILURE` line (or the deferred `run_and_emit` PRECONDITION variant) would
-fix their lane the same way.
+**This is NOT because layer3 "flattens" a guard-level `PRECONDITION_FAILURE`.** But the reason is
+narrower than this section claimed before 2026-09-01, and the earlier wording — "in-guard
+reclassification survives precisely WHEN the guard emits its own STATUS line" — was **wrong in a way
+that would mislead a guard author into building something that silently does not work.** Corrected:
+
+> **Whether a `STATUS=` line reaches Layer 3's aggregation depends on WHO PRINTED IT.**
+>
+> - **Lines printed by `run-guards.sh` itself** — its 124/137 timeout arms and its
+>   `guard-violations` summary — land directly on Layer 3's stdout. They are collected by
+>   `scripts/lang/_common.sh:tee_collect_statuses` and participate in BOTH
+>   `aggregate_worst_status` (so `PRECONDITION_FAILURE` rank 6 > `FAIL` rank 5 flips the layer to
+>   exit 2) and `scripts/lang/_common.sh:worst_reason_for_status` (called from
+>   `__layer_lifecycle_end`), which takes the
+>   **FIRST** pair matching the winning enum and puts it on the stderr `LAYER=3 … REASON=` anchor.
+> - **Lines printed by an individual guard subprocess are NOT.** `scripts/layer3.sh` invokes
+>   `run-guards.sh` with no `--verbose` flag, and `VERBOSE` defaults to false there, so each guard
+>   runs under `OUTPUT=$(… "$guard" … 2>&1)` in the non-verbose branch of the guard loop —
+>   **its stdout is captured, not passed through.** Only text matching `VIOLATION|violation|ERROR|error|WARN` is re-emitted, capped
+>   at `head -5`. `STATUS=PRECONDITION_FAILURE` matches none of those tokens (it contains `FAILURE`,
+>   not `ERROR`), so a guard's own STATUS line is **swallowed**.
+
+**Consequences for anyone writing a guard.** Do not emit `STATUS=PRECONDITION_FAILURE` from a guard
+binary expecting to reach the operator lane — it will be dropped and you will land on the implementer
+lane anyway, with code that *looks* like it handled the lane. A guard surfaces diagnostics through
+`VIOLATION:` / `ERROR:` stdout lines (which is why the vacuity classes in §6.3.1 are emitted as
+`ERROR: PRECONDITION [<token>] …` — the `ERROR:` prefix is what gets them past the re-emission grep
+at all) and through the token it carries in that text. **The token is the only channel that can carry
+a lane**, which is why guards that need the distinction encode it in the REASON vocabulary rather
+than the enum.
+
+The dt-guard-binary-missing wrappers reach the implementer lane because they emit no STATUS line AND
+are the captured subprocess — giving them one would not fix it. The fix has to be at
+`classify_guard_exit`, in `run-guards.sh` itself, where an echo is outside the capture. That change
+is tracked in `docs/TODO.md` §Guard STATUS Attribution; note it would be a **fourth** hand-rolled
+`STATUS=` emission, which `run-guards.sh`'s exit-precedence ANCHOR comment records as the standing
+trigger to revisit routing
+through `emit_status` (rejected on coupling grounds per ADR-0015 §Pre-commit standalone use). It is a
+design decision, not a patch.
+
+### Caveat: a violation's STATUS line names no guard
+
+A second asymmetry at the same emission site, worth knowing before you grep. `run-guards.sh`'s
+violations-summary emission is a **fused constant** — `STATUS=FAIL REASON=guard-violations` — once when `FAILED_GUARDS > 0`,
+naming neither the failing guard nor its rule. The 124/137 arms, by contrast, carry
+`guard-timeout-${GUARD_NAME}`.
+
+> **The operator lane is attributable per-guard; the implementer lane is not.** A timeout tells you
+> WHICH guard. A violation tells you only that something violated.
+
+So for a normal violation the stderr `LAYER=3 … REASON=` anchor — the 3am attributable-cause line —
+resolves to the bare `guard-violations`. The guard's identity survives only in the human
+`FAILED: <name>` line and in the `VIOLATION|ERROR|WARN` text re-emitted from the captured output,
+**capped at `head -5`**. That cap is why guards that fail closed on vacuity print their precondition
+line first: a coverage refusal buried at line six is invisible. Tracked in `docs/TODO.md`
+§Guard STATUS Attribution.
 
 Consequence worth knowing before triaging: `run-story.sh` routes a gate exit 1 to a **task
 escalation** and anything else non-zero to the operator lane, so this failure is recorded against

@@ -32,6 +32,14 @@ regex = "1"
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_norway = "0.9.42"
+# Typed TOML deser for the release-profile premise guard. Deliberately the real
+# parser rather than a line scanner: the artifact is determined by how *cargo*
+# reads Cargo.toml, and `toml`/`winnow` is what cargo itself parses with. A
+# hand-rolled scanner is a second, divergent implementation of that grammar and
+# every divergence is a false-negative window (dotted keys, inline tables,
+# quoted keys). @security ruling 2026-09-01; ADR-0033 audit dep-change gate
+# applies.
+toml = "0.8"
 walkdir = "2"
 
 [dev-dependencies]

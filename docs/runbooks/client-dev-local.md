@@ -256,16 +256,43 @@ deliberately not re-enumerated here.
 
 **Read its two severities correctly:**
 
-- **`✗` HARD FAIL** — nothing works without it. The script stops.
-- **`!` WARN** — only part of the demo breaks, and the script tells you which part, then starts
-  the server anyway. Sign-up and create-meeting run over TCP through the Vite proxy and are
-  unaffected by every WebTransport-related warning; **only the join step breaks.**
+- **`✗` HARD FAIL** — the demo will not work, so the script stops and does **not** start the dev
+  server. Every hard fail prints the next command to run. Fix the `✗` items and re-run.
+- **`!` WARN** — a convenience or a side path is degraded. The script names which, then starts the
+  server anyway.
 
-**One limitation to know.** `scripts/dev-web.sh::check_wt_endpoint` reads the MC/MH advertise
-addresses from the committed configmap **files on disk**, not from the live cluster. On the static
-topology those agree. On a devloop cluster the live ConfigMap has been patched and the on-disk file
-is stale, so the check validates an address nobody is using — **a green preflight there does not
-mean the join will work.** See §1 and F8.
+Which check carries which severity is maintained in the script and printed by
+`scripts/dev-web.sh --help` — as with the check list above, it is deliberately not re-enumerated
+here.
+
+**The WebTransport checks are hard fails, and that is a recent change.** The cert-fingerprint check
+and the MC/MH listener checks used to warn. That was correct when the demo's success criterion was
+sign-up and create-meeting — both run over TCP through the Vite proxy and are unaffected by any
+WebTransport problem. It is no longer the criterion: the demo is now *hearing your own audio back
+through MH* (`docs/decisions/adr-0036-media-flow.md`), so MC and MH reachability is the demonstrated
+path, not a side path. Warning there produced the worst available outcome — a demo that starts,
+appears to join, and silently returns no audio. See §4 for telling a real join from an optimistic
+one.
+
+**One limitation to know — it now blocks rather than misleads.**
+`scripts/dev-web.sh::check_wt_endpoint` reads the MC/MH advertise addresses from the committed
+configmap **files on disk**, not from the live cluster. On the static topology those agree. On a
+devloop cluster the live ConfigMap has been patched and the on-disk file is stale, so the check
+validates an address nobody is using.
+
+Before the escalation that produced a misleading green. Now the hazard runs both ways: **a red
+preflight on a devloop cluster does not necessarily mean the join is broken — and it stops the dev
+server from starting.** That is expected on the devloop topology (§1, F8), not a regression. Check
+the live value before believing the failure (substitute the pod the preflight named):
+
+```bash
+# --- WSL2 ---
+kubectl get cm mh-0-config -n dark-tower -o jsonpath='{.data.MH_WEBTRANSPORT_ADVERTISE_ADDRESS}'
+```
+
+If that disagrees with the on-disk file, the preflight is reporting stale data and the cluster may
+be healthy. `dev-web.sh` targets the static host topology (§1); a devloop cluster is not its
+intended input, and the validation path there is the Rust env-tests (§6.5).
 
 ### Step 1 — Bring up the cluster
 

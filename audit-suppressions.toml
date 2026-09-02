@@ -18,33 +18,59 @@
 
 # RUSTSEC-2023-0071 — rsa 0.9.10 Marvin Attack (timing side-channel on RSA decryption).
 #
-# Exposure analysis (security, 2026-05-08; re-anchored to new manifest 2026-06-06):
-#   - Pulled transitively by sqlx-macros-core compile-time query-validation
-#     scaffolding, NOT by any runtime driver we select.
+# Exposure analysis (security, 2026-05-08; re-anchored 2026-06-06; RE-VERIFIED
+# AND CORRECTED at the 2026-09-02 renewal — the old text OVERSTATED exposure):
+#   - LOCKFILE-ONLY. `rsa 0.9.10` has NO edges in the resolved dependency graph
+#     at all: both `cargo tree -p rsa --invert --edges normal` and the same with
+#     `--target all` return "nothing to print". It is present in `Cargo.lock`
+#     solely because `sqlx-mysql` is a recorded OPTIONAL dependency of sqlx.
+#   - The pre-2026-09-02 text claimed rsa was "pulled transitively by
+#     sqlx-macros-core compile-time query-validation scaffolding". That was a
+#     WEAKER (more exposed) position than reality, and it mattered: a reviewer
+#     running the verify command and seeing "nothing to print" would reasonably
+#     conclude the rationale had gone stale and re-open a settled question.
+#     It is not build-time-only. It is not built at all.
 #   - Workspace sqlx features = ["runtime-tokio","postgres","uuid","chrono",
-#     "migrate"]. No "mysql" feature; no runtime code path constructs rsa::*.
-#   - INVARIANT (verify command of record): `cargo tree -p rsa --invert`
-#     must show ONLY build-time consumers; no shipped binary links rsa runtime.
+#     "migrate"]. No "mysql" feature anywhere in any Cargo.toml; no runtime code
+#     path constructs rsa::*.
+#   - INVARIANT (verify command of record): `cargo tree -p rsa --invert
+#     --edges normal` (and with `--target all`) must print NOTHING. Any output
+#     at all means a consumer has appeared and this analysis is void.
 #   - Marvin requires attacker-observable RSA decrypt timing on a server we
-#     operate. We don't ship rsa code, so there is no such surface.
+#     operate. We neither ship nor compile rsa code, so there is no such surface.
+#
+# WHY NOT JUST DROP THE SUPPRESSION (asked and answered 2026-09-02, so it is not
+# re-litigated every 90 days): `cargo audit` scans `Cargo.lock`, NOT the build
+# graph, so the advisory fires on the lockfile entry regardless of the empty
+# graph above. Verified against an isolated copy of the lockfile with no
+# suppression config present: "1 vulnerability found", "No fixed upgrade is
+# available!". Dropping the entry makes Layer 6 permanently red with no remedy —
+# which converts a governed, expiring, periodically re-justified suppression
+# into standing pressure to do something worse. Renewal is the only viable path.
 #
 # Upstream: no fix in rsa 0.9.x; constant-time RSA in Rust is an unsolved
 # upstream problem (rust-lang/rsa#19). Waiting for a fix is waiting indefinitely.
 # Expected to be the longest-lived entry here.
 #
-# FAIL-CLOSED: if `cargo tree -p rsa --invert` ever shows a runtime consumer,
-# this suppression is void immediately — remove it, fix, or re-justify with a
-# new exposure analysis. No grace period.
+# FAIL-CLOSED: if the verify command of record ever prints ANYTHING, this
+# suppression is void immediately — remove it, fix, or re-justify with a new
+# exposure analysis. No grace period.
 #
-# Sunset: 90-day heavy re-justification at `expires` (2026-09-01) — re-run the
-# invert command, confirm the runtime tree is still empty, re-affirm in-tree.
+# Sunset: 90-day heavy re-justification at `expires` (2026-12-01) — re-run the
+# invert command (both forms), confirm it still prints nothing, re-affirm
+# in-tree. PERMANENT-RENEWAL RISK, named so the cycle stays a real
+# re-verification and does not decay into a rubber stamp: upstream has no fix
+# (constant-time RSA in Rust is an open problem, rust-lang/rsa#19), so the only
+# real exit is getting `rsa` OUT of the lockfile — which requires `sqlx-mysql`
+# to stop being a recorded optional dep, i.e. an upstream or dependency-structure
+# change, not anything available in-tree today. Tracked in docs/TODO.md.
 # ADR-0033 §12 14-day MTTR tripwire continues to apply independently.
 [[suppression]]
 id = "RUSTSEC-2023-0071"
 ecosystem = "rust"
-expires = "2026-09-01"
+expires = "2026-12-01"
 ticket = "docs/TODO.md (see the 'Suppressed Advisories' + 'Dependency Vulnerabilities' sections)"
-reason = "rsa 0.9.10 Marvin timing side-channel; build-time-only via sqlx-macros (no mysql feature, no runtime rsa::*) — verify with `cargo tree -p rsa --invert`; fail-closed if a runtime consumer ever appears; no upstream fix. Full rationale in comment above + docs/TODO.md Cluster C."
+reason = "rsa 0.9.10 Marvin timing side-channel; LOCKFILE-ONLY — not built at all (no mysql feature; `cargo tree -p rsa --invert --edges normal` prints nothing, verified 2026-09-02), present only because sqlx-mysql is a recorded optional dep; fail-closed if the verify command ever prints anything; no upstream fix and cargo-audit scans the lockfile not the build graph, so dropping this makes Layer 6 permanently red with no remedy. Full rationale in comment above + docs/TODO.md Cluster C."
 
 # RUSTSEC-2025-0052 — async-std 1.13.2 unmaintained (discontinued 2025-08-24).
 #

@@ -26,6 +26,8 @@ use dt_guard::knowledge_index;
 use dt_guard::kustomize;
 use dt_guard::metric_coverage;
 use dt_guard::metric_labels;
+use dt_guard::no_insecure_browser_flags;
+use dt_guard::release_build_profile;
 use dt_guard::rust_log_secrets;
 use dt_guard::rust_pii;
 use dt_guard::rust_secrets;
@@ -85,6 +87,26 @@ enum Command {
     },
     /// Dashboard-panels policy: unit, datasource, rate-window, metric-type, metric-exists.
     DashboardPanels {
+        /// Repository root for path resolution.
+        #[arg(long)]
+        root: PathBuf,
+        /// Emit single-line `EXPLAIN:` records per finding (ADR §7).
+        #[arg(long)]
+        explain: bool,
+    },
+    /// Standing prohibition on browser/test-harness settings that disable
+    /// certificate validation, disable web security, or force an insecure origin.
+    NoInsecureBrowserFlags {
+        /// Repository root for path resolution.
+        #[arg(long)]
+        root: PathBuf,
+        /// Emit single-line `EXPLAIN:` records per finding (ADR §7).
+        #[arg(long)]
+        explain: bool,
+    },
+    /// Release-build premise: assert shipped artifacts are built with
+    /// debug-assertions off, so ADR-0036 §11's compile-time control is armed.
+    ReleaseBuildProfile {
         /// Repository root for path resolution.
         #[arg(long)]
         root: PathBuf,
@@ -378,6 +400,12 @@ fn run(cli: Cli) -> Result<()> {
         }
         Command::AlertRulesPolicy { root, explain } => alert_rules::run(&root, explain),
         Command::DashboardPanels { root, explain } => dashboard_panels::run(&root, explain),
+        Command::NoInsecureBrowserFlags { root, explain } => {
+            no_insecure_browser_flags::run(&root, explain)
+        }
+        Command::ReleaseBuildProfile { root, explain } => {
+            release_build_profile::run(&root, explain)
+        }
         Command::MetricLabels { root, explain } => metric_labels::run(&root, explain),
         Command::ApplicationMetrics { root, explain } => application_metrics::run(&root, explain),
         Command::InfrastructureMetrics { root, explain } => {
