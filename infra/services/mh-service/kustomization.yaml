@@ -17,3 +17,47 @@ labels:
   - pairs:
       managed-by: dark-tower
     includeSelectors: false
+
+# Derive each instance's MH_TERMINATION_GRACE_SECONDS from THAT instance's own
+# terminationGracePeriodSeconds, at build time (R-21: one literal, derived —
+# never two hand-typed values free to drift).
+#
+# These two entries are deliberately NOT mergeable into one. `source.name` must
+# be a literal, so a single entry would silently make BOTH deployments read
+# mh-0's grace period — a per-instance quantity collapsed into a shared one,
+# which is the defect this block exists to remove.
+#
+# `options: create:` is deliberately NOT set. Requiring the target env entry to
+# pre-exist is what makes deletion of EITHER side a hard build failure:
+#   - delete the source field  -> "fieldPath ... is missing for replacement source"
+#   - delete the target entry  -> "unable to find field ... in replacement target"
+# It is also what keeps the env var name visible to `dt-guard env-config`, which
+# reads these base YAML files directly and never runs kustomize.
+#
+# Verified against kustomize v5.5.0 (embedded in kubectl v1.32.3), which is what
+# both consumers of this base actually run: the guard
+# (scripts/guards/simple/validate-kustomize.sh) and the deploy path
+# (infra/kind/scripts/setup.sh -> kubectl apply -k the Kind overlay). NOTE: the
+# story text claims verification against kustomize v5.7.1; that is not the
+# version this tree runs. See docs/TODO.md.
+replacements:
+  - source:
+      kind: Deployment
+      name: mh-0
+      fieldPath: spec.template.spec.terminationGracePeriodSeconds
+    targets:
+      - select:
+          kind: Deployment
+          name: mh-0
+        fieldPaths:
+          - spec.template.spec.containers.[name=mh-service].env.[name=MH_TERMINATION_GRACE_SECONDS].value
+  - source:
+      kind: Deployment
+      name: mh-1
+      fieldPath: spec.template.spec.terminationGracePeriodSeconds
+    targets:
+      - select:
+          kind: Deployment
+          name: mh-1
+        fieldPaths:
+          - spec.template.spec.containers.[name=mh-service].env.[name=MH_TERMINATION_GRACE_SECONDS].value
