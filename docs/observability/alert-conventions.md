@@ -147,6 +147,127 @@ The canonical alert-rule shape is:
 
 ---
 
+## Non-Zero-Denominator Guard `[reviewer-only]`
+
+Ratio alerts in this tree carry a trailing conjunct asserting the denominator is non-zero:
+
+```
+(
+  sum(rate(<svc>_<thing>_total{status="failure"}[5m]))
+  /
+  sum(rate(<svc>_<thing>_total[5m]))
+) > 0.05
+and
+sum(rate(<svc>_<thing>_total[5m])) > 0
+```
+
+The convention was established by copy-paste and documented nowhere until now, which is why the
+template did not carry it and why the coverage below is uneven.
+
+### The reason is NOT divide-by-zero
+
+This is the part to get right, because the obvious justification is wrong and an author who believes
+it will conclude the guard is decorative and drop it.
+
+PromQL does not need protecting from a zero denominator here. With **no series**, `sum(rate(...))`
+returns an empty vector and the division yields empty. With **flat series**, it is `0/0` = `NaN`, and
+`NaN > threshold` is **false**. Neither case fires. Adding the guard to a plain
+`errors_total / requests_total` ratio changes nothing about whether it fires.
+
+### The reason IS the attempts-denominator inversion
+
+The guard earns its place when the denominator is **attempts** — a sum such as
+`forwarded + dropped` — rather than a pre-existing total.
+
+Guarding on **one addend** instead of the sum inverts the alert:
+
+```
+# WRONG — silent in the everything-dropped case
+(
+  sum(rate(mh_media_datagrams_dropped_total[5m]))
+  /
+  (sum(rate(mh_media_datagrams_forwarded_total[5m])) + sum(rate(mh_media_datagrams_dropped_total[5m])))
+) > 0.01
+and
+sum(rate(mh_media_datagrams_forwarded_total[5m])) > 0     # <-- guards the wrong series
+```
+
+If **everything** is being dropped, the forwarded rate is `0`, the guard evaluates false, and the
+alert goes **silent at exactly the moment the failure is total**. The worse the outage, the quieter
+the alert.
+
+**Rule: the guard sits on the same expression that forms the denominator.**
+
+```
+# RIGHT — guard the attempts sum, not one addend
+and
+(sum(rate(mh_media_datagrams_forwarded_total[5m])) + sum(rate(mh_media_datagrams_dropped_total[5m]))) > 0
+```
+
+### What the guard is actually for
+
+Given that NaN already suppresses the no-traffic case, the guard's value is:
+
+- **Correctness for attempts denominators** (above) — the case where its absence, or its misplacement,
+  is a real defect.
+- **Making the no-traffic intent explicit**, so a reader knows silence-on-no-traffic was chosen rather
+  than inherited from NaN semantics they may not know.
+
+### Idioms that look like this guard but are not
+
+Do **not** normalise these into the shape above — they are deliberately different, and "fixing" them
+breaks the alerts:
+
+| Shape | What it is |
+|---|---|
+| `and sum(rate(X[5m])) > 0.1` | A **rate floor**, not a zero guard — suppresses alerts on trivially small denominators. |
+| `and sum(rate(X[15m] offset 1h)) > 0` | An **offset baseline** for silence detection: "traffic *used to* flow, and now does not." Removing the `offset` inverts its meaning. |
+| `and on() (...)` | Vector matching, not a guard. |
+
+### Current coverage
+
+Re-derive rather than trust this list; the counts are a snapshot.
+
+```
+# the guard (multi-line YAML — a single-line grep for "and sum(rate" returns ZERO)
+grep -rn -A2 '^\s*and\s*$' infra/docker/prometheus/rules/*.yaml | grep 'sum('
+```
+
+As of 2026-09-02 (line numbers verified against the tree **after** this changeset landed): the
+command returns **15** lines — **11 live guards**, **1 template example**, and **3 look-alike idioms**.
+
+Cited **by alert name**, not by line number: names are the stable identifier and are greppable, while
+line numbers shift on any edit above them — as all eleven did inside this very changeset when an
+unrelated comment block in `mh-alerts.yaml` grew.
+
+| Kind | Alerts |
+|---|---|
+| **This guard** (11, live rules) | `MHHighJwtValidationFailures`, `MHGCHeartbeatFailureRate`, `MHHighWebTransportRejections`, `MHTokenRefreshFailures`, `MHMCNotificationFailures`, `MCHighJoinFailureRate`, `MCHighWebTransportRejections`, `MCHighJwtValidationFailures`, `GCMeetingCreationFailureRate`, `GCHighJoinFailureRate`, `GCTelemetryProxyHighRejectionRate` |
+| Template example (not a live rule, not counted) | `<Svc>HighErrorRate` in `_template-service-alerts.yaml` |
+| Rate floor — **not** this guard | `MCMediaConnectionAllFailed` (`> 0.1`) |
+| Offset baselines — **not** this guard | `GCMeetingCreationStopped`, `GCTelemetryProxySilent` |
+
+Two inline conjuncts are also neither: `MCLowConnectionCount` (a sanity conjunct,
+`sum(mc_connections_active) < 1 and sum(mc_meetings_active) > 0`) and `GCTelemetryProxySilent`'s
+`and on()` vector matching in its `absent_over_time` branch.
+
+`_template-service-alerts.yaml` **now carries the guard** in its ratio example. It did not
+previously, which is why the convention failed to propagate: the template is the copy-paste source
+for every new service, so a new service inherited the unguarded shape by default. Note the template
+is **excluded from `dt-guard` entirely** (the `_template-*.yaml` glob) and is not loaded by
+Prometheus — so no guard would ever have caught the omission, and none will catch a future
+regression there. Its guard is an example in a non-loaded file, not a live rule, and is not counted
+among the 11.
+
+**These ratio alerts do not carry the guard** and are not yet reconciled with this convention —
+`GCHighErrorRate`, `GCErrorBudgetBurnRateCritical`, `GCErrorBudgetBurnRateWarning`,
+`GCMCAssignmentFailures`, `GCTokenRefreshFailures`, `GCDatabaseDown`, `MCGCHeartbeatWarning`. All
+have pre-existing totals as denominators, so NaN semantics cover them today and none is currently
+misfiring; they are listed for consistency, and tracked in `docs/TODO.md`. The `*HighMemory` ratios
+are **correctly** unguarded — a container memory *limit* denominator is never zero.
+
+---
+
 ## Burn-Rate Alert Shapes `[reviewer-only]`
 
 Burn-rate alerts fire when the SLO error budget is consuming faster than

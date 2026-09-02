@@ -77,6 +77,7 @@ case future drift emerges from new services or metric additions.
 | `event_type` | Bounded event discriminator | Bounded by the event enum (e.g., `connected`, `disconnected`) |
 | `region` | Geographic/deployment region | Bounded by cloud region set |
 | `pod` | Kubernetes pod identifier | Per-pod — cardinality bounded by fleet size |
+| `key_custody` | Who holds media key material | **`operator` — single permitted value.** See §Key custody below. |
 
 ### Non-canonical aliases (flagged by reviewers, not the guard) `[reviewer-only]`
 
@@ -105,6 +106,152 @@ enumerable; otherwise document the bounded-label pattern you're using
 Labels that exist only in one service (e.g., MC's `actor_type`,
 GC's `controller_type`, MH's `grpc_service`) do not need a taxonomy entry,
 but must follow all other rules (snake_case, bounded, no PII).
+
+---
+
+## Key custody `[reviewer-only]`
+
+**Key custody is a label, not a boolean** (ADR-0036 §11).
+
+Every service reports **`key_custody=operator`** in logs and metrics — ADR-0036 §11's wording,
+unqualified and deliberately so. This is **not** scoped to the media path: the question "what does
+this deployment claim about key custody?" must have an answer at every emission site, and an AC or GC
+log line with no custody label leaves it unanswered.
+
+| | |
+|---|---|
+| **Permitted values** | `operator` — **one value, and adding another requires an ADR-0036 §4 amendment.** |
+| **Why single-valued** | This is a *constraint*, not a snapshot of today's deployment. The label exists to make the custody posture explicit at every emission site; a second value may only appear when §4's custody model actually changes. |
+
+### No end-to-end or zero-trust boolean, anywhere
+
+**No metric, log, dashboard, or document may carry an end-to-end or zero-trust boolean**, because the
+default deployment is neither.
+
+What is true, in both directions (ADR-0036 §4): media is **encrypted between clients**; MH, the
+network, and storage **cannot** read it; **MC — and therefore the operator — can**. That is operator
+custody, accepted as the user's risk decision. A keyless relay does **not** make the system
+end-to-end.
+
+A boolean cannot express that, and the failure mode is not a subtle one: a stat panel reading
+`E2E: true` is a **product claim rendered to an operator**, who may repeat it to a customer. The
+label carries the truth; a boolean would carry a claim.
+
+> **Scope of this prohibition** — it covers claims of end-to-end **encryption** or **zero-trust** as
+> *deployment properties*. It does **not** touch end-to-end **latency**, which is an ordinary
+> measurement term: "join-to-first-media is an end-to-end objective" is correct usage and is
+> unaffected (see `slos.md`).
+
+> **Carrier list note** — ADR-0036 §11 states "metric, log, or document". This taxonomy additionally
+> names **dashboards** explicitly. That widening is deliberate and is a ratchet (strictly stricter,
+> relaxes nothing), recorded here so a future reader does not take the extra carrier for a
+> transcription error and "correct" it back down. Dashboards are named because a Grafana panel is the
+> most likely place someone renders a custody boolean, and because a dashboard JSON is not obviously
+> a "document" to the person adding a panel.
+
+**Canonical home**: this section. `docs/API_CONTRACTS.md` states the contract-level accuracy claim and
+the prohibition for integrators; ADR-0036 §11 is the decision record. On divergence about the *label
+mechanics* — name, permitted values, which surfaces carry it — this file wins.
+
+---
+
+## Media-path identity `[reviewer-only]`
+
+**Read this before adding any label, log field, span attribute, or exemplar on a media-carrying
+path.**
+
+These are **rules, stated as rules**. ADR-0036 §11 requires them to be stated rather than derived,
+because **four specialists independently had to be corrected on this during the design debate** — a
+rule that every author must re-derive from cardinality principles will not survive contact with a
+deadline.
+
+### R1 — No meeting identifier on any metric, raw or hashed
+
+**No metric anywhere in this design carries a meeting identifier**, in any form.
+
+A **hashed** meeting id is barred on exactly the same footing as a raw one. Hashing addresses
+*identifiability of the string*; it changes neither of the two things that bar it:
+
+1. **Cardinality** — a hash has identical cardinality to its input. One series per meeting either way.
+2. **Per-meeting aggregation** — and this is the one people miss: in a **two-person meeting,
+   per-meeting aggregation is nearly per-stream**, so a two-stream series is de-anonymising by
+   inspection. Two-person is the *common* case, not the corner case.
+
+> **Do not reach for the vocabulary guard to enforce this.** Adding `meeting_id` to the Category B
+> denylist is **inert against the realistic spelling**: `meeting_id_hash` ends in `_id_hash`, which
+> `HASHED_SUFFIXES` exempts via `is_hashed_label()`, so the entry would be defeated by the very
+> mechanism it invokes — while reading as coverage. This is ADR-0036 §11's "vocabulary additions
+> cannot be cited as the protection" as a concrete instance rather than a general warning.
+
+**Grandfathered exception — closed, enumerated, and not extended.** The ADR-0028 join-flow metrics
+that already carry the client SDK's implicit join label set (including `meeting_id_hash`) are
+grandfathered **as a set**. The set is closed: it is not an appendable carve-out list, no new metric
+joins it, and every metric this design adds — plus every future metric on any media-carrying path —
+is under the bar.
+
+### R2 — No participant or stream identity on the media path
+
+**No media-path metric label, log field, span attribute, or exemplar carries participant or stream
+identity**, or any per-frame dimension.
+
+**The aggregation floor is `pod`.** *(Deliberately stricter than ADR-0036 §11's "pod or service
+level" — a ratchet, chosen because service-level aggregation across a two-pod fleet is close enough
+to pod-level to offer no real protection while sounding like a choice. Flagged for the same reason as
+the carrier-list widening above: every delta from §11 in this file is stated, so a future reconciler
+can tell intentional from accidental.)*
+
+Aggregate distributions are safe. What is prohibited is resolution that reconstructs a *sequence*:
+per-frame size and timing for a single stream is **the voice-activity trace** — who spoke, in what
+order, for how long, and who interrupted whom — against ADR-0036 §11's stated adversary set: MH,
+whoever compromises MH, and a curious operator; **not** a network observer, since these fields sit
+inside QUIC with TLS terminated at MH.
+
+**Exemplars are the fourth surface and are the easy one to miss.** A Prometheus exemplar is not a
+metric label, a log field, or a span attribute — it hangs off a histogram bucket with its own label
+set — so a rule phrased against the other three does not reach it. A per-stream exemplar on the MH
+forward-latency histogram would reconstruct exactly the sequence this rule protects, and that
+histogram is where someone will reach for one, because it is where the SLO is measured. ADR-0036 §11
+rejects exemplars by name: they "relocate retention into the trace backend rather than solving it".
+
+**Sampling must be random, not deterministic per stream.** The natural modulo implementation meets the
+CPU budget while perfectly reconstructing the sequence.
+
+**A log level is not an acceptable gate.** The incident motivating a level change is the same incident
+producing the sensitive trace.
+
+Per-participant resolution, when genuinely needed, lives in ADR-0036 §11's armed, meeting-scoped,
+auto-expiring in-memory ring buffer dumped on demand — with **MC's assignment state answering *who***,
+at investigation time, in a system that legitimately holds that mapping.
+
+### R3 — Client media-path metrics carry only `client_version` and `org_id`
+
+Media-path metrics emitted by the client SDK **must** carry only `client_version` and `org_id`.
+
+> **This is a required end state, not a description of current behaviour.** Today the SDK's implicit
+> join label set — `client_version`, `meeting_id_hash`, `org_id` — is threaded from
+> `MeetingSession.join` into **every** emission site including the media module
+> (`packages/sdk-core/src/media/events.ts`), and `packages/sdk-core/src/media/__tests__/media-transport.test.ts`
+> **asserts** `meeting_id_hash` in that label set. So media-path client metrics would inherit a
+> meeting identifier **by inertia** unless the exemption is applied deliberately. Tracked in
+> `docs/TODO.md`; owner: client.
+
+Stated in the present-tense-required form because the inertia is the whole risk: the label set arrives
+by default, and doing nothing is what ships the violation.
+
+### Enforcement reality — read this before citing these rules as coverage
+
+**R1, R2 and R3 are `[reviewer-only]`. No guard enforces them today.**
+
+- `meeting_id` appears in **no** guard vocabulary.
+- `meeting_id_hash` is **actively exempted** by `HASHED_SUFFIXES` → `is_hashed_label()`.
+- The durable enforcement for the media-path half is by **shape, not vocabulary**: a directory-scoped
+  deny of log and metric macros across the whole media path, which catches the offending *form*
+  rather than a spelling. Word-boundary vocabulary matching cannot see inside compounds, so a
+  prefixed spelling ships clean while the guard reports green.
+
+Recorded plainly so nobody cites a conventions file as a control. See `docs/TODO.md` for the gap
+between these rules' stated scope ("anywhere in this design") and what the directory-scoped deny
+actually covers.
 
 ---
 
@@ -214,6 +361,12 @@ counter!(
     "action" => action.to_string()
 ).increment(1);
 ```
+
+> **This exemption does NOT cover `meeting_id_hash`, or any meeting identifier.** The suffix rule
+> above is a *PII* exemption; the meeting-identifier prohibition in §Media-path identity is a
+> *cardinality and aggregation* rule and is independent of it. A hashed meeting id ends in `_id_hash`
+> and is therefore waved through by `is_hashed_label()` — it is exempted **by construction** — while
+> still being prohibited. Read §Media-path identity before adding any meeting-scoped label.
 
 **Reviewer-level requirements** `[reviewer-only]` for hashed labels:
 
@@ -455,6 +608,10 @@ series is the answer to a real operational question.
 | Denylist extensions | `[reviewer-gated]` (security + observability co-owned) |
 | Allowlist extensions | `[reviewer-gated]` (prefer rename over allowlist) |
 | Shared-label-name additions | `[reviewer-only]` (land here before second-service use) |
+| `key_custody` bounded to the single value `operator` | `[reviewer-only]` (ADR-0036 §4 amendment required to extend) |
+| No end-to-end / zero-trust boolean on any carrier | `[reviewer-only]` |
+| **No meeting identifier — raw or hashed — on any metric** | `[reviewer-only]` — **NOT guard-enforced**; `meeting_id` is in no vocabulary and `meeting_id_hash` is actively exempted by `HASHED_SUFFIXES` |
+| No participant / stream identity on media-path labels, log fields, span attributes or **exemplars** | `[reviewer-only]` — the media-path half is enforced by shape via the directory-scoped macro deny, not by vocabulary |
 
 ---
 

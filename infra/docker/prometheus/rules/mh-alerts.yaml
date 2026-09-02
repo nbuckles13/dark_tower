@@ -9,11 +9,19 @@
 # docs/runbooks/mh-incident-response.md
 #
 # Notes on deliberate omissions:
-# - No burn-rate page/warning pair: MH has no error-rate SLO defined at authoring
-#   time. Cargo-culting a 10x/5x burn-rate pair without an authoritative SLO
-#   target would produce a threshold with no principled justification. To be
-#   added after the MH SLO is ratified in `docs/observability/slos.md` (its
-#   canonical home per ADR-0011, which holds no targets itself).
+# - No burn-rate page/warning pair: MH has no ratified SLO TARGET. Cargo-culting
+#   a 10x/5x burn-rate pair without an authoritative target would produce a
+#   threshold with no principled justification.
+#   CORRECTED 2026-09-02: this note previously said the blocker was the missing
+#   FILE `docs/observability/slos.md`. That file now exists and is authoritative
+#   per ADR-0011:40 -- but it does NOT unblock this alert. It defines the MH
+#   forwarding SLI and its measurement point (ingress-read-complete ->
+#   egress-enqueued) and records the target as OPEN. The real gate is the
+#   ratified NUMBER, which lands in story 8. Anyone reading the old wording
+#   would have concluded the wall had cleared when it had not.
+#   To be added after the MH target is ratified; see `docs/observability/slos.md`
+#   which states this same rule -- that file is authoritative and this comment is
+#   the copy to fix if they ever disagree.
 # - No RegisterMeeting RPC alert: mh_grpc_requests_total{method="register_meeting"}
 #   is the MC->MH inbound path, and it is now the ONLY value that label takes --
 #   registration is the control plane (ADR-0036 §8) and MediaHandlerService has a
@@ -24,9 +32,10 @@
 #   places successfully but MH fails to APPLY is a media blackhole that reports
 #   healthy on every MC-side signal -- exactly the failure ADR-0036 §8's
 #   applied-generation echo exists to detect. A dedicated alert on that is
-#   deferred until the MH SLO target is ratified in `docs/observability/slos.md`,
-#   added later in this story; the same gate, and the same wording, as the
-#   burn-rate omission above.
+#   deferred until the MH SLO TARGET is ratified (story 8) -- the same gate, and
+#   the same wording, as the burn-rate omission above. CORRECTED 2026-09-02: the
+#   gate is the ratified target, not the existence of `docs/observability/slos.md`,
+#   which now exists and records that target as open.
 # - No registration-failure-rate alert: registration is a low-volume one-shot
 #   signal (single register + periodic heartbeats). Heartbeats give a continuous,
 #   larger-denominator signal - MHGCHeartbeatFailureRate below is the canonical

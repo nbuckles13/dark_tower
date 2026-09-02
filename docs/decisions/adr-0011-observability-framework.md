@@ -114,14 +114,20 @@ Every SLO must define:
 
 #### Initial SLO Targets
 
+> **Amendment 2026-09-02** (ADR-0011:40 delegation; story `2026-08-27-hear-yourself-through-handler` task 7): **`docs/observability/slos.md` is authoritative for SLO targets.** The table below is retained as the *initial/historical* record of the values this ADR proposed, not as the live register. Where the two differ, `slos.md` wins. This is not a new decision — ADR-0011:40 already delegates "Current SLO targets" to `slos.md`; the file simply did not exist until now, so this table was the de-facto register by default. Recorded as its own amendment rather than folded into the row-level amendments below, because it is a different decision (precedence between two tables) and must be findable as one.
+
 | Service | Operation | SLI | Initial Target | Rationale |
 |---------|-----------|-----|----------------|-----------|
 | AC | Token issuance | p99 latency | < 350ms | Bcrypt ~250ms + DB ~50ms |
 | AC | Token validation | p99 latency | < 50ms | Signature verification only |
 | GC | Request (regional) | p95 latency | < 200ms | DB query + routing |
 | MC | Session join | p99 latency | < 500ms | WebTransport handshake ~200ms |
-| MH | Audio forwarding | p99 latency | < 30ms | Real-time constraint |
-| MH | Audio jitter | p99 | < 20ms | Human perception threshold |
+| MH | Audio forwarding | p99 latency | < 30ms *(measurement point redefined — see amendment below)* | Real-time constraint |
+| ~~MH~~ | ~~Audio jitter~~ | ~~p99~~ | ~~< 20ms~~ **STRUCK** | ~~Human perception threshold~~ — see amendment below |
+
+> **Amendment 2026-09-02** (ADR-0036 §11 + ADR-0036 amendments table, "ADR-0011, handler forwarding latency objective"): The **MH audio-forwarding** objective had **no defined measurement point**, which made it unfalsifiable — "forwarding latency" could mean any of several spans. Its measurement point is now defined as **ingress-read-complete → egress-enqueued**: from the moment MH has fully read a datagram off the network to the moment the rewritten datagram is enqueued for transmit. It deliberately excludes network transit in both directions and client-side buffering, none of which MH controls. The `< 30ms` figure above predates the measurement point and is therefore **not ratified against it**; the ratified target lands in story 8. See `docs/observability/slos.md`.
+
+> **Amendment 2026-09-02** (ADR-0036 amendments table, "ADR-0011, handler jitter objective"): The **MH audio-jitter** objective is **struck as unmeasurable**. MH forwards and does not buffer, so it has no jitter buffer whose behaviour could be observed; perceived jitter is a property of the **client-side** jitter buffer, and jitter-buffer design is out of scope for this system today. An objective no component can measure is worse than no objective: it reads as coverage and cannot fail. A client-side successor is deferred together with jitter-buffer design. No metric named `*jitter*` is emitted by any service, and no dashboard panel or alert references one.
 
 #### Error Budget Burn Rate Alerts (REQUIRED)
 
@@ -317,7 +323,7 @@ Each service should have **two primary runbooks** following the AC service patte
 
 Every alert must include:
 - **Alert name**: Following pattern `{Service}{Condition}` (e.g., ACHighLatency, GCDown)
-- **Severity**: critical or warning (labels: `severity: critical` or `severity: warning`)
+- **Severity**: `page`, `warning`, or `info` (labels: `severity: page` etc.) — the guard-enforced taxonomy; `docs/observability/alert-conventions.md` §Severity Taxonomy is canonical
 - **Condition**: PromQL expression with appropriate threshold
 - **Annotations**:
   - `summary`: Brief description of what fired
@@ -354,17 +360,19 @@ groups:
           ) > 0.5
         for: 5m
         labels:
-          severity: critical
+          severity: page
           service: ac-service
           component: token-issuance
         annotations:
           summary: "AC token issuance latency exceeded SLO"
           description: "p99 latency is {{ $value | humanizeDuration }}, exceeding 350ms SLO"
           impact: "Slow authentication for all services, cascading latency to GC/MC/MH"
-          runbook_url: "https://github.com/{ORG}/{REPO}/blob/main/docs/runbooks/ac-service-incident-response.md#scenario-3-high-latency--slow-responses"
+          runbook_url: "docs/runbooks/ac-service-incident-response.md#scenario-3-high-latency--slow-responses"
 ```
 
-**Alert Naming Convention**: `{Service}{Condition}` format (e.g., ACHighLatency, GCDown, MCSessionFailures, MHHighJitter)
+> **Amendment 2026-09-02** (story `2026-08-27-hear-yourself-through-handler` task 7): The example above was corrected to the **guard-enforced** forms. It previously taught two shapes `dt-guard alert-rules-policy` rejects: `severity: critical` (the allowed set is `{page, warning, info}` — `crates/dt-guard/src/alert_rules.rs`, `ALLOWED_SEVERITIES`) and an absolute `https://github.com/...` `runbook_url` (rejected by `URL_SCHEME_RE`; runbook links must be repo-relative under `docs/runbooks/`). **The guard does not scan this file** — `ALERTS_SUBDIR` is `infra/docker/prometheus/rules` only, so nothing flagged this and no gate was failing. That is what made it durable rather than harmless: this block is the canonical "Example Alert with Runbook Link", so an author who copies it into a real rules file gets a red gate with no hint that the ADR they copied from was the cause. Same propagation defect this story fixed in `_template-service-alerts.yaml`, one level further upstream. The absolute-URL form is additionally what the annotation-hygiene check exists to prevent: an alert annotation pointing off-repo.
+
+**Alert Naming Convention**: `{Service}{Condition}` format (e.g., ACHighLatency, GCDown, MCSessionFailures, MHTokenRefreshFailures)
 
 **Initial Alert Catalog** (maintained in alert rule files):
 - AC: `ACDown`, `ACHighLatency`, `ACHighErrorRate`, `ACKeyRotationFailed`, `ACDatabaseConnectionFailed`
