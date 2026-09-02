@@ -209,6 +209,7 @@ fn test_config(gc_url: &str) -> Config {
         ac_jwks_url: "http://localhost:8082/.well-known/jwks.json".to_string(),
         register_meeting_timeout_seconds: 15,
         max_connections: 10_000,
+        policy_limits: mh_service::config::PolicyLimits::default(),
         otel_enabled: false,
         otel_endpoint: String::new(),
         otel_sample_rate: 1.0,

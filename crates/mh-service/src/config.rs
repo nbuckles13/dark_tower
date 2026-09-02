@@ -46,6 +46,122 @@ pub const MAX_REGISTER_MEETING_TIMEOUT_SECONDS: u64 = 300;
 pub const DEFAULT_MAX_CONNECTIONS: usize = 10_000;
 
 // =============================================================================
+// Forwarding-policy bounds (ADR-0036 §8 control plane)
+// =============================================================================
+//
+// `RegisterMeetingRequest` carries two unbounded repeated fields. Unbounded
+// repeated fields on a control-plane message are an allocation surface, so
+// `internal.proto::EgressStream.candidate_sources` requires MH to reject a
+// registration exceeding the configured bounds **before building any routing
+// table**. `grpc::mh_service` checks them before anything that iterates,
+// including duplicate detection — a `HashSet` sized by the attacker-controlled
+// repeated field is the allocation the bound exists to prevent, merely moved
+// earlier than the routing table.
+//
+// EVERY BOUND HERE IS RESOURCE EXHAUSTION, NEVER CAPACITY. None is advertised
+// to GC and none participates in placement. `Config::max_streams` is a
+// *capacity* figure GC enforces at placement (`gc_client` reports it); it is
+// deliberately NOT reused as an enforcement threshold here — its deployed value
+// and its code default differ by an order of magnitude precisely because it is
+// inert on MH's data path, and it is scheduled for retirement when the egress
+// budget lands (R-22).
+//
+// Each bound is optional-with-default rather than required: a newly required
+// env var with no manifest is a deploy-time CrashLoop that would strand a
+// rollback. Each also has a hard code-level CEILING, because a `> 0` check
+// alone lets a fat-fingered value silently re-open the surface the bound exists
+// to close, and it would read as configured-on-purpose forever. The ceilings
+// live in code, not in a manifest, so the guarantee holds in every environment
+// including those with no ConfigMap.
+
+/// Default per-meeting bound on `RegisterMeetingRequest.egress_streams`.
+pub const DEFAULT_MAX_EGRESS_STREAMS_PER_MEETING: usize = 512;
+
+/// Hard ceiling for `MH_MAX_EGRESS_STREAMS_PER_MEETING`.
+pub const MAX_EGRESS_STREAMS_PER_MEETING_CEILING: usize = 8_192;
+
+/// Default per-egress-stream bound on `EgressStream.candidate_sources`.
+///
+/// One candidate this story (loopback); the field is repeated because audio
+/// selection among many speakers must be additive (ADR-0036 §7).
+pub const DEFAULT_MAX_CANDIDATE_SOURCES_PER_EGRESS: usize = 16;
+
+/// Hard ceiling for `MH_MAX_CANDIDATE_SOURCES_PER_EGRESS`.
+pub const MAX_CANDIDATE_SOURCES_PER_EGRESS_CEILING: usize = 256;
+
+/// Default aggregate bound on egress edges across **all** meetings.
+///
+/// The two per-meeting bounds above bound *one* meeting; `SessionState` caps
+/// no meeting count, so without this the total is per-meeting-bound x
+/// unbounded meetings. Before this story a registration entry was three short
+/// strings and an `Instant` — an uncapped map of cheap things. This story hangs
+/// a routing table off each entry, which is what makes the aggregate MH's
+/// problem rather than an inherited one.
+///
+/// Sized FAR above expected peak — single-digit *concurrent* meetings in this
+/// deployment — so that no plausible instantaneous load approaches it.
+///
+/// # What this actually bounds: a ratcheting floor, not concurrent load
+///
+/// **Nothing releases an ENDED meeting's edges.** `RoutingSnapshot::with_policy`
+/// is the only mutator of the meeting map and it only inserts; `SessionState`
+/// is likewise insert-only; and `MediaHandlerService` has one RPC, so MH is
+/// given no meeting-ended signal it could act on. Headroom is freed only when a
+/// still-**live** meeting re-asserts a smaller policy — the per-meeting
+/// subtraction makes 5 edges shrinking to 4 install and drop the total by one —
+/// so the total is not monotone, but the portion held by meetings that have
+/// finished is unreclaimable and rises at the pod's meeting-completion rate.
+///
+/// So the honest statement is the opposite of "reaching this means a bug, a
+/// leak, or a hostile MC, never growth". An earlier draft of this docstring
+/// asserted exactly that, and it was false as written: ordinary turnover is the
+/// growth path, and a future reader sizing this key would have trusted the
+/// promise.
+///
+/// The pod degrades **toward** the bound rather than falling off a cliff, which
+/// is harder to diagnose than a cliff would be. Already-installed meetings
+/// re-assert at an equal generation and short-circuit to `Applied` *before* the
+/// cap is tested, so they keep reporting healthy; what fails is every
+/// registration that would ADD an edge — a new meeting, or an existing healthy
+/// meeting admitting a new participant. Onset is intermittent, clearing when
+/// some unrelated meeting happens to shrink, and worsening with uptime.
+/// Meanwhile `RegisterMeeting` still answers `accepted: true` and GC keeps
+/// placing meetings here, because these bounds are resource guards and are
+/// deliberately not advertised. Symptom, discriminator and interim remedy are
+/// in `docs/runbooks/mh-incident-response.md` Scenario 13; reclamation needs a
+/// meeting-ended signal MH is not given and is tracked in `docs/TODO.md`
+/// §Media Path Obligations.
+///
+/// **Raising this default is not the remedy.** It buys time proportional to the
+/// meeting-completion rate and changes nothing else, because the ceiling is
+/// consumed by finished meetings at whatever rate meetings finish — independent
+/// of concurrent load. Doubling the number doubles time-to-onset and fixes
+/// nothing.
+///
+/// Does NOT bound the number of registered meetings either: an empty
+/// `egress_streams` set is legal and meaningful, so near-free meetings never
+/// trip this. That converse gap has its own `docs/TODO.md` entry rather than
+/// being fixed with a number nobody chose.
+pub const DEFAULT_MAX_TOTAL_EGRESS_EDGES: usize = 65_536;
+
+/// Hard ceiling for `MH_MAX_TOTAL_EGRESS_EDGES`.
+pub const MAX_TOTAL_EGRESS_EDGES_CEILING: usize = 1_048_576;
+
+/// Default bound on awaiting the session actor's config-apply reply, in ms.
+///
+/// The apply is asynchronous relative to the RPC response (ADR-0036 §8), so
+/// this await must be bounded: a wedged actor must produce a truthful stale
+/// `applied_generation` with `outcome=apply_failed`, never a hung RPC.
+pub const DEFAULT_POLICY_APPLY_TIMEOUT_MS: u64 = 1_000;
+
+/// Hard ceiling for `MH_POLICY_APPLY_TIMEOUT_MS` (10 seconds).
+///
+/// Above ADR-0036 §8's <=10s re-assert cadence the await outlives the interval
+/// that would have retried it, so a longer value cannot help and can only pile
+/// up in-flight calls.
+pub const MAX_POLICY_APPLY_TIMEOUT_MS: u64 = 10_000;
+
+// =============================================================================
 // OpenTelemetry Configuration Defaults (R-55)
 // =============================================================================
 
@@ -55,6 +171,75 @@ pub const DEFAULT_MAX_CONNECTIONS: usize = 10_000;
 pub const DEFAULT_OTEL_SAMPLE_RATE: f64 = 1.0;
 /// Default deployment environment when `DEPLOYMENT_ENVIRONMENT` is unset.
 pub const DEFAULT_DEPLOYMENT_ENVIRONMENT: &str = "development";
+
+/// Forwarding-policy bounds applied to `RegisterMeeting` (ADR-0036 §8).
+///
+/// Grouped rather than loose on [`Config`] so the whole set threads into the
+/// gRPC service as one value: a handler that received three of four bounds is
+/// not a state worth making representable.
+///
+/// Every field is a RESOURCE-EXHAUSTION bound. None is a capacity figure, none
+/// is advertised to GC, none participates in placement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PolicyLimits {
+    /// Max `egress_streams` in one registration.
+    pub max_egress_streams_per_meeting: usize,
+    /// Max `candidate_sources` on one egress stream.
+    pub max_candidate_sources_per_egress: usize,
+    /// Max egress edges across **all** meetings on this handler.
+    pub max_total_egress_edges: usize,
+    /// Bound on awaiting the session actor's config-apply reply, in ms.
+    pub policy_apply_timeout_ms: u64,
+}
+
+impl Default for PolicyLimits {
+    fn default() -> Self {
+        Self {
+            max_egress_streams_per_meeting: DEFAULT_MAX_EGRESS_STREAMS_PER_MEETING,
+            max_candidate_sources_per_egress: DEFAULT_MAX_CANDIDATE_SOURCES_PER_EGRESS,
+            max_total_egress_edges: DEFAULT_MAX_TOTAL_EGRESS_EDGES,
+            policy_apply_timeout_ms: DEFAULT_POLICY_APPLY_TIMEOUT_MS,
+        }
+    }
+}
+
+/// Parse one optional numeric bound, validating both ends.
+///
+/// Absent -> default. Present and parseable and within `1..=ceiling` -> the
+/// value. Anything else -> a loud [`ConfigError::InvalidValue`] naming the var,
+/// the offending value and the ceiling.
+///
+/// Rejecting rather than clamping is deliberate: a clamped value runs under a
+/// bound the operator did not choose and never learns about, which is the
+/// silent-misconfiguration shape these bounds exist to prevent.
+///
+/// Generic over the integer type rather than duplicated per width. The bodies
+/// are identical modulo the type, and what would actually drift is the pair of
+/// **operator-facing messages**: reword one copy and the four bounds start
+/// explaining a rejection two different ways. `T: Default` supplies the
+/// zero to test against, so nothing here restates a numeric literal either.
+fn parse_bounded<T>(
+    vars: &HashMap<String, String>,
+    key: &str,
+    default: T,
+    ceiling: T,
+) -> Result<T, ConfigError>
+where
+    T: std::str::FromStr + Default + PartialOrd + Copy + fmt::Display,
+{
+    let Some(raw) = vars.get(key) else {
+        return Ok(default);
+    };
+    let parsed: T = raw.trim().parse().map_err(|_| {
+        ConfigError::InvalidValue(format!("{key} must be a positive integer, got '{raw}'"))
+    })?;
+    if parsed == T::default() || parsed > ceiling {
+        return Err(ConfigError::InvalidValue(format!(
+            "{key} must be in 1..={ceiling}, got {parsed}"
+        )));
+    }
+    Ok(parsed)
+}
 
 /// Media Handler configuration.
 ///
@@ -121,6 +306,9 @@ pub struct Config {
     /// Maximum concurrent WebTransport connections (default: 10000).
     pub max_connections: usize,
 
+    /// Forwarding-policy bounds for the ADR-0036 §8 control plane.
+    pub policy_limits: PolicyLimits,
+
     /// Whether to initialize the OpenTelemetry SDK (R-55). Default `false`.
     /// When `true`, `main` calls `init_otel` (eager collector probe, fail-hard
     /// at init) and composes the tracing-opentelemetry layer; when `false`, no
@@ -165,6 +353,7 @@ impl fmt::Debug for Config {
                 &self.register_meeting_timeout_seconds,
             )
             .field("max_connections", &self.max_connections)
+            .field("policy_limits", &self.policy_limits)
             .field("otel_enabled", &self.otel_enabled)
             .field("otel_endpoint", &self.otel_endpoint)
             .field("otel_sample_rate", &self.otel_sample_rate)
@@ -310,6 +499,38 @@ impl Config {
             .and_then(|s| s.parse().ok())
             .unwrap_or(DEFAULT_MAX_CONNECTIONS);
 
+        // ADR-0036 §8 policy bounds. Unlike the scalars above these REJECT a
+        // malformed or out-of-range value rather than silently falling back to
+        // the default: a bound that quietly reverts is a bound nobody can rely
+        // on, and the whole point of these four is that exceeding them is a
+        // loud event.
+        let policy_limits = PolicyLimits {
+            max_egress_streams_per_meeting: parse_bounded(
+                vars,
+                "MH_MAX_EGRESS_STREAMS_PER_MEETING",
+                DEFAULT_MAX_EGRESS_STREAMS_PER_MEETING,
+                MAX_EGRESS_STREAMS_PER_MEETING_CEILING,
+            )?,
+            max_candidate_sources_per_egress: parse_bounded(
+                vars,
+                "MH_MAX_CANDIDATE_SOURCES_PER_EGRESS",
+                DEFAULT_MAX_CANDIDATE_SOURCES_PER_EGRESS,
+                MAX_CANDIDATE_SOURCES_PER_EGRESS_CEILING,
+            )?,
+            max_total_egress_edges: parse_bounded(
+                vars,
+                "MH_MAX_TOTAL_EGRESS_EDGES",
+                DEFAULT_MAX_TOTAL_EGRESS_EDGES,
+                MAX_TOTAL_EGRESS_EDGES_CEILING,
+            )?,
+            policy_apply_timeout_ms: parse_bounded(
+                vars,
+                "MH_POLICY_APPLY_TIMEOUT_MS",
+                DEFAULT_POLICY_APPLY_TIMEOUT_MS,
+                MAX_POLICY_APPLY_TIMEOUT_MS,
+            )?,
+        };
+
         // R-55: OpenTelemetry SDK configuration.
         // Enablement is an explicit boolean (OTEL_ENABLED), NOT presence of the
         // endpoint — so a populated OTLP_ENDPOINT with OTEL_ENABLED unset/false
@@ -387,6 +608,7 @@ impl Config {
             ac_jwks_url,
             register_meeting_timeout_seconds,
             max_connections,
+            policy_limits,
             otel_enabled,
             otel_endpoint,
             otel_sample_rate,
@@ -712,6 +934,132 @@ mod tests {
         assert_eq!(
             config.register_meeting_timeout_seconds,
             MAX_REGISTER_MEETING_TIMEOUT_SECONDS,
+        );
+    }
+
+    // -- ADR-0036 §8 policy bounds ------------------------------------------
+
+    #[test]
+    fn test_policy_limits_default_when_unset() {
+        let config = Config::from_vars(&base_vars()).unwrap();
+        assert_eq!(config.policy_limits, PolicyLimits::default());
+        assert_eq!(
+            config.policy_limits.max_egress_streams_per_meeting,
+            DEFAULT_MAX_EGRESS_STREAMS_PER_MEETING
+        );
+        assert_eq!(
+            config.policy_limits.max_total_egress_edges,
+            DEFAULT_MAX_TOTAL_EGRESS_EDGES
+        );
+    }
+
+    #[test]
+    fn test_policy_limits_custom_values() {
+        let mut vars = base_vars();
+        vars.insert(
+            "MH_MAX_EGRESS_STREAMS_PER_MEETING".to_string(),
+            "64".to_string(),
+        );
+        vars.insert(
+            "MH_MAX_CANDIDATE_SOURCES_PER_EGRESS".to_string(),
+            "4".to_string(),
+        );
+        vars.insert("MH_MAX_TOTAL_EGRESS_EDGES".to_string(), "1024".to_string());
+        vars.insert("MH_POLICY_APPLY_TIMEOUT_MS".to_string(), "250".to_string());
+
+        let config = Config::from_vars(&vars).unwrap();
+        assert_eq!(config.policy_limits.max_egress_streams_per_meeting, 64);
+        assert_eq!(config.policy_limits.max_candidate_sources_per_egress, 4);
+        assert_eq!(config.policy_limits.max_total_egress_edges, 1024);
+        assert_eq!(config.policy_limits.policy_apply_timeout_ms, 250);
+    }
+
+    /// Zero is rejected, not clamped.
+    ///
+    /// A bound of 0 would reject every registration — the same
+    /// blackhole-by-configuration shape ADR-0036 §8 exists to eliminate, so it
+    /// must fail loudly at startup rather than at the first `RegisterMeeting`.
+    #[test]
+    fn test_policy_bound_of_zero_is_rejected_loudly() {
+        for key in [
+            "MH_MAX_EGRESS_STREAMS_PER_MEETING",
+            "MH_MAX_CANDIDATE_SOURCES_PER_EGRESS",
+            "MH_MAX_TOTAL_EGRESS_EDGES",
+            "MH_POLICY_APPLY_TIMEOUT_MS",
+        ] {
+            let mut vars = base_vars();
+            vars.insert(key.to_string(), "0".to_string());
+            let err = Config::from_vars(&vars).unwrap_err();
+            assert!(
+                err.to_string().contains(key),
+                "the error must name the offending variable, got: {err}"
+            );
+        }
+    }
+
+    /// A value above the hard ceiling is rejected, not clamped.
+    ///
+    /// A `> 0` check alone lets a fat-fingered or copy-pasted figure silently
+    /// re-open the allocation surface the bound exists to close, and it would
+    /// read as configured-on-purpose forever. An operator can raise a bound;
+    /// they cannot raise it to an unbounded one. Clamping would be worse than
+    /// rejecting: the process would run under a bound nobody chose and never
+    /// learn about it.
+    #[test]
+    fn test_policy_bound_above_ceiling_is_rejected_not_clamped() {
+        let cases = [
+            (
+                "MH_MAX_EGRESS_STREAMS_PER_MEETING",
+                MAX_EGRESS_STREAMS_PER_MEETING_CEILING + 1,
+            ),
+            (
+                "MH_MAX_CANDIDATE_SOURCES_PER_EGRESS",
+                MAX_CANDIDATE_SOURCES_PER_EGRESS_CEILING + 1,
+            ),
+            (
+                "MH_MAX_TOTAL_EGRESS_EDGES",
+                MAX_TOTAL_EGRESS_EDGES_CEILING + 1,
+            ),
+        ];
+        for (key, value) in cases {
+            let mut vars = base_vars();
+            vars.insert(key.to_string(), value.to_string());
+            let err = Config::from_vars(&vars).unwrap_err();
+            assert!(err.to_string().contains(key), "got: {err}");
+        }
+
+        let mut vars = base_vars();
+        vars.insert(
+            "MH_POLICY_APPLY_TIMEOUT_MS".to_string(),
+            (MAX_POLICY_APPLY_TIMEOUT_MS + 1).to_string(),
+        );
+        let err = Config::from_vars(&vars).unwrap_err();
+        assert!(err.to_string().contains("MH_POLICY_APPLY_TIMEOUT_MS"));
+    }
+
+    /// A non-numeric value fails fast rather than silently reverting.
+    ///
+    /// Unlike the pre-existing scalars, which `parse().ok()` back to their
+    /// default, a bound that quietly reverts is a bound nobody can rely on —
+    /// and the whole point of these four is that exceeding them is a loud
+    /// event.
+    #[test]
+    fn test_unparseable_policy_bound_is_rejected_rather_than_defaulted() {
+        let mut vars = base_vars();
+        vars.insert("MH_MAX_TOTAL_EGRESS_EDGES".to_string(), "lots".to_string());
+        let err = Config::from_vars(&vars).unwrap_err();
+        assert!(err.to_string().contains("MH_MAX_TOTAL_EGRESS_EDGES"));
+    }
+
+    /// The apply timeout's ceiling is tied to ADR-0036 §8's re-assert cadence.
+    ///
+    /// Above ~10s the await outlives the interval that would have retried it,
+    /// so a longer value cannot help and can only pile up in-flight calls.
+    #[test]
+    fn test_policy_apply_timeout_ceiling_matches_the_reassert_cadence() {
+        assert_eq!(
+            MAX_POLICY_APPLY_TIMEOUT_MS, 10_000,
+            "ADR-0036 §8 bounds the re-assert cadence at 10s; a longer apply await outlives the retry that would supersede it"
         );
     }
 

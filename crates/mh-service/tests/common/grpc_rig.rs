@@ -42,7 +42,12 @@ impl GrpcRig {
         let cancel_token_clone = cancel_token.clone();
 
         let auth_layer = MhAuthLayer::new(jwks_client, 300);
-        let mh_media_service = MhMediaService::new(session_manager.clone());
+        let mh_media_service = MhMediaService::new(
+            session_manager.clone(),
+            "mh-test-handler".to_string(),
+            mh_service::process::sample_process_start_epoch_ms(),
+            mh_service::config::PolicyLimits::default(),
+        );
 
         let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
 

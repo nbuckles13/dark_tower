@@ -217,13 +217,21 @@ All dashboard JSON files are stored in `infra/grafana/dashboards/` and auto-load
 **Status**: ✅ Exists
 **File**: `infra/grafana/dashboards/mh-overview.json`
 
-**Panels**:
-- Packet forwarding rate
-- Audio forwarding latency — SLO target and measurement point per `slos.md` (authoritative; do not
-  restate a threshold here)
-- Video forwarding latency
-- Packet loss rate
-- Codec usage distribution
+**Panels**: see `infra/grafana/dashboards/mh-overview.json` — the JSON is the list.
+
+> **This section used to enumerate five panels and all five were fiction.** None of "Packet
+> forwarding rate", "Audio forwarding latency", "Video forwarding latency", "Packet loss rate" or
+> "Codec usage distribution" existed in the file, which carried 23 entirely different panels at the
+> time — those five were an aspiration for the media path that has not landed. A hand-maintained
+> copy of a panel list drifts silently, because nothing fails when the JSON changes and this list
+> does not; the same defect was removed from `crates/mh-service/src/observability/mod.rs` in the
+> same devloop, and the remedy there and here is a pointer rather than a corrected copy. Aspirational
+> panels belong in the story that will build them, not in a list a reader will take for present tense.
+> **§AC Overview has the identical defect** (6 aspirational bullets against 31 real panels) and is
+> tracked in `docs/TODO.md` §Observability Debt.
+
+**SLO-bearing panels**: SLO targets and measurement points live in `slos.md`, which is
+authoritative — do not restate a threshold here.
 
 > **Jitter panel removed.** The MH audio-jitter objective is **struck as unmeasurable** — MH forwards
 > and does not buffer, and perceived jitter is a client-side jitter-buffer property (ADR-0011

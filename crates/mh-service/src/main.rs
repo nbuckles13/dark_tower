@@ -45,6 +45,12 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 /// Default timeout for initial token acquisition.
 const TOKEN_ACQUISITION_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Maximum accepted encoded size of an inbound MC→MH gRPC message.
+///
+/// 4 MiB, matching tonic's own default — stated rather than inherited. See the
+/// call site for why this is the outermost bound on the control plane.
+const MAX_GRPC_DECODING_BYTES: usize = 4 * 1024 * 1024;
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Load configuration BEFORE the tracing subscriber: the R-55 OTel layer
@@ -106,6 +112,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_streams = config.max_streams,
         max_connections = config.max_connections,
         register_meeting_timeout_seconds = config.register_meeting_timeout_seconds,
+        // ADR-0036 §8 policy bounds. Logged because all four are
+        // optional-with-default: without this line an operator cannot tell a
+        // deliberately-configured value from a default nobody chose, which is
+        // the failure mode `MH_MAX_CONNECTIONS`'s 10,000 default already had.
+        max_egress_streams_per_meeting = config.policy_limits.max_egress_streams_per_meeting,
+        max_candidate_sources_per_egress = config.policy_limits.max_candidate_sources_per_egress,
+        max_total_egress_edges = config.policy_limits.max_total_egress_edges,
+        policy_apply_timeout_ms = config.policy_limits.policy_apply_timeout_ms,
         "Configuration loaded successfully"
     );
 
@@ -233,7 +247,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         format!("Invalid gRPC bind address: {e}")
     })?;
 
-    let mh_media_service = MhMediaService::new(session_manager.clone());
+    // Sampled ONCE, here, and carried unchanged for the process's life
+    // (ADR-0036 §8 restart detection). Deliberately at the call site rather
+    // than behind a lazily-initialised static, so "once per process" is
+    // visible where the value is passed in: a per-call `now()` makes MC's
+    // restart detector fire constantly, and a pod-name or config derivation
+    // makes it never fire for the crash-restart it exists to catch.
+    let process_start_epoch_ms = mh_service::process::sample_process_start_epoch_ms();
+    let mh_media_service = MhMediaService::new(
+        session_manager.clone(),
+        config.handler_id.clone(),
+        process_start_epoch_ms,
+        config.policy_limits,
+    );
     let auth_layer = MhAuthLayer::new(Arc::clone(&jwks_client), 300);
 
     // R-56: extract inbound W3C trace context (traceparent/tracestate) from
@@ -251,8 +277,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let grpc_server = tonic::transport::Server::builder()
         .layer(SpanLayer)
         .layer(auth_layer)
-        .add_service(MediaHandlerServiceServer::with_interceptor(
-            mh_media_service,
+        .add_service(tonic::service::interceptor::InterceptedService::new(
+            // Explicit, not implicit. `RegisterMeetingRequest` grew two
+            // unbounded repeated fields with the ADR-0036 §8 reshape, so the
+            // decoder is the OUTERMOST allocation bound on this path — the
+            // per-meeting and per-egress bounds in `PolicyLimits` only apply
+            // once a message has already been decoded into memory. tonic's
+            // default happens to be 4 MiB; stating it means a future default
+            // change cannot silently widen MH's control-plane allocation
+            // surface.
+            //
+            // Built explicitly rather than via `with_interceptor` because the
+            // size limit belongs on the generated server, and
+            // `InterceptedService` does not forward it.
+            MediaHandlerServiceServer::new(mh_media_service)
+                .max_decoding_message_size(MAX_GRPC_DECODING_BYTES),
             common::observability::otel_grpc::server_interceptor(),
         ))
         .serve_with_shutdown(grpc_addr, async move {

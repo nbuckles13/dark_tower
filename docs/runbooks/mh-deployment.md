@@ -70,6 +70,26 @@ sum(rate(mh_jwt_validations_total[5m]))
 # RegisterMeeting timeouts in the bake window (target: 0)
 sum(increase(mh_register_meeting_timeouts_total[30m]))
 
+# Forwarding-policy apply failures in the bake window (target: 0).
+#
+# RegisterMeeting SUCCEEDING DOES NOT MEAN POLICY APPLIED. The RPC answers
+# `accepted: true` and records mh_grpc_requests_total{status="success"} on
+# apply_failed, rejected_stale and rejected_invalid alike — correct RPC
+# semantics, but it means every other RegisterMeeting gate in this file is
+# blind to a build that refuses all policy. See mh-incident-response.md
+# Scenario 13.
+#
+# Cumulative-zero, same shape and justification as the timeout counter above:
+# no rate threshold is invented here (a useful rate depends on MC's re-assert
+# cadence, which lands at story task 13, and alerting is task 21's scope), and
+# zero is unambiguously correct for all three values in either era.
+#
+# `no_generation` is DELIBERATELY EXCLUDED: it is the expected steady state for
+# the whole task-11 -> task-13 window, so including it would fail every deploy
+# until MC starts emitting policy_generation >= 1. The gate stays valid
+# unchanged when the shape inverts at task 13.
+sum(increase(mh_media_policy_applies_total{outcome=~"apply_failed|rejected_invalid|rejected_stale"}[30m]))
+
 # MC RegisterMeeting RPC success rate (target: >95%, R-36 §operations)
 sum(rate(mc_register_meeting_total{status="success"}[5m]))
 /
@@ -107,6 +127,7 @@ clamp_min(sum(increase(mc_participant_mh_status_total{state=~"connected|failed"}
 - [ ] `mh_webtransport_connections_total{status="accepted"}` rate / total >95% (handshake success SLO from R-36)
 - [ ] `mh_jwt_validations_total{result="success"}` rate / total >99% (JWT success SLO from R-36)
 - [ ] `mh_register_meeting_timeouts_total` increase over 30m = 0 (healthy MC→MH coordination)
+- [ ] `mh_media_policy_applies_total{outcome=~"apply_failed|rejected_invalid|rejected_stale"}` increase over 30m = 0 (forwarding policy actually took effect — **receipt is not application**; the `mc_register_meeting_total` gate below cannot see this). `no_generation` is excluded and is the expected value until story task 13.
 - [ ] `mc_register_meeting_total{status="success"}` rate / total >95% (MC RegisterMeeting RPC SLO; emitter labels are `success|error`, see `crates/mc-service/src/observability/metrics.rs::record_register_meeting`)
 - [ ] `mh_mc_notifications_total{status="success"}` rate / total >95% (MH→MC delivery SLO)
 - [ ] `sum(mh_active_connections) > 0` once test traffic is flowing (proof clients are connecting)
@@ -119,6 +140,7 @@ clamp_min(sum(increase(mc_participant_mh_status_total{state=~"connected|failed"}
 - [ ] WebTransport handshake success rate trend stable (no downward drift toward 95%)
 - [ ] JWT validation success rate trend stable (no downward drift toward 99%)
 - [ ] `mh_register_meeting_timeouts_total` increase over the last 2 hours = 0
+- [ ] `mh_media_policy_applies_total{outcome=~"apply_failed|rejected_invalid|rejected_stale"}` increase over the last 2 hours = 0
 - [ ] `mc_participant_mh_status_total` failed-share still < 0.20 over 2h (no upward drift toward the 0.80 `MCMediaConnectionAllFailed` paging line)
 - [ ] No mh-service or mc-service pod restarts since deploy completed (`kubectl get pods -n dark-tower -l app=mh-service` — `RESTARTS` column should match pre-deploy baseline)
 - [ ] Logs show no repeated error patterns related to WebTransport, JWT, or RegisterMeeting (cross-reference `mh-incident-response.md` Scenarios 2, 5, 10 if anything looks off)
@@ -138,6 +160,7 @@ sum(rate(mh_jwt_validations_total[5m]))
 
 # Cumulative-zero counters use the per-window increase
 sum(increase(mh_register_meeting_timeouts_total[2h]))
+sum(increase(mh_media_policy_applies_total{outcome=~"apply_failed|rejected_invalid|rejected_stale"}[2h]))
 
 # Client-reported media-connection failed share over 2h (R-60; gate < 0.20).
 # Same shape as the 30-min canonical query, window widened to [2h].
@@ -168,8 +191,13 @@ histogram_quantile(0.95,
 This is the long-tail window where slow leaks show up — JWKS cache eviction interacting with token rotation, MC↔MH connection-pool drift, gradual handshake-latency creep under sustained load. The 24-hour cadence is required by R-36 (the join-flow post-deploy precedent goes 15-min/1-hour/4-hour; this checklist extends to 24-hour because QUIC connection state is more long-lived than the join handshake).
 
 ```promql
-# Cumulative coordination-failure counts since deploy (target: 0)
+# Cumulative coordination-failure counts since deploy (target: 0).
+# The policy-apply arm matters most at this tier: the aggregate egress-edge
+# bound is consumed by finished meetings over uptime, so `apply_failed` from
+# that cause surfaces at the 24-hour window rather than at 30 minutes
+# (mh-incident-response.md Scenario 13).
 sum(increase(mh_register_meeting_timeouts_total[24h]))
+sum(increase(mh_media_policy_applies_total{outcome=~"apply_failed|rejected_invalid|rejected_stale"}[24h]))
 
 # Client-reported media-connection failed share over 24h (R-60; gate < 0.20).
 sum(increase(mc_participant_mh_status_total{state="failed"}[24h]))

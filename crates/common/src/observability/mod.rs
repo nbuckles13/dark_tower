@@ -3,6 +3,9 @@
 //! This module hosts cross-service observability primitives that must not
 //! live inside a single service crate:
 //!
+//! - [`labels`] — metric/log label vocabulary emitted by more than one
+//!   service, so a label key's spelling and its permitted value set have one
+//!   home rather than one per emitter.
 //! - [`otel`] — OpenTelemetry SDK init helper (R-54). Each service calls
 //!   `init_otel` from its `main.rs` to wire OTLP-gRPC export, the W3C
 //!   trace-context propagator, sampling, and resource attributes.
@@ -18,6 +21,7 @@
 //!   production builds of consumer services do not pull in `metrics-util`
 //!   or the `metrics` facade through this crate.
 
+pub mod labels;
 pub mod otel;
 pub mod otel_grpc;
 pub mod otel_http;

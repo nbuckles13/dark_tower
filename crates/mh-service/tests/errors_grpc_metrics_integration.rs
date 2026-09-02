@@ -11,10 +11,12 @@
 //! bash predecessor's single-line regex missed the multi-line `counter!(...)`
 //! emission shape; the Rust port matches across lines).
 //!
-//! Bounded label values per `observability/metrics.rs` docstrings:
+//! Bounded label values per `docs/observability/metrics/mh-service.md`:
 //!
-//! - `mh_grpc_requests_total`: `method` ∈ {register, register_meeting,
-//!   route_media, stream_telemetry}, `status` ∈ {success, error}.
+//! - `mh_grpc_requests_total`: `method` is **single-valued** —
+//!   `register_meeting` is the only RPC on `MediaHandlerService`, because
+//!   ADR-0036 §8 makes meeting registration the control plane and it gains
+//!   fields rather than sibling RPCs. `status` ∈ {success, error}.
 //! - `mh_errors_total`: `operation` is a stable identifier from the call site
 //!   (e.g. `register_meeting`, `mc_notify`), `error_type` is from
 //!   `MhError`-variant naming, `status_code` is the HTTP/gRPC status int.
@@ -29,7 +31,7 @@ use mh_service::observability::metrics::{record_error, record_grpc_request};
 #[test]
 fn record_grpc_request_emits_grpc_requests_counter() {
     let snap = MetricAssertion::snapshot();
-    record_grpc_request("register_meeting", "success");
+    record_grpc_request("success");
     snap.counter("mh_grpc_requests_total")
         .with_labels(&[("method", "register_meeting"), ("status", "success")])
         .assert_delta(1);
@@ -38,43 +40,46 @@ fn record_grpc_request_emits_grpc_requests_counter() {
 #[test]
 fn record_grpc_request_emits_separate_series_per_status() {
     let snap = MetricAssertion::snapshot();
-    record_grpc_request("route_media", "error");
+    record_grpc_request("error");
     snap.counter("mh_grpc_requests_total")
-        .with_labels(&[("method", "route_media"), ("status", "error")])
+        .with_labels(&[("method", "register_meeting"), ("status", "error")])
         .assert_delta(1);
-    // Adjacency: success counter for the same method NOT incremented.
+    // Adjacency: the success counter for the same method is NOT incremented.
+    // Preserved from the pre-collapse matrix — the `status` dimension is still
+    // two-valued, and a swapped-label bug there is still possible.
     snap.counter("mh_grpc_requests_total")
-        .with_labels(&[("method", "route_media"), ("status", "success")])
+        .with_labels(&[("method", "register_meeting"), ("status", "success")])
         .assert_delta(0);
 }
 
-/// Matrix over the 4 bounded methods × 2 bounded statuses documented at
-/// `metrics.rs:134`. Verifies the per-method × per-status series are
-/// independent (label-swap-bug catcher). Mirrors
-/// `mc_notifications_metric_integration.rs::record_mc_notification_distinguishes_all_four_combinations`.
+/// The `method` label VALUE is asserted explicitly, not just carried along.
+///
+/// Dropping the `method` parameter made a second value impossible to introduce
+/// from a call site, which is the point — but it moved the one remaining
+/// method-label bug into the emitter: a typo in the
+/// `GRPC_METHOD_REGISTER_MEETING` const. That is invisible to a test which only
+/// asserts "some method label was emitted", and it would silently blank the
+/// runbook queries and dashboard panels that select
+/// `method="register_meeting"` (an unmatched label yields an empty series, not
+/// an error). This assertion is what catches it.
 #[test]
-fn record_grpc_request_distinguishes_all_combinations() {
+fn record_grpc_request_emits_the_single_bounded_method_value() {
     let snap = MetricAssertion::snapshot();
-    for method in [
-        "register",
-        "register_meeting",
-        "route_media",
-        "stream_telemetry",
-    ] {
-        for status in ["success", "error"] {
-            record_grpc_request(method, status);
-        }
+    record_grpc_request("success");
+    record_grpc_request("error");
+    for status in ["success", "error"] {
+        snap.counter("mh_grpc_requests_total")
+            .with_labels(&[("method", "register_meeting"), ("status", status)])
+            .assert_delta(1);
     }
-    for method in [
-        "register",
-        "register_meeting",
-        "route_media",
-        "stream_telemetry",
-    ] {
+    // The three values retired by the 2026-09-01 `internal.proto` reshape can
+    // never be emitted again — the proto's tombstone block forbids resurrecting
+    // the RPC names, so these series must stay dead.
+    for retired in ["register", "route_media", "stream_telemetry"] {
         for status in ["success", "error"] {
             snap.counter("mh_grpc_requests_total")
-                .with_labels(&[("method", method), ("status", status)])
-                .assert_delta(1);
+                .with_labels(&[("method", retired), ("status", status)])
+                .assert_delta(0);
         }
     }
 }

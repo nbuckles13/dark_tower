@@ -68,7 +68,8 @@ case future drift emerges from new services or metric additions.
 |---|---|---|
 | `service_type` | Which service is emitting / being called | `ac-service`, `gc-service`, `mc-service`, `mh-service` (or short forms `ac`/`gc`/`mc`/`mh`) |
 | `method` | RPC or HTTP method | HTTP verbs (`GET`, `POST`, ...) or gRPC method names (bounded by `.proto`) |
-| `status` | Coarse outcome classification | `success`, `error`, `timeout`, `rejected`, `accepted` |
+| `status` | Coarse outcome classification, compared **across** services | `success`, `error`, `timeout`, `rejected`, `accepted` |
+| `outcome` | Fine-grained result of a single operation, where **each value names a distinct remedy** | Closed enum **per metric**, defined in that metric's catalog entry — deliberately not enumerated here |
 | `status_code` | Raw HTTP status code | 200-599, bounded (~60 distinct) |
 | `endpoint` | Semantic HTTP path (normalized) | Bounded by `normalize_endpoint()` table |
 | `operation` | Subsystem-specific verb | Bounded by code (e.g., `select`, `insert`, `update`, `delete`) |
@@ -79,6 +80,21 @@ case future drift emerges from new services or metric additions.
 | `pod` | Kubernetes pod identifier | Per-pod — cardinality bounded by fleet size |
 | `key_custody` | Who holds media key material | **`operator` — single permitted value.** See §Key custody below. |
 | `reason` | Why a **frame** was dropped on the media path | Bounded by `proto/test-vectors/frame-v2.vectors.json` → `reject_reasons`. **Points, never restates** — restating the tokens here would give each one two homes and they would drift. Distinct from `error_type` / `error_category`, which classify why a **service operation** failed: `reason` is per-frame and lives entirely on the media path. See §Frame reject reason below. |
+
+**`status` vs `outcome`.** Use `status` when the values are the coarse, shared
+set above and a responder compares them across services. Use `outcome` when the
+value set is *metric-local* and each value points at a different fix — the
+per-metric enum then lives in that metric's catalog entry, which is where a
+responder reading the series is already looking. Borrowing `status` for a
+divergent value set is what this section exists to prevent, since the whole
+point of a canonical name is that one selector means one thing fleet-wide.
+
+`outcome` is recorded here as an **existing** convention rather than a new one:
+`ac_meeting_token_display_name_total`, `mc_join_display_name_resolved_total` and
+`mh_media_policy_applies_total` all emit it, and `internal.proto` names MC's
+counterpart of the last of those `outcome` too. The row was missing, which is
+the gap this section's own "add before the second service" rule is meant to
+close.
 
 ### Non-canonical aliases (flagged by reviewers, not the guard) `[reviewer-only]`
 
@@ -284,7 +300,13 @@ to pod-level to offer no real protection while sounding like a choice. Flagged f
 the carrier-list widening above: every delta from §11 in this file is stated, so a future reconciler
 can tell intentional from accidental.)*
 
-Aggregate distributions are safe. What is prohibited is resolution that reconstructs a *sequence*:
+Aggregate distributions are safe **only where they actually aggregate**, and that must be asserted of
+the *observable*, not of the label set: a metric partitioned no finer than `pod` still reconstructs a
+single stream's sequence whenever the pod carries one stream — which is not a corner case but the
+loopback shape this design ships with and a routine low-occupancy production state. So the rule is:
+**no per-frame time-ordered sequence for any single stream, including where per-stream isolation
+arises from low occupancy rather than from a label.** What is prohibited is resolution that
+reconstructs a *sequence*:
 per-frame size and timing for a single stream is **the voice-activity trace** — who spoke, in what
 order, for how long, and who interrupted whom — against ADR-0036 §11's stated adversary set: MH,
 whoever compromises MH, and a curious operator; **not** a network observer, since these fields sit
