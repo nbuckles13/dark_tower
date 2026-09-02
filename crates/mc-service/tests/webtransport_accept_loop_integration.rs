@@ -41,7 +41,7 @@ use proto_gen::dark_tower::signaling::v1::{client_message, ClientMessage, JoinRe
 use wtransport::{ClientConfig, Endpoint};
 
 use test_common::accept_loop_rig::AcceptLoopRig;
-use test_common::{build_test_stack, TestStackHandles};
+use test_common::{build_test_stack, sample_identity_public_key, TestStackHandles};
 
 // ---------------------------------------------------------------------------
 // Shared bring-up — thin wrapper around `build_test_stack` (in
@@ -119,7 +119,7 @@ async fn open_bi_send_join(
             // ADR-0036 §4: raw Ed25519 identity signing public key. Empty here —
             // this test exercises the join path, not attribution, and MC performs
             // no attestation check this story.
-            identity_public_key: Vec::new(),
+            identity_public_key: sample_identity_public_key(),
         })),
     };
     let encoded = msg.encode_to_vec();

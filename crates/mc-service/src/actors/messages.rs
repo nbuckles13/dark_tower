@@ -32,6 +32,15 @@ pub enum ControllerMessage {
         respond_to: oneshot::Sender<Result<(), McError>>,
     },
 
+    /// Create a meeting with a pre-seeded `sender_id` cursor.
+    /// **Test builds only** — the exhaustion-guard bypass.
+    #[cfg(feature = "test-seams")]
+    CreateMeetingWithSenderIdCursor {
+        meeting_id: String,
+        next_sender_id: Option<std::num::NonZeroU16>,
+        respond_to: oneshot::Sender<Result<(), McError>>,
+    },
+
     /// Get current status of all meetings (for health checks).
     GetStatus {
         /// Response channel for controller status.
@@ -47,6 +56,13 @@ pub enum ControllerMessage {
         connection_id: String,
         user_id: String,
         participant_id: String,
+        /// The joiner's Ed25519 identity signing public key, already parsed at
+        /// the WebTransport trust boundary. `None` means **no key published** —
+        /// a legitimate, contract-defined state, not a failure. Typed
+        /// `Option<IdentityPublicKey>` rather than `Vec<u8>` so a wrong-length
+        /// key is structurally unable to reach the meeting actor: parse, don't
+        /// validate.
+        identity_public_key: Option<crate::media_admission::IdentityPublicKey>,
         /// Registered display name from the validated meeting-token claim
         /// (already length-bounded at the connection trust boundary). Empty
         /// string means the claim carried no name → a generic label is used.
@@ -75,6 +91,8 @@ pub enum MeetingMessage {
         connection_id: String,
         user_id: String,
         participant_id: String,
+        /// See `ControllerMessage::JoinConnection::identity_public_key`.
+        identity_public_key: Option<crate::media_admission::IdentityPublicKey>,
         /// Registered display name from the validated meeting-token claim
         /// (already length-bounded at the connection trust boundary). Empty
         /// string means the claim carried no name → a generic label is used.
@@ -265,6 +283,20 @@ pub struct JoinResult {
     pub participants: Vec<ParticipantInfo>,
     /// Current fencing generation.
     pub fencing_generation: u64,
+    /// The joiner's own allocated sender id (ADR-0036 §2, §4).
+    pub sender_id: crate::media_admission::SenderId,
+    /// The meeting's current KEK.
+    ///
+    /// An `Arc` handle, not a copy: carrying this result through the join path
+    /// clones no key bytes. `MeetingKek`'s `Debug` redacts, so this struct's
+    /// derived `Debug` cannot print it.
+    ///
+    /// Not a claim that only one copy exists — `build_join_response` copies the
+    /// bytes out with `expose().to_vec()` for the one legitimate egress, and
+    /// that copy is not zeroized. See `MeetingKeyState::kek`.
+    pub meeting_kek: std::sync::Arc<crate::media_admission::MeetingKek>,
+    /// Generation of `meeting_kek`. Always 0 in this story — rotation deferred.
+    pub kek_generation: u16,
     /// Handle to the spawned ParticipantActor.
     pub participant_handle: ParticipantActorHandle,
 }
@@ -301,6 +333,22 @@ pub struct ParticipantInfo {
     pub video_server_muted: bool,
     /// Connection status.
     pub status: ParticipantStatus,
+    /// This participant's per-meeting sender id (ADR-0036 §2, §4).
+    pub sender_id: crate::media_admission::SenderId,
+    /// This participant's Ed25519 identity signing public key, as presented at
+    /// join and republished on the roster.
+    ///
+    /// `None` means **no key published** — a defined state the wire represents
+    /// as empty `bytes`, and one consumers MUST fail closed on (drop frames from
+    /// this participant; never fall back to accepting unsigned ones). A
+    /// wrong-length key is still structurally unrepresentable here: MC rejects
+    /// any length other than 0 or 32 at the trust boundary, so this is
+    /// `Option<[u8; 32]>` and never a variable-length blob.
+    ///
+    /// **Trust on first use.** No `cnf` thumbprint check binds a present key to
+    /// the meeting token, so a signature verifying against it proves only
+    /// same-keyholder consistency — never a verified identity (ADR-0036 §4).
+    pub identity_public_key: Option<crate::media_admission::IdentityPublicKey>,
 }
 
 /// Participant connection status.
@@ -561,6 +609,8 @@ mod tests {
             audio_server_muted: false,
             video_server_muted: false,
             status: ParticipantStatus::Connected,
+            sender_id: crate::media_admission::fixtures::sample_sender_id(),
+            identity_public_key: crate::media_admission::fixtures::sample_identity_key(),
         };
         let cloned = info.clone();
         assert_eq!(info.participant_id, cloned.participant_id);

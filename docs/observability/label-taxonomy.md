@@ -328,6 +328,17 @@ by default, and doing nothing is what ships the violation.
 
 - `meeting_id` appears in **no** guard vocabulary.
 - `meeting_id_hash` is **actively exempted** by `HASHED_SUFFIXES` → `is_hashed_label()`.
+- `sender_id_hash` is exempted by the same mechanism and is **not** covered by the Category B
+  `sender_id` entry — `is_hashed_label()` is tested *before* the Category B lookup in
+  `pii_token_hit`. **TRIGGER, not an inventory line**: that entry is sound today *only* because no
+  `sender_id_hash` exists and the realistic spelling is the plain one. **If a `sender_id_hash` is
+  ever proposed, that premise is void** — the entry becomes inert in the R1 sense, and the
+  hashed-exemption carve-out (tracked in `docs/TODO.md` §Observability Debt) must land before the
+  hashed spelling ships. The carve-out is deferred deliberately: `is_hashed_label` is a primitive
+  `metric_labels` reads for *every* Category B term, so changing it is guard machinery, not a
+  vocabulary edit.
+- `#[instrument]` span parameters are covered by **neither** entry: `instrument_skip_all` reads
+  Category A only. The span bar is `skip_all` discipline, reviewer-enforced.
 - The durable enforcement for the media-path half is by **shape, not vocabulary**: a directory-scoped
   deny of log and metric macros across the whole media path, which catches the offending *form*
   rather than a spelling. Word-boundary vocabulary matching cannot see inside compounds, so a
@@ -362,6 +373,7 @@ if you see a Category A flag, remove the label; do not rationalize it.
 | `private_key`, `privkey`, `signing_key` | Asymmetric key material. |
 | `jwt` | Full JWT string; label value would leak the credential. |
 | `auth_header`, `authorization` | `Authorization:` header contents. |
+| `meeting_kek`, `transmit_key` | ADR-0036 §4 media key material. Bare `kek` is deliberately **not** a token: `metric_labels`' single-word path splits on `_`, so it would false-positive on a plausible `kek_generation` label — which is metadata identifying *which* key, never key material. Classified into `NON_CREDENTIAL_TOKENS` for the retained-credential partition (a client is an *entitled* long-lived holder under §4), which does **not** weaken the log/label/span coverage. |
 
 **Category A allowlist** (narrow; co-owned with security):
 
@@ -388,6 +400,7 @@ documented false positives.
 | `phone`, `phone_number` | Direct personal identifier. |
 | `display_name` | User-chosen identifier; often correlates to real name. |
 | `user_id` (raw) | Stable cross-session identifier. Hashed form (`user_id_hash`) is allowed. |
+| `sender_id` | ADR-0036 §2/§4 per-meeting media sender handle. Restores coverage the deleted proto `user_id` field provided incidentally. **Not the inert case R1 warns about** — see §Enforcement reality: for `meeting_id` the realistic spelling is the hashed one, so a plain entry is defeated on arrival; for `sender_id` the realistic spelling is the *plain* one, because nothing in the tree hashes a sender id. Inverse of that case, not an instance of it. |
 | `username`, `nickname`, `handle` | Account identifiers. |
 | `name` | Too broad to assume safe; `hostname` / `filename` allowlisted by specific exception. |
 | `address`, `postal_code`, `zip`, `zipcode` | Location PII. |

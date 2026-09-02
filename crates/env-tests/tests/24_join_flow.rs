@@ -22,6 +22,7 @@ use bytes::{BufMut, BytesMut};
 use env_tests::cluster::ClusterConnection;
 use env_tests::fixtures::auth_client::{TokenRequest, UserRegistrationRequest};
 use env_tests::fixtures::gc_client::{CreateMeetingRequest, GcClient, GcClientError};
+use env_tests::fixtures::media::sample_identity_public_key;
 use env_tests::fixtures::AuthClient;
 use prost::Message;
 use proto_gen::dark_tower::signaling::v1::{
@@ -175,10 +176,10 @@ async fn send_join_and_read_response(
             capabilities: None,
             correlation_id: String::new(),
             binding_token: String::new(),
-            // ADR-0036 §4: raw Ed25519 identity signing public key. Empty here —
-            // this test exercises the join path, not attribution, and MC performs
-            // no attestation check this story.
-            identity_public_key: Vec::new(),
+            // ADR-0036 §4: raw Ed25519 identity signing public key. A valid
+            // 32-byte fixture — this test exercises the join path, not
+            // attribution, and MC performs no attestation check this story.
+            identity_public_key: sample_identity_public_key(),
         })),
         trace_parent: String::new(),
         trace_state: String::new(),
@@ -745,10 +746,10 @@ async fn test_second_participant_receives_join_notification() {
             capabilities: None,
             correlation_id: String::new(),
             binding_token: String::new(),
-            // ADR-0036 §4: raw Ed25519 identity signing public key. Empty here —
-            // this test exercises the join path, not attribution, and MC performs
-            // no attestation check this story.
-            identity_public_key: Vec::new(),
+            // ADR-0036 §4: raw Ed25519 identity signing public key. A valid
+            // 32-byte fixture — this test exercises the join path, not
+            // attribution, and MC performs no attestation check this story.
+            identity_public_key: sample_identity_public_key(),
         })),
         trace_parent: String::new(),
         trace_state: String::new(),

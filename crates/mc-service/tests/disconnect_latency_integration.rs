@@ -50,6 +50,18 @@ use proto_gen::dark_tower::signaling::v1::{self, server_message, ServerMessage};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+/// A syntactically valid identity key. MC checks length only; passing it
+/// asserts nothing about identity (trust on first use — same-keyholder
+/// consistency, never a verified identity).
+fn test_identity_key() -> Option<mc_service::media_admission::IdentityPublicKey> {
+    Some(
+        mc_service::media_admission::IdentityPublicKey::try_from_bytes(
+            &mc_test_utils::media::sample_identity_public_key(),
+        )
+        .expect("fixture key is exactly 32 bytes"),
+    )
+}
+
 fn spawn_meeting(meeting_id: &str) -> (MeetingActorHandle, tokio::task::JoinHandle<()>) {
     MeetingActor::spawn(
         meeting_id.to_string(),
@@ -58,6 +70,7 @@ fn spawn_meeting(meeting_id: &str) -> (MeetingActorHandle, tokio::task::JoinHand
         ControllerMetrics::new(),
         SecretBox::new(Box::new(vec![0u8; 32])),
     )
+    .expect("system CSPRNG must be available in tests")
 }
 
 /// Drain a wired participant's outbound stream and return the FIRST decoded
@@ -86,6 +99,7 @@ async fn clean_close_removes_immediately_emits_voluntary_and_broadcasts_left_fra
             "part-b".to_string(),
             String::new(),
             false,
+            test_identity_key(),
             Some(b_tx),
         )
         .await
@@ -98,6 +112,7 @@ async fn clean_close_removes_immediately_emits_voluntary_and_broadcasts_left_fra
             "part-a".to_string(),
             String::new(),
             false,
+            test_identity_key(),
             None,
         )
         .await
@@ -156,6 +171,7 @@ async fn abrupt_loss_keeps_grace_emits_connection_lost_then_timeout_left_after_g
             "part-b".to_string(),
             String::new(),
             false,
+            test_identity_key(),
             Some(b_tx),
         )
         .await
@@ -167,6 +183,7 @@ async fn abrupt_loss_keeps_grace_emits_connection_lost_then_timeout_left_after_g
             "part-a".to_string(),
             String::new(),
             false,
+            test_identity_key(),
             None,
         )
         .await

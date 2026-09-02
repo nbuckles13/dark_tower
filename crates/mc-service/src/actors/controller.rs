@@ -105,6 +105,35 @@ impl MeetingControllerActorHandle {
             .map_err(|e| McError::Internal(format!("response receive failed: {e}")))?
     }
 
+    /// Create a meeting whose `sender_id` allocator is pre-seeded.
+    /// **Test builds only** — see
+    /// [`MeetingActor::spawn_with_sender_id_cursor`]. Compiled only under the
+    /// non-default `test-seams` feature; a release build with it on fails to
+    /// compile.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::create_meeting`].
+    #[cfg(feature = "test-seams")]
+    pub async fn create_meeting_with_sender_id_cursor(
+        &self,
+        meeting_id: String,
+        next_sender_id: Option<std::num::NonZeroU16>,
+    ) -> Result<(), McError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.sender
+            .send(ControllerMessage::CreateMeetingWithSenderIdCursor {
+                meeting_id,
+                next_sender_id,
+                respond_to: tx,
+            })
+            .await
+            .map_err(|e| McError::Internal(format!("channel send failed: {e}")))?;
+
+        rx.await
+            .map_err(|e| McError::Internal(format!("response receive failed: {e}")))?
+    }
+
     /// Get information about an existing meeting.
     pub async fn get_meeting(&self, meeting_id: String) -> Result<MeetingInfo, McError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -136,6 +165,7 @@ impl MeetingControllerActorHandle {
         participant_id: String,
         display_name: String,
         is_host: bool,
+        identity_public_key: Option<crate::media_admission::IdentityPublicKey>,
         stream_tx: tokio::sync::mpsc::Sender<bytes::Bytes>,
     ) -> Result<tokio::sync::oneshot::Receiver<Result<JoinResult, McError>>, McError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -147,6 +177,7 @@ impl MeetingControllerActorHandle {
                 participant_id,
                 display_name,
                 is_host,
+                identity_public_key,
                 stream_tx,
                 respond_to: tx,
             })
@@ -360,6 +391,18 @@ impl MeetingControllerActor {
                 let _ = respond_to.send(result);
             }
 
+            #[cfg(feature = "test-seams")]
+            ControllerMessage::CreateMeetingWithSenderIdCursor {
+                meeting_id,
+                next_sender_id,
+                respond_to,
+            } => {
+                let result = self
+                    .create_meeting_with_sender_id_cursor(meeting_id, next_sender_id)
+                    .await;
+                let _ = respond_to.send(result);
+            }
+
             ControllerMessage::GetMeeting {
                 meeting_id,
                 respond_to,
@@ -375,6 +418,7 @@ impl MeetingControllerActor {
                 participant_id,
                 display_name,
                 is_host,
+                identity_public_key,
                 stream_tx,
                 respond_to,
             } => {
@@ -389,6 +433,7 @@ impl MeetingControllerActor {
                                     participant_id,
                                     display_name,
                                     is_host,
+                                    identity_public_key,
                                     Some(stream_tx),
                                 )
                                 .await;
@@ -426,6 +471,39 @@ impl MeetingControllerActor {
 
     /// Create a new meeting actor.
     async fn create_meeting(&mut self, meeting_id: String) -> Result<(), McError> {
+        self.create_meeting_inner(meeting_id, None).await
+    }
+
+    /// Test-only entry point threading a pre-seeded `sender_id` cursor.
+    #[cfg(feature = "test-seams")]
+    async fn create_meeting_with_sender_id_cursor(
+        &mut self,
+        meeting_id: String,
+        next_sender_id: Option<std::num::NonZeroU16>,
+    ) -> Result<(), McError> {
+        self.create_meeting_inner(meeting_id, Some(next_sender_id))
+            .await
+    }
+
+    /// Shared body. `sender_id_cursor` is `None` in production, meaning "a
+    /// fresh allocator"; the test seam supplies `Some(cursor)`.
+    ///
+    /// One body rather than two so the exhaustion test drives the real creation
+    /// path — a forked copy would drift and the test would stop testing
+    /// production behaviour.
+    async fn create_meeting_inner(
+        &mut self,
+        meeting_id: String,
+        #[cfg_attr(
+            not(feature = "test-seams"),
+            expect(
+                unused_variables,
+                reason = "the pre-seeded sender_id cursor only exists under `test-seams`; the \
+                      parameter stays so production and test share one construction body"
+            )
+        )]
+        sender_id_cursor: Option<Option<std::num::NonZeroU16>>,
+    ) -> Result<(), McError> {
         // Check if we're accepting new meetings
         if !self.accepting_new {
             return Err(McError::Draining);
@@ -449,13 +527,35 @@ impl MeetingControllerActor {
         // Create the meeting actor (with master_secret for session binding tokens)
         // Create a new SecretBox from the exposed secret bytes for each meeting
         let meeting_secret = SecretBox::new(Box::new(self.master_secret.expose_secret().clone()));
+        // Fails closed if the system CSPRNG cannot produce the meeting KEK
+        // (ADR-0036 §4): no meeting is created rather than one with predictable
+        // or absent key material.
+        #[cfg(feature = "test-seams")]
+        let (handle, task_handle) = match sender_id_cursor {
+            Some(cursor) => MeetingActor::spawn_with_sender_id_cursor(
+                meeting_id.clone(),
+                meeting_token,
+                Arc::clone(&self.metrics),
+                Arc::clone(&self.controller_metrics),
+                meeting_secret,
+                cursor,
+            )?,
+            None => MeetingActor::spawn(
+                meeting_id.clone(),
+                meeting_token,
+                Arc::clone(&self.metrics),
+                Arc::clone(&self.controller_metrics),
+                meeting_secret,
+            )?,
+        };
+        #[cfg(not(feature = "test-seams"))]
         let (handle, task_handle) = MeetingActor::spawn(
             meeting_id.clone(),
             meeting_token,
             Arc::clone(&self.metrics),
             Arc::clone(&self.controller_metrics),
             meeting_secret,
-        );
+        )?;
 
         let created_at = chrono::Utc::now().timestamp();
 

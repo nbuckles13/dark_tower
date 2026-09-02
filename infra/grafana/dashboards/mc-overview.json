@@ -2982,12 +2982,291 @@
       "type": "timeseries"
     },
     {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "Whether joiners reaching the join call published an Ed25519 identity signing key (ADR-0036 Sec 4). Counts join attempts that passed identity-key validation, not admissions, so it does not sum to successful joins. MC ADMITS participants that publish no key - empty is a defined 'no key published' state, not a failure - so watch the absent ratio: absent/(absent+present). Malformed keys are NOT here; they are refused at the boundary and appear on mc_session_join_failures_total{error_type=identity_key_invalid}. This does not show whether consumers fail closed on keyless participants - that obligation is client-side.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 105
+      },
+      "id": 53,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by(presence) (increase(mc_join_identity_key_presence_total[$__rate_interval]))",
+          "legendFormat": "{{presence}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Identity Key Presence",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "Meeting key-encryption keys generated (ADR-0036 Sec 4), one per meeting-actor creation. Carries key_custody=operator: media is encrypted between clients; MH, transport and storage cannot read it; MC can. That is accepted operator custody, NOT end-to-end and NOT zero-trust. This is KEK issuance rate only. It is NOT a missing-key-material signal: it increments unconditionally, so it is identically the meeting-creation count and cannot move differently in the failure case. Do not alert on its absence.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 105
+      },
+      "id": 52,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by(key_custody) (increase(mc_meeting_kek_generated_total[$__rate_interval]))",
+          "legendFormat": "{{key_custody}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Meeting KEK Issuance",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "Outcome of every AssignMeetingWithMh RPC - MC's only meeting-admission entry point from GC. Mirrors GC's gc_mc_assignments_total{status,rejection_reason} so the two ends of the RPC can be read side by side - the success arm is status=success (GC's spelling, not 'accepted'). One deliberate divergence: MC labels invalid_request status=rejected where GC uses status=error; the rejection_reason values match, which is what makes the join work: use this to attribute a GCMCAssignmentFailures page to an MC-side reason. NOTE rejection_reason=unhealthy conflates a Redis MH-assignment store failure with a create_meeting failure (which includes meeting-KEK generation); only the MC log record distinguishes them - see mc-incident-response.md Scenario 6 root cause 6.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 113
+      },
+      "id": 54,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by(status, rejection_reason) (increase(mc_meeting_assignments_total[$__rate_interval]))",
+          "legendFormat": "{{status}} / {{rejection_reason}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Meeting Assignment Outcomes",
+      "type": "timeseries"
+    },
+    {
       "collapsed": false,
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 105
+        "y": 121
       },
       "id": 41,
       "panels": [],
@@ -3069,7 +3348,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 106
+        "y": 122
       },
       "id": 42,
       "options": {
@@ -3185,7 +3464,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 106
+        "y": 122
       },
       "id": 43,
       "options": {
@@ -3300,7 +3579,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 114
+        "y": 130
       },
       "id": 44,
       "options": {
@@ -3397,7 +3676,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 122
+        "y": 138
       },
       "id": 46,
       "options": {
@@ -3490,7 +3769,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 130
+        "y": 146
       },
       "id": 47,
       "options": {
@@ -3583,7 +3862,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 130
+        "y": 146
       },
       "id": 48,
       "options": {
@@ -3676,7 +3955,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 138
+        "y": 154
       },
       "id": 49,
       "options": {
@@ -3769,7 +4048,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 138
+        "y": 154
       },
       "id": 50,
       "options": {
@@ -3862,7 +4141,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 146
+        "y": 162
       },
       "id": 51,
       "options": {

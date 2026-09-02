@@ -634,6 +634,26 @@ kubectl describe networkpolicy mc-service -n dark-tower
    - Check: DNS resolution from MC pod
    - Fix: Check CoreDNS, Infrastructure Team
 
+6. **MC is REFUSING assignments (not failing to receive them)**: the first five causes are all
+   GC-side or network-side, and all present as "assignments are not arriving". This one presents
+   identically from MC's symptom list but is MC-side: MC is receiving `AssignMeetingWithMh` and
+   answering `accepted: false`. **The pod stays Ready and Kubernetes does not restart it**, so it
+   will not look like a pod problem, and GC keeps offering meetings MC keeps refusing.
+   - Check, MC side first: **`mc_meeting_assignments_total{status="rejected",
+     rejection_reason="unhealthy"}`** — the "Meeting Assignment Outcomes" panel on the MC Overview
+     dashboard. GC's `gc_mc_assignments_total{status, rejection_reason}` is the other end of the
+     same RPC and uses the same label vocabulary, so read them side by side to confirm GC is seeing
+     what MC is emitting.
+   - Then **disambiguate with the log**, because `unhealthy` conflates the Redis MH-assignment store
+     failure with the `create_meeting` failure and only the log record separates them:
+     `kubectl logs -n dark-tower -l app=mc-service --tail=5000 | grep -E "Failed to create meeting actor|Failed to initialise meeting key material"`.
+   - `"Failed to initialise meeting key material"` means the system CSPRNG could not produce the
+     meeting KEK (ADR-0036 §4). MC fails closed and refuses the meeting rather than starting one
+     with absent or weak key material — that behaviour is correct and must not be "fixed".
+   - Fix: no in-place remedy. Restart the pod and escalate — a CSPRNG failure points at host entropy
+     or the kernel, not at MC. If the log shows a different `create_meeting` failure (e.g. the Redis
+     MH-assignment store), triage that instead; `UNHEALTHY` conflates them.
+
 **Remediation**:
 
 ```bash
@@ -854,6 +874,61 @@ Triage by the `error_type` label on `mc_session_join_failures_total`:
 9. **`internal`**: Unexpected internal error (stream failures, decode errors)
    - Check: MC logs for stack traces or error details
    - Fix: Investigate logs, may require code fix or rollback
+
+10. **`identity_key_invalid`**: The joiner presented an `identity_public_key` whose length was
+    neither 0 nor exactly 32 bytes (ADR-0036 §4). Covers every rejected length as one value
+    deliberately — the client-facing message is byte-identical across all of them, so this label is
+    the ONLY place the cause is visible.
+    - **A client that does NOT send the field cannot produce this label.** Length 0 is the
+      contract's NO KEY PUBLISHED state and is **admitted**; that population is counted on
+      `mc_join_identity_key_presence_total{presence="absent"}`, a separate series. Do not triage
+      this label as a client-rollout gap — if you are looking for "clients that have not implemented
+      the key yet", it is on the presence metric and it is not a failure.
+    - Check: the client sent *something* and got the **encoding** wrong — PEM, JWK, base64 or a
+      DER wrapper rather than the raw 32 bytes — or a genuinely wrong-length key. Correlate the
+      onset with a client release that changed key handling. A broad spike is an encoding
+      regression; a narrow one from a single source is worth a security look.
+    - Fix: roll the offending client build forward or back. There is no MC-side remedy and no
+      deploy-ordering lever — see `mc-deployment.md` §Coordination, which records that identity-key
+      handling adds no ordering constraint.
+    - **Not** remediable MC-side: MC publishes the key to every participant on the roster, so a
+      client-controlled blob of arbitrary length must never be admitted.
+
+11. **`sender_id_space_exhausted`**: The meeting consumed all 65535 per-meeting `sender_id`s and MC
+    refused the admission rather than wrapping onto a live id (invariant R-35).
+    - Check: `kubectl logs -n dark-tower -l app=mc-service --tail=5000 | grep "sender_id space exhausted"`
+      — **`--tail` is required**: with a label selector and no `--tail`, kubectl returns only the
+      last 10 lines per pod and this grep silently prints nothing. The JSON record carries
+      `meeting_id` (a span field under `fmt::layer().json()`, so it is in the record's span object,
+      not a top-level `meeting_id=` you can grep for), plus cumulative `admissions_total` and
+      `meeting_age_seconds`. An earlier one-shot `"sender_id namespace past high watermark"` record
+      for the same meeting tells you whether consumption was gradual or sudden. Neither carries key
+      material or a `sender_id` value.
+    - **The namespace is consumed by CUMULATIVE LIFETIME ADMISSIONS, not concurrent participants.**
+      Ids are never recycled, because reusing one under a live KEK collides two senders on one key
+      id — and since the wrap nonce derives from the key id, on one AES-GCM nonce. So
+      `MC_MAX_PARTICIPANTS` does **not** bound this: the exposure is a long-lived, high-churn
+      meeting, not a large one.
+    - Fix: **End the meeting and have participants rejoin a new one.** That is the only remediation,
+      and it is unattractive on purpose. There is no in-place lever: the KEK-epoch reset that would
+      reclaim the namespace is deferred with all KEK rotation, and a fresh meeting means a fresh
+      KEK and a fresh namespace. Do not attempt to "reset" the allocator — reissuing a live
+      `sender_id` is the exact collision the refusal exists to prevent.
+    - **Escalate if seen at all, and treat it as possibly DRIVEN until you have ruled that out.**
+      Two causes reach this state and they need different responses:
+      - *Deliberate.* Every join consumes one never-recycled id, MC has **no join rate limit and no
+        `jti` replay check** (neither is implemented — see `docs/TODO.md` §Media Path Obligations),
+        and the browser reconnect path is unwired so every reconnect is a fresh join. One valid
+        meeting token therefore permits unbounded joins until it expires. An authenticated
+        participant can burn the namespace **cheaply, quickly and permanently**, and the only
+        remedy is to destroy the meeting. The signature is the watermark record arriving *shortly*
+        before the exhaustion record — i.e. "sudden" — and a single `sub` accounting for the
+        admissions. Check the join rate per token and per source before assuming a bug.
+      - *Accidental.* A client reconnect loop creating fresh participants. **The "~18 hours of
+        continuous churn at one admission per second" figure describes THIS case only** — it is not
+        an estimate for the driven one, which is bounded by connection rate, not by human churn.
+      In both cases the meeting is permanently broken; the difference is whether you also need a
+      security response.
 
 **Remediation**:
 

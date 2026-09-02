@@ -222,6 +222,28 @@ impl McAssignmentService {
 /// request from being mislabelled `unhealthy` (a false sick-fleet signal that
 /// burns GC's retry budget). `McError::InvalidArgument` is constructed only at the
 /// two contract checks in `store_mh_assignments`, so the match is watertight.
+/// Stable metric-label spelling for a `RejectionReason`.
+///
+/// **Mirrors GC's vocabulary verbatim** (`gc-service/src/services/mc_assignment.rs`,
+/// the `last_rejection_reason` match): same snake_case spellings, so
+/// `mc_meeting_assignments_total` and `gc_mc_assignments_total` can be read side
+/// by side. Bounded by the proto enum, so cardinality is closed.
+///
+/// Note MC labels every non-accept `status="rejected"`, including
+/// `invalid_request`. GC maps that one to `status="error"` instead, because from
+/// GC's side it is a fault in GC's own request rather than a refusal of a
+/// healthy one. The `rejection_reason` values still match, which is what makes
+/// the join across the two series work.
+fn rejection_reason_label(reason: RejectionReason) -> &'static str {
+    match reason {
+        RejectionReason::AtCapacity => "at_capacity",
+        RejectionReason::Draining => "draining",
+        RejectionReason::Unhealthy => "unhealthy",
+        RejectionReason::InvalidRequest => "invalid_request",
+        RejectionReason::Unspecified => "unspecified",
+    }
+}
+
 fn rejection_for_store_error(e: &McError) -> RejectionReason {
     match e {
         McError::InvalidArgument(_) => RejectionReason::InvalidRequest,
@@ -263,6 +285,11 @@ impl MeetingControllerService for McAssignmentService {
                 "Rejecting meeting assignment"
             );
 
+            crate::observability::metrics::record_meeting_assignment(
+                "rejected",
+                Some(rejection_reason_label(reason)),
+            );
+
             return Ok(Response::new(AssignMeetingWithMhResponse {
                 accepted: false,
                 rejection_reason: reason.into(),
@@ -301,6 +328,11 @@ impl MeetingControllerService for McAssignmentService {
                 }
             }
 
+            crate::observability::metrics::record_meeting_assignment(
+                "rejected",
+                Some(rejection_reason_label(reason)),
+            );
+
             return Ok(Response::new(AssignMeetingWithMhResponse {
                 accepted: false,
                 rejection_reason: reason.into(),
@@ -324,6 +356,8 @@ impl MeetingControllerService for McAssignmentService {
                 // Increment meeting count
                 self.current_meetings.fetch_add(1, Ordering::SeqCst);
 
+                crate::observability::metrics::record_meeting_assignment("success", None);
+
                 Ok(Response::new(AssignMeetingWithMhResponse {
                     accepted: true,
                     rejection_reason: RejectionReason::Unspecified.into(),
@@ -339,6 +373,14 @@ impl MeetingControllerService for McAssignmentService {
 
                 // Clean up MH assignments
                 let _ = self.redis_client.delete_mh_assignment(meeting_id).await;
+
+                // `unhealthy` conflates this with the Redis-store path above.
+                // The log record immediately preceding is what distinguishes
+                // them; see mc-incident-response.md Scenario 6 root cause 6.
+                crate::observability::metrics::record_meeting_assignment(
+                    "rejected",
+                    Some(rejection_reason_label(RejectionReason::Unhealthy)),
+                );
 
                 Ok(Response::new(AssignMeetingWithMhResponse {
                     accepted: false,

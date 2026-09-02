@@ -87,6 +87,35 @@ pub enum McError {
     #[error("MH assignment missing: {0}")]
     MhAssignmentMissing(String),
 
+    /// A joiner presented an identity public key of a length that was neither
+    /// 0 nor exactly 32 bytes.
+    ///
+    /// **Absent does NOT produce this variant.** Length 0 is the contract's NO
+    /// KEY PUBLISHED state and is admitted, landing on
+    /// `mc_join_identity_key_presence_total{presence="absent"}` instead — so
+    /// this variant means a client sent *something* and got the encoding wrong
+    /// (PEM/JWK/base64 rather than the raw 32 bytes), never that a client has
+    /// not implemented the field.
+    ///
+    /// Carries NO detail — not the length, not which check failed, not the
+    /// bytes. Every rejected length produces this one variant, one client
+    /// message and one metric label, so nothing is an oracle for the rejection
+    /// cause (ADR-0036 §4).
+    #[error("Identity key rejected")]
+    IdentityKeyInvalid,
+
+    /// The meeting's 16-bit `sender_id` space is exhausted (invariant R-35).
+    ///
+    /// Fail closed: the admission is refused rather than wrapping onto a live
+    /// id. Distinct from `MeetingCapacityExceeded` so `mc-incident-response.md`
+    /// Scenario 8 can triage it — that runbook keys exclusively on
+    /// `error_type_label()`, and a shared value would route a responder to
+    /// "may require code fix or rollback" for a condition that is neither.
+    /// The client-facing message is deliberately IDENTICAL to
+    /// `MeetingCapacityExceeded`'s.
+    #[error("Sender id space exhausted")]
+    SenderIdSpaceExhausted,
+
     /// Internal error with context.
     #[error("Internal error: {0}")]
     Internal(String),
@@ -146,10 +175,12 @@ impl McError {
             McError::PermissionDenied(_) => 3,                           // FORBIDDEN
             McError::MeetingNotFound(_) | McError::ParticipantNotFound(_) => 4, // NOT_FOUND
             McError::Conflict(_) => 5,                                   // CONFLICT
+            McError::IdentityKeyInvalid => 1,                            // INVALID_REQUEST
             McError::MeetingCapacityExceeded(_)
             | McError::McCapacityExceeded
             | McError::Draining
-            | McError::Migrating { .. } => 7, // CAPACITY_EXCEEDED
+            | McError::Migrating { .. }
+            | McError::SenderIdSpaceExhausted => 7, // CAPACITY_EXCEEDED
         }
     }
 
@@ -193,6 +224,8 @@ impl McError {
             McError::Internal(_) => "internal",
             McError::TokenAcquisition(_) => "token_acquisition",
             McError::TokenAcquisitionTimeout => "token_acquisition_timeout",
+            McError::IdentityKeyInvalid => "identity_key_invalid",
+            McError::SenderIdSpaceExhausted => "sender_id_space_exhausted",
         }
     }
 
@@ -212,13 +245,22 @@ impl McError {
             McError::SessionBinding(e) => e.to_string(),
             McError::MeetingNotFound(_) => "Meeting not found".to_string(),
             McError::ParticipantNotFound(_) => "Participant not found".to_string(),
-            McError::MeetingCapacityExceeded(_) => "Meeting is at capacity".to_string(),
             McError::McCapacityExceeded => "Server is at capacity, please try again".to_string(),
             McError::Draining => "Server is shutting down, please reconnect".to_string(),
             McError::Migrating { .. } => "Meeting is being migrated, please reconnect".to_string(),
             McError::FencedOut(_) => "An internal error occurred".to_string(),
             McError::JwtValidation(_) => "Invalid or expired token".to_string(),
             McError::Conflict(msg) | McError::PermissionDenied(msg) => msg.clone(),
+            // Generic by construction: no length, no cause, nothing the caller
+            // could use to probe which validation failed.
+            McError::IdentityKeyInvalid => "Invalid join request".to_string(),
+            // Byte-identical BY CONSTRUCTION, not by convention: a client must
+            // not be able to distinguish namespace exhaustion from an ordinary
+            // capacity limit. One arm, so the two cannot drift apart — editing
+            // this string moves both, which is the point.
+            McError::MeetingCapacityExceeded(_) | McError::SenderIdSpaceExhausted => {
+                "Meeting is at capacity".to_string()
+            }
         }
     }
 }

@@ -211,6 +211,29 @@ groups:
           impact: "Some users unable to join meetings via WebTransport. Investigate join failure types in MC Overview dashboard."
           runbook_url: "docs/runbooks/mc-incident-response.md#scenario-8-join-failures"
 
+      # Absolute count, NOT a ratio, deliberately: a single meeting exhausting
+      # its 65535-id namespace cannot move the fleet-wide MCHighJoinFailureRate
+      # ratio above, so that rule is structurally blind to this condition. No
+      # threshold judgement is involved — any occurrence is one permanently
+      # broken meeting.
+      - alert: MCSenderIdSpaceExhausted
+        expr: |
+          increase(mc_session_join_failures_total{error_type="sender_id_space_exhausted"}[15m]) > 0
+        # 0m, matching MCActorPanic above (same absolute-count "any occurrence"
+        # shape): the 15m increase window already smooths, the condition cannot
+        # flap because it is permanent, and a `for:` delay would only postpone
+        # paging on an already-irreversible state.
+        for: 0m
+        labels:
+          severity: warning
+          service: mc-service
+          component: meeting-join
+        annotations:
+          summary: "MC refused a join: meeting sender_id space exhausted"
+          description: "A meeting consumed all 65535 per-meeting sender_ids and MC refused the admission rather than reusing a live id (invariant R-35). NOT SELF-CLEARING: that meeting has permanently stopped admitting participants and the only remediation is to end it and have participants rejoin a new one, so the underlying state persists whether or not this alert re-fires. Namespace use is cumulative lifetime admissions, not concurrent participants, so MC_MAX_PARTICIPANTS does not bound it. Identify the meeting from the MC log record 'sender_id space exhausted' and treat a sudden onset as possibly driven — see the runbook."
+          impact: "One meeting can admit no further participants, permanently. Existing participants are unaffected."
+          runbook_url: "docs/runbooks/mc-incident-response.md#scenario-8-join-failures"
+
       - alert: MCHighWebTransportRejections
         expr: |
           (

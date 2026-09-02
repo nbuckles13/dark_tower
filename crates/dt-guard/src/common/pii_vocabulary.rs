@@ -131,6 +131,34 @@ pub(crate) const PII_TOKENS_CATEGORY_A: &[&str] = &[
     // be correct for the segment consumer and wrong for all three word-boundary ones,
     // which is the mirror of the mistake this comment records.
     "accessToken",
+    // Wave-3 cohort — ADR-0036 media path (story task 10). @security + @observability
+    // sign-off 2026-09-02; classified into NON_CREDENTIAL_TOKENS below.
+    //
+    // FLOOR, NOT THE CONTROL. ADR-0036 §11: "Vocabulary additions cannot be cited as
+    // the protection… The directory-scoped deny catches by shape." A KEK read into a
+    // local named `bytes` or `material` matches nothing here and is still a leak. The
+    // control is the credential-leak semantic check (items 11-13); this is a backstop
+    // under it.
+    "meeting_kek",
+    "transmit_key",
+    // Bare `kek` is DELIBERATELY ABSENT, and not merely because it is redundant.
+    // Stated by matcher shape, per the `accessToken` precedent above:
+    //   * word-boundary matchers (`rust_log_secrets`, `instrument_skip_all`, `rust_pii`)
+    //     cannot reach `meeting_kek` or `kek_generation` via `\bkek\b` — `_` is a word
+    //     character — so a bare entry would be inert for them.
+    //   * `metric_labels` does NOT use word boundaries on its single-word path
+    //     (`metric_labels.rs:543-551`): it splits the label on `_` and tests set
+    //     membership, so `kek_generation` -> {kek, generation} -> Category A HIT.
+    // So a bare `kek` would be inert where you want it and a FALSE POSITIVE where you
+    // don't — firing on a plausible `kek_generation` label, which is metadata
+    // identifying WHICH key, never key material. Do not add it.
+    //
+    // KNOWN LIMIT, stated rather than assumed away: under word-boundary matching
+    // `\btransmit_key\b` does NOT match `wrapped_transmit_key` (a leading `_` is a word
+    // character, so there is no boundary). `metric_labels` covers it via its substring
+    // path; `rust_log_secrets` and `instrument_skip_all` do not. MC never holds a
+    // wrapped transmit key, so no entry is added for it here — but do not read this
+    // cohort as covering that spelling.
 ];
 
 /// Credential-shaped subset of [`PII_TOKENS_CATEGORY_A`] — "is this field name a
@@ -181,9 +209,30 @@ pub(crate) const SESSION_TOKENS: &[&str] = &[
 /// retained-credential question. Explicit rather than a fallthrough so a *forgotten*
 /// classification is distinguishable from a *deliberate* one.
 ///
-/// Empty today — every CATEGORY_A term classifies into one of the other two buckets.
-/// It exists so that the next term which fits neither has a declared home instead of
-/// silently widening one of them, and is consumed by `partition_is_total_over_category_a`.
+/// First inhabitants: `meeting_kek` and `transmit_key` (ADR-0036 §4). They are
+/// CATEGORY_A secrets for the log/label/span question, but the retained-credential
+/// question — "is this a secret whose holder should stop holding it?" — answers **no**:
+/// §4 makes a client an ENTITLED LONG-LIVED HOLDER that caches the KEK for the meeting
+/// and must retain the previous KEK across a rotation window. Filing them under
+/// [`CREDENTIAL_TOKENS`] would make `ts_retained_credentials` fire on SDK session state
+/// the ADR mandates, which gets "resolved" by an allowlist entry that silently kills
+/// the Rust-side coverage too.
+///
+/// **Membership here is inert at runtime.** The bucket is never passed as a `subset`
+/// to `matches_subset` (`ts_retained_credentials.rs:267`, `:271`), and `spellings()`
+/// (`:230-240`) iterates `CREDENTIAL_TOKENS.chain(SESSION_TOKENS)`, returning
+/// `Vec::new()` for a non-member — two independent routes to the same place. A future
+/// author who wires this bucket into a `matches_subset` call site therefore gets
+/// **silence, not coverage**: it compiles, runs, and matches nothing. Extending
+/// `spellings()` is required alongside any such wiring.
+///
+/// Its members remain full [`PII_TOKENS_CATEGORY_A`] members and are still read by
+/// `rust_log_secrets`, `instrument_skip_all` and `metric_labels` — this classification
+/// weakens nothing.
+///
+/// The bucket also exists so that the next term fitting neither of the other two has a
+/// declared home instead of silently widening one of them, and is consumed by
+/// `partition_is_total_over_category_a`.
 // Consumed only by `partition_is_total_over_category_a`, so it is dead in the
 // non-test build. `cfg_attr` rather than a bare `expect` because an unconditional
 // expect is itself unfulfilled under `cfg(test)`.
@@ -191,10 +240,10 @@ pub(crate) const SESSION_TOKENS: &[&str] = &[
     not(test),
     expect(
         dead_code,
-        reason = "deliberately-empty third bucket of a total partition; its existence is what forces a deliberate classification for a future CATEGORY_A term"
+        reason = "third bucket of a total partition, read only by the partition test; its existence is what forces a deliberate classification for a future CATEGORY_A term"
     )
 )]
-pub(crate) const NON_CREDENTIAL_TOKENS: &[&str] = &[];
+pub(crate) const NON_CREDENTIAL_TOKENS: &[&str] = &["meeting_kek", "transmit_key"];
 
 /// Alternate spellings for a CATEGORY_A term, matched by the **same segment-equality
 /// primitive** as every other term — deliberately NOT prefix matching.
@@ -236,6 +285,39 @@ pub(crate) const PII_TOKENS_CATEGORY_B: &[&str] = &[
     "phone_number",
     "display_name",
     "user_id",
+    // ADR-0036 §2/§4 (story task 10). Restores coverage the deleted proto `user_id`
+    // field provided incidentally: `sender_id` splits to {sender, id}, CATEGORY_B has
+    // no bare `id`, and no multi-word entry is a substring of it — so before this entry
+    // it matched nothing at all.
+    //
+    // B, not A: it is an identifier, not a secret. Filing it under A would drag it into
+    // the retained-credential partition and the TS consumer for no reason.
+    //
+    // WHY THIS IS NOT THE INERT CASE `label-taxonomy.md` R1 WARNS ABOUT. R1's argument
+    // turns on the word *realistic*: for `meeting_id` the realistic spelling IS the
+    // hashed one — the SDK already emits `meeting_id_hash`
+    // (`packages/sdk-core/src/session/MeetingSession.ts:279`,
+    // `packages/sdk-core/src/media/events.ts:44`) — so a plain entry is defeated on
+    // arrival. For `sender_id` the realistic spelling is the PLAIN one: nothing in the
+    // tree hashes a sender id, no `sender_id_hash` exists, and the accidental form is
+    // `"sender_id" => id.to_string()` in a label position. This entry bites the
+    // spelling that will actually be written. INVERSE of the `meeting_id` case, not an
+    // instance of it.
+    //
+    // Coverage BY MATCHER SHAPE, not as blanket protection:
+    //   * `metric_labels` covers it INCLUDING compounds — `token_hit_in_set`'s
+    //     multi-word substring pass catches `pinned_sender_id`. That is the
+    //     "never a metric label" bar.
+    //   * `rust_pii` covers `sender_id` and the `sender_id = %x` tracing-field shape,
+    //     but NOT `pinned_sender_id`: it builds `\b(alternation)\b` and `_` is a word
+    //     character.
+    //   * `sender_id_hash` is NOT covered — `is_hashed_label()` is tested BEFORE the
+    //     CATEGORY_B lookup in `pii_token_hit`. See `label-taxonomy.md`
+    //     §Enforcement reality, which carries the trigger: if a `sender_id_hash` is
+    //     ever proposed, this entry's premise is void.
+    //   * `#[instrument]` span params are NOT covered — `instrument_skip_all` reads
+    //     CATEGORY_A only. The span bar stays `skip_all` discipline.
+    "sender_id",
     "name",
     "username",
     "nickname",
@@ -307,6 +389,47 @@ mod tests {
                 "expected CATEGORY_A to contain {tok}"
             );
         }
+    }
+
+    #[test]
+    fn category_a_includes_wave3_additions() {
+        for tok in &["meeting_kek", "transmit_key"] {
+            assert!(
+                PII_TOKENS_CATEGORY_A.contains(tok),
+                "expected CATEGORY_A to contain {tok}"
+            );
+        }
+    }
+
+    #[test]
+    fn category_b_includes_wave3_additions() {
+        assert!(
+            PII_TOKENS_CATEGORY_B.contains(&"sender_id"),
+            "expected CATEGORY_B to contain sender_id"
+        );
+    }
+
+    /// The bucket went from empty to inhabited on 2026-09-02, and its members'
+    /// correctness argument is which partition they land in — so pin the
+    /// membership rather than leaving it to the totality assert alone.
+    #[test]
+    fn non_credential_tokens_has_expected_members() {
+        assert_eq!(
+            NON_CREDENTIAL_TOKENS,
+            &["meeting_kek", "transmit_key"],
+            "NON_CREDENTIAL_TOKENS membership changed; the entitled-long-lived-holder \
+             reasoning in the module docs must be re-checked before adding to it"
+        );
+    }
+
+    /// The bare token `kek` is deliberately NOT a vocabulary entry: it would be
+    /// inert for the word-boundary consumers and a false positive for the
+    /// segment-matching one. Pin the absence so a future author re-derives the
+    /// reasoning instead of "helpfully" adding it.
+    #[test]
+    fn bare_kek_is_not_a_vocabulary_entry() {
+        assert!(!PII_TOKENS_CATEGORY_A.contains(&"kek"));
+        assert!(!PII_TOKENS_CATEGORY_B.contains(&"kek"));
     }
 
     #[test]

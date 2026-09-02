@@ -117,6 +117,16 @@ Complete ALL items before deploying to production:
     coupled set then; revisit this line at that point.
   - Note: `## Rollback Procedure` below covers rolling back the *repo*, not a
     *deployment* — a deployment rollback must revert MC and the SDK together.
+  - **Identity-key handling adds NO deploy-ordering constraint** beyond the
+    tag-reshape lockstep above. MC admits a joiner that sends no
+    `identity_public_key` (length 0 is the contract's NO KEY PUBLISHED state), so
+    an un-updated SDK still joins; it is counted on
+    `mc_join_identity_key_presence_total{presence="absent"}`, not as a failure.
+    What the admission work adds is a new *observable*:
+    `error_type=identity_key_invalid` on `mc_session_join_failures_total` means a
+    client sent a **wrongly-encoded** key (PEM/JWK/base64 rather than the raw 32
+    bytes), never that a client has not implemented the field.
+
 
 - [ ] **Maintenance window scheduled** (if downtime expected)
   - Dependent services notified (GC, MH)

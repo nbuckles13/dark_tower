@@ -286,10 +286,112 @@ pub async fn seed_meeting_with_handlers(
         .expect("create_meeting");
 }
 
+/// Seed ONLY the MH assignment, without creating the meeting on the controller.
+///
+/// For callers that create the meeting themselves through a different entry
+/// point (e.g. the `test-seams` pre-seeded-cursor constructor) but still need
+/// the join path to find handler data — a join with no MH assignment fails at
+/// `build_join_response` (R-6) before reaching what such a test is exercising.
+pub fn seed_mh_assignment_only(handles: &TestStackHandles, meeting_id: &str) {
+    handles.mh_store.insert(
+        meeting_id,
+        MhAssignmentData {
+            handlers: vec![mh_handler("mh-test-1")],
+            assigned_at: "2026-04-25T00:00:00Z".to_string(),
+        },
+    );
+}
+
 /// Seed an MH assignment for `meeting_id` with a single default handler
 /// (`mh-test-1`) and create the meeting on the controller actor.
 ///
 /// Thin wrapper over [`seed_meeting_with_handlers`] for the common case.
 pub async fn seed_meeting_with_mh(handles: &TestStackHandles, meeting_id: &str) {
     seed_meeting_with_handlers(handles, meeting_id, vec![mh_handler("mh-test-1")]).await;
+}
+
+/// A syntactically valid Ed25519 identity public key for join-path tests.
+///
+/// Re-exported from `mc_test_utils::media` so the 32-byte value has one home
+/// across the MC suite rather than one literal per construction site.
+///
+/// MC checks length only — no curve validation — so a fixed synthetic pattern
+/// is sufficient. Passing it asserts nothing about identity: with no `cnf`
+/// binding the roster key is trust-on-first-use, which gives same-keyholder
+/// consistency and never a verified identity (ADR-0036 §4).
+pub fn sample_identity_public_key() -> Vec<u8> {
+    mc_test_utils::media::sample_identity_public_key()
+}
+
+/// Typed form of [`sample_identity_public_key`], for actor-level call sites
+/// that take an `IdentityPublicKey` rather than raw wire bytes.
+pub fn test_identity_key() -> Option<mc_service::media_admission::IdentityPublicKey> {
+    Some(
+        mc_service::media_admission::IdentityPublicKey::try_from_bytes(
+            &sample_identity_public_key(),
+        )
+        .expect("fixture key is exactly 32 bytes"),
+    )
+}
+
+/// The contract's NO KEY PUBLISHED state: a participant MC admits without an
+/// identity key. Legitimate, not a failure — consumers must fail closed on it.
+pub fn absent_identity_key() -> Option<mc_service::media_admission::IdentityPublicKey> {
+    None
+}
+
+// =============================================================================
+// WebTransport client-side framing
+// =============================================================================
+//
+// The signaling wire framing — 4-byte big-endian length prefix, then a
+// protobuf message — re-implemented per test file until 2026-09-02. This is
+// the shared home; new files MUST use it rather than adding a sixth copy.
+//
+// `join_tests.rs`, `media_connection_update_integration.rs`,
+// `otel_webtransport_integration.rs` and `webtransport_accept_loop_integration.rs`
+// still carry their own near-identical copies. Those pre-date this home and are
+// tracked for migration in `docs/TODO.md §Cross-Service Duplication`; the
+// variations between them are cosmetic (`Vec<u8>` vs `BytesMut`, `expect` vs a
+// bounded `Option`) against a wire contract that is identical, which is exactly
+// why drift between them would surface as a mysterious test-only decode failure.
+
+/// Length-prefix-frame a `ClientMessage` for the signaling stream.
+pub fn encode_framed(msg: &proto_gen::dark_tower::signaling::v1::ClientMessage) -> bytes::BytesMut {
+    use bytes::BufMut as _;
+    use prost::Message as _;
+
+    let payload = msg.encode_to_vec();
+    let mut framed = bytes::BytesMut::with_capacity(4 + payload.len());
+    framed.put_u32(u32::try_from(payload.len()).expect("payload fits u32"));
+    framed.put_slice(&payload);
+    framed
+}
+
+/// Read one length-prefixed `ServerMessage` off a signaling stream.
+pub async fn read_server_message(
+    recv: &mut wtransport::RecvStream,
+) -> proto_gen::dark_tower::signaling::v1::ServerMessage {
+    use prost::Message as _;
+
+    let mut len_buf = [0u8; 4];
+    recv.read_exact(&mut len_buf).await.expect("read length");
+    let len = u32::from_be_bytes(len_buf) as usize;
+    let mut payload = vec![0u8; len];
+    recv.read_exact(&mut payload).await.expect("read payload");
+    proto_gen::dark_tower::signaling::v1::ServerMessage::decode(payload.as_slice())
+        .expect("decodable ServerMessage")
+}
+
+/// Connect a WebTransport client to `url`, skipping cert validation.
+pub async fn connect(url: &str) -> wtransport::Connection {
+    let config = wtransport::ClientConfig::builder()
+        .with_bind_default()
+        .with_no_cert_validation()
+        .build();
+    wtransport::Endpoint::client(config)
+        .expect("client endpoint")
+        .connect(url)
+        .await
+        .expect("connect")
 }

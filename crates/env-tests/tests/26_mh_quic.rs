@@ -53,6 +53,7 @@ use bytes::{BufMut, BytesMut};
 use env_tests::cluster::ClusterConnection;
 use env_tests::fixtures::auth_client::UserRegistrationRequest;
 use env_tests::fixtures::gc_client::{CreateMeetingRequest, GcClient, JoinMeetingResponse};
+use env_tests::fixtures::media::sample_identity_public_key;
 use env_tests::fixtures::metrics::{
     format_instance_map, instance_maps_equal, poll_until_any_instance_above, InstanceCounters,
 };
@@ -457,10 +458,10 @@ async fn mc_join(
             capabilities: None,
             correlation_id: String::new(),
             binding_token: String::new(),
-            // ADR-0036 §4: raw Ed25519 identity signing public key. Empty here —
-            // this test exercises the join path, not attribution, and MC performs
-            // no attestation check this story.
-            identity_public_key: Vec::new(),
+            // ADR-0036 §4: raw Ed25519 identity signing public key. A valid
+            // 32-byte fixture — this test exercises the join path, not
+            // attribution, and MC performs no attestation check this story.
+            identity_public_key: sample_identity_public_key(),
         })),
         trace_parent: String::new(),
         trace_state: String::new(),
@@ -861,10 +862,10 @@ async fn test_mc_media_connection_update_increments_participant_mh_status_metric
             capabilities: None,
             correlation_id: String::new(),
             binding_token: String::new(),
-            // ADR-0036 §4: raw Ed25519 identity signing public key. Empty here —
-            // this test exercises the join path, not attribution, and MC performs
-            // no attestation check this story.
-            identity_public_key: Vec::new(),
+            // ADR-0036 §4: raw Ed25519 identity signing public key. A valid
+            // 32-byte fixture — this test exercises the join path, not
+            // attribution, and MC performs no attestation check this story.
+            identity_public_key: sample_identity_public_key(),
         })),
         trace_parent: String::new(),
         trace_state: String::new(),
