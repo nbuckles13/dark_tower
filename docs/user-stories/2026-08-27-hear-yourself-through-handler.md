@@ -333,11 +333,12 @@ tasks:
   slug: 2026-09-02-frame-v2-cross-language-vectors
   tag: story-2026-08-27-hear-yourself-through-handler-task-8
 - id: 9
-  status: pending
+  status: completed
   specialist: infrastructure
   deps:
   - 1
   prompt: 'Land the MH transport-parameter deployment configuration for the ADR-0036 media path. Add §1''s three transport parameters to `infra/services/mh-service/configmap.yaml` and both `mh-{0,1}-deployment.yaml` env blocks: `MH_MAX_CONCURRENT_UNI_STREAMS`, `MH_DATAGRAM_BUFFER_AUDIO_FRAMES` (the unit belongs in the key name — §1 requires this expressed in frames of audio, not bytes), and `MH_KEEPALIVE_INTERVAL_MS`. Set `MH_MAX_CONNECTIONS` explicitly: it appears in no manifest today, so MH runs a code default of 10 000 that nobody chose, and §1''s "the default being adequate is not the same as the default being chosen" applies to a resource-exhaustion guard as much as to a transport parameter. Derive `MH_TERMINATION_GRACE_SECONDS` from `spec.template.spec.terminationGracePeriodSeconds` via a kustomize replacement in `infra/services/mh-service/kustomization.yaml` for both instances, so the drain window has one source of truth and `kubectl kustomize` fails if the source field is removed (verified against kustomize v5.7.1: deleting the source field fails the build with a missing-fieldPath error). Add an env-test asserting the deployed MH pod''s `MH_TERMINATION_GRACE_SECONDS` equals its own pod spec''s `terminationGracePeriodSeconds` — the "does it apply" half, asserted against the real deployed artifact rather than kustomize output. The ConfigMap will then carry three max-named keys with three different meanings, so comment each to make confusion impossible: `MH_MAX_CONCURRENT_UNI_STREAMS` is a QUIC transport bound (§1); `MH_MAX_CONNECTIONS` is a resource-exhaustion guard at accept, never a capacity figure, never advertised; and the pre-existing `MH_MAX_STREAMS` is a capacity advertisement to GC that is known-wrong and deferred to story 2 (the egress-budget chain) — say so explicitly in the comment, so nobody reads `100` as a chosen value or tries to fix it here. Manifests land before media-handler''s code task, which makes these parameters required via MissingEnvVar: code-first trips `missing_in_manifest`, ConfigMap-only trips `orphan_configmap_key`, ConfigMap-plus-env-ref is green in both directions. Pair with media-handler on key names. Depends on the env-config guard fix so these keys land under a guard that is looking at mh-service.'
+  slug: 2026-09-02-mh-transport-parameter-manifests
   tag: story-2026-08-27-hear-yourself-through-handler-task-9
 - id: 10
   status: pending

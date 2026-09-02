@@ -23,6 +23,13 @@ spec:
         component: media
         instance: mh-0
     spec:
+      # SINGLE SOURCE OF TRUTH for this instance's shutdown drain window.
+      # A kustomize replacement (kustomization.yaml) copies this value into the
+      # MH_TERMINATION_GRACE_SECONDS env entry below. Once story task #12 lands,
+      # MH derives its drain as min(SETTLE_TARGET, grace - MARGIN) from that env
+      # var — so changing this number changes MH's drain behaviour, and setting it
+      # at or below MARGIN makes MH refuse to start. Do not retype the value into
+      # the env entry; the replacement is what keeps the two from drifting.
       terminationGracePeriodSeconds: 35
       securityContext:
         runAsNonRoot: true
@@ -75,6 +82,67 @@ spec:
             configMapKeyRef:
               name: mh-service-config
               key: MH_MAX_STREAMS
+        # QUIC transport parameters (ADR-0036 §1). Shared across both MH
+        # instances, so they live in the shared ConfigMap; see the rationale
+        # comments there. Both instances MUST reference all four: dt-guard
+        # env-config check 1 is per-workload, and a var present in mh-0 but
+        # missing from mh-1 CrashLoops that pod alone once task #12 makes
+        # these required.
+        - name: MH_MAX_CONCURRENT_UNI_STREAMS
+          valueFrom:
+            configMapKeyRef:
+              name: mh-service-config
+              key: MH_MAX_CONCURRENT_UNI_STREAMS
+        - name: MH_DATAGRAM_BUFFER_AUDIO_FRAMES
+          valueFrom:
+            configMapKeyRef:
+              name: mh-service-config
+              key: MH_DATAGRAM_BUFFER_AUDIO_FRAMES
+        - name: MH_KEEPALIVE_INTERVAL_MS
+          valueFrom:
+            configMapKeyRef:
+              name: mh-service-config
+              key: MH_KEEPALIVE_INTERVAL_MS
+        - name: MH_MAX_CONNECTIONS
+          valueFrom:
+            configMapKeyRef:
+              name: mh-service-config
+              key: MH_MAX_CONNECTIONS
+        # Drain window, DERIVED — do not hand-edit this value.
+        #
+        # The single source of truth is this deployment's own
+        # `spec.template.spec.terminationGracePeriodSeconds` (above). The
+        # kustomize `replacements:` block in
+        # infra/services/mh-service/kustomization.yaml overwrites the `"0"`
+        # below with that field at BUILD time. Deliberately NOT a ConfigMap
+        # key: it is a per-instance quantity read off this instance's own pod
+        # spec, and a shared key would be exactly the second, drift-prone
+        # literal this derivation exists to remove (R-21).
+        #
+        # `"0"` is a sentinel, not a value. It is invalid — task #12 requires
+        # grace > MARGIN — so a `0` that reaches a running pod is a loud refusal
+        # to start, never a silently-wrong drain. Seeing `"0"` on a live pod
+        # means the kustomize replacement did not run.
+        #
+        # That loudness is NOT automatic. It holds only if task #12 (a) parses
+        # this var STRICTLY — no `unwrap_or`, or `"0"` parses to 0 and never
+        # reaches the check; (b) validates BEFORE computing the drain; and
+        # (c) uses `saturating_sub` for `grace - MARGIN`, since on an unsigned
+        # type `0 - MARGIN` wraps to an effectively infinite drain rather than a
+        # refusal. Tracked in docs/TODO.md § Cross-Service Duplication (DRY).
+        #
+        # ALWAYS deploy through kustomize (`kubectl apply -k`, or the Kind
+        # overlay). `kubectl apply -f` on this file BYPASSES the replacement and
+        # applies the sentinel verbatim — both MH pods would then refuse to
+        # start, which is a JOIN outage, not merely a media one.
+        #
+        # Operational consequence: once task #12 lands, MH's drain window is
+        # min(SETTLE_TARGET, terminationGracePeriodSeconds - MARGIN). Editing
+        # the grace period above therefore CHANGES MH's drain behaviour. That
+        # coupling is the point, but it is not what a reader expects from a
+        # pod-spec field.
+        - name: MH_TERMINATION_GRACE_SECONDS
+          value: "0"
         - name: AC_ENDPOINT
           valueFrom:
             configMapKeyRef:

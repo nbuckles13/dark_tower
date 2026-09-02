@@ -198,9 +198,11 @@ relationship": a derived value cannot drift; a guard only catches drift after so
 reviews and no guard checks, and it silently disagrees with the panel's declared `Bps` unit. The
 panel then renders bits while claiming bytes. Put the equivalence in prose where a human reads it.
 
-**Live instances** — both are *forward references*; neither config key exists in the tree today:
+**Live instances** — one is live, one is still a *forward reference*:
 
-- **Datagram send buffer** (story 1) — ADR-0036 §1 requires this be expressed and documented **in
+- **Datagram send buffer** (story 1) — **live as of story task 9**, as
+  `MH_DATAGRAM_BUFFER_AUDIO_FRAMES` in `infra/services/mh-service/configmap.yaml`; the frames→bytes
+  conversion lands with task 12. ADR-0036 §1 requires this be expressed and documented **in
   frames of audio**, not bytes, because quinn's 1 MiB default is ≈93 seconds of queued audio and
   "1 MiB" does not make that visible while "93 seconds" does. quinn's API takes bytes, so the
   conversion happens once at config load.

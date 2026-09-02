@@ -6,6 +6,7 @@
 #![cfg(feature = "smoke")]
 
 use env_tests::cluster::ClusterConnection;
+use env_tests::NAMESPACE;
 use std::process::Command;
 
 /// Helper to create a cluster connection for tests.
@@ -55,17 +56,89 @@ async fn test_grafana_reachable() {
         .expect("Grafana should be reachable on localhost:3000");
 }
 
-#[tokio::test]
-async fn test_secrets_not_in_env_vars() {
-    // Use kubectl to check pod environment variables don't contain secrets
+// NAMESPACE is imported from the crate root, not redefined here: both this file
+// and 01_mh_deployment_config.rs assert against it, and a per-file copy is the
+// exact duplication these probes exist to catch.
+//
+// Historical note, so the fix is not undone: both credential-leak probes below
+// queried `-n default` for as long as this file existed. Nothing has ever run
+// there, so `kubectl` returned an empty string, both probes asserted
+// `!"".contains("password")`, and the suite's only two runtime credential-leak
+// controls passed unconditionally. A control that cannot fail is not a control.
+
+/// Label selector for the AC pods the credential-leak probes below sample.
+///
+/// A const, not four literals. `assert_pods_exist` only keeps a probe honest if
+/// the guard and the probe name the **same** pods, and that has to be the same
+/// expression rather than the same spelling. With separate literals the drift is
+/// asymmetric: a stale guard queries nothing and panics (safe), but a stale
+/// *probe* leaves the guard passing on the old selector while the probe samples
+/// an empty set and asserts `!"".contains("password")` — a vacuous green, which
+/// is the exact defect `assert_pods_exist` was added to prevent.
+const AC_SELECTOR: &str = "app=ac-service";
+
+/// Panics unless the selector matches at least one pod.
+///
+/// This is what keeps the probes below honest. Correcting the namespace makes
+/// them green *today*; this guard is what stops the next namespace or label
+/// drift from silently re-disarming them. Without it, "no pods matched" and
+/// "pods matched and were clean" are the same green — which is exactly how the
+/// `-n default` defect survived undetected.
+fn assert_pods_exist(selector: &str) {
     let output = Command::new("kubectl")
         .args([
             "get",
             "pods",
             "-n",
-            "default",
+            NAMESPACE,
             "-l",
-            "app=ac-service",
+            selector,
+            "-o",
+            "jsonpath={.items[*].metadata.name}",
+        ])
+        .output()
+        .unwrap_or_else(|e| {
+            panic!(
+                "kubectl not available - cannot verify secret leak protection. \
+                 env-tests require kubectl to be installed and configured: {}",
+                e
+            )
+        });
+
+    assert!(
+        output.status.success(),
+        "kubectl failed listing pods -n {} -l {} - cannot verify secret leak \
+         protection: {}",
+        NAMESPACE,
+        selector,
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let names = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !names.trim().is_empty(),
+        "no pods matched -n {} -l {}: the credential-leak probe would assert \
+         against an empty result and pass vacuously. Either the namespace or \
+         the label selector has drifted, or the workload is not deployed - \
+         fix the selector, do not delete this guard.",
+        NAMESPACE,
+        selector
+    );
+}
+
+#[tokio::test]
+async fn test_secrets_not_in_env_vars() {
+    // Use kubectl to check pod environment variables don't contain secrets
+    assert_pods_exist(AC_SELECTOR);
+
+    let output = Command::new("kubectl")
+        .args([
+            "get",
+            "pods",
+            "-n",
+            NAMESPACE,
+            "-l",
+            AC_SELECTOR,
             "-o",
             "jsonpath={.items[*].spec.containers[*].env[*].value}",
         ])
@@ -105,15 +178,10 @@ async fn test_secrets_not_in_env_vars() {
 #[tokio::test]
 async fn test_secrets_not_in_logs() {
     // Use kubectl to sample recent logs and check for leaked credentials
+    assert_pods_exist(AC_SELECTOR);
+
     let output = Command::new("kubectl")
-        .args([
-            "logs",
-            "-n",
-            "default",
-            "-l",
-            "app=ac-service",
-            "--tail=100",
-        ])
+        .args(["logs", "-n", NAMESPACE, "-l", AC_SELECTOR, "--tail=100"])
         .output();
 
     let output = output.unwrap_or_else(|e| {
@@ -181,7 +249,7 @@ async fn test_otel_collector_ready() {
             "-l",
             "app=otel-collector",
             "-n",
-            "dark-tower",
+            NAMESPACE,
             "--timeout=10s",
         ])
         .output();

@@ -34,6 +34,14 @@
 //! cargo test -p env-tests --features all
 //! ```
 
+/// Namespace every Dark Tower workload runs in.
+///
+/// Single home, because two test files assert against it and a bare constant
+/// duplicated per file is the drift this crate's own guards exist to catch.
+/// NOT `default`: nothing has ever run there, and probes pointed at an empty
+/// namespace return an empty result set that reads as a clean assertion.
+pub const NAMESPACE: &str = "dark-tower";
+
 pub mod canary;
 pub mod cluster;
 pub mod eventual;

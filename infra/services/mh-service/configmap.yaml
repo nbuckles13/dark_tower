@@ -24,7 +24,161 @@ data:
   # AC JWKS endpoint for JWT validation
   AC_JWKS_URL: "http://ac-service.dark-tower:8082/.well-known/jwks.json"
   # Maximum concurrent media streams
+  #
+  # KNOWN-WRONG, DEFERRED — do not "fix" this here. `100` is not a chosen value:
+  # it is the wrong UNIT. The real quantity MH needs to bound is an egress
+  # BANDWIDTH budget; a stream count is standing in for it. Story 2 derives the
+  # ceiling from `MH_EGRESS_BUDGET_BPS` and retires this key. Until then the
+  # value is live and on the wire: mh-service sends it to GC as `max_streams`
+  # from BOTH `register()` and `attempt_reregistration()` in
+  # crates/mh-service/src/grpc/gc_client.rs — so GC does placement against it at
+  # first registration and again after any re-registration.
+  # Enforced by: nothing on MH's data path — GC, at placement.
+  # ANCHOR (DRY): `crates/mh-service/src/config.rs` holds a second, larger
+  # fallback for this key that no manifest supplies; task #12 collapses the pair.
   MH_MAX_STREAMS: "100"
   # TLS certificate paths for WebTransport (mounted from mh-service-tls Secret)
   MH_TLS_CERT_PATH: "/etc/mh-tls/tls.crt"
   MH_TLS_KEY_PATH: "/etc/mh-tls/tls.key"
+
+  # ---------------------------------------------------------------------------
+  # QUIC transport parameters (ADR-0036 §1)
+  #
+  # ADR-0036 §1 requires MH to declare these explicitly rather than inherit
+  # quinn's defaults: "a bound has to be declared to be assertable, and the
+  # default being adequate is not the same as the default being chosen."
+  #
+  # ANCHOR (DRY): `crates/mh-service/src/config.rs` currently supplies fallbacks
+  # for some of these via `unwrap_or`, which is a second encoding of the same
+  # quantities that `dt-guard env-config` cannot see (its check 1 keys off
+  # `ConfigError::MissingEnvVar`, which `unwrap_or` never emits). Task #12
+  # collapses each pair by making the vars required. Until then these comments
+  # are the only thing holding the two in agreement — an anchor, not a guard.
+  # ---------------------------------------------------------------------------
+
+  # Ingress bound: how many unidirectional QUIC streams a PEER may have open
+  # toward MH at once. MH advertises this limit; QUIC enforces it by withholding
+  # stream credit, so the peer stalls rather than MH rejecting. Under ADR-0036
+  # §1's one-group-of-pictures-per-stream rule this bounds how many video groups
+  # from one publisher can be in flight. §1's working figure is ~5 concurrent
+  # (five video slots at a one-second keyframe cadence), and a publisher has
+  # roughly one group in flight per encoding — single digits even with simulcast.
+  # 64 leaves generous headroom while sitting below quinn's unchosen default of
+  # 100, so the ceiling is demonstrably ours.
+  # This does NOT bound MH's egress — the client's own advertised limit does.
+  # Story 1 is audio-only, so the operative count is 0; the bound is declared
+  # because a bound must be declared to be assertable.
+  # Enforced by: quinn, in MH's process, at stream-open time.
+  # Where an operator sees it: nowhere directly — a peer at the limit stalls
+  # silently. Diagnose from the publisher side, not from an MH metric.
+  MH_MAX_CONCURRENT_UNI_STREAMS: "64"
+
+  # Egress backstop: the QUIC datagram SEND buffer — the egress datagram queue
+  # toward a subscriber. It does NOT size the ingress buffer, which is a
+  # separate transport parameter declared in code (task #12); quinn's
+  # `datagram_receive_buffer_size` also does double duty as the source of the
+  # advertised `max_datagram_frame_size`, so the two directions have unrelated
+  # sizing pressures and must not share a number.
+  #
+  # Expressed in FRAMES of audio
+  # (20 ms of Opus each), not bytes — ADR-0036 §1 requires the frame form,
+  # because quinn's 1 MiB default is ~93 seconds of queued audio and "1 MiB"
+  # does not make that visible while "93 seconds" does. Code converts to bytes
+  # once at config load (quinn's API takes bytes).
+  #
+  # This is a PER-CONNECTION budget shared across every audio stream that
+  # connection carries. At the story-1 loopback shape (one stream) 32 frames is
+  # 640 ms; with N publishers multiplexed it is 640/N ms per stream.
+  #
+  # It is a BACKSTOP, never the operative queue. ADR-0036 §1 requires MH's
+  # application-level egress queue to trip FIRST so back-pressure is observable
+  # in our code rather than inside quinn; task #12 sets that bound to 8 frames
+  # per connection and validates the ordering at startup. Keep this value
+  # strictly ABOVE that bound or MH will refuse to start.
+  # Enforced by: quinn, in MH's process. NOTE quinn's *default* overflow
+  # behaviour is to silently discard the oldest datagram; MH deliberately does
+  # NOT use that path — see the observability note below, which is the
+  # authoritative statement of what MH does when this buffer fills.
+  # Where an operator sees it: NOTHING TODAY — every signal below LANDS WITH THE
+  # MH FORWARD PATH (story task 16) and does not exist in the tree yet.
+  #
+  # quinn's drop-oldest discard path is genuinely unobservable (it emits a trace
+  # and nothing else), and that is exactly WHY MH does not use it: task #16 uses
+  # the non-dropping send path, which returns a `Blocked` error when this buffer
+  # is full. A returned error is countable, so it — not the discard — is the
+  # authoritative saturation signal, and load-shedding surfaces as
+  # `mh_media_frames_dropped_total{reason="egress_queue_overflow"}`.
+  # Buffer occupancy is also readable and #16 publishes it as a trend gauge, but
+  # NO ALERT MAY REST ON THAT GAUGE ALONE: MH's scrape interval is orders of
+  # magnitude longer than the milliseconds these buffers take to fill and drain —
+  # whatever it is configured to — so an instantaneous gauge can read healthy
+  # across an entire incident while telling the truth about the instants it
+  # sampled. Counters cannot miss an event between scrapes; gauges can.
+  #
+  # This is still why the application queue must trip first: back-pressure
+  # belongs in our code, where it is countable, rather than inside quinn.
+  MH_DATAGRAM_BUFFER_AUDIO_FRAMES: "32"
+
+  # QUIC connection-level keepalive, in milliseconds. This is what refreshes the
+  # NAT binding of a MUTED participant, who by definition sends no media
+  # (ADR-0036 §1, §5) — without it an intermediary can reap the path and unmute
+  # is not instantaneous. Load-bearing for this story's mute/unmute demo.
+  #
+  # Two relationships fix this value; it is meaningless in isolation:
+  #   - it must be well below the ~30 s reap window of an aggressive NAT, so at
+  #     least two refreshes fit inside one window (10 s gives three);
+  #   - it must be well below MH's effective QUIC idle timeout, since a
+  #     keepalive is only effective if it arrives before the peer times out.
+  #     Task #12 declares `max_idle_timeout` as a named 30 s constant, making
+  #     this a chosen 1:3 ratio rather than an inherited one. A 1:2 ratio would
+  #     put a single lost keepalive at the edge of the timeout.
+  # Enforced by: quinn, in MH's process.
+  # Where an operator sees it: as connection loss after a long mute — see
+  # docs/runbooks/mh-incident-response.md Scenario 15 (media datagram drop),
+  # whose keepalive fork has no unique client-side discriminator. NOT YET IN THE
+  # TREE: that runbook ends at Scenario 14 today; Scenario 15 is reserved for
+  # this story's operations runbook task. The anchor name is fixed by the story,
+  # so it is written here as-specified rather than invented.
+  MH_KEEPALIVE_INTERVAL_MS: "10000"
+
+  # Accept-time resource-exhaustion guard: the maximum number of concurrent
+  # WebTransport connections MH will accept. NEVER a capacity figure, never
+  # advertised to GC (that is `MH_MAX_STREAMS` above, a different quantity with
+  # a confusingly similar name). It sits far above expected peak, so rejections
+  # attributed to it mean a connection flood or a connection leak, not demand
+  # that has outgrown the deployment.
+  #
+  # `500` is chosen against expected peak (single digits in this deployment) and
+  # as a 20x reduction from the 10,000 default that no one chose. It is NOT
+  # derived from this pod's memory limit, and the arithmetic below is recorded
+  # so task #12 inherits the reasoning rather than re-deriving it:
+  #
+  #   quinn-proto 0.11.17 defaults, all currently UNDECLARED by MH:
+  #     receive_window            = VarInt::MAX  (unbounded — the dominant term)
+  #     stream_receive_window     = 1.25 MB
+  #     datagram_receive_buffer_size = 1.25 MB
+  #   Per-connection adversarial receive ceiling is therefore ~206 MB against
+  #   this pod's 1 Gi limit — roughly five hostile connections, not 500. And
+  #   ADR-0036's Context records that MH has NO `accept_uni` loop today, so
+  #   incoming stream data is never read and the windows fill and stay filled:
+  #   the worst case is the ordinary case, not a tail.
+  #
+  # Connection-level receive flow control is the missing control. Task #12
+  # declares it as named constants — receive_window, stream_receive_window, and
+  # datagram_receive_buffer_size, the last of which is its OWN constant and is
+  # deliberately NOT derived from MH_DATAGRAM_BUFFER_AUDIO_FRAMES (that quinn
+  # field also feeds the advertised max_datagram_frame_size, so the send and
+  # receive directions have opposing sizing pressures). This drops the
+  # per-connection ceiling to
+  # ~263 KB and makes 500 genuinely memory-derived (~132 MB, ~13% of 1 Gi).
+  # Tracked in docs/TODO.md; until then this bound is chosen, not derived.
+  #
+  # The ~206 MB figure above is measured against this pod's 1 Gi limit — so
+  # changing `resources.limits.memory` in mh-{0,1}-deployment.yaml invalidates
+  # that analysis and requires revisiting this value.
+  # Enforced by: mh-service itself, in crates/mh-service/src/webtransport/server.rs,
+  # before allocating handler resources.
+  # Where an operator sees it: `mh_webtransport_connections_total{status="rejected"}`,
+  # alert `MHHighWebTransportRejections`, and
+  # docs/runbooks/mh-incident-response.md Scenario 5.
+  MH_MAX_CONNECTIONS: "500"
