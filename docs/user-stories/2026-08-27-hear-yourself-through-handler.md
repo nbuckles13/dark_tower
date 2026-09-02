@@ -313,9 +313,10 @@ tasks:
   slug: 2026-09-01-mh-transport-seam
   tag: story-2026-08-27-hear-yourself-through-handler-task-5
 - id: 6
-  status: pending
+  status: completed
   specialist: infrastructure
   prompt: 'Assert the deployed-artifact premises this story''s controls rest on (ADR-0036 "does it apply"). Add a `dt-guard` subcommand plus Layer-3 wrapper that fails if any service Dockerfile''s cargo build drops `--release`, or if the workspace `[profile.release]` enables `debug-assertions` — media-handler''s per-frame-tracing `compile_error!` guard (§11) is inert the moment either changes, and nothing notices today (premise currently holds: `infra/docker/mh-service/Dockerfile` builds `--release`; `[profile.release]` does not set `debug-assertions`). Separately, escalate `scripts/dev-web.sh`''s two MH WebTransport preflight checks (cert fingerprint present, right-family listener) from WARN to HARD FAIL and update the script header''s HARD-FAIL-vs-WARN contract: MH reachability was join-only when those were written and is the demonstrated path in this story, so a WARN yields a demo that starts and silently returns no audio. Add a one-line pointer in the script header to the secure-context section of `docs/runbooks/client-dev-local.md` (client owns that prose): getUserMedia, WebCodecs, WebCrypto and WebTransport all require a secure context, and a non-localhost HTTP origin silently disables the whole pipeline, presenting as "joined, no audio". No Chrome flag that disables certificate validation or forces an insecure origin may appear in any script, config, runbook, or test invocation. Unit tests for both guard halves.'
+  slug: 2026-09-01-release-premise-and-preflight-guards
   tag: story-2026-08-27-hear-yourself-through-handler-task-6
 - id: 7
   status: pending

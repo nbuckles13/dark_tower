@@ -268,6 +268,21 @@ pub fn run(repo_root: &Path, explain: bool) -> Result<()> {
 
     let plan_paths = parse_plan_paths(&main_md_content, &rel_main_md);
     let changed_files = filter_diff_paths(&diff_paths, &rel_main_md);
+
+    // A trailing edit whose EFFECTIVE diff is entirely exempt paths — the
+    // main.md itself, docs/TODO.md, INDEX files, the escalation artifact —
+    // is record-keeping about a plan already executed, not a new execution
+    // of the plan. Running planned-untouched against it re-litigates the
+    // whole plan with an empty diff and fires one false positive per
+    // planned file. Live instances: a --revalidate note commit (task 1)
+    // and a main.md-only correction commit (task 6) of the ADR-0036
+    // story-1 run, 2026-09-01. Inbound drift is vacuously absent too, so
+    // skipping the check entirely is exact, not lenient: any real file in
+    // the trailing edit keeps full enforcement.
+    if changed_files.is_empty() {
+        emit_ok("cross-boundary-scope-effective-diff-all-exempt");
+        return Ok(());
+    }
     let exempt_extras: HashSet<String> = HashSet::new();
 
     let report = check_scope(&changed_files, &plan_paths, &exempt_extras);
@@ -354,6 +369,17 @@ mod tests {
             "docs/.devloop-escalation.json"
         ));
         assert!(!is_symmetric_exclusion(rel, "crates/foo/src/lib.rs"));
+    }
+
+    #[test]
+    fn all_exempt_effective_diff_is_not_planned_untouched() {
+        // Mirrors run()'s early-out: when every changed path is a symmetric
+        // exclusion, filter_diff_paths yields empty and check_scope must not
+        // be consulted. Guard the filter half here (run() is IO-bound).
+        let rel = "docs/devloop-outputs/x/main.md";
+        let diff = vec![rel.to_string(), "docs/TODO.md".to_string()];
+        let filtered = filter_diff_paths(&diff, rel);
+        assert!(filtered.is_empty(), "exempt-only diff must filter to empty");
     }
 
     #[test]
