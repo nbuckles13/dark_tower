@@ -409,15 +409,29 @@ pub fn run(repo_root: &Path, explain: bool) -> Result<()> {
         }
         if let Some(why) = allowlist_reason(rel) {
             allowlisted_hits += file_hits.len();
-            eprintln!("WARN dt-guard allowlisted mention in {rel} ({why})");
+            // `NOTE`, not `WARN `. An allowlist HIT is the allowlist working —
+            // expected steady state, not a coverage hole — and since the
+            // guard-runner's exit-0 arm began surfacing `^WARN ` lines from
+            // passing guards, a `WARN ` here printed on every green run. The
+            // `WARN ` channel now carries real coverage holes (an absent
+            // `kubeconform` silently skipping R-17 schema validation, an
+            // ungated codec); burying those under routine allowlist chatter is
+            // how people learn to skim past the line that mattered.
+            eprintln!("NOTE dt-guard allowlisted mention in {rel} ({why})");
             continue;
         }
         hits.extend(file_hits);
     }
 
-    // Counts line: visible standalone or under `--verbose` only. Layer 3 runs
-    // the guard runner non-verbose and never echoes captured output on the OK
-    // path, so this is for the standalone triage reader, not the devloop log.
+    // Counts line: visible standalone or under `--verbose` only.
+    //
+    // Layer 3 runs the guard runner non-verbose. It now echoes `^WARN ` lines
+    // from passing guards — but ONLY those, so this `println!` is still for the
+    // standalone triage reader rather than the devloop log. (Before that arm
+    // existed this comment read "never echoes captured output on the OK path",
+    // which was true then and is not now; corrected here rather than left,
+    // because a comment that overstates what stays hidden is how something
+    // sensitive ends up printed on the assumption that nothing is.)
     println!(
         "SCOPE: {} candidate files, {} enumerated settings, {allowlisted_hits} allowlisted \
          mentions, {} hits",

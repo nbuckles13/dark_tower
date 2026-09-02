@@ -1,0 +1,58 @@
+{
+  "$comment": "Row selector and per-suite expectations for the vendored external sframe-wg vectors. `cipher_suites` is the SHARED selector, declared once here as data and read by BOTH gates (crates/media-vector-gen/tests/external_sframe_gate.rs and packages/sdk-core/src/media/frame/__tests__/). A selector written once per language would be two implementations plus an agreement, and agreements drift: the two gates could narrow to different subsets while both reported green.",
+  "schema_version": 1,
+  "source": {
+    "repo": "https://github.com/sframe-wg/sframe",
+    "commit": "025d568a506937c901af8e7f0a663f39aeaf67ad",
+    "path": "test-vectors/test-vectors.json",
+    "sha256": "b8d35efd41749567427cb9ae52d9a7362904154978ff6a5fb20c0258a8ffdec1",
+    "bytes": 35121
+  },
+  "array": "sframe",
+  "cipher_suites": [
+    4,
+    5
+  ],
+  "required_fields": [
+    "cipher_suite",
+    "kid",
+    "ctr",
+    "base_key",
+    "sframe_key_label",
+    "sframe_salt_label",
+    "sframe_secret",
+    "sframe_key",
+    "sframe_salt",
+    "nonce"
+  ],
+  "$required_fields_why": "Anti-vacuity on the ARTIFACT, distinct from the anti-vacuity on the selector. If an upstream re-vendor drops or renames a field, a gate that reads it as absent would compare nothing and report success. Both gates assert every listed field is present on every selected row before comparing anything.",
+  "expectations": [
+    {
+      "cipher_suite": 4,
+      "name": "AES_128_GCM_SHA256_128",
+      "hash": "SHA-256",
+      "prk_bytes": 32,
+      "key_bytes": 16,
+      "salt_bytes": 12,
+      "tag_bytes": 16,
+      "min_rows": 1,
+      "gates_aead": false,
+      "role": "contrast",
+      "$why_no_aead": "AES-128. Driving this row through seal/open would need an AES-128-capable code path, i.e. building a weak-key acceptance path into our crypto in order to test that we do not have one. WebCrypto does not refuse a 16-byte AES-GCM key, so the refusal must be ours. This row terminates at the key-schedule output.",
+      "$role_note": "CONTRAST, not fallback. It makes 'the PRK is 64 bytes and the hash is SHA-512' falsifiable rather than self-referential. Ciphersuite 0x0005 is present at the pinned commit, so the task's precedence ladder resolves on its primary branch with nothing degraded."
+    },
+    {
+      "cipher_suite": 5,
+      "name": "AES_256_GCM_SHA512_128",
+      "hash": "SHA-512",
+      "prk_bytes": 64,
+      "key_bytes": 32,
+      "salt_bytes": 12,
+      "tag_bytes": 16,
+      "min_rows": 1,
+      "gates_aead": true,
+      "role": "anchor",
+      "$role_note": "The suite ADR-0036 \u00a74 selects (RFC 9605 \u00a78.1). This row is the no-correlated-error gate on our HKDF-SHA512 key schedule and the AES-256-GCM primitive."
+    }
+  ]
+}

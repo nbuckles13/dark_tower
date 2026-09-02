@@ -248,6 +248,26 @@ fn allowlisted_path_is_exempt_but_its_sibling_is_not() {
     );
     assert!(out.contains("1 allowlisted mentions"), "got:\n{out}");
 
+    // The allowlist line is `NOTE `, NOT `WARN `. `run-guards.sh`'s exit-0 arm
+    // greps `^WARN ` from PASSING guards; routing an expected steady state
+    // through that channel buries the real coverage holes (an absent
+    // `kubeconform` silently skipping R-17 schema validation). Contract:
+    // `docs/runbooks/devloop-validation.md:624`, cross-referenced as
+    // load-bearing from `scripts/guards/run-guards.sh:183`.
+    //
+    // Deliberately NOT `survives_run_guards_filter` (line 96): that helper
+    // models the FAILURE arm's unanchored pattern, which is a different arm.
+    // The exit-0 arm greps `^WARN `, so the assertion is anchored to match.
+    assert!(
+        out.contains("NOTE dt-guard allowlisted mention"),
+        "allowlist line must carry the NOTE prefix; got:\n{out}"
+    );
+    assert!(
+        !out.lines().any(|l| l.starts_with("WARN ")),
+        "a PASSING allowlist-only run must emit no `^WARN ` line — that channel \
+         is reserved for coverage holes; got:\n{out}"
+    );
+
     // ...and is NARROW: a sibling in the SAME directory still fails. This is
     // the widening vector — a prefix allowlist would swallow it silently.
     let tmp = git_fixture(&[(

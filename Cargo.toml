@@ -13,6 +13,12 @@ members = [
     "crates/common",
     "crates/proto-gen",
     "crates/media-protocol",
+    # NON-PRODUCTION reference generator for the cross-language frame vectors.
+    # A workspace MEMBER, deliberately not an `exclude` entry: excluded crates are
+    # not compiled by the pipeline (the standing complaint in docs/TODO.md about
+    # the two fuzz workspaces), and an excluded generator could rot silently and
+    # take the drift gate with it.
+    "crates/media-vector-gen",
     "crates/env-tests",
     "crates/devloop-helper",
     "crates/dt-guard",

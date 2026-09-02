@@ -335,10 +335,22 @@ fn derived_constants_have_their_expected_values() {
     assert_eq!(SFRAME_OBJECT_OVERHEAD_BYTES, 24);
     assert_eq!(AEAD_TAG_BYTES, 16);
     assert_eq!(KEY_ID_BYTES, 8);
-    assert_eq!(MAX_PAYLOAD_BYTES, 1_048_576);
+    // `MAX_PAYLOAD_BYTES` is deliberately NOT pinned to a literal here.
+    //
+    // It became a cross-language value with story task 8: the single source of
+    // truth is `proto/test-vectors/frame-v2.vectors.json` -> `max_payload_bytes`,
+    // and `scripts/guards/simple/validate-frame-vectors.sh` check g2 asserts the
+    // Rust constant equals it, with a `rust-const-not-found` bail so a renamed
+    // declaration reds instead of comparing nothing. A literal here would be a
+    // THIRD home for one value — and the one most likely to be updated in
+    // isolation, since it sits next to seven other literals that are genuinely
+    // Rust-only. The derived constants below still pin it transitively.
     assert_eq!(MAX_EXT_BYTES, 3);
     assert_eq!(MAX_HEADER_BYTES, 71);
-    assert_eq!(MAX_FRAME_BYTES, 71 + 1_048_576 + 64);
+    assert_eq!(
+        MAX_FRAME_BYTES,
+        MAX_HEADER_BYTES + MAX_PAYLOAD_BYTES + SIGNATURE_SIZE
+    );
 }
 
 // ---------------------------------------------------------------------------

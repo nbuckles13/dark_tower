@@ -105,10 +105,60 @@ pub const AEAD_TAG_BYTES: usize = 16;
 
 /// Length of the `SFrame` key identifier (RFC 9605 caps the KID at 64 bits).
 ///
-/// Defined exactly once in this workspace. The key-id *layout* — `sender_id`
-/// (16 bits) | `stream` (8 bits) | `generation` (40 bits) — belongs to the
-/// crypto layer, not to this codec; only the size is needed here.
+/// Defined exactly once in this workspace. The key-id *layout* is
+/// `sender_id(16) | stream(8) | generation(40)`, big-endian; this codec does
+/// not use it — the key id is opaque inside the payload here — but the widths
+/// are declared below because three separate contracts anchor to them.
 pub const KEY_ID_BYTES: usize = 8;
+
+/// Width of the `sender_id` component of the key id.
+///
+/// ANCHOR (DRY): pinned cross-language in
+/// `proto/test-vectors/frame-v2.vectors.json` under `wire_constants.key_id_layout`.
+///
+/// Promoted from prose to a named constant because **three** separate contracts
+/// bound themselves to the old comment and nothing failed if the layout moved:
+/// `signaling.proto`'s `sender_id` (16 bits), its `stream_number` (8 bits), and
+/// the `SFrame` key-id packer in the vector generator. A comment cannot be a
+/// single source of truth for a value another crate computes with.
+///
+/// **Do not conflate with [`STREAM_ID_FIELD_BYTES`].** That is the *relay*
+/// `stream_id`: subscriber-scoped, two bytes, rewritten per subscriber by a
+/// media handler, authenticated by nobody. This layout's `stream` is
+/// sender-scoped, one byte, and cryptographically bound through the key
+/// derivation. Different scope, different width, different trust. The
+/// `KEY_ID_` prefix on all three constants exists so a reader at a call site
+/// sees which namespace they are in without looking up the declaration.
+///
+/// `usize` rather than `u32` so the fill assertion below compares against
+/// `KEY_ID_BYTES * 8` **without a cast**: this crate denies
+/// `cast_possible_truncation`, and an `as` on the key-id path is exactly the
+/// class of conversion that invariant exists to forbid. Uniformity beats
+/// matching `u32::BITS`'s type here.
+pub const KEY_ID_SENDER_ID_BITS: usize = 16;
+
+/// Width of the sender-scoped `stream` component of the key id. See
+/// [`KEY_ID_SENDER_ID_BITS`] for the deliberate non-relationship to
+/// [`STREAM_ID_FIELD_BYTES`].
+pub const KEY_ID_STREAM_BITS: usize = 8;
+
+/// Width of the `generation` component of the key id.
+///
+/// Forty bits, chosen with [`KEY_ID_SENDER_ID_BITS`]'s sixteen rather than a
+/// 32-bit sender, so that **generation is effectively inexhaustible under one
+/// KEK**. A sender rotates on every video group and every `T` for audio (§4),
+/// so generation is the fast counter; at 2^40 it cannot be driven to wrap
+/// within any meeting lifetime. That is why no generation-ceiling guard and no
+/// ceiling vector exist — the ceiling is unreachable, not merely unchecked.
+pub const KEY_ID_GENERATION_BITS: usize = 40;
+
+const _: () = {
+    assert!(
+        KEY_ID_SENDER_ID_BITS + KEY_ID_STREAM_BITS + KEY_ID_GENERATION_BITS == KEY_ID_BYTES * 8,
+        "key-id layout must exactly fill KEY_ID_BYTES: a gap would be undecoded bits in a \
+         field the nonce derivation depends on, and an overlap would alias two key ids"
+    );
+};
 
 /// Size of the `SFrame` object's own clear header plus its tag.
 ///
@@ -239,6 +289,13 @@ pub const STREAM_SEQUENCE_OFFSET: usize = PAYLOAD_LENGTH_OFFSET + PAYLOAD_LENGTH
 /// with no legitimate caller. Per §2 the version is meeting-wide and
 /// MC-directed, so a mixed-version meeting cannot arise and a relay can never
 /// translate between versions (the field is signed).
+///
+/// ANCHOR (DRY): now cross-language. Pinned in
+/// `proto/test-vectors/frame-v2.vectors.json` as `header_version`, and guard
+/// check g3 asserts the two are equal. It carried no anchor line until
+/// `signaling.proto` gained `ParticipantCapabilities.supported_header_versions`,
+/// which is what made the header version a value TypeScript must also hold —
+/// before that, nothing outside Rust consumed it.
 pub const PROTOCOL_VERSION: u8 = 2;
 
 /// Flag bit 0: this frame can be decoded without its predecessors.
@@ -381,6 +438,18 @@ impl<'a> WrappedTransmitKey<'a> {
     }
 }
 
+/// # Why printing the lengths in the clear is safe, and when it stops being
+///
+/// The redacted placeholders disclose `WRAPPED_TRANSMIT_KEY_MATERIAL_BYTES` and
+/// `AEAD_TAG_BYTES`, which are **compile-time constants and therefore not a
+/// function of the secret**. A length that varies with content is a different
+/// matter: printing it leaks a function of the plaintext, which is how a
+/// compression-ratio side channel is built. Any future field whose length
+/// depends on its value must **not** have its length printed here.
+///
+/// Recorded at this impl because it established the redaction pattern the
+/// signalling layer now copies in `crates/proto-gen/src/lib.rs`, so the
+/// reasoning belongs at its origin rather than only at the copies.
 impl fmt::Debug for WrappedTransmitKey<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("WrappedTransmitKey")

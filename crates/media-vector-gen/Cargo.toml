@@ -1,0 +1,29 @@
+[package]
+name = "media-vector-gen"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+# NOT PRODUCTION CODE. Never published, never depended on by a service.
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+# Every dependency is already in [workspace.dependencies]: no new `cargo audit`
+# surface, so this crate cannot red Layer 6 on an unrelated devloop.
+#
+# `tracing` is deliberately ABSENT, as in `media-protocol`: this crate handles
+# key material, and without the dependency a log macro here is a compile error
+# rather than a convention someone has to remember.
+media-protocol = { path = "../media-protocol" }
+ring = { workspace = true }
+hex = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[[bin]]
+name = "generate-frame-vectors"
+path = "src/main.rs"
