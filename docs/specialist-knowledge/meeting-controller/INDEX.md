@@ -13,6 +13,7 @@
 - Error types (McError hierarchy, From<JwtError>, MhAssignmentMissing) → `crates/mc-service/src/errors.rs`
 - Auth: McJwtValidator, validate_meeting_token, validate_guest_token → `crates/mc-service/src/auth/mod.rs`
 - Actors: controller, meeting, participant, messages, session (HMAC/HKDF), metrics → `crates/mc-service/src/actors/`
+- Media admission (ADR-0036 §4): meeting KEK + `u16` generation, roster `identity_public_key`, non-recycling `sender_id` allocator → `crates/mc-service/src/media_admission/`; KEK generated in `MeetingActor::spawn`, `sender_id` allocated in `handle_join` (`actors/meeting.rs`); key length-checked at the WebTransport boundary + `JoinResponse` fill (`webtransport/connection.rs`)
 - Join display-name plumbing: boundary truncate (connection.rs) → `display_name` field on `JoinConnection`/`ConnectionJoin` (messages.rs) → empty-claim fallback sink → `crates/mc-service/src/actors/meeting.rs:handle_join()`
 - Disconnect cause / leave latency: `DisconnectCause` enum → `crates/mc-service/src/actors/messages.rs`; skip-grace on clean close + `remove_and_broadcast_left()` choke-point → `crates/mc-service/src/actors/meeting.rs:handle_disconnect()`; cause-cell (AtomicU8) → `crates/mc-service/src/actors/participant.rs`
 - WebTransport: server (accept loop, TLS, capacity; config-driven max_idle_timeout/keep_alive for crash detection in `bind()`) → `crates/mc-service/src/webtransport/server.rs`
@@ -24,8 +25,7 @@
 - gRPC: auth interceptor + McAuthLayer (async JWKS + scope check, R-22) → `crates/mc-service/src/grpc/auth_interceptor.rs`
 - gRPC: media coordination service (MH→MC notifications, R-15) → `crates/mc-service/src/grpc/media_coordination.rs`
 - MH connection registry (participant→MH state, R-18, lifecycle via controller actor) → `crates/mc-service/src/mh_connection_registry.rs`
-- Redis: fenced client + MhAssignmentStore trait + MhAssignmentData (handlers Vec) → `crates/mc-service/src/redis/client.rs`
-- Redis: Lua scripts (atomic fencing) → `crates/mc-service/src/redis/lua_scripts.rs`
+- Redis: fenced client + MhAssignmentStore trait + MhAssignmentData (handlers Vec) → `crates/mc-service/src/redis/client.rs`; Lua scripts (atomic fencing) → `crates/mc-service/src/redis/lua_scripts.rs`
 - Health/readiness, system info → `crates/mc-service/src/observability/health.rs`, `crates/mc-service/src/system_info.rs`
 - Prometheus metric wrappers (record_register_meeting, record_mh_notification, record_webtransport_connection, record_jwt_validation, record_session_join, record_token_refresh_metrics, record_participant_leave, record_participant_disconnect, record_display_name_resolution) → `crates/mc-service/src/observability/metrics.rs`
 - MC metrics catalog → `docs/observability/metrics/mc-service.md`
@@ -35,8 +35,7 @@
 - Internal service RPCs (RegisterMc, AssignMeeting, MediaCoordinationService, RegisterMeeting) → `proto/dark_tower/internal/v1/internal.proto`
 
 ## Integration Seams
-- Client -> MC WebTransport (join, signaling) → `crates/mc-service/src/webtransport/server.rs`
-- MC <-> GC registration/heartbeat → `crates/mc-service/src/grpc/gc_client.rs`
+- Client -> MC WebTransport (join, signaling) → `crates/mc-service/src/webtransport/server.rs`; MC <-> GC registration/heartbeat → `crates/mc-service/src/grpc/gc_client.rs`
 - GC -> MC assignment → `crates/mc-service/src/grpc/mc_service.rs`
 - MH -> MC notifications (connect/disconnect) → `crates/mc-service/src/grpc/media_coordination.rs`
 - MC -> AC token management → `crates/common/src/token_manager.rs`
@@ -49,6 +48,7 @@
 - Shared bring-up (TestStackHandles, build_test_stack, seed_meeting_with_mh) + mock MH stores → `crates/mc-service/tests/common/mod.rs`
 - Accept-loop component rig → `crates/mc-service/tests/common/accept_loop_rig.rs`
 - Join flow tests (TestServer, MockMhRegistrationClient.wait_for_calls, multi-MH and skip-grpc-endpoint cases) → `crates/mc-service/tests/join_tests.rs`
+- Media admission integration (KEK in join response, malformed-key reject, sender_id non-recycling + exhaustion, roster attribution) → `crates/mc-service/tests/media_admission_integration.rs`; reconnect continuity is actor-level in `actors/meeting.rs`
 - Accept-loop status + per-failure-class drilldown → `crates/mc-service/tests/webtransport_accept_loop_integration.rs`
 - gRPC auth-layer per-failure-reason → `crates/mc-service/tests/auth_layer_integration.rs`
 - Media coordination notifications + connect/disconnect round-trip → `crates/mc-service/tests/media_coordination_integration.rs`; leave/disconnect counter deltas + ParticipantLeft wire frames → `crates/mc-service/tests/disconnect_latency_integration.rs`

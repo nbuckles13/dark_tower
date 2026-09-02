@@ -20,12 +20,24 @@
 //!   something must, and only a check can. But it inherits the weakness §11
 //!   named. **This guard does nothing for anyone building outside the
 //!   pipeline** — a local `cargo build`, a dev container, a fork's CI.
-//! * **The control being protected does not exist in tree yet.** As of
-//!   2026-09-01 there is no `compile_error!` and no `debug_assertions` usage
-//!   anywhere under `crates/`. §11 specifies the control; story task 23 lands
-//!   the assertion that it fires. This guard is premise-only and is
-//!   deliberately **not** a forcing function on that control existing —
-//!   premise first, control second.
+//! * **The control being protected now exists — one instance, since
+//!   2026-09-02.** `crates/mc-service/src/lib.rs`'s
+//!   `#[cfg(all(feature = "test-seams", not(debug_assertions)))]` over a
+//!   `compile_error!` is the first in-tree consumer of this premise: it makes the `test-seams`
+//!   sender-id exhaustion bypass fail to compile when `debug_assertions` is
+//!   off. **Superseded statement, kept so the correction is legible**: this
+//!   bullet previously read *"As of 2026-09-01 there is no `compile_error!` and
+//!   no `debug_assertions` usage anywhere under `crates/`"*, which that change
+//!   falsified. §11 specifies the control; story task 23 lands the assertion
+//!   that it fires. This guard remains premise-only and deliberately **not** a
+//!   forcing function on any control existing — the premise-first,
+//!   control-second ordering held, and a consumer simply arrived ahead of task
+//!   23 rather than because of this guard.
+//!
+//!   **The task-23 boundary below is unchanged by that arrival.** Task 23
+//!   asserts *the control fires*, via a real build; this guard asserts *the
+//!   premise*. A control existing does not make the premise self-asserting, so
+//!   they still complement and neither subsumes the other.
 //! * **The channel list below is a vocabulary, and vocabularies are
 //!   incomplete by construction.** §11's own closing argument applies:
 //!   *"Vocabulary additions cannot be cited as the protection."* So the OK
@@ -765,7 +777,7 @@ fn discover_cargo_configs(repo_root: &Path) -> Result<Vec<String>> {
 
 /// Run the release-build-profile policy.
 ///
-/// Emits `STATUS=OK REASON=release-build-profile-inputs-checked-clean` on a
+/// Emits `STATUS=OK REASON=release-build-profile-enumerated-inputs-clean` on a
 /// clean tree — a token naming the **enumeration**, never the conclusion, so a
 /// reader cannot derive "the release premise holds" from a green. A counts
 /// line precedes it making the scanned scope visible without reading source.

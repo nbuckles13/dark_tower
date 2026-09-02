@@ -905,6 +905,8 @@ mod tests {
             audio_server_muted: false,
             video_server_muted: false,
             status: super::super::messages::ParticipantStatus::Connected,
+            sender_id: crate::media_admission::fixtures::sample_sender_id(),
+            identity_public_key: crate::media_admission::fixtures::sample_identity_key(),
         });
         handle.send_update(update).await.unwrap();
 

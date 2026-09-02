@@ -496,6 +496,158 @@ pub fn record_display_name_resolution(outcome: &str) {
 }
 
 // ============================================================================
+// Media-path key custody (ADR-0036 §4, §11)
+// ============================================================================
+
+/// Label KEY for media key custody.
+///
+/// Promote to `crates/common/src/observability/` at the SECOND consumer; MC is
+/// the first emission site in the tree. Fleet-wide rollout to every service is
+/// R-26 (observability task 22), not this task.
+pub const KEY_CUSTODY_LABEL: &str = "key_custody";
+
+/// Label VALUE for media key custody. **One permitted value.**
+///
+/// ADR-0036 §4: media is encrypted between clients; MH, transport and storage
+/// cannot read it; **MC can**. That is accepted operator custody, recorded as
+/// the user's risk decision.
+///
+/// A `&'static str` const, never derived from config, deployment mode, a
+/// feature flag, or whether a KEK happens to be provisioned: this is a
+/// *constraint*, not a snapshot of today's deployment. Adding a second value
+/// requires an ADR-0036 §4 amendment.
+///
+/// This exists **in place of** an end-to-end or zero-trust boolean, which no
+/// metric, log, dashboard or document may carry — a stat panel reading
+/// `E2E: true` is a product claim rendered to an operator, who may repeat it to
+/// a customer. The label carries the truth; a boolean would carry a claim.
+pub const KEY_CUSTODY_OPERATOR: &str = "operator";
+
+/// Record that a meeting KEK was generated (one per meeting-actor creation).
+///
+/// Metric: `mc_meeting_kek_generated_total`
+/// Labels: `key_custody` (single value `operator`; cardinality 1)
+///
+/// KEK ISSUANCE RATE, and the carrier for the `key_custody` label. That is the
+/// whole of what it measures.
+///
+/// **This is NOT a "missing key material" signal, and must not be described as
+/// one.** It increments unconditionally, once per meeting-actor creation, so it
+/// is identically the meeting-creation count — there is no path where the actor
+/// exists and this does not fire. Detecting absent key material would need a
+/// second series to divide by, and MC has no meeting-creation counter
+/// (`mc_meetings_active` is a gauge), so the inference is not computable even in
+/// principle. The real not-provisioned condition is defined on the
+/// join-response side — `signaling.proto`: "the not-provisioned signal is
+/// `meeting_kek` not being exactly 32 bytes" — which is per-join, not per-meeting.
+///
+/// Forward-compatible: when KEK rotation lands this counts rotations too and
+/// genuinely diverges from meeting creation.
+///
+/// Emits NO key material, no `meeting_id`, and no `meeting_id_hash` (ADR-0036
+/// §11 bars any meeting identifier on any metric in this design). Which meeting
+/// is answered by the meeting actor's own span.
+pub fn record_meeting_kek_generated() {
+    counter!("mc_meeting_kek_generated_total",
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    )
+    .increment(1);
+}
+
+/// Record whether an admitted joiner published an identity signing key.
+///
+/// Metric: `mc_join_identity_key_presence_total`
+/// Labels: `presence`
+///
+/// Values: `"present"` (exactly 32 bytes, published on the roster) |
+/// `"absent"` (empty — the contract's NO KEY PUBLISHED state, admitted).
+/// Cardinality: 2, bounded by two `&'static str` literals at the single call
+/// site. A wrong-length key is never counted here — it is refused at the
+/// boundary and lands on `mc_session_join_failures_total{error_type=
+/// "identity_key_invalid"}`.
+///
+/// **Why both arms rather than an absent-only counter**: an absence-only series
+/// has no denominator, so "20 absent joins" is unreadable without a separate
+/// join count to divide by — the same defect that made
+/// `mc_meeting_kek_generated_total` useless as a missing-key signal. Counting
+/// both arms makes the absent *ratio* directly computable, which is the actual
+/// question ("are clients publishing keys?"). Follows the in-tree
+/// `mc_join_display_name_resolved_total{outcome}` precedent.
+///
+/// **Denominator: authenticated join ATTEMPTS that passed identity-key
+/// validation — not admissions.** Recorded at the parse, before the join call,
+/// so a join that later fails on capacity, `sender_id` exhaustion, Conflict or
+/// Draining is still counted. Deliberate: the question is about the client
+/// population, so conditioning it on server-side admission would answer a
+/// different one and would blank the series during exactly the incident an
+/// operator would consult it in. Consequence to know before you use it:
+/// `sum()` of this counter does **not** equal
+/// `mc_session_joins_total{status="success"}`.
+///
+/// **Why this exists at all**: MC admits a keyless participant, so "every client
+/// omits the key and nobody notices" must not be the silent steady state. The
+/// fail-closed obligation this rests on is the CONSUMER's — see `docs/TODO.md`,
+/// owner client, trigger before the SDK verifies any frame — and this counter is
+/// how an operator sees the population it applies to.
+///
+/// Carries **no participant and no meeting dimension** (ADR-0036 §11), and no
+/// key material: the label is presence, never a key or an id.
+/// Record the outcome of an `AssignMeetingWithMh` RPC — MC's only meeting-
+/// admission entry point from GC.
+///
+/// **Deliberately mirrors GC's `gc_mc_assignments_total{status,
+/// rejection_reason}`** (`gc-service/src/observability/metrics.rs`), which is
+/// the other end of this same RPC. Same label names, same value vocabulary —
+/// including `"success"` (**not** `"accepted"`) on the accepted arm, and
+/// `"none"` rather than an absent label or an empty string.
+/// `label-taxonomy.md` §Shared Label Names requires the canonical name for a
+/// shared concept, and diverging here would create a drift alias on day one —
+/// the point is that a responder can put the two series side by side and turn
+/// "GC says MC rejected 5%" into "which reason, on which MC instance" without a
+/// log dig.
+///
+/// The `"success"` spelling is GC's and MC follows it because **GC is the
+/// incumbent emitter of this same RPC**: a responder querying `status="success"`
+/// on both sides must not get a silently empty series on one of them, which no
+/// guard could catch since both spellings are canonical in the taxonomy. This
+/// deliberately differs from `mc_webtransport_connections_total`'s
+/// `accepted|rejected|error` — that measures connection admission, a different
+/// concept with no cross-service counterpart.
+///
+/// One divergence remains and is deliberate: MC labels `invalid_request` as
+/// `status="rejected"`, GC as `status="error"` (from GC's side it is a fault in
+/// its own request rather than a refusal of a healthy one). The
+/// `rejection_reason` values match, which is what makes the join work.
+///
+/// **Why this exists**: before it, this RPC had *no* instrumentation at all, so
+/// a responder paged by `GCMCAssignmentFailures` opened the MC dashboard and
+/// found nothing. Detection was never the gap — attribution on the MC side was.
+///
+/// Both arms, so the ratio has its denominator. `rejection_reason` is bounded by
+/// the `RejectionReason` proto enum, so cardinality is small and closed. No
+/// meeting dimension (ADR-0036 §11) — *which* meeting is answered by the log
+/// record, not by a label.
+///
+/// Note `UNHEALTHY` conflates a Redis-store failure with a `create_meeting`
+/// failure (which now includes KEK generation). Separating them is a third
+/// `RejectionReason` enum value and therefore a proto change, not a second
+/// counter bolted on here.
+pub fn record_meeting_assignment(status: &str, rejection_reason: Option<&str>) {
+    counter!("mc_meeting_assignments_total",
+        "status" => status.to_string(),
+        "rejection_reason" => rejection_reason.unwrap_or("none").to_string()
+    )
+    .increment(1);
+}
+
+pub fn record_join_identity_key_presence(presence: &str) {
+    counter!("mc_join_identity_key_presence_total",
+        "presence" => presence.to_string()
+    )
+    .increment(1);
+}
+
+// ============================================================================
 // gRPC Auth Layer 2 Metrics (ADR-0003)
 // ============================================================================
 
@@ -807,6 +959,36 @@ mod tests {
             success,
             duration: Duration::from_millis(42),
             error_category,
+        }
+    }
+
+    /// Both arms plus the full bounded `rejection_reason` vocabulary, so a
+    /// refactor collapsing a reason into `unspecified` fails here. The label
+    /// spellings are pinned deliberately: they mirror GC's
+    /// `gc_mc_assignments_total` and the two series are meant to be joinable.
+    #[test]
+    fn record_meeting_assignment_covers_both_arms_and_every_rejection_reason() {
+        let snap = MetricAssertion::snapshot();
+        record_meeting_assignment("success", None);
+        snap.counter("mc_meeting_assignments_total")
+            .with_labels(&[("status", "success"), ("rejection_reason", "none")])
+            .assert_delta(1);
+
+        for reason in &[
+            "at_capacity",
+            "draining",
+            "unhealthy",
+            "invalid_request",
+            "unspecified",
+        ] {
+            let snap = MetricAssertion::snapshot();
+            record_meeting_assignment("rejected", Some(reason));
+            snap.counter("mc_meeting_assignments_total")
+                .with_labels(&[("status", "rejected"), ("rejection_reason", *reason)])
+                .assert_delta(1);
+            snap.counter("mc_meeting_assignments_total")
+                .with_labels(&[("status", "success"), ("rejection_reason", "none")])
+                .assert_delta(0);
         }
     }
 

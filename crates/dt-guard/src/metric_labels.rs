@@ -1002,6 +1002,39 @@ mod tests {
         assert_eq!(hit.1, PiiCategory::B);
     }
 
+    /// Wave-3 cohort. These execute the matcher-shape reasoning the vocabulary
+    /// entries' comments assert in prose — the module's own `accessToken` note
+    /// records that this class of derivation was previously gotten backwards.
+    #[test]
+    fn wave3_media_path_tokens_fire_in_expected_categories() {
+        let kek = pii_token_hit("meeting_kek").expect("meeting_kek must fire");
+        assert_eq!(kek.1, PiiCategory::A);
+
+        let sender = pii_token_hit("sender_id").expect("sender_id must fire");
+        assert_eq!(sender.1, PiiCategory::B);
+
+        // The claim most worth executing: the multi-word substring pass is what
+        // makes the entry cover compounds, which the word-boundary consumers do
+        // NOT (an underscore is a word character, so `\bsender_id\b` misses this).
+        let compound = pii_token_hit("pinned_sender_id").expect("compound must fire");
+        assert_eq!(compound.1, PiiCategory::B);
+    }
+
+    /// Pins the documented GAP rather than a capability: `sender_id_hash` is
+    /// exempted by `is_hashed_label()` and is therefore NOT covered by the
+    /// CATEGORY_B `sender_id` entry. Recorded as a test so the gap is visible in
+    /// test output rather than only in prose, and so it fails loudly if someone
+    /// changes the hashed-suffix exemption without revisiting the reasoning.
+    #[test]
+    fn sender_id_hash_is_not_covered() {
+        assert!(
+            pii_token_hit("sender_id_hash").is_none(),
+            "sender_id_hash is expected to be EXEMPT — if this now fires, the \
+             label-taxonomy 'Enforcement reality' trigger has been discharged \
+             and that note must be updated"
+        );
+    }
+
     #[test]
     fn hashed_suffix_exempts_cat_b_only() {
         assert!(pii_token_hit("email_hash").is_none());

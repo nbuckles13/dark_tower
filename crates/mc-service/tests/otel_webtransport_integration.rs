@@ -29,7 +29,9 @@ use test_common::accept_loop_rig::AcceptLoopRig;
 use test_common::otel_capture::{
     install_test_propagator, known_trace_id_hex, known_traceparent, trace_id_hex, SpanCapture,
 };
-use test_common::{build_test_stack, seed_meeting_with_mh, TestStackHandles};
+use test_common::{
+    build_test_stack, sample_identity_public_key, seed_meeting_with_mh, TestStackHandles,
+};
 
 /// The W3C `trace_parent` value MC extracts is the `ClientMessage.trace_parent`
 /// field, which the SDK populates with the same `00-<trace>-<span>-<flags>`
@@ -101,7 +103,7 @@ async fn join_with_trace(
             // ADR-0036 §4: raw Ed25519 identity signing public key. Empty here —
             // this test exercises the join path, not attribution, and MC performs
             // no attestation check this story.
-            identity_public_key: Vec::new(),
+            identity_public_key: sample_identity_public_key(),
         })),
     };
     send.write_all(&encode_framed(&client_msg))

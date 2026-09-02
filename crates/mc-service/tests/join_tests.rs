@@ -40,8 +40,8 @@ use wtransport::{ClientConfig, Endpoint};
 use mc_service::redis::MhEndpointInfo;
 use test_common::accept_loop_rig::AcceptLoopRig;
 use test_common::{
-    build_test_stack, mh_handler, seed_meeting_with_handlers, seed_meeting_with_mh,
-    TestStackHandles,
+    build_test_stack, mh_handler, sample_identity_public_key, seed_meeting_with_handlers,
+    seed_meeting_with_mh, test_identity_key, TestStackHandles,
 };
 
 // ============================================================================
@@ -196,10 +196,12 @@ async fn join_and_read_response(
             capabilities: None,
             correlation_id: String::new(),
             binding_token: String::new(),
-            // ADR-0036 §4: raw Ed25519 identity signing public key. Empty here —
-            // this test exercises the join path, not attribution, and MC performs
-            // no attestation check this story.
-            identity_public_key: Vec::new(),
+            // ADR-0036 §4: raw Ed25519 identity signing public key, exactly 32
+            // bytes. MC rejects any other length, so every join in this suite
+            // must present one. Its VALUE is irrelevant here — MC performs no
+            // `cnf` check, so acceptance means trust-on-first-use and nothing
+            // about identity.
+            identity_public_key: sample_identity_public_key(),
         })),
     };
 
@@ -250,10 +252,12 @@ async fn join_keep_open(
             capabilities: None,
             correlation_id: String::new(),
             binding_token: String::new(),
-            // ADR-0036 §4: raw Ed25519 identity signing public key. Empty here —
-            // this test exercises the join path, not attribution, and MC performs
-            // no attestation check this story.
-            identity_public_key: Vec::new(),
+            // ADR-0036 §4: raw Ed25519 identity signing public key, exactly 32
+            // bytes. MC rejects any other length, so every join in this suite
+            // must present one. Its VALUE is irrelevant here — MC performs no
+            // `cnf` check, so acceptance means trust-on-first-use and nothing
+            // about identity.
+            identity_public_key: sample_identity_public_key(),
         })),
     };
 
@@ -576,6 +580,7 @@ async fn test_actor_level_join_success() {
             "part-1".to_string(),
             String::new(),
             false,
+            test_identity_key(),
             outbound_tx,
         )
         .await
@@ -621,6 +626,7 @@ async fn test_actor_level_join_meeting_not_found() {
             "part-1".to_string(),
             String::new(),
             false,
+            test_identity_key(),
             outbound_tx,
         )
         .await;
@@ -674,6 +680,7 @@ async fn test_actor_level_second_joiner_sees_first_in_roster() {
             "part-1".to_string(),
             "Alice".to_string(),
             false,
+            test_identity_key(),
             tx1,
         )
         .await
@@ -699,6 +706,7 @@ async fn test_actor_level_second_joiner_sees_first_in_roster() {
             "part-2".to_string(),
             "Bob".to_string(),
             false,
+            test_identity_key(),
             tx2,
         )
         .await
@@ -757,6 +765,7 @@ async fn test_join_records_display_name_resolution_outcome_metric() {
             "part-1".to_string(),
             "Alice".to_string(),
             false,
+            test_identity_key(),
             tx1,
         )
         .await
@@ -787,6 +796,7 @@ async fn test_join_records_display_name_resolution_outcome_metric() {
             "part-2".to_string(),
             String::new(),
             false,
+            test_identity_key(),
             tx2,
         )
         .await
@@ -840,10 +850,12 @@ async fn test_participant_joined_notification_via_bridge() {
             capabilities: None,
             correlation_id: String::new(),
             binding_token: String::new(),
-            // ADR-0036 §4: raw Ed25519 identity signing public key. Empty here —
-            // this test exercises the join path, not attribution, and MC performs
-            // no attestation check this story.
-            identity_public_key: Vec::new(),
+            // ADR-0036 §4: raw Ed25519 identity signing public key, exactly 32
+            // bytes. MC rejects any other length, so every join in this suite
+            // must present one. Its VALUE is irrelevant here — MC performs no
+            // `cnf` check, so acceptance means trust-on-first-use and nothing
+            // about identity.
+            identity_public_key: sample_identity_public_key(),
         })),
     };
     send1
@@ -892,10 +904,12 @@ async fn test_participant_joined_notification_via_bridge() {
             capabilities: None,
             correlation_id: String::new(),
             binding_token: String::new(),
-            // ADR-0036 §4: raw Ed25519 identity signing public key. Empty here —
-            // this test exercises the join path, not attribution, and MC performs
-            // no attestation check this story.
-            identity_public_key: Vec::new(),
+            // ADR-0036 §4: raw Ed25519 identity signing public key, exactly 32
+            // bytes. MC rejects any other length, so every join in this suite
+            // must present one. Its VALUE is irrelevant here — MC performs no
+            // `cnf` check, so acceptance means trust-on-first-use and nothing
+            // about identity.
+            identity_public_key: sample_identity_public_key(),
         })),
     };
     send2

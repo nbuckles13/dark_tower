@@ -29,7 +29,9 @@ use proto_gen::dark_tower::signaling::v1::{
 use wtransport::{ClientConfig, Endpoint};
 
 use test_common::accept_loop_rig::AcceptLoopRig;
-use test_common::{build_test_stack, seed_meeting_with_mh, TestStackHandles};
+use test_common::{
+    build_test_stack, sample_identity_public_key, seed_meeting_with_mh, TestStackHandles,
+};
 
 async fn start_stack(label: &str) -> (TestStackHandles, AcceptLoopRig) {
     let stack = build_test_stack(label).await;
@@ -78,7 +80,7 @@ fn join_frame(meeting_id: &str, join_token: &str) -> Vec<u8> {
             // ADR-0036 §4: raw Ed25519 identity signing public key. Empty here —
             // this test exercises the join path, not attribution, and MC performs
             // no attestation check this story.
-            identity_public_key: Vec::new(),
+            identity_public_key: sample_identity_public_key(),
         })),
     })
 }

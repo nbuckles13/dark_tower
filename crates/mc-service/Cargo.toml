@@ -10,6 +10,18 @@ description = "Dark Tower Meeting Controller - stateful WebTransport signaling s
 [lints]
 workspace = true
 
+[features]
+default = []
+# Test-only seams. NOT default-enabled, and a release build with this on fails
+# to compile (see `src/lib.rs`). Enabled for this crate's own test targets via
+# the self dev-dependency below, because integration tests in `tests/` compile
+# against `mc-service` as an EXTERNAL crate and so cannot see `#[cfg(test)]`
+# items. Reaching the exhaustion reject end-to-end — through `handle_join`, the
+# `JoinResponse` path and `record_session_join`'s `error_type` label — requires
+# that external-crate view; an actor-level `cfg(test)` seam would only reach the
+# allocator arithmetic.
+test-seams = []
+
 [dependencies]
 # Workspace dependencies
 tokio = { workspace = true }
@@ -63,6 +75,13 @@ proto-gen = { path = "../proto-gen" }
 media-protocol = { path = "../media-protocol" }
 
 [dev-dependencies]
+# Self dev-dependency: enables the `test-seams` feature for this crate's own
+# test targets only. Integration tests in `tests/` link `mc-service` as an
+# external crate and cannot see `#[cfg(test)]` items, so this is the only way
+# the exhaustion reject can be exercised through the real join path. A plain
+# `cargo build -p mc-service` compiles none of the seam.
+mc-service = { path = ".", features = ["test-seams"] }
+
 criterion = { workspace = true }
 mc-test-utils = { path = "../mc-test-utils" }
 # Metrics testing

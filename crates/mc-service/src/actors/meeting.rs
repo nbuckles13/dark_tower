@@ -14,6 +14,7 @@
 //! 3. If not reconnected: participant removed, slots released
 
 use crate::errors::McError;
+use crate::media_admission::{IdentityPublicKey, MeetingKeyState, SenderId, SenderIdAllocator};
 
 use super::messages::{
     DisconnectCause, JoinResult, LeaveReason, MeetingMessage, MeetingState, ParticipantInfo,
@@ -65,6 +66,13 @@ impl MeetingActorHandle {
     ///   claim (already length-bounded at the connection boundary); empty means the
     ///   claim carried no name and a generic label is applied at the join sink
     /// * `is_host` - Whether this participant has host privileges
+    /// * `identity_public_key` - The joiner's Ed25519 identity signing public
+    ///   key, parsed at the WebTransport trust boundary; `None` means no key
+    ///   published
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "actor join signature threads the full join tuple (ids + display_name + host flag + identity key + stream); bundling into a JoinConnectionParams struct is a larger cross-message refactor tracked in docs/TODO.md"
+    )]
     pub async fn connection_join(
         &self,
         connection_id: String,
@@ -72,6 +80,7 @@ impl MeetingActorHandle {
         participant_id: String,
         display_name: String,
         is_host: bool,
+        identity_public_key: Option<IdentityPublicKey>,
         stream_tx: Option<tokio::sync::mpsc::Sender<bytes::Bytes>>,
     ) -> Result<JoinResult, McError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -82,6 +91,7 @@ impl MeetingActorHandle {
                 participant_id,
                 display_name,
                 is_host,
+                identity_public_key,
                 stream_tx,
                 respond_to: tx,
             })
@@ -281,6 +291,19 @@ struct Participant {
     video_server_muted: bool,
     /// Whether this participant has host privileges.
     is_host: bool,
+    /// Per-meeting sender id, allocated once at admission (ADR-0036 §2, §4).
+    ///
+    /// Held on the participant rather than recomputed, which is what makes
+    /// reconnect continuity fall out for free: a reconnecting participant is
+    /// still in the roster and still holds this, so the allocator is never
+    /// consulted and no id is recycled.
+    sender_id: SenderId,
+    /// Ed25519 identity signing public key, as presented at join. `None` means
+    /// **no key published** — a defined state, not a failure.
+    ///
+    /// Trust on first use — no `cnf` binding. Same-keyholder consistency only,
+    /// never a verified identity (ADR-0036 §4).
+    identity_public_key: Option<IdentityPublicKey>,
 }
 
 impl Participant {
@@ -294,6 +317,8 @@ impl Participant {
             audio_server_muted: self.audio_server_muted,
             video_server_muted: self.video_server_muted,
             status: self.status,
+            sender_id: self.sender_id,
+            identity_public_key: self.identity_public_key,
         }
     }
 }
@@ -341,6 +366,13 @@ pub struct MeetingActor {
     mailbox: MailboxMonitor,
     /// Handle to self, for passing to child ParticipantActors.
     self_handle: MeetingActorHandle,
+    /// The meeting KEK and its generation (ADR-0036 §4).
+    ///
+    /// Generated at meeting-actor creation, held only here, never persisted and
+    /// never logged. Dies with the actor.
+    media_keys: MeetingKeyState,
+    /// Monotonic, non-recycling `sender_id` allocator for this meeting.
+    sender_ids: SenderIdAllocator,
 }
 
 impl MeetingActor {
@@ -356,13 +388,43 @@ impl MeetingActor {
     /// * `controller_metrics` - Controller metrics for GC heartbeat reporting (participant count)
     /// * `master_secret` - Master secret for HKDF key derivation (ADR-0023). Wrapped in
     ///   SecretBox to ensure secure memory handling (zeroization on drop, redacted Debug).
+    /// # Errors
+    ///
+    /// [`McError::Internal`] if the system CSPRNG cannot produce the meeting
+    /// KEK. **Fail closed**: the meeting is not created. There is deliberately
+    /// no fallback RNG and no default key — a predictable KEK would silently
+    /// defeat every confidentiality property ADR-0036 §4 claims.
     pub fn spawn(
         meeting_id: String,
         cancel_token: CancellationToken,
         metrics: Arc<ActorMetrics>,
         controller_metrics: Arc<ControllerMetrics>,
         master_secret: SecretBox<Vec<u8>>,
-    ) -> (MeetingActorHandle, JoinHandle<()>) {
+    ) -> Result<(MeetingActorHandle, JoinHandle<()>), McError> {
+        Self::spawn_inner(
+            meeting_id,
+            cancel_token,
+            metrics,
+            controller_metrics,
+            master_secret,
+            SenderIdAllocator::new(),
+        )
+    }
+
+    /// Shared construction for [`Self::spawn`] and the `test-seams` variant.
+    ///
+    /// The allocator is a parameter rather than always `SenderIdAllocator::new()`
+    /// so the seam threads a pre-seeded cursor without duplicating this body —
+    /// a forked copy would drift from the real construction path and the
+    /// exhaustion test would stop testing production behaviour.
+    fn spawn_inner(
+        meeting_id: String,
+        cancel_token: CancellationToken,
+        metrics: Arc<ActorMetrics>,
+        controller_metrics: Arc<ControllerMetrics>,
+        master_secret: SecretBox<Vec<u8>>,
+        sender_ids: SenderIdAllocator,
+    ) -> Result<(MeetingActorHandle, JoinHandle<()>), McError> {
         let (sender, receiver) = mpsc::channel(MEETING_CHANNEL_BUFFER);
 
         // Build the handle first so we can give the actor a clone of it
@@ -371,6 +433,27 @@ impl MeetingActor {
             cancel_token: cancel_token.clone(),
             meeting_id: meeting_id.clone(),
         };
+
+        // ADR-0036 §4: the meeting KEK is generated at meeting-actor creation,
+        // random, held only in memory, never persisted and never logged.
+        let media_keys =
+            MeetingKeyState::generate(&ring::rand::SystemRandom::new()).map_err(|_| {
+                // No key material in the error, and none in any log this
+                // produces — the failure is that there IS no key.
+                McError::Internal("Failed to initialise meeting key material".to_string())
+            })?;
+
+        crate::observability::metrics::record_meeting_kek_generated();
+
+        // `key_custody=operator` (ADR-0036 §4, §11): media is encrypted between
+        // clients; MH, transport and storage cannot read it; MC can. Never
+        // described as end-to-end or zero-trust, and never a boolean.
+        info!(
+            target: "mc.actor.meeting",
+            meeting_id = %meeting_id,
+            key_custody = crate::observability::metrics::KEY_CUSTODY_OPERATOR,
+            "Meeting key material provisioned"
+        );
 
         let actor = Self {
             meeting_id: meeting_id.clone(),
@@ -388,11 +471,47 @@ impl MeetingActor {
             controller_metrics,
             mailbox: MailboxMonitor::new(ActorType::Meeting, &meeting_id),
             self_handle: handle.clone(),
+            media_keys,
+            sender_ids,
         };
 
         let task_handle = tokio::spawn(actor.run());
 
-        (handle, task_handle)
+        Ok((handle, task_handle))
+    }
+
+    /// Spawn a meeting actor whose `sender_id` allocator is pre-seeded.
+    /// **Test builds only.**
+    ///
+    /// Exists so the fail-closed exhaustion reject can be exercised through the
+    /// real join path — `handle_join`, the `JoinResponse` write, and
+    /// `record_session_join`'s `error_type` label — without performing 65535
+    /// joins. Compiled only under the non-default `test-seams` feature, and a
+    /// release build with that feature on fails to compile (see `lib.rs`).
+    ///
+    /// This IS the exhaustion guard's bypass. It must never be reachable in
+    /// production.
+    ///
+    /// # Errors
+    ///
+    /// As [`MeetingActor::spawn`].
+    #[cfg(feature = "test-seams")]
+    pub fn spawn_with_sender_id_cursor(
+        meeting_id: String,
+        cancel_token: CancellationToken,
+        metrics: Arc<ActorMetrics>,
+        controller_metrics: Arc<ControllerMetrics>,
+        master_secret: SecretBox<Vec<u8>>,
+        next_sender_id: Option<std::num::NonZeroU16>,
+    ) -> Result<(MeetingActorHandle, JoinHandle<()>), McError> {
+        Self::spawn_inner(
+            meeting_id,
+            cancel_token,
+            metrics,
+            controller_metrics,
+            master_secret,
+            SenderIdAllocator::resuming_from(next_sender_id),
+        )
     }
 
     /// Run the actor message loop.
@@ -468,6 +587,7 @@ impl MeetingActor {
                 participant_id,
                 display_name,
                 is_host,
+                identity_public_key,
                 stream_tx,
                 respond_to,
             } => {
@@ -478,6 +598,7 @@ impl MeetingActor {
                         participant_id,
                         display_name,
                         is_host,
+                        identity_public_key,
                         stream_tx,
                     )
                     .await;
@@ -560,6 +681,10 @@ impl MeetingActor {
     /// - Correlation ID (UUIDv7)
     /// - Binding token via HMAC-SHA256(meeting_key, correlation_id || participant_id || nonce)
     #[instrument(skip_all, fields(meeting_id = %self.meeting_id))]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "actor join signature threads the full join tuple (ids + display_name + host flag + identity key + stream); bundling into a JoinConnectionParams struct is a larger cross-message refactor tracked in docs/TODO.md"
+    )]
     async fn handle_join(
         &mut self,
         connection_id: String,
@@ -567,6 +692,7 @@ impl MeetingActor {
         participant_id: String,
         display_name: String,
         is_host: bool,
+        identity_public_key: Option<IdentityPublicKey>,
         stream_tx: Option<tokio::sync::mpsc::Sender<bytes::Bytes>>,
     ) -> Result<JoinResult, McError> {
         if self.is_shutting_down {
@@ -578,6 +704,52 @@ impl MeetingActor {
             return Err(McError::Conflict(
                 "Participant already in meeting".to_string(),
             ));
+        }
+
+        // ADR-0036 §2/§4, invariant R-35: allocate the sender id BEFORE any
+        // other admission state is built, so an exhaustion reject costs nothing
+        // and leaves nothing to unwind.
+        //
+        // Fail closed. At the wall we REJECT the admission rather than
+        // allocating: a warn-and-continue that still wrapped would silently
+        // reissue a live sender_id and produce exactly the key-id collision
+        // R-35 exists to prevent. The KEK-epoch reset that would reclaim the
+        // namespace is deferred with all KEK rotation, so there is no in-place
+        // operator remedy — the meeting must end and restart.
+        let allocation = self.sender_ids.allocate().map_err(|_| {
+            // OPS-8: logged HERE, not at the connection layer. This function's
+            // span carries `meeting_id`; the WebTransport connection span
+            // carries `connection_id` only, and the metric correctly carries no
+            // meeting identifier — so without this line an operator at the wall
+            // could not tell WHICH meeting exhausted.
+            warn!(
+                target: "mc.actor.meeting",
+                admissions_total = self.sender_ids.issued(),
+                meeting_age_seconds = chrono::Utc::now().timestamp() - self.created_at,
+                "sender_id space exhausted; refusing admission. The namespace is consumed by \
+                 cumulative lifetime admissions, not concurrent participants, so the participant \
+                 cap does not bound it. No in-place remedy: the meeting must end and restart."
+            );
+            McError::SenderIdSpaceExhausted
+        })?;
+        let sender_id = allocation.sender_id;
+
+        // `high_watermark_crossed` is the allocator's own one-shot latch (true on
+        // exactly the crossing allocation and never again), so there is no
+        // second guard here — one latch, unit-tested in `sender_id.rs`.
+        if allocation.high_watermark_crossed {
+            // Forensic, not actionable: the remedy at 90% and at 100% is
+            // identical, so this exists so that after an exhaustion incident an
+            // operator can reconstruct whether consumption was sudden or
+            // gradual. Answerable from this one line without joining back to
+            // the meeting-create record. Carries no sender_id value.
+            warn!(
+                target: "mc.actor.meeting",
+                admissions_total = self.sender_ids.issued(),
+                namespace_remaining = self.sender_ids.remaining(),
+                meeting_age_seconds = chrono::Utc::now().timestamp() - self.created_at,
+                "sender_id namespace past high watermark"
+            );
         }
 
         debug!(
@@ -650,6 +822,8 @@ impl MeetingActor {
             audio_server_muted: false,
             video_server_muted: false,
             is_host,
+            sender_id,
+            identity_public_key,
         };
 
         let participant_info = participant.to_info();
@@ -689,6 +863,10 @@ impl MeetingActor {
             binding_token,
             participants,
             fencing_generation: self.fencing_generation,
+            sender_id,
+            // Arc clone: a handle, never a copy of the key bytes.
+            meeting_kek: Arc::clone(self.media_keys.kek()),
+            kek_generation: self.media_keys.generation(),
             participant_handle: conn_handle_for_result,
         })
     }
@@ -1380,13 +1558,45 @@ mod tests {
         SecretBox::new(Box::new(vec![0u8; 32]))
     }
 
+    /// Spawn a meeting actor, panicking if KEK generation fails.
+    ///
+    /// `MeetingActor::spawn` is fallible because it generates the meeting KEK
+    /// from the system CSPRNG and fails closed if that fails (ADR-0036 §4).
+    /// Tests treat that as unreachable rather than threading a `Result`.
+    fn must_spawn(
+        meeting_id: String,
+        cancel_token: CancellationToken,
+        metrics: Arc<ActorMetrics>,
+        controller_metrics: Arc<ControllerMetrics>,
+        master_secret: SecretBox<Vec<u8>>,
+    ) -> (MeetingActorHandle, JoinHandle<()>) {
+        MeetingActor::spawn(
+            meeting_id,
+            cancel_token,
+            metrics,
+            controller_metrics,
+            master_secret,
+        )
+        .expect("system CSPRNG must be available in tests")
+    }
+
+    /// A syntactically valid identity key for in-crate actor tests.
+    ///
+    /// Exact-length only — MC does no curve validation, so a fixed pattern is
+    /// sufficient. Accepting it asserts nothing about identity: with no `cnf`
+    /// binding this is trust-on-first-use, giving same-keyholder consistency
+    /// and never a verified identity.
+    fn test_identity_key() -> Option<IdentityPublicKey> {
+        crate::media_admission::fixtures::sample_identity_key()
+    }
+
     #[tokio::test]
     async fn test_meeting_actor_spawn() {
         let metrics = ActorMetrics::new();
         let controller_metrics = ControllerMetrics::new();
         let cancel_token = CancellationToken::new();
 
-        let (handle, _task) = MeetingActor::spawn(
+        let (handle, _task) = must_spawn(
             "meeting-123".to_string(),
             cancel_token.clone(),
             metrics,
@@ -1407,7 +1617,7 @@ mod tests {
         let controller_metrics = ControllerMetrics::new();
         let cancel_token = CancellationToken::new();
 
-        let (handle, _task) = MeetingActor::spawn(
+        let (handle, _task) = must_spawn(
             "meeting-join-test".to_string(),
             cancel_token.clone(),
             metrics,
@@ -1422,6 +1632,7 @@ mod tests {
                 "part-1".to_string(),
                 String::new(),
                 false, // not host
+                test_identity_key(),
                 None,
             )
             .await;
@@ -1442,7 +1653,7 @@ mod tests {
         let controller_metrics = ControllerMetrics::new();
         let cancel_token = CancellationToken::new();
 
-        let (handle, _task) = MeetingActor::spawn(
+        let (handle, _task) = must_spawn(
             "meeting-dup-test".to_string(),
             cancel_token.clone(),
             metrics,
@@ -1457,6 +1668,7 @@ mod tests {
                 "part-1".to_string(),
                 String::new(),
                 false,
+                test_identity_key(),
                 None,
             )
             .await;
@@ -1469,6 +1681,7 @@ mod tests {
                 "part-1".to_string(),
                 String::new(),
                 false,
+                test_identity_key(),
                 None,
             )
             .await;
@@ -1483,7 +1696,7 @@ mod tests {
         let controller_metrics = ControllerMetrics::new();
         let cancel_token = CancellationToken::new();
 
-        let (handle, _task) = MeetingActor::spawn(
+        let (handle, _task) = must_spawn(
             "meeting-state-test".to_string(),
             cancel_token.clone(),
             metrics,
@@ -1499,6 +1712,7 @@ mod tests {
                 "part-1".to_string(),
                 String::new(),
                 false,
+                test_identity_key(),
                 None,
             )
             .await;
@@ -1524,7 +1738,7 @@ mod tests {
         let controller_metrics = ControllerMetrics::new();
         let cancel_token = CancellationToken::new();
 
-        let (handle, _task) = MeetingActor::spawn(
+        let (handle, _task) = must_spawn(
             "meeting-name-test".to_string(),
             cancel_token.clone(),
             metrics,
@@ -1539,6 +1753,7 @@ mod tests {
                 "part-1".to_string(),
                 "Alice".to_string(),
                 false,
+                test_identity_key(),
                 None,
             )
             .await
@@ -1550,6 +1765,7 @@ mod tests {
                 "part-2".to_string(),
                 "Bob".to_string(),
                 false,
+                test_identity_key(),
                 None,
             )
             .await
@@ -1584,7 +1800,7 @@ mod tests {
         let controller_metrics = ControllerMetrics::new();
         let cancel_token = CancellationToken::new();
 
-        let (handle, _task) = MeetingActor::spawn(
+        let (handle, _task) = must_spawn(
             "meeting-fallback-test".to_string(),
             cancel_token.clone(),
             metrics,
@@ -1599,6 +1815,7 @@ mod tests {
                 "part-1".to_string(),
                 String::new(), // genuine absence → generic fallback
                 false,
+                test_identity_key(),
                 None,
             )
             .await
@@ -1620,7 +1837,7 @@ mod tests {
         let controller_metrics = ControllerMetrics::new();
         let cancel_token = CancellationToken::new();
 
-        let (handle, _task) = MeetingActor::spawn(
+        let (handle, _task) = must_spawn(
             "meeting-leave-test".to_string(),
             cancel_token.clone(),
             metrics,
@@ -1636,6 +1853,7 @@ mod tests {
                 "part-1".to_string(),
                 String::new(),
                 false,
+                test_identity_key(),
                 None,
             )
             .await;
@@ -1651,13 +1869,92 @@ mod tests {
         handle.cancel();
     }
 
+    /// `sender_id` continuity across an ADR-0023 reconnect.
+    ///
+    /// # What this exercises, and what it does NOT prove about production
+    ///
+    /// This drives the **actor-level** `handle_reconnect`. That path is not yet
+    /// wired to the WebTransport accept path — `connection_reconnect` has no
+    /// caller outside `actors/` — so it is **not production-reachable today**;
+    /// a browser "reconnect" is currently a fresh join with a fresh
+    /// `participant_id` and therefore a NEW `sender_id`. That is correct
+    /// (non-recycling), just not continuity. Continuity is proven here at the
+    /// actor seam, and the test is named for that rather than for a shipped
+    /// guarantee.
+    ///
+    /// # Continuity is not recycling
+    ///
+    /// Keeping an id across a reconnect does not violate R-35: the participant
+    /// never left the roster, so the id was never released and the allocator is
+    /// never consulted. The continuity key is the ADR-0023 `correlation_id`
+    /// plus its HMAC `binding_token` — never a client-supplied participant id,
+    /// which a caller could forge to capture someone else's `sender_id`.
+    #[tokio::test]
+    async fn sender_id_continuity_across_actor_level_reconnect() {
+        let (handle, _task) = must_spawn(
+            "meeting-sender-id-continuity".to_string(),
+            CancellationToken::new(),
+            ActorMetrics::new(),
+            ControllerMetrics::new(),
+            test_secret(),
+        );
+
+        let join = handle
+            .connection_join(
+                "conn-1".to_string(),
+                "user-1".to_string(),
+                "part-1".to_string(),
+                String::new(),
+                false,
+                test_identity_key(),
+                None,
+            )
+            .await
+            .expect("join succeeds");
+        let original_sender_id = join.sender_id;
+
+        // Mark the connection lost so the participant enters the ADR-0023 grace
+        // period rather than being removed.
+        handle
+            .connection_disconnected(
+                "conn-1".to_string(),
+                "part-1".to_string(),
+                DisconnectCause::ConnectionLost,
+            )
+            .await
+            .expect("disconnect notification delivered");
+
+        handle
+            .connection_reconnect(
+                "conn-2".to_string(),
+                join.correlation_id.clone(),
+                join.binding_token.clone(),
+            )
+            .await
+            .expect("reconnect within grace succeeds");
+
+        let state = handle.get_state().await.expect("get_state");
+        let entry = state
+            .participants
+            .iter()
+            .find(|p| p.participant_id == "part-1")
+            .expect("participant survived the reconnect");
+
+        assert_eq!(
+            entry.sender_id, original_sender_id,
+            "a reconnecting participant keeps its sender_id: it never left the roster, so the id \
+             was never released. Issuing a new one here would burn namespace on every transient \
+             network blip."
+        );
+    }
+
     #[tokio::test]
     async fn test_meeting_actor_reconnect() {
         let metrics = ActorMetrics::new();
         let controller_metrics = ControllerMetrics::new();
         let cancel_token = CancellationToken::new();
 
-        let (handle, _task) = MeetingActor::spawn(
+        let (handle, _task) = must_spawn(
             "meeting-reconnect-test".to_string(),
             cancel_token.clone(),
             metrics,
@@ -1673,6 +1970,7 @@ mod tests {
                 "part-1".to_string(),
                 String::new(),
                 false,
+                test_identity_key(),
                 None,
             )
             .await
@@ -1714,7 +2012,7 @@ mod tests {
         let controller_metrics = ControllerMetrics::new();
         let cancel_token = CancellationToken::new();
 
-        let (handle, _task) = MeetingActor::spawn(
+        let (handle, _task) = must_spawn(
             "meeting-reconnect-invalid".to_string(),
             cancel_token.clone(),
             metrics,
@@ -1730,6 +2028,7 @@ mod tests {
                 "part-1".to_string(),
                 String::new(),
                 false,
+                test_identity_key(),
                 None,
             )
             .await
@@ -1770,7 +2069,7 @@ mod tests {
         let controller_metrics = ControllerMetrics::new();
         let cancel_token = CancellationToken::new();
 
-        let (handle, _task) = MeetingActor::spawn(
+        let (handle, _task) = must_spawn(
             "meeting-mute-test".to_string(),
             cancel_token.clone(),
             metrics,
@@ -1786,6 +2085,7 @@ mod tests {
                 "part-1".to_string(),
                 String::new(),
                 false,
+                test_identity_key(),
                 None,
             )
             .await;
@@ -1815,7 +2115,7 @@ mod tests {
         let controller_metrics = ControllerMetrics::new();
         let cancel_token = CancellationToken::new();
 
-        let (handle, _task) = MeetingActor::spawn(
+        let (handle, _task) = must_spawn(
             "meeting-server-mute-test".to_string(),
             cancel_token.clone(),
             metrics,
@@ -1831,6 +2131,7 @@ mod tests {
                 "part-1".to_string(),
                 String::new(),
                 true, // host
+                test_identity_key(),
                 None,
             )
             .await;
@@ -1841,6 +2142,7 @@ mod tests {
                 "part-2".to_string(),
                 String::new(),
                 false, // not host
+                test_identity_key(),
                 None,
             )
             .await;
@@ -1870,7 +2172,7 @@ mod tests {
         let controller_metrics = ControllerMetrics::new();
         let cancel_token = CancellationToken::new();
 
-        let (handle, _task) = MeetingActor::spawn(
+        let (handle, _task) = must_spawn(
             "meeting-server-mute-denied".to_string(),
             cancel_token.clone(),
             metrics,
@@ -1886,6 +2188,7 @@ mod tests {
                 "part-1".to_string(),
                 String::new(),
                 false, // not host
+                test_identity_key(),
                 None,
             )
             .await;
@@ -1896,6 +2199,7 @@ mod tests {
                 "part-2".to_string(),
                 String::new(),
                 false, // not host
+                test_identity_key(),
                 None,
             )
             .await;
@@ -1915,7 +2219,7 @@ mod tests {
         let controller_metrics = ControllerMetrics::new();
         let cancel_token = CancellationToken::new();
 
-        let (handle, _task) = MeetingActor::spawn(
+        let (handle, _task) = must_spawn(
             "meeting-token-test".to_string(),
             cancel_token.clone(),
             metrics,
@@ -1942,7 +2246,7 @@ mod tests {
         let controller_metrics = ControllerMetrics::new();
         let cancel_token = CancellationToken::new();
 
-        let (handle, _task) = MeetingActor::spawn(
+        let (handle, _task) = must_spawn(
             "meeting-grace-period-test".to_string(),
             cancel_token.clone(),
             metrics,
@@ -1958,6 +2262,7 @@ mod tests {
                 "part-1".to_string(),
                 String::new(),
                 false,
+                test_identity_key(),
                 None,
             )
             .await
@@ -2027,7 +2332,7 @@ mod tests {
         let controller_metrics = ControllerMetrics::new();
         let cancel_token = CancellationToken::new();
 
-        let (handle, _task) = MeetingActor::spawn(
+        let (handle, _task) = must_spawn(
             "meeting-reconnect-grace-test".to_string(),
             cancel_token.clone(),
             metrics,
@@ -2043,6 +2348,7 @@ mod tests {
                 "part-1".to_string(),
                 String::new(),
                 false,
+                test_identity_key(),
                 None,
             )
             .await
@@ -2094,7 +2400,7 @@ mod tests {
         let controller_metrics = ControllerMetrics::new();
         let cancel_token = CancellationToken::new();
 
-        let (handle, _task) = MeetingActor::spawn(
+        let (handle, _task) = must_spawn(
             "meeting-clean-close-test".to_string(),
             cancel_token.clone(),
             metrics,
@@ -2110,6 +2416,7 @@ mod tests {
                 "part-1".to_string(),
                 String::new(),
                 false,
+                test_identity_key(),
                 None,
             )
             .await
@@ -2153,7 +2460,7 @@ mod tests {
         let controller_metrics = ControllerMetrics::new();
         let cancel_token = CancellationToken::new();
 
-        let (handle, _task) = MeetingActor::spawn(
+        let (handle, _task) = must_spawn(
             "meeting-conn-lost-grace-test".to_string(),
             cancel_token.clone(),
             metrics,
@@ -2168,6 +2475,7 @@ mod tests {
                 "part-1".to_string(),
                 String::new(),
                 false,
+                test_identity_key(),
                 None,
             )
             .await

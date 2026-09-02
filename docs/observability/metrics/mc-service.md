@@ -171,12 +171,120 @@ All MC service metrics follow ADR-0011 naming conventions with the `mc_` prefix.
 - **Type**: Counter
 - **Description**: Total session join failures by error type
 - **Labels**:
-  - `error_type`: Bounded by `McError` enum variants (e.g., `jwt_validation`, `internal`, `meeting_not_found`, `mc_capacity_exceeded`, `meeting_capacity_exceeded`)
-- **Cardinality**: Low (~18 error variants, bounded by `McError` enum)
+  - `error_type`: Bounded by `McError` enum variants (e.g., `jwt_validation`, `internal`, `meeting_not_found`, `mc_capacity_exceeded`, `meeting_capacity_exceeded`, `identity_key_invalid`, `sender_id_space_exhausted`)
+- **Cardinality**: Low (~20 error variants, bounded by `McError` enum)
+- **Label-name note**: the label is `error_type`, **not** `reason`. `reason` is reserved by
+  `docs/observability/label-taxonomy.md` for per-frame media-path drop reasons; this classifies a
+  *service operation* failure. Do not "normalise" one into the other.
+- **ADR-0036 media-path values** (story task 10):
+  - `identity_key_invalid` — the joiner presented an `identity_public_key` whose length was
+    **neither 0 nor exactly 32 bytes**. Covers short, long and oversized as ONE value deliberately:
+    the client-facing message is byte-identical across all of them, and a per-cause label would be a
+    server-side oracle for a distinction the wire deliberately hides. **Absent is NOT here** — length
+    0 is admitted (the contract's NO KEY PUBLISHED state) and lands on
+    `mc_join_identity_key_presence_total{presence="absent"}` below. So this value means a client sent
+    a wrongly-encoded key, never that a client has not implemented the field.
+  - `sender_id_space_exhausted` — the meeting consumed all 65535 `sender_id`s and MC refused the
+    admission rather than wrapping onto a live id (invariant R-35). **Cumulative lifetime
+    admissions, not concurrent participants**, so `MC_MAX_PARTICIPANTS` does not bound it. See
+    `mc-incident-response.md` Scenario 8.
 - **Usage**: Diagnose join failure root causes, alert on specific failure patterns
 - **Recorded in**: `connection.rs` on join failure only
 - **Alert**: Used indirectly via `MCHighJoinFailureRate` (this metric provides error type breakdown for diagnosis)
 - **Dashboard**: MC Overview - Join Failures by Error Type (Join Flow row)
+
+---
+
+### `mc_meeting_assignments_total`
+- **Type**: Counter
+- **Description**: Outcome of every `AssignMeetingWithMh` RPC — MC's only meeting-admission entry
+  point from GC.
+- **Labels**:
+  - `status`: `success` | `rejected` — **`success`, not `accepted`**, matching GC (see below)
+  - `rejection_reason`: bounded by the `RejectionReason` proto enum — `none` (on `success`),
+    `at_capacity`, `draining`, `unhealthy`, `invalid_request`, `unspecified`
+- **Cardinality**: Low (2 × 6, and most combinations unreachable)
+- **Mirrors GC deliberately**: `gc_mc_assignments_total{status, rejection_reason}` is the other end
+  of this same RPC and uses the same label names and value spellings, per `label-taxonomy.md`
+  §Shared Label Names. Read them side by side to turn "GC says MC rejected 5% of assignments" into
+  "which reason, on which MC instance" without a log dig. **The success arm is `success`, GC's
+  spelling — deliberately NOT `accepted`**, which is what `mc_webtransport_connections_total` uses:
+  that metric measures connection admission, a different concept with no cross-service counterpart,
+  whereas this one measures the same RPC GC already measures, and GC is the incumbent emitter. A
+  responder querying `status="success"` against both series must not get a silently empty one on the
+  MC side, and no guard could catch that because both spellings are canonical in the taxonomy.
+  One deliberate difference remains: MC labels `invalid_request` as `status="rejected"`, GC as
+  `status="error"` (from GC's side it is a fault in GC's own request). The `rejection_reason` values
+  match, which is what makes the join work.
+- **Usage**: Attribute `GCMCAssignmentFailures` pages to an MC-side cause. Before this metric the
+  RPC had no instrumentation at all, so a responder paged by that alert opened the MC dashboard and
+  found nothing to look at.
+- **Known limitation**: `unhealthy` conflates a Redis MH-assignment store failure with a
+  `create_meeting` failure (which includes meeting-KEK generation). Only the MC log record
+  distinguishes them — see `mc-incident-response.md` Scenario 6 root cause 6. Separating them means a
+  third `RejectionReason` enum value, i.e. a proto change, not a second counter.
+- **Recorded in**: `grpc/mc_service.rs`, at all four exit points of `assign_meeting_with_mh`
+- **Alert**: None MC-side; the fleet condition is covered by GC's `GCMCAssignmentFailures`
+- **Dashboard**: MC Overview - Meeting Assignment Outcomes (Join Flow row)
+
+---
+
+### `mc_join_identity_key_presence_total`
+- **Type**: Counter
+- **Description**: Whether each joiner reaching the join call published an Ed25519 identity signing key.
+- **Labels**:
+  - `presence`: `present` (exactly 32 bytes, published on the roster) | `absent` (empty — the
+    contract's NO KEY PUBLISHED state, which MC admits)
+- **Cardinality**: 2
+- **Usage**: The **absent ratio**. MC admits participants that publish no identity key (ADR-0036 §4,
+  `signaling.proto`), so "every client omits the key and nobody notices" must not be the silent
+  steady state. `absent / (absent + present)` answers "are clients publishing keys?" directly.
+- **Why both arms rather than an absent-only counter**: an absence-only series has no denominator, so
+  a raw count of absent joins is unreadable without a separate join count to divide by — the same
+  defect that disqualified `mc_meeting_kek_generated_total` as a missing-key signal. Follows the
+  `mc_join_display_name_resolved_total{outcome}` precedent.
+- **Does NOT count malformed keys.** A length other than 0 or 32 is refused at the trust boundary and
+  lands on `mc_session_join_failures_total{error_type="identity_key_invalid"}`.
+- **Denominator is join ATTEMPTS, not admissions** — recorded at the parse, before the join call, so
+  a join that then fails on capacity, `sender_id` exhaustion, Conflict or Draining is still counted.
+  **Chosen, not inherited**: the question is about the client population, so conditioning on
+  server-side admission would answer a different question and would blank the series during exactly
+  the incident an operator would consult it in. **Therefore `sum()` of this counter does NOT equal
+  `mc_session_joins_total{status="success"}`** — do not treat the gap as a bug.
+- **What it does not tell you**: whether anything downstream fails closed on a keyless participant.
+  That obligation is the consumer's (drop frames, never "skip verification"), is owned by client, and
+  is tracked in `docs/TODO.md`. A healthy-looking `absent` series is not evidence the consumer
+  handles it.
+- **Carries no participant and no meeting dimension** (ADR-0036 §11), and no key material.
+- **Recorded in**: `webtransport/connection.rs`, after authentication and identity-key validation, before the join call — see the denominator note above
+- **Dashboard**: MC Overview - Identity Key Presence (Join Flow row)
+
+---
+
+## Media Key Custody Metrics (ADR-0036 §4, §11)
+
+### `mc_meeting_kek_generated_total`
+- **Type**: Counter
+- **Description**: Meeting key-encryption keys generated. One per meeting-actor creation.
+- **Labels**:
+  - `key_custody`: single permitted value `operator`. Adding a second requires an ADR-0036 §4
+    amendment — this is a *constraint*, not a snapshot of today's deployment.
+- **Cardinality**: 1
+- **Usage**: KEK issuance rate, and the carrier for the `key_custody` label. **That is the whole of
+  what it measures.**
+- **NOT a "missing key material" signal.** It increments unconditionally, so it is identically the
+  meeting-creation count — there is no path where the meeting actor exists and this does not fire.
+  Detecting *absent* key material would need a second series to divide by, and MC has no
+  meeting-creation counter (`mc_meetings_active` is a gauge), so the inference is not computable
+  even in principle. The real not-provisioned condition is per-join and defined on the response
+  side (`signaling.proto`: "the not-provisioned signal is `meeting_kek` not being exactly 32
+  bytes"). Do not build an alert on the absence of this counter moving.
+- **Emits no key material**, and no `meeting_id` / `meeting_id_hash` — ADR-0036 §11 bars any meeting
+  identifier on any metric in this design. *Which* meeting is answered by the meeting actor's span.
+- **Recorded in**: `actors/meeting.rs` at meeting-actor creation
+- **Dashboard**: MC Overview - Meeting KEK Issuance (Join Flow row)
+- **Forward compatibility**: when KEK rotation lands this counts rotations too and genuinely
+  diverges from the meeting-creation count.
 
 ---
 

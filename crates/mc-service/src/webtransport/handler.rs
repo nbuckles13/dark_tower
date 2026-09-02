@@ -21,11 +21,28 @@ pub fn encode_participant_update(update: &ParticipantStateUpdate) -> Option<Serv
                 streams: Vec::new(),
                 joined_at: 0,
                 // ADR-0036 §4: sender id and identity signing key are the only
-                // roster additions, and no other key material rides here.
-                // Unpopulated until story task 10. `None`, never `Some(0)` —
-                // 0 is reserved-invalid for `sender_id`.
-                sender_id: None,
-                identity_public_key: Vec::new(),
+                // roster additions, and no other key material rides here — no
+                // meeting KEK, no wrapped transmit key, no thumbprint.
+                //
+                // Populated on the fan-out as well as on the join response, so
+                // a participant already in the meeting can resolve a later
+                // joiner's frames: key id -> sender_id -> this entry ->
+                // identity_public_key. Publishing only on the join response
+                // would leave existing members unable to attribute new frames.
+                //
+                // `Some` of a `NonZeroU16`, so never `Some(0)` — 0 is
+                // reserved-invalid. Trust on first use: same-keyholder
+                // consistency, never a verified identity.
+                sender_id: Some(u32::from(info.sender_id.get().get())),
+                // `None` MUST become EMPTY BYTES, never a zero-filled 32-byte
+                // array — see the same choke-point in `connection.rs`. An
+                // all-zero key reads as present, sends a consumer down the
+                // verify path, and silently destroys the "no key published"
+                // signal. Explicit `match`, never `unwrap_or_default()`.
+                identity_public_key: match &info.identity_public_key {
+                    Some(key) => key.as_bytes().to_vec(),
+                    None => Vec::new(),
+                },
             };
             // R-57: carry the current server-side trace context to the client on
             // the fan-out broadcast (bounded W3C IDs only).
@@ -106,6 +123,8 @@ mod tests {
             audio_server_muted: false,
             video_server_muted: false,
             status: ParticipantStatus::Connected,
+            sender_id: crate::media_admission::fixtures::sample_sender_id(),
+            identity_public_key: crate::media_admission::fixtures::sample_identity_key(),
         }
     }
 

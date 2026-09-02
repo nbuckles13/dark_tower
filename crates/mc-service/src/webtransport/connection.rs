@@ -389,6 +389,84 @@ pub async fn handle_connection(
         return Err(err);
     }
 
+    // Step 6b: parse the client's Ed25519 identity signing public key.
+    //
+    // ORDERING IS LOAD-BEARING — this runs AFTER JWT validation and the
+    // meeting_id binding check, never before. An earlier revision placed it
+    // ahead of `validate_meeting_token`, which let an UNAUTHENTICATED caller
+    // probe a validation surface and receive a distinguishable response before
+    // presenting a valid token, and made a bad-token join report
+    // `identity_key_invalid` instead of `jwt_validation` — hiding auth failures
+    // behind an input-validation error. Authenticate first, then validate
+    // input. Do not move this above Step 5.
+    //
+    // THREE STATES, not two (ADR-0036 §4, `signaling.proto`):
+    //   len 0  -> `None`: NO KEY PUBLISHED. A defined, contract-required state,
+    //             admitted. Consumers MUST fail closed on this participant's
+    //             frames — drop them, never fall back to accepting unsigned
+    //             ones, and never treat "no key" as "skip verification".
+    //   len 32 -> `Some(key)`, published on the roster verbatim.
+    //   else   -> REJECT. No client-controlled blob of any other length ever
+    //             reaches the roster, which MC fans out to every participant.
+    //
+    // Rejecting len 0 was considered and reversed: validation here is
+    // length-only, so a hostile client satisfies it with 32 random bytes it
+    // holds no private half for and is admitted anyway. Reject would have
+    // excluded only honest clients that have not yet implemented the field.
+    //
+    // SECURITY FLOOR, so nothing downstream overclaims: an exact-length check on
+    // an opaque 32-byte blob. NO `cnf` thumbprint check binds the key to the
+    // meeting token — deferred to story 2 — so a present key is TRUST ON FIRST
+    // USE, and a verifying signature proves only that all such frames came from
+    // the same keyholder. Same-keyholder consistency, never a verified identity.
+    let identity_public_key = match crate::media_admission::IdentityPublicKey::parse_join_field(
+        &join_request.identity_public_key,
+    ) {
+        Ok(key) => key,
+        Err(_) => {
+            // Server-side: specific and bounded, so the rejection is
+            // observable. Client-side: generic, so it is not an oracle for
+            // which check failed — every wrong length is indistinguishable in
+            // BOTH directions.
+            warn!(
+                target: "mc.webtransport.connection",
+                connection_id = %connection_id,
+                meeting_id = %meeting_id,
+                "Rejecting join: identity public key length is neither 0 nor 32"
+            );
+            let err = McError::IdentityKeyInvalid;
+            let _ = send_error(&mut send_stream, err.error_code(), &err.client_message()).await;
+            metrics::record_session_join(
+                "failure",
+                Some(err.error_type_label()),
+                join_start.elapsed(),
+            );
+            return Err(err);
+        }
+    };
+
+    // Observability for the absent case (ADR-0036 §11). "Every client omits and
+    // nobody notices" must not be the silent steady state, so presence is
+    // counted on both arms, giving the metric its own denominator. Bounded
+    // 2-value label; no participant and no meeting dimension.
+    //
+    // DELIBERATELY recorded here, at the parse, NOT after the join succeeds —
+    // so this counts authenticated join *attempts that passed identity-key
+    // validation*, and a join that later fails on capacity, `sender_id`
+    // exhaustion, Conflict or Draining is still counted. That is the correct
+    // denominator for the question this metric exists to answer, which is a
+    // question about the CLIENT population ("are client builds publishing
+    // keys?"), not about server admission: conditioning it on server capacity
+    // would answer a different question, and it would make the series go dead
+    // during precisely the incident (`sender_id_space_exhausted`) in which an
+    // operator would consult it. `sum()` of this metric therefore does NOT
+    // equal `mc_session_joins_total{status="success"}`; the catalog says so.
+    metrics::record_join_identity_key_presence(if identity_public_key.is_some() {
+        "present"
+    } else {
+        "absent"
+    });
+
     // Step 7: Create outbound channel BEFORE join so ParticipantActor is spawned with stream wired
     let is_host = claims.role == MeetingRole::Host;
     let participant_id = uuid::Uuid::new_v4().to_string();
@@ -410,6 +488,7 @@ pub async fn handle_connection(
             participant_id.clone(),
             display_name,
             is_host,
+            identity_public_key,
             outbound_tx,
         )
         .await
@@ -965,16 +1044,34 @@ async fn build_join_response(
             streams: Vec::new(),
             joined_at: 0,
             // ADR-0036 §4: the roster carries the sender id and the identity
-            // signing public key, and no other key material. Both are
-            // unpopulated until story task 10 lands MC's sender-id allocator
-            // and roster publication of the client's key.
+            // signing public key, and NO other key material — no meeting KEK,
+            // no wrapped transmit key, no key id, no thumbprint.
             //
-            // `sender_id` is `None`, never `Some(0)`: 0 is reserved-invalid,
-            // and N unassigned participants sharing it would collide on one
-            // roster identity and — via key id, derived wrap nonce — on one
-            // AES-GCM nonce.
-            sender_id: None,
-            identity_public_key: Vec::new(),
+            // `sender_id` is `Some` of a `NonZeroU16`, so it can never be
+            // `Some(0)`: 0 is reserved-invalid, and N participants sharing it
+            // would collide on one roster identity and — via key id, derived
+            // wrap nonce — on one AES-GCM nonce.
+            //
+            // `identity_public_key` is either exactly 32 bytes or EMPTY. Never
+            // any other length: MC refuses the join otherwise.
+            //
+            // This is the chain a receiver walks: key id -> sender_id -> this
+            // roster entry -> identity_public_key, for Ed25519 verification.
+            // Trust on first use: same-keyholder consistency, never a verified
+            // identity.
+            sender_id: Some(u32::from(p.sender_id.get().get())),
+            // `None` MUST serialize to EMPTY BYTES, never to a zero-filled
+            // 32-byte array. An explicit `match` rather than
+            // `unwrap_or_default()` because the failure mode is silent and
+            // strictly worse than empty: a present-looking all-zero key makes a
+            // consumer take the VERIFY path and never see the "no key
+            // published" signal the contract defines. It would fail closed
+            // (all-zeros is not a valid Ed25519 point) but it destroys the
+            // distinction accept-absent rests on. Do not "simplify" this.
+            identity_public_key: match &p.identity_public_key {
+                Some(key) => key.as_bytes().to_vec(),
+                None => Vec::new(),
+            },
         })
         .collect();
 
@@ -1005,15 +1102,26 @@ async fn build_join_response(
             participant_id: result.participant_id.clone(),
             existing_participants,
             media_servers,
-            // ADR-0036 §2/§4. Unpopulated this story: MC has no sender-id
-            // allocator and no per-meeting KEK yet — both land in story task
-            // 10. `sender_id: None` is the honest "not yet assigned" state
-            // (see the field's contract in signaling.proto); an empty
-            // `meeting_kek` means not-yet-provisioned, and consumers fail
-            // closed on it rather than wrapping under a short key.
-            sender_id: None,
-            meeting_kek: Vec::new(),
-            kek_generation: 0,
+            // ADR-0036 §2/§4. `sender_id` is `NonZeroU16` widened into the
+            // proto's `uint32` — `u32::from`, never `as`, and never 0.
+            sender_id: Some(u32::from(result.sender_id.get().get())),
+            // The joiner receives the meeting KEK. This is the ENTIRE
+            // key-distribution step (§4 step 3): it costs nothing beyond the
+            // join MC already performed and touches no existing member.
+            //
+            // This is the one legitimate egress of the KEK — to a client MC has
+            // just admitted, over its own authenticated session. It goes
+            // nowhere else: not to MH, not into any `dark_tower.internal.v1`
+            // message, not to disk, not to a log, metric, span or error
+            // payload. `JoinResponse`'s derived `Debug` is suppressed in
+            // `crates/proto-gen/build.rs` and the hand-written impl renders this
+            // field as a length only.
+            meeting_kek: result.meeting_kek.expose().to_vec(),
+            // u16 semantics widened into the proto's uint32. Always 0 in this
+            // story — rotation is deferred. Note 0 is a LEGAL first generation,
+            // not a sentinel: the not-provisioned signal is `meeting_kek` not
+            // being exactly 32 bytes, so never gate on `kek_generation != 0`.
+            kek_generation: u32::from(result.kek_generation),
             correlation_id: result.correlation_id.clone(),
             binding_token: result.binding_token.clone(),
         },
