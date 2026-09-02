@@ -19,6 +19,29 @@ use regex::Regex;
 /// Adding a new service requires updating only this one site — the
 /// `SERVICE_METRIC_PREFIX_RE` regex below is derived from this list at
 /// `Lazy::new` time, so prefix and regex cannot drift.
+///
+/// # Two consumers, and the invariant between them
+///
+/// This array was written to answer "which services **emit metrics**"
+/// (`application_metrics`, `dashboard_panels`). `release_build_profile` also
+/// reads it, to answer a different question: "which services **ship as a
+/// container**" — it cross-checks this roster when asserting that every
+/// service is inside the release-build premise gate.
+///
+/// **Those two sets coincide today, and that coincidence is now load-bearing.**
+/// Editing this array for a metrics reason would otherwise silently move a
+/// release-premise gate's floor. Rather than leave that to a doc comment a
+/// future editor must notice, it is **machine-checked**:
+/// `release_build_profile`'s `canonical_services_roster_drift` rule derives the
+/// service roster from `[workspace] members` matching `crates/*-service` — a
+/// true single source of truth, since cargo itself fails to build if that list
+/// is wrong — and FAILs when this array disagrees with it. So this array is a
+/// *guarded* mirror, not a trusted one.
+///
+/// ANCHOR (DRY): `scripts/guards/common.sh:CANONICAL_SERVICES` is a separate,
+/// un-guarded Bash mirror (tracked in `docs/TODO.md` §Cross-Service
+/// Duplication). The Rust array here is authoritative for the release-premise
+/// gate.
 pub const CANONICAL_SERVICES: &[(&str, &str)] = &[
     ("ac", "ac-service"),
     ("gc", "gc-service"),

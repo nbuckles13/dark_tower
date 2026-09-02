@@ -73,4 +73,21 @@ layer_lifecycle_begin 3
   # NOT under guards/simple/ — run-guards.sh's `find simple -name '*.sh'` would auto-run it as
   # a guard too. No cluster.
   run_and_emit "run-guards-selftest" "${__here}/guards/run-guards.test.sh" || true
+  # dev-web preflight contract self-test (release-premise-and-preflight-guards devloop):
+  # pins the WARN→HARD-FAIL escalation of the MC/MH WebTransport checks, which an
+  # exit-code assertion structurally CANNOT pin — `check_port` sets HARD_FAIL without
+  # exiting, so `dev-web.sh --check` exits nonzero in any cluster-less environment
+  # regardless of what those branches decided. Asserts the per-branch ✗/! markers
+  # instead, so reverting the escalation flips it red.
+  #
+  # It also carries the only automated link in the chain
+  #   client-dev-local.md §3 Step 0 -> `--help` -> script header -> script body
+  # after §3 Step 0's duplicate severity enumeration was deleted: the header-vs-body
+  # drift assertions and the `--help` last-line sentinel. Without this file wired here,
+  # that deletion would remove redundancy without adding a forcing function.
+  #
+  # Hermetic: PATH-stubbed ss/curl/getent, temp repo root, AC_PORT/GC_PORT overrides.
+  # No cluster, no network. Deliberately NOT under guards/simple/ — run-guards.sh's
+  # `find simple -name '*.sh'` would auto-run it as a guard.
+  run_and_emit "dev-web-preflight-selftest" "${__here}/dev-web.test.sh" || true
 } | tee_collect_statuses

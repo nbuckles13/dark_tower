@@ -32,6 +32,8 @@
 
 ### From DRY Reviewer (Ongoing)
 
+- [ ] **Six independent build-artifact exclusion lists inside `crates/dt-guard/`, with no shared home — this diff added the sixth** (surfaced 2026-09-01 by @dry-reviewer at Gate 2 of `docs/devloop-outputs/2026-09-01-release-premise-and-preflight-guards/`; owner: infrastructure + code-reviewer as `dt-guard` co-owners). **The sites**: `ts_metric_naming.rs:36` (`EXCLUDED_PATH_PATTERNS = ["/node_modules/", "/dist/", "/__tests__/"]`), `ts_pii.rs:37`, `ts_retained_credentials.rs:127`, `ts_secrets.rs:47`, `ts_test_removal.rs:38` — five near-identical `&[&str]` arrays of build-output path fragments — plus `release_build_profile.rs:681`'s inline `matches!(name, "target" | "node_modules" | ".git")` in its fallback walk, which spells the same concept a sixth way in a different shape (directory-name match rather than path-fragment match). **Extraction opportunity, NOT true duplication and NOT a finding against this diff**: nothing in `crates/dt-guard/src/common/` was reimplemented, because `common/` has no scan-exclusion module at all; five of the six sites predate this devloop, and per the ADR-0019 DRY Reviewer Exception this is TODO-tracked rather than fix-or-defer. **Why it is worth filing**: the TS five are converging by copy — each new TS guard has cloned its predecessor's array — and they have already diverged in content (`/__tests__/` appears in some and not others), so "which artifacts does a dt-guard scan skip" has no answer a reader can look up. The failure mode is the one this section keeps recording: a generated tree that one guard skips and another scans produces a guard that reds on build state rather than on source, which is exactly the defect resolved for `validate-subdomain-regex-sync.sh` above (§entry 2026-08-21, resolved 2026-09-01) — that fix moved one guard to git-tracked-files-only and thereby made its exclusion list unnecessary. **That resolution is the preferred shape here too, and it is why this is filed as an opportunity rather than a straight extraction**: the right fix for most of the six is probably not a shared denylist but `common::git_changes::get_tracked_files`, which makes gitignored build output unscannable by construction and needs no list to maintain. `no_insecure_browser_flags.rs:309` (new in this diff) already does exactly that and carries no exclusion array — it is the model. **Fix when acted on**: audit the five TS sites for whether each needs a denylist at all once discovery is tracked-files-only; extract a single home in `crates/dt-guard/src/common/` (named for the concern per ADR-0034 §Neutral — not `paths`/`util`) only for whatever genuinely remains, and give `release_build_profile.rs`'s fallback walk the same home. **Defer trigger / why-not-now**: touches five existing guards' discovery paths plus a decision about tracked-only discovery per guard; that is a `dt-guard`-wide sweep with its own test surface, not a fold-in to a premise-guard devloop. Natural moment is the next devloop editing TS-guard discovery, or the `dt-guard` subcommand-sprawl re-debate already tracked in §Polyglot Pipeline Follow-ups.
+
 - [ ] **`internal.v1` and `signaling.v1` now share ZERO spelling for the MH endpoint concept (owner: protocol, next `internal.proto` reshape — story task 8-10 window; raised by @dry-reviewer)**: `signaling.v1` says `media_handler_url` throughout (`MediaServerInfo`, `SendTarget`); `internal.v1` says `webtransport_endpoint` (`MhAssignment`, `RegisterMHRequest`, `RegisterMCRequest`). The join is `crates/mc-service/src/webtransport/connection.rs`. The 2026-09-01 reshape deleted `RegisterResponse.media_handler_url`, **the last `media_handler_url` spelling in `internal.v1`**, so the two files now share no spelling at all for one concept. Deliberately **not** aligned in that reshape: a rename spans the GC↔MC↔MH wire contract and three services' consuming code — task-sized Guarded-Shared-Area work, not a field edit. Recorded as a boundary with a named owner rather than dropped a second time. Surfaced 2026-09-01 by dry-reviewer at Gate 1 of `docs/devloop-outputs/2026-09-01-internal-contract-reshape/`; section placement corrected at Gate 3 of the same devloop (originally filed under §Media Path Obligations, which self-describes as `media-protocol` codec constraints — this is a cross-service naming divergence and belongs in the section a DRY reviewer sweeps).
 
 - [ ] **MC builds the ADR-0036 roster `Participant` in two places; this diff widened the clone from 4 fields to 6 and duplicated the "unpopulated until task 10" comment with it** (surfaced 2026-08-31 by dry-reviewer at Gate 3 of `docs/devloop-outputs/2026-08-31-signaling-media-contract-reshape/`; owner: meeting-controller). The two sites are `crates/mc-service/src/webtransport/connection.rs:971-977` (`build_join_response`, the join-time roster) and `crates/mc-service/src/webtransport/handler.rs:22-28` (`encode_participant_update`, the fan-out roster). Both construct `Participant { participant_id, name, streams: Vec::new(), joined_at: 0, sender_id: None, identity_public_key: Vec::new() }` from a `ParticipantInfo`, and both now carry a paraphrase of the same ADR-0036 §4 comment. **Not true duplication and NOT a finding against this diff** — the 4-field clone predates it, the two new fields were added correctly and identically at both sites, and per the ADR-0019 DRY Reviewer Exception this is TODO-tracked rather than fix-or-defer. **Why it is worth filing anyway**: the clone is now load-bearing for a *scheduled* change. Story task 10 lands MC's sender-id allocator and roster publication of `identity_public_key`, and it must populate both sites. Populating only `build_join_response` — the obvious one, the one the task description names — leaves the fan-out path publishing `sender_id: None` for every participant who joins after you. The failure is silent on the wire (absent is a legal value that this story ships everywhere) and surfaces downstream as a receiver that can resolve the key id of participants present at join time and not of anyone who arrived later. There is no guard and no type-level forcing function: `..Default::default()` is not in use, so the compiler catches a *new field* but not a field left at `None` in one of two arms. **Fix when acted on**: extract a single `fn roster_participant(info: &ParticipantInfo) -> Participant` (MC-internal — this is one crate, so it does not need a `crates/common` home) and have both call sites use it, so task 10 has exactly one place to populate and the comment has one home. **Defer trigger / why-not-now**: the natural moment is story task 10 itself, which is the next thing to edit both sites and is owned by meeting-controller; doing it here would mean a non-owner refactoring MC's join path inside a proto reshape, for no behaviour change. If task 10 lands without the extraction, re-raise against it and check both sites are populated.
@@ -398,6 +400,8 @@
 
 ## Documentation Hygiene
 
+- [ ] **Reconcile the secure-context prose duplicated between `scripts/dev-web.sh` and `docs/runbooks/client-dev-local.md` once story task 20 lands** (added 2026-09-01, devloop `docs/devloop-outputs/2026-09-01-release-premise-and-preflight-guards/`; surfaced by @dry-reviewer as F-DRY-E; owner `infrastructure` + `client`). The `dev-web.sh` header carries an inline secure-context summary — the four gated APIs, `.localhost`/loopback being potentially trustworthy, and non-loopback HTTP presenting as "joined, no audio". Three of those four statements are also mandated content for task 20's `## Secure Context and Media Setup` runbook section, so when task 20 lands there will be **two copies**. The inline copy is deliberate, not an oversight: @security's argument is that a reader who follows a not-yet-existing anchor is by construction someone who just hit a hard fail, which is exactly the moment a prohibited insecure-origin flag gets pasted in — so the substance must be at the point of failure during the window where the target does not exist. **The window closes when task 20 lands**; at that point decide whether the header keeps a one-line summary plus the pointer, or the pointer alone. Two sites: `scripts/dev-web.sh` (header, SECURE CONTEXT block) and `docs/runbooks/client-dev-local.md#secure-context-and-media-setup`. Partial forcing function already in place — `scripts/dev-web.test.sh`'s `secure-context-anchor-resolves` fires the moment any secure-context heading appears and pins its slug to the cited anchor, so a mis-spelled landing reds; it does **not** detect prose divergence, which is what this entry is for.
+
 - [ ] **`/user-story` has no ADR — its two sibling workflows do**: ADR-0024 (Agent Teams Development Workflow) documents §1 the dev-loop and §2 the debate workflow and never mentions `/user-story`; ADR-0022 is superseded by it; ADR-0035 covers the runner that *executes* stories, not the planning that produces them. So the design decisions behind a 12-specialist planning workflow — all-specialists-always, the architecture gate, the 3-round limit, continue mode — exist only as mechanism in `.claude/skills/user-story/SKILL.md`, with no record of why. If written, it is the right home for the requirement-altitude rule, which should **move** there from ADR-0035 §13 (a general planning principle currently filed in a story-runner ADR, where nobody planning a user-facing story will find it) rather than being copied. Low urgency — the workflow works and the skill is the behavioural SSoT; this is a *why* gap, not a *how* gap. Surfaced 2026-08-15.
 
 - [ ] **ADR-0010 §4a describes "max 3 retries before returning 503" for MC rejections, now refined without a forward-pointer (surfaced 2026-08-21 by @code-reviewer at Gate 3 of `docs/devloop-outputs/2026-08-21-gc-invalid-request-rejection-reason/`)**: that devloop added `REJECTION_REASON_INVALID_REQUEST` and made GC fail fast (500, no pool-walk) on a GC-verified malformed selection — a deliberate, sanctioned narrowing of §4a's retry model (the fail-fast/vs-retry call was explicitly delegated to the implementer per the devloop's Debate Decision; proto, not the ADR, is the `RejectionReason` enum SSoT). Post-S-3 the deviation is narrow: the full pool-walk failover is preserved for every case EXCEPT a GC-verified contract violation. A future reader of §4a's "max 3 retries → 503" prose would not learn of the `invalid_request` fail-fast/500 exception. **Fix**: a one-line forward-pointer in ADR-0010's implementation-status table (or §4a) noting the new variant + the narrow fail-fast exception and citing the devloop. Not folded into the carrier devloop: editing a shipped ADR is its own governance judgment and would add an out-of-plan file to a finalized changeset. Owner: global-controller (+ protocol if the wire-contract framing is touched). Defer trigger: next devloop touching ADR-0010 or GC assignment retry semantics. Low urgency — the devloop record documents the decision thoroughly; this is a *discoverability* gap in the ADR.
@@ -582,6 +586,21 @@ header v2 codec (`docs/devloop-outputs/2026-08-31-media-frame-v2-codec/`).
 
 ## Infrastructure Validation in Devloops
 
+- [ ] **Deployed-artifact IDENTITY is unasserted — the other half of "the shipped artifact is the one the pipeline built"** (added 2026-09-01, devloop `docs/devloop-outputs/2026-09-01-release-premise-and-preflight-guards/`; owner `infrastructure`, needs an `operations` ruling on tag policy). `dt-guard release-build-profile` asserts the shipped artifact's build *configuration* (release profile, debug-assertions off across seven channels). It says nothing about whether the image a cluster runs is the image that pipeline produced — mutable tags, no digest pinning, no provenance. Different inputs, different mechanism, and it needs a tag-policy decision before any guard can be written, which is why it is a task and not a fold-in.
+
+- [ ] **Shape-based complement to the release-profile premise guard: observe the effective `cfg`, not its causes** (added 2026-09-01, same devloop; proposed by @security; owner `infrastructure` + `media-handler` co-sign). `dt-guard release-build-profile` enumerates seven channels that can enable `debug_assertions` in a shipped binary, and an enumeration is incomplete by construction (ADR-0036 §11: *"Vocabulary additions cannot be cited as the protection"*). The total-by-construction alternative is a compile-time assertion on the **effective cfg**:
+
+    ```rust
+    #[cfg(all(feature = "release-artifact", debug_assertions))]
+    compile_error!("release artifact built with debug_assertions enabled");
+    ```
+
+  with the service Dockerfiles passing `--features release-artifact`. That catches all seven channels *and* ones nobody has enumerated — §11's own technique, applied to the premise instead of to the tracing feature: "a compile error has nothing to notice." **Complement, not replacement**: the guard catches the source change early, legibly, across all four services at review time and can say *which* channel broke; the `cfg` assertion catches the artifact totally but can only say "compile error". Deferred because it touches four service crates (three of them other specialists' domains), their `[features]` tables, and four Dockerfiles.
+
+- [ ] **`dev-web.sh`'s WebTransport preflight reads the on-disk ConfigMap, and that is now a BLOCKER rather than a misleading green** (added 2026-09-01, devloop `docs/devloop-outputs/2026-09-01-release-premise-and-preflight-guards/`; owner `infrastructure`; condition attached by @operations at Gate 1 as OPS-3). **This entry is the rollback plan for a decision that was made deliberately — recorded before shipping, not after it bit.** `scripts/dev-web.sh::check_wt_endpoint` reads MC/MH advertise addresses from the committed configmap files. On the static host topology the script targets, on-disk and live agree. On a **devloop** cluster `setup.sh` patches the live ConfigMap while the on-disk file goes stale, so the check can validate an address nobody is using. Before this devloop that produced a harmless yellow `!`; the WARN→HARD-FAIL escalation makes it **stop the dev server on a healthy cluster**. Accepted because `dev-web.sh` is the host-side launcher for the static topology (its own header says so) and devloop work does not go through it, and because every listener failure now prints the ground-truth `kubectl get cm <label>-config -n dark-tower -o jsonpath='{.data.<MC|MH>_WEBTRANSPORT_ADVERTISE_ADDRESS}'` command plus a pointer to runbook §1/F8, turning a blocker into a 30-second diagnosis. **The fix if it ever does bite is to read the LIVE ConfigMap, not to soften the check** — and explicitly **not** a bypass environment variable, which is the "silently skip a failure to make progress" pattern CLAUDE.md forbids and which the first person to hit it would leave permanently on.
+
+- [ ] **`crates/mh-test-utils/src/lib.rs`'s doc comment cites Dockerfile LINE NUMBERS that nothing keeps current** (added 2026-09-01, same devloop; surfaced by @dry-reviewer as P-DRY-5; owner `test` / `media-handler`). The comment's security argument cites `infra/docker/mh-service/Dockerfile` lines 53, 59, 78 and 135 by number. Any edit to that Dockerfile silently re-points them at unrelated lines, and `cite-no-line-numbers` does not reach Rust doc comments — so this is a citation class with no guard behind it at all. The *claim* those lines support is now enforced (`dt-guard release-build-profile`, cross-referenced from that comment via an `ANCHOR (DRY)` line); the *citations* are still unguarded. Either extend the doc-citation guard family to Rust doc comments or replace the line numbers with symbol/stage cites.
+
 - [ ] **`producer | grep -q` under `set -o pipefail` is a latent false-negative class — swept and counted, NOT fixed** (surfaced 2026-08-15 at Gate 3 by @infrastructure while fixing one instance in `infra/kind/scripts/setup.sh:provision_run_org()`; generalisation prompted by @test; devloop `docs/devloop-outputs/2026-08-15-layer7-per-run-org/`). **Mechanism**: `grep -q` exits at the FIRST match and closes the pipe; if the producer has more to write it takes SIGPIPE (141) and `pipefail` makes the **whole pipeline non-zero even though the pattern WAS found**. Reachability is a function of (producer's stdout buffer) vs (position of the match), so it is invisible on small inputs and appears as the input grows — the worst possible discovery curve for a gate. This is the sibling of the `find | head` / `tr | head` trap already documented at `scripts/workflow/run-story.sh:748-776`; that one is about the producer *failing*, this one is about the producer *succeeding and being cut off*.
   **Measured in this repo, today** (not theoretical): `git ls-files | grep -qxF <first-path>` false-negatives against this repo right now (71 KB of output, needle on line 1); with the needle on the LAST line it passes, which is the tell that the match position is half the mechanism. Independently reproduced by @test from a **script file** rather than an agent Bash shell, per this devloop's own §Issues #2 lesson.
   **TWO DISTINCT MECHANISMS — do not collapse them, they imply different regression tests** (corrected 2026-08-15 by @test, re-measured independently by @infrastructure; earlier drafts of this entry described only the first and framed it as a clean size threshold, which was one sample per point and wrong in both directions):
@@ -706,6 +725,8 @@ the operations brief. Related: see "Skip unchanged service image builds" under
 - [ ] **SHA-pin all third-party GitHub Actions in `.github/workflows/ci.yml`** (2026-05-11, security Gate-1 follow-up from `2026-05-11-ts-wrappers-task36`). Currently all 7 third-party actions are tag-pinned (`actions/checkout@v4`, `dtolnay/rust-toolchain@stable`, `Swatinem/rust-cache@v2`, `pnpm/action-setup@v4`, `actions/setup-node@v4`, `taiki-e/install-action@cargo-llvm-cov`, `codecov-action@v4`) — including one channel-pinned (`dtolnay/rust-toolchain@stable`). Industry best practice (OpenSSF Scorecard, GitHub Security Hardening) recommends SHA-pinning third-party actions. Bundle the conversion in a single PR per `pinact`/`stepsecurity` automation, ideally with renovate config for automated SHA-bumps. Priority: P2 (current tag-pinning matches widely-used convention; no known active threat; SHA-pinning new actions while leaving 5 existing tag-pinned would be a no-op improvement). Highest-priority target if the pass happens: `dtolnay/rust-toolchain@stable` (channel-pinned, not even tag-pinned). Owner: security + infrastructure.
 
 ## Polyglot Pipeline Follow-ups (ADR-0033 Wave 1 #1)
+
+- [ ] **A guard-class sweep is only as wide as the DIALECT it runs in — make "which dialects?" a standing question at class-sweep reviews** (added 2026-09-02, devloop `docs/devloop-outputs/2026-09-01-release-premise-and-preflight-guards/`; raised by @test off the F-DRY-F post-mortem; owner `semantic-guard` for the `checks.md` note, `operations` for the review-protocol half). **Demonstrated, not theoretical.** @dry-reviewer named a defect class — *a conjunct that silences a check on missing/unmatched input converts "could not evaluate" into a pass* — found two members in the two new Rust modules, swept both modules again, and correctly closed the class. Extending the identical method to the **bash** half of the same changeset found **two more members**, one of them a genuine silent PASS (`scripts/dev-web.sh`'s empty `LOCALHOST_FIRST` made the IPv6-mismatch test merely *false*, so a hostname resolving IPv6-first against an IPv4-only listener reported clean). Four members, two languages; the Rust sweep was thorough and still closed only a per-language subset — not a reviewer error, a structural property of single-dialect sweeps in a polyglot pipeline. **The blind spot is standing**: `scripts/**` (bash preflights, layer scripts, self-tests), `packages/**` (TS), and `crates/**` (Rust) can each carry the same defect class in their own idiom (`|| true` / `2>/dev/null`, `?.`/`catch {}`, `.ok()`/`let Ok(..) else`). **Proposed shape**: a note in `scripts/guards/semantic/checks.md` (semantic-guard's authoritative list) plus a line in `.claude/skills/devloop/review-protocol.md`, so a reviewer naming a class is prompted to enumerate the dialects in the changeset *before* closing rather than rediscovering the gap at member #4. Deliberately NOT edited into `checks.md` from this devloop: that file is semantic-guard's, the lesson is cross-cutting rather than this task's, and the record already carries it (Lesson 13).
 
 - [ ] **Run CI inside the devloop image (dev↔CI environment parity) — the durable fix for recurring CI drift** (surfaced 2026-08-09 on PR #59). ADR-0033 shares the pipeline *logic* between local and CI (both call `layer-all.sh`), but the *environment* is duplicated and drifts: the devloop image (`infra/devloop/Dockerfile`) bakes in Rust/Node/pnpm/buf/Chromium/cargo-audit/postgres, while `.github/workflows/{ci,ci-client}.yml` re-provision a subset imperatively. PR #59 hit **three failures, all environment/invocation drift (no product bugs)**: (a) `ci.yml` Layer-4 vitest browser component tests failed — no Chromium provisioned; (b) `ci-client.yml` hand-rolled `buf breaking` with `#branch=main` (a PR checkout has no local `main`) and `npx playwright` at repo root (not hoisted under pnpm); (c) `validate-story-manifest` failed — `dt-story` not built. All three were **interim-patched** (build dt-story in compile.sh; base-ref merge-base for buf; add a Chromium-install step to ci.yml + `pnpm --filter … exec`), but the ROOT is that CI re-implements what the devloop image + pipeline already provide. **Proper fix**: run CI jobs *inside the devloop image* via GitHub Actions `container:`, then just call `./scripts/layer-all.sh` — CI == dev by construction, zero drift. Scope: publish the devloop image (or a slim CI variant) to GHCR + pin; rewrite `ci.yml`/`ci-client.yml` to `container:`; postgres via `services:`; dev-user/permissions; **retire `ci-client.yml`'s hand-rolled steps** (it is a hand-rolled duplicate of `layer-all.sh`'s buf-lint/breaking + ts-lint + ts-guards + ts-test + ts-audit). Landing this removes the `INTERIM PATCH (see TODO)` blocks now marked in both workflows, and **subsumes** the "ADR-0033 §3 Layer-7 Playwright lane" item below. Peer to the production-parity debate items (§Multi-Cluster Networking: MC/MH routing; web-serving tier) — same "environment must be consistent across contexts" axis; good candidate for the same infra `/debate`. Owner: infrastructure + operations.
 
@@ -963,14 +984,35 @@ Source of truth is `audit-suppressions.toml` (repo root); this is a human-readab
 via CLI flags, hand-edited derived files, or Dependabot alert dismissals. See
 `docs/contributor/audit-suppressions.md`.
 
-| id | ecosystem | expires | ticket | summary |
-|----|-----------|---------|--------|---------|
-| RUSTSEC-2023-0071 | rust | 2026-09-01 | this section | rsa 0.9.10 Marvin timing side-channel; build-time-only via sqlx-macros (no mysql feature, no runtime `rsa::*`) — verify with `cargo tree -p rsa --invert`; fail-closed if a runtime consumer ever appears; no upstream fix. Full rationale in the manifest `#`-comment + Cluster C above. |
-| RUSTSEC-2025-0052 | rust | 2026-09-05 | 'Polyglot Pipeline Follow-ups' → async-std entry | async-std unmaintained WARNING (non-gating; noise-only suppression). Test-build-graph-only via opentelemetry_sdk 0.24 `testing` feature (dev-dep of common) — verify with `cargo tree -i async-std -e normal` (must be empty); fail-closed if a normal-graph consumer appears. Fix = tracked OTel 0.29+ migration (rt-async-std persists through sdk 0.28.0). |
-| GHSA-h67p-54hq-rp68 | js | 2026-09-18 | this row | js-yaml <=4.1.1 merge-key quadratic DoS; installed js-yaml@3.14.2 pinned by @yarnpkg/parsers@3.0.2 (^3.10.0) — no patched 3.x release exists (fix only in 4.2.0); forcing >=4.2.0 override is a breaking v3→v4 jump into nx tooling. Dev/build-tooling only, below the high/critical gate. Verify with `pnpm why js-yaml` (must show only @yarnpkg/parsers / @zkochan/js-yaml path, no production consumer); fail-closed if production consumer appears. Resolves naturally when nx bumps @yarnpkg/parsers to js-yaml@^4.x. |
+| id | ecosystem | ticket |
+|----|-----------|--------|
+| RUSTSEC-2023-0071 | rust | this section (Cluster C below) |
+| RUSTSEC-2025-0052 | rust | 'Polyglot Pipeline Follow-ups' → async-std entry |
+| GHSA-h67p-54hq-rp68 | js | this section |
+
+> **`expires` and the exposure rationale are deliberately NOT reproduced here — read them from
+> `audit-suppressions.toml`.** They used to be, and on 2026-09-02 this table was found carrying both
+> a stale `expires` and a superseded rationale ("build-time-only via sqlx-macros", by then corrected
+> to lockfile-only in the manifest): it had drifted from the source of truth and nothing noticed,
+> because nothing checks it. Rather than add machinery to keep a hand-maintained prose mirror
+> faithful, the duplicated *values* were removed — CLAUDE.md's single-source-of-truth rule offers
+> "derive one from the other **or** guard the drift", and deleting the copy is the cheaper and more
+> durable of the two. What stays here is the analysis that exists nowhere else (Cluster C, the GHSA
+> decomposition, the MTTR-source ambiguity). **Do not re-add an `expires` or `summary` column.**
 
 The always-run `scripts/audit-suppressions-check.sh` (Layer-3 guard) hard-fails any entry past
 `expires`; the weekly `audit-scheduled.yml` scan catches new advisories against unchanged deps.
+
+> **Known gap the above does NOT close** (surfaced by @security, 2026-09-02, verified against
+> `__sync_check`): the guard's drift check builds `rust_ids`/`js_ids` from the id field alone and
+> `diff`s **sorted id sets**. It never compares `expires` and never compares reason text, in any
+> mirror. So `.cargo/audit.toml`'s comment block — which *does* carry the expiry and rationale — can
+> be hand-edited into disagreement with the manifest and the check still passes, because the id set
+> still matches. **The machinery guards the set of suppressed IDs and leaves every human-readable
+> justification field unguarded, everywhere**, which is the wrong half: the id set is the part a
+> reviewer never has to reason about, while `expires` and the exposure analysis are the two fields a
+> renewal decision actually rests on. `--fix` keeps the derived comments honest in practice, so this
+> is a latent hand-edit gap rather than an active drift. Tracked below. Owner: operations + security.
 
 ### Suppression-machinery spin-out TODOs (deferred from task #47)
 
@@ -994,7 +1036,13 @@ The always-run `scripts/audit-suppressions-check.sh` (Layer-3 guard) hard-fails 
   owner rarely sees it). If built: a distinct greppable `EXPIRING_SOON=<id>:<days_left>` line, NEVER
   `STATUS=WARN` (§6 enum has no WARN member; the hard `expires` FAIL stays the only mechanical teeth).
   Owner: observability + security. **Depends-on:** the §F drift-catcher (`audit-scheduled.yml`,
-  landed in #47).
+  landed in #47). **EVIDENCE FOR, 2026-09-02**: `RUSTSEC-2023-0071` expired mid-devloop when the
+  session crossed midnight UTC, turning a scheduled 90-day re-justification into an unplanned Layer-3
+  blocker on a completed, eight-reviewer-cleared task — with a headless run and no human to escalate
+  to. The control worked exactly as designed; the *absence of lead time* is what converted planned
+  maintenance into an ambush. The sibling `RUSTSEC-2025-0052` expires three days later, so the same
+  ambush is already queued. This does not change the design above (the nudge should still ride the
+  scheduled job, not per-PR log noise) — it raises the priority and supplies the concrete cost.
 
 - [ ] **PATH-1 fail-safe e2e acceptance test (real pnpm tree)** — DEFERRED from #47, accepted by
   @code-reviewer at Gate 2 (security concurred). The §D.1.2 PATH-1 invariant (malformed
@@ -1450,3 +1498,128 @@ substring tests, so `tracing::info!("token={}", token); // not REDACTED yet` pas
 
 **Owner**: security for the policy, guard-family owner for the change. **To be
 scheduled — no slug.**
+
+## Guard STATUS Attribution — `run-guards.sh` knows things its STATUS line doesn't say
+
+- [ ] **A Layer-3 guard cannot self-declare an operator-lane precondition, and a violation's
+  STATUS line names no guard.** Surfaced 2026-09-01 during Gate 1 of devloop
+  `2026-09-01-release-premise-and-preflight-guards`, while establishing whether a new
+  `dt-guard` subcommand could route its own "I could not find my inputs" result to the operator
+  lane. It cannot, and establishing why turned up a second, adjacent gap. Both live at the same
+  emission site in `scripts/guards/run-guards.sh`. **Neither is work for the surfacing diff** —
+  they are behaviour changes to shared pipeline files that diff does not touch.
+
+  **The measured mechanism** (recorded because two reviewers got it wrong in opposite directions
+  before it was measured; see the §8 caveat repair in `docs/runbooks/devloop-validation.md`):
+  whether a `STATUS=` line reaches Layer 3's aggregation depends on **who printed it**. Lines
+  printed by `run-guards.sh` itself (`:156`, `:168`, `:253`) land on Layer 3's stdout, are
+  collected by `tee_collect_statuses` (`scripts/lang/_common.sh:471-480`), and participate in
+  both `aggregate_worst_status` and `worst_reason_for_status` (`_common.sh:396-407`, called at
+  `:507`) — the latter taking the **first** pair matching the winning enum, which is what puts a
+  cause on the stderr `LAYER=3 … REASON=` anchor. Lines printed by an individual guard
+  subprocess are captured (`run-guards.sh:217`, `OUTPUT=$(…)`, the non-verbose default that
+  `scripts/layer3.sh:27` uses) and re-emitted only when they match
+  `VIOLATION|violation|ERROR|error|WARN`, capped at `head -5`. A guard's own `STATUS=` line
+  matches none of those tokens and is silently dropped.
+
+  **(a) Operator-lane self-declaration — a design conversation, not a patch.** A `2)` arm in
+  `classify_guard_exit` echoing `STATUS=PRECONDITION_FAILURE REASON=guard-precondition-${GUARD_NAME}`
+  would let any guard binary declare a precondition failure via exit 2, and it *would* work,
+  because run-guards.sh's own echo sits outside the capture. **But it is a fourth hand-rolled
+  `STATUS=` emission, and `run-guards.sh:285-296` records that as the standing trigger to revisit
+  routing through `emit_status`** — which requires sourcing `lang/_common.sh`, rejected on coupling
+  grounds per ADR-0015 §Pre-commit standalone use (run-guards.sh must stay standalone for
+  pre-commit). So this is not "add an arm"; it trips a recorded architectural trigger. Size it as
+  a design decision.
+
+  **(b) Per-guard attribution for violations — a patch.** `run-guards.sh:253` emits a **fused
+  constant**, `STATUS=FAIL REASON=guard-violations`, once when `FAILED_GUARDS > 0`, naming neither
+  the guard nor its token, while the 124/137 arms carry `guard-timeout-${GUARD_NAME}`. **The
+  asymmetry: the operator lane is attributable per-guard; the implementer lane is not.** A timeout
+  tells you which guard; a violation tells you only that something violated, with the name
+  surviving solely in the human `FAILED: <name>` line and the capped `head -5` re-emission.
+  `FAILED_GUARD_NAMES` is already in scope at that site (printed at `:255-257`), so
+  `guard-violations-${FAILED_GUARD_NAMES[0]}` for the single-guard case (fused constant retained
+  as the multi-guard fallback) needs no new plumbing. **Do not flatten (a) and (b) into one size
+  because they share a file and a function** — (a) is a design conversation, (b) is a patch.
+
+  **The pin (b) needs, and the trap in specifying it.** `scripts/guards/run-guards.test.sh` is
+  documented at `run-guards.sh:285-296` as the ONLY mechanical drift guard on this hand-copied exit
+  ladder — and it is **blind to (b)**: `assert_status` is pure substring
+  (`scripts/lang/_test_helpers.sh:45-47`), so appending `-<name>` leaves
+  `STATUS=FAIL REASON=guard-violations` intact as a substring and `:135`/`:169` stay green through
+  the change. **"Tighten to exact-match" is the wrong instruction** — followed literally it reds the
+  multi-guard case while leaving the single-guard false-negative open. The pin is three parts:
+  positive newline-anchored `$'REASON=guard-violations\n'` for the multi-guard fused form; positive
+  prefix `"REASON=guard-violations-"` for the single-guard form, mirroring the existing
+  truncated-needle convention at `:166`; and `assert_absent` with the **newline-anchored** needle
+  for the single-guard case — a *bare* `assert_absent "REASON=guard-violations"` false-fails,
+  because the suffixed form contains it as a substring. **Load-bearing caveat, stated with its
+  reason so it survives the person who breaks it**: the suite captures via `out="$(cat "$RG_OUT")"`
+  and command substitution strips *trailing* newlines, so newline-anchored needles work only while
+  `:253` is not the last line of the capture. It isn't — `:254-258` print the header and name list
+  immediately after. Reorder that block and the assertion breaks in a way that reads as a guard
+  regression rather than a harness artifact.
+
+  **Preferred fix for the pin: add the primitive, don't be clever at the call site.** The real gap
+  is that `_test_helpers.sh` cannot express "this whole line equals X", which is why both the
+  reviewer and the specialist proposed wrong assertions in consecutive messages while explicitly
+  reasoning about substring semantics. Add `assert_status_line` / `assert_status_line_absent`
+  mirroring the existing positive/negative pairing. **Purely additive — no existing call site
+  changes behaviour**, which is the cheapest possible shape for a shared-SSoT change. An inline
+  `grep -qx` was considered and rejected: a one-off idiom in a suite that speaks `assert_*`
+  everywhere is a consistency cost paid by every future reader; the conclusion is that the idiom
+  should become vocabulary, not be inlined.
+
+  **Open scoping decision for whoever picks this up — size it deliberately.** Is the task "add the
+  primitive", or "add the primitive **and** sweep the sites where the fixed-constant-vs-variable-suffix
+  distinction is already load-bearing"? Only the second retires the trap rather than making it
+  avoidable for future authors. Measured bounds so the choice is made from numbers: **286**
+  `assert_status`/`assert_absent` invocations across **10** suites (`run-story` 138, `layer7` 56,
+  `layer-all` 28, `run-guards` 16, `validate-subdomain-regex-sync` 16, `setup` 16,
+  `audit-suppressions-check` 15, `_audit_gate` 1, `_changed_helpers` 0, plus the incoming
+  `dev-web`); of those only **55** assert on a needle containing `STATUS=` or `REASON=` — the shape
+  where the distinction can bite at all. The other 231 assert message fragments and markers where
+  substring semantics is intended and whole-line matching would be actively wrong. The 55 concentrate in
+  `layer7.test.sh` (**29 — over half**), then `run-guards` 9, `audit-suppressions-check` 8,
+  `layer-all` 4, `validate-subdomain-regex-sync` 3, `run-story` 1, `_audit_gate` 1. Note the
+  inversion: `run-story.test.sh` is 138 of the 286 assertions but only **1** of the 55, so the
+  sweep's centre of mass is `layer7`, not `run-guards` — anchor the sizing there. The existing
+  deliberate-prefix convention is **4 distinct needles**, all in `run-guards.test.sh` (the
+  `guard-timeout-` / `guard-timeout-kill-` family). **This is a latent false-negative class, not a
+  defect list: none of the 55 has been audited and none is claimed wrong.**
+
+  **The sweep is not uniformly mechanical — positive and negative prefix assertions convert
+  differently, and getting it wrong would introduce the exact defect this entry documents.** Of
+  the 4 known-intentional prefix needles, **two are `assert_absent`**:
+  `run-guards.test.sh:103` (`t124-no-old-fail-timeout`) and `:121` (`t137-no-old-fail-kill`) assert
+  that `STATUS=FAIL REASON=guard-timeout-` / `-kill-` is **gone**. They pin ADR-0034 §9's
+  2026-08-21 amendment, which moved timeout from `FAIL` to `PRECONDITION_FAILURE` leaving the
+  REASON tokens byte-identical — so the enum is the *only* detectable signal of a regression, and
+  these two are what detect it. Convert them mechanically and
+  `assert_status_line_absent "STATUS=FAIL REASON=guard-timeout-"` asserts no line *equals* the bare
+  prefix, which is trivially true forever (a real emission is always `…guard-timeout-<name>`). The
+  assertion would pass permanently, stop pinning the amendment, and let a genuine regression sail
+  through — a green test that has quietly stopped testing anything, i.e. the fix introducing the
+  failure class it was meant to close. **Rule for the sweep: positive prefix assertions may convert
+  to whole-line; negative prefix assertions may not.** The negative ones need either a prefix-aware
+  absent primitive, or to stay on substring semantics deliberately with a comment saying why. Two
+  of four known sites fall in the second category, so this is half the known-intentional set, not
+  an edge case — and it is why the "add the primitive **and** sweep" option sits further from the
+  cheap end than a raw site count implies.
+
+  **Process note worth keeping, because it is this project's own failure mode pointed inward.**
+  Six claims reached the reviewer during this Gate 1 as settled fact — a `kubectl` remedy command,
+  a "live defect" framing, the `devloop-validation.md` §8 caveat, a proposed replacement for that
+  caveat, a line citation, and an `assert_absent` proposal. Measuring each found **all six wrong**,
+  including two of the reviewer's own, and every correction came from opening
+  `scripts/lang/_common.sh`, `scripts/guards/run-guards.sh` and `scripts/lang/_test_helpers.sh`
+  rather than from any agent's summary. A confidently relayed claim reads as a verified one; that
+  is the same shape as a control that reads as coverage, which is what the surfacing devloop
+  existed to close. The cheap countermeasure is the one that worked here: open the file before
+  repeating the claim.
+
+  **Owner**: operations. Provenance: Gate 1 of
+  `docs/devloop-outputs/2026-09-01-release-premise-and-preflight-guards/main.md`, @operations +
+  @observability, @team-lead ruling 2026-09-01 that all three items stay out of the surfacing diff.
+  **To be scheduled — no slug.**

@@ -45,6 +45,11 @@
 //! move plus a production `use mh_test_utils::…` — two visible source edits in
 //! the same diff, not one.**
 //!
+//! ANCHOR (DRY): the release-profile half of the argument above — that the
+//! builder stage builds `--release` — is enforced by `dt-guard
+//! release-build-profile` (`crates/dt-guard/src/release_build_profile.rs`).
+//! Cross-reference only; the claims in this comment are unchanged.
+//!
 //! A mechanical guard on that edge is tracked in `docs/TODO.md` §Test Debt.
 //! Its second class member is already in the tree: wtransport's
 //! `dangerous-configuration` (certificate-validation bypass) is dev-scoped in
