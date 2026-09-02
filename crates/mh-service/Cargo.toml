@@ -27,6 +27,9 @@ bytes = { workspace = true }
 # gRPC for GC communication and MC→MH service
 tonic = { workspace = true }
 
+# Lock-free routing-snapshot publication for the ADR-0036 §8 control plane.
+arc-swap = { workspace = true }
+
 # OpenTelemetry (R-55/R-56/R-58): connection.rs implements a W3C `Extractor`
 # and calls `OpenTelemetrySpanExt::set_parent` directly, so these are named
 # here (not just consumed opaquely via `common::observability::otel::OtelInit`

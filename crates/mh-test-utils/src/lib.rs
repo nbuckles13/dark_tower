@@ -69,4 +69,5 @@
 
 #![forbid(unsafe_code)]
 
+pub mod media_policy;
 pub mod transport_shim;

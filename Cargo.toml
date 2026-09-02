@@ -69,6 +69,12 @@ http = "1"
 quinn = "0.11"
 wtransport = "0.7"
 
+# Lock-free snapshot publication. Readers take an `Arc` with no guard lifetime
+# (`ArcSwap::load_full`), which `tokio::sync::watch` cannot offer: its
+# `borrow()` holds an internal RwLock read for the guard's life, so holding one
+# across a per-frame forwarding decision would block the publisher.
+arc-swap = "1.9"
+
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

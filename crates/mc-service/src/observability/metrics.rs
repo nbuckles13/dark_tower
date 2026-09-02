@@ -499,29 +499,13 @@ pub fn record_display_name_resolution(outcome: &str) {
 // Media-path key custody (ADR-0036 §4, §11)
 // ============================================================================
 
-/// Label KEY for media key custody.
-///
-/// Promote to `crates/common/src/observability/` at the SECOND consumer; MC is
-/// the first emission site in the tree. Fleet-wide rollout to every service is
-/// R-26 (observability task 22), not this task.
-pub const KEY_CUSTODY_LABEL: &str = "key_custody";
-
-/// Label VALUE for media key custody. **One permitted value.**
-///
-/// ADR-0036 §4: media is encrypted between clients; MH, transport and storage
-/// cannot read it; **MC can**. That is accepted operator custody, recorded as
-/// the user's risk decision.
-///
-/// A `&'static str` const, never derived from config, deployment mode, a
-/// feature flag, or whether a KEK happens to be provisioned: this is a
-/// *constraint*, not a snapshot of today's deployment. Adding a second value
-/// requires an ADR-0036 §4 amendment.
-///
-/// This exists **in place of** an end-to-end or zero-trust boolean, which no
-/// metric, log, dashboard or document may carry — a stat panel reading
-/// `E2E: true` is a product claim rendered to an operator, who may repeat it to
-/// a customer. The label carries the truth; a boolean would carry a claim.
-pub const KEY_CUSTODY_OPERATOR: &str = "operator";
+// The `key_custody` label vocabulary lives in `crates/common` as of the second
+// emission site (mh-service, ADR-0036 §8 policy applies). The promotion note
+// that used to sit here named this exact trigger; it has now fired, so the
+// definitions moved rather than being copied. Re-exported so MC's existing
+// call sites — qualified (`actors/meeting.rs`) and unqualified (below) — keep
+// resolving through this module unchanged.
+pub use common::observability::labels::{KEY_CUSTODY_LABEL, KEY_CUSTODY_OPERATOR};
 
 /// Record that a meeting KEK was generated (one per meeting-actor creation).
 ///

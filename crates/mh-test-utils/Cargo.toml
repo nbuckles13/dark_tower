@@ -34,3 +34,7 @@ bytes = { workspace = true }
 # `[dev-dependencies]` — see the crate doc in `src/lib.rs` for the exact
 # strength of that control, which is weaker than "impossible".
 mh-service = { path = "../mh-service" }
+
+# Proto message types for the `media_policy` fixture builders. Fixtures only —
+# nothing in this crate implements a proto service or touches the wire.
+proto-gen = { path = "../proto-gen" }

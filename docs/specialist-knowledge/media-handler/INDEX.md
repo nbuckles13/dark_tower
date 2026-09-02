@@ -20,16 +20,19 @@
 - Error types (MhError hierarchy) → `crates/mh-service/src/errors.rs`
 - gRPC: GC client (registration, heartbeats, re-registration) → `crates/mh-service/src/grpc/gc_client.rs`
 - gRPC: MC client (Notify connect/disconnect, retry with backoff, auth short-circuit) → `crates/mh-service/src/grpc/mc_client.rs`
-- gRPC: MH service (RegisterMeeting via SessionManagerHandle) → `crates/mh-service/src/grpc/mh_service.rs`
-- gRPC: auth layer (MhAuthLayer: JWKS + scope + Layer 2 service_type routing, ADR-0003) → `crates/mh-service/src/grpc/auth_interceptor.rs`
-- gRPC: classify_jwt_error (JwtError → bounded failure_reason label) → `crates/mh-service/src/grpc/auth_interceptor.rs:classify_jwt_error`
+- gRPC: MH service — RegisterMeeting IS the ADR-0036 §8 control plane (validate → upsert/promote → apply policy → echo the APPLIED generation, read from the live snapshot never from the request) → `crates/mh-service/src/grpc/mh_service.rs`
+- gRPC: auth layer (MhAuthLayer JWKS+scope+Layer-2 routing, ADR-0003; `classify_jwt_error` → bounded failure_reason) → `crates/mh-service/src/grpc/auth_interceptor.rs`
 - JWT validation (MhJwtValidator wrapping common JwtValidator, token_type=meeting) → `crates/mh-service/src/auth/mod.rs`
-- Session management (SessionManagerActor/Handle, pending promotion via Notify) → `crates/mh-service/src/session/mod.rs`
+- Session management (SessionManagerActor/Handle, pending promotion via Notify) + config-apply mailbox: a SECOND mpsc into the same actor, `select!` over both (§8: config-apply must not route through the bounded lifecycle mailbox); apply semantics stale/equal-no-swap/greater → `crates/mh-service/src/session/mod.rs`
+- Forwarding-policy types + lock-free ArcSwap snapshot; structural rejects (counts FIRST, whole registration, no state mutation); scoped newtypes `SenderId`/`SlotId`/`StreamNumber` with widths derived from `media-protocol`, never literals → `crates/mh-service/src/routing/mod.rs`
+- Meeting-scoped sender resolution — the ONLY sender lookup, unconstructible without a `MeetingKey`; cross-tenant guard, `docs/TODO.md` §Media Path Obligations (a) → `crates/mh-service/src/routing/mod.rs:sources_for`
+- Process-incarnation epoch for MC's restart detector — sampled ONCE in `main`, never per call → `crates/mh-service/src/process.rs`
+- Policy bounds + hard ceilings (`PolicyLimits`; resource exhaustion, NEVER capacity, never advertised to GC) → `crates/mh-service/src/config.rs:PolicyLimits`
 - WebTransport server (TLS 1.3, capacity-bounded accept loop) → `crates/mh-service/src/webtransport/server.rs`
-- WebTransport connection handler (framed JWT read, provisional accept, MC notifications) → `crates/mh-service/src/webtransport/connection.rs`
-- Provisional-accept select helper (Registered/Timeout/Cancelled outcomes) → `crates/mh-service/src/webtransport/connection.rs:await_meeting_registration`
+- WebTransport connection handler (framed JWT, provisional accept via `await_meeting_registration`, MC notifications) → `crates/mh-service/src/webtransport/connection.rs`
 - Health + readiness endpoints → `crates/mh-service/src/observability/health.rs`
-- Prometheus metric recorders → `crates/mh-service/src/observability/metrics.rs`
+- Prometheus metric recorders; `mh_media_policy_applies_total{outcome,key_custody}` 5 bounded outcomes → `crates/mh-service/src/observability/metrics.rs:PolicyApplyOutcome`
+- Shared `key_custody` label vocabulary (hoisted to common at its 2nd consumer) → `crates/common/src/observability/labels.rs`
 - MH metrics catalog → `docs/observability/metrics/mh-service.md`
 
 ## Media Protocol (v2 frame codec — ADR-0036 §2)
@@ -37,8 +40,7 @@
 - Forward-path buffer-sizing constants (`MAX_HEADER_BYTES`, `MAX_FRAME_BYTES`, `MAX_PAYLOAD_BYTES`) → `frame.rs` (derived; do not recompute in MH)
 - Sequence-reset asymmetry: `hop_sequence` resettable / `stream_sequence` MUST NEVER reset (AEAD nonce input — reset = GCM auth-key recovery) → `frame.rs` accessors (task 16 `HopSequence` lands here, no reset API)
 - Single layout parser + four entry points (`decode_datagram`, `decode_stream_frame`, `peek_frame_len`, `rewrite_relay_region`); reject reasons via enum-derived `ALL_REJECT_REASONS` → `crates/media-protocol/src/codec.rs`
-- Relay-region rewrite (offset derived per frame via `parse_layout`, NEVER a constant) → `codec.rs:rewrite_relay_region()`
-- Reader-side pre-allocation bound (`MAX_PAYLOAD_BYTES` enforced before buffering) → `codec.rs:peek_frame_len()`
+- Relay-region rewrite (offset derived per frame, NEVER a constant) → `codec.rs:rewrite_relay_region()`; reader-side pre-alloc bound → `codec.rs:peek_frame_len()`
 - Extension TLV registry + salience `0x01` selector input (value `0..=100`) → `crates/media-protocol/src/extensions.rs` (story-5 selector)
 - Fuzz: decode / roundtrip → `crates/media-protocol/fuzz/fuzz_targets/`
 
@@ -48,9 +50,6 @@
 - Generated Rust code → `crates/proto-gen/build.rs`
 
 ## Integration Seams
-- MH → GC registration/heartbeat → `crates/mh-service/src/grpc/gc_client.rs`
-- MH → MC notifications (connect/disconnect) → `crates/mh-service/src/grpc/mc_client.rs`
-- MC → MH gRPC service (RegisterMeeting) → `crates/mh-service/src/grpc/mh_service.rs`
 - MH → AC token management → `crates/common/src/token_manager.rs`
 - MH → AC JWKS (meeting + service token validation) → `crates/common/src/jwt.rs:JwksClient`
 - Client → MH WebTransport (QUIC/TLS 1.3, framed JWT first) → `crates/mh-service/src/webtransport/server.rs`
@@ -61,9 +60,10 @@
 - Integration: MC client retry + auth short-circuit → `crates/mh-service/tests/mc_client_integration.rs`
 - Integration: MhAuthLayer over real tonic (alg:none + HS256, Layer 2 routing) → `crates/mh-service/tests/auth_layer_integration.rs`
 - Integration: RegisterMeeting over real gRPC → `crates/mh-service/tests/register_meeting_integration.rs`
-- Integration: WebTransport accept path, provisional timeout, MC notify lifecycle → `crates/mh-service/tests/webtransport_integration.rs`
-- Integration: WebTransport accept_loop component coverage → `crates/mh-service/tests/webtransport_accept_loop_integration.rs`
-- Integration rigs (JWKS mock, mock MC, gRPC rig, WT rig, token minters) → `crates/mh-service/tests/common/`
+- Integration: policy-apply metric labels + counting-boundary denominator invariant → `crates/mh-service/tests/policy_apply_integration.rs`
+- ADR-0036 §10 Tier-1b gates (apply-failure does not advance the echo, monotonicity, re-assert idempotency, gen-0) → `mh_service.rs` tests; multi-meeting cross-tenant pin (both arms) → `routing/mod.rs` tests
+- Integration: WebTransport accept path/provisional timeout/MC notify → `tests/webtransport_integration.rs`, `tests/webtransport_accept_loop_integration.rs`
+- Integration rigs (JWKS mock, mock MC, gRPC rig, WT rig, token minters) → `crates/mh-service/tests/common/`; `RegisterMeetingRequest`/`EgressStream` fixture builders — ONE home, reachable from `src/` unit tests and `tests/` binaries alike, alongside the `MediaTransport` loss/delay shim → `crates/mh-test-utils/src/media_policy.rs`
 - Env-tests: full Kind cluster MH QUIC flow (R-33 scenarios) → `crates/env-tests/tests/26_mh_quic.rs`
 
 ## Infrastructure & Operations

@@ -7,12 +7,18 @@
 //!
 //! # Cardinality
 //!
-//! Labels are bounded to prevent cardinality explosion (ADR-0011):
-//! - `status`: 2 values (success, error)
-//! - `method`: 3 values (`register`, `route_media`, `stream_telemetry`)
-//! - `error_type`: ~6 values (bounded by `MhError` variants)
-//! - `operation`: ~5 values (bounded by code paths)
+//! Labels are bounded to prevent cardinality explosion (ADR-0011). The
+//! per-metric label sets, their permitted values and their cardinality are
+//! catalogued in `docs/observability/metrics/mh-service.md`, which is the
+//! single source of truth for them.
+//!
+//! They are deliberately **not** re-listed here. Four homes used to restate
+//! them and three of the four were wrong: this block claimed `method` had
+//! three values and omitted `register_meeting`, the only value the code has
+//! ever emitted. A docstring that *points at* a binding cannot drift; one that
+//! *restates* an enumeration is a copy.
 
+use common::observability::labels::{KEY_CUSTODY_LABEL, KEY_CUSTODY_OPERATOR};
 use metrics::{counter, gauge, histogram};
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 use std::time::Duration;
@@ -128,18 +134,145 @@ pub fn record_token_refresh_metrics(event: &common::token_manager::TokenRefreshE
     record_token_refresh(status, event.error_category, event.duration);
 }
 
+/// The only method on `MediaHandlerService`, as a metric label value.
+///
+/// `internal.proto`'s service block is the single source of truth for this
+/// value set: ADR-0036 §8 makes meeting registration the control plane, so the
+/// service "gains FIELDS rather than sibling RPCs" and is expected to keep
+/// exactly one method. The
+/// `register`, `route_media` and `stream_telemetry` values retired with the
+/// 2026-09-01 reshape can never appear again — the proto's tombstone block
+/// forbids resurrecting the names.
+const GRPC_METHOD_REGISTER_MEETING: &str = "register_meeting";
+
 /// Record an incoming gRPC request from MC.
 ///
 /// Metric: `mh_grpc_requests_total`
-/// Labels: `method` (`register` | `register_meeting` | `route_media` | `stream_telemetry`), `status` (success | error)
-/// Cardinality: 8 (4 methods x 2 statuses)
-pub fn record_grpc_request(method: &str, status: &str) {
+/// Labels: `method` (single value, bound by `GRPC_METHOD_REGISTER_MEETING`), `status` (success | error)
+/// Cardinality: 2
+///
+/// The `method` label stays on the series — runbook queries and dashboard
+/// panels select on `method="register_meeting"`, and an absent label yields an
+/// empty result rather than an error, so removing it would silently blank them.
+/// The *parameter* is gone, which is what makes the single value structural: a
+/// second one cannot be introduced from a call site.
+pub fn record_grpc_request(status: &str) {
     counter!(
         "mh_grpc_requests_total",
-        "method" => method.to_string(),
+        "method" => GRPC_METHOD_REGISTER_MEETING,
         "status" => status.to_string()
     )
     .increment(1);
+}
+
+/// Record the outcome of an ADR-0036 §8 forwarding-policy apply.
+///
+/// Metric: `mh_media_policy_applies_total`
+/// Labels: `outcome` (5 values, see [`PolicyApplyOutcome`]), `key_custody` (single value `operator`)
+/// Cardinality: 5
+///
+/// Counts **registrations whose policy MH considered** — every terminal path
+/// from the first read of a policy-bearing field (`egress_streams`,
+/// `selection_rules`, `policy_generation`) onward, exactly once. Checks that
+/// read only the caller-identity and reachability scalars (`meeting_id`,
+/// `mc_id`, `mc_grpc_endpoint`) are *pre-boundary* and stay on
+/// `mh_grpc_requests_total{status="error"}` alone: "MC's assignment computation
+/// produced a policy MH will not apply" and "this caller's endpoint is
+/// malformed" have different owners and different remedies, and folding them
+/// into one series makes the sum unusable as a denominator.
+///
+/// The label key is `outcome`, not `status`. `status` is `label-taxonomy.md`'s
+/// *coarse, fleet-wide shared* classification; this is a fine-grained,
+/// metric-local taxonomy in which each value names a distinct remedy — and
+/// `internal.proto` already names the MC-side counterpart of this same RPC
+/// `outcome`, so both ends of the handshake carry one label key.
+///
+/// Emits no generation value, no `meeting_id` (raw or hashed), and no stream
+/// identity. Generations belong in the log line and in this metric's *value*;
+/// as labels they would be unbounded, one new series per policy change.
+pub fn record_media_policy_apply(outcome: PolicyApplyOutcome) {
+    counter!(
+        "mh_media_policy_applies_total",
+        "outcome" => outcome.as_label(),
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    )
+    .increment(1);
+}
+
+/// Bounded `outcome` label values for `mh_media_policy_applies_total`.
+///
+/// An enum rather than a free `&str` so the label set is closed at the type
+/// level: a typo or a sixth value is a compile error, not a new time series
+/// discovered in production.
+///
+/// Each value exists because its **remedy differs**, which is the test for
+/// whether a bounded outcome label is doing any work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyApplyOutcome {
+    /// The live forward path reflects the generation MC sent. Covers a fresh
+    /// install and an idempotent re-assert of an already-installed generation.
+    ///
+    /// The re-assert case belongs here, not under `RejectedStale`: ADR-0036
+    /// §8's cadence re-asserts every meeting every <=10 s in perfect health, so
+    /// counting it as a rejection would drive that series monotonically upward
+    /// in the steady state and make any alert on it dead on arrival.
+    Applied,
+    /// A generation strictly lower than the installed one was ignored.
+    /// Reordered or retried delivery on the MC→MH path; abnormal.
+    RejectedStale,
+    /// `policy_generation` was 0 — MC named no generation.
+    ///
+    /// The **expected steady state for the whole task-11→task-13 window**, when
+    /// MC has not yet begun emitting real generations. It is also the value the
+    /// *rejection* will land on once task 13 turns enforcement on: two eras,
+    /// one value, no rename, and the series falls to zero exactly when MC
+    /// starts sending >= 1.
+    NoGeneration,
+    /// The policy failed structural validation. MC sent bad policy; the remedy
+    /// is upstream. Distinct from `ApplyFailed` so an MC policy bug is never
+    /// indistinguishable from an MH internal fault.
+    RejectedInvalid,
+    /// MH could not install it — mailbox full, apply timed out, actor gone, or
+    /// the aggregate egress-edge bound. The prior generation stays live.
+    ApplyFailed,
+}
+
+impl PolicyApplyOutcome {
+    /// Every value of this enum, in catalog order.
+    ///
+    /// **The one hand-maintained list, and it lives here.** `as_label`'s
+    /// wildcard-free `match` is the only thing a new variant forces an update
+    /// to; every *enumeration* of the variants elsewhere would compile clean
+    /// while staying silently short, and the enumerations that go short first
+    /// are the exhaustiveness tests whose whole job is to be complete.
+    /// `media-protocol`'s `reject_reasons!` macro and its `ALL_REJECT_REASONS`
+    /// slice exist for exactly this failure; that macro is not exported and
+    /// lives in a Guarded Shared Area, so this applies the pattern locally.
+    /// Every consumer — the recorders' tests, the cardinality test and the
+    /// integration label assertions — iterates this slice.
+    /// The length is written out rather than inferred: it is the catalogued
+    /// cardinality of the `outcome` label, so a variant added to this array
+    /// without the catalog and the dashboard being revisited fails to compile
+    /// here first.
+    pub const ALL: [Self; 5] = [
+        Self::Applied,
+        Self::RejectedStale,
+        Self::NoGeneration,
+        Self::RejectedInvalid,
+        Self::ApplyFailed,
+    ];
+
+    /// The wire label value.
+    #[must_use]
+    pub const fn as_label(self) -> &'static str {
+        match self {
+            Self::Applied => "applied",
+            Self::RejectedStale => "rejected_stale",
+            Self::NoGeneration => "no_generation",
+            Self::RejectedInvalid => "rejected_invalid",
+            Self::ApplyFailed => "apply_failed",
+        }
+    }
 }
 
 /// Record an error for the global error counter.
@@ -315,15 +448,47 @@ mod tests {
 
     #[test]
     fn test_record_grpc_request() {
-        // All 8 combinations: 4 methods x 2 statuses
-        record_grpc_request("register", "success");
-        record_grpc_request("register", "error");
-        record_grpc_request("register_meeting", "success");
-        record_grpc_request("register_meeting", "error");
-        record_grpc_request("route_media", "success");
-        record_grpc_request("route_media", "error");
-        record_grpc_request("stream_telemetry", "success");
-        record_grpc_request("stream_telemetry", "error");
+        // Both combinations: 1 method x 2 statuses. `MediaHandlerService` has
+        // exactly one RPC by design (ADR-0036 §8), and the method label value
+        // is now a const inside the recorder rather than a parameter.
+        record_grpc_request("success");
+        record_grpc_request("error");
+    }
+
+    #[test]
+    fn test_record_media_policy_apply_covers_every_outcome() {
+        for outcome in PolicyApplyOutcome::ALL {
+            record_media_policy_apply(outcome);
+        }
+    }
+
+    #[test]
+    fn test_policy_apply_outcome_labels_are_distinct_and_stable() {
+        let labels: Vec<&str> = PolicyApplyOutcome::ALL
+            .iter()
+            .map(|o| o.as_label())
+            .collect();
+        // The expected side is spelled out on purpose: it is the wire
+        // contract, and a test that derived it from `as_label` would assert
+        // nothing. What must NOT be hand-listed is the variant set, which is
+        // why the left side iterates `ALL`.
+        assert_eq!(
+            labels,
+            [
+                "applied",
+                "rejected_stale",
+                "no_generation",
+                "rejected_invalid",
+                "apply_failed"
+            ],
+            "outcome label values are wire-visible; a rename silently breaks every dashboard and alert selecting on them"
+        );
+        let unique: std::collections::HashSet<_> = labels.iter().collect();
+        assert_eq!(
+            unique.len(),
+            labels.len(),
+            "outcome labels must be distinct"
+        );
     }
 
     #[test]
@@ -395,17 +560,16 @@ mod tests {
             record_gc_heartbeat(status);
         }
 
-        // Verify method labels are bounded to 4 values
-        let valid_methods = [
-            "register",
-            "register_meeting",
-            "route_media",
-            "stream_telemetry",
-        ];
-        for method in &valid_methods {
-            for status in &valid_statuses {
-                record_grpc_request(method, status);
-            }
+        // The `method` label is single-valued by construction — the value is a
+        // const inside the recorder, so cardinality is bounded by the 2
+        // statuses alone.
+        for status in &valid_statuses {
+            record_grpc_request(status);
+        }
+
+        // The `outcome` label is bounded by the PolicyApplyOutcome enum.
+        for outcome in PolicyApplyOutcome::ALL {
+            record_media_policy_apply(outcome);
         }
 
         // Verify error_type labels are bounded by MhError variants
@@ -460,9 +624,9 @@ mod tests {
         record_gc_heartbeat_latency(Duration::from_millis(10));
         record_token_refresh("success", None, Duration::from_millis(50));
         record_token_refresh("error", Some("http"), Duration::from_millis(100));
-        record_grpc_request("register", "success");
-        record_grpc_request("route_media", "error");
-        record_grpc_request("stream_telemetry", "success");
+        record_grpc_request("success");
+        record_grpc_request("error");
+        record_media_policy_apply(PolicyApplyOutcome::Applied);
         record_error("gc_heartbeat", "grpc", 503);
 
         // Single histogram assertion — `Snapshotter::snapshot()` drains
