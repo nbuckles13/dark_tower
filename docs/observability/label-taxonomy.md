@@ -78,6 +78,7 @@ case future drift emerges from new services or metric additions.
 | `region` | Geographic/deployment region | Bounded by cloud region set |
 | `pod` | Kubernetes pod identifier | Per-pod — cardinality bounded by fleet size |
 | `key_custody` | Who holds media key material | **`operator` — single permitted value.** See §Key custody below. |
+| `reason` | Why a **frame** was dropped on the media path | Bounded by `proto/test-vectors/frame-v2.vectors.json` → `reject_reasons`. **Points, never restates** — restating the tokens here would give each one two homes and they would drift. Distinct from `error_type` / `error_category`, which classify why a **service operation** failed: `reason` is per-frame and lives entirely on the media path. See §Frame reject reason below. |
 
 ### Non-canonical aliases (flagged by reviewers, not the guard) `[reviewer-only]`
 
@@ -154,6 +155,89 @@ the prohibition for integrators; ADR-0036 §11 is the decision record. On diverg
 mechanics* — name, permitted values, which surfaces carry it — this file wins.
 
 ---
+
+## Frame reject reason `[reviewer-only]`
+
+**All sixteen `reason` values are emitted individually as `reason` values, without exception
+(R-25, R-31). Nothing below bears on that.** This section is where someone will come looking for
+permission to coarsen the vocabulary, and everything after this sentence is about a different axis.
+R-25 already settled the per-token question on 2026-08-31: *"'bucket' names a FAMILY of `reason`
+values, not one collapsed `decode_reject` label"* — collapsing would destroy R-31's only lever, since
+`unknown_version` staying individually visible is how a version-skewed rollback is detected, and
+would break `sum by(reason)` comparability between MH and the client.
+
+**"Without exception" above is about granularity, not about membership of the drop counter. Those are
+different questions and only one of them has the answer "all sixteen".** Which values belong on
+`dt_client_media_frames_dropped_total{reason}` is carried by **`drops_frame`** in
+`proto/test-vectors/frame-v2.vectors.json` → `reject_reasons`. Fifteen are `true`.
+**`wrap_key_id_mismatch` is `false`, and is the only one**: it describes a correctly self-signed frame
+whose mis-bound wrapped key the receiver ignores (ADR-0036 §4), so the frame is otherwise processed
+and **played**. Counting it as a drop breaks R-25's `received = played + sum(drops)` for a frame that
+*was* played — an identity that fails silently, only in aggregate, and long after the label set is
+frozen. Stated here rather than left to the array for the same reason this section gives about R2:
+**the reader who needs the constraint is the one least likely to go read the other artifact first.**
+
+**Separately: no `reason` value may be joined with a participant, meeting, or stream dimension.**
+Today that holds for every token under R2's voice-activity-trace argument. Where a token's firing
+depends on **receiver-held state** — key material, roster contents, key-store membership — a second
+and independent argument also applies: for a party who can inject frames, the counter is an **oracle
+over the receiver's key state**, and the frame's author already knows every byte-determined outcome,
+so only the state-dependent ones tell them anything new.
+
+**The discriminator is byte-determined versus receiver-state-dependent — *not* codec-versus-crypto,
+and not `has_vector`.** Those are all *nearly* the same distinction and none of them is it:
+
+- The eight structural rejects are **byte-determined**.
+- `no_kek_for_generation`, `no_roster_entry`, `no_transmit_key`, `signature_invalid`,
+  `decrypt_failed` and `unwrap_failed` are **receiver-state-dependent**.
+- `no_transmit_key` is `layer: "codec"` yet fires on key-store membership, so an attacker choosing
+  key ids reads it as *"does this receiver hold key id X?"* — which is why the layer-based version of
+  this rule was wrong.
+- `signature_invalid` and `decrypt_failed` are byte-determined *given fixed key material*, so they
+  carry `has_vector: true` while sitting on the restricted side — which is why the `has_vector`
+  version is wrong too.
+
+State the rule in its own terms. Do not derive it from a neighbouring field.
+
+**The trigger this pre-answers, because the rule is currently inert.** R2 already bars identity
+dimensions from every media-path label, so both families are aggregate-only today and nothing about
+emission changes. A rule that reads as inert invites *"why is this here, can we drop it?"* just as one
+that reads as new invites *"was this always true?"*. The request it exists to answer is: *"the codec
+tokens are harmless — can we slice just those by meeting?"* **No, on different grounds:** the oracle
+argument does not reach them, but R2's trace argument still does.
+
+**`unwrap_failed`'s cost, stated beside its benefit.** It is the only token yielding a *positive
+confirmation* about receiver key state — the KEK unwrap succeeded, so the prober's KEK generation
+matches the receiver's — which is strictly more than the others leak. It is a direct consequence of
+splitting `decrypt_failed` into unwrap-versus-payload, that split is still right (two AES-GCM
+failures on one receive path with opposite remedies), and stating the cost is what stops it being
+cited later as unqualified precedent.
+
+**The permitted partner set is safe as a SET, not as three individually approved labels.** `reason`
+is safe because its permitted partners (`client_version`, `org_id`) are non-identifying — not because
+it is intrinsically harmless. It is one factor of the oracle, and the allow-list's job is to deny it a
+partner. A reader who concludes "these are individually safe" adds a fourth by the same reasoning,
+which is how the oracle gets rebuilt out of permitted labels.
+
+**`org_id` residual `[reviewer-only]`:** `org_id` is non-identifying only **at scale**. A
+single-tenant org, or one whose meetings do not overlap in time, makes it quasi-identifying, and
+`reason × org_id` then reconstructs a per-meeting distinguisher from permitted labels. This residual
+is **not guardable** — it depends on deployment shape, which no guard can see — so this clause is its
+entire control, and it is marked as such because a residual documented inside an enforced-looking
+rule inherits the rule's credibility without its enforcement.
+
+**Inertia, in the present-tense-required form (ADR-0036 R3).** The SDK's implicit join label set is
+threaded from `MeetingSession.join` into **every** emission site including the media module, so
+`reason × meeting_id_hash` — the oracle — is the **default**. It arrives by doing nothing. A task-19
+implementer must act to prevent it; the violation ships unless they do.
+
+**Following the pointer:** `frame-v2.vectors.json` is a **test-vector fixture**. Its `crypto` blocks
+carry synthetic, test-only key material (including a field named `identity_private_seed_hex`) whose
+values are structured low-entropy patterns, not CSPRNG output, and nothing in it derives from any real
+environment or secret. Read the `reject_reasons` array; do not file an incident on the rest.
+
+**References, cited rather than restated** so they cannot drift: R2 (media-path label policy and the
+voice-activity-trace argument), the task-#7 meeting-dimension bar, and ADR-0036 R3's inertia note.
 
 ## Media-path identity `[reviewer-only]`
 

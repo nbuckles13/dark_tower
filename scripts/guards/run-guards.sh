@@ -150,6 +150,41 @@ if [[ -d "$SIMPLE_GUARDS_DIR" ]]; then
             0)
                 echo -e "${GREEN}PASSED${NC}: $GUARD_NAME"
                 ((PASSED_GUARDS++)) || true
+                # Surface `^WARN ` lines from PASSING guards.
+                #
+                # Without this the pass arm discards $captured entirely, so a
+                # guard that passes while reporting a coverage hole is silent on
+                # every run. That made two contracts unenforceable: §6.3's
+                # `ts-no-retained-credentials` rule that "a clean run must be a
+                # WARN-free run ... do not ignore it because the layer passed",
+                # and validate-frame-vectors' g14 banner, whose whole job is to
+                # say the cross-language property is not yet established.
+                #
+                # Line-anchored `^WARN ` on this arm, deliberately narrower than
+                # the failure arm's unanchored pattern: on a green run this is a
+                # structured-emission contract, and surfacing any guard that
+                # prints "WARN" mid-sentence would be noise — which is how people
+                # learn to skim past the one line that mattered.
+                #
+                # `|| true` is load-bearing for the same reason as the failure
+                # arm: with no match, grep exits 1, pipefail propagates, and
+                # `set -e` aborts the loop, silently skipping every remaining
+                # guard. Keep the sentinel even if the pattern changes.
+                #
+                # Deliberately NO `head -5` here, unlike the failure arm. That
+                # cap exists because the failure arm's pattern is broad
+                # (VIOLATION|violation|ERROR|error|WARN, unanchored) and can
+                # match hundreds of lines from one guard. `^WARN ` is a narrow
+                # structured-emission contract with few producers, and each line
+                # is a distinct coverage hole an operator must see — truncating
+                # would silently drop the fifth one, which is the same
+                # empty-result-reads-as-pass failure this arm was added to fix.
+                # If the pass arm ever grows noisy, the fix is to stop routine
+                # text through `^WARN ` (see NOTE in no_insecure_browser_flags),
+                # not to cap it.
+                if [[ -n "$captured" ]]; then
+                    { echo "$captured" | grep -E "^WARN "; } || true
+                fi
                 ;;
             124)
                 # Timeout → operator lane (PRECONDITION_FAILURE, exit 2), NOT a diff defect.

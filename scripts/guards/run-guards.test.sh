@@ -173,4 +173,54 @@ assert_status "mix-violations-legible"   "STATUS=FAIL REASON=guard-violations" "
 assert_status "mix-lane-line-stdout"     "MIXED_LANE:" "$out"
 assert_status "mix-lane-line-stderr"     "MIXED_LANE:" "$err"
 
+# =============================================================================
+# (6) The exit-0 arm surfaces `^WARN ` from a PASSING guard — the OPS-8 fix.
+#
+# Before that arm existed, `classify_guard_exit` discarded $captured on exit 0,
+# so a guard that PASSED while reporting a coverage hole was silent on every
+# run. Two contracts depended on it and neither was enforceable: §6.3's
+# `ts-no-retained-credentials` rule that "a clean run must be a WARN-free run
+# ... do not ignore it because the layer passed", and validate-frame-vectors'
+# g14 banner, which is the only runtime signal that the cross-language property
+# is not yet established.
+#
+# THIS CASE PINS THE RUNNER LEG ONLY. The stub below is synthetic, so it cannot
+# show that any real guard emits the prefix; `validate-frame-vectors.test.sh`
+# pins that against the real guard. Composed, the two cover the channel end to
+# end with each half beside the code it constrains. Deleting either leaves a
+# silent gap.
+#
+# Both assertions route through the harness (assert_status / assert_absent) so a
+# regression lands in FAILURES[] and reddens report_results. An earlier draft of
+# this case used `echo FAIL: ...; return 1` and sat AFTER the report_results
+# call — so it never ran, and could not have failed the suite if it had, because
+# this file runs under `set +e`. That is the same empty-result-reads-as-pass bug
+# the arm itself exists to fix, reproduced in its own test.
+# =============================================================================
+# run-guards.sh derives its guards directory from its OWN location, not from the
+# path argument (which is the scan path handed to each guard). So the synthetic
+# tree has to contain a copy of the runner, not merely a copy of the guards.
+d="$WORK/stubwarn"
+mkdir -p "$d/scripts/guards/simple" "$d/.git"
+cp "$RUN_GUARDS" "$d/scripts/guards/run-guards.sh"
+cp "$(dirname "$RUN_GUARDS")/common.sh" "$d/scripts/guards/common.sh"
+cat > "$d/scripts/guards/simple/stub-warn-guard.sh" <<'STUB'
+#!/usr/bin/env bash
+echo "WARN stub-guard: a coverage hole reported from a PASSING guard"
+echo "incidental mention of WARN mid-sentence that must NOT be surfaced"
+exit 0
+STUB
+chmod +x "$d/scripts/guards/simple/stub-warn-guard.sh"
+
+warn_rc=0
+warn_out="$(bash "$d/scripts/guards/run-guards.sh" "$d" 2>&1)" || warn_rc=$?
+# Exit code rather than the "PASSED: <name>" line: run-guards colourises that
+# label, so ANSI escapes sit between "PASSED" and the colon and a substring
+# assert on the rendered text would be pinning terminal formatting.
+assert_exit   "warn-arm-guard-actually-passed" 0 "$warn_rc"
+assert_status "warn-arm-surfaces-prefixed-line" \
+  "WARN stub-guard: a coverage hole reported from a PASSING guard" "$warn_out"
+assert_absent "warn-arm-anchor-is-line-start" \
+  "incidental mention of WARN mid-sentence" "$warn_out"
+
 report_results "scripts/guards/run-guards.test.sh"

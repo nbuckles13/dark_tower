@@ -415,7 +415,18 @@ unwrap. §3's mitigation ladder applies unchanged: 40 ms audio frames halve the 
 overhead together.
 
 **The field is signed and KEK-bound.** The wrap is AES-256-GCM under the KEK with the nonce derived
-from the key id and the key id as associated data. One transmit key therefore wraps to one
+from the key id and the key id as associated data. **The derivation, stated so it has a normative
+home:** the 12-byte GCM nonce is `0x00000000 || key_id` — four zero bytes then the 8-byte
+big-endian key id, right-aligned. *This clarifies rather than decides.* It records what the story
+contract already pins in two places and chooses nothing new; it is written here because a normative
+derivation whose only homes are a story line and a task manifest prompt is one archival away from
+having none, and this repository has already had one incident where a stale manifest prompt
+contradicted the shipped contract. Zero-**prefix** rather than zero-suffix so the codebase carries
+**one** padding rule: `SFrame`'s own nonce is `salt XOR BE12(counter)`, which right-aligns a
+big-endian value identically. Any injective derivation would satisfy the uniqueness argument above
+equally well — which is exactly why leaving it to two independent implementations was the wrong
+shape. Pinned per row as `wrap_nonce_hex` in `proto/test-vectors/frame-v2.vectors.json`, which is
+the file that wins if this prose and the vectors ever disagree. One transmit key therefore wraps to one
 ciphertext — byte-identical from frame to frame within a generation — and nonce uniqueness under the
 KEK reduces to key-id uniqueness, which generation monotonicity gives (below). It sits in the
 **publisher region** (§2): covered by the signature, so MH can neither attach, strip, nor replay
@@ -1268,7 +1279,7 @@ answer to deferring performance work.
 | ADR-0011, handler jitter objective | **Unmeasurable** — MH forwards and does not buffer; perceived jitter is a client-side jitter-buffer property and jitter-buffer design is out of scope. Struck, with a client-side successor deferred with jitter-buffer design |
 | ADR-0011, handler forwarding latency objective | No defined measurement point; redefined as ingress-read-complete → egress-enqueued |
 | ADR-0012:388-389 | Thresholds already mandated but unimplementable; the bandwidth indicator in §11 makes them real |
-| ADR-0027 | **No amendment needed** — AES-256-GCM, HKDF and Ed25519 are all already approved |
+| ADR-0027, key-derivation row | **Amendment required and landed.** The original row read "no amendment needed — AES-256-GCM, HKDF and Ed25519 are all already approved", which was wrong in one specific way: the approved-algorithms table named **HKDF-SHA256**, not HKDF generically. §4's ciphersuite `AES_256_GCM_SHA512_128` (0x0005) fixes the hash at SHA-512, so it requires `ring::hkdf::HKDF_SHA512`, which the table did not permit. Broadened to HKDF-SHA256 **and** HKDF-SHA512. Recorded as a correction rather than silently edited, because a reader who trusted the original would have concluded the media key schedule was covered by the existing table when it was not — and ADR-0027's table is applied by hand at Gate 1/3, so the gap would have surfaced as a reviewer objection rather than a failing check |
 | `docs/observability/slos.md` | Referenced by ADR-0011 and does not exist; created |
 | `docs/PROJECT_STATUS.md` | Badly stale — lists MH as a skeleton and GC/MC as planned; corrected |
 
