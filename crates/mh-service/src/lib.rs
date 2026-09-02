@@ -19,8 +19,13 @@
 //! actually reflects.
 //!
 //! No media forwarding is performed yet — the snapshot is published and
-//! deliberately unconsumed until the forward path lands at story task 16, in
-//! the same posture as the [`transport`] seam below.
+//! deliberately unconsumed until the forward path lands at story task 16.
+//!
+//! QUIC transport parameters are declared explicitly and validated at startup
+//! (ADR-0036 §1): five required environment variables, a frames-to-bytes
+//! datagram-buffer conversion performed once at config load, declared
+//! receive-side flow control, and a shutdown drain window derived from the
+//! pod's own termination grace rather than hardcoded. See [`config`].
 //!
 //! Two contract obligations are **deliberately not** implemented here, both
 //! with their enforcement owner named at the code site: rejecting
@@ -28,10 +33,20 @@
 //! would blackhole every meeting for the whole window), and binding a
 //! `sender_id` to a live connection (story task 16).
 //!
-//! The ADR-0036 §10 per-connection transport seam ([`transport`]) has landed
-//! and is deliberately unconsumed: no production type implements it yet. The
-//! real wtransport implementation and the forward path that runs against it are
-//! story tasks 12 and 16 respectively.
+//! The ADR-0036 §10 per-connection transport seam ([`transport`]) now has its
+//! real implementation — [`webtransport::WtMediaTransport`], wrapping
+//! `wtransport` per-connection I/O. It is **plumbing, deliberately unwired**:
+//! nothing constructs it yet, and the forward path that consumes it is story
+//! task 16. Whoever wires it must construct it only *after*
+//! [`webtransport::connection`]'s JWT gate returns, or unauthenticated media
+//! I/O would start on an accepted-but-unvalidated session.
+//!
+//! Its `finished` flag is not incidental: `wtransport` collapses quinn's
+//! stream-scoped `ClosedStream` into the same value it uses for connection
+//! loss, so the dead-stream / dead-connection distinction the forward path
+//! needs — a per-subscriber problem versus a per-participant one — survives
+//! only where MH holds the state itself. Found by test, not by reading; see
+//! `docs/TODO.md` for the constraint that places on task 16.
 //!
 //! # Architecture (ADR-0010, ADR-0023)
 //!

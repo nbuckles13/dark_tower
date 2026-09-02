@@ -14,7 +14,18 @@ workspace = true
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 quinn = { workspace = true }
-wtransport = { workspace = true }
+# `quinn` feature: unlocks `ServerConfigBuilder::with_custom_transport`, which is
+# how ADR-0036 §1's explicit `quinn::TransportConfig` reaches the endpoint. It is
+# purely additive re-export surface (`wtransport`'s own `[features] quinn = []`
+# gates no dependency), and `wtransport` already depends on the same quinn 0.11
+# this crate does, so no second version enters the graph.
+#
+# Side effect worth knowing: it also makes `wtransport::Connection::quic_connection()`
+# compile, which `src/transport/mod.rs` previously recorded as unavailable here.
+# That does NOT change the conclusion documented there — datagrams sent through the
+# raw QUIC connection skip the HTTP/3 session-id varint and are unattributable to a
+# WebTransport session — only the reason. The docstring is corrected accordingly.
+wtransport = { workspace = true, features = ["quinn"] }
 serde = { workspace = true }
 prost = { workspace = true }
 tracing = { workspace = true }

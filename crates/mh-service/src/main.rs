@@ -112,6 +112,57 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_streams = config.max_streams,
         max_connections = config.max_connections,
         register_meeting_timeout_seconds = config.register_meeting_timeout_seconds,
+        // ADR-0036 §1 QUIC transport parameters and the derived drain window.
+        //
+        // Layer-qualified `transport_` prefix on purpose: without it this line
+        // would carry three unrelated `max_`-prefixed fields — `max_streams`
+        // (advertised to GC, enforced only at GC placement), `max_connections`
+        // (enforced by MH at accept), and the QUIC uni-stream bound (enforced
+        // by quinn) — whose names suggest a kinship they do not have. The
+        // prefix states which layer enforces the value.
+        //
+        // BOTH links of the frames->bytes conversion are printed. Logging only
+        // frames hides the conversion at the exact moment an operator is
+        // debugging it; logging bytes under a `_frames` name is the unit lie
+        // this task exists to remove. `..._ms` is the figure ADR-0036 §1
+        // actually reasons with (its "93 seconds of queued audio").
+        //
+        // Provenance is NOT visible here and cannot be: some of these are
+        // ConfigMap keys and some are compile-time constants. `config.rs`
+        // groups them so the distinction is legible in one place.
+        transport_max_concurrent_uni_streams = config.quic_transport.max_concurrent_uni_streams,
+        transport_datagram_send_buffer_audio_frames =
+            config.quic_transport.datagram_send_buffer_audio_frames,
+        transport_datagram_send_buffer_bytes = config.quic_transport.datagram_send_buffer_bytes,
+        transport_datagram_send_buffer_ms = config.quic_transport.datagram_send_buffer_ms(),
+        transport_datagram_receive_buffer_bytes = mh_service::config::DATAGRAM_RECEIVE_BUFFER_BYTES,
+        // The negotiated wire limit. quinn derives it from the receive buffer,
+        // so an operator debugging datagrams too large to send would otherwise
+        // have to read quinn's source to learn it.
+        transport_max_datagram_frame_size_bytes =
+            config.quic_transport.max_datagram_frame_size_bytes(),
+        transport_receive_window_bytes = mh_service::config::CONNECTION_RECEIVE_WINDOW_BYTES,
+        transport_stream_receive_window_bytes = mh_service::config::STREAM_RECEIVE_WINDOW_BYTES,
+        transport_keepalive_interval_ms = config.quic_transport.keepalive_interval_ms,
+        transport_max_idle_timeout_ms = mh_service::config::MAX_IDLE_TIMEOUT_SECONDS * 1_000,
+        // BOTH conversion factors, so `frames x bytes_factor = bytes` AND
+        // `frames x ms_factor = ms` are each checkable from this one line
+        // rather than from source. The ms link matters at least as much as the
+        // bytes link: `transport_datagram_send_buffer_ms` is the field an
+        // operator actually reasons with, since queued-audio latency is the
+        // quantity ADR-0036 §1 frames its whole complaint around.
+        nominal_audio_frame_bytes = mh_service::config::NOMINAL_AUDIO_FRAME_BYTES,
+        audio_frame_duration_ms = mh_service::config::AUDIO_FRAME_DURATION_MS,
+        egress_queue_frames = mh_service::config::EGRESS_QUEUE_FRAMES,
+        // Drain chain: seconds end to end, so nothing here is a unit conversion.
+        // `drain_window_source` names which arm of the min() won — the only way
+        // to tell "2s because that is the settle target" from "1s because the
+        // grace was set to 6" without reading source.
+        termination_grace_seconds = config.termination_grace_seconds,
+        shutdown_settle_target_seconds = mh_service::config::SHUTDOWN_SETTLE_TARGET_SECONDS,
+        shutdown_margin_seconds = mh_service::config::SHUTDOWN_MARGIN_SECONDS,
+        drain_window_seconds = config.drain_window.as_secs(),
+        drain_window_source = config.drain_window_source.as_str(),
         // ADR-0036 §8 policy bounds. Logged because all four are
         // optional-with-default: without this line an operator cannot tell a
         // deliberately-configured value from a default nobody chose, which is
@@ -320,6 +371,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.handler_id.clone(),
         Duration::from_secs(config.register_meeting_timeout_seconds),
         config.max_connections,
+        config.quic_transport,
         shutdown_token.child_token(),
     );
 
@@ -372,8 +424,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     shutdown_token.cancel();
 
-    // Give tasks time to shut down (drain window)
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // Settle window, DERIVED at config load as
+    // `min(SHUTDOWN_SETTLE_TARGET, MH_TERMINATION_GRACE_SECONDS - SHUTDOWN_MARGIN)`
+    // and validated there (ADR-0036 §11: "derive rather than guard wherever two
+    // values encode one relationship" — a derived value cannot drift, a guard
+    // only catches drift after someone introduces it).
+    //
+    // No seconds literal lives here on purpose. The previous hardcoded 2s was a
+    // number with no stated relationship to the 35s `terminationGracePeriodSeconds`
+    // it had to fit inside; the two could be edited independently and neither
+    // site mentioned the other.
+    //
+    // This is NOT a drain phase. ADR-0036 §11 decides that MH SHEDS media
+    // sessions on restart rather than draining them, and v1 keeps it that way —
+    // recovery is §8's re-assert. This window only lets in-flight teardown
+    // settle. The effective value and the arm that produced it are on the
+    // startup log line above.
+    tokio::time::sleep(config.drain_window).await;
 
     // Abort TokenManager background task
     info!("Stopping TokenManager...");

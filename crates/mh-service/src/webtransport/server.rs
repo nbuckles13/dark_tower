@@ -10,6 +10,10 @@
 //! 2. Child tokens propagate cancellation to active connection handlers
 
 use crate::auth::MhJwtValidator;
+use crate::config::{
+    QuicTransportParams, CONNECTION_RECEIVE_WINDOW_BYTES, DATAGRAM_RECEIVE_BUFFER_BYTES,
+    MAX_IDLE_TIMEOUT_SECONDS, STREAM_RECEIVE_WINDOW_BYTES,
+};
 use crate::grpc::McClient;
 use crate::observability::metrics;
 use crate::session::SessionManagerHandle;
@@ -42,8 +46,11 @@ pub struct WebTransportServer {
     handler_id: String,
     /// `RegisterMeeting` timeout duration.
     register_meeting_timeout: Duration,
-    /// Maximum concurrent connections (bounds resource exhaustion).
+    /// Accept-time resource-exhaustion guard, never a capacity figure
+    /// (`MH_MAX_CONNECTIONS`). Enforcement below is unchanged by ADR-0036 §1.
     max_connections: usize,
+    /// Explicit QUIC transport parameters (ADR-0036 §1).
+    quic_transport: QuicTransportParams,
     /// Active connection count.
     active_connections: Arc<AtomicUsize>,
     /// Cancellation token for graceful shutdown.
@@ -67,6 +74,7 @@ impl WebTransportServer {
         handler_id: String,
         register_meeting_timeout: Duration,
         max_connections: usize,
+        quic_transport: QuicTransportParams,
         cancel_token: CancellationToken,
     ) -> Self {
         Self {
@@ -79,6 +87,7 @@ impl WebTransportServer {
             handler_id,
             register_meeting_timeout,
             max_connections,
+            quic_transport,
             active_connections: Arc::new(AtomicUsize::new(0)),
             cancel_token,
         }
@@ -122,7 +131,7 @@ impl WebTransportServer {
 
         let config = ServerConfig::builder()
             .with_bind_address(bind_addr)
-            .with_identity(identity)
+            .with_custom_transport(identity, build_transport_config(&self.quic_transport))
             .build();
 
         let endpoint = Endpoint::server(config).map_err(|e| {
@@ -218,5 +227,161 @@ impl WebTransportServer {
                 }
             }
         }
+    }
+}
+
+/// Build the explicit QUIC transport configuration MH declares (ADR-0036 §1).
+///
+/// # Why this exists at all
+///
+/// Until this function, MH built its server config with **no transport
+/// configuration**, so quinn's defaults were live: a 1 MiB datagram send buffer
+/// (≈89 seconds of queued audio on a realtime path), no keepalive at all, and
+/// an unbounded connection receive window. ADR-0036 §1's framing is the point —
+/// "a bound has to be declared to be assertable, and the default being adequate
+/// is not the same as the default being chosen."
+///
+/// Split out from [`WebTransportServer::bind`] so every field can be asserted
+/// without binding a socket or loading a TLS identity.
+///
+/// # Provenance of each setting
+///
+/// Env-driven (from [`QuicTransportParams`], all required): the uni-stream
+/// bound, the datagram **send** buffer, the keepalive interval. Compile-time
+/// constants (see [`crate::config`]): the idle timeout, both receive windows,
+/// and the datagram **receive** buffer. Everything not set here remains a quinn
+/// default, and that set should only ever shrink.
+fn build_transport_config(params: &QuicTransportParams) -> quinn::TransportConfig {
+    let mut transport = quinn::TransportConfig::default();
+
+    transport.max_concurrent_uni_streams(params.max_concurrent_uni_streams.into());
+
+    // Egress backstop. MH's own bounded egress queue is validated at startup to
+    // trip before this, so back-pressure is countable in MH's code rather than
+    // silently discarded by quinn's drop-oldest eviction (ADR-0036 §1, §11).
+    transport.datagram_send_buffer_size(params.datagram_send_buffer_bytes);
+
+    // MUST be `Some`. quinn derives the advertised `max_datagram_frame_size`
+    // from this field, so `None` would leave datagrams un-negotiated and the
+    // audio path would not exist. See `config::DATAGRAM_RECEIVE_BUFFER_BYTES`
+    // for the floor this value has to clear and why it is not derived from the
+    // send-side frame budget.
+    transport.datagram_receive_buffer_size(Some(DATAGRAM_RECEIVE_BUFFER_BYTES));
+
+    // What refreshes a MUTED participant's NAT binding, since a muted
+    // participant sends no media by definition (ADR-0036 §1, §5). The idle
+    // timeout is declared alongside it because a keepalive is only meaningful
+    // as a fraction of one; startup validation enforces the ratio.
+    transport.keep_alive_interval(Some(Duration::from_millis(params.keepalive_interval_ms)));
+    transport.max_idle_timeout(Some(
+        Duration::from_secs(MAX_IDLE_TIMEOUT_SECONDS)
+            .try_into()
+            .unwrap_or_else(|_| {
+                unreachable!("MAX_IDLE_TIMEOUT_SECONDS is a small compile-time constant")
+            }),
+    ));
+
+    // Receive-side flow control. Without these, quinn leaves `receive_window`
+    // at `VarInt::MAX`, and since MH has no `accept_uni` loop the windows fill
+    // and stay filled — making `max_connections` an admission bound in name
+    // only. See `config::CONNECTION_RECEIVE_WINDOW_BYTES` for the arithmetic.
+    transport.receive_window(CONNECTION_RECEIVE_WINDOW_BYTES.into());
+    transport.stream_receive_window(STREAM_RECEIVE_WINDOW_BYTES.into());
+
+    transport
+}
+
+#[cfg(test)]
+mod tests {
+    //! Coverage for the transport configuration MH declares.
+    //!
+    //! `quinn::TransportConfig` exposes no getters, so these assert through its
+    //! `Debug` rendering — which prints every field this function sets. That is
+    //! weaker than reading the fields back, and it is the strongest check the
+    //! upstream API allows; it still fails if a setter is dropped, because the
+    //! rendered value reverts to quinn's default.
+
+    use super::build_transport_config;
+    use crate::config::{
+        QuicTransportParams, DATAGRAM_RECEIVE_BUFFER_BYTES, NOMINAL_AUDIO_FRAME_BYTES,
+    };
+
+    fn params() -> QuicTransportParams {
+        QuicTransportParams {
+            max_concurrent_uni_streams: 64,
+            datagram_send_buffer_audio_frames: 32,
+            datagram_send_buffer_bytes: 32 * NOMINAL_AUDIO_FRAME_BYTES,
+            keepalive_interval_ms: 10_000,
+        }
+    }
+
+    #[test]
+    fn declares_every_adr_0036_section_1_setting() {
+        let rendered = format!("{:?}", build_transport_config(&params()));
+
+        // Env-driven values reach quinn unmodified.
+        assert!(
+            rendered.contains("max_concurrent_uni_streams: 64"),
+            "uni-stream bound not applied: {rendered}"
+        );
+        assert!(
+            rendered.contains(&format!(
+                "datagram_send_buffer_size: {}",
+                32 * NOMINAL_AUDIO_FRAME_BYTES
+            )),
+            "datagram send buffer not applied (or not the converted byte value): {rendered}"
+        );
+        assert!(
+            rendered.contains("keep_alive_interval: Some(10s)"),
+            "keepalive not applied: {rendered}"
+        );
+    }
+
+    #[test]
+    fn datagram_receive_buffer_is_some_so_datagrams_stay_negotiated() {
+        // `None` here would leave `max_datagram_frame_size` unadvertised and
+        // the entire audio path would not exist. This is the one setting whose
+        // absence is silent rather than degraded.
+        let rendered = format!("{:?}", build_transport_config(&params()));
+        assert!(
+            rendered.contains(&format!(
+                "datagram_receive_buffer_size: Some({DATAGRAM_RECEIVE_BUFFER_BYTES})"
+            )),
+            "datagram receive buffer must be explicitly Some: {rendered}"
+        );
+    }
+
+    #[test]
+    fn receive_side_flow_control_is_declared_not_inherited() {
+        // Undeclared, quinn leaves `receive_window` at VarInt::MAX, which makes
+        // `MH_MAX_CONNECTIONS` an admission bound in name only.
+        let rendered = format!("{:?}", build_transport_config(&params()));
+        assert!(
+            rendered.contains("receive_window: 262144"),
+            "connection receive window not declared: {rendered}"
+        );
+        assert!(
+            rendered.contains("stream_receive_window: 65536"),
+            "stream receive window not declared: {rendered}"
+        );
+        assert!(
+            // quinn renders the idle timeout in milliseconds, not as a Duration.
+            rendered.contains("max_idle_timeout: Some(30000)"),
+            "idle timeout not declared: {rendered}"
+        );
+    }
+
+    #[test]
+    fn buffer_bytes_are_taken_from_config_never_recomputed_here() {
+        // The frames -> bytes conversion has exactly one home (config load).
+        // If this function ever recomputed it, a caller passing a deliberately
+        // odd byte value would silently have it overwritten.
+        let mut odd = params();
+        odd.datagram_send_buffer_bytes = 12_345;
+        let rendered = format!("{:?}", build_transport_config(&odd));
+        assert!(
+            rendered.contains("datagram_send_buffer_size: 12345"),
+            "byte value was recomputed rather than taken from config: {rendered}"
+        );
     }
 }

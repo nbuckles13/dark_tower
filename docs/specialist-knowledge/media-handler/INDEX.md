@@ -16,7 +16,7 @@
 ## Code Locations
 - Service entry point → `crates/mh-service/src/main.rs`
 - Library root (module declarations) → `crates/mh-service/src/lib.rs`
-- Config (TLS, advertise addrs, AC_JWKS_URL, register_meeting_timeout, max_connections) → `crates/mh-service/src/config.rs`
+- Config (TLS, advertise addrs, AC_JWKS_URL, register_meeting_timeout) + ADR-0036 §1 transport: 5 REQUIRED env vars (presence-check literals are guard-load-bearing — never extract a `require_var` helper), the compile-time half (idle timeout, receive windows, datagram receive buffer, egress-queue bound, shutdown constants), 3 fielded-`ConfigError` startup validations (load precedes subscriber init, so the variant IS the operator surface), drain = `min(SETTLE_TARGET, grace − MARGIN)` + `DrainWindowSource`, and `NOMINAL_AUDIO_FRAME_BYTES` (236; frames→bytes from `media-protocol` components, sized at the bitrate range FLOOR because the send buffer is a LATENCY CEILING not a capacity guarantee — NOT `MAX_PAYLOAD_BYTES`) → `crates/mh-service/src/config.rs`
 - Error types (MhError hierarchy) → `crates/mh-service/src/errors.rs`
 - gRPC: GC client (registration, heartbeats, re-registration) → `crates/mh-service/src/grpc/gc_client.rs`
 - gRPC: MC client (Notify connect/disconnect, retry with backoff, auth short-circuit) → `crates/mh-service/src/grpc/mc_client.rs`
@@ -28,8 +28,8 @@
 - Meeting-scoped sender resolution — the ONLY sender lookup, unconstructible without a `MeetingKey`; cross-tenant guard, `docs/TODO.md` §Media Path Obligations (a) → `crates/mh-service/src/routing/mod.rs:sources_for`
 - Process-incarnation epoch for MC's restart detector — sampled ONCE in `main`, never per call → `crates/mh-service/src/process.rs`
 - Policy bounds + hard ceilings (`PolicyLimits`; resource exhaustion, NEVER capacity, never advertised to GC) → `crates/mh-service/src/config.rs:PolicyLimits`
-- WebTransport server (TLS 1.3, capacity-bounded accept loop) → `crates/mh-service/src/webtransport/server.rs`
-- WebTransport connection handler (framed JWT, provisional accept via `await_meeting_registration`, MC notifications) → `crates/mh-service/src/webtransport/connection.rs`
+- WebTransport server (TLS 1.3, accept-time exhaustion guard) + explicit `quinn::TransportConfig` via `with_custom_transport` (needs the `wtransport/quinn` feature) → `crates/mh-service/src/webtransport/server.rs:build_transport_config`
+- WebTransport connection handler (framed JWT, provisional accept, MC notifications) → `webtransport/connection.rs`; REAL `MediaTransport` impl, where `WtSendStream.finished` disambiguates dead-stream from dead-connection because wtransport COLLAPSES quinn's `ClosedStream` into `NotConnected` → `webtransport/media_transport.rs`
 - Health + readiness endpoints → `crates/mh-service/src/observability/health.rs`
 - Prometheus metric recorders; `mh_media_policy_applies_total{outcome,key_custody}` 5 bounded outcomes → `crates/mh-service/src/observability/metrics.rs:PolicyApplyOutcome`
 - Shared `key_custody` label vocabulary (hoisted to common at its 2nd consumer) → `crates/common/src/observability/labels.rs`
@@ -62,7 +62,7 @@
 - Integration: RegisterMeeting over real gRPC → `crates/mh-service/tests/register_meeting_integration.rs`
 - Integration: policy-apply metric labels + counting-boundary denominator invariant → `crates/mh-service/tests/policy_apply_integration.rs`
 - ADR-0036 §10 Tier-1b gates (apply-failure does not advance the echo, monotonicity, re-assert idempotency, gen-0) → `mh_service.rs` tests; multi-meeting cross-tenant pin (both arms) → `routing/mod.rs` tests
-- Integration: WebTransport accept path/provisional timeout/MC notify → `tests/webtransport_integration.rs`, `tests/webtransport_accept_loop_integration.rs`
+- Integration: WebTransport accept path/provisional timeout/MC notify → `tests/webtransport_integration.rs`, `tests/webtransport_accept_loop_integration.rs`; real-vs-double transport parity (finish-then-write via ONE shared generic assertion; recv-after-close; reliable-stream round-trip — NO datagram-delivery assertion, QUIC datagrams are unreliable) → `tests/transport_real_impl.rs`
 - Integration rigs (JWKS mock, mock MC, gRPC rig, WT rig, token minters) → `crates/mh-service/tests/common/`; `RegisterMeetingRequest`/`EgressStream` fixture builders — ONE home, reachable from `src/` unit tests and `tests/` binaries alike, alongside the `MediaTransport` loss/delay shim → `crates/mh-test-utils/src/media_policy.rs`
 - Env-tests: full Kind cluster MH QUIC flow (R-33 scenarios) → `crates/env-tests/tests/26_mh_quic.rs`
 

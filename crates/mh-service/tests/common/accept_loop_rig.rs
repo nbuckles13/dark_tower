@@ -102,6 +102,15 @@ impl AcceptLoopRig {
             handler_id,
             register_meeting_timeout,
             max_connections,
+            // Deployed values (infra/services/mh-service/configmap.yaml). The
+            // rig drives the REAL `bind()`, so these are the transport
+            // parameters the test endpoint actually negotiates with.
+            mh_service::config::QuicTransportParams {
+                max_concurrent_uni_streams: 64,
+                datagram_send_buffer_audio_frames: 32,
+                datagram_send_buffer_bytes: 32 * mh_service::config::NOMINAL_AUDIO_FRAME_BYTES,
+                keepalive_interval_ms: 10_000,
+            },
             cancel_token.clone(),
         );
 

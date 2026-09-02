@@ -242,11 +242,33 @@ pub enum DatagramSendError {
     ///    genuinely hits the blocked path, then retains the payload and yields
     ///    `Poll::Pending` (`:857-860`). Back-pressure is expressed by awaiting,
     ///    never by returning a value.
-    /// 4. **wtransport does not use that path**, and its escape hatch to the
-    ///    raw QUIC connection, `quic_connection()`
-    ///    (`wtransport-0.7.2/src/connection.rs:415`), is `#[cfg(feature = "quinn")]`
-    ///    — a feature absent from wtransport's defaults and from this
-    ///    workspace's dependency, so it does not compile here today.
+    /// 4. **wtransport does not use that path.** Its escape hatch to the raw
+    ///    QUIC connection, `quic_connection()`
+    ///    (`wtransport-0.7.2/src/connection.rs:415`), is `#[cfg(feature = "quinn")]`.
+    ///
+    ///    > **Corrected 2026-09-02** (story task 12, MH transport config). This
+    ///    > clause previously read "a feature absent from wtransport's defaults
+    ///    > and from this workspace's dependency, so it does not compile here
+    ///    > today". **That is no longer true**: `crates/mh-service/Cargo.toml`
+    ///    > now enables `wtransport/quinn`, because
+    ///    > `ServerConfigBuilder::with_custom_transport` — the only way to hand
+    ///    > `wtransport` an explicit `quinn::TransportConfig`, which ADR-0036 §1
+    ///    > requires — is gated behind the same feature. So `quic_connection()`
+    ///    > **does** compile here now.
+    ///    >
+    ///    > The conclusion is unchanged; only this clause's reason is. Clause 5
+    ///    > is now the load-bearing one, and it was always the stronger of the
+    ///    > two. Corrected rather than deleted because a reader who checked this
+    ///    > clause, found it false, and discarded the whole five-clause argument
+    ///    > would conclude `WouldBlock` is reachable in production — which it is
+    ///    > not.
+    ///    >
+    ///    > The invariant is in fact safer than this correction alone suggests:
+    ///    > **clauses 2 and 3 hold independently of the feature gate.** quinn's
+    ///    > public API `unreachable!()`s the blocked arm and expresses
+    ///    > back-pressure by *awaiting*, never by returning `Blocked` as a
+    ///    > value — so removing the compile barrier opens no value-return path
+    ///    > at all. Clause 5 closes only the attributability angle.
     /// 5. **Enabling that feature would not help.** Datagrams sent through the
     ///    raw QUIC connection skip the HTTP/3 session-id varint that
     ///    `Datagram::write` prepends (`src/datagram.rs:34-48`), so they are

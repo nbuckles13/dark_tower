@@ -20,8 +20,10 @@ For active-incident triage (e.g. "an alert is firing right now"), see the compan
 
 1. [Deployment Procedure](#deployment-procedure)
 2. [Post-Deploy Monitoring Checklist: MH WebTransport + MC↔MH Coordination](#post-deploy-monitoring-checklist-mh-webtransport--mcmh-coordination)
-3. [Rollback](#rollback)
-4. [References](#references)
+3. [Required environment keys](#required-environment-keys)
+4. [Both pods CrashLoop immediately after apply](#both-pods-crashloop-immediately-after-apply)
+5. [Rollback](#rollback)
+6. [References](#references)
 
 ---
 
@@ -274,8 +276,16 @@ Trigger an immediate rollback if any of the following hold (verbatim from user s
 The 20%/5m JWT floor is intentionally looser than the existing `MHHighJwtValidationFailures` warning alert (which fires at >10%/5m, see `infra/docker/prometheus/rules/mh-alerts.yaml`). The alert is for "investigate"; this rollback floor is for "abort the deploy regardless of cause". Do not tighten the rollback floor to alert thresholds — that conflates investigation with rollback.
 
 ```bash
-# Rollback command (mh-service)
-kubectl rollout undo deployment/mh-service -n dark-tower
+# Rollback command (mh-service). BOTH instances — MH is deployed as two
+# per-instance Deployments, `mh-0` and `mh-1`, each with its own NodePort
+# Service and Kind port mapping. There is NO Deployment named `mh-service`;
+# targeting one returns NotFound.
+kubectl rollout undo deployment/mh-0 -n dark-tower
+kubectl rollout undo deployment/mh-1 -n dark-tower
+
+# Roll back BOTH. Rolling one leaves a split-version pair: GC keeps placing
+# meetings across both, so which version a participant lands on depends on
+# placement rather than on any decision you made.
 
 # Active WebTransport sessions on rolled-back pods will be severed during pod
 # replacement. Per assumption 4 of the MH QUIC story, MH state is in-memory
@@ -284,13 +294,164 @@ kubectl rollout undo deployment/mh-service -n dark-tower
 # pure binary replacement.
 ```
 
+#### Rollback ordering: the image may roll back alone, the manifests may not
+
+MH reads five **required** environment variables (see
+[Required environment keys](#required-environment-keys)). That makes the image
+and the manifests orderable rather than independent:
+
+- **Forward — manifests, then image.** Already satisfied: the ConfigMap keys
+  landed ahead of the code that requires them, so the tree was never in a state
+  where a running image demanded a key no manifest supplied.
+- **Backward — the image may roll back alone.** This is the normal rollback and
+  the two `kubectl rollout undo` commands above are the whole of it. Older MH
+  code ignores environment variables it does not read, so extra keys are inert.
+- **Backward — the manifests must NOT roll back alone.** Reverting the ConfigMap
+  to a pre-transport-parameter state while the new image is running strips five
+  variables that image requires. `Config::from_env()` fails, **both** pods enter
+  `CrashLoopBackOff`, and MH accepts no connections at all.
+
+  That last case is a **join-path outage, not a media-only degradation** — a
+  participant cannot complete a join if no MH will accept them. **Page, do not
+  ticket.** If you must revert the ConfigMap, revert the image in the same
+  action.
+
+> **Do not deploy MH with `kubectl apply -f`.** `MH_TERMINATION_GRACE_SECONDS`
+> is not a ConfigMap key: it is written into each Deployment's env at build time
+> by the kustomize `replacements:` block in
+> `infra/services/mh-service/kustomization.yaml`, from **that instance's own**
+> `spec.template.spec.terminationGracePeriodSeconds`. The literal checked into
+> `mh-{0,1}-deployment.yaml` is a `"0"` sentinel. `kubectl apply -f` bypasses the
+> replacement and applies the sentinel verbatim — and because `0` is not a valid
+> grace, **both pods refuse to start**. Always `kubectl apply -k`.
+>
+> That refusal is deliberate: a sentinel that reached a running pod silently
+> would give MH a drain window nobody chose, which is the failure the derivation
+> exists to prevent. Failing to start is the safe reading of an invalid value.
+
 If the deploy bundled MC changes alongside MH (e.g. an MC-side `RegisterMeeting` client revision), also roll back MC:
 
 ```bash
-kubectl rollout undo deployment/mc-service -n dark-tower
+# Same shape as MH: MC is two per-instance Deployments, `mc-0` and `mc-1`.
+# There is no Deployment named `mc-service` — that string is a Service, a PDB,
+# a NetworkPolicy, a ServiceMonitor and a *container* name, which is the trap.
+kubectl rollout undo deployment/mc-0 -n dark-tower
+kubectl rollout undo deployment/mc-1 -n dark-tower
 ```
 
 See `docs/runbooks/mc-deployment.md` §"Post-Deploy Monitoring Checklist: MC↔MH Coordination (RegisterMeeting + Notifications)" for the MC-side perspective on the same checklist.
+
+---
+
+## Required environment keys
+
+MH refuses to start if any of these is missing or invalid. There is no default
+for any of them: a value nobody chose, running forever because nothing failed,
+is the defect this list exists to prevent.
+
+The **Enforced by** column is the load-bearing one. Three keys begin `MH_MAX_`
+and mean unrelated things; the layer that enforces a bound is what tells them
+apart, and it is also what tells you where to look when one trips.
+
+| Key | Source | Kind value | What it bounds — and **who enforces it** |
+|---|---|---|---|
+| `MH_MAX_CONCURRENT_UNI_STREAMS` | ConfigMap `mh-service-config` | `64` | How many unidirectional QUIC streams a **peer** may have open toward MH. **Enforced by quinn**, inside MH's process, at stream-open. Ingress only — it does not bound MH's egress, which the subscriber's own advertised limit does. A peer at the limit **stalls** (QUIC withholds stream credit) rather than MH rejecting, so there is **no MH-side metric for it**: diagnose from the publisher, not from an MH dashboard. |
+| `MH_DATAGRAM_BUFFER_AUDIO_FRAMES` | ConfigMap `mh-service-config` | `32` | The QUIC datagram **send** buffer, per connection, expressed in **frames of 20 ms Opus** and converted to bytes once at startup. **Enforced by quinn.** A latency ceiling, not a capacity guarantee — quinn's unchosen default is ~1 MiB, i.e. roughly 89 seconds of queued audio on a realtime path. (`configmap.yaml` says ~93 s for the same default: identical arithmetic, differing only in the assumed frame size — ADR-0036 §1's rounded ~225 B versus the 236 B the code sums from the wire format. Neither is wrong; do not reconcile them by editing one to match.) Must stay strictly **above** MH's own application-level egress queue bound, or MH refuses to start. |
+| `MH_KEEPALIVE_INTERVAL_MS` | ConfigMap `mh-service-config` | `10000` | QUIC connection-level keepalive. **Enforced by quinn.** This is what refreshes the NAT binding of a **muted** participant, who by definition sends no media — without it an intermediary can reap the path and unmute is not instantaneous. Validated at startup to sit at or below one third of MH's 30 s idle timeout, so one lost keepalive is not fatal. |
+| `MH_MAX_CONNECTIONS` | ConfigMap `mh-service-config` | `500` | Maximum concurrent WebTransport connections. **Enforced by mh-service itself**, at accept, before allocating handler resources. A **resource-exhaustion guard, never a capacity figure, never advertised to GC.** It sits far above expected peak, so rejections attributed to it mean a connection **flood or leak** — not demand that has outgrown the deployment. Scaling out is the wrong response. Visible as `mh_webtransport_connections_total{status="rejected"}`. |
+| `MH_TERMINATION_GRACE_SECONDS` | **Not a ConfigMap key** — written into each Deployment's env at build time by the kustomize `replacements:` block | `35` | The pod's own termination grace, from which MH derives its post-cancellation settle window. **Enforced by mh-service** at startup (it refuses to start if the grace leaves no room for the shutdown margin). **Never hand-type this.** It is derived from that instance's own `spec.template.spec.terminationGracePeriodSeconds`, so the two cannot drift; the literal in the deployment file is a `"0"` sentinel. |
+
+One non-required key is listed **for contrast only**, because without it there is
+no way to see why the two `MH_MAX_` keys above are not it:
+
+| Key | Source | Kind value | What it bounds — and who enforces it |
+|---|---|---|---|
+| `MH_MAX_STREAMS` *(not new; not required)* | ConfigMap `mh-service-config` | `100` | **Advertised to GC** as capacity and **enforced only at GC placement** — never on MH's data path. It is also known to be the wrong *unit*: the quantity MH actually needs to bound is an egress bandwidth budget, and a stream count is standing in for it. Its correction is a later story. Do not "fix" it here. |
+
+Table contributed at the request of the observability review, which found that
+this runbook — unlike GC's, AC's and MC's — had no configuration section at all.
+
+---
+
+## Both pods CrashLoop immediately after apply
+
+Symptom: after a deploy, `mh-0` and `mh-1` both enter `CrashLoopBackOff` and MH
+accepts no connections. **Page, not ticket** — this is a join-path outage, not a
+media-only degradation, because a participant cannot complete a join if no MH
+will accept them.
+
+Entry point — the container is already dead, so read the previous container's
+logs, not the current one's:
+
+```bash
+kubectl logs -n dark-tower deployment/mh-0 --previous
+kubectl logs -n dark-tower deployment/mh-1 --previous
+```
+
+### First, partition on how much output there is
+
+The **absence** of MH's structured startup line is itself a diagnostic, and it
+splits the failure space three ways before you read any error text:
+
+| What you see | What it means |
+|---|---|
+| **No JSON log lines at all**, just a `Debug`-style dump | MH died *before* the tracing subscriber existed. Exactly two things run that early: configuration load, and the OpenTelemetry initialiser. See the ambiguity note below. |
+| `Starting Media Handler`, then the structured `Configuration loaded successfully` line, then it stops | Configuration was **valid and fully logged**. The failure is downstream — token acquisition against an unreachable AC, GC registration, or a bind failure — and all of those emit structured errors. Read them. |
+| **No Rust output at all** | Not a boot refusal. Look at the image, the entrypoint, or scheduling (`kubectl describe pod`). |
+
+> **Ambiguity inside the first row, and it will mislead you if you do not know
+> about it.** A rejected configuration and an **unreachable OTLP collector**
+> produce the *identical* signature — zero structured log lines and a `Debug`
+> dump — because the collector probe deliberately runs before the subscriber is
+> initialised and fails hard rather than silently dropping spans.
+>
+> The only discriminator is the **type** of the dumped error: a `ConfigError::*`
+> variant versus an OpenTelemetry initialisation error. **Read the error's type,
+> not just its message** — the instinct is to skim the message, and the message
+> alone will send you to inspect a ConfigMap that is perfectly fine.
+>
+> (This ordering is pre-existing and deliberate: the OTel layer needs the
+> endpoint from configuration, and the tracing subscriber can only be
+> initialised once. It is recorded here because five required keys make the
+> configuration branch much more likely than it used to be.)
+
+### Then, the three causes in likelihood order
+
+1. **A required ConfigMap key is missing or renamed.** The error names the exact
+   variable. Check it against
+   [Required environment keys](#required-environment-keys) and against
+   `infra/services/mh-service/configmap.yaml`. Most likely after a ConfigMap
+   edit or a partial revert.
+2. **`MH_TERMINATION_GRACE_SECONDS` reads `0`.** The kustomize replacement did
+   not run — almost always because the deploy used `kubectl apply -f` on the
+   deployment files instead of `kubectl apply -k` on the overlay. Re-deploy with
+   `apply -k`. See the sentinel note under
+   [Rollback criteria](#rollback-criteria).
+3. **The manifests were rolled back under a newer image.** The image requires
+   five variables the reverted ConfigMap no longer supplies. Roll the image back
+   to match, or restore the ConfigMap. See
+   [Rollback ordering](#rollback-ordering-the-image-may-roll-back-alone-the-manifests-may-not).
+
+Every startup refusal names the offending variable. Where the remediation
+location travels with it differs by refusal kind, and it is worth knowing which
+you are looking at, because in a CrashLoop the message is the only diagnostic an
+operator gets:
+
+- The three startup **validations** — egress-queue ordering, termination grace,
+  keepalive ratio — embed the remediation **inline**: the offending value, the
+  bound it was compared against, and which ConfigMap key or pod-spec field to
+  change.
+- A **missing variable** refuses with the variable name alone
+  (`Missing required environment variable: MH_...`). That is by design, not an
+  omission: its remediation is the
+  [Required environment keys](#required-environment-keys) table above, which
+  names the source of every one of them. Look the variable up there.
+
+Deliberately unchanged, so nobody "improves" it: the missing-variable error
+carries the variable as a **plain string literal**, and `dt-guard env-config`
+discovers MH's thirteen required variables by matching exactly that shape in
+`crates/mh-service/src/config.rs`. Restructuring it to carry a remediation field
+would blind that guard on **all thirteen** while it kept reporting clean.
 
 ---
 
