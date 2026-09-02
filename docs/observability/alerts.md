@@ -734,18 +734,42 @@ histogram_quantile(0.95,
 
 ## Media Handler Alerts
 
-**Status**: 🚧 To be created
-**File**: `infra/docker/prometheus/rules/mh-alerts.yaml` (planned)
+**Status**: ✅ Exists — **not inventoried here**
+**File**: `infra/docker/prometheus/rules/mh-alerts.yaml`
 
-**Planned Critical Alerts**:
-- `MHDown` - No MH pods running
-- `MHHighAudioLatency` - Audio forwarding p99 >30ms
+That file ships a full alert set and this inventory documents **none** of it. Read the rules file
+directly; do not treat the absence of entries below as an absence of alerts. Backfilling the MH (and
+MC) inventory is tracked in `docs/TODO.md`, together with the missing rules↔inventory drift guard
+that let the gap persist. (No count is given here deliberately — a literal would be a second
+encoding of `mh-alerts.yaml` with no guard behind it, stale on the next rule added.)
+
+The rules file also records two **deliberate omissions** in its header comments — no burn-rate
+page/warning pair, and no RegisterMeeting-apply alert — both gated on the MH SLO **target**, which is
+unratified and lands in story 8. See `docs/observability/slos.md`, which is authoritative for that
+rule; the rules-file comment is the copy.
+
+**Remaining unbuilt candidates** (aspirational — thresholds are unratified):
 - `MHHighPacketLoss` - Packet loss >1%
-
-**Planned Warning Alerts**:
-- `MHHighJitter` - Jitter p99 >20ms
-- `MHHighCPU` - CPU >80%
 - `MHForwardingQueueBacklog` - Queue depth high
+
+> `MHDown` and `MHHighCPU` were also removed from this list on 2026-09-02: **both already exist** in
+> `mh-alerts.yaml`. Listing a shipped alert as unbuilt is the same dangling-entry failure as the
+> struck `MHHighJitter` above — a candidate list reads as a work queue — and it contradicted the
+> "documents none of it" note directly above.
+
+> **Two entries removed here on 2026-09-02**, because this commit made them dangling:
+> - **`MHHighJitter` — "Jitter p99 >20ms"**: the MH audio-jitter objective is **struck as
+>   unmeasurable** (ADR-0011 amendment 2026-09-02; ADR-0036 amendments table). MH forwards and does
+>   not buffer; perceived jitter is a client-side jitter-buffer property. No `*jitter*` metric is
+>   emitted by any service, so this alert could never fire. **Deleted rather than repointed** — an
+>   entry in a planned-alert list reads as a work queue, and a pointer would instruct someone to
+>   build an alert against a metric that will never exist.
+> - **`MHHighAudioLatency` — "Audio forwarding p99 >30ms"**: the `>30ms` figure predates the
+>   forwarding objective's measurement point, which was redefined by the same amendment to
+>   ingress-read-complete → egress-enqueued. A threshold and a measurement point are a pair, so that
+>   number is **not ratified against the current SLI**. The alert is legitimate future work, but it
+>   cannot carry a number until story 8 ratifies one; see `docs/observability/slos.md`. Left out of
+>   the candidate list above rather than restated with a stale threshold.
 
 ---
 
@@ -926,4 +950,4 @@ Before deploying alerts, test:
 - [ADR-0011: Observability Framework](../decisions/adr-0011-observability-framework.md)
 - [Runbook Index](./runbooks.md)
 - [Dashboard Catalog](./dashboards.md)
-- [SLO Definitions](./slos.md) (to be created)
+- [SLO Definitions](./slos.md) — authoritative for SLO targets (ADR-0011:40)

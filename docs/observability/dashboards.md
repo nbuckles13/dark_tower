@@ -131,14 +131,16 @@ All dashboard JSON files are stored in `infra/grafana/dashboards/` and auto-load
 
 ### AC Overview
 
-**Status**: 🚧 To be created
-**File**: `infra/grafana/dashboards/ac-overview.json` (planned)
+**Status**: ✅ Exists
+**File**: `infra/grafana/dashboards/ac-overview.json`
 
-**Planned Panels**:
+**Panels**:
 - Token issuance rate
 - Token validation rate
-- Token issuance latency (p95 <350ms SLO)
-- Token validation latency (p95 <50ms SLO)
+- Token issuance latency — SLO target and quantile per `slos.md` (authoritative; do not restate a
+  threshold here)
+- Token validation latency — SLO target and quantile per `slos.md` (authoritative; do not restate a
+  threshold here)
 - Key rotation status
 - JWKS cache hit rate
 
@@ -212,16 +214,22 @@ All dashboard JSON files are stored in `infra/grafana/dashboards/` and auto-load
 
 ### MH Overview
 
-**Status**: 🚧 To be created
-**File**: `infra/grafana/dashboards/mh-overview.json` (planned)
+**Status**: ✅ Exists
+**File**: `infra/grafana/dashboards/mh-overview.json`
 
-**Planned Panels**:
+**Panels**:
 - Packet forwarding rate
-- Audio forwarding latency (p99 <30ms SLO)
+- Audio forwarding latency — SLO target and measurement point per `slos.md` (authoritative; do not
+  restate a threshold here)
 - Video forwarding latency
-- Jitter (p99 <20ms SLO)
 - Packet loss rate
 - Codec usage distribution
+
+> **Jitter panel removed.** The MH audio-jitter objective is **struck as unmeasurable** — MH forwards
+> and does not buffer, and perceived jitter is a client-side jitter-buffer property (ADR-0011
+> amendment 2026-09-02; ADR-0036 amendments table). No `*jitter*` metric is emitted by any service,
+> so a jitter panel could only ever render "No data". Do not re-add one; a client-side successor is
+> deferred with jitter-buffer design. See `slos.md` §Struck.
 
 ---
 

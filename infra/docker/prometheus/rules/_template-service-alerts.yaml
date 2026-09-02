@@ -12,6 +12,13 @@
 # glob. After copying and substituting all `<placeholder>` tokens with real
 # values (including runbook paths that exist on disk), the resulting file
 # must pass strict mode.
+#
+# GUARD-EXEMPT, AND THAT CUTS BOTH WAYS: because dt-guard skips `_template-*`
+# files entirely, nothing here is checked -- not runbook_url resolution, not the
+# severity taxonomy, and NOT the annotation-hygiene secret scan. A placeholder or
+# a stray credential-shaped literal committed to this file ships unvalidated into
+# every service that copies it. Review edits here as if they were production
+# rules, because that is what they become.
 
 groups:
   # -------------------------------------------------------------------------
@@ -23,12 +30,23 @@ groups:
     rules:
       - alert: <Svc>HighErrorRate
         # Error-rate SLO alert. Fires when error rate > 1% for 5m.
+        #
+        # NOTE the trailing non-zero-denominator conjunct. Keep it when you copy
+        # this. Its reason is NOT divide-by-zero -- PromQL yields NaN for 0/0 and
+        # NaN > threshold is false, so a plain ratio already does not fire on no
+        # traffic. It is load-bearing when the denominator is ATTEMPTS (e.g.
+        # `forwarded + dropped`) rather than a pre-existing total: guard the whole
+        # attempts sum, never one addend, or the alert goes silent in the
+        # everything-dropped case -- exactly when the failure is total.
+        # See docs/observability/alert-conventions.md #non-zero-denominator-guard.
         expr: |
           (
             sum(rate(<svc>_<operation>_errors_total[5m]))
             /
             sum(rate(<svc>_<operation>_total[5m]))
           ) > 0.01
+          and
+          sum(rate(<svc>_<operation>_total[5m])) > 0
         # `for:` must be >= 30s. 5m is typical for steady-state SLO-derived alerts.
         for: 5m
         labels:

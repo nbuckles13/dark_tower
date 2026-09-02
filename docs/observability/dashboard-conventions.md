@@ -151,8 +151,16 @@ Dashboard authoring notes for histogram panels:
 
 ## Units `[guard-enforced]`
 
-Every non-`row`, non-`logs` panel must declare a unit via
-`fieldConfig.defaults.unit`. Empty string or missing field is rejected.
+**Scope: the whole unit chain — config → metric → panel — not panel rendering alone.**
+
+A unit is chosen three times for the same quantity: once in the configuration key a human sets, once
+in the metric the code emits, and once in the panel that renders it. Those three choices must
+compose, and the bug is never in any one of them — it is in the seam. This section is the home for
+all three, deliberately: a rule about *config* units filed anywhere else is unfindable by the person
+adding a config key, which is the exact moment the chain is decided.
+
+Every non-`row`, non-`logs` panel must declare a unit via `fieldConfig.defaults.unit`. Empty string
+or missing field is rejected.
 
 Recommended units by metric intent:
 
@@ -163,8 +171,45 @@ Recommended units by metric intent:
 | Duration / latency | `s` (seconds) | histogram quantiles |
 | Ratio / percentage | `percentunit` (0..1) | error rate, CPU utilization |
 | Bytes | `bytes` | memory, network bandwidth |
+| **Throughput / bandwidth** | **`Bps`** (bytes/sec) | egress budget, datagram send rate — **see below** |
 | Time since epoch | `dateTimeFromNow` | last rotation time |
 | Days / hours | `d`, `h` | signing key age |
+
+### Throughput: the config → metric → panel chain `[reviewer-only]`
+
+Throughput is the case where the three choices most often disagree, because humans and ADRs reason in
+**bits per second** while every metric and panel convention here is **bytes**-based.
+
+| Link | Rule |
+|---|---|
+| **Config** | MAY be expressed in the unit humans and ADRs reason in — bits/s, or frames of audio. The key name states the unit (`..._BPS`, `..._frames`). Config is the one place optimised for the person setting it. |
+| **Conversion** | **Single-point, at config load, upstream of the fork.** Convert once as the value is parsed, before it reaches enforcement, the gauge, or anything else. Every consumer then reads the same converted value. |
+| **Metric** | **Bytes-based**, always. Name ends `_bytes` or `_bytes_per_second`. |
+| **Panel** | Unit `Bps`. Any bits equivalence goes in the panel **description as prose** — **never as a multiplication inside the query.** |
+
+**Why conversion must be single-point and upstream of the fork.** If enforcement and the published
+gauge each convert, they can disagree, and then the alert threshold and the enforced limit drift
+apart silently — the gauge says one thing while the code does another, and nothing fails. Converting
+once, before the value forks, makes that class of drift structurally impossible rather than merely
+unlikely. This is ADR-0036 §11's "derive rather than guard wherever two values encode one
+relationship": a derived value cannot drift; a guard only catches drift after someone introduces it.
+
+**Why no `* 8` in a query.** A multiplication inside PromQL puts a unit conversion in a place no one
+reviews and no guard checks, and it silently disagrees with the panel's declared `Bps` unit. The
+panel then renders bits while claiming bytes. Put the equivalence in prose where a human reads it.
+
+**Live instances** — both are *forward references*; neither config key exists in the tree today:
+
+- **Datagram send buffer** (story 1) — ADR-0036 §1 requires this be expressed and documented **in
+  frames of audio**, not bytes, because quinn's 1 MiB default is ≈93 seconds of queued audio and
+  "1 MiB" does not make that visible while "93 seconds" does. quinn's API takes bytes, so the
+  conversion happens once at config load.
+- **`MH_EGRESS_BUDGET_BPS`** (story 2) — specified as "bits/s, converted once at load upstream of the
+  enforcement/gauge fork; nothing downstream sees bits", with the derived stream ceiling and the
+  published gauge both reading the converted value.
+
+Two independent instances is what makes this a rule rather than a one-off, and why it belongs in a
+conventions doc.
 
 ### `percent` vs `percentunit` (reviewer-only)
 
@@ -178,6 +223,84 @@ Grafana `logs` panel type renders log lines, not numbers — unit is
 meaningless and the guard exempts them. Log-volume bar charts (`timeseries`
 with Loki datasource counting log lines) still require a unit; `short` is
 the convention.
+
+---
+
+## Periodicity `[reviewer-only]`
+
+Scrape and export cadence is a deliberate balance between **triage granularity** and **series cost**,
+not an inherited default. Operations triages meeting media quality from these signals, so the cadence
+determines what a responder can actually see.
+
+**Every value below is read from its one configuration source. This section cites the key; it does
+not restate the number as a literal**, because a literal here becomes a second encoding that drifts
+from the config silently.
+
+> **One deliberate exception, below.** The cadence *numbers* do appear in the drift table and prose
+> that follow, because a drift cannot be described without both sides of it — "the deployed value
+> differs from the intended one" is useless without saying by how much. Those figures are
+> **point-in-time documentation of a defect, not a specification**; the config remains authoritative,
+> and they disappear when D1 closes the gap. Everywhere else, cite the key.
+
+### Which config is authoritative
+
+There are **two live Prometheus configurations**, and they do not agree:
+
+| File | Applies to | Authority |
+|---|---|---|
+| `infra/kubernetes/observability/prometheus-config.yaml` | The **deployed** Kind cluster (via `infra/kind/scripts/setup.sh` → `infra/kubernetes/overlays/kind/observability/`, a labels-only passthrough) | **AUTHORITATIVE** — this is what runs, and what any triage actually gets |
+| `infra/docker/prometheus/prometheus.yml` | The local compose stack (`docker-compose.yml`) only | Local-only. Not deployed. |
+
+Naming which one wins is load-bearing: "cite the config key" is meaningless while two keys per
+cadence disagree.
+
+### Media-path cadences
+
+| Signal | Config key | Deployed value | Intended value |
+|---|---|---|---|
+| MH scrape | `scrape_configs[job_name=mh-service].scrape_interval` — **absent** in the authoritative file, so inherits `global.scrape_interval` | **15 s** (inherited) | 5 s, set only in the compose file, with the rationale "more frequent for real-time media metrics" |
+| MC scrape | same shape, `job_name=mc-service` — **absent**, inherits global | **15 s** (inherited) | 10 s (compose only) |
+| GC scrape | same shape, `job_name=gc-service` — **absent**, inherits global | **15 s** (inherited) | 10 s (compose only) |
+| Client SDK OTel export | *(no key exists)* — `PeriodicExportingMetricReader` in `packages/sdk-core/src/telemetry/telemetryConfig.ts` is constructed without `exportIntervalMillis` | **OTel JS default (60 s)** | 10 s — **open item**, lands with the SDK media pipeline (story task 19) |
+| MH latency histogram sample ratio | *(no key exists yet)* — lands with the MH forward path (story task 16), published as a gauge reading the same value the sampler reads | — | Forward reference; see `slos.md` |
+
+### The deployed cadence is 15 s, and that is a gap
+
+**MH is scraped at 15 s, not 5 s.** The authoritative config declares **no per-job
+`scrape_interval` at all**; every job inherits the global value. The 5 s and 10 s figures exist only
+in the compose file and are **intended-but-not-in-effect on the deployed path**.
+
+This matters operationally rather than cosmetically: **a forwarding-latency histogram is close to
+useless for triage at 15 s resolution.** A media-quality incident is typically shorter than a few
+scrape intervals, so at 15 s a responder sees two or three points across the whole event — not enough
+to distinguish a spike from a ramp, or to tell which of the three latency phases moved. The 5 s
+cadence was chosen precisely so that decomposed media latency would be readable during an incident,
+and that intent is currently not in effect.
+
+This is **not** "cadences vary by environment". It is a single configuration that was written in one
+place and never applied in the other. **Closing it is tracked in `docs/TODO.md` §Observability Debt
+(D1)**, owner infrastructure + operations, together with the reciprocal cross-references and a drift
+guard so the two files cannot silently rediverge again.
+
+> **This subsection inverts when D1 lands.** Every statement above — the Deployed column, "the
+> deployed cadence is 15 s", the Intended/Deployed split, the triage-resolution argument — becomes
+> false the moment the per-job overrides are applied. Updating this subsection is listed in D1's
+> **Fix** clause; it is the tracking half of documenting the gap truthfully in the meantime. Without
+> it, the doc that currently describes the drift accurately becomes the tree's most confident wrong
+> statement about cadence.
+
+### Rules
+
+- **Cite the key, never the number.** A cadence written as a literal in any document is a second
+  encoding of a config value.
+- **State which config is authoritative** whenever a cadence is referenced.
+- **A config value published as a gauge must read the same value its consumer reads** — never a
+  parallel constant. The pattern this follows is story 2's
+  `mh_media_egress_budget_bytes_per_second{basis="unmeasured"}` gauge — a **forward reference**, not
+  in the tree today, landing with the egress-budget chain — and the MH sample-ratio gauge (story task
+  16) follows the same rule. Consistent with the Throughput subsection above: neither exists yet.
+- **Do not tune a scrape interval to fix a dashboard.** A panel that needs finer resolution than the
+  scrape provides is a cadence decision (cost, owner: operations), not a panel decision.
 
 ---
 

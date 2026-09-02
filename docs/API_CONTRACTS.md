@@ -241,8 +241,11 @@ The accurate claim, in ADR-0036 §4's own words: **media is encrypted between
 clients; MH, transport and storage cannot read it; MC can.** This is accepted
 operator custody, recorded as the user's risk decision. It must never be described
 as end-to-end against the operator or as zero-trust; telemetry carries
-`key_custody=operator` in place of any end-to-end boolean. No key material crosses
-the MC→MH contract, and none rides on the roster.
+`key_custody=operator` in place of any end-to-end boolean — the label's definition,
+its permitted values, and which telemetry surfaces must carry it are specified in
+`docs/observability/label-taxonomy.md` §Key custody, which is canonical for those
+mechanics; the accuracy claim and the prohibition above are stated here as contract.
+No key material crosses the MC→MH contract, and none rides on the roster.
 
 **`identity_public_key` (ADR-0036 §3, §4).** The participant's raw Ed25519 signing
 public key — 32 bytes, not PEM/JWK/base64/SPKI — sent on `JoinRequest` and

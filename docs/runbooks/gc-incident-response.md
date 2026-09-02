@@ -2031,8 +2031,8 @@ All times in UTC. Link to relevant Slack threads, PagerDuty incidents, and dashb
 - **ADR-0010**: Global Controller Architecture
 - **ADR-0011**: Observability Framework
 - **ADR-0012**: Infrastructure Architecture
-- **Metrics Catalog**: `docs/observability/metrics/gc-service.md` (to be created)
-- **SLO Definitions**: `docs/observability/slos.md` (to be created)
+- **Metrics Catalog**: `docs/observability/metrics/gc-service.md`
+- **SLO Definitions**: `docs/observability/slos.md` — authoritative for SLO targets (ADR-0011:40)
 - **GC Service Architecture**: `docs/ARCHITECTURE.md` (GC section)
 - **Database Schema**: `docs/DATABASE_SCHEMA.md`
 - **On-call Rotation**: PagerDuty schedule "Dark Tower GC Team"
